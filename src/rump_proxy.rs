@@ -10,7 +10,7 @@
 //! the `stack=rump` dispatch hook) come next.
 
 use crate::syscall::pipe;
-use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
+use akuma_exec::mmu::user_access::{copy_from_user, copy_to_user, write_user_val};
 use akuma_exec::{process, threading};
 use akuma_rump::sysproxy::{Client, ClientMem, NoMem, PipeIo, PipeTransport, MAX_TRANSFER};
 use akuma_rump::syscall_translation as translation;
@@ -610,7 +610,7 @@ impl ClientMem for ProcMem {
             return Ok(());
         }
         out.resize(len, 0);
-        if unsafe { copy_from_user_safe(out.as_mut_ptr(), addr as *const u8, len).is_err() } {
+        if copy_from_user(out, addr).is_err() {
             return Err(NETBSD_EFAULT);
         }
         Ok(())
@@ -619,12 +619,10 @@ impl ClientMem for ProcMem {
     fn copyinstr(&mut self, addr: u64, max: usize, out: &mut Vec<u8>) -> Result<(), i32> {
         out.clear();
         for i in 0..max.min(MAX_TRANSFER) {
-            let mut b = [0u8; 1];
-            if unsafe {
-                copy_from_user_safe(b.as_mut_ptr(), (addr + i as u64) as *const u8, 1).is_err()
-            } {
+            let Ok(byte) = crate::syscall::copy_from_user_byte(addr + i as u64) else {
                 return Err(NETBSD_EFAULT);
-            }
+            };
+            let b = [byte];
             out.push(b[0]);
             if b[0] == 0 {
                 break;
@@ -638,13 +636,13 @@ impl ClientMem for ProcMem {
         if self.cout_sockaddr.contains(&addr)
             && let Some(li) = translation::sockaddr_in_netbsd_to_linux(data)
         {
-            return if unsafe { copy_to_user_safe(addr as *mut u8, li.as_ptr(), li.len()).is_err() } {
+            return if copy_to_user(addr, &li).is_err() {
                 Err(NETBSD_EFAULT)
             } else {
                 Ok(())
             };
         }
-        if unsafe { copy_to_user_safe(addr as *mut u8, data.as_ptr(), data.len()).is_err() } {
+        if copy_to_user(addr, data).is_err() {
             return Err(NETBSD_EFAULT);
         }
         Ok(())
@@ -693,7 +691,7 @@ fn proxy_connect(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
         return neg_linux_errno(LINUX_EINVAL);
     }
     let mut lin = [0u8; 16];
-    if unsafe { copy_from_user_safe(lin.as_mut_ptr(), addr_ptr as *const u8, 16).is_err() } {
+    if copy_from_user(&mut lin, addr_ptr).is_err() {
         return neg_linux_errno(LINUX_EFAULT);
     }
     let Some(nb) = translation::sockaddr_in_linux_to_netbsd(&lin) else {
@@ -742,7 +740,7 @@ fn proxy_bind(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
         return neg_linux_errno(LINUX_EINVAL);
     }
     let mut lin = [0u8; 16];
-    if unsafe { copy_from_user_safe(lin.as_mut_ptr(), addr_ptr as *const u8, 16).is_err() } {
+    if copy_from_user(&mut lin, addr_ptr).is_err() {
         return neg_linux_errno(LINUX_EFAULT);
     }
     let Some(nb) = translation::sockaddr_in_linux_to_netbsd(&lin) else {
@@ -1017,12 +1015,8 @@ fn proxy_getsockopt(args: &[u64; 6], proc: &Process) -> u64 {
     if level == 1 && optname == 4 && optval_ptr != 0 {
         let zero: i32 = 0;
         let four: u32 = 4;
-        let ok = unsafe {
-            copy_to_user_safe(optval_ptr as *mut u8, (&raw const zero).cast::<u8>(), 4).is_ok()
-                && (optlen_ptr == 0
-                    || copy_to_user_safe(optlen_ptr as *mut u8, (&raw const four).cast::<u8>(), 4)
-                        .is_ok())
-        };
+        let ok = write_user_val(optval_ptr, &zero).is_ok()
+            && (optlen_ptr == 0 || write_user_val(optlen_ptr, &four).is_ok());
         return if ok { 0 } else { neg_linux_errno(LINUX_EFAULT) };
     }
     neg_linux_errno(LINUX_EOPNOTSUPP)
@@ -1081,7 +1075,7 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
             let (addr_ptr, addrlen) = (args[4], args[5]);
             if addr_ptr != 0 && addrlen as usize >= 16 {
                 let mut lin = [0u8; 16];
-                if unsafe { copy_from_user_safe(lin.as_mut_ptr(), addr_ptr as *const u8, 16).is_err() } {
+                if copy_from_user(&mut lin, addr_ptr).is_err() {
                     return neg_linux_errno(LINUX_EFAULT);
                 }
                 let Some(nb) = translation::sockaddr_in_linux_to_netbsd(&lin) else {
@@ -1123,9 +1117,7 @@ fn proxy_transfer(args: &[u64; 6], proc: &Process, box_id: u64, op: translation:
     if matches!(op, translation::Op::Readv | translation::Op::Writev) {
         let cnt = (a2 as usize).min(8);
         let mut iobuf = [0u8; 128];
-        if cnt > 0
-            && unsafe { copy_from_user_safe(iobuf.as_mut_ptr(), a1 as *const u8, cnt * 16).is_ok() }
-        {
+        if cnt > 0 && copy_from_user(&mut iobuf[..cnt * 16], a1).is_ok() {
             let mut total = 0u64;
             let mut l0 = 0u64;
             for i in 0..cnt {
@@ -1236,7 +1228,7 @@ fn proxy_recvmsg(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
         return neg_linux_errno(LINUX_EFAULT);
     }
     let mut mh = [0u8; MSGHDR_SIZE];
-    if unsafe { copy_from_user_safe(mh.as_mut_ptr(), msghdr_ptr as *const u8, MSGHDR_SIZE).is_err() } {
+    if copy_from_user(&mut mh, msghdr_ptr).is_err() {
         return neg_linux_errno(LINUX_EFAULT);
     }
     let rd_u64 = |off: usize| u64::from_le_bytes(mh[off..off + 8].try_into().unwrap());
@@ -1252,7 +1244,7 @@ fn proxy_recvmsg(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     }
     // First iovec = { void *iov_base; size_t iov_len }.
     let mut iov = [0u8; 16];
-    if unsafe { copy_from_user_safe(iov.as_mut_ptr(), msg_iov as *const u8, 16).is_err() } {
+    if copy_from_user(&mut iov, msg_iov).is_err() {
         return neg_linux_errno(LINUX_EFAULT);
     }
     let iov_base = u64::from_le_bytes(iov[0..8].try_into().unwrap());
@@ -1281,18 +1273,8 @@ fn proxy_recvmsg(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
             // data, not truncated); the resolver may inspect msg_flags.
             let zero64 = 0u64.to_le_bytes();
             let zero32 = 0u32.to_le_bytes();
-            unsafe {
-                let _ = copy_to_user_safe(
-                    (msghdr_ptr + MSGHDR_CONTROLLEN as u64) as *mut u8,
-                    zero64.as_ptr(),
-                    8,
-                );
-                let _ = copy_to_user_safe(
-                    (msghdr_ptr + MSGHDR_FLAGS as u64) as *mut u8,
-                    zero32.as_ptr(),
-                    4,
-                );
-            }
+            let _ = copy_to_user(msghdr_ptr + MSGHDR_CONTROLLEN as u64, &zero64);
+            let _ = copy_to_user(msghdr_ptr + MSGHDR_FLAGS as u64, &zero32);
             rsp_trace!(96, "[RUMP-SP] recvmsg -> {} ({}us)\n", n, dt);
             n as u64
         }

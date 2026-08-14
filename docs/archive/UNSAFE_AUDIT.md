@@ -151,6 +151,42 @@ value target in the tree.
 
 ### P0 — the user-copy wrapper: 167 sites, 19% of all `unsafe`
 
+> **Status: DONE 2026-08-14.** The check and the copy are one helper now
+> (`copy_to_user`, `copy_from_user`, `write_user_val`, `read_user_into`, plus
+> `_with(Prefault)` forms and `as_user_bytes{,_mut}` for arrays), and
+> `validate_user_ptr` + `ensure_user_pages_mapped` moved out of the bin crate into
+> `akuma_exec::mmu::user_access` so the copy can fold them in. **`src/syscall/`
+> went from 192 `unsafe` to 24**, `rump_proxy.rs` 12 → 0, `exceptions.rs`
+> 107 → 97, `akuma-exec/src/process/mod.rs` 36 → 34. Host tests 516 → 521.
+>
+> **Two things this audit got wrong, one of them in the safe direction and one
+> not** — read them before trusting the rest of this section:
+>
+> 1. **"Folding the range check in makes it unskippable" is true. "That closes the
+>    hole" is not.** `add_kernel_mappings` (`mmu/mod.rs:710`, comment at `:105`)
+>    identity-maps kernel RAM as **EL1-only 2 MB blocks in every user address
+>    space**, and `is_current_user_range_mapped` tests *presence*, not
+>    EL0-accessibility — so a mapped kernel VA still passes validation, and the
+>    byte loop runs at EL1 where the EL1-only permission does not stop it. What
+>    keeps this from being reachable is only that the user VA allocator avoids
+>    `[KERNEL_VA_START, kernel_va_end())` — a layout convention, not a check. The
+>    real fix is to test the leaf PTE's AP bits ("mapped *as user memory*"), which
+>    is a contained change to `is_current_user_range_mapped` but a **behaviour
+>    change** and wants its own A/B. **Still open**; see §4.0a below.
+> 2. **The "it can't move, the prefault is bin-crate logic" objection was wrong.**
+>    Raised while planning, and disproved by looking: `akuma-exec` already depends
+>    on `akuma-pmm` directly, `as_lock`/`with_as_locked` are its own `Process`
+>    methods, and `ExecRuntime` already carries the exact two hooks the file fill
+>    needs (`read_at`, `read_at_by_inode`, `runtime.rs:114`/`:116`). The only
+>    genuinely bin-crate thing was `crate::pmm::alloc_page_zeroed`, a one-line
+>    wrapper over `akuma_pmm::alloc_page_zeroed`. 127 lines moved with no new hook
+>    and no new dependency edge.
+>
+> Everything else the section predicted held: the API is safe `fn`s, the length
+> invariant became unstateable-wrong, and the `(&raw const v).cast::<u8>()` +
+> separate-size pairing is gone. **Full record:**
+> [`USER_COPY_FOLD.md`](USER_COPY_FOLD.md).
+
 **Where:** `crates/akuma-exec/src/mmu/user_access.rs` defines
 
 ```rust
@@ -195,6 +231,38 @@ a mismatch between the two is a stack over-read.
 single-line form `if unsafe { copy_to_user_safe(p as *mut u8, buf.as_ptr(), n).is_err() }`
 and convert by rote. **Risk:** low. **Payoff:** −167 `unsafe` (19% of the tree) plus
 a soundness fix.
+
+### 4.0 What the P0 conversion found — full record elsewhere
+
+The conversion is written up in [`USER_COPY_FOLD.md`](USER_COPY_FOLD.md), because it
+is a history document and this is an audit. In one paragraph: ~140 of the 167 sites
+converted by rote, ~25 needed a decision, and those fall into three groups —
+copies that must not demand-page (`Prefault::No`: inside a spinlock with IRQs
+masked, or inside an exception handler), `validate_user_ptr` calls that had to stay
+(they gate a caller-sized allocation, keep the prefault off a lock, or preserve
+error precedence), and two callers that stay raw on purpose
+(`copy_from_user_byte`, whose string walk has no range to validate, and the test
+whose subject is the fault trampoline). One real bug fell out — `mremap` never
+validated its *destination*, so a lazy page in the new mapping silently truncated
+the move — and three Linux divergences plus one pre-existing lock-ordering defect
+were recorded without being changed.
+
+### 4.0a Still open: the check is unskippable, but it is the wrong check
+
+`user_range_ok` + `is_current_user_range_mapped` cannot distinguish a user page
+from a kernel page: `add_kernel_mappings` (`mmu/mod.rs:710`) identity-maps kernel
+RAM as EL1-only 2 MB blocks in **every** user address space, the mapped-ness test
+checks presence only, and the copy loop runs at EL1 where the EL1-only permission
+does not stop it. What keeps it unreachable is a layout convention (the user VA
+allocator avoids `[KERNEL_VA_START, kernel_va_end())`), not a check.
+
+The fix is an AP-bit test at the leaf — "mapped *as user memory*" — which
+`is_page_mapped_ptr` already walks to. It is a behaviour change and wants its own
+A/B plus a boot test that a kernel VA as a syscall destination returns `EFAULT`.
+Note before touching it that the kernel VA range is deliberately **not** excluded
+today, because Bun's JSC `mmap`s at `0x5000_0000`; an AP-bit test handles that
+correctly where a range exclusion would not. Rationale and the rest:
+[`USER_COPY_FOLD.md`](USER_COPY_FOLD.md) §7.
 
 ### P1 — `#[repr(C)]` structs instead of hand-offset byte writes: 3 blocks, 281 unsafe ops
 
@@ -699,7 +767,7 @@ table.
 | 2 | Drop `UnsafeCell` + `unsafe impl Sync` in `block.rs` / `audio.rs` | −10 | small | low |
 | 3 | Remaining tier A quick wins (ext2 hooks, `SOCKET_STORAGE`, `*_unchecked`, `SocketHandle`) | −15 | small | low |
 | 4 | Drop `unused_unsafe` from the `akuma-exec` allow list (fires 0 today) | 0 | trivial | none |
-| 5 | **P0** — safe slice-based user-copy API, all 167 sites | **−167** | large, mechanical | low |
+| 5 | ~~**P0** — safe slice-based user-copy API, all 167 sites~~ **DONE 2026-08-14** — `src/syscall/` 192 → 24 `unsafe`, `rump_proxy.rs` 12 → 0, `exceptions.rs` 107 → 97, `akuma-exec/process/mod.rs` 36 → 34; +5 host tests. ~25 of the sites needed a decision rather than a rewrite (§4.0), the unchecked-destination hole is **not** closed by the fold (§4.0a), and one real bug fell out (`mremap`'s destination was never validated) | **0 left** | — | — |
 | 6 | **P1** — `#[repr(C)]` `Statx` + `SigFrame` | −3 blocks / −281 ops | medium | medium |
 | 5 | Enable `clippy::undocumented_unsafe_blocks` in the clean crates (`akuma-vfs`, `akuma-terminal`, `akuma-rump`, `akuma-isolation` — 2 hits total), ratchet inward | 0 | small | none |
 | 6 | Drop `clippy::missing_safety_doc` allows; document the 34 `unsafe fn` | 0 | medium | none |
@@ -726,6 +794,22 @@ scripts/build_extreme_size.sh                        # 4 MB floor still holds
 Re-measure with the two commands in §1. For P0 specifically, the check that
 matters is that `grep -rn 'copy_to_user_safe\|copy_from_user_safe' src crates`
 returns only the definitions in `user_access.rs`.
+
+**What that grep returns after the P0 sweep (2026-08-14), and why it is not zero:**
+`user_access.rs` itself (the definitions and the safe wrappers' one call each),
+`syscall/mod.rs`'s `copy_from_user_byte` (§4.0 group 3), `tests.rs`'s
+`el1_user_copy_fault_recovery` test (the trampoline is the unit under test), and
+three `process_tests.rs` comments that name the primitive while explaining history.
+Every one is deliberate and says so at the site.
+
+**Not covered by a test, and worth saying plainly:** the `mremap`
+destination-prefault fix ([`USER_COPY_FOLD.md`](USER_COPY_FOLD.md) §5) has no
+dedicated regression test. The boot suite
+and the Tier 3 fork/CoW binaries pass unchanged, which shows the sweep preserved
+behaviour, but neither exercises "move a mapping whose destination pages are still
+lazy". A `userspace/` probe that `mremap`s a large region and verifies the moved
+bytes would pin it; the truncation was silent, so nothing would fail loudly
+without one.
 
 Syscall-surface changes need boot-suite coverage in `src/process_tests.rs`, per
 the repo convention.

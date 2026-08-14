@@ -5,7 +5,6 @@ use super::*;
 // (`akuma_primitives::errno::negated`).
 #[cfg(feature = "smoltcp")]
 use akuma_net::socket::{self, libc_errno};
-use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 /// RAII guard that runs a VFS syscall **without** the Big Kernel Lock — Phase 4 of
 /// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md. Mirrors
@@ -235,7 +234,7 @@ pub(super) struct IoVec {
     pub(super) iov_len: usize,
 }
 
-#[repr(C)] #[derive(Default)] pub struct Stat { pub st_dev: u64, pub st_ino: u64, pub st_mode: u32, pub st_nlink: u32, pub st_uid: u32, pub st_gid: u32, pub st_rdev: u64, pub __pad1: u64, pub st_size: i64, pub st_blksize: i32, pub __pad2: i32, pub st_blocks: i64, pub st_atime: i64, pub st_atime_nsec: i64, pub st_mtime: i64, pub st_mtime_nsec: i64, pub st_ctime: i64, pub st_ctime_nsec: i64, pub __unused: [i32; 2] }
+#[repr(C)] #[derive(Clone, Copy, Default)] pub struct Stat { pub st_dev: u64, pub st_ino: u64, pub st_mode: u32, pub st_nlink: u32, pub st_uid: u32, pub st_gid: u32, pub st_rdev: u64, pub __pad1: u64, pub st_size: i64, pub st_blksize: i32, pub __pad2: i32, pub st_blocks: i64, pub st_atime: i64, pub st_atime_nsec: i64, pub st_mtime: i64, pub st_mtime_nsec: i64, pub st_ctime: i64, pub st_ctime_nsec: i64, pub __unused: [i32; 2] }
 
 const fn makedev(major: u64, minor: u64) -> u64 {
     (major << 8) | minor
@@ -287,7 +286,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 let Some(proc) = akuma_exec::process::current_process_shared() else { return EBADF };
                 let n = proc.read_stdin(&mut temp);
                 if n > 0 
-                    && unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                    && copy_to_user(buf_ptr, &temp[..n]).is_err() {
                         return EFAULT;
                     }
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -317,7 +316,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                             let to_read = ready.len();
                             kernel_buf[..to_read].copy_from_slice(&ready);
                             drop(ts);
-                            if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), to_read).is_err() } {
+                            if copy_to_user(buf_ptr, &kernel_buf[..to_read]).is_err() {
                                 return EFAULT;
                             }
                             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -352,7 +351,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                                     let to_read = ready.len();
                                     kernel_buf[..to_read].copy_from_slice(&ready);
                                     drop(ts);
-                                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), to_read).is_err() } {
+                                    if copy_to_user(buf_ptr, &kernel_buf[..to_read]).is_err() {
                                         return EFAULT;
                                     }
                                     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -370,7 +369,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         }
                     }
 
-                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), n).is_err() } {
+                    if copy_to_user(buf_ptr, &kernel_buf[..n]).is_err() {
                         return EFAULT;
                     }
                     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -397,7 +396,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                                 let to_read = ready.len();
                                 kernel_buf[..to_read].copy_from_slice(&ready);
                                 drop(ts);
-                                if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), to_read).is_err() } {
+                                if copy_to_user(buf_ptr, &kernel_buf[..to_read]).is_err() {
                                     return EFAULT;
                                 }
                                 return to_read as u64;
@@ -460,7 +459,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             match crate::fs::read_at(&f.path, f.position, &mut temp) {
                 Ok(n) => {
                     if n > 0 {
-                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                        if copy_to_user(buf_ptr, &temp[..n]).is_err() {
                             return EFAULT;
                         }
                         if let Some(proc) = akuma_exec::process::current_process_shared() {
@@ -503,7 +502,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             match result {
                 Ok(n) => {
                     if n > 0
-                        && unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                        && copy_to_user(buf_ptr, &temp[..n]).is_err() {
                             return EFAULT;
                         }
                     // Reset EPOLLET edge after every successful TCP read. Go (and other callers
@@ -532,7 +531,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 loop {
                     let n = ch.read(&mut temp);
                     if n > 0 {
-                        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                        if copy_to_user(buf_ptr, &temp[..n]).is_err() {
                             return EFAULT;
                         }
                         return n as u64;
@@ -580,7 +579,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             loop {
                 let (n, eof) = super::pipe::pipe_read(pipe_id, &mut temp);
                 if n > 0 {
-                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                    if copy_to_user(buf_ptr, &temp[..n]).is_err() {
                         if crate::config::SYSCALL_DEBUG_PIPE_READ {
                             crate::tprint!(
                                 224,
@@ -615,7 +614,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             loop {
                 let (n, eof) = super::pipe::pipe_read(rx, &mut temp);
                 if n > 0 {
-                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                    if copy_to_user(buf_ptr, &temp[..n]).is_err() {
                         return EFAULT;
                     }
                     return n as u64;
@@ -641,9 +640,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             let nonblock = super::eventfd::eventfd_is_nonblock(efd_id) || super::net::fd_is_nonblock(fd_num as u32);
             loop {
                 if let Ok(val) = super::eventfd::eventfd_read(efd_id) {
-                    let mut temp = [0u8; 8];
-                    unsafe { core::ptr::write(temp.as_mut_ptr().cast::<u64>(), val); }
-                    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), 8).is_err() } {
+                    let temp = val.to_ne_bytes();
+                    if copy_to_user(buf_ptr, &temp).is_err() {
                         return EFAULT;
                     }
                     return 8;
@@ -659,7 +657,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         akuma_exec::process::FileDescriptor::DevZero => {
             // /dev/zero: fill the user buffer with zero bytes and return count.
             let temp = alloc::vec![0u8; count];
-            if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
+            if copy_to_user(buf_ptr, &temp).is_err() {
                 return EFAULT;
             }
             count as u64
@@ -668,7 +666,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             let mut temp = alloc::vec![0u8; count];
             let _drv_bkl = DriverBklGuard::new();
             if crate::rng::fill_bytes(&mut temp).is_ok() {
-                if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
+                if copy_to_user(buf_ptr, &temp).is_err() {
                     return EFAULT;
                 }
                 count as u64
@@ -693,7 +691,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             match got {
                 Some(n) => {
                     if n > 0
-                        && unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                        && copy_to_user(buf_ptr, &temp[..n]).is_err() {
                             return EFAULT;
                         }
                     n as u64
@@ -706,9 +704,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             let result = super::timerfd::timerfd_read(timer_id);
             if result == EAGAIN { return EAGAIN; }
             if count >= 8 && validate_user_ptr(buf_ptr, 8) {
-                let mut temp = [0u8; 8];
-                unsafe { core::ptr::write(temp.as_mut_ptr().cast::<u64>(), result); }
-                if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), 8).is_err() } {
+                let temp = result.to_ne_bytes();
+                if copy_to_user(buf_ptr, &temp).is_err() {
                     return EFAULT;
                 }
                 8
@@ -744,7 +741,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
             match crate::fs::read_at(&f.path, offset as usize, &mut temp) {
                 Ok(n) => {
                     if n > 0
-                        && unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), n).is_err() } {
+                        && copy_to_user(buf_ptr, &temp[..n]).is_err() {
                             return EFAULT;
                         }
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
@@ -758,7 +755,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
         akuma_exec::process::FileDescriptor::DevNull => 0,
         akuma_exec::process::FileDescriptor::DevZero => {
             let temp = alloc::vec![0u8; count];
-            if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
+            if copy_to_user(buf_ptr, &temp).is_err() {
                 return EFAULT;
             }
             count as u64
@@ -767,7 +764,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
             let mut temp = alloc::vec![0u8; count];
             let _drv_bkl = DriverBklGuard::new();
             if crate::rng::fill_bytes(&mut temp).is_ok() {
-                if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), count).is_err() } {
+                if copy_to_user(buf_ptr, &temp).is_err() {
                     return EFAULT;
                 }
                 count as u64
@@ -791,7 +788,7 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
         akuma_exec::process::FileDescriptor::File(ref f) => {
             let _vfs_bkl = VfsBklGuard::new();
             let mut buf = alloc::vec![0u8; count];
-            if unsafe { copy_from_user_safe(buf.as_mut_ptr(), buf_ptr as *const u8, count).is_err() } {
+            if copy_from_user(&mut buf, buf_ptr).is_err() {
                 return EFAULT;
             }
             match crate::fs::write_at(&f.path, offset as usize, &buf) {
@@ -853,8 +850,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         let remaining = count - total_written;
         let this_chunk = remaining.min(chunk_size);
         
-        let user_ptr = (buf_ptr as usize + total_written) as *const u8;
-        if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr(), user_ptr, this_chunk).is_err() } {
+        if copy_from_user(&mut kernel_buf[..this_chunk], buf_ptr + total_written as u64).is_err() {
             if total_written > 0 { return total_written as u64; }
             return EFAULT;
         }
@@ -1132,10 +1128,10 @@ pub(super) fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
     if !validate_user_ptr(iov_ptr, iov_size) { return EFAULT; }
     
     let mut kernel_iovs = alloc::vec![IoVec { iov_base: 0, iov_len: 0 }; iov_cnt];
-    if unsafe { copy_from_user_safe(kernel_iovs.as_mut_ptr().cast::<u8>(), iov_ptr as *const u8, iov_size).is_err() } {
+    if copy_from_user(as_user_bytes_mut(&mut kernel_iovs), iov_ptr).is_err() {
         return EFAULT;
     }
-    
+
     let mut total_read: u64 = 0;
     for iov in kernel_iovs.iter().take(iov_cnt) {
         if iov.iov_len == 0 { continue; }
@@ -1158,10 +1154,10 @@ pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
     if !validate_user_ptr(iov_ptr, iov_size) { return EFAULT; }
     
     let mut kernel_iovs = alloc::vec![IoVec { iov_base: 0, iov_len: 0 }; iov_cnt];
-    if unsafe { copy_from_user_safe(kernel_iovs.as_mut_ptr().cast::<u8>(), iov_ptr as *const u8, iov_size).is_err() } {
+    if copy_from_user(as_user_bytes_mut(&mut kernel_iovs), iov_ptr).is_err() {
         return EFAULT;
     }
-    
+
     let mut total_written: u64 = 0;
     for iov in kernel_iovs.iter().take(iov_cnt) {
         let written = sys_write(fd_num, iov.iov_base, iov.iov_len);
@@ -1180,6 +1176,7 @@ pub(super) fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
         if proc.get_fd(fd).is_none() { return EBADF; }
     } else { return ENOSYS; }
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct Statfs {
         f_type: i64,
         f_bsize: i64,
@@ -1208,7 +1205,7 @@ pub(super) fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
         f_flags: 0,
         f_spare: [0; 4],
     };
-    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, (&raw const st).cast::<u8>(), core::mem::size_of::<Statfs>()).is_err() } {
+    if write_user_val(buf_ptr, &st).is_err() {
         return EFAULT;
     }
     0
@@ -1690,10 +1687,9 @@ akuma_exec::process::FileDescriptor::PipeWrite(_)) => {
         _ => EBADF,
     };
     
-    if res == 0
-        && unsafe { copy_to_user_safe(stat_ptr as *mut u8, (&raw const stat).cast::<u8>(), stat_size).is_err() } {
-            return EFAULT;
-        }
+    if res == 0 && write_user_val(stat_ptr, &stat).is_err() {
+        return EFAULT;
+    }
     res
 }
 
@@ -1802,11 +1798,8 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
         ENOENT
     })();
 
-    if res == 0 {
-        let stat_size = core::mem::size_of::<Stat>();
-        if unsafe { copy_to_user_safe(stat_ptr as *mut u8, (&raw const stat).cast::<u8>(), stat_size).is_err() } {
-            return EFAULT;
-        }
+    if res == 0 && write_user_val(stat_ptr, &stat).is_err() {
+        return EFAULT;
     }
     res
 }
@@ -2054,7 +2047,7 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
         core::ptr::write(p.add(144).cast::<u64>(), 1);
     }
 
-    if unsafe { copy_to_user_safe(buf_ptr as *mut u8, buf.as_ptr(), STATX_SIZE).is_err() } {
+    if copy_to_user(buf_ptr, &buf[..STATX_SIZE]).is_err() {
         return EFAULT;
     }
     0
@@ -2113,7 +2106,7 @@ pub(super) fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
         temp[..cwd_bytes.len()].copy_from_slice(cwd_bytes);
         temp[cwd_bytes.len()] = 0;
         
-        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, temp.as_ptr(), temp.len()).is_err() } {
+        if copy_to_user(buf_ptr, &temp).is_err() {
             return EFAULT;
         }
         return temp.len() as u64;
@@ -2424,7 +2417,7 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
         };
         let bytes = exe.as_bytes();
         let copy_len = bytes.len().min(bufsize);
-        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, bytes.as_ptr(), copy_len).is_err() } {
+        if copy_to_user(buf_ptr, &bytes[..copy_len]).is_err() {
             return EFAULT;
         }
         return copy_len as u64;
@@ -2439,7 +2432,7 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
         if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
         let bytes = target.as_bytes();
         let copy_len = bytes.len().min(bufsize);
-        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, bytes.as_ptr(), copy_len).is_err() } {
+        if copy_to_user(buf_ptr, &bytes[..copy_len]).is_err() {
             return EFAULT;
         }
         return copy_len as u64;
@@ -2515,10 +2508,9 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
             }
         });
     }
-    if written > 0
-        && unsafe { copy_to_user_safe(ptr as *mut u8, kernel_buf.as_ptr(), written).is_err() } {
-            return EFAULT;
-        }
+    if written > 0 && copy_to_user(ptr, &kernel_buf[..written]).is_err() {
+        return EFAULT;
+    }
     written as u64
 }
 

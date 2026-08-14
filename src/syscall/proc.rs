@@ -185,7 +185,7 @@ pub(super) fn sys_uname(buf: u64) -> u64 {
     write_field(&mut kernel_buf, 4, b"aarch64");
     write_field(&mut kernel_buf, 5, b"(none)");
 
-    if unsafe { copy_to_user_safe(buf as *mut u8, kernel_buf.as_ptr(), kernel_buf.len()).is_err() } {
+    if copy_to_user(buf, &kernel_buf).is_err() {
         return EFAULT;
     }
     0
@@ -543,13 +543,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                                 proc.set_cloexec(pidfd_fd as u32);
                             }
                             let fd_i32 = pidfd_fd as i32;
-                            let _ = unsafe {
-                                copy_to_user_safe(
-                                    pidfd_out_ptr as *mut u8,
-                                    (&raw const fd_i32).cast::<u8>(),
-                                    4,
-                                )
-                            };
+                            let _ = write_user_val(pidfd_out_ptr, &fd_i32);
                             crate::tprint!(96, "[clone] CLONE_PIDFD: child={} pidfd={}\n", new_pid, pidfd_fd);
                         }
                     }
@@ -594,7 +588,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
 
 pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
     #[repr(C)]
-    #[derive(Default)]
+    #[derive(Clone, Copy, Default)]
     struct CloneArgs {
         flags: u64,
         pidfd: u64,
@@ -607,12 +601,13 @@ pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
     }
 
     let struct_size = size.min(core::mem::size_of::<CloneArgs>());
-    if !validate_user_ptr(cl_args_ptr, struct_size) {
-        return EFAULT;
-    }
-
     let mut cl_args = CloneArgs::default();
-    if unsafe { copy_from_user_safe((&raw mut cl_args).cast::<u8>(), cl_args_ptr as *const u8, struct_size).is_err() } {
+    if copy_from_user(
+        &mut as_user_bytes_mut(core::slice::from_mut(&mut cl_args))[..struct_size],
+        cl_args_ptr,
+    )
+    .is_err()
+    {
         return EFAULT;
     }
 
@@ -658,9 +653,8 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     if argv_ptr != 0 {
         let mut i = 0;
         loop {
-            if !validate_user_ptr(argv_ptr + i * 8, 8) { break; }
             let mut str_ptr: u64 = 0;
-            if unsafe { copy_from_user_safe((&raw mut str_ptr).cast::<u8>(), (argv_ptr + i * 8) as *const u8, 8).is_err() } {
+            if read_user_into(&mut str_ptr, argv_ptr + i * 8).is_err() {
                 break;
             }
             if str_ptr == 0 { break; }
@@ -912,9 +906,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
     }
 
     const RUSAGE_SIZE: usize = 144;
-    if rusage_ptr != 0 && validate_user_ptr(rusage_ptr, RUSAGE_SIZE) {
+    if rusage_ptr != 0 {
         let zero = [0u8; RUSAGE_SIZE];
-        let _ = unsafe { copy_to_user_safe(rusage_ptr as *mut u8, zero.as_ptr(), RUSAGE_SIZE) };
+        let _ = copy_to_user(rusage_ptr, &zero);
     }
 
     let wnohang = options & 1 != 0;
@@ -942,9 +936,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                         let st = encode_wait_status(code);
                         crate::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", p, code, st);
                     }
-                    if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
+                    if status_ptr != 0 {
                         let status = encode_wait_status(code);
-                        let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, (&raw const status).cast::<u8>(), 4) };
+                        let _ = write_user_val(status_ptr, &status);
                     }
                     // Reap the zombie: remove from process table + child channels.
                     // On Linux, waitpid is the only way to reap a zombie.
@@ -962,9 +956,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 // Double-check after registering to avoid missed wakeup race.
                 if ch.has_exited() {
                     let code = ch.exit_code();
-                    if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
+                    if status_ptr != 0 {
                         let status = encode_wait_status(code);
-                        let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, (&raw const status).cast::<u8>(), 4) };
+                        let _ = write_user_val(status_ptr, &status);
                     }
                     akuma_exec::process::clear_lazy_regions(p);
                     let _ = akuma_exec::process::unregister_process(p);
@@ -996,9 +990,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     let st = encode_wait_status(code);
                     crate::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
                 }
-                if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
+                if status_ptr != 0 {
                     let status = encode_wait_status(code);
-                    let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, (&raw const status).cast::<u8>(), 4) };
+                    let _ = write_user_val(status_ptr, &status);
                 }
                 // Reap the zombie
                 akuma_exec::process::clear_lazy_regions(child_pid);
@@ -1019,9 +1013,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     let st = encode_wait_status(code);
                     crate::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
                 }
-                if status_ptr != 0 && validate_user_ptr(status_ptr, 4) {
+                if status_ptr != 0 {
                     let status = encode_wait_status(code);
-                    let _ = unsafe { copy_to_user_safe(status_ptr as *mut u8, (&raw const status).cast::<u8>(), 4) };
+                    let _ = write_user_val(status_ptr, &status);
                 }
                 // Reap the zombie
                 akuma_exec::process::clear_lazy_regions(child_pid);
@@ -1062,11 +1056,10 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
 
     // Zero siginfo buffer before any early return so Go sees clean data.
     if infop != 0 {
-        if !validate_user_ptr(infop, SIGINFO_SIZE) {
+        let zero = [0u8; SIGINFO_SIZE];
+        if copy_to_user(infop, &zero).is_err() {
             return EFAULT;
         }
-        let zero = [0u8; SIGINFO_SIZE];
-        let _ = unsafe { copy_to_user_safe(infop as *mut u8, zero.as_ptr(), SIGINFO_SIZE) };
     }
 
     let wnohang = (options & WNOHANG) != 0;
@@ -1178,6 +1171,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
             // (`__pad[128 - 2*sizeof(int) - sizeof(long)]`); the kernel's own
             // signal frame writes `si_addr` at offset 16 too.
             #[repr(C)]
+            #[derive(Clone, Copy)]
             struct SigChld {
                 si_signo:  u32,
                 si_errno:  u32,
@@ -1190,11 +1184,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
             let (si_code, si_status) = if code < 0 { (CLD_KILLED, -code) } else { (CLD_EXITED, code) };
             let info = SigChld { si_signo: SIGCHLD, si_errno: 0, si_code, __pad0: 0,
                                  si_pid: child_pid, si_uid: 0, si_status };
-            let _ = unsafe {
-                copy_to_user_safe(infop as *mut u8,
-                                  (&raw const info).cast::<u8>(),
-                                  core::mem::size_of::<SigChld>())
-            };
+            let _ = write_user_val(infop, &info);
         }
         if (options & WNOWAIT) == 0 {
             // Reap the zombie (unless WNOWAIT says "don't consume")
@@ -1211,8 +1201,8 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
 
 pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: u64) -> u64 {
     if old_rlim != 0 {
-        if !validate_user_ptr(old_rlim, 16) { return EFAULT; }
         #[repr(C)]
+        #[derive(Clone, Copy)]
         struct Rlimit {
             rlim_cur: u64,
             rlim_max: u64,
@@ -1227,7 +1217,7 @@ pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: 
             _ => (RLIM_INFINITY, RLIM_INFINITY),
         };
         let rlim = Rlimit { rlim_cur: cur, rlim_max: max };
-        if unsafe { copy_to_user_safe(old_rlim as *mut u8, (&raw const rlim).cast::<u8>(), 16).is_err() } {
+        if write_user_val(old_rlim, &rlim).is_err() {
             return EFAULT;
         }
     }
@@ -1255,7 +1245,7 @@ pub(super) fn sys_sysinfo(info_ptr: usize) -> u64 {
         let memunit_ptr = info.as_mut_ptr().add(104).cast::<u32>();
         core::ptr::write(memunit_ptr, 1);                   // offset 104: mem_unit
     }
-    if unsafe { copy_to_user_safe(info_ptr as *mut u8, info.as_ptr(), 112).is_err() } {
+    if copy_to_user(info_ptr as u64, &info).is_err() {
         return EFAULT;
     }
     0
@@ -1298,7 +1288,7 @@ pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
         let chunk = remaining.min(256);
         let mut kernel_buf = alloc::vec![0u8; chunk];
         if crate::rng::fill_bytes(&mut kernel_buf).is_ok() {
-            if unsafe { copy_to_user_safe(current_ptr as *mut u8, kernel_buf.as_ptr(), chunk).is_err() } {
+            if copy_to_user(current_ptr, &kernel_buf).is_err() {
                 return EFAULT;
             }
         } else {
@@ -1348,10 +1338,8 @@ pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
     let mut args = Vec::new();
     let mut i = 0;
     loop {
-        if !BYPASS_VALIDATION.load(Ordering::Acquire)
-            && !validate_user_ptr(ptr + i * 8, 8) { break; }
         let mut str_ptr: u64 = 0;
-        if unsafe { copy_from_user_safe((&raw mut str_ptr).cast::<u8>(), (ptr + i * 8) as *const u8, 8).is_err() } {
+        if read_user_into(&mut str_ptr, ptr + i * 8).is_err() {
             break;
         }
         if str_ptr == 0 { break; }
@@ -1392,7 +1380,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
         if !BYPASS_VALIDATION.load(Ordering::Acquire)
             && !validate_user_ptr(stdin_ptr, stdin_len) { return EFAULT; }
         let mut data = alloc::vec![0u8; stdin_len];
-        if unsafe { copy_from_user_safe(data.as_mut_ptr(), stdin_ptr as *const u8, stdin_len).is_err() } {
+        if copy_from_user(&mut data, stdin_ptr).is_err() {
             return EFAULT;
         }
         Some(data)
@@ -1423,10 +1411,8 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     };
 
     if options_ptr == 0 { return EINVAL; }
-    if !validate_user_ptr(options_ptr, core::mem::size_of::<SpawnOptions>()) { return EFAULT; }
-
     let mut o = SpawnOptions { cwd_ptr: 0, cwd_len: 0, root_dir_ptr: 0, root_dir_len: 0, args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id: 0 };
-    if unsafe { copy_from_user_safe((&raw mut o).cast::<u8>(), options_ptr as *const u8, core::mem::size_of::<SpawnOptions>()).is_err() } {
+    if read_user_into(&mut o, options_ptr).is_err() {
         return EFAULT;
     }
 
@@ -1445,7 +1431,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
 
     let cwd = if o.cwd_ptr != 0 {
         let mut kernel_cwd = alloc::vec![0u8; o.cwd_len];
-        if unsafe { copy_from_user_safe(kernel_cwd.as_mut_ptr(), o.cwd_ptr as *const u8, o.cwd_len).is_err() } {
+        if copy_from_user(&mut kernel_cwd, o.cwd_ptr).is_err() {
             return EFAULT;
         }
         Some(alloc::string::String::from_utf8(kernel_cwd).unwrap_or_else(|_| String::from("/")))
@@ -1466,7 +1452,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
 
     let stdin_data = if o.stdin_ptr != 0 {
         let mut data = alloc::vec![0u8; o.stdin_len];
-        if unsafe { copy_from_user_safe(data.as_mut_ptr(), o.stdin_ptr as *const u8, o.stdin_len).is_err() } {
+        if copy_from_user(&mut data, o.stdin_ptr).is_err() {
             return EFAULT;
         }
         Some(data)
@@ -1621,7 +1607,7 @@ pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
         && ch.has_exited() {
             if status_ptr != 0 {
                 let status = encode_wait_status(ch.exit_code());
-                if unsafe { copy_to_user_safe(status_ptr as *mut u8, (&raw const status).cast::<u8>(), 4).is_err() } {
+                if write_user_val(status_ptr, &status).is_err() {
                     return EFAULT;
                 }
             }
@@ -1657,7 +1643,7 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
             // Set process name (up to 16 chars including null)
             if arg2 != 0 && validate_user_ptr(arg2, 16) {
                 let mut name_bytes = [0u8; 16];
-                if unsafe { copy_from_user_safe(name_bytes.as_mut_ptr(), arg2 as *const u8, 16).is_err() } {
+                if copy_from_user(&mut name_bytes, arg2).is_err() {
                     return EFAULT;
                 }
                 let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
@@ -1678,7 +1664,7 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
                     let len = name.len().min(15);
                     let mut kernel_buf = [0u8; 16];
                     kernel_buf[..len].copy_from_slice(&name[..len]);
-                    if unsafe { copy_to_user_safe(arg2 as *mut u8, kernel_buf.as_ptr(), 16).is_err() } {
+                    if copy_to_user(arg2, &kernel_buf).is_err() {
                         return EFAULT;
                     }
                 }
@@ -1692,7 +1678,7 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
             // Return 0 (no signal set)
             if arg2 != 0 && validate_user_ptr(arg2, 4) {
                 let zero: i32 = 0;
-                let _ = unsafe { copy_to_user_safe(arg2 as *mut u8, (&raw const zero).cast::<u8>(), 4) };
+                let _ = write_user_val(arg2, &zero);
             }
             0
         }

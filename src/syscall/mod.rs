@@ -7,9 +7,21 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
-use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
+// The folded user-copy API (validate + prefault + copy, safe `fn`s). Re-exported
+// rather than imported per-module: every syscall submodule reaches these through
+// `use super::*`, which is how it already reached the raw pair.
+// `docs/archive/UNSAFE_AUDIT.md` §4 P0.
+pub use akuma_exec::mmu::user_access::{
+    Prefault, as_user_bytes, as_user_bytes_mut, copy_from_user, copy_to_user,
+    copy_to_user_with, read_user_into, read_user_into_with, write_user_val,
+    write_user_val_with,
+};
+// The raw byte-loop primitive. One caller left in this crate's syscall layer:
+// `copy_from_user_byte`, which reads a NUL-terminated string one byte at a time and
+// therefore has no range to validate — see its doc comment.
+use akuma_exec::mmu::user_access::copy_from_user_safe;
 
 #[cfg(feature = "sc-aio")]
 mod aio;
@@ -187,8 +199,12 @@ pub mod syscall_counters {
     }
 }
 
-/// Flag to bypass pointer validation during kernel-originated syscall tests
-pub static BYPASS_VALIDATION: AtomicBool = AtomicBool::new(false);
+/// Flag to bypass pointer validation during kernel-originated syscall tests.
+///
+/// Re-export: the flag moved to `akuma_exec::mmu::user_access` with the check it
+/// disables, so the copy helpers can honour it. The ~50 boot-test call sites keep
+/// spelling it `crate::syscall::BYPASS_VALIDATION`.
+pub use akuma_exec::mmu::user_access::BYPASS_VALIDATION;
 
 /// Syscall numbers (Linux-compatible subset)
 pub mod nr {
@@ -425,7 +441,10 @@ fn net_enetdown() -> u64 {
     neg_errno(akuma_net::socket::libc_errno::ENETDOWN)
 }
 
+/// `Copy` is what `read_user_into`/`write_user_val` take as the marker for "plain
+/// ABI data, safe to move byte-wise" — two `i64`s qualify.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
@@ -440,153 +459,44 @@ pub fn user_va_limit_value() -> u64 {
 /// Exposed for kernel tests only — see `test_ensure_user_pages_mapped_as_lock`.
 #[cfg(kernel_tests)]
 pub fn ensure_user_pages_mapped_for_test(start: usize, len: usize) -> bool {
-    ensure_user_pages_mapped(start, len)
+    akuma_exec::mmu::user_access::prefault_user_range(start, len)
 }
 
+/// The 48-bit user VA limit. Now `akuma_exec::mmu::user_access::USER_VA_LIMIT` —
+/// see there for why it is not a smaller cap (Go's high arenas).
 fn user_va_limit() -> u64 {
-    // Allow the full user (TTBR0) address range.
-    //
-    // Go on AArch64 allocates goroutine stacks and M-structs from high arenas
-    // (e.g. 0x203e000000 ≈ 130 GB) via mmap, so any fixed small cap (4 GB,
-    // stack_top, …) rejects valid user pointers.
-    //
-    // The kernel's own addresses live in the TTBR1 range (top half of 64-bit
-    // space, bit 63 = 1), so excluding those is the only necessary upper bound.
-    // The real safety for arbitrary pointers is is_current_user_range_mapped
-    // (the page-table walk below) plus the EL1 data-abort recovery path.
-    0x0000_FFFF_FFFF_FFFFu64 // 48-bit user VA limit (standard Linux)
+    akuma_exec::mmu::user_access::USER_VA_LIMIT
 }
 
-fn validate_user_ptr(ptr: u64, len: usize) -> bool {
-    if BYPASS_VALIDATION.load(Ordering::Acquire) { return true; }
-    if ptr < 0x1000 { return false; }
-    let end = match ptr.checked_add(len as u64) {
-        Some(e) => e,
-        None => return false,
-    };
-    // NOTE: We intentionally do NOT exclude the kernel physical VA range
-    // (0x4000_0000-0x6000_0000) here because Bun's JSC mmap starts at
-    // 0x50000000 which overlaps with that range.  The EL1 data-abort recovery
-    // in rust_sync_el1_handler is the correct safety net: if the kernel ever
-    // writes to a user VA that isn't mapped, EC=0x25 kills the process
-    // gracefully instead of panicking the kernel.
-    if end > user_va_limit() { return false; }
-
-    if !akuma_exec::mmu::is_current_user_range_mapped(ptr as usize, len)
-        && !ensure_user_pages_mapped(ptr as usize, len) {
-            return false;
-        }
-
-    true
-}
-
-/// Demand-page any lazy user pages covering `[start, start+len)` so a kernel-side
-/// access (`validate_user_ptr`'s callers) can touch them.
+/// Validate a user pointer range, faulting lazy pages in.
 ///
-/// **Phase 7f pre-flight**: this helper runs inside BKL-free syscall windows (every
-/// whole-fn net/vfs guard reaches it through `validate_user_ptr`, and the opt-out
-/// list made `getrandom`'s prologue join that class), so the BKL no longer serializes
-/// its PTE installs against a peer core. Each page's PTE install + frame bookkeeping
-/// therefore runs under the address space's `as_lock`, the same fix Phase 7e applied
-/// to the three signal-path PTE sites. Frame allocation and the file fill stay
-/// OUTSIDE that hold: the hold masks IRQs and `as_lock` is a non-reentrant
-/// `Spinlock`, so block I/O must never run under it, and the PMM's pressure path
-/// (`reclaim_clean_file_pages`) re-enters `as_lock` per page.
-fn ensure_user_pages_mapped(start: usize, len: usize) -> bool {
-    let page_start = start & !0xFFF;
-    let page_end = (start + len + 0xFFF) & !0xFFF;
-    // The `as_lock` guarding THIS address space's page tables lives on the
-    // thread-group leader that owns the L0 root — a CLONE_VM sibling gets a fresh
-    // `as_lock` from `fork_process`, so holding the current thread's would exclude
-    // nothing (`process/bkl_guard.rs`'s rule 1). Resolved once for the whole range;
-    // it cannot change under us, this is our own address space.
-    let as_lock_owner = akuma_exec::process::address_space_owner_pid_for_fault()
-        .and_then(akuma_exec::process::lookup_process_shared);
-    let mut va = page_start;
-    while va < page_end {
-        if !akuma_exec::mmu::is_current_user_page_mapped(va) {
-            if let Some((flags, source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup(va) {
-                let map_flags = match &source {
-                    akuma_exec::process::LazySource::File { .. } => {
-                        if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RW_NO_EXEC }
-                    }
-                    _ => akuma_exec::mmu::user_flags::RW_NO_EXEC,
-                };
-                if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
-                    if let akuma_exec::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
-                        let pg_data_start = core::cmp::max(va, segment_va);
-                        let pg_data_end = core::cmp::min(va + 0x1000, segment_va + filesz);
-                        if pg_data_start < pg_data_end {
-                            let dst_off = pg_data_start - va;
-                            let file_off = file_offset + (pg_data_start - segment_va);
-                            let read_len = pg_data_end - pg_data_start;
-                            let page_ptr = akuma_exec::mmu::phys_to_virt(page_frame.addr);
-                            let page_buf = unsafe {
-                                core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), read_len)
-                            };
-                            if inode != 0 {
-                                let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
-                            } else {
-                                let _ = crate::vfs::read_at(path, file_off, page_buf);
-                            }
-                        }
-                    }
-                    // Everything above (alloc + file fill) ran with no `as_lock` held.
-                    // The PTE install and the frame bookkeeping must be atomic against
-                    // a peer core's page-table edit on this same page — in particular
-                    // against `reclaim_clean_file_pages`, whose `try_evict_ro_page`
-                    // clears a live RO PTE and only returns the frame if it is already
-                    // tracked. Installing outside the hold lets it observe the
-                    // mapped-but-untracked instant: it clears our PTE, declines to free
-                    // (untracked), and we then track a frame that is no longer mapped —
-                    // a re-fault leak. One hold per page, never spanning the loop.
-                    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-                    let owner = akuma_exec::process::lookup_process_shared(owner_pid);
-                    let install = || {
-                        let (table_frames, installed) = unsafe {
-                            akuma_exec::mmu::map_user_page(va, page_frame.addr, map_flags)
-                        };
-                        if let Some(owner) = owner {
-                            if installed {
-                                owner.address_space.track_user_frame(page_frame);
-                            }
-                            for tf in &table_frames {
-                                owner.address_space.track_page_table_frame(*tf);
-                            }
-                        }
-                        (table_frames, installed)
-                    };
-                    let (table_frames, installed) = match as_lock_owner {
-                        Some(leader) => leader.with_as_locked(install),
-                        None => install(),
-                    };
-                    // Frees run after the hold is released. Ownership rule, matching
-                    // `exceptions.rs`'s `ensure_user_page_mapped` sibling: the data
-                    // frame goes back to the PMM iff the PTE CAS race was lost (nothing
-                    // mapped it) or there is no owner to track it. The previous version
-                    // freed it iff `installed && owner.is_none()`, which leaked the
-                    // frame on every lost CAS race with a live owner.
-                    if !installed || owner.is_none() {
-                        crate::pmm::free_page(page_frame);
-                    }
-                    if owner.is_none() {
-                        for tf in table_frames { crate::pmm::free_page(tf); }
-                    }
-                } else {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-        va += 4096;
-    }
-    true
+/// Thin forwarder: the body — the range tests *and* the demand-paging half — moved
+/// to `akuma_exec::mmu::user_access` so the copy helpers could fold it in and stop
+/// being skippable (`docs/archive/UNSAFE_AUDIT.md` §4 P0). Kept as a named function
+/// because plenty of syscall arms validate a pointer they never copy through
+/// (`futex` addresses, `mmap` args), and because `Prefault::Yes` is the right
+/// default for every caller on a syscall stack.
+fn validate_user_ptr(ptr: u64, len: usize) -> bool {
+    akuma_exec::mmu::user_access::validate_user_range(
+        ptr,
+        len,
+        akuma_exec::mmu::user_access::Prefault::Yes,
+    )
 }
 
 /// Safely read a single byte from user memory.
+///
+/// **The one deliberate raw-copy caller left in the syscall layer.** Its only user is
+/// [`copy_from_user_str`], which walks a NUL-terminated string one byte at a time —
+/// and the length of a NUL-terminated string is not known until it has been read, so
+/// there is no range to validate. Routing each byte through `copy_from_user` would
+/// page-table-walk **per byte**: 4096 walks for a `PATH_MAX` path. The string reader
+/// does its own per-byte limit check and relies on the byte loop's fixup for
+/// mapped-ness, which is the correct shape for an unknown-length read.
 pub fn copy_from_user_byte(ptr: u64) -> Result<u8, u64> {
     let mut b: u8 = 0;
+    // SAFETY: one byte into a live local; the user side is covered by the recovery
+    // trampoline, and `copy_from_user_str` bounds `ptr` against the VA limit.
     if unsafe { copy_from_user_safe(&raw mut b, ptr as *const u8, 1).is_err() } {
         return Err(EFAULT);
     }
@@ -926,9 +836,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         118 => { 0 }
         119 => {
             let param_ptr = args[1] as usize;
-            if param_ptr != 0 && validate_user_ptr(param_ptr as u64, 4) {
+            if param_ptr != 0 {
                 let zero: i32 = 0;
-                let _ = unsafe { copy_to_user_safe(param_ptr as *mut u8, (&raw const zero).cast::<u8>(), 4) };
+                let _ = write_user_val(param_ptr as u64, &zero);
             }
             0
         }
@@ -966,7 +876,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 let nr_cpus: usize = 1;
                 let mask: u64 = if nr_cpus >= 64 { u64::MAX } else { (1u64 << nr_cpus).wrapping_sub(1) };
                 unsafe { core::ptr::write(kernel_mask.as_mut_ptr().cast::<u64>(), mask); }
-                let _ = unsafe { copy_to_user_safe(mask_ptr as *mut u8, kernel_mask.as_ptr(), cpusetsize) };
+                let _ = copy_to_user(mask_ptr as u64, &kernel_mask);
                 // Linux returns the number of bytes placed in the mask, and
                 // musl's `sched_getaffinity` wrapper zeroes the remainder based
                 // on this count (`if (r < size) memset(mask+r, 0, size-r)`).
@@ -987,9 +897,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         nr::CAPGET => {
             let data_ptr = args[1] as usize;
-            if data_ptr != 0 && validate_user_ptr(args[1], 24) {
+            if data_ptr != 0 {
                 let zero = [0u8; 24];
-                let _ = unsafe { copy_to_user_safe(data_ptr as *mut u8, zero.as_ptr(), 24) };
+                let _ = copy_to_user(data_ptr as u64, &zero);
             }
             0
         }

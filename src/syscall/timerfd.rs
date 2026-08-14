@@ -1,5 +1,4 @@
 use super::*;
-use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 use alloc::collections::{BTreeMap, BTreeSet};
 
 struct TimerFdState {
@@ -31,7 +30,7 @@ struct LocalTimespec {
 fn timespec_to_us_safe(ptr: usize) -> Result<u64, u64> {
     if ptr == 0 { return Ok(0); }
     let mut ts = LocalTimespec::default();
-    if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), ptr as *const u8, 16).is_err() } {
+    if read_user_into(&mut ts, ptr as u64).is_err() {
         return Err(EFAULT);
     }
     Ok(ts.tv_sec * 1_000_000 + ts.tv_nsec / 1_000)
@@ -42,7 +41,7 @@ fn us_to_timespec_safe(us: u64, ptr: usize) -> Result<(), u64> {
         tv_sec: us / 1_000_000,
         tv_nsec: (us % 1_000_000) * 1_000,
     };
-    if unsafe { copy_to_user_safe(ptr as *mut u8, (&raw const ts).cast::<u8>(), 16).is_err() } {
+    if write_user_val(ptr as u64, &ts).is_err() {
         return Err(EFAULT);
     }
     Ok(())
@@ -83,9 +82,6 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
     let mut table = TIMERFD_TABLE.lock();
 
     if old_value != 0 {
-        if !validate_user_ptr(old_value as u64, 32) {
-            return EFAULT;
-        }
         if let Some(state) = table.get(&timer_id) {
             let now = crate::timer::uptime_us();
             let elapsed = now.saturating_sub(state.armed_at_us);
@@ -95,13 +91,11 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
             if us_to_timespec_safe(remaining, old_value + 16).is_err() { return EFAULT; }         // it_value (remaining time)
         } else {
             let zero = [0u8; 32];
-            if unsafe { copy_to_user_safe(old_value as *mut u8, zero.as_ptr(), 32).is_err() } {
+            if copy_to_user(old_value as u64, &zero).is_err() {
                 return EFAULT;
             }
         }
     }
-
-    if !validate_user_ptr(new_value as u64, 32) { return EFAULT; }
 
     // struct itimerspec { struct timespec it_interval; struct timespec it_value; }
     // it_interval is at offset 0, it_value (initial) is at offset 16
@@ -153,7 +147,7 @@ pub(super) fn sys_timerfd_gettime(fd_arg0: u64, out_ptr: u64) -> u64 {
             if us_to_timespec_safe(remaining, out + 16).is_err() { return EFAULT; }
         } else {
             let zero = [0u8; 32];
-            if unsafe { copy_to_user_safe(out as *mut u8, zero.as_ptr(), 32).is_err() } {
+            if copy_to_user(out as u64, &zero).is_err() {
                 return EFAULT;
             }
         }

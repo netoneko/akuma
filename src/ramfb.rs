@@ -139,7 +139,11 @@ pub fn draw(src: &[u8]) -> usize {
 }
 
 /// Framebuffer info returned to userspace
+///
+/// `Copy` is the marker `write_user_val` uses for "plain ABI data, safe to copy out
+/// byte-wise" — four `u32`s qualify.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct FBInfo {
     pub width: u32,
     pub height: u32,

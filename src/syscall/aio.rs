@@ -43,14 +43,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
     // Linux requires *ctx_idp == 0 before the call; only return EEXIST if it
     // refers to a live context.  Bun may pass uninitialized memory here.
     let mut existing: u64 = 0;
-    if unsafe {
-        copy_from_user_safe(
-            (&raw mut existing).cast::<u8>(),
-            ctx_idp as *const u8,
-            8,
-        )
-        .is_err()
-    } {
+    if read_user_into(&mut existing, ctx_idp).is_err() {
         return EFAULT;
     }
     if existing != 0 {
@@ -115,14 +108,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
     });
 
     let ring_va_u64 = ring_va as u64;
-    if unsafe {
-        copy_to_user_safe(
-            ctx_idp as *mut u8,
-            (&raw const ring_va_u64).cast::<u8>(),
-            8,
-        )
-        .is_err()
-    } {
+    if write_user_val(ctx_idp, &ring_va_u64).is_err() {
         crate::irq::with_irqs_disabled(|| {
             AIO_CONTEXTS.lock().remove(&ring_va_u64);
         });

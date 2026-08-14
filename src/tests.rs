@@ -7332,7 +7332,11 @@ fn test_safe_user_access_fault() -> bool {
     let invalid_addr = (akuma_exec::mmu::kernel_va_end() + 0x4000_0000) as *mut u8;
     let kernel_buf = [0u8; 16];
     
-    // This should NOT crash/kill kernel, but return Err(14) (EFAULT)
+    // This should NOT crash/kill kernel, but return Err(14) (EFAULT).
+    //
+    // Deliberately the RAW primitive, not `copy_to_user`: what this test exercises is
+    // the byte loop's fault-recovery trampoline, and the folded API would reject this
+    // address at the range check and never reach the copy at all.
     let res = unsafe { akuma_exec::mmu::user_access::copy_to_user_safe(invalid_addr, kernel_buf.as_ptr(), 16) };
     
     let ok = match res {

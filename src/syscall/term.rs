@@ -1,6 +1,5 @@
 use super::*;
 use akuma_terminal::mode_flags;
-use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const TCGETS: u32 = 0x5401;
@@ -31,16 +30,14 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
 
     match cmd {
         FIONBIO => {
-            if !validate_user_ptr(arg, 4) { return EFAULT; }
             let mut val: i32 = 0;
-            if unsafe { copy_from_user_safe((&raw mut val).cast::<u8>(), arg as *const u8, 4).is_err() } {
+            if read_user_into(&mut val, arg).is_err() {
                 return EFAULT;
             }
             if val != 0 { proc.set_nonblock(fd); } else { proc.clear_nonblock(fd); }
             return 0;
         }
         FIONREAD => {
-            if !validate_user_ptr(arg, 4) { return EFAULT; }
             let fd_entry = proc.get_fd(fd);
             let count: i32 = match fd_entry {
                 Some(akuma_exec::process::FileDescriptor::PipeRead(pipe_id)) => {
@@ -71,7 +68,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 Some(akuma_exec::process::FileDescriptor::PipeWrite(_)) => 0,
                 _ => 0,
             };
-            if unsafe { copy_to_user_safe(arg as *mut u8, (&raw const count).cast::<u8>(), 4).is_err() } {
+            if write_user_val(arg, &count).is_err() {
                 return EFAULT;
             }
             return 0;
@@ -95,9 +92,8 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             // its own state; it must target the CHILD's. That child's state is
             // an Arc shared with all its descendants (shell → vi), so the update
             // reaches any full-screen app under the session via TIOCGWINSZ.
-            if !validate_user_ptr(arg, 8) { return EFAULT; }
             let mut winsz = [0u16; 4];
-            if unsafe { copy_from_user_safe(winsz.as_mut_ptr().cast::<u8>(), arg as *const u8, 8).is_err() } {
+            if copy_from_user(as_user_bytes_mut(&mut winsz), arg).is_err() {
                 return EFAULT;
             }
             let height = winsz[0];
@@ -133,9 +129,8 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             if !matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevDsp)) {
                 return ENOTTY; // not a dsp fd
             }
-            if !validate_user_ptr(arg, 4) { return EFAULT; }
             let mut val: i32 = 0;
-            if unsafe { copy_from_user_safe((&raw mut val).cast::<u8>(), arg as *const u8, 4).is_err() } {
+            if read_user_into(&mut val, arg).is_err() {
                 return EFAULT;
             }
             let res = match cmd {
@@ -148,7 +143,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 return EINVAL;
             }
             // Echo the accepted value back (OSS contract).
-            if unsafe { copy_to_user_safe(arg as *mut u8, (&raw const val).cast::<u8>(), 4).is_err() } {
+            if write_user_val(arg, &val).is_err() {
                 return EFAULT;
             }
             return 0;
@@ -198,19 +193,18 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             unsafe {
                 core::ptr::copy_nonoverlapping(ts.cc.as_ptr(), kernel_buf[4..].as_mut_ptr().cast::<u8>(), 20);
             }
-            if unsafe { copy_to_user_safe(arg as *mut u8, kernel_buf.as_ptr().cast::<u8>(), 36).is_err() } {
+            if copy_to_user_with(arg, as_user_bytes(&kernel_buf), Prefault::No).is_err() {
                 return EFAULT;
             }
             0
         }
         TCSETS | TCSETSW | TCSETSF => {
-            if !validate_user_ptr(arg, 36) { return EFAULT; }
             let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
                 None => return ENOMEM,
             };
             let mut kernel_buf = [0u32; 9];
-            if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr().cast::<u8>(), arg as *const u8, 36).is_err() } {
+            if copy_from_user(&mut as_user_bytes_mut(&mut kernel_buf)[..36], arg).is_err() {
                 return EFAULT;
             }
             let mut ts = term_state_lock.lock();
@@ -244,7 +238,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             };
             let ts = term_state_lock.lock();
             let kernel_winsz = [ts.term_height, ts.term_width, 0, 0];
-            if unsafe { copy_to_user_safe(arg as *mut u8, kernel_winsz.as_ptr().cast::<u8>(), 8).is_err() } {
+            if copy_to_user_with(arg, as_user_bytes(&kernel_winsz), Prefault::No).is_err() {
                 return EFAULT;
             }
             0
@@ -260,19 +254,18 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(128, "[syscall] TIOCGPGRP: returning foreground_pgid {}\n", pgid);
             }
-            if unsafe { copy_to_user_safe(arg as *mut u8, (&raw const pgid).cast::<u8>(), 4).is_err() } {
+            if write_user_val_with(arg, &pgid, Prefault::No).is_err() {
                 return EFAULT;
             }
             0
         }
         TIOCSPGRP => {
-            if !validate_user_ptr(arg, 4) { return EFAULT; }
             let term_state_lock = match akuma_exec::process::current_terminal_state() {
                 Some(state) => state,
                 None => return ENOMEM,
             };
             let mut pgid: u32 = 0;
-            if unsafe { copy_from_user_safe((&raw mut pgid).cast::<u8>(), arg as *const u8, 4).is_err() } {
+            if read_user_into(&mut pgid, arg).is_err() {
                 return EFAULT;
             }
             let mut ts = term_state_lock.lock();
@@ -341,7 +334,7 @@ pub(super) fn sys_get_terminal_attributes(_fd: u64, attr_ptr: u64) -> u64 {
 
     let term_state = term_state_lock.lock();
     let val = term_state.mode_flags;
-    if unsafe { copy_to_user_safe(attr_ptr as *mut u8, (&raw const val).cast::<u8>(), 8).is_err() } {
+    if write_user_val_with(attr_ptr, &val, Prefault::No).is_err() {
         return EFAULT;
     }
 
@@ -448,7 +441,7 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
     }
 
     if bytes_read > 0 {
-        if unsafe { copy_to_user_safe(buf_ptr as *mut u8, kernel_buf.as_ptr(), bytes_read).is_err() } {
+        if copy_to_user(buf_ptr, &kernel_buf[..bytes_read]).is_err() {
             return EFAULT;
         }
         bytes_read as u64
@@ -490,7 +483,7 @@ pub(super) fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
             for b in &mut stat.name[to_copy..] { *b = 0; }
         }
 
-        if unsafe { copy_to_user_safe((ptr as usize + i * stat_size) as *mut u8, (&raw const stat).cast::<u8>(), stat_size).is_err() } {
+        if write_user_val(ptr + (i * stat_size) as u64, &stat).is_err() {
             return EFAULT;
         }
     }

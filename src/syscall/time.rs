@@ -1,5 +1,4 @@
 use super::*;
-use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 use akuma_exec::threading::MAX_THREADS;
 
 #[repr(C)]
@@ -135,27 +134,13 @@ pub(super) fn sys_setitimer(which: u32, new_ptr: u64, old_ptr: u64) -> u64 {
                 tv_usec: remaining % 1_000_000,
             },
         };
-        let _ = unsafe {
-            copy_to_user_safe(
-                old_ptr as *mut u8,
-                (&raw const old).cast::<u8>(),
-                core::mem::size_of::<LocalItimerval>(),
-            )
-        };
+        let _ = write_user_val(old_ptr, &old);
     }
 
     // Read and apply new timer state if requested
     if new_ptr != 0 {
         let mut new_val = LocalItimerval::default();
-        if unsafe {
-            copy_from_user_safe(
-                (&raw mut new_val).cast::<u8>(),
-                new_ptr as *const u8,
-                core::mem::size_of::<LocalItimerval>(),
-            )
-        }
-        .is_err()
-        {
+        if read_user_into(&mut new_val, new_ptr).is_err() {
             return crate::syscall::EFAULT;
         }
 
@@ -188,14 +173,8 @@ pub(super) fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
         if let Some(elr) = akuma_exec::threading::current_trap_frame_elr() {
             let mut instr_before = [0u8; 4];
             let mut instr_at = [0u8; 4];
-            let ok_before = elr >= 4 && unsafe {
-                akuma_exec::mmu::user_access::copy_from_user_safe(
-                    instr_before.as_mut_ptr(), (elr - 4) as *const u8, 4).is_ok()
-            };
-            let ok_at = unsafe {
-                akuma_exec::mmu::user_access::copy_from_user_safe(
-                    instr_at.as_mut_ptr(), elr as *const u8, 4).is_ok()
-            };
+            let ok_before = elr >= 4 && read_user_into(&mut instr_before, elr - 4).is_ok();
+            let ok_at = read_user_into(&mut instr_at, elr).is_ok();
             let before_word = u32::from_le_bytes(instr_before);
             let at_word = u32::from_le_bytes(instr_at);
             crate::safe_print!(192,
@@ -208,8 +187,6 @@ pub(super) fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
     }
     let clock_id = clock_id_arg as u32;
 
-    if !validate_user_ptr(tp_ptr, 16) { return EFAULT; }
-
     let (sec, nsec) = if clock_id == 0 {
         let us = crate::timer::utc_time_us().unwrap_or(0);
         ((us / 1_000_000) as u64, ((us % 1_000_000) * 1_000) as u64)
@@ -219,7 +196,7 @@ pub(super) fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
     };
 
     let ts = LocalTimespec { tv_sec: sec, tv_nsec: nsec };
-    if unsafe { copy_to_user_safe(tp_ptr as *mut u8, (&raw const ts).cast::<u8>(), 16).is_err() } {
+    if write_user_val(tp_ptr, &ts).is_err() {
         return EFAULT;
     }
     0
@@ -227,9 +204,9 @@ pub(super) fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
 
 pub(super) fn sys_clock_getres(clock_id: u32, res_ptr: usize) -> u64 {
     let _ = clock_id;
-    if res_ptr != 0 && validate_user_ptr(res_ptr as u64, 16) {
+    if res_ptr != 0 {
         let ts = LocalTimespec { tv_sec: 0, tv_nsec: 1 };
-        let _ = unsafe { copy_to_user_safe(res_ptr as *mut u8, (&raw const ts).cast::<u8>(), 16) };
+        let _ = write_user_val(res_ptr as u64, &ts);
     }
     0
 }
@@ -239,13 +216,9 @@ pub(super) fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
     // - Linux/musl: a0 = pointer to struct timespec {tv_sec, tv_nsec}
     // - libakuma:   a0 = seconds (raw), a1 = nanoseconds (raw)
     // Distinguish by checking if a0 looks like a user-space pointer (>= PAGE_SIZE).
-    let (sec, nsec) = if a0 >= 4096 && validate_user_ptr(a0, 16) {
-        let mut ts = LocalTimespec::default();
-        if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), a0 as *const u8, 16).is_ok() } {
-            (ts.tv_sec, ts.tv_nsec)
-        } else {
-            (a0, a1)
-        }
+    let mut ts = LocalTimespec::default();
+    let (sec, nsec) = if a0 >= 4096 && read_user_into(&mut ts, a0).is_ok() {
+        (ts.tv_sec, ts.tv_nsec)
     } else {
         (a0, a1)
     };
@@ -275,9 +248,8 @@ pub(super) fn sys_clock_nanosleep(clock_id: u32, flags: i32, request_ptr: u64, r
     const TIMER_ABSTIME: i32 = 1;
     let _ = remain_ptr; // Linux only fills this on an interrupted *relative* sleep; sys_nanosleep doesn't either.
 
-    if !validate_user_ptr(request_ptr, 16) { return EFAULT; }
     let mut ts = LocalTimespec::default();
-    if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), request_ptr as *const u8, 16).is_err() } {
+    if read_user_into(&mut ts, request_ptr).is_err() {
         return EFAULT;
     }
     let req_us = (ts.tv_sec.saturating_mul(1_000_000)).saturating_add(ts.tv_nsec / 1_000);
@@ -312,9 +284,8 @@ pub(super) fn sys_clock_nanosleep(clock_id: u32, flags: i32, request_ptr: u64, r
 pub(super) fn sys_times(buf_ptr: usize) -> u64 {
     if buf_ptr != 0 {
         const TMS_SIZE: usize = 32;
-        if !validate_user_ptr(buf_ptr as u64, TMS_SIZE) { return EFAULT; }
         let zero = [0u8; TMS_SIZE];
-        let _ = unsafe { copy_to_user_safe(buf_ptr as *mut u8, zero.as_ptr(), TMS_SIZE) };
+        if copy_to_user(buf_ptr as u64, &zero).is_err() { return EFAULT; }
     }
     let uptime_us = crate::timer::uptime_us();
     uptime_us / 10_000 
@@ -322,9 +293,8 @@ pub(super) fn sys_times(buf_ptr: usize) -> u64 {
 
 pub(super) fn sys_getrusage(who: i32, usage_ptr: usize) -> u64 {
     const RUSAGE_SIZE: usize = 144;
-    if !validate_user_ptr(usage_ptr as u64, RUSAGE_SIZE) { return EFAULT; }
     let zero = [0u8; RUSAGE_SIZE];
-    let _ = unsafe { copy_to_user_safe(usage_ptr as *mut u8, zero.as_ptr(), RUSAGE_SIZE) };
+    if copy_to_user(usage_ptr as u64, &zero).is_err() { return EFAULT; }
     let _ = who;
     0
 }

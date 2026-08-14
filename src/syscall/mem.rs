@@ -719,10 +719,10 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             let mut total_copied = 0;
             while total_copied < copy_len {
                 let chunk = (copy_len - total_copied).min(kernel_buf.len());
-                if unsafe { copy_from_user_safe(kernel_buf.as_mut_ptr(), (old_addr + total_copied) as *const u8, chunk).is_err() } {
-                    break; 
+                if copy_from_user(&mut kernel_buf[..chunk], (old_addr + total_copied) as u64).is_err() {
+                    break;
                 }
-                if unsafe { copy_to_user_safe((new_addr + total_copied) as *mut u8, kernel_buf.as_ptr(), chunk).is_err() } {
+                if copy_to_user((new_addr + total_copied) as u64, &kernel_buf[..chunk]).is_err() {
                     break;
                 }
                 total_copied += chunk;

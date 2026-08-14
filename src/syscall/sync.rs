@@ -1,5 +1,4 @@
 use super::*;
-use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 /// Each waiter is recorded as `(handle, bitset)`. The bitset is `FUTEX_BITSET_MATCH_ANY`
 /// (`0xFFFFFFFF`) for plain `FUTEX_WAIT`/`FUTEX_WAKE`, or `val3` for `FUTEX_WAIT_BITSET`.
@@ -45,7 +44,13 @@ use akuma_exec::threading::{WakeHandle, current_wake_handle, wake_by_handle};
 /// pages — can never unmap it underneath us. A fault there therefore means userspace
 /// raced an `munmap` against its own `FUTEX_WAIT`, and with the lazy region gone
 /// `try_resolve_el1_user_copy_lazy_fault` declines the fault, so it resolves through
-/// `copy_from_user_safe`'s fixup to `EFAULT` rather than demand-paging under the hold.
+/// the byte loop's fixup to `EFAULT` rather than demand-paging under the hold.
+///
+/// That requirement is now stated in the code rather than only here: the in-hold read
+/// passes `Prefault::No`, so the copy helper range-checks (a read-only page-table walk,
+/// safe under the hold) and refuses to demand-page. Changing it to `Prefault::Yes`
+/// would allocate frames, take `as_lock` and possibly read a file with IRQs masked
+/// and this spinlock held.
 static FUTEX_WAITERS: Spinlock<BTreeMap<(u32, usize), Vec<Waiter>>> = Spinlock::new(BTreeMap::new());
 
 const BITSET_MATCH_ANY: u32 = 0xFFFFFFFF;
@@ -371,7 +376,7 @@ fn futex_check_and_enqueue(
     let r = crate::irq::with_irqs_disabled(|| {
         let mut waiters = FUTEX_WAITERS.lock();
         let mut current_val: u32 = 0;
-        if unsafe { copy_from_user_safe((&raw mut current_val).cast::<u8>(), uaddr as *const u8, 4).is_err() } {
+        if read_user_into_with(&mut current_val, uaddr as u64, Prefault::No).is_err() {
             return Err(EFAULT);
         }
         if current_val != val {
@@ -781,7 +786,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                     return EFAULT;
                 }
                 let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-                if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), timeout_ptr as *const u8, 16).is_err() } {
+                if read_user_into(&mut ts, timeout_ptr).is_err() {
                     // Remove ourselves from the waiter queue before returning.
                     futex_dequeue(key, tid);
                     return EFAULT;
@@ -1006,7 +1011,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
 
             // Check current value matches expected
             let mut current_val: u32 = 0;
-            if unsafe { copy_from_user_safe((&raw mut current_val).cast::<u8>(), uaddr as *const u8, 4).is_err() } {
+            if read_user_into(&mut current_val, uaddr as u64).is_err() {
                 return EFAULT;
             }
             if current_val != val3 {
@@ -1052,7 +1057,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             // own syscall entry and the page is validated above, so a plain RMW is
             // sufficient here (and is what the WAKE_OP probes exercise).
             let mut oldval: u32 = 0;
-            if unsafe { copy_from_user_safe((&raw mut oldval).cast::<u8>(), uaddr2 as *const u8, 4).is_err() } {
+            if read_user_into(&mut oldval, uaddr2 as u64).is_err() {
                 return EFAULT;
             }
             let newval: u32 = match op {
@@ -1063,7 +1068,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 4 => oldval ^ oparg,                 // FUTEX_OP_XOR
                 _ => return ENOSYS,
             };
-            if unsafe { copy_to_user_safe(uaddr2 as *mut u8, (&raw const newval).cast::<u8>(), 4).is_err() } {
+            if write_user_val(uaddr2 as u64, &newval).is_err() {
                 return EFAULT;
             }
 
@@ -1104,14 +1109,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             // corruption path hits it.
             if let Some(elr) = akuma_exec::threading::current_trap_frame_elr() {
                 let mut buf = [0u8; 12];
-                let read_ok = unsafe {
-                    akuma_exec::mmu::user_access::copy_from_user_safe(
-                        buf.as_mut_ptr(),
-                        elr.wrapping_sub(8) as *const u8,
-                        12,
-                    )
-                    .is_ok()
-                };
+                let read_ok = copy_from_user(&mut buf, elr.wrapping_sub(8)).is_ok();
                 if read_ok {
                     let pre = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]); // elr-8
                     let svc = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]); // elr-4

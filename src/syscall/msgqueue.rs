@@ -1,7 +1,6 @@
 use super::*;
 use alloc::collections::{BTreeMap as PollerMap, VecDeque};
 use akuma_exec::threading::{WakeHandle, wake_by_handle, wake_handle_for_thread};
-use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 const IPC_PRIVATE: i32 = 0;
 const IPC_CREAT: i32 = 0o1000;
@@ -100,9 +99,6 @@ pub fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
             0
         }
         IPC_STAT => {
-            if !validate_user_ptr(buf, 112) {
-                return EFAULT;
-            }
             let (key, mode, cbytes, qnum) = crate::irq::with_irqs_disabled(|| {
                 let table = MSGQUEUE_TABLE.lock();
                 if let Some(q) = table.get(&(box_id, msqid)) {
@@ -124,17 +120,14 @@ pub fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
             ds[80..88].copy_from_slice(&(qnum as u64).to_ne_bytes());
             // msg_qbytes (u64 at offset 88)
             ds[88..96].copy_from_slice(&(MSGMNB as u64).to_ne_bytes());
-            if unsafe { copy_to_user_safe(buf as *mut u8, ds.as_ptr(), 112).is_err() } {
+            if copy_to_user(buf, &ds).is_err() {
                 return EFAULT;
             }
             0
         }
         IPC_SET => {
-            if !validate_user_ptr(buf, 112) {
-                return EFAULT;
-            }
             let mut ds = [0u8; 112];
-            if unsafe { copy_from_user_safe(ds.as_mut_ptr(), buf as *const u8, 112).is_err() } {
+            if copy_from_user(&mut ds, buf).is_err() {
                 return EFAULT;
             }
             let mode = u32::from(u16::from_ne_bytes([ds[20], ds[21]]));
@@ -161,7 +154,7 @@ pub fn sys_msgsnd(msqid: u32, msgp: u64, msgsz: usize, flags: i32) -> u64 {
         return EFAULT;
     }
     let mut mtype_bytes = [0u8; 8];
-    if unsafe { copy_from_user_safe(mtype_bytes.as_mut_ptr(), msgp as *const u8, 8).is_err() } {
+    if copy_from_user(&mut mtype_bytes, msgp).is_err() {
         return EFAULT;
     }
     let mtype = i64::from_ne_bytes(mtype_bytes);
@@ -169,7 +162,7 @@ pub fn sys_msgsnd(msqid: u32, msgp: u64, msgsz: usize, flags: i32) -> u64 {
         return EINVAL;
     }
     let mut data = alloc::vec![0u8; msgsz];
-    if msgsz > 0 && unsafe { copy_from_user_safe(data.as_mut_ptr(), (msgp + 8) as *const u8, msgsz).is_err() } {
+    if msgsz > 0 && copy_from_user(&mut data, msgp + 8).is_err() {
         return EFAULT;
     }
     let tid = akuma_exec::threading::current_thread_id();
@@ -258,13 +251,13 @@ pub fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) 
                 }
                 // truncate: copy msgsz bytes
                 let mtype_bytes = msg.mtype.to_ne_bytes();
-                unsafe {
-                    if copy_to_user_safe(msgp as *mut u8, mtype_bytes.as_ptr(), 8).is_err() {
-                        return (Some(EFAULT), alloc::vec::Vec::new());
-                    }
-                    if msgsz > 0 && copy_to_user_safe((msgp + 8) as *mut u8, msg.data.as_ptr(), msgsz).is_err() {
-                        return (Some(EFAULT), alloc::vec::Vec::new());
-                    }
+                if copy_to_user_with(msgp, &mtype_bytes, Prefault::No).is_err() {
+                    return (Some(EFAULT), alloc::vec::Vec::new());
+                }
+                if msgsz > 0
+                    && copy_to_user_with(msgp + 8, &msg.data[..msgsz], Prefault::No).is_err()
+                {
+                    return (Some(EFAULT), alloc::vec::Vec::new());
                 }
                 q.cbytes -= actual_len;
                 // Wake senders waiting for space
@@ -274,13 +267,13 @@ pub fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) 
             }
             q.cbytes -= actual_len;
             let mtype_bytes = msg.mtype.to_ne_bytes();
-            unsafe {
-                if copy_to_user_safe(msgp as *mut u8, mtype_bytes.as_ptr(), 8).is_err() {
-                    return (Some(EFAULT), alloc::vec::Vec::new());
-                }
-                if actual_len > 0 && copy_to_user_safe((msgp + 8) as *mut u8, msg.data.as_ptr(), actual_len).is_err() {
-                    return (Some(EFAULT), alloc::vec::Vec::new());
-                }
+            if copy_to_user_with(msgp, &mtype_bytes, Prefault::No).is_err() {
+                return (Some(EFAULT), alloc::vec::Vec::new());
+            }
+            if actual_len > 0
+                && copy_to_user_with(msgp + 8, &msg.data[..actual_len], Prefault::No).is_err()
+            {
+                return (Some(EFAULT), alloc::vec::Vec::new());
             }
             // Wake senders waiting for space
             let send_handles: alloc::vec::Vec<WakeHandle> = q.send_pollers.values().copied().collect();

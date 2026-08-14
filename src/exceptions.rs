@@ -818,20 +818,44 @@ pub fn emulate_dc_zva(addr: u64) {
     let block_size = (4usize << bs).min(2048);
     let aligned_addr = addr & !(block_size as u64 - 1);
     let zeros = [0u8; 2048];
-    let _ = unsafe {
-        akuma_exec::mmu::user_access::copy_to_user_safe(
-            aligned_addr as *mut u8, zeros.as_ptr(), block_size)
-    };
+    // Fault-time store: `Prefault::No` for the reason in `read_user_instr`.
+    let _ = akuma_exec::mmu::user_access::copy_to_user_with(
+        aligned_addr,
+        &zeros[..block_size],
+        akuma_exec::mmu::user_access::Prefault::No,
+    );
+}
+
+/// Read one 32-bit instruction word from user memory **at fault time**.
+///
+/// `Prefault::No` is mandatory here, not a preference: every caller runs inside an
+/// exception handler, where [`prefault_user_range`] would allocate frames, take the
+/// address space's `as_lock` and possibly read a file — re-entering the very path
+/// that is currently faulting. A lazy page hit by a kernel→user copy is instead
+/// resolved in place by [`try_resolve_el1_user_copy_lazy_fault`], which is the
+/// mechanism designed for it.
+///
+/// [`prefault_user_range`]: akuma_exec::mmu::user_access::prefault_user_range
+fn read_user_instr(va: u64) -> Option<u32> {
+    let mut buf = [0u8; 4];
+    akuma_exec::mmu::user_access::copy_from_user_with(
+        &mut buf,
+        va,
+        akuma_exec::mmu::user_access::Prefault::No,
+    )
+    .ok()
+    .map(|()| u32::from_le_bytes(buf))
 }
 
 /// Emulate `stp xzr, xzr, [Xn, #imm7*8]` for EL0 when QEMU TCG misroutes it as EC=0x15.
 /// Writes 16 zero bytes to `addr`.
 fn emulate_stp_xzr_xzr(addr: u64) {
     let zeros = [0u8; 16];
-    let _ = unsafe {
-        akuma_exec::mmu::user_access::copy_to_user_safe(
-            addr as *mut u8, zeros.as_ptr(), 16)
-    };
+    let _ = akuma_exec::mmu::user_access::copy_to_user_with(
+        addr,
+        &zeros,
+        akuma_exec::mmu::user_access::Prefault::No,
+    );
 }
 
 /// Decode `stp xzr, xzr, [Xn, #imm7*8]` signed-offset form.
@@ -1072,11 +1096,12 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
     // `mov x19,x0`). Dump that block so the reuse pattern — free-list cell, small
     // integer, or string — is on the record without a second run.
     let mut probe = [0u64; 4];
-    let ok = unsafe {
-        akuma_exec::mmu::user_access::copy_from_user_safe(
-            probe.as_mut_ptr().cast::<u8>(), frame.x19 as *const u8, 32,
-        ).is_ok()
-    };
+    let ok = akuma_exec::mmu::user_access::copy_from_user_with(
+        akuma_exec::mmu::user_access::as_user_bytes_mut(&mut probe),
+        frame.x19,
+        akuma_exec::mmu::user_access::Prefault::No,
+    )
+    .is_ok();
     if ok {
         crate::safe_print!(192, "[Fault]  [x19={:#x}] = {:#x} {:#x} {:#x} {:#x}\n",
             frame.x19, probe[0], probe[1], probe[2], probe[3]);
@@ -3081,8 +3106,9 @@ fn try_resolve_el1_cow_fault() -> bool {
 }
 
 /// Fast-path resolver for an EL1 kernel data abort caused by touching a LAZY
-/// (not-yet-mapped) user page during a kernel→user copy (`copy_to_user_safe` /
-/// `copy_from_user_safe`) — e.g. the rump sysproxy `copyout` writing a DNS answer
+/// (not-yet-mapped) user page during a kernel→user copy (`copy_to_user` /
+/// `copy_from_user`, or their `Prefault::No` forms) — e.g. the rump sysproxy `copyout`
+/// writing a DNS answer
 /// into an *unmodified* client's demand-paged receive buffer. The kernel copy is
 /// the first touch of the buffer's later page(s), so the byte-copy loop takes a
 /// translation fault at the page boundary. Without this the registered user-copy
@@ -3164,7 +3190,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
     // deadlock.  The existing check at line ~1461 (after the debug dump,
     // inside the EC=0x25 branch) has the same risk but is only reached for
     // actual data aborts — moving it earlier increases the window.
-    // The debug dump noise for copy_to_user_safe faults is acceptable.
+    // The debug dump noise for user-copy faults is acceptable.
 
     // Read ESR_EL1 to determine exception type
     let esr: u64;
@@ -3714,15 +3740,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 static LAST_SPURIOUS_ELR: AtomicU64 = AtomicU64::new(0);
                 static SPURIOUS_REPLAYS: AtomicU32 = AtomicU32::new(0);
                 let elr = frame_ref.elr_el1;
-                let prev_instr = elr.checked_sub(4).and_then(|prev_va| {
-                    let mut buf = [0u8; 4];
-                    unsafe {
-                        akuma_exec::mmu::user_access::copy_from_user_safe(
-                            buf.as_mut_ptr(), prev_va as *const u8, 4,
-                        ).ok()
-                    }
-                    .map(|()| u32::from_le_bytes(buf))
-                });
+                let prev_instr = elr.checked_sub(4).and_then(|prev_va| { read_user_instr(prev_va) });
                 // Only act when the prev instruction is readable AND definitively not an svc.
                 if let Some(instr) = prev_instr
                     && !is_aarch64_svc(instr)
@@ -3783,15 +3801,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         // Re-executing that SVC with wrong registers causes spurious
                         // syscalls (e.g. io_setup with ctx_idp=0x1 → EFAULT → WILD-DA).
                         // In that case just flush the IC and return to ELR (skip replay).
-                        let prev_instr = elr.checked_sub(4).and_then(|prev_va| {
-                            let mut buf = [0u8; 4];
-                            unsafe {
-                                akuma_exec::mmu::user_access::copy_from_user_safe(
-                                    buf.as_mut_ptr(), prev_va as *const u8, 4,
-                                ).ok()
-                            }
-                            .map(|()| u32::from_le_bytes(buf))
-                        });
+                        let prev_instr = elr.checked_sub(4).and_then(|prev_va| { read_user_instr(prev_va) });
                         let prev_is_svc = prev_instr.is_some_and(is_aarch64_svc);
                         // FIX_MEMORY_MAPPING.md / EPOLL_PERFORMANCE.md: stale icache can make the
                         // CPU decode the wrong SVC immediate; replay preserves ELR unless prev was SVC.
@@ -3861,23 +3871,9 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             // return value — which would crash the goroutine when it resumes DC ZVA.
             {
                 let elr = frame_ref.elr_el1;
-                let elr_instr = {
-                    let mut buf = [0u8; 4];
-                    unsafe {
-                        akuma_exec::mmu::user_access::copy_from_user_safe(
-                            buf.as_mut_ptr(), elr as *const u8, 4)
-                        .ok()
-                    }.map(|()| u32::from_le_bytes(buf))
-                };
+                let elr_instr = { read_user_instr(elr) };
                 if elr_instr.is_some_and(|i| (i & !0x1F) == 0xD50B7420) {
-                    let prev_instr = elr.checked_sub(4).and_then(|prev| {
-                        let mut buf = [0u8; 4];
-                        unsafe {
-                            akuma_exec::mmu::user_access::copy_from_user_safe(
-                                buf.as_mut_ptr(), prev as *const u8, 4)
-                            .ok()
-                        }.map(|()| u32::from_le_bytes(buf))
-                    });
+                    let prev_instr = elr.checked_sub(4).and_then(|prev| { read_user_instr(prev) });
                     let prev_is_svc = prev_instr
                         .is_some_and(|i| (i & 0xFFE0001F) == 0xD4000001);
                     if !prev_is_svc {
@@ -3901,23 +3897,9 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             // Pattern 4 in GO_FORKTEST_DEBUG.md (crush, crash36.log).
             {
                 let elr = frame_ref.elr_el1;
-                let elr_instr = {
-                    let mut buf = [0u8; 4];
-                    unsafe {
-                        akuma_exec::mmu::user_access::copy_from_user_safe(
-                            buf.as_mut_ptr(), elr as *const u8, 4)
-                        .ok()
-                    }.map(|()| u32::from_le_bytes(buf))
-                };
+                let elr_instr = { read_user_instr(elr) };
                 if let Some((rn, offset)) = elr_instr.and_then(decode_stp_xzr_xzr) {
-                    let prev_instr = elr.checked_sub(4).and_then(|prev| {
-                        let mut buf = [0u8; 4];
-                        unsafe {
-                            akuma_exec::mmu::user_access::copy_from_user_safe(
-                                buf.as_mut_ptr(), prev as *const u8, 4)
-                            .ok()
-                        }.map(|()| u32::from_le_bytes(buf))
-                    });
+                    let prev_instr = elr.checked_sub(4).and_then(|prev| { read_user_instr(prev) });
                     let prev_is_svc = prev_instr
                         .is_some_and(|i| (i & 0xFFE0001F) == 0xD4000001);
                     if !prev_is_svc {
@@ -4415,10 +4397,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         {
                             let elr = frame_ref.elr_el1;
                             let mut ib = [0u8; 8];
-                            let ok = unsafe {
-                                akuma_exec::mmu::user_access::copy_from_user_safe(
-                                    ib.as_mut_ptr(), elr.wrapping_sub(4) as *const u8, 8).is_ok()
-                            };
+                            let ok = akuma_exec::mmu::user_access::copy_from_user_with(
+                                &mut ib,
+                                elr.wrapping_sub(4),
+                                akuma_exec::mmu::user_access::Prefault::No,
+                            )
+                            .is_ok();
                             if ok {
                                 let prev = u32::from_le_bytes([ib[0], ib[1], ib[2], ib[3]]);
                                 let at = u32::from_le_bytes([ib[4], ib[5], ib[6], ib[7]]);

@@ -1002,7 +1002,9 @@ tree had already done it:
    not a terminal, so changing it is a behaviour change and does not belong in a
    deduplication pass. The arm now says `ENOMEM` in code with the divergence
    written down next to it. Anyone picking this up should check what busybox and
-   musl's `isatty` do with `ENOMEM` first.
+   musl's `isatty` do with `ENOMEM` first, and read the row for it in
+   [`LINUX_COMPATIBILITY_ISSUES.md`](LINUX_COMPATIBILITY_ISSUES.md) §2 — the
+   sshd-into-box bridge depends on `TCGETS` reporting *not a tty*.
 2. **`mod.rs`'s xattr comment said `x0 = -95` is `0xffffffa9`.** It is
    `0xffffffa1`. The rest of that comment — that `!95` is `-96`
    (`0xffffffa0 = EPFNOSUPPORT`) and breaks musl and Go callers — is correct, and
@@ -2092,10 +2094,32 @@ four are mop-up once rungs 3–5 settle the hard part:
 
 ### Phase 5 — the user-copy sweep (−167 `unsafe`, 19% of the tree)
 
-Safe slice-based API with `validate_user_ptr` folded in (closes the unchecked
-destination hole), then 167 mechanical conversions. All in `src/syscall/*`, so
-it overlaps nothing above — but it is a large diff, so do not hold it open
-alongside Phase 2's.
+**DONE 2026-08-14.** Safe slice-based API with the check folded in, then the
+conversions: `src/syscall/` **192 `unsafe` → 24**, `rump_proxy.rs` 12 → 0,
+`exceptions.rs` 107 → 97, `akuma-exec/src/process/mod.rs` 36 → 34. Host tests
+516 → 521. **Full record: [`USER_COPY_FOLD.md`](USER_COPY_FOLD.md)**, including the
+two things [`UNSAFE_AUDIT.md`](UNSAFE_AUDIT.md) got wrong; the ABI divergences it
+surfaced are collected in
+[`LINUX_COMPATIBILITY_ISSUES.md`](LINUX_COMPATIBILITY_ISSUES.md). The short version
+of each:
+
+- **It is not "all in `src/syscall/*`".** `rump_proxy.rs` (15) and
+  `exceptions.rs` (13) are the two files where the decisions were, because a
+  copy in an exception handler must not demand-page.
+- **The fold does not close the unchecked-destination hole.** Kernel RAM is
+  mapped EL1-only in every user address space and the mapped-ness test only checks
+  presence, so a mapped kernel VA still validates. Recorded as §4.0a there, not
+  fixed — it needs an AP-bit test and its own A/B.
+- **"Large but mechanical" undercounted the judgement.** ~140 sites converted by
+  rote; ~25 needed a per-site decision, in three groups (must-not-prefault,
+  validate-that-has-to-stay, and the one caller that stays raw). Same lesson as
+  every other phase here: the mechanical part is not where the risk is.
+- One real bug fell out: `mremap`'s payload copy never validated its
+  *destination*, so a lazy page in the new mapping silently truncated the move.
+
+**The §5.7 errno table landed first, deliberately.** Both passes touch the same
+syscall arms, and doing errno first means each arm is rewritten once — see the
+note under §5.7.
 
 **The §5.7 errno audit is DONE (2026-08-14) and landed first, on its own.** The
 argument for running them together was that both are "the call site says one thing

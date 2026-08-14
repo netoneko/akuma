@@ -1,5 +1,4 @@
 use super::*;
-use akuma_exec::mmu::user_access::copy_to_user_safe;
 use akuma_net::socket::libc_errno;
 use alloc::collections::{BTreeMap as PollerMap, VecDeque};
 use akuma_exec::threading::{WakeHandle, wake_by_handle, wake_handle_for_thread};
@@ -418,7 +417,7 @@ pub(super) fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
     }
 
     let fds = [fd_r as i32, fd_w as i32];
-    if unsafe { copy_to_user_safe(fds_ptr as *mut u8, fds.as_ptr().cast::<u8>(), 8).is_err() } {
+    if write_user_val(fds_ptr, &fds).is_err() {
         return EFAULT;
     }
     0

@@ -1,8 +1,23 @@
 use super::*;
-use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 
 const SIG_DFL: usize = 0;
 const SIG_IGN: usize = 1;
+
+/// `stack_t`. Was declared identically inside both arms of `sys_sigaltstack`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StackT { sp: u64, flags: i32, _pad: i32, size: u64 }
+
+/// The `siginfo_t` prefix `rt_sigtimedwait` fills. 128 bytes, matching Linux.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Siginfo { si_signo: i32, si_errno: i32, si_code: i32, _pad: [i32; 29] }
+
+// The two sizes the copies used to state as literals (`STACK_T_SIZE`, `128`) are now
+// taken from the types, so pin the layouts instead of the lengths: a field added to
+// either struct is a compile error rather than a silently short copy to userspace.
+const _: () = assert!(core::mem::size_of::<StackT>() == 24, "stack_t is 24 bytes on aarch64");
+const _: () = assert!(core::mem::size_of::<Siginfo>() == 128, "siginfo_t is 128 bytes on aarch64");
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -39,14 +54,14 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
             sa_restorer: old.restorer,
             sa_mask: if sigset_ok { old.mask } else { 0 },
         };
-        if unsafe { copy_to_user_safe(oldact_ptr as *mut u8, (&raw const out).cast::<u8>(), 32).is_err() } {
+        if write_user_val_with(oldact_ptr as u64, &out, Prefault::No).is_err() {
             return EFAULT;
         }
     }
 
     if act_ptr != 0 && validate_user_ptr(act_ptr as u64, 32) {
         let mut sa = KernelSigaction::default();
-        if unsafe { copy_from_user_safe((&raw mut sa).cast::<u8>(), act_ptr as *const u8, 32).is_err() } {
+        if read_user_into(&mut sa, act_ptr as u64).is_err() {
             return EFAULT;
         }
         let handler = match sa.sa_handler {
@@ -106,22 +121,14 @@ pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigset
     let cur = akuma_exec::threading::thread_signal_mask();
 
     // Return old mask if requested
-    if oldset_ptr != 0 {
-        if !validate_user_ptr(oldset_ptr, 8) {
-            return EFAULT;
-        }
-        if unsafe { copy_to_user_safe(oldset_ptr as *mut u8, (&raw const cur).cast::<u8>(), 8).is_err() } {
-            return EFAULT;
-        }
+    if oldset_ptr != 0 && write_user_val(oldset_ptr, &cur).is_err() {
+        return EFAULT;
     }
 
     // Apply new mask if provided
     if set_ptr != 0 {
-        if !validate_user_ptr(set_ptr, 8) {
-            return EFAULT;
-        }
         let mut new_mask: u64 = 0;
-        if unsafe { copy_from_user_safe((&raw mut new_mask).cast::<u8>(), set_ptr as *const u8, 8).is_err() } {
+        if read_user_into(&mut new_mask, set_ptr).is_err() {
             return EFAULT;
         }
 
@@ -152,11 +159,8 @@ pub(super) fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: usize) -> u64 {
     if sigsetsize != 8 {
         return EINVAL;
     }
-    if !validate_user_ptr(mask_ptr, 8) {
-        return EFAULT;
-    }
     let mut new_mask: u64 = 0;
-    if unsafe { copy_from_user_safe((&raw mut new_mask).cast::<u8>(), mask_ptr as *const u8, 8).is_err() } {
+    if read_user_into(&mut new_mask, mask_ptr).is_err() {
         return EFAULT;
     }
 
@@ -202,34 +206,23 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
     // void *ss_sp;     // Base address of stack (8 bytes)
     // int ss_flags;    // Flags (4 bytes)
     // size_t ss_size;  // Size of stack (8 bytes)
-    const STACK_T_SIZE: usize = 24;
     const SS_DISABLE: i32 = 2;
 
     let slot = akuma_exec::threading::current_thread_id();
 
     // Return old stack if requested
     if old_ss_ptr != 0 {
-        if !validate_user_ptr(old_ss_ptr, STACK_T_SIZE) {
-            return EFAULT;
-        }
-        #[repr(C)]
-        struct StackT { sp: u64, flags: i32, _pad: i32, size: u64 }
         let (sp, size, flags) = akuma_exec::threading::get_sigaltstack(slot);
         let out = StackT { sp, flags, _pad: 0, size };
-        if unsafe { copy_to_user_safe(old_ss_ptr as *mut u8, (&raw const out).cast::<u8>(), STACK_T_SIZE).is_err() } {
+        if write_user_val(old_ss_ptr, &out).is_err() {
             return EFAULT;
         }
     }
 
     // Set new stack if provided
     if ss_ptr != 0 {
-        if !validate_user_ptr(ss_ptr, STACK_T_SIZE) {
-            return EFAULT;
-        }
-        #[repr(C)]
-        struct StackT { sp: u64, flags: i32, _pad: i32, size: u64 }
         let mut ss = StackT { sp: 0, flags: 0, _pad: 0, size: 0 };
-        if unsafe { copy_from_user_safe((&raw mut ss).cast::<u8>(), ss_ptr as *const u8, STACK_T_SIZE).is_err() } {
+        if read_user_into(&mut ss, ss_ptr).is_err() {
             return EFAULT;
         }
 
@@ -263,23 +256,14 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
         None => return ENOSYS,
     };
 
-    if !validate_user_ptr(set_ptr, 8) {
-        return EFAULT;
-    }
-
     let mut wait_mask: u64 = 0;
-    if unsafe { copy_from_user_safe((&raw mut wait_mask).cast::<u8>(), set_ptr as *const u8, 8).is_err() } {
+    if read_user_into(&mut wait_mask, set_ptr).is_err() {
         return EFAULT;
     }
 
     let timeout_us = if timeout_ptr != 0 {
-        if !validate_user_ptr(timeout_ptr, 16) {
-            return EFAULT;
-        }
-        #[repr(C)]
-        struct Timespec { tv_sec: i64, tv_nsec: i64 }
         let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), timeout_ptr as *const u8, 16).is_err() } {
+        if read_user_into(&mut ts, timeout_ptr).is_err() {
             return EFAULT;
         }
         (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
@@ -296,11 +280,9 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
         // in wait_mask is effectively "blocked" for this wait).
         if let Some(sig) = akuma_exec::threading::take_pending_signal(!wait_mask) {
             // Fill siginfo if requested (minimal implementation)
-            if info_ptr != 0 && validate_user_ptr(info_ptr, 128) {
-                #[repr(C)]
-                struct Siginfo { si_signo: i32, si_errno: i32, si_code: i32, _pad: [i32; 29] }
+            if info_ptr != 0 {
                 let info = Siginfo { si_signo: sig as i32, si_errno: 0, si_code: 0, _pad: [0; 29] };
-                let _ = unsafe { copy_to_user_safe(info_ptr as *mut u8, (&raw const info).cast::<u8>(), 128) };
+                let _ = write_user_val(info_ptr, &info);
             }
             return u64::from(sig);
         }

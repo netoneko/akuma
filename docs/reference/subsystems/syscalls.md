@@ -85,6 +85,26 @@ See [`../../runbooks/add-syscall-feature.md`](../../runbooks/add-syscall-feature
   both spellings existed here, across five tables, and one of them had drifted
   from its own comment (`archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.7).
   A name missing from the table is added there, not at the call site.
+- **Copying to and from user memory (one helper, since 2026-08-14):**
+  `akuma_exec::mmu::user_access` — `copy_to_user(dst_user, &[u8])`,
+  `copy_from_user(&mut [u8], src_user)`, `write_user_val(dst_user, &T)`,
+  `read_user_into(&mut T, src_user)`, plus `as_user_bytes{,_mut}` for arrays of ABI
+  structs. All safe `fn`s: they range-check, demand-page the range, then copy, so
+  **a separate `validate_user_ptr` call is no longer needed** at a site that only
+  copies. The syscall modules see them through `use super::*`.
+  - **Inside a lock, or in an exception handler:** use the `*_with(..., Prefault::No)`
+    forms. Prefaulting allocates frames, takes `as_lock` and can read a file, none
+    of which may happen under an IRQ-masked spinlock or on the fault path.
+  - `validate_user_ptr` still exists and is still right when the check must happen
+    *before* something else — an allocation sized by the caller, a lock, an fd
+    allocation, or a blocking wait. `UNSAFE_AUDIT.md` §4.0 lists every surviving
+    call and which of those three reasons it is there for.
+  - The raw `copy_{to,from}_user_safe` are the byte loop plus a fault trampoline and
+    check **nothing**; the only deliberate caller left is `copy_from_user_byte`
+    (NUL-terminated strings have no range to validate up front).
+  - Known limitation: the range check cannot tell a user page from a kernel page,
+    because kernel RAM is mapped EL1-only into every user address space and the
+    check tests presence only (`UNSAFE_AUDIT.md` §4.0a).
 - **musl compatibility:** `archive/MUSL_COMPATIBILITY.md`. musl is the userspace
   libc; the kernel aims to run unmodified musl-linked binaries.
 - **`MAX_ARG_STRLEN`:** 128 KB release / 8 KB size / 4 KB extreme (`config.rs:147`). The Go forktest 128 KB fix is a notable regression guard.

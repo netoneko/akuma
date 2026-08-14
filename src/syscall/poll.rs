@@ -1,7 +1,6 @@
 use super::*;
 #[cfg(feature = "smoltcp")]
 use akuma_net::socket;
-use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
 #[cfg(feature = "sc-epoll")]
 use core::sync::atomic::AtomicU64;
 use core::task::Waker;
@@ -320,7 +319,7 @@ pub fn sys_epoll_create1(flags: u32) -> u64 {
 
 /// Forktest Pattern 2: Go reports crashes at **`PC≈0x13060`** for both **`read`** and **`epoll_ctl`**
 /// (shared syscall trampoline). **`[sigsegv-syscall]`** serial (`src/exceptions.rs`) keys off **`x8`**.
-/// This path validates **`event_ptr`** and uses **`copy_from_user_safe`** for the 16-byte
+/// This path uses **`read_user_into`** (validate + prefault + copy) for the 16-byte
 /// AArch64 **`epoll_event`** — see **`docs/GO_FORKTEST_DEBUG.md`** if **`x8==EPOLL_CTL`** at SIGSEGV.
 #[cfg(feature = "sc-epoll")]
 pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
@@ -329,21 +328,18 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
         _ => return EBADF,
     };
 
-    const EPOLL_EVENT_SIZE: usize = core::mem::size_of::<EpollEvent>();  // 16 on ARM64
-
-    // The user copy is hoisted out of the EPOLL_TABLE hold. `validate_user_ptr`
-    // demand-pages through `ensure_user_pages_mapped`, whose `LazySource::File` arm
-    // reads the page in through the VFS — and the hold below now masks IRQs, where
-    // block I/O is barred outright (locking.md). The membership probe keeps EBADF
-    // ahead of EFAULT, which is the precedence the un-hoisted code had.
+    // The user copy is hoisted out of the EPOLL_TABLE hold, and must stay there:
+    // `read_user_into` prefaults, and the prefault's `LazySource::File` arm reads the
+    // page in through the VFS — while the hold below masks IRQs, where block I/O is
+    // barred outright (locking.md). The membership probe keeps EBADF ahead of EFAULT,
+    // which is the precedence the un-hoisted code had.
     let event = match op {
         EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
             if !crate::irq::with_irqs_disabled(|| EPOLL_TABLE.lock().contains_key(&epoll_id)) {
                 return EBADF;
             }
-            if !validate_user_ptr(event_ptr as u64, EPOLL_EVENT_SIZE) { return EFAULT; }
             let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
-            if unsafe { copy_from_user_safe((&raw mut ev).cast::<u8>(), event_ptr as *const u8, EPOLL_EVENT_SIZE).is_err() } {
+            if read_user_into(&mut ev, event_ptr as u64).is_err() {
                 return EFAULT;
             }
             Some(({ ev.events }, { ev.data }))
@@ -719,7 +715,12 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
         }
 
         if ready_count > 0 {
-            if unsafe { copy_to_user_safe(events_ptr as *mut u8, kernel_events.as_ptr().cast::<u8>(), ready_count * EPOLL_EVENT_SIZE).is_err() } {
+            if copy_to_user(
+                events_ptr as u64,
+                &as_user_bytes(&kernel_events)[..ready_count * EPOLL_EVENT_SIZE],
+            )
+            .is_err()
+            {
                 return EFAULT;
             }
             log_epoll_pwait_return(
@@ -822,24 +823,23 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
     let mut orig_read = [0u64; MAX_FDS / 64];
     let mut orig_write = [0u64; MAX_FDS / 64];
 
-    if readfds_ptr != 0 {
-        if !validate_user_ptr(readfds_ptr, fd_set_bytes) { return EFAULT; }
-        if unsafe { copy_from_user_safe(orig_read.as_mut_ptr().cast::<u8>(), readfds_ptr as *const u8, fd_set_bytes).is_err() } {
-            return EFAULT;
-        }
+    if readfds_ptr != 0
+        && copy_from_user(&mut as_user_bytes_mut(&mut orig_read)[..fd_set_bytes], readfds_ptr)
+            .is_err()
+    {
+        return EFAULT;
     }
-    if writefds_ptr != 0 {
-        if !validate_user_ptr(writefds_ptr, fd_set_bytes) { return EFAULT; }
-        if unsafe { copy_from_user_safe(orig_write.as_mut_ptr().cast::<u8>(), writefds_ptr as *const u8, fd_set_bytes).is_err() } {
-            return EFAULT;
-        }
+    if writefds_ptr != 0
+        && copy_from_user(&mut as_user_bytes_mut(&mut orig_write)[..fd_set_bytes], writefds_ptr)
+            .is_err()
+    {
+        return EFAULT;
     }
 
     let infinite = timeout_ptr == 0;
     let timeout_us = if !infinite {
-        if !validate_user_ptr(timeout_ptr, 16) { return EFAULT; }
         let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), timeout_ptr as *const u8, 16).is_err() } {
+        if read_user_into(&mut ts, timeout_ptr).is_err() {
             return EFAULT;
         }
         (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
@@ -893,26 +893,27 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
         }
 
         if ready_count > 0 {
-            if readfds_ptr != 0 
-                && unsafe { copy_to_user_safe(readfds_ptr as *mut u8, out_read.as_ptr().cast::<u8>(), fd_set_bytes).is_err() } {
-                    return EFAULT;
-                }
-            if writefds_ptr != 0 
-                && unsafe { copy_to_user_safe(writefds_ptr as *mut u8, out_write.as_ptr().cast::<u8>(), fd_set_bytes).is_err() } {
-                    return EFAULT;
-                }
+            if readfds_ptr != 0
+                && copy_to_user(readfds_ptr, &as_user_bytes(&out_read)[..fd_set_bytes]).is_err()
+            {
+                return EFAULT;
+            }
+            if writefds_ptr != 0
+                && copy_to_user(writefds_ptr, &as_user_bytes(&out_write)[..fd_set_bytes]).is_err()
+            {
+                return EFAULT;
+            }
             return ready_count;
         }
 
         if !infinite && (crate::timer::uptime_us() - start_time) >= timeout_us {
-            if readfds_ptr != 0 
-                && unsafe { copy_to_user_safe(readfds_ptr as *mut u8, [0u8; MAX_FDS/8].as_ptr(), fd_set_bytes).is_err() } {
-                    return EFAULT;
-                }
-            if writefds_ptr != 0 
-                && unsafe { copy_to_user_safe(writefds_ptr as *mut u8, [0u8; MAX_FDS/8].as_ptr(), fd_set_bytes).is_err() } {
-                    return EFAULT;
-                }
+            let cleared = [0u8; MAX_FDS / 8];
+            if readfds_ptr != 0 && copy_to_user(readfds_ptr, &cleared[..fd_set_bytes]).is_err() {
+                return EFAULT;
+            }
+            if writefds_ptr != 0 && copy_to_user(writefds_ptr, &cleared[..fd_set_bytes]).is_err() {
+                return EFAULT;
+            }
             return 0;
         }
 
@@ -934,9 +935,8 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
 
     let infinite = timeout_ptr == 0;
     let timeout_us = if !infinite {
-        if !validate_user_ptr(timeout_ptr, 16) { return EFAULT; }
         let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        if unsafe { copy_from_user_safe((&raw mut ts).cast::<u8>(), timeout_ptr as *const u8, 16).is_err() } {
+        if read_user_into(&mut ts, timeout_ptr).is_err() {
             return EFAULT;
         }
         (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
@@ -952,9 +952,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
 
     let start_time = crate::timer::uptime_us();
     let mut kernel_fds = alloc::vec![PollFd { fd: 0, events: 0, revents: 0 }; nfds];
-    if nfds > 0
-        && unsafe { copy_from_user_safe(kernel_fds.as_mut_ptr().cast::<u8>(), fds_ptr as *const u8, fds_size).is_err() }
-    {
+    if nfds > 0 && copy_from_user(as_user_bytes_mut(&mut kernel_fds), fds_ptr).is_err() {
         return EFAULT;
     }
 
@@ -1004,9 +1002,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
         }
 
         if ready_count > 0 {
-            if nfds > 0
-                && unsafe { copy_to_user_safe(fds_ptr as *mut u8, kernel_fds.as_ptr().cast::<u8>(), fds_size).is_err() }
-            {
+            if nfds > 0 && copy_to_user(fds_ptr, as_user_bytes(&kernel_fds)).is_err() {
                 return EFAULT;
             }
             return ready_count as u64;

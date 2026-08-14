@@ -3067,12 +3067,15 @@ fn record_clone_snapshot(tid: usize, stack: u64, parent_pid: Pid, parent_tid: us
     if tid >= crate::threading::MAX_THREADS { return; }
     let mut words = [0u64; 2];
     // Fault-safe: `stack` is user-supplied and a bogus one must not take down
-    // the kernel on a diagnostic read.
-    let ok = unsafe {
-        crate::mmu::user_access::copy_from_user_safe(
-            words.as_mut_ptr().cast::<u8>(), stack as *const u8, 16,
-        ).is_ok()
-    };
+    // the kernel on a diagnostic read. `Prefault::No` because this runs on the clone
+    // path — a diagnostic read must never allocate frames or take `as_lock` — and
+    // because the raw copy it replaces never demand-paged either.
+    let ok = crate::mmu::user_access::copy_from_user_with(
+        crate::mmu::user_access::as_user_bytes_mut(&mut words),
+        stack,
+        crate::mmu::user_access::Prefault::No,
+    )
+    .is_ok();
     CLONE_SNAP_STACK[tid].store(stack, Ordering::Release);
     CLONE_SNAP_FN[tid].store(if ok { words[0] } else { u64::MAX }, Ordering::Release);
     CLONE_SNAP_ARG[tid].store(if ok { words[1] } else { u64::MAX }, Ordering::Release);
@@ -3107,11 +3110,13 @@ pub fn clone_snapshot(tid: usize) -> Option<CloneSnapshot> {
 /// address space. Returns `None` if the stack page is no longer readable.
 pub fn reread_clone_handoff(snap: &CloneSnapshot) -> Option<(u64, u64)> {
     let mut words = [0u64; 2];
-    unsafe {
-        crate::mmu::user_access::copy_from_user_safe(
-            words.as_mut_ptr().cast::<u8>(), snap.stack as *const u8, 16,
-        ).ok()?;
-    }
+    // As `record_clone_snapshot`: a re-read at thread start, never a prefault.
+    crate::mmu::user_access::copy_from_user_with(
+        crate::mmu::user_access::as_user_bytes_mut(&mut words),
+        snap.stack,
+        crate::mmu::user_access::Prefault::No,
+    )
+    .ok()?;
     Some(words.into())
 }
 

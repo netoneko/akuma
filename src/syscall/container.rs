@@ -1,5 +1,4 @@
 use super::*;
-use akuma_exec::mmu::user_access::copy_from_user_safe;
 
 pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {
     if !validate_user_ptr(name_ptr, name_len) { return EFAULT; }
@@ -8,10 +7,10 @@ pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr
     let mut name_buf = alloc::vec![0u8; name_len];
     let mut root_buf = alloc::vec![0u8; root_len];
 
-    if unsafe { copy_from_user_safe(name_buf.as_mut_ptr(), name_ptr as *const u8, name_len).is_err() } {
+    if copy_from_user(&mut name_buf, name_ptr).is_err() {
         return EFAULT;
     }
-    if unsafe { copy_from_user_safe(root_buf.as_mut_ptr(), root_ptr as *const u8, root_len).is_err() } {
+    if copy_from_user(&mut root_buf, root_ptr).is_err() {
         return EFAULT;
     }
 
@@ -215,10 +214,10 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
     let mut target_buf = alloc::vec![0u8; target_len];
     let mut fstype_buf = alloc::vec![0u8; fstype_len];
     
-    if unsafe { copy_from_user_safe(target_buf.as_mut_ptr(), target_ptr as *const u8, target_len).is_err() } {
+    if copy_from_user(&mut target_buf, target_ptr).is_err() {
         return EFAULT;
     }
-    if unsafe { copy_from_user_safe(fstype_buf.as_mut_ptr(), fstype_ptr as *const u8, fstype_len).is_err() } {
+    if copy_from_user(&mut fstype_buf, fstype_ptr).is_err() {
         return EFAULT;
     }
 

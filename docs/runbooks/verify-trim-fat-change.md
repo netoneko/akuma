@@ -84,8 +84,9 @@ cargo test --target "$HOST" 2>&1 \
   | paste -sd+ - | bc
 ```
 
-> **Baseline as of 2026-08-14: 516** — after the §5.7 errno-table merge (+4 in
-> `akuma-primitives`). Was **512** earlier the same day: the arm-2 count of that
+> **Baseline as of 2026-08-14: 521** — after the Phase 5 user-copy sweep (+5
+> `user_range_ok` tests in `akuma-exec`). Was **516** after the §5.7 errno-table
+> merge (+4 in `akuma-primitives`), and **512** earlier the same day: the arm-2 count of that
 > day's DA/IA
 > demand-paging body merge (`COW_PILE_AUDIT.md` §12.3), whose baseline arm measured
 > **508** on the same tree an hour earlier. Two moves on one day: 506 → 508 → 512, so
@@ -329,6 +330,22 @@ escalation: `--test-memory 8192` in a 4 GiB box must SIGSEGV the process and
 leave the VM alive and sshable. An invented OOM and a real one look identical in
 the log, so the check here is that the box survives and the *next* boot's
 `[PASS]` count is unchanged — not the memtest's own output.
+
+### One reading this gate produced that nobody could reproduce
+
+On the Phase 5 sweep's arm (2026-08-14) a single run reported
+`host.failed: 1` / `host.tests: 418` — a total 103 short of the 521 the same tree
+scores, which is the shape of **one test binary aborting partway** rather than a
+test failing. Five subsequent runs on the identical tree (three bare
+`cargo test`, two full Tier 1) all scored 521/0, and per-crate runs of
+`akuma-exec` (the only suite large enough to account for the gap) scored 236/0
+three times.
+
+It is recorded because it is unexplained, not because it was explained away: the
+gate does not capture `cargo test`'s output, so there is no evidence to diagnose
+after the fact. **If you see a short total with `host.failed: 1`, re-run before
+believing it — and consider teaching `tier1_tests` to save the failing output**,
+which is the change that would turn this from noise into a finding.
 
 ## Before calling anything a regression
 
