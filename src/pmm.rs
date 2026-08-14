@@ -275,6 +275,18 @@ pub static DP_PROTNONE_PAGES: AtomicUsize = AtomicUsize::new(0);
 pub static EAGER_MMAP_PAGES: AtomicUsize = AtomicUsize::new(0);
 pub static USER_PAGES_FREED: AtomicUsize = AtomicUsize::new(0);
 
+/// Instruction-abort faults whose lazy region records **non-executable** flags, so the
+/// page maps non-exec and the fetch cannot succeed until the permission-fault arm
+/// upgrades it to `RX`.
+///
+/// Not a frame counter (unlike its neighbours) — it counts *faults*, once per fault
+/// rather than once per page, and it exists to answer a reachability question the tree
+/// had never measured: the merged demand-paging body skips I-cache maintenance for
+/// these pages, on the argument that the upgrade path does it instead
+/// (`docs/archive/COW_PILE_AUDIT.md` §12.1). A non-zero value means that argument is
+/// load-bearing in this workload; zero means the change is inert here.
+pub static DP_IA_NOEXEC_FAULTS: AtomicUsize = AtomicUsize::new(0);
+
 #[inline]
 pub fn dp_count(counter: &AtomicUsize, n: usize) {
     counter.fetch_add(n, Ordering::Relaxed);
@@ -287,12 +299,13 @@ pub fn dp_count(counter: &AtomicUsize, n: usize) {
 pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
     let _ = write!(
         w,
-        "file={} anon={} cow={} protnone={} eager={} freed={}",
+        "file={} anon={} cow={} protnone={} eager={} freed={} ia_noexec={}",
         DP_FILE_PAGES.load(Ordering::Relaxed),
         DP_ANON_PAGES.load(Ordering::Relaxed),
         DP_COW_PAGES.load(Ordering::Relaxed),
         DP_PROTNONE_PAGES.load(Ordering::Relaxed),
         EAGER_MMAP_PAGES.load(Ordering::Relaxed),
         USER_PAGES_FREED.load(Ordering::Relaxed),
+        DP_IA_NOEXEC_FAULTS.load(Ordering::Relaxed),
     );
 }

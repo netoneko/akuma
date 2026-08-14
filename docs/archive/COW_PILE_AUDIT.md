@@ -417,6 +417,13 @@ Not CoW, but the same file and the same shape — and this is what §8 item 5 of
 trimming doc is actually pointing at (it names the `Drop` impls, which are 6 lines
 each; see §7).
 
+> **DONE 2026-08-14 — see §12**, which records the merge, the *eight* differences it
+> found (not the two below), the `is_exec` decision and its verification, and the two
+> new findings (F9, F10) that reading the arms side by side produced. One
+> `demand_page_lazy_region` + one `akuma_exec::mmu::FaultAccess` seam; `extreme-size`
+> image −8,192 bytes. The section below is the survey as it stood, kept verbatim —
+> including its line numbers, which were already stale by the time the merge ran.
+
 | arm | body | lines |
 |---|---|---:|
 | `EC_DATA_ABORT_LOWER` | `exceptions.rs:3708-4086` | 378 |
@@ -481,6 +488,16 @@ Per the `IrqGuard`/`isb` precedent in the trimming doc, the correct outcome for
 someone measures it. **This merge is not recommended as hygiene work.** It is
 ~330 lines and it would be genuinely valuable, but it needs to be its own change
 with its own SMP=4 verification, and the barrier question answered on purpose.
+
+> That last paragraph got the prescription exactly right and the risk assessment
+> exactly wrong, which is worth recording since it is why the row was declined three
+> times. "One body, two documented entry points" is what §12 built. But the *reason*
+> for the fear — two behavioural divergences that could not be merged without choosing
+> — survived none of the contact: (2) was a copy-paste artifact (§11.1), (1) was a
+> category error (§11.2) whose real content turned out to be narrower still (§12.1),
+> and the actual difficulty was none of that. It was **eight** small differences,
+> mostly formatting and observability, and deciding where the shared body should
+> *start and stop* — which is a scoping judgement the table never mentioned.
 
 ---
 
@@ -750,6 +767,8 @@ unattributable.
 | F4 | DA single-page fallback places `dsb ish; isb` before the PTE install, disagreeing with its own batch path and with the IA arm | **FIXED 2026-08-14** — §11.1. The DA fallback was the **correct** site and the other three were wrong: that pair is the *completion* half of the `dc cvau`→`ic ivau` sequence, so it has to retire before the frame is published, and both arms publish twice (`file_page_cache::insert` in Pass B, the PTE in Pass C). All six open-coded sequences now call `mmu::sync_icache_range`, whose tail **is** the pair; the four ad-hoc trailing pairs are gone | boot test `icache_sync_whole_page_offsets`; `grep -c 'ic ivau' src/exceptions.rs` → 1, and that one is the user-trap emulator (`:4892`), not a fault path |
 | F5 | IA arm claims `icache_done: true` into `file_page_cache` for pages it may map non-exec | **RETIRED 2026-08-14 — not a defect**, §11.2. `icache_done` records a property of the **frame** ("has been through `dc cvau` + `ic ivau`"), not of the mapping's permissions, and the IA fill loop runs that maintenance *unconditionally* — there is no `is_exec` gate on it. So the claim is true for every frame this arm inserts. What was real is the comment above it (§6's "every page reaching this arm is executable"), which stated a false premise; it is rewritten | `src/file_page_cache.rs:66-72` (the `Entry::icache_done` doc) against the IA fill loop's unconditional `sync_icache_range` |
 | F6 | re-entrant `fault_slot_acquire` on one page by one thread lets the inner release drop the outer's entry | **FIXED 2026-08-14** — §11.3. Reachability established first: **unreachable in this tree**, all three `fault_slot_hold` sites are mutually exclusive branches of `rust_sync_el0_handler_inner` (single caller, EL0-only vector), and no EL1 path holds a slot. Chosen resolution is nesting-*safe*, not `assert!`: a new `FaultSlot::AlreadyHeld` variant + `FaultSlotGuard::owns_release`, plus a `[FAULT-SLOT NESTED]` tripwire. An `assert!` here would convert an unreachable bug into a kernel abort on the demand-paging path | boot test `fault_slot_nested_acquire_keeps_outer_hold`; host tests `already_held_reports_nothing`, `already_held_is_not_acquired`; `[FAULT-SLOT NESTED]` must never print |
+| F9 | **W^X is not enforced on the instruction-abort permission-fault arm.** It upgrades the page to `user_flags::RX` for **any** lazy region that is not `PROT_NONE`, without checking whether the region's own recorded flags are executable — so jumping into a `PROT_READ\|PROT_WRITE` file mapping silently promotes it to executable. Note `elf::load::segment_page_flags` enforces W^X for *segments* ("regardless of what `p_flags` asks for") and `user_flags::from_prot` never produces a writable-executable mapping, so this arm is the one place that undoes both | **NOT FIXED — recorded 2026-08-14**, found while retiring F5 and filed with §12's merge. Deliberately out of scope there: refusing the promotion makes a fetch that currently succeeds start taking SIGSEGV, which is a user-visible behaviour change (a JIT that writes into a `PROT_WRITE` file mapping and jumps into it works today) and needs its own change, its own acceptance run and a decision about whether anything on `disk.img` depends on it. The site now carries the finding in a comment so it cannot be re-merged silently | `src/exceptions.rs`, the `is_permission_fault` arm of `EC_INST_ABORT_LOWER`: the `update_current_user_page_flags(page_va, RX)` call has no `region_flags` predicate above it. `[IA-PERM-UPGRADE]` names the first instance per boot — it did **not** print in any run of §12.3's gate |
+| F10 | **Asymmetric recovery on a lazy-region miss.** When no lazy region covers the faulting VA, the data-abort arm falls back to re-mapping from the owner's *eager* `mmap` region list (`[DP-eager]`, "the PTE may have been lost") and then prints ~160 lines of forensics (errno-as-pointer decode, PMM poison decode over eight registers, page forensics, syscall-log dump). The instruction-abort arm has neither: six lines of register print, no recovery. So a lost PTE inside an eager mmap region is recoverable for a load and fatal for a fetch, and an instruction-side wild jump produces none of the diagnostics the data side has spent three investigations accumulating | **NOT FIXED — recorded 2026-08-14** while merging §6's bodies (§12, difference 8). Both halves are separable and neither is a merge: the recovery half is a policy question (should a fetch re-map an eager region?), the forensics half is a straight extraction of the DA `else` branch into a shared helper and is the cheaper, safer of the two | `src/exceptions.rs`: the `lazy_found.is_none()` branch of each arm. `[DP-eager]` exists only on the DA side; `[WILD-IA]` prints six registers where `[WILD-DA]` prints the poison decode and the syscall log |
 | F7 | survey errors: item 5 is three guards not two, ~24 lines not 142; `log_fault_reclaim`'s rustdoc opens with another function's sentence | **CLOSED 2026-08-14 — both already fixed, no code change.** Re-checked against `HEAD` (075ee16f), not against the audit's snapshot: the three guards were collapsed onto one `FaultSlotGuard` by the Phase 6 item 5 merge, and `log_fault_reclaim`'s rustdoc now opens with its own sentence. The corrections themselves are recorded in §7 and in `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 5 + Phase 6 | `git show HEAD:src/exceptions.rs \| grep -c 'struct \(CowFaultGuard\|DaFaultGuard\|FaultGuard\)'` → **0**; the rustdoc at `:709` |
 
 None of F1–F6 was being fixed in this document's original change. F1, F2 and
@@ -757,12 +776,18 @@ F4–F6 are recorded here because they are invisible from any single call site a
 only surface when the copies are read side by side — which is the argument for
 §8's items 3 and 4.
 
-> **Status as of 2026-08-14: every row in this table is closed.** F1, F1b, F2, F3
-> and F8 were closed earlier that day; F4, F5, F6 and F7 closed with the change in
-> §11 — two fixes, one retirement with evidence, one already-fixed bookkeeping row.
-> Nothing in this document is open work any more. What remains from the *pile* is
-> §8's items 5 (the ~330-line DA/IA body merge) and 8 (`map_user_page`/`_no_flush`),
-> both still graded high-risk and both still unstarted.
+> **Status as of 2026-08-14: F1–F8 are closed; F9 and F10 are open and were opened by
+> doing §8 item 5.** F1, F1b, F2, F3 and F8 closed early that day; F4, F5, F6 and F7
+> closed with the change in §11 — two fixes, one retirement with evidence, one
+> already-fixed bookkeeping row. Then the ~330-line DA/IA body merge itself landed
+> (§12), and reading the two arms *outside* the shared body — which is what a merge
+> forces you to do — produced two new rows. Both are recorded and neither is fixed;
+> both say why in their own cell. What remains from the *pile* is §8's item 8
+> (`map_user_page`/`_no_flush`), still high-risk and still unstarted.
+>
+> That F9 and F10 exist is the argument for the merge, not against it: they are the
+> third and fourth findings in this document that were invisible from either call site
+> alone and only surfaced when the copies were read side by side.
 >
 > The previous wording of this block — "all CONFIRMED by inspection, none with a
 > known symptom or trigger, all small" — was accurate about size and triggers and
@@ -1130,6 +1155,140 @@ A finding whose fix landed as a side effect of another change stays CONFIRMED
 forever unless someone re-runs it against the current tree, and there is no
 signal that this has happened — which is the argument for re-checking a stale
 row before working it, not after.
+
+## 12. §6's body merge — DONE (2026-08-14)
+
+The ~330-line DA/IA demand-paging merge §6 declined three times. It is one function
+now: `exceptions.rs`'s `demand_page_lazy_region`, called from both EL0 abort arms with
+an `akuma_exec::mmu::FaultAccess` naming the entry point. One body, two documented
+entry points — the shape §6 prescribed, not one behaviour with the differences erased.
+
+**Eight differences, not the two §6 listed.** Six of them were invisible from the
+table because they are formatting, observability, or scope:
+
+| # | difference | resolution |
+|---|---|---|
+| 1 | `map_flags` for a region that recorded none, and for every anonymous page: `RW_NO_EXEC` (DA) vs `RX` (IA) | **Parameter.** `FaultAccess::default_map_flags()`. A load/store wants data, a fetch wants text; the fault is the only evidence there is, and it is good evidence |
+| 2 | `is_exec` computed from `map_flags` (DA) vs hardcoded `true` (IA) | **Took the DA rule for both.** §12.1 — and the reason is not the one §6 or §11.2 gave |
+| 3 | Log tag `[DA-DP]` vs `[IA-DP]` | **Parameter.** `FaultAccess::tag()`. The two spellings stay distinct because every archived investigation greps for one of them; the `safe_print!`/`tprint!` buffers grew 128 → 160 to fit the substituted tag |
+| 4 | IA logged the file region under `DEMAND_PAGE_LOG_ENABLED`; DA had no such line at all | **Unified onto both arms.** The flag is `pub const … = false` (`config.rs:358`), so no shipped build's output moves; the DA arm gains a diagnostic it should always have had |
+| 5 | Guard binding named `_da_fault_guard` vs `_fault_guard`, and **only** the IA copy carried the rationale ("releases on ALL exit paths … including the early returns and fall-through to SIGSEGV") | One guard, and that rationale is now on the function, extended to say the fall-through is the caller's SIGSEGV |
+| 6 | Brace style drift: `for tf in table_frames { … }` and `if cur_va == page_va { … }` one-line in IA, three-line in DA | Noise. Resolved to the DA form. Worth listing only because it is ~30 of the 378 diff lines and it is what makes a mechanical diff of the two copies unreadable |
+| 7 | Comment drift: DA carried the load-bearing rationale (whole-page shareability, the `USER_PAGE_RESERVE` clamp, the dropped BKL, `ic ivau` by kernel VA), IA carried one-line summaries pointing at it | DA's comments kept verbatim; IA's pointers deleted. This is the bulk of the 378 lines and the reason the merge is worth doing at all — a rationale filed under one copy is a rationale the other copy's reader does not have |
+| 8 | The **surrounding** arms differ far more than the body did (below) | Left per-arm, deliberately |
+
+**What stayed per-arm, and why it is not cowardice.** The merged body starts after the
+`PROT_NONE` and kernel-VA guards and ends before the SIGSEGV path, because the code on
+either side of it is genuinely two different jobs:
+
+- **`PROT_NONE`.** DA auto-commits an anonymous `PROT_NONE` reservation as `RW` on
+  first touch — Go's `sysReserve`/`sysMap` pattern, with its own `DP_PROTNONE_PAGES`
+  counter and `[DA-NONE]` OOM line. IA falls through to SIGSEGV in one comment. Merging
+  those would mean deciding that an instruction fetch into a `PROT_NONE` reservation
+  should commit it executable, which is a policy change, not a deduplication.
+- **The lazy-region *miss* branch.** DA has ~160 lines (errno-as-pointer decode, PMM
+  poison decode across eight registers, page forensics, the syscall-log dump) plus an
+  eager-mmap-region re-map recovery; IA has six lines of register print and no recovery
+  at all. That asymmetry is now **F10** in §9 rather than something the merge quietly
+  levelled.
+
+### 12.1 The `is_exec` decision, and why the empirical check came back empty
+
+§11.2 said the merged body could take the DA rule because a non-exec IA page "reaches
+`RX` a moment later through the permission-fault branch, which runs the maintenance
+itself". That is true, and it is **not** what makes the change safe — the safety does
+not depend on that branch running at all:
+
+> `map_flags` never consulted the entry point when the region recorded flags of its
+> own. So the IA arm **already** mapped a non-exec file region non-exec, before this
+> merge, and `map_user_page_no_flush` ORs `user_flags_val` into the PTE verbatim
+> (`mmu/mod.rs:1641`) — `UXN` reaches the hardware. A page with `is_exec == false` is
+> therefore a page **no PE can fetch from**. Skipping `dc cvau`/`ic ivau` over it
+> cannot produce a stale-I-cache fetch, because there is no fetch. The pre-merge IA
+> arm was maintaining a page the MMU would refuse to execute.
+
+The permission-fault branch matters for a different reason: it is the only door by
+which such a page becomes executable, and it does the full sequence itself
+(`invalidate_icache_for_page_va` → `sync_icache_range`). So the maintenance moves from
+"once per faulting mapper, whether or not anyone executes" to "once, when someone
+actually does". Both halves of that are load-bearing and both are ten lines of
+inspection.
+
+**Two reachability facts, one of them measured.**
+
+1. *By inspection:* the gate cannot be observed in `file_page_cache` at all. Both cache
+   calls in the body (`lookup_and_ref`'s `want_exec`, `insert`'s `icache_done`) sit
+   under `is_shareable_mapping`, which requires `AP_RO_ALL`; and the only flag values a
+   lazy region can record — `user_flags::from_prot` and `elf::load::segment_page_flags`
+   are the sole producers — leave `UXN` clear whenever `AP` is `AP_RO_ALL`. **Non-exec
+   implies not shareable**, so those two calls only ever see `is_exec == true`, exactly
+   what IA hardcoded. Host test `non_exec_mappings_are_never_shareable` pins it, and
+   says what to reconsider if it ever fails.
+2. *Measured:* `[IA-PERM-UPGRADE]` (a new one-shot print at the permission branch) did
+   **not** fire once across four boots at SMP=1 and SMP=4, the full Tier 3 exercise
+   suite and the Tier 4 redis memtest. So the fault class the change touches — an
+   instruction fetch into a mapping its own region records non-exec — does not occur in
+   any workload this gate covers. `DP_IA_NOEXEC_FAULTS` counts it per fault for the
+   next workload that does — but note where it is *readable*: `dp_counters_line` has
+   exactly one caller, `log_memory_stats_on_crash`, so `ia_noexec=` appears in a crash
+   dump and nowhere else. (The comment above those counters claims a periodic `[Mem]`
+   line too; it has not been true for some time.) The live reachability signal is the
+   one-shot print, not the counter.
+
+The brief for this change asked for that trace, and said that if the recovery path did
+not run, the honest outcome was to keep IA unconditional. It did not run — and the
+conclusion is still the DA rule, because the trace was testing the wrong dependency.
+A zero there says **the change is inert in this workload**, not that anything is
+unmaintained: the pages it stops maintaining are pages the hardware will not execute.
+Recorded this way round on purpose, because "we verified it and saw nothing" and "we
+verified it and it was fine" are different results and only one of them is true here.
+
+### 12.2 What the boot test can and cannot reach
+
+`test_demand_paging_merged_body_policy` covers the merge's whole *decision* surface
+(the `FaultAccess` → `lazy_map_flags` → `is_exec` chain for every entry point × source
+× recorded-flags case) and the `icache_done` handshake through the real
+`file_page_cache`, both directions. Four host tests cover the same policy table plus
+the non-exec/shareable invariant above.
+
+None of them installs a PTE. `demand_page_lazy_region` maps through the
+ambient-`TTBR0` `mmu::map_user_page*` calls, so driving it from the boot suite would
+edit whichever address space is live and track the frames on a synthetic `Process` —
+the same wall `test_mm_bkl_drop` documents and stops at. Doing it properly needs a
+context switch to a synthetic process's own tables *with IRQs enabled* (the body does
+block I/O), which a self-test cannot arrange.
+
+That gap is covered, and covered hard, by everything else: **every process the boot
+suite and the acceptance binaries exec faults its text in through the
+instruction-abort entry point and its heap and data through the data-abort one.** A
+merge that broke either arm does not reach sshd. This is the one item in §8 where the
+end-to-end test is the whole system booting.
+
+### 12.3 Verification
+
+A/B against a `git worktree` at the parent commit (`2add6211`), `scripts/verify_trim.py`
+both arms. Every summary key identical except:
+
+| key | base | mine | reading |
+|---|---:|---:|---|
+| `host.tests` | 508 | **512** | +4 (`lazy_map_flags_policy_table`, `user_flags_is_exec_reads_only_uxn`, `fault_access_tags_stay_distinct`, `non_exec_mappings_are_never_shareable`) |
+| `smp1.passed_marker` | 275 | 276 | +1, the new boot test |
+| `smp4.passed_marker` | 282 | 283 | +1, same |
+| `smp4.bkl_stuck` | 111 | 96 | load-driven noise, documented; a real storm is thousands |
+
+`fail_set: (empty)` and `flaky_seen: (none)` on both arms at both SMP levels;
+`pass_marker: 95` unchanged (the new test reports in `[Test] … PASSED` form, like its
+neighbours); `host_timejumps: 0` everywhere, so the timing is trustworthy;
+`clippy.{release,extreme-size,devbox-smoltcp,devbox-rump}: clean`. Tier 3
+(`madvshared`, `cowstale`, `bssfork`, `bssfork 20 8 1`, `forkprobe`, `elftest`) `ok` at
+both levels. SMP=1 re-run once more on its own for the F8-class flake: identical.
+Tier 4 `redis.stage: ok`, `redis.vm_sigsegv: 0`.
+
+Size, since this is the profile with a floor: the `extreme-size` image (which excludes
+the boot test) went **636,568 → 628,376 bytes, −8,192**; the `--release` ELF −3,880,
+smaller because that build also *gains* the new boot test. Dependency edges: **none cut
+and none added** — the policy moved into `akuma-exec::mmu::types`, a crate `src/`
+already depends on, and `cargo tree` is byte-identical on both arms.
 
 ## Background
 

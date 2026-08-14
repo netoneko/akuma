@@ -97,6 +97,49 @@ mod tests {
         assert!(!mapping_is_read_only_to_user(mmu::user_flags::RW | other));
     }
 
+    /// **A non-executable mapping is never shareable.**
+    ///
+    /// This is what makes the merged DA/IA demand-paging body's `is_exec` gate inert
+    /// for `file_page_cache`: both cache calls in that body (`lookup_and_ref`'s
+    /// `want_exec` and `insert`'s `icache_done`) are reached only under
+    /// `is_shareable_mapping`, so if every shareable mapping is also executable, they
+    /// can only ever be called with `is_exec == true` — which is exactly what the
+    /// instruction-abort arm used to hardcode. Sharing requires `AP_RO_ALL`, and the
+    /// only `AP_RO_ALL` values a lazy region can record (`user_flags::from_prot` and
+    /// `elf::load::segment_page_flags` are the two producers) leave `UXN` clear.
+    ///
+    /// If this test ever fails, the `is_exec` gate has become observable in the shared
+    /// cache: `insert(.., false)` would start publishing `icache_done: false` for
+    /// pages that had it `true` before. That is still the *safe* direction ("maintain
+    /// it yourself"), but it is a behaviour change, so it should be a decision rather
+    /// than a surprise. See `docs/archive/COW_PILE_AUDIT.md` §12.1.
+    #[test]
+    fn non_exec_mappings_are_never_shareable() {
+        setup();
+        for flags in [
+            mmu::user_flags::NONE,
+            mmu::user_flags::RO,
+            mmu::user_flags::RX,
+            mmu::user_flags::RW,
+            mmu::user_flags::RW_NO_EXEC,
+        ] {
+            if !mmu::user_flags::is_exec(flags) {
+                assert!(
+                    !is_shareable_mapping(flags),
+                    "non-exec mapping {flags:#x} must not be shareable"
+                );
+            }
+        }
+        // The two producers of a lazy region's flags, exhaustively.
+        for prot in 0..8u32 {
+            let flags = mmu::user_flags::from_prot(prot);
+            assert!(
+                mmu::user_flags::is_exec(flags) || !is_shareable_mapping(flags),
+                "from_prot({prot}) = {flags:#x} is shareable but not exec"
+            );
+        }
+    }
+
     /// With the gate injected **on**, the gated form must agree with the pure
     /// predicate for every flag combination — i.e. the gate adds nothing but the
     /// kill switch.

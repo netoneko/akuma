@@ -1118,6 +1118,441 @@ fn drop_surplus_shared_ref(as_owner: u32, pf: crate::pmm::PhysFrame) {
     }
 }
 
+/// One-shot latch for the `[IA-PERM-UPGRADE]` line: the instruction-abort permission
+/// arm runs per faulting page, and this path is common enough in principle
+/// (every non-exec-mapped page a process executes) that a per-fault print would be a
+/// log flood on the fault path. See the print site for what the line answers.
+static IA_PERM_UPGRADE_SEEN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Demand-page a lazy region, for **both** EL0 abort arms.
+///
+/// One body, two documented entry points ([`akuma_exec::mmu::FaultAccess`]) — the
+/// shape §6 of `docs/archive/COW_PILE_AUDIT.md` prescribed for this merge. The data-
+/// abort and instruction-abort arms ran two copies of this algorithm for a long time;
+/// a `diff` of them was 378 lines of which everything load-bearing reduced to the
+/// three parameters named below (§12 there records the merge and every difference it
+/// resolved).
+///
+/// Three passes, and the split between them is the point:
+///
+/// - **Pass A — PLAN.** Count the pages that need a private frame, and resolve the
+///   ones already available as shared read-only pages (`file_page_cache`) up front,
+///   so the pool below covers real misses only. A fully-cached readahead batch must
+///   not allocate — and immediately free — 256 frames per fault.
+/// - **Pass B — FILL.** Read file data and run I-cache maintenance into PRIVATE
+///   frames. This is the long part (block I/O) and runs with **no** `as_lock` and,
+///   on `smp-shared`, with the BKL dropped, so peers can fault while this core waits
+///   on the disk.
+/// - **Pass C — INSTALL.** Map and track each filled frame under `as_lock`. Short, no
+///   alloc, no I/O. A frame that loses the install race to a peer is freed after the
+///   hold.
+///
+/// What the entry point decides, and nothing else:
+///
+/// 1. `map_flags` for a page whose region recorded none, and for every anonymous page
+///    ([`akuma_exec::mmu::lazy_map_flags`]): `RW_NO_EXEC` for a load/store, `RX` for
+///    an instruction fetch.
+/// 2. The log tag (`[DA-DP]` / `[IA-DP]`), because the archive greps for both.
+///
+/// Everything else — including whether the frame needs I-cache maintenance — follows
+/// from `map_flags`, which is why `is_exec` is derived here rather than passed in.
+///
+/// Returns `true` when the faulting page is present on return (mapped by this call or
+/// by a peer that won the race), i.e. when the caller should return to EL0 and let the
+/// access retry. `false` means every repair failed — the caller falls through to its
+/// own diagnostics and SIGSEGV. The fault slot is held for the whole call and released
+/// on every exit path, including that one.
+#[allow(clippy::too_many_arguments)]
+fn demand_page_lazy_region(
+    access: akuma_exec::mmu::FaultAccess,
+    pid: u32,
+    as_owner: u32,
+    far_usize: usize,
+    flags: u64,
+    source: &akuma_exec::process::LazySource,
+    region_start: usize,
+    region_size: usize,
+) -> bool {
+    let page_va = far_usize & !(0xFFF);
+
+    // Serialize demand paging per-page to prevent races when multiple CLONE_VM
+    // threads fault on the same page. Holder-tracked so a sibling can reclaim the
+    // slot if the holder died mid-fault (see fault_slot_acquire). The guard releases
+    // on ALL exit paths from this function, including the early returns and the
+    // fall-through to the caller's SIGSEGV.
+    let _fault_guard = fault_slot_hold(pid, as_owner, page_va);
+
+    let file_backed = matches!(source, akuma_exec::process::LazySource::File { .. });
+    let map_flags = akuma_exec::mmu::lazy_map_flags(access, flags, file_backed);
+    // I-cache maintenance is a property of the *mapping* this fault installs, not of
+    // the arm the fault arrived through: a page mapped non-exec cannot be fetched
+    // from, so `dc cvau`/`ic ivau` over it buys nothing. The instruction-abort arm
+    // used to hardcode `true` here — see COW_PILE_AUDIT.md §12.1 for why that was a
+    // cost rather than a correctness requirement, and what pays for it now.
+    let is_exec = akuma_exec::mmu::user_flags::is_exec(map_flags);
+    if access == akuma_exec::mmu::FaultAccess::Instruction && !is_exec {
+        // An instruction fetch into a mapping its own region records as non-exec.
+        // Counted because nothing in this tree had ever measured whether it happens:
+        // the page maps non-exec (it always did — `map_flags` never consulted the
+        // arm), so the fetch cannot succeed until the permission-fault arm upgrades
+        // it to RX, which is where its I-cache maintenance now happens.
+        crate::pmm::dp_count(&crate::pmm::DP_IA_NOEXEC_FAULTS, 1);
+    }
+    // Hoisted out of the per-page readahead loops below: `map_flags` is
+    // loop-invariant, and the predicate now reads the registered `ExecConfig` (which
+    // `config()` returns **by value** — the whole struct), so evaluating it per page
+    // cost a ~45-field copy up to 512 times per fault. Once per fault instead.
+    let shareable_mapping = crate::file_page_cache::is_shareable_mapping(map_flags);
+
+    if let akuma_exec::process::LazySource::File {
+        ref path, inode, file_offset, filesz, segment_va,
+    } = *source
+    {
+        if crate::config::DEMAND_PAGE_LOG_ENABLED {
+            crate::tprint!(256, "[{}] file region: fault_va={:#x} seg_va={:#x} filesz={:#x} file_off={:#x}\n",
+                access.tag(), far_usize, segment_va, filesz, file_offset);
+        }
+        const READAHEAD_PAGES: usize = 256;
+        let region_end = region_start + region_size;
+        let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
+
+        // Pass A — PLAN (see the header). Each shared hit already holds a reference
+        // for this mapper; anything that never gets installed is freed with the
+        // race-lost frames below, which balances it. Executable text is the main
+        // beneficiary — this is the path four concurrent `rustc`s take through the
+        // same `librustc_driver.so`.
+        let mut shared: alloc::vec::Vec<(usize, crate::pmm::PhysFrame, bool)> =
+            alloc::vec::Vec::new();
+        let mut needed = 0usize;
+        {
+            let mut va = page_va;
+            while va < ra_end {
+                if !akuma_exec::mmu::is_current_user_page_mapped(va) {
+                    // Only whole pages fully covered by file data are shareable: a
+                    // page straddling `filesz` has a zero-fill tail whose length
+                    // belongs to the mapping, not the file, so two mappers can
+                    // legitimately disagree about its contents.
+                    let full = va >= segment_va && va + 0x1000 <= segment_va + filesz;
+                    let hit = if full && shareable_mapping {
+                        let file_off = file_offset + (va - segment_va);
+                        crate::file_page_cache::lookup_and_ref(inode, file_off, is_exec)
+                    } else {
+                        None
+                    };
+                    match hit {
+                        Some((pf, needs_ic)) => {
+                            drop_surplus_shared_ref(as_owner, pf);
+                            shared.push((va, pf, needs_ic));
+                        }
+                        None => needed += 1,
+                    }
+                }
+                va += 0x1000;
+            }
+        }
+        let mut sh_idx = 0usize;
+
+        // Clamp the readahead batch so file-backed demand paging never drains the PMM
+        // below USER_PAGE_RESERVE — the same floor the anonymous path respects via
+        // alloc_page_zeroed_user(). Without this an mmap larger than RAM drains PMM to
+        // 0, and a later kernel-side alloc (IRQ/scheduler, no current process) panics
+        // into a whole-kernel brk #1 abort instead of SIGSEGV-ing the offending
+        // process. When the budget hits 0 (free <= reserve) nothing maps and we fall
+        // through to the single-page fallback below (alloc_page_zeroed_user -> None ->
+        // SIGSEGV).
+        let needed = needed.min(crate::pmm::user_readahead_budget(crate::pmm::free_count()));
+
+        // Batch-allocate all needed frames in one lock acquisition
+        let frame_pool = if needed > 0 {
+            crate::pmm::alloc_pages_zeroed(needed).unwrap_or_else(|| {
+                // Fallback: allocate what we can one at a time, still honouring the
+                // reserve so we can't starve the kernel.
+                let mut v = alloc::vec::Vec::new();
+                for _ in 0..needed {
+                    match crate::pmm::alloc_page_zeroed_user() {
+                        Some(f) => v.push(f),
+                        None => break,
+                    }
+                }
+                v
+            })
+        } else {
+            alloc::vec::Vec::new()
+        };
+        let mut pool_idx = 0usize;
+
+        // Pass B — FILL (no `as_lock`, no BKL-critical state): read file data + do
+        // icache maintenance into PRIVATE pool frames. This is the long part (block
+        // I/O) and runs OUTSIDE the per-AS lock so peers can fault/run in parallel
+        // (M5b). Records (va, frame) to install next.
+        let mut filled: alloc::vec::Vec<(usize, crate::pmm::PhysFrame)> = alloc::vec::Vec::new();
+        // M5b Stage 4a: DROP the BKL for the block-I/O fill so peer cores can enter
+        // the kernel while this core waits on the disk (the measured ~10 ms hold).
+        // Pass B touches only PRIVATE frames + the block device (own lock) + the held
+        // fault-slot — no BKL-protected state. The dropped-window ledger keeps the
+        // fill BKL-free across timer ticks (the IRQ reconcile used to re-hold it for
+        // the fill's remainder); the wrapper's leave_kernel still balances it.
+        // Concurrent munmap clears PTEs but never frees the intermediate tables this
+        // loop's page-table reads walk (freed only at teardown, which can't run while
+        // this thread faults).
+        #[cfg(kernel_smp_shared)]
+        let fault_dropped_bkl = crate::smp_shared::fault_bkl_drop_enabled();
+        #[cfg(kernel_smp_shared)]
+        if fault_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
+        let mut cur_va = page_va;
+        while cur_va < ra_end {
+            if akuma_exec::mmu::is_current_user_page_mapped(cur_va) {
+                cur_va += 0x1000;
+                continue;
+            }
+            // Shared hit resolved in Pass A: already filled by whoever faulted it
+            // first, so there is nothing to read and no frame to consume. `shared` is
+            // built in ascending VA order by the same walk this loop performs, so an
+            // index pointer is enough.
+            if sh_idx < shared.len() && shared[sh_idx].0 == cur_va {
+                let (_, pf, needs_ic) = shared[sh_idx];
+                sh_idx += 1;
+                if needs_ic {
+                    // Cached from a plain RO mapper that never ran `ic ivau`; this
+                    // mapper wants to execute it, so pay the maintenance once and
+                    // record it for the next mapper. `sync_icache_range` returns only
+                    // after the closing `dsb ish`, so the invalidation is complete and
+                    // inner-shareable BEFORE `mark_icache_clean` tells the next mapper
+                    // it may skip the maintenance.
+                    let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
+                    akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
+                    let file_off = file_offset + (cur_va - segment_va);
+                    crate::file_page_cache::mark_icache_clean(inode, file_off, pf);
+                }
+                filled.push((cur_va, pf));
+                cur_va += 0x1000;
+                continue;
+            }
+            if pool_idx >= frame_pool.len() {
+                break;
+            }
+            let pf = frame_pool[pool_idx];
+            pool_idx += 1;
+
+            {
+                let pg_data_start = core::cmp::max(cur_va, segment_va);
+                let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
+                if pg_data_start < pg_data_end {
+                    let dst_off = pg_data_start - cur_va;
+                    let file_off = file_offset + (pg_data_start - segment_va);
+                    let len = pg_data_end - pg_data_start;
+                    let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
+                    let page_buf = unsafe {
+                        core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
+                    };
+                    if inode != 0 {
+                        let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
+                    } else {
+                        let _ = crate::vfs::read_at(path, file_off, page_buf);
+                    }
+                }
+            }
+
+            if is_exec {
+                // By the kernel VA (kva), not the user VA: the user page is not mapped
+                // yet, so `ic ivau` on cur_va translation-faults on real hardware /
+                // HVF. I-cache invalidation to PoU is by physical address, so the kva
+                // alias of the same frame is equivalent and always mapped.
+                let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
+                akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
+            }
+            // Publish for every other mapper of this file page. Must come after the
+            // fill and the I-cache maintenance above — and after the maintenance has
+            // *completed*, which is why the closing `dsb ish` lives inside
+            // `sync_icache_range` rather than after the install pass: a peer core can
+            // map this frame the instant it lands in the cache, and it will trust
+            // `icache_done`.
+            //
+            // `icache_done: is_exec` is a claim about the FRAME ("has been through
+            // `dc cvau` + `ic ivau`"), not about this mapping's permissions, and it is
+            // exactly as true as the gate above: `false` means "maintain it yourself",
+            // which is the safe direction for a later `RX` mapper. See
+            // COW_PILE_AUDIT.md F5 and §12.1.
+            if cur_va >= segment_va
+                && cur_va + 0x1000 <= segment_va + filesz
+                && shareable_mapping
+            {
+                let file_off = file_offset + (cur_va - segment_va);
+                crate::file_page_cache::insert(inode, file_off, pf, is_exec);
+            }
+            filled.push((cur_va, pf));
+            cur_va += 0x1000;
+        }
+        // Close the window: re-takes the BKL for the install pass (unless a
+        // still-open outer window means it must stay dropped).
+        #[cfg(kernel_smp_shared)]
+        if fault_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
+
+        // Pass C — INSTALL (under `as_lock`): atomically map each filled frame +
+        // track it. Short, no alloc/IO. A frame that loses the install race (a peer
+        // mapped the VA) is collected and freed after the hold.
+        let mut any_mapped = false;
+        let mut pages_mapped = 0u64;
+        let mut race_free: alloc::vec::Vec<crate::pmm::PhysFrame> = alloc::vec::Vec::new();
+        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+            #[cfg(kernel_smp_shared)]
+            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+            for (cur_va, pf) in filled.iter().copied() {
+                // no_flush: batch the TLB invalidation after the loop.
+                let (table_frames, installed) = unsafe {
+                    akuma_exec::mmu::map_user_page_no_flush(cur_va, pf.addr, map_flags)
+                };
+                for tf in table_frames {
+                    owner.address_space.track_page_table_frame(tf);
+                }
+                if installed {
+                    owner.address_space.track_user_frame(pf);
+                    any_mapped = true;
+                    pages_mapped += 1;
+                } else {
+                    // Race: a peer mapped this page. Free our frame after the hold;
+                    // the faulting page is now present regardless.
+                    race_free.push(pf);
+                    if cur_va == page_va {
+                        any_mapped = true;
+                    }
+                }
+            }
+            // Flush the whole mapped run in one shot (fewer barriers).
+            if any_mapped {
+                akuma_exec::mmu::flush_tlb_range(page_va, pages_mapped as usize);
+            }
+        } else {
+            // No owner (degenerate): nothing to install; free what we filled.
+            for (_, pf) in filled.iter().copied() { race_free.push(pf); }
+        }
+
+        // Free race-lost frames + unused pool frames (outside the hold).
+        for pf in race_free { crate::pmm::free_page(pf); }
+        while pool_idx < frame_pool.len() {
+            crate::pmm::free_page(frame_pool[pool_idx]);
+            pool_idx += 1;
+        }
+
+        // No `dsb ish; isb` here. It used to sit at this point, *after* the install
+        // pass, which put the completion of the I-cache maintenance later than the
+        // first instant a peer could fetch from the frame (Pass B publishes to
+        // `file_page_cache`; Pass C publishes the PTE). The pair now closes each
+        // page's `sync_icache_range` in Pass B, and `flush_tlb_range` above ends in
+        // `dsb ish; isb` of its own, so the return to EL0 is still fully
+        // synchronized. See COW_PILE_AUDIT.md F4.
+
+        if any_mapped {
+            crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, pages_mapped as usize);
+            crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
+            if crate::config::PROCESS_SYSCALL_STATS
+                && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                    owner.syscall_stats.inc_pagefault(pages_mapped);
+                }
+            return true;
+        } else if akuma_exec::mmu::is_current_user_page_mapped(page_va) {
+            // Race: another CPU mapped the faulting page while we were doing
+            // readahead. The page is now present — return success.
+            return true;
+        }
+        // Readahead pool was exhausted before reaching page_va.
+        // Fall back to a single-page allocation for just the faulting page.
+        let (_, _, free) = crate::pmm::stats();
+        crate::tprint!(160, "[{}] pid={} va=0x{:x} readahead pool exhausted, {} free pages — retrying single page\n",
+            access.tag(), pid, far_usize, free);
+        if let Some(pf) = crate::pmm::alloc_page_zeroed_user() {
+            // Re-read file data for this single page
+            let pg_data_start = core::cmp::max(page_va, segment_va);
+            let pg_data_end = core::cmp::min(page_va + 0x1000, segment_va + filesz);
+            if pg_data_start < pg_data_end {
+                let dst_off = pg_data_start - page_va;
+                let file_off = file_offset + (pg_data_start - segment_va);
+                let len = pg_data_end - pg_data_start;
+                let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
+                let page_buf = unsafe {
+                    core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
+                };
+                if inode != 0 {
+                    let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
+                } else {
+                    let _ = crate::vfs::read_at(path, file_off, page_buf);
+                }
+            }
+            if is_exec {
+                // By the kernel VA (kva), not the user VA: the user page is not mapped
+                // yet at this point (the map happens below), so `ic ivau` on page_va
+                // translation-faults on real hardware / HVF. I-cache invalidation to
+                // PoU is by physical address, so the kva alias of the same frame is
+                // equivalent and always mapped. The sequence completes (`dsb ish;
+                // isb`) before the PTE below publishes the frame.
+                let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
+                akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
+            }
+            // Install + track under `as_lock` (frame + file data already prepared
+            // above, outside the hold).
+            let mut installed_ok = false;
+            if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                #[cfg(kernel_smp_shared)]
+                let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+                let (table_frames, installed) = unsafe {
+                    akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags)
+                };
+                for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
+                if installed {
+                    owner.address_space.track_user_frame(pf);
+                    installed_ok = true;
+                }
+            }
+            if !installed_ok {
+                crate::pmm::free_page(pf);
+            }
+            crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, 1);
+            crate::syscall::syscall_counters::inc_pagefault(1);
+            return true;
+        }
+        let (_, _, free2) = crate::pmm::stats();
+        crate::tprint!(160, "[{}] pid={} va=0x{:x} single-page fallback OOM, {} free pages\n",
+            access.tag(), pid, far_usize, free2);
+    } else if let Some(page_frame) = crate::pmm::alloc_page_zeroed_user() {
+        // Anonymous demand page: frame (zeroed) allocated OUTSIDE `as_lock`;
+        // install + track under it.
+        let mut installed_ok = false;
+        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+            #[cfg(kernel_smp_shared)]
+            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
+            let (table_frames, installed) = unsafe {
+                akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
+            };
+            for tf in table_frames {
+                owner.address_space.track_page_table_frame(tf);
+            }
+            if installed {
+                owner.address_space.track_user_frame(page_frame);
+                installed_ok = true;
+            }
+        }
+        if installed_ok {
+            crate::pmm::dp_count(&crate::pmm::DP_ANON_PAGES, 1);
+            crate::syscall::syscall_counters::inc_pagefault(1);
+            if crate::config::PROCESS_SYSCALL_STATS
+                && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                    owner.syscall_stats.inc_pagefault(1);
+                }
+        } else {
+            // Race (peer mapped it) or no owner: free our frame.
+            crate::pmm::free_page(page_frame);
+        }
+        // Page is mapped (by us or another CPU) - success
+        return true;
+    } else {
+        let (_, _, free) = crate::pmm::stats();
+        crate::tprint!(160, "[{}] pid={} va=0x{:x} anon alloc failed, {} free pages\n",
+            access.tag(), pid, far_usize, free);
+    }
+    false
+}
+
 /// Which mechanism overwrites the PTE during a CoW break, and who holds `as_lock`
 /// while it happens.
 ///
@@ -3894,374 +4329,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         // would corrupt kernel memory.  Fall through to SIGSEGV.
                         crate::tprint!(128, "[DA-DP] pid={} fault in kernel VA range {:#x} -> SIGSEGV\n",
                             pid, far_usize);
-                    } else {
-                    let page_va = far_usize & !(0xFFF);
-
-                    // Serialize demand paging per-page to prevent races when
-                    // multiple CLONE_VM threads fault on the same page.
-                    // Holder-tracked so a sibling can reclaim the slot if the
-                    // holder died mid-fault (see fault_slot_acquire).
-                    let _da_fault_guard = fault_slot_hold(pid, as_owner, page_va);
-
-                    let map_flags = match source {
-                        akuma_exec::process::LazySource::File { .. } => {
-                            if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RW_NO_EXEC }
-                        }
-                        _ => akuma_exec::mmu::user_flags::RW_NO_EXEC,
-                    };
-                    let is_exec = (map_flags & akuma_exec::mmu::flags::UXN) == 0;
-                    // Hoisted out of the per-page readahead loops below: `map_flags`
-                    // is loop-invariant, and the predicate now reads the registered
-                    // `ExecConfig` (which `config()` returns **by value** — the whole
-                    // struct), so evaluating it per page cost a ~45-field copy up to
-                    // 512 times per fault. Once per fault instead.
-                    let shareable_mapping = crate::file_page_cache::is_shareable_mapping(map_flags);
-
-                    if let akuma_exec::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
-                        const READAHEAD_PAGES: usize = 256;
-                        let region_end = region_start + region_size;
-                        let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
-
-                        // Pass A — PLAN. Count pages that need a private frame, and
-                        // resolve the ones already available as shared read-only pages
-                        // (`file_page_cache`) up front so the pool below only covers
-                        // real misses. Doing this here rather than in the fill loop is
-                        // what keeps a fully-cached readahead batch from allocating —
-                        // and immediately freeing — 256 frames per fault.
-                        //
-                        // Each hit already holds a reference for this mapper; anything
-                        // that never gets installed is freed with the race-lost frames
-                        // below, which balances it.
-                        let mut shared: alloc::vec::Vec<(usize, crate::pmm::PhysFrame, bool)> =
-                            alloc::vec::Vec::new();
-                        let mut needed = 0usize;
-                        {
-                            let mut va = page_va;
-                            while va < ra_end {
-                                if !akuma_exec::mmu::is_current_user_page_mapped(va) {
-                                    // Only whole pages fully covered by file data are
-                                    // shareable: a page straddling `filesz` has a
-                                    // zero-fill tail whose length belongs to the mapping,
-                                    // not the file, so two mappers can legitimately
-                                    // disagree about its contents.
-                                    let full = va >= segment_va
-                                        && va + 0x1000 <= segment_va + filesz;
-                                    let hit = if full && shareable_mapping {
-                                        let file_off = file_offset + (va - segment_va);
-                                        crate::file_page_cache::lookup_and_ref(inode, file_off, is_exec)
-                                    } else {
-                                        None
-                                    };
-                                    match hit {
-                                        Some((pf, needs_ic)) => {
-                                            drop_surplus_shared_ref(as_owner, pf);
-                                            shared.push((va, pf, needs_ic));
-                                        }
-                                        None => needed += 1,
-                                    }
-                                }
-                                va += 0x1000;
-                            }
-                        }
-                        let mut sh_idx = 0usize;
-
-                        // Clamp the readahead batch so file-backed demand paging never
-                        // drains the PMM below USER_PAGE_RESERVE — the same floor the
-                        // anonymous path respects via alloc_page_zeroed_user(). Without
-                        // this an mmap larger than RAM drains PMM to 0, and a later
-                        // kernel-side alloc (IRQ/scheduler, no current process) panics
-                        // into a whole-kernel brk #1 abort instead of SIGSEGV-ing the
-                        // offending process. When the budget hits 0 (free <= reserve)
-                        // nothing maps and we fall through to the single-page fallback
-                        // below (alloc_page_zeroed_user -> None -> SIGSEGV).
-                        let needed = needed.min(crate::pmm::user_readahead_budget(crate::pmm::free_count()));
-
-                        // Batch-allocate all needed frames in one lock acquisition
-                        let frame_pool = if needed > 0 {
-                            crate::pmm::alloc_pages_zeroed(needed).unwrap_or_else(|| {
-                                // Fallback: allocate what we can one at a time, still
-                                // honouring the reserve so we can't starve the kernel.
-                                let mut v = alloc::vec::Vec::new();
-                                for _ in 0..needed {
-                                    match crate::pmm::alloc_page_zeroed_user() {
-                                        Some(f) => v.push(f),
-                                        None => break,
-                                    }
-                                }
-                                v
-                            })
-                        } else {
-                            alloc::vec::Vec::new()
-                        };
-                        let mut pool_idx = 0usize;
-
-                        // Pass B — FILL (no `as_lock`, no BKL-critical state): read file
-                        // data + do icache maintenance into PRIVATE pool frames. This is the
-                        // long part (block I/O) and runs OUTSIDE the per-AS lock so peers can
-                        // fault/run in parallel (M5b). Records (va, frame) to install next.
-                        let mut filled: alloc::vec::Vec<(usize, crate::pmm::PhysFrame)> = alloc::vec::Vec::new();
-                        // M5b Stage 4a: DROP the BKL for the block-I/O fill so peer cores can
-                        // enter the kernel while this core waits on the disk (the measured
-                        // ~10 ms hold). Pass B touches only PRIVATE frames + the block device
-                        // (own lock) + the held fault-slot — no BKL-protected state. The
-                        // dropped-window ledger keeps the fill BKL-free across timer ticks
-                        // (the IRQ reconcile used to re-hold it for the fill's remainder);
-                        // the wrapper's leave_kernel still balances it. Concurrent munmap
-                        // clears PTEs but never frees the intermediate tables this loop's
-                        // page-table reads walk (freed only at teardown, which can't run
-                        // while this thread faults).
-                        #[cfg(kernel_smp_shared)]
-                        let fault_dropped_bkl = crate::smp_shared::fault_bkl_drop_enabled();
-                        #[cfg(kernel_smp_shared)]
-                        if fault_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
-                        let mut cur_va = page_va;
-                        while cur_va < ra_end {
-                            if akuma_exec::mmu::is_current_user_page_mapped(cur_va) {
-                                cur_va += 0x1000;
-                                continue;
-                            }
-                            // Shared hit resolved in Pass A: already filled by whoever
-                            // faulted it first, so there is nothing to read and no frame
-                            // to consume. `shared` is built in ascending VA order by the
-                            // same walk this loop performs, so an index pointer is enough.
-                            if sh_idx < shared.len() && shared[sh_idx].0 == cur_va {
-                                let (_, pf, needs_ic) = shared[sh_idx];
-                                sh_idx += 1;
-                                if needs_ic {
-                                    // Cached from a plain RO mapper that never ran `ic
-                                    // ivau`; this mapper wants to execute it, so pay the
-                                    // maintenance once and record it for the next mapper.
-                                    // `sync_icache_range` returns only after the closing
-                                    // `dsb ish`, so the invalidation is complete and
-                                    // inner-shareable BEFORE `mark_icache_clean` tells the
-                                    // next mapper it may skip the maintenance.
-                                    let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                                    akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
-                                    let file_off = file_offset + (cur_va - segment_va);
-                                    crate::file_page_cache::mark_icache_clean(inode, file_off, pf);
-                                }
-                                filled.push((cur_va, pf));
-                                cur_va += 0x1000;
-                                continue;
-                            }
-                            if pool_idx >= frame_pool.len() {
-                                break;
-                            }
-                            let pf = frame_pool[pool_idx];
-                            pool_idx += 1;
-
-                            {
-                                let pg_data_start = core::cmp::max(cur_va, segment_va);
-                                let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
-                                if pg_data_start < pg_data_end {
-                                    let dst_off = pg_data_start - cur_va;
-                                    let file_off = file_offset + (pg_data_start - segment_va);
-                                    let len = pg_data_end - pg_data_start;
-                                    let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
-                                    let page_buf = unsafe {
-                                        core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
-                                    };
-                                    if inode != 0 {
-                                        let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
-                                    } else {
-                                        let _ = crate::vfs::read_at(path, file_off, page_buf);
-                                    }
-                                }
-                            }
-
-                            if is_exec {
-                                // By the kernel VA (kva), not the user VA: the user page is
-                                // not mapped yet, so `ic ivau` on cur_va translation-faults
-                                // on real hardware / HVF. I-cache invalidation to PoU is by
-                                // physical address, so the kva alias of the same frame is
-                                // equivalent and always mapped.
-                                let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                                akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
-                            }
-                            // Publish for every other mapper of this file page. Must come
-                            // after the fill and the I-cache maintenance above — and after
-                            // the maintenance has *completed*, which is why the closing
-                            // `dsb ish` lives inside `sync_icache_range` rather than after
-                            // the install pass: a peer core can map this frame the instant
-                            // it lands in the cache, and it will trust `icache_done`.
-                            if cur_va >= segment_va
-                                && cur_va + 0x1000 <= segment_va + filesz
-                                && shareable_mapping
-                            {
-                                let file_off = file_offset + (cur_va - segment_va);
-                                crate::file_page_cache::insert(inode, file_off, pf, is_exec);
-                            }
-                            filled.push((cur_va, pf));
-                            cur_va += 0x1000;
-                        }
-                        // Close the window: re-takes the BKL for the install pass (unless a
-                        // still-open outer window means it must stay dropped).
-                        #[cfg(kernel_smp_shared)]
-                        if fault_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
-
-                        // Pass C — INSTALL (under `as_lock`): atomically map each filled frame
-                        // + track it. Short, no alloc/IO. A frame that loses the install race
-                        // (a peer mapped the VA) is collected and freed after the hold.
-                        let mut any_mapped = false;
-                        let mut pages_mapped = 0u64;
-                        let mut race_free: alloc::vec::Vec<crate::pmm::PhysFrame> = alloc::vec::Vec::new();
-                        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                            #[cfg(kernel_smp_shared)]
-                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
-                            for (cur_va, pf) in filled.iter().copied() {
-                                // no_flush: batch the TLB invalidation after the loop.
-                                let (table_frames, installed) = unsafe {
-                                    akuma_exec::mmu::map_user_page_no_flush(cur_va, pf.addr, map_flags)
-                                };
-                                for tf in table_frames {
-                                    owner.address_space.track_page_table_frame(tf);
-                                }
-                                if installed {
-                                    owner.address_space.track_user_frame(pf);
-                                    any_mapped = true;
-                                    pages_mapped += 1;
-                                } else {
-                                    // Race: a peer mapped this page. Free our frame after the
-                                    // hold; the faulting page is now present regardless.
-                                    race_free.push(pf);
-                                    if cur_va == page_va {
-                                        any_mapped = true;
-                                    }
-                                }
-                            }
-                            // Flush the whole mapped run in one shot (fewer barriers).
-                            if any_mapped {
-                                akuma_exec::mmu::flush_tlb_range(page_va, pages_mapped as usize);
-                            }
-                        } else {
-                            // No owner (degenerate): nothing to install; free what we filled.
-                            for (_, pf) in filled.iter().copied() { race_free.push(pf); }
-                        }
-
-                        // Free race-lost frames + unused pool frames (outside the hold).
-                        for pf in race_free { crate::pmm::free_page(pf); }
-                        while pool_idx < frame_pool.len() {
-                            crate::pmm::free_page(frame_pool[pool_idx]);
-                            pool_idx += 1;
-                        }
-
-                        // No `dsb ish; isb` here. It used to sit at this point, *after* the
-                        // install pass, which put the completion of the I-cache maintenance
-                        // later than the first instant a peer could fetch from the frame
-                        // (Pass B publishes to `file_page_cache`; Pass C publishes the PTE).
-                        // The pair now closes each page's `sync_icache_range` in Pass B, and
-                        // `flush_tlb_range` above ends in `dsb ish; isb` of its own, so the
-                        // return to EL0 is still fully synchronized. See COW_PILE_AUDIT.md F4.
-
-                        if any_mapped {
-                            crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, pages_mapped as usize);
-                            crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
-                            if crate::config::PROCESS_SYSCALL_STATS
-                                && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                                    owner.syscall_stats.inc_pagefault(pages_mapped);
-                                }
-                            return unsafe { (*frame).x0 };
-                        } else if akuma_exec::mmu::is_current_user_page_mapped(page_va) {
-                            // Race: another CPU mapped the faulting page while we were doing
-                            // readahead. The page is now present — return success.
-                            return unsafe { (*frame).x0 };
-                        }
-                        // Readahead pool was exhausted before reaching page_va.
-                        // Fall back to a single-page allocation for just the faulting page.
-                        let (_, _, free) = crate::pmm::stats();
-                        crate::tprint!(128, "[DA-DP] pid={} va=0x{:x} readahead pool exhausted, {} free pages — retrying single page\n",
-                            pid, far_usize, free);
-                        if let Some(pf) = crate::pmm::alloc_page_zeroed_user() {
-                            // Re-read file data for this single page
-                            let pg_data_start = core::cmp::max(page_va, segment_va);
-                            let pg_data_end = core::cmp::min(page_va + 0x1000, segment_va + filesz);
-                            if pg_data_start < pg_data_end {
-                                let dst_off = pg_data_start - page_va;
-                                let file_off = file_offset + (pg_data_start - segment_va);
-                                let len = pg_data_end - pg_data_start;
-                                let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
-                                let page_buf = unsafe {
-                                    core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
-                                };
-                                if inode != 0 {
-                                    let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
-                                } else {
-                                    let _ = crate::vfs::read_at(path, file_off, page_buf);
-                                }
-                            }
-                            if is_exec {
-                                // By the kernel VA (kva), not the user VA: the user page is
-                                // not mapped yet at this point (the map happens below), so
-                                // `ic ivau` on page_va translation-faults on real hardware /
-                                // HVF. I-cache invalidation to PoU is by physical address,
-                                // so the kva alias of the same frame is equivalent and
-                                // always mapped. The sequence completes (`dsb ish; isb`)
-                                // before the PTE below publishes the frame.
-                                let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                                akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
-                            }
-                            // Install + track under `as_lock` (frame + file data already
-                            // prepared above, outside the hold).
-                            let mut installed_ok = false;
-                            if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                                #[cfg(kernel_smp_shared)]
-                                let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
-                                let (table_frames, installed) = unsafe {
-                                    akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags)
-                                };
-                                for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
-                                if installed {
-                                    owner.address_space.track_user_frame(pf);
-                                    installed_ok = true;
-                                }
-                            }
-                            if !installed_ok {
-                                crate::pmm::free_page(pf);
-                            }
-                            crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, 1);
-                            crate::syscall::syscall_counters::inc_pagefault(1);
-                            return unsafe { (*frame).x0 };
-                        }
-                        let (_, _, free2) = crate::pmm::stats();
-                        crate::tprint!(128, "[DA-DP] pid={} va=0x{:x} single-page fallback OOM, {} free pages\n",
-                            pid, far_usize, free2);
-                    } else if let Some(page_frame) = crate::pmm::alloc_page_zeroed_user() {
-                        // Anonymous demand page: frame (zeroed) allocated OUTSIDE `as_lock`;
-                        // install + track under it.
-                        let mut installed_ok = false;
-                        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                            #[cfg(kernel_smp_shared)]
-                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
-                            let (table_frames, installed) = unsafe {
-                                akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
-                            };
-                            for tf in table_frames {
-                                owner.address_space.track_page_table_frame(tf);
-                            }
-                            if installed {
-                                owner.address_space.track_user_frame(page_frame);
-                                installed_ok = true;
-                            }
-                        }
-                        if installed_ok {
-                            crate::pmm::dp_count(&crate::pmm::DP_ANON_PAGES, 1);
-                            crate::syscall::syscall_counters::inc_pagefault(1);
-                            if crate::config::PROCESS_SYSCALL_STATS
-                                && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                                    owner.syscall_stats.inc_pagefault(1);
-                                }
-                        } else {
-                            // Race (peer mapped it) or no owner: free our frame.
-                            crate::pmm::free_page(page_frame);
-                        }
-                        // Page is mapped (by us or another CPU) - success
+                    } else if demand_page_lazy_region(
+                        akuma_exec::mmu::FaultAccess::Data,
+                        pid, as_owner, far_usize, flags, &source, region_start, region_size,
+                    ) {
                         return unsafe { (*frame).x0 };
-                    } else {
-                        let (_, _, free) = crate::pmm::stats();
-                        crate::tprint!(128, "[DA-DP] pid={} va=0x{:x} anon alloc failed, {} free pages\n",
-                                pid, far_usize, free);
                     }
-                    } // end else (not PROT_NONE)
                 } else {
                     // Fallback: check eager mmap regions — the PTE may have been lost.
                     // Use lookup_process(as_owner): thread-group leader (tgid). current_process() goes
@@ -4475,11 +4548,39 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             let is_permission_fault = fault_type == 0x0C;
             let far_usize = far as usize;
 
+            // Lazy region permission upgrade: an instruction fetch hit a page this
+            // address space has mapped non-executable. Upgrade it to `RX` and run the
+            // I-cache maintenance for the frame, which the demand-paging body
+            // deliberately skipped for a non-exec mapping (COW_PILE_AUDIT.md §12.1) —
+            // `invalidate_icache_for_page_va` is the full `dc cvau`/`ic ivau`/`dsb
+            // ish`/`isb` sequence over the page, so this is the *only* site that has
+            // to pay for it, and it pays once per page rather than once per mapper.
+            //
+            // **This does not check that `region_flags` is executable** — any lazy
+            // region that is not `PROT_NONE` gets promoted to `RX`, so jumping into a
+            // `PROT_READ|PROT_WRITE` file mapping silently makes it executable. W^X is
+            // not enforced on this path. Recorded as F9 in COW_PILE_AUDIT.md §9 and
+            // deliberately left alone here: refusing the promotion is a user-visible
+            // behaviour change (a legitimate-looking fetch would start taking SIGSEGV)
+            // and belongs in its own change with its own verification, not inside a
+            // body merge.
             if is_permission_fault
                 && let Some((region_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize)
                     && !akuma_exec::mmu::user_flags::is_none(region_flags) {
                         let page_va = far_usize & !(0xFFF);
                         if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
+                            // One-shot, because this is the recovery path the merged
+                            // body's `is_exec` gate relies on and nothing had ever
+                            // observed it running. Printing per fault would be a
+                            // per-page log line on the fault path; printing once names
+                            // the class and its first instance.
+                            if !IA_PERM_UPGRADE_SEEN
+                                .swap(true, core::sync::atomic::Ordering::Relaxed)
+                            {
+                                crate::safe_print!(192,
+                                    "[IA-PERM-UPGRADE] pid={} as_owner={} va={:#x} region_flags={:#x} -> RX (first of boot)\n",
+                                    pid, as_owner, page_va, region_flags);
+                            }
                             // PTE permission edit under `as_lock` (shared-kernel SMP).
                             #[cfg(kernel_smp_shared)]
                             let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
@@ -4511,325 +4612,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         // would corrupt kernel memory.  Fall through to SIGSEGV.
                         crate::tprint!(128, "[IA-DP] pid={} fault in kernel VA range {:#x} -> SIGSEGV\n",
                             pid, far_usize);
-                    } else {
-                    let page_va = far_usize & !(0xFFF);
-
-                    // Serialize page fault handling for this process so concurrent
-                    // instruction faults on the same page yield until we are done
-                    // mapping. Holder-tracked so a sibling can reclaim the slot if
-                    // the holder died mid-fault (see fault_slot_acquire). The guard
-                    // releases on ALL exit paths from this block, including the
-                    // early returns and fall-through to SIGSEGV.
-                    let _fault_guard = fault_slot_hold(pid, as_owner, page_va);
-
-                    let map_flags = match source {
-                        akuma_exec::process::LazySource::File { .. } => {
-                            if flags != 0 { flags } else { akuma_exec::mmu::user_flags::RX }
-                        }
-                        _ => akuma_exec::mmu::user_flags::RX,
-                    };
-                    // Hoisted for the same reason as the data-abort arm: loop-invariant,
-                    // and `config()` returns `ExecConfig` by value.
-                    let shareable_mapping = crate::file_page_cache::is_shareable_mapping(map_flags);
-
-                    if let akuma_exec::process::LazySource::File { ref path, inode, file_offset, filesz, segment_va } = source {
-                        if crate::config::DEMAND_PAGE_LOG_ENABLED {
-                            crate::tprint!(256, "[IA-DP] file region: fault_va={:#x} seg_va={:#x} filesz={:#x} file_off={:#x}\n",
-                                far_usize, segment_va, filesz, file_offset);
-                        }
-                        const READAHEAD_PAGES: usize = 256;
-                        let region_end = region_start + region_size;
-                        let ra_end = core::cmp::min(page_va + READAHEAD_PAGES * 0x1000, region_end);
-
-                        // Count needed pages then batch-allocate (single PMM lock).
-                        // Shared read-only file pages are resolved here too, for the same
-                        // reason as the data-abort arm: an already-cached batch must not
-                        // allocate a pool it will immediately free. Executable text is the
-                        // *main* beneficiary — this is the path four concurrent `rustc`s
-                        // take through the same `librustc_driver.so`.
-                        let mut shared: alloc::vec::Vec<(usize, crate::pmm::PhysFrame, bool)> =
-                            alloc::vec::Vec::new();
-                        let mut needed = 0usize;
-                        {
-                            let mut va = page_va;
-                            while va < ra_end {
-                                if !akuma_exec::mmu::is_current_user_page_mapped(va) {
-                                    let full = va >= segment_va
-                                        && va + 0x1000 <= segment_va + filesz;
-                                    let hit = if full && shareable_mapping {
-                                        // `want_exec: true` unconditionally, matching the
-                                        // unconditional maintenance in the fill loop below.
-                                        // It is an over-request when `map_flags` is non-exec
-                                        // (cost: one `sync_icache_range` on a frame nobody
-                                        // executes), never an under-request — and the frame
-                                        // reached this arm through an instruction fetch, so
-                                        // it is the likelier of the two guesses.
-                                        let file_off = file_offset + (va - segment_va);
-                                        crate::file_page_cache::lookup_and_ref(inode, file_off, true)
-                                    } else {
-                                        None
-                                    };
-                                    match hit {
-                                        Some((pf, needs_ic)) => {
-                                            drop_surplus_shared_ref(as_owner, pf);
-                                            shared.push((va, pf, needs_ic));
-                                        }
-                                        None => needed += 1,
-                                    }
-                                }
-                                va += 0x1000;
-                            }
-                        }
-                        let mut sh_idx = 0usize;
-                        // Clamp the readahead batch to the kernel reserve — see the
-                        // matching comment in the data-abort path. A file-backed exec
-                        // mapping larger than RAM must SIGSEGV the process, not drain
-                        // the PMM to 0 and panic the kernel from a background alloc.
-                        let needed = needed.min(crate::pmm::user_readahead_budget(crate::pmm::free_count()));
-
-                        let ia_frame_pool = if needed > 0 {
-                            crate::pmm::alloc_pages_zeroed(needed).unwrap_or_else(|| {
-                                let mut v = alloc::vec::Vec::new();
-                                for _ in 0..needed {
-                                    match crate::pmm::alloc_page_zeroed_user() {
-                                        Some(f) => v.push(f),
-                                        None => break,
-                                    }
-                                }
-                                v
-                            })
-                        } else {
-                            alloc::vec::Vec::new()
-                        };
-                        let mut ia_pool_idx = 0usize;
-
-                        // Pass B — FILL (no `as_lock`): read file data + icache maintenance
-                        // into PRIVATE frames. Block I/O runs outside the per-AS lock (M5b).
-                        let mut filled: alloc::vec::Vec<(usize, crate::pmm::PhysFrame)> = alloc::vec::Vec::new();
-                        // M5b Stage 4a: DROP the BKL for the block-I/O fill (see the matching
-                        // note in the data-abort arm). Peers run while this core waits on disk.
-                        #[cfg(kernel_smp_shared)]
-                        let fault_dropped_bkl = crate::smp_shared::fault_bkl_drop_enabled();
-                        #[cfg(kernel_smp_shared)]
-                        if fault_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
-                        let mut cur_va = page_va;
-                        while cur_va < ra_end {
-                            if akuma_exec::mmu::is_current_user_page_mapped(cur_va) {
-                                cur_va += 0x1000;
-                                continue;
-                            }
-                            // Shared hit resolved above: already filled, and I-cache clean
-                            // unless it was first cached by a plain RO mapper (`needs_ic`).
-                            if sh_idx < shared.len() && shared[sh_idx].0 == cur_va {
-                                let (_, pf, needs_ic) = shared[sh_idx];
-                                sh_idx += 1;
-                                if needs_ic {
-                                    // Completes before `mark_icache_clean` — see the
-                                    // matching note in the data-abort arm.
-                                    let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                                    akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
-                                    let file_off = file_offset + (cur_va - segment_va);
-                                    crate::file_page_cache::mark_icache_clean(inode, file_off, pf);
-                                }
-                                filled.push((cur_va, pf));
-                                cur_va += 0x1000;
-                                continue;
-                            }
-                            if ia_pool_idx >= ia_frame_pool.len() {
-                                break;
-                            }
-                            let pf = ia_frame_pool[ia_pool_idx];
-                            ia_pool_idx += 1;
-                            {
-                                let pg_data_start = core::cmp::max(cur_va, segment_va);
-                                let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
-                                if pg_data_start < pg_data_end {
-                                    let dst_off = pg_data_start - cur_va;
-                                    let file_off = file_offset + (pg_data_start - segment_va);
-                                    let len = pg_data_end - pg_data_start;
-                                    let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
-                                    let page_buf = unsafe {
-                                        core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
-                                    };
-                                    if inode != 0 {
-                                        let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
-                                    } else {
-                                        let _ = crate::vfs::read_at(path, file_off, page_buf);
-                                    }
-                                }
-
-                                // By kva, not the user VA — the page isn't mapped yet.
-                                let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                                akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
-                            }
-                            // Publish after fill + I-cache maintenance, and after that
-                            // maintenance has COMPLETED (`sync_icache_range` ends in
-                            // `dsb ish; isb`) — see the data-abort arm.
-                            //
-                            // `icache_done: true` is honest here for a reason that is about
-                            // the FRAME, not the mapping: `icache_done` records "this frame
-                            // has been through `dc cvau` + `ic ivau`", and the block above
-                            // runs unconditionally, not under an `is_exec` gate. So a page
-                            // this arm maps non-exec (possible: `map_flags` falls back to
-                            // `RX` only when the recorded region flags are 0) is still
-                            // genuinely maintained. See COW_PILE_AUDIT.md F5.
-                            if cur_va >= segment_va
-                                && cur_va + 0x1000 <= segment_va + filesz
-                                && shareable_mapping
-                            {
-                                let file_off = file_offset + (cur_va - segment_va);
-                                crate::file_page_cache::insert(inode, file_off, pf, true);
-                            }
-                            filled.push((cur_va, pf));
-                            cur_va += 0x1000;
-                        }
-                        // Close the window: re-takes the BKL for the install pass (unless a
-                        // still-open outer window means it must stay dropped).
-                        #[cfg(kernel_smp_shared)]
-                        if fault_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
-
-                        // Pass C — INSTALL (under `as_lock`): atomic map + track per frame.
-                        let mut any_mapped = false;
-                        let mut pages_mapped = 0u64;
-                        let mut race_free: alloc::vec::Vec<crate::pmm::PhysFrame> = alloc::vec::Vec::new();
-                        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                            #[cfg(kernel_smp_shared)]
-                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
-                            for (cur_va, pf) in filled.iter().copied() {
-                                let (table_frames, installed) = unsafe {
-                                    akuma_exec::mmu::map_user_page_no_flush(cur_va, pf.addr, map_flags)
-                                };
-                                for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
-                                if installed {
-                                    owner.address_space.track_user_frame(pf);
-                                    any_mapped = true;
-                                    pages_mapped += 1;
-                                } else {
-                                    race_free.push(pf);
-                                    if cur_va == page_va { any_mapped = true; }
-                                }
-                            }
-                            if any_mapped {
-                                akuma_exec::mmu::flush_tlb_range(page_va, pages_mapped as usize);
-                            }
-                        } else {
-                            for (_, pf) in filled.iter().copied() { race_free.push(pf); }
-                        }
-
-                        // Free race-lost frames + unused pool frames (outside the hold).
-                        for pf in race_free { crate::pmm::free_page(pf); }
-                        while ia_pool_idx < ia_frame_pool.len() {
-                            crate::pmm::free_page(ia_frame_pool[ia_pool_idx]);
-                            ia_pool_idx += 1;
-                        }
-
-                        // No `dsb ish; isb` here — see the matching note in the data-abort
-                        // arm. The completion barrier belongs with the maintenance it
-                        // completes (Pass B), not after the install pass.
-
-                        if any_mapped {
-                            crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, pages_mapped as usize);
-                            crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
-                            if crate::config::PROCESS_SYSCALL_STATS
-                                && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                                    owner.syscall_stats.inc_pagefault(pages_mapped);
-                                }
-                            return unsafe { (*frame).x0 };
-                        } else if akuma_exec::mmu::is_current_user_page_mapped(page_va) {
-                            // Race: another CPU mapped the faulting page — return success.
-                            return unsafe { (*frame).x0 };
-                        }
-                        // Readahead pool exhausted before reaching page_va.
-                        // Fall back to a single-page allocation for just the faulting page.
-                        let (_, _, free) = crate::pmm::stats();
-                        crate::tprint!(128, "[IA-DP] pid={} va=0x{:x} readahead pool exhausted, {} free pages — retrying single page\n",
-                            pid, far_usize, free);
-                        if let Some(pf) = crate::pmm::alloc_page_zeroed_user() {
-                            let pg_data_start = core::cmp::max(page_va, segment_va);
-                            let pg_data_end = core::cmp::min(page_va + 0x1000, segment_va + filesz);
-                            if pg_data_start < pg_data_end {
-                                let dst_off = pg_data_start - page_va;
-                                let file_off = file_offset + (pg_data_start - segment_va);
-                                let len = pg_data_end - pg_data_start;
-                                let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
-                                let page_buf = unsafe {
-                                    core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
-                                };
-                                if inode != 0 {
-                                    let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
-                                } else {
-                                    let _ = crate::vfs::read_at(path, file_off, page_buf);
-                                }
-                            }
-                            // By kva, not the user VA — the page isn't mapped yet (see the
-                            // note at the other demand-paging sites); on HVF an `ic ivau` on
-                            // page_va would translation-fault. The sequence completes before
-                            // the PTE below publishes the frame.
-                            let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                            akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
-                            // Install + track under `as_lock` (frame + file data prepared
-                            // above, outside the hold).
-                            let mut installed_ok = false;
-                            if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                                #[cfg(kernel_smp_shared)]
-                                let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
-                                let (table_frames, installed) = unsafe {
-                                    akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags)
-                                };
-                                for tf in table_frames { owner.address_space.track_page_table_frame(tf); }
-                                if installed {
-                                    owner.address_space.track_user_frame(pf);
-                                    installed_ok = true;
-                                }
-                            }
-                            if !installed_ok { crate::pmm::free_page(pf); }
-                            // The trailing `dsb ish; isb` that used to sit here is now the
-                            // tail of `sync_icache_range` above, i.e. before the install
-                            // rather than after it; `map_user_page` itself ends in
-                            // `flush_tlb_page`'s `dsb ish; isb`.
-                            crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, 1);
-                            crate::syscall::syscall_counters::inc_pagefault(1);
-                            return unsafe { (*frame).x0 };
-                        }
-                        let (_, _, free2) = crate::pmm::stats();
-                        crate::tprint!(128, "[IA-DP] pid={} va=0x{:x} single-page fallback OOM, {} free pages\n",
-                            pid, far_usize, free2);
-                    } else if let Some(page_frame) = crate::pmm::alloc_page_zeroed_user() {
-                        // Anonymous demand page: frame (zeroed) allocated OUTSIDE `as_lock`.
-                        let mut installed_ok = false;
-                        if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                            #[cfg(kernel_smp_shared)]
-                            let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
-                            let (table_frames, installed) = unsafe {
-                                akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
-                            };
-                            for tf in table_frames {
-                                owner.address_space.track_page_table_frame(tf);
-                            }
-                            if installed {
-                                owner.address_space.track_user_frame(page_frame);
-                                installed_ok = true;
-                            }
-                        }
-                        if installed_ok {
-                            crate::pmm::dp_count(&crate::pmm::DP_ANON_PAGES, 1);
-                            crate::syscall::syscall_counters::inc_pagefault(1);
-                            if crate::config::PROCESS_SYSCALL_STATS
-                                && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
-                                    owner.syscall_stats.inc_pagefault(1);
-                                }
-                        } else {
-                            // Race (peer mapped it) or no owner: free our frame.
-                            crate::pmm::free_page(page_frame);
-                        }
-                        // Page is mapped (by us or another CPU) - success
+                    } else if demand_page_lazy_region(
+                        akuma_exec::mmu::FaultAccess::Instruction,
+                        pid, as_owner, far_usize, flags, &source, region_start, region_size,
+                    ) {
                         return unsafe { (*frame).x0 };
-                    } else {
-                        let (_, _, free) = crate::pmm::stats();
-                        crate::tprint!(128, "[IA-DP] pid={} va=0x{:x} anon alloc failed, {} free pages\n",
-                            pid, far_usize, free);
                     }
-                    } // end else (not PROT_NONE)
                 } else {
                     akuma_exec::process::lazy_region_debug(far_usize);
                     crate::tprint!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);

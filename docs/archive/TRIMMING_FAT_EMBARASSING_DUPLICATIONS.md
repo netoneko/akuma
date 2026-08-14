@@ -1516,7 +1516,7 @@ ELF-loading path into one.
 | 2 | ~~`channel.rs` stdout/stdin FIFO → one helper~~ **DONE 2026-08-13** — five shared bodies, 13 methods collapsed onto them, plus 7 host tests the file never had; the survey named the wrong pair (see §6) | 0 left | — | — |
 | 3 | ~~`akuma-isolation`/`akuma-vfs` `mount.rs` → shared half into `akuma-vfs`~~ **DONE 2026-08-13** — one `MountSet<const MAX>`, both names as type aliases, −145 code lines across 4 files; the bin crate's third path normaliser went with it (§4) | 0 left | — | — |
 | 4 | ~~The `X`/`X_from_path` **quartet**~~ **DONE 2026-08-13** — `elf/mod.rs` ×3 in Phase 2a (−151 code lines, 12 clone blocks → 0), `process/mod.rs` + `process/image.rs` in Phase 2b (−105 code lines, the pairs' 60- and 47-line clone blocks → absent) | 0 left | — | — |
-| 5 | `exceptions.rs` duplicated `Drop` impls — **misdescribed on both counts, see [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §7**: there are **three** guards (`:3511`, `:3716`, `:4348`), their `Drop` bodies are byte-identical and 6 lines each, so the guard merge is ~24 lines. The `~142` was measuring the **demand-paging bodies** the guards sit at the top of (DA `:3708-4086` vs IA `:4337-4659`, ~330 lines) — a separate, genuinely high-risk merge with two *behavioural* divergences (§6 there) | ~24 + ~330 | small / large | low / **high** |
+| 5 | ~~`exceptions.rs` duplicated `Drop` impls + the demand-paging bodies~~ **DONE — both halves.** Guard half 2026-08-13 (three byte-identical guards → one `FaultSlotGuard` + `fault_slot_hold`, ~24 lines, not the `~142` the survey claimed — corrections in [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §7). Body half 2026-08-14: the ~330-line DA/IA demand-paging merge, declined three times, is one `demand_page_lazy_region` + an `akuma_exec::mmu::FaultAccess` seam (§12 there). It found **eight** differences, not §6's two — six were formatting and observability — and produced two new findings (F9 W^X on the IA permission upgrade, F10 asymmetric miss recovery), both recorded, neither fixed. `extreme-size` image −8,192 bytes; `host.tests` 508 → 512; `fail_set` identical at SMP=1 and SMP=4; Tier 4 `redis.stage: ok` | 0 left | — | — |
 | 6 | ~~`box_mod` `access.rs` / `hierarchy.rs`~~ **DONE 2026-08-14** with item 9 — one `#[cfg(test)] pub(crate) make_test_registry()` in `box_mod/mod.rs`, both test modules importing it. As §4 predicted, it was the *fixture* and not the two named functions | 0 left | — | — |
 | 7 | ~~`rump_proxy.rs` / `akuma-rump` `sysproxy.rs`~~ **DONE 2026-08-13** — 3 impls → 1 `pub NoMem` with `faulting()`/`discarding()`; there was no home to settle (§4). Also closes Phase 4's `ClientMem`/`NoMem` row | 0 left | — | — |
 | 8 | `mmu/mod.rs` `map_user_page` / `_no_flush` and the three walk clones | ~80 | medium | **high** — see `UNSAFE_AUDIT.md` §5.1 |
@@ -2030,12 +2030,29 @@ wrong about this item — three guards not two, ~24 lines not ~142 — is in
 [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §7, along with two smaller latent
 findings the merge surfaced but did not touch.
 
+**DONE 2026-08-14:** the DA/IA demand-paging bodies (§8 item 5's other half, and the
+last row of this phase). ~330 duplicated lines → one `demand_page_lazy_region` in
+`exceptions.rs` called from both EL0 abort arms, with everything the entry point
+decides behind one `akuma_exec::mmu::FaultAccess`: `default_map_flags()` (`RW_NO_EXEC`
+for a load/store, `RX` for a fetch) and `tag()` (`[DA-DP]`/`[IA-DP]`, kept distinct
+because the archive greps for both). The permission decision moved into
+`akuma-exec::mmu::types` as `lazy_map_flags` + `user_flags::is_exec`, which made the
+whole behavioural surface of the merge **host-testable** — the reason to judge this one
+on the seam and not the line count. 4 host tests (508 → 512) + 1 boot test; the
+`extreme-size` image dropped 8,192 bytes. Verified A/B against a worktree at the parent
+commit: identical `fail_set` at SMP=1 and SMP=4, Tier 3 all `ok`, Tier 4
+`redis.stage: ok`, `host_timejumps: 0` on both arms. The one behaviour change (the
+instruction arm no longer runs I-cache maintenance on pages it maps non-exec) is
+argued, measured and recorded in [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §12.1 —
+including the fact that the empirical check for it came back **empty**, which is a
+weaker result than a positive trace and is reported as such.
+
 **Still open, in the order they are worth doing:**
 
 | Item | Notes |
 |---|---|
 | `src/console.rs` `print_dec` / `print_u64` | a genuine 21-line / 82-token **Type-1** clone differing only in `usize` vs `u64`; CPD has always reported it. Found during the `akuma-primitives` work, unrelated to it |
-| `exceptions.rs`'s duplicated `Drop` impls (§8 item 5) | **Guard half DONE 2026-08-13** (above). What is left under this heading is only the DA/IA demand-paging bodies, ~330 lines, still high-risk — but **both of the behavioural divergences that had to be decided first are now decided** ([`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §11, 2026-08-14): the barrier-placement one was a real defect and is fixed, and the `is_exec`/`icache_done` one turned out not to be a divergence in what the cache is told at all. The merge is unblocked in the sense that it no longer has open questions in front of it; it is still 330 lines of fault path |
+| ~~`exceptions.rs`'s duplicated `Drop` impls (§8 item 5)~~ | **DONE — both halves.** Guard half 2026-08-13 (above); the ~330-line DA/IA demand-paging body merge landed 2026-08-14 as one `demand_page_lazy_region` + an `akuma_exec::mmu::FaultAccess` entry-point seam, with the policy half (`lazy_map_flags`, `user_flags::is_exec`) moved into `akuma-exec` so it is host-testable — 4 new host tests + 1 boot test. Full record, all eight differences and their decisions, the `is_exec` reasoning and the verification numbers: [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §12. Two new findings out of it (F9, F10 in §9 there), recorded and not fixed. **What the three previous declines got wrong:** the two "behavioural divergences" that supposedly blocked it were a copy-paste artifact and a category error; the real work was scoping where the shared body starts and stops (the `PROT_NONE` arm and the lazy-region-miss branch stay per-arm, and should) |
 | ~~The fork/CoW pile (§8 items 13–14)~~ | **DONE 2026-08-14** — all of [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §9 is closed, including the `cow_fault_lock` finding (deleted with the `akuma-pmm` extraction). Six more open-coded `dc cvau`/`ic ivau` sequences in `exceptions.rs` collapsed onto the existing `mmu::sync_icache_range` on the way out (F4) |
 
 ### Phase 7 — `#[repr(C)]` `Statx` + `SigFrame`

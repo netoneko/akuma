@@ -310,6 +310,9 @@ pub fn run_all_tests() {
     // F4: the demand-paging arms now maintain a WHOLE page through
     // `sync_icache_range` and then publish; pin that call shape (COW_PILE_AUDIT §9).
     test_icache_sync_whole_page_offsets();
+    // The merged DA/IA demand-paging body: per-entry-point policy + the
+    // `icache_done` handshake its `is_exec` gate rests on (COW_PILE_AUDIT §12).
+    test_demand_paging_merged_body_policy();
     // Stale-I-cache spurious-SVC guard (§7k.4): the SVC-instruction recogniser the
     // guard uses to decide "the executed svc came from a stale I-cache line".
     test_is_aarch64_svc_recogniser();
@@ -7810,6 +7813,176 @@ fn test_icache_sync_whole_page_offsets() {
 
     if ok {
         console::print("[Test] icache_sync_whole_page_offsets PASSED\n");
+    }
+}
+
+/// The merged DA/IA demand-paging body (`exceptions::demand_page_lazy_region`), at
+/// the two places a merge can go wrong: the per-entry-point **policy** and the shared
+/// **I-cache handshake** through `file_page_cache`.
+///
+/// Both arms of `rust_sync_el0_handler_inner` used to carry their own ~330-line copy
+/// of that body. Once merged, everything the entry point decides is
+/// `FaultAccess::{Data, Instruction}` → `lazy_map_flags` → `user_flags::is_exec`, so
+/// that chain is this test's first half: a file-backed **exec** mapping and a
+/// file-backed **non-exec** mapping must each demand-page with the flags and the
+/// maintenance decision they had before the merge, through either entry point.
+///
+/// The second half pins the contract Pass B relies on when it skips maintenance: a
+/// frame published by a mapper that did *not* run `dc cvau`/`ic ivau` must be handed
+/// to a later executable mapper with `needs_ic == true`, and one published by a mapper
+/// that did must not. That handshake is what makes `icache_done` a property of the
+/// frame rather than of a mapping (`COW_PILE_AUDIT.md` F5), and it is the only reason
+/// an `is_exec`-gated `insert` is safe.
+///
+/// **Why the install half is not tested here.** `demand_page_lazy_region` installs
+/// PTEs through the ambient-`TTBR0` `mmu::map_user_page*` calls, so driving it from
+/// the boot suite would edit whichever address space happens to be live and track the
+/// frames on a synthetic `Process` — the same reason `test_mm_bkl_drop` deliberately
+/// stops short of a real PTE install. Doing it safely needs a context switch to a
+/// synthetic process's own tables, with IRQs enabled for the block I/O the body
+/// performs, which is not something a self-test can arrange. That half is covered
+/// end-to-end instead, and heavily: every process the boot suite and the acceptance
+/// binaries exec faults its text in through the instruction-abort entry point and its
+/// heap and data through the data-abort one, so a broken merge does not reach sshd.
+fn test_demand_paging_merged_body_policy() {
+    use akuma_exec::mmu::{lazy_map_flags, user_flags, FaultAccess};
+
+    let mut fails = 0u32;
+    let check = |what: &str, got: u64, want: u64, fails: &mut u32| {
+        if got != want {
+            *fails += 1;
+            crate::safe_print!(128,
+                "[Test] dp_merged_body: {} got={:#x} want={:#x}\n", what, got, want);
+        }
+    };
+
+    // ── Policy: a file-backed region's recorded flags win on BOTH arms ──────
+    // This is what lets an instruction fetch land on a non-exec mapping at all, and
+    // it predates the merge: `map_flags` never consulted the arm when the region had
+    // flags of its own.
+    check("data/file RX", lazy_map_flags(FaultAccess::Data, user_flags::RX, true),
+        user_flags::RX, &mut fails);
+    check("inst/file RX", lazy_map_flags(FaultAccess::Instruction, user_flags::RX, true),
+        user_flags::RX, &mut fails);
+    check("data/file RW", lazy_map_flags(FaultAccess::Data, user_flags::RW_NO_EXEC, true),
+        user_flags::RW_NO_EXEC, &mut fails);
+    check("inst/file RW", lazy_map_flags(FaultAccess::Instruction, user_flags::RW_NO_EXEC, true),
+        user_flags::RW_NO_EXEC, &mut fails);
+
+    // ── Policy: the fault decides when the region recorded nothing, and for
+    // every anonymous page. This is the whole of what the entry point buys. ──
+    check("data/file flags=0", lazy_map_flags(FaultAccess::Data, 0, true),
+        user_flags::RW_NO_EXEC, &mut fails);
+    check("inst/file flags=0", lazy_map_flags(FaultAccess::Instruction, 0, true),
+        user_flags::RX, &mut fails);
+    check("data/anon", lazy_map_flags(FaultAccess::Data, user_flags::RX, false),
+        user_flags::RW_NO_EXEC, &mut fails);
+    check("inst/anon", lazy_map_flags(FaultAccess::Instruction, user_flags::RW_NO_EXEC, false),
+        user_flags::RX, &mut fails);
+
+    // ── The maintenance decision follows the mapping, not the arm ───────────
+    for (what, flags, want_exec) in [
+        ("exec file mapping", user_flags::RX, true),
+        ("non-exec file mapping", user_flags::RW_NO_EXEC, false),
+    ] {
+        for access in [FaultAccess::Data, FaultAccess::Instruction] {
+            let mapped = lazy_map_flags(access, flags, true);
+            if user_flags::is_exec(mapped) != want_exec {
+                fails += 1;
+                crate::safe_print!(128,
+                    "[Test] dp_merged_body: {} via {} is_exec={} want={}\n",
+                    what, access.tag(), user_flags::is_exec(mapped), want_exec);
+            }
+            // A non-exec mapping must never reach the shared cache — that is what
+            // keeps the `is_exec`-gated `insert`/`lookup_and_ref` calls equivalent to
+            // the instruction arm's old hardcoded `true` (COW_PILE_AUDIT.md §12.1).
+            if !user_flags::is_exec(mapped)
+                && crate::file_page_cache::is_shareable_mapping(mapped)
+            {
+                fails += 1;
+                crate::safe_print!(128,
+                    "[Test] dp_merged_body: {} is non-exec AND shareable ({:#x})\n",
+                    what, mapped);
+            }
+        }
+    }
+
+    // ── The I-cache handshake, through the real cache ───────────────────────
+    // A synthetic inode no file can own (`resolve_inode` never returns u32::MAX),
+    // at offsets far past anything mapped, so this cannot collide with a live entry.
+    const FAKE_INODE: u32 = u32::MAX;
+    const OFF_DIRTY: usize = 0x8000_0000;
+    const OFF_CLEAN: usize = 0x8000_1000;
+    if !crate::config::SHARED_FILE_PAGES_ENABLED {
+        crate::safe_print!(96,
+            "[Test] dp_merged_body: cache handshake SKIPPED (SHARED_FILE_PAGES_ENABLED=false)\n");
+    } else if let (Some(dirty), Some(clean)) =
+        (crate::pmm::alloc_page_zeroed(), crate::pmm::alloc_page_zeroed())
+    {
+        crate::file_page_cache::insert(FAKE_INODE, OFF_DIRTY, dirty, false);
+        crate::file_page_cache::insert(FAKE_INODE, OFF_CLEAN, clean, true);
+
+        // Published without maintenance → an executable mapper must be told to run it.
+        if let Some((pf, needs_ic)) =
+            crate::file_page_cache::lookup_and_ref(FAKE_INODE, OFF_DIRTY, true)
+        {
+            if pf.addr != dirty.addr || !needs_ic {
+                fails += 1;
+                crate::safe_print!(128,
+                    "[Test] dp_merged_body: dirty+want_exec needs_ic={} (want true)\n", needs_ic);
+            }
+            crate::pmm::free_page(pf); // balance the reference lookup_and_ref took
+        } else {
+            fails += 1;
+            crate::safe_print!(96, "[Test] dp_merged_body: dirty entry vanished\n");
+        }
+        // …and a non-executable mapper of the same frame must not be.
+        if let Some((pf, needs_ic)) =
+            crate::file_page_cache::lookup_and_ref(FAKE_INODE, OFF_DIRTY, false)
+        {
+            if needs_ic {
+                fails += 1;
+                crate::safe_print!(96,
+                    "[Test] dp_merged_body: dirty+!want_exec needs_ic=true (want false)\n");
+            }
+            crate::pmm::free_page(pf);
+        }
+        // Recording the maintenance retires the request for every later mapper.
+        crate::file_page_cache::mark_icache_clean(FAKE_INODE, OFF_DIRTY, dirty);
+        if let Some((pf, needs_ic)) =
+            crate::file_page_cache::lookup_and_ref(FAKE_INODE, OFF_DIRTY, true)
+        {
+            if needs_ic {
+                fails += 1;
+                crate::safe_print!(96,
+                    "[Test] dp_merged_body: needs_ic still true after mark_icache_clean\n");
+            }
+            crate::pmm::free_page(pf);
+        }
+        // Published with maintenance → never requested again.
+        if let Some((pf, needs_ic)) =
+            crate::file_page_cache::lookup_and_ref(FAKE_INODE, OFF_CLEAN, true)
+        {
+            if needs_ic {
+                fails += 1;
+                crate::safe_print!(96,
+                    "[Test] dp_merged_body: clean+want_exec needs_ic=true (want false)\n");
+            }
+            crate::pmm::free_page(pf);
+        }
+        // `invalidate_inode` drops both entries and frees the cache's own reference,
+        // so the two frames go back to the PMM exactly once.
+        crate::file_page_cache::invalidate_inode(FAKE_INODE);
+    } else {
+        crate::safe_print!(96,
+            "[Test] dp_merged_body: cache handshake SKIPPED (no PMM pages)\n");
+    }
+
+    if fails == 0 {
+        console::print("[Test] demand_paging_merged_body_policy PASSED\n");
+    } else {
+        crate::safe_print!(96,
+            "[Test] demand_paging_merged_body_policy FAILED: {} checks\n", fails);
     }
 }
 

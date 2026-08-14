@@ -85,6 +85,75 @@ pub mod user_flags {
     pub fn is_none(flags: u64) -> bool {
         flags == NONE
     }
+
+    /// Whether a mapping with these flags lets EL0 *fetch instructions* from the page.
+    ///
+    /// This is the predicate that decides whether a demand-paged frame needs the
+    /// `dc cvau` + `ic ivau` sequence: I-cache maintenance is only load-bearing for a
+    /// page some PE will fetch from. It reads `UXN` and nothing else, deliberately —
+    /// `AP` decides read/write, `PXN` decides EL1 fetch, and neither is relevant to
+    /// what EL0 can execute.
+    pub const fn is_exec(flags: u64) -> bool {
+        flags & flags::UXN == 0
+    }
+}
+
+/// Which EL0 abort a demand-paging fault arrived through.
+///
+/// The data-abort and instruction-abort arms of `rust_sync_el0_handler_inner` share
+/// **one** demand-paging body (`exceptions.rs`'s `demand_page_lazy_region`), and this
+/// is the seam between them: one body, two documented entry points. Every difference
+/// between the arms is decided by the methods below rather than by keeping a second
+/// copy of the ~330-line body — see `docs/archive/COW_PILE_AUDIT.md` §6 and §12.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum FaultAccess {
+    /// `EC_DATA_ABORT_LOWER` — a load or a store wanted the page.
+    Data,
+    /// `EC_INST_ABORT_LOWER` — an instruction fetch wanted the page.
+    Instruction,
+}
+
+impl FaultAccess {
+    /// Flags for a page whose lazy region records **none** (`flags == 0`), and for
+    /// every anonymous page regardless of what the region records.
+    ///
+    /// The fault itself is the only evidence available in that case, and it is good
+    /// evidence: a load/store wants data, an instruction fetch wants text. Anonymous
+    /// pages take this unconditionally in both arms — the historical shape, kept
+    /// because an anonymous instruction fetch (a JIT writing then jumping into a
+    /// `MAP_ANONYMOUS` page) has no other way to become executable.
+    pub const fn default_map_flags(self) -> u64 {
+        match self {
+            Self::Data => user_flags::RW_NO_EXEC,
+            Self::Instruction => user_flags::RX,
+        }
+    }
+
+    /// Log prefix for this arm's demand-paging diagnostics (`DA-DP` / `IA-DP`).
+    ///
+    /// The two spellings stay distinct because every archived investigation greps for
+    /// one or the other; merging the body must not merge the log tags.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Data => "DA-DP",
+            Self::Instruction => "IA-DP",
+        }
+    }
+}
+
+/// PTE flags for one demand-paged page of a lazy region.
+///
+/// `region_flags` is what the region recorded (`LazyRegion::flags`): an `mmap` PROT
+/// translated by [`user_flags::from_prot`], or an ELF segment's `p_flags`. It wins
+/// whenever it says anything at all — a region is a statement about permissions and
+/// the fault is not. `file_backed` is false for anonymous pages, which have never
+/// consulted `region_flags` on either arm.
+pub const fn lazy_map_flags(access: FaultAccess, region_flags: u64, file_backed: bool) -> u64 {
+    if file_backed && region_flags != 0 {
+        region_flags
+    } else {
+        access.default_map_flags()
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +188,69 @@ mod tests {
         assert_eq!(user_flags::from_prot(2), user_flags::RW_NO_EXEC);
         // prot 4 = PROT_EXEC
         assert_eq!(user_flags::from_prot(4), user_flags::RX);
+    }
+
+    #[test]
+    fn user_flags_is_exec_reads_only_uxn() {
+        assert!(user_flags::is_exec(user_flags::RX));
+        assert!(user_flags::is_exec(user_flags::EXEC));
+        assert!(!user_flags::is_exec(user_flags::RW_NO_EXEC));
+        assert!(!user_flags::is_exec(user_flags::NONE));
+        // `RO`/`RW` carry no UXN, so they are exec by this predicate — that is the
+        // AArch64 encoding, not an oversight: a PTE without UXN *is* EL0-executable.
+        assert!(user_flags::is_exec(user_flags::RO));
+        // PXN (EL1 fetch) must not influence the answer.
+        assert!(user_flags::is_exec(user_flags::RO | flags::PXN));
+        assert!(!user_flags::is_exec(user_flags::RO | flags::UXN));
+    }
+
+    /// The full policy table of the merged DA/IA demand-paging body: for every
+    /// (entry point × source × recorded flags) case, which PTE flags the page gets
+    /// and whether the frame needs I-cache maintenance.
+    ///
+    /// This is the whole behavioural surface of that merge — the body itself is
+    /// identical between the two arms once these two answers are supplied
+    /// (`docs/archive/COW_PILE_AUDIT.md` §12).
+    #[test]
+    fn lazy_map_flags_policy_table() {
+        use FaultAccess::{Data, Instruction};
+        let rx = user_flags::RX;
+        let rw = user_flags::RW_NO_EXEC;
+
+        // A file region that recorded flags: the region wins on BOTH arms, which is
+        // what makes a non-exec instruction fetch possible in the first place.
+        assert_eq!(lazy_map_flags(Data, rx, true), rx);
+        assert_eq!(lazy_map_flags(Instruction, rx, true), rx);
+        assert_eq!(lazy_map_flags(Data, rw, true), rw);
+        assert_eq!(lazy_map_flags(Instruction, rw, true), rw);
+        assert_eq!(lazy_map_flags(Instruction, user_flags::RO, true), user_flags::RO);
+
+        // A file region that recorded nothing: the fault decides.
+        assert_eq!(lazy_map_flags(Data, 0, true), rw);
+        assert_eq!(lazy_map_flags(Instruction, 0, true), rx);
+
+        // Anonymous: the fault decides even when the region recorded flags. Both arms
+        // have always ignored `region_flags` here.
+        assert_eq!(lazy_map_flags(Data, rx, false), rw);
+        assert_eq!(lazy_map_flags(Instruction, rw, false), rx);
+        assert_eq!(lazy_map_flags(Data, 0, false), rw);
+        assert_eq!(lazy_map_flags(Instruction, 0, false), rx);
+
+        // I-cache maintenance follows the *mapping*, not the entry point: an
+        // instruction fetch into a non-exec file region maps non-exec and needs no
+        // maintenance, because nothing can fetch from it until the permission-fault
+        // arm upgrades it to RX and maintains it there.
+        assert!(user_flags::is_exec(lazy_map_flags(Instruction, 0, true)));
+        assert!(!user_flags::is_exec(lazy_map_flags(Instruction, rw, true)));
+        assert!(user_flags::is_exec(lazy_map_flags(Data, rx, true)));
+        assert!(!user_flags::is_exec(lazy_map_flags(Data, 0, true)));
+    }
+
+    #[test]
+    fn fault_access_tags_stay_distinct() {
+        assert_eq!(FaultAccess::Data.tag(), "DA-DP");
+        assert_eq!(FaultAccess::Instruction.tag(), "IA-DP");
+        assert_ne!(FaultAccess::Data.tag(), FaultAccess::Instruction.tag());
     }
 
     #[test]
