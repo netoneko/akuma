@@ -307,6 +307,9 @@ pub fn run_all_tests() {
     // "x8 race" regression: rewriting code + cache maintenance must run the new
     // bytes, not stale ones (missing dc cvau before ic ivau). See §7j.
     test_icache_sync_rewrites_code();
+    // F4: the demand-paging arms now maintain a WHOLE page through
+    // `sync_icache_range` and then publish; pin that call shape (COW_PILE_AUDIT §9).
+    test_icache_sync_whole_page_offsets();
     // Stale-I-cache spurious-SVC guard (§7k.4): the SVC-instruction recogniser the
     // guard uses to decide "the executed svc came from a stale I-cache line".
     test_is_aarch64_svc_recogniser();
@@ -425,6 +428,9 @@ pub fn run_all_tests() {
     test_alloc_mmap_resolves_tgid();
     test_alloc_mmap_resolves_tgid();
     test_fault_mutex_insert_remove();
+    // F6: a nested acquire must not let the inner release drop the outer hold
+    // (COW_PILE_AUDIT §9).
+    test_fault_slot_nested_acquire_keeps_outer_hold();
     test_kill_thread_group_marks_siblings_zombie();
     test_kill_thread_group_reaps_futex_blocked_sibling();
     test_fatal_fault_group_exit_precedes_parent_notify();
@@ -1090,6 +1096,74 @@ fn test_smp_shared_userspace() {
     }
 }
 
+/// Run one A/B phase of the two BKL-drop measurements: spawn `copies` of `path`
+/// concurrently, `rounds` times, and return the contention-spin count the storm
+/// produced. Resets the counter first, so the return value is this phase alone.
+///
+/// Shared by `test_smp_shared_fault_parallelism` (which measures the *fault* drop,
+/// so `path` is the largest binary on disk and the children demand-page it) and
+/// `test_smp_shared_exec_parallelism` (which measures the *execve* drop, so the
+/// children are shells that re-exec busybox). The 5 s ceiling is a liveness bound,
+/// not a deadline: a phase that hits it still returns a usable count, and the tests
+/// are measurements rather than pass/fail.
+#[cfg(kernel_smp_shared)]
+fn bkl_spawn_storm_spins(path: &str, args: &[&str], copies: usize, rounds: usize) -> u64 {
+    use akuma_exec::sync::{contention_spins, reset_contention_spins};
+
+    reset_contention_spins();
+    for _ in 0..rounds {
+        let mut chans: alloc::vec::Vec<alloc::sync::Arc<akuma_exec::process::ProcessChannel>> =
+            alloc::vec::Vec::new();
+        for _ in 0..copies {
+            if let Ok((_t, ch, _p)) = process::spawn_process_with_channel(path, Some(args), None) {
+                chans.push(ch);
+            }
+        }
+        let start = crate::timer::uptime_us();
+        loop {
+            if chans.iter().all(|c| c.has_exited()) {
+                break;
+            }
+            if crate::timer::uptime_us().saturating_sub(start) > 5_000_000 {
+                break;
+            }
+            akuma_exec::threading::yield_now();
+            akuma_exec::threading::idle_halt();
+        }
+    }
+    contention_spins()
+}
+
+/// Report the top 8 BKL excursions by how long they made peers wait — the
+/// fine-graining lever, and the thing that says whether a drop helped the window it
+/// targeted or the win came from somewhere else.
+///
+/// A visible `syscall#` holder means that syscall's own hold shows up; `FAULT` or
+/// `IRQ/sched` dominance means the measured change is elsewhere. Both callers print
+/// this immediately after their A/B, which is the only point the counters describe
+/// the storm and not the rest of boot.
+#[cfg(kernel_smp_shared)]
+fn print_bkl_wait_by_holder(label: &str) {
+    use akuma_exec::sync::{wait_by_holder, HOLD_TAG_FAULT, HOLD_TAG_IRQ};
+
+    let mut top: alloc::vec::Vec<(usize, u64)> = (0..512usize)
+        .map(|t| (t, wait_by_holder(t)))
+        .filter(|&(_, w)| w > 0)
+        .collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    crate::safe_print!(96, "[Test] {} BKL-wait by holder (top excursions):\n", label);
+    for (tag, w) in top.iter().take(8) {
+        let holder = if *tag as u64 == HOLD_TAG_FAULT {
+            "FAULT"
+        } else if *tag as u64 == HOLD_TAG_IRQ {
+            "IRQ/sched"
+        } else {
+            "syscall#"
+        };
+        crate::safe_print!(96, "    holder={} ({}) wait_spins={}\n", tag, holder, w);
+    }
+}
+
 /// M5b Stage 4a measurement: does dropping the BKL around a file-fault's block-I/O
 /// fill pass reduce cross-core BKL wait? Spawns several copies of the largest available
 /// binary concurrently (each demand-pages its ELF via file-backed faults across cores)
@@ -1101,7 +1175,7 @@ fn test_smp_shared_userspace() {
 /// in-tree way to observe the fault-path effect.
 #[cfg(kernel_smp_shared)]
 fn test_smp_shared_fault_parallelism() {
-    use akuma_exec::sync::{contention_spins, reset_contention_spins, reset_wait_by_holder, set_profiling};
+    use akuma_exec::sync::{reset_wait_by_holder, set_profiling};
     // This is a MEASUREMENT tool, not a correctness test: its heavy busybox spawn-storm
     // provokes the pre-existing nondeterministic SMP≥4 contention race (which would halt
     // the boot suite). Run it only at exactly SMP=2 — the contention-clean config where
@@ -1130,34 +1204,9 @@ fn test_smp_shared_fault_parallelism() {
     let copies = crate::smp_shared::probed_core_count().min(4);
     const ROUNDS: usize = 3;
 
-    let run_phase = || -> u64 {
-        reset_contention_spins();
-        for _ in 0..ROUNDS {
-            let mut chans: alloc::vec::Vec<alloc::sync::Arc<akuma_exec::process::ProcessChannel>> =
-                alloc::vec::Vec::new();
-            for _ in 0..copies {
-                // busybox needs an applet to exit promptly; hello takes count/delay.
-                let args: &[&str] = if is_bb { &["true"] } else { &["1", "0"] };
-                if let Ok((_t, ch, _p)) =
-                    process::spawn_process_with_channel(path, Some(args), None)
-                {
-                    chans.push(ch);
-                }
-            }
-            let start = crate::timer::uptime_us();
-            loop {
-                if chans.iter().all(|c| c.has_exited()) {
-                    break;
-                }
-                if crate::timer::uptime_us().saturating_sub(start) > 5_000_000 {
-                    break;
-                }
-                akuma_exec::threading::yield_now();
-                akuma_exec::threading::idle_halt();
-            }
-        }
-        contention_spins()
-    };
+    // busybox needs an applet to exit promptly; hello takes count/delay.
+    let args: &[&str] = if is_bb { &["true"] } else { &["1", "0"] };
+    let run_phase = || bkl_spawn_storm_spins(path, args, copies, ROUNDS);
 
     // Profile which excursions cause the BKL wait during the storm. Profiling is OFF by
     // default (its per-entry HOLDER_TAG writes false-share and perturb timing-sensitive
@@ -1178,25 +1227,7 @@ fn test_smp_shared_fault_parallelism() {
         path, copies, ROUNDS, spins_off, spins_on
     );
     // BKL-hold profiler: which excursions made peers wait most (the fine-graining lever)?
-    {
-        use akuma_exec::sync::{wait_by_holder, HOLD_TAG_FAULT, HOLD_TAG_IRQ};
-        let mut top: alloc::vec::Vec<(usize, u64)> = (0..512usize)
-            .map(|t| (t, wait_by_holder(t)))
-            .filter(|&(_, w)| w > 0)
-            .collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1));
-        console::print("[Test] fault_parallelism BKL-wait by holder (top excursions):\n");
-        for (tag, w) in top.iter().take(8) {
-            let label = if *tag as u64 == HOLD_TAG_FAULT {
-                "FAULT"
-            } else if *tag as u64 == HOLD_TAG_IRQ {
-                "IRQ/sched"
-            } else {
-                "syscall#"
-            };
-            crate::safe_print!(96, "    holder={} ({}) wait_spins={}\n", tag, label, w);
-        }
-    }
+    print_bkl_wait_by_holder("fault_parallelism");
     if spins_on <= spins_off {
         crate::safe_print!(
             160,
@@ -1223,7 +1254,7 @@ fn test_smp_shared_fault_parallelism() {
 /// race). This is a MEASUREMENT tool: it always "passes" as long as it runs to completion.
 #[cfg(kernel_smp_shared)]
 fn test_smp_shared_exec_parallelism() {
-    use akuma_exec::sync::{contention_spins, reset_contention_spins, reset_wait_by_holder, set_profiling};
+    use akuma_exec::sync::{reset_wait_by_holder, set_profiling};
     if crate::smp_shared::probed_core_count() != 2 {
         console::print("[Test] smp_shared_exec_parallelism SKIPPED (runs only at SMP=2)\n");
         return;
@@ -1239,32 +1270,7 @@ fn test_smp_shared_exec_parallelism() {
     // child `execve` reads the whole binary through `do_execve`'s BKL-dropped read window.
     let args: &[&str] = &["sh", "-c", "/bin/busybox true; /bin/busybox true; /bin/busybox true"];
 
-    let run_phase = || -> u64 {
-        reset_contention_spins();
-        for _ in 0..ROUNDS {
-            let mut chans: alloc::vec::Vec<alloc::sync::Arc<akuma_exec::process::ProcessChannel>> =
-                alloc::vec::Vec::new();
-            for _ in 0..copies {
-                if let Ok((_t, ch, _p)) =
-                    process::spawn_process_with_channel("/bin/busybox", Some(args), None)
-                {
-                    chans.push(ch);
-                }
-            }
-            let start = crate::timer::uptime_us();
-            loop {
-                if chans.iter().all(|c| c.has_exited()) {
-                    break;
-                }
-                if crate::timer::uptime_us().saturating_sub(start) > 5_000_000 {
-                    break;
-                }
-                akuma_exec::threading::yield_now();
-                akuma_exec::threading::idle_halt();
-            }
-        }
-        contention_spins()
-    };
+    let run_phase = || bkl_spawn_storm_spins("/bin/busybox", args, copies, ROUNDS);
 
     set_profiling(true);
     reset_wait_by_holder();
@@ -1283,25 +1289,7 @@ fn test_smp_shared_exec_parallelism() {
     );
     // Which excursions made peers wait? A visible `syscall#` holder means execve's own hold
     // shows up (the window this drop targets); FAULT/IRQ dominance means the win is elsewhere.
-    {
-        use akuma_exec::sync::{wait_by_holder, HOLD_TAG_FAULT, HOLD_TAG_IRQ};
-        let mut top: alloc::vec::Vec<(usize, u64)> = (0..512usize)
-            .map(|t| (t, wait_by_holder(t)))
-            .filter(|&(_, w)| w > 0)
-            .collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1));
-        console::print("[Test] exec_parallelism BKL-wait by holder (top excursions):\n");
-        for (tag, w) in top.iter().take(8) {
-            let label = if *tag as u64 == HOLD_TAG_FAULT {
-                "FAULT"
-            } else if *tag as u64 == HOLD_TAG_IRQ {
-                "IRQ/sched"
-            } else {
-                "syscall#"
-            };
-            crate::safe_print!(96, "    holder={} ({}) wait_spins={}\n", tag, label, w);
-        }
-    }
+    print_bkl_wait_by_holder("exec_parallelism");
     if spins_on <= spins_off {
         crate::safe_print!(
             160,
@@ -2325,6 +2313,58 @@ fn test_shared_file_mmap_writeback() {
     }
 }
 
+/// NUL-terminate a path into a heap buffer the syscall layer's
+/// `copy_from_user_str` can read.
+///
+/// Was five byte-identical closures, one per `*at()` test. Kept as a `Vec` rather
+/// than a stack array because the caller must hold the buffer alive across the
+/// `handle_syscall` — the syscall reads through the raw pointer.
+fn cstr(s: &str) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::from(s.as_bytes());
+    v.push(0);
+    v
+}
+
+/// Register the process fixture the five `*at()` syscall tests share, and turn on
+/// `BYPASS_VALIDATION`. Returns the thread id to pass back to
+/// [`unregister_at_syscall_process`].
+///
+/// The fixture is three facts, and each test needs all three: **cwd is `/tmp`**, so
+/// an `AT_FDCWD`-relative path like `"unlinkat_selftest/rel.txt"` resolves;
+/// **fd 7 names `sub_dir`**, which is the dirfd-relative case (the one
+/// `archive/STAT_AND_UNLINKAT_FIX.md` records as historically regressing — `rm`
+/// recursing with `unlinkat(dirfd, "name", 0)` while dirfd was ignored); and
+/// **`BYPASS_VALIDATION`**, which lets a kernel address stand in for a user VA so
+/// the syscall's `copy_from_user_str` will read the buffer [`cstr`] built.
+///
+/// Callers pass distinct pids (7701..7705) so the five tests cannot collide in the
+/// process table if one of them leaves early.
+fn register_at_syscall_process(pid: u32, sub_dir: alloc::string::String) -> usize {
+    use akuma_exec::process::{register_process, register_thread_pid, FileDescriptor, KernelFile};
+    use core::sync::atomic::Ordering;
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let mut proc = make_test_process(pid);
+    proc.cwd = "/tmp".to_string();
+    proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(sub_dir, 0)));
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+    tid
+}
+
+/// Tear down [`register_at_syscall_process`]. Clearing `BYPASS_VALIDATION` is the
+/// part that matters beyond the test: it is a global, so leaving it set would let a
+/// later test's bad user pointer through silently.
+fn unregister_at_syscall_process(pid: u32, tid: usize) {
+    use akuma_exec::process::{unregister_process, unregister_thread_pid};
+    use core::sync::atomic::Ordering;
+
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+}
+
 /// `sys_unlinkat` (syscall 35) — dirfd resolution, `AT_REMOVEDIR`, and the errno contract.
 ///
 /// Drives the real syscall ENTRY point via `handle_syscall` (not the `crate::fs` layer
@@ -2334,13 +2374,7 @@ fn test_shared_file_mmap_writeback() {
 /// `rm` recursing with `unlinkat(dirfd, "name", 0)` — dirfd used to be ignored) and that the
 /// dropped-BKL window stays balanced on error paths too.
 fn test_unlinkat() {
-    use crate::syscall::{handle_syscall, nr::UNLINKAT, BYPASS_VALIDATION};
-    use akuma_exec::process::{
-        register_process, unregister_process, register_thread_pid, unregister_thread_pid,
-        FileDescriptor, KernelFile,
-    };
-    use akuma_exec::threading::current_thread_id;
-    use core::sync::atomic::Ordering;
+    use crate::syscall::{handle_syscall, nr::UNLINKAT};
 
     const EBADF: u64 = (-9i64) as u64;
     const ENOENT: u64 = (-2i64) as u64;
@@ -2358,29 +2392,13 @@ fn test_unlinkat() {
     let _ = crate::fs::create_dir(ROOT);
     let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
 
-    // Register a process whose cwd is /tmp (so the AT_FDCWD-relative case resolves) and
-    // whose fd 7 names the `sub` directory (the dirfd-relative / rm-recursion case).
-    let tid = current_thread_id();
     let pid: u32 = 7701;
-    let mut proc = make_test_process(pid);
-    proc.cwd = "/tmp".to_string();
-    proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(format!("{ROOT}/sub"), 0)));
-    register_process(pid, proc);
-    register_thread_pid(tid, pid);
+    let tid = register_at_syscall_process(pid, format!("{ROOT}/sub"));
 
-    // Null-terminate a path into a stack buffer the syscall's copy_from_user_str can read.
-    // BYPASS_VALIDATION lets the kernel address stand in for a user VA (same trick as
-    // test_rt_sigtimedwait_timeout).
-    let cstr = |s: &str| -> alloc::vec::Vec<u8> {
-        let mut v = alloc::vec::Vec::from(s.as_bytes());
-        v.push(0);
-        v
-    };
     let unlinkat = |dirfd: i32, path: &[u8], flags: u32| -> u64 {
         handle_syscall(UNLINKAT, &[dirfd as u64, path.as_ptr() as u64, u64::from(flags), 0, 0, 0])
     };
 
-    BYPASS_VALIDATION.store(true, Ordering::Release);
     let mut fails = 0u32;
 
     // 1. Absolute path -> remove_file.
@@ -2453,9 +2471,7 @@ fn test_unlinkat() {
         crate::safe_print!(64, "[Test] unlinkat missing FAILED r={} (want ENOENT)\n", r);
     }
 
-    BYPASS_VALIDATION.store(false, Ordering::Release);
-    unregister_process(pid);
-    unregister_thread_pid(tid);
+    unregister_at_syscall_process(pid, tid);
 
     // Cleanup (best-effort; the test verdict is the case results above, not this).
     let _ = crate::fs::remove_file(&format!("{ROOT}/sub/f.txt"));
@@ -2483,14 +2499,8 @@ fn test_unlinkat() {
 /// `/dev/null` early return keeps the BKL and still allocates a usable fd, and every
 /// error path (EBADF before the window, ENOENT inside it) leaves the window balanced.
 fn test_openat() {
-    use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
-    use akuma_exec::process::{
-        register_process, unregister_process, register_thread_pid, unregister_thread_pid,
-        FileDescriptor, KernelFile,
-    };
+    use crate::syscall::{handle_syscall, nr};
     use akuma_exec::process::open_flags;
-    use akuma_exec::threading::current_thread_id;
-    use core::sync::atomic::Ordering;
 
     const EBADF: u64 = (-9i64) as u64;
     const ENOENT: u64 = (-2i64) as u64;
@@ -2507,30 +2517,14 @@ fn test_openat() {
     let _ = crate::fs::create_dir(ROOT);
     let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
 
-    // Register a process whose cwd is /tmp (AT_FDCWD-relative) and whose fd 7 names the
-    // `sub` directory (the dirfd-relative case). cwd=/tmp so "openat_selftest/..." resolves.
-    let tid = current_thread_id();
     let pid: u32 = 7702;
-    let mut proc = make_test_process(pid);
-    proc.cwd = "/tmp".to_string();
-    proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(format!("{ROOT}/sub"), 0)));
-    register_process(pid, proc);
-    register_thread_pid(tid, pid);
+    let tid = register_at_syscall_process(pid, format!("{ROOT}/sub"));
 
-    // Null-terminate a path into a stack buffer the syscall's copy_from_user_str can read
-    // (BYPASS_VALIDATION lets the kernel address stand in for a user VA — same trick as
-    // test_unlinkat).
-    let cstr = |s: &str| -> alloc::vec::Vec<u8> {
-        let mut v = alloc::vec::Vec::from(s.as_bytes());
-        v.push(0);
-        v
-    };
     let openat = |dirfd: i32, path: &[u8], flags: u32, mode: u32| -> u64 {
         handle_syscall(nr::OPENAT, &[dirfd as u64, path.as_ptr() as u64, u64::from(flags), u64::from(mode), 0, 0])
     };
     let close = |fd: u64| { handle_syscall(nr::CLOSE, &[fd, 0, 0, 0, 0, 0]); };
 
-    BYPASS_VALIDATION.store(true, Ordering::Release);
     let mut fails = 0u32;
 
     // 1. O_CREAT|O_WRONLY on an absent file -> creates it empty.
@@ -2650,9 +2644,7 @@ fn test_openat() {
         }
     }
 
-    BYPASS_VALIDATION.store(false, Ordering::Release);
-    unregister_process(pid);
-    unregister_thread_pid(tid);
+    unregister_at_syscall_process(pid, tid);
 
     // Cleanup (best-effort; the test verdict is the case results above, not this).
     let _ = crate::fs::remove_file(&format!("{ROOT}/creat.txt"));
@@ -2684,13 +2676,7 @@ fn test_openat() {
 /// every error path (`EBADF` before the window, `ENOENT` inside it) leaves the window
 /// balanced.
 fn test_renameat() {
-    use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
-    use akuma_exec::process::{
-        register_process, unregister_process, register_thread_pid, unregister_thread_pid,
-        FileDescriptor, KernelFile,
-    };
-    use akuma_exec::threading::current_thread_id;
-    use core::sync::atomic::Ordering;
+    use crate::syscall::{handle_syscall, nr};
 
     const ENOENT: u64 = (-2i64) as u64;
     const EEXIST: u64 = (-17i64) as u64;
@@ -2709,21 +2695,9 @@ fn test_renameat() {
     let _ = crate::fs::create_dir(ROOT);
     let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
 
-    // Register a process whose cwd is /tmp (AT_FDCWD-relative) and whose fd 7 names the
-    // `sub` directory (the dirfd-relative case) — same shape as test_unlinkat/test_openat.
-    let tid = current_thread_id();
     let pid: u32 = 7703;
-    let mut proc = make_test_process(pid);
-    proc.cwd = "/tmp".to_string();
-    proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(format!("{ROOT}/sub"), 0)));
-    register_process(pid, proc);
-    register_thread_pid(tid, pid);
+    let tid = register_at_syscall_process(pid, format!("{ROOT}/sub"));
 
-    let cstr = |s: &str| -> alloc::vec::Vec<u8> {
-        let mut v = alloc::vec::Vec::from(s.as_bytes());
-        v.push(0);
-        v
-    };
     let renameat = |olddirfd: i32, old: &[u8], newdirfd: i32, new: &[u8]| -> u64 {
         handle_syscall(nr::RENAMEAT, &[olddirfd as u64, old.as_ptr() as u64, newdirfd as u64, new.as_ptr() as u64, 0, 0])
     };
@@ -2731,7 +2705,6 @@ fn test_renameat() {
         handle_syscall(nr::RENAMEAT2, &[olddirfd as u64, old.as_ptr() as u64, newdirfd as u64, new.as_ptr() as u64, u64::from(flags), 0])
     };
 
-    BYPASS_VALIDATION.store(true, Ordering::Release);
     let mut fails = 0u32;
 
     // 1. Absolute paths, both sides -> source gone, destination holds the content.
@@ -2805,9 +2778,7 @@ fn test_renameat() {
         crate::safe_print!(64, "[Test] renameat missing FAILED r={} (want ENOENT)\n", r);
     }
 
-    BYPASS_VALIDATION.store(false, Ordering::Release);
-    unregister_process(pid);
-    unregister_thread_pid(tid);
+    unregister_at_syscall_process(pid, tid);
 
     // Cleanup (best-effort; the test verdict is the case results above, not this).
     let _ = crate::fs::remove_file(&format!("{ROOT}/abs_dst.txt"));
@@ -2827,13 +2798,7 @@ fn test_renameat() {
 }
 
 fn test_mkdirat() {
-    use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
-    use akuma_exec::process::{
-        register_process, unregister_process, register_thread_pid, unregister_thread_pid,
-        FileDescriptor, KernelFile,
-    };
-    use akuma_exec::threading::current_thread_id;
-    use core::sync::atomic::Ordering;
+    use crate::syscall::{handle_syscall, nr};
 
     const ENOENT: u64 = (-2i64) as u64;
     const EEXIST: u64 = (-17i64) as u64;
@@ -2850,25 +2815,13 @@ fn test_mkdirat() {
     let _ = crate::fs::create_dir(ROOT);
     let _ = crate::fs::create_dir(&format!("{ROOT}/sub"));
 
-    // Same shape as test_renameat/test_unlinkat: cwd=/tmp, fd 7 names `sub`.
-    let tid = current_thread_id();
     let pid: u32 = 7704;
-    let mut proc = make_test_process(pid);
-    proc.cwd = "/tmp".to_string();
-    proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(format!("{ROOT}/sub"), 0)));
-    register_process(pid, proc);
-    register_thread_pid(tid, pid);
+    let tid = register_at_syscall_process(pid, format!("{ROOT}/sub"));
 
-    let cstr = |s: &str| -> alloc::vec::Vec<u8> {
-        let mut v = alloc::vec::Vec::from(s.as_bytes());
-        v.push(0);
-        v
-    };
     let mkdirat = |dirfd: i32, path: &[u8]| -> u64 {
         handle_syscall(nr::MKDIRAT, &[dirfd as u64, path.as_ptr() as u64, 0o755, 0, 0, 0])
     };
 
-    BYPASS_VALIDATION.store(true, Ordering::Release);
     let mut fails = 0u32;
 
     // 1. Absolute path -> directory created.
@@ -2924,9 +2877,7 @@ fn test_mkdirat() {
         crate::safe_print!(64, "[Test] mkdirat missing-parent FAILED r={} (want ENOENT)\n", r);
     }
 
-    BYPASS_VALIDATION.store(false, Ordering::Release);
-    unregister_process(pid);
-    unregister_thread_pid(tid);
+    unregister_at_syscall_process(pid, tid);
 
     // Cleanup (best-effort; the test verdict is the case results above, not this).
     let _ = crate::fs::remove_dir(&format!("{ROOT}/abs_dir"));
@@ -3158,13 +3109,7 @@ fn test_box_isolation_syscall_guards() {
 }
 
 fn test_fchmodat() {
-    use crate::syscall::{handle_syscall, nr, BYPASS_VALIDATION};
-    use akuma_exec::process::{
-        register_process, unregister_process, register_thread_pid, unregister_thread_pid,
-        FileDescriptor, KernelFile,
-    };
-    use akuma_exec::threading::current_thread_id;
-    use core::sync::atomic::Ordering;
+    use crate::syscall::{handle_syscall, nr};
 
     const ENOENT: u64 = (-2i64) as u64;
     const EBADF: u64 = (-9i64) as u64;
@@ -3183,20 +3128,9 @@ fn test_fchmodat() {
     let _ = crate::fs::write_file(&format!("{ROOT}/rel.txt"), b"a");
     let _ = crate::fs::write_file(&format!("{ROOT}/sub/dirfd.txt"), b"a");
 
-    // Same shape as test_renameat/test_mkdirat: cwd=/tmp, fd 7 names `sub`.
-    let tid = current_thread_id();
     let pid: u32 = 7705;
-    let mut proc = make_test_process(pid);
-    proc.cwd = "/tmp".to_string();
-    proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(format!("{ROOT}/sub"), 0)));
-    register_process(pid, proc);
-    register_thread_pid(tid, pid);
+    let tid = register_at_syscall_process(pid, format!("{ROOT}/sub"));
 
-    let cstr = |s: &str| -> alloc::vec::Vec<u8> {
-        let mut v = alloc::vec::Vec::from(s.as_bytes());
-        v.push(0);
-        v
-    };
     let fchmodat = |dirfd: i32, path: &[u8], mode: u32| -> u64 {
         handle_syscall(nr::FCHMODAT, &[dirfd as u64, path.as_ptr() as u64, u64::from(mode), 0, 0, 0])
     };
@@ -3204,7 +3138,6 @@ fn test_fchmodat() {
         crate::vfs::metadata(path).ok().map(|m| m.mode & 0o777)
     };
 
-    BYPASS_VALIDATION.store(true, Ordering::Release);
     let mut fails = 0u32;
 
     // 1. Absolute path -> mode bits actually change (not just exit-code success).
@@ -3259,9 +3192,7 @@ fn test_fchmodat() {
         crate::safe_print!(64, "[Test] fchmodat /dev/null FAILED r={} (want 0)\n", r);
     }
 
-    BYPASS_VALIDATION.store(false, Ordering::Release);
-    unregister_process(pid);
-    unregister_thread_pid(tid);
+    unregister_at_syscall_process(pid, tid);
 
     // Cleanup (best-effort; the test verdict is the case results above, not this).
     let _ = crate::fs::remove_file(&format!("{ROOT}/abs.txt"));
@@ -7762,6 +7693,70 @@ fn test_icache_sync_rewrites_code() {
     }
 }
 
+/// Regression for **F4** (`docs/archive/COW_PILE_AUDIT.md` §9): the demand-paging
+/// arms used to open-code the `dc cvau` / `dsb ish` / `ic ivau` sequence six times
+/// and place the closing `dsb ish; isb` on whichever side of the PTE install the
+/// copy happened to have. They now call `sync_icache_range(kva, PAGE_SIZE)`, whose
+/// tail *is* that pair — so the maintenance completes before the frame is
+/// published, at every site, by construction.
+///
+/// What this test can and cannot prove: barrier *ordering* is not observable under
+/// QEMU TCG, which has a coherent I-cache. What it does pin is the **call shape**
+/// the fix introduced, and that shape is genuinely uncovered today —
+/// `icache_sync_rewrites_code` above passes `len = 8`, so nothing executes code
+/// from anywhere but the first cache line of the range. The fault path maintains a
+/// whole page and then jumps into an arbitrary offset in it. So: rewrite and run a
+/// stub in the page's *second half*, maintaining the whole page each time. A
+/// `sync_icache_range` that walked the wrong number of lines, or a fault-path call
+/// that passed the wrong length, fails here and passes there.
+fn test_icache_sync_whole_page_offsets() {
+    // AArch64: `movz x0, #imm` = 0xD2800000 | (imm << 5); `ret` = 0xD65F03C0.
+    fn stub(imm: u16) -> [u32; 2] {
+        [0xD280_0000 | (u32::from(imm) << 5), 0xD65F_03C0]
+    }
+    let Some(pf) = crate::pmm::alloc_page_zeroed() else {
+        crate::safe_print!(64, "[Test] icache_sync_whole_page_offsets SKIPPED: no PMM page\n");
+        return;
+    };
+    let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
+    // Halfway into the page, and the last full instruction pair in it: both are
+    // outside the first 64-byte line, which is all `len = 8` ever reaches.
+    const OFFS: [usize; 2] = [0x800, akuma_exec::mmu::PAGE_SIZE - 8];
+    let write = |off: usize, code: [u32; 2]| unsafe {
+        let p = (kva + off) as *mut u32;
+        p.write_volatile(code[0]);
+        p.add(1).write_volatile(code[1]);
+    };
+    let call = |off: usize| -> u64 {
+        let f: extern "C" fn() -> u64 = unsafe { core::mem::transmute((kva + off) as *const ()) };
+        f()
+    };
+
+    let mut ok = true;
+    for (i, off) in OFFS.iter().copied().enumerate() {
+        // Two rounds per offset: the second reuses the same physical line with
+        // different code, which is where stale I-cache state would show up.
+        for round in 0..2u16 {
+            let want = 0x100 + (i as u16) * 0x10 + round;
+            write(off, stub(want));
+            akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
+            let got = call(off);
+            if got != u64::from(want) {
+                crate::safe_print!(112,
+                    "[Test] icache_sync_whole_page_offsets FAILED: off={:#x} round={} got={:#x} want={:#x}\n",
+                    off, round, got, want);
+                ok = false;
+            }
+        }
+    }
+
+    crate::pmm::free_page(pf);
+
+    if ok {
+        console::print("[Test] icache_sync_whole_page_offsets PASSED\n");
+    }
+}
+
 /// Regression for the §7k.4 stale-I-cache spurious-SVC guard
 /// (`docs/AKUMA_SELF_HOSTING.md`). The guard decides whether an `EC_SVC64` trap
 /// is real or a stale-I-cache phantom by checking the (cache-coherent) bytes at
@@ -10807,6 +10802,74 @@ fn test_fault_mutex_insert_remove() {
         console::print("[Test] fault_mutex_insert_remove PASSED\n");
     } else {
         console::print("[Test] fault_mutex_insert_remove FAILED\n");
+    }
+}
+
+/// Regression for **F6** (`docs/archive/COW_PILE_AUDIT.md` §9): a re-entrant
+/// `fault_slot_acquire` on one page by one thread must not let the inner release
+/// drop the outer holder's entry.
+///
+/// It used to return [`FaultSlot::Acquired`] for "the recorded holder is me",
+/// which is indistinguishable from a clean acquire — so the inner RAII guard's
+/// `fault_slot_release` removed the entry (holder-gating cannot help: the tid is
+/// the same thread), the page ran **unserialized** for the rest of the outer
+/// critical section, and the outer guard's release was a no-op.
+///
+/// No trigger exists in this tree — all three `fault_slot_hold` call sites are
+/// mutually exclusive branches of `rust_sync_el0_handler_inner`, which cannot
+/// re-enter itself — so this test is what stands in for the trigger: it nests the
+/// acquires by hand, which is exactly what a fourth call site inside a fault block
+/// would do.
+fn test_fault_slot_nested_acquire_keeps_outer_hold() {
+    use akuma_exec::process::{
+        register_process, unregister_process, lookup_process_shared, fault_slot_acquire,
+        fault_slot_release, FaultSlot,
+    };
+    use akuma_exec::threading;
+
+    let pid = 60_031u32;
+    register_process(pid, make_test_process(pid));
+    let me = threading::current_thread_id();
+    let va = 0x9000usize;
+    let held_by_me = || {
+        lookup_process_shared(pid)
+            .is_some_and(|p| p.fault_mutex.lock().get(&va).copied() == Some(me))
+    };
+    let mut ok = true;
+
+    // Outer acquire: a clean win.
+    ok &= matches!(fault_slot_acquire(pid, va), FaultSlot::Acquired);
+    ok &= held_by_me();
+
+    // Inner acquire on the SAME page by the SAME thread. Must be reported as
+    // `AlreadyHeld`, never `Acquired` — that distinction is the whole fix, because
+    // it is the only thing telling the caller not to release.
+    ok &= matches!(fault_slot_acquire(pid, va), FaultSlot::AlreadyHeld);
+    ok &= held_by_me();
+
+    // The hazard, demonstrated rather than asserted about: one release while two
+    // holds are outstanding empties the slot. `fault_slot_release` is holder-gated,
+    // and the gate passes — both holds are the same tid — so nothing at the release
+    // end can distinguish an inner guard from the outer one. That is precisely why
+    // the *acquire* has to carry the contract.
+    fault_slot_release(pid, va); // stand-in for the inner guard the old code built
+    ok &= lookup_process_shared(pid).is_some_and(|p| p.fault_mutex.lock().is_empty());
+
+    // Re-establish and release properly: with `AlreadyHeld` the inner guard makes
+    // no release call at all, so the outer one is still the only release, and the
+    // slot stays held right up to it.
+    ok &= matches!(fault_slot_acquire(pid, va), FaultSlot::Acquired);
+    ok &= matches!(fault_slot_acquire(pid, va), FaultSlot::AlreadyHeld);
+    ok &= held_by_me(); // inner guard dropped: no-op, slot still ours
+    fault_slot_release(pid, va);
+    ok &= lookup_process_shared(pid).is_some_and(|p| p.fault_mutex.lock().is_empty());
+
+    unregister_process(pid);
+
+    if ok {
+        console::print("[Test] fault_slot_nested_acquire_keeps_outer_hold PASSED\n");
+    } else {
+        console::print("[Test] fault_slot_nested_acquire_keeps_outer_hold FAILED\n");
     }
 }
 

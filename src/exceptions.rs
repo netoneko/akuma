@@ -738,6 +738,11 @@ fn log_fault_reclaim(pid: u32, page_va: usize, slot: akuma_exec::process::FaultS
 /// Release is holder-gated inside `fault_slot_release` — a sibling that reclaimed
 /// the slot from us keeps it — which is also why running it after a `NoProc`
 /// acquire is a no-op rather than a breach of the pairing contract.
+///
+/// The one acquire outcome that must **not** release is `AlreadyHeld` (a
+/// re-entrant acquire by this same thread): the entry belongs to the outer guard,
+/// and holder-gating cannot tell the two apart because the holder tid is the same.
+/// That is what `owns_release` is for — see `COW_PILE_AUDIT.md` §9 F6.
 struct FaultSlotGuard {
     /// The **address-space owner** pid the slot was acquired under, never the
     /// faulting thread's own pid: `CLONE_VM` siblings serialize on the
@@ -745,11 +750,15 @@ struct FaultSlotGuard {
     /// guard named this field `pid` and assigned `as_owner` to it.)
     as_owner: u32,
     page_va: usize,
+    /// False only for a nested acquire, where an outer guard owns the release.
+    owns_release: bool,
 }
 
 impl Drop for FaultSlotGuard {
     fn drop(&mut self) {
-        akuma_exec::process::fault_slot_release(self.as_owner, self.page_va);
+        if self.owns_release {
+            akuma_exec::process::fault_slot_release(self.as_owner, self.page_va);
+        }
     }
 }
 
@@ -762,13 +771,27 @@ impl Drop for FaultSlotGuard {
 /// This replaced three byte-identical guards (`CowFaultGuard`, `DaFaultGuard`,
 /// `FaultGuard`) in the EL0 CoW, data-abort and instruction-abort arms; the
 /// call-site comments say what each one is serializing against.
+///
+/// A nested acquire yields a guard that does not release and prints a tripwire.
+/// It should be unreachable: all three call sites are mutually exclusive branches
+/// of `rust_sync_el0_handler_inner`, and that function cannot re-enter itself
+/// (a fault taken while it runs comes from EL1 and takes the EL1 vector, which
+/// holds no fault slot). `[FAULT-SLOT NESTED]` printing means a fourth call site
+/// was added inside a fault block — the change is safe, but the new site needs
+/// looking at, because it is serializing against a slot it does not own.
 #[must_use = "the fault slot is released when the guard drops — discarding it \
               immediately un-serializes the page"]
 #[inline]
 fn fault_slot_hold(pid: u32, as_owner: u32, page_va: usize) -> FaultSlotGuard {
-    log_fault_reclaim(pid, page_va,
-        akuma_exec::process::fault_slot_acquire(as_owner, page_va));
-    FaultSlotGuard { as_owner, page_va }
+    let slot = akuma_exec::process::fault_slot_acquire(as_owner, page_va);
+    let owns_release = !matches!(slot, akuma_exec::process::FaultSlot::AlreadyHeld);
+    if !owns_release {
+        crate::safe_print!(160,
+            "[FAULT-SLOT NESTED] pid={} tid={} page={:#x}: re-entrant acquire — outer guard keeps the release\n",
+            pid, akuma_exec::threading::current_thread_id(), page_va);
+    }
+    log_fault_reclaim(pid, page_va, slot);
+    FaultSlotGuard { as_owner, page_va, owns_release }
 }
 
 /// True if `far` is in the kernel identity-RAM VA window (normally UXN for EL0 execute).
@@ -4008,14 +4031,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                     // Cached from a plain RO mapper that never ran `ic
                                     // ivau`; this mapper wants to execute it, so pay the
                                     // maintenance once and record it for the next mapper.
+                                    // `sync_icache_range` returns only after the closing
+                                    // `dsb ish`, so the invalidation is complete and
+                                    // inner-shareable BEFORE `mark_icache_clean` tells the
+                                    // next mapper it may skip the maintenance.
                                     let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                                    for off in (0..0x1000_usize).step_by(64) {
-                                        unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
-                                    }
-                                    unsafe { core::arch::asm!("dsb ish"); }
-                                    for off in (0..0x1000_usize).step_by(64) {
-                                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
-                                    }
+                                    akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
                                     let file_off = file_offset + (cur_va - segment_va);
                                     crate::file_page_cache::mark_icache_clean(inode, file_off, pf);
                                 }
@@ -4049,23 +4070,20 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             }
 
                             if is_exec {
+                                // By the kernel VA (kva), not the user VA: the user page is
+                                // not mapped yet, so `ic ivau` on cur_va translation-faults
+                                // on real hardware / HVF. I-cache invalidation to PoU is by
+                                // physical address, so the kva alias of the same frame is
+                                // equivalent and always mapped.
                                 let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                                for off in (0..0x1000_usize).step_by(64) {
-                                    unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
-                                }
-                                unsafe { core::arch::asm!("dsb ish"); }
-                                for off in (0..0x1000_usize).step_by(64) {
-                                    // IC IVAU by the kernel VA (kva), not the user VA: the
-                                    // user page is not mapped yet, so an IC IVAU on cur_va
-                                    // translation-faults on real hardware / HVF. I-cache
-                                    // invalidation to PoU is by physical address, so the kva
-                                    // alias of the same frame is equivalent and always mapped.
-                                    unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
-                                }
+                                akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
                             }
                             // Publish for every other mapper of this file page. Must come
-                            // after the fill and the I-cache maintenance above: a peer core
-                            // can map this frame the instant it lands in the table.
+                            // after the fill and the I-cache maintenance above — and after
+                            // the maintenance has *completed*, which is why the closing
+                            // `dsb ish` lives inside `sync_icache_range` rather than after
+                            // the install pass: a peer core can map this frame the instant
+                            // it lands in the cache, and it will trust `icache_done`.
                             if cur_va >= segment_va
                                 && cur_va + 0x1000 <= segment_va + filesz
                                 && shareable_mapping
@@ -4127,12 +4145,13 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             pool_idx += 1;
                         }
 
-                        if is_exec {
-                            unsafe {
-                                core::arch::asm!("dsb ish");
-                                core::arch::asm!("isb");
-                            }
-                        }
+                        // No `dsb ish; isb` here. It used to sit at this point, *after* the
+                        // install pass, which put the completion of the I-cache maintenance
+                        // later than the first instant a peer could fetch from the frame
+                        // (Pass B publishes to `file_page_cache`; Pass C publishes the PTE).
+                        // The pair now closes each page's `sync_icache_range` in Pass B, and
+                        // `flush_tlb_range` above ends in `dsb ish; isb` of its own, so the
+                        // return to EL0 is still fully synchronized. See COW_PILE_AUDIT.md F4.
 
                         if any_mapped {
                             crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, pages_mapped as usize);
@@ -4171,21 +4190,15 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                 }
                             }
                             if is_exec {
+                                // By the kernel VA (kva), not the user VA: the user page is
+                                // not mapped yet at this point (the map happens below), so
+                                // `ic ivau` on page_va translation-faults on real hardware /
+                                // HVF. I-cache invalidation to PoU is by physical address,
+                                // so the kva alias of the same frame is equivalent and
+                                // always mapped. The sequence completes (`dsb ish; isb`)
+                                // before the PTE below publishes the frame.
                                 let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                                for off in (0..0x1000_usize).step_by(64) {
-                                    unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
-                                }
-                                unsafe { core::arch::asm!("dsb ish"); }
-                                for off in (0..0x1000_usize).step_by(64) {
-                                    // IC IVAU by the kernel VA (kva), not the user VA: the
-                                    // user page is not mapped yet at this point (map happens
-                                    // below), so an IC IVAU on page_va translation-faults on
-                                    // real hardware / HVF. I-cache invalidation to PoU is by
-                                    // physical address, so the kva alias of the same frame is
-                                    // equivalent and always mapped.
-                                    unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
-                                }
-                                unsafe { core::arch::asm!("dsb ish"); core::arch::asm!("isb"); }
+                                akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
                             }
                             // Install + track under `as_lock` (frame + file data already
                             // prepared above, outside the hold).
@@ -4544,6 +4557,13 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                     let full = va >= segment_va
                                         && va + 0x1000 <= segment_va + filesz;
                                     let hit = if full && shareable_mapping {
+                                        // `want_exec: true` unconditionally, matching the
+                                        // unconditional maintenance in the fill loop below.
+                                        // It is an over-request when `map_flags` is non-exec
+                                        // (cost: one `sync_icache_range` on a frame nobody
+                                        // executes), never an under-request — and the frame
+                                        // reached this arm through an instruction fetch, so
+                                        // it is the likelier of the two guesses.
                                         let file_off = file_offset + (va - segment_va);
                                         crate::file_page_cache::lookup_and_ref(inode, file_off, true)
                                     } else {
@@ -4598,21 +4618,16 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                 cur_va += 0x1000;
                                 continue;
                             }
-                            // Shared hit resolved above: already filled and (because every
-                            // page reaching this arm is executable) already I-cache clean
-                            // unless it was first cached by a plain RO mapper.
+                            // Shared hit resolved above: already filled, and I-cache clean
+                            // unless it was first cached by a plain RO mapper (`needs_ic`).
                             if sh_idx < shared.len() && shared[sh_idx].0 == cur_va {
                                 let (_, pf, needs_ic) = shared[sh_idx];
                                 sh_idx += 1;
                                 if needs_ic {
+                                    // Completes before `mark_icache_clean` — see the
+                                    // matching note in the data-abort arm.
                                     let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                                    for off in (0..0x1000_usize).step_by(64) {
-                                        unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
-                                    }
-                                    unsafe { core::arch::asm!("dsb ish"); }
-                                    for off in (0..0x1000_usize).step_by(64) {
-                                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
-                                    }
+                                    akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
                                     let file_off = file_offset + (cur_va - segment_va);
                                     crate::file_page_cache::mark_icache_clean(inode, file_off, pf);
                                 }
@@ -4643,18 +4658,21 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                     }
                                 }
 
+                                // By kva, not the user VA — the page isn't mapped yet.
                                 let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                                for off in (0..0x1000_usize).step_by(64) {
-                                    unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
-                                }
-                                unsafe { core::arch::asm!("dsb ish"); }
-                                for off in (0..0x1000_usize).step_by(64) {
-                                    // IC IVAU by kva, not the user VA — the page isn't mapped yet.
-                                    unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
-                                }
+                                akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
                             }
-                            // Publish after fill + I-cache maintenance (see the data-abort
-                            // arm). `icache_done: true` — this arm always maintains.
+                            // Publish after fill + I-cache maintenance, and after that
+                            // maintenance has COMPLETED (`sync_icache_range` ends in
+                            // `dsb ish; isb`) — see the data-abort arm.
+                            //
+                            // `icache_done: true` is honest here for a reason that is about
+                            // the FRAME, not the mapping: `icache_done` records "this frame
+                            // has been through `dc cvau` + `ic ivau`", and the block above
+                            // runs unconditionally, not under an `is_exec` gate. So a page
+                            // this arm maps non-exec (possible: `map_flags` falls back to
+                            // `RX` only when the recorded region flags are 0) is still
+                            // genuinely maintained. See COW_PILE_AUDIT.md F5.
                             if cur_va >= segment_va
                                 && cur_va + 0x1000 <= segment_va + filesz
                                 && shareable_mapping
@@ -4705,10 +4723,9 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             ia_pool_idx += 1;
                         }
 
-                        unsafe {
-                            core::arch::asm!("dsb ish");
-                            core::arch::asm!("isb");
-                        }
+                        // No `dsb ish; isb` here — see the matching note in the data-abort
+                        // arm. The completion barrier belongs with the maintenance it
+                        // completes (Pass B), not after the install pass.
 
                         if any_mapped {
                             crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, pages_mapped as usize);
@@ -4744,17 +4761,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                     let _ = crate::vfs::read_at(path, file_off, page_buf);
                                 }
                             }
+                            // By kva, not the user VA — the page isn't mapped yet (see the
+                            // note at the other demand-paging sites); on HVF an `ic ivau` on
+                            // page_va would translation-fault. The sequence completes before
+                            // the PTE below publishes the frame.
                             let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
-                            for off in (0..0x1000_usize).step_by(64) {
-                                unsafe { core::arch::asm!("dc cvau, {}", in(reg) kva + off); }
-                            }
-                            unsafe { core::arch::asm!("dsb ish"); }
-                            for off in (0..0x1000_usize).step_by(64) {
-                                // IC IVAU by kva, not the user VA — the page isn't mapped yet
-                                // (see note at the other demand-paging sites); on HVF an IC
-                                // IVAU on page_va would translation-fault.
-                                unsafe { core::arch::asm!("ic ivau, {}", in(reg) kva + off); }
-                            }
+                            akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
                             // Install + track under `as_lock` (frame + file data prepared
                             // above, outside the hold).
                             let mut installed_ok = false;
@@ -4771,7 +4783,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                 }
                             }
                             if !installed_ok { crate::pmm::free_page(pf); }
-                            unsafe { core::arch::asm!("dsb ish"); core::arch::asm!("isb"); }
+                            // The trailing `dsb ish; isb` that used to sit here is now the
+                            // tail of `sync_icache_range` above, i.e. before the install
+                            // rather than after it; `map_user_page` itself ends in
+                            // `flush_tlb_page`'s `dsb ish; isb`.
                             crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, 1);
                             crate::syscall::syscall_counters::inc_pagefault(1);
                             return unsafe { (*frame).x0 };

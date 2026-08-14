@@ -465,8 +465,22 @@ pub fn lookup_process_shared(pid: Pid) -> Option<&'static Process> {
 pub enum FaultSlot {
     /// No address-space-owner process is registered; caller skips serialization.
     NoProc,
-    /// Slot was free (or already held by us) and acquired cleanly.
+    /// Slot was free and acquired cleanly.
     Acquired,
+    /// **This thread already held the slot** for this page — a re-entrant acquire.
+    ///
+    /// Unreachable in this tree (all three call sites are mutually exclusive
+    /// branches of `rust_sync_el0_handler_inner`, which cannot re-enter itself: a
+    /// fault taken while it runs comes from EL1 and takes the EL1 vector, and
+    /// nothing on that path touches a fault slot). It exists to make the outcome
+    /// *nameable*, because the alternative was silently wrong: this used to return
+    /// [`FaultSlot::Acquired`], so the inner RAII guard's release removed the
+    /// **outer** guard's entry and the page ran unserialized for the rest of the
+    /// outer critical section, with the outer release a no-op.
+    ///
+    /// The caller must **not** pair this with a [`fault_slot_release`] — the
+    /// outermost holder still owns the release. See `COW_PILE_AUDIT.md` §9 F6.
+    AlreadyHeld,
     /// Slot was reclaimed from a holder thread that had already died
     /// (TERMINATED/FREE) without releasing it — the root-cause poison recovery.
     /// Carries the dead holder's thread id.
@@ -505,7 +519,7 @@ impl FaultSlot {
         match *self {
             FaultSlot::ReclaimedDead(holder) => Some((ReclaimCause::Dead, holder)),
             FaultSlot::ReclaimedWedged(holder) => Some((ReclaimCause::Wedged, holder)),
-            FaultSlot::NoProc | FaultSlot::Acquired => None,
+            FaultSlot::NoProc | FaultSlot::Acquired | FaultSlot::AlreadyHeld => None,
         }
     }
 }
@@ -527,7 +541,10 @@ const FAULT_SLOT_SPIN_BOUND: u32 = 200_000;
 /// a wedged or slot-recycled holder.
 ///
 /// The caller MUST pair a successful (`Acquired`/`Reclaimed*`) return with exactly
-/// one [`fault_slot_release`] — normally via an RAII guard.
+/// one [`fault_slot_release`] — normally via an RAII guard. [`FaultSlot::NoProc`]
+/// may be released harmlessly (the release is holder-gated), but
+/// [`FaultSlot::AlreadyHeld`] must **not** be: the outer holder owns that entry,
+/// and releasing it here is exactly the bug that variant exists to name.
 pub fn fault_slot_acquire(as_owner: Pid, page_va: usize) -> FaultSlot {
     let my_tid = crate::threading::current_thread_id();
     let mut spins: u32 = 0;
@@ -559,7 +576,10 @@ pub fn fault_slot_acquire(as_owner: Pid, page_va: usize) -> FaultSlot {
                     faults.insert(page_va, my_tid);
                     Some(FaultSlot::Acquired)
                 }
-                Some(holder) if holder == my_tid => Some(FaultSlot::Acquired),
+                // Re-entrant acquire by the holder itself. NOT `Acquired`: the
+                // caller must not release, or the inner guard drops the outer
+                // guard's entry (see `FaultSlot::AlreadyHeld`).
+                Some(holder) if holder == my_tid => Some(FaultSlot::AlreadyHeld),
                 Some(holder) => {
                     if crate::threading::is_thread_terminated(holder) {
                         faults.insert(page_va, my_tid);
@@ -2012,6 +2032,27 @@ mod fault_slot_tests {
             FaultSlot::ReclaimedDead(0).reclaim_report(),
             Some((ReclaimCause::Dead, 0))
         );
+    }
+
+    /// A nested acquire is not a reclaim: nothing was taken from anyone, so the
+    /// `[FAULT-RECLAIM]` trace must stay silent for it. The caller distinguishes
+    /// it from `Acquired` by matching the variant, not by this report — the two
+    /// differ in who owns the *release*, which `reclaim_report` says nothing about
+    /// (F6, `COW_PILE_AUDIT.md` §9).
+    #[test]
+    fn already_held_reports_nothing() {
+        assert_eq!(FaultSlot::AlreadyHeld.reclaim_report(), None);
+    }
+
+    /// ...but it must not be *spelled* `Acquired`, which is the shape of the F6
+    /// defect: one variant for "you now own the release" and "someone else still
+    /// does" is what let the inner RAII guard drop the outer guard's entry. This
+    /// pins the discriminants apart so a future `reclaim_report`-driven refactor
+    /// cannot quietly merge them back.
+    #[test]
+    fn already_held_is_not_acquired() {
+        assert!(!matches!(FaultSlot::AlreadyHeld, FaultSlot::Acquired));
+        assert!(!matches!(FaultSlot::Acquired, FaultSlot::AlreadyHeld));
     }
 }
 

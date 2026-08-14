@@ -1524,7 +1524,7 @@ ELF-loading path into one.
 | 12 | ~~Runtime-registration machinery (§5.8)~~ **DONE 2026-08-13** — one `akuma_primitives::Registered<T>`; 3 definitions → 1 and **21 spinlock acquisitions removed** from `akuma-net`'s poll/socket paths. Line count a wash; judge it on the locks | 0 left | — | — |
 | 11 | **Errno spellings (§5.7)** — three tables (17 names defined twice, in two representations) + 109 raw negative literals. Run with the Phase 5 syscall sweep | ~130 sites | medium | low |
 | 13 | **`#[inline]` audit (§5.10)** — deferred by request 2026-08-13. Both directions: missing attrs on cross-crate hot paths (`[profile.release]` sets no `lto`), and 33 `#[inline(always)]` fighting the `extreme-size` floor. Judge on IMAGE size + a microbenchmark, not counts | ~700 fns surveyed | medium | low |
-| 14 | **The fork/CoW pile ([`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md))** — 4 copies of a 45-field `Process` literal, a ~40-line child-publish tail written 3×, 4 disagreeing CoW-break paths. Merge plan in §8 there, cheapest first; items 5–7 of it are defect work, not refactors | −250 mergeable | medium | mixed |
+| 14 | ~~**The fork/CoW pile ([`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md))**~~ **DONE 2026-08-14** — every row in that document's §9 findings table is closed: F1/F1b/F2/F3/F8 earlier that day, then F4 (six open-coded `dc cvau`/`ic ivau` sequences → one `mmu::sync_icache_range`, which also moved the completion barrier to the correct side of publication), F5 (**retired — not a defect**, §11.2 there), F6 (`FaultSlot::AlreadyHeld`) and F7 (already fixed). The merges landed as §8.1 (CoW-break middle) and §8.2 (`inherit_from` + `spawn_child_thread_and_publish`). **What is left is not this row**: §8 item 5's ~330-line DA/IA body merge and item 8 below, both still high-risk | 0 left | — | — |
 | 10 | Trait-impl clusters (§5.5): `ClientMem`/`NoMem` across crates, duplicate `IrqGuard`, BKL guard family → one generic guard, `impl_display!` macro, duplicate `MultiPollFuture`. **In progress — `akuma-primitives` rungs 1–2 done (§5.555); the `~180` is the wrong metric, see there** | ~180 | small–medium | low |
 
 Items 1–3 are ~190 lines for an afternoon, and item 1 is the same work as
@@ -2035,8 +2035,8 @@ findings the merge surfaced but did not touch.
 | Item | Notes |
 |---|---|
 | `src/console.rs` `print_dec` / `print_u64` | a genuine 21-line / 82-token **Type-1** clone differing only in `usize` vs `u64`; CPD has always reported it. Found during the `akuma-primitives` work, unrelated to it |
-| `exceptions.rs`'s duplicated `Drop` impls (§8 item 5) | **Reclassified 2026-08-13** — see [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §7. Three guards, not two; the merge is ~24 lines, not 142, and is *low* risk (the three `Drop` bodies are byte-identical). The ~142 was measuring the DA/IA demand-paging bodies, which stay open as a separate high-risk item with two behavioural divergences to decide first |
-| The fork/CoW pile (§8 items 13–14) | Audited 2026-08-13 while doing item 5, because item 5's neighbours are these paths. Three defect candidates found, incl. **`cow_fault_lock` provides no mutual exclusion at all**. Merge plan in that doc's §8 |
+| `exceptions.rs`'s duplicated `Drop` impls (§8 item 5) | **Guard half DONE 2026-08-13** (above). What is left under this heading is only the DA/IA demand-paging bodies, ~330 lines, still high-risk — but **both of the behavioural divergences that had to be decided first are now decided** ([`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §11, 2026-08-14): the barrier-placement one was a real defect and is fixed, and the `is_exec`/`icache_done` one turned out not to be a divergence in what the cache is told at all. The merge is unblocked in the sense that it no longer has open questions in front of it; it is still 330 lines of fault path |
+| ~~The fork/CoW pile (§8 items 13–14)~~ | **DONE 2026-08-14** — all of [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §9 is closed, including the `cow_fault_lock` finding (deleted with the `akuma-pmm` extraction). Six more open-coded `dc cvau`/`ic ivau` sequences in `exceptions.rs` collapsed onto the existing `mmu::sync_icache_range` on the way out (F4) |
 
 ### Phase 7 — `#[repr(C)]` `Statx` + `SigFrame`
 
@@ -2093,6 +2093,38 @@ in `c4f16a8e` — correctly, a workplan is not a runbook — but the deletion wa
 [`BKL_PHASE7F_OPTOUT_LIST.md`](BKL_PHASE7F_OPTOUT_LIST.md) §11, unstruck, and
 [`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md) still declines to green-light
 deleting `KernelLock` on two independently disqualifying findings.
+
+### Deferred audit: GIC/timer/ramfb/irq → a leaf crate (raised 2026-08-14)
+
+Raised while auditing whether `gic`, `gic_v3`, `ramfb`, `irq`, `timer`, and
+`kernel_timer` could leave `src/` the way the virtio drivers did in Phase 3.
+Not started — no code moved, no crate created.
+
+If you want to extract, do a separate crate (`akuma-irq` or similar) for
+`gic` + `gic_v3` + `ramfb` + `irq`, not fold them into `akuma-virtio`.
+`akuma-virtio`'s own doc scopes it to "the DMA HAL, MMIO device probing, and
+the virtio-mmio drivers" — GIC (interrupt controller), the ARM generic timer,
+and ramfb (fw_cfg-backed, not virtio) aren't virtio devices, and stuffing them
+into a virtio-named crate is the same shared-name trap `irq.rs`'s own
+`IrqGuard` doc comment already warns about. `gic.rs`, `gic_v3.rs`, and
+`ramfb.rs` only reach into `akuma_exec::mmu` for the VA seam — the same
+layering `akuma-virtio` already sits above — so those three are plausibly
+movable as-is.
+
+`timer.rs` needs the hardware/RTC half split out from the scheduler-ISR half
+before any of it can move: `enable_timer_interrupts`/`timer_irq_handler` are
+fused to `akuma_exec::threading`, `process::FORK_IN_PROGRESS`, the preemption
+watchdog, and the SMP scheduler-SGI dispatch — that's scheduler-tick logic
+wearing a driver's filename, not a driver. `kernel_timer.rs` (the async alarm
+queue) could follow once that split exists.
+
+Checked and ruled out in the same pass: `exceptions.rs`'s only touches on
+`gic`/`irq` are the three call sites inside `rust_irq_handler_with_sp`
+(`gic::acknowledge_irq`, `irq::dispatch_irq`, `gic::end_of_interrupt`), and
+that function is the single most fused piece of the exception path — BKL
+reconciliation, the SMP scheduler-SGI fast path, and raw trap-frame reads all
+live in it. It is a *caller* of the IRQ layer, not IRQ-layer code; none of it
+moves with `gic`/`irq`.
 
 ### Running total
 

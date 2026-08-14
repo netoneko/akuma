@@ -131,58 +131,9 @@ pub fn cascade_kill_order(
 #[cfg(test)]
 mod tests {
     use super::*;
-    extern crate alloc;
-    use alloc::collections::BTreeMap;
-    use alloc::string::String;
-
-    fn make_test_registry() -> BTreeMap<u64, super::BoxInfo> {
-        let mut reg = BTreeMap::new();
-        reg.insert(
-            0,
-            super::BoxInfo {
-                id: 0,
-                name: String::from("host"),
-                root_dir: String::from("/"),
-                creator_pid: 0,
-                primary_pid: 1,
-                parent_box_id: None,
-            },
-        );
-        reg.insert(
-            1,
-            super::BoxInfo {
-                id: 1,
-                name: String::from("box1"),
-                root_dir: String::from("/containers/box1"),
-                creator_pid: 100,
-                primary_pid: 101,
-                parent_box_id: Some(0),
-            },
-        );
-        reg.insert(
-            2,
-            super::BoxInfo {
-                id: 2,
-                name: String::from("nested"),
-                root_dir: String::from("/containers/box1/nested"),
-                creator_pid: 102,
-                primary_pid: 103,
-                parent_box_id: Some(1),
-            },
-        );
-        reg.insert(
-            3,
-            super::BoxInfo {
-                id: 3,
-                name: String::from("box3"),
-                root_dir: String::from("/containers/box3"),
-                creator_pid: 104,
-                primary_pid: 105,
-                parent_box_id: Some(0),
-            },
-        );
-        reg
-    }
+    // The registry fixture both this module and its sibling assert against lives
+    // one level up, in `box_mod` itself — see `make_test_registry`'s doc comment.
+    use super::super::make_test_registry;
 
     #[test]
     fn test_can_access_box_host_accesses_any() {

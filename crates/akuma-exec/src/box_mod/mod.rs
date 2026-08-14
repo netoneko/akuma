@@ -100,3 +100,66 @@ pub fn registry_snapshot() -> alloc::collections::BTreeMap<u64, BoxInfo> {
         BOX_REGISTRY.lock().clone()
     })
 }
+
+/// The four-box registry both [`hierarchy`] and [`access`] test against:
+/// host(0) → box1(1) → nested(2), plus box3(3) as a second child of the host.
+///
+/// It was defined byte-identically in each of those two files' `mod tests`, which
+/// is the whole of what CPD reported as a 60-line clone between them — the two
+/// *functions* the survey named (`cascade_kill_order`, `validate_nested_root`)
+/// share no logic at all (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §4).
+///
+/// The shape is load-bearing for both sides and neither can shrink it: `hierarchy`
+/// needs depth ≥ 2 to distinguish an ancestry *chain* from a parent lookup, and a
+/// sibling subtree (box3) so a descendant walk that over-collects is visible;
+/// `access` needs the same two properties to tell "host reaches everything" apart
+/// from "everyone reaches everything".
+#[cfg(test)]
+pub(crate) fn make_test_registry() -> alloc::collections::BTreeMap<u64, BoxInfo> {
+    let mut reg = alloc::collections::BTreeMap::new();
+    reg.insert(
+        0,
+        BoxInfo {
+            id: 0,
+            name: String::from("host"),
+            root_dir: String::from("/"),
+            creator_pid: 0,
+            primary_pid: 1,
+            parent_box_id: None,
+        },
+    );
+    reg.insert(
+        1,
+        BoxInfo {
+            id: 1,
+            name: String::from("box1"),
+            root_dir: String::from("/containers/box1"),
+            creator_pid: 100,
+            primary_pid: 101,
+            parent_box_id: Some(0),
+        },
+    );
+    reg.insert(
+        2,
+        BoxInfo {
+            id: 2,
+            name: String::from("nested"),
+            root_dir: String::from("/containers/box1/nested"),
+            creator_pid: 102,
+            primary_pid: 103,
+            parent_box_id: Some(1),
+        },
+    );
+    reg.insert(
+        3,
+        BoxInfo {
+            id: 3,
+            name: String::from("box3"),
+            root_dir: String::from("/containers/box3"),
+            creator_pid: 104,
+            primary_pid: 105,
+            parent_box_id: Some(0),
+        },
+    );
+    reg
+}

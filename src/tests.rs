@@ -3358,26 +3358,7 @@ fn test_map_user_page_preserves_irq_state() -> bool {
     unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
 
     // Clean up: clear PTE and free frames
-    unsafe {
-        let ttbr0: u64;
-        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
-        let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
-        let l0e = l0_ptr.add((test_va >> 39) & 0x1FF).read_volatile();
-        if l0e & 1 != 0 {
-            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-            let l1e = l1_ptr.add((test_va >> 30) & 0x1FF).read_volatile();
-            if l1e & 1 != 0 {
-                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-                let l2e = l2_ptr.add((test_va >> 21) & 0x1FF).read_volatile();
-                if l2e & 1 != 0 {
-                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-                    l3_ptr.add((test_va >> 12) & 0x1FF).write_volatile(0);
-                    akuma_exec::mmu::flush_tlb_page(test_va);
-                }
-            }
-        }
-    }
+    clear_boot_ttbr0_pte(test_va, PtClear::LeafAndTables);
     crate::pmm::free_page(frame);
     for tf in table_frames { crate::pmm::free_page(tf); }
 
@@ -3417,30 +3398,7 @@ fn test_map_user_page_roundtrip() -> bool {
     // pointing to the freed L2 frame. If that freed frame is later reused (e.g.,
     // as a new UserAddressSpace's L1), the boot TTBR0 would alias the new AS's
     // tables, causing spurious translation faults in subsequent tests.
-    unsafe {
-        let ttbr0: u64;
-        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
-        let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
-        let l0e = l0_ptr.add((test_va >> 39) & 0x1FF).read_volatile();
-        if l0e & 1 != 0 {
-            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-            let l1e = l1_ptr.add((test_va >> 30) & 0x1FF).read_volatile();
-            if l1e & 1 != 0 {
-                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-                let l2e = l2_ptr.add((test_va >> 21) & 0x1FF).read_volatile();
-                if l2e & 1 != 0 {
-                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-                    l3_ptr.add((test_va >> 12) & 0x1FF).write_volatile(0);
-                    // Also clear L2 and L1 entries so freed table frames are no
-                    // longer reachable from the boot TTBR0.
-                    l2_ptr.add((test_va >> 21) & 0x1FF).write_volatile(0);
-                    l1_ptr.add((test_va >> 30) & 0x1FF).write_volatile(0);
-                    akuma_exec::mmu::flush_tlb_page(test_va);
-                }
-            }
-        }
-    }
+    clear_boot_ttbr0_pte(test_va, PtClear::LeafAndTables);
 
     let after_clear = akuma_exec::mmu::is_current_user_page_mapped(test_va);
 
@@ -4310,6 +4268,29 @@ fn simulate_sys_munmap_eager(
     (None, 0)
 }
 
+/// Build the single-region eager-mmap fixture the three `test_eager_munmap_*` tests
+/// start from: `pages` freshly zeroed frames recorded as one region at `base`.
+///
+/// Returns `None` on OOM, having already freed whatever it managed to allocate and
+/// printed the `  OOM` line — so the caller's whole failure path is `else { return
+/// false }`. Was written out three times, identically, including the partial-free.
+fn alloc_eager_region(
+    base: usize,
+    pages: usize,
+) -> Option<Vec<(usize, Vec<crate::pmm::PhysFrame>)>> {
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        if let Some(f) = crate::pmm::alloc_page_zeroed() {
+            frames.push(f);
+        } else {
+            for f in frames { crate::pmm::free_page(f); }
+            console::print("  OOM\n");
+            return None;
+        }
+    }
+    Some(alloc::vec![(base, frames)])
+}
+
 /// Prefix munmap of an eager region MUST preserve the suffix.
 ///
 /// Scenario matching the Node.js crash:
@@ -4326,15 +4307,7 @@ fn test_eager_munmap_prefix_preserves_suffix() -> bool {
     let unmap_pages = 4usize;
     let base: usize = 0xA000_0000;
 
-    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
-    let mut frames = Vec::new();
-    for _ in 0..pages {
-        if let Some(f) = crate::pmm::alloc_page_zeroed() { frames.push(f) } else {
-            for f in frames { crate::pmm::free_page(f); }
-            console::print("  OOM\n"); return false;
-        }
-    }
-    mmap_regions.push((base, frames));
+    let Some(mut mmap_regions) = alloc_eager_region(base, pages) else { return false };
 
     // Simulate munmap(base, 4*4096) — should free only first 4 pages
     let (matched, freed_count) = simulate_sys_munmap_eager(
@@ -4378,15 +4351,7 @@ fn test_eager_munmap_suffix_preserves_prefix() -> bool {
     let trim = pages - keep;
     let base: usize = 0xB000_0000;
 
-    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
-    let mut frames = Vec::new();
-    for _ in 0..pages {
-        if let Some(f) = crate::pmm::alloc_page_zeroed() { frames.push(f) } else {
-            for f in frames { crate::pmm::free_page(f); }
-            console::print("  OOM\n"); return false;
-        }
-    }
-    mmap_regions.push((base, frames));
+    let Some(mut mmap_regions) = alloc_eager_region(base, pages) else { return false };
 
     let suffix_addr = base + keep * 4096;
     let (matched, freed_count) = simulate_sys_munmap_eager(
@@ -4418,15 +4383,7 @@ fn test_eager_munmap_full_removes_all() -> bool {
     let pages = 127usize;
     let base: usize = 0xC000_0000;
 
-    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
-    let mut frames = Vec::new();
-    for _ in 0..pages {
-        if let Some(f) = crate::pmm::alloc_page_zeroed() { frames.push(f) } else {
-            for f in frames { crate::pmm::free_page(f); }
-            console::print("  OOM\n"); return false;
-        }
-    }
-    mmap_regions.push((base, frames));
+    let Some(mut mmap_regions) = alloc_eager_region(base, pages) else { return false };
 
     let (matched, freed_count) = simulate_sys_munmap_eager(
         &mut mmap_regions, base, pages * 4096,
@@ -4627,26 +4584,7 @@ fn test_map_user_page_race_leaks_frame() -> bool {
     let _ = pte_pa == Some(frame_a.addr); // frame_b should be phantom (not installed)
 
     // Cleanup: clear the PTE manually
-    unsafe {
-        let ttbr0: u64;
-        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
-        let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
-        let l0e = l0_ptr.add((test_va >> 39) & 0x1FF).read_volatile();
-        if l0e & 1 != 0 {
-            let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-            let l1e = l1_ptr.add((test_va >> 30) & 0x1FF).read_volatile();
-            if l1e & 1 != 0 {
-                let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-                let l2e = l2_ptr.add((test_va >> 21) & 0x1FF).read_volatile();
-                if l2e & 1 != 0 {
-                    let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-                    l3_ptr.add((test_va >> 12) & 0x1FF).write_volatile(0);
-                    akuma_exec::mmu::flush_tlb_page(test_va);
-                }
-            }
-        }
-    }
+    clear_boot_ttbr0_pte(test_va, PtClear::LeafAndTables);
 
     crate::pmm::free_page(frame_a);
     crate::pmm::free_page(frame_b);
@@ -4669,6 +4607,58 @@ fn test_map_user_page_race_leaks_frame() -> bool {
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
+}
+
+/// How far up the walk [`clear_boot_ttbr0_pte`] tears down.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PtClear {
+    /// Clear only the L3 entry. For a test unmapping several pages that share one
+    /// L3 table: cutting the branch on the first page would leave the rest of the
+    /// leaves unreachable and therefore uncleared.
+    LeafOnly,
+    /// Clear the L3 entry **and** the L2 and L1 entries above it. Required by any
+    /// test that then `free_page`s the table frames `map_user_page` returned —
+    /// otherwise the boot L1 keeps pointing at a freed L2, and when that frame is
+    /// reused (e.g. as a new `UserAddressSpace`'s L1) the boot TTBR0 aliases the
+    /// new address space's tables and later tests take spurious translation faults.
+    LeafAndTables,
+}
+
+/// Undo a boot-TTBR0 mapping a test installed with `map_user_page`, restoring the
+/// table to the state the next test expects.
+///
+/// This walk was written four times in this file — three of them clearing only the
+/// leaf, and exactly one (in `test_map_user_page_roundtrip`) carrying both the L2/L1
+/// clear and the comment explaining why it is needed. All three shallow copies then
+/// freed the table frames anyway, so they had the aliasing hazard that comment
+/// describes; they now pass [`PtClear::LeafAndTables`]. That is the whole argument
+/// of `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §6 in one function: the fix lived
+/// in one copy of four, and no reader of the other three could see it was missing.
+///
+/// Silently does nothing if any level is already absent, which is the same
+/// best-effort contract every copy had.
+fn clear_boot_ttbr0_pte(va: usize, depth: PtClear) {
+    unsafe {
+        let ttbr0: u64;
+        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
+        let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
+        let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
+        if l0e & 1 == 0 { return; }
+        let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
+        let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
+        if l1e & 1 == 0 { return; }
+        let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
+        let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
+        if l2e & 1 == 0 { return; }
+        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
+        l3_ptr.add((va >> 12) & 0x1FF).write_volatile(0);
+        if depth == PtClear::LeafAndTables {
+            l2_ptr.add((va >> 21) & 0x1FF).write_volatile(0);
+            l1_ptr.add((va >> 30) & 0x1FF).write_volatile(0);
+        }
+        akuma_exec::mmu::flush_tlb_page(va);
+    }
 }
 
 /// Read the physical address from the L3 PTE for a given VA using current TTBR0.
@@ -4740,30 +4730,13 @@ fn test_readahead_race_phantom_frames() -> bool {
         }
     }
 
-    // Cleanup: clear all PTEs
+    // Cleanup: clear every leaf first — all NUM_PAGES share one L3 table, so cutting
+    // the branch on page 0 would strand the other seven — then cut the branch once,
+    // because the table frames are freed just below.
     for i in 0..NUM_PAGES {
-        let va = base_va + i * 0x1000;
-        unsafe {
-            let ttbr0: u64;
-            core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
-            let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-            let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
-            let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
-            if l0e & 1 != 0 {
-                let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-                let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
-                if l1e & 1 != 0 {
-                    let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-                    let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
-                    if l2e & 1 != 0 {
-                        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
-                        l3_ptr.add((va >> 12) & 0x1FF).write_volatile(0);
-                        akuma_exec::mmu::flush_tlb_page(va);
-                    }
-                }
-            }
-        }
+        clear_boot_ttbr0_pte(base_va + i * 0x1000, PtClear::LeafOnly);
     }
+    clear_boot_ttbr0_pte(base_va, PtClear::LeafAndTables);
 
     for f in frames_a { crate::pmm::free_page(f); }
     for tf in table_frames_all { crate::pmm::free_page(tf); }
@@ -5792,6 +5765,112 @@ static NEON_TEST_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Test: NEON registers survive voluntary yields.
 ///
+/// One thread of [`test_neon_regs_across_yield`]: fill **Q0-Q3** with `pattern`,
+/// yield 50 times, and count every yield that came back with a register changed.
+///
+/// Was written twice — the two spawned closures differed only in the pattern
+/// constant and which `DONE_*` flag they set. Errors go to the shared
+/// `NEON_TEST_ERRORS` rather than a return value because the thread cannot return:
+/// it ends in the mark-terminated + park loop every test thread here ends in.
+fn neon_yield_thread(pattern: u64, done: &'static AtomicBool) -> ! {
+    let mut errors: u32 = 0;
+    unsafe {
+        core::arch::asm!(
+            "dup v0.2d, {p}",
+            "dup v1.2d, {p}",
+            "dup v2.2d, {p}",
+            "dup v3.2d, {p}",
+            p = in(reg) pattern,
+        );
+    }
+
+    for _ in 0..50 {
+        threading::yield_now();
+
+        let mut lo0: u64;
+        let mut lo1: u64;
+        let mut lo2: u64;
+        let mut lo3: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {lo0}, v0.d[0]",
+                "mov {lo1}, v1.d[0]",
+                "mov {lo2}, v2.d[0]",
+                "mov {lo3}, v3.d[0]",
+                lo0 = out(reg) lo0,
+                lo1 = out(reg) lo1,
+                lo2 = out(reg) lo2,
+                lo3 = out(reg) lo3,
+            );
+        }
+        if lo0 != pattern || lo1 != pattern || lo2 != pattern || lo3 != pattern {
+            errors += 1;
+        }
+    }
+    if errors > 0 {
+        NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
+    }
+    done.store(true, Ordering::Release);
+    threading::mark_current_terminated();
+    loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// One thread of [`test_neon_regs_across_preemption`]: fill **Q4-Q7** with
+/// `pattern` and busy-loop for 30 ms, re-checking as fast as it can.
+///
+/// Deliberately a *separate* helper from [`neon_yield_thread`] rather than one
+/// parameterised body. The two differ in the register bank they occupy (Q0-Q3 vs
+/// Q4-Q7), and `asm!` register names cannot be parameters — but more importantly
+/// the difference is the coverage: the two banks are saved by different code paths
+/// and folding them together would quietly halve what these tests watch.
+fn neon_preempt_thread(pattern: u64, label: &'static str, done: &'static AtomicBool) -> ! {
+    let mut errors: u32 = 0;
+    unsafe {
+        core::arch::asm!(
+            "dup v4.2d, {p}",
+            "dup v5.2d, {p}",
+            "dup v6.2d, {p}",
+            "dup v7.2d, {p}",
+            p = in(reg) pattern,
+        );
+    }
+
+    let start = crate::timer::uptime_us();
+    let duration = 30_000; // 30ms — guarantees multiple preemptions at 10ms quantum
+    let mut checks: u32 = 0;
+
+    while crate::timer::uptime_us() - start < duration {
+        let mut lo4: u64;
+        let mut lo5: u64;
+        let mut lo6: u64;
+        let mut lo7: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {lo4}, v4.d[0]",
+                "mov {lo5}, v5.d[0]",
+                "mov {lo6}, v6.d[0]",
+                "mov {lo7}, v7.d[0]",
+                lo4 = out(reg) lo4,
+                lo5 = out(reg) lo5,
+                lo6 = out(reg) lo6,
+                lo7 = out(reg) lo7,
+            );
+        }
+        if lo4 != pattern || lo5 != pattern || lo6 != pattern || lo7 != pattern {
+            errors += 1;
+        }
+        checks += 1;
+    }
+
+    if errors > 0 {
+        NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
+    }
+    crate::safe_print!(64, "  {}: {} checks, {} errors\n", label, checks, errors);
+    done.store(true, Ordering::Release);
+    threading::mark_current_terminated();
+    loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+}
+
 /// Two threads each load a distinct pattern into Q0-Q3, yield repeatedly, then
 /// verify the pattern is intact. If the kernel doesn't save/restore NEON across
 /// context switches the patterns will be mixed.
@@ -5806,97 +5885,13 @@ fn test_neon_regs_across_yield() -> bool {
     DONE_B.store(false, Ordering::SeqCst);
 
     // Thread A: fills Q0-Q3 with 0xAAAA pattern
-    match threading::spawn_fn(|| {
-        let pattern: u64 = 0xAAAA_AAAA_AAAA_AAAA;
-        let mut errors: u32 = 0;
-        unsafe {
-            core::arch::asm!(
-                "dup v0.2d, {p}",
-                "dup v1.2d, {p}",
-                "dup v2.2d, {p}",
-                "dup v3.2d, {p}",
-                p = in(reg) pattern,
-            );
-        }
-
-        for _ in 0..50 {
-            threading::yield_now();
-
-            let mut lo0: u64;
-            let mut lo1: u64;
-            let mut lo2: u64;
-            let mut lo3: u64;
-            unsafe {
-                core::arch::asm!(
-                    "mov {lo0}, v0.d[0]",
-                    "mov {lo1}, v1.d[0]",
-                    "mov {lo2}, v2.d[0]",
-                    "mov {lo3}, v3.d[0]",
-                    lo0 = out(reg) lo0,
-                    lo1 = out(reg) lo1,
-                    lo2 = out(reg) lo2,
-                    lo3 = out(reg) lo3,
-                );
-            }
-            if lo0 != pattern || lo1 != pattern || lo2 != pattern || lo3 != pattern {
-                errors += 1;
-            }
-        }
-        if errors > 0 {
-            NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
-        }
-        DONE_A.store(true, Ordering::Release);
-        threading::mark_current_terminated();
-        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
-    }) {
+    match threading::spawn_fn(|| neon_yield_thread(0xAAAA_AAAA_AAAA_AAAA, &DONE_A)) {
         Ok(tid) => crate::safe_print!(32, "  Thread A: tid={}\n", tid),
         Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
     }
 
     // Thread B: fills Q0-Q3 with 0x5555 pattern (opposite of A)
-    match threading::spawn_fn(|| {
-        let pattern: u64 = 0x5555_5555_5555_5555;
-        let mut errors: u32 = 0;
-        unsafe {
-            core::arch::asm!(
-                "dup v0.2d, {p}",
-                "dup v1.2d, {p}",
-                "dup v2.2d, {p}",
-                "dup v3.2d, {p}",
-                p = in(reg) pattern,
-            );
-        }
-
-        for _ in 0..50 {
-            threading::yield_now();
-
-            let mut lo0: u64;
-            let mut lo1: u64;
-            let mut lo2: u64;
-            let mut lo3: u64;
-            unsafe {
-                core::arch::asm!(
-                    "mov {lo0}, v0.d[0]",
-                    "mov {lo1}, v1.d[0]",
-                    "mov {lo2}, v2.d[0]",
-                    "mov {lo3}, v3.d[0]",
-                    lo0 = out(reg) lo0,
-                    lo1 = out(reg) lo1,
-                    lo2 = out(reg) lo2,
-                    lo3 = out(reg) lo3,
-                );
-            }
-            if lo0 != pattern || lo1 != pattern || lo2 != pattern || lo3 != pattern {
-                errors += 1;
-            }
-        }
-        if errors > 0 {
-            NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
-        }
-        DONE_B.store(true, Ordering::Release);
-        threading::mark_current_terminated();
-        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
-    }) {
+    match threading::spawn_fn(|| neon_yield_thread(0x5555_5555_5555_5555, &DONE_B)) {
         Ok(tid) => crate::safe_print!(32, "  Thread B: tid={}\n", tid),
         Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
     }
@@ -5936,107 +5931,13 @@ fn test_neon_regs_across_preemption() -> bool {
     P_DONE_B.store(false, Ordering::SeqCst);
 
     // Thread A: busy-loop with Q4-Q7 = 0x1111 pattern for ~30ms
-    match threading::spawn_fn(|| {
-        let pattern: u64 = 0x1111_1111_1111_1111;
-        let mut errors: u32 = 0;
-        unsafe {
-            core::arch::asm!(
-                "dup v4.2d, {p}",
-                "dup v5.2d, {p}",
-                "dup v6.2d, {p}",
-                "dup v7.2d, {p}",
-                p = in(reg) pattern,
-            );
-        }
-
-        let start = crate::timer::uptime_us();
-        let duration = 30_000; // 30ms — guarantees multiple preemptions at 10ms quantum
-        let mut checks: u32 = 0;
-
-        while crate::timer::uptime_us() - start < duration {
-            let mut lo4: u64;
-            let mut lo5: u64;
-            let mut lo6: u64;
-            let mut lo7: u64;
-            unsafe {
-                core::arch::asm!(
-                    "mov {lo4}, v4.d[0]",
-                    "mov {lo5}, v5.d[0]",
-                    "mov {lo6}, v6.d[0]",
-                    "mov {lo7}, v7.d[0]",
-                    lo4 = out(reg) lo4,
-                    lo5 = out(reg) lo5,
-                    lo6 = out(reg) lo6,
-                    lo7 = out(reg) lo7,
-                );
-            }
-            if lo4 != pattern || lo5 != pattern || lo6 != pattern || lo7 != pattern {
-                errors += 1;
-            }
-            checks += 1;
-        }
-
-        if errors > 0 {
-            NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
-        }
-        crate::safe_print!(64, "  A: {} checks, {} errors\n", checks, errors);
-        P_DONE_A.store(true, Ordering::Release);
-        threading::mark_current_terminated();
-        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
-    }) {
+    match threading::spawn_fn(|| neon_preempt_thread(0x1111_1111_1111_1111, "A", &P_DONE_A)) {
         Ok(tid) => crate::safe_print!(32, "  Thread A: tid={}\n", tid),
         Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
     }
 
     // Thread B: busy-loop with Q4-Q7 = 0xEEEE pattern for ~30ms
-    match threading::spawn_fn(|| {
-        let pattern: u64 = 0xEEEE_EEEE_EEEE_EEEE;
-        let mut errors: u32 = 0;
-        unsafe {
-            core::arch::asm!(
-                "dup v4.2d, {p}",
-                "dup v5.2d, {p}",
-                "dup v6.2d, {p}",
-                "dup v7.2d, {p}",
-                p = in(reg) pattern,
-            );
-        }
-
-        let start = crate::timer::uptime_us();
-        let duration = 30_000;
-        let mut checks: u32 = 0;
-
-        while crate::timer::uptime_us() - start < duration {
-            let mut lo4: u64;
-            let mut lo5: u64;
-            let mut lo6: u64;
-            let mut lo7: u64;
-            unsafe {
-                core::arch::asm!(
-                    "mov {lo4}, v4.d[0]",
-                    "mov {lo5}, v5.d[0]",
-                    "mov {lo6}, v6.d[0]",
-                    "mov {lo7}, v7.d[0]",
-                    lo4 = out(reg) lo4,
-                    lo5 = out(reg) lo5,
-                    lo6 = out(reg) lo6,
-                    lo7 = out(reg) lo7,
-                );
-            }
-            if lo4 != pattern || lo5 != pattern || lo6 != pattern || lo7 != pattern {
-                errors += 1;
-            }
-            checks += 1;
-        }
-
-        if errors > 0 {
-            NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
-        }
-        crate::safe_print!(64, "  B: {} checks, {} errors\n", checks, errors);
-        P_DONE_B.store(true, Ordering::Release);
-        threading::mark_current_terminated();
-        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
-    }) {
+    match threading::spawn_fn(|| neon_preempt_thread(0xEEEE_EEEE_EEEE_EEEE, "B", &P_DONE_B)) {
         Ok(tid) => crate::safe_print!(32, "  Thread B: tid={}\n", tid),
         Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
     }

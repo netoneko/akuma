@@ -12,6 +12,10 @@ grade-carrying reference docs. Text below is verbatim as deleted.
 
 ## Corrections found after this doc was written — read these first
 
+Each is also marked **inline at the claim it corrects**, as a `⚠️ CORRECTION N`
+callout, so a reader who lands mid-document from a search does not act on a
+retracted claim.
+
 1. **The "three-mechanism combination, all load-bearing" claim is wrong on
    mechanism 3.** `COW_FAULT_LOCK` (`src/pmm.rs`) provided **no mutual exclusion
    at all** — a per-PA counter incremented and decremented around the break that
@@ -33,7 +37,13 @@ grade-carrying reference docs. Text below is verbatim as deleted.
 Since this closed, `no-bkl-process` has been promoted into the `smp-shared`
 feature set (2026-07-31) — see `BKL_PROCESS_CARVE_OUT.md` §9.9.
 
-> **UPDATE 2026-07-31: VALIDATED — the fix combination holds.** A fork-hammer
+> **UPDATE 2026-07-31: VALIDATED — the fix combination holds.**
+>
+> > ⚠️ **CORRECTION 3 (2026-08-14): this validation is not corroborated by the
+> > harness it cites** — `BKL_PROCESS_CARVE_OUT.md` §9.8 re-ran it and the numbers
+> > below do not reproduce. Re-derive before relying on them.
+>
+> A fork-hammer
 > validation at SMP=4 (3 boots × 10 rounds × 8 concurrent SSH connections, each
 > running `for i in 1..8; do busybox true; done`) produced **0 SIGSEGV / WILD-DA /
 > DA-MISS / PANIC / ppid=0** fault signatures across all boots and rounds. The
@@ -56,9 +66,19 @@ feature set (2026-07-31) — see `BKL_PROCESS_CARVE_OUT.md` §9.9.
 >    Guarantees PTE writes are globally visible before `flush_tlb_all()` under
 >    `cfg(kernel_smp_shared)`, closing the cached-RW-TLB-entry race window
 >    (hypothesis 4).
-> 3. **Per-physical-page CoW fault serialization (`COW_FAULT_LOCK`)** —
+> 3. ~~**Per-physical-page CoW fault serialization (`COW_FAULT_LOCK`)** —
 >    `src/pmm.rs:815`. Prevents parent and child (different PIDs) from
->    concurrently breaking CoW on the same shared frame (hypothesis 4).
+>    concurrently breaking CoW on the same shared frame (hypothesis 4).~~
+>
+>    > ⚠️ **CORRECTION 1 (2026-08-14): this mechanism never existed.**
+>    > `COW_FAULT_LOCK` was a per-PA counter incremented and decremented around
+>    > the break that **nothing ever read and nothing ever waited on** — it
+>    > excluded no one, so it prevented nothing. F3 of
+>    > [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §5; deleted since
+>    > (`grep -rn COW_FAULT_LOCK src crates` → 0 hits). What actually makes the
+>    > cross-process CoW break safe is the `released_last_va` gate in
+>    > `complete_cow_break`. **So the combination is two mechanisms, not three** —
+>    > 1 and 2 below stand.
 >
 > The BKL remains held across all fork/exec/fault paths and is still required:
 > it prevents concurrent EL1 on other cores. The `LifecycleGuard` + BKL together
@@ -85,6 +105,7 @@ feature set (2026-07-31) — see `BKL_PROCESS_CARVE_OUT.md` §9.9.
 >   (different PIDs) could fault on the same shared page concurrently, leading to
 >   double-free of the shared frame. Fixed by adding global per-physical-page CoW fault
 >   serialization via `COW_FAULT_LOCK` in `src/pmm.rs` + updated CoW fault handler.
+>   ⚠️ **See CORRECTION 1 — `COW_FAULT_LOCK` locked nothing and has been deleted.**
 >
 > Both fixes address the cross-core CoW/TLB coherence issues identified in hypothesis
 > 4. Testing with the fork-hammer harness is needed to confirm the WILD-DA FAR=0x0
@@ -177,7 +198,15 @@ feature set (2026-07-31) — see `BKL_PROCESS_CARVE_OUT.md` §9.9.
 > the `THREAD_CONTEXTS[tid]` writes; the trap-frame capture. Pin the exact non-yielding
 > boundaries with an lldb watchpoint on `Process.parent_pid` / `THREAD_CONTEXTS[tid].pc`.
 >
-> **Tree state now:** `crates/akuma-exec/src/process/lifecycle.rs` `LifecycleGuard` is a
+> **Tree state now:**
+>
+> > ⚠️ **CORRECTION 2 (2026-08-14): superseded, and wrong about the code.**
+> > This block is from an earlier same-day revision; the top-of-file update takes
+> > precedence. `LifecycleGuard` calls `disable_preemption()` under
+> > `cfg(kernel_smp_shared)` (`lifecycle.rs:85–86`) — it is **active**, not a
+> > no-op (`BKL_PROCESS_CARVE_OUT.md` §8.1).
+>
+> `crates/akuma-exec/src/process/lifecycle.rs` `LifecycleGuard` is a
 > documented **no-op** on every build (both the spinlock's BKL-stall regression and the
 > whole-op deadlock removed; behavior == pre-66e09bf). The 11 `LifecycleGuard::acquire()`
 > call sites are retained as no-ops marking where the narrow guards belong. SMP=4 boots
@@ -406,6 +435,7 @@ and on the CoW-break protocol being atomic across the two *separate* per-AS `as_
       serialization via `COW_FAULT_LOCK` in `src/pmm.rs` + updated CoW fault handler in
       `src/exceptions.rs`. See `docs/archive/SMP_SHARED.md` "Cross-core CoW/TLB protocol
       fixes" for full details.
+      ⚠️ **See CORRECTION 1 — `COW_FAULT_LOCK` locked nothing and has been deleted.**
 
     Testing with the fork-harness is needed to confirm the WILD-DA FAR=0x0 crashes are
     eliminated.

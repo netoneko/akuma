@@ -430,6 +430,13 @@ one-line summaries that point back at it. Pass A / Pass B / Pass C are otherwise
 the same algorithm with `frame_pool`/`pool_idx` renamed to
 `ia_frame_pool`/`ia_pool_idx`.
 
+> **Both of the "behavioural" differences below were resolved 2026-08-14 (§11),
+> ahead of and independently of the body merge — which is the point: they were
+> the two questions §6 said had to be answered *before* the merge, and answering
+> them does not require doing it.** (2) was real and is fixed; (1) is not a
+> behavioural divergence at all in the sense the row claims — see §11.2 and the
+> correction inline below. The ~330-line merge itself remains open and high-risk.
+
 Two differences are **behavioural**, and neither can be merged without choosing:
 
 1. **`is_exec` gate vs hardcoded `true`.** The DA arm computes
@@ -440,6 +447,18 @@ Two differences are **behavioural**, and neither can be merged without choosing:
    else { RX }` (`:4357`), so a region whose recorded flags are non-exec maps
    non-exec and still claims `icache_done: true` into the shared cache. Merging on
    the DA rule changes IA behaviour; merging on the IA rule changes DA behaviour.
+   > **Corrected 2026-08-14 (§11.2).** The last clause is a non-sequitur, and F5
+   > inherited it. `icache_done` is a property of the **frame**, not of the
+   > mapping: the IA arm's maintenance is *unconditional*, so a page it maps
+   > non-exec has still genuinely been through `dc cvau` + `ic ivau` and the claim
+   > is true. What is real here is narrower — the IA arm pays for maintenance it
+   > may not need. That is a cost, not a divergence in what the cache is told, and
+   > it does **not** block the merge: the merged body can keep the DA `is_exec`
+   > expression and the IA arm's cost disappears, because the only IA pages whose
+   > `map_flags` are non-exec reach `RX` a moment later through the permission-
+   > fault branch (`:4465`), which runs the maintenance itself via
+   > `invalidate_icache_for_page_va`. Left unchanged here on purpose: it is a
+   > behaviour change on the fault path with nothing to gain outside the merge.
 2. **`dsb ish; isb` placement in the single-page fallback.** DA emits it *before*
    the PTE install (inside `if is_exec`, `:4290`-ish); IA emits it *after*
    (`:4616`). Each has exactly one such pair, on opposite sides of the install.
@@ -447,6 +466,15 @@ Two differences are **behavioural**, and neither can be merged without choosing:
    which puts the barrier after Pass C — so this looks like a copy-paste artifact
    rather than a deliberate divergence, but "looks like" is not the bar for
    editing barrier placement in the fault path.
+   > **Answered and fixed 2026-08-14 (§11.1).** It was a copy-paste artifact, and
+   > the bar was cleared by reading what the pair is *for* rather than counting
+   > sites: it is the completion half of the ARM ARM `dc cvau` → `dsb ish` →
+   > `ic ivau` → `dsb ish` → `isb` sequence, so it belongs with the maintenance,
+   > and the minority site (the DA fallback) had it right. Also corrected: this
+   > row says "each has exactly one such pair", which is true per *fallback* but
+   > misses that each **batch** path has one too, after Pass C — four sites, not
+   > two, and the two batch ones were the worse offenders because Pass B publishes
+   > to `file_page_cache` long before Pass C.
 
 Per the `IrqGuard`/`isb` precedent in the trimming doc, the correct outcome for
 (2) is *one body, two documented entry points* — not one behaviour — unless
@@ -483,11 +511,18 @@ with its own SMP=4 verification, and the barrier question answered on purpose.
   same thread returns `Acquired`** (`children.rs:529`), so the inner guard's
   release removes the *outer* guard's entry and the outer release becomes a no-op.
   No known trigger; recorded because it is invisible from the call sites.
+  **FIXED 2026-08-14 — this is F6, see §11.3.** It now returns
+  `FaultSlot::AlreadyHeld` and the guard skips the release.
 
 One more thing found in passing: `log_fault_reclaim`'s rustdoc
 (`exceptions.rs:709`) opens with a sentence describing
 `far_in_kernel_identity_user_range` — an orphaned `///` line that belongs to the
 function 20 lines below it.
+**Already fixed by the time F7 was checked (2026-08-14): `HEAD` has the correct
+rustdoc.** The Phase 6 item 5 guard merge rewrote this region, and rewriting the
+doc comment was part of it — so this line describes the tree the audit read, not
+the tree it now sits in. It is kept verbatim because that is what `archive/` is
+for; see F7's row in §9 for the re-check.
 
 ---
 
@@ -712,22 +747,30 @@ unattributable.
 | F1 | both EL1 CoW-break paths copy 4 KiB from `old_pa` outside the lock the EL0 path documents as required for `old_pa`'s validity | **FIXED 2026-08-14** — copy moved inside `with_address_space`; unblocked by the F8 fix (F1 was F8's amplifier, §10.2, never the defect). Verified: 10/10 amplified + 3/3 unamplified clean suites | `cowstale`, `bssfork spread=1` at SMP=4; poison decode in `[WILD-DA]` |
 | F8 | the SMP=1 exercise suite wedges intermittently: console output stops, one core spins at 100%, **zero** time-jump lines on an idle host. Root cause: the scheduler SGI installed a **freed** L0 into TTBR0 from a zombie thread's saved context — the page-table-UAF free gate only saw TTBR0s live on cores, never saved contexts (§10.1–10.2: `TTBR0_EL1` at the wedge == the last `[AS-FREE]` line's L0; ESR=0x86000004, recursive vector-fetch abort) | **ROOT-CAUSED + FIXED 2026-08-14** (§10.3: saved-context arm on the free gate + drain re-check; boot test `as_drop_defers_while_saved_ctx_on_l0`) | `scripts/f8_wedge_repro.py`; `[SGI-S FREED-L0]` must never print; `[AS-FREE-DEFER] ... held_by_ctx` lines are the gate working |
 | F1b | the EL1 paths still translate the VA and read the refcount outside `as_lock`, so `old_pa` can be stale before the hold begins — the residue F1's prescribed fix cannot reach | **FIXED 2026-08-14** — §4 option 1: the `TakingAsLock` arm re-validates translate + refcount under the hold and declines the break (frees the unused frame, changes nothing) on a miss; boot test `cow_break_declines_stale_old_pa` | **The prescribed re-measurement was done 2026-08-14 and answered a different question: the cargo null-`Rc` was not this window.** It was `MADV_DONTNEED` zeroing a CoW-shared frame out from under the peer — [`MADV_DONTNEED_SHARED_FRAME.md`](MADV_DONTNEED_SHARED_FRAME.md). F1b remains a real narrowed window and its fix stands; it is simply no longer the null-`Rc` candidate, and nothing here is gated on that measurement any more |
-| F4 | DA single-page fallback places `dsb ish; isb` before the PTE install, disagreeing with its own batch path and with the IA arm | **CONFIRMED** | inspection; no known symptom |
-| F5 | IA arm claims `icache_done: true` into `file_page_cache` for pages it may map non-exec | **CONFIRMED** | inspection; no known symptom |
-| F6 | re-entrant `fault_slot_acquire` on one page by one thread lets the inner release drop the outer's entry | **CONFIRMED** | inspection; no known trigger |
-| F7 | survey errors: item 5 is three guards not two, ~24 lines not 142; `log_fault_reclaim`'s rustdoc opens with another function's sentence | **CONFIRMED** | §7 |
+| F4 | DA single-page fallback places `dsb ish; isb` before the PTE install, disagreeing with its own batch path and with the IA arm | **FIXED 2026-08-14** — §11.1. The DA fallback was the **correct** site and the other three were wrong: that pair is the *completion* half of the `dc cvau`→`ic ivau` sequence, so it has to retire before the frame is published, and both arms publish twice (`file_page_cache::insert` in Pass B, the PTE in Pass C). All six open-coded sequences now call `mmu::sync_icache_range`, whose tail **is** the pair; the four ad-hoc trailing pairs are gone | boot test `icache_sync_whole_page_offsets`; `grep -c 'ic ivau' src/exceptions.rs` → 1, and that one is the user-trap emulator (`:4892`), not a fault path |
+| F5 | IA arm claims `icache_done: true` into `file_page_cache` for pages it may map non-exec | **RETIRED 2026-08-14 — not a defect**, §11.2. `icache_done` records a property of the **frame** ("has been through `dc cvau` + `ic ivau`"), not of the mapping's permissions, and the IA fill loop runs that maintenance *unconditionally* — there is no `is_exec` gate on it. So the claim is true for every frame this arm inserts. What was real is the comment above it (§6's "every page reaching this arm is executable"), which stated a false premise; it is rewritten | `src/file_page_cache.rs:66-72` (the `Entry::icache_done` doc) against the IA fill loop's unconditional `sync_icache_range` |
+| F6 | re-entrant `fault_slot_acquire` on one page by one thread lets the inner release drop the outer's entry | **FIXED 2026-08-14** — §11.3. Reachability established first: **unreachable in this tree**, all three `fault_slot_hold` sites are mutually exclusive branches of `rust_sync_el0_handler_inner` (single caller, EL0-only vector), and no EL1 path holds a slot. Chosen resolution is nesting-*safe*, not `assert!`: a new `FaultSlot::AlreadyHeld` variant + `FaultSlotGuard::owns_release`, plus a `[FAULT-SLOT NESTED]` tripwire. An `assert!` here would convert an unreachable bug into a kernel abort on the demand-paging path | boot test `fault_slot_nested_acquire_keeps_outer_hold`; host tests `already_held_reports_nothing`, `already_held_is_not_acquired`; `[FAULT-SLOT NESTED]` must never print |
+| F7 | survey errors: item 5 is three guards not two, ~24 lines not 142; `log_fault_reclaim`'s rustdoc opens with another function's sentence | **CLOSED 2026-08-14 — both already fixed, no code change.** Re-checked against `HEAD` (075ee16f), not against the audit's snapshot: the three guards were collapsed onto one `FaultSlotGuard` by the Phase 6 item 5 merge, and `log_fault_reclaim`'s rustdoc now opens with its own sentence. The corrections themselves are recorded in §7 and in `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 5 + Phase 6 | `git show HEAD:src/exceptions.rs \| grep -c 'struct \(CowFaultGuard\|DaFaultGuard\|FaultGuard\)'` → **0**; the rustdoc at `:709` |
 
 None of F1–F6 was being fixed in this document's original change. F1, F2 and
 F4–F6 are recorded here because they are invisible from any single call site and
 only surface when the copies are read side by side — which is the argument for
 §8's items 3 and 4.
 
-> **Status as of 2026-08-14: F1, F1b, F2, F3 and F8 are closed.** What is left is
-> **F4** (barrier ordering in the DA single-page fallback), **F5** (`icache_done`
-> claimed for possibly-non-exec pages) and **F6** (re-entrant
-> `fault_slot_acquire`) — all CONFIRMED by inspection, none with a known symptom
-> or trigger, all small. F7 is survey bookkeeping. Nothing in that set is blocked
-> on a measurement any more.
+> **Status as of 2026-08-14: every row in this table is closed.** F1, F1b, F2, F3
+> and F8 were closed earlier that day; F4, F5, F6 and F7 closed with the change in
+> §11 — two fixes, one retirement with evidence, one already-fixed bookkeeping row.
+> Nothing in this document is open work any more. What remains from the *pile* is
+> §8's items 5 (the ~330-line DA/IA body merge) and 8 (`map_user_page`/`_no_flush`),
+> both still graded high-risk and both still unstarted.
+>
+> The previous wording of this block — "all CONFIRMED by inspection, none with a
+> known symptom or trigger, all small" — was accurate about size and triggers and
+> **wrong about status for two of the three**: F5 was never a defect, and F4's
+> "disagreeing with its own batch path" understated it (the batch paths disagreed
+> with the fallback *and* published before completing maintenance). Reading a
+> CONFIRMED row as "confirmed defect" rather than "confirmed divergence" is the
+> trap; §11.2 is what retiring one looks like.
 
 ## 10. F8 — the suite wedge, localized (2026-08-14)
 
@@ -909,6 +952,155 @@ a revived thread's TTBR0 install targets a deferred-not-freed L0 — intact tabl
 revival is safe from the page-table side. Closing it for real (refusing the WAITING
 publication over TERMINATED) changes exit semantics and needs its own verification
 campaign; the `[REVIVE]` tracer is there to size the problem first.
+
+## 11. F4–F7 closed (2026-08-14)
+
+Four rows, one change, four different outcomes: two fixes, one retirement, one
+row that was already true. Recorded here rather than in §9's cells because the
+*reasoning* is the deliverable — three of these had no symptom and no trigger,
+so the only thing separating "fixed" from "changed the fault path for nothing"
+is the argument.
+
+### 11.1 F4 — the barrier pair belongs with the maintenance, not with the install
+
+**The question §6 refused to answer by majority vote.** Four sites emitted a
+`dsb ish; isb` pair; three had it *after* the PTE install, one (the DA
+single-page fallback) *before*. Counting says the fallback is the odd one out.
+Reading says the fallback is the only one that was right.
+
+The pair is not an install barrier. It is the **completion half** of the ARM ARM
+instruction-visibility sequence:
+
+```
+dc cvau, <line>   ×N     ; clean the new bytes out of the D-cache to PoU
+dsb ish                  ; the cleans must complete before the invalidates
+ic ivau, <line>   ×N     ; invalidate stale I-cache lines at PoU
+dsb ish                  ; ← the invalidates must COMPLETE, inner-shareable
+isb                      ; ← this PE re-fetches
+```
+
+The trailing `dsb ish` is what makes the `ic ivau` broadcast complete across the
+inner-shareable domain. Its deadline is therefore **the first instant any PE can
+fetch from the frame** — not "before we return to EL0". Both demand-paging arms
+publish a frame *twice*, and the earlier publication is not the one the old code
+was ordering against:
+
+| publish | where | who can fetch |
+|---|---|---|
+| `file_page_cache::insert` | Pass B, per page, inside the fill loop | any peer core mapping the same file page, immediately — and it trusts `icache_done` and does **no** maintenance of its own |
+| the PTE | Pass C / the fallback's `map_user_page` | any `CLONE_VM` sibling running this address space |
+
+So the batch paths' pair, sitting after Pass C, retired the invalidation up to a
+whole readahead batch (256 pages of block I/O) after peers could already be
+executing from the frames — and `mark_icache_clean` had the same shape. The DA
+fallback's placement, immediately after `ic ivau` and before the install, is the
+architecturally correct one.
+
+**The fix is not a moved barrier, it is a deleted copy.**
+`akuma_exec::mmu::sync_icache_range` already implemented exactly this sequence,
+ends in `dsb ish; isb`, and is already used by
+`UserAddressSpace::invalidate_icache_for_page_va`. `exceptions.rs` open-coded it
+**six** times instead (DA and IA × shared-cache-hit, fill, single-page fallback),
+each with its own comment about `ic ivau` needing the kernel VA. All six now
+call it, which puts the completion barrier before every publication by
+construction — a site cannot get this wrong without deleting a call. The four
+ad-hoc trailing pairs are gone; the return to EL0 is still synchronized because
+`map_user_page` ends in `flush_tlb_page` and Pass C in `flush_tlb_range`, and
+both of those end in `dsb ish; isb`.
+
+**What the test can and cannot show.** Barrier ordering is not observable under
+QEMU TCG, which has a coherent I-cache — no boot test can fail on this. What is
+observable, and was untested, is the **call shape**: the existing
+`icache_sync_rewrites_code` passes `len = 8`, so nothing ever executed code from
+outside the first 64-byte line, while the fault path maintains a whole page and
+then jumps to an arbitrary offset in it. `icache_sync_whole_page_offsets` runs
+stubs at `0x800` and `PAGE_SIZE - 8`, twice each, maintaining the whole page —
+it catches a wrong length or a wrong line walk, and it is honest about not
+catching a wrong barrier position.
+
+### 11.2 F5 — retired: the claim was already true
+
+F5 said the IA arm "claims `icache_done: true` for pages it may map non-exec".
+The premise is a category error, inherited from §6's item 1 and repeated three
+times without opening `file_page_cache.rs`.
+
+`icache_done` is documented at its definition (`Entry`, `file_page_cache.rs:68`)
+as *"whether this frame has had `dc cvau` + `ic ivau` run over it"* — a property
+of the **frame**. It says nothing about any mapping's permissions, and no reader
+of it asks about permissions: `lookup_and_ref`'s `want_exec && !hit.icache_done`
+uses it only to decide whether a new `RX` mapper must pay for the maintenance.
+
+The IA fill loop performs that maintenance **unconditionally** — there is no
+`is_exec` gate on it, unlike the DA arm's. Every frame it inserts has therefore
+genuinely been through the sequence, and `insert(..., true)` is accurate. Mapping
+the page non-exec does not make it inaccurate; it just means the maintenance was
+paid for nothing.
+
+Both halves of "either stop claiming it, or make the claim true" were therefore
+already satisfied, and doing either would have been a change for its own sake.
+What *was* wrong is the comment two lines above the insert — "because every page
+reaching this arm is executable", which is the false premise §6 correctly flagged
+— and the one on `lookup_and_ref`'s hardcoded `want_exec: true`, which said
+nothing at all. Both are rewritten to say what is actually load-bearing: the
+claim is about the frame, the maintenance is unconditional, and `want_exec: true`
+is a deliberate over-request that can never be an under-request.
+
+The residual cost (maintenance on IA pages that map non-exec) is left in place.
+Removing it means gating on `is_exec` like the DA arm, which is a behaviour
+change on the fault path whose only payoff is inside §6's ~330-line body merge —
+so it belongs to that merge, and §6's row now says so.
+
+### 11.3 F6 — reachability first, then the cheaper of the two options
+
+The prescribed order was: establish whether a trigger is reachable *before*
+choosing between "make it re-entrant" and "assert it never nests".
+
+**It is not reachable.** All three `fault_slot_hold` call sites
+(`exceptions.rs:3712`, `:3881`, `:4500`) are inside `rust_sync_el0_handler_inner`,
+which has exactly one caller (`rust_sync_el0_handler`, the EL0 synchronous
+exception entry) and cannot re-enter itself: a fault taken while it runs is taken
+*from EL1* and dispatches through the EL1 vector, and nothing on that path — the
+EL1 CoW pre-flight included — acquires a fault slot. Within one invocation the
+three sites are mutually exclusive: `is_permission_fault` (`DFSC == 0x0C`) and
+`is_translation_fault` (`0x04`/`0x08`) cannot both hold, and the DA and IA sites
+are in different `EC` arms.
+
+So the choice is between two ways of protecting a path nothing reaches, and cost
+decides it. `assert!`/`panic!` would convert an unreachable bug into a **kernel
+abort on the demand-paging path** — the one place where the failure mode is
+strictly worse than the defect. The nesting-safe form costs one enum variant and
+one `bool`:
+
+- `FaultSlot::AlreadyHeld` replaces the `Acquired` that a self-held slot used to
+  return. That single conflated variant *was* the defect: "you now own the
+  release" and "someone else still does" had one spelling, so the inner RAII
+  guard released, and holder-gating could not object because the tid matched.
+- `FaultSlotGuard::owns_release` is false only for that variant.
+- `[FAULT-SLOT NESTED]` prints on the path, and — like `[SGI-S FREED-L0]` — must
+  never print. If it does, a fourth call site was added inside a fault block; the
+  change is *safe*, but that site is serializing against a slot it does not own
+  and needs looking at.
+
+The boot test nests the acquires by hand, which is exactly what such a site would
+do, and demonstrates the hazard rather than asserting about it: with two holds
+outstanding it calls one release and shows the slot goes **empty**. That is the
+proof that nothing at the release end can distinguish inner from outer, and hence
+that the contract has to ride on the acquire.
+
+### 11.4 F7 — both halves were already true
+
+Re-checked against `HEAD` rather than against the audit's snapshot, which is the
+whole lesson of the row: the three guards (`CowFaultGuard`, `DaFaultGuard`,
+`FaultGuard`) do not exist in the tree — the Phase 6 item 5 merge collapsed them
+onto one `FaultSlotGuard` — and that same merge rewrote `log_fault_reclaim`'s
+rustdoc, so the orphaned sentence is gone too. The survey corrections themselves
+(three guards not two, ~24 lines not 142) are recorded in §7 here and in
+`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 5 and Phase 6. No code change.
+
+A finding whose fix landed as a side effect of another change stays CONFIRMED
+forever unless someone re-runs it against the current tree, and there is no
+signal that this has happened — which is the argument for re-checking a stale
+row before working it, not after.
 
 ## Background
 
