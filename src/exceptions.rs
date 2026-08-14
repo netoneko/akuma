@@ -1106,7 +1106,7 @@ fn drop_surplus_shared_ref(as_owner: u32, pf: crate::pmm::PhysFrame) {
 /// how the PTE is overwritten — `aspace.map_page` through `&mut UserAddressSpace` versus
 /// `mmu::remap_current_user_page` through the live TTBR0. Unifying those is a change to
 /// the PTE-write mechanism on the fault path, which is not what F1 asked for.
-enum CowRemap<'a> {
+pub enum CowRemap<'a> {
     /// The EL1 paths ([`ensure_cow_page_writable`] and [`try_resolve_el1_cow_fault`]):
     /// take `as_lock` via `with_address_space` for the copy, the PTE overwrite and
     /// the frame bookkeeping (F1, applied 2026-08-14 — see
@@ -1165,14 +1165,13 @@ fn copy_page_under_as_lock(old_pa: usize, new_frame: crate::pmm::PhysFrame) {
 /// Owner resolution likewise stays at the call site, but all three sites now resolve
 /// the **address-space owner** (F2, fixed 2026-08-13).
 ///
-/// **Residual window, tracked as F1b.** The copy is now under `as_lock` everywhere,
-/// but the two EL1 sites still *translate* the VA and read `cow_ref_get` **outside**
-/// the hold, then pass the resulting `old_pa` in here. So a peer can free `old_pa`
-/// between the translate and the acquire, and the copy would read a stale frame — a
-/// narrower version of the same defect. The EL0 arm does not have this: it holds
-/// `as_lock` across translate, refcount and copy alike. Closing it means either
-/// re-validating the PTE inside the hold or restructuring the EL1 sites to pre-hold
-/// like EL0; see `COW_PILE_AUDIT.md` §4 F1b.
+/// **F1b (closed 2026-08-14).** The two EL1 sites still *translate* the VA and read
+/// `cow_ref_get` **outside** the hold — that cannot move (the sites answer "is this
+/// even a CoW page?" before taking any lock, and the alloc must stay outside the
+/// hold) — so the `TakingAsLock` arm **re-validates both under the hold** and
+/// declines the break (frees `new_frame`, changes nothing) if a peer got there
+/// first. The EL0 arm needs no re-validation: it holds `as_lock` across translate,
+/// refcount and copy alike. See `COW_PILE_AUDIT.md` §4 F1b, option 1.
 ///
 /// The reason this middle is worth one definition is the `released_last_va` gate
 /// below. `COW_REFCOUNTS` counts **address spaces** — the first share inserts 2,
@@ -1181,7 +1180,7 @@ fn copy_page_under_as_lock(old_pa: usize, new_frame: crate::pmm::PhysFrame) {
 /// reference the address space is still using, and the next holder's decrement then
 /// frees a frame we still map. That is the §5.6 refcount underflow, and it was fixed
 /// three times because this code existed in three places.
-fn complete_cow_break(
+pub fn complete_cow_break(
     remap: CowRemap<'_>,
     page_va: usize,
     old_pa: usize,
@@ -1190,22 +1189,47 @@ fn complete_cow_break(
     crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
 
     let released_last_va = match remap {
-        CowRemap::TakingAsLock(owner) => owner.with_address_space(|aspace| {
-            // F1 (COW_PILE_AUDIT.md §4/§8 row 6): the copy runs INSIDE the
-            // `as_lock` hold, so `old_pa` cannot be freed by a peer's munmap or
-            // CoW break mid-copy. Held back until 2026-08-14 because it amplified
-            // the F8 wedge (§10.2 — it widens the preempted-mid-exit window);
-            // with the saved-context free gate landed, 10/10 amplified suite
-            // runs were clean and this is safe.
-            copy_page_under_as_lock(old_pa, new_frame);
-            let _ = aspace.map_page(
-                page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
-            );
-            akuma_exec::mmu::flush_tlb_page(page_va);
-            aspace.track_user_frame(new_frame);
-            // CoW: the old page is freed via the global CoW refcount, never here.
-            aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa))
-        }),
+        CowRemap::TakingAsLock(owner) => {
+            let outcome = owner.with_address_space(|aspace| {
+                // F1b (COW_PILE_AUDIT.md §4, closed 2026-08-14): the EL1 callers
+                // translated `page_va` and read the refcount BEFORE this hold began,
+                // so a peer's munmap or CoW break may have retired `old_pa` in
+                // between — the copy below would then read a freed (quarantine-
+                // poisoned or recycled) frame. Re-validate both entry conditions
+                // under the hold; `None` declines the break. This is the same
+                // invariant the EL0 arm gets by construction (it pre-holds
+                // `as_lock` across translate, refcount and copy alike).
+                let still_named =
+                    aspace.translate(page_va).map(|pa| pa & !0xFFF) == Some(old_pa);
+                if !still_named || crate::pmm::cow_ref_get(old_pa) == 0 {
+                    return None;
+                }
+                // F1 (§8 row 6): the copy runs INSIDE the `as_lock` hold, so
+                // `old_pa` cannot be freed by a peer mid-copy. Held back until
+                // 2026-08-14 because it amplified the F8 wedge (§10.2); with the
+                // saved-context free gate landed, 10/10 amplified suite runs were
+                // clean and this is safe.
+                copy_page_under_as_lock(old_pa, new_frame);
+                let _ = aspace.map_page(
+                    page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
+                );
+                akuma_exec::mmu::flush_tlb_page(page_va);
+                aspace.track_user_frame(new_frame);
+                // CoW: the old page is freed via the global CoW refcount, never here.
+                Some(aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa)))
+            });
+            let Some(released) = outcome else {
+                // Declined: a peer resolved this page first (its break made the
+                // PTE name a private frame, or a munmap removed it). Leave the
+                // mapping exactly as the peer left it and return the unused
+                // frame. Callers proceed/retry: a completed sibling break means
+                // the retried access succeeds; a genuine unmap re-faults with a
+                // translation (not permission) code and takes its normal path.
+                crate::pmm::free_page(new_frame);
+                return;
+            };
+            released
+        }
         CowRemap::CallerHoldsAsLock(owner) => {
             // The caller's `AsLockHold` already covers this copy.
             copy_page_under_as_lock(old_pa, new_frame);

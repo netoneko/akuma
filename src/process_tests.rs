@@ -640,6 +640,7 @@ pub fn run_all_tests() {
     // core's TTBR0 still shows must park the frames, not free+poison them.
     test_as_drop_defers_while_core_on_l0();
     test_as_drop_defers_while_saved_ctx_on_l0();
+    test_cow_break_declines_stale_old_pa();
     // Recycled-tid channel stamp forged an exit for a live process (-j4 hang)
     test_ktg_stale_tid_channel_not_stamped();
     test_mark_terminated_ignores_large_ids();
@@ -4652,6 +4653,101 @@ fn test_as_drop_defers_while_saved_ctx_on_l0() {
         crate::safe_print!(160,
             "[Test] as_drop_defers_while_saved_ctx_on_l0 FAILED: {} ({} vs {})\n",
             msg, d1, d2);
+    }
+}
+
+/// F1b (`COW_PILE_AUDIT.md` §4, closed 2026-08-14): `complete_cow_break`'s
+/// `TakingAsLock` arm must re-validate — under the `as_lock` hold — that the
+/// faulting VA still translates to the `old_pa` the caller resolved BEFORE the
+/// hold began, and decline the break otherwise. The EL1 CoW sites translate and
+/// refcount-check lock-free, so a peer's break or munmap can retire `old_pa` in
+/// between; copying from it would read a freed, quarantine-poisoned frame — the
+/// signature class of CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md. A declined break
+/// must change nothing (PTE and refcounts intact) and return the unused frame.
+fn test_cow_break_declines_stale_old_pa() {
+    use akuma_exec::mmu::user_flags;
+    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
+
+    let pid = 63_200u32;
+    register_process(pid, make_test_process(pid));
+    let Some(owner) = lookup_process_shared(pid) else {
+        console::print("[Test] cow_break_declines_stale_old_pa FAILED: no owner\n");
+        return;
+    };
+
+    let (ok, msg) = crate::irq::with_irqs_disabled(|| {
+        let va = 0xD3F0_0000usize;
+        let Some(frame_a) = crate::pmm::alloc_page_zeroed() else {
+            return (false, "OOM frame A");
+        };
+        let Some(frame_b) = crate::pmm::alloc_page_zeroed() else {
+            crate::pmm::free_page(frame_a);
+            return (false, "OOM frame B");
+        };
+        let Some(frame_c) = crate::pmm::alloc_page_zeroed() else {
+            crate::pmm::free_page(frame_a);
+            crate::pmm::free_page(frame_b);
+            return (false, "OOM frame C");
+        };
+
+        // The shape a fork leaves behind: va maps A read-only, A is tracked in this
+        // space, and A carries the "parent + child" CoW refcount — the FIRST
+        // `cow_ref_inc` on a fresh pa inserts 2, not 1. B is a decoy with a
+        // non-zero refcount, so ONLY the translate re-check can decline it.
+        owner.with_address_space(|aspace| {
+            let _ = aspace.map_page(va, frame_a.addr, user_flags::RO);
+            aspace.track_user_frame(frame_a);
+        });
+        crate::pmm::cow_ref_inc(frame_a.addr); // -> 2
+        crate::pmm::cow_ref_inc(frame_b.addr); // -> 2
+
+        // 1. STALE old_pa: the PTE names A but the caller (as a raced EL1 site
+        //    would) passes B. The break must decline: PTE untouched, refcounts
+        //    untouched, C returned to the PMM inside the call.
+        crate::exceptions::complete_cow_break(
+            crate::exceptions::CowRemap::TakingAsLock(owner), va, frame_b.addr, frame_c);
+        let pte = owner.with_address_space(|a| a.translate(va).map(|p| p & !0xFFF));
+        if pte != Some(frame_a.addr) {
+            return (false, "declined break rewrote the PTE");
+        }
+        if crate::pmm::cow_ref_get(frame_a.addr) != 2
+            || crate::pmm::cow_ref_get(frame_b.addr) != 2
+        {
+            return (false, "declined break touched a CoW refcount");
+        }
+
+        // 2. Genuine break (old_pa really is A): PTE moves to the private copy and
+        //    this space's reference on A is released (2 -> 1).
+        let Some(frame_d) = crate::pmm::alloc_page_zeroed() else {
+            return (false, "OOM frame D");
+        };
+        crate::exceptions::complete_cow_break(
+            crate::exceptions::CowRemap::TakingAsLock(owner), va, frame_a.addr, frame_d);
+        let pte = owner.with_address_space(|a| a.translate(va).map(|p| p & !0xFFF));
+        if pte != Some(frame_d.addr) {
+            return (false, "genuine break did not remap to the private copy");
+        }
+        if crate::pmm::cow_ref_get(frame_a.addr) != 1 {
+            return (false, "genuine break did not release this space's reference");
+        }
+
+        // Teardown of what the AS drop won't cover: A left user_frames at the
+        // genuine break (refcount 1 -> free_page's dec frees it); B still carries
+        // its decoy count of 2, so drop one reference first or free_page only
+        // decrements. D stays tracked — the AS drop at unregister/reclaim frees it.
+        crate::pmm::free_page(frame_a);
+        let _ = crate::pmm::cow_ref_dec(frame_b.addr);
+        crate::pmm::free_page(frame_b);
+        (true, "")
+    });
+
+    let _ = unregister_process(pid);
+
+    if ok {
+        console::print("[Test] cow_break_declines_stale_old_pa PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] cow_break_declines_stale_old_pa FAILED: {}\n", msg);
     }
 }
 

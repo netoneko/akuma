@@ -209,7 +209,14 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
         results[f"smp{smp}.pass_marker"] = len(re.findall(r"\[PASS\]", text))
         results[f"smp{smp}.passed_marker"] = len(re.findall(r"PASSED", text))
 
+        # Two failure formats exist and BOTH must land in fail_set: `[FAIL] name`
+        # and `[Test] name FAILED: reason`. The second was invisible here until
+        # 2026-08-14, when a genuinely failing [Test]-format test sailed through a
+        # gate run as fail_set=(empty) — its only trace a passed_marker one lower,
+        # which the runbook documents as tolerable ±1 flake. A failing test must
+        # never be distinguishable from a flake by design.
         fails = set(re.findall(r"\[FAIL\] ([a-z_0-9]+)", text))
+        fails |= set(re.findall(r"\[Test\] ([A-Za-z_0-9]+) FAILED", text))
         results[f"smp{smp}.fail_set"] = ",".join(sorted(fails - FLAKY_BOOT_TESTS)) or "(empty)"
         results[f"smp{smp}.flaky_seen"] = ",".join(sorted(fails & FLAKY_BOOT_TESTS)) or "(none)"
 

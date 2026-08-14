@@ -266,8 +266,12 @@ copy, and the copies that lack it violate it* — with memory corruption as the
 cost rather than a lost log line.
 
 ### F1b — the EL1 paths still *translate* outside the lock
-**CONFIRMED (mechanism) / NEEDS-REPRO (consequence). OPEN — found 2026-08-13 while
-fixing F1.**
+**CONFIRMED (mechanism) / NEEDS-REPRO (consequence). Found 2026-08-13 while fixing F1.
+FIXED 2026-08-14 via option 1 below: `complete_cow_break`'s `TakingAsLock` arm
+re-validates translate + refcount inside the hold and declines on a miss (the decline
+path frees the unused frame and changes nothing — callers proceed/retry, which is
+also what a slightly-later arrival would have seen). Boot test:
+`cow_break_declines_stale_old_pa`.**
 
 §8 row 6 prescribes moving "the 4 KiB copy inside `with_address_space`", and that is
 what landed. It is not the whole invariant. Both EL1 sites still do this:
@@ -601,7 +605,7 @@ unattributable.
 | F2 | `try_resolve_el1_cow_fault` resolves the owner with `read_current_pid()`; for `CLONE_VM` workers this leaks two frames per kernel-side CoW break and takes a lock nobody waits on | **FIXED 2026-08-13** (mechanism was CONFIRMED, consequence still NEEDS-REPRO) | PMM drift across a threaded workload taking kernel-side user writes; `[AS-*]` traces |
 | F1 | both EL1 CoW-break paths copy 4 KiB from `old_pa` outside the lock the EL0 path documents as required for `old_pa`'s validity | **FIXED 2026-08-14** — copy moved inside `with_address_space`; unblocked by the F8 fix (F1 was F8's amplifier, §10.2, never the defect). Verified: 10/10 amplified + 3/3 unamplified clean suites | `cowstale`, `bssfork spread=1` at SMP=4; poison decode in `[WILD-DA]` |
 | F8 | the SMP=1 exercise suite wedges intermittently: console output stops, one core spins at 100%, **zero** time-jump lines on an idle host. Root cause: the scheduler SGI installed a **freed** L0 into TTBR0 from a zombie thread's saved context — the page-table-UAF free gate only saw TTBR0s live on cores, never saved contexts (§10.1–10.2: `TTBR0_EL1` at the wedge == the last `[AS-FREE]` line's L0; ESR=0x86000004, recursive vector-fetch abort) | **ROOT-CAUSED + FIXED 2026-08-14** (§10.3: saved-context arm on the free gate + drain re-check; boot test `as_drop_defers_while_saved_ctx_on_l0`) | `scripts/f8_wedge_repro.py`; `[SGI-S FREED-L0]` must never print; `[AS-FREE-DEFER] ... held_by_ctx` lines are the gate working |
-| F1b | the EL1 paths still translate the VA and read the refcount outside `as_lock`, so `old_pa` can be stale before the hold begins — the residue F1's prescribed fix cannot reach | **CONFIRMED** mechanism, **NEEDS-REPRO** consequence, **OPEN** | same instruments as F1; the fix is §4 F1b option 1 or 2 |
+| F1b | the EL1 paths still translate the VA and read the refcount outside `as_lock`, so `old_pa` can be stale before the hold begins — the residue F1's prescribed fix cannot reach | **FIXED 2026-08-14** — §4 option 1: the `TakingAsLock` arm re-validates translate + refcount under the hold and declines the break (frees the unused frame, changes nothing) on a miss; boot test `cow_break_declines_stale_old_pa` | re-measure the cargo null-Rc rate (`CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md`) — this window was its best remaining candidate route |
 | F4 | DA single-page fallback places `dsb ish; isb` before the PTE install, disagreeing with its own batch path and with the IA arm | **CONFIRMED** | inspection; no known symptom |
 | F5 | IA arm claims `icache_done: true` into `file_page_cache` for pages it may map non-exec | **CONFIRMED** | inspection; no known symptom |
 | F6 | re-entrant `fault_slot_acquire` on one page by one thread lets the inner release drop the outer's entry | **CONFIRMED** | inspection; no known trigger |
