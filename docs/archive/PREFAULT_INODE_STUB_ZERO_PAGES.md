@@ -89,7 +89,7 @@ timing sensitivity, not a fix. See
 
 - [`SELFHOST_ZERO_PAGE_HUNT.md`](SELFHOST_ZERO_PAGE_HUNT.md) — the full hunt;
   §12 is this arm, §10 the theory table it closes a row of.
-- [`HANDOFF_ZERO_PAGE_ICE.md`](HANDOFF_ZERO_PAGE_ICE.md) — the self-contained
-  handoff prompt, updated for this find; method rule 8 came out of it.
+- [`ZERO_PAGE_ICE_FIX.md`](ZERO_PAGE_ICE_FIX.md) — the fix record for the ICE as a
+  whole; this arm is root cause #1 there, and method rule 8 came out of it.
 - [`USER_COPY_FOLD.md`](USER_COPY_FOLD.md) — the fold that moved the prefault
   (and its swallowed fill result) into `akuma-exec` verbatim.

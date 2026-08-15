@@ -1008,9 +1008,12 @@ mappings, rises and falls with the build), `pin_ovf=`, `defer=` (should drain to
 
 ## Background
 
-- [`HANDOFF_ZERO_PAGE_ICE.md`](HANDOFF_ZERO_PAGE_ICE.md) — **self-contained handoff
-  prompt** for picking this up cold: repro, elimination table, ranked live theories,
+- [`ZERO_PAGE_ICE_FIX.md`](ZERO_PAGE_ICE_FIX.md) — **the fix record**, and the short
+  way in: both root causes, the elimination table, the theories that stayed open,
   the SMP=1 blocker, and the method rules this hunt paid for
+- [`HANDOFF_MAPPED_PAGE_PREMATURE_FREE.md`](HANDOFF_MAPPED_PAGE_PREMATURE_FREE.md) —
+  **the live handoff that follows this one**: quarantine poison inside mapped file
+  pages, now the dominant self-host build failure
 - [`CARGO_HEAP_NULL_RC.md`](CARGO_HEAP_NULL_RC.md) — the same end state (zeroed page in
   a live process), the task brief the earlier hunt ran from
 - [`MADV_DONTNEED_SHARED_FRAME.md`](MADV_DONTNEED_SHARED_FRAME.md) — the fixed *sharing*

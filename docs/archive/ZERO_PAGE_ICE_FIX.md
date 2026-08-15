@@ -1,14 +1,30 @@
-# Handoff prompt — the `[0,0,0,0]` self-host ICE
+# The `[0,0,0,0]` self-host ICE — the fix record
 
-*Paste everything below the line into a fresh session. It is written to be
-self-contained; the referenced docs add depth but are not required to start.*
+> **Both root causes found and fixed, 2026-08-15.** What is left of this document
+> is the summary, the elimination table (so nothing here gets re-litigated), the
+> theories that stayed open, and the method rules the hunt paid for.
+>
+> 1. **Prefault file fills ran through a stub hook** — `read_at_by_inode` had been
+>    registered as `Err(-1)` since a March crate extraction, and the call site
+>    dropped the result, so every prefault of a file-backed page installed a silent
+>    zero page (856/build). Green builds 0/10 → 3/10.
+>    [`PREFAULT_INODE_STUB_ZERO_PAGES.md`](PREFAULT_INODE_STUB_ZERO_PAGES.md).
+> 2. **The inode lifecycle was not honored across `mmap`** — `unlink` freed and
+>    reissued an inode a live mapping still named, giving that mapper `Ok(0)` zero
+>    pages or, after reuse, another file's bytes. Fixed with a pin on the mapping
+>    plus a deferred free in ext2.
+>    [`SELFHOST_ZERO_PAGE_HUNT.md`](SELFHOST_ZERO_PAGE_HUNT.md) §14–§15.
+>
+> **The ICE is not *proven* closed, and the self-host build still fails.** What
+> dominates that workload now is a different, older defect — quarantine poison
+> appearing inside mapped file pages — which has its own live handoff:
+> [`HANDOFF_MAPPED_PAGE_PREMATURE_FREE.md`](HANDOFF_MAPPED_PAGE_PREMATURE_FREE.md).
+> Start there, not here.
 
----
-
-## The task
+## The symptom
 
 In the Akuma kernel repo (bare-metal Rust, AArch64, QEMU virt), the self-hosted build
-fails on essentially every clean build. `rustc`, running **inside** the guest, panics:
+failed on essentially every clean build. `rustc`, running **inside** the guest, panicked:
 
 ```
 thread 'rustc' panicked at rustc_metadata/src/rmeta/def_path_hash_map.rs:56:13:
@@ -17,20 +33,15 @@ decode error: Expected header tag [79, 68, 72, 84] but found [0, 0, 0, 0]
 
 `[79,68,72,84]` is ASCII **`ODHT`**, the on-disk hash-table header in crate metadata.
 This is **never a compiler bug** — it means the kernel handed `rustc` zeroed memory
-where real bytes belonged. Find out which memory, and why.
+where real bytes belonged.
 
-**Status note before you start:** as of 2026-08-15 night this no longer fails on
-every clean build — the last two arms went 11/11 green. Do not read that as
-fixed. The mechanism that produces the zero pages still fires on those green
-builds (see T5b below); one root cause is fixed and a second is diagnosed and
-unfixed. Your job is the unfixed one, not a fresh repro hunt.
-
-It fails on `enumn` and `zerocopy-derive`, **in the same second**, every time. Those are
+It failed on `enumn` and `zerocopy-derive`, **in the same second**, every time. Those are
 the only two proc-macro crates cargo builds in parallel at that stage and the only two
-that depend on `syn`. Treat the pairing as a scheduling coincidence, not a fact about
-those files — a previous session spent hours on file-side theories because of it.
+that depend on `syn`. The pairing is a scheduling coincidence, not a fact about those
+files — a session spent hours on file-side theories because of it, and the eventual
+root causes were in the mapping path both times.
 
-## Reproduce
+## Reproduce (still the way to re-score any of this)
 
 ```bash
 scripts/build_devbox_smoltcp.sh
@@ -56,7 +67,7 @@ All instruments are still in the tree.
 | Theory | Instrument | Reading |
 |---|---|---|
 | Fill read short/errored (**demand-fault** site) | `[FILL-SHORT]` / `DP_FILE_FILL_SHORT` | 0 |
-| Prefault file fill short/errored (`prefault_user_range`) | `[FILL-SHORT/prefault]` / `DP_PREFAULT_FILL_SHORT` | **856/build on the as-found kernel — ROOT CAUSE, found + FIXED 2026-08-15** (`docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md`): the `read_at_by_inode` runtime hook was an `Err(-1)` stub and the call site dropped the result. Green builds 0/10 → **3/10**. The residue is what this handoff now targets. |
+| Prefault file fill short/errored (`prefault_user_range`) | `[FILL-SHORT/prefault]` / `DP_PREFAULT_FILL_SHORT` | **856/build on the as-found kernel — ROOT CAUSE #1, found + FIXED 2026-08-15** (`docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md`): the `read_at_by_inode` runtime hook was an `Err(-1)` stub and the call site dropped the result. Green builds 0/10 → **3/10**. |
 | `file_page_cache` serves wrong bytes | `[FPC-BAD]` (`config::FPCACHE_VERIFY_HITS`, re-reads every hit from disk) | 0 across **4.3M hits** |
 | `PROT_NONE` file region zero-filled | `[DA-NONE-FILE]` | 0 |
 | `MADV_DONTNEED` on a file page | `[DONTNEED-FILE]` | 0 |
@@ -74,11 +85,11 @@ bug" as progress on this one:
 2. `MAP_SHARED|MAP_ANONYMOUS` was CoW-copied by `fork` instead of shared. Fixed. ICE
    unchanged.
 
-## Live theories, ranked — for the ~60-70% RESIDUE after the 2026-08-15 prefault fix
+## Root cause #2, and the theories that were competing to explain it
 
 The prefault inode-stub fix (see the elimination table) moved green builds 0/10 →
-3/10 but did **not** close the ICE. The residue has since been **scored by
-failure mode** (5-build arm on the fix kernel, full cargo logs kept in-guest):
+3/10 but did **not** close the ICE. The residue was **scored by failure mode**
+(5-build arm on the fix kernel, full cargo logs kept in-guest):
 
 - **Mode A** — `enumn`+`zerocopy-derive` (the usual pairing),
   `rustc_serialize/src/serialize.rs:402` `assertion failed: bytes[len] == STR_SENTINEL`
@@ -145,6 +156,12 @@ means the pin table filled and every inode is being treated as pinned.
   Plausible, still unverified — and no longer *needed*, since T5b's inode-reuse
   leg explains the garbage-byte modes on its own.
 
+### Theories that were never resolved — still live for any future sighting
+
+These were ranked against the residue and overtaken by T5b before any of them was
+tested. None is eliminated; each is here so the next zero-page or garbage-byte
+sighting starts from the ranking rather than from scratch.
+
 **T1 — `sys_read`/`sys_pread64`/`readv` short-copies into the user buffer.** The
 strongest untested candidate for the *zero-page* shape. Commit `edd91fe7 "safer
 memory helpers"` rewrote **every**
@@ -171,7 +188,7 @@ SMP=1?** Currently blocked — see below.
 `write_block` evicts correctly, but it has not been tested under concurrency. Weakened
 by `fpcpoison` passing, not eliminated.
 
-## Blocker you will hit immediately
+## The blocker that stayed unresolved
 
 **`SMP=1` hard-wedges the box.** `SMP=1 overlays/devbox/run-smoltcp.sh`, same workload:
 build 1 completed in 1012 s, build 2 wedged. QEMU pinned at **98% CPU**, console frozen,
@@ -182,9 +199,10 @@ last line:
 ```
 
 Same shape as "Defect A" in `docs/runbooks/selfhost-kernel-build.md` but at SMP=1, where
-it has not been recorded before. This blocks T3 **and** any single-core control for the
-other theories, so it may be worth fixing first. To inspect a wedge you must boot with
-`GDB=1` — the gdbstub is armed at launch, so a VM already wedged is uninspectable.
+it had not been recorded before. This blocked T3 **and** every single-core control the
+other theories wanted, and it is still open — worth fixing before any arm that needs to
+compare one core against four. To inspect a wedge you must boot with `GDB=1`; the
+gdbstub is armed at launch, so a VM already wedged is uninspectable.
 
 ## Method rules — these were learned expensively
 
@@ -281,9 +299,12 @@ kept deliberately as a worked example; §12 and
 `docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md` cover the root cause found 2026-08-15;
 §13 scores the residue (garbage-byte modes, the Ok(0) flood, the timing-perturbation
 result) and ranks T5; **§14 root-causes the flood to T5b** (inode lifecycle not honored
-across `mmap`) with the actor caught in the act, and lists the ranked fix options.
-`docs/archive/FPCACHE_EVICTION_PREFERS_UNMAPPED.md`
+across `mmap`) with the actor caught in the act; **§15 is the fix** — the pin, the
+deferred free, the page-cache invalidation it required, and the poison evidence that
+became the next hunt. `docs/archive/FPCACHE_EVICTION_PREFERS_UNMAPPED.md`
 covers a cache-policy bug found along the way.
+`docs/archive/HANDOFF_MAPPED_PAGE_PREMATURE_FREE.md` is the live handoff that follows
+this one.
 
 **State: both known root causes fixed; the ICE itself is not proven closed.**
 
