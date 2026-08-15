@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 583
-- **Docs contributing at least one fix:** 179
+- **Total distinct fixes counted:** 608
+- **Docs contributing at least one fix:** 192
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 116 | 19.9% | 15 |
-| Memory & Virtual Memory | 92 | 15.8% | 26 |
-| Scheduler & Process Management | 75 | 12.9% | 18 |
-| SMP & Locking | 73 | 12.5% | 29 |
-| Networking | 31 | 5.3% | 13 |
-| Userspace Apps & Libraries | 34 | 5.8% | 18 |
-| Rump Kernel & Syscall Proxy | 25 | 4.3% | 6 |
-| Toolchain & Self-Hosting | 37 | 6.3% | 5 |
-| SSH | 15 | 2.6% | 13 |
-| VFS & Filesystem | 15 | 2.6% | 10 |
-| Boot & Drivers | 11 | 1.9% | 6 |
-| Signals & Exceptions | 12 | 2.1% | 5 |
-| Misc / Cross-cutting | 14 | 2.4% | 4 |
-| Console & Terminal | 15 | 2.6% | 7 |
-| Containers | 18 | 3.1% | 4 |
-| **Total** | **583** | **100.0%** | **179** |
+| Syscall / ABI Compatibility Audits | 116 | 19.1% | 15 |
+| Memory & Virtual Memory | 112 | 18.4% | 34 |
+| Scheduler & Process Management | 75 | 12.3% | 18 |
+| SMP & Locking | 76 | 12.5% | 32 |
+| Networking | 31 | 5.1% | 13 |
+| Userspace Apps & Libraries | 35 | 5.8% | 19 |
+| Rump Kernel & Syscall Proxy | 25 | 4.1% | 6 |
+| Toolchain & Self-Hosting | 37 | 6.1% | 5 |
+| SSH | 15 | 2.5% | 13 |
+| VFS & Filesystem | 15 | 2.5% | 10 |
+| Boot & Drivers | 11 | 1.8% | 6 |
+| Signals & Exceptions | 12 | 2.0% | 5 |
+| Misc / Cross-cutting | 14 | 2.3% | 4 |
+| Console & Terminal | 15 | 2.5% | 7 |
+| Containers | 19 | 3.1% | 5 |
+| **Total** | **608** | **100.0%** | **192** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -153,7 +153,7 @@ from several subsystems under one write-up.
 - `std::thread::sleep()` panicked on every call, on every build — Akuma never implemented `clock_nanosleep` (Linux aarch64 syscall #115), which is what Rust's `std` actually calls for `sleep` on `target_os = "linux"` (not plain `nanosleep`); the resulting `ENOSYS` (38) tripped an `assert_eq!` inside `std` that only ever expected 0 or `EINTR` (4) back; fixed by implementing `sys_clock_nanosleep` with full relative/absolute (`TIMER_ABSTIME`) clock handling
 
 
-## Memory & Virtual Memory (92 fixes, 26 docs)
+## Memory & Virtual Memory (112 fixes, 34 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -299,6 +299,42 @@ from several subsystems under one write-up.
 - `update_current_user_page_flags` (mmu page-table walk) never checked the `TABLE` bit at L1/L2, so a block descriptor's output address could be misread as a table base and walked as one; found while merging three duplicate page-table-walk implementations into one shared helper, fixed by adding the check `remap_current_user_page`'s copy always had
 - three of the four boot-TTBR0 teardown test helpers cleared only the leaf L3 PTE and then freed the page-table frames anyway, leaving the boot L1 pointing at a freed L2 that could be recycled as a new address space's L1 and cause spurious translation faults in later tests; fixed via one `clear_boot_ttbr0_pte` helper (with an explicit `PtClear` depth argument, since one caller genuinely needs leaf-only clearing) used by all four
 
+### docs/archive/COW_PILE_AUDIT.md
+- Both EL1 CoW-break paths (`ensure_cow_page_writable`, `try_resolve_el1_cow_fault`) copied the source page's 4 KiB out of `old_pa` *before* taking the lock that the EL0 CoW path's own comment says is required for `old_pa` to stay valid, so a peer core's `munmap` or CoW break could free and quarantine-poison the frame while the copy was still reading it (F1); fixed by moving the copy inside `with_address_space` (`complete_cow_break`'s `TakingAsLock` arm)
+- Even after that fix, both EL1 paths still translated the faulting VA and read the CoW refcount *outside* the lock, so `old_pa` could already be stale by the time the hold began (F1b); fixed by re-validating the translation and refcount inside the hold and declining the break — freeing the unused frame — on a mismatch (boot test `cow_break_declines_stale_old_pa`)
+- `try_resolve_el1_cow_fault` resolved the CoW-break owner via `read_current_pid()` instead of `address_space_owner_pid_for_fault()` like its two sibling paths, so for a `CLONE_VM` worker thread it operated on the worker's own empty `user_frames` map and its own never-waited-on `as_lock` instead of the thread-group leader's — leaking two physical frames per kernel-side CoW break taken by any threaded process (F2); fixed by switching to the correct owner-resolution function
+- `cow_fault_lock`/`cow_fault_unlock` were documented as the cross-PID serialization preventing double-free races in the CoW-break protocol, but they only incremented/decremented a counter nothing else in the tree ever read, so two cores breaking CoW on the same page both "acquired" it and proceeded — the actual correctness came entirely from the unrelated `released_last_va` gate (F3); deleted, with the real invariant documented on that gate instead
+- Three of the four sites performing post-fault I-cache maintenance placed the completion barrier (`dsb ish`) *after* publishing the frame (to `file_page_cache` or the PTE) instead of before, so a peer core could fetch instructions from a newly-faulted-in page before the `ic ivau` invalidation had completed inner-shareable — the same defect class as the previously-fixed "x8 race" self-hosting corruption (F4); fixed by routing all six open-coded maintenance sequences through the existing `mmu::sync_icache_range` helper, which retires the barrier before every publication by construction
+- A re-entrant `fault_slot_acquire` on the same page by the same thread returned the same `Acquired` variant as a fresh acquire, so an inner guard's release could silently drop the outer guard's hold (F6, established unreachable in this tree but latent); fixed by adding a distinct `FaultSlot::AlreadyHeld` variant that the guard's `Drop` skips releasing on
+
+### docs/archive/USER_COPY_FOLD.md
+- `mremap`'s payload move validated the source range and never the destination, so a lazy page in the freshly-created destination mapping faulted mid-copy, the byte loop broke out, and the move silently truncated — indistinguishable from success at the call site; fixed by prefaulting the destination through `copy_to_user`
+- `is_current_user_range_mapped` tested leaf-PTE *presence*, not EL0-accessibility, so a mapped **kernel** RAM VA (identity-mapped EL1-only in every user address space) passed validation as a legitimate syscall buffer and the EL1 copy loop wrote through it — silent kernel corruption, reachable only because the user VA allocator happens to avoid the kernel VA range as a layout convention rather than a check; fixed by testing the leaf PTE's AP bits instead (`is_page_user_accessible_ptr`), which also correctly rejects `PROT_NONE` pages while still accepting read-only ones
+- `BYPASS_VALIDATION` was a single kernel-wide flag rather than per-thread, so one thread's `store(false)` could close another, unrelated thread's validation-bypass window mid-syscall — surfaced by the AP-bit fix when a woken futex waiter's bypass-close cost the main thread its own window, `EFAULT`ing a legitimate wake and leaving a sibling waiter unwoken; fixed by making the flag per-thread (unchanged `store`/`load` call sites) plus a `BypassValidationGuard` so nested windows restore correctly
+- `read_current_pid` dereferenced user VA `PROCESS_INFO_ADDR` gated only on "TTBR0 is not the boot address space", so a live-but-uninitialized address space (several boot-test fixtures construct exactly this via a bare `UserAddressSpace::new()`) had nothing mapped at that address and the read was a wild EL1 access that wedged the VM with no output; fixed by checking `is_current_user_range_mapped(PROCESS_INFO_ADDR, ...)` before the read
+
+### docs/archive/FPCACHE_EVICTION_PREFERS_UNMAPPED.md
+- `file_page_cache::insert`'s over-cap eviction took whatever entry sat at the rotating cursor regardless of whether anything still mapped it, so evicting a mapped entry freed nothing and cost the next mapper a full `read_at` — the same "more pressure → more eviction → more I/O" spiral the cache exists to prevent, and the self-host build's cache sat pinned at its cap on every measured arm; fixed by preferring an unmapped victim via a bounded scan (falling back to the cursor entry only if none is found), reusing `shrink`'s existing `cow_ref_get(pa) <= 1` test
+
+### docs/archive/MADV_DONTNEED_SHARED_FRAME.md
+- `sys_madvise`'s `MADV_DONTNEED` arm called `zero_mapped_page(va)`, which `memset`s the physical frame directly — correct only while the frame has one holder, but after `fork` the frame is CoW-shared, so the `memset` wrote straight through the peer process's live page (proven with a hand-built shared-frame probe: the peer lost its whole page, 0/4096 bytes survived); this was the mechanism behind the cargo-null-`Rc` self-host heap corruption, since jemalloc/mimalloc fall back to `MADV_DONTNEED` after Akuma's `MADV_FREE` returns `EINVAL`; fixed by breaking the CoW share (installing a fresh private zero frame) instead of zeroing in place whenever `cow_ref >= 2`
+
+### docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md
+- `ExecRuntime::read_at_by_inode` had been registered as an always-failing `Err(-1)` stub since a March 2026 crate extraction (the real `vfs::read_at_by_inode` needed a `path` argument the hook signature lacked), and its only caller, `prefault_user_range`, silently dropped the error — so every syscall that prefaulted a read-only file-backed lazy page (rustc's rlibs/rmeta, linker inputs) installed a silently zero-filled page instead of the file's real content, 856 times per self-host build; fixed by giving the hook the `path` parameter and wiring it to the real `read_at_by_inode`
+
+### docs/archive/MAPPED_PAGE_PREMATURE_FREE_FIX.md
+- `file_page_cache::lookup_and_ref` copied the cache entry under the `PAGES` lock but took the mapper's `cow_ref_inc` only after dropping it, so a free path (`insert`-eviction, `invalidate_inode`, `shrink`) could see the refcount at 1, decrement to 0, and free-and-quarantine-poison the frame inside that window — the late `inc` then resurrected a fresh refcount on the now-poisoned frame, which is the dominant self-host build failure (the linker rejecting a just-written `.rlib` whose bytes decoded as PMM quarantine poison), reproducing on 6/10 clean builds; fixed by taking the `inc` inside the same `PAGES` hold
+- `file_page_cache::insert` took the cache's own `cow_ref_inc` after the publish closure and unconditionally, leaking one frame on every lost insert race and leaving a window where a fully-unmapped cache entry still pointed at a frame nothing referenced; fixed by taking the `inc` inside the publish closure, only on an actual insert
+
+### docs/archive/SELFHOST_ZERO_PAGE_HUNT.md
+- `sys_munmap`'s whole-region arm freed the frame the region record named instead of the frame the live PTE actually held, so any operation that replaced a mapping without rewriting the region's frame list (a CoW break, `MADV_DONTNEED`'s share-break, a CoW write fault) left `munmap` freeing the wrong frame — a matched premature-free-and-leak pair, 11,255 stale-record hits in one build; fixed by trusting the PTE (`translate(va)`), falling back to the region record only when nothing is mapped
+- `mmap(MAP_SHARED|MAP_ANONYMOUS)` behaved exactly like `MAP_PRIVATE` — `fork` CoW-copied the region instead of sharing it, so a child's writes were invisible to the parent; fixed via `process::share_rw_range`, the fork-time counterpart to the CoW-share path that hands the child the parent's PTEs verbatim with no RO demotion
+- `LazySource::File` held no reference on the inode number it recorded at `mmap` time, so `open(O_TRUNC)` or `unlinkat` could truncate, free and reissue an inode a live mapping still named — a dependent mapper then read back zero pages, or another file's bytes entirely, which was the root cause of a long-running self-host-build ICE; fixed via `akuma_primitives::InodePin`, a `Clone`/`Drop`-based pin that defers ext2's truncate and bitmap-free until every mapping referencing the inode is gone
+
+### docs/archive/EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md
+- The `extreme-size` profile's 64 KB user-thread kernel stack was ~10 KB too small for the userspace-sshd session path (measured 74 KB), so every ssh session ran off the end of its kernel stack and corrupted whatever frame sat below it — usually the session process's own L3 page table, unmapping part of its heap and producing a SIGSEGV with no relationship to the real cause; fixed by raising `USER_THREAD_STACK_SIZE` to 128 KB on `extreme`
+- `ENABLE_STACK_CANARIES` painted a canary at every stack base and `check_all_stack_canaries()` existed to check them, but nothing anywhere called it, so a stack overrun that corrupted a page table left no diagnostic trail; fixed by checking the canary at thread teardown and from a periodic idle-maintenance pass for still-live threads, printing `[STACK-OVERFLOW] tid=N ran off its NKB kernel stack`
+
 
 ## Scheduler & Process Management (75 fixes, 18 docs)
 
@@ -415,7 +451,7 @@ from several subsystems under one write-up.
 - `write_stdin` (`process/channel.rs`) used the same drop-oldest FIFO semantics as the (already-fixed) stdout side, so stdin past `MAX_BUFFER_SIZE` (1 MiB) was silently dropped rather than backpressured; fixed by making it a short write instead — `sys_write`'s `File` arm returns `EAGAIN` on a zero-byte accept to avoid spinning, and sshd's stdin fd joined the non-blocking set with a residue queue and deferred EOF
 
 
-## SMP & Locking (73 fixes, 29 docs)
+## SMP & Locking (76 fixes, 32 docs)
 
 ### docs/archive/SMP_GO_STRESS_CORRUPTION_FIX.md
 (standalone writeup of the same 2026-07-22 investigation SMP_SHARED.md's own
@@ -555,6 +591,15 @@ aren't recorded anywhere else.)
 - `threading::disable_preemption()` called the panicking `runtime()` accessor for a diagnostic timestamp, breaking `PreemptGuard`'s "works in host tests too" contract and failing `akuma-ext2 tests::append_to_file`; now probes `is_registered()` and degrades to `0`
 - `crates/akuma-net/src/socket.rs`'s `PreemptGuard` import, consumed only by the `smoltcp`-gated `with_table`, carried no gate of its own, tripping `unused_imports = "deny"` on any build without the native stack — `scripts/build_devbox.sh` had been unbuildable; import now carries its use site's gate
 
+### docs/archive/COW_PILE_AUDIT.md
+- The page-table-UAF free gate (`ACTIVE_L0`/`PREV_L0`) only checked TTBR0 values live on cores, not saved thread contexts, so a thread preempted mid-exit — or externally killed — could leave a dying address space's L0 referenced only by its *saved* `ctx.ttbr0`, invisible to the gate, which then freed and quarantine-poisoned it; when that zombie thread was later revived through an existing WAITING-over-TERMINATED overwrite route, the scheduler SGI installed the freed L0 into `TTBR0_EL1` and every subsequent instruction fetch — including the exception vector itself — took a translation fault, wedging the core in a silent recursive fault loop with no console output and no time-jump signal (F8); fixed by adding a saved-context scan (`any_saved_ctx_on_l0`) to the free gate (boot test `test_as_drop_defers_while_saved_ctx_on_l0`)
+
+### docs/archive/PMM_EXTRACT.md
+- The CoW/thread-admission probe was being invoked as `bssfork spread=1` across multiple investigation sessions, but `bssfork.c`'s CLI is positional (`rounds threads spread`), not `key=value` — the string `"spread=1"` parsed as `rounds=0` via `strtoul`, so the fork loop never ran and every worker thread was flagged `[never ran]` before the scheduler touched it, chased as a real CoW/frame-allocation regression across several sessions; fixed by running the correct positional form (`bssfork 20 8 1`) and adding it to `scripts/verify_trim.py` as its own exercise alongside the mis-invoked one
+
+### docs/archive/COWSTALE_FORK_THREAD_SEGV.md
+- The `[EAGER-UPGRADE]` page-permission repair rewrote AP bits that already said writable — it was really just `update_current_user_page_flags`'s trailing `flush_tlb_page` doing the actual work, dressed up as a permission fix; fixed by checking the PTE first and, when the write is already permitted, only invalidating the stale TLB entry instead of rewriting page-table state that was already correct
+
 
 ## Networking (31 fixes, 13 docs)
 
@@ -616,7 +661,7 @@ aren't recorded anywhere else.)
 - `force-legacy` incorrectly defaulted to true, masking the modern VirtIO MMIO v2 path
 
 
-## Userspace Apps & Libraries (34 fixes, 18 docs)
+## Userspace Apps & Libraries (35 fixes, 19 docs)
 
 ### docs/archive/DOOM.md
 - SIGSEGV in `R_Init` — `strncpy` stub off-by-one corrupted an adjacent struct field
@@ -687,6 +732,9 @@ aren't recorded anywhere else.)
 
 ### docs/archive/LIBAKUMA_AUDIT.md
 - `libakuma::fstatat` passed the raw `&str` pointer with no NUL terminator — the one path-taking wrapper of fourteen that skipped `format!("{}\0", path)` — so the kernel's `copy_from_user_str` walked past the string into adjacent memory (usually harmless, occasionally EFAULT, rarely a different file); its only caller had been pre-terminating by hand, which is now dropped
+
+### docs/archive/PAWS_DUPLICATED_ARGV0.md
+- `paws` passed its full argument vector — including `args[0]`, the command name it had already consumed for its own path lookup — straight through to `spawn`, which itself prepends the resolved path as `argv[0]`, so every child process received its own name twice in `argv`; invisible for multicall binaries like busybox (which expect and re-dispatch on a leading applet name) but fatal for `tcc`, which read the duplicate as an input file (`"file 'tcc' not found"`); fixed by `.skip(1)`-ing the command name at all four of `paws`'s spawn sites
 
 
 ## Rump Kernel & Syscall Proxy (25 fixes, 6 docs)
@@ -983,7 +1031,7 @@ aren't recorded anywhere else.)
 - Three per-event kernel traces (`[IA-DP] file region:` demand-page, `[pipe]` lifecycle, `[mmap]`/`[mprotect]`) printed unconditionally, saturating the single shared UART under a parallel `-j4` build (~270 KB/s, a 115200-baud line ~20x over-saturated) and serializing every logging core on the console lock — turning an in-VM self-host build from "never completes in over an hour" into a 2m21s green run once gated; `DEMAND_PAGE_LOG_ENABLED`, the flag meant to gate the largest of the three, was dead — defined and documented but with zero readers anywhere in the tree — so fixing it required wiring a live check, not flipping an existing one
 
 
-## Containers (18 fixes, 4 docs)
+## Containers (19 fixes, 5 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
 - `bootstrap/bin/tar` was never deployed by `userspace/build.sh`, so `/bin/tar` was a busybox applet whose hardlinks go through `link()` — which `sys_linkat` implements as a full file copy that also loses the mode — turning a 1.9 MB busybox layer into 467.7 MB of `0644` copies that a shell's `PATH` search then refused with "Permission denied"; fixed by linking in `akuma_tar`, which applies the archived mode bits (layer store 467.7 MB → 4.1 MB)
@@ -1011,6 +1059,9 @@ aren't recorded anywhere else.)
 - `SubdirFs` concatenated `prefix + path` with no `..` sanitization, contrary to the safety requirement in `BOX_CONTAINERS.md`; `.`/`..` are now resolved and clamped at the virtual root (canonical paths still take the allocation-free stack-buffer path)
 - `sys_mount` / `sys_umount2` / `sys_mount_in_ns` did not canonicalize their target, though `MountNamespace` compares mount points literally — an un-normalized target registered a mount point no lookup could match and side-stepped the duplicate check protecting the box root
 
+### docs/archive/BOX_RUN_OVERLAYFS.md
+- `box pull` had always extracted layers with busybox tar (`bootstrap/bin/tar` was never deployed by `userspace/build.sh`), and busybox tar creates hard links via `link()`, which `sys_linkat` implements as a full `read_file`+`write_file` copy that also drops the mode bits — so the busybox image's 410 hardlinks to one binary became 410 real `0644` copies (467.7 MB extracted from a 1.9 MB layer), and every copied binary then failed a `PATH` search's `access(X_OK)` check with `EACCES`; fixed by shipping Akuma's own `tar` and applying the archived mode bits on extraction (layer store dropped to 4.1 MB)
+
 
 ---
 
@@ -1019,6 +1070,10 @@ aren't recorded anywhere else.)
 Also re-scanned 2026-08-07: DEVELOPMENT_PRACTICES_REVIEW_AND_ASSESSMENT (pure meta-analysis of process/git history, zero concrete bug-fix content) and BKL_RUSTC_SCALING_BASELINE (re-verified still accurate as perf-not-bugs; its inconclusive `big.rs`-failure investigation is fully resolved later by SMP_SHARED_ONCPU_GATE.md and STALE_THREAD_SLOT_KILL.md, counted there).
 
 Also re-scanned 2026-08-09: CRUSH_MISSING_SYSCALLS, C_STUBS, NEEDLE_SERVER, QJS, and TOP_CORE_COLUMN_PLAN each picked up a one-line "removed as part of a codebase trimming effort" note pointing at TRIM_FAT_PART_3.md; STDCHECK_DEBUG picked up the same note but keeps its existing 1-fix count (Console & Terminal, above) — the note doesn't touch its fix content. None of these notes describe a fix on their own.
+
+Also re-scanned 2026-08-15 (completing the `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` cross-reference audit): AKUMA_PRIMITIVES_EXTRACTION (pure crate-extraction record for `akuma-primitives` — every "finding" is dead code removed or a design question resolved as "not a divergence," none is a fixed defect) and LTO_RELEASE_PROFILE (a measurement-driven config decision — `[profile.release]` `lto = "thin"` — not a bugfix). COW_PILE_AUDIT, USER_COPY_FOLD and PMM_EXTRACT were the other three `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` cross-references; their fixes are counted above under their own doc subsections.
+
+Also re-scanned 2026-08-15 (the whole branch's unaudited archive docs, ahead of closing it): CARGO_HEAP_NULL_RC (the task brief for the cargo-null-`Rc` hunt; explicitly defers its fix to MADV_DONTNEED_SHARED_FRAME, counted there — "not duplicated here, so this file cannot drift from it"), HOST_TESTS_AUDIT (a boot-test-to-host-test movability survey; every finding is a scaffolding recommendation, none a landed fix), LINUX_COMPATIBILITY_ISSUES ("this list is a byproduct, not an audit" — a register of known ABI divergences, explicitly open except the one `mremap` fix, which is counted under USER_COPY_FOLD.md), REPR_C_SIGFRAME_STATX (Phase 7's `#[repr(C)]` hardening pass — behaviour-preserving by its own claim; its two Linux-layout divergences are found and *deliberately not fixed*, and its narrowing behaviour changes are inherited from the already-counted USER_COPY_FOLD.md AP-bit fix, not new here), SMP_FORK_EXEC_CORRUPTION_FIX (a restored 2026-07-21/31 dossier; every fix in it — the `demote_range_to_ro` DSB barrier, `LifecycleGuard`'s active preemption-disable, the BKL ticket-leak self-heal, `COW_FAULT_LOCK`'s non-fix — is a duplicate mention already counted under SMP_SHARED.md, BKL_PROCESS_CARVE_OUT.md, or COW_PILE_AUDIT.md's F3), TRIM_FAT_REMOVAL_FEASIBILITY (feasibility/scoping analysis for the in-kernel SSH/shell/editor and `libakuma` removals — no landed fix of its own; the removal it scoped is counted under BUILTIN_SSH_REMOVAL.md), UNSAFE_AUDIT (the audit that spawned USER_COPY_FOLD.md, REPR_C_SIGFRAME_STATX.md and the RNG driver fixes — every "DONE"/"FIXED" marker in it points at one of those, none is new), and ZERO_PAGE_ICE_FIX (the umbrella summary of the self-host `[0,0,0,0]` ICE hunt; its two named root causes are counted under PREFAULT_INODE_STUB_ZERO_PAGES.md and SELFHOST_ZERO_PAGE_HUNT.md §14–§15, and the "two real bugs found and fixed" it lists verbatim are counted under SELFHOST_ZERO_PAGE_HUNT.md §8–§9).
 
 Also re-scanned 2026-08-12: CARGO_CRATES_IO_CONNECT_FAIL (root cause isolated, "fix not yet chosen" — five options, none landed), MINIMAL_DEV_BUSYBOX_APPLETS (an applet-coverage survey; its three verification findings — `utimensat` hardcoded to `0`, `getgroups` undispatched, no `/etc/passwd` on the devbox overlay — carry "fix shape" proposals, not fixes), TRIM_FAT_HAND_ROLLED_JSON (an audit of hand-rolled JSON across the tree; the bugs it reproduces in `herd` and `meow` are unfixed), HERD_PLUS_BOX (a proposed restructuring, explicitly not implemented — it will be renamed `TRIM_FAT_HERD_PLUS_BOX` and re-scanned when it lands), and userspace/box/BOX_RUN (current-state reference; the one fix it mentions is BOX_DOCKER_COMPAT's session-closing bug, counted there). AKUMA_SELF_HOSTING gained only a quick-start section — no change to its count. The same pass found three docs that had never been counted at all, all now listed above: DEVBOX_ISSUES (Misc), and the two deep-dives its Issues 2 and 3 point at, TERM_POLL_INPUT_PREEMPTION_FIX and UART_SMP_INTERLEAVE_FIX (both Console &amp; Terminal).
 
