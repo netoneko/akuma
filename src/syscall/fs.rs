@@ -1504,20 +1504,22 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
                 let _ = crate::vfs::chmod(&path, mode & 0o7777);
             }
         } else if file_existed && (flags & akuma_exec::process::open_flags::O_TRUNC != 0) {
-            // Diagnostic (2026-08-15 hunt §13): O_TRUNC here zeroes the file IN
+            // Diagnostic (2026-08-15 hunt §14): O_TRUNC here zeroes the file IN
             // PLACE (write_file → truncate_inode, same inode, blocks freed,
             // size 0) — while other processes may still hold lazy
             // `LazySource::File` regions naming it (Linux pins the inode via
             // the mmap's fd; this kernel drops all references at mmap time).
             // Their later faults then fill `Ok(0)` → zero pages ([FILL-SHORT]),
             // or, after inode reuse, a different file's bytes → decode
-            // garbage. Print only when real data is destroyed, naming the actor.
-            if let Ok(sz) = crate::vfs::file_size(&path) {
-                if sz > 0 {
-                    crate::safe_print!(224,
-                        "[O_TRUNC-ZAP] pid={} path={} size={}\n",
-                        akuma_exec::process::read_current_pid().unwrap_or(0), &path, sz);
-                }
+            // garbage. Gated like the other syscall traces — flip
+            // SYSCALL_DEBUG_IO_ENABLED to hunt the actor again.
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED
+                && let Ok(sz) = crate::vfs::file_size(&path)
+                && sz > 0
+            {
+                crate::safe_print!(224,
+                    "[O_TRUNC-ZAP] pid={} path={} size={}\n",
+                    akuma_exec::process::read_current_pid().unwrap_or(0), &path, sz);
             }
             let _ = crate::fs::write_file(&path, &[]);
         }
@@ -1925,9 +1927,14 @@ pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
-            // Diagnostic (2026-08-15 hunt §13): truncation of a live artifact
-            // while dependents map it — see sys_openat's [O_TRUNC-ZAP].
-            if length == 0 && f.path.contains("target") {
+            // Diagnostic (2026-08-15 hunt §14), gated: truncation of a live
+            // artifact while dependents map it — see sys_openat's
+            // [O_TRUNC-ZAP]. Never fired on this workload (the actor is
+            // open(O_TRUNC)+unlink, not ftruncate).
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED
+                && length == 0
+                && f.path.contains("target")
+            {
                 crate::safe_print!(192, "[FTRUNC-0] pid={} path={}\n",
                     akuma_exec::process::read_current_pid().unwrap_or(0), &f.path);
             }
@@ -2308,14 +2315,16 @@ pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
 
     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
         crate::safe_print!(256, "[syscall] unlinkat({}) flags=0x{:x}\n", &resolved, flags);
-    }
-    // Diagnostic (2026-08-15 hunt §13): unlink frees the inode for reuse while
-    // other processes may still hold lazy regions naming it — their fills then
-    // read whatever file next claims the number (decode garbage). Name the actor.
-    if resolved.contains("target") {
-        crate::safe_print!(192,
-            "[UNLINK] pid={} path={}\n",
-            akuma_exec::process::read_current_pid().unwrap_or(0), &resolved);
+        // Diagnostic (2026-08-15 hunt §14): unlink frees the inode for reuse
+        // while other processes may still hold lazy regions naming it — their
+        // fills then read whatever file next claims the number (decode
+        // garbage). This print caught the actor (cargo clean, 1000+/build).
+        // Same gate as the trace above it; target-scoped to cut noise.
+        if resolved.contains("target") {
+            crate::safe_print!(192,
+                "[UNLINK] pid={} path={}\n",
+                akuma_exec::process::read_current_pid().unwrap_or(0), &resolved);
+        }
     }
 
     const AT_REMOVEDIR: u32 = 0x200;

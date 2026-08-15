@@ -19,6 +19,12 @@ decode error: Expected header tag [79, 68, 72, 84] but found [0, 0, 0, 0]
 This is **never a compiler bug** — it means the kernel handed `rustc` zeroed memory
 where real bytes belonged. Find out which memory, and why.
 
+**Status note before you start:** as of 2026-08-15 night this no longer fails on
+every clean build — the last two arms went 11/11 green. Do not read that as
+fixed. The mechanism that produces the zero pages still fires on those green
+builds (see T5b below); one root cause is fixed and a second is diagnosed and
+unfixed. Your job is the unfixed one, not a fresh repro hunt.
+
 It fails on `enumn` and `zerocopy-derive`, **in the same second**, every time. Those are
 the only two proc-macro crates cargo builds in parallel at that stage and the only two
 that depend on `syn`. Treat the pairing as a scheduling coincidence, not a fact about
@@ -90,19 +96,51 @@ fingerprint JSON — rewritten-smaller or inode-reused, not yet distinguished).
 And a heavily-instrumented arm (every ext2 block-cache hit re-read from disk)
 went **4/4 green with every instrument silent** — that perturbs I/O timing
 enough to close a race window, so it establishes *timing sensitivity*, not a
-fix. The honest next arm is counters only, no disk re-reads, ten builds.
+fix.
 
-**T5 — writer/reader incoherence on freshly-written files (leading).** Two
-mechanism candidates, neither verified:
-- **T5a**: `vfs::write_at` writes, *then* invalidates `file_page_cache`. A
-  demand fill interleaved between reading the old disk bytes and publishing its
-  frame lands that stale frame *after* the invalidate — nothing removes it, and
-  every later mapper of the page gets pre-write bytes: persistent garbage, the
-  Mode A/B shape. Test: instrument publish-vs-invalidate ordering per
-  (inode, offset).
-- **T5b**: a stale `LazySource::File` inode after the file is rewritten smaller
-  or unlinked mid-build (the Ok(0) flood shape). `path=` now prints on
-  `[FILL-SHORT]`, so the next firing names the file directly.
+**That counters-only arm has since run** (`E2_VERIFY_HITS` off, ten builds,
+hunt §14) and reported **10/10 green with zero decode errors — while still
+firing 376 `[FILL-SHORT] got=Ok(0)`, on green builds included.** Take the
+mechanism from it (§14 root-causes the flood, below), not the rate: the §12 fix
+arm scored 3/10 green and this one 10/10 with *only instrumentation* between
+them, which is unexplained, and 11 consecutive green builds is a streak, not a
+fix. The one confound whose direction is known — the image degrading across the
+day — points the wrong way.
+
+**T5b — CONFIRMED root cause of the `Ok(0)` flood (2026-08-15 night, hunt §14).
+The inode lifecycle is not honored across `mmap`.** Not yet fixed.
+
+`LazySource::File` stores a raw inode number and the mmap-time `filesz` and
+holds **no reference on the file** (Linux pins the inode through the mapping's
+`struct file`; this kernel drops every reference at mmap time). Meanwhile
+`sys_openat`'s `O_TRUNC` arm calls `write_file(path, &[])`, which ext2 applies
+**in place** — same inode, blocks freed, `i_size = 0` — and `sys_unlinkat` frees
+the inode outright for immediate reuse. A dependent that mapped the artifact
+then faults and gets:
+
+- `i_size = 0` → `read_at_by_inode` returns `Ok(0)` → the page stays zero, **or**
+- the inode number already reused → **another file's bytes** → Mode A/B garbage.
+
+Both residue modes, one defect. Evidence: all 32 `[E2-EOF]` prints read
+`size_now=0x0`; victims are build artifacts written once and mapped by
+dependents (top victim: `libzerocopy_derive-….so`, 183 fills); `[UNLINK]` names
+the same paths earlier in the same log; `[FTRUNC-0]` never fires, so the actor
+is `unlink`/`O_TRUNC`, not `ftruncate`.
+
+**Fix options, ranked** (none implemented): (1) pin the inode for the life of
+the mapping and defer the free to the last reference — correct, needs a real
+VFS reference count; (2) invalidate lazy regions naming the inode on
+unlink/truncate — cheaper, needs a reverse index, semantically wrong (Linux
+keeps the old contents readable); (3) generation-tag `LazySource::File` so a
+stale fill fails loudly instead of returning `Ok(0)` — fixes nothing, but turns
+silent corruption into a detectable error, and is a prerequisite instrument
+either way.
+
+- **T5a — demoted, not closed**: `vfs::write_at` writes, *then* invalidates
+  `file_page_cache`, so a demand fill interleaved between reading the old disk
+  bytes and publishing its frame lands that stale frame *after* the invalidate.
+  Plausible, still unverified — and no longer *needed*, since T5b's inode-reuse
+  leg explains the garbage-byte modes on its own.
 
 **T1 — `sys_read`/`sys_pread64`/`readv` short-copies into the user buffer.** The
 strongest untested candidate for the *zero-page* shape. Commit `edd91fe7 "safer
@@ -190,6 +228,18 @@ other theories, so it may be worth fixing first. To inspect a wedge you must boo
     not the kernel. Rule 4's cousin: low-variance arms are suspect, and so are
     implausibly green ones on an instrumented build. Rate-score on a kernel
     whose instrumentation is counters-only.
+11. **A green build whose instrument fired is not a passing build.** The
+    counters-only arm went 10/10 green while `[FILL-SHORT] got=Ok(0)` fired 376
+    times — on green builds included. A zero page lands where it lands; whether
+    it lands somewhere fatal is luck, which is why the rate swings so hard.
+    Score the *instrument*, not just the exit code — and take the exit code from
+    the guest's own build log, never the harness's: several "FAILED" labels in
+    the actor arm were ssh timeouts with no compiler error at all.
+12. **Repair the image before rate-scoring anything.** 30+ clean-build cycles
+    left `devbox.img` with unattached inodes and wrong free-block counts, and
+    boot degraded to 15+ minutes behind a ~1900-line watchdog storm. `e2fsck -fy`
+    it (recipe in `docs/runbooks/selfhost-kernel-build.md` §5.5) and re-run until
+    it exits 0. An arm run on a damaged image is uninterpretable.
 
 ## Tools already in the tree
 
@@ -206,12 +256,20 @@ other theories, so it may be worth fixing first. To inspect a wedge you must boo
   `dp_counters_line` dump only surfaces from the exceptions path on the devbox
   profile — the console prints (`[FILL-SHORT]`, `[FILL-SHORT/prefault]`) are the
   operative guards.
-- `[E2-EOF]` — ext2 `read_at_by_inode`'s EOF arm with the size the reader
-  actually saw (counter `E2_READ_AT_EOF`). `[E2C-BAD]` — ext2 block-cache hit
-  vs. direct disk re-read (counter `E2_CACHE_VERIFY_MISMATCH`; **warning**: the
-  re-read doubles I/O on the hot path and perturbs timing — see the 4/4-green
-  caveat above; gate it off before rate-scoring any arm).
-- `[FILL-SHORT]` variants now print `path=`.
+- `[E2-EOF]` — ext2 `read_at_by_inode`'s EOF arm **with `offset > file_size`**
+  (a plain read-at-end is `offset == file_size` and is deliberately silent and
+  uncounted, or the counter is pure noise). Prints the size the reader actually
+  saw; counter `E2_READ_AT_EOF`, prints capped at 32 — **the cap is not a
+  count**, read the counter.
+- `[E2C-BAD]` — ext2 block-cache hit vs. direct disk re-read (counter
+  `E2_CACHE_VERIFY_MISMATCH`), behind `ext2::E2_VERIFY_HITS`, **default off and
+  load-bearing**: the re-read doubles I/O on the hot path and perturbs the
+  timing it observes (the 4/4-green arm above). Turn it on only to chase T4, and
+  never trust a rate scored with it on.
+- `[UNLINK]`, `[O_TRUNC-ZAP]`, `[FTRUNC-0]` — the actor prints that caught T5b
+  (`src/syscall/fs.rs`), behind `config::SYSCALL_DEBUG_IO_ENABLED`. `[UNLINK]`
+  is `target`-scoped and still runs ~1000+/build, so expect a large log.
+- `[FILL-SHORT]` variants print `path=` — this is what named the victims.
 
 ## Full history
 
@@ -219,11 +277,22 @@ other theories, so it may be worth fixing first. To inspect a wedge you must boo
 kept deliberately as a worked example; §12 and
 `docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md` cover the root cause found 2026-08-15;
 §13 scores the residue (garbage-byte modes, the Ok(0) flood, the timing-perturbation
-result) and ranks T5.
+result) and ranks T5; **§14 root-causes the flood to T5b** (inode lifecycle not honored
+across `mmap`) with the actor caught in the act, and lists the ranked fix options.
 `docs/archive/FPCACHE_EVICTION_PREFERS_UNMAPPED.md`
 covers a cache-policy bug found along the way.
 
-**State: partially fixed.** Root cause #1 (prefault inode-stub zero pages) is fixed —
-0/10 → **3/10 green**. The residue is **scored** (two garbage-byte decode modes +
-an Ok(0) fill flood) but unfixed; T5 (writer/reader incoherence) leads, T1/T3/T4
-follow. Do not trust the 4/4 instrumented arm — it perturbs the timing it observes.
+**State: one root cause fixed, a second diagnosed but unfixed.**
+
+- **Fixed:** prefault inode-stub zero pages (§12) — 0/10 → 3/10 green.
+- **Diagnosed, NOT fixed:** T5b, the inode lifecycle across `mmap` (§14).
+  `unlink`/`O_TRUNC` free or empty an inode a live `LazySource::File` still
+  names → `Ok(0)` zero pages, or another file's bytes after reuse. Fix options
+  ranked above; start with the generation tag so the failure stops being silent.
+- **Unresolved:** the last two arms went 11/11 green with no decode error — the
+  longest clean streak of the hunt — but the defect still fires on those green
+  builds, and the 3/10 → 10/10 move came with no functional change. Treat the
+  ICE as latent, not gone, and re-score only on a freshly `e2fsck`-repaired
+  image (runbook §5.5).
+- T1 (read/readv copy shortness) untested; T3 blocked by the `SMP=1` wedge; T4
+  weakened; T5a demoted.

@@ -473,9 +473,49 @@ process dies instantly and ssh fails within seconds. Cargo's cache makes this
 survivable: kill QEMU, `e2fsck -fy` the image, boot again, resume. Progress
 across a full run was 25 → 97 rlibs over 7 boots. Reboots cost ~10 s.
 
-The disk itself stays clean through all of this — `e2fsck` reported no errors
-after a run that ended with QEMU aborting — so the corruption is purely
-in-memory. Do not go looking for filesystem damage.
+A *single* crash leaves the disk clean — `e2fsck` reported no errors after a run
+that ended with QEMU aborting — so for one bad run the corruption is purely
+in-memory and there is no filesystem damage to look for.
+
+**Corrected 2026-08-15: that does not hold across a long campaign.** After 30+
+`cargo clean` + full-build cycles with repeated hard kills, `devbox.img` had
+real damage: unattached inodes reconnected to `lost+found`, wrong inode ref
+counts, and wrong free-block counts in two block groups *and* the superblock.
+The visible symptom is not a filesystem error — it is **boot degrading to 15+
+minutes behind a ~1900-line watchdog storm**, which reads like a kernel
+regression and is not one. Any measurement taken on an image in that state is
+uninterpretable (see `../archive/SELFHOST_ZERO_PAGE_HUNT.md` §14).
+
+Repair it from a container with `e2fsprogs` — the host is macOS and has no
+`e2fsck`. Kill QEMU first; `e2fsck` on an image a live VM holds will corrupt it.
+
+```bash
+pkill -f qemu-system-aarch64; sleep 2
+docker run --rm --entrypoint bash -v "$(pwd)/devbox.img:/devbox.img" \
+  <any-image-with-e2fsprogs> -c "e2fsck -fy -D /devbox.img; echo EXIT=\$?"
+```
+
+`-f` forces the check (the superblock's clean flag lies here), `-y` auto-answers,
+`-D` reindexes and compacts directories — worth it, since a build tree churns
+hundreds of thousands of dirents. **`EXIT=1` means "errors were fixed", not
+"done": re-run until it exits 0**, which is the only state to resume measuring
+from. A healthy result looks like
+`53411/393216 files (2.5% non-contiguous), 702577/1572864 blocks`.
+
+**Verify, and expect to re-stage the build tree.** After the 2026-08-15 repair
+the same image booted to sshd in **11 s with 18 `[WATCHDOG]` lines** (from 15+
+min and ~1900). But the working tree the campaign built in — `/tmp/akuma` — came
+back an **empty directory**: its dirents were what the crashes destroyed, and
+`e2fsck` could only reconnect the inodes to `/lost+found` (33 entries, 87 MB,
+including a whole orphaned copy of `userspace/`). The reconnected inode numbers
+sit in the same 44xxx range as the `[FILL-SHORT]` victims, which is consistent —
+the churned build artifacts are exactly what goes orphaned.
+
+The pre-cloned `/root/akuma` (§2) survives this and is the one to re-stage from;
+check it has `src/`, `crates/`, and `userspace/` before trusting it. Budget a
+full cold rebuild for the next arm — `target/` does not survive. `/lost+found`
+is recovered junk once you have confirmed `/root/akuma` is intact; deleting it
+reclaims the space.
 
 ### 5.6 `busybox nproc` reports the real CPU count (was: always 1)
 

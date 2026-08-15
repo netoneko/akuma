@@ -1838,14 +1838,19 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let file_size = inode.size_lower as usize;
         if offset >= file_size {
             // Diagnostic (2026-08-15 hunt): a demand-fill clamps to `filesz`
-            // resolved at mmap time, so hitting EOF here means this inode's size
-            // is smaller NOW than the caller believed then — an i_size
-            // incoherence, not a normal EOF. Counted always; the first 32 print.
-            let prev = E2_READ_AT_EOF.fetch_add(1, Ordering::Relaxed);
-            if prev < 32 && offset > 0 {
-                akuma_primitives::safe_print!(224,
-                    "[E2-EOF] inode={} off={:#x} size_now={:#x} — caller believed the file extended past off\n",
-                    inode_num, offset, file_size);
+            // resolved at mmap time, so `offset > file_size` here means this
+            // inode's size is smaller NOW than the caller believed then — an
+            // i_size incoherence (file truncated or inode freed+reused under a
+            // live mapping), not a normal EOF. The `offset == file_size` case
+            // is every ordinary read-at-end and stays silent and uncounted, or
+            // this counter would be noise.
+            if offset > file_size {
+                let prev = E2_READ_AT_EOF.fetch_add(1, Ordering::Relaxed);
+                if prev < 32 {
+                    akuma_primitives::safe_print!(224,
+                        "[E2-EOF] inode={} off={:#x} size_now={:#x} — caller believed the file extended past off\n",
+                        inode_num, offset, file_size);
+                }
             }
             return Ok(0);
         }
@@ -1892,11 +1897,11 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     // The snapshot exists only for `[E2C-BAD]` verification (off
                     // by default — see E2_VERIFY_HITS); without it this path
                     // allocates nothing the original did not.
-                    #[allow(unused_mut)]
-                    let mut hit_snapshot = None;
-                    if E2_VERIFY_HITS.load(Ordering::Relaxed) {
-                        hit_snapshot = Some(data.to_vec());
-                    }
+                    let hit_snapshot = if E2_VERIFY_HITS.load(Ordering::Relaxed) {
+                        Some(data.to_vec())
+                    } else {
+                        None
+                    };
                     drop(cache);
                     if let Some(snap) = &hit_snapshot {
                         self.verify_cached_block(&state, run_start_phys, snap);

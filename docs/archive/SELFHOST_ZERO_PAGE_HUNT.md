@@ -646,6 +646,178 @@ reader in that window misses the cache and reads the *old* disk bytes) — thoug
 ext2's state RwLock should exclude that, so it needs the lock topology verified
 before being believed.
 
+**Done next — §14**, which runs that counters-only arm and root-causes the
+`Ok(0)` flood to T5b.
+
+## 14. The `Ok(0)` flood root-caused: the inode lifecycle is not honored across `mmap` (2026-08-15, night)
+
+### The counters-only arm §13 demanded: 10/10 green — and the instrument still fired
+
+`E2_VERIFY_HITS` now gates the `[E2C-BAD]` disk re-read and defaults to **off**,
+so this arm is counters-and-prints only — no doubled I/O, none of §13's
+perturbation. Ten clean builds:
+
+- **10/10 GREEN.** Zero Mode A/B decode errors, zero `[E2C-BAD]`.
+- **Not silent:** 376 `[FILL-SHORT] got=Ok(0)` and 32 `[E2-EOF]` — and the
+  events land on **green builds too** (2, 4, 5, 7, 8).
+
+Read the two halves separately, because they say different things.
+
+**The rate is not bankable.** The §12 fix arm scored 3/10 green at 16:48; this
+arm scored 10/10 at 18:16, with only `e831afaa` between them — prints and
+counters, no functional change. Two arms that disagree by that much on an
+unchanged kernel mean at least one of them measured something other than the
+kernel, and which one is **not established**. The one confound whose direction
+is known points the wrong way: the disk image degraded monotonically across the
+day, so image state cannot explain builds getting *greener*. Rule 7's mirror
+image — do not read "the rate improved" as "the bug is gone" any more than
+"I fixed a real bug" as progress.
+
+**The mechanism is bankable**, because the same arm's log names it. `[E2-EOF]`'s
+32 prints are the rate-limit cap, not a count (the count lives in
+`E2_READ_AT_EOF`) — but **all 32 read `size_now=0x0`**. Not "smaller than the
+caller believed": *empty*.
+
+### The victims name the mechanism
+
+`path=` (added in §13) pays off immediately. The 376 fills, by victim:
+
+| Fills | Inode | Victim |
+|---|---|---|
+| 183 | 44115 | `…/build/zerocopy-derive/…/out/libzerocopy_derive-….so` |
+| 91 | 44037 | `…/build/smoltcp/…/out/libsmoltcp-….rlib` |
+| 29 ×3 | 44160/44177/44178 | `…/build/elf/…/out/libelf-….rlib` |
+| 15 | 0 | `…/build/akuma/…/out/build_script_build.…-cgu.0.rcgu.o` |
+
+Every one is a build artifact **written once, then mapped by dependents** — and
+the top victim is the proc-macro **shared library** of `zerocopy-derive`, one of
+the two crates the original ICE always killed (§1's "treat the pairing as a
+scheduling coincidence" was right about the *pairing*; the file was a real
+victim all along, just not for a file-side reason).
+
+So both residue modes have one shape: **a file is truncated or unlinked while
+another process still maps it.**
+
+### The truncate mechanism, read out of the code
+
+- `sys_openat`'s `O_TRUNC` arm calls `crate::fs::write_file(&path, &[])`, and
+  ext2's `write_file` truncates **in place** — same inode, blocks freed,
+  `i_size = 0`. That is `size_now=0x0` exactly.
+- `sys_unlinkat` frees the inode outright, and ext2 hands the number to the next
+  file created.
+- `LazySource::File` stores a raw inode number plus the `filesz` captured at
+  mmap time, and holds **no reference on the file**. Linux pins the inode
+  through the mapping's `struct file`; this kernel drops every reference at mmap
+  time.
+
+Which gives the whole chain, both modes from one defect:
+
+```
+dependent mmaps artifact  →  cargo truncates/unlinks it  →  dependent faults
+   → read_at_by_inode sees i_size = 0        → Ok(0)  → page stays zero
+   → …or the number is reused by another file → wrong bytes → Mode A/B garbage
+```
+
+A single compile per unit was confirmed from the in-guest cargo logs first —
+this is not a double-build artifact.
+
+### Catching the actor
+
+Three new prints, all behind `config::SYSCALL_DEBUG_IO_ENABLED`: `[UNLINK]`,
+`[O_TRUNC-ZAP]` (only when the file it zeroes has non-zero size), `[FTRUNC-0]`.
+One arm, 7 builds:
+
+- **8274 `[UNLINK]`** — the storm is real, ~1000+ per build.
+- **2 `[O_TRUNC-ZAP]`**, both `target/.rustc_info.json`, both benign.
+- **0 `[FTRUNC-0]`** — `ftruncate` is *not* the actor; unlink is.
+
+The correlation, same log, same path:
+
+```
+3135:  [UNLINK]     pid=7    path=…/out/libsmoltcp-4d810ef3f3c72c99.rlib
+7259:  [UNLINK]     pid=347  path=…/out/libsmoltcp-4d810ef3f3c72c99.rmeta
+21434: [FILL-SHORT] pid=1566 inode=44184 file_off=0x100000 got=Ok(0)
+       path=…/out/libsmoltcp-4d810ef3f3c72c99.rlib — page left zero-filled
+```
+
+`pid=7` is the `cargo clean` the repro mandates (its first unlinks are
+`target/CACHEDIR.TAG` and the `.cargo-*lock` files); the later low pids are
+in-build artifact replacement. The correlation is **by path** — `[UNLINK]` does
+not print the inode — so it establishes that the victim files are unlinked
+before their fills, not that this specific `unlink` freed that specific inode
+number.
+
+**T5b is confirmed end-to-end.** T5a (`file_page_cache` publish-vs-invalidate)
+is neither confirmed nor *needed*: the inode-reuse leg of T5b produces the
+garbage-byte modes too. Demote it; do not close it.
+
+### The arm's 6 non-green builds are three other defects, not the ICE
+
+1. `signal: 6` / exit 101 on the final `--crate-name akuma` LTO compile — the
+   known memory-pressure abort class.
+2. **New:** `error: could not write output to …-cgu.0.rcgu.o.rcgu.o: No such
+   file or directory` — rustc's *own output path* vanishing mid-write. Same
+   unlink-storm family, opposite side: the writer, not the mapper.
+3. The `Ok(0)` fills themselves.
+
+**None is an ODHT / `STR_SENTINEL` / `TyKind` decode error.** Across the last two
+arms — 11 builds — the original ICE did not reproduce once, the longest clean
+streak of the hunt.
+
+One scoring correction, rule 3 again: the harness's first pass labelled several
+builds "FAILED" that had produced no error lines at all. They were **ssh
+timeouts**, not compiler failures. Score from the guest's own build log, never
+from the harness's exit code.
+
+### The confound: the image was genuinely damaged
+
+30+ clean-build cycles left `devbox.img` in a state `e2fsck` had to repair —
+unattached inodes reconnected to `lost+found`, wrong ref counts, wrong
+free-block counts in two groups and in the superblock. Boot had degraded to 15+
+minutes behind a ~1900-line watchdog storm. Repaired and re-verified clean
+(exit 0, 2.5% non-contiguous); the procedure is in
+[`../runbooks/selfhost-kernel-build.md`](../runbooks/selfhost-kernel-build.md)
+§5.5, whose older claim that "the disk itself stays clean through all of this"
+is now corrected there. **Rate-score nothing on an unrepaired image.**
+
+Post-repair the same image boots to sshd in **11 s with 18 `[WATCHDOG]` lines**,
+so the slow boot was the damage, not a kernel regression. Two things the repair
+cost, both worth knowing before the next arm: the campaign's working tree
+`/tmp/akuma` came back an **empty directory** (its dirents were what the hard
+kills destroyed; `e2fsck` could only reconnect the inodes), so `target/` is gone
+and the next arm starts cold from the pre-cloned `/root/akuma`; and the 33
+reconnected `/lost+found` orphans carry inode numbers in the **same 44xxx range
+as the `[FILL-SHORT]` victims** — independent corroboration that the churned
+build artifacts are exactly the inodes this defect touches.
+
+### The fix this points at — the lifecycle, not the fill
+
+Clamping the fill would only hide it. Ranked:
+
+1. **Pin the inode for the life of the mapping** (Linux semantics). Take a
+   reference at `mmap`, release at `munmap`/teardown; `unlink` unlinks the name
+   and defers the inode free until the last reference drops. Correct, and the
+   most work — it needs a real open-file/inode reference count in the VFS.
+2. **Invalidate on unlink/truncate**: find lazy regions naming the inode and
+   drop or zero-cap them. Cheaper, needs a reverse index, and gets the semantics
+   *wrong* — Linux keeps the old contents readable through the mapping.
+3. **Generation-tag `LazySource::File`**: store a generation with the inode,
+   bump it when the inode is freed, and make a stale fill fail loudly instead of
+   returning `Ok(0)`. Fixes nothing, but converts silent corruption into a
+   detectable error. The minimum honest step, and a prerequisite instrument for
+   either real fix.
+
+### What is NOT done (carrying §11 forward)
+
+- **The ICE is not proven fixed.** 11 green builds is a streak; the mechanism
+  that produced the ICE still fires, on green builds included.
+- **3/10 → 10/10 across an instrumentation-only change is unexplained.**
+- The inode-lifecycle defect itself is **diagnosed, not fixed** — no option
+  above is implemented.
+- `signal: 11` and the SIGABRT/LTO class are untouched.
+- The `SMP=1` wedge still blocks every single-core control (§11).
+- **T1** (read/readv copy shortness) remains untested.
+
 ## Background
 
 - [`HANDOFF_ZERO_PAGE_ICE.md`](HANDOFF_ZERO_PAGE_ICE.md) — **self-contained handoff
