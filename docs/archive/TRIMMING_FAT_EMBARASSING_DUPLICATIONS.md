@@ -19,8 +19,9 @@ phys/virt translators. **Three crates — `akuma-ext2`, `akuma-virtio`,
 `akuma-net` — no longer depend on `akuma-exec` at all.** Full writeup:
 [`AKUMA_PRIMITIVES_EXTRACTION.md`](AKUMA_PRIMITIVES_EXTRACTION.md); current-state
 reference: [`../reference/subsystems/primitives.md`](../reference/subsystems/primitives.md).
-What remains of Phase 4 is the *unblocked* half (§8.5) — none of it needs a new
-crate. See §8.5 for per-item status.
+The *unblocked* half of Phase 4 (§8.5) is now also DONE (verified 2026-08-15);
+what remains of Phase 4 is only the *blocked* half — rungs 3–5 of this section,
+which need the thread-slot table's DAIF/clock/tid dependencies settled first.
 
 **~~Known blocker, owned by no phase:~~ FIXED 2026-08-13.** ssh sessions died
 instantly on the extreme-size profile, blocking
@@ -2098,7 +2099,7 @@ HTTPS (the latter exercising the moved RNG through the TLS handshake),
   the in-VM self-host build; the runbook's vendored `--offline` route is
   unaffected.
 
-### Phase 4 — trait-impl clusters (§5.5) — IN PROGRESS
+### Phase 4 — trait-impl clusters (§5.5) — DONE 2026-08-14
 
 **Read §5.555**, which is the plan of record: `akuma-primitives` exists, rungs 1
 (`OnceCopy`) and 2 (one console hook, one `StackWriter`, one `FmtBuf`, one
@@ -2113,15 +2114,18 @@ work is to build a seam, the seam is most of what you "save". Judge Phase 4 by
 definitions collapsed and dependency edges cut, not by line count — and do not
 expect CPD to register it at all (§5.555 measured 6%).
 
-Still open on the **unblocked** half — none of these need a new crate, and all
-four are mop-up once rungs 3–5 settle the hard part:
+The **unblocked** half's mop-up, verified closed (checked 2026-08-15 against the
+tree, all landed in `d21331a4`):
 
-| Item | Why it is unblocked |
+| Item | Resolution |
 |---|---|
-| `impl_display!` for `BlockError`/`RngError`/`AudioError` | Phase 3 collected all three into `akuma-virtio`; it is now an intra-crate macro |
-| BKL guard family → one generic guard | 4 of the 5 (`Net`/`Mm`/`Vfs`/`Driver`) are in `src/syscall/`; only `ProcessBklGuard` is in `akuma-exec` |
-| twice-defined `MultiPollFuture` | both copies are in `src/tests.rs` (`:2663`, `:9182`) |
+| ~~`impl_display!` for `BlockError`/`RngError`/`AudioError`~~ **DONE** | `crates/akuma-virtio/src/lib.rs:29` defines the macro; `rng.rs:82`, `block.rs:42`, `audio.rs:39` all use it |
+| ~~BKL guard family → one generic guard~~ **DONE** | `crates/akuma-primitives/src/toggled_guard.rs`'s `ToggledGuard<T: GuardToggle>` — all five (`Net`/`Mm`/`Vfs`/`Driver`/`ProcessBklGuard`) are now type aliases over it, differing only in the marker type's `COMPILED_IN` cfg and `enabled()`/`enter()`/`exit()` (e.g. `crates/akuma-exec/src/process/bkl_guard.rs`'s `ProcessBkl`) |
+| ~~twice-defined `MultiPollFuture`~~ **DONE** | one `struct MultiPollFuture` at `src/tests.rs:2671`, called from both former sites (`:2750`, `:9265`) |
 | ~~`ClientMem`/`NoMem` across two crates~~ **DONE 2026-08-13** | The home never needed settling — the trait was always in `akuma-rump` and the kernel always imported it (§4). Three impls → one `pub NoMem` with `faulting()`/`discarding()` |
+
+All four rows of the unblocked half are closed — Phase 4 in full now depends only
+on whether rungs 3–5 of §5.555 (the blocked half) are ever picked up.
 
 ### Phase 5 — the user-copy sweep (−167 `unsafe`, 19% of the tree)
 
