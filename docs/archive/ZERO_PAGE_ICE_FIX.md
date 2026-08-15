@@ -18,7 +18,7 @@
 > **The ICE is not *proven* closed, and the self-host build still fails.** What
 > dominates that workload now is a different, older defect — quarantine poison
 > appearing inside mapped file pages — which has its own live handoff:
-> [`HANDOFF_MAPPED_PAGE_PREMATURE_FREE.md`](HANDOFF_MAPPED_PAGE_PREMATURE_FREE.md).
+> [`MAPPED_PAGE_PREMATURE_FREE_FIX.md`](MAPPED_PAGE_PREMATURE_FREE_FIX.md).
 > Start there, not here.
 
 ## The symptom
@@ -303,7 +303,7 @@ across `mmap`) with the actor caught in the act; **§15 is the fix** — the pin
 deferred free, the page-cache invalidation it required, and the poison evidence that
 became the next hunt. `docs/archive/FPCACHE_EVICTION_PREFERS_UNMAPPED.md`
 covers a cache-policy bug found along the way.
-`docs/archive/HANDOFF_MAPPED_PAGE_PREMATURE_FREE.md` is the live handoff that follows
+`docs/archive/MAPPED_PAGE_PREMATURE_FREE_FIX.md` is the live handoff that follows
 this one.
 
 **State: both known root causes fixed; the ICE itself is not proven closed.**

@@ -113,7 +113,7 @@ this pipeline entirely — no `cow_ref_dec`, no ledger, no quarantine (⚠ W6).
 Each ⚠ above is a window through which a frame can be freed — and poisoned —
 while a live mapping still holds it. This is the mechanism class behind the
 self-host `.rlib` corruption (`rust-lld` reading `0xFEEDFACE…` poison as file
-content, `docs/archive/HANDOFF_MAPPED_PAGE_PREMATURE_FREE.md`): the victim
+content, `docs/archive/MAPPED_PAGE_PREMATURE_FREE_FIX.md`): the victim
 *reads* poison as ordinary data, so no kernel fault, no `[PMM-POISON]`, no
 `[PMM-UAF]` — every instrument stays silent.
 
