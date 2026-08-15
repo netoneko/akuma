@@ -1223,17 +1223,61 @@ static COW_REFCOUNTS: Spinlock<BTreeMap<usize, u16>> = Spinlock::new(BTreeMap::n
 /// new address inserts it with count=2 (parent + child). Subsequent calls
 /// increment by 1 (additional fork children).
 pub fn cow_ref_inc(pa: usize) {
-    let (before, after) = akuma_primitives::irq::with_irqs_disabled(|| {
+    let (created, before, after) = akuma_primitives::irq::with_irqs_disabled(|| {
         let mut table = COW_REFCOUNTS.lock();
-        let entry = table.entry(pa).or_insert(1);
-        let before = *entry;
-        *entry = entry.saturating_add(1);
-        (before, *entry)
+        match table.get_mut(&pa) {
+            Some(entry) => {
+                let before = *entry;
+                *entry = entry.saturating_add(1);
+                (false, before, *entry)
+            }
+            // First share: parent + child. (Formerly `or_insert(1)` + add, which
+            // made a created entry indistinguishable from an existing count of 1
+            // — the resurrection detector below needs the distinction.)
+            None => {
+                table.insert(pa, 2);
+                (true, 0, 2)
+            }
+        }
     });
+    // Resurrection detector: an inc that CREATED the entry on a
+    // frame currently parked in quarantine means the caller took a reference to
+    // a frame whose last reference was already dropped — the freed+poisoned
+    // frame is about to be handed out as live data. This is the premature-free
+    // class the quarantine itself cannot see (the victim *reads*, never
+    // writes). One relaxed atomic load, and only on the inc-from-zero path, so
+    // it cannot perturb the race the way `PMM_PREMATURE_FREE_CHECK` does.
+    // A frame that already LEFT quarantine and was reallocated is legitimately
+    // re-shareable, which is why this checks the parked set and not the ledger.
+    if created
+        && config().pmm_uaf_quarantine
+        && QUAR_PRESENT[quar_slot(pa)].load(Ordering::Acquire) == pa
+    {
+        let n = COW_RESURRECTIONS.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            let (tid_freed, seq_freed, site) = last_free_record_at(pa)
+                .unwrap_or((u32::MAX, 0, FreeSite::Unknown));
+            akuma_primitives::safe_print!(224,
+                "[PMM-RESURRECT] pa={:#x} cow_ref_inc on a QUARANTINED frame — the inc \
+                 raced the last free. freed_by=(tid={} seq={} site={}) now_seq={}\n",
+                pa, tid_freed, seq_freed, site.name(), free_ledger_seq());
+            print_cow_history(pa);
+        }
+    }
     // Recorded outside the `COW_REFCOUNTS` hold: the ledger takes no lock, but
     // keeping it out keeps the hot path's critical section exactly as short as
     // it was before the instrument existed.
     cow_ledger_record(pa, false, before, after);
+}
+
+/// Count of [`cow_ref_inc`] calls that took a reference to a frame still parked
+/// in the UAF quarantine — each one is a caught frame resurrection (a
+/// use-after-free averted or about to happen). Must stay 0.
+static COW_RESURRECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[must_use]
+pub fn cow_resurrection_count() -> usize {
+    COW_RESURRECTIONS.load(Ordering::Relaxed)
 }
 
 /// Decrement the CoW reference count. Returns true if the count reached 0
@@ -2154,7 +2198,35 @@ mod quarantine_and_escalation_effects_tests {
     fn quarantine_ring_and_escalation_effects_over_a_real_arena() {
         ensure_pmm();
         quarantine_detects_uaf_and_double_free();
+        resurrection_detector_fires_on_inc_of_a_parked_frame();
         escalation_walks_all_four_hooks_in_order_then_gives_up();
+    }
+
+    // --- Resurrection: taking a NEW reference (inc-from-zero) on a frame that
+    // is currently parked in quarantine is the race signature behind the
+    // mapped-page premature frees (a mapper's inc losing to the last dec) —
+    // it must be counted, because the victim only ever READS the poison and
+    // every other instrument stays silent. ---
+    fn resurrection_detector_fires_on_inc_of_a_parked_frame() {
+        let pa = alloc_page().expect("arena must have room for the resurrection page");
+        free_page(pa, TID); // parked in quarantine — last reference gone
+        let before = cow_resurrection_count();
+        cow_ref_inc(pa); // the racing mapper's late reference
+        assert_eq!(
+            cow_resurrection_count(),
+            before + 1,
+            "an inc that creates the entry for a quarantined frame must be counted"
+        );
+        // A SECOND inc on the same frame does not create the entry (count is
+        // now 2) and must not double-count.
+        cow_ref_inc(pa);
+        assert_eq!(cow_resurrection_count(), before + 1);
+        // Undo the two incs plus the or_insert baseline so the frame's entry
+        // is gone again, then drain the ring so later phases see a clean arena.
+        assert!(!cow_ref_dec(pa));
+        assert!(!cow_ref_dec(pa));
+        assert!(cow_ref_dec(pa));
+        quarantine_drain_all();
     }
 
     // --- UAF: a write through a frame after it was freed must be caught

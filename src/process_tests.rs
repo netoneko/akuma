@@ -8044,6 +8044,54 @@ fn test_demand_paging_merged_body_policy() {
             "[Test] dp_merged_body: cache handshake SKIPPED (no PMM pages)\n");
     }
 
+    // ── Lost-race insert keeps its hands off the loser's frame ──────────────
+    // Two mappers fill the same (inode, offset) concurrently; the loser's
+    // insert must neither replace the entry nor touch the loser's refcount.
+    // Before 2026-08-15 the cache's `cow_ref_inc` sat after the publish
+    // closure and ran on the early return too, inflating a PRIVATE frame's
+    // count to 2 — one leaked frame per lost race, and a window in which the
+    // published entry was visible with no cache reference (memory.md, "Frame
+    // lifecycle" W2).
+    const FAKE_INODE2: u32 = u32::MAX - 1;
+    const OFF_RACE: usize = 0x8000_0000;
+    if crate::config::SHARED_FILE_PAGES_ENABLED
+        && let (Some(winner), Some(loser)) =
+            (crate::pmm::alloc_page_zeroed(), crate::pmm::alloc_page_zeroed())
+    {
+        crate::file_page_cache::insert(FAKE_INODE2, OFF_RACE, winner, false);
+        if crate::pmm::cow_ref_get(winner.addr) != 2 {
+            fails += 1;
+            crate::safe_print!(128,
+                "[Test] dp_merged_body: winner cow_ref={} after insert (want 2)\n",
+                crate::pmm::cow_ref_get(winner.addr));
+        }
+        crate::file_page_cache::insert(FAKE_INODE2, OFF_RACE, loser, false); // lost race
+        if crate::pmm::cow_ref_get(loser.addr) != 0 {
+            fails += 1;
+            crate::safe_print!(128,
+                "[Test] dp_merged_body: lost-race insert touched the loser's refcount ({})\n",
+                crate::pmm::cow_ref_get(loser.addr));
+        }
+        match crate::file_page_cache::lookup_and_ref(FAKE_INODE2, OFF_RACE, false) {
+            Some((pf, _)) if pf.addr == winner.addr => crate::pmm::free_page(pf),
+            Some((pf, _)) => {
+                fails += 1;
+                crate::safe_print!(128,
+                    "[Test] dp_merged_body: lost-race insert REPLACED the entry\n");
+                crate::pmm::free_page(pf);
+            }
+            None => {
+                fails += 1;
+                crate::safe_print!(96, "[Test] dp_merged_body: race entry vanished\n");
+            }
+        }
+        // Cleanup: drop the cache's reference, then the test's own ownership of
+        // both frames (the loser was never shared, so one free returns it).
+        crate::file_page_cache::invalidate_inode(FAKE_INODE2);
+        crate::pmm::free_page(winner);
+        crate::pmm::free_page(loser);
+    }
+
     if fails == 0 {
         console::print("[Test] demand_paging_merged_body_policy PASSED\n");
     } else {

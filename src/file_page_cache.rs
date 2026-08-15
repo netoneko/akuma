@@ -135,11 +135,24 @@ pub fn lookup_and_ref(inode: u32, file_off: usize, want_exec: bool) -> Option<(P
         return None;
     }
     let hit = crate::irq::with_irqs_disabled(|| {
-        PAGES.lock().get(&(inode, file_off)).copied()
+        let pages = PAGES.lock();
+        let hit = pages.get(&(inode, file_off)).copied();
+        if let Some(ref h) = hit {
+            // Take the mapper's reference while the entry is still present.
+            // Every free path (insert-eviction, invalidate_inode, shrink)
+            // removes the entry under this same PAGES hold BEFORE dropping the
+            // cache's reference, so "entry present" ⇒ the cache still holds a
+            // reference ⇒ this inc can never land on a count that already hit
+            // zero. Inc'ing after the lock drop raced those paths: dec 1->0
+            // freed and poisoned the frame, then the late inc resurrected it
+            // and the mapper installed poison as file content (memory.md,
+            // "Frame lifecycle" W1). COW_REFCOUNTS is a leaf lock already
+            // taken under this hold by insert's eviction scan, so the nesting
+            // order is established.
+            crate::pmm::cow_ref_inc(h.pa);
+        }
+        hit
     })?;
-    // Take the mapper's reference before returning: the frame must not be freed
-    // out from under the caller between here and the install pass.
-    crate::pmm::cow_ref_inc(hit.pa);
     HITS.fetch_add(1, Ordering::Relaxed);
     Some((PhysFrame::new(hit.pa), want_exec && !hit.icache_done))
 }
@@ -182,6 +195,14 @@ pub fn insert(inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) 
             return None;
         }
         pages.insert((inode, file_off), Entry { pa: frame.addr, icache_done });
+        // The cache's own reference, taken while the entry is being published
+        // and only when it actually was. Taking it after this closure left a
+        // window where the entry was visible with no cache reference — every
+        // mapper could unmap and dec the count to zero, freeing the frame
+        // under a live cache entry — and it also ran on the lost-race early
+        // return above, leaking one count per race (memory.md, "Frame
+        // lifecycle" W2).
+        crate::pmm::cow_ref_inc(frame.addr);
 
         if pages.len() <= cap {
             return None;
@@ -236,9 +257,6 @@ pub fn insert(inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) 
         // otherwise the last unmapper frees it through the same path.
         crate::pmm::free_page_at(PhysFrame::new(pa), akuma_pmm::FreeSite::FpcacheEvict);
     }
-    // The cache's own reference for the entry we just inserted. Combined with the
-    // caller's mapping this makes the refcount 2 — see the module invariant.
-    crate::pmm::cow_ref_inc(frame.addr);
 }
 
 /// Drop every cached page belonging to `inode`.

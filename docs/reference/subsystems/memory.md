@@ -70,6 +70,123 @@ was hardcoded `0xC0000000`).
 **Untracked-frame policy:** never free a frame you didn't track (leak is
 recoverable; over-free crashes the kernel).
 
+### Frame lifecycle: the free pipeline
+
+Everything below `free_page_at` lives in `crates/akuma-pmm/src/lib.rs`; the
+reference-taking paths on the left live in `src/file_page_cache.rs` and the
+fault path. The one gate that decides whether a frame is actually released is
+`cow_ref_dec` — everything after it *assumes the caller was entitled*.
+
+```mermaid
+flowchart TB
+    subgraph REFS["Reference holders (outside the crate)"]
+        MAP["fault path: map + track_user_frame<br/>(private frame: NO cow entry, count=0)"]
+        LKP["file_page_cache::lookup_and_ref<br/>cow_ref_inc INSIDE the PAGES hold<br/>(W1, closed 2026-08-15)"]
+        INS["file_page_cache::insert<br/>cache's cow_ref_inc inside the publish,<br/>only when actually inserted<br/>(W2, closed 2026-08-15)"]
+    end
+
+    subgraph FREEPIPE["akuma_pmm::free_page_at(pa, tid, site)"]
+        DEC{"cow_ref_dec(pa)<br/>Some(n) → n-1<br/>None → 0→0, LAST ⚠ W3"}
+        KEEP["count still > 0:<br/>return — frame stays"]
+        UNTRK["untrack_frame + record_free_at<br/>(FreeSite ledger, 4096-slot ring)"]
+        PREM["report_premature_free<br/>⚠ OFF by default (perturbs the race) —<br/>poisoning a still-mapped frame is SILENT"]
+        QPUSH["quarantine_push: POISON WRITTEN HERE<br/>0xFEEDFACEDEAD0000 ^ pa, whole page<br/>no ownership/bitmap check first ⚠ W4"]
+        RING["512-slot ring, parked<br/>(bitmap still says allocated)"]
+        DRAIN["release_from_quarantine<br/>verify_poison → [PMM-UAF] if written<br/>reads survive undetected ⚠ W5"]
+        BMAP["bitmap free_page →<br/>Freed / DoubleFree / OutOfRange"]
+        REUSE["frame reallocated,<br/>re-zeroed / re-filled under<br/>any mapper that was left behind"]
+    end
+
+    MAP -. "munmap / teardown / CoW break" .-> DEC
+    LKP -. "cow_ref_inc" .-> DEC
+    INS -. "cow_ref_inc" .-> DEC
+    DEC -->|"not last"| KEEP
+    DEC -->|"LAST ref"| UNTRK --> PREM --> QPUSH --> RING
+    RING -->|"drain: alloc pressure,<br/>or ring full (evict oldest)"| DRAIN --> BMAP --> REUSE
+```
+
+`alloc_pages_contiguous_zeroed`/`free_pages_contiguous` (thread stacks) bypass
+this pipeline entirely — no `cow_ref_dec`, no ledger, no quarantine (⚠ W6).
+
+#### What the pipeline does NOT synchronize (the corruption surface)
+
+Each ⚠ above is a window through which a frame can be freed — and poisoned —
+while a live mapping still holds it. This is the mechanism class behind the
+self-host `.rlib` corruption (`rust-lld` reading `0xFEEDFACE…` poison as file
+content, `docs/archive/HANDOFF_MAPPED_PAGE_PREMATURE_FREE.md`): the victim
+*reads* poison as ordinary data, so no kernel fault, no `[PMM-POISON]`, no
+`[PMM-UAF]` — every instrument stays silent.
+
+- **W1 — `lookup_and_ref` incs outside the `PAGES` hold** — **CLOSED
+  2026-08-15** (`src/file_page_cache.rs`, the "D2" suspect). All three free
+  paths (`insert`-eviction, `invalidate_inode`, `shrink`) remove the entry
+  *under* `PAGES` and then `cow_ref_dec`. A mapper that copied the entry and
+  dropped the lock, but had not yet inc'd, was invisible to them: dec 1→0
+  freed and poisoned the frame, then the late inc **resurrected** it (a fresh
+  entry at count 2 on a quarantined frame) and the mapper installed poison as
+  file content. The fix takes the mapper's reference *inside* the `PAGES`
+  hold — "entry present ⇒ the cache's reference is still alive ⇒ the inc
+  cannot land on zero". `cow_ref_get` was already called under that hold on
+  the eviction scan, so the lock order (`PAGES` → `COW_REFCOUNTS`-leaf) was
+  established.
+- **W2 — `insert`'s cache reference landed after the closure**, and landed
+  unconditionally — **CLOSED 2026-08-15**. On the lost-race early return it
+  inflated a private frame's count (one leaked frame per race). Worse,
+  between publishing the entry and the inc, the entry was visible while the
+  count reflected **only the mappers**: if every mapper unmapped inside that
+  window (a hit incs 0→2, its unmap decs 2→1, the inserting process's
+  teardown decs 1→0), the frame was freed and poisoned with a live cache
+  entry still pointing at it — the next `lookup_and_ref` hit handed the freed
+  frame to a new mapper as valid file content. The fix takes the cache's
+  reference inside the publish closure, only when the entry was actually
+  inserted; the boot-suite lost-race check in `process_tests.rs` pins it.
+- **W3 — an untracked dec means "free it".** `cow_ref_dec` on a PA with no
+  entry returns `true` (single-owner semantics). Correct for genuinely
+  private frames — but it converts *any* unbalanced dec anywhere in the tree
+  into a silent premature free. Every poison event in the 2026-08 logs shows
+  exactly this signature: `[COW-HIST] … dec 0->0` with no matching inc.
+  Since 2026-08-15 `cow_ref_inc` distinguishes *creating* the entry from
+  incrementing one, and a created entry whose frame is currently parked in
+  the quarantine prints `[PMM-RESURRECT]` (with the free record and CoW
+  history) and bumps `cow_resurrection_count()` — one relaxed atomic load,
+  only on the inc-from-zero path, so unlike `PMM_PREMATURE_FREE_CHECK` it
+  cannot perturb the race. **`[PMM-RESURRECT]` must never print.** An inc
+  that lands *after* the frame already left quarantine is still invisible;
+  the untracked-dec policy itself is unchanged.
+  Note the victims on record are not all cache pages: several `[WILD-DA]`
+  autopsies show a **writable private** page (`AP_RW_ALL`, a 2-page anonymous
+  region) freed by *another thread's* `munmap` with `dec 0->0` — the file
+  cache never serves writable pages, so at least one route is two address
+  spaces tracking the same PA with **no `COW_REFCOUNTS` entry at all**: a
+  share whose `cow_ref_inc` never happened (the fork/CoW-share or
+  install-race class), not a cache reference miscount.
+- **W4 — a stale free is trusted, and poison is written before any check.**
+  `quarantine_push` poisons the page immediately; the double-free guards
+  (`QUAR_PRESENT`, and the bitmap check) only catch frames *still parked* or
+  *still free*. A stale free of a frame that already left quarantine and was
+  reallocated poisons the **new owner's** live data on the spot. The
+  `QUAR_PRESENT` set is also a 2048-slot direct-mapped hash on PFN low bits:
+  a collision evicts an older parked PA from the set, so its second free is
+  misattributed (contained later by the bitmap check, but the report lies).
+- **W5 — the quarantine only detects *writes*.** `verify_poison` at drain
+  compares the page against its poison; a victim that only *reads* (the
+  linker, a `.rlib` consumer) never trips it. The one instrument that fires
+  at the moment a still-mapped frame is poisoned —
+  `PMM_PREMATURE_FREE_CHECK` → `report_premature_free` — is **off by
+  default** because armed it perturbs the race away (10/10 green against a
+  25 % baseline). Poisoning a mapped page is therefore currently
+  unobservable in the failing configuration.
+- **W6 — the contiguous path bypasses everything**, and
+  `free_pages_contiguous` decrements `ALLOCATED_PAGES` by the full `count`
+  even when some pages in the run were already free — `free_count()` drifts
+  upward, and the reclaim ladder (`next_reclaim_step`) then misjudges
+  pressure from a wrong number.
+
+The `[PMM-UAF]` events on record carry one more diagnostic gift: `got` is
+frequently `want − 1` or `want − 2` — a *decrement* of the poison word, i.e. a
+refcount-shaped write through a stale mapping (the cargo null-`Rc` autopsy
+shape, `docs/archive/CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md`).
+
 ## PMM ↔ heap lock flow
 
 Two independent spinlocks govern all memory allocation, and **they call each
