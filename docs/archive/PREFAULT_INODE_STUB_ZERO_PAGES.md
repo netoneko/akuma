@@ -75,11 +75,15 @@ necessarily the only one.
 
 ## What remains
 
-7/10 builds still fail. Scoring gap owned up front: the fix arm recorded only
-GREEN/FAILED per build, not which crate died or how (hunt rule 3) — the residue
-is unattributed. Next steps, in order: re-run scoring failure modes separately;
-then the read-path copy instrument (T1) and the anonymous-heap side (T2) target
-the residue; the SMP=1 control remains blocked by the wedge.
+7/10 builds still failed on this fix alone. The residue has since been scored:
+**garbage-byte decode errors** (two modes: `rustc_serialize` STR_SENTINEL /
+invalid `Option` discriminant on `enumn`+`zerocopy-derive`; `ty_kind.rs`
+invalid variant tag `102` on `akuma-exec`) plus a **313-event
+`[FILL-SHORT] got=Ok(0)`** flood in the same boot — a writer/reader coherence
+class, not this zero-page class. A heavily-instrumented arm went 4/4 green but
+perturbs I/O timing (every ext2 cache hit re-read from disk), so it proves
+timing sensitivity, not a fix. See
+[`SELFHOST_ZERO_PAGE_HUNT.md`](SELFHOST_ZERO_PAGE_HUNT.md) §13.
 
 ## Background
 

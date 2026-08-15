@@ -492,8 +492,9 @@ tested, and **any single-core control for any other theory is unavailable too**.
    named it in one boot.
 2. **The ODHT ICE is still unexplained.** ~~Nothing here fixed it, and it now fires on
    ~every clean build.~~ **Partially explained 2026-08-15 — §12:** the prefault
-   inode-stub zero pages were found and fixed, moving green builds 0 → 3/10. The
-   residue (~70%) is unattributed; the paragraph below still describes it correctly.
+   inode-stub zero pages were found and fixed, moving green builds 0 → 3/10.
+   **§13 then scored the residue:** it is garbage-byte decode errors (two modes),
+   not zeros — a writer/reader coherence class, tracked as T5 there.
    What is left after §4 and §8: the corruption is not the file,
    not the cache, not a short read, not `madvise`, and not a premature free. The next
    suspect is the *other* end — the page rustc decompresses metadata **into** (its
@@ -544,13 +545,112 @@ The short version:
 
 **The ICE is not closed.** 7/10 still fail, and the fix arm scored only
 GREEN/FAILED — not which crate died or how (rule 3 violated by the very document
-that wrote it; the residue needs re-scoring before T1/T2 are re-ranked).
+that wrote it; the residue needs re-scoring before T1/T2 are re-ranked). **Done
+next — §13.**
+
+## 13. The residue, scored: two garbage-byte modes, an Ok(0) flood, and a timing surprise (2026-08-15, evening)
+
+### Scoring the residue properly (rule 3, belatedly)
+
+5 more clean builds on the unchanged §12 fix kernel, each with the full cargo log
+kept in-guest (`/tmp/buildN.log`) and the panic bodies extracted:
+
+- builds 2–4: **GREEN**
+- build 1 — **Mode A**, `enumn` + `zerocopy-derive` (the usual pairing), but *not*
+  the ODHT decode error:
+  ```
+  rustc_serialize/src/serialize.rs:402:18: assertion failed: bytes[len] == STR_SENTINEL
+  rustc_serialize/src/serialize.rs:136:9:  Encountered invalid discriminant while decoding `Option`
+  ```
+- build 5 — **Mode B**, on `akuma-exec` itself:
+  ```
+  rustc_type_ir/src/ty_kind.rs:145:33: invalid enum variant tag while decoding `TyKind`,
+  expected 0..29, actual 102
+  ```
+
+**The residue is garbage bytes, not zero pages.** `actual 102` is `'f'`; the
+STR_SENTINEL assertion means a decoded string's length prefix lied. Both modes are
+rustc reading .rmeta that decodes to *wrong* bytes — freshly written seconds
+earlier by a concurrent rustc. That is a coherence defect between the writer and
+the reader of the same file, a different class than anything in §4–§12 (which
+were all zero-page shapes).
+
+### The same arm's kernel log: 313 reads that returned `Ok(0)` mid-file
+
+The fix-arm boot's kernel log (10 builds) holds **313 `[FILL-SHORT]` firings,
+every one `got=Ok(0)`** — the demand-fault fill hitting ext2's EOF arm at offsets
+the mmap-time `filesz` said were inside the file (0x10e000–0x112000 range,
+~1.1 MB). Spread across ~11 build-artifact inodes (44149 ×91, 44187 ×77, then
+×29 each for a tail of others).
+
+Follow-up on one victim: inode 44076 was read at 1.0–1.1 MB offsets during the
+build but **is now a 498-byte fingerprint JSON**. Either the file was rewritten
+smaller between mmap and fault (cargo rewrites fingerprints/.d files
+constantly), or the inode was freed and reused while a stale lazy region still
+named it (`LazySource::File` holds a raw inode number with no lifetime tie to
+the file). Which of the two has not been distinguished yet; the Ok(0) flood and
+the garbage-byte modes may or may not share a mechanism.
+
+### New instruments (all in-tree)
+
+- `[E2-EOF] inode= off= size_now=` — ext2 `read_at_by_inode`'s EOF arm with a
+  non-zero offset; prints the size the reader *actually* saw (rate-limited to
+  32 prints, counted in `E2_READ_AT_EOF`).
+- `[E2C-BAD] block= first_diff= cached= disk=` — every ext2 block-cache hit is
+  re-read from disk and compared (`verify_cached_block`; counter
+  `E2_CACHE_VERIFY_MISMATCH`). Bypasses the cache, so it cannot be fooled by the
+  entry it checks — the stale-instrument rule applied.
+- `path=` added to both `[FILL-SHORT]` variants, so the next firing names the
+  file instead of requiring an inode hunt.
+
+### The arm that went 4/4 green — and why that is not a fix
+
+With those instruments built in (kernel otherwise identical to the fix arm), 4
+clean builds: **4/4 GREEN**, and all three instruments silent — `[E2-EOF]` 0,
+`[E2C-BAD]` 0, `[FILL-SHORT]` 0 (even the 313-event `Ok(0)` class vanished).
+
+Read carefully: `verify_cached_block` **re-reads every cache hit from disk**, so
+this kernel does double I/O on the hottest path in the build. That serialises
+and spaces out the exact interleavings a coherence race needs. Four greens at a
+~60–70% failure rate is ~(0.35)⁴ ≈ 1.5% by chance — plausible but not proof, and
+the perturbation is the more likely explanation. This arm establishes
+**the failure window is timing-sensitive** (an observation worth having), not
+that anything is fixed. The green-streak rule from §2's method box applies: an
+implausibly good arm is suspect, and this one *provably* perturbs the thing it
+observes. The honest next arm is **counters only, no disk re-reads**, ten
+builds, before believing any rate.
+
+### Live theory after this: T5 — writer-vs-reader incoherence on freshly-written files
+
+The evidence shape — garbage bytes in metadata written seconds earlier by a
+concurrent rustc, plus EOF-where-filesize-said-not — points at the
+write-vs-read side, which no arm has instrumented yet (fpcpoison tested
+concurrent *mappers*, not concurrent writer+mappers):
+
+- **T5a — `file_page_cache` publish/invalidate ordering.** `vfs::write_at`
+  writes first, *then* invalidates the fpc entries for the path
+  (`let r = with_fs(write); invalidate_file_pages(path);`). The hazard window is
+  a concurrent demand fill of the same page: it reads the **old** disk bytes,
+  the writer lands the new bytes and invalidates, and the fill *then* publishes
+  its old-bytes frame — after the invalidate, so nothing removes it. Every later
+  mapper of that page gets pre-write bytes: persistent garbage, exactly the
+  Mode A/B shape. Mechanism candidate only — not yet verified.
+- **T5b — stale `LazySource::File` inode after unlink/rewrite.** The Ok(0) flood
+  shape; a lazy region naming an inode whose file was rewritten smaller
+  (or freed and reused) mid-build.
+
+T1 (read-copy shortness) remains untested; T3's SMP=1 wedge is still open; T4
+(ext2 block cache under concurrency) is weakened-but-alive via the
+remove-then-write window in `write_block` (cache remove precedes disk write; a
+reader in that window misses the cache and reads the *old* disk bytes) — though
+ext2's state RwLock should exclude that, so it needs the lock topology verified
+before being believed.
 
 ## Background
 
 - [`HANDOFF_ZERO_PAGE_ICE.md`](HANDOFF_ZERO_PAGE_ICE.md) — **self-contained handoff
   prompt** for picking this up cold: repro, elimination table, ranked live theories,
-  the SMP=1 blocker, and the seven method rules this hunt paid for
+  the SMP=1 blocker, and the method rules this hunt paid for
 - [`CARGO_HEAP_NULL_RC.md`](CARGO_HEAP_NULL_RC.md) — the same end state (zeroed page in
   a live process), the task brief the earlier hunt ran from
 - [`MADV_DONTNEED_SHARED_FRAME.md`](MADV_DONTNEED_SHARED_FRAME.md) — the fixed *sharing*

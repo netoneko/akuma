@@ -338,6 +338,18 @@ impl ClockBlockCache {
 /// 0 means no write lock is held. Used to detect orphaned locks from killed processes.
 static EXT2_WRITE_LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
 
+/// Diagnostic (2026-08-15 zero-page hunt): cache hits whose bytes did not match
+/// a direct disk re-read (`[E2C-BAD]`). Non-zero means this layer is serving
+/// stale data — the "wrong bytes" half of the self-host ICE residue.
+pub static E2_CACHE_VERIFY_MISMATCH: AtomicUsize = AtomicUsize::new(0);
+
+/// Diagnostic (2026-08-15 zero-page hunt): `read_at_by_inode` calls that hit the
+/// EOF arm with a non-zero offset (`[E2-EOF]`) — the caller's mmap-time `filesz`
+/// said the file extended further than the inode's size says now. Normal EOFs
+/// (pread at end of file) land here too, so this is a *rate* signal: a burst
+/// correlated with `[FILL-SHORT]` is the defect.
+pub static E2_READ_AT_EOF: AtomicUsize = AtomicUsize::new(0);
+
 /// Kernel callbacks the orphaned-lock recovery path needs. Registered once at
 /// boot by `src/fs.rs`.
 #[derive(Clone, Copy)]
@@ -867,7 +879,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             if let Some(data) = cache.get(block_num) {
                 #[cfg(any(ext2_fs_cache, test))]
                 CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-                return Ok(data.to_vec());
+                let snapshot = data.to_vec();
+                drop(cache);
+                self.verify_cached_block(state, block_num, &snapshot);
+                return Ok(snapshot);
             }
         }
         #[cfg(any(ext2_fs_cache, test))]
@@ -883,6 +898,33 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
 
         Ok(buf)
+    }
+
+    /// Diagnostic (2026-08-15 zero-page hunt): re-read a block straight from the
+    /// device and compare against what the cache served. A mismatch means the
+    /// cache is holding bytes the disk no longer has — stale-instrument class
+    /// (see `docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §13): every earlier
+    /// exoneration verified a *different* layer than the one serving these reads.
+    /// Bypasses the cache entirely (`self.dev.read_bytes`), so it cannot be
+    /// fooled by the entry it is checking. Rate-limited to the first 32 prints;
+    /// the counter keeps counting.
+    #[cfg(not(kernel_profile_extreme))]
+    fn verify_cached_block(&self, state: &Ext2State, block_num: u32, cached: &[u8]) {
+        let bs = state.block_size;
+        let mut disk = alloc::vec![0u8; bs];
+        let off = block_num as u64 * bs as u64;
+        if self.dev.read_bytes(off, &mut disk).is_err() {
+            return;
+        }
+        if disk != cached {
+            let prev = E2_CACHE_VERIFY_MISMATCH.fetch_add(1, Ordering::Relaxed);
+            if prev < 32 {
+                let at = disk.iter().zip(cached.iter()).position(|(a, b)| a != b).unwrap_or(0);
+                akuma_primitives::safe_print!(224,
+                    "[E2C-BAD] block={:#x} first_diff={:#x} cached={:#x} disk={:#x} cached_zero={}\n",
+                    block_num, at, cached[at], disk[at], u8::from(cached.iter().all(|b| *b == 0)));
+            }
+        }
     }
 
     fn write_block(&self, state: &Ext2State, block_num: u32, data: &[u8]) -> Result<(), FsError> {
@@ -1783,6 +1825,16 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
         let file_size = inode.size_lower as usize;
         if offset >= file_size {
+            // Diagnostic (2026-08-15 hunt): a demand-fill clamps to `filesz`
+            // resolved at mmap time, so hitting EOF here means this inode's size
+            // is smaller NOW than the caller believed then — an i_size
+            // incoherence, not a normal EOF. Counted always; the first 32 print.
+            let prev = E2_READ_AT_EOF.fetch_add(1, Ordering::Relaxed);
+            if prev < 32 && offset > 0 {
+                akuma_primitives::safe_print!(224,
+                    "[E2-EOF] inode={} off={:#x} size_now={:#x} — caller believed the file extended past off\n",
+                    inode_num, offset, file_size);
+            }
             return Ok(0);
         }
 
@@ -1825,7 +1877,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
                     buf[total_read..total_read + chunk]
                         .copy_from_slice(&data[offset_in_block..offset_in_block + chunk]);
+                    let hit_snapshot = data.to_vec();
                     drop(cache);
+                    self.verify_cached_block(&state, run_start_phys, &hit_snapshot);
                     #[cfg(any(ext2_fs_cache, test))]
                     CACHE_HITS.fetch_add(1, Ordering::Relaxed);
                     pos += chunk;

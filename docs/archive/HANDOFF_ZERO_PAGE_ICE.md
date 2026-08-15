@@ -68,15 +68,45 @@ bug" as progress on this one:
 2. `MAP_SHARED|MAP_ANONYMOUS` was CoW-copied by `fork` instead of shared. Fixed. ICE
    unchanged.
 
-## Live theories, ranked — for the ~70% RESIDUE after the 2026-08-15 prefault fix
+## Live theories, ranked — for the ~60-70% RESIDUE after the 2026-08-15 prefault fix
 
 The prefault inode-stub fix (see the elimination table) moved green builds 0/10 →
-3/10 but did **not** close the ICE. First job: re-score the residue properly —
-the fix arm recorded only GREEN/FAILED per build, not which crate died or how
-(rule 3). Do that before trusting any ranking below.
+3/10 but did **not** close the ICE. The residue has since been **scored by
+failure mode** (5-build arm on the fix kernel, full cargo logs kept in-guest):
+
+- **Mode A** — `enumn`+`zerocopy-derive` (the usual pairing),
+  `rustc_serialize/src/serialize.rs:402` `assertion failed: bytes[len] == STR_SENTINEL`
+  and `:136` invalid `Option` discriminant.
+- **Mode B** — `akuma-exec` itself, `rustc_type_ir/src/ty_kind.rs:145`
+  `invalid enum variant tag while decoding TyKind, expected 0..29, actual 102`.
+
+**The residue is garbage bytes, not zero pages** (`102` = `'f'`; a decoded
+string's length prefix lied). Metadata written seconds earlier by a concurrent
+rustc decodes wrong — a writer/reader coherence class, not the zero-page class
+of the original ICE. The same arm's kernel log holds **313
+`[FILL-SHORT] got=Ok(0)`**: demand fills hitting ext2's EOF arm at offsets the
+mmap-time `filesz` said were in-file (one victim inode is now a 498-byte
+fingerprint JSON — rewritten-smaller or inode-reused, not yet distinguished).
+And a heavily-instrumented arm (every ext2 block-cache hit re-read from disk)
+went **4/4 green with every instrument silent** — that perturbs I/O timing
+enough to close a race window, so it establishes *timing sensitivity*, not a
+fix. The honest next arm is counters only, no disk re-reads, ten builds.
+
+**T5 — writer/reader incoherence on freshly-written files (leading).** Two
+mechanism candidates, neither verified:
+- **T5a**: `vfs::write_at` writes, *then* invalidates `file_page_cache`. A
+  demand fill interleaved between reading the old disk bytes and publishing its
+  frame lands that stale frame *after* the invalidate — nothing removes it, and
+  every later mapper of the page gets pre-write bytes: persistent garbage, the
+  Mode A/B shape. Test: instrument publish-vs-invalidate ordering per
+  (inode, offset).
+- **T5b**: a stale `LazySource::File` inode after the file is rewritten smaller
+  or unlinked mid-build (the Ok(0) flood shape). `path=` now prints on
+  `[FILL-SHORT]`, so the next firing names the file directly.
 
 **T1 — `sys_read`/`sys_pread64`/`readv` short-copies into the user buffer.** The
-strongest untested candidate. Commit `edd91fe7 "safer memory helpers"` rewrote **every**
+strongest untested candidate for the *zero-page* shape. Commit `edd91fe7 "safer
+memory helpers"` rewrote **every**
 user-memory copy on this branch, and nothing has instrumented the read path's *copy*
 half. If the syscall returns `n` but copies fewer than `n` bytes out, the tail of a
 freshly-allocated (zero) buffer stays zero — exactly `[0,0,0,0]` where a header belongs,
@@ -87,9 +117,9 @@ plain `read`.
 **T2 — an anonymous heap page reads back as zeros.** Same end state as
 `docs/archive/CARGO_HEAP_NULL_RC.md` (cargo reading a zeroed `Rc` out of its own heap),
 whose *sharing* half was fixed but whose class is open. `rustc` materialises metadata
-into its heap. **Every instrument so far points at the file side, which is now closed** —
-so instrument the anonymous side: the anon demand-page arm, the CoW break, and
-`mprotect`/`mremap` remapping live data.
+into its heap. Note the scored residue is **garbage bytes**, which a zeroed-anon-page
+mechanism does not produce — T2 explains only a zero-page shape and is therefore
+demoted below T5 for the residue (it stays live for any future zero-page sighting).
 
 **T3 — a missing barrier / memory-ordering bug under SMP.** Two rustc processes fail in
 the same second. If a frame is zeroed on one core and published before the zeroing is
@@ -153,6 +183,13 @@ other theories, so it may be worth fixing first. To inspect a wedge you must boo
    and its one consumer dropped the result. When a path crosses a runtime-hook
    boundary, grep the registrations for stubs first; that check costs one
    command and would have closed this hunt in March.
+10. **An instrument that perturbs the system cannot adjudicate a fix.** The
+    cache-hit verifier (re-read every hit from disk) went 4/4 green with every
+    instrument silent — but doubling I/O on the hot path serialises exactly the
+    interleavings a coherence race needs, so that arm measured the perturbation,
+    not the kernel. Rule 4's cousin: low-variance arms are suspect, and so are
+    implausibly green ones on an instrumented build. Rate-score on a kernel
+    whose instrumentation is counters-only.
 
 ## Tools already in the tree
 
@@ -169,15 +206,24 @@ other theories, so it may be worth fixing first. To inspect a wedge you must boo
   `dp_counters_line` dump only surfaces from the exceptions path on the devbox
   profile — the console prints (`[FILL-SHORT]`, `[FILL-SHORT/prefault]`) are the
   operative guards.
+- `[E2-EOF]` — ext2 `read_at_by_inode`'s EOF arm with the size the reader
+  actually saw (counter `E2_READ_AT_EOF`). `[E2C-BAD]` — ext2 block-cache hit
+  vs. direct disk re-read (counter `E2_CACHE_VERIFY_MISMATCH`; **warning**: the
+  re-read doubles I/O on the hot path and perturbs timing — see the 4/4-green
+  caveat above; gate it off before rate-scoring any arm).
+- `[FILL-SHORT]` variants now print `path=`.
 
 ## Full history
 
 `docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` — every arm, every measurement, the wrong fix
 kept deliberately as a worked example; §12 and
-`docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md` cover the root cause found 2026-08-15.
+`docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md` cover the root cause found 2026-08-15;
+§13 scores the residue (garbage-byte modes, the Ok(0) flood, the timing-perturbation
+result) and ranks T5.
 `docs/archive/FPCACHE_EVICTION_PREFERS_UNMAPPED.md`
 covers a cache-policy bug found along the way.
 
-**State: partially fixed.** The prefault inode-stub zero pages (root cause #1) are
-fixed — 0/10 → **3/10 green**. The ~70% residue is unattributed and unscored by
-failure mode; the theories above target it.
+**State: partially fixed.** Root cause #1 (prefault inode-stub zero pages) is fixed —
+0/10 → **3/10 green**. The residue is **scored** (two garbage-byte decode modes +
+an Ok(0) fill flood) but unfixed; T5 (writer/reader incoherence) leads, T1/T3/T4
+follow. Do not trust the 4/4 instrumented arm — it perturbs the timing it observes.

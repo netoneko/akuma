@@ -1392,9 +1392,9 @@ fn demand_page_lazy_region(
                     fill_complete = got == Ok(len);
                     if !fill_complete {
                         crate::pmm::dp_count(&crate::pmm::DP_FILE_FILL_SHORT, 1);
-                        crate::tprint!(224,
-                            "[FILL-SHORT] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} — page left zero-filled\n",
-                            pid, inode, file_off, len, got, cur_va);
+                        crate::tprint!(288,
+                            "[FILL-SHORT] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} path={} — page left zero-filled\n",
+                            pid, inode, file_off, len, got, cur_va, path);
                     }
                 }
             }
@@ -1553,9 +1553,9 @@ fn demand_page_lazy_region(
                 // build that trips the other by the `[FILL-SHORT]` tag alone.
                 if got != Ok(len) {
                     crate::pmm::dp_count(&crate::pmm::DP_FILE_FILL_SHORT, 1);
-                    crate::tprint!(224,
-                        "[FILL-SHORT/single] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x}\n",
-                        pid, inode, file_off, len, got, page_va);
+                    crate::tprint!(288,
+                        "[FILL-SHORT/single] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} path={}\n",
+                        pid, inode, file_off, len, got, page_va, path);
                 }
             }
             if is_exec {
