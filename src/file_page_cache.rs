@@ -89,6 +89,12 @@ static CAP_PAGES: AtomicUsize = AtomicUsize::new(0);
 pub static HITS: AtomicUsize = AtomicUsize::new(0);
 pub static MISSES: AtomicUsize = AtomicUsize::new(0);
 pub static EVICTIONS: AtomicUsize = AtomicUsize::new(0);
+/// Evictions that had to take a **still-mapped** entry because the bounded scan found
+/// no unmapped one. Each costs the next mapper a `read_at` while freeing nothing, so
+/// this is the number that matters when the cache thrashes — `evict` alone cannot tell
+/// a cheap eviction from an expensive one. A high ratio against `evict` means the cache
+/// is genuinely too small for the working set, not merely full.
+pub static EVICTIONS_MAPPED: AtomicUsize = AtomicUsize::new(0);
 pub static INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Size the cache from total RAM. Called once from `fs::init`.
@@ -181,25 +187,51 @@ pub fn insert(inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) 
             return None;
         }
         // Over cap: drop one entry at/after the rotating cursor, wrapping.
+        //
+        // **Prefer an entry nobody maps.** Evicting a *mapped* page costs a future
+        // `read_at` for the next mapper while freeing nothing now — the frame survives
+        // on its mappers' references — so a full cache that evicts blindly re-reads its
+        // own hot set from disk. That is the thrash `shrink` already avoids with the
+        // same `cow_ref_get(pa) <= 1` test ("cached with no mappers"); this path was
+        // the one place that skipped it, and it is the path a *full* cache takes on
+        // every insert. Measured: builds at 86-155 s with `evict=5337`, against 43-44 s
+        // with `evict=147` on the same tree.
+        //
+        // The scan is bounded (`EVICT_SCAN`), because `cow_ref_get` takes the CoW table
+        // lock per candidate and this runs inside the `PAGES` hold with IRQs masked. If
+        // no unmapped entry turns up within the window, fall back to the old
+        // any-entry-at-the-cursor behaviour rather than growing past cap.
+        const EVICT_SCAN: usize = 64;
         let cursor = EVICT_CURSOR.load(Ordering::Relaxed);
-        let victim = pages
+        let mut unmapped = None;
+        let mut fallback = None;
+        for (k, v) in pages
             .range((0u32, cursor)..)
+            .chain(pages.range(..(0u32, cursor)))
             .map(|(k, v)| (*k, *v))
-            .find(|(k, _)| *k != (inode, file_off))
-            .or_else(|| {
-                pages
-                    .iter()
-                    .map(|(k, v)| (*k, *v))
-                    .find(|(k, _)| *k != (inode, file_off))
-            });
-        let (vk, ve) = victim?;
+            .filter(|(k, _)| *k != (inode, file_off))
+            .take(EVICT_SCAN)
+        {
+            if fallback.is_none() {
+                fallback = Some((k, v));
+            }
+            if crate::pmm::cow_ref_get(v.pa) <= 1 {
+                unmapped = Some((k, v));
+                break;
+            }
+        }
+        let took_mapped = unmapped.is_none();
+        let (vk, ve) = unmapped.or(fallback)?;
         pages.remove(&vk);
         EVICT_CURSOR.store(vk.1.wrapping_add(4096), Ordering::Relaxed);
-        Some(ve.pa)
+        Some((ve.pa, took_mapped))
     });
 
-    if let Some(pa) = evicted {
+    if let Some((pa, took_mapped)) = evicted {
         EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        if took_mapped {
+            EVICTIONS_MAPPED.fetch_add(1, Ordering::Relaxed);
+        }
         // Drop the cache's reference. Frees only if nobody still has it mapped;
         // otherwise the last unmapper frees it through the same path.
         crate::pmm::free_page_at(PhysFrame::new(pa), akuma_pmm::FreeSite::FpcacheEvict);
@@ -277,11 +309,12 @@ pub fn shrink(want: usize) -> usize {
 pub fn stats_line(w: &mut dyn core::fmt::Write) {
     let _ = writeln!(
         w,
-        "[FPCACHE] entries={} hits={} misses={} evict={} inval={}",
+        "[FPCACHE] entries={} hits={} misses={} evict={} evict_mapped={} inval={}",
         len(),
         HITS.load(Ordering::Relaxed),
         MISSES.load(Ordering::Relaxed),
         EVICTIONS.load(Ordering::Relaxed),
+        EVICTIONS_MAPPED.load(Ordering::Relaxed),
         INVALIDATIONS.load(Ordering::Relaxed),
     );
 }

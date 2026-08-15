@@ -411,7 +411,79 @@ So the file mapping is correct end-to-end under concurrency, for the exact file 
 metadata rustc reads zeros from. Combined with §4, that closes the file side properly
 rather than by inference.
 
-## 10. What is NOT done
+## 10. Theories — killed, and live
+
+### Killed, each by an instrument that would have fired
+
+Every row was measured **on builds that reproduced the ICE**, not argued.
+
+| # | Theory | Instrument | Reading |
+|---|---|---|---|
+| 1 | Fill read short/errored, leaving a zeroed frame | `[FILL-SHORT]` | 0 |
+| 2 | `file_page_cache` serves bytes that aren't the file's | `[FPC-BAD]`, re-reading every hit from disk | 0 / **4,334,431 hits** |
+| 3 | `PROT_NONE` file region auto-committed with a zero frame | `[DA-NONE-FILE]` | 0 |
+| 4 | `MADV_DONTNEED` zeroing a file-backed page | `[DONTNEED-FILE]` | 0 |
+| 5 | Write path corrupts rustc's output | 46 MB `cp` + `md5sum` | byte-exact |
+| 6 | The rlib has holes on disk | offline block-map walk, 1540 blocks | 0 holes |
+| 7 | Premature free (UAF) delivering recycled zeroed frames | `[PMM-POISON]` + `FreeSite` | **real, FIXED** (§8) — ICE unchanged |
+| 8 | The mmap path is wrong end-to-end, cross-process | `fpcpoison`, 4 concurrent procs on `libsyn` (1540 pages) | ALL PASS |
+| 9 | `lto = "thin"` memory/time cliff | host A/B | +1.4% RSS, no cliff |
+| 10 | `filesz` past-EOF pages published as zeros | `[FILL-SHORT]` | **real latent bug, fixed** — never fires here |
+
+Rows 7 and 10 matter for the method: both were **real bugs** that explained the symptom
+plausibly, were fixed, and changed nothing. Fixing a real bug is not evidence that it
+was *this* bug.
+
+### Live, ranked
+
+**T1 — `sys_read`/`sys_pread64` short-copies to the user buffer.** The strongest
+untested candidate, and the most conspicuous gap: `edd91fe7 "safer memory helpers"`
+rewrote **every** user copy on this branch, `sys_read` included, and nothing in this
+hunt instrumented the read path's *copy* half. If the syscall returns `n` but copies
+fewer than `n` bytes into userspace, the tail of a freshly-allocated (zero) buffer stays
+zero — which is exactly `[0,0,0,0]` where a header should be, with no error anywhere.
+Test: count bytes-read against bytes-copied in `sys_read`/`sys_pread64`/`readv` and
+print on mismatch. Note `ld` issues ~13,000 `readv`s per link (§ PSTATS above), so
+`readv`'s iovec walk is as interesting as `read`.
+
+**T2 — an anonymous heap page reads back as zeros.** The same end state as
+[`CARGO_HEAP_NULL_RC.md`](CARGO_HEAP_NULL_RC.md), whose *sharing* half was fixed but
+whose class is not closed. rustc materialises crate metadata into its heap; a heap page
+that loses its contents produces this exact panic. Every instrument in this hunt points
+at the **file** side, which is now closed — so instrument the anonymous side: the
+anon demand-page arm, the CoW break, and `mprotect`/`mremap` remapping live data.
+
+**T3 — a missing barrier / memory-ordering bug under SMP.** `enumn` and
+`zerocopy-derive` fail in the *same second*, compiled in parallel. If a frame is zeroed
+by one core and published before the zeroing is visible to another, a reader sees zeros.
+**The decisive experiment is whether it reproduces at SMP=1 — and that is currently
+BLOCKED, see below.**
+
+**T4 — the ext2 block cache under concurrent readers.** Keyed on physical block number;
+`write_block` evicts correctly, but nothing here tested it under concurrency. Weakened
+by row 8 (`fpcpoison` passes concurrently), not eliminated.
+
+### Blocked: the SMP=1 experiment wedges the box
+
+`SMP=1 overlays/devbox/run-smoltcp.sh`, same workload: build 1 completed in **1012 s**
+(result unread — ssh died before it could be queried), build 2 **hard-wedged** the VM.
+QEMU at **98% CPU**, console frozen, last line:
+
+```
+[AS-NEW] pid=86 l0=0x80d2e000 asid=0x6e via=clone parent=81
+```
+
+That is the [`selfhost-kernel-build.md`](../runbooks/selfhost-kernel-build.md) "Defect A"
+shape (100% CPU, console silent, no `PANIC`) but at **SMP=1**, where it has not been
+recorded before. Console-stopped is the load-independent wedge signal; ssh timing out is
+not, and on this box ssh has historically stayed responsive during builds, so the two
+together are the tell.
+
+Until this is fixed or worked around (boot with `GDB=1` and attach — the gdbstub must be
+armed at launch, so a wedge on a VM booted without it is uninspectable), T3 cannot be
+tested, and **any single-core control for any other theory is unavailable too**.
+
+## 11. What is NOT done
 
 1. ~~**The premature free is not localised.**~~ **DONE — §8.** The `FreeSite` tag
    named it in one boot.
@@ -444,6 +516,9 @@ rather than by inference.
 
 ## Background
 
+- [`HANDOFF_ZERO_PAGE_ICE.md`](HANDOFF_ZERO_PAGE_ICE.md) — **self-contained handoff
+  prompt** for picking this up cold: repro, elimination table, ranked live theories,
+  the SMP=1 blocker, and the seven method rules this hunt paid for
 - [`CARGO_HEAP_NULL_RC.md`](CARGO_HEAP_NULL_RC.md) — the same end state (zeroed page in
   a live process), the task brief the earlier hunt ran from
 - [`MADV_DONTNEED_SHARED_FRAME.md`](MADV_DONTNEED_SHARED_FRAME.md) — the fixed *sharing*
