@@ -343,6 +343,15 @@ static EXT2_WRITE_LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
 /// stale data — the "wrong bytes" half of the self-host ICE residue.
 pub static E2_CACHE_VERIFY_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 
+/// Runtime gate for the `[E2C-BAD]` verification — **default off**, and that is
+/// load-bearing, not a nicety: re-reading every cache hit from disk doubles I/O
+/// on the hottest path in the self-host build and serialises exactly the
+/// interleavings a coherence race needs. The first instrumented arm went 4/4
+/// green with it on and proved nothing (hunt §13, handoff rule 10). Turn it on
+/// only when actively chasing T4, and never trust a rate scored with it on.
+pub static E2_VERIFY_HITS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Diagnostic (2026-08-15 zero-page hunt): `read_at_by_inode` calls that hit the
 /// EOF arm with a non-zero offset (`[E2-EOF]`) — the caller's mmap-time `filesz`
 /// said the file extended further than the inode's size says now. Normal EOFs
@@ -910,6 +919,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// the counter keeps counting.
     #[cfg(not(kernel_profile_extreme))]
     fn verify_cached_block(&self, state: &Ext2State, block_num: u32, cached: &[u8]) {
+        if !E2_VERIFY_HITS.load(Ordering::Relaxed) {
+            return;
+        }
         let bs = state.block_size;
         let mut disk = alloc::vec![0u8; bs];
         let off = block_num as u64 * bs as u64;
@@ -1877,9 +1889,18 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
                     buf[total_read..total_read + chunk]
                         .copy_from_slice(&data[offset_in_block..offset_in_block + chunk]);
-                    let hit_snapshot = data.to_vec();
+                    // The snapshot exists only for `[E2C-BAD]` verification (off
+                    // by default — see E2_VERIFY_HITS); without it this path
+                    // allocates nothing the original did not.
+                    #[allow(unused_mut)]
+                    let mut hit_snapshot = None;
+                    if E2_VERIFY_HITS.load(Ordering::Relaxed) {
+                        hit_snapshot = Some(data.to_vec());
+                    }
                     drop(cache);
-                    self.verify_cached_block(&state, run_start_phys, &hit_snapshot);
+                    if let Some(snap) = &hit_snapshot {
+                        self.verify_cached_block(&state, run_start_phys, snap);
+                    }
                     #[cfg(any(ext2_fs_cache, test))]
                     CACHE_HITS.fetch_add(1, Ordering::Relaxed);
                     pos += chunk;
