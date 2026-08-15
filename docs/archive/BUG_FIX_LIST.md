@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 573
-- **Docs contributing at least one fix:** 173
+- **Total distinct fixes counted:** 583
+- **Docs contributing at least one fix:** 179
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 116 | 20.2% | 15 |
-| Memory & Virtual Memory | 89 | 15.5% | 25 |
-| Scheduler & Process Management | 74 | 12.9% | 17 |
-| SMP & Locking | 73 | 12.7% | 29 |
-| Networking | 31 | 5.4% | 13 |
-| Userspace Apps & Libraries | 34 | 5.9% | 18 |
-| Rump Kernel & Syscall Proxy | 24 | 4.2% | 5 |
-| Toolchain & Self-Hosting | 37 | 6.5% | 5 |
-| SSH | 14 | 2.4% | 12 |
-| VFS & Filesystem | 13 | 2.3% | 9 |
-| Boot & Drivers | 9 | 1.6% | 5 |
+| Syscall / ABI Compatibility Audits | 116 | 19.9% | 15 |
+| Memory & Virtual Memory | 92 | 15.8% | 26 |
+| Scheduler & Process Management | 75 | 12.9% | 18 |
+| SMP & Locking | 73 | 12.5% | 29 |
+| Networking | 31 | 5.3% | 13 |
+| Userspace Apps & Libraries | 34 | 5.8% | 18 |
+| Rump Kernel & Syscall Proxy | 25 | 4.3% | 6 |
+| Toolchain & Self-Hosting | 37 | 6.3% | 5 |
+| SSH | 15 | 2.6% | 13 |
+| VFS & Filesystem | 15 | 2.6% | 10 |
+| Boot & Drivers | 11 | 1.9% | 6 |
 | Signals & Exceptions | 12 | 2.1% | 5 |
 | Misc / Cross-cutting | 14 | 2.4% | 4 |
 | Console & Terminal | 15 | 2.6% | 7 |
 | Containers | 18 | 3.1% | 4 |
-| **Total** | **573** | **100.0%** | **173** |
+| **Total** | **583** | **100.0%** | **179** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -153,7 +153,7 @@ from several subsystems under one write-up.
 - `std::thread::sleep()` panicked on every call, on every build — Akuma never implemented `clock_nanosleep` (Linux aarch64 syscall #115), which is what Rust's `std` actually calls for `sleep` on `target_os = "linux"` (not plain `nanosleep`); the resulting `ENOSYS` (38) tripped an `assert_eq!` inside `std` that only ever expected 0 or `EINTR` (4) back; fixed by implementing `sys_clock_nanosleep` with full relative/absolute (`TIMER_ABSTIME`) clock handling
 
 
-## Memory & Virtual Memory (89 fixes, 25 docs)
+## Memory & Virtual Memory (92 fixes, 26 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -294,8 +294,13 @@ from several subsystems under one write-up.
 ### docs/archive/FILE_PAGE_CACHE_MMAP_AMPLIFICATION.md
 - File-backed `mmap` demand faults allocated a fresh PMM frame per process instead of sharing, so N concurrent processes mapping the same toolchain library (e.g. 4× `rustc` mapping a 295MB `librustc_driver.so`) held N physical copies filled by N separate ext2 read sweeps, driving memory pressure → eviction → re-read in a loop that made `-j4` self-host builds scale far worse than the job count justified; fixed by `src/file_page_cache.rs` deduplicating on `(inode, file_offset)`, reusing the existing CoW refcount for teardown
 
+### docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md
+- `madvise(MADV_FREE)` did not return `EINVAL`, so allocators that probe for the hint and fall back to `MADV_DONTNEED` on `EINVAL` (jemalloc, mimalloc) instead saw success and used a hint this kernel does not implement, blocking redis's memtest; fixed by returning `EINVAL` (`MADV_DONTNEED`'s own divergence — zeroing the physical frame rather than dropping the mapping, corrupting a CoW/shared peer — is unchanged and tracked via the `dontneed_unaligned`/`dontneed_shared_frame` counters)
+- `update_current_user_page_flags` (mmu page-table walk) never checked the `TABLE` bit at L1/L2, so a block descriptor's output address could be misread as a table base and walked as one; found while merging three duplicate page-table-walk implementations into one shared helper, fixed by adding the check `remap_current_user_page`'s copy always had
+- three of the four boot-TTBR0 teardown test helpers cleared only the leaf L3 PTE and then freed the page-table frames anyway, leaving the boot L1 pointing at a freed L2 that could be recycled as a new address space's L1 and cause spurious translation faults in later tests; fixed via one `clear_boot_ttbr0_pte` helper (with an explicit `PtClear` depth argument, since one caller genuinely needs leaf-only clearing) used by all four
 
-## Scheduler & Process Management (74 fixes, 17 docs)
+
+## Scheduler & Process Management (75 fixes, 18 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -405,6 +410,9 @@ from several subsystems under one write-up.
 ### docs/archive/TRIM_FAT_COOPERATIVE_SCHEDULING.md
 - ThreadWaker tests (`test_thread_waker_marks_ready`/`_idempotent`/`_roundtrip`) fabricated WAITING/READY state on a bare FREE slot with `Context.sp=0`; removing thread 0's cooperative grace window let the scheduler actually dispatch to the phantom slot, crashing with `[SGI-S FATAL] new_sp=0x0 invalid!` — fixed by spawning a real (never-dispatched) slot instead
 - `test_thread_slot_reclaim_on_spawn` assumed its fill-and-terminate loop always ran under the 10ms reclaim cooldown, an assumption that depended on thread 0's old preemption immunity; fixed by measuring elapsed time and only asserting zero-reclaim when it's provably still inside the cooldown window
+
+### docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md
+- `write_stdin` (`process/channel.rs`) used the same drop-oldest FIFO semantics as the (already-fixed) stdout side, so stdin past `MAX_BUFFER_SIZE` (1 MiB) was silently dropped rather than backpressured; fixed by making it a short write instead — `sys_write`'s `File` arm returns `EAGAIN` on a zero-byte accept to avoid spinning, and sshd's stdin fd joined the non-blocking set with a residue queue and deferred EOF
 
 
 ## SMP & Locking (73 fixes, 29 docs)
@@ -681,7 +689,7 @@ aren't recorded anywhere else.)
 - `libakuma::fstatat` passed the raw `&str` pointer with no NUL terminator — the one path-taking wrapper of fourteen that skipped `format!("{}\0", path)` — so the kernel's `copy_from_user_str` walked past the string into adjacent memory (usually harmless, occasionally EFAULT, rarely a different file); its only caller had been pre-terminating by hand, which is now dropped
 
 
-## Rump Kernel & Syscall Proxy (24 fixes, 5 docs)
+## Rump Kernel & Syscall Proxy (25 fixes, 6 docs)
 
 ### docs/archive/OPTIONAL_SMOLTCP.md
 - `sendmsg` UnixSocket passthrough missing for rump box 0's own channel I/O
@@ -716,6 +724,9 @@ aren't recorded anywhere else.)
 
 ### docs/archive/ARCHITECTURE_QUESTIONS.md
 - `ifcreate` hang — `rumpuser_clock_sleep` didn't release the rump CPU around its sleep
+
+### docs/archive/RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md
+- On the rump devbox, every ssh session reset at kex (`kex_exchange_identification: Connection reset by peer`): `RumpSocket` was the one fd family `clone_deep_for_fork` did not refcount, so a forked sshd session's parent `drop(stream)` closed the socket out from under its own still-running child; fixed by refcounting `RumpSocket` the same way every other fd family already was (superseded the wrong DHCP-path diagnosis in `DEVBOX_ISSUES.md` Issue 10)
 
 
 ## Toolchain & Self-Hosting (37 fixes, 5 docs)
@@ -769,7 +780,7 @@ aren't recorded anywhere else.)
 - every path in the script is relative to `userspace/` while the documented invocation is `userspace/build.sh` from the repo root, where the first `cargo build -p libakuma` resolved against the kernel workspace and failed; fixed by anchoring with `cd "$(dirname "$0")"`, which also fixes toolchain/target resolution for the out-of-workspace members
 
 
-## SSH (14 fixes, 12 docs)
+## SSH (15 fixes, 13 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - Every SSH session ran as one future inside a single `sshd` process, so `panic = "abort"` — which is process-wide, not future- or thread-scoped — meant *any* panic on *any* connection dropped every other live session with it. `PROTOCOL_UNDER_LOAD.md` fixed the one known trigger (a malformed pre-KEX packet) while explicitly noting the blast radius itself remained; this closes that. Each accepted connection is now served by its own `fork()`ed child, which inherits the socket through the fd-table copy (`FdTable::clone_deep_for_fork` → `socket_clone_ref`, refcounted on close by `remove_socket` — machinery that already existed and was already correct for this case). Zero kernel changes were needed: `docs/MISSING_SOCKET_MACHINERY.md` had concluded the handoff was unbuildable, having surveyed `sys_spawn`, `SCM_RIGHTS` and procfs but not `fork()`, where the fd is never handed over at all. Verified by SIGKILLing one live session under load — exactly one peer ended, three ran to completion, the server kept serving. Bounded by a new `max_sessions` (default 24) against the global `MAX_PROCESSES = 64`, since a fully-occupied session now costs two process slots. On by default (`fork-sessions`); `SSHD_FORK_SESSIONS=0` reverts to the cooperative executor for memory-constrained images
@@ -809,9 +820,12 @@ aren't recorded anywhere else.)
 ### userspace/sshd/docs/PROTOCOL_UNDER_LOAD.md
 - Unauthenticated remote crash: `process_unencrypted_packet`/`process_encrypted_packet` computed `packet_len - padding_len - 1` from client-controlled bytes with no check that `padding_len < packet_len`; a single malformed pre-KEX packet (no auth, no valid crypto needed for the unencrypted path) underflowed the subtraction and panicked the later slice bounds-check, and `panic = "abort"` took the whole shared `sshd` process down — dropping every other concurrently-open session with it, not just the offending connection. Verified live on `devbox-smoltcp` (SMP=4): a 10-byte crafted packet killed a bystander session alongside the attacker's, confirmed via `herd`'s exit/restart log and reproduced twice; fixed with the same `payload_len` bound the in-kernel SSH server's own encrypted-path already enforced (that server's unencrypted path, and both of userspace `sshd`'s paths, lacked it before this fix — see the doc for the in-kernel side, tracked separately as unfixed kernel work)
 
+### docs/archive/SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md
+- sshd advertised a 1 MiB inbound SSH channel window at channel-open and never sent `SSH_MSG_CHANNEL_WINDOW_ADJUST`, so no session could ever carry more than 1 MiB of stdin — a transfer at exactly that size hung with no error until the client's own timeout fired; the same `0x100000` number as `MAX_BUFFER_SIZE` had coincidentally been hiding a second, independent stdin-overflow bug (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` Phase 0 item 5); fixed by sending the window adjustment (verified with 4 MiB through `cat` and 8 MiB through `sha256sum`, both byte-exact)
+
 ---
 
-## VFS & Filesystem (13 fixes, 9 docs)
+## VFS & Filesystem (15 fixes, 10 docs)
 
 ### docs/archive/STAT_AND_UNLINKAT_FIX.md
 - Root cause 1: `stat()` returned `st_ino=0` for every file
@@ -844,8 +858,12 @@ aren't recorded anywhere else.)
 - The large ext2 block cache (`fs-cache`) was opt-in and no shipping build (including `release`/devbox) ever opted in, leaving a pathological 256KB/64-slot FIFO ring against a 1MB readahead; fixed by adding it to `default` features (2.7× faster `hello_std`, RAM floor for the `rustc` workload dropped from >2GB to 1GB)
 - `ClockBlockCache`'s backing store was one contiguous `Vec<u8>` that geometrically doubled to a single 512MB realloc, ballooning the kernel heap to 1152MB and destabilizing sshd; fixed via chunked `Vec<Vec<u8>>` backing plus a lower cap formula (25%→12.5% RAM, 512MB→128MB max)
 
+### docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md
+- ext2 thread hooks were read/written through a bare `static mut` with no synchronization — a genuine data race between the hook-registering thread and readers retrying a lock acquisition; fixed by reusing `akuma-exec`'s existing lock-free `OnceCopy<T>` cell (release store at `init_thread_hooks`, acquire load at each read) rather than inventing a second mechanism
+- `test_openat`'s pre-test clean-slate step and its post-test teardown tracked different file lists — the symlink case's `link.txt`/`target.txt` were only in teardown's list, so a crashed run's leftover symlink inputs survived into the next boot's clean-slate step; fixed by one shared `LEFTOVERS` list used by both
 
-## Boot & Drivers (9 fixes, 5 docs)
+
+## Boot & Drivers (11 fixes, 6 docs)
 
 ### docs/archive/QEMU_HVF_ISV_BUG.md
 - Root cause 1: GICv2 MMIO programming model (`isv` assertion)
@@ -865,6 +883,10 @@ aren't recorded anywhere else.)
 
 ### docs/archive/DYNAMIC_DTB.md
 - RAM under-detected at large `MEMORY` sizes (DTB placement/overlap)
+
+### docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md
+- `rng.rs`: `copy_len` was clamped to the caller's requested remaining length rather than `to_read` (the actual descriptor-completion length), and a `copy_len == 0` completion spun the outer loop forever since `bytes_read` never advanced; fixed by clamping to `to_read` and rejecting zero-length completions
+- `rng.rs`: `VirtqAvail`/`VirtqUsed`'s `idx`/`flags`/`*_event` fields were read/written as plain `u16`s with no synchronization between producer and consumer; fixed by making them `AtomicU16` with a release store on publish and an acquire load on completion (the pre-notify `fence(SeqCst)` kept, since it orders against a Device-memory MMIO store the atomics don't cover)
 
 
 ## Signals & Exceptions (12 fixes, 5 docs)
