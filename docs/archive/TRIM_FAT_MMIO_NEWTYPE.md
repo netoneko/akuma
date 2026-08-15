@@ -171,6 +171,12 @@ once-per-access-site, one of them formerly inside a loop). That is a −15, not 
 −25/−35. The *shape* win is the real one and it did land: 34 vouching-at-access
 sites became 5 vouching-at-construction sites.
 
+Tree-wide the net is smaller still, and the honest number to quote: `MmioReg`
+pays 2 `unsafe` blocks of its own (`read`, `write`) plus 2 in its unit tests, so
+**43 → 32 blocks, −11 net** (−13 excluding tests). A newtype that concentrates
+`unsafe` does not delete it — it moves it somewhere a reviewer can check once,
+and the ledger should say so.
+
 **Deviation 1 — `gic.rs` and `console.rs` were left alone.** Both take a
 *runtime* base (`self.dist_base`, `self.base`) and both already concentrate
 every access into three or four one-line accessors. Converting them means
