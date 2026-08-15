@@ -45,6 +45,7 @@ pub mod console;
 pub mod errno;
 pub mod inode_pin;
 pub mod irq;
+pub mod mmio;
 pub mod once;
 pub mod preempt;
 pub mod toggled_guard;

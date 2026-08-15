@@ -97,6 +97,84 @@ CLIPPY_CONFIGS = [
 # used to truncate at the first page that faulted, silently — a `break` in the copy
 # loop is indistinguishable from completion at the call site. Also calibrated ALL
 # PASS on real Linux arm64, so a FAIL is the kernel.
+
+def digests_agree(out):
+    """`mmapsum` verdict: the four whole-file digests must be one value.
+
+    `mmapsum <path>` prints six FNV-1a digests of the same file — `read:` (the
+    known-good VFS path), `mmap1:`/`mmap2:` (one mapping, hashed twice),
+    `madv:` (a MADV_WILLNEED pre-faulted mapping) and `mtA:`/`mtB:`. It prints
+    no PASS line of its own, which is why this is a predicate and not a
+    substring.
+
+    Only the first four are compared, and that is deliberate: `mtA`/`mtB` hash
+    ONE HALF of the file each, so they differ from the whole-file digest and
+    from each other BY DESIGN (measured: mtA=4c20e7d2a619dc11,
+    mtB=bc613dc1fc901ae3 against read=f73e24dbf056857f on /bin/busybox). A
+    check that demanded all six agree would fail on a perfectly healthy kernel.
+    Their value is cross-run stability, which a single run cannot judge.
+
+    `madv:` is the one that matters most: on 2026-07-25 MADV_WILLNEED installed
+    ZEROED frames over file-backed lazy pages, so this digest — and only this
+    digest — diverged, which is what "llama.cpp produces garbage with mmap"
+    looked like from the outside.
+    """
+    digests = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].rstrip(":") in ("read", "mmap1", "mmap2", "madv"):
+            digests[parts[0].rstrip(":")] = parts[1]
+    # All four must be present AND equal. Requiring presence matters: a probe
+    # that died after printing two lines would otherwise "agree" with itself.
+    return len(digests) == 4 and len(set(digests.values())) == 1
+
+
+# ---------------------------------------------------------------------------
+# The second group was added 2026-08-15. Until then every exercise here was a
+# fork / CoW / ELF-load probe, so whole families of `c_stress` binaries already
+# sitting on `disk.img` — mprotect semantics, FP/NEON state across faults,
+# file-backed mmap content, signal delivery, the allocator — were never run by
+# the gate at all. Each entry below was run on a booted VM before being added,
+# and its `healthy` string copied from that binary's ACTUAL output rather than
+# guessed from its source. Selection rules, learned the hard way in that pass:
+#
+#   * It must terminate on its own, quickly. `spawnalias` (>155 s even at 300
+#     rounds), `tidflags` and `clonearg` (both still printing nothing but their
+#     banner after 4-5 minutes) are omitted for that reason, not because they
+#     are uninteresting — a probe that never exits is 420 s of TIMEOUT per SMP
+#     level. `termtest` is omitted because it blocks on terminal input.
+#   * Its verdict must be a distinctive substring. `fpfault` / `neonfault` print
+#     a `done, N/M` ratio, so the marker includes the `0/` — matching only
+#     "done," would call a corrupting kernel healthy.
+#   * A binary missing from `disk.img` reports UNEXPECTED with a `.tail` of
+#     "sh: <name>: not found", which is how `futextest` (built in-tree, never
+#     staged) presents. That is a legible result, not a false alarm.
+#
+# What each of the new ones guards:
+#
+#   `mprotectlb`    — mprotect downgrade/upgrade, PROT_NONE reads, PROT_READ
+#                     writes, and a guard page's blast radius. Self-calibrating:
+#                     it counts its own divergences FROM LINUX and prints the
+#                     total, so the marker is the count, not a PASS.
+#   `eager_mprotect_probe` — **KNOWN FAIL, see KNOWN_FAIL_EXERCISES below.**
+#   `pthread_kill_eintr`   — a signal interrupting a blocked `read()`: EINTR
+#                     without SA_RESTART, transparent restart with it. Prints a
+#                     PHASE2 INFO line about deferred handler delivery that is a
+#                     documented divergence, NOT a failure — do not "fix" the
+#                     marker to match it.
+#   `fpfault`       — all 32 Q registers canaried across every demand-paging
+#                     fault. The llama.cpp "garbage with mmap" hypothesis probe.
+#   `neonfault`     — NEON loads that straddle a page boundary into a not-yet
+#                     -faulted page (the quantized-GEMM access shape).
+#   `mmapsum`       — file content read four ways. See `digests_agree`.
+#   `mmap_file`     — demand-paging a file-backed mapping end to end.
+#   `allocstress`   — 2M allocations; the only exercise that leans on the heap
+#                     rather than the fault path.
+#   `stackstress`   — 100 rounds of deep recursion against the exception stack.
+#
+# `/bin/busybox` is the file argument for all three mmap probes: it is ~1.1 MB
+# (272 faults, enough to be a real demand-paging workload), and it is the one
+# file guaranteed present on any disk that can run this suite at all.
 EXERCISES = [
     ("madvshared", "madvshared", "madvshared: ALL PASS"),
     ("mremapmove", "mremapmove", "mremapmove: ALL PASS"),
@@ -105,7 +183,30 @@ EXERCISES = [
     ("bssfork_spread1", "bssfork 20 8 1", "bssfork PASS"),
     ("forkprobe", "forkprobe", "forkprobe: ALL PASS"),
     ("elftest", "elftest", "elftest: ALL tests PASSED"),
+    # --- added 2026-08-15 (all measured at 3-10 s each on SMP=1) ---
+    ("mprotectlb", "mprotectlb", "0 divergence(s) from Linux"),
+    ("eager_mprotect", "eager_mprotect_probe", "RESULT: PASS"),
+    ("pthread_kill_eintr", "pthread_kill_eintr", "RESULT: PASS"),
+    ("fpfault", "fpfault /bin/busybox", "fpfault: done, 0/"),
+    ("neonfault", "neonfault /bin/busybox", "neonfault: done, 0/"),
+    ("mmapsum", "mmapsum /bin/busybox", digests_agree),
+    ("mmap_file", "mmap_file /bin/busybox", "touched all pages"),
+    ("allocstress", "allocstress", "allocations without failure!"),
+    ("stackstress", "stackstress", "stackstress: PASSED"),
 ]
+
+# Exercises that FAIL on an unmodified tree today. Reported as `KNOWN-FAIL` so a
+# real regression elsewhere still reads as `UNEXPECTED`, and so a run where one
+# starts passing says so loudly instead of looking identical to every other run.
+#
+# `eager_mprotect_probe`: both phases report "write succeeded, no SIGSEGV —
+# mprotect was defeated" (measured 2026-08-15 on 24f7e1c1). The probe exists
+# precisely to catch the `[EAGER-UPGRADE]` fault-handler repair firing on a
+# region `mprotect` had downgraded, which is what it is now reporting — see its
+# header comment and J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §3,
+# §6a. It is deterministic and takes 4 s, which is exactly why it is worth
+# carrying: the day it flips to `ok` is a result.
+KNOWN_FAIL_EXERCISES = {"eager_mprotect"}
 
 # Known-flaky, threshold-driven: fails on an unmodified tree, and passes on one
 # too. Compared separately so the failure SET stays meaningful.
@@ -363,14 +464,27 @@ def exercise_suite(port, smp, results):
 
     Polling reads the output file and looks for a sentinel the shell appends after
     the binary exits. Do NOT poll with `pgrep <name>`: the ssh command line
-    contains the name, so pgrep matches itself and the job looks eternal."""
+    contains the name, so pgrep matches itself and the job looks eternal.
+
+    The redirect is `rm -f` + `>>` (append), NOT `>`, and that is a kernel bug
+    workaround rather than a style choice. In `{ probe; echo SENTINEL; } > file`
+    the two child processes inherit ONE fd and must share ONE file offset; Akuma
+    gives each its own, so `echo` writes its 12 bytes at offset 0 and destroys
+    the first 12 bytes of the probe's output. Measured 2026-08-15:
+    `{ /bin/echo AAAA…(24); /bin/echo BBB; } > f` yields `BBB\\nAAAA…`, while the
+    same line with `>>` yields the correct `AAAA…\\nBBB`. It went unnoticed for as
+    long as it did because every marker in the original EXERCISES list sits at the
+    END of the output; `mmapsum`'s `read:` digest is on line 1 and would have been
+    silently truncated to nonsense. O_APPEND writes always go to EOF, which is why
+    `>>` sidesteps the shared-offset path entirely."""
     for name, cmd, healthy in EXERCISES:
         key = f"smp{smp}.ex.{name}"
         out_path = f"/tmp/verify_ex_{name}.log"
         try:
             # `{ cmd; echo SENTINEL; }` — the sentinel lands after the binary exits
             # whatever its exit status, so polling terminates on failure too.
-            ssh(port, f"nohup sh -c '{{ {cmd}; echo __EX_DONE__; }} > {out_path} 2>&1' "
+            ssh(port, f"rm -f {out_path}; "
+                      f"nohup sh -c '{{ {cmd}; echo __EX_DONE__; }} >> {out_path} 2>&1' "
                       f"> /dev/null 2>&1 &")
             deadline = time.time() + 420
             out = ""
@@ -382,8 +496,21 @@ def exercise_suite(port, smp, results):
             if "__EX_DONE__" not in out:
                 results[key] = "TIMEOUT (still running after 420s)"
                 continue
-            results[key] = "ok" if healthy in out else "UNEXPECTED"
-            if healthy not in out:
+            # `healthy` is a substring for most probes and a predicate for the
+            # ones whose verdict is a relation between output lines rather than a
+            # line of its own (`mmapsum`).
+            ok = healthy(out) if callable(healthy) else healthy in out
+            if name in KNOWN_FAIL_EXERCISES:
+                # Never just "UNEXPECTED": that word has to keep meaning
+                # "regression". And never silently swallowed either — a
+                # known-fail that starts passing is the whole reason to run it.
+                results[key] = ("ok (KNOWN-FAIL now passes — drop it from "
+                                "KNOWN_FAIL_EXERCISES)" if ok else "KNOWN-FAIL (expected)")
+            else:
+                results[key] = "ok" if ok else "UNEXPECTED"
+            if not ok:
+                # Kept for known-fails too: the tail is how you see that a
+                # known failure still fails the SAME way.
                 lines = [l for l in out.splitlines() if l.strip() and "__EX_DONE__" not in l]
                 results[key + ".tail"] = (lines[-1] if lines else "(no output)")[:110]
         except subprocess.TimeoutExpired:

@@ -10,8 +10,9 @@
 //! path was removed when QEMU's force-legacy flag was dropped. A non-v2 device
 //! panics at init. See docs/VIRTIO_MMIO_LEGACY_TO_MODERN.md.
 
-use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU16, Ordering, fence};
+
+use akuma_primitives::mmio::MmioReg;
 
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use spinning_top::Spinlock;
@@ -45,6 +46,25 @@ const VIRTIO_MMIO_QUEUE_DRIVER_LOW: usize = 0x090; // avail ring
 const VIRTIO_MMIO_QUEUE_DRIVER_HIGH: usize = 0x094;
 const VIRTIO_MMIO_QUEUE_DEVICE_LOW: usize = 0x0a0; // used ring
 const VIRTIO_MMIO_QUEUE_DEVICE_HIGH: usize = 0x0a4;
+
+/// Name one of the slot's u32 transport registers.
+///
+/// Every virtio-mmio register this driver touches is a u32 at a fixed offset
+/// from the slot base, so this one helper replaces what used to be 30 separate
+/// `unsafe { read_volatile((base + OFFSET) as *const u32) }` sites — `unsafe`
+/// now marks *which addresses are device registers* rather than each access.
+///
+/// Private on purpose: the safety argument below depends on every caller
+/// passing a base from [`probe::scan`] and an offset from the `VIRTIO_MMIO_*`
+/// constants above.
+fn reg(base: usize, offset: usize) -> MmioReg<u32> {
+    // SAFETY: `base` is a virtio-mmio slot base returned by `probe::scan`, i.e.
+    // one of the eight fixed slots inside the device mapping the kernel
+    // establishes before any driver init runs; `offset` is one of the
+    // `VIRTIO_MMIO_*` constants, all naturally-aligned u32 registers within that
+    // slot's 0x200-byte window.
+    unsafe { MmioReg::new(base + offset) }
+}
 
 // VirtIO status bits
 const VIRTIO_STATUS_ACKNOWLEDGE: u32 = 1;
@@ -217,7 +237,7 @@ impl VirtioRngDevice {
     /// Create and initialize a new VirtIO RNG device (modern / version 2 transport)
     fn new(base_addr: usize) -> Result<Self, RngError> {
         // Verify magic value
-        let magic = unsafe { read_volatile((base_addr + VIRTIO_MMIO_MAGIC_VALUE) as *const u32) };
+        let magic = reg(base_addr, VIRTIO_MMIO_MAGIC_VALUE).read();
         if magic != 0x74726976 {
             // "virt" in little-endian
             return Err(RngError::TransportError);
@@ -228,93 +248,71 @@ impl VirtioRngDevice {
         // a misconfigured runner (force-legacy re-added) and there is no fallback,
         // so fail loud and early rather than limping into a later networking panic
         // ("RNG required for networking"). See docs/VIRTIO_MMIO_LEGACY_TO_MODERN.md.
-        let version = unsafe { read_volatile((base_addr + VIRTIO_MMIO_VERSION) as *const u32) };
-        assert!(version == 2, 
+        let version = reg(base_addr, VIRTIO_MMIO_VERSION).read();
+        assert!(version == 2,
             "[RNG] virtio-rng MMIO version {version} unsupported; modern v2 required \
              (is virtio-mmio.force-legacy set in the QEMU runner?)"
         );
 
+        let status_reg = reg(base_addr, VIRTIO_MMIO_STATUS);
+
         // Reset the device
-        unsafe {
-            write_volatile((base_addr + VIRTIO_MMIO_STATUS) as *mut u32, 0);
-        }
+        status_reg.write(0);
         fence(Ordering::SeqCst);
 
         // Set ACKNOWLEDGE status bit
-        unsafe {
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_STATUS) as *mut u32,
-                VIRTIO_STATUS_ACKNOWLEDGE,
-            );
-        }
+        status_reg.write(VIRTIO_STATUS_ACKNOWLEDGE);
         fence(Ordering::SeqCst);
 
         // Set DRIVER status bit
-        unsafe {
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_STATUS) as *mut u32,
-                VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
-            );
-        }
+        status_reg.write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
         fence(Ordering::SeqCst);
 
         // Feature negotiation. The RNG device needs no feature bits of its own,
         // but a modern device requires VIRTIO_F_VERSION_1 (bit 32) plus a
         // FEATURES_OK handshake.
+        let device_features_sel = reg(base_addr, VIRTIO_MMIO_DEVICE_FEATURES_SEL);
+        let device_features = reg(base_addr, VIRTIO_MMIO_DEVICE_FEATURES);
+        let driver_features_sel = reg(base_addr, VIRTIO_MMIO_DRIVER_FEATURES_SEL);
+        let driver_features = reg(base_addr, VIRTIO_MMIO_DRIVER_FEATURES);
+
         // Feature word 0: acknowledge nothing.
-        unsafe {
-            write_volatile((base_addr + VIRTIO_MMIO_DEVICE_FEATURES_SEL) as *mut u32, 0);
-            fence(Ordering::SeqCst);
-            let _ = read_volatile((base_addr + VIRTIO_MMIO_DEVICE_FEATURES) as *const u32);
-            write_volatile((base_addr + VIRTIO_MMIO_DRIVER_FEATURES_SEL) as *mut u32, 0);
-            write_volatile((base_addr + VIRTIO_MMIO_DRIVER_FEATURES) as *mut u32, 0);
-        }
+        device_features_sel.write(0);
+        fence(Ordering::SeqCst);
+        // The discarded read is a protocol step, not dead code: the device
+        // expects the selected feature word to be read before it is answered.
+        let _ = device_features.read();
+        driver_features_sel.write(0);
+        driver_features.write(0);
         fence(Ordering::SeqCst);
         // Feature word 1: acknowledge VIRTIO_F_VERSION_1.
-        unsafe {
-            write_volatile((base_addr + VIRTIO_MMIO_DEVICE_FEATURES_SEL) as *mut u32, 1);
-            fence(Ordering::SeqCst);
-            let _ = read_volatile((base_addr + VIRTIO_MMIO_DEVICE_FEATURES) as *const u32);
-            write_volatile((base_addr + VIRTIO_MMIO_DRIVER_FEATURES_SEL) as *mut u32, 1);
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_DRIVER_FEATURES) as *mut u32,
-                VIRTIO_F_VERSION_1_WORD1,
-            );
-        }
+        device_features_sel.write(1);
+        fence(Ordering::SeqCst);
+        let _ = device_features.read();
+        driver_features_sel.write(1);
+        driver_features.write(VIRTIO_F_VERSION_1_WORD1);
         fence(Ordering::SeqCst);
         // Latch FEATURES_OK and confirm the device kept it.
-        unsafe {
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_STATUS) as *mut u32,
-                VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK,
-            );
-        }
+        status_reg
+            .write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
         fence(Ordering::SeqCst);
-        let s = unsafe { read_volatile((base_addr + VIRTIO_MMIO_STATUS) as *const u32) };
+        let s = status_reg.read();
         if s & VIRTIO_STATUS_FEATURES_OK == 0 {
             return Err(RngError::TransportError);
         }
 
         // Set up virtqueue 0
-        unsafe {
-            write_volatile((base_addr + VIRTIO_MMIO_QUEUE_SEL) as *mut u32, 0);
-        }
+        reg(base_addr, VIRTIO_MMIO_QUEUE_SEL).write(0);
         fence(Ordering::SeqCst);
 
         // Check queue size
-        let max_size =
-            unsafe { read_volatile((base_addr + VIRTIO_MMIO_QUEUE_NUM_MAX) as *const u32) };
+        let max_size = reg(base_addr, VIRTIO_MMIO_QUEUE_NUM_MAX).read();
         if max_size == 0 || (max_size as usize) < QUEUE_SIZE {
             return Err(RngError::TransportError);
         }
 
         // Set queue size
-        unsafe {
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_QUEUE_NUM) as *mut u32,
-                QUEUE_SIZE as u32,
-            );
-        }
+        reg(base_addr, VIRTIO_MMIO_QUEUE_NUM).write(QUEUE_SIZE as u32);
         fence(Ordering::SeqCst);
 
         // Calculate queue layout. The single page-aligned region places desc at
@@ -348,34 +346,14 @@ impl VirtioRngDevice {
         let desc_phys = akuma_primitives::addr::virt_to_phys(desc as usize) as u64;
         let avail_phys = akuma_primitives::addr::virt_to_phys(avail as usize) as u64;
         let used_phys = akuma_primitives::addr::virt_to_phys(used as usize) as u64;
-        unsafe {
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_QUEUE_DESC_LOW) as *mut u32,
-                desc_phys as u32,
-            );
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_QUEUE_DESC_HIGH) as *mut u32,
-                (desc_phys >> 32) as u32,
-            );
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_QUEUE_DRIVER_LOW) as *mut u32,
-                avail_phys as u32,
-            );
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_QUEUE_DRIVER_HIGH) as *mut u32,
-                (avail_phys >> 32) as u32,
-            );
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_QUEUE_DEVICE_LOW) as *mut u32,
-                used_phys as u32,
-            );
-            write_volatile(
-                (base_addr + VIRTIO_MMIO_QUEUE_DEVICE_HIGH) as *mut u32,
-                (used_phys >> 32) as u32,
-            );
-            fence(Ordering::SeqCst);
-            write_volatile((base_addr + VIRTIO_MMIO_QUEUE_READY) as *mut u32, 1);
-        }
+        reg(base_addr, VIRTIO_MMIO_QUEUE_DESC_LOW).write(desc_phys as u32);
+        reg(base_addr, VIRTIO_MMIO_QUEUE_DESC_HIGH).write((desc_phys >> 32) as u32);
+        reg(base_addr, VIRTIO_MMIO_QUEUE_DRIVER_LOW).write(avail_phys as u32);
+        reg(base_addr, VIRTIO_MMIO_QUEUE_DRIVER_HIGH).write((avail_phys >> 32) as u32);
+        reg(base_addr, VIRTIO_MMIO_QUEUE_DEVICE_LOW).write(used_phys as u32);
+        reg(base_addr, VIRTIO_MMIO_QUEUE_DEVICE_HIGH).write((used_phys >> 32) as u32);
+        fence(Ordering::SeqCst);
+        reg(base_addr, VIRTIO_MMIO_QUEUE_READY).write(1);
         fence(Ordering::SeqCst);
 
         // Set DRIVER_OK to finish initialization
@@ -383,13 +361,11 @@ impl VirtioRngDevice {
             | VIRTIO_STATUS_DRIVER
             | VIRTIO_STATUS_FEATURES_OK
             | VIRTIO_STATUS_DRIVER_OK;
-        unsafe {
-            write_volatile((base_addr + VIRTIO_MMIO_STATUS) as *mut u32, final_status);
-        }
+        status_reg.write(final_status);
         fence(Ordering::SeqCst);
 
         // Verify device accepted our configuration
-        let status = unsafe { read_volatile((base_addr + VIRTIO_MMIO_STATUS) as *const u32) };
+        let status = status_reg.read();
         if status != final_status {
             unsafe { dealloc(queue_mem, queue_layout) };
             return Err(RngError::TransportError);
@@ -459,9 +435,7 @@ impl VirtioRngDevice {
             fence(Ordering::SeqCst);
 
             // Notify device
-            unsafe {
-                write_volatile((self.base_addr + VIRTIO_MMIO_QUEUE_NOTIFY) as *mut u32, 0);
-            }
+            reg(self.base_addr, VIRTIO_MMIO_QUEUE_NOTIFY).write(0);
 
             // Wait for completion with timeout
             let mut attempts = 0u32;

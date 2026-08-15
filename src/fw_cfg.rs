@@ -8,16 +8,28 @@
 //!
 //! Reference: <https://www.qemu.org/docs/master/specs/fw_cfg.html>
 
-use core::ptr::{addr_of, read_volatile, write_volatile};
+use core::ptr::{addr_of, read_volatile};
+
+use akuma_primitives::mmio::MmioReg;
 
 /// Remapped VA for fw_cfg (physical 0x0902_0000 via L0[1])
 const FW_CFG_BASE: usize = akuma_exec::mmu::DEV_FW_CFG_VA;
+
+// The three registers below are `const` rather than built at init: the device
+// window is at a fixed VA, so naming it costs nothing and adds no init-order
+// dependency. Each `unsafe` is the whole safety argument for every access to
+// that register — see `akuma_primitives::mmio`.
+//
+// SAFETY (all three): `DEV_FW_CFG_VA` is the kernel's fixed device mapping of
+// the QEMU fw_cfg MMIO window, established before any of these are touched, and
+// the offsets and widths are the ones the fw_cfg spec defines.
+
 /// Data register: read/write 1 byte at a time
-const FW_CFG_DATA: *mut u8 = FW_CFG_BASE as *mut u8;
+const FW_CFG_DATA: MmioReg<u8> = unsafe { MmioReg::new(FW_CFG_BASE) };
 /// Selector register: write a 16-bit big-endian value to select a key
-const FW_CFG_SELECTOR: *mut u16 = (FW_CFG_BASE + 0x08) as *mut u16;
+const FW_CFG_SELECTOR: MmioReg<u16> = unsafe { MmioReg::new(FW_CFG_BASE + 0x08) };
 /// DMA register: write a 64-bit big-endian physical address
-const FW_CFG_DMA: *mut u64 = (FW_CFG_BASE + 0x10) as *mut u64;
+const FW_CFG_DMA: MmioReg<u64> = unsafe { MmioReg::new(FW_CFG_BASE + 0x10) };
 
 /// Well-known selector for the file directory
 const FW_CFG_FILE_DIR: u16 = 0x0019;
@@ -37,18 +49,14 @@ struct FWCfgDmaAccess {
 
 /// Select a fw_cfg entry by its selector number.
 fn select(key: u16) {
-    unsafe {
-        // The selector register expects big-endian on MMIO
-        write_volatile(FW_CFG_SELECTOR, key.to_be());
-    }
+    // The selector register expects big-endian on MMIO
+    FW_CFG_SELECTOR.write(key.to_be());
 }
 
 /// Read `n` bytes from the currently selected entry via the data register.
 fn read_bytes(buf: &mut [u8]) {
     for byte in buf.iter_mut() {
-        unsafe {
-            *byte = read_volatile(FW_CFG_DATA);
-        }
+        *byte = FW_CFG_DATA.read();
     }
 }
 
@@ -125,12 +133,13 @@ pub unsafe fn write_entry(selector: u16, data: &[u8]) {
 
     // Write the physical address of the descriptor to the DMA register (big-endian)
     let desc_phys = addr_of!(dma) as u64;
-    unsafe {
-        write_volatile(FW_CFG_DMA, desc_phys.to_be());
-    }
+    FW_CFG_DMA.write(desc_phys.to_be());
 
     // Spin-wait until DMA completes (control field is zeroed by QEMU)
     loop {
+        // Deliberately a raw volatile read and **not** an `MmioReg`: this polls
+        // the descriptor in ordinary RAM, which QEMU writes back by DMA. It is
+        // not a device register, so it does not belong to the register newtype.
         let ctrl = unsafe { read_volatile(addr_of!(dma.control)) };
         let ctrl_host = u32::from_be(ctrl);
         if ctrl_host == 0 || ctrl_host & FW_CFG_DMA_CTL_ERROR != 0 {

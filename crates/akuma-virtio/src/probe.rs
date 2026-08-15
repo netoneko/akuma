@@ -6,6 +6,7 @@
 //! spelled the table as a `const` and missed the other two — see
 //! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.
 
+use akuma_primitives::mmio::MmioReg;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 /// Number of virtio-mmio slots the QEMU virt machine exposes.
@@ -42,7 +43,8 @@ fn device_id_at(addr: usize) -> u32 {
     // SAFETY: `addr` is one of `VIRTIO_MMIO_ADDRS`, all of which are inside the
     // device mapping the kernel establishes before any driver init runs. The
     // DeviceID register is read-only and reading it has no side effects.
-    unsafe { core::ptr::read_volatile((addr + VIRTIO_MMIO_DEVICE_ID) as *const u32) }
+    let device_id: MmioReg<u32> = unsafe { MmioReg::new(addr + VIRTIO_MMIO_DEVICE_ID) };
+    device_id.read()
 }
 
 /// Every virtio-mmio slot paired with the device id it advertises, in slot order.

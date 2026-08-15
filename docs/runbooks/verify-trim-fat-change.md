@@ -233,8 +233,32 @@ Memory / fork / CoW binaries already on `disk.img` — all self-reporting:
 | `bssfork 20 8 1` | `failures=0` … `bssfork PASS`. **Not `bssfork spread=1`** — the binary's CLI is positional (`bssfork [rounds] [threads] [spread]`), not `key=value`; running the literal string `spread=1` feeds it into `rounds`, `strtoul` parses that as `0`, and `spread` silently defaults to `0` too. `rounds=0` skips the fork loop entirely, so `g_stop` fires almost instantly and the liveness check flags threads `[never ran]` before they get scheduled at all — nothing to do with CoW or the kernel. **Corrected 2026-08-14**: the "BROKEN PRE-EXISTING" verdict recorded here on 2026-08-13 (`failures=7`/`8`, `ticks=0`, "unexplained regression") was this same mis-invocation on both `main` and the branch; the real control, invoked correctly, passed 8/8 clean runs at SMP=4 on first re-check. See `docs/archive/PMM_EXTRACT.md` §8 for the full correction |
 | `cowstale` | `reader_faults=0 failures=0` … `cowstale PASS` |
 | `madvshared` | `madvshared: ALL PASS`. `MADV_DONTNEED` on a CoW-shared frame must not touch the peer's page — the null-`Rc` mechanism (`../archive/CARGO_HEAP_NULL_RC.md`), fixed 2026-08-14. Deterministic, milliseconds, no allocator involved, and **calibrated**: the identical static binary PASSes all three phases on real Linux arm64 (`docker run --rm --platform linux/arm64 -v "$PWD:/w:ro" alpine /w/madvshared`), so a FAIL is the kernel, not the probe. Before the fix it reported `2 FAIL` at both SMP=1 and SMP=4 |
-| `mmapsum <path>` | three digests (`madv:`/`mtA:`/`mtB:`); **needs a path argument** |
+| `mmapsum <path>` | six digests; **needs a path argument**. `read:`/`mmap1:`/`mmap2:`/`madv:` must all be **the same value** — `madv:` is the regression check for the 2026-07-25 `MADV_WILLNEED`-installs-zeroed-frames bug. `mtA:`/`mtB:` hash **one half each** and are *supposed* to differ from that value and from each other; only their stability across runs means anything |
 | `forktest_parent -duration=20s` | `All children processed via epoll. Parent exiting.` |
+| `mprotectlb` | `=== MPROTECTLB DONE — 0 divergence(s) from Linux ===`. Self-calibrating: it counts its own divergences, so the healthy marker is the **count**, not a PASS |
+| `pthread_kill_eintr` | `RESULT: PASS`. Its `PHASE2 INFO` line about Akuma deferring handler delivery to syscall return is a documented divergence, **not** a failure |
+| `fpfault <path>` | `fpfault: done, 0/N faults corrupted FP state` — match the `0/`, not just `done,` |
+| `neonfault <path>` | `neonfault: done, 0/N crossing loads wrong` — likewise |
+| `mmap_file <path>` | `mmap_file: touched all pages` |
+| `allocstress` | `allocstress: reached 2,000,000 allocations without failure!` |
+| `eager_mprotect_probe` | `RESULT: PASS` — but it reports **`RESULT: FAIL` on an unmodified tree today** (both phases, "write succeeded, no SIGSEGV — mprotect was defeated", measured 2026-08-15 on `24f7e1c1` at SMP=1 and SMP=4). `verify_trim.py` carries it in `KNOWN_FAIL_EXERCISES` so it reads `KNOWN-FAIL (expected)` instead of masquerading as a regression. See `../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §3, §6a |
+
+Omitted from the automated suite **because they do not terminate**, not because
+they are uninteresting — measured 2026-08-15, all still running with nothing but
+their banner printed: `spawnalias` (>155 s even at `spawnalias 300`), `tidflags`
+(>300 s), `clonearg` (>240 s). `termtest` blocks on terminal input. Worth a look
+on their own; each is 420 s of `TIMEOUT` per SMP level inside the gate.
+
+**Capture probe output with `rm -f f; … >> f`, never `> f`.** In
+`{ probe; echo SENTINEL; } > f` the two child processes share one inherited fd
+and must share one file offset; Akuma gives each its own, so the sentinel lands
+at offset 0 and eats the first bytes of the probe's output. Measured 2026-08-15:
+`{ /bin/echo AAAAAAAAAAAAAAAAAAAAAAAA; /bin/echo BBB; } > f` produces
+`BBB\nAAAA…`; with `>>` it produces the correct `AAAA…\nBBB` (O_APPEND writes go
+to EOF, so the shared-offset path is never used). A shell **builtin** `echo` is
+unaffected — same process, same offset. This silently truncated the head of every
+Tier 3 log until `verify_trim.py` was fixed; it went unnoticed because every
+marker in the original list sits at the *end* of the output.
 
 `redis-server` is **not** on `disk.img` — do not treat its absence as a failure.
 It lives on the devbox image instead; see Tier 4.
@@ -260,8 +284,10 @@ merge (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.4's verification block, run
 2026-08-13). The polling wrapper below has not been re-run as often as Tiers 1–3.
 
 Run this tier when the change touches the PMM, the fault path, CoW, or the OOM /
-reclaim escalation. Every binary in Tier 3 is a *fork/CoW* exercise; this is the
-only one that puts sustained pressure on `alloc_page_zeroed_user` itself.
+reclaim escalation. Tier 3 is mostly *fork/CoW* and fault-path exercises — the
+closest it comes is `allocstress`, and that leans on the heap rather than on the
+page allocator — so this is still the only one that puts sustained pressure on
+`alloc_page_zeroed_user` itself.
 `--test-memory` allocates the requested MiB and runs a write/read/verify sweep
 over all of it, so it walks anonymous demand-paging, `USER_PAGE_RESERVE` and the
 reclaim escalation as one continuous workload, and it **verifies the bytes** —
