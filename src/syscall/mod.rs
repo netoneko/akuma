@@ -427,7 +427,7 @@ pub struct ThreadCpuStat {
 // from the positive ones so they cannot drift. Re-exported rather than imported
 // per-module: the submodules below reach these through `use super::*`, which is
 // how they always saw them.
-// See `akuma_primitives::errno` and TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
+// See `akuma_primitives::errno` and TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
 pub use akuma_primitives::errno::negated::*;
 pub use akuma_primitives::errno::neg_errno;
 

@@ -18,7 +18,7 @@
 
 ## 1. Why this question exists, and what it decides
 
-`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.10 wants an `#[inline]` audit across
+`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.10 wants an `#[inline]` audit across
 the crate boundary: attributes have been applied ad hoc as code moved from `src/`
 into `crates/`, nobody has swept them, and just **75 of 756 `pub fn` in `crates/`
 carry one (~10%)**.
@@ -225,7 +225,7 @@ one that inlines poorly.
 
 ## Background
 
-- [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   §5.10 (the audit this decides), Phase 8 (where it is filed)
 - [`REPR_C_SIGFRAME_STATX.md`](REPR_C_SIGFRAME_STATX.md) — the cross-crate calls used
   as the inlining probe

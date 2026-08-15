@@ -10,7 +10,7 @@
 //! | `akuma-exec/src/sync.rs:17` `irq_save_mask`/`irq_restore` | **no** |
 //!
 //! Two guards written twice, plus a barrier-less twin of the same operation.
-//! `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.5 counted the two guards and
+//! `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.5 counted the two guards and
 //! missed the third.
 //!
 //! # The `isb` divergence is preserved, not resolved

@@ -325,7 +325,7 @@ mod memfs_tests {
 }
 
 /// Tests for the merge of `MountTable` and `akuma_isolation::MountNamespace` into
-/// one `MountSet<const MAX>` (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §4).
+/// one `MountSet<const MAX>` (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §4).
 ///
 /// The two types differed only in capacity (8 vs 16) and in whether they called
 /// the trailing-slash helper or inlined it — so the things worth pinning are the

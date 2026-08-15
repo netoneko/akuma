@@ -46,7 +46,7 @@ silent-success shape is worse than a wrong-but-failing errno.
 | `ioctl(TIOCSWINSZ)` and the five sibling terminal ioctls when the process has no terminal state | `-12` (`ENOMEM`) | `ENOTTY` for an ioctl on a non-terminal | `src/syscall/term.rs` |
 
 Found by the errno merge
-([`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+([`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
 §5.7). The value is *consistent* across all six arms; what was wrong was the
 comment on one of them, which read `// ENXIO — no terminal attached` (`ENXIO` is 6,
 not 12) and had been wrong for as long as the line existed. The code now names
@@ -80,7 +80,7 @@ them — but they are divergences and a conformance test will find them.
 
 | Syscall | Divergence | Status |
 |---|---|---|
-| `madvise(MADV_FREE)` | returns `EINVAL` | **Deliberate**, 2026-08-13 — it unblocked redis. Allocators that probe it fall back to `MADV_DONTNEED`, which is the row below. `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8.5 Phase 0 item 4 |
+| `madvise(MADV_FREE)` | returns `EINVAL` | **Deliberate**, 2026-08-13 — it unblocked redis. Allocators that probe it fall back to `MADV_DONTNEED`, which is the row below. `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §8.5 Phase 0 item 4 |
 | `madvise(MADV_DONTNEED)` | zeroes the **physical frame**; Linux drops the *mapping* | **OPEN and the sharper of the two**: on a CoW-after-fork or `file_page_cache` frame this also wipes a peer's live copy. Tripwire counters `DONTNEED_SHARED_FRAME` / `DONTNEED_UNALIGNED` on the 30 s `[MADV]` PSTATS line; both read 0 as of 2026-08-13 |
 | `mremap` payload move | **FIXED 2026-08-14** — the destination was never validated or prefaulted, so a lazy page in the new mapping silently truncated the move. [`USER_COPY_FOLD.md`](USER_COPY_FOLD.md) §5. No regression test yet |
 | `write()` to a process stdin channel | short write instead of blocking | **Deliberate**, decided 2026-08-13 with the reasoning recorded (sshd's bridge must keep draining stdout to create the stdin space it would block on). §8.5 Phase 0 item 5 |
@@ -151,7 +151,7 @@ least work:
 
 - [`USER_COPY_FOLD.md`](USER_COPY_FOLD.md) — the sweep that surfaced §1, §2's
   sibling arms, §4's `mremap` fix and §5
-- [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   §5.7 (the errno table, and the drift it exposed) and §8.5 Phase 0 (the `madvise`
   and `write_stdin` decisions)
 - [`SYSCALL_ERRNO_COMPLIANCE_CHANGES.md`](SYSCALL_ERRNO_COMPLIANCE_CHANGES.md),

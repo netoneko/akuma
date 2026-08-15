@@ -27,7 +27,7 @@
 //! [`write_user_val`] and [`read_user_into`] validate, prefault and copy, take
 //! slices (so `len` cannot disagree with the buffer) and are **safe `fn`s**.
 //! `docs/archive/UNSAFE_AUDIT.md` §4 P0, and
-//! `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` Phase 5.
+//! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` Phase 5.
 //!
 //! # Prefaulting is a parameter, not a default
 //!
@@ -557,7 +557,7 @@ mod tests {
     // TTBR0, allocates frames or runs the copy asm. That is also where the bugs of
     // this shape live — an off-by-one on the limit, a missed overflow — so the
     // split is the point, not a compromise. See §6.1 of
-    // `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`.
+    // `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`.
 
     // `BYPASS_VALIDATION` is the exception to the note above: it reads no TTBR0 and
     // touches no frames, and its nesting contract is exactly what went wrong when

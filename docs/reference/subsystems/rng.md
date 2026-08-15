@@ -105,5 +105,5 @@ into `getrandom` output.
 - [`../../archive/UNSAFE_AUDIT.md`](../../archive/UNSAFE_AUDIT.md) §4 P2(e) —
   the analysis of this virtqueue's two defects. Both fixed; the section is kept
   for the reasoning and carries a status header.
-- [`../../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](../../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`../../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](../../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   §6.2 — why this crate had zero tests and what closing that turned up.

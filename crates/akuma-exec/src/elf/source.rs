@@ -20,7 +20,7 @@
 //! The two parsers were verified equivalent over 2,387 binaries (0
 //! disagreements, 0 panics on 280 hostile header mutations) before the
 //! hand-rolled one was deleted — see
-//! `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §3.
+//! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §3.
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;

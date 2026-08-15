@@ -2056,7 +2056,7 @@ pub fn ap_name(pte: u64) -> &'static str {
 /// functions and [`demote_range_to_ro`] — differing only in the body of the innermost
 /// loop. Since one of the three *writes* PTEs in the fork/CoW path, three copies of
 /// the index arithmetic was the highest-consequence duplication left in this file
-/// (`docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 8, §5.6).
+/// (`docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 8, §5.6).
 ///
 /// # Safety
 /// `l0_ptr` must be a valid L0 table for a live address space, and the tables it

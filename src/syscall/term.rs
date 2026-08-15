@@ -117,7 +117,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 // comment here read `ENXIO` and never matched the number. Linux
                 // returns ENOTTY for an ioctl on something that is not a
                 // terminal; changing it is a behaviour change, so it is recorded
-                // in TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7 and not made
+                // in TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.7 and not made
                 // here. The other five "no terminal state" arms below return the
                 // same value.
                 None => return ENOMEM,

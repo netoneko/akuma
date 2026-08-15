@@ -15,7 +15,7 @@
 //! 17 names were defined twice, in two representations, bridged by a
 //! `neg_errno()` in the bin crate that only some of the call sites used.
 //!
-//! See `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.7.
+//! See `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.7.
 //!
 //! # Why this is a duplication finding and not a style preference
 //!

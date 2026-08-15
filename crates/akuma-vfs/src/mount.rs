@@ -8,7 +8,7 @@
 //! capacity constant and in whether they called [`normalize_mount_path`] or
 //! inlined it (the namespace inlined the same two lines three times).
 //!
-//! `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §4 flagged this as the cross-crate
+//! `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §4 flagged this as the cross-crate
 //! clone that "should worry you most", because `akuma-vfs` is the leaf
 //! `akuma-isolation` depends on: the shared half belonged here and nothing was
 //! stopping it.

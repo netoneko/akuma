@@ -4,7 +4,7 @@
 //! `src/audio.rs` and `akuma-net`'s `smoltcp_net.rs`, plus a fifth copy of the
 //! address table written inline in `src/main.rs`. CPD caught the three that
 //! spelled the table as a `const` and missed the other two — see
-//! `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.
+//! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.
 
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 

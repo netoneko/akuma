@@ -7,7 +7,7 @@
 //! `mount`/`unmount`/`resolve`/`resolve_arc`/`list_mounts`/`child_mount_points`
 //! byte-identical apart from the capacity constant, plus the same
 //! trailing-slash trim inlined three times where `MountTable` called a helper.
-//! `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §4 flagged it as the cross-crate
+//! `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §4 flagged it as the cross-crate
 //! clone most likely to drift silently, and `akuma-vfs` is the crate this one
 //! already depends on — so the shared half moved there and this is an alias.
 //!

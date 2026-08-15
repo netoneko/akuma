@@ -43,7 +43,7 @@ and the dependency becomes ordinary, the 13 pointers disappear, and three of the
 (`alloc_page_zeroed`, `track_frame`, `cow_ref_inc`) are on the **fault path**.
 
 This is the same argument Phase 3 of
-[`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+[`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
 already used once, when it deleted the `NetHal` runtime indirection because it
 "cost a spinlocked struct read on the per-packet DMA path to reach two identity
 functions." Same shape, larger scale, and this time the indirection also blocks
@@ -186,7 +186,7 @@ cannot occur before userspace exists.
 
 ## 5. This corrects `memmath`'s membership
 
-[`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+[`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
 §5.11 moved the quarantine poison codec (`POISON_MAGIC`, `poison_word`,
 `poison_decode`, `poison_word_frame`) and the user-page reserve
 (`USER_PAGE_RESERVE`, `user_alloc_would_starve`, `user_readahead_budget`) into
@@ -505,7 +505,7 @@ SMP=4, the extraction did not buy what it was supposed to buy.
   `cow_fault_lock`, and §8.1's scoped merge that must land first
 - [`HOST_TESTS_AUDIT.md`](HOST_TESTS_AUDIT.md) — the 553 boot tests and why the
   arena is the bottleneck
-- [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   §5.11 (the `memmath` move this revises), §5.10 (`lto`/inlining), §6.1 (the
   injection principle and the hook-degradation line)
 - [`../reference/subsystems/memory.md`](../reference/subsystems/memory.md) —

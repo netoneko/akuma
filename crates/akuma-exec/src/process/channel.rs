@@ -50,7 +50,7 @@ const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 // `buffer` (stdout) and `stdin_buffer` (stdin) are two independent spinlocks on
 // one `ProcessChannel`, and the two directions grew as copies of each other —
 // which is how `write_bounded`'s short-write fix reached only the stdout half
-// (`docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §6). These helpers
+// (`docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §6). These helpers
 // are the single body for both directions, so the next fix lands once.
 //
 // Each takes exactly **one** `&Spinlock<VecDeque<u8>>`, so the shape that nests
@@ -363,7 +363,7 @@ impl ProcessChannel {
     /// (`userspace/sshd/docs/EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md`) landed
     /// `write_bounded` on the stdout copy and left this drop-oldest copy alone,
     /// the canonical copy-paste outcome documented in
-    /// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §6. It is
+    /// `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §6. It is
     /// reachable: sshd forwards client input here through `/proc/<pid>/fd/0`, so
     /// any client piping more than `MAX_BUFFER_SIZE` past a slow-reading child
     /// (`ssh host 'cat > f' < big`) outran the drain.
@@ -604,7 +604,7 @@ mod tests {
 
     /// Both bounded writers cap at `MAX_BUFFER_SIZE` and short-write rather than
     /// evicting. The stdin half is the regression test for §6 of
-    /// `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`: drop-oldest silently deletes
+    /// `TRIM_FAT_EMBARASSING_DUPLICATIONS.md`: drop-oldest silently deletes
     /// the middle of a byte-faithful stream, and this fix reached only the
     /// stdout copy for as long as the two bodies were separate.
     #[test]

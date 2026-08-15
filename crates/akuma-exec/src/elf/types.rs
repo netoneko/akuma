@@ -131,7 +131,7 @@ pub const ELF64_EHDR_SIZE: usize = 64;
 // throughout and gets third-party scrutiny. The two parsers were verified to
 // agree on all 2,387 ELF files in the tree, with zero panics across 280 hostile
 // header-field mutations, before this deletion:
-// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §3.
+// `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §3.
 
 #[cfg(test)]
 mod tests {

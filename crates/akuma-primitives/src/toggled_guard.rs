@@ -11,7 +11,7 @@
 //! latching rule restated in four doc comments; only the cfg predicate and the toggle
 //! function differed. Five copies of the most consequential lock discipline in the
 //! tree is exactly the shape §5.5 of
-//! `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` flagged. The five names
+//! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` flagged. The five names
 //! survive as type aliases — `DriverBklGuard` still reads as `DriverBklGuard` at every
 //! call site — because the name is the useful part; the body was the duplicated part.
 //!

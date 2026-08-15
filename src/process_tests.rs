@@ -12,7 +12,7 @@ use alloc::format;
 // syscall returns. Every test here used to declare its own local consts from
 // raw literals — 94 of them across the five test files, which is how a
 // comment and a number get to disagree. See
-// docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
+// docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
 use akuma_primitives::errno::negated::{
     EAFNOSUPPORT, EAGAIN, EBADF, EEXIST, EFAULT, EINTR, EINVAL, EISDIR, ENOENT, ENOSYS, EOPNOTSUPP,
     EPERM, EPFNOSUPPORT, ESPIPE, ESRCH,
@@ -482,7 +482,7 @@ pub fn run_all_tests() {
     // akuma-exec (`process::mod::fork_copy_math_tests`, 8 of them). They were
     // five boot tests here, four of which exercised a mirror of the production
     // expression defined in this file rather than the production code itself —
-    // see docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.11.
+    // see docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.11.
     // fork THREAD_PID_MAP and clone_thread CoW-safe write regressions
     test_fork_thread_pid_map_invariant();
     test_clone_thread_tid_write_cow_safe();
@@ -9759,7 +9759,7 @@ fn test_oom_user_page_reserve() {
     // `akuma_exec::memmath` — it needed no VM, and asserting it here cost a boot.
     // What stays is the part that genuinely needs a live PMM: that the real
     // allocator hands back a usable zeroed frame and that the reserve-exempt
-    // path still works. See docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.11.
+    // path still works. See docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.11.
 
     // Live: with ample free pages (boot suite runs at >= 32 MB) the user
     // allocator returns a usable, zeroed page; free it back.
@@ -12677,7 +12677,7 @@ fn test_syscall_name_linux_nrs() {
 // real `akuma_exec::process::fork_code_start` — which is also now the single
 // definition both `fork_process` arms call, instead of an inline expression
 // written twice. The mirror meant these tests could not fail when production
-// drifted; see docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.11.
+// drifted; see docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.11.
 
 /// Regression: fork_process was missing THREAD_PID_MAP.insert(tid, child_pid).
 /// Without it, current_process_shared() for the child thread returned the parent PID,
@@ -17029,7 +17029,7 @@ fn test_pmm_heap_lock_order_smp() {
 /// that defines it.
 ///
 /// It lives in `akuma-primitives` (the leaf crate — see
-/// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.555), and its whole
+/// `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.555), and its whole
 /// body is behind `#[cfg(kernel_smp_shared)]`, which that crate's `build.rs`
 /// emits from its own forwarded `smp-shared` feature. So if the forwarding chain
 /// ever breaks — the bin crate's `smp-shared` not reaching

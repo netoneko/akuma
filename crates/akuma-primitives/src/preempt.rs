@@ -4,7 +4,7 @@
 //!
 //! `PreemptGuard` is a ~40-line RAII guard, and it was the single reason
 //! `akuma-ext2` and `akuma-net` each depended on the 23.8k-line `akuma-exec`
-//! (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.55 named it "the long pole for
+//! (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.55 named it "the long pole for
 //! the whole untangling"). §5.55 also recorded why it looked immovable: it calls
 //! `threading::disable_preemption`, which is *not* a standalone counter — it
 //! indexes `PREEMPTION_DISABLED[tid]` by `TPIDRRO_EL0` and maintains two

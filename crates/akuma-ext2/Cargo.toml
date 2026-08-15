@@ -34,6 +34,6 @@ akuma-vfs = { path = "../akuma-vfs" }
 # this crate depended on `akuma-exec` — the 23.8k-line execution crate, for a
 # ~40-line RAII guard and a ~40-line cell. Both live in the dependency-free leaf
 # now, so that edge is gone: see
-# docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md 5.55 / 5.555.
+# docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md 5.55 / 5.555.
 akuma-primitives = { path = "../akuma-primitives" }
 spinning_top = "0.3"

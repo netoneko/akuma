@@ -83,7 +83,7 @@ See [`../../runbooks/add-syscall-feature.md`](../../runbooks/add-syscall-feature
   `neg_errno()`. `akuma_net::socket::libc_errno` is an alias of the same table.
   **Do not write `(-22i64) as u64` or `i64::from(-libc_errno::EINVAL) as u64`**:
   both spellings existed here, across five tables, and one of them had drifted
-  from its own comment (`archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.7).
+  from its own comment (`archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.7).
   A name missing from the table is added there, not at the call site.
 - **Copying to and from user memory (one helper, since 2026-08-14):**
   `akuma_exec::mmu::user_access` — `copy_to_user(dst_user, &[u8])`,

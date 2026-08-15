@@ -18,7 +18,7 @@
 //! All three macros were the same six lines. `akuma-virtio/src/print.rs` said so
 //! in its own header — "a library crate cannot reach that macro" — which is the
 //! missing-crate diagnosis of
-//! `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.55 stated by the
+//! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.55 stated by the
 //! duplicate itself.
 //!
 //! # The sink is a hook, and it degrades

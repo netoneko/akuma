@@ -1,7 +1,7 @@
 # Extracting `akuma-primitives`: the missing leaf crate
 
 **Date:** 2026-08-13
-**Scope:** Phase 4 of [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+**Scope:** Phase 4 of [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
 (§5.55 / §5.555). New crate `crates/akuma-primitives`; changes across the bin
 crate, `akuma-exec`, `akuma-net`, `akuma-ext2` and `akuma-virtio`.
 **Current-state doc:** [`../reference/subsystems/primitives.md`](../reference/subsystems/primitives.md)
@@ -314,7 +314,7 @@ the phase; +28 in `akuma-primitives`, −5 as `OnceCopy`'s moved with it).
 
 QEMU `MEMORY=2048`, `--release`: 94 `[PASS]`, failure set identical to a clean
 tree (`retired_reclaim_ab` only — the known-bad threshold documented in
-[`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+[`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
 §8.5 Phase 0), and `test_preempt_guard_is_live PASSED` with `size=16`.
 
 Every rewired console sink confirmed live in one boot — which matters, because
@@ -352,7 +352,7 @@ with `max_level_off` and no logger is ever registered.
 
 ## Background
 
-- [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   — the survey. §5.5 (trait-impl clusters), §5.55 (the missing-crate diagnosis),
   §5.555 (this work's running record), §8.5 Phase 4.
 - [`UNSAFE_AUDIT.md`](UNSAFE_AUDIT.md) — the `unsafe` census; the DAIF and

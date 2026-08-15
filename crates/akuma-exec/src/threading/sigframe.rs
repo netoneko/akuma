@@ -11,7 +11,7 @@
 //! Here the layout is the type, the offsets are derived from it with `offset_of!`, and
 //! the `const _: () = assert!(...)` block below turns any drift into a build failure on
 //! every profile. `UNSAFE_AUDIT.md` §4 P1 is the plan; the phase record is
-//! `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` Phase 7.
+//! `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` Phase 7.
 //!
 //! # The layout is Linux's, with one deliberate divergence
 //!

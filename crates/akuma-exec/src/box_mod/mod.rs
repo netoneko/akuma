@@ -107,7 +107,7 @@ pub fn registry_snapshot() -> alloc::collections::BTreeMap<u64, BoxInfo> {
 /// It was defined byte-identically in each of those two files' `mod tests`, which
 /// is the whole of what CPD reported as a 60-line clone between them — the two
 /// *functions* the survey named (`cascade_kill_order`, `validate_nested_root`)
-/// share no logic at all (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §4).
+/// share no logic at all (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §4).
 ///
 /// The shape is load-bearing for both sides and neither can shrink it: `hierarchy`
 /// needs depth ≥ 2 to distinguish an ancestry *chain* from a parent lookup, and a

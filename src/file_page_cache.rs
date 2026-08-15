@@ -116,7 +116,7 @@ pub fn init(total_ram_bytes: usize) {
 // gate) lives in `akuma_exec::memmath`, where both halves are host-tested — the
 // gate reaches it through the injectable `ExecConfig` rather than
 // `crate::config`, which is what let the whole function move instead of leaving a
-// wrapper behind (docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.11).
+// wrapper behind (docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.11).
 // Re-exported so `file_page_cache::is_shareable_mapping` call sites are unchanged.
 pub use akuma_exec::memmath::is_shareable_mapping;
 

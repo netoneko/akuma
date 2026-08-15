@@ -78,7 +78,7 @@ inferred from signals.
 ### 3a. Explicit mirrors — a copy of production logic, in the test file (13)
 
 Same pattern as the `fork_code_start` mirror already fixed in
-[`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+[`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
 §5.11: the test exercises its own copy, so production can drift freely.
 
 | test | file:line | mirrors |
@@ -210,7 +210,7 @@ tree before being written down, because the document will be cited:
 
 ## Background
 
-- [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   §6.1 (the injection principle and why "needs a scheduler" was too wide a line),
   §5.9 (host-test coverage by crate), §5.11 (the first mirror found and fixed)
 - [`PMM_EXTRACT.md`](PMM_EXTRACT.md) §6 — why extracting the PMM subsumes §5's

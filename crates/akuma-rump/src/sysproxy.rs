@@ -494,7 +494,7 @@ impl<P: PipeIo> Transport for PipeTransport<P> {
 /// byte-identical private copy in the kernel's `src/rump_proxy.rs`, and a
 /// `DiscardMem` there that differed only in `copyout` — and that spelled its
 /// errno as a bare `14` where the other two used `EFAULT`
-/// (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 7, and §5.7 for the
+/// (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 7, and §5.7 for the
 /// errno-spelling half). `ClientMem` already lived here and the kernel already
 /// imported it, so there was never a home to settle.
 pub struct NoMem {

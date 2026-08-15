@@ -18,7 +18,7 @@
 //! copy-paste of `X`. That produced two independent ELF parsers — one vetted,
 //! one hand-rolled at literal byte offsets — with which one validated your
 //! dynamic linker decided by binary size. See
-//! `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §3.
+//! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §3.
 
 pub mod types;
 

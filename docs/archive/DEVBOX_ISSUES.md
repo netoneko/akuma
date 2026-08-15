@@ -690,7 +690,7 @@ socket its own session child was about to speak SSH over. Fixed with a
 **Original report follows. Pre-existing — A/B-confirmed 2026-08-13, NOT a
 regression** (that part was correct).
 Found while verifying the `akuma-virtio` crate extraction (Phase 3 of
-[`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)),
+[`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)),
 which is why the A/B below exists — the extraction was the initial suspect and
 was cleared.
 
@@ -839,7 +839,7 @@ fine and the fix already exists in `userspace/sshd`; `devbox.img` is carrying a
 
 **Pre-existing — A/B-confirmed 2026-08-13, NOT a regression.** Found while
 verifying the `NoMem`/`DiscardMem` merge (§8 item 7 of
-[`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)),
+[`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)),
 which was the initial suspect because it touches `src/rump_proxy.rs`'s
 `ClientMem` impls, and was cleared.
 

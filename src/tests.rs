@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 // syscall returns. Every test here used to declare its own local consts from
 // raw literals — 94 of them across the five test files, which is how a
 // comment and a number get to disagree. See
-// docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
+// docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
 use akuma_primitives::errno::negated::{
     EFAULT, EINVAL, ENOSYS, ESRCH,
 };
@@ -4671,7 +4671,7 @@ enum PtClear {
 /// clear and the comment explaining why it is needed. All three shallow copies then
 /// freed the table frames anyway, so they had the aliasing hazard that comment
 /// describes; they now pass [`PtClear::LeafAndTables`]. That is the whole argument
-/// of `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §6 in one function: the fix lived
+/// of `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §6 in one function: the fix lived
 /// in one copy of four, and no reader of the other three could see it was missing.
 ///
 /// Silently does nothing if any level is already absent, which is the same

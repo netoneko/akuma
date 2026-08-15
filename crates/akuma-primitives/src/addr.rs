@@ -14,7 +14,7 @@
 //! than an accident. `akuma-net` used to reach the kernel's translators through
 //! `NetRuntime` function pointers precisely so it could avoid depending on
 //! `akuma-exec` — and Phase 3 of
-//! `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` **deleted** that
+//! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` **deleted** that
 //! indirection because it "cost a spinlocked struct read on the per-packet DMA
 //! path to reach two identity functions".
 //!

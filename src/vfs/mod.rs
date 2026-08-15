@@ -138,7 +138,7 @@ pub fn list_namespace_mounts(box_id: u64) -> Vec<MountInfo> {
 /// with the CWD it actually has. Identical on `""`, `"/"`, `"/foo/"` and `"foo"`;
 /// on `"foo/../bar"` it yields `/bar` where the old code yielded
 /// `/foo/../bar`, which is the correction. See
-/// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §4.
+/// `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §4.
 #[inline]
 fn resolve_without_cwd(path: &str) -> String {
     resolve_path("/", path)

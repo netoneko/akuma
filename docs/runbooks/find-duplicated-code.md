@@ -6,7 +6,7 @@ function, or to gate CI against someone duplicating something substantial. The
 tool is PMD's **CPD** (Copy/Paste Detector), which has a Rust tokenizer.
 
 The current findings and the work list derived from them live in
-[`../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md).
+[`../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md).
 Read that before re-running — most of what a fresh scan reports is already
 triaged there.
 
@@ -51,7 +51,7 @@ pass explicit `--dir` arguments.
 `src/exceptions.rs` is worth more attention than a 60-line one in a test file:
 the 2026-08-12 CoW refcount underflow lived in three mutually-cloned break sites
 that only appear at `--minimum-tokens 50`, and had to be fixed three times
-(`../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.6). Small clones in
+(`../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.6). Small clones in
 dangerous code outrank large clones in safe code.
 
 ## 3. Aggregate the output
@@ -104,7 +104,7 @@ back as parameters).
   7.26.0 — output is byte-identical with and without it). Every number CPD gives
   you is Type-1 (exact tokens) only. Clones that survived a variable rename are
   invisible. Worked examples of what this misses are in
-  [`../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md) §6.
+  [`../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md) §6.
 - **Treat the numbers as a floor, never an estimate.** The two virtio `Hal`
   impls are ~120 lines of functionally identical code; CPD reports 35, because a
   single substituted call expression breaks the token run.
@@ -132,7 +132,7 @@ When you suspect a clone that CPD cannot see:
   same contract and you intend to delete one. Reimplement or link both, run them
   over a real corpus, diff the outputs. This is what proved the two ELF parsers
   equivalent before deleting the hand-rolled one
-  ([`../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md) §3):
+  ([`../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md) §3):
   2,387 real binaries under `bootstrap/` + `userspace/`, 0 disagreements, plus
   the 2,031 `.o` files as free negative cases and a header-field mutation pass
   for panic-safety. Cheap to write, and it converts "looks equivalent" into
@@ -176,7 +176,7 @@ If the run takes more than ~30 seconds, you are almost certainly walking
 
 ## Background
 
-- [`../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   — the 2026-08-12 findings, the per-pattern work list, and what CPD missed.
 - [`../archive/UNSAFE_AUDIT.md`](../archive/UNSAFE_AUDIT.md) — the `unsafe`
   census; its tier-A work list is the same virtio-driver consolidation, since

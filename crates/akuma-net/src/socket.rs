@@ -974,5 +974,5 @@ pub fn list_sockets() -> Vec<SocketStat> {
 /// it that way. New code may use either path — they are the same items.
 ///
 /// See `akuma_primitives::errno` and
-/// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.7.
+/// `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.7.
 pub use akuma_primitives::errno as libc_errno;

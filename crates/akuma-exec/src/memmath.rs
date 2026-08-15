@@ -6,7 +6,7 @@
 //! access, and is a mapping eligible for the shared file-page cache. Both used
 //! to live in `src/` — the kernel binary, which no host test can reach — so
 //! they were checked by booting a VM instead of a unit test.
-//! `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.11 has the full
+//! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.11 has the full
 //! argument, including why this is a module in `akuma-exec` rather than a new
 //! crate: nothing outside `akuma-exec` and `src/` consumes it, so a crate would
 //! cut no `cargo tree` edge — the one criterion `akuma-primitives` exists to

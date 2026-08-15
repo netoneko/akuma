@@ -7,7 +7,7 @@ count below was read out of the tree on this date and is cited; the three
 (mechanism established, consequence not yet observed in a log).
 
 Written while doing Phase 6 item 5 of
-[`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+[`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
 (the `exceptions.rs` fault guards). The question that prompted it: *how many
 process-duplication and CoW paths are there, and can they be merged or reduced to
 one implementation each?*
@@ -647,7 +647,7 @@ would make it unverifiable:
    left in `src/`. Chosen over fully injecting the escalation because it captures
    the bug class that bites (a missing re-check between steps, the wrong order, or
    a premature `GiveUp`) without putting a fn-pointer call on the fault path
-   (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.11, "Still open here").
+   (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.11, "Still open here").
 
 **Sequencing: merge first, fix second.** The helper lands strictly
 behaviour-preserving — the EL1 paths keep `read_current_pid()` and the
@@ -769,7 +769,7 @@ unattributable.
 | F6 | re-entrant `fault_slot_acquire` on one page by one thread lets the inner release drop the outer's entry | **FIXED 2026-08-14** — §11.3. Reachability established first: **unreachable in this tree**, all three `fault_slot_hold` sites are mutually exclusive branches of `rust_sync_el0_handler_inner` (single caller, EL0-only vector), and no EL1 path holds a slot. Chosen resolution is nesting-*safe*, not `assert!`: a new `FaultSlot::AlreadyHeld` variant + `FaultSlotGuard::owns_release`, plus a `[FAULT-SLOT NESTED]` tripwire. An `assert!` here would convert an unreachable bug into a kernel abort on the demand-paging path | boot test `fault_slot_nested_acquire_keeps_outer_hold`; host tests `already_held_reports_nothing`, `already_held_is_not_acquired`; `[FAULT-SLOT NESTED]` must never print |
 | F9 | **W^X is not enforced on the instruction-abort permission-fault arm.** It upgrades the page to `user_flags::RX` for **any** lazy region that is not `PROT_NONE`, without checking whether the region's own recorded flags are executable — so jumping into a `PROT_READ\|PROT_WRITE` file mapping silently promotes it to executable. Note `elf::load::segment_page_flags` enforces W^X for *segments* ("regardless of what `p_flags` asks for") and `user_flags::from_prot` never produces a writable-executable mapping, so this arm is the one place that undoes both | **NOT FIXED — recorded 2026-08-14**, found while retiring F5 and filed with §12's merge. Deliberately out of scope there: refusing the promotion makes a fetch that currently succeeds start taking SIGSEGV, which is a user-visible behaviour change (a JIT that writes into a `PROT_WRITE` file mapping and jumps into it works today) and needs its own change, its own acceptance run and a decision about whether anything on `disk.img` depends on it. The site now carries the finding in a comment so it cannot be re-merged silently | `src/exceptions.rs`, the `is_permission_fault` arm of `EC_INST_ABORT_LOWER`: the `update_current_user_page_flags(page_va, RX)` call has no `region_flags` predicate above it. `[IA-PERM-UPGRADE]` names the first instance per boot — it did **not** print in any run of §12.3's gate |
 | F10 | **Asymmetric recovery on a lazy-region miss.** When no lazy region covers the faulting VA, the data-abort arm falls back to re-mapping from the owner's *eager* `mmap` region list (`[DP-eager]`, "the PTE may have been lost") and then prints ~160 lines of forensics (errno-as-pointer decode, PMM poison decode over eight registers, page forensics, syscall-log dump). The instruction-abort arm has neither: six lines of register print, no recovery. So a lost PTE inside an eager mmap region is recoverable for a load and fatal for a fetch, and an instruction-side wild jump produces none of the diagnostics the data side has spent three investigations accumulating | **NOT FIXED — recorded 2026-08-14** while merging §6's bodies (§12, difference 8). Both halves are separable and neither is a merge: the recovery half is a policy question (should a fetch re-map an eager region?), the forensics half is a straight extraction of the DA `else` branch into a shared helper and is the cheaper, safer of the two | `src/exceptions.rs`: the `lazy_found.is_none()` branch of each arm. `[DP-eager]` exists only on the DA side; `[WILD-IA]` prints six registers where `[WILD-DA]` prints the poison decode and the syscall log |
-| F7 | survey errors: item 5 is three guards not two, ~24 lines not 142; `log_fault_reclaim`'s rustdoc opens with another function's sentence | **CLOSED 2026-08-14 — both already fixed, no code change.** Re-checked against `HEAD` (075ee16f), not against the audit's snapshot: the three guards were collapsed onto one `FaultSlotGuard` by the Phase 6 item 5 merge, and `log_fault_reclaim`'s rustdoc now opens with its own sentence. The corrections themselves are recorded in §7 and in `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 5 + Phase 6 | `git show HEAD:src/exceptions.rs \| grep -c 'struct \(CowFaultGuard\|DaFaultGuard\|FaultGuard\)'` → **0**; the rustdoc at `:709` |
+| F7 | survey errors: item 5 is three guards not two, ~24 lines not 142; `log_fault_reclaim`'s rustdoc opens with another function's sentence | **CLOSED 2026-08-14 — both already fixed, no code change.** Re-checked against `HEAD` (075ee16f), not against the audit's snapshot: the three guards were collapsed onto one `FaultSlotGuard` by the Phase 6 item 5 merge, and `log_fault_reclaim`'s rustdoc now opens with its own sentence. The corrections themselves are recorded in §7 and in `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 5 + Phase 6 | `git show HEAD:src/exceptions.rs \| grep -c 'struct \(CowFaultGuard\|DaFaultGuard\|FaultGuard\)'` → **0**; the rustdoc at `:709` |
 
 None of F1–F6 was being fixed in this document's original change. F1, F2 and
 F4–F6 are recorded here because they are invisible from any single call site and
@@ -1149,7 +1149,7 @@ whole lesson of the row: the three guards (`CowFaultGuard`, `DaFaultGuard`,
 onto one `FaultSlotGuard` — and that same merge rewrote `log_fault_reclaim`'s
 rustdoc, so the orphaned sentence is gone too. The survey corrections themselves
 (three guards not two, ~24 lines not 142) are recorded in §7 here and in
-`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 5 and Phase 6. No code change.
+`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 5 and Phase 6. No code change.
 
 A finding whose fix landed as a side effect of another change stays CONFIRMED
 forever unless someone re-runs it against the current tree, and there is no
@@ -1292,7 +1292,7 @@ already depends on, and `cargo tree` is byte-identical on both arms.
 
 ## Background
 
-- [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   — §5.6 is the CoW refcount underflow case study that motivated reading these
   paths together; §8 item 5 is the entry this audit corrects
 - [`CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md`](CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md)

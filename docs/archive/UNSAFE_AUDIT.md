@@ -479,7 +479,7 @@ failure prints something useful.
 > was split out as a pure function and pinned by
 > `completion_length_is_clamped_to_what_was_offered`. Until then
 > `akuma-virtio` had **zero** tests across ~1,470 lines — the only crate in the
-> workspace with none. See `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §6.2.
+> workspace with none. See `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §6.2.
 
 There is exactly **one** hand-rolled virtqueue in the tree — `src/rng.rs`
 (`VirtqDesc`/`VirtqAvail`/`VirtqUsedElem`/`VirtqUsed` at lines 116-149, plus its

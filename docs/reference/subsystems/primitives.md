@@ -339,14 +339,14 @@ rather than skipped.
 this crate, and `akuma-exec`'s wake path is atomic-array bookkeeping — so
 registering and signalling a waiter are host-testable; only a thread actually
 stopping and resuming is not. Full reasoning:
-`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §6.1.
+`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §6.1.
 
 ## Background
 
 - [`archive/AKUMA_PRIMITIVES_EXTRACTION.md`](../../archive/AKUMA_PRIMITIVES_EXTRACTION.md)
   — the six-rung extraction, what was duplicated, what the measurements were, and
   the two places the plan was wrong.
-- [`archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](../../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](../../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   §5.55 / §5.555 — the survey that diagnosed the missing crate, and Phase 4's
   running record. **§5.8** is `Registered<T>`: the three-way divergence, the 21
   lock acquisitions it removed, and why the line count is a wash. **§6.1** is

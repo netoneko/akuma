@@ -91,7 +91,7 @@ mod tests;
 mod timer;
 
 // The virtio drivers moved to `akuma-virtio` together with the `Hal` and the
-// MMIO probe loop they shared (docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md
+// MMIO probe loop they shared (docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md
 // Phase 3). Re-bound here so existing `crate::block::…` paths still resolve.
 pub(crate) use akuma_virtio::{audio, block, rng};
 mod vfs;

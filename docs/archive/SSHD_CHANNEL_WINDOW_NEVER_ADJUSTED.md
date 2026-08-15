@@ -3,7 +3,7 @@
 **Date:** 2026-08-13
 **Status:** FIXED (`userspace/sshd/src/protocol.rs`).
 **Found by:** trying to verify the `write_stdin` backpressure fix — Phase 0 item 5
-of [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md) §8.5.
+of [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md) §8.5.
 
 Two bugs sat on top of each other here, and the outer one had been hiding the
 inner one since the userspace sshd was written. This doc is about the outer one:
@@ -75,7 +75,7 @@ of a byte-faithful input stream. That is the stdin twin of the stdout truncation
 bug in `userspace/sshd/docs/EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md`, whose fix
 (`write_bounded` + `check_set_writer`) reached only the stdout copy —
 the copy-paste outcome catalogued in
-[`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md) §6.
+[`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md) §6.
 
 §6 left the reachability question open: *"whether it is live-triggerable depends
 on how much unread stdin a caller can queue past `MAX_BUFFER_SIZE`."*
@@ -186,7 +186,7 @@ where before the fix the 4 MiB case stopped dead at 1048576 bytes.
 
 ## Background
 
-- [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   §6 (the unfixed stdin twin) and §8.5 Phase 0 item 5 (the work item this came
   out of).
 - `userspace/sshd/docs/EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md` — the stdout

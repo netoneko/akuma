@@ -1777,7 +1777,7 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
 // needed from outside `core` — a console (the FATAL corrupt-tid halt), a clock
 // (the 0->1 diagnostic timestamp) and IRQ masking — are all available to a leaf
 // crate now. See that module's header, and
-// docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md 5.555.
+// docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md 5.555.
 pub use akuma_primitives::preempt::{
     check_preemption_watchdog, disable_preemption, enable_preemption, is_preemption_disabled,
     preemption_disabled_at, preemption_disabled_count,

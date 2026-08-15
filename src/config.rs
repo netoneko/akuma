@@ -166,7 +166,7 @@ pub const USER_THREAD_STACK_SIZE: usize = 512 * 1024;
 // `vfs::resolve_symlinks`), unmapping the child's malloc arena, so every ssh
 // session died instantly with a SIGSEGV whose faulting address had nothing to do
 // with the corruption. That is the failure
-// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` recorded as "ssh
+// `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` recorded as "ssh
 // sessions die instantly on extreme-size, degradation of unknown origin"; see
 // `docs/archive/EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md`.
 //

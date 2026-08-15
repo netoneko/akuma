@@ -115,7 +115,7 @@ merge had already moved *its* policy half into `akuma_exec::mmu`
 
 **Lesson worth keeping:** the objection was about crate boundaries, and crate
 boundaries are the one thing in this tree that `cargo tree` and a `Cargo.toml` can
-settle in thirty seconds. `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.555 makes
+settle in thirty seconds. `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.555 makes
 the same point from the other direction ("counting `use` statements said the edge
 was gone; `cargo tree` said otherwise").
 
@@ -450,7 +450,7 @@ boundary, Go's 130 GB arena addresses, and zero-length ranges.
 `scripts/verify_trim.py` on both arms — this tree against a worktree at `edd91fe7`
 — carrying §7's AP-bit check, the per-thread `BYPASS_VALIDATION`, §5's
 `mremapmove` probe and the `mmu` walk merge
-(`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 8). **The whole diff:**
+(`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §8 item 8). **The whole diff:**
 
 ```
 < host.tests: 521            > host.tests: 527
@@ -533,7 +533,7 @@ would delete the `ensure_cow_page_writable` pre-flight dance. That single
 
 - [`UNSAFE_AUDIT.md`](UNSAFE_AUDIT.md) — §4 P0 (the plan), §4.0/§4.0a (the
   status), §4 P1 (what this unblocks)
-- [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   — Phase 5, and §5.7 for the errno table that landed immediately before it and
   for why it went first
 - [`COW_PILE_AUDIT.md`](COW_PILE_AUDIT.md) §12 — the DA/IA demand-paging merge,

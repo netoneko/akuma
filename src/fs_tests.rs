@@ -11,7 +11,7 @@ use crate::fs;
 // syscall returns. Every test here used to declare its own local consts from
 // raw literals — 94 of them across the five test files, which is how a
 // comment and a number get to disagree. See
-// docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
+// docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
 use akuma_primitives::errno::negated::{
     EACCES, EEXIST, EINVAL, EIO, EISDIR, EMFILE, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, EROFS,
 };

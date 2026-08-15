@@ -81,7 +81,7 @@ use akuma_terminal as terminal;
 /// conventions": no `format!`/`String` on any path ending at the console)
 /// without hand-rolling a fifth copy of this type. It is exposed for reuse for
 /// the same reason `runtime::OnceCopy` was — see
-/// `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8.5 Phase 0 item 3.
+/// `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §8.5 Phase 0 item 3.
 ///
 /// Re-exported from `akuma_primitives::console`, which now owns the one stack
 /// writer the tree has (there were five). Kept as a re-export so
@@ -143,7 +143,7 @@ pub fn fork_page_count_for_len(len: usize) -> Option<usize> {
 /// expression in each arm plus a **third copy in the boot suite**
 /// (`src/process_tests.rs`, a `fork_code_start` helper the tests exercised
 /// *instead of* this logic — so they could not fail when production drifted).
-/// See `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.11.
+/// See `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.11.
 #[must_use]
 pub fn fork_code_start(code_end: usize) -> usize {
     if code_end >= 0x1000_0000 {
@@ -3462,7 +3462,7 @@ mod fork_copy_math_tests {
     //! exercised a `fork_code_start` helper defined *in the test file* — a mirror
     //! of the production expression, so they could not fail when production
     //! drifted, and they cost a 60 s VM boot to check integer comparisons. Moved
-    //! here against the real function: `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.11.
+    //! here against the real function: `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.11.
     use super::*;
 
     /// The Go AArch64 layout this floor exists for. `forktest_parent` has

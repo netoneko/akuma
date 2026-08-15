@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// This is the tree's one mechanism for "registered at boot, read from
 /// anywhere". It lived in `akuma_exec::runtime` and was made `pub` there so
 /// `akuma-ext2`'s thread hooks could reuse it rather than inventing a second
-/// mechanism (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` Phase 0 item 3) — which
+/// mechanism (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` Phase 0 item 3) — which
 /// meant `akuma-ext2` depended on the 23.8k-line execution crate for a 40-line
 /// cell. It lives here now so reuse costs nothing.
 pub struct OnceCopy<T: Copy> {

@@ -4,7 +4,7 @@
 the `extreme-size` profile again, at 64 MB and at the 4.0 MB floor.
 
 This is the failure
-[`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+[`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
 §8.5 recorded as *"ssh sessions die instantly on the extreme-size profile — a
 degradation of unknown origin, not bisected, owned by no phase"*, and which made
 `acceptance/05_meow_tcc_extreme_4mb.md` unrunnable.
@@ -159,7 +159,7 @@ See [`PAWS_DUPLICATED_ARGV0.md`](PAWS_DUPLICATED_ARGV0.md). With both fixed,
 
 ## Background
 
-- [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   §8.5 — where this was logged as an unowned, unbisected degradation, with the
   A/B that (correctly) cleared the Phase 2a ELF-parser merge of causing it.
 - `acceptance/05_meow_tcc_extreme_4mb.md` — the playbook this unblocks.

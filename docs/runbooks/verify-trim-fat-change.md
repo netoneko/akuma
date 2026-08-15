@@ -4,7 +4,7 @@
 item 1 (the `channel.rs` FIFO merge).
 
 For deduplication / extraction work from
-[`../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md).
+[`../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md).
 Those changes are supposed to be behaviour-preserving, so the gate is a
 **comparison against a baseline**, not a green checkmark.
 
@@ -127,7 +127,7 @@ fn setup() { crate::runtime::register_config_for_test(); }
 ```
 
 `OnceCopy::set` is idempotent, so every test can call it unconditionally despite
-parallel execution. Background: `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §6.1.
+parallel execution. Background: `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §6.1.
 
 ---
 
@@ -158,7 +158,7 @@ grep -aoE '\[FAIL\] [a-z_0-9]+' /tmp/mine.log | sort -u  # expect exactly one li
 
 **Baseline 2026-08-13: 94 `[PASS]`, and the failure set is exactly
 `retired_reclaim_ab`** — that one fails on an unmodified tree (threshold too
-tight, `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §8.5 Phase 0).
+tight, `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §8.5 Phase 0).
 
 > **`retired_reclaim_ab` flips run to run — so `94` is really `94 or 95`.**
 > Measured at SMP=4 on 2026-08-13, five boots: the working tree scored
@@ -255,7 +255,7 @@ name, so pgrep matches itself and the job looks eternal.
 ## Tier 4 — `redis-server --test-memory` on devbox-smoltcp (memory-path changes only)
 
 **Grade: B** — the command and its expected output are from the Phase 3 driver
-merge (`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §5.4's verification block, run
+merge (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.4's verification block, run
 2026-08-13). The polling wrapper below has not been re-run as often as Tiers 1–3.
 
 Run this tier when the change touches the PMM, the fault path, CoW, or the OOM /
@@ -398,7 +398,7 @@ whose point is to build a seam pays for the seam. CPD is also nearly blind here
 
 ## Background
 
-- [`../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   — the survey, the phase list, and §6.1's host-testability finding
 - [`find-duplicated-code.md`](find-duplicated-code.md) — running CPD and why its
   numbers are a lower bound

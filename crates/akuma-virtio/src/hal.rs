@@ -12,7 +12,7 @@
 //!
 //! That single substituted call expression was enough to hide two thirds of the
 //! clone from token-based clone detection, which is why the pair is the worked
-//! example in `docs/archive/TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` §6 of what
+//! example in `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §6 of what
 //! CPD cannot see.
 //!
 //! The `NetRuntime` indirection was not load-bearing by the time it was removed.

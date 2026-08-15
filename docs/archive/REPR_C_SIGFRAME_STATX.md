@@ -10,7 +10,7 @@ change is a build failure instead of a corrupted userspace context.
 - **Struct + host tests:** `crates/akuma-exec/src/threading/sigframe.rs` (new)
 - **Call sites:** `src/exceptions.rs` (`try_deliver_signal`, `do_rt_sigreturn`),
   `src/syscall/fs.rs` (`sys_statx`)
-- **Phase record:** `TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md` Phase 7
+- **Phase record:** `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` Phase 7
 
 ---
 
@@ -237,7 +237,7 @@ Builds clean; `.text` −24 bytes, ELF byte size unchanged (see §5).
 - [`UNSAFE_AUDIT.md`](UNSAFE_AUDIT.md) — §4 P1, the plan this closes
 - [`USER_COPY_FOLD.md`](USER_COPY_FOLD.md) — §7 (the AP-bit test this relies on),
   §4 group 1 (why `Prefault::No` on a fault stack), §11 item 6 (this item)
-- [`TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md`](TRIMMING_FAT_EMBARASSING_DUPLICATIONS.md)
+- [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   — Phase 7
 - [`../reference/subsystems/exceptions.md`](../reference/subsystems/exceptions.md) —
   the EL0 sync/IRQ frame layouts
