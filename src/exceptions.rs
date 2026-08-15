@@ -1110,33 +1110,6 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
     }
 }
 
-/// Pre-resolve a CoW write barrier: if the page at `page_va` in the current
-/// TTBR0 address space is a CoW-demoted RO page (cow_ref_get > 0), allocate a
-/// private copy, remap it RW, and update frame tracking.
-///
-/// Returns true if the page is now writable (either already was, or just resolved).
-/// Returns false only on OOM or if no process owner is found.
-///
-/// Must be called AFTER ensure_user_page_mapped so the page table entry exists.
-/// Prevents EL1 data aborts when kernel code writes to user memory (signal frame
-/// delivery, futex wake writes, etc.) that hits a CoW-demoted RO page.
-/// Hand back the reference `file_page_cache::lookup_and_ref` just took when this
-/// address space is *already* an owner of that frame.
-///
-/// The cache takes one reference per fault, but an address space frees each
-/// distinct PA exactly once at teardown (`user_frames` counts VAs per PA, and the
-/// teardown loop deliberately frees once per PA). So the second VA in one process
-/// that maps an already-held shared page must not add a second reference, or the
-/// frame outlives the process. Releasing through `free_page` is safe here: the
-/// count cannot reach zero while this address space still maps the page.
-fn drop_surplus_shared_ref(as_owner: u32, pf: crate::pmm::PhysFrame) {
-    if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner)
-        && owner.address_space.tracks_user_frame(pf.addr)
-    {
-        crate::pmm::free_page(pf);
-    }
-}
-
 /// One-shot latch for the `[IA-PERM-UPGRADE]` line: the instruction-abort permission
 /// arm runs per faulting page, and this path is common enough in principle
 /// (every non-exec-mapped page a process executes) that a per-fault print would be a
@@ -1241,7 +1214,11 @@ fn demand_page_lazy_region(
         // race-lost frames below, which balances it. Executable text is the main
         // beneficiary — this is the path four concurrent `rustc`s take through the
         // same `librustc_driver.so`.
-        let mut shared: alloc::vec::Vec<(usize, crate::pmm::PhysFrame, bool)> =
+        // `(va, frame, needs_icache, owns_ref)`. `owns_ref` records whether this
+        // fault still holds a global reference for the frame; `adopt_user_frame`
+        // consumes it on install, and Pass C frees it on a lost race. Pool frames
+        // always own theirs; shared hits own the one `lookup_and_ref` took.
+        let mut shared: alloc::vec::Vec<(usize, crate::pmm::PhysFrame, bool, bool)> =
             alloc::vec::Vec::new();
         let mut needed = 0usize;
         {
@@ -1261,8 +1238,14 @@ fn demand_page_lazy_region(
                     };
                     match hit {
                         Some((pf, needs_ic)) => {
-                            drop_surplus_shared_ref(as_owner, pf);
-                            shared.push((va, pf, needs_ic));
+                            // The reference `lookup_and_ref` took is kept until Pass C
+                            // decides this frame's fate — it is what keeps the cache
+                            // entry's frame alive across the fill. `adopt_user_frame`
+                            // consumes it, and reports back if it turned out surplus.
+                            // Reconciling here (the old `drop_surplus_shared_ref`) split
+                            // the two updates across the `as_lock` hold and could drive
+                            // the count below the truth on a lost install race.
+                            shared.push((va, pf, needs_ic, true));
                         }
                         None => needed += 1,
                     }
@@ -1305,7 +1288,10 @@ fn demand_page_lazy_region(
         // icache maintenance into PRIVATE pool frames. This is the long part (block
         // I/O) and runs OUTSIDE the per-AS lock so peers can fault/run in parallel
         // (M5b). Records (va, frame) to install next.
-        let mut filled: alloc::vec::Vec<(usize, crate::pmm::PhysFrame)> = alloc::vec::Vec::new();
+        // `(va, frame, owns_ref)` — see `shared` above. Pool frames always carry a
+        // reference of their own; shared hits may not.
+        let mut filled: alloc::vec::Vec<(usize, crate::pmm::PhysFrame, bool)> =
+            alloc::vec::Vec::new();
         // M5b Stage 4a: DROP the BKL for the block-I/O fill so peer cores can enter
         // the kernel while this core waits on the disk (the measured ~10 ms hold).
         // Pass B touches only PRIVATE frames + the block device (own lock) + the held
@@ -1330,8 +1316,32 @@ fn demand_page_lazy_region(
             // built in ascending VA order by the same walk this loop performs, so an
             // index pointer is enough.
             if sh_idx < shared.len() && shared[sh_idx].0 == cur_va {
-                let (_, pf, needs_ic) = shared[sh_idx];
+                let (_, pf, needs_ic, owns_ref) = shared[sh_idx];
                 sh_idx += 1;
+                // Diagnostic (config::FPCACHE_VERIFY_HITS, off by default): re-read this
+                // page from disk and compare against what the cache handed us. This is
+                // the direct test for "the cache is serving bytes that are not the
+                // file's" — the alternative is inferring it from a userspace symptom
+                // three layers up. See `pmm::DP_FILE_CACHE_MISMATCH`.
+                if crate::config::FPCACHE_VERIFY_HITS {
+                    let file_off = file_offset + (cur_va - segment_va);
+                    let mut disk = alloc::vec![0u8; 0x1000];
+                    let got = if inode != 0 {
+                        crate::vfs::read_at_by_inode(path, inode, file_off, &mut disk)
+                    } else {
+                        crate::vfs::read_at(path, file_off, &mut disk)
+                    };
+                    let kva = akuma_exec::mmu::phys_to_virt(pf.addr).cast::<u8>();
+                    let cached = unsafe { core::slice::from_raw_parts(kva, 0x1000) };
+                    if got == Ok(0x1000) && cached != disk.as_slice() {
+                        let at = cached.iter().zip(disk.iter()).position(|(a, b)| a != b).unwrap_or(0);
+                        crate::pmm::dp_count(&crate::pmm::DP_FILE_CACHE_MISMATCH, 1);
+                        crate::tprint!(256,
+                            "[FPC-BAD] pid={} inode={} file_off={:#x} va={:#x} first_diff={:#x} cached={:#x} disk={:#x} cached_zero={}\n",
+                            pid, inode, file_off, cur_va, at, cached[at], disk[at],
+                            u8::from(cached.iter().all(|b| *b == 0)));
+                    }
+                }
                 if needs_ic {
                     // Cached from a plain RO mapper that never ran `ic ivau`; this
                     // mapper wants to execute it, so pay the maintenance once and
@@ -1344,7 +1354,7 @@ fn demand_page_lazy_region(
                     let file_off = file_offset + (cur_va - segment_va);
                     crate::file_page_cache::mark_icache_clean(inode, file_off, pf);
                 }
-                filled.push((cur_va, pf));
+                filled.push((cur_va, pf, owns_ref));
                 cur_va += 0x1000;
                 continue;
             }
@@ -1427,7 +1437,7 @@ fn demand_page_lazy_region(
                     crate::pmm::dp_count(&crate::pmm::DP_FILE_FILL_UNPUBLISHED, 1);
                 }
             }
-            filled.push((cur_va, pf));
+            filled.push((cur_va, pf, true));
             cur_va += 0x1000;
         }
         // Close the window: re-takes the BKL for the install pass (unless a
@@ -1444,7 +1454,7 @@ fn demand_page_lazy_region(
         if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
             #[cfg(kernel_smp_shared)]
             let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
-            for (cur_va, pf) in filled.iter().copied() {
+            for (cur_va, pf, owns_ref) in filled.iter().copied() {
                 // no_flush: batch the TLB invalidation after the loop.
                 let (table_frames, installed) = unsafe {
                     akuma_exec::mmu::map_user_page_no_flush(cur_va, pf.addr, map_flags)
@@ -1453,13 +1463,24 @@ fn demand_page_lazy_region(
                     owner.address_space.track_page_table_frame(tf);
                 }
                 if installed {
-                    owner.address_space.track_user_frame(pf);
+                    // One hold maintains both the per-AS frame list and the global
+                    // share count, and hands back any surplus reference rather than
+                    // leaving it to a separate reconciliation pass.
+                    if owner.address_space.adopt_user_frame(pf, owns_ref) {
+                        race_free.push(pf);
+                    }
                     any_mapped = true;
                     pages_mapped += 1;
                 } else {
-                    // Race: a peer mapped this page. Free our frame after the hold;
-                    // the faulting page is now present regardless.
-                    race_free.push(pf);
+                    // Race: a peer mapped this page. Release our reference after the
+                    // hold — but ONLY if this fault still holds one. Freeing a frame
+                    // whose reference was already balanced drove `cow_ref` one below
+                    // the truth, handing a live frame back to the PMM to be recycled
+                    // and re-zeroed under its remaining mappers
+                    // (docs/archive/SELFHOST_ZERO_PAGE_HUNT.md §6).
+                    if owns_ref {
+                        race_free.push(pf);
+                    }
                     if cur_va == page_va {
                         any_mapped = true;
                     }
@@ -1471,7 +1492,9 @@ fn demand_page_lazy_region(
             }
         } else {
             // No owner (degenerate): nothing to install; free what we filled.
-            for (_, pf) in filled.iter().copied() { race_free.push(pf); }
+            for (_, pf, owns_ref) in filled.iter().copied() {
+                if owns_ref { race_free.push(pf); }
+            }
         }
 
         // Free race-lost frames + unused pool frames (outside the hold).
@@ -4252,7 +4275,20 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     akuma_exec::process::lazy_region_debug(far_usize);
                 }
                 if let Some((flags, source, region_start, region_size)) = lazy_found {
-                    if akuma_exec::mmu::user_flags::is_none(flags) {
+                    // A `PROT_NONE` region whose source is a FILE is not an anonymous
+                    // reservation, and auto-committing it with a zeroed frame below
+                    // would hand the process zeros where the file's bytes belong — no
+                    // short read, no error, nothing to see anywhere downstream. Fall
+                    // through to the normal file demand-paging path instead.
+                    let protnone_file = akuma_exec::mmu::user_flags::is_none(flags)
+                        && matches!(source, akuma_exec::process::LazySource::File { .. });
+                    if protnone_file {
+                        crate::pmm::dp_count(&crate::pmm::DP_PROTNONE_FILE_REGION, 1);
+                        crate::tprint!(224,
+                            "[DA-NONE-FILE] pid={} as_owner={} va={:#x} flags={:#x} — PROT_NONE flags on a FILE-backed lazy region, demand-paging instead of zero-filling\n",
+                            pid, as_owner, far_usize, flags);
+                    }
+                    if akuma_exec::mmu::user_flags::is_none(flags) && !protnone_file {
                         // Auto-commit anonymous PROT_NONE reservation on first access.
                         // Go's sysReserve calls mmap(PROT_NONE) then sysMap calls
                         // mmap(PROT_RW, MAP_FIXED) to commit subranges. When the parent
@@ -4572,7 +4608,20 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 }
                 // #endregion
                 if let Some((flags, source, region_start, region_size)) = lazy_found {
-                    if akuma_exec::mmu::user_flags::is_none(flags) {
+                    // A `PROT_NONE` region whose source is a FILE is not an anonymous
+                    // reservation, and auto-committing it with a zeroed frame below
+                    // would hand the process zeros where the file's bytes belong — no
+                    // short read, no error, nothing to see anywhere downstream. Fall
+                    // through to the normal file demand-paging path instead.
+                    let protnone_file = akuma_exec::mmu::user_flags::is_none(flags)
+                        && matches!(source, akuma_exec::process::LazySource::File { .. });
+                    if protnone_file {
+                        crate::pmm::dp_count(&crate::pmm::DP_PROTNONE_FILE_REGION, 1);
+                        crate::tprint!(224,
+                            "[DA-NONE-FILE] pid={} as_owner={} va={:#x} flags={:#x} — PROT_NONE flags on a FILE-backed lazy region, demand-paging instead of zero-filling\n",
+                            pid, as_owner, far_usize, flags);
+                    }
+                    if akuma_exec::mmu::user_flags::is_none(flags) && !protnone_file {
                         // PROT_NONE: don't demand-page, fall through to SIGSEGV
                     } else if far_in_kernel_identity_user_range(far) {
                         // Fault VA is in the kernel identity-map range — demand-paging

@@ -60,6 +60,11 @@
 
 #define PAGE 4096u
 
+/* Spin budget for the start gate before a child gives up and proceeds anyway.
+ * Large enough that the gate does its job on a loaded guest, small enough that a
+ * dead parent costs seconds rather than a wedged core. */
+#define GATE_SPIN_LIMIT 200000000L
+
 static uint64_t fnv1a(const unsigned char *p, size_t n) {
     uint64_t h = 0xcbf29ce484222325ULL;
     for (size_t i = 0; i < n; i++) {
@@ -119,9 +124,19 @@ static void child_pass(const char *path, const uint64_t *ref, size_t npages,
     close(fd);
     if (m == MAP_FAILED) { perror("mmap(child)"); _exit(2); }
 
-    /* Line every child up on the same instant so they race for the same pages. */
+    /* Line every child up on the same instant so they race for the same pages.
+     * BOUNDED: an unbounded spin here means that killing the parent leaves every
+     * child burning a core forever, which wedged a guest during development. The
+     * gate is a latency optimisation, not a correctness requirement — timing out
+     * and proceeding just makes this child's pass less concurrent. */
     __sync_fetch_and_add(&c->ready, 1);
-    while (!c->gate) { __asm__ __volatile__("yield" ::: "memory"); }
+    for (long spins = 0; !c->gate; spins++) {
+        if (spins > GATE_SPIN_LIMIT) {
+            if (getppid() == 1) _exit(3);   /* parent died — do not spin on */
+            break;                          /* proceed un-gated rather than hang */
+        }
+        __asm__ __volatile__("yield" ::: "memory");
+    }
 
     int bad = 0;
     for (size_t i = 0; i < npages; i++) {
@@ -195,8 +210,17 @@ int main(int argc, char **argv) {
             if (p < 0) { perror("fork"); return 2; }
             if (p == 0) child_pass(path, ref, npages, size, c);
         }
-        /* Release only once everyone has its mapping and is at the gate. */
-        while (c->ready < nprocs) { __asm__ __volatile__("yield" ::: "memory"); }
+        /* Release only once everyone has its mapping and is at the gate — bounded,
+         * because a child that dies before reaching the gate (the very corruption
+         * this hunts can kill one) would otherwise hang the parent forever. */
+        for (long spins = 0; c->ready < nprocs; spins++) {
+            if (spins > GATE_SPIN_LIMIT) {
+                fprintf(stderr, "  warning: only %d/%d children reached the gate; "
+                                "releasing anyway\n", c->ready, nprocs);
+                break;
+            }
+            __asm__ __volatile__("yield" ::: "memory");
+        }
         c->gate = 1;
 
         int bad_children = 0;

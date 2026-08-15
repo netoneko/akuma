@@ -962,6 +962,48 @@ impl UserAddressSpace {
         *self.user_frames.lock().entry(frame.addr).or_insert(0) += 1;
     }
 
+    /// Adopt `frame` as a mapping of this address space, maintaining **both** the
+    /// per-AS frame list and the global share count as one uninterruptible unit.
+    ///
+    /// The two mechanisms count different things — `user_frames` counts VAs per PA
+    /// *within this address space*, `COW_REFCOUNTS` counts *address spaces* — and the
+    /// rule connecting them ("an address space contributes exactly one global
+    /// reference however many VAs it maps") was maintained by hand at ~40 call sites.
+    /// Splitting the two updates across the `as_lock` hold is what let the count drift
+    /// below the truth and hand a live frame back to the PMM
+    /// (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §6). Here they cannot drift: one
+    /// `IrqGuard`, one `user_frames` hold, and the decision "is this the first VA for
+    /// this PA here?" read from the same map it then updates.
+    ///
+    /// `caller_holds_ref` says whether the caller already took a global reference for
+    /// this adoption (`file_page_cache::lookup_and_ref` does, to keep the frame alive
+    /// across the fill). Returns `true` when that reference was **surplus** — this
+    /// address space already had the PA — and the caller must release it. That is the
+    /// old `drop_surplus_shared_ref`, moved inside the hold and made a return value so
+    /// it cannot be forgotten on one arm and not the other.
+    ///
+    /// Lock order: `COW_REFCOUNTS` is a leaf and is taken innermost here, which is the
+    /// same direction as the existing `as_lock` → `COW_REFCOUNTS` order.
+    pub fn adopt_user_frame(&self, frame: PhysFrame, caller_holds_ref: bool) -> bool {
+        let _irq = IrqGuard::new();
+        let mut uf = self.user_frames.lock();
+        let first_va_here = !uf.contains_key(&frame.addr);
+        *uf.entry(frame.addr).or_insert(0) += 1;
+        match (caller_holds_ref, first_va_here) {
+            // Caller's reference becomes this address space's one reference.
+            (true, true) => false,
+            // Already had the PA: the caller's reference is surplus.
+            (true, false) => true,
+            // No reference taken; this is the first VA, so take one now.
+            (false, true) => {
+                akuma_pmm::cow_ref_inc(frame.addr);
+                false
+            }
+            // Already counted by an earlier VA — nothing to add.
+            (false, false) => false,
+        }
+    }
+
     /// Does this address space already hold `pa` as a user frame?
     ///
     /// Teardown frees each distinct PA **exactly once** regardless of how many VAs

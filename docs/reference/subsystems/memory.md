@@ -200,8 +200,54 @@ with IRQs masked, so there is no verdict to print.
 
 ### CoW invariants (the desync surface)
 
-1. `track_user_frame` count must equal `cow_ref_inc` count (1:1) — ~30
-   hand-maintained call sites. Any new mapping of a physical page must do both.
+1. **The two mechanisms count different things, and are NOT 1:1.** (Corrected
+   2026-08-15 — the old "1:1, any new mapping must do both" was wrong, and
+   believing it is how frames get freed under their mappers.)
+
+   | | `UserAddressSpace::user_frames` | `COW_REFCOUNTS` |
+   |---|---|---|
+   | where | `crates/akuma-exec/src/mmu/mod.rs:464`, per address space | `crates/akuma-pmm/src/lib.rs:1102`, global |
+   | shape | `BTreeMap<PA, u32>` | `BTreeMap<PA, u16>` |
+   | counts | **VAs per PA inside this AS** | **address spaces holding the PA** |
+   | answers | "what must teardown free?" (enumeration) | "may `free_page` release this?" (O(1)) |
+
+   The real rule is **"one address space contributes exactly one global
+   reference, however many VAs it maps"**. So:
+
+   - A freshly allocated **private** frame is tracked with **no** `cow_ref_inc` —
+   `cow_ref_get` returns 0, which legitimately means "single owner, free it".
+   13 of the 23 `track_user_frame` sites are this case and are correct.
+   - `cow_ref_inc` belongs only where a **second** holder appears: fork
+   (`cow_share_and_demote_range`) and the shared file-page cache.
+   - The first `inc` on an untracked PA inserts **2**, not 1 (parent + child).
+
+   Neither map can be deleted: only `user_frames` can enumerate, only
+   `COW_REFCOUNTS` can answer the free question in O(1). What was consolidated is
+   the *counting*.
+
+1a. **Use `UserAddressSpace::adopt_user_frame`, not the two calls by hand.**
+   It maintains both maps under **one** `IrqGuard` + `user_frames` hold, decides
+   "is this the first VA for this PA here?" from the same map it updates, and
+   returns `true` when the caller's reference turned out surplus. Splitting the
+   two updates across the `as_lock` hold is what let the count drift below the
+   truth and hand a live frame back to the PMM — the frame is then recycled and
+   **re-zeroed under its remaining mappers**, which surfaces as unrelated
+   processes reading zeros
+   ([`../../archive/SELFHOST_ZERO_PAGE_HUNT.md`](../../archive/SELFHOST_ZERO_PAGE_HUNT.md) §6).
+   It replaced `drop_surplus_shared_ref`, a separate reconciliation pass that was
+   unbalanced on the lost-install-race arm.
+
+   `AsLockHold` is `IrqGuard` + the spinlock, so a pair inside it is both
+   uninterruptible locally *and* excluded cross-core for that address space —
+   masking IRQs alone would not give the second half at SMP=4. Lock order is
+   `as_lock` → `user_frames` → `COW_REFCOUNTS`; the last is a **leaf** and must
+   stay innermost. The same principle is stated for fork at
+   `crates/akuma-exec/src/process/bkl_guard.rs:44` ("The PTE read, the
+   `cow_ref_inc`, and the demote must be in ONE hold").
+
+   Two holders are **not** address spaces and keep calling `cow_ref_*` directly:
+   `file_page_cache::insert` (the cache's own reference) and `invalidate_inode` /
+   eviction (releasing it). Those are the documented exceptions.
 2. `remove_user_frame` is `#[must_use] -> bool` (true ⇒ last ref, caller owns
    the free). munmap loops free **only when it returns true**.
 3. `Drop` frees each distinct PA **once** (count is mapping refcount, not alloc

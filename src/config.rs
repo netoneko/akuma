@@ -449,6 +449,20 @@ pub const VFORK_FASTPATH_ENABLED: bool = true;
 /// See `crate::file_page_cache`.
 pub const SHARED_FILE_PAGES_ENABLED: bool = true;
 
+/// **Diagnostic, OFF by default.** On every `file_page_cache` *hit*, re-read the page
+/// from disk and compare it against the cached frame before mapping it, printing
+/// `[FPC-BAD]` with the `(inode, file_off)` and the first differing byte on mismatch.
+///
+/// This is the decisive instrument for "a mapped file reads back as zeros": it answers
+/// *is the cache serving bytes that do not match the file* directly, rather than by
+/// inference. It costs a block read per hit — i.e. it throws away the entire point of
+/// the cache — so it is for investigation runs only, never a shipping default.
+///
+/// A mismatch names the poisoned key. **No mismatch across a failing build is equally
+/// decisive**: it clears the cache and moves the search to the install pass or the
+/// mapping itself. Counter: `pmm::DP_FILE_CACHE_MISMATCH`.
+pub const FPCACHE_VERIFY_HITS: bool = false;
+
 /// Let a `pthread_kill` (`tkill`/`tgkill`) signal interrupt a blocking syscall
 /// with `EINTR`, per Linux semantics.
 ///

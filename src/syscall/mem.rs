@@ -109,6 +109,14 @@ pub static DONTNEED_SHARED_FRAME: core::sync::atomic::AtomicUsize =
 pub static DONTNEED_SHARE_BREAK_SKIPPED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// `MADV_DONTNEED` pages that were **file-backed**, and so had their mapping dropped
+/// (Linux's behaviour) instead of being zeroed in place or replaced with a private
+/// zero frame. Before this, both of the other actions made an mmap'd file read back as
+/// zeros permanently — see `MADV_DONTNEED_SHARED_FRAME.md` "Still open" item 2, and
+/// `FPCACHE_ZERO_PAGE_POISONING.md` for the hunt that ended here.
+pub static DONTNEED_FILE_BACKED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// The page range `MADV_DONTNEED` actually zeroes for `(addr, len)`, as
 /// `(start_va, pages)`.
 ///
@@ -962,6 +970,48 @@ fn madvise_dontneed_range(
     pages: usize,
 ) {
     use core::sync::atomic::Ordering;
+
+    // Pass 0 — FILE-BACKED pages. Neither of the two actions below is correct for
+    // one: `ZeroInPlace` overwrites the file's bytes, and `BreakSharing` installs a
+    // private zero frame. Both leave the mapping reading as zeros for the rest of
+    // its life, with no short read, no cache miss and no error anywhere — the
+    // residue left after `DP_FILE_FILL_SHORT`, `DP_FILE_CACHE_MISMATCH` and
+    // `DP_PROTNONE_FILE_REGION` all came back clean across a reproducing build.
+    //
+    // Linux drops the mapping and lets the next touch re-read the file. That is
+    // safe to do *here*, unlike the anonymous case the comment above worries
+    // about, precisely because being file-backed means a `LazySource::File` lazy
+    // region exists to demand-page from — the missing-region hazard that forced
+    // the zero-frame design does not apply.
+    //
+    // MADV_DONTNEED_SHARED_FRAME.md "Still open" item 2.
+    let file_vas: alloc::vec::Vec<usize> = (0..pages)
+        .map(|i| aligned_addr + i * 4096)
+        .filter(|va| {
+            matches!(
+                akuma_exec::process::lazy_region_lookup_for_pid(proc.tgid, *va),
+                Some((_, akuma_exec::process::LazySource::File { .. }, _, _))
+            )
+        })
+        .collect();
+    if !file_vas.is_empty() {
+        let mut dropped: alloc::vec::Vec<crate::pmm::PhysFrame> =
+            alloc::vec::Vec::with_capacity(file_vas.len());
+        proc.with_address_space(|aspace| {
+            for va in &file_vas {
+                if let Some(old) = aspace.unmap_and_free_page(*va) {
+                    dropped.push(old);
+                }
+            }
+        });
+        for frame in dropped {
+            crate::pmm::free_page(frame);
+        }
+        DONTNEED_FILE_BACKED.fetch_add(file_vas.len(), Ordering::Relaxed);
+        crate::tprint!(192,
+            "[DONTNEED-FILE] pid={} va={:#x} pages={} — dropped file-backed mapping instead of zeroing it\n",
+            proc.pid, file_vas[0], file_vas.len());
+    }
 
     // Pass 1 — count the pages that need a private replacement frame. No
     // allocation: `as_lock` is held with IRQs masked, so this closure must not

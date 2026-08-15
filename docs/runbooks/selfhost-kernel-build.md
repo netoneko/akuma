@@ -622,7 +622,7 @@ same tree.
   > and not an OOM cliff. The table above was measured on an older tree; treat its
   > *ordering* as transferable and its magnitudes as stale. The build failure that
   > actually prompted this warning was
-  > [`../archive/FPCACHE_ZERO_PAGE_POISONING.md`](../archive/FPCACHE_ZERO_PAGE_POISONING.md),
+  > [`../archive/SELFHOST_ZERO_PAGE_HUNT.md`](../archive/SELFHOST_ZERO_PAGE_HUNT.md),
   > which has nothing to do with LTO, and chasing `lto` first cost real time.
 - **`fs-cache` feature** is already **on** — it is in `default`, so
   `--features devbox-smoltcp,no-tests` includes it. Nothing to add. The lever is

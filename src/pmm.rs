@@ -306,6 +306,22 @@ pub static DP_IA_NOEXEC_FAULTS: AtomicUsize = AtomicUsize::new(0);
 /// EOF condition — the range was already clamped to `filesz` by the caller.
 pub static DP_FILE_FILL_SHORT: AtomicUsize = AtomicUsize::new(0);
 
+/// Faults on a lazy region whose flags say `PROT_NONE` but whose source is a **file**.
+///
+/// The `PROT_NONE` arm of the translation-fault path auto-commits a reservation with a
+/// zeroed frame (Go's `sysReserve`/`sysMap` shape). That is right for an anonymous
+/// reservation and catastrophic for a file-backed one: the process gets zeros where the
+/// file's bytes belong, with no short read, no error, and no cache involvement — which
+/// is exactly the residue left after `DP_FILE_FILL_SHORT` and `DP_FILE_CACHE_MISMATCH`
+/// both came back clean across a reproducing build.
+pub static DP_PROTNONE_FILE_REGION: AtomicUsize = AtomicUsize::new(0);
+
+/// `file_page_cache` hits whose frame did **not** match the file on disk, counted only
+/// when `config::FPCACHE_VERIFY_HITS` is on. Non-zero proves the cache is serving wrong
+/// bytes and names the key; zero across a reproducing build clears the cache entirely
+/// and moves the search downstream.
+pub static DP_FILE_CACHE_MISMATCH: AtomicUsize = AtomicUsize::new(0);
+
 /// Pages withheld from `file_page_cache` because [`DP_FILE_FILL_SHORT`] fired for them.
 /// The gap between the two counters is the incomplete fills that were never eligible
 /// to be published anyway (not fully covered by file data, or a private mapping).
@@ -323,7 +339,7 @@ pub fn dp_count(counter: &AtomicUsize, n: usize) {
 pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
     let _ = write!(
         w,
-        "file={} anon={} cow={} protnone={} eager={} freed={} ia_noexec={} fill_short={} unpub={}",
+        "file={} anon={} cow={} protnone={} eager={} freed={} ia_noexec={} fill_short={} unpub={} fpc_bad={} pn_file={}",
         DP_FILE_PAGES.load(Ordering::Relaxed),
         DP_ANON_PAGES.load(Ordering::Relaxed),
         DP_COW_PAGES.load(Ordering::Relaxed),
@@ -333,5 +349,7 @@ pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
         DP_IA_NOEXEC_FAULTS.load(Ordering::Relaxed),
         DP_FILE_FILL_SHORT.load(Ordering::Relaxed),
         DP_FILE_FILL_UNPUBLISHED.load(Ordering::Relaxed),
+        DP_FILE_CACHE_MISMATCH.load(Ordering::Relaxed),
+        DP_PROTNONE_FILE_REGION.load(Ordering::Relaxed),
     );
 }
