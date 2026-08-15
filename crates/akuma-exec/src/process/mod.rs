@@ -238,6 +238,70 @@ impl Drop for ForkInProgressGuard {
 /// `parent_l0` must be the live L0 root of the address space that `as_lock` guards —
 /// for a `CLONE_THREAD` group that is the **leader's** lock, resolved by
 /// [`address_space_owner_pid_for_fault`], not the calling thread's.
+/// Share a `MAP_SHARED | MAP_ANONYMOUS` range with a forked child as **one object**:
+/// the child maps the parent's frames with the parent's own permissions, and the
+/// parent is **not** demoted.
+///
+/// This is the deliberate opposite of [`cow_share_and_demote_range`]. That one exists
+/// to make a write *diverge* — demote both sides to RO so the first write allocates a
+/// private copy. Running it over a `MAP_SHARED` anonymous mapping gives parent and
+/// child separate pages, so a child's write becomes invisible to the parent: the flag
+/// is silently ignored (probe: `userspace/forktest/c_stress/shmanon.c`, which read
+/// back the parent's own value where Linux returns the child's).
+///
+/// The reference accounting is identical to the CoW path and for the same reason —
+/// `COW_REFCOUNTS` counts **address spaces**, so one increment per distinct PA per
+/// address space, deduped against frames the child already tracks from an earlier
+/// chunk and against duplicates inside this one. What differs is only that no PTE is
+/// demoted and the child's flags are copied verbatim rather than forced to
+/// `AP_RO_ALL`.
+///
+/// No TLB maintenance is needed here: the parent's PTEs are untouched, and the
+/// child's address space has never been on a CPU.
+pub fn share_rw_range(
+    parent_l0: *const u64,
+    as_lock: &Spinlock<()>,
+    va_start: usize,
+    len: usize,
+    child_as: &mut mmu::UserAddressSpace,
+    scratch: &mut alloc::vec::Vec<(usize, usize, u64)>,
+) -> Result<usize, &'static str> {
+    let pages = fork_page_count_for_len(len).ok_or("shared-anon share page count overflow")?;
+    let mut count = 0usize;
+    let mut done = 0usize;
+    while done < pages {
+        let chunk = (pages - done).min(FORK_AS_CHUNK_PAGES);
+        let chunk_va = done
+            .checked_mul(mmu::PAGE_SIZE)
+            .and_then(|off| va_start.checked_add(off))
+            .ok_or("shared-anon share VA overflow")?;
+        {
+            #[cfg(kernel_smp_shared)]
+            let _asg = AsLockHold::new(as_lock);
+            #[cfg(not(kernel_smp_shared))]
+            let _ = as_lock;
+            mmu::collect_mapped_pages_with_flags_into(parent_l0, chunk_va, chunk, scratch);
+            for (idx, &(_, pa, _)) in scratch.iter().enumerate() {
+                let seen_in_earlier_chunk = child_as.tracks_user_frame(pa);
+                let seen_in_this_chunk =
+                    scratch[..idx].iter().any(|&(_, prev_pa, _)| prev_pa == pa);
+                if seen_in_earlier_chunk || seen_in_this_chunk {
+                    continue;
+                }
+                akuma_pmm::cow_ref_inc(pa);
+            }
+        }
+        // Child gets the parent's permissions verbatim — that is the whole point.
+        for &(va, pa, pte_flags) in scratch.iter() {
+            child_as.map_page(va, pa, pte_flags)?;
+            child_as.track_user_frame(PhysFrame::new(pa));
+        }
+        count += scratch.len();
+        done += chunk;
+    }
+    Ok(count)
+}
+
 pub fn cow_share_and_demote_range(
     parent_l0: *const u64,
     as_lock: &Spinlock<()>,
@@ -2604,11 +2668,20 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             // process that ran `mmap` (`( cmd; cmd ) &` — shell forks a subshell,
             // subshell forks to exec) faulted on musl's first malloc arena.
             for region in &parent.mmap_regions {
-                if region.pages > 0 {
-                    total_shared += cow_share_and_demote_range(parent_l0, as_lock, region.start_va,
-                        region.len_bytes(), &mut new_proc.address_space, &mut chunk_scratch,
-                        "mmap")?;
+                if region.pages == 0 {
+                    continue;
                 }
+                // `MAP_SHARED|MAP_ANONYMOUS` must survive fork as ONE object. CoW-sharing
+                // it would give parent and child separate pages on the first write,
+                // silently ignoring the flag — see `share_rw_range`.
+                total_shared += if region.shared_anon {
+                    share_rw_range(parent_l0, as_lock, region.start_va,
+                        region.len_bytes(), &mut new_proc.address_space, &mut chunk_scratch)?
+                } else {
+                    cow_share_and_demote_range(parent_l0, as_lock, region.start_va,
+                        region.len_bytes(), &mut new_proc.address_space, &mut chunk_scratch,
+                        "mmap")?
+                };
             }
 
             for (va_start, len) in &sibling_ranges {

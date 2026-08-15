@@ -276,6 +276,21 @@ pub struct MmapRegion {
     /// with SIGSEGV instead. See
     /// `docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §3.
     pub flags: u64,
+
+    /// `MAP_SHARED | MAP_ANONYMOUS`: this mapping must survive `fork` as **one
+    /// object**, not as a copy-on-write copy.
+    ///
+    /// Everything else in an address space is private, so fork demotes it to RO and
+    /// lets the first write break CoW. Doing that to a `MAP_SHARED` anonymous
+    /// mapping silently gives parent and child separate pages — a child's write is
+    /// then invisible to the parent, which is the opposite of what the flag asks
+    /// for. Regions carrying this take
+    /// [`share_rw_range`](crate::process::share_rw_range) at fork instead: same
+    /// frames, mapped writable in the child, parent left alone.
+    ///
+    /// Must propagate to inherited regions too, or a grandchild silently stops
+    /// sharing. Probe: `userspace/forktest/c_stress/shmanon.c`.
+    pub shared_anon: bool,
 }
 
 impl MmapRegion {
@@ -293,7 +308,7 @@ impl MmapRegion {
 
     /// Region created by this process, with its real protection recorded.
     pub fn owned_with_flags(start_va: usize, frames: Vec<PhysFrame>, flags: u64) -> Self {
-        Self { start_va, pages: frames.len(), frames, flags }
+        Self { start_va, pages: frames.len(), frames, flags, shared_anon: false }
     }
 
     /// Region inherited by a CoW-forked child: extent known, no owned frames,
@@ -304,7 +319,14 @@ impl MmapRegion {
 
     /// Region inherited by a CoW-forked child, carrying the parent's protection.
     pub fn inherited_with_flags(start_va: usize, pages: usize, flags: u64) -> Self {
-        Self { start_va, pages, frames: Vec::new(), flags }
+        Self { start_va, pages, frames: Vec::new(), flags, shared_anon: false }
+    }
+
+    /// Mark this region `MAP_SHARED | MAP_ANONYMOUS`. See [`MmapRegion::shared_anon`].
+    #[must_use]
+    pub fn shared_anon(mut self) -> Self {
+        self.shared_anon = true;
+        self
     }
 
 

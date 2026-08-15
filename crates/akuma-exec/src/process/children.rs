@@ -1210,7 +1210,12 @@ pub fn propagate_lazy_regions_to_child(parent_regions: &[LazyRegion], child: &Pr
 pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> alloc::vec::Vec<MmapRegion> {
     parent_regions
         .iter()
-        .map(|r| MmapRegion::inherited_with_flags(r.start_va, r.pages, r.flags))
+        .map(|r| {
+            let inherited = MmapRegion::inherited_with_flags(r.start_va, r.pages, r.flags);
+            // Must carry `shared_anon` across, or a grandchild silently stops sharing:
+            // the child would CoW-share a mapping its parent shares by identity.
+            if r.shared_anon { inherited.shared_anon() } else { inherited }
+        })
         .collect()
 }
 
@@ -1288,6 +1293,9 @@ pub fn detach_eager_regions_in_range(
         // carries its page count and no frames, which is exactly right.
         let reg = regions.remove(i);
         let flags = reg.flags;
+        // A partial unmap changes extent, not identity: both survivors are still the
+        // same `MAP_SHARED|MAP_ANONYMOUS` object if the original was.
+        let shared_anon = reg.shared_anon;
         let mut it = reg.frames.into_iter();
         let head: alloc::vec::Vec<PhysFrame> = (0..head_pages).filter_map(|_| it.next()).collect();
         let mid: alloc::vec::Vec<PhysFrame> = (0..clip_pages).filter_map(|_| it.next()).collect();
@@ -1298,10 +1306,12 @@ pub fn detach_eager_regions_in_range(
         // [range_start, range_end), so re-examining them costs one overlap test
         // and cannot loop.
         if head_pages > 0 {
-            regions.push(MmapRegion { start_va: reg_start, pages: head_pages, frames: head, flags });
+            regions.push(MmapRegion {
+                start_va: reg_start, pages: head_pages, frames: head, flags, shared_anon });
         }
         if tail_pages > 0 {
-            regions.push(MmapRegion { start_va: clip_end, pages: tail_pages, frames: tail, flags });
+            regions.push(MmapRegion {
+                start_va: clip_end, pages: tail_pages, frames: tail, flags, shared_anon });
         }
         if clip_pages > 0 {
             pieces.push((clip_start, clip_pages, mid));

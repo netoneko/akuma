@@ -333,7 +333,85 @@ Cost: `translate()` per page roughly doubles `munmap` wall time on this workload
 (~50 s → ~100 s per build). Worth optimising (the walk can be hoisted), not worth
 reverting.
 
-## 9. What is NOT done
+## 9. `MAP_SHARED|MAP_ANONYMOUS` was not shared (found + FIXED 2026-08-15)
+
+A side finding that invalidates instrumentation rather than explaining the ICE, and
+which anything cross-process on this kernel needs to know.
+
+`mmap(MAP_SHARED|MAP_ANONYMOUS)` **behaves exactly like `MAP_PRIVATE`**: `fork` copies
+it instead of sharing it, so a child's write is invisible to the parent. Probe:
+`userspace/forktest/c_stress/shmanon.c` (in `userspace/build.sh` -> `bootstrap/bin/`),
+which checks both legs in one run — testing only the `MAP_SHARED` leg cannot tell
+"sharing is broken" from "the child never ran". Calibrated correct on macOS arm64;
+the guest fails the shared leg and passes the private one.
+
+```
+MAP_SHARED  parent sees 0x0  -> *** NOT SHARED - behaves like MAP_PRIVATE ***
+MAP_PRIVATE parent sees 0x0  -> isolated (correct)
+```
+
+**How it was found, and why that matters more than the bug.** `fpcpoison` lines its
+children up on a spin gate in a `MAP_SHARED` page so they fault the same pages at the
+same instant. In-guest, the parent never observed `ready` reaching 4 — it timed out on
+every round and released anyway:
+
+```
+warning: only 0/4 children reached the gate; releasing anyway
+```
+
+So every "concurrent, cross-process" round it has run on this kernel actually ran
+**unsynchronised**, and its `ALL PASS` is far weaker evidence than it reads as. Had the
+gate stayed unbounded (as originally written) this would have hung the box instead of
+warning — the bounded spin is what surfaced it.
+
+**Rule this establishes: an instrument can be broken by the bug it is hunting.** The
+gate failed silently and the probe still printed `ALL PASS`, which reads as evidence
+and was not. A bounded spin is what turned a hang into a visible warning; unbounded, it
+had simply wedged the box.
+
+### The fix
+
+`fork` shares every region through `cow_share_and_demote_range`, which demotes both
+sides to RO so the first write breaks CoW into a private copy. That is the correct
+default and precisely wrong for `MAP_SHARED`: it makes writes *diverge*, which is the
+opposite of what the flag asks for.
+
+- `MmapRegion::shared_anon` records the flag at `mmap` time
+  (`MAP_SHARED` and **not** file-backed — file-backed `MAP_SHARED` is a separate
+  mechanism, `SHARED_FILE_MAPPINGS` writeback).
+- `process::share_rw_range` is the fork-time counterpart of
+  `cow_share_and_demote_range`: same reference accounting (one `cow_ref_inc` per
+  distinct PA per address space, deduped the same way), but the child gets the
+  parent's PTE flags **verbatim** and the parent is **not** demoted. No TLB
+  maintenance — the parent's PTEs are untouched and the child's AS has never run.
+- The flag propagates through CoW inheritance (`inherit_mmap_regions_for_cow_child`)
+  and through region **splits** on partial `munmap`, or a grandchild silently stops
+  sharing.
+
+Verified in-guest, matching the host calibration exactly:
+
+```
+MAP_SHARED  parent sees 0x5eed  -> SHARED (correct)
+MAP_PRIVATE parent sees 0x0     -> isolated (correct)
+```
+
+533 host tests pass; fork is exercised by every build in the arms above.
+
+### What it unblocked
+
+With a working gate, `fpcpoison` finally ran as designed — genuinely concurrent,
+cross-process — and passed on the rlib that actually trips the ICE:
+
+| file | rounds x procs | result |
+|---|---|---|
+| `libquote` (516 KB, 126 pages) | 5 x 4 | ALL PASS |
+| **`libsyn` (6.3 MB, 1540 pages)** | 3 x 4 | **ALL PASS** |
+
+So the file mapping is correct end-to-end under concurrency, for the exact file whose
+metadata rustc reads zeros from. Combined with §4, that closes the file side properly
+rather than by inference.
+
+## 10. What is NOT done
 
 1. ~~**The premature free is not localised.**~~ **DONE — §8.** The `FreeSite` tag
    named it in one boot.

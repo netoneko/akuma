@@ -673,7 +673,17 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             }
         }
 
-    proc.vm_with_regions(|r| r.push(MmapRegion::owned_with_flags(mmap_addr, frames, page_flags)));
+    // `MAP_SHARED|MAP_ANONYMOUS` must survive fork as one object rather than being
+    // CoW-copied — see `MmapRegion::shared_anon` and `process::share_rw_range`. File
+    // -backed `MAP_SHARED` is a different mechanism entirely (SHARED_FILE_MAPPINGS
+    // writeback), so this is the anonymous case only.
+    let region = MmapRegion::owned_with_flags(mmap_addr, frames, page_flags);
+    let region = if (flags & MAP_SHARED != 0) && !is_file_backed {
+        region.shared_anon()
+    } else {
+        region
+    };
+    proc.vm_with_regions(|r| r.push(region));
 
     mmap_addr as u64
 }

@@ -308,7 +308,7 @@ echo "mmap_file (C) copied to bootstrap/bin/"
 # "Expected header tag [79, 68, 72, 84] but found [0, 0, 0, 0]" during the
 # self-host build. Pair a FAIL with the kernel's `[FILL-SHORT]` lines.
 # Calibrate ALL PASS on real Linux arm64; a FAIL here is the kernel.
-echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapmove + fpcpoison (C, thread-spawn/mprotect/CoW/mremap/file-page-cache probes)..."
+echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapmove + fpcpoison + shmanon (C, thread-spawn/mprotect/CoW/mremap/file-page-cache/shared-anon probes)..."
 (
     cd forktest/c_stress
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mprotectlb mprotectlb.c
@@ -318,6 +318,7 @@ echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapm
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o madvshared madvshared.c
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mremapmove mremapmove.c
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o fpcpoison fpcpoison.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o shmanon shmanon.c
 )
 cp forktest/c_stress/mprotectlb ../bootstrap/bin/
 cp forktest/c_stress/clonearg ../bootstrap/bin/
@@ -326,7 +327,8 @@ cp forktest/c_stress/bssfork ../bootstrap/bin/
 cp forktest/c_stress/madvshared ../bootstrap/bin/
 cp forktest/c_stress/mremapmove ../bootstrap/bin/
 cp forktest/c_stress/fpcpoison ../bootstrap/bin/
-echo "mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapmove + fpcpoison (C) copied to bootstrap/bin/"
+cp forktest/c_stress/shmanon ../bootstrap/bin/
+echo "mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapmove + fpcpoison + shmanon (C) copied to bootstrap/bin/"
 
 # spawnalias: the address-space identity canary for the thread-spawn SIGSEGV
 # class. Unlike clonearg (which proved the clone *handoff* is sound and would
