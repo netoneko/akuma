@@ -909,6 +909,48 @@ and then prints `[rump] BSP tap not available: tap: transport init failed (run
 QEMU with RUMP_NIC=1)` — the code never runs, and a boot that looks completely
 clean has verified nothing about it.
 
+## Issue 13: `pwritev2` (nr 287) unimplemented — high-frequency `[ENOSYS]` console spam under build load
+
+**Status: OPEN.** Found 2026-08-15 during the mapped-page premature-free
+verification runs (`MAPPED_PAGE_PREMATURE_FREE_FIX.md`). Not investigated
+beyond decoding the syscall — adding here so it doesn't get lost.
+
+### Symptom
+
+The console fills with lines like:
+
+```
+[ENOSYS] nr=287 pid=54 args=[0x4, 0x203fff9490, 0x1]
+```
+
+repeating at high frequency while a build workload runs. nr 287 on the
+aarch64 Linux ABI is `pwritev2(fd, iov, iovcnt, pos_lo, pos_hi, flags)` —
+here `fd=4, iovcnt=1` (the offset/flags args fall outside the 3-arg print;
+the common calling pattern is `pos=-1, flags=0`, i.e. "plain `writev`, just
+probing for the newer syscall"). The dispatcher's catch-all
+(`src/syscall/mod.rs`, the `_ =>` arm) returns `-ENOSYS` and prints one line
+per attempt.
+
+### Why it (mostly) doesn't matter — and why it still does
+
+Nothing is broken: every libc/runtime that issues `pwritev2` falls back to
+`writev` (nr 66, implemented) on `ENOSYS`, so the writes succeed. But this
+caller is **not caching the ENOSYS** — it re-probes on every write, so each
+write pays a wasted syscall round-trip plus a console print, and under load
+the print is the expensive half (console output is serialized and not free
+on this kernel). The spam also buries real diagnostics in the log.
+
+### Next step, if picked up
+
+1. Identify the caller: grep the console log for the pid's `execve` line
+   (the syscall trace prints binary + argv per spawn).
+2. If warranted, add a `PWRITEV2` dispatcher arm: `flags == 0 && pos == -1`
+   → forward to `fs::sys_writev`; `flags == 0 && pos >= 0` → a positional
+   variant; nonzero flags → `-EOPNOTSUPP` (Linux's own convention for
+   unsupported `RWF_*` flags). Same treatment for `preadv2` (286) if it
+   surfaces. Per repo convention, the syscall change needs a boot-suite
+   self-test in `src/process_tests.rs`.
+
 ## Background
 
 - [`SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md`](SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md)

@@ -338,3 +338,5 @@ Papercuts surfaced by dogfooding, to fix later:
   latency-sensitive net/SSH path can't get a timeslice in time. Likely fix: raise the
   scheduling weight/priority of the rump proxy thread (and/or sshd) so the network stays
   responsive under load. See `docs/OPTIONAL_SMOLTCP.md`'s backlog for the same item.
+- **`pwritev2` (nr 287) unimplemented — `[ENOSYS]` console spam under build load.**
+  Moved to `docs/archive/DEVBOX_ISSUES.md` Issue 13 (decode, impact, fix sketch).
