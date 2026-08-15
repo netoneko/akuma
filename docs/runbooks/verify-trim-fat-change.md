@@ -11,8 +11,9 @@ Those changes are supposed to be behaviour-preserving, so the gate is a
 Work in tiers, each one gated on the last being clean: **Tier 1** is host-only and
 takes ~2 minutes; **Tier 2** boots the VM for the self-test suite; **Tier 3** is
 the live I/O and fork/CoW binaries; **Tier 4** is the redis memtest on the devbox,
-for changes in the memory path. Tiers 3 and 4 are conditional — read their
-headers before spending the time.
+for changes in the memory path; **Tier 5** is self-host clean-build trials, for
+changes in the mmu / fault / file-page-cache path. Tiers 3–5 are conditional —
+read their headers before spending the time.
 
 **Tiers 1–3 are automated: run [`../../scripts/verify_trim.py`](../../scripts/verify_trim.py)
 rather than hand-assembling the commands below.** It runs the four clippy
@@ -366,6 +367,27 @@ believing it.**
 > fails — the change this section used to ask for. A passing run's file is the
 > baseline to diff the next failure against, so on the third occurrence this
 > should be answerable in one command instead of a session.
+
+## Tier 5 — self-host clean-build trials (page-table / mmu / fault-path changes)
+
+For changes inside `crates/akuma-exec/src/mmu/` or the fault/CoW/file-page-cache
+path, add clean-build kernel-compile trials: nothing else in this gate puts
+rustc-scale fork/mmap/demand-paging load through those exact walks. Procedure
+and Verify block: [`selfhost-kernel-build.md`](selfhost-kernel-build.md)
+§ "Run a build trial". The three rules that matter here:
+
+- **`cargo clean` before every trial** — a green incremental build proves
+  nothing, and no script issues the clean for you.
+- **A/B it**: same number of trials on a worktree at the parent commit. As of
+  2026-08-15 the baseline is green (10/10 clean builds), so a single red trial
+  on your arm is already a real finding — but confirm the baseline on *your*
+  image before concluding, and check the tripwire greps (`[PMM-RESURRECT]`
+  etc.) even on green runs.
+- **Do not retry past a failure** — capture both logs and match against that
+  runbook's Common failures table.
+
+Five trials per arm is a reasonable "extensive" batch: ~7–12 min each,
+unattended.
 
 ## Before calling anything a regression
 

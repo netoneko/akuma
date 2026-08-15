@@ -8,6 +8,60 @@ build + a nightly toolchain on a separate large disk.
 > stable toolchain. Self-hosting has actually compiled the kernel (147/147
 > units) and the self-built kernel boots.
 
+## Run a build trial (current procedure, 2026-08-15)
+
+A clean `-j4` `--release` build is now **expected green** (10/10 clean builds
+on 2026-08-15, devbox-smoltcp image; ~7–12 min). Every stochastic crash class
+from the 08-05/08-07 era below has been root-caused and fixed — the chronology
+lives in the archive docs linked from **Common failures**, not here. The
+consequence for procedure: **stop retrying through failures. A clean-build
+failure today is a regression finding — capture it.**
+
+1. Boot (§3, or `overlays/devbox/run-smoltcp.sh` for the devbox image). Add
+   `GDB=1` if you can afford it — a wedge on a VM booted without the gdbstub
+   is uninspectable, and the one still-open failure (Defect A, the all-core
+   wedge) has no other diagnostic path.
+2. In-guest, **cwd = the manifest dir**, and **start from `cargo clean` —
+   this is the trial, not hygiene.** A green *incremental* build proves
+   nothing: the fingerprint cache resumes past exactly the paths the fixed
+   classes exercised (proc-macro recompiles, every `.rlib` re-link, the full
+   toolchain re-faulted through the file-page cache). No script does the clean
+   for you — not `run_selfhost_kernelbuild.py`, `loop_selfhost_kernelbuild.py`,
+   nor `j4_selfhost_campaign.py`.
+
+   ```sh
+   cd /root/akuma && cargo clean && \
+     nohup sh -c '{ cargo build --release -p akuma -j4 --offline; echo EXIT=$?; } \
+       > /tmp/build.log 2>&1' &     # detached — §5.2, sshd kills long channels
+   ```
+
+3. While it runs, watch the **host-side boot log**, not just the guest:
+   any of `[PMM-RESURRECT]`, `[FILL-SHORT] got=Ok(0)`, `[PMM-UAF]`,
+   `[PMM-POISON]`, `[WILD-DA]` is a failed trial even if the build exits 0.
+
+### Verify
+
+```sh
+# in-guest: EXIT=0 and a real ELF at the target-triple path
+grep EXIT= /tmp/build.log                          # EXIT=0
+ls -la target/aarch64-unknown-none/release/akuma   # ~4.3 MB, not 16 KB
+
+# host-side boot log: every tripwire silent / zero
+grep -ac 'PMM-RESURRECT\|PMM-UAF\|PMM-POISON\|WILD-DA' <boot.log>   # 0
+grep -a 'FILL-SHORT' <boot.log>                    # no got=Ok(0) lines
+grep -a 'defer_leak' <boot.log>                    # defer_leak=0
+```
+
+**On failure:** keep both logs, match the symptom against **Common failures**
+below, and A/B against the parent commit before blaming your change — do not
+resume-retry past it. The §5 machinery (detached runs, wedge detection, 0-byte
+artifacts, reboot-through-poisoning) is still the right *mechanics* for driving
+a long campaign; its framing of crashes as weather is historical.
+
+**Between campaigns:** `e2fsck` the image (§5.5). Dozens of clean-build cycles
+with hard kills accumulate real filesystem damage whose symptom — a 15-minute
+boot behind a watchdog storm — impersonates a kernel regression.
+
 ## Status (2026-08-05) — the `release-smp-shared` build completes
 
 | | `cargo build --release -j1` (§1-§4 below) | in-VM `release-smp-shared` + `devbox-smoltcp` |
@@ -40,6 +94,10 @@ ssh.
 > predates the `mprotect` fix in [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md)
 > §2b. Check `.git/HEAD` in the guest before claiming a self-host build of a
 > given commit; the kernel prints the hash in `uname -a`.
+
+> **Superseded 2026-08-15** — the crash classes this paragraph described have
+> since been fixed; see "Status (2026-08-15)" above. Kept as written below for
+> the record of what the 08-05 runs looked like.
 
 The two crash classes below still fire during the dependency phase and still
 cost whole crate compiles — they are **not** fixed, they are only survivable by
@@ -126,7 +184,7 @@ leak the pipe write refcount that hung `rustc` in `read()` forever. Note the
 print is rate-limited to the first 64 fires, so 63 is near the cap and a longer
 run under-reports — reboot between measurements rather than looping in one boot.
 
-### The two remaining blockers — both OPEN, neither is the KTG class
+### The two remaining blockers — A still OPEN, B FIXED 2026-08-14; neither is the KTG class
 
 **Defect A — all-core wedge (run 1).** Hard-wedged at T459 (~7.6 min in): all 4
 vCPUs pinned at 100 %, serial console silent from mid-`[mmap]` storm onward,
@@ -688,7 +746,9 @@ same tree.
 | icache stale (`dc cvau`) | icache not flushed after code write | FIXED |
 | Stale I-cache spurious SVC | spurious svc during execve | FIXED (the headline §7k.6) |
 | `cargo --version` crash (EC=0x0) | **FIXED 2026-08-06** — OpenSSL `OPENSSL_cpuid_setup` executes `SM3SS1` (FEAT_SM3) which Apple Silicon lacks; the kernel's `EC=0x0` arm didn't deliver SIGILL so the probe handler couldn't recover. Now delivers SIGILL via `try_deliver_signal` (§6). The old "traps HVF CNTP" reading was a misattribution (that would be EC=0x18) | Nightly `/usr/local/bin/cargo` now runs under HVF. (Old workaround: apk cargo + nightly rustc, or `HVF=0` — no longer needed) |
-| `error: could not compile … (signal: 11)`, or all rustc processes frozen with `pthread_join` waiters | freshly-cloned thread SIGSEGVs at a fixed PC | **OPEN** — [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) |
+| `error: could not compile … (signal: 11)`, or all rustc processes frozen with `pthread_join` waiters | freshly-cloned thread SIGSEGVs at a fixed PC | **FIXED 2026-08-06** — three sub-causes (§2e tid-clear, §2g `THREAD_STATES` races, §2h trampoline/`AS MISMATCH`), all in [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md). A recurrence is news: identify *which* class per that runbook before assuming it is the same bug |
+| rustc ICE `decode error: Expected header tag [79, 68, 72, 84] but found [0, 0, 0, 0]` (`ODHT`), or any page reading back as zeros | The kernel served a zero page where file bytes belonged | **FIXED 2026-08-15**, two root causes (prefault stub hook; inode reuse under a live mapping). Latent rather than proven gone: `[FILL-SHORT] got=Ok(0)` and `defer_leak=` must stay 0 — [`../archive/ZERO_PAGE_ICE_FIX.md`](../archive/ZERO_PAGE_ICE_FIX.md) |
+| `rust-lld` rejects an `.rlib` it just wrote — `invalid sh_name (0x5000feed)`, `Archive::children failed`, `invalid sh_type … expected SHT_STRTAB` | Bytes decode to `0xFEEDFACE…` quarantine poison: a mapped file page's frame was freed and poisoned under the mapper | **FIXED 2026-08-15** (file-page-cache refcount windows W1/W2; 6/10 red → 10/10 green). `[PMM-RESURRECT]` must never print — [`../archive/MAPPED_PAGE_PREMATURE_FREE_FIX.md`](../archive/MAPPED_PAGE_PREMATURE_FREE_FIX.md) |
 | Final `akuma` crate sits on `Compiling akuma v0.0.7` forever at `-j4`; waiters on `0x300c2340` with `queued_for` > 900 s, **no** `[kill]` and **no** `[Fault]` lines | Lost scheduler wakeup in `schedule_blocking` — a wake that raced the `WAITING` publication was dropped. **FIXED 2026-08-05** | Fix is in; `-j1` remains the recipe until a `-j4` run confirms it (§5.1). Diagnosis: [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) §4a |
 | `Exec format error (os error 8)` on the same `build-script-build` every attempt | 0-byte artifact from a crashed link, still "fresh" to cargo | Delete the fingerprint dir (§5.4) — not a kernel bug |
 | Build restarts lose all progress; ssh dies ~every 5 min | remote cargo killed with the ssh session | Run detached + poll (§5.2) |
@@ -704,4 +764,7 @@ same tree.
   **`--release -j1`** build with a hardcoded `-p 2322`, and it retries in-band
   over ssh, so it does not cover the §5 flow (detached build, wedge detection,
   reboot-through-poisoning, `-j1` only for the final crate). Treat it as the
-  starting point, not the harness.
+  starting point, not the harness. **It also never runs `cargo clean`** — nor
+  does any other script here — so out of the box it measures incremental
+  resumes, not clean-build reliability; see "Status (2026-08-15)" for why that
+  distinction is the whole trial.
