@@ -1,0 +1,12 @@
+[package]
+name = "shareprobe"
+version = "0.1.0"
+edition = "2021"
+description = "Hunts the fork/CoW share-without-inc premature-free route (MAPPED_PAGE_PREMATURE_FREE_FIX.md route 2) — no files involved"
+
+[[bin]]
+name = "shareprobe"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma", features = ["chunked-allocator"] }

@@ -184,6 +184,57 @@ detector exists for the second reading — `[PMM-RESURRECT]` cannot see it
 null-`Rc` crashes recur, hunt that route with the `bssfork`/`cowstale`
 harnesses.
 
+## Targeted probes (userspace, in-tree)
+
+Two purpose-built probes now cover the two routes directly —
+`userspace/fpcprobe` and `userspace/shareprobe` (built by `userspace/build.sh`,
+shipped in `bootstrap/bin/`, ~20 KB each; push to a running VM over ssh and
+run from `/tmp`). Both self-verify pattern-stamped memory every generation and
+print `ALL PASS` / `CORRUPTION events=N`; a reported qword with a `0xFEEDFACE`
+high half is quarantine poison naming its own frame.
+
+- **`fpcprobe`** (route 1): 6 readers mmap the same file `PROT_READ` (the
+  rust-lld shape), fault/verify/munmap in a loop while a writer drives
+  `invalidate_inode` with content-identical rewrites, plus a private RW canary
+  arena per worker for second-order damage. `norename` (argv) omits the
+  rename dance.
+- **`shareprobe`** (route 2): no files anywhere. Fork storms over 2-page anon
+  RW regions (the autopsy victim's exact shape) with CoW-break scribbles,
+  child-side munmaps, parent munmap+remap racing live children, unreaped
+  teardown backlog, and full parent verification every generation.
+
+**Results on the fixed kernel (2026-08-15):**
+
+| probe | verdict |
+|---|---|
+| `shareprobe` (300 gens × 4 children) | **ALL PASS**, 0 events |
+| `fpcprobe norename` (6 workers × 300 gens) | **ALL PASS**, 0 events |
+| `fpcprobe` with renames | **CORRUPTION — but a different, NEW bug** (below) |
+| `[PMM-RESURRECT]` across all runs | 0 |
+
+**New defect found by `fpcprobe` (open, distinct from the premature free):**
+the fd layer is **path-identified** (`KernelFile` carries a `path`, no inode),
+so `sys_mmap` resolves `(inode, filesz)` by *path* even though it holds the fd
+(`resolve_file_extent`, `src/syscall/mem.rs`). An mmap that races a rename
+window records `inode=0` (the path-only fallback), and a demand fault landing
+in a later rename window fills by path, gets `Err(NotFound)`, and **silently
+installs a zero page** — witnessed by the (pre-existing) instrument:
+
+```
+[FILL-SHORT] pid=17 inode=0 file_off=0x0 want=4096 got=Err(NotFound)
+             va=0x10418000 path=/tmp/fpcprobe.dat — page left zero-filled
+```
+
+Linux semantics pin the **inode** at map time; a rename never affects an
+existing mapping. Akuma's path-only fallback cannot honor that, and
+write-to-tmp-then-rename is exactly cargo's atomic-write pattern — this is a
+plausible third contributor to the historical zero-page/ODHT failure class
+(`SELFHOST_ZERO_PAGE_HUNT.md` closed two others). The real fix is
+inode-identity in the fd layer (resolve and pin the inode at `open()`,
+`InodePin` already exists), which is an architectural change left for its own
+session. Until then, `[FILL-SHORT] … Err(NotFound)` with `inode=0` is the
+signature to grep for.
+
 ## Reproduction recipe (for re-running arms)
 
 ```bash

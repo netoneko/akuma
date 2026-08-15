@@ -32,6 +32,7 @@ pages — not every member has one).
 | `forktest` | Go fork/clone stress-testing harness; `forktest/c_stress/` holds pure-C musl-static control binaries (mmap/fault/futex/thread-spawn probes) used to disambiguate kernel bugs from Go-runtime bugs |
 | `hiss` | New/WIP crate, not yet a `userspace/Cargo.toml` workspace member — audio-related, reuses `wavplay`'s playback logic |
 | `echo2`, `elftest`, `hello`, `stackstress`, `termtest`, `allocstress` | Small repro/stress/example programs (echo loop, ELF-load + subprocess-spawn check, long-running argv/streaming test, exception-stack-overflow stress, terminal-attribute test, allocator-stress test) |
+| `fpcprobe`, `shareprobe` | Premature-free race probes (`docs/archive/MAPPED_PAGE_PREMATURE_FREE_FIX.md`): file-page-cache invalidate/evict-vs-mmap races with pattern verification (`fpcprobe`, pass `norename` to exclude the fd path-identity bug), and fork/CoW share-without-inc races over 2-page anon regions (`shareprobe`). Verdict lines `ALL PASS` / `CORRUPTION events=N`; a `0xFEEDFACE…` qword in a report is quarantine poison naming its frame |
 
 Removed members (documented in `docs/archive/`, kept for historical
 reference): `quickjs`, `needle-server`, `crush`, `stdcheck`, `top`, `stp_test`,

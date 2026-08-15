@@ -19,9 +19,11 @@ phys/virt translators. **Three crates — `akuma-ext2`, `akuma-virtio`,
 `akuma-net` — no longer depend on `akuma-exec` at all.** Full writeup:
 [`AKUMA_PRIMITIVES_EXTRACTION.md`](AKUMA_PRIMITIVES_EXTRACTION.md); current-state
 reference: [`../reference/subsystems/primitives.md`](../reference/subsystems/primitives.md).
-The *unblocked* half of Phase 4 (§8.5) is now also DONE (verified 2026-08-15);
-what remains of Phase 4 is only the *blocked* half — rungs 3–5 of this section,
-which need the thread-slot table's DAIF/clock/tid dependencies settled first.
+Phase 4 is now fully DONE, both halves: §5.555's rungs 1–6 (the blocked half)
+landed 2026-08-13, and the unblocked-half mop-up below landed 2026-08-14 —
+verified against the tree 2026-08-15 (dependency graph check: `akuma-virtio`,
+`akuma-net`, and `akuma-ext2` all depend on `akuma-primitives` alone, none on
+`akuma-exec`).
 
 **~~Known blocker, owned by no phase:~~ FIXED 2026-08-13.** ssh sessions died
 instantly on the extreme-size profile, blocking
@@ -1392,7 +1394,19 @@ it was deliberately not bundled into the move above.
 
 ## 5.10 Open audit: `#[inline]` across the crate boundary (raised 2026-08-13)
 
-**Not yet done — deferred by request.** Flagged on the grounds that inline
+**Settled 2026-08-14 the way this section suggested, before the 700-function sweep
+was ever done.** `[profile.release]` now sets `lto = "thin"` — full record in
+[`LTO_RELEASE_PROFILE.md`](LTO_RELEASE_PROFILE.md) — which is exactly the "pairing"
+this section proposed below, and it did make direction 1 (missing attributes) moot:
+LTO makes the callee IR visible across the codegen-unit boundary regardless of
+whether it carries `#[inline]`, so the crossing no longer depends on the sweep.
+**Still open:** the *speed* win this was chosen to buy is unmeasured — the decision
+was made on peak linker memory (fat's ~1.09 GB vs thin's ~779 MB matters because
+this kernel self-hosts on a 1 GB guest, acceptance 10), not on a microbenchmark of a
+boundary-crossing path. Direction 2 (spurious `#[inline(always)]` fighting the
+`extreme-size` size floor) is also still unaudited — LTO doesn't bear on that half.
+
+Flagged on the grounds that inline
 attributes have been applied ad hoc as code moved out of `src/` into `crates/`,
 and nobody has ever swept them. First measurements, which say the concern is
 real and not stylistic:
@@ -2124,8 +2138,8 @@ tree, all landed in `d21331a4`):
 | ~~twice-defined `MultiPollFuture`~~ **DONE** | one `struct MultiPollFuture` at `src/tests.rs:2671`, called from both former sites (`:2750`, `:9265`) |
 | ~~`ClientMem`/`NoMem` across two crates~~ **DONE 2026-08-13** | The home never needed settling — the trait was always in `akuma-rump` and the kernel always imported it (§4). Three impls → one `pub NoMem` with `faulting()`/`discarding()` |
 
-All four rows of the unblocked half are closed — Phase 4 in full now depends only
-on whether rungs 3–5 of §5.555 (the blocked half) are ever picked up.
+All four rows of the unblocked half are closed, and §5.555's blocked half (all
+six rungs) was already closed 2026-08-13 — Phase 4 has nothing left open.
 
 ### Phase 5 — the user-copy sweep (−167 `unsafe`, 19% of the tree)
 

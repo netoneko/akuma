@@ -1,0 +1,12 @@
+[package]
+name = "fpcprobe"
+version = "0.1.0"
+edition = "2021"
+description = "Triggers/regression-tests the file-page-cache premature-free race (MAPPED_PAGE_PREMATURE_FREE_FIX.md route 1)"
+
+[[bin]]
+name = "fpcprobe"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma", features = ["chunked-allocator"] }
