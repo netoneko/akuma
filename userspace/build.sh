@@ -299,7 +299,16 @@ echo "mmap_file (C) copied to bootstrap/bin/"
 # (docs/archive/USER_COPY_FOLD.md §5 — the bug the user-copy fold found, which
 # shipped without a test because a truncation looks exactly like a completion).
 # Calibrated ALL PASS on real Linux arm64; a FAIL here is the kernel.
-echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapmove (C, thread-spawn/mprotect/CoW/mremap probes)..."
+# fpcpoison: the CROSS-PROCESS integrity probe for the shared file-page cache
+# (src/file_page_cache.rs). mmapsum.c already checks one file from one process;
+# this one forks real processes that map the same file at the same instant,
+# which is the only way to see a poisoned `(inode, file_off)` entry — a page
+# whose fill came up short, published to the cache, and then served to every
+# other mapper as a hit. That is the mechanism behind rustc ICEing with
+# "Expected header tag [79, 68, 72, 84] but found [0, 0, 0, 0]" during the
+# self-host build. Pair a FAIL with the kernel's `[FILL-SHORT]` lines.
+# Calibrate ALL PASS on real Linux arm64; a FAIL here is the kernel.
+echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapmove + fpcpoison (C, thread-spawn/mprotect/CoW/mremap/file-page-cache probes)..."
 (
     cd forktest/c_stress
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mprotectlb mprotectlb.c
@@ -308,6 +317,7 @@ echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapm
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o bssfork bssfork.c -pthread
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o madvshared madvshared.c
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o mremapmove mremapmove.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o fpcpoison fpcpoison.c
 )
 cp forktest/c_stress/mprotectlb ../bootstrap/bin/
 cp forktest/c_stress/clonearg ../bootstrap/bin/
@@ -315,7 +325,8 @@ cp forktest/c_stress/cowstale ../bootstrap/bin/
 cp forktest/c_stress/bssfork ../bootstrap/bin/
 cp forktest/c_stress/madvshared ../bootstrap/bin/
 cp forktest/c_stress/mremapmove ../bootstrap/bin/
-echo "mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapmove (C) copied to bootstrap/bin/"
+cp forktest/c_stress/fpcpoison ../bootstrap/bin/
+echo "mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapmove + fpcpoison (C) copied to bootstrap/bin/"
 
 # spawnalias: the address-space identity canary for the thread-spawn SIGSEGV
 # class. Unlike clonearg (which proved the clone *handoff* is sound and would

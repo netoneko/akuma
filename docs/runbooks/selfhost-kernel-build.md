@@ -77,6 +77,17 @@ The `--release` (default-feature) kernel build now runs to completion in-VM at
 cargo build --release -p akuma -j4 --offline     # disk_selfhost.img, SMP=4, MEMORY=14336
 ```
 
+> **The artifact is at `target/aarch64-unknown-none/release/akuma`, not
+> `target/release/akuma`.** With `CARGO_BUILD_TARGET` set (or the tree's
+> `.cargo/config.toml` `[build] target`), `target/release/` holds only build-script
+> output, so "the build never produced a binary" is usually just this. And **run the
+> build with cwd = the manifest dir**: cargo discovers `.cargo/config.toml` and
+> `rust-toolchain.toml` by walking up from the *process cwd*, never from
+> `--manifest-path`. From a foreign cwd you silently lose `-Clink-arg=-Tlinker.ld`
+> and get a 16 KB ELF with `entry=0x0` and no `.text` — with `Finished` and exit 0.
+> The override, if you need it, is spelled `CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS`
+> (see `scripts/run_selfhost_kernelbuild.py`) and wants an **absolute** linker.ld path.
+
 Six `-j4` attempts are on record, all 2026-08-07 — one before the
 `kill_thread_group` stale-tid fix, five after (each a fresh boot with an empty
 `target/`, so each is an independent sample):
@@ -598,12 +609,21 @@ same tree.
   per iteration, which compounds across a full kernel build.
 
   Budget accordingly: **thin roughly doubles link time versus no LTO**, and the
-  in-VM figure will be worse than the host's 2.0×. If a self-host build starts
-  failing at the link step after this date, drop `lto` from `[profile.release]`
-  before suspecting anything else — that is a one-line bisect. `extreme-size`
+  in-VM figure will be worse than the host's 2.0×. `extreme-size`
   keeps `lto = true` (fat) and is unaffected: it is size-gated and never
   self-hosted. Full A/B and what is still unmeasured:
   [`../archive/LTO_RELEASE_PROFILE.md`](../archive/LTO_RELEASE_PROFILE.md).
+
+  > **Correction (2026-08-15): this paragraph used to say "if a self-host build
+  > starts failing at the link step after this date, drop `lto` before suspecting
+  > anything else — that is a one-line bisect." Do not do that first; it is a red
+  > herring.** Re-measured on the 2026-08-15 tree, `thin` costs **+1.4% peak RSS**
+  > (793,952,256 → 805,044,224) and **1.2×** relink (8.4 s → 10.2 s) — not the 2.0×
+  > and not an OOM cliff. The table above was measured on an older tree; treat its
+  > *ordering* as transferable and its magnitudes as stale. The build failure that
+  > actually prompted this warning was
+  > [`../archive/FPCACHE_ZERO_PAGE_POISONING.md`](../archive/FPCACHE_ZERO_PAGE_POISONING.md),
+  > which has nothing to do with LTO, and chasing `lto` first cost real time.
 - **`fs-cache` feature** is already **on** — it is in `default`, so
   `--features devbox-smoltcp,no-tests` includes it. Nothing to add. The lever is
   its *size*: `src/fs.rs` caps it at `min(RAM/8, 384 MB)` at mount. The ceiling

@@ -287,6 +287,30 @@ pub static USER_PAGES_FREED: AtomicUsize = AtomicUsize::new(0);
 /// load-bearing in this workload; zero means the change is inert here.
 pub static DP_IA_NOEXEC_FAULTS: AtomicUsize = AtomicUsize::new(0);
 
+/// File-backed demand-page fills whose `read_at` **errored or came up short**.
+///
+/// Pass B fills into a frame from `alloc_pages_zeroed`, so an incomplete read leaves
+/// the tail (or the whole page) as zeros. Both fill sites used to discard the
+/// `Result<usize, _>` entirely, which made that indistinguishable from a file that
+/// genuinely contains zeros — and the shareable arm then published the frame to
+/// `file_page_cache` under `(inode, file_off)`, so one transient short read became a
+/// *persistent, cross-process* zero page that every later mapper got as a cache hit
+/// without touching the disk.
+///
+/// That is the mechanism behind `rustc` ICEing with
+/// `Expected header tag [79, 68, 72, 84] but found [0, 0, 0, 0]` ("ODHT", the crate
+/// metadata header) during the self-host build: one poisoned `.rlib` page, then every
+/// concurrent `rustc` reading the same page of the same file.
+///
+/// **Non-zero here is always a defect.** A short read at this layer is not a normal
+/// EOF condition — the range was already clamped to `filesz` by the caller.
+pub static DP_FILE_FILL_SHORT: AtomicUsize = AtomicUsize::new(0);
+
+/// Pages withheld from `file_page_cache` because [`DP_FILE_FILL_SHORT`] fired for them.
+/// The gap between the two counters is the incomplete fills that were never eligible
+/// to be published anyway (not fully covered by file data, or a private mapping).
+pub static DP_FILE_FILL_UNPUBLISHED: AtomicUsize = AtomicUsize::new(0);
+
 #[inline]
 pub fn dp_count(counter: &AtomicUsize, n: usize) {
     counter.fetch_add(n, Ordering::Relaxed);
@@ -299,7 +323,7 @@ pub fn dp_count(counter: &AtomicUsize, n: usize) {
 pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
     let _ = write!(
         w,
-        "file={} anon={} cow={} protnone={} eager={} freed={} ia_noexec={}",
+        "file={} anon={} cow={} protnone={} eager={} freed={} ia_noexec={} fill_short={} unpub={}",
         DP_FILE_PAGES.load(Ordering::Relaxed),
         DP_ANON_PAGES.load(Ordering::Relaxed),
         DP_COW_PAGES.load(Ordering::Relaxed),
@@ -307,5 +331,7 @@ pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
         EAGER_MMAP_PAGES.load(Ordering::Relaxed),
         USER_PAGES_FREED.load(Ordering::Relaxed),
         DP_IA_NOEXEC_FAULTS.load(Ordering::Relaxed),
+        DP_FILE_FILL_SHORT.load(Ordering::Relaxed),
+        DP_FILE_FILL_UNPUBLISHED.load(Ordering::Relaxed),
     );
 }

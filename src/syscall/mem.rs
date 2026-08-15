@@ -330,6 +330,38 @@ pub(super) fn sys_brk(new_brk: usize) -> u64 {
     } else { 0 }
 }
 
+/// Resolve `(inode, filesz)` for a file-backed lazy region.
+///
+/// **`filesz` describes FILE data, not the mapping**, and the difference is a
+/// correctness boundary rather than a detail. `mmap` may legally map more than the
+/// file holds — the tail past EOF reads as zeros for *this* mapping and SIGBUSes on
+/// write — so a page beyond EOF has a zero-fill tail whose length belongs to the
+/// mapping, not to the file. `file_page_cache`'s eligibility rules say exactly that
+/// ("Fully covered by file data … two mappers can legitimately disagree about its
+/// contents"), and the fault path decides *fully covered* by testing against `filesz`.
+///
+/// Passing the mmap length here defeated that test: every page between EOF and the
+/// end of the mapping was classed as fully covered, read short (`read_at_by_inode`
+/// clamps to the real size and returns `Ok(0)` past it), left zeroed by
+/// `alloc_pages_zeroed` — and then **published to the shared cache under
+/// `(inode, file_off)`**, making those zeros authoritative for every other process
+/// that maps the same file. That is the ODHT-header corruption in
+/// `docs/archive/FPCACHE_ZERO_PAGE_POISONING.md`.
+///
+/// If the size cannot be read, the mapping still works (the read extent falls back to
+/// `len`) but `inode` is zeroed, which disables both `lookup_and_ref` and `insert` —
+/// without a size there is no way to tell a real page from a past-EOF one, and
+/// refusing to share is the safe direction.
+fn resolve_file_extent(path: &str, offset: usize, len: usize) -> (u32, usize) {
+    match crate::vfs::file_size(path) {
+        Ok(file_len) => (
+            crate::vfs::resolve_inode(path).unwrap_or(0),
+            core::cmp::min(len, (file_len as usize).saturating_sub(offset)),
+        ),
+        Err(_) => (0, len),
+    }
+}
+
 /// Fallback when an eager mmap can't get its frames even after reclaiming clean
 /// file pages: reserve the region lazily (demand-paged) instead of returning
 /// ENOMEM. A lazy region is just a VA reservation that always succeeds; its pages
@@ -346,12 +378,12 @@ fn mmap_eager_to_lazy_fallback(
             let path = f.path.clone();
             // On-disk metadata read — dropped-BKL window like the other read paths
             // (Phase 2e of the no-bkl-vfs carve-out).
-            let inode = {
+            let (inode, filesz) = {
                 let _vfs_window = super::fs::VfsBklGuard::new();
-                crate::vfs::resolve_inode(&path).unwrap_or(0)
+                resolve_file_extent(&path, offset, len)
             };
             let source = akuma_exec::process::LazySource::File {
-                path, inode, file_offset: offset, filesz: len, segment_va: mmap_addr,
+                path, inode, file_offset: offset, filesz, segment_va: mmap_addr,
             };
             let count = akuma_exec::process::push_lazy_region_with_source(
                 proc.tgid, mmap_addr, pages * 4096, page_flags, source);
@@ -470,15 +502,15 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             // Path→inode resolution reads ext2 metadata (real I/O on a cold cache) —
             // take the dropped-BKL window for it like every other on-disk read path
             // (Phase 2e of the no-bkl-vfs carve-out).
-            let inode = {
+            let (inode, filesz) = {
                 let _vfs_window = super::fs::VfsBklGuard::new();
-                crate::vfs::resolve_inode(&path).unwrap_or(0)
+                resolve_file_extent(&path, offset, len)
             };
             let source = akuma_exec::process::LazySource::File {
                 path: path.clone(),
                 inode,
                 file_offset: offset,
-                filesz: len,
+                filesz,
                 segment_va: mmap_addr,
             };
             let count = akuma_exec::process::push_lazy_region_with_source(

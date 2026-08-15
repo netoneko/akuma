@@ -1354,6 +1354,10 @@ fn demand_page_lazy_region(
             let pf = frame_pool[pool_idx];
             pool_idx += 1;
 
+            // `true` unless the fill below came up short. A page with no file data to
+            // read (entirely past `filesz`) is trivially complete: its zeros are the
+            // mapping's own zero-fill tail, not a failed read.
+            let mut fill_complete = true;
             {
                 let pg_data_start = core::cmp::max(cur_va, segment_va);
                 let pg_data_end = core::cmp::min(cur_va + 0x1000, segment_va + filesz);
@@ -1365,10 +1369,22 @@ fn demand_page_lazy_region(
                     let page_buf = unsafe {
                         core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
                     };
-                    if inode != 0 {
-                        let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
+                    let got = if inode != 0 {
+                        crate::vfs::read_at_by_inode(path, inode, file_off, page_buf)
                     } else {
-                        let _ = crate::vfs::read_at(path, file_off, page_buf);
+                        crate::vfs::read_at(path, file_off, page_buf)
+                    };
+                    // The range is already clamped to `filesz`, so anything less than
+                    // `len` is a defect, not EOF. The frame came from
+                    // `alloc_pages_zeroed`, so whatever was not read reads back as
+                    // zeros — indistinguishable from real file content unless we say so
+                    // here. See `pmm::DP_FILE_FILL_SHORT`.
+                    fill_complete = got == Ok(len);
+                    if !fill_complete {
+                        crate::pmm::dp_count(&crate::pmm::DP_FILE_FILL_SHORT, 1);
+                        crate::tprint!(224,
+                            "[FILL-SHORT] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} — page left zero-filled\n",
+                            pid, inode, file_off, len, got, cur_va);
                     }
                 }
             }
@@ -1393,12 +1409,23 @@ fn demand_page_lazy_region(
             // exactly as true as the gate above: `false` means "maintain it yourself",
             // which is the safe direction for a later `RX` mapper. See
             // COW_PILE_AUDIT.md F5 and §12.1.
+            //
+            // `fill_complete` is the load-bearing addition: publishing a frame whose
+            // fill came up short turns one transient read failure into a permanent
+            // `(inode, file_off)` entry full of zeros, which every later mapper takes
+            // as a *hit* and never re-reads. The frame stays private and correct-ish
+            // for this mapper (it is what the read produced); it just does not get to
+            // speak for every other process.
             if cur_va >= segment_va
                 && cur_va + 0x1000 <= segment_va + filesz
                 && shareable_mapping
             {
-                let file_off = file_offset + (cur_va - segment_va);
-                crate::file_page_cache::insert(inode, file_off, pf, is_exec);
+                if fill_complete {
+                    let file_off = file_offset + (cur_va - segment_va);
+                    crate::file_page_cache::insert(inode, file_off, pf, is_exec);
+                } else {
+                    crate::pmm::dp_count(&crate::pmm::DP_FILE_FILL_UNPUBLISHED, 1);
+                }
             }
             filled.push((cur_va, pf));
             cur_va += 0x1000;
@@ -1492,10 +1519,20 @@ fn demand_page_lazy_region(
                 let page_buf = unsafe {
                     core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
                 };
-                if inode != 0 {
-                    let _ = crate::vfs::read_at_by_inode(path, inode, file_off, page_buf);
+                let got = if inode != 0 {
+                    crate::vfs::read_at_by_inode(path, inode, file_off, page_buf)
                 } else {
-                    let _ = crate::vfs::read_at(path, file_off, page_buf);
+                    crate::vfs::read_at(path, file_off, page_buf)
+                };
+                // This arm never publishes to `file_page_cache`, so a short read here
+                // poisons only the faulting process — but it is the same defect and
+                // shares the counter, so a build that trips one can be told from a
+                // build that trips the other by the `[FILL-SHORT]` tag alone.
+                if got != Ok(len) {
+                    crate::pmm::dp_count(&crate::pmm::DP_FILE_FILL_SHORT, 1);
+                    crate::tprint!(224,
+                        "[FILL-SHORT/single] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x}\n",
+                        pid, inode, file_off, len, got, page_va);
                 }
             }
             if is_exec {
