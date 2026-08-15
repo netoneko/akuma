@@ -807,6 +807,23 @@ Clamping the fill would only hide it. Ranked:
    detectable error. The minimum honest step, and a prerequisite instrument for
    either real fix.
 
+### Post-repair sanity arm (same night, closes the loop)
+
+After the repair (and after `/tmp/akuma` was restored from the pre-cloned
+`/root/akuma`), the gated-print kernel — `[UNLINK]`/`[O_TRUNC-ZAP]`/`[FTRUNC-0]`
+now behind `SYSCALL_DEBUG_IO_ENABLED`, clippy clean, 322 host tests green —
+booted to sshd in **9 s** and ran **3/3 clean builds green**. Cumulative:
+**14 consecutive greens** across three kernels (10 counters-arm + 1 actor-arm +
+3 sanity), with zero Mode A/B decode errors in any of them — and the defect
+still firing underneath (§ the actor arm's fills on green builds), so the
+streak is luck-of-scheduling, not absence of mechanism.
+
+One instrument-semantics change landed with the gating, after the actor arm:
+`[E2-EOF]`/`E2_READ_AT_EOF` now fire only when `offset > file_size` — the
+shrinkage anomaly. The old condition (`offset >= file_size`, any non-zero
+offset) also counted every ordinary read-at-end, which made the counter noise;
+the arms above were scored under the old semantics.
+
 ### What is NOT done (carrying §11 forward)
 
 - **The ICE is not proven fixed.** 11 green builds is a streak; the mechanism
@@ -817,6 +834,177 @@ Clamping the fill would only hide it. Ranked:
 - `signal: 11` and the SIGABRT/LTO class are untouched.
 - The `SMP=1` wedge still blocks every single-core control (§11).
 - **T1** (read/readv copy shortness) remains untested.
+
+## 15. T5b FIXED: the mapping now pins its inode (2026-08-15, night)
+
+§14 diagnosed the lifecycle defect and ranked three fixes. This is option 1 — the
+Linux semantics — implemented, because options 2 and 3 both leave a mapper
+reading bytes that are not its file's.
+
+### The rule
+
+**A `LazySource::File` region holds a reference on its inode for as long as it
+exists, and the filesystem will not free a referenced inode.** `unlink` removes
+the name and stops there; the truncate and the bitmap free happen when the last
+mapping goes. An unlinked-but-still-mapped inode keeps its size and its block
+pointers, which is exactly what lets the mapper go on reading correct data.
+
+### Why it is a `Clone`/`Drop` handle and not a counter
+
+The hard part was never the count, it was the **call sites**. Regions are copied
+and destroyed by `push` (including replacement at an existing VA), `remove`,
+`clear`, fork's `extend_from_slice` and `replace_with_clone`, `update_flags`'s
+three-way split, `munmap_one_overlap`'s four clip shapes, and `Process::drop`.
+Hand-maintaining a reference count across those is precisely the kind of ~40-site
+bookkeeping §7 of this document already found this tree getting wrong.
+
+So the count is maintained by the type, not by the code:
+
+```rust
+LazySource::File { path, inode, file_offset, filesz, segment_va, pin: InodePin }
+```
+
+`InodePin::clone` increments and `InodePin::drop` decrements
+(`crates/akuma-primitives/src/inode_pin.rs`). Every path above already copies or
+drops the `LazySource`, so **all of them became correct at once**, and none of
+them mentions the pin. `LazySource::file()` is the only constructor, so a caller
+cannot build an unpinned file region either.
+
+Nothing ever *reads* the field. It is load-bearing entirely through its
+destructor — which is worth knowing before someone deletes it as dead weight.
+
+### Lock-free, because of where it is called from
+
+The two callers sit on opposite sides of a lock-ordering hazard: pins are taken
+and dropped on the demand-fault path, and `is_pinned` is read by ext2 **while
+holding its state write lock**. A spinlock would be an AB-BA waiting to happen,
+so the table is a fixed 1024-slot open-addressed array of atomics with CAS
+updates and tombstone reuse — no allocation, no lock, callable from any context.
+
+### Every failure mode defers a free rather than permitting one
+
+- Keyed on the inode number **alone**, with no filesystem identity, so two mounts
+  sharing a number alias. Aliasing can only *add* pins, so it costs a deferred
+  free and never a freed mapping. (The deferral list itself is per-filesystem,
+  which is not optional — a shared one lets one mount's drain free another
+  mount's inode. The first draft had it global and the test suite's parallel
+  mounts caught it.)
+- Pin table full → the pin is unrecorded, `pin_ovf` counts it, and `is_pinned`
+  answers `true` for **everything** until the lost pins are released.
+- Deferral list full → the inode is **leaked**, not freed: `defer_leak` counts it
+  and `e2fsck` reclaims it. Leaked blocks are recoverable; bytes handed to the
+  wrong reader are not.
+
+Drains run on unlink and on inode allocation, so a build's own unlink storm keeps
+the list short, and a filesystem cannot report itself full while holding inodes
+nothing references.
+
+### A second fix the design requires: invalidate the page cache by inode
+
+`file_page_cache` is keyed on **`(inode, file_offset)`**, and `vfs::remove_file`
+invalidates it *by path*, before the unlink. Deferring the free makes that
+structurally too early: an unlinked-but-still-mapped file goes on faulting, and
+every successful fill **publishes pages under a number that is about to be
+reissued**. The next file to take that number would inherit a dead file's cached
+pages.
+
+Under the old behaviour this could not happen, by accident rather than design:
+the unlinked inode was truncated at once, so those fills returned `Ok(0)`,
+`fill_complete` went false, and the pages were **withheld from the cache**
+(`DP_FILE_FILL_UNPUBLISHED`). Repairing the fills removes that accident, so the
+deferral has to pay for it explicitly.
+
+It does, with a callback at ext2's `free_inode` — the single point where a number
+returns to the allocator — invalidating the cache by inode. The pin is what makes
+that callback race-free: `LazyRegionMap::lookup` **clones** the `LazySource` for
+the caller to use outside the lock, and that clone carries a pin, so a fill in
+flight is a live reference and an inode reaching `free_inode` provably has no
+fill that could republish behind the invalidation.
+
+### The scare that wasn't: a 1-build control almost sold a false conclusion
+
+Worth recording, because it is rule 1 catching the author of this document.
+
+Two clean builds on the fixed kernel failed with the linker rejecting freshly
+built artifacts (`invalid sh_type … expected SHT_STRTAB`, `ELF section name out
+of range`), one of them killing `zerocopy-derive` **and** `enumn` in the same
+second on the same `libsyn.rlib` — the hunt's signature pairing (§1), reached
+through the linker instead of rustc's decoder. A single as-found control build
+came back **green**, and the obvious reading was "the regression is yours".
+
+It was not. Extending the control to four builds gave **1 green / 4**, against
+the fixed kernel's **1 green / 3** — indistinguishable — and control build 2
+failed as `a section [index 30] has an invalid sh_name (0x5000feed)`. The
+`0xfeed` is the tell: that is **PMM quarantine poison** read out of a mapped
+file page, the same signature as the fixed kernel's
+`\x00P\x8eA\xce\xfa\xed\xfe` (`0xFEEDFACE418E5000`). Both arms corrupt, at the
+same rate, in the same way.
+
+So the pin fix neither caused this nor cures it. And the near-miss is exactly
+what rule 1 exists for: *one* control build is not a control arm, and it pointed
+confidently the wrong way.
+
+### What the poison actually tells the next session
+
+This is the sharpest evidence the hunt has produced for the **premature-free**
+class (`CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md`, still open), and it is better
+evidence than a null `Rc`:
+
+- The poison appears **inside a file-backed mapped page** — a freshly built
+  `.rlib` the linker was reading — so a *file page* frame is being freed while
+  still mapped. That narrows the search to file-page frame accounting
+  (`file_page_cache` refcounts, CoW refs on shared file pages), away from the
+  anonymous-heap theories.
+- It is **self-identifying**: `poison ^ 0xFEEDFACEDEAD0000` names the frame, so a
+  single reproduction plus `report_poison_value` should name the free site
+  directly — the `FreeSite` tag is what cracked §8 in one boot.
+- `[FILL-SHORT]`, `[E2-EOF]` and `[PMM-POISON]` all read **0** on these builds,
+  so the kernel never noticed: the frame was freed and reused with the quarantine
+  never firing on it. Whatever drops that last reference believes it is entitled
+  to.
+
+One refcount bug spotted while reading that path, unrelated to any of the above
+and **not** yet fixed: `file_page_cache::insert` returns early when a peer has
+already cached the key, but its `cow_ref_inc(frame.addr)` sits *after* the
+closure and runs anyway — so a lost publish race leaks a reference on the
+caller's private frame. That leaks rather than corrupts, which is why nothing has
+noticed it.
+
+### What this does not fix
+
+- **`open(O_TRUNC)` on a mapped file still truncates in place.** Linux does the
+  same (mappers take SIGBUS past the new EOF, where this kernel gives zeros), and
+  `[O_TRUNC-ZAP]` fired twice in the whole actor arm, both on
+  `.rustc_info.json`. Left alone deliberately; it is not the actor.
+- **Only ext2 defers.** `overlay_fs`/`subdir_fs` delegate, so they inherit it for
+  ext2-backed files; any future filesystem that frees inodes needs the same
+  check.
+- The `3/10 → 10/10` rate move of §14 is **still unexplained**, and this fix does
+  not explain it.
+- T1 (read/readv copy shortness) is still untested; T3's `SMP=1` wedge still
+  blocks the single-core control.
+
+### Verification
+
+| Layer | Test | Result |
+|---|---|---|
+| `akuma-primitives` | 8 tests: refcounting, clone/drop, tombstone reuse, hash collisions, overflow is conservative *and* self-clearing | pass |
+| `akuma-exec` | 8 tests: pins follow `push`/`remove`/`clear`/map-drop, fork propagation takes its own reference, same-VA replacement swaps the pin, munmap clip shapes and `mprotect` splits keep the count matching the pieces | pass |
+| `akuma-ext2` | 6 tests: **data readable after unlink**, **number not reissued while pinned**, reclaimed once unpinned, unpinned unlink still frees immediately, repeated cycles do not exhaust the list, and a freed number is reported for cache invalidation — at drain time for a deferred free, not at unlink | pass |
+| kernel boot suite | `test_unlinked_inode_survives_while_pinned` — the whole path against the live VFS | `PASSED (inode 36 kept its 21 bytes across unlink, not reissued)` |
+
+555 host tests and 275 boot-suite tests pass; kernel `clippy` clean.
+
+**Workload level: not validated, and not claimed.** A 3-build arm on the fixed
+kernel scored 1 green; the 4-build as-found control scored 1 green. The fix
+closes a defect its tests prove is closed, and moves the self-host build's
+success rate not at all — because what dominates that workload now is the
+premature-free class above, which this fix does not touch. Anyone re-scoring
+should run ten builds per arm (rule 1) on a freshly repaired image (rule 12).
+
+The counters to watch are in the `[Mem]` line: `pin=` (inodes held by live
+mappings, rises and falls with the build), `pin_ovf=`, `defer=` (should drain to
+0) and **`defer_leak=`, which must stay 0**.
 
 ## Background
 

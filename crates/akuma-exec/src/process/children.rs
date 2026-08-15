@@ -1696,13 +1696,7 @@ mod lazy_region_propagation_tests {
     }
 
     fn file_source(path: &str, inode: u32) -> LazySource {
-        LazySource::File {
-            path: alloc::string::String::from(path),
-            inode,
-            file_offset: 0,
-            filesz: 0x2000,
-            segment_va: 0x2000_0000,
-        }
+        LazySource::file(alloc::string::String::from(path), inode, 0, 0x2000, 0x2000_0000)
     }
 
     #[test]
@@ -1737,6 +1731,135 @@ mod lazy_region_propagation_tests {
 
         // The parent keeps its own regions — propagation is a copy, not a move.
         assert_eq!(parent.len(), 2);
+    }
+
+    // ── Inode pins follow region lifetime ───────────────────────────
+    //
+    // A `LazySource::File` region holds an `InodePin` that stops the filesystem
+    // freeing its inode underneath it (`SELFHOST_ZERO_PAGE_HUNT.md` §14). Nothing
+    // reads that field, so nothing would notice it going wrong — these tests are
+    // the check that every mutation on this map leaves the count balanced.
+    //
+    // Each test uses its own inode number: the pin table is a process-wide
+    // static, so shared numbers would make peers interfere.
+
+    use akuma_primitives::inode_pin::pin_count;
+
+    #[test]
+    fn a_file_region_pins_its_inode_until_it_is_removed() {
+        let ino = 50_001;
+        let mut map = LazyRegionMap::new();
+        assert_eq!(pin_count(ino), 0);
+
+        map.push(0x1000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
+        assert_eq!(pin_count(ino), 1, "a live region must pin its inode");
+
+        map.remove(0x1000_0000);
+        assert_eq!(pin_count(ino), 0, "removing the region must release it");
+    }
+
+    #[test]
+    fn dropping_the_whole_map_releases_every_pin() {
+        // The `Process::drop` path: a dying process must not leave its inodes
+        // pinned forever, or their disk space is never reclaimed.
+        let ino = 50_002;
+        {
+            let mut map = LazyRegionMap::new();
+            map.push(0x1000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
+            map.push(0x2000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
+            assert_eq!(pin_count(ino), 2);
+        }
+        assert_eq!(pin_count(ino), 0, "map drop must release all of them");
+    }
+
+    #[test]
+    fn clear_releases_every_pin() {
+        // `exec` replacing the image: same requirement as drop.
+        let ino = 50_003;
+        let mut map = LazyRegionMap::new();
+        map.push(0x1000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
+        assert_eq!(pin_count(ino), 1);
+
+        map.clear();
+        assert_eq!(pin_count(ino), 0);
+    }
+
+    #[test]
+    fn fork_propagation_takes_a_reference_of_its_own() {
+        // The child maps the same file, so the inode must stay pinned until
+        // *both* are gone — a child outliving its parent is the ordinary case.
+        let ino = 50_004;
+        let mut parent = LazyRegionMap::new();
+        parent.push(0x1000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
+
+        let mut child = LazyRegionMap::new();
+        child.extend_from_slice(&snapshot(&parent));
+        assert_eq!(pin_count(ino), 2, "parent and child hold one each");
+
+        parent.clear();
+        assert_eq!(pin_count(ino), 1, "the child's mapping still needs the file");
+
+        child.clear();
+        assert_eq!(pin_count(ino), 0);
+    }
+
+    #[test]
+    fn replacing_a_region_at_the_same_va_swaps_the_pin() {
+        // `push` over an existing key drops the old region — its pin must go
+        // with it, or a re-mmap'd VA leaks a pin on the previous file.
+        let old = 50_005;
+        let new = 50_006;
+        let mut map = LazyRegionMap::new();
+        map.push(0x1000_0000, 0x1000, 0x1, file_source("/old.so", old));
+        map.push(0x1000_0000, 0x1000, 0x1, file_source("/new.so", new));
+
+        assert_eq!(pin_count(old), 0, "the replaced region must release its pin");
+        assert_eq!(pin_count(new), 1);
+        map.clear();
+        assert_eq!(pin_count(new), 0);
+    }
+
+    #[test]
+    fn munmap_clip_shapes_keep_the_count_matching_the_pieces() {
+        // Every clip shape rebuilds regions by remove-then-insert, which is
+        // exactly where a hand-maintained count would drift.
+        let ino = 50_007;
+        let mut map = LazyRegionMap::new();
+        map.push(0x1000_0000, 0x4000, 0x1, file_source("/lib.so", ino));
+        assert_eq!(pin_count(ino), 1);
+
+        // Middle split: one region becomes two, so two pins.
+        map.munmap_one_overlap(0x1000_1000, 0x1000_2000);
+        assert_eq!(pin_count(ino), 2, "a middle split leaves two live regions");
+
+        // Full unmap of everything that is left.
+        while map.munmap_one_overlap(0x1000_0000, 0x1000_4000).is_some() {}
+        assert_eq!(pin_count(ino), 0, "unmapping it all must release every pin");
+    }
+
+    #[test]
+    fn mprotect_splitting_a_region_keeps_the_pin() {
+        // `update_flags` also removes and re-inserts up to three pieces.
+        let ino = 50_008;
+        let mut map = LazyRegionMap::new();
+        map.push(0x1000_0000, 0x4000, 0x1, file_source("/lib.so", ino));
+
+        map.update_flags(0x1000_1000, 0x1000, 0x7);
+        assert_eq!(pin_count(ino), 3, "split into three pieces, three pins");
+
+        map.clear();
+        assert_eq!(pin_count(ino), 0);
+    }
+
+    #[test]
+    fn anonymous_regions_pin_nothing() {
+        // `LazySource::Zero` has no file behind it; it must not touch the table.
+        let mut map = LazyRegionMap::new();
+        map.push(0x1000_0000, 0x1000, 0x1, LazySource::Zero);
+        // An inode-0 file region is the "read by path" case and is equally inert.
+        map.push(0x2000_0000, 0x1000, 0x1, file_source("/by-path", 0));
+        assert_eq!(pin_count(0), 0);
+        map.clear();
     }
 
     #[test]

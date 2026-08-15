@@ -40,7 +40,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 #[cfg(not(kernel_profile_extreme))]
 use spinning_top::Spinlock;
 use spinning_top::RwSpinlock;
@@ -341,6 +341,9 @@ static EXT2_WRITE_LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
 /// Diagnostic (2026-08-15 zero-page hunt): cache hits whose bytes did not match
 /// a direct disk re-read (`[E2C-BAD]`). Non-zero means this layer is serving
 /// stale data — the "wrong bytes" half of the self-host ICE residue.
+/// Gated with its only consumer (`verify_cached_block`): `extreme` has no block
+/// cache at all, so there is nothing to verify and the counter is dead there.
+#[cfg(not(kernel_profile_extreme))]
 pub static E2_CACHE_VERIFY_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 
 /// Runtime gate for the `[E2C-BAD]` verification — **default off**, and that is
@@ -349,6 +352,7 @@ pub static E2_CACHE_VERIFY_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 /// interleavings a coherence race needs. The first instrumented arm went 4/4
 /// green with it on and proved nothing (hunt §13, handoff rule 10). Turn it on
 /// only when actively chasing T4, and never trust a rate scored with it on.
+#[cfg(not(kernel_profile_extreme))]
 pub static E2_VERIFY_HITS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -358,6 +362,77 @@ pub static E2_VERIFY_HITS: core::sync::atomic::AtomicBool =
 /// (pread at end of file) land here too, so this is a *rate* signal: a burst
 /// correlated with `[FILL-SHORT]` is the defect.
 pub static E2_READ_AT_EOF: AtomicUsize = AtomicUsize::new(0);
+
+// ==========================================================================
+// Deferred inode frees — "unlinked but still mapped"
+// ==========================================================================
+
+/// Slots for inodes unlinked while still mapped.
+///
+/// Sized for the worst case observed in a `-j4` self-host build, where the whole
+/// deferred set drains within a handful of unlinks (`cargo` unlinks ~1000 files
+/// per build, and every one of them drains this list first).
+///
+/// A fixed array of atomics rather than a `Vec` because it is manipulated under
+/// the state write lock on paths that must not allocate, and because a bounded
+/// structure cannot itself become the reason a free is lost.
+const DEFERRED_FREE_SLOTS: usize = 256;
+
+/// The per-filesystem list of inodes whose last name was removed while a mapping
+/// still held them pinned. The dirent is gone, but the inode keeps its size and
+/// block pointers so the mapping goes on reading real data; the truncate and the
+/// bitmap free happen in [`Ext2Filesystem::drain_deferred_frees`] once the last
+/// pin drops. `0` means an empty slot.
+///
+/// **Per-filesystem, not global**, and that is a correctness requirement rather
+/// than tidiness: an inode number only means something relative to the
+/// filesystem that issued it, so a shared list would let one mount's drain free
+/// an unrelated inode on another. (The global version of this list failed
+/// exactly that way against the test suite's parallel mounts.)
+struct DeferredFrees {
+    slots: [AtomicU32; DEFERRED_FREE_SLOTS],
+}
+
+impl DeferredFrees {
+    const fn new() -> Self {
+        Self { slots: [const { AtomicU32::new(0) }; DEFERRED_FREE_SLOTS] }
+    }
+
+    /// Record `inode` for a later free. Returns `false` if there was no room, in
+    /// which case the caller must leak it rather than free it.
+    fn push(&self, inode: u32) -> bool {
+        for slot in &self.slots {
+            if slot.load(Ordering::Relaxed) != 0 {
+                continue;
+            }
+            if slot.compare_exchange(0, inode, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                DEFERRED_FREE_PENDING.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        DEFERRED_FREE_LEAKED.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+/// Inodes currently awaiting a deferred free, across every mount, for the
+/// `[Mem]` dump. Tracked as a counter because the lists themselves are
+/// per-filesystem and the dump has no filesystem in hand.
+pub static DEFERRED_FREE_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Inodes leaked rather than freed, because they were unlinked while pinned and
+/// the deferral list was full.
+///
+/// Leaked blocks are recoverable (`e2fsck` reconnects them to `lost+found`);
+/// bytes handed to the wrong reader are not, which is why this is the direction
+/// the overflow falls. Non-zero here means the bound needs raising.
+pub static DEFERRED_FREE_LEAKED: AtomicUsize = AtomicUsize::new(0);
+
+/// Inodes currently awaiting their deferred free, for the `[Mem]`/PSTATS dump.
+#[must_use]
+pub fn deferred_free_pending() -> usize {
+    DEFERRED_FREE_PENDING.load(Ordering::Relaxed)
+}
 
 /// Kernel callbacks the orphaned-lock recovery path needs. Registered once at
 /// boot by `src/fs.rs`.
@@ -392,6 +467,44 @@ pub fn init_thread_hooks(current_thread_id: fn() -> usize, is_thread_dead: fn(us
         current_thread_id,
         is_thread_dead,
     });
+}
+
+/// Kernel callback invoked when an inode number is returned to the allocator.
+///
+/// The kernel's `file_page_cache` is keyed on **`(inode, file_offset)`**, so a
+/// recycled inode number silently inherits the previous file's cached pages
+/// unless they are dropped at the moment the number is released. Path-keyed
+/// invalidation at `unlink` is not enough: a mapping of an unlinked file goes on
+/// faulting and publishing pages under that number right up until its last
+/// reference drops.
+///
+/// This was not hypothetical. Deferring the free (so unlinked-but-mapped files
+/// keep their data) removed an *accidental* protection: before it, those fills
+/// hit the truncated inode, returned `Ok(0)` and were withheld from the cache by
+/// `fill_complete`. Once they started succeeding, the stale entries became
+/// reachable and the next file to take the number read the dead file's bytes —
+/// which showed up as `rust-lld: ELF section name out of range` on a freshly
+/// built `libsyn.rlib`. See `docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §15.
+#[derive(Clone, Copy)]
+struct InodeFreedHook {
+    invalidate_pages: fn(u32),
+}
+
+static INODE_FREED_HOOK: Registered<InodeFreedHook> =
+    Registered::new("akuma-ext2: InodeFreedHook not registered");
+
+/// Register the "this inode number is being reissued" callback.
+///
+/// Called once by the kernel at boot; unregistered (host tests, early boot)
+/// degrades to a no-op, which is correct because neither has a page cache.
+pub fn init_inode_freed_hook(invalidate_pages: fn(u32)) {
+    INODE_FREED_HOOK.register(InodeFreedHook { invalidate_pages });
+}
+
+fn on_inode_freed(inode: u32) {
+    if let Some(h) = INODE_FREED_HOOK.get() {
+        (h.invalidate_pages)(inode);
+    }
 }
 
 fn current_thread_id() -> usize {
@@ -694,6 +807,8 @@ pub struct Ext2Filesystem<B: BlockDevice> {
     state: RwSpinlock<Ext2State>,
     #[cfg(not(kernel_profile_extreme))]
     block_cache: Spinlock<BlockCache>,
+    /// Inodes unlinked while a mapping still pinned them — see [`DeferredFrees`].
+    deferred: DeferredFrees,
 }
 
 /// The active block cache type: the large clock cache under the `fs-cache`
@@ -754,6 +869,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             state: RwSpinlock::new(state),
             #[cfg(not(kernel_profile_extreme))]
             block_cache: Spinlock::new(BlockCache::new(block_size)),
+            deferred: DeferredFrees::new(),
         })
     }
 
@@ -1180,6 +1296,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // ========================================================================
 
     fn allocate_inode(&self, state: &mut Ext2State, is_dir: bool) -> Result<u32, FsError> {
+        // Reclaim anything unlinked-while-mapped whose mappings have since gone.
+        // Without this the filesystem could report itself full while holding
+        // inodes nothing references any more, and — worse for a build workload —
+        // an inode freed here is one the next `create` can reuse immediately.
+        self.drain_deferred_frees(state);
+
         let unalloc = state.superblock.unallocated_inodes;
         if unalloc == 0 {
             return Err(FsError::NoSpace);
@@ -1218,10 +1340,64 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         Err(FsError::NoSpace)
     }
 
+    /// Complete the frees deferred by [`Self::remove_file`] for inodes whose
+    /// last pin has since dropped.
+    ///
+    /// Called with the state write lock already held, from the two places that
+    /// care: every unlink (which keeps the list short on a build workload) and
+    /// every inode allocation (so a deferred free is reclaimed before the
+    /// filesystem reports itself full).
+    ///
+    /// `is_pinned` is deliberately re-asked here rather than trusted from unlink
+    /// time: a mapping created *after* the unlink still names this inode, and
+    /// freeing it would reintroduce exactly the defect the deferral exists to
+    /// prevent.
+    /// Inodes *this* filesystem has queued for a deferred free. The global
+    /// [`deferred_free_pending`] counter aggregates every mount, so it cannot be
+    /// asserted on by tests that run in parallel — this can.
+    #[cfg(test)]
+    pub fn deferred_free_len(&self) -> usize {
+        self.deferred.slots.iter().filter(|s| s.load(Ordering::Relaxed) != 0).count()
+    }
+
+    fn drain_deferred_frees(&self, state: &mut Ext2State) {
+        for slot in &self.deferred.slots {
+            let inode_num = slot.load(Ordering::Acquire);
+            if inode_num == 0 || akuma_primitives::inode_pin::is_pinned(inode_num) {
+                continue;
+            }
+            // Claim it before doing any work, so a concurrent drain cannot free
+            // the same inode twice.
+            if slot
+                .compare_exchange(inode_num, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            DEFERRED_FREE_PENDING.fetch_sub(1, Ordering::Relaxed);
+            // Best-effort from here: a failure leaves the inode allocated but
+            // unreferenced, which `e2fsck` reconnects. Re-queueing it on error
+            // could spin on a permanently failing inode.
+            if let Ok(mut inode) = self.read_inode(state, inode_num) {
+                let _ = self.truncate_inode(state, &mut inode);
+                inode.deletion_time = self.current_time();
+                let _ = self.write_inode(state, inode_num, &inode);
+            }
+            let _ = self.free_inode(state, inode_num, false);
+        }
+    }
+
     fn free_inode(&self, state: &mut Ext2State, inode_num: u32, is_dir: bool) -> Result<(), FsError> {
         if inode_num == 0 {
             return Ok(());
         }
+
+        // The single choke point where a number returns to the allocator, and so
+        // the only correct place to drop anything keyed on it — see
+        // [`InodeFreedHook`]. Safe from a publish-after-invalidate race precisely
+        // because of the pin: a fill in flight holds a cloned `LazySource`, which
+        // holds a pin, so an inode reaching here has no fill that could republish.
+        on_inode_freed(inode_num);
 
         let inode_idx = inode_num - 1;
         let group = inode_idx / state.inodes_per_group;
@@ -2284,6 +2460,12 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             return Err(FsError::NotAFile);
         }
 
+        // Retire anything whose mappings have since gone away. Doing this on the
+        // unlink path is what keeps `DEFERRED_FREES` short: a build unlinks
+        // constantly, so a deferred inode is normally reclaimed within
+        // milliseconds of its last mapping closing.
+        self.drain_deferred_frees(&mut state);
+
         // Remove directory entry
         self.remove_dir_entry(&mut state, parent_inode, &name)?;
 
@@ -2291,6 +2473,33 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         inode.hard_links = inode.hard_links.saturating_sub(1);
 
         if inode.hard_links == 0 {
+            // A live mapping still names this inode. Linux keeps an unlinked
+            // inode alive until its last reference goes; this kernel has no
+            // open-file object to hang that on, so the mapping's `InodePin` is
+            // the reference — see `akuma_primitives::inode_pin`.
+            //
+            // Freeing here is what produced root cause #2 of the self-host ICE:
+            // the truncate below zeroes `i_size`, so the mapper's next fill
+            // reads `Ok(0)` and installs a zero page, and once `free_inode`
+            // returns the number to the bitmap the next file created inherits
+            // it, handing that mapper another file's bytes
+            // (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14).
+            //
+            // So: drop the name, keep the inode. Size and block pointers stay
+            // exactly as they are, which is precisely what lets the mapping go
+            // on reading correct data.
+            if akuma_primitives::inode_pin::is_pinned(inode_num) {
+                // If the deferral list is full the inode is *leaked*, not freed:
+                // it stays allocated with no name and no queued free, and only
+                // `e2fsck` reclaims it. `defer_free` counts that case. Leaking
+                // blocks is recoverable; handing a mapper another file's bytes
+                // is not, so the overflow falls this way deliberately.
+                self.deferred.push(inode_num);
+                inode.hard_links = 0;
+                self.write_inode(&state, inode_num, &inode)?;
+                return Ok(());
+            }
+
             let is_fast_symlink = (inode.type_perms & 0xF000) == S_IFLNK
                 && inode.sectors_used == 0
                 && (inode.size_lower as usize) <= FAST_SYMLINK_MAX;

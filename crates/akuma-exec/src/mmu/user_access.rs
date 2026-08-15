@@ -293,7 +293,7 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
             };
             let page_frame = crate::PhysFrame::new(page_addr);
             if let crate::process::LazySource::File {
-                ref path, inode, file_offset, filesz, segment_va,
+                ref path, inode, file_offset, filesz, segment_va, ..
             } = source
             {
                 let pg_data_start = core::cmp::max(va, segment_va);

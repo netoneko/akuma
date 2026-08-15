@@ -102,13 +102,13 @@ impl ImageSource<'_> {
 fn push_deferred_regions(lazy: &mut LazyRegionMap, segments: &[DeferredLazySegment]) {
     for seg in segments {
         let source = match &seg.file_source {
-            Some(fs) => LazySource::File {
-                path: fs.path.clone(),
-                inode: fs.inode,
-                file_offset: fs.file_offset,
-                filesz: fs.filesz,
-                segment_va: fs.segment_va,
-            },
+            Some(fs) => LazySource::file(
+                fs.path.clone(),
+                fs.inode,
+                fs.file_offset,
+                fs.filesz,
+                fs.segment_va,
+            ),
             None => LazySource::Zero,
         };
         lazy.push(seg.start_va, seg.size, seg.page_flags, source);

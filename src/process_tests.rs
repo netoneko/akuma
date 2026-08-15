@@ -750,6 +750,12 @@ pub fn run_all_tests() {
     // binary lands on disk as zero bytes).
     test_shared_file_mmap_writeback();
 
+    // The inode lifecycle a file mapping depends on: unlink must not free or
+    // reissue an inode something still maps. Root cause #2 of the self-host ICE
+    // (SELFHOST_ZERO_PAGE_HUNT.md §14) — the defect that turned `cargo clean`'s
+    // unlink storm into zero pages inside a running compiler.
+    test_unlinked_inode_survives_while_pinned();
+
     // sys_unlinkat entry point: dirfd resolution, AT_REMOVEDIR, errno contract —
     // pins what the Phase 2c VfsBklGuard conversion (carve-out doc §12) must preserve.
     test_unlinkat();
@@ -2267,6 +2273,89 @@ fn test_term_state_lock_bounded_acquire_does_not_starve_peers() {
             waiter_elapsed_us, canary_ticks, waited_enough, resolved_in_time
         );
     }
+}
+
+/// The inode-lifecycle guarantee a file mapping depends on: unlinking a file that
+/// something still maps must not destroy or reissue its inode.
+///
+/// This is root cause #2 of the self-host `rustc` ICE
+/// (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14). A `LazySource::File` region
+/// names its file by raw inode number, and `remove_file` used to truncate and
+/// free that inode regardless, so the mapper's next fill read `Ok(0)` and
+/// installed a **zero page** — or, once the number was reissued, another file's
+/// bytes. `cargo clean` unlinks ~1000 build artifacts per build, which is why a
+/// compiler reading a `.rlib` through a mapping was the thing that broke.
+///
+/// Runs against the live VFS rather than a mock: the defect was in the
+/// interaction between the real ext2 `remove_file` and the real pin table, and a
+/// mock of either would have passed throughout.
+fn test_unlinked_inode_survives_while_pinned() {
+    const PATH: &str = "/tmp/pinned_unlink.bin";
+    const PAYLOAD: &[u8] = b"REAL BYTES, NOT ZEROS";
+
+    if crate::fs::write_file(PATH, PAYLOAD).is_err() {
+        console::print("[Test] unlinked_inode_survives_while_pinned SKIPPED (write failed)\n");
+        return;
+    }
+    let Ok(inode) = crate::vfs::resolve_inode(PATH) else {
+        console::print("[Test] unlinked_inode_survives_while_pinned SKIPPED (no inode)\n");
+        return;
+    };
+
+    // Exactly what a `LazySource::File` region holds for its whole lifetime.
+    let pin = akuma_primitives::InodePin::new(inode);
+
+    if crate::vfs::remove_file(PATH).is_err() {
+        console::print("[Test] unlinked_inode_survives_while_pinned SKIPPED (unlink failed)\n");
+        return;
+    }
+
+    // 1. The mapping's fill still reads the file. Before the fix this was the
+    //    `[FILL-SHORT] got=Ok(0)` flood: i_size had been truncated to 0.
+    let mut buf = [0u8; PAYLOAD.len()];
+    let got = crate::vfs::read_at_by_inode(PATH, inode, 0, &mut buf);
+    if got != Ok(PAYLOAD.len()) || buf != *PAYLOAD {
+        crate::safe_print!(224,
+            "[Test] unlinked_inode_survives_while_pinned FAILED (read after unlink: {:?}, wanted Ok({}))\n",
+            got, PAYLOAD.len());
+        return;
+    }
+
+    // 2. The number must not be reissued while the mapping holds it — that is the
+    //    garbage-bytes half, where a mapper reads a different file entirely.
+    let mut reissued = false;
+    for i in 0..8 {
+        let path = alloc::format!("/tmp/pinned_unlink_filler{i}.bin");
+        if crate::fs::write_file(&path, b"a different file").is_ok() {
+            if crate::vfs::resolve_inode(&path) == Ok(inode) {
+                reissued = true;
+            }
+            let _ = crate::vfs::remove_file(&path);
+        }
+    }
+    if reissued {
+        crate::safe_print!(192,
+            "[Test] unlinked_inode_survives_while_pinned FAILED (inode {} reissued under a live mapping)\n",
+            inode);
+        return;
+    }
+
+    // 3. Deferral is not a leak: once the mapping goes, the inode comes back.
+    drop(pin);
+    let _ = crate::fs::write_file("/tmp/pinned_unlink_drain.bin", b"drain");
+    let leaked = akuma_ext2::DEFERRED_FREE_LEAKED.load(core::sync::atomic::Ordering::Relaxed);
+    let pending = akuma_ext2::deferred_free_pending();
+    let _ = crate::vfs::remove_file("/tmp/pinned_unlink_drain.bin");
+
+    if leaked != 0 {
+        crate::safe_print!(192,
+            "[Test] unlinked_inode_survives_while_pinned FAILED (deferral list overflowed, {} inodes leaked)\n",
+            leaked);
+        return;
+    }
+    crate::safe_print!(224,
+        "[Test] unlinked_inode_survives_while_pinned PASSED (inode {} kept its {} bytes across unlink, not reissued; defer_pending={})\n",
+        inode, PAYLOAD.len(), pending);
 }
 
 /// Exercises the core of the writable MAP_SHARED writeback path: fill a resident

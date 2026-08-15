@@ -43,6 +43,7 @@ pub mod addr;
 pub mod clock;
 pub mod console;
 pub mod errno;
+pub mod inode_pin;
 pub mod irq;
 pub mod once;
 pub mod preempt;
@@ -57,3 +58,4 @@ pub use irq::{
     unmask_irqs_sync, with_irqs_disabled,
 };
 pub use once::{OnceCopy, Registered};
+pub use inode_pin::InodePin;

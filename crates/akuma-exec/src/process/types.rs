@@ -232,7 +232,44 @@ pub enum LazySource {
         file_offset: usize,
         filesz: usize,
         segment_va: usize,
+        /// Keeps `inode`'s data alive for as long as this region exists.
+        ///
+        /// `inode` is a raw number with no lifetime tie to the file, so without
+        /// this the filesystem was free to truncate it and reissue the number
+        /// under a live mapping — the fill then read `Ok(0)` (zero page) or, after
+        /// reuse, another file's bytes. That is root cause #2 of the self-host
+        /// `rustc` ICE (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14).
+        ///
+        /// Nothing reads this field. It is load-bearing purely through
+        /// [`InodePin`]'s `Clone`/`Drop`, which is what makes every region path —
+        /// fork's propagate/clone, `mprotect`'s split, `munmap`'s four clip
+        /// shapes, `exec`'s clear, `Process::drop` — balanced without any of them
+        /// knowing the pin exists. Construct with [`LazySource::file`] rather
+        /// than by hand so the pin can never be forgotten.
+        pin: akuma_primitives::InodePin,
     },
+}
+
+impl LazySource {
+    /// The only way to build a [`LazySource::File`]: takes the pin on `inode`
+    /// as part of construction, so a caller cannot create an unpinned mapping.
+    #[must_use]
+    pub fn file(
+        path: String,
+        inode: u32,
+        file_offset: usize,
+        filesz: usize,
+        segment_va: usize,
+    ) -> Self {
+        Self::File {
+            path,
+            inode,
+            file_offset,
+            filesz,
+            segment_va,
+            pin: akuma_primitives::InodePin::new(inode),
+        }
+    }
 }
 
 /// A lazily-backed virtual memory region.

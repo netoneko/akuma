@@ -365,7 +365,7 @@ pub fn dp_count(counter: &AtomicUsize, n: usize) {
 pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
     let _ = write!(
         w,
-        "file={} anon={} cow={} protnone={} eager={} freed={} ia_noexec={} fill_short={} unpub={} fpc_bad={} pn_file={} munmap_stale={} pf_fill_short={}",
+        "file={} anon={} cow={} protnone={} eager={} freed={} ia_noexec={} fill_short={} unpub={} fpc_bad={} pn_file={} munmap_stale={} pf_fill_short={} pin={} pin_ovf={} defer={} defer_leak={}",
         DP_FILE_PAGES.load(Ordering::Relaxed),
         DP_ANON_PAGES.load(Ordering::Relaxed),
         DP_COW_PAGES.load(Ordering::Relaxed),
@@ -379,5 +379,16 @@ pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
         DP_PROTNONE_FILE_REGION.load(Ordering::Relaxed),
         DP_MUNMAP_STALE_REGION_FRAME.load(Ordering::Relaxed),
         akuma_pmm::DP_PREFAULT_FILL_SHORT.load(Ordering::Relaxed),
+        // Inode-lifecycle guards (SELFHOST_ZERO_PAGE_HUNT.md §14). `pin=` is the
+        // number of inodes a live mapping is holding open — it rises and falls
+        // with the build. The other three are the ones to watch: `pin_ovf=`
+        // means the pin table ran out and every inode is now treated as pinned;
+        // `defer=` is unlinked-but-still-mapped inodes awaiting their free, and
+        // should drain to 0; `defer_leak=` is inodes leaked because the deferral
+        // list was full and **must stay 0** — non-zero means raise the bound.
+        akuma_primitives::inode_pin::pinned_inodes(),
+        akuma_primitives::inode_pin::OVERFLOW.load(Ordering::Relaxed),
+        akuma_ext2::deferred_free_pending(),
+        akuma_ext2::DEFERRED_FREE_LEAKED.load(Ordering::Relaxed),
     );
 }

@@ -390,9 +390,9 @@ fn mmap_eager_to_lazy_fallback(
                 let _vfs_window = super::fs::VfsBklGuard::new();
                 resolve_file_extent(&path, offset, len)
             };
-            let source = akuma_exec::process::LazySource::File {
-                path, inode, file_offset: offset, filesz, segment_va: mmap_addr,
-            };
+            let source = akuma_exec::process::LazySource::file(
+                path, inode, offset, filesz, mmap_addr,
+            );
             let count = akuma_exec::process::push_lazy_region_with_source(
                 proc.tgid, mmap_addr, pages * 4096, page_flags, source);
             crate::tprint!(128, "[mmap] eager OOM -> lazy-file fallback pid={} pages={} ({} regions)\n",
@@ -514,13 +514,13 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 let _vfs_window = super::fs::VfsBklGuard::new();
                 resolve_file_extent(&path, offset, len)
             };
-            let source = akuma_exec::process::LazySource::File {
-                path: path.clone(),
+            let source = akuma_exec::process::LazySource::file(
+                path.clone(),
                 inode,
-                file_offset: offset,
+                offset,
                 filesz,
-                segment_va: mmap_addr,
-            };
+                mmap_addr,
+            );
             let count = akuma_exec::process::push_lazy_region_with_source(
                 proc.tgid, mmap_addr, pages * 4096, page_flags, source);
             if crate::config::MEM_SYSCALL_TRACE_ENABLED {

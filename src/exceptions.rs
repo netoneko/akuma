@@ -1198,7 +1198,7 @@ fn demand_page_lazy_region(
     let shareable_mapping = crate::file_page_cache::is_shareable_mapping(map_flags);
 
     if let akuma_exec::process::LazySource::File {
-        ref path, inode, file_offset, filesz, segment_va,
+        ref path, inode, file_offset, filesz, segment_va, ..
     } = *source
     {
         if crate::config::DEMAND_PAGE_LOG_ENABLED {

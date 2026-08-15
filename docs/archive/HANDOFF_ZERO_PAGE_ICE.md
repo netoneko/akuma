@@ -107,8 +107,8 @@ them, which is unexplained, and 11 consecutive green builds is a streak, not a
 fix. The one confound whose direction is known — the image degrading across the
 day — points the wrong way.
 
-**T5b — CONFIRMED root cause of the `Ok(0)` flood (2026-08-15 night, hunt §14).
-The inode lifecycle is not honored across `mmap`.** Not yet fixed.
+**T5b — root cause of the `Ok(0)` flood, CONFIRMED (§14) and FIXED (§15),
+2026-08-15 night. The inode lifecycle was not honored across `mmap`.**
 
 `LazySource::File` stores a raw inode number and the mmap-time `filesz` and
 holds **no reference on the file** (Linux pins the inode through the mapping's
@@ -127,14 +127,17 @@ dependents (top victim: `libzerocopy_derive-….so`, 183 fills); `[UNLINK]` name
 the same paths earlier in the same log; `[FTRUNC-0]` never fires, so the actor
 is `unlink`/`O_TRUNC`, not `ftruncate`.
 
-**Fix options, ranked** (none implemented): (1) pin the inode for the life of
-the mapping and defer the free to the last reference — correct, needs a real
-VFS reference count; (2) invalidate lazy regions naming the inode on
-unlink/truncate — cheaper, needs a reverse index, semantically wrong (Linux
-keeps the old contents readable); (3) generation-tag `LazySource::File` so a
-stale fill fails loudly instead of returning `Ok(0)` — fixes nothing, but turns
-silent corruption into a detectable error, and is a prerequisite instrument
-either way.
+**The fix (option 1, hunt §15).** `LazySource::File` now carries an
+`akuma_primitives::InodePin`; ext2's `remove_file` drops the name but defers the
+truncate and the bitmap free while the inode is pinned, completing them on a
+later unlink or inode allocation. The pin is maintained by `InodePin`'s
+`Clone`/`Drop` rather than by any call site, so fork propagation, `mprotect`
+splits, all four `munmap` clip shapes, `exec`'s clear and `Process::drop` are
+balanced by construction. The table is lock-free because `is_pinned` is read
+under ext2's state write lock while pins are taken on the fault path.
+
+Watch `defer_leak=` in the `[Mem]` line — it must stay 0. `pin_ovf=` non-zero
+means the pin table filled and every inode is being treated as pinned.
 
 - **T5a — demoted, not closed**: `vfs::write_at` writes, *then* invalidates
   `file_page_cache`, so a demand fill interleaved between reading the old disk
@@ -282,17 +285,33 @@ across `mmap`) with the actor caught in the act, and lists the ranked fix option
 `docs/archive/FPCACHE_EVICTION_PREFERS_UNMAPPED.md`
 covers a cache-policy bug found along the way.
 
-**State: one root cause fixed, a second diagnosed but unfixed.**
+**State: both known root causes fixed; the ICE itself is not proven closed.**
 
 - **Fixed:** prefault inode-stub zero pages (§12) — 0/10 → 3/10 green.
-- **Diagnosed, NOT fixed:** T5b, the inode lifecycle across `mmap` (§14).
-  `unlink`/`O_TRUNC` free or empty an inode a live `LazySource::File` still
-  names → `Ok(0)` zero pages, or another file's bytes after reuse. Fix options
-  ranked above; start with the generation tag so the failure stops being silent.
-- **Unresolved:** the last two arms went 11/11 green with no decode error — the
-  longest clean streak of the hunt — but the defect still fires on those green
-  builds, and the 3/10 → 10/10 move came with no functional change. Treat the
-  ICE as latent, not gone, and re-score only on a freshly `e2fsck`-repaired
-  image (runbook §5.5).
-- T1 (read/readv copy shortness) untested; T3 blocked by the `SMP=1` wedge; T4
-  weakened; T5a demoted.
+- **Fixed:** T5b, the inode lifecycle across `mmap` — diagnosed §14, fixed §15.
+  Mappings pin their inode (`akuma_primitives::InodePin` inside
+  `LazySource::File`), and ext2 drops the name but defers the truncate and the
+  bitmap free while an inode is pinned. 21 host tests plus a boot self-test
+  (`unlinked_inode_survives_while_pinned`) cover it.
+- **Unresolved:** the last three arms went 14/14 green with no decode error
+  (10 counters-arm + 1 actor-arm + 3 post-repair sanity) — the longest clean
+  streak of the hunt — but the defect still fired on those green
+  builds, and the 3/10 → 10/10 move came with no functional change. That move is
+  still unexplained, so treat the ICE as **latent rather than proven gone**, and
+  re-score only on a freshly `e2fsck`-repaired image (runbook §5.5). A green
+  build whose instrument fired is not a passing build (rule 11).
+- **Now dominant, and where to go next: the premature-free class.** On the
+  post-fix workload both arms (fixed 1/3 green, as-found control 1/4) fail the
+  same way — the linker rejecting a freshly built `.rlib` whose bytes contain
+  **PMM quarantine poison** (`0xFEEDFACE…`, seen as `invalid sh_name
+  (0x5000feed)` and `\x00P\x8eA\xce\xfa\xed\xfe`). A *file-backed mapped page* is
+  being freed while still mapped, with `[PMM-POISON]` never firing. The poison
+  names its own frame (`^ 0xFEEDFACEDEAD0000`), so one reproduction plus
+  `report_poison_value`/`FreeSite` should name the free site — that instrument
+  cracked §8 in a single boot. Start there, not on the ODHT decode error.
+- **Still open:** `open(O_TRUNC)` truncates a mapped file in place (matches
+  Linux, and it was never the actor); T1 (read/readv copy shortness) untested;
+  T3 blocked by the `SMP=1` wedge; T4 weakened; T5a demoted and no longer needed
+  to explain anything. Also unfixed: `file_page_cache::insert` increments the
+  frame refcount even on the lost-publish-race path that returns early — a leak,
+  not corruption.

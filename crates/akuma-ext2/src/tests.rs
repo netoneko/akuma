@@ -486,6 +486,227 @@ fn reuse_space_after_removal() {
     assert_eq!(fs.read_file("/reuse/new").unwrap(), b"new");
 }
 
+// ── Unlinked-but-still-mapped inodes ────────────────────────────────
+//
+// Root cause #2 of the self-host `rustc` ICE: a `LazySource::File` mapping names
+// its file by raw inode number, so `remove_file` freeing that inode under a live
+// mapping made the mapper read `Ok(0)` (zero page) or, once the number was
+// reissued, another file's bytes. `docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14.
+//
+// The pin these tests take is what a mapping holds for its whole lifetime.
+//
+// They are serialized against each other because the pin table is keyed on the
+// inode number **alone**, with no filesystem identity (see
+// `akuma_primitives::inode_pin` — aliasing can only defer a free, never permit
+// one, so it is safe in the kernel). Every test here mounts the *same* fixture,
+// so their inode numbers collide exactly; run in parallel, one test's pin would
+// make another's inode look pinned. That is the documented behaviour rather than
+// a bug, so the tests take a lock instead of weakening the assertion.
+extern crate std;
+static PIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn pin_test_serial() -> std::sync::MutexGuard<'static, ()> {
+    PIN_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Inodes reported through [`crate::init_inode_freed_hook`], newest last.
+static FREED_INODES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Register the recorder once; `Registered` ignores repeat calls, so every test
+/// that needs it shares this one hook (they are serialized by `pin_test_serial`).
+fn record_freed_inodes() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::init_inode_freed_hook(|inode| {
+            FREED_INODES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(inode);
+        });
+    });
+    FREED_INODES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+}
+
+fn freed_inodes() -> Vec<u32> {
+    FREED_INODES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// Reissuing an inode number must drop anything keyed on it.
+///
+/// The kernel's `file_page_cache` keys on `(inode, file_offset)`, so a recycled
+/// number inherits the previous file's cached pages unless they go at the moment
+/// the number is released. Deferring the free made this reachable: an unlinked
+/// but still-mapped file goes on publishing pages under its number, where before
+/// the truncated inode made those fills come back `Ok(0)` and be withheld. The
+/// symptom was `rust-lld: ELF section name out of range` on a freshly built
+/// rlib — §15.
+#[test]
+fn freeing_an_inode_reports_it_for_cache_invalidation() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    record_freed_inodes();
+
+    // Immediate free: no mapping, so the unlink frees the inode inline.
+    fs.write_file("/plainfree", b"data").unwrap();
+    let plain = fs.resolve_inode("/plainfree").unwrap();
+    fs.remove_file("/plainfree").unwrap();
+    assert!(
+        freed_inodes().contains(&plain),
+        "an immediate free must report inode {plain}: {:?}",
+        freed_inodes(),
+    );
+
+    // Deferred free: reported when the deferral is drained, not at unlink time —
+    // the number is still in use until then, so invalidating early would be both
+    // wrong and useless.
+    record_freed_inodes();
+    fs.write_file("/deferredfree", b"data").unwrap();
+    let deferred = fs.resolve_inode("/deferredfree").unwrap();
+    let pin = akuma_primitives::InodePin::new(deferred);
+    fs.remove_file("/deferredfree").unwrap();
+    assert!(
+        !freed_inodes().contains(&deferred),
+        "a pinned inode is not free yet and must not be reported",
+    );
+
+    drop(pin);
+    fs.write_file("/triggerdrain", b"x").unwrap();
+    assert!(
+        freed_inodes().contains(&deferred),
+        "draining the deferral must report inode {deferred}: {:?}",
+        freed_inodes(),
+    );
+}
+
+/// The exact defect, at the layer that caused it: the data a mapping is reading
+/// must survive the unlink of its last name.
+#[test]
+fn unlink_of_a_pinned_inode_keeps_its_data_readable() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/mapped.rlib", b"REAL FILE CONTENT").unwrap();
+    let inode = fs.resolve_inode("/mapped.rlib").unwrap();
+
+    // A mapper takes its pin, exactly as `LazySource::file` does at mmap time.
+    let pin = akuma_primitives::InodePin::new(inode);
+
+    fs.remove_file("/mapped.rlib").unwrap();
+
+    // The name is gone...
+    assert!(!fs.exists("/mapped.rlib"), "the dirent must be removed");
+    // ...but the mapping's next fill still reads the file, not zeros. Before the
+    // fix this returned Ok(0) because `remove_file` had truncated i_size to 0.
+    let mut buf = [0u8; 17];
+    let n = fs.read_at_by_inode(inode, 0, &mut buf).unwrap();
+    assert_eq!(n, 17, "a pinned inode must not read short after unlink");
+    assert_eq!(&buf, b"REAL FILE CONTENT");
+
+    drop(pin);
+}
+
+/// The garbage-bytes half: the freed number must not be handed to the next file
+/// created while a mapping still names it.
+#[test]
+fn a_pinned_inode_number_is_not_reissued_to_a_new_file() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/victim", b"victim data").unwrap();
+    let inode = fs.resolve_inode("/victim").unwrap();
+    let pin = akuma_primitives::InodePin::new(inode);
+
+    fs.remove_file("/victim").unwrap();
+
+    // Create files until one would plausibly land on the recycled number.
+    for i in 0..16 {
+        let name = alloc::format!("/filler{i}");
+        fs.write_file(&name, b"other file entirely").unwrap();
+        assert_ne!(
+            fs.resolve_inode(&name).unwrap(),
+            inode,
+            "inode {inode} was reissued while a mapping still held it",
+        );
+    }
+
+    // And the mapping still sees its own bytes, not the new file's.
+    let mut buf = [0u8; 11];
+    assert_eq!(fs.read_at_by_inode(inode, 0, &mut buf).unwrap(), 11);
+    assert_eq!(&buf, b"victim data");
+
+    drop(pin);
+}
+
+/// Deferral is not a leak: once the last mapping goes, the inode is reclaimed.
+#[test]
+fn dropping_the_last_pin_lets_the_inode_be_reclaimed() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/transient", b"data").unwrap();
+    let inode = fs.resolve_inode("/transient").unwrap();
+
+    let pin = akuma_primitives::InodePin::new(inode);
+    fs.remove_file("/transient").unwrap();
+    assert_eq!(fs.deferred_free_len(), 1, "the free must be queued");
+
+    // The mapping goes away, and the next allocation drains the queue.
+    drop(pin);
+    fs.write_file("/after", b"x").unwrap();
+
+    assert_eq!(
+        fs.deferred_free_len(),
+        0,
+        "an unpinned inode must not stay deferred",
+    );
+    // Reclaimed for real — the number is issued again, which is precisely what
+    // must *not* happen while a mapping still holds it (the test above).
+    assert_eq!(
+        fs.resolve_inode("/after").unwrap(),
+        inode,
+        "an unpinned inode should return to the allocator",
+    );
+}
+
+/// The unchanged path — an unlink with no mapping still frees immediately, so
+/// the fix costs nothing on the overwhelmingly common case.
+#[test]
+fn unlink_of_an_unpinned_inode_frees_immediately() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/plain", b"nothing maps me").unwrap();
+    let inode = fs.resolve_inode("/plain").unwrap();
+
+    fs.remove_file("/plain").unwrap();
+
+    assert_eq!(fs.deferred_free_len(), 0, "nothing to defer");
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        fs.read_at_by_inode(inode, 0, &mut buf).unwrap(),
+        0,
+        "an unpinned inode is truncated and freed as before",
+    );
+}
+
+/// Nothing is leaked by the deferral machinery itself over repeated cycles —
+/// the bounded slot array must be returned, not consumed.
+#[test]
+fn repeated_pin_unlink_cycles_do_not_exhaust_the_deferral_list() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    for i in 0..64 {
+        let name = alloc::format!("/cycle{i}");
+        fs.write_file(&name, b"payload").unwrap();
+        let inode = fs.resolve_inode(&name).unwrap();
+        let pin = akuma_primitives::InodePin::new(inode);
+        fs.remove_file(&name).unwrap();
+        drop(pin);
+    }
+    // One more allocation to drain whatever the last cycle queued.
+    fs.write_file("/drain", b"x").unwrap();
+
+    assert_eq!(fs.deferred_free_len(), 0, "deferral list must drain");
+    assert_eq!(
+        crate::DEFERRED_FREE_LEAKED.load(core::sync::atomic::Ordering::Relaxed),
+        0,
+        "no inode should ever have been leaked at this scale",
+    );
+}
+
 #[test]
 fn remove_file_from_dir_does_not_affect_file() {
     let fs = mount_empty();
