@@ -429,10 +429,13 @@ Every row was measured **on builds that reproduced the ICE**, not argued.
 | 8 | The mmap path is wrong end-to-end, cross-process | `fpcpoison`, 4 concurrent procs on `libsyn` (1540 pages) | ALL PASS |
 | 9 | `lto = "thin"` memory/time cliff | host A/B | +1.4% RSS, no cliff |
 | 10 | `filesz` past-EOF pages published as zeros | `[FILL-SHORT]` | **real latent bug, fixed** — never fires here |
+| 11 | Prefault file fill short/errored (`prefault_user_range`) | `[FILL-SHORT/prefault]` | **856/build on the as-found kernel — root cause found + FIXED, §12** |
 
 Rows 7 and 10 matter for the method: both were **real bugs** that explained the symptom
 plausibly, were fixed, and changed nothing. Fixing a real bug is not evidence that it
-was *this* bug.
+was *this* bug. Row 11 is the counterexample that kept that rule honest: when it was
+finally fixed, the rate moved (0 → 3/10 green) — and note that row 1's `0` reading did
+not cover it, because row 1's instrument sat on a path a prefaulted page never takes.
 
 ### Live, ranked
 
@@ -487,8 +490,11 @@ tested, and **any single-core control for any other theory is unavailable too**.
 
 1. ~~**The premature free is not localised.**~~ **DONE — §8.** The `FreeSite` tag
    named it in one boot.
-2. **The ODHT ICE is still unexplained.** Nothing here fixed it, and it now fires on
-   ~every clean build. What is left after §4 and §8: the corruption is not the file,
+2. **The ODHT ICE is still unexplained.** ~~Nothing here fixed it, and it now fires on
+   ~every clean build.~~ **Partially explained 2026-08-15 — §12:** the prefault
+   inode-stub zero pages were found and fixed, moving green builds 0 → 3/10. The
+   residue (~70%) is unattributed; the paragraph below still describes it correctly.
+   What is left after §4 and §8: the corruption is not the file,
    not the cache, not a short read, not `madvise`, and not a premature free. The next
    suspect is the *other* end — the page rustc decompresses metadata **into** (its
    anonymous heap), which is where `CARGO_HEAP_NULL_RC.md` found its zeros too.
@@ -513,6 +519,32 @@ tested, and **any single-core control for any other theory is unavailable too**.
    `kill -9`s. Both spins are bounded now (`GATE_SPIN_LIMIT`), but the probe still needs
    to be pointed at a *small* file, and it is aimed at the file-page cache, which §4
    exonerated. It is not the instrument this bug needs.
+
+## 12. The prefault fill ran through a failing stub — FOUND + FIXED (2026-08-15, later that day)
+
+Full write-up: [`PREFAULT_INODE_STUB_ZERO_PAGES.md`](PREFAULT_INODE_STUB_ZERO_PAGES.md).
+The short version:
+
+- **`prefault_user_range`'s file fill was never instrumented** — `[FILL-SHORT]` sits
+  on the demand-fault fill in `exceptions.rs`, and a page the prefault installs is
+  *present*, so no fault ever re-visits it. The instrument was structurally blind to
+  this site (rule 5's structural cousin, now rule 8 in the handoff).
+- The fill calls the `ExecRuntime::read_at_by_inode` hook, registered in `src/main.rs`
+  as a stub returning `Err(-1)` since `94d1daf6 "extract akuma-exec"` (2026-03-05) —
+  the signature lacked the `path` the real VFS needs, so the extraction left a stub —
+  and the call site dropped the result (`let _ =`).
+- With `MMAP_FILE_BACKED_LAZY` on, every RO file mmap carries a real inode, so every
+  prefault of such a region installed a **zero page with no error, no fault, and no
+  cache involvement**.
+- Control arm (instrument only), one reproducing build: **856 firings, all
+  `got=Err(-1)`**, against `syn`/`managed` `.rmeta` and `.d` artifacts.
+- Fix (hook takes `path`, real `vfs::read_at_by_inode` wired; the prefault site was
+  its only consumer), 10 clean builds: instrument silent, **3/10 GREEN** — first
+  green builds in any arm of this hunt.
+
+**The ICE is not closed.** 7/10 still fail, and the fix arm scored only
+GREEN/FAILED — not which crate died or how (rule 3 violated by the very document
+that wrote it; the residue needs re-scoring before T1/T2 are re-ranked).
 
 ## Background
 

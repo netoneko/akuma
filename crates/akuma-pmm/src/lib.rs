@@ -909,6 +909,19 @@ static ALLOCATED_PAGES: AtomicUsize = AtomicUsize::new(0);
 /// the periodic `[Mem]` stats line.
 static DOUBLE_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// File-page fills in `akuma_exec::mmu::user_access::prefault_user_range` that
+/// came back short or errored, counted per page.
+///
+/// The prefault fill is the one file-fill site in the tree the demand-fault
+/// instrument (`[FILL-SHORT]` in `src/exceptions.rs`) cannot see: a page the
+/// prefault installs is *present*, so no later fault re-fills or re-checks it.
+/// A short fill here therefore installs a zero page that reads back as
+/// `[0,0,0,0]` forever — the self-host ICE shape. The fill result was dropped
+/// on the floor (`let _ =`) until 2026-08-15; this counter is the instrument
+/// that closes the blind spot. `pub` because the print site lives in
+/// `akuma-exec` while the `[Mem]` dump lives in the bin crate.
+pub static DP_PREFAULT_FILL_SHORT: AtomicUsize = AtomicUsize::new(0);
+
 // ============================================================================
 // UAF hunt: free ledger — a ring of recent frees, named by thread
 // ============================================================================

@@ -49,7 +49,8 @@ All instruments are still in the tree.
 
 | Theory | Instrument | Reading |
 |---|---|---|
-| Fill read short/errored | `[FILL-SHORT]` / `DP_FILE_FILL_SHORT` | 0 |
+| Fill read short/errored (**demand-fault** site) | `[FILL-SHORT]` / `DP_FILE_FILL_SHORT` | 0 |
+| Prefault file fill short/errored (`prefault_user_range`) | `[FILL-SHORT/prefault]` / `DP_PREFAULT_FILL_SHORT` | **856/build on the as-found kernel — ROOT CAUSE, found + FIXED 2026-08-15** (`docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md`): the `read_at_by_inode` runtime hook was an `Err(-1)` stub and the call site dropped the result. Green builds 0/10 → **3/10**. The residue is what this handoff now targets. |
 | `file_page_cache` serves wrong bytes | `[FPC-BAD]` (`config::FPCACHE_VERIFY_HITS`, re-reads every hit from disk) | 0 across **4.3M hits** |
 | `PROT_NONE` file region zero-filled | `[DA-NONE-FILE]` | 0 |
 | `MADV_DONTNEED` on a file page | `[DONTNEED-FILE]` | 0 |
@@ -67,7 +68,12 @@ bug" as progress on this one:
 2. `MAP_SHARED|MAP_ANONYMOUS` was CoW-copied by `fork` instead of shared. Fixed. ICE
    unchanged.
 
-## Live theories, ranked
+## Live theories, ranked — for the ~70% RESIDUE after the 2026-08-15 prefault fix
+
+The prefault inode-stub fix (see the elimination table) moved green builds 0/10 →
+3/10 but did **not** close the ICE. First job: re-score the residue properly —
+the fix arm recorded only GREEN/FAILED per build, not which crate died or how
+(rule 3). Do that before trusting any ranking below.
 
 **T1 — `sys_read`/`sys_pread64`/`readv` short-copies into the user buffer.** The
 strongest untested candidate. Commit `edd91fe7 "safer memory helpers"` rewrote **every**
@@ -133,7 +139,20 @@ other theories, so it may be worth fixing first. To inspect a wedge you must boo
    rlib has no `ODHT`" looked decisive; all four guest rlibs lack it (metadata is
    compressed) and the host comparison was across rustc versions.
 7. **Fixing a plausible bug is not evidence it was the bug.** Two real fixes moved
-   nothing. Require the ICE rate to change.
+   nothing. Require the ICE rate to change. (The prefault fix on 2026-08-15 was the
+   first that did — 0 → 3/10 green.)
+8. **A fault-path instrument cannot see a page another path made present.**
+   `[FILL-SHORT]` read 0 across reproducing builds and was cited as exonerating
+   short fills — but it sat on the demand-fault fill, while `prefault_user_range`
+   installed 856 zero-filled pages per build through a site no fault ever
+   re-visits. When two paths can produce the same end state, enumerate the sites
+   ("who can install this page?") before trusting an exoneration on one of them.
+9. **A crate extraction that leaves a stub behind a fn-pointer hook silently
+   corrupts every consumer.** `read_at_by_inode` became `Err(-1)` in
+   `94d1daf6` because the real VFS needed a `path` the hook signature lacked —
+   and its one consumer dropped the result. When a path crosses a runtime-hook
+   boundary, grep the registrations for stubs first; that check costs one
+   command and would have closed this hunt in March.
 
 ## Tools already in the tree
 
@@ -146,12 +165,19 @@ other theories, so it may be worth fixing first. To inspect a wedge you must boo
   prints `site=`. This named a UAF culprit in **one boot** after four arms of guessing.
   Reach for attribution instrumentation earlier than feels justified.
 - Counters in the `[Mem]` line: `fill_short`, `unpub`, `fpc_bad`, `pn_file`,
-  `munmap_stale`; `[FPCACHE]` carries `evict_mapped`.
+  `munmap_stale`, `pf_fill_short`; `[FPCACHE]` carries `evict_mapped`. Note the
+  `dp_counters_line` dump only surfaces from the exceptions path on the devbox
+  profile — the console prints (`[FILL-SHORT]`, `[FILL-SHORT/prefault]`) are the
+  operative guards.
 
 ## Full history
 
 `docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` — every arm, every measurement, the wrong fix
-kept deliberately as a worked example. `docs/archive/FPCACHE_EVICTION_PREFERS_UNMAPPED.md`
+kept deliberately as a worked example; §12 and
+`docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md` cover the root cause found 2026-08-15.
+`docs/archive/FPCACHE_EVICTION_PREFERS_UNMAPPED.md`
 covers a cache-policy bug found along the way.
 
-**State: the ICE is unfixed.** 0 green builds in every arm measured.
+**State: partially fixed.** The prefault inode-stub zero pages (root cause #1) are
+fixed — 0/10 → **3/10 green**. The ~70% residue is unattributed and unscored by
+failure mode; the theories above target it.

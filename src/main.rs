@@ -453,7 +453,16 @@ pub(crate) fn build_exec_runtime(
         read_file: |path| crate::fs::read_file(path).map_err(|_| -1),
         read_at: |path, off, buf| crate::vfs::read_at(path, off, buf).map_err(|_| -1),
         resolve_inode: |path| crate::vfs::resolve_inode(path).map_err(|_| -1),
-        read_at_by_inode: |_inode, _off, _buf| Err(-1),
+        // Real implementation, not a stub: `prefault_user_range` fills every
+        // inode-backed lazy file page through this hook (the path is required —
+        // `with_fs` dispatches on its prefix). A previous `Err(-1)` stub made
+        // every such prefault install a silent zero page, which is the
+        // `[0,0,0,0]` metadata ICE in the self-host build. See
+        // `akuma_pmm::DP_PREFAULT_FILL_SHORT` and
+        // `docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md`.
+        read_at_by_inode: |path, inode, off, buf| {
+            crate::vfs::read_at_by_inode(path, inode, off, buf).map_err(|_| -1)
+        },
         on_process_exit: |_pid| {},
         remove_socket: akuma_net::socket::remove_socket,
         socket_clone_ref: akuma_net::socket::socket_clone_ref,

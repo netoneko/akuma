@@ -92,7 +92,7 @@ pub fn ensure_test_runtime() {
         read_file: |_| Err(0),
         read_at: |_, _, _| Err(0),
         resolve_inode: |_| Err(0),
-        read_at_by_inode: |_, _, _| Err(0),
+        read_at_by_inode: |_, _, _, _| Err(0),
         on_process_exit: |_| {},
         remove_socket: |_| {},
         socket_clone_ref: |_| {},

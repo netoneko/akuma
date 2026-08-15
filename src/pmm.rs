@@ -365,7 +365,7 @@ pub fn dp_count(counter: &AtomicUsize, n: usize) {
 pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
     let _ = write!(
         w,
-        "file={} anon={} cow={} protnone={} eager={} freed={} ia_noexec={} fill_short={} unpub={} fpc_bad={} pn_file={} munmap_stale={}",
+        "file={} anon={} cow={} protnone={} eager={} freed={} ia_noexec={} fill_short={} unpub={} fpc_bad={} pn_file={} munmap_stale={} pf_fill_short={}",
         DP_FILE_PAGES.load(Ordering::Relaxed),
         DP_ANON_PAGES.load(Ordering::Relaxed),
         DP_COW_PAGES.load(Ordering::Relaxed),
@@ -378,5 +378,6 @@ pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
         DP_FILE_CACHE_MISMATCH.load(Ordering::Relaxed),
         DP_PROTNONE_FILE_REGION.load(Ordering::Relaxed),
         DP_MUNMAP_STALE_REGION_FRAME.load(Ordering::Relaxed),
+        akuma_pmm::DP_PREFAULT_FILL_SHORT.load(Ordering::Relaxed),
     );
 }

@@ -113,7 +113,12 @@ pub struct ExecRuntime {
     pub read_file: fn(&str) -> Result<alloc::vec::Vec<u8>, i32>,
     pub read_at: fn(&str, usize, &mut [u8]) -> Result<usize, i32>,
     pub resolve_inode: fn(&str) -> Result<u32, i32>,
-    pub read_at_by_inode: fn(u32, usize, &mut [u8]) -> Result<usize, i32>,
+    /// Takes the path as well as the inode: the VFS is multi-root (`with_fs`
+    /// dispatches on the path prefix), so an inode alone does not name a file.
+    /// The prefault fill in `mmu/user_access.rs` calls this for every
+    /// inode-backed lazy file page — a stub registration here turns those pages
+    /// into silent zeros (`[FILL-SHORT/prefault]`, the self-host ICE).
+    pub read_at_by_inode: fn(&str, u32, usize, &mut [u8]) -> Result<usize, i32>,
 
     // Process exit hook (e.g. socket cleanup)
     pub on_process_exit: fn(u32),

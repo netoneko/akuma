@@ -314,11 +314,26 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
                         )
                     };
                     let rt = crate::runtime::runtime();
-                    let _ = if inode == 0 {
+                    let got = if inode == 0 {
                         (rt.read_at)(path, file_off, page_buf)
                     } else {
-                        (rt.read_at_by_inode)(inode, file_off, page_buf)
+                        (rt.read_at_by_inode)(path, inode, file_off, page_buf)
                     };
+                    // The range is already clamped to `filesz`, so anything less
+                    // than `read_len` is a defect, not EOF — same contract as
+                    // the demand-fault fill's `[FILL-SHORT]` in
+                    // `src/exceptions.rs`. But this site is the one that
+                    // instrument could never see: the page installed below is
+                    // PRESENT, so no later fault re-fills it, and the zero tail
+                    // of `alloc_page_zeroed`'s frame reads back as file data.
+                    // The result used to be dropped (`let _ =`), which made the
+                    // defect silent; count and name it instead.
+                    if got != Ok(read_len) {
+                        akuma_pmm::DP_PREFAULT_FILL_SHORT.fetch_add(1, Ordering::Relaxed);
+                        crate::safe_print!(224,
+                            "[FILL-SHORT/prefault] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} — page installed zero-filled\n",
+                            crate::process::read_current_pid().unwrap_or(0), inode, file_off, read_len, got, va);
+                    }
                 }
             }
             // Everything above (alloc + file fill) ran with no `as_lock` held.
