@@ -922,28 +922,133 @@ static FREE_LEDGER_META: [AtomicUsize; FREE_LEDGER_SLOTS] =
     [const { AtomicUsize::new(0) }; FREE_LEDGER_SLOTS];
 static FREE_LEDGER_NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// Note that `pa` was returned to the PMM by thread `tid`. Lock-free and
-/// IRQ-safe: two relaxed stores and a fetch_add.
-pub fn record_free(pa: usize, tid: u32) {
+/// **Which code path returned a frame to the PMM.**
+///
+/// The ledger named the freeing *thread* and sequence number, which answers "when"
+/// but not "who" — and on a premature free the thread is rarely the interesting
+/// half, because the victim is usually a different address space entirely
+/// (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §6). Every free site that can plausibly
+/// release a frame another mapping still holds gets its own value here, so one boot
+/// distinguishes `munmap` from a CoW break from a lost fault race instead of a
+/// bisect per candidate.
+///
+/// `Unknown` is the default for sites that have not been tagged; a premature free
+/// attributed to `Unknown` means the tag list is incomplete, not that the path is
+/// exotic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum FreeSite {
+    Unknown = 0,
+    /// `munmap` / region teardown returning a mapping's frames.
+    Munmap = 1,
+    /// `sys_munmap`, whole-region arm.
+    MunmapRegion = 11,
+    /// `sys_munmap`, partial-shrink arm.
+    MunmapPartial = 12,
+    /// `sys_munmap`, unmapped-span sweep arm.
+    MunmapSpan = 13,
+    /// Whole-address-space teardown at process exit.
+    AsTeardown = 2,
+    /// `complete_cow_break` dropping the old shared frame.
+    CowBreak = 3,
+    /// Demand-paging install pass, frame lost the race for its VA.
+    FaultRaceLost = 4,
+    /// Demand-paging: readahead pool frames never consumed.
+    FaultPoolSurplus = 5,
+    /// `file_page_cache` eviction (over cap, or `shrink` under pressure).
+    FpcacheEvict = 6,
+    /// `file_page_cache::invalidate_inode` — the file was written/removed/renamed.
+    FpcacheInvalidate = 7,
+    /// `MADV_DONTNEED` share-break replacing a frame.
+    MadviseDontneed = 8,
+    /// `mremap` moving or shrinking a mapping.
+    Mremap = 9,
+    /// A surplus reference handed back at adoption time.
+    SurplusRef = 10,
+}
+
+impl FreeSite {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Munmap => "munmap",
+            Self::AsTeardown => "as-teardown",
+            Self::CowBreak => "cow-break",
+            Self::FaultRaceLost => "fault-race-lost",
+            Self::FaultPoolSurplus => "fault-pool-surplus",
+            Self::FpcacheEvict => "fpcache-evict",
+            Self::FpcacheInvalidate => "fpcache-invalidate",
+            Self::MadviseDontneed => "madv-dontneed",
+            Self::Mremap => "mremap",
+            Self::SurplusRef => "surplus-ref",
+            Self::MunmapRegion => "munmap-region",
+            Self::MunmapPartial => "munmap-partial",
+            Self::MunmapSpan => "munmap-span",
+        }
+    }
+    const fn from_bits(b: u8) -> Self {
+        match b {
+            1 => Self::Munmap,
+            2 => Self::AsTeardown,
+            3 => Self::CowBreak,
+            4 => Self::FaultRaceLost,
+            5 => Self::FaultPoolSurplus,
+            6 => Self::FpcacheEvict,
+            7 => Self::FpcacheInvalidate,
+            8 => Self::MadviseDontneed,
+            9 => Self::Mremap,
+            10 => Self::SurplusRef,
+            11 => Self::MunmapRegion,
+            12 => Self::MunmapPartial,
+            13 => Self::MunmapSpan,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Note that `pa` was returned to the PMM by thread `tid`, from `site`. Lock-free
+/// and IRQ-safe: two relaxed stores and a fetch_add.
+///
+/// `META` packs `site << 48 | tid << 32 | seq`. `tid` is bounded by `MAX_THREADS`
+/// (≤ 256), so the 16 bits above it were dead space and the site rides for free —
+/// no extra array, no extra store on the free path.
+pub fn record_free_at(pa: usize, tid: u32, site: FreeSite) {
     let seq = FREE_LEDGER_NEXT.fetch_add(1, Ordering::Relaxed);
     let idx = seq & (FREE_LEDGER_SLOTS - 1);
-    FREE_LEDGER_META[idx].store(((tid as usize) << 32) | (seq & 0xFFFF_FFFF), Ordering::Relaxed);
+    FREE_LEDGER_META[idx].store(
+        ((site as usize) << 48) | ((tid as usize & 0xFFFF) << 32) | (seq & 0xFFFF_FFFF),
+        Ordering::Relaxed,
+    );
     FREE_LEDGER_PA[idx].store(pa, Ordering::Release);
+}
+
+/// Back-compat shim: record with no site attribution.
+pub fn record_free(pa: usize, tid: u32) {
+    record_free_at(pa, tid, FreeSite::Unknown);
 }
 
 /// Most recent ledger entry for `pa`, as `(tid, seq)` — `None` if this frame has
 /// not been freed inside the ring's window.
 #[must_use]
 pub fn last_free_record(pa: usize) -> Option<(u32, u32)> {
-    let mut best: Option<(u32, u32)> = None;
+    last_free_record_at(pa).map(|(tid, seq, _)| (tid, seq))
+}
+
+/// As [`last_free_record`], plus **which code path** did the freeing.
+#[must_use]
+pub fn last_free_record_at(pa: usize) -> Option<(u32, u32, FreeSite)> {
+    let mut best: Option<(u32, u32, FreeSite)> = None;
     for i in 0..FREE_LEDGER_SLOTS {
         if FREE_LEDGER_PA[i].load(Ordering::Acquire) != pa {
             continue;
         }
         let meta = FREE_LEDGER_META[i].load(Ordering::Relaxed);
-        let (tid, seq) = ((meta >> 32) as u32, (meta & 0xFFFF_FFFF) as u32);
-        if best.is_none_or(|(_, prev)| seq.wrapping_sub(prev) < u32::MAX / 2) {
-            best = Some((tid, seq));
+        let tid = ((meta >> 32) & 0xFFFF) as u32;
+        let seq = (meta & 0xFFFF_FFFF) as u32;
+        let site = FreeSite::from_bits(((meta >> 48) & 0xFF) as u8);
+        if best.is_none_or(|(_, prev, _)| seq.wrapping_sub(prev) < u32::MAX / 2) {
+            best = Some((tid, seq, site));
         }
     }
     best
@@ -1566,6 +1671,13 @@ fn alloc_page_once() -> Option<usize> {
 /// `current_thread_id`, threaded through explicitly (this crate does not
 /// depend on `akuma_exec::threading`).
 pub fn free_page(pa: usize, tid: u32) {
+    free_page_at(pa, tid, FreeSite::Unknown);
+}
+
+/// As [`free_page`], but records **which code path** released the frame, so a
+/// premature-free report can name the culprit instead of only the thread.
+/// See [`FreeSite`].
+pub fn free_page_at(pa: usize, tid: u32, site: FreeSite) {
     if !cow_ref_dec(pa) {
         // Still shared by other processes — don't free the physical page.
         return;
@@ -1575,7 +1687,7 @@ pub fn free_page(pa: usize, tid: u32) {
     // untrack, another CPU could reallocate the same frame and track it before
     // we untrack, causing us to remove their tracking.
     untrack_frame(pa);
-    record_free(pa, tid);
+    record_free_at(pa, tid, site);
 
     if config().pmm_premature_free_check {
         report_premature_free(pa, tid);

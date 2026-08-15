@@ -727,7 +727,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             if let Some(frame) = crate::pmm::alloc_page_zeroed() {
                 new_frames.push(frame);
             } else {
-                for f in new_frames { crate::pmm::free_page(f); }
+                for f in new_frames { crate::pmm::free_page_at(f, akuma_pmm::FreeSite::Mremap); }
                 return ENOMEM;
             }
         }
@@ -804,7 +804,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                     }
                 }
             });
-            for frame in to_free { crate::pmm::free_page(frame); }
+            for frame in to_free { crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::Mremap); }
             proc.vm_free_mmap(old_addr, freed_size);
             found_eager = true;
         }
@@ -828,7 +828,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                     }
                 }
             });
-            for frame in to_free { crate::pmm::free_page(frame); }
+            for frame in to_free { crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::Mremap); }
             proc.vm_free_mmap(old_addr, old_pages * 4096);
         }
 
@@ -1056,10 +1056,10 @@ fn madvise_dontneed_range(
     });
 
     for frame in spares.drain(used..) {
-        crate::pmm::free_page(frame);
+        crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::MadviseDontneed);
     }
     for frame in to_free {
-        crate::pmm::free_page(frame);
+        crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::MadviseDontneed);
     }
     if broke > 0 {
         DONTNEED_SHARED_FRAME.fetch_add(broke, Ordering::Relaxed);
@@ -1321,30 +1321,41 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         proc.with_address_space(|aspace| {
             for i in 0..n {
                 let va = base + i * 4096;
-                match frames.get(i) {
-                    // Frame this process owns: unmap the PTE, then drop our
-                    // reference. Free only when this drops the frame's last
-                    // reference; an aliased/shared PA is freed by its surviving
-                    // owner instead.
-                    Some(&frame) => {
-                        let _ = aspace.unmap_page_no_flush(va);
-                        if aspace.remove_user_frame(frame) {
-                            to_free.push(frame);
-                        }
+                // **Take the PA from the live PTE, never from the region's record.**
+                // That record goes stale whenever something replaces a mapping without
+                // rewriting the region's frame list — `complete_cow_break` installing a
+                // private copy, `MADV_DONTNEED`'s share-break, a CoW write fault.
+                // Freeing the *recorded* frame released a page this process no longer
+                // maps (a peer may still hold it — the premature free every
+                // `site=munmap-region` poison report named) while leaking the one that
+                // actually was mapped. This used to be two arms: an owned-frame arm
+                // that trusted `frames[i]`, and a CoW-inherited arm that read the PTE.
+                // Only the second was right, so both collapse into it —
+                // `unmap_and_free_page_no_flush` walks the tables **once**, returns what
+                // was really there and drops it from `user_frames`. The record is now
+                // consulted for one purpose: reporting that it disagreed.
+                let dropped = aspace.unmap_and_free_page_no_flush(va);
+                if let (Some(rec), Some(live)) = (frames.get(i).copied(), dropped)
+                    && rec.addr != live.addr
+                {
+                    let seen = crate::pmm::DP_MUNMAP_STALE_REGION_FRAME
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // Rate-limited: this fires ~11k times per self-host build, and
+                    // printing every one doubles build wall time — enough to move the
+                    // very races being measured. `munmap_stale=` carries the volume.
+                    if seen < 32 {
+                        crate::tprint!(192,
+                            "[MUNMAP-STALE] pid={} va={:#x} recorded={:#x} live={:#x} — freed the live frame\n",
+                            proc.pid, va, rec.addr, live.addr);
                     }
-                    // CoW-inherited page (no owned frame recorded): take the PA
-                    // from the live PTE instead, which also covers the case where
-                    // a CoW write fault already swapped in a private frame.
-                    None => {
-                        if let Some(frame) = aspace.unmap_and_free_page_no_flush(va) {
-                            to_free.push(frame);
-                        }
-                    }
+                }
+                if let Some(frame) = dropped {
+                    to_free.push(frame);
                 }
             }
             akuma_exec::mmu::flush_tlb_range_all_asid(base, n);
         });
-        for frame in to_free { crate::pmm::free_page(frame); }
+        for frame in to_free { crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapRegion); }
         proc.vm_free_mmap(base, n * 4096);
     }
 
@@ -1364,7 +1375,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
                 akuma_exec::mmu::flush_tlb_range_all_asid(freed_start, freed_pages);
             });
             let had_physical = !to_free.is_empty();
-            for frame in to_free { crate::pmm::free_page(frame); }
+            for frame in to_free { crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapPartial); }
             // Only recycle the VA range when physical pages were actually freed.
             // Pure lazy (PROT_NONE, never demand-paged) regions must NOT be put
             // back in free_regions: alloc_mmap prefers free_regions over
@@ -1405,6 +1416,6 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             akuma_exec::mmu::flush_tlb_range_all_asid(addr, total_pages);
         }
     });
-    for frame in to_free { crate::pmm::free_page(frame); }
+    for frame in to_free { crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapSpan); }
     0
 }

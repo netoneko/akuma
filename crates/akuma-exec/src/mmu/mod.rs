@@ -543,14 +543,14 @@ fn free_as_frames_now(l0_frame: PhysFrame, user_frames: &BTreeMap<usize, u32>, p
         // Free each distinct physical page exactly ONCE. `user_frames` counts
         // how many VAs map a PA, not how many times it was allocated.
         for (&addr, &_count) in user_frames {
-            akuma_pmm::free_page(addr, tid);
+            akuma_pmm::free_page_at(addr, tid, akuma_pmm::FreeSite::AsTeardown);
         }
     }
     {
         let _irq = IrqGuard::new();
-        for frame in pt_frames { akuma_pmm::free_page(frame.addr, tid); }
+        for frame in pt_frames { akuma_pmm::free_page_at(frame.addr, tid, akuma_pmm::FreeSite::AsTeardown); }
     }
-    akuma_pmm::free_page(l0_frame.addr, tid);
+    akuma_pmm::free_page_at(l0_frame.addr, tid, akuma_pmm::FreeSite::AsTeardown);
 }
 
 /// Re-check parked address-space frames and free the ones whose L0 no core

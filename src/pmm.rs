@@ -179,11 +179,12 @@ fn poison_word_frame(word: u64) -> Option<usize> {
 /// from the fault path with whatever registers the faulting instruction used.
 pub fn report_poison_value(tag: &str, word: u64) {
     let Some(pa) = poison_word_frame(word) else { return };
-    let (tid_freed, seq_freed) = last_free_record(pa).unwrap_or((u32::MAX, 0));
+    let (tid_freed, seq_freed, site) = akuma_pmm::last_free_record_at(pa)
+        .unwrap_or((u32::MAX, 0, akuma_pmm::FreeSite::Unknown));
     crate::safe_print!(255,
         "[PMM-POISON] {}={:#x} is quarantine poison for pa={:#x} — the kernel FREED \
-         this frame while the process still had it. freed_by=(tid={} seq={}) now_seq={} cow_ref={}\n",
-        tag, word, pa, tid_freed, seq_freed, free_ledger_seq(), cow_ref_get(pa));
+         this frame while the process still had it. freed_by=(tid={} seq={} site={}) now_seq={} cow_ref={}\n",
+        tag, word, pa, tid_freed, seq_freed, site.name(), free_ledger_seq(), cow_ref_get(pa));
     if let Some((pid, tgid)) = surviving_mapper(pa) {
         crate::safe_print!(128,
             "  [PMM-POISON] pa={:#x} still tracked by pid={} tgid={}\n", pa, pid, tgid);
@@ -213,6 +214,18 @@ pub fn alloc_page() -> Option<PhysFrame> {
 /// frame is freed when the last reference is dropped.
 pub fn free_page(frame: PhysFrame) {
     akuma_pmm::free_page(frame.addr, akuma_primitives::preempt::current_tid() as u32);
+}
+
+/// As [`free_page`], but attributes the release to a specific code path so a
+/// premature-free / poison report can name it. Prefer this at every site that could
+/// plausibly free a frame another mapping still holds — see `akuma_pmm::FreeSite` and
+/// `docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §6.
+pub fn free_page_at(frame: PhysFrame, site: akuma_pmm::FreeSite) {
+    akuma_pmm::free_page_at(
+        frame.addr,
+        akuma_primitives::preempt::current_tid() as u32,
+        site,
+    );
 }
 
 pub fn alloc_pages_contiguous_zeroed(count: usize) -> Option<PhysFrame> {
@@ -306,6 +319,19 @@ pub static DP_IA_NOEXEC_FAULTS: AtomicUsize = AtomicUsize::new(0);
 /// EOF condition — the range was already clamped to `filesz` by the caller.
 pub static DP_FILE_FILL_SHORT: AtomicUsize = AtomicUsize::new(0);
 
+/// `sys_munmap`'s whole-region arm found the region's **recorded** frame for a VA
+/// disagreeing with the frame actually in the live PTE.
+///
+/// The record goes stale whenever something replaces a mapping without rewriting the
+/// region's frame list: `complete_cow_break` installing a private copy,
+/// `MADV_DONTNEED`'s share-break, a CoW write fault. Freeing the recorded frame then
+/// releases a page this process no longer maps — while a peer may still hold it — and
+/// simultaneously leaks the frame that *was* mapped.
+///
+/// Every premature free in the 2026-08-15 hunt attributed to `site=munmap-region`
+/// (6/6). See `docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §6.
+pub static DP_MUNMAP_STALE_REGION_FRAME: AtomicUsize = AtomicUsize::new(0);
+
 /// Faults on a lazy region whose flags say `PROT_NONE` but whose source is a **file**.
 ///
 /// The `PROT_NONE` arm of the translation-fault path auto-commits a reservation with a
@@ -339,7 +365,7 @@ pub fn dp_count(counter: &AtomicUsize, n: usize) {
 pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
     let _ = write!(
         w,
-        "file={} anon={} cow={} protnone={} eager={} freed={} ia_noexec={} fill_short={} unpub={} fpc_bad={} pn_file={}",
+        "file={} anon={} cow={} protnone={} eager={} freed={} ia_noexec={} fill_short={} unpub={} fpc_bad={} pn_file={} munmap_stale={}",
         DP_FILE_PAGES.load(Ordering::Relaxed),
         DP_ANON_PAGES.load(Ordering::Relaxed),
         DP_COW_PAGES.load(Ordering::Relaxed),
@@ -351,5 +377,6 @@ pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
         DP_FILE_FILL_UNPUBLISHED.load(Ordering::Relaxed),
         DP_FILE_CACHE_MISMATCH.load(Ordering::Relaxed),
         DP_PROTNONE_FILE_REGION.load(Ordering::Relaxed),
+        DP_MUNMAP_STALE_REGION_FRAME.load(Ordering::Relaxed),
     );
 }

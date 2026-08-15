@@ -202,7 +202,7 @@ pub fn insert(inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) 
         EVICTIONS.fetch_add(1, Ordering::Relaxed);
         // Drop the cache's reference. Frees only if nobody still has it mapped;
         // otherwise the last unmapper frees it through the same path.
-        crate::pmm::free_page(PhysFrame::new(pa));
+        crate::pmm::free_page_at(PhysFrame::new(pa), akuma_pmm::FreeSite::FpcacheEvict);
     }
     // The cache's own reference for the entry we just inserted. Combined with the
     // caller's mapping this makes the refcount 2 — see the module invariant.
@@ -231,7 +231,7 @@ pub fn invalidate_inode(inode: u32) {
     }
     INVALIDATIONS.fetch_add(dropped.len(), Ordering::Relaxed);
     for pa in dropped {
-        crate::pmm::free_page(PhysFrame::new(pa));
+        crate::pmm::free_page_at(PhysFrame::new(pa), akuma_pmm::FreeSite::FpcacheInvalidate);
     }
 }
 
@@ -266,7 +266,7 @@ pub fn shrink(want: usize) -> usize {
     let n = dropped.len();
     EVICTIONS.fetch_add(n, Ordering::Relaxed);
     for pa in dropped {
-        crate::pmm::free_page(PhysFrame::new(pa));
+        crate::pmm::free_page_at(PhysFrame::new(pa), akuma_pmm::FreeSite::FpcacheEvict);
     }
     n
 }

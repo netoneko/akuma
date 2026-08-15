@@ -1498,9 +1498,9 @@ fn demand_page_lazy_region(
         }
 
         // Free race-lost frames + unused pool frames (outside the hold).
-        for pf in race_free { crate::pmm::free_page(pf); }
+        for pf in race_free { crate::pmm::free_page_at(pf, akuma_pmm::FreeSite::FaultRaceLost); }
         while pool_idx < frame_pool.len() {
-            crate::pmm::free_page(frame_pool[pool_idx]);
+            crate::pmm::free_page_at(frame_pool[pool_idx], akuma_pmm::FreeSite::FaultPoolSurplus);
             pool_idx += 1;
         }
 
