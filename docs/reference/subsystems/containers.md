@@ -212,9 +212,21 @@ and dedupe, copy-up, whiteout clearing, layer capping (`MAX_LOWER_LAYERS = 32`).
 
 - Image `Env` is dropped: `SpawnOptions` has no env field, so a container gets
   `DEFAULT_ENV`. `box run` compensates by resolving a bare Entrypoint against
-  the standard `PATH` directories itself.
-- `spawn_ext` does not honour shebangs (only `execve` does), so a script
-  Entrypoint needs `--entrypoint`.
+  the standard `PATH` directories itself. `DEFAULT_ENV`'s `PATH` is the full
+  Linux search order since 2026-08-16 (`/usr/local/sbin:/usr/local/bin:
+  /usr/sbin:/usr/bin:/sbin:/bin`) — it was `/usr/bin:/bin`, so a container's
+  own shell could not find the binary the image installs under `/usr/local/bin`
+  and every official Entrypoint died on `exec: <prog>: not found`.
+- **No per-process credentials**, and this is the live blocker for running an
+  official image under its own Entrypoint. `setresuid`/`setuid`/`setgid`/
+  `setgroups`/`capset` are accepting no-ops and `getuid`/`geteuid` hardcode 0,
+  so the near-universal entrypoint shape
+  `exec setpriv --reuid=<user> -- "$0" "$@"` guarded by `[ "$(id -u)" = '0' ]`
+  **re-execs itself forever**: the child sees uid 0 again and takes the same
+  branch. Not a crash — the container simply never starts its program and
+  prints nothing. Workaround is `--entrypoint <the real binary>`; the fix is
+  uid/gid fields on `Process`, reported rather than enforced.
+  [`../../archive/DEVBOX_ISSUES.md`](../../archive/DEVBOX_ISSUES.md) Issue 15.
 - No layer GC, no `box rmi`, no digest pinning.
 - Full OCI runtime spec (cgroups, capabilities, seccomp, devices) — Akuma's
   isolation is namespace + network-stack, not a full container runtime.
@@ -254,3 +266,7 @@ boxed service.
   the mount lockdown, and the two bugs found underneath (busybox tar +
   `linkat`-copies-files; `spawn_ext` and shebangs).
 - `userspace/box/docs/OCI_IMAGE_PULL.md`, `userspace/herd/docs/CORE_AWARE_SCHEDULING.md`.
+- `archive/REDIS_END_TO_END.md` — running the official `redis:alpine` image end
+  to end: what `#!`-in-spawn, the `PATH`, the credential syscalls and
+  `/proc/self` each cost, and which one is still open.
+  `../../runbooks/run-redis.md` is the recipe.

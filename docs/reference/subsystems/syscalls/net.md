@@ -110,6 +110,65 @@ fixed-size handshake read, not a conformant SEQPACKET implementation.
   the one connect-specific error code callers should expect to see and
   retry-via-`epoll`/`poll` on (see [`../syscalls.md`](../syscalls.md)
   "Blocking vs non-blocking" and [`poll.md`](poll.md)).
+- `bind` with port `0` allocates an ephemeral port, for **TCP as well as
+  UDP**. Only the UDP arm did until 2026-08-16; the TCP arm stored the literal
+  `0`, so the following `connect` handed smoltcp `local_port = 0` and got
+  `Unaddressable`. Every client that binds before connecting (`busybox nc`,
+  anything setting a source address) failed against a healthy listener.
+- `bind` on a TCP socket does **not** record the address, only the port.
+  Binding `127.0.0.1:N` and binding `0.0.0.0:N` produce the same listener; a
+  smoltcp listener accepts on any local address. There is no way to restrict a
+  listener to loopback.
+
+## `connect` state machine and errnos
+
+`connect(2)` is not a single shot at smoltcp: `smoltcp::tcp::Socket::connect`
+rejects any socket that is not `Closed`, so the socket layer classifies the
+current TCP state first (`connect_step`, `crates/akuma-net/src/socket.rs`).
+
+| Socket state | Result |
+|---|---|
+| `Closed` / `Listen` / any teardown state | dials — a real SYN |
+| `Established` | `0` (success) |
+| `SynSent`/`SynReceived`, `O_NONBLOCK` | `EALREADY` |
+| `SynSent`/`SynReceived`, blocking | waits for completion, **without re-issuing the SYN** |
+
+`Established` returning *success* rather than POSIX's `EISCONN` is deliberate.
+The redial is how the standard non-blocking idiom collects a finished connect —
+`connect` → `EINPROGRESS` → poll → `connect` — and hiredis (so `redis-cli`) does
+exactly that. Until 2026-08-16 that second call was passed straight to smoltcp,
+rejected as `InvalidState`, and reported as `ECONNREFUSED`: **every local client
+failed against a listener that was up**, while traffic from outside the VM
+worked, which made it look like a loopback bug. It was not.
+
+Failure errnos are distinct, and were not before:
+
+| Errno | Means |
+|---|---|
+| `ECONNREFUSED` | the socket reached `Closed` — RST, or the stack gave up |
+| `ETIMEDOUT` | still half-open at the 10 s deadline |
+| `EADDRNOTAVAIL` | smoltcp `Unaddressable` — unroutable remote, or a zero local port |
+| `EISCONN` | smoltcp `InvalidState` on a fresh dial |
+| `ENETDOWN` | no network stack |
+
+Collapsing all of these into `ECONNREFUSED` is what hid two separate bugs behind
+one symptom: "nothing is listening", "the connect never completed" and "the local
+address is unusable" were indistinguishable from userspace. Both the state
+classification and the errno mapping are pure functions with host tests
+(`connect_state_tests`, `crates/akuma-net/src/tests.rs`) — the socket table and
+smoltcp are not needed to test them. Background:
+[`../../../archive/REDIS_END_TO_END.md`](../../../archive/REDIS_END_TO_END.md) §2.
+
+## No IPv6
+
+`sys_socket` accepts `domain == 2` (`AF_INET`) only; anything else, `AF_INET6`
+included, is `EAFNOSUPPORT` (97). smoltcp is built `proto-ipv4` only and there
+is not one `Ipv6` identifier in `crates/akuma-net/src/`. This is a missing
+feature, not a defect — but it is *loud*: servers that try to bind `::` first
+print a scary-looking startup warning and then serve IPv4 normally. See
+[`../../../archive/DEVBOX_ISSUES.md`](../../../archive/DEVBOX_ISSUES.md) Issue 9,
+which also records that `cargo` cannot reach crates.io because of it while
+`curl` can.
 
 ## The net bounce buffer
 

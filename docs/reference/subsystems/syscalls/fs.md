@@ -128,6 +128,38 @@ partial completion. `pwrite64`/`pread64` reject a negative `offset` with
 `write_at` call, no APPEND handling — POSIX `pwrite` ignores `O_APPEND` by
 design).
 
+## `readv`/`writev` — a short transfer ends the vector
+
+Both loop `sys_read`/`sys_write` over the iovecs and **stop at the first one
+that transfers fewer bytes than it was given**, returning the running total. A
+zero-length iovec is skipped, not treated as short.
+
+This is not an optimization, it is the contract. A partial transfer means the
+tail of that iovec did not happen; continuing to the next one writes it directly
+after the truncated bytes, while the caller — which learns only the total —
+resumes from a point that never corresponds to what actually went out. The
+stream ends up with a hole in it, and on a socket that is silent corruption of
+someone else's protocol.
+
+It matters constantly rather than rarely, because short writes are the *normal*
+case here: `socket_send` returns whatever fit in smoltcp's 16 KB TX buffer, and
+`alloc_net_bounce` degrades to a single page under memory pressure. Worse,
+`socket_send` ends with a `poll()` that drains the TX buffer, so the next iovec
+usually *succeeds* — which turns a dropped tail into a splice rather than a
+harmless stall.
+
+`writev` lacked the guard until 2026-08-16 while `readv` always had it; every
+Redis reply larger than the TX window came out spliced. Full A/B (4/16 KiB
+clean, 64 KiB / 256 KiB / 1 MiB corrupt, first wrong byte `0x0d` — the `\r\n` of
+the next iovec):
+[`../../../archive/WRITEV_SHORT_WRITE_SPLICE.md`](../../../archive/WRITEV_SHORT_WRITE_SPLICE.md).
+The rule is a named predicate (`writev_stops_after`) with a boot-suite check,
+`run_writev_short_write_tests`.
+
+**`sendmsg`/`recvmsg` are a different story** and still only process `iovs[0]` —
+see [`net.md`](net.md). That is a legal short transfer rather than a splice, but
+it is a real gap versus POSIX.
+
 ## `getdents64` directory cache
 
 `sys_getdents64` (`fs.rs:2235`) reads the whole directory listing once via

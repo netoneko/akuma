@@ -65,14 +65,37 @@ CLOEXEC stripping at exec). epoll fds are stripped on fork (not refcounted).
 | Path | Content |
 |---|---|
 | `/proc/<pid>/stat` | Linux compact single-line format (what `ps`/`top` parse) |
-| `/proc/<pid>/status` | human-readable |
+| `/proc/<pid>/status` | human-readable; includes `Uid`/`Gid` (always 0) and `CapInh`/`CapPrm`/`CapEff`/`CapBnd`/`CapAmb` |
 | `/proc/<pid>/cmdline` | argv |
 | `/proc/<pid>/fd/` | fd listing + `/proc/<pid>/fd/<n>` symlinks |
+| `/proc/self/…` | resolves to the calling process's pid (see below) |
 | `/proc/cores` | static single-row table (`0 online bsp`) |
 | `/proc/boxes` | box listing |
 
 > `ps`/`top` parse `/proc/<pid>/stat` (compact), not `status`. The `stat` file
 > was added after `ps` showed nothing (`archive/PROCFS.md`).
+
+**`/proc/self` is rewritten, not chased.** The VFS hands procfs the literal
+path rather than resolving the `self` symlink first, so `resolve_self`
+(`src/vfs/proc.rs`) rewrites a leading `self/` to the caller's pid at the top of
+`read_dir`/`read_at`/`read_file`/`exists`/`metadata`. The bare string `self`
+is deliberately left alone so `readlink("/proc/self")` keeps working.
+
+Before 2026-08-16 this did not happen at all: `read_symlink` reported `self`
+correctly, but `open("/proc/self/status")` arrived as the string `self/status`
+and matched nothing — `cat /proc/self/status` said `No such file or directory`
+in box 0 and in containers alike, for every file that existed under
+`/proc/<pid>/`. It is the reason `redis-server` could not start for four days
+(`/proc/self/smaps`, `archive/LONG_ROAD_TO_REDIS.md`) and, later, the reason
+libcap-ng failed inside a container (`archive/REDIS_END_TO_END.md` §4). If you
+add a `/proc` entry, test it through `/proc/self/` too — the two paths take
+different code.
+
+The `Cap*` lines report a full-root set (`000001ffffffffff`). Nothing enforces
+capabilities; the lines exist because **libcap-ng reads a process's
+capabilities from `/proc/self/status`**, not from `capget(2)`, and returns -1
+without setting errno when it cannot — which surfaces as the useless
+`setpriv: activate capabilities: No error information`.
 
 ## Mount namespaces & box isolation
 

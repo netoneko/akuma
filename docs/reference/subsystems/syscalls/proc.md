@@ -1,8 +1,8 @@
 # proc syscalls
 
-fork / clone / vfork / execve / wait / exit. Source: `src/syscall/proc.rs`.
-For signal delivery see [`signal.md`](signal.md); for CoW mechanics see
-[`../memory.md`](../memory.md).
+fork / clone / vfork / execve / wait / exit, plus the credential queries.
+Source: `src/syscall/proc.rs`. For signal delivery see
+[`signal.md`](signal.md); for CoW mechanics see [`../memory.md`](../memory.md).
 
 > **Stability: A (stable).** The Go forktest + rustc bring-up cohort
 > (Mar–May 2026) is resolved and dormant. The recurring lesson: **a Linux
@@ -106,6 +106,63 @@ Loader pick (see [`../../abi/linux-compat.md`](../../abi/linux-compat.md)
 "ELF loading"): `read_file()` first; on `FsError` (binary > 16 MB), fall back
 to `load_elf_from_path` (page-at-a-time via `vfs::read_at()`).
 
+### `#!` scripts
+
+Both `execve` **and** `spawn` resolve them, through one shared parser
+(`akuma_exec::process::{parse_shebang, shebang_hop}`): `exec_shebang`
+(`src/syscall/proc.rs`) for the exec path, `resolve_shebang_chain`
+(`crates/akuma-exec/src/process/spawn.rs`) for the SPAWN abi. Up to 4 hops,
+matching Linux's `BINPRM_MAX_RECURSION`; at most one argument after the
+interpreter, **not** split on whitespace (`#!/usr/bin/env -S a b` passes
+`-S a b` as one argv entry).
+
+Two rules that are easy to get wrong and were both wrong here until 2026-08-16:
+
+- **`argv[0]` is the interpreter as *written* in the `#!` line, never its
+  symlink-resolved target.** The resolved path is for loading the image only.
+  `exec_shebang` used to shadow one with the other, which is fatal rather than
+  cosmetic on a busybox system: busybox dispatches entirely on `argv[0]`, so
+  `#!/bin/sh` ran `/bin/busybox` with `argv[0]="/bin/busybox"` and busybox never
+  knew it was meant to be a shell.
+- **Spawn resolves the chain inside the namespace override**, because a
+  container's `/bin/sh` exists only in its own mount table; reading the shebang
+  from box 0's view finds the wrong interpreter or none. `spawn` had no shebang
+  support at all before, so nothing on the SPAWN abi — herd's services, all of
+  `box run` — could start a script, and every official OCI image's Entrypoint
+  is one.
+
+Tests: `shebang_tests` (host, in `spawn.rs`) for parsing and argv construction;
+`spawn_resolves_a_shebang_script` (boot suite) against the real VFS.
+
+## Credentials
+
+There are none. Every process is root and there is no per-process identity to
+change:
+
+| Syscall | nr | Behaviour |
+|---|---|---|
+| `getuid` / `geteuid` / `getgid` / `getegid` | 174-177 | always `0` |
+| `getresuid` / `getresgid` | 148 / 150 | write `0` to all three ids; `NULL` pointer → `EFAULT` |
+| `getgroups` | 158 | `0` groups; negative size → `EINVAL` |
+| `capget` | 90 | full-root set, with real version negotiation |
+| `capset`, `setuid`, `setgid`, `setresuid`, `setresgid`, `setgroups` | 91, 146, 144, 147, 149, 159 | accepting no-ops |
+
+**Read the setters' success as "not implemented", not "it worked."** A caller
+that asks to become an unprivileged user stays root, silently. That is the same
+fiction `getuid` already tells; making them fail instead would not add safety,
+only break callers. The real cost is documented under
+[`../containers.md`](../containers.md) "Not implemented": a privilege-dropping
+entrypoint that re-execs itself loops forever, because the child sees uid 0
+again.
+
+`capget` is the one with real logic, and it matters: Linux answers an unknown
+`hdr.version` by writing back the version it *does* support and returning
+`EINVAL` — a negotiation, which libcap-ng performs by calling `capget` with
+version 0 to learn the layout. The old stub returned success for any input,
+so every later call used a layout the kernel never agreed to. Note that
+libcap-ng reads the *capabilities themselves* from `/proc/self/status`, not
+from this syscall — see [`../vfs.md`](../vfs.md) "procfs".
+
 ## exit / exit_group
 
 `sys_exit` (93) / `sys_exit_group` (94) (`src/syscall/proc.rs`):
@@ -161,3 +218,6 @@ table). Linux wait-status encoding (`encode_wait_status`): normal exit
   wait-status encoding.
 - `archive/COW_OPTIMIZATIONS.md` — vfork fast path + frame-teardown O(n²) fix.
 - `archive/SIGNAL_DELIVERY.md` — wait/signal interaction, tgid sibling wake.
+- `archive/REDIS_END_TO_END.md` §3-§4 — where the `#!` and credential gaps
+  above were found, and why two plausible fixes for the capability failure
+  each changed nothing.

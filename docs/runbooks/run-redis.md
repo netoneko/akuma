@@ -199,7 +199,7 @@ Failure modes and where they point:
 | `box run` prints `failed to spawn …docker-entrypoint.sh` | Kernel predates shebang support in `spawn`. Rebuild, or pass `--entrypoint` |
 | `box run` starts and then nothing at all happens | The `setpriv` re-exec loop of §3. Use `--entrypoint` |
 | `Can't create socket: No file descriptors available` | Socket budget, §4 |
-| `Protocol error, got "<c>" as reply type byte` | The client read a byte that is not a RESP type marker. Seen once under a storm of short-lived connections and never reproduced — run `scripts/redis_stream_integrity.py --port 4544` (700 connections, validates every reply byte-for-byte). A **corruption** hit there is the socket layer; connect *timeouts* are just the backlog. [`../archive/REDIS_END_TO_END.md`](../archive/REDIS_END_TO_END.md) §7 |
+| `Protocol error, got "<c>" as reply type byte` | **FIXED 2026-08-16.** `sys_writev` did not stop at a short write, so any reply bigger than the 16 KB socket TX window came out spliced — `KEYS *` on a populated database was the reliable trigger. If you see it on an older kernel, that is the bug: [`../archive/WRITEV_SHORT_WRITE_SPLICE.md`](../archive/WRITEV_SHORT_WRITE_SPLICE.md) |
 
 ---
 

@@ -238,25 +238,20 @@ Until then: `--entrypoint /usr/local/bin/redis-server` skips the script.
   fall back to read/write.
 - **`INFO persistence` right after `BGSAVE`** once returned `recv timeout`
   while the RDB wrote correctly. Once, not reproduced.
-- **One `Protocol error, got "t" as reply type byte`** from a macOS `redis-cli`
-  typing `keys` interactively, while a loop of short-lived raw connections was
-  hammering the same server. `t` is not a RESP type byte (`+-:$*`), so the
-  client read something that was not the start of a reply — the shape of a
-  cross-stream splice, which this tree has had before (the socket-fd-refcount
-  bug that showed up as SSH MAC errors).
+- **`Protocol error, got "<c>" as reply type byte`** — first seen here as a
+  one-off and written up as unexplained. It was not a fluke: **ROOT-CAUSED and
+  FIXED** the same day once it reproduced on `KEYS *` against a populated
+  database, from the host *and* from inside the VM. `sys_writev` did not stop at
+  a short write, so every reply larger than smoltcp's 16 KB TX window came out
+  of the socket spliced. Full A/B and mechanism:
+  [`WRITEV_SHORT_WRITE_SPLICE.md`](WRITEV_SHORT_WRITE_SPLICE.md).
 
-  **Not reproduced**, and the obvious suspects were ruled out: a bare `keys`
-  returns a correct `-ERR wrong number of arguments` 8/8; 6 concurrent clients
-  × 40 ops each were clean; `scripts/redis_stream_integrity.py` — 700
-  connections, up to 40 at once, each validating that `PING` returns exactly
-  `+PONG\r\n` — found **zero** corrupt replies. The only failures at 40-way
-  concurrency were connect timeouts, which is the 32-deep backlog above, not
-  corruption.
+  Worth noting how the first sighting was mis-scoped here: the probe written for
+  it (`scripts/redis_stream_integrity.py`) sends `PING` and checks `+PONG\r\n`
+  — 7 bytes. It passed 700 connections cleanly and was taken as evidence of no
+  corruption, when it could not have detected this bug at all. **A negative
+  result is only as strong as the size of the thing it exercised.**
 
-  Best current explanation is a connection that arrived while the backlog was
-  saturated and got an aborted response the client mis-parsed. Left open on
-  purpose: if it recurs, `scripts/redis_stream_integrity.py` is the probe, and a
-  hit there (as opposed to a timeout) means the socket layer, not Redis.
 - **No IPv6 anywhere.** The `errno: 97` line Redis prints at startup is that,
   and is harmless (`DEVBOX_ISSUES.md` Issue 9).
 
