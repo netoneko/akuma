@@ -3,6 +3,57 @@
 Running log of issues found while dogfooding the devbox-smoltcp image
 (`overlays/devbox/`). One entry per issue; each stands alone.
 
+## Re-test sweep 2026-08-16 — read this before trusting a per-issue Status line
+
+All rows measured the same day on `devbox.img`, `MEMORY=8192 SMP=4`,
+`devbox-smoltcp`. **Four of the per-issue Status lines below are now wrong**;
+they are left in place (this is an archive log) and corrected here.
+
+| # | Status line says | Measured 2026-08-16 | |
+|---|---|---|---|
+| 1 | Did not reproduce (08-11) | **not re-tested** — avoided entirely; `devbox.img` ships `/root/akuma` pre-cloned, so nothing needs an in-guest clone | |
+| 2 | FIXED | **not re-tested** — reproducing it means wedging the VM | |
+| 3 | **FIXED 2026-08-11** | **STILL BROKEN** — see below. ⚠️ | ✗ |
+| 4 | OPEN | **confirmed OPEN** — `cat /proc/cores` → `read error: No such file or directory`, while `cores` *is* listed in `/proc` | |
+| 5 | FIXED | **confirmed FIXED** — 11/11 applets present (`wc head ps tail sort uniq grep sed awk du df`) | |
+| 6 | OPEN | **not re-tested** — needs an interactive `^C` | |
+| 7 | OPEN | **premise retired** — `/bin/bash` (GNU bash 5.3.9, a real 866 KB ELF) is installed. Re-test whether the original failure was bash syntax or Issue 8's shebang bug | ✗ |
+| 8 | OPEN, "busybox's own trigger" | **ROOT-CAUSED, and misattributed** — a kernel `execve` `argv[0]` bug; the busybox trigger runs clean. See the entry | ✗ |
+| 9 | OPEN (no IPv6, cargo can't reach crates.io) | **RESOLVED for cargo** — `cargo search` and `cargo fetch` both work in-guest; a full dep set (14.2 MB) downloaded. Whether IPv6 itself exists was not tested — cargo simply no longer needs it | ✗ |
+| 10 | FIXED | **not re-tested** — rump image, different build | |
+| 11 | OPEN (three lines every `SMP>1` boot) | **confirmed OPEN, unchanged** — exactly 3 lines at SMP=4 | |
+| 12 | OPEN (stdin hangs at 1 MiB) | **confirmed OPEN** — 4 MiB over ssh stdin → `rc=255`, no output. The image-staleness fix in that entry has not been applied to this `devbox.img` | |
+| 13 | OPEN (`pwritev2` ENOSYS spam under build load) | **not observed** — a full `-j4` kernel build logged **0** × `nr=287` (only `nr=71` ×6). Either the spam is gone or this workload does not provoke it | ✗ |
+
+### ⚠️ Issue 3 is not fixed — cross-core console interleaving still tears lines
+
+Its Status line reads "FIXED (shipped, default-on in `release`), 2026-08-11".
+Measured 2026-08-16 on a `devbox-smoltcp` boot at SMP=4, `[herd] Started sshd
+(pid= 2)` came out of the console **split across two lines**, with the prefix
+separated from its tail:
+
+```
+[herd] Starting service: sshd
+sshd (pid= 2)
+```
+
+This is not cosmetic. Any harness that waits on a console string can miss a
+perfectly healthy boot: it cost a 12-minute self-host trial that scored
+`BOOT_FAIL` against a VM where herd was PID 1, sshd was PID 2 accepting at 640
+syscalls/s, and a session handler had already forked at PID 3. The repo's own
+gate had the same latent false-negative — `scripts/verify_trim.py`'s
+`wait_for_marker` matched only `Started sshd|sshd started`, now widened to accept
+the surviving tail `sshd (pid=`.
+
+**Rule for anyone writing a harness: never assume a console string arrives
+contiguously at `SMP>1`. Gate on an ssh round-trip, which no other core's printf
+can tear.** Written up in
+[`../runbooks/verify-trim-fat-change.md`](../runbooks/verify-trim-fat-change.md)
+§ "Before calling anything a regression" item 4.
+
+Whether the 08-11 fix regressed or only ever narrowed the window is not
+established here — this sweep observed the symptom, it did not re-audit the lock.
+
 ## Issue 1: `git clone` over HTTPS deadlocks — pipe fills, nobody drains it
 
 **Status: Did not reproduce, 2026-08-11 — likely superseded.** Revisited
@@ -543,7 +594,51 @@ hitting the next bashism on a later run.
 
 ## Issue 8: `apk add`/`apk fix` reports "1 error" from busybox's own trigger even on a clean install
 
-**Status: OPEN.** Found 2026-08-12, same session as Issue 7, while installing
+**Status: ROOT-CAUSED 2026-08-16 — it is a kernel `execve` bug, and the title
+above misattributes it.** The busybox trigger now runs clean; the surviving "1
+error" is a `#!/bin/sh` package script failing to start at all:
+
+```
+* bash-5.3.9-r1.post-upgrade: applet not found
+ERROR: lib/apk/exec/bash-5.3.9-r1.post-upgrade: exited with error 127
+(2/2) Reinstalling redis (8.8.0-r0)
+Executing busybox-1.37.0-r31.trigger        <- this part is fine now
+1 error; 697.4 MiB in 58 packages
+```
+
+**Cause: `exec_shebang` puts the *symlink-resolved* interpreter in `argv[0]`.**
+`src/syscall/proc.rs` (`let interpreter = crate::vfs::resolve_symlinks(interpreter);`
+shadows the as-written string, which is then pushed as `argv[0]`). `/bin/sh` is a
+symlink to `/bin/busybox`, so a `#!/bin/sh` script execs busybox with
+`argv[0] = /bin/busybox` and `argv[1] = <script>`. Busybox invoked *as* `busybox`
+treats its first argument as an **applet name**, finds no applet by that name, and
+exits 127. Linux passes the interpreter **exactly as written in the shebang** as
+`argv[0]`, resolving the path only to load the image.
+
+This breaks **every `#!/bin/sh` script**, not just apk's. Measured in-guest
+2026-08-16 — the last two rows are the decisive control, identical but for `argv[0]`:
+
+| invocation | result |
+|---|---|
+| `#!/bin/sh` script | `rc=127  a.sh: applet not found` |
+| `#!/bin/busybox sh` script | `rc=0  OK` |
+| `#!/bin/bash` script | `rc=0  OK` (real ELF; ignores `argv[0]`) |
+| `busybox /tmp/a.sh` — what the kernel builds | `rc=127  a.sh: applet not found` |
+| `busybox sh /tmp/a.sh` | `rc=0  OK` |
+
+**`spawn.rs::resolve_shebang_chain` already gets this right** — it pushes the
+unresolved interpreter into the argv prefix and resolves separately into
+`elf_path`, and says so in its doc comment ("a shell must see the name it was
+asked to run, not the symlink target"). So this is two implementations of one
+rule that disagree; fix `exec_shebang` to keep the as-written string for
+`argv[0]` and the resolved path for loading, and prefer sharing one
+implementation. Issue 7 (`build.sh` "needs bash") is worth re-testing afterwards
+— it may be the same bug rather than bash-specific syntax.
+
+Original 2026-08-12 finding follows, kept because the reproduction is still the
+fastest way to see it.
+
+**Status (original): OPEN.** Found 2026-08-12, same session as Issue 7, while installing
 packages (`xz`, then reproduced against `busybox` directly) inside a running
 devbox-smoltcp guest over SSH.
 

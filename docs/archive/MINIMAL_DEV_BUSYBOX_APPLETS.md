@@ -193,6 +193,103 @@ The original failure was SSH-session teardown racing the backgrounded `sleep
 
 ---
 
+## V4 (2026-08-16) — `applet not found` that is **not** a missing applet: `exec_shebang` puts the symlink-resolved interpreter in `argv[0]`
+
+**Read this before chasing any `applet not found` on the devbox.** The applet
+symlink set is complete (re-verified below); this message can instead mean the
+kernel started busybox under the wrong `argv[0]`, and **every `#!/bin/sh` script
+on the image fails this way.**
+
+### Symptom
+
+```
+$ printf '#!/bin/sh\necho OK\n' > /tmp/a.sh; chmod +x /tmp/a.sh; /tmp/a.sh
+a.sh: applet not found            # rc=127
+```
+
+It surfaces most visibly through `apk`, which is where it was found — a package
+script that never starts, misread for years as a busybox trigger problem
+([`DEVBOX_ISSUES.md`](DEVBOX_ISSUES.md) Issue 8):
+
+```
+* bash-5.3.9-r1.post-upgrade: applet not found
+ERROR: lib/apk/exec/bash-5.3.9-r1.post-upgrade: exited with error 127
+1 error; 697.4 MiB in 58 packages
+```
+
+### Diagnosis — five invocations, measured in-guest
+
+The last two rows are the decisive control: same binary, same script, differing
+**only** in `argv[0]`.
+
+| # | invocation | result |
+|---|---|---|
+| A | `#!/bin/sh` script | `rc=127` `a.sh: applet not found` |
+| B | `#!/bin/busybox sh` script | `rc=0` `OK` |
+| C | `#!/bin/bash` script | `rc=0` `OK` |
+| D | `busybox /tmp/a.sh` — *the argv the kernel actually builds* | `rc=127` `a.sh: applet not found` |
+| E | `busybox sh /tmp/a.sh` | `rc=0` `OK` |
+
+`/bin/sh` is `lrwxrwxrwx /bin/sh -> /bin/busybox`. B works because the shebang
+names the applet explicitly; C works because `/bin/bash` is a real 866 KB ELF
+that ignores `argv[0]`. D reproduces the kernel's failure from userspace, which
+is what makes this a proof rather than a story.
+
+### Root cause
+
+`exec_shebang` in `src/syscall/proc.rs` shadows the as-written interpreter with
+its symlink target and then uses that for **both** jobs:
+
+```rust
+let interpreter = crate::vfs::resolve_symlinks(interpreter);  // "/bin/sh" -> "/bin/busybox"
+...
+new_args.push(interpreter.clone());   // argv[0] = "/bin/busybox"   <-- wrong
+do_execve(interpreter, new_args, env) //   load  = "/bin/busybox"   <-- right
+```
+
+Linux passes the interpreter **exactly as written in the shebang** as `argv[0]`
+and resolves the path only to load the image. Busybox is a multi-call binary
+whose entire dispatch is `argv[0]`: invoked as `busybox`, it treats its first
+argument as an applet name, so `argv[1]` (the script path) is looked up as an
+applet, basename and all. Any interpreter reached through a symlink loses its
+identity this way — busybox is simply the one that notices loudest.
+
+### Fix
+
+Keep the two values apart; only `argv[0]` changes:
+
+```rust
+let interp_argv0 = String::from(interpreter);                  // "/bin/sh"       -> argv[0]
+let interp_path  = crate::vfs::resolve_symlinks(interpreter);  // "/bin/busybox"  -> load
+```
+
+**`spawn.rs::resolve_shebang_chain` already does exactly this** — it pushes the
+unresolved interpreter into the argv prefix and resolves separately into
+`elf_path`, and states the rule in its doc comment ("a shell must see the name it
+was asked to run, not the symlink target"). So the two shebang implementations
+disagree, and only the `execve` one is wrong; the durable fix is one shared
+implementation rather than two that drift.
+
+### Verify
+
+```sh
+printf '#!/bin/sh\necho OK\n' > /tmp/a.sh && chmod +x /tmp/a.sh && /tmp/a.sh   # expect: OK
+/bin/busybox /tmp/a.sh                                                          # expect: OK
+apk fix 2>&1 | tail -2                                                          # expect: no "1 error"
+```
+
+### Applet inventory re-check (2026-08-16), for contrast
+
+All present on `devbox.img`, so a missing symlink is **not** the explanation for
+V4: `wc`, `head`, `ps`, `tail`, `sort`, `uniq`, `grep`, `sed`, `awk`, `du`, `df`
+— 11/11. `/bin/bash` (GNU bash 5.3.9) is installed as a real binary, which also
+retires [`DEVBOX_ISSUES.md`](DEVBOX_ISSUES.md) Issue 7's premise. Still broken
+independently of V4: `df` fails with `/proc/mounts: No such file or directory`
+(Cluster C below), and `cat /proc/cores` returns `read error: No such file or
+directory` while `cores` is listed in `/proc` (Issue 4).
+
+---
+
 ## Clustered gap analysis
 
 The missing surface clusters into eight groups. Order is roughly "cheapest
