@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 608
-- **Docs contributing at least one fix:** 192
+- **Total distinct fixes counted:** 619
+- **Docs contributing at least one fix:** 194
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 116 | 19.1% | 15 |
-| Memory & Virtual Memory | 112 | 18.4% | 34 |
-| Scheduler & Process Management | 75 | 12.3% | 18 |
-| SMP & Locking | 76 | 12.5% | 32 |
-| Networking | 31 | 5.1% | 13 |
-| Userspace Apps & Libraries | 35 | 5.8% | 19 |
-| Rump Kernel & Syscall Proxy | 25 | 4.1% | 6 |
-| Toolchain & Self-Hosting | 37 | 6.1% | 5 |
-| SSH | 15 | 2.5% | 13 |
-| VFS & Filesystem | 15 | 2.5% | 10 |
+| Syscall / ABI Compatibility Audits | 127 | 20.5% | 17 |
+| Memory & Virtual Memory | 112 | 18.1% | 34 |
+| Scheduler & Process Management | 75 | 12.1% | 18 |
+| SMP & Locking | 76 | 12.3% | 32 |
+| Networking | 31 | 5.0% | 13 |
+| Userspace Apps & Libraries | 35 | 5.7% | 19 |
+| Rump Kernel & Syscall Proxy | 25 | 4.0% | 6 |
+| Toolchain & Self-Hosting | 37 | 6.0% | 5 |
+| SSH | 15 | 2.4% | 13 |
+| VFS & Filesystem | 15 | 2.4% | 10 |
 | Boot & Drivers | 11 | 1.8% | 6 |
-| Signals & Exceptions | 12 | 2.0% | 5 |
+| Signals & Exceptions | 12 | 1.9% | 5 |
 | Misc / Cross-cutting | 14 | 2.3% | 4 |
-| Console & Terminal | 15 | 2.5% | 7 |
+| Console & Terminal | 15 | 2.4% | 7 |
 | Containers | 19 | 3.1% | 5 |
-| **Total** | **608** | **100.0%** | **192** |
+| **Total** | **619** | **100.0%** | **194** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -45,7 +45,7 @@ from several subsystems under one write-up.
 
 ---
 
-## Syscall / ABI Compatibility Audits (116 fixes, 15 docs)
+## Syscall / ABI Compatibility Audits (127 fixes, 17 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -152,6 +152,24 @@ from several subsystems under one write-up.
 ### docs/archive/THREAD_SLEEP_MISSING_CLOCK_NANOSLEEP.md
 - `std::thread::sleep()` panicked on every call, on every build — Akuma never implemented `clock_nanosleep` (Linux aarch64 syscall #115), which is what Rust's `std` actually calls for `sleep` on `target_os = "linux"` (not plain `nanosleep`); the resulting `ENOSYS` (38) tripped an `assert_eq!` inside `std` that only ever expected 0 or `EINTR` (4) back; fixed by implementing `sys_clock_nanosleep` with full relative/absolute (`TIMER_ABSTIME`) clock handling
 
+### docs/archive/REDIS_END_TO_END.md
+
+Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program work" — so it is tagged here per the per-file rule, though three of its ten fixes are Networking and two are VFS. `DEVBOX_ISSUES.md` Issues 14-16 describe the same fixes from the symptom side and are **not** counted again there.
+
+- `connect(2)` handed every call straight to `smoltcp::tcp::Socket::connect`, which rejects any socket that is not `Closed` with `InvalidState` — reported as `ECONNREFUSED`, so the standard non-blocking idiom (`connect` → `EINPROGRESS` → poll → `connect` to collect the result, which is what hiredis and therefore `redis-cli` does) failed against a listener that was up and healthy; the socket's TCP state is now classified first (`connect_step`) — `Established` → success, `SynSent`/`SynReceived` → `EALREADY` for a non-blocking caller or a wait-for-completion that does not re-issue the SYN for a blocking one
+- `bind(addr, 0)` on a **TCP** socket stored the literal port `0` (only the UDP arm allocated an ephemeral port), so the following `connect` handed smoltcp `local_port = 0` and got `Unaddressable` — every client that binds before connecting (`busybox nc`, anything setting a source address) failed with what was then reported as `ECONNREFUSED`
+- every non-`Established` outcome of `connect` returned `ECONNREFUSED`, the 10-second timeout included, so "nothing is listening", "the connect never completed" and "the local address is unusable" were indistinguishable from userspace — which is what hid the two bugs above behind one symptom; now `ECONNREFUSED` / `ETIMEDOUT` / `EADDRNOTAVAIL` / `EISCONN` / `ENETDOWN` are distinct (`connect_outcome`), and splitting them located the port-0 bug in a single run
+- `spawn_process_with_channel_ext` did not honour `#!` scripts (only `do_execve` did), so nothing on the SPAWN abi — herd's services and all of `box run` — could start a script, and every official OCI image's Entrypoint is one; `resolve_shebang_chain` now follows up to 4 hops **inside the namespace override**, because a container's `/bin/sh` exists only in its own mount table
+- `exec_shebang` shadowed the interpreter-as-written in the `#!` line with its symlink-resolved target and used the resolved path as `argv[0]`; busybox is a multi-call binary that dispatches entirely on `argv[0]`, so `#!/bin/sh` ran `/bin/busybox` with `argv[0]="/bin/busybox"` and busybox never knew it was meant to be a shell. Both paths now share one parser and one argv rule so they cannot diverge again
+- `DEFAULT_ENV`'s `PATH` was `/usr/bin:/bin`, and an OCI image's own `Env` is not propagated through the SPAWN abi (`SpawnOptions` has no env field), so a container's shell could not find the program the image installs under `/usr/local/bin` — every official Entrypoint died on `exec: <prog>: not found`; `DEFAULT_ENV` now carries the full Linux search order
+- `getresuid` (148), `getresgid` (150) and `getgroups` (158) were undispatched, and util-linux's `setpriv` treats `ENOSYS` from them as fatal, killing `redis:alpine`'s entrypoint under its `set -e` (this closes the `getgroups` gap `MINIMAL_DEV_BUSYBOX_APPLETS.md` recorded as a "fix shape" rather than a fix)
+- `capget` returned success for **any** `hdr.version`; Linux answers an unknown version by writing back the version it does support and returning `EINVAL`, and libcap-ng performs exactly that negotiation by calling `capget` with version 0 to learn the layout — so every later call used a layout the kernel never agreed to, surfacing as `setpriv: activate capabilities: No error information` (musl's `strerror(0)`, i.e. a failure that was not a syscall). Now negotiates properly and reports a full-root set, matching procfs
+- `/proc/self/<anything>` did not resolve: the VFS hands procfs the literal path rather than chasing the `self` symlink, so `/proc/self/status` arrived as the string `self/status` and matched nothing, in box 0 and in containers alike, for every file that existed under `/proc/<pid>/`. This is the *actual* root cause behind `LONG_ROAD_TO_REDIS.md`'s "`/proc/self/` is empty" — which was worked around there by adding the missing files, so `/proc/self/smaps` would have failed even once written; fixed properly with `resolve_self`, which leaves the bare `self` symlink alone
+- `/proc/<pid>/status` had no `CapInh`/`CapPrm`/`CapEff`/`CapBnd`/`CapAmb` lines, which is where **libcap-ng reads a process's capabilities from** (it does not call `capget`); it returns -1 without setting errno when it cannot. Added alongside `FDSize`/`Groups`, and the four near-identical per-state `format!` arms were merged into one so a future field cannot be added to three of them
+
+
+### docs/archive/WRITEV_SHORT_WRITE_SPLICE.md
+- `sys_writev` did not stop at a **short** write: after an iovec that wrote fewer bytes than it was given, it moved on to the next one, so the tail that never went out was replaced by the following iovec's bytes and the caller — told only a total — resumed from a point that did not correspond to what had actually been written. Short writes are the normal case here (`socket_send` returns whatever fit in smoltcp's 16 KB TX buffer, and it ends with a `poll()` that frees TX space so the *next* iovec usually succeeds), so every socket reply larger than the TX window came out spliced; `redis-cli` reported it as `Protocol error, got "\n" as reply type byte`, and an A/B on the same VM showed 4/16 KiB replies clean while 64 KiB, 256 KiB and 1 MiB corrupted — with the first wrong byte `0x0d` in all three, i.e. the `\r\n` of the next iovec. `sys_readv` had always had the mirror guard
 
 ## Memory & Virtual Memory (112 fixes, 34 docs)
 
