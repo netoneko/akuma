@@ -313,6 +313,9 @@ pub fn run_all_tests() {
     // MMU: RX promotion + I-cache invalidate (PLAN_SIGSEGV_COMPILE_FIX)
     test_update_page_flags_rw_to_rx_clears_uxn();
     test_icache_invalidate_page_va_smoke();
+    // The single-VA write walk must stop at a block descriptor rather than take its
+    // output address for a table base (TRIM_FAT_PTE_NEWTYPE.md §2 / `l3_slot`).
+    test_kernel_identity_va_walk_stops_at_block();
     // "x8 race" regression: rewriting code + cache maintenance must run the new
     // bytes, not stale ones (missing dc cvau before ic ivau). See §7j.
     test_icache_sync_rewrites_code();
@@ -7738,6 +7741,63 @@ fn test_update_page_flags_rw_to_rx_clears_uxn() {
         return;
     }
     console::print("[Test] update_page_flags_rw_to_rx_clears_uxn PASSED\n");
+}
+
+/// A kernel-identity VA resolves through a 2 MB **block**, so the single-VA write
+/// walk must refuse to descend it — and must therefore leave the RAM behind that
+/// block untouched.
+///
+/// Seven `&mut self` walks in `mmu/mod.rs` tested only `VALID` at L1/L2 before the
+/// `l3_slot` consolidation (`docs/archive/TRIM_FAT_PTE_NEWTYPE.md` §2). Every address
+/// space has such blocks — `add_kernel_mappings` identity-maps `[ram_base, ram_end)`
+/// as EL1-only 2 MB blocks — so those walks took a block's *output address* for an L3
+/// table base and then read, or wrote, at `block_pa + ((va >> 12) & 0x1FF) * 8`, which
+/// is live kernel RAM. It was reachable from EL0: `sys_munmap` applies no kernel-VA
+/// guard at all (`mmap_fixed_overlaps_kernel_va` is consulted only by `sys_mmap`), and
+/// `sys_mprotect` gates on `is_mapped`, which reports a block as **present**.
+///
+/// The read-only half runs first and returns before the mutating half if the walk is
+/// already broken, so a regressed tree reports FAILED instead of reproducing the
+/// corruption it is meant to detect.
+fn test_kernel_identity_va_walk_stops_at_block() {
+    use akuma_exec::mmu;
+    let mut p = make_test_process(99903);
+
+    // 16 MB into RAM: inside the identity map, past the kernel image, and 2 MB-aligned.
+    let va = mmu::ram_base() + 16 * 1024 * 1024;
+    if va >= mmu::ram_end() {
+        console::print("[Test] kernel_identity_va_walk_stops_at_block SKIPPED: RAM too small\n");
+        return;
+    }
+    // Presence and descent are different questions and both answers matter: the block
+    // IS mapped (`is_page_mapped` reports a block as present, deliberately), and there
+    // is still no L3 slot for a walk to point at.
+    if !p.address_space.is_mapped(va) {
+        crate::safe_print!(96,
+            "[Test] kernel_identity_va_walk_stops_at_block SKIPPED: va=0x{:x} not block-mapped\n", va);
+        return;
+    }
+    if p.address_space.read_l3_page_entry(va).is_some() {
+        crate::safe_print!(96,
+            "[Test] kernel_identity_va_walk_stops_at_block FAILED: walked into a block at va=0x{:x}\n", va);
+        return;
+    }
+
+    // The qword the pre-fix walk would have read, and then clobbered.
+    let victim = (mmu::phys_to_virt(va & !0x1F_FFFF) as usize + (((va >> 12) & 0x1FF) * 8)) as *mut u64;
+    let before = unsafe { core::ptr::read_volatile(victim) };
+
+    let _ = p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+    let _ = p.address_space.unmap_page_no_flush(va);
+
+    let after = unsafe { core::ptr::read_volatile(victim) };
+    if before != after {
+        crate::safe_print!(128,
+            "[Test] kernel_identity_va_walk_stops_at_block FAILED: kernel RAM at 0x{:x} changed 0x{:x} -> 0x{:x}\n",
+            victim as usize, before, after);
+        return;
+    }
+    console::print("[Test] kernel_identity_va_walk_stops_at_block PASSED\n");
 }
 
 /// Smoke: `invalidate_icache_for_page_va` completes for a mapped executable page.

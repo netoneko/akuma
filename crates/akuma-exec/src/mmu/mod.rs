@@ -1080,6 +1080,28 @@ impl UserAddressSpace {
         false // untracked here — not this address space's free obligation
     }
 
+    /// Walk **this** address space's own L0→L2 and return a pointer to the L3 slot
+    /// for `va`, or `None` when any intermediate level is unmapped or is a block
+    /// descriptor rather than a table.
+    ///
+    /// The `&self` analog of [`current_user_l3_pte`], which asks the same question of
+    /// the live `TTBR0_EL1`; both delegate to [`l3_slot_in`]. Seven `&mut self` walks
+    /// in this file open with the same four index extractions and the same three-level
+    /// descent, and differ only in what they do at the leaf — see
+    /// `docs/archive/TRIM_FAT_PTE_NEWTYPE.md` §2.
+    ///
+    /// Deliberately does **not** read the leaf: the callers disagree about what a
+    /// valid or invalid L3 entry means for them (one overwrites it unconditionally,
+    /// one checks AP first, the rest bail), so that decision stays at the call site.
+    /// It likewise takes no [`IrqGuard`] and does no TLB maintenance — the `_no_flush`
+    /// variants exist precisely because per-page barriers dominated large `munmap`s,
+    /// so guard and flush discipline stays with the caller, byte for byte.
+    fn l3_slot(&self, va: usize) -> Option<*mut u64> {
+        // SAFETY: `self.l0_frame` is this address space's live L0, kept alive by
+        // `&self`; the tables it reaches are freed only through `Drop`.
+        unsafe { l3_slot_in(phys_to_virt(self.l0_frame.addr) as *mut u64, va) }
+    }
+
     pub fn unmap_page(&mut self, va: usize) -> Result<(), &'static str> {
         let r = self.unmap_page_no_flush(va);
         flush_tlb_page(va);
@@ -1092,23 +1114,9 @@ impl UserAddressSpace {
     /// batch one barrier per region instead of one per page.
     pub fn unmap_page_no_flush(&mut self, va: usize) -> Result<(), &'static str> {
         let _irq_guard = IrqGuard::new();
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-        let l3_idx = (va >> 12) & 0x1FF;
-        unsafe {
-            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
-            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-            if l0_entry & flags::VALID == 0 { return Ok(()); }
-            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-            if l1_entry & flags::VALID == 0 { return Ok(()); }
-            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-            if l2_entry & flags::VALID == 0 { return Ok(()); }
-            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            l3_ptr.add(l3_idx).write_volatile(0);
-        }
+        let Some(pte) = self.l3_slot(va) else { return Ok(()) };
+        // Unconditional: this copy has never read the leaf before clearing it.
+        unsafe { pte.write_volatile(0); }
         Ok(())
     }
 
@@ -1127,24 +1135,11 @@ impl UserAddressSpace {
     /// showed single 12,426-page unmaps); per-page barriers dominated otherwise.
     pub fn unmap_and_free_page_no_flush(&mut self, va: usize) -> Option<PhysFrame> {
         let _irq_guard = IrqGuard::new();
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-        let l3_idx = (va >> 12) & 0x1FF;
+        let pte = self.l3_slot(va)?;
         let pa = unsafe {
-            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
-            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-            if l0_entry & flags::VALID == 0 { return None; }
-            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-            if l1_entry & flags::VALID == 0 { return None; }
-            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-            if l2_entry & flags::VALID == 0 { return None; }
-            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l3_entry = l3_ptr.add(l3_idx).read_volatile();
+            let l3_entry = pte.read_volatile();
             if l3_entry & flags::VALID == 0 { return None; }
-            l3_ptr.add(l3_idx).write_volatile(0);
+            pte.write_volatile(0);
             (l3_entry & 0x0000_FFFF_FFFF_F000) as usize
         };
         let frame = PhysFrame::new(pa);
@@ -1178,27 +1173,14 @@ impl UserAddressSpace {
     /// reallocated frame would corrupt memory (same hazard `munmap` guards).
     pub fn try_evict_ro_page(&mut self, va: usize) -> Option<PhysFrame> {
         let _irq_guard = IrqGuard::new();
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-        let l3_idx = (va >> 12) & 0x1FF;
+        let pte = self.l3_slot(va)?;
         let pa = unsafe {
-            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
-            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-            if l0_entry & flags::VALID == 0 { return None; }
-            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-            if l1_entry & flags::VALID == 0 { return None; }
-            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-            if l2_entry & flags::VALID == 0 { return None; }
-            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l3_entry = l3_ptr.add(l3_idx).read_volatile();
+            let l3_entry = pte.read_volatile();
             if l3_entry & flags::VALID == 0 { return None; }
             // AP_RO_ALL (bits [7:6] == 0b11) is the only state guaranteed clean:
             // a written CoW page is AP_RW_ALL and must never be re-read from file.
             if (l3_entry & flags::AP_RO_ALL) != flags::AP_RO_ALL { return None; }
-            l3_ptr.add(l3_idx).write_volatile(0);
+            pte.write_volatile(0);
             (l3_entry & 0x0000_FFFF_FFFF_F000) as usize
         };
         flush_tlb_page(va);
@@ -1214,22 +1196,9 @@ impl UserAddressSpace {
     /// Returns true if a page was found and zeroed, false if no mapping exists.
     pub fn zero_mapped_page(&self, va: usize) -> bool {
         let _irq_guard = IrqGuard::new();
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-        let l3_idx = (va >> 12) & 0x1FF;
+        let Some(pte) = self.l3_slot(va) else { return false };
         unsafe {
-            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
-            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-            if l0_entry & flags::VALID == 0 { return false; }
-            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-            if l1_entry & flags::VALID == 0 { return false; }
-            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-            if l2_entry & flags::VALID == 0 { return false; }
-            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l3_entry = l3_ptr.add(l3_idx).read_volatile();
+            let l3_entry = pte.read_volatile();
             if l3_entry & flags::VALID == 0 { return false; }
             let pa = (l3_entry & 0x0000_FFFF_FFFF_F000) as usize;
             core::ptr::write_bytes(phys_to_virt(pa) as *mut u8, 0, 4096);
@@ -1240,29 +1209,7 @@ impl UserAddressSpace {
     /// Update the permission bits of an existing L3 page table entry.
     /// Preserves the physical address and fixed flags, replaces only user permission bits.
     pub fn update_page_flags(&mut self, va: usize, new_flags: u64) -> Result<(), &'static str> {
-        let _irq_guard = IrqGuard::new();
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-        let l3_idx = (va >> 12) & 0x1FF;
-        const PERM_MASK: u64 = flags::AP_RO_ALL | flags::AP_RW_ALL | flags::UXN | flags::PXN;
-        unsafe {
-            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
-            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-            if l0_entry & flags::VALID == 0 { return Ok(()); }
-            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-            if l1_entry & flags::VALID == 0 { return Ok(()); }
-            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-            if l2_entry & flags::VALID == 0 { return Ok(()); }
-            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let old_entry = l3_ptr.add(l3_idx).read_volatile();
-            if old_entry & flags::VALID == 0 { return Ok(()); }
-            let entry = (old_entry & !PERM_MASK) | new_flags;
-            l3_ptr.add(l3_idx).write_volatile(entry);
-        }
-        flush_tlb_page(va);
+        self.update_page_flags_inner(va, new_flags, true);
         Ok(())
     }
 
@@ -1272,30 +1219,34 @@ impl UserAddressSpace {
     /// After calling this for all pages, issue a single `flush_tlb_range` or
     /// `flush_tlb_asid` to make the permission changes visible to userspace.
     pub fn update_page_flags_no_flush(&mut self, va: usize, new_flags: u64) -> Result<(), &'static str> {
-        let _irq_guard = IrqGuard::new();
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-        let l3_idx = (va >> 12) & 0x1FF;
-        const PERM_MASK: u64 = flags::AP_RO_ALL | flags::AP_RW_ALL | flags::UXN | flags::PXN;
-        unsafe {
-            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
-            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-            if l0_entry & flags::VALID == 0 { return Ok(()); }
-            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-            if l1_entry & flags::VALID == 0 { return Ok(()); }
-            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-            if l2_entry & flags::VALID == 0 { return Ok(()); }
-            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let old_entry = l3_ptr.add(l3_idx).read_volatile();
-            if old_entry & flags::VALID == 0 { return Ok(()); }
-            let entry = (old_entry & !PERM_MASK) | new_flags;
-            l3_ptr.add(l3_idx).write_volatile(entry);
-        }
         // No TLB flush — caller must call flush_tlb_range after the batch.
+        self.update_page_flags_inner(va, new_flags, false);
         Ok(())
+    }
+
+    /// The body behind the two `update_page_flags*` variants, which differed only in
+    /// whether the successful edit issues the per-page TLB invalidation. Same shape as
+    /// [`map_user_page_inner`]: `flush` is a literal at both call sites and this is
+    /// `#[inline]` into two one-line wrappers, so the branch constant-folds away.
+    ///
+    /// The flush stays inside the [`IrqGuard`] hold, and is skipped on every early
+    /// return, exactly as both copies had it. Neither copy ever needed `&mut self` —
+    /// both edit through a raw pointer — so this takes `&self`; the two public
+    /// wrappers keep `&mut self`, which is their existing API.
+    #[inline]
+    fn update_page_flags_inner(&self, va: usize, new_flags: u64, flush: bool) {
+        let _irq_guard = IrqGuard::new();
+        const PERM_MASK: u64 = flags::AP_RO_ALL | flags::AP_RW_ALL | flags::UXN | flags::PXN;
+        let Some(pte) = self.l3_slot(va) else { return };
+        unsafe {
+            let old_entry = pte.read_volatile();
+            if old_entry & flags::VALID == 0 { return; }
+            let entry = (old_entry & !PERM_MASK) | new_flags;
+            pte.write_volatile(entry);
+        }
+        if flush {
+            flush_tlb_page(va);
+        }
     }
 
     /// Raw L3 page descriptor for `va` (4KiB-aligned), if mapped at the final level.
@@ -1303,33 +1254,12 @@ impl UserAddressSpace {
     pub fn read_l3_page_entry(&self, va: usize) -> Option<u64> {
         let va = va & !(PAGE_SIZE - 1);
         let _irq_guard = IrqGuard::new();
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-        let l3_idx = (va >> 12) & 0x1FF;
-        unsafe {
-            let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
-            let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-            if l0_entry & flags::VALID == 0 {
-                return None;
-            }
-            let l1_ptr = phys_to_virt((l0_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-            if l1_entry & flags::VALID == 0 {
-                return None;
-            }
-            let l2_ptr = phys_to_virt((l1_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-            if l2_entry & flags::VALID == 0 {
-                return None;
-            }
-            let l3_ptr = phys_to_virt((l2_entry & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
-            let l3_entry = l3_ptr.add(l3_idx).read_volatile();
-            if l3_entry & flags::VALID == 0 {
-                return None;
-            }
-            Some(l3_entry)
+        let pte = self.l3_slot(va)?;
+        let l3_entry = unsafe { pte.read_volatile() };
+        if l3_entry & flags::VALID == 0 {
+            return None;
         }
+        Some(l3_entry)
     }
 
     /// Physical address of the 4KiB frame backing `va`, if mapped.
@@ -1621,24 +1551,59 @@ fn current_user_l3_pte(va: usize) -> Option<*mut u64> {
     { unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); } }
     #[cfg(not(target_os = "none"))]
     { ttbr0 = 0; }
+    // SAFETY: the L0 is the one this core is *currently* translating through, so it
+    // is live for as long as this core stays on it — which the caller's `IrqGuard`
+    // and the per-AS `as_lock` are what guarantee.
+    unsafe { l3_slot_in(phys_to_virt((ttbr0 & TABLE_PA) as usize) as *mut u64, va) }
+}
+
+/// Walk `l0_ptr`'s L0→L2 and return a pointer to the L3 slot for `va`, creating
+/// nothing, or `None` when any intermediate level is unmapped or is a block
+/// descriptor rather than a table.
+///
+/// The one write-side walk in this file: [`AddressSpace::l3_slot`] supplies an address
+/// space's own L0, [`current_user_l3_pte`] supplies the live `TTBR0_EL1`, and between
+/// them they serve the seven `&mut self` copies and the two current-TTBR0 editors that
+/// each used to open with these same four index extractions and three descents
+/// (`docs/archive/TRIM_FAT_PTE_NEWTYPE.md` §2). Read-side range work goes through
+/// [`for_each_mapped_user_pte`] and single-VA reads through [`resolve_user_leaf`]; this
+/// is the single-VA *write* case, which is why it hands back the slot rather than the
+/// descriptor.
+///
+/// **The `TABLE` test at L1/L2 is load-bearing**, and folding it in here is the one
+/// behavioural difference the consolidation introduces. Five of the seven `&mut self`
+/// copies tested only `VALID`, so a VA landing on a 1 GB or 2 MB **block** — which
+/// every address space has, since [`AddressSpace::add_kernel_mappings`] identity-maps
+/// kernel RAM as EL1-only 2 MB blocks — took the block's *output address* for a table
+/// base and then read, or wrote, into the middle of that RAM. This is the same latent
+/// bug the 2026-08-14 read-side merge found in [`update_current_user_page_flags`] and
+/// closed by way of [`resolve_user_leaf`]; [`current_user_l3_pte`] has tested it since.
+///
+/// Neither `VALID` nor `TABLE` is tested at L0: with a 4 KiB granule and a 48-bit VA,
+/// AArch64 has no L0 block descriptor, so a valid L0 entry is necessarily a table.
+/// [`resolve_user_leaf`] and the pre-merge copies all made the same assumption.
+///
+/// # Safety
+/// `l0_ptr` must be a live L0 table whose reachable tables are not freed for the
+/// duration of the walk, and of any use made of the returned pointer.
+#[inline]
+unsafe fn l3_slot_in(l0_ptr: *mut u64, va: usize) -> Option<*mut u64> { unsafe {
+    const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
     let l0_idx = (va >> 39) & 0x1FF;
     let l1_idx = (va >> 30) & 0x1FF;
     let l2_idx = (va >> 21) & 0x1FF;
     let l3_idx = (va >> 12) & 0x1FF;
-    unsafe {
-        let l0_ptr = phys_to_virt((ttbr0 & TABLE_PA) as usize) as *mut u64;
-        let l0_entry = l0_ptr.add(l0_idx).read_volatile();
-        if l0_entry & flags::VALID == 0 { return None; }
-        let l1_ptr = phys_to_virt((l0_entry & TABLE_PA) as usize) as *mut u64;
-        let l1_entry = l1_ptr.add(l1_idx).read_volatile();
-        if l1_entry & flags::VALID == 0 || l1_entry & flags::TABLE == 0 { return None; }
-        let l2_ptr = phys_to_virt((l1_entry & TABLE_PA) as usize) as *mut u64;
-        let l2_entry = l2_ptr.add(l2_idx).read_volatile();
-        if l2_entry & flags::VALID == 0 || l2_entry & flags::TABLE == 0 { return None; }
-        let l3_ptr = phys_to_virt((l2_entry & TABLE_PA) as usize) as *mut u64;
-        Some(l3_ptr.add(l3_idx))
-    }
-}
+    let l0_entry = l0_ptr.add(l0_idx).read_volatile();
+    if l0_entry & flags::VALID == 0 { return None; }
+    let l1_ptr = phys_to_virt((l0_entry & TABLE_PA) as usize) as *mut u64;
+    let l1_entry = l1_ptr.add(l1_idx).read_volatile();
+    if l1_entry & flags::VALID == 0 || l1_entry & flags::TABLE == 0 { return None; }
+    let l2_ptr = phys_to_virt((l1_entry & TABLE_PA) as usize) as *mut u64;
+    let l2_entry = l2_ptr.add(l2_idx).read_volatile();
+    if l2_entry & flags::VALID == 0 || l2_entry & flags::TABLE == 0 { return None; }
+    let l3_ptr = phys_to_virt((l2_entry & TABLE_PA) as usize) as *mut u64;
+    Some(l3_ptr.add(l3_idx))
+}}
 
 /// Overwrite the current address space's PTE for an ALREADY-MAPPED `va` with a new
 /// `pa`/`flags` — the copy-on-write remap. Unlike [`map_user_page`] (which refuses to

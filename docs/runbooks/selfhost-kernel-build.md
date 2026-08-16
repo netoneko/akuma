@@ -8,10 +8,11 @@ build + a nightly toolchain on a separate large disk.
 > stable toolchain. Self-hosting has actually compiled the kernel (147/147
 > units) and the self-built kernel boots.
 
-## Run a build trial (current procedure, 2026-08-15)
+## Run a build trial (current procedure, 2026-08-16)
 
 A clean `-j4` `--release` build is now **expected green** (10/10 clean builds
-on 2026-08-15, devbox-smoltcp image; ~7–12 min). Every stochastic crash class
+on 2026-08-15, devbox-smoltcp image; recorded then as ~7–12 min each — see the
+re-measurement below, which supersedes that figure). Every stochastic crash class
 from the 08-05/08-07 era below has been root-caused and fixed — the chronology
 lives in the archive docs linked from **Common failures**, not here. The
 consequence for procedure: **stop retrying through failures. A clean-build
@@ -61,6 +62,61 @@ a long campaign; its framing of crashes as weather is historical.
 **Between campaigns:** `e2fsck` the image (§5.5). Dozens of clean-build cycles
 with hard kills accumulate real filesystem damage whose symptom — a 15-minute
 boot behind a watchdog storm — impersonates a kernel regression.
+
+### How long a trial takes — **~2 min, not ~10** (re-measured 2026-08-16)
+
+**A whole trial is ~2m10s of wall clock**, boot + `cargo clean` + build
+inclusive, and it is *stable*: five consecutive trials measured 131, 132, 131
+and 132 s (the probe run before them, 127 s). The build is real work, not a
+fingerprint-cache resume — it recompiles from `scopeguard` up through
+`akuma-exec`, leaving 255 artifacts in `deps/` and a 3.8 MB ELF. Check that
+before trusting a fast trial: a *genuinely* no-op build is also quick, and the
+two are told apart by the artifact count, not the clock.
+
+Timing is a property of the **configuration**, so record it alongside the
+number. This one is:
+
+```bash
+DISK=devbox.img MEMORY=8192 SMP=4 cargo run --release --features devbox-smoltcp,no-tests
+# in-guest, per trial:
+cargo clean && cargo build --release -p akuma -j4 --offline
+```
+
+— the image's own `/root/akuma`, 8 GB, four cores, `-j4`, `--offline` against a
+pre-primed registry (below). The **~7–12 min** figure recorded on 2026-08-15 is
+left in place at the top of this section rather than rewritten; it predates this
+configuration. A trial that takes ten minutes again is therefore a finding about
+the machine or the image, not a return to normal.
+
+**Consequence for procedure: a five-trials-per-arm batch costs ~11 minutes, not
+an hour, so stop treating trial count as the expensive knob.** Ten per arm is
+~22 min unattended and buys real power against a stochastic class — a 1-in-5
+flake is unremarkable in five samples and cannot be told from a regression.
+
+### Prime the cargo registry first, or `--offline` fails misleadingly
+
+The devbox image ships `/root/akuma` and the nightly toolchain at
+`/usr/local/bin/rustc`, but an **empty** `/root/.cargo/registry`. `--offline`
+then dies in *resolution* rather than compilation, naming an arbitrary
+dependency:
+
+```
+error: no matching package named `arm_pl031` found
+location searched: crates.io index
+note: offline mode (via `--offline`) can sometimes cause surprising resolution failures
+```
+
+That reads like a broken manifest and is not. Prime once over the guest's
+network and every later trial is hermetic — `cargo clean` removes `target/`,
+never `CARGO_HOME`:
+
+```sh
+cargo fetch --manifest-path /root/akuma/Cargo.toml     # ~14 MB, one time
+```
+
+Priming **before** the batch rather than letting the first build fetch is the
+point: it keeps DNS/HTTP out of every trial, so a red trial means the memory
+path and not the network.
 
 ## Status (2026-08-05) — the `release-smp-shared` build completes
 

@@ -412,8 +412,18 @@ and Verify block: [`selfhost-kernel-build.md`](selfhost-kernel-build.md)
 - **Do not retry past a failure** — capture both logs and match against that
   runbook's Common failures table.
 
-Five trials per arm is a reasonable "extensive" batch: ~7–12 min each,
-unattended.
+**A trial is ~2 minutes, not ~10** (re-measured 2026-08-16: five consecutive
+trials at 131/132/131/132 s wall clock, boot + `cargo clean` + build inclusive,
+on `devbox.img` at `MEMORY=8192 SMP=4` with `-j4 --offline`). The
+[selfhost runbook](selfhost-kernel-build.md) § "How long a trial takes" has the
+configuration the number belongs to, and the one-time `cargo fetch` that
+`--offline` needs before the first trial.
+
+So five trials per arm costs ~11 min, not an hour — **run more than five.** Ten
+per arm is ~22 min unattended, and against a stochastic class that is the
+difference between a result and an anecdote: this gate's own `cowstale` entry
+records a flake that shows up ~2-in-5, which five samples cannot separate from
+noise on either arm.
 
 ## Before calling anything a regression
 
