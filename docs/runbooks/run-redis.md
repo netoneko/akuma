@@ -182,10 +182,18 @@ ssh -p 2322 root@localhost 'redis-cli -p 4444 get k'     # -> hostvalue
 ssh -p 2322 root@localhost 'redis-cli -p 4444 info server | grep ^os:'
 #    -> os:Akuma 0.0.7 aarch64
 
-# 5. no cross-stream corruption under connection churn
+# 5. large replies come back byte-exact (4 KiB .. 1 MiB)
+scripts/redis_stream_integrity.py --port 4544 --large
+#    -> every size "OK — byte-exact", then PASS
+
+# 6. no cross-stream corruption under connection churn
 scripts/redis_stream_integrity.py --port 4544 --conns 200 --parallel 16
 #    -> 200/200 connections returned exactly b'+PONG\r\n'
 ```
+
+Run **both**. Check 6 sends 7-byte replies and is blind to anything that only
+corrupts large ones — it passed 700 connections against the kernel that spliced
+every reply over 16 KB. Check 5 is the one that catches that class.
 
 Raise `--parallel` past ~32 and connections start *timing out* — that is the
 backlog of §4, not corruption, and the script says which it saw.

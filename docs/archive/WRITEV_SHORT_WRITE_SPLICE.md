@@ -78,10 +78,9 @@ of them), which is why it was the program that exposed this.
 
 ## 4. A/B
 
-`SET bigkey <N bytes>` / `GET bigkey`, with a non-repeating payload so a hole
-cannot hide behind identical neighbours, verified byte-for-byte
-(`bigreply.py`-style RESP client; the reusable probe is
-`scripts/redis_stream_integrity.py` for the connection-level check).
+`scripts/redis_stream_integrity.py --large`: `SET bigkey <N bytes>` / `GET
+bigkey` with a non-repeating payload, so a hole cannot hide behind identical
+neighbours, verified byte-for-byte.
 
 Same VM, same image, same Redis, only `sys_writev` differing:
 
@@ -94,6 +93,13 @@ Same VM, same image, same Redis, only `sys_writev` differing:
 | 1 MiB | **CORRUPT** — first mismatch at byte 985950 | OK |
 
 The threshold sits between 16 KiB and 64 KiB — the TX buffer, as predicted.
+
+Run against the same broken kernel, the script's **default** mode — 200
+connections each checking `PING` → `+PONG\r\n` — reported `200/200`. It is
+structurally incapable of seeing this: the reply is 7 bytes. That is recorded
+here rather than quietly fixed because it was a real mistake made during this
+investigation: the first sighting of the symptom was written off as
+unreproducible on the strength of that clean run.
 
 The decisive detail is *which* byte arrives wrong. In all three failures the
 payload byte was replaced by **`0x0d`** — a carriage return. That is the `\r\n`

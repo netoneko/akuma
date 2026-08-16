@@ -1168,6 +1168,52 @@ pub(super) fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
     total_read
 }
 
+/// Whether `writev` must stop after an iovec that wrote `written` of `want`.
+///
+/// **A short write ends the whole `writev`.** The tail of that iovec did not go
+/// out; moving on to the next one splices it in directly after the truncated
+/// bytes, and the caller — which learns only the total — resumes from there. The
+/// result is a byte stream with a hole in the middle. On a socket that is silent
+/// corruption of somebody else's protocol.
+///
+/// Short writes are routine on this kernel, not exceptional: `socket_send`
+/// returns whatever fit in smoltcp's 16 KB TX buffer, and the net bounce buffer
+/// degrades to a single page under memory pressure. Worse, `socket_send` ends
+/// with a `poll()` that pushes the queued bytes onto the wire and frees TX
+/// space — so the *next* iovec usually succeeds, which is what turns a dropped
+/// tail into a splice rather than a harmless stall.
+///
+/// Redis writes replies through `writev` over many iovecs, so any reply larger
+/// than the free TX window came out spliced; `redis-cli` reported it as
+/// `Protocol error, got "\n" as reply type byte` — the byte it found where the
+/// next reply should have started. `sys_readv` has always had the mirror guard;
+/// `writev` was simply missed.
+///
+/// Pure so the rule is testable without an fd (`run_writev_short_write_tests`).
+#[must_use]
+pub const fn writev_stops_after(written: u64, want: usize) -> bool {
+    written < want as u64
+}
+
+/// Boot-suite check for [`writev_stops_after`], in the same
+/// pure-function-plus-boot-assert shape as `run_net_bounce_tests`.
+///
+/// It covers the decision, not the splice: staging a *real* short write that is
+/// followed by an accepting one needs a peer draining the far end concurrently,
+/// which the boot suite (single-threaded, no network) cannot do. The end-to-end
+/// check is `scripts/redis_stream_integrity.py` against a live VM.
+#[cfg(kernel_tests)]
+pub fn run_writev_short_write_tests() {
+    assert!(!writev_stops_after(4096, 4096), "a fully-written iovec must continue");
+    assert!(writev_stops_after(10, 4096), "a short write must end the writev");
+    assert!(writev_stops_after(0, 1), "writing nothing is short — do not skip ahead");
+    assert!(!writev_stops_after(0, 0), "an empty iovec is complete, not short");
+    // The exact shape that corrupted Redis replies: smoltcp's 16 KB TX window
+    // truncating a larger iovec.
+    assert!(writev_stops_after(16384, 65536), "a TX-window-bounded write must stop");
+    crate::console::print("[Test] writev_stops_at_short_write PASSED\n");
+}
+
 pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
     let iov_size = iov_cnt * core::mem::size_of::<IoVec>();
     if !validate_user_ptr(iov_ptr, iov_size) { return EFAULT; }
@@ -1179,12 +1225,19 @@ pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
 
     let mut total_written: u64 = 0;
     for iov in kernel_iovs.iter().take(iov_cnt) {
+        if iov.iov_len == 0 { continue; }
         let written = sys_write(fd_num, iov.iov_base, iov.iov_len);
         if (written as i64) < 0 {
             if total_written == 0 { return written; }
             break;
         }
         total_written += written;
+        if writev_stops_after(written, iov.iov_len) {
+            break;
+        }
+    }
+    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        crate::safe_print!(128, "[syscall] writev(fd={}, cnt={}) = {}\n", fd_num, iov_cnt, total_written);
     }
     total_written
 }

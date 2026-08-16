@@ -226,6 +226,11 @@ pub fn run_all_tests() {
     // can't grow the heap. No network stack required.
     crate::syscall::run_net_bounce_tests();
 
+    // writev must stop at the first short write — continuing to the next iovec
+    // splices it in after the truncated bytes and silently corrupts the stream
+    // (Redis replies over a socket, docs/archive/REDIS_END_TO_END.md §7).
+    crate::syscall::run_writev_short_write_tests();
+
     // Re-enabled to investigate EC=0x0 crash
     test_echo2();
 

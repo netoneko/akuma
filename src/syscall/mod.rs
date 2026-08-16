@@ -42,6 +42,9 @@ mod net;
 /// Boot self-test for the net bounce-buffer allocator (see `net::alloc_net_bounce`).
 #[cfg(kernel_tests)]
 pub use net::run_net_bounce_tests;
+/// Boot self-test for `writev`'s short-write rule (see `fs::writev_stops_after`).
+#[cfg(kernel_tests)]
+pub use fs::run_writev_short_write_tests;
 pub mod pipe;
 pub mod poll;
 pub mod proc;
