@@ -719,7 +719,8 @@ fn secondary_gic_init(idx: usize) {
     unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
 }
 
-/// Base VA of this core's 16 KiB boot/idle stack in `secondary_boot_stacks_shared`.
+/// Base VA of this core's 64 KiB (`1 << STACK_SHIFT`) boot/idle stack in
+/// `secondary_boot_stacks_shared`.
 fn secondary_stack_base(core: usize) -> usize {
     let addr: usize;
     // SAFETY: resolves the `.bss.smp_shared` symbol's address; no memory access.

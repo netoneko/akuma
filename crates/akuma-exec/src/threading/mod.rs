@@ -1808,6 +1808,27 @@ pub fn adopt_current_as_core_idle(
     pool.slots[slot].start_time_us = (runtime().uptime_us)();
     pool.slots[slot].exception_stack_top = exc_stack_top;
     pool.stacks[slot] = StackInfo::new(stack_base, stack_size);
+    // Paint the canary, exactly as every other stack-registration path does
+    // (`allocate_stack_for_slot`, the boot stack in `init`, the recycle path in
+    // `cleanup_terminated`). This stack is static `.bss` rather than PMM-backed, so
+    // nothing painted it: the linker's `*(.bss .bss.*)` catch-all zeroes it, the
+    // canary words read 0 instead of the magic, and the first
+    // `report_overrun_stack_canaries` sweep announced a run-off on every secondary
+    // core that had never happened. Worse than the noise, the per-slot latch then
+    // kept those slots permanently "already reported", so a REAL overrun of a
+    // secondary's stack could never be announced — and this is the tightest stack in
+    // the system, since `secondary_shared_start` points the core's exception stack at
+    // the same 64 KiB (`exc_top = stack_base + stack_size`).
+    //
+    // Writing here is safe: the core entered on this stack with SP at its top, so the
+    // canary words at the base sit a whole stack below any live frame. Deliberately
+    // NOT paired with `fill_stack_sentinel` the way `allocate_stack_for_slot` is —
+    // that paints `base..top`, which would clobber the live SP of the very core
+    // running this code. Secondary high-water would need a `paint_boot_stack`-style
+    // paint that stops short of the current SP.
+    if config().enable_stack_canaries {
+        init_stack_canary(stack_base);
+    }
     // Seed a valid context; sp/ttbr0 are captured on the first switch-out from idle.
     unsafe {
         let ctx = &mut *get_context_mut(slot);
