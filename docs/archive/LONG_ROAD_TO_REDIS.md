@@ -1,7 +1,25 @@
 # The long road to Redis
 
+> **Fixed, and superseded for what happened next (2026-08-16).** Both fixes in
+> §5 landed: `MADV_FREE` returns `EINVAL` (§5.1) and `/proc/<pid>/{cmdline,
+> status,stat}` exist (a partial §5.2 — `smaps` still does not). `redis-server`
+> starts. It then turned out that no client on the same box could *reach* it,
+> for two unrelated reasons in `crates/akuma-net/src/socket.rs`; with those
+> fixed the official `redis:alpine` image runs in a box.
+> See [`REDIS_END_TO_END.md`](REDIS_END_TO_END.md) and the runbook
+> [`../runbooks/run-redis.md`](../runbooks/run-redis.md).
+>
+> One conclusion below is worth revisiting rather than trusting: §3.4 reads the
+> gap as "`/proc/self/` is empty" and §5.2 proposes adding the missing *files*.
+> The deeper cause was that **`/proc/self/<anything>` did not resolve at all** —
+> the VFS never chased the `self` symlink, so procfs saw the literal string
+> `self/status`. Adding files papered over it for the paths that were added;
+> `/proc/self/smaps` would have failed even once written. Fixed 2026-08-16
+> (`resolve_self` in `src/vfs/proc.rs`), and it cost another hour four days
+> later — see [`REDIS_END_TO_END.md`](REDIS_END_TO_END.md) §4.
+
 **Date:** 2026-08-12
-**Status:** root-caused, not yet fixed
+**Status:** root-caused, fixed — see the note above
 **Short version:** `redis-server` refuses to start because `/proc/self/smaps`
 does not exist. It is not a CoW bug and it is not `madvise`, though both were
 plausible and both were wrong.

@@ -319,6 +319,15 @@ pub mod nr {
     pub const GETGID: u64 = 176;
     pub const GETEGID: u64 = 177;
     pub const GETTID: u64 = 178;
+    /// The three credential *queries* `setpriv` makes before it will drop
+    /// privileges. Everything runs as root here, so all three answer 0 — but they
+    /// have to answer: ENOSYS made util-linux's `setpriv` bail
+    /// ("getresuid failed: Function not implemented"), which killed
+    /// `redis:alpine`'s `docker-entrypoint.sh` under its `set -e`
+    /// (docs/archive/DEVBOX_ISSUES.md Issue 15).
+    pub const GETRESUID: u64 = 148;
+    pub const GETRESGID: u64 = 150;
+    pub const GETGROUPS: u64 = 158;
     pub const KILL_LINUX: u64 = 129;
     pub const SETPGID: u64 = 154;
     pub const GETPGID: u64 = 155;
@@ -374,6 +383,28 @@ pub mod nr {
     #[cfg(feature = "sc-timerfd")]
     pub const TIMERFD_GETTIME: u64 = 87;
     pub const CAPGET: u64 = 90;
+    /// The credential *setters*, as accepting no-ops.
+    ///
+    /// This kernel has one identity — root — and no capability model, so there is
+    /// nothing to change and nothing to drop. They exist because privilege-dropping
+    /// wrappers treat a failure here as fatal: `redis:alpine`'s entrypoint runs
+    /// `setpriv --reuid=redis --regid=redis --clear-groups`, whose libcap-ng
+    /// `capng_apply` calls `capset` and whose `--clear-groups` calls `setgroups`.
+    /// ENOSYS from either killed the container before `redis-server` started
+    /// (docs/archive/DEVBOX_ISSUES.md Issue 15).
+    ///
+    /// **Read this as "privilege dropping is not implemented", not "it worked".**
+    /// A caller that asks to become an unprivileged user stays root, silently. That
+    /// is the same fiction `getuid`/`geteuid` already tell (both hardcode 0); making
+    /// these fail instead would not add safety, only break the callers. A real
+    /// implementation needs per-process credentials first — there is no uid field on
+    /// `Process` to set.
+    pub const CAPSET: u64 = 91;
+    pub const SETGID: u64 = 144;
+    pub const SETUID: u64 = 146;
+    pub const SETRESUID: u64 = 147;
+    pub const SETRESGID: u64 = 149;
+    pub const SETGROUPS: u64 = 159;
     pub const IO_URING_SETUP: u64 = 425;
     pub const IO_URING_ENTER: u64 = 426;
     pub const IO_URING_REGISTER: u64 = 427;
@@ -782,6 +813,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETGID => 0,
         nr::GETEGID => 0,
         nr::GETTID => akuma_exec::threading::current_thread_id() as u64,
+        nr::GETRESUID => proc::sys_getresugid(args[0], args[1], args[2]),
+        nr::GETRESGID => proc::sys_getresugid(args[0], args[1], args[2]),
+        nr::GETGROUPS => proc::sys_getgroups(args[0] as i32, args[1]),
         nr::KILL_LINUX => proc::sys_kill(args[0] as u32, args[1] as u32),
         nr::SETPGID => proc::sys_setpgid(args[0] as u32, args[1] as u32),
         nr::GETPGID => proc::sys_getpgid(args[0] as u32),
@@ -895,14 +929,15 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLOSE_RANGE => {
             fs::sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32)
         }
-        nr::CAPGET => {
-            let data_ptr = args[1] as usize;
-            if data_ptr != 0 {
-                let zero = [0u8; 24];
-                let _ = copy_to_user(data_ptr as u64, &zero);
-            }
-            0
-        }
+        nr::CAPGET => proc::sys_capget(args[0], args[1]),
+        // Accepting no-ops — see the `CAPSET` doc comment for why "success" here
+        // means "not implemented", not "privileges dropped".
+        nr::CAPSET
+        | nr::SETGID
+        | nr::SETUID
+        | nr::SETRESUID
+        | nr::SETRESGID
+        | nr::SETGROUPS => 0,
         nr::SYSINFO => proc::sys_sysinfo(args[0] as usize),
         nr::CLOCK_GETRES => time::sys_clock_getres(args[0] as u32, args[1] as usize),
         #[cfg(feature = "sc-epoll")]

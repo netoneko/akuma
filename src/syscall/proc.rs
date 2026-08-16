@@ -1282,6 +1282,116 @@ pub(super) fn sys_geteuid() -> u64 {
     0
 }
 
+/// `capget`: report a full-root capability set, with real version negotiation.
+///
+/// The old stub zeroed 24 bytes of `data` and returned 0 for any input. Both
+/// halves of that were wrong in ways that broke libcap-ng:
+///
+///  * **No version negotiation.** Linux's `capget` rejects an unknown
+///    `hdr.version` by writing the version it *does* support back into the header
+///    and returning EINVAL. That is a probe, not an error — libcap-ng calls
+///    `capget` with version 0 precisely to be told which layout to use. Blindly
+///    returning 0 told it "version 0 is fine", so every later call used a layout
+///    the kernel never agreed to.
+///  * **Zero capabilities.** Reporting an empty set makes a privilege-dropping
+///    wrapper believe it has nothing to preserve across a uid change, while
+///    `/proc/<pid>/status` says the opposite (`CapEff: 000001ffffffffff`). Two
+///    sources of truth that disagree is worse than either answer alone.
+///
+/// Everything here runs as root, so the honest answer is "all capabilities", and
+/// it matches what procfs reports.
+pub(super) fn sys_capget(hdr_ptr: u64, data_ptr: u64) -> u64 {
+    /// `_LINUX_CAPABILITY_VERSION_1/2/3`. v3 is what every current libc uses.
+    const CAP_V1: u32 = 0x1998_0330;
+    const CAP_V2: u32 = 0x2007_1026;
+    const CAP_V3: u32 = 0x2008_0522;
+    /// The low 41 capability bits (`CAP_LAST_CAP` = 40), as procfs reports them.
+    const CAP_LOW: u32 = 0xffff_ffff;
+    const CAP_HIGH: u32 = 0x0000_01ff;
+
+    if hdr_ptr == 0 || !validate_user_ptr(hdr_ptr, 8) {
+        return EFAULT;
+    }
+    let mut version: u32 = 0;
+    if read_user_into(&mut version, hdr_ptr).is_err() {
+        return EFAULT;
+    }
+
+    // Unknown version: tell the caller which one to use, then fail — this IS the
+    // negotiation, and returning success here is what broke libcap-ng.
+    if version != CAP_V1 && version != CAP_V2 && version != CAP_V3 {
+        if write_user_val(hdr_ptr, &CAP_V3).is_err() {
+            return EFAULT;
+        }
+        return EINVAL;
+    }
+
+    // A NULL `data` with a valid version is the pure "which version?" query.
+    if data_ptr == 0 {
+        return 0;
+    }
+
+    // v1 is one 32-bit triple; v2/v3 are two (low, high) — the struct is
+    // `{effective, permitted, inheritable}` repeated per 32-bit slot.
+    let slots: usize = if version == CAP_V1 { 1 } else { 2 };
+    let mut caps = [0u32; 6];
+    for slot in 0..slots {
+        let (eff, perm, inh) = if slot == 0 {
+            (CAP_LOW, CAP_LOW, 0)
+        } else {
+            (CAP_HIGH, CAP_HIGH, 0)
+        };
+        caps[slot * 3] = eff;
+        caps[slot * 3 + 1] = perm;
+        caps[slot * 3 + 2] = inh;
+    }
+    let bytes = slots * 12;
+    if !validate_user_ptr(data_ptr, bytes) {
+        return EFAULT;
+    }
+    if copy_to_user(data_ptr, &as_user_bytes(&caps)[..bytes]).is_err() {
+        return EFAULT;
+    }
+    0
+}
+
+/// `getresuid`/`getresgid`: write the real, effective and saved id.
+///
+/// One function for both because this kernel has exactly one identity — root —
+/// so all six values are 0. Answering matters even though the answer is
+/// constant: util-linux's `setpriv` treats ENOSYS from these as fatal, and
+/// `redis:alpine`'s entrypoint runs `setpriv --reuid=redis` under `set -e`, so
+/// the container died before `redis-server` ever started.
+///
+/// A NULL pointer is EFAULT, matching Linux — a caller passing one has a bug,
+/// and silently succeeding would hide it.
+pub(super) fn sys_getresugid(rptr: u64, eptr: u64, sptr: u64) -> u64 {
+    let zero: u32 = 0;
+    for ptr in [rptr, eptr, sptr] {
+        if ptr == 0 || !validate_user_ptr(ptr, 4) {
+            return EFAULT;
+        }
+        if write_user_val(ptr, &zero).is_err() {
+            return EFAULT;
+        }
+    }
+    0
+}
+
+/// `getgroups`: this kernel has no supplementary groups, so the count is 0.
+///
+/// `size == 0` is the standard "how many are there?" probe and must return the
+/// count without touching the buffer — that is the only form `setpriv` uses, but
+/// the buffer form is handled too rather than left as a trap. A negative size is
+/// EINVAL, per Linux.
+pub(super) fn sys_getgroups(size: i32, _list_ptr: u64) -> u64 {
+    if size < 0 {
+        return EINVAL;
+    }
+    // Zero groups to report, so nothing is ever written to `list_ptr`.
+    0
+}
+
 pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
     if !validate_user_ptr(ptr, len) { return EFAULT; }
     let _drv_bkl = super::fs::DriverBklGuard::new();

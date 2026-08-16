@@ -155,9 +155,28 @@ down, `DISK=devbox.img scripts/populate_disk.sh --bin-only`, then wipe
 `/var/lib/box/layers` and re-pull. The tell that you were hit by this is a
 layer store hundreds of megabytes larger than the image.
 
-**`box run: failed to spawn /entrypoint.sh`.** The image's Entrypoint is a shell
-script, and `spawn_ext` (syscall 315) does not honour shebangs — only `execve`
-does. Use `--entrypoint <the real binary>`.
+**`box run: failed to spawn /entrypoint.sh`.** **FIXED 2026-08-16** — `spawn`
+resolves `#!` scripts now (`resolve_shebang_chain`,
+`crates/akuma-exec/src/process/spawn.rs`), including a container's own `/bin/sh`
+from the image's layers. If you still see this, your kernel predates the fix;
+`--entrypoint <the real binary>` remains the workaround.
+[`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) Issue 14.
+
+**The container starts and then does nothing** — `Started PID N`, no output, no
+listener, no exit. The image's Entrypoint drops privileges and re-execs itself
+(`exec setpriv --reuid=… -- "$0" "$@"`, the standard shape for `redis`,
+`postgres`, `nginx`, …). Akuma has no per-process credentials, so `id -u` still
+answers 0 on the second pass and the script re-execs **forever**. Use
+`--entrypoint <the real binary>` to skip it.
+[`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) Issue 15, and
+[`run-redis.md`](run-redis.md) for a worked example.
+
+**`exec: <name>: not found` from inside the container**, for a binary that is
+plainly in the image. The container's `PATH` comes from `DEFAULT_ENV` — an OCI
+image's own `Env` is not propagated through the SPAWN abi, which has no env
+field. `DEFAULT_ENV` covers the full Linux search order since 2026-08-16
+(`/usr/local/bin` included); an image that installs somewhere else still needs
+an absolute path.
 
 **`box run: image '<x>' has no layer list`.** The image was pulled before the
 layer store existed. Re-pull it.

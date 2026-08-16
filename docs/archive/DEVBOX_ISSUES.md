@@ -1046,6 +1046,143 @@ on this kernel). The spam also buries real diagnostics in the log.
    surfaces. Per repo convention, the syscall change needs a boot-suite
    self-test in `src/process_tests.rs`.
 
+## Issue 14: `sys_spawn` could not run `#!` scripts — every OCI image's Entrypoint is one
+
+**Status: FIXED 2026-08-16.** Found running the official `redis:alpine` image
+in a box.
+
+### Symptom
+
+```
+~ # box run --rm -d redis:alpine redis-server --port 4444
+box: running '/usr/local/bin/docker-entrypoint.sh' in redis-alpine-53265326 (7 layers, ...)
+box run: failed to spawn /usr/local/bin/docker-entrypoint.sh
+```
+
+The file exists in the overlay, is executable, and `--entrypoint
+/usr/local/bin/redis-server` on the same image works — so it is not the image,
+the pull, or the overlay.
+
+### Cause
+
+`do_execve` has always handled `#!` (`exec_shebang`, `src/syscall/proc.rs`).
+**`spawn_process_with_channel_ext` never did.** Everything that goes through
+Akuma's SPAWN abi rather than exec — herd's services and all of `box run` —
+could therefore only start real ELF binaries.
+
+That is not a corner case: `redis`, `postgres`, `mysql` and `nginx` all ship a
+`docker-entrypoint.sh` as their Entrypoint, so *no* official image could run
+under its own entrypoint.
+
+### Fix
+
+`resolve_shebang_chain` in `crates/akuma-exec/src/process/spawn.rs`, called
+after path resolution and **inside** the namespace override — a container's
+`/bin/sh` lives in the image's layers, so reading the shebang from box 0's view
+would find the wrong interpreter or none. Follows up to 4 hops, like Linux.
+
+Two things came out of writing it:
+
+- **`exec_shebang` had an `argv[0]` bug**, found independently by another agent
+  and fixed in the same pass: it shadowed the interpreter-as-written with its
+  symlink-resolved target and used the *resolved* path as `argv[0]`. Linux uses
+  the name from the `#!` line. On a busybox system that is fatal rather than
+  cosmetic — busybox dispatches entirely on `argv[0]`, so `#!/bin/sh` ran
+  `/bin/busybox` with `argv[0]="/bin/busybox"` and busybox never knew it was
+  meant to be a shell. The decisive experiment was `busybox /tmp/a.sh` vs
+  `busybox sh /tmp/a.sh`: same binary, same script, differing only in `argv[0]`.
+- Both paths now share one parser (`parse_shebang`) and one argv rule
+  (`shebang_hop`). Two implementations of one rule is how they diverged.
+
+Tests: `shebang_tests` (host, in `spawn.rs`) for the parsing and argv
+construction; `spawn_resolves_a_shebang_script` (boot suite,
+`src/process_tests.rs`) against the real VFS.
+
+## Issue 15: privilege-dropping entrypoints re-exec forever — no per-process credentials
+
+**Status: OPEN.** The blocker between "`box run redis:alpine` with
+`--entrypoint`" and "`box run redis:alpine`".
+
+### Symptom
+
+`box run --rm -d redis:alpine redis-server --port 4444` starts, prints
+`Started PID 8`, and then nothing happens at all: no listener, no log output,
+no exit. `box ps` shows the container alive.
+
+### Cause
+
+`docker-entrypoint.sh`:
+
+```sh
+if [ "$1" = 'redis-server' -a "$(id -u)" = '0' ]; then
+	find . \! -user redis -exec chown redis '{}' +
+	exec setpriv --reuid=redis --regid=redis --clear-groups -- "$0" "$@"
+fi
+exec "$@"
+```
+
+`setpriv` now succeeds (see the chain below), but Akuma has **no per-process
+credentials**: `setresuid` is an accepting no-op and `getuid`/`geteuid` hardcode
+0. So the re-exec'd script sees `id -u` = 0 *again*, takes the same branch, and
+re-execs itself under `setpriv` forever. It never reaches `exec "$@"`.
+
+This is the general trap of a silently-succeeding credential syscall, not a
+Redis quirk — "drop privileges and re-exec" is the standard entrypoint shape.
+
+### What it took to get this far
+
+Four separate gaps, each of which had to be closed before the next was visible:
+
+| Failure | Cause | Fix |
+|---|---|---|
+| `exec: line 184: redis-server: not found` | `DEFAULT_ENV`'s `PATH` was `/usr/bin:/bin`; images install under `/usr/local/bin` | Full Linux search order in `crates/akuma-exec/src/process/types.rs` |
+| `setpriv: getresuid failed: Function not implemented` | `getresuid`/`getresgid`/`getgroups` undispatched | Implemented — everything is root, so all report 0 |
+| `setpriv: activate capabilities: No error information` | `/proc/self/<anything>` did not resolve — the VFS never chased the `self` symlink, so procfs saw the literal string `self/status`. Same gap that blocked Redis from starting at all in `LONG_ROAD_TO_REDIS.md` | `resolve_self` in `src/vfs/proc.rs`; `Cap*` lines added to `/proc/<pid>/status` |
+| *same message, still* | `capget` returned success for **any** header version. Linux answers an unknown version by writing back the supported one and returning `EINVAL` — that is a negotiation, and libcap-ng performs it by calling `capget` with version 0 | Real version negotiation + a full-root capability set in `sys_capget` |
+
+`No error information` is musl's `strerror(0)`: the failing call returned -1
+without setting errno, i.e. it was **not** a syscall — it was libcap-ng. Two
+plausible fixes (stub `capset`, add `Cap*` to procfs) each "should have" fixed
+it and neither did. Verify the fix, not the theory.
+
+### Fix
+
+Add `uid`/`gid` to `Process`; have the `get*` family read them and the `set*`
+family write them; inherit across fork/exec. **No enforcement is needed** — the
+kernel would simply report the identity a process asked for, which is enough to
+break the loop. A couple of hours. The risk is second-order: tools that behave
+differently as non-root, and file permission checks this kernel does not do.
+
+Until then, `--entrypoint /usr/local/bin/redis-server` skips the script:
+[`../runbooks/run-redis.md`](../runbooks/run-redis.md) §3.
+
+## Issue 16: socket budget caps concurrent clients at ~20-50
+
+**Status: OPEN, a sizing limit rather than a defect.** Found benchmarking Redis.
+
+`redis-benchmark -p 4444 -c 50` fails outright:
+
+```
+Could not connect to Redis at 127.0.0.1:4444: Can't create socket: No file descriptors available
+```
+
+`-c 20` is clean (4000-4500 rps), and back-to-back runs at `-c 20` can hit it
+too, so the effective ceiling depends on recent history rather than on the
+number alone.
+
+That message is `alloc_socket` returning `None` → `EMFILE`, from two caps:
+`akuma_net::socket::MAX_SOCKETS` (128 `KernelSocket` entries) and
+`smoltcp_net::MAX_SOCKETS` (256 with `many-sessions`). Every listener
+pre-allocates `MAX_BACKLOG` (32 with `many-sessions`) smoltcp sockets at
+`TCP_RX_BUFFER_SIZE + TCP_TX_BUFFER_SIZE` = 32 KB each — ~1 MB of heap held for
+the listener's whole life — and closed sockets sit in `pending_removal` for a
+cooldown before their slots come back, which is why consecutive runs are worse
+than a cold one.
+
+Fix would be a lazily-grown backlog (create listening sockets on demand up to
+the cap instead of all 32 up front) plus a configurable total. Both caps are
+compile-time constants today.
+
 ## Background
 
 - [`SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md`](SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md)

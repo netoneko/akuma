@@ -92,6 +92,43 @@ box's stack. This matters for Rust's `std::process::Command`, which uses
 spawn. Source: `crates/akuma-rump/src/syscall_translation.rs`,
 `archive/OPTIONAL_SMOLTCP.md`.
 
+## `connect(2)` semantics on the native stack
+
+smoltcp's `tcp::Socket::connect` refuses any socket that is not `Closed`, so the
+socket layer classifies the current TCP state *before* dialing
+(`connect_step`, `crates/akuma-net/src/socket.rs`):
+
+| Socket state | `connect` returns |
+|---|---|
+| `Closed`, `Listen`, or any teardown state | dials (a real SYN) |
+| `Established` | `0` — success |
+| `SynSent` / `SynReceived`, non-blocking caller | `EALREADY` |
+| `SynSent` / `SynReceived`, blocking caller | waits for completion, **without re-issuing the SYN** |
+
+`Established` answering *success* rather than POSIX's `EISCONN` is deliberate:
+the redial is how the standard non-blocking idiom collects a completed connect
+(`connect` → `EINPROGRESS` → poll → `connect`), and hiredis — so `redis-cli` —
+uses exactly that. Reporting an error there made every local client fail against
+a healthy listener.
+
+Failure errnos are **distinct**, which they were not before 2026-08-16:
+
+| Errno | Means |
+|---|---|
+| `ECONNREFUSED` | the socket reached `Closed` — RST, or the stack gave up |
+| `ETIMEDOUT` | still half-open at the 10 s deadline |
+| `EADDRNOTAVAIL` | smoltcp `Unaddressable` — unroutable remote, or a zero local port |
+| `ENETDOWN` | no network stack at all |
+
+`bind(addr, 0)` allocates an ephemeral port for TCP as well as UDP; storing the
+literal 0 made the following `connect` unaddressable. Both rules are
+pure-function-tested (`connect_state_tests`, `crates/akuma-net/src/tests.rs`).
+
+There is **no IPv6**: smoltcp is built `proto-ipv4` only, and `sys_socket`
+returns `EAFNOSUPPORT` for any domain but `AF_INET` (2) — which is the `errno:
+97` line servers print when they try to bind `::` first. See
+`archive/DEVBOX_ISSUES.md` Issue 9.
+
 ## Port forwarding (host → guest)
 
 `scripts/cargo_runner.sh` sets up SLIRP `hostfwd` rules:
@@ -109,3 +146,7 @@ spawn. Source: `crates/akuma-rump/src/syscall_translation.rs`,
 - `archive/NATIVE_STACK_INTERNET.md` — validating the native stack.
 - `archive/RUMP_SYSPROXY.md` — the committed sysproxy design.
 - `archive/HIJACK_VS_KERNEL_PROXY.md` — why kernel-side routing.
+- `archive/REDIS_END_TO_END.md` — the two `connect`/`bind` bugs above, and why
+  one errno for every failure hid both of them.
+- `../../runbooks/run-redis.md` — a worked end-to-end server on this stack,
+  including which guest ports the runner actually forwards.

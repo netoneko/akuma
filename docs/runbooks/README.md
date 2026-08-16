@@ -15,6 +15,7 @@ Start from the symptom or task on the left.
 | Debugging the devbox (SSH down, cargo crash, 100% CPU) | [`debug-devbox.md`](debug-devbox.md) |
 | Recovering a wedged / hung / 100%-CPU VM | [`recover-wedged-vm.md`](recover-wedged-vm.md) |
 | Debugging networking (native smoltcp stack) | [`debug-network.md`](debug-network.md) |
+| Running Redis — the Alpine package, or the official `redis:alpine` image in a box | [`run-redis.md`](run-redis.md) |
 | Debugging OOM / panics / allocation failures | [`debug-memory-oom.md`](debug-memory-oom.md) |
 | Debugging an EL1 crash / data abort / unhandled exception | [`debug-exceptions.md`](debug-exceptions.md) |
 | Debugging a boot hang | [`debug-boot-hang.md`](debug-boot-hang.md) |

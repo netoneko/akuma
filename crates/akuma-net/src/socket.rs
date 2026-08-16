@@ -506,24 +506,85 @@ where F: FnMut() -> bool
     }
 }
 
+/// The port a `bind` records: the requested one, or a freshly allocated
+/// ephemeral when the caller asked for 0.
+///
+/// Port 0 means "pick one for me". The TCP arm used to store the literal 0, so
+/// the *next* `connect` handed smoltcp `local_port = 0` — which it rejects as
+/// `Unaddressable` — and every client that binds before connecting failed
+/// against a healthy listener. Pure (the allocator is a callback) so that rule
+/// has a test that needs no network, and lazy so an explicit port does not burn
+/// an ephemeral number on the way past.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn bind_port_for(requested: u16, ephemeral: impl FnOnce() -> u16) -> u16 {
+    if requested == 0 { ephemeral() } else { requested }
+}
+
+/// What `connect(2)` must do next, given the socket's current TCP state.
+///
+/// The redial case is the whole reason this exists: the standard non-blocking
+/// idiom is `connect` -> `EINPROGRESS` -> poll -> `connect` again to collect the
+/// result, and hiredis (so `redis-cli`) does exactly that. Handing that second
+/// call to `smoltcp::tcp::Socket::connect` gets `InvalidState`, which used to be
+/// reported as ECONNREFUSED — so a healthy listener looked refused.
+#[cfg(feature = "smoltcp")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectStep {
+    /// Socket is idle: issue the SYN.
+    Dial,
+    /// Already established. POSIX says EISCONN, but a redial here is how the
+    /// non-blocking idiom asks "did it work?", so report success.
+    AlreadyConnected,
+    /// A connect is in flight. EALREADY for a non-blocking caller; a blocking
+    /// one waits for completion WITHOUT re-issuing the SYN.
+    InProgress,
+}
+
+/// Classify a socket's state into the action `connect` should take.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub const fn connect_step(state: tcp::State) -> ConnectStep {
+    match state {
+        tcp::State::Established => ConnectStep::AlreadyConnected,
+        tcp::State::SynSent | tcp::State::SynReceived => ConnectStep::InProgress,
+        _ => ConnectStep::Dial,
+    }
+}
+
+/// Map the end of a blocking connect onto a return value.
+///
+/// `waited` is what the poll loop reported (a signal or its own deadline);
+/// `state` is where the socket actually landed. Every non-`Established` outcome
+/// used to collapse into ECONNREFUSED, which made "nothing is listening" and
+/// "the connect never completed" indistinguishable from userspace — the reason
+/// two separate bugs hid behind one errno.
+#[cfg(feature = "smoltcp")]
+pub fn connect_outcome(waited: Result<(), i32>, state: Option<tcp::State>) -> Result<(), i32> {
+    match (waited, state) {
+        (_, Some(tcp::State::Established)) => Ok(()),
+        (Err(e), _) => Err(e),
+        (Ok(()), Some(tcp::State::Closed)) => Err(libc_errno::ECONNREFUSED),
+        (Ok(()), Some(_)) => Err(libc_errno::ETIMEDOUT),
+        (Ok(()), None) => Err(libc_errno::ENETDOWN),
+    }
+}
+
 #[cfg(feature = "smoltcp")]
 pub fn socket_bind(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
     with_table(|table| {
         if let Some(Some(sock)) = table.get_mut(idx) {
+            // Port 0 means "pick one for me", and it means that for TCP exactly as
+            // it does for UDP. The TCP arm used to store the literal 0, so the next
+            // `connect` handed smoltcp `local_port = 0` — rejected as
+            // `Unaddressable` — and every client that binds before connecting
+            // (busybox `nc`, anything setting a source address) failed with
+            // EADDRNOTAVAIL against a healthy listener. A `listen` after a port-0
+            // bind now also gets a real ephemeral port instead of listening on 0.
+            let port = bind_port_for(addr.port, alloc_ephemeral_port);
+            sock.bind_port = Some(port);
             if let SocketType::Datagram { handle, .. } = &sock.inner {
-                let port = if addr.port == 0 { alloc_ephemeral_port() } else { addr.port };
-                sock.bind_port = Some(port);
                 smoltcp_net::udp_socket_bind(*handle, port).map_err(|()| libc_errno::EINVAL)?;
-            } else {
-                // Port 0 means "pick one for me" for TCP exactly as it does for UDP.
-                // Storing the literal 0 made the *next* `connect` hand smoltcp
-                // `local_port = 0`, which it rejects as `Unaddressable` — so every
-                // client that binds before connecting (busybox `nc`, anything using
-                // a source address) failed with EADDRNOTAVAIL against a healthy
-                // listener. A `listen` after a port-0 bind now also gets a real
-                // ephemeral port instead of listening on 0.
-                let port = if addr.port == 0 { alloc_ephemeral_port() } else { addr.port };
-                sock.bind_port = Some(port);
             }
             Ok(())
         } else {
@@ -678,19 +739,16 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
     // `InvalidState`. Reporting that as ECONNREFUSED made every such caller
     // (`redis-cli`/hiredis is the reference case) fail against a listener that was
     // up and healthy. POSIX: EISCONN once established, EALREADY while connecting.
-    let state_before = with_network(|net| net.sockets.get::<tcp::Socket>(h).state());
-    match state_before {
-        None => return Err(libc_errno::ENETDOWN),
-        Some(tcp::State::Established) => return Ok(()),
-        Some(tcp::State::SynSent | tcp::State::SynReceived) => {
-            if nonblock {
-                return Err(libc_errno::EALREADY);
-            }
-            // Blocking redial: fall through to the completion wait below without
-            // re-issuing the SYN.
-            return finish_connect_wait(h);
-        }
-        Some(_) => {}
+    let Some(state_before) = with_network(|net| net.sockets.get::<tcp::Socket>(h).state()) else {
+        return Err(libc_errno::ENETDOWN);
+    };
+    match connect_step(state_before) {
+        ConnectStep::AlreadyConnected => return Ok(()),
+        ConnectStep::InProgress if nonblock => return Err(libc_errno::EALREADY),
+        // Blocking redial: wait for the in-flight connect to finish rather than
+        // re-issuing the SYN.
+        ConnectStep::InProgress => return finish_connect_wait(h),
+        ConnectStep::Dial => {}
     }
 
     let res = with_network(|net| {
@@ -724,15 +782,10 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
 }
 
 /// Block until a TCP socket that is already in `SynSent` either establishes or
-/// dies, and map the outcome to a POSIX errno.
+/// dies, and map the outcome to a POSIX errno via [`connect_outcome`].
 ///
 /// Split out of [`socket_connect`] so a blocking *redial* takes the same path as
-/// the first call. The failure errno is derived from the state the socket
-/// actually reached: `Closed` means the peer refused (RST) or the stack gave up,
-/// anything still half-open at the deadline is ETIMEDOUT — previously every
-/// non-`Established` outcome, timeout included, reported ECONNREFUSED, which is
-/// what made "connect never completes" and "nothing is listening" indistinguishable
-/// from userspace.
+/// the first call.
 #[cfg(feature = "smoltcp")]
 fn finish_connect_wait(h: SocketHandle) -> Result<(), i32> {
     let waited = wait_until(|| {
@@ -742,14 +795,7 @@ fn finish_connect_wait(h: SocketHandle) -> Result<(), i32> {
         }).unwrap_or(true)
     }, Some(10_000_000));
 
-    let state = with_network(|net| net.sockets.get::<tcp::Socket>(h).state());
-    match (waited, state) {
-        (_, Some(tcp::State::Established)) => Ok(()),
-        (Err(e), _) => Err(e),
-        (Ok(()), Some(tcp::State::Closed)) => Err(libc_errno::ECONNREFUSED),
-        (Ok(()), Some(_)) => Err(libc_errno::ETIMEDOUT),
-        (Ok(()), None) => Err(libc_errno::ENETDOWN),
-    }
+    connect_outcome(waited, with_network(|net| net.sockets.get::<tcp::Socket>(h).state()))
 }
 
 #[cfg(feature = "smoltcp")]

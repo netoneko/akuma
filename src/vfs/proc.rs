@@ -28,6 +28,35 @@ use akuma_exec::process::{self, Pid, ProcessState};
 // /proc/<pid>/cmdline + status (Linux-style)
 // ============================================================================
 
+/// Rewrite a leading `self/` to the calling process's own pid.
+///
+/// `/proc/self` is a symlink on Linux, and everything under it resolves through
+/// that symlink. Akuma's VFS hands procfs the literal path instead of chasing it,
+/// so `/proc/self/status` — a path essentially every libc and tool uses — reached
+/// this filesystem as the string `self/status` and matched nothing. `read_symlink`
+/// reported `self` correctly all along, which is why the gap was easy to miss.
+///
+/// The consequences were not cosmetic. It is the reason `redis-server` could not
+/// start at all (`/proc/self/smaps`,
+/// docs/archive/LONG_ROAD_TO_REDIS.md), and later the reason `redis:alpine`'s
+/// entrypoint died at `setpriv: activate capabilities: No error information` —
+/// libcap-ng reads a process's capabilities out of `/proc/self/status` and returns
+/// -1 *without setting errno* when it cannot.
+///
+/// The bare string `self` is deliberately NOT rewritten: it must stay a symlink so
+/// `readlink("/proc/self")` keeps working.
+fn resolve_self(path: &str) -> alloc::borrow::Cow<'_, str> {
+    match path.strip_prefix("self/") {
+        Some(rest) => match akuma_exec::process::read_current_pid() {
+            Some(pid) => alloc::borrow::Cow::Owned(format!("{pid}/{rest}")),
+            // No current process (kernel thread): leave it alone and let the
+            // caller's normal not-found path report it.
+            None => alloc::borrow::Cow::Borrowed(path),
+        },
+        None => alloc::borrow::Cow::Borrowed(path),
+    }
+}
+
 fn proc_cmdline_bytes(p: &process::Process) -> Vec<u8> {
     if p.args.is_empty() {
         let mut v: Vec<u8> = p.name.as_bytes().to_vec();
@@ -42,27 +71,44 @@ fn proc_cmdline_bytes(p: &process::Process) -> Vec<u8> {
     out
 }
 
+/// The capability mask a full-root process reports: every capability Linux
+/// defines up to `CAP_LAST_CAP`.
+///
+/// This kernel has no capability model — everything runs as root — but the
+/// `Cap*` lines still have to be here, because that is where **libcap-ng** reads
+/// a process's capabilities from (`capng_get_caps_process` parses
+/// `/proc/self/status`, it does not call `capget`). With the lines absent it
+/// fails, and `capng_apply` then returns -1 *without setting errno* — which is
+/// exactly the `setpriv: activate capabilities: No error information` that
+/// killed `redis:alpine`'s entrypoint. Stubbing `capset(2)` did not help,
+/// because `capset` was never the call that failed.
+const CAP_FULL_MASK: &str = "000001ffffffffff";
+
 fn proc_status_text(p: &process::Process) -> String {
     let name = p.name.as_str();
     let name_field = if name.len() > 15 { &name[..15] } else { name };
-    match p.state {
-        ProcessState::Zombie(code) => format!(
-            "Name:\t{}\nState:\tZ (zombie)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\nExitCode:\t{}\n",
-            name_field, p.pid, p.pid, p.parent_pid, code
-        ),
-        ProcessState::Ready => format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\n",
-            name_field, p.pid, p.pid, p.parent_pid
-        ),
-        ProcessState::Running => format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\n",
-            name_field, p.pid, p.pid, p.parent_pid
-        ),
-        ProcessState::Blocked => format!(
-            "Name:\t{}\nState:\tS (sleeping)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\n",
-            name_field, p.pid, p.pid, p.parent_pid
-        ),
+    let state = match p.state {
+        ProcessState::Zombie(_) => "Z (zombie)",
+        ProcessState::Ready | ProcessState::Running => "R (running)",
+        ProcessState::Blocked => "S (sleeping)",
+    };
+    // One format for every state — the four arms this replaced were identical
+    // apart from the state string and the zombie's trailing ExitCode, so adding
+    // a field meant remembering to add it four times.
+    let mut out = format!(
+        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\n\
+         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\n\
+         VmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\n\
+         CapInh:\t0000000000000000\nCapPrm:\t{}\nCapEff:\t{}\nCapBnd:\t{}\n\
+         CapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\n",
+        name_field, state, p.pid, p.pid, p.parent_pid,
+        CAP_FULL_MASK, CAP_FULL_MASK, CAP_FULL_MASK,
+    );
+    if let ProcessState::Zombie(code) = p.state {
+        use core::fmt::Write as _;
+        let _ = writeln!(out, "ExitCode:\t{code}");
     }
+    out
 }
 
 /// `/proc/<pid>/stat` (Linux-compatible, space-separated, single line).
@@ -261,7 +307,8 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
-        let path = path.trim_matches('/');
+        let path = resolve_self(path.trim_matches('/'));
+        let path = path.as_ref();
         let current_box_id = akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
 
         if path.is_empty() {
@@ -443,7 +490,8 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
-        let path = path.trim_start_matches('/');
+        let path = resolve_self(path.trim_start_matches('/'));
+        let path = path.as_ref();
 
         // Handle virtual files first (boxes, net/tcp, sysvipc/msg, <pid>/syscalls, etc.)
         if path == "boxes" || path.starts_with("net/") || path == "sysvipc/msg" {
@@ -544,7 +592,8 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
-        let path = path.trim_start_matches('/');
+        let path = resolve_self(path.trim_start_matches('/'));
+        let path = path.as_ref();
         let current_proc = akuma_exec::process::current_process_shared();
         let current_box_id = current_proc.as_ref().map_or(0, |p| p.box_id);
 
@@ -705,7 +754,8 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn exists(&self, path: &str) -> bool {
-        let path = path.trim_matches('/');
+        let path = resolve_self(path.trim_matches('/'));
+        let path = path.as_ref();
 
         if path.is_empty() {
             return true; // Root always exists
@@ -765,7 +815,8 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
-        let path = path.trim_matches('/');
+        let path = resolve_self(path.trim_matches('/'));
+        let path = path.as_ref();
 
         let inode = {
             let mut h: u64 = 0xcbf29ce484222325;
