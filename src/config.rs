@@ -697,7 +697,8 @@ pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = false;
 /// tens of thousands of lines/build (docs/archive/SELFHOST_DEVBOX_SMOLTCP.md).
 /// Flip to `false` to silence it (e.g. for a quieter self-host build run);
 /// leave `true` to keep the WILD-DA-crash diagnostic live for the general case.
-pub const SYSCALL_ERRNO_DIAG_ENABLED: bool = false;
+/// TEMP DEBUG nca-build EFAULT: narrowed to EFAULT only (EINVAL floods readlinkat).
+pub const SYSCALL_ERRNO_DIAG_ENABLED: bool = true;
 
 /// Stale-instruction-cache **spurious-SVC** guard (§7k.4 root cause).
 ///

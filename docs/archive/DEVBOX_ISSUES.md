@@ -1196,7 +1196,45 @@ Fix would be a lazily-grown backlog (create listening sockets on demand up to
 the cap instead of all 32 up front) plus a configurable total. Both caps are
 compile-time constants today.
 
+## Issue 17: socket read hangs forever when the response's first byte is delayed
+
+**Status: OPEN (found 2026-08-17), kernel suspicion — lost wakeup of a
+blocked socket reader after a long idle window.**
+
+Found dogfooding `nca` (upstream `native-cli-ai`, host-built musl-static,
+see `NCA_MISSING_SYSCALLS.md`) against host Ollama at `10.0.2.2:11434`:
+
+- Instant-response model (qwen3.5:0.8b): full round trips — `2+2 → 4`,
+  `3+3 → 6`, SSE streaming, clean session completion. Twice.
+- Slow-prefill model (gemma4:e4b, ~10 s silent window before first byte):
+  connect + send succeed, then the client blocks in read **forever**. 100%
+  reproducible.
+- **The identical gemma request succeeds through a host-side logging proxy**
+  that responds to the initial probe instantly and forwards chunks as they
+  arrive — same SLIRP path, same binary. The proxy changes timing, not
+  topology: every passing test got first bytes in ~1 s; every failing one
+  waited >5 s.
+
+Ruled out: SLIRP/host reachability (`wget` POST to the same endpoint works
+during the hang), keep-alive reuse (two sequential requests over one
+connection both answered), non-blocking I/O specifically (std nonblocking
+probe fine), nca/reqwest (works via proxy). Suspect surface:
+`crates/akuma-net/src/socket.rs` rx wake bookkeeping,
+`src/syscall/net.rs` blocked recv / `src/syscall/poll.rs` wake registration
+and timeout teardown — same race class as the futex "published-WAITING-
+before-re-read" hunt (`docs/runbooks/debug-futex-lost-wakeup.md` §4a), on
+the socket rx path.
+
+Full write-up incl. the minimal-repro sketch (delayed-reply host listener,
+sweep 0.5–30 s, plus a mid-stream-gap variant):
+[`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md).
+
 ## Background
+
+- [`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md)
+  — Issue 17's full investigation: the timing discrimination between direct
+  Ollama and the logging proxy, everything ruled out, and the minimal-repro
+  sketch.
 
 - [`SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md`](SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md)
   — Issue 12's root cause: the missing `SSH_MSG_CHANNEL_WINDOW_ADJUST`, and why

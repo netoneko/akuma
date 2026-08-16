@@ -1,0 +1,73 @@
+diff --git a/crates/core/Cargo.toml b/crates/core/Cargo.toml
+index 49038fa..cf5b217 100644
+--- a/crates/core/Cargo.toml
++++ b/crates/core/Cargo.toml
+@@ -12,7 +12,7 @@ serde_json = { workspace = true }
+ tokio = { workspace = true }
+ thiserror = { workspace = true }
+ tracing = { workspace = true }
+-reqwest = { version = "0.12", features = ["json", "stream"] }
++reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+ genai = "0.5"
+ similar = "2"
+ globset = "0.4"
+@@ -21,7 +21,7 @@ base64 = "0.22"
+ scraper = "0.23"
+ futures-util = "0.3"
+ serde_yaml = "0.9.34"
+-mcpr = "0.2.3"
++mcpr = { version = "0.2.3", optional = true }
+ regex = "1"
+ chrono = { version = "0.4", features = ["serde", "clock"] }
+ tempfile = "3"
+diff --git a/crates/runtime/src/ipc.rs b/crates/runtime/src/ipc.rs
+index 7663bfa..6a5c6d1 100644
+--- a/crates/runtime/src/ipc.rs
++++ b/crates/runtime/src/ipc.rs
+@@ -49,23 +49,34 @@ impl IpcServer {
+             let _ = tokio::fs::remove_file(&self.socket_path).await;
+         }
+ 
+-        let listener = bind_listener(&self.socket_path).await?;
++        // Akuma has no AF_UNIX stream sockets (only socketpair). Degrade to a
++        // disabled-IPC mode: the handle's channels still work in-process, only
++        // external attach/status clients lose connectivity.
++        let listener = match bind_listener(&self.socket_path).await {
++            Ok(l) => Some(l),
++            Err(err) => {
++                tracing::warn!("IPC disabled: socket bind failed: {err}");
++                None
++            }
++        };
+         let (event_tx, _) = broadcast::channel::<String>(256);
+         let accept_event_tx = event_tx.clone();
+         let (command_tx, command_rx) = mpsc::unbounded_channel();
+         let socket_path = self.socket_path.clone();
+ 
+-        tokio::spawn(async move {
+-            loop {
+-                let Ok((stream, _)) = listener.accept().await else {
+-                    break;
+-                };
+-                let event_rx = accept_event_tx.subscribe();
+-                let command_tx = command_tx.clone();
+-                tokio::spawn(handle_connection(stream, event_rx, command_tx));
+-            }
+-            cleanup_endpoint(&socket_path).await;
+-        });
++        if let Some(listener) = listener {
++            tokio::spawn(async move {
++                loop {
++                    let Ok((stream, _)) = listener.accept().await else {
++                        break;
++                    };
++                    let event_rx = accept_event_tx.subscribe();
++                    let command_tx = command_tx.clone();
++                    tokio::spawn(handle_connection(stream, event_rx, command_tx));
++                }
++                cleanup_endpoint(&socket_path).await;
++            });
++        }
+ 
+         Ok(IpcHandle {
+             socket_path: self.socket_path.clone(),
