@@ -18,6 +18,37 @@
 > and is retained in §5 as a worked example of a mechanism that explained the symptom
 > perfectly and was still not happening. Every instrument added along the way is
 > permanent and is what made the elimination possible — read §8 before adding more.
+>
+> ---
+>
+> **UPDATE 2026-08-16 — the ICE did not reproduce in 20 further clean builds.**
+> Not a claimed fix; a measurement, recorded because the header above says the ICE
+> reproduces on **~every** clean build and that is no longer what the machine does.
+>
+> | | this doc's arms (2026-08-15) | 2026-08-16 |
+> |---|---|---|
+> | image / command | `devbox.img`, `cargo clean` + `-p akuma -j4 --offline` | **identical** |
+> | SMP | 4 | 4 |
+> | MEMORY | 4096 | **8192** |
+> | clean builds | (§2 arms; final two arms = 11 with no ICE) | **20** |
+> | ODHT-zeros ICE | ~every build, earlier in the hunt | **0 / 20** |
+> | rustc `signal: 11` | the more frequent failure (§ item 3) | **0 / 20** |
+> | `[PMM-POISON]` / `[PMM-UAF]` / `[PMM-RESURRECT]` / `[WILD-DA]` | — | **0** |
+>
+> Those 20 were the Tier 5 arm of an unrelated gate
+> ([`TRIM_FAT_PTE_NEWTYPE.md`](TRIM_FAT_PTE_NEWTYPE.md) §5), 10 each on two
+> kernels, so the streak spans two builds of the kernel and is not one lucky
+> image state. Chained onto this hunt's own closing streak of 11, that is **31
+> consecutive clean builds with no ODHT ICE**.
+>
+> **Why this is not marked FIXED.** No root cause was ever found, so there is
+> nothing to point at; the memory size differs (8 GB vs 4 GB), and §12 already
+> showed this ICE's rate moving with prefault behaviour, so more RAM is exactly
+> the kind of thing that could mask it rather than remove it. This document's own
+> rule also applies to its update: **rate-score nothing on an unrepaired image** —
+> the 2026-08-16 runs were not preceded by an `e2fsck`, and the disk had been
+> repaired at the end of the original hunt. Someone reopening this should re-run
+> at `MEMORY=4096` on a freshly-checked image before concluding either way.
 
 ## 1. The symptom
 

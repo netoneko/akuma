@@ -333,7 +333,7 @@ No read became two, and no two became one.
 | 2 — boot suite SMP=1 and SMP=4 | 95 `[PASS]`, **empty** failure sets, 0 host time-jumps |
 | 3 — Tier 3 exercises, both SMP levels | all `ok`; `eager_mprotect` `KNOWN-FAIL (expected)` |
 | 4 — redis `--test-memory 512` | `Your memory passed this test`; 0 SIGSEGV, tripwires silent |
-| 5 — self-host clean builds, 10 per arm | **IN FLIGHT at time of writing — fill this in** |
+| 5 — self-host clean builds, 10 per arm | **10/10 both arms**, 0 tripwires, 0 `defer_leak`, 0 `FILL-SHORT got=Ok(0)` |
 
 The whole Tiers 1–3 A/B diff came to three lines, all accounted for:
 `passed_marker` +1 at each SMP level (the new boot test — `pass_marker` stayed 95
@@ -351,7 +351,38 @@ for a harness reason (the probe never ran: sshd accepts later than its boot
 marker prints), which is why the harness now scores that INCONCLUSIVE instead —
 a missed run must never be indistinguishable from a SIGSEGV.
 
-Tier 5 measured trial cost at **~2m10s**, not the ~7–12 min on record; both
+Tier 5 ran 20 trials, 10 per arm, each a fresh boot + `cargo clean` + `-j4
+--offline` kernel build, both arms from **pinned worktrees** (`5b54763b` and
+`b8eefbe3`) rather than the live tree. Every trial exited 0, compiled
+`akuma-exec`, and left the full `deps/` tree; boot logs came out uniformly
+548–563 KB on both arms, which is the structural check that no trial was
+silently truncated. Elapsed 106–128 s throughout.
+
+Three Tier 5 attempts were discarded before this one, none for a kernel reason,
+all caught by a number that did not fit the ~131 s norm:
+
+1. **Stale sentinel.** `/tmp` survives the reboot (the devbox is not booted in
+   snapshot mode), so a trial matched the *previous* trial's `__EX__0` and scored
+   GREEN in 33 s with a 94 KB boot log. Fixed with per-trial sentinels and log
+   paths.
+2. **Build-graph contamination.** A concurrent unrelated edit to
+   `src/exceptions.rs` / `sync.rs` / `console.rs` meant each trial was rebuilding
+   a different kernel from the live tree. Fixed by pinning both arms to
+   worktrees.
+3. **Torn console marker.** At SMP=4 the cores interleave, and `[herd] Started
+   sshd (pid= 2)` arrived split across two lines, so the readiness regex never
+   matched a perfectly healthy boot — one trial burned its full 720 s budget and
+   scored BOOT_FAIL. `scripts/verify_trim.py:317` had the identical weakness and
+   was fixed too.
+
+A fourth measurement error did not cost the run only because the harness printed
+its raw number: a guessed `deps >= 200` threshold (extrapolated from one bad
+observation of 255) marked **all twenty** trials `INVALID` while every one had
+exited 0. The real figure is 86 in-guest and 95 on the host reference, and the
+criterion was reapplied afterwards from the recorded `deps=` values. All four
+traps are now written up in the two runbooks.
+
+Tier 5 also measured trial cost at **~2m10s**, not the ~7–12 min on record; both
 runbooks were corrected, along with the registry-priming step `--offline` needs.
 
 ### Not done

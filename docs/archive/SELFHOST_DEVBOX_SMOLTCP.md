@@ -1,5 +1,26 @@
 # Self-host retest on `devbox-smoltcp` after the execve-leak fix (Aug 2 2026)
 
+> **SUPERSEDED as a status report, 2026-08-16 — self-hosting on
+> `devbox-smoltcp` is stable.** 20 consecutive clean in-VM kernel builds (10 per
+> arm of an A/B, `cargo clean` + `-j4 --offline` each, fresh boot each) all
+> succeeded first try in 107–128 s, with every PMM tripwire silent. Evidence and
+> the full table: [`AKUMA_SELF_HOSTING.md`](AKUMA_SELF_HOSTING.md) § "STATUS
+> 2026-08-16"; procedure:
+> [`../runbooks/selfhost-kernel-build.md`](../runbooks/selfhost-kernel-build.md).
+>
+> Two things below are stale in a way that will mislead:
+> - **The setup blockers were real and are largely gone.** They were found on
+>   `disk_selfhost.img`, staged by hand. The current path uses `devbox.img`,
+>   which already ships `/root/akuma` and the nightly toolchain at
+>   `/usr/local/bin`. The one setup step that *is* still required and is not
+>   below: prime the cargo registry once with `cargo fetch`, or `--offline`
+>   fails during resolution naming an arbitrary crate.
+> - **`SMP=1` here, `SMP=4` now.** This session ran `MEMORY=8192 SMP=1`; the
+>   2026-08-16 runs were `MEMORY=8192 SMP=4` throughout.
+>
+> Kept verbatim below as the record of what setup cost in August 2026 — the
+> blocker list is still the right first stop when a *fresh* image misbehaves.
+
 Follow-up to `AKUMA_SELF_HOSTING.md` §7j (the original `--release -p akuma`,
 rump-devbox-era self-host success from June 19 2026). This session re-ran the
 self-host experiment against current HEAD (`5ea6024`, "possibly fixes for

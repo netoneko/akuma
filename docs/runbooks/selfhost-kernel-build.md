@@ -118,10 +118,39 @@ Two fixes, and use both:
    more ssh that can quietly fail.
 2. **Make the trial prove it did the work.** A clean build must recompile the
    crate you changed and leave a full `deps/` tree, so require
-   `Compiling <your-crate>` in the log **and** ≥200 artifacts in
-   `target/aarch64-unknown-none/release/deps`. Score anything else `INVALID`, not
-   `GREEN`: absence of a failure is not evidence of a build, and a no-op resume
-   is fast for the same reason a stale sentinel is.
+   `Compiling <your-crate>` in the log **and** an artifact count in
+   `target/aarch64-unknown-none/release/deps` at the expected figure. Score
+   anything else `INVALID`, not `GREEN`: absence of a failure is not evidence of
+   a build, and a no-op resume is fast for the same reason a stale sentinel is.
+
+   **Measure that figure before you start the batch — do not guess it, and do
+   not reuse the one below.** It is small, and it moves with the feature set:
+
+   | build | files in `deps/` |
+   |---|---|
+   | in-guest `cargo build -p akuma` (default features) | **86** |
+   | host `--features devbox-smoltcp,no-tests` | **95** (32 `.d` + 31 `.rmeta` + 31 `.rlib` + 1 binary) |
+
+   Both are "one complete clean kernel build", and they differ — which is the
+   whole reason to calibrate against *your* configuration rather than inherit a
+   number. Do one known-good build first and count:
+
+   ```sh
+   ls target/aarch64-unknown-none/release/deps | wc -l
+   ```
+
+   A guessed threshold is not a safe over-approximation. Measured 2026-08-16: a
+   `>= 200` guess, taken from a single earlier observation of 255 that was never
+   one clean build of one configuration, marked **all twenty** trials of a
+   10-vs-10 `INVALID` while every one of them had exited 0 and compiled
+   `akuma-exec`. That batch was only salvageable because the verdict string
+   carried the raw `deps=` number, so the criterion could be reapplied
+   afterwards — **print the measured value in the verdict, never just
+   pass/fail**, or a mis-set threshold costs you the whole run.
+
+   Gating on the **output ELF** instead (exists, and ~3.8 MB rather than 16 KB)
+   is the sturdier check where you can use it: it is the artifact you actually
+   care about and it does not drift with the dependency graph.
 
 This belongs in the same family as the Tier 3 `>>`-not-`>` rule in
 [`verify-trim-fat-change.md`](verify-trim-fat-change.md) — both are cases where

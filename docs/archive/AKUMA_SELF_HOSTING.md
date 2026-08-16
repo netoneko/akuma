@@ -11,6 +11,54 @@ The single-file bring-up that preceded it (`rustc hello.rs`) is in
 
 ---
 
+## STATUS 2026-08-16 — self-hosting is stable; the chronology below is history
+
+**A clean in-VM kernel build is now a routine, first-try operation.** Measured
+2026-08-16 as the Tier 5 arm of a trim-the-fat gate
+([`TRIM_FAT_PTE_NEWTYPE.md`](TRIM_FAT_PTE_NEWTYPE.md) §5):
+
+| | |
+|---|---|
+| clean builds run | **20** (10 per arm of an A/B, two different kernels) |
+| succeeded first try | **20 / 20** — `EXIT=0`, full `deps/` tree, 3.8 MB ELF |
+| retries needed | **0** |
+| wall clock | **107–128 s** per trial, boot + `cargo clean` + `-j4` build |
+| `[PMM-RESURRECT]` / `[PMM-UAF]` / `[PMM-POISON]` / `[WILD-DA]` | **0** |
+| `[FILL-SHORT] got=Ok(0)`, non-zero `defer_leak=` | **0** |
+| `[BKL] stuck` during a full `-j4` build | ~8 lines (a storm is thousands) |
+
+Each trial was a fresh boot, `cargo clean` first, `-j4 --offline`, on
+`devbox.img` at `MEMORY=8192 SMP=4`.
+
+**What that changes for anyone reading further down.**
+
+- **The retry loop is no longer the procedure.** Most of §7 is written around
+  riding out intermittent rustc SIGSEGVs with
+  `scripts/loop_selfhost_kernelbuild.py` — "the build does not survive one
+  uninterrupted run. It needs a supervisor" (§5 of the runbook, as it then was).
+  Twenty consecutive first-try builds say otherwise. A failed clean build today
+  is a **regression finding**, not weather: capture both logs and A/B it, do not
+  resume-retry past it.
+- **The §0 quick start's `git clone` step is unnecessary and is its own hazard.**
+  `devbox.img` already ships `/root/akuma` and the nightly toolchain at
+  `/usr/local/bin/rustc`; cloning over HTTPS in-guest has its own open deadlock
+  ([`DEVBOX_ISSUES.md`](DEVBOX_ISSUES.md) Issue 1). Build the checkout that is
+  already there.
+- **`--offline` needs the registry primed once** (`cargo fetch`, ~14 MB) or it
+  fails during *resolution* naming an arbitrary crate, which reads like a broken
+  manifest. See the runbook.
+- **Timing on record here is stale.** §7b's estimates and the ~7–12 min figure
+  that used to head the runbook predate this configuration; a trial is ~2 min.
+
+The current procedure is
+[`../runbooks/selfhost-kernel-build.md`](../runbooks/selfhost-kernel-build.md)
+§ "Run a build trial". **Everything below this banner is the historical record of
+getting here** — §7a–§7l are a chronology from June 2026, kept verbatim because
+the archived investigations link into them. Read them for *why* a fix exists,
+not for what the procedure is today.
+
+---
+
 ## 0. Quick start
 
 Start qemu with `devbox-smoltcp` overlay:

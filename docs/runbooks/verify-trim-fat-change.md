@@ -442,6 +442,24 @@ a stale VM holding the ports, ssh's banner folded into a stdout parse, and a
    `capture_output=True`, and read `.stdout` alone).
 3. **Pick controls that exist.** `/proc/uptime` and `/etc/hostname` are absent
    on `disk.img`; `/hello.c` and `/bin/busybox` are present.
+4. **Never assume a console string arrives contiguously at SMP>1.** The cores
+   interleave, and a line can land torn in half. Measured 2026-08-16 on a
+   devbox-smoltcp boot at SMP=4: `[herd] Started sshd (pid= 2)` came out as
+
+   ```
+   [herd] Starting service: sshd
+   sshd (pid= 2)
+   ```
+
+   so neither `Started sshd` nor `sshd started` appeared anywhere, on a VM that
+   was entirely healthy — herd at PID 1, sshd at PID 2 accepting at 640
+   syscalls/s, a session handler already forked at PID 3. A harness gated on
+   that string waits out its whole budget and then reports a boot failure. Cost
+   that day: one 12-minute Tier 5 trial, scored `BOOT_FAIL` against a kernel
+   that had booted fine. `wait_for_marker` now also matches the surviving tail
+   `sshd (pid=`; **if you write your own harness, gate on an ssh round-trip
+   instead** — it tests the precondition you actually need and no other core's
+   printf can tear it.
 
 ## What to report
 

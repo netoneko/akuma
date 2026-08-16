@@ -313,8 +313,28 @@ def tier1_tests(results, logdir="/tmp"):
 
 
 def wait_for_marker(log_path, timeout=480):
-    """Poll the log file. Never wait on the QEMU process itself — it runs forever."""
-    marker = re.compile(rb"Started sshd|sshd started")
+    """Poll the log file. Never wait on the QEMU process itself — it runs forever.
+
+    `sshd \\(pid=` is in the alternation because **the marker line can arrive torn in
+    half**. At SMP=4 the cores interleave console output, and `[herd] Started sshd
+    (pid= 2)` was observed (2026-08-16) split across two lines as
+
+        [herd] Starting service: sshd
+        sshd (pid= 2)
+
+    with the `[herd] Started ` prefix separated from its tail, so neither `Started
+    sshd` nor `sshd started` appears contiguously anywhere in a log whose VM is
+    perfectly healthy — herd at PID 1, sshd at PID 2 accepting, a session handler at
+    PID 3. That reports `booted: False`, which reads exactly like a broken commit;
+    it is the same misreading this script's header calls out for the missing-disk
+    case. The torn tail is what survives, so match it too.
+
+    A contiguous string in an SMP console log is never a safe assumption. The
+    strictly better gate is an ssh round-trip, which no other core's printf can tear
+    — this stays log-based only because it must also work for the `booted: False`
+    diagnostics path, which needs to run before ssh is reachable.
+    """
+    marker = re.compile(rb"Started sshd|sshd started|sshd \(pid=")
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
