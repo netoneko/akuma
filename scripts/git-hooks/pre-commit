@@ -1,0 +1,52 @@
+#!/bin/sh
+# Run clippy and tests on all extracted crates before committing.
+# Uses the host target so tests/clippy work outside QEMU.
+
+HOST_TARGET="$(rustc -vV | grep '^host:' | cut -d' ' -f2)"
+
+# Console-print rule (CLAUDE.md § "Kernel conventions", docs/reference/subsystems/
+# console.md § "Printing rules"): no heap allocation on any path that ends at the
+# console. Two cheap, high-confidence greps for the two worst violation shapes;
+# both are full-tree, matching the clippy loop below.
+
+echo "console-print rule: no reimplemented core::fmt::Write writers"
+VIOLATIONS="$(grep -rnE 'impl(<[^>]*>)? core::fmt::Write for' src/ crates/*/src/ --include='*.rs' \
+    | grep -v '^crates/akuma-primitives/src/console\.rs:')"
+if [ -n "$VIOLATIONS" ]; then
+    echo "$VIOLATIONS"
+    echo "ERROR: hand-rolled core::fmt::Write writer outside crates/akuma-primitives/src/console.rs."
+    echo "Reuse console::StackWriter / process::FmtBuf instead — see docs/reference/subsystems/console.md § \"Printing rules\"."
+    exit 1
+fi
+
+echo "console-print rule: no format!/alloc::format! feeding a console print call"
+VIOLATIONS="$(grep -rnE '(print_str|safe_print!|tprint!|console::print)[!(].*(format!|alloc::format!)' src/ crates/*/src/ --include='*.rs' \
+    | grep -vE '^src/(tests|process_tests|shell_tests)\.rs:')"
+if [ -n "$VIOLATIONS" ]; then
+    echo "$VIOLATIONS"
+    echo "ERROR: format!/alloc::format! result passed into a console print call — heap allocation on a console path."
+    echo "Format directly into the print macro's args, or a console::StackWriter/process::FmtBuf, instead — see docs/reference/subsystems/console.md § \"Printing rules\"."
+    exit 1
+fi
+
+for crate in crates/*/; do
+    name="$(basename "$crate")"
+    echo "clippy: $name"
+    cargo clippy -p "$name" --target "$HOST_TARGET" -- -D warnings || exit 1
+done
+
+echo "clippy: akuma (release)"
+cargo clippy --release -- -D warnings || exit 1
+
+echo "clippy: akuma (extreme-size)"
+cargo clippy --profile extreme-size --no-default-features \
+    --features no-tests,smoltcp,extreme,userspace-sshd -- -D warnings || exit 1
+
+echo "tests"
+cargo test --target "$HOST_TARGET" || exit 1
+
+# akuma-ssh-crypto moved to userspace/ (its only consumer is userspace/sshd), so
+# the crates/*/ loop above no longer reaches it.
+echo "clippy+tests: akuma-ssh-crypto (userspace)"
+(cd userspace && cargo clippy -p akuma-ssh-crypto --target "$HOST_TARGET" -- -D warnings) || exit 1
+(cd userspace && cargo test -p akuma-ssh-crypto --target "$HOST_TARGET") || exit 1
