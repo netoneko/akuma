@@ -9,20 +9,20 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 619
-- **Docs contributing at least one fix:** 194
+- **Total distinct fixes counted:** 622
+- **Docs contributing at least one fix:** 196
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 127 | 20.5% | 17 |
-| Memory & Virtual Memory | 112 | 18.1% | 34 |
+| Syscall / ABI Compatibility Audits | 127 | 20.4% | 17 |
+| Memory & Virtual Memory | 112 | 18.0% | 34 |
 | Scheduler & Process Management | 75 | 12.1% | 18 |
-| SMP & Locking | 76 | 12.3% | 32 |
+| SMP & Locking | 79 | 12.7% | 34 |
 | Networking | 31 | 5.0% | 13 |
-| Userspace Apps & Libraries | 35 | 5.7% | 19 |
+| Userspace Apps & Libraries | 35 | 5.6% | 19 |
 | Rump Kernel & Syscall Proxy | 25 | 4.0% | 6 |
-| Toolchain & Self-Hosting | 37 | 6.0% | 5 |
+| Toolchain & Self-Hosting | 37 | 5.9% | 5 |
 | SSH | 15 | 2.4% | 13 |
 | VFS & Filesystem | 15 | 2.4% | 10 |
 | Boot & Drivers | 11 | 1.8% | 6 |
@@ -30,7 +30,7 @@ from several subsystems under one write-up.
 | Misc / Cross-cutting | 14 | 2.3% | 4 |
 | Console & Terminal | 15 | 2.4% | 7 |
 | Containers | 19 | 3.1% | 5 |
-| **Total** | **619** | **100.0%** | **194** |
+| **Total** | **622** | **100.0%** | **196** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -469,7 +469,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `write_stdin` (`process/channel.rs`) used the same drop-oldest FIFO semantics as the (already-fixed) stdout side, so stdin past `MAX_BUFFER_SIZE` (1 MiB) was silently dropped rather than backpressured; fixed by making it a short write instead — `sys_write`'s `File` arm returns `EAGAIN` on a zero-byte accept to avoid spinning, and sshd's stdin fd joined the non-blocking set with a residue queue and deferred EOF
 
 
-## SMP & Locking (76 fixes, 32 docs)
+## SMP & Locking (79 fixes, 34 docs)
 
 ### docs/archive/SMP_GO_STRESS_CORRUPTION_FIX.md
 (standalone writeup of the same 2026-07-22 investigation SMP_SHARED.md's own
@@ -618,6 +618,12 @@ aren't recorded anywhere else.)
 ### docs/archive/COWSTALE_FORK_THREAD_SEGV.md
 - The `[EAGER-UPGRADE]` page-permission repair rewrote AP bits that already said writable — it was really just `update_current_user_page_flags`'s trailing `flush_tlb_page` doing the actual work, dressed up as a permission fix; fixed by checking the PTE first and, when the write is already permitted, only invalidating the stale TLB entry instead of rewriting page-table state that was already correct
 
+### docs/archive/SMP_SECONDARY_IDLE_STACK_CANARY.md
+- Every `SMP=N>1` boot printed `SMP-1` false `[STACK-OVERFLOW]` reports: `adopt_current_as_core_idle` registered each secondary's static `.bss` boot stack in the pool but never painted a canary on it, and the sweep cannot tell an unpainted canary from a smashed one — which also left those per-core idle stacks permanently un-monitorable, since the reporter latches per slot on `base`; fixed by painting the canary where the stack is registered (closes `DEVBOX_ISSUES.md` Issue 11)
+
+### docs/archive/SMP_ADOPTED_IDLE_SLOT_CLOBBER.md
+- `threading::init` stored `FREE` over the `RUNNING` state of thread slots secondary cores had already adopted (self-test image brings secondaries up before init), handing live slots back to the allocator for the next `claim_free_slot` to hand out a second time — fixed by skipping adopted core-idle slots in the state-reset loop
+- The same init's stack pre-allocation loop overwrote those slots' `stacks[i]` and `exception_stack_top` with fresh PMM stacks nothing was executing on, so `validate_current_sp`, the canary check and the high-water probe all read the wrong memory for a live core — and it silently vacuumed the boot suite's `spurious == 0` canary assertion, which is why the bug above went unnoticed; fixed by the same `is_adopted_core_idle` guard, with regression `test_core_idle_slots_survive_init`
 
 ## Networking (31 fixes, 13 docs)
 
