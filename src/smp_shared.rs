@@ -721,7 +721,7 @@ fn secondary_gic_init(idx: usize) {
 
 /// Base VA of this core's 64 KiB (`1 << STACK_SHIFT`) boot/idle stack in
 /// `secondary_boot_stacks_shared`.
-fn secondary_stack_base(core: usize) -> usize {
+pub fn secondary_stack_base(core: usize) -> usize {
     let addr: usize;
     // SAFETY: resolves the `.bss.smp_shared` symbol's address; no memory access.
     unsafe {
@@ -1065,6 +1065,10 @@ secondary_entry_shared:
 
 .section .bss.smp_shared
 .balign 16
+// `.global` because `secondary_stack_base` is pub and gets inlined into callers in
+// other codegen units (the boot self-test). Without it the symbol is local to this
+// global_asm! block and any out-of-CGU `adrp` reference fails to link.
+.global secondary_boot_stacks_shared
 secondary_boot_stacks_shared:
     .space  {stacks_bytes}
 "#,

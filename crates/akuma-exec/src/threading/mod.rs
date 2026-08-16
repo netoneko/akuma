@@ -618,6 +618,46 @@ pub fn register_core_idle(core_id: usize, slot: usize) {
     }
 }
 
+/// The slot registered as `core_id`'s idle thread, or `None` if that core has not
+/// come up. Diagnostics and the `core_idle_slots_survive_init` self-test.
+pub fn core_idle_slot(core_id: usize) -> Option<usize> {
+    if core_id >= MAX_CORES {
+        return None;
+    }
+    let slot = IDLE_SLOT_FOR_CORE[core_id].load(Ordering::Acquire);
+    (slot >= 0 && (slot as usize) < MAX_THREADS).then_some(slot as usize)
+}
+
+/// The `(base, size)` this pool has RECORDED for `slot`'s kernel stack, or `None`
+/// if the slot has no stack. This is the pool's belief, which is exactly what the
+/// `core_idle_slots_survive_init` self-test needs to compare against the address a
+/// secondary core is actually running on.
+pub fn slot_stack_bounds(slot: usize) -> Option<(usize, usize)> {
+    if slot >= MAX_THREADS {
+        return None;
+    }
+    with_irqs_disabled(|| {
+        let pool = POOL.lock();
+        let stack = &pool.stacks[slot];
+        stack.is_allocated().then_some((stack.base, stack.size))
+    })
+}
+
+/// Is `slot` a thread slot that a core has already adopted as its idle thread?
+///
+/// Exists for `init`, which must not trample slots that are ALREADY LIVE. On the
+/// self-test image `smp_shared::bringup_secondaries()` runs BEFORE `threading::init`
+/// (see `src/main.rs`), so by the time init runs, each secondary core has claimed a
+/// slot via [`adopt_current_as_core_idle`] and is *executing on it right now*. Init's
+/// job is to set up FREE slots; for these it must keep its hands off.
+///
+/// Reads [`IS_IDLE_THREAD`] rather than the pool, because that is what
+/// [`register_core_idle`] sets and it needs no lock — init calls this while holding
+/// the `POOL` lock in one place and not in the other.
+fn is_adopted_core_idle(slot: usize) -> bool {
+    slot < MAX_THREADS && IS_IDLE_THREAD[slot].load(Ordering::Acquire)
+}
+
 /// Per-thread pending signal bitmask.  Bit N set = signal (N+1) pending.
 /// Multiple signals can be pending simultaneously (unlike the old single-slot).
 /// Set by pend_signal_for_thread via fetch_or.
@@ -2211,15 +2251,29 @@ impl ThreadPool {
         // stacks per class; ensure_slot_stack grows the rest on demand at spawn
         // and cleanup_terminated frees back to the floor on recycle. This avoids
         // reserving ~1 MB of PMM for slots that are idle most of the time.
+        // Slots a secondary core has already adopted as its idle thread are skipped
+        // by every loop below: that core is RUNNING on the stack it registered, and
+        // `allocate_stack_for_slot` would overwrite both `stacks[i]` and
+        // `slots[i].exception_stack_top` with a fresh PMM stack nothing is executing
+        // on. The pool would then describe the wrong memory for a live core —
+        // `validate_current_sp`, the canary check and the high-water probe all read
+        // `stacks[i]` — while the core kept running on its `.bss` boot stack. See
+        // `is_adopted_core_idle` and docs/archive/SMP_ADOPTED_IDLE_SLOT_CLOBBER.md.
         #[cfg(not(kernel_profile_extreme))]
         {
             for i in 1..config().reserved_threads {
+                if is_adopted_core_idle(i) {
+                    continue;
+                }
                 assert!(
                     self.allocate_stack_for_slot(i, config().system_thread_stack_size),
                     "boot: failed to allocate system thread stack for slot {}", i
                 );
             }
             for i in config().reserved_threads..thread_limit() {
+                if is_adopted_core_idle(i) {
+                    continue;
+                }
                 assert!(
                     self.allocate_stack_for_slot(i, config().user_thread_stack_size),
                     "boot: failed to allocate user thread stack for slot {}", i
@@ -2230,6 +2284,9 @@ impl ThreadPool {
         {
             let sys_end = (1 + WARM_FREE_SYSTEM).min(config().reserved_threads);
             for i in 1..sys_end {
+                if is_adopted_core_idle(i) {
+                    continue;
+                }
                 assert!(
                     self.allocate_stack_for_slot(i, config().system_thread_stack_size),
                     "boot: failed to allocate warm system thread stack for slot {}", i
@@ -2238,6 +2295,9 @@ impl ThreadPool {
             let user_start = config().reserved_threads;
             let user_end = (user_start + WARM_FREE_USER).min(thread_limit());
             for i in user_start..user_end {
+                if is_adopted_core_idle(i) {
+                    continue;
+                }
                 assert!(
                     self.allocate_stack_for_slot(i, config().user_thread_stack_size),
                     "boot: failed to allocate warm user thread stack for slot {}", i
@@ -2747,7 +2807,19 @@ pub fn init() {
     // into — latch its ON_CPU gate so a peer can never pick it while it runs
     // (it becomes READY-visible the moment it blocks in schedule_blocking).
     ON_CPU[0].store(1, Ordering::SeqCst);
+    // "All others are FREE" holds only for slots nobody has taken yet. A secondary
+    // core that came up BEFORE this runs (the self-test image's bringup order — see
+    // `src/main.rs`) is RUNNING on the slot it adopted; storing FREE over that state
+    // hands a live slot back to the allocator, and the next `claim_free_slot` — the
+    // async-main thread, in practice — hands out a slot another core is executing on.
+    // Two threads, one slot: the boot stall this order was long assumed to just
+    // "collide" on. Leave adopted idles alone; `adopt_current_as_core_idle` already
+    // stored RUNNING and latched their ON_CPU gate.
+    // See docs/archive/SMP_ADOPTED_IDLE_SLOT_CLOBBER.md.
     for i in 1..MAX_THREADS {
+        if is_adopted_core_idle(i) {
+            continue;
+        }
         THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
     }
     set_current_thread_register(0);  // Initialize CPU register for boot thread

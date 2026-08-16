@@ -138,6 +138,12 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_cores_online();
 
+    // `threading::init` must not trample slots the secondaries already adopted (their
+    // RUNNING state, their stack). Runs right after the cores-online check, before
+    // anything spawns — a clobbered slot is most visible before the allocator reuses it.
+    #[cfg(kernel_smp_shared)]
+    test_core_idle_slots_survive_init();
+
     // Real (shared-kernel) SMP M2c: confirm the shared scheduler runs threads on more
     // than one core (secondaries participate in scheduling). No-op on a single CPU.
     #[cfg(kernel_smp_shared)]
@@ -976,6 +982,74 @@ fn test_smp_shared_cores_online() {
             expected
         );
     }
+}
+
+/// `threading::init` must not trample the slots secondary cores already adopted.
+///
+/// On this (self-test) image `bringup_secondaries()` runs BEFORE `threading::init`, so
+/// each secondary claims a slot and starts running on its own `.bss` boot stack first.
+/// Init used to walk every slot unconditionally: it stored `FREE` over their RUNNING
+/// state (handing live slots back to the allocator — the async-main thread then got one
+/// a core was executing on) and re-pointed `stacks[i]`/`exception_stack_top` at a fresh
+/// PMM stack nothing was running on. Both are silent: the box boots and the pool simply
+/// describes the wrong memory for a live core.
+///
+/// Asserts, for every registered secondary idle slot, the three things init used to
+/// break: the slot is still RUNNING, the pool's recorded stack base is the core's
+/// ACTUAL `.bss` stack, and the size is the real one. See
+/// docs/archive/SMP_ADOPTED_IDLE_SLOT_CLOBBER.md.
+#[cfg(kernel_smp_shared)]
+fn test_core_idle_slots_survive_init() {
+    use akuma_exec::threading;
+
+    let probed = crate::smp_shared::probed_core_count();
+    if probed <= 1 {
+        console::print(
+            "[Test] core_idle_slots_survive_init SKIPPED (single CPU; boot with SMP>1)\n",
+        );
+        return;
+    }
+
+    let mut checked = 0usize;
+    let mut bad = 0usize;
+    for core in 1..probed {
+        let Some(slot) = threading::core_idle_slot(core) else {
+            continue; // core never came up; test_smp_shared_cores_online covers that
+        };
+        checked += 1;
+
+        let expect_base = crate::smp_shared::secondary_stack_base(core);
+        let running =
+            threading::get_thread_state(slot) == threading::thread_state::RUNNING;
+        let bounds = threading::slot_stack_bounds(slot);
+        let base_ok = bounds.map(|(b, _)| b) == Some(expect_base);
+
+        if !running || !base_ok {
+            bad += 1;
+            crate::safe_print!(
+                224,
+                "  core {} idle slot {}: running={} recorded_base={:#x} expected_base={:#x}\n",
+                core,
+                slot,
+                running,
+                bounds.map_or(0, |(b, _)| b),
+                expect_base
+            );
+        }
+    }
+
+    let pass = bad == 0 && checked > 0;
+    crate::safe_print!(
+        160,
+        "  checked={} bad={}\n",
+        checked,
+        bad
+    );
+    crate::safe_print!(
+        96,
+        "[Test] core_idle_slots_survive_init {}\n",
+        if pass { "PASSED" } else { "FAILED" }
+    );
 }
 
 /// M2c boot self-test for real SMP: spawn demo worker threads into the shared pool and

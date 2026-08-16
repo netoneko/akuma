@@ -859,7 +859,20 @@ to *rump*:22.
 
 ## Issue 11: three spurious `[STACK-OVERFLOW]` lines on every `SMP=N>1` boot
 
-**Status: OPEN.** Not a devbox bug specifically — it fires on any `smp-shared`
+**Status: FIXED, 2026-08-16** — via the first fix option below (paint the canary
+in `adopt_current_as_core_idle`). Verified on devbox-smoltcp `SMP=4`: secondaries
+online as idle tid 1/2/3, zero `[STACK-OVERFLOW]` lines. Full record, including
+why `fill_stack_sentinel` must *not* be painted alongside it:
+[`SMP_SECONDARY_IDLE_STACK_CANARY.md`](SMP_SECONDARY_IDLE_STACK_CANARY.md).
+
+The investigation also turned up a second, independent bug in the same area —
+`threading::init` trampling the slots secondaries had already adopted, which is
+why the `spurious=0` row in the table below was passing for the wrong reason:
+[`SMP_ADOPTED_IDLE_SLOT_CLOBBER.md`](SMP_ADOPTED_IDLE_SLOT_CLOBBER.md).
+
+Original analysis follows, unchanged.
+
+Not a devbox bug specifically — it fires on any `smp-shared`
 boot with secondaries — but the devbox is where you meet it, because it is the
 default multi-core image and it builds `no-tests` (so the self-test that would
 have shown `spurious=0` isn't there to reassure you).
