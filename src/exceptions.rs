@@ -3380,61 +3380,11 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
     }
 }
 
-// ============================================================================
-// Static buffer formatting for crash handlers (no heap allocation)
-// ============================================================================
-
-/// Static buffer writer for crash-safe formatting
-/// Uses a fixed-size buffer on the stack to avoid heap allocations
-struct StaticWriter {
-    buf: [u8; 256],
-    pos: usize,
-}
-
-impl StaticWriter {
-    fn new() -> Self {
-        Self {
-            buf: [0u8; 256],
-            pos: 0,
-        }
-    }
-    
-    fn as_str(&self) -> &str {
-        // Safety: we only write valid UTF-8 via core::fmt::Write
-        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.pos]) }
-    }
-    
-    fn clear(&mut self) {
-        self.pos = 0;
-    }
-    
-    /// Write and flush to console, then clear buffer
-    fn flush(&mut self) {
-        if self.pos > 0 {
-            crate::console::print(self.as_str());
-            self.clear();
-        }
-    }
-}
-
-impl core::fmt::Write for StaticWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let remaining = self.buf.len() - self.pos;
-        let to_write = bytes.len().min(remaining);
-        if to_write > 0 {
-            self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
-            self.pos += to_write;
-        }
-        Ok(()) // Always succeed, just truncate if full
-    }
-}
-
 /// Log comprehensive memory stats when a crash occurs
 /// Uses static buffer to avoid heap allocations during crash
 fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
     use core::fmt::Write;
-    let mut w = StaticWriter::new();
+    let mut w = crate::console::StackWriter::<256>::new();
     
     safe_print!(64, "\n=== Memory Stats at Crash ===\n");
     

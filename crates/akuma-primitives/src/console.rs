@@ -159,6 +159,19 @@ pub fn print_args<const N: usize>(args: core::fmt::Arguments) {
     w.flush();
 }
 
+/// Like [`print_args`], but safe for callers that may run before/without a registered
+/// console sink.
+///
+/// For diagnostics that may run before/without a registered console sink (e.g. host unit
+/// tests driving kernel types directly) and must never assume `runtime()`-style
+/// unconditional resolution. Skips the formatting work entirely — not just the print — when
+/// no sink is registered, per [`print_str`]'s "skip formatting work entirely" contract.
+pub fn print_args_if_registered<const N: usize>(args: core::fmt::Arguments) {
+    if is_print_registered() {
+        print_args::<N>(args);
+    }
+}
+
 /// Format into a `$size`-byte stack buffer and print it. Cannot fail from
 /// allocation, because it never allocates.
 ///

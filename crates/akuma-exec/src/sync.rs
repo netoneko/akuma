@@ -801,22 +801,12 @@ fn log_kernel_lock_stuck(owner: u32, me: u32) {
     } else {
         HOLD_TAG_UNKNOWN
     };
-    let mut buf = [0u8; 96];
-    let mut pos = 0usize;
-    let _ = core::fmt::write(
-        &mut crate::process::FmtBuf { buf: &mut buf, pos: &mut pos },
-        format_args!("[BKL] stuck: owner={} waiter={} tag={} (aff0+1)\n", owner, me, tag),
-    );
-    if pos > 0 {
-        if let Ok(s) = core::str::from_utf8(&buf[..pos]) {
-            // `is_registered` first: a contended acquire can run before/without a registered
-            // runtime (host unit tests drive `KernelLock` directly), and a diagnostic must
-            // never be the thing that panics.
-            if crate::runtime::is_registered() {
-                (crate::runtime::runtime().print_str)(s);
-            }
-        }
-    }
+    // `print_args_if_registered` first: a contended acquire can run before/without a
+    // registered runtime (host unit tests drive `KernelLock` directly), and a diagnostic
+    // must never be the thing that panics.
+    akuma_primitives::console::print_args_if_registered::<96>(format_args!(
+        "[BKL] stuck: owner={owner} waiter={me} tag={tag} (aff0+1)\n"
+    ));
 }
 
 /// Diagnostic: log when [`KernelLock::acquire`]'s self-healing fired (see the recovery
@@ -824,21 +814,12 @@ fn log_kernel_lock_stuck(owner: u32, me: u32) {
 /// keep them until the leak is root-caused. Stack-buffered (IRQ-masked context).
 fn log_kernel_lock_recovered(me: u32, kind: &str) {
     KERNEL_LOCK_RECOVERIES.fetch_add(1, Ordering::Relaxed);
-    let mut buf = [0u8; 96];
-    let mut pos = 0usize;
-    let _ = core::fmt::write(
-        &mut crate::process::FmtBuf { buf: &mut buf, pos: &mut pos },
-        format_args!("[BKL] RECOVERED ({kind}) by core {me} (aff0+1)\n"),
-    );
-    if pos > 0 {
-        if let Ok(s) = core::str::from_utf8(&buf[..pos]) {
-            // See `log_kernel_lock_stuck`: probe before printing so a host unit test driving
-            // `KernelLock` without a registered runtime records the counter and stays quiet.
-            if crate::runtime::is_registered() {
-                (crate::runtime::runtime().print_str)(s);
-            }
-        }
-    }
+    // See `log_kernel_lock_stuck`: `print_args_if_registered` skips the print (and the
+    // formatting) so a host unit test driving `KernelLock` without a registered runtime
+    // records the counter above and stays quiet.
+    akuma_primitives::console::print_args_if_registered::<96>(format_args!(
+        "[BKL] RECOVERED ({kind}) by core {me} (aff0+1)\n"
+    ));
 }
 
 /// Raw reader-writer spinlock with writer priority.

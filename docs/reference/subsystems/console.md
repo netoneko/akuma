@@ -86,11 +86,12 @@ Two narrow exemptions, both established by the audit rather than assumed:
    once is also what keeps a multi-field line from being interleaved by another
    core's output mid-message.
 2. **Paths that may run with no runtime registered** — `sync.rs`'s
-   `log_kernel_lock_stuck`/`log_kernel_lock_recovered` probe
-   `runtime::is_registered()` before printing, because host unit tests drive
-   `KernelLock` directly. `safe_print!` resolves `runtime()` unconditionally, so
-   these keep the explicit build-then-guard-then-flush shape. A diagnostic must
-   never be the thing that panics.
+   `log_kernel_lock_stuck`/`log_kernel_lock_recovered` use
+   `akuma_primitives::console::print_args_if_registered`, not `safe_print!`,
+   because host unit tests drive `KernelLock` directly and `safe_print!`
+   resolves `runtime()` unconditionally. `print_args_if_registered` probes
+   `is_print_registered()` and skips the format-and-print entirely when unset.
+   A diagnostic must never be the thing that panics.
 
 Boot self-tests (`src/tests.rs`, `src/process_tests.rs`, `src/shell_tests.rs`)
 are out of scope — they run in ordinary thread context at boot, never inside
