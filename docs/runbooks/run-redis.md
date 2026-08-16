@@ -181,7 +181,14 @@ ssh -p 2322 root@localhost 'redis-cli -p 4444 get k'     # -> hostvalue
 # 4. it is the upstream binary, on this kernel
 ssh -p 2322 root@localhost 'redis-cli -p 4444 info server | grep ^os:'
 #    -> os:Akuma 0.0.7 aarch64
+
+# 5. no cross-stream corruption under connection churn
+scripts/redis_stream_integrity.py --port 4544 --conns 200 --parallel 16
+#    -> 200/200 connections returned exactly b'+PONG\r\n'
 ```
+
+Raise `--parallel` past ~32 and connections start *timing out* — that is the
+backlog of §4, not corruption, and the script says which it saw.
 
 Failure modes and where they point:
 
@@ -192,6 +199,7 @@ Failure modes and where they point:
 | `box run` prints `failed to spawn …docker-entrypoint.sh` | Kernel predates shebang support in `spawn`. Rebuild, or pass `--entrypoint` |
 | `box run` starts and then nothing at all happens | The `setpriv` re-exec loop of §3. Use `--entrypoint` |
 | `Can't create socket: No file descriptors available` | Socket budget, §4 |
+| `Protocol error, got "<c>" as reply type byte` | The client read a byte that is not a RESP type marker. Seen once under a storm of short-lived connections and never reproduced — run `scripts/redis_stream_integrity.py --port 4544` (700 connections, validates every reply byte-for-byte). A **corruption** hit there is the socket layer; connect *timeouts* are just the backlog. [`../archive/REDIS_END_TO_END.md`](../archive/REDIS_END_TO_END.md) §7 |
 
 ---
 

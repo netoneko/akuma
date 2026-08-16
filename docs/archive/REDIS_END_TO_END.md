@@ -238,6 +238,25 @@ Until then: `--entrypoint /usr/local/bin/redis-server` skips the script.
   fall back to read/write.
 - **`INFO persistence` right after `BGSAVE`** once returned `recv timeout`
   while the RDB wrote correctly. Once, not reproduced.
+- **One `Protocol error, got "t" as reply type byte`** from a macOS `redis-cli`
+  typing `keys` interactively, while a loop of short-lived raw connections was
+  hammering the same server. `t` is not a RESP type byte (`+-:$*`), so the
+  client read something that was not the start of a reply — the shape of a
+  cross-stream splice, which this tree has had before (the socket-fd-refcount
+  bug that showed up as SSH MAC errors).
+
+  **Not reproduced**, and the obvious suspects were ruled out: a bare `keys`
+  returns a correct `-ERR wrong number of arguments` 8/8; 6 concurrent clients
+  × 40 ops each were clean; `scripts/redis_stream_integrity.py` — 700
+  connections, up to 40 at once, each validating that `PING` returns exactly
+  `+PONG\r\n` — found **zero** corrupt replies. The only failures at 40-way
+  concurrency were connect timeouts, which is the 32-deep backlog above, not
+  corruption.
+
+  Best current explanation is a connection that arrived while the backlog was
+  saturated and got an aborted response the client mis-parsed. Left open on
+  purpose: if it recurs, `scripts/redis_stream_integrity.py` is the probe, and a
+  hit there (as opposed to a timeout) means the socket layer, not Redis.
 - **No IPv6 anywhere.** The `errno: 97` line Redis prints at startup is that,
   and is harmless (`DEVBOX_ISSUES.md` Issue 9).
 
