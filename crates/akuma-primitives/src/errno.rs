@@ -117,11 +117,14 @@ errno_table! {
     EPFNOSUPPORT = 96;
     EAFNOSUPPORT = 97;
     EADDRINUSE = 98;
+    EADDRNOTAVAIL = 99;
     ENETDOWN = 100;
     ECONNABORTED = 103;
+    EISCONN = 106;
     ENOTCONN = 107;
     ETIMEDOUT = 110;
     ECONNREFUSED = 111;
+    EALREADY = 114;
     EINPROGRESS = 115;
 }
 
@@ -205,10 +208,13 @@ mod tests {
             ("ENOTEMPTY", ENOTEMPTY, 39),
             ("EDESTADDRREQ", EDESTADDRREQ, 89),
             ("EAFNOSUPPORT", EAFNOSUPPORT, 97),
+            ("EADDRNOTAVAIL", EADDRNOTAVAIL, 99),
             ("ENETDOWN", ENETDOWN, 100),
             ("ECONNABORTED", ECONNABORTED, 103),
+            ("EISCONN", EISCONN, 106),
             ("ENOTCONN", ENOTCONN, 107),
             ("ECONNREFUSED", ECONNREFUSED, 111),
+            ("EALREADY", EALREADY, 114),
             // Module-local third definitions (`msgqueue.rs`, `fs.rs`) and the
             // names that only ever existed as raw literals at a call site.
             ("E2BIG", E2BIG, 7),

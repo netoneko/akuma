@@ -14,6 +14,120 @@ use crate::process::lifecycle::LifecycleGuard;
 
 use super::{Process, enter_user_mode, read_current_pid, get_box_name};
 
+/// Longest `#!` line honoured, matching Linux's `BINPRM_BUF_SIZE`.
+///
+/// Public because `do_execve`'s `exec_shebang` (bin crate) truncates its
+/// already-read file bytes to the same window before parsing — the two paths
+/// must agree on where a shebang line ends.
+pub const SHEBANG_MAX: usize = 256;
+
+/// How many `#!` hops to follow before giving up — an interpreter may itself be
+/// a script. Same limit Linux uses (`BINPRM_MAX_RECURSION`), and it is what
+/// stops a script whose interpreter is itself from spinning forever.
+const SHEBANG_MAX_DEPTH: usize = 4;
+
+/// Parse a file's leading bytes as a `#!` line: `(interpreter, optional arg)`.
+///
+/// `None` for a normal binary or a malformed line — in every one of those cases
+/// the caller carries on with the ELF loader, which produces the real error.
+///
+/// Linux takes at most ONE argument after the interpreter and does NOT split it
+/// on whitespace (`#!/usr/bin/env -S foo bar` passes `-S foo bar` as a single
+/// argv entry); this matches, as does `do_execve`'s `exec_shebang`. `trim` also
+/// disposes of the `\r` a CRLF script leaves on the interpreter path — otherwise
+/// `/bin/sh\r` is looked up verbatim and never found.
+pub fn parse_shebang(head: &[u8]) -> Option<(&str, Option<&str>)> {
+    if head.len() < 2 || head[0] != b'#' || head[1] != b'!' {
+        return None;
+    }
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line = core::str::from_utf8(head.get(2..line_end)?).ok()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (interpreter, arg) = match line.split_once(char::is_whitespace) {
+        Some((i, a)) => {
+            let a = a.trim();
+            (i.trim(), if a.is_empty() { None } else { Some(a) })
+        }
+        None => (line, None),
+    };
+    if interpreter.is_empty() {
+        return None;
+    }
+    Some((interpreter, arg))
+}
+
+/// Build the argv prefix for one `#!` hop.
+///
+/// `prev` is the prefix built by the hop below this one (empty on the first).
+/// Its `argv[0]` is dropped, mirroring `remove_arg_zero` in Linux's
+/// `fs/binfmt_script.c`: a script whose interpreter is itself a script must come
+/// out as `[sh, interp1, arg1, script]`, not with `interp1` repeated.
+pub fn shebang_hop(interpreter: &str, arg: Option<&str>, script_name: &str, prev: &[String]) -> Vec<String> {
+    let mut hop = Vec::new();
+    hop.push(String::from(interpreter));
+    if let Some(a) = arg {
+        hop.push(String::from(a));
+    }
+    hop.push(String::from(script_name));
+    if prev.len() > 1 {
+        hop.extend_from_slice(&prev[1..]);
+    }
+    hop
+}
+
+/// Read `path`'s `#!` line. Only the first [`SHEBANG_MAX`] bytes are read, so a
+/// large non-ELF file costs one short read, not a slurp. An unreadable path
+/// yields `None` and the ELF loader reports the real error.
+fn shebang_line_of(path: &str) -> Option<(String, Option<String>)> {
+    let mut head = [0u8; SHEBANG_MAX];
+    let n = (runtime().read_at)(path, 0, &mut head).ok()?;
+    let (interpreter, arg) = parse_shebang(head.get(..n)?)?;
+    Some((String::from(interpreter), arg.map(String::from)))
+}
+
+/// Follow a `#!` chain from `resolved` (the symlink-resolved on-disk path) and
+/// return the ELF that should actually be loaded plus the argv prefix that
+/// replaces `argv[0]`.
+///
+/// Empty prefix means "not a script, load `resolved` as-is". Otherwise the
+/// prefix is `[interpreter, shebang_arg?, script_path, ...]`, exactly the shape
+/// `execve` produces: the caller appends the user's arguments after it.
+///
+/// `display` is the path as the *caller* wrote it, which is what lands in the
+/// interpreter's argv (a shell must see the name it was asked to run, not the
+/// symlink target).
+///
+/// Nesting drops the previous `argv[0]` on each hop, mirroring Linux's
+/// `remove_arg_zero` in `fs/binfmt_script.c`: a script whose interpreter is
+/// itself a script yields `[sh, interp1, arg1, script]`, not a duplicated
+/// `interp1`.
+///
+/// Public so the boot suite can drive it against the real VFS
+/// (`spawn_resolves_a_shebang_script` in `src/process_tests.rs`) without
+/// spawning a process during boot; the pure halves it is built from are
+/// host-tested in `shebang_tests` below.
+pub fn resolve_shebang_chain(resolved: &str, display: &str) -> (String, Vec<String>) {
+    let mut elf_path = String::from(resolved);
+    let mut prefix: Vec<String> = Vec::new();
+    let mut probe = String::from(resolved);
+    let mut script_name = String::from(display);
+
+    for _ in 0..SHEBANG_MAX_DEPTH {
+        let Some((interpreter, arg)) = shebang_line_of(&probe) else {
+            break;
+        };
+        prefix = shebang_hop(&interpreter, arg.as_deref(), &script_name, &prefix);
+
+        elf_path = (runtime().resolve_symlinks)(&interpreter);
+        probe.clone_from(&elf_path);
+        script_name = interpreter;
+    }
+
+    (elf_path, prefix)
+}
+
 /// Spawn a process on a user thread for concurrent execution
 ///
 /// This function creates a new process from the ELF file and spawns it on a
@@ -120,10 +234,26 @@ pub fn spawn_process_with_channel_ext(
     }
 
     let resolved = (runtime().resolve_symlinks)(path);
-    let elf_path = &resolved;
+
+    // `#!` scripts. `do_execve` has always handled these; spawn did not, so every
+    // caller that goes through the SPAWN abi instead of exec — herd's services and
+    // `box run` — could only start real ELFs. That is what made `box run
+    // redis:alpine` fail with "failed to spawn": every official OCI image's
+    // Entrypoint is `docker-entrypoint.sh`, a `#!/bin/sh` script.
+    //
+    // It has to happen HERE rather than in the syscall layer: the namespace
+    // override is already active, and a container's interpreter (`/bin/sh` inside
+    // the image's layers) exists ONLY in the box's mount table — reading the
+    // shebang from box 0's view would resolve the wrong `/bin/sh`, or none.
+    let (elf_path_owned, shebang_prefix) = resolve_shebang_chain(&resolved, path);
+    let elf_path = &elf_path_owned;
 
     let mut full_args = Vec::new();
-    full_args.push(path.to_string());
+    if shebang_prefix.is_empty() {
+        full_args.push(path.to_string());
+    } else {
+        full_args.extend_from_slice(&shebang_prefix);
+    }
     if let Some(arg_slice) = args {
         for arg in arg_slice {
             full_args.push(arg.to_string());
@@ -437,4 +567,87 @@ pub(crate) fn run_registered_process(pid: Pid) -> ! {
     }
     // Reached only if the process vanished between spawn and first run.
     panic!("Process not found in run_registered_process");
+}
+
+#[cfg(test)]
+mod shebang_tests {
+    use super::*;
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| String::from(*s)).collect()
+    }
+
+    #[test]
+    fn an_elf_is_not_a_script() {
+        assert!(parse_shebang(b"\x7fELF\x02\x01\x01\x00").is_none());
+        assert!(parse_shebang(b"").is_none());
+        assert!(parse_shebang(b"#").is_none());
+        // A `#` comment is not a shebang: only `#!` at offset 0 is.
+        assert!(parse_shebang(b"# not a shebang\n").is_none());
+    }
+
+    #[test]
+    fn plain_interpreter_has_no_arg() {
+        assert_eq!(parse_shebang(b"#!/bin/sh\nexit 0\n"), Some(("/bin/sh", None)));
+    }
+
+    #[test]
+    fn a_missing_newline_still_parses() {
+        assert_eq!(parse_shebang(b"#!/bin/sh"), Some(("/bin/sh", None)));
+    }
+
+    /// Linux passes everything after the interpreter as ONE argv entry rather
+    /// than splitting it — `env -S` depends on that.
+    #[test]
+    fn the_argument_is_not_split_on_whitespace() {
+        assert_eq!(
+            parse_shebang(b"#!/usr/bin/env -S foo bar\n"),
+            Some(("/usr/bin/env", Some("-S foo bar")))
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed() {
+        assert_eq!(parse_shebang(b"#!  /bin/sh   \n"), Some(("/bin/sh", None)));
+        assert_eq!(parse_shebang(b"#!/bin/sh   -e  \n"), Some(("/bin/sh", Some("-e"))));
+    }
+
+    /// A CRLF script would otherwise look up the interpreter as `/bin/sh\r`,
+    /// which no filesystem has.
+    #[test]
+    fn a_crlf_script_does_not_keep_the_carriage_return() {
+        assert_eq!(parse_shebang(b"#!/bin/sh\r\nexit 0\r\n"), Some(("/bin/sh", None)));
+    }
+
+    #[test]
+    fn an_empty_shebang_line_is_rejected() {
+        assert!(parse_shebang(b"#!\n").is_none());
+        assert!(parse_shebang(b"#!   \n").is_none());
+    }
+
+    /// The shape `execve` produces: interpreter, its optional arg, then the
+    /// script named the way the caller asked for it.
+    #[test]
+    fn first_hop_is_interpreter_arg_script() {
+        assert_eq!(
+            shebang_hop("/bin/sh", None, "/usr/local/bin/docker-entrypoint.sh", &[]),
+            strs(&["/bin/sh", "/usr/local/bin/docker-entrypoint.sh"])
+        );
+        assert_eq!(
+            shebang_hop("/bin/sh", Some("-e"), "/run.sh", &[]),
+            strs(&["/bin/sh", "-e", "/run.sh"])
+        );
+    }
+
+    /// Nesting drops the previous argv[0] (Linux's `remove_arg_zero`), so the
+    /// inner interpreter appears exactly once.
+    #[test]
+    fn a_nested_hop_drops_the_previous_argv0() {
+        let first = shebang_hop("/bin/interp1", Some("-x"), "/script", &[]);
+        assert_eq!(first, strs(&["/bin/interp1", "-x", "/script"]));
+        assert_eq!(
+            shebang_hop("/bin/sh", None, "/bin/interp1", &first),
+            strs(&["/bin/sh", "/bin/interp1", "-x", "/script"])
+        );
+    }
 }

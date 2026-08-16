@@ -375,6 +375,9 @@ pub fn run_all_tests() {
     // a FAILED execve must leave close-on-exec fds intact (see RUST_TOOLCHAIN.md).
     test_lseek_nonseekable_returns_espipe();
     test_failed_exec_preserves_cloexec_fds();
+    // SPAWN (not execve) must resolve `#!` scripts too — `box run` and herd both
+    // go through spawn, and every OCI image's Entrypoint is a shell script.
+    test_spawn_resolves_a_shebang_script();
 
     // Test atomic pipe_check_set_reader (race fix for blocking read hang)
     test_pipe_check_set_reader_data_available();
@@ -8966,6 +8969,59 @@ fn test_failed_exec_preserves_cloexec_fds() {
             192,
             "[Test] failed_exec_preserves_cloexec_fds FAILED: execve={} (want <0), fd_present={} cloexec={}\n",
             ret as i64, still_present, still_cloexec,
+        );
+    }
+}
+
+/// SPAWN resolves `#!` scripts, against the real VFS.
+///
+/// `do_execve` has always handled shebangs; `spawn_process_with_channel_ext` did
+/// not, so everything that goes through the SPAWN abi instead of exec — herd's
+/// services and `box run` — could only start real ELFs. `box run redis:alpine`
+/// failed with "failed to spawn" because the image's Entrypoint is
+/// `docker-entrypoint.sh`, a `#!/bin/sh` script
+/// (docs/archive/DEVBOX_ISSUES.md Issue 14).
+///
+/// This drives `resolve_shebang_chain` rather than a real spawn: the boot suite
+/// runs before userspace is up, and the chain resolution IS the new behaviour —
+/// everything after it is the pre-existing ELF loader. Symlink resolution is
+/// part of what is checked, so this exercises the real filesystem, not a mock.
+/// The pure parsing/argv-construction halves are host-tested in
+/// `akuma_exec::process::spawn::shebang_tests`.
+fn test_spawn_resolves_a_shebang_script() {
+    const SCRIPT: &str = "/tmp/akuma_shebang_spawn_test.sh";
+
+    if crate::fs::write_file(SCRIPT, b"#!/bin/busybox sh\necho hi\n").is_err() {
+        console::print("[Test] spawn_resolves_a_shebang_script SKIP (/tmp not writable)\n");
+        return;
+    }
+
+    let resolved = crate::vfs::resolve_symlinks(SCRIPT);
+    let (elf_path, prefix) =
+        akuma_exec::process::resolve_shebang_chain(&resolved, SCRIPT);
+
+    // The loader must be pointed at the interpreter, and argv must be
+    // [interpreter, shebang-arg, script] — the caller appends user args after it.
+    let interp_ok = elf_path == "/bin/busybox";
+    let argv_ok = prefix.len() == 3
+        && prefix[0] == "/bin/busybox"
+        && prefix[1] == "sh"
+        && prefix[2] == SCRIPT;
+
+    // A real ELF must come back unchanged, or every normal spawn would break.
+    let (elf_self, elf_prefix) =
+        akuma_exec::process::resolve_shebang_chain("/bin/busybox", "/bin/busybox");
+    let elf_untouched = elf_self == "/bin/busybox" && elf_prefix.is_empty();
+
+    let _ = crate::fs::remove_file(SCRIPT);
+
+    if interp_ok && argv_ok && elf_untouched {
+        console::print("[Test] spawn_resolves_a_shebang_script PASSED\n");
+    } else {
+        crate::safe_print!(
+            192,
+            "[Test] spawn_resolves_a_shebang_script FAILED: elf={} argc={} elf_untouched={}\n",
+            elf_path.as_str(), prefix.len(), elf_untouched,
         );
     }
 }

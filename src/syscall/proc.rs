@@ -857,47 +857,50 @@ fn exec_shebang(script_path: String, file_data: Vec<u8>, original_args: Vec<Stri
     // this function recurses into do_execve, whose successful exec erets and
     // abandons every frame below it — so the script bytes and the original
     // argv must be freed BEFORE the recursion, not after it "returns".
-    let line_end = file_data.iter().position(|&b| b == b'\n').unwrap_or_else(|| file_data.len().min(256));
-    let Ok(shebang_line) = core::str::from_utf8(&file_data[2..line_end]) else {
+    // Shared with `spawn`'s shebang path so the two cannot drift: one parser, one
+    // argv-construction rule, both host-tested in akuma-exec's `shebang_tests`.
+    let head = &file_data[..file_data.len().min(akuma_exec::process::SHEBANG_MAX)];
+    let Some((interpreter, shebang_arg)) = akuma_exec::process::parse_shebang(head) else {
         crate::safe_print!(128, "[syscall] execve: invalid shebang in {}\n", script_path);
         return ENOENT;
     };
-    let shebang_line = shebang_line.trim();
 
-    if shebang_line.is_empty() {
-        crate::safe_print!(128, "[syscall] execve: empty shebang in {}\n", script_path);
-        return ENOENT;
-    }
+    // TWO different strings, and collapsing them is a real bug. `interp_argv0` is
+    // the interpreter AS WRITTEN in the `#!` line and is what Linux puts in
+    // argv[0]; `interp_path` is the symlink-resolved file to actually load. This
+    // used to shadow one with the other, so an interpreter reached through a
+    // symlink lost its identity — and busybox is a multi-call binary that
+    // dispatches ENTIRELY on argv[0], so `#!/bin/sh` ran as `/bin/busybox` with
+    // argv[0]="/bin/busybox" and busybox had no idea it was meant to be a shell.
+    // See docs/archive/DEVBOX_ISSUES.md Issue 14.
+    let interp_argv0 = String::from(interpreter);
+    let interp_arg = shebang_arg.map(String::from);
+    drop(file_data); // last borrow (interpreter/shebang_arg) ended above
 
-    let (interpreter, shebang_arg) = match shebang_line.split_once(char::is_whitespace) {
-        Some((interp, arg)) => (interp.trim(), Some(String::from(arg.trim()))),
-        None => (shebang_line, None),
-    };
-
-    let interpreter = crate::vfs::resolve_symlinks(interpreter);
-    drop(file_data); // last borrow (shebang_line) ended above
+    let interp_path = crate::vfs::resolve_symlinks(&interp_argv0);
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        if let Some(ref arg) = shebang_arg {
-            crate::safe_print!(128, "[syscall] execve: shebang {} {} {}\n", interpreter, arg, script_path);
+        if let Some(ref arg) = interp_arg {
+            crate::safe_print!(128, "[syscall] execve: shebang {} {} {}\n", interp_argv0, arg, script_path);
         } else {
-            crate::safe_print!(128, "[syscall] execve: shebang {} {}\n", interpreter, script_path);
+            crate::safe_print!(128, "[syscall] execve: shebang {} {}\n", interp_argv0, script_path);
         }
     }
 
-    let mut new_args = Vec::new();
-    new_args.push(interpreter.clone());
-    if let Some(arg) = shebang_arg
-        && !arg.is_empty() {
-            new_args.push(arg);
-        }
-    new_args.push(script_path);
+    let mut new_args =
+        akuma_exec::process::shebang_hop(&interp_argv0, interp_arg.as_deref(), &script_path, &[]);
     if original_args.len() > 1 {
         new_args.extend_from_slice(&original_args[1..]);
     }
     drop(original_args);
+    drop(script_path);
 
-    do_execve(interpreter, new_args, env)
+    // If `interp_path` is ITSELF a script, do_execve recurses here and this
+    // function sees the resolved path as its `script_path` — one level deeper the
+    // as-written name is gone. `spawn`'s `resolve_shebang_chain` walks the whole
+    // chain in one pass and does not have that hole; matching it here means
+    // threading both names through do_execve's signature.
+    do_execve(interp_path, new_args, env)
 }
 
 pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {

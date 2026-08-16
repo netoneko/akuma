@@ -515,7 +515,15 @@ pub fn socket_bind(idx: usize, addr: SocketAddrV4) -> Result<(), i32> {
                 sock.bind_port = Some(port);
                 smoltcp_net::udp_socket_bind(*handle, port).map_err(|()| libc_errno::EINVAL)?;
             } else {
-                sock.bind_port = Some(addr.port);
+                // Port 0 means "pick one for me" for TCP exactly as it does for UDP.
+                // Storing the literal 0 made the *next* `connect` hand smoltcp
+                // `local_port = 0`, which it rejects as `Unaddressable` — so every
+                // client that binds before connecting (busybox `nc`, anything using
+                // a source address) failed with EADDRNOTAVAIL against a healthy
+                // listener. A `listen` after a port-0 bind now also gets a real
+                // ephemeral port instead of listening on 0.
+                let port = if addr.port == 0 { alloc_ephemeral_port() } else { addr.port };
+                sock.bind_port = Some(port);
             }
             Ok(())
         } else {
@@ -663,18 +671,48 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
         p
     });
 
+    // A REDIAL — connect(2) called again on a fd whose first connect is still in
+    // flight (the standard non-blocking idiom: connect -> EINPROGRESS -> poll ->
+    // connect again to collect the result) — must NOT be handed to
+    // `smoltcp::connect`, which rejects any non-`Closed` socket with
+    // `InvalidState`. Reporting that as ECONNREFUSED made every such caller
+    // (`redis-cli`/hiredis is the reference case) fail against a listener that was
+    // up and healthy. POSIX: EISCONN once established, EALREADY while connecting.
+    let state_before = with_network(|net| net.sockets.get::<tcp::Socket>(h).state());
+    match state_before {
+        None => return Err(libc_errno::ENETDOWN),
+        Some(tcp::State::Established) => return Ok(()),
+        Some(tcp::State::SynSent | tcp::State::SynReceived) => {
+            if nonblock {
+                return Err(libc_errno::EALREADY);
+            }
+            // Blocking redial: fall through to the completion wait below without
+            // re-issuing the SYN.
+            return finish_connect_wait(h);
+        }
+        Some(_) => {}
+    }
+
     let res = with_network(|net| {
         let socket = net.sockets.get_mut::<tcp::Socket>(h);
         let cx = net.iface.context();
-        socket.connect(cx, 
+        socket.connect(cx,
             (smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(addr.ip)), addr.port),
             local_port
-        ).map_err(|_| libc_errno::ECONNREFUSED)
+        )
     });
-    
+
     match res {
         Some(Ok(())) => {},
-        Some(Err(_)) => return Err(libc_errno::ECONNREFUSED),
+        // Distinguish the two smoltcp refusals: an unroutable/unaddressable remote
+        // is EADDRNOTAVAIL, a socket that is already open is EISCONN. Collapsing
+        // both into ECONNREFUSED hid which one was happening.
+        Some(Err(smoltcp::socket::tcp::ConnectError::Unaddressable)) => {
+            return Err(libc_errno::EADDRNOTAVAIL)
+        }
+        Some(Err(smoltcp::socket::tcp::ConnectError::InvalidState)) => {
+            return Err(libc_errno::EISCONN)
+        }
         None => return Err(libc_errno::ENETDOWN),
     }
 
@@ -682,15 +720,36 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
         return Err(libc_errno::EINPROGRESS);
     }
 
-    wait_until(|| {
+    finish_connect_wait(h)
+}
+
+/// Block until a TCP socket that is already in `SynSent` either establishes or
+/// dies, and map the outcome to a POSIX errno.
+///
+/// Split out of [`socket_connect`] so a blocking *redial* takes the same path as
+/// the first call. The failure errno is derived from the state the socket
+/// actually reached: `Closed` means the peer refused (RST) or the stack gave up,
+/// anything still half-open at the deadline is ETIMEDOUT — previously every
+/// non-`Established` outcome, timeout included, reported ECONNREFUSED, which is
+/// what made "connect never completes" and "nothing is listening" indistinguishable
+/// from userspace.
+#[cfg(feature = "smoltcp")]
+fn finish_connect_wait(h: SocketHandle) -> Result<(), i32> {
+    let waited = wait_until(|| {
         with_network(|net| {
             let socket = net.sockets.get::<tcp::Socket>(h);
             matches!(socket.state(), tcp::State::Established | tcp::State::Closed | tcp::State::Closing | tcp::State::TimeWait)
         }).unwrap_or(true)
-    }, Some(10_000_000))?;
+    }, Some(10_000_000));
 
-    let connected = with_network(|net| net.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established).unwrap_or(false);
-    if connected { Ok(()) } else { Err(libc_errno::ECONNREFUSED) }
+    let state = with_network(|net| net.sockets.get::<tcp::Socket>(h).state());
+    match (waited, state) {
+        (_, Some(tcp::State::Established)) => Ok(()),
+        (Err(e), _) => Err(e),
+        (Ok(()), Some(tcp::State::Closed)) => Err(libc_errno::ECONNREFUSED),
+        (Ok(()), Some(_)) => Err(libc_errno::ETIMEDOUT),
+        (Ok(()), None) => Err(libc_errno::ENETDOWN),
+    }
 }
 
 #[cfg(feature = "smoltcp")]

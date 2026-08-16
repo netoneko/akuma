@@ -14,8 +14,22 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 /// Default environment variables for new processes when none are provided.
+/// Environment handed to a process spawned with no explicit environment (herd's
+/// services, `box run`).
+///
+/// `PATH` is the full Linux search order, not the `/usr/bin:/bin` pair it used to
+/// be. An OCI image's own `Env` is not propagated through the SPAWN abi
+/// (`SpawnOptions` has no env field), so a container's shell gets exactly this
+/// list — and every official image installs its program under `/usr/local/bin`.
+/// `redis:alpine`'s `docker-entrypoint.sh` ends in `exec "$@"` with `$1 =
+/// redis-server`, which failed with "redis-server: not found" against the short
+/// PATH even though `/usr/local/bin/redis-server` was right there in the overlay.
+///
+/// Order matches Docker's and a Linux login shell's: local before system, sbin
+/// before bin at each level, so an image that ships its own build of a tool wins
+/// over the distro's — which is the point of `/usr/local`.
 pub const DEFAULT_ENV: &[&str] = &[
-    "PATH=/usr/bin:/bin",
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "HOME=/",
     "TERM=xterm",
 ];
