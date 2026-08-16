@@ -93,6 +93,41 @@ an hour, so stop treating trial count as the expensive knob.** Ten per arm is
 ~22 min unattended and buys real power against a stochastic class — a 1-in-5
 flake is unremarkable in five samples and cannot be told from a regression.
 
+### Give every trial its own sentinel — `/tmp` survives the reboot
+
+The detached-run pattern (§5.2) ends the build with `echo __EX__$?` into a log
+the driver polls. Across a **batch** that pattern has a trap: the devbox is not
+booted in snapshot mode, so `/tmp` persists from one trial into the next, and
+with `>>` the previous trial's sentinel is still sitting at the top of the file
+when the next build starts appending under it.
+
+A driver that greps for a bare `__EX__` then scores the *previous* trial's exit
+code, at the first poll, and tears the VM down mid-build. Measured 2026-08-16:
+one trial in ten came back `GREEN` in **33 s** — less than a boot takes — with
+`Compiling byteorder` as its last log line. Two things give it away, and both
+are worth asserting rather than eyeballing:
+
+- **wall clock far below the ~2 min norm**, and
+- **a stunted boot log** — 94 KB against the 554 KB its neighbours produced.
+
+Two fixes, and use both:
+
+1. **Per-trial log path and per-trial sentinel** (`__EX_<label>_<n>__$?` into
+   `/tmp/build_<label>_<n>.log`). A stale file then cannot satisfy the check for
+   a different trial, which a plain `rm -f` does not guarantee — the `rm` is one
+   more ssh that can quietly fail.
+2. **Make the trial prove it did the work.** A clean build must recompile the
+   crate you changed and leave a full `deps/` tree, so require
+   `Compiling <your-crate>` in the log **and** ≥200 artifacts in
+   `target/aarch64-unknown-none/release/deps`. Score anything else `INVALID`, not
+   `GREEN`: absence of a failure is not evidence of a build, and a no-op resume
+   is fast for the same reason a stale sentinel is.
+
+This belongs in the same family as the Tier 3 `>>`-not-`>` rule in
+[`verify-trim-fat-change.md`](verify-trim-fat-change.md) — both are cases where
+the *harness* silently produced a healthy-looking answer about work that never
+ran.
+
 ### Prime the cargo registry first, or `--offline` fails misleadingly
 
 The devbox image ships `/root/akuma` and the nightly toolchain at
