@@ -15,6 +15,7 @@
 //! waitid                           waitid(P_PIDFD, ...) — tokio's reaping call
 //! raw [main|thread|split]          tcsetattr(raw) + read(0), same/different thread
 //! sleepbench                       what a short nanosleep actually costs
+//! pollbench                        what a short epoll_wait timeout actually costs
 //! termbench [--net]                stdout write-latency tail, +/- network load
 //! pipebench [--epoll N]            pipe write+read cost
 //! ```
@@ -528,6 +529,56 @@ fn probe_sleepbench() {
     }
 }
 
+// ---------------------------------------------------------------- probe K
+// Does a short poll TIMEOUT actually shorten the wait?
+//
+// `sys_epoll_pwait` caps each loop iteration's sleep at
+// `effective_poll_interval_us` (10 ms normally, 1 ms for rump fds) and re-scans.
+// That knob can only do something if the scheduler can actually deliver a wake
+// sooner than the round-robin period. Poll an fd that never becomes ready and
+// compare the requested timeout against the wall clock.
+//
+// If short timeouts come back at the same ~35 ms as long ones, then every
+// poll-interval tuning knob in the kernel is inert and the round-robin pass is
+// the only thing that matters.
+
+fn probe_pollbench() {
+    println!("=== probe: epoll_wait timeout accuracy (never-ready fd) ===");
+    // An eventfd nobody ever writes: registered, watched, never ready.
+    let efd = unsafe { libc::eventfd(0, 0) };
+    let epfd = unsafe { libc::epoll_create1(0) };
+    let mut ev = libc::epoll_event { events: EPOLLIN, u64: 1 };
+    unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, efd, &mut ev) };
+
+    println!("requested -> actual (median of 30), us");
+    for req_ms in [1i32, 2, 5, 10, 50] {
+        let mut got = Vec::new();
+        for _ in 0..30 {
+            let mut out = [libc::epoll_event { events: 0, u64: 0 }; 1];
+            let t = Instant::now();
+            let n = unsafe { libc::epoll_wait(epfd, out.as_mut_ptr(), 1, req_ms) };
+            got.push(t.elapsed().as_micros() as u64);
+            if n != 0 {
+                println!("  (unexpected ready fd)");
+            }
+        }
+        got.sort_unstable();
+        let med = got[got.len() / 2];
+        println!(
+            "  {:>5} ms -> {:>7} us   (min {:>7} max {:>7})  overshoot x{:.1}",
+            req_ms,
+            med,
+            got[0],
+            got[got.len() - 1],
+            med as f64 / (req_ms as f64 * 1000.0)
+        );
+    }
+    unsafe {
+        libc::close(epfd);
+        libc::close(efd);
+    }
+}
+
 // ---------------------------------------------------------------- probe F
 // tokio's pidfd reaper reaps with waitid(P_PIDFD, ...), not wait4.
 
@@ -816,6 +867,9 @@ fn probe_fds() {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("pollbench") => {
+            probe_pollbench();
+        }
         Some("sleepbench") => {
             probe_sleepbench();
         }

@@ -15,24 +15,26 @@ For real (shared-kernel) SMP, see [`smp-shared.md`](smp-shared.md).
 
 ## Threading model
 
-- **Preemptive**, fixed-size thread pool. `MAX_THREADS`=64 slots (`config.rs`);
-  runtime cap `THREAD_LIMIT` clamped to `[RESERVED_THREADS+1, MAX_THREADS]`.
+- **Preemptive**, fixed-size thread pool. `MAX_THREADS`=256 slots (**64 under
+  the `size`/`extreme-size` profile**); defined in `akuma_primitives::preempt`,
+  re-exported via `threading/types.rs` and `config`. Runtime cap `THREAD_LIMIT`
+  clamped to `[RESERVED_THREADS+1, MAX_THREADS]`.
 - **Stacks** come from PMM (`alloc_pages_contiguous_zeroed`); per-thread sizes
   via `USER_THREAD_STACK_SIZE` / `SYSTEM_THREAD_STACK_SIZE` (`config.rs`).
   Stack-overflow detection via canaries (`ENABLE_STACK_CANARIES`).
-- **Thread states** (`crates/akuma-exec/src/threading/types.rs:126`):
+- **Thread states** (`crates/akuma-exec/src/threading/types.rs:64`):
   `Free → Ready → Running → Terminated`. Tracked in lock-free atomics
-  `THREAD_STATES: [AtomicU8; MAX_THREADS]` (no mutex on the hot path).
+  `THREAD_STATES: [AtomicU8; MAX_THREADS]` (`threading/mod.rs:292`; no mutex on the hot path).
 
 ### Slot state machine
 
-`THREAD_STATES[tid]` (`crates/akuma-exec/src/threading/mod.rs:316`; the state values
-themselves are the `thread_state` constants module, `types.rs:76`) is the lock-free
+`THREAD_STATES[tid]` (`crates/akuma-exec/src/threading/mod.rs:292`; the state values
+themselves are the `thread_state` constants module, `types.rs:64`) is the lock-free
 source of truth. `INITIALIZING` exists so the scheduler cannot pick a slot whose context
 is half-built, and the `TERMINATED → FREE` edge is deliberately delayed by a cooldown so
 a dying thread is never recycled while a peer still holds a reference to it.
 
-`mark_thread_terminated()` (`threading/mod.rs:1022`, the state store itself at `:1067`) is
+`mark_thread_terminated()` (`threading/mod.rs:1080`, the state store itself at `:1125`) is
 an **unconditional store, callable from any state** — not just `RUNNING`. `kill_thread_group`,
 `request_thread_kill`, and a spawn failure all terminate a slot directly regardless of
 whether it was `READY`, `WAITING`, or still `INITIALIZING`.
@@ -60,15 +62,19 @@ the CPU.
 
 ## Preemption
 
-- **10 ms timer → SGI** (Software Generated Interrupt). The timer fires, the
-  exception handler runs the scheduler.
+- **Timer tick → SGI** (Software Generated Interrupt). **1 ms since 2026-08-18**
+  (`TIMER_INTERVAL_US`, `src/config.rs`); **10 ms on `extreme-size`** (profile
+  gate — the 4 MB single-core box pays for every interrupt). The timer fires,
+  the exception handler runs the scheduler. Measurement record:
+  `../../archive/SCHEDULING_INVESTIGATION.md` → Resolution.
 - `PREEMPT_WAKE_TID` / `WOKEN_STATES`: "sticky wake" flags set by `wake()`,
   consumed in `schedule_indices`. A woken thread runs promptly via the SGI.
 - **Preemption watchdog** (`ENABLE_PREEMPTION_WATCHDOG`, default true): warns
-  if preemption disabled >100 ms (`PREEMPTION_WATCHDOG_WARN_US`, `types.rs:66`); at 5 s
-  (`PREEMPTION_WATCHDOG_PANIC_US`, `types.rs:69`) it prints a rate-limited `[WATCHDOG]`
+  if preemption disabled >100 ms (`PREEMPTION_WATCHDOG_WARN_US`); at 5 s
+  (`PREEMPTION_WATCHDOG_PANIC_US`) it prints a rate-limited `[WATCHDOG]`
   critical line and **keeps running** — `check_preemption_watchdog`
-  (`crates/akuma-exec/src/threading/mod.rs:1928-1932`) deliberately never panics ("DO NOT
+  (`akuma-primitives/src/preempt.rs`, re-exported into
+  `crates/akuma-exec/src/threading/types.rs:60`) deliberately never panics ("DO NOT
   use panic! here - we're in IRQ context"); the constant is merely *named*
   `PANIC_US`. This is the tripwire for the "yield inside a critical section" bug class.
 - `with_irqs_disabled` (`runtime.rs:256`) is the primitive; nesting is counted
@@ -88,7 +94,7 @@ the CPU.
 > **Stability: C (active risk).** The wedge described at the end of this section is
 > open and reproducible.
 
-`POOL: Spinlock<ThreadPool>` (`threading/mod.rs:2775`) is a **single global lock** guarding
+`POOL: Spinlock<ThreadPool>` (`threading/mod.rs:2744`) is a **single global lock** guarding
 the slot table. Under `smp-shared` it is also what makes the context switch atomic:
 `sgi_scheduler_handler_with_sp` holds `POOL` across the *entire* switch — decision,
 outgoing context save, and incoming load — **on every path**, unconditionally. It has to,
@@ -98,10 +104,10 @@ core may pick it), and a peer that restored a not-yet-saved SP would run a corru
 Only *half* of that switch is BKL-free, though — "the scheduler SGI runs BKL-free" is
 overstated as a blanket claim. Since M5c step-2, a scheduler SGI that preempted **EL0**
 runs the whole switch without ever taking the BKL, gated on `interrupted_el0 &&
-sched_bklfree_el0_enabled() && irq == SGI_SCHEDULER` (`src/exceptions.rs:1893-1908`). An
+sched_bklfree_el0_enabled() && irq == SGI_SCHEDULER` (`src/exceptions.rs:2622-2642`). An
 SGI that instead preempted **EL1** falls through to `bkl::enter_kernel()`
-(`exceptions.rs:1931`) and runs `sgi_scheduler_handler_with_sp` **BKL-held**
-(`exceptions.rs:1946`), exactly like any other device IRQ. So the BKL-free path is the
+(`exceptions.rs:2665`) and runs `sgi_scheduler_handler_with_sp` **BKL-held**
+(`exceptions.rs:2680`), exactly like any other device IRQ. So the BKL-free path is the
 EL0-preempt arm only; the `POOL`-across-the-whole-switch guarantee above holds either way.
 
 The load-bearing consequence: **`POOL` is the gate on all preemption.** The SGI handler
@@ -205,15 +211,15 @@ holder, which reduces the suspect list to a handful of call sites in one run.
 
 ## Blocking & wait/wake
 
-- **`yield_now()`** (`threading/mod.rs:2221`) — voluntary yield; thread stays
+- **`yield_now()`** (`threading/mod.rs:2856`) — voluntary yield; thread stays
   `Ready`, wakes promptly, **no SGI**. Use inside `block_on` and any
   cooperative loop.
-- **`schedule_blocking(wake_time_us)`** (`threading/mod.rs:2555`) — flips the
+- **`schedule_blocking(wake_time_us)`** (`threading/mod.rs:3563`) — flips the
   thread to `Waiting`; on wake fires an SGI for immediate context switch.
   **Do NOT use inside `block_on` while the network thread may hold the
   `NETWORK` spinlock** (SGI-during-poll deadlock — see
   `../../runbooks/debug-ssh-latency.md`).
-- **`Waker`** (`threading/mod.rs:2470`) — `wake()` sets the sticky
+- **`Waker`** (`ThreadWaker`, `threading/mod.rs:3351`, `wake()` at `:3363`) — `wake()` sets the sticky
   `WOKEN_STATES` flag + `PREEMPT_WAKE_TID`. Used by wait queues, epoll, and the
   SSH `current_thread_waker()`.
 - **Wait queues** (see `archive/WAIT_QUEUES.md`): a thread registers a `Waker`
@@ -257,12 +263,23 @@ Regression test: `park_wake_race_tests`
 
 ## Scheduling weights
 
-- **Proportional scheduler** (`schedule_indices`, `threading/mod.rs:1874`).
+- **Proportional scheduler** (`schedule_indices`, `threading/mod.rs:2425`).
   `MAIN_THREAD_PRIORITY_BOOST` is legacy (off) — proportional is default.
 - **`NETWORK_THREAD_RATIO`** (default 4) — the network thread is boosted every
   N ticks. The boosted thread is the **registered** one
   (`set_network_thread_id`, called by `run_async_main`), not slot 0.
   Historical bug: boost was hardcoded to slot 0 (idle) → SSH staggering.
+- **Wake-deadline preemption (on since 2026-08-18).** When the scheduler's
+  deadline wake-pass promotes a WAITING thread (sleep/timer expiry), it arms
+  `PREEMPT_WAKE_TID` for the earliest-deadline thread so it runs on the NEXT
+  switch instead of joining the back of the round-robin queue
+  (`WAKE_DEADLINE_PREEMPT` in `threading/mod.rs`). Before this, eligibility
+  was not execution: an expired sleeper waited a full round-robin pass, giving
+  short sleeps a ~35 ms floor and making every poll-interval cap inert
+  (`../../archive/SCHEDULING_INVESTIGATION.md`). The older
+  `WAKEUP_LOCALITY_HINT` gate (arming the same hint from explicit
+  `ThreadWaker::wake` calls) stays off — that experiment measured no gain for
+  the rump sysproxy and is a separate knob on purpose.
 
 ## Real (shared-kernel) SMP
 
@@ -277,3 +294,7 @@ BKL carve-outs.
 - `archive/CONTEXT_SWITCH_FIX_2026.md`, `archive/TTBR0_AND_THREADING_FIXES.md`.
 - `archive/MULTIKERNEL.md` — the removed one-kernel-per-core design (29
   commits); see `archive/TRIM_FAT_MULTIKERNEL.md` for the removal.
+- `archive/SCHEDULING_AUDIT.md` (2026-08-18) — docs-vs-code audit of this
+  subsystem; the source of the line references above.
+- `archive/SCHEDULING_INVESTIGATION.md` (2026-08-17/18) — the short-sleep
+  floor / inert poll-knob investigation and its open measurement matrix.

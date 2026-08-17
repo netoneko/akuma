@@ -72,6 +72,7 @@ Each isolates one layer, so a pass eliminates that layer permanently:
 | `cross` | One thread parked in `epoll_wait` while another `epoll_ctl(ADD)`s into it — tokio's shape. |
 | `fds` | Which fds are open, which are epoll instances, and whether two fds alias one instance. |
 | `waitid` | `waitid(P_PIDFD, …)`, tokio's reaping call, including the returned `siginfo`. |
+| `pollbench` | Does a short `epoll_wait` **timeout** actually shorten the wait? Answers whether any poll-interval tuning knob can work at all. |
 | `sleepbench` | What does a short `nanosleep` **actually** cost? A flat ~35 ms floor regardless of the request means every poll-loop in the system runs at ~27 Hz. |
 | `termbench [--net]` | Latency distribution of writes to stdout — the SSH terminal path — optionally with a concurrent download. Stutter is the **tail**, so this reports p50/p90/p99/max and counts writes over 10 ms. |
 | `pipebench [--epoll N]` | Per-iteration pipe write+read cost, optionally with the read end registered in N epoll instances (the re-arm walks every instance). |

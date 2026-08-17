@@ -589,6 +589,31 @@ static PREEMPT_WAKE_TID: AtomicUsize = AtomicUsize::new(MAX_THREADS);
 /// the hint is never set, so the scheduler is exactly baseline round-robin.
 const WAKEUP_LOCALITY_HINT: bool = false;
 
+/// Wake-deadline preemption (2026-08-18, `SCHEDULING_AUDIT.md` /
+/// `SCHEDULING_INVESTIGATION.md`): when the scheduler's deadline wake-pass
+/// promotes a WAITING thread to READY (its sleep/timer deadline expired), arm
+/// [`PREEMPT_WAKE_TID`] so it runs on the NEXT switch instead of joining the
+/// back of the round-robin queue.
+///
+/// Before this, eligibility was not execution: a thread whose sleep deadline
+/// had expired waited a full round-robin pass (one timeslice per runnable
+/// thread), giving short sleeps a hard floor of ~tick × runnable-threads
+/// (~35 ms measured at 3 runnable threads, 10 ms tick) and making every
+/// poll-interval cap (`BLOCKING_POLL_INTERVAL_US`,
+/// `RUMP_BLOCKING_POLL_INTERVAL_US`) inert below that floor.
+///
+/// Distinct from [`WAKEUP_LOCALITY_HINT`]: that gate arms the same hint from
+/// an explicit `ThreadWaker::wake` (futex/cond) and was measured NOT to help
+/// the rump sysproxy; this one arms it from the *deadline* wake-pass, where
+/// the measurement says the cost lives. Keep the two experiments separate.
+///
+/// Fairness: the hint fires once per wake; the preempted thread stays READY
+/// and keeps its rotation position, so a periodic short sleeper steals only
+/// its own runtime (~µs per tick), never a peer's quantum. When several
+/// sleepers expire in the same pass, the earliest deadline wins the hint and
+/// the rest wait their rotation as before.
+const WAKE_DEADLINE_PREEMPT: bool = true;
+
 /// Real shared-kernel SMP: which thread slots are per-core idle threads. Idle threads
 /// are skipped by the round-robin scan — a core only ever runs ITS OWN idle, chosen
 /// explicitly as the fallback in `schedule_indices` — so one core can never pick
@@ -2440,6 +2465,9 @@ impl ThreadPool {
         // without costing wakeup latency.)
         let now = (runtime().uptime_us)();
         let mut woke_any = false;
+        // Earliest-deadline woken thread, for the run-next hint below.
+        let mut hint_tid = usize::MAX;
+        let mut hint_deadline = u64::MAX;
         for i in 0..MAX_THREADS {
             if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::WAITING {
                 let wake_time = WAKE_TIMES[i].load(Ordering::SeqCst);
@@ -2462,9 +2490,22 @@ impl ThreadPool {
                     {
                         WAKE_TIMES[i].store(0, Ordering::SeqCst);
                         woke_any = true;
+                        if wake_time < hint_deadline {
+                            hint_deadline = wake_time;
+                            hint_tid = i;
+                        }
                     }
                 }
             }
+        }
+        // Wake-deadline preemption: the thread whose deadline expired earliest
+        // runs NEXT, not after a full round-robin pass. Consumed by the `hinted`
+        // swap below in this same call (or the next entry, if the preemption
+        // gate returns early). A plain store: with WAKEUP_LOCALITY_HINT off we
+        // are the only writer; if both gates are ever on, last-writer-wins is
+        // benign — the consumer re-validates READY/ON_CPU before using it.
+        if WAKE_DEADLINE_PREEMPT && hint_tid != usize::MAX {
+            PREEMPT_WAKE_TID.store(hint_tid, Ordering::SeqCst);
         }
         // Send event to wake any threads in WFI
         if woke_any {

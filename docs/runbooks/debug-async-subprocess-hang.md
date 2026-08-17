@@ -33,10 +33,19 @@ Symptoms that land you here:
   the caller's timeout. This runbook is for "exited in milliseconds, caller
   waited 30 s".
 - **Is it a lost *scheduler* wakeup?** It is not.
-  `sys_epoll_pwait` re-scans every fd at least every `BLOCKING_POLL_INTERVAL_US`
-  = 10 ms whether or not a `Waker` ever fires, so a watcher cannot sleep through
-  a state change. If the fd is ready and nothing is delivered, the **readiness
+  `sys_epoll_pwait` re-scans every fd on a bounded interval whether or not a
+  `Waker` ever fires, so a watcher cannot sleep through a state change
+  indefinitely. If the fd is ready and nothing is delivered, the **readiness
   oracle** is lying — that is where to look.
+
+  > The bound is **not** `BLOCKING_POLL_INTERVAL_US` = 10 ms, as this runbook
+  > originally claimed. Measured on the pre-2026-08-18 kernel it is ~35 ms and
+  > grows with runnable-thread count, because the cap sets when a thread
+  > becomes *eligible*, not when it runs. See
+  > [`../archive/SCHEDULING_INVESTIGATION.md`](../archive/SCHEDULING_INVESTIGATION.md)
+  > §5. **Fixed 2026-08-18** (wake-deadline preemption + 1 ms tick): the
+  > re-scan bound is now ~1 ms on all profiles except `extreme-size`, where it
+  > is one 10 ms round. The logic is unaffected; only the number changed.
 
 ## What was already found
 
