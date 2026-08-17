@@ -169,6 +169,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Recover a wedged/hung VM | [`runbooks/recover-wedged-vm.md`](runbooks/recover-wedged-vm.md) |
 | Merge duplicated code (a `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` phase item) and prove it changed nothing | [`runbooks/verify-trim-fat-change.md`](runbooks/verify-trim-fat-change.md) — run [`scripts/verify_trim.py`](../scripts/verify_trim.py) and diff against your parent commit; the runbook says which log lines are known-benign, how to decide host test vs boot test, and (Tier 4) the redis memtest for memory-path changes |
 | Update `docs/archive/BUG_FIX_LIST.md` after landing a fix | [`runbooks/update-bug-fix-list.md`](runbooks/update-bug-fix-list.md) |
+| Export an HTML slide deck under `bootstrap/public/` to PDF | [`runbooks/print-deck-to-pdf.md`](runbooks/print-deck-to-pdf.md) — run [`scripts/render_deck_pdf.py`](../scripts/render_deck_pdf.py), **not** Cmd-P or `chrome --print-to-pdf`: Chrome lays print media out at a ~800px viewport whatever `@page` says, so the two-column slides paginate as the mobile stack with the `vw` type scale magnified |
 | Toggle debug knobs | [`reference/subsystems/config-flags.md`](reference/subsystems/config-flags.md) |
 | Run the acceptance playbooks | [`acceptance/`](../acceptance/) |
 

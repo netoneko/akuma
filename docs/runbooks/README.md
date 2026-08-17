@@ -35,6 +35,7 @@ Start from the symptom or task on the left.
 | Adding a `sc-*` kernel feature | [`add-syscall-feature.md`](add-syscall-feature.md) |
 | Landed a fix and need to update the bugfix audit | [`update-bug-fix-list.md`](update-bug-fix-list.md) |
 | Looking for copy-pasted code before a refactor (PMD CPD) | [`find-duplicated-code.md`](find-duplicated-code.md) |
+| Exporting an HTML deck under `bootstrap/public/` to PDF — or wondering why Cmd-P prints the mobile layout with huge type | [`print-deck-to-pdf.md`](print-deck-to-pdf.md) — Chrome lays print media out at a ~800px viewport whatever `@page` says; use [`scripts/render_deck_pdf.py`](../../scripts/render_deck_pdf.py) |
 | Confirming a deduplication / extraction change caused no regression — [`scripts/verify_trim.py`](../../scripts/verify_trim.py) diffed against your parent commit, which log lines are known-benign, and the redis memtest for memory-path changes | [`verify-trim-fat-change.md`](verify-trim-fat-change.md) |
 
 ## Conventions
