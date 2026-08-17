@@ -324,6 +324,70 @@ fn probe_eofedge() {
     let _ = child.wait();
 }
 
+// ---------------------------------------------------------------- probe H
+// Pipe read/write cost. `epoll_on_fd_drained` runs on every pipe read, so
+// anything it does lands on sshd's bridge, every byte of a TUI's output and
+// every busybox pipeline. This measures that per-read cost directly.
+//
+// `--epoll N` first registers the read end in N epoll instances, because the
+// re-arm walks every instance in the table: the gap between N=0 and N=8 is the
+// part that scales with how much else on the box is using epoll.
+
+fn probe_pipebench() {
+    const ITERS: usize = 20_000;
+    let n_epolls: usize = std::env::args()
+        .position(|a| a == "--epoll")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        println!("pipe() failed");
+        return;
+    }
+    let (r, w) = (fds[0], fds[1]);
+    unsafe {
+        let fl = libc::fcntl(r, libc::F_GETFL);
+        libc::fcntl(r, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+
+    let mut epfds = Vec::new();
+    for _ in 0..n_epolls {
+        let ep = unsafe { libc::epoll_create1(0) };
+        let mut ev = libc::epoll_event { events: PIPE_MASK, u64: 1 };
+        unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_ADD, r, &mut ev) };
+        epfds.push(ep);
+    }
+    println!("pipe rw x{ITERS}, read end registered in {n_epolls} epoll instance(s)");
+
+    let buf = [b'x'; 64];
+    let mut rbuf = [0u8; 64];
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        unsafe {
+            libc::write(w, buf.as_ptr().cast(), buf.len());
+            libc::read(r, rbuf.as_mut_ptr().cast(), rbuf.len());
+        }
+    }
+    let el = t0.elapsed();
+
+    println!(
+        "RESULT: {:.2} us/iter  ({} iters in {} ms, {:.0} iters/s)",
+        el.as_secs_f64() * 1e6 / ITERS as f64,
+        ITERS,
+        el.as_millis(),
+        ITERS as f64 / el.as_secs_f64()
+    );
+    for ep in epfds {
+        unsafe { libc::close(ep) };
+    }
+    unsafe {
+        libc::close(r);
+        libc::close(w);
+    }
+}
+
 // ---------------------------------------------------------------- probe F
 // tokio's pidfd reaper reaps with waitid(P_PIDFD, ...), not wait4.
 
@@ -612,6 +676,10 @@ fn probe_fds() {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("pipebench") => {
+            println!("=== probe: pipe read/write cost ===");
+            probe_pipebench();
+        }
         Some("eofedge") => {
             println!("=== probe: EOF edge after a partial drain ===");
             probe_eofedge();
@@ -658,7 +726,8 @@ fn main() {
             probe_raw(mode);
         }
         _ => {
-            println!("usage: ncaprobe epoll [main|thread] [--late]");
+            println!("usage: ncaprobe epoll [main|thread] [--late] [--zero]");
+            println!("       ncaprobe tokio|eofedge|cross|fds|waitid|pipebench [--epoll N]");
             println!("       ncaprobe raw [main|thread|split]");
         }
     }

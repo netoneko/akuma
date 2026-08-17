@@ -283,22 +283,33 @@ fn epoll_reset_edge(fd: u32, bits: u32) {
     // (any epoll_wait/epoll_ctl syscall), the cores deadlock AB-BA. Masking
     // IRQs for the (tiny) holds makes them nest-free. Harmless on other builds.
     //
-    // Snapshot IDs so the per-instance holds stay short and independent.
-    let ids: alloc::vec::Vec<u32> = crate::irq::with_irqs_disabled(|| {
-        let table = EPOLL_TABLE.lock();
-        table.keys().copied().collect()
+    // One hold, no allocation. This used to snapshot the instance IDs into a
+    // `Vec` and then re-take the lock once per instance, "so the per-instance
+    // holds stay short and independent". Both halves of that were wrong:
+    //
+    // * `table.keys().copied().collect()` allocated **inside** the IRQ-masked
+    //   `EPOLL_TABLE` hold, which is the rule in `locking.md` ("the allocator is
+    //   a lock re-entrant too") — any allocation in a locked section is a call
+    //   into the OOM path, which is allowed to tear down processes.
+    // * N lock acquisitions plus a heap round-trip is strictly *more* total
+    //   IRQ-masked time than one pass, not less. The per-instance work is a
+    //   `BTreeMap` lookup and a mask clear; there is nothing to break up.
+    //
+    // Both only mattered once this became hot. It was socket-only until
+    // 2026-08-17, when the pipe read path started calling it — putting an
+    // allocation and N spinlock round-trips on every `read()` of a pipe, i.e.
+    // on sshd's session bridge, every byte a TUI writes, and every busybox
+    // pipeline. See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
+    crate::irq::with_irqs_disabled(|| {
+        let mut table = EPOLL_TABLE.lock();
+        for inst in table.values_mut() {
+            if let Some(entry) = inst.interest_list.get_mut(&fd)
+                && entry.events & EPOLLET != 0
+            {
+                entry.last_ready &= !bits;
+            }
+        }
     });
-
-    for epoll_id in ids {
-        crate::irq::with_irqs_disabled(|| {
-            let mut table = EPOLL_TABLE.lock();
-            if let Some(inst) = table.get_mut(&epoll_id)
-                && let Some(entry) = inst.interest_list.get_mut(&fd)
-                    && entry.events & EPOLLET != 0 {
-                        entry.last_ready &= !bits;
-                    }
-        });
-    }
 }
 
 /// Called when a socket read drained the receive buffer (an `EAGAIN`, or any
