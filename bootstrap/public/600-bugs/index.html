@@ -380,8 +380,6 @@
       effectively solved and focus shifts to <em>bugs beyond safety</em>. For those they
       reach for <strong>model checking and tests</strong>, not proofs. Logic-level
       verification is explicitly aspirational.</p>
-      <p class="pull cool">The team most invested in proofs scoped them to the 14% where
-      proofs work, and used practical tools for everything else.</p>
     </div>
   </section>
 
@@ -509,8 +507,8 @@
       <p>Any <span class="m hot">stuck</span> / <span class="m hot">RECOVERED</span> /
       <span class="m hot">PANIC</span> / <span class="m hot">WILD</span> /
       <span class="m hot">SPURIOUS</span> marker fails the run.</p>
-      <p class="pull">"The tests pass" isn't the bar — the tests were written by the person
-      who wrote the bug.</p>
+      <p class="pull">Remember, the tests were written by the AI
+      who wrote the bug, and someone <em>signed off on them.</em></p>
     </div>
   </section>
 
@@ -546,7 +544,7 @@
   <section class="slide">
     <div class="num">12</div>
     <div class="body">
-      <p class="eyebrow cool">Act III · how it's built</p>
+      <p class="eyebrow hot">Act III · how it's built</p>
       <h2>Learn from history</h2>
       <p><strong>A full OS development cycle is a surprisingly large dataset.</strong> 1,547
       commits, 196 investigation docs. What can be mined:</p>
@@ -562,7 +560,33 @@
   <section class="slide">
     <div class="num">13</div>
     <div class="body">
-      <p class="eyebrow cool">Act III · how it's built</p>
+      <p class="eyebrow hot">Act III · how it's built</p>
+      <h2>Clean up after yourself</h2>
+      <p><strong>Generation is cheap, so the default move is a second copy.</strong> A clone
+      detector over the kernel found <strong>5,370 duplicated lines</strong> — 5.6% of the
+      tree, and that is the floor, not the estimate. What the copies cost:</p>
+      <div class="scroller">
+        <table class="dense">
+          <thead><tr><th>written more than once</th><th class="r">copies</th><th>what it cost</th></tr></thead>
+          <tbody>
+            <tr><td>the CoW break path, <code>exceptions.rs</code></td><td class="r hot">3</td><td>a refcount underflow in the page-fault path — frames freed while still mapped. Three separate fixes</td></tr>
+            <tr><td><code>X</code> and <code>X_from_path</code>, down a whole call chain</td><td class="r">4 pairs</td><td>a <strong>second, hand-rolled ELF parser</strong> — which one validates your dynamic linker depends on which <code>execve</code> path ran</td></tr>
+            <tr><td>the bounded channel write</td><td class="r">2</td><td>the stream-truncation fix landed on stdout, never on stdin</td></tr>
+            <tr><td>errno tables</td><td class="r">5</td><td><code>-12</code> (<code>ENOMEM</code>) returned under a comment reading <code>ENXIO</code>. 116 definitions → <strong>39</strong></td></tr>
+            <tr><td>the runtime-registration pattern</td><td class="r">3</td><td>every network poll took a spinlock to read a function pointer</td></tr>
+            <tr><td>production logic, re-typed inside its own test</td><td class="r hot">13</td><td>the test exercises its copy, so production drifts for free — plus 25 more that assert <code>true&nbsp;==&nbsp;true</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="pull"><em class="q">GOD DAAAAAAAAAM</em></p>
+    </div>
+  </section>
+
+  <!-- 14 -->
+  <section class="slide">
+    <div class="num">14</div>
+    <div class="body">
+      <p class="eyebrow hot">Act III · how it's built</p>
       <h2>mood</h2>
       <pre><span class="d">2025-11-28</span>  does not actually detect ram
 <span class="d">2025-11-28</span>  at least it still runs
@@ -579,9 +603,9 @@
     </div>
   </section>
 
-  <!-- 14 -->
+  <!-- 15 -->
   <section class="slide">
-    <div class="num">14</div>
+    <div class="num">15</div>
     <div class="body">
       <p class="eyebrow"><code>go build</code> defeated</p>
       <pre>akuma:~$ apk add go git
