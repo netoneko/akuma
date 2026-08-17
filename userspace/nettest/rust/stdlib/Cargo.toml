@@ -1,0 +1,48 @@
+[package]
+name = "nettest-std"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone crate: NOT a member of any workspace. The repo root and
+# userspace/ both target the no_std kernel (`aarch64-unknown-none`); this is a
+# Linux/musl program. Same opt-out the sibling curl probe (`../Cargo.toml`) and
+# `userspace/nca` use.
+#
+# Build: ../build-musl.sh (host cross-build, aarch64-linux-musl-gcc). NOT the
+# Alpine docker path the curl probe uses — this probe deliberately shares nca's
+# toolchain so a divergence between the two binaries cannot be blamed on the
+# compiler or the libc.
+
+[[bin]]
+name = "nettest-std"
+path = "src/main.rs"
+
+[dependencies]
+# poll(2) + the nonblocking-connect idiom. Nothing else in this probe is
+# allowed a dependency: the whole point is a client with no runtime, no
+# reactor, and no event loop between the syscalls and the timings.
+libc = "0.2"
+
+# TLS is the ONLY axis this probe shares with the reqwest probe, and it shares
+# it deliberately: same rustls major, same crypto provider, driven
+# SYNCHRONOUSLY over a blocking `std::net::TcpStream` instead of through tokio.
+# If `tls` passes here and the reqwest probe fails on the same URL, the fault is
+# in the readiness/epoll path, not in rustls.
+#
+# `default-features = false` + `ring` is load-bearing for that claim. rustls
+# 0.23's DEFAULT provider is aws-lc-rs, but `reqwest`'s `rustls-tls` feature
+# resolves to **ring** (verified in ../reqwest/Cargo.lock: ring 0.17.14, no
+# aws-lc-rs). Taking rustls' default here would have left the two probes on
+# different crypto backends and made the TLS axis uncontrolled — "std tls
+# passes, reqwest fails" would then be explainable by the backend rather than by
+# the runtime, which is the one thing this comparison must not allow.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+
+[profile.release]
+opt-level = 2
+codegen-units = 1
+strip = true
+
+[workspace]

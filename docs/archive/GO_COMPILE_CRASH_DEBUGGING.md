@@ -1,5 +1,23 @@
 # Go `compile` crash — handoff theory (errno-shaped faults)
 
+> **RESOLVED — `go build` works on-target as of 2026-08-17.** The crash this doc
+> analyses (`go tool compile` dying at `reflectdata.WriteRuntimeTypes` with
+> `unexpected fault address 0xffffffffffffffc0`, i.e. `-64`) no longer reproduces:
+> a cold module build completes in 112 s over 38 stdlib packages and the resulting
+> binary runs. See
+> [`GOLANG_MISSING_SYSCALLS.md`](GOLANG_MISSING_SYSCALLS.md) § "Milestone Status"
+> for the verification.
+>
+> **The errno-shaped-fault theory below was right about the class.** The same
+> shape — a kernel errno reaching userspace in a register holding a live pointer —
+> was root-caused in the self-host campaign as a **stale-instruction-cache phantom
+> `svc`**: the CPU executes a syscall at a PC whose cache-coherent instruction is
+> not an `svc`, the phantom syscall returns an errno into `x0`, and the next deref
+> faults. Fixed by the `VERIFY_SVC_AT_ENTRY` guard in `src/exceptions.rs`. This
+> doc is kept for its evidence-gathering method (the per-process syscall ring
+> buffer and the signed-value reading of fault addresses), which is what made that
+> class legible.
+
 This note summarizes evidence from **`crash9.log`** (`go tool compile`), **`crash12.log`** (`forktest` / mmap stress vs `GODEBUG=asyncpreemptoff`), userspace stack traces, and the xattr syscall stub. It is intended for another agent to turn into a fix plan and tests.
 
 ## Symptoms (userspace)

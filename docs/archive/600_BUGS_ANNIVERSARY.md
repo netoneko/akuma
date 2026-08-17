@@ -243,7 +243,26 @@ one fact determines the whole documentation system.
 Not written for posterity — **written to reconstitute project-specific intuition in
 a reader who starts from zero.**
 
-**And the informal half of the same record — the commit log:**
+**The failure mode this guards against**, logged once in the archive: during what
+should have been a mechanical port, two syscalls were **rewritten instead of
+copied** — breaking an ABI. Caught and reverted, and named in the doc as exactly
+that.
+
+*Speaker:* this is the part I'd argue is genuinely new. The archive isn't history,
+it's a cache of hard-won judgement — correctness rules learned the hard way, so
+they stop being relearned. Two agent-context files existed in parallel at one
+point, and the log shows a second model consulted mid-crisis for alternative
+theories. The job drifts from writing code to curating the context that makes good
+code likely.
+
+On the rewritten-instead-of-copied bug, say the honest part out loud: it was caught
+that once, and there is no way to know from the record how many similar
+substitutions were not. That is the specific risk of this way of working, and no
+amount of documentation tiers fixes it — only a diff you actually read.
+
+---
+
+### 10 — mood
 
 ```
 2025-11-28  does not actually detect ram
@@ -260,36 +279,20 @@ a reader who starts from zero.**
 ```
 
 The four tiers document the *reasoning*. The commit log documents the *state of
-mind* — and it is still a record you can mine: "this is getting out of hand" recurs
-four times across two months before it becomes "still out of hand", and the last
-three lines are from the era where every claim carries a measurement. The tone
-survived; the rigour arrived.
+mind* — and it is still a record you can mine.
 
-**The failure mode this guards against**, logged once in the archive: during what
-should have been a mechanical port, two syscalls were **rewritten instead of
-copied** — breaking an ABI. Caught and reverted, and named in the doc as exactly
-that.
+*Speaker:* not a joke reel — read in order it's a legible progression. "This is
+getting out of hand" recurs four times across two months before it graduates to
+"still out of hand"; the two `at least it` lines eleven days apart are the whole of
+the first era; and the 2026-08 lines are from the period where every claim carries a
+measurement. The tone survived, the rigour arrived. None of it was written for an
+audience, which is exactly why it's usable evidence now.
 
-*Speaker:* this is the part I'd argue is genuinely new. The archive isn't history,
-it's a cache of hard-won judgement — correctness rules learned the hard way, so
-they stop being relearned. Two agent-context files existed in parallel at one
-point, and the log shows a second model consulted mid-crisis for alternative
-theories. The job drifts from writing code to curating the context that makes good
-code likely.
-
-The commit log is not a joke reel — read in order it is a legible progression, and
-the two `at least it` lines eleven days apart are the whole of Era 1. Worth saying
-that none of it was written for an audience, which is exactly why it's usable
-evidence now.
-
-On the rewritten-instead-of-copied bug, say the honest part out loud: it was caught
-that once, and there is no way to know from the record how many similar
-substitutions were not. That is the specific risk of this way of working, and no
-amount of documentation tiers fixes it — only a diff you actually read.
+*(`mood` is itself one of the commit messages, from the middle era.)*
 
 ---
 
-### 10 — Reading the diff
+### 11 — Reading the diff
 
 Last August the build had been failing for days, filed under a label that turned
 out to mean nothing.
@@ -310,7 +313,7 @@ keeping; being right about which function to open is luck with a good prior.
 
 ---
 
-### 11 — Learn from history
+### 12 — Learn from history
 
 **A full OS development cycle is a surprisingly large dataset.** 1,547 commits, 196
 investigation docs. What falls out of it:
@@ -336,7 +339,7 @@ reversed it. Same data, different filing, opposite answer.
 
 ## Closing
 
-### 12 — `go build` defeated
+### 13 — `go build` defeated
 
 ```
 akuma:~$ apk add go git

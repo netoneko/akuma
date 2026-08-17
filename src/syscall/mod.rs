@@ -42,6 +42,9 @@ mod net;
 /// Boot self-test for the net bounce-buffer allocator (see `net::alloc_net_bounce`).
 #[cfg(kernel_tests)]
 pub use net::run_net_bounce_tests;
+/// Boot self-test for `SO_RCVTIMEO`/`SO_SNDTIMEO` (see `net::sys_setsockopt`).
+#[cfg(all(kernel_tests, feature = "smoltcp"))]
+pub use net::run_socket_timeout_tests;
 /// Boot self-test for `writev`'s short-write rule (see `fs::writev_stops_after`).
 #[cfg(kernel_tests)]
 pub use fs::run_writev_short_write_tests;

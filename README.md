@@ -6,6 +6,10 @@
 
 **Bare-metal AArch64 OS in Rust — preemptive kernel, Linux ABI, SSH, containers, apk, TCC/Clang/GCC/rustc, Git**
 
+**Redis, Go and Rust all run real workloads here** (2026-08-17) — including the
+official `redis:alpine` image pulled from Docker Hub. See
+[Real software](#real-software) below.
+
 
 ```
                                              %#%:                +
@@ -44,6 +48,25 @@
 
 ## Capabilities
 
+### Real software
+
+Three third-party runtimes, none of them modified for Akuma, all verified
+**2026-08-17**:
+
+| | What runs | How |
+|---|---|---|
+| **Redis** | `redis-server` from Alpine apk, **and the official `redis:alpine` image pulled from Docker Hub** running in a box — `SET`/`GET` from inside the VM *and* from a macOS terminal on the host | [`docs/runbooks/run-redis.md`](docs/runbooks/run-redis.md) |
+| **Go** | **`go build` compiles and links on-target** — Go 1.26.3 from apk, a cold module build in 112 s (38 stdlib packages), and the binary runs. Go binaries also run under shared-kernel SMP: goroutines, `fork`+`exec`, pidfd, signal delivery on Go's own signal stack, network I/O | [`docs/archive/GOLANG_MISSING_SYSCALLS.md`](docs/archive/GOLANG_MISSING_SYSCALLS.md) |
+| **Rust** | Two on-target toolchains (Alpine `rustc` 1.91 + nightly musl), and Rust programs built against real async/TLS stacks — tokio, hyper, reqwest, rustls | [`docs/archive/AKUMA_SELF_HOSTING.md`](docs/archive/AKUMA_SELF_HOSTING.md) |
+
+None of these needed a "support" component. What Redis needed was four
+corrections to existing behaviour — `connect(2)` classifying TCP state before
+dialing, `writev` stopping at a short write, `/proc/self/` chasing its own
+symlink, `waitid` checking parentage — because the expensive part (CoW fork,
+`CLONE_VM`, lazy `mmap`, demand paging, signals, thread groups, 17 syscall
+families) was already built. Measurements and the cross-project comparison are in
+[`docs/archive/LINE_COUNT_ANALYSIS.md`](docs/archive/LINE_COUNT_ANALYSIS.md).
+
 **Can run a coding client and tcc on 4mb of RAM:**
 
 ```
@@ -54,7 +77,7 @@ meow -c "statically compile /akuma-playground/hello.c with /bin/tcc, put binary 
 runs inside Akuma and builds the full Akuma kernel from source — all 147 crates
 plus the final link — over a single in-VM `cargo build --release`. The resulting
 ELF boots and reaches the SSH server. *Akuma compiles Akuma, and the result runs.*
-See [`docs/AKUMA_SELF_HOSTING.md`](docs/AKUMA_SELF_HOSTING.md).
+See [`docs/archive/AKUMA_SELF_HOSTING.md`](docs/archive/AKUMA_SELF_HOSTING.md).
 
 ### Kernel
 
@@ -102,7 +125,7 @@ See [`docs/AKUMA_SELF_HOSTING.md`](docs/AKUMA_SELF_HOSTING.md).
 | Feature | Details |
 |---|---|
 | **C compiler (TCC)** | Tiny C Compiler with musl libc — compile and run C programs on-target |
-| **Rust compiler (rustc)** | Two toolchains run on-target: Alpine `rustc` 1.91 (`rustc -C linker=clang hello.rs` → runnable native binary) and a **nightly musl toolchain** with the `aarch64-unknown-none` std, which compiles and links the **entire Akuma kernel in-VM** (`cargo build --release` over a populated disk, ≥6 GB RAM). Needed in-kernel support: `MAP_SHARED` writeback for linker output, 128 KB argv strings, the futex/`exit_group` thread-group reaping fixes, and `getpriority`. See [`docs/AKUMA_SELF_HOSTING.md`](docs/AKUMA_SELF_HOSTING.md) and [`docs/RUST_TOOLCHAIN.md`](docs/RUST_TOOLCHAIN.md) |
+| **Rust compiler (rustc)** | Two toolchains run on-target: Alpine `rustc` 1.91 (`rustc -C linker=clang hello.rs` → runnable native binary) and a **nightly musl toolchain** with the `aarch64-unknown-none` std, which compiles and links the **entire Akuma kernel in-VM** (`cargo build --release` over a populated disk, ≥6 GB RAM). Needed in-kernel support: `MAP_SHARED` writeback for linker output, 128 KB argv strings, the futex/`exit_group` thread-group reaping fixes, and `getpriority`. See [`docs/archive/AKUMA_SELF_HOSTING.md`](docs/archive/AKUMA_SELF_HOSTING.md) and [`docs/archive/RUST_TOOLCHAIN.md`](docs/archive/RUST_TOOLCHAIN.md) |
 | **C compiler (Clang/GCC)** | LLVM `clang`/`clang-21` and GCC/binutils (`cc`, `ld`, `as`) from Alpine apk |
 | **JavaScript (Bun)** | Bun runtime for running JS/TS scripts |
 | **Git** | `git` from Alpine apk — `apk add git` |
@@ -116,6 +139,8 @@ See [`docs/AKUMA_SELF_HOSTING.md`](docs/AKUMA_SELF_HOSTING.md).
 | **Container manager (box)** | `box open/close/stop/ps/inspect` |
 | **AI assistant (meow)** | LLM chat client connecting to Ollama — streaming responses, filesystem and network tool calling |
 | **Package managers** | Built-in `pkg install`, plus `apk` (Alpine Linux) |
+| **Redis** | `redis-server` (Alpine package) and the official `redis:alpine` Docker Hub image in a box — see [`docs/runbooks/run-redis.md`](docs/runbooks/run-redis.md) |
+| **Go runtime** | Statically-linked Go binaries under SMP — goroutines, `fork`+`exec`, pidfd, network I/O |
 
 ## Build & Run
 

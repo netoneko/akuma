@@ -1,0 +1,9 @@
+# Load-bearing — see ../stdlib/.cargo/config.toml for why (cargo walks UP and
+# would otherwise inherit the curl probe's Alpine triple, then the repo root's
+# no_std `aarch64-unknown-none`).
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "link-arg=-static"]

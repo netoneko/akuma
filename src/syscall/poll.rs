@@ -256,27 +256,34 @@ pub fn epoll_destroy(epoll_id: u32) {
     });
 }
 
-/// No-op when epoll is gated out: there is no interest table to reset, and the
-/// net/fs drain hooks call this unconditionally. Keeping the symbol avoids
+/// No-ops when epoll is gated out: there is no interest table to reset, and the
+/// net/fs hooks call these unconditionally. Keeping the symbols avoids
 /// sprinkling `#[cfg]` across every caller in net.rs/fs.rs.
 #[cfg(not(feature = "sc-epoll"))]
-pub(super) fn epoll_on_fd_drained(_fd: u32) {}
+pub fn epoll_on_fd_drained(_fd: u32) {}
+#[cfg(not(feature = "sc-epoll"))]
+pub fn epoll_on_fd_write_blocked(_fd: u32) {}
 
-/// Called when a non-blocking socket read returns EAGAIN (socket fully drained).
-/// Resets the EPOLLET edge for this fd so the next data arrival fires a new EPOLLIN event.
-/// Without this, if new data arrives within the same 10ms poll window as the drain,
-/// the transition is missed and EPOLLIN never re-fires.
+/// Clear `bits` from the edge-triggered "already reported" mask of every epoll
+/// instance watching `fd`, so the next time those bits go ready they count as a
+/// fresh edge.
+///
+/// The `last_ready` mask exists because `sys_epoll_pwait` recomputes readiness
+/// from scratch on each pass and reports `revents & !last_ready`. It is
+/// refreshed only *inside* that loop, which means a level transition that
+/// happens and un-happens between two passes is invisible — the mask still says
+/// "already reported" and the edge never fires again. The I/O syscalls are the
+/// only code that witnesses those transitions, so they have to report them.
 #[cfg(feature = "sc-epoll")]
-pub(super) fn epoll_on_fd_drained(fd: u32) {
-    // IRQ-masked holds: this is called from the TCP recv syscalls, which under
-    // `no-bkl-network` run with the Big Kernel Lock DROPPED. A nested IRQ there
-    // does an unconditional `enter_kernel()` hard-spin; if it lands while this
-    // core holds EPOLL_TABLE and the BKL owner is blocked on EPOLL_TABLE (any
-    // epoll_wait/epoll_ctl syscall), the cores deadlock AB-BA. Masking IRQs for
-    // the (tiny) holds makes them nest-free. Harmless on all other builds.
+fn epoll_reset_edge(fd: u32, bits: u32) {
+    // IRQ-masked holds: this is called from the TCP send/recv syscalls, which
+    // under `no-bkl-network` run with the Big Kernel Lock DROPPED. A nested IRQ
+    // there does an unconditional `enter_kernel()` hard-spin; if it lands while
+    // this core holds EPOLL_TABLE and the BKL owner is blocked on EPOLL_TABLE
+    // (any epoll_wait/epoll_ctl syscall), the cores deadlock AB-BA. Masking
+    // IRQs for the (tiny) holds makes them nest-free. Harmless on other builds.
     //
-    // Snapshot IDs to avoid holding EPOLL_TABLE lock during the entire iteration
-    // (though not strictly necessary for this simple function yet, good practice)
+    // Snapshot IDs so the per-instance holds stay short and independent.
     let ids: alloc::vec::Vec<u32> = crate::irq::with_irqs_disabled(|| {
         let table = EPOLL_TABLE.lock();
         table.keys().copied().collect()
@@ -288,10 +295,48 @@ pub(super) fn epoll_on_fd_drained(fd: u32) {
             if let Some(inst) = table.get_mut(&epoll_id)
                 && let Some(entry) = inst.interest_list.get_mut(&fd)
                     && entry.events & EPOLLET != 0 {
-                        entry.last_ready &= !EPOLLIN;
+                        entry.last_ready &= !bits;
                     }
         });
     }
+}
+
+/// Called when a socket read drained the receive buffer (an `EAGAIN`, or any
+/// successful read — BoringSSL/bun read one TLS record at a time and never
+/// drain to `EAGAIN`). Re-arms the `EPOLLIN` edge so the next arrival fires.
+#[cfg(feature = "sc-epoll")]
+pub fn epoll_on_fd_drained(fd: u32) {
+    epoll_reset_edge(fd, EPOLLIN);
+}
+
+/// Called when a socket write could not take everything the caller offered —
+/// an `EAGAIN`, or a **short** write. Re-arms the `EPOLLOUT` edge.
+///
+/// This is the exact mirror of [`epoll_on_fd_drained`], and its absence was a
+/// real, reproducible hang: a client that filled the 16 KB TCP transmit buffer
+/// and then waited for `EPOLLOUT` could wait forever. The window is small but
+/// wide open —
+///
+/// 1. an `epoll_pwait` pass sees room in the transmit buffer, reports
+///    `EPOLLOUT`, and records `last_ready |= EPOLLOUT`;
+/// 2. the client writes until the buffer is full and gets a short write /
+///    `EAGAIN`, then goes back into `epoll_pwait`;
+/// 3. that call drives `smoltcp_net::poll()` at the top of its loop, which
+///    flushes the buffer to the wire, so by the time readiness is computed
+///    `can_send()` is already true again;
+/// 4. `revents & !last_ready` is therefore 0 — `EPOLLOUT` was never *observed*
+///    to go false, so no new edge is reported, and the client sleeps forever
+///    holding a half-written request.
+///
+/// Step 3 is why this is intermittent rather than deterministic: whether any
+/// pass lands while the buffer is genuinely full is a race against the flush.
+/// Reproduced 2026-08-17 with `nettest-reqwest post <url> 64` (hyper + tokio,
+/// edge-triggered mio) — 2 of 3 runs at a 64 KiB body hung with the connection
+/// ESTABLISHED and the request never delivered, while 16 KiB bodies always
+/// completed. See `docs/runbooks/debug-delayed-first-byte.md`.
+#[cfg(feature = "sc-epoll")]
+pub fn epoll_on_fd_write_blocked(fd: u32) {
+    epoll_reset_edge(fd, EPOLLOUT);
 }
 
 #[cfg(feature = "sc-epoll")]

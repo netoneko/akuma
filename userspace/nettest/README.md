@@ -1,6 +1,103 @@
-# nettest — cargo-vs-curl HTTPS divergence probe
+# nettest — guest-side network client probes
 
-Why this exists, what it tests, and how to run it, all in one place.
+Three probes live here. They exist for two different investigations, share
+nothing but a directory, and are built by two different scripts.
+
+| Probe | Directory | Client stack | Investigation | Build |
+|---|---|---|---|---|
+| `nettest` | `rust/` | libcurl (vendored, static OpenSSL + nghttp2) | cargo-vs-curl HTTPS divergence | `rust/build.sh` (Alpine docker) |
+| `nettest-std` | `rust/stdlib/` | `std::net` + `poll(2)` + sync rustls — no runtime | delayed first byte | `rust/build-musl.sh` (host cross) |
+| `nettest-reqwest` | `rust/reqwest/` | tokio + hyper 1.x + reqwest 0.12 + rustls — nca's stack | delayed first byte | `rust/build-musl.sh` (host cross) |
+
+---
+
+# Part 1 — `nettest-std` / `nettest-reqwest`: the delayed-first-byte bisect
+
+A guest client hangs when the server takes more than a few seconds to send its
+**first** response byte, while the identical request answered within ~1 s
+streams perfectly
+([`docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md`](../../docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md)).
+The only client that reproduced it was nca — tokio + hyper + reqwest + rustls +
+an agent loop — so the investigation could not say *which layer* stalls.
+
+**Outcome (2026-08-17): four kernel defects found and fixed.** A blocking TCP
+read capped at 30 s and a write at 5 s (spurious `ETIMEDOUT`);
+`SO_RCVTIMEO`/`SO_SNDTIMEO` accepted and silently dropped; the `EPOLLET` write
+edge never re-armed; and — the dominant one — a socket still in `SynSent`
+reported as read-closed (`EPOLLIN` + `EPOLLRDHUP`, `recv() == Ok(0)`), which
+made a tokio client park forever without ever sending its request. Details in
+[`docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md`](../../docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md)
+§ Resolution. The probes stay as the regression harness — in particular
+`nettest-reqwest post <url> 64` repeated a dozen times, which is what caught the
+two races.
+
+These two probes cut that stack into axes that can be tested one at a time:
+
+| probe / mode | sockets | HTTP | TLS | isolates |
+|---|---|---|---|---|
+| `nettest-std raw` | blocking `std::net` | hand-rolled | none | the kernel's blocking recv path (`socket_recv` → `wait_until`) |
+| `nettest-std poll` | nonblocking + `poll(2)` | hand-rolled | none | readiness reporting without epoll (`sys_ppoll`) |
+| `nettest-std tls` | blocking `std::net` | hand-rolled | rustls (sync) | rustls without an async runtime |
+| `nettest-reqwest get` | tokio/mio + `epoll_pwait` | hyper 1.x | rustls (async) | nca's whole stack |
+
+Both print the same `[probe]` line vocabulary, so their output diffs directly.
+
+## Build and run
+
+```bash
+# host: cross-build both -> bootstrap/bin/nettest-{std,reqwest}
+userspace/nettest/rust/build-musl.sh
+scripts/populate_disk.sh                    # -> /bin in the image
+
+# host: the timing server the probes measure against
+scripts/net_delay_server.py --port 18080 --verbose
+```
+
+In the guest (`10.0.2.2` is the host over SLIRP — no `hostfwd` rule needed):
+
+```
+nettest-std     sweep    http://10.0.2.2:18080          # delay ladder, blocking
+nettest-std     sweep    http://10.0.2.2:18080 0,5,35 poll
+nettest-std     gap      http://10.0.2.2:18080 0 20     # first byte fast, 20 s mid-stream idle
+nettest-std     rcvtimeo http://10.0.2.2:18080/delay/30 2
+nettest-std     tls      https://example.com/
+nettest-reqwest sweep    http://10.0.2.2:18080
+nettest-reqwest stream   http://10.0.2.2:18080/sse/1/10
+nettest-reqwest post     http://10.0.2.2:18080/delay/10 64
+```
+
+Both probes also build for the **development host**
+(`cargo build --release --target "$(rustc -vV | grep '^host:' | cut -d' ' -f2)"`).
+Run them there against the same delay server first: that is the control. A
+sweep that fails in the guest and passes on the host localises the fault to the
+kernel; one that fails on both is a probe or server bug.
+
+The step-by-step procedure, the result matrix, and the kernel traces to collect
+are in
+[`docs/runbooks/debug-delayed-first-byte.md`](../../docs/runbooks/debug-delayed-first-byte.md).
+The audit these probes were designed against — poll drivers, RX buffering,
+readiness predicates, and the kernel's undeclared timeouts — is
+[`docs/reference/subsystems/networking.md`](../../docs/reference/subsystems/networking.md)
+§ "The native data path".
+
+## Why these two are cross-built on the host, not in docker
+
+`rust/build-musl.sh` uses `aarch64-unknown-linux-musl` +
+`aarch64-linux-musl-gcc` — the **same toolchain `userspace/nca` uses for nca
+itself** (`userspace/nca/build.rs`). That is the design constraint, not a
+convenience: "nca hangs but the probe does not" is only informative if the two
+binaries came out of the same compiler against the same libc. The `reqwest`
+probe's dependency line is copied verbatim from nca's
+`[workspace.dependencies]` for the same reason.
+
+The curl probe below has the opposite requirement (match apk/nightly cargo's
+libcurl), which is why it keeps its own container build.
+
+---
+
+# Part 2 — `nettest`: the cargo-vs-curl HTTPS divergence probe
+
+Why this exists, what it tests, and how to run it.
 The root-cause analysis lives in
 [`docs/archive/CARGO_CRATES_IO_CONNECT_FAIL.md`](../../docs/archive/CARGO_CRATES_IO_CONNECT_FAIL.md).
 

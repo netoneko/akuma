@@ -490,8 +490,21 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
         }
     } else {
         match socket::socket_send(idx, buf, fd_is_nonblock(fd)) {
-            Ok(n) => n as u64,
-            Err(e) => neg_errno(e),
+            Ok(n) => {
+                // A short write means the transmit buffer filled. Re-arm the
+                // EPOLLET edge so the drain that follows counts as a fresh
+                // EPOLLOUT — see `epoll_on_fd_write_blocked`.
+                if n < buf.len() {
+                    super::poll::epoll_on_fd_write_blocked(fd);
+                }
+                n as u64
+            }
+            Err(e) => {
+                if e == libc_errno::EAGAIN {
+                    super::poll::epoll_on_fd_write_blocked(fd);
+                }
+                neg_errno(e)
+            }
         }
     }
 }
@@ -600,6 +613,42 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _src_
 
 pub(super) fn sys_shutdown(_fd: u32, _how: i32) -> u64 { 0 }
 
+/// AArch64 `struct timeval` — `{ time_t tv_sec; suseconds_t tv_usec; }`, both
+/// 64-bit, 16 bytes total. musl passes this shape for `SO_RCVTIMEO`/`SO_SNDTIMEO`.
+#[cfg(feature = "smoltcp")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Timeval {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+/// Read a `struct timeval` option value and convert it to microseconds.
+///
+/// Returns `Ok(None)` for an all-zero timeval, because POSIX says zero means
+/// "no timeout, block indefinitely" — NOT "time out immediately". Returns
+/// `Err(())` for a malformed or unreadable value, which the caller reports as
+/// `EINVAL`. The two nested "nothing"s mean different things, hence the
+/// `Result` rather than an `Option<Option<_>>`.
+#[cfg(feature = "smoltcp")]
+#[allow(clippy::result_unit_err)]
+fn read_timeval_us(optval: u64, optlen: u32) -> Result<Option<u64>, ()> {
+    if optval == 0 || (optlen as usize) < core::mem::size_of::<Timeval>() {
+        return Err(());
+    }
+    let mut tv = Timeval::default();
+    if read_user_into(&mut tv, optval).is_err() {
+        return Err(());
+    }
+    if tv.tv_sec < 0 || tv.tv_usec < 0 {
+        return Err(());
+    }
+    let us = (tv.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(tv.tv_usec as u64);
+    Ok(if us == 0 { None } else { Some(us) })
+}
+
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u32) -> u64 {
     let _net_bkl = NetBklGuard::new();
@@ -611,6 +660,8 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
     const SO_SNDBUF: i32 = 7;
     const SO_LINGER: i32 = 13;
     const SO_REUSEPORT: i32 = 15;
+    const SO_RCVTIMEO: i32 = 20;
+    const SO_SNDTIMEO: i32 = 21;
     const TCP_NODELAY: i32 = 1;
     const TCP_CORK: i32 = 3;
     const TCP_KEEPIDLE: i32 = 4;
@@ -645,6 +696,20 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                 }
                 SO_LINGER => {
                     0
+                }
+                // Both used to fall through to the `_` arm below: accepted,
+                // logged, and dropped. A client could not tell, because
+                // `getsockopt` had no arm for them either — so a read that the
+                // caller believed was bounded to 2 s was not bounded at all
+                // (and then died at the kernel's own hidden 30 s cap).
+                SO_RCVTIMEO | SO_SNDTIMEO => {
+                    match read_timeval_us(optval, optlen) {
+                        Ok(us) => {
+                            socket::set_socket_timeout(idx, optname == SO_RCVTIMEO, us);
+                            0
+                        }
+                        Err(()) => EINVAL,
+                    }
                 }
                 _ => {
                     crate::tprint!(128, "[setsockopt] SOL_SOCKET optname={} ignored\n", optname);
@@ -687,12 +752,44 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
     const SO_RCVBUF: i32 = 8;
     const SO_KEEPALIVE: i32 = 9;
     const SO_TYPE: i32 = 3;
+    const SO_RCVTIMEO: i32 = 20;
+    const SO_SNDTIMEO: i32 = 21;
 
     if optval == 0 || optlen == 0 { return 0; }
     let mut len: u32 = 0;
     if read_user_into(&mut len, optlen).is_err() {
         return EFAULT;
     }
+
+    // These two answer with a 16-byte `struct timeval`, not the 4-byte int
+    // every other option here uses, so they are handled before the common
+    // path. Without a readback a client cannot distinguish "honoured" from
+    // "accepted and dropped" — which is how the missing SO_RCVTIMEO
+    // implementation went unnoticed. Rust's `TcpStream::read_timeout()` is
+    // exactly this call.
+    if level == SOL_SOCKET && (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) {
+        let tv_size = core::mem::size_of::<Timeval>();
+        if (len as usize) < tv_size || !validate_user_ptr(optval, tv_size) {
+            return EFAULT;
+        }
+        let us = get_socket_from_fd(fd)
+            .and_then(|idx| socket::socket_timeout(idx, optname == SO_RCVTIMEO));
+        // No timeout is reported as an all-zero timeval, matching how POSIX
+        // spells "block indefinitely" on the way in.
+        let tv = us.map_or_else(Timeval::default, |us| Timeval {
+            tv_sec: (us / 1_000_000) as i64,
+            tv_usec: (us % 1_000_000) as i64,
+        });
+        if write_user_val(optval, &tv).is_err() {
+            return EFAULT;
+        }
+        let out_len = tv_size as u32;
+        if write_user_val(optlen, &out_len).is_err() {
+            return EFAULT;
+        }
+        return 0;
+    }
+
     if (len as usize) < 4 || !validate_user_ptr(optval, 4) { return EFAULT; }
 
     let val: i32 = if level == SOL_SOCKET {
@@ -825,8 +922,20 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
             }
         }
         match result {
-            Ok(n) => n as u64,
-            Err(e) => neg_errno(e),
+            Ok(n) => {
+                // Short write == transmit buffer filled; re-arm the EPOLLOUT
+                // edge (see `epoll_on_fd_write_blocked`).
+                if n < kernel_buf.len() {
+                    super::poll::epoll_on_fd_write_blocked(fd);
+                }
+                n as u64
+            }
+            Err(e) => {
+                if e == libc_errno::EAGAIN {
+                    super::poll::epoll_on_fd_write_blocked(fd);
+                }
+                neg_errno(e)
+            }
         }
     }
 }
@@ -1065,15 +1174,19 @@ pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
                     let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
                     // Report readable when:
                     //   - data is buffered (can_recv), OR
-                    //   - remote sent FIN and socket is still active (!may_recv && is_active):
-                    //     this causes recv() to return 0 (EOF) so the app can clean up.
+                    //   - the peer sent FIN on a connection that was UP, so that
+                    //     recv() returns 0 (EOF) and the app can clean up.
                     //
                     // Do NOT use !is_active() here: a Closed smoltcp socket (e.g. after TCP
                     // timeout or RST) would permanently signal EPOLLIN even with no data,
                     // causing the caller to spin recv() → EAGAIN → epoll → EPOLLIN → ...
                     // Instead, a fully-dead socket is reported via EPOLLHUP in
                     // epoll_check_fd_readiness.
-                    s.can_recv() || (s.is_active() && !s.may_recv())
+                    //
+                    // The `is_active() && !may_recv()` pair this used to test was ALSO true
+                    // in SynSent, so a socket mid-handshake was advertised as readable-at-EOF
+                    // — see `tcp_reached_established`, which is what makes the difference.
+                    akuma_net::socket::tcp_recv_ready(s.can_recv(), s.may_recv(), s.state())
                 }).unwrap_or(false)
             }
             socket::SocketType::Listener { handles, .. } => {
@@ -1121,13 +1234,18 @@ pub(super) fn socket_is_dead_tcp(idx: usize) -> bool {
 
 /// Returns true when the remote peer has closed its write side (sent FIN).
 /// Used to report EPOLLRDHUP — signals to libuv that recv() will return EOF.
+///
+/// The `tcp_reached_established` guard is what keeps this from firing on a
+/// socket that is still shaking hands: `may_recv()` is false in SynSent too, so
+/// the bare `!may_recv()` this used to be announced "peer closed its write
+/// half" on connections the peer had not yet accepted.
 #[cfg(feature = "smoltcp")]
 pub(super) fn socket_peer_closed_tcp(idx: usize) -> bool {
     socket::with_socket(idx, |sock| {
         if let socket::SocketType::Stream(h) = &sock.inner {
             akuma_net::smoltcp_net::with_network(|net| {
                 let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
-                !s.may_recv()
+                !s.may_recv() && akuma_net::socket::tcp_reached_established(s.state())
             }).unwrap_or(false)
         } else {
             false
@@ -1156,6 +1274,111 @@ pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> 
         // (matches how getaddrinfo's EAI_NONAME maps to ENOENT-flavored errors
         // and is much more useful to userspace than a generic -EPERM).
         Err(_) => ENOENT,
+    }
+}
+
+#[cfg(all(kernel_tests, feature = "smoltcp"))]
+/// Regression for `SO_RCVTIMEO`/`SO_SNDTIMEO` being accepted and dropped.
+///
+/// Both used to fall through `sys_setsockopt`'s catch-all arm, which returns
+/// success and does nothing, and `sys_getsockopt` had no arm for them at all —
+/// so a client could not even detect the loss. Meanwhile the blocking paths
+/// carried hardcoded caps (30 s recv, 5 s send), so a read the caller believed
+/// was bounded to 2 s actually died at 30 s with ETIMEDOUT. Measured
+/// 2026-08-17 with `nettest-std rcvtimeo`: readback NONE, fired at 30041 ms.
+///
+/// Checks the full round trip plus the two POSIX corners: the default is "no
+/// timeout", and a zero timeval means "block indefinitely" — not "expire
+/// immediately".
+pub fn run_socket_timeout_tests() {
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
+
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+
+    const SOL_SOCKET: i32 = 1;
+    const SO_RCVTIMEO: i32 = 20;
+    const SO_SNDTIMEO: i32 = 21;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+    struct Timeval { tv_sec: i64, tv_usec: i64 }
+    let tv_len = core::mem::size_of::<Timeval>() as u32;
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 8032u32;
+    register_process(pid, crate::process_tests::make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    let Some(idx) = socket::alloc_socket(socket::socket_const::SOCK_STREAM) else {
+        unregister_thread_pid(tid);
+        unregister_process(pid);
+        crate::safe_print!(128, "[Test] socket_timeout_option_roundtrip SKIPPED (no socket slots)\n");
+        return;
+    };
+    let proc = akuma_exec::process::current_process_shared().unwrap();
+    let fd = proc.alloc_fd(FileDescriptor::Socket(idx));
+
+    let mut readback = Timeval::default();
+    let mut len_io: u32 = tv_len;
+
+    // Default: no timeout, reported as an all-zero timeval.
+    let rc_default = sys_getsockopt(
+        fd, SOL_SOCKET, SO_RCVTIMEO,
+        &raw mut readback as u64, &raw mut len_io as u64);
+    let default_unset = rc_default == 0 && readback == Timeval::default()
+        && socket::socket_timeout(idx, true).is_none();
+
+    // 2.5 s round trip.
+    let mut want = Timeval { tv_sec: 2, tv_usec: 500_000 };
+    let rc_set = sys_setsockopt(
+        fd, SOL_SOCKET, SO_RCVTIMEO, &raw mut want as u64, tv_len);
+    readback = Timeval::default();
+    len_io = tv_len;
+    let rc_get = sys_getsockopt(
+        fd, SOL_SOCKET, SO_RCVTIMEO, &raw mut readback as u64, &raw mut len_io as u64);
+    let roundtrip = rc_set == 0 && rc_get == 0 && readback == want
+        && socket::socket_timeout(idx, true) == Some(2_500_000);
+
+    // A zero timeval means "block indefinitely" (POSIX), not "expire now".
+    let mut zero = Timeval::default();
+    let rc_zero = sys_setsockopt(
+        fd, SOL_SOCKET, SO_RCVTIMEO, &raw mut zero as u64, tv_len);
+    let zero_means_forever = rc_zero == 0 && socket::socket_timeout(idx, true).is_none();
+
+    // Send side is stored independently of the receive side.
+    let mut snd = Timeval { tv_sec: 7, tv_usec: 0 };
+    let rc_snd = sys_setsockopt(
+        fd, SOL_SOCKET, SO_SNDTIMEO, &raw mut snd as u64, tv_len);
+    let send_independent = rc_snd == 0
+        && socket::socket_timeout(idx, false) == Some(7_000_000)
+        && socket::socket_timeout(idx, true).is_none();
+
+    // `sys_close`, not a bare `remove_socket`: the fd must leave the table with
+    // the socket reference it holds. Calling `remove_socket(idx)` directly and
+    // leaving the fd behind drops the socket now and drops it AGAIN when the
+    // test process is reaped — by which time the freed slot belongs to someone
+    // else. That is not hypothetical: the first draft of this test did exactly
+    // that and silently destroyed sshd's listener sockets, so every subsequent
+    // connection was answered with a RST
+    // (`kex_exchange_identification: read: Connection reset by peer`) while
+    // sshd sat in a healthy accept loop. `KernelSocket::refs` exists for this
+    // hazard; a test must not route around it.
+    let _ = super::fs::sys_close(fd);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if default_unset && roundtrip && zero_means_forever && send_independent {
+        crate::safe_print!(
+            160,
+            "[Test] socket_timeout_option_roundtrip PASSED (SO_RCVTIMEO/SO_SNDTIMEO set+get, zero=forever, sides independent)\n"
+        );
+    } else {
+        crate::safe_print!(
+            192,
+            "[Test] socket_timeout_option_roundtrip FAILED: default_unset={} roundtrip={} zero_forever={} send_independent={}\n",
+            default_unset, roundtrip, zero_means_forever, send_independent
+        );
+        panic!("SO_RCVTIMEO/SO_SNDTIMEO regression");
     }
 }
 

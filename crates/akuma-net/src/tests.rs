@@ -278,3 +278,91 @@ mod connect_state_tests {
         assert_ne!(bind_port_for(0, || 49152), 0);
     }
 }
+
+/// `tcp_reached_established` / `tcp_recv_ready` — the predicate that separates
+/// "the peer closed the read side" from "the handshake has not finished yet".
+///
+/// smoltcp answers both with `may_recv() == false`, so before this existed a
+/// socket in `SynSent` was reported readable-at-EOF and RDHUP, and a
+/// non-blocking `recv` on it returned `Ok(0)`. A client that polled inside the
+/// SYN window concluded the connection was dead and parked forever without
+/// sending its request — an intermittent hang, one SLIRP round trip wide. See
+/// `docs/runbooks/debug-delayed-first-byte.md`.
+#[cfg(feature = "smoltcp")]
+mod recv_eof_state_tests {
+    use crate::socket::{tcp_reached_established, tcp_recv_ready};
+    use smoltcp::socket::tcp::State;
+
+    /// The four states a connection can be in *before* it has ever carried
+    /// data. `!may_recv()` in any of them means "not yet", never "no more".
+    const PRE_ESTABLISHED: [State; 4] =
+        [State::Closed, State::Listen, State::SynSent, State::SynReceived];
+
+    /// Every state reachable only after the handshake completed. `!may_recv()`
+    /// here is a real end-of-stream.
+    const POST_ESTABLISHED: [State; 7] = [
+        State::Established,
+        State::FinWait1,
+        State::FinWait2,
+        State::CloseWait,
+        State::Closing,
+        State::LastAck,
+        State::TimeWait,
+    ];
+
+    #[test]
+    fn pre_established_states_are_not_established() {
+        for s in PRE_ESTABLISHED {
+            assert!(!tcp_reached_established(s), "{s:?} must not count as established");
+        }
+    }
+
+    #[test]
+    fn post_established_states_are_established() {
+        for s in POST_ESTABLISHED {
+            assert!(tcp_reached_established(s), "{s:?} must count as established");
+        }
+    }
+
+    /// The regression itself: a connecting socket with no data must be NOT
+    /// ready, so the poller stays quiet and `recv` answers EAGAIN rather than
+    /// handing back a phantom EOF.
+    #[test]
+    fn a_connecting_socket_with_no_data_is_not_readable() {
+        for s in PRE_ESTABLISHED {
+            assert!(
+                !tcp_recv_ready(false, false, s),
+                "{s:?} with no buffered data must not be readable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_fin_is_readable_so_recv_can_report_eof() {
+        for s in POST_ESTABLISHED {
+            assert!(
+                tcp_recv_ready(false, false, s),
+                "{s:?} with the read side finished must be readable for the EOF"
+            );
+        }
+    }
+
+    /// Buffered data outranks every state question — including a SYN-window
+    /// socket that somehow already has bytes, and a half-closed one draining
+    /// its receive buffer.
+    #[test]
+    fn buffered_data_is_always_readable() {
+        for s in PRE_ESTABLISHED.iter().chain(POST_ESTABLISHED.iter()) {
+            assert!(tcp_recv_ready(true, false, *s), "{s:?} with data must be readable");
+            assert!(tcp_recv_ready(true, true, *s), "{s:?} with data must be readable");
+        }
+    }
+
+    /// A live connection with an open read side and nothing buffered is simply
+    /// not ready — the ordinary "wait for more" case.
+    #[test]
+    fn an_open_idle_connection_is_not_readable() {
+        assert!(!tcp_recv_ready(false, true, State::Established));
+        assert!(!tcp_recv_ready(false, true, State::FinWait1));
+    }
+}

@@ -31,6 +31,10 @@ pub fn run_network_tests() {
     test_epoll_socket_waker();
     test_epoll_poll_socket_readiness_no_deadlock();
     test_epoll_check_fd_readiness_unknown_fd();
+    test_epoll_edge_rearm_symmetry();
+
+    #[cfg(all(kernel_tests, feature = "smoltcp"))]
+    crate::syscall::run_socket_timeout_tests();
 
     #[cfg(feature = "smoltcp")]
     test_socket_refcount_survives_first_close();
@@ -10815,6 +10819,106 @@ fn test_epoll_check_fd_readiness_unknown_fd() {
             "[Test] test_epoll_check_fd_readiness_unknown_fd FAILED: got 0x{:x} expected 0x{:x}\n",
             result, EPOLLHUP | EPOLLERR
         );
+    }
+}
+
+
+/// Regression for the EPOLLET write-edge hang (2026-08-17).
+///
+/// `sys_epoll_pwait` reports `revents & !last_ready` for an edge-triggered fd
+/// and refreshes `last_ready` only inside its own loop. A level transition that
+/// happens and un-happens *between* two passes is therefore invisible, and the
+/// edge never fires again. The I/O syscalls are the only code that witnesses
+/// those transitions, so they must report them — `epoll_on_fd_drained` for
+/// EPOLLIN, `epoll_on_fd_write_blocked` for EPOLLOUT.
+///
+/// The read half existed and the write half did not, which made a client that
+/// filled the 16 KB TCP transmit buffer and then waited for EPOLLOUT wait
+/// forever. Measured with `nettest-reqwest post <url> 64` (hyper + tokio,
+/// edge-triggered mio): 2 of 3 runs hung with the connection ESTABLISHED and
+/// the request never delivered.
+///
+/// A pipe stands in for a socket here on purpose: both go through
+/// `epoll_check_fd_readiness`, and the defect is in the shared `last_ready`
+/// bookkeeping, not in anything socket-specific. That keeps the test
+/// deterministic — no peer, no timing, no network.
+fn test_epoll_edge_rearm_symmetry() {
+    use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
+    use crate::syscall::pipe::{pipe_create, pipe_write};
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
+
+    // epoll_event buffers below are kernel stack addresses — EL1-only in any
+    // user address space, so epoll_ctl/epoll_pwait would reject them. Same
+    // reason every other epoll test here takes this guard.
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+
+    const EPOLLIN: u32 = 0x001;
+    const EPOLLOUT: u32 = 0x004;
+    const EPOLLET: u32 = 1 << 31;
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 8031u32;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    let pipe_id = pipe_create();
+    let proc = akuma_exec::process::current_process_shared().unwrap();
+    let fd_w = proc.alloc_fd(FileDescriptor::PipeWrite(pipe_id));
+    let fd_r = proc.alloc_fd(FileDescriptor::PipeRead(pipe_id));
+
+    let epfd = sys_epoll_create1(0);
+    let mut out = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 2];
+
+    // ---- write edge -------------------------------------------------------
+    let mut evw = crate::syscall::poll::EpollEvent { events: EPOLLET | EPOLLOUT, _pad: 0, data: 1 };
+    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd_w, &raw mut evw as usize);
+
+    // Pass 1: an empty pipe is writable, so the edge fires and is recorded.
+    let first = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    // Pass 2: still writable, but already reported — an edge must NOT repeat.
+    let second = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    // The syscall a blocked writer makes on a short write / EAGAIN. Before the
+    // fix nothing called this and the next pass stayed silent forever.
+    crate::syscall::poll::epoll_on_fd_write_blocked(fd_w);
+    let third = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+
+    sys_epoll_ctl(epfd as u32, 2 /* DEL */, fd_w, core::ptr::null_mut::<u8>() as usize);
+
+    // ---- read edge (the half that already worked — guard the refactor) -----
+    let mut evr = crate::syscall::poll::EpollEvent { events: EPOLLET | EPOLLIN, _pad: 0, data: 2 };
+    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd_r, &raw mut evr as usize);
+    let _ = pipe_write(pipe_id, b"x");
+    let r_first = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    let r_second = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    crate::syscall::poll::epoll_on_fd_drained(fd_r);
+    let r_third = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+
+    // Close through `sys_close`, NOT by dropping the fds on the floor. An fd
+    // left in the fd table is closed AGAIN when the process is reaped, and that
+    // second close lands on whatever now owns the recycled id — which is how
+    // the first draft of the sibling socket test destroyed sshd's listener
+    // moments after the suite handed the slot over. `sys_close` removes the
+    // table entry and releases the resource exactly once.
+    let _ = crate::syscall::fs::sys_close(fd_w);
+    let _ = crate::syscall::fs::sys_close(fd_r);
+    let _ = crate::syscall::fs::sys_close(epfd as u32);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    let write_ok = first == 1 && second == 0 && third == 1;
+    let read_ok = r_first == 1 && r_second == 0 && r_third == 1;
+    if write_ok && read_ok {
+        crate::safe_print!(
+            160,
+            "[Test] epoll_edge_rearm_symmetry PASSED (EPOLLOUT + EPOLLIN edges both re-arm after a blocked write / drained read)\n"
+        );
+    } else {
+        crate::safe_print!(
+            192,
+            "[Test] epoll_edge_rearm_symmetry FAILED: write(fire={} repeat={} rearm={}) read(fire={} repeat={} rearm={}) — each want (1,0,1)\n",
+            first, second, third, r_first, r_second, r_third
+        );
+        panic!("epoll edge re-arm regression");
     }
 }
 

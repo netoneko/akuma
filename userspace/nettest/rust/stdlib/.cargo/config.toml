@@ -1,0 +1,16 @@
+# Load-bearing. Cargo walks UP from the crate directory collecting config, so
+# without this file the probe inherits `../.cargo/config.toml` (the curl
+# probe's `aarch64-alpine-linux-musl`, which only exists inside the Alpine
+# container) and, above that, the repo root's `aarch64-unknown-none` (the
+# no_std kernel target, which has no `std`). Either one fails the build.
+#
+# `aarch64-unknown-linux-musl` is the same triple `userspace/nca` cross-builds
+# nca with — that is the point: the reqwest probe, this probe, and the real nca
+# binary must be the same toolchain output so a behavioural difference between
+# them is a difference in the CLIENT, not in the build.
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "link-arg=-static"]

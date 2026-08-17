@@ -2,14 +2,11 @@
 
 **This is a living document, not a historical record.** Unlike most of
 `docs/archive/`, the numbers and analysis below are kept current — re-measured
-and rewritten in place whenever the tree changes enough to matter, most
-recently **2026-08-14** (top-line only — see the re-measurement block below;
-the per-area table is still the 2026-08-10 figure). It's used as a real
-competitive comparison against other
-kernels, so stale numbers here aren't "history," they're just wrong. Past
-snapshots (the original 2026-08-07 measurement at commit `d3f28d6`, the
-2026-08-10 in-kernel-SSH/shell/editor removal, the 2026-08-10 multikernel
-removal) live in git history and in
+and rewritten in place whenever the tree changes enough to matter. It's used as a
+real competitive comparison against other kernels, so stale numbers here aren't
+"history," they're just wrong — replace them, don't stack a new dated block on top.
+Past snapshots live in git history (`git log -p` this file), and the two 2026-08-10
+removals have their own write-ups in
 [`TRIM_FAT_MULTIKERNEL.md`](TRIM_FAT_MULTIKERNEL.md) /
 [`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md) if you need the delta at a
 specific commit.
@@ -22,83 +19,30 @@ Companion doc: the profile/image-size half of this investigation — what a
 profile's *bytes* cost, which is a different question with a different answer —
 lives in [`reference/build-profiles.md`](../reference/build-profiles.md).
 
-> ## Re-measured 2026-08-14, branch `trim-some-more-fat`, commit `9f7110b`
->
-> ```
-> scripts/cloc_akuma.py --vs ebfb73f       # the --vs/--rev flags were added for this
-> ```
->
-> | bucket | `ebfb73f` (2026-08-10) | `9f7110b` (2026-08-14) | delta |
-> |---|---:|---:|---:|
-> | **Production code** | 38,579 | **39,021** | **+442** |
-> | Test code | 24,680 | 26,630 | +1,950 |
-> | Comments | 22,073 | 25,063 | +2,990 |
-> | Files | 131 | 149 | +18 |
->
-> **Production code went UP 442 lines (+1.1%) across a period of work called
-> "trim the fat", and that is not a contradiction.** The accounting:
->
-> | | prod code |
-> |---|---:|
-> | three new extracted crates (`akuma-pmm` 1,039, `akuma-virtio` 858, `akuma-primitives` 513) | **+2,410** |
-> | the components they were extracted *from* (`src` −1,670, `akuma-exec` −467, `akuma-net` −105, `akuma-rump` −10) | **−2,252** |
-> | genuinely new code in existing components (`akuma-isolation` +235, `src/syscall` +24, `akuma-vfs` +21, …) | **+284** |
-> | **net** | **+442** |
->
-> So **extraction cost +158 lines across 2,252 moved** — about 7%, which is the
-> `Cargo.toml` / `lib.rs` / public API / runtime-injection glue a standalone
-> `no_std` crate needs, plus the forwarding shim left behind (`src/pmm.rs` is now
-> 153 lines that used to be 898). The other +284 is real new production code and
-> was never a refactor.
->
-> **Beware the filename-based prod/test split — it gets this backwards.** Counting
-> production as "everything not in `*_tests.rs`/`tests/`" reports the `akuma-pmm`
-> extraction as **+501 production lines**; attributing its inline
-> `#[cfg(test)] mod tests` correctly gives **+221**. Extraction into a
-> host-testable crate is exactly the move that relocates test code *into* a
-> production-named file, so a naive counter reads a test-coverage win as
-> production bloat. [`scripts/cloc_akuma.py`](../../scripts/cloc_akuma.py) has
-> always handled this (it evaluates `cfg` predicates rather than trusting
-> filenames); what it lacked, and now has, is `--rev`/`--vs` so the comparison can
-> be made at all without checking out two trees.
->
-> The real story of this period is the bottom two rows of the first table: **test
-> code +1,950 and comments +2,990 against production +442.** Extracting
-> `pmm`/`primitives`/`virtio` into host-testable crates is what bought those, and
-> it is what the work was for.
->
-> **The per-area table and the ratios below are still the `ebfb73f` measurement**
-> and have not been re-derived — the area groupings are file-pattern based and
-> three new crates need placing. Treat the body's `38,579` / `24,680` as the
-> 2026-08-10 snapshot until that is redone.
+**Current measurement: 2026-08-17.** `scripts/cloc_akuma.py src crates`.
 
-**Measured 2026-08-10, branch `better-sshd-and-networking`, commit `ebfb73f`**
-(`scripts/cloc_akuma.py src crates`).
-
-**Cumulative reduction since the original 2026-08-07 measurement (48,942
-production lines at commit `d3f28d6`): −10,363 lines of production code
-(−21.2%)**, in two cuts on the same day:
+**Cumulative reduction since the first measurement (48,942 production lines):
+−9,057 lines of production code**, from two cuts made on 2026-08-10 and partly
+given back by later work:
 1. **In-kernel SSH server, shell, editor, `async_fs`, and all kernel-side
-   TLS/cryptography deleted** (48,942 → 42,320; −6,622, −13.5%) — see
-   [`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md). Four crates went with
-   it (`akuma-ssh`, `akuma-shell`, `akuma-editor` deleted; `akuma-ssh-crypto`
-   moved to `userspace/`, out of this doc's scope).
+   TLS/cryptography deleted** (−6,622) — see
+   [`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md). Four crates went with it
+   (`akuma-ssh`, `akuma-shell`, `akuma-editor` deleted; `akuma-ssh-crypto` moved
+   to `userspace/`, out of this doc's scope).
 2. **The multikernel (one-kernel-per-core, `smp`/`cfg(kernel_smp)`) deleted in
-   full** (42,320 → 38,579; −3,741, −8.8%) — `src/smp.rs`, the `akuma-smp`
-   crate, `FileDescriptor::RemoteFd`/`RemoteKind`, the
+   full** (−3,741) — `src/smp.rs`, the `akuma-smp` crate,
+   `FileDescriptor::RemoteFd`/`RemoteKind`, the
    `prepare_user_address_space`/`remote_fd_close` runtime hooks, the two
-   `spawn_process_from_image*` entry points, and every `cfg(kernel_smp)` guard
-   in the syscall layer. See
-   [`TRIM_FAT_MULTIKERNEL.md`](TRIM_FAT_MULTIKERNEL.md) for the full
-   accounting and rationale.
+   `spawn_process_from_image*` entry points, and every `cfg(kernel_smp)` guard in
+   the syscall layer. See [`TRIM_FAT_MULTIKERNEL.md`](TRIM_FAT_MULTIKERNEL.md).
 
-Every number in the body below is the **current** measurement (post both
-cuts). If you're trying to reconstruct a prior snapshot, use `git log -p` on
-this file rather than looking for it inline.
+Since those cuts, three crates were extracted into host-testable form and real new
+code landed, taking production back up to its current figure — see
+[Stat 6](#stat-6-extraction-costs-about-7-and-a-naive-counter-reads-it-as-bloat).
 
 > Every Akuma number here is measured. Every number about *another* kernel is a
-> recalled approximation, marked `~`, and should be re-measured before being
-> cited anywhere. No other kernel's source was available in this session.
+> public or recalled figure, marked as such, and should be re-checked before being
+> cited anywhere.
 
 ---
 
@@ -121,7 +65,7 @@ counter calls code (it is part of a string token) and cloc calls blank.
 ### Scope limit: first-party only
 
 Every count below covers `src/` + `crates/` and **nothing else**. Akuma links
-third-party Rust — none of it appears in the 38,579 figure while all of it
+third-party Rust — none of it appears in the 39,885 figure while all of it
 ships in the image — but the dependency footprint itself is now small enough
 to enumerate in full, not just gesture at: **10 unique external crates across
 the whole workspace** (`smoltcp`, `virtio-drivers`, `talc`, `fdt`, `arm_pl031`,
@@ -138,7 +82,7 @@ scheduling) it implements itself rather than pulling in.
 The byte measurements show how large the remaining gap is. In the `size`
 image, the `smoltcp` group is entirely dependency code contributing zero lines
 to this count while shipping in the image, with more dependency code (talc,
-virtio-drivers, fdt) folded into the unattributed remainder. So "38.6k lines"
+virtio-drivers, fdt) folded into the unattributed remainder. So "39.9k lines"
 describes *the code this project maintains*, not the code it ships. Both are
 legitimate numbers; they answer different questions, and only the first one is
 measured here. See [Planned: Linked Code Size](#planned-linked-code-size-lcs).
@@ -149,49 +93,88 @@ measured here. See [Planned: Linked Code Size](#planned-linked-code-size-lcs).
 
 ```
 Language                   files     blank   comment      code    % test
-Rust                         119     10377     21995     62884     39.2%
-Markdown                       5       143         0       281      0.0%
-TOML                           7        22        78        94      0.0%
-SUM                          131     10542     22073     63259     39.0%
+Rust                         139     11252     27872     67314     41.4%
+Markdown                       5       143         0       284      0.0%
+TOML                          10        32       110       132      0.0%
+SUM                          154     11427     27982     67730     41.1%
 ```
 
 | bucket | files | blank | comment | code |
 |---|---|---|---|---|
-| Production | 116 | 5,643 | 15,410 | **38,579** |
-| Tests | 15 | 4,899 | 6,663 | **24,680** |
+| Production | 139 | 6,022 | 19,811 | **39,885** |
+| Tests | 15 | 5,405 | 8,171 | **27,845** |
 
-- comment / code = **34.9%**
-- test code / production code = **0.64x**
-- 95,874 physical lines
+- comment / code = **41.3%**
+- test code / production code = **0.70x**
+- 107,139 physical lines
 
-Production code by area (all 38,579 production lines accounted for — unlike
-the original 2026-08-07 table, this one folds each crate's `Cargo.toml`/
-`README.md` into its own area rather than leaving them unattributed):
+Production code by area. Every one of the 154 production files is assigned by
+explicit rule, an assertion checks that none is left unassigned, and the rows sum to
+the measured **39,885**. The eleven areas match
+[`BUG_FIX_LIST.md`](BUG_FIX_LIST.md)'s subsystem categories so the two ledgers can
+be cross-referenced (see
+[Stat 7](#stat-7-bug-density-per-area-and-why-the-grouping-decides-the-answer)):
 
 | area | prod code | share |
-|---|---|---|
-| Process / threads / MM | 14,720 | 38.2% |
-| Syscall layer | 9,022 | 23.4% |
-| CPU / exceptions / SMP | 4,406 | 11.4% |
-| Networking | 3,580 | 9.3% |
-| Filesystems / VFS | 3,534 | 9.2% |
-| Boot / drivers / misc | 3,053 | 7.9% |
-| Editor + terminal | 264 | 0.7% |
+|---|---:|---:|
+| Scheduler & Process | 10,019 | 25.1% |
+| Syscall / ABI | 5,933 | 14.9% |
+| Memory & VM | 4,709 | 11.8% |
+| Networking | 4,516 | 11.3% |
+| VFS & Filesystem | 4,006 | 10.0% |
+| Signals & Exceptions | 3,317 | 8.3% |
+| Boot & Drivers | 2,986 | 7.5% |
+| SMP & Locking | 2,099 | 5.3% |
+| Containers | 1,114 | 2.8% |
+| Console & Terminal | 911 | 2.3% |
+| Misc / cross-cutting | 275 | 0.7% |
+| **total** | **39,885** | **100%** |
 
-Grouping: `akuma-exec` + `allocator.rs`/`pmm.rs`/`syscall/mem.rs` +
-`akuma-isolation` → process/MM; `src/syscall/` (minus `mem.rs`) → syscall
-layer; `exceptions.rs`/`smp_shared.rs`/`irq.rs`/`gic*`/`timer*`/
-`kernel_timer.rs` → CPU; `akuma-net`/`akuma-rump`/`rump_proxy.rs` →
-networking; `akuma-ext2`/`akuma-vfs`/`src/vfs/` → filesystems. **Shell** and
-**SSH server (in kernel)** were their own rows through 2026-08-09 (3,425 and
-2,427 lines); both are now **0** and dropped from the table — see
-[`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md). **`akuma-smp`** fed the
-CPU row through 2026-08-10; also **0** now — see
+Grouping rules, and the judgment calls they embed:
+
+- **Memory & VM** — `akuma-pmm`, `allocator.rs`, `pmm.rs`, `file_page_cache.rs`,
+  `akuma-exec/src/mmu/`, `syscall/mem.rs`.
+- **Scheduler & Process** — `akuma-exec` `threading/` + `process/` + `elf/` and the
+  crate root, plus `syscall/proc.rs`. The largest area, and the one the old
+  grouping merged with memory into a single 38% row.
+- **Syscall / ABI** — `src/syscall/` minus the files claimed by another area
+  (`mem.rs`, `proc.rs`, `net.rs`, `term.rs`, `container.rs`, `signal.rs`).
+- **SMP & Locking** — `smp_shared.rs`, `bkl_profile.rs`, `akuma-exec` `sync.rs` /
+  `bkl.rs` / `bkl_model.rs` / `bkl_guard.rs`, `akuma-net/src/locks.rs`, and the
+  `akuma-primitives` preempt/irq/once/toggled-guard leaves.
+- **Signals & Exceptions** — `exceptions.rs`, `syscall/signal.rs`,
+  `threading/sigframe.rs`, `process/signal.rs`. **This is the mapping's most
+  consequential call**: `exceptions.rs` alone is 2,767 lines, and the SMP/BKL
+  campaigns were *investigated* as concurrency work while *landing* as edits
+  inside it. Filing it here rather than under SMP & Locking swings that area's
+  bug density by a factor of ~3.8 — see Stat 6.
+- **Networking** — `akuma-net`, `akuma-rump`, `rump_proxy.rs`, `syscall/net.rs`.
+- **VFS & Filesystem** — `akuma-ext2`, `akuma-vfs`, `src/vfs/`, `fs.rs`,
+  `primitives/inode_pin.rs`.
+- **Containers** — `akuma-isolation`, `akuma-exec/src/box_mod/`,
+  `syscall/container.rs`. Its own row now; the old grouping folded it into
+  process/MM.
+- **Console & Terminal** — `akuma-terminal`, `console.rs`, `syscall/term.rs`,
+  `primitives/console.rs`. Formerly "Editor + terminal".
+- **Boot & Drivers** — `main.rs`, `boot.rs`, `gic*`, `timer*`, `irq.rs`,
+  `ramfb.rs`, `fw_cfg.rs`, `akuma-virtio`, and the primitives mmio/clock/addr
+  leaves.
+- **Misc / cross-cutting** — `config.rs` and the remaining `akuma-primitives`
+  scaffolding.
+
+**Shell** and **SSH server (in kernel)** were their own rows through 2026-08-09
+(3,425 and 2,427 lines); both are **0** — see
+[`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md). **`akuma-smp`** fed the CPU
+row through 2026-08-10; also **0** — see
 [`TRIM_FAT_MULTIKERNEL.md`](TRIM_FAT_MULTIKERNEL.md).
+
+Reproduce with `scripts/cloc_akuma.py src crates --json` and the assignment rules
+above; the exact rule table used for this measurement is recorded in
+[`600_BUGS_ANNIVERSARY.md`](600_BUGS_ANNIVERSARY.md) § "The central finding".
 
 ---
 
-## Stat 1: 38.6k lines of production code
+## Stat 1: 39.9k lines of production code
 
 **Reading A — "that's a lot for one kernel."** True against the teaching-OS
 reference points most people carry:
@@ -200,7 +183,7 @@ reference points most people carry:
 |---|---|---|
 | xv6-riscv | ~6–7k C (kernel) | no |
 | seL4 (verified core) | ~10k C | no (microkernel; needs a userland OS personality) |
-| Akuma | 38,579 Rust (first-party) | yes |
+| Akuma | 39,885 Rust (first-party) | yes |
 | Linux | ~30M+ | it *is* the reference |
 
 **Reading B — "it's small for what it does," and this is the one that holds.**
@@ -218,6 +201,24 @@ demand paging, thread groups, signals. The syscall layer (9,022 lines, 23.4%) is
 the kernel is the cost of the Linux ABI, and the ABI is the entire point: it's
 why unmodified musl binaries run.
 
+**The workloads are the sharpest evidence for this.** As of 2026-08-17 the kernel
+runs, unmodified: **Redis** (the Alpine package *and* the official `redis:alpine`
+image pulled from Docker Hub, in a box, reachable from the host —
+[`REDIS_END_TO_END.md`](REDIS_END_TO_END.md)), **Go** (`go build` compiles and links
+on-target: Go 1.26.3 from apk, cold module build 112 s over 38 stdlib packages, warm
+14 s, binary runs — [`GOLANG_MISSING_SYSCALLS.md`](GOLANG_MISSING_SYSCALLS.md)
+§ Milestone Status), and **Rust** (two on-target toolchains; the nightly one builds
+this kernel in-VM and the result boots —
+[`AKUMA_SELF_HOSTING.md`](AKUMA_SELF_HOSTING.md)).
+
+None of those needed a "support" component. Redis needed four corrections to
+existing behaviour — `connect(2)` classifying TCP state before dialing,
+`sys_writev` stopping at a short write, `/proc/self/` chasing its own symlink,
+`waitid` checking parentage — because the expensive part was already built and is
+already counted here. A feature-count reading of this codebase would predict a
+"Redis support" component; there isn't one, and that is a claim about *what kind of
+code* the line count is made of.
+
 So the honest framing is that **line count tracks ABI surface, not feature
 count**, and a fair yardstick has to be a kernel that runs an unmodified Linux
 userspace. Against xv6 the number looks bloated; against anything that hosts a
@@ -233,12 +234,12 @@ Figures below are from public sources (linked at the end of this section);
 | Project | Started | Language / shape | Size | Capability high-water mark | Hosts a Rust toolchain? |
 |---|---|---|---|---|---|
 | **Redox** | 2015 | Rust, microkernel | kernel <30k–50k lines (own docs vary) | `relibc`; Linux-compatible at API *and* syscall-ABI level; COSMIC desktop | **Yes — Jan 2026.** rustc + cargo run natively; can build Rust CLI/TUI programs; first merge request submitted from inside Redox. Third attempt; ~10.5 years from project start |
-| **Asterinas** | ~2022 | Rust, framekernel (monolithic address space, safe-Rust services) | **>100K lines Rust, 50+ contributors** | 210+ Linux syscalls (230+ by 0.18); Ext2/exFAT32/overlay, TCP/UDP/Unix; Nginx 1.26.2, Redis 7.0.15, SQLite 3.46.1 at ~Linux parity (Nginx *faster*: 22,912 vs 19,227 rps); TCB 14.0%. As of 0.18.0 (2026-06-09), 100+ NixOS packages verified including **Firefox** (needed new kernel support: `ARCH_GET_GS`/`ARCH_SET_GS`) and QEMU | **Not established either way.** The ATC'25 paper says no compiler ran on it then; the 0.18.0 release notes (checked 2026-08-10) confirm Firefox now runs but say nothing about rustc/cargo/gcc — Linux-userspace breadth has grown a lot since the paper, compiler-hosting specifically is unconfirmed |
+| **Asterinas** | ~2022 | Rust, framekernel (monolithic address space, safe-Rust services) | **>100K lines Rust, 50+ contributors** | 210+ Linux syscalls (230+ by 0.18); Ext2/exFAT32/overlay, TCP/UDP/Unix; Nginx 1.26.2, Redis 7.0.15, SQLite 3.46.1 at ~Linux parity (Nginx *faster*: 22,912 vs 19,227 rps). **Entirely safe Rust at the service layer** — all `unsafe` is confined to one library (OSTD, ~15k lines = TCB 14.0%, comparable in size to seL4's verified core), which is the only part they formally verify (Verus, with CertiK) and only for memory safety; concurrency and logic bugs are chased with model checking (Converos) and tests instead, with logic-level verification stated as aspirational. As of 0.18.0 (2026-06-09), 100+ NixOS packages verified including **Firefox** (needed new kernel support: `ARCH_GET_GS`/`ARCH_SET_GS`) and QEMU | **Not established either way.** The ATC'25 paper says no compiler ran on it then; the 0.18.0 release notes (checked 2026-08-10) confirm Firefox now runs but say nothing about rustc/cargo/gcc — Linux-userspace breadth has grown a lot since the paper, compiler-hosting specifically is unconfirmed |
 | **Sortix** | 2011 | C | — | POSIX; installable on real hardware | Self-hosting **C** toolchain at 1.0 (Mar 2016) — ~5 years |
 | **ToaruOS** | Jan 2011 | C, from scratch | — | own libc, compositing GUI, dynamic linker, network stack; replaced all third-party runtime deps in 2018 (1.6) | Not established |
 | **Aero** | ~2021 | Rust, monolithic | — | Unix-like, Linux-inspired, SMP, 5-level paging | No evidence found either way |
 | **Maestro** | ~2018 | Rust | — | Linux-compatible; own init (Solfège), utils, package manager | No evidence found either way |
-| **Akuma** | 2026 | Rust, monolithic | 38,579 first-party lines | 17 syscall families; CoW fork, threads, lazy mmap; ext2, TCP/IP, userspace SSH (`/bin/sshd`, in-kernel SSH removed 2026-08-10); runs apk, rustc, llama.cpp | **Yes — builds its own kernel.** 147 units, 8m29s, self-built ELF boots (2026-06-19); `release-smp-shared` in-VM build reaches the ELF (2026-08-05); a full build has since completed **in one go** under SMP=4 `-j4` (9m43s, EXIT=0, 108 crates, ELF emitted) — at least 2 clean runs so far |
+| **Akuma** | 2026 | Rust, monolithic | 39,885 first-party lines | 17 syscall families; CoW fork, threads, lazy mmap; ext2, TCP/IP, userspace SSH (`/bin/sshd`, in-kernel SSH removed 2026-08-10); runs apk, rustc, llama.cpp, **Redis** (Alpine package *and* the official `redis:alpine` Docker image in a box, host-reachable), **Go** (`go build` on-target, plus Go binaries under SMP), and **Rust** programs with tokio/hyper/reqwest/rustls | **Yes — builds its own kernel.** 147 units, 8m29s, self-built ELF boots (2026-06-19); `release-smp-shared` in-VM build reaches the ELF (2026-08-05); a full build has since completed **in one go** under SMP=4 `-j4` (9m43s, EXIT=0, 108 crates, ELF emitted); the build is now **reliable**, not retry-dependent |
 
 **What this comparison actually shows:**
 
@@ -246,7 +247,7 @@ Figures below are from public sources (linked at the end of this section);
 differently.** Redox's January 2026 milestone was *running* rustc and cargo and
 compiling Rust programs — not building the OS itself. Akuma builds its own kernel
 and the result boots. On that specific axis Akuma is further along, having reached
-it at 38.6k lines — squarely inside the 30–50k range Redox's own docs cite for
+it at 39.9k lines — squarely inside the 30–50k range Redox's own docs cite for
 its kernel alone — with one maintainer, where Redox took a decade, a team, and
 three attempts.
 
@@ -261,6 +262,17 @@ completed in one go with no retries (9m43s, EXIT=0, 108 crates, ELF emitted), an
 at least one more clean run followed it — still a small sample, not a reliability
 claim yet, but "self-hosting" is achieved and getting steadier.
 
+**The Redis row is now a direct overlap, and it cuts both ways.** Asterinas runs
+Redis 7.0.15 at roughly Linux parity and publishes throughput numbers; Akuma runs
+Redis too, including the official `redis:alpine` image pulled from Docker Hub and
+served to a host client (2026-08-16). That is the same workload on a kernel with
+39.7k first-party lines and one maintainer against >100k lines and 50+
+contributors. **But "runs it" and "runs it at Linux parity" are different claims,
+and only Asterinas has measured the second one.** Akuma has no Redis benchmark at
+all — no rps figure, no comparison against Linux on the same hardware. Reading
+the overlap as a size-efficiency win would be exactly the error Reading A makes
+with xv6, one table row further along.
+
 **Asterinas is the sharpest lesson, because it optimized for the opposite thing.**
 Twice the code, 50+ contributors, three years — and it beats Linux on Nginx
 throughput while not running a compiler at all. Capability is not one axis, and
@@ -269,7 +281,7 @@ more rigorously verified *and* less self-sufficient simultaneously.
 
 **Size comparisons across kernel architectures are close to meaningless.** Redox's
 30–50k is a *microkernel*: drivers, much of POSIX, and the network stack live in
-userspace and are excluded from that count, while Akuma's 38.6k includes smoltcp
+userspace and are excluded from that count, while Akuma's 39.9k includes smoltcp
 and VFS (SSH and the shell moved to userspace 2026-08-10, so they no longer
 inflate this side of the comparison either). Comparing the two numbers without
 adjusting for architecture would still flatter or damn this project arbitrarily —
@@ -284,6 +296,8 @@ Sources: [Phoronix — rustc/Cargo on Redox](https://www.phoronix.com/news/Redox
 [Redox book — microkernels](https://doc.redox-os.org/book/microkernels.html) ·
 [Asterinas, USENIX ATC'25](https://arxiv.org/abs/2506.03876) (local copy: `atc25-peng-yuke.pdf`) ·
 [Announcing Asterinas 0.18.0](https://asterinas.github.io/2026/06/04/announcing-asterinas-0.18.0.html) ·
+the safe-Rust / 14%-TCB / verification-scope claims are stated in the ATC'25 abstract, the
+Asterinas blog and LWN's coverage (checked 2026-08-17) ·
 [Phoronix — Asterinas 0.18 released](https://www.phoronix.com/news/Asterinas-0.18) ·
 [asterinas/asterinas](https://github.com/asterinas/asterinas) ·
 [Sortix](https://sortix.org/) · [ToaruOS at 5 Years](https://toaruos.org/toaruos-at-5-years.html) ·
@@ -363,9 +377,9 @@ history would.
 
 ---
 
-## Stat 2: 0.64x test-to-code — the most misleading number here
+## Stat 2: 0.70x test-to-code — the most misleading number here
 
-24,680 test lines against 38,579 production lines looks like strong discipline.
+27,845 test lines against 39,885 production lines looks like strong discipline.
 Three things complicate it.
 
 **It is ~25x Linux's in-tree ratio, which means almost nothing.** Linux's in-tree
@@ -377,7 +391,7 @@ are all in-tree because **there is no external ecosystem pointed at it** — the
 boot suite *is* the harness.
 
 So the in-tree ratio measures *where tests live*, not how much testing exists. A
-mature kernel at 0.02x can be better tested than a young one at 0.64x by orders
+mature kernel at 0.02x can be better tested than a young one at 0.70x by orders
 of magnitude. Comparing the two as quality signals is a category error.
 
 **A different tradition replaces tests entirely.** seL4 has a famously small test
@@ -386,22 +400,22 @@ proof). Under a "verification instead of testing" model the test ratio approache
 zero while confidence goes up. The ratio is not a quality axis at all — it's an
 artifact of methodology.
 
-**The distribution undercuts the aggregate.** 18,382 of the 24,680 test lines
-(74.5%) are in three files, unchanged by either 2026-08-10 removal:
+**The distribution undercuts the aggregate.** 18,923 of the 27,845 test lines
+(68.0%) are in three files:
 
 | file | test code |
 |---|---|
-| `src/process_tests.rs` | 10,220 |
-| `src/tests.rs` | 6,483 |
-| `src/sync_tests.rs` | 1,679 |
+| `src/process_tests.rs` | 10,972 |
+| `src/tests.rs` | 6,274 |
+| `src/sync_tests.rs` | 1,677 |
 
 Meanwhile, by component:
 
 | component | prod code | test code | ratio |
 |---|---|---|---|
-| `src/syscall` | 9,746 | 0 | — |
-| `src/vfs` | 1,107 | 0 | — |
-| `crates/akuma-isolation` | 481 | 159 | 0.33x |
+| `src/syscall` | 10,012 | 0 | — |
+| `src/vfs` | 1,124 | 0 | — |
+| `crates/akuma-isolation` | 717 | 551 | 0.77x |
 
 (`src/shell` and `src/ssh` were the two worst-tested areas in the original
 2026-08-07 measurement — 0.01x each. Both directories are gone entirely as of
@@ -418,7 +432,7 @@ worth flagging rather than smoothing over.
 
 ---
 
-## Stat 3: 34.9% comment-to-code
+## Stat 3: 41.3% comment-to-code
 
 High for a systems codebase; `~15–20%` is the usual range quoted for Linux.
 
@@ -473,7 +487,7 @@ their own). `RUSTFLAGS="--force-warn dead_code"` overrides those attributes
 without editing source (third-party crates filtered out; run in an isolated
 `CARGO_TARGET_DIR`).
 
-**Re-measured 2026-08-10 at the item-count level only.** The default-feature
+**Item counts are current; the per-item line audit is not.** The default-feature
 build now shows **72 dead items** (up from 64) — re-checked directly against
 the diagnostics rather than recalled, but the specific line-count-per-item
 audit below (879 lines, the 1.2%/0.55% figures, the by-area table) was a
@@ -504,7 +518,7 @@ to clean up; the number is a property of the lint configuration more than of the
 code.
 
 **Reading B — the interesting 69% (of the last full audit's 879 dead lines)
-is test code that never runs**, which the 0.64x ratio in Stat 2 counts as
+is test code that never runs**, which the 0.70x ratio in Stat 2 counts as
 coverage. Two clusters, different causes (both files are untouched by either
 2026-08-10 removal, so these specific findings still hold):
 
@@ -531,7 +545,7 @@ One of the nine msgqueue functions is **not** a test seam and is a real defect:
 `cleanup_box_queues` documents "Called from sys_kill_box" and has no callers. See
 [`DEAD_CODE_SWEEP_FINDINGS.md`](DEAD_CODE_SWEEP_FINDINGS.md) §1.
 
-This sharpens Stat 2 rather than contradicting it: 609 of the current 24,680
+This sharpens Stat 2 rather than contradicting it: 609 of the current 27,845
 test lines (2.5%) are counted as tests but cannot run. Small, but it is exactly the kind of
 error the aggregate ratio is blind to — and note that 6 of the 7 disabled tests
 carry documented reasons, so the *conduct* here is better than the raw number
@@ -554,6 +568,128 @@ suggests. Only the six allocator tests were dropped silently.
 the 6 `akuma-exec` hits are only the non-`pub` ones. And this is *compile-time
 reachability*, not execution: code that is reachable but never actually runs on
 any boot would need coverage instrumentation, which means booting a VM.
+
+---
+
+## Stat 6: extraction costs about 7%, and a naive counter reads it as bloat
+
+Three crates — `akuma-pmm`, `akuma-virtio`, `akuma-primitives` — were extracted out
+of `src`/`akuma-exec` into host-testable form. Production code went **up** across a
+period of work called "trim the fat", and that is not a contradiction:
+
+| | prod code |
+|---|---:|
+| the three new crates | **+2,410** |
+| the components they came out of (`src` −1,670, `akuma-exec` −467, `akuma-net` −105, `akuma-rump` −10) | **−2,252** |
+| genuinely new code in existing components | **+284** |
+| **net** | **+442** |
+
+So **extraction cost 158 lines across 2,252 moved** — about **7%**, which is the
+`Cargo.toml` / `lib.rs` / public API / runtime-injection glue a standalone `no_std`
+crate needs, plus the forwarding shim left behind (`src/pmm.rs` is 153 lines where
+it was 898). The other +284 was never a refactor.
+
+What the round actually bought: **test code +1,950 and comments +2,990** against
+production +442. Extracting into host-testable crates is what those buy, and it is
+what the work was for.
+
+**Beware the filename-based prod/test split — it gets this backwards.** Counting
+production as "everything not in `*_tests.rs`/`tests/`" reports the `akuma-pmm`
+extraction as **+501 production lines**; attributing its inline
+`#[cfg(test)] mod tests` correctly gives **+221**. Extraction into a host-testable
+crate is exactly the move that relocates test code *into* a production-named file,
+so a naive counter reads a test-coverage win as production bloat.
+[`scripts/cloc_akuma.py`](../../scripts/cloc_akuma.py) has always handled this — it
+evaluates `cfg` predicates rather than trusting filenames — and grew `--rev`/`--vs`
+so the before/after comparison can be made without checking out two trees.
+
+---
+
+## Stat 7: bug density per area, and why the grouping decides the answer
+
+**New 2026-08-17.** The re-derived split above makes something possible that no
+previous version of this doc could do: cross-reference the line ledger against
+[`BUG_FIX_LIST.md`](BUG_FIX_LIST.md)'s **622 documented fixes**. The eleven areas
+were chosen to match that doc's own subsystem categories precisely so this join
+would be legitimate.
+
+Bug set is the **535 kernel-attributable** fixes; the excluded 87 are Userspace
+Apps (35), Toolchain & Self-hosting (37) and SSH (15), none of which has a kernel
+line-area to map onto. `index` = bug share ÷ line share; **1.00 means an area
+carries exactly the share of bugs its size predicts.**
+
+| area | prod lines | line % | bugs | bug % | bugs/kLoC | index |
+|---|---:|---:|---:|---:|---:|---:|
+| Misc / cross-cutting | 275 | 0.7% | 14 | 2.6% | 50.9 | 3.79 |
+| SMP & Locking | 2,099 | 5.3% | 79 | 14.8% | 37.6 | 2.80 |
+| Memory & VM | 4,709 | 11.8% | 112 | 20.9% | 23.8 | 1.77 |
+| Syscall / ABI | 5,933 | 14.9% | 127 | 23.7% | 21.4 | 1.60 |
+| Containers | 1,114 | 2.8% | 19 | 3.6% | 17.1 | 1.27 |
+| Console & Terminal | 911 | 2.3% | 15 | 2.8% | 16.5 | 1.23 |
+| Networking | 4,516 | 11.3% | 56 | 10.5% | 12.4 | 0.93 |
+| Scheduler & Process | 10,019 | 25.1% | 75 | 14.0% | 7.5 | 0.56 |
+| VFS & Filesystem | 4,006 | 10.0% | 15 | 2.8% | 3.7 | 0.28 |
+| Boot & Drivers | 2,986 | 7.5% | 11 | 2.1% | 3.7 | 0.27 |
+| Signals & Exceptions | 3,317 | 8.3% | 12 | 2.2% | 3.6 | 0.27 |
+| **total** | **39,885** | 100% | **535** | 100% | **13.4** | — |
+
+### Reading A — "size predicts risk." It doesn't
+
+The largest area in the codebase, **Scheduler & Process at 25.1% of all production
+lines, carries 14.0% of the bugs** (index 0.56). The two areas that carry the most —
+Syscall/ABI and Memory & VM — are 26.7% of the code and 44.6% of the bugs between
+them. Size predicts *maintenance burden*, which is what this whole document
+measures; it does not predict where the failures came from.
+
+### Reading B — "so refactor by density." Only for the rows that survive re-cutting
+
+Four assignments in the mapping are genuinely arguable. Each was flipped to its
+alternative and the table recomputed (`syscall/sync.rs` (futex) → SMP;
+`exceptions.rs` → SMP; `threading/mod.rs` → SMP; `syscall/poll.rs` → Scheduler),
+giving six groupings in total:
+
+| area | bugs/kLoC range | index range | verdict |
+|---|---|---|---|
+| Memory & VM | 23.8 – 23.8 | 1.77 | **robust — high** |
+| Syscall / ABI | 21.4 – 28.6 | 1.60 – 2.13 | **robust — high** |
+| Scheduler & Process | 6.9 – 10.0 | 0.52 – 0.74 | **robust — low** |
+| VFS & Filesystem | 3.7 – 3.7 | 0.28 | **robust — low** |
+| Boot & Drivers | 3.7 – 3.7 | 0.27 | **robust — low** |
+| SMP & Locking | **9.8 – 37.6** | **0.73 – 2.80** | fragile — crosses 1.00 |
+| Signals & Exceptions | **3.6 – 21.8** | **0.27 – 1.63** | fragile — crosses 1.00 |
+
+**What survives:** memory management and the syscall/ABI layer have cost **~6× per
+line** what the filesystem and driver code cost (23.8 and 21.4 against 3.7 and
+3.7), under every grouping tested.
+
+**What does not:** anything about concurrency. `src/exceptions.rs` is 2,767 lines,
+and *where that one file is filed* swings SMP & Locking between 9.8 and 37.6
+bugs/kLoC — because `BUG_FIX_LIST.md` tags a fix by the dominant subsystem of its
+*investigation*, while lines are counted by *file location*, and the SMP/BKL
+campaigns were investigated as concurrency work but landed as edits inside
+`exceptions.rs` and `threading/mod.rs`. Grouped as one super-area
+(scheduler + SMP + exceptions), concurrency comes out at **10.8 bugs/kLoC, index
+0.80 — below average.**
+
+**This retracts an intermediate finding.** A draft of this cross-reference used the
+old seven-area grouping and concluded concurrency was *the* high-density area, at
+roughly 5× the filesystem code, with `exceptions.rs` and `threading/mod.rs` named
+as the refactoring queue. That was an artifact: the coarse grouping put
+concurrency's *bugs* into a 4,406-line bucket while the files those fixes actually
+landed in were counted under process/MM. Same two ledgers, two defensible
+groupings, opposite verdict on the most consequential question.
+
+### Limits that hold under any grouping
+
+- **Bug counts measure *found and fixed*, not *present*.** Every density figure is
+  as much a measure of attention as of defect. VFS at 3.7 is either genuinely
+  simpler or simply less examined — `src/vfs` has **0** test lines by directory
+  attribution — and this join cannot distinguish those.
+- **Per-doc subsystem tagging** means grab-bag investigations smear across areas.
+- **Tiny denominators manufacture signal.** Misc / cross-cutting at 50.9 bugs/kLoC
+  is 275 lines against 14 grab-bag bugs, and means nothing.
+- **Density cannot separate "inherently hard" from "under-decomposed."** Defect
+  density *per file over git history* would; that is still not measured here.
 
 ---
 
@@ -604,7 +740,7 @@ tracks pain almost perfectly** — which is both a compliment and a prediction.
   whose build nothing verifies automatically.
 - **Comments assert intent that stopped being true.** `cleanup_box_queues`'
   "Called from sys_kill_box" is false in-source; `src/tests.rs:3` points readers at
-  a dead entry point. At 34.9% comment density (Stat 3) comments are load-bearing,
+  a dead entry point. At 41.3% comment density (Stat 3) comments are load-bearing,
   so wrong ones actively mislead rather than merely age.
 - **Invariants are enforced per-site rather than derived.** The
   `caller_box != 0 → EPERM` rule appears at 3 sites in `src/syscall/container.rs`
@@ -614,14 +750,14 @@ tracks pain almost perfectly** — which is both a compliment and a prediction.
 ### The pattern that explains both columns
 
 Scheduler, SMP, BKL, fork/exec: measured, A/B'd, documented across 200+ archive
-docs, and carrying 9,644 lines of self-tests. Those bugs cost weeks, so they got
-instrumentation.
+docs, and carrying the bulk of the 27,845 self-test lines. Those bugs cost weeks,
+so they got instrumentation.
 
 Everything this sweep found sits in the **quiet** areas instead — dead msgqueue
 seams, a missing box-teardown call, orphaned allocator tests, inconsistent box
 authorization. Stat 2 says the same thing structurally: `src/syscall` carries
-9,931 production lines against 117 test lines, and its bugs have been silent so
-far.
+10,012 production lines against 0 test lines by directory attribution, and its
+bugs have been silent so far.
 
 That is rational triage for one maintainer, not a defect of character. But it is
 predictive: the next expensive bug comes from an area with no test pressure, and
@@ -640,7 +776,7 @@ in pre-commit. Each converts a class of silent failure into a loud one.
   comments are also the areas with the longest bug histories; the correlation is
   real and uninformative as to cause.
 - **What actually executes.** Stat 5 measures compile-time reachability, not
-  runtime coverage. Some of the 38,579 production lines may never run on any
+  runtime coverage. Some of the 39,885 production lines may never run on any
   boot, and nothing here would show it.
 - **Test quality.** Nothing here measures assertion density, or whether the three
   *running* msgqueue tests check anything meaningful. "Wired into the suite" and

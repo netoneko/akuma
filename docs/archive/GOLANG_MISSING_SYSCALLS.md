@@ -2,12 +2,44 @@
 
 Tracked gaps and fixes required to run Go binaries on Akuma.
 
+> **CLOSED 2026-08-17: `go build` compiles and links on-target.** The milestone
+> table below tracked this doc's own investigation era (2026-03..05) and its
+> "in progress / crashes during compilation" line was stale for months. Verified
+> end-to-end on `devbox-smoltcp`, SMP=4, 4096 MB — see § "Milestone Status"
+> for the measurement. The per-bug root causes in the body remain accurate and
+> are unaffected.
+
 ## Milestone Status
 
 | Milestone | Status |
 |-----------|--------|
 | `CGO_ENABLED=0 go build -n` (dry run, no compilation) | **Fixed** (2026-03-21) |
-| `CGO_ENABLED=0 go build` (actual compilation) | **In progress** — crashes during compilation |
+| `CGO_ENABLED=0 go build` (actual compilation) | **Fixed** (verified 2026-08-17) |
+
+**Verification, 2026-08-17** — Go **1.26.3 linux/arm64** from Alpine apk, on a
+`devbox-smoltcp` kernel at commit `f79d5aaf` (SMP=4, 4096 MB):
+
+```bash
+apk add go git
+git clone --depth 1 https://github.com/netoneko/akuma-playground.git
+cd akuma-playground && rm -f *.c *.rs      # leave go.mod + main.go
+CGO=0 go build -v .
+./playground                                # → "Hello from Golang on Akuma"
+```
+
+| Measurement | Result |
+|---|---|
+| Cold build (after `go clean -cache`) | **112 s**, **38** stdlib packages compiled, exit 0 |
+| Warm rebuild | **14 s**, exit 0 |
+| Output binary | 2,329,697 bytes, static, runs (exit 0) |
+
+The cold figure is the honest one — the Go build cache has to be built from
+nothing the first time, and that is the bulk of the 112 s. `go build` was
+previously dying inside `go tool compile` at
+`reflectdata.WriteRuntimeTypes` with `unexpected fault address
+0xffffffffffffffc0` (an errno-shaped `-64` reaching userspace as a pointer); see
+[`GO_COMPILE_CRASH_DEBUGGING.md`](GO_COMPILE_CRASH_DEBUGGING.md) for that
+investigation.
 
 ---
 

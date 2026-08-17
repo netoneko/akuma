@@ -1022,8 +1022,20 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
                 
                 match result {
-                    Ok(n) => n as u64,
+                    Ok(n) => {
+                        // Short write == transmit buffer filled. Re-arm the
+                        // EPOLLET edge so the drain counts as a fresh EPOLLOUT
+                        // (see `epoll_on_fd_write_blocked`). write(2) is the
+                        // send path Go and hyper take, not just sendto/sendmsg.
+                        if n < buf_slice.len() {
+                            super::poll::epoll_on_fd_write_blocked(fd_num as u32);
+                        }
+                        n as u64
+                    }
                     Err(e) => {
+                        if e == libc_errno::EAGAIN {
+                            super::poll::epoll_on_fd_write_blocked(fd_num as u32);
+                        }
                         if total_written > 0 { return total_written as u64; }
                         return (-i64::from(e)) as u64;
                     }

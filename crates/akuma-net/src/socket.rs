@@ -172,6 +172,17 @@ pub struct KernelSocket {
     pub tcp_nodelay: bool,
     /// `SO_KEEPALIVE` option
     pub keepalive: bool,
+    /// `SO_RCVTIMEO` / `SO_SNDTIMEO`, in microseconds. `None` is POSIX's
+    /// default and POSIX's meaning of a zero timeval: **wait indefinitely**.
+    ///
+    /// These used to not exist, and the blocking paths carried hardcoded caps
+    /// instead — 30 s on recv, 5 s on send — which meant a client got
+    /// `ETIMEDOUT` at a deadline it never set, and setting `SO_RCVTIMEO`
+    /// (silently accepted, silently dropped) changed nothing. Measured
+    /// 2026-08-17 with `nettest-std`: a blocking read of a response delayed
+    /// 35 s died at 30069 ms, and a 2 s `SO_RCVTIMEO` fired at 30041 ms.
+    pub rcvtimeo_us: Option<u64>,
+    pub sndtimeo_us: Option<u64>,
     /// Threads waiting for I/O on this socket (epoll, blocking recv/send)
     pub wakers: Spinlock<Vec<Waker>>,
     /// Number of fd-table references to this socket (fork-inherited fds, dup'd
@@ -198,6 +209,8 @@ impl KernelSocket {
             box_id,
             tcp_nodelay: true,  // We disable Nagle by default
             keepalive: false,
+            rcvtimeo_us: None,
+            sndtimeo_us: None,
             wakers: Spinlock::new(Vec::new()),
             refs: 1,
         })
@@ -213,6 +226,8 @@ impl KernelSocket {
             box_id,
             tcp_nodelay: false,
             keepalive: false,
+            rcvtimeo_us: None,
+            sndtimeo_us: None,
             wakers: Spinlock::new(Vec::new()),
             refs: 1,
         })
@@ -245,6 +260,8 @@ impl KernelSocket {
             box_id,
             tcp_nodelay: true,
             keepalive: false,
+            rcvtimeo_us: None,
+            sndtimeo_us: None,
             wakers: Spinlock::new(Vec::new()),
             refs: 1,
         })
@@ -435,6 +452,40 @@ pub fn set_socket_keepalive(idx: usize, enabled: bool) {
     });
 }
 
+/// Set `SO_RCVTIMEO` (`recv`) or `SO_SNDTIMEO` (`send`), in microseconds.
+///
+/// `None` means "wait indefinitely", which is both POSIX's default and what
+/// POSIX says a zero `timeval` requests — so callers translate a zero timeval
+/// to `None` before getting here.
+#[cfg(feature = "smoltcp")]
+pub fn set_socket_timeout(idx: usize, is_recv: bool, timeout_us: Option<u64>) {
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get_mut(idx) {
+            if is_recv {
+                sock.rcvtimeo_us = timeout_us;
+            } else {
+                sock.sndtimeo_us = timeout_us;
+            }
+        }
+    });
+}
+
+/// Read back `SO_RCVTIMEO` / `SO_SNDTIMEO` in microseconds.
+///
+/// `None` means no timeout. Needed by `getsockopt`: a client that cannot read
+/// the option back cannot tell "honoured" from "silently dropped" — which is
+/// exactly how the missing implementation stayed invisible.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn socket_timeout(idx: usize, is_recv: bool) -> Option<u64> {
+    with_table(|table| {
+        table
+            .get(idx)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|sock| if is_recv { sock.rcvtimeo_us } else { sock.sndtimeo_us })
+    })
+}
+
 // ============================================================================
 // Socket Operations (Blocking with Yield)
 // ============================================================================
@@ -539,6 +590,53 @@ pub enum ConnectStep {
     /// A connect is in flight. EALREADY for a non-blocking caller; a blocking
     /// one waits for completion WITHOUT re-issuing the SYN.
     InProgress,
+}
+
+/// True once the connection has actually come up, i.e. the socket has left the
+/// pre-established states.
+///
+/// This exists because `smoltcp::tcp::Socket::may_recv()` answers "can I read
+/// right now?", not "is the read side finished?", and those differ in exactly
+/// one place that matters: a socket still completing its handshake. In
+/// `SynSent`, `is_active()` is `true` (it is not `Closed`/`Listen`/`TimeWait`)
+/// while `may_recv()` is `false` (it is not `Established` and has nothing
+/// buffered) — the same pair of answers a peer's FIN produces.
+///
+/// Every caller that read `!may_recv()` as "EOF / peer closed" therefore said
+/// so about connections that had never been open. Concretely, during the SYN
+/// window a client would see:
+///
+/// - `EPOLLIN` with `recv()` returning `Ok(0)` — a spurious end-of-stream on a
+///   socket that had not yet carried a byte, and
+/// - `EPOLLRDHUP` — "peer closed its write half" before the peer had accepted.
+///
+/// A client that polled inside that window concluded the connection was dead
+/// and parked forever without ever sending its request. Reproduced 2026-08-17
+/// with `nettest-reqwest post <url> 64` (tokio + hyper): roughly 1 run in 3
+/// hung with the socket ESTABLISHED and **zero** bytes delivered to the
+/// server. The window is one SLIRP round trip wide, which is why it presented
+/// as an intermittent hang rather than a consistent failure.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub const fn tcp_reached_established(state: tcp::State) -> bool {
+    !matches!(
+        state,
+        tcp::State::Closed
+            | tcp::State::Listen
+            | tcp::State::SynSent
+            | tcp::State::SynReceived
+    )
+}
+
+/// Whether a TCP socket should report "readable" to a poller, and whether a
+/// non-blocking `recv` on it should report EOF rather than `EAGAIN`.
+///
+/// Buffered data always wins. Absent data, EOF is only real once the
+/// connection has been up — see [`tcp_reached_established`].
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub const fn tcp_recv_ready(can_recv: bool, may_recv: bool, state: tcp::State) -> bool {
+    can_recv || (!may_recv && tcp_reached_established(state))
 }
 
 /// Classify a socket's state into the action `connect` should take.
@@ -676,6 +774,8 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
         box_id: current_box_id,
         tcp_nodelay: true,
         keepalive: false,
+        rcvtimeo_us: None,
+        sndtimeo_us: None,
         wakers: Spinlock::new(Vec::new()),
         refs: 1,
     };
@@ -800,15 +900,23 @@ fn finish_connect_wait(h: SocketHandle) -> Result<(), i32> {
 
 #[cfg(feature = "smoltcp")]
 pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32> {
-    let handle = with_table(|table| {
-        if let Some(Some(KernelSocket { inner: SocketType::Stream(h), .. })) = table.get(idx) { Some(*h) } else { None }
+    let (handle, sndtimeo) = with_table(|table| {
+        if let Some(Some(sock @ KernelSocket { inner: SocketType::Stream(h), .. })) = table.get(idx) {
+            Some((*h, sock.sndtimeo_us))
+        } else {
+            None
+        }
     }).ok_or(libc_errno::EBADF)?;
 
     if nonblock {
         let can = with_network(|net| net.sockets.get::<tcp::Socket>(handle).can_send()).unwrap_or(false);
         if !can { return Err(libc_errno::EAGAIN); }
     } else {
-        wait_until(|| with_network(|net| net.sockets.get::<tcp::Socket>(handle).can_send()).unwrap_or(true), Some(5_000_000))?;
+        // `sndtimeo` (None = forever) replaces what used to be an unconditional
+        // 5 s cap. A blocking write that cannot make room in the transmit
+        // buffer must block, not invent an `ETIMEDOUT` the caller never asked
+        // for — see `KernelSocket::sndtimeo_us`.
+        wait_until(|| with_network(|net| net.sockets.get::<tcp::Socket>(handle).can_send()).unwrap_or(true), sndtimeo)?;
     }
 
     let res = with_network(|net| {
@@ -832,8 +940,12 @@ pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32>
 
 #[cfg(feature = "smoltcp")]
 pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, i32> {
-    let handle = with_table(|table| {
-        if let Some(Some(KernelSocket { inner: SocketType::Stream(h), .. })) = table.get(idx) { Some(*h) } else { None }
+    let (handle, rcvtimeo) = with_table(|table| {
+        if let Some(Some(sock @ KernelSocket { inner: SocketType::Stream(h), .. })) = table.get(idx) {
+            Some((*h, sock.rcvtimeo_us))
+        } else {
+            None
+        }
     }).ok_or(libc_errno::EBADF)?;
 
     // EOF is signalled ONLY by `!may_recv()` — the peer closed its send half (FIN) or the
@@ -846,14 +958,19 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
         smoltcp_net::poll();
         let ready = with_network(|net| {
             let socket = net.sockets.get::<tcp::Socket>(handle);
-            socket.can_recv() || !socket.may_recv()
+            tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state())
         }).unwrap_or(true);
         if !ready { return Err(libc_errno::EAGAIN); }
     } else {
         wait_until(|| with_network(|net| {
             let socket = net.sockets.get::<tcp::Socket>(handle);
-            socket.can_recv() || !socket.may_recv()
-        }).unwrap_or(true), Some(30_000_000))?;
+            tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state())
+        // `rcvtimeo` (None = forever) replaces what used to be an unconditional
+        // 30 s cap — the one a 35 s-delayed response tripped at 30069 ms, and
+        // the one that made a 2 s `SO_RCVTIMEO` fire at 30041 ms. POSIX: a
+        // blocking read with no `SO_RCVTIMEO` blocks until data, EOF or a
+        // signal.
+        }).unwrap_or(true), rcvtimeo)?;
     }
 
     let res = with_network(|net| {
@@ -864,7 +981,13 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
                 buf[..len].copy_from_slice(&data[..len]);
                 (len, len)
             }).map_err(|_| libc_errno::EIO)
-        } else if !socket.may_recv() { Ok(0) } else { Err(libc_errno::EAGAIN) }
+        } else if !socket.may_recv() && tcp_reached_established(socket.state()) {
+            // Real EOF: the peer closed its write half of a connection that was
+            // up. A socket still in SynSent also answers `!may_recv()`, and
+            // reporting THAT as `Ok(0)` handed the caller an end-of-stream
+            // before the handshake had finished.
+            Ok(0)
+        } else { Err(libc_errno::EAGAIN) }
     });
 
     if matches!(res, Some(Ok(_))) {

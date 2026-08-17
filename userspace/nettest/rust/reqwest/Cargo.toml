@@ -1,0 +1,61 @@
+[package]
+name = "nettest-reqwest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone crate: NOT a member of any workspace (repo root and userspace/
+# both target the no_std kernel). Same opt-out as the sibling curl probe and
+# `userspace/nca`.
+#
+# Build: ../build-musl.sh — the SAME host cross-build recipe `userspace/nca`
+# uses (aarch64-unknown-linux-musl + aarch64-linux-musl-gcc). That is the whole
+# design constraint of this crate: it must be nca's network stack and nothing
+# else, built the way nca is built, so that "nca hangs but the probe does not"
+# is impossible to explain away as a toolchain difference.
+
+[[bin]]
+name = "nettest-reqwest"
+path = "src/main.rs"
+
+[dependencies]
+# Copied verbatim from `userspace/nca/native-cli-ai/Cargo.toml`'s
+# [workspace.dependencies]. Do not "clean this up" — the feature set is the
+# specimen. `default-features = false` + `rustls-tls` is what pulls in
+# hyper-rustls + rustls 0.23 + ring rather than native-tls.
+#
+# What the manifest claims is that the DEPENDENCY LINE matches nca's. The
+# resolved versions drift, because both manifests use caret ranges and the two
+# lockfiles were generated months apart:
+#
+#   | crate   | nca's lock | this probe's lock |
+#   |---------|------------|-------------------|
+#   | reqwest | 0.12.28    | 0.12.28           |
+#   | hyper   | 1.8.1      | 1.11.0            |
+#   | rustls  | 0.23.37    | 0.23.43           |
+#   | tokio   | 1.50.0     | 1.53.1            |
+#   | mio     | 1.1.1      | 1.2.2             |
+#   | crypto  | ring       | ring              |
+#
+# Same majors, same crypto provider, so a behavioural divergence is not
+# plausibly a version difference — but if a result ever hinges on it, copy
+# nca's `Cargo.lock` over this one and rebuild, rather than editing the caret
+# ranges here.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# nca uses features = ["full"]; the probe needs rt-multi-thread (nca's default
+# runtime), rt (for the current-thread comparison), macros, time and io-util.
+# "full" would also drag in tokio's process/signal machinery, which is not on
+# any path this probe exercises.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "io-util", "net"] }
+
+[profile.release]
+# nca builds with opt-level=3 / lto=fat / codegen-units=1 / panic=abort
+# (userspace/nca/build.rs). Matched here so codegen differences cannot be the
+# explanation for a divergence either.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]
