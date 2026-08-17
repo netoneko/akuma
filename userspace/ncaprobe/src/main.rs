@@ -14,6 +14,9 @@
 //! fds                              open fds, which are epolls, and fd aliasing
 //! waitid                           waitid(P_PIDFD, ...) — tokio's reaping call
 //! raw [main|thread|split]          tcsetattr(raw) + read(0), same/different thread
+//! sleepbench                       what a short nanosleep actually costs
+//! termbench [--net]                stdout write-latency tail, +/- network load
+//! pipebench [--epoll N]            pipe write+read cost
 //! ```
 
 use std::io::Read;
@@ -388,6 +391,143 @@ fn probe_pipebench() {
     }
 }
 
+// ---------------------------------------------------------------- probe I
+// "Networking stutters the terminal." A TUI redraw is a burst of writes to
+// stdout; stutter is the TAIL of that write latency, not the mean. Measure the
+// distribution with the network idle, then again with a download running in
+// another thread, and compare the tails.
+//
+// stdout here takes the same path nca's does: pipe -> sshd -> TCP. Results are
+// buffered and printed at the end so the reporting does not perturb the thing
+// being measured.
+
+fn pctile(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let i = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+    sorted[i]
+}
+
+fn probe_termbench() {
+    const ITERS: usize = 1500;
+    const CHUNK: usize = 1024;
+    let with_net = std::env::args().any(|a| a == "--net");
+    let host = std::env::args()
+        .position(|a| a == "--host")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .unwrap_or_else(|| "10.0.2.2:8899".to_string());
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut netthread = None;
+
+    if with_net {
+        let (stop_c, bytes_c, host_c) = (stop.clone(), bytes.clone(), host.clone());
+        netthread = Some(std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                let Ok(mut s) = std::net::TcpStream::connect(&host_c) else {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                };
+                let _ = s.write_all(
+                    format!("GET /ncaprobe HTTP/1.0\r\nHost: {host_c}\r\n\r\n").as_bytes(),
+                );
+                let mut buf = [0u8; 16384];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            bytes_c.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                            if stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        std::thread::sleep(Duration::from_millis(600)); // let traffic ramp
+    }
+
+    let chunk = vec![b'.'; CHUNK];
+    let mut lat = Vec::with_capacity(ITERS);
+    // warm up
+    for _ in 0..50 {
+        unsafe { libc::write(1, chunk.as_ptr().cast(), CHUNK) };
+    }
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        let s = Instant::now();
+        unsafe { libc::write(1, chunk.as_ptr().cast(), CHUNK) };
+        lat.push(s.elapsed().as_micros() as u64);
+    }
+    let wall = t0.elapsed();
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = netthread {
+        let _ = h.join();
+    }
+
+    lat.sort_unstable();
+    let total: u64 = lat.iter().sum();
+    println!("\n\n=== termbench {} ===", if with_net { "WITH concurrent download" } else { "network idle" });
+    println!("{ITERS} writes of {CHUNK}B to stdout in {} ms", wall.as_millis());
+    if with_net {
+        println!(
+            "concurrent download moved {} KiB",
+            bytes.load(std::sync::atomic::Ordering::Relaxed) / 1024
+        );
+    }
+    println!(
+        "write latency us:  p50={}  p90={}  p99={}  max={}  mean={}",
+        pctile(&lat, 0.50),
+        pctile(&lat, 0.90),
+        pctile(&lat, 0.99),
+        lat[lat.len() - 1],
+        total / lat.len() as u64
+    );
+    let stalls: Vec<u64> = lat.iter().copied().filter(|&x| x > 10_000).collect();
+    println!("writes over 10ms (visible stalls): {}", stalls.len());
+    if !stalls.is_empty() {
+        println!("  worst: {:?}", &stalls[stalls.len().saturating_sub(8)..]);
+    }
+}
+
+// ---------------------------------------------------------------- probe J
+// Sleep granularity. sshd's bridge loop asks for sleep_ms(1) between polls, so
+// whatever a 1 ms sleep ACTUALLY costs is the quantum every byte of terminal
+// output is forwarded at. Ask for a range of short sleeps and report what came
+// back.
+
+fn probe_sleepbench() {
+    println!("=== probe: nanosleep granularity ===");
+    println!("requested -> actual (median of 40), us");
+    for req_us in [500u64, 1_000, 2_000, 5_000, 10_000, 20_000] {
+        let mut got = Vec::new();
+        for _ in 0..40 {
+            let ts = libc::timespec {
+                tv_sec: (req_us / 1_000_000) as libc::time_t,
+                tv_nsec: ((req_us % 1_000_000) * 1000) as _,
+            };
+            let t = Instant::now();
+            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+            got.push(t.elapsed().as_micros() as u64);
+        }
+        got.sort_unstable();
+        let med = got[got.len() / 2];
+        println!(
+            "  {:>7} -> {:>7}   (min {:>7} max {:>7})  overshoot x{:.1}",
+            req_us,
+            med,
+            got[0],
+            got[got.len() - 1],
+            med as f64 / req_us as f64
+        );
+    }
+}
+
 // ---------------------------------------------------------------- probe F
 // tokio's pidfd reaper reaps with waitid(P_PIDFD, ...), not wait4.
 
@@ -676,6 +816,12 @@ fn probe_fds() {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("sleepbench") => {
+            probe_sleepbench();
+        }
+        Some("termbench") => {
+            probe_termbench();
+        }
         Some("pipebench") => {
             println!("=== probe: pipe read/write cost ===");
             probe_pipebench();
