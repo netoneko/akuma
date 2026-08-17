@@ -270,6 +270,43 @@
     .hint { display: none; }
     .rail { width: auto; left: auto; right: 0; padding-right: 0.45rem; }
   }
+
+  /* ── print / PDF ────────────────────────────────────────────────
+     One 16:9 page per slide, with the navigation rail and keyboard
+     hint dropped: nothing in a PDF can be clicked or arrowed through.
+
+     Cmd-P will still not match the screen, and it cannot be made to.
+     Chrome lays print media out at a ~800px viewport whatever the
+     @page size says — measured with a breakpoint probe at both
+     1280x720px and 2276x1280px, and --window-size does not move it —
+     so every `min-width: 60rem` rule below loses and the two-column
+     slides paginate as the mobile stack. For a faithful PDF use
+     `scripts/render_deck_pdf.py`, which captures each slide in screen
+     media at 1280x720 instead.
+     ─────────────────────────────────────────────────────────────── */
+  @media print {
+    @page { size: 1280px 720px; margin: 0; }
+    /* the deck's dark ground is the design, not a preference — keep it */
+    * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+
+    .rail, .hint { display: none !important; }
+
+    /* drop the scroll-snap viewport; let the pages stack */
+    html, body { height: auto !important; overflow: visible !important; }
+    .deck { height: auto !important; overflow: visible !important; scroll-snap-type: none !important; }
+
+    .slide {
+      height: 720px; min-height: 0;
+      break-after: page; break-inside: avoid;
+      overflow: hidden;
+      border-bottom: 0;
+    }
+    .slide:last-child { break-after: auto; }
+
+    /* no horizontal scroll on paper — a clipped table would lose data */
+    .scroller { overflow: visible !important; }
+    table { min-width: 0; }
+  }
 </style>
 </head>
 <body>
