@@ -306,16 +306,12 @@ out to mean nothing.
 I was reading the code as Claude edited it — the fault handler, about **4.5k
 lines** — and one function looked like the one worth checking. It was.
 
-Nice feeling. Not a method.
+That was luck with a good prior. So the same commit added a diagnostic that says
+which path declined, and measuring the codebase started not long after.
 
-So the same commit added a diagnostic that says which path declined, and measuring
-the codebase started not long after.
-
-*Speaker:* be honest about what that was — pattern-matching on a file I'd spent
-months in. It doesn't transfer to anyone else and it doesn't scale to a bigger
-codebase, so the useful part wasn't the find, it was turning it into something that
-prints the answer next time. Reviewing the diff as it lands is the habit worth
-keeping; being right about which function to open is luck with a good prior.
+*Speaker:* pattern-matching on a file I'd spent months in. It doesn't transfer and it
+doesn't scale, so the useful part was turning it into something that prints the
+answer next time. Reviewing the diff as it lands is the habit worth keeping.
 
 ---
 
@@ -375,32 +371,26 @@ cold number is the honest one — 112 s is mostly building the Go cache from not
 
 ---
 
-## Flagged: negative framing ("not X, Y")
+## Negative framing — audited and fixed
 
-Scanned both files for the *not-X-but-Y* construction — a known tell, and something
-this deck leans on more than it should. **Four are load-bearing rhetoric, three are
-lazy, one is just accurate.** Nothing here is changed yet; decide per row.
+Scanned both files for the *not-X-but-Y* construction. Four instances were doing
+rhetorical work rather than carrying information; all four rewritten:
 
-| slide | as written | verdict |
+| slide | was | now |
 |---|---|---|
-| 05 | *"**Not** "improve the memory subsystem". Compatibility with X, in order to run X."* | **Keep.** The contrast *is* the point — the wrong goal has to be visible for the right one to land. |
-| 09 | *"**Not** written for posterity — written to reconstitute project-specific intuition in a reader who starts from zero."* | **Rewrite candidate.** The positive half stands alone: "Written to reconstitute project-specific intuition in a reader who starts from zero." |
-| 11 | *"Nice feeling. **Not** a method."* | **Keep.** Two beats, four words, and the whole slide turns on it. |
-| 08 | *"'The tests pass' **isn't** the bar — the tests were written by the person who wrote the bug."* | **Keep.** Quoting the thing being rejected, then rejecting it. |
-| 07 | *"that work is **never** wasted, even when the theory it was built for turns out to be wrong"* | **Rewrite candidate.** Double-negative shape ("never wasted … even when wrong"). Positive version: "that work pays off even when the theory it was built for dies." |
-| 07 | *"The bug is almost **never** where the error appears."* | **Keep.** This is a claim about the world, not a rhetorical contrast. |
-| 09 | *"two syscalls were rewritten **instead of** copied"* | **Keep.** Literal description of what happened; there is no positive phrasing. |
-| 09 | *"There is **no way to know** how many similar substitutions weren't."* | **Keep.** The admission is the value; softening it would be dishonest. |
+| 05 | *Not "improve the memory subsystem". Compatibility with X…* | *Compatibility with X, in order to run X.* |
+| 07 | *…that work is never wasted, even when the theory turns out to be wrong* | *…that work pays off even when the theory it was built for dies* |
+| 09 | *Not written for posterity — written to reconstitute…* | *Written to reconstitute project-specific intuition in a reader who starts from zero.* |
+| 11 | *Nice feeling. Not a method.* | *That was luck with a good prior.* |
 
-**The pattern worth watching:** three of the four keepers put the negation in a
-*short* clause and the substance in the positive one. The two rewrite candidates do
-the reverse — they spend the long clause on what the thing isn't. That's the test to
-apply if more of these appear.
+Left alone, because the negation is the information rather than the framing:
+"the bug is almost never where the error appears" (slide 07), "'the tests pass' isn't
+the bar" (slide 08), "rewritten instead of copied" (slide 09, literal), "there is no
+way to know how many similar substitutions weren't" (slide 09), "capability is not
+one axis" (slide 03), "neither addresses who keeps it" (slide 04).
 
-**Also present, deliberately, and not flagged:** the two "capability is not one
-axis" / "both policies legislate who writes the code, neither addresses who keeps
-it" lines on slides 03–04. Those are the deck's argument against a false dichotomy,
-so the negation is the content.
+**Check to apply if more appear:** if the long clause is spent on what the thing
+isn't, rewrite it.
 
 ---
 

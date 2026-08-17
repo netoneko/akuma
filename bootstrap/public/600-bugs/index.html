@@ -333,8 +333,7 @@
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Have a concrete goal: <em>run X</em></h2>
-      <p>Not "improve the memory subsystem". <strong>Compatibility with X, in order to run
-      X.</strong></p>
+      <p><strong>Compatibility with X, in order to run X.</strong></p>
       <div class="scroller">
         <table>
           <thead><tr><th>target</th><th>what it forced</th></tr></thead>
@@ -380,8 +379,8 @@
       <p><strong>Build the smallest thing that can tell two theories apart. Kill theories
       until one survives.</strong></p>
       <p><strong>Adding instrumentation and tracking the data flow is always worth it.</strong>
-      Where a value came from, who owns it, when it was freed — that work is never wasted,
-      even when the theory it was built for turns out to be wrong.</p>
+      Where a value came from, who owns it, when it was freed — that work pays off even when
+      the theory it was built for dies.</p>
       <p>Probes inspect <em>state</em>, not behaviour. Keep the good ones; leave them armed.</p>
       <p class="pull">The bug is almost never <em class="q">where the error appears.</em></p>
     </div>
@@ -428,8 +427,8 @@
           </tbody>
         </table>
       </div>
-      <p>Not written for posterity — <strong>written to reconstitute project-specific
-      intuition in a reader who starts from zero.</strong></p>
+      <p><strong>Written to reconstitute project-specific intuition in a reader who starts
+      from zero.</strong></p>
       <p><strong>The failure mode this guards against</strong>, logged once in the archive:
       during what should have been a mechanical port, two syscalls were
       <strong>rewritten instead of copied</strong> — breaking an ABI. Caught and reverted.
@@ -471,9 +470,8 @@
       <p>I was reading the code as Claude edited it — the fault handler, about
       <strong>4.5k lines</strong> — and one function looked like the one worth checking.
       It was.</p>
-      <p class="pull">Nice feeling. <em class="q">Not a method.</em></p>
-      <p>So the same commit added a diagnostic that says which path declined, and measuring
-      the codebase started not long after.</p>
+      <p>That was luck with a good prior. So the same commit added a diagnostic that says
+      which path declined, and measuring the codebase started not long after.</p>
     </div>
   </section>
 
