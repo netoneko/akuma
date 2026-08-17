@@ -123,6 +123,17 @@
   em.q { color: var(--shu); font-style: italic; }
   code, .m { font-family: var(--mono); font-size: 0.87em; color: var(--ink); font-variant-numeric: tabular-nums; }
 
+  .byline {
+    font-family: var(--mono);
+    font-size: clamp(0.68rem, 0.9vw, 0.8rem);
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin: 0;
+    padding-top: clamp(0.4rem, 1.2vh, 0.9rem);
+    border-top: 1px solid var(--rule-soft);
+    max-width: 22rem;
+  }
   .sub {
     font-family: var(--mono);
     font-size: clamp(0.78rem, 1.1vw, 1rem);
@@ -237,6 +248,7 @@
           <p class="eyebrow">Akuma OS</p>
           <h1>AI will write <span class="n600">600 bugs</span><br>and I will write <span class="n600">600 more</span></h1>
           <p class="sub">at some point you gotta do some real engineering</p>
+          <p class="byline">Kirill Maksimov &middot; <span class="m">2026-08-17</span></p>
         </div>
         <figure>
           <img src="lock_in.jpg" alt="Meme: an older man holding out a cigarette, captioned &quot;Your ancestors need you to lock in son.&quot;">
@@ -418,7 +430,19 @@
       </div>
       <p>Not written for posterity — <strong>written to reconstitute project-specific
       intuition in a reader who starts from zero.</strong></p>
-      <p><strong>And the informal half of the same record — the commit log:</strong></p>
+      <p><strong>The failure mode this guards against</strong>, logged once in the archive:
+      during what should have been a mechanical port, two syscalls were
+      <strong>rewritten instead of copied</strong> — breaking an ABI. Caught and reverted.
+      There is no way to know how many similar substitutions weren't.</p>
+    </div>
+  </section>
+
+  <!-- 10 -->
+  <section class="slide">
+    <div class="num">10</div>
+    <div class="body">
+      <p class="eyebrow cool">Act III · how it's built</p>
+      <h2>mood</h2>
       <pre><span class="d">2025-11-28</span>  does not actually detect ram
 <span class="d">2025-11-28</span>  at least it still runs
 <span class="d">2025-11-30</span>  allocation is the root of all evil
@@ -431,18 +455,14 @@
 <span class="d">2026-08-11</span>  curious case of nothingburger
 <span class="d">2026-08-13</span>  java crossover episode</pre>
       <p>The four tiers document the <em>reasoning</em>. The commit log documents the
-      <em>state of mind</em> — and it is still a record you can mine. The tone survived;
-      the rigour arrived.</p>
-      <p><strong>The failure mode this guards against</strong>, logged once in the archive:
-      during what should have been a mechanical port, two syscalls were
-      <strong>rewritten instead of copied</strong> — breaking an ABI. Caught and reverted.
-      There is no way to know how many similar substitutions weren't.</p>
+      <em>state of mind</em> — and it is still a record you can mine.</p>
+      <p class="pull">The tone survived. <em class="q">The rigour arrived.</em></p>
     </div>
   </section>
 
-  <!-- 10 -->
+  <!-- 11 -->
   <section class="slide">
-    <div class="num">10</div>
+    <div class="num">11</div>
     <div class="body">
       <p class="eyebrow cool">Act III · how it's built</p>
       <h2>Reading the diff</h2>
@@ -457,9 +477,9 @@
     </div>
   </section>
 
-  <!-- 11 -->
+  <!-- 12 -->
   <section class="slide">
-    <div class="num">11</div>
+    <div class="num">12</div>
     <div class="body">
       <p class="eyebrow cool">Act III · how it's built</p>
       <h2>Learn from history</h2>
@@ -480,9 +500,9 @@
     </div>
   </section>
 
-  <!-- 12 -->
+  <!-- 13 -->
   <section class="slide">
-    <div class="num">12</div>
+    <div class="num">13</div>
     <div class="body">
       <p class="eyebrow"><code>go build</code> defeated</p>
       <pre>akuma:~$ apk add go git

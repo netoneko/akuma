@@ -1,9 +1,11 @@
 # AI will write 600 bugs and I will write 600 more — presentation script
 
-**Status:** draft 14. The *content* of a talk plus speaker notes.
+**Kirill Maksimov · 2026-08-17**
+
+**Status:** draft 16. The *content* of a talk plus speaker notes.
 
 **Rendered deck:** [`bootstrap/public/600-bugs/index.html`](../../bootstrap/public/600-bugs/index.html)
-— 12 slides, keyboard-navigable (↑/↓, Home/End), self-contained apart from
+— 13 slides, keyboard-navigable (↑/↓, Home/End), self-contained apart from
 `lock_in.jpg` beside it. Served at `/600-bugs/`. Served from `bootstrap/public/`, so it is reachable from the
 VM's own httpd. **This file stays the source of truth**: edit the script here, then
 mirror into the HTML.
@@ -20,7 +22,7 @@ they belong, and the deck now shows the loop that produced them.
 past ~8 lines of content it is still too long. The prose under each slide is
 speaker material, not slide text.
 
-### Changes from draft 13
+### Changes from draft 15
 
 | Change | Reason |
 |---|---|
@@ -41,7 +43,9 @@ speaker material, not slide text.
 | **"one maintainer" dropped** from the subject line, the AI-policy row and slide 10 | Per review — "no one cares" |
 | **Deck rendered to HTML** and both files renamed `600_BUGS_ANNIVERSARY` | Per review |
 | **Title slide split in two** — 01 is title + subtitle + meme only, 02 carries the "checks got cheap too" argument | Per review. The image needs to land on its own before the argument starts |
-| **The commit-message block moved to the docs slide (09)** and expanded to eleven | Per review. It belongs with the record-keeping argument: the four doc tiers document the reasoning, the commit log documents the state of mind |
+| **The commit-message block became its own slide, 10, titled `mood`** | Per review — eleven lines was too much to share with the docs slide. `mood` is itself one of the commit messages (2026-02-22, ×3) |
+| **Byline added** — Kirill Maksimov · 2026-08-17, on slide 01 and this doc's header | Per review |
+| **Negative framing audited and flagged** — see § "Flagged: negative framing" | Per review. Eight instances found across both files; two flagged as rewrite candidates, six defended. Nothing changed yet |
 
 ---
 
@@ -50,8 +54,8 @@ speaker material, not slide text.
 > **The problem with writing throwaway software is that people don't actually
 > throw away software.**
 
-Twelve slides. The opener states the trade, Act I places the project, Act II is the
-workflow, Act III is how it's built.
+Thirteen slides. The opener states the trade, Act I places the project, Act II is
+the workflow, Act III is how it's built.
 
 **Title:** **AI will write 600 bugs and I will write 600 more**
 **Subtitle:** *at some point you gotta do some real engineering*
@@ -64,7 +68,9 @@ workflow, Act III is how it's built.
 
 > *at some point you gotta do some real engineering*
 
-*Slide is the title, the subtitle, and the meme. Nothing else.*
+**Kirill Maksimov · 2026-08-17**
+
+*Slide is the title, the subtitle, the byline and the meme. Nothing else.*
 
 *Speaker:* the number is real and it's the next slide. Let the image land first.
 
@@ -151,7 +157,7 @@ than most CI — matter more here, not less. They are the review.
 
 ### 05 — Have a concrete goal: run X
 
-Not "improve the memory subsystem". **Compatibility with X, in order to run X.**
+**Compatibility with X, in order to run X.**
 
 | target | what it forced |
 |---|---|
@@ -191,8 +197,8 @@ and it's much cheaper than discovering it from a fault address.
 one survives.**
 
 **Adding instrumentation and tracking the data flow is always worth it.** Where a
-value came from, who owns it, when it was freed — that work is never wasted, even
-when the theory it was built for turns out to be wrong.
+value came from, who owns it, when it was freed — that work pays off even when the
+theory it was built for dies.
 
 Probes inspect *state*, not behaviour. Keep the good ones; leave them armed.
 
@@ -240,8 +246,8 @@ one fact determines the whole documentation system.
 | `archive/` | 200+ investigations, verbatim, **never rewritten** — including the wrong theories |
 | agent-context files | the standing rules, so they're never re-litigated |
 
-Not written for posterity — **written to reconstitute project-specific intuition in
-a reader who starts from zero.**
+**Written to reconstitute project-specific intuition in a reader who starts from
+zero.**
 
 **The failure mode this guards against**, logged once in the archive: during what
 should have been a mechanical port, two syscalls were **rewritten instead of
@@ -366,6 +372,35 @@ months.**
 
 *Speaker:* measured while these slides were being drafted, on a separate VM. The
 cold number is the honest one — 112 s is mostly building the Go cache from nothing.
+
+---
+
+## Flagged: negative framing ("not X, Y")
+
+Scanned both files for the *not-X-but-Y* construction — a known tell, and something
+this deck leans on more than it should. **Four are load-bearing rhetoric, three are
+lazy, one is just accurate.** Nothing here is changed yet; decide per row.
+
+| slide | as written | verdict |
+|---|---|---|
+| 05 | *"**Not** "improve the memory subsystem". Compatibility with X, in order to run X."* | **Keep.** The contrast *is* the point — the wrong goal has to be visible for the right one to land. |
+| 09 | *"**Not** written for posterity — written to reconstitute project-specific intuition in a reader who starts from zero."* | **Rewrite candidate.** The positive half stands alone: "Written to reconstitute project-specific intuition in a reader who starts from zero." |
+| 11 | *"Nice feeling. **Not** a method."* | **Keep.** Two beats, four words, and the whole slide turns on it. |
+| 08 | *"'The tests pass' **isn't** the bar — the tests were written by the person who wrote the bug."* | **Keep.** Quoting the thing being rejected, then rejecting it. |
+| 07 | *"that work is **never** wasted, even when the theory it was built for turns out to be wrong"* | **Rewrite candidate.** Double-negative shape ("never wasted … even when wrong"). Positive version: "that work pays off even when the theory it was built for dies." |
+| 07 | *"The bug is almost **never** where the error appears."* | **Keep.** This is a claim about the world, not a rhetorical contrast. |
+| 09 | *"two syscalls were rewritten **instead of** copied"* | **Keep.** Literal description of what happened; there is no positive phrasing. |
+| 09 | *"There is **no way to know** how many similar substitutions weren't."* | **Keep.** The admission is the value; softening it would be dishonest. |
+
+**The pattern worth watching:** three of the four keepers put the negation in a
+*short* clause and the substance in the positive one. The two rewrite candidates do
+the reverse — they spend the long clause on what the thing isn't. That's the test to
+apply if more of these appear.
+
+**Also present, deliberately, and not flagged:** the two "capability is not one
+axis" / "both policies legislate who writes the code, neither addresses who keeps
+it" lines on slides 03–04. Those are the deck's argument against a false dichotomy,
+so the negation is the content.
 
 ---
 
