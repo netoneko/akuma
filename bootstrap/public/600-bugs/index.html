@@ -159,6 +159,20 @@
   }
   .pull.cool { border-top-color: var(--ai); }
 
+  /* a quote is a .pull that is someone else's words, so it reuses it */
+  blockquote.quote { margin: 0; }
+  blockquote.quote .pull { font-style: italic; }
+  blockquote.quote cite {
+    display: block;
+    margin-top: clamp(0.5rem, 1.3vh, 0.85rem);
+    font-family: var(--mono);
+    font-style: normal;
+    font-size: clamp(0.66rem, 0.9vw, 0.78rem);
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
   /* ── data ───────────────────────────────────────────────────── */
   .scroller { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   table {
@@ -211,6 +225,11 @@
   }
   .hero figure { margin: 0; }
   .hero figcaption { font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); margin-top: 0.55rem; }
+
+  /* ── inline figure, for slides that are not the opener ──────── */
+  .shot { margin: 0; width: clamp(14rem, 30vw, 26rem); max-width: 100%; }
+  .shot img { width: 100%; height: auto; display: block; border: 1px solid var(--rule); filter: saturate(0.92) contrast(1.02); }
+  .shot figcaption { font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); margin-top: 0.55rem; }
 
   /* ── overview: prose + figures left, mark + link right ──────── */
   .split { display: grid; grid-template-columns: 1fr; gap: clamp(1.1rem, 2.8vw, 2.4rem); align-items: start; }
@@ -562,23 +581,34 @@
     <div class="body">
       <p class="eyebrow hot">Act III · how it's built</p>
       <h2>Clean up after yourself</h2>
-      <p><strong>Generation is cheap, so the default move is a second copy.</strong> A clone
-      detector over the kernel found <strong>5,370 duplicated lines</strong> — 5.6% of the
-      tree, and that is the floor, not the estimate. What the copies cost:</p>
-      <div class="scroller">
-        <table class="dense">
-          <thead><tr><th>written more than once</th><th class="r">copies</th><th>what it cost</th></tr></thead>
-          <tbody>
-            <tr><td>the CoW break path, <code>exceptions.rs</code></td><td class="r hot">3</td><td>a refcount underflow in the page-fault path — frames freed while still mapped. Three separate fixes</td></tr>
-            <tr><td><code>X</code> and <code>X_from_path</code>, down a whole call chain</td><td class="r">4 pairs</td><td>a <strong>second, hand-rolled ELF parser</strong> — which one validates your dynamic linker depends on which <code>execve</code> path ran</td></tr>
-            <tr><td>the bounded channel write</td><td class="r">2</td><td>the stream-truncation fix landed on stdout, never on stdin</td></tr>
-            <tr><td>errno tables</td><td class="r">5</td><td><code>-12</code> (<code>ENOMEM</code>) returned under a comment reading <code>ENXIO</code>. 116 definitions → <strong>39</strong></td></tr>
-            <tr><td>the runtime-registration pattern</td><td class="r">3</td><td>every network poll took a spinlock to read a function pointer</td></tr>
-            <tr><td>production logic, re-typed inside its own test</td><td class="r hot">13</td><td>the test exercises its copy, so production drifts for free — plus 25 more that assert <code>true&nbsp;==&nbsp;true</code></td></tr>
-          </tbody>
-        </table>
+      <div class="split">
+        <div class="col">
+          <p><strong>Generation is cheap, so the default move is a second copy.</strong> A clone
+          detector over the kernel found <strong>5,370 duplicated lines</strong> — 5.6% of the
+          tree, and that is the floor, not the estimate. What the copies cost:</p>
+          <div class="scroller">
+            <table class="dense">
+              <thead><tr><th>written more than once</th><th class="r">copies</th><th>what it cost</th></tr></thead>
+              <tbody>
+                <tr><td>the CoW break path, <code>exceptions.rs</code></td><td class="r hot">3</td><td>a refcount underflow in the page-fault path — frames freed while still mapped. Three separate fixes</td></tr>
+                <tr><td><code>X</code> and <code>X_from_path</code>, down a whole call chain</td><td class="r">4 pairs</td><td>a <strong>second, hand-rolled ELF parser</strong> — which one validates your dynamic linker depends on which <code>execve</code> path ran</td></tr>
+                <tr><td>the bounded channel write</td><td class="r">2</td><td>the stream-truncation fix landed on stdout, never on stdin</td></tr>
+                <tr><td>errno tables</td><td class="r">5</td><td><code>-12</code> (<code>ENOMEM</code>) returned under a comment reading <code>ENXIO</code>. 116 definitions → <strong>39</strong></td></tr>
+                <tr><td>the runtime-registration pattern</td><td class="r">3</td><td>every network poll took a spinlock to read a function pointer</td></tr>
+                <tr><td>production logic, re-typed inside its own test</td><td class="r hot">13</td><td>the test exercises its copy, so production drifts for free — plus 25 more that assert <code>true&nbsp;==&nbsp;true</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <figure class="shot">
+          <img src="slop_factory.jpg" alt="Meme: a cat wearing a necktie stands outside a factory labelled &quot;out of touch slop factory&quot;, saying &quot;I hope I don't see any out of touch ai slop.&quot;">
+          <figcaption>the audit, arriving on site</figcaption>
+        </figure>
       </div>
-      <p class="pull"><em class="q">GOD DAAAAAAAAAM</em></p>
+      <blockquote class="quote">
+        <p class="pull">&ldquo;Coding is solved.&rdquo;</p>
+        <cite>&mdash; some guy with a $2T company</cite>
+      </blockquote>
     </div>
   </section>
 
@@ -625,7 +655,7 @@ akuma:~$ ./playground
       <p>Pick a real program. Audit before you touch anything. Probe until a
       theory dies. A/B on the real workload. Write it down for whoever starts from zero
       tomorrow.</p>
-      <p class="pull">LLMs are statistical engines and it is your job to turn stats to your favor.</p>
+      <p class="pull">LLMs are statistical engines and it is your job to turn the stats in your favor.</p>
     </div>
   </section>
 
