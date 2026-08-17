@@ -108,13 +108,33 @@ table keyed by an internal `epoll_id` (not by fd) — an `EpollFd(id)`
 
    | Hook | Called from | Clears | Why |
    |---|---|---|---|
-   | `epoll_on_fd_drained` | `recvfrom`/`recvmsg`/`read` — every successful read **and** every `EAGAIN` | `EPOLLIN` | a caller that reads one TLS record at a time without draining to `EAGAIN` (BoringSSL/bun) would never see `EPOLLIN` fire again for data that arrived in the same poll window |
+   | `epoll_on_fd_drained` | `recvfrom`/`recvmsg`/`read` on **sockets, pipes and socketpairs** — every successful read **and** every `EAGAIN` | `EPOLLIN` | a caller that reads one TLS record at a time without draining to `EAGAIN` (BoringSSL/bun) would never see `EPOLLIN` fire again for data that arrived in the same poll window |
    | `epoll_on_fd_write_blocked` | `sendto`/`sendmsg`/`write` — every **short** write **and** every `EAGAIN` | `EPOLLOUT` | a caller that fills the 16 KB TCP transmit buffer and waits for `EPOLLOUT` would wait forever: this loop drives `smoltcp_net::poll()` at the top of each pass, which usually flushes the buffer before readiness is computed, so `can_send()` is never *observed* false |
 
    The write hook did not exist until 2026-08-17 and its absence was an
    intermittent hang — intermittent precisely because it raced the flush
    described above. If you add a new readiness bit here, add its reset hook at
    the same time. Regression: `epoll_edge_rearm_symmetry` in the boot suite.
+
+   The read hook was wired into the **socket** paths only, and later the same
+   day the identical hole was found on **pipes**: `sys_read`'s `PipeRead` and
+   `UnixSocket` arms never called it, so a child's stdout fired `EPOLLIN` exactly
+   once and was `SUPPRESSED` for the rest of its life. That is the whole reason
+   `tokio::process::Command::output()` never completed on Akuma. Two lessons
+   generalise. First, **the hook belongs to the fd type, not to the syscall** —
+   "`read` calls it" is not enough when `read` has eight arms. Second, a
+   readiness predicate that folds two states into one bit has no edge between
+   them: `pipe_can_read` answers true both for "has bytes" and "at EOF", which is
+   why pipes now also report `EPOLLHUP` (`pipe_hup`) once the last writer is
+   gone — that is the bit that makes the EOF transition an edge at all.
+   Regression: `epoll_pipe_eof_edge_after_partial_drain`;
+   [`../../../archive/TOKIO_PIPE_EPOLL_HANG.md`](../../../archive/TOKIO_PIPE_EPOLL_HANG.md),
+   procedure in
+   [`../../../runbooks/debug-async-subprocess-hang.md`](../../../runbooks/debug-async-subprocess-hang.md).
+
+   To see these decisions live, set `SYSCALL_DEBUG_EPOLL_EDGE` (`src/config.rs`):
+   one line per ready fd per scan, with `rev`/`last`/`new` and
+   `deliver`/`SUPPRESSED`.
 
    Note also what `epoll_check_fd_readiness` must NOT report: a TCP socket
    still in `SynSent` answers `is_active() && !may_recv()`, the same pair a

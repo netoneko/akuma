@@ -527,14 +527,25 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
             }
         }
         akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
-            if requested & EPOLLIN != 0 {
-                // Register for wakeup notifications
-                if waker.is_some() {
-                    super::pipe::pipe_add_poller(pipe_id, tid);
-                }
-                if super::pipe::pipe_can_read(pipe_id) {
-                    ready |= EPOLLIN;
-                }
+            // Register for wakeup notifications
+            if waker.is_some() {
+                super::pipe::pipe_add_poller(pipe_id, tid);
+            }
+            if requested & EPOLLIN != 0 && super::pipe::pipe_can_read(pipe_id) {
+                ready |= EPOLLIN;
+            }
+            // `EPOLLHUP` is reported whether or not the caller asked for it —
+            // Linux does the same, and it is never maskable. It matters here
+            // beyond parity: losing the last writer is the *only* state change
+            // an edge-triggered reader gets between "drained, writer alive"
+            // and EOF. `pipe_can_read` is already true in both states (it
+            // folds "has bytes" and "at EOF" into one `EPOLLIN`), so without a
+            // distinct bit `revents & !last_ready` is 0 and the EOF edge is
+            // silently swallowed — `tokio`'s `read_to_end` then waits forever
+            // on a pipe that is sitting at EOF.
+            // See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
+            if super::pipe::pipe_hup(pipe_id) {
+                ready |= EPOLLHUP;
             }
         }
         akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
@@ -749,6 +760,22 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
                             entry.last_ready = revents;
                         }
                 });
+                // One line per ready fd, showing whether the edge bookkeeping
+                // let this event through. A lost edge is invisible in every
+                // other trace: the fd stays ready, the watcher stays parked,
+                // and nothing reports an error. See `SYSCALL_DEBUG_EPOLL_EDGE`.
+                if crate::config::SYSCALL_DEBUG_EPOLL_EDGE && revents != 0 {
+                    crate::tprint!(
+                        160,
+                        "[epoll] ET epfd={} fd={} rev=0x{:x} last=0x{:x} new=0x{:x} {}\n",
+                        epfd,
+                        fd,
+                        revents,
+                        last_ready,
+                        new_bits,
+                        if new_bits == 0 { "SUPPRESSED" } else { "deliver" }
+                    );
+                }
                 if new_bits != 0 {
                     kernel_events.push(EpollEvent { events: new_bits, _pad: 0, data });
                     ready_count += 1;

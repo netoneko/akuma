@@ -388,6 +388,18 @@ pub fn pipe_can_read(id: u32) -> bool {
     })
 }
 
+/// True once every write end is gone (or the pipe is already destroyed): the
+/// read end can never produce anything but EOF again. This is `POLLHUP` on a
+/// pipe read end, and it is the bit that distinguishes "drained, writer still
+/// alive" from "at EOF" — `pipe_can_read` folds both into one `POLLIN`, so an
+/// edge-triggered watcher has nothing else to key the EOF transition on.
+/// See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
+pub fn pipe_hup(id: u32) -> bool {
+    crate::irq::with_irqs_disabled(|| {
+        PIPES.lock().get(&id).is_none_or(|p| p.write_count == 0)
+    })
+}
+
 pub fn pipe_bytes_available(id: u32) -> usize {
     crate::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).map_or(0, |p| p.buffer.len())

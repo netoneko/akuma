@@ -32,6 +32,8 @@ pub fn run_network_tests() {
     test_epoll_poll_socket_readiness_no_deadlock();
     test_epoll_check_fd_readiness_unknown_fd();
     test_epoll_edge_rearm_symmetry();
+    test_pipe_read_nonblock_returns_eagain();
+    test_epoll_pipe_eof_edge_after_partial_drain();
 
     #[cfg(all(kernel_tests, feature = "smoltcp"))]
     crate::syscall::run_socket_timeout_tests();
@@ -10919,6 +10921,155 @@ fn test_epoll_edge_rearm_symmetry() {
             first, second, third, r_first, r_second, r_third
         );
         panic!("epoll edge re-arm regression");
+    }
+}
+
+/// `read()` on an `O_NONBLOCK` pipe must return `EAGAIN`, not block.
+///
+/// The `PipeRead` arm of `sys_read` ignored `O_NONBLOCK` entirely until
+/// 2026-08-17 — it parked in `schedule_blocking(u64::MAX)` and only came back
+/// when the writer produced a byte or closed. Both sibling arms (`ChildStdout`,
+/// `UnixSocket`) honoured the flag, so this read like a per-fd-type oversight
+/// rather than a policy. It is not cosmetic: an async runtime does this read on
+/// its reactor thread, so the whole runtime stalls inside the kernel for as long
+/// as the child holds the pipe open.
+///
+/// Deliberately a *live writer* with an empty buffer — the one state where
+/// "block" and "EAGAIN" differ. With no writers the read returns 0 (EOF) on
+/// either behaviour and proves nothing.
+/// See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
+fn test_pipe_read_nonblock_returns_eagain() {
+    use crate::syscall::pipe::{pipe_create, pipe_write};
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
+
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 8032u32;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    let pipe_id = pipe_create();
+    let proc = akuma_exec::process::current_process_shared().unwrap();
+    let fd_w = proc.alloc_fd(FileDescriptor::PipeWrite(pipe_id));
+    let fd_r = proc.alloc_fd(FileDescriptor::PipeRead(pipe_id));
+    proc.set_nonblock(fd_r);
+
+    let mut buf = [0u8; 16];
+
+    // Empty pipe, writer still open: EAGAIN. Before the fix this call never
+    // returned and the test suite hung here instead of failing.
+    let empty = crate::syscall::fs::sys_read(u64::from(fd_r), buf.as_mut_ptr() as u64, buf.len());
+
+    // Data present: a normal short read, unaffected by O_NONBLOCK.
+    let _ = pipe_write(pipe_id, b"hi");
+    let with_data = crate::syscall::fs::sys_read(u64::from(fd_r), buf.as_mut_ptr() as u64, buf.len());
+
+    // Writer gone: EOF (0), which must NOT be reported as EAGAIN.
+    let _ = crate::syscall::fs::sys_close(fd_w);
+    let at_eof = crate::syscall::fs::sys_read(u64::from(fd_r), buf.as_mut_ptr() as u64, buf.len());
+
+    let _ = crate::syscall::fs::sys_close(fd_r);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    let want_eagain = (-11i64) as u64; // -EAGAIN
+    if empty == want_eagain && with_data == 2 && at_eof == 0 {
+        crate::safe_print!(
+            160,
+            "[Test] pipe_read_nonblock_returns_eagain PASSED (empty=EAGAIN, data=2, eof=0)\n"
+        );
+    } else {
+        crate::safe_print!(
+            192,
+            "[Test] pipe_read_nonblock_returns_eagain FAILED: empty={} (want {}) data={} (want 2) eof={} (want 0)\n",
+            empty, want_eagain, with_data, at_eof
+        );
+        panic!("O_NONBLOCK pipe read regression");
+    }
+}
+
+/// The EOF edge must reach an edge-triggered watcher that drained the pipe
+/// while the writer was still open.
+///
+/// This is the whole `tokio::process::Command::output()` hang in one test, and
+/// it is the sequence `read_to_end` performs on every child's stdout:
+///
+/// 1. data arrives          -> `EPOLLIN` edge fires
+/// 2. reader drains it      -> must re-arm, or `last_ready` keeps `EPOLLIN`
+/// 3. drained, writer alive -> nothing ready, watcher parks
+/// 4. **writer closes**     -> the EOF edge, which is the step that was lost
+///
+/// Step 4 was silent because `pipe_can_read` folds "has bytes" and "at EOF" into
+/// the same `EPOLLIN`, so `revents & !last_ready` was 0 at step 4 unless step 2
+/// re-armed. The fix is both halves: `sys_read` calls `epoll_on_fd_drained`, and
+/// the read end now also reports `EPOLLHUP` once the last writer is gone.
+/// See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
+fn test_epoll_pipe_eof_edge_after_partial_drain() {
+    use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
+    use crate::syscall::pipe::{pipe_create, pipe_write};
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
+
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+
+    const EPOLLIN: u32 = 0x001;
+    const EPOLLHUP: u32 = 0x010;
+    const EPOLLET: u32 = 1 << 31;
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 8033u32;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    let pipe_id = pipe_create();
+    let proc = akuma_exec::process::current_process_shared().unwrap();
+    let fd_w = proc.alloc_fd(FileDescriptor::PipeWrite(pipe_id));
+    let fd_r = proc.alloc_fd(FileDescriptor::PipeRead(pipe_id));
+    proc.set_nonblock(fd_r);
+
+    let epfd = sys_epoll_create1(0);
+    let mut out = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 2];
+    let mut ev = crate::syscall::poll::EpollEvent { events: EPOLLET | EPOLLIN, _pad: 0, data: 7 };
+    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd_r, &raw mut ev as usize);
+
+    // 1. data arrives -> the edge fires.
+    let _ = pipe_write(pipe_id, b"EARLY");
+    let fired = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+
+    // 2. the watcher drains through the real syscall (this is what re-arms).
+    let mut buf = [0u8; 16];
+    let drained = crate::syscall::fs::sys_read(u64::from(fd_r), buf.as_mut_ptr() as u64, buf.len());
+
+    // 3. drained with the writer still open -> genuinely nothing ready.
+    let quiet = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+
+    // 4. the writer closes -> the EOF edge MUST arrive. This returned 0 forever
+    //    before the fix, which is exactly where tokio parked.
+    let _ = crate::syscall::fs::sys_close(fd_w);
+    let eof_edge = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    let eof_bits = out[0].events;
+
+    let _ = crate::syscall::fs::sys_close(fd_r);
+    let _ = crate::syscall::fs::sys_close(epfd as u32);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    // The EOF edge carries EPOLLIN (read() will return 0) and EPOLLHUP (no
+    // writers left). HUP is the bit that makes it a *new* edge at all.
+    let bits_ok = eof_bits & EPOLLIN != 0 && eof_bits & EPOLLHUP != 0;
+    if fired == 1 && drained == 5 && quiet == 0 && eof_edge == 1 && bits_ok {
+        crate::safe_print!(
+            192,
+            "[Test] epoll_pipe_eof_edge_after_partial_drain PASSED (fire=1 drain=5 quiet=0 eof_edge=1 bits=0x{:x})\n",
+            eof_bits
+        );
+    } else {
+        crate::safe_print!(
+            224,
+            "[Test] epoll_pipe_eof_edge_after_partial_drain FAILED: fire={} (want 1) drain={} (want 5) quiet={} (want 0) eof_edge={} (want 1) bits=0x{:x} (want IN|HUP)\n",
+            fired, drained, quiet, eof_edge, eof_bits
+        );
+        panic!("pipe EOF edge regression");
     }
 }
 

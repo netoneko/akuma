@@ -30,8 +30,24 @@ this family — aarch64 Linux has no bare `pipe`, only `pipe2`.
 **`O_NONBLOCK` is not applied here.** The `pipe2(2)` flag is accepted but
 `sys_pipe2` never calls `proc.set_nonblock` on the new fds — non-blocking
 pipe I/O is instead configured after the fact via `ioctl(fd, FIONBIO, ...)`
-(`src/syscall/term.rs`). Callers that pass `O_NONBLOCK` to `pipe2()` and
-never follow up with `FIONBIO` will get blocking pipe reads.
+(`src/syscall/term.rs`) or `fcntl(F_SETFL)`. Callers that pass `O_NONBLOCK` to
+`pipe2()` and never follow up will get blocking pipe reads.
+
+**Once the flag *is* set, `read()` honours it — but only since 2026-08-17.**
+The `PipeRead` arm of `sys_read` ignored `fd_is_nonblock` outright and parked in
+`schedule_blocking(u64::MAX)` on an empty pipe with a live writer, while both
+sibling arms (`ChildStdout`, `UnixSocket`) honoured it. The cost was not a slow
+read but a stalled *runtime*: an async reactor performs that read on its own
+thread, so the whole executor sat inside the kernel until the child closed the
+pipe. Regression: `pipe_read_nonblock_returns_eagain` in the boot suite;
+[`../../../archive/TOKIO_PIPE_EPOLL_HANG.md`](../../../archive/TOKIO_PIPE_EPOLL_HANG.md).
+
+**A read end reports `POLLHUP` once the last writer is gone** (`pipe_hup`),
+whether or not the caller asked for it, as Linux does. This is load-bearing for
+edge-triggered watchers rather than cosmetic: `pipe_can_read` folds "has bytes"
+and "at EOF" into a single `POLLIN`, so without a distinct bit the
+*drained → EOF* transition yields `revents & !last_ready == 0` and the EOF edge
+is swallowed. See [`poll.md`](poll.md) for the edge bookkeeping.
 
 ## Fd allocation & refcounting
 

@@ -16,6 +16,7 @@ Start from the symptom or task on the left.
 | Recovering a wedged / hung / 100%-CPU VM | [`recover-wedged-vm.md`](recover-wedged-vm.md) |
 | Debugging networking (native smoltcp stack) | [`debug-network.md`](debug-network.md) |
 | A client hangs only when the server is slow to send its first byte | [`debug-delayed-first-byte.md`](debug-delayed-first-byte.md) |
+| An async runtime's child process never completes — the child exits in milliseconds, the caller times out | [`debug-async-subprocess-hang.md`](debug-async-subprocess-hang.md) |
 | Running Redis — the Alpine package, or the official `redis:alpine` image in a box | [`run-redis.md`](run-redis.md) |
 | Debugging OOM / panics / allocation failures | [`debug-memory-oom.md`](debug-memory-oom.md) |
 | Debugging an EL1 crash / data abort / unhandled exception | [`debug-exceptions.md`](debug-exceptions.md) |

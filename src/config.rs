@@ -768,6 +768,28 @@ pub const SYSCALL_DEBUG_NET_ENABLED: bool = false;
 /// to avoid serial floods; increase for quieter traces, decrease (e.g. 512) while debugging.
 pub const EPOLL_ZERO_SAMPLE_INTERVAL: u64 = 64;
 
+/// Trace every **edge-triggered** (`EPOLLET`) readiness decision in `sys_epoll_pwait`:
+/// one line per fd whose `revents != 0`, showing `rev` (readiness now), `last`
+/// (the edge already reported), the resulting `new` bits, and whether the event
+/// was delivered or **SUPPRESSED** by the edge bookkeeping.
+///
+/// This is the flag that shows a *lost edge* — the failure mode where the fd is
+/// permanently ready, the watcher is parked forever, and nothing else in the log
+/// looks wrong. Turn it on when an epoll-driven runtime (tokio/mio, hyper, Go)
+/// hangs on an fd that a blind `read()` proves has data or EOF waiting.
+/// Independent of `SYSCALL_DEBUG_NET_ENABLED`, which floods the same traces with
+/// TCP/UDP/DNS noise.
+///
+/// The signature to look for is a first `deliver` followed by an unbroken run of
+/// `SUPPRESSED` on the same fd:
+/// ```text
+/// [epoll] ET epfd=3 fd=9 rev=0x1 last=0x0 new=0x1 deliver
+/// [epoll] ET epfd=3 fd=9 rev=0x1 last=0x1 new=0x0 SUPPRESSED   <- and forever after
+/// ```
+/// See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md` for the investigation this was
+/// written for. Chatty: one line per ready fd per `epoll_pwait` iteration.
+pub const SYSCALL_DEBUG_EPOLL_EDGE: bool = false;
+
 /// Option to disable [ext2] debug prints to the kernel log.
 pub const DEBUG_EXT2: bool = false;
 

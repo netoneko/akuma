@@ -1,0 +1,23 @@
+# Own workspace root, like userspace/nca and userspace/nettest/rust: this crate
+# is NOT part of the root workspace (which targets `aarch64-unknown-none`) and
+# NOT a member of userspace/Cargo.toml (which is `no_std` on libakuma). It is deliberately a plain **std +
+# musl + pthreads** binary, because that is the exact runtime surface tokio uses
+# — the bug this probe was written for only reproduces on that stack.
+# Build with ./build-musl.sh; see README.md.
+[workspace]
+
+[package]
+name = "ncaprobe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ncaprobe"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+panic = "abort"

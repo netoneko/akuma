@@ -595,6 +595,13 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     );
                 }
             }
+            // O_NONBLOCK was ignored on this arm until 2026-08-17 — the sibling
+            // `ChildStdout` and `UnixSocket` arms both honoured it, this one
+            // parked in `schedule_blocking(u64::MAX)` instead. A reactor thread
+            // that read a drained-but-still-open pipe therefore blocked *inside
+            // the kernel* until the writer closed, stalling the whole runtime.
+            // See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
+            let nonblock = super::net::fd_is_nonblock(fd_num as u32);
             loop {
                 let (n, eof) = super::pipe::pipe_read(pipe_id, &mut temp);
                 if n > 0 {
@@ -612,10 +619,23 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         }
                         return EFAULT;
                     }
+                    // Re-arm the `EPOLLET` `EPOLLIN` edge, exactly as the socket
+                    // read paths do (`epoll_on_fd_drained`'s own doc comment
+                    // describes this hang for `EPOLLOUT`). Callers that do not
+                    // drain to EAGAIN before returning to `epoll_pwait` — which
+                    // is every `read_to_end` — would otherwise leave `last_ready`
+                    // holding `EPOLLIN` and never see another edge.
+                    super::poll::epoll_on_fd_drained(fd_num as u32);
                     return n as u64;
                 }
                 if eof {
                     return 0;
+                }
+                if nonblock {
+                    // Drained with the writer still open: re-arm before handing
+                    // back EAGAIN, or the arrival that follows fires no edge.
+                    super::poll::epoll_on_fd_drained(fd_num as u32);
+                    return EAGAIN;
                 }
                 if akuma_exec::process::should_interrupt_blocking_syscall() {
                     return EINTR;
@@ -636,12 +656,17 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     if copy_to_user(buf_ptr, &temp[..n]).is_err() {
                         return EFAULT;
                     }
+                    // Same edge re-arm as the `PipeRead` arm — a socketpair is
+                    // two pipes, and tokio's signal driver watches one of them
+                    // edge-triggered.
+                    super::poll::epoll_on_fd_drained(fd_num as u32);
                     return n as u64;
                 }
                 if eof {
                     return 0;
                 }
                 if nonblock {
+                    super::poll::epoll_on_fd_drained(fd_num as u32);
                     return EAGAIN;
                 }
                 if akuma_exec::process::should_interrupt_blocking_syscall() {

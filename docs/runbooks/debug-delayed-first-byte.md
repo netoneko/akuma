@@ -305,6 +305,10 @@ against `net_delay_server.py` on the host at `MEMORY=2048`:
 - [`../reference/subsystems/networking.md`](../reference/subsystems/networking.md)
   § "The native data path" — the audit: poll drivers, RX buffering, readiness
   predicates, and the full divergence table.
+- [`debug-async-subprocess-hang.md`](debug-async-subprocess-hang.md) — the same
+  edge-triggered class on **pipes** rather than sockets: defect 3's read-side
+  twin, found 2026-08-17 when `epoll_on_fd_drained` turned out to be wired into
+  the socket paths only. Read it if a *child process* hangs rather than a socket.
 - [`debug-network.md`](debug-network.md) — general native-stack debugging.
 - [`debug-futex-lost-wakeup.md`](debug-futex-lost-wakeup.md) — the lost-wakeup
   hunt whose shape the archive doc borrowed. Kept as a cross-reference for the
