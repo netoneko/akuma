@@ -97,14 +97,30 @@ table keyed by an internal `epoll_id` (not by fd) — an `EpollFd(id)`
    real readiness model (e.g. a plain file) fall through to the catch-all
    arm and are reported ready for whatever was requested — always-ready,
    not polled.
-3. `EPOLLET` (edge-triggered) bookkeeping is entirely local to this file:
-   `last_ready` per interest-list entry tracks what was already reported, so
-   an edge-triggered fd only re-fires on **new** bits since the last report.
-   `net.rs`/`fs.rs` call `epoll_on_fd_drained` after every socket read (see
-   [`net.md`](net.md)) specifically to reset that edge — without it, a
-   caller that reads one TLS record at a time without draining to `EAGAIN`
-   (BoringSSL/bun) would never see `EPOLLIN` fire again for buffered data
-   that arrived within the same poll window.
+3. `EPOLLET` (edge-triggered) bookkeeping lives in this file — `last_ready`
+   per interest-list entry tracks what was already reported, so an
+   edge-triggered fd only re-fires on **new** bits since the last report — but
+   the *resets* cannot. `last_ready` is refreshed only inside
+   `sys_epoll_pwait`'s own loop, so a level transition that happens and
+   un-happens between two passes is invisible to it. The I/O syscalls are the
+   only code that witnesses those transitions, so `net.rs`/`fs.rs` report them
+   back, in **both** directions:
+
+   | Hook | Called from | Clears | Why |
+   |---|---|---|---|
+   | `epoll_on_fd_drained` | `recvfrom`/`recvmsg`/`read` — every successful read **and** every `EAGAIN` | `EPOLLIN` | a caller that reads one TLS record at a time without draining to `EAGAIN` (BoringSSL/bun) would never see `EPOLLIN` fire again for data that arrived in the same poll window |
+   | `epoll_on_fd_write_blocked` | `sendto`/`sendmsg`/`write` — every **short** write **and** every `EAGAIN` | `EPOLLOUT` | a caller that fills the 16 KB TCP transmit buffer and waits for `EPOLLOUT` would wait forever: this loop drives `smoltcp_net::poll()` at the top of each pass, which usually flushes the buffer before readiness is computed, so `can_send()` is never *observed* false |
+
+   The write hook did not exist until 2026-08-17 and its absence was an
+   intermittent hang — intermittent precisely because it raced the flush
+   described above. If you add a new readiness bit here, add its reset hook at
+   the same time. Regression: `epoll_edge_rearm_symmetry` in the boot suite.
+
+   Note also what `epoll_check_fd_readiness` must NOT report: a TCP socket
+   still in `SynSent` answers `is_active() && !may_recv()`, the same pair a
+   peer's FIN produces, and reporting that as `EPOLLIN`/`EPOLLRDHUP` told
+   clients a *connecting* socket was already read-closed. See
+   [`../networking.md`](../networking.md) "Readiness reporting".
 4. No event ready and `timeout != 0`: `schedule_blocking(deadline)` — never
    a busy `yield_now()` spin. The 10 ms `BLOCKING_POLL_INTERVAL_US` cap
    still exists as a safety net for resources that don't yet support wakers

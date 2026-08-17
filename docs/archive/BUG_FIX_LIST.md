@@ -9,17 +9,17 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 622
-- **Docs contributing at least one fix:** 196
+- **Total distinct fixes counted:** 626
+- **Docs contributing at least one fix:** 197
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 127 | 20.4% | 17 |
-| Memory & Virtual Memory | 112 | 18.0% | 34 |
-| Scheduler & Process Management | 75 | 12.1% | 18 |
-| SMP & Locking | 79 | 12.7% | 34 |
-| Networking | 31 | 5.0% | 13 |
+| Syscall / ABI Compatibility Audits | 127 | 20.3% | 17 |
+| Memory & Virtual Memory | 112 | 17.9% | 34 |
+| Scheduler & Process Management | 75 | 12.0% | 18 |
+| SMP & Locking | 79 | 12.6% | 34 |
+| Networking | 35 | 5.6% | 14 |
 | Userspace Apps & Libraries | 35 | 5.6% | 19 |
 | Rump Kernel & Syscall Proxy | 25 | 4.0% | 6 |
 | Toolchain & Self-Hosting | 37 | 5.9% | 5 |
@@ -27,10 +27,10 @@ from several subsystems under one write-up.
 | VFS & Filesystem | 15 | 2.4% | 10 |
 | Boot & Drivers | 11 | 1.8% | 6 |
 | Signals & Exceptions | 12 | 1.9% | 5 |
-| Misc / Cross-cutting | 14 | 2.3% | 4 |
+| Misc / Cross-cutting | 14 | 2.2% | 4 |
 | Console & Terminal | 15 | 2.4% | 7 |
-| Containers | 19 | 3.1% | 5 |
-| **Total** | **622** | **100.0%** | **196** |
+| Containers | 19 | 3.0% | 5 |
+| **Total** | **626** | **100.0%** | **197** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -625,7 +625,7 @@ aren't recorded anywhere else.)
 - `threading::init` stored `FREE` over the `RUNNING` state of thread slots secondary cores had already adopted (self-test image brings secondaries up before init), handing live slots back to the allocator for the next `claim_free_slot` to hand out a second time — fixed by skipping adopted core-idle slots in the state-reset loop
 - The same init's stack pre-allocation loop overwrote those slots' `stacks[i]` and `exception_stack_top` with fresh PMM stacks nothing was executing on, so `validate_current_sp`, the canary check and the high-water probe all read the wrong memory for a live core — and it silently vacuumed the boot suite's `spurious == 0` canary assertion, which is why the bug above went unnoticed; fixed by the same `is_adopted_core_idle` guard, with regression `test_core_idle_slots_survive_init`
 
-## Networking (31 fixes, 13 docs)
+## Networking (35 fixes, 14 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - `MAX_BACKLOG = 8` (`crates/akuma-net/src/socket.rs`) was a hard ceiling on **simultaneous connection arrivals**, not the soft hint `listen(2)`'s backlog is on Linux: this stack has no SYN queue, a listener *is* a fixed pool of pre-created sockets sitting in `Listen` that `socket_accept` replenishes one at a time, so arrivals past the 8th got a RST regardless of how fast the server accepted. Every caller's requested backlog was silently clamped to it (`libakuma`'s `TcpListener::bind` asks for 128). Measured on devbox-smoltcp/SMP=4: 8/8 connections clean, 12/16, 17/24 before; 16/16 and 24/24 after. Raised to 32 behind the default-on `many-sessions` feature, which also lifts the smoltcp socket table from 32 to 128 on `small-sockets` builds — a 32-deep backlog is meaningless against a 32-socket budget. `kernel_profile_extreme` overrides both back down, so the 4 MB floor is unaffected
@@ -684,6 +684,12 @@ aren't recorded anywhere else.)
 ### docs/archive/VIRTIO_MMIO_LEGACY_TO_MODERN.md
 - `force-legacy` incorrectly defaulted to true, masking the modern VirtIO MMIO v2 path
 
+
+### docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md
+- A TCP socket still in `SynSent` was reported read-closed — `is_active() && !may_recv()` is the same pair a peer's FIN produces, so a *connecting* socket raised `EPOLLIN`+`EPOLLRDHUP` and a non-blocking `recv` on it returned `Ok(0)`; a tokio/hyper client that polled inside the one-round-trip SYN window concluded the connection was dead and parked forever **without ever sending its request** (~1 run in 3 at a 64 KiB POST body), fixed by gating both predicates on `tcp_reached_established`
+- Blocking TCP `read`/`recv` was capped at an undeclared 30 s (and `write`/`send` at 5 s), returning `ETIMEDOUT` at a deadline no client had set — a 35 s-delayed response died at 30069 ms, and it killed **mid-stream** reads just as readily (a 40 s idle after a good first chunk died at 30125 ms), so the symptom was never specific to the first byte; both now block indefinitely unless the caller sets a timeout
+- `SO_RCVTIMEO`/`SO_SNDTIMEO` were accepted by `setsockopt` and silently discarded, with no `getsockopt` arm at all, so a 2 s read timeout actually fired at 30041 ms (the cap above) and the client could not detect the loss; now a real per-socket `struct timeval` with POSIX zero-means-block-forever, `EINVAL` on a malformed value, and a working 16-byte readback
+- The `EPOLLET` **write** edge was never re-armed — `epoll_on_fd_drained` reset `EPOLLIN` and had no `EPOLLOUT` counterpart — so a client that filled the 16 KB transmit buffer and waited for `EPOLLOUT` could wait forever; intermittent because `epoll_pwait` drives `smoltcp_net::poll()` at the top of its own loop and usually flushed the buffer before `can_send()` was ever *observed* false. Added `epoll_on_fd_write_blocked`, called from `sendto`/`sendmsg`/`write` on every short write and every `EAGAIN`
 
 ## Userspace Apps & Libraries (35 fixes, 19 docs)
 

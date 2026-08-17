@@ -53,6 +53,13 @@ here, because a new hang is likely to rhyme with one of them.
 | 3 | `EPOLLET` **write** edge never re-armed | a client that filled the 16 KB transmit buffer waited forever for `EPOLLOUT`; intermittent, because `epoll_pwait` flushes the buffer itself before it can observe `can_send()` go false | `epoll_on_fd_write_blocked`, called from `sendto`/`sendmsg`/`write` |
 | 4 | A socket in **`SynSent`** reported read-closed | `EPOLLIN` + `EPOLLRDHUP` and `recv() == Ok(0)` on a connection that had never carried a byte; client parked forever **without sending its request** — ~1 run in 3 | `tcp_reached_established` guards both predicates |
 
+The four were found in that order, and **the order matters as a warning**:
+fixing 3 on its own left the 64 KiB POST still hanging roughly 1 run in 3, which
+is easy to misread as "the fix didn't work" rather than "there is a second race
+here". Two independent races with overlapping symptoms is the situation this
+runbook exists for — do not stop at the first green run, and do not assume one
+fix explains the whole symptom until the repeat test in step 5b is clean.
+
 Defect 4 was the dominant one and it is the reason this symptom looked like it
 was about *delay*. It is a race against the SYN window, so anything that shifts
 timing — a bigger request body, a slower peer — changes how often it fires.
@@ -265,6 +272,12 @@ You have a usable result when all of these hold:
    question is answered rather than assumed.
 6. Step 5b was run **at least 12 times**, because defects 3 and 4 were races
    that a single run passes by luck.
+7. If you changed the kernel to get here, the boot log still shows SSH working
+   and the suite still green. A socket fd released with a bare
+   `remove_socket()` instead of `sys_close` double-drops on deferred reap and
+   silently destroys whatever owns the recycled slot — that is how this very
+   investigation broke sshd for four boots
+   (`../reference/subsystems/networking.md` -> "Socket lifetime").
 
 For reference, these are the numbers a healthy kernel produced on 2026-08-17,
 against `net_delay_server.py` on the host at `MEMORY=2048`:

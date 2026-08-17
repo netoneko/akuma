@@ -276,6 +276,40 @@ exist until 2026-08-17, and its absence was a hang: a client that filled the
 often flushed the buffer before it ever observed `can_send()` go false.
 Regression: `epoll_edge_rearm_symmetry` in the boot suite.
 
+### Socket lifetime: never bypass the fd refcount
+
+A `KernelSocket` is destroyed by the **last** close, not the first:
+`KernelSocket::refs` counts fd-table references, `socket_clone_ref` bumps it
+(fork's fd-table copy, `dup`/`dup2`/`F_DUPFD`) and `remove_socket` drops it.
+That field exists because the first close used to destroy the socket under every
+other fd still using it — the freed table slot **and** the smoltcp handle were
+then reused by the next connection, splicing two unrelated TCP streams together
+(TLS record bytes inside an SSH session → "message authentication code
+incorrect").
+
+The rule that follows: **anything holding a `FileDescriptor::Socket` releases it
+through `sys_close`**, which removes the fd-table entry and drops exactly one
+reference. Calling `remove_socket(idx)` directly while leaving the fd in the
+table drops the socket now and drops it *again* when the owning process is
+reaped — and process teardown is deferred, so by then the freed slot may belong
+to somebody else.
+
+That is not hypothetical. A boot self-test added on 2026-08-17 did exactly this,
+and the second close landed on **sshd's listener** moments after the suite handed
+the slot over. The symptom was maximally misleading: sshd bound, listened, and
+sat in a healthy non-blocking accept loop forever, while every client got
+
+```
+kex_exchange_identification: read: Connection reset by peer
+```
+
+— which is the same line an exhausted listener backlog produces (see
+`socket::MAX_BACKLOG`). `httpd` on :8080 kept serving normally, so the network
+stack looked fine. The tell was sshd's `[PSTATS]` line: `accept=N` climbing with
+**no** `clone`, `write` or `close` alongside it, meaning not one connection had
+ever been accepted since boot. Compare that against a known-good boot before
+suspecting the network.
+
 ### Divergences from Linux (native stack)
 
 These are the ones that change observable client behaviour. Several look like

@@ -5,8 +5,9 @@
 rustc 1.99.0 in the guest).
 **Status:** **submodule swapped to upstream 2026-08-17**; host-built upstream
 binary **verified against host Ollama from the guest** (two full round trips).
-In-guest build still blocked by the spawn EFAULT (§1); slow-model hang is a
-new open kernel suspicion (§2b). Patches needed on top of upstream HEAD are in
+In-guest build still blocked by the spawn EFAULT (§1); the slow-model hang
+(§2b) was **root-caused and FIXED 2026-08-17** — four kernel defects, see
+`SOCKET_DELAYED_FIRST_BYTE_HANG.md` § Resolution. Patches needed on top of upstream HEAD are in
 `userspace/nca/upstream-akuma-patches.patch`.
 
 ## TL;DR
@@ -17,7 +18,7 @@ new open kernel suspicion (§2b). Patches needed on top of upstream HEAD are in
 | `socket(AF_UNIX)` unimplemented → nca IPC dies with EAFNOSUPPORT | **Patched in-tree** (bind failure degrades to IPC-less mode) |
 | Upstream HEAD won't cross-build: `openssl-sys` via `mcpr` + core's own `reqwest` | **Patched in-tree** (two one-liners, §4b) |
 | `scp`/SFTP into the guest times out | Use HTTP: host `python3 -m http.server`, guest `wget http://10.0.2.2:<port>/...` (§3) |
-| nca↔Ollama verified | qwen3.5:0.8b instant round trips OK; gemma4:e4b (slow prefill) hangs — kernel suspicion §2b |
+| nca↔Ollama verified | qwen3.5:0.8b instant round trips OK; gemma4:e4b hang **FIXED 2026-08-17** (§2b) — it was not prefill time, it was four kernel defects, dominant one a `SynSent` socket reported read-closed |
 
 ## 0. Submodule swap (2026-08-17)
 
@@ -128,10 +129,22 @@ until the kernel fix lands.
 filesystem-backed rendezvous. Nontrivial: per-path listener table, `connect`
 blocking model, VFS special-file entries.
 
-## 2b. NEW OPEN: slow first byte on a socket → read hangs (lost wakeup?)
+## 2b. slow first byte on a socket → read hangs — FIXED 2026-08-17
 
 Full write-up moved to **`SOCKET_DELAYED_FIRST_BYTE_HANG.md`** (also
 DEVBOX_ISSUES Issue 17); summary retained here.
+
+> **FIXED 2026-08-17.** Filed as "lost wakeup?" — it was not. Four separate
+> kernel defects, the dominant one a socket still in `SynSent` being reported
+> read-closed (`EPOLLIN`+`EPOLLRDHUP`, `recv() == Ok(0)`), which made nca park
+> forever *before sending its request*. The gemma-vs-qwen split was request
+> **size** shifting timing into that SYN window, not prefill being slow. Plus an
+> undeclared 30 s blocking-read cap (which also killed mid-stream reads, so the
+> "first byte" framing below is wrong), a dropped `SO_RCVTIMEO`, and an
+> `EPOLLET` write edge that was never re-armed. Resolution, measurements and
+> regression tests: `SOCKET_DELAYED_FIRST_BYTE_HANG.md` § Resolution; procedure
+> and probes: `docs/runbooks/debug-delayed-first-byte.md`. The summary below is
+> the original filing, kept verbatim.
 
 **Symptom:** nca↔Ollama over SLIRP works end-to-end for **instant** responses
 (qwen3.5:0.8b: `2+2 → 4`, `3+3 → 6`, full SSE stream, session completed) but

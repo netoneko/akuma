@@ -102,9 +102,31 @@ fixed-size handshake read, not a conformant SEQPACKET implementation.
 - `setsockopt`/`getsockopt`: unrecognized `level`/`optname` pairs are not an
   error — they're logged and treated as a successful no-op (`0`), matching
   the common "ignore options we don't model" strategy rather than
-  `ENOPROTOOPT`. `getsockopt` always writes back an `optlen` of `4` and
-  requires the caller's buffer to be at least 4 bytes; anything smaller →
-  `EFAULT`.
+  `ENOPROTOOPT`. For the 4-byte integer options `getsockopt` writes back an
+  `optlen` of `4` and requires the caller's buffer to be at least 4 bytes;
+  anything smaller → `EFAULT`.
+- **`SO_RCVTIMEO` (20) / `SO_SNDTIMEO` (21) are the exception to that no-op
+  rule, and they are the reason the rule is dangerous.** Both are real:
+  the value is a 16-byte AArch64 `struct timeval` (`{i64 tv_sec; i64
+  tv_usec;}`), stored per socket and consumed by the blocking `recv`/`send`
+  wait. Corners that matter:
+  - An all-zero timeval means **block indefinitely** (POSIX), not "expire
+    immediately". `getsockopt` reports "no timeout" the same way.
+  - A negative field, or an `optlen` below 16, is `EINVAL` — not a silent
+    accept.
+  - `getsockopt` answers these two with 16 bytes and sets `optlen` to 16,
+    unlike every other option here. That readback is what lets a client tell
+    "honoured" from "dropped", and Rust's `TcpStream::read_timeout()` is
+    exactly this call.
+
+  Until 2026-08-17 both fell through the no-op arm: accepted, reported
+  successful, and discarded, with no `getsockopt` arm at all — so a client
+  that bounded a read to 2 s was not bounded, and could not detect it. It then
+  died at the kernel's own undeclared 30 s blocking-read cap instead. Both the
+  cap and the missing option are gone; regression
+  `socket_timeout_option_roundtrip` in the boot suite. The lesson generalises:
+  **a silently-accepted option is indistinguishable from a working one unless
+  `getsockopt` can read it back**, so anything added here should be readable.
 - `connect`: a real in-progress non-blocking connect surfaces
   `EINPROGRESS`, not folded into the generic `neg_errno(e)` path — this is
   the one connect-specific error code callers should expect to see and

@@ -1198,8 +1198,17 @@ compile-time constants today.
 
 ## Issue 17: socket read hangs forever when the response's first byte is delayed
 
-**Status: OPEN (found 2026-08-17), kernel suspicion — lost wakeup of a
-blocked socket reader after a long idle window.**
+**Status: FIXED 2026-08-17.** Filed with a lost-wakeup suspicion; it was
+four separate kernel defects and none of them was a lost wakeup. Dominant one:
+a socket still in `SynSent` answers `is_active() && !may_recv()` — the same
+pair a peer's FIN produces — so a *connecting* socket was reported
+`EPOLLIN`+`EPOLLRDHUP` with `recv() == Ok(0)`, and the client parked forever
+without ever sending its request. Also an undeclared 30 s blocking-read cap
+(which killed mid-stream reads too, so "first byte" is a misnomer), a silently
+dropped `SO_RCVTIMEO`/`SO_SNDTIMEO`, and an `EPOLLET` write edge that was never
+re-armed. Full resolution: `SOCKET_DELAYED_FIRST_BYTE_HANG.md` § Resolution.
+Procedure + probes: `docs/runbooks/debug-delayed-first-byte.md`. The original
+filing below is kept verbatim.
 
 Found dogfooding `nca` (upstream `native-cli-ai`, host-built musl-static,
 see `NCA_MISSING_SYSCALLS.md`) against host Ollama at `10.0.2.2:11434`:
