@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI will write 600 bugs and I will write 600 more</title>
+<style>
+  /* ─────────────────────────────────────────────────────────────
+     Committed single-theme deck (projected, so dark is the design,
+     not a preference). Every colour is painted explicitly.
+       ground  sumi-indigo         ink   bone
+       shu     朱色 vermilion       ai    pale indigo
+     Type carries the split the talk is about:
+       mono  = anything measured        serif = anything argued
+     ───────────────────────────────────────────────────────────── */
+  :root {
+    --ground:   #12141b;
+    --panel:    #191d26;
+    --rule:     #2b3140;
+    --rule-soft:#21262f;
+    --ink:      #e8e6e1;
+    --ink-2:    #b6bac3;
+    --dim:      #8b929f;
+    --shu:      #e2553c;
+    --shu-soft: rgba(226, 85, 60, 0.13);
+    --ai:       #7a9cc6;
+
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+
+    --pad: clamp(1.4rem, 4.5vw, 5.5rem);
+    --rail: clamp(2.5rem, 4.5vw, 4.5rem);
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--serif);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── deck mechanics ─────────────────────────────────────────── */
+  .deck {
+    height: 100dvh;
+    overflow-y: auto;
+    scroll-snap-type: y mandatory;
+    scroll-behavior: smooth;
+    scrollbar-width: none;
+  }
+  .deck::-webkit-scrollbar { display: none; }
+  @media (prefers-reduced-motion: reduce) { .deck { scroll-behavior: auto; } }
+
+  .slide {
+    min-height: 100dvh;
+    scroll-snap-align: start;
+    scroll-snap-stop: always;
+    display: grid;
+    grid-template-columns: var(--rail) 1fr;
+    align-items: center;
+    border-bottom: 1px solid var(--rule-soft);
+    padding: clamp(2rem, 5vh, 4.5rem) var(--pad) clamp(2rem, 5vh, 4.5rem) 0;
+  }
+  .num {
+    align-self: stretch;
+    padding: clamp(2rem, 5vh, 4.5rem) clamp(0.6rem, 1.4vw, 1.3rem) 0 0;
+    border-right: 1px solid var(--rule-soft);
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.14em;
+    color: var(--dim);
+    text-align: right;
+  }
+  .body {
+    padding-left: clamp(1rem, 2.4vw, 2.4rem);
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: clamp(0.85rem, 2vh, 1.6rem);
+  }
+
+  /* ── type ───────────────────────────────────────────────────── */
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--shu);
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+  }
+  .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
+  .eyebrow.cool { color: var(--ai); }
+
+  h1 {
+    font-family: var(--serif);
+    font-weight: 400;
+    font-size: clamp(2.1rem, 5.4vw, 4.6rem);
+    line-height: 1.0;
+    letter-spacing: -0.022em;
+    text-wrap: balance;
+    margin: 0;
+  }
+  h1 .n600 { color: var(--shu); font-style: italic; }
+  h2 {
+    font-family: var(--serif);
+    font-weight: 400;
+    font-size: clamp(1.6rem, 3.5vw, 2.9rem);
+    line-height: 1.07;
+    letter-spacing: -0.017em;
+    text-wrap: balance;
+    margin: 0;
+    max-width: 32ch;
+  }
+  h2 em { font-style: italic; color: var(--shu); }
+  h2 .cool { font-style: italic; color: var(--ai); }
+
+  p { font-size: clamp(0.98rem, 1.2vw, 1.14rem); line-height: 1.55; color: var(--ink-2); max-width: 62ch; margin: 0; }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  em.q { color: var(--shu); font-style: italic; }
+  code, .m { font-family: var(--mono); font-size: 0.87em; color: var(--ink); font-variant-numeric: tabular-nums; }
+
+  .sub {
+    font-family: var(--mono);
+    font-size: clamp(0.78rem, 1.1vw, 1rem);
+    letter-spacing: 0.02em;
+    color: var(--ai);
+    margin: 0;
+  }
+  ul { margin: 0; padding-left: 1.15rem; display: flex; flex-direction: column; gap: 0.5rem; }
+  li { font-size: clamp(0.95rem, 1.15vw, 1.08rem); line-height: 1.5; color: var(--ink-2); max-width: 60ch; }
+  li::marker { color: var(--shu); }
+
+  .pull {
+    font-family: var(--serif);
+    font-size: clamp(1.2rem, 2.2vw, 1.85rem);
+    line-height: 1.22;
+    letter-spacing: -0.012em;
+    color: var(--ink);
+    margin: 0;
+    max-width: 36ch;
+    text-wrap: balance;
+    border-top: 2px solid var(--shu);
+    padding-top: clamp(0.7rem, 1.6vh, 1.1rem);
+  }
+  .pull.cool { border-top-color: var(--ai); }
+
+  /* ── data ───────────────────────────────────────────────────── */
+  .scroller { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 26rem;
+    font-family: var(--mono);
+    font-size: clamp(0.7rem, 0.92vw, 0.84rem);
+    font-variant-numeric: tabular-nums;
+  }
+  th {
+    text-align: left; font-weight: 500; text-transform: uppercase;
+    letter-spacing: 0.11em; font-size: 0.64rem; color: var(--dim);
+    padding: 0 0.85rem 0.55rem 0; border-bottom: 1px solid var(--rule); vertical-align: bottom;
+  }
+  td { padding: 0.58rem 0.85rem 0.58rem 0; border-bottom: 1px solid var(--rule-soft); color: var(--ink-2); vertical-align: top; }
+  th:last-child, td:last-child { padding-right: 0; }
+  tr.self td { color: var(--ink); background: var(--shu-soft); }
+  tr.self td:first-child { box-shadow: inset 3px 0 0 var(--shu); padding-left: 0.65rem; }
+  .hot { color: var(--shu); }
+
+  pre {
+    font-family: var(--mono);
+    font-size: clamp(0.68rem, 0.9vw, 0.82rem);
+    line-height: 1.75;
+    color: var(--ink-2);
+    background: var(--panel);
+    border: 1px solid var(--rule-soft);
+    border-left: 2px solid var(--shu);
+    padding: clamp(0.7rem, 1.6vw, 1.1rem);
+    margin: 0;
+    overflow-x: auto;
+  }
+  pre .d { color: var(--dim); }
+  pre .out { color: var(--shu); }
+
+  .figs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(8.5rem,100%),1fr)); gap: 1px; background: var(--rule-soft); border: 1px solid var(--rule-soft); }
+  .fig { background: var(--panel); padding: clamp(0.75rem, 1.7vw, 1.15rem); }
+  .fig .v { display: block; font-family: var(--mono); font-size: clamp(1.2rem, 2.5vw, 1.85rem); letter-spacing: -0.03em; color: var(--ink); line-height: 1.05; font-variant-numeric: tabular-nums; }
+  .fig .v.hot { color: var(--shu); }
+  .fig .k { display: block; margin-top: 0.45rem; font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.13em; text-transform: uppercase; color: var(--dim); }
+
+  /* ── opener ─────────────────────────────────────────────────── */
+  .hero { display: grid; grid-template-columns: 1fr; gap: clamp(1.2rem, 3vw, 2.5rem); align-items: center; }
+  @media (min-width: 60rem) { .hero { grid-template-columns: 1.35fr 0.65fr; } }
+  .hero img {
+    width: 100%; height: auto; display: block;
+    border: 1px solid var(--rule);
+    filter: saturate(0.92) contrast(1.02);
+  }
+  .hero figure { margin: 0; }
+  .hero figcaption { font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); margin-top: 0.55rem; }
+
+  /* ── rail ───────────────────────────────────────────────────── */
+  .rail { position: fixed; left: 0; top: 0; bottom: 0; width: var(--rail); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.4rem; z-index: 20; pointer-events: none; }
+  .rail button { pointer-events: auto; appearance: none; background: none; border: 0; padding: 0; width: 1rem; height: 0.58rem; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+  .rail button::before { content: ""; width: 0.6rem; height: 1px; background: var(--rule); transition: background 160ms ease, width 160ms ease; }
+  .rail button:hover::before { background: var(--ink-2); width: 0.9rem; }
+  .rail button[aria-current="true"]::before { background: var(--shu); width: 1rem; height: 2px; }
+  .rail button:focus-visible { outline: 1px solid var(--ai); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { .rail button::before { transition: none; } }
+
+  .hint { position: fixed; right: var(--pad); bottom: clamp(0.8rem, 2vh, 1.4rem); font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.13em; text-transform: uppercase; color: var(--dim); z-index: 20; pointer-events: none; }
+  .hint kbd { font-family: var(--mono); border: 1px solid var(--rule); padding: 0.08rem 0.28rem; color: var(--ink-2); }
+
+  @media (max-width: 44rem) {
+    .slide { grid-template-columns: 1fr; padding-left: var(--pad); }
+    .num { display: none; }
+    .body { padding-left: 0; }
+    .hint { display: none; }
+    .rail { width: auto; left: auto; right: 0; padding-right: 0.45rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="rail" id="rail" aria-label="Slide navigation"></div>
+
+<main class="deck" id="deck">
+
+  <!-- 01 -->
+  <section class="slide">
+    <div class="num">01</div>
+    <div class="body">
+      <div class="hero">
+        <div style="display:flex;flex-direction:column;gap:clamp(0.9rem,2.4vh,1.8rem)">
+          <p class="eyebrow">Akuma OS</p>
+          <h1>AI will write <span class="n600">600 bugs</span><br>and I will write <span class="n600">600 more</span></h1>
+          <p class="sub">at some point you gotta do some real engineering</p>
+        </div>
+        <figure>
+          <img src="lock_in.jpg" alt="Meme: an older man holding out a cigarette, captioned &quot;Your ancestors need you to lock in son.&quot;">
+          <figcaption>the operative engineering principle</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- 02 -->
+  <section class="slide">
+    <div class="num">02</div>
+    <div class="body">
+      <p class="eyebrow">622 documented, dated, fixed</p>
+      <h2>The checks got <em>cheap too</em></h2>
+      <p>More code generated means more code to check. <strong>But the same shift that made
+      the code cheap makes the checks cheap</strong> — probes, tripwires, self-tests, boot
+      suites, A/B runs on real workloads, all cheap enough to write per-bug and leave in
+      place.</p>
+      <p class="pull">So the checks stop being a budget item you ration, and start being the
+      default response to <em class="q">every change.</em></p>
+    </div>
+  </section>
+
+  <!-- 03 -->
+  <section class="slide">
+    <div class="num">03</div>
+    <div class="body">
+      <p class="eyebrow">Act I · the landscape</p>
+      <h2>Competitive landscape</h2>
+      <div class="scroller">
+        <table>
+          <thead><tr><th></th><th>Redox</th><th>Asterinas</th><th>Akuma</th></tr></thead>
+          <tbody>
+            <tr><td>since · people</td><td>2015 · team + nonprofit</td><td>~2022 · 50+, 3 universities</td><td>2026 · 1</td></tr>
+            <tr><td>funding</td><td>EU NGI grants</td><td>Ant Group + Intel</td><td>none</td></tr>
+            <tr><td>high-water</td><td>COSMIC desktop, packages</td><td><span class="hot">nginx faster than Linux</span>, Firefox, Redis at parity</td><td>Redis + official image, Go, rustc, llama.cpp</td></tr>
+            <tr class="self"><td>builds itself</td><td>not yet</td><td>not established</td><td><strong>yes</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Asterinas is the one worth studying.</strong> A <em>framekernel</em>: all
+      <code>unsafe</code> is confined to one library (OSTD, ~15k lines, <strong>14% of the
+      kernel</strong> — about the size of seL4's verified core), so every service above it
+      is written in <strong>100% safe Rust</strong>.</p>
+      <p><strong>And they drew a hard boundary around formal verification.</strong> They verify
+      the tiny TCB for memory safety — tractable at 15k lines — then say memory safety is
+      effectively solved and focus shifts to <em>bugs beyond safety</em>. For those they
+      reach for <strong>model checking and tests</strong>, not proofs. Logic-level
+      verification is explicitly aspirational.</p>
+      <p class="pull cool">The team most invested in proofs scoped them to the 14% where
+      proofs work, and used practical tools for everything else.</p>
+    </div>
+  </section>
+
+  <!-- 04 -->
+  <section class="slide">
+    <div class="num">04</div>
+    <div class="body">
+      <p class="eyebrow">Act I · the landscape</p>
+      <h2>Same pressure, <em>opposite answers</em></h2>
+      <div class="scroller">
+        <table>
+          <thead><tr><th></th><th>AI-contribution policy</th></tr></thead>
+          <tbody>
+            <tr><td>Redox</td><td><strong>Banned</strong>, Feb 2026, enforced — LLM-labelled contributions closed on sight; bypassing it is a project ban</td></tr>
+            <tr><td>Asterinas</td><td><strong>Welcomed and automated</strong> — <em>"AI is welcome, but the human is responsible"</em>; ships an AI PR-review bot</td></tr>
+            <tr class="self"><td>Akuma</td><td>No policy. Built with AI from the start</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Same pressure — generation outpacing review capacity. Two structurally opposite
+      answers, both from funded, multi-institution projects.</p>
+      <p class="pull">Both policies legislate <em class="q">who writes the code.</em> Neither
+      addresses who keeps it.</p>
+    </div>
+  </section>
+
+  <!-- 05 -->
+  <section class="slide">
+    <div class="num">05</div>
+    <div class="body">
+      <p class="eyebrow">Act II · the workflow</p>
+      <h2>Have a concrete goal: <em>run X</em></h2>
+      <p>Not "improve the memory subsystem". <strong>Compatibility with X, in order to run
+      X.</strong></p>
+      <div class="scroller">
+        <table>
+          <thead><tr><th>target</th><th>what it forced</th></tr></thead>
+          <tbody>
+            <tr><td><strong>redis</strong></td><td><code>/proc/&lt;pid&gt;/*</code>, <code>MADV_FREE</code> honesty, TCP connect-state, short-write <code>writev</code></td></tr>
+            <tr><td><strong>rust / cargo</strong></td><td><code>MAP_SHARED</code> writeback, 128 KB argv, thread-group reaping, <code>getpriority</code></td></tr>
+            <tr><td><strong>golang</strong></td><td>signals on a foreign signal stack, pidfd, <code>waitid</code> parentage, fork/exec</td></tr>
+            <tr><td><strong>llama.cpp</strong></td><td>lazy mmap, file-page eviction, heap-growth headroom</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="pull">A real program is a specification you didn't write and
+      <em class="q">can't argue with.</em></p>
+    </div>
+  </section>
+
+  <!-- 06 -->
+  <section class="slide">
+    <div class="num">06</div>
+    <div class="body">
+      <p class="eyebrow">Act II · the workflow</p>
+      <h2>Audit before touching code</h2>
+      <p><strong>Update the references and the diagrams first.</strong> Then reason about
+      where the problem could be.</p>
+      <ul>
+        <li>Re-measure the project's own headline numbers. One audit opened by knocking a
+        claimed <strong>88.8%</strong> down to <strong>23.0%</strong> — the gap was a bug in
+        the profiler.</li>
+        <li>Standing rule: <strong>never trust a percentage without re-measuring.</strong></li>
+        <li>Enumerate the candidate theories explicitly, before writing any code.</li>
+      </ul>
+      <p class="pull">Updating the docs is how you find out your mental model and the code
+      have diverged — cheaper than finding out from a fault address.</p>
+    </div>
+  </section>
+
+  <!-- 07 -->
+  <section class="slide">
+    <div class="num">07</div>
+    <div class="body">
+      <p class="eyebrow">Act II · the workflow</p>
+      <h2>Isolate theories with probes, <em>then discredit them</em></h2>
+      <p><strong>Build the smallest thing that can tell two theories apart. Kill theories
+      until one survives.</strong></p>
+      <p><strong>Adding instrumentation and tracking the data flow is always worth it.</strong>
+      Where a value came from, who owns it, when it was freed — that work is never wasted,
+      even when the theory it was built for turns out to be wrong.</p>
+      <p>Probes inspect <em>state</em>, not behaviour. Keep the good ones; leave them armed.</p>
+      <p class="pull">The bug is almost never <em class="q">where the error appears.</em></p>
+    </div>
+  </section>
+
+  <!-- 08 -->
+  <section class="slide">
+    <div class="num">08</div>
+    <div class="body">
+      <p class="eyebrow">Act II · the workflow</p>
+      <h2>Then A/B it on <em>real workloads</em></h2>
+      <p>Any change to architecture or implementation detail triggers an A/B spree — on real
+      software, once the probes pass. <strong>Same binary, one variable, zero
+      tolerance.</strong></p>
+      <ul>
+        <li>host unit tests for the logic</li>
+        <li>a boot self-test hitting the real entry point</li>
+        <li><strong>same-binary A/B stress on real workloads</strong> — in-VM <code>rustc -j4</code>, Go fork/exec stress, Redis, a container pull</li>
+      </ul>
+      <p>Any <span class="m hot">stuck</span> / <span class="m hot">RECOVERED</span> /
+      <span class="m hot">PANIC</span> / <span class="m hot">WILD</span> /
+      <span class="m hot">SPURIOUS</span> marker fails the run.</p>
+      <p class="pull">"The tests pass" isn't the bar — the tests were written by the person
+      who wrote the bug.</p>
+    </div>
+  </section>
+
+  <!-- 09 -->
+  <section class="slide">
+    <div class="num">09</div>
+    <div class="body">
+      <p class="eyebrow cool">Act III · how it's built</p>
+      <h2>AI-assisted development: <span class="cool">docs as cognition</span></h2>
+      <p><strong>Every session starts with an assistant that has no memory of
+      yesterday.</strong> That one fact determines the whole documentation system.</p>
+      <div class="scroller">
+        <table>
+          <thead><tr><th>tier</th><th>job</th></tr></thead>
+          <tbody>
+            <tr><td><code>runbooks/</code></td><td>do X, expect Y — ends in <strong>Verify</strong></td></tr>
+            <tr><td><code>reference/</code></td><td>current state only, each page graded <strong>A / B / C</strong> for how far to trust it</td></tr>
+            <tr><td><code>archive/</code></td><td>200+ investigations, verbatim, <strong>never rewritten</strong> — including the wrong theories</td></tr>
+            <tr><td>agent context</td><td>the standing rules, so they're never re-litigated</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Not written for posterity — <strong>written to reconstitute project-specific
+      intuition in a reader who starts from zero.</strong></p>
+      <p><strong>And the informal half of the same record — the commit log:</strong></p>
+      <pre><span class="d">2025-11-28</span>  does not actually detect ram
+<span class="d">2025-11-28</span>  at least it still runs
+<span class="d">2025-11-30</span>  allocation is the root of all evil
+<span class="d">2025-11-30</span>  this is clearly getting out of hand
+<span class="d">2025-12-27</span>  aaaaaaaa CAT
+<span class="d">2026-01-21</span>  at least it boots
+<span class="d">2026-04-02</span>  god damn it x2
+<span class="d">2026-04-03</span>  why are we here? just to suffer?
+<span class="d">2026-08-06</span>  more tests and fixes, cargo remains undefeated
+<span class="d">2026-08-11</span>  curious case of nothingburger
+<span class="d">2026-08-13</span>  java crossover episode</pre>
+      <p>The four tiers document the <em>reasoning</em>. The commit log documents the
+      <em>state of mind</em> — and it is still a record you can mine. The tone survived;
+      the rigour arrived.</p>
+      <p><strong>The failure mode this guards against</strong>, logged once in the archive:
+      during what should have been a mechanical port, two syscalls were
+      <strong>rewritten instead of copied</strong> — breaking an ABI. Caught and reverted.
+      There is no way to know how many similar substitutions weren't.</p>
+    </div>
+  </section>
+
+  <!-- 10 -->
+  <section class="slide">
+    <div class="num">10</div>
+    <div class="body">
+      <p class="eyebrow cool">Act III · how it's built</p>
+      <h2>Reading the diff</h2>
+      <p>Last August the build had been failing for days, filed under a label that turned
+      out to mean nothing.</p>
+      <p>I was reading the code as Claude edited it — the fault handler, about
+      <strong>4.5k lines</strong> — and one function looked like the one worth checking.
+      It was.</p>
+      <p class="pull">Nice feeling. <em class="q">Not a method.</em></p>
+      <p>So the same commit added a diagnostic that says which path declined, and measuring
+      the codebase started not long after.</p>
+    </div>
+  </section>
+
+  <!-- 11 -->
+  <section class="slide">
+    <div class="num">11</div>
+    <div class="body">
+      <p class="eyebrow cool">Act III · how it's built</p>
+      <h2>Learn from history</h2>
+      <p><strong>A full OS development cycle is a surprisingly large dataset.</strong> 1,547
+      commits, 196 investigation docs. What falls out of it:</p>
+      <ul>
+        <li><strong>622 distinct fixes</strong> across 15 subsystems, itemised, dated, cross-referenced.</li>
+        <li><strong>Two crisis windows, from commit volume alone</strong> — an independent churn-per-file measure lands on the same two months.</li>
+        <li><strong>Recurring defect <em>shapes</em>.</strong> ~3% of all fixes are the same underlying bug rediscovered in a different subsystem: stale address-space pointer ×3, lock-held-across-blocking ×4, readiness gaps ×6 across four files. The most-repeated shape: <strong>a raw index outliving the thing it names.</strong></li>
+      </ul>
+      <p>That last one is worth more than any single fix — it is a defect class you can go
+      look for <em>on purpose</em>.</p>
+      <pre><span class="d">2025-11-28</span>  does not actually detect ram
+<span class="d">2025-11-30</span>  allocation is the root of all evil
+<span class="d">2025-11-30</span>  this is clearly getting out of hand
+<span class="d">2026-04-03</span>  why are we here? just to suffer?
+<span class="d">2026-08-06</span>  more tests and fixes, cargo remains undefeated</pre>
+    </div>
+  </section>
+
+  <!-- 12 -->
+  <section class="slide">
+    <div class="num">12</div>
+    <div class="body">
+      <p class="eyebrow"><code>go build</code> defeated</p>
+      <pre>akuma:~$ apk add go git
+akuma:~$ git clone --depth 1 .../akuma-playground.git
+akuma:~$ cd akuma-playground &amp;&amp; rm -f *.c *.rs
+akuma:~$ CGO=0 go build -v .
+akuma:~$ ./playground
+<span class="out">Hello from Golang on Akuma</span></pre>
+      <div class="figs">
+        <div class="fig"><span class="v">1.26.3</span><span class="k">go, from apk</span></div>
+        <div class="fig"><span class="v hot">112 s</span><span class="k">cold build · 38 pkgs</span></div>
+        <div class="fig"><span class="v">14 s</span><span class="k">warm rebuild</span></div>
+        <div class="fig"><span class="v">2.3 MB</span><span class="k">binary · runs</span></div>
+      </div>
+      <p>The milestone table said <em>"in progress — crashes during compilation"</em> for
+      <strong>five months.</strong></p>
+      <p class="pull">Pick a real program. Audit before you touch anything. Probe until a
+      theory dies. A/B on the real workload. Write it down for whoever starts from zero
+      tomorrow.</p>
+      <p><strong>None of that got harder. It got cheaper at exactly the same rate the code
+      did.</strong></p>
+    </div>
+  </section>
+
+</main>
+
+<p class="hint"><kbd>↑</kbd> <kbd>↓</kbd> to navigate</p>
+
+<script>
+(function () {
+  var deck = document.getElementById('deck');
+  var rail = document.getElementById('rail');
+  var slides = Array.prototype.slice.call(deck.querySelectorAll('.slide'));
+  var current = 0;
+
+  slides.forEach(function (s, i) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.setAttribute('aria-label', 'Go to slide ' + (i + 1) + ' of ' + slides.length);
+    b.addEventListener('click', function () { go(i); });
+    rail.appendChild(b);
+  });
+  var ticks = Array.prototype.slice.call(rail.children);
+
+  function mark(i) {
+    if (i === current) return;
+    current = i;
+    ticks.forEach(function (t, n) { t.setAttribute('aria-current', n === i ? 'true' : 'false'); });
+  }
+  function go(i) {
+    i = Math.max(0, Math.min(slides.length - 1, i));
+    slides[i].scrollIntoView({ block: 'start' });
+    mark(i);
+  }
+
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting && e.intersectionRatio > 0.5) mark(slides.indexOf(e.target));
+      });
+    }, { threshold: [0.5, 0.75] });
+    slides.forEach(function (s) { io.observe(s); });
+  }
+  ticks[0].setAttribute('aria-current', 'true');
+
+  document.addEventListener('keydown', function (e) {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    var k = e.key;
+    if (k === 'ArrowDown' || k === 'ArrowRight' || k === 'PageDown' || k === ' ') { e.preventDefault(); go(current + 1); }
+    else if (k === 'ArrowUp' || k === 'ArrowLeft' || k === 'PageUp') { e.preventDefault(); go(current - 1); }
+    else if (k === 'Home') { e.preventDefault(); go(0); }
+    else if (k === 'End') { e.preventDefault(); go(slides.length - 1); }
+  });
+})();
+</script>
+</body>
+</html>
