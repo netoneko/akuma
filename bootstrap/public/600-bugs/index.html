@@ -283,10 +283,11 @@
         <table>
           <thead><tr><th></th><th>Redox</th><th>Asterinas</th><th>Akuma</th></tr></thead>
           <tbody>
-            <tr><td>since · people</td><td>2015 · team + nonprofit</td><td>~2022 · 50+, 3 universities</td><td>2026 · 1</td></tr>
+            <tr><td>since</td><td>2015</td><td>~2022</td><td>2026</td></tr>
+            <tr><td>people</td><td>team + nonprofit</td><td>50+, 3 universities</td><td><strong>1</strong></td></tr>
             <tr><td>funding</td><td>EU NGI grants</td><td>Ant Group + Intel</td><td>none</td></tr>
             <tr><td>high-water</td><td>COSMIC desktop, packages</td><td><span class="hot">nginx faster than Linux</span>, Firefox, Redis at parity</td><td>Redis + official image, Go, rustc, llama.cpp</td></tr>
-            <tr class="self"><td>builds itself</td><td>not yet</td><td>not established</td><td><strong>yes</strong></td></tr>
+            <tr class="self"><td>builds itself</td><td>not yet</td><td>probably</td><td><strong>yes</strong></td></tr>
           </tbody>
         </table>
       </div>
@@ -355,6 +356,34 @@
     <div class="num">06</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
+      <h2>Self-hosting: <em>it compiles itself</em></h2>
+      <p>Cloned from GitHub and built <strong>inside Akuma</strong>, on a nightly musl
+      toolchain:</p>
+      <pre>~ # git clone https://github.com/netoneko/akuma.git \
+             &amp;&amp; cd /tmp/akuma &amp;&amp; cargo build --release</pre>
+      <div class="figs">
+        <div class="fig"><span class="v hot">20/20</span><span class="k">clean builds, first try</span></div>
+        <div class="fig"><span class="v">107–128 s</span><span class="k">per trial, in-guest</span></div>
+        <div class="fig"><span class="v">3.8 MB</span><span class="k">elf · it boots</span></div>
+        <div class="fig"><span class="v">0</span><span class="k">retries needed</span></div>
+      </div>
+      <p>147/147 units, fresh boot and <code>cargo clean</code> every trial, 8 GB, SMP=4,
+      every memory-corruption tripwire silent.</p>
+      <p><strong>Almost nothing gets here.</strong> Redox reached <em>running</em> rustc and
+      cargo natively in January 2026 — a decade in, on the third attempt — and does not yet
+      build itself. Asterinas hasn't published a self-build result — with 210+ syscalls,
+      Firefox and QEMU running, a compiler almost certainly works there; nobody has claimed
+      the kernel builds under it.</p>
+      <p class="pull">Twenty consecutive first-try builds. A failed clean build is now a
+      <em class="q">regression finding, not weather.</em></p>
+    </div>
+  </section>
+
+  <!-- 07 -->
+  <section class="slide">
+    <div class="num">07</div>
+    <div class="body">
+      <p class="eyebrow">Act II · the workflow</p>
       <h2>Audit before touching code</h2>
       <p><strong>Update the references and the diagrams first.</strong> Then reason about
       where the problem could be.</p>
@@ -370,9 +399,9 @@
     </div>
   </section>
 
-  <!-- 07 -->
+  <!-- 08 -->
   <section class="slide">
-    <div class="num">07</div>
+    <div class="num">08</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Isolate theories with probes, <em>then discredit them</em></h2>
@@ -386,9 +415,9 @@
     </div>
   </section>
 
-  <!-- 08 -->
+  <!-- 09 -->
   <section class="slide">
-    <div class="num">08</div>
+    <div class="num">09</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Then A/B it on <em>real workloads</em></h2>
@@ -408,9 +437,9 @@
     </div>
   </section>
 
-  <!-- 09 -->
+  <!-- 10 -->
   <section class="slide">
-    <div class="num">09</div>
+    <div class="num">10</div>
     <div class="body">
       <p class="eyebrow cool">Act III · how it's built</p>
       <h2>AI-assisted development: <span class="cool">docs as cognition</span></h2>
@@ -436,9 +465,25 @@
     </div>
   </section>
 
-  <!-- 10 -->
+  <!-- 11 -->
   <section class="slide">
-    <div class="num">10</div>
+    <div class="num">11</div>
+    <div class="body">
+      <p class="eyebrow cool">Act III · how it's built</p>
+      <h2>Learn from history</h2>
+      <p><strong>A full OS development cycle is a surprisingly large dataset.</strong> 1,547
+      commits, 196 investigation docs. What falls out of it:</p>
+      <ul>
+        <li><strong>622 distinct fixes</strong> across 15 subsystems, itemised, dated, cross-referenced.</li>
+        <li><strong>Two crisis windows, from commit volume alone</strong> — an independent churn-per-file measure lands on the same two months.</li>
+        <li><strong>Recurring defect <em>shapes</em>.</strong> ~3% of all fixes are the same underlying bug rediscovered in a different subsystem: stale address-space pointer ×3, lock-held-across-blocking ×4, readiness gaps ×6 across four files. The most-repeated shape: <strong>a raw index outliving the thing it names.</strong></li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 12 -->
+  <section class="slide">
+    <div class="num">12</div>
     <div class="body">
       <p class="eyebrow cool">Act III · how it's built</p>
       <h2>mood</h2>
@@ -453,48 +498,6 @@
 <span class="d">2026-08-06</span>  more tests and fixes, cargo remains undefeated
 <span class="d">2026-08-11</span>  curious case of nothingburger
 <span class="d">2026-08-13</span>  java crossover episode</pre>
-      <p>The four tiers document the <em>reasoning</em>. The commit log documents the
-      <em>state of mind</em> — and it is still a record you can mine.</p>
-      <p class="pull">The tone survived. <em class="q">The rigour arrived.</em></p>
-    </div>
-  </section>
-
-  <!-- 11 -->
-  <section class="slide">
-    <div class="num">11</div>
-    <div class="body">
-      <p class="eyebrow cool">Act III · how it's built</p>
-      <h2>Reading the diff</h2>
-      <p>Last August the build had been failing for days, filed under a label that turned
-      out to mean nothing.</p>
-      <p>I was reading the code as Claude edited it — the fault handler, about
-      <strong>4.5k lines</strong> — and one function looked like the one worth checking.
-      It was.</p>
-      <p>That was luck with a good prior. So the same commit added a diagnostic that says
-      which path declined, and measuring the codebase started not long after.</p>
-    </div>
-  </section>
-
-  <!-- 12 -->
-  <section class="slide">
-    <div class="num">12</div>
-    <div class="body">
-      <p class="eyebrow cool">Act III · how it's built</p>
-      <h2>Learn from history</h2>
-      <p><strong>A full OS development cycle is a surprisingly large dataset.</strong> 1,547
-      commits, 196 investigation docs. What falls out of it:</p>
-      <ul>
-        <li><strong>622 distinct fixes</strong> across 15 subsystems, itemised, dated, cross-referenced.</li>
-        <li><strong>Two crisis windows, from commit volume alone</strong> — an independent churn-per-file measure lands on the same two months.</li>
-        <li><strong>Recurring defect <em>shapes</em>.</strong> ~3% of all fixes are the same underlying bug rediscovered in a different subsystem: stale address-space pointer ×3, lock-held-across-blocking ×4, readiness gaps ×6 across four files. The most-repeated shape: <strong>a raw index outliving the thing it names.</strong></li>
-      </ul>
-      <p>That last one is worth more than any single fix — it is a defect class you can go
-      look for <em>on purpose</em>.</p>
-      <pre><span class="d">2025-11-28</span>  does not actually detect ram
-<span class="d">2025-11-30</span>  allocation is the root of all evil
-<span class="d">2025-11-30</span>  this is clearly getting out of hand
-<span class="d">2026-04-03</span>  why are we here? just to suffer?
-<span class="d">2026-08-06</span>  more tests and fixes, cargo remains undefeated</pre>
     </div>
   </section>
 

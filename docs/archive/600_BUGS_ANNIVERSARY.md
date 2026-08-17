@@ -2,7 +2,7 @@
 
 **Kirill Maksimov · 2026-08-17**
 
-**Status:** draft 16. The *content* of a talk plus speaker notes.
+**Status:** draft 18. The *content* of a talk plus speaker notes.
 
 **Rendered deck:** [`bootstrap/public/600-bugs/index.html`](../../bootstrap/public/600-bugs/index.html)
 — 13 slides, keyboard-navigable (↑/↓, Home/End), self-contained apart from
@@ -22,7 +22,7 @@ they belong, and the deck now shows the loop that produced them.
 past ~8 lines of content it is still too long. The prose under each slide is
 speaker material, not slide text.
 
-### Changes from draft 15
+### Changes from draft 17
 
 | Change | Reason |
 |---|---|
@@ -45,7 +45,13 @@ speaker material, not slide text.
 | **Title slide split in two** — 01 is title + subtitle + meme only, 02 carries the "checks got cheap too" argument | Per review. The image needs to land on its own before the argument starts |
 | **The commit-message block became its own slide, 10, titled `mood`** | Per review — eleven lines was too much to share with the docs slide. `mood` is itself one of the commit messages (2026-02-22, ×3) |
 | **Byline added** — Kirill Maksimov · 2026-08-17, on slide 01 and this doc's header | Per review |
-| **Negative framing audited and flagged** — see § "Flagged: negative framing" | Per review. Eight instances found across both files; two flagged as rewrite candidates, six defended. Nothing changed yet |
+| **Negative framing audited and four instances rewritten** — see § "Negative framing" | Per review |
+| **New slide 06 — self-hosting**, same shape as the `go build` slide: transcript, numbers, and how few Rust OSes get there | Per review |
+| **"Reading the diff" dropped entirely** | Per review |
+| **`mood` moved to 12**, after "Learn from history" | Per review |
+| **Slide 06's transcript replaced** with the real in-guest recipe (`git clone` from GitHub, then `cargo build --release`) and in-guest measurements — 20/20 first try, 107–128 s, 3.8 MB ELF | Per review. The figures I had first were host-shaped, and the ELF size was wrong (4.3 MB) |
+| **Asterinas compiler-hosting claim corrected** to "undocumented, not unlikely" | Per review — with 210+ syscalls, Firefox and QEMU running, a compiler almost certainly works; the distinct claim here is *self-build* |
+| **"That last one is worth more than any single fix"** paragraph cut, and a leftover 5-line commit block removed from slide 11 | Per review |
 
 ---
 
@@ -55,7 +61,7 @@ speaker material, not slide text.
 > throw away software.**
 
 Thirteen slides. The opener states the trade, Act I places the project, Act II is
-the workflow, Act III is how it's built.
+the workflow and what it produced, Act III is how it's built.
 
 **Title:** **AI will write 600 bugs and I will write 600 more**
 **Subtitle:** *at some point you gotta do some real engineering*
@@ -100,10 +106,11 @@ actually spend the checking budget on.
 
 | | **Redox** | **Asterinas** | **Akuma** |
 |---|---|---|---|
-| since · people | 2015 · team + nonprofit | ~2022 · 50+, 3 universities | 2026 · **1** |
+| since | 2015 | ~2022 | 2026 |
+| people | team + nonprofit | 50+, 3 universities | **1** |
 | funding | EU NGI grants | Ant Group + Intel | none |
 | high-water | COSMIC desktop, packages | nginx **faster than Linux**, Firefox, Redis at parity | Redis + official image, Go, rustc, llama.cpp |
-| builds itself | not yet | not established | **yes** |
+| builds itself | not yet | undocumented | **yes** |
 
 **Asterinas is the one worth studying.** A *framekernel*: all `unsafe` is confined
 to one library (OSTD, ~15k lines, **14% of the kernel** — about the size of seL4's
@@ -174,7 +181,53 @@ Pick the program and the roadmap writes itself.
 
 ---
 
-### 06 — Audit before touching code
+### 06 — Self-hosting: it compiles itself
+
+Cloned from GitHub and built **inside Akuma**, on a nightly musl toolchain:
+
+```
+akuma:/tmp$ git clone https://github.com/netoneko/akuma.git && cd /tmp/akuma && cargo build --release
+```
+
+`[data]` Measured in-guest 2026-08-16 (fresh boot, `cargo clean`, `-j4 --offline`,
+`MEMORY=8192 SMP=4`) as the Tier 5 arm of a trim-the-fat gate:
+
+| | |
+|---|---|
+| clean builds run | **20** (10 per arm of an A/B, two different kernels) |
+| succeeded first try | **20 / 20** — `EXIT=0`, full `deps/` tree, **3.8 MB ELF** |
+| retries needed | **0** |
+| wall clock | **107–128 s** per trial, boot + `cargo clean` + `-j4` build |
+| memory-corruption tripwires | **all 0** |
+| units | **147 / 147** — and the self-built ELF **boots** |
+
+**Almost nothing gets here.** Redox reached *running* rustc and cargo natively in
+January 2026 — a decade in, on the third attempt — and does not yet build itself.
+Asterinas hasn't published a self-build result; with 210+ syscalls, Firefox and QEMU
+running, a compiler almost certainly works there — nobody has claimed the kernel
+builds under it.
+
+*Speaker:* the closer does the same thing for `go build`; this is that shape one rung
+up, and it lands here because "run X" pointed at the compiler eventually. Every
+number above is in-guest, not host.
+
+Be precise about the scarcity, because it is easy to overclaim: "hosts a compiler" is
+not the rare part — Asterinas runs Firefox and QEMU, so a compiler running there is
+near-certain and simply undocumented. The rare part is **the kernel building itself
+and the result booting**, which is a claim someone has to make and verify. The stability claim is the interesting half:
+twenty consecutive first-try builds, zero retries — a failed clean build today is a
+regression finding, not weather. That is a recent change; most of the self-hosting
+doc is written around riding out intermittent rustc SIGSEGVs with a supervisor
+script, and that procedure is retired.
+
+Two honest caveats: my route is easier in one specific way, because Linux ABI plus
+musl means unmodified rustc binaries where Redox had to port the compiler onto their
+own libc; and "it compiles itself" is a narrower claim than Redox's breadth of
+desktop, drivers and packages.
+
+---
+
+### 07 — Audit before touching code
 
 **Update the references and the diagrams first. Then reason about where the problem
 could be.**
@@ -191,7 +244,7 @@ and it's much cheaper than discovering it from a fault address.
 
 ---
 
-### 07 — Isolate theories with probes, then discredit them
+### 08 — Isolate theories with probes, then discredit them
 
 **Build the smallest thing that can tell two theories apart. Kill theories until
 one survives.**
@@ -213,7 +266,7 @@ feels like a detour from the fix.
 
 ---
 
-### 08 — Then A/B it on real workloads
+### 09 — Then A/B it on real workloads
 
 **Any change to architecture or implementation detail triggers an A/B spree — on
 real software, once the probes pass.** Same binary, one variable, zero tolerance.
@@ -234,7 +287,7 @@ across two builds differing in one thing. Keep one workload as a control that
 
 ## Act III — How it's built
 
-### 09 — AI-assisted development: docs as cognition
+### 10 — AI-assisted development: docs as cognition
 
 **Every session starts with an assistant that has no memory of yesterday.** That
 one fact determines the whole documentation system.
@@ -268,7 +321,27 @@ amount of documentation tiers fixes it — only a diff you actually read.
 
 ---
 
-### 10 — mood
+### 11 — Learn from history
+
+**A full OS development cycle is a surprisingly large dataset.** 1,547 commits, 196
+investigation docs. What falls out of it:
+
+- **622 distinct fixes** across 15 subsystems, itemised, dated, cross-referenced.
+- **Two crisis windows, from commit volume alone** — and an independent
+  churn-per-file measure lands on the same two months.
+- **Recurring defect *shapes*.** ~3% of all fixes are the same underlying bug
+  rediscovered in a different subsystem: stale address-space pointer ×3,
+  lock-held-across-blocking ×4, readiness gaps ×6 across four files. The
+  most-repeated shape: **a raw index outliving the thing it names.**
+
+*Speaker:* the records only became interrogable once they existed in bulk.
+Cross-joining lines against bugs turned up a real signal, and also caught me out: my first cut of that analysis
+concluded concurrency was the riskiest code per line, and re-deriving the grouping
+reversed it. Same data, different filing, opposite answer.
+
+---
+
+### 12 — mood
 
 ```
 2025-11-28  does not actually detect ram
@@ -295,47 +368,6 @@ measurement. The tone survived, the rigour arrived. None of it was written for a
 audience, which is exactly why it's usable evidence now.
 
 *(`mood` is itself one of the commit messages, from the middle era.)*
-
----
-
-### 11 — Reading the diff
-
-Last August the build had been failing for days, filed under a label that turned
-out to mean nothing.
-
-I was reading the code as Claude edited it — the fault handler, about **4.5k
-lines** — and one function looked like the one worth checking. It was.
-
-That was luck with a good prior. So the same commit added a diagnostic that says
-which path declined, and measuring the codebase started not long after.
-
-*Speaker:* pattern-matching on a file I'd spent months in. It doesn't transfer and it
-doesn't scale, so the useful part was turning it into something that prints the
-answer next time. Reviewing the diff as it lands is the habit worth keeping.
-
----
-
-### 12 — Learn from history
-
-**A full OS development cycle is a surprisingly large dataset.** 1,547 commits, 196
-investigation docs. What falls out of it:
-
-- **622 distinct fixes** across 15 subsystems, itemised, dated, cross-referenced.
-- **Two crisis windows, from commit volume alone** — and an independent
-  churn-per-file measure lands on the same two months.
-- **Recurring defect *shapes*.** ~3% of all fixes are the same underlying bug
-  rediscovered in a different subsystem: stale address-space pointer ×3,
-  lock-held-across-blocking ×4, readiness gaps ×6 across four files. The
-  most-repeated shape: **a raw index outliving the thing it names.**
-
-**That last bullet is worth more than any single fix.** It is a defect class you can
-go look for on purpose.
-
-*Speaker:* the sequel to slide 10 — once the diagnostic replaced the guesswork, the
-records became something you could interrogate. Cross-joining lines against bugs
-turned up a real signal, and also caught me out: my first cut of that analysis
-concluded concurrency was the riskiest code per line, and re-deriving the grouping
-reversed it. Same data, different filing, opposite answer.
 
 ---
 
@@ -438,7 +470,9 @@ isn't, rewrite it.
   [`LONG_ROAD_TO_REDIS.md`](LONG_ROAD_TO_REDIS.md) ·
   [`REDIS_END_TO_END.md`](REDIS_END_TO_END.md) — two theories discredited
   (copy-on-write, `madvise`) before the real cause.
-- [`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md) §18.4 — slide 05's 88.8% → 23.0%.
+- [`BKL_PHASE7_AUDIT.md`](BKL_PHASE7_AUDIT.md) §18.4 — slide 07's 88.8% → 23.0%.
+- [`../runbooks/selfhost-kernel-build.md`](../runbooks/selfhost-kernel-build.md) ·
+  [`AKUMA_SELF_HOSTING.md`](AKUMA_SELF_HOSTING.md) — slide 06's numbers.
 - [`GOLANG_MISSING_SYSCALLS.md`](GOLANG_MISSING_SYSCALLS.md) — slide 11 (`go build`).
 - [`LINE_COUNT_ANALYSIS.md`](LINE_COUNT_ANALYSIS.md) — slide 02's peer group, and
   everything the deck deliberately leaves out.
