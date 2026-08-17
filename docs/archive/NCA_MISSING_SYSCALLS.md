@@ -9,6 +9,19 @@ In-guest build still blocked by the spawn EFAULT (§1); the slow-model hang
 (§2b) was **root-caused and FIXED 2026-08-17** — four kernel defects, see
 `SOCKET_DELAYED_FIRST_BYTE_HANG.md` § Resolution. Patches needed on top of upstream HEAD are in
 `userspace/nca/upstream-akuma-patches.patch`.
+Later on 2026-08-17: nca driven against **Z.ai GLM-4.7 over real HTTPS** from
+the guest (§6b); the stdin-pipe transfer route in §3 was **retested and works**
+(the "use HTTP" advice there is superseded); and the exit-time
+`tokio-rt-worker` abort was traced to an **upstream tokio shutdown bug**, not a
+kernel gap (§7).
+
+> **Deployment trap seen twice this session:** the patches live in the submodule
+> working tree, but `bootstrap/bin/nca` is a *build artifact* and does not
+> update itself. A stale `bootstrap/bin/nca` (Aug 12, 8 862 136 bytes) was
+> shipped into the guest five days after the §0 patches were written, so the
+> AF_UNIX bind was still fatal and the §2 fix looked broken. Compare sizes
+> before debugging: patched is **10 913 904** bytes. Rebuild with
+> `userspace/build.sh --nca-only` (installs straight into `bootstrap/bin/`).
 
 ## TL;DR
 
@@ -19,6 +32,8 @@ In-guest build still blocked by the spawn EFAULT (§1); the slow-model hang
 | Upstream HEAD won't cross-build: `openssl-sys` via `mcpr` + core's own `reqwest` | **Patched in-tree** (two one-liners, §4b) |
 | `scp`/SFTP into the guest times out | Use HTTP: host `python3 -m http.server`, guest `wget http://10.0.2.2:<port>/...` (§3) |
 | nca↔Ollama verified | qwen3.5:0.8b instant round trips OK; gemma4:e4b hang **FIXED 2026-08-17** (§2b) — it was not prefill time, it was four kernel defects, dominant one a `SynSent` socket reported read-closed |
+| `tokio-rt-worker` panics `Option::unwrap()` on `None` at `fs/file.rs:745` on **exit** (session itself fine) | **Not a syscall gap** — upstream tokio state bug on the runtime-shutdown path, §7 |
+| GLM-4.7 via Z.ai verified end-to-end from the guest | §6b. Context window mis-detected as 32 000 (real: 204 800) — `model_limits.rs` has no GLM entry |
 
 ## 0. Submodule swap (2026-08-17)
 
@@ -188,6 +203,26 @@ responding, then reads — against a host `nc` with a delayed reply.
 - `ssh ... 'cat > /tmp/file' < file` (stdin pipe) also stalled — likely the
   same flow-control issue. Use HTTP.
 
+> **Correction 2026-08-17:** the stdin-pipe route **does** work; it just needs
+> keepalives so the client does not give up during a quiet stretch. 10 913 904
+> bytes landed in 25 s, sha256 identical to the host copy:
+>
+> ```python
+> opts = ["-o","StrictHostKeyChecking=no","-o","ServerAliveInterval=15",
+>         "-o","ServerAliveCountMax=40"]
+> subprocess.run(["ssh",*opts,"-p","2222","root@localhost",
+>                 "cat > /bin/nca.new && wc -c /bin/nca.new && sha256sum /bin/nca.new"],
+>                input=open("bootstrap/bin/nca","rb").read(), timeout=900)
+> ```
+>
+> `scp` remains broken (rc 255, "Timeout, server localhost not responding") —
+> that is the SFTP subsystem, not the transport. Always stage to a temp name and
+> compare `sha256sum` before `mv`-ing over a live binary: a stalled stream
+> truncates and a truncated ELF looks exactly like a successful copy.
+> Throughput is erratic (a 1 MB warm-up probe measured 72 KB/s, the 10.9 MB
+> transfer averaged ~440 KB/s), so size the timeout generously rather than
+> extrapolating from a small probe.
+
 ## 4. `userspace/nca` wrapper (in-guest self-build) — still blocked
 
 1. **build.rs hardcodes `aarch64-linux-musl-gcc`** (`CC_aarch64_...`,
@@ -259,6 +294,153 @@ provider API key` even though Ollama needs no auth. `nca models` should show
 IPv4 TCP to 10.0.2.2 works from the guest; IPv6 sockets EAFNOSUPPORT on
 Akuma — keep URLs literal IPv4 (never `localhost`). Caveat: pick a model with
 fast prefill until §2b is fixed; slow first byte hangs the session.
+
+## 6b. GLM-4.7 over the public internet (Z.ai) — verified 2026-08-17
+
+Unlike §6 (host Ollama over SLIRP) this leaves the box entirely: real DNS, real
+TLS, real HTTPS from the guest. Z.ai speaks Anthropic's wire format, so the
+Custom provider with `compatibility = "anthropic"` drives it — the adapter
+appends `/v1/messages` (`crates/core/src/provider/custom.rs:91`), giving
+`https://api.z.ai/api/anthropic/v1/messages`.
+
+**Config path moved.** The `~/.nca/config.toml` in §6 is now only a legacy read
+fallback. Upstream resolves `$NCA_HOME` → `$XDG_DATA_HOME/ncacli` →
+`$HOME/.local/share/ncacli` (`nca_product_home`, `crates/common/src/config.rs`).
+The guest runs with `HOME=/`, so the live file is
+**`/.local/share/ncacli/config.toml`**.
+
+```toml
+[provider]
+default = "custom"
+
+[provider.custom]
+base_url = "https://api.z.ai/api/anthropic"   # no /v1 suffix — adapter appends it
+model = "glm-4.7"
+compatibility = "anthropic"
+temperature = 1.0
+api_key = "<z.ai key>"
+api_key_env = "ZAI_API_KEY"                    # consulted only if api_key is absent
+
+[model]
+default_model = "glm-4.7"
+
+[ui]
+onboarding_completed = true
+```
+
+Verified from the guest: `SessionStarted … "model":"glm-4.7"`, then a genuine
+JSON `401 token expired or incorrect` from Z.ai on a placeholder key — which is
+the useful negative result, since reaching a provider-issued 401 proves DNS,
+the rustls handshake (§4b) and the endpoint URL are all correct.
+
+**Two gotchas:**
+
+- **`[ui] onboarding_completed = true` alone does not skip the first-run modal.**
+  `needs_onboarding()` is `!onboarding_completed || !any_api_key_present()`, so
+  without a resolvable key the second half keeps it true and the connect TUI
+  still opens. There is no config-level `--no-tui`; the flag is CLI-only.
+- **Context window is mis-detected as 32 000 tokens.** `model_limits.rs` has no
+  GLM entry (zero hits for `glm` in `crates/runtime/`), so detection falls
+  through to the 32 000 default; GLM-4.7 is really **204 800**. At the default
+  75 % `auto_summarize_threshold` nca starts compacting near ~24 k tokens and
+  discards context the model could have held. `context_window_target` is read
+  **only when auto-detect is off** (`supervisor.rs:412-420`), so both lines are
+  required:
+
+  ```toml
+  [memory.context]
+  auto_detect_context_window = false
+  context_window_target = 204800
+  ```
+
+  The alternative — a GLM row in `crates/runtime/src/model_limits.rs` — is an
+  upstream change and belongs in `upstream-akuma-patches.patch`.
+
+## 7. Exit-time `tokio-rt-worker` panic — NOT a syscall gap (2026-08-17)
+
+**Symptom:** the session runs fine start to finish; the panic lands only as the
+process exits.
+
+```
+2026-08-17T13:56:18 INFO nca: nca starting
+[session] Resuming last session session-1786974897551249-0
+2026-08-17T13:56:18 WARN nca_runtime::ipc: IPC disabled: socket bind failed: ... (os error 97)
+2026-08-17T13:56:19 INFO nca_runtime::supervisor: Context window target for glm-4.7: 32000 tokens
+
+thread 'tokio-rt-worker' (17) panicked at tokio-1.50.0/src/fs/file.rs:745:51:
+called `Option::unwrap()` on a `None` value
+Aborted
+```
+
+**This is an upstream tokio bug, not a missing Akuma syscall.** No kernel work
+is implied. Mechanism, all inside tokio's `impl AsyncWrite for File::poll_write`
+(`tokio-1.50.0/src/fs/file.rs`):
+
+| line | what happens |
+| --- | --- |
+| 744 | `State::Idle(ref mut buf_cell) =>` |
+| 745 | `let mut buf = buf_cell.take().unwrap();` — buffer moved **out** of the cell |
+| 756 | `spawn_mandatory_blocking(…)` returns `None` once the runtime is shutting down |
+| 765-767 | `.ok_or_else(…)?` — the `?` **returns early** |
+| 769 | `inner.state = State::Busy(handle);` — *never reached* |
+
+The early return leaves the file in `State::Idle(None)`: the buffer was taken at
+745 and never put back. The write is *poisoned*, not merely failed. The **next**
+`poll_write` re-enters 745, `take()` yields `None`, and `unwrap()` aborts.
+
+**Why it fires every time here rather than intermittently.** The event-log
+writer does two writes per event and discards both results
+(`crates/runtime/src/supervisor.rs:964`, twin at `crates/cli/src/stream.rs:193`,
+TUI twin at `crates/tui/src/tui/bridge.rs:40`):
+
+```rust
+let _ = file.write_all(line.as_bytes()).await;   // poisons the cell, Err swallowed by `let _ =`
+let _ = file.write_all(b"\n").await;             // hits Idle(None) -> unwrap panic
+```
+
+The first call is exactly the one that returns the swallowed
+`"background task failed"` error and strands the state; the trailing newline
+write is the one that panics. The two-call-per-event shape converts a silent
+error into an abort within a single event.
+
+**Why Akuma surfaces it and a dev laptop mostly does not.** The writer is a
+detached `tokio::spawn` task appending JSONL to the event log, racing runtime
+teardown at exit. Guest ext2 writes are slow (same cost centre as
+`RUSTC_COMPILE_EXT2_MMAP`), so a write is far likelier to still be in flight
+when the runtime drops. Nothing about it is Akuma-specific beyond timing.
+
+`Aborted` rather than a normal panic exit is `-C panic=abort` from the §5
+RUSTFLAGS — the abort is the panic, not a second fault.
+
+**Impact:** cosmetic for the session (all model traffic has completed by then),
+but the **tail of the event-log JSONL can be truncated** — the last one or two
+records may be missing or partial. Session state itself is safe: `session_store`
+uses one-shot `tokio::fs::write` on the blocking pool
+(`crates/runtime/src/session_store.rs:29`), not `File`/`poll_write`, so it is
+not on this path.
+
+**The panic is the loud form; silent truncation is the common one.** Observed
+on the same box minutes later, in a run that did *not* panic: a one-shot
+`-p "reply with exactly: pong"` streamed four ndjson events, stopped dead after
+`Checkpoint … "Starting model turn 1"`, and exited 0 with no assistant output on
+stdout — while the session JSON had persisted `{"role":"assistant","content":
+"pong"}` and billed 1 output token. The `.events.jsonl` was 629 bytes holding
+only those four events. Same shutdown window, same lost tail; whether it aborts
+or merely truncates depends on how far the second `write_all` got. **A run that
+appears to produce no answer is therefore not evidence the provider failed** —
+check the session JSON before chasing it as a network or model problem.
+
+**Fix, if it becomes worth doing** (all userspace, all upstreamable):
+
+1. Stop discarding the results — `let _ =` on `write_all` is what hides the
+   first error and lets execution reach the panicking second call.
+2. Write `line + "\n"` in a **single** `write_all`, so a poisoned cell surfaces
+   as an error and never gets a second poll.
+3. Flush/await the event-log task before dropping the runtime, so no write is
+   in flight at shutdown.
+
+Upstream-tokio-side the real defect is that the `?` at 767 should restore the
+buffer to `buf_cell` before returning.
 
 ## Background
 

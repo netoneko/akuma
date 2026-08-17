@@ -2,10 +2,10 @@
 
 **Kirill Maksimov · 2026-08-17**
 
-**Status:** draft 18. The *content* of a talk plus speaker notes.
+**Status:** draft 19. The *content* of a talk plus speaker notes.
 
 **Rendered deck:** [`bootstrap/public/600-bugs/index.html`](../../bootstrap/public/600-bugs/index.html)
-— 13 slides, keyboard-navigable (↑/↓, Home/End), self-contained apart from
+— 14 slides, keyboard-navigable (↑/↓, Home/End), self-contained apart from
 `lock_in.jpg` beside it. Served at `/600-bugs/`. Served from `bootstrap/public/`, so it is reachable from the
 VM's own httpd. **This file stays the source of truth**: edit the script here, then
 mirror into the HTML.
@@ -21,6 +21,13 @@ they belong, and the deck now shows the loop that produced them.
 **Slides carry headlines and evidence, not paragraphs.** If a slide below runs
 past ~8 lines of content it is still too long. The prose under each slide is
 speaker material, not slide text.
+
+### Changes from draft 18
+
+| Change | Reason |
+|---|---|
+| **New slide 03 — "What it is, and where the bugs were"**, opening Act I ahead of the peer comparison: a capability paragraph, the line/fix figures, the per-subsystem bug table, the project mark and the GitHub link | Requested. The deck compared itself to Redox and Asterinas without ever saying what it was, and the two ledgers it draws on were never shown. Stats only — the readings stay in speaker notes and `LINE_COUNT_ANALYSIS.md` § Stat 7 |
+| Slides 03–13 renumbered to 04–14 | Consequence of the above. **Prose cross-references in the back-matter were already stale before this change** (they point at draft-7 numbering) and were left alone |
 
 ### Changes from draft 17
 
@@ -60,7 +67,7 @@ speaker material, not slide text.
 > **The problem with writing throwaway software is that people don't actually
 > throw away software.**
 
-Thirteen slides. The opener states the trade, Act I places the project, Act II is
+Fourteen slides. The opener states the trade, Act I places the project, Act II is
 the workflow and what it produced, Act III is how it's built.
 
 **Title:** **AI will write 600 bugs and I will write 600 more**
@@ -102,7 +109,57 @@ actually spend the checking budget on.
 
 ## Act I — The landscape
 
-### 03 — Competitive landscape
+### 03 — What it is, and where the bugs were
+
+**Bare-metal AArch64 kernel in Rust**, `no_std`, on QEMU virt: preemptive
+scheduling with shared-kernel SMP, per-process address spaces with demand paging
+and CoW fork, **~140 Linux syscalls**, dynamically linked ELF against musl, ext2 on
+virtio-blk, smoltcp TCP/IP, containers with per-box roots, a userspace `sshd` and
+TLS 1.3. On top of it, **unmodified**: Redis — including the official
+`redis:alpine` image off Docker Hub — Go 1.26.3, two rustc toolchains,
+clang / gcc / tcc, git, Bun.
+
+| | |
+|---|---|
+| prod lines | **39,885** |
+| test lines | **27,845** (0.70x) |
+| linux syscalls | **~140** |
+| documented fixes | **622** |
+
+| subsystem | fixes | % | /kLoC |
+|---|---:|---:|---:|
+| Syscall / ABI | 127 | 23.7% | 21.4 |
+| Memory & VM | 112 | 20.9% | 23.8 |
+| SMP & Locking | 79 | 14.8% | 37.6 |
+| Scheduler & Process | 75 | 14.0% | 7.5 |
+| Networking | 56 | 10.5% | 12.4 |
+| Containers | 19 | 3.6% | 17.1 |
+| VFS & Filesystem | 15 | 2.8% | 3.7 |
+| Console & Terminal | 15 | 2.8% | 16.5 |
+| Misc / cross-cutting | 14 | 2.6% | 50.9 |
+| Signals & Exceptions | 12 | 2.2% | 3.6 |
+| Boot & Drivers | 11 | 2.1% | 3.7 |
+| **kernel** | **535** | 100% | 13.4 |
+| outside it — apps, toolchain, ssh | 87 | — | — |
+
+The project mark (`src/akuma_40.txt`) and a link to
+[github.com/netoneko/akuma](https://github.com/netoneko/akuma) sit in the right
+column.
+
+*Speaker:* the deck compares itself to Redox and Asterinas on the next slide, so
+this one says what the thing actually is first, and hands over the two ledgers the
+rest of the talk draws on. **Just the stats — no reading of them on the slide.** If
+asked: memory and the syscall layer cost ~6× per line what the filesystem and driver
+code did under every grouping tested, the largest area by lines carries the
+*fewest* bugs per line, and the concurrency rows are the fragile ones — see
+[`LINE_COUNT_ANALYSIS.md`](LINE_COUNT_ANALYSIS.md) § Stat 7 for why the grouping
+decides that answer. Bug set is the **535 kernel-attributable** fixes of the 622;
+the other 87 are userspace apps, toolchain and SSH, none of which has a kernel
+line-area to join against.
+
+---
+
+### 04 — Competitive landscape
 
 | | **Redox** | **Asterinas** | **Akuma** |
 |---|---|---|---|
@@ -142,7 +199,7 @@ nothing about implementation correctness" line may exist in their conference tal
 
 ---
 
-### 04 — Same pressure, opposite answers
+### 05 — Same pressure, opposite answers
 
 | | AI-contribution policy |
 |---|---|
@@ -162,7 +219,7 @@ than most CI — matter more here, not less. They are the review.
 
 ## Act II — The workflow
 
-### 05 — Have a concrete goal: run X
+### 06 — Have a concrete goal: run X
 
 **Compatibility with X, in order to run X.**
 
@@ -181,7 +238,7 @@ Pick the program and the roadmap writes itself.
 
 ---
 
-### 06 — Self-hosting: it compiles itself
+### 07 — Self-hosting: it compiles itself
 
 Cloned from GitHub and built **inside Akuma**, on a nightly musl toolchain:
 
@@ -227,7 +284,7 @@ desktop, drivers and packages.
 
 ---
 
-### 07 — Audit before touching code
+### 08 — Audit before touching code
 
 **Update the references and the diagrams first. Then reason about where the problem
 could be.**
@@ -244,7 +301,7 @@ and it's much cheaper than discovering it from a fault address.
 
 ---
 
-### 08 — Isolate theories with probes, then discredit them
+### 09 — Isolate theories with probes, then discredit them
 
 **Build the smallest thing that can tell two theories apart. Kill theories until
 one survives.**
@@ -266,7 +323,7 @@ feels like a detour from the fix.
 
 ---
 
-### 09 — Then A/B it on real workloads
+### 10 — Then A/B it on real workloads
 
 **Any change to architecture or implementation detail triggers an A/B spree — on
 real software, once the probes pass.** Same binary, one variable, zero tolerance.
@@ -287,7 +344,7 @@ across two builds differing in one thing. Keep one workload as a control that
 
 ## Act III — How it's built
 
-### 10 — AI-assisted development: docs as cognition
+### 11 — AI-assisted development: docs as cognition
 
 **Every session starts with an assistant that has no memory of yesterday.** That
 one fact determines the whole documentation system.
@@ -321,7 +378,7 @@ amount of documentation tiers fixes it — only a diff you actually read.
 
 ---
 
-### 11 — Learn from history
+### 12 — Learn from history
 
 **A full OS development cycle is a surprisingly large dataset.** 1,547 commits, 196
 investigation docs. What falls out of it:
@@ -341,7 +398,7 @@ reversed it. Same data, different filing, opposite answer.
 
 ---
 
-### 12 — mood
+### 13 — mood
 
 ```
 2025-11-28  does not actually detect ram
@@ -373,7 +430,7 @@ audience, which is exactly why it's usable evidence now.
 
 ## Closing
 
-### 13 — `go build` defeated
+### 14 — `go build` defeated
 
 ```
 akuma:~$ apk add go git

@@ -212,6 +212,26 @@
   .hero figure { margin: 0; }
   .hero figcaption { font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); margin-top: 0.55rem; }
 
+  /* ── overview: prose + figures left, mark + link right ──────── */
+  .split { display: grid; grid-template-columns: 1fr; gap: clamp(1.1rem, 2.8vw, 2.4rem); align-items: start; }
+  @media (min-width: 60rem) { .split { grid-template-columns: minmax(0, 1fr) auto; } }
+  .split .col { display: flex; flex-direction: column; gap: clamp(0.8rem, 1.9vh, 1.4rem); min-width: 0; }
+  .mark { display: flex; flex-direction: column; gap: clamp(0.7rem, 1.8vh, 1.1rem); width: clamp(12rem, 22vw, 20rem); max-width: 100%; }
+  pre.logo {
+    background: none; border: 0; padding: 0; margin: 0; overflow: visible;
+    color: var(--shu);
+    font-size: clamp(0.4rem, 0.95vw, 0.8rem);
+    line-height: 1.05;
+    white-space: pre;
+  }
+  /* dense stats table — 13 rows have to share a slide with everything else */
+  table.dense td { padding-top: 0.3rem; padding-bottom: 0.3rem; }
+  .link { font-family: var(--mono); font-size: clamp(0.66rem, 0.9vw, 0.78rem); letter-spacing: 0.05em; margin: 0; }
+  .body a { color: var(--ai); text-decoration-color: var(--rule); text-underline-offset: 0.22em; }
+  .body a:hover { color: var(--shu); text-decoration-color: var(--shu); }
+  .body a:focus-visible { outline: 1px solid var(--ai); outline-offset: 2px; }
+  th.r, td.r { text-align: right; }
+
   /* ── rail ───────────────────────────────────────────────────── */
   .rail { position: fixed; left: 0; top: 0; bottom: 0; width: var(--rail); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.4rem; z-index: 20; pointer-events: none; }
   .rail button { pointer-events: auto; appearance: none; background: none; border: 0; padding: 0; width: 1rem; height: 0.58rem; cursor: pointer; display: flex; align-items: center; justify-content: center; }
@@ -269,13 +289,73 @@
       suites, A/B runs on real workloads, all cheap enough to write per-bug and leave in
       place.</p>
       <p class="pull">So the checks stop being a budget item you ration, and start being the
-      default response to <em class="q">every change.</em></p>
+      default response to <em class="q">every commit.</em></p>
     </div>
   </section>
 
   <!-- 03 -->
   <section class="slide">
     <div class="num">03</div>
+    <div class="body">
+      <p class="eyebrow">Act I · the landscape</p>
+      <h2>What it is, and <em>where the bugs were</em></h2>
+      <div class="split">
+        <div class="col">
+          <p><strong>Bare-metal AArch64 kernel in Rust</strong>, <code>no_std</code>, on QEMU virt:
+          preemptive scheduling with shared-kernel SMP, per-process address spaces with demand paging
+	  and CoW fork, dynamic libraries, ext2, <code>smoltcp</code> networking stack, <strong>limited Linux binary compatibility</strong>, runs Docker images like <code>redis:alpine</code>. Comes with <code>apk</code> package manager and Go 1.26.3, Rust and Cargo (stable and nightly),
+          clang / gcc / tcc, git, Bun.</p>
+          <div class="scroller">
+            <table class="dense">
+              <thead><tr><th>subsystem</th><th class="r">fixes</th><th class="r">%</th><th class="r">/kLoC</th></tr></thead>
+              <tbody>
+                <tr><td>Syscall / ABI</td><td class="r">127</td><td class="r">23.7%</td><td class="r">21.4</td></tr>
+                <tr><td>Memory &amp; VM</td><td class="r">112</td><td class="r">20.9%</td><td class="r hot">23.8</td></tr>
+                <tr><td>SMP &amp; Locking</td><td class="r">79</td><td class="r">14.8%</td><td class="r">37.6</td></tr>
+                <tr><td>Scheduler &amp; Process</td><td class="r">75</td><td class="r">14.0%</td><td class="r">7.5</td></tr>
+                <tr><td>Networking</td><td class="r">56</td><td class="r">10.5%</td><td class="r">12.4</td></tr>
+                <tr><td>Containers</td><td class="r">19</td><td class="r">3.6%</td><td class="r">17.1</td></tr>
+                <tr><td>VFS &amp; Filesystem</td><td class="r">15</td><td class="r">2.8%</td><td class="r">3.7</td></tr>
+                <tr><td>Console &amp; Terminal</td><td class="r">15</td><td class="r">2.8%</td><td class="r">16.5</td></tr>
+                <tr><td>Misc / cross-cutting</td><td class="r">14</td><td class="r">2.6%</td><td class="r">50.9</td></tr>
+                <tr><td>Signals &amp; Exceptions</td><td class="r">12</td><td class="r">2.2%</td><td class="r">3.6</td></tr>
+                <tr><td>Boot &amp; Drivers</td><td class="r">11</td><td class="r">2.1%</td><td class="r">3.7</td></tr>
+                <tr class="self"><td><strong>kernel</strong></td><td class="r"><strong>535</strong></td><td class="r">100%</td><td class="r">13.4</td></tr>
+                <tr><td>outside it — apps, toolchain, ssh</td><td class="r">87</td><td class="r">—</td><td class="r">—</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="mark">
+          <pre class="logo" aria-hidden="true">                      =#=      .-
+                      +*#*:.:-**
+                      +%%#%##***
+                      +%%%#%%#**.
+                      +%@@@%%%+*:
+          :::::--=+++*%@%@%%%%*-
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+*%%%%%@%@@%@@@%%%%#%@@@@@@@%%@@%@@@*+--
+ ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+         .--+**%@@@@@%@@%%@@%*       :-.
+                  ::::---#@%%*</pre>
+          <p class="link"><a href="https://github.com/netoneko/akuma">github.com/netoneko/akuma</a></p>
+          <div class="figs">
+            <div class="fig"><span class="v">39,885</span><span class="k">prod lines</span></div>
+            <div class="fig"><span class="v">27,845</span><span class="k">test lines</span></div>
+            <div class="fig"><span class="v">~140</span><span class="k">linux syscalls</span></div>
+            <div class="fig"><span class="v hot">622</span><span class="k">documented fixes</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 04 -->
+  <section class="slide">
+    <div class="num">04</div>
     <div class="body">
       <p class="eyebrow">Act I · the landscape</p>
       <h2>Competitive landscape</h2>
@@ -305,9 +385,9 @@
     </div>
   </section>
 
-  <!-- 04 -->
+  <!-- 05 -->
   <section class="slide">
-    <div class="num">04</div>
+    <div class="num">05</div>
     <div class="body">
       <p class="eyebrow">Act I · the landscape</p>
       <h2>Same pressure, <em>opposite answers</em></h2>
@@ -328,9 +408,9 @@
     </div>
   </section>
 
-  <!-- 05 -->
+  <!-- 06 -->
   <section class="slide">
-    <div class="num">05</div>
+    <div class="num">06</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Have a concrete goal: <em>run X</em></h2>
@@ -351,9 +431,9 @@
     </div>
   </section>
 
-  <!-- 06 -->
+  <!-- 07 -->
   <section class="slide">
-    <div class="num">06</div>
+    <div class="num">07</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Self-hosting: <em>it compiles itself</em></h2>
@@ -367,21 +447,18 @@
         <div class="fig"><span class="v">3.8 MB</span><span class="k">elf · it boots</span></div>
         <div class="fig"><span class="v">0</span><span class="k">retries needed</span></div>
       </div>
-      <p>147/147 units, fresh boot and <code>cargo clean</code> every trial, 8 GB, SMP=4,
-      every memory-corruption tripwire silent.</p>
-      <p><strong>Almost nothing gets here.</strong> Redox reached <em>running</em> rustc and
+      <p><strong>Almost no hobby operating system gets to self-hosting.</strong> Redox reached <em>running</em> rustc and
       cargo natively in January 2026 — a decade in, on the third attempt — and does not yet
       build itself. Asterinas hasn't published a self-build result — with 210+ syscalls,
-      Firefox and QEMU running, a compiler almost certainly works there; nobody has claimed
-      the kernel builds under it.</p>
-      <p class="pull">Twenty consecutive first-try builds. A failed clean build is now a
-      <em class="q">regression finding, not weather.</em></p>
+      Firefox and QEMU running, rust/cargo probably work as clockwork.</p>
+      <p class="pull">Twenty consecutive first-try builds. A failed clean build is a
+      <em class="q">clear regression finding.</em></p>
     </div>
   </section>
 
-  <!-- 07 -->
+  <!-- 08 -->
   <section class="slide">
-    <div class="num">07</div>
+    <div class="num">08</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Audit before touching code</h2>
@@ -395,13 +472,13 @@
         <li>Enumerate the candidate theories explicitly, before writing any code.</li>
       </ul>
       <p class="pull">Updating the docs is how you find out your mental model and the code
-      have diverged — cheaper than finding out from a fault address.</p>
+      have diverged.</p>
     </div>
   </section>
 
-  <!-- 08 -->
+  <!-- 09 -->
   <section class="slide">
-    <div class="num">08</div>
+    <div class="num">09</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Isolate theories with probes, <em>then discredit them</em></h2>
@@ -415,9 +492,9 @@
     </div>
   </section>
 
-  <!-- 09 -->
+  <!-- 10 -->
   <section class="slide">
-    <div class="num">09</div>
+    <div class="num">10</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Then A/B it on <em>real workloads</em></h2>
@@ -437,14 +514,14 @@
     </div>
   </section>
 
-  <!-- 10 -->
+  <!-- 11 -->
   <section class="slide">
-    <div class="num">10</div>
+    <div class="num">11</div>
     <div class="body">
-      <p class="eyebrow cool">Act III · how it's built</p>
-      <h2>AI-assisted development: <span class="cool">docs as cognition</span></h2>
-      <p><strong>Every session starts with an assistant that has no memory of
-      yesterday.</strong> That one fact determines the whole documentation system.</p>
+      <p class="eyebrow hot">Act III · how it's built</p>
+      <h2>AI-assisted development: <span class="hot">build your intuition</span></h2>
+      <p class="pull"><strong>LLMs are stateless, engineers aren't. Good intuition indicates a strong mental model.</strong></p>
+      <p>Documenting the development process and helping the LLM discover the context by itself is cheap and always pays off.</p>
       <div class="scroller">
         <table>
           <thead><tr><th>tier</th><th>job</th></tr></thead>
@@ -465,25 +542,25 @@
     </div>
   </section>
 
-  <!-- 11 -->
+  <!-- 12 -->
   <section class="slide">
-    <div class="num">11</div>
+    <div class="num">12</div>
     <div class="body">
       <p class="eyebrow cool">Act III · how it's built</p>
       <h2>Learn from history</h2>
       <p><strong>A full OS development cycle is a surprisingly large dataset.</strong> 1,547
-      commits, 196 investigation docs. What falls out of it:</p>
+      commits, 196 investigation docs. What can be mined:</p>
       <ul>
         <li><strong>622 distinct fixes</strong> across 15 subsystems, itemised, dated, cross-referenced.</li>
         <li><strong>Two crisis windows, from commit volume alone</strong> — an independent churn-per-file measure lands on the same two months.</li>
-        <li><strong>Recurring defect <em>shapes</em>.</strong> ~3% of all fixes are the same underlying bug rediscovered in a different subsystem: stale address-space pointer ×3, lock-held-across-blocking ×4, readiness gaps ×6 across four files. The most-repeated shape: <strong>a raw index outliving the thing it names.</strong></li>
+        <li><strong>Recurring defect types.</strong> ~3% of all fixes are the same underlying bug rediscovered in a different subsystem: stale address-space pointer ×3, lock-held-across-blocking ×4, readiness gaps ×6 across four files. The most-repeated shape: <strong>a raw index outliving the thing it names.</strong></li>
       </ul>
     </div>
   </section>
 
-  <!-- 12 -->
+  <!-- 13 -->
   <section class="slide">
-    <div class="num">12</div>
+    <div class="num">13</div>
     <div class="body">
       <p class="eyebrow cool">Act III · how it's built</p>
       <h2>mood</h2>
@@ -498,12 +575,13 @@
 <span class="d">2026-08-06</span>  more tests and fixes, cargo remains undefeated
 <span class="d">2026-08-11</span>  curious case of nothingburger
 <span class="d">2026-08-13</span>  java crossover episode</pre>
+      <p class="pull">Time honored Eastern European tradition: curse, complain, then complain some more, still do the job.</p>
     </div>
   </section>
 
-  <!-- 13 -->
+  <!-- 14 -->
   <section class="slide">
-    <div class="num">13</div>
+    <div class="num">14</div>
     <div class="body">
       <p class="eyebrow"><code>go build</code> defeated</p>
       <pre>akuma:~$ apk add go git
@@ -520,11 +598,10 @@ akuma:~$ ./playground
       </div>
       <p>The milestone table said <em>"in progress — crashes during compilation"</em> for
       <strong>five months.</strong></p>
-      <p class="pull">Pick a real program. Audit before you touch anything. Probe until a
+      <p>Pick a real program. Audit before you touch anything. Probe until a
       theory dies. A/B on the real workload. Write it down for whoever starts from zero
       tomorrow.</p>
-      <p><strong>None of that got harder. It got cheaper at exactly the same rate the code
-      did.</strong></p>
+      <p class="pull">LLMs are statistical engines and it is your job to turn stats to your favor.</p>
     </div>
   </section>
 
