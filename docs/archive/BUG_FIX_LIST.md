@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 626
-- **Docs contributing at least one fix:** 197
+- **Total distinct fixes counted:** 632
+- **Docs contributing at least one fix:** 201
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 127 | 20.3% | 17 |
-| Memory & Virtual Memory | 112 | 17.9% | 34 |
-| Scheduler & Process Management | 75 | 12.0% | 18 |
-| SMP & Locking | 79 | 12.6% | 34 |
-| Networking | 35 | 5.6% | 14 |
-| Userspace Apps & Libraries | 35 | 5.6% | 19 |
+| Syscall / ABI Compatibility Audits | 127 | 20.1% | 17 |
+| Memory & Virtual Memory | 112 | 17.7% | 34 |
+| Scheduler & Process Management | 76 | 12.0% | 19 |
+| SMP & Locking | 79 | 12.5% | 34 |
+| Networking | 37 | 5.9% | 15 |
+| Userspace Apps & Libraries | 37 | 5.9% | 20 |
 | Rump Kernel & Syscall Proxy | 25 | 4.0% | 6 |
 | Toolchain & Self-Hosting | 37 | 5.9% | 5 |
 | SSH | 15 | 2.4% | 13 |
-| VFS & Filesystem | 15 | 2.4% | 10 |
-| Boot & Drivers | 11 | 1.8% | 6 |
+| VFS & Filesystem | 16 | 2.5% | 11 |
+| Boot & Drivers | 11 | 1.7% | 6 |
 | Signals & Exceptions | 12 | 1.9% | 5 |
 | Misc / Cross-cutting | 14 | 2.2% | 4 |
 | Console & Terminal | 15 | 2.4% | 7 |
 | Containers | 19 | 3.0% | 5 |
-| **Total** | **626** | **100.0%** | **197** |
+| **Total** | **632** | **100.0%** | **201** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -354,7 +354,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `ENABLE_STACK_CANARIES` painted a canary at every stack base and `check_all_stack_canaries()` existed to check them, but nothing anywhere called it, so a stack overrun that corrupted a page table left no diagnostic trail; fixed by checking the canary at thread teardown and from a periodic idle-maintenance pass for still-live threads, printing `[STACK-OVERFLOW] tid=N ran off its NKB kernel stack`
 
 
-## Scheduler & Process Management (75 fixes, 18 docs)
+## Scheduler & Process Management (76 fixes, 19 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -467,6 +467,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md
 - `write_stdin` (`process/channel.rs`) used the same drop-oldest FIFO semantics as the (already-fixed) stdout side, so stdin past `MAX_BUFFER_SIZE` (1 MiB) was silently dropped rather than backpressured; fixed by making it a short write instead — `sys_write`'s `File` arm returns `EAGAIN` on a zero-byte accept to avoid spinning, and sshd's stdin fd joined the non-blocking set with a residue queue and deferred EOF
+
+### docs/archive/SCHEDULING_INVESTIGATION.md
+- Expired sleepers/pollers rejoined the back of the round-robin queue instead of running next, and the 10 ms timer tick meant every sleep/poll deadline paid a full round (~35 ms floor at SMP=1, ~13 ms more per additional runnable thread) — measured as terminal output forwarded in ~27 Hz bursts; fixed via `WAKE_DEADLINE_PREEMPT` (arms the existing `PREEMPT_WAKE_TID` run-next hint from the deadline wake-pass instead of only from `ThreadWaker::wake`) plus dropping `TIMER_INTERVAL_US` 10 000→1 000, profile-gated (`extreme-size` keeps 10 ms) — A/B'd clean on release SMP=1/SMP=4, the 4 MB extreme-size floor, and devbox-smoltcp SMP=4
 
 
 ## SMP & Locking (79 fixes, 34 docs)
@@ -625,7 +628,7 @@ aren't recorded anywhere else.)
 - `threading::init` stored `FREE` over the `RUNNING` state of thread slots secondary cores had already adopted (self-test image brings secondaries up before init), handing live slots back to the allocator for the next `claim_free_slot` to hand out a second time — fixed by skipping adopted core-idle slots in the state-reset loop
 - The same init's stack pre-allocation loop overwrote those slots' `stacks[i]` and `exception_stack_top` with fresh PMM stacks nothing was executing on, so `validate_current_sp`, the canary check and the high-water probe all read the wrong memory for a live core — and it silently vacuumed the boot suite's `spurious == 0` canary assertion, which is why the bug above went unnoticed; fixed by the same `is_adopted_core_idle` guard, with regression `test_core_idle_slots_survive_init`
 
-## Networking (35 fixes, 14 docs)
+## Networking (37 fixes, 15 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - `MAX_BACKLOG = 8` (`crates/akuma-net/src/socket.rs`) was a hard ceiling on **simultaneous connection arrivals**, not the soft hint `listen(2)`'s backlog is on Linux: this stack has no SYN queue, a listener *is* a fixed pool of pre-created sockets sitting in `Listen` that `socket_accept` replenishes one at a time, so arrivals past the 8th got a RST regardless of how fast the server accepted. Every caller's requested backlog was silently clamped to it (`libakuma`'s `TcpListener::bind` asks for 128). Measured on devbox-smoltcp/SMP=4: 8/8 connections clean, 12/16, 17/24 before; 16/16 and 24/24 after. Raised to 32 behind the default-on `many-sessions` feature, which also lifts the smoltcp socket table from 32 to 128 on `small-sockets` builds — a 32-deep backlog is meaningless against a 32-socket budget. `kernel_profile_extreme` overrides both back down, so the 4 MB floor is unaffected
@@ -691,7 +694,11 @@ aren't recorded anywhere else.)
 - `SO_RCVTIMEO`/`SO_SNDTIMEO` were accepted by `setsockopt` and silently discarded, with no `getsockopt` arm at all, so a 2 s read timeout actually fired at 30041 ms (the cap above) and the client could not detect the loss; now a real per-socket `struct timeval` with POSIX zero-means-block-forever, `EINVAL` on a malformed value, and a working 16-byte readback
 - The `EPOLLET` **write** edge was never re-armed — `epoll_on_fd_drained` reset `EPOLLIN` and had no `EPOLLOUT` counterpart — so a client that filled the 16 KB transmit buffer and waited for `EPOLLOUT` could wait forever; intermittent because `epoll_pwait` drives `smoltcp_net::poll()` at the top of its own loop and usually flushed the buffer before `can_send()` was ever *observed* false. Added `epoll_on_fd_write_blocked`, called from `sendto`/`sendmsg`/`write` on every short write and every `EAGAIN`
 
-## Userspace Apps & Libraries (35 fixes, 19 docs)
+### docs/archive/TOKIO_PIPE_EPOLL_HANG.md
+- `PipeRead` ignored `O_NONBLOCK` and blocked instead of returning `EAGAIN`, and a pipe's `EPOLLET` `EPOLLIN` edge was never re-armed on read/EAGAIN (nor was `EPOLLHUP` ever reported once the last writer closed), so any edge-triggered reader (tokio/mio, and therefore `nca`) that drained a child's stdout then went back to `epoll_wait` for EOF hung forever, looking like a healthy-but-stuck process; fixed by honoring `fd_is_nonblock` in `PipeRead`'s `sys_read` arm and calling `epoll_on_fd_drained` on every pipe read and `EAGAIN`, plus reporting `EPOLLHUP` once the last writer is gone
+- The `Stdin` arm of `sys_read` had the identical two defects (no `O_NONBLOCK` check, no `epoll_on_fd_drained` re-arm), independently and never carried over from the `PipeRead` fix above — since `nca`'s keystroke path also goes through edge-triggered epoll (crossterm's default `mio` backend) on fd 0, a read after draining one keystroke blocked inside the syscall for the full idle gap until the next one arrived, manifesting as multi-minute input freezes; fixed the same way, mirroring the `PipeRead` fix in the `Stdin` arm
+
+## Userspace Apps & Libraries (37 fixes, 20 docs)
 
 ### docs/archive/DOOM.md
 - SIGSEGV in `R_Init` — `strncpy` stub off-by-one corrupted an adjacent struct field
@@ -765,6 +772,10 @@ aren't recorded anywhere else.)
 
 ### docs/archive/PAWS_DUPLICATED_ARGV0.md
 - `paws` passed its full argument vector — including `args[0]`, the command name it had already consumed for its own path lookup — straight through to `spawn`, which itself prepends the resolved path as `argv[0]`, so every child process received its own name twice in `argv`; invisible for multicall binaries like busybox (which expect and re-dispatch on a leading applet name) but fatal for `tcc`, which read the duplicate as an input file (`"file 'tcc' not found"`); fixed by `.skip(1)`-ing the command name at all four of `paws`'s spawn sites
+
+### docs/archive/SCHEDULING_INVESTIGATION.md
+- `nca`'s `--no-tui` `Repl::run()` (an `async fn`) called reedline's blocking `read_line()` directly with no `spawn_blocking`, monopolizing one of tokio's 4 worker threads for as long as a keystroke was pending and starving every other task scheduled on it (event-fanout, IPC command consumer, subagent consumer); fixed by moving the call onto `tokio::task::spawn_blocking` (`crates/tui/src/repl.rs`)
+- `nca`'s TUI event bridge (`spawn_tui_bridge`, `crates/tui/src/tui/bridge.rs`) called a blocking `std::sync::Mutex::lock()` directly inside a `tokio::spawn` task once per event; the render loop held that same lock across its own synchronous `terminal.draw()` pty I/O, so a slow draw blocked the bridge's tokio worker on the lock and the render loop's own input `poll()` — sequenced after its critical section on the same thread — never got reached, producing multi-minute input freezes; fixed by moving the lock-and-mutate onto `tokio::task::spawn_blocking`
 
 
 ## Rump Kernel & Syscall Proxy (25 fixes, 6 docs)
@@ -903,7 +914,7 @@ aren't recorded anywhere else.)
 
 ---
 
-## VFS & Filesystem (15 fixes, 10 docs)
+## VFS & Filesystem (16 fixes, 11 docs)
 
 ### docs/archive/STAT_AND_UNLINKAT_FIX.md
 - Root cause 1: `stat()` returned `st_ino=0` for every file
@@ -939,6 +950,9 @@ aren't recorded anywhere else.)
 ### docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md
 - ext2 thread hooks were read/written through a bare `static mut` with no synchronization — a genuine data race between the hook-registering thread and readers retrying a lock acquisition; fixed by reusing `akuma-exec`'s existing lock-free `OnceCopy<T>` cell (release store at `init_thread_hooks`, acquire load at each read) rather than inventing a second mechanism
 - `test_openat`'s pre-test clean-slate step and its post-test teardown tracked different file lists — the symlink case's `link.txt`/`target.txt` were only in teardown's list, so a crashed run's leftover symlink inputs survived into the next boot's clean-slate step; fixed by one shared `LEFTOVERS` list used by both
+
+### docs/archive/NCA_FD_NONBLOCK_TOCTOU.md
+- `sys_close` cleared an fd's `cloexec` flag immediately after freeing its table slot but its `nonblock` flag only after the slot's resource-cleanup match arm ran; in that window a concurrent thread on the same shared fd table (`CLONE_THREAD`) could `alloc_fd` the exact same fd number for an unrelated new pipe, inherit the previous occupant's stale `nonblock` bit (or have its own legitimately-set flag wiped out by the closer's now-late clear) — real `cargo`/`rustc` spawns from cargo's multi-threaded jobserver hit this as a spurious `EAGAIN` on what should be a blocking child-error-pipe read (24/40 failures reproduced under 4 concurrent threads); fixed by clearing `nonblock` immediately alongside `cloexec` in `sys_close`/`sys_close_range`, copying `nonblock` onto `newfd` in `sys_dup3` (which shares the open-file-description on real Linux but didn't propagate the flag here), and defensively clearing both flags in `alloc_fd_from` before a freed fd number is ever reissued
 
 
 ## Boot & Drivers (11 fixes, 6 docs)
