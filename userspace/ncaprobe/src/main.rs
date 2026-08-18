@@ -9,6 +9,7 @@
 //! ```text
 //! tokio [--workers N] [--tui]      end-to-end: does Command::output() complete?
 //! eofedge                          does the EOF edge arrive after a partial drain?
+//! ptyedge                          does a pty's 2nd EPOLLET edge arrive after an idle gap?
 //! epoll [main|thread] [--late] [--zero]   raw pipe + spawn + epoll(ET) + pidfd
 //! cross                            epoll_wait on one thread, epoll_ctl on another
 //! fds                              open fds, which are epolls, and fd aliasing
@@ -326,6 +327,197 @@ fn probe_eofedge() {
         println!("          (a blind read right now returns {r} — the EOF was there all along)");
     }
     let _ = child.wait();
+}
+
+// ---------------------------------------------------------------- probe L
+// nca's TUI reads keystrokes via crossterm's default (mio) backend, which is
+// edge-triggered epoll (EPOLLET) on the pty fd — the exact same mechanism
+// PipeRead had the missing epoll_on_fd_drained re-arm for (probe G/eofedge).
+// This is the pty-shaped version of that test: drain an initial byte, go
+// back to epoll_wait, then — well after the reader is idle again — have a
+// companion writer deliver a SECOND byte to the master side (what sshd does
+// when a keystroke arrives from the network) and time how long that second
+// edge takes to arrive. Written for the nca input-freeze finding in
+// docs/archive/TOKIO_PIPE_EPOLL_HANG.md ("New finding 2026-08-18").
+
+fn open_pty_pair() -> Option<(i32, i32)> {
+    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    if master < 0 {
+        println!("posix_openpt failed: {}", std::io::Error::last_os_error());
+        return None;
+    }
+    if unsafe { libc::grantpt(master) } != 0 {
+        println!("grantpt failed: {}", std::io::Error::last_os_error());
+        return None;
+    }
+    if unsafe { libc::unlockpt(master) } != 0 {
+        println!("unlockpt failed: {}", std::io::Error::last_os_error());
+        return None;
+    }
+    let name_ptr = unsafe { libc::ptsname(master) };
+    if name_ptr.is_null() {
+        println!("ptsname failed: {}", std::io::Error::last_os_error());
+        return None;
+    }
+    let cname = unsafe { std::ffi::CStr::from_ptr(name_ptr) };
+    println!("pty slave path: {}", cname.to_string_lossy());
+    let slave = unsafe { libc::open(cname.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    if slave < 0 {
+        println!("open(slave) failed: {}", std::io::Error::last_os_error());
+        return None;
+    }
+    Some((master, slave))
+}
+
+fn probe_ptyedge() {
+    let t0 = Instant::now();
+    let el = |t0: &Instant| format!("{:>7}ms", t0.elapsed().as_millis());
+
+    let Some((master, slave)) = open_pty_pair() else {
+        println!("RESULT: could not open a pty pair — probe inconclusive");
+        return;
+    };
+    println!("[{}] master fd={master} slave fd={slave}", el(&t0));
+
+    // A freshly opened pty defaults to canonical mode: a single byte with no
+    // newline just sits in the line-discipline's edit buffer and is never
+    // "readable" at all, which would make this probe fail on ANY kernel and
+    // is not what nca hits (crossterm puts the real tty in raw mode). Put
+    // this one in raw mode too so single bytes become readable immediately.
+    unsafe {
+        let mut raw: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(slave, &mut raw);
+        libc::cfmakeraw(&mut raw);
+        libc::tcsetattr(slave, libc::TCSANOW, &raw);
+    }
+
+    unsafe {
+        let fl = libc::fcntl(slave, libc::F_GETFL);
+        libc::fcntl(slave, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+    // Read interest only (mio registers stdin-like sources for READABLE, not
+    // WRITABLE) — PIPE_MASK's EPOLLOUT bit would make epoll_wait return
+    // immediately on the pty's (almost always writable) slave fd regardless
+    // of whether there's anything to read, defeating the test.
+    const EPOLLIN_ET: u32 = 0x8000_0001; // EPOLLIN | EPOLLET
+    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    let mut ev = libc::epoll_event { events: EPOLLIN_ET, u64: 1 };
+    unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, slave, &mut ev) };
+    println!("[{}] slave registered EPOLLIN|EPOLLET on epoll", el(&t0));
+
+    // Writer: byte 'A' shortly after start (round 1 — the easy case), then
+    // — only after the reader has drained and gone idle — byte 'B' after a
+    // real gap (round 2 — the case that was hanging in nca).
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        let r1 = unsafe { libc::write(master, b"A".as_ptr().cast(), 1) };
+        println!("[writer] write('A') -> {r1} err={:?}", std::io::Error::last_os_error());
+        std::thread::sleep(Duration::from_millis(700));
+        let r2 = unsafe { libc::write(master, b"B".as_ptr().cast(), 1) };
+        println!("[writer] write('B') -> {r2} err={:?}", std::io::Error::last_os_error());
+    });
+
+    let drain = |t0: &Instant, fd: i32, label: &str| {
+        loop {
+            let mut buf = [0u8; 64];
+            let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if r > 0 {
+                println!(
+                    "[{}]         {label} read = {r} {:?}",
+                    el(t0),
+                    String::from_utf8_lossy(&buf[..r as usize])
+                );
+            } else {
+                println!("[{}]         {label} read = EAGAIN/err({r})", el(t0));
+                break;
+            }
+        }
+    };
+
+    for (round, budget_ms, expect) in [(1, 2000, 'A'), (2, 3000, 'B')] {
+        let wait_start = Instant::now();
+        let mut evs = [libc::epoll_event { events: 0, u64: 0 }; 4];
+        let n = unsafe { libc::epoll_wait(epfd, evs.as_mut_ptr(), 4, budget_ms) };
+        let waited = wait_start.elapsed();
+        if n <= 0 {
+            println!(
+                "[{}] round {round}: epoll_wait(budget={budget_ms}ms) -> {n} after {waited:?} \
+                 — *** edge for {expect:?} NEVER ARRIVED ***",
+                el(&t0)
+            );
+            continue;
+        }
+        println!(
+            "[{}] round {round}: READY events={} after {waited:?} (budget was {budget_ms}ms)",
+            el(&t0),
+            ev_name(evs[0].events)
+        );
+        drain(&t0, slave, &format!("round{round}"));
+    }
+    let _ = writer.join();
+    println!("[{}] done", el(&t0));
+}
+
+// ---------------------------------------------------------------- probe M
+// `ptyedge` above needs a real POSIX pty (`/dev/ptmx`), which does not exist
+// on Akuma — `nca`'s actual stdin under sshd is a `FileDescriptor::Stdin`
+// exec-channel, a different, Akuma-specific construct entirely (see
+// `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`, "New finding 2026-08-18"). This
+// tests THAT code path directly: register fd 0 itself with EPOLLIN|EPOLLET,
+// set it non-blocking, and time how long it takes to see a keystroke typed
+// after an idle gap. Needs a real interactive session — run this, wait
+// ~2s, then type one character.
+
+fn probe_stdinedge() {
+    let t0 = Instant::now();
+    let el = |t0: &Instant| format!("{:>7}ms", t0.elapsed().as_millis());
+
+    unsafe {
+        let fl = libc::fcntl(0, libc::F_GETFL);
+        libc::fcntl(0, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+    const EPOLLIN_ET: u32 = 0x8000_0001; // EPOLLIN | EPOLLET
+    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    let mut ev = libc::epoll_event { events: EPOLLIN_ET, u64: 1 };
+    let reg = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, 0, &mut ev) };
+    println!("[{}] fd 0 registered EPOLLIN|EPOLLET on epoll (epoll_ctl -> {reg})", el(&t0));
+    println!("[{}] type ONE character now, then wait — no need to press Enter", el(&t0));
+
+    for round in 1..=3 {
+        let wait_start = Instant::now();
+        let mut evs = [libc::epoll_event { events: 0, u64: 0 }; 4];
+        let n = unsafe { libc::epoll_wait(epfd, evs.as_mut_ptr(), 4, 15_000) };
+        let waited = wait_start.elapsed();
+        if n <= 0 {
+            println!(
+                "[{}] round {round}: epoll_wait(budget=15000ms) -> {n} after {waited:?} \
+                 — *** edge never arrived ***",
+                el(&t0)
+            );
+            continue;
+        }
+        println!(
+            "[{}] round {round}: READY events={} after {waited:?}",
+            el(&t0),
+            ev_name(evs[0].events)
+        );
+        loop {
+            let mut buf = [0u8; 64];
+            let r = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+            if r > 0 {
+                println!(
+                    "[{}]         read = {r} {:?}",
+                    el(&t0),
+                    String::from_utf8_lossy(&buf[..r as usize])
+                );
+            } else {
+                println!("[{}]         read = EAGAIN/err({r})", el(&t0));
+                break;
+            }
+        }
+        println!("[{}] type another character (or wait 15s to end)", el(&t0));
+    }
+    println!("[{}] done", el(&t0));
 }
 
 // ---------------------------------------------------------------- probe H
@@ -884,6 +1076,14 @@ fn main() {
             println!("=== probe: EOF edge after a partial drain ===");
             probe_eofedge();
         }
+        Some("ptyedge") => {
+            println!("=== probe: pty EPOLLET edge for a second, later byte ===");
+            probe_ptyedge();
+        }
+        Some("stdinedge") => {
+            println!("=== probe: fd 0 (real Stdin exec-channel) EPOLLET edge ===");
+            probe_stdinedge();
+        }
         Some("waitid") => {
             println!("=== probe: waitid(P_PIDFD) — tokio's reaping call ===");
             probe_waitid();
@@ -927,7 +1127,7 @@ fn main() {
         }
         _ => {
             println!("usage: ncaprobe epoll [main|thread] [--late] [--zero]");
-            println!("       ncaprobe tokio|eofedge|cross|fds|waitid|pipebench [--epoll N]");
+            println!("       ncaprobe tokio|eofedge|ptyedge|cross|fds|waitid|pipebench [--epoll N]");
             println!("       ncaprobe raw [main|thread|split]");
         }
     }

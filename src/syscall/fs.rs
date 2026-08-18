@@ -348,6 +348,16 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
                 let n = ch.read_stdin(&mut kernel_buf);
                 if n > 0 {
+                    // Re-arm the `EPOLLET` `EPOLLIN` edge on every successful
+                    // read, exactly like the `PipeRead`/`UnixSocket`/`Socket`
+                    // arms above (see `epoll_on_fd_drained`'s doc comment and
+                    // `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`). This arm never
+                    // called it before — an edge-triggered reader (mio, which
+                    // is what crossterm's default backend uses to watch this
+                    // exact fd for keyboard input) that drains this read and
+                    // goes back to `epoll_wait` would see `new_bits == 0` for
+                    // the *next* keystroke's edge and never wake for it.
+                    super::poll::epoll_on_fd_drained(fd_num as u32);
                     if !is_pipe {
                         let term_state_lock = akuma_exec::process::current_terminal_state();
                         if let Some(ref ts_lock) = term_state_lock {
@@ -430,6 +440,19 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
                 if akuma_exec::process::should_interrupt_blocking_syscall() {
                     return EINTR;
+                }
+
+                // Every other read arm (`PipeRead`, `UnixSocket`, `Socket`)
+                // honours `O_NONBLOCK` here; this one never did — a caller
+                // that set it (mio, for the same reason crossterm needs
+                // `EPOLLET` semantics to work at all: an edge-triggered
+                // reader must be able to drain to `EAGAIN`) got parked in
+                // `schedule_blocking(u64::MAX)` regardless, indistinguishable
+                // from a real hang. Re-arm the edge before handing back
+                // `EAGAIN`, exactly as `PipeRead` does.
+                if super::net::fd_is_nonblock(fd_num as u32) {
+                    super::poll::epoll_on_fd_drained(fd_num as u32);
+                    return EAGAIN;
                 }
 
                 let term_state_lock = if let Some(state) = akuma_exec::process::current_terminal_state() { state } else {

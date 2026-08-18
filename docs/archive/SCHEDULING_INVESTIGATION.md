@@ -1,14 +1,15 @@
 # Terminal stutter: every short sleep costs a full round-robin pass
 
 **Date:** 2026-08-17/18
-**Status:** **REOPENED 2026-08-18** — real-world nca use shows this is
-**not fixed**: freezes are still present after the landed changes, and
-appear to get *worse*, not better, when network traffic and terminal
-rendering happen concurrently. See
-[Post-fix: nca still freezes](#post-fix-nca-still-freezes-2026-08-18) below.
-The probe-driven results below were real, but did not transfer to actual nca
-usage — the workload the probes model is apparently not the one that
-matters. Original status text, kept for the record:
+**Status:** **The kernel-scheduler fix below is real and stands. The
+freezes it didn't fix were a separate, nca-side bug — also found and fixed
+2026-08-18, see [Root cause found: nca, not the kernel]
+(#root-cause-found-nca-not-the-kernel-2026-08-18).** `Repl::run()` called
+reedline's blocking `read_line()` directly inside an `async fn`, starving
+tokio's worker pool on the `--no-tui` path. The scheduler/futex layer was
+inspected in detail chasing this and held up — no kernel bug found. Fixed in
+nca, not in Akuma; live interactive re-verification still outstanding.
+Original status text, kept for the record:
 **FIXED 2026-08-18** — two changes landed:
 `WAKE_DEADLINE_PREEMPT` in `crates/akuma-exec/src/threading/mod.rs` (the
 deadline wake-pass arms the existing `PREEMPT_WAKE_TID` run-next hint) and
@@ -477,6 +478,190 @@ under nca itself (not `ncaprobe`) with traffic and rendering concurrent,
 capture `PSTATS` and BKL contention during a live freeze, and check whether
 this is the same "expired sleepers join the back of the round-robin queue"
 mechanism at a different multiplier, or a distinct bug the fix didn't touch.
+
+### Live capture, 2026-08-18: a genuine multi-minute stall, not just latency
+
+Caught live with `GDB=1 overlays/devbox/run-smoltcp.sh` (console redirected to
+`logs/devbox_gdb_session.log` instead of a terminal, so the periodic
+`PSTATS`/`THR-DUMP`/`FUTEX-DUMP` kept recording through the freeze) plus
+`aarch64-elf-gdb -ex "target remote localhost:1234"` against the running
+kernel. nca (pid 11, tgid 11) froze mid-keystroke — reedline stopped echoing
+characters entirely, before Enter was even pressed, so this cannot be
+LLM/network latency; echoing a typed character is 100% local.
+
+The `PSTATS` line for pid 11 is the clearest signal:
+
+```
+[PSTATS] PID 11 (/usr/local/bin/nca)  37.49s: futex=77(24924ms) epoll_pwait=3765(47410ms) …
+[PSTATS] PID 11 (/usr/local/bin/nca)  67.49s: futex=77(24924ms) epoll_pwait=6779(77401ms) …
+[PSTATS] PID 11 (/usr/local/bin/nca) 127.49s: futex=77(24924ms) epoll_pwait=12854(137383ms) …
+[PSTATS] PID 11 (/usr/local/bin/nca) 277.49s: futex=77(24924ms) epoll_pwait=25311(260377ms) clock_gettime=25970(2ms) …
+```
+
+`futex` call count and cumulative time are **frozen at exactly 77/24924ms
+across 240 seconds of wall time** — zero completed futex syscalls in four
+minutes — while `epoll_pwait` (the tokio reactor thread) keeps climbing
+normally the whole time, and a `clock_gettime` counter that didn't exist at
+t=37s appears and climbs steadily by t=277s. Reading: the reactor thread is
+fine; one or more of nca's other OS threads (tokio blocking-pool workers,
+`clone`d — 3 live ones per the `THR-DUMP`: tid 13/15/16, tgid 11) stopped
+completing futex waits and appear to have fallen back to a clock-polling
+spin instead — consistent with whatever real input-handling thread reedline
+depends on never getting scheduled back in.
+
+`aarch64-elf-gdb` samples taken ~3 minutes apart, mid-freeze, agree with
+this: all 4 physical cores idle, core 0 parked one instruction past `wfi` in
+`akuma::run_async_main`'s idle loop, cores 1-3 parked in
+`secondary_shared_start`. **The hardware is idle while a userspace thread
+that should be runnable makes no progress** — the same signature as
+[[project_pool_gate_preemption_wedge]] ("the box is not dead, it is
+unscheduled" — console/IRQs/other threads keep running, only the one thread
+never gets switched in). Difference from that memory: no `[SGI] POOL
+contended` storm printed here (grepped the full session log — one hit, and
+it's the unrelated `[WATCHDOG] Time jump … host sleep/wake` line), so this
+is not proven to be textually the same bug, only the same *category*:
+a runnable thread starved of CPU for minutes with idle cores available,
+invisible to the preemption watchdog because that watchdog only fires on
+`PREEMPTION_DISABLED`, which a scheduling-starvation stall never touches.
+
+**Correction after closer inspection (same session):** the "idle cores while a
+runnable thread starves" reading above does not survive a second look, and
+should not be repeated as the finding. Reading `THREAD_STATES`/`WAKE_TIMES`
+directly out of guest memory via gdb (`akuma_exec::threading::THREAD_STATES`
+at `0x40331630`, `WAKE_TIMES` at `0x4032fc30` — both plain symbol names, no
+mangling trouble) showed tid 13/15/16 (the tokio blocking-pool workers)
+cycling completely normally: fresh `WAKE_TIMES` within ~0.2 s of "now" every
+time sampled, `queued_for` staying in the tens-of-ms range, never growing.
+`schedule_blocking` was returning for them on schedule the whole time — the
+untimed-`FUTEX_WAIT` 200 ms revalidation safety net (§ code comment at
+`src/syscall/sync.rs:836`, `FUTEX_REVALIDATE_US`) was doing exactly its job.
+Reading that safety net's implementation (`futex_check_and_enqueue`,
+`src/syscall/sync.rs:368`) end to end: the value re-check and the re-enqueue
+happen under the *same* `FUTEX_WAITERS` lock with IRQs masked, so a concurrent
+`futex_do_wake` cannot land in the gap — this is not the classic lost-wakeup
+shape and no bug was found in it this session.
+
+So the frozen `PID 11` aggregate (`futex=77` unchanged for 240+ s while the
+per-thread counters above kept moving) is most likely a **stats-reporting
+artifact** — `PSTATS`'s per-syscall table for that pid stopped being credited
+— not proof the process itself was fully wedged. What *is* still true and
+un-explained: the user could not get a keystroke echoed for 4+ minutes, and
+`ps aux` on the guest showed the process alive the whole time making no
+visible progress, and it was killed (by the user) before its *main* thread
+(tid 12 — distinct from the three worker tids inspected above) could be
+individually captured mid-hang.
+
+### Root cause found: nca, not the kernel (2026-08-18)
+
+Not a kernel bug. `crates/tui/src/repl.rs`'s `Repl::run()` is an `async fn`,
+and its main loop called `editor.read_line(&self.prompt)` — reedline's
+**synchronous, blocking** raw-terminal read — directly, with no
+`spawn_blocking`. That is tokio's textbook "blocking call on the async
+runtime" hazard: for as long as the user is mid-keystroke, that call
+monopolizes whichever of the runtime's 4 worker threads (`ps aux` on the
+guest showed exactly 4 `{tokio-rt-worker}` threads, matching
+`std::thread::available_parallelism` at SMP=4) is running this task, and
+starves everything else scheduled on it — the event-fanout task, the IPC
+command consumer, the subagent consumer. Every *other* blocking call in this
+same file (git operations, the TUI's own `run_blocking`) already goes through
+`tokio::task::spawn_blocking` correctly; this one call site, on the `--no-tui`
+path the freezes were reported on, was the one gap. It explains every
+observed symptom at once: stuck before Enter was even pressed (rules out
+LLM/network latency), worse under concurrent load (more tasks competing for
+the one worker thread this call doesn't release), and specific to nca (rest
+of `userspace/` is `no_std` on `libakuma` and never exercises a real
+multi-threaded `std` + tokio runtime the way nca does).
+
+Fixed by moving the call onto tokio's blocking pool:
+`let (returned_editor, sig) = tokio::task::spawn_blocking(move || { let sig =
+editor.read_line(&prompt_snapshot); (editor, sig) }).await…`, with
+`NcaPrompt` made `Clone` so a snapshot can move into the closure. Built,
+deployed to the running devbox VM, and smoke-tested (`crates/tui/src/repl.rs`,
+`crates/tui/src/prompt.rs`; recorded in `userspace/nca/upstream-akuma-patches.patch`
+alongside the render-duplication fix from earlier the same day). Live
+interactive re-verification (does it actually stop freezing under real typing
++ concurrent traffic) is the outstanding step — not yet confirmed by a human
+at the keyboard.
+
+The earlier live-capture evidence above (frozen `PID 11` `PSTATS` aggregate,
+gdb samples of idle cores) is kept as the record of what was chased and ruled
+out before landing on this — none of it turned out to be the kernel's fault,
+which is itself the useful result: it closes off the scheduler/futex
+avenue for this specific symptom.
+
+### Second bug found the same day: the TUI path had the same class of issue
+
+The `read_line` fix above covers the `--no-tui` line-REPL path only. Real-world
+use immediately surfaced that the full-screen TUI (`run_with_tui`) freezes the
+same way, on a fresh binary that already had the `read_line` fix — so it's a
+second, distinct bug of the same *shape*, not the same code path.
+
+**Measured, not guessed:** nca's own per-session JSONL event log
+(`~/.local/share/ncacli/workspaces/<id>/sessions/<session>.events.jsonl`) gave
+an exact number instead of a stopwatch guess. Turn 1 went idle at
+`02:21:58.356`; the user's next typed message wasn't recorded as
+`MessageReceived` until `02:29:53.664` — **a 7 minute 55 second stall**, after
+which the LLM round-trip for that turn was completely normal (4.5 s). The
+`MessageReceived` event only fires once `read_line`-equivalent input has
+actually been submitted, so the entire stall was on the input side, matching
+the pattern from the first bug — and confirming (again) it wasn't the LLM.
+
+Corroborating kernel-side evidence: `PSTATS` for that pid showed `ppoll` calls
+barely moving (5 → 13 total) across the whole 8-minute window, even though the
+TUI's render/input loop (`run_blocking` in `crates/tui/src/tui/app.rs`) calls
+`poll(Duration::from_millis(250))` on every idle iteration — over 8 minutes
+that should have logged on the order of ~2000 calls, not 8. Something was
+stuck *before* that loop ever reached its own `poll()` call.
+
+Root cause: `crates/tui/src/tui/bridge.rs`'s `spawn_tui_bridge` — the task that
+applies incoming `AgentEvent`s to the shared `TuiSessionState` — called
+`state.lock()` (a blocking `std::sync::Mutex`) directly inside its
+`tokio::spawn(async move { … })` body, once per event, with no
+`spawn_blocking`. The render loop holds that same lock across its entire
+draw-and-then-poll iteration, including the synchronous `terminal.draw()`
+call (which does real write() syscalls to the pty). If `terminal.draw()` is
+slow for any reason, the bridge task blocks its tokio worker thread waiting
+on the same lock — and the render loop's own `poll()` call, sequenced *after*
+its critical section in the same loop iteration on the same thread, never
+even gets reached until the lock is free. This is the user's own hypothesis,
+confirmed by reading the code: yes, the event stream can block the input.
+
+Fixed the same way as the first bug: moved the lock-and-mutate onto
+`tokio::task::spawn_blocking` (`crates/tui/src/tui/bridge.rs`). Built,
+deployed, recorded in `userspace/nca/upstream-akuma-patches.patch`. Not yet
+confirmed against a live re-freeze — the process that produced the 7m55s
+number above was still running the *old* binary when it happened, so this
+fix has not been proven against a real repro yet. A scripted SSH-driven
+repro (type via a real pty, with concurrent bulk traffic and real tool-call
+turns, 6 cycles) did not reproduce a hard freeze either before or after this
+fix — worst observed echo latency 170 ms — so whatever triggers the multi-minute
+version is rarer or more specific than that harness currently captures.
+
+Residual risk, unresolved: the render loop holding `state.lock()` across
+`terminal.draw()`'s actual pty I/O is still true after this fix. If
+`terminal.draw()` itself can stall for a long time on Akuma (a real pty-write
+stall, the original subject of this whole document), *every* lock site in
+`crates/tui/src/repl.rs` that runs from an async command handler (100+ call
+sites, all the same `if let Ok(mut g) = st.lock() { … }` shape) would block
+its tokio worker the same way the bridge did. Those are individually
+short critical sections with no per-event volume, so they're a much smaller
+target than the bridge was, but they were not audited or fixed this session —
+worth revisiting if a freeze reproduces again on the current binary.
+
+Two loose ends from the chase, not otherwise connected to either bug:
+
+1. Check whether crossterm/reedline's stdin-readiness path on Akuma has an
+   edge-notification gap similar to the pipe `EPOLLET` bug fixed in
+   [`TOKIO_PIPE_EPOLL_HANG.md`](TOKIO_PIPE_EPOLL_HANG.md) — that fix covered
+   pipes, not ptys, and is worth ruling in/out if freezes persist post-fix.
+2. `crates/akuma-net/src/smoltcp_net.rs`'s
+   loopback path (`LoopbackAwareTxToken::consume`) pushes onto
+   `loopback_queue: VecDeque<Vec<u8>>` with **no capacity bound and a fresh
+   heap allocation per loopback frame** — a real unbounded-queue-without-
+   backpressure gap, matching a standing suspicion about `akuma-net`. Not
+   implicated in this specific hang (no loopback TCP traffic was in play —
+   nca's own IPC socket never even binds, see the `AF_UNIX unsupported`
+   warning), but worth fixing on its own merits before it causes one.
 
 ## What is still open
 

@@ -68,6 +68,7 @@ Each isolates one layer, so a pass eliminates that layer permanently:
 |---|---|
 | `tokio [--workers N] [--tui]` | Does `tokio::process::Command::output()` complete at all? The end-to-end repro. |
 | `eofedge` | After draining a pipe with the writer still open, does the **EOF edge** ever arrive? The minimal form of the bug. |
+| `ptyedge` | pty-shaped version of `eofedge`: after draining an initial byte, does a *second, later* `EPOLLET` edge on the pty's slave fd arrive after an idle gap? Written for the nca TUI input-freeze finding — see `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`'s "New finding 2026-08-18" section. |
 | `epoll [main\|thread] [--late] [--zero]` | Raw `pipe`+`posix_spawn`+`epoll(ET)`+`pidfd`, on the main or a worker thread, registering before or after the child exits. |
 | `cross` | One thread parked in `epoll_wait` while another `epoll_ctl(ADD)`s into it — tokio's shape. |
 | `fds` | Which fds are open, which are epoll instances, and whether two fds alias one instance. |

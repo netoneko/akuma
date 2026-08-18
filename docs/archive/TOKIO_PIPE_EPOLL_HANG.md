@@ -184,6 +184,95 @@ Two adjacent findings from the same dig, neither the cause here:
   created — it would land on fd ≥ 3 — and any program that dups its tty to a
   higher fd gets `ENOTTY`.
 
+## New finding 2026-08-18: `poll()` itself stalling far past its budget — confirmed, fixed
+
+A third, distinct symptom from live `nca` usage (multi-minute freezes reported
+independently in `SCHEDULING_INVESTIGATION.md`, after both bugs documented
+there were fixed): the render loop's own `crossterm::event::poll(Duration)`
+call — the OS-level readiness check on the pty fd, called before any of nca's
+own logic runs — was measured taking far longer than its requested timeout.
+Opt-in timing instrumentation (`NCA_TUI_TIMING_LOG=1`, see
+`crates/tui/src/tui/debug_log.rs` in the `native-cli-ai` submodule) caught it
+live:
+
+```
+poll_slow: poll(budget=66ms) took 1.07281s before returning false
+poll_slow: poll(budget=250ms) took 1.211525s before returning false
+```
+
+Both are 16-18x their budget. In the same capture, every `state.lock()` wait on
+both sides of the shared `Arc<Mutex<TuiSessionState>>` (the render loop and the
+event-bridge task) stayed in single-digit microseconds throughout, including
+around the stalls — ruling out lock contention as the mechanism for *this*
+symptom. Right after the second stall, a burst of keystrokes appears in the log
+4-5ms apart, far faster than a human types, consistent with keystrokes queuing
+up while `poll()` failed to notice them and then draining all at once the
+moment it finally returned.
+
+**Why this rhymes with the pipe bug above:** `crossterm` is built with its
+default `events` feature (`nca`'s `Cargo.toml` sets no feature flags), which
+selects the `mio` backend (`crossterm-0.29.0/src/event/source/unix.rs`) over
+the `use-dev-tty` backend — i.e. `nca`'s keystroke path really does go through
+**edge-triggered epoll** (`EPOLLET`) on its stdin fd, the identical mechanism
+`PipeRead` had the missing `epoll_on_fd_drained` re-arm for.
+
+**It is not a real pty.** `posix_openpt()` fails with `ENOENT` on Akuma —
+`/dev/ptmx` does not exist (consistent with "Two adjacent findings" above:
+`/dev/tty`/`/dev/pts` don't exist either). sshd does not allocate a POSIX pty
+for a spawned session at all; `nca`'s stdin is `FileDescriptor::Stdin`
+(`crates/akuma-exec/src/process/types.rs`), Akuma's own exec-channel
+construct, read via a dedicated arm in `sys_read`
+(`src/syscall/fs.rs`, `FileDescriptor::Stdin`). An `ncaprobe ptyedge` probe
+modelled on `eofedge` (pty pair, `EPOLLET`, second byte after an idle gap) was
+written first and confirmed sound against the Linux control — but is
+structurally the wrong test, since Akuma has no pty subsystem for it to
+exercise.
+
+**Root cause, found by inspection once that was clear:** the `Stdin` arm of
+`sys_read` (`src/syscall/fs.rs`) has *both* defects `PipeRead` had before its
+fix — independently discovered, never carried over to this arm:
+
+1. No `O_NONBLOCK` check anywhere in the arm. Every other read arm
+   (`PipeRead`, `UnixSocket`, `Socket`) checks `fd_is_nonblock` and returns
+   `EAGAIN`; `Stdin` unconditionally calls `schedule_blocking(u64::MAX)`
+   whenever there is no data yet, regardless of the flag mio set.
+2. No `epoll_on_fd_drained` call anywhere in the arm, so even a caller that
+   *did* get `EAGAIN` would leave the `EPOLLET` `last_ready` bit stuck and
+   never see the next keystroke's edge.
+
+**Confirmed with the same A/B technique as the rest of this doc**, using a new
+`ncaprobe stdinedge` (registers fd 0 itself with `EPOLLIN|EPOLLET`, non-blocks
+it, times how long a keystroke typed after an idle gap takes to arrive —
+needs a real interactive session, no pty construction required) run over SSH
+against two private, port-isolated QEMU boots of the *same* disk image
+(`scripts/cargo_runner.sh`'s `INSTANCE=` mechanism, `snapshot=on`, `devbox.img`
+— the live VM — untouched):
+
+```
+--- PRE-FIX ---                                --- POST-FIX ---
+round 1: READY events=IN after 3.036s          round 1: READY events=IN after 3.042s
+        read = 1 "x"                                   read = 1 "x"
+        read = 1 "y"   <-- 8s later, same read()!       read = EAGAIN/err(-1)
+                                                round 2: READY events=IN after 8.037s
+                                                        read = 1 "y"
+                                                        read = EAGAIN/err(-1)
+```
+
+Pre-fix, the very first `read()` call after draining `'x'` never returns
+`EAGAIN` at all — it blocks *inside that one syscall* for the full 8 s until
+`'y'` arrives, so `epoll_wait` is never even re-entered for round 2. That is
+defect 1 exactly, not defect 2 — the edge re-arm never gets a chance to matter
+because the read doesn't return control to the caller in the first place.
+Post-fix, `'y'`'s wait (8.037s) matches the real elapsed time between the two
+sends almost exactly, with no added kernel-side delay.
+
+**Fix:** mirrors `PipeRead`'s, in the same file — `fd_is_nonblock` check
+before parking (`return EAGAIN` instead of `schedule_blocking`), and
+`epoll_on_fd_drained` on every successful read as well as before returning
+`EAGAIN`. Both probes (`ptyedge`, kept as it's a legitimate test if Akuma ever
+grows a real pty subsystem; `stdinedge`, the one that actually matters here)
+live in `userspace/ncaprobe`.
+
 ## Fixed in
 
 - `src/syscall/fs.rs` — `PipeRead` honours `O_NONBLOCK`; both it and the
@@ -195,6 +284,20 @@ Two adjacent findings from the same dig, neither the cause here:
 - `src/process_tests.rs` — `test_pipe_read_nonblock_returns_eagain`,
   `test_epoll_pipe_eof_edge_after_partial_drain`
 - `userspace/ncaprobe` — the probe, kept for the next one
+- **2026-08-18, `Stdin` arm (the nca-input-freeze bug):**
+  `src/syscall/fs.rs` — `FileDescriptor::Stdin` now checks `fd_is_nonblock`
+  before parking (`EAGAIN` instead of `schedule_blocking(u64::MAX)`), and
+  calls `epoll_on_fd_drained` on every successful `read_stdin` as well as
+  before returning `EAGAIN` — same shape as the `PipeRead` fix above, just
+  never applied to this arm until now
+- `userspace/ncaprobe` — `ptyedge` (pty-shaped edge probe; Akuma has no real
+  pty subsystem, kept in case that changes) and `stdinedge` (the one that
+  reproduced and confirmed the fix, against fd 0 directly)
+- `crates/tui/src/tui/debug_log.rs`, wired into `crates/tui/src/tui/app.rs`
+  (`run_blocking`'s poll/lock timings) and `crates/tui/src/tui/bridge.rs`
+  (event-apply lock timings) in the `native-cli-ai` submodule — opt-in
+  (`NCA_TUI_TIMING_LOG=1`) instrumentation that caught the original
+  `poll_slow` evidence live and ruled out lock contention as the mechanism
 
 ## Background
 
