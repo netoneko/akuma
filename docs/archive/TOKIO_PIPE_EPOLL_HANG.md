@@ -273,6 +273,34 @@ before parking (`return EAGAIN` instead of `schedule_blocking`), and
 grows a real pty subsystem; `stdinedge`, the one that actually matters here)
 live in `userspace/ncaprobe`.
 
+### Residual: shorter stalls survive the fix — a second, different mechanism
+
+Confirmed live on the user's own VM, freshly rebooted onto the fixed kernel,
+`NCA_TUI_TIMING_LOG=1` still running: the multi-minute freezes are gone, but
+short (~1-3s) `poll()` stalls still happen, rarely. Filtering
+`/tmp/nca-tui-timing.log` by the VM's boot time (the file is append-only and
+survives reboots, so older entries are pre-fix) leaves 7 genuine post-fix
+`poll_slow` lines over roughly 20 minutes of real use, e.g.:
+
+```
+poll_slow: poll(budget=66ms)  took 2.98s before returning true
+poll_slow: poll(budget=66ms)  took 1.00s before returning false
+poll_slow: poll(budget=250ms) took 1.00-1.16s before returning false  (x5)
+```
+
+Every `lock_wait` around these stalls is still single-digit microseconds, so
+this is not lock contention either. The tell: several of these are `poll()`
+calls that **timed out anyway** — asked to wait 66-250ms, they returned
+`false` (nothing ready) after ~1s, i.e. the wait didn't just find an edge
+late, it overran its own requested duration. That doesn't fit "missed
+readiness edge" (this doc's whole subject); it fits a thread not getting
+rescheduled promptly once its timer expires — general wake/scheduling
+latency, not an epoll-specific bug. That was the *original* subject of
+`SCHEDULING_INVESTIGATION.md` before that investigation redirected onto the
+nca-side bugs documented there. Not investigated further yet — noted here so
+the next person chasing a short stutter (as opposed to a hang) doesn't
+mistake it for a recurrence of the bug this doc describes.
+
 ## Fixed in
 
 - `src/syscall/fs.rs` — `PipeRead` honours `O_NONBLOCK`; both it and the

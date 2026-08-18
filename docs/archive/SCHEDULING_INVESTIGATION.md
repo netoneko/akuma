@@ -7,9 +7,18 @@ freezes it didn't fix were a separate, nca-side bug — also found and fixed
 (#root-cause-found-nca-not-the-kernel-2026-08-18).** `Repl::run()` called
 reedline's blocking `read_line()` directly inside an `async fn`, starving
 tokio's worker pool on the `--no-tui` path. The scheduler/futex layer was
-inspected in detail chasing this and held up — no kernel bug found. Fixed in
-nca, not in Akuma; live interactive re-verification still outstanding.
-Original status text, kept for the record:
+inspected in detail chasing this and held up — no kernel bug found.
+**Update, same day:** the full-screen TUI path had a second, unrelated bug
+(missing `O_NONBLOCK`/`epoll_on_fd_drained` on the `Stdin` read arm — a real
+kernel defect this time), root-caused and fixed; see
+[`TOKIO_PIPE_EPOLL_HANG.md`](TOKIO_PIPE_EPOLL_HANG.md)'s "New finding
+2026-08-18" section for the full A/B proof. Live-verified on the user's own
+VM: the multi-minute freezes are gone. A **third, smaller, still-open**
+symptom survives — short (~1-3s) stalls where `poll()` overruns its own
+requested timeout, which looks like genuine wake/scheduling latency rather
+than a missed epoll edge, i.e. much closer to what *this* document's title
+describes. See that same file's "Residual" subsection for the live evidence;
+not yet investigated further. Original status text, kept for the record:
 **FIXED 2026-08-18** — two changes landed:
 `WAKE_DEADLINE_PREEMPT` in `crates/akuma-exec/src/threading/mod.rs` (the
 deadline wake-pass arms the existing `PREEMPT_WAKE_TID` run-next hint) and
