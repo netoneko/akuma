@@ -6,9 +6,12 @@
 deadline wake-pass arms the existing `PREEMPT_WAKE_TID` run-next hint) and
 `TIMER_INTERVAL_US` 10 000 → 1 000, **profile-gated**: `extreme-size` keeps
 10 ms. Validated on `release` SMP=1 and SMP=4, the 4 MB `extreme-size` floor,
-and devbox-smoltcp SMP=4 — [Resolution](#resolution-2026-08-18). Still open:
-the full in-VM kernel-build A/B, rump, and the tick sweep
-([What is still open](#what-is-still-open)).
+devbox-smoltcp SMP=4, and (2026-08-18) the rump devbox at SMP=4, where the
+10 ms baseline is the arm that fails — [`RUMP_ON_SMP.md`](RUMP_ON_SMP.md).
+**One axis regressed:** bulk download throughput at SMP=4, ~2× on both
+release and devbox-smoltcp; reproduced under an interleaved A/B and not
+recovered ([What is still open](#what-is-still-open) item 6). Still open:
+the full in-VM kernel-build A/B and the tick sweep.
 **Symptom that started it:** "serious stutter in nca", then "looks like networking
 stutters the terminal for unknown reason".
 
@@ -209,24 +212,54 @@ Readings worth recording:
 
 ### Release, SMP=4
 
-| metric | AB (1 ms + preempt) |
-|---|---|
-| `sleepbench` / `pollbench` 1 ms | 1.01 / 1.02 ms (tight, 4 rounds) |
-| `pipebench` | 1.46–1.59 µs/iter |
-| `termbench` p90 / stalls | 91 µs / 0 |
-| 128 MB download | 2.45 s |
-| boot suite | 292/0 |
-| diagnostics | `[BKL] stuck` 93 (transient contention, no unbounded growth — expected under SMP today), `POOL contended` lines 1, time jumps 0 |
+| metric | base (10 ms, no preempt) | fixed (1 ms + preempt) |
+|---|---|---|
+| `sleepbench` 1 ms actual | 5.57 ms (5.42–7.13) | **1.01 ms** (1.012–1.019) |
+| `pollbench` 1 ms actual | 3.94 ms (3.66–5.10) | **1.02 ms** (1.013–1.019) |
+| `pipebench` | 1.43 µs/iter (1.15–1.65) | 1.51 µs/iter (1.44–1.59) |
+| `termbench` p90 / stalls | 62 µs / 2 | 91 µs / 0 |
+| 128 MB download | **1.23 s** (1.23–1.26) | 2.48 s (2.41–2.50) |
+| boot suite | 291/0 lines, `[BKL] stuck` 96 | 291/0 lines, `[BKL] stuck` 93 |
 
 ### devbox-smoltcp, SMP=4 (the config nca runs on)
 
-| metric | AB |
-|---|---|
-| `sleepbench` / `pollbench` 1 ms | 1.02 / 1.02 ms |
-| `pipebench` | 1.58–1.83 µs/iter |
-| `termbench` p90 / stalls | 81 µs / 0 |
-| 128 MB download | 2.55 s (spread 2.53–2.57) |
-| in-VM `cargo build --release` of `/root/hello` (`-j1`/`-j4`) | 17.7 s vs 17.4 s base — **flat**, within noise, 0 OOM / 0 `[BKL] stuck` both arms |
+| metric | base (10 ms, no preempt) | fixed (1 ms + preempt) |
+|---|---|---|
+| `sleepbench` 1 ms actual | 4.38 ms (4.10–5.44) | **1.02 ms** (1.017–1.021) |
+| `pollbench` 1 ms actual | 5.87 ms (3.73–7.10) | **1.03 ms** (1.021–1.034) |
+| `pipebench` | 1.06 µs/iter (1.03–1.09) | 1.71 µs/iter (1.58–1.83) |
+| `termbench` p90 / stalls | 46 µs / 0 | 81 µs / 0 |
+| 128 MB download | **1.20 s** (1.20–1.24) | 2.55 s (2.53–2.57) |
+| in-VM `cargo build --release` of `/root/hello` (`-j1`/`-j4`) | 17.4 / 17.4 s | 17.7 / 17.7 s — **flat**, within noise, 0 OOM / 0 `[BKL] stuck` both arms |
+
+### The SMP=4 columns say something the SMP=1 columns do not
+
+The base arms for both SMP=4 configs were collected **after** the fix was
+already committed, and they change the story materially. Two findings:
+
+- **The catastrophic floor is an SMP=1 phenomenon.** At SMP=4 the *unfixed*
+  kernel already slept in 4.4–5.6 ms (not ~35 ms) and already wrote the
+  terminal at 46–62 µs p90 with 0–2 stalls. More cores means more chances
+  to be picked in a round, so the round-robin tax mostly disappears. The
+  fix still tightens sleep/poll to a hard 1.0 ms, but it is buying
+  *predictability* there, not rescuing a broken axis.
+- **Bulk throughput regressed ~2× at SMP=4, on both configs**: 1.23 → 2.48 s
+  (release) and 1.20 → 2.55 s (devbox) for the same 128 MB. Within-arm
+  spread is a few percent in every cell, so this is not measurement noise;
+  the arms were not interleaved, though, which is the one confound left
+  (see open item 6). devbox `pipebench` moved the same way (1.06 → 1.71
+  µs/iter) while release `pipebench` stayed flat.
+
+  Mechanism, unproven but consistent with the SMP=1 B arm: at 1 ms the
+  kernel takes 10× the timer interrupts and the wake hint fires far more
+  often, so a bulk-copy loop is interrupted mid-slice ~10× as much. At
+  SMP=1 that cost was invisible because the *baseline* was so much worse
+  (6.27 → 3.40 s, a win); at SMP=4 there is no broken baseline left to
+  rescue, so only the cost shows.
+
+The two `[BKL] stuck` counts settle open item 5: the base arm logged **96**
+lines to the fixed arm's **93** under the same load. The count is a property
+of SMP=4 contention, not of the tick or the wake hint.
 
 The cargo result is *flat, not faster*, and the crate explains it: `hello`
 is one file, so the build is a single CPU-bound rustc+link run with no
@@ -248,6 +281,38 @@ over ssh, 0 fork-failures, 0 `[OOM]`, idle 1 heartbeat/30 s — same idle
 profile as every other arm, so the retained 10 ms tick costs nothing
 observable at idle. Scheduler-latency behaviour at 10 ms + preemption is
 characterized by the release-B arm (sleep ≈ one tick + overhead).
+
+### Full matrix, all arms in one table
+
+Medians, round 1 discarded. Every arm booted from a saved kernel binary
+(`shasum`-distinct), same host, on AC. Reproduce or extend with
+`scripts/sched_audit_matrix.py` (`run` / `report`).
+
+| arm | SMP | RAM | tick | wake-preempt | sleep 1 ms | poll 1 ms | pipe µs/iter | term p90 | stalls >10 ms | term+net p90 | 128 MB dl | suite | `[BKL] stuck` |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| release base | 1 | 2048 | 10 ms | off | 29.18 ms | 40.65 ms | 10.43 | 36.35 ms | 1010 | 58.9 ms | 6.27 s | 284/0 | 0 |
+| release B | 1 | 2048 | 10 ms | **ON** | 14.75 ms | 44.42 ms | 10.12 | 51.33 ms | 477 | 61.5 ms | 9.54 s | 284/0 | 0 |
+| release fixed | 1 | 2048 | **1 ms** | **ON** | **1.06 ms** | **1.01 ms** | **3.25** | **2.01 ms** | **0** | **4.0 ms** | **3.40 s** | 284/0 | 0 |
+| release base | 4 | 2048 | 10 ms | off | 5.57 ms | 3.94 ms | 1.43 | 62 µs | 2 | — | **1.23 s** | 291/0 | 96 |
+| release fixed | 4 | 2048 | **1 ms** | **ON** | **1.01 ms** | **1.02 ms** | 1.51 | 91 µs | **0** | — | 2.48 s | 291/0 | 93 |
+| devbox base | 4 | 4096 | 10 ms | off | 4.38 ms | 5.87 ms | **1.06** | 46 µs | 0 | — | **1.20 s** | n/a | 0 |
+| devbox fixed | 4 | 4096 | **1 ms** | **ON** | **1.02 ms** | **1.03 ms** | 1.71 | 81 µs | 0 | — | 2.55 s | n/a | 0 |
+| rump base | 4 | 4096 | 10 ms | off | 3.88 ms | 3.69 ms | 1.83 | — | — | — | **never completed** | n/a | **5225** |
+| rump fixed | 4 | 4096 | **1 ms** | **ON** | **1.01 ms** | **1.01 ms** | 2.22 | — | — | — | 104.4 s | n/a | **0** |
+| extreme 4 MB | 1 | 4 | 10 ms | ON | — | — | — | — | — | — | — | boots, 6/6 forks, 0 OOM | 0 |
+| extreme 8 MB | 1 | 8 | 10 ms | ON | — | — | — | — | — | — | — | probe OOM-killed | — |
+
+Bold = best cell in its config group. `n/a` = devbox builds with `no-tests`,
+so there is no boot suite to count. The `extreme-size` rows carry no
+scheduler numbers at all — the probe does not fit (see below), so that
+profile's 10 ms tick is a *decision by default*, not a measured one.
+
+Read down the columns, not across configs: the SMP=1 rows and SMP=4 rows
+measure different machines, and the download column in particular is not
+comparable between them (four cores move more bytes).
+
+In-VM `cargo build --release` of `/root/hello` on devbox, `-j1` / `-j4`:
+17.4 / 17.4 s base vs 17.7 / 17.7 s fixed — flat.
 
 ## The fix candidate
 
@@ -396,10 +461,32 @@ sub-10 ms cadence it always assumed it had.
    (memory floor; see Matrix B note in the Resolution). If a smaller probe
    or an in-image build ever makes it measurable and it shows no cost, drop
    the profile gate and use 1 ms everywhere.
-5. **SMP=4 `[BKL] stuck` count** (93 transient lines on the AB arm, zero
-   growth, suite 292/0) — almost certainly the documented expected
-   contention noise, but it is one number nobody compared against a
-   same-load 10 ms baseline. Cheap to check from the saved logs' method.
+5. ~~**SMP=4 `[BKL] stuck` count**~~ — **closed 2026-08-18.** The 10 ms
+   baseline logged **96** lines to the fixed arm's **93** under the same
+   load. Contention noise, unrelated to the tick or the wake hint.
+6. **The SMP=4 bulk-throughput regression** (128 MB download 1.2 s → 2.5 s
+   on both release and devbox; see "The SMP=4 columns say something…").
+   Reproduced under an interleaved A/B, so it is not drift — but the
+   mechanism is unproven and no attempt has been made to recover it. The
+   obvious levers, cheapest first: (a) a 2 ms tick, if the tick sweep shows
+   the latency knee is below it; (b) suppress the run-next hint when the
+   preempted thread is inside a bulk copy (no cheap signal exists today);
+   (c) accept it — 2.5 s for 128 MB is still ~50 MB/s and better than every
+   SMP=1 arm. This is the one axis where the fix is strictly worse than
+   what it replaced.
+7. **Rump at SMP=4** — **measured 2026-08-18, and it inverts the risk this
+   investigation hedged against.** Full write-up:
+   [`RUMP_ON_SMP.md`](RUMP_ON_SMP.md). Rump had never run multi-core at all
+   (`scripts/build_devbox.sh` is `--no-default-features`, which drops
+   `smp-shared`); with that feature added, the **fixed** kernel boots 4/4
+   cores, passes rump's boot tests, sleeps/polls at 1.01 ms and completes a
+   128 MB download over the sysproxy stack 5/5 times with **0** `[BKL]
+   stuck` lines. The **10 ms baseline** on the same image never completed a
+   single download and logged **5225** `tag=511` stuck lines. Caveats: one
+   run each, base arm on battery, and `smp-shared`+rump is itself a new
+   combination — but the direction is the opposite of the feared one.
+   Remaining: the HTTPS A/B (probe wired, unrun), a 10 ms SMP=1 third point,
+   and an AC re-run.
 
 ### Running the workloads
 
