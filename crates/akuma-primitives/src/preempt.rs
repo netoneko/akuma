@@ -353,10 +353,42 @@ mod tests {
         is_preemption_disabled, preemption_disabled_at, preemption_disabled_count, scrub_slot,
     };
 
-    // Host builds report tid 0 for every thread (`current_tid`'s non-bare-metal
-    // arm), so these all operate on slot 0 and must clean up after themselves.
-    fn reset() {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    /// Host builds report tid 0 for every thread (`current_tid`'s non-bare-metal
+    /// arm), so every test below operates on the *same* global slot 0 — and
+    /// `cargo test` runs them in parallel. Cleaning up at the top and bottom of
+    /// each test was not enough: under load they interleaved, one test's
+    /// `disable_preemption` bumping another's count, or its `Location::caller()`
+    /// winning the 0→1 store, or its `reset()` landing mid-flight in a third.
+    /// That produced three distinct flaky signatures (2 failures in 60 loaded
+    /// runs) — see `docs/archive/SMP_SECONDARY_TICK_KILLED_BY_WFI_PROBE.md`
+    /// § "Not part of this bug: the flaky `preempt` host tests".
+    ///
+    /// Slot 0 is a shared resource here, so it gets a lock.
+    static SLOT0: Mutex<()> = Mutex::new(());
+
+    /// Take exclusive use of slot 0 and hand it back scrubbed. Scrubs again on
+    /// drop, so a test that leaks a disable count — or panics mid-flight —
+    /// cannot hand the mess to whichever test runs next.
+    fn slot0() -> Slot0 {
+        // A panicking test poisons the mutex. Recover instead of cascading that
+        // one failure into every other test in the module, which is exactly the
+        // truncated-suite effect (`host.tests: 482` instead of 592) that made
+        // the flake look like a commit had disabled tests.
+        let guard = SLOT0.lock().unwrap_or_else(PoisonError::into_inner);
         scrub_slot(0);
+        Slot0 { _guard: guard }
+    }
+
+    struct Slot0 {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Slot0 {
+        fn drop(&mut self) {
+            scrub_slot(0);
+        }
     }
 
     #[test]
@@ -373,21 +405,20 @@ mod tests {
 
     #[test]
     fn disable_enable_round_trips() {
-        reset();
+        let _slot = slot0();
         assert!(!is_preemption_disabled());
         disable_preemption();
         assert!(is_preemption_disabled());
         assert_eq!(preemption_disabled_count(0), 1);
         enable_preemption();
         assert!(!is_preemption_disabled());
-        reset();
     }
 
     #[test]
     fn nesting_is_counted_not_boolean() {
         // The whole reason this is a count: an inner guard dropping must not
         // re-enable preemption for an outer one that is still held.
-        reset();
+        let _slot = slot0();
         disable_preemption();
         disable_preemption();
         disable_preemption();
@@ -398,12 +429,11 @@ mod tests {
         enable_preemption();
         enable_preemption();
         assert!(!is_preemption_disabled());
-        reset();
     }
 
     #[test]
     fn disabled_at_names_the_zero_to_one_call_site_only() {
-        reset();
+        let _slot = slot0();
         assert!(preemption_disabled_at(0).is_none());
         let line_of_disable = line!() + 1;
         disable_preemption();
@@ -417,14 +447,13 @@ mod tests {
         enable_preemption();
         // Fully re-enabled: the location is no longer live.
         assert!(preemption_disabled_at(0).is_none());
-        reset();
     }
 
     #[test]
     fn scrub_slot_clears_a_leaked_count() {
         // A recycled slot inheriting a non-zero count would be a thread the
         // scheduler silently never preempts.
-        reset();
+        let _slot = slot0();
         disable_preemption();
         disable_preemption();
         assert_eq!(preemption_disabled_count(0), 2);
@@ -441,7 +470,7 @@ mod tests {
 
     #[test]
     fn guard_balances_the_counter() {
-        reset();
+        let _slot = slot0();
         let before = preemption_disabled_count(0);
         {
             let _g = PreemptGuard::new();
@@ -449,12 +478,11 @@ mod tests {
             assert_eq!(preemption_disabled_count(0), before + 1);
         }
         assert_eq!(preemption_disabled_count(0), before);
-        reset();
     }
 
     #[test]
     fn nested_guards_balance() {
-        reset();
+        let _slot = slot0();
         {
             let _outer = PreemptGuard::new();
             {
@@ -466,6 +494,5 @@ mod tests {
             assert!(is_preemption_disabled());
         }
         assert_eq!(preemption_disabled_count(0), 0);
-        reset();
     }
 }
