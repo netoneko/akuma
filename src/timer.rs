@@ -163,12 +163,41 @@ pub fn timer_irq_handler(_irq: u32) {
 // Boot-time host-WFI probe
 // ============================================================================
 
+/// The core currently running [`probe_host_tick`], or `u32::MAX` when no probe
+/// is in flight. Read by [`probe_irq_nop`] to tell its own one-shot apart from
+/// a *secondary's* periodic tick landing in the same shared handler slot.
+static PROBING_CORE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
 /// NOP IRQ handler installed while the probe measures WFI: the exception
 /// dispatcher acks/EOIs around us, but the handler itself must disarm the
 /// timer — a one-shot that has fired keeps its level asserted (CVAL <=
 /// counter, enabled), and an unmasked level re-forwards forever after EOI.
 /// The next probe sample re-arms.
+///
+/// **Only the probing core may disarm.** IRQ 27 is a per-CPU PPI, but
+/// `irq::register_handler` writes ONE shared dispatch table (`src/irq.rs:42`),
+/// so every *secondary's* periodic tick lands here too for as long as the probe
+/// runs. That is not the hypothetical this function's contract below assumes:
+/// `bringup_secondaries()` (main.rs:849) has had the secondaries online,
+/// armed and IRQ-unmasked for 100+ lines by the time the probe starts
+/// (main.rs:955). Disarming there stops that core's timer *permanently* — a
+/// secondary arms its tick exactly once (smp_shared.rs:952), and the only thing
+/// that would re-arm it is `timer_irq_handler`'s defensive write, which needs a
+/// tick it can now never take. Every secondary then sits in WFI forever: online,
+/// never preempted, never entering the scheduler, so all work stays on core 0
+/// (`smp_shared_{scheduler,userspace,migration}` FAILED, `core1=0`; regression
+/// bisected to 38345eb7, which introduced the probe).
+///
+/// A secondary therefore re-arms its periodic tick and returns. It loses only
+/// the scheduler SGI of whatever ticks fall inside the probe's ~50 ms window.
 pub fn probe_irq_nop(_irq: u32) {
+    if akuma_exec::bkl::current_core_id()
+        != PROBING_CORE.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        akuma_timer::arm_periodic_tick();
+        return;
+    }
     akuma_timer::disarm();
 }
 
@@ -177,8 +206,13 @@ pub fn probe_irq_nop(_irq: u32) {
 /// Requires: IRQ 27 registered (as [`probe_irq_nop`]) and enabled at the GIC.
 /// Runs with IRQs briefly unmasked (saved/restored): each sample needs the
 /// one-shot timer IRQ actually delivered, or WFI would never wake. Only the
-/// BSP calls this, before secondaries exist; the chosen tick is published via
-/// the crate's `set_tick_us` and every core re-arms from it.
+/// BSP calls this; the chosen tick is published via the crate's `set_tick_us`
+/// and every core re-arms from it.
+///
+/// It does **not** run before secondaries exist — `bringup_secondaries()` is
+/// main.rs:849, this is main.rs:955 — so it publishes the probing core for
+/// [`probe_irq_nop`], which shares its handler slot with every secondary's
+/// live periodic tick. See that function for what happens without it.
 ///
 /// Skipped (returns the compiled default) on `kernel_profile_extreme`: a 4 MB
 /// single-core box keeps its historical 10 ms and needs no probing.
@@ -189,10 +223,16 @@ pub fn probe_host_tick() -> u64 {
     }
     #[cfg(not(kernel_profile_extreme))]
     {
+        // Publish before unmasking: the first sample's IRQ can land immediately.
+        PROBING_CORE.store(
+            akuma_exec::bkl::current_core_id(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         let saved_daif = irq::irq_save_mask();
         irq::unmask_irqs_sync();
         let picked = akuma_timer::policy::pick_tick(&ArchHw);
         irq::irq_restore(saved_daif);
+        PROBING_CORE.store(u32::MAX, core::sync::atomic::Ordering::Relaxed);
         crate::safe_print!(96, "[Timer] host WFI probe: tick = {} us\n", picked);
         picked
     }
