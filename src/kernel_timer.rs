@@ -44,47 +44,18 @@ impl Duration {
 
 
 // ============================================================================
-// ARM Timer Hardware Access
+// Current time
 // ============================================================================
 
-/// Tick frequency -- 1MHz (microsecond precision)
-const TICK_HZ: u64 = 1_000_000;
-
-/// Read the ARM virtual timer counter (CNTVCT)
-#[inline]
-fn read_counter() -> u64 {
-    let counter: u64;
-    unsafe {
-        asm!("mrs {}, cntvct_el0", out(reg) counter);
-    }
-    counter
-}
-
-/// Read the ARM timer frequency (CNTFRQ)
-#[inline]
-fn read_frequency() -> u64 {
-    let freq: u64;
-    unsafe {
-        asm!("mrs {}, cntfrq_el0", out(reg) freq);
-    }
-    freq
-}
-
-/// Convert hardware counter ticks to microseconds
-#[inline]
-fn counter_to_us(counter: u64) -> u64 {
-    let freq = read_frequency();
-    if freq > 0 {
-        ((u128::from(counter) * u128::from(TICK_HZ)) / u128::from(freq)) as u64
-    } else {
-        0
-    }
-}
-
-/// Get current time in microseconds (from virtual counter)
+/// Get current time in microseconds (from the virtual counter).
+///
+/// Delegates to the extracted `akuma-timer` crate — this file used to carry
+/// its own private copy of the CNTVCT/CNTFRQ access (a duplicate of
+/// `src/timer.rs`'s, two owners of one hardware seam). Same semantics:
+/// microseconds since boot.
 #[inline]
 pub fn now_us() -> u64 {
-    counter_to_us(read_counter())
+    akuma_timer::uptime_us()
 }
 
 // ============================================================================
