@@ -38,8 +38,9 @@ Env knobs (all optional):
 | `DEVBOX_BUILD_USERSPACE` | `true` | `false` reuses existing `bootstrap/bin`. |
 | `DEVBOX_CA_CERTS` | `true` | `false` skips the Mozilla CA bundle (offline builds). |
 | `DEVBOX_GIT` | `true` | `false` keeps `git -> scratch` instead of apk git. |
-| `DEVBOX_RUST_TOOLCHAIN` | `true` | `false` skips the apk rust + cargo + C toolchain. |
-| `DEVBOX_NIGHTLY_RUST` | `true` | `false` skips the nightly toolchain (static.rust-lang.org) under `/usr/local`. |
+| `DEVBOX_RUST_TOOLCHAIN` | `true` | `false` skips step 7 entirely — **including the C toolchain**, after which cargo cannot link. Not the way to drop stable Rust; use `DEVBOX_STABLE_RUST`. |
+| `DEVBOX_STABLE_RUST` | **`false`** | `true` *adds* apk's stable rust + cargo alongside nightly. Default off since 2026-08-19 — see the toolchain note below. |
+| `DEVBOX_NIGHTLY_RUST` | `true` | `false` skips the nightly toolchain (static.rust-lang.org) under `/usr/local`. On a default image that leaves **no** Rust at all. |
 | `DEVBOX_SOUNDTRACK` | `false` | `true` copies `bootstrap/music`. |
 
 ### What lands on the image
@@ -49,20 +50,46 @@ Env knobs (all optional):
 - `/bin/sshd` — userspace sshd (the only sshd).
 - `/bin/busybox` + full applet symlinks — the shell + coreutils.
 - `/usr/bin/git` (apk) — real git; `/bin/git` → `/usr/bin/git`.
-- `/usr/bin/rustc`, `/usr/bin/cargo` + clang/lld/gcc/binutils/make/musl-dev (apk stable).
+- clang/lld/gcc/binutils/make/musl-dev (apk) — the C toolchain cargo needs to link.
 - `/usr/local/bin/rustc`, `/usr/local/bin/cargo` (nightly, static.rust-lang.org) + rust-std for
-  `aarch64-unknown-linux-musl` and `aarch64-unknown-none` + `rust-src`.
+  `aarch64-unknown-linux-musl` and `aarch64-unknown-none` + `rust-src`. **This is the
+  image's Rust**, and it is first on `PATH`.
+- `/usr/bin/rustc`, `/usr/bin/cargo` (apk stable) — **only with `DEVBOX_STABLE_RUST=true`**.
 - `/etc/ssl/certs/ca-certificates.crt` — Mozilla roots, for userspace `curl https`.
 - `/etc` comes **only** from `overlays/devbox/rootfs/`.
 
-> **Toolchain note (current truth, updated 2026-08-11):** the devbox ships
-> **both** toolchains side by side. `bootstrap.sh` step 7 installs **apk
-> stable** `rust`/`cargo` into `/usr` with `PATH=/usr/bin` set via
-> `/etc/profile.d/rust.sh`. Step 7b installs **nightly**, downloaded straight
-> from [`static.rust-lang.org/dist`](https://static.rust-lang.org/dist), into
-> `/usr/local` — default on (`DEVBOX_NIGHTLY_RUST=true`). Step 7b does **not**
-> touch `PATH`, so bare `cargo`/`rustc` still resolve to apk stable; invoke
-> `/usr/local/bin/cargo` explicitly for nightly.
+> **Toolchain note (current truth, updated 2026-08-19):** the devbox ships **one**
+> toolchain — **nightly**, downloaded from
+> [`static.rust-lang.org/dist`](https://static.rust-lang.org/dist) into `/usr/local`
+> by `bootstrap.sh` step 7b (`DEVBOX_NIGHTLY_RUST=true`, default on). Step 7 installs
+> the C toolchain. Bare `cargo`/`rustc` **are** nightly, so no in-guest command has to
+> spell out which toolchain it means.
+>
+> **That ordering comes from the kernel, not from a profile script.**
+> `akuma_exec::process::types::DEFAULT_ENV`
+> (`crates/akuma-exec/src/process/types.rs`) hands every process
+> `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` — `/usr/local`
+> ahead of `/usr` by design, so a locally-installed tool beats the distro's. Step 7
+> used to write `/etc/profile.d/rust.sh` to set PATH; **that never ran and has been
+> removed** — busybox `ash` sources `/etc/profile` only for *login* shells, this image
+> has no `/etc/profile` (`/etc` comes solely from `overlays/devbox/rootfs/`, which has
+> none), and every harness drives the VM over `ssh host cmd`, which is non-login.
+> Verified on a live guest 2026-08-19: the file said `PATH=/usr/bin:$PATH` while the
+> real PATH was the kernel default. Do not re-add a profile.d PATH script expecting it
+> to take effect.
+>
+> Set `DEVBOX_STABLE_RUST=true` to *also* install apk's stable `rust`/`cargo` into
+> `/usr`; `/usr/local/bin` still wins on `PATH`, so stable is then reachable only by
+> its absolute path. It is worth keeping reachable: apk's build is a different build
+> from upstream's tarball and pulls all its own shared libs (LLVM, libcurl, libssl,
+> libsqlite3, …), so it exercises the **dynamic linker** far harder than the
+> mostly-static nightly — the only thing on this image that does.
+>
+> **Superseded (2026-08-11 – 2026-08-19):** the image shipped both toolchains by
+> default, with `PATH=/usr/bin` first, so bare `cargo` was apk stable and nightly
+> needed an absolute path. That split existed only because nightly `cargo` used to
+> crash on this kernel; once that was fixed the split was just two ways to be wrong
+> about which compiler ran.
 >
 > Nightly `cargo` used to die instantly under HVF (`EC=0x0` at a constant
 > `ELR`) — **root-caused and fixed 2026-08-06**: the trap was OpenSSL's

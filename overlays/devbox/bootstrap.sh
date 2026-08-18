@@ -15,11 +15,21 @@
 #
 # Env knobs (all optional):
 #   DEVBOX_DISK            output image (default: devbox.img)
-#   DEVBOX_DISK_MB         image size in MB (default: 6144 — apk stable rust/cargo + the
-#                          nightly toolchain + C toolchain no longer fit in the old 1024
-#                          MB default now that DEVBOX_NIGHTLY_RUST defaults on)
+#   DEVBOX_DISK_MB         image size in MB (default: 6144 — the nightly toolchain +
+#                          C toolchain no longer fit in the old 1024 MB default now
+#                          that DEVBOX_NIGHTLY_RUST defaults on. Left at 6144 rather
+#                          than shrunk when stable Rust went default-off, since
+#                          DEVBOX_STABLE_RUST=true must still fit)
 #   DEVBOX_BUILD_USERSPACE rebuild herd + sshd from source (default: true; false uses
 #                          the existing bootstrap/bin binaries)
+#   DEVBOX_RUST_TOOLCHAIN  step 7: C toolchain (+ optional stable Rust). Default true.
+#                          false drops the C TOOLCHAIN TOO — cargo cannot link after.
+#   DEVBOX_STABLE_RUST     step 7: also install apk's stable rust/cargo alongside
+#                          nightly. Default FALSE — one toolchain (nightly) is the
+#                          default image. Set true to regain the dynamic-linker
+#                          coverage apk's build provides; /usr/local/bin still wins.
+#   DEVBOX_NIGHTLY_RUST    step 7b: nightly toolchain -> /usr/local. Default true.
+#                          This is the image's Rust; false leaves none by default.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -223,47 +233,89 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Rust toolchain (aarch64-unknown-linux-musl host, runs ON the devbox), installed
-#    via apk — Alpine's own stable `rust`/`cargo` build — plus the C toolchain
-#    (clang/lld/gcc/binutils/make/musl-dev) cargo's build scripts need. Previously this
-#    step downloaded the nightly toolchain straight from static.rust-lang.org/dist; that
-#    nightly `cargo` binary crashes the kernel's EL0 exception handler on every
-#    invocation (see docs/RUST_TOOLCHAIN_ISSUES.md) — `rustc --version` works,
-#    `cargo --version` faults with EC=0x0 at a fixed instruction, reproducing
-#    identically across every kernel build tried (main, this branch, both profiles,
-#    a kernel from 6 weeks earlier), which points at the nightly cargo binary itself
-#    rather than the kernel. apk's stable `rust`/`cargo` is a completely different
-#    build (Alpine's own, not upstream's static.rust-lang.org tarball) and installs
-#    all its own shared-lib deps (LLVM, libcurl, libssl, libsqlite3, ...), so this
-#    also exercises the dynamic linker much harder than the mostly-static nightly did.
+# 7. C toolchain (clang/lld/gcc/binutils/make/musl-dev) that cargo's build scripts and
+#    linking need, plus — only when DEVBOX_STABLE_RUST=true — Alpine's own stable
+#    `rust`/`cargo` from apk.
+#
+#    **Stable Rust defaults OFF since 2026-08-19; nightly (step 7b) is the toolchain.**
+#    Two toolchains on one image is confusing: `cargo` resolving to apk-stable while
+#    `/usr/local/bin/cargo` is nightly meant every in-guest build command had to say
+#    which one it meant, and a command that forgot silently got the other one. The
+#    historical reason for the split is gone — step 7b's note records that nightly
+#    `cargo` no longer crashes the EL0 handler (re-verified 2026-08-11) — so the
+#    default is now one toolchain, nightly, first on PATH.
+#
+#    Why the flag still exists rather than deleting the stable install outright:
+#    apk's `rust`/`cargo` is a completely different build from upstream's
+#    static.rust-lang.org tarball and pulls all its own shared libs (LLVM, libcurl,
+#    libssl, libsqlite3, ...), so it exercises the **dynamic linker** far harder than
+#    the mostly-static nightly does. That is real coverage, and it is the only thing
+#    on this image that provides it — keep it reachable with DEVBOX_STABLE_RUST=true.
+#
+#    Historical (why stable was ever the default): the nightly `cargo` binary used to
+#    crash the kernel's EL0 exception handler on every invocation — `rustc --version`
+#    worked, `cargo --version` faulted with EC=0x0 at a fixed instruction, reproducing
+#    across every kernel build tried (main, that branch, both profiles, a kernel from
+#    6 weeks earlier), which pointed at the cargo binary rather than the kernel. See
+#    docs/archive/RUST_TOOLCHAIN_ISSUES.md §1.
+#
 #    All packages install in a single `apk add` transaction (matching step 6's fix):
 #    doing it as separate `apk add` calls once reset apk's "wanted" set and purged
-#    earlier steps' packages (see step 6's comment for the war story).
-#    Skip with DEVBOX_RUST_TOOLCHAIN=false (large download; offline builds).
+#    earlier steps' packages (see step 6's comment for the war story). That is why the
+#    package list is assembled into one variable instead of a second `apk add` call.
+#
+#    Skip the whole step with DEVBOX_RUST_TOOLCHAIN=false — but note that drops the
+#    **C toolchain** too, so cargo cannot link afterwards. To get nightly-only (the
+#    default) leave this true and leave DEVBOX_STABLE_RUST false.
 # ---------------------------------------------------------------------------
 if [ "${DEVBOX_RUST_TOOLCHAIN:-true}" = "true" ]; then
-    hr "Installing Rust toolchain (apk: rust + cargo, Alpine's stable aarch64-musl build)"
+    DEVBOX_APK_PKGS="clang lld gcc binutils make musl-dev"
+    if [ "${DEVBOX_STABLE_RUST:-false}" = "true" ]; then
+        DEVBOX_APK_PKGS="$DEVBOX_APK_PKGS rust cargo"
+        hr "Installing C toolchain + apk stable rust/cargo (DEVBOX_STABLE_RUST=true)"
+    else
+        hr "Installing C toolchain (nightly-only image; DEVBOX_STABLE_RUST=false)"
+    fi
     docker run --rm --privileged \
         -v "$REPO_ROOT/$DEVBOX_DISK:/disk.img" \
+        -e DEVBOX_APK_PKGS \
         alpine:latest \
         sh -c '
             set -e
             mkdir -p /mnt/disk
             mount -o loop /disk.img /mnt/disk
 
-            echo "Installing C toolchain + rust + cargo into disk..."
-            apk --root /mnt/disk --no-scripts add clang lld gcc binutils make musl-dev rust cargo
+            echo "Installing into disk: $DEVBOX_APK_PKGS"
+            apk --root /mnt/disk --no-scripts add $DEVBOX_APK_PKGS
 
-            mkdir -p /mnt/disk/etc/profile.d
-            printf "export PATH=/usr/bin:\$PATH\n" > /mnt/disk/etc/profile.d/rust.sh
+            # No profile.d PATH script, deliberately. This step used to write
+            # /etc/profile.d/rust.sh with `PATH=/usr/bin:$PATH` — which NEVER RAN.
+            # busybox ash sources /etc/profile only for LOGIN shells, this image has
+            # no /etc/profile at all (/etc comes solely from overlays/devbox/rootfs,
+            # which has none), and every harness here drives the VM through
+            # `ssh host cmd`, i.e. non-login. Verified on a live guest 2026-08-19:
+            # rust.sh contained `PATH=/usr/bin:$PATH` while the actual PATH was
+            # /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin.
+            #
+            # PATH order comes from the KERNEL: akuma_exec::process::types::DEFAULT_ENV
+            # (crates/akuma-exec/src/process/types.rs), which puts /usr/local ahead of
+            # /usr by design so a locally-installed tool wins over the distro copy.
+            # NOTE: no apostrophes in this comment block - it lives inside a
+            # single-quoted sh -c string, so one would close it and break the script.
+            # That is exactly the nightly-over-apk-stable ordering we want, it applies
+            # to every process rather than to login shells only, and it needs nothing
+            # here. Removing any stale copy so it cannot start working later and
+            # silently invert the order.
+            rm -f /mnt/disk/etc/profile.d/rust.sh
 
-            echo "Rust toolchain installed:"
-            ls -la /mnt/disk/usr/bin/rustc /mnt/disk/usr/bin/cargo
+            echo "Installed:"
+            ls -la /mnt/disk/usr/bin/rustc /mnt/disk/usr/bin/cargo 2>/dev/null \
+                || echo "  (no apk rust/cargo — nightly-only image, see step 7b)"
             sync
             umount /mnt/disk
         '
 else
-    echo "Skipping Rust toolchain (DEVBOX_RUST_TOOLCHAIN=false)"
+    echo "Skipping toolchain step (DEVBOX_RUST_TOOLCHAIN=false) - no C toolchain either"
 fi
 
 # ---------------------------------------------------------------------------
@@ -273,10 +325,17 @@ fi
 #    invocation (EC=0x0; see docs/archive/RUST_TOOLCHAIN_ISSUES.md §1) — `rustc` alone was
 #    fine. Re-added here, default ON, 2026-08-11: `cargo new`/`cargo build`/running the
 #    resulting binary all worked cleanly under devbox-smoltcp (HVF on) — the crash no
-#    longer reproduces (see docs/runbooks/build-devbox.md's toolchain note). Does not
-#    touch step 7's PATH/profile.d setup, so `cargo`/`rustc` still resolve to apk-stable
-#    by default; invoke /usr/local/bin/{rustc,cargo} explicitly for nightly.
-#    Skip with DEVBOX_NIGHTLY_RUST=false (large download; offline builds).
+#    longer reproduces (see docs/runbooks/build-devbox.md's toolchain note).
+#
+#    **This is now THE toolchain.** Since 2026-08-19 step 7 no longer installs apk
+#    stable rust/cargo by default (DEVBOX_STABLE_RUST=false), and its profile.d puts
+#    /usr/local/bin first — so plain `cargo`/`rustc` are nightly, and no in-guest
+#    command needs to spell out which toolchain it means. The previous note here said
+#    the opposite ("still resolve to apk-stable by default; invoke
+#    /usr/local/bin/{rustc,cargo} explicitly for nightly"); that is no longer true.
+#    With DEVBOX_STABLE_RUST=true both are present and /usr/local/bin still wins.
+#    Skip with DEVBOX_NIGHTLY_RUST=false (large download; offline builds) — on a
+#    default image that leaves NO Rust toolchain at all.
 # ---------------------------------------------------------------------------
 if [ "${DEVBOX_NIGHTLY_RUST:-true}" = "true" ]; then
     hr "Installing nightly Rust toolchain (static.rust-lang.org, aarch64-musl host) -> /usr/local"

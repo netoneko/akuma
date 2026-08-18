@@ -131,7 +131,7 @@ charged all of it to the last one. Booting the true parent settles it:
 | commit | tick | probe | SMP=4 scheduler tests |
 |---|---|---|---|
 | `fdcc51be` | 1_000 µs | absent | **PASS** (3 cores) |
-| `38345eb7` | 3_000 µs | **present** | not booted directly |
+| `38345eb7` | 3_000 µs | **present** | **FAIL** (`core0=2175 core1=0`) — booted 2026-08-19, see below |
 | `44562a9c` | 3_000 µs | present | **FAIL** (`core0=1879 core1=0`) |
 | `65b63bd3` | 3_000 µs | present | **FAIL** (`core0=2192 core1=0`) |
 
@@ -143,9 +143,28 @@ reach cross-core scheduling. `65b63bd3` is a mechanical move of
 deletion; the doc it adds
 ([`TRIMMING_FAT_SCHEDULER.md`](TRIMMING_FAT_SCHEDULER.md)) states in its own
 header that the unification is *"proposal — no code moved."*
-That leaves `38345eb7` by elimination. It was not booted directly — the
-inference rests on `fdcc51be` PASS, `44562a9c` FAIL, and `44562a9c`'s diff
-being incapable of it.
+That leaves `38345eb7` by elimination. The inference rested on `fdcc51be` PASS,
+`44562a9c` FAIL, and `44562a9c`'s diff being incapable of it.
+
+**Closed by direct measurement, 2026-08-19.** `38345eb7` was booted at SMP=4 in
+its own worktree (`verify_trim.py --tier 2 --smp 4 --instance 1`), and it
+reproduces the failure exactly:
+
+```
+[Test] smp_shared_scheduler  FAILED (only 1 core ran workers; core0=2175 core1=0)
+[Test] smp_shared_userspace  FAILED (userspace on only 1 core; core0=1082 core1=0)
+[Test] smp_shared_migration  FAILED (probe thread stayed on 1 core)
+[Test] smp_shared_cooperative_wait PASSED (40 exec+wait iters …; no BKL deadlock)
+smp4.booted: False   smp4.pass_marker: 76   smp4.host_timejumps: 0
+```
+
+`core=[0-9]` histogram: **88 / 0 / 0 / 0** — byte-identical to the `65b63bd3`
+row of the table above, i.e. the probe commit alone already produces the whole
+effect, and the two commits after it add nothing. `cooperative_wait` PASSED
+immediately before the hang, matching the mechanism described earlier (the next
+test spawns four system threads expecting peer cores and blocks forever).
+`host_timejumps: 0` rules out host starvation, and `pass_marker: 76` against the
+95 both other arms score is the suite stopping, not failing.
 
 The boot logs name the difference in one line each:
 
@@ -235,6 +254,24 @@ The `core=[0-9]` histogram in the boot log is the fastest single check: cores
 `bkl_stuck` is inside its documented run-to-run band (93 / 97 / 108 / 93 across
 four SMP=4 boots here; the runbook records 93, 96, 109 on an unchanged tree).
 
+> **The "17 Tier-3 exercises … ok" row was one lucky sample.** Re-run
+> 2026-08-19 as a fresh A/B (`fdcc51be` worktree vs `a3004246`, `--tier all`),
+> `smp1.ex.cowstale` came back `UNEXPECTED` / `Segmentation fault` on **both**
+> arms, with `host_timejumps: 0` on both. It is still not a regression — that is
+> what A/B'ing it establishes — but the row should not be read as "Tier 3 is
+> reliably clean". See the runbook's known-benign `cowstale` entry, which this
+> run also corrects: that class was recorded as SMP=2-only, and it fires at
+> SMP=1.
+>
+> The same re-run reproduced everything else here: 3-line gate diff against
+> `fdcc51be` (`host.tests 585 → 592`, `bkl_stuck 93 → 95`, commit line), idle CPU
+> **3.7 / 3.8 %** at SMP=4 and **1.0 %** at SMP=1, `core=[0-9]` histogram
+> **399 / 171 / 174 / 202**, and all three scheduler tests PASSED on 4 cores
+> (`core0=752 core1=500`). Note `fdcc51be` measured **354 / 229 / 173 / 169**
+> that day rather than the `353 / 147 / 218 / 194` above — the baseline's own
+> numbers move run to run, which is why the *fixed* arm's `core1` being
+> comparable to `core0` is the reading that matters, not the absolute counts.
+
 ### Stability — three consecutive SMP=4 gates
 
 | run | `smp_shared_scheduler` | `smp_shared_userspace` | `migration` |
@@ -298,6 +335,35 @@ instead of 592) — which is what made it look like a commit had disabled tests.
 Fix (not applied here — it belongs in its own commit, in a crate this branch
 does not touch): serialize the eight behind a mutex, or give each its own slot
 instead of sharing 0.
+
+> **Fixed in `9d81f25b` "fix preempt tests" (2026-08-19).** The mutex option, not
+> the per-slot one: every host thread reports tid 0, so a test cannot be *given*
+> another slot without changing `current_tid` itself. `preempt.rs`'s test module
+> now holds a `static SLOT0: Mutex<()>` and each of the six tests that touch the
+> counters opens with `let _slot = slot0();`, which takes the lock, scrubs slot 0,
+> and scrubs it again on drop — so the per-test cleanup is no longer something a
+> test can forget or skip by panicking. The lock is taken with
+> `unwrap_or_else(PoisonError::into_inner)`: a panicking test would otherwise
+> poison the mutex and fail every sibling, which is precisely the
+> truncated-suite effect (`host.tests: 482` instead of 592) that made this look
+> like a commit had disabled tests. The two tests that touch no shared state
+> (`host_tid_is_zero`, `max_threads_leaves_room_for_the_reserved_range`) and
+> `scrub_slot_ignores_out_of_range` (whose arguments are rejected by the bounds
+> check before any store) stay lock-free.
+>
+> A/B under this section's own conditions — 4 spinning load generators,
+> `preempt::tests --test-threads=8`:
+>
+> | arm | runs | failures |
+> |---|---|---|
+> | pre-fix (`a3004246`) | 60 | **2** — `disable_enable_round_trips`, then `nesting_is_counted_not_boolean` + `scrub_slot_clears_a_leaked_count` together |
+> | fixed (`9d81f25b`) | **240** | **0** |
+>
+> The baseline arm reproducing at exactly 2/60 is what makes the fixed arm's 0
+> mean anything; 240 runs is 4× the exposure, and at the measured 3.3% per-run
+> rate a clean 240 would happen by luck about 0.03% of the time. Both arms were
+> built from the same tree with only the test module differing, so the kernel
+> code under test is identical.
 
 ## Background
 
