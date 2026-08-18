@@ -134,6 +134,39 @@ impl SharedFdTable {
         })
     }
 
+    /// Allocate the lowest fd number >= `min_fd` and insert `entry` at it,
+    /// atomically. Moved here (from [`Process`], which now just delegates)
+    /// so the flag-staleness fix below is unit-testable directly against a
+    /// bare `SharedFdTable`, the same way [`reserve_write_pos`] is — see
+    /// [`alloc_fd_tests`].
+    ///
+    /// Clears `nonblock`/`cloexec` for the chosen fd number *before* the
+    /// table insert makes it visible: both are tracked per raw fd *number*
+    /// here, not per underlying pipe/file object, so a fd number a previous
+    /// occupant left with either flag set would otherwise carry it forward
+    /// to whatever gets allocated next, regardless of whether the code path
+    /// that freed the number remembered to clear it. It didn't, once:
+    /// `sys_close` used to clear `cloexec` right after freeing the slot but
+    /// `nonblock` only after a whole match arm of real cleanup syscalls,
+    /// long enough for a concurrent `alloc_fd` on the same (`CLONE_THREAD`-
+    /// shared) table to reuse the number in between and inherit the stale
+    /// bit — `docs/archive/NCA_FD_NONBLOCK_TOCTOU.md`. `sys_close`'s own
+    /// ordering is fixed too, but this is the guarantee that holds even if
+    /// some *other*, not-yet-audited close path gets the ordering wrong
+    /// again.
+    ///
+    /// [`reserve_write_pos`]: SharedFdTable::reserve_write_pos
+    pub fn alloc_fd_from(&self, min_fd: u32, entry: FileDescriptor) -> u32 {
+        with_irqs_disabled(|| {
+            let mut table = self.table.lock();
+            let fd = SharedFdTable::lowest_available_fd(&table, min_fd);
+            self.nonblock.lock().remove(&fd);
+            self.cloexec.lock().remove(&fd);
+            table.insert(fd, entry);
+            fd
+        })
+    }
+
     /// Explicitly close all underlying kernel resources and clear the table.
     /// This is used during process exit to ensure immediate cleanup.
     ///
@@ -200,14 +233,11 @@ impl Process {
     }
 
     /// Allocate the lowest available fd number >= `min_fd` and insert the entry.
-    /// Used by `fcntl(F_DUPFD)` which specifies a minimum fd.
+    /// Used by `fcntl(F_DUPFD)` which specifies a minimum fd. See
+    /// [`SharedFdTable::alloc_fd_from`] for the flag-staleness guarantee this
+    /// provides and why it lives there now.
     pub fn alloc_fd_from(&self, min_fd: u32, entry: FileDescriptor) -> u32 {
-        with_irqs_disabled(|| {
-            let mut table = self.fds.table.lock();
-            let fd = SharedFdTable::lowest_available_fd(&table, min_fd);
-            table.insert(fd, entry);
-            fd
-        })
+        self.fds.alloc_fd_from(min_fd, entry)
     }
 
     /// Get a file descriptor entry (cloned)
@@ -431,5 +461,117 @@ mod reserve_write_pos_tests {
             _ => unreachable!(),
         });
         assert_eq!(final_pos, Some(total * CHUNK));
+    }
+}
+
+/// Regression coverage for `docs/archive/NCA_FD_NONBLOCK_TOCTOU.md` — the fd-number
+/// reuse race where `nonblock`/`cloexec`, tracked per raw fd number rather than per
+/// underlying pipe/file object, could leak from a closed fd's stale flag onto whatever
+/// a concurrent `alloc_fd` handed out next. Exercised directly against
+/// [`SharedFdTable::alloc_fd_from`], the same way `reserve_write_pos_tests` covers its
+/// sibling method — the bug itself was only ever observable end-to-end (a real `rustc`
+/// child hitting `EAGAIN` on what should be a blocking pipe read), not reproducible as
+/// a unit test on its own.
+#[cfg(test)]
+mod alloc_fd_tests {
+    use super::*;
+
+    #[test]
+    fn reused_fd_number_does_not_inherit_a_stale_nonblock_flag() {
+        let t = SharedFdTable::new();
+        for fd in 0..5 {
+            t.table.lock().insert(fd, FileDescriptor::Stdin);
+        }
+        // Simulate the *old*, buggy `sys_close`: the table slot is freed, but the
+        // nonblock bit — which used to be cleared only after a whole match arm of
+        // cleanup syscalls — is deliberately left set, exactly the window the fix
+        // closes from the allocation side.
+        t.table.lock().insert(5, FileDescriptor::Stdout);
+        t.nonblock.lock().insert(5);
+        t.cloexec.lock().insert(5);
+        t.table.lock().remove(&5);
+
+        let fd = t.alloc_fd_from(0, FileDescriptor::Stderr);
+        assert_eq!(fd, 5, "test assumes fd 5 is the lowest free slot");
+        assert!(!t.nonblock.lock().contains(&fd), "fresh fd must not inherit the stale nonblock bit");
+        assert!(!t.cloexec.lock().contains(&fd), "fresh fd must not inherit the stale cloexec bit");
+    }
+
+    #[test]
+    fn allocation_does_not_disturb_other_fds_flags() {
+        let t = SharedFdTable::new();
+        t.table.lock().insert(0, FileDescriptor::Stdin);
+        t.nonblock.lock().insert(0); // fd 0 legitimately non-blocking — must survive
+        let fd = t.alloc_fd_from(1, FileDescriptor::Stdout);
+        assert_eq!(fd, 1);
+        assert!(t.nonblock.lock().contains(&0), "an unrelated fd's flag must not be touched");
+    }
+
+    /// The actual regression test: a "closer" thread repeatedly frees fd 3 without
+    /// ever clearing its `nonblock` bit itself (the old `sys_close`'s exact
+    /// vulnerable window, held open deliberately with a `yield_now` to widen the
+    /// race), racing an "allocator" thread that repeatedly reuses that same slot —
+    /// fds 0-2 are permanently occupied so fd 3 is always the next fd `alloc_fd_from`
+    /// hands out once freed. Every single time the allocator receives fd 3, its
+    /// nonblock bit must already read false — proving the guarantee holds under
+    /// real concurrent hammering, not just the single-threaded case above.
+    #[test]
+    fn concurrent_reuse_never_observes_a_stale_nonblock_flag() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        const ROUNDS: usize = 20_000;
+
+        let table = StdArc::new(SharedFdTable::new());
+        for fd in 0..3 {
+            table.table.lock().insert(fd, FileDescriptor::Stdin);
+        }
+        // The closer starts by taking fd 3 for the allocator to eventually free again.
+        table.table.lock().insert(3, FileDescriptor::Stdout);
+        table.nonblock.lock().insert(3);
+
+        let closer_table = StdArc::clone(&table);
+        let closer = thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                // Old `sys_close`'s exact shape: free the slot first...
+                closer_table.table.lock().remove(&3);
+                thread::yield_now(); // widen the window for the allocator to jump in
+                // ...and only "remember" to clear nonblock afterward. A real
+                // pre-fix run would sometimes clear a slot the allocator had
+                // *already* reused — this test doesn't need that second half of
+                // the bug to prove the allocator-side guarantee, so it stops here.
+            }
+        });
+
+        let hits = StdArc::new(AtomicUsize::new(0));
+        let alloc_table = StdArc::clone(&table);
+        let alloc_hits = StdArc::clone(&hits);
+        let allocator = thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                let fd = alloc_table.alloc_fd_from(3, FileDescriptor::Stderr);
+                if fd == 3 {
+                    alloc_hits.fetch_add(1, Ordering::Relaxed);
+                    assert!(
+                        !alloc_table.nonblock.lock().contains(&3),
+                        "allocator observed a stale nonblock bit on a freshly reused fd"
+                    );
+                    // Give the closer another slot to take back.
+                    alloc_table.nonblock.lock().insert(3);
+                } else {
+                    // fd 3 was still occupied this round; put back what we got so
+                    // the table doesn't grow unbounded, and try again next round.
+                    alloc_table.table.lock().remove(&fd);
+                }
+                thread::yield_now();
+            }
+        });
+
+        closer.join().unwrap();
+        allocator.join().unwrap();
+        assert!(
+            hits.load(Ordering::Relaxed) > 0,
+            "test never actually raced the allocator onto fd 3 — widen the window and retry"
+        );
     }
 }

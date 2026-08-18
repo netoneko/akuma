@@ -1405,6 +1405,16 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     } else {
         proc.clear_cloexec(newfd);
     }
+    // `nonblock`, unlike `cloexec`, is a property of the open file description
+    // dup2/dup3 shares between oldfd and newfd (real Linux: both fds report
+    // the same O_NONBLOCK status afterward), but this table tracks it per raw
+    // fd *number* — copy it explicitly or `newfd` keeps whatever its own,
+    // unrelated previous occupant left behind.
+    if proc.is_nonblock(oldfd) {
+        proc.set_nonblock(newfd);
+    } else {
+        proc.clear_nonblock(newfd);
+    }
 
     // Close the old entry AFTER inserting the new one.
     if let Some(old) = old_entry {
@@ -1650,7 +1660,23 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
 pub fn sys_close(fd: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         if let Some(entry) = proc.remove_fd(fd) {
+            // Both flag-clears must happen here, immediately after `remove_fd`
+            // frees this fd number for reuse — not after the resource-cleanup
+            // match below, which can run real syscalls (`pipe_close_*`,
+            // `remove_socket`, ...) that give a concurrent thread on a shared
+            // fd table (CLONE_THREAD/CLONE_FILES) time to `alloc_fd` the same
+            // number for something new. `clear_cloexec` already lived here;
+            // `clear_nonblock` didn't — it ran last, after that window, so a
+            // fresh pipe reusing this fd number could transiently read this
+            // fd's stale `nonblock` bit as its own (spurious `EAGAIN` on what
+            // should be a blocking read — e.g. std's child CLOEXEC-pipe
+            // handshake, "the CLOEXEC pipe failed: ... WouldBlock"), and this
+            // call's late `clear_nonblock` could then wipe out whatever the
+            // new owner had legitimately set in the meantime. See
+            // docs/archive/NCA_MISSING_SYSCALLS.md §1 update — reproduced via
+            // concurrent `cargo build` spawns from nca's multi-threaded runtime.
             proc.clear_cloexec(fd);
+            proc.clear_nonblock(fd);
             match entry {
                 akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
                 akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
@@ -1683,7 +1709,6 @@ pub fn sys_close(fd: u32) -> u64 {
                 }
                 _ => {}
             }
-            proc.clear_nonblock(fd);
             0
         } else { EBADF }
     } else { ESRCH }
@@ -1704,7 +1729,12 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
         if flags & CLOSE_RANGE_CLOEXEC != 0 {
             proc.set_cloexec(fd);
         } else if let Some(entry) = proc.remove_fd(fd) {
+            // Same ordering fix as `sys_close`: clear both flags right after
+            // `remove_fd`, before the resource-cleanup match can hand a
+            // concurrent `alloc_fd` on this shared fd table time to reuse the
+            // number while this fd's `nonblock` bit is still stale.
             proc.clear_cloexec(fd);
+            proc.clear_nonblock(fd);
             match entry {
                 akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
                 akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
@@ -1726,7 +1756,6 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
                 }
                 _ => {}
             }
-            proc.clear_nonblock(fd);
         }
     }
     0

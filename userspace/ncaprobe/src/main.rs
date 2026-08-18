@@ -935,7 +935,11 @@ fn probe_raw(mode: &str) {
 // see whether the failure needs the actual weight of a real compile to
 // trigger, and to catch a raw_os_error on the Rust side per iteration.
 
-fn probe_bigspawn(iterations: usize) {
+/// One spawn+wait of the exact heavy rustc invocation cargo uses for
+/// proc-macro2's build script, with cargo's exact injected environment.
+/// `label` must be unique across concurrent callers (out-dir and `-C
+/// metadata` both key off it).
+fn bigspawn_one(label: &str) -> (bool, String) {
     let args: [&str; 13] = [
         "--crate-name", "build_script_build", "--edition=2021",
         "/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.106/build.rs",
@@ -944,97 +948,143 @@ fn probe_bigspawn(iterations: usize) {
         "--crate-type", "bin", "--emit=dep-info,link",
         "-C", "embed-bitcode=no", "-C", "debug-assertions=off",
     ];
+    let out_dir = format!("/tmp/rustc_bigspawn_{label}");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let t0 = Instant::now();
+    let mut cmd = Command::new("/usr/local/bin/rustc");
+    // NOT env_clear()'d: cargo adds these on top of its own inherited
+    // environment (PATH etc still needed to find the linker), it doesn't
+    // replace it.
+    cmd.env("CARGO", "/usr/local/bin/cargo");
+    cmd.env("CARGO_CRATE_NAME", "build_script_build");
+    cmd.env(
+        "CARGO_MANIFEST_DIR",
+        "/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.106",
+    );
+    cmd.env(
+        "CARGO_MANIFEST_PATH",
+        "/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.106/Cargo.toml",
+    );
+    cmd.env(
+        "CARGO_PKG_AUTHORS",
+        "David Tolnay <dtolnay@gmail.com>:Alex Crichton <alex@alexcrichton.com>",
+    );
+    cmd.env(
+        "CARGO_PKG_DESCRIPTION",
+        "A substitute implementation of the compiler's `proc_macro` API to decouple token-based libraries from the procedural macro use case.",
+    );
+    cmd.env("CARGO_PKG_HOMEPAGE", "");
+    cmd.env("CARGO_PKG_LICENSE", "MIT OR Apache-2.0");
+    cmd.env("CARGO_PKG_LICENSE_FILE", "");
+    cmd.env("CARGO_PKG_NAME", "proc-macro2");
+    cmd.env("CARGO_PKG_README", "README.md");
+    cmd.env(
+        "CARGO_PKG_REPOSITORY",
+        "https://github.com/dtolnay/proc-macro2",
+    );
+    cmd.env("CARGO_PKG_RUST_VERSION", "1.68");
+    cmd.env("CARGO_PKG_VERSION", "1.0.106");
+    cmd.env("CARGO_PKG_VERSION_MAJOR", "1");
+    cmd.env("CARGO_PKG_VERSION_MINOR", "0");
+    cmd.env("CARGO_PKG_VERSION_PATCH", "106");
+    cmd.env("CARGO_PKG_VERSION_PRE", "");
+    cmd.env("LD_LIBRARY_PATH", "");
+    cmd.args(args)
+        .arg("--cfg")
+        .arg("feature=\"default\"")
+        .arg("--cfg")
+        .arg("feature=\"proc-macro\"")
+        .arg("--check-cfg")
+        .arg("cfg(docsrs,test)")
+        .arg("--check-cfg")
+        .arg("cfg(feature, values(\"default\", \"nightly\", \"proc-macro\", \"span-locations\"))")
+        .arg("-C")
+        .arg(format!("metadata=bigspawn{label}"))
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg("-C")
+        .arg("strip=symbols")
+        .arg("--cap-lints")
+        .arg("allow")
+        .current_dir("/tmp/native-cli-ai")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let result = match cmd.output() {
+        Ok(out) if out.status.success() => (
+            true,
+            format!("[{label}] OK in {}ms", t0.elapsed().as_millis()),
+        ),
+        Ok(out) => {
+            let full_path = format!("/tmp/bigspawn_fail_{label}.stderr");
+            let _ = std::fs::write(&full_path, &out.stderr);
+            let stderr_head: String =
+                String::from_utf8_lossy(&out.stderr).chars().take(300).collect();
+            (
+                false,
+                format!(
+                    "[{label}] rustc exited {:?} in {}ms full_stderr={full_path} stderr={stderr_head:?}",
+                    out.status.code(),
+                    t0.elapsed().as_millis()
+                ),
+            )
+        }
+        Err(e) => (
+            false,
+            format!(
+                "[{label}] *** SPAWN FAILED after {}ms: {e} (raw_os_error={:?}) ***",
+                t0.elapsed().as_millis(),
+                e.raw_os_error()
+            ),
+        ),
+    };
+    let _ = std::fs::remove_dir_all(&out_dir);
+    result
+}
+
+fn probe_bigspawn(iterations: usize) {
     let mut ok = 0usize;
     let mut fail = 0usize;
     for i in 0..iterations {
-        let out_dir = format!("/tmp/rustc_bigspawn_{i}");
-        let _ = std::fs::create_dir_all(&out_dir);
-        let t0 = Instant::now();
-        let mut cmd = Command::new("/usr/local/bin/rustc");
-        // NOT env_clear()'d: cargo adds these on top of its own inherited
-        // environment (PATH etc still needed to find the linker), it doesn't
-        // replace it.
-        cmd.env("CARGO", "/usr/local/bin/cargo");
-        cmd.env("CARGO_CRATE_NAME", "build_script_build");
-        cmd.env(
-            "CARGO_MANIFEST_DIR",
-            "/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.106",
-        );
-        cmd.env(
-            "CARGO_MANIFEST_PATH",
-            "/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.106/Cargo.toml",
-        );
-        cmd.env(
-            "CARGO_PKG_AUTHORS",
-            "David Tolnay <dtolnay@gmail.com>:Alex Crichton <alex@alexcrichton.com>",
-        );
-        cmd.env(
-            "CARGO_PKG_DESCRIPTION",
-            "A substitute implementation of the compiler's `proc_macro` API to decouple token-based libraries from the procedural macro use case.",
-        );
-        cmd.env("CARGO_PKG_HOMEPAGE", "");
-        cmd.env("CARGO_PKG_LICENSE", "MIT OR Apache-2.0");
-        cmd.env("CARGO_PKG_LICENSE_FILE", "");
-        cmd.env("CARGO_PKG_NAME", "proc-macro2");
-        cmd.env("CARGO_PKG_README", "README.md");
-        cmd.env(
-            "CARGO_PKG_REPOSITORY",
-            "https://github.com/dtolnay/proc-macro2",
-        );
-        cmd.env("CARGO_PKG_RUST_VERSION", "1.68");
-        cmd.env("CARGO_PKG_VERSION", "1.0.106");
-        cmd.env("CARGO_PKG_VERSION_MAJOR", "1");
-        cmd.env("CARGO_PKG_VERSION_MINOR", "0");
-        cmd.env("CARGO_PKG_VERSION_PATCH", "106");
-        cmd.env("CARGO_PKG_VERSION_PRE", "");
-        cmd.env("LD_LIBRARY_PATH", "");
-        cmd.args(args)
-            .arg("--cfg")
-            .arg("feature=\"default\"")
-            .arg("--cfg")
-            .arg("feature=\"proc-macro\"")
-            .arg("--check-cfg")
-            .arg("cfg(docsrs,test)")
-            .arg("--check-cfg")
-            .arg("cfg(feature, values(\"default\", \"nightly\", \"proc-macro\", \"span-locations\"))")
-            .arg("-C")
-            .arg(format!("metadata=bigspawn{i:08x}"))
-            .arg("--out-dir")
-            .arg(&out_dir)
-            .arg("-C")
-            .arg("strip=symbols")
-            .arg("--cap-lints")
-            .arg("allow")
-            .current_dir("/tmp/native-cli-ai")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        match cmd.output() {
-            Ok(out) if out.status.success() => {
-                ok += 1;
-                println!("[{i}] OK in {}ms", t0.elapsed().as_millis());
-            }
-            Ok(out) => {
-                fail += 1;
-                let stderr_head: String =
-                    String::from_utf8_lossy(&out.stderr).chars().take(200).collect();
-                println!(
-                    "[{i}] rustc exited {:?} in {}ms stderr={stderr_head:?}",
-                    out.status.code(),
-                    t0.elapsed().as_millis()
-                );
-            }
-            Err(e) => {
-                fail += 1;
-                println!(
-                    "[{i}] *** SPAWN FAILED after {}ms: {e} (raw_os_error={:?}) ***",
-                    t0.elapsed().as_millis(),
-                    e.raw_os_error()
-                );
-            }
+        let (pass, line) = bigspawn_one(&format!("{i:08x}"));
+        println!("{line}");
+        if pass {
+            ok += 1;
+        } else {
+            fail += 1;
         }
-        let _ = std::fs::remove_dir_all(&out_dir);
     }
     println!("RESULT: {ok} ok, {fail} failed out of {iterations}");
+}
+
+/// Same spawn, but from `threads` OS threads concurrently, `iters_per_thread`
+/// rounds each — cargo's own execution is multi-threaded (job-scheduling pool
+/// + jobserver), unlike the sequential `bigspawn` above, which never
+/// reproduced the failure in 80 combined iterations. This tests whether
+/// concurrent spawning is the missing ingredient.
+fn probe_bigspawn_threads(threads: usize, iters_per_thread: usize) {
+    let results: std::sync::Arc<std::sync::Mutex<Vec<(bool, String)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let results = results.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..iters_per_thread {
+                let (pass, line) = bigspawn_one(&format!("t{t}_{i:08x}"));
+                println!("{line}");
+                results.lock().unwrap().push((pass, line));
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let results = results.lock().unwrap();
+    let ok = results.iter().filter(|(pass, _)| *pass).count();
+    let fail = results.len() - ok;
+    println!(
+        "RESULT: {ok} ok, {fail} failed out of {} ({threads} threads x {iters_per_thread})",
+        results.len()
+    );
 }
 
 // ---------------------------------------------------------------- probe C
@@ -1205,6 +1255,14 @@ fn main() {
                 .unwrap_or(50usize);
             println!("=== probe: real rustc spawn x{iterations} (cargo EFAULT repro) ===");
             probe_bigspawn(iterations);
+        }
+        Some("bigspawn-threads") => {
+            let threads = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4usize);
+            let iters = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10usize);
+            println!(
+                "=== probe: real rustc spawn from {threads} concurrent threads x{iters} each ==="
+            );
+            probe_bigspawn_threads(threads, iters);
         }
         Some("waitid") => {
             println!("=== probe: waitid(P_PIDFD) — tokio's reaping call ===");

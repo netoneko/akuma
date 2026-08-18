@@ -136,6 +136,14 @@ still the right next step, but now specifically aimed at *live cargo*, not a
 synthetic mimic — a probe that only reproduces cargo's spawn shape without
 cargo's actual concurrency has been shown not to trigger this.
 
+**2026-08-18, continued:** this investigation forked into two — a real fd-table
+bug in the same family was found and fixed
+([`NCA_FD_NONBLOCK_TOCTOU.md`](NCA_FD_NONBLOCK_TOCTOU.md), confirmed by A/B),
+but the `EFAULT` failure documented above survives that fix under a real
+`cargo build -j4`. Full ruled-out/still-open detail moved to
+[`NCA_CARGO_SPAWN_EFAULT.md`](NCA_CARGO_SPAWN_EFAULT.md) rather than growing
+further here.
+
 ## 2. AF_UNIX `socket()` → EAFNOSUPPORT (nca IPC)
 
 **Symptom:** `nca` runs (`--help`, `models`, config load fine) but any real
