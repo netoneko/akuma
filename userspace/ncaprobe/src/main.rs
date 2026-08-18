@@ -923,6 +923,120 @@ fn probe_raw(mode: &str) {
     }
 }
 
+// ---------------------------------------------------------------- probe N
+// Reproduces the cargo->rustc "Bad address (os error 14)" spawn failure
+// (docs/archive/NCA_MISSING_SYSCALLS.md §1) at the plain std::process::Command
+// level: the *exact* heavy rustc invocation cargo uses to build proc-macro2's
+// build script on this guest, piped stdout/stderr (matching cargo's JSON
+// diagnostics capture), looped many times. The existing investigation found
+// this racy (~8 successes before the first big-compile spawn failed) and a
+// lighter synthetic mimic (piped stdio + big argv, no real heavy rustc
+// invocation) passed 40/40 — this probe spawns the real thing instead, to
+// see whether the failure needs the actual weight of a real compile to
+// trigger, and to catch a raw_os_error on the Rust side per iteration.
+
+fn probe_bigspawn(iterations: usize) {
+    let args: [&str; 13] = [
+        "--crate-name", "build_script_build", "--edition=2021",
+        "/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.106/build.rs",
+        "--error-format=json",
+        "--json=diagnostic-rendered-ansi,artifacts,future-incompat",
+        "--crate-type", "bin", "--emit=dep-info,link",
+        "-C", "embed-bitcode=no", "-C", "debug-assertions=off",
+    ];
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    for i in 0..iterations {
+        let out_dir = format!("/tmp/rustc_bigspawn_{i}");
+        let _ = std::fs::create_dir_all(&out_dir);
+        let t0 = Instant::now();
+        let mut cmd = Command::new("/usr/local/bin/rustc");
+        // NOT env_clear()'d: cargo adds these on top of its own inherited
+        // environment (PATH etc still needed to find the linker), it doesn't
+        // replace it.
+        cmd.env("CARGO", "/usr/local/bin/cargo");
+        cmd.env("CARGO_CRATE_NAME", "build_script_build");
+        cmd.env(
+            "CARGO_MANIFEST_DIR",
+            "/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.106",
+        );
+        cmd.env(
+            "CARGO_MANIFEST_PATH",
+            "/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.106/Cargo.toml",
+        );
+        cmd.env(
+            "CARGO_PKG_AUTHORS",
+            "David Tolnay <dtolnay@gmail.com>:Alex Crichton <alex@alexcrichton.com>",
+        );
+        cmd.env(
+            "CARGO_PKG_DESCRIPTION",
+            "A substitute implementation of the compiler's `proc_macro` API to decouple token-based libraries from the procedural macro use case.",
+        );
+        cmd.env("CARGO_PKG_HOMEPAGE", "");
+        cmd.env("CARGO_PKG_LICENSE", "MIT OR Apache-2.0");
+        cmd.env("CARGO_PKG_LICENSE_FILE", "");
+        cmd.env("CARGO_PKG_NAME", "proc-macro2");
+        cmd.env("CARGO_PKG_README", "README.md");
+        cmd.env(
+            "CARGO_PKG_REPOSITORY",
+            "https://github.com/dtolnay/proc-macro2",
+        );
+        cmd.env("CARGO_PKG_RUST_VERSION", "1.68");
+        cmd.env("CARGO_PKG_VERSION", "1.0.106");
+        cmd.env("CARGO_PKG_VERSION_MAJOR", "1");
+        cmd.env("CARGO_PKG_VERSION_MINOR", "0");
+        cmd.env("CARGO_PKG_VERSION_PATCH", "106");
+        cmd.env("CARGO_PKG_VERSION_PRE", "");
+        cmd.env("LD_LIBRARY_PATH", "");
+        cmd.args(args)
+            .arg("--cfg")
+            .arg("feature=\"default\"")
+            .arg("--cfg")
+            .arg("feature=\"proc-macro\"")
+            .arg("--check-cfg")
+            .arg("cfg(docsrs,test)")
+            .arg("--check-cfg")
+            .arg("cfg(feature, values(\"default\", \"nightly\", \"proc-macro\", \"span-locations\"))")
+            .arg("-C")
+            .arg(format!("metadata=bigspawn{i:08x}"))
+            .arg("--out-dir")
+            .arg(&out_dir)
+            .arg("-C")
+            .arg("strip=symbols")
+            .arg("--cap-lints")
+            .arg("allow")
+            .current_dir("/tmp/native-cli-ai")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match cmd.output() {
+            Ok(out) if out.status.success() => {
+                ok += 1;
+                println!("[{i}] OK in {}ms", t0.elapsed().as_millis());
+            }
+            Ok(out) => {
+                fail += 1;
+                let stderr_head: String =
+                    String::from_utf8_lossy(&out.stderr).chars().take(200).collect();
+                println!(
+                    "[{i}] rustc exited {:?} in {}ms stderr={stderr_head:?}",
+                    out.status.code(),
+                    t0.elapsed().as_millis()
+                );
+            }
+            Err(e) => {
+                fail += 1;
+                println!(
+                    "[{i}] *** SPAWN FAILED after {}ms: {e} (raw_os_error={:?}) ***",
+                    t0.elapsed().as_millis(),
+                    e.raw_os_error()
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+    println!("RESULT: {ok} ok, {fail} failed out of {iterations}");
+}
+
 // ---------------------------------------------------------------- probe C
 // Exactly what nca's BashTool does (crates/core/src/tools/bash.rs:43-67),
 // on a multi-thread runtime like nca's.
@@ -1083,6 +1197,14 @@ fn main() {
         Some("stdinedge") => {
             println!("=== probe: fd 0 (real Stdin exec-channel) EPOLLET edge ===");
             probe_stdinedge();
+        }
+        Some("bigspawn") => {
+            let iterations = args
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50usize);
+            println!("=== probe: real rustc spawn x{iterations} (cargo EFAULT repro) ===");
+            probe_bigspawn(iterations);
         }
         Some("waitid") => {
             println!("=== probe: waitid(P_PIDFD) — tokio's reaping call ===");

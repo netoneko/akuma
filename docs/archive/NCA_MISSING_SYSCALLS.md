@@ -119,6 +119,23 @@ Revert both when this is solved.
 `dup2`/`chdir`/pipe-read paths gated on a new config flag, and diff which
 child-side syscall returns -14 for the failing spawn.
 
+**2026-08-18: ruled out "just spawning real rustc with piped stdio,
+repeatedly."** `ncaprobe bigspawn N` (`userspace/ncaprobe`) spawns the *exact*
+heavy rustc invocation cargo uses for this crate's build script (piped
+stdout/stderr, matching cargo's JSON-diagnostics capture) via plain
+`std::process::Command`, in a loop. **50/50 succeeded** — well past the ~8
+spawns where cargo itself starts failing, and each took the real ~4s a build
+of this size actually costs, so it wasn't skipping work. That narrows it
+further: it isn't the weight of the real rustc invocation, and it isn't
+`std::process::Command`'s basic piped-stdio spawn path in isolation — cargo
+itself must be doing something concurrent with the spawn that a sequential
+probe doesn't: its jobserver (a pipe + fds set up and passed to children even
+at `-j1`), or its own background threads (progress bar / signal handling)
+running while the spawn happens. The "next steps" instrumentation above is
+still the right next step, but now specifically aimed at *live cargo*, not a
+synthetic mimic — a probe that only reproduces cargo's spawn shape without
+cargo's actual concurrency has been shown not to trigger this.
+
 ## 2. AF_UNIX `socket()` → EAFNOSUPPORT (nca IPC)
 
 **Symptom:** `nca` runs (`--help`, `models`, config load fine) but any real
