@@ -13,7 +13,13 @@ image; the devbox is the reference.
 1. Edit `overlays/devbox/bootstrap.sh`. Find the relevant `apk ... add`
    transaction:
    - Step 6 (`DEVBOX_GIT`): `apk add ... musl git`
-   - Step 7 (`DEVBOX_RUST_TOOLCHAIN`): `apk ... add clang lld gcc binutils make musl-dev rust cargo`
+   - Step 7 (`DEVBOX_RUST_TOOLCHAIN`): the list is **built into `$DEVBOX_APK_PKGS`**
+     (`clang lld gcc binutils make musl-dev`, plus `rust cargo` only when
+     `DEVBOX_STABLE_RUST=true`) and then passed to one `apk ... add
+     $DEVBOX_APK_PKGS`. Add your package to that **variable**, not to the `apk add`
+     line — and note the variable is handed to the container as
+     `-e DEVBOX_APK_PKGS="$DEVBOX_APK_PKGS"`; the bare `-e DEVBOX_APK_PKGS` form
+     silently passes nothing, because bash does not export a plain assignment.
 2. Add your package to the **same** `apk add` line. Do NOT create a new
    transaction.
 3. If it needs `/etc` config, add it under `overlays/devbox/rootfs/etc/` (the
@@ -26,7 +32,8 @@ image; the devbox is the reference.
 |---|---|---|
 | `DEVBOX_CA_CERTS` | true | Mozilla CA bundle |
 | `DEVBOX_GIT` | true | apk git |
-| `DEVBOX_RUST_TOOLCHAIN` | true | apk rust + cargo + C toolchain |
+| `DEVBOX_RUST_TOOLCHAIN` | true | the whole step — **C toolchain included** |
+| `DEVBOX_STABLE_RUST` | **false** | apk `rust`/`cargo` (opt-in; nightly under `/usr/local` is the default toolchain) |
 | `DEVBOX_SOUNDTRACK` | false | bonus music |
 
 ## Why a single transaction

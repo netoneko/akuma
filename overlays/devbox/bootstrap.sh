@@ -276,17 +276,38 @@ if [ "${DEVBOX_RUST_TOOLCHAIN:-true}" = "true" ]; then
     else
         hr "Installing C toolchain (nightly-only image; DEVBOX_STABLE_RUST=false)"
     fi
+    # `-e VAR` (no value) forwards VAR from the CALLER environment, and a plain
+    # `VAR=...` assignment in bash is a shell variable, not an exported one — so the
+    # bare form silently passed nothing and `apk add` ran with ZERO packages,
+    # reporting a cheerful "OK: 19.5 MiB in 17 packages" (the pre-existing set,
+    # unchanged) while installing no C toolchain at all. Measured 2026-08-19 on the
+    # first real bootstrap after this step was split. Pass the value explicitly.
     docker run --rm --privileged \
         -v "$REPO_ROOT/$DEVBOX_DISK:/disk.img" \
-        -e DEVBOX_APK_PKGS \
+        -e DEVBOX_APK_PKGS="$DEVBOX_APK_PKGS" \
         alpine:latest \
         sh -c '
             set -e
             mkdir -p /mnt/disk
             mount -o loop /disk.img /mnt/disk
 
+            # An empty list is always a bug here, and `apk add` with no arguments
+            # exits 0 — so it has to be caught rather than trusted.
+            if [ -z "$DEVBOX_APK_PKGS" ]; then
+                echo "ERROR: DEVBOX_APK_PKGS is empty - package list did not reach the container" >&2
+                umount /mnt/disk
+                exit 1
+            fi
+
             echo "Installing into disk: $DEVBOX_APK_PKGS"
             apk --root /mnt/disk --no-scripts add $DEVBOX_APK_PKGS
+
+            # Prove the C toolchain actually landed; a silent no-op here is what the
+            # guard above exists to prevent, and cc/ld missing only shows up much
+            # later as a cargo link failure inside the guest.
+            for tool in clang ld.lld gcc make; do
+                [ -x "/mnt/disk/usr/bin/$tool" ] || { echo "ERROR: /usr/bin/$tool missing after apk add" >&2; umount /mnt/disk; exit 1; }
+            done
 
             # No profile.d PATH script, deliberately. This step used to write
             # /etc/profile.d/rust.sh with `PATH=/usr/bin:$PATH` — which NEVER RAN.
