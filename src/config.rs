@@ -831,18 +831,22 @@ pub const ENABLE_IRQ_DEBUG_PRINTS: bool = false;
 pub const SHELL_PS_DEBUG: bool = false;
 
 // Timer interval in microseconds
-// Timer (preemption tick) interval. 1 ms since 2026-08-18 — measured, with
-// wake-deadline preemption (WAKE_DEADLINE_PREEMPT in akuma-exec), strictly
-// better on every axis at SMP=1: sleep/poll floors ~1 ms (were ~35-40 ms),
-// pipe round-trip 3.2 vs 10.4 us/iter, 0 terminal stalls (were ~1000/1500
-// writes), 128 MB download 3.4 s vs 6.3 s, boot suite 284/0 unchanged
-// (docs/archive/SCHEDULING_INVESTIGATION.md, Matrix A re-run).
+// Scheduler preemption tick. 3 ms since 2026-08-18: with wake-deadline
+// preemption (WAKE_DEADLINE_PREEMPT in akuma-exec) this keeps the measured
+// wins of the 1 ms arm (sleep/poll floors ~1 tick, pipe round-trip, zero
+// terminal stalls — docs/archive/SCHEDULING_INVESTIGATION.md, Matrix A) while
+// staying above the host WFI floor. Under QEMU HVF on darwin/arm64 the host
+// declines to sleep vCPU threads for deadlines below ~2.5 ms, which turns the
+// idle loops' WFI into a no-op and burns one saturated host core per guest
+// core at tick<=2ms (100% at SMP=1, 330% at SMP=4) vs ~1.6% at 3 ms
+// (docs/archive/CPU_LOAD_REGRESSION_INVESTIGATION.md). The floor is an
+// undocumented HVF heuristic and can move; a self-tuning ticker (boot probe +
+// runtime demotion) is planned to replace this constant — see that doc's fix
+// options. Gate: scripts/measure_idle_cpu.py (verify-trim-fat-change.md).
 // extreme-size keeps the old 10 ms: a 4 MB single-core box pays for every
-// interrupt and has no sc-epoll, and the 1 ms arm is unvalidated there — if
-// Matrix B ever shows no cost on extreme, flip this gate off and use 1 ms
-// everywhere.
+// interrupt and has no sc-epoll, and the 1 ms arm is unvalidated there.
 #[cfg(not(kernel_profile_extreme))]
-pub const TIMER_INTERVAL_US: u64 = 1_000;
+pub const TIMER_INTERVAL_US: u64 = 3_000;
 #[cfg(kernel_profile_extreme)]
 pub const TIMER_INTERVAL_US: u64 = 10_000;
 

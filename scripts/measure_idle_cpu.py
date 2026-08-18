@@ -81,8 +81,6 @@ def main():
                     help="seconds to wait after the boot marker before sampling")
     ap.add_argument("--window", type=float, default=30.0, help="sampling window, seconds")
     ap.add_argument("--log", default=None, help="boot log path (default: a temp file)")
-    ap.add_argument("--knobs", default=None,
-                    help="AKUMA_KNOBS passed to the run command (e.g. 'tick_us=2000 wfi=off')")
     ap.add_argument("--keep", action="store_true", help="leave the VM running afterwards")
     args = ap.parse_args()
 
@@ -103,8 +101,6 @@ def main():
     env = dict(os.environ)
     if args.smp:
         env["SMP"] = str(args.smp)
-    if args.knobs:
-        env["AKUMA_KNOBS"] = args.knobs
 
     logf = open(log_path, "wb")
     proc = subprocess.Popen(

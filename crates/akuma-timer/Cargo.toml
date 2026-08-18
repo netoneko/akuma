@@ -1,0 +1,11 @@
+[package]
+name = "akuma-timer"
+version = "0.1.0"
+edition = "2024"
+description = "ARM generic timer hardware access, timekeeping, and the self-tuning scheduler-tick policy"
+
+[lints]
+workspace = true
+
+[dependencies]
+arm_pl031 = { version = "0.2", default-features = false }

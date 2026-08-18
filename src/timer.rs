@@ -1,80 +1,85 @@
+// Timer ISR + presentation shim.
+//
+// The hardware half (CNTV access, PL031 RTC, UTC offset) and the self-tuning
+// tick policy live in the `akuma-timer` crate (extracted 2026-08-18 per
+// docs/archive/TRIM_FAT_EMBARRESSING_DUPLICATIONS.md's deferred-audit row:
+// this file used to be scheduler-ISR logic wearing a driver's filename). What
+// remains here is fused to the bin crate and cannot move:
+//
+// - `timer_irq_handler` — the ISR: re-arms the periodic tick, services the
+//   `kernel_timer` alarm queue, runs the preemption watchdog, feeds the
+//   governor, and rings the scheduler SGI. All of that reaches akuma_exec.
+// - `probe_host_tick` — boot-time WFI probe wiring (GIC + DAIF dance around
+//   `akuma_timer::policy::pick_tick`).
+// - UTC/ISO presentation (`DateTime`, `utc_iso8601`), which allocates and is
+//   console-facing.
+//
+// Re-exports below keep the ~190 `timer::uptime_us` call sites unchanged.
+
 use alloc::string::String;
 use alloc::format;
-use arm_pl031::Rtc;
-use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
-use spinning_top::Spinlock;
 
-// UTC offset in microseconds since Unix epoch (1970-01-01 00:00:00)
-// Can be set via set_utc_time_us() to sync with real time.
-//
-// A lock-free atomic rather than a `Spinlock<Option<u64>>`: the value is one scalar with
-// no other state published alongside it, and the read path is reachable from a BKL-free
-// syscall window (`futex(FUTEX_WAIT_BITSET|CLOCK_REALTIME)` converts its absolute
-// wall-clock deadline through `utc_time_us`). A bare `Spinlock` there is an AB-BA waiting
-// to happen — a nested IRQ's unconditional `enter_kernel()` hard-spins for the BKL while
-// a peer holds the BKL inside `clock_gettime`/`gettimeofday` waiting on this lock
-// (`locking.md`, "Correctness rules learned the hard way"). Deleting the lock is better
-// than masking IRQs around it: it takes the entry off the load-bearing inventory instead
-// of adding one more hold that has to keep its discipline.
-//
-// `UNSET` encodes the old `None`. A real offset is a Unix-epoch microsecond count minus
-// uptime — on the order of 1.7e15 — so the sentinel is unreachable by four orders of
-// magnitude.
-const UTC_OFFSET_UNSET: u64 = u64::MAX;
-static UTC_OFFSET_US: AtomicU64 = AtomicU64::new(UTC_OFFSET_UNSET);
+#[cfg(not(kernel_profile_extreme))]
+use akuma_primitives::irq;
+#[cfg(not(kernel_profile_extreme))]
+use akuma_timer::ArchHw;
 
-// PL031 RTC instance for reading real-time clock from QEMU
-// The standard PL031 address for QEMU virt machine is 0x9010000
-static RTC: Spinlock<Option<Rtc>> = Spinlock::new(None);
+pub use akuma_timer::read_frequency;
+pub use akuma_timer::uptime_us;
 
 pub fn init() {
-    // Initialize the PL031 RTC
-    // SAFETY: 0x9010000 is the standard PL031 RTC address on QEMU virt machine
-    unsafe {
-        let rtc = Rtc::new(0x9010000 as *mut _);
-        *RTC.lock() = Some(rtc);
-    }
+    // Nothing left to do at init now: the PL031 is read on demand by
+    // `init_utc_from_rtc`, and the timer hardware is armed by
+    // `enable_timer_interrupts`.
 }
 
-// Enable timer interrupts for preemptive scheduling
-// Store configured interval for use in handler
-static TIMER_INTERVAL_US: AtomicU64 = AtomicU64::new(10_000); // Default 10ms
-
+// Enable timer interrupts for preemptive scheduling.
 // interval_us: interval in microseconds between interrupts
 pub fn enable_timer_interrupts(interval_us: u64) {
-    TIMER_INTERVAL_US.store(interval_us, Ordering::Relaxed);
-
-    let freq = read_frequency();
-    let ticks = (freq * interval_us) / 1_000_000;
-    let counter = read_counter();
-    let new_cval = counter + ticks;
-
-    unsafe {
-        // Set the timer compare value (virtual timer; fires PPI 27).
-        asm!("msr cntv_cval_el0, {}", in(reg) new_cval);
-
-        // Enable the timer (bit 0 = enable, bit 1 = !mask)
-        asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
-    }
+    akuma_timer::set_tick_us(interval_us);
+    akuma_timer::arm_periodic_tick();
 }
+
+/// The scheduler tick the host probe chose (or the compiled default / debug
+/// override). The ISR and secondary cores read this every re-arm, so a
+/// governor demotion takes effect on the next tick without a broadcast.
+pub fn current_tick_us() -> u64 {
+    akuma_timer::tick_us(crate::config::TIMER_INTERVAL_US)
+}
+
+// AB-PROBE: tick-cost instrumentation. Remove before landing.
+pub static PROBE_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PROBE_LAST_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PROBE_BODY_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PROBE_PERIOD_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// BSP idle/netpoll loop iterations — the runtime governor's spin sensor.
+/// Healthy: ~1 iteration per timer tick (the loop halts in WFI between ticks).
+/// Host that stopped honouring WFI: hundreds of thousands per window
+/// (measured ~1.8M/s at a 1 ms tick on the regression host). Incremented from
+/// the async-main loop (`main.rs`), read/swapped by the TICKPROBE block below.
+pub static NETPOLL_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // Timer interrupt handler - called from IRQ handler
 pub fn timer_irq_handler(_irq: u32) {
-    // Acknowledge interrupt by setting next compare value
-    let freq = read_frequency();
-    let interval_us = TIMER_INTERVAL_US.load(Ordering::Relaxed);
-    let interval_ticks = (freq * interval_us) / 1_000_000;
-    let counter = read_counter();
+    let probe_entry = akuma_timer::read_counter();
+    // Acknowledge interrupt by setting next compare value. The next deadline
+    // is computed from the ENTRY counter (not post-work), so a handler that
+    // overruns its own interval shows up as a shortened period in TICKPROBE
+    // instead of silently collapsing the tick.
+    let freq = akuma_timer::read_frequency();
+    let interval_ticks = akuma_timer::ticks_from_us(freq, current_tick_us());
+    let counter = akuma_timer::read_counter();
     let new_cval = counter + interval_ticks;
 
     unsafe {
-        asm!("msr cntv_cval_el0, {}", in(reg) new_cval);
-        // Defensively re-enable the timer on every tick: bit 0 = enable, bit 1 = !mask.
-        // If cntv_ctl_el0 ever gets corrupted (enable cleared or mask set), no further
-        // IRQs would fire, causing a permanent freeze. Writing 1 here ensures the timer
-        // keeps ticking even if something corrupted the control register.
-        asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
+        core::arch::asm!("msr cntv_cval_el0, {}", in(reg) new_cval);
+        // Defensively re-enable the timer on every tick: bit 0 = enable,
+        // bit 1 = !mask. If cntv_ctl_el0 ever gets corrupted (enable cleared
+        // or mask set), no further IRQs would fire, causing a permanent
+        // freeze. Writing 1 here ensures the timer keeps ticking even if
+        // something corrupted the control register.
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
     }
 
     // This periodic virtual-timer tick is the single hardware timer for the
@@ -88,14 +93,14 @@ pub fn timer_irq_handler(_irq: u32) {
         && let Some(duration_us) = akuma_exec::threading::check_preemption_watchdog() {
             // Log warning
             // Use AtomicU64 instead of static mut to avoid data races
-            static LAST_WARN_US: AtomicU64 = AtomicU64::new(0);
+            static LAST_WARN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
             let now = uptime_us();
-            let last = LAST_WARN_US.load(Ordering::Relaxed);
+            let last = LAST_WARN_US.load(core::sync::atomic::Ordering::Relaxed);
             // Rate-limit warnings to once per second
             if now.saturating_sub(last) > 1_000_000 {
-                LAST_WARN_US.store(now, Ordering::Relaxed);
+                LAST_WARN_US.store(now, core::sync::atomic::Ordering::Relaxed);
                 // Get poll step to help diagnose where we're stuck
-                let step = crate::GLOBAL_POLL_STEP.load(Ordering::Relaxed);
+                let step = crate::GLOBAL_POLL_STEP.load(core::sync::atomic::Ordering::Relaxed);
                 // Use stack-only print to avoid heap allocation in IRQ context
                 let tid = akuma_exec::threading::current_thread_id();
                 crate::safe_print!(96, "[WATCHDOG] Preemption disabled for {}ms at step {} tid={}\n",
@@ -113,9 +118,9 @@ pub fn timer_irq_handler(_irq: u32) {
     // Cleanup should be done from user code via threading::cleanup_terminated().
 
     if crate::config::TIMER_TICK_HEARTBEAT {
-        static TIMER_TICK: AtomicU64 = AtomicU64::new(0);
-        let tick = TIMER_TICK.fetch_add(1, Ordering::Relaxed);
-        let forking = akuma_exec::process::FORK_IN_PROGRESS.load(Ordering::Relaxed);
+        static TIMER_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let tick = TIMER_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let forking = akuma_exec::process::FORK_IN_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
         let interval = if forking { 100 } else { 1000 };
         if tick.is_multiple_of(interval) {
             let tid = akuma_exec::threading::current_thread_id();
@@ -129,61 +134,91 @@ pub fn timer_irq_handler(_irq: u32) {
     // table), so it must ring the CURRENT core's scheduler SGI, not the hardcoded PE0
     // that `trigger_sgi` targets — otherwise a secondary's tick would preempt the BSP.
     // On the BSP (aff0 = 0) `trigger_sgi_self` is equivalent to `trigger_sgi`.
+    // AB-PROBE
+    {
+        let end = akuma_timer::read_counter();
+        let last = PROBE_LAST_ENTRY.swap(probe_entry, core::sync::atomic::Ordering::Relaxed);
+        PROBE_BODY_SUM.fetch_add(end.saturating_sub(probe_entry), core::sync::atomic::Ordering::Relaxed);
+        if last > 0 {
+            PROBE_PERIOD_SUM.fetch_add(probe_entry.saturating_sub(last), core::sync::atomic::Ordering::Relaxed);
+        }
+        let n = PROBE_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_multiple_of(2000) {
+            let f = freq / 1_000_000; // ticks per us
+            let body = PROBE_BODY_SUM.swap(0, core::sync::atomic::Ordering::Relaxed) / 2000 / f.max(1);
+            let period = PROBE_PERIOD_SUM.swap(0, core::sync::atomic::Ordering::Relaxed) / 2000 / f.max(1);
+            let netiter = NETPOLL_ITERS.swap(0, core::sync::atomic::Ordering::Relaxed);
+            crate::safe_print!(128, "[TICKPROBE] n={} tick_us={} body_us={} period_us={} idle_iters={}\n",
+                n, current_tick_us(), body, period, netiter);
+            // Runtime governor: if the idle loop is spinning (host stopped
+            // honouring WFI since boot), demote the tick. Takes effect on the
+            // very next re-arm above.
+            if let Some(new_us) = akuma_timer::policy::governor_observe(netiter, 2000) {
+                akuma_timer::set_tick_us(new_us);
+                crate::safe_print!(96, "[TICKPROBE] governor: WFI spin detected, tick -> {} us\n", new_us);
+            }
+        }
+    }
     #[cfg(kernel_smp_shared)]
     crate::gic::trigger_sgi_self(crate::gic::SGI_SCHEDULER);
     #[cfg(not(kernel_smp_shared))]
     crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
 }
 
-// Read the ARM Generic Timer counter.
-//
-// Uses the VIRTUAL counter (CNTVCT) rather than the physical one (CNTPCT). The
-// physical timer/counter is owned by the hypervisor under QEMU HVF and trapping
-// to it faults the guest (EC=0x0); the virtual timer works under HVF, TCG, and
-// bare-metal EL1 alike. The preemption timer below programs CNTV_CVAL, so the
-// counter we compute deadlines against must be the same virtual time base
-// (CNTVOFF is nonzero under HVF, so CNTPCT and CNTVCT differ there).
-pub fn read_counter() -> u64 {
-    let counter: u64;
-    unsafe {
-        asm!("mrs {}, cntvct_el0", out(reg) counter);
-    }
-    counter
+// ============================================================================
+// Boot-time host-WFI probe
+// ============================================================================
+
+/// NOP IRQ handler installed while the probe measures WFI: the exception
+/// dispatcher acks/EOIs around us, but the handler itself must disarm the
+/// timer — a one-shot that has fired keeps its level asserted (CVAL <=
+/// counter, enabled), and an unmasked level re-forwards forever after EOI.
+/// The next probe sample re-arms.
+pub fn probe_irq_nop(_irq: u32) {
+    akuma_timer::disarm();
 }
 
-// Read the timer frequency (public for debugging)
-pub fn read_frequency() -> u64 {
-    let freq: u64;
-    unsafe {
-        asm!("mrs {}, cntfrq_el0", out(reg) freq);
+/// Probe the host's WFI behaviour and return the scheduler tick to use.
+///
+/// Requires: IRQ 27 registered (as [`probe_irq_nop`]) and enabled at the GIC.
+/// Runs with IRQs briefly unmasked (saved/restored): each sample needs the
+/// one-shot timer IRQ actually delivered, or WFI would never wake. Only the
+/// BSP calls this, before secondaries exist; the chosen tick is published via
+/// the crate's `set_tick_us` and every core re-arms from it.
+///
+/// Skipped (returns the compiled default) on `kernel_profile_extreme`: a 4 MB
+/// single-core box keeps its historical 10 ms and needs no probing.
+pub fn probe_host_tick() -> u64 {
+    #[cfg(kernel_profile_extreme)]
+    {
+        crate::config::TIMER_INTERVAL_US
     }
-    freq
+    #[cfg(not(kernel_profile_extreme))]
+    {
+        let saved_daif = irq::irq_save_mask();
+        irq::unmask_irqs_sync();
+        let picked = akuma_timer::policy::pick_tick(&ArchHw);
+        irq::irq_restore(saved_daif);
+        crate::safe_print!(96, "[Timer] host WFI probe: tick = {} us\n", picked);
+        picked
+    }
 }
 
-// Get time in microseconds
-// Note: Uses u128 intermediate to prevent overflow during multiplication
-pub fn get_time_us() -> u64 {
-    let counter = read_counter();
-    let freq = read_frequency();
-    if freq > 0 {
-        // Use u128 to prevent overflow when multiplying counter * 1_000_000
-        ((u128::from(counter) * 1_000_000) / u128::from(freq)) as u64
-    } else {
-        0
-    }
-}
-
-// Get current time as u64 microseconds since boot
-// Overflows after ~584 years
-pub fn uptime_us() -> u64 {
-    get_time_us()
-}
+// ============================================================================
+// UTC / presentation
+// ============================================================================
 
 // Read Unix timestamp from PL031 RTC (seconds since Unix epoch)
 // Returns None if RTC is not initialized
 pub fn read_rtc_timestamp() -> Option<u32> {
-    let rtc = RTC.lock();
-    rtc.as_ref().map(arm_pl031::Rtc::get_unix_timestamp)
+    #[cfg(target_os = "none")]
+    {
+        akuma_timer::rtc::unix_seconds()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        None
+    }
 }
 
 // Initialize UTC time from PL031 RTC
@@ -192,27 +227,17 @@ pub fn init_utc_from_rtc() -> bool {
     if let Some(timestamp) = read_rtc_timestamp() {
         // Convert seconds to microseconds
         let unix_epoch_us = u64::from(timestamp) * 1_000_000;
-        set_utc_time_us(unix_epoch_us);
+        akuma_timer::set_utc_time_us(unix_epoch_us, uptime_us());
         true
     } else {
         false
     }
 }
 
-// Set UTC offset for real-world time tracking
-// unix_epoch_us: microseconds since Unix epoch (1970-01-01 00:00:00 UTC)
-pub fn set_utc_time_us(unix_epoch_us: u64) {
-    let boot_time = uptime_us();
-    UTC_OFFSET_US.store(unix_epoch_us.saturating_sub(boot_time), Ordering::Release);
-}
-
 // Get current UTC time in microseconds since Unix epoch
 // Returns None if UTC time has not been set
 pub fn utc_time_us() -> Option<u64> {
-    match UTC_OFFSET_US.load(Ordering::Acquire) {
-        UTC_OFFSET_UNSET => None,
-        off => Some(off.wrapping_add(uptime_us())),
-    }
+    akuma_timer::utc_time_us(uptime_us())
 }
 
 // Get current UTC time in seconds since Unix epoch
@@ -260,7 +285,6 @@ impl DateTime {
             year += 1;
         }
 
-        // Calculate month and day
         let months = if is_leap_year(year) {
             [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
         } else {
@@ -289,7 +313,6 @@ impl DateTime {
         }
     }
 
-    // Format as ISO 8601: YYYY-MM-DDTHH:MM:SS.ssssssZ
     pub fn to_iso8601(&self) -> String {
         format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
@@ -309,7 +332,7 @@ fn is_leap_year(year: u32) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
-// Get current UTC time as ISO 8601 string
+// Get current UTC time as ISO 8601
 // Returns "NOT_SET" if UTC time hasn't been configured
 pub fn utc_iso8601() -> String {
     match utc_time_us() {

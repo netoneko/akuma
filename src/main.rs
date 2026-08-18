@@ -50,7 +50,7 @@ mod daif_tests;
 // mod embassy_virtio_driver;
 mod exceptions;
 mod file_page_cache;
-// fw_cfg exists only to configure ramfb, so it follows the framebuffer gate.
+// fw_cfg exists to configure ramfb, so it follows the framebuffer gate.
 #[cfg(feature = "sc-framebuffer")]
 mod fw_cfg;
 mod kernel_timer;
@@ -943,12 +943,18 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // drives preemption AND services the async alarm queue (kernel_timer). The
     // physical timer (CNTP/PPI 30) is not used — it is inaccessible to the guest
     // under QEMU HVF (programming it faults with EC=0x0).
-    irq::register_handler(27, timer::timer_irq_handler);
+    //
+    // Boot order: a NOP handler is registered first so the host WFI probe
+    // (timer::probe_host_tick) can fire one-shots into a harmless handler;
+    // the real ISR is swapped in below before the periodic tick is armed.
+    irq::register_handler(27, timer::probe_irq_nop);
     gic::enable_irq(27); // Enable virtual timer interrupt
 
     console::print("Enabling timer...\n");
-    timer::enable_timer_interrupts(config::TIMER_INTERVAL_US); // 10ms intervals
-    console::print("Preemptive scheduling enabled (10ms timer -> SGI)\n");
+    let tick_us = timer::probe_host_tick();
+    irq::register_handler(27, timer::timer_irq_handler);
+    timer::enable_timer_interrupts(tick_us);
+    safe_print!(96, "Preemptive scheduling enabled ({}us timer -> SGI)\n", tick_us);
 
     // Enable IRQ-safe allocations now that preemption is active
     allocator::enable_preemption_safe_alloc();
@@ -1435,6 +1441,7 @@ fn run_async_main() -> ! {
     crate::bkl_profile::init();
 
     loop {
+        timer::NETPOLL_ITERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Profiler only: name the top-of-iteration housekeeping (heartbeat/pstats
         // logging, reclaim_terminated_slots, bkl_profile::maybe_dump) separately from
         // the smoltcp drain and herd polling below it, so a `netpoll` measurement

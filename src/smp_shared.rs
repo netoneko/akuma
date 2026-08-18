@@ -947,7 +947,9 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
     // Bring up this PE's interrupt receive path, install shared vectors, arm the tick.
     secondary_gic_init(core);
     set_shared_vbar();
-    crate::timer::enable_timer_interrupts(crate::config::TIMER_INTERVAL_US);
+    // Arm this core's periodic tick from the shared choice (BSP's probe /
+    // override result, published via akuma-timer's registry).
+    crate::timer::enable_timer_interrupts(crate::timer::current_tick_us());
 
     // Unmask IRQs: from here the timer tick drives this core's scheduler.
     // The `isb` matters here specifically: this is the first time this core takes

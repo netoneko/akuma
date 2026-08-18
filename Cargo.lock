@@ -14,9 +14,9 @@ dependencies = [
  "akuma-primitives",
  "akuma-rump",
  "akuma-terminal",
+ "akuma-timer",
  "akuma-vfs",
  "akuma-virtio",
- "arm_pl031",
  "embedded-io-async",
  "fdt",
  "smoltcp",
@@ -92,6 +92,13 @@ name = "akuma-terminal"
 version = "0.1.0"
 dependencies = [
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-timer"
+version = "0.1.0"
+dependencies = [
+ "arm_pl031",
 ]
 
 [[package]]

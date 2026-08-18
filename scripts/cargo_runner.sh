@@ -226,16 +226,6 @@ fi
 
 echo "[cargo_runner] -smp $SMP" >&2
 
-# AB-KNOB: runtime experiment knobs for the idle-CPU investigation, passed as a
-# fw_cfg file the guest reads at boot (src/knobs.rs). e.g.
-#   AKUMA_KNOBS="tick_us=2000 wfi=off" cargo run --release
-# Unset = compiled defaults. Temporary — remove with src/knobs.rs.
-FWCFG_KNOB_ARGS=()
-if [ -n "${AKUMA_KNOBS:-}" ]; then
-    FWCFG_KNOB_ARGS=(-fw_cfg "name=opt/akuma,string=${AKUMA_KNOBS}")
-    echo "[cargo_runner] knobs: ${AKUMA_KNOBS}" >&2
-fi
-
 exec qemu-system-aarch64 \
   -semihosting \
   -machine virt,gic-version=3 \
@@ -254,5 +244,4 @@ exec qemu-system-aarch64 \
   "${FB_ARGS[@]}" \
   "${SOUND_ARGS[@]}" \
   -kernel "$BIN" \
-  "${FWCFG_KNOB_ARGS[@]}" \
   "${GDB_ARGS[@]}"

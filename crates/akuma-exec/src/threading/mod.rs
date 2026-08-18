@@ -2936,6 +2936,9 @@ pub fn yield_now() {
 /// stop a racing timer tick from billing the halt. [`yield_now`] is still the
 /// cooperative give-up-the-CPU primitive; this is the complementary "there is
 /// nothing to do, so genuinely stop" primitive for idle loops.
+// AB-PROBE: WFI entries. Remove before landing.
+pub static PROBE_WFI: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 #[cfg(target_os = "none")]
 pub fn idle_halt() {
     let tid = current_thread_id();
@@ -2952,6 +2955,7 @@ pub fn idle_halt() {
     // reschedules immediately. The watchdog (100 ms WARN) tolerates a ≤1-tick
     // (~10 ms) disabled window.
     disable_preemption();
+    PROBE_WFI.fetch_add(1, Ordering::Relaxed); // AB-PROBE
     let entered = (runtime().uptime_us)();
     // Real shared-kernel SMP: an idle core must not hold the Big Kernel Lock while
     // halted, or peer cores can't enter the kernel. Drop it before WFI; the IRQ that
