@@ -5,7 +5,9 @@
 **works at SMP=4 with the 2026-08-18 scheduler fix** (1 ms tick + wake-deadline
 preemption) and **degrades badly without it** (BKL storm, bulk download never
 completes). Single run per arm, one confound (below) — treat as a strong
-signal, not a settled result.
+signal, not a settled result. A second half, added the same day, answers
+whether the **fiber backend should be replaced by real threads** or its
+context switch folded into `akuma-exec` — code analysis, not a rebuild.
 **Written because:** the scheduling audit
 ([`SCHEDULING_INVESTIGATION.md`](SCHEDULING_INVESTIGATION.md)) shipped a
 profile-gated tick with rump as its named open risk, and the tick's owner
@@ -117,6 +119,111 @@ For balance: `akuma-net`/smoltcp is not a tuned stack either, and carries
 suspected allocation issues on its hot paths. The rump-vs-smoltcp ratios above
 are "two unoptimised stacks compared", not "rump against a good baseline".
 
+## Would threads beat fibers? Would folding the switch into `akuma-exec` help?
+
+Asked after the SMP=4 result above, since both premises the fiber backend was
+chosen under have since changed. Answers from the code, not from a rebuild —
+nothing here was measured today.
+
+### The context switch is not the cost
+
+`akfiber_switch` (`rumpuser/src/fiber.rs:503-520`, seeded by `akctx_make` at
+`:184`) saves 22 callee-saved registers and swaps SP, entirely in userspace:
+no syscall, no exception entry, no TTBR/ASID change. That is tens of
+nanoseconds against a **~20 ms** proxied round-trip — call it 0.0001 % of the
+cost.
+
+So **folding the switch into `akuma-exec` would make rump slower, not
+faster.** Every switch would become a syscall plus exception entry plus a
+kernel scheduling decision, and it would put rump's cooperative semantics
+(fibers that assume they run until they yield) on a preemptive scheduler that
+does not share them. The kernel's useful contribution to this path is **wake
+delivery**, not switching — which is what the 2026-08-18 tick + wake-preemption
+change already improved, and what the `poll()`-on-the-channel-fd design
+(`poll_fd_waiters`, `:450`) is built to exploit.
+
+### `ncpu = 1` is the structural blocker for threads
+
+`rumpuser_getparam` returns `_RUMPUSER_NCPU = "1"`
+(`rumpuser/src/lib.rs:377`). The NetBSD kernel inside `rump_server` therefore
+has **one virtual CPU**, and its own scheduler hands that vCPU to one lwp at a
+time. Nineteen OS threads contending for one virtual CPU is exactly the futex
+storm that was measured when the pthread backend was retired
+([`FIBER_HANDOFF.md`](FIBER_HANDOFF.md)): `clone`/`futex` **20 / 2606** vs
+**0 / 0**, `curl` **62.8 s → 16.3 s**, OS threads **19 → 1**.
+
+So reverting to pthreads *by itself* re-buys the storm. Two things have
+changed since that measurement, and it is worth being precise about which:
+
+- **Changed:** the scheduler-latency component. A woken thread now gets the
+  CPU *next* at ~1 ms, instead of waiting a ~35 ms round-robin pass. Three
+  fiber-only workarounds would also disappear — the `rump_server` park loop,
+  the `sp_serve_fd.c` `pthread_cond_*` redirect (which exists *only* because
+  one blocking OS thread deadlocks the fiber scheduler), and the receiver's
+  `poll(0)` + yield loop (`FIBER_HANDOFF.md` items 1-3).
+- **Unchanged:** the serialization. `ncpu = 1` means no amount of OS-thread
+  parallelism reaches the NetBSD kernel.
+
+### The configuration nobody has tried
+
+Fibers and `ncpu > 1` are **mutually exclusive by construction** — one OS
+thread cannot occupy four virtual CPUs. So "should we go back to threads" is
+really *"do we want rump to use more than one core"*, and that question only
+became askable once rump ran multi-core at all, which first happened in the
+run documented above.
+
+The untried configuration is:
+
+    _RUMPUSER_NCPU=4  +  pthread backend  +  Akuma SMP=4  +  1 ms tick
+
+Every one of those four preconditions is new or newly verified. The pthread
+backend is still live behind `--no-default-features`
+(`rumpuser/Cargo.toml`); `docker-build-rump-server.sh` rebuilds and relinks
+the binary.
+
+**Snag if you try it:** the comment at `rumpuser/src/lib.rs:365` says a set
+`RUMP_NCPU` wins, but the code does `getenv(name)` on the *param* name, so the
+variable it actually reads is `_RUMPUSER_NCPU`. NetBSD's own librumpuser maps
+`RUMP_NCPU` → `_RUMPUSER_NCPU`; this port does not. **Setting `RUMP_NCPU=4`
+today silently does nothing.**
+
+### The tick change exposed the fiber scheduler's own quantization
+
+The fiber scheduler's entire time base is **integer milliseconds**: `now()`
+truncates `clock_gettime` to ms (`fiber.rs:387-392`), `poll()` timeouts are
+ms, and the idle fallback is a ms-granularity `nanosleep` (`schedule()`,
+`:623`). That rounding was invisible when a 1 ms sleep cost 35 ms — it was
+noise on top of a far larger floor. Now that a 1 ms sleep costs 1.01 ms, the
+fiber scheduler's own quantization is a **co-dominant term**, not a rounding
+error. Sub-ms rump latency needs `now()` in µs regardless of which threading
+backend wins.
+
+### An exact analogue of the fix that worked
+
+`fiber.rs:355` defines `const WAKE_LOCALITY_HINT: bool = false` — a run-next
+hint for the fiber a wakeup targeted, with the machinery present in
+`schedule()` (the `hint` branch) and **compiled out**. That is the same
+mechanism, under nearly the same name and in the same disabled state, as the
+kernel's `WAKEUP_LOCALITY_HINT`, whose fix on 2026-08-18 was to arm it from
+the one path that never set it. Whether the fiber version has the same
+untapped win is unknown; it is a one-const experiment.
+
+Related and already disproved, so nobody re-tries it: `EAGER_FD_POLL`
+(`fiber.rs:380`, also `false`) polls fd-waiters on every scheduling decision.
+Measured 2026-07-19 — `poll` calls 1892 → 20124, idle CPU ~1 % → 13-26 %,
+best-case latency 288 → 216 ms, **median unchanged**. The in-code comment says
+to rate-limit or debounce it if ever revisited.
+
+### Recommendation
+
+Do not drop rump on today's evidence, and do not build anything speculative —
+run the one experiment. If rump cannot beat its own single-vCPU fiber numbers
+with four virtual CPUs, four real cores, and a scheduler that wakes in 1 ms,
+then "rump on 1 vCPU is a fool's errand" becomes a measured conclusion with a
+receipt rather than a hunch, and the support can be removed on that basis.
+Roughly an hour of work; either outcome settles a question that has been open
+since July.
+
 ## Not done
 
 - **HTTPS A/B across the two ticks.** A `https` probe (curl timing breakdown:
@@ -126,6 +233,10 @@ are "two unoptimised stacks compared", not "rump against a good baseline".
   about interactive rump behaviour under the new tick.
 - **A 10 ms SMP=1 rump arm** — the third point that would separate "the tick"
   from "rump has never seen more than one core".
+- **The `_RUMPUSER_NCPU=4` + pthread-backend experiment** described above —
+  the decide-or-drop measurement.
+- **`WAKE_LOCALITY_HINT` in the fiber scheduler** — one const, directly
+  analogous to the kernel fix that worked.
 - **Re-run of the base arm on AC.**
 - Root-causing the `tag=511` storm itself.
 
@@ -138,6 +249,9 @@ are "two unoptimised stacks compared", not "rump against a good baseline".
   sysproxy path is scheduler-latency-bound.
 - [`RUMP_LATENCY_SLEEP_FIX.md`](RUMP_LATENCY_SLEEP_FIX.md) — the disproved
   heartbeat theory ("don't re-try this").
+- [`FIBER_HANDOFF.md`](FIBER_HANDOFF.md) — why the pthread backend was retired
+  (`curl` 62.8 → 16.3 s, threads 19 → 1, `clone`/`futex` 20/2606 → 0/0) and the
+  three fiber-only workarounds it required.
 - [`RUMP_PLUS_HERD.md`](RUMP_PLUS_HERD.md), [`RUMP_SYSPROXY.md`](RUMP_SYSPROXY.md),
   [`PHASE01_BUILDRUMP.md`](PHASE01_BUILDRUMP.md), [`PHASE2_RUMPUSER.md`](PHASE2_RUMPUSER.md).
 - [`../../acceptance/11_netbsd_rumpkernel_irc.md`](../../acceptance/11_netbsd_rumpkernel_irc.md).
