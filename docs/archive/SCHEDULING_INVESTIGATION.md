@@ -1,7 +1,15 @@
 # Terminal stutter: every short sleep costs a full round-robin pass
 
 **Date:** 2026-08-17/18
-**Status:** **FIXED 2026-08-18** — two changes landed:
+**Status:** **REOPENED 2026-08-18** — real-world nca use shows this is
+**not fixed**: freezes are still present after the landed changes, and
+appear to get *worse*, not better, when network traffic and terminal
+rendering happen concurrently. See
+[Post-fix: nca still freezes](#post-fix-nca-still-freezes-2026-08-18) below.
+The probe-driven results below were real, but did not transfer to actual nca
+usage — the workload the probes model is apparently not the one that
+matters. Original status text, kept for the record:
+**FIXED 2026-08-18** — two changes landed:
 `WAKE_DEADLINE_PREEMPT` in `crates/akuma-exec/src/threading/mod.rs` (the
 deadline wake-pass arms the existing `PREEMPT_WAKE_TID` run-next hint) and
 `TIMER_INTERVAL_US` 10 000 → 1 000, **profile-gated**: `extreme-size` keeps
@@ -445,6 +453,31 @@ treat that constant as unverified rather than load-bearing — and note that
 after the fix, the 1 ms `TIMER_INTERVAL_US` finally gives that knob the
 sub-10 ms cadence it always assumed it had.
 
+## Post-fix: nca still freezes (2026-08-18)
+
+After `WAKE_DEADLINE_PREEMPT` + the 1 ms tick landed, real-world use of `nca`
+(the terminal-rendering client this investigation was originally chasing)
+still shows the freeze/stutter symptom. This contradicts the "FIXED" verdict
+above, which was based entirely on `ncaprobe` synthetic workloads
+(`sleepbench`, `termbench`, `pipebench`) and the full-matrix A/B, not on nca
+itself.
+
+Observed: freezes appear to get **worse**, not better, when network traffic
+and terminal rendering happen **at the same time** — i.e. concurrent
+sshd-forwarded traffic plus active screen redraw is the trigger, not either
+alone. This is consistent with the fixed round being *shorter* in isolation
+but the round still growing under combined load (more runnable threads →
+longer round, [§2](#2-the-floor-scales-with-runnable-threads)), or with a
+different mechanism entirely that the probes never modeled — the probes
+exercise sleep/pipe/terminal paths independently, not simultaneously under
+real sshd + nca traffic patterns.
+
+Not yet root-caused. Nothing here has been reverted. Next steps: reproduce
+under nca itself (not `ncaprobe`) with traffic and rendering concurrent,
+capture `PSTATS` and BKL contention during a live freeze, and check whether
+this is the same "expired sleepers join the back of the round-robin queue"
+mechanism at a different multiplier, or a distinct bug the fix didn't touch.
+
 ## What is still open
 
 1. **Full in-VM kernel-build A/B** (`scripts/run_selfhost_kernelbuild.py`,
@@ -452,9 +485,12 @@ sub-10 ms cadence it always assumed it had.
    `hello` crate was flat (single CPU-bound rustc run, no pipe traffic);
    the multi-crate build is where round-trip savings should appear, and it
    is the last veto-class workload nobody re-measured. ~30+ min per arm.
-2. **Rump** — deferred by its owner. With the 1 ms tick now default on
-   non-extreme profiles, re-verify the rump devbox end to end; the author's
-   10-ms-for-rump recollection is the open question the profile gate hedges.
+2. **Rump** — partly answered on 2026-08-18 at SMP=4 (item 7 below,
+   [`RUMP_ON_SMP.md`](RUMP_ON_SMP.md)), where the 10 ms arm is the one that
+   fails. Still owed: the same comparison at **SMP=1**, rump's historical
+   configuration and the one the "10 ms was chosen for rump" recollection
+   refers to. Until that exists, the profile gate hedges a risk that has
+   been contradicted at 4 cores and never tested at 1.
 3. **Tick sweep** (500 µs / 2 ms / 5 ms) on the best and worst rows — is
    2 ms as good as 1 ms at half the interrupts? The knee was never found.
 4. **`extreme-size` on a 1 ms tick** — **DEFERRED by decision, 2026-08-18.**
@@ -522,6 +558,12 @@ sub-10 ms cadence it always assumed it had.
    combination — but the direction is the opposite of the feared one.
    Remaining: the HTTPS A/B (probe wired, unrun), a 10 ms SMP=1 third point,
    and an AC re-run.
+8. **nca still freezes with the fix landed** — **new, top priority.** See
+   [Post-fix: nca still freezes](#post-fix-nca-still-freezes-2026-08-18).
+   Real nca usage, not `ncaprobe`, still stutters, and appears to worsen
+   specifically when traffic and terminal rendering overlap. Unlike items
+   1-7, this calls into question whether the fixed mechanism was the actual
+   cause of the symptom nca users see, not just an untested axis.
 
 ### Running the workloads
 
