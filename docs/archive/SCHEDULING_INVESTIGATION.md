@@ -457,10 +457,45 @@ sub-10 ms cadence it always assumed it had.
    10-ms-for-rump recollection is the open question the profile gate hedges.
 3. **Tick sweep** (500 µs / 2 ms / 5 ms) on the best and worst rows — is
    2 ms as good as 1 ms at half the interrupts? The knee was never found.
-4. **`extreme-size` on a 1 ms tick** — unmeasurable with the current probe
-   (memory floor; see Matrix B note in the Resolution). If a smaller probe
-   or an in-image build ever makes it measurable and it shows no cost, drop
-   the profile gate and use 1 ms everywhere.
+4. **`extreme-size` on a 1 ms tick** — **DEFERRED by decision, 2026-08-18.**
+   The profile keeps 10 ms; the gate in `src/config.rs` stays. This is a
+   deliberate hold, not an oversight: the case for flipping is real but
+   entirely inferential, and nobody wanted to spend the boots today.
+
+   *The case for flipping, when someone picks this up:*
+
+   - `extreme-size` is **SMP=1**, and the one measured cost of the 1 ms tick
+     (bulk throughput, ~2×) appeared only at **SMP=4**. At SMP=1 the 1 ms
+     arm was *better* on throughput too — 128 MB download 6.27 → 3.40 s.
+   - The axis where 10× the interrupt rate should hurt most is CPU-bound
+     work, and there the 1 ms tick won at SMP=1 as well
+     ([§4](#4-what-the-1-ms-tick-costs-nothing-measurable-and-it-helps):
+     `md5sum` 1.27 / 2.23 s → 0.48 s).
+   - Extreme currently runs the **B-arm configuration** — 10 ms tick *with*
+     `WAKE_DEADLINE_PREEMPT` — which measured a **~14.7 ms** sleep floor. It
+     is the only profile still paying a floor an order of magnitude above
+     the rest of the matrix.
+
+   *Why it is not a foregone conclusion:*
+
+   - Extreme is not "release with less RAM". It builds
+     `--features no-tests,smoltcp,extreme,userspace-sshd`, i.e. **no
+     `sc-epoll`**. `pollbench` is therefore structurally unmeasurable there,
+     and userspace sshd's polling path — the consumer this whole
+     investigation started from — is a *different* path on that profile.
+     The mechanism the fix exploits may not behave the same way.
+   - The real risk is interrupt overhead on a small, slow single core. That
+     is a CPU cost, not a memory one, so the 4 MB floor is not what is in
+     danger; throughput is.
+
+   *The experiment that would settle it* (~4 boots, ~30 min): the blocker
+   was never the tick, it was the probe — 1.2 MB of binary plus a 2 MB heap
+   does not fit a 4-8 MB box. Boot the **extreme kernel at 32 MB** (a
+   scheduler test, explicitly not a floor test) and A/B `sleepbench` +
+   `pipebench` + a CPU-bound `busybox time` run across both ticks; then one
+   **4 MB functional boot per tick** (ssh up, fork + exec rounds, 0 OOM,
+   idle heartbeat cadence) to confirm the floor is unaffected. If that comes
+   back clean, drop the gate and use 1 ms everywhere.
 5. ~~**SMP=4 `[BKL] stuck` count**~~ — **closed 2026-08-18.** The 10 ms
    baseline logged **96** lines to the fixed arm's **93** under the same
    load. Contention noise, unrelated to the tick or the wake hint.
