@@ -9,20 +9,20 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 632
-- **Docs contributing at least one fix:** 201
+- **Total distinct fixes counted:** 634
+- **Docs contributing at least one fix:** 202
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 127 | 20.1% | 17 |
+| Syscall / ABI Compatibility Audits | 127 | 20.0% | 17 |
 | Memory & Virtual Memory | 112 | 17.7% | 34 |
 | Scheduler & Process Management | 76 | 12.0% | 19 |
-| SMP & Locking | 79 | 12.5% | 34 |
-| Networking | 37 | 5.9% | 15 |
-| Userspace Apps & Libraries | 37 | 5.9% | 20 |
-| Rump Kernel & Syscall Proxy | 25 | 4.0% | 6 |
-| Toolchain & Self-Hosting | 37 | 5.9% | 5 |
+| SMP & Locking | 81 | 12.8% | 35 |
+| Networking | 37 | 5.8% | 15 |
+| Userspace Apps & Libraries | 37 | 5.8% | 20 |
+| Rump Kernel & Syscall Proxy | 25 | 3.9% | 6 |
+| Toolchain & Self-Hosting | 37 | 5.8% | 5 |
 | SSH | 15 | 2.4% | 13 |
 | VFS & Filesystem | 16 | 2.5% | 11 |
 | Boot & Drivers | 11 | 1.7% | 6 |
@@ -30,7 +30,7 @@ from several subsystems under one write-up.
 | Misc / Cross-cutting | 14 | 2.2% | 4 |
 | Console & Terminal | 15 | 2.4% | 7 |
 | Containers | 19 | 3.0% | 5 |
-| **Total** | **632** | **100.0%** | **201** |
+| **Total** | **634** | **100.0%** | **202** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -472,7 +472,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - Expired sleepers/pollers rejoined the back of the round-robin queue instead of running next, and the 10 ms timer tick meant every sleep/poll deadline paid a full round (~35 ms floor at SMP=1, ~13 ms more per additional runnable thread) — measured as terminal output forwarded in ~27 Hz bursts; fixed via `WAKE_DEADLINE_PREEMPT` (arms the existing `PREEMPT_WAKE_TID` run-next hint from the deadline wake-pass instead of only from `ThreadWaker::wake`) plus dropping `TIMER_INTERVAL_US` 10 000→1 000, profile-gated (`extreme-size` keeps 10 ms) — A/B'd clean on release SMP=1/SMP=4, the 4 MB extreme-size floor, and devbox-smoltcp SMP=4
 
 
-## SMP & Locking (79 fixes, 34 docs)
+## SMP & Locking (81 fixes, 35 docs)
 
 ### docs/archive/SMP_GO_STRESS_CORRUPTION_FIX.md
 (standalone writeup of the same 2026-07-22 investigation SMP_SHARED.md's own
@@ -623,6 +623,10 @@ aren't recorded anywhere else.)
 
 ### docs/archive/SMP_SECONDARY_IDLE_STACK_CANARY.md
 - Every `SMP=N>1` boot printed `SMP-1` false `[STACK-OVERFLOW]` reports: `adopt_current_as_core_idle` registered each secondary's static `.bss` boot stack in the pool but never painted a canary on it, and the sweep cannot tell an unpainted canary from a smashed one — which also left those per-core idle stacks permanently un-monitorable, since the reporter latches per slot on `base`; fixed by painting the canary where the stack is registered (closes `DEVBOX_ISSUES.md` Issue 11)
+
+### docs/archive/SMP_SECONDARY_TICK_KILLED_BY_WFI_PROBE.md
+- The boot-time host-WFI probe permanently disarmed every *secondary* core's virtual timer: IRQ 27 is a per-CPU PPI but `irq::register_handler` writes one shared dispatch table, so each secondary's periodic tick landed in `probe_irq_nop` → `akuma_timer::disarm()`, and a secondary arms its tick exactly once at bringup with nothing to re-arm it — cores came online then sat in WFI forever with all work on core 0 (`smp_shared_{scheduler,userspace,migration}` FAILED, `core1=0`); fixed by publishing the probing core in a `PROBING_CORE` atomic so only that core disarms and a secondary re-arms and returns
+- The eight `preempt::tests` all operated on thread slot 0 (host builds report tid 0 for every thread) while `cargo test` ran them in parallel, so one test's `disable_preemption`/`scrub_slot` corrupted another's counter under load — and the resulting panic aborted the crate's run, truncating the host suite to 482 tests and masquerading as a commit having disabled tests; fixed by serializing the six state-touching tests behind a poison-recovering `Mutex` that scrubs slot 0 on both acquire and drop
 
 ### docs/archive/SMP_ADOPTED_IDLE_SLOT_CLOBBER.md
 - `threading::init` stored `FREE` over the `RUNNING` state of thread slots secondary cores had already adopted (self-test image brings secondaries up before init), handing live slots back to the allocator for the next `claim_free_slot` to hand out a second time — fixed by skipping adopted core-idle slots in the state-reset loop
