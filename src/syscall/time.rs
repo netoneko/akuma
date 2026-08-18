@@ -34,7 +34,7 @@ struct LocalItimerval {
 }
 
 /// Check and fire expired ITIMER_REAL timers. Called from the timer tick
-/// (`kernel_timer::on_timer_interrupt`). Sends SIGALRM (14) to each thread
+/// (`akuma_exec::alarms::on_timer_interrupt`). Sends SIGALRM (14) to each thread
 /// whose deadline has passed.
 ///
 /// Runs in timer-IRQ context on whichever core took the interrupt — "current

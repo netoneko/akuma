@@ -831,20 +831,17 @@ pub const ENABLE_IRQ_DEBUG_PRINTS: bool = false;
 pub const SHELL_PS_DEBUG: bool = false;
 
 // Timer interval in microseconds
-// Scheduler preemption tick. 3 ms since 2026-08-18: with wake-deadline
-// preemption (WAKE_DEADLINE_PREEMPT in akuma-exec) this keeps the measured
-// wins of the 1 ms arm (sleep/poll floors ~1 tick, pipe round-trip, zero
-// terminal stalls — docs/archive/SCHEDULING_INVESTIGATION.md, Matrix A) while
-// staying above the host WFI floor. Under QEMU HVF on darwin/arm64 the host
-// declines to sleep vCPU threads for deadlines below ~2.5 ms, which turns the
-// idle loops' WFI into a no-op and burns one saturated host core per guest
-// core at tick<=2ms (100% at SMP=1, 330% at SMP=4) vs ~1.6% at 3 ms
-// (docs/archive/CPU_LOAD_REGRESSION_INVESTIGATION.md). The floor is an
-// undocumented HVF heuristic and can move; a self-tuning ticker (boot probe +
-// runtime demotion) is planned to replace this constant — see that doc's fix
-// options. Gate: scripts/measure_idle_cpu.py (verify-trim-fat-change.md).
+// Scheduler preemption tick — the FALLBACK value. At boot the host WFI probe
+// (akuma-timer's pick_tick, wired in src/timer.rs::probe_host_tick) measures
+// which intervals this host actually honours and overrides this: under QEMU
+// HVF on darwin/arm64 the host declines to sleep vCPU threads below ~2.5 ms,
+// which turns the idle loops' WFI into a no-op and burns one saturated host
+// core per guest core (100% at SMP=1, 330% at SMP=4) vs ~5.6% at 3 ms
+// (docs/archive/AKUMA_TIME_EXTRACTION.md). A runtime governor demotes further
+// if the host's behaviour changes after boot. Keep this at 3 ms (the measured
+// HVF-safe floor) so a disabled probe still boots cheap.
 // extreme-size keeps the old 10 ms: a 4 MB single-core box pays for every
-// interrupt and has no sc-epoll, and the 1 ms arm is unvalidated there.
+// interrupt and has no sc-epoll, and short ticks are unvalidated there.
 #[cfg(not(kernel_profile_extreme))]
 pub const TIMER_INTERVAL_US: u64 = 3_000;
 #[cfg(kernel_profile_extreme)]

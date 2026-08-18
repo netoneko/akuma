@@ -15,7 +15,7 @@ use spinning_top::Spinlock;
 /// duplicate stayed invisible to a grep — and `akuma-exec/src/sync.rs` carried a
 /// third, barrier-less DAIF implementation beside them. One now, with the `isb`
 /// difference documented and preserved.
-pub use akuma_primitives::irq::{IrqGuard, with_irqs_disabled};
+pub use akuma_primitives::irq::with_irqs_disabled;
 
 /// Unbalanced IRQ mask/unmask, re-exported under this crate's historical names.
 ///

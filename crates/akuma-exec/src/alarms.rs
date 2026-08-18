@@ -1,15 +1,23 @@
-//! Kernel async timer primitives for bare-metal aarch64
+//! Async alarm queue for futures ("make this `Waker` runnable at time T").
 //!
-//! Replaces Embassy's time driver with a minimal implementation built directly
-//! on the ARM Virtual Timer (CNTV). Provides:
-//! - `with_timeout()` -- wrap a future with a deadline
-//! - `Timer::after()` -- async delay
-//! - `Duration` -- minimal duration type
+//! A minimal Embassy-time-driver replacement, extracted from the bin crate
+//! (`src/kernel_timer.rs`, 2026-08-18): this is glue over the exec/scheduler —
+//! it parks async wakers against deadlines and is serviced by the scheduler
+//! tick ISR's call to [`on_timer_interrupt`]. It owns no timer hardware: the
+//! deadline register (CNTV_CVAL) belongs to the scheduler tick
+//! (`src/timer.rs` + `akuma-timer`), so alarm resolution equals the tick.
+//! Registering a deadline does not re-arm the hardware — see
+//! [`update_hardware_timer`].
 //!
-//! Uses the VIRTUAL timer (CNTV, IRQ 27) to avoid conflict with the scheduler
-//! which uses the physical timer (CNTP) for preemptive scheduling.
+//! The pre-extraction split (hardware + policy in `crates/akuma-timer`,
+//! scheduler ISR in `src/timer.rs`, waker queue here) and the unification
+//! plan (wake-pass consumes waker deadlines directly) are recorded in
+//! `docs/archive/AKUMA_TIME_EXTRACTION.md` and
+//! `docs/archive/TRIMMING_FAT_SCHEDULER.md`.
+//!
+//! Provides `Timer::after()` (async delay) and `Duration`; `with_timeout`
+//! was removed with Embassy.
 
-use core::arch::asm;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -27,11 +35,13 @@ pub struct Duration {
 }
 
 impl Duration {
+    #[inline]
     pub const fn from_secs(secs: u64) -> Self {
         Self { us: secs * 1_000_000 }
     }
 
 
+    #[inline]
     pub const fn as_micros(&self) -> u64 {
         self.us
     }
@@ -47,15 +57,14 @@ impl Duration {
 // Current time
 // ============================================================================
 
-/// Get current time in microseconds (from the virtual counter).
+/// Get current time in microseconds since boot.
 ///
-/// Delegates to the extracted `akuma-timer` crate — this file used to carry
-/// its own private copy of the CNTVCT/CNTFRQ access (a duplicate of
-/// `src/timer.rs`'s, two owners of one hardware seam). Same semantics:
-/// microseconds since boot.
+/// Delegates to the registered runtime's `uptime_us` hook — same source as
+/// the scheduler's wake-pass. (The pre-extraction copy carried its own CNTV
+/// access; two owners of one hardware seam.)
 #[inline]
 pub fn now_us() -> u64 {
-    akuma_timer::uptime_us()
+    (crate::runtime::runtime().uptime_us)()
 }
 
 // ============================================================================
@@ -95,7 +104,7 @@ pub fn schedule_wake(at_us: u64, waker: &Waker) {
     // Callers run in ordinary EL1 code with IRQs enabled, so mask them for the hold —
     // otherwise the timer IRQ firing on this same core while we hold the lock would
     // have `on_timer_interrupt` spin forever on a `Spinlock` this core already owns.
-    let _irq_guard = crate::irq::IrqGuard::new();
+    let _irq_guard = crate::runtime::IrqGuard::new();
     let mut queue = ALARM_QUEUE.lock();
 
     // Find a slot - prefer empty slots or replace matching waker
@@ -147,6 +156,7 @@ fn update_hardware_timer(_queue: &[ScheduledWake; QUEUE_SIZE]) {}
 /// deadlocks or increased interrupt latency. No `IrqGuard` needed here: this runs from
 /// IRQ context, where the CPU has already masked IRQs on this core since exception
 /// entry (BKL Phase 7a — this queue no longer needs the BKL to be safe cross-core).
+#[inline]
 pub fn on_timer_interrupt() {
     let now = now_us();
 
@@ -176,7 +186,7 @@ pub fn on_timer_interrupt() {
     }
 
     // Check ITIMER_REAL / alarm() expirations and deliver SIGALRM.
-    crate::syscall::check_itimers();
+    (crate::runtime::runtime().check_itimers)();
 }
 
 // ============================================================================
@@ -188,23 +198,24 @@ pub fn on_timer_interrupt() {
 /// Wakes any cores waiting in WFE.
 #[inline(always)]
 pub fn signal_wake() {
-    unsafe { asm!("sev") }
+    #[cfg(target_os = "none")]
+    unsafe { core::arch::asm!("sev") }
+    #[cfg(not(target_os = "none"))]
+    {}
 }
 
 // ============================================================================
 // Initialization
 // ============================================================================
 
-/// Initialize the kernel timer subsystem.
-/// Call early in boot, before using any async timer functionality.
-pub fn init() {
-    // Disable the virtual timer until alarms are set.
-    // We use CNTV to avoid conflict with CNTP (scheduler).
-    unsafe {
-        asm!("msr cntv_ctl_el0, {}", in(reg) 0u64);
-    }
-    crate::console::print("[KernelTimer] Initialized (CNTV)\n");
-}
+/// Initialize the alarm queue.
+///
+/// The pre-extraction version disabled CNTV here ("until alarms are set") —
+/// but CNTV belongs to the scheduler tick, which `src/timer.rs` arms
+/// separately and later; nothing here ever arms or owns it. The only state
+/// is the statically initialized queue, so this is deliberately empty and
+/// kept only as the boot-sequence marker.
+pub fn init() {}
 
 // ============================================================================
 // with_timeout

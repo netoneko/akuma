@@ -137,6 +137,10 @@ pub struct ExecRuntime {
 
     // Syscall helpers
     pub futex_wake: fn(u32, usize, i32),
+    /// ITIMER_REAL / alarm() expiry check + SIGALRM delivery, riding the tick
+    /// ISR (called from `alarms::on_timer_interrupt`). A hook because itimer
+    /// state lives in the bin crate's syscall layer.
+    pub check_itimers: fn(),
     pub pipe_close_write: fn(u32),
     pub pipe_close_read: fn(u32),
     pub pipe_clone_ref: fn(u32, bool),

@@ -2644,7 +2644,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     // BKL-free device-IRQ dispatch (Phase 7a, docs/archive/BKL_PHASE7_AUDIT.md §2.3/§5).
     // The timer is the only device IRQ this kernel registers
     // (`irq::register_handler(27, timer::timer_irq_handler)`), and its handler
-    // (`kernel_timer::on_timer_interrupt`'s alarm queue, the preemption watchdog, the
+    // (`akuma_exec::alarms::on_timer_interrupt`'s alarm queue, the preemption watchdog, the
     // scheduler-SGI trigger) no longer touches anything the BKL alone protects: the
     // alarm queue has its own `Spinlock`, the watchdog reads are per-thread atomics, and
     // `trigger_sgi_self`/GIC ack/EOI are raw MMIO. Unlike the M5c fast path above, this

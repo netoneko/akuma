@@ -46,14 +46,13 @@ mod console;
 #[cfg(kernel_tests)]
 mod daif_tests;
 // mod embassy_net_driver;
-// mod embassy_time_driver; // replaced by kernel_timer
+// mod embassy_time_driver; // replaced by akuma_exec::alarms
 // mod embassy_virtio_driver;
 mod exceptions;
 mod file_page_cache;
 // fw_cfg exists to configure ramfb, so it follows the framebuffer gate.
 #[cfg(feature = "sc-framebuffer")]
 mod fw_cfg;
-mod kernel_timer;
 mod fs;
 #[cfg(kernel_tests)]
 mod fs_tests;
@@ -474,6 +473,8 @@ pub(crate) fn build_exec_runtime(
         #[cfg(not(feature = "rump"))]
         rump_socket_clone_ref: noop_u64_i32,
         futex_wake: crate::syscall::futex_wake,
+        // ITIMER_REAL/alarm() expiry check, riding the tick ISR (alarms module).
+        check_itimers: crate::syscall::check_itimers,
         pipe_close_write: crate::syscall::pipe::pipe_close_write,
         pipe_close_read: crate::syscall::pipe::pipe_close_read,
         pipe_clone_ref: crate::syscall::pipe::pipe_clone_ref,
@@ -891,7 +892,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     }
 
     // Initialize kernel timer (CNTV alarm queue for async timeouts)
-    kernel_timer::init();
+    akuma_exec::alarms::init();
 
     // Check timer hardware
     let freq = timer::read_frequency();
@@ -1704,7 +1705,7 @@ async fn memory_monitor() -> ! {
         }
     }
     use core::fmt::Write;
-    use crate::kernel_timer::{Duration, Timer};
+    use akuma_exec::alarms::{Duration, Timer};
 
     // `console::StackWriter`, not a local `struct Buf([u8; N], usize)` + `impl
     // Write`: that hand-rolled shape is the one `docs/reference/subsystems/console.md`

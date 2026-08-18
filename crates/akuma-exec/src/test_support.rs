@@ -98,6 +98,7 @@ pub fn ensure_test_runtime() {
         socket_clone_ref: |_| {},
         rump_socket_clone_ref: |_, _| {},
         futex_wake: |_, _, _| {},
+        check_itimers: || {},
         pipe_close_write: |_| {},
         pipe_close_read: |_| {},
         pipe_clone_ref: |_, _| {},

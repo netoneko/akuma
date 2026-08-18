@@ -112,11 +112,17 @@ ThinLTO only saves explicitly-marked callees):
 
 **`src/timer.rs` stays** (fused to the bin crate, cannot move):
 
-- `timer_irq_handler` — re-arm, `kernel_timer::on_timer_interrupt`,
+- `timer_irq_handler` — re-arm, `akuma_exec::alarms::on_timer_interrupt`,
   preemption watchdog, scheduler SGI (reaches `akuma_exec`/`gic`)
 - `probe_host_tick` + `probe_irq_nop` — the probe's GIC/DAIF dance is
   bin-crate wiring (register-handler swap around `pick_tick`)
 - `DateTime`/`utc_iso8601` presentation (allocates; console-facing)
+
+(The alarm-queue half, `src/kernel_timer.rs`, moved to
+`akuma_exec::alarms` in a follow-up the same day — it is glue over
+exec/scheduler, not timer hardware. See
+[`TRIMMING_FAT_SCHEDULER.md`](TRIMMING_FAT_SCHEDULER.md) for the unification
+plan that motivated it.)
 
 Call sites unchanged: ~190 `timer::uptime_us` re-export consumers, and
 secondary cores now arm from `timer::current_tick_us()` (the shared choice)
@@ -129,29 +135,43 @@ host, so behaviour is identical even if the probe were disabled). The 1 ms
 constant from commit `0e4ba1b9` is gone: it was strictly worse on this host
 and the probe recovers it automatically on hosts that honour short WFIs.
 
-## Temporary, still in tree (remove before landing the branch)
+## Temporary instrumentation (removed at branch finalization)
 
-- `src/timer.rs` TICKPROBE block (`PROBE_TICKS`/`PROBE_LAST_ENTRY`/
-  `PROBE_BODY_SUM`/`PROBE_PERIOD_SUM` + the print). The `NETPOLL_ITERS`
-  sensor and governor call are permanent.
-- `akuma_exec::threading::PROBE_WFI` (`idle_halt` entry counter).
-- Fixed `PROBE_WFI`'s cfg-theft of `idle_halt` (the static was inserted
-  between `#[cfg(target_os = "none")]` and its fn, silently un-gating it —
-  found by the pre-commit hook's host clippy pass, E0428).
+The measurement scaffolding that produced the numbers above — the TICKPROBE
+block (tick/period/body sums + print) in `src/timer.rs` and the
+`threading::PROBE_WFI` idle-halt counter — was removed once the design was
+validated. What survived it, permanently: the `timer::NETPOLL_ITERS` sensor
+and the governor call in the ISR (silent unless demoting), and the
+`[Timer] host WFI probe: tick = N us` boot line. Also removed in the same
+pass: `PROBE_WFI`'s cfg-theft of `idle_halt` (the static had been inserted
+between `#[cfg(target_os = "none")]` and its fn, silently un-gating it —
+found by the pre-commit hook's host clippy pass, E0428).
 
 ## Open items
 
 1. **One-shot/tickless idle** is the real endgame the investigation doc
    named: arm the timer at the earliest pending wake deadline, take zero
    interrupts when idle. `akuma-timer`'s `arm_oneshot_ticks` is the seam;
-   the natural next step is letting `kernel_timer`'s alarm queue own the
-   hardware deadline (replacing its intentionally-no-op
-   `update_hardware_timer`) and only falling back to a periodic tick when
-   threads are runnable.
+   the natural next step is letting the alarm queue (now
+   `akuma_exec::alarms`) own the hardware deadline (replacing its
+   intentionally-no-op `update_hardware_timer`) and only falling back to a
+   periodic tick when threads are runnable.
 2. Pessimistic-boot mitigation (re-probe failed candidates at end of boot)
    if CI-under-load machines ever hit it.
 3. `gic`/`gic_v3`/`ramfb`/`irq` extraction — the rest of the deferred-audit
    row, still not started, now unblocked pattern-wise by this crate.
+4. **Deferred: sweep manual `IrqGuard::new()` placements to
+   `with_irqs_disabled` closures** (raised during the alarms move, which
+   touched one). The two shapes do the same thing — mask IRQs across a
+   region — but the guard form scatters `let _guard = ...` bindings whose
+   drop point is the real end of the critical section, invisible at the
+   declaration site, and which miscompile the intent when rebound early or
+   moved. 42 sites today, 31 of them in `akuma-exec/src/mmu/mod.rs`, 7 in
+   `threading/mod.rs`, 3 in `process/mod.rs`, 1 in `alarms.rs`. The sweep is
+   mechanical per site but each drop-point must be read for what the guard
+   actually covers (the mmu ones guard page-table writes where a tick ISR
+   must not fault mid-update); do it as its own change with the boot suite +
+   `forktest_smp_matrix.py` as the gate, not as drive-by edits.
 
 ## Background
 

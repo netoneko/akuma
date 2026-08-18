@@ -99,6 +99,7 @@ pub mod memmath;
 #[path = "elf/mod.rs"]
 pub mod elf_loader;
 pub mod threading;
+pub mod alarms;
 pub mod process;
 #[path = "box_mod/mod.rs"]
 pub mod box_registry;

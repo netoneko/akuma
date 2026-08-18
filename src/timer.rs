@@ -7,7 +7,7 @@
 // remains here is fused to the bin crate and cannot move:
 //
 // - `timer_irq_handler` — the ISR: re-arms the periodic tick, services the
-//   `kernel_timer` alarm queue, runs the preemption watchdog, feeds the
+//   `akuma_exec::alarms` queue, runs the preemption watchdog, feeds the
 //   governor, and rings the scheduler SGI. All of that reaches akuma_exec.
 // - `probe_host_tick` — boot-time WFI probe wiring (GIC + DAIF dance around
 //   `akuma_timer::policy::pick_tick`).
@@ -47,26 +47,27 @@ pub fn current_tick_us() -> u64 {
     akuma_timer::tick_us(crate::config::TIMER_INTERVAL_US)
 }
 
-// AB-PROBE: tick-cost instrumentation. Remove before landing.
-pub static PROBE_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static PROBE_LAST_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static PROBE_BODY_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static PROBE_PERIOD_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 /// BSP idle/netpoll loop iterations — the runtime governor's spin sensor.
 /// Healthy: ~1 iteration per timer tick (the loop halts in WFI between ticks).
 /// Host that stopped honouring WFI: hundreds of thousands per window
 /// (measured ~1.8M/s at a 1 ms tick on the regression host). Incremented from
-/// the async-main loop (`main.rs`), read/swapped by the TICKPROBE block below.
+/// the async-main loop (`main.rs`), read/swapped by the governor block in the
+/// ISR below.
 pub static NETPOLL_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Governor observation cadence: every this-many ticks, feed the idle-loop
+/// iteration count to `akuma_timer::policy::governor_observe` and demote the
+/// tick if the host has stopped honouring WFI. 2000 ticks ≈ 2–6 s depending
+/// on the chosen tick.
+const GOVERNOR_WINDOW_TICKS: u64 = 2000;
+static GOVERNOR_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // Timer interrupt handler - called from IRQ handler
 pub fn timer_irq_handler(_irq: u32) {
-    let probe_entry = akuma_timer::read_counter();
     // Acknowledge interrupt by setting next compare value. The next deadline
     // is computed from the ENTRY counter (not post-work), so a handler that
-    // overruns its own interval shows up as a shortened period in TICKPROBE
-    // instead of silently collapsing the tick.
+    // overruns its own interval shortens the next period rather than
+    // silently collapsing the tick.
     let freq = akuma_timer::read_frequency();
     let interval_ticks = akuma_timer::ticks_from_us(freq, current_tick_us());
     let counter = akuma_timer::read_counter();
@@ -85,8 +86,8 @@ pub fn timer_irq_handler(_irq: u32) {
     // This periodic virtual-timer tick is the single hardware timer for the
     // kernel. Besides driving preemption (the scheduler SGI below), it services
     // the async alarm queue (SSH read timeouts, Timer::after) which no longer
-    // owns the timer hardware itself — see kernel_timer::update_hardware_timer.
-    crate::kernel_timer::on_timer_interrupt();
+    // owns the timer hardware itself — see akuma_exec::alarms::update_hardware_timer.
+    akuma_exec::alarms::on_timer_interrupt();
 
     // Check preemption watchdog - detect threads that hold preemption disabled too long
     if crate::config::ENABLE_PREEMPTION_WATCHDOG
@@ -134,28 +135,21 @@ pub fn timer_irq_handler(_irq: u32) {
     // table), so it must ring the CURRENT core's scheduler SGI, not the hardcoded PE0
     // that `trigger_sgi` targets — otherwise a secondary's tick would preempt the BSP.
     // On the BSP (aff0 = 0) `trigger_sgi_self` is equivalent to `trigger_sgi`.
-    // AB-PROBE
+    //
+    // Runtime governor (before the SGI so a demotion lands on this very tick's
+    // re-arm path next interrupt): every GOVERNOR_WINDOW_TICKS, check whether
+    // the idle loop has been spinning — the host may stop honouring WFI after
+    // boot (load, heuristic shift), which silently converts idle loops into
+    // busy-polls. Demotion is latched and one-way.
     {
-        let end = akuma_timer::read_counter();
-        let last = PROBE_LAST_ENTRY.swap(probe_entry, core::sync::atomic::Ordering::Relaxed);
-        PROBE_BODY_SUM.fetch_add(end.saturating_sub(probe_entry), core::sync::atomic::Ordering::Relaxed);
-        if last > 0 {
-            PROBE_PERIOD_SUM.fetch_add(probe_entry.saturating_sub(last), core::sync::atomic::Ordering::Relaxed);
-        }
-        let n = PROBE_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-        if n.is_multiple_of(2000) {
-            let f = freq / 1_000_000; // ticks per us
-            let body = PROBE_BODY_SUM.swap(0, core::sync::atomic::Ordering::Relaxed) / 2000 / f.max(1);
-            let period = PROBE_PERIOD_SUM.swap(0, core::sync::atomic::Ordering::Relaxed) / 2000 / f.max(1);
-            let netiter = NETPOLL_ITERS.swap(0, core::sync::atomic::Ordering::Relaxed);
-            crate::safe_print!(128, "[TICKPROBE] n={} tick_us={} body_us={} period_us={} idle_iters={}\n",
-                n, current_tick_us(), body, period, netiter);
-            // Runtime governor: if the idle loop is spinning (host stopped
-            // honouring WFI since boot), demote the tick. Takes effect on the
-            // very next re-arm above.
-            if let Some(new_us) = akuma_timer::policy::governor_observe(netiter, 2000) {
+        let n = GOVERNOR_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_multiple_of(GOVERNOR_WINDOW_TICKS) {
+            let idle_iters = NETPOLL_ITERS.swap(0, core::sync::atomic::Ordering::Relaxed);
+            if let Some(new_us) =
+                akuma_timer::policy::governor_observe(idle_iters, GOVERNOR_WINDOW_TICKS)
+            {
                 akuma_timer::set_tick_us(new_us);
-                crate::safe_print!(96, "[TICKPROBE] governor: WFI spin detected, tick -> {} us\n", new_us);
+                crate::safe_print!(96, "[Timer] governor: WFI spin detected, tick -> {} us\n", new_us);
             }
         }
     }

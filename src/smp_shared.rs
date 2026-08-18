@@ -194,7 +194,7 @@ pub fn set_drivers_bkl_drop_enabled(on: bool) {
 /// Runtime toggle (default **on**) for `no-bkl-irq` (Phase 7a of
 /// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7) — dispatch the timer IRQ (27) in
 /// `rust_irq_handler_with_sp` without acquiring the BKL at all, relying on the alarm
-/// queue's own `Spinlock` (`kernel_timer::ALARM_QUEUE`) and the lock-free preemption
+/// queue's own `Spinlock` (`akuma_exec::alarms::ALARM_QUEUE`) and the lock-free preemption
 /// watchdog / GIC MMIO the handler otherwise touches. Unlike `VfsBklGuard` and friends
 /// this is not a dropped-BKL "window" latched per-call — there is no `enter_kernel` to
 /// balance on this path in the first place — so the read happens once, directly in

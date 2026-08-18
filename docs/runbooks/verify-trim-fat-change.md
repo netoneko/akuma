@@ -180,6 +180,29 @@ diff <(grep -aoE '\[FAIL\] [a-z_0-9]+' base.log | sort -u) \
      <(grep -aoE '\[FAIL\] [a-z_0-9]+' mine.log | sort -u)
 ```
 
+### Idle-CPU gate (scheduler/tick/wake/poll changes: mandatory)
+
+Every functional gate above can pass while an idle VM burns whole host cores
+— nothing it measures is *wrong*, there is just 100x more of it. The
+scheduler-tick regression of 2026-08-18 landed exactly this way (1 ms tick →
+100% host CPU per guest core under HVF; `archive/CPU_LOAD_REGRESSION_INVESTIGATION.md`).
+
+```bash
+scripts/measure_idle_cpu.py --smp 4    # boots its own VM, samples post-boot
+```
+
+- Expect single digits (`idle_cpu_pct` ≈ 4–8 on devbox-smoltcp SMP=4 with the
+  self-tuning tick; the log should show `[Timer] host WFI probe: tick = 3000 us`
+  on an HVF host).
+- `ps -o %cpu` is meaningless here (macOS averages over process lifetime) —
+  that is why the script differences `ps -o time=` over a post-boot window.
+- Exit status is not a verdict: A/B against a worktree at your parent commit,
+  same SMP. A reading >2x the parent's with `time_jumps: 0` is a real
+  regression even if the suite is green.
+
+Run this for any change touching: the scheduler tick, wake/preempt paths,
+idle loops (`idle_halt`, netpoll WFI), poll intervals, or the timer crate.
+
 ### Known-benign — do not chase these
 
 | In the log | Why it is fine |
