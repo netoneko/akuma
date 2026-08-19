@@ -15,6 +15,9 @@ Start from the symptom or task on the left.
 | Debugging the devbox (SSH down, cargo crash, 100% CPU) | [`debug-devbox.md`](debug-devbox.md) |
 | Recovering a wedged / hung / 100%-CPU VM | [`recover-wedged-vm.md`](recover-wedged-vm.md) |
 | Debugging networking (native smoltcp stack) | [`debug-network.md`](debug-network.md) |
+| Network **latency** — a round trip costs milliseconds, or you want to profile the NIC path | [`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md) — build `--features net-profile` for `[NICSTAT]`, drive it with [`scripts/benchmarks/bench_nic_rtt.py`](../../scripts/benchmarks/bench_nic_rtt.py). If `nic_irq=0` in the dump, the NIC SPI is not reaching the CPU and the stack is back to being tick-driven |
+| Connections reset under connection-per-request load (HTTP/1.0, `accept` fails) | Socket slots exhausted by `TimeWait` against a 128 budget. **FIXED 2026-08-19** by a pressure valve in `socket_create` — [`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md) §3.4 |
+| In-guest `cargo` says `Could not connect to index.crates.io:443` while `curl` gets 200 | [`cargo-cannot-reach-crates-io.md`](cargo-cannot-reach-crates-io.md) — **no cargo config fixes this**; the multiplexing advice was disproven. It is nightly cargo's vendored libcurl, not the net stack. Fetch with apk `/usr/bin/cargo`, then build `--offline` |
 | A client hangs only when the server is slow to send its first byte | [`debug-delayed-first-byte.md`](debug-delayed-first-byte.md) |
 | An async runtime's child process never completes — the child exits in milliseconds, the caller times out | [`debug-async-subprocess-hang.md`](debug-async-subprocess-hang.md) |
 | Running Redis — the Alpine package, or the official `redis:alpine` image in a box | [`run-redis.md`](run-redis.md) |

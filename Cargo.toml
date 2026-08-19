@@ -311,6 +311,19 @@ no-bkl-irq = []
 #   cargo build --release --features devbox-smoltcp,no-tests,bkl-profile
 bkl-profile = []
 
+# Device-level NIC instrumentation (measurement builds only — never ship it).
+# Forwards `akuma-net/net-profile`, which counts per-packet RX/TX/poll timing
+# and bytes at the virtio-net boundary, and makes the async-main loop print a
+# windowed `[NICSTAT]` delta line. This is the input for "why is a network round
+# trip N microseconds" — the BKL profiler above answers "which syscall held the
+# lock", which is a different question and cannot separate device time from
+# stack time. Costs two CNTVCT reads per packet, so it perturbs the very path it
+# measures: read the RATIOS between counters, not the absolute throughput of a
+# run made with it on. Enable explicitly:
+#   cargo build --release --features devbox-smoltcp,no-tests,net-profile
+# Parsed by scripts/benchmarks/bench_nic_rtt.py.
+net-profile = ["akuma-net/net-profile"]
+
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device
 # (NIC1) and exposes it as /dev/net/tap0 (open/read/write whole frames + a

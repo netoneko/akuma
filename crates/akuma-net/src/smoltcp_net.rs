@@ -22,6 +22,7 @@ use virtio_drivers::transport::mmio::MmioTransport;
 use akuma_virtio::VirtioHal;
 use crate::runtime::runtime;
 use crate::runtime::PreemptGuard;
+use crate::nicstat;
 
 // ============================================================================
 // Constants
@@ -106,6 +107,87 @@ pub fn is_dhcp_configured() -> bool {
 
 pub fn poll_count() -> usize {
     POLL_COUNT.load(Ordering::Acquire)
+}
+
+// ============================================================================
+// NIC interrupt
+// ============================================================================
+
+/// virtio-mmio `InterruptStatus` — which events the device is signalling.
+const VIRTIO_MMIO_INTERRUPT_STATUS: usize = 0x060;
+/// virtio-mmio `InterruptACK` — write back the bits read from `InterruptStatus`
+/// to de-assert the line.
+const VIRTIO_MMIO_INTERRUPT_ACK: usize = 0x064;
+
+/// MMIO base of NIC0, captured during [`init`]. 0 until then.
+///
+/// Held separately from the `VirtIONetRaw` inside `NETWORK` because the IRQ
+/// handler must reach it **without taking a lock**: the core it interrupted may
+/// be the one holding `NETWORK`, and a handler that blocked on it would wedge
+/// the machine. A raw MMIO base in an atomic is the same discipline the timer
+/// IRQ uses for the GIC (see the `no-bkl-irq` feature notes).
+static NIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// virtio-mmio slot index of NIC0, or [`NIC_SLOT_NONE`] before [`init`].
+static NIC_SLOT: AtomicU32 = AtomicU32::new(NIC_SLOT_NONE);
+/// Sentinel for "no NIC found / not initialised yet".
+pub const NIC_SLOT_NONE: u32 = u32::MAX;
+
+/// The virtio-mmio slot NIC0 was probed at, for the kernel to derive its GIC
+/// INTID from. `None` when there is no NIC or the stack has not initialised.
+///
+/// The kernel owns the slot-to-INTID mapping (it is a property of the machine,
+/// not of this crate) — see `src/main.rs`.
+#[must_use]
+pub fn nic_slot() -> Option<u32> {
+    match NIC_SLOT.load(Ordering::Acquire) {
+        NIC_SLOT_NONE => None,
+        slot => Some(slot),
+    }
+}
+
+/// Acknowledge NIC0's pending interrupt. **Safe to call from IRQ context.**
+///
+/// Reads `InterruptStatus` and writes it straight back to `InterruptACK`, which
+/// is all the virtio-mmio spec requires to de-assert a level-triggered line.
+/// Deliberately does nothing else: the *value* of the NIC interrupt is that it
+/// makes a `WFI` return, so the netpoll loop runs immediately instead of waiting
+/// for the next scheduler tick. Draining the queue here would need `NETWORK`,
+/// which this context must never take.
+///
+/// A no-op before [`init`] has recorded a base, so an early spurious interrupt
+/// cannot fault on a null pointer.
+pub fn nic_irq_ack() {
+    let base = NIC_MMIO_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return;
+    }
+    NIC_IRQS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: `base` was recorded from `akuma_virtio::probe`, which only yields
+    // addresses inside the kernel's device mapping, and is only ever stored
+    // once. Both registers are 32-bit at fixed offsets in the virtio-mmio
+    // layout.
+    unsafe {
+        let status: akuma_primitives::mmio::MmioReg<u32> =
+            akuma_primitives::mmio::MmioReg::new(base + VIRTIO_MMIO_INTERRUPT_STATUS);
+        let ack: akuma_primitives::mmio::MmioReg<u32> =
+            akuma_primitives::mmio::MmioReg::new(base + VIRTIO_MMIO_INTERRUPT_ACK);
+        let pending = status.read();
+        if pending != 0 {
+            ack.write(pending);
+        }
+    }
+}
+
+/// Count of NIC interrupts taken. The first thing to check when a latency fix
+/// that depends on the interrupt does not move: if this is 0, the SPI never
+/// reached the CPU and the stack is still tick-driven.
+static NIC_IRQS: AtomicU64 = AtomicU64::new(0);
+
+/// How many NIC interrupts have been taken since boot.
+#[must_use]
+pub fn nic_irq_count() -> u64 {
+    NIC_IRQS.load(Ordering::Relaxed)
 }
 
 /// QEMU user-mode networking DNS server address
@@ -265,8 +347,12 @@ impl Device for VirtioSmoltcpDevice {
         // VirtIO requires the driver to submit buffers in advance; the device
         // DMAs received packets into them.
         if self.rx_token.is_none() {
+            let t = nicstat::start();
             match unsafe { self.inner.receive_begin(&mut self.rx_buffer) } {
-                Ok(token) => self.rx_token = Some(token),
+                Ok(token) => {
+                    nicstat::record_rx_begin(t);
+                    self.rx_token = Some(token);
+                }
                 Err(_) => return None,
             }
         }
@@ -274,6 +360,7 @@ impl Device for VirtioSmoltcpDevice {
         // Phase 2: Check if the device has completed the receive (filled our buffer).
         if self.inner.poll_receive().is_some() {
             let token = self.rx_token.take().unwrap();
+            let t = nicstat::start();
             match unsafe { self.inner.receive_complete(token, &mut self.rx_buffer) } {
                 Ok((hdr_len, pkt_len)) => {
                     // Validate buffer bounds — a malformed VirtIO response could
@@ -282,6 +369,7 @@ impl Device for VirtioSmoltcpDevice {
                     if hdr_len.saturating_add(pkt_len) > self.rx_buffer.len() {
                         return None;
                     }
+                    nicstat::record_rx_packet(t, pkt_len);
                     let rx = VirtioRxToken {
                         buffer: unsafe { core::slice::from_raw_parts_mut(self.rx_buffer.as_mut_ptr().add(hdr_len), pkt_len) },
                     };
@@ -294,6 +382,7 @@ impl Device for VirtioSmoltcpDevice {
                 Err(_) => return None,
             }
         }
+        nicstat::record_rx_empty();
         None
     }
 
@@ -335,7 +424,10 @@ impl smoltcp::phy::TxToken for VirtioTxToken<'_> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let res = f(&mut self.buffer[..len]);
-        if let Err(_e) = self.inner.send(&self.buffer[..len]) {
+        let t = nicstat::start();
+        let sent = self.inner.send(&self.buffer[..len]);
+        nicstat::record_tx(t, len, sent.is_ok());
+        if sent.is_err() {
             TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         res
@@ -414,8 +506,12 @@ impl Device for LoopbackAwareDevice {
         // Fall back to VirtIO: two-phase receive pattern
         // Phase 1: Ensure a receive buffer is posted to the device
         if self.virtio.rx_token.is_none() {
+            let t = nicstat::start();
             match unsafe { self.virtio.inner.receive_begin(&mut self.virtio.rx_buffer) } {
-                Ok(token) => self.virtio.rx_token = Some(token),
+                Ok(token) => {
+                    nicstat::record_rx_begin(t);
+                    self.virtio.rx_token = Some(token);
+                }
                 Err(_) => return None,
             }
         }
@@ -423,6 +519,7 @@ impl Device for LoopbackAwareDevice {
         // Phase 2: Check if the device has completed the receive
         if self.virtio.inner.poll_receive().is_some() {
             let token = self.virtio.rx_token.take().unwrap();
+            let t = nicstat::start();
             match unsafe {
                 self.virtio
                     .inner
@@ -433,6 +530,7 @@ impl Device for LoopbackAwareDevice {
                     if hdr_len.saturating_add(pkt_len) > self.virtio.rx_buffer.len() {
                         return None;
                     }
+                    nicstat::record_rx_packet(t, pkt_len);
                     let rx = LoopbackAwareRxToken::Virtio(unsafe {
                         core::slice::from_raw_parts_mut(
                             self.virtio.rx_buffer.as_mut_ptr().add(hdr_len),
@@ -456,6 +554,7 @@ impl Device for LoopbackAwareDevice {
                 Err(_) => return None,
             }
         }
+        nicstat::record_rx_empty();
         None
     }
 
@@ -512,8 +611,14 @@ impl smoltcp::phy::TxToken for LoopbackAwareTxToken<'_> {
             let mut frame = vec![0u8; len];
             frame.copy_from_slice(&self.virtio_buffer[..len]);
             self.loopback_queue.push_back(frame);
-        } else if let Err(_e) = self.virtio_inner.send(&self.virtio_buffer[..len]) {
-            TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            nicstat::record_loopback(len);
+        } else {
+            let t = nicstat::start();
+            let sent = self.virtio_inner.send(&self.virtio_buffer[..len]);
+            nicstat::record_tx(t, len, sent.is_ok());
+            if sent.is_err() {
+                TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         res
@@ -534,6 +639,11 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
     if let Some((i, transport)) = akuma_virtio::probe::probe(akuma_virtio::device_id::NET) {
         log::info!("[SmolNet] Found virtio-net at slot {i}");
         if let Ok(dev) = VirtIONetRaw::new(transport) {
+            // Record the slot and its MMIO base for the IRQ handler before the
+            // device is moved into `NETWORK` — afterwards it is only reachable
+            // under the lock, which IRQ context must not take.
+            NIC_MMIO_BASE.store(akuma_virtio::VIRTIO_MMIO_ADDRS[i], Ordering::Release);
+            NIC_SLOT.store(i as u32, Ordering::Release);
             found_device = Some(dev);
         }
     }
@@ -596,6 +706,7 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
 #[allow(clippy::cast_possible_wrap)]
 pub fn poll() -> bool {
     POLL_ENTERED.fetch_add(1, Ordering::Relaxed);
+    let poll_t = nicstat::start();
     let socket_state_changed = {
         // Hold preemption disabled for the whole NETWORK critical section so the
         // spinlock is never stranded across a context switch (fatal under the
@@ -704,6 +815,7 @@ pub fn poll() -> bool {
         });
     }
 
+    nicstat::record_poll(poll_t, socket_state_changed);
     socket_state_changed
 }
 
@@ -846,10 +958,96 @@ pub async fn tcp_connect(addr: IpAddress, port: u16) -> Result<(TcpStream, Socke
 // ============================================================================
 
 #[must_use] 
+/// Free slots held by sockets that are only waiting out a protocol timer.
+///
+/// `socket_close` does not drop a socket immediately — it parks the handle in
+/// `pending_removal` so smoltcp can finish the teardown handshake, and `poll`'s
+/// sweep collects it once the state reaches `Closed` or `SOCKET_GC_TIMEOUT_US`
+/// (**30 s**) expires. That is correct for a long-lived connection and badly
+/// wrong for connection-per-request traffic: a socket in `TimeWait` holds a slot
+/// for smoltcp's full close timeout, so at ~900 HTTP requests a second the
+/// 128-slot budget drains in well under a second and every subsequent `accept`
+/// fails. Measured 2026-08-19: **26 % of requests reset**
+/// (`docs/archive/AKUMA_NET_ISSUES.md` §3.4).
+///
+/// Under pressure the states below are reclaimed early, oldest first:
+///
+/// - `TimeWait` — the connection is over. TIME-WAIT exists to absorb delayed
+///   duplicates from the *old* incarnation of a 4-tuple; recycling it under slot
+///   pressure is what every production stack does (Linux's `tcp_tw_recycle`
+///   lineage, and its `tcp_max_tw_buckets` cap, which simply drops the oldest).
+/// - `Closed` — already collectable; the periodic sweep just has not run.
+///
+/// Nothing else is touched. A socket still in `FinWait1`/`FinWait2`/`LastAck` is
+/// waiting on the *peer*, and killing it would discard data the peer is still
+/// entitled to send, so those keep the 30 s timeout they always had.
+///
+/// Returns how many slots it freed.
+fn reclaim_pending_slots(net: &mut NetworkState, want: usize) -> usize {
+    if want == 0 {
+        return 0;
+    }
+    let mut freed = 0;
+    // Oldest first: `pending_removal` holds the close timestamp, and the entry
+    // that has waited longest is the one whose duplicates are least likely to
+    // still be in flight.
+    while freed < want {
+        let mut oldest: Option<(usize, u64)> = None;
+        for (i, &(handle, added_at)) in net.pending_removal.iter().enumerate() {
+            if !is_valid_handle(handle) {
+                continue;
+            }
+            let state = net.sockets.get::<tcp::Socket>(handle).state();
+            if !matches!(state, tcp::State::TimeWait | tcp::State::Closed) {
+                continue;
+            }
+            if oldest.is_none_or(|(_, t)| added_at < t) {
+                oldest = Some((i, added_at));
+            }
+        }
+        let Some((idx, _)) = oldest else { break };
+        let (handle, _) = net.pending_removal[idx];
+        net.sockets.get_mut::<tcp::Socket>(handle).abort();
+        net.sockets.remove(handle);
+        net.pending_removal.swap_remove(idx);
+        freed += 1;
+        RECLAIMED_SLOTS.fetch_add(1, Ordering::Relaxed);
+    }
+    freed
+}
+
+/// Slots to free per pressure-valve trip. Small next to `MAX_SOCKETS` (128 on
+/// the devbox) so a burst never discards a meaningful fraction of the table,
+/// large enough that a listener refilling an 8- or 32-deep backlog does not
+/// re-scan `pending_removal` on every single `socket_create`.
+const RECLAIM_BATCH: usize = 8;
+
+/// Sockets reclaimed early by [`reclaim_pending_slots`]. A steadily climbing
+/// value means the socket budget is genuinely too small for the workload rather
+/// than merely churning; a flat zero under connection-per-request load means the
+/// valve is not being reached.
+static RECLAIMED_SLOTS: AtomicU64 = AtomicU64::new(0);
+
+/// How many socket slots have been reclaimed under pressure since boot.
+#[must_use]
+pub fn reclaimed_slot_count() -> u64 {
+    RECLAIMED_SLOTS.load(Ordering::Relaxed)
+}
+
+#[must_use]
 pub fn socket_create() -> Option<SocketHandle> {
     with_network(|net| {
         if net.sockets.iter().count() >= MAX_SOCKETS {
-            return None;
+            // Pressure valve before giving up: a full table under
+            // connection-per-request traffic is usually full of `TimeWait`,
+            // not of live connections. Reclaim a small batch rather than the
+            // one slot needed — the scan is O(pending) and the caller here is
+            // the listener refilling its backlog, so it is about to ask again
+            // several more times.
+            let _ = reclaim_pending_slots(net, RECLAIM_BATCH);
+            if net.sockets.iter().count() >= MAX_SOCKETS {
+                return None;
+            }
         }
         let rx_buffer = tcp::SocketBuffer::new(vec![0; TCP_RX_BUFFER_SIZE]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0; TCP_TX_BUFFER_SIZE]);

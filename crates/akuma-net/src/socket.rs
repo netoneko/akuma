@@ -530,12 +530,14 @@ where F: FnMut() -> bool
 
         if !any_progress {
             fruitless_progress_rounds = 0;
+            let relax_t = crate::nicstat::start();
             // Wait for more network progress. Under shared-kernel SMP this DROPS the
             // Big Kernel Lock across the wait (a plain `yield_now` would spin holding
             // it, freezing every peer core — the meow→LLM `connect`+recv wedge). The
             // BKL is not held while we poll below either, so a peer's async-main poller
             // can drive the RX that satisfies `condition`.
             (runtime().blocking_relax)();
+            crate::nicstat::record_relax(relax_t);
         } else {
             // poll() made progress but not the progress WE need. Under sustained
             // unrelated traffic (a torrent's dozens of peers, DHT chatter) poll()
@@ -551,7 +553,9 @@ where F: FnMut() -> bool
             // within the first rounds — is unchanged.
             fruitless_progress_rounds = fruitless_progress_rounds.wrapping_add(1);
             if fruitless_progress_rounds >= 4 {
+                let relax_t = crate::nicstat::start();
                 (runtime().blocking_relax)();
+                crate::nicstat::record_relax(relax_t);
             }
         }
     }

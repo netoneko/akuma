@@ -1146,6 +1146,11 @@ None of them are about the bug; all of them are about the harness.
   `Failed to connect to index.crates.io:443 after 420 ms`. It is libcurl's HTTP/2
   multiplexing; `[http] multiplexing = false` in `/root/.cargo/config.toml` (or
   `CARGO_HTTP_MULTIPLEXING=false`) fixes it. Don't debug the net stack.
+  **SUPERSEDED 2026-08-11 — the multiplexing half of this is wrong.** Setting the
+  flag was tested and does *not* fix it; the cause is nightly cargo's vendored
+  libcurl issuing non-blocking connects that never complete, and apk
+  `/usr/bin/cargo` is unaffected. "Don't debug the net stack" still holds. See
+  [`cargo-cannot-reach-crates-io.md`](cargo-cannot-reach-crates-io.md).
 - **`--offline` can fail with sources fully cached.** `no matching package named
   arm_pl031 found` while `~/.cargo/registry/{cache,src}` both hold it and
   `~/.cargo/git/db` holds the `embedded-tls` checkout: what is stale is the

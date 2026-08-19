@@ -236,6 +236,27 @@ pub fn trigger_sgi(sgi_id: u32) {
     crate::gic_v3::trigger_sgi(sgi_id);
 }
 
+/// Send an SGI to **every** PE in affinity cluster 0.0.0 — including this one.
+///
+/// The cross-core doorbell for the virtio-net interrupt: an SPI is delivered to
+/// a single routed core, but the thread waiting for that packet may be halted
+/// in `blocking_relax` on any core, and a halted core only wakes on an
+/// interrupt *it* receives. Broadcasting the scheduler SGI ends every core's
+/// `wfi` at once. See `nic_irq_handler` in `src/main.rs`, and the doorbell
+/// coalescer that keeps this from firing per packet.
+///
+/// Targeting self as well is deliberate and harmless: it is what
+/// `trigger_sgi_self` already does on the routed core's own behalf.
+///
+/// GICv3 only — GICv2's `SGIR` has a different target encoding, and no
+/// `gic-v2` build has ever registered a device SPI.
+/// Also gated on `kernel_smp_shared`: the sole caller is the virtio-net
+/// doorbell, which has no peer cores to wake on a single-core build.
+#[cfg(all(not(feature = "gic-v2"), kernel_smp_shared))]
+pub fn broadcast_sgi(sgi_id: u32) {
+    crate::gic_v3::broadcast_sgi(sgi_id);
+}
+
 /// Trigger an SGI on a specific core (by affinity-0 = `MPIDR & 0xff`). Used by real
 /// shared-kernel SMP as the cross-core doorbell. GICv3 only.
 #[cfg(all(not(feature = "gic-v2"), kernel_smp_shared))]

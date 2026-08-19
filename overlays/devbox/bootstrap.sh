@@ -400,6 +400,58 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 7c. Cargo network policy, shipped WITH the toolchain.
+#
+#    Always runs: whichever of step 7 (apk stable) or step 7b (nightly) put a
+#    cargo on the image, it gets the same policy. A toolchain that can build but
+#    cannot fetch is only half installed.
+#
+#    `retry = 20` is the load-bearing one. Even when the index is reachable,
+#    `static.crates.io` *download* connections fail often enough on this stack
+#    that cargo's default budget of 3 aborts a large fetch part-way
+#    (docs/runbooks/debug-thread-spawn-segv.md).
+#
+#    `multiplexing = false` is retained because it is harmless and is the
+#    historical recommendation — but be clear about what it does NOT do: it does
+#    **not** fix "Could not connect to index.crates.io:443" from the *nightly*
+#    toolchain. That was tested and disproven 2026-08-11
+#    (docs/archive/CARGO_CRATES_IO_CONNECT_FAIL.md): the cause is nightly cargo's
+#    vendored libcurl issuing non-blocking connects that never complete on the
+#    smoltcp kernel, and no cargo config reaches it. Use apk `/usr/bin/cargo` to
+#    fill the registry cache, then build `--offline`
+#    (docs/runbooks/cargo-cannot-reach-crates-io.md).
+#
+#    Deliberately NOT set here: `[net] offline`. Pinning the mode in the image
+#    would make a first fetch impossible and turn a network problem into a
+#    confusing resolution error. Offline is a per-command choice
+#    (`cargo build --offline`, or `CARGO_NET_OFFLINE=true`).
+# ---------------------------------------------------------------------------
+hr "Installing cargo network policy -> /root/.cargo/config.toml"
+docker run --rm --privileged \
+    -v "$REPO_ROOT/$DEVBOX_DISK:/disk.img" \
+    alpine:latest \
+    sh -c '
+        set -e
+        mkdir -p /mnt/disk
+        mount -o loop /disk.img /mnt/disk
+        mkdir -p /mnt/disk/root/.cargo
+        cat > /mnt/disk/root/.cargo/config.toml <<CARGOCFG
+# Shipped by overlays/devbox/bootstrap.sh step 7c, with the Rust toolchain.
+# Rationale and the failure this does NOT fix:
+#   docs/runbooks/cargo-cannot-reach-crates-io.md
+[net]
+retry = 20
+
+[http]
+multiplexing = false
+CARGOCFG
+        echo "Wrote /root/.cargo/config.toml:"
+        cat /mnt/disk/root/.cargo/config.toml
+        sync
+        umount /mnt/disk
+    '
+
+# ---------------------------------------------------------------------------
 # 8. Optional soundtrack (bootstrap/music) — pure bonus content, off by default.
 #    Skip (default) leaves the image without it; set DEVBOX_SOUNDTRACK=true to
 #    include it, e.g. DEVBOX_SOUNDTRACK=true overlays/devbox/bootstrap.sh

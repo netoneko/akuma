@@ -24,7 +24,21 @@ use akuma_exec::mmu;
 // --- GICD (distributor) MMIO register offsets ---
 mod gicd {
     pub const CTLR: usize = 0x0000; // Distributor Control Register
+    // The SPI configuration banks. Until 2026-08-19 only `CTLR` was here,
+    // because nothing registered an SPI — the sole device IRQ was the virtual
+    // timer (PPI 27), which lives in the redistributor. Enabling the
+    // virtio-net interrupt needs all four: an SPI left at its reset state is
+    // in Group 0, which `ICC_IGRPEN1_EL1` does not deliver, and has no route.
+    pub const IGROUPR: usize = 0x0080; // 1 bit per INTID
+    pub const ISENABLER: usize = 0x0100; // 1 bit per INTID
+    pub const IPRIORITYR: usize = 0x0400; // 1 byte per INTID
+    pub const IROUTER: usize = 0x6000; // 8 bytes per INTID, from INTID 32
 }
+
+/// Interrupt priority for everything Akuma enables. Below `ICC_PMR_EL1` (0xFF),
+/// so it is deliverable, and identical to the value `init` writes for SGIs/PPIs
+/// — nothing here wants a priority hierarchy.
+const IRQ_PRIORITY: u8 = 0xA0;
 
 // GICD_CTLR bits, with Security disabled (DS=1), as QEMU `virt` presents.
 const GICD_CTLR_ARE_NS: u32 = 1 << 4; // Affinity Routing Enable (Non-secure)
@@ -181,8 +195,37 @@ pub fn init() {
     isb();
 }
 
-/// Enable a specific IRQ. SGIs/PPIs (INTID < 32) live in this PE's
-/// redistributor; SPIs (>= 32) would use the distributor (unused by Akuma).
+/// Enable a specific IRQ.
+///
+/// SGIs/PPIs (INTID < 32) live in this PE's redistributor, already configured
+/// as Group 1 at [`IRQ_PRIORITY`] by [`init`] — enabling one is a single
+/// `ISENABLER0` bit.
+///
+/// SPIs (INTID >= 32) are **not** pre-configured, because `init` only walks the
+/// redistributor. Before 2026-08-19 this arm wrote `ISENABLER` alone and was
+/// commented "best effort", which was accurate: an SPI enabled that way never
+/// reaches the CPU, since its reset state is Group 0 and `ICC_IGRPEN1_EL1`
+/// delivers Group 1 only. That was fine while the virtual timer (PPI 27) was
+/// the only device interrupt this kernel registered; it stopped being fine when
+/// the network stack needed a virtio-net RX interrupt to avoid waiting a whole
+/// scheduler tick for every packet
+/// (`docs/archive/AKUMA_NET_ISSUES.md` §3.1).
+///
+/// The SPI path now programs all four banks, in the order the architecture
+/// requires — group, priority and route **before** enable, so the interrupt
+/// cannot be delivered under a half-written configuration:
+///
+/// 1. `GICD_IGROUPR` — Group 1 Non-secure, matching `ICC_IGRPEN1_EL1`.
+/// 2. `GICD_IPRIORITYR` — [`IRQ_PRIORITY`], below `ICC_PMR_EL1`'s 0xFF.
+/// 3. `GICD_IROUTER` — affinity 0.0.0.0 (core 0), written explicitly rather
+///    than relying on a reset value the architecture leaves UNKNOWN. Akuma
+///    routes every device IRQ to the boot core; under `smp-shared` the handler
+///    runs there and peers are reached through the scheduler SGI as before.
+/// 4. `GICD_ISENABLER` — the enable bit, last.
+///
+/// `GICD_ICFGR` is deliberately untouched: virtio-mmio is level-triggered and
+/// level is the reset state for SPIs, so writing it would only risk flipping a
+/// correct setting.
 pub fn enable_irq(irq: u32) {
     if irq >= 1020 {
         return; // Invalid / special INTID
@@ -190,15 +233,41 @@ pub fn enable_irq(irq: u32) {
     if irq < 32 {
         // GICR SGI_base frame, device-mapped for CPU0.
         mmio_w32(gicr_sgi(gicr_sgi::ISENABLER0), 1u32 << irq);
-    } else {
-        // SPI: GICD_ISENABLER<n> at 0x100 + (irq/32)*4 (best effort; Akuma uses
-        // no SPIs, and affinity routing via GICD_IROUTER is not programmed).
-        const GICD_ISENABLER: usize = 0x0100;
-        let off = GICD_ISENABLER + ((irq / 32) as usize) * 4;
-        let bit = 1u32 << (irq % 32);
-        mmio_w32(gicd(off), bit);
+        dsb_ish();
+        return;
     }
+
+    let idx = irq as usize;
+    let word = (idx / 32) * 4;
+    let bit = 1u32 << (irq % 32);
+
+    // 1. Group 1 Non-secure (read-modify-write: the word holds 32 INTIDs).
+    let grp_off = gicd::IGROUPR + word;
+    mmio_w32(gicd(grp_off), mmio_r32(gicd(grp_off)) | bit);
+
+    // 2. Priority. One byte per INTID, four per 32-bit word.
+    let prio_off = gicd::IPRIORITYR + (idx / 4) * 4;
+    let shift = (idx % 4) * 8;
+    let prio = (mmio_r32(gicd(prio_off)) & !(0xFFu32 << shift))
+        | (u32::from(IRQ_PRIORITY) << shift);
+    mmio_w32(gicd(prio_off), prio);
+
+    // 3. Route to core 0. IROUTER is 64-bit per INTID and indexed from 32;
+    //    write it as two 32-bit stores because that is all `mmio_w32` offers,
+    //    and the register is not required to be accessed atomically.
+    let route_off = gicd::IROUTER + idx * 8;
+    mmio_w32(gicd(route_off), 0); // Aff0/Aff1
+    mmio_w32(gicd(route_off + 4), 0); // Aff2/Aff3, IRM=0 (targeted)
+
+    // Configuration must land before the enable bit.
     dsb_ish();
+
+    // 4. Enable.
+    mmio_w32(gicd(gicd::ISENABLER + word), bit);
+    dsb_ish();
+    while mmio_r32(gicd(gicd::CTLR)) & GICD_CTLR_RWP != 0 {
+        core::hint::spin_loop();
+    }
 }
 
 /// Acknowledge an interrupt and return its INTID, or `None` if spurious.
@@ -249,6 +318,26 @@ pub fn trigger_sgi_core(target_aff0: u32, sgi_id: u32) {
     }
     // IRM=0, Aff3/2/1 = 0, INTID at [27:24], TargetList bit `target_aff0`.
     let val = (u64::from(sgi_id) << 24) | (1u64 << target_aff0);
+    write_sysreg!("S3_0_C12_C11_5", val);
+    let _ = ICC_SGI1R_EL1;
+    dsb_ish();
+    isb();
+}
+
+/// Send an SGI to every PE in affinity cluster 0.0.0 (aff0 0..15), self included.
+///
+/// `ICC_SGI1R_EL1`'s TargetList is a 16-bit mask over aff0 within one cluster,
+/// so a single register write reaches every core Akuma runs on — the machine is
+/// a flat `-smp N` with Aff1/2/3 = 0. Bits for PEs that do not exist are
+/// ignored by the GIC, so no core count is needed here.
+#[cfg(kernel_smp_shared)]
+pub fn broadcast_sgi(sgi_id: u32) {
+    if sgi_id > 15 {
+        return;
+    }
+    // IRM=0 (use the target list), Aff3/2/1 = 0, INTID at [27:24],
+    // TargetList = all 16 aff0 slots.
+    let val = (u64::from(sgi_id) << 24) | 0xFFFF;
     write_sysreg!("S3_0_C12_C11_5", val);
     let _ = ICC_SGI1R_EL1;
     dsb_ish();

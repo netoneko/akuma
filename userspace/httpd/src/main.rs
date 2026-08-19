@@ -13,6 +13,30 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::vec;
 
+mod resp;
+mod stats;
+use resp::{DateCache, FixedBuf};
+use stats::{Phase, Stats};
+
+use core::fmt::Write as _;
+
+/// Request buffer size. Was an 8 KB `alloc::vec!` per connection; it is a single
+/// reusable buffer now because `httpd` serves one connection at a time (see the
+/// accept loop in `main`), so there is never a second live request to overlap
+/// with it.
+const REQUEST_BUF: usize = 8192;
+
+/// Files at or below this size are served out of a reusable buffer with no
+/// allocation. Above it, `read_file` falls back to a `Vec` — a large download is
+/// dominated by the transfer, not by one `malloc`, and sizing the static buffer
+/// for the worst case would cost that memory permanently.
+const STATIC_FILE_BUF: usize = 64 * 1024;
+
+/// Longest filesystem path this server will build. Anything longer is refused
+/// with a 403 rather than truncated — a truncated path resolves to a different
+/// file, which is a correctness bug wearing a buffer-size costume.
+const PATH_BUF: usize = 512;
+
 use libakuma::net::{TcpListener, TcpStream, Error, Shutdown};
 use libakuma::{print, open, read_fd, fstat, close, open_flags, lseek, seek_mode};
 use libakuma::{spawn_with_env, waitpid};
@@ -54,13 +78,34 @@ pub extern "C" fn main() {
 
     print("httpd: Listening for connections...\n");
 
+    // Phase timing for the request path (`HTTPD_STATS=1`). See stats.rs for what
+    // each phase covers and why `other` is the "server compute" number.
+    let mut st = Stats::new();
+    // One cache for the process: the `Date` header only changes once a second.
+    let mut dates = DateCache::new();
+    // One reusable request buffer, reused across connections (see REQUEST_BUF).
+    let mut req = alloc::vec![0u8; REQUEST_BUF];
+    // One reusable file buffer for small responses (see STATIC_FILE_BUF).
+    let mut file = alloc::vec![0u8; STATIC_FILE_BUF];
+
     loop {
+        st.begin();
         match listener.accept() {
             Ok((stream, addr)) => {
-                print(&format!("httpd: connection from {}\n", libakuma::net::format_addr(&addr)));
-                handle_connection(stream);
+                // Charged to `accept`: everything from the previous request
+                // finishing to this connection existing. On Akuma that is a
+                // kernel `wait_until` parked in WFI, so it is the phase most
+                // likely to dominate — which is exactly the point of measuring.
+                st.mark(Phase::Accept);
+                if st.verbose() {
+                    print(&format!("httpd: connection from {}\n", libakuma::net::format_addr(&addr)));
+                }
+                st.mark(Phase::Log);
+                handle_connection(stream, &mut st, &mut dates, &mut req, &mut file);
+                st.finish_request();
             }
             Err(e) => {
+                st.mark(Phase::Accept);
                 if e.kind != libakuma::net::ErrorKind::WouldBlock {
                     print("httpd: Accept error: ");
                     print(&format!("{:?}\n", e));
@@ -71,12 +116,18 @@ pub extern "C" fn main() {
     }
 }
 
-fn handle_connection(stream: TcpStream) {
-    let mut buf = alloc::vec![0u8; 8192];
-    let n = match stream.read(&mut buf) {
+fn handle_connection(
+    stream: TcpStream,
+    st: &mut Stats,
+    dates: &mut DateCache,
+    buf: &mut [u8],
+    file: &mut [u8],
+) {
+    let n = match stream.read(buf) {
         Ok(n) => n,
         Err(_) => return,
     };
+    st.mark(Phase::Read);
 
     if n == 0 {
         return;
@@ -85,7 +136,7 @@ fn handle_connection(stream: TcpStream) {
     let request = match core::str::from_utf8(&buf[..n]) {
         Ok(s) => s,
         Err(_) => {
-            let _ = send_error(&stream, 400, "Bad Request");
+            let _ = send_error(&stream, 400);
             return;
         }
     };
@@ -94,7 +145,7 @@ fn handle_connection(stream: TcpStream) {
     let first_line = match lines.next() {
         Some(l) => l,
         None => {
-            let _ = send_error(&stream, 400, "Bad Request");
+            let _ = send_error(&stream, 400);
             return;
         }
     };
@@ -108,13 +159,13 @@ fn handle_connection(stream: TcpStream) {
         "HEAD" => true,
         "POST" => false,
         _ => {
-            let _ = send_error(&stream, 405, "Method Not Allowed");
+            let _ = send_error(&stream, 405);
             return;
         }
     };
 
     if path.contains("..") {
-        let _ = send_error(&stream, 403, "Forbidden");
+        let _ = send_error(&stream, 403);
         return;
     }
 
@@ -129,29 +180,110 @@ fn handle_connection(stream: TcpStream) {
     }
 
     if method == "POST" {
-        let _ = send_error(&stream, 405, "Method Not Allowed");
+        let _ = send_error(&stream, 405);
         return;
     }
 
-    let fs_path = if path == "/" {
-        String::from("/public/index.html")
-    } else {
-        format!("/public{}", path)
+    // Filesystem path, built into a stack buffer rather than a `String`. A path
+    // longer than the buffer is refused instead of being silently truncated,
+    // which would otherwise resolve to some *other* file.
+    let mut fs_path = FixedBuf::<PATH_BUF>::new();
+    let _ = fs_path.write_str("/public");
+    let _ = fs_path.write_str(if path == "/" { "/index.html" } else { path });
+    if fs_path.truncated() {
+        let _ = send_error(&stream, 403);
+        return;
+    }
+    let Ok(fs_path) = core::str::from_utf8(fs_path.as_bytes()) else {
+        let _ = send_error(&stream, 400);
+        return;
     };
 
-    let now_us = libakuma::time();
-    let time_str = format_time_rfc1123(now_us);
-    print(&format!("[{}] {} {}\n", time_str, method, path));
+    // Everything above this point is parse + path building: charge it to the
+    // compute bucket before the logging and I/O phases start.
+    st.mark(Phase::Other);
 
-    match read_file(&fs_path) {
-        Ok(content) => {
-            let content_type = get_content_type(&fs_path);
-            let _ = send_file(&stream, &content, content_type, is_head);
-        }
+    if st.verbose() {
+        let now_us = libakuma::time();
+        let time_str = format_time_rfc1123(now_us);
+        print(&format!("[{}] {} {}\n", time_str, method, path));
+    }
+    st.mark(Phase::Log);
+
+    let content_type = get_content_type(fs_path);
+    match serve_file(&stream, fs_path, content_type, is_head, dates, file, st) {
+        Ok(n) => st.add_tx(n),
         Err(_) => {
-            let _ = send_error(&stream, 404, "Not Found");
+            let _ = send_error(&stream, 404);
+            st.mark(Phase::Write);
         }
     }
+}
+
+/// Open `path`, send a 200 with its contents, and return the body length.
+///
+/// Reads through the caller's reusable buffer instead of allocating a `Vec` per
+/// request. A file larger than that buffer is **streamed** in buffer-sized
+/// chunks rather than growing the buffer: `Content-Length` comes from `fstat`,
+/// so the response is still framed correctly without ever holding the whole file
+/// in memory.
+fn serve_file(
+    stream: &TcpStream,
+    path: &str,
+    content_type: &str,
+    head_only: bool,
+    dates: &mut DateCache,
+    buf: &mut [u8],
+    st: &mut Stats,
+) -> Result<usize, i32> {
+    let fd = open(path, open_flags::O_RDONLY);
+    if fd < 0 {
+        st.mark(Phase::File);
+        return Err(-fd);
+    }
+    let stat = match fstat(fd) {
+        Ok(s) => s,
+        Err(e) => {
+            close(fd);
+            st.mark(Phase::File);
+            return Err(e);
+        }
+    };
+    let size = stat.st_size as usize;
+    lseek(fd, 0, seek_mode::SEEK_SET);
+    st.mark(Phase::File);
+
+    if send_headers(stream, content_type, size, dates).is_err() {
+        close(fd);
+        st.mark(Phase::Write);
+        return Ok(0);
+    }
+    if head_only {
+        close(fd);
+        let _ = stream.shutdown(Shutdown::Write);
+        st.mark(Phase::Write);
+        return Ok(0);
+    }
+
+    let mut sent = 0usize;
+    while sent < size {
+        let want = (size - sent).min(buf.len());
+        let n = read_fd(fd, &mut buf[..want]);
+        st.mark(Phase::File);
+        if n <= 0 {
+            break;
+        }
+        let n = n as usize;
+        if stream.write_all(&buf[..n]).is_err() {
+            break;
+        }
+        st.mark(Phase::Write);
+        sent += n;
+    }
+    close(fd);
+    let _ = stream.shutdown(Shutdown::Write);
+    st.mark(Phase::Write);
+    Ok(sent)
 }
 
 fn format_time_rfc1123(us: u64) -> String {
@@ -250,32 +382,6 @@ fn extract_post_body(initial_data: &[u8], stream: &TcpStream) -> Option<Vec<u8>>
     Some(body)
 }
 
-fn read_file(path: &str) -> Result<Vec<u8>, i32> {
-    let fd = open(path, open_flags::O_RDONLY);
-    if fd < 0 {
-        return Err(-fd);
-    }
-
-    let stat = match fstat(fd) {
-        Ok(s) => s,
-        Err(e) => { close(fd); return Err(e); }
-    };
-
-    let size = stat.st_size as usize;
-    lseek(fd, 0, seek_mode::SEEK_SET);
-
-    let mut content = alloc::vec![0u8; size];
-    let mut read = 0;
-    while read < size {
-        let n = read_fd(fd, &mut content[read..]);
-        if n <= 0 { break; }
-        read += n as usize;
-    }
-
-    close(fd);
-    Ok(content)
-}
-
 fn get_content_type(path: &str) -> &'static str {
     if path.ends_with(".html") || path.ends_with(".htm") {
         "text/html; charset=utf-8"
@@ -302,46 +408,43 @@ fn get_content_type(path: &str) -> &'static str {
     }
 }
 
-fn send_file(stream: &TcpStream, content: &[u8], content_type: &str, head_only: bool) -> Result<(), Error> {
-    let date = format_time_rfc1123(libakuma::time());
-    let response = format!(
-        "HTTP/1.0 200 OK\r\n\
-         Date: {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        date, content_type, content.len()
-    );
-
-    stream.write_all(response.as_bytes())?;
-    if !head_only {
-        stream.write_all(content)?;
+/// Send a 200 with `content` as the body.
+///
+/// The header block is formatted into a stack buffer instead of a `String`:
+/// only `Content-Type`, `Content-Length` and `Date` vary, and `Date` comes from
+/// a per-second cache (`DateCache`) rather than being recomputed per request.
+/// Write a 200 header block.
+///
+/// Formatted into a stack buffer instead of a `String`: only `Content-Type`,
+/// `Content-Length` and `Date` vary, and `Date` comes from a per-second cache
+/// (`DateCache`) rather than being recomputed per request.
+fn send_headers(
+    stream: &TcpStream,
+    content_type: &str,
+    content_len: usize,
+    dates: &mut DateCache,
+) -> Result<(), Error> {
+    let mut hdr = FixedBuf::<256>::new();
+    let _ = hdr.write_str("HTTP/1.0 200 OK\r\nDate: ");
+    // The cache holds ASCII produced by `write_rfc1123`, so this is infallible;
+    // a corrupt cache degrades to an absent Date rather than a failed response.
+    if let Ok(d) = core::str::from_utf8(dates.get(libakuma::time())) {
+        let _ = hdr.write_str(d);
     }
-    let _ = stream.shutdown(Shutdown::Write);
-    Ok(())
+    let _ = write!(
+        hdr,
+        "\r\nContent-Type: {content_type}\r\nContent-Length: {content_len}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(hdr.as_bytes())
 }
 
-fn send_error(stream: &TcpStream, code: u16, message: &str) -> Result<(), Error> {
-    let body = format!(
-        "<!DOCTYPE html>\n<html><head><title>{} {}</title></head>\n\
-         <body><h1>{} {}</h1></body></html>\n",
-        code, message, code, message
-    );
-
-    let date = format_time_rfc1123(libakuma::time());
-    let response = format!(
-        "HTTP/1.0 {} {}\r\n\
-         Date: {}\r\n\
-         Content-Type: text/html; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        code, message, date, body.len(), body
-    );
-
-    stream.write_all(response.as_bytes())?;
+/// Send one of the compile-time error responses.
+///
+/// `message` is no longer a parameter: the text belongs to the status code and
+/// lives in `resp::ERROR_RESPONSES` alongside a `Content-Length` computed from
+/// the body it describes. Passing it in was how the two could disagree.
+fn send_error(stream: &TcpStream, code: u16) -> Result<(), Error> {
+    stream.write_all(resp::error_response(code))?;
     let _ = stream.shutdown(Shutdown::Write);
     Ok(())
 }
@@ -380,7 +483,7 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option
 
     let fd = open(&fs_path, open_flags::O_RDONLY);
     if fd < 0 {
-        let _ = send_error(stream, 404, "Not Found");
+        let _ = send_error(stream, 404);
         return;
     }
     close(fd);
@@ -407,7 +510,7 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option
     let result = match spawn_result {
         Some(r) => r,
         None => {
-            let _ = send_error(stream, 500, "Internal Server Error");
+            let _ = send_error(stream, 500);
             return;
         }
     };
@@ -469,7 +572,7 @@ fn handle_cgi_request(stream: &TcpStream, method: &str, path: &str, body: Option
 
     if timed_out {
         close(stdout);
-        let _ = send_error(stream, 504, "Gateway Timeout");
+        let _ = send_error(stream, 504);
         return;
     }
 

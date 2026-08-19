@@ -62,6 +62,10 @@ mod gic_v3;
 mod irq;
 #[cfg(all(kernel_tests, feature = "smoltcp"))]
 mod network_tests;
+// Device-level NIC counters' console half (`net-profile`). Measurement builds
+// only; see the module docs and `crates/akuma-net/src/nicstat.rs`.
+#[cfg(feature = "net-profile")]
+mod nic_profile;
 mod pmm;
 #[cfg(kernel_tests)]
 mod process_tests;
@@ -1305,6 +1309,32 @@ fn run_async_main() -> ! {
         }
     }
 
+    // ── virtio-net RX interrupt ────────────────────────────────────────────
+    //
+    // Until 2026-08-19 the timer (PPI 27) was the ONLY device interrupt this
+    // kernel registered, so the entire network stack was tick-driven: the
+    // async-main netpoll loop ends each lap in `wfi`, and `wait_until` parks a
+    // blocked socket reader in `blocking_relax` (`yield_now` + `wfi`). With no
+    // NIC interrupt the only thing that can end either wait is the scheduler
+    // tick — 3 ms on this host, because QEMU HVF declines to honour a WFI
+    // deadline below ~2.5 ms (`akuma_timer::policy::pick_tick`). Measured
+    // consequence: blocked readers parked for 4.9 ms on average, and an HTTP
+    // request that needs two such waits cost ~7 ms against Linux's ~0.55 ms.
+    // Full measurements: docs/archive/AKUMA_NET_ISSUES.md §3.1.
+    //
+    // Registering the NIC's SPI makes an arriving packet end the `wfi`
+    // immediately. The handler does nothing but acknowledge the device — see
+    // `nic_irq_handler` — because *returning from WFI* is the whole benefit;
+    // the netpoll loop is already sitting right behind it.
+    #[cfg(feature = "smoltcp")]
+    if let Some(slot) = akuma_net::smoltcp_net::nic_slot() {
+        let intid = VIRTIO_MMIO_SPI_BASE + slot;
+        irq::register_handler(intid, nic_irq_handler);
+        safe_print!(96, "[Net] virtio-net IRQ: slot {} -> INTID {}\n", slot, intid);
+    } else {
+        console::print("[Net] no virtio-net slot recorded; RX stays tick-driven\n");
+    }
+
     console::print("--- Network Initialization Done ---\n\n");
 
     // rump feature: bind the BSP's rump tap (/dev/net/tap0) to NIC1 on virtio-mmio-bus.4
@@ -1623,6 +1653,8 @@ fn run_async_main() -> ! {
 
         #[cfg(kernel_bkl_profile)]
         crate::bkl_profile::maybe_dump(now_us);
+        #[cfg(feature = "net-profile")]
+        crate::nic_profile::maybe_dump(now_us);
 
         GLOBAL_POLL_STEP.store(1, Ordering::Relaxed);
         // Poll network stack in a loop until no more progress.
@@ -1661,6 +1693,11 @@ fn run_async_main() -> ! {
                     break; // Safety cap to avoid starving other threads
                 }
             }
+            // Re-arm the NIC doorbell: the stack has now been polled, so the
+            // next arriving packet is entitled to another cross-core wake. See
+            // `NIC_WAKE_PENDING`.
+            #[cfg(kernel_smp_shared)]
+            NIC_WAKE_PENDING.store(false, Ordering::Relaxed);
             #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
             akuma_exec::bkl::dropped_window_close();
         }
@@ -1747,6 +1784,66 @@ fn run_async_main() -> ! {
         // burst-draining throughput is untouched. See docs/KNOWN_ISSUES.md #11.
         #[cfg(not(feature = "smoltcp"))]
         threading::idle_halt();
+    }
+}
+
+/// GIC INTID of virtio-mmio slot 0 on the QEMU `virt` machine.
+///
+/// QEMU wires virtio-mmio transport `i` to SPI `16 + i`, and an SPI's INTID is
+/// `32 + spi` — so slot `i` is INTID `48 + i`. The slot itself is not assumed:
+/// `akuma_virtio::probe` reports which one the NIC actually landed on, because
+/// QEMU's assignment order is not something to hard-code.
+#[cfg(feature = "smoltcp")]
+const VIRTIO_MMIO_SPI_BASE: u32 = 48;
+
+/// Set by the NIC interrupt when it has broadcast a wake, cleared once the
+/// network stack has actually been polled.
+///
+/// This is a **doorbell coalescer**, and it is what keeps the cross-core wake
+/// from becoming an IPI storm. Without it a broadcast per packet would cost
+/// `(cores - 1)` SGIs per frame, each entering `sgi_scheduler_handler_with_sp`
+/// and contending `POOL` — the shape behind `[SGI] POOL contended`. With it,
+/// during a burst the first packet rings the doorbell and every packet after it
+/// finds it already ringing, so the SGI rate is bounded by how fast the stack
+/// polls rather than by how fast packets arrive.
+/// Only exists where it is used: the doorbell is about waking *peer* cores, so a
+/// single-core build (`extreme-size` drops `smp-shared`) has nobody to poke.
+#[cfg(all(feature = "smoltcp", kernel_smp_shared))]
+static NIC_WAKE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// virtio-net interrupt handler: acknowledge, ring the cross-core doorbell,
+/// and return.
+///
+/// Deliberately does no network work. The interrupt exists to end a `wfi`, not
+/// to deliver packets — the async-main netpoll loop and every blocked
+/// `wait_until` are already polling, and they run the moment this returns. A
+/// handler that touched `NETWORK` would be taking a lock the core it just
+/// interrupted may be holding, which is the AB-BA wedge `PreemptGuard` exists
+/// to prevent. The acknowledge is a raw MMIO write for the same reason (see
+/// `akuma_net::smoltcp_net::nic_irq_ack`), which is what makes this handler
+/// legal on the `no-bkl-irq` dispatch path in `rust_irq_handler_with_sp`:
+/// exactly like the timer handler, it touches only device registers and
+/// atomics, never BKL-protected state.
+#[cfg(feature = "smoltcp")]
+fn nic_irq_handler(_irq: u32) {
+    akuma_net::smoltcp_net::nic_irq_ack();
+
+    // The SPI is routed to one core (GICD_IROUTER, affinity 0.0.0.0 — see
+    // `gic_v3::enable_irq`), so only that core's `wfi` ends. Every other core
+    // may be halted inside `blocking_relax` on behalf of a thread waiting for
+    // exactly this packet — `httpd` blocked in `accept`, an ssh session blocked
+    // in `recv` — and would sleep until its own timer tick. That is how the
+    // interrupt fixed the *minimum* latency (3.0 ms -> 0.38 ms measured) while
+    // leaving the median at milliseconds: the fast cases were the ones that
+    // happened to be waiting on the routed core.
+    //
+    // Poking every core with the scheduler SGI ends those halts. The SGI
+    // handler is the ordinary preemption path, so a woken core re-evaluates its
+    // run queue and the waiter's own `wait_until` loop polls the stack again.
+    #[cfg(kernel_smp_shared)]
+    if !NIC_WAKE_PENDING.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        gic::broadcast_sgi(gic::SGI_SCHEDULER);
     }
 }
 

@@ -9,6 +9,13 @@ edition = "2024"
 # this crate with `default-features = false` and NOT re-enabling `smoltcp`.
 default = ["smoltcp"]
 small-sockets = []
+# Device-level NIC instrumentation (`nicstat`): per-packet RX/TX/poll timing and
+# byte counts, plus how long blocking socket waits park in `blocking_relax`.
+# MEASUREMENT BUILDS ONLY — never ship it. Off by default and every recorder is
+# an empty inline body when off, so a normal build is byte-for-byte unchanged
+# (same discipline as the kernel's `bkl-profile`). Forwarded from the kernel's
+# feature of the same name; the kernel prints the windowed delta as `[NICSTAT]`.
+net-profile = []
 # Raise the per-listener backlog (socket.rs `MAX_BACKLOG`) and, on the
 # size-constrained profiles, the total socket budget (smoltcp_net.rs
 # `MAX_SOCKETS`), so a server can absorb more simultaneous *arrivals* than the

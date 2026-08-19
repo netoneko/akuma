@@ -69,6 +69,31 @@ verification anywhere in this tree anymore.
 | `curl https://...` fails in-kernel | There is no in-kernel HTTPS client (the kernel has no shell at all now — SSH is the userspace `/bin/sshd`) | BY DESIGN | Use a userspace HTTPS tool over the userspace shell |
 | Userspace TLS skips cert verification | Phase-1 libakuma-tls does NoVerify (MITM-vulnerable) | OPEN | No kernel fallback exists anymore to do full X.509; would need fixing in `libakuma-tls` itself if this matters |
 
+## Latency: is the NIC interrupt alive?
+
+Until 2026-08-19 the timer (PPI 27) was the only device IRQ this kernel
+registered, so the whole stack was tick-driven and a round trip cost
+milliseconds. That is fixed — but the fix is one MMIO configuration away from
+silently reverting, so check it first for any latency complaint:
+
+```bash
+grep -a "virtio-net IRQ" logs/your.log     # expect: slot 0 -> INTID 48
+```
+
+With `--features net-profile` the `[NICSTAT]` dump carries the live count:
+
+```
+[NICSTAT] w=3 nic_irq=179
+```
+
+`nic_irq=0` under real traffic means the SPI never reached the CPU (group,
+priority or route not programmed — see `gic_v3::enable_irq`), and every wait is
+back on the 3 ms scheduler tick. The other tell is `relax=N/Mms` in the same
+dump: a per-park average near the tick interval is the same symptom.
+
+Full investigation and the measured before/after:
+[`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md).
+
 ## Network debug knobs
 
 | Knob | Default | Effect |

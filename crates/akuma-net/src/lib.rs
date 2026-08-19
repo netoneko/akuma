@@ -20,6 +20,10 @@ pub mod dns;
 
 // Lock infrastructure for fine-grained locking (Phase 1 of BKL removal)
 pub mod locks;
+// Device-level traffic/latency counters. Always compiled (the module's public
+// API is the same either way); the counters themselves only exist under the
+// `net-profile` feature.
+pub mod nicstat;
 
 
 #[cfg(test)]
