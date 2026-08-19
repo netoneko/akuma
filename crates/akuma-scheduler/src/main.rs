@@ -34,7 +34,28 @@ fn main() {
         ));
         println!("| {name:<28} | {peak:>4} | {ratio:>12.1}x |");
     }
-    println!("\nNeither reaches 14.6x. How much wake latency would it take?\n");
+    println!("\nTick sensitivity: the tick is probe-selected from [1,2,3,5] ms and this");
+    println!("host refuses WFI below ~2.5 ms, so 3 ms is the live value, not 1 ms.\n");
+    println!("| tick | wake path  | -t 3 | -t 4 | collapse |");
+    println!("|-----:|-----------|-----:|-----:|---------:|");
+    for tick in [1_000_u64, 2_000, 3_000, 5_000] {
+        for (nm, w) in [("immediate", WakePlacement::Immediate), ("next tick", WakePlacement::NextTick)] {
+            let r: Vec<Report> = (1..=4)
+                .map(|t| {
+                    let mut c = Config::devbox(t);
+                    c.tick_us = tick;
+                    c.wake = w;
+                    Sim::new(c).run()
+                })
+                .collect();
+            let (_, ratio) = shape(&r);
+            println!(
+                "| {:>3} ms | {nm:<9} | {:>4.0} | {:>4.0} | {ratio:>7.1}x |",
+                tick / 1000, r[2].iters_per_sec, r[3].iters_per_sec
+            );
+        }
+    }
+    println!("\nHow much wake latency would it take?\n");
     println!("| futex wake latency | -t 3 | -t 4 | collapse |");
     println!("|-------------------:|-----:|-----:|---------:|");
     for lat in [60_u64, 250, 500, 1_000, 2_000, 5_000] {

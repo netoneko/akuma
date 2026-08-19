@@ -601,6 +601,38 @@ copies filled by two `read_at` calls — the mechanism behind "`-j4` is slower t
 [`runbooks/selfhost-kernel-build.md`](../../runbooks/selfhost-kernel-build.md)
 §5.1a).
 
+### Sizing: an elastic cap (2026-08-19)
+
+The cap is `RAM / FPCACHE_BASE_RAM_DIVISOR` (default 8), **plus up to
+`FPCACHE_INFLATE_PCT` (default 20%) of that base when free RAM can spare it** —
+512 MB base / 614 MB inflated at `MEMORY=4096`. `[FPCACHE]` prints
+`entries=<n>/<cap>` so the live cap is visible in the heartbeat.
+
+Why elastic rather than a bigger fixed number: a workload whose read-only
+working set lands just *over* the cap pays the worst case this cache has —
+`evict_mapped`, where the eviction frees nothing (the frame survives on its
+mappers' references) and still costs the next mapper a `read_at`. A llama.cpp
+decode hit exactly that with a 532 MB mmap'd model against the 512 MB cap:
+`entries=131072/131072 evict_mapped=20124`, ~2.6 K refaults/s steady-state
+(`archive/CROSS_CORE_THREAD_COLLAPSE.md` §3).
+
+Three properties make the growth safe:
+
+- **Grant and withdrawal use different thresholds** — grow only with
+  `FPCACHE_INFLATE_HEADROOM_MULT x` the inflation free, hold it until free RAM
+  falls below `1x`. `akuma_kacho::hysteresis` supplies the band; a workload
+  parked on the line cannot toggle the cap.
+- **Withdrawal evicts nothing.** The over-cap trim in `insert` is lazy, so an
+  over-cap cache drains one entry per subsequent insert, still preferring
+  unmapped victims. Acute pressure stays `shrink`'s job (below).
+- **Engaged-ness is derived, not stored** — the cap already knows whether the
+  inflation is granted, so no second copy can disagree with it.
+
+Reassessment runs every 512 *inserts*, and inserts only happen on a miss: it
+samples fastest exactly when the cache is under pressure and is silent when it
+is serving hits. `pmm::free_count` is two relaxed atomic loads, so it is safe
+inside the IRQ-masked `PAGES` region and cannot join a lock cycle.
+
 ### The refcount is the existing CoW refcount
 
 No new teardown code exists, and none should be added. `pmm::free_page` already

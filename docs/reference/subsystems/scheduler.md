@@ -322,6 +322,42 @@ Regression test: `park_wake_race_tests`
   EL1-interrupted, WAITING (blocked), or READY (yielded) currents still fall
   through to the idle switch.
 
+## Evaluating a placement policy before building it
+
+`crates/akuma-scheduler` (host-only, **not** in `default-members`) models this
+scheduler against a barrier-synchronous workload and scores candidate placement
+policies in about a second, instead of a kernel build + devbox boot + llama
+sweep per candidate:
+
+```bash
+HOST=$(rustc -vV | grep '^host:' | cut -d' ' -f2)
+cargo run -p akuma-scheduler --release --target $HOST
+```
+
+It already carries `RoundRobin` (pre-2026-08-19), `Immunity` (today's bounded
+displacement bypass), `Spread` (a placement governor) and `Pinned` (hard
+affinity), plus the netpoll wake policy as a separate axis. **Three conclusions
+from it are load-bearing for anyone about to change this file**
+(`../../archive/AKUMA_SCHEDULING_EXTRACTION.md`):
+
+- **Per-core run queues and hard affinity are not indicated.** A single global
+  queue reaches 99.8% of the work-conservation bound once netpoll's wake rate
+  is fixed; the queue structure was never the constraint. Affinity scores the
+  same as today and hides a netpoll starvation bug.
+- **`-t 4`'s collapse is wake latency, not oversubscription.** 5 runnable
+  threads on 4 cores costs ~10-15%; reproducing the measured 14.6x needs a
+  2-3 ms futex wake latency, which `CROSS_CORE_THREAD_COLLAPSE.md` §2
+  independently measured. So the remaining win is in the explicit-wake path
+  above, not in the placement scan.
+- **Score throughput and latency together.** The first spread-governor variant
+  "won" +14% purely by starving netpoll, and only packet latency exposed it.
+  A single global starvation bound cannot serve both a barrier thread (2 ms =
+  one barrier) and a packet (2 ms = a stalled ACK) — a latency class is needed.
+
+Self-tuning knobs in this subsystem should be built on `akuma-kacho`
+(`Latch` / `hysteresis` / `ramp` / `rate_per_sec`) rather than hand-rolled;
+that crate exists because three subsystems each rolled the same thing.
+
 ## Real (shared-kernel) SMP
 
 One shared kernel across all cores under real cross-core locks — see
@@ -333,6 +369,9 @@ BKL carve-outs.
 - `archive/MULTITASKING.md`, `archive/CONCURRENCY.md`, `archive/LOCK_REFERENCE.md`.
 - `archive/WAIT_QUEUES.md`, `archive/SYSCALL_BLOCKING.md`.
 - `archive/CONTEXT_SWITCH_FIX_2026.md`, `archive/TTBR0_AND_THREADING_FIXES.md`.
+- `archive/CROSS_CORE_THREAD_COLLAPSE.md` — the 2026-08-19 fixes above.
+- `archive/AKUMA_SCHEDULING_EXTRACTION.md` — `crates/akuma-scheduler` (policy
+  simulator) and `crates/akuma-kacho` (the shared self-tuning primitives).
 - `archive/MULTIKERNEL.md` — the removed one-kernel-per-core design (29
   commits); see `archive/TRIM_FAT_MULTIKERNEL.md` for the removal.
 - `archive/SCHEDULING_AUDIT.md` (2026-08-18) — docs-vs-code audit of this

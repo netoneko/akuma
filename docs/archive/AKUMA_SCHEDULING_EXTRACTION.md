@@ -99,8 +99,55 @@ it samples fastest exactly when the cache is under pressure and goes silent when
 it is serving hits. `pmm::free_count` is two relaxed atomic loads, no lock, so
 it is safe to call from the IRQ-masked region and cannot join a lock cycle.
 
-**Not yet measured against llama.** The mechanism is verified; the throughput
-claim is not. That is the first thing to run.
+### Measured 2026-08-19: the mechanism works, the throughput claim does not
+
+Devbox-smoltcp, SMP=4, MEMORY=4096, `llama-bench -p 0 -n 16 -mmp 1`, **5
+repeats** (`logs/fpcache_verify_boot.log`).
+
+**The mechanism is confirmed, cleanly:**
+
+```
+before:  entries=131072/131072  evict_mapped=20124
+after:   entries=133952/157286  evict=0  evict_mapped=0   (first pass)
+         entries=133952/157286  hits=133952 misses=133952 (second pass)
+```
+
+The working set is **133952 pages — genuinely 2880 pages (11 MB) larger than the
+old 131072 cap**, so it provably did not fit. With the inflation (157286 pages,
+614 MB) eviction stops entirely, 23334 pages spare, and a second `llama-bench`
+run serves all 133952 of its faults from cache with zero disk reads.
+
+**The throughput claim is not supported:**
+
+| `tg16` tok/s | `-t 1` | `-t 2` | `-t 3` | `-t 4` |
+|---|---:|---:|---:|---:|
+| before (§0 fixes, ranges over runs) | 44.8-45.6 | 67.9-68.2 | 73.7-96.3 | 5.8-6.6 |
+| **after, 5 repeats, mean +- stddev** | **45.4 +- 1.0** | **70.5 +- 2.9** | **69.6 +- 8.3** | **6.4 +- 1.2** |
+
+Every cell overlaps its predecessor. `-t 2` is up ~3% and `-t 3` down ~5%, both
+inside a spread that is 12% at `-t 3` and 18% at `-t 4`. **No measurable
+throughput change.**
+
+### Why the counter was alarming and inert
+
+`evict_mapped` counts evictions that had to take a still-mapped entry. Its cost
+is documented as "the next mapper pays a `read_at`" — and that is exactly the
+loophole. llama.cpp maps the model **once**, in one long-lived process. The
+eviction drops the *cache's* reference; the frame survives on llama's own
+mapping and llama never unmaps it. So there was no next mapper, and the 20124
+evictions cost this workload nothing.
+
+`CROSS_CORE_THREAD_COLLAPSE.md` §3 called this "the leading suspect for the
+remaining ~13% single-thread decode gap". **It is not.** The suspect was
+promoted on the strength of an alarming counter without checking whether the
+mechanism behind the counter could reach the workload.
+
+What the change *is* worth: any workload with **more than one mapper of the same
+oversized file** — concurrent `rustc`s on a 295 MB `librustc_driver.so`, several
+boxes sharing a rootfs — where "the next mapper" genuinely exists. The 50%
+hit rate on the second `llama-bench` run is that case in miniature. It is a
+real fix for the case it addresses; it was simply not the case being measured.
+The `-t 1` gap versus Linux remains unexplained.
 
 ---
 
@@ -160,6 +207,35 @@ to — locates it:
 | 5000 us | 3704 | 167 | 22.2x |
 
 Reproducing the measured 14.6x needs a wake latency of **~2-3 ms**.
+
+### Negative result: the tick is NOT the 2-3 ms
+
+The obvious candidate was tick granularity. The tick is probe-selected from
+`[1, 2, 3, 5] ms` (`akuma_timer::policy::PROBE_CANDIDATES_US`) and this
+darwin/arm64 host declines to sleep a vCPU below ~2.5 ms, so the live tick is
+**3 ms, not the 1 ms the model was first configured with** — which sits exactly
+in the band the collapse needs. It looked like three independent things
+agreeing.
+
+It is wrong. Sweeping the tick with everything else held:
+
+| tick | wake path | `-t 3` | `-t 4` | collapse |
+|---:|---|---:|---:|---:|
+| 1 ms | next tick | 3704 | 2111 | 1.8x |
+| 2 ms | next tick | 3704 | 2214 | 1.7x |
+| 3 ms | next tick | 3704 | 2299 | 1.6x |
+| 5 ms | next tick | 3704 | 2498 | 1.5x |
+
+A longer tick makes `-t 4` slightly **better**, not worse: the longer wait per
+displacement is more than offset by there being fewer displacements. The two
+effects cancel, and tick granularity is not a lever here in either direction.
+
+So the 2-3 ms is a delay *between the futex wake being issued and the woken
+thread becoming runnable at all* — not queueing behind the rotation, and not
+the tick. That points inside the futex implementation (the wake path itself,
+the 200 ms revalidation backstop, a lost wake needing re-check), not at the
+scheduler's placement scan. It is a sharper claim than the one this section
+started with, and a narrower place to look.
 
 That number was not fitted to anything — it falls out of throughput. And it
 lands on top of a completely independent hardware measurement:
@@ -356,8 +432,10 @@ direction that flatters us.
 
 ## 10. What to do next, in order
 
-1. **Re-run the llama sweep** against the elastic fpcache (§1). The mechanism is
-   verified on a boot; the throughput claim is not measured at all.
+1. ~~Re-run the llama sweep against the elastic fpcache~~ — **DONE** (§1).
+   Mechanism confirmed, throughput unchanged, and the "leading suspect for the
+   remaining 13%" claim is retracted. The `-t 1` gap versus Linux is open again
+   with no leading suspect.
 2. **Instrument futex wake-to-run delay during a live `-t 4` decode.** This is
    the one experiment that falsifies §4's central claim. If the delay is not
    milliseconds, this document is wrong and the `-t 4` diagnosis reverts.

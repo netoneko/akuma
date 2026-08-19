@@ -202,6 +202,9 @@ These are **compile-time** `pub const bool` — toggle in source and rebuild.
 | `COW_FORK_ENABLED` | `true` | Copy-on-Write fork. | `config.rs:301` |
 | `VFORK_FASTPATH_ENABLED` | `true` | vfork fast path. | `config.rs:311` |
 | `SHARED_FILE_PAGES_ENABLED` | `true` | Share one physical frame between all read-only mappers of a file page, keyed `(inode, file_offset)`, instead of a private copy per process. Fixes the `-jN` memory/I-O amplification. Off = per-process private file pages. | `config.rs` |
+| `FPCACHE_BASE_RAM_DIVISOR` | `8` | Base file-page cache cap as a divisor of total RAM. 8 = RAM/8 = 512 MB at `MEMORY=4096`. Lower it to starve the cache for an A/B. | `config.rs` |
+| `FPCACHE_INFLATE_PCT` | `20` | Extra cap allowed **on top of the base**, as a percent of the base, granted only while free RAM can spare it. 614 MB at `MEMORY=4096` — enough to hold a 532 MB mmap'd model that the base cap misses by 20 MB. `0` pins the cap at the base (old fixed behaviour). | `config.rs` |
+| `FPCACHE_INFLATE_HEADROOM_MULT` | `2` | Free RAM demanded before the inflation is granted, as a multiple of the inflation. Withdrawal happens at `1x`, so the two form a hysteresis band and the cap cannot flap. | `config.rs` |
 | `NETWORK_THREAD_RATIO` | `4` | Scheduler weight for the network thread. | `config.rs:222` |
 | `MAIN_THREAD_PRIORITY_BOOST` | `false` | Legacy; proportional scheduler is now default. | `config.rs:207` |
 | `ENABLE_PREEMPTION_WATCHDOG` | `true` | | `config.rs:275` |

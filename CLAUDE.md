@@ -7,7 +7,13 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 ## Layout
 
 - `src/` — Kernel (no_std Rust)
-- `crates/` — Host-testable extracted crates: `akuma-{exec,ext2,isolation,net,rump,terminal,vfs}`
+- `crates/` — Host-testable extracted crates:
+  `akuma-{exec,ext2,isolation,kacho,net,pmm,primitives,rump,terminal,timer,vfs,virtio}`.
+  `akuma-kacho` is the shared observe/decide/hysteresis layer every self-tuning
+  policy uses (timer-tick demotion, file-page cache cap, netpoll wake rate).
+  `akuma-scheduler` is host-only and **not** in `default-members`: it models
+  scheduler placement / netpoll wake policies so a candidate can be ranked in a
+  second instead of a devbox boot (`docs/archive/AKUMA_SCHEDULING_EXTRACTION.md`).
 - `userspace/` — ELF binaries (musl libc); current member list + one-liners: `docs/reference/userspace-layout.md`
 - `docs/` — Documentation (see below)
 - `scripts/` — Build and debug helpers

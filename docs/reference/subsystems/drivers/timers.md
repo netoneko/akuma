@@ -41,8 +41,23 @@ core per guest core (`archive/CPU_LOAD_REGRESSION_INVESTIGATION.md`,
 `archive/AKUMA_TIME_EXTRACTION.md`). At runtime the governor
 (`policy::governor_observe`, fed by the `timer::NETPOLL_ITERS` sensor)
 demotes the tick to 5 ms if the host stops honouring WFI after boot —
-latched, never re-promotes. `kernel_profile_extreme` skips the probe and
-keeps 10 ms.
+latched, never re-promotes. Since 2026-08-19 the latch itself is
+`akuma_kacho::Latch`, the shared primitive behind every self-tuning policy in
+the tree; the thresholds and the verdict are unchanged.
+`kernel_profile_extreme` skips the probe and keeps 10 ms.
+
+> **Caveat: the sensor is desensitised at SMP>1 (OPEN, 2026-08-19).**
+> `NETPOLL_ITERS` is incremented only by the BSP netpoll loop
+> (`src/main.rs:1445`), but `GOVERNOR_TICKS` is incremented by **every** core —
+> the timer handler is one shared dispatch table (`src/timer.rs:134`). Over a
+> `GOVERNOR_WINDOW_TICKS = 2000` window at SMP=4 only ~500 real ticks of BSP
+> wall time have elapsed, while the threshold is still
+> `2000 x SPIN_ITER_PER_TICK`, so the effective trip point is 40 iterations per
+> real tick instead of 10 — **4x desensitised, scaling with core count.**
+> Nothing has been attributed to it, and fixing it changes behaviour on a
+> demotion path, so it is recorded rather than changed. Do not read this
+> governor's verdict as evidence at SMP>1 until it is fixed
+> (`archive/AKUMA_SCHEDULING_EXTRACTION.md` §6).
 
 ## Why CNTV, not CNTP
 

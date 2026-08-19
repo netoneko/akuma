@@ -179,11 +179,21 @@ found and SGI'd); if a peer takes the work, this core keeps its thread.
 - **File-page-cache thrash under mmap'd models**: `[FPCACHE]
   entries=131072/131072 evict_mapped=20124` — the cache cap is 512 MB
   (131072 x 4 KB); the 532 MB model + binaries exceed it, so **mapped weight
-  pages are evicted and re-faulted continuously** (llama at `-t 1`:
-  pgfault=167268 / 302065 pages in 63 s ≈ 2.6 K faults/s steady-state). This is
-  the leading suspect for the remaining ~13% single-thread decode gap vs
-  Linux (`BENCHMARK_PERFORMANCE_ATTEMPT_0.md` §"decode"), and it charges every
-  thread count.
+  pages are evicted** (llama at `-t 1`: pgfault=167268 / 302065 pages in 63 s
+  ≈ 2.6 K faults/s steady-state).
+
+  **RETRACTED 2026-08-19.** This said "the leading suspect for the remaining
+  ~13% single-thread decode gap vs Linux". The cap was made elastic
+  (`AKUMA_SCHEDULING_EXTRACTION.md` §1) and `evict_mapped` went 20124 → **0**,
+  with the working set (133952 pages) provably larger than the old cap. Decode
+  did **not** move: 45.4 / 70.5 / 69.6 / 6.4 tok/s over 5 repeats, every cell
+  overlapping its predecessor. The reason is in the counter's own definition —
+  an `evict_mapped` costs "the next mapper a `read_at`", and llama maps the
+  model once, in one long-lived process, and never unmaps it. There was no next
+  mapper, so the 20124 evictions cost this workload nothing. The fix is real
+  for multi-mapper workloads (concurrent `rustc`s on `librustc_driver.so`,
+  boxes sharing a rootfs) and inert here. **The `-t 1` gap has no leading
+  suspect again.**
 - **The netpoll thread occupies ~93-97% of one core permanently**
   (`cpu_us` 1596 s of a 1710 s boot). Under `smp-shared` its loop WFIs with the
   BKL dropped each iteration, so part of that is *billed* wait, but host-side
@@ -224,6 +234,24 @@ found and SGI'd); if a peer takes the work, this core keeps its thread.
 | + bounded displacement bypass (§2B, ungated) | 34.3–36.9 | 21.8–22.3 | 1.5–1.7 | 0.46–0.47 |
 | + EL0 gate on §2B/§2.2 (BKL valve, required) | 39.3–40.4 | 5.6–6.0 | — | 0.18 |
 | **+ CNTKCTL EL0 counter access (§0, final)** | **44.8–45.6** | **67.9–68.2** | **73.7–96.3** | **5.8–6.6** |
+| + elastic file-page cache (later, 5 repeats ±stddev) | 45.4 ±1.0 | 70.5 ±2.9 | 69.6 ±8.3 | 6.4 ±1.2 |
+
+Per-stage deltas at `-t 2`, the most sensitive cell — note that two of the seven
+stages are **negative**, and that the last one is the whole story:
+
+| stage | `-t 2` factor | note |
+|---|---:|---|
+| 1. same-TTBR0 switch skip | **x2.0** | real, but not the dominant cost |
+| 2A. wake hint ON | x0.36 | **reverted** — the single-slot hint preempts the producer |
+| 2.2 keep-RUNNING fallback | x1.0 | no effect at `-t >= 2`; strictly better elsewhere |
+| 2B. displacement bypass (ungated) | x6.9 | **an illusion** — it won by shielding threads that were in EL1 *because of §0*, and it wedged the boot suite |
+| EL0 gate on 2B/2.2 | **x0.26** | a real **cost**, paid for correctness: without it the BKL release valve is gone |
+| 0. CNTKCTL EL0 counter access | **x11.7** | the actual fix, found last |
+| elastic file-page cache | x1.04 | inside noise; see §3's retraction |
+
+Cumulative `-t 2`: **1.61 → 70.5 tok/s, x43.8.** `-t 1` moved only x1.26
+(36.0 → 45.4) and essentially all of it came from the last two stages — which is
+the tell that everything before §0 was treating amplifiers, not the cause.
 
 Reading the table: the ungated bypass "won" `-t 2` largely by shielding threads
 that were in EL1 **because of the §0 trap storm** — once the storm is gone,
@@ -240,18 +268,33 @@ and the collapse inverts into real scaling. `-t 4` stays oversubscribed
    CNTFRQ traps), found via the `[EXCC]`/`mrs.` counters this investigation
    added. The counters stay in the heartbeat; a reappearing `e0.0x18` bucket
    means some new register joined the party.
-2. **`-t 4` oversubscription**: 4 compute threads + the netpoll thread on 4
-   cores. The netpoll core tax (~93-97% of one core, `cpu_us`-billed WFI
-   included) is the other half of this item. Real fix candidates: per-core run
-   queues + affinity (M5-class), or a cheaper netpoll idle mode.
+2. **`-t 4` oversubscription** — **RE-DIAGNOSED 2026-08-19, see
+   [`AKUMA_SCHEDULING_EXTRACTION.md`](AKUMA_SCHEDULING_EXTRACTION.md).**
+   Simulating this scheduler against a barrier-synchronous workload shows
+   oversubscription costs only ~10-15%: with a competent wake path, `-t 4` is
+   the *peak*, not a collapse. So this is **not** the `-t 4` mechanism — item 4
+   below is. What survives of this item is the netpoll core tax, which the
+   simulation values at ~20% and which a traffic-adaptive wake rate recovers in
+   full (99.8% of the work-conservation bound). **Per-core run queues +
+   affinity are not indicated**: the single global queue was never the
+   constraint, and hard affinity scores the same as today while hiding a
+   netpoll starvation bug.
 3. **FPCACHE sizing/policy** for mmap'd files larger than the cap — mapped-page
    eviction guarantees a steady refault tax on exactly the pages a decoding
    model streams. Candidates: raise the cap under high-RAM boots; exempt
    actively-mapped pages from eviction; per-file working-set hints.
-4. **Explicit-wake latency**: a futex-woken thread should run within SGI
-   latency on SOME core, without preempting the producer (what killed
-   Experiment A). Per-core hint slots, or wake-to-idle-core-first routing.
-   Much less urgent post-§0 (barriers rarely reach the futex path now).
+4. **Explicit-wake latency** — **PROMOTED to the top of this list
+   2026-08-19.** A futex-woken thread should run within SGI latency on SOME
+   core, without preempting the producer (what killed Experiment A). Per-core
+   hint slots, or wake-to-idle-core-first routing.
+
+   The "much less urgent post-§0" note that used to sit here was wrong. To
+   reproduce the measured 14.6x `-t 4` collapse, the simulation needs a futex
+   wake latency of **2-3 ms** — and §2 above independently measured 0.2-5 ms
+   per futex call on hardware, from the syscall side. Two unrelated
+   measurements, same millisecond-scale wake path. **This is the `-t 4`
+   mechanism.** The falsifying experiment: instrument wake-to-run delay during
+   a live `-t 4` decode; if it is not milliseconds, the simulation is wrong.
 5. Cross-AS `tlbi aside1, #0` (kernel-global-preserving flush) — §1 follow-up.
 6. Fix the two lying diagnostics (§3) — `fe()` needs an atomic RMW ring;
    the orphan check needs a per-tid re-check under the table lock.
@@ -272,3 +315,6 @@ and the collapse inverts into real scaling. `-t 4` stays oversubscribed
   session's "orphans" are NOT confirmed instances of it (see §3).
 - `DEVBOX_ISSUES.md` Issue 22 — the cross-box memory-isolation verification
   task filed alongside the §1 change.
+- [`AKUMA_SCHEDULING_EXTRACTION.md`](AKUMA_SCHEDULING_EXTRACTION.md) — the
+  follow-up that re-diagnosed open item 2, promoted item 4, ruled out per-core
+  run queues, and extracted `crates/akuma-kacho` + `crates/akuma-scheduler`.
