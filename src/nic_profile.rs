@@ -67,7 +67,7 @@ prev!(
     RX_PKTS, RX_BYTES, RX_BEGIN, RX_BEGIN_US, RX_DONE_US, RX_EMPTY,
     TX_PKTS, TX_BYTES, TX_US, TX_DROPS, TX_FLIGHT, TX_FLIGHT_US,
     LO_PKTS, LO_BYTES,
-    POLL_CALLS, POLL_PROGRESS, POLL_US,
+    POLL_CALLS, POLL_PROGRESS, POLL_US, POLL_WAIT_US, POLL_WAKE_US,
     RELAX, RELAX_US,
 );
 
@@ -94,6 +94,10 @@ fn load_prev() -> NicStat {
         poll_progress: g(&prev::POLL_PROGRESS),
         poll_us: g(&prev::POLL_US),
         poll_max_us: 0,
+        poll_wait_us: g(&prev::POLL_WAIT_US),
+        poll_wait_max_us: 0,
+        poll_wake_us: g(&prev::POLL_WAKE_US),
+        sockets_live: 0,
         relax: g(&prev::RELAX),
         relax_us: g(&prev::RELAX_US),
     }
@@ -118,6 +122,8 @@ fn store_prev(s: &NicStat) {
     p(&prev::POLL_CALLS, s.poll_calls);
     p(&prev::POLL_PROGRESS, s.poll_progress);
     p(&prev::POLL_US, s.poll_us);
+    p(&prev::POLL_WAIT_US, s.poll_wait_us);
+    p(&prev::POLL_WAKE_US, s.poll_wake_us);
     p(&prev::RELAX, s.relax);
     p(&prev::RELAX_US, s.relax_us);
 }
@@ -209,6 +215,24 @@ pub fn maybe_dump(now_us: u64) {
             fa,
             fb,
             d.tx_flight_max_us
+        );
+    }
+
+    // Decompose `poll`: waiting for NETWORK vs the post-drop wake_all pass. The
+    // remainder is the poll itself. A `poll_max` in the milliseconds is one of
+    // these three and they need different fixes.
+    if d.poll_calls > 0 {
+        let (wa, wb) = tenths(d.poll_wait_us, d.poll_calls);
+        crate::safe_print!(
+            160,
+            "[NICSTAT] w={} poll_wait={}ms({}.{}us/c max={}us) wake={}ms sockets={}\n",
+            w,
+            d.poll_wait_us / 1000,
+            wa,
+            wb,
+            d.poll_wait_max_us,
+            d.poll_wake_us / 1000,
+            d.sockets_live
         );
     }
 

@@ -849,7 +849,13 @@ pub fn poll() -> bool {
         // spinlock is never stranded across a context switch (fatal under the
         // BKL — see `PreemptGuard`). No-op on non-smp-shared builds.
         let _pg = PreemptGuard::new();
+        // Time the acquisition separately: `NETWORK` is a plain (unfair)
+        // `Spinlock`, so under 4-core contention a waiter can be starved, and
+        // `poll_us` alone cannot distinguish that from a slow poll or a slow
+        // wake pass.
+        let wait_t = nicstat::start();
         let mut guard = NETWORK.lock();
+        nicstat::record_poll_wait(wait_t);
         mark_acquire(NetSite::Poll);
         let result = if let Some(net) = guard.as_mut() {
             let timestamp = Instant::from_micros((runtime().uptime_us)() as i64);
@@ -926,6 +932,10 @@ pub fn poll() -> bool {
                 }
             }
 
+            // Publish the set size: `iface.poll()` above walks all of it, so this
+            // is the scaling term behind `poll_us`.
+            nicstat::record_sockets_live(net.sockets.iter().count());
+
             if matches!(p1, PollResult::SocketStateChanged) {
                 POLL_COUNT.fetch_add(1, Ordering::Release);
                 true
@@ -945,11 +955,15 @@ pub fn poll() -> bool {
     // with socket_can_recv_tcp et al. which hold SOCKET_TABLE→NETWORK.
 
     if socket_state_changed {
+        // Walks EVERY socket slot (MAX_SOCKETS) taking each one's waker lock,
+        // with SOCKET_TABLE held. Timed separately from the poll itself.
+        let wake_t = nicstat::start();
         crate::socket::with_table(|table| {
             for slot in table.iter().flatten() {
                 slot.wake_all();
             }
         });
+        nicstat::record_poll_wake(wake_t);
     }
 
     nicstat::record_poll(poll_t, socket_state_changed);

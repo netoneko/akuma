@@ -87,6 +87,25 @@ pub struct NicStat {
     pub poll_us: u64,
     /// Worst single `poll()` in µs.
     pub poll_max_us: u64,
+    /// Cumulative µs spent WAITING for the `NETWORK` spinlock inside `poll()`.
+    ///
+    /// Split out of `poll_us` because that number conflates three unrelated
+    /// things — lock wait, lock hold, and the post-drop `wake_all` pass over
+    /// every socket — and a `poll_max` of 3.7 ms could be any of them.
+    pub poll_wait_us: u64,
+    /// Worst single `NETWORK` acquisition wait in µs.
+    pub poll_wait_max_us: u64,
+    /// Live entries in the smoltcp `SocketSet` at the last dump — a LEVEL, not a
+    /// delta, so `delta()` passes it through unchanged.
+    ///
+    /// `iface.poll()` walks the whole set on every call, so this is the scaling
+    /// term behind `poll_us`. Under connection-per-request load the set fills
+    /// with `TimeWait`/`pending_removal` entries and per-poll cost climbs (10.5
+    /// -> 15.6 us measured across three benchmark runs).
+    pub sockets_live: u64,
+    /// Cumulative µs in `poll()`'s post-drop `wake_all` pass. Runs with `NETWORK`
+    /// released but takes `SOCKET_TABLE` and every slot's waker lock.
+    pub poll_wake_us: u64,
     /// Times a blocking socket op parked in `blocking_relax` (yield + WFI).
     pub relax: u64,
     /// Cumulative µs spent parked there — the wake-latency budget.
@@ -121,6 +140,11 @@ impl NicStat {
             poll_progress: self.poll_progress.saturating_sub(base.poll_progress),
             poll_us: self.poll_us.saturating_sub(base.poll_us),
             poll_max_us: self.poll_max_us,
+            poll_wait_us: self.poll_wait_us.saturating_sub(base.poll_wait_us),
+            poll_wait_max_us: self.poll_wait_max_us,
+            poll_wake_us: self.poll_wake_us.saturating_sub(base.poll_wake_us),
+            // A level, not a counter: report it as-is.
+            sockets_live: self.sockets_live,
             relax: self.relax.saturating_sub(base.relax),
             relax_us: self.relax_us.saturating_sub(base.relax_us),
         }
@@ -154,6 +178,7 @@ mod imp {
         TX_FLIGHT, TX_FLIGHT_US, TX_FLIGHT_MAX_US,
         LO_PKTS, LO_BYTES,
         POLL_CALLS, POLL_PROGRESS, POLL_US, POLL_MAX_US,
+        POLL_WAIT_US, POLL_WAIT_MAX_US, POLL_WAKE_US, SOCKETS_LIVE,
         RELAX, RELAX_US,
     );
 
@@ -198,6 +223,10 @@ mod imp {
             poll_progress: g(&POLL_PROGRESS),
             poll_us: g(&POLL_US),
             poll_max_us: g(&POLL_MAX_US),
+            poll_wait_us: g(&POLL_WAIT_US),
+            poll_wait_max_us: g(&POLL_WAIT_MAX_US),
+            poll_wake_us: g(&POLL_WAKE_US),
+            sockets_live: g(&SOCKETS_LIVE),
             relax: g(&RELAX),
             relax_us: g(&RELAX_US),
         }
@@ -207,6 +236,7 @@ mod imp {
         TX_MAX_US.store(0, Ordering::Relaxed);
         TX_FLIGHT_MAX_US.store(0, Ordering::Relaxed);
         POLL_MAX_US.store(0, Ordering::Relaxed);
+        POLL_WAIT_MAX_US.store(0, Ordering::Relaxed);
     }
 }
 
@@ -330,6 +360,30 @@ recorder! {
             imp::add(&imp::POLL_US, us);
             imp::max(&imp::POLL_MAX_US, us);
         }
+    }
+}
+
+recorder! {
+    /// Publish the current live socket-set size (a level, overwritten each call).
+    pub fn record_sockets_live(n: usize) {
+        imp::SOCKETS_LIVE.store(n as u64, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+recorder! {
+    /// Time spent waiting to acquire `NETWORK` in one `poll()`.
+    pub fn record_poll_wait(s: Started) {
+        if let Some(us) = elapsed(s) {
+            imp::add(&imp::POLL_WAIT_US, us);
+            imp::max(&imp::POLL_WAIT_MAX_US, us);
+        }
+    }
+}
+
+recorder! {
+    /// Time spent in `poll()`'s post-drop `wake_all` pass.
+    pub fn record_poll_wake(s: Started) {
+        if let Some(us) = elapsed(s) { imp::add(&imp::POLL_WAKE_US, us); }
     }
 }
 
