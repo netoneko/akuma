@@ -232,13 +232,12 @@ pub mod policy {
     /// window and both write the same value.
     #[must_use]
     pub struct Governor {
-        spin_windows: u32,
-        demoted: bool,
+        latch: akuma_kacho::Latch,
     }
 
     impl Governor {
         pub const fn new() -> Self {
-            Self { spin_windows: 0, demoted: false }
+            Self { latch: akuma_kacho::Latch::new() }
         }
 
         /// Feed one observation window: `idle_iters` idle-loop iterations
@@ -246,20 +245,12 @@ pub mod policy {
         /// exactly once, when the host has stopped honouring WFI (the idle
         /// loop is spinning) for [`SPIN_WINDOWS`] consecutive windows.
         /// Never re-promotes — flipping back mid-flight buys a second burn.
-        pub fn observe(&mut self, idle_iters: u64, ticks: u64) -> Option<u64> {
-            if self.demoted || ticks == 0 {
+        pub const fn observe(&mut self, idle_iters: u64, ticks: u64) -> Option<u64> {
+            if ticks == 0 {
                 return None;
             }
-            if idle_iters > ticks.saturating_mul(SPIN_ITER_PER_TICK) {
-                self.spin_windows += 1;
-            } else {
-                self.spin_windows = 0;
-            }
-            if self.spin_windows >= SPIN_WINDOWS {
-                self.demoted = true;
-                return Some(DEMOTE_TO_US);
-            }
-            None
+            let spinning = idle_iters > ticks.saturating_mul(SPIN_ITER_PER_TICK);
+            if self.latch.observe(spinning, SPIN_WINDOWS) { Some(DEMOTE_TO_US) } else { None }
         }
     }
 
@@ -276,13 +267,14 @@ pub mod policy {
     /// Static-wrapper convenience for the ISR: observe through the packed
     /// global governor state. Returns `Some(new_tick_us)` on demotion.
     pub fn governor_observe(idle_iters: u64, ticks: u64) -> Option<u64> {
-        let mut g = Governor::new();
         let packed = GOVERNOR.load(core::sync::atomic::Ordering::Relaxed);
-        g.spin_windows = (packed & 0xFFFF_FFFF) as u32;
-        g.demoted = packed >> 32 != 0;
+        let mut g = Governor {
+            latch: akuma_kacho::Latch::from_parts((packed & 0xFFFF_FFFF) as u32, packed >> 32 != 0),
+        };
         let verdict = g.observe(idle_iters, ticks);
+        let (consecutive, latched) = g.latch.into_parts();
         GOVERNOR.store(
-            u64::from(g.spin_windows) | (u64::from(g.demoted) << 32),
+            u64::from(consecutive) | (u64::from(latched) << 32),
             core::sync::atomic::Ordering::Relaxed,
         );
         verdict

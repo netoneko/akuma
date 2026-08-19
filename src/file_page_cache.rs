@@ -83,8 +83,25 @@ static PAGES: Spinlock<BTreeMap<(u32, usize), Entry>> = Spinlock::new(BTreeMap::
 /// (clock-like) instead of always dropping the numerically lowest inode.
 static EVICT_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
-/// Maximum entries. Set once at init from RAM size; 0 until then (cache off).
+/// Maximum entries **right now**: the base cap, plus the elastic inflation when
+/// free RAM can spare it. 0 until [`init`] runs (cache off). Re-derived by
+/// [`reassess_cap`]; every reader loads it fresh rather than caching it.
 static CAP_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+/// The un-inflated cap, fixed at [`init`] from RAM size. [`reassess_cap`] never
+/// takes the effective cap below this — memory pressure below the base is the
+/// [`shrink`] hook's job, not the cap's.
+static BASE_CAP_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+/// Inserts since the last [`reassess_cap`], so the free-RAM check runs on a
+/// coarse cadence instead of per insert. Inserts happen only on a *miss*, so
+/// this samples fastest exactly when the cache is under pressure and stops
+/// entirely when it is serving hits.
+static INSERTS_SINCE_REASSESS: AtomicUsize = AtomicUsize::new(0);
+
+/// Inserts between reassessments. At the ~2.6 K miss/s of a thrashing mmap'd
+/// workload that is ~5 checks/s; at a healthy hit rate it is silent.
+const REASSESS_EVERY_INSERTS: usize = 512;
 
 pub static HITS: AtomicUsize = AtomicUsize::new(0);
 pub static MISSES: AtomicUsize = AtomicUsize::new(0);
@@ -107,9 +124,85 @@ pub fn init(total_ram_bytes: usize) {
     if !crate::config::SHARED_FILE_PAGES_ENABLED {
         return;
     }
-    let cap = (total_ram_bytes / 8) / 4096;
-    CAP_PAGES.store(cap, Ordering::Relaxed);
-    crate::tprint!(128, "[fpcache] shared file-page cache enabled, cap={} pages\n", cap);
+    let divisor = crate::config::FPCACHE_BASE_RAM_DIVISOR.max(1);
+    let base = (total_ram_bytes / divisor) / 4096;
+    BASE_CAP_PAGES.store(base, Ordering::Relaxed);
+    CAP_PAGES.store(base, Ordering::Relaxed);
+    crate::tprint!(
+        160,
+        "[fpcache] shared file-page cache enabled, base cap={} pages (+{}% elastic)\n",
+        base,
+        crate::config::FPCACHE_INFLATE_PCT
+    );
+    // Boot is the cheapest moment there will ever be to grant the inflation, so
+    // take the first reading now instead of waiting for 512 misses to accumulate.
+    reassess_cap();
+}
+
+/// Pages the cap may grow by when RAM allows: [`config::FPCACHE_INFLATE_PCT`] of
+/// the base cap.
+///
+/// [`config::FPCACHE_INFLATE_PCT`]: crate::config::FPCACHE_INFLATE_PCT
+fn inflation_pages() -> usize {
+    BASE_CAP_PAGES
+        .load(Ordering::Relaxed)
+        .saturating_mul(crate::config::FPCACHE_INFLATE_PCT)
+        / 100
+}
+
+/// Re-derive the effective cap from current free RAM.
+///
+/// Grants the inflation while free RAM is at least
+/// [`config::FPCACHE_INFLATE_HEADROOM_MULT`]x the inflation, and withdraws it
+/// once free RAM falls below the inflation itself. Those are deliberately two
+/// different thresholds: a single one would let a workload parked on the line
+/// flip the cap on every call.
+///
+/// Withdrawing the inflation does **not** evict anything by itself — the
+/// over-cap trim in [`insert`] is lazy, so an over-cap cache drains one entry
+/// per subsequent insert, preferring unmapped victims exactly as it always has.
+/// Acute pressure is still [`shrink`]'s job; this only stops the cache *growing*
+/// into memory that someone else now needs.
+///
+/// Cheap enough to call from anywhere: `pmm::free_count` is two relaxed atomic
+/// loads (`akuma_pmm::stats`), no lock, so this is safe inside an IRQ-masked
+/// region and cannot participate in a lock cycle.
+///
+/// [`config::FPCACHE_INFLATE_HEADROOM_MULT`]: crate::config::FPCACHE_INFLATE_HEADROOM_MULT
+pub fn reassess_cap() {
+    if !crate::config::SHARED_FILE_PAGES_ENABLED {
+        return;
+    }
+    let base = BASE_CAP_PAGES.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let extra = inflation_pages();
+    if extra == 0 {
+        CAP_PAGES.store(base, Ordering::Relaxed);
+        return;
+    }
+    let free = crate::pmm::free_count();
+    // Engaged-ness is derived, not stored: the cap already knows whether the
+    // inflation is granted, and a second copy could disagree with it. Grow only
+    // with the full headroom free, but hold the growth until free RAM drops
+    // below the inflation itself — the band between those two is what stops a
+    // workload parked on the line toggling the cap on every reassessment.
+    let inflated = CAP_PAGES.load(Ordering::Relaxed) > base;
+    let want_inflated = akuma_kacho::hysteresis(
+        inflated,
+        free as u64,
+        extra.saturating_mul(crate::config::FPCACHE_INFLATE_HEADROOM_MULT.max(1)) as u64,
+        extra as u64,
+    );
+    if want_inflated != inflated {
+        CAP_PAGES.store(if want_inflated { base + extra } else { base }, Ordering::Relaxed);
+    }
+}
+
+/// Effective cap in pages (diagnostics / `[FPCACHE]` PSTATS line).
+pub fn cap() -> usize {
+    CAP_PAGES.load(Ordering::Relaxed)
 }
 
 // The eligibility predicate (AP-field test + the `SHARED_FILE_PAGES_ENABLED`
@@ -179,6 +272,13 @@ pub fn mark_icache_clean(inode: u32, file_off: usize, frame: PhysFrame) {
 pub fn insert(inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) {
     if !crate::config::SHARED_FILE_PAGES_ENABLED || inode == 0 {
         return;
+    }
+    // Re-derive the elastic cap on a coarse cadence. Placed before the read
+    // below so a freshly granted inflation takes effect on this very insert,
+    // and before the `PAGES` lock so it never lengthens that hold.
+    if INSERTS_SINCE_REASSESS.fetch_add(1, Ordering::Relaxed) >= REASSESS_EVERY_INSERTS {
+        INSERTS_SINCE_REASSESS.store(0, Ordering::Relaxed);
+        reassess_cap();
     }
     let cap = CAP_PAGES.load(Ordering::Relaxed);
     if cap == 0 {
@@ -327,8 +427,9 @@ pub fn shrink(want: usize) -> usize {
 pub fn stats_line(w: &mut dyn core::fmt::Write) {
     let _ = writeln!(
         w,
-        "[FPCACHE] entries={} hits={} misses={} evict={} evict_mapped={} inval={}",
+        "[FPCACHE] entries={}/{} hits={} misses={} evict={} evict_mapped={} inval={}",
         len(),
+        cap(),
         HITS.load(Ordering::Relaxed),
         MISSES.load(Ordering::Relaxed),
         EVICTIONS.load(Ordering::Relaxed),

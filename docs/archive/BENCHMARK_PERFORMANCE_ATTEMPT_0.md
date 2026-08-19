@@ -1,8 +1,30 @@
 # Benchmark performance, attempt 0 — Akuma vs Docker/Linux (2026-08-19)
 
-**Status: two workloads measured, at two core counts.** Redis (§1–§7, §9) and
-llama.cpp (§8), on one machine in one session, shape-matched, with the machine's
-other load audited.
+**Status: two workloads measured, at two core counts — and PARTLY SUPERSEDED
+the same day.** Redis (§1–§7, §9) and llama.cpp (§8), on one machine in one
+session, shape-matched, with the machine's other load audited.
+
+> ### Read this before quoting any number below
+>
+> Three kernel fixes landed *after* this document was written
+> ([`CROSS_CORE_THREAD_COLLAPSE.md`](CROSS_CORE_THREAD_COLLAPSE.md)), and every
+> measurement here predates all three. The dominant one — EL0 `CNTVCT_EL0` /
+> `CNTFRQ_EL0` reads trapping at ~1M pairs/s and being **emulated as zero** —
+> was burning 30–80% of every core on *any* workload, Redis included.
+>
+> | section | status |
+> |---|---|
+> | §8 llama.cpp `-t 1/2/3/4` = 36 / 1.6 / 0.28 / 0.18 | **SUPERSEDED.** Now 45.6 / 68.2 / 96.3 / 6.6. `-t 1` is above the Docker reference, not below it |
+> | §8 Result 1: decode at 86.6% of Linux | **SUPERSEDED.** Decode now exceeds the Linux reference at `-t 1` |
+> | §8 Result 2 "decode collapses with a second thread" | **FIXED** |
+> | §9 "Akuma burns ~9× more CPU per kernel crossing" | **STALE, direction known.** Every Redis cell here paid the same trap tax and the same per-switch full TLB flush. The 9× can only shrink. **Not yet re-measured** — `scripts/benchmarks/redis_matrix.sh` re-runs it |
+> | §4 fixed round-trip ceiling | **Probably still real** — it reproduced at two core counts and is a property of the single netpoll drain loop, which nothing has changed. Re-confirm before relying on it |
+> | §9 "it is what happens when two cores touch the same user page" | **REFUTED.** Memory is not slow; user PTEs are correct Normal WB inner-shareable. See `CROSS_CORE_THREAD_COLLAPSE.md` opening |
+> | §1–§3, §5–§7, §10 (method, arms, fairness, noise floor) | **Still valid** — these are about how to measure, not what was measured |
+>
+> The `-t 4` cell is the one open llama item, and
+> [`AKUMA_SCHEDULING_EXTRACTION.md`](AKUMA_SCHEDULING_EXTRACTION.md) since found that
+> oversubscription is *not* its mechanism — a ~2–3 ms futex wake latency is.
 
 Two workloads were used because they load opposite halves of the system, and
 together they say something neither says alone:

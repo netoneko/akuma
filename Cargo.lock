@@ -9,6 +9,7 @@ dependencies = [
  "akuma-exec",
  "akuma-ext2",
  "akuma-isolation",
+ "akuma-kacho",
  "akuma-net",
  "akuma-pmm",
  "akuma-primitives",
@@ -58,6 +59,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-kacho"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-net"
 version = "0.1.0"
 dependencies = [
@@ -88,6 +93,13 @@ name = "akuma-rump"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-scheduler"
+version = "0.1.0"
+dependencies = [
+ "akuma-kacho",
+]
+
+[[package]]
 name = "akuma-terminal"
 version = "0.1.0"
 dependencies = [
@@ -98,6 +110,7 @@ dependencies = [
 name = "akuma-timer"
 version = "0.1.0"
 dependencies = [
+ "akuma-kacho",
  "arm_pl031",
 ]
 

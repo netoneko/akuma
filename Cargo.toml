@@ -5,6 +5,7 @@ default-members = [
     "crates/akuma-exec",
     "crates/akuma-ext2",
     "crates/akuma-isolation",
+    "crates/akuma-kacho",
     "crates/akuma-net",
     "crates/akuma-pmm",
     "crates/akuma-primitives",
@@ -427,6 +428,10 @@ akuma-net = { path = "crates/akuma-net", default-features = false }
 # virtio Hal + MMIO probe + the block/rng/audio drivers.
 akuma-virtio = { path = "crates/akuma-virtio" }
 akuma-exec = { path = "crates/akuma-exec" }
+# The Chief: observe/decide/hysteresis primitives shared by every self-tuning
+# policy in the tree (timer-tick demotion, file-page cache cap, netpoll wake
+# rate). Takes reports, issues verdicts, never touches hardware.
+akuma-kacho = { path = "crates/akuma-kacho" }
 # Physical memory manager: bitmap allocator, frame tracking, UAF quarantine,
 # free/CoW event ledgers. `src/pmm.rs` is now a thin shim over this crate.
 akuma-pmm = { path = "crates/akuma-pmm" }

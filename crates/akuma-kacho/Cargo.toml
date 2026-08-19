@@ -1,0 +1,8 @@
+[package]
+name = "akuma-kacho"
+version = "0.1.0"
+edition = "2024"
+description = "The Chief: observe/decide/hysteresis primitives for self-tuning kernel policies"
+
+[lints]
+workspace = true

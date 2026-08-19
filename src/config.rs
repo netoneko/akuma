@@ -449,6 +449,44 @@ pub const VFORK_FASTPATH_ENABLED: bool = true;
 /// See `crate::file_page_cache`.
 pub const SHARED_FILE_PAGES_ENABLED: bool = true;
 
+/// Base size of the shared file-page cache, as a **divisor of total RAM**.
+/// `8` → RAM/8, which is 512 MB (131072 pages) at the devbox default
+/// `MEMORY=4096`. Sized once at boot in [`crate::file_page_cache::init`].
+///
+/// The cache is a *deduplicator*, not an extra consumer — an entry whose frame
+/// is still mapped costs nothing beyond the map node, since that frame was
+/// going to exist anyway — so this can be generous relative to the ext2 block
+/// cache. Lower it to starve the cache for an A/B.
+pub const FPCACHE_BASE_RAM_DIVISOR: usize = 8;
+
+/// Extra cache allowed on top of the base cap, as a **percentage of the base
+/// cap**, granted only while free RAM can spare it (see
+/// [`FPCACHE_INFLATE_HEADROOM_MULT`]). `20` → up to RAM/8 × 1.2, i.e. 614 MB at
+/// `MEMORY=4096`.
+///
+/// Why this exists: the base cap is a fixed fraction of RAM, and a workload
+/// whose read-only working set lands just *over* it pays the worst case the
+/// cache has — `evict_mapped`, where the eviction frees nothing (the frame
+/// survives on its mappers' references) and still costs the next mapper a
+/// `read_at`. The llama.cpp decode benchmark hit exactly that: a 532 MB mmap'd
+/// model against a 512 MB cap, `entries=131072/131072 evict_mapped=20124`, a
+/// steady ~2.6 K refaults/s charged to every thread count
+/// (`docs/archive/CROSS_CORE_THREAD_COLLAPSE.md` §3). A small elastic margin
+/// converts that cliff into a fit whenever the machine has the RAM to spare.
+///
+/// Set to `0` to pin the cap at the base and restore the old fixed behaviour.
+pub const FPCACHE_INFLATE_PCT: usize = 20;
+
+/// Free-RAM headroom demanded before the inflation is granted, as a multiple of
+/// the inflation itself. `2` → the extra pages are handed out only while at
+/// least twice that many pages are free.
+///
+/// The deflate threshold is deliberately *not* the same figure — the cap drops
+/// back to base only once free RAM falls below the inflation (1×), so the two
+/// thresholds bracket a hysteresis band and a workload sitting near the line
+/// cannot flap the cap on every reassessment.
+pub const FPCACHE_INFLATE_HEADROOM_MULT: usize = 2;
+
 /// **Diagnostic, OFF by default.** On every `file_page_cache` *hit*, re-read the page
 /// from disk and compare it against the cached frame before mapping it, printing
 /// `[FPC-BAD]` with the `(inode, file_off)` and the first differing byte on mismatch.

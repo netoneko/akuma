@@ -1,0 +1,16 @@
+[package]
+name = "akuma-scheduler"
+version = "0.1.0"
+edition = "2024"
+description = "Scheduler placement and netpoll wake policy: models, candidate policies, and the simulator that ranks them"
+publish = false
+
+[dependencies]
+akuma-kacho = { path = "../akuma-kacho" }
+
+[[bin]]
+name = "sched-sim"
+path = "src/main.rs"
+
+[lints]
+workspace = true

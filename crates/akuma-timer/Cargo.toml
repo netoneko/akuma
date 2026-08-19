@@ -8,4 +8,5 @@ description = "ARM generic timer hardware access, timekeeping, and the self-tuni
 workspace = true
 
 [dependencies]
+akuma-kacho = { path = "../akuma-kacho" }
 arm_pl031 = { version = "0.2", default-features = false }
