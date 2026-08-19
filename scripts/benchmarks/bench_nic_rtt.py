@@ -275,7 +275,7 @@ def _run_loop(fn, mode: str, host: str, port: int, count: int, warmup: int,
 # [NICSTAT] parsing
 # ---------------------------------------------------------------------------
 
-# The kernel prints three lines per window (src/nic_profile.rs). They are keyed
+# The kernel prints five lines per window (src/nic_profile.rs). They are keyed
 # by window number so a torn/interleaved serial log still reassembles: console
 # output from other threads lands between them routinely.
 _L1 = re.compile(
@@ -284,11 +284,22 @@ _L1 = re.compile(
 _L2 = re.compile(
     r"\[NICSTAT\] w=(\d+) tx_wait=(\d+)ms\(([\d.]+)us/pkt max=(\d+)us\) "
     r"rx_post=(\d+)ms\(([\d.]+)us\) rx_done=(\d+)ms")
+# `laps=` is the async-main loop rate and is NOT derivable from `poll=`: polls come
+# from every caller (wait_until polls up to 64x per blocked op, epoll polls,
+# socket_send/recv poll on the way out) and run ~10x laps. Deriving one from the
+# other is the error corrected in AKUMA_NET_ISSUES.md §11.5.
 _IRQ = re.compile(
-    r"\[NICSTAT\] w=(\d+) nic_irq=(\d+)(?: orphan=(\d+) tx_stall=(\d+))?")
+    r"\[NICSTAT\] w=(\d+) nic_irq=(\d+)(?: laps=(\d+))?(?: orphan=(\d+) tx_stall=(\d+))?")
 _L3 = re.compile(
     r"\[NICSTAT\] w=(\d+) poll=(\d+)c/(\d+)prog (\d+)ms\(([\d.]+)us/c max=(\d+)us\) "
     r"empty=(\d+) relax=(\d+)/(\d+)ms\(([\d.]+)us\)")
+# The socket-table line. `sockets=N/CAP` is the single most load-bearing field in a
+# window: at exactly CAP every accept runs `reclaim_pending_slots` under
+# `PreemptGuard` and throughput halves (AKUMA_NET_ISSUES.md §11.2), so a comparison
+# that does not report it cannot tell an arm's effect from the cliff.
+_L4 = re.compile(
+    r"\[NICSTAT\] w=(\d+) poll_wait=(\d+)ms\(([\d.]+)us/c max=(\d+)us\) "
+    r"wake=(\d+)ms sockets=(\d+)/(\d+) epoch_saves=(\d+)")
 
 
 def parse_nicstat(log_path: str) -> list[dict]:
@@ -319,8 +330,16 @@ def parse_nicstat(log_path: str) -> list[dict]:
                 w = windows.setdefault(int(m.group(1)), {"w": int(m.group(1))})
                 w["nic_irq"] = int(m.group(2))
                 if m.group(3) is not None:
-                    w["orphan"] = int(m.group(3))
-                    w["tx_stall"] = int(m.group(4))
+                    w["laps"] = int(m.group(3))
+                if m.group(4) is not None:
+                    w["orphan"] = int(m.group(4))
+                    w["tx_stall"] = int(m.group(5))
+            elif (m := _L4.search(line)):
+                w = windows.setdefault(int(m.group(1)), {"w": int(m.group(1))})
+                w.update(poll_wait_ms=int(m.group(2)), poll_wait_us=float(m.group(3)),
+                         poll_wait_max_us=int(m.group(4)), wake_ms=int(m.group(5)),
+                         sockets=int(m.group(6)), sockets_cap=int(m.group(7)),
+                         epoch_saves=int(m.group(8)))
             elif (m := _L3.search(line)):
                 w = windows.setdefault(int(m.group(1)), {"w": int(m.group(1))})
                 w.update(poll_calls=int(m.group(2)), poll_prog=int(m.group(3)),
