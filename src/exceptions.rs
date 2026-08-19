@@ -2618,6 +2618,9 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
 
     // Acknowledge the IRQ once, up front (the GIC IAR read needs no BKL).
     let irq_opt = crate::gic::acknowledge_irq();
+    if let Some(intid) = irq_opt {
+        note_irq_intid(intid);
+    }
 
     // BKL-free fast path (M5c): a scheduler SGI that preempted EL0. This core held no BKL,
     // and `sgi_scheduler_handler_with_sp` makes the switch atomic on POOL. Reconcile at
@@ -2825,6 +2828,23 @@ fn note_exception_entry() {
     if core < EXCEPTION_ENTRIES.len() {
         EXCEPTION_ENTRIES[core].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Per-INTID IRQ entry counts (INTIDs >= 63 pool in the last slot). Companion to
+/// [`EXCEPTION_ENTRIES`]: that told us "~1M vector entries/s/core under llama
+/// decode" without saying WHICH exception; this decomposes the IRQ share so a
+/// screaming interrupt is attributable to its source (SGI 0 = scheduler, PPI 27
+/// = CNTV tick, SPIs = virtio). Printed next to `[EXC]` in the heartbeat.
+pub static IRQ_BY_INTID: [core::sync::atomic::AtomicU64; 64] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [INIT; 64]
+};
+
+#[inline(always)]
+fn note_irq_intid(intid: u32) {
+    let slot = (intid as usize).min(IRQ_BY_INTID.len() - 1);
+    IRQ_BY_INTID[slot].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Write faults absorbed because the PTE already granted the write — the access

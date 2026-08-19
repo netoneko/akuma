@@ -1521,6 +1521,34 @@ thread-group bookkeeping that exists), `Threads` should count the group, and
 `/proc/<pid>/task/` should enumerate it. The first is the cheapest and fixes the
 `ps` over-count on its own.
 
+## Issue 22: cross-box memory isolation has never been verified
+
+**Status: OPEN (verification task), filed 2026-08-19** during the same-TTBR0
+context-switch work (the SGI switch now skips the `msr ttbr0_el1` +
+`tlbi vmalle1` when the incoming thread's tables are already live —
+`crates/akuma-exec/src/threading/mod.rs`).
+
+Nobody has demonstrated that a process inside one box **cannot** read or write
+memory belonging to a process in another box (or on the host side of the VM).
+Isolation is assumed from the per-process page-table design — every process gets
+its own L0 and user PTEs are `nG` — but there is no test that attacks it:
+
+- probe another process's known VA ranges from a box and assert `SIGSEGV`, not
+  data;
+- fork/exec churn while probing, to catch stale-TLB windows (the exact class the
+  switch-path change touches: all address spaces share ASID 0, so a *missed*
+  flush on a cross-AS switch would surface as exactly this leak);
+- shared-page edges: file-page-cache pages (`is_shareable_mapping`), CoW frames
+  after fork, and `MAP_SHARED` mappings must only ever be shared by design,
+  never by accident of frame reuse (see the PMM-poison / premature-free class in
+  `COW_PILE_AUDIT.md`).
+
+**Why filed now**: the switch fast path narrows the flush to cross-AS
+transitions only. The safety argument (an equal TTBR0 is provably the same
+address space, because the live-TTBR0 free gate blocks L0 reuse) is written down
+at the skip site, but an adversarial in-VM test is the right way to pin it —
+and no such test exists for the *old* behavior either.
+
 ## Background
 
 - [`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md)

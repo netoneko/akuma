@@ -93,7 +93,12 @@ pub struct ExecRuntime {
     // Real shared-kernel SMP: nudge one idle peer core to reschedule so a just-woken
     // thread runs there promptly instead of waiting for that core's next timer tick.
     // No-op on single-core / non-SMP builds.
-    pub wake_remote_idle: fn(),
+    /// Ring one idle peer core's scheduler SGI so it can pick up READY work.
+    /// Returns `true` if an idle peer was found and rung, `false` if every peer
+    /// is busy (callers use this to decide whether displacing the current
+    /// thread is the only way to run queued work). Off shared-SMP: always
+    /// `false`.
+    pub wake_remote_idle: fn() -> bool,
     // Real shared-kernel SMP: send a scheduler SGI to a specific core (the woken
     // thread's last-known core) so its scheduler picks up the just-READY thread
     // without waiting for the ~10 ms timer tick. No-op on single-core / non-SMP.

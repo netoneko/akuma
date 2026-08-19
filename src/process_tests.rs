@@ -196,6 +196,12 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_vfs_parallelism();
 
+    // Same-TTBR0 context switches skip the `msr ttbr0_el1` + `tlbi vmalle1` (the
+    // per-quantum full TLB flush that made same-process thread workloads 22x slower
+    // under SMP). Threads sharing one set of tables must still see each other's
+    // stores across every switch through the skip path.
+    test_same_ttbr0_switch_pingpong();
+
     // Thread-slot exhaustion must be recoverable: a spawn that finds no free slot has to
     // collect cooled-down terminated slots itself instead of reporting ENOMEM.
     test_thread_slot_reclaim_on_spawn();
@@ -1410,6 +1416,76 @@ fn test_smp_shared_exec_parallelism() {
             192,
             "[Test] smp_shared_exec_parallelism PASSED (measured; drop ON did not lower spins here: +{} — expected on host-cached disk)\n",
             spins_on.saturating_sub(spins_off)
+        );
+    }
+}
+
+/// Regression test for the same-TTBR0 context-switch fast path: the SGI switch
+/// (`crates/akuma-exec/src/threading/mod.rs`) skips the `msr ttbr0_el1` +
+/// `tlbi vmalle1` when the incoming thread's saved TTBR0 already matches the
+/// live register, so sibling threads of one address space (and all kernel
+/// threads, which share the boot table) no longer pay a full local TLB flush
+/// per switch. Two threads sharing the boot TTBR0 ping-pong a token through
+/// shared atomics with a yield at every hand-off: every hand-off is a
+/// same-TTBR0 switch through the skip path, and completing all rounds proves
+/// stores made before each switch-out are observed after the peer's switch-in.
+/// A stale translation surviving a skipped flush stalls the token and the test
+/// times out FAILED.
+fn test_same_ttbr0_switch_pingpong() {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const ROUNDS: usize = 200;
+    static TURN: AtomicUsize = AtomicUsize::new(0);
+    static COUNT_A: AtomicUsize = AtomicUsize::new(0);
+    static COUNT_B: AtomicUsize = AtomicUsize::new(0);
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    fn spawn_side(me: usize, counter: &'static AtomicUsize) -> Result<usize, &'static str> {
+        akuma_exec::threading::spawn_user_thread_fn(move || {
+            while counter.load(Ordering::SeqCst) < ROUNDS && !STOP.load(Ordering::SeqCst) {
+                if TURN.load(Ordering::SeqCst) == me {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    TURN.store(1 - me, Ordering::SeqCst);
+                }
+                akuma_exec::threading::yield_now();
+            }
+            let my_tid = akuma_exec::threading::current_thread_id();
+            akuma_exec::threading::mark_thread_terminated(my_tid);
+            loop {
+                akuma_exec::threading::yield_now();
+            }
+        })
+    }
+
+    if spawn_side(0, &COUNT_A).is_err() || spawn_side(1, &COUNT_B).is_err() {
+        STOP.store(true, Ordering::SeqCst);
+        console::print("[Test] same_ttbr0_switch_pingpong SKIPPED (no free thread slots)\n");
+        return;
+    }
+
+    let start = crate::timer::uptime_us();
+    while (COUNT_A.load(Ordering::SeqCst) < ROUNDS || COUNT_B.load(Ordering::SeqCst) < ROUNDS)
+        && crate::timer::uptime_us().saturating_sub(start) < 5_000_000
+    {
+        akuma_exec::threading::yield_now();
+    }
+    STOP.store(true, Ordering::SeqCst);
+
+    let a = COUNT_A.load(Ordering::SeqCst);
+    let b = COUNT_B.load(Ordering::SeqCst);
+    if a == ROUNDS && b == ROUNDS {
+        crate::safe_print!(
+            96,
+            "[Test] same_ttbr0_switch_pingpong PASSED ({} strict hand-offs)\n",
+            a + b
+        );
+    } else {
+        crate::safe_print!(
+            112,
+            "[Test] same_ttbr0_switch_pingpong FAILED (a={} b={} of {} rounds)\n",
+            a,
+            b,
+            ROUNDS
         );
     }
 }

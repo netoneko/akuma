@@ -431,7 +431,7 @@ pub(crate) fn build_exec_runtime(
         #[cfg(kernel_smp_shared)]
         wake_remote_idle: smp_shared::wake_remote_idle,
         #[cfg(not(kernel_smp_shared))]
-        wake_remote_idle: || {},
+        wake_remote_idle: || false,
         // Direct a scheduler SGI at the woken thread's last-known core so its
         // scheduler picks up the READY thread promptly. No-op off shared-SMP.
         #[cfg(kernel_smp_shared)]
@@ -1530,6 +1530,22 @@ fn run_async_main() -> ! {
                     e[2].load(Ordering::Relaxed), e[3].load(Ordering::Relaxed),
                     e[4].load(Ordering::Relaxed), e[5].load(Ordering::Relaxed),
                     e[6].load(Ordering::Relaxed), e[7].load(Ordering::Relaxed));
+                // Decompose the IRQ share by INTID (companion counter, see
+                // exceptions::IRQ_BY_INTID). Only nonzero slots print, so this
+                // stays one short line on a healthy system.
+                {
+                    let mut w = console::StackWriter::<192>::new();
+                    let _ = core::fmt::Write::write_str(&mut w, "[IRQS]");
+                    for (id, c) in exceptions::IRQ_BY_INTID.iter().enumerate() {
+                        let v = c.load(Ordering::Relaxed);
+                        if v != 0 {
+                            let _ = core::fmt::Write::write_fmt(
+                                &mut w, format_args!(" {id}={v}"));
+                        }
+                    }
+                    let _ = core::fmt::Write::write_str(&mut w, "\n");
+                    w.flush();
+                }
             }
             // Deadlock-hunt aid: the Thread-0 heartbeat's dump trigger fires
             // every 50M idle loops (~never with idle_halt); piggyback on the

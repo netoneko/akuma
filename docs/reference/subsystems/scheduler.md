@@ -84,9 +84,22 @@ the CPU.
 
 - Saves/restores the full trap frame (`THREAD_CURRENT_TRAP_FRAME` per slot) +
   callee-saved regs + TPIDR_EL1 (exception SP) + TTBR0 swap.
-- **Key invariant:** `flush_tlb_asid(0)` (all ASIDs) after a TTBR0 change that
-  affects shared L0 entries — sibling threads share L0 with different ASIDs.
-  Stale TTBR0 was the dominant bug class in `fork`/`vfork`/`clone_thread`
+- **Same-TTBR0 fast path (2026-08-19):** the switch skips both the
+  `msr ttbr0_el1` and the TLB flush when the incoming thread's saved TTBR0
+  equals the live register — sibling threads of one process, and all kernel
+  threads (shared boot table). Safe because the live-TTBR0 free gate
+  (`mmu::any_core_on_l0` + the saved-context arm) forbids freeing/reissuing an
+  L0 a core is parked on, so an equal value is provably the same address
+  space; page-table edits broadcast (`tlbi ...is`) under smp-shared. The old
+  unconditional `tlbi vmalle1` per switch (the ASID-0 crutch — kernel
+  translations included, since the kernel lives in the TTBR0 low half) cost
+  same-process thread workloads their whole TLB every quantum
+  (`../../archive/CROSS_CORE_THREAD_COLLAPSE.md` §1). Cross-AS switches keep
+  the full flush. Regression test: `test_same_ttbr0_switch_pingpong`.
+- **Key invariant (cross-AS switches):** full local flush after a TTBR0 change —
+  all address spaces share ASID 0, so stale entries from the previous AS would
+  be valid hits. Stale TTBR0 was the dominant bug class in
+  `fork`/`vfork`/`clone_thread`
   (all three call sites now set `child_ctx.ttbr0 = new_proc.address_space.ttbr0()`).
 
 ## The `POOL` gate (shared-SMP)
@@ -278,8 +291,29 @@ Regression test: `park_wake_race_tests`
   short sleeps a ~35 ms floor and making every poll-interval cap inert
   (`../../archive/SCHEDULING_INVESTIGATION.md`). The older
   `WAKEUP_LOCALITY_HINT` gate (arming the same hint from explicit
-  `ThreadWaker::wake` calls) stays off — that experiment measured no gain for
-  the rump sysproxy and is a separate knob on purpose.
+  `ThreadWaker::wake` calls) stays off — measured no gain for the rump
+  sysproxy, and re-measured **worse** for llama.cpp thread barriers
+  2026-08-19 (`tg16 -t 2` 2.5 → 1.15 tok/s: the single-slot hint preempts the
+  producer; `../../archive/CROSS_CORE_THREAD_COLLAPSE.md` §2A).
+- **Bounded displacement bypass (on since 2026-08-19, smp-shared only).** On an
+  involuntary tick that would displace a RUNNING, non-idle thread for another
+  READY thread, the scheduler first tries `wake_remote_idle()` (SGIs the lowest
+  idle peer core and reports whether one existed); if an idle core can take the
+  READY work, this core keeps its thread — for at most
+  `DISPLACEMENT_IMMUNITY_TICKS - 1 = 4` consecutive ticks (~5 ms effective
+  timeslice), then it rotates exactly as baseline. Applies to both the
+  round-robin scan and the network-boost path. Rationale + measurements
+  (llama `-t 2` decode 1.6 → 22 tok/s across this + the same-TTBR0 switch fix;
+  the unbounded variant starved sshd and is documented as a failure):
+  `../../archive/CROSS_CORE_THREAD_COLLAPSE.md` §2B. Off smp-shared,
+  `wake_remote_idle` is `|| false` and the bypass is inert.
+- **Idle-fallback keep-running (2026-08-19).** When the scan finds NO other
+  non-idle READY thread, a still-RUNNING current thread now stays on-core
+  (`return None`) instead of being switched out to the per-core idle thread —
+  the old behavior made every lone CPU-bound thread bounce
+  core → idle → another core on every tick. Safe: a RUNNING thread is never
+  picked by a peer's scan. A WAITING (blocked) or READY (yielded) current
+  still falls through to the idle switch.
 
 ## Real (shared-kernel) SMP
 
@@ -298,3 +332,7 @@ BKL carve-outs.
   subsystem; the source of the line references above.
 - `archive/SCHEDULING_INVESTIGATION.md` (2026-08-17/18) — the short-sleep
   floor / inert poll-knob investigation and its open measurement matrix.
+- `archive/CROSS_CORE_THREAD_COLLAPSE.md` (2026-08-19) — the llama.cpp
+  `-t N` 22x decode collapse: the per-switch full-TLB-flush fix, the
+  displacement-bypass and wake-hint experiments (one landed, one reverted),
+  and the open sync-exception-storm / FPCACHE-thrash items.

@@ -48,7 +48,12 @@ real SMP) — see `scripts/build_devbox_smoltcp.sh` and
   `_page`/`_range_all_asid`) broadcast over the inner-shareable domain (`...is`) under
   `kernel_smp_shared`, so a user address space edited on one core is coherent on peers
   running it. Real per-AS ASIDs are deferred (a perf optimization; all use ASID 0 today,
-  which is correct given private per-core TLBs + full local switch-flush + IS edits).
+  which is correct given private per-core TLBs + IS edits + the **cross-AS**
+  switch-flush). Since 2026-08-19 the switch-flush is conditional: a switch whose
+  incoming TTBR0 equals the live one skips both the install and the flush (same
+  address space by the live-TTBR0 free-gate argument) — the unconditional flush was
+  a 22x tax on same-process thread workloads
+  (`../../archive/CROSS_CORE_THREAD_COLLAPSE.md`).
 
 ## Boot / bringup
 

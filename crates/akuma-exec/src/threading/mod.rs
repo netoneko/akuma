@@ -583,11 +583,23 @@ static WOKEN_STATES: [AtomicBool; MAX_THREADS] = {
 /// scheduling delay — woken threads already run promptly via the SGI), so it
 /// stays disabled to keep baseline round-robin behavior. Kept for a future,
 /// more-targeted use. The real latency lever is the fiber rumpuser backend.
+/// Re-tested 2026-08-19 against the llama.cpp `-t N` barrier collapse: flipping
+/// it ON made decode WORSE (tg16 `-t 2`: 2.5 -> 1.15 tok/s) — the single-slot
+/// hint preempts the producer thread that still has compute left. Keep it off.
 static PREEMPT_WAKE_TID: AtomicUsize = AtomicUsize::new(MAX_THREADS);
 
 /// Master switch for the [`PREEMPT_WAKE_TID`] wakeup-locality experiment. Off:
 /// the hint is never set, so the scheduler is exactly baseline round-robin.
 const WAKEUP_LOCALITY_HINT: bool = false;
+
+/// Consecutive involuntary ticks each thread has declined displacement for (the
+/// scheduler's bounded displacement bypass — see `schedule_indices`). Relaxed:
+/// only the core currently running the slot's thread writes its counter.
+static DISPLACE_DEFER: [AtomicU8; MAX_THREADS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: AtomicU8 = AtomicU8::new(0);
+    [INIT; MAX_THREADS]
+};
 
 /// Wake-deadline preemption (2026-08-18, `SCHEDULING_AUDIT.md` /
 /// `SCHEDULING_INVESTIGATION.md`): when the scheduler's deadline wake-pass
@@ -2519,6 +2531,47 @@ impl ThreadPool {
             return None;
         }
 
+        // Involuntary-displacement bypass: on a timer tick that would swap out a
+        // thread still doing real work (RUNNING, not idle, didn't yield or block),
+        // first try handing the queued READY work to an IDLE peer core instead.
+        // `wake_remote_idle` rings the lowest idle peer's scheduler SGI and reports
+        // whether one existed; if so, this core keeps its thread and the idle core
+        // picks the READY thread up within SGI latency. Without this, the global
+        // round-robin displaced a compute thread on some core every tick whenever
+        // ANY other thread was READY — even with cores sitting idle — so threads
+        // of one process kept losing their barrier partners for ~a tick at a time
+        // (the llama.cpp `-t N` 14-22x decode collapse).
+        //
+        // BOUNDED, not unconditional: an unbounded bypass let a spinning thread
+        // monopolize its core for as long as any core anywhere was idle, which
+        // starved sshd/netpoll onto one shared core under llama `-t 3` load
+        // (973 preemption-watchdog hits, dropped ssh handshakes). A thread may
+        // decline displacement at most DISPLACEMENT_IMMUNITY_TICKS-1 consecutive
+        // ticks — an effective ~5 ms timeslice — then rotates exactly as before,
+        // so a queued READY thread waits a bounded few ticks, never forever.
+        // When every core is busy the bypass does nothing at all.
+        let displacement_bypass = |current_idx: usize| -> bool {
+            const DISPLACEMENT_IMMUNITY_TICKS: u8 = 5;
+            if voluntary
+                || IS_IDLE_THREAD[current_idx].load(Ordering::Relaxed)
+                || THREAD_STATES[current_idx].load(Ordering::SeqCst) != thread_state::RUNNING
+            {
+                return false;
+            }
+            let deferred = DISPLACE_DEFER[current_idx].load(Ordering::Relaxed);
+            if deferred >= DISPLACEMENT_IMMUNITY_TICKS - 1 {
+                DISPLACE_DEFER[current_idx].store(0, Ordering::Relaxed);
+                return false;
+            }
+            if (runtime().wake_remote_idle)() {
+                DISPLACE_DEFER[current_idx].store(deferred + 1, Ordering::Relaxed);
+                true
+            } else {
+                DISPLACE_DEFER[current_idx].store(0, Ordering::Relaxed);
+                false
+            }
+        };
+
         // Proportional scheduling for the network polling thread (run_async_main).
         // The network thread gets boosted every NETWORK_THREAD_RATIO scheduler ticks,
         // giving it a 1/N share of CPU time (e.g., 25% with ratio=4).
@@ -2530,6 +2583,11 @@ impl ThreadPool {
                 if THREAD_STATES[net_tid].load(Ordering::SeqCst) == thread_state::READY
                     && ON_CPU[net_tid].load(Ordering::SeqCst) == 0
                 {
+                    // Boost-path arm of the displacement bypass: if an idle peer can
+                    // run the net thread, don't take this core's working thread.
+                    if displacement_bypass(current_idx) {
+                        return None;
+                    }
                     // Same ON_CPU latch as commit_switch (this path bypasses it).
                     ON_CPU[current_idx].store(1, Ordering::SeqCst);
                     ON_CPU[net_tid].store(1, Ordering::SeqCst);
@@ -2613,6 +2671,11 @@ impl ThreadPool {
                     && !IS_IDLE_THREAD[next_idx].load(Ordering::Relaxed)
                     && ON_CPU[next_idx].load(Ordering::SeqCst) == 0
                 {
+                    // Round-robin arm of the displacement bypass (see above): an
+                    // idle peer takes the READY thread; this core keeps working.
+                    if displacement_bypass(current_idx) {
+                        return None;
+                    }
                     // Found a ready, non-idle thread to switch TO.
                     break;
                 }
@@ -2620,7 +2683,23 @@ impl ThreadPool {
                 next_idx = (next_idx + 1) % MAX_THREADS;
 
                 if next_idx == start_idx {
-                    // No non-idle READY thread. Fall back to THIS core's idle thread so
+                    // No non-idle READY thread anywhere. If the current thread is still
+                    // RUNNING (an involuntary tick preempted it, it did not block or
+                    // yield), keep it on this core: switching it out to idle here made
+                    // every CPU-bound thread bounce core -> idle -> another core on
+                    // every timer tick (the peer core's next tick picked it back up),
+                    // costing a context switch + cache/TLB locality per tick and — for
+                    // multi-threaded processes — regularly removing a barrier partner
+                    // from execution for ~a tick, which is what collapsed llama.cpp
+                    // `-t N` decode 14-22x. RUNNING is the safe gate: a RUNNING thread
+                    // is never picked by a peer core's scan (only READY is), so staying
+                    // put cannot double-run it; a WAITING (blocked) or READY (yielded)
+                    // current thread still falls through to the idle switch below,
+                    // which is what takes it off-CPU.
+                    if THREAD_STATES[current_idx].load(Ordering::SeqCst) == thread_state::RUNNING {
+                        return None;
+                    }
+                    // Fall back to THIS core's idle thread so
                     // the core has something to run (single-core: idle is slot 0, the
                     // original behavior of dropping to idle when nothing else is ready).
                     let idle = IDLE_SLOT_FOR_CORE[core_id].load(Ordering::Relaxed);
@@ -3184,21 +3263,38 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
                     THREAD_STATES[new_idx].load(Ordering::SeqCst));
             }
 
-            // Publish the transition to the per-core live-TTBR0 registry (the
-            // page-table-UAF free gate, see mmu::any_core_on_l0): PREV covers the
-            // outgoing table across the msr window, ACTIVE covers the incoming one
-            // from before the hardware can walk it.
-            let pub_core = crate::mmu::publish_l0_begin(new_ttbr0);
-            core::arch::asm!(
-                "dsb ish",
-                "msr ttbr0_el1, {ttbr0}",
-                "isb",
-                "tlbi vmalle1",
-                "dsb ish",
-                "isb",
-                ttbr0 = in(reg) new_ttbr0,
-            );
-            crate::mmu::publish_l0_end(pub_core);
+            // Same-TTBR0 switch (sibling threads of one process, or any thread
+            // resuming under the tables it left live): skip the install AND the
+            // full flush. Safe because an equal TTBR0 value here is provably the
+            // SAME address space, not a recycled L0 frame — the free gate
+            // (mmu::any_core_on_l0 + the saved-context arm) refuses to free an L0
+            // while this core's ACTIVE_L0 names it, so the frame cannot have been
+            // freed and re-issued in between. Staleness is covered too: page-table
+            // edits broadcast over the inner-shareable domain under smp-shared
+            // (mmu M3), and off smp-shared this core made the edits itself and
+            // flushed at edit time. The unconditional `tlbi vmalle1` this replaces
+            // was the ASID-0 crutch for CROSS-AS switches only — with a 1 ms tick
+            // it cost same-process thread workloads their whole TLB (and the
+            // kernel's, which lives in the TTBR0 low half) every quantum.
+            // The registry is left untouched on the skip: ACTIVE_L0 already names
+            // this L0 (or 0 = the never-freed boot table).
+            if new_ttbr0 != current_ttbr0 {
+                // Publish the transition to the per-core live-TTBR0 registry (the
+                // page-table-UAF free gate, see mmu::any_core_on_l0): PREV covers the
+                // outgoing table across the msr window, ACTIVE covers the incoming one
+                // from before the hardware can walk it.
+                let pub_core = crate::mmu::publish_l0_begin(new_ttbr0);
+                core::arch::asm!(
+                    "dsb ish",
+                    "msr ttbr0_el1, {ttbr0}",
+                    "isb",
+                    "tlbi vmalle1",
+                    "dsb ish",
+                    "isb",
+                    ttbr0 = in(reg) new_ttbr0,
+                );
+                crate::mmu::publish_l0_end(pub_core);
+            }
             
             if config().enable_sgi_debug_prints {
                 safe_print!(64, "[SGI-S] returning new_sp={:#x}\n", new_sp);

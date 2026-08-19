@@ -460,16 +460,19 @@ fn set_core_idle(core: usize, idle: bool) {
 
 /// Ring one idle peer core's scheduler SGI so it wakes from WFI, reschedules, and can
 /// pick up a just-woken READY thread now rather than on its next timer tick. Best-effort
-/// (a race that finds no idle core just falls back to the timer). Called from `wake()`
-/// via the `wake_remote_idle` runtime hook. No-op unless a peer is idle.
-pub fn wake_remote_idle() {
+/// (a race that finds no idle core just falls back to the timer). Reached via the
+/// `wake_remote_idle` runtime hook — the scheduler's displacement bypass calls it to
+/// route READY work to idle capacity instead of preempting a RUNNING thread.
+/// Returns `true` iff an idle peer was found and rung.
+pub fn wake_remote_idle() -> bool {
     let self_aff0 = read_mpidr() & 0xff;
     let mask = CORE_IDLE_MASK.load(Ordering::Acquire) & !(1u32 << self_aff0);
     if mask == 0 {
-        return; // no idle peer
+        return false; // no idle peer
     }
     let target = mask.trailing_zeros(); // lowest idle peer core
     crate::gic::trigger_sgi_core(target, SCHED_SGI);
+    true
 }
 
 /// Send a scheduler SGI to a specific core so its scheduler picks up a just-woken

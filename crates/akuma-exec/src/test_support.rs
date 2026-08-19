@@ -84,7 +84,7 @@ pub fn ensure_test_runtime() {
         enable_irqs: || {},
         end_of_interrupt: |_| {},
         trigger_sgi: |_| {},
-        wake_remote_idle: || {},
+        wake_remote_idle: || false,
         wake_core: |_| {},
         heap_stats: || (0, 0),
         is_memory_low: || false,
