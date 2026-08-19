@@ -45,6 +45,10 @@ pub struct NetRuntime {
     /// handle is generation-tagged so a stale registration cannot wake whatever
     /// later occupies the same thread slot.
     pub current_waker: fn() -> core::task::Waker,
+    /// This core's id (`MPIDR` aff0). Used to record which cores have a socket
+    /// waiter parked, so the NIC interrupt can wake exactly those instead of
+    /// broadcasting to all of them. Always 0 off `smp-shared`.
+    pub current_core_id: fn() -> u32,
     pub current_box_id: fn() -> u64,
     pub is_current_interrupted: fn() -> bool,
     pub rng_fill: fn(&mut [u8]),

@@ -553,6 +553,18 @@ where F: FnMut() -> bool
     let mut fruitless_progress_rounds: u32 = 0;
 
     loop {
+        // Wake epoch, read BEFORE we poll. `POLL_COUNT` is bumped by
+        // `smoltcp_net::poll()` on every `SocketStateChanged` — by ANY caller,
+        // including the netpoll drain thread and other sockets' waiters — so it
+        // is an accumulating record of "the stack moved", not a one-shot signal.
+        //
+        // That is the property `net-waker-park` (§8) failed to get from a waker
+        // list: `wake_all()` DRAINS, so a waiter had to re-register every lap and
+        // any wake landing during the poll x64 below was simply lost. A counter
+        // cannot be lost — if it moved, we notice, whenever we get around to
+        // looking.
+        let epoch = smoltcp_net::poll_count();
+
         // Drain all pending network work (not just one poll)
         let mut any_progress = false;
         for _ in 0..64 {
@@ -577,7 +589,18 @@ where F: FnMut() -> bool
 
         if !any_progress {
             fruitless_progress_rounds = 0;
+            // Someone ELSE advanced the stack while we were polling and checking.
+            // Our own `any_progress` is false because our polls found nothing,
+            // but the state we just judged `condition` against is already stale.
+            // Re-check rather than parking on it: parking here is precisely how a
+            // wake gets missed and the wait lands on the 3 ms tick instead.
+            if smoltcp_net::poll_count() != epoch {
+                crate::nicstat::record_epoch_save();
+                continue;
+            }
             let relax_t = crate::nicstat::start();
+            // Tell the NIC interrupt this core has someone waiting on it, so it
+            // can target its wake instead of broadcasting to every core.
             // Park properly instead of the old `blocking_relax()` (yield + WFI).
             // That left this thread READY, so nothing could target it: `wake_all`
             // walked an empty list and the only thing that ended the halt was an

@@ -63,11 +63,17 @@ macro_rules! prev {
 /// reached the CPU and the stack is still tick-driven.
 static PREV_NIC_IRQS: AtomicU64 = AtomicU64::new(0);
 
+/// async-main loop iterations — one wake/drain/halt cycle each. Incremented in
+/// `src/main.rs`; printed as a windowed delta so `laps` can be compared against
+/// `nic_irq` (what should be waking it) and `poll` (calls from all callers).
+pub static NETPOLL_LAPS: AtomicU64 = AtomicU64::new(0);
+static PREV_NETPOLL_LAPS: AtomicU64 = AtomicU64::new(0);
+
 prev!(
     RX_PKTS, RX_BYTES, RX_BEGIN, RX_BEGIN_US, RX_DONE_US, RX_EMPTY,
     TX_PKTS, TX_BYTES, TX_US, TX_DROPS, TX_FLIGHT, TX_FLIGHT_US,
     LO_PKTS, LO_BYTES,
-    POLL_CALLS, POLL_PROGRESS, POLL_US, POLL_WAIT_US, POLL_WAKE_US,
+    POLL_CALLS, POLL_PROGRESS, POLL_US, POLL_WAIT_US, POLL_WAKE_US, EPOCH_SAVES,
     RELAX, RELAX_US,
 );
 
@@ -97,6 +103,7 @@ fn load_prev() -> NicStat {
         poll_wait_us: g(&prev::POLL_WAIT_US),
         poll_wait_max_us: 0,
         poll_wake_us: g(&prev::POLL_WAKE_US),
+        epoch_saves: g(&prev::EPOCH_SAVES),
         sockets_live: 0,
         relax: g(&prev::RELAX),
         relax_us: g(&prev::RELAX_US),
@@ -124,6 +131,7 @@ fn store_prev(s: &NicStat) {
     p(&prev::POLL_US, s.poll_us);
     p(&prev::POLL_WAIT_US, s.poll_wait_us);
     p(&prev::POLL_WAKE_US, s.poll_wake_us);
+    p(&prev::EPOCH_SAVES, s.epoch_saves);
     p(&prev::RELAX, s.relax);
     p(&prev::RELAX_US, s.relax_us);
 }
@@ -192,11 +200,14 @@ pub fn maybe_dump(now_us: u64) {
     let (orphan, tx_stall) = akuma_net::virtio_rings::ring_health();
     #[cfg(not(feature = "net-noalloc"))]
     let (orphan, tx_stall) = (0u64, 0u64);
+    let laps_now = NETPOLL_LAPS.load(Ordering::Relaxed);
+    let laps = laps_now.saturating_sub(PREV_NETPOLL_LAPS.swap(laps_now, Ordering::Relaxed));
     crate::safe_print!(
-        128,
-        "[NICSTAT] w={} nic_irq={} orphan={} tx_stall={}\n",
+        160,
+        "[NICSTAT] w={} nic_irq={} laps={} orphan={} tx_stall={}\n",
         w,
         irqs,
+        laps,
         orphan,
         tx_stall
     );
@@ -225,14 +236,16 @@ pub fn maybe_dump(now_us: u64) {
         let (wa, wb) = tenths(d.poll_wait_us, d.poll_calls);
         crate::safe_print!(
             160,
-            "[NICSTAT] w={} poll_wait={}ms({}.{}us/c max={}us) wake={}ms sockets={}\n",
+            "[NICSTAT] w={} poll_wait={}ms({}.{}us/c max={}us) wake={}ms sockets={}/{} epoch_saves={}\n",
             w,
             d.poll_wait_us / 1000,
             wa,
             wb,
             d.poll_wait_max_us,
             d.poll_wake_us / 1000,
-            d.sockets_live
+            d.sockets_live,
+            smoltcp_net::socket_soft_cap(),
+            d.epoch_saves
         );
     }
 

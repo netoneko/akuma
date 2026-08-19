@@ -50,7 +50,24 @@ const MAX_SOCKETS: usize = 32;
     feature = "many-sessions",
     not(kernel_profile_extreme)
 ))]
-const MAX_SOCKETS: usize = 128;
+const MAX_SOCKETS: usize = 512;
+
+/// Where [`SOCKET_SOFT_CAP`] starts, and the size the table behaves as until
+/// pressure forces it wider.
+///
+/// `MAX_SOCKETS` is a *ceiling on the static storage*, not the operating size.
+/// Sizing the operating table generously is actively harmful: measured
+/// 2026-08-20, `iface.poll()` walks the whole `SocketSet` on every call, so
+/// per-poll cost tracks the table — **10.6 us at 128 slots, 45 us at 2048** —
+/// and the set saturates to whatever cap it is given (2047/2048 observed),
+/// because `TimeWait` accumulates faster than the 30 s timeout releases. A
+/// 2048-slot table measured **848 req/s against 1,052 at 128**.
+///
+/// Derived rather than per-profile so `extreme-size` (32 slots) starts at its
+/// own ceiling and never grows, while the devbox starts at the 128 that
+/// measured best and keeps the rest as headroom.
+const SOCKET_SOFT_CAP_START: usize = if MAX_SOCKETS < 128 { MAX_SOCKETS } else { 128 };
+
 // Reduced from 64KB to 16KB per direction to save heap memory.
 // 40 sockets × 32KB = 1.25MB vs 40 × 128KB = 5MB.
 // 16KB is still plenty for TLS handshakes and HTTP requests.
@@ -58,6 +75,7 @@ const TCP_RX_BUFFER_SIZE: usize = 16384;
 const TCP_TX_BUFFER_SIZE: usize = 16384;
 const EPHEMERAL_PORT_START: u16 = 49152;
 const SOCKET_GC_TIMEOUT_US: u64 = 30_000_000; // 30 seconds
+
 static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(EPHEMERAL_PORT_START);
 
 fn alloc_ephemeral_port() -> u16 {
@@ -812,6 +830,7 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
     let dhcp_handle = if enable_dhcp {
         log::info!("[SmolNet] DHCP enabled");
         let dhcp_socket = dhcpv4::Socket::new();
+        SOCKETS_LIVE.fetch_add(1, Ordering::Relaxed);
         Some(sockets.add(dhcp_socket))
     } else {
         None
@@ -819,6 +838,7 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
 
     let dns_servers = &[QEMU_DNS_SERVER];
     let dns_socket = dns::Socket::new(dns_servers, vec![]);
+    SOCKETS_LIVE.fetch_add(1, Ordering::Relaxed);
     let dns_handle = sockets.add(dns_socket);
     log::info!("[SmolNet] DNS socket initialized (server: 10.0.2.3)");
 
@@ -910,6 +930,21 @@ pub fn poll() -> bool {
             // Garbage collect pending removals.
             // Force-abort sockets stuck in non-Closed states for longer than
             // SOCKET_GC_TIMEOUT_US to prevent slot exhaustion.
+            //
+            // Runs on EVERY poll. Rate-limiting it to 100 ms was tried
+            // 2026-08-20 — reasonable on the face of it, since everything it
+            // collects is on a 10 s (smoltcp `CLOSE_DELAY`) or 30 s clock — and
+            // measured NO DIFFERENCE, so it was reverted as unearned complexity
+            // rather than as a regression.
+            //
+            // Normalised by traffic (the only fair comparison — poll count tracks
+            // packet count), gated vs ungated at ~12,160 rx packets/window:
+            // 6.96 vs 6.87/6.70 polls per packet, 10.7 vs 11.0/11.5 us per poll.
+            // That is noise.
+            //
+            // Why it is cheaper than it looks: `SocketSet::get` is an array index,
+            // not a scan, so the sweep is ~100 cheap operations per poll. Counting
+            // operations is not measuring them — see AKUMA_NET_ISSUES.md §10.
             let now_us = (runtime().uptime_us)();
             let mut i = 0;
             while i < net.pending_removal.len() {
@@ -926,6 +961,7 @@ pub fn poll() -> bool {
                         net.sockets.get_mut::<tcp::Socket>(handle).abort();
                     }
                     net.sockets.remove(handle);
+                    SOCKETS_LIVE.fetch_sub(1, Ordering::Relaxed);
                     net.pending_removal.swap_remove(i);
                 } else {
                     i += 1;
@@ -934,7 +970,11 @@ pub fn poll() -> bool {
 
             // Publish the set size: `iface.poll()` above walks all of it, so this
             // is the scaling term behind `poll_us`.
-            nicstat::record_sockets_live(net.sockets.iter().count());
+            // O(1): `SOCKETS_LIVE` is maintained on add/remove. It used to be
+            // `iter().count()` here, which made the meter a material part of what
+            // it measured — ~0.9 us/poll at 128 slots and ~14 us at 2048, which
+            // inflated the first 2048-slot experiment.
+            nicstat::record_sockets_live(sockets_live());
 
             if matches!(p1, PollResult::SocketStateChanged) {
                 POLL_COUNT.fetch_add(1, Ordering::Release);
@@ -1160,6 +1200,7 @@ fn reclaim_pending_slots(net: &mut NetworkState, want: usize) -> usize {
         let (handle, _) = net.pending_removal[idx];
         net.sockets.get_mut::<tcp::Socket>(handle).abort();
         net.sockets.remove(handle);
+        SOCKETS_LIVE.fetch_sub(1, Ordering::Relaxed);
         net.pending_removal.swap_remove(idx);
         freed += 1;
         RECLAIMED_SLOTS.fetch_add(1, Ordering::Relaxed);
@@ -1172,6 +1213,59 @@ fn reclaim_pending_slots(net: &mut NetworkState, want: usize) -> usize {
 /// large enough that a listener refilling an 8- or 32-deep backlog does not
 /// re-scan `pending_removal` on every single `socket_create`.
 const RECLAIM_BATCH: usize = 8;
+
+/// The table size actually enforced right now. Starts at
+/// [`SOCKET_SOFT_CAP_START`] and grows toward `MAX_SOCKETS` only under genuine
+/// pressure — see [`grow_soft_cap`].
+#[cfg(feature = "smoltcp")]
+static SOCKET_SOFT_CAP: AtomicUsize = AtomicUsize::new(SOCKET_SOFT_CAP_START);
+
+/// Grow the soft cap by 20 % (at least one slot), clamped to `MAX_SOCKETS`.
+///
+/// Called only when reclamation has already failed to free anything, i.e. the
+/// table is full of genuinely live connections rather than `TimeWait` corpses.
+/// That distinction is the whole design: growing on `TimeWait` pressure would
+/// walk the cap straight up to the ceiling and inherit the 2048-slot result
+/// (45 us per poll), whereas growing on *live* pressure trades a slightly more
+/// expensive poll for connections that would otherwise be refused.
+///
+/// Returns the new cap.
+#[cfg(feature = "smoltcp")]
+fn grow_soft_cap() -> usize {
+    let cur = SOCKET_SOFT_CAP.load(Ordering::Relaxed);
+    if cur >= MAX_SOCKETS {
+        return cur;
+    }
+    let next = (cur + cur / 5).max(cur + 1).min(MAX_SOCKETS);
+    SOCKET_SOFT_CAP.store(next, Ordering::Relaxed);
+    next
+}
+
+/// Live entries in the smoltcp `SocketSet`, maintained incrementally.
+///
+/// `SocketSet::iter().count()` is O(set) and there is no cheaper accessor, so
+/// every "how full are we" question used to walk the whole table — up to three
+/// times per `socket_create`, plus once per `poll()` for the profiler. At 128
+/// slots and ~90,000 polls/s that is over 10M iterations/s inside the `NETWORK`
+/// lock with IRQs masked; at 2048 slots it distorted the measurement it was
+/// taken for. Maintained here instead: `+1` on `add`, `-1` on `remove`, read as
+/// a single atomic load.
+#[cfg(feature = "smoltcp")]
+static SOCKETS_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Live socket count. O(1) — see [`SOCKETS_LIVE`].
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn sockets_live() -> usize {
+    SOCKETS_LIVE.load(Ordering::Relaxed)
+}
+
+/// The enforced table size right now. Diagnostic + the `[NICSTAT]` dump.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn socket_soft_cap() -> usize {
+    SOCKET_SOFT_CAP.load(Ordering::Relaxed)
+}
 
 /// Sockets reclaimed early by [`reclaim_pending_slots`]. A steadily climbing
 /// value means the socket budget is genuinely too small for the workload rather
@@ -1188,16 +1282,26 @@ pub fn reclaimed_slot_count() -> u64 {
 #[must_use]
 pub fn socket_create() -> Option<SocketHandle> {
     with_network(|net| {
-        if net.sockets.iter().count() >= MAX_SOCKETS {
+        let mut cap = SOCKET_SOFT_CAP.load(Ordering::Relaxed);
+        if sockets_live() >= cap {
             // Pressure valve before giving up: a full table under
             // connection-per-request traffic is usually full of `TimeWait`,
             // not of live connections. Reclaim a small batch rather than the
             // one slot needed — the scan is O(pending) and the caller here is
             // the listener refilling its backlog, so it is about to ask again
             // several more times.
-            let _ = reclaim_pending_slots(net, RECLAIM_BATCH);
-            if net.sockets.iter().count() >= MAX_SOCKETS {
-                return None;
+            let freed = reclaim_pending_slots(net, RECLAIM_BATCH);
+            if sockets_live() >= cap {
+                // Reclamation could not help: the table is full of LIVE
+                // connections, not corpses. Widen rather than refuse — see
+                // `grow_soft_cap` for why this is gated on `freed == 0` and not
+                // simply on being full.
+                if freed == 0 {
+                    cap = grow_soft_cap();
+                }
+                if sockets_live() >= cap {
+                    return None;
+                }
             }
         }
         let rx_buffer = tcp::SocketBuffer::new(vec![0; TCP_RX_BUFFER_SIZE]);
@@ -1207,6 +1311,7 @@ pub fn socket_create() -> Option<SocketHandle> {
         // Disable delayed ACK so receive-heavy workloads aren't throttled
         // to ~65KB/10ms by piggyback waiting.
         socket.set_ack_delay(None);
+        SOCKETS_LIVE.fetch_add(1, Ordering::Relaxed);
         Some(net.sockets.add(socket))
     }).flatten()
 }
@@ -1224,7 +1329,7 @@ const UDP_PAYLOAD_SIZE: usize = 1500;
 #[must_use] 
 pub fn udp_socket_create() -> Option<SocketHandle> {
     with_network(|net| {
-        if net.sockets.iter().count() >= MAX_SOCKETS {
+        if sockets_live() >= MAX_SOCKETS {
             return None;
         }
         let rx_meta = udp::PacketMetadata::EMPTY;
@@ -1238,6 +1343,7 @@ pub fn udp_socket_create() -> Option<SocketHandle> {
             vec![0u8; UDP_PACKET_COUNT * UDP_PAYLOAD_SIZE],
         );
         let socket = udp::Socket::new(rx_buffer, tx_buffer);
+        SOCKETS_LIVE.fetch_add(1, Ordering::Relaxed);
         Some(net.sockets.add(socket))
     }).flatten()
 }
@@ -1302,6 +1408,7 @@ pub fn udp_socket_close(handle: SocketHandle) {
         let socket = net.sockets.get_mut::<udp::Socket>(handle);
         socket.close();
         net.sockets.remove(handle);
+        SOCKETS_LIVE.fetch_sub(1, Ordering::Relaxed);
     });
 }
 

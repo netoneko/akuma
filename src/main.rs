@@ -1378,6 +1378,7 @@ fn run_async_main() -> ! {
             // timer — see `NetRuntime::park_until`.
             park_until: threading::schedule_blocking,
             current_waker: || threading::get_waker_for_thread(threading::current_thread_id()),
+            current_core_id: akuma_exec::bkl::current_core_id,
             current_box_id: || process::current_process_shared().map_or(0, |p| p.box_id),
             // Combined Ctrl-C + pthread_kill check, so a socket read blocked in
             // `wait_until` honours `tkill` the same way pipe/wait loops do.
@@ -1560,6 +1561,14 @@ fn run_async_main() -> ! {
 
     loop {
         timer::NETPOLL_ITERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Separate from NETPOLL_ITERS, which the tick governor swaps to 0 every
+        // window and so cannot be read for anything else. This is the async-main
+        // LAP rate — how often the loop wakes, drains and halts again. Distinct
+        // from `[NICSTAT] poll=`, which counts `smoltcp_net::poll()` calls from
+        // ALL callers (this drain, every `wait_until`, epoll, and the post-op
+        // flush in send/recv), and is therefore several times larger.
+        #[cfg(feature = "net-profile")]
+        crate::nic_profile::NETPOLL_LAPS.fetch_add(1, Ordering::Relaxed);
         // Profiler only: name the top-of-iteration housekeeping (heartbeat/pstats
         // logging, reclaim_terminated_slots, bkl_profile::maybe_dump) separately from
         // the smoltcp drain and herd polling below it, so a `netpoll` measurement
@@ -1893,6 +1902,23 @@ fn nic_irq_handler(_irq: u32) {
     // run queue and the waiter's own `wait_until` loop polls the stack again.
     #[cfg(kernel_smp_shared)]
     if !NIC_WAKE_PENDING.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        // Wake EVERY core, not just the ones with a parked socket waiter.
+        //
+        // Targeting was tried 2026-08-20 — a per-core count of waiters
+        // (`net_waiter_park`/`_unpark`), poked with `trigger_sgi_core` — on the
+        // reasoning that broadcasting ends the `wfi` on cores with nothing to do
+        // (2.5 async-main laps per NIC interrupt). It measured WORSE both times:
+        // laps per packet went 3.18 -> 6.5-7.6 and throughput ~1,100 -> 454-867
+        // req/s, with the swallowed-wake signature (fewer `relax` parks, each
+        // 2-3x longer).
+        //
+        // Why targeting cannot work as written: `blocking_relax` begins with
+        // `yield_now`, so a waiter can resume on a core it never marked, and the
+        // netpoll loop's own halt is a `wfi` rather than a park — so the set of
+        // "cores that need this packet" is not knowable at interrupt time from
+        // anything the waiters record. A broadcast is imprecise and cheap; a
+        // precise wake here is wrong more often than it is expensive.
+        // See docs/archive/AKUMA_NET_ISSUES.md §11.
         gic::broadcast_sgi(gic::SGI_SCHEDULER);
     }
 }

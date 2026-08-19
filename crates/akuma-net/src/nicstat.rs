@@ -95,6 +95,10 @@ pub struct NicStat {
     pub poll_wait_us: u64,
     /// Worst single `NETWORK` acquisition wait in µs.
     pub poll_wait_max_us: u64,
+    /// Times a waiter was about to park, noticed the wake epoch had moved, and
+    /// looped to re-check instead. Zero means the epoch guard never fires and the
+    /// window it closes does not exist in practice.
+    pub epoch_saves: u64,
     /// Live entries in the smoltcp `SocketSet` at the last dump — a LEVEL, not a
     /// delta, so `delta()` passes it through unchanged.
     ///
@@ -144,6 +148,7 @@ impl NicStat {
             poll_wait_max_us: self.poll_wait_max_us,
             poll_wake_us: self.poll_wake_us.saturating_sub(base.poll_wake_us),
             // A level, not a counter: report it as-is.
+            epoch_saves: self.epoch_saves.saturating_sub(base.epoch_saves),
             sockets_live: self.sockets_live,
             relax: self.relax.saturating_sub(base.relax),
             relax_us: self.relax_us.saturating_sub(base.relax_us),
@@ -178,7 +183,7 @@ mod imp {
         TX_FLIGHT, TX_FLIGHT_US, TX_FLIGHT_MAX_US,
         LO_PKTS, LO_BYTES,
         POLL_CALLS, POLL_PROGRESS, POLL_US, POLL_MAX_US,
-        POLL_WAIT_US, POLL_WAIT_MAX_US, POLL_WAKE_US, SOCKETS_LIVE,
+        POLL_WAIT_US, POLL_WAIT_MAX_US, POLL_WAKE_US, SOCKETS_LIVE, EPOCH_SAVES,
         RELAX, RELAX_US,
     );
 
@@ -226,6 +231,7 @@ mod imp {
             poll_wait_us: g(&POLL_WAIT_US),
             poll_wait_max_us: g(&POLL_WAIT_MAX_US),
             poll_wake_us: g(&POLL_WAKE_US),
+            epoch_saves: g(&EPOCH_SAVES),
             sockets_live: g(&SOCKETS_LIVE),
             relax: g(&RELAX),
             relax_us: g(&RELAX_US),
@@ -360,6 +366,13 @@ recorder! {
             imp::add(&imp::POLL_US, us);
             imp::max(&imp::POLL_MAX_US, us);
         }
+    }
+}
+
+recorder! {
+    /// A waiter re-checked instead of parking because the wake epoch moved.
+    pub fn record_epoch_save() {
+        imp::add(&imp::EPOCH_SAVES, 1);
     }
 }
 
