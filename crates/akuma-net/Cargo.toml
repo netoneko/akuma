@@ -16,6 +16,24 @@ small-sockets = []
 # (same discipline as the kernel's `bkl-profile`). Forwarded from the kernel's
 # feature of the same name; the kernel prints the windowed delta as `[NICSTAT]`.
 net-profile = []
+# Static RX/TX frame rings + a non-blocking transmit path (`virtio_rings`).
+# OFF by default; forwarded from the kernel feature of the same name, which is
+# NOT in the kernel's `default` set either.
+#
+# Without it the device has ONE 2 KB receive buffer and ONE 2 KB transmit
+# buffer, which forces `VirtIONetRaw::send` — a spin until the host consumes the
+# descriptor, executed with `NETWORK` held and local IRQs masked. With it,
+# frames are staged in a BSS-resident ring and submitted with `transmit_begin`,
+# whose completion is reaped on a later pass.
+#
+# That halves the time the network stack holds its lock (measured: 472 ms ->
+# 211 ms of poll per 5 s window, tx wait 27.8 -> 9.2 us/pkt) but end-to-end HTTP
+# p90 got 2.9x WORSE, so it stays off pending the wake-latency work. Full
+# numbers and the hypothesis: the kernel's `net-noalloc` entry in the root
+# Cargo.toml, and docs/archive/AKUMA_NET_ISSUES.md §7.
+#
+# Costs ~32 KB of BSS (8 + 8 slots of 2 KB).
+net-noalloc = []
 # Raise the per-listener backlog (socket.rs `MAX_BACKLOG`) and, on the
 # size-constrained profiles, the total socket budget (smoltcp_net.rs
 # `MAX_SOCKETS`), so a server can absorb more simultaneous *arrivals* than the

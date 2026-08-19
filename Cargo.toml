@@ -324,6 +324,52 @@ bkl-profile = []
 # Parsed by scripts/benchmarks/bench_nic_rtt.py.
 net-profile = ["akuma-net/net-profile"]
 
+# Static RX/TX frame rings and a non-blocking transmit path in the virtio-net
+# device (`crates/akuma-net/src/virtio_rings.rs`). NOT in `default` — opt-in.
+#
+# The device ships with ONE 2 KB receive buffer and ONE 2 KB transmit buffer. A
+# single transmit buffer forces `VirtIONetRaw::send`, which is
+# `add_notify_wait_pop` — it spins until the host consumes the descriptor,
+# because the buffer must be free again by the time it returns. That spin runs
+# inside `iface.poll()`, inside the `NETWORK` spinlock, inside a `PreemptGuard`
+# that masks local IRQs. With a ring, `transmit_begin` submits and returns, and
+# completions are reaped on a later pass.
+#
+# It does what it says at the device layer, and measured 2026-08-19 on
+# devbox-smoltcp (SMP=4 MEMORY=4096, same httpd binary both arms) that is worth,
+# per comparable 5,040-packet `[NICSTAT]` window:
+#
+#     tx blocking wait   27.8 us/pkt (140 ms)  ->  9.2 us/pkt (46 ms)
+#     total poll time    472 ms               ->  211 ms
+#     httpd `read` phase 44-78 us             ->  7-9 us
+#
+# END TO END IT IS STILL A REGRESSION, which is why it is off:
+#
+#     req/s   1,071 -> 855      p50   658 us -> 639 us
+#     p90     1,172 us -> 3,433 us        p99   4,091 us -> 6,819 us
+#
+# The CPU cost fell and the wake latency rose: httpd's `accept` phase — the
+# kernel wait for the next connection — went from 66-77 % of the request to
+# 81-88 %.
+#
+# Notify suppression was tested as the cause and is only part of it. Forcing a
+# transmit-queue notify after every submit (`smoltcp_net::nic_kick_tx`, kept)
+# halves the worst submit-to-completion and recovers p99 6,819 -> 5,384 us and
+# 855 -> 938 req/s, still short of the single-buffer path. The leading remaining
+# suspect is that the per-packet `receive_begin` notify the rings amortise away
+# was doubling as the wake source: the single-buffer path takes ~25 % MORE NIC
+# interrupts for the same packets. Turn this on to work that problem, or to
+# measure a pipelined workload (redis) where the lock-hold win should dominate
+# and per-connection wake cost should not. Do not turn it on for latency.
+#
+# Costs ~32 KB of BSS (8 + 8 slots of 2 KB), held in dedicated statics rather
+# than in `NetworkState` — which is built on the stack before being moved into
+# the `NETWORK` static, so inline arrays would push 32 KB through a kernel stack
+# during init.
+#
+# Measurements: docs/archive/AKUMA_NET_ISSUES.md §7.
+net-noalloc = ["akuma-net/net-noalloc"]
+
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device
 # (NIC1) and exposes it as /dev/net/tap0 (open/read/write whole frames + a

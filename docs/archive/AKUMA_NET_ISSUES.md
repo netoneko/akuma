@@ -1,6 +1,8 @@
 # Akuma networking: why a round trip costs milliseconds (2026-08-19)
 
-**Status: measured, root-caused, three fixes landed and A/B-verified.** This is the investigation
+**Status: measured, root-caused, three fixes landed and A/B-verified; a fourth
+(static RX/TX rings, §7) is written and measured but left OFF because it
+regresses the tail.** This is the investigation
 record for the NIC-path audit. The procedures it produced live in
 [`../runbooks/debug-network.md`](../runbooks/debug-network.md); the numbers and
 the reasoning live here.
@@ -254,6 +256,7 @@ landing on the 3 ms tick rather than on a packet. Two candidates, untested:
 |---|---|---|
 | **virtio-net RX interrupt** | `src/gic_v3.rs`, `src/gic.rs`, `src/main.rs`, `crates/akuma-net/src/smoltcp_net.rs` | §6.1 / §6.2 below. Default-on |
 | **Pressure-driven socket reclaim** | `crates/akuma-net/src/smoltcp_net.rs` | §3.4. Default-on |
+| Static RX/TX rings + async TX | `crates/akuma-net/src/virtio_rings.rs`, `smoltcp_net.rs` | §7. **OFF** (`net-noalloc`): halves the lock hold, loses 2.9x on p90 |
 | NIC counters + `[NICSTAT]` dump | `crates/akuma-net/src/nicstat.rs`, `src/nic_profile.rs` | measurement only; off by default |
 | Round-trip benchmark + Linux control | `scripts/benchmarks/bench_nic_rtt.py`, `serial_httpd_ref.py` | measurement only |
 | httpd phase timing | `userspace/httpd/src/stats.rs` | measurement only, `HTTPD_STATS=1` |
@@ -319,13 +322,181 @@ Broadcasting per packet would cost `(cores - 1)` IPIs per frame, each entering
 loop, which bounds the SGI rate to how fast the stack polls rather than to how
 fast packets arrive.
 
-## 7. Not done
+## 7. Static RX/TX rings and async transmit — done, measured, and OFF
+
+`crates/akuma-net/src/virtio_rings.rs`, kernel feature `net-noalloc`
+(→ `akuma-net/net-noalloc`). **Not in `default`.** It does what §3.2 and §3.3
+said it would at the device layer, and it makes the end-to-end tail *worse*.
+Both halves of that are the finding.
+
+### 7.1 What it does
+
+- **RX**: 8 slots of 2 KB in BSS, all posted up front, so the device always has
+  somewhere to DMA. Replaces the single buffer that had to be re-posted per
+  packet.
+- **TX**: 8 slots. `transmit_begin` submits and returns; completions are reaped
+  on a later pass (`TxRing::reap`, called before every claim). Replaces
+  `VirtIONetRaw::send` — `add_notify_wait_pop`, which spins until the host
+  consumes the descriptor, with `NETWORK` held and local IRQs masked.
+
+Buffers are `static mut` rather than `NetworkState` fields because
+`NetworkState` is built on the stack and then moved into the `NETWORK` static;
+32 KB of inline arrays would go through a kernel stack during `init`. Same
+discipline as the pre-existing `SOCKET_STORAGE`.
+
+### 7.2 The device layer: it works
+
+Per comparable 5,040-packet `[NICSTAT]` window, `devbox-smoltcp`,
+`SMP=4 MEMORY=4096`:
+
+| | single buffer | rings |
+|---|---:|---:|
+| tx blocking wait | 27.8 us/pkt, **140 ms**/window | 9.2 us/pkt, **46 ms**/window |
+| total poll time | 472 ms | **211 ms** |
+| per poll call | 10.7 us | 5.7 us |
+| NIC interrupts | 6,071 | 4,879 |
+| `blocking_relax` parks | 3,918 | **4,644** |
+| `tx_stall` / `orphan` | — | **0 / 0** |
+
+94 ms of IRQ-masked spinning and 261 ms of `NETWORK`-lock-held time removed per
+5 s window — over half the lock hold. The ring never saturated (`tx_stall=0`)
+and never desynchronised from the used ring (`orphan=0`).
+
+### 7.3 End to end: it regresses
+
+Same `httpd` binary in both arms (`md5 6085451088b1545f5256892312c698f0`), same
+docroot, 400 requests per run, 10 runs for rings (across two boots) and 5 for
+the control. Medians:
+
+| | single buffer | rings | |
+|---|---:|---:|---|
+| req/s | 1,071 | 855 | **-20 %** |
+| min | 378 us | 394 us | flat |
+| p50 | 658 us | 639 us | -3 % |
+| p90 | 1,172 us | **3,433 us** | **2.9x worse** |
+| p99 | 4,091 us | **6,819 us** | **1.7x worse** |
+
+Forcing the transmit notify (§7.5) recovers part of this — 938 req/s, p90
+2,930 us, p99 5,384 us — and is kept, but does not close the gap.
+
+### 7.4 Where it went: `accept`, not compute
+
+`HTTPD_STATS=1`, in-load blocks only (the ~11 ms blocks in the log are the idle
+gaps between benchmark runs landing in `accept`, not measurements):
+
+| phase | single buffer | rings |
+|---|---:|---:|
+| `read` | 44-78 us | **7-9 us** |
+| `file` | 98-136 us | 49-122 us |
+| `write` | 62-114 us | 50-111 us |
+| `other` (compute) | 0-1 us | 0-1 us |
+| **`accept`** | 546-741 us (66-77 %) | **882-1,262 us (81-88 %)** |
+| wall/req | ~925 us | ~1,259 us |
+
+Every syscall got cheaper — `read` by 6x, which is precisely the reduced lock
+hold from 7.2 showing up where predicted. But `accept`, the kernel wait for the
+next connection, got longer, and it is 80-90 % of the request. **The change
+bought CPU and spent wake latency.** `other` is still 0 us, so server compute
+remains irrelevant, as in §2.
+
+### 7.5 The notify hypothesis — tested, real, and not enough
+
+**Hypothesis.** `transmit_begin` notifies the device only when
+`VirtQueue::should_notify()` allows, and QEMU negotiates `VIRTIO_F_EVENT_IDX`,
+so that can return false. `VirtIONetRaw::send` checks the same flag — but then
+spins until the used ring advances, which waits the suppression out and forces
+the host to consume the frame. Async submit has no such backstop.
+
+**Test.** Two changes, then the same 5-run sweep:
+
+1. A new counter, `[NICSTAT] tx_flight` — µs from `transmit_begin` to the
+   completion being observed in the used ring. Once transmit stops blocking,
+   `tx_wait` only covers the submit; `tx_flight` is where the rest of the cost
+   went.
+2. `smoltcp_net::nic_kick_tx()` — an unconditional write of the transmit queue
+   index to virtio-mmio `QueueNotify` (0x050) after every submit, using the
+   `NIC_MMIO_BASE` the IRQ handler already records. A spurious notify is a hint
+   by spec, so it does not need to second-guess `should_notify`.
+
+Also added: `reap` now runs once per poll lap (top of `Device::receive`), not
+only inside `claim`. Without that, a slot stays in flight for as long as nothing
+transmits — on request/response traffic, the entire gap between requests.
+
+**Result.** The suppression was real, and fixing it is a genuine but partial
+win:
+
+| | rings | rings + forced notify | single buffer |
+|---|---:|---:|---:|
+| `tx_flight` avg | 90.9 us | 76.7-83.1 us | n/a |
+| `tx_flight` max | **6,486 us** | **3,673-3,896 us** | n/a |
+| `tx_wait` (submit) | 9.1 us/pkt | **17.4 us/pkt** | 27.8 us/pkt |
+| req/s | 855 | **938** | **1,071** |
+| p50 | 639 us | 653 us | 658 us |
+| p90 | 3,433 us | **2,930 us** | **1,172 us** |
+| p99 | 6,819 us | **5,384 us** | **4,091 us** |
+
+The `tx_flight` worst case nearly halved and p99 fell 21 %, so notify
+suppression was **a** cause. It is **not the dominant one**: p90 is still 2.5x
+the single-buffer path. The kick also costs ~8 µs/packet of vmexit, which is why
+`tx_wait` doubled — still well under the 27.8 µs it replaced.
+
+**Caveat on `tx_flight`, stated because it is easy to over-read.** Reap runs
+once per poll lap and there are ~38,000 laps per 5 s window — one per ~130 µs.
+Sampling granularity alone can account for most of the ~80-90 µs mean, so
+**`tx_flight` is an upper bound on device latency, not a measurement of it**.
+The remaining max of ~3,700 µs is also suspiciously close to the 3 ms scheduler
+tick, which suggests what it is really catching there is a poll lap that did not
+happen (the core parked in `WFI`) rather than a device that was slow. A TX
+completion wakes nobody — only RX raises the interrupt — so after the last
+submit of a burst, nothing observes the completion until the next tick. That
+makes the counter useful for the *avail*-side question it was built for and
+unreliable as an absolute.
+
+**Still unexplained**, and where the next attempt should go: the single-buffer
+path takes ~25 % *more* NIC interrupts for the same packet count (6,071 vs
+4,741-4,909 per 5,040 frames), because it must re-post a receive buffer — and
+therefore notify — per packet. Those notifications may be doing double duty as
+the wake source. The rings amortise exactly them away. That would mean the win
+and the loss have the same cause, and the fix is an explicit wake rather than a
+shallower ring.
+
+### 7.6 A bug the measurement did not catch, found by reading
+
+The first version fell back to `VirtIONetRaw::send` when every TX slot was in
+flight. `send` is `add_notify_wait_pop`, and `pop_used` rejects any token that
+is not the used-ring **head** (`Error::WrongToken`) — which is guaranteed to be
+the case in the only situation that fallback is reached. It would have failed
+the send *and* leaked the descriptor chain permanently, shrinking the send queue
+until the NIC died. **`send` and `transmit_begin` cannot be interleaved on one
+queue; the ring must own it exclusively.** Replaced with a bounded reap-spin
+(`CLAIM_SPINS`) that drops the frame if the ring stays full, counted by
+`TX_STALLS` and printed as `tx_stall` in `[NICSTAT]`.
+
+### 7.7 Allocations in the packet path, after the change
+
+Audited because "noalloc" was the premise:
+
+- `virtio_rings.rs` and `nicstat.rs`: **zero** allocations. The rings hold only
+  tokens, indices and lengths; the frames are BSS.
+- The per-packet **external** path (RX complete → smoltcp → TX submit)
+  allocates **nothing**, and allocated nothing before either. There was never
+  anything to remove — the win available here was the spin, not the heap.
+- **One per-packet allocation remains**: `smoltcp_net.rs`, the loopback TX arm —
+  `vec![0u8; frame.len()]` plus a `VecDeque::push_back` per frame. It never
+  fires for external traffic (`lo=0p` in every window measured here) but fires
+  **once per frame for in-guest 127.0.0.1 traffic**. This is the same path that
+  raises no interrupt, so any traffic-adaptive netpoll backoff must count
+  loopback depth as well.
+- Socket rx/tx buffers, the DNS socket and UDP packet metadata allocate at
+  socket creation, not per packet.
+
+## 8. Not done
 
 1. **The p90/p99 tail** (§4) — the two candidates named there. This is now the
    whole remaining gap to Linux.
-2. **Async TX + static buffer rings** (§3.2, §3.3) — contained inside
-   `crates/akuma-net/src/smoltcp_net.rs`; worth ~20-30 us per round trip and
-   removes an IRQ-masked spin.
+2. **Fix the ring's wake latency, then turn `net-noalloc` on** (§7) — the
+   rings are written, correct and measured; they halve the lock hold and lose
+   on p90. §7.5 names the one hypothesis to test first.
 3. **`userspace/httpd` does not run on Linux** — `hello` (the minimal libakuma
    binary) SIGSEGVs too, so the blocker is in libakuma's startup, not httpd.
    Worth fixing: it would give the same-binary A/B that

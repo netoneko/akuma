@@ -8,6 +8,10 @@ pub mod runtime;
 // rump-only build (devbox) compiles them out; the rump path below is smoltcp-free.
 #[cfg(feature = "smoltcp")]
 pub mod smoltcp_net;
+// Static RX/TX frame rings backing the async transmit path. Only meaningful
+// with the smoltcp device, and only compiled when `net-noalloc` selects it.
+#[cfg(all(feature = "smoltcp", feature = "net-noalloc"))]
+pub mod virtio_rings;
 // Raw L2 packet path (second NIC → /dev/net/tap0) for the kernel `rump` feature.
 #[cfg(feature = "rump")]
 pub mod rump_tap;

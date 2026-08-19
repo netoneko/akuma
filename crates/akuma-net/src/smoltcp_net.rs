@@ -119,6 +119,15 @@ const VIRTIO_MMIO_INTERRUPT_STATUS: usize = 0x060;
 /// to de-assert the line.
 const VIRTIO_MMIO_INTERRUPT_ACK: usize = 0x064;
 
+/// virtio-mmio `QueueNotify`. Writing a queue index tells the device that queue
+/// has new available buffers. Only the async transmit path kicks it by hand.
+#[cfg(feature = "net-noalloc")]
+const VIRTIO_MMIO_QUEUE_NOTIFY: usize = 0x050;
+
+/// virtio-net's transmit virtqueue index (receive is 0).
+#[cfg(feature = "net-noalloc")]
+const VIRTIO_NET_QUEUE_TRANSMIT: u32 = 1;
+
 /// MMIO base of NIC0, captured during [`init`]. 0 until then.
 ///
 /// Held separately from the `VirtIONetRaw` inside `NETWORK` because the IRQ
@@ -176,6 +185,38 @@ pub fn nic_irq_ack() {
         if pending != 0 {
             ack.write(pending);
         }
+    }
+}
+
+/// Kick the transmit queue unconditionally.
+///
+/// `transmit_begin` notifies only when `VirtQueue::should_notify()` allows, and
+/// QEMU negotiates `VIRTIO_F_EVENT_IDX`, so that can be false. The blocking
+/// `VirtIONetRaw::send` this replaced checks the same flag — but then *spins
+/// until the used ring advances*, which waits the suppression out and forces
+/// the host to pick the frame up. Async submit has no such backstop, so a
+/// suppressed notify leaves the frame sitting in the avail ring.
+///
+/// Measured cost of not doing this (`[NICSTAT] tx_flight`, 2026-08-19):
+/// **90.9 us average submit → completion, 6,486 us worst case**, against a
+/// 9.1 us submit — and an HTTP p99 of 6,747 us that tracks the worst case
+/// almost exactly.
+///
+/// A spurious notify is harmless by spec (it is a hint), so this is
+/// unconditional rather than trying to second-guess `should_notify`.
+#[cfg(feature = "net-noalloc")]
+pub(crate) fn nic_kick_tx() {
+    let base = NIC_MMIO_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return;
+    }
+    // SAFETY: same base and the same discipline as `nic_irq_ack` — recorded
+    // once from `akuma_virtio::probe`, inside the kernel's device mapping.
+    // `QueueNotify` is a 32-bit write-only register at a fixed offset.
+    unsafe {
+        let notify: akuma_primitives::mmio::MmioReg<u32> =
+            akuma_primitives::mmio::MmioReg::new(base + VIRTIO_MMIO_QUEUE_NOTIFY);
+        notify.write(VIRTIO_NET_QUEUE_TRANSMIT);
     }
 }
 
@@ -311,86 +352,225 @@ static mut SOCKET_STORAGE: [SocketStorage<'static>; MAX_SOCKETS] = [SocketStorag
 
 pub struct VirtioSmoltcpDevice {
     inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>,
+    /// The single receive buffer of the pre-`net-noalloc` path.
+    #[cfg(not(feature = "net-noalloc"))]
     rx_buffer: [u8; 2048],
+    /// The single transmit buffer of the pre-`net-noalloc` path. Also the
+    /// saturation-fallback staging buffer's counterpart.
+    #[cfg(not(feature = "net-noalloc"))]
     tx_buffer: [u8; 2048],
     /// Token for a pending `VirtIO` receive buffer that has been submitted to the device.
     /// `VirtIO` requires buffers to be posted via `receive_begin()` before the device can
     /// DMA received packets into them. We track the token so we can call `receive_complete()`
     /// once `poll_receive()` indicates the device has filled the buffer.
+    #[cfg(not(feature = "net-noalloc"))]
     rx_token: Option<u16>,
+    /// Receive slots posted to the device. Buffers live in BSS, not here — see
+    /// `virtio_rings`.
+    #[cfg(feature = "net-noalloc")]
+    rx: crate::virtio_rings::RxRing,
+    /// Transmit slots in flight.
+    #[cfg(feature = "net-noalloc")]
+    tx: crate::virtio_rings::TxRing,
 }
 
 impl VirtioSmoltcpDevice {
-    #[must_use] 
+    #[must_use]
     pub const fn new(inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>) -> Self {
         Self {
             inner,
+            #[cfg(not(feature = "net-noalloc"))]
             rx_buffer: [0u8; 2048],
+            #[cfg(not(feature = "net-noalloc"))]
             tx_buffer: [0u8; 2048],
+            #[cfg(not(feature = "net-noalloc"))]
             rx_token: None,
+            #[cfg(feature = "net-noalloc")]
+            rx: crate::virtio_rings::RxRing::new(),
+            #[cfg(feature = "net-noalloc")]
+            tx: crate::virtio_rings::TxRing::new(),
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn mac_address(&self) -> [u8; 6] {
         self.inner.mac_address()
     }
+
+    /// Take the next received frame, if the device has one ready.
+    ///
+    /// Returns a pointer to the L2 frame (virtio header already skipped) and its
+    /// length. A raw pointer rather than a slice because the caller owns the
+    /// lifetime: smoltcp's `RxToken` borrows it for exactly as long as
+    /// `consume` runs, which is not a lifetime this function can name.
+    ///
+    /// The two implementations differ in one thing that matters: with
+    /// `net-noalloc` the device always has a *ring* of buffers posted, so a
+    /// burst drains without an MMIO notify per frame. Without it there is one
+    /// buffer, and every single packet costs a fresh `receive_begin`.
+    fn take_rx_frame(&mut self) -> Option<(*mut u8, usize)> {
+        #[cfg(feature = "net-noalloc")]
+        {
+            // Reap first: this runs once per poll lap, which is the only place
+            // TX completions get harvested promptly. Leaving it to the next
+            // `claim` means a slot stays in flight for as long as nothing is
+            // transmitted — which, on a request/response workload, is exactly
+            // the gap between requests.
+            self.tx.reap(&mut self.inner);
+            // Re-post whatever the previous call released. Safe to do here and
+            // not earlier: an outstanding `RxToken` has been consumed by the
+            // time smoltcp asks for another frame.
+            self.rx.refill(&mut self.inner);
+            let Some((slot, hdr, len)) = self.rx.take_frame(&mut self.inner) else {
+                nicstat::record_rx_empty();
+                return None;
+            };
+            // SAFETY: `slot` came from the ring's own table and `NETWORK` is
+            // held; `hdr + len <= FRAME_BUF` was checked by `take_frame`.
+            let base = unsafe { crate::virtio_rings::rx_frame(slot) };
+            Some((unsafe { base.as_mut_ptr().add(hdr) }, len))
+        }
+        #[cfg(not(feature = "net-noalloc"))]
+        {
+            // Phase 1: ensure a receive buffer is posted to the device.
+            if self.rx_token.is_none() {
+                let t = nicstat::start();
+                match unsafe { self.inner.receive_begin(&mut self.rx_buffer) } {
+                    Ok(token) => {
+                        nicstat::record_rx_begin(t);
+                        self.rx_token = Some(token);
+                    }
+                    Err(_) => return None,
+                }
+            }
+            // Phase 2: has the device filled it?
+            if self.inner.poll_receive().is_some() {
+                let token = self.rx_token.take().unwrap();
+                let t = nicstat::start();
+                if let Ok((hdr_len, pkt_len)) =
+                    unsafe { self.inner.receive_complete(token, &mut self.rx_buffer) }
+                {
+                    // A malformed VirtIO response could report a frame longer
+                    // than the buffer; slicing on that corrupts adjacent memory.
+                    if hdr_len.saturating_add(pkt_len) > self.rx_buffer.len() {
+                        return None;
+                    }
+                    nicstat::record_rx_packet(t, pkt_len);
+                    return Some((
+                        unsafe { self.rx_buffer.as_mut_ptr().add(hdr_len) },
+                        pkt_len,
+                    ));
+                }
+                return None;
+            }
+            nicstat::record_rx_empty();
+            None
+        }
+    }
+
+    /// Fill one outbound frame and dispose of it.
+    ///
+    /// `fill` writes the L2 frame into the staging region. `divert` is then
+    /// handed the filled frame and returns `true` if it must **not** reach the
+    /// wire — that is how loopback traffic is intercepted without this function
+    /// needing to know what loopback is.
+    ///
+    /// With `net-noalloc` the frame is staged directly in a ring slot and
+    /// submitted with `transmit_begin`, which returns immediately; the device's
+    /// completion is reaped on a later pass. Without it, every frame goes
+    /// through `VirtIONetRaw::send`, which spins until the host consumes the
+    /// descriptor — 20-26 us per packet with `NETWORK` held and IRQs masked
+    /// (`docs/archive/AKUMA_NET_ISSUES.md` §3.2).
+    fn emit_frame<R>(
+        &mut self,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> R,
+        divert: impl FnOnce(&[u8]) -> bool,
+    ) -> R {
+        #[cfg(feature = "net-noalloc")]
+        {
+            use crate::virtio_rings::{FRAME_BUF, tx_discard, tx_frame};
+            if let Some(slot) = self.tx.claim(&mut self.inner) {
+                // SAFETY: `slot < TX_RING` by construction; `NETWORK` is held.
+                let frame = unsafe { tx_frame(slot) };
+                // `transmit_begin` sends whatever is in the buffer verbatim, so
+                // the virtio header has to be written into it here — unlike
+                // `send`, which prepends its own.
+                let hdr = self.inner.fill_buffer_header(frame).unwrap_or(0);
+                let end = hdr.saturating_add(len).min(FRAME_BUF);
+                let res = fill(&mut frame[hdr..end]);
+                if divert(&frame[hdr..end]) {
+                    // Never submitted, so the slot was never marked in flight —
+                    // there is nothing to release.
+                    return res;
+                }
+                let t = nicstat::start();
+                let ok = self.tx.submit(&mut self.inner, slot, end);
+                nicstat::record_tx(t, end - hdr, ok);
+                if !ok {
+                    TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                return res;
+            }
+            // Every slot was still in flight after `CLAIM_SPINS` reaps. The
+            // frame is dropped — smoltcp retransmits — but `consume`'s contract
+            // still requires the fill closure to run, so it writes into a buffer
+            // nothing reads. Falling back to `VirtIONetRaw::send` here would be
+            // a bug, not a slow path: see `TxRing::claim`.
+            //
+            // A diverted (loopback) frame is unaffected by NIC saturation, so it
+            // is still delivered.
+            // SAFETY: `NETWORK` is held, so nothing else is touching the buffer.
+            let discard = unsafe { tx_discard() };
+            let end = len.min(FRAME_BUF);
+            let res = fill(&mut discard[..end]);
+            if divert(&discard[..end]) {
+                return res;
+            }
+            TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            res
+        }
+        #[cfg(not(feature = "net-noalloc"))]
+        {
+            let end = len.min(self.tx_buffer.len());
+            let res = fill(&mut self.tx_buffer[..end]);
+            if divert(&self.tx_buffer[..end]) {
+                return res;
+            }
+            let t = nicstat::start();
+            let ok = self.inner.send(&self.tx_buffer[..end]).is_ok();
+            nicstat::record_tx(t, end, ok);
+            if !ok {
+                TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            res
+        }
+    }
 }
 
+// `deref_addrof`: `receive` must hand out an rx and a tx token from one
+// `&mut self`, and the tx token holds the whole device — so unlike
+// `LoopbackAwareDevice` below, disjoint field borrows cannot express it.
 #[allow(clippy::deref_addrof)]
 impl Device for VirtioSmoltcpDevice {
     type RxToken<'a> = VirtioRxToken<'a>;
     type TxToken<'a> = VirtioTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Phase 1: Ensure a receive buffer is posted to the device.
-        // VirtIO requires the driver to submit buffers in advance; the device
-        // DMAs received packets into them.
-        if self.rx_token.is_none() {
-            let t = nicstat::start();
-            match unsafe { self.inner.receive_begin(&mut self.rx_buffer) } {
-                Ok(token) => {
-                    nicstat::record_rx_begin(t);
-                    self.rx_token = Some(token);
-                }
-                Err(_) => return None,
-            }
-        }
-
-        // Phase 2: Check if the device has completed the receive (filled our buffer).
-        if self.inner.poll_receive().is_some() {
-            let token = self.rx_token.take().unwrap();
-            let t = nicstat::start();
-            match unsafe { self.inner.receive_complete(token, &mut self.rx_buffer) } {
-                Ok((hdr_len, pkt_len)) => {
-                    // Validate buffer bounds — a malformed VirtIO response could
-                    // report hdr_len + pkt_len > buffer size, causing an out-of-bounds
-                    // slice that corrupts adjacent memory (e.g. NETWORK static fields).
-                    if hdr_len.saturating_add(pkt_len) > self.rx_buffer.len() {
-                        return None;
-                    }
-                    nicstat::record_rx_packet(t, pkt_len);
-                    let rx = VirtioRxToken {
-                        buffer: unsafe { core::slice::from_raw_parts_mut(self.rx_buffer.as_mut_ptr().add(hdr_len), pkt_len) },
-                    };
-                    let tx = VirtioTxToken {
-                        inner: unsafe { &mut *(&raw mut self.inner) },
-                        buffer: unsafe { core::slice::from_raw_parts_mut(self.tx_buffer.as_mut_ptr(), 2048) },
-                    };
-                    return Some((rx, tx));
-                }
-                Err(_) => return None,
-            }
-        }
-        nicstat::record_rx_empty();
-        None
+        let (ptr, len) = self.take_rx_frame()?;
+        // SAFETY: `take_rx_frame` returned a live L2 frame of `len` bytes in a
+        // buffer this device owns, and the token's lifetime is bounded by the
+        // `&mut self` borrow. The `&raw mut` aliasing for the tx half is the
+        // pre-existing pattern here: smoltcp's `Device` contract hands out an
+        // rx and a tx token together, and they touch disjoint state (rx frame
+        // storage vs the device/tx ring).
+        let rx = VirtioRxToken { buffer: unsafe { core::slice::from_raw_parts_mut(ptr, len) } };
+        let tx = VirtioTxToken { dev: unsafe { &mut *(&raw mut *self) } };
+        Some((rx, tx))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(VirtioTxToken {
-            inner: unsafe { &mut *(&raw mut self.inner) },
-            buffer: unsafe { core::slice::from_raw_parts_mut(self.tx_buffer.as_mut_ptr(), 2048) },
-        })
+        Some(VirtioTxToken { dev: self })
     }
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
@@ -414,8 +594,7 @@ impl smoltcp::phy::RxToken for VirtioRxToken<'_> {
 }
 
 pub struct VirtioTxToken<'a> {
-    inner: &'a mut VirtIONetRaw<VirtioHal, MmioTransport, 16>,
-    buffer: &'a mut [u8],
+    dev: &'a mut VirtioSmoltcpDevice,
 }
 
 impl smoltcp::phy::TxToken for VirtioTxToken<'_> {
@@ -423,14 +602,8 @@ impl smoltcp::phy::TxToken for VirtioTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let res = f(&mut self.buffer[..len]);
-        let t = nicstat::start();
-        let sent = self.inner.send(&self.buffer[..len]);
-        nicstat::record_tx(t, len, sent.is_ok());
-        if sent.is_err() {
-            TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-        }
-        res
+        // No diversion: this device has no loopback queue.
+        self.dev.emit_frame(len, f, |_| false)
     }
 }
 
@@ -484,93 +657,64 @@ impl LoopbackAwareDevice {
     }
 }
 
-#[allow(clippy::deref_addrof)]
 impl Device for LoopbackAwareDevice {
     type RxToken<'a> = LoopbackAwareRxToken<'a>;
     type TxToken<'a> = LoopbackAwareTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Priority: loopback queue first
-        if let Some(frame) = self.loopback_queue.pop_front() {
-            let rx = LoopbackAwareRxToken::Loopback(frame);
-            let tx = LoopbackAwareTxToken {
-                virtio_inner: unsafe { &mut *(&raw mut self.virtio.inner) },
-                virtio_buffer: unsafe {
-                    core::slice::from_raw_parts_mut(self.virtio.tx_buffer.as_mut_ptr(), 2048)
-                },
-                loopback_queue: unsafe { &mut *(&raw mut self.loopback_queue) },
-            };
-            return Some((rx, tx));
-        }
+        // Choose the frame BEFORE building the tx token. Doing it in this order
+        // is what lets the two tokens be plain disjoint field borrows
+        // (`&mut self.virtio` and `&mut self.loopback_queue`) instead of the
+        // `&raw mut` aliasing this used to need: the loopback pop wants the
+        // queue mutably, and the tx token wants to keep it.
+        let source = if let Some(frame) = self.loopback_queue.pop_front() {
+            // An internally queued frame is already in hand — no device round
+            // trip, and `receive` drains these ahead of the wire.
+            FrameSource::Loopback(frame)
+        } else {
+            let (ptr, len) = self.virtio.take_rx_frame()?;
+            FrameSource::Virtio(ptr, len)
+        };
 
-        // Fall back to VirtIO: two-phase receive pattern
-        // Phase 1: Ensure a receive buffer is posted to the device
-        if self.virtio.rx_token.is_none() {
-            let t = nicstat::start();
-            match unsafe { self.virtio.inner.receive_begin(&mut self.virtio.rx_buffer) } {
-                Ok(token) => {
-                    nicstat::record_rx_begin(t);
-                    self.virtio.rx_token = Some(token);
-                }
-                Err(_) => return None,
-            }
-        }
-
-        // Phase 2: Check if the device has completed the receive
-        if self.virtio.inner.poll_receive().is_some() {
-            let token = self.virtio.rx_token.take().unwrap();
-            let t = nicstat::start();
-            match unsafe {
-                self.virtio
-                    .inner
-                    .receive_complete(token, &mut self.virtio.rx_buffer)
-            } {
-                Ok((hdr_len, pkt_len)) => {
-                    // Validate buffer bounds — see VirtioSmoltcpDevice::receive()
-                    if hdr_len.saturating_add(pkt_len) > self.virtio.rx_buffer.len() {
-                        return None;
-                    }
-                    nicstat::record_rx_packet(t, pkt_len);
-                    let rx = LoopbackAwareRxToken::Virtio(unsafe {
-                        core::slice::from_raw_parts_mut(
-                            self.virtio.rx_buffer.as_mut_ptr().add(hdr_len),
-                            pkt_len,
-                        )
-                    });
-                    let tx = LoopbackAwareTxToken {
-                        virtio_inner: unsafe { &mut *(&raw mut self.virtio.inner) },
-                        virtio_buffer: unsafe {
-                            core::slice::from_raw_parts_mut(
-                                self.virtio.tx_buffer.as_mut_ptr(),
-                                2048,
-                            )
-                        },
-                        loopback_queue: unsafe {
-                            &mut *(&raw mut self.loopback_queue)
-                        },
-                    };
-                    return Some((rx, tx));
-                }
-                Err(_) => return None,
-            }
-        }
-        nicstat::record_rx_empty();
-        None
+        let tx = LoopbackAwareTxToken {
+            virtio: &mut self.virtio,
+            loopback_queue: &mut self.loopback_queue,
+        };
+        let rx = match source {
+            FrameSource::Loopback(frame) => LoopbackAwareRxToken::Loopback(frame),
+            // SAFETY: `take_rx_frame` returned a live L2 frame of `len` bytes in
+            // storage this device owns — with `net-noalloc` a ring slot the ring
+            // has already released and will not re-post until the next
+            // `receive`, otherwise the single rx buffer. The token's lifetime is
+            // bounded by the `&mut self` borrow.
+            FrameSource::Virtio(ptr, len) => LoopbackAwareRxToken::Virtio(unsafe {
+                core::slice::from_raw_parts_mut(ptr, len)
+            }),
+        };
+        Some((rx, tx))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(LoopbackAwareTxToken {
-            virtio_inner: unsafe { &mut *(&raw mut self.virtio.inner) },
-            virtio_buffer: unsafe {
-                core::slice::from_raw_parts_mut(self.virtio.tx_buffer.as_mut_ptr(), 2048)
-            },
-            loopback_queue: unsafe { &mut *(&raw mut self.loopback_queue) },
+            virtio: &mut self.virtio,
+            loopback_queue: &mut self.loopback_queue,
         })
     }
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         self.virtio.capabilities()
     }
+}
+
+/// Where the frame `receive` is about to hand up came from.
+///
+/// Exists so the decision can be made before either token is built — see
+/// `LoopbackAwareDevice::receive`.
+enum FrameSource {
+    /// An owned frame popped off the internal loopback queue.
+    Loopback(Vec<u8>),
+    /// A pointer to the L2 frame in device-owned storage, and its length.
+    Virtio(*mut u8, usize),
 }
 
 pub enum LoopbackAwareRxToken<'a> {
@@ -593,8 +737,7 @@ impl smoltcp::phy::RxToken for LoopbackAwareRxToken<'_> {
 }
 
 pub struct LoopbackAwareTxToken<'a> {
-    virtio_inner: &'a mut VirtIONetRaw<VirtioHal, MmioTransport, 16>,
-    virtio_buffer: &'a mut [u8],
+    virtio: &'a mut VirtioSmoltcpDevice,
     loopback_queue: &'a mut VecDeque<Vec<u8>>,
 }
 
@@ -603,25 +746,19 @@ impl smoltcp::phy::TxToken for LoopbackAwareTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // Write the frame into the VirtIO tx buffer (avoids allocation for external traffic)
-        let res = f(&mut self.virtio_buffer[..len]);
-
-        if is_loopback_frame(&self.virtio_buffer[..len]) {
-            // Loopback: copy into an owned Vec and queue for the next receive()
-            let mut frame = vec![0u8; len];
-            frame.copy_from_slice(&self.virtio_buffer[..len]);
-            self.loopback_queue.push_back(frame);
-            nicstat::record_loopback(len);
-        } else {
-            let t = nicstat::start();
-            let sent = self.virtio_inner.send(&self.virtio_buffer[..len]);
-            nicstat::record_tx(t, len, sent.is_ok());
-            if sent.is_err() {
-                TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        let queue = self.loopback_queue;
+        self.virtio.emit_frame(len, f, |frame| {
+            // Frames addressed to 127.x never reach the wire: copy them into the
+            // internal queue, which `receive` drains ahead of the device.
+            if !is_loopback_frame(frame) {
+                return false;
             }
-        }
-
-        res
+            let mut owned = vec![0u8; frame.len()];
+            owned.copy_from_slice(frame);
+            queue.push_back(owned);
+            nicstat::record_loopback(frame.len());
+            true
+        })
     }
 }
 

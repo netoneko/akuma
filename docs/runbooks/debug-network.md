@@ -94,6 +94,41 @@ dump: a per-park average near the tick interval is the same symptom.
 Full investigation and the measured before/after:
 [`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md).
 
+## Latency: do NOT reach for `net-noalloc` to fix it
+
+`net-noalloc` (static RX/TX rings + async transmit,
+`crates/akuma-net/src/virtio_rings.rs`) looks like the obvious next latency
+lever and **is off for a reason**. Measured 2026-08-19 on `devbox-smoltcp`, same
+`httpd` binary both arms:
+
+| | single buffer | `net-noalloc` |
+|---|---:|---:|
+| poll time held per 5 s window | 472 ms | **211 ms** |
+| tx blocking wait | 27.8 us/pkt | **9.2 us/pkt** |
+| httpd `read` syscall | 44-78 us | **7-9 us** |
+| HTTP p90 | **1,172 us** | 3,433 us |
+| HTTP req/s | **1,071** | 855 |
+
+It halves the time the stack holds `NETWORK` and still loses, because the cost
+moved into the wake: httpd's `accept` phase went from 66-77 % of the request to
+81-88 %. Turn it on to work *that* problem, or to measure a pipelined /
+long-lived-connection workload where the lock-hold win should dominate and the
+per-connection wake should not — it has not been measured against redis yet.
+Reasoning and the untested hypothesis:
+[`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md) §7.
+
+When it is on, `[NICSTAT]` gains two cumulative counters, both of which must
+stay at zero:
+
+```
+[NICSTAT] w=7 nic_irq=169 orphan=0 tx_stall=0
+```
+
+`tx_stall` counts frames that found every TX slot in flight — the ring is too
+shallow and those frames took a spin or were dropped. `orphan` counts device
+completions whose token no slot claims, which should be impossible and means
+the token map has desynchronised from the used ring.
+
 ## Network debug knobs
 
 | Knob | Default | Effect |

@@ -284,7 +284,8 @@ _L1 = re.compile(
 _L2 = re.compile(
     r"\[NICSTAT\] w=(\d+) tx_wait=(\d+)ms\(([\d.]+)us/pkt max=(\d+)us\) "
     r"rx_post=(\d+)ms\(([\d.]+)us\) rx_done=(\d+)ms")
-_IRQ = re.compile(r"\[NICSTAT\] w=(\d+) nic_irq=(\d+)")
+_IRQ = re.compile(
+    r"\[NICSTAT\] w=(\d+) nic_irq=(\d+)(?: orphan=(\d+) tx_stall=(\d+))?")
 _L3 = re.compile(
     r"\[NICSTAT\] w=(\d+) poll=(\d+)c/(\d+)prog (\d+)ms\(([\d.]+)us/c max=(\d+)us\) "
     r"empty=(\d+) relax=(\d+)/(\d+)ms\(([\d.]+)us\)")
@@ -317,6 +318,9 @@ def parse_nicstat(log_path: str) -> list[dict]:
             elif (m := _IRQ.search(line)):
                 w = windows.setdefault(int(m.group(1)), {"w": int(m.group(1))})
                 w["nic_irq"] = int(m.group(2))
+                if m.group(3) is not None:
+                    w["orphan"] = int(m.group(3))
+                    w["tx_stall"] = int(m.group(4))
             elif (m := _L3.search(line)):
                 w = windows.setdefault(int(m.group(1)), {"w": int(m.group(1))})
                 w.update(poll_calls=int(m.group(2)), poll_prog=int(m.group(3)),
@@ -371,6 +375,10 @@ def print_result(r: dict) -> None:
         if irq is not None:
             note = "  <- 0 means the NIC SPI never reached the CPU" if irq == 0 else ""
             print(f"      NIC interrupts    {irq}{note}")
+        if n.get("tx_stall") is not None:
+            stall = n["tx_stall"]
+            note = "" if stall == 0 else "  <- TX ring too shallow; these frames blocked"
+            print(f"      TX ring stalls    {stall}{note}   orphan tokens {n.get('orphan')}")
 
 
 def compare(a: dict, b: dict) -> None:

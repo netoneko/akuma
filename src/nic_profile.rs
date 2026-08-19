@@ -65,7 +65,7 @@ static PREV_NIC_IRQS: AtomicU64 = AtomicU64::new(0);
 
 prev!(
     RX_PKTS, RX_BYTES, RX_BEGIN, RX_BEGIN_US, RX_DONE_US, RX_EMPTY,
-    TX_PKTS, TX_BYTES, TX_US, TX_DROPS,
+    TX_PKTS, TX_BYTES, TX_US, TX_DROPS, TX_FLIGHT, TX_FLIGHT_US,
     LO_PKTS, LO_BYTES,
     POLL_CALLS, POLL_PROGRESS, POLL_US,
     RELAX, RELAX_US,
@@ -85,6 +85,9 @@ fn load_prev() -> NicStat {
         tx_us: g(&prev::TX_US),
         tx_max_us: 0,
         tx_drops: g(&prev::TX_DROPS),
+        tx_flight: g(&prev::TX_FLIGHT),
+        tx_flight_us: g(&prev::TX_FLIGHT_US),
+        tx_flight_max_us: 0,
         lo_pkts: g(&prev::LO_PKTS),
         lo_bytes: g(&prev::LO_BYTES),
         poll_calls: g(&prev::POLL_CALLS),
@@ -108,6 +111,8 @@ fn store_prev(s: &NicStat) {
     p(&prev::TX_BYTES, s.tx_bytes);
     p(&prev::TX_US, s.tx_us);
     p(&prev::TX_DROPS, s.tx_drops);
+    p(&prev::TX_FLIGHT, s.tx_flight);
+    p(&prev::TX_FLIGHT_US, s.tx_flight_us);
     p(&prev::LO_PKTS, s.lo_pkts);
     p(&prev::LO_BYTES, s.lo_bytes);
     p(&prev::POLL_CALLS, s.poll_calls);
@@ -173,7 +178,39 @@ pub fn maybe_dump(now_us: u64) {
 
     let irqs_now = smoltcp_net::nic_irq_count();
     let irqs = irqs_now.saturating_sub(PREV_NIC_IRQS.swap(irqs_now, Ordering::Relaxed));
-    crate::safe_print!(96, "[NICSTAT] w={} nic_irq={}\n", w, irqs);
+    // `orphan` and `tx_stall` are cumulative, not windowed: both should be
+    // exactly zero forever, so the useful question is "has it ever happened",
+    // not "how often this window". A non-zero `tx_stall` means `TX_RING` is too
+    // shallow for the offered load and those frames took the old blocking path.
+    #[cfg(feature = "net-noalloc")]
+    let (orphan, tx_stall) = akuma_net::virtio_rings::ring_health();
+    #[cfg(not(feature = "net-noalloc"))]
+    let (orphan, tx_stall) = (0u64, 0u64);
+    crate::safe_print!(
+        128,
+        "[NICSTAT] w={} nic_irq={} orphan={} tx_stall={}\n",
+        w,
+        irqs,
+        orphan,
+        tx_stall
+    );
+
+    // Async TX only: how long the host actually took to consume a submitted
+    // descriptor. `tx_wait` above stops being the whole cost once transmit no
+    // longer blocks — this is the rest of it.
+    if d.tx_flight > 0 {
+        let (fa, fb) = tenths(d.tx_flight_us, d.tx_flight);
+        crate::safe_print!(
+            128,
+            "[NICSTAT] w={} tx_flight={}p {}ms({}.{}us/pkt max={}us)\n",
+            w,
+            d.tx_flight,
+            d.tx_flight_us / 1000,
+            fa,
+            fb,
+            d.tx_flight_max_us
+        );
+    }
 
     let (txa, txb) = tenths(d.tx_us, d.tx_pkts);
     let (rxa, rxb) = tenths(d.rx_begin_us, d.rx_begin);

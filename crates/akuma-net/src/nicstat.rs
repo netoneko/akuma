@@ -63,6 +63,18 @@ pub struct NicStat {
     pub tx_max_us: u64,
     /// Sends that returned an error (queue full) and were dropped.
     pub tx_drops: u64,
+    /// Frames whose device completion was reaped (`net-noalloc` only).
+    pub tx_flight: u64,
+    /// Cumulative µs from `transmit_begin` to that completion being observed.
+    ///
+    /// The async-TX equivalent of `tx_us`, and the one number that says whether
+    /// the host is picking submitted frames up promptly. `tx_us` cannot answer
+    /// that once transmit stops blocking: it only covers the submit itself.
+    /// Reap runs once per poll lap, and there are tens of thousands of those
+    /// per window, so the observation delay is not what this measures.
+    pub tx_flight_us: u64,
+    /// Worst single submit → completion in µs.
+    pub tx_flight_max_us: u64,
     /// Frames short-circuited into the loopback queue.
     pub lo_pkts: u64,
     /// Bytes in those frames.
@@ -100,6 +112,9 @@ impl NicStat {
             // which `reset_maxima` re-arms after every dump.
             tx_max_us: self.tx_max_us,
             tx_drops: self.tx_drops.saturating_sub(base.tx_drops),
+            tx_flight: self.tx_flight.saturating_sub(base.tx_flight),
+            tx_flight_us: self.tx_flight_us.saturating_sub(base.tx_flight_us),
+            tx_flight_max_us: self.tx_flight_max_us,
             lo_pkts: self.lo_pkts.saturating_sub(base.lo_pkts),
             lo_bytes: self.lo_bytes.saturating_sub(base.lo_bytes),
             poll_calls: self.poll_calls.saturating_sub(base.poll_calls),
@@ -136,6 +151,7 @@ mod imp {
     counters!(
         RX_PKTS, RX_BYTES, RX_BEGIN, RX_BEGIN_US, RX_DONE_US, RX_EMPTY,
         TX_PKTS, TX_BYTES, TX_US, TX_MAX_US, TX_DROPS,
+        TX_FLIGHT, TX_FLIGHT_US, TX_FLIGHT_MAX_US,
         LO_PKTS, LO_BYTES,
         POLL_CALLS, POLL_PROGRESS, POLL_US, POLL_MAX_US,
         RELAX, RELAX_US,
@@ -173,6 +189,9 @@ mod imp {
             tx_us: g(&TX_US),
             tx_max_us: g(&TX_MAX_US),
             tx_drops: g(&TX_DROPS),
+            tx_flight: g(&TX_FLIGHT),
+            tx_flight_us: g(&TX_FLIGHT_US),
+            tx_flight_max_us: g(&TX_FLIGHT_MAX_US),
             lo_pkts: g(&LO_PKTS),
             lo_bytes: g(&LO_BYTES),
             poll_calls: g(&POLL_CALLS),
@@ -186,6 +205,7 @@ mod imp {
 
     pub(super) fn reset_maxima() {
         TX_MAX_US.store(0, Ordering::Relaxed);
+        TX_FLIGHT_MAX_US.store(0, Ordering::Relaxed);
         POLL_MAX_US.store(0, Ordering::Relaxed);
     }
 }
@@ -274,6 +294,21 @@ recorder! {
         if let Some(us) = elapsed(s) {
             imp::add(&imp::TX_US, us);
             imp::max(&imp::TX_MAX_US, us);
+        }
+    }
+}
+
+recorder! {
+    /// One asynchronously submitted frame, completed by the device.
+    ///
+    /// `s` is the `Started` opened at `transmit_begin`, so this measures how
+    /// long the host took to consume the descriptor — the cost `transmit_begin`
+    /// stopped charging the caller for, but that did not stop existing.
+    pub fn record_tx_complete(s: Started) {
+        imp::add(&imp::TX_FLIGHT, 1);
+        if let Some(us) = elapsed(s) {
+            imp::add(&imp::TX_FLIGHT_US, us);
+            imp::max(&imp::TX_FLIGHT_MAX_US, us);
         }
     }
 }
