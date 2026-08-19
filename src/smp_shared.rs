@@ -1026,6 +1026,9 @@ secondary_entry_shared:
     mov     sp, x0
 
     // 3. MMU registers (mirror boot.rs configure_mmu_regs).
+    // CNTKCTL_EL1.EL0VCTEN — EL0 reads CNTVCT/CNTFRQ directly (see boot.rs).
+    mov     x0, #0x2
+    msr     cntkctl_el1, x0
     // MAIR_EL1 = 0xFFBB4400
     mov     x0, #0x4400
     movk    x0, #0xFFBB, lsl #16

@@ -269,6 +269,15 @@ setup_boot_page_tables:
 
 // Configure MMU control registers
 configure_mmu_regs:
+    // CNTKCTL_EL1 - let EL0 read the virtual counter + frequency directly
+    // (EL0VCTEN, bit 1). Without this every userspace `mrs cntvct_el0` /
+    // `mrs cntfrq_el0` traps to EL1 (EC=0x18) — measured at ~1M pairs/s under
+    // llama.cpp decode, and the emulation returned 0 for both, freezing
+    // userspace's hardware clock (docs/archive/CROSS_CORE_THREAD_COLLAPSE.md
+    // §3). Linux enables this unconditionally.
+    mov     x0, #0x2
+    msr     cntkctl_el1, x0
+
     // MAIR_EL1 - Memory Attribute Indirection Register
     // Attr0: Device-nGnRnE (0x00)
     // Attr1: Normal Non-cacheable (0x44)

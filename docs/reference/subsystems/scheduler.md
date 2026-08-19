@@ -295,25 +295,32 @@ Regression test: `park_wake_race_tests`
   sysproxy, and re-measured **worse** for llama.cpp thread barriers
   2026-08-19 (`tg16 -t 2` 2.5 → 1.15 tok/s: the single-slot hint preempts the
   producer; `../../archive/CROSS_CORE_THREAD_COLLAPSE.md` §2A).
-- **Bounded displacement bypass (on since 2026-08-19, smp-shared only).** On an
-  involuntary tick that would displace a RUNNING, non-idle thread for another
-  READY thread, the scheduler first tries `wake_remote_idle()` (SGIs the lowest
+- **Bounded displacement bypass (on since 2026-08-19, smp-shared only,
+  EL0-interrupted ticks only).** On an involuntary tick that interrupted
+  USERSPACE and would displace a RUNNING, non-idle thread for another READY
+  thread, the scheduler first tries `wake_remote_idle()` (SGIs the lowest
   idle peer core and reports whether one existed); if an idle core can take the
   READY work, this core keeps its thread — for at most
   `DISPLACEMENT_IMMUNITY_TICKS - 1 = 4` consecutive ticks (~5 ms effective
   timeslice), then it rotates exactly as baseline. Applies to both the
-  round-robin scan and the network-boost path. Rationale + measurements
-  (llama `-t 2` decode 1.6 → 22 tok/s across this + the same-TTBR0 switch fix;
-  the unbounded variant starved sshd and is documented as a failure):
-  `../../archive/CROSS_CORE_THREAD_COLLAPSE.md` §2B. Off smp-shared,
-  `wake_remote_idle` is `|| false` and the bypass is inert.
-- **Idle-fallback keep-running (2026-08-19).** When the scan finds NO other
-  non-idle READY thread, a still-RUNNING current thread now stays on-core
-  (`return None`) instead of being switched out to the per-core idle thread —
-  the old behavior made every lone CPU-bound thread bounce
-  core → idle → another core on every tick. Safe: a RUNNING thread is never
-  picked by a peer's scan. A WAITING (blocked) or READY (yielded) current
-  still falls through to the idle switch.
+  round-robin scan and the network-boost path. **The EL0 gate is load-bearing**:
+  an EL1-interrupted thread is a BKL holder ("held iff in EL1"), and the
+  per-tick switch is the BKL release valve for long kernel excursions — an
+  ungated version wedged the boot suite's FS tests in a `[BKL] stuck` storm
+  (thread 0 held the BKL through bulk ext2 I/O forever). Rationale +
+  measurements (llama `-t 2` decode 1.6 → 22 tok/s across this + the
+  same-TTBR0 switch fix; the unbounded variant starved sshd and is documented
+  as a failure): `../../archive/CROSS_CORE_THREAD_COLLAPSE.md` §2B.
+  Off smp-shared, `wake_remote_idle` is `|| false` and the bypass is inert.
+- **Idle-fallback keep-running (2026-08-19, EL0-interrupted ticks only).** When
+  the scan finds NO other non-idle READY thread, a still-RUNNING,
+  EL0-interrupted current thread now stays on-core (`return None`) instead of
+  being switched out to the per-core idle thread — the old behavior made every
+  lone CPU-bound thread bounce core → idle → another core on every tick. Safe
+  against double-run: a RUNNING thread is never picked by a peer's scan. Safe
+  against BKL starvation: only EL0-interrupted (no BKL held) threads qualify;
+  EL1-interrupted, WAITING (blocked), or READY (yielded) currents still fall
+  through to the idle switch.
 
 ## Real (shared-kernel) SMP
 

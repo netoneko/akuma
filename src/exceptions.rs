@@ -2504,6 +2504,7 @@ pub fn init() {
 #[unsafe(no_mangle)]
 extern "C" fn rust_default_exception_handler() {
     note_exception_entry();
+    note_exc_class(3);
     let esr: u64;
     let elr: u64;
     let spsr: u64;
@@ -2592,6 +2593,7 @@ fn irq_eret_poison_check(final_sp: u64, switched: bool) {
 #[unsafe(no_mangle)]
 extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     note_exception_entry();
+    note_exc_class(2);
     // Under shared SMP, read the interrupted frame's SPSR up front: SPSR.M[3:0]==0 means
     // we preempted EL0 (userspace), where this core holds NO BKL (the invariant is "held
     // iff in EL1"). That is exactly the case where the scheduler SGI can run BKL-FREE
@@ -2618,8 +2620,16 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
 
     // Acknowledge the IRQ once, up front (the GIC IAR read needs no BKL).
     let irq_opt = crate::gic::acknowledge_irq();
-    if let Some(intid) = irq_opt {
-        note_irq_intid(intid);
+    match irq_opt {
+        Some(intid) => note_irq_intid(intid),
+        // IAR said "spurious" (1023): the vector fired but the interrupt was
+        // already consumed (peer core, or a de-asserted level source). These
+        // entries are invisible to the per-INTID counters yet still count in
+        // EXCEPTION_ENTRIES — exactly the gap the ~140K/s/core unattributed
+        // exception storm hid in (CROSS_CORE_THREAD_COLLAPSE.md §3).
+        None => {
+            SPURIOUS_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     // BKL-free fast path (M5c): a scheduler SGI that preempted EL0. This core held no BKL,
@@ -2846,6 +2856,60 @@ fn note_irq_intid(intid: u32) {
     let slot = (intid as usize).min(IRQ_BY_INTID.len() - 1);
     IRQ_BY_INTID[slot].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
+
+/// IRQ-vector entries whose GIC acknowledge came back "spurious" (IAR 1023).
+/// Printed as `spurious=` on the `[IRQS]` heartbeat line.
+pub static SPURIOUS_IRQS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// [`EXCEPTION_ENTRIES`] decomposed by vector class: 0 = sync EL0, 1 = sync
+/// EL1, 2 = IRQ, 3 = default/unexpected. Under llama decode the per-core entry
+/// rate is >1M/s while IRQs + syscalls + counted faults sum to <10K/s — this
+/// split names which handler eats the difference. For sync EL0/EL1 the low
+/// 6 bits of the companion `SYNC_EC_*` counters bucket ESR.EC (0x15 = SVC,
+/// 0x24/0x25 = data abort, 0x20/0x21 = instr abort, 0x07 = FP/SIMD trap, ...).
+pub static EXC_BY_CLASS: [core::sync::atomic::AtomicU64; 4] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [INIT; 4]
+};
+
+/// ESR.EC histogram for sync-EL0 entries (index = EC, 6 bits).
+pub static SYNC_EC_EL0: [core::sync::atomic::AtomicU64; 64] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [INIT; 64]
+};
+
+/// ESR.EC histogram for sync-EL1 entries (index = EC, 6 bits).
+pub static SYNC_EC_EL1: [core::sync::atomic::AtomicU64; 64] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [INIT; 64]
+};
+
+#[inline(always)]
+fn note_exc_class(class: usize) {
+    EXC_BY_CLASS[class & 3].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// First 8 distinct trapped MSR/MRS encodings + hit counts (EC=0x18 storm
+/// attribution). `.0` holds `key + 1` (0 = free slot) where key packs
+/// direction | (crm<<1) | (crn<<5) | (op1<<9) | (op0<<12) | (op2<<16).
+pub static MRS_TRAP_ENCODINGS: [(
+    core::sync::atomic::AtomicU64,
+    core::sync::atomic::AtomicU64,
+); 8] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: (
+        core::sync::atomic::AtomicU64,
+        core::sync::atomic::AtomicU64,
+    ) = (
+        core::sync::atomic::AtomicU64::new(0),
+        core::sync::atomic::AtomicU64::new(0),
+    );
+    [INIT; 8]
+};
 
 /// Write faults absorbed because the PTE already granted the write — the access
 /// was legal by the time the handler looked, so the fault was stale.
@@ -3196,6 +3260,15 @@ fn try_resolve_el1_user_copy_lazy_fault() -> bool {
 #[unsafe(no_mangle)]
 extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
     note_exception_entry();
+    note_exc_class(1);
+    {
+        let esr: u64;
+        // SAFETY: reading the syndrome register has no side effects; this handler
+        // owns the trap until it reads it (IRQs still masked at entry).
+        unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) esr) };
+        SYNC_EC_EL1[((esr >> 26) & 0x3F) as usize]
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     // Quick CoW pre-check: avoid the full debug dump for expected CoW write faults.
     // EC=0x25 + DFSC=0x0F (permission fault L3) + WnR + user VA → almost certainly CoW.
     // Quick CoW pre-check: resolve CoW write faults before full debug dump.
@@ -3564,6 +3637,9 @@ pub fn spurious_svc_count() -> u64 {
 /// else's trap. Same for ELR_EL1 — use the frame's saved copy.
 extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
     note_exception_entry();
+    note_exc_class(0);
+    SYNC_EC_EL0[((esr >> 26) & 0x3F) as usize]
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // Per-syscall BKL opt-out (Phase 7f, BKL_FINE_GRAINED_LOCKING_PLAN.md §7.3):
     // acquire the BKL UNLESS the trapped syscall's number is on the opt-out list.
     // The decision is LATCHED here and reused verbatim on every exit path below —
@@ -4657,6 +4733,34 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             let crm = (iss >> 1) & 0xF;
             let op2 = (iss >> 17) & 0x7;
 
+            // Storm attribution (CROSS_CORE_THREAD_COLLAPSE.md §3): count the
+            // first few DISTINCT trapped encodings so the >1M/s EC=0x18 storm
+            // names its register. Printed on the [EXCC] heartbeat line.
+            {
+                let key = (op0 << 12) | (op1 << 9) | (crn << 5) | (crm << 1) | (op2 << 16) | direction;
+                for slot in &MRS_TRAP_ENCODINGS {
+                    let cur = slot.0.load(core::sync::atomic::Ordering::Relaxed);
+                    if cur == key + 1 {
+                        slot.1.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                    if cur == 0
+                        && slot
+                            .0
+                            .compare_exchange(
+                                0,
+                                key + 1,
+                                core::sync::atomic::Ordering::Relaxed,
+                                core::sync::atomic::Ordering::Relaxed,
+                            )
+                            .is_ok()
+                    {
+                        slot.1.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+
             if direction == 1 && rt < 31 {
                 // MRS (read) — emulate system register reads
                 let value = if op0 == 3 && op1 == 3 && crn == 0 && crm == 0 && op2 == 1 {
@@ -4664,6 +4768,19 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     let ctr: u64;
                     unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr); }
                     ctr
+                } else if op0 == 3 && op1 == 3 && crn == 14 && crm == 0 && op2 == 2 {
+                    // CNTVCT_EL0 — normally never trapped (CNTKCTL_EL1.EL0VCTEN
+                    // is set at bringup); real-value fallback in case a build
+                    // path misses the bit. Returning 0 here froze userspace's
+                    // hardware clock (CROSS_CORE_THREAD_COLLAPSE.md §3).
+                    let v: u64;
+                    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v); }
+                    v
+                } else if op0 == 3 && op1 == 3 && crn == 14 && crm == 0 && op2 == 0 {
+                    // CNTFRQ_EL0 — same fallback as CNTVCT above.
+                    let v: u64;
+                    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v); }
+                    v
                 } else {
                     0
                 };

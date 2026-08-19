@@ -1543,6 +1543,43 @@ fn run_async_main() -> ! {
                                 &mut w, format_args!(" {id}={v}"));
                         }
                     }
+                    let sp = exceptions::SPURIOUS_IRQS.load(Ordering::Relaxed);
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut w, format_args!(" spurious={sp}\n"));
+                    w.flush();
+                }
+                // Vector-class decomposition + per-EC histograms of the sync
+                // classes (nonzero buckets only) — the discriminator for the
+                // ">1M vector entries/s with <10K/s of attributable work"
+                // storm (CROSS_CORE_THREAD_COLLAPSE.md §3).
+                {
+                    let c = &exceptions::EXC_BY_CLASS;
+                    let mut w = console::StackWriter::<224>::new();
+                    let _ = core::fmt::Write::write_fmt(&mut w, format_args!(
+                        "[EXCC] el0={} el1={} irq={} other={} |",
+                        c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed),
+                        c[2].load(Ordering::Relaxed), c[3].load(Ordering::Relaxed)));
+                    for (ec, v) in exceptions::SYNC_EC_EL0.iter().enumerate() {
+                        let v = v.load(Ordering::Relaxed);
+                        if v != 0 {
+                            let _ = core::fmt::Write::write_fmt(
+                                &mut w, format_args!(" e0.{ec:#x}={v}"));
+                        }
+                    }
+                    for (ec, v) in exceptions::SYNC_EC_EL1.iter().enumerate() {
+                        let v = v.load(Ordering::Relaxed);
+                        if v != 0 {
+                            let _ = core::fmt::Write::write_fmt(
+                                &mut w, format_args!(" e1.{ec:#x}={v}"));
+                        }
+                    }
+                    for (k, c) in &exceptions::MRS_TRAP_ENCODINGS {
+                        let key = k.load(Ordering::Relaxed);
+                        if key != 0 {
+                            let _ = core::fmt::Write::write_fmt(&mut w, format_args!(
+                                " mrs.{:#x}={}", key - 1, c.load(Ordering::Relaxed)));
+                        }
+                    }
                     let _ = core::fmt::Write::write_str(&mut w, "\n");
                     w.flush();
                 }

@@ -2459,7 +2459,12 @@ impl ThreadPool {
     /// thread. Per-core idle threads (see [`IS_IDLE_THREAD`]) are skipped by the
     /// round-robin scan; a core falls back only to ITS OWN idle. `core_id` is 0 on
     /// single-core builds, so behavior there is unchanged.
-    pub fn schedule_indices(&mut self, voluntary: bool, core_id: usize) -> Option<(usize, usize)> {
+    pub fn schedule_indices(
+        &mut self,
+        voluntary: bool,
+        core_id: usize,
+        interrupted_el0: bool,
+    ) -> Option<(usize, usize)> {
         // Use TPIDRRO_EL0 register for current thread ID - more reliable than atomic
         let current_idx = get_current_thread_register();
 
@@ -2550,9 +2555,19 @@ impl ThreadPool {
         // ticks — an effective ~5 ms timeslice — then rotates exactly as before,
         // so a queued READY thread waits a bounded few ticks, never forever.
         // When every core is busy the bypass does nothing at all.
+        //
+        // EL0-ONLY: the bypass (and the keep-running fallback below) apply only
+        // when the tick interrupted USERSPACE. Under smp-shared "the BKL is held
+        // iff a core is in EL1", so a thread interrupted mid-EL1 is a BKL holder
+        // — the per-tick switch (to idle, whose loop drops the BKL around WFI,
+        // or to another thread via the dropped-window ledger) is the RELEASE
+        // VALVE for long kernel excursions. Keeping an EL1 thread pinned wedged
+        // the boot suite's FS tests in a `[BKL] stuck` storm (thread 0 held the
+        // BKL through bulk ext2 I/O forever, every secondary starved).
         let displacement_bypass = |current_idx: usize| -> bool {
             const DISPLACEMENT_IMMUNITY_TICKS: u8 = 5;
             if voluntary
+                || !interrupted_el0
                 || IS_IDLE_THREAD[current_idx].load(Ordering::Relaxed)
                 || THREAD_STATES[current_idx].load(Ordering::SeqCst) != thread_state::RUNNING
             {
@@ -2685,18 +2700,26 @@ impl ThreadPool {
                 if next_idx == start_idx {
                     // No non-idle READY thread anywhere. If the current thread is still
                     // RUNNING (an involuntary tick preempted it, it did not block or
-                    // yield), keep it on this core: switching it out to idle here made
-                    // every CPU-bound thread bounce core -> idle -> another core on
-                    // every timer tick (the peer core's next tick picked it back up),
-                    // costing a context switch + cache/TLB locality per tick and — for
-                    // multi-threaded processes — regularly removing a barrier partner
-                    // from execution for ~a tick, which is what collapsed llama.cpp
-                    // `-t N` decode 14-22x. RUNNING is the safe gate: a RUNNING thread
-                    // is never picked by a peer core's scan (only READY is), so staying
-                    // put cannot double-run it; a WAITING (blocked) or READY (yielded)
-                    // current thread still falls through to the idle switch below,
-                    // which is what takes it off-CPU.
-                    if THREAD_STATES[current_idx].load(Ordering::SeqCst) == thread_state::RUNNING {
+                    // yield) AND it was interrupted in EL0, keep it on this core:
+                    // switching it out to idle here made every CPU-bound thread bounce
+                    // core -> idle -> another core on every timer tick (the peer core's
+                    // next tick picked it back up), costing a context switch +
+                    // cache/TLB locality per tick and — for multi-threaded processes —
+                    // regularly removing a barrier partner from execution for ~a tick,
+                    // which is what collapsed llama.cpp `-t N` decode 14-22x. RUNNING
+                    // is the safe gate against double-run: a RUNNING thread is never
+                    // picked by a peer core's scan (only READY is). The EL0 gate is the
+                    // safe gate against BKL starvation: an EL1-interrupted thread is a
+                    // BKL holder under smp-shared, and the idle switch below is the
+                    // release valve that lets peer cores enter the kernel (see the
+                    // displacement_bypass comment above — omitting this wedged the
+                    // boot suite's FS tests in a `[BKL] stuck` storm). A WAITING
+                    // (blocked) or READY (yielded) current thread also still falls
+                    // through to the idle switch, which is what takes it off-CPU.
+                    if interrupted_el0
+                        && THREAD_STATES[current_idx].load(Ordering::SeqCst)
+                            == thread_state::RUNNING
+                    {
                         return None;
                     }
                     // Fall back to THIS core's idle thread so
@@ -3107,10 +3130,19 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
 
     let voluntary = voluntary_schedule_flag().swap(false, Ordering::Acquire);
     let debug = SGI_DEBUG_ONCE.swap(false, Ordering::SeqCst);
-    
+
     if debug {
         safe_print!(64, "[SGI-DBG] entry voluntary={}\n", voluntary);
     }
+
+    // Which EL did this tick interrupt? SPSR.M[3:0] == 0 is EL0t (userspace).
+    // Read from the IRQ frame we were handed (SPSR at +248, the same offset the
+    // POISON tripwire uses). Gates the displacement bypass / keep-running paths
+    // in schedule_indices: an EL1-interrupted thread is a BKL holder under
+    // smp-shared and must stay displaceable (the BKL release valve).
+    // SAFETY: current_sp is the live IRQ trap frame the vector asm just built.
+    let interrupted_el0 =
+        unsafe { core::ptr::read_volatile((current_sp as usize + 248) as *const u64) } & 0xF == 0;
     
     // Get scheduling decision. Use try_lock instead of a blocking lock(): this handler
     // runs from the timer-driven SGI in IRQ context (PSTATE.I masked). If the timer
@@ -3141,7 +3173,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     if debug { (runtime().print_str)("[SGI-DBG] got POOL\n"); }
     // Which core is scheduling — selects this core's idle fallback. 0 on single-core.
     let core_id = crate::bkl::current_core_id() as usize;
-    let switch_info = pool.schedule_indices(voluntary, core_id).map(|(old_idx, new_idx)| {
+    let switch_info = pool.schedule_indices(voluntary, core_id, interrupted_el0).map(|(old_idx, new_idx)| {
         let new_tpidr = pool.slots[new_idx].exception_stack_top;
         (old_idx, new_idx, new_tpidr)
     });

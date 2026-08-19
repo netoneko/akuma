@@ -8,9 +8,45 @@ passes through extra boundaries left over from the deleted multikernel" — is
 **refuted**: there are no extra copies, mappings, or unmappings on the path, and
 user memory attributes are correct (Normal WB, inner-shareable, `nG` on every
 user PTE; verified in `crates/akuma-exec/src/mmu/`). Memory is not slow.
-**Context switching and scheduling around it were.** One real defect was found
-and fixed, several more were characterized, and two scheduler experiments were
-run to a measured verdict each.
+
+**Final outcome (read this first):** three landed fixes took decode from
+36 / 1.6 / 0.28 / 0.18 tok/s (`-t 1/2/3/4`) to **45.6 / 68.2 / 96.3 / 6.6** —
+real multi-thread scaling, with `-t 1` now above the Docker/Linux reference
+(40.6). The dominant root cause, found last (§0), was **EL0 counter reads
+(`CNTVCT_EL0`/`CNTFRQ_EL0`) trapping at ~1M pairs/s and being emulated as 0**;
+the per-switch full TLB flush (§1) and the scheduler's displacement behavior
+(§2) were real amplifiers on top. `-t 4` remains oversubscribed by design
+(4 compute threads + the netpoll core on 4 cores).
+
+## 0. THE ROOT CAUSE: CNTVCT/CNTFRQ traps at ~1M pairs/s, emulated as zero
+
+Found by decomposing the "~1.3M exception-vector entries/s per core during
+decode" storm (§3): new `[EXCC]` per-class + per-`ESR.EC` counters showed it
+was **sync EL0, EC=0x18** (trapped MRS), and the one-shot encoding counters
+named the registers: `op0=3 op1=3 crn=14 crm=0 op2=2` (**CNTVCT_EL0**) and
+`op2=0` (**CNTFRQ_EL0**), perfectly paired — a userspace timing read, ~1M
+pairs/s under decode (ggml/OpenBLAS spin- and poll-loops time themselves on
+every iteration).
+
+Two compounding defects:
+1. `CNTKCTL_EL1` was never programmed, so EL0 counter access stayed trapped.
+   Linux sets `EL0VCTEN` unconditionally; Akuma paid a full EL0->EL1->EL0
+   round trip per read — ~30-80% of every core under decode.
+2. The EC=0x18 emulation (`src/exceptions.rs`) returned **0** for every
+   register except CTR_EL0 — so userspace's hardware clock was FROZEN AT ZERO.
+   ggml's spin budgets and park/wake heuristics ran on a dead clock, which is
+   what actually turned barriers pathological.
+
+**Fix:** `CNTKCTL_EL1 = 0b10` (EL0VCTEN) at BSP boot (`boot.rs
+configure_mmu_regs`) and secondary bringup (`smp_shared.rs` trampoline), plus
+real-value fallbacks for CNTVCT/CNTFRQ in the trap emulation. After it, EC=0x18
+disappears from `[EXCC]` outright and the per-core exception rate under decode
+drops to ~3K/s (timer + SGIs + syscalls).
+
+**Context switching and scheduling around it were also defective.** One real
+defect was found and fixed (§1), the scheduler's displacement behavior was
+reworked (§2), and two scheduler experiments were run to a measured verdict
+each.
 
 All numbers: devbox-smoltcp (`smp-shared`), SMP=4, MEMORY=4096, QEMU HVF on
 Apple Silicon (`-cpu host` — real hardware TLBs), qwen3.5-0.8b-q4 (532 MB,
@@ -90,6 +126,18 @@ stack up:
    effect on llama: none on its own (at `-t >= 2` there is always another
    READY thread so the fallback wasn't the llama path), but it removes the
    bounce for every single-busy-thread regime and is strictly better.
+
+   **CRITICAL LESSON, found the hard way**: the first version applied this
+   (and §2B) to EL1-interrupted threads too, and the boot suite promptly
+   wedged in a `[BKL] stuck` storm at the FS tests — under smp-shared the BKL
+   is held iff a core is in EL1, and the per-tick switch to idle (whose loop
+   drops the BKL around WFI) was the RELEASE VALVE for long kernel excursions.
+   Both mechanisms are therefore gated on the tick having interrupted **EL0**
+   (SPSR.M[3:0]==0 read from the IRQ frame, threaded through
+   `schedule_indices(voluntary, core_id, interrupted_el0)`). Userspace holds
+   no BKL, which is exactly the llama case, so the gate costs the win nothing:
+   with it, boot suite 291 PASSED / 0 FAILED with FEWER transient
+   `[BKL] stuck` lines than the pre-change baseline run (91 vs 101).
 3. **A woken thread joins the BACK of the rotation.** `ThreadWaker::wake` CASes
    WAITING->READY and rings SGIs, but the receiving scheduler round-robins;
    the futex-woken barrier partner waits out the rotation behind the netpoll
@@ -173,33 +221,43 @@ found and SGI'd); if a peer takes the work, this core keeps its thread.
 | + same-TTBR0 switch skip (§1) | 35.2 | 2.5–4.2 | 0.26 | 0.17 |
 | + wake hint ON (§2A, reverted) | 35.1 | 1.15–1.23 | 0.30 | 0.20 |
 | + keep-RUNNING fallback (§2.2) | 35.2 | 2.6–3.8 | 0.26 | 0.17 |
-| **+ bounded displacement bypass (§2B, final)** | **34.3–36.9** | **21.8–22.3** | **1.5–1.7** | **0.46–0.47** |
+| + bounded displacement bypass (§2B, ungated) | 34.3–36.9 | 21.8–22.3 | 1.5–1.7 | 0.46–0.47 |
+| + EL0 gate on §2B/§2.2 (BKL valve, required) | 39.3–40.4 | 5.6–6.0 | — | 0.18 |
+| **+ CNTKCTL EL0 counter access (§0, final)** | **44.8–45.6** | **67.9–68.2** | **73.7–96.3** | **5.8–6.6** |
 
-Net: `-t 2` from 4% of `-t 1` to ~60% (13.5x); `-t 3`/`-t 4` 3–6x better but
-still oversubscription-bound (open item 5). Raw CSVs:
+Reading the table: the ungated bypass "won" `-t 2` largely by shielding threads
+that were in EL1 **because of the §0 trap storm** — once the storm is gone,
+threads genuinely run in EL0, the (mandatory) EL0-gated bypass protects them,
+and the collapse inverts into real scaling. `-t 4` stays oversubscribed
+(4 compute + netpoll > 4 cores; open item). Raw CSVs:
 `logs/llama_bench/akuma_tg_tsweep*.csv` (`_fixed` = §1 only, `_wakehint` = §2A,
-`_keeprun` = §2.2, `_bounded` = final).
+`_keeprun` = §2.2, `_bounded` = ungated §2B, `_final` = EL0-gated pre-§0,
+`_cntvct` = final).
 
 ## 5. What remains open (ranked by expected value)
 
-1. **Attribute the 5M/s sync-exception storm** (§3). Whatever it is, it taxes
-   every core ~continuously under load and is invisible to PSTATS.
-2. **FPCACHE sizing/policy** for mmap'd files larger than the cap — mapped-page
+1. ~~Attribute the 5M/s sync-exception storm~~ — **DONE, it was §0** (CNTVCT/
+   CNTFRQ traps), found via the `[EXCC]`/`mrs.` counters this investigation
+   added. The counters stay in the heartbeat; a reappearing `e0.0x18` bucket
+   means some new register joined the party.
+2. **`-t 4` oversubscription**: 4 compute threads + the netpoll thread on 4
+   cores. The netpoll core tax (~93-97% of one core, `cpu_us`-billed WFI
+   included) is the other half of this item. Real fix candidates: per-core run
+   queues + affinity (M5-class), or a cheaper netpoll idle mode.
+3. **FPCACHE sizing/policy** for mmap'd files larger than the cap — mapped-page
    eviction guarantees a steady refault tax on exactly the pages a decoding
    model streams. Candidates: raise the cap under high-RAM boots; exempt
    actively-mapped pages from eviction; per-file working-set hints.
-3. **Explicit-wake latency**: a futex-woken thread should run within SGI
+4. **Explicit-wake latency**: a futex-woken thread should run within SGI
    latency on SOME core, without preempting the producer (what killed
    Experiment A). Per-core hint slots, or wake-to-idle-core-first routing.
-4. **The netpoll core tax** at SMP=4.
-5. `-t 3/-t 4` remain structurally oversubscribed: 3-4 spinning compute
-   threads + netpoll + main on 4 cores; every mechanism above only softens the
-   rotation. Real fix is likely per-core run queues + affinity (an M5-class
-   scheduler change), or teaching ggml threads to park cheaply (they spin by
-   design with `--poll`).
-6. Cross-AS `tlbi aside1, #0` (kernel-global-preserving flush) — §1 follow-up.
-7. Fix the two lying diagnostics (§3) — `fe()` needs an atomic RMW ring;
+   Much less urgent post-§0 (barriers rarely reach the futex path now).
+5. Cross-AS `tlbi aside1, #0` (kernel-global-preserving flush) — §1 follow-up.
+6. Fix the two lying diagnostics (§3) — `fe()` needs an atomic RMW ring;
    the orphan check needs a per-tid re-check under the table lock.
+7. Re-run the Redis matrix: the §0 trap tax and §1 flush were also present
+   under every Redis measurement in `BENCHMARK_PERFORMANCE_ATTEMPT_0.md`; the
+   "9x per-round-trip" number likely shrinks.
 
 ## Background
 
