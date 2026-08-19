@@ -2844,16 +2844,52 @@ fn test_openat() {
         }
     }
 
+    // 9. Write-mode open of an existing DIRECTORY must fail EISDIR at open()
+    //    time (Linux fs/namei.c may_open), not hand out a fd that dies on the
+    //    first write(). This is the apk-tools 3 failure shape: its
+    //    `openat(dirfd, ".", O_RDWR|O_TMPFILE)` used to "succeed" with a
+    //    writable fd on the directory, and apk then reported "failed to write
+    //    database: Is a directory" after a successful install.
+    let p = cstr(ROOT);
+    let r = openat(AT_FDCWD, &p, open_flags::O_RDWR, 0);
+    if r != EISDIR {
+        fails += 1;
+        crate::safe_print!(64, "[Test] openat dir-write FAILED r={} (want EISDIR)\n", r);
+    }
+    let p = cstr(".");
+    let r = openat(7, &p, open_flags::O_WRONLY | open_flags::O_CREAT, 0o644);
+    if r != EISDIR {
+        fails += 1;
+        crate::safe_print!(64, "[Test] openat dirfd-dir-write FAILED r={} (want EISDIR)\n", r);
+    }
+    // Control: read-only dir open (getdents) must keep working.
+    let r = openat(AT_FDCWD, &p, open_flags::O_RDONLY, 0);
+    if (r as i64) < 0 {
+        fails += 1;
+        crate::safe_print!(96, "[Test] openat dir-read FAILED r={}\n", r);
+    } else {
+        close(r);
+    }
+
+    // 10. O_TMPFILE is not implemented; Linux kernels predating it answer
+    //     EINVAL and portable callers (apk-tools 3) fall back to .tmp+rename.
+    let p = cstr(ROOT);
+    let r = openat(AT_FDCWD, &p, open_flags::O_RDWR | open_flags::O_TMPFILE, 0o644);
+    if r != EINVAL {
+        fails += 1;
+        crate::safe_print!(64, "[Test] openat O_TMPFILE FAILED r={} (want EINVAL)\n", r);
+    }
+
     unregister_at_syscall_process(pid, tid);
 
     // Cleanup (best-effort; the test verdict is the case results above, not this).
     clean_at_test_tree(ROOT, &LEFTOVERS);
 
     if fails == 0 {
-        crate::safe_print!(128, "[Test] openat PASSED (8 cases: O_CREAT/O_TRUNC/dirfd/cwd-rel/dev-null/EBADF/ENOENT/symlink)\n");
+        crate::safe_print!(128, "[Test] openat PASSED (10 cases: O_CREAT/O_TRUNC/dirfd/cwd-rel/dev-null/EBADF/ENOENT/symlink/dir-write-EISDIR/O_TMPFILE-EINVAL)\n");
     } else {
-        crate::safe_print!(64, "[Test] openat FAILED ({} of 8 cases)\n", fails);
-        panic!("test_openat: {fails} of 8 cases failed");
+        crate::safe_print!(64, "[Test] openat FAILED ({} of 10 cases)\n", fails);
+        panic!("test_openat: {fails} of 10 cases failed");
     }
 }
 

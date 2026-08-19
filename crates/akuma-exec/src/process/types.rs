@@ -234,6 +234,14 @@ pub mod open_flags {
     pub const O_TRUNC: u32 = 0o1000;
     pub const O_APPEND: u32 = 0o2000;
     pub const O_CLOEXEC: u32 = 0o2000000;
+    /// `__O_TMPFILE | O_DIRECTORY` in the **arm64** encoding — arm64 keeps the
+    /// 32-bit ARM fcntl values (`O_DIRECTORY = 0o40000`), *not* the asm-generic
+    /// ones x86/riscv use (`0o200000`); this is what musl, glibc and Go all
+    /// pass on this target. The kernel does not implement tmpfiles;
+    /// `sys_openat` rejects the flag so portable callers (apk-tools 3's atomic
+    /// writes) take their `.tmp` + `renameat` fallback instead of writing into
+    /// a directory fd.
+    pub const O_TMPFILE: u32 = 0o20040000;
 }
 
 /// Source of data for a lazy region page.

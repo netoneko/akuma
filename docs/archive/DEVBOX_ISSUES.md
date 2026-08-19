@@ -1357,6 +1357,119 @@ links `akuma-tar` in deliberately (`Cargo.toml:25`, `oci.rs:119`), because
 exists" has no call site to attach to; the fix belongs in `/bin/tar` and the
 overlay, as above.
 
+## Issue 19: long-running `ssh <host> <cmd>` dies at ~300 s with `rc=255`
+
+**Status: OPEN, observed 2026-08-19, mechanism NOT attributed.** Found running
+`llama-bench` over ssh for the benchmark in
+`BENCHMARK_PERFORMANCE_ATTEMPT_0.md`.
+
+```
+ssh -p 2222 root@localhost 'llama-bench -m /root/qwen3.5-0.8b-q4.gguf ...'
+  -> rc=255 after 303 s, stdout truncated mid-run
+```
+
+`255` is ssh's own "connection error" exit, not the remote command's status, and
+the CSV came back with 3 of 8 rows. Timeline matters: rows 1-3 were emitted
+within the first ~90 s; row 4 (`tg128 -t 4`) is a cell that takes **over ten
+minutes** on this kernel, so **the channel had been carrying no data for
+roughly four minutes when it died**. That points at an *idle*-data cap around
+300 s, not a cap on total session duration — but that distinction is untested.
+
+**The folklore explanation is wrong, so do not repeat it.** "sshd's keepalive
+kills a long-lived exec channel" has been passed along in handoff notes; it is
+not supported by the source. `userspace/sshd/src/` (`main.rs`, `protocol.rs`,
+`wire.rs`, `config.rs`, `auth.rs`, `crypto.rs`, `keys.rs`, `lib.rs`) contains
+**no keepalive, idle-timeout, or deadline logic at all** — grepping the whole
+directory for `timeout|keepalive|deadline|SO_RCVTIMEO` returns nothing. Whatever
+drops the connection is not in sshd.
+
+Remaining suspects, none checked: the macOS client (though nothing was passed
+that would arm `ServerAliveInterval`, whose default is 0/disabled), the kernel
+socket layer, or QEMU SLIRP. Note that Issue 17 turned up "an undeclared 30 s
+blocking-read cap" in the socket path as one of four defects; a second,
+longer-lived cap of the same family is the most economical hypothesis and the
+first place to look.
+
+### Confirmed on the way past: `SO_KEEPALIVE` is a dead flag
+
+Checking the "we have no keepalive handling" theory turned up a real defect,
+independent of whether it is this bug's cause:
+
+```rust
+// crates/akuma-net/src/socket.rs:447
+pub fn set_socket_keepalive(idx: usize, enabled: bool) {
+    ...
+            sock.keepalive = enabled;      // line 450 — the only write
+```
+
+`sock.keepalive` is **written and never read**. Grepping `crates/akuma-net` and
+`src/` for `.keepalive` returns exactly that one assignment, and smoltcp's own
+`set_keep_alive` — the call that would actually arm the socket's
+`keep_alive_at` timer (`smoltcp-0.12.0/src/socket/tcp.rs:256,278-310`) — is
+never called anywhere in the crate. So `setsockopt(SO_KEEPALIVE)` succeeds,
+stores a bool, and does nothing. Akuma never emits a TCP keepalive probe.
+
+**This does not by itself explain the 300 s drop**, and the distinction matters:
+keepalive probes exist to let *this* side notice a dead peer, so their absence
+means Akuma fails to detect a vanished client — not that Akuma's own connection
+gets torn down. An inbound probe from the other side should still be answered by
+smoltcp's ordinary duplicate-ACK path without `set_keep_alive` being armed. And
+nothing in the default OpenSSH client fires at 300 s: `ServerAliveInterval`
+defaults to 0, and `TCPKeepAlive yes` inherits macOS's ~2 h idle.
+
+So: a genuine bug worth fixing on its own (`set_socket_keepalive` should call
+through to smoltcp), and still an open question as to what closes the channel at
+300 s. The test list below is unchanged.
+
+**Discriminating test, in this order:**
+
+1. `ssh -p 2222 root@localhost 'sleep 600; echo alive'`. If it dies at ~300 s,
+   the cap is about idleness and reproduces without any workload. If it
+   survives, the trigger involves the running command, not the quiet channel.
+2. Repeat with `-o ServerAliveInterval=30`. If client-driven traffic keeps it
+   alive, the cap is an idle-data timeout on the guest side and Issue 17's
+   `SOCKET_DELAYED_FIRST_BYTE_HANG.md` is the map.
+3. Watch `/proc/net/tcp` in a second session across the 300 s mark to see which
+   side tears the connection down.
+
+**Workaround — detach and poll, do not hold the channel open.** This is the
+pattern the benchmark used:
+
+```
+ssh ... "nohup sh -c 'cd /root && llama-bench ... > /root/out.csv 2>/root/out.err; \
+                      echo DONE > /root/out.done' >/dev/null 2>&1 & echo launched"
+# then poll /root/out.done from short-lived ssh calls
+```
+
+The failure is worth knowing precisely because of how it presents: a truncated
+result file plus a client-side timeout reads exactly like a wedged VM, and the
+VM is fine — the work keeps running if it was detached, and is lost if it was
+not.
+
+## Issue 20: `apk add` installs the files but fails every database write — "Is a directory"
+
+**Status: FIXED 2026-08-19.** The `apk` failure Issue 18 recorded as an aside
+(`ERROR: System state may be inconsistent: failed to write database: Is a
+directory`, seen with `apk add tar` the same day) and the prerequisite the
+llama.cpp benchmark flagged. **Not the post-install scripts** — those run
+clean (see Issue 8 for the earlier, genuinely-script-related "1 error");
+this is apk-tools 3's *atomic writes*: `__apk_ostream_to_file` prefers
+`openat(dirfd, ".", O_RDWR|O_TMPFILE)` whenever `/proc/self/fd` resolves
+(which it has since the 2026-08-16 `resolve_self` fix), and `sys_openat`
+neither implemented nor rejected `O_TMPFILE` — it returned a **writable fd on
+the directory itself**, and every later `write()` died `EISDIR`, so
+`apk update` reported `2 unavailable` and `apk add` left no database while
+installing the files.
+
+Fix: `O_TMPFILE` → `EINVAL` (what pre-tmpfile Linux returned; apk falls back
+to `.tmp` + `renameat`, which works), and write-mode opens of an existing
+directory → `EISDIR` at open() time (Linux `may_open`). One trap on the way:
+arm64 keeps the **32-bit ARM fcntl values** (`O_TMPFILE = 0o20040000`), not
+the asm-generic ones — a mask check written against the x86 numbers never
+matches a real musl binary. Regression: `test_openat` cases 9-10 (boot suite).
+Full investigation + in-guest probe:
+[`APK_OTMPFILE_DIR_FD.md`](APK_OTMPFILE_DIR_FD.md).
+
 ## Background
 
 - [`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md)

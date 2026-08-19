@@ -1447,6 +1447,25 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         crate::tprint!(128, "[syscall] openat(dirfd={}, path={:?}, flags=0x{:x}, mode=0x{:x})\n", dirfd, raw_path, flags, mode);
     }
 
+    // O_TMPFILE (an unnamed file linked in later via `linkat(/proc/self/fd/N)`)
+    // is not implemented, and Linux kernels that predate it answer EINVAL —
+    // portable callers (apk-tools 3 `__apk_ostream_to_file`) treat any failure
+    // as "no tmpfiles here" and fall back to a named `.tmp` + `renameat`. What
+    // this used to do instead was far worse: the flag was silently ignored, the
+    // O_DIRECTORY bit it carries resolved to the directory itself, and the
+    // write-mode-on-directory check below did not exist — so apk's
+    // `openat(dirfd, ".", O_RDWR|O_TMPFILE)` "succeeded" with a writable fd ON
+    // THE DIRECTORY, and every later write() failed EISDIR (apk: "failed to
+    // write database: Is a directory" after a successful install).
+    if flags & akuma_exec::process::open_flags::O_TMPFILE
+        == akuma_exec::process::open_flags::O_TMPFILE
+    {
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(128, "[syscall] openat({:?}): O_TMPFILE unsupported -> EINVAL\n", raw_path);
+        }
+        return EINVAL;
+    }
+
     let path = if raw_path.starts_with('/') {
         crate::vfs::canonicalize_path(&raw_path)
     } else {
@@ -1621,6 +1640,25 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
 
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let file_existed = crate::fs::exists(&path);
+
+        // Linux (fs/namei.c `may_open`): write access to an existing directory
+        // is EISDIR *at open()*. Handing out the fd anyway just moves the same
+        // error to the first write() — a failure at the wrong syscall, which is
+        // exactly how apk-tools 3's O_TMPFILE probe "succeeded" and then died
+        // writing its database. Read-only directory opens (getdents/`ls`) are
+        // unaffected.
+        if file_existed
+            && flags & (akuma_exec::process::open_flags::O_WRONLY
+                | akuma_exec::process::open_flags::O_RDWR)
+                != 0
+            && crate::vfs::metadata(&path).map(|m| m.is_dir).unwrap_or(false)
+        {
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(128, "[syscall] openat({:?}): write open of directory -> EISDIR\n", path);
+            }
+            return EISDIR;
+        }
+
         if !file_existed && (flags & akuma_exec::process::open_flags::O_CREAT != 0) {
             let _ = crate::fs::write_file(&path, &[]);
             if mode & 0o7777 != 0 {
