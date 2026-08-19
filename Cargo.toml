@@ -397,6 +397,17 @@ net-noalloc = ["akuma-net/net-noalloc"]
 # NIC interrupt — a scheduler change (a "light sleep" state), not a net change.
 # Until then the promiscuous wake wins on this workload.
 #
+# There is also a CORRECTNESS reason not to flip this on casually. `sys_accept`
+# opens a `NetBklGuard` for the whole syscall, so `wait_until` runs inside a
+# dropped-BKL window — and this feature puts a `schedule_blocking()` deschedule
+# in there. locking.md warns that a BKL-free window spanning a context-switch
+# point must be treated as touching the process-table row, and Phase 7b got
+# intermittent data corruption from that shape on ppoll/epoll_pwait. The default
+# path already spans a switch (`blocking_relax` starts with `yield_now`), so this
+# deepens an existing shape rather than creating one — but from "yields and comes
+# back" to "descheduled up to 3 ms". Nothing was observed; nothing was run long
+# enough to observe it either.
+#
 # Measurements: docs/archive/AKUMA_NET_ISSUES.md §8.
 net-waker-park = ["akuma-net/net-waker-park"]
 

@@ -1,9 +1,11 @@
 # Akuma networking: why a round trip costs milliseconds (2026-08-19)
 
-**Status: measured, root-caused, three fixes landed and A/B-verified. Two
-further attempts — static RX/TX rings (§7) and waker-based parking (§8) — are
-written, measured, and left OFF because both regress the tail; §8 also corrects
-an attribution error in §7.4 that should be read before building on this
+**Status: measured, root-caused, FOUR fixes landed and A/B-verified — the
+fourth (§9, the doorbell re-arm race) is a one-line reordering worth +65 %
+throughput and 2.7x on p99, and brings p50 to parity with Linux. Two further
+attempts — static RX/TX rings (§7) and waker-based parking (§8) — are written,
+measured, and left OFF because both regress the tail; §8 also corrects an
+attribution error in §7.4 that should be read before building on this
 document.** This is the investigation
 record for the NIC-path audit. The procedures it produced live in
 [`../runbooks/debug-network.md`](../runbooks/debug-network.md); the numbers and
@@ -260,6 +262,7 @@ landing on the 3 ms tick rather than on a packet. Two candidates, untested:
 | **Pressure-driven socket reclaim** | `crates/akuma-net/src/smoltcp_net.rs` | §3.4. Default-on |
 | Static RX/TX rings + async TX | `crates/akuma-net/src/virtio_rings.rs`, `smoltcp_net.rs` | §7. **OFF** (`net-noalloc`): halves the lock hold, loses 2.9x on p90 |
 | Waker-based socket parking | `crates/akuma-net/src/socket.rs`, `runtime.rs`, `src/main.rs` | §8. **OFF** (`net-waker-park`): directed wake, but lossy — 1,071 → 944 req/s |
+| **Doorbell re-arm before the drain** | `src/main.rs` | §9. **Default-on.** Closes a swallowed-wake race: +65 % req/s, p99 2.7x, p50 to Linux parity |
 | NIC counters + `[NICSTAT]` dump | `crates/akuma-net/src/nicstat.rs`, `src/nic_profile.rs` | measurement only; off by default |
 | Round-trip benchmark + Linux control | `scripts/benchmarks/bench_nic_rtt.py`, `serial_httpd_ref.py` | measurement only |
 | httpd phase timing | `userspace/httpd/src/stats.rs` | measurement only, `HTTPD_STATS=1` |
@@ -591,7 +594,31 @@ NIC interrupt** — a scheduler change (a "light sleep" state), not a network on
 A non-draining waker list would also narrow the race, at the cost of stale
 registrations. Neither is attempted here.
 
-### 8.5 What survives regardless
+### 8.5 A second, independent reason to leave it off: the BKL window
+
+`sys_accept` opens a `NetBklGuard` for the whole syscall
+(`src/syscall/net.rs:249`), so `socket_accept` → `wait_until` runs **inside a
+dropped-BKL window** (`no-bkl-network`). With this feature on, `wait_until`
+calls `schedule_blocking()` there — a real deschedule inside a BKL-free window.
+`docs/reference/subsystems/locking.md` warns about precisely that:
+
+> Any future BKL-free window that can span a `schedule_blocking()`/context-switch
+> point (not just a single bounded I/O op) should be treated as touching [the
+> process-table row], whether or not it looks like it does.
+
+Phase 7b tried that shape on `ppoll`/`epoll_pwait` and got one intermittent
+data-corruption run out of two, then reverted
+([`BKL_PHASE7B_PPOLL_CARVE_OUT.md`](BKL_PHASE7B_PPOLL_CARVE_OUT.md) §3-4).
+
+**Stated fairly: this deepens an existing shape rather than introducing a new
+one.** The default path already spans a context switch, because `blocking_relax`
+begins with `yield_now()`. But it deepens it from "yields and comes straight
+back" to "descheduled for up to the 3 ms backstop", which widens the window the
+process-table row is about. Nothing was observed — the boot suite is green on
+this feature — but it was never run long enough to trip an intermittent
+corruption, and it should not be turned on without that regimen.
+
+### 8.6 What survives regardless
 
 - `KernelSocket::waker_count()` — a diagnostic that reads zero for any blocking
   socket waiter on the default build. That is the outlier of 8.1, still true.
@@ -602,41 +629,111 @@ registrations. Neither is attempted here.
   not have caught it, because the backstop returns at about the same time either
   way.
 
-## 9. Not done
+## 9. The doorbell re-arm race — FIXED, and the biggest win of the session
 
-1. **The doorbell re-arm race — the leading untested candidate.** The gap to
-   Linux is entirely tail, and the tail is *bimodal*, not uniform: Akuma's
-   minimum (378 us) is **141 us FASTER than Linux** (519 us), while p99 is 4.6x
-   worse (4,091 vs 882 us). p99/p50 is 6.2x here and 1.5x on Linux. Most requests
-   take the fast route; a minority fall off a cliff — and the cliff is
-   tick-shaped (`relax` ~1,172 us/park, `tx_flight` max ~3,700 us, p99 ~4,000 us,
-   against a 3 ms tick).
+`src/main.rs`. **Default-on**, no feature gate: it is a one-line reordering with
+no tradeoff to opt into.
 
-   The mechanism that would produce exactly that: `src/main.rs` re-arms the
-   doorbell **after** the drain —
+### 9.1 The race
 
-   ```rust
-   while poll() { ... }                     // drain
-   NIC_WAKE_PENDING.store(false, Relaxed);  // re-arm — AFTER
-   ```
+The netpoll drain re-armed the NIC doorbell *after* draining:
 
-   — while the handler broadcasts only on a clear doorbell
-   (`if !NIC_WAKE_PENDING.swap(true) { broadcast_sgi() }`). A packet arriving
-   after `poll()` last returned false but before the `store(false)` is missed by
-   the drain, finds the doorbell already set so raises no broadcast, and is then
-   erased by the re-arm. Every core reaches `wfi` and sleeps to the tick: one
-   swallowed wake, one 3 ms request.
+```rust
+while poll() { ... }                     // drain
+NIC_WAKE_PENDING.store(false, Relaxed);  // re-arm — AFTER
+```
 
-   Fix is ordering — re-arm *before* the drain, so a packet landing during it
-   finds the doorbell clear and leaves an SGI pending that makes the trailing
-   `wfi` return at once. Costs extra SGIs, still bounded by the coalescer.
-   **Untested.** Flagged as candidate 1 in the original §4 and still never tried.
-2. **Turn `net-noalloc` on once the tail is fixed** (§7) — the rings are
-   written, correct, and halve the lock hold; they lose on p90 today. Their
-   suspected loss mechanism (the per-packet `receive_begin` notify was doubling
-   as a wake source) is the same wake problem as item 1, so item 1 may resolve
-   both. Also still unmeasured against a pipelined workload (redis), which is
-   the shape they should suit.
+while the interrupt handler broadcasts only on a clear doorbell:
+
+```rust
+if !NIC_WAKE_PENDING.swap(true, AcqRel) { gic::broadcast_sgi(SGI_SCHEDULER); }
+```
+
+A packet arriving **after the last `poll()` returned false but before the
+`store(false)`** is missed by the drain, finds the doorbell already set so its
+handler raises **no broadcast**, and is then erased by the re-arm. Every core
+reaches the trailing `wfi` and sleeps to the tick. One swallowed wake, one 3 ms
+request.
+
+### 9.2 The fix
+
+Re-arm **before** the drain. That inverts the race into a harmless one: a packet
+landing during the drain now finds the doorbell clear, broadcasts, and leaves an
+SGI pending that makes the trailing `wfi` return immediately, so the next lap
+drains it. The cost is one extra SGI per drain that overlaps an arrival — still
+bounded by the coalescer, since a burst mid-drain rings once, not once per frame.
+
+No lock or IRQ guard is needed, and neither would help: a local `IrqGuard`
+cannot exclude a *peer* core's handler, it would delay the very interrupt that
+ends the `wfi`, and it would extend an IRQ-masked region across a drain that
+costs 800+ ms per 5 s window under load — the exact cost §3.2 exists to complain
+about. The ordering makes the race benign rather than excluded, which is
+strictly better.
+
+### 9.3 Result
+
+n=2000 per run (n=400 is too few to resolve p90 here — the baseline's p90 ranged
+1,143-5,048 us across runs at that size). A-B-A: doorbell measured, reverted to
+baseline, then restored and re-measured, on separate boots. 6 doorbell runs,
+5 baseline runs. Medians:
+
+| | baseline | **doorbell** | Linux control |
+|---|---:|---:|---:|
+| req/s | 673 | **1,108** (+65 %) | 1,641 |
+| p50 | 630 us | **583 us** | 576 us |
+| p90 | 4,892 us | **2,107 us** (2.3x) | 643 us |
+| p99 | 10,913 us | **4,085 us** (2.7x) | 882 us |
+| p90 spread across runs | 1,143-5,048 us | **1,977-2,233 us** | — |
+
+**p50 is now at parity with Linux** (583 vs 576 us). The collapse in *variance*
+is the strongest evidence that this was the race it looked like: the baseline's
+p90 swings 4.4x run to run, the fixed build holds within 6 %.
+
+### 9.4 The mechanism, confirmed in the counters
+
+| per 5 s window | baseline | doorbell |
+|---|---:|---:|
+| `relax` parks | 3,918 | **5,328-6,151** |
+| us per park | 1,172 | **759-877** |
+| `nic_irq` | 6,071 | 6,468 |
+| total `poll` time | 472 ms | **362 ms** |
+
+More parks, each much shorter, and slightly more interrupts — exactly what
+closing a swallowed wake predicts. Waiters that used to sleep to the tick are
+now woken early, so they park more often and for less time.
+
+### 9.5 What is left in the tail, quantified
+
+The host tick is **3,000 us exactly** (`[Timer] host WFI probe: tick = 3000 us`).
+
+```
+p50 (a normal request)            583 us
+one tick                        3,000 us
+tick + p50                      3,583 us
+p99 measured                    4,085 us   -> 502 us unaccounted
+p90 measured                    2,107 us   -> p90 - p50 = 1,524 us, LESS than a tick
+```
+
+So a p99 request is "one swallowed-wake-equivalent plus a normal request", with
+~500 us left over — and p90 is *not* a clean one-tick event, so the tail is a
+continuum rather than a second clean bimodal step.
+
+**The next lead is in the same dump: `poll max = 3,592-3,695 us`.** A single
+`poll()` call blocking for a full tick means a thread is holding `NETWORK` and
+going to sleep while holding it — the same class of defect as this one (a wait
+that lands on the tick), one layer down. `smoltcp_net::network_holder_snapshot`
+already exists to attribute it. That is where to go next.
+
+## 10. Not done
+
+1. **The `poll()` full-tick stall** (§9.5) — `poll max` 3.6-3.7 ms says a
+   `NETWORK` holder sleeps while holding. Now the largest identified item.
+2. **Turn `net-noalloc` on once the tail is fixed** (§7) — the rings halve the
+   lock hold and lose on p90 today. Their suspected loss mechanism (the
+   per-packet `receive_begin` notify doubling as a wake source) is a wake
+   problem, and §9 fixed a different wake problem, so **the rings deserve a
+   re-measure on top of §9 before any further judgement**. Also still unmeasured
+   against a pipelined workload (redis), the shape they should suit.
 3. **A concurrent-connection harness.** `bench_nic_rtt.py` is serial, which is
    what confounded the `accept` reading (§7.4 correction). Without connections
    in flight, server-side phase timing cannot be separated from client

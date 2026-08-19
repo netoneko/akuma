@@ -1692,6 +1692,29 @@ fn run_async_main() -> ! {
             // the BKL" — the AB-BA shape the `PreemptGuard` doc warns about.
             #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
             akuma_exec::bkl::dropped_window_open();
+            // Re-arm the NIC doorbell BEFORE draining, not after.
+            //
+            // Re-arming afterwards left a window: a packet arriving after the
+            // last `poll()` returned false but before the store is missed by
+            // this drain, finds `NIC_WAKE_PENDING` still set so its handler
+            // raises NO broadcast, and is then erased by the store. Every core
+            // reaches the `wfi` below and sleeps to the 3 ms tick — one
+            // swallowed wake, one 3 ms request. That is the shape the tail
+            // actually has: Akuma's MINIMUM round trip beats the Linux control
+            // (378 us vs 519 us) while p99 is 4.6x worse, i.e. most requests are
+            // fine and a minority fall off a tick-shaped cliff.
+            //
+            // Clearing first inverts the race into a harmless one: a packet
+            // landing during the drain now finds the doorbell clear, broadcasts,
+            // and leaves an SGI pending that makes the trailing `wfi` return
+            // immediately — so the next lap drains it instead of the tick doing
+            // it 3 ms later. The cost is one extra SGI per drain that overlaps
+            // an arrival, still bounded by the coalescer (a burst mid-drain
+            // still rings once, not once per frame).
+            //
+            // See docs/archive/AKUMA_NET_ISSUES.md §9.
+            #[cfg(kernel_smp_shared)]
+            NIC_WAKE_PENDING.store(false, Ordering::Relaxed);
             let mut polls = 0u32;
             while akuma_net::smoltcp_net::poll() {
                 polls += 1;
@@ -1699,11 +1722,6 @@ fn run_async_main() -> ! {
                     break; // Safety cap to avoid starving other threads
                 }
             }
-            // Re-arm the NIC doorbell: the stack has now been polled, so the
-            // next arriving packet is entitled to another cross-core wake. See
-            // `NIC_WAKE_PENDING`.
-            #[cfg(kernel_smp_shared)]
-            NIC_WAKE_PENDING.store(false, Ordering::Relaxed);
             #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
             akuma_exec::bkl::dropped_window_close();
         }

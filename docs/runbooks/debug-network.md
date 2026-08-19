@@ -151,6 +151,31 @@ Full reasoning: [`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.m
 zero for any blocking socket waiter on the default build. If you are debugging a
 socket that never wakes, that zero is expected, not the bug.
 
+## The doorbell must be re-armed BEFORE the drain
+
+`src/main.rs`'s netpoll loop clears `NIC_WAKE_PENDING` *before* `while poll()`,
+not after. That ordering is load-bearing, not cosmetic: re-arming afterwards
+leaves a window where a packet arriving after the last `poll()` is missed by the
+drain, raises no broadcast (the doorbell is still set), and is then erased by the
+re-arm — so every core sleeps to the 3 ms tick. Fixed 2026-08-20, worth:
+
+| | re-arm after (old) | re-arm before |
+|---|---:|---:|
+| req/s | 673 | **1,108** |
+| p50 | 630 us | **583 us** |
+| p99 | 10,913 us | **4,085 us** |
+| p90 spread across runs | 1,143-5,048 us | **1,977-2,233 us** |
+
+If a latency regression appears here, check that ordering first. The tell in
+`[NICSTAT]` is `relax`: the fixed build has MORE parks that are each SHORTER
+(5,328-6,151 @ ~800 us vs 3,918 @ 1,172 us). Fewer, longer parks means wakes are
+being swallowed again.
+
+**Measure the tail with `-n 2000`, not the default.** At n=400 the baseline's p90
+ranged 1,143-5,048 us across runs — enough noise to hide a 2.3x change or invent
+one. Full reasoning:
+[`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md) §9.
+
 ## Before blaming the NIC path: check whether the tail is bimodal
 
 Akuma's *minimum* HTTP round trip (378 us) is **faster than the Linux control**
@@ -161,9 +186,18 @@ slowdown and a wake cliff need opposite fixes, so measure the shape first:
 scripts/benchmarks/bench_nic_rtt.py --mode http --target localhost:8080 -n 400
 ```
 
-p99/p50 near 1.5 means a genuinely slow path. Near 6 — what Akuma shows — means
-most requests are fine and a minority are landing on the ~3 ms scheduler tick.
-Chase the missed wake, not the per-packet cost.
+p99/p50 near 1.5 means a genuinely slow path. Near 6 — what Akuma still shows —
+means most requests are fine and a minority are landing on the 3 ms scheduler
+tick. Chase the missed wake, not the per-packet cost. That reading is what found
+the doorbell race above.
+
+Arithmetic for the residue, so the next person does not re-derive it: the tick is
+3,000 us exactly (`[Timer] host WFI probe`), p50 is 583 us, so one swallowed wake
+costs `3,000 + 583 = 3,583 us` and the measured p99 of 4,085 us leaves ~500 us
+unaccounted. p90 (2,107 us) is only 1,524 us above p50 — LESS than a tick — so
+the remaining tail is a continuum, not another clean bimodal step. The lead for
+it is `poll max = 3.6-3.7 ms` in the same dump: a single `poll()` blocking a full
+tick means a `NETWORK` holder is sleeping while holding it.
 
 ## Network debug knobs
 
