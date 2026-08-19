@@ -829,6 +829,142 @@ reason to measure it end-to-end before believing the attribution's promise.
    (measured p50 137 us) where QEMU SLIRP does not (Akuma p50 120 us, i.e.
    *faster*). Use `connect` for Akuma-vs-Akuma A/B only.
 
+## 11. Socket table, wake targeting, and four corrections (2026-08-20)
+
+### 11.1 The socket table saturates to whatever cap it is given
+
+Three arms, same session, 4 runs x 2000 requests, medians:
+
+| arm | req/s | p50 | p90 | p99 | table settled at |
+|---|---:|---:|---:|---:|---|
+| **A** 2048 hardcoded | 848 | 808 us | 2,471 us | 5,348 us | **2047/2048** |
+| **B** 128 + reclamation | 1,052 | 600 us | 2,353 us | 4,150 us | 123-127 |
+| **C** soft 128 -> x1.2 -> 512 | **1,098** | **581 us** | **2,093 us** | **4,119 us** | **128, never grew** |
+
+**Bigger is worse, not neutral.** `iface.poll()` walks the whole `SocketSet` every
+call, so per-poll cost tracks the table: **10.6 us at 128 slots, 45 us at 2048**
+(poll time 845-1,044 ms vs 1,807-2,862 ms per 5 s window). And the set fills to
+whatever cap exists, because smoltcp holds `TimeWait` for `CLOSE_DELAY` = **10 s**
+and at ~1,000 conn/s that wants 10,000 slots. Saturation is arithmetic, not tuning.
+
+C is the design that landed. It is **statistically indistinguishable from B** here
+(the ranges overlap and the cap never moved), because `grow_soft_cap` is gated on
+`freed == 0` and reclamation always freed something. That gate is the point:
+growing on `TimeWait` pressure would walk the cap to the ceiling and inherit A's
+result. C earns its place on robustness — headroom for genuinely-live pressure
+that B refuses outright — not on throughput.
+
+`SOCKET_SOFT_CAP_START` is derived as `min(128, MAX_SOCKETS)` so `extreme-size`
+starts at its own 32-slot ceiling and can never grow.
+
+### 11.2 What the cliff actually is
+
+At exactly `MAX_SOCKETS`, every `socket_create` — i.e. every accept, since
+`socket_accept` refills the listener backlog — runs `reclaim_pending_slots`, a
+nested scan (for each of 8 slots to free, rescan all of `pending_removal`) inside
+`with_network`, so under `PreemptGuard` with IRQs masked. Observed:
+
+| sockets | req/s | us/poll | relax parks | us/park |
+|---:|---:|---:|---:|---:|
+| 127 | 1,102 | 10.2 | 11,608 | 364 |
+| **128** | **459** | **19.4** | 4,769 | **889** |
+
+A threshold, not a gradient. Moving reclamation off the accept path — proactively
+from the netpoll drain at a high-water mark — is still the fix, and is NOT done.
+
+### 11.3 Wake accumulation (epoch): correct, and almost never fires
+
+`wait_until` now reads `smoltcp_net::poll_count()` before polling and re-checks it
+before parking, looping instead of parking if the stack moved underneath. This is
+the lossless version of what §8's waker registration failed to be — `wake_all()`
+drains its list, a counter cannot be lost.
+
+It fires on **1.1-1.3 % of would-be parks** (155/11,608, 63/4,769, 65/5,704), and
+end-to-end it measures neutral (1,028 vs 1,038 req/s, p99 4,166 vs 4,168). Kept:
+it is one relaxed load, and the `epoch_saves` counter is what turns "no effect"
+into a conclusion rather than a shrug.
+
+### 11.4 Targeted wake instead of broadcast: tried twice, WORSE both times
+
+The NIC handler broadcasts `SGI_SCHEDULER` to every core. Measured cost: **2.5
+async-main laps per NIC interrupt**, waking cores with nothing to do. Two attempts
+to wake only the cores with a parked socket waiter (`trigger_sgi_core` against a
+per-core record maintained around `blocking_relax`):
+
+| | laps per packet | req/s |
+|---|---:|---:|
+| broadcast | **3.18** | **~1,100** |
+| bitmask of waiter cores | 1.5-1.8 | 569-867 |
+| per-core waiter counts | 6.5-7.6 | 454-867 |
+
+The bitmask lost wakes outright — two waiters on one core share a bit, so the
+first to wake clears it and the second is never woken again (classic signature:
+fewer `relax` parks, each 2-3x longer). Counting per core fixed that and was still
+worse.
+
+**Why targeting cannot work as written**, and both reasons are structural:
+
+1. `blocking_relax` begins with `yield_now`, so a waiter can resume on a core it
+   never marked. Any affinity it records is stale by the time the interrupt reads it.
+2. The netpoll loop's own halt is a bare `wfi`, not a park, so folding it into the
+   same waiter table conflates two different things.
+
+A broadcast is imprecise and cheap; a precise wake was wrong more often than it was
+expensive. Recorded in `nic_irq_handler` so it is not re-tried blind.
+
+### 11.5 Four corrections to earlier claims in this document
+
+- **The async-main lap rate is 11,262/s under load and 2,281/s at idle** — not the
+  15,412/s quoted in §10 and `MAIN_THREAD_SPLIT.md`. That figure came from
+  `poll_calls - poll_progress`, which assumes every `poll()` is a drain lap. It is
+  not: `wait_until` polls up to 64x per blocked op, epoll polls, and
+  `socket_send`/`socket_recv` each poll once on the way out. Polls are ~10x laps.
+  `[NICSTAT] laps=` now reports the real number.
+- **The herd-poll rate limit did not "measure worse"** (§10.2). Neither did the
+  `pending_removal` GC rate limit. Both comparisons were run-vs-run across
+  different boots without normalising for traffic; normalised at ~12,160 rx
+  packets/window the GC one shows 6.96 vs 6.87/6.70 polls per packet and 10.7 vs
+  11.0/11.5 us per poll — noise. Both were reverted as unearned complexity, not as
+  regressions.
+- **"Work removed from the lap becomes more laps" is retracted.** It was inferred
+  from that same unnormalised comparison and does not survive normalisation.
+- **"A `NETWORK` holder sleeps while holding it"** (§9.5) is wrong.
+  `smoltcp_net::poll()` wraps the critical section in `PreemptGuard`, which masks
+  IRQs, so the holder cannot be descheduled.
+
+### 11.6 GIC audit: no v2/v3 mixing
+
+Checked because misusing the API would explain a lot. It is clean: `gic-v2` is not
+a default feature, the v3 driver touches no `GICC` MMIO (system registers
+throughout), every dispatch point in `gic.rs` has both arms, and the PE0-hardcoded
+`trigger_sgi` is confined to `not(kernel_smp_shared)` at both call sites —
+`smp-shared` uses `trigger_sgi_self`.
+
+Two notes, neither a bug today:
+
+- `enable_irq` programs `IROUTER` with **`IRM=0`**, pinning the NIC SPI to aff0=0.
+  `IRM=1` ("1-of-N") would let the GIC deliver to any participating PE. Untried;
+  it would not fix the waiter-on-another-core problem but would stop core 0
+  absorbing every NIC interrupt.
+- `trigger_sgi`'s comment claims TargetList bit 0 selects "this CPU". It selects
+  PE 0. Harmless where it is reachable (single-core only), latent trap otherwise.
+
+### 11.7 Measurement discipline this section cost us to learn
+
+- **Normalise by traffic.** Poll and lap counts track packet count; comparing raw
+  totals between runs invents effects. Three wrong conclusions came from this.
+- **Measure a control in the same session.** The same build gave 1,108 and 1,040
+  req/s hours apart — ~6 % drift, enough to manufacture a result this size.
+- **`bkl-profile` shares are contended *spin* time, not CPU.** 85 % of it is
+  `idle` + `irq/sched`, i.e. cores that had nothing to do. Returning a lock sooner
+  to an idle core buys nothing. Use it to find *who holds*, never to predict what a
+  fix is worth.
+- **Counting operations is not measuring them.** `SocketSet::get` is an array
+  index; "9M lookups/s" sounded damning and cost nothing.
+- **Instrument with O(1) counters.** `iter().count()` per poll made the meter a
+  material part of what it measured — ~0.9 us/poll at 128 slots, ~14 us at 2048,
+  which inflated the first 2048-slot experiment.
+
 ## Background
 
 - [`BENCHMARK_PERFORMANCE_ATTEMPT_0.md`](BENCHMARK_PERFORMANCE_ATTEMPT_0.md) §4
