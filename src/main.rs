@@ -1237,6 +1237,87 @@ fn run_async_main_preemptive() -> ! {
     halt();
 }
 
+/// One pass of the network drain: post buffers, drain every ready frame, hand
+/// wakes to whoever was waiting.
+///
+/// Split out of the async-main loop so a dedicated thread can run it at packet
+/// rate while [`netpoll_maint_step`]'s housekeeping runs at its own, much slower
+/// cadence. The two used to share one loop body, which meant the BKL-held
+/// housekeeping was re-entered once per network wake: measured 15,412 laps/s
+/// under HTTP load against the ~100/s the Phase 7 audit assumed when it decided
+/// not to carve `netpoll_maint` (`BKL_PHASE7_AUDIT.md` §2.6 — written before the
+/// NIC had an interrupt at all, so its premise was 150x stale).
+///
+/// This function itself takes **no BKL**. Everything `poll()` touches has its own
+/// lock, which is what `no-bkl-network` already established; the dropped window
+/// below is that carve-out.
+#[cfg(feature = "smoltcp")]
+#[inline]
+fn netpoll_drain_step() {
+    // Poll network stack in a loop until no more progress.
+    // Each poll() may only process one RX packet (single VirtIO buffer),
+    // so we need to loop to drain bursts of incoming packets. This is
+    // critical for bulk transfer throughput (e.g. git clone over SSH):
+    // without draining, TCP ACKs/window updates are delayed until the
+    // next scheduler slot, causing the remote sender's TCP window to
+    // shrink and throughput to collapse.
+    // Rump-only builds have no smoltcp interface to poll; the rump stack is
+    // driven by rump_server + the per-box sysproxy path instead.
+    #[cfg(feature = "smoltcp")]
+    {
+        // Profiler only: isolate the burst-drain itself from the maintenance work
+        // above it (BKL_VFS_CARVE_OUT.md §19 sub-tag split).
+        #[cfg(kernel_smp_shared)]
+        akuma_exec::sync::set_holder_tag(
+            akuma_exec::bkl::current_core_id(),
+            akuma_exec::sync::HOLD_TAG_NETPOLL_DRAIN,
+        );
+        // BKL carve-out (§19.3/§20): every piece of state `poll()` touches (`NETWORK`,
+        // transitively `SOCKET_TABLE` via the post-drop wake pass) is already behind
+        // its own `PreemptGuard`-protected lock, so the drain doesn't need the BKL for
+        // exclusivity — same precedent as `NetBklGuard` (src/syscall/net.rs), whose
+        // mechanism this reuses directly. Gated on `kernel_no_bkl_network`
+        // specifically, not just `kernel_smp_shared`: that is what makes
+        // `PreemptGuard::new()` mask IRQs for the inner `NETWORK` hold, which is what
+        // keeps a nested IRQ from ever observing this core "holding NETWORK, wanting
+        // the BKL" — the AB-BA shape the `PreemptGuard` doc warns about.
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        akuma_exec::bkl::dropped_window_open();
+        // Re-arm the NIC doorbell BEFORE draining, not after.
+        //
+        // Re-arming afterwards left a window: a packet arriving after the
+        // last `poll()` returned false but before the store is missed by
+        // this drain, finds `NIC_WAKE_PENDING` still set so its handler
+        // raises NO broadcast, and is then erased by the store. Every core
+        // reaches the `wfi` below and sleeps to the 3 ms tick — one
+        // swallowed wake, one 3 ms request. That is the shape the tail
+        // actually has: Akuma's MINIMUM round trip beats the Linux control
+        // (378 us vs 519 us) while p99 is 4.6x worse, i.e. most requests are
+        // fine and a minority fall off a tick-shaped cliff.
+        //
+        // Clearing first inverts the race into a harmless one: a packet
+        // landing during the drain now finds the doorbell clear, broadcasts,
+        // and leaves an SGI pending that makes the trailing `wfi` return
+        // immediately — so the next lap drains it instead of the tick doing
+        // it 3 ms later. The cost is one extra SGI per drain that overlaps
+        // an arrival, still bounded by the coalescer (a burst mid-drain
+        // still rings once, not once per frame).
+        //
+        // See docs/archive/AKUMA_NET_ISSUES.md §9.
+        #[cfg(kernel_smp_shared)]
+        NIC_WAKE_PENDING.store(false, core::sync::atomic::Ordering::Relaxed);
+        let mut polls = 0u32;
+        while akuma_net::smoltcp_net::poll() {
+            polls += 1;
+            if polls >= 64 {
+                break; // Safety cap to avoid starving other threads
+            }
+        }
+        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        akuma_exec::bkl::dropped_window_close();
+    }
+}
+
 /// Run the async main loop
 ///
 /// This is the main entry point for async networking.
@@ -1663,68 +1744,7 @@ fn run_async_main() -> ! {
         crate::nic_profile::maybe_dump(now_us);
 
         GLOBAL_POLL_STEP.store(1, Ordering::Relaxed);
-        // Poll network stack in a loop until no more progress.
-        // Each poll() may only process one RX packet (single VirtIO buffer),
-        // so we need to loop to drain bursts of incoming packets. This is
-        // critical for bulk transfer throughput (e.g. git clone over SSH):
-        // without draining, TCP ACKs/window updates are delayed until the
-        // next scheduler slot, causing the remote sender's TCP window to
-        // shrink and throughput to collapse.
-        // Rump-only builds have no smoltcp interface to poll; the rump stack is
-        // driven by rump_server + the per-box sysproxy path instead.
-        #[cfg(feature = "smoltcp")]
-        {
-            // Profiler only: isolate the burst-drain itself from the maintenance work
-            // above it (BKL_VFS_CARVE_OUT.md §19 sub-tag split).
-            #[cfg(kernel_smp_shared)]
-            akuma_exec::sync::set_holder_tag(
-                akuma_exec::bkl::current_core_id(),
-                akuma_exec::sync::HOLD_TAG_NETPOLL_DRAIN,
-            );
-            // BKL carve-out (§19.3/§20): every piece of state `poll()` touches (`NETWORK`,
-            // transitively `SOCKET_TABLE` via the post-drop wake pass) is already behind
-            // its own `PreemptGuard`-protected lock, so the drain doesn't need the BKL for
-            // exclusivity — same precedent as `NetBklGuard` (src/syscall/net.rs), whose
-            // mechanism this reuses directly. Gated on `kernel_no_bkl_network`
-            // specifically, not just `kernel_smp_shared`: that is what makes
-            // `PreemptGuard::new()` mask IRQs for the inner `NETWORK` hold, which is what
-            // keeps a nested IRQ from ever observing this core "holding NETWORK, wanting
-            // the BKL" — the AB-BA shape the `PreemptGuard` doc warns about.
-            #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
-            akuma_exec::bkl::dropped_window_open();
-            // Re-arm the NIC doorbell BEFORE draining, not after.
-            //
-            // Re-arming afterwards left a window: a packet arriving after the
-            // last `poll()` returned false but before the store is missed by
-            // this drain, finds `NIC_WAKE_PENDING` still set so its handler
-            // raises NO broadcast, and is then erased by the store. Every core
-            // reaches the `wfi` below and sleeps to the 3 ms tick — one
-            // swallowed wake, one 3 ms request. That is the shape the tail
-            // actually has: Akuma's MINIMUM round trip beats the Linux control
-            // (378 us vs 519 us) while p99 is 4.6x worse, i.e. most requests are
-            // fine and a minority fall off a tick-shaped cliff.
-            //
-            // Clearing first inverts the race into a harmless one: a packet
-            // landing during the drain now finds the doorbell clear, broadcasts,
-            // and leaves an SGI pending that makes the trailing `wfi` return
-            // immediately — so the next lap drains it instead of the tick doing
-            // it 3 ms later. The cost is one extra SGI per drain that overlaps
-            // an arrival, still bounded by the coalescer (a burst mid-drain
-            // still rings once, not once per frame).
-            //
-            // See docs/archive/AKUMA_NET_ISSUES.md §9.
-            #[cfg(kernel_smp_shared)]
-            NIC_WAKE_PENDING.store(false, Ordering::Relaxed);
-            let mut polls = 0u32;
-            while akuma_net::smoltcp_net::poll() {
-                polls += 1;
-                if polls >= 64 {
-                    break; // Safety cap to avoid starving other threads
-                }
-            }
-            #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
-            akuma_exec::bkl::dropped_window_close();
-        }
+        netpoll_drain_step();
 
         GLOBAL_POLL_STEP.store(2, Ordering::Relaxed);
         if config::MEM_MONITOR_ENABLED {
@@ -1741,6 +1761,12 @@ fn run_async_main() -> ! {
         GLOBAL_POLL_STEP.store(3, Ordering::Relaxed);
         // Profiler only: isolate herd output/heartbeat polling from the drain above it
         // (BKL_VFS_CARVE_OUT.md §19 sub-tag split).
+        //
+        // This runs once per lap — 15,412 times/s under load — and `bkl-profile`
+        // attributes 5.0-14.3 % of all contended BKL time to it. Rate-limiting it
+        // to 100 ms was tried 2026-08-20 and measured NEUTRAL-TO-WORSE (req/s
+        // 1,040 -> 1,002, p90 2,453 -> 2,727 us on the same machine state). Do not
+        // "fix" it again without re-measuring: see AKUMA_NET_ISSUES.md §10.
         #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
         akuma_exec::sync::set_holder_tag(
             akuma_exec::bkl::current_core_id(),

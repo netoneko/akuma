@@ -724,27 +724,107 @@ going to sleep while holding it — the same class of defect as this one (a wait
 that lands on the tick), one layer down. `smoltcp_net::network_holder_snapshot`
 already exists to attribute it. That is where to go next.
 
-## 10. Not done
+## 10. Herd polling: 5-14 % of contended BKL, and rate-limiting it does NOT help
 
-1. **The `poll()` full-tick stall** (§9.5) — `poll max` 3.6-3.7 ms says a
-   `NETWORK` holder sleeps while holding. Now the largest identified item.
-2. **Turn `net-noalloc` on once the tail is fixed** (§7) — the rings halve the
+Third negative result of the session, and the one that most changes how to read
+the profiler.
+
+### 10.1 What the attribution said
+
+`bkl-profile` under HTTP load, `SMP=4`, three consecutive windows:
+
+| tag | w2 | w3 | w4 (heaviest) |
+|---|---:|---:|---:|
+| irq/sched | 30.4 % | 32.7 % | 48.5 % |
+| idle | 11.9 % | 19.9 % | 36.9 % |
+| **netpoll_herd** | — | **14.3 %** | **5.0 %** |
+| **netpoll_maint** | **15.2 %** | **10.6 %** | — |
+| netpoll_drain | — | — | 2.2 % |
+
+`netpoll_herd` is a `try_read()` on a channel that is usually empty and often
+absent entirely, executed once per async-main lap — **15,412 laps/s** measured
+under load, against the ~100/s `BKL_PHASE7_AUDIT.md` §2.6 assumed when it decided
+not to carve `netpoll_maint` (that audit predates the NIC interrupt, so its
+premise is 150x stale). Meanwhile `netpoll_drain`, the part that IS carved out,
+is 2.2 %. It looks like free money.
+
+### 10.2 It is not
+
+Rate-limited herd polling to 100 ms (a ~1,500x reduction), A/B on the same
+machine state, 4 runs x 2000 requests per arm:
+
+| | herd every lap | herd every 100 ms |
+|---|---:|---:|
+| req/s | **1,040** | 1,002 |
+| p50 | 605 us | 608 us |
+| p90 | **2,453 us** | 2,727 us |
+| p99 | **4,162 us** | 4,334 us |
+
+Neutral on p50, slightly worse everywhere else, consistently across runs.
+Reverted.
+
+### 10.3 Why — the lesson worth keeping
+
+**BKL contention share is not a proxy for throughput.** The `spins` a tag
+accumulates measure how long *other cores waited* while that tag held the lock.
+In this workload those other cores are overwhelmingly in `idle` (36.9 %) and
+`irq/sched` (48.5 %) — together 85 % — i.e. they had nothing better to do. Giving
+an idle core its lock back sooner buys nothing.
+
+A secondary effect probably explains the small *regression*: removing work from
+the tail of the lap makes the loop reach `wfi` sooner, so it runs more laps, so
+it does more BKL acquire/release churn per second. Same shape as §8's finding
+that a plentiful-but-imprecise wake beat a precise one — doing less per lap is
+not the same as doing less work.
+
+**Practical rule: use `bkl-profile` to find *who holds the lock*, not to predict
+what a fix is worth. Only the end-to-end A/B decides that** — and only against a
+control measured on the same machine state. (Today's control was 1,040 req/s
+where the same build measured 1,108 a few hours earlier: ~6 % drift, enough to
+manufacture or hide a result this size.)
+
+### 10.4 What was kept
+
+`netpoll_drain_step()` — the drain extracted from the async-main loop body into
+its own `#[inline]` function. Behaviour-identical and measured as such; it exists
+so a dedicated network thread can call it at packet rate while housekeeping runs
+at its own cadence, with single-core/`extreme-size` builds keeping one thread
+that calls both. That split is designed but NOT built or measured; §10.3 is the
+reason to measure it end-to-end before believing the attribution's promise.
+
+## 11. Not done
+
+1. **The split netpoll thread** (§10.4) — `netpoll_drain_step()` is extracted and
+   ready; the design is a dedicated drain thread at packet rate plus housekeeping
+   at its own cadence, with `extreme-size`/`SMP=1` keeping one thread that calls
+   both inlined halves. §10 is the warning attached: the attribution says
+   maintenance+herd is 15-25 % of contended BKL, and §10.2 shows that number does
+   not convert into throughput. Measure end-to-end against a same-session control.
+2. **The `poll()` full-tick stall** — `poll max` is 3.6-3.7 ms. NOTE: the earlier
+   guess that a `NETWORK` holder sleeps while holding it is **wrong** —
+   `smoltcp_net::poll()` wraps the whole critical section in `PreemptGuard`, which
+   masks IRQs, so the holder cannot be descheduled. Two live candidates instead:
+   `NETWORK` is a plain (unfair) `Spinlock`, so a waiter can be starved under
+   4-core contention; and `poll_us` spans the post-drop `wake_all()` pass, which
+   walks **every** socket slot (`MAX_SOCKETS` = 128, or 256 with `many-sessions`)
+   taking each one's waker lock. Attribute before fixing.
+3. **Turn `net-noalloc` on once the tail is fixed** (§7) — the rings halve the
    lock hold and lose on p90 today. Their suspected loss mechanism (the
    per-packet `receive_begin` notify doubling as a wake source) is a wake
    problem, and §9 fixed a different wake problem, so **the rings deserve a
    re-measure on top of §9 before any further judgement**. Also still unmeasured
    against a pipelined workload (redis), the shape they should suit.
-3. **A concurrent-connection harness.** `bench_nic_rtt.py` is serial, which is
+4. **A concurrent-connection harness.** `bench_nic_rtt.py` is serial, which is
    what confounded the `accept` reading (§7.4 correction). Without connections
    in flight, server-side phase timing cannot be separated from client
    turnaround.
-4. **`userspace/httpd` does not run on Linux** — `hello` (the minimal libakuma
+5. **`userspace/httpd` does not run on Linux** — `hello` (the minimal libakuma
    binary) SIGSEGVs too, so the blocker is in libakuma's startup, not httpd.
    Worth fixing: it would give the same-binary A/B that
    `scripts/probes/` provides for `std` binaries. Syscall numbers are already
    Linux aarch64 apart from the 300+ Akuma extensions (`SPAWN` 301, `TIME` 305,
    `UPTIME` 319), and those return `-ENOSYS` rather than faulting.
-5. **`connect`-mode comparison against Docker is not meaningful** — Docker
+6. **`connect`-mode comparison against Docker is not meaningful** — Docker
    Desktop's proxy opens a fresh backend connection per inbound connection
    (measured p50 137 us) where QEMU SLIRP does not (Akuma p50 120 us, i.e.
    *faster*). Use `connect` for Akuma-vs-Akuma A/B only.
