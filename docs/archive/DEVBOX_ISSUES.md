@@ -1196,6 +1196,35 @@ Fix would be a lazily-grown backlog (create listening sockets on demand up to
 the cap instead of all 32 up front) plus a configurable total. Both caps are
 compile-time constants today.
 
+**Refined 2026-08-19 while benchmarking Redis** (`BENCHMARK_PERFORMANCE_ATTEMPT_0.md`).
+The ceiling is not really a client count — it is *how recently the last run
+ended*. Sweeping `-c 10/16/20/32` against `redis:alpine` in a box, one
+`redis-benchmark` invocation per test:
+
+| clients | back-to-back (no gap) | 10 s gap |
+|---|---|---|
+| 10 | both tests pass | pass |
+| 16 | both tests pass | pass |
+| 20 | both tests pass | pass |
+| 32 | **2nd test fails** | pass |
+
+whereas a *single* invocation carrying two tests (`-t set,get`) fails on the
+second test at `-c 20`, because redis-benchmark tears down and rebuilds its
+whole client pool between tests with no pause. So `-c 32` is reachable with a
+cooldown, and `-c 20` is not reachable without one. Throughput was flat at
+~3,000 rps across all four client counts, which says the pool limit is not what
+caps throughput — see the benchmark doc.
+
+Two things make this worse than it needs to be for anyone measuring:
+
+- **`redis-benchmark` exits 0 after printing the message.** The affected tests
+  simply do not appear in the `--csv` output, so a harness that trusts the exit
+  status records a clean run that is missing half its cells.
+  `scripts/benchmarks/bench_redis.py` now greps stdout for
+  `No file descriptors available` and has `--per-test` / `--cooldown` for this.
+- The message names file descriptors, which sends you to `RLIMIT_NOFILE`. It is
+  `alloc_socket` → `EMFILE`, nothing to do with the fd table.
+
 ## Issue 17: socket read hangs forever when the response's first byte is delayed
 
 **Status: FIXED 2026-08-17.** Filed with a lost-wakeup suspicion; it was
@@ -1237,6 +1266,96 @@ the socket rx path.
 Full write-up incl. the minimal-repro sketch (delayed-reply host listener,
 sweep 0.5–30 s, plus a mid-stream-gap variant):
 [`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md).
+
+## Issue 18: `box pull` fails at the first blob fetch — `config fetch failed: IoError`
+
+**Status: OPEN, found 2026-08-19.** Blocks `docs/runbooks/run-redis.md` §3 (the
+"official image in a box" demo) on kernel `3f7a33de-release-smp-shared`; the
+runbook's own verification was 2026-08-16, so this is a regression window of
+three days.
+
+```
+~ # box pull redis:alpine
+box: pulling registry-1.docker.io/library/redis:alpine
+  Fetching auth token...
+  Fetching manifest...
+  Fetching platform manifest...
+  Config: sha256:fbe100e8c73fa3ceb2cb5c357c390d5b8c898591fc693590aa68dac219ae8ae1
+  Layers:  7
+  Fetching config...
+box pull: config fetch failed: IoError
+```
+
+Not image-specific — `box pull alpine:latest` (1 layer) fails identically at the
+same step. Everything before it succeeds, so this is not auth, DNS, TLS setup or
+manifest parsing.
+
+What is different about the step that fails: the three successful fetches are
+`https_get` (`oci.rs:55,74`), which returns the body in memory from
+`registry-1.docker.io`. `fetch_config` (`oci.rs:82`) is the first
+`download_file_with_headers` — a **blob** URL, which Docker Hub answers with a
+307 to `production.cloudflare.docker.com`, and it **writes to a file**
+(`/tmp/oci-config.json`). So the suspects are redirect handling, the second
+host, or the file write — in that order, and none of them is confirmed yet.
+
+Guest-side networking is *not* the problem: `wget -O /dev/null
+https://production.cloudflare.docker.com/` returns cleanly from the same shell,
+and `apk update` fetches both APKINDEXes over TLS.
+
+The file-write suspect is worth checking first, because `apk` on the same image
+fails at *its* write step too — `ERROR: System state may be inconsistent:
+failed to write database: Is a directory` — which suggests something is wrong
+with path resolution or file creation on this rootfs independently of `box`.
+
+**Workaround used for the benchmark** — populate the box's root from the host
+instead of pulling. This runs the genuine `redis:alpine` binaries, so it is a
+real substitute for §3, not an approximation:
+
+```bash
+docker export akuma-redis-bench | gzip -1 > redis_rootfs.tar.gz
+# stream it in over ssh (from Python; the ssh CLI is blocked by policy)
+#   ssh ... 'mkdir -p /root/redisimg && busybox tar -xzf - -C /root/redisimg'
+```
+```
+~ # box open redisbox --root /root/redisimg -d \
+      /usr/local/bin/redis-server --port 4444 --protected-mode no --save ''
+~ # box use redisbox -i /usr/local/bin/redis-cli -p 4444 ping
+PONG
+```
+
+`box use <name> -i <cmd>` is the `docker exec` equivalent, and **`-i` is what
+makes it relay stdout** — without it the command runs and you get only
+`Injected PID 110`.
+
+### Sub-issue: `/bin/tar` cannot read a gzipped tarball, or stdin
+
+Note the `busybox tar` above. Akuma's own `/bin/tar` (`userspace/tar`, 41 KB)
+rejects that invocation:
+
+```
+~ # ... | tar xf - -C /root/redisimg
+tar: only extraction (-x) is supported for now.
+~ # tar --help
+tar: invalid option -- '-'
+```
+
+The error is misleading twice over: the command *was* an extraction, and the
+real gaps are no `-z` (gzip) and no `-f -` (stdin). It also has no `--help`.
+
+**Deferred patch, recorded here rather than made** (2026-08-19, by request):
+
+1. Teach `/bin/tar` `-z` and `-f -`, or make it say which flag it actually
+   refused instead of "only extraction is supported".
+2. Ship a tar that can do this in the base image via
+   `overlays/devbox/bootstrap.sh`, so moving a tarball into a devbox does not
+   depend on knowing that `busybox tar` is the one that works.
+
+Note that **`box` itself does not shell out to `tar`** — `userspace/box`
+links `akuma-tar` in deliberately (`Cargo.toml:25`, `oci.rs:119`), because
+`/bin/tar` was once a busybox applet symlink whose hardlink handling inflated a
+1.9 MB layer to 467 MB (`BOX_DOCKER_COMPAT.md`). So "make `box` check that tar
+exists" has no call site to attach to; the fix belongs in `/bin/tar` and the
+overlay, as above.
 
 ## Background
 

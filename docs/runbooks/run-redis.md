@@ -119,6 +119,13 @@ SET: 4008.02 requests per second, p50=2.327 msec
 GET: 4566.21 requests per second, p50=2.191 msec
 ```
 
+Those figures are a smoke test, not throughput: at `-n 4000` connection setup
+dominates. Measured properly (`-n 100000`, one invocation per test, median of 3)
+the same setup does **~20,000 ops/s** unpipelined and **~210,000 at `-P 16`**
+from a host client, and ~3,400 / ~53,000 with the client inside the guest — see
+[`../archive/BENCHMARK_PERFORMANCE_ATTEMPT_0.md`](../archive/BENCHMARK_PERFORMANCE_ATTEMPT_0.md),
+which also explains why the in-guest arm is the *slower* one here.
+
 `-c 20` is comfortable. **`-c 50` fails** with `Can't create socket: No file
 descriptors available` — that is the kernel socket budget, not Redis: each
 listener pre-allocates `MAX_BACKLOG` (32 with the default `many-sessions`
@@ -202,6 +209,7 @@ Failure modes and where they point:
 
 | What you see | Meaning |
 |---|---|
+| `box pull: config fetch failed: IoError` | **§3 is broken as of 2026-08-19** on `3f7a33de`, for every image. Networking is fine (`wget`/`apk` work); it dies at the first blob fetch. [`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) Issue 18 has the analysis and a `docker export` → `box open --root` workaround that still runs the genuine image binaries |
 | `Connection refused` from `redis-cli` against a server that is up | Kernel predates the connect-redial fix (2026-08-16). [`../archive/REDIS_END_TO_END.md`](../archive/REDIS_END_TO_END.md) §2 |
 | Host `nc` hangs with no `+PONG` | Wrong port. 6379 is not forwarded; use guest 4444 |
 | `box run` prints `failed to spawn …docker-entrypoint.sh` | Kernel predates shebang support in `spawn`. Rebuild, or pass `--entrypoint` |
