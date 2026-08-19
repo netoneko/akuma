@@ -129,6 +129,42 @@ shallow and those frames took a spin or were dropped. `orphan` counts device
 completions whose token no slot claims, which should be impossible and means
 the token map has desynchronised from the used ring.
 
+## Latency: `net-waker-park` is off for the same kind of reason
+
+The other tempting lever. Blocking socket ops (`accept`/`recv`/`send`/`connect`)
+park in `blocking_relax` — yield + WFI — which leaves the thread READY, so
+nothing can target it and the socket's `wake_all()` walks an empty waker list.
+Every other blocking path in the kernel (pipes, fs, msgqueue, epoll) registers
+and parks properly. Fixing that outlier **measured worse**:
+
+| | default | `net-waker-park` |
+|---|---:|---:|
+| req/s | **1,071** | 944 |
+| p90 | **1,172 us** | 2,169 us |
+
+`blocking_relax` wakes on *any* interrupt, and under load the NIC raises ~6,300
+per 5 s window — so the imprecise wake is plentiful, while the directed one is
+lossy (`wake_all` drains the list, so a waiter must re-register every lap).
+Full reasoning: [`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md) §8.
+
+**Diagnostic that stays useful either way:** `KernelSocket::waker_count()` reads
+zero for any blocking socket waiter on the default build. If you are debugging a
+socket that never wakes, that zero is expected, not the bug.
+
+## Before blaming the NIC path: check whether the tail is bimodal
+
+Akuma's *minimum* HTTP round trip (378 us) is **faster than the Linux control**
+(519 us); the whole remaining gap is tail (p99 4,091 vs 882 us). A uniform
+slowdown and a wake cliff need opposite fixes, so measure the shape first:
+
+```bash
+scripts/benchmarks/bench_nic_rtt.py --mode http --target localhost:8080 -n 400
+```
+
+p99/p50 near 1.5 means a genuinely slow path. Near 6 — what Akuma shows — means
+most requests are fine and a minority are landing on the ~3 ms scheduler tick.
+Chase the missed wake, not the per-packet cost.
+
 ## Network debug knobs
 
 | Knob | Default | Effect |
