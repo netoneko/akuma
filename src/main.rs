@@ -1291,6 +1291,12 @@ fn run_async_main() -> ! {
             utc_seconds: timer::utc_seconds,
             yield_now: threading::yield_now,
             blocking_relax: threading::blocking_relax,
+            // The blocking-socket waiter's park. Unlike `blocking_relax` this
+            // marks the thread WAITING, which is what lets `wake_all()` on the
+            // socket target it directly instead of leaving it to notice on a
+            // timer — see `NetRuntime::park_until`.
+            park_until: threading::schedule_blocking,
+            current_waker: || threading::get_waker_for_thread(threading::current_thread_id()),
             current_box_id: || process::current_process_shared().map_or(0, |p| p.box_id),
             // Combined Ctrl-C + pthread_kill check, so a socket read blocked in
             // `wait_until` honours `tkill` the same way pipe/wait loops do.

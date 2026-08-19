@@ -34,6 +34,10 @@ net-profile = []
 #
 # Costs ~32 KB of BSS (8 + 8 slots of 2 KB).
 net-noalloc = []
+# Park blocking socket waiters with a registered waker (`schedule_blocking`)
+# instead of `blocking_relax`. OFF — it MEASURED WORSE. See the kernel feature
+# of the same name in the root Cargo.toml for the numbers and why.
+net-waker-park = []
 # Raise the per-listener backlog (socket.rs `MAX_BACKLOG`) and, on the
 # size-constrained profiles, the total socket budget (smoltcp_net.rs
 # `MAX_SOCKETS`), so a server can absorb more simultaneous *arrivals* than the

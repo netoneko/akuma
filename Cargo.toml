@@ -370,6 +370,36 @@ net-profile = ["akuma-net/net-profile"]
 # Measurements: docs/archive/AKUMA_NET_ISSUES.md §7.
 net-noalloc = ["akuma-net/net-noalloc"]
 
+# Park blocking socket waiters (`wait_until` in akuma-net) the way every other
+# blocking path in the kernel does: register a waker on the socket, then
+# `schedule_blocking(deadline)` — instead of `blocking_relax()` (yield + WFI).
+# NOT in `default`: it measured WORSE and is kept only as scaffolding for the
+# follow-up described below.
+#
+#              req/s   p50     p90      p99
+#   default     1071   658 us  1172 us  4091 us
+#   this         944   706 us  2169 us  5507 us
+#
+# The premise was that a `blocking_relax` waiter is unwakeable — it never enters
+# WAITING and registers nothing, so the socket's `wake_all()` walks an empty
+# list. That is true and still costs nothing to fix; it is just not what was
+# slow. `blocking_relax`'s WFI ends on ANY interrupt, and under load the NIC
+# raises ~6,300 per 5 s window — one every ~0.8 ms. So the old wake was
+# imprecise but plentiful, and the new one is precise but LOSSY: `wake_all`
+# drains the waker list, so the waiter must re-register every lap and any wake
+# arriving during its poll x64 is dropped onto the 3 ms backstop.
+#
+# The counters show the trade exactly: parks 3,918 -> 2,565 (registration works)
+# but us/park 1,172 -> 1,787 (more of them hit the backstop), total parked time
+# unchanged at ~4.59 s of a 5 s window, plus 3-4 us/call of added poll cost.
+#
+# To beat the default this needs a park that is BOTH targetable and woken by any
+# NIC interrupt — a scheduler change (a "light sleep" state), not a net change.
+# Until then the promiscuous wake wins on this workload.
+#
+# Measurements: docs/archive/AKUMA_NET_ISSUES.md §8.
+net-waker-park = ["akuma-net/net-waker-park"]
+
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device
 # (NIC1) and exposes it as /dev/net/tap0 (open/read/write whole frames + a

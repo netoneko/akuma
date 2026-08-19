@@ -276,6 +276,16 @@ impl KernelSocket {
         }
     }
 
+    /// How many wakers are registered on this socket right now.
+    ///
+    /// Diagnostic, and the boot suite's evidence that a blocking waiter actually
+    /// announced itself before parking: this read zero for `accept`/`recv` until
+    /// `wait_until` started registering (docs/archive/AKUMA_NET_ISSUES.md §8).
+    #[must_use]
+    pub fn waker_count(&self) -> usize {
+        self.wakers.lock().len()
+    }
+
     /// Wake all threads waiting for I/O on this socket.
     pub fn wake_all(&self) {
         let mut wakers = self.wakers.lock();
@@ -360,7 +370,23 @@ where F: FnOnce(&KernelSocket) -> R
     })
 }
 
+/// Boot-suite hook: run [`wait_until`]'s exact wait discipline against a
+/// caller-supplied predicate.
+///
+/// Exists because the properties that matter — a parked waiter registers itself
+/// so `wake_all` can reach it, and a waiter nothing ever wakes still returns on
+/// the backstop instead of hanging — are not reachable through the public socket
+/// API without a live TCP peer. Used by `src/process_tests.rs`.
 #[cfg(feature = "smoltcp")]
+#[doc(hidden)]
+pub fn wait_until_for_boot_test(
+    idx: usize,
+    condition: impl FnMut() -> bool,
+    timeout_us: Option<u64>,
+) -> Result<(), i32> {
+    wait_until(idx, condition, timeout_us)
+}
+
 pub fn socket_add_waker(idx: usize, waker: Waker) {
     with_table(|table| {
         if let Some(Some(sock)) = table.get(idx) {
@@ -490,13 +516,34 @@ pub fn socket_timeout(idx: usize, is_recv: bool) -> Option<u64> {
 // Socket Operations (Blocking with Yield)
 // ============================================================================
 
-/// Helper to poll and yield until a condition is met or timeout.
+/// Longest a parked socket waiter sleeps before re-checking on its own.
+///
+/// A BACKSTOP for the directed wake, not the mechanism. Deliberately the
+/// scheduler tick and not `poll.rs`'s 10 ms `BLOCKING_POLL_INTERVAL_US`: this
+/// path used to land on the tick via `blocking_relax`, so anchoring here means
+/// a wake that never arrives is no worse than the old behaviour, while a wake
+/// that does arrive is immediate.
+#[cfg(all(feature = "smoltcp", feature = "net-waker-park"))]
+const WAIT_PARK_BACKSTOP_US: u64 = 3_000;
+
+/// Block until `condition` holds, driving the network stack while we wait.
 ///
 /// Drains all pending network work before checking the condition, since the
 /// calling thread is about to block anyway. This ensures TCP ACKs, window
 /// updates, and retransmissions are processed promptly.
+///
+/// `idx` is the socket the caller is waiting on: before parking we register the
+/// current thread's waker there, so `smoltcp_net::poll()`'s `wake_all()` can
+/// wake us directly instead of leaving us to notice on a timer.
+///
+/// **Ordering is load-bearing.** Register, THEN re-check, THEN park. A wake that
+/// lands between a check and the park is lost if the waker is not in the list
+/// yet, and a lost wake here is a hang, not a delay — the same trap
+/// `pipe_check_set_reader` (`src/syscall/pipe.rs`) was written to close.
+/// `schedule_blocking` adds a second layer: it consults the sticky
+/// `WOKEN_STATES` flag and returns without parking if a wake already landed.
 #[cfg(feature = "smoltcp")]
-fn wait_until<F>(mut condition: F, timeout_us: Option<u64>) -> Result<(), i32>
+fn wait_until<F>(idx: usize, mut condition: F, timeout_us: Option<u64>) -> Result<(), i32>
 where F: FnMut() -> bool
 {
     let start = (runtime().uptime_us)();
@@ -531,12 +578,19 @@ where F: FnMut() -> bool
         if !any_progress {
             fruitless_progress_rounds = 0;
             let relax_t = crate::nicstat::start();
-            // Wait for more network progress. Under shared-kernel SMP this DROPS the
-            // Big Kernel Lock across the wait (a plain `yield_now` would spin holding
-            // it, freezing every peer core — the meow→LLM `connect`+recv wedge). The
-            // BKL is not held while we poll below either, so a peer's async-main poller
-            // can drive the RX that satisfies `condition`.
-            (runtime().blocking_relax)();
+            // Park properly instead of the old `blocking_relax()` (yield + WFI).
+            // That left this thread READY, so nothing could target it: `wake_all`
+            // walked an empty list and the only thing that ended the halt was an
+            // unrelated interrupt — measured as httpd's `accept` phase costing
+            // 80-88 % of a request (docs/archive/AKUMA_NET_ISSUES.md §8).
+            //
+            // Register first, re-check, then park — see this function's header
+            // for why that order is the correctness argument.
+            //
+            // Parking still drops the BKL (`schedule_blocking` switches away), so
+            // a peer core can drive the RX that satisfies `condition` — the
+            // property the old `blocking_relax` was chosen for is preserved.
+            wait_park(idx, &mut condition, start, timeout_us);
             crate::nicstat::record_relax(relax_t);
         } else {
             // poll() made progress but not the progress WE need. Under sustained
@@ -554,10 +608,60 @@ where F: FnMut() -> bool
             fruitless_progress_rounds = fruitless_progress_rounds.wrapping_add(1);
             if fruitless_progress_rounds >= 4 {
                 let relax_t = crate::nicstat::start();
-                (runtime().blocking_relax)();
+                wait_park(idx, &mut condition, start, timeout_us);
                 crate::nicstat::record_relax(relax_t);
             }
         }
+    }
+}
+
+/// Register, re-check, park. The tail of both [`wait_until`] wait arms.
+///
+/// Returns nothing: the caller loops and re-evaluates `condition` immediately,
+/// so the re-check here exists only to close the lost-wake window, not to report
+/// a result.
+#[cfg(feature = "smoltcp")]
+fn wait_park<F>(idx: usize, condition: &mut F, start: u64, timeout_us: Option<u64>)
+where F: FnMut() -> bool
+{
+    #[cfg(feature = "net-waker-park")]
+    {
+        // 1. Announce ourselves BEFORE the final check.
+        socket_add_waker(idx, (runtime().current_waker)());
+
+        // 2. Re-check. A state change that landed during the poll loop above is
+        //    caught here; anything later is caught by the waker we just
+        //    registered.
+        if (*condition)() {
+            return;
+        }
+
+        // 3. Park. The deadline is the backstop; the waker is the mechanism.
+        let now = (runtime().uptime_us)();
+        let backstop = now.saturating_add(WAIT_PARK_BACKSTOP_US);
+        let deadline = match timeout_us {
+            // Never sleep past the caller's own timeout, or a `SO_RCVTIMEO`
+            // would fire a whole backstop late.
+            Some(t) => backstop.min(start.saturating_add(t)),
+            None => backstop,
+        };
+        (runtime().park_until)(deadline);
+    }
+    #[cfg(not(feature = "net-waker-park"))]
+    {
+        let _ = (idx, start, timeout_us);
+        let _ = &mut *condition;
+        // Yield, then halt until ANY interrupt. Imprecise — nothing can target
+        // this thread, because it never enters WAITING — but under load the NIC
+        // raises ~6,300 interrupts per 5 s window, so the wake is plentiful. It
+        // measured FASTER than the targeted park; see the `net-waker-park`
+        // feature notes in the root Cargo.toml.
+        //
+        // Under shared-kernel SMP this DROPS the Big Kernel Lock across the wait
+        // (a plain `yield_now` would spin holding it, freezing every peer core —
+        // the meow->LLM `connect`+recv wedge), so a peer's async-main poller can
+        // drive the RX that satisfies `condition`.
+        (runtime().blocking_relax)();
     }
 }
 
@@ -743,7 +847,7 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
             return Err(libc_errno::EAGAIN);
         }
     } else {
-        wait_until(|| has_pending_connection(idx), None)?;
+        wait_until(idx, || has_pending_connection(idx), None)?;
     }
 
     let (handle, addr) = with_table(|table| {
@@ -851,7 +955,7 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
         ConnectStep::InProgress if nonblock => return Err(libc_errno::EALREADY),
         // Blocking redial: wait for the in-flight connect to finish rather than
         // re-issuing the SYN.
-        ConnectStep::InProgress => return finish_connect_wait(h),
+        ConnectStep::InProgress => return finish_connect_wait(idx, h),
         ConnectStep::Dial => {}
     }
 
@@ -882,7 +986,7 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
         return Err(libc_errno::EINPROGRESS);
     }
 
-    finish_connect_wait(h)
+    finish_connect_wait(idx, h)
 }
 
 /// Block until a TCP socket that is already in `SynSent` either establishes or
@@ -891,8 +995,8 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
 /// Split out of [`socket_connect`] so a blocking *redial* takes the same path as
 /// the first call.
 #[cfg(feature = "smoltcp")]
-fn finish_connect_wait(h: SocketHandle) -> Result<(), i32> {
-    let waited = wait_until(|| {
+fn finish_connect_wait(idx: usize, h: SocketHandle) -> Result<(), i32> {
+    let waited = wait_until(idx, || {
         with_network(|net| {
             let socket = net.sockets.get::<tcp::Socket>(h);
             matches!(socket.state(), tcp::State::Established | tcp::State::Closed | tcp::State::Closing | tcp::State::TimeWait)
@@ -920,7 +1024,7 @@ pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32>
         // 5 s cap. A blocking write that cannot make room in the transmit
         // buffer must block, not invent an `ETIMEDOUT` the caller never asked
         // for — see `KernelSocket::sndtimeo_us`.
-        wait_until(|| with_network(|net| net.sockets.get::<tcp::Socket>(handle).can_send()).unwrap_or(true), sndtimeo)?;
+        wait_until(idx, || with_network(|net| net.sockets.get::<tcp::Socket>(handle).can_send()).unwrap_or(true), sndtimeo)?;
     }
 
     let res = with_network(|net| {
@@ -966,7 +1070,7 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
         }).unwrap_or(true);
         if !ready { return Err(libc_errno::EAGAIN); }
     } else {
-        wait_until(|| with_network(|net| {
+        wait_until(idx, || with_network(|net| {
             let socket = net.sockets.get::<tcp::Socket>(handle);
             tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state())
         // `rcvtimeo` (None = forever) replaces what used to be an unconditional
@@ -1059,7 +1163,7 @@ pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(us
             return Err(libc_errno::EAGAIN);
         }
     } else {
-        wait_until(|| {
+        wait_until(idx, || {
             smoltcp_net::poll();
             smoltcp_net::udp_can_recv(handle)
         }, Some(10_000_000))?;

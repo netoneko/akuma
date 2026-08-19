@@ -29,6 +29,9 @@ pub fn run_network_tests() {
     test_rump_tap();
 
     test_epoll_socket_waker();
+    #[cfg(feature = "net-waker-park")]
+    test_socket_wait_registers_waker();
+    test_socket_wait_backstop_no_hang();
     test_epoll_poll_socket_readiness_no_deadlock();
     test_epoll_check_fd_readiness_unknown_fd();
     test_epoll_edge_rearm_symmetry();
@@ -10744,6 +10747,109 @@ fn test_two_child_sequential_exit() {
 }
 
 /// Test that epoll_pwait is woken immediately by a socket event.
+/// A blocking socket waiter must REGISTER itself before parking.
+///
+/// This is the defect the wake work fixed: `wait_until` used to park in
+/// `blocking_relax` (yield + WFI), which leaves the thread READY and anonymous —
+/// so `smoltcp_net::poll()`'s `wake_all()` walked an empty list and the waiter
+/// could only resume on an unrelated interrupt. Measured cost: httpd's `accept`
+/// was 80-88 % of every request (docs/archive/AKUMA_NET_ISSUES.md §8).
+///
+/// The observable proof is `waker_count()` being non-zero *while the waiter is
+/// parked*. A peer thread watches for that, then satisfies the condition. Before
+/// the fix `observed` stays false and this test fails; a latency assertion would
+/// not have caught it, because the 3 ms backstop returns at roughly the same
+/// time either way.
+#[cfg(feature = "net-waker-park")]
+fn test_socket_wait_registers_waker() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static COND: AtomicBool = AtomicBool::new(false);
+    static OBSERVED_WAKER: AtomicBool = AtomicBool::new(false);
+    static PEER_DONE: AtomicBool = AtomicBool::new(false);
+    COND.store(false, Ordering::SeqCst);
+    OBSERVED_WAKER.store(false, Ordering::SeqCst);
+    PEER_DONE.store(false, Ordering::SeqCst);
+
+    let Some(idx) = akuma_net::socket::alloc_socket(1) else {
+        console::print("[Test] test_socket_wait_registers_waker SKIPPED: no socket slot\n");
+        return;
+    };
+
+    if akuma_exec::threading::spawn_user_thread_fn(move || {
+        // Watch for the waiter announcing itself, bounded so a regression fails
+        // the assertion instead of hanging the boot suite.
+        let start = crate::timer::uptime_us();
+        while crate::timer::uptime_us() - start < 500_000 {
+            let n = akuma_net::socket::with_socket(idx, akuma_net::socket::KernelSocket::waker_count).unwrap_or(0);
+            if n > 0 {
+                OBSERVED_WAKER.store(true, Ordering::SeqCst);
+                break;
+            }
+            akuma_exec::threading::yield_now();
+        }
+        COND.store(true, Ordering::SeqCst);
+        akuma_net::socket::with_socket(idx, akuma_net::socket::KernelSocket::wake_all);
+        PEER_DONE.store(true, Ordering::SeqCst);
+        let tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::threading::mark_thread_terminated(tid);
+        loop { akuma_exec::threading::yield_now(); }
+    }).is_err() {
+        akuma_net::socket::remove_socket(idx);
+        console::print("[Test] test_socket_wait_registers_waker SKIPPED: spawn failed\n");
+        return;
+    }
+
+    let res = akuma_net::socket::wait_until_for_boot_test(
+        idx,
+        || COND.load(Ordering::SeqCst),
+        Some(2_000_000),
+    );
+
+    // Let the peer finish so it cannot touch the socket after we free it.
+    let drain = crate::timer::uptime_us();
+    while !PEER_DONE.load(Ordering::SeqCst) && crate::timer::uptime_us() - drain < 500_000 {
+        akuma_exec::threading::yield_now();
+    }
+    akuma_net::socket::remove_socket(idx);
+
+    if res.is_err() {
+        console::print("[Test] test_socket_wait_registers_waker FAILED: wait returned error\n");
+    } else if OBSERVED_WAKER.load(Ordering::SeqCst) {
+        console::print("[Test] test_socket_wait_registers_waker PASSED\n");
+    } else {
+        console::print("[Test] test_socket_wait_registers_waker FAILED: waiter parked without registering a waker\n");
+    }
+}
+
+/// A waiter that is NEVER woken must still return on its timeout.
+///
+/// The safety property of the register/park change: parking a socket waiter
+/// means it no longer drives `poll()` itself, so if the wake path ever fails the
+/// failure mode must be latency, not a hang. `WAIT_PARK_BACKSTOP_US` is what
+/// guarantees that, and this is the test that would catch its removal.
+fn test_socket_wait_backstop_no_hang() {
+    let Some(idx) = akuma_net::socket::alloc_socket(1) else {
+        console::print("[Test] test_socket_wait_backstop_no_hang SKIPPED: no socket slot\n");
+        return;
+    };
+
+    let start = crate::timer::uptime_us();
+    let res = akuma_net::socket::wait_until_for_boot_test(idx, || false, Some(50_000));
+    let elapsed = crate::timer::uptime_us() - start;
+    akuma_net::socket::remove_socket(idx);
+
+    // Generous ceiling: this asserts "returned at all, roughly on time", not a
+    // latency budget. A lost wake under the old code would sit here forever.
+    if res.is_err() && elapsed < 1_000_000 {
+        crate::safe_print!(128,
+            "[Test] test_socket_wait_backstop_no_hang PASSED ({}us)\n", elapsed);
+    } else {
+        crate::safe_print!(128,
+            "[Test] test_socket_wait_backstop_no_hang FAILED: err={} elapsed={}us\n",
+            res.is_err(), elapsed);
+    }
+}
+
 fn test_epoll_socket_waker() {
     use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
     // The `epoll_event` buffers below are kernel STACK addresses, which are

@@ -1,8 +1,10 @@
 # Akuma networking: why a round trip costs milliseconds (2026-08-19)
 
-**Status: measured, root-caused, three fixes landed and A/B-verified; a fourth
-(static RX/TX rings, §7) is written and measured but left OFF because it
-regresses the tail.** This is the investigation
+**Status: measured, root-caused, three fixes landed and A/B-verified. Two
+further attempts — static RX/TX rings (§7) and waker-based parking (§8) — are
+written, measured, and left OFF because both regress the tail; §8 also corrects
+an attribution error in §7.4 that should be read before building on this
+document.** This is the investigation
 record for the NIC-path audit. The procedures it produced live in
 [`../runbooks/debug-network.md`](../runbooks/debug-network.md); the numbers and
 the reasoning live here.
@@ -257,6 +259,7 @@ landing on the 3 ms tick rather than on a packet. Two candidates, untested:
 | **virtio-net RX interrupt** | `src/gic_v3.rs`, `src/gic.rs`, `src/main.rs`, `crates/akuma-net/src/smoltcp_net.rs` | §6.1 / §6.2 below. Default-on |
 | **Pressure-driven socket reclaim** | `crates/akuma-net/src/smoltcp_net.rs` | §3.4. Default-on |
 | Static RX/TX rings + async TX | `crates/akuma-net/src/virtio_rings.rs`, `smoltcp_net.rs` | §7. **OFF** (`net-noalloc`): halves the lock hold, loses 2.9x on p90 |
+| Waker-based socket parking | `crates/akuma-net/src/socket.rs`, `runtime.rs`, `src/main.rs` | §8. **OFF** (`net-waker-park`): directed wake, but lossy — 1,071 → 944 req/s |
 | NIC counters + `[NICSTAT]` dump | `crates/akuma-net/src/nicstat.rs`, `src/nic_profile.rs` | measurement only; off by default |
 | Round-trip benchmark + Linux control | `scripts/benchmarks/bench_nic_rtt.py`, `serial_httpd_ref.py` | measurement only |
 | httpd phase timing | `userspace/httpd/src/stats.rs` | measurement only, `HTTPD_STATS=1` |
@@ -379,7 +382,7 @@ the control. Medians:
 Forcing the transmit notify (§7.5) recovers part of this — 938 req/s, p90
 2,930 us, p99 5,384 us — and is kept, but does not close the gap.
 
-### 7.4 Where it went: `accept`, not compute
+### 7.4 Where it went: `accept` — but see the correction below
 
 `HTTPD_STATS=1`, in-load blocks only (the ~11 ms blocks in the log are the idle
 gaps between benchmark runs landing in `accept`, not measurements):
@@ -393,11 +396,22 @@ gaps between benchmark runs landing in `accept`, not measurements):
 | **`accept`** | 546-741 us (66-77 %) | **882-1,262 us (81-88 %)** |
 | wall/req | ~925 us | ~1,259 us |
 
-Every syscall got cheaper — `read` by 6x, which is precisely the reduced lock
-hold from 7.2 showing up where predicted. But `accept`, the kernel wait for the
-next connection, got longer, and it is 80-90 % of the request. **The change
-bought CPU and spent wake latency.** `other` is still 0 us, so server compute
-remains irrelevant, as in §2.
+Every syscall got cheaper — `read` by 6x, precisely the reduced lock hold from
+7.2 showing up where predicted. `other` is still 0 us, so server compute remains
+irrelevant, as in §2.
+
+> **Correction (2026-08-20).** The `accept` row was originally read as "the
+> kernel wake is starved", and §8 was built on that. **It does not support that
+> conclusion.** `bench_nic_rtt.py` is serial — one connection at a time — so
+> httpd's `accept` phase spans from finishing request N to connection N+1
+> *arriving*, which includes the client's entire turnaround. Note that `accept`
+> (546-741 us) sits on top of the client-measured p50 RTT (658 us), because it
+> largely IS that RTT. `accept` growing means the whole round trip grew; it is
+> not independent evidence about where inside the round trip the time went.
+>
+> A harness with concurrent connections in flight would separate the two. Until
+> then, treat `accept` as a restatement of end-to-end latency, not a decomposition
+> of it.
 
 ### 7.5 The notify hypothesis — tested, real, and not enough
 
@@ -490,14 +504,144 @@ Audited because "noalloc" was the premise:
 - Socket rx/tx buffers, the DNS socket and UDP packet metadata allocate at
   socket creation, not per packet.
 
-## 8. Not done
+## 8. The waker-park experiment — tested, WORSE, kept off
 
-1. **The p90/p99 tail** (§4) — the two candidates named there. This is now the
-   whole remaining gap to Linux.
-2. **Fix the ring's wake latency, then turn `net-noalloc` on** (§7) — the
-   rings are written, correct and measured; they halve the lock hold and lose
-   on p90. §7.5 names the one hypothesis to test first.
-3. **`userspace/httpd` does not run on Linux** — `hello` (the minimal libakuma
+Kernel feature `net-waker-park` (→ `akuma-net/net-waker-park`). **Not in
+`default`.** Second negative result of the session, and the more instructive one.
+
+### 8.1 The premise, and why it looked airtight
+
+`wait_until` (`crates/akuma-net/src/socket.rs`) is the blocking path for
+`accept`/`recv`/`send`/`connect`. It parked in `blocking_relax()` — `yield_now`
++ WFI — which leaves the thread **READY**, never WAITING. A READY thread cannot
+be targeted: `ThreadWaker::wake` CASes WAITING→READY and IPIs the thread's last
+core, and both are no-ops against a thread that never parked properly.
+
+So `smoltcp_net::poll()`'s `wake_all()` — which fires on every
+`SocketStateChanged` — walked an **empty waker list** for every blocking socket
+op. The only registrant of `socket_add_waker` was `poll.rs:478`, the epoll path.
+
+Every other blocking path in the kernel already parks properly:
+
+| subsystem | blocks with | woken by |
+|---|---|---|
+| pipe | `pipe_check_set_reader` registers a `WakeHandle` → `schedule_blocking` | `wake_by_handle` on write |
+| fs / stdin, msgqueue | `schedule_blocking(deadline)` | targeted wake |
+| epoll / ppoll | `socket_add_waker` → `schedule_blocking(deadline)` | `wake_all()` |
+| **blocking socket ops** | **poll x64 → `blocking_relax()`** | **nothing — it re-polls** |
+
+Sockets were the only outlier. Fixing an outlier that is also the slow path is
+about as good as a hypothesis gets.
+
+### 8.2 What was built
+
+`wait_until` gained the socket index and the pipe discipline — **register, then
+re-check, then park**:
+
+```
+socket_add_waker(idx, current_waker());   // announce BEFORE the last check
+if condition() { return }                 // catch a wake that already landed
+park_until(min(caller_timeout, now + 3ms))
+```
+
+Two `NetRuntime` seam entries (`park_until`, `current_waker`) because akuma-net
+does **not** depend on akuma-exec — the `runtime.rs` comment claiming it does is
+stale, left over from when `PreemptGuard` lived there. The 3 ms backstop is the
+scheduler tick deliberately, not `poll.rs`'s 10 ms `BLOCKING_POLL_INTERVAL_US`,
+so a missed wake is never worse than the behaviour it replaced.
+
+### 8.3 Result: worse
+
+Five runs x 400 requests per arm, same httpd binary, medians:
+
+| | default (`blocking_relax`) | `net-waker-park` |
+|---|---:|---:|
+| req/s | **1,071** | 944 |
+| p50 | **658 us** | 706 us |
+| p90 | **1,172 us** | 2,169 us |
+| p99 | **4,091 us** | 5,507 us |
+
+### 8.4 Why — an imprecise-but-plentiful wake beat a precise-but-lossy one
+
+The premise was true and irrelevant. `blocking_relax`'s WFI ends on **any**
+interrupt, and under load the NIC raises ~6,300 per 5 s window — one every
+~0.8 ms. The old wake was not missing; it was promiscuous and frequent.
+
+The replacement is precise and **lossy**: `wake_all()` *drains* the waker list,
+so a waiter must re-register on every lap, and any wake arriving during its
+poll x64 window finds nothing registered and drops through to the 3 ms backstop.
+
+The counters show the trade exactly:
+
+| | default | `net-waker-park` |
+|---|---:|---:|
+| `relax` parks | 3,918 | **2,565** |
+| us per park | 1,172 | **1,787** |
+| total parked / 5 s window | 4,592 ms | 4,583 ms |
+| `poll` per call | 10.7 us | 13.7-15.1 us |
+| httpd `accept` | 546-741 us | 626-918 us |
+
+Registration *works* — a third of the parks were replaced by directed wakes.
+But the parks that remain are longer, because they are the ones that lost the
+race and hit the backstop. Total parked time is unchanged, and the per-lap
+registration cost is new.
+
+**To beat the default this needs a park that is both targetable and woken by any
+NIC interrupt** — a scheduler change (a "light sleep" state), not a network one.
+A non-draining waker list would also narrow the race, at the cost of stale
+registrations. Neither is attempted here.
+
+### 8.5 What survives regardless
+
+- `KernelSocket::waker_count()` — a diagnostic that reads zero for any blocking
+  socket waiter on the default build. That is the outlier of 8.1, still true.
+- `test_socket_wait_backstop_no_hang` — a waiter nothing ever wakes must return
+  on its timeout, not hang. Guards the property that made the change safe to try.
+- `test_socket_wait_registers_waker` (feature-gated) — proves registration
+  happens while parked. It fails on the old code, and a latency assertion would
+  not have caught it, because the backstop returns at about the same time either
+  way.
+
+## 9. Not done
+
+1. **The doorbell re-arm race — the leading untested candidate.** The gap to
+   Linux is entirely tail, and the tail is *bimodal*, not uniform: Akuma's
+   minimum (378 us) is **141 us FASTER than Linux** (519 us), while p99 is 4.6x
+   worse (4,091 vs 882 us). p99/p50 is 6.2x here and 1.5x on Linux. Most requests
+   take the fast route; a minority fall off a cliff — and the cliff is
+   tick-shaped (`relax` ~1,172 us/park, `tx_flight` max ~3,700 us, p99 ~4,000 us,
+   against a 3 ms tick).
+
+   The mechanism that would produce exactly that: `src/main.rs` re-arms the
+   doorbell **after** the drain —
+
+   ```rust
+   while poll() { ... }                     // drain
+   NIC_WAKE_PENDING.store(false, Relaxed);  // re-arm — AFTER
+   ```
+
+   — while the handler broadcasts only on a clear doorbell
+   (`if !NIC_WAKE_PENDING.swap(true) { broadcast_sgi() }`). A packet arriving
+   after `poll()` last returned false but before the `store(false)` is missed by
+   the drain, finds the doorbell already set so raises no broadcast, and is then
+   erased by the re-arm. Every core reaches `wfi` and sleeps to the tick: one
+   swallowed wake, one 3 ms request.
+
+   Fix is ordering — re-arm *before* the drain, so a packet landing during it
+   finds the doorbell clear and leaves an SGI pending that makes the trailing
+   `wfi` return at once. Costs extra SGIs, still bounded by the coalescer.
+   **Untested.** Flagged as candidate 1 in the original §4 and still never tried.
+2. **Turn `net-noalloc` on once the tail is fixed** (§7) — the rings are
+   written, correct, and halve the lock hold; they lose on p90 today. Their
+   suspected loss mechanism (the per-packet `receive_begin` notify was doubling
+   as a wake source) is the same wake problem as item 1, so item 1 may resolve
+   both. Also still unmeasured against a pipelined workload (redis), which is
+   the shape they should suit.
+3. **A concurrent-connection harness.** `bench_nic_rtt.py` is serial, which is
+   what confounded the `accept` reading (§7.4 correction). Without connections
+   in flight, server-side phase timing cannot be separated from client
+   turnaround.
+4. **`userspace/httpd` does not run on Linux** — `hello` (the minimal libakuma
    binary) SIGSEGVs too, so the blocker is in libakuma's startup, not httpd.
    Worth fixing: it would give the same-binary A/B that
    `scripts/probes/` provides for `std` binaries. Syscall numbers are already

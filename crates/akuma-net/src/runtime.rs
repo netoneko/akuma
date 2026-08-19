@@ -26,6 +26,25 @@ pub struct NetRuntime {
     /// Off `smp-shared` the kernel wires it to a plain `yield_now`. Holding the BKL
     /// across the wait freezes every peer core (see docs/runbooks/debug-smp.md).
     pub blocking_relax: fn(),
+    /// Park the current thread until `wake_time_us`, or until something calls
+    /// its waker — the kernel wires this to `threading::schedule_blocking`.
+    ///
+    /// The difference from [`blocking_relax`](Self::blocking_relax) is the whole
+    /// point: `blocking_relax` leaves the thread READY and merely halts the core,
+    /// so nothing can target it and it re-polls when *any* interrupt lands.
+    /// `park_until` marks it WAITING, which is what makes a directed wake
+    /// possible (`ThreadWaker::wake` CASes WAITING -> READY and IPIs the
+    /// thread's last core). Every other blocking path in the kernel — pipes,
+    /// fs, msgqueue, epoll — already parks this way; sockets were the outlier.
+    ///
+    /// The deadline is a BACKSTOP, not the mechanism. A wake that is somehow
+    /// missed must cost latency, never a hang.
+    pub park_until: fn(u64),
+    /// A `Waker` for the current thread, for a waiter registering itself on a
+    /// socket before it parks. Wired to `threading::get_waker_for_thread`, whose
+    /// handle is generation-tagged so a stale registration cannot wake whatever
+    /// later occupies the same thread slot.
+    pub current_waker: fn() -> core::task::Waker,
     pub current_box_id: fn() -> u64,
     pub is_current_interrupted: fn() -> bool,
     pub rng_fill: fn(&mut [u8]),
