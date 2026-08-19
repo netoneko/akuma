@@ -1,14 +1,30 @@
-# Benchmark performance, attempt 0 — Redis on Akuma vs Docker/Linux (2026-08-19)
+# Benchmark performance, attempt 0 — Akuma vs Docker/Linux (2026-08-19)
 
-**Status: complete for Redis.** Four arms, all measured on one machine in one
-session with the machine otherwise idle. The llama.cpp section at the end is a
-plan, not results.
+**Status: two workloads measured, at two core counts.** Redis (§1–§7, §9) and
+llama.cpp (§8), on one machine in one session, shape-matched, with the machine's
+other load audited.
 
-The short version: **Akuma's throughput ceiling is a fixed number of network
-round trips per second, and nothing else.** It does not move when the command
-changes, it does not move when the payload changes, and on the in-guest path it
-does not move when sixteen times more data is packed into each round trip. Every
-other number in this document is downstream of that one fact.
+Two workloads were used because they load opposite halves of the system, and
+together they say something neither says alone:
+
+> **Akuma's compute is within a couple of percent of Linux. Its
+> kernel-crossing and its cross-core paths are nowhere near.**
+
+- **llama.cpp at `-t 1`** — the kernel is out of the hot loop — runs at
+  **98.5 %** of Linux on compute-bound prefill, same binary and same weights.
+  The ELF loader, page tables, `mmap`, allocator and arithmetic cost nothing
+  measurable. Bandwidth-bound decode is further back at **86.6 %**, which is a
+  separate and much smaller lead (§8, Result 1).
+- **Redis** — where every operation is a kernel crossing and nothing else —
+  runs at **35 %** of Linux forwarded, **1 %** in-guest, and its throughput is
+  pinned to a fixed number of round trips per second that does not move with
+  command, payload, or concurrency.
+- **llama.cpp at `-t 2`** — the moment a second core touches shared memory —
+  is **22× slower than `-t 1`**, and it is *not* the wakeup path (proven in
+  §8, Result 3).
+
+So there are two distinct costs here, not one: a per-crossing cost (§4) and a
+cross-core cost (§8). Neither is a compute cost.
 
 ---
 
@@ -355,28 +371,33 @@ highest-value thing on this list.
 
 ## 7. Method (reproduce exactly)
 
-`scripts/benchmarks/bench_redis.py` drives every arm, takes the median of N
-repeats, records the spread, and has a `--compare` mode that gates each row
-against the measured noise floor.
+Three harnesses, all in `scripts/benchmarks/`:
+
+| script | what it does |
+|---|---|
+| `redis_matrix.sh` | the whole four-arm Redis matrix, serialized, with preflight checks |
+| `bench_redis.py` | one arm; medians, spread, and a `--compare` mode that gates each row against the measured noise floor |
+| `bench_llama.py` | both llama.cpp arms; hash + package verification, detached execution, stale-run guard |
 
 ```bash
-docker run -d --name akuma-redis-bench --cpuset-cpus=0-3 -m 4g -p 6379:6379 redis:alpine
+# Redis — the whole matrix. CORES picks the shape on BOTH sides.
+scripts/benchmarks/redis_matrix.sh                    # SMP=4 vs --cpuset-cpus=0-3
+CORES=1 scripts/benchmarks/redis_matrix.sh            # SMP=1 vs --cpuset-cpus=0
 
-COMMON="--requests 100000 --clients 20 --size 64 --pipelines 1,16 --repeats 3 --per-test"
-
-scripts/benchmarks/bench_redis.py --label akuma-fwd  --port 4444 $COMMON --cooldown 15 \
-    --out logs/redis_bench/akuma_fwd.json
-scripts/benchmarks/bench_redis.py --label akuma-box  --via box:2222:redisbox --port 4444 $COMMON \
-    --cooldown 15 --bench-bin /usr/local/bin/redis-benchmark --cli-bin /usr/local/bin/redis-cli \
-    --out logs/redis_bench/akuma_box.json
-scripts/benchmarks/bench_redis.py --label docker-fwd --port 6379 $COMMON --cooldown 3 \
-    --out logs/redis_bench/docker_fwd.json
-scripts/benchmarks/bench_redis.py --label docker-local --via docker:akuma-redis-bench --port 6379 \
-    $COMMON --cooldown 3 --out logs/redis_bench/docker_local.json
-
-scripts/benchmarks/bench_redis.py --compare logs/redis_bench/docker_fwd.json \
-                                            logs/redis_bench/akuma_fwd.json
+# llama.cpp — push the weights once, then one arm at a time.
+scripts/benchmarks/bench_llama.py --push
+scripts/benchmarks/bench_llama.py --arm akuma  --out logs/llama_bench/akuma.csv
+scripts/benchmarks/bench_llama.py --arm docker --out logs/llama_bench/docker.csv
+scripts/benchmarks/bench_llama.py --compare logs/llama_bench/docker.csv \
+                                            logs/llama_bench/akuma.csv
 ```
+
+`redis_matrix.sh` aborts unless `nproc` inside the guest *and* inside the
+container both match `CORES`, and prints the host's top CPU consumers before
+starting. `bench_llama.py` refuses to launch while any `llama-bench` is present
+in the guest, verifies the model's sha256 on both sides, and refuses to run if
+the two `apk info -v llama.cpp` versions differ. Every one of those guards
+exists because its absence cost a set of numbers in this session (§10).
 
 **Run the arms one at a time.** Two arms at once measure each other.
 
@@ -399,103 +420,264 @@ against an Akuma arm at `-c 20` per-test is not a comparison.
 
 ---
 
-## 8. Next workload: llama.cpp with `qwen3.5-0.8b-q4.gguf`
+## 8. Second workload: llama.cpp with `qwen3.5-0.8b-q4.gguf`
 
-Planned, not run. Written down now because llama.cpp is a **much cleaner kernel
-comparison than Redis**, and the reason is worth stating before the numbers
-exist.
+**Measured 2026-08-19.** This one was chosen because Redis measures the
+kernel-crossing path and almost nothing else — §4 through §6 are entirely about
+which network path is under the microscope, and §5 concludes that no cell in
+that matrix isolates server work on Akuma at all. llama.cpp is the opposite
+workload: once the weights are loaded it is NEON arithmetic in userspace with
+the kernel out of the hot loop. Together the two bracket the same question from
+both ends.
 
-### Why this one is the better experiment
+### The setup, and why it is a fair comparison
 
-Redis on this pair of stacks is dominated by transport — §4 through §6 above are
-entirely about which network path is being measured, and §5 concludes that no
-cell in the matrix isolates server work on Akuma at all. llama.cpp has almost no
-syscall traffic once the weights are loaded: it is NEON arithmetic over a 532 MB
-working set, on the same silicon, from the same file. Whatever gap remains is
-attributable to a short list of kernel behaviours rather than to a forwarder.
+Alpine ships `llama.cpp` and the Akuma guest is Alpine, so `apk add llama.cpp`
+gives **the same distro package, same version, same architecture, built by the
+same builders** on both sides — `llama.cpp-0.0.9564-r0`, build
+`3b3da01dc21dc68e958efb898ab739c65ed08ca2`, loading the same
+`libggml-cpu-armv8.2_2.so` and reporting the same `OpenBLAS, CPU` backend. The
+weights are byte-identical: sha256 `bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517`
+verified on the host, in the guest and in the container. Shape matched as in §1
+(`SMP=4 MEMORY=4096` vs `--cpuset-cpus=0-3 -m 4g`).
 
-### Which llama.cpp build
+That is a stronger control than the Redis comparison could offer, where the best
+available was "the same image, unpacked two ways".
 
-**Use Alpine's `apk add llama.cpp`, not the in-tree cross-build.**
-`userspace/llama.cpp/README.md` is written around SmolLM2-135M in a 256 MB VM
-and its guidance (`-c 256`, the memory table, `--no-mmap` as an absolute) is
-stale; `bootstrap/bin/llama-cli` was last built 2026-08-12. Taking the package
-also buys a control the comparison would not otherwise have:
+`pp512` is **prompt processing** (prefill): 512 tokens ingested as one batched
+matmul — compute-bound and parallel. `tg128`/`tg16` is **token generation**
+(decode): tokens produced one at a time, each streaming the whole weight set —
+memory-bandwidth-bound and sequential, with far more thread barriers per unit of
+work. They behave completely differently here, so both are reported.
 
-> The Akuma guest is Alpine and `redis:alpine` is Alpine. `apk add llama.cpp` on
-> both sides yields the **same distro package, same version, same arch, built by
-> the same builders** — differing only in which kernel executes it.
+### Result 1 — single-threaded, Akuma is close to Linux but not at parity
 
-Record `apk info -v llama.cpp` on both sides and refuse to compare if the
-versions differ.
+Both columns measured with the other side's VM/container stopped, so neither is
+competing with the other.
 
-**Prerequisite to clear first:** `apk` on this devbox image fails its database
-write — `ERROR: System state may be inconsistent: failed to write database: Is a
-directory` — even though the package files do get installed (verified with
-`apk add tar`, 2026-08-19). Decide whether that is good enough to trust an
-`apk add llama.cpp`, or whether it needs fixing first. It shares a smell with
-Issue 18's `box pull` failure, which also dies at a file write.
+| test | Akuma | Docker/Linux | Akuma % |
+|---|---:|---:|---:|
+| pp512 `-t 1` (prefill, compute-bound) | 102.40 ±0.85 | 103.91 ±0.08 | **98.5 %** |
+| tg128 `-t 1` (decode, bandwidth-bound) | 35.18 ±0.53 | 40.61 ±0.05 | **86.6 %** |
 
-If the package does not exist for `aarch64`, fall back to the in-tree build —
-`bootstrap/bin/llama-cli` and `bootstrap/bin/llama-bench` are statically-linked
-musl aarch64 binaries, so the *identical file* runs on Akuma and in an `aarch64`
-Linux container, which is the strongest control available. Either way, do not
-compare an Alpine package against the in-tree build.
+Same binary, same weights, same silicon. Prefill is within 1.5 % — effectively
+identical, and that was the intended control: the plan said "`-t 1` *should* be
+identical; if it is not, something is wrong with the measurement". It passed for
+the compute-bound half.
 
-### What actually differs, and is therefore what gets measured
+**Decode is 13 % short, and that gap is real.** It is the memory-bandwidth-bound
+half — each token streams the entire 532 MB weight set through the cores — so a
+deficit there points at the cost of *reaching* memory rather than the cost of
+arithmetic: page size and TLB coverage for the mmap'd weights are the obvious
+suspects (Linux will back a mapping this size with huge pages where it can).
+Untested. It is the cheapest remaining lead in this document, because it shows
+up with one thread and therefore has nothing to do with §8's cross-core problem.
 
-| | Linux | Akuma | What it costs |
-|---|---|---|---|
-| Loading the weights | `mmap`, demand-paged | possibly `--no-mmap` → 532 MB through `read()` on ext2 | **model load time** — expected to be the largest single gap |
-| Weight pages during inference | page cache, shared, resident | private anonymous heap | resident set, and whether it fits |
-| `-t N` worker threads | CFS on 4 pinned cores | Akuma scheduler, shared 32-thread kernel pool | **pp throughput** scaling from `-t 1` to `-t 4` |
-| Token generation | memory-bandwidth bound | same, through Akuma's page tables | **tg throughput** — TLB/mapping quality |
+> **This correction matters.** An earlier version of this table reported
+> **101.3 % / 101.6 %** and called it parity. Those Docker figures
+> (101.12 / 34.62) were taken while an orphaned `llama-bench` was still running
+> inside QEMU (§10) and were depressed by up to 17 % — the decode cell most of
+> all. The clean re-run moved Docker *up*, not Akuma down. The lesson is that a
+> contaminated baseline flatters the system under test, which is the direction
+> that does not announce itself.
 
-So the three numbers to collect are **load time**, **pp (prompt processing)
-tok/s** and **tg (token generation) tok/s** — not one "speed" figure.
+Still substantive: the ELF loader, page tables, `mmap`, the allocator and the
+arithmetic path are all correct, and on compute they cost nothing measurable.
+Whatever is expensive about Akuma is not arithmetic.
 
-### Protocol
+**`--no-mmap` is no longer required.** `userspace/llama.cpp/README.md` states it
+as an absolute ("Akuma's VFS doesn't support file-backed mmap"). Every run here
+is `use_mmap=1` and completed normally, so `src/file_page_cache.rs` closed that
+gap. The README is stale.
 
-1. **Verify `--no-mmap` is still mandatory.** The README says Akuma's VFS has no
-   file-backed `mmap`, but `src/file_page_cache.rs` landed since. If plain
-   `mmap` loading now works, that is a result on its own. Run the Linux arm
-   **with `--no-mmap` too** so the arms match, then add a third Linux arm *with*
-   mmap purely to price what Akuma is missing.
-2. **Get the weights into the guest.** `overlays/devbox/bootstrap.sh` skips
-   `models/` on purpose (line 65), so `bootstrap/models/qwen3.5-0.8b-q4.gguf` is
-   not on `devbox.img`. Stream it in the way the Redis rootfs went in — 41 MB
-   took 14 s over ssh, so budget ~3 min for 532 MB — and **verify a sha256 on
-   both sides before benchmarking anything**. A short read on a 532 MB transfer
-   produces a model that still loads and still generates text.
-3. **Use `llama-bench`, not `llama-cli`.** It reports `pp512` and `tg128` in
-   tok/s with repetitions and a stddev built in, which is exactly the discipline
-   the Redis run had to bolt on by hand. Fall back to `llama-cli` only if
-   `llama-bench` will not start, and then parse the `llama_perf_context_print`
-   footer rather than eyeballing output.
-4. **Match the shape**, as §1 did: `--cpuset-cpus=0-3 -m 4g` against
-   `SMP=4 MEMORY=4096`. Sweep `-t 1` and `-t 4`: `-t 1` isolates single-core
-   compute, which *should* be identical — if it is not, something is wrong with
-   the measurement, which makes it a useful control — and the `-t 1 → -t 4`
-   scaling ratio is where the scheduler shows up.
-5. **Fix everything else**: same `-c` (pin it, do not let the default vary),
-   fixed seed, fixed prompt, identical `-n`. Median of ≥3 with the spread
-   reported, and no claim inside the spread.
+### Result 2 — the moment a second thread appears, decode collapses
 
-### Pitfalls already known
+`tg16`, one repetition, mmap on, thread count swept:
 
-- **Memory.** 532 MB of weights with `--no-mmap` means 532 MB of private
-  anonymous memory, plus KV cache, plus scratch. `MEMORY=4096` has room, but pin
-  `-c` explicitly: llama.cpp's default context on a Qwen3.5 model will size the
-  KV cache far above the README's `-c 256` example, written for a 135 M model in
-  a 256 MB VM.
-- **Thread count.** Akuma's kernel thread pool is 32 and shared with the OS.
-  `-t` beyond `SMP` is not a useful data point; sweep `1` and `4` only.
-- **Do not report a single ratio.** Same rule as §5. A load-time gap caused by
-  the absence of file-backed `mmap` is a VFS feature gap, not "the kernel is N×
-  slower", and mixing it into a throughput headline hides the one number
-  (`tg` tok/s at `-t 1`) closest to like-for-like.
+| threads | tok/s | vs `-t 1` |
+|---:|---:|---:|
+| 1 | 36.05 | 1.00× |
+| 2 | 1.61 | **0.045×** |
+| 3 | 0.28 | 0.008× |
+| 4 | 0.18 | 0.005× |
 
----
+**The cliff is between one thread and two — 22× slower for one extra thread**,
+long before four threads could be contending for four cores. Linux over the same
+1→4 step gains cleanly and almost linearly:
+
+| threads | Docker pp512 | Docker tg128 |
+|---:|---:|---:|
+| 1 | 103.91 | 40.61 |
+| 2 | 186.82 | 72.92 |
+| 3 | 251.24 | 100.31 |
+| 4 | 316.26 (3.04×) | 117.85 (2.90×) |
+
+Prefill degrades on Akuma too, but mildly: `pp512` goes 102.40 → 68.28 (0.67×)
+where Docker goes 103.91 → 316.26 (3.04×). The asymmetry is the diagnostic.
+Prefill
+does a few large matrix multiplies with long stretches of arithmetic between
+synchronization points; decode does many tiny operations per token and therefore
+crosses far more barriers. **The cost is per-barrier**, so the workload with
+more barriers per unit of work is destroyed and the one with fewer is merely
+hurt.
+
+At `-t 4`, `tg128` did not finish in 27 minutes and was abandoned; at the
+measured 0.18 tok/s, 128 tokens × 3 repetitions is ~36 minutes, which is
+consistent rather than a hang.
+
+### Result 3 — it is NOT the wakeup path
+
+The obvious hypothesis was futex/scheduler wakeup latency: threads park at a
+barrier and are slow to be woken. `ggml` has a knob that settles this directly —
+`--poll`, the spin-before-park threshold, where 100 means worker threads never
+park at all and 0 means they park at every barrier.
+
+| `--poll` | behaviour | `tg16 -t 4` |
+|---|---|---:|
+| 100 | never park — pure spin | 0.19 tok/s |
+| 50 | default | 0.18 tok/s |
+| 0 | park at every barrier | 0.19 tok/s |
+
+**Removing the park/wake path from the inner loop entirely changes nothing.**
+The hypothesis is dead, and so is the related intuition that this is the same
+mechanism as the Redis round-trip ceiling.
+
+What survives: the threads are spinning on shared memory (QEMU sat at ~304 %
+CPU throughout, so cores are busy, not idle), and the cost appears the instant
+two cores touch the same data. That is the signature of cross-core shared-memory
+synchronization being pathologically expensive — the leading suspect being the
+memory attributes on user mappings (shareability/cacheability), because
+non-inner-shareable mappings make cross-core atomics and cache-line sharing
+degrade exactly this way while leaving single-core performance untouched. **Not
+verified.** The next probes are a bare `ldxr/stxr` ping-pong between two guest
+threads on one cache line, timed, and a dump of the page-table attributes for a
+user anonymous mapping.
+
+### Scope
+
+`smp-shared` is an actively-changing subsystem; Results 2 and 3 are a snapshot
+of 2026-08-19 on `3f7a33de`, not a property of the design. Result 1 is the
+durable one.
+
+## 9. The Redis gap at one core — it gets *worse*, and that is the answer
+
+§5 left a question open: Akuma's forwarded arm runs at ~35 % of Linux with four
+cores on both sides. Is that a per-kernel-crossing cost that is already there
+with one core, or is part of it SMP contention that vanishes when there is
+nothing to contend with?
+
+Re-ran the whole matrix at `SMP=1` against `--cpuset-cpus=0`
+(`CORES=1 scripts/benchmarks/redis_matrix.sh`, 20,000 requests to keep the run
+finite — Akuma at one core is slow enough that 100,000 would have taken hours).
+
+### Forwarded arm
+
+| test | Akuma 1c | Akuma 4c | Docker 1c | Docker 4c | Akuma % @1c | Akuma % @4c |
+|---|---:|---:|---:|---:|---:|---:|
+| SET P=1 | 5,479 | 20,623 | 50,378 | 56,850 | **10.9 %** | 36.3 % |
+| GET P=1 | 5,562 | 20,100 | 50,761 | 57,241 | **11.0 %** | 35.1 % |
+| INCR P=1 | 5,456 | 20,794 | 50,891 | 58,072 | 10.7 % | 35.8 % |
+| LPUSH P=1 | 5,237 | 19,940 | 46,948 | 53,107 | 11.2 % | 37.5 % |
+| SET P=16 | 51,020 | 171,233 | 555,556 | 598,802 | 9.2 % | 28.6 % |
+| GET P=16 | 58,651 | 210,970 | 571,429 | 628,931 | 10.3 % | 33.5 % |
+| MSET P=16 | 17,079 | 49,776 | 317,460 | 480,769 | 5.4 % | 10.4 % |
+
+**The answer is the opposite of the hypothesis.** Akuma does not hold its ~35 %
+at one core — it falls to ~11 %. What changed is not Akuma getting worse in
+absolute terms for no reason; it is that the two kernels respond to core count
+completely differently:
+
+| going 1 core → 4 cores | Akuma | Docker/Linux |
+|---|---:|---:|
+| forwarded, P=1 | **3.76×** | 1.13× |
+| forwarded, P=16 | **3.36×** | 1.08× |
+| in-guest, P=1 | **5.92×** | 1.46× |
+
+`redis-server` is single-threaded, so Linux needs essentially one core and gains
+almost nothing from three more. **Akuma scales nearly linearly** — and
+superlinearly on the in-guest arm, where at one core the benchmark client, the
+server and the netpoll loop must all timeshare a single CPU.
+
+So the four-core figure was not hiding contention. It was showing Akuma
+*successfully using* the extra cores to paper over a much larger per-operation
+cost. Stated as CPU rather than wall-clock, taking the one-core numbers where a
+single CPU is the whole budget:
+
+| | CPU per round trip |
+|---|---:|
+| Akuma, forwarded | ~182 µs |
+| Linux, forwarded | ~20 µs |
+
+**Akuma burns roughly 9× more CPU per kernel crossing than Linux.** With four
+cores it parallelizes that down to ~50 µs of wall-clock latency, which is why
+the visible gap narrows to 2.8×. The 9× is the real number; the 2.8× is what
+four cores buy you.
+
+### In-guest arm
+
+| test | Akuma 1c | Akuma 4c | Docker 1c | Docker 4c | Akuma % @1c | Akuma % @4c |
+|---|---:|---:|---:|---:|---:|---:|
+| SET P=1 | 573 | 3,392 | 217,391 | 317,460 | 0.26 % | 1.07 % |
+| GET P=1 | 578 | 3,372 | 232,558 | 306,748 | 0.25 % | 1.10 % |
+| GET P=16 | 8,643 | 53,022 | 1,428,571 | 2,702,703 | 0.61 % | 1.96 % |
+| LPUSH P=16 | 8,718 | 49,652 | 526,316 | 684,932 | 1.66 % | 7.25 % |
+
+**§4's fixed round-trip ceiling reproduces at a second core count**, which is
+the strongest evidence for it. In round trips per second, the in-guest arm at
+one core is 573 at P=1 and 540 at P=16 (8,643 ÷ 16) — *identical*, exactly as it
+was at four cores (3,345 vs 3,314). Sixteen times the payload per exchange, same
+number of exchanges. The ceiling is on exchanges, and only on exchanges, at
+every core count tested.
+
+`PING_INLINE` and `PING_MBULK` are absent from this arm: those cells returned
+`rc=1` from `box use` with empty stderr. Not the socket-budget message of Issue
+16 — a different, unattributed `box use` failure, and worth a look before the
+next run.
+
+### What this does to the llama.cpp reading
+
+The two workloads now disagree about multi-core in a way that is more useful
+than either alone:
+
+| | 1 → 4 cores/threads |
+|---|---|
+| Redis (separate processes) | **3.4× – 5.9× faster** |
+| llama.cpp (threads sharing memory) | **200× slower** |
+
+Akuma's SMP is not broken in general — Redis demonstrably gets near-linear
+benefit from four cores. What breaks is specifically **threads of one process
+sharing memory across cores**. That narrows §8's suspect list considerably: it
+is not the scheduler (Redis's processes are scheduled across cores fine), not
+wakeups (§8 Result 3), and not core count as such. It is what happens when two
+cores touch the same user page.
+
+## 10. Method note — how this measurement was nearly ruined twice
+
+Both incidents are recorded because they were caught by accident rather than by
+procedure, and both are now guarded in the harnesses.
+
+**Orphaned load on the host.** Four `while :; do :; done` processes from another
+session's abandoned preempt stress run (`PPID=1`, 3 h 37 m, ~4 of 12 cores) were
+running when the session began. Found via `top`, not by any check. Impact turned
+out to be ~5 %, inside the spread, but it was luck. `redis_matrix.sh` now prints
+the top CPU consumers before starting.
+
+**An orphaned run inside the guest.** The first llama.cpp attempt held an ssh
+channel open; it died at 303 s with `rc=255` (Issue 19) and **the remote
+`llama-bench` was not killed with it**. A replacement run was launched alongside
+it, and both Docker's arm and the re-run were measured while two processes
+fought over four cores. Every number from that window was discarded and the
+whole thing redone on a cold VM with the process count verified.
+
+That mistake was made harder to catch by Issue 21: `ps` on Akuma shows threads
+as processes, so "two runs of seven threads" and "fourteen runaway processes"
+look identical. `bench_llama.py` now refuses to launch while any `llama-bench`
+is present, and always runs detached with a sentinel rather than holding a
+channel open.
+
+**The rule both incidents point at:** check what else is running — on the host
+*and* in the guest — immediately before a measurement, and record it alongside
+the result.
 
 ## Background
 

@@ -1470,6 +1470,57 @@ matches a real musl binary. Regression: `test_openat` cases 9-10 (boot suite).
 Full investigation + in-guest probe:
 [`APK_OTMPFILE_DIR_FD.md`](APK_OTMPFILE_DIR_FD.md).
 
+## Issue 21: procfs cannot distinguish a thread from a process
+
+**Status: OPEN, found 2026-08-19** while benchmarking `llama-bench`
+(`BENCHMARK_PERFORMANCE_ATTEMPT_0.md`). Three related procfs defects; the
+consequence of the set is worse than any one of them.
+
+Exactly **one** `llama-bench` was launched, from a `busybox sh` at pid 18. `ps`
+shows eight entries:
+
+```
+   20 llama-bench -m /root/qwen3.5-0.8b-q4.gguf ...     <- the real process
+   21 llama-bench ...   22 llama-bench ...   23 llama-bench ...
+   35 llama-bench ...   36 llama-bench ...   37 llama-bench ...
+   18 {busybox} sh -c cd /root && llama-bench ...
+```
+
+`PPid` gives the game away — 21, 22, 23, 35, 36 and 37 all report `PPid: 20`, so
+they are threads of the single process 20. But `/proc/<pid>/status` insists
+otherwise:
+
+| field | reported | Linux would report |
+|---|---|---|
+| `Tgid` | the thread's **own** pid (21, 22, 23, 35 …) | `20` for every thread |
+| `Threads:` | `1`, on every entry | `7` |
+| `/proc/<pid>/task/` | **empty** | one entry per thread |
+
+So the thread-group relationship is not exposed anywhere: `Tgid` is wrong,
+`Threads` is a constant, and the `task/` directory that is the canonical way to
+enumerate a thread group has no contents.
+
+**Why it matters beyond cosmetics.** `ps ax` reports N threads as N processes,
+so any human or script counting processes over-counts by the thread factor —
+seven-to-one for `llama-bench`. During this benchmark that directly caused a
+misdiagnosis: a stale run and a fresh run appeared as fourteen `llama-bench`
+"processes", and distinguishing "two processes with seven threads each" from
+"fourteen runaway processes" was only possible by noticing that some pids were
+lower than the shell that had launched the newer run. Anything that walks
+`/proc/*/task` to find threads — a debugger, a profiler, a supervisor deciding
+what to kill — sees nothing at all.
+
+It also makes the orphan class in Issue 19 much harder to spot, which is how the
+first set of llama.cpp numbers got contaminated: a run whose ssh channel had
+died was still executing, and `ps` output offered no way to separate it from the
+replacement run at a glance.
+
+**Fix sketch**: `Tgid` should report the thread-group leader (the value
+`CLONE_THREAD` already tracks internally — see `GIT_MISSING_SYSCALLS.md` for the
+thread-group bookkeeping that exists), `Threads` should count the group, and
+`/proc/<pid>/task/` should enumerate it. The first is the cheapest and fixes the
+`ps` over-count on its own.
+
 ## Background
 
 - [`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md)
