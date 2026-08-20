@@ -1032,6 +1032,46 @@ and burns a saturated host core per guest core).
    emphatically not the `[BKL] stuck` count, which is ~85 on healthy and wedged
    kernels alike.
 
+### `net-noalloc` re-measured on top of §9 + §12 — NEUTRAL, still off
+
+§11-item-3 asked for this: the static RX/TX rings lost on p90 in §7, their
+suspected loss mechanism was a wake problem, and §9/§12 fixed wake problems. Same
+session, same protocol, 5 x 2000:
+
+| | split, no rings | rings (`net-noalloc`) |
+|---|---:|---:|
+| req/s median | 1,339.0 | 1,377.2 |
+| req/s range | 1,236-1,471 | 1,285-1,427 |
+| p50 | 481.7 us | 468.5 us |
+| p90 | 967.4 us | 865.9 us |
+| p90 range | 734-1,616 | 809-1,156 |
+| p99 | 3,807.7 us | 3,816.8 us |
+
+**Indistinguishable.** The ranges overlap heavily and +2.8 % on the median is
+inside the ~6 % session drift of §11.7. One soft signal, not claimed: rings' p90
+*spread* is tighter (809-1,156 vs 734-1,616), which is the shape you would expect
+from removing per-packet allocation.
+
+**§7's "the rings lose on p90" is now stale** — that loss was the wake problem
+§9 and §12 fixed. They are no longer a regression. They still should not go
+default-on: added machinery for no measured gain. What they are now is *available*
+for the pipelined workload (redis) §7 says was never measured.
+
+The mechanistically useful part is the time budget:
+
+| per window, ~12,170 pkts | split | rings |
+|---|---:|---:|
+| parked | 4,120-4,164 ms | 4,144-4,146 ms |
+| in `poll()` | 851-891 ms | 878-891 ms |
+| **`tx_wait`** | 273-275 ms, **22.5-22.7 us/pkt** | 276-279 ms, **22.7-23.0 us/pkt** |
+| stack/other | 61.6-62.7 % of poll | 62.4 % of poll |
+
+**`tx_wait` per packet does not move.** So the 31 %-of-poll cost is **not**
+allocation or copy cost — removing both leaves it identical. It is time waiting on
+virtio TX completion: device/host side (QEMU SLIRP), not kernel side. Correct the
+expectation accordingly — `tx_wait` is probably not addressable from inside the
+kernel, and it should stop being cited as the next kernel-side target.
+
 ### Harness added
 
 - `scripts/benchmarks/run_nic_ab.py` — boots one arm, starts `httpd`, runs N x 2000

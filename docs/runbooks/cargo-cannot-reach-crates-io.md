@@ -40,12 +40,29 @@ curl -o /dev/null -w '%{http_code}\n' https://index.crates.io/config.json   # ex
 ```
 
 If `curl` returns `200` and apk cargo fetches while nightly cargo cannot, this
-is the known bug: **non-blocking TCP connects issued by nightly cargo's
-vendored libcurl never complete on the smoltcp kernel.** The kernel log shows
-the signature — 110 `socket()` + `connect() = EINPROGRESS` cycles with **zero**
-completions, happy-eyeballs rotating the four Fastly IPs at ~300 ms each.
+is the known bug. The **observation** is solid: the kernel log shows 110
+`socket()` + `connect() = EINPROGRESS` cycles with **zero** completions across a
+30 s nightly-cargo run, while apk libcurl issues the same syscalls to the same
+IPs and connects fine. DNS is not the problem; the A records resolve and appear
+in the log.
 
-DNS is not the problem; the A records resolve and appear in the log.
+The **explanation** is not settled, and two things should stop you treating it as
+settled:
+
+- **No probe reproduces it.** All four `nettest` modes — including `multi2`, which
+  is cargo's exact Multi + multiplex + worker-thread pattern — pass 30/30. The
+  only reproducer is cargo itself. The probe links apk libcurl, so it has never
+  exercised the vendored build (step 5).
+- **The ~300 ms give-up time contradicts "connects never complete."** A connect
+  that hangs burns `CURLOPT_CONNECTTIMEOUT`, not 353 ms. Failing in roughly one
+  successful round trip is the signature of an **error being returned** —
+  `POLLERR`, `ECONNRESET`, `EHOSTUNREACH` — not of silence. Nothing has yet
+  reconciled the timing with the stated mechanism. (`CURL_HEET_DEFAULT_QUEUESIZE`,
+  cited in the archive doc for the ~300 ms spacing, does not govern connect
+  timing; happy-eyeballs is `CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS`, default 200 ms.)
+
+Both gaps mean the *class* of bug may still be open. The workarounds in step 3
+are unaffected either way.
 
 ## 3. Work around it
 
@@ -100,12 +117,21 @@ CARGO_NET_OFFLINE=true cargo build --release
 
 ## 5. What would actually fix it
 
-Ranked in `../archive/CARGO_CRATES_IO_CONNECT_FAIL.md` § "Fix options". The
-cheapest next step is **not** a kernel change: rebuild the nettest probe with
-`static-curl` + `static-ssl` so it links the same vendored libcurl the nightly
-toolchain does, and bisect build flags until the trigger is one flag. The
-current probe links apk libcurl (c-ares) and therefore passes all four modes —
-it does not reproduce the bug yet.
+Ranked in `../archive/CARGO_CRATES_IO_CONNECT_FAIL.md` § "Fix options". Two cheap
+steps come before any kernel change:
+
+1. **Re-test on a current kernel.** The diagnosis dates from 2026-08-11, before the
+   `benchmarks-improved-networking` work. That branch fixed two lost-wake bugs in
+   the socket path (the NIC doorbell re-arm,
+   `../archive/AKUMA_NET_ISSUES.md` §9, and the `blocking_relax` yield, §12) — and
+   "`connect` → `EINPROGRESS` → `poll(POLLOUT)` never fires" is a lost-wake
+   signature. Nobody has re-run the reproducer since. This is the cheapest
+   experiment available and it may simply be fixed.
+2. **Rebuild the nettest probe with `static-curl` + `static-ssl`** so it links the
+   same vendored libcurl the nightly toolchain does, then bisect build flags until
+   the trigger is one flag. The current probe links apk libcurl (c-ares) and
+   passes all four modes, so it does not reproduce the bug — which is also why the
+   stated root cause is not yet confirmed (step 2).
 
 Do **not** start by debugging the smoltcp stack. Four hypotheses were already
 ruled out by experiment (HTTP/2 ALPN, c-ares DNS racing, worker-thread socket
@@ -133,8 +159,10 @@ them, that is the known bug, not a regression.
 ## Background
 
 - [`../archive/CARGO_CRATES_IO_CONNECT_FAIL.md`](../archive/CARGO_CRATES_IO_CONNECT_FAIL.md)
-  — root cause isolated 2026-08-11, fix not yet chosen. The four ruled-out
-  hypotheses and the reproducer live here.
+  — the 2026-08-11 investigation: four ruled-out hypotheses and the cargo-only
+  reproducer. Its header claims "root cause isolated"; read that as *observation
+  isolated* — its own § "What the probe does NOT yet reproduce" concedes no
+  controlled binary reproduces the failure. See step 2 above.
 - [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) §"cargo cannot
   reach crates.io" — the earlier, **superseded** multiplexing diagnosis.
 - [`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) — `CARGO_NET_RETRY=20`,

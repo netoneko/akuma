@@ -159,9 +159,12 @@ Inside `poll()` the split is stable across every arm and every window:
 | `rx_post` | 6.1-7.1 % | 4.2-5.4 us per packet |
 | `rx_done` | 0 % | — |
 
-So the largest *named* remaining cost in the loop is `tx_wait`, ~31 % of all poll
-time. That is what `net-noalloc`'s static TX rings were built for (§7, gated off
-and owed a re-measure on top of §9).
+The largest *named* remaining cost in the loop is `tx_wait`, ~31 % of all poll
+time — but **it is not kernel-side work.** `net-noalloc`'s static rings were
+re-measured on top of this fix ([`AKUMA_NET_ISSUES.md`](AKUMA_NET_ISSUES.md) §12)
+and `tx_wait` per packet is unchanged (22.5-22.7 -> 22.7-23.0 us), so it is
+neither allocation nor copy cost; it is time waiting on virtio TX completion,
+i.e. device/host side. It should not be cited as a kernel-side target.
 
 Two context numbers worth keeping: `poll()` is only **4.4 % of the core budget**
 and parked time ~21 % (about one core of four). The machine is close to idle — the

@@ -1143,13 +1143,14 @@ None of them are about the bug; all of them are about the harness.
 - **`cargo` cannot reach crates.io from the guest even though the network is
   fine.** `curl -o /dev/null -w '%{http_code}' https://index.crates.io/config.json`
   returns `200` in 0.3 s while cargo reports
-  `Failed to connect to index.crates.io:443 after 420 ms`. It is libcurl's HTTP/2
-  multiplexing; `[http] multiplexing = false` in `/root/.cargo/config.toml` (or
-  `CARGO_HTTP_MULTIPLEXING=false`) fixes it. Don't debug the net stack.
-  **SUPERSEDED 2026-08-11 — the multiplexing half of this is wrong.** Setting the
-  flag was tested and does *not* fix it; the cause is nightly cargo's vendored
-  libcurl issuing non-blocking connects that never complete, and apk
-  `/usr/bin/cargo` is unaffected. "Don't debug the net stack" still holds. See
+  `Failed to connect to index.crates.io:443 after 420 ms`. **Use apk cargo
+  (`/usr/bin/cargo`) to fetch, then build `--offline`** — the failure is exclusive
+  to the nightly toolchain's `/usr/local/bin/cargo`.
+  **No cargo config fixes this.** `[http] multiplexing = false` /
+  `CARGO_HTTP_MULTIPLEXING=false` was the advice here until 2026-08-11; it was
+  tested and **does not work**, and HTTP/2 multiplexing is not the cause — a probe
+  forcing exactly that pattern succeeds 30/30. Do not spend time on it.
+  Full state of the diagnosis, including what is still unexplained, in
   [`cargo-cannot-reach-crates-io.md`](cargo-cannot-reach-crates-io.md).
 - **`--offline` can fail with sources fully cached.** `no matching package named
   arm_pl031 found` while `~/.cargo/registry/{cache,src}` both hold it and
@@ -1167,8 +1168,8 @@ None of them are about the bug; all of them are about the harness.
   encoded bytes on stdin. 145 KB lands in 0.1 s.
 - **The guest has almost no standalone coreutils.** `nproc`, `sleep`, `timeout`,
   `head`, `nohup`, `which` and `uname` all need a `busybox ` prefix.
-- **Downloads are flakier than the index.** Even with multiplexing off,
-  `static.crates.io` connection failures are common. Add `[net] retry = 20` and
+- **Downloads are flakier than the index.** `static.crates.io` connection
+  failures are common regardless of cargo config. Add `[net] retry = 20` and
   run `cargo fetch` in a retry loop until it is clean *before* starting the
   timed repro, so a network stall is never mistaken for a kernel hang.
 
