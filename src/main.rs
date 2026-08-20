@@ -1283,11 +1283,11 @@ fn netpoll_drain_step() {
         // the BKL" — the AB-BA shape the `PreemptGuard` doc warns about.
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_open();
-        // Re-arm the NIC doorbell BEFORE draining, not after.
+        // Re-arm the netpoll doorbell BEFORE draining, not after.
         //
         // Re-arming afterwards left a window: a packet arriving after the
         // last `poll()` returned false but before the store is missed by
-        // this drain, finds `NIC_WAKE_PENDING` still set so its handler
+        // this drain, finds `NETPOLL_WAKE_PENDING` still set so its ringer
         // raises NO broadcast, and is then erased by the store. Every core
         // reaches the `wfi` below and sleeps to the 3 ms tick — one
         // swallowed wake, one 3 ms request. That is the shape the tail
@@ -1303,9 +1303,12 @@ fn netpoll_drain_step() {
         // an arrival, still bounded by the coalescer (a burst mid-drain
         // still rings once, not once per frame).
         //
-        // See docs/archive/AKUMA_NET_ISSUES.md §9.
+        // See docs/archive/AKUMA_NET_ISSUES.md §9. Originally NIC-interrupt-only
+        // (`NIC_WAKE_PENDING`); renamed when a loopback frame push
+        // (`akuma_net::runtime::NetRuntime::wake_netpoll`) became a second ringer
+        // — see `ring_netpoll_doorbell` and `docs/archive/LOOPBACK_RING_CONVERSION.md`.
         #[cfg(kernel_smp_shared)]
-        NIC_WAKE_PENDING.store(false, core::sync::atomic::Ordering::Relaxed);
+        NETPOLL_WAKE_PENDING.store(false, core::sync::atomic::Ordering::Relaxed);
         let mut polls = 0u32;
         while akuma_net::smoltcp_net::poll() {
             polls += 1;
@@ -1389,6 +1392,12 @@ fn run_async_main() -> ! {
             is_current_interrupted: process::should_interrupt_blocking_syscall,
             rng_fill: |buf| rng::fill_bytes(buf).expect("RNG required for networking"),
             current_thread_id: || threading::current_thread_id() as u32,
+            // Loopback frames never touch virtio, so they have no interrupt of
+            // their own to end a parked core's `wfi`/`blocking_relax` — this is
+            // the same doorbell `nic_irq_handler` rings for real packets, called
+            // instead from `LoopbackRing::push`. See `ring_netpoll_doorbell` and
+            // `docs/archive/LOOPBACK_RING_CONVERSION.md`.
+            wake_netpoll: ring_netpoll_doorbell,
         },
         config::ENABLE_DHCP,
     ) {
@@ -1859,8 +1868,8 @@ fn run_async_main() -> ! {
 #[cfg(feature = "smoltcp")]
 const VIRTIO_MMIO_SPI_BASE: u32 = 48;
 
-/// Set by the NIC interrupt when it has broadcast a wake, cleared once the
-/// network stack has actually been polled.
+/// Set by [`ring_netpoll_doorbell`] when it has broadcast a wake, cleared
+/// once the network stack has actually been polled.
 ///
 /// This is a **doorbell coalescer**, and it is what keeps the cross-core wake
 /// from becoming an IPI storm. Without it a broadcast per packet would cost
@@ -1869,11 +1878,60 @@ const VIRTIO_MMIO_SPI_BASE: u32 = 48;
 /// during a burst the first packet rings the doorbell and every packet after it
 /// finds it already ringing, so the SGI rate is bounded by how fast the stack
 /// polls rather than by how fast packets arrive.
+///
+/// Two ringers share this flag: [`nic_irq_handler`] for external traffic, and
+/// `akuma_net::runtime::NetRuntime::wake_netpoll` (wired to
+/// [`ring_netpoll_doorbell`] at registration), called after a loopback frame
+/// is queued — loopback never touches virtio, so it has no interrupt of its
+/// own to ring this with. Named `NIC_WAKE_PENDING` until the loopback ringer
+/// was added; renamed because both ringers need exactly the same thing:
+/// "something changed, wake everyone polling" — see
+/// `docs/archive/LOOPBACK_RING_CONVERSION.md`.
+///
 /// Only exists where it is used: the doorbell is about waking *peer* cores, so a
 /// single-core build (`extreme-size` drops `smp-shared`) has nobody to poke.
 #[cfg(all(feature = "smoltcp", kernel_smp_shared))]
-static NIC_WAKE_PENDING: core::sync::atomic::AtomicBool =
+static NETPOLL_WAKE_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// Ring the cross-core netpoll doorbell: broadcast the scheduler SGI to every
+/// core, coalesced through [`NETPOLL_WAKE_PENDING`] so a burst costs one SGI
+/// per drain cycle rather than one per frame. No-op off `kernel_smp_shared`
+/// (see that static's doc comment).
+///
+/// Two callers want exactly the same effect — end every core's
+/// `wfi`/`blocking_relax` halt immediately instead of leaving it to the next
+/// 3 ms timer tick — for two different reasons: [`nic_irq_handler`] (a real
+/// packet arrived over virtio, so it can ride the interrupt) and
+/// `akuma_net::runtime::NetRuntime::wake_netpoll` (a loopback frame was
+/// queued in pure software, so nothing else would ever end that halt for it).
+/// See `docs/archive/AKUMA_NET_ISSUES.md` §6.2/§9 for why broadcasting beats a
+/// targeted wake, and `docs/archive/LOOPBACK_RING_CONVERSION.md` for the
+/// loopback ringer.
+#[cfg(feature = "smoltcp")]
+fn ring_netpoll_doorbell() {
+    #[cfg(kernel_smp_shared)]
+    if !NETPOLL_WAKE_PENDING.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        // Wake EVERY core, not just the ones with a parked socket waiter.
+        //
+        // Targeting was tried 2026-08-20 — a per-core count of waiters
+        // (`net_waiter_park`/`_unpark`), poked with `trigger_sgi_core` — on the
+        // reasoning that broadcasting ends the `wfi` on cores with nothing to do
+        // (2.5 async-main laps per NIC interrupt). It measured WORSE both times:
+        // laps per packet went 3.18 -> 6.5-7.6 and throughput ~1,100 -> 454-867
+        // req/s, with the swallowed-wake signature (fewer `relax` parks, each
+        // 2-3x longer).
+        //
+        // Why targeting cannot work as written: `blocking_relax` begins with
+        // `yield_now`, so a waiter can resume on a core it never marked, and the
+        // netpoll loop's own halt is a `wfi` rather than a park — so the set of
+        // "cores that need this packet" is not knowable at interrupt time from
+        // anything the waiters record. A broadcast is imprecise and cheap; a
+        // precise wake here is wrong more often than it is expensive.
+        // See docs/archive/AKUMA_NET_ISSUES.md §11.
+        gic::broadcast_sgi(gic::SGI_SCHEDULER);
+    }
+}
 
 /// virtio-net interrupt handler: acknowledge, ring the cross-core doorbell,
 /// and return.
@@ -1901,30 +1959,9 @@ fn nic_irq_handler(_irq: u32) {
     // leaving the median at milliseconds: the fast cases were the ones that
     // happened to be waiting on the routed core.
     //
-    // Poking every core with the scheduler SGI ends those halts. The SGI
-    // handler is the ordinary preemption path, so a woken core re-evaluates its
-    // run queue and the waiter's own `wait_until` loop polls the stack again.
-    #[cfg(kernel_smp_shared)]
-    if !NIC_WAKE_PENDING.swap(true, core::sync::atomic::Ordering::AcqRel) {
-        // Wake EVERY core, not just the ones with a parked socket waiter.
-        //
-        // Targeting was tried 2026-08-20 — a per-core count of waiters
-        // (`net_waiter_park`/`_unpark`), poked with `trigger_sgi_core` — on the
-        // reasoning that broadcasting ends the `wfi` on cores with nothing to do
-        // (2.5 async-main laps per NIC interrupt). It measured WORSE both times:
-        // laps per packet went 3.18 -> 6.5-7.6 and throughput ~1,100 -> 454-867
-        // req/s, with the swallowed-wake signature (fewer `relax` parks, each
-        // 2-3x longer).
-        //
-        // Why targeting cannot work as written: `blocking_relax` begins with
-        // `yield_now`, so a waiter can resume on a core it never marked, and the
-        // netpoll loop's own halt is a `wfi` rather than a park — so the set of
-        // "cores that need this packet" is not knowable at interrupt time from
-        // anything the waiters record. A broadcast is imprecise and cheap; a
-        // precise wake here is wrong more often than it is expensive.
-        // See docs/archive/AKUMA_NET_ISSUES.md §11.
-        gic::broadcast_sgi(gic::SGI_SCHEDULER);
-    }
+    // Poking every core with the scheduler SGI ends those halts — see
+    // `ring_netpoll_doorbell` for the mechanism.
+    ring_netpoll_doorbell();
 }
 
 /// Async task that periodically reports memory usage

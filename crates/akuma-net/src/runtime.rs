@@ -56,6 +56,19 @@ pub struct NetRuntime {
     /// tracking (see `smoltcp_net::network_holder_snapshot`). Plain `u32`
     /// because the holder slot is an `AtomicU32` and stays IRQ-friendly.
     pub current_thread_id: fn() -> u32,
+    /// End every parked core's `wfi`/`blocking_relax` halt immediately,
+    /// instead of leaving it to the next timer tick.
+    ///
+    /// The kernel wires this to the same cross-core doorbell the virtio-net
+    /// RX interrupt rings for external traffic (`src/main.rs`
+    /// `ring_netpoll_doorbell`, called by `nic_irq_handler`). Called from
+    /// `smoltcp_net::LoopbackRing::push` after a loopback frame is queued —
+    /// loopback traffic never touches virtio, so unlike a real packet it has
+    /// no interrupt of its own to end a waiter's halt with; without this it
+    /// rides the periodic tick, the exact cost the NIC interrupt fix removed
+    /// for external traffic (`docs/archive/AKUMA_NET_ISSUES.md` §3.1). See
+    /// `docs/archive/LOOPBACK_RING_CONVERSION.md`.
+    pub wake_netpoll: fn(),
 }
 
 /// RAII guard that disables scheduler preemption (and, under the BKL-drop

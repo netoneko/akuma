@@ -1,14 +1,17 @@
-# Loopback ring conversion, and why loopback is still slow (2026-08-20)
+# Loopback ring conversion, and the doorbell it was missing (2026-08-20)
 
-**Status: one fix landed and verified — `LoopbackAwareDevice`'s internal
-queue is now a fixed-capacity ring, not a `VecDeque<Vec<u8>>` — but it does
-**not** close the latency gap to the NIC path. Measured after the fix:
-loopback round trips are still ~5.4 ms at p50 against ~0.66-0.79 ms for the
-interrupt-driven NIC path documented in `AKUMA_NET_ISSUES.md`. The likely
-cause is identified (§4) but not fixed: loopback pushes never ring the
-doorbell that `AKUMA_NET_ISSUES.md` built for the NIC, so a loopback-blocked
-waiter still rides the old tick-bound cadence that document replaced for
-external traffic.**
+**Status: two fixes landed and verified.** `LoopbackAwareDevice`'s internal
+queue is now a fixed-capacity ring, not a `VecDeque<Vec<u8>>` (§1-§3). That
+alone did **not** close the latency gap to the NIC path — measured
+afterward, loopback round trips were still ~5.4 ms at p50 against
+~0.66-0.79 ms for the interrupt-driven NIC path documented in
+`AKUMA_NET_ISSUES.md` (§4). Root cause: a loopback push never rang the
+cross-core doorbell that document built for the NIC, so a loopback-blocked
+waiter rode the old tick-bound cadence that document replaced for external
+traffic. §5 wires a loopback push into the same doorbell. Measured result:
+**p50 5.4 ms → 1.2 ms** (4.5x), now within ~1.6x of the NIC path instead of
+~7x. p90/p99 still trail the NIC path by a smaller margin — open, not
+chased further this session (§5).
 
 ## 1. What was wrong
 
@@ -182,11 +185,68 @@ tick-bound shape `AKUMA_NET_ISSUES.md` measured and fixed for the NIC path
 (pre-fix: 4.9 ms average park) — evidence this is the same mechanism,
 recurring on a path the interrupt fix never reached.
 
-**Not fixed in this session** — scope was the ring conversion. The fix, if
-this diagnosis holds, is to make a loopback `push` ring the same doorbell
-`nic_irq_handler` does (or an equivalent local wake) instead of relying on
-an interrupt that can never fire for it. Confirming the diagnosis further
-and landing that fix is the next step.
+## 5. The fix: ring the same doorbell from `push`
+
+Confirmed the diagnosis by acting on it. `nic_irq_handler`'s doorbell logic
+(swap-and-broadcast on `NIC_WAKE_PENDING`) was extracted from the IRQ handler
+into a standalone `fn ring_netpoll_doorbell()` (`src/main.rs`) that both the
+IRQ handler and a new caller can invoke. The static it coalesces through was
+renamed `NIC_WAKE_PENDING` -> `NETPOLL_WAKE_PENDING` — it now has two ringers
+with nothing NIC-specific about either of them, and the old name would have
+lied.
+
+The new caller reaches `crates/akuma-net` (which cannot call
+`ring_netpoll_doorbell` or touch the GIC directly — it is a host-testable
+crate and deliberately has no hardware/IRQ dependency) through the same
+seam every other kernel capability it needs already goes through:
+`akuma_net::runtime::NetRuntime`, a table of plain `fn` pointers the kernel
+registers once at boot (`uptime_us`, `yield_now`, `blocking_relax`, …). One
+field was added:
+
+```rust
+pub wake_netpoll: fn(),
+```
+
+wired at registration (`src/main.rs`, the `akuma_net::init(NetRuntime { .. })`
+call) to `ring_netpoll_doorbell`, and called from `LoopbackRing::push`
+(`smoltcp_net.rs`) right after a frame is successfully queued — not on the
+overflow/drop path, where there is nothing for anyone to wake up for.
+
+This is the same seam an earlier fix in this file could have used and
+didn't need to: the ring conversion (§1-§3) stayed entirely inside
+`akuma-net` because allocation and queue depth are pure data-structure
+concerns. Waking a parked core is not — it is a kernel capability
+(`gic::broadcast_sgi`, the same one `nic_irq_handler` already used) that
+`akuma-net` was never going to be given directly, which is exactly why
+`NetRuntime` exists as a seam in the first place.
+
+### Result
+
+Same `devbox-smoltcp` boot, same machine, same method as §4 (`httpd`
+`HTTPD_STATS=1`, one client `curl` process issuing 200 sequential requests
+via `--next` so client process-spawn cost cannot confound the number),
+run back-to-back with a fresh NIC-path measurement for a same-session
+reference:
+
+| path | p50 | p90 | p99 | mean |
+|---|---:|---:|---:|---:|
+| loopback, **before** this fix | 5,407 us | 6,292 us | 6,971 us | 4,481 us |
+| loopback, **after** this fix | **1,211 us** | 4,151 us | 6,371 us | **2,092 us** |
+| NIC path (same session, reference) | 776 us | 2,721 us | 3,775 us | 1,100 us |
+
+p50 dropped **4.5x** and mean dropped **2.1x** — loopback went from ~7x
+slower than the NIC path to ~1.6x slower. Zero curl errors, zero drops,
+zero panics/`[BKL] stuck` across the boot.
+
+**p90/p99 still trail the NIC path by a real margin** (4,151/6,371 us vs
+2,721/3,775 us) — smaller than before, but not closed. Plausible causes not
+chased this session: the doorbell coalesces (one broadcast per drain cycle,
+same as the NIC path already accepts — see the `NETPOLL_WAKE_PENDING` doc
+comment), TCP connection teardown/`TIME_WAIT` and `pending_removal` GC run
+on their own timers regardless of this fix, and a `curl --next` chain is
+still one client process serializing 200 real TCP connections so some tail
+variance is inherent to the harness, not the kernel. Worth a closer look if
+loopback tail latency matters to a real workload; not pursued further here.
 
 ## Background
 

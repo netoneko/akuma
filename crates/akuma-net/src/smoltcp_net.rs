@@ -773,6 +773,13 @@ impl LoopbackRing {
         self.lens[slot] = frame.len() as u16;
         self.tail = (self.tail + 1) % LOOPBACK_RING;
         self.count += 1;
+        // A loopback frame never touches virtio, so unlike a real packet it
+        // has no interrupt of its own to end a parked core's `wfi`/
+        // `blocking_relax` halt — without this it rides the periodic timer
+        // tick, the exact cost `AKUMA_NET_ISSUES.md` §3.1 removed for
+        // external traffic. See `NetRuntime::wake_netpoll` and
+        // `docs/archive/LOOPBACK_RING_CONVERSION.md`.
+        (runtime().wake_netpoll)();
     }
 
     /// Hand back the oldest queued frame, if any, as a `'static` slice into
