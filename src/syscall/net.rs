@@ -611,6 +611,23 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _src_
     EBADF
 }
 
+/// `shutdown(fd, how)` — half-close a TCP connection, keeping the fd.
+///
+/// A `return 0` stub until 2026-08-20, which made `SHUT_WR` a lie: no FIN ever
+/// reached the peer. See [`akuma_net::socket::socket_shutdown`] for what that
+/// cost (5 s per nginx request). Non-socket fds keep the old permissive
+/// success — nothing in the tree half-closes a pipe, and failing them now would
+/// be a new error where there has never been one.
+#[cfg(feature = "smoltcp")]
+pub(super) fn sys_shutdown(fd: u32, how: i32) -> u64 {
+    let Some(idx) = get_socket_from_fd(fd) else { return 0 };
+    match socket::socket_shutdown(idx, how) {
+        Ok(()) => 0,
+        Err(e) => neg_errno(e),
+    }
+}
+
+#[cfg(not(feature = "smoltcp"))]
 pub(super) fn sys_shutdown(_fd: u32, _how: i32) -> u64 { 0 }
 
 /// AArch64 `struct timeval` — `{ time_t tv_sec; suseconds_t tv_usec; }`, both
@@ -1181,9 +1198,26 @@ pub(super) fn socket_recv_queue_size(idx: usize) -> usize {
 
 #[cfg(feature = "smoltcp")]
 pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
+    // A listening fd is readable when a connection is waiting to be accepted,
+    // and asking that question is also what reaps backlog handles that died
+    // before anyone accepted them — the maintenance that keeps the port
+    // answering at all (`listener_refresh`). It has to run on the poller's path
+    // and not just `accept`'s, because an event-driven server (nginx) never
+    // calls `accept` until a poll tells it to. Called with no socket-table lock
+    // held: `listener_ready` takes that lock itself.
+    if let Some(ready) = akuma_net::socket::listener_ready(idx) {
+        if crate::config::SYSCALL_DEBUG_EPOLL_EDGE {
+            let (listening, pending, dead) =
+                akuma_net::socket::listener_backlog_census(idx).unwrap_or((0, 0, 0));
+            crate::tprint!(160, "[epoll-listener] idx={} ready={} backlog={}/{}/{}\n",
+                idx, ready, listening, pending, dead);
+        }
+        return ready;
+    }
     socket::with_socket(idx, |sock| {
         match &sock.inner {
             socket::SocketType::Stream(h) => {
+                let was_connected = sock.was_connected;
                 akuma_net::smoltcp_net::with_network(|net| {
                     let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
                     // Report readable when:
@@ -1200,22 +1234,10 @@ pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
                     // The `is_active() && !may_recv()` pair this used to test was ALSO true
                     // in SynSent, so a socket mid-handshake was advertised as readable-at-EOF
                     // — see `tcp_reached_established`, which is what makes the difference.
-                    akuma_net::socket::tcp_recv_ready(s.can_recv(), s.may_recv(), s.state())
+                    akuma_net::socket::tcp_recv_ready(s.can_recv(), s.may_recv(), s.state(), was_connected)
                 }).unwrap_or(false)
             }
-            socket::SocketType::Listener { handles, .. } => {
-                // Report readable when any backlog handle has an established connection
-                let states: alloc::vec::Vec<_> = handles.iter().map(|&h| {
-                    akuma_net::smoltcp_net::with_network(|net| {
-                        net.sockets.get::<smoltcp::socket::tcp::Socket>(h).state()
-                    })
-                }).collect();
-                if crate::config::SYSCALL_DEBUG_EPOLL_EDGE {
-                    crate::tprint!(160, "[epoll-listener] idx={} handles={} states={:?}\n",
-                        idx, handles.len(), states);
-                }
-                states.contains(&Some(smoltcp::socket::tcp::State::Established))
-            }
+            // Listeners are handled before the table lock is taken — see above.
             _ => false,
         }
     }).unwrap_or(false)

@@ -1,12 +1,15 @@
 # Getting nginx running on Akuma — what it actually cost
 
-**Status: nginx starts and serves real requests end-to-end (Issues A-D
-FIXED)** — `curl` gets a clean `HTTP/1.1 200 OK` from both inside the guest
-(loopback) and from the host via the forwarded port. Benchmarked against
-Docker nginx over the NIC: `connect` is a dead heat, `echo` has a healthy
-median but a 12-24x tail, `http` mode and any sustained connection churn hit
-a still-open degradation (**Issue E**) that a second worker does not fix.
-2026-08-20, `devbox-smoltcp`, apk `nginx-1.30.4-r1`.
+**Status: nginx starts, serves real requests end-to-end, and survives
+connection churn (Issues A-E FIXED).** Issues A-D got it running; Issue E —
+"nginx stops answering after enough traffic" — turned out to be **three
+kernel-side defects and nothing whatsoever to do with nginx**, root-caused and
+fixed 2026-08-20 (§"Issue E, resolved"). `--mode http` went from 100 %
+timeouts to 300/300 samples at 732 us p50; a listener now survives 1088
+churned connections where it used to die at 80. The one thing still open is
+the **tail**, not correctness: `echo` p99 is ~5x Docker's, the scheduler-tick
+signature this repo already knows about. 2026-08-20, `devbox-smoltcp`, apk
+`nginx-1.30.4-r1`.
 
 Goal: run the official `nginx` package (not the Docker image) on the barest
 config possible and benchmark it against nginx-in-Docker. The opening question
@@ -356,9 +359,17 @@ Fresh connect + GET + read-until-close per sample. This is where connection
 churn (Issue E) showed up directly: it triggered the exact degradation this
 mode's rapid-fire pattern is built to.
 
-## Issue E — OPEN: nginx degrades under connection churn; 2 workers make it worse, not better
+**Superseded**: `http` mode works now, and the numbers are in
+[§"What the fixes are worth"](#what-the-fixes-are-worth). It was never really
+about churn — the read-until-close was waiting on a FIN that a stubbed
+`shutdown(2)` never sent.
 
-**Status: OPEN, root cause not fixed.** Found while benchmarking (above), not
+## Issue E — nginx degrades under connection churn; 2 workers make it worse, not better
+
+**Status when first written: OPEN, root cause not fixed. Now RESOLVED — see
+[§"Issue E, resolved"](#issue-e-resolved-three-kernel-defects-none-of-them-nginxs)
+below. The section that follows is the original write-up, kept as the record
+of what the symptom looked like and of a first reading that was wrong.** Found while benchmarking (above), not
 while getting nginx to start. Distinct from Issues A-D: this is not "nginx
 can't start" but "nginx stops answering after enough traffic," and — as E2
 below shows — adding a second worker doesn't help; it adds a *new* failure
@@ -456,6 +467,170 @@ Akuma's TCP stack delivering the FIN late for this specific short-lived-
 connection shape, is unresolved — flagging it here rather than chasing a
 fifth rabbit hole in the same session.
 
+## Issue E, resolved: three kernel defects, none of them nginx's
+
+Picked up 2026-08-20 as its own investigation. Every one of E1's symptoms is
+kernel-side. The original reading above — "nginx's own free-connection pool
+isn't being returned to correctly" — was wrong, and the reason it was
+persuasive is worth keeping: **restarting nginx fixed it instantly**, which
+reads as process state right up until you notice that a restart also rebuilds
+the kernel's listener.
+
+### How it was decided, before any code was read
+
+Two experiments, in this order, on the VM the previous session left running:
+
+1. **A different server, same churn.** `userspace/httpd` — a plain blocking
+   accept loop with no connection pool of any kind — started on :4444 and
+   given the same treatment died after **24** connections. Whatever this is,
+   nginx is a bystander.
+2. **Count the connections it takes.** nginx's `worker_connections` defaults
+   to 512; `MAX_BACKLOG` is 32. nginx died at **80** cumulative churned
+   connections, in graded steps of 8/16/24/32 — an order of magnitude below
+   512 and in the neighbourhood of 32. That is the whole discriminator, and it
+   is what `scripts/probes/listener_backlog_churn.py` automates. Its Linux
+   reference arm (Docker nginx on :8082) survives 1088 without flinching.
+
+### E1a: the listener pool erodes to zero and the port goes deaf
+
+A listener on Akuma is not one socket. `SocketType::Listener` holds
+`MAX_BACKLOG` (32 under `many-sessions`) smoltcp sockets, all already in
+`Listen` on the port; smoltcp completes a handshake on whichever one it
+matches, and `accept()` hands that handle out and creates a replacement.
+
+A handle that reaches `Established` and is then **reset before anyone accepts
+it** goes to `Closed` — and nothing ever called `listen()` on a pool handle
+again. `accept()` only replaced the handles it successfully handed out. So
+every connect-then-RST that beat the server to the accept burned one slot,
+permanently.
+
+`SO_LINGER 0` is exactly that pattern, and it is not exotic: it is what
+`bench_nic_rtt.py --mode connect` does by its own documented choice, what a
+load generator does, and what any client that gives up mid-handshake does.
+
+Proving it needed a look at the pool, and there was none: `/proc/net/tcp`
+printed one `LISTEN` row per listener whether the pool held 32 listening
+handles or none. So the row gained a `BACKLOG` column —
+`listening/pending/dead` — and the erosion was then visible directly, in
+graded churn steps of 8 against single-worker nginx:
+
+```
+8080,0.0.0.0:0,LISTEN,0,32/0/0     <- fresh
+8080,0.0.0.0:0,LISTEN,0,27/0/5
+8080,0.0.0.0:0,LISTEN,0,20/0/12
+8080,0.0.0.0:0,LISTEN,0,15/0/17
+8080,0.0.0.0:0,LISTEN,0,10/0/22
+8080,0.0.0.0:0,LISTEN,0,7/0/25
+8080,0.0.0.0:0,LISTEN,0,2/0/30
+8080,0.0.0.0:0,LISTEN,0,0/0/32     <- port now RSTs everything, permanently
+```
+
+Not every churned connection burns a slot — the ones the server accepts in
+time are replaced normally, which is why 80 connections were needed to kill 32
+slots, and why the failure looks load-dependent rather than deterministic.
+
+**Fix:** `listener_refresh` in `crates/akuma-net/src/socket.rs`. Any handle
+that is not `Listen`/`SynReceived`/`Established`/`CloseWait` is recycled with
+`abort()` + `listen()` **on the same handle** — no allocation, so a listener
+under churn cannot be starved by a full socket table. It runs from `accept()`
+*and* from the poller (`socket_can_recv_tcp`), the latter being the one that
+matters for nginx: an event-driven server never calls `accept` until a poll
+tells it to. `CloseWait` was also added to what `accept` will hand out — a
+client that sent its whole request and then closed leaves that request in the
+handle's receive buffer, and both dropping it and recycling the handle lose a
+complete, answerable request.
+
+### E1b: a blocking `read` on a reset connection never returns
+
+This is what actually killed `httpd`, and it is a second defect: `httpd`'s log
+ends at `connection from 10.0.2.2:53200` with no request line after it. It
+accepted a churned connection, the RST arrived, and it blocked on `read`
+forever — never returning to `accept()`.
+
+smoltcp keeps no history. A connection reset after it was serving lands in
+`Closed`, which is also where a socket that has never been connected sits, so
+`tcp_reached_established` has to call `Closed` "not established yet" — that
+classification is itself load-bearing, it is what stopped a socket in
+`SynSent` from reporting a phantom EOF (`SOCKET_DELAYED_FIRST_BYTE_HANG.md`).
+The readiness predicate therefore said "nothing yet" about a connection that
+was never going to produce anything again, and the reader parked on it.
+
+**Fix:** `KernelSocket::was_connected`, set by `accept` (which by construction
+only hands out a connection that reached `Established`) and by a successful
+`connect`, and latched in `socket_recv` for a fd that finished a *non*-blocking
+connect. With that bit, `Closed` is unambiguous: it means **reset**, and
+`recv` returns `ECONNRESET` rather than waiting. A graceful FIN parks the
+socket in `CloseWait` and never reaches that arm, so a clean end-of-stream is
+still `read() == 0` — the distinction matters, since `Ok(0)` would tell an HTTP
+server "request complete" about a request that was cut in half.
+
+### E2: why `--mode http` timed out — `shutdown(2)` was a stub
+
+Also kernel-side, also nothing to do with churn, and the sharpest signal in
+the whole investigation. Reading a response to EOF:
+
+```
+nginx  +160B at 2.8ms    EOF at 5007.5ms      <- five seconds, to the millisecond
+httpd  +135B at 2.9ms    EOF at    3.2ms
+```
+
+5 s is nginx's `lingering_timeout` default. nginx finishes a response with a
+*lingering close* (`ngx_http_set_lingering_close`): `shutdown(SHUT_WR)` first —
+which is what tells the client "response complete, EOF" — then it keeps reading
+whatever the client still has in flight until the client closes or that timer
+expires. `sys_shutdown` was `pub(super) fn sys_shutdown(_fd: u32, _how: i32)
+-> u64 { 0 }`, so the FIN was silently dropped and the client saw nothing until
+nginx gave up and closed for real. `httpd` was unaffected only because it
+happens to `close()` immediately after its own `shutdown`.
+
+**Fix:** `socket_shutdown` in `crates/akuma-net/src/socket.rs`. `SHUT_WR` calls
+smoltcp `close()` (FIN out, socket to `FinWait1`, still able to receive — which
+nginx's lingering read depends on) and polls immediately so the FIN goes out
+now rather than at the next poll. `SHUT_RD` sets `recv_shutdown`, a local
+promise, which is all TCP has in that direction anyway. Neither frees the fd.
+
+### What the fixes are worth
+
+Same VM, same nginx, same config, `scripts/probes/listener_backlog_churn.py`
+and `scripts/benchmarks/bench_nic_rtt.py`:
+
+| | before | after |
+|---|---|---|
+| nginx, churned connections survived | died at **80** | **1088**, pool back to `32/0/0` |
+| `httpd`, churned connections survived | died at **24** | **1088** |
+| `--mode http`, 300 samples | 100 % timeouts, unusable | 0 errors, p50 **732 us** |
+| nginx read-to-EOF, per request | 5007 ms | **2.6 ms** |
+| `--mode connect` p50 | 130.5 us | 127.3 us (unchanged; no cost from the sweep) |
+
+`--mode http` is now measurable, and because both arms are the same nginx it is
+a legitimate cross-kernel number for once — 300 samples, 0 errors both sides:
+
+| | Akuma | Docker |
+|---|---|---|
+| min | 466.8 us | 378.8 us |
+| p50 | 732.4 us | 461.2 us |
+| p90 | 3001.4 us | 522.2 us |
+| p99 | 5879.8 us | 638.9 us |
+
+The median is 1.6x and the tail is 6-9x — the same shape `echo` showed, and
+the same scheduler-tick tail this repo has been chasing elsewhere. That is
+what is left; it is a latency problem, not a correctness one.
+
+### What was NOT fixed here
+
+The `SCM_RIGHTS` gap from E2 above is untouched: `sendmsg`/`recvmsg` over
+`AF_UNIX` still drop `msg_control` on the floor, so `worker_processes 2` still
+logs `recvmsg() returned invalid ancillary data level 0 or type 0`. It is a
+real, independent gap — it just is not what was breaking nginx, and with a
+single worker now surviving churn there is no longer any reason to reach for a
+second one to work around E1.
+
+`/var/lib/nginx/logs` being a file rather than a directory (the `write() to
+"…/access.log" failed (20: Not a directory)` alert) is still there and is still
+a stock-Alpine packaging gap, not a kernel one. It was never causal; it was
+recorded above only because it was the one new log line that coincided with the
+failure.
+
 ## Net effect on the original question
 
 "How much would user syscalls cost, or stubbing them?" — the real
@@ -468,13 +643,22 @@ problem in the sense the opening question assumed — they're all either
 "accept and ignore, we don't need the real behavior" or "don't leak/desync
 kernel state across a call real programs make more than once."
 
-What's left (Issue E) isn't a missing syscall either: it's real load-bearing
-behavior — connection lifecycle bookkeeping under churn, and `SCM_RIGHTS`
-ancillary data over `AF_UNIX` sockets — that nothing in A-D needed and that
-only showed up once the benchmark started exercising nginx harder than "does
-it start and answer one request." `connect` and `echo` say the fast path is
-genuinely competitive with Docker; E is what stands between that and a
-server that survives real traffic.
+Issue E wasn't a missing syscall either — with one exception that turned out
+to be the whole `http`-mode story: `shutdown(2)` was a stub. The rest was real
+load-bearing behaviour nothing in A-D needed, and it only showed up once the
+benchmark exercised nginx harder than "does it start and answer one request":
+a listener backlog that could erode without ever being swept, and a reset
+connection that no reader could be woken from. Both are the same shape as
+Issue D — kernel state that desyncs across a call real programs make all the
+time — and neither is nginx-specific in the slightest; `userspace/httpd` died
+of them faster than nginx did.
+
+The one item from Issue E still open is `SCM_RIGHTS` over `AF_UNIX`, which
+nothing needs until someone runs a second nginx worker.
+
+Running total: **eight** kernel fixes to get an unmodified upstream nginx from
+"won't start" to "serves real traffic and survives churn", and not one of them
+was the "add the user syscalls" the opening question budgeted for.
 
 ## Background
 

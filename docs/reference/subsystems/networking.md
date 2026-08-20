@@ -328,6 +328,50 @@ stack looked fine. The tell was sshd's `[PSTATS]` line: `accept=N` climbing with
 ever been accepted since boot. Compare that against a known-good boot before
 suspecting the network.
 
+### The listener is a pool, and it has to be swept
+
+`SocketType::Listener` is not one smoltcp socket but `MAX_BACKLOG` of them,
+each already in `Listen` on the same port; a SYN lands on whichever one smoltcp
+matches first, and `accept()` hands that handle out and creates a replacement.
+The invariant that matters is that **a handle must always find its way back to
+`Listen`**, and until 2026-08-20 one path did not: a connection that completed
+its handshake and was then reset *before* anyone accepted it went to `Closed`
+and stayed there. Nothing ever called `listen()` on a pool handle again.
+
+Connect-then-RST churn — `SO_LINGER 0`, which is what a load generator, an
+impatient client and a port scanner all do — therefore ground the pool down one
+handle at a time. At zero listening handles the port answers every SYN with a
+RST, for every process on it, permanently, until the listening fd is closed and
+rebuilt. It looks exactly like the server having broken, which is how it was
+first misdiagnosed: restarting nginx "fixed" it, because a restart rebuilds the
+pool.
+
+`listener_refresh` (`crates/akuma-net/src/socket.rs`) is the sweep. It runs on
+both paths a server can reach the listener through — `accept()` and the poller
+(`socket_can_recv_tcp`), the latter mattering because an event-driven server
+never calls `accept` until a poll tells it to — and recycles any handle that is
+not `Listen`/`SynReceived`/`Established`/`CloseWait` by `abort()` + `listen()`
+**on the same handle**, so a listener under churn allocates nothing and cannot
+be starved by a full socket table. `CloseWait` is deliberately *not* recycled
+and *is* acceptable: a client that sent its whole request and closed leaves the
+request sitting in that handle's receive buffer.
+
+To see the pool, read the `BACKLOG` column of `/proc/net/tcp` —
+`listening/pending/dead` per listener:
+
+```
+LOCAL_PORT,REMOTE_ADDR,STATE,BOX,BACKLOG
+8080,0.0.0.0:0,LISTEN,0,32/0/0
+```
+
+A healthy listener sits at `N/0/0`. `dead` climbing is a listener eroding
+toward permanent deafness; `0/0/N` is one that has already stopped answering.
+The regression probe is
+[`scripts/probes/listener_backlog_churn.py`](../../../scripts/probes/listener_backlog_churn.py),
+which escalates churn counts until the listener stops answering and takes a
+Linux target as its reference arm. Background:
+[`../../archive/NGINX_MISSING_SYSCALLS.md`](../../archive/NGINX_MISSING_SYSCALLS.md) Issue E.
+
 ### Divergences from Linux (native stack)
 
 These are the ones that change observable client behaviour. Several look like
@@ -344,9 +388,10 @@ client bugs from userspace.
 | blocking UDP `recvfrom` | `ETIMEDOUT` after 10 s | blocks indefinitely |
 | blocking `accept` | no timeout | no timeout |
 | `SO_RCVBUF` / `SO_SNDBUF` | accepted and ignored; buffers are fixed at 16 KB each direction (`TCP_{RX,TX}_BUFFER_SIZE`) | honoured |
-| `shutdown(2)` | no-op returning 0 | half-closes the connection |
+| `shutdown(2)` | implemented 2026-08-20. `SHUT_WR` sends the FIN (smoltcp `close()` → `FinWait1`, so the socket can still receive); `SHUT_RD` is local-only (`KernelSocket::recv_shutdown`, later `recv`s report EOF). Neither frees the fd | half-closes the connection |
 | `TCP_NODELAY` | tracked, but Nagle is off unconditionally (`set_nagle_enabled(false)`) and delayed ACK is disabled | configurable |
-| listen backlog | a **hard** ceiling of pre-created sockets (8, or 32 with `many-sessions`), not a hint — past it the peer gets RST | soft SYN-queue hint |
+| listen backlog | a **hard** ceiling of pre-created sockets (8, or 32 with `many-sessions`), not a hint — past it the peer gets RST. Self-healing since 2026-08-20; census in `/proc/net/tcp`'s `BACKLOG` column | soft SYN-queue hint |
+| `recv` on a connection the peer **reset** | `ECONNRESET`. Distinct from a graceful FIN, which stays `read() == 0` | same |
 | address families | `AF_INET` only; `AF_INET6` is `EAFNOSUPPORT` | both |
 | socket budget | 128 fds (`socket::MAX_SOCKETS`) over 32–256 smoltcp sockets depending on features, 32 KB of heap each | ulimit-bound |
 

@@ -120,6 +120,10 @@ errno_table! {
     EADDRNOTAVAIL = 99;
     ENETDOWN = 100;
     ECONNABORTED = 103;
+    /// The peer aborted an established connection (RST). Distinct from a
+    /// graceful FIN, which is `read() == 0` — see
+    /// `akuma_net::socket::socket_recv`.
+    ECONNRESET = 104;
     EISCONN = 106;
     ENOTCONN = 107;
     ETIMEDOUT = 110;
@@ -211,6 +215,7 @@ mod tests {
             ("EADDRNOTAVAIL", EADDRNOTAVAIL, 99),
             ("ENETDOWN", ENETDOWN, 100),
             ("ECONNABORTED", ECONNABORTED, 103),
+            ("ECONNRESET", ECONNRESET, 104),
             ("EISCONN", EISCONN, 106),
             ("ENOTCONN", ENOTCONN, 107),
             ("ECONNREFUSED", ECONNREFUSED, 111),

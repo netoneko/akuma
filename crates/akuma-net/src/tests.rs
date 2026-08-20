@@ -331,7 +331,7 @@ mod recv_eof_state_tests {
     fn a_connecting_socket_with_no_data_is_not_readable() {
         for s in PRE_ESTABLISHED {
             assert!(
-                !tcp_recv_ready(false, false, s),
+                !tcp_recv_ready(false, false, s, false),
                 "{s:?} with no buffered data must not be readable"
             );
         }
@@ -341,7 +341,7 @@ mod recv_eof_state_tests {
     fn a_real_fin_is_readable_so_recv_can_report_eof() {
         for s in POST_ESTABLISHED {
             assert!(
-                tcp_recv_ready(false, false, s),
+                tcp_recv_ready(false, false, s, false),
                 "{s:?} with the read side finished must be readable for the EOF"
             );
         }
@@ -353,8 +353,8 @@ mod recv_eof_state_tests {
     #[test]
     fn buffered_data_is_always_readable() {
         for s in PRE_ESTABLISHED.iter().chain(POST_ESTABLISHED.iter()) {
-            assert!(tcp_recv_ready(true, false, *s), "{s:?} with data must be readable");
-            assert!(tcp_recv_ready(true, true, *s), "{s:?} with data must be readable");
+            assert!(tcp_recv_ready(true, false, *s, false), "{s:?} with data must be readable");
+            assert!(tcp_recv_ready(true, true, *s, false), "{s:?} with data must be readable");
         }
     }
 
@@ -362,7 +362,80 @@ mod recv_eof_state_tests {
     /// not ready — the ordinary "wait for more" case.
     #[test]
     fn an_open_idle_connection_is_not_readable() {
-        assert!(!tcp_recv_ready(false, true, State::Established));
-        assert!(!tcp_recv_ready(false, true, State::FinWait1));
+        assert!(!tcp_recv_ready(false, true, State::Established, true));
+        assert!(!tcp_recv_ready(false, true, State::FinWait1, true));
+    }
+
+    /// The reset case, and why `was_connected` had to exist.
+    ///
+    /// A connection reset after it was serving ends up in `Closed` — the same
+    /// state a socket that was never connected sits in. Judged by state alone
+    /// it is "not established yet", so a blocking `recv()` parked on it waited
+    /// for a readability that could never come: `userspace/httpd` accepted one
+    /// churned connection and never returned to `accept()` again
+    /// (`docs/archive/NGINX_MISSING_SYSCALLS.md` Issue E1).
+    #[test]
+    fn a_reset_connection_is_readable_so_recv_can_report_the_reset() {
+        assert!(
+            tcp_recv_ready(false, false, State::Closed, true),
+            "a Closed socket that WAS connected is a reset and must wake the reader"
+        );
+        assert!(
+            !tcp_recv_ready(false, false, State::Closed, false),
+            "a Closed socket that was never connected is still 'nothing yet'"
+        );
+    }
+
+    /// `was_connected` only ever *adds* readiness for the no-data case; it must
+    /// not make a live, quiet connection look readable.
+    #[test]
+    fn history_does_not_make_an_open_connection_readable() {
+        for s in [State::Established, State::FinWait1, State::FinWait2] {
+            assert!(!tcp_recv_ready(false, true, s, true), "{s:?} open and idle is not readable");
+        }
+    }
+}
+
+/// `backlog_handle_is_live` — which pool handles a listener can still serve
+/// with, and which have to be recycled.
+///
+/// A listener on Akuma is a pool of pre-`listen()`ed smoltcp sockets, and a
+/// handle leaves `Listen` as soon as a SYN lands on it. `accept()` replaces the
+/// handles it hands out; nothing replaced the ones that *died* before anyone
+/// accepted them, so connect-then-RST churn ground the pool down to zero
+/// listening handles and the port went permanently deaf — verified live on
+/// 2026-08-20 by watching `/proc/net/tcp`'s BACKLOG column go `32/0/0` →
+/// `0/0/32` (`docs/archive/NGINX_MISSING_SYSCALLS.md` Issue E1).
+#[cfg(feature = "smoltcp")]
+mod listener_backlog_tests {
+    use crate::socket::backlog_handle_is_live;
+    use smoltcp::socket::tcp::State;
+
+    /// `CloseWait` is deliberately live: the client sent its request and then
+    /// closed, and that request is still in this handle's receive buffer.
+    /// Recycling it would drop a complete, answerable request on the floor.
+    #[test]
+    fn a_handle_that_can_still_serve_is_live() {
+        for s in [State::Listen, State::SynReceived, State::Established, State::CloseWait] {
+            assert!(backlog_handle_is_live(s), "{s:?} can still serve a connection");
+        }
+    }
+
+    /// The regression itself: a backlog handle reset before it was accepted
+    /// lands in `Closed`, and it will never see another SYN unless something
+    /// calls `listen()` on it again.
+    #[test]
+    fn a_dead_handle_must_be_recycled() {
+        for s in [
+            State::Closed,
+            State::TimeWait,
+            State::Closing,
+            State::LastAck,
+            State::FinWait1,
+            State::FinWait2,
+            State::SynSent,
+        ] {
+            assert!(!backlog_handle_is_live(s), "{s:?} can never serve again — recycle it");
+        }
     }
 }

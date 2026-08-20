@@ -627,14 +627,24 @@ impl Filesystem for ProcFilesystem {
 
         if path == "net/tcp" {
             let sockets = akuma_net::socket::list_sockets();
-            let mut out = String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n");
+            // BACKLOG is listening/pending/dead over a listener's smoltcp handle
+            // pool, and `-` for everything else — see `SocketStat::backlog`. It is
+            // the only view of the one number that decides whether a port still
+            // answers.
+            let mut out = String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX,BACKLOG\n");
             for s in sockets {
-                let _ = writeln!(out, "{},{}.{}.{}.{}:{},{},{}",
+                let _ = write!(out, "{},{}.{}.{}.{}:{},{},{},",
                     s.local_port,
                     s.remote_ip[0], s.remote_ip[1], s.remote_ip[2], s.remote_ip[3],
                     s.remote_port,
                     s.state,
                     s.box_id);
+                let (listening, pending, dead) = s.backlog;
+                if listening == 0 && pending == 0 && dead == 0 {
+                    let _ = writeln!(out, "-");
+                } else {
+                    let _ = writeln!(out, "{listening}/{pending}/{dead}");
+                }
             }
             return Ok(out.into_bytes());
         }

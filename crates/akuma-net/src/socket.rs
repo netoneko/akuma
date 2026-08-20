@@ -151,6 +151,12 @@ pub enum SocketType {
     Listener {
         local_port: u16,
         handles: VecDeque<SocketHandle>,
+        /// How deep the pool is *supposed* to be. `handles.len()` can fall
+        /// below it when `socket_create` fails while refilling after an
+        /// `accept`, and without a target depth to compare against there was
+        /// nothing that could ever put the lost slot back — see
+        /// [`listener_refresh`].
+        backlog: usize,
     },
     /// A UDP socket with an optional default peer (set by connect)
     Datagram {
@@ -164,6 +170,11 @@ pub enum SocketType {
 // ============================================================================
 
 #[cfg(feature = "smoltcp")]
+// Five flags, each an independent per-fd fact with no state to share:
+// `tcp_nodelay`/`keepalive` are socket options, `connect_timed_out` and
+// `was_connected` are connection history. Bit-packing them would only make the
+// call sites that read exactly one of them harder to read.
+#[allow(clippy::struct_excessive_bools)]
 pub struct KernelSocket {
     pub inner: SocketType,
     pub bind_port: Option<u16>,
@@ -200,6 +211,23 @@ pub struct KernelSocket {
     /// connect reports `ETIMEDOUT` instead of the `ECONNREFUSED` a bare `Closed`
     /// socket would otherwise imply.
     pub connect_timed_out: bool,
+    /// This socket's TCP connection reached `Established` at least once —
+    /// set by `accept` (which only ever hands out a connection that did) and
+    /// by a `connect` that succeeded.
+    ///
+    /// smoltcp keeps no history: a connection **reset** after it was up lands
+    /// in `Closed`, which is also where a socket that has never been used
+    /// sits, so the state alone cannot tell "no more data ever" from "nothing
+    /// yet". [`tcp_reached_established`] therefore has to call `Closed`
+    /// not-established, and a blocking `recv()` on a reset connection waited
+    /// forever instead of reporting the reset. This flag is the missing
+    /// history — see `docs/archive/NGINX_MISSING_SYSCALLS.md` Issue E1.
+    pub was_connected: bool,
+    /// `shutdown(fd, SHUT_RD)` was called: every later `recv` reports EOF
+    /// without looking at the wire. smoltcp has no half-close for the receive
+    /// direction (TCP has no such thing on the wire either — it is purely a
+    /// local promise), so this bit is the whole implementation.
+    pub recv_shutdown: bool,
 }
 
 #[cfg(feature = "smoltcp")]
@@ -219,6 +247,8 @@ impl KernelSocket {
             wakers: Spinlock::new(Vec::new()),
             refs: 1,
             connect_timed_out: false,
+            was_connected: false,
+            recv_shutdown: false,
         })
     }
 
@@ -237,6 +267,8 @@ impl KernelSocket {
             wakers: Spinlock::new(Vec::new()),
             refs: 1,
             connect_timed_out: false,
+            was_connected: false,
+            recv_shutdown: false,
         })
     }
 
@@ -262,7 +294,7 @@ impl KernelSocket {
         let box_id = (runtime().current_box_id)();
         
         Some(Self {
-            inner: SocketType::Listener { local_port: port, handles },
+            inner: SocketType::Listener { local_port: port, handles, backlog: actual_backlog },
             bind_port: Some(port),
             box_id,
             tcp_nodelay: true,
@@ -272,6 +304,8 @@ impl KernelSocket {
             wakers: Spinlock::new(Vec::new()),
             refs: 1,
             connect_timed_out: false,
+            was_connected: false,
+            recv_shutdown: false,
         })
     }
 
@@ -806,10 +840,25 @@ pub const fn tcp_reached_established(state: tcp::State) -> bool {
 ///
 /// Buffered data always wins. Absent data, EOF is only real once the
 /// connection has been up — see [`tcp_reached_established`].
+///
+/// `was_connected` is [`KernelSocket::was_connected`], and it is what covers
+/// the one state `tcp_reached_established` cannot classify on its own:
+/// `Closed`. A connection **reset** after it was serving lands in `Closed`,
+/// which is indistinguishable by state alone from a socket that has never been
+/// connected — so without this bit a blocking `recv()` on a reset connection
+/// waited for readability that could never arrive, and the reader hung
+/// forever. That is not hypothetical: it is how `userspace/httpd` died after
+/// 24 connect-then-RST connections, accepting one and then blocking on it for
+/// good (`docs/archive/NGINX_MISSING_SYSCALLS.md` Issue E1).
 #[cfg(feature = "smoltcp")]
 #[must_use]
-pub const fn tcp_recv_ready(can_recv: bool, may_recv: bool, state: tcp::State) -> bool {
-    can_recv || (!may_recv && tcp_reached_established(state))
+pub const fn tcp_recv_ready(
+    can_recv: bool,
+    may_recv: bool,
+    state: tcp::State,
+    was_connected: bool,
+) -> bool {
+    can_recv || (!may_recv && (was_connected || tcp_reached_established(state)))
 }
 
 /// Classify a socket's state into the action `connect` should take.
@@ -907,21 +956,131 @@ pub fn socket_listen(idx: usize, backlog: usize) -> Result<(), i32> {
     })
 }
 
+/// Can this backlog handle still take part in serving a connection?
+///
+/// `Listen` is waiting for a SYN, `SynReceived` is mid-handshake, and
+/// `Established`/`CloseWait` are connections `accept()` is about to hand out
+/// (`CloseWait` included deliberately: a client that sent its request and then
+/// closed leaves the handle there with the request still buffered — dropping
+/// it would lose a real, complete request).
+///
+/// Everything else — `Closed` above all — is a handle that will never serve
+/// another connection and must be recycled by [`listener_refresh`].
 #[cfg(feature = "smoltcp")]
-fn has_pending_connection(idx: usize) -> bool {
-    let mut result = false;
+#[must_use]
+pub const fn backlog_handle_is_live(state: tcp::State) -> bool {
+    matches!(
+        state,
+        tcp::State::Listen
+            | tcp::State::SynReceived
+            | tcp::State::Established
+            | tcp::State::CloseWait
+    )
+}
+
+/// Put a listener's backlog back the way `listen()` left it, and report whether
+/// a connection is waiting to be accepted.
+///
+/// **This is what keeps a port answering.** A listener here is not one socket
+/// but a pool of `MAX_BACKLOG` pre-`listen()`ed smoltcp sockets, and a pool
+/// entry leaves `Listen` the moment a SYN lands on it. `accept()` replaces the
+/// handles it hands out, but a handle that reaches `Established` and is then
+/// **reset before anyone accepts it** just goes to `Closed` and stays there:
+/// nothing in the old code ever called `listen()` on a pool handle again. Under
+/// connect-then-RST churn (`SO_LINGER 0`, which is what a load generator and
+/// any impatient client do) the pool eroded one handle at a time until zero
+/// were listening, at which point the kernel answered every SYN on that port
+/// with a RST — permanently, for every process, until the listening fd was
+/// closed and rebuilt. Measured directly on 2026-08-20 via the `BACKLOG`
+/// column this function's failure made necessary: `32/0/0` → `27/0/5` →
+/// … → `0/0/32`, nginx dead at the end of it
+/// (`docs/archive/NGINX_MISSING_SYSCALLS.md` Issue E1,
+/// `scripts/probes/listener_backlog_churn.py`).
+///
+/// Recycling is `abort()` + `listen()` on the same handle rather than a fresh
+/// `socket_create`: it reuses the buffers already allocated for that slot, so a
+/// listener under churn does no allocation at all and cannot be starved by a
+/// full socket table. The refill loop below is the second half — it only has
+/// work to do when an earlier `accept` could not allocate a replacement.
+#[cfg(feature = "smoltcp")]
+fn listener_refresh(idx: usize) -> bool {
+    let mut pending = false;
     with_table(|table| {
-        if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, .. }, .. })) = table.get(idx) {
-            for &handle in handles {
-                let state = with_network(|net| net.sockets.get::<tcp::Socket>(handle).state());
-                if state == Some(tcp::State::Established) {
-                    result = true;
-                    break;
+        let Some(Some(KernelSocket {
+            inner: SocketType::Listener { handles, local_port, backlog },
+            ..
+        })) = table.get_mut(idx) else { return };
+        let port = *local_port;
+        let want = *backlog;
+
+        with_network(|net| {
+            for &handle in handles.iter() {
+                let socket = net.sockets.get_mut::<tcp::Socket>(handle);
+                let state = socket.state();
+                if backlog_handle_is_live(state) {
+                    if matches!(state, tcp::State::Established | tcp::State::CloseWait) {
+                        pending = true;
+                    }
+                    continue;
                 }
+                // Dead slot: hand it back to the pool as a fresh listener.
+                socket.abort();
+                let _ = socket.listen(port);
             }
+        });
+
+        // Slots lost entirely (an `accept` whose replacement `socket_create`
+        // came back empty). Cheap no-op in the normal case.
+        while handles.len() < want {
+            let Some(new_h) = smoltcp_net::socket_create() else { break };
+            with_network(|net| {
+                let _ = net.sockets.get_mut::<tcp::Socket>(new_h).listen(port);
+            });
+            handles.push_back(new_h);
         }
     });
-    result
+    pending
+}
+
+#[cfg(feature = "smoltcp")]
+fn has_pending_connection(idx: usize) -> bool {
+    listener_refresh(idx)
+}
+
+/// Listener readiness for a poller (`epoll`/`poll`), reaping dead backlog
+/// handles on the way past — the same maintenance `accept()` does, on the path
+/// an event-driven server actually spends its time in.
+///
+/// `None` means "not a listening socket", so the caller can fall through to its
+/// stream handling. Takes the socket-table lock itself: call it with no table
+/// lock held.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn listener_ready(idx: usize) -> Option<bool> {
+    let is_listener = with_socket(idx, |sock| matches!(sock.inner, SocketType::Listener { .. }))?;
+    if !is_listener {
+        return None;
+    }
+    Some(listener_refresh(idx))
+}
+
+/// The `(listening, pending, dead)` census of a listener's backlog pool, for
+/// `/proc/net/tcp` and tests. `None` for anything that is not a listener.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn listener_backlog_census(idx: usize) -> Option<(u16, u16, u16)> {
+    with_socket(idx, |sock| {
+        let SocketType::Listener { handles, .. } = &sock.inner else { return None };
+        let mut census = (0u16, 0u16, 0u16);
+        for &h in handles {
+            match with_network(|net| net.sockets.get::<tcp::Socket>(h).state()) {
+                Some(tcp::State::Listen) => census.0 += 1,
+                Some(s) if backlog_handle_is_live(s) => census.1 += 1,
+                _ => census.2 += 1,
+            }
+        }
+        Some(census)
+    })?
 }
 
 #[cfg(feature = "smoltcp")]
@@ -935,11 +1094,14 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
     }
 
     let (handle, addr) = with_table(|table| {
-        if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, local_port }, .. })) = table.get_mut(idx) {
+        if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, local_port, .. }, .. })) = table.get_mut(idx) {
              let port = *local_port;
              for (i, &handle) in handles.iter().enumerate() {
                 let state = with_network(|net| net.sockets.get::<tcp::Socket>(handle).state());
-                if state == Some(tcp::State::Established) {
+                // `CloseWait` as well as `Established`: the client may have sent
+                // its whole request and closed before anyone got here, and that
+                // request is still sitting in this handle's receive buffer.
+                if matches!(state, Some(tcp::State::Established | tcp::State::CloseWait)) {
                     let h = handles.remove(i).unwrap();
                     if let Some(new_h) = smoltcp_net::socket_create() {
                         with_network(|net| { let _ = net.sockets.get_mut::<tcp::Socket>(new_h).listen(port); });
@@ -971,6 +1133,11 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
         wakers: Spinlock::new(Vec::new()),
         refs: 1,
         connect_timed_out: false,
+        // By construction: `accept` only hands out a handle that reached
+        // `Established`, so a later `Closed` on it is a reset, not a socket
+        // that never connected.
+        was_connected: true,
+        recv_shutdown: false,
     };
     let new_idx = with_table(|table| {
         for (i, slot) in table.iter_mut().enumerate() {
@@ -1036,7 +1203,7 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
         return Err(libc_errno::ENETDOWN);
     };
     match connect_step(state_before) {
-        ConnectStep::AlreadyConnected => return Ok(()),
+        ConnectStep::AlreadyConnected => { mark_was_connected(idx); return Ok(()); }
         ConnectStep::InProgress if nonblock => return Err(libc_errno::EALREADY),
         // Blocking redial: wait for the in-flight connect to finish rather than
         // re-issuing the SYN.
@@ -1093,7 +1260,81 @@ fn finish_connect_wait(idx: usize, h: SocketHandle) -> Result<(), i32> {
         }).unwrap_or(true)
     }, Some(10_000_000));
 
-    connect_outcome(waited, with_network(|net| net.sockets.get::<tcp::Socket>(h).state()))
+    let outcome = connect_outcome(waited, with_network(|net| net.sockets.get::<tcp::Socket>(h).state()));
+    if outcome.is_ok() {
+        mark_was_connected(idx);
+    }
+    outcome
+}
+
+/// Record that this fd's connection reached `Established`. See
+/// [`KernelSocket::was_connected`].
+#[cfg(feature = "smoltcp")]
+fn mark_was_connected(idx: usize) {
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get_mut(idx) {
+            sock.was_connected = true;
+        }
+    });
+}
+
+/// `shutdown(2)` on a TCP socket: half-close without giving up the fd.
+///
+/// This was a `return 0` stub, and the missing FIN cost a full five seconds per
+/// request against nginx. nginx finishes a response with a *lingering close*
+/// (`ngx_http_set_lingering_close`): `shutdown(SHUT_WR)` first — which is what
+/// tells the client "response complete, EOF" — then it keeps reading whatever
+/// the client still has in flight for up to `lingering_timeout`, default 5 s.
+/// With the FIN silently dropped, a client reading to end-of-response saw
+/// nothing at all until nginx's 5 s timer expired and it closed for real:
+/// `--mode http` "times out waiting for connection close" in
+/// `docs/archive/NGINX_MISSING_SYSCALLS.md` Issue E, measured here at
+/// 5007 ms/request against 3 ms for `userspace/httpd`, which happens to
+/// `close()` immediately after its own `shutdown`.
+///
+/// `SHUT_WR` sends the FIN (smoltcp `close()`, so the socket lands in
+/// `FinWait1` and can still *receive* — nginx's lingering read depends on
+/// that). `SHUT_RD` is local-only bookkeeping, see
+/// [`KernelSocket::recv_shutdown`]. Neither frees the fd; only `close(2)` does.
+#[cfg(feature = "smoltcp")]
+pub fn socket_shutdown(idx: usize, how: i32) -> Result<(), i32> {
+    const SHUT_RD: i32 = 0;
+    const SHUT_WR: i32 = 1;
+    const SHUT_RDWR: i32 = 2;
+    if !matches!(how, SHUT_RD | SHUT_WR | SHUT_RDWR) {
+        return Err(libc_errno::EINVAL);
+    }
+
+    let handle = with_table(|table| {
+        let sock = table.get_mut(idx)?.as_mut()?;
+        if matches!(how, SHUT_RD | SHUT_RDWR) {
+            sock.recv_shutdown = true;
+        }
+        match sock.inner {
+            SocketType::Stream(h) => Some(h),
+            _ => None,
+        }
+    });
+
+    let Some(handle) = handle else {
+        // A listener or a UDP socket: nothing to half-close, but the fd is
+        // real, so this is not an error the caller should act on.
+        return Ok(());
+    };
+
+    if matches!(how, SHUT_WR | SHUT_RDWR) {
+        with_network(|net| net.sockets.get_mut::<tcp::Socket>(handle).close());
+        // Put the FIN on the wire now rather than at the next poll: the whole
+        // point of this call is that the peer learns about it promptly.
+        smoltcp_net::poll();
+    }
+
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get(idx) {
+            sock.wake_all();
+        }
+    });
+    Ok(())
 }
 
 #[cfg(feature = "smoltcp")]
@@ -1146,6 +1387,26 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
         }
     }).ok_or(libc_errno::EBADF)?;
 
+    // Latch the connection's history before parking on it. `accept`/`connect`
+    // already set this, but a fd that finished a NON-blocking connect has only
+    // ever been observed by the poller, so catch that here too: once the socket
+    // is seen in a post-handshake state, a later `Closed` on it is a reset and
+    // must wake this read rather than silently never satisfying it.
+    if with_socket(idx, |sock| sock.recv_shutdown).unwrap_or(false) {
+        return Ok(0);
+    }
+
+    let was_connected = with_table(|table| {
+        let sock = table.get_mut(idx)?.as_mut()?;
+        if !sock.was_connected
+            && with_network(|net| tcp_reached_established(net.sockets.get::<tcp::Socket>(handle).state()))
+                .unwrap_or(false)
+        {
+            sock.was_connected = true;
+        }
+        Some(sock.was_connected)
+    }).unwrap_or(false);
+
     // EOF is signalled ONLY by `!may_recv()` — the peer closed its send half (FIN) or the
     // connection was reset. `!is_active()` is deliberately NOT treated as EOF here: a live
     // ESTABLISHED socket can momentarily read `!is_active()` across smoltcp poll boundaries,
@@ -1156,13 +1417,13 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
         smoltcp_net::poll();
         let ready = with_network(|net| {
             let socket = net.sockets.get::<tcp::Socket>(handle);
-            tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state())
+            tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected)
         }).unwrap_or(true);
         if !ready { return Err(libc_errno::EAGAIN); }
     } else {
         wait_until(idx, || with_network(|net| {
             let socket = net.sockets.get::<tcp::Socket>(handle);
-            tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state())
+            tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected)
         // `rcvtimeo` (None = forever) replaces what used to be an unconditional
         // 30 s cap — the one a 35 s-delayed response tripped at 30069 ms, and
         // the one that made a 2 s `SO_RCVTIMEO` fire at 30041 ms. POSIX: a
@@ -1179,6 +1440,14 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
                 buf[..len].copy_from_slice(&data[..len]);
                 (len, len)
             }).map_err(|_| libc_errno::EIO)
+        } else if !socket.may_recv() && socket.state() == tcp::State::Closed && was_connected {
+            // A connection that was up and is now `Closed` was ABORTED — reset by
+            // the peer, or given up on by smoltcp's own timeout. A graceful FIN
+            // parks the socket in `CloseWait` and never reaches here, so this is
+            // never a clean end-of-stream and must not be reported as one:
+            // `Ok(0)` would tell an HTTP server "request complete" about a
+            // request that was cut in half.
+            Err(libc_errno::ECONNRESET)
         } else if !socket.may_recv() && tcp_reached_established(socket.state()) {
             // Real EOF: the peer closed its write half of a connection that was
             // up. A socket still in SynSent also answers `!may_recv()`, and
@@ -1304,6 +1573,20 @@ pub struct SocketStat {
     pub remote_port: u16,
     pub state: &'static str,
     pub box_id: u64,
+    /// Backlog census, listener rows only (`(listening, pending, dead)`); all
+    /// zero for every other socket type.
+    ///
+    /// A listener on Akuma is not one socket but a *pool* of `MAX_BACKLOG`
+    /// pre-`listen()`ed smoltcp sockets ([`SocketType::Listener`]), and the
+    /// only thing that keeps the port answering is that pool still holding
+    /// handles in `Listen`. That number was invisible until this column
+    /// existed: the row said `LISTEN` whether the pool had 32 listening
+    /// handles or none, which is exactly the state
+    /// `docs/archive/NGINX_MISSING_SYSCALLS.md` Issue E1 had to be diagnosed
+    /// blind. `dead` counts handles in a state that can never serve a
+    /// connection again (`Closed`, `TimeWait`, ...) — a non-zero, climbing
+    /// `dead` is a listener eroding toward permanent deafness.
+    pub backlog: (u16, u16, u16),
 }
 
 #[must_use]
@@ -1348,16 +1631,28 @@ pub fn list_sockets() -> Vec<SocketStat> {
                             remote_port: remote.1,
                             state: tcp_state,
                             box_id: slot.box_id,
+                            backlog: (0, 0, 0),
                         });
                     });
                 }
-                SocketType::Listener { local_port, .. } => {
+                SocketType::Listener { local_port, ref handles, .. } => {
+                    let mut listening = 0u16;
+                    let mut pending = 0u16;
+                    let mut dead = 0u16;
+                    for &h in handles {
+                        match with_network(|net| net.sockets.get::<tcp::Socket>(h).state()) {
+                            Some(tcp::State::Listen) => listening += 1,
+                            Some(st) if backlog_handle_is_live(st) => pending += 1,
+                            _ => dead += 1,
+                        }
+                    }
                     stats.push(SocketStat {
                         local_port,
                         remote_ip: [0;4],
                         remote_port: 0,
                         state: "LISTEN",
                         box_id: slot.box_id,
+                        backlog: (listening, pending, dead),
                     });
                 }
                 SocketType::Datagram { peer, .. } => {
@@ -1368,6 +1663,7 @@ pub fn list_sockets() -> Vec<SocketStat> {
                         remote_port: port,
                         state: "UDP",
                         box_id: slot.box_id,
+                        backlog: (0, 0, 0),
                     });
                 }
             }
