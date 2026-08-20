@@ -1,8 +1,12 @@
 # Getting nginx running on Akuma — what it actually cost
 
-**Status: FIXED. nginx serves real requests end-to-end** — `curl` gets a clean
-`HTTP/1.1 200 OK` from both inside the guest (loopback) and from the host via
-the forwarded port. 2026-08-20, `devbox-smoltcp`, apk `nginx-1.30.4-r1`.
+**Status: nginx starts and serves real requests end-to-end (Issues A-D
+FIXED)** — `curl` gets a clean `HTTP/1.1 200 OK` from both inside the guest
+(loopback) and from the host via the forwarded port. Benchmarked against
+Docker nginx over the NIC: `connect` is a dead heat, `echo` has a healthy
+median but a 12-24x tail, `http` mode and any sustained connection churn hit
+a still-open degradation (**Issue E**) that a second worker does not fix.
+2026-08-20, `devbox-smoltcp`, apk `nginx-1.30.4-r1`.
 
 Goal: run the official `nginx` package (not the Docker image) on the barest
 config possible and benchmark it against nginx-in-Docker. The opening question
@@ -298,6 +302,160 @@ twice (cosmetic curiosity now, not a blocker): any program that calls
 `listen()` twice on the same fd before `accept()`-ing anything will leak a
 backlog the same way, fork or no fork.
 
+## Benchmark: nginx vs Docker nginx, via the NIC
+
+Both arms run the *exact same* bare-bones config above (Docker's mounted
+read-only over the stock image's `/etc/nginx/nginx.conf`, `user nginx;`
+instead of `user root;` since Docker has real users). Client is the macOS
+host, both servers reached through a forwarded port —
+`scripts/benchmarks/bench_nic_rtt.py`, `SMP=4 MEMORY=4096` vs `docker run
+--cpuset-cpus=0-3 -m 4g`. Because both servers are the same program for once
+(unlike `userspace/httpd` vs nginx), all three of the script's modes are
+legitimately comparable here, not just `connect`.
+
+### `connect` — raw TCP handshake, isolates the stack
+
+500 samples, 0 errors both arms:
+
+| | Akuma | Docker |
+|---|---|---|
+| min | 108.4 us | 111.2 us |
+| p50 | 130.5 us | 132.3 us |
+| p90 | 173.0 us | 152.3 us |
+| p99 | 217.1 us | 254.1 us |
+| rate | 6567/s | 6567/s |
+
+Essentially a dead heat — a real change from this repo's historical baseline
+(`BENCHMARK_PERFORMANCE_ATTEMPT_0.md`: ~50 us akuma-fwd vs ~17 us docker-fwd,
+measured against redis). The loopback/networking work on this branch
+(`move loopback to noalloc path`, `more loopback interface gains`) shows up
+directly here.
+
+### `echo` — one request/response on an already-open keep-alive connection
+
+500 samples, 0 errors both arms (`--payload 'GET / HTTP/1.1\r\nHost: x\r\n
+Connection: keep-alive\r\n\r\n' --expect 'hello from akuma'`):
+
+| | Akuma | Docker |
+|---|---|---|
+| min | 79.7 us | 101.3 us |
+| p50 | 253.7 us | 140.3 us |
+| p90 | **2754.4 us** | 167.3 us |
+| p99 | **5352.6 us** | 221.6 us |
+| rate | 1469/s | 6972/s |
+
+Median is ~1.8x Docker's; the tail is 12-24x. Tight median + huge tail is the
+signature the benchmark script's own docstring calls out: some round trips
+are waiting for a scheduler tick (the `blocking_relax` WFI park) rather than
+for the wire. `min` being *lower* than Docker's says the fast path is
+genuinely fast — it's specifically the tail that costs.
+
+### `http` mode — never got clean numbers; see Issue E below
+
+Fresh connect + GET + read-until-close per sample. This is where connection
+churn (Issue E) showed up directly: it triggered the exact degradation this
+mode's rapid-fire pattern is built to.
+
+## Issue E — OPEN: nginx degrades under connection churn; 2 workers make it worse, not better
+
+**Status: OPEN, root cause not fixed.** Found while benchmarking (above), not
+while getting nginx to start. Distinct from Issues A-D: this is not "nginx
+can't start" but "nginx stops answering after enough traffic," and — as E2
+below shows — adding a second worker doesn't help; it adds a *new* failure
+mode on top.
+
+### E1: a `--mode connect` run leaves the worker permanently unable to answer
+
+500 handshakes with `SO_LINGER 0` (the benchmark script's own choice, so
+teardown is a single RST rather than a FIN exchange — see the script's
+docstring) against a single-worker nginx: the run itself completes cleanly
+(0 errors), but the *very next* real request afterward gets `Connection
+reset by peer` — consistently, indefinitely (30+ s of retries, no recovery).
+`ps`/`PSTATS` show the worker still alive, not crashed, not looping. The
+error log has one new line each time this state is entered:
+
+```
+write() to "/var/lib/nginx/logs/access.log" failed (20: Not a directory) while logging request
+```
+
+(`/var/lib/nginx/logs` is a file, not a directory, on this rootfs — a stock
+Alpine packaging gap, not a kernel bug; harmless on its own since nginx logs
+the alert and keeps serving — but it's the only new signal that lines up with
+when things stop working, so it's recorded here even though it wasn't
+confirmed as causal.)
+
+**Killing and restarting nginx fixes it instantly** — same kernel, same
+listening socket, same port, brand new worker, first request succeeds. So
+this is *worker-process* state degrading under heavy connect+immediate-RST
+load, not a kernel-level socket/fd leak that would survive the process exit.
+The natural read: nginx's own free-connection pool isn't being returned to
+correctly when a connection is accepted and then RST'd before any data
+exchange — 500 of those in a row exhausts something nginx tracks internally
+(`worker_connections`, default 512, is suspiciously close to 500). Not
+confirmed; whether the RST'd connections are being cleaned up on Akuma's side
+in a way nginx's accept/close bookkeeping doesn't expect is the open question.
+
+### E2: `worker_processes 2` doesn't recover from E1 — and adds its own bug
+
+Tried, at the point this doc was written, specifically to see if a second
+worker would let the listener keep serving while one worker degraded. It
+does not:
+
+- The same `--mode connect` churn test, run against 2 workers, hits E1
+  identically — the next real request gets `Connection reset by peer`,
+  every time, from every one of several follow-up attempts.
+- The churn test's own tail latency was *worse* with 2 workers, not better:
+  `p99` 2725 us vs 217 us single-worker, `max` 30816 us vs 398 us — some
+  extra contention or scheduling cost from the second worker, not a win.
+- A **new, distinct error appears only with 2 workers**, never with 1:
+  ```
+  recvmsg() returned invalid ancillary data level 0 or type 0
+  accept4() failed (103: Connection aborted)
+  ```
+  The first is nginx's inter-worker channel (`ngx_channel.c`) reading a
+  `recvmsg()` control message it doesn't recognize. With one worker there is
+  nothing to pass messages *to*, so this path is simply never exercised —
+  it's new precisely because `worker_processes 2` is new. Root cause traced
+  to `sys_sendmsg`'s `AF_UNIX` fast path (`src/syscall/net.rs`,
+  `fd_is_unix_socket(fd)` branch): it reads `msg_control`/`msg_controllen`
+  off the caller's `struct msghdr` but never forwards them — the whole branch
+  is `return super::fs::sys_write(fd, iov.iov_base, iov.iov_len)`, a plain
+  byte-stream write with **no ancillary-data support at all**. `sys_recvmsg`'s
+  matching branch does correctly zero `msg_controllen` back on the way out,
+  so this isn't as simple as "the field is garbage" — the exact mechanism by
+  which nginx ends up reading a non-empty, zeroed cmsg header wasn't chased
+  further, but the underlying gap is real and verified by inspection: **Akuma
+  has no `SCM_RIGHTS` (or any other ancillary data) support in `sendmsg`/
+  `recvmsg` over `AF_UNIX` sockets**, full stop. Any program that passes a fd
+  or credentials over a Unix socket — nginx's multi-worker channel is one,
+  but it's a standard enough pattern that others will hit it too — will find
+  the control data silently vanishes.
+- `accept4() failed (103: Connection aborted)` from the *other* worker in the
+  same run — matches a connection that reached the listener's backlog and
+  then died (RST or abort) before `accept()` could claim it, consistent with
+  the same churn pattern as E1, just observed from the kernel-error side
+  instead of the client side.
+
+**Net answer to "can 2 workers help it recover": no.** Given the same load
+that breaks a single worker, two workers break the same way *and* surface an
+unrelated, real ancillary-data gap that would block anything relying on
+`SCM_RIGHTS` over a Unix socket, independent of nginx or of E1.
+
+### Why `http` mode couldn't get clean numbers
+
+Separately from E1/E2: even on a freshly restarted, otherwise idle
+single-worker nginx, `--mode http` (fresh connect, send a minimal HTTP/1.0
+request, read until the peer closes) reliably times out — even with 100 ms
+gaps between samples, so it isn't rate/churn-related the way E1 is. A raw
+one-shot probe confirms the response body **is** delivered (`HTTP/1.1 200
+OK` and the 17-byte body arrive over a single `recv()`), so the connection
+just isn't closing promptly enough afterward for the client's
+read-until-EOF loop to see it inside the 5 s timeout. Whether this is nginx
+not calling `close()` in the code path this minimal a request takes, or
+Akuma's TCP stack delivering the FIN late for this specific short-lived-
+connection shape, is unresolved — flagging it here rather than chasing a
+fifth rabbit hole in the same session.
+
 ## Net effect on the original question
 
 "How much would user syscalls cost, or stubbing them?" — the real
@@ -309,6 +467,14 @@ no-ops (Issue B), one `epoll_wait` bookkeeping fix (Issue C), and one
 problem in the sense the opening question assumed — they're all either
 "accept and ignore, we don't need the real behavior" or "don't leak/desync
 kernel state across a call real programs make more than once."
+
+What's left (Issue E) isn't a missing syscall either: it's real load-bearing
+behavior — connection lifecycle bookkeeping under churn, and `SCM_RIGHTS`
+ancillary data over `AF_UNIX` sockets — that nothing in A-D needed and that
+only showed up once the benchmark started exercising nginx harder than "does
+it start and answer one request." `connect` and `echo` say the fast path is
+genuinely competitive with Docker; E is what stands between that and a
+server that survives real traffic.
 
 ## Background
 
