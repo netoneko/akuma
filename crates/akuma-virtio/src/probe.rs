@@ -7,6 +7,7 @@
 //! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.
 
 use akuma_primitives::mmio::MmioReg;
+use crate::transport::SteppedMmioTransport;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 /// Upper bound on virtio-mmio slots. The *actual* count is
@@ -109,7 +110,7 @@ pub fn find(device_id: u32) -> Option<(usize, usize)> {
 /// fails on the slot you cared about is still visible in the boot log — losing
 /// that was the one real cost of the reconciliation.
 #[must_use]
-pub fn probe(device_id: u32) -> Option<(usize, MmioTransport)> {
+pub fn probe(device_id: u32) -> Option<(usize, SteppedMmioTransport)> {
     probe_with(device_id, |i, transport| Some((i, transport)))
 }
 
@@ -124,7 +125,7 @@ pub fn probe(device_id: u32) -> Option<(usize, MmioTransport)> {
 /// turned "try the next virtio-blk" into "give up".
 pub fn probe_with<T>(
     device_id: u32,
-    mut make: impl FnMut(usize, MmioTransport) -> Option<T>,
+    mut make: impl FnMut(usize, SteppedMmioTransport) -> Option<T>,
 ) -> Option<T> {
     for (i, addr) in (0..num_slots()).map(|i| (i, slot_addr(i))) {
         if device_id_at(addr) != device_id {
@@ -143,7 +144,7 @@ pub fn probe_with<T>(
             continue;
         };
 
-        if let Some(made) = make(i, transport) {
+        if let Some(made) = make(i, SteppedMmioTransport::new(transport)) {
             return Some(made);
         }
     }

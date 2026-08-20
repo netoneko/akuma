@@ -1,9 +1,10 @@
 # Akuma on Firecracker: first boot, and the five reset-value assumptions it exposed
 
 **Date:** 2026-08-21
-**Result:** Akuma boots on Firecracker v1.16.1 under KVM on an Apple M4 Pro, reaches
-its idle loop with zero tripwire poison, passes its memory test suite, and drives
-virtio-blk. It does not yet mount ext2.
+**Result:** Akuma boots on Firecracker v1.16.1 under KVM on an Apple M4 Pro, mounts
+its ext2 root, runs the boot suite, and executes userspace processes. Seven bugs
+were fixed getting there; **six of the seven were the same mistake** — trusting a
+value that only QEMU happened to provide (§3).
 **Reproduce:** `docs/runbooks/run-on-firecracker.md`
 **Design:** `proposals/FIRECRACKER_PORT.md`
 
@@ -41,7 +42,10 @@ Timer frequency: 24000000 Hz
 Memory Tests: ALL PASSED
 [Block] Found virtio-blk at slot 0
 [Block] Capacity: 2048 MB (4194304 sectors)
-[FS] Initializing filesystem...          <- stops here
+[FS] Ext2 filesystem mounted at /
+[FS] Procfs mounted at /proc
+[FS] Files in root: 15
+Memory Tests: ALL PASSED
 ```
 
 Three predictions from `proposals/FIRECRACKER_PORT.md` confirmed empirically:
@@ -74,12 +78,13 @@ Virtualization.framework for nested virt. Fixing either alone changes nothing.
 
 Contrast with the Lima guest above, which is the same hardware doing it right.
 
-## 3. The theme: five places Akuma trusted a reset value
+## 3. The theme: six places Akuma trusted a value only QEMU provided
 
-Every single failure on the way to a boot was the same mistake in a different
-place — **depending on the value a register or address range happens to have
-because QEMU happens to provide it.** KVM is deliberately hostile to this, which
-is what made Firecracker such an effective test of the assumption.
+Every failure on the way to a working userspace was the same mistake in a
+different place — **depending on a value that happens to hold because QEMU
+happens to provide it.** KVM is deliberately hostile to this (its
+`reset_unknown()` actively poisons registers the architecture leaves UNKNOWN),
+which is what made Firecracker such an effective test of the assumption.
 
 Worth stating because it predicts where the *next* bugs are: not in logic, but in
 constants that were only ever validated against one machine.
@@ -191,6 +196,103 @@ installed once from `main.rs` via `set_kernel_text_window`. It is two relaxed
 atomic loads on the IRQ path, which sits right next to two `read_volatile`s of
 the trap frame, so the cost is in the noise — and it cannot invert.
 
+### 3.6 Firecracker validates the virtio handshake; QEMU does not
+
+The longest-lived symptom. Block init *looked* healthy —
+
+```
+[Block] Found virtio-blk at slot 0
+[Block] Capacity: 2048 MB (4194304 sectors)
+[Block] Block device initialized successfully
+[FS] Initializing filesystem...     <- and then nothing, forever
+```
+
+— so the obvious read was "ext2 mount hangs". It was not: the device had never
+been turned on.
+
+Firecracker validates every write to the virtio MMIO status register against an
+exact-match transition table
+(`src/vmm/src/devices/virtio/transport/mmio.rs`, `set_device_status`):
+
+```
+INIT                           -> ACKNOWLEDGE
+ACKNOWLEDGE                    -> ACKNOWLEDGE|DRIVER
+ACKNOWLEDGE|DRIVER             -> ACKNOWLEDGE|DRIVER|FEATURES_OK
+ACKNOWLEDGE|DRIVER|FEATURES_OK -> ACKNOWLEDGE|DRIVER|FEATURES_OK|DRIVER_OK
+```
+
+A write that is not exactly one of those pairs is discarded with a warning.
+`virtio-drivers` 0.7.5 (`src/transport/mod.rs:74-75`) writes:
+
+```rust
+self.set_status(DeviceStatus::empty());                              // 0x0
+self.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);   // 0x3
+```
+
+`0x0 -> 0x3` skips `0x0 -> 0x1`, so it is rejected and the status stays at
+`INIT`. Every subsequent queue write is then refused —
+`update virtio queue in invalid state 0x0` — and `activate()`, which Firecracker
+only runs on the exact transition to `DRIVER_OK`, never happens. No queues, no
+interrupts, no I/O. Config-space reads need no handshake, which is why the
+capacity was correct and the failure looked like a filesystem problem.
+
+The diagnostic that cracked it was **swapping the read-only virtiofs image for a
+writable local copy and getting byte-identical output.** That ruled out the disk
+and left the device.
+
+QEMU ORs status bits without validating order, which is why this had never
+surfaced.
+
+Fixed **without forking the dependency**: `crates/akuma-virtio/src/transport.rs`
+adds `SteppedMmioTransport`, a newtype that delegates the whole `Transport` trait
+to `MmioTransport` and overrides exactly one method, `set_status`, walking from
+the current status to the requested one through the intermediate milestones.
+Overriding `set_status` rather than the `begin_init` default method was
+deliberate: it needs no generic bounds, so it does not pull `bitflags` in as a
+direct dependency, and it fixes every caller rather than one path. There is no
+platform `#[cfg]` — the extra `ACKNOWLEDGE` write is a no-op on QEMU, so both
+machines now follow the spec-ordered sequence.
+
+Cost: `MmioTransport` was a concrete type parameter in ~15 places across
+`akuma-virtio` and `akuma-net`, all mechanically retyped to
+`akuma_virtio::VirtioTransport`.
+
+### 3.7 `SCTLR_EL1.SA0` — inherited SP-alignment checking killed every binary
+
+With ext2 mounted, the first userspace execution failed deterministically. Both
+`/bin/hello` processes died at the identical instruction:
+
+```
+[Exception] Unknown from EL0: EC=0x26, ISS=0x0 ELR=0x4000d8 — delivering SIGILL
+[PROC-EXIT] pid=20 name=/bin/hello code=-4
+```
+
+`EC=0x26` is an SP alignment fault. Measured directly rather than guessed:
+
+| | `SCTLR_EL1` | SA (bit 3) | SA0 (bit 4) |
+|---|---|---|---|
+| QEMU virt | `0x3490d185` | 0 | 0 |
+| Firecracker / KVM | `0x34c5d1dd` | **1** | **1** |
+
+`boot.rs` did `mrs sctlr_el1` → a chain of `orr` → `msr`, which **inherits every
+bit the reset value carried** and clears nothing. Under KVM that means EL0
+SP-alignment checking is on — a constraint this kernel's userspace ABI has never
+had to satisfy, because QEMU never enforced it.
+
+Fixed by clearing SA and SA0 explicitly, in `boot.rs` **and** in
+`secondary_entry_shared` (each PSCI-woken core resets its own `SCTLR_EL1`, so
+fixing the BSP alone would leave every secondary enforcing it).
+
+Deliberately *not* fixed by reconstructing `SCTLR_EL1` from scratch: the reset
+value carries the architecturally RES1 fields, and hand-rolling those is how you
+get a subtly wrong `SCTLR` on the next core revision. Only the bits Akuma has an
+opinion about are forced.
+
+**Left open by this fix:** whether the initial user SP is genuinely misaligned.
+SA0 exposed *something*; clearing it restores QEMU's behaviour rather than
+proving the stack is 16-byte aligned. If it is not, that is a latent ABI bug and
+SA0 could then be enabled deliberately as a guard. Worth a look.
+
 ## 4. What the port actually needed
 
 Smaller than the survey estimated, because the structural decision paid off.
@@ -204,6 +306,9 @@ Smaller than the survey estimated, because the structural decision paid off.
 | Boot asm maps **only** the UART | `src/boot.rs` |
 | L1[1] Normal vs Device, per machine | `src/boot.rs` (assembler `.if`) |
 | virtio stride/count become runtime | `akuma-primitives`, `akuma-virtio` |
+| Spec-ordered virtio status handshake | `crates/akuma-virtio/src/transport.rs` (new) |
+| `SCTLR_EL1` SA/SA0 forced off | `src/boot.rs`, `src/smp_shared.rs` |
+| Runtime kernel-text window | `crates/akuma-exec/src/mmu/mod.rs` |
 | virtio INTID base 48 → 32 | `src/main.rs` |
 | Kernel base via linker `--defsym` | `build.rs`, `linker.ld`, `src/config.rs` |
 | `platform-firecracker` feature | `Cargo.toml` |

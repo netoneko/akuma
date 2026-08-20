@@ -572,6 +572,19 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // before the first IRQ; a wrong window makes every legitimate frame look
     // poisoned (see `mmu::set_kernel_text_window`).
     mmu::set_kernel_text_window(config::KERNEL_PHYS_BASE, config::KERNEL_TEXT_END);
+    // Diagnostic: SCTLR_EL1 as it stands after boot.rs ORed its bits into the
+    // RESET value. The architecture leaves several SCTLR_EL1 fields UNKNOWN at
+    // reset, and KVM stamps UNKNOWN-reset registers with a poison pattern, so
+    // "or into whatever was there" inherits different behaviour per hypervisor.
+    // SA0 (bit 4) in particular enables EL0 SP-alignment checking.
+    {
+        let sctlr: u64;
+        // SAFETY: reading SCTLR_EL1 has no memory effects.
+        unsafe { core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr) };
+        safe_print!(96, "[SCTLR] EL1=0x{:x} SA={} SA0={}\n",
+            sctlr, (sctlr >> 3) & 1, (sctlr >> 4) & 1);
+    }
+
     platform::install_bootstrap_device_map();
     // SAFETY: still on the boot page table built by `boot.rs`, single-threaded,
     // before any user address space exists, and `boot_device_l3_phys()` is the L3

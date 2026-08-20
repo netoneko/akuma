@@ -53,10 +53,10 @@
 use akuma_virtio::VirtioHal;
 use core::sync::atomic::{AtomicU64, Ordering};
 use virtio_drivers::device::net::VirtIONetRaw;
-use virtio_drivers::transport::mmio::MmioTransport;
+use akuma_virtio::VirtioTransport;
 
 /// The virtio-net device type this crate binds. `16` is the virtqueue depth.
-pub type NetDev = VirtIONetRaw<VirtioHal, MmioTransport, 16>;
+pub type NetDev = VirtIONetRaw<VirtioHal, VirtioTransport, 16>;
 
 /// Bytes per frame slot: the 1514-byte MTU plus the virtio net header, rounded
 /// up. Also the minimum `VirtIONetRaw` will accept for a receive buffer

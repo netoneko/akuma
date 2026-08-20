@@ -16,7 +16,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
 use virtio_drivers::device::net::VirtIONetRaw;
-use virtio_drivers::transport::mmio::MmioTransport;
+use akuma_virtio::VirtioTransport;
 
 use akuma_virtio::VirtioHal;
 use crate::runtime::runtime;
@@ -391,7 +391,7 @@ static mut SOCKET_STORAGE: [SocketStorage<'static>; MAX_SOCKETS] = [SocketStorag
 // ============================================================================
 
 pub struct VirtioSmoltcpDevice {
-    inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>,
+    inner: VirtIONetRaw<VirtioHal, VirtioTransport, 16>,
     /// The single receive buffer of the pre-`net-noalloc` path.
     #[cfg(not(feature = "net-noalloc"))]
     rx_buffer: [u8; 2048],
@@ -416,7 +416,7 @@ pub struct VirtioSmoltcpDevice {
 
 impl VirtioSmoltcpDevice {
     #[must_use]
-    pub const fn new(inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>) -> Self {
+    pub const fn new(inner: VirtIONetRaw<VirtioHal, VirtioTransport, 16>) -> Self {
         Self {
             inner,
             #[cfg(not(feature = "net-noalloc"))]
@@ -937,7 +937,7 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
     log::info!("[SmolNet] Initializing network stack...");
     DHCP_ENABLED.store(enable_dhcp, Ordering::Relaxed);
 
-    let mut found_device: Option<VirtIONetRaw<VirtioHal, MmioTransport, 16>> = None;
+    let mut found_device: Option<VirtIONetRaw<VirtioHal, VirtioTransport, 16>> = None;
 
     if let Some((i, transport)) = akuma_virtio::probe::probe(akuma_virtio::device_id::NET) {
         log::info!("[SmolNet] Found virtio-net at slot {i}");

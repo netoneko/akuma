@@ -20,6 +20,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use spinning_top::Spinlock;
 use virtio_drivers::device::net::VirtIONetRaw;
+use akuma_virtio::VirtioTransport;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 use akuma_virtio::VirtioHal;
 use akuma_rump::{NicError, RawNic, TapNic};
@@ -28,7 +29,7 @@ use akuma_rump::{NicError, RawNic, TapNic};
 /// Wraps the `unsafe` `VirtIONetRaw` calls in the safe [`RawNic`] trait so the
 /// `akuma-rump` orchestration (and its host tests) need no virtio knowledge.
 struct VirtioRawNic {
-    inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>,
+    inner: VirtIONetRaw<VirtioHal, VirtioTransport, 16>,
 }
 
 impl VirtioRawNic {
@@ -79,7 +80,9 @@ pub fn init_at(addr: usize) -> Result<[u8; 6], &'static str> {
     let header_ptr =
         core::ptr::NonNull::new(addr as *mut VirtIOHeader).ok_or("tap: bad mmio addr")?;
     let transport =
-        unsafe { MmioTransport::new(header_ptr) }.map_err(|_| "tap: transport init failed")?;
+        VirtioTransport::new(
+        unsafe { MmioTransport::new(header_ptr) }.map_err(|_| "tap: transport init failed")?,
+    );
     let inner = VirtIONetRaw::new(transport).map_err(|_| "tap: VirtIONetRaw init failed")?;
 
     let nic = VirtioRawNic { inner };

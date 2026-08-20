@@ -1075,6 +1075,11 @@ secondary_entry_shared:
     dsb     sy
     isb
     // Enable MMU + caches (same SCTLR bits as boot.rs _boot_code).
+    //
+    // Including the two `bic`s: each PSCI-woken core gets its own SCTLR_EL1 with
+    // its own reset value, and KVM's has SA/SA0 set while QEMU's does not. Clearing
+    // them on the BSP alone would leave every secondary enforcing EL0 SP-alignment
+    // checks that this kernel's userspace has never satisfied. See boot.rs.
     mrs     x0, sctlr_el1
     orr     x0, x0, #1              // M  = MMU enable
     orr     x0, x0, #(1 << 2)      // C  = data cache
@@ -1082,6 +1087,8 @@ secondary_entry_shared:
     orr     x0, x0, #(1 << 14)     // DZE
     orr     x0, x0, #(1 << 15)     // UCT
     orr     x0, x0, #(1 << 26)     // UCI
+    bic     x0, x0, #(1 << 3)      // SA  = 0: no SP alignment check at EL1
+    bic     x0, x0, #(1 << 4)      // SA0 = 0: no SP alignment check at EL0
     msr     sctlr_el1, x0
     isb
 

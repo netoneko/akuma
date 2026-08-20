@@ -138,7 +138,25 @@ _boot_code:
     // Configure MMU registers
     bl      configure_mmu_regs
     
-    // Enable MMU
+    // Enable MMU.
+    //
+    // This reads SCTLR_EL1 and ORs bits in, which means it INHERITS whatever the
+    // reset value happened to contain. The architecture leaves several
+    // SCTLR_EL1 fields UNKNOWN at reset, and hypervisors disagree:
+    //
+    //   QEMU virt        SCTLR_EL1 = 0x3490d185   SA=0 SA0=0
+    //   Firecracker/KVM  SCTLR_EL1 = 0x34c5d1dd   SA=1 SA0=1
+    //
+    // So the bits below must be CLEARED explicitly, not merely left unset.
+    // Inheriting SA0 under KVM enabled EL0 SP-alignment checking, which this
+    // kernel's userspace ABI has never had to satisfy — every `/bin/*` binary
+    // took an SP alignment fault (EC=0x26) at its entry point and got SIGILL.
+    // See docs/archive/AKUMA_FIRECRACKER_KVM.md.
+    //
+    // Only the bits Akuma has an opinion about are forced. The rest of the reset
+    // value is left alone deliberately: it carries the architecturally RES1
+    // fields, and reconstructing those by hand is how you get a subtly wrong
+    // SCTLR on the next core revision.
     mrs     x0, sctlr_el1
     orr     x0, x0, #1              // M bit = MMU enable
     orr     x0, x0, #(1 << 2)       // C bit = data cache
@@ -146,6 +164,8 @@ _boot_code:
     orr     x0, x0, #(1 << 14)      // DZE = EL0 DC ZVA enable (Go runtime uses this for bulk zeroing)
     orr     x0, x0, #(1 << 15)      // UCT = EL0 access to CTR_EL0
     orr     x0, x0, #(1 << 26)      // UCI = EL0 cache maintenance (DC CVAU, IC IVAU)
+    bic     x0, x0, #(1 << 3)       // SA  = 0: no SP alignment check at EL1
+    bic     x0, x0, #(1 << 4)       // SA0 = 0: no SP alignment check at EL0
     msr     sctlr_el1, x0
     isb
     

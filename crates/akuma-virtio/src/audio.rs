@@ -73,7 +73,7 @@ mod imp {
 
     use spinning_top::Spinlock;
     use virtio_drivers::device::sound::{PcmFeatures, PcmFormat, PcmRate, VirtIOSound};
-    use virtio_drivers::transport::mmio::MmioTransport;
+    use crate::transport::SteppedMmioTransport;
 
     use crate::hal::VirtioHal;
     use crate::probe;
@@ -106,7 +106,7 @@ mod imp {
     /// Like `VirtioBlockDevice`, all access is serialized through the global
     /// `SOUND_DEVICE` Spinlock, so the `UnsafeCell`s are sound.
     pub struct VirtioSoundDevice {
-        inner: UnsafeCell<VirtIOSound<VirtioHal, MmioTransport>>,
+        inner: UnsafeCell<VirtIOSound<VirtioHal, SteppedMmioTransport>>,
         out_stream: u32,
         params: UnsafeCell<Params>,
         /// True once set_params+prepare+start have run for the current params.
@@ -119,7 +119,7 @@ mod imp {
     impl VirtioSoundDevice {
         #[inline]
         #[allow(clippy::mut_from_ref)]
-        fn inner_mut(&self) -> &mut VirtIOSound<VirtioHal, MmioTransport> {
+        fn inner_mut(&self) -> &mut VirtIOSound<VirtioHal, SteppedMmioTransport> {
             unsafe { &mut *self.inner.get() }
         }
 
@@ -194,7 +194,7 @@ mod imp {
         let device = probe::probe_with(probe::device_id::SOUND, |i, transport| {
             crate::safe_print!(48, "[SND] Found virtio-snd at slot {}\n", i);
 
-            let Ok(mut snd) = VirtIOSound::<VirtioHal, MmioTransport>::new(transport) else {
+            let Ok(mut snd) = VirtIOSound::<VirtioHal, SteppedMmioTransport>::new(transport) else {
                 akuma_primitives::console::print_str("[SND] Failed to init virtio-snd device\n");
                 return None;
             };

@@ -40,6 +40,7 @@ macro_rules! impl_display {
 
 pub mod hal;
 pub mod probe;
+pub mod transport;
 
 // The virtio-mmio device drivers. These lived in the kernel bin crate until they
 // followed the `Hal` and the probe loop they all shared into this one.
@@ -49,6 +50,14 @@ pub mod audio;
 
 pub use hal::VirtioHal;
 pub use probe::{device_id, num_slots, slot_addr, slot_addrs};
+
+/// The virtio-mmio transport every driver in this tree is built on.
+///
+/// A thin wrapper over `virtio_drivers`' `MmioTransport` that steps the device
+/// status register one milestone at a time, because Firecracker validates the
+/// virtio 1.0 §3.1.1 sequence strictly while QEMU does not. Read
+/// `transport`'s module header before changing anything here.
+pub use transport::SteppedMmioTransport as VirtioTransport;
 
 /// The tree's one heap-free print macro, re-exported so this crate's
 /// `crate::safe_print!(…)` call sites resolve.
