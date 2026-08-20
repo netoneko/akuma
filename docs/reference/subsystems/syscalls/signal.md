@@ -8,7 +8,9 @@ build/unwind lives in `src/exceptions.rs` (`try_deliver_signal`,
 `rt_sigsuspend`/`rt_sigtimedwait` see [`../scheduler.md`](../scheduler.md)
 "Blocking & wait/wake".
 
-> **Stability: C (active risk).** Last touched 2026-08-04 (fatal `SIG_DFL`
+> **Stability: C (active risk).** Last touched 2026-08-20 (`fork` gave the
+> child an empty disposition table instead of the parent's — see "Disposition
+> inheritance across fork and exec"); before that 2026-08-04 (fatal `SIG_DFL`
 > signals arriving via the pending queue were dropped, `tkill` was being
 > handed PIDs, and a `tkill`-pended signal could not interrupt a blocking
 > syscall — see "Default action for pended signals" and "EINTR from a pended
@@ -50,6 +52,38 @@ unconditionally, re-executing an already-*successful* `FUTEX_WAKE` with
 `try_deliver_signal` ORs `action.mask` and (unless `SA_NODEFER`) the delivered
 signal itself into the **per-thread** mask before jumping to the handler.
 SIGKILL/SIGSTOP bits are always stripped from that OR.
+
+## Disposition inheritance across fork and exec
+
+| | disposition table | POSIX |
+|---|---|---|
+| `fork` / `vfork` | private **copy** of the parent's (`SharedSignalTable::clone_for_fork`) | inherited |
+| `clone` with `CLONE_SIGHAND` (`clone_thread`) | the parent's table itself, shared by `Arc` | shared |
+| `execve` | caught (`UserFn`) → `Default`; `Ignore` preserved; done in place on the same table (`Process::load_image`) | same |
+
+`fork` handed the child a **fresh, all-`Default`** table until 2026-08-20,
+which silently un-installed every handler the parent had registered. Worth
+knowing about because of how narrow the observable blast radius is: `fork`
+immediately followed by `exec` is unaffected — `exec` resets caught handlers
+anyway — so only a process that forks and *stays in the same image* could ever
+see it. That is precisely the master/worker daemon shape.
+
+The failure it produced was two-headed, and neither head looked like a signal
+bug:
+
+1. The child could not be interrupted out of a blocking syscall.
+   `current_thread_has_pending_interrupt` (below) only reports an interrupt for
+   a `UserFn` handler, correctly — so with the disposition reset to `Default`
+   the predicate answered "nothing deliverable" on every pass and an idle
+   nginx worker sat in `epoll_pwait` through repeated `SIGTERM`s, looking
+   immune to `kill`.
+2. When the syscall did return for some unrelated reason, the `Default` action
+   **terminated** the process rather than running its handler — killing an
+   in-flight request instead of shutting down gracefully.
+
+Full account: [`../../../archive/FORK_LOSES_SIGNAL_HANDLERS.md`](../../../archive/FORK_LOSES_SIGNAL_HANDLERS.md).
+Regressions: `fork_signal_inheritance_tests` in
+`crates/akuma-exec/src/process/signal.rs`.
 
 ## rt_sigprocmask / rt_sigsuspend
 

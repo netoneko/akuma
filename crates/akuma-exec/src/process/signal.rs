@@ -23,6 +23,40 @@ impl SharedSignalTable {
             actions: Spinlock::new([SignalAction::default(); MAX_SIGNALS]),
         }
     }
+
+    /// A private copy of this table, for `fork`/`vfork`.
+    ///
+    /// POSIX: **`fork` inherits every signal disposition**; only `execve`
+    /// resets caught handlers (see `Process::load_image`, which does that part
+    /// correctly). `fork` used to hand the child a `new()` table instead —
+    /// all-`Default` — silently un-installing every handler the parent had
+    /// registered.
+    ///
+    /// That is invisible for the common `fork`+`exec` pair, because `exec`
+    /// would have reset the handlers anyway, which is why it survived so long.
+    /// It bites a process that forks and **stays** in the same image: a
+    /// master/worker daemon. nginx installs its `SIGTERM` handler in the master
+    /// before forking, so on Akuma the worker's disposition was `Default`, and
+    /// the consequences ran in both directions:
+    ///
+    /// - `current_thread_has_pending_interrupt` only reports an interrupt for a
+    ///   `UserFn` handler, so a `Default` disposition never broke the worker
+    ///   out of `epoll_pwait` — `SIGTERM` sat pending indefinitely and the
+    ///   worker looked immune to `kill`.
+    /// - When the syscall did eventually return for an unrelated reason, the
+    ///   `Default` action **terminated** the worker instead of running nginx's
+    ///   graceful-shutdown handler — killing the in-flight request with it.
+    ///
+    /// The copy is deep by construction: `SignalAction` is `Copy`, so the child
+    /// gets its own array and a later `sigaction` on either side is invisible to
+    /// the other, which is exactly what `fork` (as opposed to `CLONE_SIGHAND`)
+    /// requires.
+    #[must_use]
+    pub fn clone_for_fork(&self) -> Self {
+        Self {
+            actions: Spinlock::new(*self.actions.lock()),
+        }
+    }
 }
 
 /// Kill a process by PID
@@ -186,5 +220,82 @@ fn slot_still_owned_by(tid: usize, pid: Pid) -> bool {
             false
         }
         _ => true,
+    }
+}
+
+/// `fork` inherits signal dispositions; `CLONE_SIGHAND` shares them.
+///
+/// The regression is the difference between the two. A `fork` child must get a
+/// *copy* it can diverge from, and it must not start life with every handler
+/// un-installed — which is what a fresh `SharedSignalTable::new()` gave it, and
+/// what made nginx's worker unkillable by `SIGTERM` while parked in
+/// `epoll_pwait` (`docs/archive/FORK_LOSES_SIGNAL_HANDLERS.md`).
+#[cfg(test)]
+mod fork_signal_inheritance_tests {
+    use super::SharedSignalTable;
+    use crate::process::types::{SignalAction, SignalHandler};
+
+    /// SIGTERM is signal 15, and `actions` is indexed by `sig - 1`.
+    const SIGTERM_IDX: usize = 14;
+
+    fn table_with_sigterm_handler() -> SharedSignalTable {
+        let table = SharedSignalTable::new();
+        table.actions.lock()[SIGTERM_IDX] = SignalAction {
+            handler: SignalHandler::UserFn(0x1234),
+            flags: 0x4,
+            mask: 0,
+            restorer: 0x5678,
+        };
+        table
+    }
+
+    #[test]
+    fn a_fork_child_inherits_every_disposition() {
+        let parent = table_with_sigterm_handler();
+        let child = parent.clone_for_fork();
+        let action = child.actions.lock()[SIGTERM_IDX];
+        assert!(
+            matches!(action.handler, SignalHandler::UserFn(0x1234)),
+            "fork must carry the parent's handler over, not reset it to Default"
+        );
+        assert_eq!(action.flags, 0x4, "flags travel with the handler");
+        assert_eq!(action.restorer, 0x5678);
+    }
+
+    /// The other half: it is a *copy*, so `sigaction` on either side after the
+    /// fork is invisible to the other. Sharing is `CLONE_SIGHAND`'s job, and
+    /// that path passes the parent's `Arc` instead of calling this.
+    #[test]
+    fn the_copy_is_private_to_the_child() {
+        let parent = table_with_sigterm_handler();
+        let child = parent.clone_for_fork();
+
+        child.actions.lock()[SIGTERM_IDX] = SignalAction::default();
+        assert!(
+            matches!(parent.actions.lock()[SIGTERM_IDX].handler, SignalHandler::UserFn(_)),
+            "the child resetting its handler must not touch the parent's"
+        );
+
+        parent.actions.lock()[SIGTERM_IDX] = SignalAction {
+            handler: SignalHandler::Ignore,
+            ..SignalAction::default()
+        };
+        assert!(
+            matches!(child.actions.lock()[SIGTERM_IDX].handler, SignalHandler::Default),
+            "and the parent changing its own must not touch the child's"
+        );
+    }
+
+    /// Untouched signals stay `Default` — the copy must not invent anything.
+    #[test]
+    fn untouched_signals_stay_default() {
+        let child = table_with_sigterm_handler().clone_for_fork();
+        let actions = child.actions.lock();
+        for (i, action) in actions.iter().enumerate() {
+            if i == SIGTERM_IDX {
+                continue;
+            }
+            assert!(matches!(action.handler, SignalHandler::Default), "signal {} changed", i + 1);
+        }
     }
 }

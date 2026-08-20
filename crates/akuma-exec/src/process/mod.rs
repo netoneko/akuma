@@ -628,8 +628,10 @@ pub struct InheritOverrides {
     /// copy. `clone_thread`: `parent.fds.clone()`, i.e. the same table shared by
     /// `Arc` (`CLONE_FILES`).
     pub fds: Arc<SharedFdTable>,
-    /// `fork`/`vfork`: a fresh [`SharedSignalTable`]. `clone_thread`: the
-    /// parent's, shared by `Arc` (`CLONE_SIGHAND`).
+    /// `fork`/`vfork`: a private **copy** of the parent's dispositions
+    /// ([`SharedSignalTable::clone_for_fork`]) — POSIX inherits them across
+    /// fork, and only `execve` resets caught handlers. `clone_thread`: the
+    /// parent's table itself, shared by `Arc` (`CLONE_SIGHAND`).
     pub signal_actions: Arc<SharedSignalTable>,
     /// `0` for `fork`/`vfork`. For `clone_thread`, `child_tid_ptr` — but only when
     /// the caller passed `CLONE_CHILD_CLEARTID`, which is what earns the
@@ -2441,7 +2443,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         address_space: new_address_space,
         process_info_phys: process_info_frame.addr,
         fds: Arc::new(parent.fds.clone_deep_for_fork()),
-        signal_actions: Arc::new(SharedSignalTable::new()), // Fork creates fresh table
+        // A COPY of the parent's dispositions, not a fresh table: POSIX says
+        // fork inherits them. See `SharedSignalTable::clone_for_fork`.
+        signal_actions: Arc::new(parent.signal_actions.clone_for_fork()),
         clear_child_tid: 0,
     })?;
 
@@ -3034,7 +3038,8 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
         // THREAD_PID_MAP.  exec installs a fresh page.
         process_info_phys: parent.process_info_phys,
         fds: Arc::new(parent.fds.clone_deep_for_fork()),
-        signal_actions: Arc::new(SharedSignalTable::new()),
+        // Inherited, like fork's — see `SharedSignalTable::clone_for_fork`.
+        signal_actions: Arc::new(parent.signal_actions.clone_for_fork()),
         clear_child_tid: 0,
     })?;
     // `mmap_regions` is left empty by `inherit_from`: the child sees the parent's
