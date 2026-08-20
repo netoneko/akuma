@@ -187,7 +187,7 @@ and skips it — no synthetic event — instead of falling into the generic
 After this fix, both `nginx` processes stay alive indefinitely and the
 listener answers on `:8080` — but only when nothing tries to connect to it.
 
-## Issue D — OPEN: a listening socket that survives `fork()` never sees new connections
+## Issue D — FIXED: a second `listen()` call orphans the first call's backlog
 
 ### Symptom
 
@@ -210,85 +210,105 @@ state forever — confirmed by instrumenting `socket_can_recv_tcp`'s
 `Listener` branch (`src/syscall/net.rs`) to print every handle's state on
 each check; none ever moves.
 
-### Isolation
+### Isolation — and a wrong turn worth recording
 
 - A single, non-forking process (`busybox nc -l -p <port>`, or a second `nc`
   as the client) on a fresh boot: **works**. Data flows both directions.
-- `nginx` with `master_process off;` (the whole server runs in one process,
-  the "master" *is* the event loop — no `fork()` at all): **works**. `curl`
-  gets a clean `200 hello from akuma`.
-- `nginx` in its normal shape (master calls `listen()`, then `fork()`s a
-  worker that inherits the listening fd and runs the actual event loop):
-  **hangs**, reproducibly, on a fresh boot — not the flaky leftover-listener
-  noise from repeated manual testing seen earlier in this investigation
-  (`killall busybox` doesn't match on process name here since every busybox
-  applet shows as `{busybox}` or its own argv[0] in `ps`; a stale listener
-  from an earlier test can and did confuse one intermediate result — always
-  reboot to a clean VM before trusting a negative result here).
+- `nginx` with `master_process off;` (no `fork()` at all): **works**.
+- `nginx` in its normal shape (master `listen()`s, then `fork()`s a worker
+  that inherits the fd and runs the event loop): **hung**, reproducibly.
 
-So the fault isn't nginx, isn't the 8080 port, and isn't the 32-way backlog
-by itself — it is specifically **a listening socket that was `listen()`'d in
-one process and is later `accept()`-driven from a forked child**.
+That pattern — works without fork, fails with fork — pointed straight at
+"a listening socket can't survive `fork()`". It was the wrong turn. Two
+minimal, purpose-built C reproducers (cross-compiled with the host's
+`aarch64-linux-musl-gcc`, pushed to the VM), replicating fork+listen+accept
+in exactly nginx's shape — plain blocking `accept()` in the child, then a
+second version using non-blocking `accept()` driven by `epoll_wait` with
+edge-triggered eventfds registered ahead of the listener, `EPOLLRDHUP`,
+even `curl` specifically as the client instead of `nc` — **all worked**.
+Fork-plus-listening-socket is fine in general; something exclusive to real
+nginx was still missing. `box_id` isolation, the worker not driving
+`smoltcp_net::poll()`, and the wake-on-state-change path were all checked
+directly and ruled out along the way (each fires as expected).
 
-### What's ruled out
+### Cause
 
-- **`box_id` isolation filtering** (`crates/akuma-net/src/socket.rs:1299`,
-  `if current_box_id != 0 && slot.box_id != current_box_id`) — both master
-  and worker are box 0 (native process, not a `box run` container), so this
-  guard is inert (`0 != 0` is always false) for this case.
-- **The worker not driving the network stack** — `sys_epoll_pwait`'s internal
-  loop (`src/syscall/poll.rs`) calls `smoltcp_net::poll()` every iteration,
-  confirmed still running once every ~10ms for the whole 50+ second hang
-  (`epoll-tcp`/`epoll-listener` debug lines, `SYSCALL_DEBUG_EPOLL_EDGE`).
-- **The wake-on-state-change path in general** — `smoltcp_net::poll()` calls
-  `wake_all()` on every socket slot whenever `iface.poll()` reports
-  `SocketStateChanged`, and this is what makes the `nc`/`nc` and
-  `master_process off` cases work at all.
-- **`fcntl(F_SETOWN)`/`ioctl(FIOASYNC)` themselves** — those only gate whether
-  `fork()` gets called (Issue B); they don't touch socket state afterward.
+Root-caused by adding one targeted print to `sys_listen` (`src/syscall/
+net.rs`) and reading the ordering directly, rather than continuing to guess
+at reproducers:
 
-### What's not yet ruled out
+```
+[syscall] listen(fd=6, backlog=511) idx=2 pid=10
+[syscall] listen(fd=6, backlog=511) idx=2 pid=10
+[syscall] clone: forking PID 10 -> 11 (flags=0x11)
+```
 
-The socket table (`SOCKET_TABLE`) is refcounted and shared by index
-(`socket_clone_ref` on fork just bumps a count — `crates/akuma-exec/src/
-process/fd.rs`), so in principle both master and worker's `fd=6` point at the
-*same* global `KernelSocket`/`handles` list, and nothing about `fork()` should
-need to touch it. That it demonstrably does anyway is the open question.
-Leads worth checking next, roughly in order of likely payoff:
+nginx's master calls `listen()` on the same fd **twice**, both before the
+fork. `socket_listen` (`crates/akuma-net/src/socket.rs`) was not idempotent:
+every call unconditionally `.take()`s the table slot and builds a brand new
+`Listener` with `MAX_BACKLOG` (32) fresh smoltcp sockets. For the `Stream`
+variant it closes the old handle first; for `Listener` it did **not** —
+the old `handles: VecDeque<Handle>` was simply dropped, in Rust terms, with
+no call to `smoltcp_net::socket_close` on any of them.
 
-1. Whether `net.sockets` (the smoltcp `SocketSet`) or its backing storage
-   is genuinely kernel-global (mapped identically in every process's page
-   tables) or ends up, by some allocation path, inside memory that fork's
-   CoW logic treats as process-private — which would explain a
-   parent-vs-child divergence exactly at the fork boundary. This is the same
-   *shape* of bug as `project_cow_fork_mmap_region_extent.md` and
-   `project_relr_fork_parent_entry_point.md` in prior sessions, though
-   neither is this bug.
-2. Whether the *interface/device* half of the loopback path (recent work on
-   this branch: `move loopback to noalloc path`, `more loopback interface
-   gains`) has any per-process or per-thread state that a listening socket
-   depends on to actually receive a SYN, as opposed to a socket that
-   `connect()`s out.
-3. Whether accepting the connection needs to happen on the *same* box/thread
-   context that originally called `listen()` — i.e. whether there's a
-   thread-affinity assumption buried somewhere in the accept path that
-   `master_process off` trivially satisfies (same process) and the normal
-   fork'd-worker shape violates.
+Those 32 orphaned sockets don't go away: they're still live inside smoltcp's
+`SocketSet`, still bound and `Listen`-ing on port 8080 — just no longer
+referenced by `table[idx]`. The *second* `listen()` call's 32 fresh handles
+are what `table[idx].handles` now points to, and they're what
+`socket_can_recv_tcp`/`has_pending_connection`/`socket_accept` all walk. Two
+independent sets of 32 `Listen`-state sockets end up bound to the same port;
+smoltcp has no way to know one set is orphaned and will happily complete a
+handshake on either. Every SYN that landed on the orphaned first set went
+`Established` invisibly and sat there forever — `accept()` never saw it,
+because nothing was still looking at that set. That this reproduced 100% of
+the time (not intermittently) says smoltcp's internal matching order is
+stable — first-created-first-matched, so the orphaned set with the earlier
+allocation order won every single handshake.
 
-A minimal repro for whoever picks this up: any program that `listen()`s,
-`fork()`s, and lets the **child** `accept()` on the inherited fd. nginx is
-just the first thing that happened to hit it; it will affect anything shaped
-like a classic Unix preforking server.
+Why nginx calls `listen()` twice wasn't chased further — it reproduced
+identically across every run in this session, on an unmodified upstream
+Alpine `nginx` binary, so it's nginx's real behavior on this platform, not a
+test artifact. The kernel bug is that a second `listen()` shouldn't have been
+able to leak the first call's backlog regardless of why it happened; real
+Linux permits calling `listen()` again on a live socket purely to adjust the
+backlog depth, without disturbing the existing queue.
+
+### Fix
+
+`socket_listen` (`crates/akuma-net/src/socket.rs`) now closes **every**
+handle in an existing `Listener`'s `handles` list, the same way it already
+closed a single `Stream` handle, before replacing the table entry:
+
+```rust
+match sock.inner {
+    SocketType::Stream(h) => smoltcp_net::socket_close(h),
+    SocketType::Listener { handles, .. } => {
+        for h in handles { smoltcp_net::socket_close(h); }
+    }
+    _ => {}
+}
+```
+
+~10 lines. Verified end-to-end: `curl` gets a clean `HTTP/1.1 200 OK` /
+`hello from akuma`, repeatably, from both guest loopback and the host via the
+forwarded port.
+
+A minimal repro for anyone who wants to chase *why* nginx calls `listen()`
+twice (cosmetic curiosity now, not a blocker): any program that calls
+`listen()` twice on the same fd before `accept()`-ing anything will leak a
+backlog the same way, fork or no fork.
 
 ## Net effect on the original question
 
 "How much would user syscalls cost, or stubbing them?" — the real
 credential/user-syscall surface (Issue A) cost nothing; it was already done.
-What it actually cost to get nginx *this far* was two tiny accepting no-ops
-(Issue B, ~10 lines) and one bookkeeping fix in `epoll_wait` (Issue C, ~15
-lines) — both narrowly scoped, low-risk, and already landed on this branch.
-Issue D is the real remaining cost, and it's a networking/fork interaction
-bug, not a missing-syscall one; its size is unknown until root-caused.
+Getting nginx from "won't even start" to "serves real requests end-to-end"
+cost four small, narrowly-scoped kernel fixes, ~45 lines total: two accepting
+no-ops (Issue B), one `epoll_wait` bookkeeping fix (Issue C), and one
+`listen()` idempotency fix (Issue D). None of the four is a missing-syscall
+problem in the sense the opening question assumed — they're all either
+"accept and ignore, we don't need the real behavior" or "don't leak/desync
+kernel state across a call real programs make more than once."
 
 ## Background
 
