@@ -983,6 +983,22 @@ same `httpd`:
 `threading::blocking_relax_net` — `blocking_relax` without the leading
 `yield_now` — wired into `NetRuntime::blocking_relax` and nowhere else.
 
+### The absolutes above are ~12 % low — host contamination, deltas unaffected
+
+An orphaned `redis-benchmark` from a previous session (22.7 h at 100 % CPU, aimed
+at forwarded guest port 4444, so it pressured the stack under test as well as the
+host) was running for every arm in this table. Clean-host re-measure of the split
+arm: **1,494 req/s, p50 415.4 us, p90 725.8 us, p99 3,794.0 us**. All arms shared
+the handicap, so every comparison here stands; the absolutes are ~12 % low.
+**The Linux ratio is not quotable**: git dates the 1,641 control to `32f6f60a`,
+2026-08-19 22:50, ~18 h into the orphan's run, so the denominator is contaminated
+too — and asymmetrically, since the orphan pressured Akuma's forwarded port 4444
+as well as the host CPU while the Docker arm saw only CPU. Re-measure both sides
+on a clean host before quoting any percentage.
+Details and the two traps it exposed: `BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md`
+§ "Correction". Note p99 moved 0.4 % between contaminated and clean hosts —
+independent confirmation that the p99 floor is the timer tick, not load.
+
 ### Why it works, and why it must not be kernel-wide
 
 The socket waiter is woken by a *device interrupt*. With the yield, the park is a
@@ -1056,6 +1072,34 @@ from removing per-packet allocation.
 §9 and §12 fixed. They are no longer a regression. They still should not go
 default-on: added machinery for no measured gain. What they are now is *available*
 for the pipelined workload (redis) §7 says was never measured.
+
+**And redis — the pipelined shape §7 said they should suit — is neutral too.**
+Host client through the forwarded port (arm A), redis 8.8.0 from apk in the guest,
+20,000 requests, 20 clients, 64 B, median of 3, `--per-test --cooldown 12`:
+
+| test | P=1 no-rings | P=1 rings | P=16 no-rings | P=16 rings | P=16 delta |
+|---|---:|---:|---:|---:|---:|
+| GET | 14,296 | 14,440 | 166,667 | 168,067 | +0.8 % |
+| SET | 14,409 | 14,075 | 117,647 | 117,647 | 0.0 % |
+| **LPUSH** | 13,596 | 13,812 | 103,627 | 96,618 | **-6.8 %** |
+| **MSET** | 13,559 | 13,351 | 33,223 | 33,168 | **-0.2 %** |
+| PING_INLINE | 13,755 | 13,387 | 176,991 | 161,290 | -8.9 % |
+| PING_MBULK | 13,908 | 13,976 | 202,020 | 215,054 | +6.5 % |
+
+Mixed signs, nothing outside noise (spread reached 19-22 % in several cells).
+**LPUSH and MSET at P=16 are the cells to weight** — `bench_redis.py`'s header
+records them as the only ones where the *server* rather than the forwarder is the
+bottleneck — and both show no gain. **§7's "unmeasured against a pipelined
+workload, the shape they should suit" is now measured, and the answer is no.**
+Between this and the HTTP arm, the rings are neutral on both workload shapes; the
+case for turning `net-noalloc` on is now empty rather than merely unproven.
+
+Caveat on resolution: 3 repeats with up to 22 % spread cannot resolve a <20 %
+effect in the noisy cells. What carries the conclusion is the *consistent absence*
+of gain across 12 cells, not any single one. Driver:
+`scripts/benchmarks/run_redis_arm.py` (boots the arm, installs nothing — redis
+comes from `apk add redis`, since `box pull` is DEVBOX_ISSUES Issue 18 and still
+open).
 
 The mechanistically useful part is the time budget:
 

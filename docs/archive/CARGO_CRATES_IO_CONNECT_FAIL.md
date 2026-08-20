@@ -2,6 +2,30 @@
 
 **Status:** Root cause isolated. Reproducer confirmed in-VM. Fix not yet chosen.
 **Date:** 2026-08-11.
+
+> **2026-08-20 — read this first; the body below is left verbatim.** Two claims
+> in this doc do not survive a source trace, which is written up in
+> `docs/runbooks/cargo-cannot-reach-crates-io.md` § 3:
+>
+> 1. **"Non-blocking TCP connects … never complete" is the wrong shape.** The
+>    vendored libcurl this cargo links (`curl-sys-0.4.90+curl-8.21.0`) raises
+>    `CURLE_COULDNT_CONNECT` only when *no attempt is still ongoing*
+>    (`cf-ip-happy.c`, `cf_ip_ballers_run`); a hung connect keeps an attempt
+>    ongoing and cannot produce the message at 353 ms. Every attempt
+>    **hard-failed within about one round trip**. The `~300 ms` spacing is not
+>    `CURL_HEET_DEFAULT_QUEUESIZE`, which does not govern connect timing.
+> 2. **"The probe links dynamically against apk libcurl … the next step is to
+>    rebuild it with `static-curl`" is stale.** `userspace/nettest/rust/Cargo.toml`
+>    already carries `static-curl` + `static-ssl`, and the binary shipped in
+>    `bootstrap/bin/nettest` contains vendored `curl/lib/vtls/openssl.c` and the
+>    string `OpenSSL 3.6.3` — built twenty minutes *before* the commit that added
+>    this doc. Fix option 1 below is therefore already done, and unrecorded is
+>    only whether the 30/30 pass used that binary or the earlier dynamic one.
+>
+> What the trace does establish: a `SynSent` socket cannot die on its own (no
+> `set_timeout()` call site anywhere), so a `POLLHUP` on a live connecting fd has
+> only three possible origins, distinguishable by `revents`. See the runbook
+> § 3.4, and `userspace/nettest/rust/connect/` for the probe that reads them.
 **Symptom:** `cargo build`/`fetch` using **the nightly musl toolchain** (`/usr/local/bin/cargo`) inside a devbox-smoltcp VM loops on:
 
 ```

@@ -36,6 +36,53 @@ session against the same `httpd`. Per-run ranges are disjoint between arms
 effect is far outside the ~6 % session drift documented in
 [`AKUMA_NET_ISSUES.md`](AKUMA_NET_ISSUES.md) §11.7.
 
+## Correction: every absolute below was measured with a saturated host core
+
+Found at the end of the session: an **orphaned `redis-benchmark` from a previous
+session** (`-n 100000 -t set`, `redis_matrix.sh`'s defaults) had been running for
+**22.7 hours at 100 % CPU**, aimed at guest port 4444 — which QEMU forwards into
+the guest, so it was also firing connection attempts into the smoltcp stack under
+test the whole time. `redis_matrix.sh`'s own header warns about exactly this
+("orphaned load generators left by another session"); the session-start check
+looked for stray QEMU but not for load generators. **Add load generators to that
+check.**
+
+Re-measuring the split arm on a clean host, same protocol, fresh boot:
+
+| split arm | with orphan | clean host | delta |
+|---|---:|---:|---|
+| req/s | 1,339 | **1,494** | +11.6 % |
+| p50 | 481.7 us | **415.4 us** | -14 % |
+| p90 | 967.4 us | **725.8 us** | -25 % |
+| p99 | 3,807.7 us | **3,794.0 us** | **-0.4 %** |
+
+**Every A/B conclusion in this document stands** — all arms ran under the identical
+handicap, so the deltas are unaffected. What is wrong is the *absolutes*, which are
+~12 % low.
+
+**The Linux ratio is not quotable at all right now, in either direction.** Git
+dates the `1,641 req/s` control to `32f6f60a`, 2026-08-19 22:50 — about 18 h into
+the orphan's run (its 22.7 h of CPU at ~100 %, killed ~03:35 on 2026-08-20, puts
+its start near 05:07 on the 19th). So the control is contaminated too, and
+**asymmetrically**: the orphan hit Akuma through host CPU *and* connection pressure
+on forwarded guest port 4444, while the Docker arm saw only host CPU — its traffic
+never entered the container. Akuma carried the heavier handicap, so the clean-host
+ratio is probably better than the 1,494/1,641 = 91 % arithmetic suggests, but
+**both sides must be re-measured on a clean host before any ratio is quoted.**
+The 82 % figure quoted earlier in this session is superseded and was doubly wrong
+(contaminated Akuma numerator, contaminated Linux denominator).
+
+**p99 not moving is an accidental control worth keeping**: host contention costs
+throughput, p50 and p90, and does not touch p99. That is independent confirmation
+that the ~3 ms p99 floor is structural (one timer tick), not a load artifact.
+
+A second trap from the same episode: a re-measure taken on the **already-running**
+VM — after an `apk add` and a redis session — showed 814-988 req/s with p90 2,990-
+4,934 us, i.e. *worse* than the contaminated run. That was the §11.2 socket-table
+state, not the host: p50 was unchanged (448-480 us) while only the tail moved.
+**A clean-host re-measure still needs a fresh boot**; changing two variables
+measures neither.
+
 ## The regression
 
 `MEMORY=2048 SMP=4 cargo run --release`, default features, nothing else differing:
