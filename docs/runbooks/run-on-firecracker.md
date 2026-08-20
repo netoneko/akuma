@@ -10,8 +10,12 @@ means a Linux VM with nested virtualization — macOS itself never has `/dev/kvm
 and **Docker Desktop cannot provide it** (see §5). On AWS it means a `.metal`
 instance; this runbook is the local path.
 
-Design background and the constants behind every address here:
-`proposals/FIRECRACKER_PORT.md`.
+**The scripted path is `overlays/devbox-firecracker/`** — `host-setup.sh`,
+`guest-setup.sh`, `build.sh`, `run.sh`, in that order. This runbook explains what
+those do and how to debug when they fail; prefer the scripts for routine use.
+
+Platform invariants and constants: `docs/reference/firecracker/`.
+Design background: `proposals/FIRECRACKER_PORT.md`.
 
 ---
 

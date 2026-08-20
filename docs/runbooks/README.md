@@ -63,3 +63,4 @@ Start from the symptom or task on the left.
 4. End with **Verify** - the log lines / command output / SSH result that means
    it worked.
 5. Add a row to the triage matrix above.
+| Akuma on Firecracker / `/dev/kvm` on a Mac / microVM boot | [run-on-firecracker.md](run-on-firecracker.md) |
