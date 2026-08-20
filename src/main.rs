@@ -1371,7 +1371,11 @@ fn run_async_main() -> ! {
             uptime_us: timer::uptime_us,
             utc_seconds: timer::utc_seconds,
             yield_now: threading::yield_now,
-            blocking_relax: threading::blocking_relax,
+            // NOT `threading::blocking_relax` — the socket variant, which skips the
+            // `yield_now` before halting. Worth +27 % req/s and half the p90 here,
+            // and unsafe kernel-wide (it wedges the spawn/reap path at SMP=4).
+            // Rationale and the A/B numbers: `threading::blocking_relax_net`.
+            blocking_relax: threading::blocking_relax_net,
             // The blocking-socket waiter's park. Unlike `blocking_relax` this
             // marks the thread WAITING, which is what lets `wake_all()` on the
             // socket target it directly instead of leaving it to notice on a

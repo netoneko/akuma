@@ -3099,32 +3099,61 @@ pub fn idle_halt() {
 pub fn idle_halt() {}
 
 /// Cooperative wait for a blocking kernel loop that is polling for external
-/// progress (network data, a child exit, …) while holding the Big Kernel Lock.
+/// progress (a child exit, a pipe, …) while holding the Big Kernel Lock.
 ///
-/// Under shared-kernel SMP this is [`idle_halt`] — which DROPS the BKL around a WFI
-/// — so a peer core can enter the kernel and produce the progress this loop is
-/// waiting on. Without the drop the loop busy-spins holding the BKL, freezing every
-/// peer core: exactly the socket-recv / `exec_with_io_cwd` cross-core wedge (see
-/// docs/runbooks/debug-smp.md). We wake on the next interrupt — the timer tick, or
-/// the device IRQ that delivered the very thing we are waiting for — and the caller
+/// First [`yield_now`], so any thread already READY on this core runs. Then, under
+/// shared-kernel SMP only, [`idle_halt`] — which DROPS the BKL around a WFI — so a
+/// peer core can enter the kernel and produce the progress this loop is waiting on.
+/// Without the drop the loop busy-spins holding the BKL (nothing else READY on the
+/// core → `yield_now` returns without switching), freezing every peer core: exactly
+/// the socket-recv / `exec_with_io_cwd` cross-core wedge (see
+/// docs/runbooks/debug-smp.md). We wake on the next timer tick and the caller
 /// re-checks its condition.
 ///
-/// **There is deliberately no `yield_now` first.** It was there until 2026-08-20, on
-/// the reasoning that a thread already READY on this core should run before we halt.
-/// It is not what fixes the wedge — the BKL drop is (docs/runbooks/debug-smp.md) —
-/// and it costs a full scheduler pass plus an SGI on every park, ~2,400 times/s
-/// under network load, almost always finding nothing else READY. It is also what
-/// made per-core wake targeting unimplementable: a waiter that yields can resume on
-/// a core it never marked, so any affinity it records is stale by the time the NIC
-/// interrupt reads it (docs/archive/AKUMA_NET_ISSUES.md §11.4). The WFI still ends
-/// on the timer tick, so a READY peer thread on this core is delayed by at most one
-/// tick rather than starved.
+/// The `yield_now` is NOT redundant with the BKL drop, and 2026-08-20 measured what
+/// happens without it: at `SMP=4` the boot suite reaches 23 tests instead of 294 and
+/// wedges permanently in the spawn/reap path. Keep it here. The network stack uses
+/// [`blocking_relax_net`] instead, which is the variant without it — see there for
+/// why the two paths differ.
 ///
-/// Off `cfg(kernel_smp_shared)` this stays a plain `yield_now`: `idle_halt` compiles
-/// out there, so the yield is the whole function and dropping it would turn a
-/// cooperative wait into a spin.
+/// Off `cfg(kernel_smp_shared)` this is a plain `yield_now` — single-core / default
+/// builds are byte-for-byte unchanged (the `idle_halt` call compiles out).
 #[inline]
 pub fn blocking_relax() {
+    yield_now();
+    #[cfg(kernel_smp_shared)]
+    idle_halt();
+}
+
+/// [`blocking_relax`] for the **socket** wait loop (`akuma_net`'s `wait_until`),
+/// wired in through `NetRuntime::blocking_relax`.
+///
+/// Identical except that under `cfg(kernel_smp_shared)` it does NOT `yield_now`
+/// before halting. That single difference is worth +27 % on HTTP throughput and cuts
+/// p90 by half (A/B 2026-08-20, 5x2000 requests per arm, same session and same
+/// `httpd`: 1,028 -> 1,307 req/s, p90 2,411 -> 1,166 us, ranges disjoint):
+///
+/// | per NICSTAT window, matched at ~12,170 rx packets | with yield | without |
+/// |---|---:|---:|
+/// | `relax` parks | 11,263-11,753 | 54,137-69,406 |
+/// | us per park | 356-370 | 59-77 |
+/// | us per poll | 11.1-11.9 | 6.9-7.7 |
+///
+/// **Why the yield costs so much here specifically.** The socket waiter is woken by
+/// the NIC IRQ. With the yield, the park is a scheduler pass + SGI *before* the WFI
+/// is entered, so a packet arriving during that window ends no halt — the waiter
+/// reaches WFI just after its wake and sleeps to the next timer tick (~360 us
+/// observed). Without it the waiter is already in WFI when the packet lands and the
+/// device IRQ ends the halt directly (~70 us). More parks, each shorter, is the
+/// signature of wakes landing (docs/archive/AKUMA_NET_ISSUES.md §11.7).
+///
+/// **Why this is not done for [`blocking_relax`].** Dropping the yield kernel-wide
+/// reintroduces the cross-core wedge: at `SMP=4` the boot suite got 23 tests in and
+/// froze (294 with the yield). The spawn/reap waiters genuinely depend on running a
+/// READY peer on their own core; the socket waiter is woken by a device interrupt
+/// and does not.
+#[inline]
+pub fn blocking_relax_net() {
     #[cfg(not(kernel_smp_shared))]
     yield_now();
     #[cfg(kernel_smp_shared)]

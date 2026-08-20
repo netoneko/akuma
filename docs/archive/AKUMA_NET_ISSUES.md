@@ -965,6 +965,85 @@ Two notes, neither a bug today:
   material part of what it measured — ~0.9 us/poll at 128 slots, ~14 us at 2048,
   which inflated the first 2048-slot experiment.
 
+## 12. The `blocking_relax` yield: +30 %, and the SMP=4 wedge it hides (2026-08-20)
+
+Full write-up, including the regression and the method notes, in
+[`BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md`](BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md).
+Headline, 5 x 2000 requests per arm, all three arms in one session against the
+same `httpd`:
+
+| arm | req/s | p50 | p90 | p99 | SMP=4 boot suite |
+|---|---:|---:|---:|---:|---|
+| §9 baseline (yield + halt) | 1,028 | 601 us | 2,411 us | 4,703 us | 294 passed |
+| yield dropped for ALL callers | 1,307 | 502 us | 1,166 us | 3,874 us | **23, wedged** |
+| **yield dropped for sockets only** | **1,339** | **482 us** | **967 us** | **3,808 us** | **294 passed** |
+| Linux control (2026-08-19) | 1,641 | 576 us | 643 us | 882 us | — |
+
+**p50 is now below Linux** (482 vs 576 us) and p90 is down 60 %. What landed is
+`threading::blocking_relax_net` — `blocking_relax` without the leading
+`yield_now` — wired into `NetRuntime::blocking_relax` and nowhere else.
+
+### Why it works, and why it must not be kernel-wide
+
+The socket waiter is woken by a *device interrupt*. With the yield, the park is a
+scheduler pass + SGI **before** the WFI is entered, so a packet arriving in that
+window ends no halt: the waiter reaches WFI just after its own wake and sleeps to
+the next tick. Without it the waiter is already halted when the packet lands and
+the NIC IRQ ends the halt directly.
+
+The spawn/exec/reap waiters are woken by *another thread on their own core* and
+genuinely need the yield. Dropping it for them reintroduces the socket-recv /
+`exec_with_io_cwd` cross-core wedge: `SMP=4` freezes after 23 tests, twice,
+identically. Single-core cannot see this — the regression test SKIPs at `SMP=1`
+and the suite reports a clean 286/0.
+
+### The mechanism is finer-grained parking, NOT less parking
+
+Total parked time per packet is **342 us on both arms**. The parks go 11.6k x
+359 us -> 57k x 71 us — same total, 5x finer grain, so a wake lands within it. Every
+throughput-side cost moved <10 %. This is a wake-latency fix; the throughput came
+free. Full time budget (`scripts/benchmarks/nicstat_breakdown.py`) in the
+regression doc; inside `poll()` the stable split is `tx_wait` 31 %, smoltcp 62 %,
+`rx_post` 6 %, making `tx_wait` (22.5 us per TX packet) the largest named cost
+left and giving §11-item-3's static TX rings a specific thing to beat.
+
+### p99 is now tick-quantised
+
+p90 fell 60 % but p99 barely moved. `TIMER_INTERVAL_US = 3_000` and p99 is 3,808 us
+= one tick + ~800 us of real work: a single missed wake on the timer backstop.
+`poll max` agrees (3,504-3,698 us). **p99 cannot go below ~3 ms by further wake
+tuning** — either close the last lost wake, or shorten the tick, and 3 ms is
+already the HVF-safe floor (below ~2.5 ms darwin/arm64 refuses to sleep the vCPU
+and burns a saturated host core per guest core).
+
+### Two additions to §11.7's measurement discipline
+
+1. **Back-to-back runs walk into the §11.2 socket-table cliff.** Runs 4-5 of an arm
+   scored *half* runs 1-3 with no code change (1,030-1,077 -> 525-537 req/s), with
+   the full swallowed-wake signature (polls/pkt 6.4-7.0 -> 4.2, us/poll 11.3-12.2
+   -> 16.6-16.8, us/park 236-349 -> 531-585) produced by **run order alone**. Any
+   arm measured second would have been condemned. smoltcp holds `TimeWait` for
+   `CLOSE_DELAY` = 10 s; a 25 s settle between runs removes it entirely (5 runs
+   within 3 %). `run_nic_ab.py --settle` exists for this; do not lower it.
+2. **A single-core boot suite does not verify an SMP primitive.** 286/0 was a green
+   light on a kernel that freezes at `SMP=4`. Any `blocking_relax` change must be
+   run at `SMP=4`, and the acceptance signal is the line
+   `smp_shared_blocking_wait_peer_progress PASSED` — not the pass count, and
+   emphatically not the `[BKL] stuck` count, which is ~85 on healthy and wedged
+   kernels alike.
+
+### Harness added
+
+- `scripts/benchmarks/run_nic_ab.py` — boots one arm, starts `httpd`, runs N x 2000
+  with a settle window, slices the `[NICSTAT]` windows per run, prints medians.
+  Confirms readiness with a real ssh round trip, because `[herd] Started sshd`
+  arrives torn by console interleaving (`[herd] Started [syscall] socket(...)`)
+  often enough to cost an arm.
+- `scripts/benchmarks/nicstat_breakdown.py` — window counters -> time budget,
+  wall-vs-core and nesting handled.
+- `bench_nic_rtt.py` now parses the socket-table line (`sockets=N/CAP`,
+  `epoch_saves`) and `laps=`, which were previously dropped on the floor.
+
 ## Background
 
 - [`BENCHMARK_PERFORMANCE_ATTEMPT_0.md`](BENCHMARK_PERFORMANCE_ATTEMPT_0.md) §4
