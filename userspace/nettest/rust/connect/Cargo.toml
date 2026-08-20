@@ -1,0 +1,26 @@
+[package]
+name = "nettest-connect"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone crate: NOT a member of any workspace (repo root and userspace/
+# both target `aarch64-unknown-none`). Built by ../build-musl.sh.
+
+[[bin]]
+name = "nettest-connect"
+path = "src/main.rs"
+
+[dependencies]
+# The ONLY dependency, deliberately. This probe exists because every existing
+# reproducer of the cargo-cannot-reach-crates-io failure is four layers thick
+# (cargo -> curl crate -> libcurl -> OpenSSL). Nothing here may sit between the
+# probe and the syscall.
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+codegen-units = 1
+strip = true
+
+[workspace]

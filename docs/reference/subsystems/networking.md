@@ -106,6 +106,24 @@ spawn. Source: `crates/akuma-rump/src/syscall_translation.rs`,
 
 ## `connect(2)` semantics on the native stack
 
+**A connect is bounded.** `CONNECT_TIMEOUT_US` (10 s, `crates/akuma-net/src/smoltcp_net.rs`)
+caps how long a socket may sit in `SynSent`; `poll()` sweeps a small
+`connecting` list and aborts anything past the deadline, flagging it so
+`SO_ERROR` answers `ETIMEDOUT` rather than the `ECONNREFUSED` a bare `Closed`
+socket would imply. Until 2026-08-20 only the *blocking* path had a cap
+(`finish_connect_wait`), so a non-blocking connect to a black hole retransmitted
+its SYN forever — smoltcp never gives up unless a `timeout` is set, and nothing
+set one.
+
+smoltcp's own `Socket::set_timeout` is deliberately **not** used for this: it is
+an *inactivity* timeout armed in every state, so it would also abort an idle
+`Established` connection — an ssh session at a prompt, a keep-alive pool, or a
+stream whose next byte is slow, which is the exact class
+[`../../archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md`](../../archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md)
+spent four bugs eliminating. Verified 2026-08-20: a connect to `10.255.255.1`
+ends at 10 002 ms with `SO_ERROR=110`, while an idle SSH session survives 25 s.
+
+
 smoltcp's `tcp::Socket::connect` refuses any socket that is not `Closed`, so the
 socket layer classifies the current TCP state *before* dialing
 (`connect_step`, `crates/akuma-net/src/socket.rs`):
@@ -321,6 +339,8 @@ client bugs from userspace.
 | blocking `write`/`send` on TCP | blocks indefinitely, or until `SO_SNDTIMEO` | same |
 | `SO_RCVTIMEO` / `SO_SNDTIMEO` | honoured; `struct timeval`, zero means "block forever", readable back via `getsockopt` | same |
 | blocking `connect` | `ETIMEDOUT` after 10 s | ~2 min (`tcp_syn_retries`) |
+| non-blocking `connect` | `ETIMEDOUT` after 10 s (`CONNECT_TIMEOUT_US`), reported via `SO_ERROR` + `EPOLLHUP` | ~2 min (`tcp_syn_retries`) |
+| `select(2)` `exceptfds` | always answered "none" — Akuma has no out-of-band data — but the set **is** written on every return path | set per real OOB/exceptional state |
 | blocking UDP `recvfrom` | `ETIMEDOUT` after 10 s | blocks indefinitely |
 | blocking `accept` | no timeout | no timeout |
 | `SO_RCVBUF` / `SO_SNDBUF` | accepted and ignored; buffers are fixed at 16 KB each direction (`TCP_{RX,TX}_BUFFER_SIZE`) | honoured |

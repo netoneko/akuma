@@ -38,6 +38,9 @@ pub fn run_network_tests() {
     test_pipe_read_nonblock_returns_eagain();
     test_epoll_pipe_eof_edge_after_partial_drain();
 
+    #[cfg(kernel_tests)]
+    crate::syscall::run_pselect6_exceptfds_test();
+
     #[cfg(all(kernel_tests, feature = "smoltcp"))]
     crate::syscall::run_socket_timeout_tests();
 

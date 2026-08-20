@@ -76,6 +76,24 @@ const TCP_TX_BUFFER_SIZE: usize = 16384;
 const EPHEMERAL_PORT_START: u16 = 49152;
 const SOCKET_GC_TIMEOUT_US: u64 = 30_000_000; // 30 seconds
 
+/// How long a TCP socket may sit in `SynSent` before the connect is abandoned.
+///
+/// Without this a non-blocking connect to a black hole **never** fails: smoltcp
+/// retransmits the SYN forever unless a `timeout` is set, and nothing in this
+/// tree sets one. The *blocking* path already gave up — `finish_connect_wait`
+/// caps its wait at 10 s — so the two paths disagreed, and only the caller who
+/// asked for the non-blocking version got an unbounded hang. This makes them
+/// agree.
+///
+/// smoltcp's own `Socket::set_timeout` is deliberately NOT used for this. It is
+/// an *inactivity* timeout that stays armed in every state, so it would also
+/// abort an idle `Established` connection — an ssh session at a prompt, a
+/// keep-alive pool, or a stream whose next byte is slow. That last one is the
+/// exact failure class `docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md` spent
+/// four bugs eliminating. Scoping the deadline to `SynSent` here keeps the
+/// connect bounded without putting a ceiling on idle time.
+const CONNECT_TIMEOUT_US: u64 = 10_000_000; // 10 s, matching finish_connect_wait
+
 static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(EPHEMERAL_PORT_START);
 
 fn alloc_ephemeral_port() -> u16 {
@@ -260,6 +278,11 @@ pub struct NetworkState {
     pub dns_handle: SocketHandle,
     /// Sockets closed by the user, waiting for TCP teardown. Tuple: (handle, `close_timestamp_us`).
     pub pending_removal: Vec<(SocketHandle, u64)>,
+    /// Handles currently in `SynSent`, with the microsecond the connect was
+    /// issued. Swept in `poll()` to enforce [`CONNECT_TIMEOUT_US`]. Holds only
+    /// in-flight connects, so it is empty on an idle system and never more than
+    /// a few entries deep under load.
+    pub connecting: Vec<(SocketHandle, u64)>,
 }
 
 /// Global network stack protected by a Spinlock.
@@ -849,6 +872,7 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
         dhcp_handle,
         dns_handle,
         pending_removal: Vec::new(),
+        connecting: Vec::new(),
     });
 
     NETWORK_READY.store(true, Ordering::Release);
@@ -966,6 +990,37 @@ pub fn poll() -> bool {
                 } else {
                     i += 1;
                 }
+            }
+
+            // Bound `SynSent`. An entry leaves this list the moment the socket
+            // is no longer shaking hands — connected, reset, or closed — so the
+            // deadline never applies to an established connection. See
+            // `CONNECT_TIMEOUT_US`.
+            let mut i = 0;
+            while i < net.connecting.len() {
+                let (handle, started_at) = net.connecting[i];
+                if !is_valid_handle(handle) {
+                    net.connecting.swap_remove(i);
+                    continue;
+                }
+                if net.sockets.get::<tcp::Socket>(handle).state() != tcp::State::SynSent {
+                    net.connecting.swap_remove(i);
+                    continue;
+                }
+                if now_us.saturating_sub(started_at) > CONNECT_TIMEOUT_US {
+                    // `abort()` moves it to `Closed`, which surfaces to the
+                    // caller as `EPOLLHUP`. The socket is flagged first so
+                    // `SO_ERROR` can answer `ETIMEDOUT` rather than the
+                    // `ECONNREFUSED` a plain `Closed` would imply — a connect
+                    // that was never answered is not a connect that was refused,
+                    // and telling them apart is the difference between reading a
+                    // log correctly and not.
+                    crate::socket::mark_connect_timed_out(handle);
+                    net.sockets.get_mut::<tcp::Socket>(handle).abort();
+                    net.connecting.swap_remove(i);
+                    continue;
+                }
+                i += 1;
             }
 
             // Publish the set size: `iface.poll()` above walks all of it, so this
@@ -1409,6 +1464,21 @@ pub fn udp_socket_close(handle: SocketHandle) {
         socket.close();
         net.sockets.remove(handle);
         SOCKETS_LIVE.fetch_sub(1, Ordering::Relaxed);
+    });
+}
+
+/// Record that `handle` has just entered `SynSent`, so `poll()` can enforce
+/// [`CONNECT_TIMEOUT_US`] on it.
+pub fn note_connect_started(handle: SocketHandle) {
+    with_network(|net| {
+        let now = (runtime().uptime_us)();
+        // A redial on the same handle replaces the old deadline rather than
+        // stacking a second one.
+        if let Some(e) = net.connecting.iter_mut().find(|(h, _)| *h == handle) {
+            e.1 = now;
+        } else {
+            net.connecting.push((handle, now));
+        }
     });
 }
 

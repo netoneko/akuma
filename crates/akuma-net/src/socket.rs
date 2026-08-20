@@ -195,6 +195,11 @@ pub struct KernelSocket {
     /// incorrect" on the client). Guarded by the SOCKET_TABLE lock, so a plain
     /// integer suffices.
     pub refs: u32,
+    /// Set when `poll()` abandoned this socket's connect at
+    /// `CONNECT_TIMEOUT_US`. Read (and cleared) by `SO_ERROR`, so an unanswered
+    /// connect reports `ETIMEDOUT` instead of the `ECONNREFUSED` a bare `Closed`
+    /// socket would otherwise imply.
+    pub connect_timed_out: bool,
 }
 
 #[cfg(feature = "smoltcp")]
@@ -213,6 +218,7 @@ impl KernelSocket {
             sndtimeo_us: None,
             wakers: Spinlock::new(Vec::new()),
             refs: 1,
+            connect_timed_out: false,
         })
     }
 
@@ -230,6 +236,7 @@ impl KernelSocket {
             sndtimeo_us: None,
             wakers: Spinlock::new(Vec::new()),
             refs: 1,
+            connect_timed_out: false,
         })
     }
 
@@ -264,6 +271,7 @@ impl KernelSocket {
             sndtimeo_us: None,
             wakers: Spinlock::new(Vec::new()),
             refs: 1,
+            connect_timed_out: false,
         })
     }
 
@@ -393,6 +401,40 @@ pub fn socket_add_waker(idx: usize, waker: Waker) {
             sock.add_waker(waker);
         }
     });
+}
+
+/// Flag the socket owning `handle` as having timed out mid-connect.
+///
+/// Called from `smoltcp_net::poll()`'s `SynSent` sweep just before it aborts the
+/// socket. Linear over the socket table, but only ever on the timeout path.
+#[cfg(feature = "smoltcp")]
+pub fn mark_connect_timed_out(handle: SocketHandle) {
+    with_table(|table| {
+        for slot in table.iter_mut().flatten() {
+            if let SocketType::Stream(h) = slot.inner
+                && h == handle
+            {
+                slot.connect_timed_out = true;
+                return;
+            }
+        }
+    });
+}
+
+/// Consume the connect-timeout flag for socket `idx`, if set.
+///
+/// Consuming matches Linux: `SO_ERROR` reports a pending socket error exactly
+/// once and clears it.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn take_connect_timed_out(idx: usize) -> bool {
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get_mut(idx) {
+            core::mem::take(&mut sock.connect_timed_out)
+        } else {
+            false
+        }
+    })
 }
 
 /// Add one fd-table reference to socket `idx` (see [`KernelSocket::refs`]).
@@ -909,6 +951,7 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
         sndtimeo_us: None,
         wakers: Spinlock::new(Vec::new()),
         refs: 1,
+        connect_timed_out: false,
     };
     let new_idx = with_table(|table| {
         for (i, slot) in table.iter_mut().enumerate() {
@@ -1004,6 +1047,11 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
         }
         None => return Err(libc_errno::ENETDOWN),
     }
+
+    // The SYN is out; arm the connect deadline (see `CONNECT_TIMEOUT_US`). The
+    // blocking path below has its own 10 s cap, but it shares the deadline so a
+    // socket abandoned by `poll()` is reported the same way whoever asked.
+    smoltcp_net::note_connect_started(h);
 
     if nonblock {
         return Err(libc_errno::EINPROGRESS);

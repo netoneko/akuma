@@ -1,5 +1,21 @@
 # In-guest `cargo` cannot reach crates.io
 
+> **FIXED 2026-08-20.** Root cause was `sys_pselect6` never writing the caller's
+> `exceptfds` set. If you are on a kernel built after that, this page is history
+> — go to [§ 3](#3-the-mechanism-traced-through-source-2026-08-20) for the
+> mechanism and skip the workarounds entirely. Nightly cargo is safe as the
+> bootstrap default: three cold-registry `cargo fetch` runs in a row, 35 crates
+> each, zero `spurious network error` lines.
+>
+> **One line:** the nightly toolchain's libcurl uses `select(2)`, not `poll(2)`;
+> Akuma's `select` left `exceptfds` exactly as the caller passed it in; libcurl
+> read that back as `POLLPRI`, called it `CURL_CSELECT_ERR`, and threw away every
+> TCP connection about one RTT *after it had successfully connected*.
+>
+> If you still see this on a current kernel, it is a **new** bug — the runbook
+> below still works as a diagnostic, and `nettest-connect` (§ 3.6) is the fastest
+> way to tell a kernel fault from a network one.
+
 **Symptom.** Inside a devbox VM, `cargo build` / `cargo fetch` loops on:
 
 ```
@@ -26,64 +42,65 @@ cargo --version
 
 | Result | Meaning |
 |---|---|
-| `/usr/local/bin/cargo` (nightly) | **This is the broken one.** Go to step 2. |
-| `/usr/bin/cargo` (apk, 1.96.x) | Works — 39/39 fetches in the reference run. If it fails, the network really is down; go to [`debug-network.md`](debug-network.md). |
+| `/usr/local/bin/cargo` (nightly) | The one that used to fail. Its libcurl calls `select(2)`; everything else in the guest calls `poll(2)`. Go to step 2. |
+| `/usr/bin/cargo` (apk, 1.96.x) | Never affected — its libcurl uses `poll(2)`. If it fails, the network really is down; go to [`debug-network.md`](debug-network.md). |
 
 Since 2026-08-19 the devbox puts nightly first on `PATH`, so a bare `cargo` is
-the failing one by default.
+the `select(2)` one by default. That is fine on a kernel built after
+2026-08-20; before it, that single difference was the whole bug.
 
-## 2. Confirm it is the known bug, not your network
+## 2. Confirm which bug you have
 
 ```sh
 curl -o /dev/null -w '%{http_code}\n' https://index.crates.io/config.json   # expect 200
-/usr/bin/cargo fetch                                                        # expect success
+cargo fetch                                                                 # expect success
 ```
 
-If `curl` returns `200` and apk cargo fetches while nightly cargo cannot, this
-is the known bug. The **observation** is solid: the kernel log shows 110
-`socket()` + `connect() = EINPROGRESS` cycles with **zero** completions across a
-30 s nightly-cargo run, while apk libcurl issues the same syscalls to the same
-IPs and connects fine. DNS is not the problem; the A records resolve and appear
-in the log.
+On a kernel built after 2026-08-20 both succeed. If `cargo` still fails while
+`curl` returns `200`, run the probe in [§ 3.6](#36-reading-the-answer-off-one-run)
+before anything else — it separates a kernel fault from a network one in a single
+command, and it will tell you immediately whether you are looking at a regression
+of the `exceptfds` bug or at something new.
 
-The **explanation** is not settled, and two things should stop you treating it as
-settled:
+### What the original 2026-08-11 evidence actually showed
 
-- **No probe reproduces it.** All four `nettest` modes — including `multi2`, which
-  is cargo's exact Multi + multiplex + worker-thread pattern — pass 30/30. The
-  only reproducer is cargo itself. The probe links apk libcurl, so it has never
-  exercised the vendored build (step 5).
-- **The ~300 ms give-up time contradicts "connects never complete."** A connect
-  that hangs burns `CURLOPT_CONNECTTIMEOUT`, not 353 ms. Failing in roughly one
-  successful round trip is the signature of an **error being returned** —
-  `POLLERR`, `ECONNRESET`, `EHOSTUNREACH` — not of silence. Nothing has yet
-  reconciled the timing with the stated mechanism. (`CURL_HEET_DEFAULT_QUEUESIZE`,
-  cited in the archive doc for the ~300 ms spacing, does not govern connect
-  timing; happy-eyeballs is `CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS`, default 200 ms.)
+Kept because two of its conclusions were wrong in instructive ways, and both
+misdirections cost real time:
 
-Both gaps mean the *class* of bug may still be open. The workarounds in step 4
-are unaffected either way.
+- **"110 `connect() = EINPROGRESS` cycles with zero completions."** There were no
+  completions *in the log* because `sys_connect` logs `= OK` only on the
+  **blocking** path — a non-blocking connect always logs `EINPROGRESS` and its
+  completion is invisible to that log site. The absence was not evidence. In fact
+  every one of those connects succeeded; instrumentation on 2026-08-20 caught the
+  sockets sitting in `Established` with `SO_ERROR == 0` at the exact moment
+  libcurl declared them failed.
+- **"No probe reproduces it."** True of the probes that existed — all four
+  `nettest` modes pass 30/30, and `bootstrap/bin/nettest` really is the vendored
+  static-libcurl build (the archive doc's claim that it links apk libcurl is
+  stale). They all missed it because they bisected libcurl's *stack* — HTTP/2,
+  multiplexing, resolver, worker threads — and the axis that mattered was which
+  **readiness syscall** the client calls. `nettest-connect --wait poll` vs
+  `--wait select` found it in one run.
 
-The second gap is now closed on paper — see
-[§ 3. The mechanism, traced through source](#3-the-mechanism-traced-through-source-2026-08-20).
-The failing connects are being **refused**, not ignored, and the trace narrows
-the possible causes to three, each with a distinct `poll` fingerprint you can
-read off one probe run.
+The one contemporaneous observation that did point the right way was the timing:
+libcurl gave up after ~300 ms, which no hung connect can explain. § 3.1 turns
+that into a proof.
 
 ## 3. The mechanism, traced through source (2026-08-20)
 
-Nothing below was measured in a VM. It is a read of the two code bases that
-meet at this failure — the vendored libcurl the nightly toolchain links
-(`curl-sys-0.4.90+curl-8.21.0`, unpacked in `~/.cargo/registry`) and the
-kernel's readiness path — and it settles the timing contradiction in step 2 on
-its own.
+§§ 3.1–3.3 are a read of the two code bases that meet at this failure — the
+vendored libcurl the nightly toolchain links (`curl-sys-0.4.90+curl-8.21.0`,
+unpacked in `~/.cargo/registry`) and the kernel's readiness path. They settle the
+timing contradiction without a VM and narrow the search to a handful of
+candidates. § 3.4 is the measurement that picked one, and § 3.5 is what is left
+for any *future* stall in the same shape.
 
 ### 3.1 The 353 ms is a refusal, not a hang
 
 `cf-socket.c`, `cf_tcp_connect()`, is the whole decision:
 
 ```c
-rc = SOCKET_WRITABLE(ctx->sock, 0);          /* poll(POLLOUT), timeout 0 */
+rc = SOCKET_WRITABLE(ctx->sock, 0);   /* readiness query for OUT, timeout 0 */
 if(rc == 0)                     /* "not connected yet" — attempt stays ONGOING */
 else if(rc == CURL_CSELECT_OUT) /* verifyconnect(): getsockopt(SO_ERROR) */
 else if(rc & CURL_CSELECT_ERR)  /* HARD FAIL, socket closed, fd released */
@@ -138,7 +155,7 @@ Two consequences:
   branch is effectively unreachable here: the hard failure always arrives via
   `CURL_CSELECT_ERR`.
 
-### 3.3 A `SynSent` socket cannot die on its own
+### 3.3 A `SynSent` socket could not die on its own
 
 This is the part that narrows the search. **Nothing in the tree ever calls
 smoltcp's `set_timeout()`** — repo-wide, zero call sites. The field defaults to
@@ -159,30 +176,93 @@ The latter two only ever touch handles whose last fd is already gone, and
 (`src/syscall/fs.rs:1360`, `:1395`, `:2360`), so a live fd's socket is not
 reachable from either.
 
-### 3.4 Therefore: three candidate origins, and `revents` tells them apart
+> **Changed 2026-08-20.** This unbounded-`SynSent` behaviour was a second, real
+> defect found by the same investigation and is now fixed: `poll()` sweeps a
+> small `connecting` list and abandons anything past `CONNECT_TIMEOUT_US` (10 s,
+> matching the blocking path's existing cap), flagging the socket so `SO_ERROR`
+> answers `ETIMEDOUT` rather than `ECONNREFUSED`. smoltcp's `set_timeout()` is
+> still not used — it is an *inactivity* timeout armed in every state, so it
+> would also abort idle `Established` connections. So on a current kernel a
+> `HUP` on a connecting socket has one more possible origin than § 3.5's table
+> had when it was written; `SO_ERROR` tells them apart. Details:
+> `../reference/subsystems/networking.md` § `connect(2)` semantics.
 
-A `POLLHUP` on a *live connecting fd* within one RTT can only be:
+### 3.4 The answer: `exceptfds` came back stale
+
+Measured in the VM on 2026-08-20, with temporary logging in
+`epoll_check_fd_readiness` and `sys_getsockopt`. Across a full failing
+`cargo fetch`: **zero** `EPOLLHUP` from the socket branch, **zero** fd-lookup
+misses, and every `SO_ERROR` read returned `val=0 state=Established`. The
+sockets were connecting perfectly and libcurl was throwing them away anyway.
+
+That ruled out both `POLLHUP` origins and left one possibility: libcurl was not
+calling `poll` at all. It was not. `curl-sys`' `build.rs` defines `HAVE_POLL_H`
+and `HAVE_POLL_FINE` but **never plain `HAVE_POLL`**, and `Curl_poll()` in
+`select.c` is `#ifdef HAVE_POLL` — so the vendored libcurl the nightly toolchain
+links compiles the **`select(2)`** branch. apk's libcurl and `/bin/curl` are
+autotools builds that define `HAVE_POLL`, which is exactly why they always
+worked.
+
+The select branch does this:
+
+```c
+if(ufds[i].events & (POLLRDBAND | POLLPRI))
+    FD_SET(ufds[i].fd, &fds_err);            /* -> exceptfds */
+...
+if(FD_ISSET(ufds[i].fd, &fds_err)) {
+    if(ufds[i].events & POLLPRI)
+        ufds[i].revents |= POLLPRI;
+}
+```
+
+and `Curl_socket_check()` asks for `POLLWRNORM|POLLOUT|POLLPRI` on a connecting
+socket — so the fd goes into `exceptfds`. `sys_pselect6` took `_exceptfds_ptr`
+and never wrote it, so `FD_ISSET(sock, &fds_err)` was still true on return,
+libcurl synthesised `POLLPRI`, and `Curl_socket_check` mapped `POLLPRI` into
+`CURL_CSELECT_ERR`. `cf_tcp_connect` tests `rc == CURL_CSELECT_OUT` by
+**equality**, so `OUT|ERR` took the error branch, `verifyconnect()` read
+`SO_ERROR == 0`, and the attempt died as `CURLE_COULDNT_CONNECT` with
+`ctx->sockerr == 0` — the `"No error information"` in the trace.
+
+The probe isolates it to one syscall, same address, same moment:
+
+```text
+nettest-connect one index.crates.io 443 --wait poll     t=77.0ms revents=OUT      -> CONNECTED
+nettest-connect one index.crates.io 443 --wait select   t=68.6ms revents=PRI|OUT  -> HARDFAIL
+```
+
+**Fix:** `sys_pselect6` now zeroes `exceptfds` on both the ready and the timeout
+path (`src/syscall/poll.rs`). Regression test:
+`run_pselect6_exceptfds_test` → `[PASS] pselect6_clears_exceptfds`.
+
+Anything else in the guest that uses `select(2)` was affected the same way; this
+was not a cargo-specific fault, only a cargo-specific *symptom*.
+
+### 3.5 If a connect really does stall: the origins, and `revents` tells them apart
+
+This table is what is left over for a *future* stall in the same shape — it is
+not the 2026-08-20 bug, which produced no `POLLHUP` at all. A `POLLHUP` on a
+**live connecting fd** can only be:
 
 | `revents` | origin | `SO_ERROR` reads |
 |---|---|---|
-| `HUP` alone | smoltcp reached `!is_active()`: **an RST actually arrived**, or the handle was recycled under it | `ECONNREFUSED`, synthesised from state (`src/syscall/net.rs:797`) |
-| `ERR\|HUP` | `current_process_shared()` / `get_fd()` returned `None` (`src/syscall/poll.rs:466`) — **no socket state was consulted at all** | `0` (`net.rs:810`, the fd-miss arm) |
+| `HUP` alone | an RST arrived, or the handle was recycled under the socket | `ECONNREFUSED`, synthesised from state (`src/syscall/net.rs`) |
+| `HUP` alone, at ~10 s | the `CONNECT_TIMEOUT_US` sweep gave up on `SynSent` (§ 3.3) — the expected outcome for an unroutable peer, not a defect | `ETIMEDOUT` |
+| `ERR\|HUP` | `current_process_shared()` / `get_fd()` returned `None` (`src/syscall/poll.rs`) — **no socket state was consulted at all** | `0`, from the fd-miss arm |
 | `OUT` with `ERR`/`HUP` | impossible on Akuma — you are reading the Linux control arm | — |
 
-The middle row is the one that would explain why *only* nightly cargo
-reproduces this with nothing wrong on the wire. It is thread-shaped:
-`current_pid()` (`crates/akuma-exec/src/process/children.rs:693`) resolves via
-`THREAD_PID_MAP` first and the ProcessInfo page second, and the nightly
-toolchain's libcurl uses the **threaded resolver** (`USE_RESOLV_THREADED` in
-curl-sys' `build.rs`, compiling `asyn-thrdd.c`) — it spawns a pthread per
-resolution, which apk libcurl's c-ares build never does. Every other difference
-between the two libcurls has already been ruled out by experiment; this one has
-not been tested.
+`SO_ERROR` separates the first two rows, which is exactly why the connect
+deadline reports `ETIMEDOUT` instead of reusing `ECONNREFUSED`: a connect nobody
+answered is not a connect that was refused, and a log that conflates them sends
+the next reader down the wrong path.
 
-The top row is not a kernel bug in the readiness path at all — it moves the
-question to why a SYN is being reset (SLIRP, the peer, or a malformed segment).
+The `ERR|HUP` row is the interesting one if it ever appears — it is thread-shaped
+(`current_pid()`, `crates/akuma-exec/src/process/children.rs`, resolves via
+`THREAD_PID_MAP` first and the ProcessInfo page second), and it is
+indistinguishable to the caller from a socket that died. It has never been
+observed; instrumentation across a full failing `cargo fetch` counted zero.
 
-### 3.5 Reading the answer off one run
+### 3.6 Reading the answer off one run
 
 `nettest-connect` (`userspace/nettest/rust/connect/`, built by
 `userspace/nettest/rust/build-musl.sh connect`) makes the same syscalls with no
@@ -197,9 +277,10 @@ nettest-connect one   index.crates.io 443 --wait poll   # blocking wait vs poll0
 
 | what it prints | what it means |
 |---|---|
-| `SUMMARY he verdict=COULDNT_CONNECT` at a few hundred ms | reproduced without libcurl; read the `hint:` line for which row |
-| `verdict=PENDING` at 5 s | the connects really do hang — then §3.1 says libcurl could not have reported this at 353 ms, and the divergence is somewhere else |
-| `verdict=CONNECTED` throughout | not reproducible on this kernel; go to step 6 item 1 and close the whole thing |
+| `--wait poll` connects but `--wait select` does not | the 2026-08-20 bug, or a regression of it. Check `sys_pselect6` writes all three sets |
+| `verdict=HARDFAIL_*` on every mode | read the `hint:` line for which row of § 3.5 |
+| `verdict=PENDING` past `CONNECT_TIMEOUT_US` (10 s) | the `SynSent` sweep is not running; a connect should now always end |
+| `verdict=CONNECTED` throughout | the guest's network is fine; the fault is in whatever client you were debugging |
 
 Same static binary runs under Docker Linux as the control arm
 (`../archive/LINUX_AB_PROBE.md`). Full probe documentation, including the
@@ -207,6 +288,8 @@ Same static binary runs under Docker Linux as the control arm
 `sys_epoll_pwait`, is in `userspace/nettest/README.md` § Part 3.
 
 ## 4. Work around it
+
+> Only needed on a kernel from before 2026-08-20. On a current kernel nightly cargo fetches normally — skip this section.
 
 In order of preference:
 
@@ -257,21 +340,29 @@ CARGO_NET_RETRY=50 cargo fetch
 CARGO_NET_OFFLINE=true cargo build --release
 ```
 
-## 6. What would actually fix it
+## 6. What fixed it, and what to try first next time
 
-Ranked in `../archive/CARGO_CRATES_IO_CONNECT_FAIL.md` § "Fix options". Two cheap
-steps come before any kernel change:
+**The fix:** `sys_pselect6` now writes `exceptfds` — zeroed, on both the ready
+and the timeout path (`src/syscall/poll.rs`). None of the ranked options in
+`../archive/CARGO_CRATES_IO_CONNECT_FAIL.md` § "Fix options" was the answer;
+every one of them targeted libcurl's build or its resolver, and the fault was in
+the kernel's `select`.
 
-1. **Re-test on a current kernel.** The diagnosis dates from 2026-08-11, before the
-   `benchmarks-improved-networking` work. That branch fixed two lost-wake bugs in
-   the socket path (the NIC doorbell re-arm,
-   `../archive/AKUMA_NET_ISSUES.md` §9, and the `blocking_relax` yield, §12) — and
-   "`connect` → `EINPROGRESS` → `poll(POLLOUT)` never fires" is a lost-wake
-   signature. Nobody has re-run the reproducer since. This is the cheapest
-   experiment available and it may simply be fixed.
-2. **Run `nettest-connect`** (§ 3.5) and read `revents` off the failing attempt.
-   That picks one of the three rows in § 3.4 and turns the remaining work into a
-   single question instead of a search.
+The two steps that actually got there, in order, and the right first moves for
+anything in this shape:
+
+1. **Re-test on a current kernel — done 2026-08-20, and it did *not* fix it.**
+   The 2026-08-11 diagnosis predated `benchmarks-improved-networking`, whose two
+   lost-wake fixes (NIC doorbell re-arm, `../archive/AKUMA_NET_ISSUES.md` §9;
+   `blocking_relax` yield, §12) matched the reported "`connect` → `EINPROGRESS`
+   → `POLLOUT` never fires" signature. Re-running the reproducer cost one boot
+   and, by failing, produced the live reproducer everything else depended on.
+   Cheap experiments are worth running even when you expect them to fail.
+2. **Run `nettest-connect`** (§ 3.6) and read `revents` off the failing attempt.
+   Comparing `--wait poll` against `--wait select` is what identified the bug —
+   the axis nobody had varied was *which readiness syscall the client calls*.
+   For a stall rather than a fast failure, § 3.5 maps the `revents` you get to
+   an origin.
 
    Do **not** start by rebuilding the `nettest` curl probe with `static-curl` —
    the archive doc names that as the cheapest next step and that text is stale.
@@ -280,45 +371,71 @@ steps come before any kernel change:
    binary (`bootstrap/bin/nettest`) contains vendored `curl/lib/vtls/openssl.c`
    plus the string `OpenSSL 3.6.3` — the same vendored OpenSSL the nightly
    toolchain reports. It was built twenty minutes *before* the commit that added
-   the doc (`0c9d96ce`). The vendored probe exists and has shipped; what is
-   unrecorded is whether the 30/30 pass was measured with it or with the earlier
-   dynamic build.
+   the doc (`0c9d96ce`).
 
-Do **not** start by debugging the smoltcp stack. Four hypotheses were already
-ruled out by experiment (HTTP/2 ALPN, c-ares DNS racing, worker-thread socket
-ownership, Multi+pipewait multiplexing); the table is in that doc.
+Do **not** start by debugging the smoltcp stack, and do not spend time on
+libcurl's HTTP/2, multiplexing, resolver or threading — all four were ruled out
+by experiment in 2026-08-11, and the eventual cause was none of them.
 
 ## Verify
 
-On a freshly bootstrapped devbox image:
+On a devbox image, with a **cold registry** — a warm one succeeds without
+touching the network and proves nothing:
 
 ```sh
-ssh -o StrictHostKeyChecking=no -p 2222 root@localhost 'cat /root/.cargo/config.toml'
+ssh -o StrictHostKeyChecking=no -p 2222 root@localhost \
+  'cd /tmp/akuma && rm -rf $HOME/.cargo/registry && cargo fetch 2>&1 | tail -5'
 ```
 
-Expect the `[net] retry = 20` / `[http] multiplexing = false` block above — that
-confirms step 7c ran and the toolchain shipped with its network policy.
+Expect it to finish with `Downloaded …` lines and **zero** `spurious network
+error`. Reference run, 2026-08-20, three cold fetches back to back on
+`devbox-smoltcp`, no `~/.cargo/config.toml` present:
+
+```text
+run 1: rc=0 spurious=0 downloaded=35
+run 2: rc=0 spurious=0 downloaded=35
+run 3: rc=0 spurious=0 downloaded=35
+```
+
+The syscall-level check, which does not need cargo at all and localises a
+regression immediately:
 
 ```sh
-ssh ... '/usr/bin/cargo fetch && cargo build --release --offline'
+for w in poll0 poll select epoll; do
+    nettest-connect one index.crates.io 443 --wait $w --quiet
+done
 ```
 
-Expect the fetch to succeed and the offline build to proceed without a single
-`spurious network error` line. If nightly cargo is *not* offline and does emit
-them, that is the known bug, not a regression.
+All four must report `verdict=CONNECTED`. `select` reporting
+`revents=PRI|OUT -> HARDFAIL` while `poll` connects is this exact bug returning.
+
+The kernel-side regression test is `run_pselect6_exceptfds_test`; a normal
+`cargo run --release` boot prints `[PASS] pselect6_clears_exceptfds`.
+
+And the connect deadline from § 3.3, which should end rather than hang:
+
+```sh
+nettest-connect one 10.255.255.1 443 --timeout-ms 30000   # ends ~10 s, so_error=110 ETIMEDOUT
+```
 
 ## Background
 
-- `userspace/nettest/README.md` § Part 3 — `nettest-connect`, the probe § 3.5
+- `userspace/nettest/README.md` § Part 3 — `nettest-connect`, the probe § 3.6
   runs, its mode/verdict tables, and the Linux control-arm reference output.
+- [`../reference/subsystems/syscalls/poll.md`](../reference/subsystems/syscalls/poll.md)
+  § `sys_pselect6` — the fixed `exceptfds` contract, as reference rather than
+  narrative.
+- [`../reference/subsystems/networking.md`](../reference/subsystems/networking.md)
+  § `connect(2)` semantics — `CONNECT_TIMEOUT_US`, and why smoltcp's own
+  `set_timeout()` is the wrong tool for it.
 - [`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md) §9, §12 —
-  the two lost-wake fixes on `benchmarks-improved-networking` that make step 6
-  item 1 worth doing before anything else.
+  the two lost-wake fixes on `benchmarks-improved-networking`. Re-testing on
+  that kernel was the first thing tried here; it did **not** fix this, which is
+  what produced the current reproducer to instrument.
 - [`../archive/CARGO_CRATES_IO_CONNECT_FAIL.md`](../archive/CARGO_CRATES_IO_CONNECT_FAIL.md)
-  — the 2026-08-11 investigation: four ruled-out hypotheses and the cargo-only
-  reproducer. Its header claims "root cause isolated"; read that as *observation
-  isolated* — its own § "What the probe does NOT yet reproduce" concedes no
-  controlled binary reproduces the failure. See step 2 above.
+  — the 2026-08-11 investigation, kept verbatim with a corrected header. Its
+  "root cause isolated" claim and its "connects never complete" reading are both
+  wrong; step 2 above says how.
 - [`debug-thread-spawn-segv.md`](debug-thread-spawn-segv.md) §"cargo cannot
   reach crates.io" — the earlier, **superseded** multiplexing diagnosis.
 - [`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) — `CARGO_NET_RETRY=20`,

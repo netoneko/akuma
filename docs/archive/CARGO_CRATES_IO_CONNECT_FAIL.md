@@ -3,11 +3,29 @@
 **Status:** Root cause isolated. Reproducer confirmed in-VM. Fix not yet chosen.
 **Date:** 2026-08-11.
 
-> **2026-08-20 — read this first; the body below is left verbatim.** Two claims
+> **2026-08-20 — SOLVED; the body below is left verbatim and is wrong in two
+> places.** Root cause: `sys_pselect6` never wrote the caller's `exceptfds` set.
+> The nightly toolchain's libcurl compiles `Curl_poll()`'s **`select(2)`** branch
+> — `curl-sys`' `build.rs` defines `HAVE_POLL_H` and `HAVE_POLL_FINE` but not
+> plain `HAVE_POLL` — and `Curl_socket_check()` asks for `POLLPRI` on a
+> connecting socket, which that branch puts in `exceptfds`. With the set returned
+> untouched, libcurl read `POLLPRI` back, mapped it to `CURL_CSELECT_ERR`, and
+> `cf_tcp_connect()` (which tests `rc == CURL_CSELECT_OUT` by equality) discarded
+> a socket that had just reached `Established` with `SO_ERROR == 0`. apk cargo
+> and `/bin/curl` are autotools builds that define `HAVE_POLL` and use `poll(2)`,
+> which is the entire reason they worked. Fix + evidence:
+> `docs/runbooks/cargo-cannot-reach-crates-io.md` § 3.4.
+>
+> Two claims
 > in this doc do not survive a source trace, which is written up in
 > `docs/runbooks/cargo-cannot-reach-crates-io.md` § 3:
 >
-> 1. **"Non-blocking TCP connects … never complete" is the wrong shape.** The
+> 1. **"Non-blocking TCP connects … never complete" is exactly backwards** — they
+>    completed every time. The evidence for it was a kernel log showing
+>    `connect() = EINPROGRESS` with no `= OK`, but `sys_connect` only ever logs
+>    `= OK` for a *blocking* connect: a non-blocking completion is invisible to
+>    that log, so "zero completions" was never in the data.
+>    Separately, the give-up timing does not fit a hang: The
 >    vendored libcurl this cargo links (`curl-sys-0.4.90+curl-8.21.0`) raises
 >    `CURLE_COULDNT_CONNECT` only when *no attempt is still ongoing*
 >    (`cf-ip-happy.c`, `cf_ip_ballers_run`); a hung connect keeps an attempt

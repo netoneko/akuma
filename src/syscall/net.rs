@@ -795,8 +795,15 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
     let val: i32 = if level == SOL_SOCKET {
         match optname {
             SO_ERROR => {
-                if let Some(idx) = get_socket_from_fd(fd) {
-                    socket::with_socket(idx, |sock| {
+                match get_socket_from_fd(fd) {
+                    // A connect the kernel abandoned at `CONNECT_TIMEOUT_US`
+                    // reports ETIMEDOUT, not the ECONNREFUSED that reading the
+                    // bare `Closed` state below would produce. Checked first
+                    // because it is the more specific answer for the same state.
+                    Some(idx) if akuma_net::socket::take_connect_timed_out(idx) => {
+                        libc_errno::ETIMEDOUT
+                    }
+                    Some(idx) => socket::with_socket(idx, |sock| {
                         if let socket::SocketType::Stream(h) = &sock.inner {
                             akuma_net::smoltcp_net::with_network(|net| {
                                 let s = net.sockets.get::<smoltcp::socket::tcp::Socket>(*h);
@@ -806,9 +813,8 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                         } else {
                             0
                         }
-                    }).unwrap_or(0)
-                } else {
-                    0
+                    }).unwrap_or(0),
+                    None => 0,
                 }
             }
             SO_TYPE => {
@@ -826,6 +832,14 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
     } else {
         0
     };
+
+    // `SO_ERROR` is what a non-blocking connect's outcome is read through, so
+    // its value and the socket state behind it are the two things any connect
+    // investigation needs side by side.
+    if crate::config::SYSCALL_DEBUG_NET_ENABLED && level == SOL_SOCKET && optname == SO_ERROR {
+        let st = get_socket_from_fd(fd).map_or("no-fd", socket_tcp_state_str);
+        crate::tprint!(96, "[soerr] fd={} val={} state={}\n", fd, val, st);
+    }
 
     if write_user_val(optval, &val).is_err() {
         return EFAULT;
@@ -1215,6 +1229,34 @@ pub(super) fn socket_can_send_tcp(idx: usize) -> bool {
             false
         }
     }).unwrap_or(false)
+}
+
+/// smoltcp TCP state as a static string, for `tprint!` — no allocation, so it is
+/// safe on the console path (`docs/reference/subsystems/console.md`).
+#[cfg(feature = "smoltcp")]
+pub(super) fn socket_tcp_state_str(idx: usize) -> &'static str {
+    socket::with_socket(idx, |sock| {
+        if let socket::SocketType::Stream(h) = &sock.inner {
+            akuma_net::smoltcp_net::with_network(|net| {
+                use smoltcp::socket::tcp::State;
+                match net.sockets.get::<smoltcp::socket::tcp::Socket>(*h).state() {
+                    State::Closed => "Closed",
+                    State::Listen => "Listen",
+                    State::SynSent => "SynSent",
+                    State::SynReceived => "SynReceived",
+                    State::Established => "Established",
+                    State::FinWait1 => "FinWait1",
+                    State::FinWait2 => "FinWait2",
+                    State::CloseWait => "CloseWait",
+                    State::Closing => "Closing",
+                    State::LastAck => "LastAck",
+                    State::TimeWait => "TimeWait",
+                }
+            }).unwrap_or("no-net")
+        } else {
+            "not-stream"
+        }
+    }).unwrap_or("no-sock")
 }
 
 /// Returns true when the smoltcp socket is completely dead (Closed state).

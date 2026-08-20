@@ -1,0 +1,11 @@
+# Load-bearing, same reason as ../stdlib/.cargo/config.toml: cargo walks UP
+# from the crate directory, so without this the probe inherits
+# `../.cargo/config.toml` (the curl probe's `aarch64-alpine-linux-musl`, which
+# only exists inside its Alpine container) and above that the repo root's
+# `aarch64-unknown-none` (the no_std kernel target, which has no `std`).
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "link-arg=-static"]

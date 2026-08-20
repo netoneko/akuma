@@ -463,9 +463,14 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
 
 pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Waker>) -> u32 {
     let fd_entry = akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd_num));
-    let fd_entry = match fd_entry {
-        Some(e) => e,
-        None => return EPOLLHUP | EPOLLERR,
+    let Some(fd_entry) = fd_entry else {
+        // A poll on an fd the calling process cannot see. Rare and always worth
+        // knowing about: it is indistinguishable, to the caller, from a socket
+        // that died — see `docs/runbooks/cargo-cannot-reach-crates-io.md` § 3.4.
+        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            crate::tprint!(96, "[pollmiss] fd={} -> EPOLLHUP|EPOLLERR (no fd entry)\n", fd_num);
+        }
+        return EPOLLHUP | EPOLLERR;
     };
 
     let mut ready = 0u32;
@@ -496,6 +501,10 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                 // connected and not connecting).  This lets the caller detect a
                 // timed-out or reset connection without spinning on EPOLLIN.
                 if super::net::socket_is_dead_tcp(idx) {
+                    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                        crate::tprint!(96, "[pollhup] fd={} idx={} state={} req=0x{:x}\n",
+                            fd_num, idx, super::net::socket_tcp_state_str(idx), requested);
+                    }
                     ready |= EPOLLHUP;
                 } else {
                     if requested & EPOLLIN != 0 && super::net::socket_can_recv_tcp(idx) {
@@ -896,7 +905,32 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
     }
 }
 
-pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _exceptfds_ptr: u64, timeout_ptr: u64, _sigmask_ptr: u64) -> u64 {
+/// `pselect6(2)`.
+///
+/// # `exceptfds` must be cleared, not ignored
+///
+/// Akuma has no out-of-band/urgent TCP data, so no fd ever has an exceptional
+/// condition and the honest answer for `exceptfds` is "none of them". That is
+/// **not** the same as leaving the caller's set alone: `select` reports its
+/// results by *overwriting* all three sets, so a kernel that never writes
+/// `exceptfds` hands every fd back still flagged, exactly as the caller passed
+/// it in.
+///
+/// That is not theoretical. It is the whole of
+/// `docs/runbooks/cargo-cannot-reach-crates-io.md`: `curl-sys`' vendored libcurl
+/// — the one the nightly Rust toolchain's cargo links — defines `HAVE_POLL_H`
+/// and `HAVE_POLL_FINE` but **not** plain `HAVE_POLL`, so `Curl_poll()` compiles
+/// its `select()` branch. `Curl_socket_check()` asks for
+/// `POLLWRNORM|POLLOUT|POLLPRI` on a connecting socket, and the select branch
+/// puts a fd with `POLLPRI` into `exceptfds`. With the set returned untouched,
+/// `FD_ISSET(sock, &fds_err)` stayed true, libcurl synthesised `POLLPRI`, mapped
+/// it to `CURL_CSELECT_ERR`, and `cf_tcp_connect()` — which tests
+/// `rc == CURL_CSELECT_OUT` by equality — took the error branch on a socket that
+/// had just reached `Established` with `SO_ERROR == 0`. Every `cargo fetch`
+/// failed with `[7] Could not connect to server` about one RTT into a connection
+/// that had in fact succeeded. `poll(2)` callers were unaffected, which is why
+/// apk cargo and `/bin/curl` always worked.
+pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64, _sigmask_ptr: u64) -> u64 {
     if nfds == 0 { return 0; }
     const MAX_FDS: usize = 1024;
     if nfds > MAX_FDS { return EINVAL; }
@@ -986,6 +1020,14 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
             {
                 return EFAULT;
             }
+            // No exceptional conditions exist here, but the set still has to be
+            // written — see this function's doc comment.
+            if exceptfds_ptr != 0 {
+                let cleared = [0u8; MAX_FDS / 8];
+                if copy_to_user(exceptfds_ptr, &cleared[..fd_set_bytes]).is_err() {
+                    return EFAULT;
+                }
+            }
             return ready_count;
         }
 
@@ -997,12 +1039,108 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, _ex
             if writefds_ptr != 0 && copy_to_user(writefds_ptr, &cleared[..fd_set_bytes]).is_err() {
                 return EFAULT;
             }
+            if exceptfds_ptr != 0 && copy_to_user(exceptfds_ptr, &cleared[..fd_set_bytes]).is_err() {
+                return EFAULT;
+            }
             return 0;
         }
 
         let abs_deadline = if infinite { u64::MAX } else { start_time + timeout_us };
         let deadline = abs_deadline.min(crate::timer::uptime_us() + effective_poll_interval_us(has_rump_fd));
         akuma_exec::threading::schedule_blocking(deadline);
+    }
+}
+
+/// Regression: `select(2)` must **write** all three fd sets, including
+/// `exceptfds`.
+///
+/// `sys_pselect6` used to take `_exceptfds_ptr` and never touch it, so the
+/// caller's exceptional-condition set came back exactly as passed in — every fd
+/// in it still flagged. Akuma has no out-of-band data, so the correct answer is
+/// always "none", but "none" has to be written down.
+///
+/// This is the whole of `docs/runbooks/cargo-cannot-reach-crates-io.md`: the
+/// nightly toolchain's cargo links a libcurl whose `Curl_poll()` compiles its
+/// `select()` branch (curl-sys' build.rs defines `HAVE_POLL_H`/`HAVE_POLL_FINE`
+/// but not plain `HAVE_POLL`), and `Curl_socket_check()` asks for `POLLPRI` on a
+/// connecting socket, which the select branch puts into `exceptfds`. The stale
+/// set made libcurl read `POLLPRI` back, map it to `CURL_CSELECT_ERR`, and
+/// abandon a socket that had just reached `Established` with `SO_ERROR == 0` —
+/// so every `cargo fetch` died with `[7] Could not connect to server` about one
+/// RTT into a connection that had actually succeeded. Verified 2026-08-20:
+/// `nettest-connect one index.crates.io 443 --wait select` returned
+/// `revents=PRI|OUT` before the fix and `revents=OUT` after, with `--wait poll`
+/// connecting cleanly in both.
+#[cfg(kernel_tests)]
+pub fn run_pselect6_exceptfds_test() {
+    use akuma_exec::process::{
+        register_process, register_thread_pid, unregister_process, unregister_thread_pid,
+        FileDescriptor,
+    };
+
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 8041u32;
+    register_process(pid, crate::process_tests::make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    let proc = akuma_exec::process::current_process_shared().unwrap();
+    // A pipe's write end is unconditionally writable while the reader lives, so
+    // it drives the ready path without needing a peer on the network.
+    let pipe_id = super::pipe::pipe_create();
+    let wfd = proc.alloc_fd(FileDescriptor::PipeWrite(pipe_id));
+    let rfd = proc.alloc_fd(FileDescriptor::PipeRead(pipe_id));
+
+    let bit = |fd: u32| -> [u64; 16] {
+        let mut set = [0u64; 16];
+        set[(fd / 64) as usize] |= 1u64 << (fd % 64);
+        set
+    };
+    // Zero timeout — exactly what libcurl's `SOCKET_WRITABLE(sock, 0)` passes.
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+
+    // Ready path: the write fd is writable, so pselect6 returns > 0.
+    let mut wset = bit(wfd);
+    let mut eset = bit(wfd);
+    let rc_ready = sys_pselect6(
+        (wfd + 1) as usize,
+        0,
+        &raw mut wset as u64,
+        &raw mut eset as u64,
+        &raw mut ts as u64,
+        0,
+    );
+    let ready_ok = rc_ready > 0 && wset[(wfd / 64) as usize] & (1u64 << (wfd % 64)) != 0;
+    let ready_except_cleared = eset[(wfd / 64) as usize] & (1u64 << (wfd % 64)) == 0;
+
+    // Timeout path: an empty pipe is not readable, so pselect6 returns 0 — and
+    // must still have cleared the set it was handed.
+    let mut rset = bit(rfd);
+    let mut eset2 = bit(rfd);
+    let rc_timeout = sys_pselect6(
+        (rfd + 1) as usize,
+        &raw mut rset as u64,
+        0,
+        &raw mut eset2 as u64,
+        &raw mut ts as u64,
+        0,
+    );
+    let timeout_ok = rc_timeout == 0;
+    let timeout_except_cleared = eset2[(rfd / 64) as usize] & (1u64 << (rfd % 64)) == 0;
+
+    proc.remove_fd(wfd);
+    proc.remove_fd(rfd);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    let pass = ready_ok && ready_except_cleared && timeout_ok && timeout_except_cleared;
+    if pass {
+        crate::safe_print!(128, "  [PASS] pselect6_clears_exceptfds\n");
+    } else {
+        crate::safe_print!(160,
+            "  [FAIL] pselect6_clears_exceptfds ready_ok={} ready_cleared={} timeout_ok={} timeout_cleared={}\n",
+            ready_ok, ready_except_cleared, timeout_ok, timeout_except_cleared);
     }
 }
 

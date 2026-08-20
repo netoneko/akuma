@@ -3,6 +3,12 @@
 #
 #   stdlib/   -> bootstrap/bin/nettest-std       (std::net + poll(2) + sync rustls)
 #   reqwest/  -> bootstrap/bin/nettest-reqwest   (tokio + hyper + reqwest + rustls)
+#   connect/  -> bootstrap/bin/nettest-connect   (raw connect(2) + poll/select/epoll)
+#
+# `connect/` belongs to a third investigation (cargo cannot reach crates.io,
+# `docs/runbooks/cargo-cannot-reach-crates-io.md`) but shares this build path
+# because it has the same requirement: no runtime, no TLS, nothing between the
+# probe and the syscall.
 #
 # This is NOT the sibling curl probe's build path. That one (./build.sh) runs
 # cargo inside an Alpine arm64 container because it has to build libcurl +
@@ -15,9 +21,10 @@
 # worthless if the probe and nca were built by different compilers against
 # different libcs.
 #
-#   ./build-musl.sh            # both probes
+#   ./build-musl.sh            # all three probes
 #   ./build-musl.sh std        # just nettest-std
 #   ./build-musl.sh reqwest    # just nettest-reqwest
+#   ./build-musl.sh connect    # just nettest-connect
 #
 # After building: scripts/populate_disk.sh copies bootstrap/bin/* into /bin.
 set -euo pipefail
@@ -61,10 +68,11 @@ build_one() {
 }
 
 case "$want" in
-    all)     build_one stdlib nettest-std; build_one reqwest nettest-reqwest ;;
+    all)     build_one stdlib nettest-std; build_one reqwest nettest-reqwest; build_one connect nettest-connect ;;
     std)     build_one stdlib nettest-std ;;
     reqwest) build_one reqwest nettest-reqwest ;;
-    *)       echo "usage: $0 [all|std|reqwest]" >&2; exit 2 ;;
+    connect) build_one connect nettest-connect ;;
+    *)       echo "usage: $0 [all|std|reqwest|connect]" >&2; exit 2 ;;
 esac
 
 echo "[nettest] done. Run scripts/populate_disk.sh to ship them to the disk image."

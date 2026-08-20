@@ -74,8 +74,21 @@ POSIX `poll()`: negative fd means "ignore this slot").
 this is a **hard cap** not present in the epoll/ppoll paths; a caller
 `select()`-ing on a very high fd number will get `EINVAL` where `ppoll`/
 `epoll` would work fine. `readfds_ptr`/`writefds_ptr`, when non-null, are
-validated for `nfds.div_ceil(64) * 8` bytes. `exceptfds_ptr` is accepted but
-entirely ignored (`_exceptfds_ptr`) — no exceptional-condition reporting.
+validated for `nfds.div_ceil(64) * 8` bytes.
+
+`exceptfds_ptr` reports no exceptional conditions — Akuma has no out-of-band
+TCP data, so the answer is always "none" — but it **is written**: every return
+path zeroes the caller's set. Reporting by overwriting is what `select()` is,
+and a set left untouched reads back as "every fd I asked about has an
+exceptional condition". That was a live bug until 2026-08-20 and it broke
+`cargo` completely: the nightly toolchain's libcurl compiles `Curl_poll()`'s
+`select()` branch (curl-sys' `build.rs` defines `HAVE_POLL_H`/`HAVE_POLL_FINE`
+but not plain `HAVE_POLL`) and asks for `POLLPRI` on a connecting socket, which
+that branch places in `exceptfds`. The stale set made libcurl synthesise
+`POLLPRI`, map it to `CURL_CSELECT_ERR`, and abandon a socket that had just
+reached `Established` with `SO_ERROR == 0`. See
+[`../../../runbooks/cargo-cannot-reach-crates-io.md`](../../../runbooks/cargo-cannot-reach-crates-io.md).
+Regression: `run_pselect6_exceptfds_test` (`[PASS] pselect6_clears_exceptfds`).
 
 ## epoll interest-list semantics
 
