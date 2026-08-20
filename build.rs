@@ -236,4 +236,18 @@ fn main() {
         "release"
     };
     println!("cargo:rustc-env=AKUMA_BUILD_PROFILE={build_profile}");
+
+    // Kernel load address, when the target machine is not QEMU virt.
+    //
+    // Firecracker's loader does `kernel_load = get_kernel_start() + text_offset`
+    // (rust-vmm/linux-loader `pe::PE::load`), and Firecracker passes
+    // get_kernel_start() = SYSTEM_MEM_START + SYSTEM_MEM_SIZE = 0x8020_0000.
+    // boot.rs's Image header declares text_offset = 1 MiB, so the image lands at
+    // 0x8030_0000 and the link address has to match exactly.
+    //
+    // Passed as a linker --defsym so `linker.ld` stays one file; it reads the
+    // symbol through DEFINED(). Keep in lockstep with `config::KERNEL_PHYS_BASE`.
+    if std::env::var_os("CARGO_FEATURE_PLATFORM_FIRECRACKER").is_some() {
+        println!("cargo:rustc-link-arg=--defsym=KERNEL_PHYS_BASE_OVERRIDE=0x80300000");
+    }
 }

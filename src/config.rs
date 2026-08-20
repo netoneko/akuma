@@ -23,8 +23,16 @@
 /// DTB is placed at ALIGN_UP(KERNEL_PHYS_BASE + image_size, 2MB) = 0x40200000,
 /// which fits in 4 MB RAM (DTB end 0x40300000 < 0x40400000).
 ///
+/// Firecracker uses the same `text_offset` rule with a different base: its
+/// loader places the image at `get_kernel_start()` (0x8020_0000) + `text_offset`,
+/// so the kernel lands at 0x8030_0000. Selected by `platform-firecracker`; the
+/// linker side is a `--defsym` emitted by build.rs.
+///
 /// Must match `KERNEL_PHYS_BASE` in linker.ld and `text_offset` in boot.rs.
+#[cfg(not(feature = "platform-firecracker"))]
 pub const KERNEL_PHYS_BASE: usize = 0x4010_0000;
+#[cfg(feature = "platform-firecracker")]
+pub const KERNEL_PHYS_BASE: usize = 0x8030_0000;
 
 /// Pre-kernel gap size: bytes from RAM_BASE to KERNEL_PHYS_BASE.
 /// This region is reclaimed to the PMM pool after early boot.

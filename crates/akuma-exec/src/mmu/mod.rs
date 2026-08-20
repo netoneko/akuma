@@ -122,27 +122,145 @@ pub fn kernel_va_end() -> usize {
 /// by every user address space's `add_kernel_mappings()`.
 static SHARED_DEV_L1_PHYS: AtomicUsize = AtomicUsize::new(0);
 
-/// Device physical addresses and their L3 slot indices.
-const DEV_PAGES: &[(usize, usize)] = &[
-    (0, 0x0800_0000), // L3[0]: GIC distributor (GICD, shared by v2 & v3)
-    (1, 0x0801_0000), // L3[1]: GICv2 CPU interface (unused under GICv3)
-    (2, 0x0900_0000), // L3[2]: UART PL011
-    (3, 0x0902_0000), // L3[3]: fw_cfg
-    (4, 0x0A00_0000), // L3[4]: VirtIO MMIO
-    (5, 0x080A_0000), // L3[5]: GICv3 redistributor CPU0 RD_base frame
-    (6, 0x080B_0000), // L3[6]: GICv3 redistributor CPU0 SGI_base frame
-];
+/// The greatest number of device regions the L0[1] window can describe.
+///
+/// One more than the current platforms need, so adding a device does not force a
+/// constant change. The bound exists because the table is a static array of
+/// atomics rather than a heap `Vec`: it is populated before the allocator runs.
+pub const MAX_DEV_REGIONS: usize = 16;
+
+/// One device region in the L0[1] window: kernel VA, machine PA, byte length.
+///
+/// `va` comes from `akuma_primitives::addr` and is our choice, fixed at compile
+/// time. `pa` is the *machine's*, and is therefore a runtime value — QEMU virt
+/// and Firecracker disagree on every one of them, and Firecracker's GIC
+/// redistributor base additionally depends on the configured vCPU count
+/// (`proposals/FIRECRACKER_PORT.md` §2.1), which no build-time constant can
+/// express. That asymmetry — fixed VAs, discovered PAs — is the whole shape of
+/// the device-map abstraction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DevRegion {
+    pub va: usize,
+    pub pa: usize,
+    pub size: usize,
+}
+
+/// The active device map. Written once by [`set_device_map`] before the first
+/// address space exists, read by [`init_shared_device_tables`] and
+/// [`rebuild_boot_device_table`].
+static DEV_MAP: [(AtomicUsize, AtomicUsize, AtomicUsize); MAX_DEV_REGIONS] =
+    [const { (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)) }; MAX_DEV_REGIONS];
+static DEV_MAP_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the device map: which machine PA backs each device VA.
+///
+/// Must be called before [`init_shared_device_tables`] and before any user
+/// address space is created. Regions are validated against the compile-time
+/// window layout, so a caller cannot install a region that escapes the L0[1]
+/// window or is not page-aligned — the failure mode that
+/// `docs/archive/GICD_IROUTER_ALIASING.md` describes is a mapping that is
+/// *shorter* than the device it claims to cover, and a short region here means a
+/// short mapping there.
+///
+/// Returns the number of regions installed.
+pub fn set_device_map(regions: &[DevRegion]) -> usize {
+    // Referencing the const forces its evaluation, which is what actually
+    // enforces the no-overlap invariant on the VA layout.
+    let () = DEV_WINDOW_NO_OVERLAP;
+
+    let n = regions.len().min(MAX_DEV_REGIONS);
+    for (slot, r) in DEV_MAP.iter().zip(regions.iter().take(n)) {
+        debug_assert_eq!(r.va % PAGE_SIZE, 0, "device VA not page-aligned");
+        debug_assert_eq!(r.pa % PAGE_SIZE, 0, "device PA not page-aligned");
+        debug_assert!(r.size > 0 && r.size % PAGE_SIZE == 0, "bad device region size");
+        debug_assert!(
+            r.va >= DEV_WINDOW_VA && r.va - DEV_WINDOW_VA + r.size <= DEV_WINDOW_SIZE,
+            "device region escapes the L0[1] window"
+        );
+        slot.0.store(r.va, Ordering::Relaxed);
+        slot.1.store(r.pa, Ordering::Relaxed);
+        slot.2.store(r.size, Ordering::Relaxed);
+    }
+    DEV_MAP_LEN.store(n, Ordering::Release);
+    n
+}
+
+/// The installed device map, copied out. Empty until [`set_device_map`] runs.
+#[must_use]
+pub fn device_map() -> ([DevRegion; MAX_DEV_REGIONS], usize) {
+    let n = DEV_MAP_LEN.load(Ordering::Acquire);
+    let mut out = [DevRegion { va: 0, pa: 0, size: 0 }; MAX_DEV_REGIONS];
+    for (o, slot) in out.iter_mut().zip(DEV_MAP.iter()).take(n) {
+        o.va = slot.0.load(Ordering::Relaxed);
+        o.pa = slot.1.load(Ordering::Relaxed);
+        o.size = slot.2.load(Ordering::Relaxed);
+    }
+    (out, n)
+}
+
+/// Page-descriptor flags for a device page: Device-nGnRnE, EL1-only, never
+/// executable.
+#[inline]
+fn device_page_flags() -> u64 {
+    flags::VALID
+        | flags::TABLE
+        | flags::AF
+        | attr_index(MAIR_DEVICE_NGNRNE)
+        | flags::PXN
+        | flags::UXN
+        | flags::SH_OUTER
+}
+
+/// Write every page of the installed device map into an L3 table covering
+/// `DEV_WINDOW_VA`.
+///
+/// # Safety
+/// `l3_ptr` must point at a writable, 512-entry L3 table that L0[1]→L1[0]→L2[0]
+/// resolves to.
+unsafe fn write_device_l3(l3_ptr: *mut u64) {
+    let flags = device_page_flags();
+    let (map, n) = device_map();
+    for r in map.iter().take(n) {
+        let first = (r.va - DEV_WINDOW_VA) / PAGE_SIZE;
+        for page in 0..(r.size / PAGE_SIZE) {
+            let pa = (r.pa + page * PAGE_SIZE) as u64;
+            unsafe { l3_ptr.add(first + page).write_volatile(pa | flags) };
+        }
+    }
+}
+
+/// Rewrite the **boot** table's device L3 from the installed device map.
+///
+/// `boot.rs` fills that L3 in pre-MMU assembly from compile-time literals, which
+/// is only enough to reach the console. Once the FDT has been parsed the real
+/// machine addresses are known and may differ — on Firecracker the GIC
+/// redistributor moves with vCPU count — so the boot table has to be corrected
+/// before any GIC or virtio MMIO access. Everything else in the boot table is
+/// left alone.
+///
+/// # Safety
+/// `boot_dev_l3_phys` must be the physical address of the L3 table `boot.rs`
+/// installed under L0[1], and the caller must be running on the boot table (or
+/// on a table sharing that L3) with interrupts disabled.
+pub unsafe fn rebuild_boot_device_table(boot_dev_l3_phys: usize) {
+    unsafe {
+        write_device_l3(phys_to_virt(boot_dev_l3_phys) as *mut u64);
+        core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb");
+    }
+}
 
 /// Allocate the shared L1/L2/L3 device page tables that every user address
 /// space will reference via L0[1].  Must be called once during kernel init,
-/// after the PMM is ready.
+/// after the PMM is ready and after [`set_device_map`].
 pub fn init_shared_device_tables() {
+    debug_assert!(
+        DEV_MAP_LEN.load(Ordering::Acquire) > 0,
+        "init_shared_device_tables before set_device_map: no devices would be mapped"
+    );
+
     let l1 = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).expect("shared dev L1");
     let l2 = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).expect("shared dev L2");
     let l3 = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).expect("shared dev L3");
-
-    let device_page_flags: u64 = flags::VALID | flags::TABLE | flags::AF
-        | attr_index(MAIR_DEVICE_NGNRNE) | flags::PXN | flags::UXN | flags::SH_OUTER;
 
     unsafe {
         let l1_ptr = phys_to_virt(l1.addr) as *mut u64;
@@ -154,9 +272,7 @@ pub fn init_shared_device_tables() {
         // L2[0] -> L3
         l2_ptr.write_volatile((l3.addr as u64) | flags::VALID | flags::TABLE);
 
-        for &(idx, pa) in DEV_PAGES {
-            l3_ptr.add(idx).write_volatile((pa as u64) | device_page_flags);
-        }
+        write_device_l3(l3_ptr);
     }
 
     SHARED_DEV_L1_PHYS.store(l1.addr, Ordering::Release);

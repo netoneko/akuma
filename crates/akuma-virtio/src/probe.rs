@@ -9,21 +9,41 @@
 use akuma_primitives::mmio::MmioReg;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
-/// Number of virtio-mmio slots the QEMU virt machine exposes.
-pub const NUM_SLOTS: usize = 8;
+/// Upper bound on virtio-mmio slots. The *actual* count is
+/// [`akuma_primitives::addr::virtio_slots`], which the machine sets during early
+/// boot; this only sizes the fixed-capacity array [`scan`] returns.
+pub const MAX_SLOTS: usize = 8;
 
-/// The QEMU virt machine's eight virtio-mmio slots, 0x200 bytes apart, as seen
-/// through the kernel's device mapping (`DEV_VIRTIO_VA`, remapped via L0[1]).
-pub const VIRTIO_MMIO_ADDRS: [usize; NUM_SLOTS] = [
-    akuma_primitives::addr::DEV_VIRTIO_VA,
-    akuma_primitives::addr::DEV_VIRTIO_VA + 0x200,
-    akuma_primitives::addr::DEV_VIRTIO_VA + 0x400,
-    akuma_primitives::addr::DEV_VIRTIO_VA + 0x600,
-    akuma_primitives::addr::DEV_VIRTIO_VA + 0x800,
-    akuma_primitives::addr::DEV_VIRTIO_VA + 0xa00,
-    akuma_primitives::addr::DEV_VIRTIO_VA + 0xc00,
-    akuma_primitives::addr::DEV_VIRTIO_VA + 0xe00,
-];
+/// The machine's virtio-mmio slots, as seen through the kernel's device mapping
+/// (`DEV_VIRTIO_VA`, remapped via L0[1]).
+///
+/// This used to be a `const` array with a hardcoded 0x200 stride, which is QEMU
+/// virt's packing — eight slots inside one 4 KiB page. Firecracker uses a
+/// `MMIO_LEN` (0x1000) stride and one page per device, so both the stride and the
+/// count are runtime values now. The probe *logic* below never cared: it walks
+/// whatever addresses it is handed.
+#[must_use]
+pub fn slot_addrs() -> [usize; MAX_SLOTS] {
+    let mut out = [0usize; MAX_SLOTS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = akuma_primitives::addr::virtio_slot_va(i);
+    }
+    out
+}
+
+/// Kernel VA of virtio-mmio slot `i`.
+#[inline]
+#[must_use]
+pub fn slot_addr(i: usize) -> usize {
+    akuma_primitives::addr::virtio_slot_va(i)
+}
+
+/// How many slots to actually walk.
+#[inline]
+#[must_use]
+pub fn num_slots() -> usize {
+    akuma_primitives::addr::virtio_slots().min(MAX_SLOTS)
+}
 
 /// Offset of the `DeviceID` register in the virtio-mmio layout.
 const VIRTIO_MMIO_DEVICE_ID: usize = 0x008;
@@ -40,7 +60,7 @@ pub mod device_id {
 
 /// Read the `DeviceID` of the virtio-mmio slot at `addr`.
 fn device_id_at(addr: usize) -> u32 {
-    // SAFETY: `addr` is one of `VIRTIO_MMIO_ADDRS`, all of which are inside the
+    // SAFETY: `addr` is one of the machine's virtio slots (see `slot_addr`), all
     // device mapping the kernel establishes before any driver init runs. The
     // DeviceID register is read-only and reading it has no side effects.
     let device_id: MmioReg<u32> = unsafe { MmioReg::new(addr + VIRTIO_MMIO_DEVICE_ID) };
@@ -53,8 +73,16 @@ fn device_id_at(addr: usize) -> u32 {
 /// first of a kind: `akuma-rump` binds the **second** virtio-net (the first is
 /// smoltcp's NIC0), so it cannot use [`find`].
 #[must_use]
-pub fn scan() -> [(usize, u32); NUM_SLOTS] {
-    VIRTIO_MMIO_ADDRS.map(|addr| (addr, device_id_at(addr)))
+pub fn scan() -> [(usize, u32); MAX_SLOTS] {
+    let mut out = [(0usize, 0u32); MAX_SLOTS];
+    let n = num_slots();
+    for (i, entry) in out.iter_mut().enumerate() {
+        if i < n {
+            let addr = slot_addr(i);
+            *entry = (addr, device_id_at(addr));
+        }
+    }
+    out
 }
 
 /// Find the first virtio-mmio slot advertising `device_id`, returning
@@ -65,11 +93,9 @@ pub fn scan() -> [(usize, u32); NUM_SLOTS] {
 /// that do want a transport should call [`probe`] instead.
 #[must_use]
 pub fn find(device_id: u32) -> Option<(usize, usize)> {
-    VIRTIO_MMIO_ADDRS
-        .iter()
-        .enumerate()
-        .find(|&(_, &addr)| device_id_at(addr) == device_id)
-        .map(|(i, &addr)| (i, addr))
+    (0..num_slots())
+        .map(|i| (i, slot_addr(i)))
+        .find(|&(_, addr)| device_id_at(addr) == device_id)
 }
 
 /// Find the first virtio-mmio slot advertising `device_id` and build an
@@ -100,7 +126,7 @@ pub fn probe_with<T>(
     device_id: u32,
     mut make: impl FnMut(usize, MmioTransport) -> Option<T>,
 ) -> Option<T> {
-    for (i, &addr) in VIRTIO_MMIO_ADDRS.iter().enumerate() {
+    for (i, addr) in (0..num_slots()).map(|i| (i, slot_addr(i))) {
         if device_id_at(addr) != device_id {
             continue;
         }

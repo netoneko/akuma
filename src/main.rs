@@ -66,6 +66,7 @@ mod network_tests;
 // only; see the module docs and `crates/akuma-net/src/nicstat.rs`.
 #[cfg(feature = "net-profile")]
 mod nic_profile;
+mod platform;
 mod pmm;
 #[cfg(kernel_tests)]
 mod process_tests;
@@ -554,6 +555,27 @@ pub(crate) fn build_exec_runtime(
 fn kernel_main(dtb_ptr: usize) -> ! {
     // Detect memory from DTB (must be done before heap init, so print first)
     console::print("Akuma Kernel starting...\n");
+
+    // =========================================================================
+    // Device map: install before ANY GIC or virtio MMIO access
+    // =========================================================================
+    // `boot.rs` maps only the console UART, because that is the only device whose
+    // address can be a compile-time literal — Firecracker's GIC redistributor
+    // base moves with vCPU count, so the rest has to be discovered. Install the
+    // compile-time bootstrap map now and rewrite the boot table's device L3 from
+    // it, so the GIC and virtio pages exist before `gic::init()` runs.
+    //
+    // This is the bootstrap map, not the authority: `platform::machine`'s
+    // redistributor address assumes one vCPU. The FDT-derived refinement runs
+    // after `detect_memory` below.
+    platform::install_bootstrap_device_map();
+    // SAFETY: still on the boot page table built by `boot.rs`, single-threaded,
+    // before any user address space exists, and `boot_device_l3_phys()` is the L3
+    // that table installed under L0[1].
+    unsafe { mmu::rebuild_boot_device_table(boot::boot_device_l3_phys()) };
+    console::print("[Platform] ");
+    console::print(platform::machine::NAME);
+    console::print(" device map installed\n");
 
     // =========================================================================
     // CRITICAL: Verify kernel binary doesn't overlap with boot stack
@@ -1368,7 +1390,7 @@ fn run_async_main() -> ! {
     console::print("\n--- Network Initialization ---\n");
 
     // Initialize the akuma-net networking stack. The MMIO slot table lives in
-    // `akuma_virtio::VIRTIO_MMIO_ADDRS` now — this used to be a fifth copy of it.
+    // `akuma_virtio::slot_addr` now — this used to be a fifth copy of the table.
     if let Err(e) = akuma_net::init(
         akuma_net::NetRuntime {
             uptime_us: timer::uptime_us,
@@ -1862,11 +1884,15 @@ fn run_async_main() -> ! {
 /// GIC INTID of virtio-mmio slot 0 on the QEMU `virt` machine.
 ///
 /// QEMU wires virtio-mmio transport `i` to SPI `16 + i`, and an SPI's INTID is
-/// `32 + spi` — so slot `i` is INTID `48 + i`. The slot itself is not assumed:
-/// `akuma_virtio::probe` reports which one the NIC actually landed on, because
-/// QEMU's assignment order is not something to hard-code.
+/// `32 + spi` — so slot `i` is INTID `48 + i`. Firecracker instead allocates
+/// device IRQs from `GSI_LEGACY_START = 0`, which is SPI 32, so the same slot is
+/// INTID `32 + i` there. The base therefore comes from the machine description.
+///
+/// The slot itself is not assumed: `akuma_virtio::probe` reports which one the
+/// NIC actually landed on, because neither machine's assignment order is
+/// something to hard-code.
 #[cfg(feature = "smoltcp")]
-const VIRTIO_MMIO_SPI_BASE: u32 = 48;
+const VIRTIO_MMIO_SPI_BASE: u32 = platform::machine::VIRTIO_INTID_BASE;
 
 /// Set by [`ring_netpoll_doorbell`] when it has broadcast a wake, cleared
 /// once the network stack has actually been polled.

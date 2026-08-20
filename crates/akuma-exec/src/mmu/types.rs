@@ -15,8 +15,9 @@ pub const BITS_PER_LEVEL: usize = 9;
 /// `akuma-net` on it. See that module's header for why the table moved whole
 /// rather than one constant at a time.
 pub use akuma_primitives::addr::{
-    DEV_FW_CFG_VA, DEV_GIC_CPU_VA, DEV_GIC_DIST_VA, DEV_GICR_RD_VA, DEV_GICR_SGI_VA, DEV_UART_VA,
-    DEV_VIRTIO_VA,
+    DEV_FW_CFG_VA, DEV_GIC_CPU_VA, DEV_GIC_DIST_SIZE, DEV_GIC_DIST_VA, DEV_GICR_RD_VA,
+    DEV_GICR_SGI_VA, DEV_UART_VA, DEV_VIRTIO_SIZE, DEV_VIRTIO_VA, DEV_WINDOW_NO_OVERLAP,
+    DEV_WINDOW_SIZE, DEV_WINDOW_SPANS, DEV_WINDOW_VA,
 };
 
 pub const MAIR_DEVICE_NGNRNE: u64 = 0;

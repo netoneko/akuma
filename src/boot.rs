@@ -184,9 +184,23 @@ setup_boot_page_tables:
     ldr     x0, =DEVICE_BLOCK
     str     x0, [x13, #0]           // L1[0]
     
-    // L1[1] = 0x4000_0000 - 0x7FFF_FFFF (RAM, 1GB block)
+    // L1[1] = 0x4000_0000 - 0x7FFF_FFFF.
+    //
+    // On QEMU virt this is RAM, so it is a Normal-memory block. On Firecracker it
+    // is the MMIO32 window — the RTC, the serial port and every virtio slot live
+    // in it — so it must be Device. Mapping device registers Normal-cacheable
+    // while the same PAs are also mapped Device through L0[1] is a
+    // mismatched-attribute alias, which the ARM ARM leaves CONSTRAINED
+    // UNPREDICTABLE: the CPU may speculatively read, cache and write back a UART
+    // FIFO or a virtio doorbell. The choice comes from
+    // `crate::platform::machine::MMIO_WINDOW_IS_DEVICE`; the flag values stay
+    // defined once, here in the assembler, rather than mirrored into Rust.
     ldr     x0, =0x40000000
+.if {mmio_window_is_device}
+    ldr     x1, =DEVICE_BLOCK
+.else
     ldr     x1, =NORMAL_BLOCK
+.endif
     orr     x0, x0, x1
     str     x0, [x13, #8]           // L1[1]
     
@@ -215,44 +229,25 @@ setup_boot_page_tables:
     orr     x0, x0, #(PT_VALID | PT_TABLE)
     str     x0, [x15, #0]           // dev_l2[0]
     
-    // Device page entries in boot_dev_l3:
-    // L3[0] = GIC distributor       (PA 0x0800_0000)
-    // L3[1] = GICv2 CPU interface    (PA 0x0801_0000)
-    // L3[2] = UART PL011             (PA 0x0900_0000)
-    // L3[3] = fw_cfg                 (PA 0x0902_0000)
-    // L3[4] = VirtIO MMIO            (PA 0x0A00_0000)
-    // L3[5] = GICv3 redist RD_base   (PA 0x080A_0000)
-    // L3[6] = GICv3 redist SGI_base  (PA 0x080B_0000)
-    // Must mirror DEV_PAGES in crates/akuma-exec/src/mmu/mod.rs.
+    // Device page entries in boot_dev_l3.
+    //
+    // ONLY the UART is mapped here. That is deliberate and is the whole point of
+    // the platform split: this assembly runs before the MMU is fully configured
+    // and long before any FDT can be parsed, so every address it uses has to be
+    // a compile-time literal — and compile-time literals cannot describe
+    // Firecracker's GIC, whose redistributor base moves with the configured vCPU
+    // count (proposals/FIRECRACKER_PORT.md §2.1).
+    //
+    // So the boot table maps exactly enough to make `safe_print!` work, and Rust
+    // installs the real device map from the FDT via
+    // `mmu::rebuild_boot_device_table` before the first GIC or virtio access.
+    // The previous version of this block hardcoded seven QEMU-virt physical
+    // addresses here and a mirrored copy in `akuma-exec`'s `DEV_PAGES`.
     ldr     x1, =DEVICE_PAGE
 
-    ldr     x0, =0x08000000
+    ldr     x0, ={uart_pa}
     orr     x0, x0, x1
-    str     x0, [x16, #0]           // L3[0]: GIC dist
-
-    ldr     x0, =0x08010000
-    orr     x0, x0, x1
-    str     x0, [x16, #8]           // L3[1]: GICv2 CPU iface
-
-    ldr     x0, =0x09000000
-    orr     x0, x0, x1
-    str     x0, [x16, #16]          // L3[2]: UART
-
-    ldr     x0, =0x09020000
-    orr     x0, x0, x1
-    str     x0, [x16, #24]          // L3[3]: fw_cfg
-
-    ldr     x0, =0x0a000000
-    orr     x0, x0, x1
-    str     x0, [x16, #32]          // L3[4]: VirtIO MMIO
-
-    ldr     x0, =0x080a0000
-    orr     x0, x0, x1
-    str     x0, [x16, #40]          // L3[5]: GICv3 redist RD_base
-
-    ldr     x0, =0x080b0000
-    orr     x0, x0, x1
-    str     x0, [x16, #48]          // L3[6]: GICv3 redist SGI_base
+    str     x0, [x16, #({uart_slot} * 8)]   // UART PL011 — the console
 
     // Store TTBR0 address
     adrp    x0, boot_ttbr0_addr
@@ -341,4 +336,28 @@ boot_page_tables:
     .space  4096 * 6
 "#,
     phys_base = const PHYS_BASE,
+    uart_pa = const crate::platform::machine::UART_PA,
+    uart_slot = const UART_L3_SLOT,
+    mmio_window_is_device = const (crate::platform::machine::MMIO_WINDOW_IS_DEVICE as usize),
 );
+
+/// L3 slot the console UART occupies in the L0[1] device window.
+///
+/// Derived from the VA layout rather than written down twice — the boot assembly
+/// and `akuma_exec::mmu` must agree on it, and a mirrored constant is how that
+/// kind of pair drifts.
+const UART_L3_SLOT: usize =
+    (akuma_primitives::addr::DEV_UART_VA - akuma_primitives::addr::DEV_WINDOW_VA) / 4096;
+
+/// Physical address of the L3 table the boot assembly installs under L0[1].
+///
+/// `boot_page_tables` reserves six pages; the device L3 is page 5. Rust needs
+/// this to rewrite the device map once the FDT has been read.
+#[must_use]
+pub fn boot_device_l3_phys() -> usize {
+    unsafe extern "C" {
+        static boot_page_tables: u8;
+    }
+    // SAFETY: taking the address of a linker-provided symbol; no memory access.
+    (&raw const boot_page_tables) as usize + 5 * 4096
+}

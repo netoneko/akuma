@@ -45,7 +45,7 @@ pub use runtime::NetRuntime;
 /// * `enable_dhcp` — Whether to enable DHCP (vs static IP fallback)
 ///
 /// The MMIO slots to probe are no longer a parameter: they are
-/// `akuma_virtio::VIRTIO_MMIO_ADDRS`, which every caller passed anyway.
+/// `akuma_virtio::slot_addr`, which every caller derived the same way anyway.
 #[cfg(feature = "smoltcp")]
 pub fn init(rt: NetRuntime, enable_dhcp: bool) -> Result<(), &'static str> {
     runtime::register(rt);

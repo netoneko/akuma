@@ -28,6 +28,8 @@
 //! a compile-time offset constant or a per-region translation the caller passes
 //! in — not a registered function pointer.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 /// Kernel virtual address → physical address.
 ///
 /// The kernel map is the identity, so this is a no-op that exists to name the
@@ -67,25 +69,149 @@ pub fn phys_to_virt(paddr: usize) -> *mut u8 {
 // `smoltcp_net::init` / `rump_tap::init` precisely because every caller passed
 // the same table.
 
+// Each device gets a *span*, not a single page. The one-page-per-device version
+// of this table is what made every `GICD_IROUTER` write land on the
+// redistributor: `GICD_IROUTER` is at distributor offset 0x6000, and
+// `DEV_GIC_DIST_VA + 0x6000` was exactly `DEV_GICR_SGI_VA`. See
+// `docs/archive/GICD_IROUTER_ALIASING.md`. Spans are asserted non-overlapping
+// by `device_window_spans_do_not_overlap` below and by `DEV_WINDOW_NO_OVERLAP`.
+
 /// GICv2/v3 distributor.
+///
+/// **64 KiB**, not one page: `GICD_IROUTER` starts at offset 0x6000 and the
+/// register file runs to 0xE000 for INTID 1020. A 4 KiB mapping here silently
+/// aliased the distributor's upper registers onto whatever device followed it.
 pub const DEV_GIC_DIST_VA: usize = 0x80_0000_0000;
-/// GICv2 CPU interface.
-pub const DEV_GIC_CPU_VA: usize = 0x80_0000_1000;
+/// Bytes mapped for the distributor. GICv3 mandates 64 KiB.
+pub const DEV_GIC_DIST_SIZE: usize = 0x1_0000;
+
+/// GICv2 CPU interface. Unused under GICv3.
+pub const DEV_GIC_CPU_VA: usize = 0x80_0001_0000;
 /// PL011 UART — the console.
-pub const DEV_UART_VA: usize = 0x80_0000_2000;
-/// QEMU fw_cfg.
-pub const DEV_FW_CFG_VA: usize = 0x80_0000_3000;
-/// Base of the virtio-mmio slot array. Slots are `DEV_VIRTIO_VA + n * 0x200`.
-pub const DEV_VIRTIO_VA: usize = 0x80_0000_4000;
-/// GICv3 redistributor, CPU0 RD_base frame (PA 0x080A_0000). GICR_WAKER lives here.
-pub const DEV_GICR_RD_VA: usize = 0x80_0000_5000;
-/// GICv3 redistributor, CPU0 SGI_base frame (PA 0x080B_0000). SGI/PPI enable,
-/// priority and group registers live here.
-pub const DEV_GICR_SGI_VA: usize = 0x80_0000_6000;
+pub const DEV_UART_VA: usize = 0x80_0001_1000;
+/// QEMU fw_cfg. Absent on Firecracker; the slot is simply left unmapped there.
+pub const DEV_FW_CFG_VA: usize = 0x80_0001_2000;
+/// GICv3 redistributor, CPU0 RD_base frame. `GICR_WAKER` lives here.
+///
+/// One page is enough: every redistributor register this kernel touches
+/// (`GICR_WAKER` at 0x14) is inside the first 4 KiB of the frame.
+pub const DEV_GICR_RD_VA: usize = 0x80_0001_3000;
+/// GICv3 redistributor, CPU0 SGI_base frame. SGI/PPI enable, priority and group
+/// registers live here — all inside the first 4 KiB.
+pub const DEV_GICR_SGI_VA: usize = 0x80_0001_4000;
+
+/// Base of the virtio-mmio slot array.
+///
+/// Slot *n* is at `DEV_VIRTIO_VA + n * virtio_stride()`. The stride is a
+/// **runtime** value because it is machine-specific: QEMU virt packs 8 slots
+/// 0x200 apart inside a single page, while Firecracker gives each device its own
+/// 0x1000 page. [`DEV_VIRTIO_SIZE`] is sized for the larger of the two.
+pub const DEV_VIRTIO_VA: usize = 0x80_0002_0000;
+/// Bytes reserved for the virtio-mmio slot array — 8 slots at a 0x1000 stride.
+pub const DEV_VIRTIO_SIZE: usize = 8 * 0x1000;
+
+/// Runtime virtio-mmio slot geometry.
+///
+/// The stride is machine-specific — QEMU virt packs eight slots 0x200 apart
+/// inside one page, Firecracker gives each device its own 0x1000 page — and the
+/// count is what the machine actually instantiated. Both are set once during
+/// early boot, before any driver probes, and read-only afterwards, so a plain
+/// relaxed atomic is enough: no probe runs on a per-packet path (see the module
+/// header on why this file must not grow a *hook*).
+static VIRTIO_STRIDE: AtomicUsize = AtomicUsize::new(0x200);
+static VIRTIO_SLOTS: AtomicUsize = AtomicUsize::new(8);
+
+/// Bytes between consecutive virtio-mmio slots.
+#[inline]
+#[must_use]
+pub fn virtio_stride() -> usize {
+    VIRTIO_STRIDE.load(Ordering::Relaxed)
+}
+
+/// Number of virtio-mmio slots the machine exposes.
+#[inline]
+#[must_use]
+pub fn virtio_slots() -> usize {
+    VIRTIO_SLOTS.load(Ordering::Relaxed)
+}
+
+/// Kernel VA of virtio-mmio slot `i`.
+#[inline]
+#[must_use]
+pub fn virtio_slot_va(i: usize) -> usize {
+    DEV_VIRTIO_VA + i * virtio_stride()
+}
+
+/// Install the machine's virtio-mmio geometry. Call during early boot, before
+/// any driver probes. `slots * stride` must fit in [`DEV_VIRTIO_SIZE`].
+pub fn set_virtio_geometry(stride: usize, slots: usize) {
+    debug_assert!(stride > 0 && slots > 0, "degenerate virtio geometry");
+    debug_assert!(
+        slots.saturating_mul(stride) <= DEV_VIRTIO_SIZE,
+        "virtio slot array does not fit its VA reservation"
+    );
+    VIRTIO_STRIDE.store(stride, Ordering::Relaxed);
+    VIRTIO_SLOTS.store(slots, Ordering::Relaxed);
+}
+
+/// Every device span in the L0[1] window, as `(base, size)`.
+///
+/// The single source of truth for the layout above. `akuma_exec::mmu` walks this
+/// to build the page tables, so adding a device here is all it takes to get it
+/// mapped — and the overlap assertion below then covers it for free.
+pub const DEV_WINDOW_SPANS: &[(usize, usize)] = &[
+    (DEV_GIC_DIST_VA, DEV_GIC_DIST_SIZE),
+    (DEV_GIC_CPU_VA, 0x1000),
+    (DEV_UART_VA, 0x1000),
+    (DEV_FW_CFG_VA, 0x1000),
+    (DEV_GICR_RD_VA, 0x1000),
+    (DEV_GICR_SGI_VA, 0x1000),
+    (DEV_VIRTIO_VA, DEV_VIRTIO_SIZE),
+];
+
+/// Base of the whole device window. Every span must live inside
+/// `[DEV_WINDOW_VA, DEV_WINDOW_VA + DEV_WINDOW_SIZE)`, which is what one L2
+/// entry's worth of L3 (512 pages, 2 MiB) covers.
+pub const DEV_WINDOW_VA: usize = 0x80_0000_0000;
+/// Size of the device window: one L3 table.
+pub const DEV_WINDOW_SIZE: usize = 512 * 0x1000;
+
+/// Compile-time proof that no two device spans overlap and all are page-aligned
+/// and in-window.
+///
+/// This is the assertion whose absence let the `GICD_IROUTER` aliasing survive:
+/// the old check compared base addresses only, so a 64 KiB device declared as
+/// one page passed it. Evaluating this `const` is what enforces the layout —
+/// `DEV_WINDOW_NO_OVERLAP` is referenced from `akuma_exec::mmu` so it cannot be
+/// optimized into irrelevance.
+pub const DEV_WINDOW_NO_OVERLAP: () = {
+    let n = DEV_WINDOW_SPANS.len();
+    let mut i = 0;
+    while i < n {
+        let (a_base, a_size) = DEV_WINDOW_SPANS[i];
+        assert!(a_base % 4096 == 0, "device span base is not page-aligned");
+        assert!(a_size % 4096 == 0, "device span size is not a page multiple");
+        assert!(a_size > 0, "device span is empty");
+        assert!(
+            a_base >= DEV_WINDOW_VA && a_base - DEV_WINDOW_VA + a_size <= DEV_WINDOW_SIZE,
+            "device span escapes the L0[1] device window"
+        );
+        let mut j = i + 1;
+        while j < n {
+            let (b_base, b_size) = DEV_WINDOW_SPANS[j];
+            assert!(
+                a_base + a_size <= b_base || b_base + b_size <= a_base,
+                "two device spans overlap"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 #[cfg(test)]
 mod tests {
-    use super::{DEV_UART_VA, DEV_VIRTIO_VA, phys_to_virt, virt_to_phys};
+    use super::{phys_to_virt, virt_to_phys};
 
     #[test]
     fn translation_is_the_identity() {
@@ -100,22 +226,40 @@ mod tests {
     }
 
     #[test]
-    fn device_window_pages_are_distinct_and_page_aligned() {
-        // A collision here silently aliases two devices' MMIO.
-        let all = [
-            super::DEV_GIC_DIST_VA,
-            super::DEV_GIC_CPU_VA,
-            DEV_UART_VA,
-            super::DEV_FW_CFG_VA,
-            DEV_VIRTIO_VA,
-            super::DEV_GICR_RD_VA,
-            super::DEV_GICR_SGI_VA,
-        ];
-        for (i, a) in all.iter().enumerate() {
-            assert_eq!(a % 4096, 0, "device VA {a:#x} is not page-aligned");
-            for b in &all[i + 1..] {
-                assert_ne!(a, b, "two devices share VA {a:#x}");
+    fn device_window_spans_do_not_overlap() {
+        // Forcing the const to be evaluated is the actual check; this test exists
+        // so `cargo test` reports it by name rather than only failing a build.
+        //
+        // The predecessor of this test compared *base addresses* only, which is
+        // why it passed for years while `DEV_GIC_DIST_VA + 0x6000` aliased
+        // `DEV_GICR_SGI_VA` — the distributor is 64 KiB but was declared as one
+        // page. See docs/archive/GICD_IROUTER_ALIASING.md.
+        let () = super::DEV_WINDOW_NO_OVERLAP;
+
+        for (i, &(a_base, a_size)) in super::DEV_WINDOW_SPANS.iter().enumerate() {
+            assert_eq!(a_base % 4096, 0, "device VA {a_base:#x} is not page-aligned");
+            for &(b_base, b_size) in &super::DEV_WINDOW_SPANS[i + 1..] {
+                assert!(
+                    a_base + a_size <= b_base || b_base + b_size <= a_base,
+                    "spans {a_base:#x}+{a_size:#x} and {b_base:#x}+{b_size:#x} overlap"
+                );
             }
         }
+    }
+
+    #[test]
+    fn gicd_irouter_stays_inside_the_distributor_span() {
+        // The specific regression: GICD_IROUTER is at distributor offset 0x6000,
+        // 8 bytes per INTID from INTID 0. The highest INTID this kernel can pass
+        // to enable_irq is 1019, so the last byte touched is 0x6000 + 1019*8 + 8.
+        const IROUTER: usize = 0x6000;
+        const MAX_INTID: usize = 1019;
+        let last = IROUTER + MAX_INTID * 8 + 8;
+        assert!(
+            last <= super::DEV_GIC_DIST_SIZE,
+            "GICD_IROUTER for INTID {MAX_INTID} ends at {last:#x}, past the \
+             {:#x}-byte distributor mapping",
+            super::DEV_GIC_DIST_SIZE
+        );
     }
 }

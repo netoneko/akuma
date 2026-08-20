@@ -48,7 +48,7 @@ pub mod rng;
 pub mod audio;
 
 pub use hal::VirtioHal;
-pub use probe::{VIRTIO_MMIO_ADDRS, device_id};
+pub use probe::{device_id, num_slots, slot_addr, slot_addrs};
 
 /// The tree's one heap-free print macro, re-exported so this crate's
 /// `crate::safe_print!(…)` call sites resolve.

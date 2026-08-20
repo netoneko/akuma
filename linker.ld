@@ -17,8 +17,16 @@ KERNEL_VIRT_BASE = 0xFFFF000040000000;
  *
  * Pre-kernel region [0x40000000, 0x40100000) (1 MB) is free space reclaimed
  * to the PMM pool after early boot.
+ *
+ * Firecracker uses the same text_offset rule but a different base: its loader
+ * places the image at get_kernel_start() (0x80200000) + text_offset, so the
+ * kernel lands at 0x80300000. That is selected by the `platform-firecracker`
+ * feature, which makes build.rs pass --defsym=KERNEL_PHYS_BASE_OVERRIDE. Keeping
+ * it a defsym rather than a second linker script means the two machines cannot
+ * drift apart in the rest of this file.
+ * Must match `config::KERNEL_PHYS_BASE` and `text_offset` in boot.rs.
  */
-KERNEL_PHYS_BASE = 0x40100000;
+KERNEL_PHYS_BASE = DEFINED(KERNEL_PHYS_BASE_OVERRIDE) ? KERNEL_PHYS_BASE_OVERRIDE : 0x40100000;
 
 /* Offset to convert between physical and virtual */
 KERNEL_OFFSET = KERNEL_VIRT_BASE - KERNEL_PHYS_BASE;

@@ -137,6 +137,20 @@ default = [
 ]
 no-tests = ["akuma-net/small-sockets"]
 
+# Target Firecracker's aarch64 microVM instead of QEMU `virt`.
+#
+# Selects the machine description in `src/platform.rs`: guest RAM at 2 GiB, the
+# PL011 at 0x4000_2000, virtio-mmio on a 0x1000 stride from 0x4000_3000 with
+# INTID base 32, no fw_cfg, and the 0x4000_0000 identity block mapped Device
+# (it is Firecracker's MMIO window, not RAM). Also moves KERNEL_PHYS_BASE to
+# 0x8030_0000 — Firecracker loads at `get_kernel_start()` (0x8020_0000) plus the
+# Image header's text_offset (1 MiB).
+#
+# The device *physical* addresses this sets are a bootstrap map only; the real
+# ones come from the FDT at runtime, because Firecracker's GIC redistributor base
+# depends on vCPU count. See proposals/FIRECRACKER_PORT.md.
+platform-firecracker = []
+
 # Support for a server handling many simultaneous connections: a deeper
 # per-listener backlog and a larger socket budget (see
 # `crates/akuma-net/src/socket.rs` `MAX_BACKLOG`). IN `default` — it is the

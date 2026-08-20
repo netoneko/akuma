@@ -658,9 +658,23 @@ fn dsb_sy() {
 // The boot L1[0] block identity-maps device space, so a secondary on the shared boot
 // tables reaches its own redistributor at its physical address directly. Constants
 // mirror `crate::smp` (kept private here so the multikernel path stays untouched).
-const GICR_BASE: usize = 0x080A_0000;
-const GICR_STRIDE: usize = 0x2_0000;
-const GICR_SGI_OFFSET: usize = 0x1_0000;
+/// Base of the GICv3 redistributor region, as a **physical** address.
+///
+/// Secondaries reach the redistributor through the low identity mapping
+/// (`boot.rs` L1[0] maps 0..1 GiB as a device block, and the GIC is below 1 GiB
+/// on both supported machines) rather than through the L0[1] device window,
+/// because this runs during bringup on the boot page table.
+///
+/// The value is machine-specific, and on Firecracker it also depends on the
+/// configured vCPU count — see `crate::platform`. It is read from the installed
+/// device map so that a redistributor discovered from the FDT wins over the
+/// compile-time bootstrap literal; getting this wrong points a core at another
+/// core's frames, which silently costs it its timer interrupt.
+fn gicr_base() -> usize {
+    crate::platform::gicr_base_pa()
+}
+const GICR_STRIDE: usize = crate::platform::GICR_STRIDE;
+const GICR_SGI_OFFSET: usize = crate::platform::GICR_SGI_OFFSET;
 const GICR_WAKER: usize = 0x0014;
 const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
 const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
@@ -706,7 +720,7 @@ fn secondary_gic_init(idx: usize) {
         core::arch::asm!("msr S3_0_C12_C12_7, {0}", in(reg) 1u64, options(nomem, nostack)); // ICC_IGRPEN1_EL1
         core::arch::asm!("isb", options(nomem, nostack));
     }
-    let rd = GICR_BASE + idx * GICR_STRIDE;
+    let rd = gicr_base() + idx * GICR_STRIDE;
     let sgi = rd + GICR_SGI_OFFSET;
     let waker = rd + GICR_WAKER;
     mmio_w32(waker, mmio_r32(waker) & !GICR_WAKER_PROCESSOR_SLEEP);
