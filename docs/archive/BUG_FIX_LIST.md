@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 634
-- **Docs contributing at least one fix:** 202
+- **Total distinct fixes counted:** 646
+- **Docs contributing at least one fix:** 208
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 127 | 20.0% | 17 |
-| Memory & Virtual Memory | 112 | 17.7% | 34 |
-| Scheduler & Process Management | 76 | 12.0% | 19 |
-| SMP & Locking | 81 | 12.8% | 35 |
-| Networking | 37 | 5.8% | 15 |
-| Userspace Apps & Libraries | 37 | 5.8% | 20 |
+| Syscall / ABI Compatibility Audits | 127 | 19.7% | 17 |
+| Memory & Virtual Memory | 113 | 17.5% | 35 |
+| Scheduler & Process Management | 76 | 11.8% | 19 |
+| SMP & Locking | 86 | 13.3% | 37 |
+| Networking | 42 | 6.5% | 17 |
+| Userspace Apps & Libraries | 37 | 5.7% | 20 |
 | Rump Kernel & Syscall Proxy | 25 | 3.9% | 6 |
-| Toolchain & Self-Hosting | 37 | 5.8% | 5 |
-| SSH | 15 | 2.4% | 13 |
-| VFS & Filesystem | 16 | 2.5% | 11 |
+| Toolchain & Self-Hosting | 37 | 5.7% | 5 |
+| SSH | 15 | 2.3% | 13 |
+| VFS & Filesystem | 17 | 2.6% | 12 |
 | Boot & Drivers | 11 | 1.7% | 6 |
 | Signals & Exceptions | 12 | 1.9% | 5 |
 | Misc / Cross-cutting | 14 | 2.2% | 4 |
-| Console & Terminal | 15 | 2.4% | 7 |
-| Containers | 19 | 3.0% | 5 |
-| **Total** | **634** | **100.0%** | **202** |
+| Console & Terminal | 15 | 2.3% | 7 |
+| Containers | 19 | 2.9% | 5 |
+| **Total** | **646** | **100.0%** | **208** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -171,7 +171,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/WRITEV_SHORT_WRITE_SPLICE.md
 - `sys_writev` did not stop at a **short** write: after an iovec that wrote fewer bytes than it was given, it moved on to the next one, so the tail that never went out was replaced by the following iovec's bytes and the caller — told only a total — resumed from a point that did not correspond to what had actually been written. Short writes are the normal case here (`socket_send` returns whatever fit in smoltcp's 16 KB TX buffer, and it ends with a `poll()` that frees TX space so the *next* iovec usually succeeds), so every socket reply larger than the TX window came out spliced; `redis-cli` reported it as `Protocol error, got "\n" as reply type byte`, and an A/B on the same VM showed 4/16 KiB replies clean while 64 KiB, 256 KiB and 1 MiB corrupted — with the first wrong byte `0x0d` in all three, i.e. the `\r\n` of the next iovec. `sys_readv` had always had the mirror guard
 
-## Memory & Virtual Memory (112 fixes, 34 docs)
+## Memory & Virtual Memory (113 fixes, 35 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -353,6 +353,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - The `extreme-size` profile's 64 KB user-thread kernel stack was ~10 KB too small for the userspace-sshd session path (measured 74 KB), so every ssh session ran off the end of its kernel stack and corrupted whatever frame sat below it — usually the session process's own L3 page table, unmapping part of its heap and producing a SIGSEGV with no relationship to the real cause; fixed by raising `USER_THREAD_STACK_SIZE` to 128 KB on `extreme`
 - `ENABLE_STACK_CANARIES` painted a canary at every stack base and `check_all_stack_canaries()` existed to check them, but nothing anywhere called it, so a stack overrun that corrupted a page table left no diagnostic trail; fixed by checking the canary at thread teardown and from a periodic idle-maintenance pass for still-live threads, printing `[STACK-OVERFLOW] tid=N ran off its NKB kernel stack`
 
+### docs/archive/AKUMA_SCHEDULING_EXTRACTION.md
+- The file-page cache cap was a fixed `RAM/8` with no headroom, so a single mmap'd file larger than the cap (a 532 MB llama.cpp model against a 512 MB cap at `MEMORY=4096`) evicted its own still-mapped hot pages every pass, costing the next mapper of the same file a `read_at` off ext2; fixed with an elastic cap (`FPCACHE_INFLATE_PCT`, default +20%, granted when free RAM clears a 2x headroom threshold and withdrawn only below 1x, hysteresis-gated so a workload parked on the line can't flap the cap) — real for any workload with more than one mapper of the same oversized file (concurrent `rustc`s on one `.so`, boxes sharing a rootfs), though it did not move the single-mapper llama.cpp throughput it was raised to fix
+
 
 ## Scheduler & Process Management (76 fixes, 19 docs)
 
@@ -472,7 +475,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - Expired sleepers/pollers rejoined the back of the round-robin queue instead of running next, and the 10 ms timer tick meant every sleep/poll deadline paid a full round (~35 ms floor at SMP=1, ~13 ms more per additional runnable thread) — measured as terminal output forwarded in ~27 Hz bursts; fixed via `WAKE_DEADLINE_PREEMPT` (arms the existing `PREEMPT_WAKE_TID` run-next hint from the deadline wake-pass instead of only from `ThreadWaker::wake`) plus dropping `TIMER_INTERVAL_US` 10 000→1 000, profile-gated (`extreme-size` keeps 10 ms) — A/B'd clean on release SMP=1/SMP=4, the 4 MB extreme-size floor, and devbox-smoltcp SMP=4
 
 
-## SMP & Locking (81 fixes, 35 docs)
+## SMP & Locking (86 fixes, 37 docs)
 
 ### docs/archive/SMP_GO_STRESS_CORRUPTION_FIX.md
 (standalone writeup of the same 2026-07-22 investigation SMP_SHARED.md's own
@@ -632,7 +635,16 @@ aren't recorded anywhere else.)
 - `threading::init` stored `FREE` over the `RUNNING` state of thread slots secondary cores had already adopted (self-test image brings secondaries up before init), handing live slots back to the allocator for the next `claim_free_slot` to hand out a second time — fixed by skipping adopted core-idle slots in the state-reset loop
 - The same init's stack pre-allocation loop overwrote those slots' `stacks[i]` and `exception_stack_top` with fresh PMM stacks nothing was executing on, so `validate_current_sp`, the canary check and the high-water probe all read the wrong memory for a live core — and it silently vacuumed the boot suite's `spurious == 0` canary assertion, which is why the bug above went unnoticed; fixed by the same `is_adopted_core_idle` guard, with regression `test_core_idle_slots_survive_init`
 
-## Networking (37 fixes, 15 docs)
+### docs/archive/CROSS_CORE_THREAD_COLLAPSE.md
+- `CNTKCTL_EL1` was never programmed, so EL0 reads of `CNTVCT_EL0`/`CNTFRQ_EL0` stayed trapped to EL1 (~1M pairs/s under a multi-threaded compute workload, 30-80% of every core), and the EC=0x18 trap emulation returned 0 for every register except `CTR_EL0` — userspace's hardware clock was frozen at zero, which turned ggml's spin/park heuristics pathological; fixed by setting `CNTKCTL_EL1 = 0b10` (EL0VCTEN) at boot and secondary bringup plus real-value fallbacks in the trap emulation (llama.cpp decode `-t 1`: 36.0 → 45.6 tok/s)
+- The SGI scheduler switch performed an unconditional `tlbi vmalle1` (flushes all ASIDs on the core, including the kernel's own translations) on every context switch, even between sibling threads of the same process sharing one TTBR0 — with a 1 ms tick, two threads alternating on one core paid a full TLB + walk-cache rebuild up to 1000x/s over an mmap'd model's working set; fixed by skipping the `msr ttbr0_el1` + flush when the incoming thread's TTBR0 already matches the live one (`-t 2` decode: 1.61 → 2.5-4.2 tok/s)
+- The involuntary-tick idle fallback switched a RUNNING thread out to the per-core idle thread whenever the scheduler scan found no other READY thread, even though nothing else was runnable, so every CPU-bound single-busy-thread bounced core → idle → another core every tick (idle threads billed ~39% CPU each); fixed by returning "keep running" from the fallback instead, gated on the tick having interrupted EL0 (an EL1-interrupted thread still needs the idle bounce as the BKL's release valve)
+- Round-robin displaced a RUNNING thread for any other READY thread with no preference for routing that work to an idle core first, so barrier-synchronized worker threads (llama.cpp `-t 2`+) bounced off-CPU every tick while their partner spun waiting on the barrier, degrading to futex park/wake at ~1ms per round trip; fixed with a bounded displacement-immunity mechanism (a thread may decline displacement for up to 4 consecutive ticks unless an idle peer core is found first) — `tg16 -t 2` 2.5 → 21.8-22.3 tok/s (13.5x)
+
+### docs/archive/BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md
+- Commit `1a29c9c3` dropped `blocking_relax()`'s leading `yield_now()` for every caller to speed up the socket wait loop (+27% HTTP throughput), but the spawn/exec/reap waiters — woken by another thread on their own core, not by a device interrupt — genuinely need that yield to hand off, so removing it kernel-wide permanently wedged `SMP=4` in the spawn/exec/reap path (boot suite: 294 passed → 23 passed, wedged); fixed by splitting the primitive into `blocking_relax_net` (no yield) wired only into `NetRuntime::blocking_relax`, keeping the yield everywhere else (294 passed, +30% HTTP throughput preserved)
+
+## Networking (42 fixes, 17 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - `MAX_BACKLOG = 8` (`crates/akuma-net/src/socket.rs`) was a hard ceiling on **simultaneous connection arrivals**, not the soft hint `listen(2)`'s backlog is on Linux: this stack has no SYN queue, a listener *is* a fixed pool of pre-created sockets sitting in `Listen` that `socket_accept` replenishes one at a time, so arrivals past the 8th got a RST regardless of how fast the server accepted. Every caller's requested backlog was silently clamped to it (`libakuma`'s `TcpListener::bind` asks for 128). Measured on devbox-smoltcp/SMP=4: 8/8 connections clean, 12/16, 17/24 before; 16/16 and 24/24 after. Raised to 32 behind the default-on `many-sessions` feature, which also lifts the smoltcp socket table from 32 to 128 on `small-sockets` builds — a 32-deep backlog is meaningless against a 32-socket budget. `kernel_profile_extreme` overrides both back down, so the 4 MB floor is unaffected
@@ -701,6 +713,15 @@ aren't recorded anywhere else.)
 ### docs/archive/TOKIO_PIPE_EPOLL_HANG.md
 - `PipeRead` ignored `O_NONBLOCK` and blocked instead of returning `EAGAIN`, and a pipe's `EPOLLET` `EPOLLIN` edge was never re-armed on read/EAGAIN (nor was `EPOLLHUP` ever reported once the last writer closed), so any edge-triggered reader (tokio/mio, and therefore `nca`) that drained a child's stdout then went back to `epoll_wait` for EOF hung forever, looking like a healthy-but-stuck process; fixed by honoring `fd_is_nonblock` in `PipeRead`'s `sys_read` arm and calling `epoll_on_fd_drained` on every pipe read and `EAGAIN`, plus reporting `EPOLLHUP` once the last writer is gone
 - The `Stdin` arm of `sys_read` had the identical two defects (no `O_NONBLOCK` check, no `epoll_on_fd_drained` re-arm), independently and never carried over from the `PipeRead` fix above — since `nca`'s keystroke path also goes through edge-triggered epoll (crossterm's default `mio` backend) on fd 0, a read after draining one keystroke blocked inside the syscall for the full idle gap until the next one arrived, manifesting as multi-minute input freezes; fixed the same way, mirroring the `PipeRead` fix in the `Stdin` arm
+
+### docs/archive/AKUMA_NET_ISSUES.md
+- No virtio-net RX interrupt was registered at all (`src/main.rs` enabled only the timer IRQ) because `gic_v3::enable_irq`'s SPI arm only wrote `GICD_ISENABLER`, whose reset state is Group 0 while the kernel only enables Group 1 — an SPI configured that way never reaches the CPU; every packet wait therefore fell back to the 3 ms timer tick (measured 4.9-5.2 ms average park); fixed by programming `GICD_IGROUPR`/`GICD_IPRIORITYR`/`GICD_IROUTER` before `GICD_ISENABLER`
+- An SPI is delivered to one core only, so a `blocking_relax` waiter halted on a different core never saw the NIC's interrupt and slept to the next tick regardless; fixed by broadcasting the scheduler SGI from `nic_irq_handler`, rate-limited by a `NIC_WAKE_PENDING` doorbell coalescer so a burst rings once per drain instead of once per packet (median request latency 2,148us → 645us)
+- Socket slots exhausted under a round-trip HTTP workload (26% connection errors at ~175 req/s) — a closed socket sat in `pending_removal` until TCP teardown or the 30s `SOCKET_GC_TIMEOUT_US` expired, and connection-per-request traffic retired sockets faster than that GC allowed; fixed with pressure-driven socket reclaim (26% errors → 0%)
+- The netpoll drain re-armed the NIC doorbell (`NIC_WAKE_PENDING.store(false)`) *after* draining, not before — a packet arriving between the last `poll()` returning false and the re-arm found the doorbell already set, so the interrupt handler raised no broadcast and the packet's wake was then erased by the re-arm, leaving every core to sleep to the next tick; fixed by re-arming before the drain instead of after (+65% req/s, p99 2.3x-2.7x tighter, p50 to Linux parity)
+
+### docs/archive/CARGO_CRATES_IO_CONNECT_FAIL.md
+- `sys_pselect6` never wrote the caller's `exceptfds` set back, so any `select(2)`-based caller reading it after a call saw whatever was passed in as still set; the nightly musl toolchain's vendored libcurl (built without `HAVE_POLL`) uses the `select(2)` branch and puts a connecting socket in `exceptfds` to watch for `POLLPRI`, so `FD_ISSET` stayed true, libcurl synthesised a false `POLLPRI`, mapped it to `CURL_CSELECT_ERR`, and discarded sockets that had already reached `Established` with `SO_ERROR == 0` — `cargo fetch`/`build` looped on "spurious network error" forever; fixed by zeroing `exceptfds` on both the ready and timeout path (`src/syscall/poll.rs`)
 
 ## Userspace Apps & Libraries (37 fixes, 20 docs)
 
@@ -918,7 +939,7 @@ aren't recorded anywhere else.)
 
 ---
 
-## VFS & Filesystem (16 fixes, 11 docs)
+## VFS & Filesystem (17 fixes, 12 docs)
 
 ### docs/archive/STAT_AND_UNLINKAT_FIX.md
 - Root cause 1: `stat()` returned `st_ino=0` for every file
@@ -957,6 +978,9 @@ aren't recorded anywhere else.)
 
 ### docs/archive/NCA_FD_NONBLOCK_TOCTOU.md
 - `sys_close` cleared an fd's `cloexec` flag immediately after freeing its table slot but its `nonblock` flag only after the slot's resource-cleanup match arm ran; in that window a concurrent thread on the same shared fd table (`CLONE_THREAD`) could `alloc_fd` the exact same fd number for an unrelated new pipe, inherit the previous occupant's stale `nonblock` bit (or have its own legitimately-set flag wiped out by the closer's now-late clear) — real `cargo`/`rustc` spawns from cargo's multi-threaded jobserver hit this as a spurious `EAGAIN` on what should be a blocking child-error-pipe read (24/40 failures reproduced under 4 concurrent threads); fixed by clearing `nonblock` immediately alongside `cloexec` in `sys_close`/`sys_close_range`, copying `nonblock` onto `newfd` in `sys_dup3` (which shares the open-file-description on real Linux but didn't propagate the flag here), and defensively clearing both flags in `alloc_fd_from` before a freed fd number is ever reissued
+
+### docs/archive/APK_OTMPFILE_DIR_FD.md
+- `sys_openat` neither implemented `O_TMPFILE` nor rejected write-mode opens of directories, so apk-tools 3's atomic-write path (`openat(dirfd, ".", O_RDWR|O_TMPFILE)`) silently succeeded with a writable fd on the directory itself, and every subsequent `write()` failed `EISDIR` at the wrong syscall — `apk update`/`apk add` installed files but never wrote the database; fixed by answering `O_TMPFILE` with `EINVAL` (apk falls back to `.tmp`+`renameat`, which works) and write-mode opens of an existing directory with `EISDIR` at open() time (closes `DEVBOX_ISSUES.md` Issue 20)
 
 
 ## Boot & Drivers (11 fixes, 6 docs)
@@ -1123,7 +1147,7 @@ Also re-scanned 2026-08-15 (completing the `TRIM_FAT_EMBARASSING_DUPLICATIONS.md
 
 Also re-scanned 2026-08-15 (the whole branch's unaudited archive docs, ahead of closing it): CARGO_HEAP_NULL_RC (the task brief for the cargo-null-`Rc` hunt; explicitly defers its fix to MADV_DONTNEED_SHARED_FRAME, counted there — "not duplicated here, so this file cannot drift from it"), HOST_TESTS_AUDIT (a boot-test-to-host-test movability survey; every finding is a scaffolding recommendation, none a landed fix), LINUX_COMPATIBILITY_ISSUES ("this list is a byproduct, not an audit" — a register of known ABI divergences, explicitly open except the one `mremap` fix, which is counted under USER_COPY_FOLD.md), REPR_C_SIGFRAME_STATX (Phase 7's `#[repr(C)]` hardening pass — behaviour-preserving by its own claim; its two Linux-layout divergences are found and *deliberately not fixed*, and its narrowing behaviour changes are inherited from the already-counted USER_COPY_FOLD.md AP-bit fix, not new here), SMP_FORK_EXEC_CORRUPTION_FIX (a restored 2026-07-21/31 dossier; every fix in it — the `demote_range_to_ro` DSB barrier, `LifecycleGuard`'s active preemption-disable, the BKL ticket-leak self-heal, `COW_FAULT_LOCK`'s non-fix — is a duplicate mention already counted under SMP_SHARED.md, BKL_PROCESS_CARVE_OUT.md, or COW_PILE_AUDIT.md's F3), TRIM_FAT_REMOVAL_FEASIBILITY (feasibility/scoping analysis for the in-kernel SSH/shell/editor and `libakuma` removals — no landed fix of its own; the removal it scoped is counted under BUILTIN_SSH_REMOVAL.md), UNSAFE_AUDIT (the audit that spawned USER_COPY_FOLD.md, REPR_C_SIGFRAME_STATX.md and the RNG driver fixes — every "DONE"/"FIXED" marker in it points at one of those, none is new), and ZERO_PAGE_ICE_FIX (the umbrella summary of the self-host `[0,0,0,0]` ICE hunt; its two named root causes are counted under PREFAULT_INODE_STUB_ZERO_PAGES.md and SELFHOST_ZERO_PAGE_HUNT.md §14–§15, and the "two real bugs found and fixed" it lists verbatim are counted under SELFHOST_ZERO_PAGE_HUNT.md §8–§9).
 
-Also re-scanned 2026-08-12: CARGO_CRATES_IO_CONNECT_FAIL (root cause isolated, "fix not yet chosen" — five options, none landed), MINIMAL_DEV_BUSYBOX_APPLETS (an applet-coverage survey; its three verification findings — `utimensat` hardcoded to `0`, `getgroups` undispatched, no `/etc/passwd` on the devbox overlay — carry "fix shape" proposals, not fixes), TRIM_FAT_HAND_ROLLED_JSON (an audit of hand-rolled JSON across the tree; the bugs it reproduces in `herd` and `meow` are unfixed), HERD_PLUS_BOX (a proposed restructuring, explicitly not implemented — it will be renamed `TRIM_FAT_HERD_PLUS_BOX` and re-scanned when it lands), and userspace/box/BOX_RUN (current-state reference; the one fix it mentions is BOX_DOCKER_COMPAT's session-closing bug, counted there). AKUMA_SELF_HOSTING gained only a quick-start section — no change to its count. The same pass found three docs that had never been counted at all, all now listed above: DEVBOX_ISSUES (Misc), and the two deep-dives its Issues 2 and 3 point at, TERM_POLL_INPUT_PREEMPTION_FIX and UART_SMP_INTERLEAVE_FIX (both Console &amp; Terminal).
+Also re-scanned 2026-08-12: CARGO_CRATES_IO_CONNECT_FAIL (root cause isolated, "fix not yet chosen" — five options, none landed; **fixed 2026-08-20, now counted under Networking**), MINIMAL_DEV_BUSYBOX_APPLETS (an applet-coverage survey; its three verification findings — `utimensat` hardcoded to `0`, `getgroups` undispatched, no `/etc/passwd` on the devbox overlay — carry "fix shape" proposals, not fixes), TRIM_FAT_HAND_ROLLED_JSON (an audit of hand-rolled JSON across the tree; the bugs it reproduces in `herd` and `meow` are unfixed), HERD_PLUS_BOX (a proposed restructuring, explicitly not implemented — it will be renamed `TRIM_FAT_HERD_PLUS_BOX` and re-scanned when it lands), and userspace/box/BOX_RUN (current-state reference; the one fix it mentions is BOX_DOCKER_COMPAT's session-closing bug, counted there). AKUMA_SELF_HOSTING gained only a quick-start section — no change to its count. The same pass found three docs that had never been counted at all, all now listed above: DEVBOX_ISSUES (Misc), and the two deep-dives its Issues 2 and 3 point at, TERM_POLL_INPUT_PREEMPTION_FIX and UART_SMP_INTERLEAVE_FIX (both Console &amp; Terminal).
 
 docs/archive: 4MB_STABLE_AGENT, AI_DEBUGGING, ARCHITECTURE, BKL_DRIVERS_CARVE_OUT, BKL_PHASE7B_PPOLL_CARVE_OUT (piece 2 reverted after A/B caught real corruption), BKL_PHASE7D_THREAD_CONTEXTS (dead/unreachable code removed, not a live bug), BKL_PHASE7F_OPTOUT_LIST, BKL_RUSTC_SCALING_BASELINE, BOX_SUBDIR_FS_LIMITATIONS, C_STUBS, CGI, COMMAND_CHAINING_SSH_BUGS, CONCURRENCY, CONTAINERS_STAGE_1_PLAN, CONTAINERS_STAGE_2_PLAN, CP_MV_IMPLEMENTATION_PLAN, CRUSH_MISSING_SYSCALLS (all gaps, none marked fixed), CWD, DEAD_CODE_ANALYSIS, DEAD_CODE_SWEEP_FINDINGS (findings only, explicitly "nothing here is fixed. No source was edited"), DEV_RANDOM, DEV_ZERO, DOCKER, EMBASSY_REMOVAL, ERRORS_TO_CHECK, EXTREME_STACK_TRIMMING (perf, not bugs), FORKTEST_GO_HANG_FIX (its one fix — the `sys_waitid` ECHILD-on-non-child parentage check — is the exact same 2026-07-22 investigation already counted under SMP_SHARED.md's "forktest_parent (Go) hang" entry), FRANKENLIBC_EVAL, FREEZE_INSTRUMENTATION_PLAN, HEAP_AND_MEMORY_IMPROVEMENTS, HERD, HERD_ADD_AND_PATH_VALIDATION, HIJACK_VS_KERNEL_PROXY (analysis/validation only), IMPLEMENTATION_PLAN (rump phases, milestones only), INTERACTIVE_IO, J4_HANG_LIVE_AUTOPSY (verbatim session record; its 3 fixes are counted once under KTG_STALE_TID_EXIT_STAMP_J4_HANG.md), KILL_COMMAND, LARGE_BINARY_LOAD_PERFORMANCE, LINE_COUNT_ANALYSIS (line-count/dead-code statistics and cross-kernel comparison, not a bugfix), LOCK_REFERENCE, LOOPBACK_TIMEOUT_FIX_PLAN (plan, not landed), MEMORY_LAYOUT (duplicate of AKUMA_SELF_HOSTING §3), MULTIKERNEL, MULTITASKING, MUSL_COMPATIBILITY, NAMESPACES, NATIVE_STACK_INTERNET, NEEDLE_SERVER, NETWORKING_PERFORMANCE_AND_THREAD_SAFETY_ANALYSIS, ON_DEMAND_ELF_LOADER, OOM_BEHAVIOR, OOM_RECOVERY_OPTIONS, PAWS_PLAN, PAWS_TO_SSH_SHELL_PLAN, PHASE01_BUILDRUMP, PHASE1_COMPLETION_BASELINE, PHASE1_NETWORK_LOCK_FOUNDATION, PHASE2_RUMPUSER, PHASE3_KERNEL_TAP, PLAN_SIGSEGV_COMPILE_FIX, POSSIBLE_MEMORY_LEAK, POST_EXIT_PMM_RECLAIM, PROCESS_MEMORY_CLEANUP, PROCFS, PROPER_EXECVE_PLAN, QJS, refactor_plan, RSA_FEATURE_GATE, RUMP_LATENCY_SLEEP_FIX (hypothesis disproven, patches reverted), RUMP_PLUS_HERD, SCHEDULING_TIMING_ISSUES (open/critical, not fixed), SCRATCH, SEPARATE_SHELL_BINARY, SHARED_FD_TABLES, SHELL_ENVIRONMENT_VARIABLES, SHELL_LIMITATIONS, SIGNAL_DELIVERY_FORKTEST_EVIDENCE (summary of fixes counted elsewhere), SMOLTCP_MIGRATION_SUMMARY (duplicate summary), SMP_SHARED_M5_FAULT_LOCK_PLAN, SSH, SSH_PERFORMANCE_FIX_2026, SSH_THREADING_BUG (superseded, duplicate), STRATEGY_A_IMMEDIATE_TUNING, STRATEGY_B_SMOLTCP_MIGRATION (duplicate), STRATEGY_C_IRQ_WAKEUPS, SYSCALL_BLOCKING, SYSCALL_ERRNO_COMPLIANCE_CHANGES, SYSCALL_HARDENING, TCC_LOW_MEMORY, TCP_SEQUENCE_UNDERFLOW_PANIC, TERMINAL_SYSCALLS (duplicate reference), TLS_DOWNLOAD_PERFORMANCE, TLS_INFRASTRUCTURE, TOP_CORE_COLUMN_PLAN, TRIM_FAT_PART_1, TRIM_FAT_PART_2, TRIM_FAT_PART_3 (pure component-removal log, no bugfix content — same shape as TRIM_FAT_PART_2), TWO_VMS_AGENT_DEMO, UNIFIED_CONTEXT_ARCHITECTURE (duplicate of FAR_0x5/THREADING_RACE_CONDITIONS fixes), UNIFIED_PROCESS_ABI, UNSAFE_POINTERS_AND_ATOMICITY, USERSPACE_MEMORY_MODEL, USERSPACE_SOCKET_API, VFS_LOCK_OPTIMIZATION_PLAN, WAIT_QUEUES, MEOW.
 
