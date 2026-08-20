@@ -117,6 +117,39 @@ pub fn kernel_va_end() -> usize {
     (ram_end() + GB - 1) & !(GB - 1)
 }
 
+/// Bounds of the kernel image window, used by the exception/scheduler tripwires
+/// to classify an `ELR` as kernel or user code.
+///
+/// Runtime rather than `const` because the kernel's load address is
+/// machine-specific: `0x4010_0000` on QEMU virt, `0x8030_0000` under Firecracker.
+/// A hardcoded `0x4010_0000..0x6000_0000` here (and in five places in
+/// `src/exceptions.rs`) inverted into an empty range on Firecracker, so every
+/// legitimate EL1 frame was reported as poisoned — `[SGI-S POISON]` and
+/// `[IRQ POISON]` on every scheduler switch and timer tick.
+static KERNEL_TEXT_START: AtomicUsize = AtomicUsize::new(0x4010_0000);
+static KERNEL_TEXT_END: AtomicUsize = AtomicUsize::new(0x6000_0000);
+
+/// Install the kernel image window. Call once during early init, from the kernel
+/// crate that owns `config::KERNEL_PHYS_BASE`.
+pub fn set_kernel_text_window(start: usize, end: usize) {
+    debug_assert!(start < end, "kernel text window is inverted or empty");
+    KERNEL_TEXT_START.store(start, Ordering::Relaxed);
+    KERNEL_TEXT_END.store(end, Ordering::Relaxed);
+}
+
+/// Is `addr` inside the kernel image window?
+///
+/// Two relaxed atomic loads. These run on the IRQ and context-switch paths, which
+/// already do two `read_volatile`s of the trap frame right beside this call, so
+/// the cost is in the noise — and correctness across machines is worth more than
+/// a `const` here.
+#[inline]
+#[must_use]
+pub fn is_kernel_text(addr: usize) -> bool {
+    addr >= KERNEL_TEXT_START.load(Ordering::Relaxed)
+        && addr < KERNEL_TEXT_END.load(Ordering::Relaxed)
+}
+
 /// Physical address of the shared device L1 table (under L0[1]).
 /// Allocated once by `init_shared_device_tables()`, then referenced
 /// by every user address space's `add_kernel_mappings()`.

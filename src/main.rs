@@ -568,6 +568,10 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // This is the bootstrap map, not the authority: `platform::machine`'s
     // redistributor address assumes one vCPU. The FDT-derived refinement runs
     // after `detect_memory` below.
+    // Tell the exception/scheduler tripwires where kernel code lives. Must happen
+    // before the first IRQ; a wrong window makes every legitimate frame look
+    // poisoned (see `mmu::set_kernel_text_window`).
+    mmu::set_kernel_text_window(config::KERNEL_PHYS_BASE, config::KERNEL_TEXT_END);
     platform::install_bootstrap_device_map();
     // SAFETY: still on the boot page table built by `boot.rs`, single-threaded,
     // before any user address space exists, and `boot_device_l3_phys()` is the L3

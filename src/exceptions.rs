@@ -2252,7 +2252,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
 
         // Demand-paged or RW-only mappings can leave the handler/restorer pages
         // non-executable; without RX, ERET to the handler faults immediately.
-        // (If fault_pc is in the 0x6000_0000 kernel-RAM VA range, that is a
+        // (If fault_pc is in the kernel-RAM VA range below KERNEL_TEXT_END, that is a
         // separate bug: user tried to *execute* identity-mapped RAM — usually UXN.)
         let handler_va = handler_addr & !0xFFF;
         let restorer_va = restorer & !0xFFF;
@@ -2572,7 +2572,7 @@ fn irq_eret_poison_check(final_sp: u64, switched: bool) {
     // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
     let elr = unsafe { core::ptr::read_volatile((final_sp as usize + 240) as *const u64) };
     let spsr = unsafe { core::ptr::read_volatile((final_sp as usize + 248) as *const u64) };
-    let kernel_text = (crate::config::KERNEL_PHYS_BASE as u64..0x6000_0000).contains(&elr);
+    let kernel_text = akuma_exec::mmu::is_kernel_text(elr as usize);
     // EL0-target frames must not eret into kernel text; EL1-target frames must
     // eret INTO kernel text (an EL1 ELR like 0x8 is the boot-storm crash shape).
     let poison = if (spsr & 0xF) == 0 { kernel_text } else { !kernel_text };
@@ -3136,7 +3136,7 @@ fn try_resolve_el1_cow_fault() -> bool {
     // No FAR range check — user VA space spans 0..512GB; translate_user_va() handles
     // unmapped/kernel addresses by returning None.
     if ec != 0x25 || dfsc != 0x0F || (iss & (1 << 6)) == 0 { return false; }
-    if !((crate::config::KERNEL_PHYS_BASE as u64..0x6000_0000).contains(&fault_pc)) { return false; }
+    if !(akuma_exec::mmu::is_kernel_text(fault_pc as usize)) { return false; }
 
     let l0_addr = (fault_ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
     let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
@@ -3232,7 +3232,7 @@ fn try_resolve_el1_user_copy_lazy_fault() -> bool {
         return false;
     }
     // A real copy_to_user/from_user is executing in kernel text.
-    if !((crate::config::KERNEL_PHYS_BASE as u64..0x6000_0000).contains(&fault_pc)) {
+    if !(akuma_exec::mmu::is_kernel_text(fault_pc as usize)) {
         return false;
     }
     let page_va = fault_far as usize & !0xFFF;
@@ -3356,7 +3356,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
     // instead of halting the kernel.  This guards against validate_user_ptr letting a
     // kernel address slip through.
     if ec == 0x25 {
-        let in_kernel_code = elr >= crate::config::KERNEL_PHYS_BASE as u64 && elr < 0x6000_0000;
+        let in_kernel_code = akuma_exec::mmu::is_kernel_text(elr as usize);
         if in_kernel_code {
             // Check if thread has a registered fault handler for user copy operations
             let fault_handler = akuma_exec::threading::get_user_copy_fault_handler();
@@ -3728,7 +3728,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     // SIGSEGV with a kernel register file.
     {
         let f = unsafe { &*frame };
-        if (crate::config::KERNEL_PHYS_BASE as u64..0x6000_0000).contains(&f.elr_el1) {
+        if akuma_exec::mmu::is_kernel_text(f.elr_el1 as usize) {
             crate::safe_print!(224,
                 "[SVC POISON] eret->EL0 elr={:#x} spsr={:#x} sp_el0={:#x} x0={:#x} x1={:#x} x3={:#x} x8={:#x} tid={} core={}\n",
                 f.elr_el1, f.spsr_el1, f.sp_el0, f.x0, f.x1, f.x3, f.x8,

@@ -1021,6 +1021,15 @@ core::arch::global_asm!(
 secondary_entry_shared:
     mov     x19, x0                 // x19 = context_id (a3 from PSCI CPU_ON; unused M0)
 
+    // 0. Zero TPIDRRO_EL0 before anything can call `current_tid()`.
+    //
+    // Same reason as the BSP path in `boot.rs`: the register's reset value is
+    // architecturally UNKNOWN, and KVM stamps UNKNOWN-reset registers with
+    // 0x1de7ec7edbadc0de, which `current_tid()` treats as fatal. Each PSCI-woken
+    // secondary gets its own freshly-reset register, so zeroing it on the BSP is
+    // not enough.
+    msr     tpidrro_el0, xzr
+
     // 1. Enable FPU/SIMD (FPEN = 0b11).
     mov     x0, #(3 << 20)
     msr     cpacr_el1, x0

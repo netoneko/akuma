@@ -31,6 +31,21 @@ const FW_CFG_SELECTOR: MmioReg<u16> = unsafe { MmioReg::new(FW_CFG_BASE + 0x08) 
 /// DMA register: write a 64-bit big-endian physical address
 const FW_CFG_DMA: MmioReg<u64> = unsafe { MmioReg::new(FW_CFG_BASE + 0x10) };
 
+/// Does this machine have an fw_cfg device at all?
+///
+/// QEMU virt does; Firecracker does not — it has no `fw_cfg` and nothing is
+/// mapped at [`akuma_exec::mmu::DEV_FW_CFG_VA`] there, so *touching* one of the
+/// registers above is an EL1 translation fault rather than a read of zeroes.
+/// That is exactly how this surfaced: the first Firecracker boot got all the way
+/// through device init and then took `EC=0x25` (data abort, same EL) with
+/// `FAR=0x8000012008` — `DEV_FW_CFG_VA + 0x08`, the selector register — from
+/// `ramfb::init`. See `docs/archive/AKUMA_FIRECRACKER_KVM.md`.
+///
+/// Every public entry point checks this, so callers do not need to: they get the
+/// same "not found" answer they would get from a machine whose fw_cfg simply has
+/// no such file.
+const AVAILABLE: bool = crate::platform::machine::FW_CFG_PA.is_some();
+
 /// Well-known selector for the file directory
 const FW_CFG_FILE_DIR: u16 = 0x0019;
 
@@ -71,6 +86,9 @@ fn read_be_u32() -> u32 {
 ///
 /// Returns `Some((selector, size))` if found, `None` otherwise.
 pub fn find_file(name: &str) -> Option<(u16, u32)> {
+    if !AVAILABLE {
+        return None;
+    }
     // Select the file directory
     select(FW_CFG_FILE_DIR);
 
@@ -121,6 +139,9 @@ pub fn find_file(name: &str) -> Option<(u16, u32)> {
 /// # Safety
 /// `data` must be a valid byte slice whose contents match what QEMU expects.
 pub unsafe fn write_entry(selector: u16, data: &[u8]) {
+    if !AVAILABLE {
+        return;
+    }
     // Build DMA descriptor (all fields big-endian)
     let dma = FWCfgDmaAccess {
         control: (u32::from(selector) << 16

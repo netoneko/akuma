@@ -93,6 +93,22 @@ _boot_code:
     // Save DTB pointer
     mov     x19, x0
     
+    // Zero TPIDRRO_EL0 — the current-thread id.
+    //
+    // `akuma_primitives::preempt::current_tid` reads this register and HALTS the
+    // core if it is >= MAX_THREADS, because every per-slot static is indexed by
+    // it. Until `threading` installs a real tid, that read has to see 0.
+    //
+    // The architecture leaves TPIDRRO_EL0's reset value UNKNOWN. QEMU happens to
+    // zero it, so relying on that worked for years. KVM does not: its
+    // `reset_unknown()` deliberately stamps UNKNOWN-reset system registers with
+    // the poison 0x1de7ec7edbadc0de ("I detected bad code") precisely to catch
+    // guests that depend on a reset value. Under Firecracker that poison reached
+    // `current_tid()` and halted the kernel right after device probing:
+    //   [FATAL] TPIDRRO_EL0 CORRUPT: tid=0x1de7ec7edbadc0de >= MAX_THREADS (256)
+    // See docs/archive/AKUMA_FIRECRACKER_KVM.md.
+    msr     tpidrro_el0, xzr
+
     // Enable FPU/SIMD
     mov     x0, #(3 << 20)
     msr     cpacr_el1, x0

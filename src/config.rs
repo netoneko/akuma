@@ -34,6 +34,22 @@ pub const KERNEL_PHYS_BASE: usize = 0x4010_0000;
 #[cfg(feature = "platform-firecracker")]
 pub const KERNEL_PHYS_BASE: usize = 0x8030_0000;
 
+/// Exclusive upper bound of the "this address is kernel code" window.
+///
+/// The exception-path tripwires in `src/exceptions.rs` classify an `ELR`/fault-PC
+/// as kernel or user by testing `KERNEL_PHYS_BASE..KERNEL_TEXT_END`. That bound
+/// used to be a literal `0x6000_0000`, which is ~511 MB above QEMU virt's
+/// `0x4010_0000` — fine there, and **inverted** on any machine that loads the
+/// kernel higher. On Firecracker (`KERNEL_PHYS_BASE = 0x8030_0000`) the range
+/// `0x8030_0000..0x6000_0000` is empty, so every EL1 IRQ frame looked like a
+/// poisoned frame and `[IRQ POISON]` printed on every single timer tick.
+///
+/// Deliberately generous and deliberately a `const`: these tests run on the IRQ
+/// and fault paths, so they must not load anything, and a window that is too
+/// wide only risks missing a poisoned frame — while one that is too narrow
+/// reports every legitimate frame as corrupt.
+pub const KERNEL_TEXT_END: usize = KERNEL_PHYS_BASE + 0x2000_0000;
+
 /// Pre-kernel gap size: bytes from RAM_BASE to KERNEL_PHYS_BASE.
 /// This region is reclaimed to the PMM pool after early boot.
 pub const KERNEL_PHYS_OFFSET: usize = 0x10_0000; // 1 MB (= text_offset)

@@ -3,10 +3,6 @@
 
 #![allow(dead_code)]
 
-// Physical address where the kernel binary is loaded (RAM_BASE + text_offset).
-// Must match KERNEL_PHYS_BASE in src/config.rs and KERNEL_PHYS_BASE in linker.ld.
-const KERNEL_PHYS_BASE: usize = 0x4010_0000;
-
 pub mod sigframe;
 pub mod types;
 
@@ -3381,7 +3377,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             {
                 let elr = ((new_sp + 240) as *const u64).read_volatile();
                 let spsr = ((new_sp + 248) as *const u64).read_volatile();
-                let kernel_text = (0x4010_0000..0x6000_0000).contains(&elr);
+                let kernel_text = crate::mmu::is_kernel_text(elr as usize);
                 // EL0-target frames must not eret into kernel text (NOT merely
                 // ≥0x4000_0000 — user mmap VAs legitimately reach 0x1_xxxx_xxxx+);
                 // EL1-target frames must eret INTO kernel text (ELR=0x8 shape).
