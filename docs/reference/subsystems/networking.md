@@ -187,7 +187,7 @@ flowchart TD
 
     subgraph dev["device"]
         VDEV["LoopbackAwareDevice"]
-        LOOP["loopback_queue<br/>(127.x frames, intercepted in TxToken)"]
+        LOOP["loopback: LoopbackRing<br/>(127.x frames, intercepted in TxToken;<br/>fixed 32-slot ring, no per-packet alloc)"]
         VIO["VirtioSmoltcpDevice<br/>ONE 2 KB rx_buffer, one rx_token"]
     end
 

@@ -3,7 +3,6 @@
 //! Provides the core networking stack using smoltcp, protected by a Spinlock.
 //! This allows any thread (kernel or userspace via syscall) to drive the network stack.
 
-use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -671,24 +670,144 @@ fn is_loopback_frame(frame: &[u8]) -> bool {
     }
 }
 
+/// Bytes per loopback frame slot. Loopback frames are pure L2 (no virtio
+/// header, MTU 1514 — see `capabilities()`), but this matches
+/// `virtio_rings::FRAME_BUF` and every other frame buffer in this file for
+/// the same reason: one size means one set of bounds to reason about.
+const LOOPBACK_FRAME_BUF: usize = 2048;
+
+/// Loopback frames that may be queued at once. Deliberately the same order of
+/// magnitude as `virtio_rings::RX_RING`/`TX_RING`: enough to cover one
+/// TCP-handshake-shaped burst between two `poll()` calls, not a backlog.
+const LOOPBACK_RING: usize = 32;
+
+/// Frame storage for the loopback ring. Not a `LoopbackAwareDevice` field —
+/// `NetworkState` (which owns the device) is built on the stack before being
+/// moved into the `NETWORK` static, and `LOOPBACK_RING * LOOPBACK_FRAME_BUF`
+/// (64 KiB) inline would push that far past a comfortable kernel stack frame.
+/// Same reasoning as `virtio_rings`' `RX_BUFS`/`TX_BUFS`.
+static mut LOOPBACK_BUFS: [[u8; LOOPBACK_FRAME_BUF]; LOOPBACK_RING] =
+    [[0; LOOPBACK_FRAME_BUF]; LOOPBACK_RING];
+
+/// Loopback frames dropped because the ring was full, or (should be
+/// impossible — `capabilities()` caps the MTU well under this) too large for
+/// a slot. `docs/archive/FREEZE_INSTRUMENTATION_PLAN.md` F5 flagged the old
+/// `VecDeque` for growing without bound instead of ever hitting this path.
+static LOOPBACK_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[must_use]
+pub fn loopback_drop_count() -> usize {
+    LOOPBACK_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Pointer to loopback slot `slot`.
+///
+/// # Safety
+/// `slot < LOOPBACK_RING`, and the caller holds `NETWORK` — the lock that
+/// serialises every push/pop below, same as `virtio_rings::rx_buf`/`tx_buf`.
+unsafe fn loopback_buf(slot: usize) -> *mut u8 {
+    unsafe { (&raw mut LOOPBACK_BUFS).cast::<u8>().add(slot * LOOPBACK_FRAME_BUF) }
+}
+
+/// A fixed-capacity ring of loopback frames, replacing what used to be a
+/// `VecDeque<Vec<u8>>`.
+///
+/// The old queue paid a zeroing heap allocation and a copy for every loopback
+/// frame (`docs/archive/AKUMA_NET_ISSUES.md` §"one per-packet allocation
+/// remains", `docs/archive/BENCHMARK_PERFORMANCE_ATTEMPT_0.md` §6) and had no
+/// capacity bound, which `docs/archive/SCHEDULING_INVESTIGATION.md` flagged as
+/// an unbounded-queue-without-backpressure smell. This ring bounds depth at
+/// [`LOOPBACK_RING`] and drops (counted) on overflow instead of growing —
+/// the same backpressure a real NIC's finite ring already gives external
+/// traffic.
+///
+/// # Why holding raw slices into a shared static is sound
+///
+/// Every push and pop happens under the `NETWORK` spinlock (`push` from
+/// `TxToken::consume` during egress, `pop` from `Device::receive` during
+/// ingress), so there is exactly one thread touching the ring at a time. A
+/// slot popped by `pop` is only reused by a `push` after `LOOPBACK_RING`
+/// further pushes advance `tail` all the way back around to it — and by then
+/// the `RxToken::consume` call that borrowed it has long since returned,
+/// because `receive()`/`consume()` are synchronous and non-reentrant on this
+/// slot (the one case where a `push` runs "inside" an outstanding `pop` —
+/// smoltcp generating an immediate reply, e.g. an ICMP echo, from within the
+/// rx closure it was handed alongside the tx token — targets `tail`, a
+/// different slot from the `head` slot still being read, as long as
+/// `LOOPBACK_RING >= 2`).
+struct LoopbackRing {
+    /// Length of the frame in slot `i`, valid only while that slot is queued.
+    lens: [u16; LOOPBACK_RING],
+    /// Next slot to pop.
+    head: usize,
+    /// Next slot to push into.
+    tail: usize,
+    /// Frames currently queued.
+    count: usize,
+}
+
+impl LoopbackRing {
+    const fn new() -> Self {
+        Self {
+            lens: [0; LOOPBACK_RING],
+            head: 0,
+            tail: 0,
+            count: 0,
+        }
+    }
+
+    /// Copy `frame` into the next free slot. Drops and counts it
+    /// (`LOOPBACK_DROP_COUNT`) if the ring is full or the frame does not fit
+    /// a slot — the latter should be unreachable given the MTU, but a
+    /// malformed frame must not overrun `LOOPBACK_BUFS`.
+    fn push(&mut self, frame: &[u8]) {
+        if self.count == LOOPBACK_RING || frame.len() > LOOPBACK_FRAME_BUF {
+            LOOPBACK_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let slot = self.tail;
+        // SAFETY: `slot < LOOPBACK_RING` (`tail` is kept in range by the `%`
+        // below); see the struct-level safety argument for exclusivity.
+        let dst = unsafe { core::slice::from_raw_parts_mut(loopback_buf(slot), frame.len()) };
+        dst.copy_from_slice(frame);
+        self.lens[slot] = frame.len() as u16;
+        self.tail = (self.tail + 1) % LOOPBACK_RING;
+        self.count += 1;
+    }
+
+    /// Hand back the oldest queued frame, if any, as a `'static` slice into
+    /// `LOOPBACK_BUFS`.
+    fn pop(&mut self) -> Option<&'static mut [u8]> {
+        if self.count == 0 {
+            return None;
+        }
+        let slot = self.head;
+        let len = self.lens[slot] as usize;
+        self.head = (self.head + 1) % LOOPBACK_RING;
+        self.count -= 1;
+        // SAFETY: as `push`.
+        Some(unsafe { core::slice::from_raw_parts_mut(loopback_buf(slot), len) })
+    }
+}
+
 /// A composite device that wraps `VirtIO` for external traffic and an internal
-/// queue for loopback (127.x.x.x) traffic.
+/// ring for loopback (127.x.x.x) traffic.
 ///
 /// Outgoing frames destined for
 /// loopback addresses are intercepted in `TxToken::consume()` and queued
 /// internally rather than being sent through `VirtIO`. `receive()` checks
-/// the loopback queue first, then falls back to `VirtIO`.
+/// the loopback ring first, then falls back to `VirtIO`.
 pub struct LoopbackAwareDevice {
     virtio: VirtioSmoltcpDevice,
-    pub loopback_queue: VecDeque<Vec<u8>>,
+    loopback: LoopbackRing,
 }
 
 impl LoopbackAwareDevice {
-    #[must_use] 
+    #[must_use]
     pub const fn new(virtio: VirtioSmoltcpDevice) -> Self {
         Self {
             virtio,
-            loopback_queue: VecDeque::new(),
+            loopback: LoopbackRing::new(),
         }
     }
 
@@ -705,10 +824,10 @@ impl Device for LoopbackAwareDevice {
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // Choose the frame BEFORE building the tx token. Doing it in this order
         // is what lets the two tokens be plain disjoint field borrows
-        // (`&mut self.virtio` and `&mut self.loopback_queue`) instead of the
+        // (`&mut self.virtio` and `&mut self.loopback`) instead of the
         // `&raw mut` aliasing this used to need: the loopback pop wants the
-        // queue mutably, and the tx token wants to keep it.
-        let source = if let Some(frame) = self.loopback_queue.pop_front() {
+        // ring mutably, and the tx token wants to keep it.
+        let source = if let Some(frame) = self.loopback.pop() {
             // An internally queued frame is already in hand — no device round
             // trip, and `receive` drains these ahead of the wire.
             FrameSource::Loopback(frame)
@@ -719,7 +838,7 @@ impl Device for LoopbackAwareDevice {
 
         let tx = LoopbackAwareTxToken {
             virtio: &mut self.virtio,
-            loopback_queue: &mut self.loopback_queue,
+            loopback: &mut self.loopback,
         };
         let rx = match source {
             FrameSource::Loopback(frame) => LoopbackAwareRxToken::Loopback(frame),
@@ -738,7 +857,7 @@ impl Device for LoopbackAwareDevice {
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(LoopbackAwareTxToken {
             virtio: &mut self.virtio,
-            loopback_queue: &mut self.loopback_queue,
+            loopback: &mut self.loopback,
         })
     }
 
@@ -752,15 +871,16 @@ impl Device for LoopbackAwareDevice {
 /// Exists so the decision can be made before either token is built — see
 /// `LoopbackAwareDevice::receive`.
 enum FrameSource {
-    /// An owned frame popped off the internal loopback queue.
-    Loopback(Vec<u8>),
+    /// A frame popped off the internal loopback ring, borrowed `'static` out
+    /// of `LOOPBACK_BUFS`.
+    Loopback(&'static mut [u8]),
     /// A pointer to the L2 frame in device-owned storage, and its length.
     Virtio(*mut u8, usize),
 }
 
 pub enum LoopbackAwareRxToken<'a> {
-    /// An owned frame that was looped back internally.
-    Loopback(Vec<u8>),
+    /// A frame that was looped back internally.
+    Loopback(&'a mut [u8]),
     /// A borrowed frame received from `VirtIO`.
     Virtio(&'a mut [u8]),
 }
@@ -771,7 +891,7 @@ impl smoltcp::phy::RxToken for LoopbackAwareRxToken<'_> {
         F: FnOnce(&[u8]) -> R,
     {
         match self {
-            Self::Loopback(buf) => f(&buf),
+            Self::Loopback(buf) => f(buf),
             Self::Virtio(buf) => f(buf),
         }
     }
@@ -779,7 +899,7 @@ impl smoltcp::phy::RxToken for LoopbackAwareRxToken<'_> {
 
 pub struct LoopbackAwareTxToken<'a> {
     virtio: &'a mut VirtioSmoltcpDevice,
-    loopback_queue: &'a mut VecDeque<Vec<u8>>,
+    loopback: &'a mut LoopbackRing,
 }
 
 impl smoltcp::phy::TxToken for LoopbackAwareTxToken<'_> {
@@ -787,16 +907,14 @@ impl smoltcp::phy::TxToken for LoopbackAwareTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let queue = self.loopback_queue;
+        let ring = self.loopback;
         self.virtio.emit_frame(len, f, |frame| {
             // Frames addressed to 127.x never reach the wire: copy them into the
-            // internal queue, which `receive` drains ahead of the device.
+            // internal ring, which `receive` drains ahead of the device.
             if !is_loopback_frame(frame) {
                 return false;
             }
-            let mut owned = vec![0u8; frame.len()];
-            owned.copy_from_slice(frame);
-            queue.push_back(owned);
+            ring.push(frame);
             nicstat::record_loopback(frame.len());
             true
         })
