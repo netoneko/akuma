@@ -1032,12 +1032,21 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     if need_timing {
         let elapsed = crate::timer::uptime_us().saturating_sub(t0);
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-        if track_time
-            && let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
-                proc.syscall_stats.add_time_us(syscall_num, elapsed);
-            }
-        if crate::config::PROC_SYSCALL_LOG_ENABLED && owner_pid != 0 {
-            log::record(owner_pid, syscall_num, t0, elapsed, result);
+        let logging = crate::config::PROC_SYSCALL_LOG_ENABLED && owner_pid != 0;
+        // One lookup feeding both consumers. The log needs `box_id` because it
+        // outlives the process: `/proc/<pid>/syscalls` stays readable after exit,
+        // and by then the process table can no longer say which box produced it.
+        let proc = if track_time || logging {
+            akuma_exec::process::lookup_process_shared(owner_pid)
+        } else {
+            None
+        };
+        if track_time && let Some(p) = &proc {
+            p.syscall_stats.add_time_us(syscall_num, elapsed);
+        }
+        if logging {
+            let box_id = proc.as_ref().map_or(0, |p| p.box_id);
+            log::record(owner_pid, box_id, syscall_num, t0, elapsed, result);
         }
     }
 

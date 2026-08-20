@@ -9,7 +9,7 @@ Kernel side: [`../../../docs/reference/subsystems/containers.md`](../../../docs/
 ## Startup sequence
 
 ```
-box run [--rm] [-d] [-i] [--name X] [-w dir] [--entrypoint P] <image> [cmd …]
+box run [--rm] [-d] [-i] [--name X] [-w dir] [--entrypoint P] [-e K=V] <image> [cmd …]
   │
   ├─ resolve image → /var/lib/box/images/<store>/{oci-config.json,layers}
   ├─ read `layers` (base-first) → reverse → overlay lowerdirs (topmost-first)
@@ -41,9 +41,11 @@ across runs and an unnamed one (`<image>-<uptime>`) is unique.
 | Image layers read-only and shared; per-container writable layer | ✅ |
 | OCI whiteouts (`.wh.`, `.wh..wh..opq`) | ✅ |
 | `/etc/resolv.conf`, `/etc/hosts` injected | ✅ |
-| Image `Env` (notably `PATH`) | ❌ — `SpawnOptions` has no env field. `box` resolves a bare Entrypoint against the standard `PATH` directories itself as a stand-in |
-| Script (shebang) Entrypoint | ❌ — `spawn_ext` does not honour `#!`; use `--entrypoint` |
-| `-p` port mapping, `-v` volumes, `-e` env | ❌ |
+| Image `Env` (notably `PATH`) | ✅ (2026-08-20) — `SpawnOptions` carries `env_ptr`/`env_len`. `box` still resolves a bare Entrypoint against the standard `PATH` directories itself, since the kernel's spawn takes a path, not a name |
+| `-e KEY=VALUE`, repeatable, overriding image `Env` **by name** | ✅ (2026-08-20) |
+| `-e KEY` passthrough from `box`'s own environment | ✅ — an unset name is dropped, not passed empty |
+| Script (shebang) Entrypoint | ✅ (2026-08-16) — `resolve_shebang_chain`, inside the box's namespace |
+| `-p` port mapping, `-v` volumes | ❌ |
 | `USER`, cgroups, capabilities, seccomp | ❌ — isolation here is namespace + network-stack |
 | Docker-in-docker | ❌ **by design** — see below |
 | Interactive (`-i`), including from an SSH login shell | ✅ (fixed 2026-08-11 — a container's exit used to close the login shell; see the archive doc) |

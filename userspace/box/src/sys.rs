@@ -17,6 +17,7 @@
 /// side, instead of silently handing the kernel a struct whose `box_id` lands
 /// where it expects `stdin_len`.
 #[repr(C)]
+#[derive(Default)]
 pub struct SpawnOptions {
     pub cwd_ptr: u64,
     pub cwd_len: usize,
@@ -27,6 +28,15 @@ pub struct SpawnOptions {
     pub stdin_ptr: u64,
     pub stdin_len: usize,
     pub box_id: u64,
+    /// A NULL-terminated `char *envp[]`, or 0 for "use the kernel's default
+    /// environment". Built by [`spawn_ext`] from its `env` argument.
+    ///
+    /// Appended after `box_id` so the offsets above are unchanged: the kernel
+    /// negotiates the struct's size (it is passed as `SPAWN_EXT`'s third
+    /// argument), so a binary built against the older 72-byte layout still runs
+    /// on a newer kernel and simply gets the default environment.
+    pub env_ptr: u64,
+    pub env_len: usize,
 }
 
 pub const SYSCALL_SPAWN_EXT: u64 = 315;
@@ -38,6 +48,7 @@ pub const SYSCALL_SET_BOX_STACK: u64 = 324;
 mod calls {
     use super::{SpawnOptions, SYSCALL_KILL_BOX, SYSCALL_REGISTER_BOX, SYSCALL_SET_BOX_STACK, SYSCALL_SPAWN_EXT};
     use alloc::format;
+    use alloc::string::String;
     use alloc::vec::Vec;
     use libakuma::SpawnResult;
 
@@ -79,6 +90,22 @@ mod calls {
         stdin: Option<&[u8]>,
         options: &mut SpawnOptions,
     ) -> Option<SpawnResult> {
+        spawn_ext_env(path, args, None, stdin, options)
+    }
+
+    /// [`spawn_ext`] plus an explicit environment.
+    ///
+    /// `env` is the child's **whole** environment, already composed — an empty
+    /// or absent list means "use the kernel's default", not "no variables". A
+    /// caller passing only the user's `-e` overrides would silently drop `PATH`,
+    /// which is the one variable an image's own `Env` always sets.
+    pub fn spawn_ext_env(
+        path: &str,
+        args: Option<&[&str]>,
+        env: Option<&[String]>,
+        stdin: Option<&[u8]>,
+        options: &mut SpawnOptions,
+    ) -> Option<SpawnResult> {
         let mut argv = Vec::new();
         let path_terminated = format!("{}\0", path);
         argv.push(path_terminated.as_ptr());
@@ -97,6 +124,25 @@ mod calls {
         options.args_ptr = argv.as_ptr() as u64;
         options.args_len = argv.len();
 
+        // Same NUL-terminated, NULL-terminated shape as argv. Both the owning
+        // Strings and the pointer array must outlive the syscall below, which is
+        // why they are bound here rather than built inline.
+        let env_terminated: Vec<String> = match env {
+            Some(vars) if !vars.is_empty() => {
+                vars.iter().map(|v| format!("{}\0", v)).collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut envp: Vec<*const u8> = Vec::new();
+        if !env_terminated.is_empty() {
+            for v in &env_terminated {
+                envp.push(v.as_ptr());
+            }
+            envp.push(core::ptr::null());
+            options.env_ptr = envp.as_ptr() as u64;
+            options.env_len = envp.len();
+        }
+
         if let Some(s) = stdin {
             options.stdin_ptr = s.as_ptr() as u64;
             options.stdin_len = s.len();
@@ -106,7 +152,9 @@ mod calls {
             SYSCALL_SPAWN_EXT,
             path_terminated.as_ptr() as u64,
             options as *const _ as u64,
-            0,
+            // The struct's size, so a kernel that knows more fields than this
+            // build does reads only the ones actually written.
+            core::mem::size_of::<SpawnOptions>() as u64,
             0,
             0,
             0,
@@ -123,7 +171,7 @@ mod calls {
 }
 
 #[cfg(feature = "akuma")]
-pub use calls::{kill_box, register_box, set_box_stack_rump, spawn_ext};
+pub use calls::{kill_box, register_box, set_box_stack_rump, spawn_ext, spawn_ext_env};
 
 #[cfg(test)]
 mod tests {
@@ -134,7 +182,7 @@ mod tests {
     // docs/archive/HERD_PLUS_BOX.md, "Mechanics".
     #[test]
     fn matches_the_kernels_abi() {
-        assert_eq!(core::mem::size_of::<SpawnOptions>(), 72);
+        assert_eq!(core::mem::size_of::<SpawnOptions>(), 88);
         assert_eq!(core::mem::offset_of!(SpawnOptions, cwd_ptr), 0);
         assert_eq!(core::mem::offset_of!(SpawnOptions, cwd_len), 8);
         assert_eq!(core::mem::offset_of!(SpawnOptions, root_dir_ptr), 16);
@@ -144,5 +192,10 @@ mod tests {
         assert_eq!(core::mem::offset_of!(SpawnOptions, stdin_ptr), 48);
         assert_eq!(core::mem::offset_of!(SpawnOptions, stdin_len), 56);
         assert_eq!(core::mem::offset_of!(SpawnOptions, box_id), 64);
+        // Appended, not inserted — every offset above must stay put, or a
+        // `/bin/box` older than the kernel writes its `box_id` where the kernel
+        // reads `stdin_len`.
+        assert_eq!(core::mem::offset_of!(SpawnOptions, env_ptr), 72);
+        assert_eq!(core::mem::offset_of!(SpawnOptions, env_len), 80);
     }
 }

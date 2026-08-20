@@ -850,6 +850,14 @@ pub fn run_all_tests() {
     // gap that made /proc/cores open and stat fine but 404 on every read.
     test_procfs_virtual_files_are_readable();
 
+    // SPAWN_EXT's env_ptr/env_len, and the size negotiation that lets an older
+    // userspace binary keep working against a kernel that knows more fields.
+    test_spawn_ext_passes_env();
+
+    // procfs must not leak another box's process existence, listing or trace —
+    // the rule was in one of the four methods that serve /proc/<pid>/syscalls.
+    test_procfs_box_isolation();
+
     // prctl's capability queries must reject an out-of-range capability, or
     // util-linux's cap_last_cap() probe never terminates.
     test_prctl_capbset_is_bounded();
@@ -2887,6 +2895,198 @@ fn test_procfs_virtual_files_are_readable() {
     } else {
         crate::safe_print!(64, "[Test] procfs_virtual_files_are_readable FAILED ({} of 2)\n", fails);
         panic!("test_procfs_virtual_files_are_readable: {fails} of 2 cases failed");
+    }
+}
+
+/// A spawned child must receive the environment its spawner composed.
+///
+/// Drives the real `SPAWN_EXT` syscall entry with a userspace-shaped `envp`, so
+/// the ABI decode is what is under test — the struct grew `env_ptr`/`env_len`,
+/// and its size is now negotiated through the syscall's third argument so a
+/// `/bin/box` older than the kernel is not read past the end of what it wrote.
+///
+/// `busybox env` is the oracle: it prints exactly what it was given, so the
+/// child's own view is what the assertion sees rather than the spawner's
+/// intent. The paired case is what makes it meaningful — a spawn passing NO
+/// environment must still get the kernel's `DEFAULT_ENV`, because that fallback
+/// is what keeps every existing caller (and every herd service without an `env`
+/// line) working unchanged.
+fn test_spawn_ext_passes_env() {
+    use crate::syscall::{handle_syscall, nr};
+
+    const BUSYBOX: &str = "/bin/busybox";
+    if !check_binary_exists(BUSYBOX) {
+        return;
+    }
+
+    // Runs `busybox env` under `options`, returns what the child printed.
+    fn run_env(env_entries: &[&str]) -> alloc::string::String {
+        use alloc::vec::Vec;
+        let pid: u32 = 7710;
+        let tid = register_at_syscall_process(pid, "/tmp".to_string());
+
+        let path = cstr(BUSYBOX);
+        let argv_strs = [cstr(BUSYBOX), cstr("env")];
+        let mut argv: Vec<*const u8> = argv_strs.iter().map(Vec::as_ptr).collect();
+        argv.push(core::ptr::null());
+
+        // Owned separately from the pointer array: both must outlive the call.
+        let env_strs: Vec<Vec<u8>> = env_entries.iter().map(|e| cstr(e)).collect();
+        let mut envp: Vec<*const u8> = env_strs.iter().map(Vec::as_ptr).collect();
+        envp.push(core::ptr::null());
+
+        let mut opts = crate::syscall::proc::SpawnOptions {
+            args_ptr: argv.as_ptr() as u64,
+            args_len: argv.len(),
+            ..Default::default()
+        };
+        if !env_entries.is_empty() {
+            opts.env_ptr = envp.as_ptr() as u64;
+            opts.env_len = envp.len();
+        }
+
+        let r = handle_syscall(nr::SPAWN_EXT, &[
+            path.as_ptr() as u64,
+            core::ptr::addr_of!(opts) as u64,
+            core::mem::size_of::<crate::syscall::proc::SpawnOptions>() as u64,
+            0, 0, 0,
+        ]);
+        unregister_at_syscall_process(pid, tid);
+        if (r as i64) < 0 {
+            return alloc::string::String::from("<spawn failed>");
+        }
+
+        let child = (r & 0xFFFF_FFFF) as u32;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        for _ in 0..2000 {
+            match akuma_exec::process::get_child_channel(child) {
+                Some(ch) => {
+                    let n = ch.read(&mut buf);
+                    if n > 0 {
+                        out.extend_from_slice(&buf[..n]);
+                    } else if ch.has_exited() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+            akuma_exec::threading::yield_now();
+        }
+        alloc::string::String::from_utf8_lossy(&out).into_owned()
+    }
+
+    let mut fails = 0u32;
+
+    // 1. A composed environment reaches the child verbatim.
+    let out = run_env(&["PATH=/bin", "AKUMA_ENV_PROBE=composed", "TZ=UTC"]);
+    if !out.contains("AKUMA_ENV_PROBE=composed") || !out.contains("TZ=UTC") {
+        fails += 1;
+        crate::safe_print!(192, "[Test] spawn_ext env FAILED, child saw: {}
+", out.as_str());
+    }
+
+    // 2. No environment at all still yields the kernel's default, which is what
+    //    every caller predating this field relies on.
+    let out = run_env(&[]);
+    if !out.contains("PATH=") || !out.contains("HOME=") {
+        fails += 1;
+        crate::safe_print!(192, "[Test] spawn_ext default env FAILED, child saw: {}
+", out.as_str());
+    }
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] spawn_ext_passes_env PASSED (composed + default)
+");
+    } else {
+        crate::safe_print!(96, "[Test] spawn_ext_passes_env FAILED ({} of 2)
+", fails);
+        panic!("test_spawn_ext_passes_env: {fails} of 2 cases failed");
+    }
+}
+
+/// procfs must not leak another box's processes — existence, listing, or trace.
+///
+/// The rule was applied inconsistently rather than absently, which is why it
+/// survived: `/proc/<pid>/status` was refused inside a box, so isolation *looked*
+/// right, while `/proc/<pid>/syscalls` — reachable through four `ProcFilesystem`
+/// methods with the check in only one of them, and that one the method a `read()`
+/// never reaches — handed a container the full syscall trace of PID 1. `read_dir`
+/// separately appended every pid with a retained log after its own box filter had
+/// run, so `ls /proc` in a container listed the whole host
+/// (docs/archive/DEVBOX_ISSUES.md Issue 24).
+///
+/// Every case is paired with the same probe run from box 0, because a test that
+/// only asserts "denied" passes just as well against a procfs that answers
+/// nothing at all.
+fn test_procfs_box_isolation() {
+    use akuma_exec::process::{register_process, register_thread_pid, unregister_process, unregister_thread_pid};
+    use crate::vfs::Filesystem;
+    use crate::vfs::proc::ProcFilesystem;
+
+    const BOX_A: u64 = 0x9101;
+    let host_pid: u32 = 7708;
+    let boxed_pid: u32 = 7709;
+
+    // Two processes with retained syscall logs: one on the host, one in a box.
+    register_process(host_pid, make_test_process(host_pid)); // box_id 0
+    let mut boxed = make_test_process(boxed_pid);
+    boxed.box_id = BOX_A;
+    register_process(boxed_pid, boxed);
+    crate::syscall::log::record(host_pid, 0, 64, 1, 1, 0);
+    crate::syscall::log::record(boxed_pid, BOX_A, 64, 1, 1, 0);
+
+    let fs = ProcFilesystem::new();
+    let tid = akuma_exec::threading::current_thread_id();
+    let mut fails = 0u32;
+    let mut check = |what: &str, got: bool, want: bool| {
+        if got != want {
+            fails += 1;
+            crate::safe_print!(96, "[Test] procfs isolation {} FAILED got={}\n", what, got);
+        }
+    };
+
+    // --- As the boxed process: the host's process must be invisible. ---
+    register_thread_pid(tid, boxed_pid);
+    let host_dir = format!("{host_pid}");
+    let host_syscalls = format!("{host_pid}/syscalls");
+    let host_status = format!("{host_pid}/status");
+
+    check("box sees host pid dir", fs.exists(&host_dir), false);
+    check("box sees host syscalls", fs.exists(&host_syscalls), false);
+    check("box sees host status", fs.exists(&host_status), false);
+    check("box stats host syscalls", fs.metadata(&host_syscalls).is_ok(), false);
+    // The one that actually leaked bytes: `read()` lands in `read_at`.
+    let mut buf = [0u8; 64];
+    check("box reads host syscalls", fs.read_at(&host_syscalls, 0, &mut buf).is_ok(), false);
+    check("box lists host pid dir", fs.read_dir(&host_dir).is_ok(), false);
+    let listed = fs.read_dir("").map(|e| e.iter().any(|d| d.name == host_dir)).unwrap_or(false);
+    check("box lists host pid in /proc", listed, false);
+
+    // Positive control, same box: its own process must be fully visible, or every
+    // assertion above passes because procfs answers nothing.
+    let own_syscalls = format!("{boxed_pid}/syscalls");
+    check("box sees own pid dir", fs.exists(&format!("{boxed_pid}")), true);
+    check("box reads own syscalls", fs.read_at(&own_syscalls, 0, &mut buf).is_ok(), true);
+    let own_listed = fs.read_dir("").map(|e| e.iter().any(|d| d.name == format!("{boxed_pid}"))).unwrap_or(false);
+    check("box lists own pid in /proc", own_listed, true);
+
+    // --- As the host: the same probes must all succeed. ---
+    unregister_thread_pid(tid);
+    register_thread_pid(tid, host_pid);
+    check("host sees boxed pid dir", fs.exists(&format!("{boxed_pid}")), true);
+    check("host reads boxed syscalls", fs.read_at(&own_syscalls, 0, &mut buf).is_ok(), true);
+    check("host sees own syscalls", fs.read_at(&host_syscalls, 0, &mut buf).is_ok(), true);
+
+    unregister_thread_pid(tid);
+    unregister_process(host_pid);
+    unregister_process(boxed_pid);
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] procfs_box_isolation PASSED (13 cases)\n");
+    } else {
+        crate::safe_print!(96, "[Test] procfs_box_isolation FAILED ({} of 13 cases)\n", fails);
+        panic!("test_procfs_box_isolation: {fails} of 13 cases failed");
     }
 }
 

@@ -1,0 +1,46 @@
+# Example: a boxed service with environment variables.
+#
+# Copy into /etc/herd/enabled/ to run it. Nothing enables this by default —
+# it exists to show the `env` key, so it names an image path that only exists
+# if you pulled one.
+#
+# `env` is REPEATABLE: one KEY=VALUE per line. It is not space-split the way
+# `args` is, so a value may contain spaces:
+#
+#   env = JAVA_OPTS=-Xmx256m -Xms64m
+#
+# Only the FIRST `=` separates the name from the value, so a value may contain
+# further ones:
+#
+#   env = DSN=host=db port=5432
+#
+# Variables override by name, and what they override depends on the service:
+#
+#   * `bundle` service  -> the bundle's own OCI `process.env`
+#   * anything else     -> PATH, HOME, TERM (the same defaults the kernel
+#                          applies to a service that configures no env at all)
+#
+# A service with no `env` line passes no environment at all, and the kernel
+# applies its defaults — identical to how every service behaved before `env`
+# existed. Adding even one `env` line makes this service's environment fully
+# its own, which is why the defaults are re-applied as a base rather than
+# dropped.
+
+command = /usr/local/bin/redis-server
+args = --port 6379 --save ""
+
+boxed = true
+box_root = /var/lib/box/containers/redis/upper
+# A fresh-root box has no /proc until one is mounted here, and redis reads
+# /proc/self/* at startup.
+mount = proc
+
+env = REDIS_PORT=6379
+env = REDIS_REPLICATION_MODE=master
+env = TZ=UTC
+# Overrides the PATH that would otherwise come from the defaults above.
+env = PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin
+
+restart = true
+restart_delay_ms = 2000
+max_retries = 0

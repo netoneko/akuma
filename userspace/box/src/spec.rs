@@ -16,6 +16,8 @@ pub struct ImageProcess {
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
     pub working_dir: String,
+    /// The image's `config.Env`, in the order the image lists it.
+    pub env: Vec<String>,
 }
 
 impl Default for ImageProcess {
@@ -26,6 +28,7 @@ impl Default for ImageProcess {
             entrypoint: Vec::new(),
             cmd: Vec::new(),
             working_dir: String::from("/"),
+            env: Vec::new(),
         }
     }
 }
@@ -67,8 +70,73 @@ pub fn image_process_from_config(config_json: &str) -> ImageProcess {
         entrypoint: json::strings_at(config_json, &["config", "Entrypoint", "*"]),
         cmd: json::strings_at(config_json, &["config", "Cmd", "*"]),
         working_dir,
+        env: json::strings_at(config_json, &["config", "Env", "*"]),
     }
 }
+
+/// The name half of a `KEY=VALUE` entry, or the whole string when there is no
+/// `=` (a bare `-e KEY` passthrough that found nothing to pass through).
+#[must_use]
+pub fn env_key(entry: &str) -> &str {
+    match entry.find('=') {
+        Some(i) => &entry[..i],
+        None => entry,
+    }
+}
+
+/// Compose a container's environment the way `docker run` does: the image's
+/// `Env` first, then `-e` entries, which **override by name** rather than
+/// appending a second entry for the same key.
+///
+/// Two rules that are easy to get wrong and that the tests pin:
+///
+///  * **Order is the image's, not the overrides'.** An override replaces the
+///    value in place, so a program that walks `environ` sees the image's layout.
+///    Appending instead leaves two entries for one key, and which one wins is
+///    then up to the libc.
+///  * **`PATH` is guaranteed.** The kernel treats a non-empty environment as the
+///    *whole* environment, so a composed list that happens to lack `PATH` would
+///    leave the container unable to resolve a bare program name — the exact
+///    `exec: redis-server: not found` that a short `PATH` used to cause. Images
+///    essentially always set it; when one does not, the default is added.
+#[must_use]
+pub fn compose_env(image_env: &[String], overrides: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = image_env.to_vec();
+    for entry in overrides {
+        let key = env_key(entry);
+        match out.iter().position(|e| env_key(e) == key) {
+            Some(i) => out[i] = entry.clone(),
+            None => out.push(entry.clone()),
+        }
+    }
+    if !out.iter().any(|e| env_key(e) == "PATH") {
+        out.push(String::from(DEFAULT_PATH));
+    }
+    out
+}
+
+/// The environment a *service* falls back to when nothing supplies one.
+///
+/// Mirrors the kernel's `DEFAULT_ENV` (`crates/akuma-exec/src/process/types.rs`)
+/// and must keep mirroring it: the kernel uses that list only when a spawn passes
+/// **no** environment at all, so the moment a caller composes a list of its own
+/// it owns every variable — a service that gained one `env =` line would
+/// otherwise silently lose `HOME` and `TERM`.
+///
+/// Not used by `box run`: a container's environment is its image's `Env`, which
+/// is Docker's rule and deliberately does not include `HOME`/`TERM`.
+pub const DEFAULT_ENV: &[&str] = &[
+    DEFAULT_PATH,
+    "HOME=/",
+    "TERM=xterm",
+];
+
+/// The `PATH` a container falls back to when its image sets none.
+///
+/// Same search order as the kernel's `DEFAULT_ENV` and as Docker's: local before
+/// system, `sbin` before `bin` at each level.
+pub const DEFAULT_PATH: &str =
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Whether there is anything to run at all.
 impl ImageProcess {
@@ -101,6 +169,10 @@ pub struct RunArgs {
     pub name: Option<String>,
     pub workdir: Option<String>,
     pub entrypoint: Option<String>,
+    /// `-e` entries in command-line order. A bare `KEY` (no `=`) is a
+    /// passthrough request the caller resolves against its own environment
+    /// before composing — this layer keeps it verbatim.
+    pub env: Vec<String>,
     pub image: String,
     /// Everything after the image name, untouched — including anything that
     /// looks like a flag, which belongs to the container's program, not to us.
@@ -143,6 +215,7 @@ pub fn parse_run_args(args: &[&str]) -> Result<RunArgs, RunArgsError> {
             "-i" | "-I" | "-it" | "--interactive" => out.interactive = true,
             "--name" => out.name = Some(value_of(args, &mut i, "--name")?),
             "--entrypoint" => out.entrypoint = Some(value_of(args, &mut i, "--entrypoint")?),
+            "-e" | "--env" => out.env.push(value_of(args, &mut i, "--env")?),
             "-w" | "--workdir" => out.workdir = Some(value_of(args, &mut i, "--workdir")?),
             _ => {
                 out.image = String::from(arg);
@@ -230,6 +303,7 @@ mod tests {
             entrypoint: vec![],
             cmd: strs(&["sh"]),
             working_dir: String::from("/"),
+            env: Vec::new(),
         };
         assert_eq!(p.argv_with(&[]), ["sh"]);
     }
@@ -240,6 +314,7 @@ mod tests {
             entrypoint: strs(&["/usr/bin/curl"]),
             cmd: strs(&["--help"]),
             working_dir: String::from("/"),
+            env: Vec::new(),
         };
         assert_eq!(p.argv_with(&[]), ["/usr/bin/curl", "--help"]);
         assert_eq!(
@@ -254,6 +329,7 @@ mod tests {
             entrypoint: vec![],
             cmd: strs(&["sh"]),
             working_dir: String::from("/"),
+            env: Vec::new(),
         };
         assert_eq!(p.argv_with(&strs(&["echo", "hi"])), ["echo", "hi"]);
     }
@@ -264,10 +340,95 @@ mod tests {
             entrypoint: strs(&["/usr/bin/curl"]),
             cmd: strs(&["--help"]),
             working_dir: String::from("/"),
+            env: Vec::new(),
         };
         p.override_entrypoint("/bin/sh");
         assert_eq!(p.argv_with(&[]), ["/bin/sh"]);
         assert_eq!(p.argv_with(&strs(&["-c", "ls"])), ["/bin/sh", "-c", "ls"]);
+    }
+
+    #[test]
+    fn reads_the_image_env() {
+        let p = image_process_from_config(BUSYBOX_CONFIG);
+        assert_eq!(p.env, ["PATH=/usr/local/sbin:/usr/local/bin"]);
+        // An image with no Env is empty, not a panic — `compose_env` is what
+        // decides that an empty list still gets a PATH.
+        assert!(image_process_from_config(r#"{"config": {}}"#).env.is_empty());
+    }
+
+    #[test]
+    fn env_overrides_replace_in_place() {
+        // Docker's rule: `-e` replaces the image's value for that key, and the
+        // image's ORDER is preserved. Appending would leave two `LANG=` entries.
+        let image = strs(&["PATH=/bin", "LANG=C", "TZ=UTC"]);
+        let out = compose_env(&image, &strs(&["LANG=en_US.UTF-8"]));
+        assert_eq!(out, ["PATH=/bin", "LANG=en_US.UTF-8", "TZ=UTC"]);
+        assert_eq!(out.iter().filter(|e| e.starts_with("LANG=")).count(), 1);
+    }
+
+    #[test]
+    fn env_overrides_append_when_the_image_has_no_such_key() {
+        let out = compose_env(&strs(&["PATH=/bin"]), &strs(&["REDIS_PORT=6379"]));
+        assert_eq!(out, ["PATH=/bin", "REDIS_PORT=6379"]);
+    }
+
+    #[test]
+    fn later_overrides_win_over_earlier_ones() {
+        // `-e A=1 -e A=2` is command-line order, so the last one is the answer.
+        let out = compose_env(&strs(&["PATH=/bin"]), &strs(&["A=1", "A=2"]));
+        assert_eq!(out, ["PATH=/bin", "A=2"]);
+    }
+
+    #[test]
+    fn a_value_containing_an_equals_sign_is_not_split_twice() {
+        // Only the FIRST `=` separates name from value; `KEY=a=b` is one entry
+        // whose value is `a=b`, which is what a connection string looks like.
+        let out = compose_env(&[], &strs(&["DSN=host=db port=5432", "PATH=/bin"]));
+        assert_eq!(out, ["DSN=host=db port=5432", "PATH=/bin"]);
+        assert_eq!(env_key("DSN=host=db"), "DSN");
+    }
+
+    #[test]
+    fn path_is_always_present() {
+        // The kernel treats a non-empty environment as the WHOLE environment, so
+        // a composed list without PATH would break every bare program name.
+        assert_eq!(compose_env(&[], &[]), [DEFAULT_PATH]);
+        assert_eq!(compose_env(&[], &strs(&["FOO=1"])), ["FOO=1", DEFAULT_PATH]);
+        // ...but a PATH that IS supplied is never second-guessed.
+        let out = compose_env(&strs(&["PATH=/only"]), &[]);
+        assert_eq!(out, ["PATH=/only"]);
+        let out = compose_env(&strs(&["PATH=/image"]), &strs(&["PATH=/user"]));
+        assert_eq!(out, ["PATH=/user"]);
+    }
+
+    #[test]
+    fn a_bare_key_is_kept_verbatim_for_the_caller_to_resolve() {
+        // `-e TZ` asks to pass TZ through from the caller's own environment.
+        // Resolving it needs a real environment, so this layer only records it.
+        let a = parse_run_args(&["-e", "TZ", "img"]).unwrap();
+        assert_eq!(a.env, ["TZ"]);
+        assert_eq!(env_key("TZ"), "TZ");
+    }
+
+    #[test]
+    fn collects_repeated_env_flags_before_the_image() {
+        let a = parse_run_args(&["-e", "A=1", "--env", "B=2", "--rm", "img", "sh"]).unwrap();
+        assert_eq!(a.env, ["A=1", "B=2"]);
+        assert!(a.rm);
+        assert_eq!(a.image, "img");
+        assert_eq!(a.argv, ["sh"]);
+    }
+
+    #[test]
+    fn an_env_flag_after_the_image_belongs_to_the_container() {
+        let a = parse_run_args(&["img", "-e", "A=1"]).unwrap();
+        assert!(a.env.is_empty());
+        assert_eq!(a.argv, ["-e", "A=1"]);
+    }
+
+    #[test]
+    fn an_env_flag_with_no_value_is_an_error() {
+        assert_eq!(parse_run_args(&["-e"]), Err(RunArgsError::MissingValue("--env")));
     }
 
     #[test]

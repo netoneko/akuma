@@ -55,6 +55,13 @@ Entrypoint outright.
 | `--name X` | container id (otherwise `<image>-<uptime>`) |
 | `--entrypoint P` | override the image's Entrypoint |
 | `-w DIR` | working directory (overrides `WorkingDir`) |
+| `-e K=V` | set an environment variable (repeatable); `-e K` passes `K` through from `box`'s own environment |
+
+The container's environment is the image's `Env` with `-e` applied over it by
+name — `docker run`'s rule. Details and the corner cases (values containing `=`
+or spaces, the guaranteed `PATH`) are in
+[`../reference/subsystems/containers.md`](../reference/subsystems/containers.md)
+-> "Environment".
 
 The container's writable layer is `/var/lib/box/containers/<id>/upper`. Inspect
 it after a non-`--rm` run to see exactly what the container changed.
@@ -194,11 +201,11 @@ server block is the workaround.
 [`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) Issue 23.
 
 **`exec: <name>: not found` from inside the container**, for a binary that is
-plainly in the image. The container's `PATH` comes from `DEFAULT_ENV` — an OCI
-image's own `Env` is not propagated through the SPAWN abi, which has no env
-field. `DEFAULT_ENV` covers the full Linux search order since 2026-08-16
-(`/usr/local/bin` included); an image that installs somewhere else still needs
-an absolute path.
+plainly in the image. The container's `PATH` now comes from the image's own
+`Env` (since 2026-08-20); an image that installs somewhere its `Env` does not
+mention still needs an absolute path, or `-e PATH=...`. If the container's
+`PATH` looks like the kernel default rather than the image's, the `/bin/box` on
+the image predates the env support — rebuild and re-populate it.
 
 **`box run: image '<x>' has no layer list`.** The image was pulled before the
 layer store existed. Re-pull it.

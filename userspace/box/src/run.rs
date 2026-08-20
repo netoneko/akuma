@@ -12,12 +12,12 @@ use libakuma::{
 };
 
 use boxlib::spec::{self, ImageProcess, RunArgsError};
-use boxlib::sys::{self, SpawnOptions, spawn_ext};
+use boxlib::sys::{self, SpawnOptions, spawn_ext_env};
 
 use crate::images;
 
 const USAGE: &str =
-    "Usage: box run [--rm] [-d] [-i] [--name X] [-w dir] <image> [cmd [args...]]\n";
+    "Usage: box run [--rm] [-d] [-i] [--name X] [-w dir] [-e K=V] <image> [cmd [args...]]\n";
 
 /// What a pulled image says to run. An image with no readable config yields an
 /// empty process, which `cmd_run` reports rather than spawning.
@@ -212,6 +212,22 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
     }
     let working_dir = parsed.workdir.clone().unwrap_or(image_proc.working_dir);
 
+    // Docker's `-e KEY` (no `=`) passes the variable through from the caller's
+    // own environment. A name that is not set here is dropped rather than passed
+    // as an empty string, which is what Docker does and what a shell's `${VAR:-}`
+    // test expects.
+    let overrides: Vec<String> = parsed
+        .env
+        .iter()
+        .filter_map(|entry| {
+            if entry.contains('=') {
+                return Some(entry.clone());
+            }
+            libakuma::env(entry).map(|v| format!("{}={}", entry, v))
+        })
+        .collect();
+    let env = spec::compose_env(&image_proc.env, &overrides);
+
     let path = resolve_in_container(&upper, &lowerdirs, &argv[0]);
     let rest: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
 
@@ -225,6 +241,8 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
         stdin_ptr: 0,
         stdin_len: 0,
         box_id,
+        env_ptr: 0,
+        env_len: 0,
     };
 
     print("box: running '");
@@ -238,7 +256,7 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
     print(")\n");
 
     let rest_opt = if rest.is_empty() { None } else { Some(rest.as_slice()) };
-    let Some(res) = spawn_ext(&path, rest_opt, None, &mut options) else {
+    let Some(res) = spawn_ext_env(&path, rest_opt, Some(&env), None, &mut options) else {
         print("box run: failed to spawn ");
         println(&path);
         if rm {

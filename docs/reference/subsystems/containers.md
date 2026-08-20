@@ -96,18 +96,50 @@ spawns + supervises each service. Config schema (`ServiceConfig`, `main.rs:115-1
 | `stack` | "" / "smoltcp" | "rump" routes the box's net to a rump box |
 | `join_box` | "" | join an existing box (e.g. sshd `join_box = rumpnet`) |
 | `mount_fs` | [] | mount points to create ("proc"/"tmpfs"); a fresh-root box has no /proc unless mounted |
+| `env` | [] | **repeatable**: one `env = KEY=VALUE` per line. See below |
 | `core` | 0 | core pin via the `core_init` syscall (mutually exclusive with `boxed`); the kernel side is now a permanent `ENOSYS` stub — the one-kernel-per-core multikernel it activated was removed, see `docs/archive/TRIM_FAT_MULTIKERNEL.md` — so herd treats it as unavailable on every current build |
 
 **Lifecycle:** service starts → runs → on exit: `oneshot` → `Completed`; else
 `restart` → respawn after `restart_delay_ms`, up to `max_retries`. `herd status`
 lists services + states.
 
+> `restart_delay` / `restart_delay_ms` and `start_delay` / `start_delay_ms` are
+> both accepted. Until 2026-08-20 the parser matched only the un-suffixed
+> spelling while this table and the shipped devbox `sshd.conf` both wrote `_ms`,
+> so those lines fell through the config parser's `_ => {}` and did nothing —
+> the devbox sshd's documented 10-second wait for box 0's rump DHCP handshake
+> had never actually happened.
+
+### `env` — service environment
+
+Repeatable rather than space-split like `args`, so a value may contain spaces
+(`env = JAVA_OPTS=-Xmx256m -Xms64m`). Only the **first** `=` separates name from
+value, so a value may contain more of them (`env = DSN=host=db port=5432`).
+
+Entries override **by name**, and what they override depends on the service:
+
+| service kind | base environment |
+|---|---|
+| `bundle` | the bundle's own OCI `process.env` |
+| everything else | `PATH`, `HOME`, `TERM` (`boxlib::spec::DEFAULT_ENV`) |
+
+**A service with no `env` line passes no environment at all**, and the kernel
+applies its own `DEFAULT_ENV`. That is deliberate rather than incidental: the
+kernel treats a supplied environment as the *whole* environment, so composing
+unconditionally would have changed every existing service. Adding even one `env`
+line makes the service's environment entirely its own, which is why the defaults
+are re-applied as a base rather than dropped — otherwise a service that gained
+one variable would silently lose `HOME` and `TERM`.
+
+Worked example, including the traps:
+[`../../../overlays/devbox/rootfs/etc/herd/available/redis-boxed.conf.example`](../../../overlays/devbox/rootfs/etc/herd/available/redis-boxed.conf.example).
+
 ### devbox sshd.conf (reference)
 
 ```
 command = /bin/sshd
 args = --port 22 --shell /bin/sh
-start_delay_ms = 10000     # wait for box 0's ~5s rump DHCP
+start_delay_ms = 10000     # wait for box 0's ~5s rump DHCP (honoured since 2026-08-20)
 restart = true
 # UNBOXED — box 0 itself is rump under rump-default, no join_box needed
 ```
@@ -208,15 +240,51 @@ and dedupe, copy-up, whiteout clearing, layer capping (`MAX_LOWER_LAYERS = 32`).
 4. `box run` injects `/etc/resolv.conf` and `/etc/hosts` into the upper layer,
    which no OCI image ships and every networked program expects.
 
-### Not implemented
+5. Image `Env` is the container's environment, and `-e KEY=VALUE` (repeatable)
+   overrides it — see below.
 
-- Image `Env` is dropped: `SpawnOptions` has no env field, so a container gets
-  `DEFAULT_ENV`. `box run` compensates by resolving a bare Entrypoint against
-  the standard `PATH` directories itself. `DEFAULT_ENV`'s `PATH` is the full
-  Linux search order since 2026-08-16 (`/usr/local/sbin:/usr/local/bin:
-  /usr/sbin:/usr/bin:/sbin:/bin`) — it was `/usr/bin:/bin`, so a container's
-  own shell could not find the binary the image installs under `/usr/local/bin`
-  and every official Entrypoint died on `exec: <prog>: not found`.
+### Environment
+
+`SpawnOptions` carries `env_ptr`/`env_len`, and `box run` composes what goes in
+them the way `docker run` does:
+
+```
+image config `Env`   →   -e overrides, by name   →   PATH guaranteed
+```
+
+Three rules, each of which is a way to get it wrong:
+
+- **Overrides replace in place.** `-e LANG=x` against an image that sets `LANG`
+  replaces that entry where it sits rather than appending a second one — two
+  entries for one name leaves the winner up to the libc. Later `-e` beats
+  earlier, so `-e A=1 -e A=2` is `A=2`.
+- **Only the first `=` splits.** `-e DSN=host=db port=5432` is one variable
+  whose value contains both a space and an `=`.
+- **`PATH` is added if the composition lacks it.** The kernel treats a supplied
+  environment as the *whole* environment, so a list without `PATH` would leave
+  the container unable to resolve a bare program name. Images essentially always
+  set it; `boxlib::spec::DEFAULT_PATH` covers the case where one does not.
+
+`-e KEY` with no `=` is Docker's passthrough: the value comes from `box`'s own
+environment, and a name that is not set there is dropped rather than passed as
+empty.
+
+The ABI is **size-negotiated**, not versioned by a flag: `SPAWN_EXT`'s third
+argument is the caller's `sizeof(SpawnOptions)`, and `env_ptr`/`env_len` were
+appended after `box_id` so every earlier offset is unchanged. A `/bin/box` or
+`/bin/herd` older than the kernel — they are separate artifacts on one image, so
+this happens — passes 72, the kernel reads only those bytes, and the container
+gets the default environment instead of the kernel reading whatever followed the
+caller's struct on the stack and using it as an `envp`.
+
+Before 2026-08-20 image `Env` was dropped entirely and a container got the
+kernel's `DEFAULT_ENV`. The visible consequence was `PATH`: it was `/usr/bin:/bin`
+until 2026-08-16, so a container's own shell could not find the binary the image
+installs under `/usr/local/bin` and every official Entrypoint died on
+`exec: <prog>: not found`. `box run` still resolves a bare Entrypoint against the
+standard `PATH` directories itself, since the kernel's spawn takes a path.
+
+### Not implemented
 - **No per-process credentials**, and this is the live blocker for running an
   official image under its own Entrypoint. `setresuid`/`setuid`/`setgid`/
   `setgroups`/`capset` are accepting no-ops and `getuid`/`geteuid` hardcode 0,

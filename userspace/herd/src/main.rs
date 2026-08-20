@@ -15,12 +15,12 @@ use alloc::vec::Vec;
 
 use libakuma::{
     print, exit, open, read_fd, write_fd, close, fstat, lseek,
-    open_flags, seek_mode, spawn, kill_signal, waitpid_status, read_dir, uptime,
+    open_flags, seek_mode, spawn, spawn_with_env, kill_signal, waitpid_status, read_dir, uptime,
     sleep_ms, mkdir_p, SpawnResult, SIGTERM,
 };
 
 use boxlib::json;
-use boxlib::spec::box_id_for;
+use boxlib::spec::{self, box_id_for};
 use boxlib::sys;
 
 use herd::exit::{classify, Exit, Outcome, Policy};
@@ -152,6 +152,17 @@ struct ServiceConfig {
     /// terminal `Completed` state instead of `Stopped` (so it is never restarted),
     /// regardless of exit code. Overrides `restart`. A reboot runs it again.
     oneshot: bool,
+    /// Environment variables for the service, one `env = KEY=VALUE` line each.
+    ///
+    /// Repeatable rather than whitespace-separated like `args`, so a value may
+    /// contain spaces. These **override by name**: for a `bundle` service the
+    /// base is the bundle's own `process.env` (the OCI runtime spec's
+    /// environment), otherwise it is `boxlib::spec::DEFAULT_ENV`.
+    ///
+    /// Left empty, nothing is composed at all and the spawn passes no
+    /// environment, which is what makes the kernel apply its own default — so an
+    /// existing service's environment is byte-identical to before this existed.
+    env: Vec<String>,
     /// Multikernel core pin (docs/MULTIKERNEL.md §10, CORE_AWARE_SCHEDULING.md). 0 =
     /// unpinned / BSP (current behavior: spawn locally on core 0). Non-zero = run this
     /// service on that secondary core's kernel: herd hands the kernel the command path in
@@ -172,6 +183,7 @@ impl Default for ServiceConfig {
             boxed: false,
             box_root: String::from("/"),
             bundle: String::new(),
+            env: Vec::new(),
             stack: String::new(),
             restart: true,
             join_box: String::new(),
@@ -466,7 +478,11 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                         .map(String::from)
                         .collect();
                 }
-                "restart_delay" => {
+                // Both spellings: the `_ms` form is what the reference docs and
+                // the shipped devbox `sshd.conf` have always written, and it was
+                // silently falling through to `_ => {}` — so that config's
+                // 10-second wait for box 0's rump DHCP handshake never happened.
+                "restart_delay" | "restart_delay_ms" => {
                     config.restart_delay_ms = value.parse::<u64>().ok().unwrap_or(DEFAULT_RESTART_DELAY_MS);
                 }
                 "max_retries" => {
@@ -494,11 +510,19 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                         .map(String::from)
                         .collect();
                 }
-                "start_delay" => {
+                "start_delay" | "start_delay_ms" => {
                     config.start_delay_ms = value.parse::<u64>().ok().unwrap_or(0);
                 }
                 "oneshot" => {
                     config.oneshot = value == "true" || value == "1";
+                }
+                // Repeatable: each line adds one variable. The `split_once('=')`
+                // above takes the FIRST `=`, so the value keeps any further ones
+                // (`env = DSN=host=db port=5432` is one entry, spaces and all).
+                "env" => {
+                    if !value.is_empty() {
+                        config.env.push(String::from(value));
+                    }
                 }
                 "core" => {
                     config.core = value.parse::<u64>().ok().unwrap_or(0) as u32;
@@ -702,10 +726,31 @@ fn is_boxed(config: &ServiceConfig) -> bool {
         || config.box_root != "/"
 }
 
+/// Compose a service's environment, or `None` to leave it to the kernel.
+///
+/// `base` is the bundle's `process.env` for an OCI bundle service and empty
+/// otherwise. Returning `None` when nothing was configured is deliberate: the
+/// kernel applies `DEFAULT_ENV` only to a spawn that passes no environment, so
+/// composing unconditionally would change every existing service's environment.
+fn service_env(base: &[String], overrides: &[String]) -> Option<Vec<String>> {
+    if base.is_empty() && overrides.is_empty() {
+        return None;
+    }
+    let fallback: Vec<String>;
+    let base = if base.is_empty() {
+        fallback = spec::DEFAULT_ENV.iter().map(|s| String::from(*s)).collect();
+        &fallback
+    } else {
+        base
+    };
+    Some(spec::compose_env(base, overrides))
+}
+
 fn spawn_in_box(
     box_id: u64,
     command: &str,
     args: &[&str],
+    env: Option<&[String]>,
 ) -> Option<SpawnResult> {
     let mut options = sys::SpawnOptions {
         cwd_ptr: "/".as_ptr() as u64,
@@ -717,9 +762,11 @@ fn spawn_in_box(
         stdin_ptr: 0,
         stdin_len: 0,
         box_id,
+        env_ptr: 0,
+        env_len: 0,
     };
     let args_opt = if args.is_empty() { None } else { Some(args) };
-    sys::spawn_ext(command, args_opt, None, &mut options)
+    sys::spawn_ext_env(command, args_opt, env, None, &mut options)
 }
 
 /// Set up mounts in a box's namespace from OCI config mount entries.
@@ -896,7 +943,8 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         let target_box_id = box_id_for(&config.join_box);
         setup_fs_mounts(target_box_id, &config.mount_fs);
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
-        spawn_in_box(target_box_id, &config.command, &args)
+        let env = service_env(&[], &config.env);
+        spawn_in_box(target_box_id, &config.command, &args, env.as_deref())
     } else if !config.bundle.is_empty() {
         // OCI Bundle mode
         let config_path = format!("{}/config.json", config.bundle);
@@ -946,8 +994,12 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         // 2. Set up OCI mounts in the box's namespace
         setup_oci_mounts(box_id, &oci.mounts);
 
-        // 3. Spawn the main process (namespace handles path resolution)
-        let res = spawn_in_box(box_id, &command, &args);
+        // 3. Spawn the main process (namespace handles path resolution).
+        //    The bundle's `process.env` is the service's base environment — the
+        //    OCI runtime spec says it is the container's environment — and the
+        //    service's own `env =` lines override it by name.
+        let env = service_env(&oci.process_env, &config.env);
+        let res = spawn_in_box(box_id, &command, &args, env.as_deref());
         if let Some(ref r) = res {
             sys::register_box(box_id, name, &root_dir, r.pid);
         }
@@ -965,7 +1017,8 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
             sys::set_box_stack_rump(box_id);
         }
         setup_fs_mounts(box_id, &config.mount_fs);
-        let res = spawn_in_box(box_id, &config.command, &args);
+        let env = service_env(&[], &config.env);
+        let res = spawn_in_box(box_id, &config.command, &args, env.as_deref());
         if let Some(ref r) = res {
             sys::register_box(box_id, name, &config.box_root, r.pid);
         }
@@ -973,7 +1026,15 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     } else {
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
         let args_opt = if args.is_empty() { None } else { Some(args.as_slice()) };
-        spawn(&config.command, args_opt)
+        match service_env(&[], &config.env) {
+            Some(env) => {
+                let refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
+                spawn_with_env(&config.command, args_opt, None, &refs)
+            }
+            // No `env =` lines: keep the plain spawn, so an unboxed service's
+            // environment is exactly what it was before this feature existed.
+            None => spawn(&config.command, args_opt),
+        }
     };
 
     match spawn_res {

@@ -1702,6 +1702,85 @@ convention the syscall change needs a boot-suite self-test in
   reparents orphans to init to reap them. No CPU is burned, but `ps` accumulates
   corpses, which compounds Issue 21's thread/process confusion.
 
+## Issue 24: procfs leaked other boxes' processes — `ls /proc` and `/proc/<pid>/syscalls`
+
+**Status: FIXED 2026-08-20.** Found while checking a report that `/proc/boxes`
+did not respect the box namespace. It does — the report was wrong, and chasing
+it is what turned this up.
+
+### What was actually fine
+
+From inside a container, `/proc/boxes` and `/proc/cores` are absent from the
+listing and refuse to open, and `/proc/<host-pid>/status` is refused. Those
+paths carried the box check in all four `ProcFilesystem` methods.
+
+### What was not
+
+```
+# box run --rm --entrypoint /bin/sh nginx-alpine -c 'ls /proc; cat /proc/2/syscalls'
+1  107  112  199  2  220  230  245  ...        <- every host pid
+# pid=2                                        <- sshd's syscall trace, from a container
+# TIMESTAMP_US       NR  DUR_US  RESULT
+          17453936239  202       0  18446744073709551605
+```
+
+`/proc/1/syscalls` read the same way. Two independent defects, both around the
+retained-syscall-log feature (`PROC_SYSCALL_LOG_ENABLED`):
+
+1. **`read_dir` appended every pid with a retained log after its own box filter
+   had already run.** The live-pid filter above it was correct, which is what
+   made this hard to see — and `ps` looked right, because busybox enumerates and
+   then reads each `stat`, and the foreign ones are refused, so it discarded them
+   for the wrong reason.
+2. **`<pid>/syscalls` is reachable through four methods and only one applied the
+   rule** — `read_file`, which is the one a `read()` never reaches (reads land in
+   `read_at`). `exists` and `metadata` had no check either, so `open()` and
+   `stat()` also succeeded.
+
+Underneath both, `process_exists` was a bare "is there such a pid" used at eight
+sites as though it also answered "and may I see it", so `ls /proc/<host-pid>`
+listed a host process's `fd`/`cmdline`/`status`/`stat` entries.
+
+### Why the one check that existed still would not have been enough
+
+It consulted the process table:
+
+```rust
+if current_box_id != 0
+    && let Some(proc) = process::lookup_process_shared(pid)
+        && proc.box_id != current_box_id { return Err(FsError::NotFound); }
+```
+
+A **retained log outlives its process** — that is the entire point of the
+feature — so `lookup_process_shared` returns `None` for exactly the pids the
+feature exists to serve, and the condition falls open. The fix records `box_id`
+in the log entry itself (`src/syscall/log.rs`) and has `get_formatted` /
+`list_pids_with_logs` take the viewer's box, so visibility is decided in one
+place instead of four. `record` also resets an entry whose `box_id` changes,
+so a container handed a recycled pid does not inherit the previous occupant's
+trace.
+
+`process_exists` became `process_visible(pid, viewer_box_id)`, which fails
+**closed** for a pid the table cannot answer for.
+
+### The general shape
+
+This is the same class as Issue 4, one file over: **a `/proc` path is served by
+four independent methods (`read_dir`, `read_at`, `exists`, `metadata`) and each
+carries its own copy of every rule.** Issue 4 was a path missing from one of
+them; this was a *rule* missing from three. Both were invisible from a host
+shell, and both would have been caught by any test that probed from inside a box
+— which is what Issue 22 says has never existed. `test_procfs_box_isolation`
+(boot suite) is the first one, and it pairs every denial with the same probe run
+from box 0, because a test that only asserts "denied" passes against a procfs
+that answers nothing at all.
+
+### Also fixed here
+
+- **`box close` does not kill the container's primary process**, and orphans are
+  never reaped: after `box close`, the entrypoint pid survives as `State: Z` with
+  `PPid: 0`. No CPU is burned, but every `box run -d` leaks a zombie. Still OPEN.
+
 ## Background
 
 - [`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md)

@@ -186,6 +186,35 @@ below. Fixed 2026-08-20; boot-suite check `test_prctl_capbset_is_bounded`
 for a setter. For a query that a caller uses to discover a bound, "yes" to
 everything is an infinite loop.**
 
+## SPAWN_EXT and the size-negotiated options struct
+
+`SPAWN_EXT` (315) takes `(path, options_ptr, options_len)`. `options_len` is the
+caller's `sizeof(SpawnOptions)`; **0 means the original 72-byte layout**, which
+is what every binary built before the argument was used passes.
+
+This matters because `/bin/box` and `/bin/herd` are separate build artifacts
+from the kernel and live on the same disk image, so a userspace binary older
+than the kernel is routine rather than exotic. Reading the current struct size
+out of a caller that wrote fewer bytes hands the kernel whatever followed the
+caller's struct on its stack — and since the newest field is `env_ptr`, the
+kernel would then walk that as a `char *envp[]`.
+
+Two rules follow, and neither is optional:
+
+- **Append, never insert.** `env_ptr`/`env_len` sit after `box_id`, so every
+  earlier offset is untouched. Both sides assert the offsets — the kernel with a
+  `const _` block beside its own copy, userspace with
+  `sys::tests::matches_the_kernels_abi` — so a reordering fails a build rather
+  than landing `box_id` where the kernel reads `stdin_len`.
+- **Every new field's zero value must mean "unset".** The struct is zeroed and
+  filled only as far as the caller wrote, so an old caller's missing fields read
+  as 0. `env_ptr == 0` therefore means "use the kernel's default environment",
+  which is exactly what such a caller expects.
+
+`options_len` below 72 is `EINVAL`; above the kernel's own size it is clamped, so
+a *newer* userspace against an older kernel loses the fields that kernel does not
+know rather than corrupting the ones it does.
+
 ## exit / exit_group
 
 `sys_exit` (93) / `sys_exit_group` (94) (`src/syscall/proc.rs`):

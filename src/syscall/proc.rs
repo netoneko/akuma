@@ -1425,6 +1425,14 @@ pub struct SpawnOptions {
     pub stdin_ptr: u64,
     pub stdin_len: usize,
     pub box_id: u64,
+    /// A NULL-terminated `char *envp[]`, or 0 for "use the default environment".
+    ///
+    /// Appended rather than inserted: `box_id` keeps offset 64, so a userspace
+    /// binary built before this field existed still lands every field it knows
+    /// where the kernel reads it. It passes `args_len` sized for the old struct,
+    /// which `read_user_into` zero-fills past — hence 0 meaning "default".
+    pub env_ptr: u64,
+    pub env_len: usize,
 }
 
 // This layout is restated independently in userspace (`boxlib::sys::SpawnOptions`,
@@ -1434,7 +1442,7 @@ pub struct SpawnOptions {
 // drifts, one of the two builds fails here rather than the kernel silently
 // reading `box_id` out of what userspace meant as `stdin_len`.
 const _: () = {
-    assert!(core::mem::size_of::<SpawnOptions>() == 72);
+    assert!(core::mem::size_of::<SpawnOptions>() == 88);
     assert!(core::mem::offset_of!(SpawnOptions, cwd_ptr) == 0);
     assert!(core::mem::offset_of!(SpawnOptions, cwd_len) == 8);
     assert!(core::mem::offset_of!(SpawnOptions, root_dir_ptr) == 16);
@@ -1444,6 +1452,8 @@ const _: () = {
     assert!(core::mem::offset_of!(SpawnOptions, stdin_ptr) == 48);
     assert!(core::mem::offset_of!(SpawnOptions, stdin_len) == 56);
     assert!(core::mem::offset_of!(SpawnOptions, box_id) == 64);
+    assert!(core::mem::offset_of!(SpawnOptions, env_ptr) == 72);
+    assert!(core::mem::offset_of!(SpawnOptions, env_len) == 80);
 };
 
 pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
@@ -1517,16 +1527,45 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     ENOMEM
 }
 
-pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+/// The size of `SpawnOptions` before `env_ptr`/`env_len` were appended.
+///
+/// A `/bin/box` or `/bin/herd` on disk can be older than the kernel booting it —
+/// they are separate build artifacts on the same image — so the struct's size is
+/// negotiated rather than assumed. Reading the current 88 bytes out of a caller
+/// that only wrote 72 would hand the kernel whatever followed its struct on the
+/// stack and use it as an `envp` pointer.
+const SPAWN_OPTIONS_V1_SIZE: usize = 72;
+
+/// `SPAWN_EXT(path, options, options_len)`.
+///
+/// `options_len` is the size of the caller's `SpawnOptions`. Zero means "the
+/// original 72-byte layout", which is what every binary built before the field
+/// was added passes (the argument was ignored and they leave it at whatever the
+/// register held — the wrapper zeroes it).
+pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
     let path = match copy_from_user_str(path_ptr, 512) {
         Ok(p) => p,
         Err(e) => return e,
     };
 
     if options_ptr == 0 { return EINVAL; }
-    let mut o = SpawnOptions { cwd_ptr: 0, cwd_len: 0, root_dir_ptr: 0, root_dir_len: 0, args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id: 0 };
-    if read_user_into(&mut o, options_ptr).is_err() {
-        return EFAULT;
+    // Zeroed, then filled only as far as the caller actually wrote: every field
+    // the caller does not know about reads as 0, which is each one's "unset".
+    let mut o = SpawnOptions::default();
+    let known = core::mem::size_of::<SpawnOptions>();
+    let supplied = if options_len == 0 {
+        SPAWN_OPTIONS_V1_SIZE
+    } else {
+        (options_len as usize).min(known)
+    };
+    if supplied < SPAWN_OPTIONS_V1_SIZE {
+        return EINVAL;
+    }
+    {
+        let bytes = as_user_bytes_mut(core::slice::from_mut(&mut o));
+        if copy_from_user(&mut bytes[..supplied], options_ptr).is_err() {
+            return EFAULT;
+        }
     }
 
     // Entering a box is a privilege boundary, not a preference: the child takes
@@ -1575,7 +1614,14 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, _a2: u64, _a3: u64, _a4: u
     
     let stdin_slice = stdin_data.as_deref();
 
-    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, None, stdin_slice, cwd_ref, o.box_id, false) {
+    // An empty list means "no environment was specified" and the spawn falls back
+    // to `DEFAULT_ENV`. A caller that wants to *narrow* the environment therefore
+    // has to pass at least one variable; `box run` composes the full list
+    // (image `Env`, then `-e` overrides) rather than passing only the overrides.
+    let env_vec = parse_argv_array(o.env_ptr);
+    let env_opt = if env_vec.is_empty() { None } else { Some(env_vec.as_slice()) };
+
+    if let Ok((_tid, ch, pid)) = akuma_exec::process::spawn_process_with_channel_ext(&path, args_opt, env_opt, stdin_slice, cwd_ref, o.box_id, false) {
         // For a `stack=rump` box, when herd spawns its `rump_server` the kernel
         // wires a sysproxy channel onto fd 3 (BEFORE the server runs) and brings
         // the proxy up. herd owns the process; the kernel owns the channel.

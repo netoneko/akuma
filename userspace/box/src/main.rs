@@ -64,7 +64,7 @@ pub extern "C" fn main() {
 fn print_usage() {
     print("box - Container management utility\n\n");
     print("Usage:\n");
-    print("  box run [--rm] [-d] [-i] [--name X] <image> [cmd ...]     Run a container\n");
+    print("  box run [--rm] [-d] [-i] [--name X] [-e K=V] <image> [cmd ...]  Run a container\n");
     print("  box open <name> [-i <img>] [-d] [--root <dir>] [cmd] [args...]             Start a box\n");
     print("  box pull <image>                                          Pull an OCI image\n");
     print("  box images                                                List pulled images\n");
@@ -169,6 +169,7 @@ fn cmd_open(args: libakuma::Args) -> ! {
             cwd_ptr: working_dir.as_ptr() as u64, cwd_len: working_dir.len(),
             root_dir_ptr: 0, root_dir_len: 0,
             args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id,
+            env_ptr: 0, env_len: 0,
         };
 
         print("box: starting '"); print(name); print("' in "); print(&directory); print(" (ID="); libakuma::print_hex(box_id as usize); print(")\n");
@@ -241,6 +242,7 @@ fn cmd_use(args: libakuma::Args) -> ! {
         cwd_ptr: "/".as_ptr() as u64, cwd_len: 1,
         root_dir_ptr: 0, root_dir_len: 0,
         args_ptr: 0, args_len: 0, stdin_ptr: 0, stdin_len: 0, box_id: target_id,
+        env_ptr: 0, env_len: 0,
     };
 
     let args_opt = if cmd_args.is_empty() { None } else { Some(cmd_args.as_slice()) };

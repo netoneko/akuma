@@ -57,6 +57,17 @@ fn resolve_self(path: &str) -> alloc::borrow::Cow<'_, str> {
     }
 }
 
+/// The box the calling process belongs to; 0 (the host) when there is no current
+/// process, which is the kernel-thread case.
+///
+/// Every `ProcFilesystem` method needs this, and several used to recompute it
+/// inline while others simply forgot to — `/proc/<pid>/syscalls` was reachable
+/// through four of them and only one applied the rule. Reaching for this helper
+/// is the cheap habit that keeps the four in step.
+fn caller_box_id() -> u64 {
+    akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id)
+}
+
 fn proc_cmdline_bytes(p: &process::Process) -> Vec<u8> {
     if p.args.is_empty() {
         let mut v: Vec<u8> = p.name.as_bytes().to_vec();
@@ -184,9 +195,21 @@ impl ProcFilesystem {
         parts[0].parse().map_err(|_| FsError::NotFound)
     }
 
-    /// Check if a process exists
-    fn process_exists(pid: Pid) -> bool {
-        process::lookup_process_shared(pid).is_some()
+    /// Whether `viewer_box_id` may see process `pid` at all.
+    ///
+    /// Box 0 (the host) sees every process; a box sees only its own. This
+    /// replaced a bare `process_exists`, which answered "is there such a pid"
+    /// and was used at eight sites as if it also answered "and may I see it" —
+    /// so `ls /proc/<host-pid>` from inside a container listed a host process's
+    /// `fd`/`cmdline`/`status`/`stat` entries, and `exists("/proc/2")` said yes.
+    /// The individual files were refused on read, so the leak was structure and
+    /// existence rather than content, but it is the same rule either way
+    /// (docs/archive/DEVBOX_ISSUES.md Issue 24).
+    fn process_visible(pid: Pid, viewer_box_id: u64) -> bool {
+        match process::lookup_process_shared(pid) {
+            Some(proc) => viewer_box_id == 0 || proc.box_id == viewer_box_id,
+            None => false,
+        }
     }
 
     /// Returns a human-readable description string for an fd entry (used by readlinkat).
@@ -359,9 +382,13 @@ impl Filesystem for ProcFilesystem {
                 size: 0,
             });
 
-            // Add recently-exited PIDs that still have retained syscall logs
+            // Add recently-exited PIDs that still have retained syscall logs.
+            // This runs AFTER the box filter above and must repeat it — appending
+            // the unfiltered list here is what put every host pid into a
+            // container's `ls /proc`, while `ps` looked correct because it stats
+            // each entry and the foreign ones are refused.
             if crate::config::PROC_SYSCALL_LOG_ENABLED {
-                let logged_pids = crate::syscall::log::list_pids_with_logs();
+                let logged_pids = crate::syscall::log::list_pids_with_logs(current_box_id);
                 let live_pids: alloc::collections::BTreeSet<u32> = entries.iter()
                     .filter_map(|e| e.name.parse::<u32>().ok())
                     .collect();
@@ -410,12 +437,12 @@ impl Filesystem for ProcFilesystem {
             let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
             // Process may have exited but still have a retained log
             let pid_has_log = crate::config::PROC_SYSCALL_LOG_ENABLED
-                && crate::syscall::log::get_formatted(pid).is_some();
-            if !Self::process_exists(pid) && !pid_has_log {
+                && crate::syscall::log::get_formatted(pid, current_box_id).is_some();
+            if !Self::process_visible(pid, current_box_id) && !pid_has_log {
                 return Err(FsError::NotFound);
             }
             let mut pid_entries = alloc::vec![];
-            if Self::process_exists(pid) {
+            if Self::process_visible(pid, current_box_id) {
                 pid_entries.push(DirEntry {
                     name: String::from("fd"),
                     is_dir: true,
@@ -442,7 +469,7 @@ impl Filesystem for ProcFilesystem {
                 });
             }
             if crate::config::PROC_SYSCALL_LOG_ENABLED
-                && crate::syscall::log::get_formatted(pid).is_some()
+                && crate::syscall::log::get_formatted(pid, current_box_id).is_some()
             {
                 pid_entries.push(DirEntry {
                     name: String::from("syscalls"),
@@ -457,7 +484,7 @@ impl Filesystem for ProcFilesystem {
         if parts.len() == 2 && parts[1] == "fd" {
             // /<pid>/fd - list all open file descriptors
             let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
-            if !Self::process_exists(pid) {
+            if !Self::process_visible(pid, current_box_id) {
                 return Err(FsError::NotFound);
             }
 
@@ -513,12 +540,14 @@ impl Filesystem for ProcFilesystem {
             return Ok(n);
         }
 
-        // Handle <pid>/syscalls
+        // Handle <pid>/syscalls. `get_formatted` applies the box rule itself —
+        // this is the method a `read()` actually lands in, and it is the one that
+        // used to have no isolation check at all.
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
             if parts.len() == 2 && parts[1] == "syscalls"
                 && let Ok(pid) = parts[0].parse::<Pid>() {
-                    let data = crate::syscall::log::get_formatted(pid)
+                    let data = crate::syscall::log::get_formatted(pid, caller_box_id())
                         .ok_or(FsError::NotFound)?;
                     if offset >= data.len() {
                         return Ok(0);
@@ -681,18 +710,15 @@ impl Filesystem for ProcFilesystem {
             return Ok(out.into_bytes());
         }
 
-        // Handle <pid>/syscalls
+        // Handle <pid>/syscalls. The check that used to live here consulted the
+        // process table, which cannot answer for a pid that has already exited —
+        // and an exited pid is exactly what a retained log is for, so it fell open.
+        // The log carries its own `box_id` now and decides for itself.
         if crate::config::PROC_SYSCALL_LOG_ENABLED {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
             if parts.len() == 2 && parts[1] == "syscalls"
                 && let Ok(pid) = parts[0].parse::<Pid>() {
-                    // Box isolation check: only allow if same box or host
-                    if current_box_id != 0
-                        && let Some(proc) = process::lookup_process_shared(pid)
-                            && proc.box_id != current_box_id {
-                                return Err(FsError::NotFound);
-                            }
-                    return crate::syscall::log::get_formatted(pid)
+                    return crate::syscall::log::get_formatted(pid, current_box_id)
                         .ok_or(FsError::NotFound);
                 }
         }
@@ -775,13 +801,13 @@ impl Filesystem for ProcFilesystem {
     fn exists(&self, path: &str) -> bool {
         let path = resolve_self(path.trim_matches('/'));
         let path = path.as_ref();
+        let current_box_id = caller_box_id();
 
         if path.is_empty() {
             return true; // Root always exists
         }
 
         if path == "boxes" || path == "cores" {
-            let current_box_id = akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
             return current_box_id == 0;
         }
 
@@ -795,7 +821,7 @@ impl Filesystem for ProcFilesystem {
 
         // Try to parse as fd path first
         if let Ok((pid, fd_num)) = Self::parse_fd_path(path) {
-            if !Self::process_exists(pid) { return false; }
+            if !Self::process_visible(pid, current_box_id) { return false; }
             if fd_num <= 1 { return true; }
             return process::lookup_process_shared(pid)
                 .is_some_and(|p| p.get_fd(fd_num).is_some());
@@ -805,28 +831,20 @@ impl Filesystem for ProcFilesystem {
         if let Ok(pid) = Self::parse_pid_path(path) {
             let parts: Vec<&str> = path.split('/').collect();
             if parts.len() == 1 {
-                if Self::process_exists(pid) { return true; }
+                if Self::process_visible(pid, current_box_id) { return true; }
                 if crate::config::PROC_SYSCALL_LOG_ENABLED {
-                    return crate::syscall::log::get_formatted(pid).is_some();
+                    return crate::syscall::log::get_formatted(pid, current_box_id).is_some();
                 }
                 return false;
             }
             if parts.len() == 2 && parts[1] == "fd" {
-                return Self::process_exists(pid);
+                return Self::process_visible(pid, current_box_id);
             }
             if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat") {
-                if !Self::process_exists(pid) {
-                    return false;
-                }
-                if let Some(proc) = process::lookup_process_shared(pid) {
-                    let current_box_id =
-                        akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
-                    return current_box_id == 0 || proc.box_id == current_box_id;
-                }
-                return false;
+                return Self::process_visible(pid, current_box_id);
             }
             if parts.len() == 2 && parts[1] == "syscalls" && crate::config::PROC_SYSCALL_LOG_ENABLED {
-                return crate::syscall::log::get_formatted(pid).is_some();
+                return crate::syscall::log::get_formatted(pid, current_box_id).is_some();
             }
         }
 
@@ -859,8 +877,7 @@ impl Filesystem for ProcFilesystem {
         }
 
         if path == "boxes" || path == "cores" {
-            let current_box_id = akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
-            if current_box_id != 0 {
+            if caller_box_id() != 0 {
                 return Err(FsError::NotFound);
             }
             return Ok(Metadata {
@@ -949,7 +966,7 @@ impl Filesystem for ProcFilesystem {
             let parts: Vec<&str> = path.split('/').collect();
             // <pid>/syscalls
             if parts.len() == 2 && parts[1] == "syscalls" && crate::config::PROC_SYSCALL_LOG_ENABLED {
-                if crate::syscall::log::get_formatted(pid).is_some() {
+                if crate::syscall::log::get_formatted(pid, caller_box_id()).is_some() {
                     return Ok(Metadata {
                         is_dir: false,
                         size: 0,
@@ -985,9 +1002,9 @@ impl Filesystem for ProcFilesystem {
                     accessed: None,
                 });
             }
-            let pid_exists = Self::process_exists(pid)
+            let pid_exists = Self::process_visible(pid, caller_box_id())
                 || (crate::config::PROC_SYSCALL_LOG_ENABLED
-                    && crate::syscall::log::get_formatted(pid).is_some());
+                    && crate::syscall::log::get_formatted(pid, caller_box_id()).is_some());
             if !pid_exists {
                 return Err(FsError::NotFound);
             }

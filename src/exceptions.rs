@@ -4530,7 +4530,9 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // Note: CLONE_VM threads share the address space owner's process info
                     // page, so read_current_pid() returns the owner PID for all siblings —
                     // the syscall log is stored under that owner PID, not the thread's own PID.
-                    match crate::syscall::log::get_formatted(pid) {
+                    // Box 0: this is the kernel's own crash dump to the console, not a
+                    // procfs read on behalf of a container, so it sees every log.
+                    match crate::syscall::log::get_formatted(pid, 0) {
                         Some(log_bytes) => {
                             crate::safe_print!(64, "[WILD-DA] syscall log (pid={}):\n", pid);
                             if let Ok(s) = core::str::from_utf8(&log_bytes) {

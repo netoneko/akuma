@@ -40,9 +40,18 @@ box close demo                                   # stop a box
 - `--name <id>` — container id (default `<image>-<uptime>`)
 - `--entrypoint <path>` — override the image's Entrypoint
 - `-w <dir>` / `--workdir <dir>` — override `WorkingDir`
+- `-e <K=V>` / `--env <K=V>` — set an environment variable; repeatable. A bare
+  `-e <K>` passes `K` through from `box`'s own environment.
 
 Arguments after the image replace the image's **Cmd** and are passed to its
 Entrypoint, as `docker run` does.
+
+The environment is the image's `Env` with `-e` applied over it **by name**, so
+`-e` replaces an image's value in place rather than appending a duplicate.
+Only the first `=` splits a name from its value, so `-e DSN=host=db port=5432`
+is one variable. `PATH` is added if the composed list has none — the kernel
+treats a supplied environment as the whole environment, so a list without it
+would break every bare program name.
 
 ### `box open` options
 
@@ -156,11 +165,11 @@ mounted at `/proc`, so `ps` works and shows only the container's processes.
 
 - **No nested OCI images.** Composing a container root needs an overlay mount,
   and a boxed process may not mount at all. Nested *boxes* still work.
-- The image's `Env` is not passed through yet, so `PATH` inside a container is
-  the kernel default; a bare Entrypoint is resolved against the standard `PATH`
-  directories by `box` itself.
-- A script Entrypoint needs `--entrypoint <binary>`: `spawn_ext` does not honour
-  shebangs (only `execve` does).
+- A bare Entrypoint is resolved against the standard `PATH` directories by `box`
+  itself, not by the container's own `PATH` — the kernel's spawn takes a path,
+  not a name, so the lookup has to happen before the process exists. An image
+  whose `Env` sets an unusual `PATH` therefore still needs an absolute
+  Entrypoint. (The image's `Env` itself *is* passed through, since 2026-08-20.)
 - No layer GC (`box rmi`), no digest pinning.
 
 ## Testing
