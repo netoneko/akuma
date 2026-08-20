@@ -1747,6 +1747,9 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
     const PR_GET_NO_NEW_PRIVS: i32 = 39;
     const PR_SET_VMA: i32 = 0x53564d41; // "SVMA"
     const PR_CAPBSET_READ: i32 = 23;
+    /// The highest capability number this kernel admits to, matching the
+    /// `000001ffffffffff` set `sys_capget` and `/proc/<pid>/status` report.
+    const CAP_LAST_CAP: u32 = 40;
     const PR_CAPBSET_DROP: i32 = 24;
     const PR_CAP_AMBIENT: i32 = 47;
     const PR_SET_PTRACER: i32 = 42;
@@ -1808,11 +1811,37 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
             EINVAL
         }
         PR_CAPBSET_READ => {
-            // Return 1 for all capabilities (we have all caps)
+            // We hold every capability, so the answer is 1 — but only for a
+            // capability that *exists*. Linux rejects an out-of-range index with
+            // EINVAL, and that rejection is load-bearing: util-linux's
+            // `cap_last_cap()` falls back to probing this option when
+            // `/proc/sys/kernel/cap_last_cap` is unreadable, so an unconditional
+            // 1 makes it conclude CAP_LAST_CAP is INT_MAX. `setpriv --dump` then
+            // iterates ~2.1 billion capability indices per capability set —
+            // ~13 minutes of pure prctl spin each, which is indistinguishable
+            // from a hang. That is what parks `redis:alpine`'s entrypoint, whose
+            // `has_cap()` is `setpriv -d | grep -q 'Capability bounding set:…'`
+            // (docs/archive/DEVBOX_ISSUES.md Issue 15).
+            if arg2 > u64::from(CAP_LAST_CAP) {
+                return EINVAL;
+            }
             1
         }
-        PR_CAPBSET_DROP | PR_CAP_AMBIENT => {
+        PR_CAPBSET_DROP => {
             // Accept but ignore capability operations
+            0
+        }
+        PR_CAP_AMBIENT => {
+            // The ambient set is empty and stays empty; raising into it is a
+            // no-op. `PR_CAP_AMBIENT_IS_SET` is a query over a capability
+            // number, though, so it inherits `PR_CAPBSET_READ`'s range rule —
+            // `setpriv --dump` walks 0..=cap_last_cap() through this option, and
+            // answering 0 for every integer is the second half of the spin
+            // described above.
+            const PR_CAP_AMBIENT_IS_SET: u64 = 1;
+            if arg2 == PR_CAP_AMBIENT_IS_SET && arg3 > u64::from(CAP_LAST_CAP) {
+                return EINVAL;
+            }
             0
         }
         PR_SET_PTRACER => {

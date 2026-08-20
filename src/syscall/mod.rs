@@ -364,6 +364,10 @@ pub mod nr {
     pub const EVENTFD2: u64 = 19;
     pub const PREAD64: u64 = 67;
     pub const PWRITE64: u64 = 68;
+    pub const PREADV: u64 = 69;
+    pub const PWRITEV: u64 = 70;
+    pub const PREADV2: u64 = 286;
+    pub const PWRITEV2: u64 = 287;
     pub const SETITIMER: u64 = 103;
     pub const MEMBARRIER: u64 = 283;
     pub const RT_SIGTIMEDWAIT: u64 = 137;
@@ -603,8 +607,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MMAP => { syscall_counters::inc_mmap((args[1] as usize).div_ceil(4096)); }
         nr::MUNMAP => { syscall_counters::inc_munmap(); }
         nr::BRK => { syscall_counters::inc_brk(); }
-        nr::READ | nr::READV | nr::PREAD64 => { syscall_counters::inc_read(); }
-        nr::WRITE | nr::WRITEV | nr::PWRITE64 => { syscall_counters::inc_write(); }
+        nr::READ | nr::READV | nr::PREAD64 | nr::PREADV | nr::PREADV2 => { syscall_counters::inc_read(); }
+        nr::WRITE | nr::WRITEV | nr::PWRITE64 | nr::PWRITEV | nr::PWRITEV2 => { syscall_counters::inc_write(); }
         nr::OPENAT => { syscall_counters::inc_openat(); }
         nr::CLOSE => { syscall_counters::inc_close(); }
         nr::MPROTECT => { syscall_counters::inc_mprotect(); }
@@ -852,6 +856,16 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::EVENTFD2 => eventfd::sys_eventfd2(args[0] as u32, args[1] as u32),
         nr::PREAD64 => fs::sys_pread64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
         nr::PWRITE64 => fs::sys_pwrite64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
+        // args[4] is `pos_h`, which carries nothing on a 64-bit kernel — see
+        // `fs::sys_pvec2`. The `2` variants add the `RWF_*` flags word.
+        nr::PREADV => fs::sys_pvec2(args[0], args[1], args[2] as usize, args[3], 0, false),
+        nr::PWRITEV => fs::sys_pvec2(args[0], args[1], args[2] as usize, args[3], 0, true),
+        nr::PREADV2 => {
+            fs::sys_pvec2(args[0], args[1], args[2] as usize, args[3], args[5] as u32, false)
+        }
+        nr::PWRITEV2 => {
+            fs::sys_pvec2(args[0], args[1], args[2] as usize, args[3], args[5] as u32, true)
+        }
         nr::SETITIMER => {
             time::sys_setitimer(args[0] as u32, args[1], args[2])
         }

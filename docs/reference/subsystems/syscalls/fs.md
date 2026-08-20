@@ -47,6 +47,10 @@ repeated.
 | `writev` | 66 | `sys_writev` |
 | `pread64` | 67 | `sys_pread64` |
 | `pwrite64` | 68 | `sys_pwrite64` |
+| `preadv` | 69 | `sys_pvec2` |
+| `pwritev` | 70 | `sys_pvec2` |
+| `preadv2` | 286 | `sys_pvec2` |
+| `pwritev2` | 287 | `sys_pvec2` |
 | `readlinkat` | 78 | `sys_readlinkat` |
 | `newfstatat` | 79 | `sys_newfstatat` |
 | `fstat` | 80 | `sys_fstat` |
@@ -155,6 +159,45 @@ the next iovec):
 [`../../../archive/WRITEV_SHORT_WRITE_SPLICE.md`](../../../archive/WRITEV_SHORT_WRITE_SPLICE.md).
 The rule is a named predicate (`writev_stops_after`) with a boot-suite check,
 `run_writev_short_write_tests`.
+
+## `preadv`/`pwritev`/`preadv2`/`pwritev2` — all four, or none
+
+All four go to one entry point, `sys_pvec2`, which walks the iovecs with
+`sys_pread64`/`sys_pwrite64` and advances the offset by what was actually
+transferred. The same short-transfer rule as above applies, for the same reason.
+
+**All four have to exist for the family to work**, because musl decides which
+one to issue and only reaches the `2` variants when `flags` is nonzero:
+
+| what the caller asked for | what musl actually issues |
+|---|---|
+| `flags == 0`, `offset == -1` | `writev` / `readv` (66 / 65) |
+| `flags == 0`, `offset >= 0` | `pwritev` / `preadv` (70 / 69) |
+| `flags != 0` | `pwritev2` / `preadv2` (287 / 286) |
+
+Implementing only 286/287 therefore leaves the common path falling through to
+the dispatcher's `-ENOSYS` catch-all, **which prints a line per attempt**. That
+was the `[ENOSYS] nr=287` console flood: the writes still succeeded through a
+caller-side fallback, but each one paid a wasted syscall plus a console print,
+and the print is the expensive half under load
+([`../../../archive/DEVBOX_ISSUES.md`](../../../archive/DEVBOX_ISSUES.md)
+Issue 13).
+
+Two details worth not re-deriving:
+
+- **`pos_h` (arg 4) carries nothing on a 64-bit kernel.** Linux reassembles the
+  offset with `pos_from_hilo(pos_h, pos_l)`, whose two 32-bit shifts of a 64-bit
+  value make the high word contribute zero; `pos_l` already holds the whole
+  offset. `sys_pvec2` does not take it as a parameter, deliberately — folding it
+  in would break every offset above 4 GB.
+- **Unsupported `RWF_*` flags return `EOPNOTSUPP`, not `EINVAL`.** None of
+  `HIPRI`/`DSYNC`/`SYNC`/`NOWAIT`/`APPEND` are implemented. `EINVAL` reads as
+  "bad argument" and stops a caller from retrying without the flag; `EOPNOTSUPP`
+  is Linux's own answer and invites the retry.
+
+Boot-suite check: `test_pvec2` (`src/process_tests.rs`), whose load-bearing case
+is the two-iovec positional write — an offset that fails to advance between
+iovecs makes the second overwrite the first.
 
 **`sendmsg`/`recvmsg` are a different story** and still only process `iovs[0]` —
 see [`net.md`](net.md). That is a legal short transfer rather than a splice, but

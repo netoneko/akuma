@@ -493,8 +493,17 @@ impl Filesystem for ProcFilesystem {
         let path = resolve_self(path.trim_start_matches('/'));
         let path = path.as_ref();
 
-        // Handle virtual files first (boxes, net/tcp, sysvipc/msg, <pid>/syscalls, etc.)
-        if path == "boxes" || path.starts_with("net/") || path == "sysvipc/msg" {
+        // Handle virtual files first (boxes, cores, net/tcp, sysvipc/msg,
+        // <pid>/syscalls, etc.). This list must name every path `read_file`
+        // renders — `metadata` and `list_dir` advertising a file that `read_at`
+        // does not forward is how `/proc/cores` came to `open()` and `stat()`
+        // fine while every `read()` returned NotFound
+        // (docs/archive/DEVBOX_ISSUES.md Issue 4).
+        if path == "boxes"
+            || path == "cores"
+            || path.starts_with("net/")
+            || path == "sysvipc/msg"
+        {
             let data = self.read_file(path)?;
             if offset >= data.len() {
                 return Ok(0);

@@ -163,13 +163,35 @@ from the image's layers. If you still see this, your kernel predates the fix;
 [`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) Issue 14.
 
 **The container starts and then does nothing** — `Started PID N`, no output, no
-listener, no exit. The image's Entrypoint drops privileges and re-execs itself
-(`exec setpriv --reuid=… -- "$0" "$@"`, the standard shape for `redis`,
-`postgres`, `nginx`, …). Akuma has no per-process credentials, so `id -u` still
-answers 0 on the second pass and the script re-execs **forever**. Use
-`--entrypoint <the real binary>` to skip it.
+listener, no exit. Check `ps` before assuming a cause; there are two, and they
+look identical from outside:
+
+- **A `setpriv`/`grep` pair sitting there** means the entrypoint's capability
+  probe is stuck, not its privilege drop. `redis:alpine` 8.x gates on
+  `setpriv -d | grep -q 'Capability bounding set:…'`, and `setpriv --dump` used
+  to spin ~13 minutes per capability set because `prctl(PR_CAPBSET_READ)`
+  answered every capability number. Fixed 2026-08-20; if you still see it, your
+  kernel predates the fix.
+- **A single process and nothing else** means the classic one: the Entrypoint
+  drops privileges and re-execs itself (`exec setpriv --reuid=… -- "$0" "$@"`,
+  the standard shape for `redis`, `postgres`, …). Akuma has no per-process
+  credentials, so `id -u` still answers 0 on the second pass and the script
+  re-execs **forever**.
+
+`--entrypoint <the real binary>` skips the script either way.
 [`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) Issue 15, and
 [`run-redis.md`](run-redis.md) for a worked example.
+
+**A web server answers `200` with zero bytes and the client reports
+`connection closed prematurely`.** `sendfile(2)` is not implemented, so nginx
+(whose stock config has `sendfile on;`) writes headers and then drops the
+connection on every static file. The tell is in the container's error log —
+`sendfile() failed (38: Function not implemented)` — which for the official
+nginx image lands in `/var/lib/box/containers/<id>/upper/dev/stderr`, because
+the image symlinks its logs to `/dev/stderr` and the container's `/dev` has no
+such device, so nginx creates it as a regular file. `sendfile off;` in the
+server block is the workaround.
+[`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) Issue 23.
 
 **`exec: <name>: not found` from inside the container**, for a binary that is
 plainly in the image. The container's `PATH` comes from `DEFAULT_ENV` — an OCI

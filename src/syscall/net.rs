@@ -704,7 +704,8 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                     0
                 }
                 SO_KEEPALIVE => {
-                    // Store keepalive setting (we don't actually use it yet)
+                    // Arms smoltcp's keep-alive timer, not just a bool — see
+                    // `socket::set_socket_keepalive`.
                     socket::set_socket_keepalive(idx, val != 0);
                     0
                 }

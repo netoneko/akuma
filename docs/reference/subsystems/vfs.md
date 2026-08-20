@@ -91,6 +91,20 @@ libcap-ng failed inside a container (`archive/REDIS_END_TO_END.md` §4). If you
 add a `/proc` entry, test it through `/proc/self/` too — the two paths take
 different code.
 
+**Adding a virtual file means touching four functions, not one.** `read_file`
+renders the content, but `metadata`, `list_dir` and — separately — `read_at`
+each keep their own idea of which paths exist, and `read_at` is the one that
+serves the actual `read()`. `/proc/cores` was in three of the four until
+2026-08-20: `open()` and `stat()` succeeded, `ls /proc` listed it, and every
+`read()` returned `NotFound`. busybox renders that as `read error: No such file
+or directory` rather than `can't open`, which is the only tell that the file was
+found and the *read* was what failed
+([`../../archive/DEVBOX_ISSUES.md`](../../archive/DEVBOX_ISSUES.md) Issue 4).
+`read_at`'s whitelist must name every path `read_file` renders; the boot-suite
+check is `test_procfs_virtual_files_are_readable` (`src/process_tests.rs`),
+which drives `openat` + `read` rather than calling `read_file` — testing the
+renderer directly is what kept the gap invisible.
+
 The `Cap*` lines report a full-root set (`000001ffffffffff`). Nothing enforces
 capabilities; the lines exist because **libcap-ng reads a process's
 capabilities from `/proc/self/status`**, not from `capget(2)`, and returns -1

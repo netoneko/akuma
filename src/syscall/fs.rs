@@ -1302,6 +1302,106 @@ pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
     total_written
 }
 
+/// The one iovec walk behind `preadv`/`pwritev`/`preadv2`/`pwritev2`.
+///
+/// The same short-transfer rule as `sys_readv`/`sys_writev` applies — a partial
+/// transfer ends the whole call, because continuing would splice the next
+/// iovec's bytes in where the truncated tail belonged (see
+/// [`writev_stops_after`]). The difference here is that the offset advances by
+/// what was actually transferred rather than by the file position, so each
+/// chunk lands where the caller asked.
+fn pvec_at(fd_num: u64, iov_ptr: u64, iov_cnt: usize, offset: i64, write: bool) -> u64 {
+    if offset < 0 {
+        return EINVAL;
+    }
+    let Some(iov_size) = iov_cnt.checked_mul(core::mem::size_of::<IoVec>()) else {
+        return EINVAL;
+    };
+    if !validate_user_ptr(iov_ptr, iov_size) {
+        return EFAULT;
+    }
+
+    let mut kernel_iovs = alloc::vec![IoVec { iov_base: 0, iov_len: 0 }; iov_cnt];
+    if copy_from_user(as_user_bytes_mut(&mut kernel_iovs), iov_ptr).is_err() {
+        return EFAULT;
+    }
+
+    let mut total: u64 = 0;
+    let mut at = offset;
+    for iov in kernel_iovs.iter().take(iov_cnt) {
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let n = if write {
+            sys_pwrite64(fd_num as u32, iov.iov_base, iov.iov_len, at)
+        } else {
+            sys_pread64(fd_num as u32, iov.iov_base, iov.iov_len, at)
+        };
+        if (n as i64) < 0 {
+            // Report the error only if nothing has moved yet; otherwise the
+            // caller must learn how far the transfer got.
+            if total == 0 {
+                return n;
+            }
+            break;
+        }
+        total += n;
+        // An offset past i64::MAX is not reachable through any file this kernel
+        // serves, but wrapping here would silently rewrite the start of the file.
+        let Some(next) = at.checked_add(n as i64) else {
+            break;
+        };
+        at = next;
+        if writev_stops_after(n, iov.iov_len) {
+            break;
+        }
+    }
+    total
+}
+
+/// `preadv`/`pwritev` (nr 69/70) and their `2` variants (nr 286/287).
+///
+/// musl only reaches `p{read,write}v2` when `flags` is nonzero — with no flags
+/// it rewrites the call to `p{read,write}v`, or to plain `{read,write}v` when
+/// the offset is -1 — so a build that lacked all four saw callers fall all the
+/// way through to the dispatcher's `-ENOSYS` catch-all, which prints a line per
+/// attempt. That is the `[ENOSYS] nr=287` console flood
+/// (docs/archive/DEVBOX_ISSUES.md Issue 13): the write itself still succeeded
+/// via a fallback, but every one of them paid a wasted syscall and a console
+/// print, and console output is the expensive half under load.
+///
+/// `pos_h` is deliberately not a parameter. Linux reassembles the offset with
+/// `pos_from_hilo(pos_h, pos_l)`, whose two 32-bit shifts of a 64-bit value make
+/// `pos_h` contribute nothing on a 64-bit kernel; `pos_l` already carries the
+/// whole offset. Naming it would invite someone to fold it in and break every
+/// offset above 4 GB.
+///
+/// `flags` are the `RWF_*` set (`HIPRI`, `DSYNC`, `SYNC`, `NOWAIT`, `APPEND`).
+/// None of them are implemented, and Linux's own answer for an unsupported
+/// `RWF_*` bit is `EOPNOTSUPP` — not `EINVAL`, which would read as "bad
+/// argument" and stop a caller from retrying without the flag.
+pub(super) fn sys_pvec2(
+    fd_num: u64,
+    iov_ptr: u64,
+    iov_cnt: usize,
+    pos_l: u64,
+    flags: u32,
+    write: bool,
+) -> u64 {
+    if flags != 0 {
+        return EOPNOTSUPP;
+    }
+    // -1 means "use the file position", which is exactly readv/writev.
+    if pos_l as i64 == -1 {
+        return if write {
+            sys_writev(fd_num, iov_ptr, iov_cnt)
+        } else {
+            sys_readv(fd_num, iov_ptr, iov_cnt)
+        };
+    }
+    pvec_at(fd_num, iov_ptr, iov_cnt, pos_l as i64, write)
+}
+
 pub(super) fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
     if !validate_user_ptr(buf_ptr, 120) { return EFAULT; }
     if let Some(proc) = akuma_exec::process::current_process_shared() {

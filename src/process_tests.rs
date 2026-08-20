@@ -46,6 +46,9 @@ pub fn run_network_tests() {
 
     #[cfg(feature = "smoltcp")]
     test_socket_refcount_survives_first_close();
+
+    #[cfg(feature = "smoltcp")]
+    test_so_keepalive_arms_smoltcp();
 }
 
 /// Regression: writing to a broken pipe delivers SIGPIPE whose DEFAULT action
@@ -130,6 +133,49 @@ fn test_socket_refcount_survives_first_close() {
     assert!(socket::with_socket(idx, |_| ()).is_none());
 
     console::print("  [PASS] test_socket_refcount_survives_first_close\n");
+}
+
+/// `SO_KEEPALIVE` must arm smoltcp's keep-alive timer, not just set a bool.
+///
+/// `set_socket_keepalive` used to write `KernelSocket::keepalive` and stop
+/// there. That field was read nowhere, and smoltcp's `set_keep_alive` — the
+/// call that winds `keep_alive_at` — was never reached from anywhere in the
+/// crate, so `setsockopt(SO_KEEPALIVE)` returned success and Akuma emitted no
+/// probe, ever (docs/archive/DEVBOX_ISSUES.md Issue 19).
+///
+/// The assertion deliberately reads back through smoltcp rather than the local
+/// flag: a test against the flag passes in exactly the broken case.
+#[cfg(feature = "smoltcp")]
+fn test_so_keepalive_arms_smoltcp() {
+    use akuma_net::socket;
+
+    let Some(idx) = socket::alloc_socket(socket::socket_const::SOCK_STREAM) else {
+        console::print("  [SKIP] test_so_keepalive_arms_smoltcp (no socket available)\n");
+        return;
+    };
+
+    assert!(
+        socket::socket_keepalive_interval(idx).is_none(),
+        "a fresh socket must not have keep-alive armed"
+    );
+
+    socket::set_socket_keepalive(idx, true);
+    let armed = socket::socket_keepalive_interval(idx);
+    assert_eq!(
+        armed.map(|d| d.secs()),
+        Some(socket::KEEPALIVE_IDLE_SECS),
+        "SO_KEEPALIVE did not reach smoltcp's set_keep_alive"
+    );
+
+    // Turning it back off must disarm, not merely clear the local flag.
+    socket::set_socket_keepalive(idx, false);
+    assert!(
+        socket::socket_keepalive_interval(idx).is_none(),
+        "clearing SO_KEEPALIVE left smoltcp's timer armed"
+    );
+
+    socket::remove_socket(idx);
+    console::print("  [PASS] test_so_keepalive_arms_smoltcp\n");
 }
 
 /// Run all process tests
@@ -799,6 +845,18 @@ pub fn run_all_tests() {
     // errno contract — pins what the Phase 2b VfsBklGuard conversion (carve-out doc §13)
     // must preserve.
     test_openat();
+
+    // procfs read_at's whitelist must cover every path read_file renders — the
+    // gap that made /proc/cores open and stat fine but 404 on every read.
+    test_procfs_virtual_files_are_readable();
+
+    // prctl's capability queries must reject an out-of-range capability, or
+    // util-linux's cap_last_cap() probe never terminates.
+    test_prctl_capbset_is_bounded();
+
+    // preadv/pwritev/preadv2/pwritev2: positional iovec walk, the -1 delegation
+    // to readv/writev, and EOPNOTSUPP for unimplemented RWF_* flags.
+    test_pvec2();
 
     // sys_renameat/sys_renameat2 entry points: dirfd resolution, RENAME_NOREPLACE,
     // errno contract — pins what the Phase 2c VfsBklGuard conversion (carve-out doc
@@ -2773,6 +2831,239 @@ fn test_unlinkat() {
     } else {
         crate::safe_print!(64, "[Test] unlinkat FAILED ({} of 8 cases)\n", fails);
         panic!("test_unlinkat: {fails} of 8 cases failed");
+    }
+}
+
+/// `/proc/cores` must be **readable**, not merely openable.
+///
+/// `ProcFilesystem` keeps a whitelist in `read_at` that is separate from the
+/// paths `read_file`, `metadata` and `list_dir` recognize, and `cores` was in
+/// three of the four. So `open()` and `stat()` succeeded while every `read()`
+/// returned `NotFound` — busybox renders that as `read error`, not `can't
+/// open`, which is the tell that sends you to the wrong function
+/// (docs/archive/DEVBOX_ISSUES.md Issue 4).
+///
+/// Driven through the real `openat`/`read` entry points on purpose: calling
+/// `read_file` directly is what made the bug invisible for as long as it was.
+/// `boxes` is checked alongside it as the control — it was always in the
+/// whitelist, so a failure on both means the fixture broke, not the fix.
+fn test_procfs_virtual_files_are_readable() {
+    use crate::syscall::{handle_syscall, nr};
+
+    const AT_FDCWD: i32 = -100;
+    let pid: u32 = 7706;
+    let tid = register_at_syscall_process(pid, "/tmp".to_string());
+
+    let mut fails = 0u32;
+    for path in ["/proc/cores", "/proc/boxes"] {
+        let p = cstr(path);
+        let fd = handle_syscall(
+            nr::OPENAT,
+            &[AT_FDCWD as u64, p.as_ptr() as u64, 0, 0, 0, 0],
+        );
+        if (fd as i64) < 0 {
+            fails += 1;
+            crate::safe_print!(96, "[Test] procfs open {} FAILED fd={}\n", path, fd);
+            continue;
+        }
+        let mut buf = [0u8; 256];
+        let n = handle_syscall(
+            nr::READ,
+            &[fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0],
+        );
+        // A virtual file that renders nothing is as broken as one that 404s:
+        // both leave `cat` with no output to show.
+        if (n as i64) <= 0 {
+            fails += 1;
+            crate::safe_print!(96, "[Test] procfs read {} FAILED n={}\n", path, n);
+        }
+        handle_syscall(nr::CLOSE, &[fd, 0, 0, 0, 0, 0]);
+    }
+
+    unregister_at_syscall_process(pid, tid);
+
+    if fails == 0 {
+        crate::safe_print!(96, "[Test] procfs_virtual_files_are_readable PASSED (cores, boxes)\n");
+    } else {
+        crate::safe_print!(64, "[Test] procfs_virtual_files_are_readable FAILED ({} of 2)\n", fails);
+        panic!("test_procfs_virtual_files_are_readable: {fails} of 2 cases failed");
+    }
+}
+
+/// `prctl`'s capability queries must reject an out-of-range capability number.
+///
+/// Answering every integer keeps util-linux's `cap_last_cap()` probe from ever
+/// terminating: with `/proc/sys/kernel/cap_last_cap` unreadable it falls back to
+/// asking `PR_CAPBSET_READ`, concludes `CAP_LAST_CAP` is `INT_MAX`, and
+/// `setpriv --dump` then walks ~2.1 billion capability indices per set. That is
+/// what parks `redis:alpine`'s entrypoint, whose privilege-drop gate is
+/// `setpriv -d | grep -q 'Capability bounding set:…'`
+/// (docs/archive/DEVBOX_ISSUES.md Issue 15).
+///
+/// The in-range answers are asserted too: bounding this by returning 0 or
+/// EINVAL for a *valid* capability would contradict the full-root set
+/// `sys_capget` and `/proc/<pid>/status` both report.
+fn test_prctl_capbset_is_bounded() {
+    use crate::syscall::{handle_syscall, nr};
+
+    const PR_CAPBSET_READ: u64 = 23;
+    const PR_CAP_AMBIENT: u64 = 47;
+    const PR_CAP_AMBIENT_IS_SET: u64 = 1;
+    /// Matches the `000001ffffffffff` set reported elsewhere.
+    const CAP_LAST_CAP: u64 = 40;
+
+    let prctl = |option: u64, a2: u64, a3: u64| -> u64 {
+        handle_syscall(nr::PRCTL, &[option, a2, a3, 0, 0, 0])
+    };
+
+    let mut fails = 0u32;
+    let mut check = |what: &str, got: u64, want: u64| {
+        if got != want {
+            fails += 1;
+            crate::safe_print!(96, "[Test] prctl {} FAILED got={} want={}\n", what, got, want);
+        }
+    };
+
+    // We hold every capability, so every capability that exists answers 1.
+    check("capbset(0)", prctl(PR_CAPBSET_READ, 0, 0), 1);
+    check("capbset(CAP_LAST_CAP)", prctl(PR_CAPBSET_READ, CAP_LAST_CAP, 0), 1);
+    // One past the end, and far past it — the probe walks upward from 0, so the
+    // first rejection is the only thing that ever stops it.
+    check("capbset(41)", prctl(PR_CAPBSET_READ, CAP_LAST_CAP + 1, 0), EINVAL);
+    check("capbset(i32::MAX)", prctl(PR_CAPBSET_READ, 0x7fff_ffff, 0), EINVAL);
+
+    // The ambient set is empty, so a valid capability answers 0 — but an
+    // out-of-range one must still be rejected, because `setpriv --dump` walks
+    // this option over the same bogus range.
+    check(
+        "ambient is_set(0)",
+        prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, 0),
+        0,
+    );
+    check(
+        "ambient is_set(41)",
+        prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_LAST_CAP + 1),
+        EINVAL,
+    );
+    // Raising into the ambient set stays an accepting no-op; only IS_SET is a
+    // query over a capability number.
+    check("ambient raise", prctl(PR_CAP_AMBIENT, 2, 0x7fff_ffff), 0);
+
+    if fails == 0 {
+        crate::safe_print!(96, "[Test] prctl_capbset_is_bounded PASSED (7 cases)\n");
+    } else {
+        crate::safe_print!(64, "[Test] prctl_capbset_is_bounded FAILED ({} of 7)\n", fails);
+        panic!("test_prctl_capbset_is_bounded: {fails} of 7 cases failed");
+    }
+}
+
+/// `preadv`/`pwritev` (69/70) and `preadv2`/`pwritev2` (286/287).
+///
+/// musl only issues the `2` variants when `flags` is nonzero — with no flags it
+/// rewrites the call to `p{read,write}v`, or to plain `{read,write}v` at offset
+/// -1 — so all four have to exist for the family to stop falling through to the
+/// dispatcher's `-ENOSYS` catch-all and its per-attempt console print
+/// (docs/archive/DEVBOX_ISSUES.md Issue 13).
+///
+/// The case that matters most is the multi-iovec positional write: the offset
+/// has to advance by what was actually transferred, or the second iovec
+/// overwrites the first.
+fn test_pvec2() {
+    use crate::syscall::{handle_syscall, nr};
+
+    const PATH: &str = "/tmp/pvec2_selftest.bin";
+    let _ = crate::fs::remove_file(PATH);
+    let _ = crate::fs::write_file(PATH, b"................");
+
+    let pid: u32 = 7707;
+    let tid = register_at_syscall_process(pid, "/tmp".to_string());
+
+    let p = cstr(PATH);
+    // O_RDWR = 2.
+    let fd = handle_syscall(nr::OPENAT, &[(-100i32) as u64, p.as_ptr() as u64, 2, 0, 0, 0]);
+    if (fd as i64) < 0 {
+        unregister_at_syscall_process(pid, tid);
+        crate::safe_print!(96, "[Test] pvec2 setup FAILED to open fd={}\n", fd);
+        panic!("test_pvec2: could not open the fixture file");
+    }
+
+    // `IoVec` is `#[repr(C)] { u64, usize }`, i.e. two 64-bit words.
+    let a = *b"AAAA";
+    let b = *b"BBBB";
+    let iov: [u64; 4] = [
+        a.as_ptr() as u64, 4,
+        b.as_ptr() as u64, 4,
+    ];
+
+    // Returns the failure count to add, so the caller keeps ownership of it —
+    // a capturing closure would borrow `fails` for the whole test body.
+    let check = |what: &str, got: u64, want: u64| -> u32 {
+        if got == want {
+            return 0;
+        }
+        crate::safe_print!(96, "[Test] pvec2 {} FAILED got={} want={}\n", what, got, want);
+        1
+    };
+
+    let mut fails = 0u32;
+
+    // 1. pwritev2 at offset 8, two iovecs: the second must land at 12, not 8.
+    fails += check(
+        "pwritev2@8",
+        handle_syscall(nr::PWRITEV2, &[fd, iov.as_ptr() as u64, 2, 8, 0, 0]),
+        8,
+    );
+
+    // 2. pwritev (no flags word) at offset 0 — the call musl actually emits.
+    fails += check(
+        "pwritev@0",
+        handle_syscall(nr::PWRITEV, &[fd, iov.as_ptr() as u64, 2, 0, 0, 0]),
+        8,
+    );
+
+    // 3. Nonzero RWF_* flags are unimplemented. EOPNOTSUPP, not EINVAL: the
+    //    caller may legitimately retry without the flag.
+    fails += check(
+        "pwritev2 RWF_HIPRI",
+        handle_syscall(nr::PWRITEV2, &[fd, iov.as_ptr() as u64, 2, 8, 0, 1]),
+        EOPNOTSUPP,
+    );
+
+    // 4. Read it all back positionally and check both writes landed where asked.
+    let mut got = [0u8; 16];
+    let riov: [u64; 2] = [got.as_mut_ptr() as u64, 16];
+    fails += check(
+        "preadv2@0",
+        handle_syscall(nr::PREADV2, &[fd, riov.as_ptr() as u64, 1, 0, 0, 0]),
+        16,
+    );
+    // 0..8 came from case 2, 8..16 from case 1. The 8..12 == "AAAA" check is the
+    // one that catches an offset that failed to advance between iovecs.
+    if &got[0..4] != b"AAAA" || &got[4..8] != b"BBBB" || &got[8..12] != b"AAAA" || &got[12..16] != b"BBBB" {
+        fails += 1;
+        crate::safe_print!(128, "[Test] pvec2 layout FAILED got={:?}\n", &got[..16]);
+    }
+
+    // 5. Offset -1 means "use the file position", i.e. plain readv. The fd sits
+    //    at EOF after nothing (positional I/O must not move it), so a readv from
+    //    the start reads the whole file again.
+    let mut got2 = [0u8; 16];
+    let riov2: [u64; 2] = [got2.as_mut_ptr() as u64, 16];
+    fails += check(
+        "preadv2@-1",
+        handle_syscall(nr::PREADV2, &[fd, riov2.as_ptr() as u64, 1, u64::MAX, 0, 0]),
+        16,
+    );
+
+    handle_syscall(nr::CLOSE, &[fd, 0, 0, 0, 0, 0]);
+    unregister_at_syscall_process(pid, tid);
+    let _ = crate::fs::remove_file(PATH);
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] pvec2 PASSED (6 cases: pwritev2/pwritev/flags/preadv2/layout/pos-1)\n");
+    } else {
+        crate::safe_print!(64, "[Test] pvec2 FAILED ({} of 6 cases)\n", fails);
+        panic!("test_pvec2: {fails} of 6 cases failed");
     }
 }
 

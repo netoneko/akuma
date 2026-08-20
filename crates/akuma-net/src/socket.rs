@@ -23,6 +23,8 @@ use crate::runtime::runtime;
 use crate::runtime::PreemptGuard;
 #[cfg(feature = "smoltcp")]
 use smoltcp::socket::tcp;
+#[cfg(feature = "smoltcp")]
+use smoltcp::time::Duration;
 
 // ============================================================================
 // Constants
@@ -544,14 +546,67 @@ pub fn set_tcp_nodelay(idx: usize, enabled: bool) {
     });
 }
 
-/// Set `SO_KEEPALIVE` option on a socket
+/// Linux's `tcp_keepalive_time`: idle seconds before the first probe.
+///
+/// smoltcp has a single interval rather than Linux's time/intvl/probes triple,
+/// so this is also what an armed socket repeats at.
+#[cfg(feature = "smoltcp")]
+pub const KEEPALIVE_IDLE_SECS: u64 = 7200;
+
+/// Set `SO_KEEPALIVE` on a socket, and actually arm it.
+///
+/// This used to write `sock.keepalive` and stop there. The field was never read
+/// anywhere, and smoltcp's `set_keep_alive` — the call that winds the
+/// `keep_alive_at` timer — was never reached from anywhere in the crate, so
+/// `setsockopt(SO_KEEPALIVE)` reported success and Akuma emitted no keepalive
+/// probe, ever (docs/archive/DEVBOX_ISSUES.md Issue 19).
+///
+/// What this buys is Akuma noticing a peer that vanished without a FIN; it is
+/// **not** a fix for a connection Akuma itself tears down, so it does not by
+/// itself explain the 300 s `rc=255` in that issue.
+///
+/// A listener's pooled handles are armed too, so a connection inherits the
+/// option from the socket it was accepted on rather than silently losing it.
 #[cfg(feature = "smoltcp")]
 pub fn set_socket_keepalive(idx: usize, enabled: bool) {
+    let interval = enabled.then(|| Duration::from_secs(KEEPALIVE_IDLE_SECS));
     with_table(|table| {
-        if let Some(Some(sock)) = table.get_mut(idx) {
-            sock.keepalive = enabled;
-        }
+        let Some(Some(sock)) = table.get_mut(idx) else {
+            return;
+        };
+        sock.keepalive = enabled;
+        with_network(|net| match &sock.inner {
+            SocketType::Stream(h) => {
+                net.sockets.get_mut::<tcp::Socket>(*h).set_keep_alive(interval);
+            }
+            SocketType::Listener { handles, .. } => {
+                for h in handles {
+                    net.sockets.get_mut::<tcp::Socket>(*h).set_keep_alive(interval);
+                }
+            }
+            // UDP has no connection to keep alive.
+            SocketType::Datagram { .. } => {}
+        });
     });
+}
+
+/// Read back the keep-alive interval smoltcp is actually holding for `idx`.
+///
+/// Deliberately reads *smoltcp*, not `KernelSocket::keepalive` — the whole
+/// defect was those two disagreeing, so a getter that returned the local bool
+/// would pass whether or not the option was ever armed.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn socket_keepalive_interval(idx: usize) -> Option<Duration> {
+    with_table(|table| {
+        let Some(Some(sock)) = table.get(idx) else {
+            return None;
+        };
+        let SocketType::Stream(h) = sock.inner else {
+            return None;
+        };
+        with_network(|net| net.sockets.get::<tcp::Socket>(h).keep_alive()).flatten()
+    })
 }
 
 /// Set `SO_RCVTIMEO` (`recv`) or `SO_SNDTIMEO` (`send`), in microseconds.

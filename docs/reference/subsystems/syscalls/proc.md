@@ -163,6 +163,29 @@ so every later call used a layout the kernel never agreed to. Note that
 libcap-ng reads the *capabilities themselves* from `/proc/self/status`, not
 from this syscall — see [`../vfs.md`](../vfs.md) "procfs".
 
+### The capability *number* is bounded, even though the capability *set* is full
+
+`prctl(PR_CAPBSET_READ, cap)` answers 1 for every capability that exists and
+`EINVAL` above `CAP_LAST_CAP` (40 — the same bound as the `000001ffffffffff` set
+`capget` and `/proc/<pid>/status` report). `prctl(PR_CAP_AMBIENT,
+PR_CAP_AMBIENT_IS_SET, cap)` follows the same range rule.
+
+**That rejection is load-bearing, and it is the non-obvious half.** With
+`/proc/sys/kernel/cap_last_cap` unreadable — it does not exist on this kernel —
+util-linux's `cap_last_cap()` falls back to probing `PR_CAPBSET_READ`. A
+kernel that answers every integer makes it conclude `CAP_LAST_CAP` is
+`INT_MAX`, and `setpriv --dump` then walks ~2.1 billion capability indices per
+set at roughly 0.4 us each: ~13 minutes per set, which presents as a hang, not
+as a slow command.
+
+What that hung was `redis:alpine`'s entrypoint, whose privilege-drop gate is
+`has_cap() { setpriv -d | grep -q 'Capability bounding set:.*\bsetuid\b'; }` —
+so `box run redis:alpine` parked before it ever reached the credential wall
+below. Fixed 2026-08-20; boot-suite check `test_prctl_capbset_is_bounded`
+(`src/process_tests.rs`). The general shape: **an accepting no-op is only safe
+for a setter. For a query that a caller uses to discover a bound, "yes" to
+everything is an infinite loop.**
+
 ## exit / exit_group
 
 `sys_exit` (93) / `sys_exit_group` (94) (`src/syscall/proc.rs`):

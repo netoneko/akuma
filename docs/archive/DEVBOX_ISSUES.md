@@ -348,7 +348,14 @@ message.
 
 ## Issue 4: `/proc/cores` is unreadable — `read_at` never forwards it to `read_file`
 
-**Status: OPEN.** Found 2026-08-10 while boot-verifying the multikernel removal
+**Status: FIXED 2026-08-20.** The one-line whitelist addition below was made
+(`src/vfs/proc.rs`), with a boot-suite regression that drives `openat` + `read`
+rather than `read_file` — testing the renderer directly is what let this hide.
+`read_file` recognizes exactly `boxes`, `cores`, `net/tcp`, `net/udp` and
+`sysvipc/msg`, and `read_at`'s list now covers all five, so the audit the
+"Next step" section below asks for is done for the current set.
+
+**Status (original): OPEN.** Found 2026-08-10 while boot-verifying the multikernel removal
 (docs/archive/TRIM_FAT_MULTIKERNEL.md) against an isolated devbox-smoltcp copy.
 Pre-existing — confirmed via `git show HEAD:src/vfs/proc.rs` that the bug
 predates this session's changes; not a regression from the removal.
@@ -1019,7 +1026,18 @@ clean has verified nothing about it.
 
 ## Issue 13: `pwritev2` (nr 287) unimplemented — high-frequency `[ENOSYS]` console spam under build load
 
-**Status: OPEN.** Found 2026-08-15 during the mapped-page premature-free
+**Status: FIXED 2026-08-20.** All four of `preadv`/`pwritev` (69/70) and
+`preadv2`/`pwritev2` (286/287) now dispatch to one entry point,
+`fs::sys_pvec2`. **All four were needed, not just 287**: musl only issues the
+`2` variants when `flags` is nonzero, rewriting a flagless call to
+`p{read,write}v`, or to plain `{read,write}v` at offset -1 — so implementing
+only 286/287 would have left the common path still hitting the catch-all. Rules
+as sketched below: offset -1 delegates to `readv`/`writev`, a real offset walks
+the iovecs advancing by what was actually transferred, nonzero `RWF_*` →
+`EOPNOTSUPP`. `pos_h` is ignored, which is what Linux effectively does on a
+64-bit kernel. Boot-suite regression `test_pvec2`.
+
+**Status (original): OPEN.** Found 2026-08-15 during the mapped-page premature-free
 verification runs (`MAPPED_PAGE_PREMATURE_FREE_FIX.md`). Not investigated
 beyond decoding the syscall — adding here so it doesn't get lost.
 
@@ -1113,10 +1131,52 @@ construction; `spawn_resolves_a_shebang_script` (boot suite,
 
 ## Issue 15: privilege-dropping entrypoints re-exec forever — no per-process credentials
 
-**Status: OPEN.** The blocker between "`box run redis:alpine` with
-`--entrypoint`" and "`box run redis:alpine`".
+**Status: still OPEN — but the script quoted below is not the one shipping
+today, and it was not what `box run redis:alpine` actually hung on.**
 
-### Symptom
+### Correction, 2026-08-20 (redis 8.10.0, `redis:alpine`)
+
+Re-measured against the live image. `box run -d redis-alpine` parks with three
+processes, and none of them is in a re-exec loop:
+
+```
+  107 {busybox} redis-server              <- the entrypoint shell
+  112 /bin/setpriv -d
+  113 {busybox} grep -q Capability bounding set:.*\bsetuid\b
+```
+
+The 8.x entrypoint gates the privilege drop on a *capability probe that runs
+first*, which the version quoted below did not have:
+
+```sh
+has_cap() { /bin/setpriv -d | grep -q 'Capability bounding set:.*\b'"$1"'\b'; }
+if [ "$IS_REDIS_SERVER" ] && [ -z "$SKIP_DROP_PRIVS" ] && [ "$(id -u)" = '0' ] \
+   && has_cap setuid && has_cap setgid; then
+```
+
+`setpriv -d` never returns. `/proc/112/syscalls` shows nothing but `nr=167`
+(`prctl`) returning `0`, ~0.37 us apart, indefinitely — reproduced in isolation
+with `box run --entrypoint /bin/setpriv redis-alpine -d`, so redis is not
+involved. Cause: `PR_CAPBSET_READ` answered `1` for every capability number and
+`/proc/sys/kernel/cap_last_cap` does not exist, so util-linux's `cap_last_cap()`
+probe concluded `CAP_LAST_CAP` was `INT_MAX` and `setpriv --dump` walked ~2.1
+billion indices per capability set — ~13 minutes each, which presents as a hang.
+**Fixed 2026-08-20** (`sys_prctl` bounds both `PR_CAPBSET_READ` and
+`PR_CAP_AMBIENT`'s `IS_SET` at `CAP_LAST_CAP` = 40; regression
+`test_prctl_capbset_is_bounded`).
+
+So there were two blockers stacked, and the outer one wore the inner one's
+costume. The credential wall below is real and is what remains: past the probe,
+the script `exec`s `setpriv --reuid redis`, `id -u` still answers 0, and it
+re-execs forever. **The end-to-end "redis runs under its own entrypoint" claim
+has not been re-measured since the prctl fix** — that needs a VM booted on a
+kernel carrying it.
+
+Note also that 8.x offers `SKIP_DROP_PRIVS=1` as a supported escape hatch, which
+`box run` cannot currently use: it has no `-e` flag, and the SPAWN abi has no env
+field at all.
+
+### Symptom (as filed, against an older `redis:alpine` entrypoint)
 
 `box run --rm -d redis:alpine redis-server --port 4444` starts, prints
 `Started PID 8`, and then nothing happens at all: no listener, no log output,
@@ -1269,7 +1329,13 @@ sweep 0.5–30 s, plus a mid-stream-gap variant):
 
 ## Issue 18: `box pull` fails at the first blob fetch — `config fetch failed: IoError`
 
-**Status: OPEN, found 2026-08-19.** Blocks `docs/runbooks/run-redis.md` §3 (the
+**Status: does not reproduce as of 2026-08-20.** `box pull alpine:latest` and
+`box pull redis:alpine` both complete on a `devbox-smoltcp` VM running a kernel
+built from the same day, config fetch included. Not root-caused — no fix was
+aimed at this, so it was presumably carried by the networking work landed
+between 08-19 and 08-20. Re-open with a fresh kernel id if it returns.
+
+**Status (original): OPEN, found 2026-08-19.** Blocks `docs/runbooks/run-redis.md` §3 (the
 "official image in a box" demo) on kernel `3f7a33de-release-smp-shared`; the
 runbook's own verification was 2026-08-16, so this is a regression window of
 three days.
@@ -1392,8 +1458,18 @@ first place to look.
 
 ### Confirmed on the way past: `SO_KEEPALIVE` is a dead flag
 
-Checking the "we have no keepalive handling" theory turned up a real defect,
-independent of whether it is this bug's cause:
+**FIXED 2026-08-20** — `set_socket_keepalive` now calls smoltcp's
+`set_keep_alive` at `KEEPALIVE_IDLE_SECS` (7200 s, Linux's
+`tcp_keepalive_time`), arming a listener's whole pooled backlog so an accepted
+connection inherits the option. Regression `test_so_keepalive_arms_smoltcp`
+asserts against smoltcp's own `keep_alive()`, not the local flag — a test
+against the flag passes in the broken case, which is the same trap the original
+defect is. **The 300 s drop itself remains OPEN and unattributed**; the
+distinction in the paragraph below still holds, so do not read this as a fix
+for the issue's headline symptom. The three discriminating tests are still the
+next step.
+
+The original finding:
 
 ```rust
 // crates/akuma-net/src/socket.rs:447
@@ -1548,6 +1624,83 @@ transitions only. The safety argument (an equal TTBR0 is provably the same
 address space, because the live-TTBR0 free gate blocks L0 reuse) is written down
 at the skip site, but an adversarial in-VM test is the right way to pin it —
 and no such test exists for the *old* behavior either.
+
+## Issue 23: `sendfile(2)` is undispatched — nginx serves headers, then drops the connection
+
+**Status: OPEN, found 2026-08-20** running the official `nginx:alpine` image in
+a box while checking what `box run` does with real image entrypoints.
+
+The good news first: `box run -d nginx-alpine` **works**. `/docker-entrypoint.sh`
+runs, `exec "$@"` lands on `nginx -g daemon off;`, the master forks four workers,
+and requests get logged. It is the response body that never arrives.
+
+### Symptom
+
+```
+# wget -qO- http://127.0.0.1/
+wget: connection closed prematurely
+```
+
+while the access log records a perfectly happy request:
+
+```
+10.0.2.15 - - [20/Aug/2026:19:07:08 +0000] "GET / HTTP/1.1" 200 0 "-" "Wget" "-"
+                                                              ^ 200, zero bytes
+```
+
+and the error log says exactly what happened:
+
+```
+[alert] 81#15: *1 sendfile() failed (38: Function not implemented) while sending
+        response to client, request: "GET / HTTP/1.1"
+```
+
+### Cause
+
+`sendfile` (aarch64 nr 71) has no constant and no dispatcher arm — the whole
+family is absent, so it falls to the `-ENOSYS` catch-all. nginx's stock config
+has `sendfile on;`, so every static file gets its headers written and then the
+connection dropped.
+
+Note this is the *same syscall number* the Issue 13 re-test sweep saw
+(`nr=71` x6 during a kernel build) and dismissed as background noise.
+
+### Confirmed by A/B
+
+One nginx, one file, one request, two server blocks differing only in the
+directive:
+
+| | result |
+|---|---|
+| `sendfile on;` (port 8080) | `wget: connection closed prematurely` |
+| `sendfile off;` (port 8081) | `<!DOCTYPE html>` — serves fine |
+
+A `location / { return 200 "..."; }` inline body also serves fine, so the
+request path, the overlay root and the worker are all healthy.
+
+### Next step, if picked up
+
+A read/write loop between the two fds is enough — there is no zero-copy path to
+preserve here. Linux's contract worth matching: the input fd must be seekable
+(a regular file), the output fd may be a socket, `offset` non-NULL means read
+from there and write the new position back *without* moving the input fd's file
+position, and a short write is reported rather than retried. Per repo
+convention the syscall change needs a boot-suite self-test in
+`src/process_tests.rs`.
+
+### Two smaller things found in the same session
+
+- **`recvmsg() returned invalid ancillary data level 0 or type 0`**, logged by
+  every nginx worker at startup. nginx's master<->worker channel passes fds over
+  a socketpair with `SCM_RIGHTS`; Akuma produces no cmsg. nginx logs it as
+  `[alert]` and carries on, so this is noise rather than breakage — but it means
+  channel fd-passing does not work, and something that *depends* on it would
+  fail silently.
+- **`box run -d` leaks a zombie per container, and `box close` does not kill the
+  container's primary process.** After `box close`, the entrypoint pid survives
+  as `State: Z` with `PPid: 0`: `box run -d`'s parent has exited and nothing
+  reparents orphans to init to reap them. No CPU is burned, but `ps` accumulates
+  corpses, which compounds Issue 21's thread/process confusion.
 
 ## Background
 

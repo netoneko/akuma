@@ -127,6 +127,23 @@ fixed-size handshake read, not a conformant SEQPACKET implementation.
   `socket_timeout_option_roundtrip` in the boot suite. The lesson generalises:
   **a silently-accepted option is indistinguishable from a working one unless
   `getsockopt` can read it back**, so anything added here should be readable.
+- **`SO_KEEPALIVE` (9)** arms smoltcp's keep-alive timer via `set_keep_alive`
+  at `socket::KEEPALIVE_IDLE_SECS` (7200 s, Linux's `tcp_keepalive_time`).
+  smoltcp has one interval rather than Linux's time/intvl/probes triple, so
+  that is also the repeat period. A listener's whole pooled backlog is armed,
+  so an accepted connection inherits the option instead of losing it.
+
+  Until 2026-08-20 this was the exact failure mode the `SO_RCVTIMEO` note warns
+  about, one layer deeper: `set_socket_keepalive` wrote a `KernelSocket`
+  field that **nothing in the crate ever read**, and smoltcp's `set_keep_alive`
+  was never called from anywhere — so `setsockopt` reported success and Akuma
+  emitted no keepalive probe, ever
+  ([`../../../archive/DEVBOX_ISSUES.md`](../../../archive/DEVBOX_ISSUES.md)
+  Issue 19). What this buys is Akuma *noticing* a peer that vanished without a
+  FIN; it does not stop Akuma from tearing down a connection itself, so it is
+  not a fix for that issue's 300 s `rc=255`. Regression
+  `test_so_keepalive_arms_smoltcp` asserts against smoltcp's own `keep_alive()`
+  rather than the local flag — a test against the flag passes in the broken case.
 - `connect`: a real in-progress non-blocking connect surfaces
   `EINPROGRESS`, not folded into the generic `neg_errno(e)` path — this is
   the one connect-specific error code callers should expect to see and
