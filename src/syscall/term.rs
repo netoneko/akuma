@@ -14,6 +14,12 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const FIONREAD: u32 = 0x541B;
     const FIOCLEX: u32 = 0x5451;
     const FIONCLEX: u32 = 0x5450;
+    // SIGIO-on-data-ready for a fd. Akuma delivers no such signal, but accepting
+    // it as a no-op is enough for callers that only treat *failure* as fatal —
+    // e.g. nginx's ngx_spawn_process bails out (never calls fork()) if this
+    // ioctl on the master/worker channel socketpair fails, even though nothing
+    // else in its worker lifecycle depends on the SIGIO actually arriving.
+    const FIOASYNC: u32 = 0x5452;
     // TUN/TAP: _IOW('T', 202, int) — rump's Linux virtif uses this to bind the tap.
     #[cfg(feature = "rump")]
     const TUNSETIFF: u32 = 0x4004_54ca;
@@ -79,6 +85,9 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         }
         FIONCLEX => {
             proc.clear_cloexec(fd);
+            return 0;
+        }
+        FIOASYNC => {
             return 0;
         }
         TIOCSWINSZ => {

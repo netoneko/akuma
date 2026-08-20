@@ -874,10 +874,29 @@ pub fn socket_listen(idx: usize, backlog: usize) -> Result<(), i32> {
         let port = table[idx].as_ref().unwrap().bind_port.ok_or(libc_errno::EINVAL)?;
         
         if let Some(sock) = table[idx].take() {
-            if let SocketType::Stream(h) = sock.inner {
-                smoltcp_net::socket_close(h);
+            match sock.inner {
+                SocketType::Stream(h) => smoltcp_net::socket_close(h),
+                // A second `listen()` on an already-listening socket must not
+                // orphan the first call's backlog: `listen()` is idempotent on
+                // real Linux (it can only adjust the backlog of a live queue),
+                // but this used to unconditionally replace the table entry
+                // with a freshly allocated `Listener`, leaking the previous
+                // `handles` — still bound and `Listen`-ing on the same port
+                // inside smoltcp's `SocketSet`, just no longer referenced by
+                // anything that calls `accept()`. A SYN smoltcp matched to one
+                // of those orphaned handles went Established and then sat
+                // invisible forever: nginx's real `ngx_open_listening_sockets`
+                // calls `listen()` twice on the master's listening fd, and
+                // every connection had ~50% odds of landing on the orphaned
+                // set — see `NGINX_MISSING_SYSCALLS.md` Issue D.
+                SocketType::Listener { handles, .. } => {
+                    for h in handles {
+                        smoltcp_net::socket_close(h);
+                    }
+                }
+                _ => {}
             }
-            
+
             KernelSocket::new_listener(port, backlog).map_or(Err(libc_errno::ENOMEM), |new_sock| {
                 table[idx] = Some(new_sock);
                 Ok(())

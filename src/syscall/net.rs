@@ -1205,12 +1205,16 @@ pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
             }
             socket::SocketType::Listener { handles, .. } => {
                 // Report readable when any backlog handle has an established connection
-                handles.iter().any(|&h| {
+                let states: alloc::vec::Vec<_> = handles.iter().map(|&h| {
                     akuma_net::smoltcp_net::with_network(|net| {
                         net.sockets.get::<smoltcp::socket::tcp::Socket>(h).state()
-                            == smoltcp::socket::tcp::State::Established
-                    }).unwrap_or(false)
-                })
+                    })
+                }).collect();
+                if crate::config::SYSCALL_DEBUG_EPOLL_EDGE {
+                    crate::tprint!(160, "[epoll-listener] idx={} handles={} states={:?}\n",
+                        idx, handles.len(), states);
+                }
+                states.contains(&Some(smoltcp::socket::tcp::State::Established))
             }
             _ => false,
         }

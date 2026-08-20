@@ -2336,6 +2336,12 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const F_SETLKW: u32 = 7;
     const F_GETLK: u32 = 5;
     const F_DUPFD_CLOEXEC: u32 = 1030;
+    // SIGIO owner for a fd — paired with ioctl(FIOASYNC) (src/syscall/term.rs).
+    // No-op like the advisory locks below: Akuma delivers no SIGIO, but nginx's
+    // ngx_spawn_process treats a failing F_SETOWN as fatal before it ever calls
+    // fork(), so accepting it is what lets the worker process actually spawn.
+    const F_SETOWN: u32 = 8;
+    const F_GETOWN: u32 = 9;
     const FD_CLOEXEC: u64 = 1;
     const O_NONBLOCK: u64 = 0x800;
 
@@ -2390,6 +2396,7 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
         }
         // Advisory locks: no-op (we have no file locking state)
         F_GETLK | F_SETLK | F_SETLKW => 0,
+        F_SETOWN | F_GETOWN => 0,
         _ => {
             crate::safe_print!(192, "[fcntl] UNSUPPORTED: pid={} fd={} cmd={} arg={:#x}\n",
                 proc.pid, fd, cmd, arg);

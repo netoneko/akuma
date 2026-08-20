@@ -507,7 +507,8 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                     }
                     ready |= EPOLLHUP;
                 } else {
-                    if requested & EPOLLIN != 0 && super::net::socket_can_recv_tcp(idx) {
+                    let can_recv = super::net::socket_can_recv_tcp(idx);
+                    if requested & EPOLLIN != 0 && can_recv {
                         ready |= EPOLLIN;
                     }
                     if requested & EPOLLOUT != 0 && super::net::socket_can_send_tcp(idx) {
@@ -515,6 +516,10 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                     }
                     if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) {
                         ready |= EPOLLRDHUP;
+                    }
+                    if crate::config::SYSCALL_DEBUG_EPOLL_EDGE {
+                        crate::tprint!(96, "[epoll-tcp] fd={} idx={} req=0x{:x} can_recv={} ready=0x{:x}\n",
+                            fd_num, idx, requested, can_recv, ready);
                     }
                 }
             }
@@ -762,6 +767,27 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
                 Some(info) => info,
                 None => continue, // FD removed from epoll interest during loop
             };
+
+            // Real Linux implicitly drops a fd from every epoll instance's interest
+            // list the instant the fd is close()'d (ep_free/eventpoll_release_file
+            // walk back-references from the file to its epitems). Akuma's close()
+            // does not do the equivalent, so a fd closed after being added here can
+            // leave a stale interest-list entry behind. Left unchecked,
+            // epoll_check_fd_readiness's "no fd entry" fallback synthesizes
+            // EPOLLHUP|EPOLLERR for it — a real event delivered to userspace for a
+            // fd the caller already closed, which real Linux can never produce.
+            // nginx hit exactly this (creates+registers+closes a socketpair in one
+            // breath): its crash-recovery path ORs EPOLLIN|EPOLLOUT into revents on
+            // HUP/ERR to force both handlers to run, and dereferenced a connection
+            // object it had already torn down along with the fd. Prune instead.
+            if akuma_exec::process::current_process_shared().is_none_or(|p| p.get_fd(fd).is_none()) {
+                crate::irq::with_irqs_disabled(|| {
+                    if let Some(inst) = EPOLL_TABLE.lock().get_mut(&epoll_id) {
+                        inst.interest_list.remove(&fd);
+                    }
+                });
+                continue;
+            }
 
             let is_et = raw_events & EPOLLET != 0;
             let requested = raw_events & EPOLL_EVENT_MASK;
