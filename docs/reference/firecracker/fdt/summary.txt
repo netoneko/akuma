@@ -1,0 +1,133 @@
+# Firecracker aarch64 FDT sweep
+# host:        Linux 6.17.0-1019-aws aarch64
+# firecracker: Firecracker v1.16.1
+# guest ram:   1024 MiB
+# generated:   2026-08-21T11:10:37Z
+
+=== vcpu_count=1 ===
+  9:	cpus {
+  49:	memory@ram {
+  54:	chosen {
+  61:	intc {
+  80:	timer {
+  94:	psci {
+  106:	uart@40002000 {
+  114:	virtio_mmio@40003000 {
+  122:	virtio_mmio@40004000 {
+  130:	virtio_mmio@40005000 {
+  --- reg / interrupts under those nodes ---
+  	memory@ram {
+      		reg = <0x00 0x80200000 0x00 0x3fe00000>;
+  	intc {
+      		reg = <0x00 0x3fff0000 0x00 0x10000 0x00 0x3ffd0000 0x00 0x20000>;
+      		interrupts = <0x01 0x09 0x04>;
+  	uart@40002000 {
+      		reg = <0x00 0x40002000 0x00 0x1000>;
+      		interrupts = <0x00 0x03 0x01>;
+  	virtio_mmio@40003000 {
+      		reg = <0x00 0x40003000 0x00 0x1000>;
+      		interrupts = <0x00 0x00 0x01>;
+  	virtio_mmio@40004000 {
+      		reg = <0x00 0x40004000 0x00 0x1000>;
+      		interrupts = <0x00 0x01 0x01>;
+  	virtio_mmio@40005000 {
+      		reg = <0x00 0x40005000 0x00 0x1000>;
+      		interrupts = <0x00 0x02 0x01>;
+
+=== vcpu_count=2 ===
+  9:	cpus {
+  74:	memory@ram {
+  79:	chosen {
+  86:	intc {
+  105:	timer {
+  119:	psci {
+  131:	uart@40002000 {
+  139:	virtio_mmio@40003000 {
+  147:	virtio_mmio@40004000 {
+  155:	virtio_mmio@40005000 {
+  --- reg / interrupts under those nodes ---
+  	memory@ram {
+      		reg = <0x00 0x80200000 0x00 0x3fe00000>;
+  	intc {
+      		reg = <0x00 0x3fff0000 0x00 0x10000 0x00 0x3ffb0000 0x00 0x40000>;
+      		interrupts = <0x01 0x09 0x04>;
+  	uart@40002000 {
+      		reg = <0x00 0x40002000 0x00 0x1000>;
+      		interrupts = <0x00 0x03 0x01>;
+  	virtio_mmio@40003000 {
+      		reg = <0x00 0x40003000 0x00 0x1000>;
+      		interrupts = <0x00 0x00 0x01>;
+  	virtio_mmio@40004000 {
+      		reg = <0x00 0x40004000 0x00 0x1000>;
+      		interrupts = <0x00 0x01 0x01>;
+  	virtio_mmio@40005000 {
+      		reg = <0x00 0x40005000 0x00 0x1000>;
+      		interrupts = <0x00 0x02 0x01>;
+
+=== vcpu_count=4 ===
+  9:	cpus {
+  124:	memory@ram {
+  129:	chosen {
+  136:	intc {
+  155:	timer {
+  169:	psci {
+  181:	uart@40002000 {
+  189:	virtio_mmio@40003000 {
+  197:	virtio_mmio@40004000 {
+  205:	virtio_mmio@40005000 {
+  --- reg / interrupts under those nodes ---
+  	memory@ram {
+      		reg = <0x00 0x80200000 0x00 0x3fe00000>;
+  	intc {
+      		reg = <0x00 0x3fff0000 0x00 0x10000 0x00 0x3ff70000 0x00 0x80000>;
+      		interrupts = <0x01 0x09 0x04>;
+  	uart@40002000 {
+      		reg = <0x00 0x40002000 0x00 0x1000>;
+      		interrupts = <0x00 0x03 0x01>;
+  	virtio_mmio@40003000 {
+      		reg = <0x00 0x40003000 0x00 0x1000>;
+      		interrupts = <0x00 0x00 0x01>;
+  	virtio_mmio@40004000 {
+      		reg = <0x00 0x40004000 0x00 0x1000>;
+      		interrupts = <0x00 0x01 0x01>;
+  	virtio_mmio@40005000 {
+      		reg = <0x00 0x40005000 0x00 0x1000>;
+      		interrupts = <0x00 0x02 0x01>;
+
+=== vcpu_count=8 ===
+  9:	cpus {
+  224:	memory@ram {
+  229:	chosen {
+  236:	intc {
+  255:	timer {
+  269:	psci {
+  281:	uart@40002000 {
+  289:	virtio_mmio@40003000 {
+  297:	virtio_mmio@40004000 {
+  305:	virtio_mmio@40005000 {
+  --- reg / interrupts under those nodes ---
+  	memory@ram {
+      		reg = <0x00 0x80200000 0x00 0x3fe00000>;
+  	intc {
+      		reg = <0x00 0x3fff0000 0x00 0x10000 0x00 0x3fef0000 0x00 0x100000>;
+      		interrupts = <0x01 0x09 0x04>;
+  	uart@40002000 {
+      		reg = <0x00 0x40002000 0x00 0x1000>;
+      		interrupts = <0x00 0x03 0x01>;
+  	virtio_mmio@40003000 {
+      		reg = <0x00 0x40003000 0x00 0x1000>;
+      		interrupts = <0x00 0x00 0x01>;
+  	virtio_mmio@40004000 {
+      		reg = <0x00 0x40004000 0x00 0x1000>;
+      		interrupts = <0x00 0x01 0x01>;
+  	virtio_mmio@40005000 {
+      		reg = <0x00 0x40005000 0x00 0x1000>;
+      		interrupts = <0x00 0x02 0x01>;
+
+# Expected, from Firecracker v1.16.1 src/vmm/src/arch/aarch64:
+#   GICD          0x3fff0000                       size 0x10000
+#   GICR base     0x3fff0000 - n * 0x20000         size n * 0x20000
+#   PL011         0x40002000
+#   virtio-mmio   0x40003000 + k * 0x1000, INTID from SPI 32
+#   DRAM          0x80000000
+#   FDT           (0x80000000 + ram_size) - 0x200000

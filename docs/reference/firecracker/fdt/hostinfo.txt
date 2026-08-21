@@ -1,0 +1,39 @@
+=== akuma firecracker host ===
+date:            2026-08-21T11:05:11Z
+instance-type:   m6g.metal
+kernel:          Linux 6.17.0-1019-aws aarch64
+nproc:           64
+MIDR_EL1:        0x00000000413fd0c1
+cpu implementer: 0x41
+cpu part:        0xd0c
+features:        fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp
+
+--- /dev/kvm ---
+crw-rw---- 1 root kvm 10, 232 Aug 21 11:04 /dev/kvm
+
+--- exception level (the line that matters) ---
+[    0.027439] CPU: All CPU(s) started at EL2
+
+--- kvm dmesg ---
+[    0.148065] kvm [1]: nv: 567 coarse grained trap handlers
+[    0.148161] kvm [1]: IPA Size Limit: 48 bits
+[    0.148182] kvm [1]: GICv3: no GICV resource entry
+[    0.148185] kvm [1]: disabling GICv2 emulation
+[    0.148209] kvm [1]: GIC system register CPU interface enabled
+[    0.148217] kvm [1]: vgic interrupt IRQ9
+[    0.148252] kvm [1]: VHE mode initialized successfully
+
+--- kvm modules ---
+kvm is built in, not a module
+
+--- firecracker ---
+Firecracker v1.16.1
+
+2026-08-21T11:05:12.375835982 [anonymous-instance:main] Firecracker exiting successfully. exit_code=0
+
+--- alpine guest ---
+version:   3.24.1 (v3.24)
+kernel:    6.18.44-0-virt
+kernel img: 36175872 bytes
+initramfs:  10830248 bytes
+rootfs:     /opt/akuma/guest/alpine-rootfs.ext4 (1024 MiB ext4)

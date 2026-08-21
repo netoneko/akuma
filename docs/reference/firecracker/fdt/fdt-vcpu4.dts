@@ -1,0 +1,224 @@
+/dts-v1/;
+
+/ {
+	compatible = "linux,dummy-virt";
+	#address-cells = <0x02>;
+	#size-cells = <0x02>;
+	interrupt-parent = <0x01>;
+
+	cpus {
+		#address-cells = <0x02>;
+		#size-cells = <0x00>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,arm-v8";
+			enable-method = "psci";
+			reg = <0x00 0x00>;
+			d-cache-size = <0x10000>;
+			d-cache-line-size = <0x40>;
+			d-cache-sets = <0x100>;
+			i-cache-size = <0x10000>;
+			i-cache-line-size = <0x40>;
+			i-cache-sets = <0x100>;
+			next-level-cache = <0xfa0>;
+
+			l2-0-cache {
+				phandle = <0xfa0>;
+				compatible = "cache";
+				cache-level = <0x02>;
+				cache-size = <0x100000>;
+				cache-line-size = <0x40>;
+				cache-sets = <0x800>;
+				cache-unified;
+				next-level-cache = <0xf9c>;
+			};
+
+			l3-0-cache {
+				phandle = <0xf9c>;
+				compatible = "cache";
+				cache-level = <0x03>;
+				cache-size = <0x2000000>;
+				cache-line-size = <0x40>;
+				cache-sets = <0x8000>;
+				cache-unified;
+			};
+		};
+
+		cpu@1 {
+			device_type = "cpu";
+			compatible = "arm,arm-v8";
+			enable-method = "psci";
+			reg = <0x00 0x01>;
+			d-cache-size = <0x10000>;
+			d-cache-line-size = <0x40>;
+			d-cache-sets = <0x100>;
+			i-cache-size = <0x10000>;
+			i-cache-line-size = <0x40>;
+			i-cache-sets = <0x100>;
+			next-level-cache = <0xf9f>;
+
+			l2-1-cache {
+				phandle = <0xf9f>;
+				compatible = "cache";
+				cache-level = <0x02>;
+				cache-size = <0x100000>;
+				cache-line-size = <0x40>;
+				cache-sets = <0x800>;
+				cache-unified;
+				next-level-cache = <0xf9c>;
+			};
+		};
+
+		cpu@2 {
+			device_type = "cpu";
+			compatible = "arm,arm-v8";
+			enable-method = "psci";
+			reg = <0x00 0x02>;
+			d-cache-size = <0x10000>;
+			d-cache-line-size = <0x40>;
+			d-cache-sets = <0x100>;
+			i-cache-size = <0x10000>;
+			i-cache-line-size = <0x40>;
+			i-cache-sets = <0x100>;
+			next-level-cache = <0xf9e>;
+
+			l2-2-cache {
+				phandle = <0xf9e>;
+				compatible = "cache";
+				cache-level = <0x02>;
+				cache-size = <0x100000>;
+				cache-line-size = <0x40>;
+				cache-sets = <0x800>;
+				cache-unified;
+				next-level-cache = <0xf9c>;
+			};
+		};
+
+		cpu@3 {
+			device_type = "cpu";
+			compatible = "arm,arm-v8";
+			enable-method = "psci";
+			reg = <0x00 0x03>;
+			d-cache-size = <0x10000>;
+			d-cache-line-size = <0x40>;
+			d-cache-sets = <0x100>;
+			i-cache-size = <0x10000>;
+			i-cache-line-size = <0x40>;
+			i-cache-sets = <0x100>;
+			next-level-cache = <0xf9d>;
+
+			l2-3-cache {
+				phandle = <0xf9d>;
+				compatible = "cache";
+				cache-level = <0x02>;
+				cache-size = <0x100000>;
+				cache-line-size = <0x40>;
+				cache-sets = <0x800>;
+				cache-unified;
+				next-level-cache = <0xf9c>;
+			};
+		};
+	};
+
+	memory@ram {
+		device_type = "memory";
+		reg = <0x00 0x80200000 0x00 0x3fe00000>;
+	};
+
+	chosen {
+		bootargs = "console=ttyS0 reboot=t panic=1 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/akuma-fdtdump pci=off root=/dev/vda rw earlycon=uart,mmio,0x40002000";
+		linux,initrd-start = <0x00 0xbf3ab000>;
+		linux,initrd-end = <0x00 0xbfdff1a8>;
+		linux,pci-probe-only = <0x01>;
+	};
+
+	intc {
+		compatible = "arm,gic-v3";
+		interrupt-controller;
+		#interrupt-cells = <0x03>;
+		reg = <0x00 0x3fff0000 0x00 0x10000 0x00 0x3ff70000 0x00 0x80000>;
+		phandle = <0x01>;
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
+		interrupts = <0x01 0x09 0x04>;
+
+		msic {
+			compatible = "arm,gic-v3-its";
+			msi-controller;
+			phandle = <0x03>;
+			reg = <0x00 0x3ff50000 0x00 0x20000>;
+		};
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		always-on;
+		interrupts = <0x01 0x0d 0x04 0x01 0x0e 0x04 0x01 0x0b 0x04 0x01 0x0a 0x04>;
+	};
+
+	apb-pclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <0x16e3600>;
+		clock-output-names = "clk24mhz";
+		phandle = <0x02>;
+	};
+
+	psci {
+		compatible = "arm,psci-0.2";
+		method = "hvc";
+	};
+
+	rtc@40001000 {
+		compatible = "arm,pl031\0arm,primecell";
+		reg = <0x00 0x40001000 0x00 0x1000>;
+		clocks = <0x02>;
+		clock-names = "apb_pclk";
+	};
+
+	uart@40002000 {
+		compatible = "ns16550a";
+		reg = <0x00 0x40002000 0x00 0x1000>;
+		clocks = <0x02>;
+		clock-names = "apb_pclk";
+		interrupts = <0x00 0x03 0x01>;
+	};
+
+	virtio_mmio@40003000 {
+		dma-coherent;
+		compatible = "virtio,mmio";
+		reg = <0x00 0x40003000 0x00 0x1000>;
+		interrupts = <0x00 0x00 0x01>;
+		interrupt-parent = <0x01>;
+	};
+
+	virtio_mmio@40004000 {
+		dma-coherent;
+		compatible = "virtio,mmio";
+		reg = <0x00 0x40004000 0x00 0x1000>;
+		interrupts = <0x00 0x01 0x01>;
+		interrupt-parent = <0x01>;
+	};
+
+	virtio_mmio@40005000 {
+		dma-coherent;
+		compatible = "virtio,mmio";
+		reg = <0x00 0x40005000 0x00 0x1000>;
+		interrupts = <0x00 0x02 0x01>;
+		interrupt-parent = <0x01>;
+	};
+
+	vmgenid {
+		compatible = "microsoft,vmgenid";
+		reg = <0x00 0x801ffff0 0x00 0x10>;
+		interrupts = <0x00 0x05 0x01>;
+	};
+
+	ptp@2149572608 {
+		compatible = "amazon,vmclock";
+		reg = <0x00 0x801fe000 0x00 0x1000>;
+		interrupts = <0x00 0x06 0x01>;
+	};
+};

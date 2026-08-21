@@ -1,9 +1,23 @@
 # Firecracker aarch64 guest physical memory map
 
-**Stability: B** — verify behaviour. Read from Firecracker **v1.16.1**
+**Stability: A** — measured. Read from Firecracker **v1.16.1**
 (`src/vmm/src/arch/aarch64/layout.rs`, `gic/gicv3/mod.rs`, `arch/aarch64/mod.rs`,
-`device_manager/mmio.rs`) and confirmed identical on `main` on 2026-08-21.
-Empirically confirmed for RAM base, kernel load address and FDT placement (§3).
+`device_manager/mmio.rs`), confirmed identical on `main` on 2026-08-21, and then
+**confirmed against the FDT Firecracker actually emits** — at 1, 2, 4 and 8 vCPUs
+on an `m6g.metal` host. The blobs and a per-value comparison are in
+`fdt/`; the procedure is `docs/runbooks/dump-firecracker-fdt.md`.
+
+Confirmed by measurement: the GICD base and its 64 KiB span, the GICR base moving
+`-0x20000` per vCPU, the PL011 at `0x40002000`, virtio-mmio at `0x40003000+`
+stride `0x1000` with INTIDs from SPI 32, DRAM at `0x80000000`, and the kernel load
+address and FDT placement (§3).
+
+**One correction the source reading did not give.** The FDT `memory` node starts
+at **`0x80200000`, not `0x80000000`**: Firecracker reserves the first 2 MiB of
+DRAM (`SYSTEM_MEM_SIZE`) and the node describes only what follows, so with
+1024 MiB configured it reads `<0x0 0x80200000 0x0 0x3fe00000>` — 1022 MiB. The
+map below is right about where DRAM begins; anything reading the `memory` node,
+`detect_memory()` included, sees `0x80200000`.
 
 These constants have moved between Firecracker releases. **Re-read them if the
 pinned version changes.**

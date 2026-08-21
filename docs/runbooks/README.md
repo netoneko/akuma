@@ -64,3 +64,4 @@ Start from the symptom or task on the left.
    it worked.
 5. Add a row to the triage matrix above.
 | Akuma on Firecracker / `/dev/kvm` on a Mac / microVM boot | [run-on-firecracker.md](run-on-firecracker.md) |
+| The device tree a Firecracker microVM actually gets / GIC and virtio addresses per vCPU count | [dump-firecracker-fdt.md](dump-firecracker-fdt.md) |

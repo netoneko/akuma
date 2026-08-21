@@ -1,0 +1,4 @@
+# The context is a purpose-built staging directory, so the only thing worth
+# excluding is the Dockerfile the script copies in beside it.
+Dockerfile
+.dockerignore

@@ -1,0 +1,72 @@
+===AKUMA-INFO-BEGIN
+--- /proc/interrupts ---
+           CPU0       
+ 11:        498    GICv3  27 Level     arch_timer
+ 13:        196    GICv3  35 Edge      ttyS0
+ 14:          0    GICv3  37 Edge      vmgenid
+ 15:         58    GICv3  32 Edge      virtio0
+ 16:          0    GICv3  33 Edge      virtio1
+ 17:          2    GICv3  34 Edge      virtio2
+IPI0:         0       Rescheduling interrupts
+IPI1:         0       Function call interrupts
+IPI2:         0       CPU stop interrupts
+IPI3:         0       CPU stop NMIs
+IPI4:         0       Timer broadcast interrupts
+IPI5:         0       IRQ work interrupts
+IPI6:         0       CPU backtrace interrupts
+IPI7:         0       KGDB roundup interrupts
+Err:          0
+--- /proc/iomem ---
+3ffd0000-3ffeffff : GICR
+3fff0000-3fffffff : GICD
+40001000-40001fff : rtc@40001000
+  40001000-40001fff : rtc-pl031
+40002000-40002fff : serial
+40003000-40003fff : 40003000.virtio_mmio virtio_mmio@40003000
+40004000-40004fff : 40004000.virtio_mmio virtio_mmio@40004000
+40005000-40005fff : 40005000.virtio_mmio virtio_mmio@40005000
+801ffff0-801fffff : 801ffff0.vmgenid vmgenid
+80200000-bfffffff : System RAM
+  80200000-8176ffff : Kernel code
+  81770000-8196ffff : reserved
+  81970000-8247ffff : Kernel data
+  bde80000-beffffff : reserved
+  bf028000-bf073fff : reserved
+  bf074000-bf174fff : reserved
+  bf175000-bf196fff : reserved
+  bf199000-bf3aafff : reserved
+  bf3ab000-bfe00fff : reserved
+  bfe01000-bfe01fff : reserved
+  bfe02000-bfe04fff : reserved
+  bfe05000-bfffffff : reserved
+--- /proc/cmdline ---
+console=ttyS0 reboot=t panic=1 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/akuma-fdtdump pci=off root=/dev/vda rw earlycon=uart,mmio,0x40002000
+--- /proc/cpuinfo ---
+processor	: 0
+BogoMIPS	: 243.75
+Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp
+CPU implementer	: 0x41
+CPU architecture: 8
+CPU variant	: 0x3
+CPU part	: 0xd0c
+CPU revision	: 1
+
+--- /sys/firmware/devicetree/base (node list) ---
+/sys/firmware/devicetree/base
+/sys/firmware/devicetree/base/apb-pclk
+/sys/firmware/devicetree/base/chosen
+/sys/firmware/devicetree/base/cpus
+/sys/firmware/devicetree/base/cpus/cpu@0
+/sys/firmware/devicetree/base/intc
+/sys/firmware/devicetree/base/intc/msic
+/sys/firmware/devicetree/base/memory@ram
+/sys/firmware/devicetree/base/psci
+/sys/firmware/devicetree/base/ptp@2149572608
+/sys/firmware/devicetree/base/rtc@40001000
+/sys/firmware/devicetree/base/timer
+/sys/firmware/devicetree/base/uart@40002000
+/sys/firmware/devicetree/base/virtio_mmio@40003000
+/sys/firmware/devicetree/base/virtio_mmio@40004000
+/sys/firmware/devicetree/base/virtio_mmio@40005000
+/sys/firmware/devicetree/base/vmgenid
+===AKUMA-INFO-END
