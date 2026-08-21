@@ -519,6 +519,17 @@ That structure is what made the Firecracker arm mostly a table of constants.
 
 ## 5. Open
 
+> **Both items in this section are now closed.** RX (§5.1) was root-caused to
+> Firecracker's 65562-byte posted-capacity gate and fixed
+> (`RX_BUFFER_LEN = 65568`), then **verified on 2026-08-21** on an AWS
+> `m6g.metal` host: DHCP completes, the guest takes `10.0.2.15/24`, and an
+> operator SSH session reaches `userspace/sshd`. The vCPU-dependent
+> redistributor (§5.2) is read from the FDT now, and 2 vCPUs boots and serves
+> SSH. See `docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md` §10. The evidence below
+> is kept verbatim as the record of how the RX failure presented.
+>
+> **What is still open is the vCPU sweep on Lima — see §5.3.**
+
 ### 5.1 Inbound (RX) never reaches the guest
 
 The single remaining blocker for SSH. Everything else on the path works: ext2
@@ -671,6 +682,54 @@ other half of the ~96% CPU observation. Not investigated.
   290 PASSED so most run, but some of those assertions pass vacuously.
 - **Building Akuma inside the Firecracker guest** — the self-host target. Blocked
   on §5.1 only for convenience (SSH); the disk and userspace already work.
+
+### 5.3 TODO: the vCPU sweep on Lima — 4, 6 and 10
+
+**Open, and deliberately Lima's job rather than metal's.** The FDT-derived device
+map means `vcpu_count` is no longer pinned at build time, so the counts above 2
+are now worth walking — and the one data point that exists is a failure:
+`fab3e50c` is committed as **`smp=4 breaks disk in lima`**, i.e. virtio-blk, not
+the GIC.
+
+To check, on Lima:
+
+```bash
+overlays/devbox-firecracker/run.sh --vcpus 4    # the known-bad one; reproduce first
+overlays/devbox-firecracker/run.sh --vcpus 6
+overlays/devbox-firecracker/run.sh --vcpus 10
+```
+
+Why these three, and why Lima:
+
+- **4** is the recorded failure. Reproducing it is the control for the other two —
+  a fix that is not tested against 4 has not been tested.
+- **6** crosses no documented threshold, which is the point: it distinguishes "any
+  `vcpu_count > 2` breaks" from "4 specifically breaks".
+- **10** exceeds the FDT sweep, which only measured 1/2/4/8
+  (`docs/reference/firecracker/fdt/`), so the redistributor base at 10 is
+  *predicted* (`0x3fff_0000 - 10 * 0x2_0000 = 0x3fec_0000`) rather than measured.
+  It also likely exceeds Lima's own vCPU allocation — `host-setup.sh` creates the
+  instance with `--cpus=4` — so **raise the Lima instance's CPU count first** or
+  the guest is oversubscribed and any timing result is meaningless.
+  `MAX_CORES` in `src/smp_shared.rs` is the other ceiling to check before blaming
+  the platform.
+
+What to read in the log, in order — anything past the first failure is not
+meaningful:
+
+| Line | Means |
+|---|---|
+| `[Platform] FDT device map: GICR=0x...` | the map came from the FDT. Check it equals `0x3fff_0000 - vcpus * 0x2_0000`; a `0x3ffd0000` at `vcpus > 1` means the parse fell back and the boot core is about to lose its tick |
+| `[SMP-shared] probed N core(s)` | the DTB's `cpu@0..n` were seen |
+| `[SMP-shared] ✓ N secondary core(s) online` | PSCI `CPU_ON` succeeded for each |
+| ext2 mount / `PASSED=` count | **the `smp=4` symptom lives here**, not above it |
+
+Metal is the better host for everything else, but it is 64 cores at $3.168/hr and
+this sweep needs many short boots — which is exactly what a laptop is for.
+Bear in mind when reading results that Lima adds nested-virt overhead: an idle
+guest that costs 2% of a core on metal is not comparable, and a "slow" result
+there should be re-measured on metal before it is believed
+(`AKUMA_FIRECRACKER_TERRAFORM.md` §10).
 
 ## 6. The lesson worth keeping
 

@@ -3,9 +3,11 @@
 **Date opened:** 2026-08-21
 **Project:** `../akuma-terraform/` (its own git repo,
 `github.com/netoneko/akuma-terraform`)
-**Status:** **applied and delivering.** `m6g.metal` running in `ap-northeast-1`,
-Firecracker v1.16.1 under KVM in VHE mode, Alpine microVM booting, and the FDT
-dumped at 1/2/4/8 vCPUs. The artifacts are in `docs/reference/firecracker/fdt/`.
+**Status:** **delivered.** `m6g.metal` in `ap-northeast-1`, Firecracker v1.16.1
+under KVM in VHE mode, the FDT dumped at 1/2/4/8 vCPUs
+(`docs/reference/firecracker/fdt/`) — and, as of the second session on
+2026-08-21, **Akuma itself boots on it and answers SSH**, at 1 and 2 vCPUs
+(§10).
 **Design it serves:** `proposals/FIRECRACKER_PORT.md` §7 (AWS metal) and §5
 (FDT-derived device map)
 **Prior art:** `docs/archive/AKUMA_FIRECRACKER_KVM.md` (the local Lima boot),
@@ -226,7 +228,7 @@ Order of work when it is picked up:
    finds, so the order is load-bearing.
 4. `bin/fetch-kernel.sh` on the workstation to extract and verify the result.
 
-## 7. Three traps worth remembering
+## 7. Four traps worth remembering
 
 **A same-named profile in `~/.aws/config` shadows static keys elsewhere.**
 Credentials live in a separate file, but the SDK still consults `~/.aws/config`
@@ -241,6 +243,20 @@ ones being used.
 would have quietly replaced the devbox `resolv.conf`. This is the sort of thing
 that surfaces later as "DNS broke in the guest" with no connection to the image
 build.
+
+**A region you have not opted into reports expired credentials.** Every EC2 call
+against a non-enabled opt-in region (`il-central-1`, `eu-south-1`,
+`eu-central-2`, …) fails with `AuthFailure: AWS was not able to validate the
+provided access credentials` — and since this project runs on temporary SSO
+credentials, "they expired" is the obvious and wrong conclusion. The test is to
+call a *second* region: if `eu-central-1` answers at the same instant, the
+credentials are fine and the region is the problem.
+`aws account list-regions --region-opt-status-contains ENABLED
+ENABLED_BY_DEFAULT` settles it outright. The nastier variant: the same call with
+`--filters Name=instance-type,...` prints the error on **stderr** and an empty
+list on stdout, so a script that discards stderr concludes "this region offers no
+Graviton metal" — a wrong answer that looks like a measurement. Full table and
+the enable-permission problem in §10.1.
 
 **`user_data` has a 16 KiB ceiling and base64 is the wrong lever.** The bootstrap
 scripts are ~25 KB of shell. Embedding them base64-encoded inside the cloud-config
@@ -308,7 +324,7 @@ Also confirmed, from the same blobs:
 `docs/reference/firecracker/memory-map.md` moved **B → A** on the strength of
 this, with the `memory`-node correction folded in.
 
-## 9. Three bugs found on the way, all in this project's own tooling
+## 9. Eight bugs found on the way, all in this project's own tooling
 
 Recorded because each one produced a failure that looked like something else.
 
@@ -337,7 +353,301 @@ specifically to catch it**, and each check paid for itself by being wrong in a
 legible way rather than hanging. Worth keeping in mind when adding the next
 assertion.
 
-## 10. State, and what is next
+### The second session's five, 2026-08-21
+
+The first three were found while building the FDT dump. These five were found
+taking the same project from "Akuma has never booted here" to an SSH session,
+and they share a different shape: **each one only fires on the second run.** The
+bootstrap was verified once, on a fresh host, and every one of these was invisible
+until something ran twice — a reboot, a re-push, a rebuild.
+
+**4. `dnsmasq` cannot reopen its own log, so networking dies on every reboot but
+the first.** `akuma-fc-net.service` failed with
+
+```
+dnsmasq: cannot open log /var/tmp/dnsmasq.log: Permission denied
+```
+
+leaving tap0 present but no DHCP, no NAT and no ssh forward — which reads as a
+networking bug in the guest, not a host unit that never started. The host runs
+`fs.protected_regular = 2`, which refuses an open-for-write of an *existing*
+regular file in a world-writable sticky directory when the file's owner is not
+the opener. **Root is not exempt** — protecting root from file-planting in `/tmp`
+is the entire point of the sysctl. dnsmasq creates the log as root and then
+`fchown`s it to `nobody`, so run 1 (file absent, created) succeeds and every
+later run (file present, owned by `nobody`) fails. `/var/log` and `/run` are
+root-owned and not sticky; the log and pid file live there now.
+
+**5. `rustup target add` without `--toolchain` installs it on the wrong
+toolchain.** The Akuma tree pins `channel = "nightly"`, but stage 50 runs from
+`/`, outside any cargo project, where the pin is invisible — so the bare-metal
+std landed on **stable** and the kernel build got nightly. The failure is 15
+crates deep and names neither rustup nor the pin:
+
+```
+error[E0463]: can't find crate for `core`
+note: the `aarch64-unknown-none` target may not be installed
+help: consider building the standard library from source with -Zbuild-std
+```
+
+and `rustup target list --installed`, also run outside the project, cheerfully
+confirms the target is present. Both toolchains get it now.
+
+**6. `/usr/bin/rsync` on macOS 15 is openrsync, and rejects `--info`.** It
+prints a usage dump and transfers nothing. Worse, the flag error is *not* what
+made this expensive: `--delete-before` had already deleted the previous tree, so
+a failed push leaves **no** source on the host rather than a stale one. The next
+build failed with `overlays/devbox-firecracker/build.sh: No such file or
+directory` — which looks like a missing script, not a dead transfer. §10's
+table has what replaced the transport.
+
+**7. `bin/package-rootfs.sh` died on `set -u` with no arguments.**
+`"${ARGS[@]}"` on an empty array is an unbound-variable error on bash 3.2 —
+which is `/bin/bash` on macOS — so the *default* invocation was the broken one:
+`ARGS[@]: unbound variable`. `${ARGS[@]+"${ARGS[@]}"}` expands to nothing
+instead.
+
+**8. Stages 60 and 62 were never on the host.** `build-image.sh` uploaded 45 MB
+over a 53 KB/s link — 13 minutes — and *then* failed with
+`sudo: /opt/akuma/bin/60-akuma-image.sh: command not found`. This is trap 2 of
+this document made concrete: the pending `user_data` change that stages them is
+still unapplied in terraform state, and the by-hand fixes done to the live host
+in session 1 did not cover these two. They were scp'd up. **The ordering is the
+lesson** — check the remote prerequisite *before* the slow upload, not after.
+
+## 10. Akuma booted here, 2026-08-21 (second session)
+
+The four items §10.2 lists as "not done" were the point of this session. The
+first is done.
+
+### What ran
+
+The instance was **started, not re-applied.** `terraform plan` showed
+`0 to add, 12 to change, 0 to destroy` — the volume shrink 200 -> 10 GiB reads as
+an **in-place** `ModifyVolume`, not the reprovision the session-1 handoff
+predicted, and EBS cannot shrink a volume, so that apply would fail at the API
+rather than rebuild the box. The 12 changes are the shrink, the default tags and
+the `user_data` staging of stages 60/62. None of them were needed to boot Akuma,
+and applying would have cost a metal stop/start, so the box was started with
+`aws ec2 start-instances` and left otherwise untouched. **The pending changes are
+still pending.**
+
+Pipeline, in the order it actually worked:
+
+| Step | Result |
+|---|---|
+| source to the host | **git clone, 1.8 s** — not rsync (§9 bug 6) |
+| kernel build, 64 cores | 27 s; `_boot at 0x80300000`, `text_offset=0x100000 image_size=0x402000`, 3.19 MB flat |
+| rootfs package (workstation) | 174 MiB root -> 45 MB `tar.xz`, 42 s |
+| upload to host | **13 minutes** over a 53 KB/s link |
+| ext2 image build | 1024 MB, label AKUMA, `e2fsck -fn` clean, `authorized_keys` present |
+| boot, 1 vCPU | `PASSED=292 FAILED=0 POISON=0`, 3491 lines |
+| boot, 2 vCPUs | `PASSED=302 FAILED=0 POISON=0`, 4361 lines |
+| SSH from the workstation | works at both |
+
+### The three things it settled
+
+**1. Inbound RX works.** This was the one open question, and the DHCP handshake
+alone answers it — `DHCPREQUEST` cannot come from a guest that never received the
+offer:
+
+```
+[SmolNet] DHCP configured
+[SmolNet] IP: 10.0.2.15/24
+Heartbeat ... rx posted=13 fail=0 recvd=12
+```
+
+Then `ssh -p 4444 root@<eip>` returned
+`Akuma akuma 0.0.7 fab3e50-release-smp-shared aarch64 Linux`. Measured inbound
+throughput, guest pulling over HTTP from the host: **20 MiB in 1.32 s, ~15 MB/s.**
+
+**2. `vcpu_count = 2` works, and the FDT map is why.** The handoff listed "1 vCPU
+only, and it fails silently above that" as an open blocker. It is not open: the
+FDT-derived map (`crates/akuma-firecracker`, consumed by
+`platform::install_fdt_device_map`) landed in the meantime and moves the
+redistributor at run time.
+
+```
+vcpus=1  [Platform] FDT device map: GICR=0x3ffd0000
+vcpus=2  [Platform] FDT device map: GICR=0x3ffb0000 (moved from bootstrap literal)
+         [SMP-shared] probed 2 core(s) / CPU_ON core 1 (mpidr=0x1) -> ok
+```
+
+`0x3ffb0000` = `0x3fff_0000 - 2 * 0x2_0000`, exactly §8's measured formula. The
+`(moved from bootstrap literal)` suffix is the thing to grep for: its absence at
+`vcpu_count > 1` means the parse fell back and the boot core is about to lose its
+tick. **4 vCPUs is still untried here**; `fab3e50c` records
+`smp=4 breaks disk in lima`, and this host is the right place to retry it without
+Lima's overhead in the way.
+
+**3. Where the CPU actually goes.** Three different "slow" claims came up and they
+are three different things:
+
+| | Measurement |
+|---|---|
+| guest `topd`, network thread, idle | 68.9% |
+| host `firecracker` (all threads), guest idle | **2% of one core** |
+| host `firecracker`, sustained 15 MB/s transfer | 65% of one core |
+| operator link, workstation <-> Tokyo | **53 KB/s up, 34 KB/s down, ICMP blocked** |
+
+Rows 1 and 2 are the same idle machine. Akuma's `topd` figure is a share of
+*guest scheduler* time and the netpoll thread is what the scheduler parks on when
+nothing else is runnable, so an idle guest credits it ~70% while costing the host
+2%. **The host number is the honest one.** Row 4 is the operator's home uplink and
+has nothing to do with Akuma — it is what made a 45 MB upload take 13 minutes.
+The earlier "network eats 70% of CPU" observation was also taken under Lima,
+where nested virt inflates everything; on metal it does not reproduce.
+
+### Four findings that are not Firecracker's fault
+
+Worth writing down because each looked like a platform bug and none was:
+
+1. **The `devbox` image root has no busybox applet links.** Every command is
+   `not found`; only `/bin/busybox <applet>` and `/bin/sh` resolve until someone
+   runs `busybox --install`. There is nothing to fix in the packager's copy step —
+   `bootstrap/bin` on the workstation holds **59 regular files and 1 symlink**, no
+   applet links to preserve.
+2. **No CA bundle.** `curl: (77) Error reading ca cert file
+   /etc/ssl/certs/ca-certificates.crt` on any HTTPS fetch. It exists at
+   `bootstrap/etc/ssl/certs/ca-certificates.crt`, but the `devbox` profile takes
+   `/etc` from `overlays/devbox/rootfs/etc` **only** (§5), which has no `ssl/`.
+   `--profile full` carries it.
+3. **Kernel-path DNS points at nothing here.** `smoltcp_net.rs` has
+   `QEMU_DNS_SERVER = 10.0.2.3`, SLIRP's forwarder. Under Firecracker the resolver
+   is `20-net.sh`'s dnsmasq at `10.0.2.2`, which it also hands out as DHCP option
+   6. The log prints `[SmolNet] DNS socket initialized (server: 10.0.2.3)` and
+   nothing supersedes it.
+4. **`/proc` is nearly empty, and it is what limits real binaries.** `fastfetch`
+   2.67.1 built `-static` runs on Akuma and prints `Kernel: Akuma 0.0.7` — and
+   little else, because `/proc` holds **only numeric PID directories and `boxes`**:
+   no `cpuinfo`, `meminfo`, `uptime`, `version`. Same gap that blocks redis, so
+   filling it pays twice. (Neither upstream fastfetch release is usable regardless
+   of platform: `fastfetch-linux-aarch64` and `-polyfilled` are the same BuildID,
+   both glibc-dynamic PIEs wanting `/lib/ld-linux-aarch64.so.1`. "Polyfilled"
+   means an older glibc, not static.)
+
+## 10.1 Region: measured, and why Tokyo stays for now
+
+§2 recorded "Japan was the requirement". With the operator in Israel that costs
+**253 ms RTT**, and the 45 MB rootfs upload took 13 minutes. Measured 2026-08-21,
+TCP-connect time to `ec2.<region>.amazonaws.com` (~1 RTT), best of 3, plus
+`m6g.metal` on-demand from the price list API:
+
+| Region | RTT | `m6g.metal` | Usable on this account? |
+|---|---|---|---|
+| `il-central-1` Tel Aviv | **12 ms** | $2.8896 | **No — opt-in, not enabled** |
+| `eu-south-1` Milan | 52 ms | $2.8672 | No — opt-in, not enabled |
+| `eu-west-3` Paris | 59 ms | $2.8800 | yes |
+| `eu-west-2` London | 68 ms | $2.8416 | yes |
+| `eu-central-1` Frankfurt | 64-72 ms | $2.9440 | yes |
+| `eu-north-1` Stockholm | 87 ms | **$2.6240** | yes |
+| `eu-west-1` Ireland | 76-98 ms | $2.7520 | yes |
+| `ap-northeast-1` Tokyo | **253 ms** | $3.1680 | current |
+| `eu-central-2` Zurich | 56 ms | **none** | no Graviton metal at all |
+
+**Tel Aviv is 21x closer and 9% cheaper than Tokyo, and cannot be used without an
+account change.** It is an opt-in region and this account has not enabled it;
+`aws account list-regions --region-opt-status-contains ENABLED ENABLED_BY_DEFAULT`
+is the authority. Same for Milan.
+
+**The trap that wasted time here, worth knowing:** a non-enabled opt-in region
+does not answer "region not enabled". Every EC2 call returns
+
+```
+An error occurred (AuthFailure) when calling the DescribeInstanceTypeOfferings
+operation: AWS was not able to validate the provided access credentials
+```
+
+which reads as expired credentials — and these *are* temporary SSO credentials,
+so that is entirely plausible. It is not the credentials: `sts
+get-caller-identity` and the same call against `eu-central-1` both succeed at the
+same instant. **Test enabled-vs-expired by calling a second region, never by
+re-authenticating.** Worse, a query filtered by instance type in such a region
+returns an empty list on stderr, which reads as "this region has no Graviton
+metal" if stderr is being discarded. Zurich is the one row above where the
+absence is real.
+
+Enabling `il-central-1` needs `account:EnableRegion`, which this SSO role
+(`AWSReservedSSO_PowerUserAccess`) does not have — the same permission wall as
+§5b's IAM roles. **That is the one action worth asking an admin for**: it turns a
+253 ms link into a 12 ms one and cuts 9% off the hourly rate.
+
+Failing that, `eu-west-3` (Paris, 59 ms) or `eu-central-1` (Frankfurt) are
+available today at ~4x better latency and ~7% cheaper. `eu-north-1` (Stockholm)
+is the cheapest usable at $2.6240 but 87 ms.
+
+**None of this is why the upload was slow enough to matter.** The 45 MB tarball is
+avoidable rather than accelerable — see §9 bug 6, and note that the host clones
+this repo in 1.8 s while the workstation needed 13 minutes for the tarball. Fix
+the transport before paying for a migration.
+
+### a1.metal, for the deferred probe (§3) — and it constrains the region choice
+
+| Region | `a1.metal` | vs `m6g.metal` there | RTT from Israel |
+|---|---|---|---|
+| N. Virginia | $0.4080 | — | 147 ms |
+| Ireland `eu-west-1` | $0.4610 | 6.0x cheaper | 76-98 ms |
+| **Frankfurt `eu-central-1`** | **$0.4660** | 6.3x cheaper | **64-72 ms** |
+| Tokyo `ap-northeast-1` | $0.5140 | 6.2x cheaper | 253 ms |
+| Tel Aviv, Paris, London, Stockholm, Milan | **not offered** | — | 12-87 ms |
+
+`a1.metal` is **16 vCPU / 32 GiB**, Graviton1, "up to 10 Gigabit" — the whole
+family is `medium` (1/2 GiB), `large` (2/4), `xlarge` (4/8), `2xlarge` (8/16),
+`4xlarge` (16/32) and `metal` (16/32). Still unproven for Firecracker (§3).
+
+**`a1.metal` is the floor: AWS sells no smaller aarch64 metal instance.** Every
+bare-metal arm64 type, by size (`describe-instance-types --filters
+bare-metal=true, processor-info.supported-architecture=arm64`):
+
+| vCPU | RAM | Types |
+|---|---|---|
+| **16** | **32 GiB** | **`a1.metal` — the only one** |
+| 64 | 128-512 GiB | `c6g` `c6gd` `c7g` `c7gd` `g5g` `m6g` `m6gd` `m7g` `m7gd` `r6g` `r6gd` `r7g` `r7gd` |
+| 96 | 192 GiB-1.5 TiB | `c8g` `c8gd` `i8g` `i8ge` `m8g` `m8gd` `r8g` `r8gd` `x8g` (all `.metal-24xl`) |
+| 192 | 384 GiB-3 TiB | the `.metal-48xl` tier, plus `c9g` / `m9g` |
+
+The `.metal-24xl` / `.metal-48xl` suffixes on the 8g/9g families are AWS's
+partial-metal sizes — a bare-metal slice smaller than the whole host — but they
+begin at 96 vCPU, so they are larger than the 64-core generation, not smaller.
+
+**There is a 4x cliff and no rung in between**, and it is a price cliff too: from
+`a1.metal` at $0.4660/hr (Frankfurt) the next bare-metal arm64 option is
+`c6g.metal` at $2.4832 there, or $2.3347 in Ireland. **5.3x, in one step.**
+
+This is what makes §3's deferred a1 probe worth more than its $0.10: `a1.metal` is
+the *only* option below ~$2.33/hr, so that experiment decides whether cheap
+iteration on this project is possible at all, or whether every hour of Firecracker
+work costs $2.33 minimum. Do it before settling on a long-running box.
+
+**`a1.4xlarge` is a trap: identical specs, $0.0004/hr cheaper, and it cannot run
+this workload at all.** 16 vCPU and 32 GiB are the same numbers as `a1.metal`, so
+a spec-and-price comparison picks it — but `BareMetal: false` means it is an EC2
+guest, EC2 offers nested virtualization on no architecture, and therefore
+`/dev/kvm` does not exist on it. That is §2's forced decision restated: for this
+project the `.metal` suffix is the requirement and every other size in the family
+is unusable regardless of price.
+
+**a1 is an old generation and the newer regions do not carry it.** Confirmed two
+independent ways: the price list returns nothing for those locations, and
+`describe-instance-type-offerings` returns an empty AZ list in `eu-west-3`,
+`eu-west-2` and `eu-north-1`. Among the regions this account has enabled, only
+`eu-central-1` (AZs a, b) and `eu-west-1` (AZs a, c) offer it.
+
+**So the two moves conflict.** "Get closer to Israel" points at Tel Aviv (12 ms),
+Paris (59 ms) or London (68 ms) — **none of which have a1**. "Move to a1" points
+at Frankfurt, Ireland, Tokyo or N. Virginia. The intersection is a single row:
+
+> **`eu-central-1` (Frankfurt)** — a1.metal at $0.4660/hr *and* 64-72 ms, versus
+> Tokyo's 253 ms. Not the closest region available, but the closest one that can
+> ever run the cheap instance.
+
+Pick the region against the a1 plan, not against latency alone: latency buys a
+nicer session, a1 buys a 6x cheaper one, and only Frankfurt leaves both open.
+Note also that a1's 16 vCPU / 32 GiB is a real step down from m6g.metal's
+64 / 256 — §3 chose 256 GiB partly to remove memory as a variable for the
+mmap-heavy self-host workloads, and 32 GiB puts it back.
+
+## 10.2 State, and what is next
 
 Applied: 13 resources (VPC, IGW, subnet in an AZ that actually offers the type,
 route table + association, SG with `tcp/22,2222,4444` from one `/32`, egress, key

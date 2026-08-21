@@ -89,11 +89,26 @@ mapping is written up in `docs/reference/firecracker/disk-and-volumes.md`.
 
 ## 4. Known limits
 
-- **`--vcpus 1` only.** The GIC redistributor base is
-  `0x3FFF_0000 - vcpu_count * 0x2_0000`; Akuma's bootstrap map assumes one vCPU,
-  so anything more makes the boot core drive another core's redistributor and
-  silently lose its timer. The FDT-derived device map that fixes this is not
-  implemented.
+- ~~**`--vcpus 1` only.**~~ **`--vcpus 2` verified 2026-08-21** on
+  `m6g.metal`. The GIC redistributor base is
+  `0x3FFF_0000 - vcpu_count * 0x2_0000`, so a map pinned to one vCPU makes the
+  boot core drive *another* core's redistributor and silently lose its timer.
+  The FDT-derived device map (`crates/akuma-firecracker` ->
+  `platform::install_fdt_device_map`) now reads it at run time, and the boot log
+  says so out loud:
+
+  ```
+  vcpus=1  [Platform] FDT device map: GICR=0x3ffd0000
+  vcpus=2  [Platform] FDT device map: GICR=0x3ffb0000 (moved from bootstrap literal)
+           [SMP-shared] probed 2 core(s) / CPU_ON core 1 (mpidr=0x1) -> ok
+           [SMP-shared] ✓ 1 secondary core(s) online (shared kernel)
+  ```
+
+  At 2 vCPUs the suite is **302/0/0** (the +10 over 1 vCPU are the SMP tests),
+  SSH works, and `nproc` in the guest returns 2. **`(moved from bootstrap
+  literal)` is the line to check** — its absence at `vcpus > 1` means the parse
+  fell back and the boot core is about to lose its tick. `--vcpus 4` is untried
+  here; `fab3e50c` records `smp=4 breaks disk in lima`.
 - ~~**Inbound (RX): fixed in code, unverified on a boot.**~~ **Verified
   2026-08-21** (see the status block above). The symptom was a NIC that
   transmitted perfectly and received absolutely nothing — dnsmasq answered
@@ -134,3 +149,24 @@ mapping is written up in `docs/reference/firecracker/disk-and-volumes.md`.
 - `run.sh` always attaches `"entropy": {}`. Without a virtio-rng device three
   boot-suite tests fail on `getrandom` returning `EIO`; QEMU's runner always
   provides one, so its absence looks like a kernel bug.
+- **The `devbox` image root has no busybox applet links and no CA bundle.** Both
+  are consequences of one packaging rule, and both were hit on 2026-08-21:
+
+  `overlays/devbox-firecracker-aws/build-rootfs-image.sh --profile devbox` takes
+  `/etc` from `overlays/devbox/rootfs/etc` **only** (mirroring
+  `overlays/devbox/bootstrap.sh` step 3, which wipes the base `/etc` first). So:
+
+  | Missing | Where it actually lives | Symptom in the guest |
+  |---|---|---|
+  | applet links (`ls`, `uname`, …) | nowhere — `bootstrap/bin` holds 59 *regular* files and 1 symlink, no applet links to copy | every command is `not found`; only `/bin/busybox <applet>` and `/bin/sh` work until someone runs `busybox --install` |
+  | `etc/ssl/certs/ca-certificates.crt` | `bootstrap/etc/ssl/certs/` — which the `devbox` profile never reads | `curl: (77) Error reading ca cert file /etc/ssl/certs/ca-certificates.crt` on any HTTPS fetch |
+
+  `--profile full` takes `/etc` from `bootstrap/` and so carries the CA bundle;
+  the applet links are absent from the tree either way. Neither is a Firecracker
+  issue — the same image on QEMU behaves identically.
+- **The guest's DNS default does not match this host.** `smoltcp_net.rs` has
+  `QEMU_DNS_SERVER = 10.0.2.3`, which is SLIRP's built-in forwarder. Under
+  Firecracker nothing listens there: `20-net.sh`'s dnsmasq is the resolver and it
+  is at `10.0.2.2` (and hands itself out as DHCP option 6). The boot log prints
+  `[SmolNet] DNS socket initialized (server: 10.0.2.3)` and no later line
+  supersedes it, so kernel-path DNS is aimed at an address with no server on it.

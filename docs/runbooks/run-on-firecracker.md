@@ -1,11 +1,18 @@
 # Run Akuma on Firecracker locally
 
-**Stability: B** — verify behaviour. Akuma **does** boot under Firecracker: on
-2026-08-21 it ran the boot suite at 290/0/0, mounted its ext2 root, ran userspace
-and started `/bin/sshd` under herd, on a Lima nested-virt host
-(`docs/archive/AKUMA_FIRECRACKER_KVM.md`). Steps below marked *(unverified)* had
-not been executed end-to-end when this was written; that caveat now applies to
-the SSH-in step only, since inbound RX was fixed after that boot (§8).
+**Stability: B** — verify behaviour. Akuma boots under Firecracker, and as of
+2026-08-21 the path runs **end to end, SSH included**, on an AWS `m6g.metal`
+host: boot suite **292/0/0** at 1 vCPU and **302/0/0** at 2, ext2 root mounted,
+userspace up, `/bin/sshd` under herd, a DHCP lease taken, and an operator SSH
+session from outside the host. The earlier Lima run
+(`docs/archive/AKUMA_FIRECRACKER_KVM.md`) reached 290/0/0 but never got a shell;
+inbound RX was fixed after it (§8).
+
+Nothing on this page is marked *(unverified)* for the local path any more, but
+the **AWS metal** procedure is a different document —
+`docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md`, plus `../akuma-terraform` — and
+that is where the verified run happened. Read §8 before debugging anything: two
+of the four items there cost time on 2026-08-21 and are packaging, not kernel.
 
 For the AWS metal path rather than this local one, see
 `docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md`.
@@ -191,12 +198,24 @@ rm -f /tmp/fc.sock
 firecracker --api-sock /tmp/fc.sock --config-file /tmp/akuma.json'
 ```
 
-**Start with `vcpu_count: 1`.** Akuma's compile-time bootstrap map assumes one
-vCPU, because Firecracker places the GIC redistributors at
-`0x3FFF_0000 - vcpu_count * 0x2_0000` — CPU0's frames move with the count. The
-FDT-derived refinement that makes `SMP=N` correct is **not implemented yet**
-(`proposals/FIRECRACKER_PORT.md` §5), so more than one vCPU is expected to lose
-the boot core's timer interrupt.
+**Start with `vcpu_count: 1`** — but 2 works. Firecracker places the GIC
+redistributors at `0x3FFF_0000 - vcpu_count * 0x2_0000`, so CPU0's frames move
+with the count, and the compile-time bootstrap map is right for one vCPU only.
+The FDT-derived refinement (`proposals/FIRECRACKER_PORT.md` §5) **is now
+implemented** — `crates/akuma-firecracker` parsed by
+`platform::install_fdt_device_map` — and 2 vCPUs was verified on metal on
+2026-08-21 (302/0/0, secondary online, SSH in).
+
+The line that tells you which map the GIC was configured from:
+
+```
+vcpus=1  [Platform] FDT device map: GICR=0x3ffd0000
+vcpus=2  [Platform] FDT device map: GICR=0x3ffb0000 (moved from bootstrap literal)
+```
+
+If you see `[Platform] no FDT` or a `GICR=0x3ffd0000` at `vcpu_count > 1`, the
+parse fell back to the literal and the boot core is about to drive another core's
+redistributor and lose its tick — silently. 4 vCPUs is still untried on metal.
 
 `boot_args` is passed but Akuma ignores the kernel command line; it is harmless.
 
@@ -250,12 +269,37 @@ meaningful.
   Firecracker versus 48 on QEMU — no longer "untested": the FDT confirms it,
   `virtio_mmio@40003000` carrying `interrupts = <0x00 0x00 0x01>`, i.e. SPI 0 →
   INTID 32 (`docs/reference/firecracker/fdt/`).
-- **Inbound RX: fixed 2026-08-21, not yet verified on a boot.** Firecracker will
-  not read a frame off the host tap until the *total* posted receive-descriptor
-  capacity reaches `MAX_BUFFER_SIZE` = 65562 bytes, so the old 2 KB buffer meant
-  every inbound frame was silently dropped. `RX_BUFFER_LEN` is now 65568. The
-  first boot that reaches a shell over SSH settles it. **`extreme-size` keeps the
-  2 KB buffer on purpose and therefore has no inbound networking here.**
+- ~~**Inbound RX: fixed, not yet verified on a boot.**~~ **Verified 2026-08-21.**
+  Firecracker will not read a frame off the host tap until the *total* posted
+  receive-descriptor capacity reaches `MAX_BUFFER_SIZE` = 65562 bytes, so the old
+  2 KB buffer meant every inbound frame was silently dropped. `RX_BUFFER_LEN` is
+  now 65568. DHCP completing (`[SmolNet] DHCP configured`, `IP: 10.0.2.15/24`) is
+  the cheap proof — `DHCPREQUEST` cannot be sent by a guest that never received
+  the offer. Measured inbound throughput on metal: **~15 MB/s**.
+  **`extreme-size` keeps the 2 KB buffer on purpose and therefore has no inbound
+  networking here.**
+- **Two packaging gaps make a working guest look broken.** Neither is
+  Firecracker's fault and both cost time on 2026-08-21: the `devbox` image root
+  has **no busybox applet links** (so every command is `not found` until
+  `busybox --install`; only `/bin/busybox <applet>` and `/bin/sh` work) and **no
+  CA bundle** (so HTTPS fails with `curl: (77) Error reading ca cert file`).
+  `overlays/devbox-firecracker/README.md` §4 has the table of where each one
+  actually lives. Also, kernel-path DNS points at `10.0.2.3` (SLIRP's forwarder)
+  while the Firecracker host's resolver is dnsmasq at `10.0.2.2`.
+- **Third-party static binaries run, and `/proc` is what limits them.**
+  `fastfetch` 2.67.1 built `-static` against glibc executes on Akuma here and
+  prints `Kernel: Akuma 0.0.7` — but only that, because it reports whatever
+  `/proc` gives it and `/proc` holds **only numeric PID directories and
+  `boxes`**: no `cpuinfo`, `meminfo`, `uptime` or `version`. The upstream
+  releases are no use regardless of platform — both `fastfetch-linux-aarch64`
+  and the `-polyfilled` variant are glibc-dynamic PIEs needing
+  `/lib/ld-linux-aarch64.so.1` (same BuildID; "polyfilled" means an older glibc,
+  not static). This is the same missing-`/proc` gap that blocks redis, so any
+  work there pays off twice.
+- **`topd` in the guest reports the network thread at ~69% while idle.** That is
+  a share of guest *scheduler* time, not host cycles: the same idle guest costs
+  the host 2% of a core. See `docs/reference/firecracker/README.md` §4 before
+  treating it as a regression.
 - **Audio and the framebuffer are not in the image.** `kernel_framebuffer` and
   `kernel_audio` (build.rs) compile out `src/ramfb.rs`, `src/fw_cfg.rs` and the
   virtio-sound driver on this platform — 0 such symbols against 14 in the QEMU

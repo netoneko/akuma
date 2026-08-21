@@ -3,9 +3,11 @@
 **Stability: C** — active risk, expect surprises. Akuma boots, mounts its ext2
 root, runs the boot suite and executes userspace processes. `vcpu_count > 1`
 works as of 2026-08-21 — the device map is read from the FDT (§3.3).
-**Networking is verified as of 2026-08-21**, at 1 vCPU on an AWS `m6g.metal`
-host: DHCP completes, the guest takes `10.0.2.15/24`, and an operator SSH
-session reaches `userspace/sshd` from outside the host (§4).
+**Networking is verified as of 2026-08-21**, at 1 **and 2** vCPUs on an AWS
+`m6g.metal` host: DHCP completes, the guest takes `10.0.2.15/24`, and an operator
+SSH session reaches `userspace/sshd` from outside the host (§4). Measured
+throughput and where the CPU goes are in §4 as well — the guest's own `topd`
+attributes ~69% to the network thread, and that figure needs reading carefully.
 
 Current-state facts only. History and the debugging narrative are in
 `docs/archive/AKUMA_FIRECRACKER_KVM.md`; the design argument is in
@@ -289,8 +291,14 @@ Never write a literal upper bound for a kernel-address test.
   (`fdt/`), the boot does not. `MAX_CORES` in `src/smp_shared.rs` is the other
   ceiling to check first. Lima's own vCPU count caps what can be tested here.
 
-- **SMP networking is untested.** No longer blocked behind RX; it is simply
-  unexercised, because the verified boot below was a 1-vCPU one.
+- **SMP networking works at 2 vCPUs, measured 2026-08-21.** `PASSED=302
+  FAILED=0 POISON=0` (4361 console lines), `[SMP-shared] ✓ 1 secondary core(s)
+  online`, SSH in, `nproc` = 2, and a 20 MiB inbound transfer completed. The
+  redistributor moved as predicted:
+  `[Platform] FDT device map: GICR=0x3ffb0000 (moved from bootstrap literal)` =
+  `0x3fff_0000 - 2 * 0x2_0000`. **4 vCPUs is untried on this host**; `fab3e50c`
+  records `smp=4 breaks disk in lima`, so that is the next thing to reproduce
+  here, where Lima's own overhead is not in the way.
 - ~~**Inbound (RX) does not work.**~~ **Fixed and verified 2026-08-21.**
   Firecracker's virtio-net will not read a frame off the host tap until the
   *total* capacity of the posted receive descriptors reaches `MAX_BUFFER_SIZE` =
@@ -314,6 +322,35 @@ Never write a literal upper bound for a kernel-address test.
 
   **`extreme-size` still keeps the 2 KB buffer on purpose and therefore has no
   inbound networking here.** Historical detail below.
+
+- **Throughput and CPU cost, measured 2026-08-21** on `m6g.metal`, 1 vCPU,
+  1024 MiB, guest pulling a 20 MiB file over HTTP from the host's `10.0.2.2`:
+
+  | Measurement | Value |
+  |---|---|
+  | inbound throughput, host -> guest | **20 MiB in 1.32 s ≈ 15 MB/s (~121 Mbit/s)** |
+  | host `firecracker` CPU, guest idle | **2% of one core** |
+  | host `firecracker` CPU, sustained transfer | **65% of one core** |
+  | guest `topd`, network thread (tid 1), idle | **68.9%** |
+
+  **The last two rows are the trap.** Read naively, the guest says networking
+  burns ~70% of the machine while doing nothing. It does not: with the guest
+  idle, the whole `firecracker` process — vCPU thread included — takes 2% of a
+  host core. Akuma's `topd` percentage is a share of *guest scheduler* time, and
+  the netpoll thread is what the scheduler parks on when there is nothing else
+  runnable, so an idle system credits it nearly everything. The honest cost
+  figure is the host one.
+
+  Under real load the 65% is genuine work (virtio + smoltcp + TCP for 15 MB/s),
+  and it is the number to attack if throughput per core matters.
+
+  **A slow *operator* link is a third thing again, and is not this.** From the
+  workstation used on 2026-08-21 the link to Tokyo measured **53 KB/s up**
+  (5 MiB in 97 s) and **34 KB/s down** (20 MiB in 600 s), with ICMP blocked
+  outright. That is what makes `scp` of the
+  45 MB rootfs a 13-minute affair and interactive SSH feel bad; it says nothing
+  about the guest. Anything already on a remote should be fetched host-side
+  instead — the host clones this repo from GitHub in **1.8 s**.
 - ~~**Inbound (RX) never reaches the guest.**~~ Outbound works and is well-formed on
   the wire; dnsmasq answers `DHCPOFFER`. But no `DHCPREQUEST` follows, host ARP goes
   unanswered, and tap0 shows every host→guest frame dropped — while
