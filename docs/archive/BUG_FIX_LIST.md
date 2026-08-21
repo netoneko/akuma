@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 646
-- **Docs contributing at least one fix:** 208
+- **Total distinct fixes counted:** 667
+- **Docs contributing at least one fix:** 211
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 127 | 19.7% | 17 |
-| Memory & Virtual Memory | 113 | 17.5% | 35 |
-| Scheduler & Process Management | 76 | 11.8% | 19 |
-| SMP & Locking | 86 | 13.3% | 37 |
-| Networking | 42 | 6.5% | 17 |
-| Userspace Apps & Libraries | 37 | 5.7% | 20 |
-| Rump Kernel & Syscall Proxy | 25 | 3.9% | 6 |
-| Toolchain & Self-Hosting | 37 | 5.7% | 5 |
-| SSH | 15 | 2.3% | 13 |
-| VFS & Filesystem | 17 | 2.6% | 12 |
-| Boot & Drivers | 11 | 1.7% | 6 |
-| Signals & Exceptions | 12 | 1.9% | 5 |
-| Misc / Cross-cutting | 14 | 2.2% | 4 |
-| Console & Terminal | 15 | 2.3% | 7 |
-| Containers | 19 | 2.9% | 5 |
-| **Total** | **646** | **100.0%** | **208** |
+| Syscall / ABI Compatibility Audits | 127 | 19.0% | 17 |
+| Memory & Virtual Memory | 113 | 16.9% | 35 |
+| Scheduler & Process Management | 76 | 11.4% | 19 |
+| SMP & Locking | 86 | 12.9% | 37 |
+| Networking | 42 | 6.3% | 17 |
+| Userspace Apps & Libraries | 37 | 5.5% | 20 |
+| Rump Kernel & Syscall Proxy | 26 | 3.9% | 6 |
+| Toolchain & Self-Hosting | 37 | 5.5% | 5 |
+| SSH | 15 | 2.2% | 13 |
+| VFS & Filesystem | 17 | 2.5% | 12 |
+| Boot & Drivers | 23 | 3.4% | 8 |
+| Signals & Exceptions | 12 | 1.8% | 5 |
+| Misc / Cross-cutting | 22 | 3.3% | 5 |
+| Console & Terminal | 15 | 2.2% | 7 |
+| Containers | 19 | 2.8% | 5 |
+| **Total** | **667** | **100.0%** | **211** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -803,7 +803,7 @@ aren't recorded anywhere else.)
 - `nca`'s TUI event bridge (`spawn_tui_bridge`, `crates/tui/src/tui/bridge.rs`) called a blocking `std::sync::Mutex::lock()` directly inside a `tokio::spawn` task once per event; the render loop held that same lock across its own synchronous `terminal.draw()` pty I/O, so a slow draw blocked the bridge's tokio worker on the lock and the render loop's own input `poll()` — sequenced after its critical section on the same thread — never got reached, producing multi-minute input freezes; fixed by moving the lock-and-mutate onto `tokio::task::spawn_blocking`
 
 
-## Rump Kernel & Syscall Proxy (25 fixes, 6 docs)
+## Rump Kernel & Syscall Proxy (26 fixes, 6 docs)
 
 ### docs/archive/OPTIONAL_SMOLTCP.md
 - `sendmsg` UnixSocket passthrough missing for rump box 0's own channel I/O
@@ -835,6 +835,7 @@ aren't recorded anywhere else.)
 ### docs/archive/RUMP_SYSPROXY.md
 - Bug fixed en route to Phase A dispatch (kernel can't drain its ProcessChannel early in boot) — fixed via idle-through-`nanosleep`
 - Self-interception bug — the sysproxy server drove its own channel and intercepted its own replies
+- `box use` accepted a bare hex box id only with a `0x` prefix, so pasting the id exactly as `ps` prints it (hex, e.g. `185c61f8b7`, while `/proc/boxes` writes decimal) fell through to a name lookup and missed; `boxes::resolve` now takes the name, `0x`-prefixed hex, bare hex and decimal, with **bare hex tried last so a name that is also valid hex stays a name** (`db` = 0xdb = 219 and is a real box name). An all-digit hex id still reads as decimal by construction — use the `0x` form
 
 ### docs/archive/ARCHITECTURE_QUESTIONS.md
 - `ifcreate` hang — `rumpuser_clock_sleep` didn't release the rump CPU around its sleep
@@ -983,7 +984,24 @@ aren't recorded anywhere else.)
 - `sys_openat` neither implemented `O_TMPFILE` nor rejected write-mode opens of directories, so apk-tools 3's atomic-write path (`openat(dirfd, ".", O_RDWR|O_TMPFILE)`) silently succeeded with a writable fd on the directory itself, and every subsequent `write()` failed `EISDIR` at the wrong syscall — `apk update`/`apk add` installed files but never wrote the database; fixed by answering `O_TMPFILE` with `EINVAL` (apk falls back to `.tmp`+`renameat`, which works) and write-mode opens of an existing directory with `EISDIR` at open() time (closes `DEVBOX_ISSUES.md` Issue 20)
 
 
-## Boot & Drivers (11 fixes, 6 docs)
+## Boot & Drivers (23 fixes, 8 docs)
+
+### docs/archive/AKUMA_FIRECRACKER_KVM.md
+(The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
+- §3.2 `TPIDRRO_EL0` — KVM hands a vCPU the poison value `0x1de7ec7edbadc0de` where QEMU zeroes it, so `current_tid()` read it as a tid and halted the core before `threading` had installed a real one; zeroed with `msr tpidrro_el0, xzr` at both entry points (`boot.rs` for the BSP, `secondary_entry_shared` for PSCI-woken secondaries)
+- §3.3 `ramfb::init` took a data abort (`EC=0x25`, `FAR=0x8000012008`) touching an fw_cfg selector register on a machine that maps nothing there — Firecracker has no fw_cfg device, and unlike QEMU's clean "file not found" the register access itself faults; fixed with a compile-time `AVAILABLE` gate on both public entry points of `src/fw_cfg.rs`
+- §3.4 The kernel-text tripwire range was written with a stale `0x6000_0000` upper bound, so at `KERNEL_PHYS_BASE = 0x8030_0000` it inverted to `0x8030_0000..0x6000_0000` — permanently empty, making `kernel_text` always false and flooding every timer tick with `[IRQ POISON]`; five sites in `src/exceptions.rs` shared the literal
+- §3.5 The same inverted range in `akuma-exec`'s scheduler fired `[SGI-S POISON]` on every context switch, and carried a **fourth** mirrored copy of the kernel load address — dead, never referenced, hidden by the module's `#![allow(dead_code)]`; deleted, and both sites now read one runtime window (`akuma_exec::mmu::is_kernel_text`, installed once via `set_kernel_text_window`)
+- §3.6 Firecracker validates the virtio status handshake and QEMU does not, so a driver that jumped straight to `DRIVER_OK` left block init *looking* healthy while no request ever completed; fixed without forking the dependency by `SteppedMmioTransport` in `crates/akuma-virtio/src/transport.rs`, which overrides `set_status` alone to walk the status bits in order
+- §3.7 `SCTLR_EL1.SA0` — KVM's reset value enables EL0 SP-alignment checking where QEMU's does not, killing every userspace binary deterministically at the same instruction; cleared as a single bit rather than by reconstructing `SCTLR_EL1`, which would hand-roll the architecturally RES1 fields. Whether the initial user SP is genuinely misaligned is left open
+- §3.8 Firecracker attaches no entropy device unless the config says `"entropy": {}`, and without it three boot-suite tests fail on `getrandom` returning `EIO` — a runner-config omission that reads as a kernel bug because QEMU's runner always supplies one; `run.sh` now always attaches it (290/0/0)
+- §3.9 The virtio-net header is 12 bytes under `VERSION_1`, not 10, and `virtio-drivers` 0.7.5 sized it by `MRG_RXBUF` — shifting every received frame two bytes left and presenting first as "ext2 mount hangs", then as "DHCP doesn't work"; fixed by bumping to 0.13.0, at a cost of ~9 mechanical retypings across `akuma-virtio`
+- §3.10 On a 4 GB microVM Firecracker places the FDT around 6 GiB while `boot.rs` statically maps `[0, 3 GiB)`, so reading `x0` faulted before the kernel printed a word about memory — and `extend_boot_ram_identity_map` cannot help, since it needs the RAM size the FDT is being read to discover; fixed with `mmu::ensure_boot_identity_covers(dtb_ptr)` immediately before `detect_memory`
+- §3.12 Removing `max_level_off` from `akuma-net`'s `log` dependency resurrected 25 previously-dead `log::` statements, several inside preemption-disabled sections, wedging a single-vCPU guest — a print is a lock acquisition, and one inside a section that disables preemption has nothing to yield to on a one-core machine
+- §5.1 Inbound RX never reached the guest: Firecracker's virtio-net reads nothing off the host tap until the **total** capacity of posted receive descriptors reaches `MAX_BUFFER_SIZE` = 65562 bytes, so a single 2 KB buffer left every inbound frame dropped into `no_rx_avail_buffer` with no guest-visible error — TX correct on the wire, `DHCPOFFER` answered, no `DHCPREQUEST`, host ARP unanswered. `RX_BUFFER_LEN` is now 65568; verified end-to-end 2026-08-21 (DHCP lease + operator SSH session) per `AKUMA_FIRECRACKER_TERRAFORM.md` §10
+
+### docs/archive/GICD_IROUTER_ALIASING.md
+- `GICD_IROUTER` writes landed on the **redistributor**: the distributor was mapped as a single 4 KiB page while `GICD_IROUTER` lives at offset `0x6000`, making `DEV_GIC_DIST_VA + 0x6000` exactly `DEV_GICR_SGI_VA`. Latent on QEMU only because its `GICD_IROUTER` resets to 0, which targets core 0 — the value the code wanted — and would corrupt redistributor state for real at INTID >= 128. Fixed by giving each device a *span* rather than a page in `akuma_primitives::addr`, plus a `const` no-overlap assertion (`DEV_WINDOW_NO_OVERLAP`) and two host tests; the predecessor test compared base addresses only, which is why a 64 KiB device declared as one page went unnoticed
 
 ### docs/archive/QEMU_HVF_ISV_BUG.md
 - Root cause 1: GICv2 MMIO programming model (`isv` assertion)
@@ -1034,7 +1052,18 @@ aren't recorded anywhere else.)
 - The `EC=0x0` (undefined-instruction) exception handler hard-killed the process instead of delivering SIGILL, so OpenSSL's ARM-feature-probe idiom (deliberately executing an unsupported instruction inside a SIGILL handler) could never recover, crashing nightly `cargo` under HVF at a fixed PC (`SM3SS1`, FEAT_SM3); fixed by routing `EC=0x0` through `try_deliver_signal` like the other fatal-fault arms
 
 
-## Misc / Cross-cutting (14 fixes, 4 docs)
+## Misc / Cross-cutting (22 fixes, 5 docs)
+
+### docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md
+(Host-side tooling for the AWS metal Firecracker host, `../akuma-terraform`. §9's eight bugs; the §10 Akuma-side results are verifications of fixes counted elsewhere, not new fixes, and §7's traps are AWS behaviours rather than bugs in this project.)
+- Alpine's `vmlinuz-virt` is an EFI zboot PE wrapper (`MZ` + `zimg`, payload offset at 8) since `CONFIG_EFI_ZBOOT`, not a raw ARM64 `Image`, so offset 56 held payload (measured `0x818223cd`) and Firecracker rejected it with `InvalidImageMagicNumber`; the dump now inflates the gzip payload at 51832 first
+- The FDT dump filtered console lines to the base64 alphabet *before* stripping `\r`, and every CRLF-terminated line failed the character class — discarding the whole blob and producing an empty decode indistinguishable from a guest that never dumped
+- The FDT header-magic check compared a host-endian word (`od -tx4` → `0xedfe0dd0`) against big-endian `0xd00dfeed` and failed on a correct blob; compare bytewise (`od -An -tx1`)
+- `dnsmasq` could not reopen its own `/var/tmp` log under `fs.protected_regular = 2` — it creates the file as root then `fchown`s it to `nobody`, so run 1 succeeded and every later run exited 3, failing `akuma-fc-net.service` and leaving tap0 up with no DHCP, no NAT and no ssh forward on **every reboot but the first**; log and pid moved to `/var/log` and `/run`, which are not sticky
+- Stage 50's bare `rustup target add aarch64-unknown-none` ran from `/`, outside the cargo project, so it resolved to the default toolchain (stable) while the tree pins `channel = "nightly"` — the bare-metal std landed on the toolchain the kernel build never uses and 15 no_std crates failed at once with `E0463: can't find crate for core`, while `rustup target list --installed` showed it present; both toolchains now get it explicitly
+- `bin/push-akuma.sh` passed `--info=progress2` to what is **openrsync** on macOS 15, which has no `--info` and exits with a usage dump; compounded because `--delete` had already removed the previous tree, so the failed push left *no* source on the host and the next build failed with `overlays/devbox-firecracker/build.sh: No such file or directory`. Switched to `--stats`, and a `--from git` transport (the host clones from GitHub, 1.8 s) is now the default over an operator uplink measured at 53 KB/s
+- `bin/package-rootfs.sh` expanded `"${ARGS[@]}"` on an empty array under `set -u`, which is an unbound-variable error on bash 3.2 (macOS `/bin/bash`), so the no-argument invocation — the usual one — died before reaching the builder; now `${ARGS[@]+"${ARGS[@]}"}`
+- Stages `60-akuma-image.sh` / `62-ecr-image.sh` were never staged to `/opt/akuma/bin` on the running host, and `build-image.sh` checked only after uploading 45 MB over the slow link — 13 minutes to reach `command not found`; scp'd into place, and the prerequisite belongs before the upload rather than after (the `user_data` change that stages them remains unapplied in terraform state)
 
 ### docs/archive/DEVBOX_ISSUES.md
 (Issue 5 only. Issue 2's fix is counted under `TERM_POLL_INPUT_PREEMPTION_FIX.md` and Issue 3's under `UART_SMP_INTERLEAVE_FIX.md`, the deep-dives it points at; Issues 4 and 6 are open, Issue 1 did not reproduce. Issue 5's `busybox --install -s` link-target half is counted under `BUILTIN_SSH_REMOVAL.md` above — the bullet here is the invocation-coverage half it did not cover.)
@@ -1148,6 +1177,8 @@ Also re-scanned 2026-08-15 (completing the `TRIM_FAT_EMBARASSING_DUPLICATIONS.md
 Also re-scanned 2026-08-15 (the whole branch's unaudited archive docs, ahead of closing it): CARGO_HEAP_NULL_RC (the task brief for the cargo-null-`Rc` hunt; explicitly defers its fix to MADV_DONTNEED_SHARED_FRAME, counted there — "not duplicated here, so this file cannot drift from it"), HOST_TESTS_AUDIT (a boot-test-to-host-test movability survey; every finding is a scaffolding recommendation, none a landed fix), LINUX_COMPATIBILITY_ISSUES ("this list is a byproduct, not an audit" — a register of known ABI divergences, explicitly open except the one `mremap` fix, which is counted under USER_COPY_FOLD.md), REPR_C_SIGFRAME_STATX (Phase 7's `#[repr(C)]` hardening pass — behaviour-preserving by its own claim; its two Linux-layout divergences are found and *deliberately not fixed*, and its narrowing behaviour changes are inherited from the already-counted USER_COPY_FOLD.md AP-bit fix, not new here), SMP_FORK_EXEC_CORRUPTION_FIX (a restored 2026-07-21/31 dossier; every fix in it — the `demote_range_to_ro` DSB barrier, `LifecycleGuard`'s active preemption-disable, the BKL ticket-leak self-heal, `COW_FAULT_LOCK`'s non-fix — is a duplicate mention already counted under SMP_SHARED.md, BKL_PROCESS_CARVE_OUT.md, or COW_PILE_AUDIT.md's F3), TRIM_FAT_REMOVAL_FEASIBILITY (feasibility/scoping analysis for the in-kernel SSH/shell/editor and `libakuma` removals — no landed fix of its own; the removal it scoped is counted under BUILTIN_SSH_REMOVAL.md), UNSAFE_AUDIT (the audit that spawned USER_COPY_FOLD.md, REPR_C_SIGFRAME_STATX.md and the RNG driver fixes — every "DONE"/"FIXED" marker in it points at one of those, none is new), and ZERO_PAGE_ICE_FIX (the umbrella summary of the self-host `[0,0,0,0]` ICE hunt; its two named root causes are counted under PREFAULT_INODE_STUB_ZERO_PAGES.md and SELFHOST_ZERO_PAGE_HUNT.md §14–§15, and the "two real bugs found and fixed" it lists verbatim are counted under SELFHOST_ZERO_PAGE_HUNT.md §8–§9).
 
 Also re-scanned 2026-08-12: CARGO_CRATES_IO_CONNECT_FAIL (root cause isolated, "fix not yet chosen" — five options, none landed; **fixed 2026-08-20, now counted under Networking**), MINIMAL_DEV_BUSYBOX_APPLETS (an applet-coverage survey; its three verification findings — `utimensat` hardcoded to `0`, `getgroups` undispatched, no `/etc/passwd` on the devbox overlay — carry "fix shape" proposals, not fixes), TRIM_FAT_HAND_ROLLED_JSON (an audit of hand-rolled JSON across the tree; the bugs it reproduces in `herd` and `meow` are unfixed), HERD_PLUS_BOX (a proposed restructuring, explicitly not implemented — it will be renamed `TRIM_FAT_HERD_PLUS_BOX` and re-scanned when it lands), and userspace/box/BOX_RUN (current-state reference; the one fix it mentions is BOX_DOCKER_COMPAT's session-closing bug, counted there). AKUMA_SELF_HOSTING gained only a quick-start section — no change to its count. The same pass found three docs that had never been counted at all, all now listed above: DEVBOX_ISSUES (Misc), and the two deep-dives its Issues 2 and 3 point at, TERM_POLL_INPUT_PREEMPTION_FIX and UART_SMP_INTERLEAVE_FIX (both Console &amp; Terminal).
+
+Also re-scanned 2026-08-21 (the `improve-portability` branch's archive docs, ahead of closing it — the list had not been touched in the branch's 19 commits): PORTING_POSSIBILITIES (the options survey that preceded the Firecracker port — every entry is a candidate weighed and either taken or dropped, none a landed fix; the port it chose is counted under AKUMA_FIRECRACKER_KVM.md above). DEVBOX_ISSUES gained **Issue 25** (`fw_cfg`'s base address is a hardcoded VA, not a reading) which is explicitly **OPEN** and design debt rather than a bug, so that file's count is unchanged; its §3.3 relative — the fw_cfg *fault* the Firecracker boot took — is counted under AKUMA_FIRECRACKER_KVM.md, not here. RUMP_SYSPROXY gained one landed fix (the `box use` bare-hex resolution gotcha) and is bumped by 1 above. The branch's other new docs are out of scope for this file by kind, not by emptiness: `proposals/FIRECRACKER_PORT.md` is an in-flight proposal, `docs/reference/firecracker/{README,memory-map,disk-and-volumes,fdt/README}.md` and `docs/runbooks/{run-on-firecracker,dump-firecracker-fdt}.md` are current-state reference and procedure, and `overlays/devbox-firecracker{,-aws}/README.md` are component READMEs.
 
 docs/archive: 4MB_STABLE_AGENT, AI_DEBUGGING, ARCHITECTURE, BKL_DRIVERS_CARVE_OUT, BKL_PHASE7B_PPOLL_CARVE_OUT (piece 2 reverted after A/B caught real corruption), BKL_PHASE7D_THREAD_CONTEXTS (dead/unreachable code removed, not a live bug), BKL_PHASE7F_OPTOUT_LIST, BKL_RUSTC_SCALING_BASELINE, BOX_SUBDIR_FS_LIMITATIONS, C_STUBS, CGI, COMMAND_CHAINING_SSH_BUGS, CONCURRENCY, CONTAINERS_STAGE_1_PLAN, CONTAINERS_STAGE_2_PLAN, CP_MV_IMPLEMENTATION_PLAN, CRUSH_MISSING_SYSCALLS (all gaps, none marked fixed), CWD, DEAD_CODE_ANALYSIS, DEAD_CODE_SWEEP_FINDINGS (findings only, explicitly "nothing here is fixed. No source was edited"), DEV_RANDOM, DEV_ZERO, DOCKER, EMBASSY_REMOVAL, ERRORS_TO_CHECK, EXTREME_STACK_TRIMMING (perf, not bugs), FORKTEST_GO_HANG_FIX (its one fix — the `sys_waitid` ECHILD-on-non-child parentage check — is the exact same 2026-07-22 investigation already counted under SMP_SHARED.md's "forktest_parent (Go) hang" entry), FRANKENLIBC_EVAL, FREEZE_INSTRUMENTATION_PLAN, HEAP_AND_MEMORY_IMPROVEMENTS, HERD, HERD_ADD_AND_PATH_VALIDATION, HIJACK_VS_KERNEL_PROXY (analysis/validation only), IMPLEMENTATION_PLAN (rump phases, milestones only), INTERACTIVE_IO, J4_HANG_LIVE_AUTOPSY (verbatim session record; its 3 fixes are counted once under KTG_STALE_TID_EXIT_STAMP_J4_HANG.md), KILL_COMMAND, LARGE_BINARY_LOAD_PERFORMANCE, LINE_COUNT_ANALYSIS (line-count/dead-code statistics and cross-kernel comparison, not a bugfix), LOCK_REFERENCE, LOOPBACK_TIMEOUT_FIX_PLAN (plan, not landed), MEMORY_LAYOUT (duplicate of AKUMA_SELF_HOSTING §3), MULTIKERNEL, MULTITASKING, MUSL_COMPATIBILITY, NAMESPACES, NATIVE_STACK_INTERNET, NEEDLE_SERVER, NETWORKING_PERFORMANCE_AND_THREAD_SAFETY_ANALYSIS, ON_DEMAND_ELF_LOADER, OOM_BEHAVIOR, OOM_RECOVERY_OPTIONS, PAWS_PLAN, PAWS_TO_SSH_SHELL_PLAN, PHASE01_BUILDRUMP, PHASE1_COMPLETION_BASELINE, PHASE1_NETWORK_LOCK_FOUNDATION, PHASE2_RUMPUSER, PHASE3_KERNEL_TAP, PLAN_SIGSEGV_COMPILE_FIX, POSSIBLE_MEMORY_LEAK, POST_EXIT_PMM_RECLAIM, PROCESS_MEMORY_CLEANUP, PROCFS, PROPER_EXECVE_PLAN, QJS, refactor_plan, RSA_FEATURE_GATE, RUMP_LATENCY_SLEEP_FIX (hypothesis disproven, patches reverted), RUMP_PLUS_HERD, SCHEDULING_TIMING_ISSUES (open/critical, not fixed), SCRATCH, SEPARATE_SHELL_BINARY, SHARED_FD_TABLES, SHELL_ENVIRONMENT_VARIABLES, SHELL_LIMITATIONS, SIGNAL_DELIVERY_FORKTEST_EVIDENCE (summary of fixes counted elsewhere), SMOLTCP_MIGRATION_SUMMARY (duplicate summary), SMP_SHARED_M5_FAULT_LOCK_PLAN, SSH, SSH_PERFORMANCE_FIX_2026, SSH_THREADING_BUG (superseded, duplicate), STRATEGY_A_IMMEDIATE_TUNING, STRATEGY_B_SMOLTCP_MIGRATION (duplicate), STRATEGY_C_IRQ_WAKEUPS, SYSCALL_BLOCKING, SYSCALL_ERRNO_COMPLIANCE_CHANGES, SYSCALL_HARDENING, TCC_LOW_MEMORY, TCP_SEQUENCE_UNDERFLOW_PANIC, TERMINAL_SYSCALLS (duplicate reference), TLS_DOWNLOAD_PERFORMANCE, TLS_INFRASTRUCTURE, TOP_CORE_COLUMN_PLAN, TRIM_FAT_PART_1, TRIM_FAT_PART_2, TRIM_FAT_PART_3 (pure component-removal log, no bugfix content — same shape as TRIM_FAT_PART_2), TWO_VMS_AGENT_DEMO, UNIFIED_CONTEXT_ARCHITECTURE (duplicate of FAR_0x5/THREADING_RACE_CONDITIONS fixes), UNIFIED_PROCESS_ABI, UNSAFE_POINTERS_AND_ATOMICITY, USERSPACE_MEMORY_MODEL, USERSPACE_SOCKET_API, VFS_LOCK_OPTIMIZATION_PLAN, WAIT_QUEUES, MEOW.
 

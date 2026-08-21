@@ -519,14 +519,16 @@ That structure is what made the Firecracker arm mostly a table of constants.
 
 ## 5. Open
 
-> **Both items in this section are now closed.** RX (§5.1) was root-caused to
-> Firecracker's 65562-byte posted-capacity gate and fixed
+> **Two of the items below are now closed; §5.2 and §5.3 are not.** RX (§5.1)
+> was root-caused to Firecracker's 65562-byte posted-capacity gate and fixed
 > (`RX_BUFFER_LEN = 65568`), then **verified on 2026-08-21** on an AWS
 > `m6g.metal` host: DHCP completes, the guest takes `10.0.2.15/24`, and an
-> operator SSH session reaches `userspace/sshd`. The vCPU-dependent
-> redistributor (§5.2) is read from the FDT now, and 2 vCPUs boots and serves
-> SSH. See `docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md` §10. The evidence below
-> is kept verbatim as the record of how the RX failure presented.
+> operator SSH session reaches `userspace/sshd`. The **`vcpu_count > 1`** entry
+> in §5.4 is also closed — the device map is read from the FDT now, and 2 vCPUs
+> boots and serves SSH. Both: `docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md` §10.
+> **§5.2 (the nondeterministic `akuma_net::init` hang) and §5.3 (the spinning
+> DHCP settle loop) remain open** — neither was investigated on metal. The
+> evidence below is kept verbatim as the record of how the RX failure presented.
 >
 > **What is still open is the vCPU sweep on Lima — see §5.3.**
 
