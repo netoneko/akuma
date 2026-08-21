@@ -3,15 +3,26 @@
 Akuma as a Firecracker microVM. The sibling of `overlays/devbox-smoltcp` (QEMU,
 smoltcp, real SMP) and `overlays/devbox` (QEMU, rump).
 
-**Status: boots and runs at 1 vCPU; inbound RX fixed in code, not yet verified
-on a boot.** Boots, mounts its ext2 root (including the 6 GB devbox image),
-passes the boot suite 290/0/0, runs userspace, and starts `/bin/sshd` under herd.
-Outbound networking works and is correct on the wire.
+**Status: works at 1 vCPU, SSH included.** Boots, mounts its ext2 root, passes
+the boot suite **292/0/0**, runs userspace, starts `/bin/sshd` under herd, takes
+a DHCP lease, and **accepts an SSH session from outside the host.**
 
-**Inbound (RX) was root-caused and fixed after the last recorded boot** — the
-receive buffer was too small to open Firecracker's delivery gate (§4) — so SSH
-is *expected* to work rather than *known* to. The first boot that reaches a
-shell settles it; until then treat "SSH in" as unverified. `--vcpus 1` only.
+Verified 2026-08-21 on an AWS `m6g.metal` host (`../akuma-terraform`), 1 vCPU,
+1024 MiB, at `fab3e50c`:
+
+```
+[Platform] FDT device map: GICR=0x3ffd0000
+[Memory] Detected from DTB: base=0x80200000, size=1022 MB
+[SmolNet] DHCP configured / IP: 10.0.2.15/24
+lines=3491 PASSED=292 FAILED=0 POISON=0
+$ ssh -p 4444 root@<eip> -- uname -a
+Akuma akuma 0.0.7 fab3e50-release-smp-shared aarch64 Linux
+```
+
+That closes the inbound-RX question this file used to carry as unverified: the
+receive buffer was too small to open Firecracker's delivery gate (§4), and with
+`RX_BUFFER_LEN = 65568` the DHCP handshake completes, which it cannot do without
+inbound frames. `--vcpus 1` is still the only tested topology here.
 
 - Procedure: `docs/runbooks/run-on-firecracker.md`
 - Platform invariants and constants: `docs/reference/firecracker/`
@@ -83,10 +94,13 @@ mapping is written up in `docs/reference/firecracker/disk-and-volumes.md`.
   so anything more makes the boot core drive another core's redistributor and
   silently lose its timer. The FDT-derived device map that fixes this is not
   implemented.
-- **Inbound (RX): fixed in code, unverified on a boot.** The symptom was a NIC
-  that transmitted perfectly and received absolutely nothing — dnsmasq answered
+- ~~**Inbound (RX): fixed in code, unverified on a boot.**~~ **Verified
+  2026-08-21** (see the status block above). The symptom was a NIC that
+  transmitted perfectly and received absolutely nothing — dnsmasq answered
   `DHCPOFFER`, no `DHCPREQUEST` followed, host ARP went unanswered, and a receive
-  buffer *was* posted that the device never filled.
+  buffer *was* posted that the device never filled. The counter to read if it
+  ever comes back is `recvd` in the `Heartbeat` line's `rx posted=N fail=N
+  recvd=N`: it was 0 before the fix and tracks `posted` after it.
 
   The cause is a Firecracker behaviour with no guest-visible error:
   **its virtio-net will not read a single frame off the host tap until the

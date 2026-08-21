@@ -2,8 +2,10 @@
 
 **Stability: C** — active risk, expect surprises. Akuma boots, mounts its ext2
 root, runs the boot suite and executes userspace processes. `vcpu_count > 1`
-works as of 2026-08-21 — the device map is read from the FDT (§3.3); networking
-is unverified (§4).
+works as of 2026-08-21 — the device map is read from the FDT (§3.3).
+**Networking is verified as of 2026-08-21**, at 1 vCPU on an AWS `m6g.metal`
+host: DHCP completes, the guest takes `10.0.2.15/24`, and an operator SSH
+session reaches `userspace/sshd` from outside the host (§4).
 
 Current-state facts only. History and the debugging narrative are in
 `docs/archive/AKUMA_FIRECRACKER_KVM.md`; the design argument is in
@@ -287,14 +289,31 @@ Never write a literal upper bound for a kernel-address test.
   (`fdt/`), the boot does not. `MAX_CORES` in `src/smp_shared.rs` is the other
   ceiling to check first. Lima's own vCPU count caps what can be tested here.
 
-- **SMP networking is untested**, and blocked behind the RX item below anyway.
-- **Inbound (RX): root-caused and fixed 2026-08-21, not yet verified on a boot.**
+- **SMP networking is untested.** No longer blocked behind RX; it is simply
+  unexercised, because the verified boot below was a 1-vCPU one.
+- ~~**Inbound (RX) does not work.**~~ **Fixed and verified 2026-08-21.**
   Firecracker's virtio-net will not read a frame off the host tap until the
   *total* capacity of the posted receive descriptors reaches `MAX_BUFFER_SIZE` =
   65562 bytes (`read_from_mmds_or_tap`); a single 2 KB buffer never opened that
   gate, so every inbound frame was dropped into `no_rx_avail_buffer` with no
-  guest-visible error. `RX_BUFFER_LEN` is now 65568. `extreme-size` keeps 2 KB on
-  purpose and therefore has no inbound networking here. Historical detail below.
+  guest-visible error. `RX_BUFFER_LEN` is now 65568.
+
+  Verified on an AWS `m6g.metal` host, 1 vCPU, 1024 MiB, `platform-firecracker`
+  at `fab3e50c`. The evidence, in the order it rules things out:
+
+  | Observation | What it proves |
+  |---|---|
+  | `rx posted=13 fail=0 recvd=12` (`Heartbeat`) | the device is filling posted descriptors — the gate is open |
+  | `[SmolNet] DHCP configured` / `IP: 10.0.2.15/24` | a full DHCP handshake, so `DHCPOFFER` was *received*, not just answered |
+  | dnsmasq logs a complete lease | the host side agrees a client spoke to it |
+  | `ssh -p 4444 root@<eip>` returns `Akuma akuma 0.0.7 fab3e50-release-smp-shared aarch64 Linux` | bidirectional TCP through `userspace/sshd`, from outside the host |
+
+  The DHCP line alone is sufficient: `DHCPREQUEST` cannot be sent by a guest
+  that never received the offer, and that is precisely the step that used to be
+  missing.
+
+  **`extreme-size` still keeps the 2 KB buffer on purpose and therefore has no
+  inbound networking here.** Historical detail below.
 - ~~**Inbound (RX) never reaches the guest.**~~ Outbound works and is well-formed on
   the wire; dnsmasq answers `DHCPOFFER`. But no `DHCPREQUEST` follows, host ARP goes
   unanswered, and tap0 shows every host→guest frame dropped — while
@@ -306,10 +325,20 @@ Never write a literal upper bound for a kernel-address test.
 - **`virtio-drivers` must stay at 0.13+.** 0.7.5 sizes the virtio-net header by
   `MRG_RXBUF` (10 bytes) rather than `VERSION_1` (12), which shifts every frame two
   bytes left under Firecracker. QEMU tolerated it; Firecracker does not.
-- **Networking untested.** `VIRTIO_INTID_BASE = 32` is wired but unexercised;
-  it depends on the same virtio handshake as block.
+- ~~**Networking untested.**~~ `VIRTIO_INTID_BASE = 32` is exercised: the
+  verified boot above took a DHCP lease and carried an SSH session, both of
+  which require virtio-net interrupts to be delivered at that base.
 - **`src/tests.rs` bakes in QEMU's map.** ~20 sites treat
   `0x4000_0000..0x8000_0000` as kernel RAM; under Firecracker that is the MMIO
-  window. Some fail loudly, others pass vacuously. The Firecracker boot therefore
-  reports far fewer `PASSED` lines than QEMU's 289, and the two counts are not
-  comparable.
+  window. Some fail loudly, others pass vacuously, so the two `PASSED` counts are
+  not comparable *in kind* even where they agree in number.
+
+  Measured 2026-08-21 on `m6g.metal`, 1 vCPU, with a root disk attached:
+  **`PASSED=292 FAILED=0 POISON=0`** over 3491 console lines
+  (`grep -ac PASSED`). That is +2 on the 290 recorded from the Lima host, and the
+  delta is accounted for: `test_drivers_bkl_drop` and
+  `test_platform_device_gates` were added after that run. Nothing regressed.
+
+  A **console-only** boot (`--no-disk`) reports `PASSED=9` instead — most of the
+  suite needs the ext2 root, so that number is a smoke test, not a comparable
+  figure.
