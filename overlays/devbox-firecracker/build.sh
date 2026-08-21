@@ -15,8 +15,15 @@ ELF="target/aarch64-unknown-none/release/akuma"
 say() { printf '\033[1;36m[fc-build]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[fc-build] %s\033[0m\n' "$*" >&2; exit 1; }
 
-say "building --release --features platform-firecracker"
-cargo build --release --features platform-firecracker
+# Extra features layered on top of the platform. Default is the bare platform
+# (boot suite included). For a devbox-shaped image — userspace sshd via herd, real
+# SMP, boot suite skipped — use:
+#   FC_FEATURES=devbox-smoltcp,no-tests overlays/devbox-firecracker/build.sh
+# which is the Firecracker equivalent of scripts/build_devbox_smoltcp.sh.
+FEATURES="platform-firecracker${FC_FEATURES:+,$FC_FEATURES}"
+
+say "building --release --features $FEATURES"
+cargo build --release --features "$FEATURES"
 
 # The load address is the single most likely thing to be wrong, and it fails as a
 # silent hang rather than an error, so check it here rather than at boot.
