@@ -135,24 +135,31 @@ fn main() {
     // overhead, so they stay off unless `CONSOLE_LOCK=1` forces it on for an
     // opt-in test. `CONSOLE_LOCK=0` is an explicit opt-out for `release`.
     //
-    // ALSO off for `platform-firecracker`, and that is a correctness matter, not
-    // an optimization. The lock is acquired inside `with_irqs_disabled`, so a
-    // print issued from a section that already runs with preemption disabled —
-    // `akuma_net::smoltcp_net::poll`'s `NETWORK` critical section is the one that
-    // bit us — spins on a `Spinlock` whose holder may be a thread that cannot be
-    // scheduled. On a multi-core guest another core drains it; on a **single-vCPU**
-    // guest nothing can, and the kernel wedges with no output. Firecracker only
-    // supports `vcpu_count: 1` here today (the GIC redistributor base moves with
-    // vCPU count — see docs/reference/firecracker/), so the interleave the lock
-    // exists to prevent cannot occur, while the deadlock it enables certainly can.
+    // `platform-firecracker` used to be excluded here, and that exclusion was a
+    // correctness matter rather than an optimization: the lock is acquired inside
+    // `with_irqs_disabled`, so a print issued from a section that already runs with
+    // preemption disabled — `akuma_net::smoltcp_net::poll`'s `NETWORK` critical
+    // section is the one that bit us — spins on a `Spinlock` whose holder may be a
+    // thread that cannot be scheduled. On a multi-core guest another core drains
+    // it; on a single-vCPU guest nothing can, and the kernel wedges with no output.
+    // Firecracker was a single-vCPU-only target, so the interleave the lock
+    // prevents could not occur while the deadlock it enables certainly could.
     //
-    // Set `CONSOLE_LOCK=1` to force it on if a Firecracker build ever runs SMP.
-    // Background on why the lock exists at all:
-    // docs/archive/UART_SMP_INTERLEAVE_FIX.md.
+    // Both halves of that argument are runtime facts, and Firecracker is no longer
+    // single-vCPU-only (the redistributor base now comes from the FDT — see
+    // `platform::install_fdt_device_map`). So the decision moved to run time:
+    // the lock is compiled in here, and `console::set_multicore` decides whether
+    // to *acquire* it, based on whether a second core has actually come online.
+    // Single-vCPU keeps the deadlock-free behaviour, multi-vCPU gets serialized
+    // output, and neither depends on a build-time guess about `vcpu_count`.
+    //
+    // Still off for the size/extreme profiles: those are single-core targets where
+    // even the compiled-in atomic load is pure overhead. `CONSOLE_LOCK=1` forces it
+    // on there, `CONSOLE_LOCK=0` opts out of `release`. Background on why the lock
+    // exists at all: docs/archive/UART_SMP_INTERLEAVE_FIX.md.
     println!("cargo:rerun-if-env-changed=CONSOLE_LOCK");
     let size_opt_for_console = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
-    let single_core_platform = std::env::var("CARGO_FEATURE_PLATFORM_FIRECRACKER").is_ok();
-    let console_lock_default_on = !size_opt_for_console && !single_core_platform;
+    let console_lock_default_on = !size_opt_for_console;
     let console_lock = match std::env::var("CONSOLE_LOCK").as_deref() {
         Ok("0") => false,                       // explicit opt-out
         Ok("1") => true,                        // explicit opt-in (size/extreme)

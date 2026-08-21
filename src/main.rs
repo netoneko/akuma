@@ -618,7 +618,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     //
     // This is the bootstrap map, not the authority: `platform::machine`'s
     // redistributor address assumes one vCPU. The FDT-derived refinement runs
-    // after `detect_memory` below.
+    // below, as soon as `ensure_boot_identity_covers` has mapped the blob.
     // Tell the exception/scheduler tripwires where kernel code lives. Must happen
     // before the first IRQ; a wrong window makes every legitimate frame look
     // poisoned (see `mmu::set_kernel_text_window`).
@@ -719,6 +719,46 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // anything about memory. No-op on QEMU virt, where the DTB is low.
     // SAFETY: still on the boot page table, single-threaded, no other address space.
     unsafe { mmu::ensure_boot_identity_covers(dtb_ptr) };
+
+    // =========================================================================
+    // Device map, take two: from the machine, not from a literal
+    // =========================================================================
+    // The bootstrap map installed above holds `platform::machine::GICR_PA`, which
+    // is the *single-vCPU* redistributor address. Firecracker stacks the
+    // redistributors downward from the distributor, so CPU0's frames sit at
+    // `GICD - vcpu_count * 0x2_0000` and move with the configured vCPU count.
+    // Keeping the literal at `SMP=2` points the boot core at CPU1's frames: it
+    // clears the wrong `GICR_WAKER` and enables the virtual timer on the wrong
+    // frame, losing its own scheduler tick with no build or boot error. So this
+    // has to run before `gic::init()`, and the DTB has to be mapped first — hence
+    // its position immediately after `ensure_boot_identity_covers`.
+    //
+    // A failure here is not fatal: the bootstrap map stays, which is correct on
+    // QEMU virt at every `SMP=N` and correct on a single-vCPU Firecracker. Print
+    // the outcome either way — it is the only record of which map the GIC was
+    // configured from. See docs/reference/firecracker/README.md §3.3.
+    {
+        let resolved = if dtb_ptr != 0 { dtb_ptr } else { scan_for_dtb() };
+        // SAFETY: `resolved` is zero or a magic-checked FDT inside the boot
+        // identity map (extended above). Still single-threaded on the boot page
+        // table, before any user address space exists.
+        let outcome = unsafe { platform::install_fdt_device_map(resolved) };
+        match outcome {
+            platform::FdtMapOutcome::Installed { gicr_pa, moved } => {
+                // SAFETY: as for the bootstrap rebuild above — boot page table,
+                // single-threaded, and this is the L3 that table installed.
+                unsafe { mmu::rebuild_boot_device_table(boot::boot_device_l3_phys()) };
+                safe_print!(96, "[Platform] FDT device map: GICR=0x{:x}{}\n",
+                    gicr_pa, if moved { " (moved from bootstrap literal)" } else { "" });
+            }
+            platform::FdtMapOutcome::NoFdt => {
+                safe_print!(80, "[Platform] no FDT; keeping bootstrap device map\n");
+            }
+            platform::FdtMapOutcome::Rejected(e) => {
+                safe_print!(96, "[Platform] FDT rejected ({:?}); keeping bootstrap map\n", e);
+            }
+        }
+    }
 
     let (ram_base, ram_size) = detect_memory(dtb_ptr);
 

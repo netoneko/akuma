@@ -1,8 +1,9 @@
 # Firecracker platform reference
 
 **Stability: C** — active risk, expect surprises. Akuma boots, mounts its ext2
-root, runs the boot suite and executes userspace processes. `vcpu_count > 1` is
-known broken (§3.3); networking is unverified (§4).
+root, runs the boot suite and executes userspace processes. `vcpu_count > 1`
+works as of 2026-08-21 — the device map is read from the FDT (§3.3); networking
+is unverified (§4).
 
 Current-state facts only. History and the debugging narrative are in
 `docs/archive/AKUMA_FIRECRACKER_KVM.md`; the design argument is in
@@ -44,7 +45,7 @@ same constant names, selected by feature. Nothing else in the tree should need a
 | `RAM_BASE` | `0x4000_0000` | `0x8000_0000` |
 | `KERNEL_PHYS_BASE` (`src/config.rs`) | `0x4010_0000` | `0x8030_0000` |
 | `GICD_PA` | `0x0800_0000` | `0x3FFF_0000` |
-| `GICR_PA` | `0x080A_0000` | `0x3FFD_0000` **(1 vCPU only — §3.3)** |
+| `GICR_PA` | `0x080A_0000` | `0x3FFD_0000` **(bootstrap only; real value from the FDT — §3.3)** |
 | `UART_PA` | `0x0900_0000` | `0x4000_2000` |
 | `FW_CFG_PA` | `Some(0x0902_0000)` | `None` |
 | `VIRTIO_PA` | `0x0A00_0000` | `0x4000_3000` |
@@ -76,7 +77,7 @@ can be parsed. Everything else is installed from Rust by
 `gic::init()`. Anything that touches GIC or virtio MMIO earlier than that will
 fault.
 
-### 3.3 `vcpu_count` must be 1
+### 3.3 The redistributor base comes from the FDT, not from a constant
 
 Firecracker computes the GIC redistributor base as:
 
@@ -86,20 +87,49 @@ GICR_base = 0x3FFF_0000 - vcpu_count * 0x2_0000
 
 so CPU0's frames move with the configured vCPU count:
 
-| vCPUs | CPU0 RD_base | CPU0 SGI_base |
-|---|---|---|
-| 1 | `0x3FFD_0000` | `0x3FFE_0000` |
-| 2 | `0x3FFB_0000` | `0x3FFC_0000` |
-| 4 | `0x3FF7_0000` | `0x3FF8_0000` |
+| vCPUs | CPU0 RD_base | CPU0 SGI_base | measured |
+|---|---|---|---|
+| 1 | `0x3FFD_0000` | `0x3FFE_0000` | ✓ |
+| 2 | `0x3FFB_0000` | `0x3FFC_0000` | ✓ |
+| 4 | `0x3FF7_0000` | `0x3FF8_0000` | ✓ |
 
-`platform::firecracker::GICR_PA` is the 1-vCPU value. With more vCPUs, CPU0
-drives *another core's* redistributor: `gic_v3::init` clears the wrong
-`GICR_WAKER` (a per-PE register, so CPU0's stays asleep) and `enable_irq(27)`
-enables the virtual timer on the wrong frame — **the boot core silently loses its
-timer interrupt.** No build or boot error.
+`platform::firecracker::GICR_PA` is the 1-vCPU value and is **a bootstrap
+constant only** — enough to print and survive until the FDT is read. Using it
+with more vCPUs points CPU0 at *another core's* redistributor: `gic_v3::init`
+clears the wrong `GICR_WAKER` (a per-PE register, so CPU0's stays asleep) and
+`enable_irq(27)` enables the virtual timer on the wrong frame — **the boot core
+silently loses its timer interrupt**, with no build or boot error.
 
-The fix is to derive the device map from the FDT, which Firecracker populates
-correctly. **Not implemented.** This is the largest outstanding piece.
+`platform::install_fdt_device_map` (called from `kernel_main`, after
+`mmu::ensure_boot_identity_covers` maps the blob and **before** `gic::init`)
+replaces the bootstrap map with one derived from the device tree via
+`crates/akuma-firecracker`. It **reads** the redistributor from `intc`'s second
+`reg` entry rather than computing it from `vcpu_count` — `cpu_count * 0x2_0000`
+happens to equal the redistributor span, so a derivation would pass every test
+here and still be an address inferred from an unrelated property.
+
+The boot log states which map the GIC was configured from, and it is the first
+thing to check when a multi-vCPU boot misbehaves:
+
+```
+[Platform] firecracker device map installed            <- bootstrap
+[Platform] FDT device map: GICR=0x3ffb0000 (moved from bootstrap literal)
+[SMP-shared] probed 2 core(s)
+```
+
+A failure to parse is not fatal — the bootstrap map is retained and the log says
+so (`no FDT` / `FDT rejected`). That is correct at `vcpu_count: 1` and on QEMU
+virt at every `SMP=N`, and wrong for multi-vCPU Firecracker, so
+`GICR=0x3ffd0000` alongside `probed 2 core(s)` means the parse fell back and the
+boot core is about to lose its tick.
+
+Measured 2026-08-21, Lima nested virt (`vz`, 4 CPUs), `--no-disk --no-net`: 1, 2
+and 4 vCPUs all report the predicted `GICR`, bring up every secondary
+(`✓ 3 secondary core(s) online` at 4), and keep the timer
+(`[Timer] host WFI probe: tick = 1000 us`). The same change re-derives QEMU
+virt's `0x080A_0000` from its own tree, where the boot suite stays at 298/0 under
+`SMP=4` — that boot is what proves the parse against a machine whose answers are
+independently known.
 
 ### 3.4 No `fw_cfg`, no RTC, no ramfb — and since 2026-08-21, none compiled in
 
@@ -186,10 +216,27 @@ Consequences to respect:
   per-packet tracing is elided. Routing kernel messages through that facade either
   resurrects the tracing or loses the messages with it. `src/klog.rs` installs a
   heap-free sink so third-party crates (virtio-drivers) still report at info+.
-- **`kernel_console_lock` defaults OFF for `platform-firecracker`.** The lock
-  prevents cross-core PL011 byte-interleaving, impossible on a guest limited to one
-  vCPU (§3.3), while the deadlock it enables is not. `CONSOLE_LOCK=1` forces it on
-  if a Firecracker build ever runs SMP.
+- **The console lock is compiled in, and *acquiring* it is a runtime decision.**
+  Both halves of that are correctness. Acquiring it on a single-vCPU guest can
+  deadlock, for the reason above: nothing can drain a lock whose holder cannot be
+  scheduled. Not acquiring it on a multi-vCPU guest byte-interleaves at the shared
+  PL011 register (`docs/archive/UART_SMP_INTERLEAVE_FIX.md`). Neither condition is
+  knowable at build time now that `vcpu_count` is free (§3.3), so `build.rs`
+  compiles the lock into every non-size profile and `console::set_multicore`
+  decides whether to take it — flipped by `smp_shared::bringup_secondaries`
+  **before** the first `PSCI CPU_ON`.
+
+  That last detail is load-bearing. Flipping it from the secondary's own entry
+  path instead leaves the BSP printing unlocked while the secondary starts, which
+  is reliably enough to corrupt one line:
+
+  ```
+  [SMP-sh[aSrMePd-]s hCPaUr_eOdN]  ccoorree  11  (omnpliidnre= 0(x1i)d l-e>  toikd
+  ```
+
+  `platform-firecracker` was previously excluded from the lock altogether, which
+  was right while the target was single-vCPU-only and is wrong now.
+  `CONSOLE_LOCK=1`/`=0` still force the compile-time half either way.
 
 ### 3.9 Address-range checks must not be machine-relative literals
 
@@ -204,7 +251,43 @@ Never write a literal upper bound for a kernel-address test.
 
 ## 4. Known broken
 
-- **`vcpu_count > 1`** — §3.3. The largest outstanding piece.
+- ~~**`vcpu_count > 1` cannot address its GIC**~~ — fixed 2026-08-21 by reading
+  the device map from the FDT (§3.3). Verified at 1/2/4 vCPUs under Lima nested
+  virt with `--no-disk --no-net`: predicted `GICR` each time, every secondary
+  online, timer alive, console serialized.
+
+- **Multi-vCPU under boot-suite load storms the BKL.** This is what replaced
+  §3.3 as the blocker, and it is a contention bug, not an addressing one — the
+  GIC is now configured correctly and the cores really do run.
+
+  Measured with a disk attached, `--no-net`, Lima nested virt:
+
+  | vCPUs | result | `[BKL] stuck` lines |
+  |---|---|---|
+  | 1 | 284 PASSED / 0 FAILED, suite completes | 0 |
+  | 2 | 274 PASSED, suite **does not complete** | 635 |
+
+  At 2 vCPUs the log ends in an unbroken run of
+  `[BKL] stuck: owner=1 waiter=2 tag=511 (aff0+1)` and the run hits its timeout
+  with the late boot-suite tests (including `gicr-device-map` itself) never
+  reached. The first such line appears early — during the realloc test — and the
+  suite keeps making progress for thousands of lines before the storm becomes
+  terminal, so the symptom is degradation, not an immediate hang.
+
+  **Not Firecracker-specific, but much worse here.** The same `SMP=4` QEMU boot
+  emits 109 of those lines and still finishes 299/0. So this is the known
+  load-driven `tag=511` class rather than anything new about this platform; KVM
+  simply drives it harder. Treat a fix as an SMP problem and reproduce it on
+  QEMU first, where the boot is cheap.
+
+  The single-vCPU path is unaffected (0 stuck lines) and remains the one to use
+  for anything that is not specifically SMP work.
+
+- **vCPU counts above 4 are untried.** The measured FDT sweep goes to 8
+  (`fdt/`), the boot does not. `MAX_CORES` in `src/smp_shared.rs` is the other
+  ceiling to check first. Lima's own vCPU count caps what can be tested here.
+
+- **SMP networking is untested**, and blocked behind the RX item below anyway.
 - **Inbound (RX): root-caused and fixed 2026-08-21, not yet verified on a boot.**
   Firecracker's virtio-net will not read a frame off the host tap until the
   *total* capacity of the posted receive descriptors reaches `MAX_BUFFER_SIZE` =

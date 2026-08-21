@@ -903,6 +903,7 @@ pub fn run_all_tests() {
     // Device drivers must not be compiled for hardware this machine does not
     // have — the invariant behind `kernel_framebuffer` / `kernel_audio`.
     test_platform_device_gates();
+    test_gicr_device_map();
 
     // `no-bkl-irq` (Phase 7a): the timer IRQ (27) dispatch no longer needs the BKL at
     // all — pins that this core's BKL hold state is unchanged across real timer ticks,
@@ -4481,6 +4482,91 @@ fn test_mm_bkl_drop() {
 /// mapped. That is exactly how `ramfb::init` took a data abort at
 /// `FAR=0x8000012008` on the first Firecracker boot
 /// (`docs/archive/AKUMA_FIRECRACKER_KVM.md`).
+/// The installed redistributor mapping must have room for every core the machine
+/// described — the §3.3 invariant, checked on the running machine.
+///
+/// This catches the exact failure the FDT-derived device map exists to prevent,
+/// and it catches it *arithmetically* rather than by comparing against a second
+/// copy of the expected address. Firecracker stacks the redistributors downward
+/// from the distributor, so with the 1-vCPU literal (`0x3FFD_0000`) and two vCPUs
+/// core 1's frames land at `0x3FFF_0000` — which *is* the distributor. Any base
+/// too high for the core count therefore collides with GICD, and that collision is
+/// what this asserts is absent.
+///
+/// Machine-neutral by construction: on QEMU virt the redistributors sit *above* a
+/// distributor at `0x0800_0000`, so the same check passes there for a completely
+/// different reason. Nothing here names an address.
+fn test_gicr_device_map() {
+    use akuma_primitives::addr;
+
+    let mut fails = 0u32;
+
+    let (map, n) = akuma_exec::mmu::device_map();
+    let find = |va: usize| map.iter().take(n).find(|r| r.va == va).map(|r| r.pa);
+
+    let Some(rd) = find(addr::DEV_GICR_RD_VA) else {
+        crate::safe_print!(96, "[Test] gicr-device-map FAILED (no RD region installed)\n");
+        panic!("test_gicr_device_map: redistributor RD frame is not mapped");
+    };
+    let Some(sgi) = find(addr::DEV_GICR_SGI_VA) else {
+        crate::safe_print!(96, "[Test] gicr-device-map FAILED (no SGI region installed)\n");
+        panic!("test_gicr_device_map: redistributor SGI frame is not mapped");
+    };
+
+    // The SGI frame is the second 64 KiB frame of the same PE's redistributor, so
+    // its address is not independent — it is RD + 0x1_0000. A map where these two
+    // drifted apart would wake one frame and configure the other.
+    if sgi != rd + crate::platform::GICR_SGI_OFFSET {
+        fails += 1;
+        crate::safe_print!(
+            128,
+            "[Test] gicr-device-map: SGI 0x{:x} != RD 0x{:x} + 0x{:x}\n",
+            sgi, rd, crate::platform::GICR_SGI_OFFSET
+        );
+    }
+
+    // Frames are 64 KiB and the region is frame-aligned. A misaligned base means
+    // the value came from somewhere other than a redistributor `reg` entry.
+    if rd % crate::platform::GICR_SGI_OFFSET != 0 {
+        fails += 1;
+        crate::safe_print!(128, "[Test] gicr-device-map: RD 0x{:x} not 64 KiB aligned\n", rd);
+    }
+
+    // The load-bearing check. `gic_v3` (BSP) and `smp_shared::secondary_gic_init`
+    // both index this region as `base + core * GICR_STRIDE`, so every such frame
+    // must exist and must not be the distributor.
+    #[cfg(kernel_smp_shared)]
+    let cores = crate::smp_shared::probed_core_count();
+    #[cfg(not(kernel_smp_shared))]
+    let cores = 1usize;
+
+    let gicd = crate::platform::gicd_base_pa();
+    let gicd_end = gicd + addr::DEV_GIC_DIST_SIZE;
+    for core in 0..cores {
+        let lo = rd + core * crate::platform::GICR_STRIDE;
+        let hi = lo + crate::platform::GICR_STRIDE;
+        if lo < gicd_end && gicd < hi {
+            fails += 1;
+            crate::safe_print!(
+                160,
+                "[Test] gicr-device-map: core {} frames [0x{:x},0x{:x}) overlap GICD [0x{:x},0x{:x})\n",
+                core, lo, hi, gicd, gicd_end
+            );
+        }
+    }
+
+    if fails == 0 {
+        crate::safe_print!(
+            160,
+            "[Test] gicr-device-map PASSED ({}: GICR=0x{:x} GICD=0x{:x} cores={})\n",
+            crate::platform::machine::NAME, rd, gicd, cores
+        );
+    } else {
+        crate::safe_print!(64, "[Test] gicr-device-map FAILED ({} cases)\n", fails);
+        panic!("test_gicr_device_map: {fails} cases failed");
+    }
+}
+
 fn test_platform_device_gates() {
     use crate::platform::machine;
 

@@ -598,6 +598,15 @@ pub fn bringup_secondaries() {
         return;
     }
 
+    // Serialize console output from here on, BEFORE the first `CPU_ON`. Doing this
+    // on the BSP rather than in `secondary_entry_shared` is what closes the window
+    // entirely: a secondary that flipped the flag itself would already be racing
+    // the BSP's own bringup prints, which is measurably enough to corrupt one line
+    // ("CPU_ON core 1 (mpi[dSrM=P0x1) -->s ok"). Past this point at least two
+    // cores can reach `emit()`, which is exactly the condition the lock is for.
+    // See `console::set_multicore`.
+    crate::console::set_multicore();
+
     let entry_pa = secondary_entry_shared as *const () as u64;
     // Publish everything the secondaries read (this module's statics, their stacks)
     // before any of them starts executing.

@@ -70,10 +70,12 @@ die() { printf '\033[1;31m[fc-run] %s\033[0m\n' "$*" >&2; exit 1; }
 [ -f "$KERNEL" ] || die "$KERNEL not found — run overlays/devbox-firecracker/build.sh"
 
 if [ "$VCPUS" != "1" ]; then
-  say "WARNING: vcpu_count=$VCPUS. Firecracker places the GIC redistributors at"
-  say "         0x3FFF_0000 - vcpu_count * 0x2_0000, and Akuma's bootstrap device"
-  say "         map assumes one vCPU, so CPU0 will drive another core's frames and"
-  say "         lose its timer interrupt. See docs/reference/firecracker/."
+  say "vcpu_count=$VCPUS: the guest reads its GIC redistributor base from the FDT"
+  say "         (Firecracker places it at 0x3FFF_0000 - vcpu_count * 0x2_0000), so"
+  say "         check the boot log for '[Platform] FDT device map: GICR=' and for"
+  say "         '[SMP-shared] probed $VCPUS core(s)'. If GICR is 0x3ffd0000 with"
+  say "         vcpu_count>1 the FDT parse fell back and the boot core will lose"
+  say "         its timer interrupt. See docs/reference/firecracker/ §3.3."
 fi
 
 # --- where do the guest-visible paths live? -------------------------------------

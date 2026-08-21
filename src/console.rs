@@ -1,7 +1,7 @@
 use crate::alloc::string::ToString;
 use alloc::vec::Vec;
 #[cfg(kernel_console_lock)]
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 #[cfg(kernel_console_lock)]
 use spinning_top::Spinlock;
 
@@ -83,6 +83,50 @@ static CONSOLE_LOCK: Spinlock<()> = Spinlock::new(());
 #[cfg(kernel_console_lock)]
 static CONSOLE_OWNER: AtomicU8 = AtomicU8::new(0);
 
+/// Is there more than one core that could be inside `emit()`?
+///
+/// The lock is compiled in, but acquiring it is gated on this. Both halves of the
+/// gate are correctness, not optimization:
+///
+/// * **Acquiring while single-core can deadlock.** The lock is taken inside
+///   `with_irqs_disabled`, so a print issued from a section that already runs with
+///   preemption disabled spins on a `Spinlock` whose holder may be a thread that
+///   cannot be scheduled. With another core running, that core drains it; with one
+///   core, nothing can, and the kernel wedges with no output. This is why
+///   `platform-firecracker` used to compile the lock out altogether — it was a
+///   single-vCPU target (docs/reference/firecracker/README.md §3.8).
+/// * **Not acquiring while multi-core interleaves bytes.** `with_irqs_disabled`
+///   masks IRQs on the calling core only, so two cores byte-interleave at the
+///   shared PL011 data register (docs/archive/UART_SMP_INTERLEAVE_FIX.md).
+///
+/// Neither condition is known at build time — `vcpu_count`/`SMP=N` is a runtime
+/// choice — so the decision is made here instead. Set once, by the first secondary
+/// to come online; never cleared, because a core that has run could have output
+/// pending anywhere.
+#[cfg(kernel_console_lock)]
+static MULTICORE: AtomicBool = AtomicBool::new(false);
+
+/// Start serializing console output across cores. Called by each secondary as it
+/// comes online, before it can print.
+///
+/// A single line can still interleave at the instant this flips: the BSP may
+/// already be inside `emit()`'s byte loop without the lock. That is one line at
+/// bringup, against the alternative of never locking at all.
+///
+/// `allow(dead_code)`: the only caller is `smp_shared::secondary_entry_shared`,
+/// which is compiled out on single-core targets (the extreme profile).
+#[cfg(kernel_console_lock)]
+#[allow(dead_code)]
+pub fn set_multicore() {
+    MULTICORE.store(true, Ordering::Release);
+}
+
+/// No-op when the lock is compiled out (size/extreme profiles). See above for
+/// why this can be uncalled.
+#[cfg(not(kernel_console_lock))]
+#[allow(dead_code)]
+pub fn set_multicore() {}
+
 // ============================================================================
 // Public API - Safe wrappers around UART operations
 // ============================================================================
@@ -96,7 +140,7 @@ static CONSOLE_OWNER: AtomicU8 = AtomicU8::new(0);
 fn emit(bytes: &[u8]) {
     crate::irq::with_irqs_disabled(|| {
         #[cfg(kernel_console_lock)]
-        {
+        if MULTICORE.load(Ordering::Acquire) {
             let me = akuma_exec::bkl::current_core_id() as u8 + 1;
             if CONSOLE_OWNER.load(Ordering::Relaxed) == me {
                 // Reentrant fast path: panic / sync-exception inside an
@@ -114,8 +158,8 @@ fn emit(bytes: &[u8]) {
             }
             CONSOLE_OWNER.store(0, Ordering::Relaxed);
             drop(_g);
+            return;
         }
-        #[cfg(not(kernel_console_lock))]
         for &b in bytes {
             UART.write(b);
         }

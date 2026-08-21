@@ -556,6 +556,11 @@ akuma-primitives = { path = "crates/akuma-primitives" }
 # `rump` feature needs it directly (akuma-net already pulls it for rump_tap).
 akuma-rump = { path = "crates/akuma-rump", optional = true }
 akuma-isolation = { path = "crates/akuma-isolation" }
+# Machine description read from the FDT at run time. Required, not optional:
+# Firecracker's GIC redistributor base moves with `vcpu_count`, so no
+# compile-time constant can address it (docs/reference/firecracker/README.md
+# §3.3). Platform-neutral — it parses QEMU virt's tree too.
+akuma-firecracker = { path = "crates/akuma-firecracker" }
 talc = "4"
 spinning_top = "0.3"
 fdt = "0.1"

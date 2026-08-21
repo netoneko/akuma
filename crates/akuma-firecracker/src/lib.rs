@@ -172,10 +172,20 @@ pub struct MachineDescription {
     virtio: [Device; MAX_VIRTIO_SLOTS],
     virtio_count: usize,
     virtio_seen: usize,
-    /// `cpu@N` nodes present. Firecracker lists only `cpu@0` regardless of
-    /// `vcpu_count` — secondaries are powered off awaiting PSCI — so this is a
-    /// count of *described* CPUs, not of configured ones. Do not derive the
-    /// redistributor span from it; read [`Gic::redistributors`].
+    /// `cpu@N` nodes present.
+    ///
+    /// Both machines describe **every** configured CPU: the measured sweep has
+    /// 1/2/4/8 `cpu@N` nodes for `vcpu_count` 1/2/4/8
+    /// (`docs/reference/firecracker/fdt/`). Being *described* is not being
+    /// *running* — Firecracker's secondaries are powered off awaiting a PSCI
+    /// `CPU_ON` — so this counts configured CPUs, not online ones.
+    ///
+    /// Do not derive the redistributor span from it. `cpu_count * 0x2_0000`
+    /// happens to equal that span on Firecracker, so code that computed it would
+    /// pass every test here and still be an address inferred from an unrelated
+    /// property — the same mistake as the compile-time literal. Read
+    /// [`Gic::redistributors`], which this crate takes from `intc`'s second `reg`
+    /// entry.
     pub cpu_count: usize,
     /// `totalsize` from the FDT header.
     pub fdt_size: usize,

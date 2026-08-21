@@ -250,3 +250,130 @@ pub fn gicd_base_pa() -> usize {
         .find(|r| r.va == addr::DEV_GIC_DIST_VA)
         .map_or(machine::GICD_PA, |r| r.pa)
 }
+
+/// Outcome of refining the device map from the machine's own device tree.
+///
+/// Reported rather than returned as a bare `bool` because the interesting cases
+/// are not "worked / did not work": a machine whose FDT is unreadable still boots
+/// on the bootstrap map, and on QEMU virt that map is *correct*, so a failure
+/// here is only fatal on Firecracker with more than one vCPU. The caller prints
+/// this; it is the only evidence of which map the GIC is about to be configured
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdtMapOutcome {
+    /// The map now reflects the FDT. Carries the redistributor base actually
+    /// installed, because that is the value `vcpu_count > 1` turns on.
+    Installed { gicr_pa: usize, moved: bool },
+    /// No FDT at the pointer, or it did not parse. Bootstrap map retained.
+    NoFdt,
+    /// The FDT parsed but does not describe what the kernel needs. Bootstrap map
+    /// retained.
+    Rejected(akuma_firecracker::Error),
+}
+
+/// Replace the bootstrap device map with one derived from the FDT.
+///
+/// # Why this exists
+///
+/// [`machine::GICR_PA`] is the single-vCPU literal. Firecracker stacks the
+/// redistributors *downward* from the distributor, so CPU0's frames sit at
+/// `GICD - vcpu_count * 0x2_0000` and move every time the microVM is configured
+/// with a different vCPU count. Booting `SMP=2` against the 1-vCPU literal points
+/// the boot core at CPU1's redistributor: it clears the wrong `GICR_WAKER` (a
+/// per-PE register, so its own stays asleep) and enables the virtual timer on the
+/// wrong frame — losing its scheduler tick with no build or boot error. See
+/// `docs/reference/firecracker/README.md` §3.3.
+///
+/// # Ordering
+///
+/// Call **after** `mmu::ensure_boot_identity_covers(dtb_ptr)` — the FDT can sit
+/// outside `boot.rs`'s static identity map — and **before** `gic::init()`, which
+/// is the first thing to touch a GIC register. The caller must rebuild the boot
+/// device L3 afterwards; this function only installs the table.
+///
+/// Platform-neutral: it parses QEMU virt's tree too, where it re-derives the same
+/// addresses the literals already held. That is deliberate — one code path, and
+/// the QEMU boot is what proves the parse against a machine whose answers are
+/// independently known.
+///
+/// # Safety
+///
+/// `dtb_ptr` must be zero or point at a mapped, complete FDT blob.
+#[must_use]
+pub unsafe fn install_fdt_device_map(dtb_ptr: usize) -> FdtMapOutcome {
+    if dtb_ptr == 0 {
+        return FdtMapOutcome::NoFdt;
+    }
+    // SAFETY: the caller guarantees `dtb_ptr` is mapped and holds a complete FDT.
+    let desc = match unsafe { akuma_firecracker::describe_ptr(dtb_ptr as *const u8) } {
+        Ok(d) => d,
+        Err(akuma_firecracker::Error::BadFdt) => return FdtMapOutcome::NoFdt,
+        Err(e) => return FdtMapOutcome::Rejected(e),
+    };
+
+    // The redistributor is the whole point: refuse to install a map without one
+    // rather than silently keeping the literal, which is what §3.3 punishes.
+    let Some(redist) = desc.gic.redistributors else {
+        return FdtMapOutcome::Rejected(akuma_firecracker::Error::BadInterruptController);
+    };
+
+    let mut out = [DevRegion { va: 0, pa: 0, size: 0 }; mmu::MAX_DEV_REGIONS];
+    let mut n = 0;
+    let mut push = |va: usize, pa: usize, size: usize| {
+        if n < mmu::MAX_DEV_REGIONS {
+            out[n] = DevRegion { va, pa, size };
+            n += 1;
+        }
+    };
+
+    let gicd_pa = desc.gic.distributor.base as usize;
+    push(addr::DEV_GIC_DIST_VA, gicd_pa, addr::DEV_GIC_DIST_SIZE);
+    // GICv3 has no memory-mapped CPU interface — the FDT's second `reg` entry is
+    // the redistributor, not a GICC. Point the VA at the distributor so it is
+    // never a dangling translation; nothing reads it under GICv3.
+    push(addr::DEV_GIC_CPU_VA, gicd_pa, 0x1000);
+
+    let uart_pa = desc.uart.map_or(machine::UART_PA, |u| u.region.base as usize);
+    push(addr::DEV_UART_VA, uart_pa, 0x1000);
+    if let Some(fw_cfg) = machine::FW_CFG_PA {
+        // Not described by either tree in a form this crate reads; the literal is
+        // the only source, and it is QEMU-only.
+        push(addr::DEV_FW_CFG_VA, fw_cfg, 0x1000);
+    }
+
+    // Only CPU0's two frames are mapped through the L0[1] device window. That is
+    // not an oversight: secondaries reach their own redistributor by physical
+    // address through the low identity block during bringup
+    // (`smp_shared::secondary_gic_init`), so per-core VAs would be unused.
+    let gicr_pa = redist.base as usize;
+    push(addr::DEV_GICR_RD_VA, gicr_pa, 0x1000);
+    push(addr::DEV_GICR_SGI_VA, gicr_pa + GICR_SGI_OFFSET, 0x1000);
+
+    let slots = desc.virtio_slots();
+    let (virtio_pa, stride) = match slots {
+        [] => (machine::VIRTIO_PA, machine::VIRTIO_STRIDE),
+        [only] => (only.region.base as usize, machine::VIRTIO_STRIDE),
+        [first, second, ..] => (
+            first.region.base as usize,
+            (second.region.base - first.region.base) as usize,
+        ),
+    };
+    let span = fdt_virtio_window_bytes(stride, slots.len().max(1));
+    push(addr::DEV_VIRTIO_VA, virtio_pa, span);
+
+    mmu::set_device_map(&out[..n]);
+    // Geometry must match the map the probe will walk. Cap the slot count at what
+    // fits the reserved VA span, so a machine advertising 32 slots (QEMU virt)
+    // cannot make the probe walk past the mapping.
+    let slot_cap = if stride == 0 { 1 } else { addr::DEV_VIRTIO_SIZE / stride };
+    addr::set_virtio_geometry(stride, slots.len().clamp(1, slot_cap.max(1)));
+
+    FdtMapOutcome::Installed { gicr_pa, moved: gicr_pa != machine::GICR_PA }
+}
+
+/// Bytes of VA a discovered virtio slot array needs, clamped to the reserved span.
+const fn fdt_virtio_window_bytes(stride: usize, slots: usize) -> usize {
+    let span = slots * stride;
+    let rounded = (span + 0xFFF) & !0xFFF;
+    if rounded > addr::DEV_VIRTIO_SIZE { addr::DEV_VIRTIO_SIZE } else { rounded }
+}
