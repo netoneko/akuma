@@ -3,9 +3,11 @@
 Akuma as a Firecracker microVM. The sibling of `overlays/devbox-smoltcp` (QEMU,
 smoltcp, real SMP) and `overlays/devbox` (QEMU, rump).
 
-**Status: mostly working at 1 vCPU.** Boots, mounts its ext2 root, runs the boot
-suite and executes userspace processes. Networking is wired but unverified, so
-sshd has not been reached yet. `--vcpus 1` only — see §4.
+**Status: everything but inbound packets, at 1 vCPU.** Boots, mounts its ext2
+root (including the 6 GB devbox image), passes the boot suite 290/0/0, runs
+userspace, and starts `/bin/sshd` under herd. Outbound networking works and is
+correct on the wire. **Inbound (RX) does not**, so SSH is not reachable yet —
+see §4. `--vcpus 1` only.
 
 - Procedure: `docs/runbooks/run-on-firecracker.md`
 - Platform invariants and constants: `docs/reference/firecracker/`
@@ -31,7 +33,13 @@ overlays/devbox-firecracker/run.sh            # add --local on metal
 ```
 
 `run.sh --help` lists `--no-disk`, `--no-net`, `--vcpus`, `--mem`,
-`--interactive`, `--timeout`.
+`--interactive`, `--timeout`. Build a devbox-shaped image (userspace sshd via
+herd, boot suite skipped) with
+`FC_FEATURES=devbox-smoltcp,no-tests overlays/devbox-firecracker/build.sh`.
+
+SSH is forwarded on host port **4444**, deliberately not 2222: QEMU's devbox
+runner uses that, and Lima forwards guest listeners to the host, so both would
+claim it — `localhost:2222` then silently resolves to whichever bound first.
 
 ## 1. Why there is no QEMU here
 
@@ -71,9 +79,13 @@ mapping is written up in `docs/reference/firecracker/disk-and-volumes.md`.
   so anything more makes the boot core drive another core's redistributor and
   silently lose its timer. The FDT-derived device map that fixes this is not
   implemented.
-- **Networking unverified.** The tap + dnsmasq host side is scripted and the
-  guest-side INTID base is correct, but no DHCP lease has been observed yet.
-- **No sshd yet** — waiting on networking.
+- **Inbound (RX) never reaches the guest.** TX is correct — dnsmasq answers
+  `DHCPOFFER` — but no `DHCPREQUEST` follows and host ARP goes unanswered. A
+  receive buffer *is* posted; the device still never fills it. The only thing
+  between here and SSH. `docs/archive/AKUMA_FIRECRACKER_KVM.md` §5.1.
+- **sshd runs but is unreachable**, for the reason above.
+- **Requires `virtio-drivers` 0.13+.** 0.7.5 gets the virtio-net header size
+  wrong under `VERSION_1` and shifts every frame two bytes.
 - `run.sh` always attaches `"entropy": {}`. Without a virtio-rng device three
   boot-suite tests fail on `getrandom` returning `EIO`; QEMU's runner always
   provides one, so its absence looks like a kernel bug.

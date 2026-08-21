@@ -70,6 +70,27 @@ const SOCKET_SOFT_CAP_START: usize = if MAX_SOCKETS < 128 { MAX_SOCKETS } else {
 // Reduced from 64KB to 16KB per direction to save heap memory.
 // 40 sockets × 32KB = 1.25MB vs 40 × 128KB = 5MB.
 // 16KB is still plenty for TLS handshakes and HTTP requests.
+/// RX-path counters. Plain atomics rather than log statements on purpose: this
+/// path runs inside the `NETWORK` critical section with preemption disabled, where
+/// console I/O can deadlock (see `poll()`). Read them with [`rx_counters`].
+static RX_BUFFERS_POSTED: AtomicUsize = AtomicUsize::new(0);
+static RX_BEGIN_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static RX_FRAMES_RECEIVED: AtomicUsize = AtomicUsize::new(0);
+
+/// `(buffers posted, receive_begin failures, frames received)`.
+///
+/// A receive path that posts buffers but never receives a frame is otherwise
+/// invisible: the device has nowhere to put frames, drops them all, and it reads
+/// as "the network is down" rather than "nothing consumed our buffer".
+#[must_use]
+pub fn rx_counters() -> (usize, usize, usize) {
+    (
+        RX_BUFFERS_POSTED.load(Ordering::Relaxed),
+        RX_BEGIN_FAILURES.load(Ordering::Relaxed),
+        RX_FRAMES_RECEIVED.load(Ordering::Relaxed),
+    )
+}
+
 const TCP_RX_BUFFER_SIZE: usize = 16384;
 const TCP_TX_BUFFER_SIZE: usize = 16384;
 const EPHEMERAL_PORT_START: u16 = 49152;
@@ -475,13 +496,21 @@ impl VirtioSmoltcpDevice {
             // Phase 1: ensure a receive buffer is posted to the device.
             if self.rx_token.is_none() {
                 let t = nicstat::start();
-                match unsafe { self.inner.receive_begin(&mut self.rx_buffer) } {
-                    Ok(token) => {
-                        nicstat::record_rx_begin(t);
-                        self.rx_token = Some(token);
-                    }
-                    Err(_) => return None,
-                }
+                // NOTE: do not log from here. `Device::receive` is called by
+                // `iface.poll()` from inside the `NETWORK` critical section, which
+                // runs with preemption disabled — see the comment above the
+                // deferred `DhcpReport` emission in `poll()`. A print here spins on
+                // `CONSOLE_LOCK`, and on a single-vCPU guest a holder that has been
+                // preempted can never run to release it. Counters
+                // (`RX_BUFFERS_POSTED` below) are safe; console I/O is not.
+                let Ok(token) = (unsafe { self.inner.receive_begin(&mut self.rx_buffer) })
+                else {
+                    RX_BEGIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                };
+                nicstat::record_rx_begin(t);
+                self.rx_token = Some(token);
+                RX_BUFFERS_POSTED.fetch_add(1, Ordering::Relaxed);
             }
             // Phase 2: has the device filled it?
             if self.inner.poll_receive().is_some() {
@@ -500,6 +529,7 @@ impl VirtioSmoltcpDevice {
                         return None;
                     }
                     nicstat::record_rx_packet(t, pkt_len);
+                    RX_FRAMES_RECEIVED.fetch_add(1, Ordering::Relaxed);
                     return Some((
                         unsafe { self.rx_buffer.as_mut_ptr().add(hdr_len) },
                         pkt_len,
@@ -938,13 +968,13 @@ impl smoltcp::phy::TxToken for LoopbackAwareTxToken<'_> {
 
 #[allow(clippy::cast_possible_wrap)]
 pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
-    log::info!("[SmolNet] Initializing network stack...");
+    crate::safe_print!(64, "[SmolNet] Initializing network stack...\n");
     DHCP_ENABLED.store(enable_dhcp, Ordering::Relaxed);
 
     let mut found_device: Option<VirtIONetRaw<VirtioHal, VirtioTransport, 16>> = None;
 
     if let Some((i, transport)) = akuma_virtio::probe::probe(akuma_virtio::device_id::NET) {
-        log::info!("[SmolNet] Found virtio-net at slot {i}");
+        crate::safe_print!(64, "[SmolNet] Found virtio-net at slot {i}\n");
         if let Ok(dev) = VirtIONetRaw::new(transport) {
             // Record the slot and its MMIO base for the IRQ handler before the
             // device is moved into `NETWORK` — afterwards it is only reachable
@@ -959,7 +989,8 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
         VirtioSmoltcpDevice::new(found_device.ok_or("No virtio-net device found")?)
     );
     let mac = device.mac_address();
-    log::info!(
+    crate::safe_print!(
+        96,
         "[SmolNet] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
@@ -978,10 +1009,10 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
     // mode (no static fallback address; DHCP still runs). Log and continue.
     iface.update_ip_addrs(|ip_addrs| {
         if ip_addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).is_err() {
-            log::error!("[SmolNet] could not add static IPv4 address: list full");
+            crate::safe_print!(80, "[SmolNet] could not add static IPv4 address: list full\n");
         }
         if ip_addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).is_err() {
-            log::error!("[SmolNet] could not add loopback address: list full");
+            crate::safe_print!(80, "[SmolNet] could not add loopback address: list full\n");
         }
     });
     if iface
@@ -989,13 +1020,13 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
         .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2))
         .is_err()
     {
-        log::error!("[SmolNet] could not add default IPv4 route: table full");
+        crate::safe_print!(80, "[SmolNet] could not add default IPv4 route: table full\n");
     }
 
     let mut sockets = unsafe { SocketSet::new(&mut SOCKET_STORAGE[..]) };
 
     let dhcp_handle = if enable_dhcp {
-        log::info!("[SmolNet] DHCP enabled");
+        crate::safe_print!(32, "[SmolNet] DHCP enabled\n");
         let dhcp_socket = dhcpv4::Socket::new();
         SOCKETS_LIVE.fetch_add(1, Ordering::Relaxed);
         Some(sockets.add(dhcp_socket))
@@ -1007,7 +1038,7 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
     let dns_socket = dns::Socket::new(dns_servers, vec![]);
     SOCKETS_LIVE.fetch_add(1, Ordering::Relaxed);
     let dns_handle = sockets.add(dns_socket);
-    log::info!("[SmolNet] DNS socket initialized (server: 10.0.2.3)");
+    crate::safe_print!(64, "[SmolNet] DNS socket initialized (server: 10.0.2.3)\n");
 
     *NETWORK.lock() = Some(NetworkState {
         iface,
@@ -1020,7 +1051,7 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
     });
 
     NETWORK_READY.store(true, Ordering::Release);
-    log::info!("[SmolNet] Initialized successfully (VirtIO + Loopback)");
+    crate::safe_print!(64, "[SmolNet] Initialized successfully (VirtIO + Loopback)\n");
     Ok(())
 }
 
@@ -1028,10 +1059,28 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
 // Public API
 // ============================================================================
 
+/// What the DHCP socket reported during a `poll()`, recorded inside the
+/// `NETWORK` critical section and logged **after** it is released.
+///
+/// Logging from inside that section is a deadlock: `poll()` holds a `Spinlock`
+/// with preemption disabled, and the console takes `CONSOLE_LOCK` — establishing
+/// a NETWORK -> CONSOLE order that any CONSOLE -> NETWORK path (or a print from
+/// IRQ context) closes into a cycle. These log statements were harmless for years
+/// because `akuma-net` built with `log`'s `max_level_off`, which compiled them
+/// out entirely; they became real console I/O the moment a sink was installed.
+#[derive(Copy, Clone)]
+enum DhcpReport {
+    Configured { addr: smoltcp::wire::Ipv4Cidr, addr_full: bool, loopback_full: bool },
+    Deconfigured { fallback_full: bool, loopback_full: bool },
+}
+
 #[allow(clippy::cast_possible_wrap)]
 pub fn poll() -> bool {
     POLL_ENTERED.fetch_add(1, Ordering::Relaxed);
     let poll_t = nicstat::start();
+    // Filled inside the critical section, emitted once it has been released.
+    let mut dhcp_report: Option<DhcpReport> = None;
+    let mut corrupt_handles: u32 = 0;
     let socket_state_changed = {
         // Hold preemption disabled for the whole NETWORK critical section so the
         // spinlock is never stranded across a context switch (fatal under the
@@ -1057,38 +1106,45 @@ pub fn poll() -> bool {
                 if let Some(event) = event {
                     match event {
                         dhcpv4::Event::Configured(config) => {
-                            log::info!("[SmolNet] DHCP configured");
                             // `addrs` was just cleared, so these cannot fail —
                             // but panicking here would kill the kernel over a
-                            // DHCP lease, so degrade instead.
+                            // DHCP lease, so degrade instead. Failures are
+                            // recorded and reported outside the lock.
+                            let mut addr_full = false;
+                            let mut loopback_full = false;
                             net.iface.update_ip_addrs(|addrs| {
                                 addrs.clear();
-                                if addrs.push(IpCidr::Ipv4(config.address)).is_err() {
-                                    log::error!("[SmolNet] could not install DHCP address");
-                                }
-                                if addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).is_err() {
-                                    log::error!("[SmolNet] could not install loopback address");
-                                }
+                                addr_full = addrs.push(IpCidr::Ipv4(config.address)).is_err();
+                                loopback_full = addrs
+                                    .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
+                                    .is_err();
+                            });
+                            dhcp_report = Some(DhcpReport::Configured {
+                                addr: config.address,
+                                addr_full,
+                                loopback_full,
                             });
                             if let Some(router) = config.router {
                                 let _ = net.iface.routes_mut().add_default_ipv4_route(router);
                             }
 
-                            log::info!("[SmolNet] IP: {}", config.address);
                             DHCP_CONFIGURED.store(true, Ordering::Release);
                         }
                         dhcpv4::Event::Deconfigured => {
                             DHCP_CONFIGURED.store(false, Ordering::Release);
-                            log::info!("[SmolNet] DHCP deconfigured - reverting to static fallback");
+                            let mut fallback_full = false;
+                            let mut loopback_full = false;
                             net.iface.update_ip_addrs(|addrs| {
                                 addrs.clear();
-                                if addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).is_err() {
-                                    log::error!("[SmolNet] could not install static fallback address");
-                                }
-                                if addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).is_err() {
-                                    log::error!("[SmolNet] could not install loopback address");
-                                }
+                                fallback_full = addrs
+                                    .push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24))
+                                    .is_err();
+                                loopback_full = addrs
+                                    .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
+                                    .is_err();
                             });
+                            dhcp_report =
+                                Some(DhcpReport::Deconfigured { fallback_full, loopback_full });
                             let _ = net.iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2));
                         }
                     }
@@ -1129,7 +1185,7 @@ pub fn poll() -> bool {
             while i < net.pending_removal.len() {
                 let (handle, added_at) = net.pending_removal[i];
                 if !is_valid_handle(handle) {
-                    log::warn!("[NET] CORRUPT HANDLE in poll GC: handle={handle}");
+                    corrupt_handles = corrupt_handles.saturating_add(1);
                     net.pending_removal.swap_remove(i);
                     continue;
                 }
@@ -1203,6 +1259,36 @@ pub fn poll() -> bool {
     // NETWORK lock is released here — safe to acquire SOCKET_TABLE.
     // Acquiring SOCKET_TABLE while holding NETWORK causes AB-BA deadlock
     // with socket_can_recv_tcp et al. which hold SOCKET_TABLE→NETWORK.
+    //
+    // The console is the same hazard and belongs in the same paragraph: printing
+    // takes `CONSOLE_LOCK`, so a `log::` call inside the section above would
+    // establish NETWORK -> CONSOLE. Everything recorded in there is emitted here
+    // instead. See `DhcpReport`.
+    match dhcp_report {
+        Some(DhcpReport::Configured { addr, addr_full, loopback_full }) => {
+            crate::safe_print!(32, "[SmolNet] DHCP configured\n");
+            if addr_full {
+                crate::safe_print!(80, "[SmolNet] could not install DHCP address: list full\n");
+            }
+            if loopback_full {
+                crate::safe_print!(80, "[SmolNet] could not install loopback address: list full\n");
+            }
+            crate::safe_print!(64, "[SmolNet] IP: {addr}\n");
+        }
+        Some(DhcpReport::Deconfigured { fallback_full, loopback_full }) => {
+            crate::safe_print!(80, "[SmolNet] DHCP deconfigured - reverting to static fallback\n");
+            if fallback_full {
+                crate::safe_print!(88, "[SmolNet] could not install static fallback address: list full\n");
+            }
+            if loopback_full {
+                crate::safe_print!(80, "[SmolNet] could not install loopback address: list full\n");
+            }
+        }
+        None => {}
+    }
+    if corrupt_handles > 0 {
+        crate::safe_print!(72, "[NET] {corrupt_handles} corrupt handle(s) dropped in poll GC\n");
+    }
 
     if socket_state_changed {
         // Walks EVERY socket slot (MAX_SOCKETS) taking each one's waker lock,
@@ -1639,7 +1725,7 @@ pub fn note_connect_started(handle: SocketHandle) {
 
 pub fn socket_close(handle: SocketHandle) {
     if !is_valid_handle(handle) {
-        log::warn!("[NET] CORRUPT HANDLE in socket_close: handle={handle}");
+        crate::safe_print!(72, "[NET] CORRUPT HANDLE in socket_close: handle={handle}\n");
         return;
     }
     with_network(|net| {
@@ -1715,8 +1801,9 @@ impl embedded_io_async::Read for TcpStream {
             // async state machine could overwrite handle_index with garbage;
             // catch it here instead of panicking inside smoltcp's get_mut.
             if self.handle_index >= MAX_SOCKETS {
-                log::warn!(
-                    "[NET] CORRUPT HANDLE in TcpStream::read: index={}, handle={}",
+                crate::safe_print!(
+                    96,
+                    "[NET] CORRUPT HANDLE in TcpStream::read: index={}, handle={}\n",
                     self.handle_index,
                     self.handle
                 );
@@ -1747,8 +1834,9 @@ impl embedded_io_async::Write for TcpStream {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         core::future::poll_fn(|cx| {
             if self.handle_index >= MAX_SOCKETS {
-                log::warn!(
-                    "[NET] CORRUPT HANDLE in TcpStream::write: index={}, handle={}",
+                crate::safe_print!(
+                    96,
+                    "[NET] CORRUPT HANDLE in TcpStream::write: index={}, handle={}\n",
                     self.handle_index,
                     self.handle
                 );
@@ -1773,8 +1861,9 @@ impl embedded_io_async::Write for TcpStream {
     async fn flush(&mut self) -> Result<(), Self::Error> {
         core::future::poll_fn(|cx| {
             if self.handle_index >= MAX_SOCKETS {
-                log::warn!(
-                    "[NET] CORRUPT HANDLE in TcpStream::flush: index={}, handle={}",
+                crate::safe_print!(
+                    96,
+                    "[NET] CORRUPT HANDLE in TcpStream::flush: index={}, handle={}\n",
                     self.handle_index,
                     self.handle
                 );

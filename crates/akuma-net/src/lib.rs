@@ -7,6 +7,14 @@ pub mod runtime;
 // The native smoltcp stack + the smoltcp-coupled protocol modules. Optional so a
 // rump-only build (devbox) compiles them out; the rump path below is smoltcp-free.
 #[cfg(feature = "smoltcp")]
+/// Re-exported so `crate::safe_print!(…)` resolves here as it does in
+/// `akuma-virtio`. This crate prints with `safe_print!` rather than `log::`:
+/// the `log` dependency exists for **smoltcp**, and it is deliberately built
+/// with `max_level_off` so smoltcp's per-packet tracing compiles out entirely.
+/// Routing our own messages through the same facade would either resurrect that
+/// tracing or make our messages disappear with it.
+pub use akuma_primitives::safe_print;
+
 pub mod smoltcp_net;
 // Static RX/TX frame rings backing the async transmit path. Only meaningful
 // with the smoltcp device, and only compiled when `net-noalloc` selects it.

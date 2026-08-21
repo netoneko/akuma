@@ -2,9 +2,13 @@
 
 **Date:** 2026-08-21
 **Result:** Akuma boots on Firecracker v1.16.1 under KVM on an Apple M4 Pro, mounts
-its ext2 root, runs the boot suite, and executes userspace processes. Seven bugs
-were fixed getting there; **six of the seven were the same mistake** — trusting a
-value that only QEMU happened to provide (§3).
+its ext2 root (both `disk.img` and the 6 GB devbox image), runs the boot suite at
+**290 PASSED / 0 FAILED / 0 POISON**, executes userspace processes, and starts
+`/bin/sshd` under herd. Outbound networking works and is well-formed on the wire;
+**inbound (RX) does not**, so SSH is not yet reachable (§5.1).
+
+Nine bugs fixed getting there. **Eight of the nine were the same mistake** —
+trusting a value that only QEMU happened to provide (§3).
 **Reproduce:** `docs/runbooks/run-on-firecracker.md`
 **Design:** `proposals/FIRECRACKER_PORT.md`
 
@@ -293,33 +297,103 @@ SA0 exposed *something*; clearing it restores QEMU's behaviour rather than
 proving the stack is 16-byte aligned. If it is not, that is a latent ABI bug and
 SA0 could then be enabled deliberately as a guard. Worth a look.
 
-## 4. What the port actually needed
+### 3.9 The virtio-net header is 12 bytes under `VERSION_1`, not 10
 
-Smaller than the survey estimated, because the structural decision paid off.
-`src/platform.rs` is the only file describing either machine.
+The one that blocked networking, and the one where guessing would have wasted the
+most time. Symptoms:
 
-| Change | Where |
-|---|---|
-| Machine descriptions (both) | `src/platform.rs` (new) |
-| Device VAs become spans; GICD gets 64 KiB | `crates/akuma-primitives/src/addr.rs` |
-| `DEV_PAGES` const → runtime `DevRegion` map | `crates/akuma-exec/src/mmu/mod.rs` |
-| Boot asm maps **only** the UART | `src/boot.rs` |
-| L1[1] Normal vs Device, per machine | `src/boot.rs` (assembler `.if`) |
-| virtio stride/count become runtime | `akuma-primitives`, `akuma-virtio` |
-| Spec-ordered virtio status handshake | `crates/akuma-virtio/src/transport.rs` (new) |
-| `SCTLR_EL1` SA/SA0 forced off | `src/boot.rs`, `src/smp_shared.rs` |
-| Runtime kernel-text window | `crates/akuma-exec/src/mmu/mod.rs` |
-| virtio INTID base 48 → 32 | `src/main.rs` |
-| Kernel base via linker `--defsym` | `build.rs`, `linker.ld`, `src/config.rs` |
-| `platform-firecracker` feature | `Cargo.toml` |
+- `[SmolNet] DHCP deconfigured - reverting to static fallback`, forever.
+- The KVM host could not reach the guest: `ping` 100% loss, TCP connect
+  `No route to host` — ARP unanswered.
+- `dnsmasq` logged **zero** DHCP packets, despite tap0 showing guest→host traffic.
+- tap0: `RX: 11 packets, 11 dropped`. The host received our frames and discarded
+  every one.
 
-The boot assembly maps one page — the console — because that is the only device
-whose address *can* be a compile-time literal. Everything else is installed from
-Rust by `mmu::rebuild_boot_device_table` before the first GIC or virtio access.
-That structure is what made the Firecracker arm mostly a table of constants.
+3322 bytes / 11 packets ≈ 302, which is DHCP-DISCOVER sized — so Akuma *was*
+building and sending DHCP correctly. A well-formed broadcast does not get dropped
+by a host with dnsmasq bound to that interface, so the frames had to be malformed.
 
-**No regression on QEMU**: `cargo run --release` still boots to 289 PASSED /
-0 FAILED with `[Platform] qemu-virt device map installed`.
+`tcpdump -i tap0 -XX` settled it in one frame:
+
+```
+ethertype Unknown (0x4500), length 302
+0x0000:  ffff ffff 02fc 0000 0001 0800 4500 0122
+```
+
+Read the bytes: `ff ff ff ff | 02 fc 00 00 00 01 | 08 00 | 45 00 ...` — a
+broadcast MAC with only **four** `ff` bytes instead of six, then our real MAC,
+then the ethertype, then the IPv4 header. The frame is shifted **two bytes left**:
+the device consumed two more bytes as virtio-net header than the driver wrote.
+
+Cause, in `virtio-drivers` 0.7.5 (`src/device/net/mod.rs`):
+
+```rust
+pub struct VirtioNetHdr {
+    flags, gso_type, hdr_len, gso_size, csum_start, csum_offset,   // = 10 bytes
+    // num_buffers: u16, // only available when the feature MRG_RXBUF is negotiated.
+}
+```
+
+That is the **legacy** rule. Under `VIRTIO_F_VERSION_1` — which Firecracker
+mandates, and which the boot log confirms
+(`negotiated_features Features(MAC | VERSION_1 | ...)`) — `num_buffers` is
+unconditional and the header is 12 bytes (`virtio_net_hdr_v1`). Firecracker sizes
+it by `VERSION_1`; QEMU sizes it by `MRG_RXBUF`, which was not negotiated, so QEMU
+wanted 10 and worked by coincidence.
+
+**Fixed by bumping `virtio-drivers` 0.7.5 → 0.13.0**, where upstream had already
+split the two (`VirtioNetHdrLegacy` at 10 bytes, `VirtioNetHdr` with
+`num_buffers` at 12) and selects by negotiated features. After the bump the wire
+is correct:
+
+```
+02:fc:00:00:00:01 > ff:ff:ff:ff:ff:ff, ethertype IPv4 (0x0800), length 304:
+  0.0.0.0.68 > 255.255.255.255.67: BOOTP/DHCP, Request from 02:fc:00:00:00:01
+```
+
+and dnsmasq answers `DHCPOFFER`. `0 packets dropped by kernel`.
+
+The bump cost ~9 mechanical errors, all in `akuma-virtio`: `MmioTransport` gained
+a lifetime, `config_space` split into `read_config_space`/`write_config_space`/
+`read_config_generation`, `ack_interrupt` returns `InterruptStatus`, `PhysAddr`
+became `u64`, and `MmioTransport::new` takes an `mmio_size` — which is exactly the
+runtime slot stride the device map already tracks. QEMU verified unaffected: boot
+suite 289/0/0 **and** a real SSH session into the devbox.
+
+### 3.10 The FDT can sit above the boot identity map
+
+A 4 GB microVM has RAM at `0x8020_0000..0x1_8020_0000`, so Firecracker places the
+FDT at roughly **6 GiB**. `boot.rs` statically maps `[0, 3 GiB)`. Reading `x0`
+therefore faulted before the kernel printed one word about memory — the boot
+stopped dead after `WARNING: Kernel is within 4MB of stack!`.
+
+`extend_boot_ram_identity_map` cannot help: it needs the RAM size, which is what
+the FDT is being read to discover. Fixed with
+`mmu::ensure_boot_identity_covers(dtb_ptr)`, called immediately before
+`detect_memory`, which maps the single 1 GiB block containing the FDT. Only that
+block, deliberately — mapping the whole L1 as Normal memory would invite
+speculative access to addresses with no backing store.
+
+Invisible on QEMU at any RAM size, because the DTB goes right after the kernel.
+
+### 3.11 Not a bug: two hypervisors fighting over host port 2222
+
+Recorded because it burned real time and looked exactly like a regression. QEMU's
+devbox runner forwards host `:2222`, and Lima **auto-forwards guest listening
+sockets to the host** — so the `socat` set up to reach the microVM's sshd also
+claimed `:2222`:
+
+```
+limactl    127.0.0.1:2222 (LISTEN)
+qemu-syst  *:2222         (LISTEN)
+```
+
+`127.0.0.1` beats `*` for specificity, so `ssh -p 2222 localhost` went to Lima →
+socat → a Firecracker microVM that was no longer running. Presented as
+`Connection closed by 127.0.0.1 port 2222`, then as `rc=255` with **empty
+stderr** — which reads as "networking is broken" rather than "you have two
+listeners". The Firecracker forward now lives on **4444**
+(`overlays/devbox-firecracker/guest-setup.sh`).
 
 ### 3.8 virtio-rng is not optional
 
@@ -348,117 +422,193 @@ Device slot order follows Firecracker's device-creation order, which is the orde
 of the config: block at slot 0, net at slot 1, rng at slot 2. `[Net] virtio-net
 IRQ: slot 1 -> INTID 33` confirms `VIRTIO_INTID_BASE = 32` is right — 32 + slot 1.
 
-## 5. Open
+### 3.12 Printing from a preemption-disabled section wedges a single-vCPU guest
 
-### 5.1 `akuma_net::init` hangs, nondeterministically
-
-The current frontier. One run reached `Herd started`; subsequent runs of the
-**same binary** freeze inside `akuma_net::init`, before `main.rs` prints
-`[Net] virtio-net IRQ: ...`, spinning at ~96% CPU.
-
-Evidence gathered:
-
-- Not output buffering — reproduced with `stdbuf -o0`; the log stops at exactly
-  3402 lines and stays there for minutes.
-- `tcpdump -i tap0` captures **nothing** during a hung run: the guest never
-  transmits. The `RX: 11 packets / 11 dropped` on tap0 is cumulative from the one
-  run that got through, not from the hung one.
-- dnsmasq logs zero `DHCPDISCOVER`, consistent with "never transmitted".
-- tap0 is `UP,LOWER_UP`, so Firecracker did open it.
-
-**The immediate obstacle is observability, not the bug itself.** Every progress
-message in `smoltcp_net::init` is a `log::info!`, and there is **no `set_logger`
-anywhere in the tree** — so all of them compile to nothing. The function is
-silent between `--- Network Initialization ---` and the `safe_print!` that follows
-it in `main.rs`, which is precisely the interval that hangs.
-
-**Resolved the observability half.** `src/klog.rs` now installs a heap-free
-`log::Log` sink (formats into a `StackWriter<256>`, per the `CLAUDE.md` console
-rule), and `akuma-net`'s `log` dependency no longer carries `max_level_off` —
-that feature elides the macros at *compile* time, so a sink alone would have
-changed nothing. `smoltcp_net::init` now reports:
-
-```
-[I] [SmolNet] Initializing network stack...
-[I] [SmolNet] Found virtio-net at slot 1
-[I] negotiated_features Features(MAC | RING_EVENT_IDX)
-[I] [SmolNet] MAC: 02:fc:00:00:00:01
-[I] [SmolNet] DHCP enabled
-[I] [SmolNet] Initialized successfully (VirtIO + Loopback)
-[I] [SmolNet] DHCP deconfigured - reverting to static fallback
-```
-
-So with logging on, that run went **all the way to `Herd started`** — the hang is
-nondeterministic, not a fixed wall. Two things are now known:
-
-- **DHCP never completes**; the stack falls back to the static `10.0.2.15/24`
-  via `10.0.2.2`. dnsmasq logs zero `DHCPDISCOVER`.
-- **The guest is unreachable at the static address**: `ping 10.0.2.15` from the
-  KVM host gets 100% loss and a TCP connect returns `No route to host`, i.e. ARP
-  goes unanswered. tap0 shows host→guest frames dropped, so the guest's RX queue
-  is not being consumed.
-
-**Ruled out:** `RING_EVENT_IDX`. It *is* negotiated, and a driver that advertised
-it without implementing it would produce exactly these lost-notification
-symptoms — but `virtio-drivers`' net driver does pass
-`negotiated_features.contains(Features::RING_EVENT_IDX)` into both its transmit
-and receive `VirtQueue::new` calls (`src/device/net/dev_raw.rs:43-54`), the same
-as `blk.rs`. Not the cause.
-
-Next candidate: the RX path specifically — receive buffers may never be posted to
-the receive queue, which would explain TX-to-guest drops, unanswered ARP, and a
-DHCP offer that never arrives, while guest→host transmits still work.
-
-**Caveat worth recording:** SSH could not be demonstrated on **QEMU** either
-during this session. `[herd] Started sshd` is absent from every boot log
-captured, including the first one taken before any networking-related change. So
-the userspace sshd was not coming up with this `disk.img` to begin with, and the
-Firecracker-side network bug is not the only thing between here and a shell.
-
-### 5.2 The DHCP settle loop spins, and IRQ volume is high
-
-`src/network_tests.rs:26-38` polls up to 5000 times with only `yield_now()`
-between iterations and no `wfi`:
+**Self-inflicted, and the most instructive of the set.** Removing `max_level_off`
+from `akuma-net`'s `log` dependency (§5.1's diagnostic work) resurrected **25
+previously-dead `log::` statements** — including several inside
+`smoltcp_net::poll`'s `NETWORK` critical section, which is explicitly documented
+as running with preemption disabled:
 
 ```rust
-for _ in 0..5000 {
-    smoltcp_net::poll();
-    if smoltcp_net::is_dhcp_configured() { break; }
-    if crate::timer::uptime_us() - start > timeout_us { break; }
-    akuma_exec::threading::yield_now();
-}
+// Hold preemption disabled for the whole NETWORK critical section so the
+// spinlock is never stranded across a context switch (fatal under the BKL)
+let _pg = PreemptGuard::new();
+let mut guard = NETWORK.lock();
+...
+    log::info!("[SmolNet] DHCP configured");   // ← now real console I/O
 ```
 
-It is correctly bounded (5000 iterations, 5 s timeout), so it is not the hang in
-§5.1. But on a single-vCPU microVM nothing else is runnable, so `yield_now()`
-returns immediately and this burns 100% of the core for the full five seconds
-whenever no lease arrives. On QEMU a SLIRP lease lands in milliseconds, which
-masks it.
+`console::emit` runs inside `with_irqs_disabled` and, when `kernel_console_lock`
+is set (default-on for `release`), acquires a `Spinlock`. A print from a
+preemption-disabled section therefore spins on a lock whose holder may be a
+thread that cannot be scheduled. On a multi-core guest another core drains it; on
+a **single-vCPU** guest nothing can, and the kernel wedges silently.
+
+That is why it presented as "QEMU fine, Firecracker hangs": QEMU's devbox runs
+`SMP=4`, Firecracker runs one vCPU.
+
+**Two corrections to earlier conclusions in this document's history:**
+
+1. The deterministic hang was blamed on declining `RING_EVENT_IDX`. Wrong — it
+   appeared when an RX diagnostic `log::info!` was added to `Device::receive`,
+   which smoltcp calls *from inside* the `NETWORK` critical section. The EVENT_IDX
+   experiment merely ran at the same time.
+2. The mechanism was briefly doubted on the grounds that `CONSOLE_LOCK` is
+   `#[cfg(kernel_console_lock)]` and therefore opt-in. It is opt-**out**:
+   `build.rs` sets `console_lock_default_on = !size_opt_for_console`, so every
+   `release` build has it. Verified by symbol count: the default build carries
+   `CONSOLE_LOCK`/`CONSOLE_OWNER`, the size profiles do not.
+
+Fixes, in order of how much they matter:
+
+- **`akuma-net` prints with `safe_print!`, not `log::`.** The `log` dependency is
+  there for **smoltcp**, and `max_level_off` existed to compile smoltcp's
+  per-packet tracing out. Routing our own messages through the same facade meant
+  either resurrecting that tracing or losing our messages with it. All 19 of
+  akuma-net's own messages are now `safe_print!`, which is the `CLAUDE.md`
+  convention anyway. `log` is retained, filtered to `release_max_level_info`, so
+  third-party crates still report — and that is what produced the
+  `negotiated_features Features(MAC | VERSION_1)` line that cracked §3.9.
+- **Nothing prints from inside the `NETWORK` critical section.** `poll()` records
+  what happened into a `DhcpReport` and emits it after `drop(guard)`, next to the
+  pre-existing comment warning about the identical hazard with `SOCKET_TABLE`.
+  RX-path observability is plain atomic counters (`rx_counters()`), not prints.
+- **`kernel_console_lock` now defaults OFF for `platform-firecracker`.** The lock
+  prevents cross-core PL011 byte-interleaving, which cannot occur on a guest that
+  only supports one vCPU — while the deadlock it enables certainly can.
+  `CONSOLE_LOCK=1` forces it back on.
+
+The general rule, now recorded in `docs/reference/firecracker/`: **a print is a
+lock acquisition.** Treat it as one when auditing a critical section, and never
+add one inside a section that disables preemption.
+
+## 4. What the port actually needed
+
+Smaller than the survey estimated, because the structural decision paid off.
+`src/platform.rs` is the only file describing either machine.
+
+| Change | Where |
+|---|---|
+| Machine descriptions (both) | `src/platform.rs` (new) |
+| Device VAs become spans; GICD gets 64 KiB | `crates/akuma-primitives/src/addr.rs` |
+| `DEV_PAGES` const → runtime `DevRegion` map | `crates/akuma-exec/src/mmu/mod.rs` |
+| Boot asm maps **only** the UART | `src/boot.rs` |
+| L1[1] Normal vs Device, per machine | `src/boot.rs` (assembler `.if`) |
+| virtio stride/count become runtime | `akuma-primitives`, `akuma-virtio` |
+| Spec-ordered virtio status handshake | `crates/akuma-virtio/src/transport.rs` (new) |
+| `SCTLR_EL1` SA/SA0 forced off | `src/boot.rs`, `src/smp_shared.rs` |
+| Runtime kernel-text window | `crates/akuma-exec/src/mmu/mod.rs` |
+| virtio INTID base 48 → 32 | `src/main.rs` |
+| Kernel base via linker `--defsym` | `build.rs`, `linker.ld`, `src/config.rs` |
+| `platform-firecracker` feature | `Cargo.toml` |
+
+The boot assembly maps one page — the console — because that is the only device
+whose address *can* be a compile-time literal. Everything else is installed from
+Rust by `mmu::rebuild_boot_device_table` before the first GIC or virtio access.
+That structure is what made the Firecracker arm mostly a table of constants.
+
+**No regression on QEMU**: `cargo run --release` still boots to 289 PASSED /
+0 FAILED with `[Platform] qemu-virt device map installed`.
+
+## 5. Open
+
+### 5.1 Inbound (RX) never reaches the guest
+
+The single remaining blocker for SSH. Everything else on the path works: ext2
+mounts off the 6 GB devbox image, the boot suite passes 290/0/0, userspace runs,
+and `[herd] Started sshd (pid= 2)`.
+
+State of the evidence:
+
+- **TX is correct.** Frames on the wire are well-formed (§3.9) and dnsmasq
+  answers `DHCPOFFER`.
+- **The guest never sees the reply.** No `DHCPREQUEST` follows the offer, and
+  host ARP for the guest goes unanswered.
+- **tap0 host→guest: `0 packets, 60 dropped`.** Every inbound frame is discarded
+  because nothing consumes it.
+- **A receive buffer *is* posted.** Instrumenting the live path prints
+  `[SmolNet] RX: first buffer posted (token 0)` — but the companion
+  `RX: first frame received` never appears. So descriptors are available and the
+  device still does not fill them.
+
+Two things ruled out by experiment rather than reasoning:
+
+- **`RING_EVENT_IDX` notification suppression.** Plausible: EVENT_IDX lets the
+  driver skip the queue kick, and Firecracker's net device defers RX and waits
+  for one (its startup `Artificially kick devices` exists for that hazard).
+  Declining the feature — masked at `read_device_features`, so driver and device
+  agree — produced `Features(MAC | VERSION_1)` and RX still never delivered, so it
+  is not the cause. It was *also* blamed for a deterministic hang at the time;
+  that was wrong, and the real cause was a diagnostic print inside a
+  preemption-disabled section (§3.12). Reverted regardless, as unproven. Note that
+  masking at `write_driver_features` instead is actively harmful:
+  `negotiated_features` is computed from the *read*, so the driver stays in
+  EVENT_IDX mode while the device was never told.
+- **A missing `event_idx` argument.** `virtio-drivers`' net driver does pass
+  `negotiated_features.contains(Features::RING_EVENT_IDX)` into both its transmit
+  and receive `VirtQueue::new` calls (`device/net/dev_raw.rs`), same as `blk.rs`.
+
+Worth knowing about the code: `RxRing` in `virtio_rings.rs` is **not** the live
+path — it is `#[cfg(feature = "net-noalloc")]`. The active receive path is the
+single-buffer one in `smoltcp_net.rs` using `rx_buffer: [u8; 2048]` and
+`rx_token`. An early diagnostic went into `RxRing::refill` and never printed on
+*either* platform, which is how that was discovered; don't repeat it.
+
+Next avenues: whether the posted descriptor is actually visible to Firecracker
+(avail-ring publication / the `share`+`unshare` no-op cache-maintenance path in
+`akuma-virtio`'s `Hal`), and whether the RX queue index Akuma posts to matches the
+one Firecracker services.
+
+### 5.2 `akuma_net::init` hangs nondeterministically
+
+Same binary, different outcomes: some runs reach `Herd started`, others freeze
+inside `akuma_net::init` at ~96% CPU. Confirmed not to be output buffering
+(reproduced under `stdbuf -o0`; the log stops at a fixed line count for minutes).
+Note: the deterministic variant of this was **§3.12**, a print inside a
+preemption-disabled section, and is fixed. What remains is the original
+intermittent form, last seen before that fix; it has not recurred since but has
+not been proven gone either.
+
+### 5.3 The DHCP settle loop spins, and IRQ volume is high
+
+`src/network_tests.rs` polls up to 5000 times with only `yield_now()` between
+iterations and no `wfi`. Correctly bounded (5000 iterations, 5 s), so not a hang —
+but on a single-vCPU microVM nothing else is runnable, so `yield_now()` returns
+immediately and it burns 100% of the core for the full five seconds whenever no
+lease arrives. On QEMU a SLIRP lease lands in milliseconds, masking it.
 
 Separately, both platforms print `[BKL] dropped window preserved across IRQ`
-doubling to `x131072`, which is a very large interrupt count for an idle system
-and is the other half of the ~96% CPU observation. Not yet investigated.
+doubling to `x131072` — a very large interrupt count for an idle system, and the
+other half of the ~96% CPU observation. Not investigated.
 
-### 5.3 Still outstanding
+### 5.4 Still outstanding
 
 - **`vcpu_count > 1`.** Firecracker places the GIC redistributors at
   `0x3FFF_0000 - vcpu_count * 0x2_0000`, so CPU0's frames move with the count and
   Akuma's compile-time bootstrap map assumes one. The FDT-derived device map is
-  the fix and is **not implemented**. Largest remaining piece.
-- **No sshd.** Blocked behind §5.1.
-- **Whether the initial user SP is actually 16-byte aligned** — §3.7 restored
-  QEMU's behaviour by clearing SA0 rather than proving the stack is aligned.
+  the fix and is **not implemented**. Largest remaining piece after §5.1.
+- **Whether the initial user SP is genuinely 16-byte aligned.** §3.7 restored
+  QEMU's behaviour by clearing `SA0` rather than proving alignment.
 - **`src/tests.rs` map assertions.** ~20 sites treat `0x4000_0000..0x8000_0000`
-  as kernel RAM; under Firecracker that is the MMIO window. The suite now reports
-  290 PASSED, so most run, but some of those assertions are passing vacuously
-  rather than covering anything.
+  as kernel RAM; under Firecracker that is the MMIO window. The suite reports
+  290 PASSED so most run, but some of those assertions pass vacuously.
+- **Building Akuma inside the Firecracker guest** — the self-host target. Blocked
+  on §5.1 only for convenience (SSH); the disk and userspace already work.
 
 ## 6. The lesson worth keeping
 
-Six of the seven bugs were a value that had only ever been checked against one
+Eight of the nine bugs were a value that had only ever been checked against one
 machine — a register reset value, an address literal, a status-transition
-assumption — and one of those was a mirrored copy of such a value. None were logic
-errors. The device-map abstraction that came out of this — **fixed VAs, discovered
+assumption, a protocol header size — and one of those was a mirrored copy of such
+a value. None were logic errors.
+
+The two most expensive to find were the two where the *symptom pointed somewhere
+else*: a 12-byte header read as 10 presented as "ext2 mount hangs" and then as
+"DHCP doesn't work", and a port collision between two hypervisors presented as
+"my change broke QEMU networking". In both cases the thing that actually resolved
+it was cheap, direct observation — `tcpdump -XX` on one frame, `lsof -iTCP:2222` —
+rather than more reasoning about the code. The device-map abstraction that came out of this — **fixed VAs, discovered
 PAs** — is the shape that prevents the class, and the `const`
 `DEV_WINDOW_NO_OVERLAP` assertion is what makes the layout self-checking rather
 than self-documenting.

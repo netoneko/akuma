@@ -132,9 +132,25 @@ fn main() {
     // The size/extreme profiles are single-core targets where the lock is pure
     // overhead, so they stay off unless `CONSOLE_LOCK=1` forces it on for an
     // opt-in test. `CONSOLE_LOCK=0` is an explicit opt-out for `release`.
+    //
+    // ALSO off for `platform-firecracker`, and that is a correctness matter, not
+    // an optimization. The lock is acquired inside `with_irqs_disabled`, so a
+    // print issued from a section that already runs with preemption disabled —
+    // `akuma_net::smoltcp_net::poll`'s `NETWORK` critical section is the one that
+    // bit us — spins on a `Spinlock` whose holder may be a thread that cannot be
+    // scheduled. On a multi-core guest another core drains it; on a **single-vCPU**
+    // guest nothing can, and the kernel wedges with no output. Firecracker only
+    // supports `vcpu_count: 1` here today (the GIC redistributor base moves with
+    // vCPU count — see docs/reference/firecracker/), so the interleave the lock
+    // exists to prevent cannot occur, while the deadlock it enables certainly can.
+    //
+    // Set `CONSOLE_LOCK=1` to force it on if a Firecracker build ever runs SMP.
+    // Background on why the lock exists at all:
+    // docs/archive/UART_SMP_INTERLEAVE_FIX.md.
     println!("cargo:rerun-if-env-changed=CONSOLE_LOCK");
     let size_opt_for_console = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
-    let console_lock_default_on = !size_opt_for_console;
+    let single_core_platform = std::env::var("CARGO_FEATURE_PLATFORM_FIRECRACKER").is_ok();
+    let console_lock_default_on = !size_opt_for_console && !single_core_platform;
     let console_lock = match std::env::var("CONSOLE_LOCK").as_deref() {
         Ok("0") => false,                       // explicit opt-out
         Ok("1") => true,                        // explicit opt-in (size/extreme)

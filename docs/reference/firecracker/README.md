@@ -111,27 +111,6 @@ declines cleanly as a result.
 Firecracker does have a PL031 RTC at `0x4000_1000`, but Akuma does not map it;
 the boot log's `Warning: RTC not available` is expected.
 
-### 3.5a The virtio status handshake must be stepped
-
-Firecracker validates every write to the virtio MMIO status register against an
-exact-match transition table; QEMU just ORs the bits. `virtio-drivers` writes
-`ACKNOWLEDGE|DRIVER` in one store, which Firecracker rejects, leaving the device
-at `INIT` forever — no queues, no I/O, and a failure that presents as an ext2
-hang because config reads still work.
-
-All drivers therefore go through **`akuma_virtio::VirtioTransport`**
-(`crates/akuma-virtio/src/transport.rs`), which steps the status register one
-milestone at a time. Never construct a bare `MmioTransport` for a device driver;
-read that module's header first.
-
-### 3.5b The `entropy` device is not optional
-
-Firecracker attaches no virtio-rng unless the config says `"entropy": {}`. Without
-it Akuma prints `[RNG] Hardware RNG not available` and three boot-suite tests
-fail — `rng entropy-live`, plus `getrandom` returning `EIO`, which also fails
-`syscall_bkl_optout`. QEMU's runner always provides one, so this is easy to
-mistake for a kernel regression.
-
 ### 3.5 Registers with UNKNOWN reset values must be initialised
 
 KVM stamps `0x1de7ec7edbadc0de` into system registers whose architectural reset
@@ -157,7 +136,52 @@ the architecturally RES1 fields. Force only the bits Akuma has an opinion about.
 Likewise, do not rely on an MMIO register's reset value. `GICD_IROUTER` was
 relied on for years — see `docs/archive/GICD_IROUTER_ALIASING.md`.
 
-### 3.6 Address-range checks must not be machine-relative literals
+### 3.6 The virtio status handshake must be stepped
+
+Firecracker validates every write to the virtio MMIO status register against an
+exact-match transition table; QEMU just ORs the bits. `virtio-drivers` writes
+`ACKNOWLEDGE|DRIVER` in one store, which Firecracker rejects, leaving the device
+at `INIT` forever — no queues, no I/O, and a failure that presents as an ext2
+hang because config reads still work.
+
+All drivers therefore go through **`akuma_virtio::VirtioTransport`**
+(`crates/akuma-virtio/src/transport.rs`), which steps the status register one
+milestone at a time. Never construct a bare `MmioTransport` for a device driver;
+read that module's header first.
+
+### 3.7 The `entropy` device is not optional
+
+Firecracker attaches no virtio-rng unless the config says `"entropy": {}`. Without
+it Akuma prints `[RNG] Hardware RNG not available` and three boot-suite tests
+fail — `rng entropy-live`, plus `getrandom` returning `EIO`, which also fails
+`syscall_bkl_optout`. QEMU's runner always provides one, so this is easy to
+mistake for a kernel regression.
+
+### 3.8 A print is a lock acquisition
+
+`console::emit` runs inside `with_irqs_disabled` and, under `kernel_console_lock`,
+acquires a `Spinlock`. So **never print from a section that disables preemption**:
+the print spins on a lock whose holder may be a thread that cannot be scheduled,
+and on a single-vCPU guest nothing can drain it. The kernel wedges with no output.
+
+The concrete instance: `akuma_net::smoltcp_net::poll` holds `NETWORK` with
+`PreemptGuard` active. Anything it needs to report is recorded (see `DhcpReport`)
+and emitted after `drop(guard)`; RX-path observability is atomic counters
+(`rx_counters()`), not prints.
+
+Consequences to respect:
+
+- **`akuma-net` prints with `safe_print!`, never `log::`.** Its `log` dependency
+  exists for **smoltcp**, built with a compile-time max-level so smoltcp's
+  per-packet tracing is elided. Routing kernel messages through that facade either
+  resurrects the tracing or loses the messages with it. `src/klog.rs` installs a
+  heap-free sink so third-party crates (virtio-drivers) still report at info+.
+- **`kernel_console_lock` defaults OFF for `platform-firecracker`.** The lock
+  prevents cross-core PL011 byte-interleaving, impossible on a guest limited to one
+  vCPU (§3.3), while the deadlock it enables is not. `CONSOLE_LOCK=1` forces it on
+  if a Firecracker build ever runs SMP.
+
+### 3.9 Address-range checks must not be machine-relative literals
 
 `akuma_exec::mmu::is_kernel_text` is the single place that answers "is this
 address kernel code", backed by a window installed from `main.rs`. Five sites in
@@ -171,8 +195,17 @@ Never write a literal upper bound for a kernel-address test.
 ## 4. Known broken
 
 - **`vcpu_count > 1`** — §3.3. The largest outstanding piece.
-- **Networking unverified.** `VIRTIO_INTID_BASE = 32` is wired and the DHCP/tap
-  host side is scripted, but no lease has been observed yet.
+- **Inbound (RX) never reaches the guest.** Outbound works and is well-formed on
+  the wire; dnsmasq answers `DHCPOFFER`. But no `DHCPREQUEST` follows, host ARP goes
+  unanswered, and tap0 shows every host→guest frame dropped — while
+  `rx_counters()` confirms a receive buffer *is* posted. So descriptors are
+  available and the device still does not fill them. `RING_EVENT_IDX` is ruled out.
+  See `docs/archive/AKUMA_FIRECRACKER_KVM.md` §5.1. This is the only thing between
+  here and an SSH session: ext2 mounts, the boot suite passes 290/0/0, userspace
+  runs, and herd starts `/bin/sshd`.
+- **`virtio-drivers` must stay at 0.13+.** 0.7.5 sizes the virtio-net header by
+  `MRG_RXBUF` (10 bytes) rather than `VERSION_1` (12), which shifts every frame two
+  bytes left under Firecracker. QEMU tolerated it; Firecracker does not.
 - **Networking untested.** `VIRTIO_INTID_BASE = 32` is wired but unexercised;
   it depends on the same virtio handshake as block.
 - **`src/tests.rs` bakes in QEMU's map.** ~20 sites treat

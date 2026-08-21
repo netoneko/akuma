@@ -63,6 +63,7 @@ pub type NetDev = VirtIONetRaw<VirtioHal, VirtioTransport, 16>;
 /// (`MIN_BUFFER_LEN` is 1526).
 pub const FRAME_BUF: usize = 2048;
 
+
 /// Receive slots posted to the device.
 ///
 /// Half the 16-descriptor virtqueue, which leaves headroom for the driver's own

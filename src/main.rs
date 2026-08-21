@@ -1652,9 +1652,18 @@ fn run_async_main() -> ! {
         if now_us.saturating_sub(last_heartbeat) >= HEARTBEAT_INTERVAL_US {
             LAST_HEARTBEAT_US.store(now_us, Ordering::Relaxed);
             let tid = threading::current_thread_id();
-            crate::safe_print!(160, 
-                "[Heartbeat] Loop {} | T{} | SmolNet Active\n",
-                count, tid
+            // RX counters ride along on the heartbeat: a stack that polls happily
+            // while receiving nothing is otherwise indistinguishable from a stack
+            // that is wedged. `posted` climbing with `recvd` stuck at 0 means the
+            // device has buffers and is not filling them — which is a very
+            // different bug from "we never offered one".
+            #[cfg(feature = "smoltcp")]
+            let (posted, begin_fail, recvd) = akuma_net::smoltcp_net::rx_counters();
+            #[cfg(not(feature = "smoltcp"))]
+            let (posted, begin_fail, recvd) = (0usize, 0usize, 0usize);
+            crate::safe_print!(160,
+                "[Heartbeat] Loop {} | T{} | SmolNet Active | rx posted={} fail={} recvd={}\n",
+                count, tid, posted, begin_fail, recvd
             );
         }
 
