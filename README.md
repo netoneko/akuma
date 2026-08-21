@@ -6,7 +6,7 @@
 
 **Bare-metal AArch64 OS in Rust — preemptive kernel, Linux ABI, SSH, containers, apk, TCC/Clang/GCC/rustc, Git**
 
-**Now runs on Graviton 2** via Firecracker (2026-08-21) - verified on `m6g.metal` machine in `ap-northeast-1` Tokyo AWS region, see (here)[./docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md].
+**Now runs on Graviton 2** via Firecracker (2026-08-21) - verified on `m6g.metal` machine in `ap-northeast-1` Tokyo AWS region, see [here(./docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md).
 
 **Redis, Go and Rust all run real workloads here** (2026-08-17) — including the
 official `redis:alpine` image pulled from Docker Hub. See
