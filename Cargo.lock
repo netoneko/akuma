@@ -20,6 +20,7 @@ dependencies = [
  "akuma-virtio",
  "embedded-io-async",
  "fdt",
+ "log",
  "smoltcp",
  "spinning_top",
  "talc",

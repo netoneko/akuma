@@ -93,5 +93,10 @@ smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv
 virtio-drivers = { version = "0.7", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }
 spinning_top = "0.3"
-log = { version = "0.4", default-features = false, features = ["max_level_off"] }
+# NOT `max_level_off`: that feature elides every `log::` macro at COMPILE time,
+# which made `smoltcp_net::init` silent and a hang inside it invisible (see
+# src/klog.rs and docs/archive/AKUMA_FIRECRACKER_KVM.md §5.1). Filtering is done
+# at runtime by the sink instead. `release_max_level_info` still drops
+# debug!/trace! statically, so smoltcp's per-packet tracing costs nothing.
+log = { version = "0.4", default-features = false, features = ["release_max_level_info"] }
 

@@ -558,6 +558,12 @@ akuma-isolation = { path = "crates/akuma-isolation" }
 talc = "4"
 spinning_top = "0.3"
 fdt = "0.1"
+
+# The `log` facade, so `src/klog.rs` can install a console sink for the
+# statements `akuma-net`/smoltcp already emit. `default-features = false` drops
+# `std`; no `max_level_*` feature here on purpose — filtering is the sink's job,
+# and a compile-time cap cannot be undone at runtime.
+log = { version = "0.4", default-features = false }
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 virtio-drivers = { version = "0.7", default-features = false }
 akuma-timer = { path = "crates/akuma-timer" }

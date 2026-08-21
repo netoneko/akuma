@@ -3,10 +3,9 @@
 Akuma as a Firecracker microVM. The sibling of `overlays/devbox-smoltcp` (QEMU,
 smoltcp, real SMP) and `overlays/devbox` (QEMU, rump).
 
-**Status: partially working.** Boots, reaches the idle loop with zero tripwire
-poison, passes its memory suite, and reads virtio-blk config space. Block I/O
-does **not** complete, so there is no filesystem and therefore no sshd yet. Cause
-is known and narrow — see §4.
+**Status: mostly working at 1 vCPU.** Boots, mounts its ext2 root, runs the boot
+suite and executes userspace processes. Networking is wired but unverified, so
+sshd has not been reached yet. `--vcpus 1` only — see §4.
 
 - Procedure: `docs/runbooks/run-on-firecracker.md`
 - Platform invariants and constants: `docs/reference/firecracker/`
@@ -67,17 +66,14 @@ mapping is written up in `docs/reference/firecracker/disk-and-volumes.md`.
 
 ## 4. Known limits
 
-- **Block I/O does not complete.** Firecracker enforces the virtio status
-  handshake as a strict exact-match state machine;
-  `virtio-drivers-0.7.5` writes `ACKNOWLEDGE|DRIVER` in one store (`0x0 -> 0x3`),
-  skipping `0x0 -> 0x1`. Firecracker rejects it, status stays `INIT`, the queues
-  are never accepted and the device is never activated. Config reads still work,
-  so it presents as a hang during ext2 mount. Fix requires patching the driver
-  crate's status sequence.
 - **`--vcpus 1` only.** The GIC redistributor base is
   `0x3FFF_0000 - vcpu_count * 0x2_0000`; Akuma's bootstrap map assumes one vCPU,
   so anything more makes the boot core drive another core's redistributor and
   silently lose its timer. The FDT-derived device map that fixes this is not
   implemented.
-- **Networking untested** — blocked behind the same virtio handshake.
-- **No sshd** — needs a filesystem, so also blocked on the above.
+- **Networking unverified.** The tap + dnsmasq host side is scripted and the
+  guest-side INTID base is correct, but no DHCP lease has been observed yet.
+- **No sshd yet** — waiting on networking.
+- `run.sh` always attaches `"entropy": {}`. Without a virtio-rng device three
+  boot-suite tests fail on `getrandom` returning `EIO`; QEMU's runner always
+  provides one, so its absence looks like a kernel bug.

@@ -66,6 +66,7 @@ mod network_tests;
 // only; see the module docs and `crates/akuma-net/src/nicstat.rs`.
 #[cfg(feature = "net-profile")]
 mod nic_profile;
+mod klog;
 mod platform;
 mod pmm;
 #[cfg(kernel_tests)]
@@ -572,6 +573,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // before the first IRQ; a wrong window makes every legitimate frame look
     // poisoned (see `mmu::set_kernel_text_window`).
     mmu::set_kernel_text_window(config::KERNEL_PHYS_BASE, config::KERNEL_TEXT_END);
+    // Route the `log` facade into the console before anything that uses it.
+    // `akuma-net`/smoltcp report progress exclusively through `log::info!`, and
+    // with no sink installed `smoltcp_net::init` was silent — see src/klog.rs.
+    klog::init();
+
     // Diagnostic: SCTLR_EL1 as it stands after boot.rs ORed its bits into the
     // RESET value. The architecture leaves several SCTLR_EL1 fields UNKNOWN at
     // reset, and KVM stamps UNKNOWN-reset registers with a poison pattern, so

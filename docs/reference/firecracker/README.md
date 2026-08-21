@@ -1,8 +1,8 @@
 # Firecracker platform reference
 
-**Stability: C** — active risk, expect surprises. Akuma boots on Firecracker and
-drives virtio-blk config space, but block I/O does not complete (§4) and
-`vcpu_count > 1` is known broken (§3.3).
+**Stability: C** — active risk, expect surprises. Akuma boots, mounts its ext2
+root, runs the boot suite and executes userspace processes. `vcpu_count > 1` is
+known broken (§3.3); networking is unverified (§4).
 
 Current-state facts only. History and the debugging narrative are in
 `docs/archive/AKUMA_FIRECRACKER_KVM.md`; the design argument is in
@@ -111,6 +111,27 @@ declines cleanly as a result.
 Firecracker does have a PL031 RTC at `0x4000_1000`, but Akuma does not map it;
 the boot log's `Warning: RTC not available` is expected.
 
+### 3.5a The virtio status handshake must be stepped
+
+Firecracker validates every write to the virtio MMIO status register against an
+exact-match transition table; QEMU just ORs the bits. `virtio-drivers` writes
+`ACKNOWLEDGE|DRIVER` in one store, which Firecracker rejects, leaving the device
+at `INIT` forever — no queues, no I/O, and a failure that presents as an ext2
+hang because config reads still work.
+
+All drivers therefore go through **`akuma_virtio::VirtioTransport`**
+(`crates/akuma-virtio/src/transport.rs`), which steps the status register one
+milestone at a time. Never construct a bare `MmioTransport` for a device driver;
+read that module's header first.
+
+### 3.5b The `entropy` device is not optional
+
+Firecracker attaches no virtio-rng unless the config says `"entropy": {}`. Without
+it Akuma prints `[RNG] Hardware RNG not available` and three boot-suite tests
+fail — `rng entropy-live`, plus `getrandom` returning `EIO`, which also fails
+`syscall_bkl_optout`. QEMU's runner always provides one, so this is easy to
+mistake for a kernel regression.
+
 ### 3.5 Registers with UNKNOWN reset values must be initialised
 
 KVM stamps `0x1de7ec7edbadc0de` into system registers whose architectural reset
@@ -119,8 +140,19 @@ them instead. Any register Akuma reads before writing must be explicitly
 initialised in `src/boot.rs` (BSP) **and** `secondary_entry_shared` in
 `src/smp_shared.rs` (each PSCI-woken core resets its own copy).
 
-Currently required: `TPIDRRO_EL0`, which `preempt::current_tid` reads and treats
-an out-of-range value as fatal.
+Currently required:
+
+- **`TPIDRRO_EL0`** — `preempt::current_tid` reads it and treats an out-of-range
+  value as fatal. KVM's poison tripped it immediately.
+- **`SCTLR_EL1.SA`/`.SA0`** — `boot.rs` ORs its bits into the reset value and
+  clears nothing, so KVM's `SA0=1` was inherited and enabled EL0 SP-alignment
+  checking, which this kernel's userspace ABI does not satisfy. Every `/bin/*`
+  binary took `EC=0x26` at its entry point. Measured: QEMU `0x3490d185`
+  (SA=0, SA0=0) versus KVM `0x34c5d1dd` (SA=1, SA0=1). Both are now forced off,
+  in `boot.rs` **and** `secondary_entry_shared`.
+
+Do not reconstruct `SCTLR_EL1` wholesale to avoid this — the reset value carries
+the architecturally RES1 fields. Force only the bits Akuma has an opinion about.
 
 Likewise, do not rely on an MMIO register's reset value. `GICD_IROUTER` was
 relied on for years — see `docs/archive/GICD_IROUTER_ALIASING.md`.
@@ -138,19 +170,9 @@ Never write a literal upper bound for a kernel-address test.
 
 ## 4. Known broken
 
-- **Block I/O does not complete.** Firecracker's virtio MMIO transport enforces
-  the status handshake as a strict state machine
-  (`INIT -> ACKNOWLEDGE -> ACK|DRIVER -> ...|FEATURES_OK -> ...|DRIVER_OK`,
-  exact-match on each step). `virtio-drivers-0.7.5`
-  (`src/transport/mod.rs:74-75`) writes `ACKNOWLEDGE | DRIVER` in a single store,
-  jumping `0x0 -> 0x3`, which is not a valid transition. Firecracker rejects it,
-  device status stays `INIT`, every later queue write is refused with
-  `update virtio queue in invalid state 0x0`, and `activate()` — which only runs
-  on the exact transition to `0xf` — never happens. Config reads still work
-  (capacity is reported correctly), so the failure looks like a hang in ext2
-  mount rather than a device error. QEMU ORs status bits without validating the
-  sequence, which is why this has never surfaced before.
-- **`vcpu_count > 1`** — §3.3.
+- **`vcpu_count > 1`** — §3.3. The largest outstanding piece.
+- **Networking unverified.** `VIRTIO_INTID_BASE = 32` is wired and the DHCP/tap
+  host side is scripted, but no lease has been observed yet.
 - **Networking untested.** `VIRTIO_INTID_BASE = 32` is wired but unexercised;
   it depends on the same virtio handshake as block.
 - **`src/tests.rs` bakes in QEMU's map.** ~20 sites treat

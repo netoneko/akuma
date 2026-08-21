@@ -119,12 +119,18 @@ DRIVES="[]"
 NICS="[]"
 [ "$WITH_NET" = 1 ] && NICS="[{\"iface_id\":\"eth0\",\"host_dev_name\":\"$TAP\",\"guest_mac\":\"02:FC:00:00:00:01\"}]"
 
+# virtio-rng. Not optional in practice: without it Akuma reports "[RNG] Hardware
+# RNG not available" and three boot-suite tests fail (rng entropy-live, and
+# getrandom returning EIO, which also fails syscall_bkl_optout). QEMU's runner
+# always gives the guest an RNG device, so this is easy to forget.
+
 CFG=/tmp/akuma-fc.json
 runsh "cat > $CFG <<EOF
 {
   \"boot-source\": { \"kernel_image_path\": \"$G_KERNEL\", \"boot_args\": \"console=ttyS0\" },
   \"drives\": $DRIVES,
   \"network-interfaces\": $NICS,
+  \"entropy\": {},
   \"machine-config\": { \"vcpu_count\": $VCPUS, \"mem_size_mib\": $MEM }
 }
 EOF"
