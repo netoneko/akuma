@@ -101,7 +101,17 @@ timer interrupt.** No build or boot error.
 The fix is to derive the device map from the FDT, which Firecracker populates
 correctly. **Not implemented.** This is the largest outstanding piece.
 
-### 3.4 No `fw_cfg`, no RTC, no ramfb
+### 3.4 No `fw_cfg`, no RTC, no ramfb — and since 2026-08-21, none compiled in
+
+Superseded in part: the drivers are no longer merely guarded, they are absent.
+`kernel_framebuffer` and `kernel_audio` (build.rs) keep `src/ramfb.rs`,
+`src/fw_cfg.rs` and the virtio-sound driver out of a `platform-firecracker`
+image — verified by symbol count, 0 here against 14 in the QEMU build. The
+runtime guard described below still exists and still matters for any build that
+does compile them. `test_platform_device_gates` asserts the general rule: a
+driver may only be compiled in if the machine has the device.
+
+
 
 `platform::machine::FW_CFG_PA` is `None`, and `src/fw_cfg.rs` gates both public
 entry points on it. Touching an unmapped device VA is an EL1 translation fault,
@@ -195,7 +205,14 @@ Never write a literal upper bound for a kernel-address test.
 ## 4. Known broken
 
 - **`vcpu_count > 1`** — §3.3. The largest outstanding piece.
-- **Inbound (RX) never reaches the guest.** Outbound works and is well-formed on
+- **Inbound (RX): root-caused and fixed 2026-08-21, not yet verified on a boot.**
+  Firecracker's virtio-net will not read a frame off the host tap until the
+  *total* capacity of the posted receive descriptors reaches `MAX_BUFFER_SIZE` =
+  65562 bytes (`read_from_mmds_or_tap`); a single 2 KB buffer never opened that
+  gate, so every inbound frame was dropped into `no_rx_avail_buffer` with no
+  guest-visible error. `RX_BUFFER_LEN` is now 65568. `extreme-size` keeps 2 KB on
+  purpose and therefore has no inbound networking here. Historical detail below.
+- ~~**Inbound (RX) never reaches the guest.**~~ Outbound works and is well-formed on
   the wire; dnsmasq answers `DHCPOFFER`. But no `DHCPREQUEST` follows, host ARP goes
   unanswered, and tap0 shows every host→guest frame dropped — while
   `rx_counters()` confirms a receive buffer *is* posted. So descriptors are

@@ -1781,6 +1781,71 @@ that answers nothing at all.
   never reaped: after `box close`, the entrypoint pid survives as `State: Z` with
   `PPid: 0`. No CPU is burned, but every `box run -d` leaks a zombie. Still OPEN.
 
+## Issue 25: `fw_cfg`'s base address is a hardcoded VA, not a reading
+
+**Status: OPEN** (raised 2026-08-21). Not a bug today — a design debt the
+Firecracker port put a spotlight on. Filed after asking the narrower question
+"should `src/fw_cfg.rs` live in `akuma-primitives::mmio` or `akuma-virtio`?",
+where the answer turned out to be "neither, and the placement is not the
+problem".
+
+### Where it stands
+
+`src/fw_cfg.rs` takes its window from a kernel constant:
+
+```rust
+const FW_CFG_BASE: usize = akuma_exec::mmu::DEV_FW_CFG_VA;
+const AVAILABLE: bool = crate::platform::machine::FW_CFG_PA.is_some();
+```
+
+`FW_CFG_PA` is a per-platform literal — `Some(0x0902_0000)` for QEMU virt,
+`None` for Firecracker — and `AVAILABLE` exists because getting it wrong is not
+a graceful failure. On the first Firecracker boot `ramfb::init` wrote the
+selector register on a machine that maps nothing there and took a data abort,
+`EC=0x25` / `FAR=0x8000012008` — the `+0x08` in that address being what
+identified it (`AKUMA_FIRECRACKER_KVM.md`). Reading an absent MMIO register
+usually returns garbage and the code muddles through; here nothing was mapped at
+all.
+
+### Why placement is the wrong fix
+
+- **Not `akuma-primitives::mmio`.** That module's own doc says it is "not an
+  abstraction over device protocol" — it is a 132-line `MmioReg` newtype that
+  moves one `unsafe` from every register access to a single construction. And
+  `akuma-primitives` is the dependency-free leaf: a QEMU-specific driver there
+  would push platform knowledge to the bottom of the graph where every crate
+  inherits it. `fw_cfg.rs` being a *consumer* of `mmio` is the correct relation.
+- **Not `akuma-virtio`.** `fw_cfg` contains zero virtio concepts — no virtqueue,
+  no device id, no feature negotiation (grep returns 0). It is a pre-virtio QEMU
+  port: write a big-endian `u16` key to `+0x08`, read bytes back from `+0x00`.
+  Filing it there would make that crate's stated scope wrong and would drag QEMU
+  platform specifics into a crate `akuma-net` also depends on. The one
+  similarity — "a device at an MMIO address" — is what `MmioReg` already
+  abstracts.
+- **It has not earned a crate.** Crates here are "host-testable extracted
+  crates"; `fw_cfg` has exactly one consumer (`src/ramfb.rs`), one platform, and
+  since 2026-08-21 is compiled out on the other (`kernel_framebuffer`, build.rs).
+
+### What to do instead
+
+1. **Read the address from the FDT.** QEMU virt advertises the device:
+   `fw-cfg@9020000`, `compatible = "qemu,fw-cfg-mmio"` — confirmed in the DTB
+   dumped at `crates/akuma-firecracker/fixtures/qemu-virt-smp1.dtb`. Firecracker
+   emits no such node, which is the same fact `FW_CFG_PA = None` states by hand.
+   Reporting it from `crates/akuma-firecracker` makes `AVAILABLE` a consequence
+   of the machine description rather than a literal kept in sync with one, which
+   is the argument `proposals/FIRECRACKER_PORT.md` §5 makes for the GIC.
+2. **Host-test the directory walk.** `find_file` reads a big-endian count and
+   walks 64-byte entries — offset arithmetic over device-supplied data, the shape
+   that most deserves a test. Taking a byte slice instead of reading registers
+   directly makes it testable with a synthetic blob, needs no extraction, and is
+   the refactor that would later *justify* a crate if one is ever wanted.
+
+Both are small. Neither is urgent while Firecracker compiles the driver out and
+QEMU's address has not moved in the lifetime of the project — which is precisely
+why this is a note rather than a task.
+
+
 ## Background
 
 - [`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md)

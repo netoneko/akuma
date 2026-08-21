@@ -7,6 +7,12 @@ its ext2 root (both `disk.img` and the 6 GB devbox image), runs the boot suite a
 `/bin/sshd` under herd. Outbound networking works and is well-formed on the wire;
 **inbound (RX) does not**, so SSH is not yet reachable (§5.1).
 
+> **Update 2026-08-21 — §5.1 is resolved in code.** The RX blocker was
+> root-caused after this document was written: Firecracker withholds every
+> inbound frame until the posted receive-descriptor capacity reaches 65562 bytes.
+> See §5.1's *Resolution* at the end of that section. The investigation below is
+> left as written; it is the record of how the symptom presented.
+
 Nine bugs fixed getting there. **Eight of the nine were the same mistake** —
 trusting a value that only QEMU happened to provide (§3).
 **Reproduce:** `docs/runbooks/run-on-firecracker.md`
@@ -591,6 +597,44 @@ Next avenues: whether the posted descriptor is actually visible to Firecracker
 (avail-ring publication / the `share`+`unshare` no-op cache-maintenance path in
 `akuma-virtio`'s `Hal`), and whether the RX queue index Akuma posts to matches the
 one Firecracker services.
+
+#### Resolution (2026-08-21)
+
+**Root cause: a delivery gate on posted receive capacity, with no guest-visible
+error.** Firecracker's virtio-net does not read a single frame off the host tap
+until the **total** capacity of the receive descriptors the driver has posted
+reaches `MAX_BUFFER_SIZE` = **65562 bytes**
+(`src/vmm/src/devices/virtio/net/device.rs`, `read_from_mmds_or_tap`). Akuma
+posted one 2 KB buffer — 2048 of the required 65562 — so the gate never opened.
+Every inbound frame was dropped and counted in the device's
+`no_rx_avail_buffer` metric, which the guest cannot see.
+
+That explains each observation above exactly: TX perfect, one buffer posted,
+zero `receive_begin` failures, zero completions, and `tap0` showing every
+host→guest frame dropped. The driver was not wrong and the buffer was not
+unposted — it was too small to be *eligible*.
+
+QEMU imposes no such threshold, which is why the same receive path had worked for
+years.
+
+**Fix:** `akuma_net::smoltcp_net::RX_BUFFER_LEN` = 65568 (65562 rounded up to a
+multiple of 8), on every platform rather than behind a Firecracker `cfg` — so the
+receive path exercised daily is the one Firecracker needs. The buffer lives in
+BSS rather than a `VirtioSmoltcpDevice` field because `NetworkState` is built on
+the kernel stack before being moved into `NETWORK`, and 64 KB would be a stack
+temporary on a 96 KB system stack.
+
+`VIRTIO_NET_F_MRG_RXBUF` would let the device chain several small buffers to the
+same total, but `virtio-drivers` does not offer that feature, so the capacity has
+to come from a single descriptor.
+
+**Consequence for `extreme-size`:** it keeps the 2 KB buffer deliberately — 4 MB
+of RAM makes 64 KB of BSS 1.6% of the machine, and it is a QEMU target
+(`acceptance/05`). That profile has **no inbound networking under Firecracker**.
+
+**Still unverified.** The fix landed after the last boot recorded here, so no
+Akuma boot has yet demonstrated a completed receive on Firecracker. Treat SSH-in
+as expected, not proven, until one does.
 
 ### 5.2 `akuma_net::init` hangs nondeterministically
 

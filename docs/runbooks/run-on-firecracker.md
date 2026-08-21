@@ -1,9 +1,14 @@
 # Run Akuma on Firecracker locally
 
-**Stability: C** — active work. The `platform-firecracker` build target exists and
-links correctly, but **no Akuma boot under Firecracker has been observed yet**.
-Steps marked *(unverified)* have not been executed end-to-end. Steps marked
-*(verified)* were run on 2026-08-21.
+**Stability: B** — verify behaviour. Akuma **does** boot under Firecracker: on
+2026-08-21 it ran the boot suite at 290/0/0, mounted its ext2 root, ran userspace
+and started `/bin/sshd` under herd, on a Lima nested-virt host
+(`docs/archive/AKUMA_FIRECRACKER_KVM.md`). Steps below marked *(unverified)* had
+not been executed end-to-end when this was written; that caveat now applies to
+the SSH-in step only, since inbound RX was fixed after that boot (§8).
+
+For the AWS metal path rather than this local one, see
+`docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md`.
 
 Firecracker needs `/dev/kvm` and an aarch64 host. On an Apple-silicon Mac that
 means a Linux VM with nested virtualization — macOS itself never has `/dev/kvm`,
@@ -241,8 +246,20 @@ meaningful.
 - **The FDT device map is not implemented.** Akuma uses the compile-time
   bootstrap map from `src/platform.rs`. Correct for a single-vCPU microVM only.
 - **No networking in the config above.** A tap device and a
-  `network-interfaces` entry are needed, and `VIRTIO_MMIO_SPI_BASE` is 32 on
-  Firecracker versus 48 on QEMU (handled in `src/main.rs`, untested).
+  `network-interfaces` entry are needed. `VIRTIO_MMIO_SPI_BASE` is 32 on
+  Firecracker versus 48 on QEMU — no longer "untested": the FDT confirms it,
+  `virtio_mmio@40003000` carrying `interrupts = <0x00 0x00 0x01>`, i.e. SPI 0 →
+  INTID 32 (`docs/reference/firecracker/fdt/`).
+- **Inbound RX: fixed 2026-08-21, not yet verified on a boot.** Firecracker will
+  not read a frame off the host tap until the *total* posted receive-descriptor
+  capacity reaches `MAX_BUFFER_SIZE` = 65562 bytes, so the old 2 KB buffer meant
+  every inbound frame was silently dropped. `RX_BUFFER_LEN` is now 65568. The
+  first boot that reaches a shell over SSH settles it. **`extreme-size` keeps the
+  2 KB buffer on purpose and therefore has no inbound networking here.**
+- **Audio and the framebuffer are not in the image.** `kernel_framebuffer` and
+  `kernel_audio` (build.rs) compile out `src/ramfb.rs`, `src/fw_cfg.rs` and the
+  virtio-sound driver on this platform — 0 such symbols against 14 in the QEMU
+  build. Do not chase `[SND]`/`[ramfb]` lines here; they are gone by design.
 - **`src/tests.rs` map assertions** — see §7 step 5.
 
 ---
