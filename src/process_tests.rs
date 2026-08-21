@@ -900,6 +900,10 @@ pub fn run_all_tests() {
     // real guarded path, plus the runtime kill switch.
     test_drivers_bkl_drop();
 
+    // Device drivers must not be compiled for hardware this machine does not
+    // have — the invariant behind `kernel_framebuffer` / `kernel_audio`.
+    test_platform_device_gates();
+
     // `no-bkl-irq` (Phase 7a): the timer IRQ (27) dispatch no longer needs the BKL at
     // all — pins that this core's BKL hold state is unchanged across real timer ticks,
     // plus the runtime kill switch.
@@ -4455,6 +4459,85 @@ fn test_mm_bkl_drop() {
 /// Does NOT drive the RNG read path with a real buffer (that needs a mapped user
 /// page — out of scope here, same constraint the mm test respects). Instead
 /// exercises the guard through `sys_fb_init`, which takes dimensions not pointers,
+/// Every device driver compiled in must correspond to hardware this machine
+/// actually has.
+///
+/// Two cfgs decide that (build.rs): `kernel_framebuffer` = `sc-framebuffer` AND a
+/// machine with an fw_cfg to configure ramfb through; `kernel_audio` = `sound`
+/// AND a machine that can carry a virtio-sound device. Firecracker satisfies
+/// neither — its device tree has no fw_cfg node and no sound device
+/// (`docs/reference/firecracker/fdt/`), and Firecracker upstream implements
+/// neither device.
+///
+/// This asserts the implication in the direction that can actually hurt: *if the
+/// driver is compiled in, the machine must have the device.* The converse is
+/// fine and normal — `extreme-size` drops both drivers on QEMU virt, which has
+/// both devices.
+///
+/// Why it is worth a boot test rather than trusting the cfgs: the two halves live
+/// in different files. The capability lives in `platform.rs` and the gate in
+/// `build.rs`, so adding a platform, or enabling a driver for one, can set one
+/// without the other — and the failure mode is a driver poking MMIO that is not
+/// mapped. That is exactly how `ramfb::init` took a data abort at
+/// `FAR=0x8000012008` on the first Firecracker boot
+/// (`docs/archive/AKUMA_FIRECRACKER_KVM.md`).
+fn test_platform_device_gates() {
+    use crate::platform::machine;
+
+    let mut fails = 0u32;
+
+    let fb_compiled = cfg!(kernel_framebuffer);
+    if fb_compiled && !machine::HAS_FRAMEBUFFER {
+        fails += 1;
+        crate::safe_print!(
+            128,
+            "[Test] platform-device-gates: framebuffer compiled in on a machine with none\n"
+        );
+    }
+
+    let audio_compiled = cfg!(kernel_audio);
+    if audio_compiled && !machine::HAS_VIRTIO_SOUND {
+        fails += 1;
+        crate::safe_print!(
+            128,
+            "[Test] platform-device-gates: virtio-sound compiled in on a machine with none\n"
+        );
+    }
+
+    // HAS_FRAMEBUFFER is derived from FW_CFG_PA precisely so the two cannot
+    // disagree; check the derivation survived any edit to `platform.rs`.
+    if machine::HAS_FRAMEBUFFER != machine::FW_CFG_PA.is_some() {
+        fails += 1;
+        crate::safe_print!(
+            128,
+            "[Test] platform-device-gates: HAS_FRAMEBUFFER disagrees with FW_CFG_PA\n"
+        );
+    }
+
+    // A framebuffer driver with no fw_cfg mapping is the fault case above, so
+    // pin the mapping too: if fb is compiled, the device VA must be backed.
+    if fb_compiled && machine::FW_CFG_PA.is_none() {
+        fails += 1;
+        crate::safe_print!(
+            128,
+            "[Test] platform-device-gates: fb compiled but no fw_cfg PA to map\n"
+        );
+    }
+
+    if fails == 0 {
+        crate::safe_print!(
+            160,
+            "[Test] platform-device-gates PASSED ({}: fb={} snd={})\n",
+            machine::NAME,
+            if fb_compiled { "in" } else { "out" },
+            if audio_compiled { "in" } else { "out" }
+        );
+    } else {
+        crate::safe_print!(64, "[Test] platform-device-gates FAILED ({} cases)\n", fails);
+        panic!("test_platform_device_gates: {fails} cases failed");
+    }
+}
+
 /// so no user-buffer mapping is needed.
 fn test_drivers_bkl_drop() {
     use akuma_exec::bkl;
@@ -4482,44 +4565,77 @@ fn test_drivers_bkl_drop() {
     if r != EFAULT { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: getrandom(null) FAILED r={} (want EFAULT)\n", r); }
     balanced("getrandom(null ptr)", &mut fails);
 
-    // fb_init with zero dimensions: EINVAL before the guard.
-    let r = handle_syscall(nr::FB_INIT, &[0, 0, 0, 0, 0, 0]);
-    if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_init(0,0) FAILED r={} (want EINVAL)\n", r); }
-    balanced("fb_init(zero dims)", &mut fails);
+    // The framebuffer syscalls are the other driver-family vehicle, and they only
+    // exist where the machine has a framebuffer — `kernel_framebuffer` is off on
+    // Firecracker, which has no fw_cfg to configure ramfb through. The getrandom
+    // legs above carry this test on such a build; only the fb legs drop out.
+    #[cfg(kernel_framebuffer)]
+    {
+        // fb_init with zero dimensions: EINVAL before the guard.
+        let r = handle_syscall(nr::FB_INIT, &[0, 0, 0, 0, 0, 0]);
+        if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_init(0,0) FAILED r={} (want EINVAL)\n", r); }
+        balanced("fb_init(zero dims)", &mut fails);
 
-    // fb_info with null ptr: EINVAL before the guard.
-    let r = handle_syscall(nr::FB_INFO, &[0, 0, 0, 0, 0, 0]);
-    if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_info(null) FAILED r={} (want EINVAL)\n", r); }
-    balanced("fb_info(null)", &mut fails);
+        // fb_info with null ptr: EINVAL before the guard.
+        let r = handle_syscall(nr::FB_INFO, &[0, 0, 0, 0, 0, 0]);
+        if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_info(null) FAILED r={} (want EINVAL)\n", r); }
+        balanced("fb_info(null)", &mut fails);
 
-    // fb_draw with null ptr / zero len: EINVAL before the guard.
-    let r = handle_syscall(nr::FB_DRAW, &[0, 0, 0, 0, 0, 0]);
-    if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_draw(0,0) FAILED r={} (want EINVAL)\n", r); }
-    balanced("fb_draw(null)", &mut fails);
+        // fb_draw with null ptr / zero len: EINVAL before the guard.
+        let r = handle_syscall(nr::FB_DRAW, &[0, 0, 0, 0, 0, 0]);
+        if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_draw(0,0) FAILED r={} (want EINVAL)\n", r); }
+        balanced("fb_draw(null)", &mut fails);
 
-    // ── Real guarded path ──────────────────────────────────────────────────
-    // fb_init with valid dims: guard IS constructed. ramfb::init may succeed (0)
-    // or fail (EIO if no fw_cfg); either way the guard must be balanced.
-    let _ = handle_syscall(nr::FB_INIT, &[320, 240, 0, 0, 0, 0]);
-    balanced("fb_init(320x240)", &mut fails);
+        // ── Real guarded path ──────────────────────────────────────────────
+        // fb_init with valid dims: guard IS constructed. ramfb::init may succeed
+        // (0) or fail (EIO); either way the guard must be balanced.
+        let _ = handle_syscall(nr::FB_INIT, &[320, 240, 0, 0, 0, 0]);
+        balanced("fb_init(320x240)", &mut fails);
 
-    // Runtime kill switch: with the toggle off, the guard must never open the
-    // window at all — same kill-switch contract as the other phases.
-    #[cfg(kernel_smp_shared)]
+        // Runtime kill switch: with the toggle off, the guard must never open the
+        // window at all — same kill-switch contract as the other phases.
+        #[cfg(kernel_smp_shared)]
+        {
+            use crate::smp_shared::{drivers_bkl_drop_enabled, set_drivers_bkl_drop_enabled};
+            let was = drivers_bkl_drop_enabled();
+            set_drivers_bkl_drop_enabled(false);
+            let _ = handle_syscall(nr::FB_INIT, &[320, 240, 0, 0, 0, 0]);
+            balanced("fb_init(toggle off)", &mut fails);
+            set_drivers_bkl_drop_enabled(was);
+        }
+    }
+
+    // Without the framebuffer there is no driver-family syscall this test can
+    // safely call that actually constructs the guard (getrandom's legs above all
+    // fail validation *before* it). So the kill switch is checked directly: the
+    // toggle must round-trip, which at least keeps the contract honest and the
+    // setter exercised on every platform.
+    #[cfg(all(kernel_smp_shared, not(kernel_framebuffer)))]
     {
         use crate::smp_shared::{drivers_bkl_drop_enabled, set_drivers_bkl_drop_enabled};
         let was = drivers_bkl_drop_enabled();
         set_drivers_bkl_drop_enabled(false);
-        let _ = handle_syscall(nr::FB_INIT, &[320, 240, 0, 0, 0, 0]);
-        balanced("fb_init(toggle off)", &mut fails);
+        if drivers_bkl_drop_enabled() {
+            fails += 1;
+            crate::safe_print!(96, "[Test] drivers-bkl-drop: kill switch did not take\n");
+        }
         set_drivers_bkl_drop_enabled(was);
+        if drivers_bkl_drop_enabled() != was {
+            fails += 1;
+            crate::safe_print!(96, "[Test] drivers-bkl-drop: kill switch did not restore\n");
+        }
     }
 
     unregister_process(pid);
     unregister_thread_pid(tid);
 
     if fails == 0 {
-        crate::safe_print!(160, "[Test] drivers-bkl-drop PASSED (4 early-error + fb_init + kill switch)\n");
+        let legs = if cfg!(kernel_framebuffer) {
+            "4 early-error + fb_init + kill switch"
+        } else {
+            "getrandom + kill switch; no framebuffer on this machine"
+        };
+        crate::safe_print!(160, "[Test] drivers-bkl-drop PASSED ({})\n", legs);
     } else {
         crate::safe_print!(64, "[Test] drivers-bkl-drop FAILED ({} cases)\n", fails);
         panic!("test_drivers_bkl_drop: {fails} cases failed");

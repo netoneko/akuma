@@ -34,7 +34,7 @@ pub mod eventfd;
 pub mod log;
 #[cfg(feature = "sc-sysv-ipc")]
 pub mod msgqueue;
-#[cfg(feature = "sc-framebuffer")]
+#[cfg(kernel_framebuffer)]
 mod fb;
 pub mod fs;
 pub mod mem;
@@ -300,11 +300,11 @@ pub mod nr {
     pub const REATTACH: u64 = 318;
     pub const UPTIME: u64 = 319;
     pub const SET_TPIDR_EL0: u64 = 320;
-    #[cfg(feature = "sc-framebuffer")]
+    #[cfg(kernel_framebuffer)]
     pub const FB_INIT: u64 = 321;
-    #[cfg(feature = "sc-framebuffer")]
+    #[cfg(kernel_framebuffer)]
     pub const FB_DRAW: u64 = 322;
-    #[cfg(feature = "sc-framebuffer")]
+    #[cfg(kernel_framebuffer)]
     pub const FB_INFO: u64 = 323;
     /// Select a box's network stack: arg0 = box_id, arg1 = stack (0 = smoltcp,
     /// 1 = rump). herd calls this for a `stack = rump` service so the kernel
@@ -812,11 +812,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),
         nr::SET_TPIDR_EL0 => proc::sys_set_tpidr_el0(args[0]),
-        #[cfg(feature = "sc-framebuffer")]
+        #[cfg(kernel_framebuffer)]
         nr::FB_INIT => fb::sys_fb_init(args[0] as u32, args[1] as u32),
-        #[cfg(feature = "sc-framebuffer")]
+        #[cfg(kernel_framebuffer)]
         nr::FB_DRAW => fb::sys_fb_draw(args[0], args[1] as usize),
-        #[cfg(feature = "sc-framebuffer")]
+        #[cfg(kernel_framebuffer)]
         nr::FB_INFO => fb::sys_fb_info(args[0]),
         nr::GETPID => proc::sys_getpid(),
         nr::GETPPID => proc::sys_getppid(),

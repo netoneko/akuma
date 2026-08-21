@@ -8,9 +8,16 @@ on an `m6g.metal` host. The blobs and a per-value comparison are in
 `fdt/`; the procedure is `docs/runbooks/dump-firecracker-fdt.md`.
 
 Confirmed by measurement: the GICD base and its 64 KiB span, the GICR base moving
-`-0x20000` per vCPU, the PL011 at `0x40002000`, virtio-mmio at `0x40003000+`
+`-0x20000` per vCPU, the serial at `0x40002000`, virtio-mmio at `0x40003000+`
 stride `0x1000` with INTIDs from SPI 32, DRAM at `0x80000000`, and the kernel load
 address and FDT placement (§3).
+
+**The serial is a 16550, not a PL011.** The FDT advertises
+`compatible = "ns16550a"`. The map below says PL011 because that is the driver
+Akuma points at it, and transmit works either way — `DR` and `THR` are both at
+offset `0x00` — but the status registers differ (`FR` at `0x18` vs `LSR` at
+`0x05`), so console *input* on this platform is reading the wrong register.
+Details: `fdt/README.md`.
 
 **One correction the source reading did not give.** The FDT `memory` node starts
 at **`0x80200000`, not `0x80000000`**: Firecracker reserves the first 2 MiB of

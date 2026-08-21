@@ -10,6 +10,8 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
     println!("cargo::rustc-check-cfg=cfg(kernel_console_lock)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_framebuffer)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_audio)");
 
     // Real (shared-kernel) SMP gate: ONE shared kernel — one set of statics, one
     // page-table set, one PMM/heap, one global run queue — across all cores under
@@ -158,6 +160,39 @@ fn main() {
     };
     if console_lock {
         println!("cargo:rustc-cfg=kernel_console_lock");
+    }
+
+    // ------------------------------------------------------------------
+    // Devices this machine does not have.
+    //
+    // Firecracker's device tree, dumped from a live microVM and checked in at
+    // docs/reference/firecracker/fdt/, lists exactly: cpus, memory, chosen,
+    // intc, timer, apb-pclk, psci, rtc@40001000, uart@40002000, three
+    // virtio_mmio nodes (net/block/rng), vmgenid and ptp. There is **no fw_cfg
+    // node and no sound device**, and Firecracker upstream implements neither.
+    //
+    // So on `platform-firecracker` the framebuffer and virtio-sound drivers are
+    // not merely unused, they are undriveable — and one of them was actively
+    // dangerous: `ramfb::init` faulted on `DEV_FW_CFG_VA + 0x08` because nothing
+    // is mapped there (docs/archive/AKUMA_FIRECRACKER_KVM.md). That was patched
+    // with a runtime `FW_CFG_PA.is_some()` guard; this removes the code instead.
+    //
+    // Expressed as cfgs rather than repeating `all(feature = "...", not(feature =
+    // "platform-firecracker"))` at a dozen sites, because that compound is
+    // exactly the kind of mirror invariant that rots when one site is missed —
+    // the same argument proposals/FIRECRACKER_PORT.md §5.2 makes about the
+    // duplicated device tables.
+    //
+    // Cargo features are additive and cannot be subtracted by a platform, so
+    // `sound` and `sc-framebuffer` stay in the default set and these cfgs are
+    // what a Firecracker build actually keys off.
+    let firecracker = std::env::var("CARGO_FEATURE_PLATFORM_FIRECRACKER").is_ok();
+
+    if std::env::var("CARGO_FEATURE_SC_FRAMEBUFFER").is_ok() && !firecracker {
+        println!("cargo:rustc-cfg=kernel_framebuffer");
+    }
+    if std::env::var("CARGO_FEATURE_SOUND").is_ok() && !firecracker {
+        println!("cargo:rustc-cfg=kernel_audio");
     }
 
     // Boot self-test suite present. Mirrors the `not(any(feature = "no-tests",

@@ -51,7 +51,9 @@ mod daif_tests;
 mod exceptions;
 mod file_page_cache;
 // fw_cfg exists to configure ramfb, so it follows the framebuffer gate.
-#[cfg(feature = "sc-framebuffer")]
+// `kernel_framebuffer` is `sc-framebuffer` AND a machine that actually has an
+// fw_cfg device — Firecracker has none (build.rs).
+#[cfg(kernel_framebuffer)]
 mod fw_cfg;
 mod fs;
 #[cfg(kernel_tests)]
@@ -73,7 +75,7 @@ mod pmm;
 mod process_tests;
 #[cfg(kernel_tests)]
 mod pthread_tests;
-#[cfg(feature = "sc-framebuffer")]
+#[cfg(kernel_framebuffer)]
 mod ramfb;
 #[cfg(feature = "rump")]
 mod rump_proxy;
@@ -98,7 +100,55 @@ mod timer;
 // The virtio drivers moved to `akuma-virtio` together with the `Hal` and the
 // MMIO probe loop they shared (docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md
 // Phase 3). Re-bound here so existing `crate::block::…` paths still resolve.
-pub(crate) use akuma_virtio::{audio, block, rng};
+pub(crate) use akuma_virtio::{block, rng};
+
+/// virtio-sound, on machines that have one.
+///
+/// Firecracker does not: its device tree carries three virtio devices (net,
+/// block, rng) and no sound device, and Firecracker upstream implements none. So
+/// `kernel_audio` is off there and [`audio`] below is a stub instead — see the
+/// `kernel_audio` note in build.rs.
+#[cfg(kernel_audio)]
+pub(crate) use akuma_virtio::audio;
+
+/// Stub `audio` for machines with no sound device.
+///
+/// Mirrors `akuma_virtio::audio`'s own feature-off stub (its `imp` module) so the
+/// syscall layer compiles unchanged: `/dev/dsp` never opens because
+/// `is_available()` is false, which is the same gate `syscall/fs.rs` already
+/// applies. The OSS ABI constants are re-exported rather than restated — they are
+/// compile-time numbers, and duplicating them is how the two copies drift.
+#[cfg(not(kernel_audio))]
+pub(crate) mod audio {
+    // Which of these has a caller depends on the feature set — `AFMT_S16_LE` is
+    // used only by the boot suite, which `no-tests` builds drop — so the parity
+    // surface is deliberately wider than any single configuration needs. That is
+    // the point of a stub: the syscall layer compiles unchanged either way.
+    #[allow(unused_imports)]
+    pub use akuma_virtio::audio::{
+        AFMT_S16_LE, AudioError, SNDCTL_DSP_CHANNELS, SNDCTL_DSP_SETFMT, SNDCTL_DSP_SPEED,
+    };
+
+    // Deliberately no `init`: `kernel_audio` is off, so nothing probes for a
+    // sound device and a stub `init` would be dead code. If the boot probe is
+    // ever re-enabled here, the resulting compile error is the point.
+    pub fn is_available() -> bool {
+        false
+    }
+    pub fn set_format_oss(_fmt: i32) -> Result<(), AudioError> {
+        Err(AudioError::NotInitialized)
+    }
+    pub fn set_channels(_channels: i32) -> Result<(), AudioError> {
+        Err(AudioError::NotInitialized)
+    }
+    pub fn set_rate(_rate_hz: i32) -> Result<(), AudioError> {
+        Err(AudioError::NotInitialized)
+    }
+    pub fn play(_frames: &[u8]) -> Result<usize, AudioError> {
+        Err(AudioError::NotInitialized)
+    }
+    pub fn stop() {}
+}
 mod vfs;
 
 use core::sync::atomic::AtomicU64;
@@ -927,6 +977,9 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // =========================================================================
     // VirtIO sound output initialization (non-fatal; /dev/dsp gated on success)
     // =========================================================================
+    // Skipped entirely where the machine has no sound device: probing all eight
+    // virtio slots to report "not available" every boot is noise, not diagnosis.
+    #[cfg(kernel_audio)]
     match audio::init() {
         Ok(()) => console::print("[SND] virtio-sound ready (/dev/dsp)\n"),
         Err(_e) => console::print("[SND] virtio-sound not available\n"),
@@ -935,7 +988,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // =========================================================================
     // Framebuffer initialization (ramfb via fw_cfg)
     // =========================================================================
-    #[cfg(feature = "sc-framebuffer")]
+    #[cfg(kernel_framebuffer)]
     match ramfb::init(320, 200) {
         Ok(()) => {
             console::print("[ramfb] Framebuffer ready\n");

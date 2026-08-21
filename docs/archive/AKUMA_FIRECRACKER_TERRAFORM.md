@@ -292,9 +292,13 @@ Also confirmed, from the same blobs:
   at 48.
 - **virtio-mmio stride `0x1000`, one node per configured device** — three nodes
   for three devices, not QEMU's eight `0x200`-spaced slots in one page.
-- **PL011 at `0x40002000`, SPI 3 → INTID 35.**
-- **PSCI v1.3**, with only `cpu@0` present at every vCPU count — secondaries
-  powered off awaiting PSCI wakeup, as §3 Q5 predicted.
+- **Serial at `0x40002000`, SPI 3 → INTID 35 — advertised as `ns16550a`, not a
+  PL011.** Akuma drives it as a PL011 and TX works by coincidence (PL011 `DR` and
+  16550 `THR` are both at offset `0x00`); status reads do not line up (`FR` at
+  `0x18` vs `LSR` at `0x05`). See `docs/reference/firecracker/fdt/README.md`.
+- **PSCI v1.3**, and the tree describes every configured vCPU (`cpu@0..n`).
+  Described is not running — secondaries are powered off awaiting PSCI wakeup, as
+  §3 Q5 predicted.
 - **One correction:** the FDT `memory` node starts at **`0x80200000`**, not
   `0x80000000`. Firecracker reserves the first 2 MiB (`SYSTEM_MEM_SIZE`) and the
   node describes only what follows, so 1024 MiB configured reads as

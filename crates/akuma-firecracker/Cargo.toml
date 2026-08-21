@@ -1,0 +1,14 @@
+[package]
+name = "akuma-firecracker"
+version = "0.1.0"
+edition = "2024"
+description = "Derive Akuma's machine description (RAM, GIC, UART, virtio slots) from a flattened device tree"
+
+[dependencies]
+# Same version the kernel already uses in src/main.rs and src/smp_shared.rs.
+# no_std and alloc-free, which is required: the device map has to be built
+# before the heap exists.
+fdt = "0.1"
+
+[lints]
+workspace = true

@@ -82,6 +82,19 @@ pub mod qemu_virt {
     /// same range is the MMIO window and getting this wrong creates a
     /// mismatched-attribute alias over live device registers.
     pub const MMIO_WINDOW_IS_DEVICE: bool = false;
+
+    /// Can this machine present a framebuffer?
+    ///
+    /// Derived, not asserted: ramfb is configured *through* fw_cfg, so a machine
+    /// with no fw_cfg cannot have one. Keeping it a derivation means the two
+    /// facts cannot disagree.
+    pub const HAS_FRAMEBUFFER: bool = FW_CFG_PA.is_some();
+
+    /// Can a virtio-sound device appear here?
+    ///
+    /// Yes — QEMU attaches one with `-device virtio-sound-device` (the runner
+    /// does when `SOUND` is set), and it shows up as an ordinary virtio-mmio slot.
+    pub const HAS_VIRTIO_SOUND: bool = true;
 }
 
 /// Firecracker's aarch64 microVM.
@@ -137,6 +150,22 @@ pub mod firecracker {
     /// does, where it is RAM) would alias live device registers with mismatched
     /// memory attributes, which the ARM ARM leaves CONSTRAINED UNPREDICTABLE.
     pub const MMIO_WINDOW_IS_DEVICE: bool = true;
+
+    /// No framebuffer: ramfb is configured through fw_cfg and there is no fw_cfg
+    /// (see [`FW_CFG_PA`]). Derived so the two cannot disagree.
+    ///
+    /// This was not always harmless. `ramfb::init` used to touch
+    /// `DEV_FW_CFG_VA + 0x08` on a machine that maps nothing there, taking a data
+    /// abort with `FAR=0x8000012008` (docs/archive/AKUMA_FIRECRACKER_KVM.md). A
+    /// runtime guard fixed the fault; `kernel_framebuffer` (build.rs) now keeps
+    /// the driver out of the image altogether.
+    pub const HAS_FRAMEBUFFER: bool = FW_CFG_PA.is_some();
+
+    /// No sound device. Firecracker implements virtio net, block, balloon, vsock
+    /// and rng — there is no virtio-sound to attach, and the device tree a live
+    /// microVM emits confirms it: three virtio nodes, none of them sound
+    /// (docs/reference/firecracker/fdt/).
+    pub const HAS_VIRTIO_SOUND: bool = false;
 }
 
 /// Bytes between one CPU's GICv3 redistributor RD frame and the next's.

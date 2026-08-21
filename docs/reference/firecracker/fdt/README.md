@@ -53,9 +53,28 @@ reserved before the `GICD_IROUTER` aliasing fix
 
 **virtio-mmio stride is `0x1000`, one device per slot, only for configured
 devices** — three nodes for three devices, at `0x40003000`, `0x40004000`,
-`0x40005000`. Not QEMU virt's eight `0x200`-spaced slots inside one page.
+`0x40005000`.
 
-**The PL011 is at `0x40002000`, SPI 3 → INTID 35.**
+QEMU virt is the opposite on both counts: its device tree advertises **32**
+`0x200`-spaced slots from `0xa000000`, almost all empty, of which
+`crates/akuma-virtio/src/probe.rs` walks the low eight. So neither the stride, the
+count, nor the "slots are always present" assumption carries between the two
+machines. Both trees are parsed by the same code in `crates/akuma-firecracker`,
+whose fixtures include the QEMU dumps for exactly this comparison.
+
+**The serial at `0x40002000` (SPI 3 → INTID 35) advertises
+`compatible = "ns16550a"` — a 16550, not a PL011.** The memory map calls it a
+PL011 because that is what Akuma drives it as, and TX works: a PL011's `DR` and a
+16550's `THR` are both at offset `0x00`, so byte writes transmit either way. Reads
+do **not** line up — PL011 `FR` is at `0x18`, 16550 `LSR` at `0x05` — so anything
+depending on a status flag (RX, or a TX-full check) is reading an unrelated
+register. Worth resolving before trusting console input on this platform.
+
+Related trap in the same tree: `rtc@40001000` is
+`compatible = "arm,pl031\0arm,primecell"`, and it is listed *before* the UART. A
+device search that falls back to `arm,primecell` therefore finds the **clock** and
+calls it the console. `akuma-firecracker` matches `ns16550a` and `arm,pl011`
+explicitly for that reason.
 
 **The `memory` node starts at `0x80200000`, not `0x80000000`.** Worth stating
 because the memory *map* documents `DRAM_MEM_START = 0x8000_0000`: Firecracker
@@ -65,9 +84,18 @@ only what follows. With 1024 MiB configured the node reads
 size from this node is what produces Akuma's
 `[Memory] Detected from DTB: base=0x80200000`.
 
-**PSCI v1.3 is advertised** (`psci: PSCIv1.3 detected in firmware`), with only
-`cpu@0` present at any vCPU count above 1 — secondaries are powered off awaiting
-PSCI wakeup, as `FIRECRACKER_PORT.md` §3 Q5 said.
+**PSCI v1.3 is advertised** (`psci: PSCIv1.3 detected in firmware`), and the tree
+describes **every** configured vCPU — `cpu@0..n`, 1/2/4/8 nodes across the sweep.
+Being *described* is not being *running*: secondaries are powered off awaiting a
+PSCI wakeup, as `FIRECRACKER_PORT.md` §3 Q5 said. (An earlier revision of this file
+claimed only `cpu@0` appeared; that was read off the 1-vCPU dump and is wrong.)
+
+A trap that follows from it: `cpu_count * 0x2_0000` happens to equal the
+redistributor span, so code could derive the GIC address from the CPU list and
+pass every test here. That is the same class of mistake as the compile-time
+literal — an address inferred from an unrelated property. `akuma-firecracker`
+reads the span from `intc`'s second `reg` entry and merely *asserts* the two
+agree.
 
 ## Nodes Akuma does not get
 

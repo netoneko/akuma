@@ -315,7 +315,7 @@ The in-process backend gives only one networked payload per box.
 ## Box demo status (2026-06-23)
 - ✅ **herd autostarts a boxed NetBSD rump kernel.** `RUMP_NIC=1` boot → herd starts the
   `rumpnet` service **boxed**; `ps` shows `/bin/rump_server` + its ~18 rump kthreads under
-  a non-zero box (hex `185c61f8b7` / decimal `104629139639`, named `rumpnet`). Idle and
+  a non-zero box (`0x185c61f8b7`, named `rumpnet`). Idle and
   stable; VM stays responsive. (Required three fixes: herd `spawn_in_box` ABI [argv
   pointer-array + options at arg2]; kernel `sys_spawn_ext` always stripping `argv[0]`
   [was leaking the path as a positional arg → `rump_init_server("/bin/rump_server")`];
@@ -323,11 +323,19 @@ The in-process backend gives only one networked payload per box.
   immediately, so `for(;;) pause()` busy-pegged the CPU].)
 - ✅ **A process runs inside the box.** `box use rumpnet -i /bin/busybox sh` →
   `/bin/busybox sh` runs under box `185c61f8b7` (confirmed in `ps`). Box plumbing works.
-- ⚠️ **box-id resolution gotcha.** `ps` prints the box id in **hex** (`185c61f8b7`) but
-  `box use` / `/proc/boxes` use **decimal** (`104629139639`); `resolve_target_id` only
-  accepts bare hex with a `0x` prefix, so `box use 185c61f8b7` falls through to a name
-  lookup and misses. Working forms: `box use rumpnet`, `box use 104629139639`,
-  `box use 0x185c61f8b7`. TODO: make the resolver accept the hex form `ps` prints.
+- ✅ **box-id resolution gotcha — FIXED 2026-08-21.** `ps` prints the box id in **hex**
+  (`185c61f8b7`) while `/proc/boxes` writes **decimal**, so which form a user copies
+  depends on where they copied it from — and `box use` used to accept bare hex only with
+  a `0x` prefix, so pasting what `ps` showed fell through to a name lookup and missed.
+  `boxes::resolve` now takes all of `box use rumpnet`, `box use 0x185c61f8b7`,
+  `box use 185c61f8b7` and the decimal form.
+  **Bare hex is tried last, after the name lookup, and that order is load-bearing:**
+  plenty of ordinary names are also valid hex (`db` = 0xdb = 219, and `db` is a real box
+  name in the unit tests), so reading `box use db` as id 219 would be both wrong and
+  baffling. One case is still ambiguous by construction — a hex id that happens to be
+  all digits (`ps` showing `3039` for decimal 12345) reads as decimal; use `0x3039`.
+  Curing that needs `ps` to print the `0x` prefix, which is kernel-side.
+  Tests: `boxes::tests::{bare_hex_from_ps_resolves,a_name_that_is_also_valid_hex_stays_a_name}`.
 - ✅ **curl (musl) runs + does real HTTPS from inside the box** — via `box use`:
   `box use rumpnet -i /bin/curl -sS https://ifconfig.me/ip` → `87.71.13.205` (mbedTLS).
   **This is over SMOLTCP ONLY — NOT the NetBSD/rump stack.** The box shares the kernel's

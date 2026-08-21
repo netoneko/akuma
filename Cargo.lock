@@ -52,6 +52,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-firecracker"
+version = "0.1.0"
+dependencies = [
+ "fdt",
+]
+
+[[package]]
 name = "akuma-isolation"
 version = "0.1.0"
 dependencies = [

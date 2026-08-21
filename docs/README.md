@@ -214,6 +214,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Drivers (GIC, timers, block, fw_cfg) | [`reference/subsystems/drivers/`](reference/subsystems/drivers/) | B / B / A / A |
 | Exceptions (vector table, trap frame, ESR_EL1) | [`reference/subsystems/exceptions.md`](reference/subsystems/exceptions.md) | **C** |
 | `akuma-primitives` (the dependency-free leaf: `OnceCopy`, `safe_print!`, all DAIF, `PreemptGuard`, phys/virt) | [`reference/subsystems/primitives.md`](reference/subsystems/primitives.md) | A |
+| `akuma-firecracker` (the machine description read from the FDT at run time: RAM, GIC distributor/redistributor, console, virtio slots) | crate docs — `crates/akuma-firecracker/src/lib.rs`. Measured fixtures from **both** machines: [`reference/firecracker/fdt/`](reference/firecracker/fdt/) (Firecracker) and `crates/akuma-firecracker/fixtures/` (QEMU virt). Not yet wired into the kernel; `src/platform.rs` still holds the literals | A |
 
 Syscalls / Linux ABI now has 17 per-family docs under
 [`reference/subsystems/syscalls/`](reference/subsystems/syscalls/) — grades

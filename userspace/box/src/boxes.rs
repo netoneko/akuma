@@ -56,24 +56,12 @@ pub fn parse(content: &str) -> Vec<BoxEntry> {
         .collect()
 }
 
-/// A box id written literally: `0x1f4` or `500`. `None` for anything else,
-/// including a name — which is the caller's cue to look the table up.
+/// A box id written *unambiguously*: `0x1f4` or `500`. `None` for anything
+/// else — including bare hex, which cannot be told apart from a name here (see
+/// [`resolve`]).
 pub fn parse_id(target: &str) -> Option<u64> {
     if let Some(hex) = target.strip_prefix("0x") {
-        if hex.is_empty() {
-            return None;
-        }
-        let mut id = 0u64;
-        for b in hex.as_bytes() {
-            let digit = match *b {
-                b'0'..=b'9' => *b - b'0',
-                b'a'..=b'f' => *b - b'a' + 10,
-                b'A'..=b'F' => *b - b'A' + 10,
-                _ => return None,
-            };
-            id = (id << 4) | u64::from(digit);
-        }
-        return Some(id);
+        return parse_hex(hex);
     }
 
     if target.is_empty() || !target.bytes().all(|b| b.is_ascii_digit()) {
@@ -82,17 +70,67 @@ pub fn parse_id(target: &str) -> Option<u64> {
     Some(digits_to_u64(target))
 }
 
+/// Hex digits with no prefix. `None` on a non-hex byte or on overflow —
+/// wrapping would resolve to some unrelated box rather than failing.
+fn parse_hex(hex: &str) -> Option<u64> {
+    if hex.is_empty() {
+        return None;
+    }
+    let mut id = 0u64;
+    for b in hex.as_bytes() {
+        let digit = match *b {
+            b'0'..=b'9' => *b - b'0',
+            b'a'..=b'f' => *b - b'a' + 10,
+            b'A'..=b'F' => *b - b'A' + 10,
+            _ => return None,
+        };
+        id = id.checked_mul(16)?.checked_add(u64::from(digit))?;
+    }
+    Some(id)
+}
+
 /// Resolve what the user typed — an id or a name — against the table.
 ///
-/// An id is taken literally without consulting the table, so `box close 500`
-/// works even for a box that has already lost its row.
+/// An explicit id is taken literally without consulting the table, so
+/// `box close 500` works even for a box that has already lost its row.
+///
+/// Three forms are accepted, in this order, because `ps` and `/proc/boxes`
+/// disagree about base: `ps` prints the id as **bare hex** while `/proc/boxes`
+/// writes **decimal**, so which one a user copies depends on where they copied it
+/// from. Pasting the hex `ps` shows used to fall through to a name lookup and
+/// miss (`docs/archive/RUMP_SYSPROXY.md`).
+///
+/// | Input | Read as | Why |
+/// |---|---|---|
+/// | `0x185c61f8b7` | hex id | explicit prefix, unambiguous |
+/// | `104629139639` | decimal id | all digits — `/proc/boxes`'s own format |
+/// | `db` | **name** | a live box is named that |
+/// | `185c61f8b7` | hex id | valid hex and no box is named that |
+///
+/// **The name lookup runs before bare hex, and that order is load-bearing.**
+/// Plenty of ordinary names are also valid hex — `db`, `ace`, `cafe`, `add` —
+/// and reading `box use db` as id 219 rather than the box called `db` would be
+/// both wrong and baffling. Bare hex is therefore a last resort: it only applies
+/// when nothing answers to that name.
+///
+/// One case stays ambiguous: a hex id that is all digits, e.g. `ps` showing
+/// `3039` for decimal 12345, still reads as decimal. Only `ps` printing a `0x`
+/// prefix can fix that, which is a kernel-side change; use `0x3039` meanwhile.
 pub fn resolve(target: &str, content: &str) -> Option<u64> {
-    parse_id(target).or_else(|| {
-        parse(content)
-            .into_iter()
-            .find(|e| e.name == target)
-            .map(|e| e.id)
-    })
+    if let Some(id) = parse_id(target) {
+        return Some(id);
+    }
+
+    if let Some(id) = parse(content)
+        .into_iter()
+        .find(|e| e.name == target)
+        .map(|e| e.id)
+    {
+        return Some(id);
+    }
+
+    // Last resort: the bare hex `ps` prints, now that no name has claimed it.
+    parse_hex(target)
 }
 
 /// The row for a box id, if it is still listed.
@@ -123,6 +161,46 @@ mod tests {
             }
         );
         assert_eq!(entries[1].name, "db");
+    }
+
+    #[test]
+    fn bare_hex_from_ps_resolves() {
+        // The reported gotcha: `ps` prints 185c61f8b7, `/proc/boxes` says
+        // 104629139639, and pasting the former used to miss entirely.
+        assert_eq!(resolve("185c61f8b7", TABLE), Some(104_629_139_639));
+        assert_eq!(resolve("0x185c61f8b7", TABLE), Some(104_629_139_639));
+        assert_eq!(resolve("104629139639", TABLE), Some(104_629_139_639));
+        assert_eq!(resolve("185C61F8B7", TABLE), Some(104_629_139_639));
+    }
+
+    #[test]
+    fn a_name_that_is_also_valid_hex_stays_a_name() {
+        // `db` is 0xdb = 219, and also the name of a real box in TABLE. The name
+        // must win, or `box use db` silently targets box 219.
+        assert_eq!(resolve("db", TABLE), Some(678));
+        // With no box of that name, the same string is read as the hex `ps` prints.
+        assert_eq!(resolve("db", "ID,NAME,ROOT,CREATOR,PRIMARY\n"), Some(0xdb));
+    }
+
+    #[test]
+    fn all_digit_input_stays_decimal() {
+        // /proc/boxes writes decimal, so an all-digit id must not become hex --
+        // that would break every script pasting from that file.
+        assert_eq!(parse_id("500"), Some(500));
+        assert_eq!(parse_id("0x500"), Some(0x500));
+        assert_eq!(parse_id("3039"), Some(3039));
+    }
+
+    #[test]
+    fn rejects_junk_and_refuses_to_wrap() {
+        assert_eq!(parse_id(""), None);
+        assert_eq!(parse_id("0x"), None);
+        assert_eq!(parse_id("rumpnet"), None);
+        assert_eq!(parse_id("12g4"), None);
+        assert_eq!(resolve("rumpnet", TABLE), None);
+        // Overflow must fail rather than wrap into an unrelated box id.
+        assert_eq!(parse_id("0xffffffffffffffffff"), None);
+        assert_eq!(resolve("ffffffffffffffffff", TABLE), None);
     }
 
     #[test]
