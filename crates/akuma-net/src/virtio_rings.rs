@@ -70,6 +70,15 @@ pub const FRAME_BUF: usize = 2048;
 /// bookkeeping and is far more than the 1 this replaces. Deeper would buy
 /// nothing here: the netpoll loop drains up to 64 frames per lap, so the ring
 /// only has to cover one host-side burst, not a backlog.
+///
+/// **This path has no inbound networking under Firecracker.** Firecracker will
+/// not read a frame from the tap until the driver has posted 65562 bytes of
+/// receive capacity in total (see `smoltcp_net::RX_BUFFER_LEN`), and this ring
+/// offers `RX_RING * FRAME_BUF` = 16 KB. Reaching the threshold from a
+/// 16-descriptor queue needs `FRAME_BUF` of at least 4098, and `FRAME_BUF` is
+/// shared with `TX_BUFS`, so it is a resize of both rings rather than a constant
+/// bump — not done, because nothing enables `net-noalloc` (it measured worse;
+/// see this crate's `[features]`).
 pub const RX_RING: usize = 8;
 
 /// Transmit slots that may be in flight simultaneously.

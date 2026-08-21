@@ -411,11 +411,61 @@ static mut SOCKET_STORAGE: [SocketStorage<'static>; MAX_SOCKETS] = [SocketStorag
 // VirtIO Smoltcp Device Wrapper
 // ============================================================================
 
+/// Bytes of receive buffer posted to the device at a time.
+///
+/// 2 KB holds an Ethernet frame and is all QEMU ever asks for. Firecracker is
+/// different, and silently so: its virtio-net device will not read a single
+/// frame from the host tap until the *total* capacity of the receive
+/// descriptors the driver has posted reaches `MAX_BUFFER_SIZE` = 65562 bytes
+/// (`src/vmm/src/devices/virtio/net/device.rs`, `read_from_mmds_or_tap`). One
+/// 2 KB buffer is 2048 of the 65562, so the gate never opens: every inbound
+/// frame is dropped and counted in the `no_rx_avail_buffer` metric, with no
+/// error anywhere the guest can see. It presents as a NIC that transmits
+/// perfectly and receives absolutely nothing.
+///
+/// So the default is one buffer past that threshold — 65562 rounded up to a
+/// multiple of 8 — on every platform rather than under a Firecracker `cfg`.
+/// QEMU does not care how large the buffer is, and one size means the receive
+/// path that gets exercised daily is the one Firecracker needs.
+/// `VIRTIO_NET_F_MRG_RXBUF` would let the device chain several small buffers to
+/// the same total, but `virtio-drivers` does not offer that feature, so the
+/// capacity has to come from a single descriptor.
+///
+/// `extreme-size` keeps 2 KB: it boots in 4 MB of RAM, where 64 KB of BSS is
+/// 1.6% of the machine, and it is a QEMU target — its acceptance test is the
+/// 4 MB floor (`acceptance/05`). Running *that* profile under Firecracker would
+/// have no inbound networking.
+///
+/// See `docs/archive/AKUMA_FIRECRACKER_KVM.md` §5.1.
+pub const RX_BUFFER_LEN: usize = if cfg!(kernel_profile_extreme) {
+    2048
+} else {
+    65_568
+};
+
+/// The single receive buffer of the pre-`net-noalloc` path.
+///
+/// In BSS rather than a [`VirtioSmoltcpDevice`] field, for the same reason
+/// `virtio_rings` keeps its frame storage there: `NetworkState` is built on the
+/// kernel stack by [`init`] and then moved into `NETWORK`, so a field this size
+/// would be a 64 KB stack temporary on a 96 KB system stack. Sound because
+/// exactly one `VirtioSmoltcpDevice` is ever constructed, and every access is
+/// under `NETWORK`.
+#[cfg(not(feature = "net-noalloc"))]
+static mut RX_BUFFER: [u8; RX_BUFFER_LEN] = [0; RX_BUFFER_LEN];
+
+/// [`RX_BUFFER`] as a mutable slice.
+///
+/// # Safety
+/// Caller holds `NETWORK`, and must not hold a second borrow: the device owns
+/// this buffer from `receive_begin` until `receive_complete`.
+#[cfg(not(feature = "net-noalloc"))]
+unsafe fn rx_buffer() -> &'static mut [u8] {
+    unsafe { core::slice::from_raw_parts_mut((&raw mut RX_BUFFER).cast::<u8>(), RX_BUFFER_LEN) }
+}
+
 pub struct VirtioSmoltcpDevice {
     inner: VirtIONetRaw<VirtioHal, VirtioTransport, 16>,
-    /// The single receive buffer of the pre-`net-noalloc` path.
-    #[cfg(not(feature = "net-noalloc"))]
-    rx_buffer: [u8; 2048],
     /// The single transmit buffer of the pre-`net-noalloc` path. Also the
     /// saturation-fallback staging buffer's counterpart.
     #[cfg(not(feature = "net-noalloc"))]
@@ -440,8 +490,6 @@ impl VirtioSmoltcpDevice {
     pub const fn new(inner: VirtIONetRaw<VirtioHal, VirtioTransport, 16>) -> Self {
         Self {
             inner,
-            #[cfg(not(feature = "net-noalloc"))]
-            rx_buffer: [0u8; 2048],
             #[cfg(not(feature = "net-noalloc"))]
             tx_buffer: [0u8; 2048],
             #[cfg(not(feature = "net-noalloc"))]
@@ -503,7 +551,9 @@ impl VirtioSmoltcpDevice {
                 // `CONSOLE_LOCK`, and on a single-vCPU guest a holder that has been
                 // preempted can never run to release it. Counters
                 // (`RX_BUFFERS_POSTED` below) are safe; console I/O is not.
-                let Ok(token) = (unsafe { self.inner.receive_begin(&mut self.rx_buffer) })
+                // SAFETY: `NETWORK` is held and there is no outstanding borrow —
+                // `rx_token` is `None`, so the device does not own the buffer.
+                let Ok(token) = (unsafe { self.inner.receive_begin(rx_buffer()) })
                 else {
                     RX_BEGIN_FAILURES.fetch_add(1, Ordering::Relaxed);
                     return None;
@@ -520,20 +570,20 @@ impl VirtioSmoltcpDevice {
                 // invariant. Drop the frame and let the next poll retry.
                 let token = self.rx_token.take()?;
                 let t = nicstat::start();
+                // SAFETY: the same buffer that was passed to `receive_begin`,
+                // which `receive_complete`'s contract requires.
+                let buf = unsafe { rx_buffer() };
                 if let Ok((hdr_len, pkt_len)) =
-                    unsafe { self.inner.receive_complete(token, &mut self.rx_buffer) }
+                    unsafe { self.inner.receive_complete(token, buf) }
                 {
                     // A malformed VirtIO response could report a frame longer
                     // than the buffer; slicing on that corrupts adjacent memory.
-                    if hdr_len.saturating_add(pkt_len) > self.rx_buffer.len() {
+                    if hdr_len.saturating_add(pkt_len) > buf.len() {
                         return None;
                     }
                     nicstat::record_rx_packet(t, pkt_len);
                     RX_FRAMES_RECEIVED.fetch_add(1, Ordering::Relaxed);
-                    return Some((
-                        unsafe { self.rx_buffer.as_mut_ptr().add(hdr_len) },
-                        pkt_len,
-                    ));
+                    return Some((unsafe { buf.as_mut_ptr().add(hdr_len) }, pkt_len));
                 }
                 return None;
             }
