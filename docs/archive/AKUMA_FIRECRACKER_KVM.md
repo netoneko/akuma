@@ -527,10 +527,42 @@ State of the evidence:
   host ARP for the guest goes unanswered.
 - **tap0 host→guest: `0 packets, 60 dropped`.** Every inbound frame is discarded
   because nothing consumes it.
-- **A receive buffer *is* posted.** Instrumenting the live path prints
-  `[SmolNet] RX: first buffer posted (token 0)` — but the companion
-  `RX: first frame received` never appears. So descriptors are available and the
-  device still does not fill them.
+- **A receive buffer *is* posted, and nothing ever fills it.** The heartbeat now
+  carries `rx_counters()`:
+
+  ```
+  [Heartbeat] Loop 21112 | T1 | SmolNet Active | rx posted=1 fail=0 recvd=0
+  [Heartbeat] Loop 43351 | T1 | SmolNet Active | rx posted=1 fail=0 recvd=0
+  ```
+
+  43,000 netpoll iterations, one buffer posted, zero `receive_begin` failures,
+  **zero completions**. `posted` is exactly 1 because the single-buffer path only
+  re-posts after a completion, which never arrives.
+
+That last line settles two things that were repeatedly re-litigated:
+
+- **It is not a stuck init.** The heartbeat only ticks from the netpoll loop, and
+  `[herd] Started sshd (pid= 2)` precedes it. The stack is running.
+- **It is not a header/format mismatch on RX.** A wrong `hdr_len` would yield
+  frames at the wrong offset — `recvd` climbing with garbage contents. There are no
+  completions at all, so the failure is upstream of parsing. (Reasonable hypothesis
+  given §3.9 was exactly that bug on TX.)
+- **And it is not selective.** "Why does it not answer TCP?" has the same answer as
+  "why does it not answer ARP": it receives *nothing*. TCP is downstream of ARP,
+  which is downstream of RX working at all.
+
+**Confound to clear before testing, learned the hard way:** a failed ARP leaves
+`10.0.2.15 FAILED` in the host neighbour table, and Linux then returns
+`EHOSTUNREACH` immediately without re-ARPing. `sudo ip neigh flush dev tap0`
+between attempts. A stale *resolved* entry is worse — it appeared once as
+`10.0.2.15 lladdr 02:fc:00:00:00:01 DELAY` and briefly looked like the guest had
+answered. It had not; the entry outlived the instance that produced it. Always
+flush, then re-test.
+
+Also ruled out: the MAC and the forward target. tcpdump shows the guest
+transmitting *from* `02:fc:00:00:00:01` and the host addressing frames *to* the
+same MAC, and socat forwards to `10.0.2.15`, which is the guest's static-fallback
+address.
 
 Two things ruled out by experiment rather than reasoning:
 
