@@ -485,7 +485,11 @@ impl VirtioSmoltcpDevice {
             }
             // Phase 2: has the device filled it?
             if self.inner.poll_receive().is_some() {
-                let token = self.rx_token.take().unwrap();
+                // Phase 1 above sets `rx_token` before we ever get here, so this
+                // is `Some` by construction — but this is the per-packet receive
+                // path, and a panic is not how it should report a broken
+                // invariant. Drop the frame and let the next poll retry.
+                let token = self.rx_token.take()?;
                 let t = nicstat::start();
                 if let Ok((hdr_len, pkt_len)) =
                     unsafe { self.inner.receive_complete(token, &mut self.rx_buffer) }
@@ -967,11 +971,26 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
     
     let mut iface = Interface::new(config, &mut device, timestamp);
     
+    // `push` fails only if smoltcp's fixed address list is full, and
+    // `add_default_ipv4_route` only if its route table is. Neither can happen on
+    // a freshly built interface — but `unwrap()` here would take the whole kernel
+    // down for a misconfiguration, on a path that has a perfectly good degraded
+    // mode (no static fallback address; DHCP still runs). Log and continue.
     iface.update_ip_addrs(|ip_addrs| {
-        ip_addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
-        ip_addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
+        if ip_addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).is_err() {
+            log::error!("[SmolNet] could not add static IPv4 address: list full");
+        }
+        if ip_addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).is_err() {
+            log::error!("[SmolNet] could not add loopback address: list full");
+        }
     });
-    iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2)).unwrap();
+    if iface
+        .routes_mut()
+        .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2))
+        .is_err()
+    {
+        log::error!("[SmolNet] could not add default IPv4 route: table full");
+    }
 
     let mut sockets = unsafe { SocketSet::new(&mut SOCKET_STORAGE[..]) };
 
@@ -1039,10 +1058,17 @@ pub fn poll() -> bool {
                     match event {
                         dhcpv4::Event::Configured(config) => {
                             log::info!("[SmolNet] DHCP configured");
+                            // `addrs` was just cleared, so these cannot fail —
+                            // but panicking here would kill the kernel over a
+                            // DHCP lease, so degrade instead.
                             net.iface.update_ip_addrs(|addrs| {
                                 addrs.clear();
-                                addrs.push(IpCidr::Ipv4(config.address)).unwrap();
-                                addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
+                                if addrs.push(IpCidr::Ipv4(config.address)).is_err() {
+                                    log::error!("[SmolNet] could not install DHCP address");
+                                }
+                                if addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).is_err() {
+                                    log::error!("[SmolNet] could not install loopback address");
+                                }
                             });
                             if let Some(router) = config.router {
                                 let _ = net.iface.routes_mut().add_default_ipv4_route(router);
@@ -1056,8 +1082,12 @@ pub fn poll() -> bool {
                             log::info!("[SmolNet] DHCP deconfigured - reverting to static fallback");
                             net.iface.update_ip_addrs(|addrs| {
                                 addrs.clear();
-                                addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
-                                addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
+                                if addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).is_err() {
+                                    log::error!("[SmolNet] could not install static fallback address");
+                                }
+                                if addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).is_err() {
+                                    log::error!("[SmolNet] could not install loopback address");
+                                }
                             });
                             let _ = net.iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2));
                         }

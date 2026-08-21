@@ -110,7 +110,7 @@ pub fn find(device_id: u32) -> Option<(usize, usize)> {
 /// fails on the slot you cared about is still visible in the boot log — losing
 /// that was the one real cost of the reconciliation.
 #[must_use]
-pub fn probe(device_id: u32) -> Option<(usize, SteppedMmioTransport)> {
+pub fn probe(device_id: u32) -> Option<(usize, SteppedMmioTransport<'static>)> {
     probe_with(device_id, |i, transport| Some((i, transport)))
 }
 
@@ -125,7 +125,7 @@ pub fn probe(device_id: u32) -> Option<(usize, SteppedMmioTransport)> {
 /// turned "try the next virtio-blk" into "give up".
 pub fn probe_with<T>(
     device_id: u32,
-    mut make: impl FnMut(usize, SteppedMmioTransport) -> Option<T>,
+    mut make: impl FnMut(usize, SteppedMmioTransport<'static>) -> Option<T>,
 ) -> Option<T> {
     for (i, addr) in (0..num_slots()).map(|i| (i, slot_addr(i))) {
         if device_id_at(addr) != device_id {
@@ -139,7 +139,11 @@ pub fn probe_with<T>(
         // SAFETY: `header` points at a virtio-mmio header inside the device
         // mapping whose DeviceID we just matched, so the transport is being
         // built over a real device of the expected kind.
-        let Ok(transport) = (unsafe { MmioTransport::new(header) }) else {
+        // virtio-drivers 0.13 needs the MMIO region size so it can bound the
+        // config space. That is exactly the machine's slot stride: 0x200 on QEMU
+        // virt (eight slots packed in one page), 0x1000 under Firecracker.
+        let mmio_size = akuma_primitives::addr::virtio_stride();
+        let Ok(transport) = (unsafe { MmioTransport::new(header, mmio_size) }) else {
             crate::safe_print!(64, "[virtio] slot {i}: device {device_id} transport init failed\n");
             continue;
         };

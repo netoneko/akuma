@@ -17,6 +17,13 @@ GW="${FC_GATEWAY:-10.0.2.2}"
 SUBNET="${FC_SUBNET:-10.0.2.0/24}"
 RANGE_LO="${FC_RANGE_LO:-10.0.2.15}"
 RANGE_HI="${FC_RANGE_HI:-10.0.2.30}"
+# Must match run.sh's guest_mac, and the address the SSH forward targets.
+GUEST_MAC="${FC_GUEST_MAC:-02:FC:00:00:00:01}"
+GUEST_IP="${FC_GUEST_IP:-10.0.2.15}"
+# Host port forwarded to the microVM's sshd. Deliberately NOT 2222: QEMU's
+# devbox runner uses that, and lima forwards guest listeners to the host, so both
+# would fight over it — `localhost:2222` then resolves to whichever bound first.
+SSH_PORT="${FC_SSH_PORT:-4444}"
 
 LOCAL=0
 [ "${1:-}" = "--local" ] && LOCAL=1
@@ -73,8 +80,12 @@ else
   say "starting dnsmasq on $TAP ($RANGE_LO-$RANGE_HI, router $GW)"
   # dnsmasq daemonizes itself. Do NOT add --no-daemon here: backgrounding it from
   # a shell that then exits kills it.
+  # --dhcp-host pins the lease to a fixed address so the SSH forward below has a
+  # stable target; without it dnsmasq picks anywhere in the range (observed:
+  # 10.0.2.26) and the forward silently points at nothing.
   runsh "dnsmasq --interface=$TAP --bind-dynamic --except-interface=lo \
     --dhcp-range=$RANGE_LO,$RANGE_HI,12h \
+    --dhcp-host=$GUEST_MAC,$GUEST_IP \
     --dhcp-option=3,$GW --dhcp-option=6,$GW \
     --dhcp-authoritative --log-dhcp \
     --log-facility=/var/tmp/dnsmasq.log --pid-file=/var/tmp/dnsmasq.pid"
@@ -87,4 +98,15 @@ runsh "iptables -t nat -C POSTROUTING -s $SUBNET -j MASQUERADE 2>/dev/null || ip
 runsh "iptables -C FORWARD -i $TAP -j ACCEPT 2>/dev/null || iptables -A FORWARD -i $TAP -j ACCEPT"
 runsh "iptables -C FORWARD -o $TAP -j ACCEPT 2>/dev/null || iptables -A FORWARD -o $TAP -j ACCEPT"
 
-say "OK. Next: scripts/firecracker/build.sh && scripts/firecracker/run.sh"
+# SSH forward: lima auto-forwards a guest LISTENING socket to the host, so socat
+# here makes the microVM reachable from macOS at localhost:$SSH_PORT.
+if runsh "pgrep -f 'socat.*$SSH_PORT' >/dev/null 2>&1"; then
+  say "socat already forwarding $SSH_PORT -> $GUEST_IP:22"
+else
+  runsh "command -v socat >/dev/null 2>&1 || (DEBIAN_FRONTEND=noninteractive apt-get install -y socat >/dev/null 2>&1)"
+  say "forwarding $SSH_PORT -> $GUEST_IP:22"
+  runsh "nohup socat TCP-LISTEN:$SSH_PORT,fork,reuseaddr TCP:$GUEST_IP:22 >/var/tmp/socat.log 2>&1 &"
+fi
+
+say "OK. Next: overlays/devbox-firecracker/build.sh && overlays/devbox-firecracker/run.sh"
+say "Once sshd is up:  ssh -p $SSH_PORT root@localhost"

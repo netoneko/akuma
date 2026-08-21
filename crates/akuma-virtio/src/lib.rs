@@ -57,7 +57,11 @@ pub use probe::{device_id, num_slots, slot_addr, slot_addrs};
 /// status register one milestone at a time, because Firecracker validates the
 /// virtio 1.0 §3.1.1 sequence strictly while QEMU does not. Read
 /// `transport`'s module header before changing anything here.
-pub use transport::SteppedMmioTransport as VirtioTransport;
+/// `'static` because the MMIO region is the kernel's permanent device mapping —
+/// virtio-drivers 0.13's `MmioTransport` borrows that region rather than holding
+/// a raw pointer, and it outlives every driver built on it.
+pub type VirtioTransport = transport::SteppedMmioTransport<'static>;
+pub use transport::SteppedMmioTransport;
 
 /// The tree's one heap-free print macro, re-exported so this crate's
 /// `crate::safe_print!(…)` call sites resolve.

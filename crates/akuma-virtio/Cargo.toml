@@ -12,8 +12,12 @@ workspace = true
 # probe helper and the drivers are written against. Must stay on the same
 # version the kernel and akuma-net use, or the `Hal` impl here does not satisfy
 # *their* `virtio_drivers::Hal` bound — the types would be from distinct crates.
-virtio-drivers = { version = "0.7", default-features = false }
+virtio-drivers = { version = "0.13", default-features = false }
 spinning_top = "0.3"
+# Only for the `Transport` trait bounds on read/write_config_space, which
+# virtio-drivers 0.13 states in terms of zerocopy traits. Must match the version
+# virtio-drivers itself uses, or the bounds refer to different traits.
+zerocopy = { version = "0.8", default-features = false }
 # The DMA `Hal` needs kernel phys<->virt translation, the probe needs the virtio
 # MMIO window base, and `block` needs `PreemptGuard`. All three used to come from
 # `akuma-exec`, which meant `akuma-net -> akuma-virtio -> akuma-exec` kept the net

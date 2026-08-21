@@ -55,28 +55,31 @@
 
 use virtio_drivers::PhysAddr;
 use virtio_drivers::transport::mmio::MmioTransport;
-use virtio_drivers::transport::{DeviceStatus, DeviceType, Transport};
+use virtio_drivers::transport::{DeviceStatus, DeviceType, InterruptStatus, Transport};
 
 /// A [`MmioTransport`] whose status writes always follow virtio 1.0 §3.1.1 one
 /// step at a time. See the module header.
+///
+/// The lifetime is `MmioTransport`'s own: as of virtio-drivers 0.13 it borrows
+/// the MMIO region rather than owning a raw pointer to it.
 #[derive(Debug)]
-pub struct SteppedMmioTransport(MmioTransport);
+pub struct SteppedMmioTransport<'a>(MmioTransport<'a>);
 
-impl SteppedMmioTransport {
+impl<'a> SteppedMmioTransport<'a> {
     /// Wrap an already-constructed transport.
     #[must_use]
-    pub const fn new(inner: MmioTransport) -> Self {
+    pub const fn new(inner: MmioTransport<'a>) -> Self {
         Self(inner)
     }
 
     /// The wrapped transport.
     #[must_use]
-    pub const fn inner(&self) -> &MmioTransport {
+    pub const fn inner(&self) -> &MmioTransport<'a> {
         &self.0
     }
 }
 
-impl Transport for SteppedMmioTransport {
+impl Transport for SteppedMmioTransport<'_> {
     /// The one method that is not a plain delegation.
     ///
     /// Walks from the current status to `status` through the intermediate values
@@ -162,10 +165,23 @@ impl Transport for SteppedMmioTransport {
     fn queue_used(&mut self, queue: u16) -> bool {
         self.0.queue_used(queue)
     }
-    fn ack_interrupt(&mut self) -> bool {
+    fn ack_interrupt(&mut self) -> InterruptStatus {
         self.0.ack_interrupt()
     }
-    fn config_space<T: 'static>(&self) -> virtio_drivers::Result<core::ptr::NonNull<T>> {
-        self.0.config_space::<T>()
+    fn read_config_generation(&self) -> u32 {
+        self.0.read_config_generation()
+    }
+    fn read_config_space<T: zerocopy::FromBytes + zerocopy::IntoBytes>(
+        &self,
+        offset: usize,
+    ) -> virtio_drivers::Result<T> {
+        self.0.read_config_space(offset)
+    }
+    fn write_config_space<T: zerocopy::IntoBytes + zerocopy::Immutable>(
+        &mut self,
+        offset: usize,
+        value: T,
+    ) -> virtio_drivers::Result<()> {
+        self.0.write_config_space(offset, value)
     }
 }

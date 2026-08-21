@@ -663,6 +663,13 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         console::print(" KB margin)\n");
     }
 
+    // The FDT may live outside boot.rs's static [0, 3 GiB) identity map: Firecracker
+    // places it in the last 2 MiB of guest RAM, so a 4 GiB microVM has it at ~6 GiB.
+    // Map its block before reading it, or `detect_memory` faults before printing
+    // anything about memory. No-op on QEMU virt, where the DTB is low.
+    // SAFETY: still on the boot page table, single-threaded, no other address space.
+    unsafe { mmu::ensure_boot_identity_covers(dtb_ptr) };
+
     let (ram_base, ram_size) = detect_memory(dtb_ptr);
 
     // Real (shared-kernel) SMP: snapshot CPU/PSCI info from the DTB NOW, before the

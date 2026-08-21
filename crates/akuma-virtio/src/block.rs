@@ -56,7 +56,7 @@ impl_display!(BlockError {
 /// Uses UnsafeCell for interior mutability because VirtIOBlk needs &mut self
 /// for read/write operations, but we want to share it through a Spinlock.
 pub struct VirtioBlockDevice {
-    inner: UnsafeCell<VirtIOBlk<VirtioHal, SteppedMmioTransport>>,
+    inner: UnsafeCell<VirtIOBlk<VirtioHal, SteppedMmioTransport<'static>>>,
     capacity_sectors: u64,
 }
 
@@ -67,7 +67,7 @@ unsafe impl Sync for VirtioBlockDevice {}
 
 impl VirtioBlockDevice {
     /// Create a new VirtIO block device wrapper
-    fn new(inner: VirtIOBlk<VirtioHal, SteppedMmioTransport>) -> Self {
+    fn new(inner: VirtIOBlk<VirtioHal, SteppedMmioTransport<'static>>) -> Self {
         let capacity_sectors = inner.capacity();
         Self {
             inner: UnsafeCell::new(inner),
@@ -91,7 +91,7 @@ impl VirtioBlockDevice {
     /// Caller must ensure exclusive access (e.g., via the BLOCK_DEVICE Spinlock).
     #[inline]
     #[allow(clippy::mut_from_ref)]
-    fn inner_mut(&self) -> &mut VirtIOBlk<VirtioHal, SteppedMmioTransport> {
+    fn inner_mut(&self) -> &mut VirtIOBlk<VirtioHal, SteppedMmioTransport<'static>> {
         unsafe { &mut *self.inner.get() }
     }
 
@@ -240,7 +240,7 @@ pub fn init() -> Result<(), BlockError> {
         log("[Block] Found virtio-blk at slot ");
         crate::safe_print!(32, "{}\n", i);
 
-        let Ok(blk) = VirtIOBlk::<VirtioHal, SteppedMmioTransport>::new(transport) else {
+        let Ok(blk) = VirtIOBlk::<VirtioHal, SteppedMmioTransport<'static>>::new(transport) else {
             log("[Block] Failed to init virtio device\n");
             return None;
         };

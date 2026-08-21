@@ -90,7 +90,7 @@ akuma-primitives = { path = "../akuma-primitives" }
 # akuma-virtio's hal.rs for why this crate no longer carries its own.
 akuma-virtio = { path = "../akuma-virtio" }
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
-virtio-drivers = { version = "0.7", default-features = false }
+virtio-drivers = { version = "0.13", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }
 spinning_top = "0.3"
 # NOT `max_level_off`: that feature elides every `log::` macro at COMPILE time,

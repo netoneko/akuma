@@ -59,7 +59,8 @@ unsafe impl Hal for VirtioHal {
 
         assert!(!virt.is_null(), "DMA allocation failed");
 
-        let phys = virt_to_phys(virt as usize);
+        // `PhysAddr` is `u64` as of virtio-drivers 0.13 (was `usize`).
+        let phys = virt_to_phys(virt as usize) as PhysAddr;
         // SAFETY: just asserted non-null.
         let ptr = unsafe { NonNull::new_unchecked(virt) };
 
@@ -81,11 +82,11 @@ unsafe impl Hal for VirtioHal {
     unsafe fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
         // SAFETY: caller contract — `paddr` is a mapped MMIO region, so its
         // linear-map VA is non-null.
-        unsafe { NonNull::new_unchecked(phys_to_virt(paddr)) }
+        unsafe { NonNull::new_unchecked(phys_to_virt(paddr as usize)) }
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> PhysAddr {
-        virt_to_phys(buffer.as_ptr().cast::<u8>() as usize)
+        virt_to_phys(buffer.as_ptr().cast::<u8>() as usize) as PhysAddr
     }
 
     unsafe fn unshare(_paddr: PhysAddr, _buffer: NonNull<[u8]>, _direction: BufferDirection) {

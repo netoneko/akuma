@@ -39,6 +39,59 @@ pub fn init(ram_base: usize, ram_size: usize) {
 /// must be mapped at runtime once the detected RAM size is known.
 const BOOT_STATIC_MAP_END: usize = 0xC000_0000; // 3 GB
 
+/// Ensure the boot identity map covers `addr`, mapping its 1 GiB block if not.
+///
+/// `boot.rs` statically maps `[0, 3 GiB)`. That is enough for QEMU virt, where
+/// the DTB is placed immediately after the kernel image at a low address. It is
+/// **not** enough for Firecracker, which puts the FDT in the last 2 MiB of guest
+/// RAM: a 4 GiB microVM has RAM at `0x8020_0000..0x1_8020_0000` and its FDT at
+/// roughly 6 GiB, far outside the static map. Reading `x0` there faults before
+/// the kernel has printed a single line about memory.
+///
+/// [`extend_boot_ram_identity_map`] cannot solve this — it needs the RAM size,
+/// which is precisely what the FDT is being read to discover. So this maps one
+/// 1 GiB block on demand, before the read.
+///
+/// Only the block containing `addr` is mapped, deliberately: mapping the whole
+/// 512 GiB L1 as Normal memory would invite speculative access to addresses with
+/// no backing store.
+///
+/// # Safety
+/// Must run on the boot page table, single-threaded, before any other address
+/// space exists.
+#[cfg(target_os = "none")]
+pub unsafe fn ensure_boot_identity_covers(addr: usize) {
+    let idx = addr >> 30;
+    if idx == 0 || idx > 511 {
+        return; // block 0 is the device block; anything past 511 is not addressable here
+    }
+    if addr < BOOT_STATIC_MAP_END {
+        return; // already covered by boot.rs's static blocks
+    }
+
+    let l0_phys = (get_boot_ttbr0() & 0x0000_FFFF_FFFF_F000) as usize;
+    if l0_phys == 0 {
+        return;
+    }
+    let l0 = phys_to_virt(l0_phys) as *const u64;
+    let l0_0 = unsafe { core::ptr::read_volatile(l0) };
+    let l1_phys = (l0_0 & 0x0000_FFFF_FFFF_F000) as usize;
+    let l1 = phys_to_virt(l1_phys) as *mut u64;
+
+    // Same attributes boot.rs uses for its RAM blocks.
+    let block_flags =
+        flags::VALID | flags::BLOCK | flags::AF | flags::SH_INNER | attr_index(MAIR_NORMAL_WB);
+
+    unsafe {
+        let existing = core::ptr::read_volatile(l1.add(idx));
+        if existing & flags::VALID != 0 {
+            return; // already mapped
+        }
+        core::ptr::write_volatile(l1.add(idx), ((idx << 30) as u64) | block_flags);
+        core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb");
+    }
+}
+
 /// Extend the boot TTBR0 identity map to cover ALL detected RAM.
 ///
 /// `boot.rs` statically maps only `[0, 3GB)`. The PMM, however, hands out frames

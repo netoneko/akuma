@@ -81,7 +81,8 @@ pub fn init_at(addr: usize) -> Result<[u8; 6], &'static str> {
         core::ptr::NonNull::new(addr as *mut VirtIOHeader).ok_or("tap: bad mmio addr")?;
     let transport =
         VirtioTransport::new(
-        unsafe { MmioTransport::new(header_ptr) }.map_err(|_| "tap: transport init failed")?,
+        unsafe { MmioTransport::new(header_ptr, akuma_primitives::addr::virtio_stride()) }
+            .map_err(|_| "tap: transport init failed")?,
     );
     let inner = VirtIONetRaw::new(transport).map_err(|_| "tap: VirtIONetRaw init failed")?;
 
