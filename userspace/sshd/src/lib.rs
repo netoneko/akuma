@@ -18,4 +18,5 @@
 
 extern crate alloc;
 
+pub mod client_wire;
 pub mod wire;

@@ -160,7 +160,14 @@ done
 
 if [ -n "$MEMBER_ONLY" ]; then
     echo "Building $MEMBER_ONLY only..."
-    build_member "$MEMBER_ONLY"
+    # `ssh` is a second binary target in the `sshd` *package*
+    # (`userspace/sshd/src/bin/ssh/main.rs`), not a package of its own —
+    # `cargo build -p ssh` doesn't resolve. Build the package that owns it
+    # instead; `cargo build -p sshd` produces both `sshd` and `ssh` binaries,
+    # and the copy step below still keys off the original "ssh" name.
+    BUILD_PKG="$MEMBER_ONLY"
+    [ "$MEMBER_ONLY" == "ssh" ] && BUILD_PKG="sshd"
+    build_member "$BUILD_PKG"
     if [ "$MEMBER_ONLY" == "tcc" ]; then
         # tcc ships only libtcc1.tar (libtcc1.a + tcc's internal headers). The
         # musl sysroot is NOT shipped — install it on Akuma with `apk add musl-dev`.
@@ -261,6 +268,10 @@ BINARIES=(
     "tcc"
     "tar"
     "sshd"
+    # Second binary target in the `sshd` package (`src/bin/ssh/main.rs`), not
+    # a package of its own — built for free by the "sshd" step in $MEMBERS
+    # above, just copied here under its own name.
+    "ssh"
 )
 
 for bin in "${BINARIES[@]}"; do
