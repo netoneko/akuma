@@ -132,14 +132,41 @@ profile) on 2026-08-10; see `docs/archive/BUILTIN_SSH_REMOVAL.md`.
 
 ## 3. Connect
 
+Publickey auth is required — `sshd`'s default build ignores
+`disable_key_verification` regardless of what `/etc/sshd/sshd.conf` says (it
+only takes effect in an `insecure-disable-key-verification` build; see
+[`../reference/subsystems/ssh.md`](../reference/subsystems/ssh.md) § Auth
+model). Ed25519 keys only — RSA is rejected. Stage your pubkey into the image
+before connecting:
+
+```bash
+docker run --rm --privileged \
+    -v "$(pwd)/devbox.img:/disk.img" \
+    -v "$HOME/.ssh/id_ed25519.pub:/pubkey.pub:ro" \
+    alpine:latest \
+    sh -c '
+        mkdir -p /mnt/disk
+        mount -o loop /disk.img /mnt/disk
+        cp /pubkey.pub /mnt/disk/etc/sshd/authorized_keys
+        chmod 644 /mnt/disk/etc/sshd/authorized_keys
+        sync
+        umount /mnt/disk
+    '
+```
+
+This has to be redone after any `bootstrap.sh` rebuild — step 3 there wipes
+`/etc` entirely and re-overlays it from `overlays/devbox/rootfs/`, which does
+**not** ship an `authorized_keys` (a personal key doesn't belong committed to
+the repo). It survives a plain binary re-stage (e.g. `userspace/build.sh
+--sshd-only` + copying just `sshd`/`ssh` into the image), since that only
+touches `/bin`.
+
 ```bash
 ssh -o StrictHostKeyChecking=no -p 2223 root@localhost
 ```
 
-`/etc/sshd/sshd.conf` sets `disable_key_verification = true` (local dev VM), so
-no key setup is needed. The host key is auto-generated on first boot at
-`/etc/sshd/id_ed25519`; after a rebuild run
-`ssh-keygen -R "[localhost]:2223"`.
+The host key is auto-generated on first boot at `/etc/sshd/id_ed25519`; after
+a rebuild run `ssh-keygen -R "[localhost]:2223"`.
 
 ## Verify
 
@@ -178,6 +205,10 @@ curl https://ifconfig.me               # HTTPS over rump (verifies CA bundle)
   accessible.
 - **Port 2223 busy** — `pkill -9 qemu-system-aarch64`, or set
   `RUMP_SSH_PORT=2224`.
+- **`Permission denied (publickey)`** — no `/etc/sshd/authorized_keys` on the
+  image, or it holds the wrong key. Stage yours per § Connect above; check
+  what's currently on the image with the same docker-mount trick, swapping the
+  `cp` for a `cat /mnt/disk/etc/sshd/authorized_keys`.
 
 ## Background
 

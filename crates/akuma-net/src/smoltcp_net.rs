@@ -1773,6 +1773,24 @@ pub fn note_connect_started(handle: SocketHandle) {
     });
 }
 
+/// Drop `handle`'s entry from `connecting`, if it has one.
+///
+/// Split out of [`socket_close`] as a pure function over plain data so the
+/// invariant is host-testable without a real smoltcp `SocketSet` — see
+/// `smoltcp_close_removes_connecting_entry` in `tests.rs`.
+///
+/// A close() on a socket still in `SynSent` (non-blocking connect, fd closed
+/// before the handshake finished) transitions it straight to `Closed`, which
+/// the `pending_removal` sweep in `poll()` frees on its very next pass. If
+/// `handle` were left in `connecting`, the sweep right after it in the same
+/// `poll()` call would call `sockets.get()` on an already-removed handle and
+/// panic with smoltcp's "handle does not refer to a valid socket" — this is
+/// what actually happened, not a rare race: any non-blocking connect closed
+/// before it establishes hits it deterministically.
+pub(crate) fn purge_connecting(connecting: &mut Vec<(SocketHandle, u64)>, handle: SocketHandle) {
+    connecting.retain(|(h, _)| *h != handle);
+}
+
 pub fn socket_close(handle: SocketHandle) {
     if !is_valid_handle(handle) {
         crate::safe_print!(72, "[NET] CORRUPT HANDLE in socket_close: handle={handle}\n");
@@ -1782,6 +1800,7 @@ pub fn socket_close(handle: SocketHandle) {
         let socket = net.sockets.get_mut::<tcp::Socket>(handle);
         socket.close();
         net.pending_removal.push((handle, (runtime().uptime_us)()));
+        purge_connecting(&mut net.connecting, handle);
     });
 }
 
@@ -1828,6 +1847,14 @@ fn socket_handle_index(handle: SocketHandle) -> usize {
 /// Check if a `SocketHandle` index is within the valid range for our socket set.
 fn is_valid_handle(handle: SocketHandle) -> bool {
     socket_handle_index(handle) < MAX_SOCKETS
+}
+
+/// Build a `SocketHandle` from a raw index for host tests, which have no real
+/// `SocketSet` to call `add()` on. The inverse of [`socket_handle_index`]; see
+/// that function's safety note.
+#[cfg(test)]
+pub(crate) fn test_socket_handle(idx: usize) -> SocketHandle {
+    unsafe { core::mem::transmute::<usize, SocketHandle>(idx) }
 }
 
 impl TcpStream {

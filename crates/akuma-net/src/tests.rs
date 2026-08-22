@@ -406,6 +406,53 @@ mod recv_eof_state_tests {
 /// listening handles and the port went permanently deaf — verified live on
 /// 2026-08-20 by watching `/proc/net/tcp`'s BACKLOG column go `32/0/0` →
 /// `0/0/32` (`docs/archive/NGINX_MISSING_SYSCALLS.md` Issue E1).
+/// `purge_connecting` — the bookkeeping fix behind the smoltcp panic
+/// "handle does not refer to a valid socket".
+///
+/// A non-blocking `connect()` in `SynSent` sits in `net.connecting` until it
+/// either establishes or times out. If the app instead `close()`s the fd
+/// first, `socket_close` snaps the socket straight to `Closed` and queues it
+/// in `pending_removal`, which `poll()`'s GC sweep frees on its very next
+/// pass — before the `connecting` sweep that runs right after it in the same
+/// `poll()` call. Leaving a stale entry in `connecting` meant that sweep
+/// called `sockets.get()` on an already-removed handle and crashed the
+/// kernel. `purge_connecting` is the fix: `socket_close` must drop the
+/// handle's `connecting` entry in the same step that queues it for removal.
+#[cfg(all(test, feature = "smoltcp"))]
+mod connecting_bookkeeping_tests {
+    use crate::smoltcp_net::{purge_connecting, test_socket_handle};
+
+    #[test]
+    fn closing_a_connecting_handle_removes_its_entry() {
+        let h = test_socket_handle(3);
+        let mut connecting = vec![(h, 1_000u64)];
+        purge_connecting(&mut connecting, h);
+        assert!(connecting.is_empty(), "the closed handle must not survive in `connecting`");
+    }
+
+    /// The bug in one line: without this, `connecting` still names a handle
+    /// that `pending_removal`'s GC sweep is about to free from the real
+    /// `SocketSet`, and the very next sweep in the same `poll()` call
+    /// dereferences it.
+    #[test]
+    fn only_the_closed_handles_own_entry_is_removed() {
+        let closed = test_socket_handle(1);
+        let still_connecting = test_socket_handle(2);
+        let mut connecting = vec![(closed, 1_000u64), (still_connecting, 2_000u64)];
+        purge_connecting(&mut connecting, closed);
+        assert_eq!(connecting, vec![(still_connecting, 2_000u64)]);
+    }
+
+    #[test]
+    fn closing_a_handle_never_in_connecting_is_a_no_op() {
+        let established = test_socket_handle(5);
+        let connecting_handle = test_socket_handle(6);
+        let mut connecting = vec![(connecting_handle, 1_000u64)];
+        purge_connecting(&mut connecting, established);
+        assert_eq!(connecting, vec![(connecting_handle, 1_000u64)]);
+    }
+}
+
 #[cfg(feature = "smoltcp")]
 mod listener_backlog_tests {
     use crate::socket::backlog_handle_is_live;
