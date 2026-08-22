@@ -27,6 +27,21 @@ Routes
                               separates "delayed first byte" from "any long idle
                               window", which the archive doc explicitly could
                               not distinguish.
+  GET /dropmid/<pre>/<gap>    Like /gap, but instead of completing the response
+                              after the idle window, closes the raw socket —
+                              no terminating chunk. Simulates a peer (e.g. an
+                              LLM API) dying mid-stream: ESTABLISHED with data
+                              already read -> CLOSE_WAIT with the app-level
+                              response never finished. /gap always completes
+                              cleanly and cannot reproduce this shape.
+  GET /keepalive/<idle>       200 OK, `Connection: keep-alive` (unlike every
+                              other route, which sends `close` and so can
+                              never be pooled). After the response, the
+                              server holds the socket open, sleeps <idle>
+                              seconds, then force-closes it unprompted --
+                              a server-initiated idle-connection close, the
+                              shape a pooled reqwest connection can be reused
+                              against after the peer already hung up.
   GET /sse/<gap>/<n>          <n> SSE events, <gap> seconds apart, then
                               `data: [DONE]`. Shaped like the Ollama/OpenAI
                               streaming response nca actually consumes.
@@ -230,6 +245,62 @@ class Handler(socketserver.StreamRequestHandler):
             self.send_chunk(f"second after {gap}s gap\n".encode())
             self.end_chunks()
 
+        elif kind == "keepalive":
+            # Unlike every other route, this does NOT send `Connection: close`
+            # -- the point is to let the client pool the connection, so
+            # /reuse-style probes can test "server force-closes an idle
+            # pooled connection, client reuses it for a later request" without
+            # the reqwest client refusing to pool in the first place.
+            body = b"ok\n"
+            self.send_head(
+                "200 OK",
+                {
+                    "Content-Type": "text/plain",
+                    "Content-Length": str(len(body)),
+                    "Connection": "keep-alive",
+                },
+            )
+            self.send_raw(body, "body")
+            # Keep this handler thread alive without reading again, so the
+            # underlying socket stays open (from the client's point of view,
+            # sitting idle in its pool) instead of returning to the accept
+            # loop's per-connection cleanup immediately. Path is
+            # /keepalive/<idle_secs>.
+            idle = num(0, 5.0)
+            log(f"{self.client_address[0]} idling {idle}s before force-closing the keep-alive connection")
+            time.sleep(idle)
+            log(f"{self.client_address[0]} !! force-closing idle keep-alive connection (server-initiated)")
+            try:
+                self.connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            self.connection.close()
+
+        elif kind == "dropmid":
+            # Like /gap, but instead of completing the response after the idle
+            # window, the server just closes the raw socket — no terminating
+            # chunk, no clean HTTP framing. This is an LLM API connection dying
+            # mid-SSE-stream, not a client-initiated close: the guest's socket
+            # goes ESTABLISHED -> CLOSE_WAIT with data already read and a
+            # response the app-level protocol never finished. Added 2026-08-22
+            # chasing a live nca hang where exactly that state was observed
+            # (`docs/runbooks/diagnose-hung-userspace-process.md`) and the
+            # existing /gap route couldn't reproduce it because it always
+            # completes cleanly.
+            pre = num(0, 0.0)
+            gap = num(1, 3.0)
+            time.sleep(pre)
+            self.start_chunked()
+            self.send_chunk(f"first after {pre}s\n".encode())
+            log(f"idling {gap}s mid-stream, then DROPPING the connection (no terminator)")
+            time.sleep(gap)
+            log(f"{self.client_address[0]} !! closing WITHOUT completing the response")
+            try:
+                self.connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            self.connection.close()
+
         elif kind == "sse":
             gap = num(0, 1.0)
             count = int(num(1, 5.0, 1, 1000))
@@ -287,7 +358,7 @@ def main() -> int:
     )
     print(
         "[delay-server] routes: /health /delay/<s> /gap/<pre>/<gap> "
-        "/sse/<gap>/<n> /drip/<total>/<n> /big/<mb>[/<s>]",
+        "/dropmid/<pre>/<gap> /keepalive/<idle> /sse/<gap>/<n> /drip/<total>/<n> /big/<mb>[/<s>]",
         flush=True,
     )
     try:

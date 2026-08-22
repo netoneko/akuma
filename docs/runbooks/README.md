@@ -10,6 +10,7 @@ Start from the symptom or task on the left.
 | You are... | Read |
 |---|---|
 | Booting a VM and connecting via SSH | [`boot-and-connect.md`](boot-and-connect.md) |
+| Not sure whether a devbox userspace process is actually hung or just slow | [`diagnose-hung-userspace-process.md`](diagnose-hung-userspace-process.md) — start here before kernel tracing or gdb |
 | Building the devbox image | [`build-devbox.md`](build-devbox.md) |
 | Building the `extreme-size` (4 MB floor) image | [`build-extreme-size.md`](build-extreme-size.md) |
 | Debugging the devbox (SSH down, cargo crash, 100% CPU) | [`debug-devbox.md`](debug-devbox.md) |

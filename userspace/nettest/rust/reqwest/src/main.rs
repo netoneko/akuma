@@ -34,6 +34,8 @@
 //! nettest-reqwest post   <url> <kb>                POST <kb> KiB of JSON-ish body
 //! nettest-reqwest sweep  <base> [secs,secs,…]      GET <base>/delay/<n> per n
 //! nettest-reqwest gap    <base> <pre> <gap>        GET <base>/gap/<pre>/<gap>
+//! nettest-reqwest reuse  <base> [idle]             GET <base>/keepalive/<idle> twice, across
+//!                                                   the server's own idle-close of the pool
 //! ```
 //!
 //! `<base>` is the host-side delay server: run `scripts/net_delay_server.py` on
@@ -451,6 +453,46 @@ async fn mode_gap(base: &str, pre: u64, gap: u64) -> i32 {
     }
 }
 
+/// Two requests on one shared `Client`, with a real wall-clock gap between
+/// them long enough for the SERVER to force-close the idle pooled connection
+/// in between. Every other mode in this probe hits routes that send
+/// `Connection: close`, so reqwest never pools them — this is the one mode
+/// that can catch "reused a connection the peer already hung up on", which
+/// is nca's actual keep-alive shape and was never covered before 2026-08-22
+/// (`docs/runbooks/diagnose-hung-userspace-process.md`).
+async fn mode_reuse(base: &str, idle: u64) -> i32 {
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/keepalive/{idle}");
+    let client = build_client();
+    println!("[probe] reuse idle={idle}s url={url}");
+    println!("[probe] reuse: first request (populates the pool)");
+    match mode_get(&client, &url, false).await {
+        Ok(tl) => println!("[probe] reuse: first OK body={} chunks={}", tl.body_bytes, tl.chunks),
+        Err(e) => {
+            print_fail(&e);
+            println!("[probe] REUSE FAIL: the FIRST request itself failed, not the reuse");
+            return 1;
+        }
+    }
+    println!("[probe] reuse: sleeping past the server's {idle}s idle-close so the pool holds a dead connection");
+    tokio::time::sleep(std::time::Duration::from_secs(idle + 1)).await;
+    println!("[probe] reuse: second request (reuses the pooled connection, if reqwest thinks it's still good)");
+    match mode_get(&client, &url, false).await {
+        Ok(tl) => {
+            println!("[probe] REUSE OK second request succeeded body={} chunks={}", tl.body_bytes, tl.chunks);
+            0
+        }
+        Err(e) => {
+            print_fail(&e);
+            println!(
+                "[probe] REUSE FAIL stage={} after_ms={} kind={} — reused a connection the peer already closed",
+                e.stage.as_str(), ms(e.after), e.kind
+            );
+            1
+        }
+    }
+}
+
 // ============================================================================
 // CLI
 // ============================================================================
@@ -463,6 +505,8 @@ fn usage() -> ! {
     eprintln!("  post   <url> <kb>             POST <kb> KiB of JSON-ish body");
     eprintln!("  sweep  <base> [secs,secs,…]   GET <base>/delay/<n> per n");
     eprintln!("  gap    <base> <pre> <gap>     GET <base>/gap/<pre>/<gap>");
+    eprintln!("  reuse  <base> [idle]          GET <base>/keepalive/<idle> twice, reusing the");
+    eprintln!("                                pool across the server's idle-close (default idle=2)");
     eprintln!();
     eprintln!("<base> is scripts/net_delay_server.py, e.g. http://10.0.2.2:18080");
     eprintln!("env: NETTEST_RT=current|multi NETTEST_TIMEOUT=<s> NETTEST_NEW_CLIENT=1");
@@ -525,6 +569,11 @@ async fn dispatch(args: Vec<String>) -> i32 {
             let gap = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(10);
             println!("[probe] impl=reqwest mode=gap");
             mode_gap(&args[2], pre, gap).await
+        }
+        "reuse" => {
+            let idle = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(2);
+            println!("[probe] impl=reqwest mode=reuse");
+            mode_reuse(&args[2], idle).await
         }
         _ => usage(),
     }
