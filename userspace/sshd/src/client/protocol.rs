@@ -48,6 +48,7 @@ const SSH_MSG_NEWKEYS: u8 = 21;
 const SSH_MSG_KEX_ECDH_INIT: u8 = 30;
 const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
 const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
+const SSH_MSG_USERAUTH_BANNER: u8 = 53;
 const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
 const SSH_MSG_REQUEST_FAILURE: u8 = 82;
 const SSH_MSG_CHANNEL_OPEN: u8 = 90;
@@ -510,23 +511,27 @@ fn authenticate(
     write_string(&mut none_req, b"none");
     conn.send_payload(&none_req)?;
 
-    let (msg_type, payload) = conn.recv_packet()?;
-    match msg_type {
-        SSH_MSG_USERAUTH_SUCCESS => return Ok(()), // server accepts anyone (disable_key_verification-style)
-        SSH_MSG_USERAUTH_FAILURE => {
-            let mut off = 0;
-            let methods = read_string(&payload, &mut off).unwrap_or(b"");
-            let methods_str = core::str::from_utf8(methods).unwrap_or("");
-            if !methods_str.split(',').any(|m| m == "publickey") {
+    loop {
+        let (msg_type, payload) = conn.recv_packet()?;
+        match msg_type {
+            SSH_MSG_USERAUTH_SUCCESS => return Ok(()), // server accepts anyone (disable_key_verification-style)
+            SSH_MSG_USERAUTH_FAILURE => {
+                let mut off = 0;
+                let methods = read_string(&payload, &mut off).unwrap_or(b"");
+                let methods_str = core::str::from_utf8(methods).unwrap_or("");
+                if !methods_str.split(',').any(|m| m == "publickey") {
+                    return Err(ClientError::Msg(format!(
+                        "server does not offer publickey authentication (offers: {methods_str})"
+                    )));
+                }
+                break;
+            }
+            SSH_MSG_USERAUTH_BANNER => print_auth_banner(&payload),
+            other => {
                 return Err(ClientError::Msg(format!(
-                    "server does not offer publickey authentication (offers: {methods_str})"
+                    "unexpected reply to auth query (message type {other})"
                 )));
             }
-        }
-        other => {
-            return Err(ClientError::Msg(format!(
-                "unexpected reply to auth query (message type {other})"
-            )));
         }
     }
 
@@ -551,20 +556,37 @@ fn authenticate(
     write_string(&mut req, &sig_blob);
     conn.send_payload(&req)?;
 
-    let (msg_type, payload) = conn.recv_packet()?;
-    match msg_type {
-        SSH_MSG_USERAUTH_SUCCESS => Ok(()),
-        SSH_MSG_USERAUTH_FAILURE => {
-            let mut off = 0;
-            let methods = read_string(&payload, &mut off).unwrap_or(b"");
-            Err(ClientError::Msg(format!(
-                "publickey authentication failed for user '{username}' (server offers: {})",
-                core::str::from_utf8(methods).unwrap_or("")
-            )))
+    loop {
+        let (msg_type, payload) = conn.recv_packet()?;
+        match msg_type {
+            SSH_MSG_USERAUTH_SUCCESS => return Ok(()),
+            SSH_MSG_USERAUTH_FAILURE => {
+                let mut off = 0;
+                let methods = read_string(&payload, &mut off).unwrap_or(b"");
+                return Err(ClientError::Msg(format!(
+                    "publickey authentication failed for user '{username}' (server offers: {})",
+                    core::str::from_utf8(methods).unwrap_or("")
+                )));
+            }
+            SSH_MSG_USERAUTH_BANNER => print_auth_banner(&payload),
+            other => {
+                return Err(ClientError::Msg(format!(
+                    "unexpected reply to publickey auth (message type {other})"
+                )));
+            }
         }
-        other => Err(ClientError::Msg(format!(
-            "unexpected reply to publickey auth (message type {other})"
-        ))),
+    }
+}
+
+/// `SSH_MSG_USERAUTH_BANNER` (RFC 4252 §5.4): a server may send this at any
+/// point during authentication (a login-of-the-day / legal notice), and it
+/// is *not* a reply to anything the client asked — a real client displays it
+/// and keeps waiting for the actual auth response, exactly like `late.sh`
+/// does on every connection.
+fn print_auth_banner(payload: &[u8]) {
+    let mut off = 0;
+    if let Some(text) = read_string(payload, &mut off) {
+        print(core::str::from_utf8(text).unwrap_or(""));
     }
 }
 

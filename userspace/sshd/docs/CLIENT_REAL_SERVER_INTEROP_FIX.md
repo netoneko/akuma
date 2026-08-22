@@ -18,10 +18,17 @@ or, once that was fixed, one step later:
 ssh: expected a reply to 'exec', got message type 93
 ```
 
-Neither is a crash — the client returns a clean `ClientError` and exits 255 —
-but from the outside it reads like one: the connection dies right around the
-point it's using the identity key, with no useful explanation of what
-actually went wrong.
+or, once *that* was fixed, against a server that sends a pre-auth banner
+(e.g. `ssh late.sh`, which shows one on every connection):
+
+```
+ssh: unexpected reply to auth query (message type 53)
+```
+
+None of these is a crash — the client returns a clean `ClientError` and
+exits 255 — but from the outside it reads like one: the connection dies
+right around the point it's using the identity key, with no useful
+explanation of what actually went wrong.
 
 ## 2. Root cause
 
@@ -38,7 +45,7 @@ match msg_type {
 ```
 
 That works only against a server that never sends anything else in between —
-true of Akuma's own `sshd`, false of real ones. Two SSH-2 message types are
+true of Akuma's own `sshd`, false of real ones. Three SSH-2 message types are
 legitimately allowed to show up first:
 
 - **`SSH_MSG_GLOBAL_REQUEST` (80)** — OpenSSH sends
@@ -51,6 +58,12 @@ legitimately allowed to show up first:
   send window before it replies to a channel request (`pty-req`, `exec`,
   `shell`), since window credit and the request/reply are independent pieces
   of per-channel state.
+- **`SSH_MSG_USERAUTH_BANNER` (53)** — RFC 4252 §5.4 lets a server send a
+  login banner (MOTD, legal notice, "please use a key") at any point
+  *during* authentication, not just once. It isn't a reply to the client's
+  `none`/`publickey` query at all; a real client displays it and keeps
+  waiting for the actual auth response. `late.sh` sends one on every single
+  connection, which is why this client had never round-tripped with it.
 
 The client's own interactive loop (`pump`, further down in the same file)
 already handles both correctly — this was a gap specific to the two
@@ -91,8 +104,14 @@ handling, not a case the client had never considered.
    since a window adjust can arrive before *any* of `pty-req`, `exec`, or
    `shell` gets its reply.
 
-Both sites now match the pattern `pump`'s main loop already used — this is a
-consolidation of message handling onto one convention, not a new one.
+3. **`authenticate`** (both the `none` probe and the `publickey` request):
+   both response waits now loop on `SSH_MSG_USERAUTH_BANNER`, printing the
+   banner text (`print_auth_banner` — UTF-8, best-effort, matches how a real
+   client surfaces it) instead of erroring, and keep waiting for the actual
+   `SUCCESS`/`FAILURE`/`PK_OK`.
+
+All three sites now match the pattern `pump`'s main loop already used — this
+is a consolidation of message handling onto one convention, not a new one.
 
 ## 4. Verification
 
@@ -119,6 +138,14 @@ hello_from_real_sshd
   `sshd`) re-verified working after the change, both with a rejected identity
   (clean auth-failure error, unchanged) and with an authorized one (`exec`
   round-trip, unchanged).
+- **`ssh late.sh`** (real internet server, no shared identity — the point of
+  the connection is its unauthenticated guest experience) — previously
+  failed immediately with `unexpected reply to auth query (message type
+  53)`. After the fix, the pre-auth banner prints (`late.sh requires SSH
+  public-key auth...`) and the session proceeds into late.sh's interactive
+  terminal app (alt-screen, mouse tracking, and its own escape-code
+  handshake all visible on the wire) instead of the client tearing the
+  connection down.
 - Host unit tests (`cargo test -p sshd --lib --no-default-features`): 29/29.
 - `cargo clippy -p sshd --bin ssh --release --target aarch64-unknown-none`:
   clean (one pre-existing, unrelated `too_many_arguments` warning on
