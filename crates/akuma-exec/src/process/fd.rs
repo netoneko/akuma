@@ -183,10 +183,14 @@ impl SharedFdTable {
     /// self-host hang). Popping per-iteration bounds an abandoned sweep's damage
     /// to the single in-flight entry.
     pub fn close_all(&self) {
+        let holder = self as *const Self as usize;
         loop {
             let entry = with_irqs_disabled(|| self.table.lock().pop_first());
-            let Some((_fd, fd)) = entry else { break };
+            let Some((fd_num, fd)) = entry else { break };
             match fd {
+                FileDescriptor::File(f) => {
+                    (runtime().flock_release)(&f.path, holder, fd_num);
+                }
                 FileDescriptor::Socket(idx) => {
                     (runtime().remove_socket)(idx);
                 }

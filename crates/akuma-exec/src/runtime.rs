@@ -153,6 +153,10 @@ pub struct ExecRuntime {
     pub eventfd_clone_ref: fn(u32),
     pub epoll_destroy: fn(u32),
     pub pidfd_close: fn(u32),
+    /// Release whatever `flock(2)` lock `(holder, fd)` — the `usize` is the
+    /// calling process's `SharedFdTable` `Arc` pointer, see `src/syscall/flock.rs`
+    /// — holds on `path`, if any. A no-op if it holds none.
+    pub flock_release: fn(&str, usize, u32),
 
     // VFS helpers
     pub resolve_symlinks: fn(&str) -> alloc::string::String,

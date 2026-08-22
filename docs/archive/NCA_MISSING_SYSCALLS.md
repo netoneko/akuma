@@ -5,10 +5,22 @@
 rustc 1.99.0 in the guest).
 **Status:** **submodule swapped to upstream 2026-08-17**; host-built upstream
 binary **verified against host Ollama from the guest** (two full round trips).
-In-guest build still blocked by the spawn EFAULT (§1); the slow-model hang
-(§2b) was **root-caused and FIXED 2026-08-17** — four kernel defects, see
-`SOCKET_DELAYED_FIRST_BYTE_HANG.md` § Resolution. Patches needed on top of upstream HEAD are in
-`userspace/nca/upstream-akuma-patches.patch`.
+The slow-model hang (§2b) was **root-caused and FIXED 2026-08-17** — four
+kernel defects, see `SOCKET_DELAYED_FIRST_BYTE_HANG.md` § Resolution. Patches
+needed on top of upstream HEAD are in `userspace/nca/upstream-akuma-patches.patch`.
+**§1's in-guest spawn EFAULT — STALE as of 2026-08-22.** A real, sustained
+in-guest self-hosted build (`/src/github.com/netoneko/akuma-cli`, many
+`cargo build`/`cargo check` invocations across a long nca session) completed
+Compiling/Checking steps repeatedly with **zero** `Bad address (os error 14)`
+or missing-`execve` symptoms — the failure mode §1 describes never
+reproduced once in that session. Not root-caused (no commit in the interim
+touches the pre-exec dance this section names as the suspect), so treat as
+**no longer reproducing, cause unknown** rather than fixed — if it resurfaces,
+the investigation notes below are still the starting point. The session that
+found this instead root-caused and fixed an unrelated bug: nca's own
+`execute_bash` timeout path didn't kill the child on expiry
+(`userspace/nca/docs/ISSUES.md`), which is what a hang immediately
+*following* a real (non-EFAULT) build failure actually was.
 Later on 2026-08-17: nca driven against **Z.ai GLM-4.7 over real HTTPS** from
 the guest (§6b); the stdin-pipe transfer route in §3 was **retested and works**
 (the "use HTTP" advice there is superseded); and the exit-time
@@ -27,7 +39,7 @@ kernel gap (§7).
 
 | Problem | Status |
 | --- | --- |
-| `cargo build` in guest: `could not execute process rustc ... Bad address (os error 14)` | **Open** — not a kernel syscall EFAULT; see §1 |
+| `cargo build` in guest: `could not execute process rustc ... Bad address (os error 14)` | **STALE 2026-08-22** — not reproducing on a real sustained self-hosted build; not root-caused, may recur; see §1 |
 | `socket(AF_UNIX)` unimplemented → nca IPC dies with EAFNOSUPPORT | **Patched in-tree** (bind failure degrades to IPC-less mode) |
 | Upstream HEAD won't cross-build: `openssl-sys` via `mcpr` + core's own `reqwest` | **Patched in-tree** (two one-liners, §4b) |
 | `scp`/SFTP into the guest times out | Use HTTP: host `python3 -m http.server`, guest `wget http://10.0.2.2:<port>/...` (§3) |
@@ -466,6 +478,54 @@ check the session JSON before chasing it as a network or model problem.
 
 Upstream-tokio-side the real defect is that the `?` at 767 should restore the
 buffer to `buf_cell` before returning.
+
+## 8. `flock(2)` was a no-op stub — implemented 2026-08-22/23
+
+Found while building `ncaprobe timeoutleak`'s contention check (see
+`userspace/nca/docs/ISSUES.md`): `nr::FLOCK` (syscall 32) dispatched to a
+bare `=> 0` in `src/syscall/mod.rs` — every `flock()` call **unconditionally
+reported success** with zero actual locking. `sh`'s `flock` applet never
+errored, which is why the probe's call B never blocked on call A's lock
+regardless of whether the leak fix worked: there was no lock to block on.
+Not confirmed whether real cargo's own build lock relies on `flock()`
+specifically (vs. `fcntl(F_SETLKW)`, not checked) — if it does, this stub is
+also why the "second cargo build contends with the orphaned first" part of
+`ISSUES.md`'s hang theory couldn't be verified either.
+
+**Implemented**, not yet booted/verified live (session ran out of budget
+first): real advisory locking in the new `src/syscall/flock.rs`, following
+the `pidfd.rs`/`pipe.rs` module pattern already in this file. Design:
+
+- Locks keyed by **path string** (matching `KernelFile`, which itself has no
+  inode number — see that struct) — not the true inode, so hardlinks/bind
+  mounts to the same file are not recognised as contending.
+- Holder identity is `(SharedFdTable Arc pointer, fd number)`, not a real
+  POSIX "open file description" — simpler, and correct for the motivating
+  case (one process, one fd, one lockfile), but a `dup()`'d fd does not
+  automatically become a joint holder the way real Linux's OFD-sharing
+  would. Full rationale in the module's doc comment.
+- Blocking `LOCK_EX`/`LOCK_SH` (no `LOCK_NB`) poll-retry every 10ms
+  (`schedule_blocking(now + 10_000)`, matching `signal.rs`'s `sigsuspend`
+  wait loop) rather than a real waiter/wake list — flock is not a hot path,
+  so this trades a little latency for not building new wake-list plumbing.
+- Auto-unlock-on-close wired into **both** fd-teardown paths this codebase
+  already has for exactly this reason (see `crates/akuma-exec/src/process/fd.rs`'s
+  own doc comment on a *previous* leak of this shape, for pipe `write_count`):
+  `sys_close` (`src/syscall/fs.rs`, direct call) and `SharedFdTable::close_all`
+  (process exit, via a new `runtime().flock_release` hook — `close_all` lives
+  in a lower crate that can't call `src/syscall/` directly).
+
+Files: `src/syscall/flock.rs` (new), `src/syscall/mod.rs` (dispatch, `pub mod
+flock`), `src/syscall/fs.rs` (`sys_close` hook), `crates/akuma-exec/src/runtime.rs`
+(`flock_release` hook field), `crates/akuma-exec/src/process/fd.rs` (`close_all`
+hook), `src/main.rs` (hook registration).
+
+Verified: `cargo check --release`, `cargo build --release`, and `cargo
+clippy --release -- -D warnings` all clean. **Not** verified against a
+booted kernel — re-run `ncaprobe timeoutleak` (`userspace/ncaprobe`, already
+has this exact scenario built in) once one is booted with this change; a fix
+that works should show call B blocking for the remainder of call A's held
+lock instead of completing in ~40ms.
 
 ## Background
 

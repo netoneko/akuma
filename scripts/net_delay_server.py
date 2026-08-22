@@ -11,6 +11,19 @@ per-delay one-liner.
     scripts/net_delay_server.py                 # listen on 0.0.0.0:18080
     scripts/net_delay_server.py --port 18081
     scripts/net_delay_server.py --verbose       # log every request + write
+    scripts/net_delay_server.py --tls           # HTTPS instead of HTTP, same routes
+
+--tls wraps every accepted connection in TLS using a throwaway self-signed
+cert generated fresh into a tempdir on startup (via the `openssl` CLI) and
+discarded on exit -- nothing is written under the repo. Point a client that
+skips cert validation at it (`nettest-reqwest`'s `NETTEST_INSECURE_TLS=1`,
+`nettest-std`'s `--insecure`, or plain `curl -k`). This exists specifically so
+`/keepalive` and `/dropmid` can be tested through a REAL TLS shutdown, not
+just a raw TCP one: `SSLSocket.close()` without a prior `unwrap()` skips the
+`close_notify` alert, so those two routes reused under `--tls` are an
+*unclean* TLS shutdown -- a FIN with no close_notify -- which is a different
+event for a TLS stack to process than the plain-TCP FIN the non-TLS server
+sends. See `docs/runbooks/diagnose-hung-userspace-process.md`.
 
 Routes
 ------
@@ -66,9 +79,14 @@ next request.
 """
 
 import argparse
+import atexit
+import shutil
 import socket
 import socketserver
+import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -339,6 +357,44 @@ class Handler(socketserver.StreamRequestHandler):
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    # Set to an ssl.SSLContext by main() when --tls is passed; None means
+    # plain HTTP.
+    tls_context = None
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        if self.tls_context is not None:
+            # server_side=True: this is TLS's accept()-equivalent, the
+            # handshake happens here before the Handler ever sees the socket.
+            # A raw `sock.close()` later (as /keepalive and /dropmid do) skips
+            # `unwrap()`, so it never sends `close_notify` -- an UNCLEAN TLS
+            # shutdown, deliberately, see the --tls flag's help text.
+            sock = self.tls_context.wrap_socket(sock, server_side=True)
+        return sock, addr
+
+
+def generate_self_signed_cert() -> str:
+    """Write a throwaway 1-day self-signed cert+key into a fresh tempdir via
+    the `openssl` CLI and return the dir. Registered with atexit for cleanup;
+    nothing under the repo is touched."""
+    if shutil.which("openssl") is None:
+        print("error: --tls needs the `openssl` CLI on PATH", file=sys.stderr)
+        sys.exit(1)
+    d = tempfile.mkdtemp(prefix="net_delay_server_tls_")
+    atexit.register(shutil.rmtree, d, ignore_errors=True)
+    key = f"{d}/key.pem"
+    cert = f"{d}/cert.pem"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-days", "1", "-nodes",
+            "-keyout", key, "-out", cert, "-subj", "/CN=localhost",
+            "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:10.0.2.2",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    print(f"[delay-server] generated throwaway TLS cert in {d} (deleted on exit)", flush=True)
+    return d
 
 
 def main() -> int:
@@ -347,13 +403,21 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=18080)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--verbose", "-v", action="store_true")
+    ap.add_argument("--tls", action="store_true", help="serve HTTPS with a throwaway self-signed cert")
     args = ap.parse_args()
     VERBOSE = args.verbose
 
     srv = Server((args.host, args.port), Handler)
+    scheme = "http"
+    if args.tls:
+        cert_dir = generate_self_signed_cert()
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(f"{cert_dir}/cert.pem", f"{cert_dir}/key.pem")
+        srv.tls_context = ctx
+        scheme = "https"
     print(
         f"[delay-server] listening on {args.host}:{args.port} "
-        f"— guest reaches it at http://10.0.2.2:{args.port}",
+        f"— guest reaches it at {scheme}://10.0.2.2:{args.port}",
         flush=True,
     )
     print(

@@ -37,6 +37,7 @@ pub mod msgqueue;
 #[cfg(kernel_framebuffer)]
 mod fb;
 pub mod fs;
+pub mod flock;
 pub mod mem;
 mod net;
 /// Boot self-test for the net bounce-buffer allocator (see `net::alloc_net_bounce`).
@@ -833,7 +834,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETPGID => proc::sys_getpgid(args[0] as u32),
         nr::SETSID => proc::sys_setsid(),
         nr::UNAME => proc::sys_uname(args[0]),
-        nr::FLOCK => 0,
+        nr::FLOCK => flock::sys_flock(args[0] as u32, args[1] as u32),
         nr::UMASK => 0o022,
         nr::UTIMENSAT => 0,
         nr::FDATASYNC => 0,

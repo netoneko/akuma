@@ -1845,6 +1845,10 @@ pub fn sys_close(fd: u32) -> u64 {
                 akuma_exec::process::FileDescriptor::DevDsp => {
                     crate::audio::stop();
                 }
+                akuma_exec::process::FileDescriptor::File(f) => {
+                    let holder = alloc::sync::Arc::as_ptr(&proc.fds) as usize;
+                    super::flock::flock_release(&f.path, holder, fd);
+                }
                 _ => {}
             }
             0

@@ -14,6 +14,9 @@
 //! cross                            epoll_wait on one thread, epoll_ctl on another
 //! fds                              open fds, which are epolls, and fd aliasing
 //! waitid                           waitid(P_PIDFD, ...) — tokio's reaping call
+//! timeoutleak [--fixed]            does a timed-out Command orphan its child? (nca bash.rs bug,
+//!                                   fixed 2026-08-22 by adding .kill_on_drop(true); --fixed
+//!                                   re-adds it here to show the contrast)
 //! raw [main|thread|split]          tcsetattr(raw) + read(0), same/different thread
 //! sleepbench                       what a short nanosleep actually costs
 //! pollbench                        what a short epoll_wait timeout actually costs
@@ -1137,6 +1140,118 @@ fn probe_tokio(blocking_tui: bool, worker_threads: usize) {
     });
 }
 
+// ---------------------------------------------------------------- probe C2
+// nca's `bash.rs` `execute_bash` tool, verbatim: `tokio::time::timeout(secs,
+// cmd.output())`, and — as shipped, before this investigation's fix — no
+// `.kill_on_drop(true)` on the `Command`. Per tokio's own documented default,
+// dropping a `Child` without that flag does NOT signal the process; it keeps
+// running, orphaned. `--fixed` adds the flag back to show the contrast.
+//
+// Call A holds an flock well past its own timeout, simulating cargo holding
+// its own target-dir build lock across a command nca gave up on. Call B then
+// wants the same lock — real production shape: "cargo build" timed out,
+// then a later "cargo build" in the same workspace contends with the first,
+// STILL-RUNNING one for no reason its own log shows.
+
+async fn timeoutleak_run_one(label: &str, command: &str, timeout_secs: u64, fixed: bool) -> Option<i32> {
+    let t0 = Instant::now();
+    println!("--- {label}: sh -lc {command:?}  (timeout={timeout_secs}s)");
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-lc").arg(command).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if fixed {
+        cmd.kill_on_drop(true);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("    SPAWN FAILED: {e}");
+            return None;
+        }
+    };
+    let pid = child.id().map(|p| p as i32);
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+        Ok(Ok(status)) => {
+            println!("    completed in {}ms status={:?}", t0.elapsed().as_millis(), status.code());
+            None
+        }
+        Ok(Err(e)) => {
+            println!("    WAIT ERR after {}ms: {e}", t0.elapsed().as_millis());
+            None
+        }
+        Err(_) => {
+            println!(
+                "    *** TIMED OUT after {}ms (this is what nca reports to the model; pid={pid:?}) ***",
+                t0.elapsed().as_millis()
+            );
+            pid
+        }
+    }
+    // `child` (and, if `fixed`, its kill-on-drop) is dropped HERE, exactly
+    // where nca's `match timeout(...).await { Err(_) => ... }` drops it.
+}
+
+fn probe_timeoutleak(fixed: bool) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    println!(
+        "=== probe: nca bash.rs's timeout pattern {} ===",
+        if fixed { "WITH .kill_on_drop(true) (the fix)" } else { "AS SHIPPED (no kill_on_drop)" }
+    );
+
+    rt.block_on(async move {
+        let lockfile = "/tmp/ncaprobe_timeoutleak.lock";
+        let _ = std::fs::remove_file(lockfile);
+
+        let orphan_pid = timeoutleak_run_one(
+            "call A (holds an flock for 8s)",
+            &format!("flock {lockfile} -c 'sleep 8'"),
+            2,
+            fixed,
+        )
+        .await;
+
+        if let Some(pid) = orphan_pid {
+            std::thread::sleep(Duration::from_millis(300));
+            let alive = unsafe { libc::kill(pid, 0) == 0 };
+            println!(
+                "    orphan check: pid={pid} still alive={alive}  {}",
+                if alive {
+                    "*** LEAKED — still running after nca reported it timed out ***"
+                } else {
+                    "correctly killed"
+                }
+            );
+        }
+
+        // Independent of whether A leaked: does B's OWN timeout still fire at
+        // its OWN deadline? This isolates "the orphan causes contention" from
+        // "the timeout mechanism itself is broken" — they are different bugs
+        // and this probe is built to tell them apart.
+        let b_pid = timeoutleak_run_one(
+            "call B (wants the SAME lock, right after A)",
+            &format!("exec 9>{lockfile}; flock 9; echo GOT_LOCK"),
+            3,
+            fixed,
+        )
+        .await;
+        if let Some(pid) = b_pid {
+            let alive = unsafe { libc::kill(pid, 0) == 0 };
+            println!(
+                "    B also timed out (pid={pid} alive={alive}) — contention from A's orphan, \
+                 but B's OWN timeout still fired correctly: the leak, not the timer, is the bug"
+            );
+        } else {
+            println!("    call B completed within its own timeout");
+        }
+
+        let _ = std::fs::remove_file(lockfile);
+    });
+}
+
 // ---------------------------------------------------------------- probe D
 // Which fds are open, and which of them are epoll instances?
 // akuma's sys_epoll_ctl returns EBADF for a non-epoll fd and ENOENT for an
@@ -1267,6 +1382,10 @@ fn main() {
         Some("waitid") => {
             println!("=== probe: waitid(P_PIDFD) — tokio's reaping call ===");
             probe_waitid();
+        }
+        Some("timeoutleak") => {
+            let fixed = args.iter().any(|a| a == "--fixed");
+            probe_timeoutleak(fixed);
         }
         Some("cross") => {
             println!("=== probe: epoll_wait on one thread, epoll_ctl(ADD) on another ===");

@@ -129,7 +129,17 @@ this session; only one works reliably:
   keeps using the *old* binary in memory until it's restarted (`Ctrl+X Q`,
   relaunch) — swapping the file doesn't hot-reload it.
 
-## Building inside Akuma (self-hosted, currently blocked)
+## Building inside Akuma (self-hosted — status unclear as of 2026-08-22)
+
+**2026-08-22 update:** a real, sustained self-hosted build at
+`/src/github.com/netoneko/akuma-cli` completed many `cargo build`/`cargo
+check` steps in a row with no sign of the EFAULT below — the specific
+failure this section describes did not reproduce. Not root-caused as fixed
+(nothing in the interim touches the suspect code path), so this section is
+left as-is for the investigation trail; treat "currently blocked" as stale
+until someone confirms one way or the other. What *was* found in that same
+session: a real, unrelated hang once a build legitimately failed and nca's
+own `execute_bash` timeout didn't kill the child (fixed — `docs/ISSUES.md`).
 
 Tried 2026-08-18 with a full nightly Rust toolchain already installed on the
 guest disk (`scripts/populate_disk.sh --with-rust-toolchain`) and the

@@ -288,6 +288,13 @@ fn build_client() -> reqwest::Client {
         // so "does the hang need a reused connection?" is a one-env-var test.
         b = b.pool_max_idle_per_host(0);
     }
+    if env::var("NETTEST_INSECURE_TLS").is_ok() {
+        // For `scripts/net_delay_server.py --tls`'s throwaway self-signed
+        // cert ONLY. This probe exists to catch kernel/stack bugs in the
+        // shutdown path, not to validate certs, and a real endpoint is never
+        // pointed at with this set.
+        b = b.danger_accept_invalid_certs(true);
+    }
     b.build().expect("reqwest Client::build")
 }
 
