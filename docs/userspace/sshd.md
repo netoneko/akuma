@@ -10,6 +10,9 @@ Docs live at [`userspace/sshd/docs/`](../../userspace/sshd/docs/):
   silently lossy (kernel `ProcessChannel` drop-oldest, no backpressure) and
   newline-mangled below that (unconditional `\n`→`\r\n` on the live path only).
 - `EXIT_STATUS_FIX.md` — exit-status channel request (`ssh` no longer 255).
+- `CLIENT_REAL_SERVER_INTEROP_FIX.md` — `ssh` client vs a real server: it
+  choked on interleaved `GLOBAL_REQUEST`/`WINDOW_ADJUST` messages that only a
+  real (non-Akuma) sshd sends.
 - `LIMITATIONS.md`, `MIGRATION_SUMMARY.md`.
 
 See also: [`../reference/subsystems/ssh.md`](../reference/subsystems/ssh.md),

@@ -148,5 +148,6 @@ Only logic that needs no syscalls can live in the lib target — see
 | [`docs/FLOW.md`](docs/FLOW.md) | Session/channel lifecycle, the multiplexer, `shell` vs `exec` |
 | [`docs/EXIT_STATUS_FIX.md`](docs/EXIT_STATUS_FIX.md) | Why remote commands used to always return 255 |
 | [`docs/INTERACTIVE_SHELL_BRIDGE_DRAIN_FIX.md`](docs/INTERACTIVE_SHELL_BRIDGE_DRAIN_FIX.md) | Output lost at child exit, and the drain that fixed it |
+| [`docs/CLIENT_REAL_SERVER_INTEROP_FIX.md`](docs/CLIENT_REAL_SERVER_INTEROP_FIX.md) | `ssh` client vs a real server: unhandled interleaved `GLOBAL_REQUEST`/`WINDOW_ADJUST` |
 | [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | Known gaps |
 | [`docs/MIGRATION_SUMMARY.md`](docs/MIGRATION_SUMMARY.md) | History of the kernel → userspace port |

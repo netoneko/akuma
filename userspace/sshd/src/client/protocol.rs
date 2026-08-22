@@ -295,8 +295,26 @@ pub fn run(cfg: ClientConfig) -> Result<i32, ClientError> {
     write_u32(&mut open_payload, INITIAL_WINDOW);
     write_u32(&mut open_payload, MAX_PACKET);
     conn.send_payload(&open_payload)?;
-    let (msg_type, payload) = conn.recv_packet()?;
-    let (remote_channel, send_window, send_max_packet) = match msg_type {
+    // OpenSSH sends unsolicited SSH_MSG_GLOBAL_REQUEST (e.g.
+    // "hostkeys-00@openssh.com") right after auth succeeds, before replying
+    // to our CHANNEL_OPEN — RFC 4254 permits global requests at any time
+    // once the connection service is running. Swallow any of those here the
+    // same way the interactive loop does further down, instead of treating
+    // the first one as a protocol violation.
+    let (msg_type, payload) = loop {
+        let (msg_type, payload) = conn.recv_packet()?;
+        if msg_type == SSH_MSG_GLOBAL_REQUEST {
+            let mut off = 0;
+            let _req_name = read_string(&payload, &mut off);
+            let want_reply = payload.get(off).copied().unwrap_or(0) != 0;
+            if want_reply {
+                conn.send_payload(&[SSH_MSG_REQUEST_FAILURE])?;
+            }
+            continue;
+        }
+        break (msg_type, payload);
+    };
+    let (remote_channel, mut send_window, send_max_packet) = match msg_type {
         SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
             let mut off = 0;
             let _recipient = read_u32(&payload, &mut off);
@@ -333,7 +351,7 @@ pub fn run(cfg: ClientConfig) -> Result<i32, ClientError> {
         write_u32(&mut req, 0);
         write_string(&mut req, b"");
         conn.send_payload(&req)?;
-        expect_channel_reply(&mut conn, "pty-req")?;
+        expect_channel_reply(&mut conn, "pty-req", remote_channel, &mut send_window)?;
     }
 
     let mut req = vec![SSH_MSG_CHANNEL_REQUEST];
@@ -343,12 +361,12 @@ pub fn run(cfg: ClientConfig) -> Result<i32, ClientError> {
         req.push(1);
         write_string(&mut req, cmd.as_bytes());
         conn.send_payload(&req)?;
-        expect_channel_reply(&mut conn, "exec")?;
+        expect_channel_reply(&mut conn, "exec", remote_channel, &mut send_window)?;
     } else {
         write_string(&mut req, b"shell");
         req.push(1);
         conn.send_payload(&req)?;
-        expect_channel_reply(&mut conn, "shell")?;
+        expect_channel_reply(&mut conn, "shell", remote_channel, &mut send_window)?;
     }
 
     if want_pty {
@@ -550,14 +568,50 @@ fn authenticate(
     }
 }
 
-fn expect_channel_reply(conn: &mut Connection, what: &str) -> Result<(), ClientError> {
-    let (msg_type, _payload) = conn.recv_packet()?;
-    match msg_type {
-        SSH_MSG_CHANNEL_SUCCESS => Ok(()),
-        SSH_MSG_CHANNEL_FAILURE => Err(ClientError::Msg(format!("server rejected '{what}' request"))),
-        other => Err(ClientError::Msg(format!(
-            "expected a reply to '{what}', got message type {other}"
-        ))),
+/// Waits for the `CHANNEL_SUCCESS`/`CHANNEL_FAILURE` reply to a channel
+/// request, discarding two kinds of message a real server can legitimately
+/// interleave before that reply arrives: `SSH_MSG_GLOBAL_REQUEST` (RFC 4254
+/// permits these at any time once the connection service is running — see
+/// the matching comment at the `CHANNEL_OPEN` call site above) and
+/// `SSH_MSG_CHANNEL_WINDOW_ADJUST` for our channel (the server growing our
+/// send window before it's even replied to the request). The latter still
+/// has to be applied to `send_window`, not just dropped, or the client
+/// starts the interactive phase with a stale, too-small window.
+fn expect_channel_reply(
+    conn: &mut Connection,
+    what: &str,
+    channel: u32,
+    send_window: &mut u32,
+) -> Result<(), ClientError> {
+    loop {
+        let (msg_type, payload) = conn.recv_packet()?;
+        match msg_type {
+            SSH_MSG_CHANNEL_SUCCESS => return Ok(()),
+            SSH_MSG_CHANNEL_FAILURE => {
+                return Err(ClientError::Msg(format!("server rejected '{what}' request")));
+            }
+            SSH_MSG_CHANNEL_WINDOW_ADJUST => {
+                let mut off = 0;
+                if read_u32(&payload, &mut off) == Some(channel)
+                    && let Some(add) = read_u32(&payload, &mut off)
+                {
+                    *send_window = send_window.saturating_add(add);
+                }
+            }
+            SSH_MSG_GLOBAL_REQUEST => {
+                let mut off = 0;
+                let _req_name = read_string(&payload, &mut off);
+                let want_reply = payload.get(off).copied().unwrap_or(0) != 0;
+                if want_reply {
+                    conn.send_payload(&[SSH_MSG_REQUEST_FAILURE])?;
+                }
+            }
+            other => {
+                return Err(ClientError::Msg(format!(
+                    "expected a reply to '{what}', got message type {other}"
+                )));
+            }
+        }
     }
 }
 
