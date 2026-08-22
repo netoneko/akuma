@@ -25,9 +25,9 @@ use alloc::vec::Vec;
 // crate returns from `handle_publickey_auth`.
 pub use akuma_ssh_crypto::auth::AuthResult;
 
-use akuma_ssh_crypto::auth::{
-    build_failure_response, build_success_response, handle_publickey_auth,
-};
+use akuma_ssh_crypto::auth::{build_failure_response, handle_publickey_auth};
+#[cfg(feature = "insecure-disable-key-verification")]
+use akuma_ssh_crypto::auth::build_success_response;
 
 use super::config::SshdConfig;
 use super::crypto::read_string;
@@ -70,10 +70,25 @@ pub async fn handle_userauth_request(
         core::str::from_utf8(method)
     ));
 
-    // If key verification is disabled, accept any auth
+    // `disable_key_verification` is an auth bypass — a config-file typo or a
+    // stray copy-pasted dev config must not be able to turn it on in a
+    // binary nobody built with that in mind. It only takes effect when this
+    // binary was compiled with the `insecure-disable-key-verification`
+    // feature (off by default; see Cargo.toml). Without that feature, the
+    // config flag is parsed (so a config file isn't a hard error) but
+    // ignored, loudly, rather than silently.
+    #[cfg(feature = "insecure-disable-key-verification")]
     if config.disable_key_verification {
-        println("[SSH Auth] Key verification disabled, accepting auth");
+        println("[SSH Auth] Key verification disabled (insecure-disable-key-verification build), accepting auth");
         return (AuthResult::Success, build_success_response());
+    }
+    #[cfg(not(feature = "insecure-disable-key-verification"))]
+    if config.disable_key_verification {
+        println(
+            "[SSH Auth] WARNING: disable_key_verification is set in config, but this binary \
+             was NOT built with the 'insecure-disable-key-verification' feature -- ignoring it \
+             and requiring publickey auth",
+        );
     }
 
     match method {

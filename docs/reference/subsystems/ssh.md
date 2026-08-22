@@ -1,9 +1,10 @@
 # SSH
 
-Current-state architecture for Akuma's SSH server. Since 2026-08-10 there is
-exactly one: the **userspace `/bin/sshd`** (`userspace/sshd`). The built-in
-in-kernel SSH-2 server (`src/ssh/`, `crates/akuma-ssh`) was deleted from every
-profile — see
+Current-state architecture for Akuma's SSH server *and* client, both in
+`userspace/sshd` (two binary targets, `sshd` and `ssh`, in one package).
+Since 2026-08-10 there is exactly one server: the **userspace `/bin/sshd`**
+(`userspace/sshd`). The built-in in-kernel SSH-2 server (`src/ssh/`,
+`crates/akuma-ssh`) was deleted from every profile — see
 [`../../archive/BUILTIN_SSH_REMOVAL.md`](../../archive/BUILTIN_SSH_REMOVAL.md)
 for the measurements that motivated it (217 KB of `extreme` image, +308 KB of
 free RAM at the 4 MB floor) and
@@ -23,10 +24,19 @@ For debugging, see [`../../runbooks/debug-ssh-latency.md`](../../runbooks/debug-
 
 KEX `curve25519-sha256`; host key `ssh-ed25519`; encryption `aes128-ctr`; MAC
 `hmac-sha2-256`; compression `none`; auth **publickey (Ed25519 only — RSA
-rejected)**. Wire/crypto primitives live in the host-testable
-`crates/akuma-ssh-crypto` crate, which `userspace/sshd` links with
-`default-features = false` (dropping `fast`+`zeroize`, worth ~38 KB — see
-[`../../archive/TRIM_FAT_SSHD.md`](../../archive/TRIM_FAT_SSHD.md)).
+rejected)**. Both `sshd` and `ssh` speak exactly this suite — the client
+requires an exact match on all four algorithms and fails fast (naming which
+one) rather than negotiating a fallback. Wire/crypto primitives live in the
+host-testable `akuma-ssh-crypto` crate (server) and
+`userspace/sshd/src/client_wire.rs` (client, in the package's own lib
+target). `userspace/sshd` links `akuma-ssh-crypto` with
+`default-features = false` + `features = ["zeroize"]`: drops `fast`
+(curve25519-dalek's ~30 KB precomputed basepoint table — see
+[`../../archive/TRIM_FAT_SSHD.md`](../../archive/TRIM_FAT_SSHD.md); neither
+binary signs/verifies often enough for it to pay for itself) but keeps
+`zeroize` (key material zeroed on drop) on, since that one's a security
+property, not a size trade — see
+[`../../../userspace/sshd/docs/SECURITY_IMPROVEMENTS.md`](../../../userspace/sshd/docs/SECURITY_IMPROVEMENTS.md) §10.
 
 ## Userspace sshd (`userspace/sshd`)
 
@@ -59,6 +69,31 @@ copy had the same bug and was strictly worse — `panic=abort` at EL1 has no
 process boundary, so a 10-byte crafted packet took the whole VM down — but that
 implementation no longer exists, which closes it by deletion.
 
+## Userspace ssh client (`userspace/sshd`, binary `ssh`)
+
+Second `[[bin]]` target in the `sshd` package (`src/client/main.rs`), not a
+separate crate — see [`../../../userspace/sshd/docs/SSH_CLIENT.md`](../../../userspace/sshd/docs/SSH_CLIENT.md)
+for scope/usage/identity-keys/`known_hosts`, and
+[`../../../userspace/sshd/docs/SECURITY_IMPROVEMENTS.md`](../../../userspace/sshd/docs/SECURITY_IMPROVEMENTS.md)
+for an audit pass done immediately after writing it (several buffer-safety
+panics and a hang class fixed, entropy source for key material fixed, a few
+limitations accepted and documented rather than silently left).
+
+- Interactive shell over a `pty` (default) or one-shot `exec` (a command
+  given, no pty) — no SFTP/SCP, no port/agent/X11 forwarding, no rekeying.
+- **Real flow control** (channel window + max-packet honored both ways) and
+  a **TOFU `known_hosts`** (`$HOME/.ssh/known_hosts`, mismatch = hard
+  refuse) — both matter for a client reaching a third-party server it
+  doesn't control (the motivating case: `ssh late.sh`, an SSH BBS), even
+  though they're moot talking to this repo's own `sshd`.
+- Identity key precedence: `-i <path>` → `$HOME/.ssh/id_ed25519` →
+  `/etc/sshd/id_ed25519` (`sshd`'s own host key, reused) → generate + persist
+  to `$HOME/.ssh/id_ed25519`. Raw 32-byte format only, not OpenSSH PEM.
+- Host-tested pure wire logic (KEXINIT, exchange-hash, packet framing) lives
+  in `sshd::client_wire` (the package lib target) — the `ssh` binary itself
+  links `libakuma` unconditionally, same reason `sshd`'s own `main.rs` can't
+  be host-tested.
+
 ## Auth model
 
 - **Publickey only**, Ed25519 only; `password`/`none` rejected.
@@ -66,7 +101,11 @@ implementation no longer exists, which closes it by deletion.
   `publickey(no sig)` → server checks `authorized_keys` → `PK_OK` → client
   `publickey(sig)` → server verifies against `session_id` → `SUCCESS`.
 - `disable_key_verification` in `SshdConfig` returns `Success` unconditionally
-  (**test/local-dev only**, e.g. the devbox).
+  (**test/local-dev only**, e.g. the devbox) — and, since the client's
+  security audit, is *also* gated behind the `insecure-disable-key-verification`
+  Cargo feature (off by default): without it the config flag is parsed but
+  ignored, loudly, so a stray dev config can't silently disable auth in a
+  binary nobody built expecting that.
 - **Host key:** load 32-byte private key from `/etc/sshd/host_key`; if
   missing/wrong-length, generate via hardware RNG and best-effort persist.
   Public key auto-added to `/etc/sshd/authorized_keys`.
@@ -98,3 +137,5 @@ implementation no longer exists, which closes it by deletion.
 - `archive/SSH.md`, `archive/SSH_STREAMING_ARCHITECTURE.md`.
 - `archive/RICH_TERMINAL_INTERFACE_OVER_SSH.md`, `archive/INTERACTIVE_IO.md`.
 - `userspace/sshd/docs/FLOW.md`, `userspace/sshd/docs/LIMITATIONS.md`.
+- `userspace/sshd/docs/SSH_CLIENT.md`, `userspace/sshd/docs/SECURITY_IMPROVEMENTS.md`
+  — the `ssh` client and its security audit.

@@ -1,9 +1,10 @@
 //! Client-side SSH-2: version/KEX/auth handshake plus the interactive
 //! channel pump. Mirrors the algorithm suite `userspace/sshd` speaks
 //! (`curve25519-sha256` / `ssh-ed25519` / `aes128-ctr` / `hmac-sha2-256`) but
-//! is a fresh implementation — a `src/bin/*.rs` binary cannot share modules
-//! with `main.rs` (each is its own crate root), and the two sides parse
-//! opposite halves of the same wire format anyway.
+//! is a fresh implementation — `src/client/main.rs` (package binary `ssh`)
+//! and `src/main.rs` (`sshd`) are separate crate roots that can't share
+//! modules directly with each other, and the two sides parse opposite
+//! halves of the same wire format anyway.
 //!
 //! Scope, deliberately: no rekeying (one KEX per connection), no port/agent/
 //! X11 forwarding, no SFTP/SCP subsystem, no cipher/KEX negotiation beyond
@@ -67,6 +68,14 @@ const LOCAL_CHANNEL: u32 = 0;
 const INITIAL_WINDOW: u32 = 0x0010_0000; // 1 MiB — matches sshd's own confirmation
 const MAX_PACKET: u32 = 0x4000; // 16 KiB
 const WINDOW_ADJUST_THRESHOLD: u32 = 64 * 1024;
+/// Hard ceiling on how much unconsumed data `Connection::input_buffer` may
+/// hold. Without this, a peer that declares a packet_len far larger than it
+/// ever sends (or than we'd ever legitimately need) makes us buffer
+/// indefinitely while waiting for a "packet" that never completes — a
+/// memory-exhaustion DoS against this client, not the peer. 1 MiB is
+/// generous headroom over the 16 KiB `MAX_PACKET` this client ever asks a
+/// peer to keep to, while still bounding the worst case.
+const MAX_INPUT_BUFFER: usize = 1024 * 1024;
 
 /// Raw mode flags (`akuma_terminal::mode_flags`), duplicated locally the same
 /// way `userspace/termtest` does — libakuma doesn't re-export them.
@@ -147,8 +156,20 @@ pub fn run(cfg: ClientConfig) -> Result<i32, ClientError> {
     require_algo(&peer_algos.mac_s2c, client_wire::MAC_ALGO, "server-to-client MAC")?;
 
     // --- ECDH key exchange ---
+    // `conn.rng` (`SimpleRng`, an xorshift64 with 64 bits of state) is fine
+    // for the KEXINIT cookie and AES-CTR packet padding — neither is secret
+    // or security-load-bearing. The ephemeral X25519 secret is exactly the
+    // opposite: 64 bits of effective entropy for what's supposed to be a
+    // 256-bit key would collapse this exchange's real security margin to
+    // whatever it takes to brute-force a 64-bit RNG state. Pull directly
+    // from the kernel's hardware entropy instead, and refuse to proceed
+    // rather than silently fall back to a weak secret if that fails.
     let mut secret_bytes = [0u8; 32];
-    conn.rng.fill_bytes(&mut secret_bytes);
+    if getrandom(&mut secret_bytes).is_err() {
+        return Err(ClientError::Msg(String::from(
+            "couldn't obtain secure random bytes for the key exchange \u{2014} refusing to proceed",
+        )));
+    }
     let client_secret = StaticSecret::from(secret_bytes);
     let client_public = X25519PublicKey::from(&client_secret);
 
@@ -264,7 +285,8 @@ pub fn run(cfg: ClientConfig) -> Result<i32, ClientError> {
         )));
     }
 
-    let identity = keys::load_identity(cfg.identity.as_deref());
+    let identity = keys::load_identity(cfg.identity.as_deref())
+        .ok_or_else(|| ClientError::Msg(String::from("no usable SSH identity key available")))?;
     authenticate(&mut conn, &session_id, &cfg.username, &identity)?;
 
     let mut open_payload = vec![SSH_MSG_CHANNEL_OPEN];
@@ -380,11 +402,23 @@ impl Connection {
     /// Delegates to the host-tested framing in `sshd::client_wire` (this
     /// binary itself can't be host-tested — it links `libakuma`
     /// unconditionally — so the actual byte-parsing logic lives there).
-    fn try_take_packet(&mut self) -> Option<(u8, Vec<u8>)> {
-        if self.peer_newkeys_received && self.crypto.decrypt_cipher.is_some() {
+    ///
+    /// `Ok(None)` means "not enough bytes yet, try again once more arrive".
+    /// `Err` means the buffered bytes don't parse as a valid packet at all
+    /// (bad MAC, or a length field that can never become valid) — fatal,
+    /// since retrying can't change the outcome for bytes already in hand.
+    fn try_take_packet(&mut self) -> Result<Option<(u8, Vec<u8>)>, ClientError> {
+        let outcome = if self.peer_newkeys_received && self.crypto.decrypt_cipher.is_some() {
             client_wire::take_encrypted_packet(&mut self.input_buffer, &mut self.crypto)
         } else {
             client_wire::take_unencrypted_packet(&mut self.input_buffer, &mut self.crypto)
+        };
+        match outcome {
+            client_wire::TakePacket::Ready(msg_type, payload) => Ok(Some((msg_type, payload))),
+            client_wire::TakePacket::Incomplete => Ok(None),
+            client_wire::TakePacket::Malformed => Err(ClientError::Msg(String::from(
+                "peer sent a malformed SSH packet \u{2014} disconnecting",
+            ))),
         }
     }
 
@@ -396,11 +430,16 @@ impl Connection {
     /// can also service local stdin in the same loop.
     fn recv_packet(&mut self) -> Result<(u8, Vec<u8>), ClientError> {
         loop {
-            while let Some((msg_type, payload)) = self.try_take_packet() {
+            while let Some((msg_type, payload)) = self.try_take_packet()? {
                 match msg_type {
                     SSH_MSG_IGNORE | SSH_MSG_DEBUG | SSH_MSG_UNIMPLEMENTED => continue,
                     _ => return Ok((msg_type, payload)),
                 }
+            }
+            if self.input_buffer.len() > MAX_INPUT_BUFFER {
+                return Err(ClientError::Msg(String::from(
+                    "peer sent an oversized or never-completing packet \u{2014} disconnecting",
+                )));
             }
             let mut buf = [0u8; 4096];
             let n = self.stream.read(&mut buf)?;
@@ -586,6 +625,11 @@ fn pump(
             Ok(0) => return Ok(exit_code.unwrap_or(255)),
             Ok(n) => {
                 conn.input_buffer.extend_from_slice(&sock_buf[..n]);
+                if conn.input_buffer.len() > MAX_INPUT_BUFFER {
+                    return Err(ClientError::Msg(String::from(
+                        "peer sent an oversized or never-completing packet \u{2014} disconnecting",
+                    )));
+                }
                 did_io = true;
             }
             Err(e) if e.kind() == NetErrorKind::WouldBlock => {}
@@ -593,7 +637,7 @@ fn pump(
         }
 
         let mut should_close = false;
-        while let Some((msg_type, payload)) = conn.try_take_packet() {
+        while let Some((msg_type, payload)) = conn.try_take_packet()? {
             did_io = true;
             match msg_type {
                 SSH_MSG_CHANNEL_DATA => {
@@ -722,6 +766,8 @@ fn resolve_target(host: &str) -> Result<[u8; 4], ClientError> {
 }
 
 fn read_version_line(conn: &mut Connection) -> Result<Vec<u8>, ClientError> {
+    const MAX_BANNER_LINES: u32 = 100;
+    let mut banner_lines = 0u32;
     loop {
         let mut line = Vec::new();
         loop {
@@ -745,6 +791,12 @@ fn read_version_line(conn: &mut Connection) -> Result<Vec<u8>, ClientError> {
         }
         if line.starts_with(b"SSH-") {
             return Ok(line);
+        }
+        banner_lines += 1;
+        if banner_lines > MAX_BANNER_LINES {
+            return Err(ClientError::Msg(String::from(
+                "too many lines before the SSH version string \u{2014} giving up",
+            )));
         }
         // RFC 4253 §4.2: a server may send other lines (e.g. a banner) before
         // its version line — print them and keep reading.

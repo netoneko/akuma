@@ -74,10 +74,17 @@ fn try_load_raw_key(path: &str) -> Option<SigningKey> {
     Some(SigningKey::from_bytes(&bytes))
 }
 
-fn generate_and_save(path: &str) -> SigningKey {
-    let mut rng = super::crypto::new_seeded_rng();
+/// Generates and persists a new identity key. `None` if secure randomness
+/// wasn't available — this is the long-term key that authenticates every
+/// future connection, so (like the ephemeral KEX secret in `protocol.rs`)
+/// it must come from real hardware entropy, never `SimpleRng` (64 bits of
+/// state is nowhere near enough for a key meant to last).
+fn generate_and_save(path: &str) -> Option<SigningKey> {
     let mut key_bytes = [0u8; SECRET_KEY_LENGTH];
-    rng.fill_bytes(&mut key_bytes);
+    if libakuma::getrandom(&mut key_bytes).is_err() {
+        eprintln("ssh: couldn't obtain secure random bytes to generate an identity key");
+        return None;
+    }
     let key = SigningKey::from_bytes(&key_bytes);
 
     if let Some(dir) = parent_dir(path)
@@ -99,7 +106,7 @@ fn generate_and_save(path: &str) -> SigningKey {
     if let Err(e) = write_vec_to_file(&format!("{path}.pub"), pub_line.as_bytes()) {
         eprintln(&format!("ssh: warning: couldn't save {path}.pub (errno {e})"));
     }
-    key
+    Some(key)
 }
 
 /// Resolve the client identity key.
@@ -108,10 +115,14 @@ fn generate_and_save(path: &str) -> SigningKey {
 /// `$HOME` is `/root`), then `sshd`'s own host key
 /// (`/etc/sshd/id_ed25519`) if that's the only key already on the box, and
 /// finally a freshly generated key persisted to `$HOME/.ssh/id_ed25519`.
-pub fn load_identity(explicit: Option<&str>) -> SigningKey {
+///
+/// `None` only when no key could be loaded *and* none could be generated
+/// (no secure randomness available) — the caller must treat that as fatal,
+/// not fall back to any kind of default identity.
+pub fn load_identity(explicit: Option<&str>) -> Option<SigningKey> {
     if let Some(p) = explicit {
         if let Some(k) = try_load_raw_key(p) {
-            return k;
+            return Some(k);
         }
         eprintln(&format!(
             "ssh: identity file '{p}' not found or not a valid raw Ed25519 key; falling back to defaults"
@@ -120,14 +131,14 @@ pub fn load_identity(explicit: Option<&str>) -> SigningKey {
 
     let user_key_path = format!("{}/.ssh/id_ed25519", home_dir());
     if let Some(k) = try_load_raw_key(&user_key_path) {
-        return k;
+        return Some(k);
     }
 
     if let Some(k) = try_load_raw_key(SSHD_HOST_KEY_PATH) {
         println(&format!(
             "[ssh] no {user_key_path}; using sshd's host key ({SSHD_HOST_KEY_PATH}) as identity"
         ));
-        return k;
+        return Some(k);
     }
 
     println(&format!("[ssh] generating new identity key at {user_key_path}"));

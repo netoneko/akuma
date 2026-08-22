@@ -3,6 +3,15 @@ name = "sshd"
 version = "0.1.0"
 edition = "2024"
 
+# `src/main.rs` is still auto-discovered as the "sshd" binary (adding [[bin]]
+# entries doesn't disable that). Declared explicitly, rather than relying on
+# Cargo's `src/bin/ssh/main.rs` auto-discovery convention, so the client's
+# code can live at the more legible `src/client/` instead of nested under a
+# directory literally named `bin`.
+[[bin]]
+name = "ssh"
+path = "src/client/main.rs"
+
 [features]
 # On by default; everything except the host-testable `src/wire.rs` needs it.
 # `--no-default-features` drops libakuma so `cargo test --lib` can link against
@@ -29,18 +38,33 @@ akuma = ["dep:libakuma"]
 # `userspace/sshd/docs/PROCESS_PER_SESSION.md`.
 fork-sessions = []
 
+# OFF by default, deliberately. `disable_key_verification = true` in
+# sshd.conf accepts ANY client without checking authorized_keys — a real
+# auth bypass. Without this feature the config flag is still parsed (so a
+# config file carrying it isn't a hard error) but ignored, with a loud
+# warning logged, so a stray dev config or a typo can't silently disable
+# authentication in a binary nobody built expecting that. Build with
+# `--features insecure-disable-key-verification` (dev/demo images only) to
+# make the flag actually take effect. See src/auth.rs.
+insecure-disable-key-verification = []
+
 [dependencies]
 # net-async: sshd uses embedded_io_async::{Read,Write} with libakuma's net Error,
 # so it opts into libakuma's `net-async` feature (off by default).
 # Optional only so the `wire` unit tests can build for the host — the binary
 # always needs it (see [features]).
 libakuma = { path = "../libakuma", features = ["net-async"], optional = true }
-# Shared, host-testable SSH-2 wire-format/crypto primitives (also used by the
-# in-kernel SSH server via crates/akuma-ssh) instead of a hand-rolled duplicate.
-# `default-features = false`: sshd doesn't need the fast (precomputed-table)
-# ed25519 basepoint multiplication or key zeroize-on-drop — see the crate's
-# own Cargo.toml for why those stay on by default for the in-kernel server.
-akuma-ssh-crypto = { path = "../akuma-ssh-crypto", default-features = false }
+# Shared, host-testable SSH-2 wire-format/crypto primitives, instead of a
+# hand-rolled duplicate. `default-features = false` drops "fast" (curve25519-
+# dalek's ~30 KB precomputed basepoint-multiplication table) — neither binary
+# here signs/verifies often enough (once per connection) for that speedup to
+# be worth its size. "zeroize" (key material zeroed on drop) is re-enabled
+# explicitly: unlike "fast" it's a security property, not a size/speed
+# trade, and both `sshd`'s host key and `ssh`'s identity/ephemeral key
+# material are exactly what it protects — see
+# `docs/SECURITY_IMPROVEMENTS.md`. Turn it back off only for a specific,
+# deliberate reason, not as a blanket default.
+akuma-ssh-crypto = { path = "../akuma-ssh-crypto", default-features = false, features = ["zeroize"] }
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 aes = { version = "0.8", default-features = false }
