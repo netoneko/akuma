@@ -2,7 +2,11 @@
 
 **Date:** 2026-08-24. **Scope:** `src/` and `crates/*/src` (excludes
 `tests.rs`, `#[test]`-gated modules, and anything under a `tests/` directory).
-**Status:** survey only — nothing remediated yet.
+**Status:** survey (§Findings) **partially remediated**. #1 (`map_user_page`)
+fixed 2026-08-24 as `bf0aa54b "use fixed type for page tables"` — verified via
+`docs/runbooks/verify-trim-fat-change.md` Tiers 1/3/5 (host clippy ×4 + tests,
+live fault-path probes, 3/3 clean self-host build trials). #2 (`socket.rs`
+`SOCKET_TABLE`) in progress. #3 (`irq.rs`) still open.
 
 **One line:** of 301 non-test `Vec<...>` usages, the overwhelming majority are
 legitimately variable-length (path components, `/proc` snapshots, ELF program
@@ -31,7 +35,7 @@ since a table declaration and its access pattern are rarely on the same line.
 
 ## Findings — should probably be a fixed buffer
 
-### 1. `crates/akuma-exec/src/mmu/mod.rs:1649-1835` — page-table frame list per page map
+### 1. `crates/akuma-exec/src/mmu/mod.rs:1649-1835` — page-table frame list per page map — **FIXED 2026-08-24**
 
 `map_user_page` / `map_user_page_no_flush` / their shared `map_user_page_inner`
 return `(Vec<PhysFrame>, bool)`, where the `Vec` collects any *new* page-table
@@ -47,7 +51,19 @@ empty `Vec`, plus real allocation when non-empty) on a path that has a known
 3-element ceiling. A `[Option<PhysFrame>; 3]` (or equivalent small fixed
 array with a count) would remove the allocation entirely.
 
-### 2. `crates/akuma-net/src/socket.rs:364-400` — legacy socket table
+**Fix landed as `bf0aa54b`:** a new `TableFrames` type (`crates/akuma-exec/src/mmu/mod.rs`,
+next to `map_user_page`) wraps a `[Option<PhysFrame>; 3]`, with `push`/`iter`
+and `IntoIterator` impls for both owned and `&TableFrames` so every call site
+(`for tf in table_frames { ... }` / `for tf in &table_frames { ... }`) needed
+no changes beyond the function signatures. Verified via
+`docs/runbooks/verify-trim-fat-change.md`: Tier 1 (4 clippy configs clean,
+727/0 host tests), Tier 3 (live fault-path probes on the booted kernel —
+`elftest`, `forkprobe`, `cowstale` with 0 faults over 200 rounds, `madvshared`,
+`bssfork`, `allocstress` — all PASS), Tier 5 (3/3 clean self-host
+`cargo build --release -j4 --offline` trials, `EXIT=0`, identical
+4,184,272-byte artifact, ~2m01s each — mandatory tier for `mmu/` changes).
+
+### 2. `crates/akuma-net/src/socket.rs:364-400` — legacy socket table — **FIXED 2026-08-24**
 
 ```rust
 static SOCKET_TABLE: Spinlock<Option<Vec<Option<KernelSocket>>>> = Spinlock::new(None);
@@ -70,6 +86,20 @@ static mut SOCKET_STORAGE: [SocketStorage<'static>; MAX_SOCKETS] = [SocketStorag
 
 `socket.rs`'s table is the outlier relative to its own crate's established
 pattern, not an unprecedented design decision.
+
+**Fix:** `SOCKET_TABLE` is now `Spinlock<[Option<KernelSocket>; MAX_SOCKETS]>`,
+statically initialized `[const { None }; MAX_SOCKETS]` (the `const {}` block
+is required — `KernelSocket` isn't `Copy`, so a plain `[None; N]` repeat
+doesn't typecheck; the compiler's own suggestion is the fix). `with_table`
+lost its `Option<Vec<_>>` lazy-init dance entirely. The two `push`-if-under-cap
+fallbacks in `alloc_socket` and the socketpair path became dead code once
+every slot exists from boot — deleted, leaving just the pre-existing
+scan-for-a-`None`-slot loop, which now covers the whole table instead of only
+the region already grown into. Every other `with_table(|table| ...)` call
+site (~30 of them) needed no changes: `&mut [T; N]` deref-coerces to slice
+methods (`.iter()`, `.get()`, indexing) the same as `&mut Vec<T>` did.
+Verified: all 4 Tier-1 clippy configs clean, `akuma-net` host tests 138/138,
+full host suite 727/0 (unchanged from before the change).
 
 ### 3. `src/irq.rs:36-55` — IRQ handler table
 
@@ -143,8 +173,6 @@ is O(1) either way — the cost here is design cleanliness, not runtime cost.
 
 ## Suggested next step
 
-If picked up, do them in priority order: `map_user_page`'s page-table-frame
-`Vec` (#1) is the only one on a genuinely hot path and has the clearest fix
-shape (a 3-element inline array). `socket.rs`'s `SOCKET_TABLE` (#2) can
-likely copy `smoltcp_net.rs`'s existing `SOCKET_STORAGE` pattern almost
-verbatim. `irq.rs` (#3) is boot-time-only and lowest priority.
+#1 and #2 are done (see their sections above). `irq.rs`'s IRQ handler table
+(#3) is the only one left — boot-time-only, lowest priority, same shape as
+#2 (`[Option<IrqHandler>; MAX_IRQ]` sized to the GIC's fixed IRQ line count).

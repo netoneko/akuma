@@ -359,13 +359,18 @@ fn alloc_ephemeral_port() -> u16 {
 // Global Socket Table
 // ============================================================================
 
-/// Global table of sockets (indexed by integer "socket descriptor")
+/// Global table of sockets (indexed by integer "socket descriptor").
+///
+/// Fixed at `MAX_SOCKETS` slots rather than a heap `Vec` that grows one `push`
+/// at a time up to that same cap — `smoltcp_net.rs`'s `SOCKET_STORAGE` already
+/// uses this pattern for the same problem (`docs/archive/VEC_AUDIT.md` #2).
 #[cfg(feature = "smoltcp")]
-static SOCKET_TABLE: Spinlock<Option<Vec<Option<KernelSocket>>>> = Spinlock::new(None);
+static SOCKET_TABLE: Spinlock<[Option<KernelSocket>; MAX_SOCKETS]> =
+    Spinlock::new([const { None }; MAX_SOCKETS]);
 
 #[cfg(feature = "smoltcp")]
 pub(crate) fn with_table<F, R>(f: F) -> R
-where F: FnOnce(&mut Vec<Option<KernelSocket>>) -> R 
+where F: FnOnce(&mut [Option<KernelSocket>; MAX_SOCKETS]) -> R
 {
     // Preemption disabled for the whole hold: the SOCKET_TABLE spinlock (and the
     // NETWORK lock nested under it via socket ops) must never be stranded across a
@@ -373,10 +378,7 @@ where F: FnOnce(&mut Vec<Option<KernelSocket>>) -> R
     // yield — the same discipline the native stack already followed single-core.
     let _pg = PreemptGuard::new();
     let mut guard = SOCKET_TABLE.lock();
-    if guard.is_none() {
-        *guard = Some(Vec::new());
-    }
-    f(guard.as_mut().unwrap())
+    f(&mut guard)
 }
 
 /// Allocate a socket index
@@ -396,12 +398,7 @@ pub fn alloc_socket(socket_type: i32) -> Option<usize> {
                 return Some(i);
             }
         }
-        if table.len() < MAX_SOCKETS {
-            table.push(Some(socket));
-            Some(table.len() - 1)
-        } else {
-            None
-        }
+        None
     })
 }
 
@@ -1208,7 +1205,7 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
         for (i, slot) in table.iter_mut().enumerate() {
             if slot.is_none() { *slot = Some(new_sock); return Some(i); }
         }
-        if table.len() < MAX_SOCKETS { table.push(Some(new_sock)); Some(table.len() - 1) } else { None }
+        None
     }).ok_or(libc_errno::ENOMEM)?;
 
     Ok((new_idx, addr))
