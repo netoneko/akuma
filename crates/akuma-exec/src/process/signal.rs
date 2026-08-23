@@ -269,6 +269,24 @@ pub fn deliver_signal(pid: Pid, sig: u32) -> bool {
 /// mechanism a terminal's INTR character (Ctrl-C) needs. See
 /// `write_to_process_stdin`'s ISIG handling and
 /// `docs/archive/CTRL_C_SIGINT_DELIVERY.md`.
+///
+/// Deliberately excludes the group **leader** (`p.pid == pgid` — by
+/// construction, in every case this is called for, that's the interactive
+/// login shell itself: `spawn_process_with_channel_ext` sets a freshly
+/// spawned top-level process's own `.pgid` to its own `pid`,
+/// `crates/akuma-exec/src/process/image.rs:296`). Live-tested 2026-08-24:
+/// broadcasting to the leader too killed the shell (and the whole SSH
+/// session with it) on roughly 2 of 3 runs — real Unix relies on the shell
+/// protecting itself with `SIG_IGN`, and something in that path is not
+/// reliable here (`SIG_IGN` is correctly stored and honored, and `fork`/
+/// `vfork` both correctly give the child a private `signal_actions` copy —
+/// see `deliver_signal`'s and `SharedSignalTable::clone_for_fork`'s doc
+/// comments — so the exact mechanism is still unattributed; this exclusion
+/// sidesteps it rather than fixes it). Excluding the leader is safe for
+/// every caller of this function today: it exists solely for the terminal's
+/// INTR-character handling in `write_to_process_stdin`, not as a general
+/// `kill(-pgid, sig)` primitive, and the thing that should die on Ctrl-C is
+/// the foreground job, never the shell running it.
 pub fn kill_process_group(pgid: Pid, sig: u32) {
     // Fixed array, not a `Vec`: `for_each_process`'s callback runs with IRQs
     // disabled and forbids allocation, and there can never be more than
@@ -276,7 +294,7 @@ pub fn kill_process_group(pgid: Pid, sig: u32) {
     let mut targets = [0 as Pid; table::MAX_PROCESSES];
     let mut count = 0;
     table::for_each_process(|p| {
-        if p.pgid == pgid && count < targets.len() {
+        if p.pgid == pgid && p.pid != pgid && count < targets.len() {
             targets[count] = p.pid;
             count += 1;
         }

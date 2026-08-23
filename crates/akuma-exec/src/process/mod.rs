@@ -455,7 +455,13 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
     // not the SPAWN syscall that keeps `foreground_pgid` current) is reached
     // by the group broadcast without this needing to track "whichever pid is
     // currently in the foreground". See `docs/archive/CTRL_C_SIGINT_DELIVERY.md`.
-    let stripped: Option<alloc::vec::Vec<u8>> = if proc.channel.as_ref().is_some_and(|ch| ch.is_terminal()) {
+    // `Empty`/`Owned` rather than a bare `Option<Vec<u8>>`: the overwhelming
+    // common case is one INTR byte alone (an interactive keystroke arrives
+    // one byte at a time), which needs no allocation at all — only a pasted
+    // chunk with an INTR byte buried in real data falls back to owning a
+    // filtered copy.
+    enum Filtered<'a> { Unfiltered(&'a [u8]), Empty, Owned(alloc::vec::Vec<u8>) }
+    let filtered = if proc.channel.as_ref().is_some_and(|ch| ch.is_terminal()) {
         let ts = crate::sync::lock_bounded(&proc.terminal_state);
         if ts.lflag & terminal::mode_flags::ISIG != 0 {
             let vintr = ts.cc[terminal::cc_index::VINTR];
@@ -463,23 +469,44 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
                 let pgid = ts.foreground_pgid;
                 drop(ts);
                 signal::kill_process_group(pgid, 2 /* SIGINT */);
-                Some(data.iter().copied().filter(|&b| b != vintr).collect())
+                if data.len() == 1 {
+                    Filtered::Empty
+                } else {
+                    Filtered::Owned(data.iter().copied().filter(|&b| b != vintr).collect())
+                }
             } else {
-                None
+                Filtered::Unfiltered(data)
             }
         } else {
-            None
+            Filtered::Unfiltered(data)
         }
     } else {
-        None
+        Filtered::Unfiltered(data)
     };
-    let data: &[u8] = stripped.as_deref().unwrap_or(data);
+    let original_len = data.len();
+    let data: &[u8] = match &filtered {
+        Filtered::Unfiltered(d) => d,
+        Filtered::Empty => &[],
+        Filtered::Owned(v) => v,
+    };
+    // How many stripped INTR bytes are hiding in `original_len - data.len()`.
+    // They're never written anywhere and never retried — a real tty line
+    // discipline consumes the INTR character unconditionally, even if the
+    // pty's data channel is fully backed up — so they must count as
+    // "accepted" in the return value below. Getting this wrong (reporting
+    // only the filtered-buffer accept count) makes the lone-keystroke case
+    // (`data = [0x03]`, filtered to empty, `write_stdin(&[])` trivially
+    // "accepts" 0 of 0) look like a **short write of the original 1-byte
+    // input** to the caller — sshd's retry loop would then resend that same
+    // already-handled `0x03` forever, re-broadcasting `SIGINT` every bridge
+    // tick instead of once per keystroke.
+    let stripped_count = original_len - data.len();
 
     let Some(ref channel) = proc.channel else {
         // No channel: the legacy buffer is the only sink, and it has always taken
         // everything (clearing itself on overflow), so report a full write.
         proc.stdin.lock().write_with_limit(data, config().proc_stdin_max_size);
-        return Ok(data.len());
+        return Ok(data.len() + stripped_count);
     };
 
     let accepted = channel.write_stdin(data);
@@ -498,7 +525,7 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
             waker.wake();
         }
     }
-    Ok(accepted)
+    Ok(accepted + stripped_count)
 }
 
 /// Signal end-of-input on a process's stdin (the SSH client closed its stdin
