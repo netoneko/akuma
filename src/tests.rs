@@ -4613,7 +4613,7 @@ fn test_map_user_page_race_leaks_frame() -> bool {
         akuma_exec::mmu::map_user_page(test_va, frame_b.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
     };
 
-    // After the fix, map_user_page returns (Vec<PhysFrame>, bool) where
+    // After the fix, map_user_page returns (TableFrames, bool) where
     // bool=true means "PTE was installed", bool=false means "already mapped,
     // your frame was NOT installed" (phantom).
     //

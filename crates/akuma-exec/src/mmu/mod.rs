@@ -1639,6 +1639,49 @@ pub unsafe fn shatter_block_to_pages(l3_frame_addr: usize, block_entry: u64) {
     }
 }
 
+/// Intermediate page-table frames allocated by one [`map_user_page`] call.
+///
+/// AArch64's 4-level walk (L0 always pre-exists for a live address space) can
+/// allocate at most one new frame per level of L1/L2/L3 — 3 total — so this is a
+/// fixed 3-slot array rather than a heap `Vec`, on a path the page-fault handler
+/// calls once per page (`docs/archive/VEC_AUDIT.md` #1).
+#[derive(Default)]
+pub struct TableFrames {
+    frames: [Option<PhysFrame>; 3],
+}
+
+impl TableFrames {
+    fn push(&mut self, frame: PhysFrame) {
+        for slot in &mut self.frames {
+            if slot.is_none() {
+                *slot = Some(frame);
+                return;
+            }
+        }
+        debug_assert!(false, "more than 3 page-table frames allocated by one map_user_page call");
+    }
+
+    fn iter(&self) -> core::iter::Flatten<core::slice::Iter<'_, Option<PhysFrame>>> {
+        self.frames.iter().flatten()
+    }
+}
+
+impl IntoIterator for TableFrames {
+    type Item = PhysFrame;
+    type IntoIter = core::iter::Flatten<core::array::IntoIter<Option<PhysFrame>, 3>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.frames.into_iter().flatten()
+    }
+}
+
+impl<'a> IntoIterator for &'a TableFrames {
+    type Item = &'a PhysFrame;
+    type IntoIter = core::iter::Flatten<core::slice::Iter<'a, Option<PhysFrame>>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// Map a user page at `va` to physical address `pa`.
 ///
 /// Returns `(table_frames, installed)`:
@@ -1646,7 +1689,7 @@ pub unsafe fn shatter_block_to_pages(l3_frame_addr: usize, block_entry: u64) {
 /// - `installed`: `true` if this call installed the PTE, `false` if the PTE was
 ///   already valid (another thread won the race).  When `false`, the caller's
 ///   data frame was NOT mapped and should be freed.
-pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Vec<PhysFrame>, bool) {
+pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (TableFrames, bool) {
     unsafe { map_user_page_inner(va, pa, user_flags_val, true) }
 }
 
@@ -1662,9 +1705,9 @@ unsafe fn map_user_page_inner(
     pa: usize,
     user_flags_val: u64,
     flush: bool,
-) -> (Vec<PhysFrame>, bool) { unsafe {
+) -> (TableFrames, bool) { unsafe {
     let _irq_guard = IrqGuard::new();
-    let mut allocated_tables = Vec::new();
+    let mut allocated_tables = TableFrames::default();
     let ttbr0: u64;
     #[cfg(target_os = "none")]
     { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
@@ -1832,7 +1875,7 @@ pub fn remap_current_user_page(va: usize, pa: usize, user_flags_val: u64) -> boo
 ///
 /// The caller is responsible for issuing the TLB flush before the new
 /// mappings can be safely used by userspace.
-pub unsafe fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) -> (Vec<PhysFrame>, bool) {
+pub unsafe fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) -> (TableFrames, bool) {
     // No TLB flush — caller must call flush_tlb_range after mapping all pages.
     unsafe { map_user_page_inner(va, pa, user_flags_val, false) }
 }
