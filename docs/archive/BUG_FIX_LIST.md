@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 680
-- **Docs contributing at least one fix:** 215
+- **Total distinct fixes counted:** 691
+- **Docs contributing at least one fix:** 217
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 128 | 18.8% | 18 |
-| Memory & Virtual Memory | 113 | 16.6% | 35 |
-| Scheduler & Process Management | 76 | 11.2% | 19 |
-| SMP & Locking | 86 | 12.6% | 37 |
-| Networking | 43 | 6.3% | 18 |
+| Syscall / ABI Compatibility Audits | 128 | 18.5% | 18 |
+| Memory & Virtual Memory | 113 | 16.4% | 35 |
+| Scheduler & Process Management | 76 | 11.0% | 19 |
+| SMP & Locking | 86 | 12.4% | 37 |
+| Networking | 49 | 7.1% | 19 |
 | Userspace Apps & Libraries | 37 | 5.4% | 20 |
 | Rump Kernel & Syscall Proxy | 26 | 3.8% | 6 |
 | Toolchain & Self-Hosting | 37 | 5.4% | 5 |
 | SSH | 26 | 3.8% | 15 |
 | VFS & Filesystem | 17 | 2.5% | 12 |
-| Boot & Drivers | 23 | 3.4% | 8 |
-| Signals & Exceptions | 12 | 1.8% | 5 |
+| Boot & Drivers | 23 | 3.3% | 8 |
+| Signals & Exceptions | 12 | 1.7% | 5 |
 | Misc / Cross-cutting | 22 | 3.2% | 5 |
 | Console & Terminal | 15 | 2.2% | 7 |
-| Containers | 19 | 2.8% | 5 |
-| **Total** | **680** | **100.0%** | **215** |
+| Containers | 24 | 3.5% | 6 |
+| **Total** | **691** | **100.0%** | **217** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -647,7 +647,7 @@ aren't recorded anywhere else.)
 ### docs/archive/BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md
 - Commit `1a29c9c3` dropped `blocking_relax()`'s leading `yield_now()` for every caller to speed up the socket wait loop (+27% HTTP throughput), but the spawn/exec/reap waiters — woken by another thread on their own core, not by a device interrupt — genuinely need that yield to hand off, so removing it kernel-wide permanently wedged `SMP=4` in the spawn/exec/reap path (boot suite: 294 passed → 23 passed, wedged); fixed by splitting the primitive into `blocking_relax_net` (no yield) wired only into `NetRuntime::blocking_relax`, keeping the yield everywhere else (294 passed, +30% HTTP throughput preserved)
 
-## Networking (43 fixes, 18 docs)
+## Networking (49 fixes, 19 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - `MAX_BACKLOG = 8` (`crates/akuma-net/src/socket.rs`) was a hard ceiling on **simultaneous connection arrivals**, not the soft hint `listen(2)`'s backlog is on Linux: this stack has no SYN queue, a listener *is* a fixed pool of pre-created sockets sitting in `Listen` that `socket_accept` replenishes one at a time, so arrivals past the 8th got a RST regardless of how fast the server accepted. Every caller's requested backlog was silently clamped to it (`libakuma`'s `TcpListener::bind` asks for 128). Measured on devbox-smoltcp/SMP=4: 8/8 connections clean, 12/16, 17/24 before; 16/16 and 24/24 after. Raised to 32 behind the default-on `many-sessions` feature, which also lifts the smoltcp socket table from 32 to 128 on `small-sockets` builds — a 32-deep backlog is meaningless against a 32-socket budget. `kernel_profile_extreme` overrides both back down, so the 4 MB floor is unaffected
@@ -728,6 +728,14 @@ aren't recorded anywhere else.)
 
 ### docs/archive/SMOLTCP_STALE_CONNECTING_HANDLE_PANIC.md
 - `socket_close` queued a closed socket in `pending_removal` for GC but never purged it from `net.connecting` (the list `poll()` uses to enforce the non-blocking-connect timeout), so a socket closed while still `SynSent` sat in both lists at once; the next `poll()` freed its `SocketSet` slot via the `pending_removal` sweep, then the `connecting` sweep immediately after dereferenced the now-freed handle and smoltcp panicked unconditionally — deterministic for any non-blocking `connect()` closed before the handshake finishes, not a rare race; fixed by purging the `connecting` entry in the same step `socket_close` queues the handle for removal
+
+### docs/archive/UNIX_SOCKET_IMPROVEMENTS.md
+- `SHUT_RD` on a unix socket returned 0 immediately instead of draining already-buffered bytes first, silently discarding a complete message the peer had successfully sent (Linux returns the buffered bytes, then EOF)
+- `UnixTable::pair` never set `peer_creds`, so `SO_PEERCRED` reported pid 0 for both ends of every `socketpair`, breaking any daemon that identifies its peer by pid
+- `bind` on a unix socket path created a plain regular file (`mode=0o100644, S_ISSOCK=false`) instead of a real socket node, so a client that checks `S_ISSOCK` before connecting — the normal thing to do — refused to talk to a working socket; fixed by adding `S_IFSOCK`/`EXT2_FT_SOCK` and a real `create_socket_node` path
+- `socket(AF_UNIX, ...)` returned `EAFNOSUPPORT` inside a `stack=rump` box because `rump_proxy` intercepted every socket-family syscall and forwarded it to NetBSD's sysproxy, which has no AF_UNIX; fixed by letting AF_UNIX fall through to the native path (a unix socket has no wire, so this doesn't weaken the proxy's network-isolation guarantee)
+- `recvmsg`/`getsockopt`/`setsockopt` on a unix socket answered `ENETDOWN` on the rump-only build because the syscall-ungating list missed those three, so a unix socket got a *network* error for having no network
+- the rump-only devbox target had not compiled for some time: four `#[cfg(feature = "smoltcp")]` gates were lost, the worst in `akuma-net/src/lib.rs` where a doc comment and a `pub use` inserted between the attribute and `pub mod smoltcp_net` silently relocated the gate onto the re-export, producing 40+ "unlinked crate `smoltcp`" errors from `scripts/build_devbox.sh`; all four gates restored
 
 ## Userspace Apps & Libraries (37 fixes, 20 docs)
 
@@ -1153,7 +1161,7 @@ aren't recorded anywhere else.)
 - Three per-event kernel traces (`[IA-DP] file region:` demand-page, `[pipe]` lifecycle, `[mmap]`/`[mprotect]`) printed unconditionally, saturating the single shared UART under a parallel `-j4` build (~270 KB/s, a 115200-baud line ~20x over-saturated) and serializing every logging core on the console lock — turning an in-VM self-host build from "never completes in over an hour" into a 2m21s green run once gated; `DEMAND_PAGE_LOG_ENABLED`, the flag meant to gate the largest of the three, was dead — defined and documented but with zero readers anywhere in the tree — so fixing it required wiring a live check, not flipping an existing one
 
 
-## Containers (19 fixes, 5 docs)
+## Containers (24 fixes, 6 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
 - `bootstrap/bin/tar` was never deployed by `userspace/build.sh`, so `/bin/tar` was a busybox applet whose hardlinks go through `link()` — which `sys_linkat` implements as a full file copy that also loses the mode — turning a 1.9 MB busybox layer into 467.7 MB of `0644` copies that a shell's `PATH` search then refused with "Permission denied"; fixed by linking in `akuma_tar`, which applies the archived mode bits (layer store 467.7 MB → 4.1 MB)
@@ -1184,6 +1192,12 @@ aren't recorded anywhere else.)
 ### docs/archive/BOX_RUN_OVERLAYFS.md
 - `box pull` had always extracted layers with busybox tar (`bootstrap/bin/tar` was never deployed by `userspace/build.sh`), and busybox tar creates hard links via `link()`, which `sys_linkat` implements as a full `read_file`+`write_file` copy that also drops the mode bits — so the busybox image's 410 hardlinks to one binary became 410 real `0644` copies (467.7 MB extracted from a 1.9 MB layer), and every copied binary then failed a `PATH` search's `access(X_OK)` check with `EACCES`; fixed by shipping Akuma's own `tar` and applying the archived mode bits on extraction (layer store dropped to 4.1 MB)
 
+### docs/archive/REATTACH_STALE_CHANNEL_HANG.md
+- `sys_read`'s stdin loop and `sys_poll_input_event`'s blocking branch each fetched the process's `Arc<ProcessChannel>` once before entering their blocking wait and kept reusing it across every park/wake cycle; `sys_reattach` repoints `Process::channel` to a new `Arc`, so a process already parked in a blocking read at grab time woke correctly but kept checking the old, abandoned channel forever — typed input into a `box grab`bed session never reached the target even though the syscall reported success; fixed by re-resolving `current_channel()` on every loop iteration instead of caching it once
+- nothing stopped a second `box grab` on the same pid from silently stealing the channel out from under a still-active first grab, and the first grabber had no way to notice; added `Process::grabbed_by` and a `force`/`-d` flag on `sys_reattach` (mirroring `screen -r`/`-d`) so an unheld target still succeeds, an already-held target fails with a new `EBUSY` errno, and `-d` detaches the previous holder first
+- `box grab`'s `waitpid` loop could never tell that its target had exited, because `reattach` does not reparent the grabbed pid — `wait4`/`waitpid` on a non-child pid returns the same "nothing to report" as "still running"; fixed by falling back to a `kill(pid, 0)` liveness probe when `waitpid` reports nothing
+- reattaching to a full-screen app left it looking frozen or misdrawn because nothing told it its terminal had effectively changed; `sys_reattach` now copies the caller's `term_width`/`term_height` onto the target's `TerminalState` and sends `SIGWINCH` on every successful reattach, matching `screen`/`tmux`'s attach behavior
+- `-d`-detaching a previous holder was a raw crate-internal force-stop (`kill_process_with_signal` manipulating process state directly, no disposition-aware signal path, no terminal cleanup) instead of a real kill, so the displaced client's terminal was left in whatever raw/alt-screen state the grabbed app had put it in; fixed by moving the detach to the syscall boundary, writing a terminal-reset escape sequence into the previous holder's channel while the connection is still up, then delivering a real `SIGTERM` through `sys_kill` so the previous holder runs its normal `exit_group` teardown
 
 ---
 
