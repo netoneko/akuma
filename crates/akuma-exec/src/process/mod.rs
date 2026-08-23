@@ -445,6 +445,36 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
         return write_to_process_stdin(target_pid, data);
     }
 
+    // Real tty line-discipline behaviour for the INTR character: on an actual
+    // pty session (`channel.is_terminal()` — never true for a plain `exec`
+    // pipe, so a non-interactive client piping binary data can't trip this)
+    // with ISIG enabled, the interrupt character is consumed here and never
+    // reaches the process's stdin — it raises SIGINT on the terminal's whole
+    // foreground process group instead. `fork`/`clone` propagate `.pgid` from
+    // parent to child, so a shell's `tail -f` (spawned via plain fork+exec,
+    // not the SPAWN syscall that keeps `foreground_pgid` current) is reached
+    // by the group broadcast without this needing to track "whichever pid is
+    // currently in the foreground". See `docs/archive/CTRL_C_SIGINT_DELIVERY.md`.
+    let stripped: Option<alloc::vec::Vec<u8>> = if proc.channel.as_ref().is_some_and(|ch| ch.is_terminal()) {
+        let ts = crate::sync::lock_bounded(&proc.terminal_state);
+        if ts.lflag & terminal::mode_flags::ISIG != 0 {
+            let vintr = ts.cc[terminal::cc_index::VINTR];
+            if data.contains(&vintr) {
+                let pgid = ts.foreground_pgid;
+                drop(ts);
+                signal::kill_process_group(pgid, 2 /* SIGINT */);
+                Some(data.iter().copied().filter(|&b| b != vintr).collect())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let data: &[u8] = stripped.as_deref().unwrap_or(data);
+
     let Some(ref channel) = proc.channel else {
         // No channel: the legacy buffer is the only sink, and it has always taken
         // everything (clearing itself on overflow), so report a full write.

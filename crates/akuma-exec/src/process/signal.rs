@@ -197,6 +197,95 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
     Ok(())
 }
 
+/// Deliver `sig` to `pid`'s whole thread group (target + CLONE_THREAD siblings),
+/// or hard-kill it if it has no live thread to interrupt. This is `sys_kill`'s
+/// per-pid delivery logic, factored out so [`kill_process_group`] can reuse it
+/// for each member of a process group instead of duplicating it.
+///
+/// Returns `true` if the process was found (delivered to a live thread, or
+/// hard-killed via the fallback) — `sys_kill` maps that to its 0-vs-`ESRCH`
+/// return value.
+pub fn deliver_signal(pid: Pid, sig: u32) -> bool {
+    let Some(proc) = lookup_process_shared(pid) else {
+        return kill_process_with_signal(pid, sig).is_ok();
+    };
+    let tgid = proc.tgid;
+    let l0_phys = proc.address_space.l0_phys();
+
+    // SIGKILL (9) is unconditional — bypass signal delivery entirely. On
+    // Linux, SIGKILL cannot be caught or ignored. Hard-kill the thread group.
+    if sig == 9 {
+        crate::process::kill_thread_group(pid, l0_phys, -9);
+        let _ = kill_process_with_signal(pid, 9);
+        return true;
+    }
+
+    // Collect ALL thread IDs in the group (target + siblings) FIRST.
+    // `for_each_process` runs its callback with IRQs disabled, which forbids
+    // allocation — a fixed array bounded by `MAX_PROCESSES` (there can never
+    // be more live threads than that) sidesteps it instead of a `Vec` that
+    // would grow inside the callback.
+    let mut all_tids = [0usize; table::MAX_PROCESSES];
+    let mut tid_count = 0;
+    if let Some(tid) = proc.thread_id {
+        all_tids[tid_count] = tid;
+        tid_count += 1;
+    }
+    table::for_each_process(|p| {
+        if p.pid != pid && p.tgid == tgid
+            && let Some(tid) = p.thread_id
+            && tid_count < all_tids.len() {
+                all_tids[tid_count] = tid;
+                tid_count += 1;
+            }
+    });
+    let all_tids = &all_tids[..tid_count];
+
+    // Set ALL interrupted flags FIRST — before any wake() call. This prevents
+    // a race where a thread wakes from schedule_blocking, checks
+    // is_current_interrupted() (false — not set yet), and re-enters
+    // schedule_blocking before we set the flag.
+    for &tid in all_tids {
+        crate::process::interrupt_thread(tid);
+    }
+
+    // NOW pend signals and wake. pend_signal_for_thread calls wake() internally.
+    // The interrupted flag is already set, so when the thread wakes and checks
+    // is_current_interrupted(), it sees true.
+    for &tid in all_tids {
+        threading::pend_signal_for_thread(tid, sig);
+    }
+
+    true
+}
+
+/// Deliver `sig` to every process whose `.pgid` is `pgid` (POSIX `kill(-pgid,
+/// sig)` group semantics).
+///
+/// `fork`/`clone` propagate `.pgid` from parent to child (a plain
+/// non-job-control shell never calls `setpgid`, so it and everything it execs
+/// share one `pgid`), so this reaches a shell's foreground child without
+/// needing to track "whichever pid is currently in the foreground" — the
+/// mechanism a terminal's INTR character (Ctrl-C) needs. See
+/// `write_to_process_stdin`'s ISIG handling and
+/// `docs/archive/CTRL_C_SIGINT_DELIVERY.md`.
+pub fn kill_process_group(pgid: Pid, sig: u32) {
+    // Fixed array, not a `Vec`: `for_each_process`'s callback runs with IRQs
+    // disabled and forbids allocation, and there can never be more than
+    // `MAX_PROCESSES` matches.
+    let mut targets = [0 as Pid; table::MAX_PROCESSES];
+    let mut count = 0;
+    table::for_each_process(|p| {
+        if p.pgid == pgid && count < targets.len() {
+            targets[count] = p.pid;
+            count += 1;
+        }
+    });
+    for &pid in &targets[..count] {
+        deliver_signal(pid, sig);
+    }
+}
+
 /// Does thread slot `tid` still belong to `pid`?
 ///
 /// Thread slots are recycled (`cleanup_terminated_internal`, ~10 ms cooldown), so a

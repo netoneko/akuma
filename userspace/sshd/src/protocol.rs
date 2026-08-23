@@ -41,6 +41,8 @@ const SSH_MSG_NEWKEYS: u8 = 21;
 const SSH_MSG_KEX_ECDH_INIT: u8 = 30;
 const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
 const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
+const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
+const SSH_MSG_REQUEST_FAILURE: u8 = 82;
 const SSH_MSG_CHANNEL_OPEN: u8 = 90;
 const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
 const SSH_MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
@@ -373,6 +375,15 @@ async fn bridge_process(
                     let mut offset = 0;
                     let _recipient = read_u32(&payload, &mut offset);
                     if let Some(data) = read_string(&payload, &mut offset) {
+                        // Ctrl-C (0x03) is handled kernel-side now: on a pty
+                        // session, `write_to_process_stdin` (the function
+                        // behind the `/proc/<pid>/fd/0` write below) consumes
+                        // the INTR byte itself and raises SIGINT on the
+                        // terminal's foreground process group instead of
+                        // handing it to the child — see
+                        // `docs/archive/CTRL_C_SIGINT_DELIVERY.md`. sshd just
+                        // forwards bytes.
+                        //
                         // Queue for the child's stdin (opened once above). Queued
                         // rather than written straight through: the write is
                         // non-blocking and may be short, and whatever the child
@@ -654,6 +665,23 @@ async fn handle_message(
                     session.term_width = w;
                     session.term_height = h;
                 }
+            }
+        }
+        SSH_MSG_GLOBAL_REQUEST => {
+            // RFC 4254 §4: unrecognized global requests (e.g. OpenSSH's
+            // `keepalive@openssh.com`, sent every ServerAliveInterval seconds)
+            // must get SSH_MSG_REQUEST_FAILURE when want_reply is set, or the
+            // client has no way to tell the server is still alive. sshd
+            // implements no global requests, so every one gets this reply.
+            // Before this arm existed, an unhandled SSH_MSG_GLOBAL_REQUEST
+            // fell into the `_ => {}` catch-all below and got no reply at
+            // all — after ServerAliveCountMax missed probes the client gave
+            // up with "Timeout, server <host> not responding."
+            let mut offset = 0;
+            let _request_name = read_string(payload, &mut offset);
+            let want_reply = payload.get(offset).copied().unwrap_or(0) != 0;
+            if want_reply {
+                send_packet(stream, &[SSH_MSG_REQUEST_FAILURE], session).await?;
             }
         }
         SSH_MSG_DISCONNECT => return Ok(MessageResult::Disconnect),

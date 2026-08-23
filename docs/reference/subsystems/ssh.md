@@ -127,6 +127,13 @@ limitations accepted and documented rather than silently left).
   xterm sequences into actions: Delete `\x1b[3~`, Home `\x1b[1~`, End `\x1b[4~`,
   arrows `\x1b[A/B/C/D`. Window-change requests signal a resize byte to the
   foreground process.
+- **Ctrl-C / `SIGINT`:** handled in the kernel, not sshd. `write_to_process_
+  stdin` (`crates/akuma-exec/src/process/mod.rs`) — the chokepoint every
+  stdin write reaches, sshd's included, via `/proc/<pid>/fd/0` — checks
+  `ISIG`/`cc[VINTR]` on a real pty session (`channel.is_terminal()`) and
+  broadcasts `SIGINT` to every process sharing the terminal's
+  `foreground_pgid` instead of forwarding the byte. See
+  [`../../archive/CTRL_C_SIGINT_DELIVERY.md`](../../archive/CTRL_C_SIGINT_DELIVERY.md).
 
 ## Background
 

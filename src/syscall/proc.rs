@@ -1703,61 +1703,11 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
         crate::tprint!(96, "[signal] kill(pid={}, sig={})\n", pid, sig);
     }
 
-    if let Some(proc) = akuma_exec::process::lookup_process_shared(pid) {
-        let tgid = proc.tgid;
-        let l0_phys = proc.address_space.l0_phys();
-
-        // SIGKILL (9) is unconditional — bypass signal delivery entirely.
-        // On Linux, SIGKILL cannot be caught or ignored.  Hard-kill the
-        // entire thread group immediately.
-        if sig == 9 {
-            let tid = proc.thread_id;
-            let exited = proc.exited;
-            let _ = proc; // Release the borrow
-            crate::tprint!(128, "[kill-dbg] SIGKILL pid={} tgid={} tid={:?} exited={}\n", pid, tgid, tid, exited);
-            akuma_exec::process::kill_thread_group(pid, l0_phys, -9);
-            let kill_result = akuma_exec::process::kill_process_with_signal(pid, 9);
-            crate::tprint!(128, "[kill-dbg] SIGKILL pid={} kill_result={:?}\n", pid, kill_result);
-            return 0;
-        }
-
-        // Collect ALL thread IDs in the group (target + siblings) FIRST.
-        let mut all_tids: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-        if let Some(tid) = proc.thread_id {
-            all_tids.push(tid);
-        }
-        {
-            let mut sibling_tids = alloc::vec::Vec::new();
-            akuma_exec::process::table::for_each_process(|p| {
-                if p.pid != pid && p.tgid == tgid
-                    && let Some(tid) = p.thread_id {
-                        sibling_tids.push(tid);
-                    }
-            });
-            all_tids.extend(sibling_tids);
-        }
-
-        // Set ALL interrupted flags FIRST — before any wake() call.
-        // This prevents a race where a thread wakes from schedule_blocking,
-        // checks is_current_interrupted() (false — not set yet), and
-        // re-enters schedule_blocking before we set the flag.
-        for &tid in &all_tids {
-            akuma_exec::process::interrupt_thread(tid);
-        }
-
-        // NOW pend signals and wake.  pend_signal_for_thread calls wake()
-        // internally.  The interrupted flag is already set, so when the
-        // thread wakes and checks is_current_interrupted(), it sees true.
-        crate::tprint!(128, "[kill-dbg] pid={} sig={} tids={}\n", pid, sig, all_tids.len());
-        for &tid in &all_tids {
-            akuma_exec::threading::pend_signal_for_thread(tid, sig);
-        }
-
-        return 0;
-    }
-
-    // Fallback: no thread to deliver to — hard-kill the process.
-    if akuma_exec::process::kill_process_with_signal(pid, sig).is_ok() { 0 } else { ESRCH }
+    // Per-pid delivery (thread-group interrupt+pend, SIGKILL hard-kill, and
+    // the no-live-thread fallback) lives in `akuma_exec::process::deliver_signal`
+    // now, shared with `kill_process_group`'s per-member broadcast (used by the
+    // kernel's Ctrl-C/SIGINT handling — see `write_to_process_stdin`).
+    if akuma_exec::process::deliver_signal(pid, sig) { 0 } else { ESRCH }
 }
 
 pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
