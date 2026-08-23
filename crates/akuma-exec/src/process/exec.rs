@@ -221,12 +221,16 @@ where
 /// `force` mirrors `screen -d`: if another still-live pid already holds this
 /// target's I/O (`Process::grabbed_by`), a non-`force` call is refused
 /// (`"Already attached"`) rather than silently stealing the channel out from
-/// under whoever is currently watching it. `force` detaches the previous
-/// holder first — `kill_process_with_signal(existing, SIGTERM)` — so its own
-/// (now pointless) wait loop actually exits instead of spinning forever with
-/// no channel. See `docs/archive/REATTACH_STALE_CHANNEL_HANG.md` for why a
-/// grabber's wait loop needs to be able to observe this at all.
-pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid, force: bool) -> Result<(), &'static str> {
+/// under whoever is currently watching it. On success, `Ok(Some(previous))`
+/// names a holder that `force` displaced — the syscall boundary (which has
+/// the disposition-aware signal-delivery path this crate does not) is
+/// responsible for actually detaching it: a real `SIGTERM` (not a raw
+/// force-stop) so it exits through its normal cleanup, and a terminal-reset
+/// write to its own channel first so a human on the other end doesn't inherit
+/// a torn-down connection sitting in raw/alt-screen mode. `Ok(None)` means
+/// nothing needed detaching. See `docs/archive/REATTACH_STALE_CHANNEL_HANG.md`
+/// for why a grabber's wait loop needs to be able to observe a detach at all.
+pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid, force: bool) -> Result<Option<Pid>, &'static str> {
     // 1. Validate hierarchy permissions
     let (caller_box_id, channel) = if let Some(pid) = caller_pid {
         let caller = lookup_process_shared(pid).ok_or("Caller not found")?;
@@ -270,15 +274,12 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid, force: boo
         .and_then(|target| target.grabbed_by)
         .filter(|&existing| Some(existing) != caller_pid && lookup_process_shared(existing).is_some());
 
-    if let Some(existing) = existing_grabber {
-        if !force {
-            return Err("Already attached");
-        }
-        // Detach the previous holder: SIGTERM its grabbing process so its own
-        // wait loop (which has no other way to learn it's been superseded)
-        // exits instead of spinning forever against a channel nobody reads.
-        let _ = crate::process::kill_process_with_signal(existing, 15 /* SIGTERM */);
+    if existing_grabber.is_some() && !force {
+        return Err("Already attached");
     }
+    // Actually detaching `existing_grabber` when `force` is set (reset its
+    // terminal, signal it, reap-friendly exit) is the syscall boundary's
+    // job — see the doc comment above.
 
     // 2. Perform the delegation
     if let Some(pid) = caller_pid {
@@ -301,11 +302,11 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid, force: boo
         log::debug!("[Process] Reattached (caller={:?}) -> PID {}", caller_pid, target_pid);
     }
 
-    Ok(())
+    Ok(existing_grabber)
 }
 
 /// Reattach I/O from the current process to a target PID
-pub fn reattach_process(target_pid: Pid, force: bool) -> Result<(), &'static str> {
+pub fn reattach_process(target_pid: Pid, force: bool) -> Result<Option<Pid>, &'static str> {
     let caller_pid = read_current_pid(); // Can be None for kernel threads
     reattach_process_ext(caller_pid, target_pid, force)
 }

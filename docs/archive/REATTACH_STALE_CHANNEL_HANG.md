@@ -5,11 +5,17 @@ instances, disk clones + private ports — no live VM the reporting user was
 using was ever touched). **Kernel at capture:** devbox-smoltcp, `smp-shared`
 default feature set, `SMP=4`.
 
-Three fixes, same day, same feature, in the order they were found: §1-§5 is
-the original bug (input silently swallowed by a stale cached channel); §6 is
-what surfaced immediately afterward once `box grab` actually worked well
-enough to use for real — no way to detach a previous session (`-d`, like
-`screen -d`) and no way for `box grab` to notice its target had exited.
+Same day, same feature, in the order things were found: §1-§5 is the original
+bug (input silently swallowed by a stale cached channel); §6 is what surfaced
+immediately afterward once `box grab` actually worked well enough to use for
+real — no way to detach a previous session (`-d`, like `screen -d`) and no way
+for `box grab` to notice its target had exited; §7 is what came out of a
+"just curious" question about repaint signals — `SIGWINCH` propagation on
+attach, turning §6's raw force-stop detach into a real disposition-aware kill
+with a terminal reset first (§7.1-§7.2), discovering `tmux` itself cannot run
+on Akuma at all for an unrelated, pre-existing reason (§7.3), and verifying
+the whole mechanism instead against a real raw-mode full-screen app,
+`busybox`'s `vi` (§7.4).
 
 **One line:** `sys_read`'s stdin loop (`src/syscall/fs.rs`) and
 `sys_poll_input_event` (`src/syscall/term.rs`) each fetched the process's
@@ -326,8 +332,135 @@ sets) and `cargo test --target <host-triple>` (which now also exercises the
 new `EBUSY` table entry via `errno::tests::every_value_is_the_linux_number`)
 are all clean.
 
+## 7. Follow-on (2026-08-23, same day): repaint on attach, graceful death on detach
+
+Two more pieces, prompted by a "just curious" question about whether there's
+a standard signal for "please repaint" — there is (`SIGWINCH`) — which led
+straight back to two gaps in §6's `-d`/detach work.
+
+### 7.1 `SIGWINCH` and terminal-size propagation on every reattach
+
+`box grab`ing a full-screen app (anything ncurses-based) left it looking
+frozen or misdrawn until something else prompted a redraw, because nothing
+told it its terminal had effectively changed. `screen`/`tmux` handle this on
+every attach by pushing the new terminal's size onto the session and sending
+`SIGWINCH` — "your window changed, requery (`TIOCGWINSZ`) and redraw." Added
+the same thing to `sys_reattach` (`src/syscall/container.rs`), unconditionally
+on every successful reattach (not just `-d`): copy the caller's
+`term_width`/`term_height` onto the target's `TerminalState`, then
+`SIGWINCH` (28) the target through the normal disposition-aware `sys_kill`
+path. Confirmed safe to send unconditionally, including at a target with no
+handler installed (a plain `cat`): `SIGWINCH`'s POSIX default action is
+Ignore, and 28 is absent from `crate::syscall::signal::signal_is_fatal_default`
+— so an unhandled `SIGWINCH` is silently dropped, never fatal.
+
+### 7.2 Detaching a previous holder was a raw force-stop, not a real kill
+
+§6.1's original `-d` implementation detached the previous holder from
+*inside* `reattach_process_ext` (`crates/akuma-exec`, the crate boundary)
+using `kill_process_with_signal` — a crate-internal hard-stop that manipulates
+process state directly (marks it a zombie, sets the exit code, notifies the
+parent) without going through the normal disposition-aware signal path or a
+real `exit_group` teardown. Reported as insufficiently "graceful," and
+separately: nothing reset the displaced session's terminal, so whatever the
+grabbed app had left it in (raw mode, alternate screen, hidden cursor) would
+still be sitting there once the connection dropped — that state lives in the
+*client's* terminal emulator, which nothing server-side can reach once the
+connection is gone, so it has to be fixed by sending a reset **before** the
+connection closes, not after.
+
+Fixed by moving the actual detach out of the crate and up to the syscall
+boundary, which is where the real, disposition-aware signal path already
+lives (`src/syscall/proc.rs::sys_kill` — the same one a plain `kill(2)`
+uses). `reattach_process_ext`'s job shrank to *deciding* whether someone
+needs detaching: it now returns `Ok(Some(previous_holder))` instead of acting.
+`sys_reattach` does the detach itself, in order: write a soft terminal-reset
+escape sequence (exit alt-screen `?1049l`, show cursor `?25h`, clear
+attributes `0m`, DECSTR soft reset `!p`, newline) into the previous holder's
+own channel — while the connection is still up — then `sys_kill(previous,
+SIGTERM)`, which runs the previous holder through its own normal `exit_group`
+cleanup rather than a raw state flip.
+
+Verified on the same isolated-QEMU setup as §6.3: grabbing a `cat`, having a
+second session `-d`-grab it, and confirming the first session's final bytes
+before disconnect are exactly the reset escape sequence, followed by the
+connection closing with a nonzero exit — not a bare "connection reset,"
+a real, escape-sequence-terminated goodbye.
+
+### 7.3 tmux itself is blocked — a real, pre-existing, unrelated gap
+
+**`tmux` cannot run on Akuma at all, independent of anything in this doc.**
+Tried it directly: `box pull alpine` + `box run ... apk add tmux` worked fine
+(network and apk-inside-a-container are both functional), and `tmux 3.7c`
+installed and executed — up to the point where it tried to create its
+client/server rendezvous socket:
+
+```
+error connecting to /tmp/tmux-0/default (Address family not supported by protocol)
+```
+
+`tmux`'s entire architecture is a client and a server talking over a **named,
+filesystem-bound `AF_UNIX` socket** (`bind()` a path, `listen()`, a separate
+process `connect()`s to it later). `sys_socket()` (`src/syscall/net.rs:115`)
+hard-rejects any domain other than `AF_INET`; `bind`/`listen`/`connect` are
+all gated on the `smoltcp` (IP) stack. The *only* `AF_UNIX` support that
+exists is `socketpair()` — an anonymous, already-connected pair for one
+process's own IPC (what `rustc` uses to talk to its linker child) — which
+cannot serve a rendezvous between two independently-launched processes. This
+is a pre-existing, already-documented limitation
+([`../reference/subsystems/syscalls/net.md`](../reference/subsystems/syscalls/net.md)
+— "AF_UNIX socketpair exclusion"), not something introduced or exposed by
+`box grab`. Fixing it would mean building a real bindable/connectable
+`AF_UNIX` socket subsystem — a separate, much larger project, out of scope
+here.
+
+(One rough edge hit along the way, unrelated to any of this: a `box run`
+whose spawn fails — e.g. `tmux`'s own strict check that its runtime dir
+`/tmp/tmux-$UID` be mode `0700`, which the container's default `/tmp` isn't —
+leaves the box registered with no way to `box close` it under its name until
+whatever call path unregisters an emptied box runs. Not investigated further;
+noted here in case it resurfaces.)
+
+### 7.4 Verified instead against a real raw-mode full-screen app (`vi`)
+
+Since `tmux` itself is off the table, repeated the same on-device check
+(isolated QEMU instance, per the established technique) against `busybox`'s
+`vi` — a genuine full-screen, raw-terminal-mode editor, not a synthetic stand-in
+like `cat`. Three things confirmed, each against the live process, not
+inferred:
+
+1. **Repaint on attach, unprompted.** Grabbing a running `vi` and then simply
+   typing into the new session showed a full clear-and-redraw (`\e[H\e[J` +
+   every tilde line + status line redrawn) fire on its own — `SIGWINCH`
+   reaching a real app and producing exactly the repaint §7.1 was built for,
+   not merely "delivered without crashing."
+2. **Raw-mode keystrokes forward correctly.** Entered insert mode (`i`),
+   typed text, `Esc` — `vi`'s buffer and status line (`[Modified]`) updated
+   correctly after being relayed through the reattached channel, confirming
+   input forwarding survives reattach for a process in raw/noncanonical mode
+   (echo off, no line buffering), not just a line-buffered tool like `cat`.
+3. **`-d` detach against a real app, twice over.** Grabbed `vi` from session
+   B, then `-d`-grabbed it from session C. B died observably (nonzero exit,
+   connection closed) with its exact final bytes being §7.2's terminal-reset
+   sequence (`\e[?1049l\e[?25h\e[0m\e[!p`). C then continued editing the
+   *same live* `vi` process correctly (typed `from-C`, saw it inserted,
+   modified flag set). `vi` never crashed or visibly corrupted its screen
+   state across any of this.
+
+This doesn't exercise `tmux`'s own client/server reattach protocol (§7.3
+explains why that's currently impossible to test at all), but it does confirm
+the mechanism this whole doc is about — reattach, `SIGWINCH`-triggered
+repaint, and detach-with-terminal-reset — against real, unmodified
+third-party software in raw terminal mode, not only the synthetic `cat`/`sh`
+targets used in §5-§7.2.
+
 ## Background
 
+- [`../reference/subsystems/syscalls/net.md`](../reference/subsystems/syscalls/net.md)
+  — "AF_UNIX socketpair exclusion": why `tmux` can't run at all (§7.3).
+  `sys_socket` only accepts `AF_INET`; the only `AF_UNIX` path is an
+  anonymous `socketpair()`, with no `bind`/`listen`/`connect` for a named
+  socket two independent processes could rendezvous on.
 - [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) #4 "`reattach` fails to wake target
   process" — the original report of this symptom. The *symptom* description
   was accurate; the attributed cause (a wake/scheduler bug) was not — see §3
@@ -348,7 +481,14 @@ are all clean.
   should read both.
 - [`crates/akuma-exec/src/process/exec.rs`](../../crates/akuma-exec/src/process/exec.rs)
   → `reattach_process_ext` (`:229`) — unchanged by §1-§5; gained the
-  `force`/`grabbed_by` detach-and-take-over logic in §6.1.
+  `force`/`grabbed_by` detach *decision* in §6.1, then (§7.2) had the actual
+  detach action moved back out to `sys_reattach`, since only the syscall
+  boundary can reach the disposition-aware signal path.
+- [`src/syscall/container.rs`](../../src/syscall/container.rs) → `sys_reattach`
+  — the SIGWINCH/winsize-propagation (§7.1) and terminal-reset-then-`sys_kill`
+  detach (§7.2) both live here now, reusing `src/syscall/proc.rs::sys_kill`
+  directly (`pub(super)`, reachable from any `crate::syscall` submodule) —
+  the same disposition-aware path `kill(2)` uses, not reimplemented.
 - [`crates/akuma-exec/src/threading/mod.rs`](../../crates/akuma-exec/src/threading/mod.rs)
   → `ThreadWaker::wake` (`:3561`) — unchanged by this fix; confirmed correct
   (generation check, CAS, SGI trigger all behave as designed) via the debug

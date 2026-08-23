@@ -63,11 +63,16 @@ would break every bare program name.
 ### `box grab` options
 
 - `-d` / `--detach` — like `screen -d`: if the target process is already
-  reattached to another, still-live `box grab`, detach that one (it gets
-  `SIGTERM`'d, its own session ends) and take over instead. Without `-d`, a
-  target that's already attached elsewhere is refused (`already attached...
-  use -d`) rather than silently stealing its channel out from under whoever
-  is currently watching it.
+  reattached to another, still-live `box grab`, detach that one (its own
+  terminal is reset to a sane state, then it's `SIGTERM`'d and its session
+  ends) and take over instead. Without `-d`, a target that's already attached
+  elsewhere is refused (`already attached... use -d`) rather than silently
+  stealing its channel out from under whoever is currently watching it.
+
+Every successful grab — not just a `-d` one — pushes your terminal's current
+size onto the target and sends it `SIGWINCH`, the same way `screen`/`tmux` do
+on attach, so a full-screen app (anything ncurses-based: `vi`, `top`, …)
+redraws against your session instead of looking frozen or misdrawn.
 
 `box grab` exits on its own once the grabbed process exits (or once it's
 detached by a later `-d` grab) — it doesn't wait for you to notice the

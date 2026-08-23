@@ -21,7 +21,11 @@ bundles — none of which are re-derived here — see
 > -d`-style detach-and-take-over, see "reattach" below) and `box grab` no
 > longer hangs forever after its target exits — it was polling `waitpid()`
 > on a pid that is essentially never its own child, which can never report
-> that pid's exit.
+> that pid's exit. **Also 2026-08-23:** every successful reattach now
+> propagates the caller's terminal size to the target and sends it
+> `SIGWINCH`, and a `force`-displaced holder gets a terminal-reset escape
+> sequence and a real, disposition-aware `SIGTERM` rather than a raw
+> force-stop — see "reattach" below for both.
 
 ## register_box / kill_box
 
@@ -54,16 +58,45 @@ target already has a different, live holder:
 
 - `force == 0`: refused, `EBUSY`. Nobody's channel gets stolen out from under
   them by accident.
-- `force != 0`: the previous holder is sent `SIGTERM`
-  (`kill_process_with_signal`) before the reattach proceeds — otherwise its
-  own wait loop has no way to learn it's been superseded and would spin
-  forever against a channel nobody reads from anymore (see `box grab`'s exit
-  detection, next paragraph, for the same "no way to learn" shape on the
-  read side).
+- `force != 0`: the previous holder is detached (see below) before the
+  reattach proceeds — otherwise its own wait loop has no way to learn it's
+  been superseded and would spin forever against a channel nobody reads from
+  anymore (see `box grab`'s exit detection, next paragraph, for the same "no
+  way to learn" shape on the read side).
 
 `userspace/box`'s `box grab` exposes this as `-d`/`--detach`; `box run`/`box
 open -i`/`box use -i`/`paws`'s reattach-into-shell path all pass `force =
 false` — freshly spawned children can't already have a holder.
+
+`akuma_exec::process::reattach_process_ext` only *decides* whether someone
+needs detaching — it returns `Ok(Some(previous_holder))` rather than acting,
+because acting needs the disposition-aware signal path this crate can't reach
+(wrong dependency direction: that logic lives in `src/syscall/proc.rs`).
+`sys_reattach` (`container.rs`) does the actual detach, in order:
+
+1. Write a soft terminal-reset escape sequence
+   (`TERM_RESET_SEQUENCE` — exit alt-screen, show cursor, clear attributes,
+   DECSTR soft reset, newline) into the previous holder's own channel, so
+   whatever the grabbed app left that human's terminal in (raw mode,
+   alt-screen, hidden cursor) doesn't survive the connection dropping — that
+   state lives in the *client's* terminal emulator, unreachable once the
+   connection is gone.
+2. `super::proc::sys_kill(previous_holder, SIGTERM)` — the same
+   disposition-aware path a plain `kill(2)` uses (not
+   `kill_process_with_signal`'s crate-level hard-stop, which is for genuine
+   force-kills elsewhere and skips normal cleanup), so the previous holder's
+   own process exits through its ordinary `exit_group` teardown.
+
+**Terminal size and repaint, every successful reattach (not just `force`).**
+After the reattach itself succeeds, `sys_reattach` copies the caller's
+`term_width`/`term_height` onto the target's `TerminalState` and sends the
+target `SIGWINCH` (28) via the same `sys_kill` path — mirroring what
+`screen`/`tmux` do on attach so a full-screen app (anything ncurses-based)
+actually redraws against the new session's size instead of looking frozen or
+misdrawn until something else prompts it. Safe unconditionally: `SIGWINCH`'s
+POSIX default action is Ignore (confirmed absent from
+`crate::syscall::signal::signal_is_fatal_default`), so a target with no
+handler installed — a plain `cat`, say — just drops it.
 
 **`box grab`'s exit-on-target-exit** is a userspace fix, not a kernel one, but
 worth recording next to this: the grabbed process is essentially never `box

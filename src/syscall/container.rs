@@ -71,9 +71,60 @@ pub(super) fn sys_kill_box(box_id: u64) -> u64 {
     0
 }
 
+/// Soft terminal reset, written to a displaced holder's own channel right
+/// before it's killed: exit alternate screen (`?1049l`), show the cursor
+/// (`?25h`), clear character attributes (`0m`), DECSTR soft reset (`!p`), then
+/// a fresh line. Same idea as `tput reset` / what `screen`/`tmux` send a
+/// terminal on a forced detach — without it, whatever the grabbed app left
+/// the terminal in (raw mode, alt-screen, hidden cursor) survives the
+/// connection closing, because that state lives in the *client's* terminal
+/// emulator, not anywhere this kernel can reach after the fact.
+const TERM_RESET_SEQUENCE: &[u8] = b"\r\n\x1b[?1049l\x1b[?25h\x1b[0m\x1b[!p";
+
 pub(super) fn sys_reattach(pid: u32, force: u32) -> u64 {
     match akuma_exec::process::reattach_process(pid, force != 0) {
-        Ok(()) => 0,
+        Ok(displaced) => {
+            if let Some(previous_holder) = displaced {
+                // Give the human on the other end a sane-looking terminal
+                // before their connection disappears out from under them,
+                // then let them go through the real signal-delivery path —
+                // a disposition-aware SIGTERM and a full `exit_group` cleanup,
+                // not the crate-level hard-stop used for actual force-kills
+                // elsewhere — so their own wait loop exits the way a normal
+                // process exit would, not as if it had been yanked.
+                if let Some(proc) = akuma_exec::process::lookup_process_shared(previous_holder)
+                    && let Some(ref channel) = proc.channel {
+                        channel.write(TERM_RESET_SEQUENCE);
+                    }
+                super::proc::sys_kill(previous_holder, 15 /* SIGTERM */);
+            }
+            // Mirror what `screen`/`tmux` do on attach: hand the target the
+            // caller's real terminal size and nudge it to repaint. Neither
+            // step is required for correctness (a full-screen app that never
+            // redraws just looks stale until its next natural refresh), but
+            // without them every ncurses-style app looks frozen/misdrawn
+            // after a `box grab` until something else prompts it to redraw.
+            if let Some(caller) = akuma_exec::process::current_process_shared() {
+                let (width, height) = {
+                    let ts = caller.terminal_state.lock();
+                    (ts.term_width, ts.term_height)
+                };
+                if let Some(target) = akuma_exec::process::lookup_process_shared(pid) {
+                    let mut ts = target.terminal_state.lock();
+                    ts.term_width = width;
+                    ts.term_height = height;
+                }
+            }
+            // SIGWINCH (28): the standard "your window changed, requery and
+            // redraw" signal. Its POSIX default action is Ignore (confirmed
+            // absent from `signal_is_fatal_default`), so a target with no
+            // handler installed just drops it — this can never kill a plain
+            // `cat`. Goes through the same disposition-aware path `kill(2)`
+            // uses, not a raw pend, so SA_RESTART and everything else already
+            // hardened there applies here too.
+            super::proc::sys_kill(pid, 28);
+            0
+        }
         // `box grab` (screen -d-style) distinguishes "already attached" —
         // pass `force` to detach the previous holder — from every other
         // failure (unknown pid, permission denied), which the syscall
