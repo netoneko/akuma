@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 667
-- **Docs contributing at least one fix:** 211
+- **Total distinct fixes counted:** 680
+- **Docs contributing at least one fix:** 215
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 127 | 19.0% | 17 |
-| Memory & Virtual Memory | 113 | 16.9% | 35 |
-| Scheduler & Process Management | 76 | 11.4% | 19 |
-| SMP & Locking | 86 | 12.9% | 37 |
-| Networking | 42 | 6.3% | 17 |
-| Userspace Apps & Libraries | 37 | 5.5% | 20 |
-| Rump Kernel & Syscall Proxy | 26 | 3.9% | 6 |
-| Toolchain & Self-Hosting | 37 | 5.5% | 5 |
-| SSH | 15 | 2.2% | 13 |
+| Syscall / ABI Compatibility Audits | 128 | 18.8% | 18 |
+| Memory & Virtual Memory | 113 | 16.6% | 35 |
+| Scheduler & Process Management | 76 | 11.2% | 19 |
+| SMP & Locking | 86 | 12.6% | 37 |
+| Networking | 43 | 6.3% | 18 |
+| Userspace Apps & Libraries | 37 | 5.4% | 20 |
+| Rump Kernel & Syscall Proxy | 26 | 3.8% | 6 |
+| Toolchain & Self-Hosting | 37 | 5.4% | 5 |
+| SSH | 26 | 3.8% | 15 |
 | VFS & Filesystem | 17 | 2.5% | 12 |
 | Boot & Drivers | 23 | 3.4% | 8 |
 | Signals & Exceptions | 12 | 1.8% | 5 |
-| Misc / Cross-cutting | 22 | 3.3% | 5 |
+| Misc / Cross-cutting | 22 | 3.2% | 5 |
 | Console & Terminal | 15 | 2.2% | 7 |
 | Containers | 19 | 2.8% | 5 |
-| **Total** | **667** | **100.0%** | **211** |
+| **Total** | **680** | **100.0%** | **215** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -45,7 +45,7 @@ from several subsystems under one write-up.
 
 ---
 
-## Syscall / ABI Compatibility Audits (127 fixes, 17 docs)
+## Syscall / ABI Compatibility Audits (128 fixes, 18 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -170,6 +170,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/WRITEV_SHORT_WRITE_SPLICE.md
 - `sys_writev` did not stop at a **short** write: after an iovec that wrote fewer bytes than it was given, it moved on to the next one, so the tail that never went out was replaced by the following iovec's bytes and the caller — told only a total — resumed from a point that did not correspond to what had actually been written. Short writes are the normal case here (`socket_send` returns whatever fit in smoltcp's 16 KB TX buffer, and it ends with a `poll()` that frees TX space so the *next* iovec usually succeeds), so every socket reply larger than the TX window came out spliced; `redis-cli` reported it as `Protocol error, got "\n" as reply type byte`, and an A/B on the same VM showed 4/16 KiB replies clean while 64 KiB, 256 KiB and 1 MiB corrupted — with the first wrong byte `0x0d` in all three, i.e. the `\r\n` of the next iovec. `sys_readv` had always had the mirror guard
+
+### docs/archive/NCA_MISSING_SYSCALLS.md
+- `flock(2)` (syscall 32) was a bare `=> 0` no-op stub — every call unconditionally reported success with zero actual locking, so `sh`'s `flock` applet never errored and a lock-contention probe never saw a second caller block on a first caller's held lock; fixed with real advisory locking (`src/syscall/flock.rs`) keyed by path string, blocking `LOCK_EX`/`LOCK_SH` via 10ms poll-retry, and auto-unlock-on-close wired into both `sys_close` and `SharedFdTable::close_all` — implemented and clean under `cargo check`/`build`/`clippy --release`, not yet re-verified against a booted kernel
 
 ## Memory & Virtual Memory (113 fixes, 35 docs)
 
@@ -644,7 +647,7 @@ aren't recorded anywhere else.)
 ### docs/archive/BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md
 - Commit `1a29c9c3` dropped `blocking_relax()`'s leading `yield_now()` for every caller to speed up the socket wait loop (+27% HTTP throughput), but the spawn/exec/reap waiters — woken by another thread on their own core, not by a device interrupt — genuinely need that yield to hand off, so removing it kernel-wide permanently wedged `SMP=4` in the spawn/exec/reap path (boot suite: 294 passed → 23 passed, wedged); fixed by splitting the primitive into `blocking_relax_net` (no yield) wired only into `NetRuntime::blocking_relax`, keeping the yield everywhere else (294 passed, +30% HTTP throughput preserved)
 
-## Networking (42 fixes, 17 docs)
+## Networking (43 fixes, 18 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - `MAX_BACKLOG = 8` (`crates/akuma-net/src/socket.rs`) was a hard ceiling on **simultaneous connection arrivals**, not the soft hint `listen(2)`'s backlog is on Linux: this stack has no SYN queue, a listener *is* a fixed pool of pre-created sockets sitting in `Listen` that `socket_accept` replenishes one at a time, so arrivals past the 8th got a RST regardless of how fast the server accepted. Every caller's requested backlog was silently clamped to it (`libakuma`'s `TcpListener::bind` asks for 128). Measured on devbox-smoltcp/SMP=4: 8/8 connections clean, 12/16, 17/24 before; 16/16 and 24/24 after. Raised to 32 behind the default-on `many-sessions` feature, which also lifts the smoltcp socket table from 32 to 128 on `small-sockets` builds — a 32-deep backlog is meaningless against a 32-socket budget. `kernel_profile_extreme` overrides both back down, so the 4 MB floor is unaffected
@@ -722,6 +725,9 @@ aren't recorded anywhere else.)
 
 ### docs/archive/CARGO_CRATES_IO_CONNECT_FAIL.md
 - `sys_pselect6` never wrote the caller's `exceptfds` set back, so any `select(2)`-based caller reading it after a call saw whatever was passed in as still set; the nightly musl toolchain's vendored libcurl (built without `HAVE_POLL`) uses the `select(2)` branch and puts a connecting socket in `exceptfds` to watch for `POLLPRI`, so `FD_ISSET` stayed true, libcurl synthesised a false `POLLPRI`, mapped it to `CURL_CSELECT_ERR`, and discarded sockets that had already reached `Established` with `SO_ERROR == 0` — `cargo fetch`/`build` looped on "spurious network error" forever; fixed by zeroing `exceptfds` on both the ready and timeout path (`src/syscall/poll.rs`)
+
+### docs/archive/SMOLTCP_STALE_CONNECTING_HANDLE_PANIC.md
+- `socket_close` queued a closed socket in `pending_removal` for GC but never purged it from `net.connecting` (the list `poll()` uses to enforce the non-blocking-connect timeout), so a socket closed while still `SynSent` sat in both lists at once; the next `poll()` freed its `SocketSet` slot via the `pending_removal` sweep, then the `connecting` sweep immediately after dereferenced the now-freed handle and smoltcp panicked unconditionally — deterministic for any non-blocking `connect()` closed before the handshake finishes, not a rare race; fixed by purging the `connecting` entry in the same step `socket_close` queues the handle for removal
 
 ## Userspace Apps & Libraries (37 fixes, 20 docs)
 
@@ -895,7 +901,7 @@ aren't recorded anywhere else.)
 - every path in the script is relative to `userspace/` while the documented invocation is `userspace/build.sh` from the repo root, where the first `cargo build -p libakuma` resolved against the kernel workspace and failed; fixed by anchoring with `cd "$(dirname "$0")"`, which also fixes toolchain/target resolution for the out-of-workspace members
 
 
-## SSH (15 fixes, 13 docs)
+## SSH (26 fixes, 15 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - Every SSH session ran as one future inside a single `sshd` process, so `panic = "abort"` — which is process-wide, not future- or thread-scoped — meant *any* panic on *any* connection dropped every other live session with it. `PROTOCOL_UNDER_LOAD.md` fixed the one known trigger (a malformed pre-KEX packet) while explicitly noting the blast radius itself remained; this closes that. Each accepted connection is now served by its own `fork()`ed child, which inherits the socket through the fd-table copy (`FdTable::clone_deep_for_fork` → `socket_clone_ref`, refcounted on close by `remove_socket` — machinery that already existed and was already correct for this case). Zero kernel changes were needed: `docs/MISSING_SOCKET_MACHINERY.md` had concluded the handoff was unbuildable, having surveyed `sys_spawn`, `SCM_RIGHTS` and procfs but not `fork()`, where the fd is never handed over at all. Verified by SIGKILLing one live session under load — exactly one peer ended, three ran to completion, the server kept serving. Bounded by a new `max_sessions` (default 24) against the global `MAX_PROCESSES = 64`, since a fully-occupied session now costs two process slots. On by default (`fork-sessions`); `SSHD_FORK_SESSIONS=0` reverts to the cooperative executor for memory-constrained images
@@ -937,6 +943,21 @@ aren't recorded anywhere else.)
 
 ### docs/archive/SSHD_CHANNEL_WINDOW_NEVER_ADJUSTED.md
 - sshd advertised a 1 MiB inbound SSH channel window at channel-open and never sent `SSH_MSG_CHANNEL_WINDOW_ADJUST`, so no session could ever carry more than 1 MiB of stdin — a transfer at exactly that size hung with no error until the client's own timeout fired; the same `0x100000` number as `MAX_BUFFER_SIZE` had coincidentally been hiding a second, independent stdin-overflow bug (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` Phase 0 item 5); fixed by sending the window adjustment (verified with 4 MiB through `cat` and 8 MiB through `sha256sum`, both byte-exact)
+
+### userspace/sshd/docs/CLIENT_REAL_SERVER_INTEROP_FIX.md
+- The `ssh` client's handshake-phase call sites (`CHANNEL_OPEN` confirmation wait, `expect_channel_reply` for `pty-req`/`exec`/`shell`, and `authenticate`'s auth-response waits) each read exactly one packet and treated any other message type as fatal, so a real-world server interleaving `SSH_MSG_GLOBAL_REQUEST` (OpenSSH's `hostkeys-00@openssh.com`), `SSH_MSG_CHANNEL_WINDOW_ADJUST`, or `SSH_MSG_USERAUTH_BANNER` (all legal per RFC 4253/4252 at those points) killed the connection with "expected X, got message type N" even though nothing was actually wrong; fixed by looping all three call sites on those message types the same way the client's own interactive `pump` loop already did, including applying `WINDOW_ADJUST`'s send-window credit instead of discarding it — verified against a real OpenSSH server and `late.sh`, which previously failed at each of the three message types in turn
+
+### userspace/sshd/docs/SECURITY_IMPROVEMENTS.md
+- `take_unencrypted_packet`/`take_encrypted_packet` indexed the message-type byte without checking `packet_len` was large enough for it to exist — a 5-byte packet panicked (`panic = "abort"` kills the whole process), reachable pre-auth by any TCP peer on the unencrypted path and post-auth by a malicious server on the encrypted one; fixed by rejecting `packet_len < 2` before either index
+- The same two functions could compute `payload_len = packet_len - padding_len - 1 == 0` from a legitimate-looking length field and then slice `[6..5]` (`start > end`), an unconditional panic in Rust regardless of buffer contents; fixed by rejecting `payload_len < 1`
+- The `Option`-returning packet parser conflated "not enough bytes yet" with "these bytes are fully buffered and permanently malformed (bad MAC, bad length)", so a caller that treated both as "keep waiting" spun forever re-parsing the same stuck bytes — a pre-auth hang for a MITM that corrupts one byte during the unencrypted phase; fixed with a three-state `TakePacket` enum (`Ready`/`Incomplete`/`Malformed`) so `Malformed` now disconnects instead of looping
+- The ephemeral X25519 KEX secret and the persisted Ed25519 identity key both drew from `SimpleRng`, a 64-bit xorshift PRNG (fine for its original non-secret uses — KEXINIT cookie, anti-fingerprinting padding — but collapsing a 256-bit key's effective security to ~64 bits); fixed by pulling both from real hardware entropy (`getrandom()`) instead
+- `Connection::input_buffer` had no size cap, so a peer claiming an enormous `packet_len` and trickling bytes (or never finishing) could grow it without bound — a memory-exhaustion DoS; fixed with `MAX_INPUT_BUFFER` (1 MiB), checked after every socket read on both the blocking handshake path and the non-blocking interactive pump
+- `read_version_line` looped on pre-version banner lines (legal per RFC 4253 §4.2) with no cap on the *count* of lines, so a hostile peer that never sent a line starting with `SSH-` could hold the handshake open indefinitely; fixed with `MAX_BANNER_LINES = 100`
+- `generate_and_save` (new identity key) and `add_known_host` (TOFU acceptance) discarded the `Result` of their `mkdir_p`/file-write calls, so a silent persistence failure meant a freshly generated identity key was reported saved when it wasn't (next connection silently generates a different key) or a TOFU-accepted host key was "forgotten" (next connection re-prompts as if the host key changed); fixed by checking the `Result` and warning with the path and errno on failure
+- `sshd.conf`'s `disable_key_verification = true` bypassed `publickey` auth entirely for any client, reachable by one typo or one copy-pasted dev config in a binary nobody built with that in mind; fixed by gating it behind a new off-by-default Cargo feature (`insecure-disable-key-verification`) — without the feature the flag still parses but is ignored, with a loud warning naming why
+- The interactive pump's `CHANNEL_DATA`/`CHANNEL_EXTENDED_DATA`/`CHANNEL_WINDOW_ADJUST`/`CHANNEL_REQUEST`/`CHANNEL_CLOSE` handling never checked the packet's `recipient channel` field against `LOCAL_CHANNEL`; fixed by validating it explicitly and skipping a mismatched frame instead of acting on it
+- `zeroize` (zeroes `ed25519-dalek` key material on drop) was off for both `sshd` and the `ssh` client via a shared `default-features = false` on `akuma-ssh-crypto`, leaving the host key and identity/ephemeral KEX secrets able to linger in freed heap memory after use; fixed by re-enabling `zeroize` explicitly for both binaries while leaving the unrelated `fast` (speed-only) feature off
 
 ---
 
