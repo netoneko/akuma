@@ -30,6 +30,11 @@ pub mod socket;
 #[cfg(feature = "smoltcp")]
 pub mod dns;
 
+// The AF_UNIX socket state machine. Unconditional, like `socket`'s address
+// types: AF_UNIX must exist on the rump-only devbox build, where box 0's
+// `rump_server` answers every proxied syscall over a `UnixSocket` at fd 3.
+// Contains no smoltcp references. See docs/archive/UNIX_SOCKET_IMPROVEMENTS.md.
+pub mod unix;
 // Lock infrastructure for fine-grained locking (Phase 1 of BKL removal)
 pub mod locks;
 // Device-level traffic/latency counters. Always compiled (the module's public
@@ -42,6 +47,8 @@ pub mod nicstat;
 mod tests;
 #[cfg(test)]
 mod lock_tests;
+#[cfg(test)]
+mod unix_tests;
 
 pub use runtime::NetRuntime;
 

@@ -248,7 +248,14 @@ pub fn attach_server(box_id: u64, server_pid: process::Pid) {
     };
     // Install the channel at fd 3 before the server is scheduled (single-core:
     // it does not run until the spawning thread yields).
-    server.set_fd(3, process::FileDescriptor::UnixSocket { rx: px, tx: py });
+// `sock: 0` — no AF_UNIX table entry. This is a kernel-internal pipe pair, not
+    // a socket userspace created: box 0's `rump_server` only ever `send`/`recv`/
+    // `sendmsg`s on it, and every one of those paths keeps its pre-table raw-pipe
+    // behaviour for `sock == 0`. Giving it a table entry would put the sysproxy
+    // handshake behind the new framing code for no gain and real risk — a
+    // regression here stops the rump stack from coming up, several layers away
+    // from anything that looks like socket code.
+    server.set_fd(3, process::FileDescriptor::UnixSocket { rx: px, tx: py, sock: 0 });
     crate::safe_print!(
         96,
         "[RUMP-SP] box={} attached sysproxy channel to rump_server pid={}; handshaking\n",
@@ -1466,7 +1473,8 @@ pub fn run_rump() {
         let _ = process::kill_process(pid);
         return;
     };
-    p.set_fd(3, process::FileDescriptor::UnixSocket { rx: px, tx: py });
+    // Same kernel-internal sysproxy channel as above; `sock: 0` for the same reason.
+    p.set_fd(3, process::FileDescriptor::UnixSocket { rx: px, tx: py, sock: 0 });
 
     // Drive the handshake + one socket syscall, then ALWAYS tear the server down
     // (kill from outside — cascades to its ~19 rump kthreads) so it does not leak.

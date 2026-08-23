@@ -581,9 +581,28 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                 }
             }
         }
-        // AF_UNIX socketpair endpoint: readable when `rx` has data, writable
-        // when `tx`'s peer is still open.
-        akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+        // AF_UNIX socket. A connected endpoint is readable when `rx` has data
+        // and writable when `tx`'s peer is still open; a **listener** has no
+        // pipes at all and is readable when its backlog is non-empty.
+        //
+        // The listener case is the one genuinely new readiness predicate
+        // AF_UNIX adds, and it is checked first because a listening socket's
+        // `rx`/`tx` are 0 — falling through to the pipe arms would ask
+        // `pipe_can_read(0)`, which is `false` for a pipe that does not exist,
+        // so an `accept`-ready listener would poll as "nothing" forever and
+        // every event-loop server would hang. It must report identically
+        // through poll/select/epoll; the AF_INET side of that same contract is
+        // what the `_exceptfds_ptr` bug violated
+        // (docs/runbooks/cargo-cannot-reach-crates-io.md §3).
+        akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, .. } => {
+            if let Some(accept_ready) =
+                super::unixsock::listener_ready(fd_num, waker.is_some().then_some(tid))
+            {
+                if requested & EPOLLIN != 0 && accept_ready {
+                    ready |= EPOLLIN;
+                }
+                return ready;
+            }
             if requested & EPOLLIN != 0 {
                 if waker.is_some() {
                     super::pipe::pipe_add_poller(rx, tid);

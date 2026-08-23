@@ -1467,9 +1467,10 @@ pub(super) fn sys_dup(oldfd: u32) -> u64 {
     match &entry {
         akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
         akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
-        akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+        akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
             super::pipe::pipe_clone_ref(*rx, false);
             super::pipe::pipe_clone_ref(*tx, true);
+            super::unixsock::unix_sock_clone_ref(*sock);
         }
         #[cfg(feature = "smoltcp")]
         akuma_exec::process::FileDescriptor::Socket(idx) => socket::socket_clone_ref(*idx),
@@ -1502,9 +1503,10 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     match &entry {
         akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
         akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
-        akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+        akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
             super::pipe::pipe_clone_ref(*rx, false);
             super::pipe::pipe_clone_ref(*tx, true);
+            super::unixsock::unix_sock_clone_ref(*sock);
         }
         #[cfg(feature = "smoltcp")]
         akuma_exec::process::FileDescriptor::Socket(idx) => socket::socket_clone_ref(*idx),
@@ -1536,9 +1538,10 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
         match old {
             akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_close_write(id),
             akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_close_read(id),
-            akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+            akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
                 super::pipe::pipe_close_read(rx);
                 super::pipe::pipe_close_write(tx);
+                super::unixsock::unix_sock_close(sock);
             }
             akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
             #[cfg(feature = "sc-eventfd")]
@@ -1841,9 +1844,10 @@ pub fn sys_close(fd: u32) -> u64 {
                 akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
                     super::pipe::pipe_close_read(pipe_id);
                 }
-                akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+                akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
                     super::pipe::pipe_close_read(rx);
                     super::pipe::pipe_close_write(tx);
+                    super::unixsock::unix_sock_close(sock);
                 }
                 #[cfg(feature = "sc-eventfd")]
                 akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
@@ -1903,9 +1907,10 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
                 akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
                     super::pipe::pipe_close_read(pipe_id);
                 }
-                akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+                akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
                     super::pipe::pipe_close_read(rx);
                     super::pipe::pipe_close_write(tx);
+                    super::unixsock::unix_sock_close(sock);
                 }
                 #[cfg(feature = "sc-eventfd")]
                 akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
@@ -2477,9 +2482,10 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
             match &entry {
                 akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
                 akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
-                akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+                akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
                     super::pipe::pipe_clone_ref(*rx, false);
                     super::pipe::pipe_clone_ref(*tx, true);
+                    super::unixsock::unix_sock_clone_ref(*sock);
                 }
                 #[cfg(feature = "smoltcp")]
                 akuma_exec::process::FileDescriptor::Socket(idx) => socket::socket_clone_ref(*idx),

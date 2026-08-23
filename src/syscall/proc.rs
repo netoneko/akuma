@@ -804,9 +804,10 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         match entry {
             akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => super::pipe::pipe_close_write(pipe_id),
             akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => super::pipe::pipe_close_read(pipe_id),
-            akuma_exec::process::FileDescriptor::UnixSocket { rx, tx } => {
+            akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
                 super::pipe::pipe_close_read(rx);
                 super::pipe::pipe_close_write(tx);
+                super::unixsock::unix_sock_close(sock);
             }
             akuma_exec::process::FileDescriptor::Socket(idx) => akuma_net::socket::remove_socket(idx),
             akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {

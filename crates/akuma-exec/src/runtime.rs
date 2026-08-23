@@ -151,6 +151,21 @@ pub struct ExecRuntime {
     pub pipe_clone_ref: fn(u32, bool),
     pub eventfd_close: fn(u32),
     pub eventfd_clone_ref: fn(u32),
+    /// Release one reference to an AF_UNIX table entry
+    /// (`FileDescriptor::UnixSocket`'s `sock` field), tearing it down at zero.
+    ///
+    /// Needed as a callback for the same reason `pipe_close_read` is: the fd
+    /// table lives here and the socket table lives in `akuma-net`, and this
+    /// crate cannot call into it directly. Skipping it would leak a table
+    /// entry — and, for a listener, every server-side endpoint still queued in
+    /// its backlog — on every close. A `sock` of 0 is the "no entry" sentinel
+    /// and the implementation ignores it.
+    pub unix_sock_close: fn(u32),
+    /// Take one reference to an AF_UNIX table entry. `dup`, `dup2`, `F_DUPFD`
+    /// and `fork` each produce a real second reference; without this the first
+    /// close destroys the entry underneath the other fd, exactly as it would
+    /// for a pipe or a socket.
+    pub unix_sock_clone_ref: fn(u32),
     pub epoll_destroy: fn(u32),
     pub pidfd_close: fn(u32),
     /// Release whatever `flock(2)` lock `(holder, fd)` — the `usize` is the

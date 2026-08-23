@@ -253,7 +253,13 @@ pub fn pipe_read(id: u32, buf: &mut [u8]) -> (usize, bool) {
 }
 
 pub fn pipe_close_write(id: u32) {
-    crate::irq::with_irqs_disabled(|| {
+    // Set inside the locked section, acted on outside it: the AF_UNIX
+    // channel detach takes the socket-table lock, and taking that while
+    // `PIPES` is held (IRQs masked) is the lock-ordering inversion that
+    // wedged a core the last time an allocation ran inside this lock (see
+    // `PIPE_CAPACITY`'s docs, failure 2).
+    let destroyed = crate::irq::with_irqs_disabled(|| {
+        let mut destroyed = false;
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.write_count = pipe.write_count.saturating_sub(1);
@@ -272,15 +278,31 @@ pub fn pipe_close_write(id: u32) {
             if pipe.write_count == 0 && pipe.read_count == 0 {
                 crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 pipes.remove(&id);
+                destroyed = true;
             }
         } else if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::tprint!(64, "[pipe] close_rw WARN: id={} not found\n", id);
         }
+        destroyed
     });
+    if destroyed {
+        // The pipe is gone, so its AF_UNIX framing metadata must go with it —
+        // and any SCM_RIGHTS descriptors still sitting in unread records must be
+        // closed rather than dropped. A channel that outlives its pipe would be
+        // re-attached by the next pipe to reuse the id, handing a fresh socket
+        // the previous one's record boundaries.
+        super::unixsock::unix_channel_detach(id);
+    }
 }
 
 pub fn pipe_close_read(id: u32) {
-    crate::irq::with_irqs_disabled(|| {
+    // Set inside the locked section, acted on outside it: the AF_UNIX
+    // channel detach takes the socket-table lock, and taking that while
+    // `PIPES` is held (IRQs masked) is the lock-ordering inversion that
+    // wedged a core the last time an allocation ran inside this lock (see
+    // `PIPE_CAPACITY`'s docs, failure 2).
+    let destroyed = crate::irq::with_irqs_disabled(|| {
+        let mut destroyed = false;
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.read_count = pipe.read_count.saturating_sub(1);
@@ -311,11 +333,21 @@ pub fn pipe_close_read(id: u32) {
             if pipe.write_count == 0 && pipe.read_count == 0 {
                 crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 pipes.remove(&id);
+                destroyed = true;
             }
         } else if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::tprint!(64, "[pipe] close_rw WARN: id={} not found\n", id);
         }
+        destroyed
     });
+    if destroyed {
+        // The pipe is gone, so its AF_UNIX framing metadata must go with it —
+        // and any SCM_RIGHTS descriptors still sitting in unread records must be
+        // closed rather than dropped. A channel that outlives its pipe would be
+        // re-attached by the next pipe to reuse the id, handing a fresh socket
+        // the previous one's record boundaries.
+        super::unixsock::unix_channel_detach(id);
+    }
 }
 
 /// Atomically check if there is data (or EOF) available on the pipe, and if

@@ -59,9 +59,14 @@ impl SharedFdTable {
             match entry {
                 FileDescriptor::PipeWrite(id) => (crate::runtime::runtime().pipe_clone_ref)(*id, true),
                 FileDescriptor::PipeRead(id) => (crate::runtime::runtime().pipe_clone_ref)(*id, false),
-                FileDescriptor::UnixSocket { rx, tx } => {
+                FileDescriptor::UnixSocket { rx, tx, sock } => {
                     (crate::runtime::runtime().pipe_clone_ref)(*rx, false);
                     (crate::runtime::runtime().pipe_clone_ref)(*tx, true);
+                    // The socket table entry is refcounted alongside the pipes:
+                    // the child's copy is a real reference, and without this the
+                    // child's first close would destroy the name binding and the
+                    // record boundaries under the parent's still-open fd.
+                    (crate::runtime::runtime().unix_sock_clone_ref)(*sock);
                 }
                 FileDescriptor::EventFd(id) => (crate::runtime::runtime().eventfd_clone_ref)(*id),
                 // Sockets are refcounted like pipes: the child's fd-table copy is a
@@ -203,9 +208,10 @@ impl SharedFdTable {
                 FileDescriptor::PipeRead(pipe_id) => {
                     (runtime().pipe_close_read)(pipe_id);
                 }
-                FileDescriptor::UnixSocket { rx, tx } => {
+                FileDescriptor::UnixSocket { rx, tx, sock } => {
                     (runtime().pipe_close_read)(rx);
                     (runtime().pipe_close_write)(tx);
+                    (runtime().unix_sock_close)(sock);
                 }
                 FileDescriptor::EventFd(efd_id) => {
                     (runtime().eventfd_close)(efd_id);

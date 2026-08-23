@@ -482,6 +482,18 @@ pub fn run_all_tests() {
     test_socketpair_bidirectional();
     test_socketpair_close_refcount();
     test_socketpair_recv_send_via_socket_syscalls();
+    // AF_UNIX as a socket family (bind/listen/accept/connect, framing,
+    // readiness, teardown). The state machine behind these is host-tested in
+    // `akuma_net::unix`; these cover the kernel wiring.
+    test_unix_socket_not_eafnosupport();
+    test_unix_abstract_connect_accept_roundtrip();
+    test_unix_connect_refused_when_unbound();
+    test_unix_seqpacket_preserves_boundaries();
+    test_unix_sendmsg_all_iovecs();
+    test_unix_so_type_reports_real_type();
+    test_unix_table_returns_to_baseline();
+    test_unix_listener_polls_readable();
+    test_unix_shutdown_wr_delivers_eof();
 
     // Test exit_group sibling behavior (Fix 1)
     test_exit_group_does_not_unregister_while_siblings_running();
@@ -10472,8 +10484,12 @@ fn test_socketpair_recv_send_via_socket_syscalls() {
     let px = crate::syscall::pipe::pipe_create();
     let py = crate::syscall::pipe::pipe_create();
     let proc = akuma_exec::process::current_process_shared().unwrap();
-    let fd_a = proc.alloc_fd(FileDescriptor::UnixSocket { rx: px, tx: py });
-    let fd_b = proc.alloc_fd(FileDescriptor::UnixSocket { rx: py, tx: px });
+    // `sock: 0` deliberately: this test predates the AF_UNIX table and asserts
+    // the RAW pipe-backed path (the one box 0's rump sysproxy channel still
+    // uses). Giving it table entries would move it off the code it was written
+    // to cover; the table paths have their own tests below.
+    let fd_a = proc.alloc_fd(FileDescriptor::UnixSocket { rx: px, tx: py, sock: 0 });
+    let fd_b = proc.alloc_fd(FileDescriptor::UnixSocket { rx: py, tx: px, sock: 0 });
 
     // Test buffers/structs live on the kernel stack; bypass user-ptr validation.
     crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
@@ -10524,6 +10540,586 @@ fn test_socketpair_recv_send_via_socket_syscalls() {
             224,
             "[Test] socketpair_recv_send_via_socket_syscalls FAILED: sendto={} recvfrom={} sendmsg={} recvmsg={} (EBADF={})\n",
             sendto_ret as i64, recvfrom_ret as i64, sendmsg_ret as i64, recvmsg_ret as i64, EBADF as i64);
+    }
+}
+
+// ============================================================================
+// AF_UNIX: the socket family, not just socketpair
+// ============================================================================
+//
+// The state machine these drive is host-tested in `akuma_net::unix` (88 tests,
+// `cargo test -p akuma-net`). What CANNOT be host-tested is the wiring: the fd
+// table, the pipes, the syscall dispatch, and the readiness path. These tests
+// cover exactly that seam — everything below goes through `handle_syscall`, the
+// way userspace would.
+//
+// See docs/archive/UNIX_SOCKET_IMPROVEMENTS.md.
+
+/// `socket(AF_UNIX, SOCK_STREAM, 0)` must return an fd.
+///
+/// It returned **EAFNOSUPPORT** before this work: `sys_socket` rejected every
+/// domain but `AF_INET`, so no program could build a unix socket the normal way
+/// and every unix-socket server was impossible. This is the root gap of the
+/// whole audit, so it gets the most direct possible assertion.
+fn test_unix_socket_not_eafnosupport() {
+    use akuma_exec::process::{register_process, register_thread_pid, unregister_process, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    const NR_SOCKET: u64 = 198;
+    const NR_CLOSE: u64 = 57;
+    const AF_UNIX: u64 = 1;
+    const SOCK_STREAM: u64 = 1;
+
+    // `socket()` needs a current process to hang the new fd on, so register one
+    // — the same pattern every other test in this group uses. An earlier
+    // version bailed out when there was *no* current process, which inverted
+    // the guard and made the test a permanent SKIP: it never once ran.
+    if akuma_exec::process::current_process_shared().is_some() {
+        console::print("[Test] unix_socket_not_eafnosupport SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6110;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    let ret = crate::syscall::handle_syscall(NR_SOCKET, &[AF_UNIX, SOCK_STREAM, 0, 0, 0, 0]);
+    if (ret as i64) >= 0 {
+        let _ = crate::syscall::handle_syscall(NR_CLOSE, &[ret, 0, 0, 0, 0, 0]);
+    }
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if (ret as i64) >= 0 {
+        console::print("[Test] unix_socket_not_eafnosupport PASSED\n");
+    } else {
+        crate::safe_print!(96, "[Test] unix_socket_not_eafnosupport FAILED: ret={} (EAFNOSUPPORT is -97)\n", ret as i64);
+    }
+}
+
+/// The abstract-namespace round trip: bind, listen, connect, accept, and data
+/// both ways — all through `handle_syscall`, with no filesystem involved.
+///
+/// This is the milestone assertion for the whole feature. It also covers the
+/// thing a pure state-machine test structurally cannot: that `connect` actually
+/// creates the pipes and installs them on **both** processes' descriptors, so
+/// the accepted fd can really carry bytes.
+fn test_unix_abstract_connect_accept_roundtrip() {
+    use akuma_exec::process::{register_process, register_thread_pid, unregister_process, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+    const NR_SOCKET: u64 = 198;
+    const NR_BIND: u64 = 200;
+    const NR_LISTEN: u64 = 201;
+    const NR_ACCEPT: u64 = 202;
+    const NR_CONNECT: u64 = 203;
+    const NR_SENDTO: u64 = 206;
+    const NR_RECVFROM: u64 = 207;
+    const NR_CLOSE: u64 = 57;
+    const AF_UNIX: u64 = 1;
+    const SOCK_STREAM: u64 = 1;
+
+    if akuma_exec::process::current_process_shared().is_some() {
+        console::print("[Test] unix_abstract_connect_accept_roundtrip SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6111;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    // `sockaddr_un` for the abstract name "\0akuma-boot-test": addrlen counts
+    // the leading NUL and there is NO terminator, which is the whole reason the
+    // decoder keys off addrlen rather than strlen.
+    const NAME: &[u8] = b"akuma-boot-test";
+    let mut addr = [0u8; 110];
+    addr[0..2].copy_from_slice(&1u16.to_ne_bytes()); // AF_UNIX
+    addr[3..3 + NAME.len()].copy_from_slice(NAME);   // addr[2] stays 0 = abstract
+    let addrlen = (3 + NAME.len()) as u64;
+    let addr_ptr = addr.as_ptr() as u64;
+
+    let srv = crate::syscall::handle_syscall(NR_SOCKET, &[AF_UNIX, SOCK_STREAM, 0, 0, 0, 0]);
+    let bind_ret = crate::syscall::handle_syscall(NR_BIND, &[srv, addr_ptr, addrlen, 0, 0, 0]);
+    let listen_ret = crate::syscall::handle_syscall(NR_LISTEN, &[srv, 4, 0, 0, 0, 0]);
+
+    let cli = crate::syscall::handle_syscall(NR_SOCKET, &[AF_UNIX, SOCK_STREAM, 0, 0, 0, 0]);
+    let connect_ret = crate::syscall::handle_syscall(NR_CONNECT, &[cli, addr_ptr, addrlen, 0, 0, 0]);
+    // Non-blocking accept is guaranteed to succeed: `connect` queued the
+    // connection synchronously before returning, so the backlog is already
+    // non-empty. (That property is itself the reason a client may write before
+    // the server accepts.)
+    let acc = crate::syscall::handle_syscall(NR_ACCEPT, &[srv, 0, 0, 0, 0, 0]);
+
+    // client -> server
+    let out = *b"ping";
+    let sent = crate::syscall::handle_syscall(NR_SENDTO, &[cli, out.as_ptr() as u64, 4, 0, 0, 0]);
+    let mut inbuf = [0u8; 8];
+    let got = crate::syscall::handle_syscall(NR_RECVFROM, &[acc, inbuf.as_mut_ptr() as u64, 8, 0, 0, 0]);
+    let fwd_ok = sent == 4 && got == 4 && &inbuf[..4] == b"ping";
+
+    // server -> client
+    let back = *b"pong";
+    let sent2 = crate::syscall::handle_syscall(NR_SENDTO, &[acc, back.as_ptr() as u64, 4, 0, 0, 0]);
+    let mut inbuf2 = [0u8; 8];
+    let got2 = crate::syscall::handle_syscall(NR_RECVFROM, &[cli, inbuf2.as_mut_ptr() as u64, 8, 0, 0, 0]);
+    let rev_ok = sent2 == 4 && got2 == 4 && &inbuf2[..4] == b"pong";
+
+    for fd in [acc, cli, srv] {
+        if (fd as i64) >= 0 {
+            let _ = crate::syscall::handle_syscall(NR_CLOSE, &[fd, 0, 0, 0, 0, 0]);
+        }
+    }
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if bind_ret == 0 && listen_ret == 0 && connect_ret == 0 && (acc as i64) >= 0 && fwd_ok && rev_ok {
+        console::print("[Test] unix_abstract_connect_accept_roundtrip PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] unix_abstract_connect_accept_roundtrip FAILED: bind={} listen={} connect={} accept={} fwd={} rev={}\n",
+            bind_ret as i64, listen_ret as i64, connect_ret as i64, acc as i64, fwd_ok, rev_ok);
+    }
+}
+
+/// `connect` to a name nobody bound must be **ECONNREFUSED**, promptly.
+///
+/// This is the stale-socket case every daemon restart runs through, and the
+/// failure mode that matters is not the wrong errno — it is a *hang*. A client
+/// that blocks forever on a dead service looks identical to a network outage.
+fn test_unix_connect_refused_when_unbound() {
+    use akuma_exec::process::{register_process, register_thread_pid, unregister_process, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+    const NR_SOCKET: u64 = 198;
+    const NR_CONNECT: u64 = 203;
+    const NR_CLOSE: u64 = 57;
+    const ECONNREFUSED: i64 = -111;
+
+    if akuma_exec::process::current_process_shared().is_some() {
+        console::print("[Test] unix_connect_refused_when_unbound SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6112;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    const NAME: &[u8] = b"akuma-nobody-here";
+    let mut addr = [0u8; 110];
+    addr[0..2].copy_from_slice(&1u16.to_ne_bytes());
+    addr[3..3 + NAME.len()].copy_from_slice(NAME);
+    let cli = crate::syscall::handle_syscall(NR_SOCKET, &[1, 1, 0, 0, 0, 0]);
+    let ret = crate::syscall::handle_syscall(
+        NR_CONNECT,
+        &[cli, addr.as_ptr() as u64, (3 + NAME.len()) as u64, 0, 0, 0],
+    );
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[cli, 0, 0, 0, 0, 0]);
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if ret as i64 == ECONNREFUSED {
+        console::print("[Test] unix_connect_refused_when_unbound PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] unix_connect_refused_when_unbound FAILED: ret={} want={}\n",
+            ret as i64, ECONNREFUSED);
+    }
+}
+
+/// A `SOCK_SEQPACKET` socketpair must preserve message boundaries end to end.
+///
+/// **This is the regression test for a silent data corruption.** Two 10-byte
+/// sends followed by one 20-byte read returned 20 before the table existed — two
+/// messages merged into one, with a plausible byte count and no error anywhere.
+/// The framing decision itself is host-tested; this asserts the *kernel* path
+/// really consults it, through `sendto`/`recvfrom` on real fds.
+fn test_unix_seqpacket_preserves_boundaries() {
+    use akuma_exec::process::{register_process, register_thread_pid, unregister_process, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+    const NR_SOCKETPAIR: u64 = 199;
+    const NR_SENDTO: u64 = 206;
+    const NR_RECVFROM: u64 = 207;
+    const NR_CLOSE: u64 = 57;
+    const SOCK_SEQPACKET: u64 = 5;
+
+    if akuma_exec::process::current_process_shared().is_some() {
+        console::print("[Test] unix_seqpacket_preserves_boundaries SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6113;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    let mut sv = [0i32; 2];
+    let sp = crate::syscall::handle_syscall(
+        NR_SOCKETPAIR,
+        &[1, SOCK_SEQPACKET, 0, sv.as_mut_ptr() as u64, 0, 0],
+    );
+    let (a, b) = (sv[0] as u64, sv[1] as u64);
+
+    let m1 = *b"0123456789";
+    let m2 = *b"abcdefghij";
+    let s1 = crate::syscall::handle_syscall(NR_SENDTO, &[a, m1.as_ptr() as u64, 10, 0, 0, 0]);
+    let s2 = crate::syscall::handle_syscall(NR_SENDTO, &[a, m2.as_ptr() as u64, 10, 0, 0, 0]);
+
+    // One 20-byte read must return the FIRST message only.
+    let mut buf = [0u8; 32];
+    let r1 = crate::syscall::handle_syscall(NR_RECVFROM, &[b, buf.as_mut_ptr() as u64, 20, 0, 0, 0]);
+    let first_ok = r1 == 10 && &buf[..10] == b"0123456789";
+    // And the second read must return the second message, intact.
+    let mut buf2 = [0u8; 32];
+    let r2 = crate::syscall::handle_syscall(NR_RECVFROM, &[b, buf2.as_mut_ptr() as u64, 20, 0, 0, 0]);
+    let second_ok = r2 == 10 && &buf2[..10] == b"abcdefghij";
+
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[a, 0, 0, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[b, 0, 0, 0, 0, 0]);
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if sp == 0 && s1 == 10 && s2 == 10 && first_ok && second_ok {
+        console::print("[Test] unix_seqpacket_preserves_boundaries PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] unix_seqpacket_preserves_boundaries FAILED: pair={} s1={} s2={} r1={} r2={}\n",
+            sp as i64, s1 as i64, s2 as i64, r1 as i64, r2 as i64);
+    }
+}
+
+/// `sendmsg` must send **every** iovec, and `recvmsg` must fill every iovec.
+///
+/// The smoltcp arm of `sys_sendmsg` used `iovs[0]` only and returned its length,
+/// so a caller passing a header + payload pair lost the payload and got a short
+/// count it had no reason to distrust — while the rump-only arm of the same
+/// syscall coalesced correctly. Nothing in a kernel log shows this.
+fn test_unix_sendmsg_all_iovecs() {
+    use akuma_exec::process::{register_process, register_thread_pid, unregister_process, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+    const NR_SOCKETPAIR: u64 = 199;
+    const NR_SENDMSG: u64 = 211;
+    const NR_RECVMSG: u64 = 212;
+    const NR_CLOSE: u64 = 57;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct MsgHdr {
+        msg_name: u64, msg_namelen: u32, _pad1: u32,
+        msg_iov: u64, msg_iovlen: u32, _pad2: u32,
+        msg_control: u64, msg_controllen: u64, msg_flags: i32,
+    }
+    #[repr(C)]
+    struct IoVec { iov_base: u64, iov_len: u64 }
+
+    if akuma_exec::process::current_process_shared().is_some() {
+        console::print("[Test] unix_sendmsg_all_iovecs SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6114;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    let mut sv = [0i32; 2];
+    let _ = crate::syscall::handle_syscall(NR_SOCKETPAIR, &[1, 1, 0, sv.as_mut_ptr() as u64, 0, 0]);
+    let (a, b) = (sv[0] as u64, sv[1] as u64);
+
+    // Three iovecs: "HDR" + "payload" + "!". Anything that sends only the first
+    // returns 3 instead of 11.
+    let p0 = *b"HDR";
+    let p1 = *b"payload";
+    let p2 = *b"!";
+    let iovs = [
+        IoVec { iov_base: p0.as_ptr() as u64, iov_len: 3 },
+        IoVec { iov_base: p1.as_ptr() as u64, iov_len: 7 },
+        IoVec { iov_base: p2.as_ptr() as u64, iov_len: 1 },
+    ];
+    let msg = MsgHdr { msg_iov: iovs.as_ptr() as u64, msg_iovlen: 3, ..MsgHdr::default() };
+    let sent = crate::syscall::handle_syscall(NR_SENDMSG, &[a, &raw const msg as u64, 0, 0, 0, 0]);
+
+    // Read it back split across two iovecs, which is the mirror bug: recvmsg
+    // filled iov[0] and left iov[1] untouched.
+    let mut r0 = [0u8; 3];
+    let mut r1 = [0u8; 8];
+    let riovs = [
+        IoVec { iov_base: r0.as_mut_ptr() as u64, iov_len: 3 },
+        IoVec { iov_base: r1.as_mut_ptr() as u64, iov_len: 8 },
+    ];
+    let rmsg = MsgHdr { msg_iov: riovs.as_ptr() as u64, msg_iovlen: 2, ..MsgHdr::default() };
+    let got = crate::syscall::handle_syscall(NR_RECVMSG, &[b, &raw const rmsg as u64, 0, 0, 0, 0]);
+    let scattered_ok = got == 11 && &r0[..] == b"HDR" && &r1[..8] == b"payload!";
+
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[a, 0, 0, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[b, 0, 0, 0, 0, 0]);
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if sent == 11 && scattered_ok {
+        console::print("[Test] unix_sendmsg_all_iovecs PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] unix_sendmsg_all_iovecs FAILED: sent={} (want 11) got={} (want 11)\n",
+            sent as i64, got as i64);
+    }
+}
+
+/// `getsockopt(SO_TYPE)` must report the socket's real type.
+///
+/// It answered a hardcoded `1` (`SOCK_STREAM`) for every non-AF_INET fd, so a
+/// `SOCK_SEQPACKET` socket misreported itself — and a client that picks its
+/// framing off the answer then reads the stream wrong.
+fn test_unix_so_type_reports_real_type() {
+    use akuma_exec::process::{register_process, register_thread_pid, unregister_process, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+    const NR_SOCKETPAIR: u64 = 199;
+    const NR_GETSOCKOPT: u64 = 209;
+    const NR_CLOSE: u64 = 57;
+    const SOL_SOCKET: u64 = 1;
+    const SO_TYPE: u64 = 3;
+
+    if akuma_exec::process::current_process_shared().is_some() {
+        console::print("[Test] unix_so_type_reports_real_type SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6115;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    let mut sv = [0i32; 2];
+    let _ = crate::syscall::handle_syscall(NR_SOCKETPAIR, &[1, 5, 0, sv.as_mut_ptr() as u64, 0, 0]);
+    let mut val: i32 = -1;
+    let mut vlen: u32 = 4;
+    let ret = crate::syscall::handle_syscall(
+        NR_GETSOCKOPT,
+        &[sv[0] as u64, SOL_SOCKET, SO_TYPE,
+          &raw mut val as u64, &raw mut vlen as u64, 0],
+    );
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[sv[0] as u64, 0, 0, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[sv[1] as u64, 0, 0, 0, 0, 0]);
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if ret == 0 && val == 5 {
+        console::print("[Test] unix_so_type_reports_real_type PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] unix_so_type_reports_real_type FAILED: ret={} type={} want 5\n",
+            ret as i64, val);
+    }
+}
+
+/// The AF_UNIX table must return to its baseline after every fd is closed.
+///
+/// The leak classes in this design — a name left behind by a closed listener, a
+/// server endpoint queued but never accepted, a channel outliving its pipe — are
+/// all *accumulating* and all invisible from userspace. They show up only as a
+/// drift in these counts, which is why the table exposes them at all. Run over
+/// several rounds so a per-round leak of one is unmistakable.
+fn test_unix_table_returns_to_baseline() {
+    use akuma_exec::process::{register_process, register_thread_pid, unregister_process, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+    const NR_SOCKET: u64 = 198;
+    const NR_BIND: u64 = 200;
+    const NR_LISTEN: u64 = 201;
+    const NR_ACCEPT: u64 = 202;
+    const NR_CONNECT: u64 = 203;
+    const NR_CLOSE: u64 = 57;
+
+    if akuma_exec::process::current_process_shared().is_some() {
+        console::print("[Test] unix_table_returns_to_baseline SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6116;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    let (base_socks, base_names) = crate::syscall::unixsock::table_stats();
+
+    const NAME: &[u8] = b"akuma-leak-probe";
+    let mut addr = [0u8; 110];
+    addr[0..2].copy_from_slice(&1u16.to_ne_bytes());
+    addr[3..3 + NAME.len()].copy_from_slice(NAME);
+    let addr_ptr = addr.as_ptr() as u64;
+    let addrlen = (3 + NAME.len()) as u64;
+
+    let mut ok = true;
+    for round in 0..4u32 {
+        let srv = crate::syscall::handle_syscall(NR_SOCKET, &[1, 1, 0, 0, 0, 0]);
+        let _ = crate::syscall::handle_syscall(NR_BIND, &[srv, addr_ptr, addrlen, 0, 0, 0]);
+        let _ = crate::syscall::handle_syscall(NR_LISTEN, &[srv, 4, 0, 0, 0, 0]);
+        let cli = crate::syscall::handle_syscall(NR_SOCKET, &[1, 1, 0, 0, 0, 0]);
+        let _ = crate::syscall::handle_syscall(NR_CONNECT, &[cli, addr_ptr, addrlen, 0, 0, 0]);
+        let acc = crate::syscall::handle_syscall(NR_ACCEPT, &[srv, 0, 0, 0, 0, 0]);
+        for fd in [acc, cli, srv] {
+            if (fd as i64) >= 0 {
+                let _ = crate::syscall::handle_syscall(NR_CLOSE, &[fd, 0, 0, 0, 0, 0]);
+            }
+        }
+        // A name that outlives its listener makes every later bind EADDRINUSE,
+        // which for a real daemon means it can never restart. Assert per round
+        // rather than only at the end, so the round it first leaks is named.
+        let (socks, names) = crate::syscall::unixsock::table_stats();
+        if socks != base_socks || names != base_names {
+            crate::safe_print!(160,
+                "[Test] unix_table_returns_to_baseline FAILED at round {}: socks {}->{} names {}->{}\n",
+                round, base_socks, socks, base_names, names);
+            ok = false;
+            break;
+        }
+    }
+
+    // The unaccepted-connection case: close the listener with a connection still
+    // queued. That queued server endpoint is referenced only by the listener's
+    // backlog, so closing the listener must reclaim it too.
+    let srv = crate::syscall::handle_syscall(NR_SOCKET, &[1, 1, 0, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_BIND, &[srv, addr_ptr, addrlen, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_LISTEN, &[srv, 4, 0, 0, 0, 0]);
+    let cli = crate::syscall::handle_syscall(NR_SOCKET, &[1, 1, 0, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_CONNECT, &[cli, addr_ptr, addrlen, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[srv, 0, 0, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[cli, 0, 0, 0, 0, 0]);
+    let (socks, names) = crate::syscall::unixsock::table_stats();
+    let orphan_ok = socks == base_socks && names == base_names;
+    if !orphan_ok {
+        crate::safe_print!(160,
+            "[Test] unix_table_returns_to_baseline FAILED (unaccepted): socks {}->{} names {}->{}\n",
+            base_socks, socks, base_names, names);
+    }
+
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if ok && orphan_ok {
+        console::print("[Test] unix_table_returns_to_baseline PASSED\n");
+    }
+}
+
+/// A listener with a queued connection must poll as `EPOLLIN`.
+///
+/// This is the one genuinely new readiness predicate AF_UNIX adds, and getting
+/// it wrong is a total hang rather than a slowdown: a listening socket has no
+/// pipes, so falling through to the pipe arms asks `pipe_can_read(0)` — false
+/// for a pipe that does not exist — and an accept-ready listener polls as
+/// "nothing" forever. Every event-loop server would hang at startup.
+fn test_unix_listener_polls_readable() {
+    use akuma_exec::process::{register_process, register_thread_pid, unregister_process, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+    const NR_SOCKET: u64 = 198;
+    const NR_BIND: u64 = 200;
+    const NR_LISTEN: u64 = 201;
+    const NR_CONNECT: u64 = 203;
+    const NR_CLOSE: u64 = 57;
+    const EPOLLIN: u32 = 0x1;
+
+    if akuma_exec::process::current_process_shared().is_some() {
+        console::print("[Test] unix_listener_polls_readable SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6117;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    const NAME: &[u8] = b"akuma-poll-probe";
+    let mut addr = [0u8; 110];
+    addr[0..2].copy_from_slice(&1u16.to_ne_bytes());
+    addr[3..3 + NAME.len()].copy_from_slice(NAME);
+    let addr_ptr = addr.as_ptr() as u64;
+    let addrlen = (3 + NAME.len()) as u64;
+
+    let srv = crate::syscall::handle_syscall(NR_SOCKET, &[1, 1, 0, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_BIND, &[srv, addr_ptr, addrlen, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_LISTEN, &[srv, 4, 0, 0, 0, 0]);
+
+    // Empty backlog: must NOT be readable. A listener that always reports
+    // readable spins an event loop at 100% CPU on a failing accept.
+    let idle = crate::syscall::poll::epoll_check_fd_readiness(srv as u32, EPOLLIN, None);
+
+    let cli = crate::syscall::handle_syscall(NR_SOCKET, &[1, 1, 0, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_CONNECT, &[cli, addr_ptr, addrlen, 0, 0, 0]);
+    let ready = crate::syscall::poll::epoll_check_fd_readiness(srv as u32, EPOLLIN, None);
+
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[cli, 0, 0, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[srv, 0, 0, 0, 0, 0]);
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if idle & EPOLLIN == 0 && ready & EPOLLIN != 0 {
+        console::print("[Test] unix_listener_polls_readable PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] unix_listener_polls_readable FAILED: idle=0x{:x} ready=0x{:x}\n",
+            idle, ready);
+    }
+}
+
+/// `shutdown(SHUT_WR)` must make the peer see EOF.
+///
+/// `sys_shutdown` returned a bare 0 for every non-AF_INET fd, so `SHUT_WR` was a
+/// lie: no EOF ever reached the peer. A protocol that ends a request by
+/// half-closing then hangs until something else times it out — that exact stub
+/// cost 5 s per nginx request on the AF_INET side before it was fixed there.
+fn test_unix_shutdown_wr_delivers_eof() {
+    use akuma_exec::process::{register_process, register_thread_pid, unregister_process, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+    const NR_SOCKETPAIR: u64 = 199;
+    const NR_SHUTDOWN: u64 = 210;
+    const NR_RECVFROM: u64 = 207;
+    const NR_CLOSE: u64 = 57;
+    const SHUT_WR: u64 = 1;
+
+    if akuma_exec::process::current_process_shared().is_some() {
+        console::print("[Test] unix_shutdown_wr_delivers_eof SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6118;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    let mut sv = [0i32; 2];
+    let _ = crate::syscall::handle_syscall(NR_SOCKETPAIR, &[1, 1, 0, sv.as_mut_ptr() as u64, 0, 0]);
+    let (a, b) = (sv[0] as u64, sv[1] as u64);
+
+    let sd = crate::syscall::handle_syscall(NR_SHUTDOWN, &[a, SHUT_WR, 0, 0, 0, 0]);
+    // The peer's read must now return 0 (EOF), not block. Blocking here would
+    // hang the boot suite, which is exactly the userspace symptom.
+    let mut buf = [0u8; 8];
+    let r = crate::syscall::handle_syscall(NR_RECVFROM, &[b, buf.as_mut_ptr() as u64, 8, 0, 0, 0]);
+
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[a, 0, 0, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[b, 0, 0, 0, 0, 0]);
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if sd == 0 && r == 0 {
+        console::print("[Test] unix_shutdown_wr_delivers_eof PASSED\n");
+    } else {
+        crate::safe_print!(128,
+            "[Test] unix_shutdown_wr_delivers_eof FAILED: shutdown={} read={} (want 0/0)\n",
+            sd as i64, r as i64);
     }
 }
 

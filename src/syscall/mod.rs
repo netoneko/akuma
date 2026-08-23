@@ -54,6 +54,10 @@ pub use fs::run_writev_short_write_tests;
 pub mod pipe;
 pub mod poll;
 pub mod proc;
+/// AF_UNIX sockets. The decisions live in `akuma_net::unix` (host-tested); this
+/// module is the kernel half — the one table, the user-pointer copies, and the
+/// pipes that carry the bytes. See docs/archive/UNIX_SOCKET_IMPROVEMENTS.md.
+pub mod unixsock;
 pub mod signal;
 mod sync;
 mod term;
@@ -689,45 +693,31 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         // have no implementation, so a stray box-0 call gets a clean ENETDOWN
         // instead of a link error. SOCKETPAIR (pipe-backed) and SHUTDOWN (no-op)
         // stay available on both builds.
-        #[cfg(feature = "smoltcp")]
-        nr::SOCKET => net::sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
-        #[cfg(not(feature = "smoltcp"))]
-        nr::SOCKET => net_enetdown(),
+        // Every socket-family syscall is dispatched UNCONDITIONALLY through a
+        // `net::dispatch_*` wrapper that tries AF_UNIX first and only then the
+        // native stack (or `ENETDOWN` when smoltcp is compiled out). Gating
+        // these on `smoltcp` — as they were before AF_UNIX had a socket object
+        // — gives the rump-only devbox, which is the DEFAULT devbox, a family
+        // that can create sockets and then refuse to bind them. AF_UNIX is
+        // smoltcp-free by construction and is the family box 0's rump sysproxy
+        // channel already uses. See `net::dispatch_socket` and
+        // docs/archive/UNIX_SOCKET_IMPROVEMENTS.md.
+        nr::SOCKET => net::dispatch_socket(args[0] as i32, args[1] as i32, args[2] as i32),
         nr::SOCKETPAIR => net::sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
-        #[cfg(feature = "smoltcp")]
-        nr::BIND => net::sys_bind(args[0] as u32, args[1], args[2] as usize),
-        #[cfg(not(feature = "smoltcp"))]
-        nr::BIND => net_enetdown(),
-        #[cfg(feature = "smoltcp")]
-        nr::LISTEN => net::sys_listen(args[0] as u32, args[1] as i32),
-        #[cfg(not(feature = "smoltcp"))]
-        nr::LISTEN => net_enetdown(),
-        #[cfg(feature = "smoltcp")]
-        nr::ACCEPT => net::sys_accept(args[0] as u32, args[1], args[2]),
-        #[cfg(not(feature = "smoltcp"))]
-        nr::ACCEPT => net_enetdown(),
-        #[cfg(feature = "smoltcp")]
-        nr::ACCEPT4 => net::sys_accept4(args[0] as u32, args[1], args[2], args[3] as u32),
-        #[cfg(not(feature = "smoltcp"))]
-        nr::ACCEPT4 => net_enetdown(),
-        #[cfg(feature = "smoltcp")]
-        nr::CONNECT => net::sys_connect(args[0] as u32, args[1], args[2] as usize),
-        #[cfg(not(feature = "smoltcp"))]
-        nr::CONNECT => net_enetdown(),
+        nr::BIND => net::dispatch_bind(args[0] as u32, args[1], args[2] as usize),
+        nr::LISTEN => net::dispatch_listen(args[0] as u32, args[1] as i32),
+        // `accept` is `accept4` with flags == 0; one path serves both.
+        nr::ACCEPT => net::dispatch_accept(args[0] as u32, args[1], args[2], 0),
+        nr::ACCEPT4 => net::dispatch_accept(args[0] as u32, args[1], args[2], args[3] as u32),
+        nr::CONNECT => net::dispatch_connect(args[0] as u32, args[1], args[2] as usize),
         // Always dispatched (both smoltcp and rump-only builds define these): the
         // rump-only variants handle a UnixSocket (pipe-backed) fd — the box-0
         // rump_server's fd-3 sysproxy channel uses send()/recv() on it — and EBADF
         // anything else. Gating these to net_enetdown() breaks the rump handshake.
         nr::SENDTO => net::sys_sendto(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5] as usize),
         nr::RECVFROM => net::sys_recvfrom(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5]),
-        #[cfg(feature = "smoltcp")]
-        nr::GETSOCKNAME => net::sys_getsockname(args[0] as u32, args[1], args[2]),
-        #[cfg(not(feature = "smoltcp"))]
-        nr::GETSOCKNAME => net_enetdown(),
-        #[cfg(feature = "smoltcp")]
-        nr::GETPEERNAME => net::sys_getpeername(args[0] as u32, args[1], args[2]),
-        #[cfg(not(feature = "smoltcp"))]
-        nr::GETPEERNAME => net_enetdown(),
+        nr::GETSOCKNAME => net::dispatch_getsockname(args[0] as u32, args[1], args[2]),
+        nr::GETPEERNAME => net::dispatch_getpeername(args[0] as u32, args[1], args[2]),
         #[cfg(feature = "smoltcp")]
         nr::SETSOCKOPT => net::sys_setsockopt(args[0] as u32, args[1] as i32, args[2] as i32, args[3], args[4] as u32),
         #[cfg(not(feature = "smoltcp"))]
@@ -736,7 +726,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETSOCKOPT => net::sys_getsockopt(args[0] as u32, args[1] as i32, args[2] as i32, args[3], args[4]),
         #[cfg(not(feature = "smoltcp"))]
         nr::GETSOCKOPT => net_enetdown(),
-        nr::SHUTDOWN => net::sys_shutdown(args[0] as u32, args[1] as i32),
+        nr::SHUTDOWN => net::dispatch_shutdown(args[0] as u32, args[1] as i32),
         // Always dispatched: the rump-only variant handles the box-0 rump_server's
         // fd-3 UnixSocket channel (dosend → sendmsg for the handshake RESP + all
         // proxied-syscall replies). Gating it to net_enetdown() breaks rump entirely.

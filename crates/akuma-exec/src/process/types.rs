@@ -155,10 +155,26 @@ pub enum FileDescriptor {
     ChildStdout(Pid),
     PipeRead(u32),
     PipeWrite(u32),
-    /// AF_UNIX socketpair endpoint, backed by two unidirectional kernel pipes.
+    /// AF_UNIX socket endpoint, backed by two unidirectional kernel pipes.
     /// `rx` is the pipe this endpoint reads from; `tx` is the pipe it writes to.
     /// The peer endpoint has rx/tx swapped.
-    UnixSocket { rx: u32, tx: u32 },
+    ///
+    /// `sock` indexes the entry in `akuma_net::unix::UnixTable` carrying
+    /// everything a pipe pair cannot express: the bound name, the socket type,
+    /// the peer's identity and credentials, shutdown state, a listener's
+    /// backlog, and the record boundaries that make `SOCK_SEQPACKET` and
+    /// `SOCK_DGRAM` preserve messages.
+    ///
+    /// **`sock == 0` means "no table entry"**, and every table operation
+    /// no-ops for it. That is not a placeholder to be cleaned up later — it is
+    /// what keeps two callers working unchanged: `src/rump_proxy.rs` installs a
+    /// kernel-internal pipe pair at box 0's fd 3 for the sysproxy channel, and
+    /// it must stay byte-for-byte identical (a regression there stops the rump
+    /// stack from coming up, several layers away from any socket code). A
+    /// descriptor with `sock == 0` behaves exactly as the pre-table
+    /// implementation did: `read`/`write`/`send`/`recv` on the raw pipes, no
+    /// framing, no name.
+    UnixSocket { rx: u32, tx: u32, sock: u32 },
     EventFd(u32),
     DevNull,
     DevUrandom,

@@ -546,6 +546,12 @@ pub(crate) fn build_exec_runtime(
         eventfd_clone_ref: crate::syscall::eventfd::eventfd_clone_ref,
         #[cfg(not(feature = "sc-eventfd"))]
         eventfd_clone_ref: noop_u32,
+        // AF_UNIX table refcounting. Not behind an `sc-*` gate: `socketpair`
+        // is unconditional (rustc's linker spawn and box 0's rump sysproxy both
+        // need it), so the descriptor variant is always constructible and these
+        // must always be real.
+        unix_sock_close: crate::syscall::unixsock::unix_sock_close,
+        unix_sock_clone_ref: crate::syscall::unixsock::unix_sock_clone_ref,
         #[cfg(feature = "sc-epoll")]
         epoll_destroy: crate::syscall::poll::epoll_destroy,
         #[cfg(not(feature = "sc-epoll"))]

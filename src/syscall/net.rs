@@ -169,8 +169,22 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
     let px = super::pipe::pipe_create();
     let py = super::pipe::pipe_create();
 
-    let fd0 = proc.alloc_fd(akuma_exec::process::FileDescriptor::UnixSocket { rx: px, tx: py });
-    let fd1 = proc.alloc_fd(akuma_exec::process::FileDescriptor::UnixSocket { rx: py, tx: px });
+    // Table entries, so the pair carries its socket TYPE and — for
+    // SOCK_SEQPACKET — real record boundaries. Without them this syscall's own
+    // doc comment was accurate: the pair approximated SEQPACKET with a byte
+    // stream and silently merged messages. `None` cannot happen (the type was
+    // validated above) but is handled rather than unwrapped, because a panic
+    // here would be a kernel abort on a syscall userspace controls.
+    let Some((sock0, sock1)) = super::unixsock::socketpair_alloc(sock_type, px, py) else {
+        super::pipe::pipe_close_read(px);
+        super::pipe::pipe_close_write(px);
+        super::pipe::pipe_close_read(py);
+        super::pipe::pipe_close_write(py);
+        return EAFNOSUPPORT;
+    };
+
+    let fd0 = proc.alloc_fd(akuma_exec::process::FileDescriptor::UnixSocket { rx: px, tx: py, sock: sock0 });
+    let fd1 = proc.alloc_fd(akuma_exec::process::FileDescriptor::UnixSocket { rx: py, tx: px, sock: sock1 });
 
     if cloexec {
         proc.set_cloexec(fd0);
@@ -195,6 +209,7 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
         super::pipe::pipe_close_write(px);
         super::pipe::pipe_close_read(py);
         super::pipe::pipe_close_write(py);
+        super::unixsock::socketpair_rollback(sock0, sock1);
         return EFAULT;
     }
     crate::safe_print!(96, "[syscall] socketpair(AF_UNIX) = ({}, {})\n", fd0, fd1);
@@ -421,6 +436,69 @@ pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     }
 }
 
+/// `MSG_DONTWAIT` — a per-call non-blocking request, independent of the fd's
+/// `O_NONBLOCK`.
+///
+/// Every AF_UNIX path took its `flags` as `_flags` before this, so a caller that
+/// used `MSG_DONTWAIT` instead of setting `O_NONBLOCK` got a **blocking** call.
+/// That is the one ignored flag whose failure mode is a hang rather than a wrong
+/// answer, which is why it is honoured first.
+pub(super) const MSG_DONTWAIT: i32 = 0x40;
+/// `MSG_PEEK` — read without consuming.
+pub(super) const MSG_PEEK: i32 = 0x02;
+/// `MSG_TRUNC` — set in `recvmsg`'s reply when a record was truncated.
+pub(super) const MSG_TRUNC: i32 = 0x20;
+
+/// Copy `len` bytes in from userspace and send them on a unix socket.
+///
+/// Shared by `sendto` and `sendmsg` so the framing decision happens in exactly
+/// one place. The bounce is fallible ([`alloc_net_bounce`]) for the same reason
+/// every other net path's is: an infallible `vec![0; N]` on a fragmented heap is
+/// a whole-kernel abort, not an error return.
+fn unix_send_user(fd: u32, buf_ptr: u64, len: usize, flags: i32) -> u64 {
+    if len == 0 {
+        return super::unixsock::unix_send(fd, &[], flags & MSG_DONTWAIT != 0);
+    }
+    if !validate_user_ptr(buf_ptr, len) {
+        return EFAULT;
+    }
+    let mut kbuf = match alloc_net_bounce(len) {
+        Some(b) => b,
+        None => return ENOMEM,
+    };
+    if copy_from_user(&mut kbuf, buf_ptr).is_err() {
+        return EFAULT;
+    }
+    super::unixsock::unix_send(fd, &kbuf, flags & MSG_DONTWAIT != 0)
+}
+
+/// Receive from a unix socket into a user buffer. Returns `(ret, truncated)`.
+fn unix_recv_user(fd: u32, buf_ptr: u64, len: usize, flags: i32) -> (u64, bool) {
+    if len == 0 {
+        return (0, false);
+    }
+    if !validate_user_ptr(buf_ptr, len) {
+        return (EFAULT, false);
+    }
+    let mut kbuf = match alloc_net_bounce(len) {
+        Some(b) => b,
+        None => return (ENOMEM, false),
+    };
+    let (ret, truncated) = super::unixsock::unix_recv(
+        fd,
+        &mut kbuf,
+        flags & MSG_DONTWAIT != 0,
+        flags & MSG_PEEK != 0,
+    );
+    if (ret as i64) > 0 {
+        let n = ret as usize;
+        if copy_to_user(buf_ptr, &kbuf[..n.min(kbuf.len())]).is_err() {
+            return (EFAULT, false);
+        }
+    }
+    (ret, truncated)
+}
+
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
     // AF_UNIX socketpair endpoint: send == write to the tx pipe. Checked BEFORE
@@ -428,7 +506,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
     // also take, which must not happen in the BKL-free window (AB-BA with a
     // nested IRQ's enter_kernel — see NetBklGuard).
     if fd_is_unix_socket(fd) {
-        return super::fs::sys_write(u64::from(fd), buf_ptr, len);
+        return unix_send_user(fd, buf_ptr, len, _flags);
     }
     let _net_bkl = NetBklGuard::new();
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
@@ -514,7 +592,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
     // AF_UNIX socketpair endpoint: recv == read from the rx pipe. Checked BEFORE
     // dropping the BKL — see sys_sendto.
     if fd_is_unix_socket(fd) {
-        return super::fs::sys_read(u64::from(fd), buf_ptr, len);
+        return unix_recv_user(fd, buf_ptr, len, _flags).0;
     }
     let _net_bkl = NetBklGuard::new();
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
@@ -598,7 +676,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
 #[cfg(not(feature = "smoltcp"))]
 pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _dest_addr: u64, _addr_len: usize) -> u64 {
     if fd_is_unix_socket(fd) {
-        return super::fs::sys_write(u64::from(fd), buf_ptr, len);
+        return unix_send_user(fd, buf_ptr, len, _flags);
     }
     EBADF
 }
@@ -606,7 +684,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _dest_a
 #[cfg(not(feature = "smoltcp"))]
 pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _src_addr: u64, _addr_len_ptr: u64) -> u64 {
     if fd_is_unix_socket(fd) {
-        return super::fs::sys_read(u64::from(fd), buf_ptr, len);
+        return unix_recv_user(fd, buf_ptr, len, _flags).0;
     }
     EBADF
 }
@@ -772,11 +850,56 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
     const SO_TYPE: i32 = 3;
     const SO_RCVTIMEO: i32 = 20;
     const SO_SNDTIMEO: i32 = 21;
+    const SO_PEERCRED: i32 = 17;
 
     if optval == 0 || optlen == 0 { return 0; }
     let mut len: u32 = 0;
     if read_user_into(&mut len, optlen).is_err() {
         return EFAULT;
+    }
+
+    // `SO_PEERCRED` answers a 12-byte `struct ucred`, not the 4-byte int the
+    // common path below assumes, so it is handled first. AF_UNIX only — there
+    // is no peer credential on a TCP socket, and Linux reports ENOPROTOOPT for
+    // one; `EOPNOTSUPP` is the nearest name this errno table has.
+    if level == SOL_SOCKET && optname == SO_PEERCRED {
+        let Some(cred) = super::unixsock::peer_cred_of(fd) else {
+            return neg_errno(libc_errno::EOPNOTSUPP);
+        };
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Ucred { pid: u32, uid: u32, gid: u32 }
+        let out = Ucred { pid: cred.pid, uid: cred.uid, gid: cred.gid };
+        let sz = core::mem::size_of::<Ucred>();
+        if (len as usize) < sz || !validate_user_ptr(optval, sz) {
+            return EFAULT;
+        }
+        if write_user_val(optval, &out).is_err() {
+            return EFAULT;
+        }
+        if write_user_val(optlen, &(sz as u32)).is_err() {
+            return EFAULT;
+        }
+        return 0;
+    }
+
+    // `SO_TYPE` on a unix fd must come from the socket's recorded type. The
+    // common path below hardcoded `1` (SOCK_STREAM) for every non-AF_INET fd,
+    // so a SOCK_SEQPACKET or SOCK_DGRAM socket misreported itself — and a
+    // client that picks its framing off the answer then reads the stream wrong.
+    if level == SOL_SOCKET && optname == SO_TYPE {
+        if let Some(ty) = super::unixsock::sock_type_of(fd) {
+            if (len as usize) < 4 || !validate_user_ptr(optval, 4) {
+                return EFAULT;
+            }
+            if write_user_val(optval, &ty).is_err() {
+                return EFAULT;
+            }
+            if write_user_val(optlen, &4u32).is_err() {
+                return EFAULT;
+            }
+            return 0;
+        }
     }
 
     // These two answer with a 16-byte `struct timeval`, not the 4-byte int
@@ -883,6 +1006,129 @@ struct MsgHdr {
     msg_flags: i32,
 }
 
+/// Gather every iovec of a `msghdr` into one kernel buffer.
+///
+/// **This is the fix for a silent data loss.** The AF_UNIX arm of the smoltcp
+/// `sendmsg` used `iovs[0]` only and returned its length, so a caller passing a
+/// header+payload iovec pair lost the payload and got a short count it had no
+/// reason to distrust. The rump-only arm of the *same syscall* coalesced all
+/// iovecs correctly, so the two arms disagreed. Nothing in a kernel log shows
+/// this; the caller simply sends less than it asked to.
+///
+/// Coalescing into ONE buffer is also required, not merely tidy: for a framed
+/// socket the whole message must reach the pipe in a single write or the record
+/// boundary would land mid-message, and on the rump sysproxy channel one write
+/// is one wake with one complete frame (docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md
+/// §3q).
+///
+/// Returns `Err(errno)` on a bad pointer or an unsatisfiable allocation.
+fn gather_iovecs(iovs: &[super::fs::IoVec]) -> Result<alloc::vec::Vec<u8>, u64> {
+    let total: usize = iovs.iter().map(|v| v.iov_len).sum();
+    if total == 0 {
+        return Ok(alloc::vec::Vec::new());
+    }
+    let mut buf = match alloc_net_bounce(total) {
+        Some(b) => b,
+        None => return Err(ENOMEM),
+    };
+    // `alloc_net_bounce` may hand back a single page instead of the full size
+    // under memory pressure; copy only as much as it actually gave us and let
+    // the caller report the short count, exactly as write(2) permits.
+    let cap = buf.len();
+    let mut off = 0usize;
+    for iov in iovs {
+        if off >= cap {
+            break;
+        }
+        if iov.iov_len == 0 {
+            continue;
+        }
+        if !validate_user_ptr(iov.iov_base, iov.iov_len) {
+            return Err(EFAULT);
+        }
+        let n = iov.iov_len.min(cap - off);
+        if copy_from_user(&mut buf[off..off + n], iov.iov_base).is_err() {
+            return Err(EFAULT);
+        }
+        off += n;
+    }
+    buf.truncate(off);
+    Ok(buf)
+}
+
+/// Scatter a received buffer back across a `msghdr`'s iovecs.
+///
+/// The mirror of [`gather_iovecs`], and missing for the same reason: `recvmsg`
+/// filled `iovs[0]` only, so a caller that split a fixed header from a payload
+/// buffer — the normal way to read a framed protocol — got the header and
+/// nothing else.
+fn scatter_iovecs(iovs: &[super::fs::IoVec], data: &[u8]) -> Result<usize, u64> {
+    let mut off = 0usize;
+    for iov in iovs {
+        if off >= data.len() {
+            break;
+        }
+        if iov.iov_len == 0 {
+            continue;
+        }
+        if !validate_user_ptr(iov.iov_base, iov.iov_len) {
+            return Err(EFAULT);
+        }
+        let n = iov.iov_len.min(data.len() - off);
+        if copy_to_user(iov.iov_base, &data[off..off + n]).is_err() {
+            return Err(EFAULT);
+        }
+        off += n;
+    }
+    Ok(off)
+}
+
+/// `sendmsg` on an AF_UNIX fd: gather every iovec, then one framed send.
+fn unix_sendmsg(fd: u32, iovs: &[super::fs::IoVec], flags: i32) -> u64 {
+    let buf = match gather_iovecs(iovs) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    super::unixsock::unix_send(fd, &buf, flags & MSG_DONTWAIT != 0)
+}
+
+/// `recvmsg` on an AF_UNIX fd: one framed receive, then scatter across the
+/// iovecs. Writes `msg_flags`/`msg_controllen` back through `msg_ptr`.
+fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVec], flags: i32) -> u64 {
+    let capacity: usize = iovs.iter().map(|v| v.iov_len).sum();
+    let mut kbuf = if capacity == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        match alloc_net_bounce(capacity) {
+            Some(b) => b,
+            None => return ENOMEM,
+        }
+    };
+    let (ret, truncated) = super::unixsock::unix_recv(
+        fd,
+        &mut kbuf,
+        flags & MSG_DONTWAIT != 0,
+        flags & MSG_PEEK != 0,
+    );
+    if (ret as i64) < 0 {
+        return ret;
+    }
+    let n = (ret as usize).min(kbuf.len());
+    let written = match scatter_iovecs(iovs, &kbuf[..n]) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    // Ancillary data is not implemented (Phase 4), so report none rather than
+    // leaving the caller's `msg_controllen` untouched — a stale non-zero value
+    // would make it parse whatever was in its own buffer as a cmsg header.
+    msg.msg_controllen = 0;
+    msg.msg_flags = if truncated { MSG_TRUNC } else { 0 };
+    if write_user_val(msg_ptr, msg).is_err() {
+        return EFAULT;
+    }
+    written as u64
+}
+
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) { return EFAULT; }
@@ -891,25 +1137,27 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         return EFAULT;
     }
 
-    if msg.msg_iovlen == 0 { return 0; }
     let iov_size = msg.msg_iovlen as usize * core::mem::size_of::<super::fs::IoVec>();
-    if !validate_user_ptr(msg.msg_iov, iov_size) { return EFAULT; }
+    if msg.msg_iovlen != 0 && !validate_user_ptr(msg.msg_iov, iov_size) { return EFAULT; }
     let mut iovs = alloc::vec![super::fs::IoVec { iov_base: 0, iov_len: 0 }; msg.msg_iovlen as usize];
-    if copy_from_user(as_user_bytes_mut(&mut iovs), msg.msg_iov).is_err() {
+    if msg.msg_iovlen != 0 && copy_from_user(as_user_bytes_mut(&mut iovs), msg.msg_iov).is_err() {
         return EFAULT;
     }
 
+    // AF_UNIX: handled BEFORE dropping the BKL (the pipe paths must not run in
+    // the BKL-free window — see sys_sendto) and BEFORE the `iovs[0]`-only
+    // shortcut below, because that shortcut is what silently dropped every
+    // iovec past the first. Also before the `iov_len == 0` early return: a
+    // zero-length message on a framed socket is a real, deliverable datagram,
+    // and returning 0 without sending it makes the peer wait forever.
+    if fd_is_unix_socket(fd) {
+        return unix_sendmsg(fd, &iovs, _flags);
+    }
+
+    if msg.msg_iovlen == 0 { return 0; }
     let iov = &iovs[0];
     if iov.iov_len == 0 { return 0; }
     if !validate_user_ptr(iov.iov_base, iov.iov_len as usize) { return EFAULT; }
-
-    // AF_UNIX socketpair endpoint: sendmsg == write the first iovec to the tx
-    // pipe. (libstd's handshake uses a single small message.) Handled BEFORE
-    // dropping the BKL — the pipe paths must not run in the BKL-free window
-    // (see sys_sendto).
-    if fd_is_unix_socket(fd) {
-        return super::fs::sys_write(u64::from(fd), iov.iov_base, iov.iov_len as usize);
-    }
 
     let _net_bkl = NetBklGuard::new();
 
@@ -1043,30 +1291,25 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         return EFAULT;
     }
 
-    if msg.msg_iovlen == 0 { return 0; }
     let iov_size = msg.msg_iovlen as usize * core::mem::size_of::<super::fs::IoVec>();
-    if !validate_user_ptr(msg.msg_iov, iov_size) { return EFAULT; }
+    if msg.msg_iovlen != 0 && !validate_user_ptr(msg.msg_iov, iov_size) { return EFAULT; }
     let mut iovs = alloc::vec![super::fs::IoVec { iov_base: 0, iov_len: 0 }; msg.msg_iovlen as usize];
-    if copy_from_user(as_user_bytes_mut(&mut iovs), msg.msg_iov).is_err() {
+    if msg.msg_iovlen != 0 && copy_from_user(as_user_bytes_mut(&mut iovs), msg.msg_iov).is_err() {
         return EFAULT;
     }
 
+    // AF_UNIX: handled before the BKL drop (see sys_sendto) and before the
+    // `iovs[0]`-only shortcut, which filled the first iovec and left every
+    // other one untouched — so a caller reading a fixed header into iov[0] and
+    // a payload into iov[1] got the header and silently nothing else.
+    if fd_is_unix_socket(fd) {
+        return unix_recvmsg(fd, msg_ptr, &mut msg, &iovs, _flags);
+    }
+
+    if msg.msg_iovlen == 0 { return 0; }
     let iov = &mut iovs[0];
     if iov.iov_len == 0 { return 0; }
     if !validate_user_ptr(iov.iov_base, iov.iov_len as usize) { return EFAULT; }
-
-    // AF_UNIX socketpair endpoint: recvmsg == read into the first iovec from the
-    // rx pipe. (libstd's handshake uses a single small message.) On success,
-    // clear the ancillary/flags fields and write the header back.
-    if fd_is_unix_socket(fd) {
-        let n = super::fs::sys_read(u64::from(fd), iov.iov_base, iov.iov_len as usize);
-        if (n as i64) >= 0 {
-            msg.msg_controllen = 0;
-            msg.msg_flags = 0;
-            let _ = write_user_val(msg_ptr, &msg);
-        }
-        return n;
-    }
 
     // Past the pipe-backed unix-socket branch: safe to drop the BKL (see sys_sendto).
     let _net_bkl = NetBklGuard::new();
@@ -1492,4 +1735,157 @@ pub fn run_net_bounce_tests() {
     assert_eq!(capped.len(), NET_BOUNCE_MAX, "oversized request is served at the cap");
 
     crate::console::print("  [PASS] test_net_bounce_alloc_degradation\n");
+}
+
+// ============================================================================
+// Family dispatch — AF_UNIX first, then the native (smoltcp) stack
+// ============================================================================
+//
+// These wrappers exist so `src/syscall/mod.rs` can dispatch each socket syscall
+// **unconditionally**. Before AF_UNIX had a socket object, the rump-only build
+// (no `smoltcp`) sent `bind`/`listen`/`accept`/`connect`/`getsockname`/
+// `getpeername` straight to `net_enetdown()`, because the only sockets that
+// could exist were AF_INET ones and there was no native stack to serve them.
+// That is no longer true: AF_UNIX is smoltcp-free by construction, and it is
+// the family box 0's rump sysproxy channel already uses. Leaving the old gating
+// in place would give the rump devbox — the *default* devbox — an AF_UNIX
+// implementation that could create sockets and then refuse to bind them.
+//
+// Every wrapper checks "is this fd (or domain) AF_UNIX?" first and routes to
+// `unixsock`, which runs entirely with the BKL held (see that module's docs).
+// Only when the answer is no does control reach the smoltcp arm and its
+// `NetBklGuard`, so the BKL-free window is unchanged for AF_INET traffic and
+// never entered for AF_UNIX.
+
+/// `socket(2)`. AF_UNIX is served here; AF_INET falls through to the native
+/// stack, or `ENETDOWN` when it is compiled out.
+pub(super) fn dispatch_socket(domain: i32, sock_type: i32, proto: i32) -> u64 {
+    const AF_UNIX: i32 = 1;
+    if domain == AF_UNIX {
+        let cloexec = sock_type & 0x8_0000 != 0;
+        let nonblock = sock_type & 0x800 != 0;
+        return super::unixsock::sys_socket_unix(sock_type, cloexec, nonblock);
+    }
+    #[cfg(feature = "smoltcp")]
+    {
+        sys_socket(domain, sock_type, proto)
+    }
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let _ = (domain, sock_type, proto);
+        super::net_enetdown()
+    }
+}
+
+/// `bind(2)`.
+pub(super) fn dispatch_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
+    if fd_is_unix_socket(fd) {
+        return super::unixsock::sys_bind(fd, addr_ptr, len);
+    }
+    #[cfg(feature = "smoltcp")]
+    {
+        sys_bind(fd, addr_ptr, len)
+    }
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let _ = (fd, addr_ptr, len);
+        super::net_enetdown()
+    }
+}
+
+/// `listen(2)`.
+pub(super) fn dispatch_listen(fd: u32, backlog: i32) -> u64 {
+    if fd_is_unix_socket(fd) {
+        return super::unixsock::sys_listen(fd, backlog);
+    }
+    #[cfg(feature = "smoltcp")]
+    {
+        sys_listen(fd, backlog)
+    }
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let _ = (fd, backlog);
+        super::net_enetdown()
+    }
+}
+
+/// `accept(2)` / `accept4(2)`. `flags` is 0 for plain `accept`, which is
+/// exactly `accept4`'s contract, so the two share one path.
+pub(super) fn dispatch_accept(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u64 {
+    if fd_is_unix_socket(fd) {
+        return super::unixsock::sys_accept(fd, addr_ptr, len_ptr, flags);
+    }
+    #[cfg(feature = "smoltcp")]
+    {
+        if flags == 0 {
+            sys_accept(fd, addr_ptr, len_ptr)
+        } else {
+            sys_accept4(fd, addr_ptr, len_ptr, flags)
+        }
+    }
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let _ = (fd, addr_ptr, len_ptr, flags);
+        super::net_enetdown()
+    }
+}
+
+/// `connect(2)`.
+pub(super) fn dispatch_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
+    if fd_is_unix_socket(fd) {
+        return super::unixsock::sys_connect(fd, addr_ptr, len);
+    }
+    #[cfg(feature = "smoltcp")]
+    {
+        sys_connect(fd, addr_ptr, len)
+    }
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let _ = (fd, addr_ptr, len);
+        super::net_enetdown()
+    }
+}
+
+/// `getsockname(2)`.
+pub(super) fn dispatch_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+    if fd_is_unix_socket(fd) {
+        return super::unixsock::sys_getsockname(fd, addr_ptr, len_ptr);
+    }
+    #[cfg(feature = "smoltcp")]
+    {
+        sys_getsockname(fd, addr_ptr, len_ptr)
+    }
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let _ = (fd, addr_ptr, len_ptr);
+        super::net_enetdown()
+    }
+}
+
+/// `getpeername(2)`.
+pub(super) fn dispatch_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+    if fd_is_unix_socket(fd) {
+        return super::unixsock::sys_getpeername(fd, addr_ptr, len_ptr);
+    }
+    #[cfg(feature = "smoltcp")]
+    {
+        sys_getpeername(fd, addr_ptr, len_ptr)
+    }
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let _ = (fd, addr_ptr, len_ptr);
+        super::net_enetdown()
+    }
+}
+
+/// `shutdown(2)`.
+///
+/// AF_UNIX goes to `unixsock`, which actually closes the `tx` pipe's write end
+/// for `SHUT_WR` — previously this returned a bare 0 for every unix fd, so the
+/// peer never saw the EOF the caller asked to send.
+pub(super) fn dispatch_shutdown(fd: u32, how: i32) -> u64 {
+    if fd_is_unix_socket(fd) {
+        return super::unixsock::sys_shutdown(fd, how);
+    }
+    sys_shutdown(fd, how)
 }

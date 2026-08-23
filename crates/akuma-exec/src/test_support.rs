@@ -104,6 +104,8 @@ pub fn ensure_test_runtime() {
         pipe_clone_ref: |_, _| {},
         eventfd_close: |_| {},
         eventfd_clone_ref: |_| {},
+        unix_sock_close: |_| {},
+        unix_sock_clone_ref: |_| {},
         epoll_destroy: |_| {},
         pidfd_close: |_| {},
         flock_release: |_, _, _| {},
