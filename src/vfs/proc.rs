@@ -422,6 +422,7 @@ impl Filesystem for ProcFilesystem {
         if parts.len() == 1 {
             if parts[0] == "net" {
                 return Ok(alloc::vec![
+                    DirEntry { name: String::from("dev"), is_dir: false, is_symlink: false, size: 0 },
                     DirEntry { name: String::from("tcp"), is_dir: false, is_symlink: false, size: 0 },
                     DirEntry { name: String::from("udp"), is_dir: false, is_symlink: false, size: 0 },
                 ]);
@@ -691,6 +692,30 @@ impl Filesystem for ProcFilesystem {
             return Ok(String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n").into_bytes());
         }
 
+        // Real Linux `/proc/net/dev` format, verbatim (header + `%6s: %7llu
+        // %7llu %4llu %4llu %4llu %5llu %10llu %9llu %8llu %7llu %4llu %4llu
+        // %4llu %5llu %7llu %10llu` per interface, from `net/core/net-procfs.c`)
+        // — unlike `net/tcp`/`net/udp` above, this one has a real consumer that
+        // parses it strictly: busybox `ifconfig` with no interface name reads
+        // this file to enumerate devices before it can print anything, and its
+        // ioctl-based fallback (`SIOCGIFCONF`) is a struct-layout guess this
+        // sidesteps entirely. Only `lo` and `eth0` exist (`docs/reference/subsystems/networking.md`);
+        // this kernel doesn't track byte/packet counters per interface, so
+        // every field is `0` — a legitimate value ifconfig already prints for
+        // any idle interface, not a placeholder that reads as broken.
+        if path == "net/dev" {
+            let mut out = String::from(
+                "Inter-|   Receive                                                |  Transmit\n \
+                 face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n"
+            );
+            for name in ["lo", "eth0"] {
+                let _ = writeln!(out,
+                    "{name:>6}: {:>7} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            }
+            return Ok(out.into_bytes());
+        }
+
         #[cfg(feature = "sc-sysv-ipc")]
         if path == "sysvipc/msg" && crate::config::PROC_SYSVIPC_ENABLED {
             let queues = crate::syscall::msgqueue::list_msg_queues();
@@ -811,7 +836,7 @@ impl Filesystem for ProcFilesystem {
             return current_box_id == 0;
         }
 
-        if path == "net" || path == "net/tcp" || path == "net/udp" {
+        if path == "net" || path == "net/tcp" || path == "net/udp" || path == "net/dev" {
             return true;
         }
 
@@ -903,7 +928,7 @@ impl Filesystem for ProcFilesystem {
             });
         }
 
-        if path == "net/tcp" || path == "net/udp" {
+        if path == "net/tcp" || path == "net/udp" || path == "net/dev" {
             return Ok(Metadata {
                 is_dir: false,
                 size: 0,

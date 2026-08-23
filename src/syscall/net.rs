@@ -1949,6 +1949,154 @@ pub(super) fn dispatch_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 
     }
 }
 
+// ============================================================================
+// Read-only network ioctls (SIOCGIF*) — `ifconfig`/`ip addr` support
+// ============================================================================
+//
+// Two synthetic interfaces: `lo` (fixed) and `eth0` (the smoltcp interface's
+// live IP/netmask/MAC/MTU via `interface_snapshot()`). Dispatched by
+// `term::sys_ioctl` (the one place all `ioctl(2)` cmds are routed by number,
+// regardless of subsystem — audio/tty/tun-tap already live there) matching on
+// the `pub(super)` cmd constants below; these are query-only (`SIOCS*`
+// counterparts are not implemented, nothing here mutates state).
+
+#[cfg(feature = "smoltcp")]
+pub(super) const SIOCGIFCONF: u32 = 0x8912;
+#[cfg(feature = "smoltcp")]
+pub(super) const SIOCGIFFLAGS: u32 = 0x8913;
+#[cfg(feature = "smoltcp")]
+pub(super) const SIOCGIFADDR: u32 = 0x8915;
+#[cfg(feature = "smoltcp")]
+pub(super) const SIOCGIFBRDADDR: u32 = 0x8919;
+#[cfg(feature = "smoltcp")]
+pub(super) const SIOCGIFNETMASK: u32 = 0x891b;
+#[cfg(feature = "smoltcp")]
+pub(super) const SIOCGIFMTU: u32 = 0x8921;
+#[cfg(feature = "smoltcp")]
+pub(super) const SIOCGIFHWADDR: u32 = 0x8927;
+
+#[cfg(feature = "smoltcp")]
+struct NetIface {
+    name: &'static [u8],
+    ip: [u8; 4],
+    netmask: [u8; 4],
+    broadcast: [u8; 4],
+    mac: [u8; 6],
+    mtu: u32,
+    /// `IFF_*` bits (`linux/if.h`): `lo` is `UP|LOOPBACK|RUNNING` (0x49),
+    /// `eth0` is `UP|BROADCAST|RUNNING|MULTICAST` (0x1043).
+    flags: i16,
+}
+
+#[cfg(feature = "smoltcp")]
+fn net_ifaces() -> [NetIface; 2] {
+    let info = akuma_net::smoltcp_net::interface_snapshot();
+    let prefix = info.prefix_len.min(32);
+    let mask_bits: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(prefix)) };
+    let ip_bits = u32::from_be_bytes(info.ip);
+    [
+        NetIface {
+            name: b"lo", ip: [127, 0, 0, 1], netmask: [255, 0, 0, 0],
+            broadcast: [127, 255, 255, 255], mac: [0; 6], mtu: 65536, flags: 0x49,
+        },
+        NetIface {
+            name: b"eth0", ip: info.ip, netmask: mask_bits.to_be_bytes(),
+            broadcast: (ip_bits | !mask_bits).to_be_bytes(), mac: info.mac,
+            mtu: u32::from(info.mtu), flags: 0x1043,
+        },
+    ]
+}
+
+#[cfg(feature = "smoltcp")]
+fn ifname_bytes(name16: &[u8; 16]) -> &[u8] {
+    let len = name16.iter().position(|&b| b == 0).unwrap_or(16);
+    &name16[..len]
+}
+
+#[cfg(feature = "smoltcp")]
+fn write_ifname(dst: &mut [u8; 16], name: &[u8]) {
+    let n = name.len().min(dst.len() - 1);
+    dst.fill(0);
+    dst[..n].copy_from_slice(&name[..n]);
+}
+
+#[cfg(feature = "smoltcp")]
+fn ip_sockaddr(ip: [u8; 4]) -> SockAddrIn {
+    SockAddrIn { sin_family: 2, sin_port: 0, sin_addr: u32::from_ne_bytes(ip), sin_zero: [0; 8] }
+}
+
+/// `sockaddr` shape for `SIOCGIFHWADDR`: `sa_family = ARPHRD_ETHER` (1) + the
+/// 6-byte MAC, zero-padded to the same 16 bytes as [`SockAddrIn`].
+#[cfg(feature = "smoltcp")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SockAddrHw { sa_family: u16, mac: [u8; 6], pad: [u8; 8] }
+
+/// `SIOCGIFFLAGS` / `SIOCGIFADDR` / `SIOCGIFNETMASK` / `SIOCGIFBRDADDR` /
+/// `SIOCGIFMTU` / `SIOCGIFHWADDR`: read the requested `ifr_name` from `arg`
+/// (`struct ifreq`, offset 0), write the cmd-specific union member at `arg+16`.
+#[cfg(feature = "smoltcp")]
+pub(super) fn sys_ioctl_siocgifreq(cmd: u32, arg: u64) -> u64 {
+    let mut req_name = [0u8; 16];
+    if read_user_into(&mut req_name, arg).is_err() { return EFAULT; }
+    let requested = ifname_bytes(&req_name);
+    let Some(iface) = net_ifaces().into_iter().find(|f| f.name == requested) else { return ENODEV; };
+    let union_ptr = arg + 16;
+    let write_ok = match cmd {
+        SIOCGIFFLAGS => write_user_val(union_ptr, &iface.flags).is_ok(),
+        SIOCGIFADDR => write_user_val(union_ptr, &ip_sockaddr(iface.ip)).is_ok(),
+        SIOCGIFNETMASK => write_user_val(union_ptr, &ip_sockaddr(iface.netmask)).is_ok(),
+        SIOCGIFBRDADDR => write_user_val(union_ptr, &ip_sockaddr(iface.broadcast)).is_ok(),
+        SIOCGIFMTU => write_user_val(union_ptr, &(iface.mtu as i32)).is_ok(),
+        SIOCGIFHWADDR => write_user_val(union_ptr, &SockAddrHw { sa_family: 1, mac: iface.mac, pad: [0; 8] }).is_ok(),
+        _ => return ENOTTY,
+    };
+    if write_ok { 0 } else { EFAULT }
+}
+
+/// `SIOCGIFCONF`: `struct ifconf { int ifc_len; char *ifc_buf; }` (16 bytes on
+/// a 64-bit ABI — 4-byte `ifc_len`, 4 bytes padding, 8-byte pointer). Fills
+/// `ifc_buf` with one 32-byte `{ name[16], sockaddr addr }` record per
+/// interface (as many as fit in the caller's `ifc_len`), then writes the
+/// actual byte count back into `ifc_len`. `ifc_buf == NULL` reports the byte
+/// count a full buffer would need without writing anything, matching the
+/// common "query the size first" caller pattern.
+#[cfg(feature = "smoltcp")]
+pub(super) fn sys_ioctl_siocgifconf(arg: u64) -> u64 {
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct IfConfHdr { len: i32, _pad: i32, buf: u64 }
+    // Full `sizeof(struct ifreq)` (40 bytes: 16-byte name + the union sized to
+    // its largest member, `struct ifmap`, not the 16-byte `sockaddr` this
+    // record actually uses) — callers stride `ifc_buf` by `sizeof(struct
+    // ifreq)`, not by how much of the union a given record fills.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct GifreqAddr { name: [u8; 16], addr: SockAddrIn, _union_pad: [u8; 8] }
+
+    let mut hdr = IfConfHdr::default();
+    if read_user_into(&mut hdr, arg).is_err() { return EFAULT; }
+    let cap = usize::try_from(hdr.len).unwrap_or(0);
+    let rec_size = core::mem::size_of::<GifreqAddr>();
+
+    let written = if hdr.buf == 0 {
+        net_ifaces().len() * rec_size
+    } else {
+        let mut written = 0usize;
+        for iface in net_ifaces() {
+            if written + rec_size > cap { break; }
+            let mut name = [0u8; 16];
+            write_ifname(&mut name, iface.name);
+            let rec = GifreqAddr { name, addr: ip_sockaddr(iface.ip), _union_pad: [0; 8] };
+            if write_user_val(hdr.buf + written as u64, &rec).is_err() { return EFAULT; }
+            written += rec_size;
+        }
+        written
+    };
+    if write_user_val(arg, &(written as i32)).is_err() { return EFAULT; }
+    0
+}
+
 /// `shutdown(2)`.
 ///
 /// AF_UNIX goes to `unixsock`, which actually closes the `tx` pipe's write end

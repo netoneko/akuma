@@ -1735,18 +1735,50 @@ pub fn udp_can_send(handle: SocketHandle) -> bool {
     }).unwrap_or(false)
 }
 
-#[must_use] 
+/// Static IPv4 address/prefix `init()` (above) always configures this
+/// interface with — the fallback when [`with_network`] can't take the lock,
+/// not a placeholder guess.
+const DEFAULT_IP: [u8; 4] = [10, 0, 2, 15];
+const DEFAULT_PREFIX_LEN: u8 = 24;
+const LOOPBACK_IP: [u8; 4] = [127, 0, 0, 1];
+
+#[must_use]
 pub fn get_local_ip() -> [u8; 4] {
+    interface_snapshot().ip
+}
+
+/// The non-loopback interface's address/prefix, MAC, and MTU.
+///
+/// Everything a read-only `ifconfig`/`SIOCGIF*` needs
+/// (`docs/reference/subsystems/networking.md`). The loopback address itself is
+/// not reported here: it is a second address on this same interface
+/// (`LoopbackAwareDevice`), not a distinct device, so the `ioctl` layer
+/// synthesizes its own fixed `lo` entry rather than deriving one.
+#[derive(Debug, Clone, Copy)]
+pub struct IfaceInfo {
+    pub ip: [u8; 4],
+    pub prefix_len: u8,
+    pub mac: [u8; 6],
+    pub mtu: u16,
+}
+
+#[must_use]
+pub fn interface_snapshot() -> IfaceInfo {
     with_network(|net| {
-            for cidr in net.iface.ip_addrs() {
+        let (ip, prefix_len) = net.iface.ip_addrs().iter()
+            .find_map(|cidr| {
                 let IpCidr::Ipv4(v4) = cidr;
                 let octets = v4.address().octets();
-                if octets != [127, 0, 0, 1] {
-                    return octets;
-                }
-            }
-        [10, 0, 2, 15]
-    }).unwrap_or([10, 0, 2, 15])
+                (octets != LOOPBACK_IP).then_some((octets, v4.prefix_len()))
+            })
+            .unwrap_or((DEFAULT_IP, DEFAULT_PREFIX_LEN));
+        IfaceInfo {
+            ip,
+            prefix_len,
+            mac: net.device.mac_address(),
+            mtu: net.device.capabilities().max_transmission_unit as u16,
+        }
+    }).unwrap_or(IfaceInfo { ip: DEFAULT_IP, prefix_len: DEFAULT_PREFIX_LEN, mac: [0; 6], mtu: 1500 })
 }
 
 pub fn udp_socket_close(handle: SocketHandle) {

@@ -409,6 +409,39 @@ Regression: `socket_timeout_option_roundtrip` in the boot suite.
 the guest — `nettest-std rcvtimeo` and `nettest-std sweep` in particular. The
 procedure is [`../../runbooks/debug-delayed-first-byte.md`](../../runbooks/debug-delayed-first-byte.md).
 
+### Interface introspection (`ifconfig`, `SIOCGIF*`, `/proc/net/dev`)
+
+Added 2026-08-24 so `ifconfig`/`ifconfig -a`/`ifconfig <name>` work — **read-only**;
+no `SIOCSIF*` (`ifconfig up/down`, address changes) or `AF_NETLINK`/`RTM_GETLINK`
+(`ip addr`, glibc's netlink-based `if_nameindex()`) are implemented, so tools
+that enumerate interfaces via netlink instead of `/proc/net/dev` still won't see
+anything.
+
+Two synthetic interfaces are reported, matching the one real smoltcp interface
+(`LoopbackAwareDevice` handles both addresses at the device layer, not two
+NICs): `lo` (127.0.0.1/8, fixed) and `eth0` (live IP/netmask/MAC/MTU via
+`akuma_net::smoltcp_net::interface_snapshot()`). `/proc/net/dev`
+(`src/vfs/proc.rs`) reports both with all-zero byte/packet counters — this
+kernel doesn't track per-interface traffic stats, and `0` is what any idle
+interface already shows, not a placeholder.
+
+`src/syscall/term.rs` dispatches `SIOCGIFCONF` / `SIOCGIFFLAGS` / `SIOCGIFADDR`
+/ `SIOCGIFNETMASK` / `SIOCGIFBRDADDR` / `SIOCGIFMTU` / `SIOCGIFHWADDR` to
+`src/syscall/net.rs`'s handlers before the `fd > 2 → ENOTTY` gate that every
+other ioctl on a non-tty fd hits (same discipline as the pre-existing
+`FIONBIO`/`FIONREAD` socket arms) — fd must resolve to `FileDescriptor::Socket`.
+
+**The one non-obvious byte-layout trap:** `SIOCGIFCONF`'s output buffer is a
+sequence of `struct ifreq` records, and callers stride it by
+**`sizeof(struct ifreq)` = 40 bytes** (16-byte name + the union sized to its
+*largest* member, `struct ifmap`, not by how much of the union a given ioctl
+actually fills). A first implementation used a tightly-packed 32-byte record
+(name + the 16-byte `sockaddr` `SIOCGIFADDR` needs) — busybox `ifconfig -a`'s
+own name+address parsing read record 0 fine but landed record 1 mid-`sockaddr`,
+producing a garbage name and `ifconfig: : error fetching interface
+information: Device not found`. Padding the record to the full 40 bytes fixed
+it. `sys_ioctl_siocgifconf` in `src/syscall/net.rs` has the record layout.
+
 ## Port forwarding (host → guest)
 
 `scripts/cargo_runner.sh` sets up SLIRP `hostfwd` rules:

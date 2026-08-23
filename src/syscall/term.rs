@@ -27,6 +27,21 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const SNDCTL_DSP_SPEED: u32 = crate::audio::SNDCTL_DSP_SPEED;
     const SNDCTL_DSP_SETFMT: u32 = crate::audio::SNDCTL_DSP_SETFMT;
     const SNDCTL_DSP_CHANNELS: u32 = crate::audio::SNDCTL_DSP_CHANNELS;
+    // Read-only network ioctls (mirror super::net constants) — `ifconfig`.
+    #[cfg(feature = "smoltcp")]
+    const SIOCGIFCONF: u32 = super::net::SIOCGIFCONF;
+    #[cfg(feature = "smoltcp")]
+    const SIOCGIFFLAGS: u32 = super::net::SIOCGIFFLAGS;
+    #[cfg(feature = "smoltcp")]
+    const SIOCGIFADDR: u32 = super::net::SIOCGIFADDR;
+    #[cfg(feature = "smoltcp")]
+    const SIOCGIFBRDADDR: u32 = super::net::SIOCGIFBRDADDR;
+    #[cfg(feature = "smoltcp")]
+    const SIOCGIFNETMASK: u32 = super::net::SIOCGIFNETMASK;
+    #[cfg(feature = "smoltcp")]
+    const SIOCGIFMTU: u32 = super::net::SIOCGIFMTU;
+    #[cfg(feature = "smoltcp")]
+    const SIOCGIFHWADDR: u32 = super::net::SIOCGIFHWADDR;
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
@@ -156,6 +171,20 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 return EFAULT;
             }
             return 0;
+        }
+        #[cfg(feature = "smoltcp")]
+        SIOCGIFCONF => {
+            if !matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::Socket(_))) {
+                return ENOTTY;
+            }
+            return super::net::sys_ioctl_siocgifconf(arg);
+        }
+        #[cfg(feature = "smoltcp")]
+        SIOCGIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR | SIOCGIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR => {
+            if !matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::Socket(_))) {
+                return ENOTTY;
+            }
+            return super::net::sys_ioctl_siocgifreq(cmd, arg);
         }
         #[cfg(feature = "rump")]
         TUNSETIFF => {
