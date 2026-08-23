@@ -1,6 +1,6 @@
 # nettest — guest-side network client probes
 
-Four probes live here. They exist for three different investigations, share
+Five probes live here. They exist for four different investigations, share
 nothing but a directory, and are built by two different scripts.
 
 | Probe | Directory | Client stack | Investigation | Build |
@@ -9,6 +9,7 @@ nothing but a directory, and are built by two different scripts.
 | `nettest-connect` | `rust/connect/` | raw `connect(2)` + `poll`/`select`/`epoll` — no library at all | cargo-vs-curl HTTPS divergence | `rust/build-musl.sh` (host cross) |
 | `nettest-std` | `rust/stdlib/` | `std::net` + `poll(2)` + sync rustls — no runtime | delayed first byte | `rust/build-musl.sh` (host cross) |
 | `nettest-reqwest` | `rust/reqwest/` | tokio + hyper 1.x + reqwest 0.12 + rustls — nca's stack | delayed first byte | `rust/build-musl.sh` (host cross) |
+| `nettest-unix` | `rust/unixsock/` | raw AF_UNIX syscalls — no `std::os::unix::net` | AF_UNIX implementation | `rust/build-musl.sh unix` (host cross) |
 
 ---
 
@@ -386,3 +387,127 @@ It was built at 20:19 on 2026-08-11, twenty minutes *before* the commit that
 added the doc (`0c9d96ce`, "curious case of nothingburger"). The vendored probe
 exists and has shipped; what is unrecorded is whether the 30/30 pass was
 measured with it or with the earlier dynamic build.
+
+---
+
+# Part 4 — `nettest-unix`: does AF_UNIX work, and does it work the way Linux does?
+
+Until 2026-08-23 Akuma had no AF_UNIX socket object at all: `socket(AF_UNIX, …)`
+returned `EAFNOSUPPORT`, and the only thing that worked was `socketpair(2)` over
+two kernel pipes. The audit, the plan and the outcome are in
+[`docs/archive/UNIX_SOCKET_IMPROVEMENTS.md`](../../docs/archive/UNIX_SOCKET_IMPROVEMENTS.md).
+
+## Why a probe, and why the Linux arm is not optional here
+
+Two of the defects that audit found were **silent**: `SOCK_SEQPACKET` merged
+messages, and `sendmsg` sent only the first iovec. Neither produces an error, an
+errno, or a kernel log line — the caller gets a plausible short count and carries
+on with corrupt data. Every mode below is written against one specific way to
+lose or duplicate user data, and each reports *which* way it failed rather than
+just that it did.
+
+The Linux control arm matters more for this probe than for the four above, and
+for a structural reason. A unix-socket probe is **entirely self-contained**: no
+server, no network, no peer to blame. So there is no external reference to
+disagree with, and running the identical static-musl binary under Docker Linux is
+the *only* way to tell a kernel bug from a probe bug.
+
+That is not a theoretical benefit. The Linux arm found **five kernel defects and
+two bugs in this probe**, including one where the probe's own assertion was wrong
+in the same direction as the kernel (`SHUT_RD`) — a test written from the same
+misunderstanding as the implementation would have passed. See § 0 of the audit
+doc for the list.
+
+**Run the Linux arm first. It is free, and a mode that fails there is a probe
+bug.**
+
+## Build and run
+
+```bash
+userspace/nettest/rust/build-musl.sh unix   # -> bootstrap/bin/nettest-unix
+scripts/populate_disk.sh                    # -> /bin/nettest-unix in the image
+```
+
+```text
+nettest-unix all                        # every argument-free mode, in phase order
+nettest-unix pair stream|seqpacket      # socketpair, TWO messages each way
+nettest-unix iovec                      # sendmsg 3 iovecs / recvmsg into 2
+nettest-unix shutdown                   # the SHUT_RD / SHUT_WR / bad-how matrix
+nettest-unix abstract                   # bind/listen/connect/accept, no VFS
+nettest-unix path  /tmp/p.sock          # the same over a path, plus S_ISSOCK
+nettest-unix stale /tmp/s.sock          # crashed-daemon node: refuse, then re-bind
+nettest-unix dgram /tmp/d.sock          # SOCK_DGRAM sendto + a zero-length datagram
+nettest-unix syslog                     # connect(/dev/log) and send one line
+nettest-unix passfd                     # SCM_RIGHTS — the passed fd must WORK
+nettest-unix peercred                   # SO_PEERCRED reports our own pid
+nettest-unix poll                       # readiness via poll AND select AND epoll
+nettest-unix stress 200                 # n connect/accept/close cycles + fd leak check
+```
+
+The Linux arm, against the same binary:
+
+```bash
+docker run --rm --platform linux/arm64 -v "$PWD/bootstrap/bin:/b:ro" \
+    alpine:3.20 /b/nettest-unix all
+```
+
+## Reading the verdicts
+
+| verdict | meaning |
+|---|---|
+| `OK` | every assertion in the mode held |
+| `UNSUPPORTED` | a syscall returned `EAFNOSUPPORT`/`ENOSYS`/`EOPNOTSUPP` — not built yet, **not** broken |
+| `TRUNCATED` | data arrived short, or a message boundary was lost — the silent class |
+| `LEAK` | an fd count did not return to baseline |
+| `READINESS` | poll/select/epoll disagreed about the same fd at the same instant |
+| `FAIL` | a syscall failed where Linux succeeds |
+
+A verdict that differs between the Linux arm and the guest is a kernel
+divergence. One that matches on both is not a bug.
+
+`UNSUPPORTED` is deliberately not a failure: a phase that has not landed should
+not read as a regression. The corollary bit the probe once — `mode_path`
+originally treated `Unsupported` as "keep going", so on the rump build it
+continued past a rendezvous that had never created the socket and reported
+**OK**. `Verdict::succeeded` (did it happen) is now distinct from
+`Verdict::is_acceptable` (is this an acceptable outcome).
+
+## Why `poll` checks all three readiness syscalls
+
+`poll`, `select` and `epoll` are separate kernel paths (`sys_ppoll`,
+`sys_pselect6`, `sys_epoll_pwait`), and the AF_INET version of exactly this
+disagreement was a real bug — `poll` said `CONNECTED` and `select` said
+`HARDFAIL` for one socket at one instant, because `sys_pselect6` never wrote
+`exceptfds` (Part 3, "Outcome"). A listener's `EPOLLIN` is a brand-new
+predicate: a listening unix socket has **no pipes at all**, so a path that falls
+through to the pipe arms asks `pipe_can_read(0)` — false for a pipe that does not
+exist — and an accept-ready listener polls as "nothing" forever. Every
+event-loop server would hang at startup. The mode also asserts an *idle*
+listener is **not** readable, because one that always reports ready spins an
+event loop at 100% CPU on an `accept` that returns `EAGAIN`.
+
+## Why `stress` exists
+
+Every leak class in the AF_UNIX design is *accumulating* and invisible from
+userspace: a name left behind by a closed listener (which makes every subsequent
+`bind` fail `EADDRINUSE`, so the service can never restart), a server endpoint
+queued but never accepted, a channel outliving its pipe. One round trip passes
+with any of them present.
+
+## The three build targets it has to agree on
+
+AF_UNIX is smoltcp-free by construction, so it must work on the rump-only devbox
+too — and that is the target where the un-gated dispatch in `src/syscall/mod.rs`
+is load-bearing:
+
+```bash
+cargo build --release && cargo run --release                       # default (smoltcp)
+scripts/build_devbox_smoltcp.sh && overlays/devbox/run-smoltcp.sh  # devbox-smoltcp
+scripts/build_devbox.sh && overlays/devbox/run.sh                  # rump-only
+```
+
+On the rump build the additional acceptance check is that **box 0's rump stack
+still comes up** (`[RUMP-SP] box=0 proxy ready`): the sysproxy channel at fd 3 is
+a `UnixSocket`, so any regression in the descriptor layout or in `sendmsg`'s
+iovec coalescing kills the handshake silently, several layers away from anything
+that looks like socket code.

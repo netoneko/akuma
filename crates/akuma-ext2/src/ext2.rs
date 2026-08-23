@@ -532,11 +532,25 @@ const ROOT_INODE: u32 = 2;
 const S_IFREG: u16 = 0x8000; // Regular file
 const S_IFDIR: u16 = 0x4000; // Directory
 const S_IFLNK: u16 = 0xA000; // Symbolic link
+/// Unix-domain socket node. Created by `bind(2)` on an AF_UNIX pathname; it
+/// carries no data, only the type bits.
+///
+/// Those bits are the whole point. A client connecting to a unix socket
+/// `stat`s the path and checks `S_ISSOCK` first — before this existed, `bind`
+/// created an ordinary file and `stat` reported `S_IFREG`, so a conformant
+/// client refused to connect to a socket that was working perfectly. Caught by
+/// `nettest-unix path` diffing against its Linux control arm
+/// (`docs/archive/UNIX_SOCKET_IMPROVEMENTS.md` G7).
+const S_IFSOCK: u16 = 0xC000; // Unix-domain socket
 
 /// Default permissions for new files/directories
 const DEFAULT_FILE_PERMS: u16 = S_IFREG | 0o644;
 const DEFAULT_DIR_PERMS: u16 = S_IFDIR | 0o755;
 const DEFAULT_SYMLINK_PERMS: u16 = S_IFLNK | 0o777;
+/// A socket node is `srwxr-xr-x`: the permission bits are what govern who may
+/// `connect`, and Linux applies the process umask to `0o777` here. There is no
+/// per-process umask in this kernel, so 0o755 is used directly.
+const DEFAULT_SOCKET_PERMS: u16 = S_IFSOCK | 0o755;
 
 /// Maximum target length for fast (inline) symlinks.
 /// Stored in direct_blocks[12] + indirect + double_indirect + triple_indirect = 60 bytes.
@@ -545,6 +559,9 @@ const FAST_SYMLINK_MAX: usize = 60;
 /// Directory entry file type constants
 const FT_REG_FILE: u8 = 1;
 const FT_DIR: u8 = 2;
+/// `EXT2_FT_SOCK`. Recorded in the directory entry alongside the inode's type
+/// bits so `getdents64` reports `DT_SOCK` without having to read the inode.
+const FT_SOCK: u8 = 6;
 const FT_SYMLINK: u8 = 7;
 
 /// Minimum directory entry size (inode + rec_len + name_len + file_type)
@@ -1916,6 +1933,45 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         Ok(())
     }
 
+    // ========================================================================
+    // Socket node operations
+    // ========================================================================
+
+    /// Create a zero-length `S_IFSOCK` node — the filesystem presence of an
+    /// AF_UNIX `bind(2)` on a pathname.
+    ///
+    /// Deliberately NOT a variant of file creation with a different mode: the
+    /// node must never be openable as a file. It holds no data and allocates no
+    /// data blocks, and the only things that read it are `stat` (for
+    /// `S_ISSOCK`), `unlink`, and directory listings. `connect` resolves against
+    /// the kernel's AF_UNIX name table, not against this inode — the node exists
+    /// so that userspace conventions work (a client checking `S_ISSOCK`, a
+    /// daemon `unlink`ing a stale path, `ls -l` showing an `s`), not as the
+    /// socket itself.
+    fn create_socket_node_internal(
+        &self,
+        state: &mut Ext2State,
+        parent_inode: u32,
+        name: &str,
+    ) -> Result<(), FsError> {
+        let inode_num = self.allocate_inode(state, false)?;
+        let now = self.current_time();
+        let inode = Inode {
+            type_perms: DEFAULT_SOCKET_PERMS,
+            uid: 0,
+            size_lower: 0,
+            access_time: now,
+            creation_time: now,
+            modification_time: now,
+            hard_links: 1,
+            sectors_used: 0,
+            ..Default::default()
+        };
+        self.write_inode(state, inode_num, &inode)?;
+        self.add_dir_entry(state, parent_inode, name, inode_num, FT_SOCK)?;
+        Ok(())
+    }
+
     fn read_symlink_inode(&self, state: &Ext2State, inode_num: u32) -> Result<String, FsError> {
         let inode = self.read_inode(state, inode_num)?;
         if (inode.type_perms & 0xF000) != S_IFLNK {
@@ -2572,6 +2628,19 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         let (parent_inode, name) = self.lookup_parent(link_path)?;
         let mut state = self.write_state();
         self.create_symlink_internal(&mut state, parent_inode, &name, target)
+    }
+
+    fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
+        // `AlreadyExists` is the honest answer and the caller depends on it:
+        // AF_UNIX `bind` maps it to `EADDRINUSE`, which is what tells a daemon
+        // it must `unlink` a stale node before it can restart. Silently reusing
+        // the node would let two daemons believe they own the same path.
+        if self.lookup_path(path).is_ok() {
+            return Err(FsError::AlreadyExists);
+        }
+        let (parent_inode, name) = self.lookup_parent(path)?;
+        let mut state = self.write_state();
+        self.create_socket_node_internal(&mut state, parent_inode, &name)
     }
 
     fn read_symlink(&self, path: &str) -> Result<String, FsError> {

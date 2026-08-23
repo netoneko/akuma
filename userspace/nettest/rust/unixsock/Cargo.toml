@@ -1,0 +1,29 @@
+[package]
+name = "nettest-unix"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone crate: NOT a member of any workspace (repo root and userspace/
+# both target `aarch64-unknown-none`). Built by ../build-musl.sh, same as the
+# `connect` and `stdlib` probes.
+
+[[bin]]
+name = "nettest-unix"
+path = "src/main.rs"
+
+[dependencies]
+# The ONLY dependency, deliberately — and specifically NOT
+# `std::os::unix::net::{UnixStream, UnixListener}`. Those wrappers decide for
+# you which syscall runs, retry on EINTR, and translate errno into io::Error
+# kinds that collapse distinct kernel answers into the same variant. This probe
+# exists to report exactly which syscall answered what, so it makes the calls
+# itself.
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+codegen-units = 1
+strip = true
+
+[workspace]

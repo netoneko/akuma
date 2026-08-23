@@ -379,6 +379,44 @@ pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
         return None;
     }
 
+    // ── AF_UNIX is local IPC and is NEVER proxied ─────────────────────────
+    //
+    // A unix socket does not touch a network stack, so which stack the box uses
+    // is irrelevant to it — and forwarding it would be actively wrong: two
+    // processes in the same Akuma box talking over `/run/app.sock` would have
+    // their IPC round-trip through a NetBSD kernel that knows nothing about
+    // either of them, at ~50 ms per leg
+    // (`docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md`).
+    //
+    // This is not a new judgement. `socketpair` (199) is already excluded from
+    // `is_socket_family_sysno` on exactly this reasoning — "AF_UNIX-only,
+    // pipe-backed, pure local IPC" (`akuma-rump`'s syscall_translation.rs) —
+    // and the rest of the family had simply never been implemented natively, so
+    // the question had not come up. Now that it is, `proxy_socket`'s
+    // `domain != 2 → EAFNOSUPPORT` would refuse every unix socket inside a rump
+    // box.
+    //
+    // It also does not weaken the HARD ISOLATION GUARANTEE described below.
+    // That guarantee exists so a rump box cannot leak traffic onto the native
+    // smoltcp stack. An AF_UNIX socket has no wire, no address family reachable
+    // off-host, and no route — there is nothing for it to leak.
+    const AF_UNIX_DOMAIN: u64 = 1;
+    if op == Some(translation::Op::Socket) && args[0] == AF_UNIX_DOMAIN {
+        return None;
+    }
+    // The fd-addressed half: bind/listen/accept/connect/getsockname/... on an
+    // fd that is a unix socket rather than a rump one. Same "check the fd, not
+    // just the syscall number" reasoning the read/write list above is built on,
+    // and the same failure mode if it is missing — `proxy_and_fd` rejects the
+    // non-`RumpSocket` fd with a bare `EBADF` instead of letting the native
+    // implementation, which handles it correctly, run.
+    if matches!(
+        proc.get_fd(args[0] as u32),
+        Some(process::FileDescriptor::UnixSocket { .. })
+    ) {
+        return None;
+    }
+
     // HARD ISOLATION GUARANTEE: for a `stack=rump` box, a socket-family syscall (by
     // number) or ANY syscall on a rump-owned fd MUST be owned by this proxy — it can
     // never fall through to the native smoltcp stack. We route it if we can marshal

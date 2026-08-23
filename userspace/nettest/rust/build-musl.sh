@@ -4,11 +4,18 @@
 #   stdlib/   -> bootstrap/bin/nettest-std       (std::net + poll(2) + sync rustls)
 #   reqwest/  -> bootstrap/bin/nettest-reqwest   (tokio + hyper + reqwest + rustls)
 #   connect/  -> bootstrap/bin/nettest-connect   (raw connect(2) + poll/select/epoll)
+#   unixsock/ -> bootstrap/bin/nettest-unix      (AF_UNIX: raw syscalls, no std::os wrappers)
 #
 # `connect/` belongs to a third investigation (cargo cannot reach crates.io,
-# `docs/runbooks/cargo-cannot-reach-crates-io.md`) but shares this build path
-# because it has the same requirement: no runtime, no TLS, nothing between the
-# probe and the syscall.
+# `docs/runbooks/cargo-cannot-reach-crates-io.md`) and `unixsock/` to a fourth
+# (AF_UNIX, `docs/archive/UNIX_SOCKET_IMPROVEMENTS.md`), but both share this
+# build path because they have the same requirement: no runtime, no TLS,
+# nothing between the probe and the syscall.
+#
+# `unixsock/` needs the static-musl output for a second reason the others only
+# benefit from: an AF_UNIX probe is entirely self-contained — no server, no
+# network, no peer to blame — so running the identical binary under Docker Linux
+# is the ONLY way to tell a kernel bug from a probe bug.
 #
 # This is NOT the sibling curl probe's build path. That one (./build.sh) runs
 # cargo inside an Alpine arm64 container because it has to build libcurl +
@@ -21,10 +28,11 @@
 # worthless if the probe and nca were built by different compilers against
 # different libcs.
 #
-#   ./build-musl.sh            # all three probes
+#   ./build-musl.sh            # all four probes
 #   ./build-musl.sh std        # just nettest-std
 #   ./build-musl.sh reqwest    # just nettest-reqwest
 #   ./build-musl.sh connect    # just nettest-connect
+#   ./build-musl.sh unix       # just nettest-unix
 #
 # After building: scripts/populate_disk.sh copies bootstrap/bin/* into /bin.
 set -euo pipefail
@@ -68,11 +76,12 @@ build_one() {
 }
 
 case "$want" in
-    all)     build_one stdlib nettest-std; build_one reqwest nettest-reqwest; build_one connect nettest-connect ;;
+    all)     build_one stdlib nettest-std; build_one reqwest nettest-reqwest; build_one connect nettest-connect; build_one unixsock nettest-unix ;;
     std)     build_one stdlib nettest-std ;;
     reqwest) build_one reqwest nettest-reqwest ;;
     connect) build_one connect nettest-connect ;;
-    *)       echo "usage: $0 [all|std|reqwest|connect]" >&2; exit 2 ;;
+    unix)    build_one unixsock nettest-unix ;;
+    *)       echo "usage: $0 [all|std|reqwest|connect|unix]" >&2; exit 2 ;;
 esac
 
 echo "[nettest] done. Run scripts/populate_disk.sh to ship them to the disk image."

@@ -435,6 +435,18 @@ pub fn create_symlink(link_path: &str, target: &str) -> Result<(), FsError> {
     Ok(())
 }
 
+/// Create the socket node for an AF_UNIX pathname `bind(2)`.
+///
+/// No in-memory fallback, unlike [`create_symlink`]: a socket node's whole
+/// purpose is that `stat` reports `S_ISSOCK` and `unlink` removes it, and a
+/// kernel-side table entry gives neither. If the mounted filesystem cannot
+/// represent the type, the caller is told so and can decide — falling back to a
+/// regular file is the substitution that made a conformant client refuse to
+/// connect to a working socket (`docs/archive/UNIX_SOCKET_IMPROVEMENTS.md` G7).
+pub fn create_socket_node(path: &str) -> Result<(), FsError> {
+    with_fs(path, |fs, rel| fs.create_socket_node(rel))
+}
+
 pub fn read_symlink(path: &str) -> Option<String> {
     // Try on-disk first
     if let Ok(target) = with_fs(path, |fs, rel| fs.read_symlink(rel)) {

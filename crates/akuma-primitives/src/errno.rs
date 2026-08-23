@@ -107,22 +107,26 @@ errno_table! {
     ENOSYS = 38;
     ENOTEMPTY = 39;
     ENOMSG = 42;
-    /// The fd is not a socket. Returned by the AF_UNIX arms when a socket
-    /// syscall lands on a pipe, a file or a tty — previously these answered
-    /// `EBADF`, which tells a caller the descriptor is invalid rather than that
-    /// it is the wrong *kind* of object, and sends it looking for a leak.
+    /// The fd is not a socket.
+    ///
+    /// Returned by the AF_UNIX arms when a socket syscall lands on a pipe, a
+    /// file or a tty. Previously these answered `EBADF`, which tells a caller
+    /// the descriptor is invalid rather than that it is the wrong *kind* of
+    /// object, and sends it looking for a leak.
     ENOTSOCK = 88;
     EDESTADDRREQ = 89;
-    /// A datagram larger than the socket's send buffer. The AF_UNIX framed
-    /// types (`SOCK_DGRAM`/`SOCK_SEQPACKET`) must report this rather than
-    /// blocking: a message that cannot fit atomically can never be sent, and a
-    /// partial write is unrepresentable for a framed socket
+    /// A datagram larger than the socket's send buffer.
+    ///
+    /// The AF_UNIX framed types (`SOCK_DGRAM`/`SOCK_SEQPACKET`) must report this
+    /// rather than blocking: a message that cannot fit atomically can never be
+    /// sent, and a partial write is unrepresentable for a framed socket
     /// (`akuma_net::unix::plan_write`).
     EMSGSIZE = 90;
-    /// The peer's socket type does not match this one's — connecting a
-    /// `SOCK_STREAM` to a `SOCK_DGRAM` name, for instance. Distinct from
-    /// `EPROTONOSUPPORT`: the protocol exists, this socket is the wrong type
-    /// for it.
+    /// The peer's socket type does not match this one's.
+    ///
+    /// Connecting a `SOCK_STREAM` to a `SOCK_DGRAM` name, for instance.
+    /// Distinct from `EPROTONOSUPPORT`: the protocol exists, this socket is the
+    /// wrong type for it.
     EPROTOTYPE = 91;
     /// Returned by the extended-attribute syscall arms. Must be encoded as
     /// `x0 = -95` (`0xffff_ffa9`), never `!95` — that is `-96`

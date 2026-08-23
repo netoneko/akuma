@@ -455,9 +455,20 @@ pub(super) const MSG_TRUNC: i32 = 0x20;
 /// one place. The bounce is fallible ([`alloc_net_bounce`]) for the same reason
 /// every other net path's is: an infallible `vec![0; N]` on a fragmented heap is
 /// a whole-kernel abort, not an error return.
-fn unix_send_user(fd: u32, buf_ptr: u64, len: usize, flags: i32) -> u64 {
+///
+/// `dest_addr`/`addr_len` carry `sendto`'s destination. They matter only for
+/// `SOCK_DGRAM`, which has no peer to write through — and passing 0 for them is
+/// **not** the same as passing an unnamed address: the first means "no
+/// destination given" (fine on a connected socket), the second is a malformed
+/// one. `read_dest` keeps them apart.
+fn unix_send_user(fd: u32, buf_ptr: u64, len: usize, flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
+    let dest = match super::unixsock::read_dest(dest_addr, addr_len) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let dontwait = flags & MSG_DONTWAIT != 0;
     if len == 0 {
-        return super::unixsock::unix_send(fd, &[], flags & MSG_DONTWAIT != 0);
+        return super::unixsock::unix_sendto(fd, &[], dest.as_ref(), dontwait);
     }
     if !validate_user_ptr(buf_ptr, len) {
         return EFAULT;
@@ -469,7 +480,7 @@ fn unix_send_user(fd: u32, buf_ptr: u64, len: usize, flags: i32) -> u64 {
     if copy_from_user(&mut kbuf, buf_ptr).is_err() {
         return EFAULT;
     }
-    super::unixsock::unix_send(fd, &kbuf, flags & MSG_DONTWAIT != 0)
+    super::unixsock::unix_sendto(fd, &kbuf, dest.as_ref(), dontwait)
 }
 
 /// Receive from a unix socket into a user buffer. Returns `(ret, truncated)`.
@@ -506,7 +517,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
     // also take, which must not happen in the BKL-free window (AB-BA with a
     // nested IRQ's enter_kernel — see NetBklGuard).
     if fd_is_unix_socket(fd) {
-        return unix_send_user(fd, buf_ptr, len, _flags);
+        return unix_send_user(fd, buf_ptr, len, _flags, dest_addr, addr_len);
     }
     let _net_bkl = NetBklGuard::new();
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
@@ -676,7 +687,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
 #[cfg(not(feature = "smoltcp"))]
 pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _dest_addr: u64, _addr_len: usize) -> u64 {
     if fd_is_unix_socket(fd) {
-        return unix_send_user(fd, buf_ptr, len, _flags);
+        return unix_send_user(fd, buf_ptr, len, _flags, _dest_addr, _addr_len);
     }
     EBADF
 }
@@ -858,48 +869,19 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
         return EFAULT;
     }
 
-    // `SO_PEERCRED` answers a 12-byte `struct ucred`, not the 4-byte int the
-    // common path below assumes, so it is handled first. AF_UNIX only — there
-    // is no peer credential on a TCP socket, and Linux reports ENOPROTOOPT for
-    // one; `EOPNOTSUPP` is the nearest name this errno table has.
-    if level == SOL_SOCKET && optname == SO_PEERCRED {
-        let Some(cred) = super::unixsock::peer_cred_of(fd) else {
-            return neg_errno(libc_errno::EOPNOTSUPP);
-        };
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct Ucred { pid: u32, uid: u32, gid: u32 }
-        let out = Ucred { pid: cred.pid, uid: cred.uid, gid: cred.gid };
-        let sz = core::mem::size_of::<Ucred>();
-        if (len as usize) < sz || !validate_user_ptr(optval, sz) {
-            return EFAULT;
-        }
-        if write_user_val(optval, &out).is_err() {
-            return EFAULT;
-        }
-        if write_user_val(optlen, &(sz as u32)).is_err() {
-            return EFAULT;
-        }
-        return 0;
+    // AF_UNIX owns `SO_PEERCRED` (a 12-byte `struct ucred`, not the 4-byte int
+    // the common path below assumes) and `SO_TYPE` (which that path hardcoded to
+    // 1/SOCK_STREAM for every non-AF_INET fd, so a SEQPACKET or DGRAM socket
+    // misreported itself). Shared with the rump-only dispatch — see
+    // `unix_getsockopt`.
+    if let Some(r) = unix_getsockopt(fd, level, optname, optval, optlen) {
+        return r;
     }
-
-    // `SO_TYPE` on a unix fd must come from the socket's recorded type. The
-    // common path below hardcoded `1` (SOCK_STREAM) for every non-AF_INET fd,
-    // so a SOCK_SEQPACKET or SOCK_DGRAM socket misreported itself — and a
-    // client that picks its framing off the answer then reads the stream wrong.
-    if level == SOL_SOCKET && optname == SO_TYPE {
-        if let Some(ty) = super::unixsock::sock_type_of(fd) {
-            if (len as usize) < 4 || !validate_user_ptr(optval, 4) {
-                return EFAULT;
-            }
-            if write_user_val(optval, &ty).is_err() {
-                return EFAULT;
-            }
-            if write_user_val(optlen, &4u32).is_err() {
-                return EFAULT;
-            }
-            return 0;
-        }
+    // `SO_PEERCRED` on a non-unix fd: there is no peer credential on a TCP
+    // socket, and Linux reports ENOPROTOOPT; `EOPNOTSUPP` is the nearest name
+    // this errno table has.
+    if level == SOL_SOCKET && optname == SO_PEERCRED {
+        return neg_errno(libc_errno::EOPNOTSUPP);
     }
 
     // These two answer with a 16-byte `struct timeval`, not the 4-byte int
@@ -1083,13 +1065,102 @@ fn scatter_iovecs(iovs: &[super::fs::IoVec], data: &[u8]) -> Result<usize, u64> 
     Ok(off)
 }
 
+/// The AF_UNIX answers to `getsockopt`, reachable on **every** build.
+///
+/// Returns `None` for an option this does not own, so the caller falls through
+/// to the native stack's handling (or to `ENETDOWN` where there is none).
+///
+/// Split out of the `smoltcp`-gated `sys_getsockopt` because a rump-only build
+/// has no such function, and routing `GETSOCKOPT` to `net_enetdown()` there made
+/// `SO_PEERCRED` on a perfectly good unix socket answer **ENETDOWN** — a network
+/// error for a socket that has no network. Found by running the probe on the
+/// rump devbox.
+pub(super) fn unix_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u64) -> Option<u64> {
+    const SOL_SOCKET: i32 = 1;
+    const SO_TYPE: i32 = 3;
+    const SO_PEERCRED: i32 = 17;
+    if level != SOL_SOCKET {
+        return None;
+    }
+    if optval == 0 || optlen == 0 {
+        return None;
+    }
+    let mut len: u32 = 0;
+    if read_user_into(&mut len, optlen).is_err() {
+        return Some(EFAULT);
+    }
+    match optname {
+        // A 12-byte `struct ucred`, not the 4-byte int most options use.
+        SO_PEERCRED => {
+            let cred = super::unixsock::peer_cred_of(fd)?;
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct Ucred { pid: u32, uid: u32, gid: u32 }
+            let out = Ucred { pid: cred.pid, uid: cred.uid, gid: cred.gid };
+            let sz = core::mem::size_of::<Ucred>();
+            if (len as usize) < sz || !validate_user_ptr(optval, sz) {
+                return Some(EFAULT);
+            }
+            if write_user_val(optval, &out).is_err() || write_user_val(optlen, &(sz as u32)).is_err() {
+                return Some(EFAULT);
+            }
+            Some(0)
+        }
+        SO_TYPE => {
+            let ty = super::unixsock::sock_type_of(fd)?;
+            if (len as usize) < 4 || !validate_user_ptr(optval, 4) {
+                return Some(EFAULT);
+            }
+            if write_user_val(optval, &ty).is_err() || write_user_val(optlen, &4u32).is_err() {
+                return Some(EFAULT);
+            }
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+/// `recvmsg` on an AF_UNIX fd, reachable on every build.
+///
+/// The `msghdr`/iovec unpacking used to live only inside the `smoltcp`-gated
+/// `sys_recvmsg`, so a rump-only build answered `ENETDOWN` for a unix socket.
+/// Factored out here so both dispatch paths share one implementation.
+pub(super) fn unix_recvmsg_entry(fd: u32, msg_ptr: u64, flags: i32) -> u64 {
+    if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) {
+        return EFAULT;
+    }
+    let mut msg = MsgHdr::default();
+    if read_user_into(&mut msg, msg_ptr).is_err() {
+        return EFAULT;
+    }
+    let iov_size = msg.msg_iovlen as usize * core::mem::size_of::<super::fs::IoVec>();
+    if msg.msg_iovlen != 0 && !validate_user_ptr(msg.msg_iov, iov_size) {
+        return EFAULT;
+    }
+    let mut iovs = alloc::vec![super::fs::IoVec { iov_base: 0, iov_len: 0 }; msg.msg_iovlen as usize];
+    if msg.msg_iovlen != 0 && copy_from_user(as_user_bytes_mut(&mut iovs), msg.msg_iov).is_err() {
+        return EFAULT;
+    }
+    unix_recvmsg(fd, msg_ptr, &mut msg, &iovs, flags)
+}
+
 /// `sendmsg` on an AF_UNIX fd: gather every iovec, then one framed send.
-fn unix_sendmsg(fd: u32, iovs: &[super::fs::IoVec], flags: i32) -> u64 {
+///
+/// The destination comes from `msg_name`/`msg_namelen`, which is how a datagram
+/// `sendmsg` addresses an unconnected socket — the same field `sendto` passes
+/// separately. Ignoring it would make `sendmsg` work on connected sockets only,
+/// silently, and datagram libraries reach for `sendmsg` precisely when they have
+/// both a destination and multiple buffers.
+fn unix_sendmsg(fd: u32, msg: &MsgHdr, iovs: &[super::fs::IoVec], flags: i32) -> u64 {
+    let dest = match super::unixsock::read_dest(msg.msg_name, msg.msg_namelen as usize) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
     let buf = match gather_iovecs(iovs) {
         Ok(b) => b,
         Err(e) => return e,
     };
-    super::unixsock::unix_send(fd, &buf, flags & MSG_DONTWAIT != 0)
+    super::unixsock::unix_sendto(fd, &buf, dest.as_ref(), flags & MSG_DONTWAIT != 0)
 }
 
 /// `recvmsg` on an AF_UNIX fd: one framed receive, then scatter across the
@@ -1151,7 +1222,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     // zero-length message on a framed socket is a real, deliverable datagram,
     // and returning 0 without sending it makes the peer wait forever.
     if fd_is_unix_socket(fd) {
-        return unix_sendmsg(fd, &iovs, _flags);
+        return unix_sendmsg(fd, &msg, &iovs, _flags);
     }
 
     if msg.msg_iovlen == 0 { return 0; }
@@ -1888,4 +1959,58 @@ pub(super) fn dispatch_shutdown(fd: u32, how: i32) -> u64 {
         return super::unixsock::sys_shutdown(fd, how);
     }
     sys_shutdown(fd, how)
+}
+
+/// `recvmsg(2)`.
+pub(super) fn dispatch_recvmsg(fd: u32, msg_ptr: u64, flags: i32) -> u64 {
+    if fd_is_unix_socket(fd) {
+        return unix_recvmsg_entry(fd, msg_ptr, flags);
+    }
+    #[cfg(feature = "smoltcp")]
+    {
+        sys_recvmsg(fd, msg_ptr, flags)
+    }
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let _ = (fd, msg_ptr, flags);
+        super::net_enetdown()
+    }
+}
+
+/// `getsockopt(2)`.
+pub(super) fn dispatch_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u64) -> u64 {
+    if let Some(r) = unix_getsockopt(fd, level, optname, optval, optlen) {
+        return r;
+    }
+    #[cfg(feature = "smoltcp")]
+    {
+        sys_getsockopt(fd, level, optname, optval, optlen)
+    }
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let _ = (fd, level, optname, optval, optlen);
+        super::net_enetdown()
+    }
+}
+
+/// `setsockopt(2)`.
+///
+/// No unix-specific options are implemented, but a unix fd must not get
+/// `ENETDOWN` for one either: `SO_SNDBUF`/`SO_RCVBUF`/`SO_PASSCRED` are things
+/// a client sets opportunistically and ignores the result of, and a hard error
+/// makes a library treat the socket as broken. Accepted-and-ignored is what
+/// Linux effectively does for the ones that do not apply.
+pub(super) fn dispatch_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, optlen: u32) -> u64 {
+    if fd_is_unix_socket(fd) {
+        return 0;
+    }
+    #[cfg(feature = "smoltcp")]
+    {
+        sys_setsockopt(fd, level, optname, optval, optlen)
+    }
+    #[cfg(not(feature = "smoltcp"))]
+    {
+        let _ = (fd, level, optname, optval, optlen);
+        super::net_enetdown()
+    }
 }

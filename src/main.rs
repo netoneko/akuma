@@ -1403,6 +1403,20 @@ fn run_async_main_preemptive() -> ! {
 /// This function itself takes **no BKL**. Everything `poll()` touches has its own
 /// lock, which is what `no-bkl-network` already established; the dropped window
 /// below is that carve-out.
+/// Rump-only builds have no smoltcp interface to poll.
+///
+/// The maintenance thread's structure is shared between the two stacks, so this
+/// keeps its call site unconditional rather than sprinkling `#[cfg]` through the
+/// loop body. Rump's own RX path is driven by the tap device
+/// (`akuma_net::rump_tap`), not from here.
+///
+/// Its absence is one of four lost `smoltcp` gates that made
+/// `scripts/build_devbox.sh` fail to compile — see `akuma-net`'s `lib.rs`
+/// comment on `pub mod smoltcp_net` for the class of mistake.
+#[cfg(not(feature = "smoltcp"))]
+#[inline]
+fn netpoll_drain_step() {}
+
 #[cfg(feature = "smoltcp")]
 #[inline]
 fn netpoll_drain_step() {
@@ -2073,6 +2087,12 @@ static NETPOLL_WAKE_PENDING: core::sync::atomic::AtomicBool =
 /// See `docs/archive/AKUMA_NET_ISSUES.md` §6.2/§9 for why broadcasting beats a
 /// targeted wake, and `docs/archive/LOOPBACK_RING_CONVERSION.md` for the
 /// loopback ringer.
+/// Rump-only builds have no smoltcp netpoll to wake and no loopback ring to
+/// ring it from, so the doorbell is a no-op. `NetRuntime::wake_netpoll` is not
+/// an optional field, so it still needs something to point at.
+#[cfg(not(feature = "smoltcp"))]
+fn ring_netpoll_doorbell() {}
+
 #[cfg(feature = "smoltcp")]
 fn ring_netpoll_doorbell() {
     #[cfg(kernel_smp_shared)]

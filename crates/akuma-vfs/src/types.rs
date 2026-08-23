@@ -146,6 +146,19 @@ pub trait Filesystem: Send + Sync {
         Err(FsError::NotSupported)
     }
 
+    /// Create a zero-length socket node (`S_IFSOCK`) — the filesystem presence
+    /// of an AF_UNIX `bind(2)` on a pathname.
+    ///
+    /// Defaults to `NotSupported` so a filesystem that cannot represent the
+    /// type says so, rather than silently creating a regular file. That
+    /// substitution is exactly the bug this method exists to fix: `stat`
+    /// reported `S_IFREG`, and a client checking `S_ISSOCK` before connecting
+    /// refused to talk to a working socket
+    /// (`docs/archive/UNIX_SOCKET_IMPROVEMENTS.md` G7).
+    fn create_socket_node(&self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
     fn read_symlink(&self, _path: &str) -> Result<String, FsError> {
         Err(FsError::NotFound)
     }

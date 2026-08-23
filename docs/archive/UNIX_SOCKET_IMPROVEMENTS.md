@@ -1,12 +1,117 @@
 # AF_UNIX on Akuma: what exists, what is missing, and how to build the rest (2026-08-23)
 
-**Status: research + design. Nothing in this document has been implemented.**
-It is an audit of the AF_UNIX surface Akuma has today (a `socketpair`
+**Status: Phases 0-3 IMPLEMENTED and verified on three build targets
+(2026-08-23). Phase 4 (`SCM_RIGHTS`) and Phase 5 (introspection, size gate)
+are open.** Sections 1-8 below are the original audit and plan, kept verbatim;
+what actually landed, what the plan got wrong, and the five defects the probe
+found are in § 0 immediately below.
+
+This document was an audit of the AF_UNIX surface Akuma had (a `socketpair`
 shim and nothing else), a gap list against what real workloads call, a phased
 implementation plan with the host-testable seam named, and the two verification
-harnesses the plan is written against: `cargo test -p akuma-net` for the pure
+harnesses the plan was written against: `cargo test -p akuma-net` for the pure
 state machine and a fifth `userspace/nettest` probe — `nettest-unix` — that runs
 the same binary on Akuma and on Linux so every claim has a control arm.
+
+---
+
+## 0. Outcome
+
+### What landed
+
+| Piece | Where |
+|---|---|
+| The pure state machine — codec, name table, rendezvous, framing, shutdown, credentials, datagram resolution | `crates/akuma-net/src/unix.rs`, **un-gated** on `smoltcp` |
+| 101 host tests for it | `crates/akuma-net/src/unix_tests.rs` (`cargo test -p akuma-net`: 138 total) |
+| Kernel half — the one table, user-pointer copies, pipes, parking | `src/syscall/unixsock.rs` |
+| `socket`/`bind`/`listen`/`accept`/`accept4`/`connect`/`getsockname`/`getpeername`/`shutdown`/`getsockopt`/`setsockopt`/`recvmsg` dispatched **unconditionally** via `net::dispatch_*` | `src/syscall/net.rs`, `src/syscall/mod.rs` |
+| `S_IFSOCK` + `EXT2_FT_SOCK` + `create_socket_node` | `crates/akuma-ext2/src/ext2.rs`, `crates/akuma-vfs/src/types.rs`, `src/vfs/mod.rs` (5 host tests) |
+| Listener readiness (`EPOLLIN` on a non-empty backlog) | `src/syscall/poll.rs` |
+| AF_UNIX bypasses the rump proxy entirely | `src/rump_proxy.rs` |
+| 10 boot self-tests | `src/process_tests.rs` |
+| The probe | `userspace/nettest/rust/unixsock/` → `nettest-unix` |
+
+Phases 0-3 of § 4 are done: the iovec/framing/shutdown/`SO_TYPE`/`MSG_DONTWAIT`
+fixes (Phase 0), the table + abstract namespace (Phase 1), the filesystem
+namespace with real `S_IFSOCK` nodes (Phase 2), and `SOCK_DGRAM` with framing
+(Phase 3). Phase 4 (`SCM_RIGHTS`; `SO_PEERCRED` itself is done) and Phase 5
+(`/proc/net/unix`, the `sc-unix-socket` size gate) are not.
+
+### Verification
+
+`nettest-unix` runs 13 modes. **Linux (the control arm), the default `--release`
+build at `SMP=4`, and the rump-only devbox all agree on 13 of 13** — the only
+difference being `passfd`, which is `OK` on Linux and `UNSUPPORTED` in the guest
+because `SCM_RIGHTS` is Phase 4. Boot suite: 309 `PASSED`, 0 `FAILED` at
+`SMP=1` and `SMP=4`. Host: `cargo test` green across the workspace; `cargo
+clippy --release` reports zero warnings on both feature sets.
+
+### The five defects the probe found
+
+Each was found by *diffing against the Linux control arm*, not by a test written
+in advance — which is the argument for § 6's design:
+
+1. **`SHUT_RD` destroyed already-received data.** Linux returns the buffered
+   bytes and only then reads as EOF; Akuma returned 0 immediately, silently
+   throwing away a complete message the peer had successfully sent. The probe's
+   own assertion was wrong in the same direction, and the Linux arm corrected
+   both.
+2. **`SO_PEERCRED` reported pid 0 on a `socketpair`.** `UnixTable::pair` never
+   set `peer_creds`, so a daemon identifying its peer by pid read 0 for
+   everyone.
+3. **`bind` created a regular file, not a socket node.** `stat` reported
+   `mode=0o100644, S_ISSOCK=false`, so a client that checks `S_ISSOCK` before
+   connecting — the normal thing to do — refused to talk to a working socket.
+   This is G7, and it is why Phase 2 got done rather than deferred.
+4. **AF_UNIX did not work inside a `stack=rump` box at all.** `rump_proxy`
+   intercepts socket-family syscalls and forwards them to NetBSD, whose sysproxy
+   has no AF_UNIX, so `socket(AF_UNIX)` returned `EAFNOSUPPORT`. Fixed by
+   letting AF_UNIX fall through to the native path — a unix socket has no wire
+   and cannot leak onto a network stack, so this does not weaken the proxy's
+   hard-isolation guarantee. `socketpair` was *already* excluded from the proxy
+   on precisely this reasoning; the rest of the family had simply never existed.
+5. **`recvmsg`/`getsockopt`/`setsockopt` answered `ENETDOWN` on the rump build.**
+   § 4's Phase 1 listed the syscalls to un-gate and these three were not among
+   them, so a unix socket got a *network* error for having no network.
+
+### What the plan got wrong
+
+- **The rump-only target did not compile, and had not for some time.** § 7 step 5
+  says to verify on it; that was impossible at `dbe9b998`. Four
+  `#[cfg(feature = "smoltcp")]` gates had been lost — the most consequential in
+  `akuma-net`'s `lib.rs`, where a doc comment and a `pub use` inserted between
+  the attribute and `pub mod smoltcp_net` silently moved the gate onto the
+  re-export. `scripts/build_devbox.sh` failed with 40+ "unlinked crate
+  `smoltcp`" errors. All four are fixed here; none was AF_UNIX-related. The
+  class of mistake is worth remembering: **an attribute attaches to the next
+  item, and a doc comment is an item's attribute**, so anything inserted between
+  a `#[cfg]` and its target relocates the gate instead of failing at the edit.
+- **§ 3.2 said to keep a `Record` per stream write.** That made the plain
+  `SOCK_STREAM` path heap-allocate on its first write (a `VecDeque` push) for
+  metadata no reader consults. Replaced with a `pending_bytes: usize` counter —
+  which also has to exist for *correctness*, not just speed: without it, bytes
+  written **before** an `SCM_RIGHTS` message leave no trace, so a reader draining
+  only those bytes would pop the fd-carrying record and receive descriptors it
+  had not been told about.
+- **§ 4 Phase 1 under-counted the syscalls to un-gate** — see defect 5.
+- **§ 3.4's `SCM_RIGHTS` teardown accounting exists but is unreachable.** The
+  `Record::anc_fds` plumbing, `detach_channel`'s return value and the
+  `unix_channel_detach` call site are all in place, with `debug_assert!`s that
+  fire if descriptors ever appear before the close path is wired. Phase 4 is a
+  smaller job than § 4 implies because of it.
+
+### Known limitations, stated rather than hidden
+
+- **`SO_PEERCRED.uid`/`.gid` are 0 for every process**, because this kernel has
+  no per-process uid (`getuid` hardcodes 0). Anything security-relevant must
+  **not** gate on the uid; `pid` is real. The capture path is written so that
+  adding real uids is a one-line change.
+- **`SCM_RIGHTS` is not implemented** — `recvmsg` reports no ancillary data.
+- **`DirEntry` has no socket flag**, so a directory *listing* does not
+  distinguish a socket node; `stat` does, and that is what `ls -l` and every
+  client actually use.
+- **No `sc-unix-socket` feature yet**, so the `extreme-size` 4 MB floor pays for
+  the whole family. Phase 5.
 
 > ### The one-line summary
 >

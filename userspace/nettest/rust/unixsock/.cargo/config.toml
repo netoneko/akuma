@@ -1,0 +1,17 @@
+# Load-bearing, same reason as ../connect/.cargo/config.toml: cargo walks UP
+# from the crate directory, so without this the probe inherits
+# `../.cargo/config.toml` (the curl probe's `aarch64-alpine-linux-musl`, which
+# only exists inside its Alpine container) and above that the repo root's
+# `aarch64-unknown-none` (the no_std kernel target, which has no `std`).
+#
+# `-static` matters more here than for the sibling probes. An AF_UNIX probe is
+# entirely self-contained — no server, no network, no peer to blame — so the
+# only way to tell a kernel bug from a probe bug is to run the IDENTICAL file
+# under Docker Linux as a control arm. A dynamically-linked binary would not be
+# the identical file on both.
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "link-arg=-static"]

@@ -301,6 +301,101 @@ fn create_and_read_symlink() {
     assert!(fs.exists("/link.txt"));
 }
 
+// ── AF_UNIX socket nodes (S_IFSOCK) ─────────────────────────────────
+
+/// A socket node must `stat` as `S_IFSOCK` (0o14xxxx), not as a regular file.
+///
+/// **The type bits are the entire reason this node exists.** A client connecting
+/// to a unix socket `stat`s the path and checks `S_ISSOCK` first; before this,
+/// `bind` created an ordinary file, `stat` reported `S_IFREG`, and a conformant
+/// client refused to connect to a socket that was working perfectly. Found by
+/// `nettest-unix path` against its Linux control arm, which reported
+/// `mode=0o100644 S_ISSOCK=false`.
+#[test]
+fn socket_node_stats_as_ifsock() {
+    let fs = mount_empty();
+    fs.create_socket_node("/probe.sock").unwrap();
+    let md = fs.metadata("/probe.sock").unwrap();
+    assert_eq!(
+        md.mode & 0xF000,
+        0xC000,
+        "socket node reports mode 0o{:o}, not S_IFSOCK — a client checking S_ISSOCK will refuse to connect",
+        md.mode
+    );
+    assert!(!md.is_dir);
+    assert_eq!(md.size, 0, "a socket node holds no data");
+}
+
+/// `bind` on a path that already exists must fail, and the error has to be
+/// `AlreadyExists` specifically: AF_UNIX maps it to `EADDRINUSE`, which is what
+/// tells a daemon it must `unlink` a stale node before it can restart. Silently
+/// reusing the node would let two daemons believe they own the same path.
+#[test]
+fn socket_node_on_existing_path_is_already_exists() {
+    let fs = mount_empty();
+    fs.write_file("/taken", b"x").unwrap();
+    assert!(matches!(
+        fs.create_socket_node("/taken"),
+        Err(akuma_vfs::FsError::AlreadyExists)
+    ));
+    fs.create_socket_node("/s.sock").unwrap();
+    assert!(matches!(
+        fs.create_socket_node("/s.sock"),
+        Err(akuma_vfs::FsError::AlreadyExists)
+    ));
+}
+
+/// A daemon must be able to unlink its own stale node and rebind.
+///
+/// `remove_file` rejects directories; a socket node is not one, but it is also
+/// not a regular file, so this asserts the type check does not sweep it up. If
+/// unlink refused, a crashed daemon could never restart — the node would sit
+/// there forever making every `bind` fail.
+#[test]
+fn socket_node_can_be_unlinked_and_recreated() {
+    let fs = mount_empty();
+    fs.create_socket_node("/s.sock").unwrap();
+    fs.remove_file("/s.sock").unwrap();
+    assert!(!fs.exists("/s.sock"));
+    fs.create_socket_node("/s.sock").unwrap();
+    assert_eq!(fs.metadata("/s.sock").unwrap().mode & 0xF000, 0xC000);
+}
+
+/// A socket node lives in a directory like anything else, and creating one must
+/// not corrupt the directory it goes into — the `EXT2_FT_SOCK` dirent type byte
+/// is new, and an unrecognised type byte is how a directory parse goes wrong.
+#[test]
+fn socket_node_in_a_subdirectory_leaves_the_directory_readable() {
+    let fs = mount_empty();
+    fs.create_dir("/run").unwrap();
+    fs.write_file("/run/before.txt", b"a").unwrap();
+    fs.create_socket_node("/run/app.sock").unwrap();
+    fs.write_file("/run/after.txt", b"b").unwrap();
+
+    let names: Vec<_> = fs.read_dir("/run").unwrap().into_iter().map(|e| e.name).collect();
+    assert!(names.iter().any(|n| n == "app.sock"), "socket node missing from listing: {names:?}");
+    assert!(names.iter().any(|n| n == "before.txt"));
+    assert!(names.iter().any(|n| n == "after.txt"), "entries after the socket node were lost");
+    // And the neighbours still read back correctly.
+    assert_eq!(fs.read_file("/run/before.txt").unwrap(), b"a");
+    assert_eq!(fs.read_file("/run/after.txt").unwrap(), b"b");
+}
+
+/// The node is not a file and must not be readable as one — it holds nothing,
+/// and a caller that manages to `read` it is reading whatever the inode's block
+/// pointers happen to contain.
+#[test]
+fn socket_node_is_not_a_regular_file() {
+    let fs = mount_empty();
+    fs.create_socket_node("/s.sock").unwrap();
+    let md = fs.metadata("/s.sock").unwrap();
+    assert_ne!(md.mode & 0xF000, 0x8000, "socket node claims to be S_IFREG");
+    // Whatever read_file does with it, it must not hand back data.
+    if let Ok(data) = fs.read_file("/s.sock") {
+        assert!(data.is_empty(), "read a socket node and got {} bytes", data.len());
+    }
+}
+
 #[test]
 fn populated_image_has_symlink() {
     let fs = mount_populated();

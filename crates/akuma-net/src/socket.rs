@@ -431,6 +431,16 @@ pub fn wait_until_for_boot_test(
     wait_until(idx, condition, timeout_us)
 }
 
+/// Park a waker on a native (smoltcp) socket, so `wake_all` can reach it.
+///
+/// `smoltcp`-gated because everything it touches is: `Waker` is imported under
+/// that gate, and `with_table` is the smoltcp socket table. It was ungated,
+/// which was invisible for as long as nothing built without smoltcp — the
+/// rump-only devbox target had been failing to compile before this, on a
+/// separate lost gate in `lib.rs`, so this one never got the chance to be
+/// reported. Both callers (`src/syscall/poll.rs`'s `FileDescriptor::Socket` arm
+/// and `wait_until` below) are themselves smoltcp-only.
+#[cfg(feature = "smoltcp")]
 pub fn socket_add_waker(idx: usize, waker: Waker) {
     with_table(|table| {
         if let Some(Some(sock)) = table.get(idx) {

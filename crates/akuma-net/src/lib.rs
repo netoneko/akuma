@@ -4,17 +4,33 @@
 extern crate alloc;
 
 pub mod runtime;
-// The native smoltcp stack + the smoltcp-coupled protocol modules. Optional so a
-// rump-only build (devbox) compiles them out; the rump path below is smoltcp-free.
-#[cfg(feature = "smoltcp")]
 /// Re-exported so `crate::safe_print!(…)` resolves here as it does in
 /// `akuma-virtio`. This crate prints with `safe_print!` rather than `log::`:
 /// the `log` dependency exists for **smoltcp**, and it is deliberately built
 /// with `max_level_off` so smoltcp's per-packet tracing compiles out entirely.
 /// Routing our own messages through the same facade would either resurrect that
 /// tracing or make our messages disappear with it.
+///
+/// Unconditional. It used to carry `#[cfg(feature = "smoltcp")]`, which is what
+/// separated that attribute from the module below — see there.
 pub use akuma_primitives::safe_print;
 
+// The native smoltcp stack + the smoltcp-coupled protocol modules. Optional so a
+// rump-only build (devbox) compiles them out; the rump path below is smoltcp-free.
+//
+// **This gate was lost and the rump-only build could not compile.** The
+// `#[cfg(feature = "smoltcp")]` that belongs here had drifted upwards: a doc
+// comment and the `pub use` above were inserted between the attribute and this
+// `mod`, so the attribute silently started gating the re-export instead, and
+// `smoltcp_net.rs` — which is nothing but smoltcp types — was compiled
+// unconditionally. `scripts/build_devbox.sh` then failed with 40+
+// "unresolved module or unlinked crate `smoltcp`" errors.
+//
+// The class of mistake is worth naming: an attribute attaches to the next item,
+// and a doc comment IS an item's attribute, so anything inserted between a
+// `#[cfg]` and its target moves the gate rather than breaking the build at the
+// point of the edit. Keep the attribute adjacent to `pub mod`.
+#[cfg(feature = "smoltcp")]
 pub mod smoltcp_net;
 // Static RX/TX frame rings backing the async transmit path. Only meaningful
 // with the smoltcp device, and only compiled when `net-noalloc` selects it.

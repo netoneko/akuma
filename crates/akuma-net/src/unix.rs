@@ -914,6 +914,78 @@ impl UnixTable {
         Ok(ConnectOutcome::Queued { listener: target, server_sock })
     }
 
+    /// Resolve a `sendto` destination name to the socket that owns it and the
+    /// pipe carrying its receive queue.
+    ///
+    /// # Why a datagram socket has ONE queue, not a pipe per peer
+    ///
+    /// A `SOCK_DGRAM` socket is written to by anyone who knows its name, with no
+    /// rendezvous and no per-peer state — that is the whole point of the type,
+    /// and it is what `/dev/log` relies on (musl's `syslog(3)` is a connect and
+    /// a send, from every process on the system). Modelling it as a pipe pair
+    /// per sender would mean allocating two pipes on every first send from a new
+    /// peer, and a receiver would then have to poll all of them. Linux gives
+    /// each socket a single receive queue and so does this: the destination's
+    /// `rx` pipe *is* its queue, and a sender writes one record into it.
+    ///
+    /// The errnos are the ones a sender can act on:
+    ///
+    /// - no socket bound to the name → `ECONNREFUSED` (a stale node, or a
+    ///   syslogd that is not running), never a hang.
+    /// - bound, but not a datagram socket → `EPROTOTYPE`: the name exists and
+    ///   belongs to something, but sending a datagram at a stream listener
+    ///   would put bytes into a queue framed by different rules.
+    pub fn resolve_dgram_dest(&self, name: &UnixName) -> Result<(u32, u32), i32> {
+        if *name == UnixName::Unnamed {
+            return Err(libc_errno::EDESTADDRREQ);
+        }
+        let target = *self.names.get(name).ok_or(libc_errno::ECONNREFUSED)?;
+        let s = self.socks.get(&target).ok_or(libc_errno::ECONNREFUSED)?;
+        if s.ty != SockType::Dgram {
+            return Err(libc_errno::EPROTOTYPE);
+        }
+        if s.rx == 0 {
+            // A datagram socket without a queue cannot receive. Reported as
+            // refused rather than as a kernel error: from the sender's side it
+            // is indistinguishable from nothing being there.
+            return Err(libc_errno::ECONNREFUSED);
+        }
+        Ok((target, s.rx))
+    }
+
+    /// The receive queue of this socket's recorded default peer — where a
+    /// `send(2)` (no destination) on a *connected* datagram socket goes.
+    ///
+    /// `EDESTADDRREQ` when there is no default peer, which is precisely what
+    /// `send` on an unconnected datagram socket must report: the call is
+    /// missing the address, not broken.
+    pub fn dgram_default_dest(&self, id: u32) -> Result<u32, i32> {
+        let s = self.socks.get(&id).ok_or(libc_errno::EBADF)?;
+        let peer = s.peer.ok_or(libc_errno::EDESTADDRREQ)?;
+        let t = self.socks.get(&peer).ok_or(libc_errno::ECONNREFUSED)?;
+        if t.rx == 0 {
+            return Err(libc_errno::ECONNREFUSED);
+        }
+        Ok(t.rx)
+    }
+
+    /// Give a datagram socket its receive queue.
+    ///
+    /// Both `rx` and `tx` are set to the same pipe id, and `tx` is **not** a
+    /// send path for this type — every datagram send resolves its destination
+    /// fresh. The duplication exists so the fd teardown path stays uniform:
+    /// closing a `UnixSocket` fd does `pipe_close_read(rx)` and
+    /// `pipe_close_write(tx)`, so a queue recorded only in `rx` would keep
+    /// `write_count == 1` forever and the pipe would never be destroyed — a leak
+    /// of one pipe per datagram socket, with nothing to point at it.
+    pub fn attach_dgram_queue(&mut self, id: u32, queue: u32) {
+        self.channels.entry(queue).or_default();
+        if let Some(s) = self.socks.get_mut(&id) {
+            s.rx = queue;
+            s.tx = queue;
+        }
+    }
+
     /// `accept(2)`: claim the oldest queued connection.
     ///
     /// `EINVAL` if the socket is not listening, `EAGAIN` if the backlog is
@@ -937,17 +1009,31 @@ impl UnixTable {
     pub fn pair(&mut self, a: u32, b: u32, a_rx: u32, a_tx: u32) {
         self.channels.entry(a_rx).or_default();
         self.channels.entry(a_tx).or_default();
+        // Both ends of a `socketpair` belong to the same process, so each one's
+        // peer credentials are its own. Leaving `peer_creds` at its default made
+        // `SO_PEERCRED` report **pid 0** on a socketpair — found by
+        // `nettest-unix peercred` diffing against the Linux arm, which reports
+        // the calling process. A daemon identifying its peer by pid would have
+        // read 0 for everyone.
+        let a_creds = self.socks.get(&a).map(|s| s.creds);
+        let b_creds = self.socks.get(&b).map(|s| s.creds);
         if let Some(s) = self.socks.get_mut(&a) {
             s.rx = a_rx;
             s.tx = a_tx;
             s.peer = Some(b);
             s.state = SockState::Connected;
+            if let Some(c) = b_creds {
+                s.peer_creds = c;
+            }
         }
         if let Some(s) = self.socks.get_mut(&b) {
             s.rx = a_tx;
             s.tx = a_rx;
             s.peer = Some(a);
             s.state = SockState::Connected;
+            if let Some(c) = a_creds {
+                s.peer_creds = c;
+            }
         }
     }
 

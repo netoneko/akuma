@@ -177,7 +177,7 @@ fn read_sockaddr(addr_ptr: u64, addrlen: usize) -> Result<UnixName, u64> {
     if copy_from_user(&mut raw[..len], addr_ptr).is_err() {
         return Err(EFAULT);
     }
-    SockAddrUn::decode(&raw[..len]).map_err(|e| neg_errno(e))
+    SockAddrUn::decode(&raw[..len]).map_err(neg_errno)
 }
 
 /// Write a name back out as `sockaddr_un` + `addrlen`, truncating to the
@@ -331,7 +331,18 @@ pub fn sys_socket_unix(sock_type: i32, cloexec: bool, nonblock: bool) -> u64 {
     };
     let creds = current_creds();
     let sock = with_table(|t| t.alloc(ty, creds));
-    let fd = proc.alloc_fd(FileDescriptor::UnixSocket { rx: 0, tx: 0, sock });
+    // A datagram socket gets its receive queue right away, not at `bind`.
+    // Anyone who learns its name can send to it, and it must also be able to
+    // receive a *reply* while still unbound — which is what a `syslog(3)`-style
+    // client does. Creating the queue at bind time would silently drop those.
+    let (rx, tx) = if ty == SockType::Dgram {
+        let q = super::pipe::pipe_create();
+        with_table(|t| t.attach_dgram_queue(sock, q));
+        (q, q)
+    } else {
+        (0, 0)
+    };
+    let fd = proc.alloc_fd(FileDescriptor::UnixSocket { rx, tx, sock });
     if cloexec {
         proc.set_cloexec(fd);
     }
@@ -395,10 +406,10 @@ pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> u64 {
     if let Err(e) = with_table(|t| t.bind(sock, name.clone())) {
         return neg_errno(e);
     }
-    if let Some(path) = name.path_bytes() {
-        if let Ok(p) = core::str::from_utf8(path) {
-            create_socket_node(p);
-        }
+    if let Some(path) = name.path_bytes()
+        && let Ok(p) = core::str::from_utf8(path)
+    {
+        create_socket_node(p);
     }
     if let Some(path) = name.path_bytes() {
         crate::safe_print!(
@@ -413,26 +424,27 @@ pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> u64 {
     0
 }
 
-/// Create the filesystem presence for a pathname bind.
+/// Create the filesystem presence for a pathname bind: a real `S_IFSOCK` node.
 ///
-/// Akuma has no `mknod` and no `S_IFSOCK` in its ext2 layer
-/// (`docs/archive/UNIX_SOCKET_IMPROVEMENTS.md` G7), so this creates an ordinary
-/// empty file as the node. That is a **known divergence**, stated here rather
-/// than hidden: `stat()` on a bound socket path reports `S_IFREG`, so a client
-/// that checks `S_ISSOCK` before connecting will refuse to. `unlink`, `ls` and
-/// "does the path exist" all behave, which is what a daemon's own restart logic
-/// uses. Closing the gap needs the ext2 type bits, which is Phase 2 of the
-/// plan; the name table — not the node type — is what `connect` resolves
-/// against, so AF_UNIX itself works either way.
+/// The type bits are the point. An earlier version created an ordinary empty
+/// file, and `nettest-unix path` — diffing against its Linux control arm —
+/// reported `mode=0o100644 S_ISSOCK=false`: a client that checks `S_ISSOCK`
+/// before connecting, which is the normal thing to do, would refuse to talk to
+/// a socket that was working perfectly.
+///
+/// A failure here is logged and **not** propagated. The name is already claimed
+/// in the table at this point, and `connect` resolves against that table rather
+/// than against the inode, so the socket works either way — a rootfs that
+/// cannot make the node (read-only, or a filesystem without the type) should
+/// not turn a working `bind` into a failure. What it does cost is the userspace
+/// conventions: `stat`, `unlink` and `ls` will not see the path.
 fn create_socket_node(path: &str) {
-    match crate::fs::write_file(path, &[]) {
-        Ok(()) => {}
-        Err(_) => {
-            crate::safe_print!(
-                96,
-                "[unix] bind: node create failed (name still bound)\n"
-            );
-        }
+    if let Err(e) = crate::vfs::create_socket_node(path) {
+        let _ = e;
+        crate::safe_print!(
+            112,
+            "[unix] bind: S_IFSOCK node create failed (name is still bound)\n"
+        );
     }
 }
 
@@ -724,16 +736,14 @@ pub fn listener_ready(fd: u32, tid: Option<usize>) -> Option<bool> {
         }
         Some(s.accept_ready())
     })?;
-    if !ready {
-        if let Some(tid) = tid {
-            crate::irq::with_irqs_disabled(|| {
-                ACCEPT_WAITERS
-                    .lock()
-                    .entry(sock)
-                    .or_default()
-                    .insert(tid, wake_handle_for_thread(tid));
-            });
-        }
+    if !ready && let Some(tid) = tid {
+        crate::irq::with_irqs_disabled(|| {
+            ACCEPT_WAITERS
+                .lock()
+                .entry(sock)
+                .or_default()
+                .insert(tid, wake_handle_for_thread(tid));
+        });
     }
     Some(ready)
 }
@@ -767,6 +777,12 @@ pub fn unix_send(fd: u32, data: &[u8], dontwait: bool) -> u64 {
         Some(v) => v,
         None => return EBADF,
     };
+    // A datagram socket's `tx` is its OWN receive queue, not a send path (see
+    // `UnixTable::attach_dgram_queue`) — writing through it here would deliver
+    // the caller's message back to itself. Route to the recorded peer instead.
+    if ty == SockType::Dgram {
+        return unix_sendto(fd, data, None, dontwait);
+    }
     if wr_shut {
         // Linux also raises SIGPIPE here; `pipe_write` does that for the
         // broken-pipe case, and a local SHUT_WR is the caller's own doing, so
@@ -822,6 +838,111 @@ pub fn unix_send(fd: u32, data: &[u8], dontwait: bool) -> u64 {
     }
 }
 
+/// Send a datagram to an explicit destination name — `sendto(2)` on a
+/// `SOCK_DGRAM` socket.
+///
+/// This is the path `/dev/log` uses, and the reason it is separate from
+/// [`unix_send`]: a datagram socket has no `tx` peer to write through. The
+/// destination is resolved per call, so an unconnected socket can address a
+/// different name every time, and a receiver that restarts is picked up by the
+/// next send rather than leaving the sender wired to a dead endpoint.
+pub fn unix_sendto(fd: u32, data: &[u8], dest: Option<&UnixName>, dontwait: bool) -> u64 {
+    let Some((_, _, sock)) = fd_parts(fd) else {
+        return ENOTSOCK;
+    };
+    // `sock == 0` is a pre-table pipe pair — box 0's rump sysproxy channel,
+    // which reaches this function through `sendto`/`sendmsg` on its fd 3.
+    // `unix_send` has the raw-pipe fallback for it. Returning an error here
+    // instead would break the rump handshake, and the symptom would be "box 0's
+    // rump stack never comes up", several layers away from anything that looks
+    // like socket code.
+    if sock == 0 {
+        return unix_send(fd, data, dontwait);
+    }
+    let Some(ty) = with_table(|t| t.get(sock).map(|s| s.ty)) else {
+        return EBADF;
+    };
+    if ty != SockType::Dgram {
+        // A connection-oriented socket ignores any destination and sends to its
+        // peer, which is what Linux does for a connected socket.
+        return unix_send(fd, data, dontwait);
+    }
+    // Resolve the queue on every call. A destination that goes away between two
+    // sends must fail the second one, not the first.
+    let queue = match dest {
+        Some(name) => match with_table(|t| t.resolve_dgram_dest(name)) {
+            Ok((_, q)) => q,
+            Err(e) => return neg_errno(e),
+        },
+        None => match with_table(|t| t.dgram_default_dest(sock)) {
+            Ok(q) => q,
+            Err(e) => return neg_errno(e),
+        },
+    };
+    let nonblock = dontwait || super::net::fd_is_nonblock(fd);
+    deliver_datagram(queue, data, nonblock)
+}
+
+/// Put one whole datagram on `queue`, all-or-nothing.
+///
+/// A datagram is never split: [`plan_write`] refuses a partial one because
+/// there is no way to record "two thirds of a message", and the next boundary
+/// would then be wrong by the shortfall for the rest of the channel's life.
+fn deliver_datagram(queue: u32, data: &[u8], nonblock: bool) -> u64 {
+    loop {
+        let room = super::pipe::PIPE_CAPACITY
+            .saturating_sub(super::pipe::pipe_bytes_available(queue));
+        let sndbuf = with_table(|t| t.channel(queue).map_or(unix::DEFAULT_SNDBUF, |c| c.sndbuf));
+        match plan_write(SockType::Dgram, data.len(), room, sndbuf) {
+            Ok(plan) => {
+                // A zero-length datagram writes nothing but is still a real,
+                // deliverable message — the record is what carries it.
+                let written = if plan.bytes == 0 {
+                    0
+                } else {
+                    match super::pipe::pipe_write(queue, &data[..plan.bytes]) {
+                        Ok(n) => n,
+                        Err(e) => return neg_errno(e),
+                    }
+                };
+                if written != plan.bytes {
+                    crate::safe_print!(
+                        128,
+                        "[unix] DGRAM DESYNC queue={} want={} wrote={}\n",
+                        queue,
+                        plan.bytes,
+                        written
+                    );
+                }
+                with_table(|t| t.commit_write(queue, written, true, Vec::new()));
+                return plan.bytes as u64;
+            }
+            Err(e) if e == libc_errno::EAGAIN => {
+                if nonblock {
+                    return EAGAIN;
+                }
+                let tid = akuma_exec::threading::current_thread_id();
+                if !super::pipe::pipe_check_set_writer(queue, tid) {
+                    akuma_exec::threading::schedule_blocking(u64::MAX);
+                }
+            }
+            Err(e) => return neg_errno(e),
+        }
+    }
+}
+
+/// Decode a `sendto` destination address, if the caller supplied one.
+///
+/// `Ok(None)` means "no destination given", which for a connected socket is
+/// normal and for an unconnected datagram socket becomes `EDESTADDRREQ` further
+/// down — a distinction the caller must not collapse.
+pub fn read_dest(addr_ptr: u64, addrlen: usize) -> Result<Option<UnixName>, u64> {
+    if addr_ptr == 0 || addrlen == 0 {
+        return Ok(None);
+    }
+    read_sockaddr(addr_ptr, addrlen).map(Some)
+}
+
 /// Write to a pipe honouring `O_NONBLOCK`, for the no-table-entry path.
 fn pipe_write_bytes(tx: u32, data: &[u8], nonblock: bool) -> u64 {
     if data.is_empty() {
@@ -864,11 +985,18 @@ pub fn unix_recv(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u64, b
         Some(v) => v,
         None => return (EBADF, false),
     };
-    // A local SHUT_RD means "I will not read any more": report EOF rather than
-    // draining bytes the caller has declared it does not want.
-    if rd_shut {
-        return (0, false);
-    }
+    // `SHUT_RD` does **not** discard what has already arrived.
+    //
+    // Verified against Linux with `nettest-unix shutdown`: after
+    // `shutdown(SHUT_RD)` a socket with 6 buffered bytes still returns those 6
+    // bytes, and only then reads as EOF. An earlier version of this function
+    // returned 0 immediately, which silently destroyed data the peer had
+    // already successfully sent — the caller saw a clean EOF and never learned
+    // that a complete message had been thrown away. That divergence is exactly
+    // what the probe's Linux control arm exists to find, and it found it.
+    //
+    // So `SHUT_RD` only changes what happens when the queue is *empty*: EOF
+    // instead of a block.
     let nonblock = dontwait || super::net::fd_is_nonblock(fd);
 
     loop {
@@ -917,11 +1045,12 @@ pub fn unix_recv(fd: u32, buf: &mut [u8], dontwait: bool, peek: bool) -> (u64, b
             with_table(|t| t.commit_read(rx, consumed, plan.consume_record));
             return (taken as u64, plan.truncated);
         }
-        // Nothing queued. EOF only when the peer's write end is truly gone —
-        // "drained" and "at EOF" are different answers, and folding them
-        // together is what made a tokio client park forever on the AF_INET side
+        // Nothing queued. EOF when the peer's write end is truly gone, or when
+        // this end has been shut down for reading — "drained" and "at EOF" are
+        // different answers otherwise, and folding them together is what made a
+        // tokio client park forever on the AF_INET side
         // (docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md).
-        if super::pipe::pipe_hup(rx) {
+        if rd_shut || super::pipe::pipe_hup(rx) {
             return (0, false);
         }
         if nonblock {
@@ -962,12 +1091,18 @@ fn pipe_read_bytes(rx: u32, buf: &mut [u8], nonblock: bool) -> u64 {
 // Introspection
 // ============================================================================
 
-/// `(sockets, names, channels)` — for `/proc` and the boot self-tests.
+/// `(live sockets, bound names)` — the boot self-tests' leak check.
 ///
-/// Exposed because every accumulating leak class in this design (a name left by
-/// a closed listener, an unaccepted server endpoint, a channel outliving its
-/// pipe) is invisible from userspace and shows up only as a drift in these
-/// three numbers.
+/// Exposed because every accumulating leak class in this design is invisible
+/// from userspace and shows up only as a drift in these two numbers: a name left
+/// behind by a closed listener (which makes every later `bind` fail
+/// `EADDRINUSE`, so the service can never restart), and a server endpoint queued
+/// but never accepted.
+///
+/// `kernel_tests`-gated because `test_unix_table_returns_to_baseline` is its
+/// only caller, and `extreme-size` builds with `no-tests` against a 4.0 MB
+/// floor — an ungated accessor there is dead code the linker still has to carry.
+#[cfg(kernel_tests)]
 #[must_use]
 pub fn table_stats() -> (usize, usize) {
     with_table(|t| (t.len(), t.name_count()))

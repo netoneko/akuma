@@ -494,6 +494,7 @@ pub fn run_all_tests() {
     test_unix_table_returns_to_baseline();
     test_unix_listener_polls_readable();
     test_unix_shutdown_wr_delivers_eof();
+    test_unix_dgram_sendto_delivers();
 
     // Test exit_group sibling behavior (Fix 1)
     test_exit_group_does_not_unregister_while_siblings_running();
@@ -11120,6 +11121,95 @@ fn test_unix_shutdown_wr_delivers_eof() {
         crate::safe_print!(128,
             "[Test] unix_shutdown_wr_delivers_eof FAILED: shutdown={} read={} (want 0/0)\n",
             sd as i64, r as i64);
+    }
+}
+
+/// `SOCK_DGRAM`: an unconnected `sendto` reaches a bound datagram socket, and a
+/// zero-length datagram survives the trip.
+///
+/// This is the shape `syslog(3)` uses — connect (or sendto) `/dev/log` and send
+/// one line — so it is the cheapest check that datagram AF_UNIX works for
+/// software people actually wrote. The zero-length case is the subtle half: an
+/// empty datagram is a real message, `recv` returns 0 for it, and 0 also means
+/// EOF, so a kernel that drops the record leaves the receiver waiting forever
+/// for something that was already sent.
+fn test_unix_dgram_sendto_delivers() {
+    use akuma_exec::process::{register_process, register_thread_pid, unregister_process, unregister_thread_pid};
+    use akuma_exec::threading::current_thread_id;
+    use core::sync::atomic::Ordering;
+    const NR_SOCKET: u64 = 198;
+    const NR_BIND: u64 = 200;
+    const NR_SENDTO: u64 = 206;
+    const NR_RECVFROM: u64 = 207;
+    const NR_CLOSE: u64 = 57;
+    const SOCK_DGRAM: u64 = 2;
+    const MSG_DONTWAIT: u64 = 0x40;
+
+    if akuma_exec::process::current_process_shared().is_some() {
+        console::print("[Test] unix_dgram_sendto_delivers SKIP (process already current)\n");
+        return;
+    }
+    let tid = current_thread_id();
+    let pid = 6119;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+    crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+
+    const NAME: &[u8] = b"akuma-dgram-probe";
+    let mut addr = [0u8; 110];
+    addr[0..2].copy_from_slice(&1u16.to_ne_bytes());
+    addr[3..3 + NAME.len()].copy_from_slice(NAME);
+    let addr_ptr = addr.as_ptr() as u64;
+    let addrlen = (3 + NAME.len()) as u64;
+
+    let srv = crate::syscall::handle_syscall(NR_SOCKET, &[1, SOCK_DGRAM, 0, 0, 0, 0]);
+    let bind_ret = crate::syscall::handle_syscall(NR_BIND, &[srv, addr_ptr, addrlen, 0, 0, 0]);
+    let cli = crate::syscall::handle_syscall(NR_SOCKET, &[1, SOCK_DGRAM, 0, 0, 0, 0]);
+
+    let msg = *b"dgram";
+    let sent = crate::syscall::handle_syscall(
+        NR_SENDTO,
+        &[cli, msg.as_ptr() as u64, 5, 0, addr_ptr, addrlen],
+    );
+    let mut buf = [0u8; 32];
+    // MSG_DONTWAIT so a kernel that dropped the datagram fails the test instead
+    // of hanging the boot suite.
+    let got = crate::syscall::handle_syscall(
+        NR_RECVFROM,
+        &[srv, buf.as_mut_ptr() as u64, 32, MSG_DONTWAIT, 0, 0],
+    );
+    let data_ok = sent == 5 && got == 5 && &buf[..5] == b"dgram";
+
+    // A zero-length datagram: sendto returns 0, and recv must return 0 having
+    // CONSUMED the record — not block, and not re-deliver it forever.
+    let zsent = crate::syscall::handle_syscall(
+        NR_SENDTO,
+        &[cli, msg.as_ptr() as u64, 0, 0, addr_ptr, addrlen],
+    );
+    let zgot = crate::syscall::handle_syscall(
+        NR_RECVFROM,
+        &[srv, buf.as_mut_ptr() as u64, 32, MSG_DONTWAIT, 0, 0],
+    );
+    // And the queue must now be empty: a second read reports EAGAIN, proving the
+    // empty record was consumed rather than left in place.
+    let after = crate::syscall::handle_syscall(
+        NR_RECVFROM,
+        &[srv, buf.as_mut_ptr() as u64, 32, MSG_DONTWAIT, 0, 0],
+    );
+    let zero_ok = zsent == 0 && zgot == 0 && (after as i64) == -11; // EAGAIN
+
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[cli, 0, 0, 0, 0, 0]);
+    let _ = crate::syscall::handle_syscall(NR_CLOSE, &[srv, 0, 0, 0, 0, 0]);
+    crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    if bind_ret == 0 && data_ok && zero_ok {
+        console::print("[Test] unix_dgram_sendto_delivers PASSED\n");
+    } else {
+        crate::safe_print!(192,
+            "[Test] unix_dgram_sendto_delivers FAILED: bind={} sent={} got={} zsent={} zgot={} after={}\n",
+            bind_ret as i64, sent as i64, got as i64, zsent as i64, zgot as i64, after as i64);
     }
 }
 

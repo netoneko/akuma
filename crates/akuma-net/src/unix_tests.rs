@@ -953,11 +953,155 @@ mod rendezvous {
 }
 
 // ============================================================================
+// SOCK_DGRAM destination resolution
+// ============================================================================
+
+mod dgram {
+    use super::*;
+
+    fn bound_dgram(t: &mut UnixTable, name: &[u8], queue: u32) -> u32 {
+        let s = t.alloc(SockType::Dgram, creds(1));
+        t.bind(s, UnixName::Abstract(name.to_vec())).unwrap();
+        t.attach_dgram_queue(s, queue);
+        s
+    }
+
+    #[test]
+    fn sendto_resolves_to_the_targets_queue() {
+        let mut t = UnixTable::new();
+        let srv = bound_dgram(&mut t, b"log", 42);
+        let (sock, queue) = t
+            .resolve_dgram_dest(&UnixName::Abstract(b"log".to_vec()))
+            .unwrap();
+        assert_eq!(sock, srv);
+        assert_eq!(queue, 42, "sender did not find the receiver's queue");
+    }
+
+    /// Nothing bound is `ECONNREFUSED`, not a hang and not `ENOENT`. This is
+    /// `syslog(3)` with no syslogd running — the single most common datagram
+    /// case there is, and it must fail fast so the caller's log line is dropped
+    /// rather than its thread parked.
+    #[test]
+    fn sendto_unbound_name_is_econnrefused() {
+        let t = UnixTable::new();
+        assert_eq!(
+            t.resolve_dgram_dest(&UnixName::Path(b"/dev/log".to_vec()))
+                .unwrap_err(),
+            libc_errno::ECONNREFUSED
+        );
+    }
+
+    /// A datagram aimed at a stream socket's name is `EPROTOTYPE`. The name
+    /// exists and belongs to something, but delivering the bytes would put them
+    /// in a queue framed by different rules.
+    #[test]
+    fn sendto_a_stream_socket_is_eprototype() {
+        let mut t = UnixTable::new();
+        let s = t.alloc(SockType::Stream, creds(1));
+        t.bind(s, UnixName::Abstract(b"svc".to_vec())).unwrap();
+        assert_eq!(
+            t.resolve_dgram_dest(&UnixName::Abstract(b"svc".to_vec()))
+                .unwrap_err(),
+            libc_errno::EPROTOTYPE
+        );
+    }
+
+    /// A bound datagram socket with no queue cannot receive, and the sender is
+    /// told "refused" — from its side that is indistinguishable from nothing
+    /// being there, and it is actionable, unlike a kernel-internal error.
+    #[test]
+    fn sendto_a_queueless_socket_is_econnrefused() {
+        let mut t = UnixTable::new();
+        let s = t.alloc(SockType::Dgram, creds(1));
+        t.bind(s, UnixName::Abstract(b"q".to_vec())).unwrap();
+        // No attach_dgram_queue.
+        assert_eq!(
+            t.resolve_dgram_dest(&UnixName::Abstract(b"q".to_vec()))
+                .unwrap_err(),
+            libc_errno::ECONNREFUSED
+        );
+    }
+
+    #[test]
+    fn sendto_unnamed_destination_is_edestaddrreq() {
+        let t = UnixTable::new();
+        assert_eq!(
+            t.resolve_dgram_dest(&UnixName::Unnamed).unwrap_err(),
+            libc_errno::EDESTADDRREQ
+        );
+    }
+
+    /// `send(2)` with no destination on an **unconnected** datagram socket is
+    /// `EDESTADDRREQ`: the call is missing an address, which is a different
+    /// thing from the socket being broken, and a caller can fix it.
+    #[test]
+    fn send_without_a_destination_or_a_peer_is_edestaddrreq() {
+        let mut t = UnixTable::new();
+        let c = t.alloc(SockType::Dgram, creds(2));
+        assert_eq!(t.dgram_default_dest(c).unwrap_err(), libc_errno::EDESTADDRREQ);
+    }
+
+    /// After `connect`, a bare `send` goes to the recorded peer's queue.
+    #[test]
+    fn connected_dgram_send_uses_the_peers_queue() {
+        let mut t = UnixTable::new();
+        bound_dgram(&mut t, b"log", 42);
+        let c = t.alloc(SockType::Dgram, creds(2));
+        t.connect(c, &UnixName::Abstract(b"log".to_vec()), creds(2)).unwrap();
+        assert_eq!(t.dgram_default_dest(c).unwrap(), 42);
+    }
+
+    /// **A datagram socket's `tx` is not a send path.**
+    ///
+    /// Both `rx` and `tx` point at the socket's own single receive queue, purely
+    /// so the fd teardown path stays uniform: closing a `UnixSocket` fd does
+    /// `pipe_close_read(rx)` + `pipe_close_write(tx)`, so a queue recorded only
+    /// in `rx` would keep `write_count == 1` forever and the pipe would never be
+    /// destroyed — one leaked pipe per datagram socket, with nothing pointing at
+    /// it.
+    #[test]
+    fn dgram_queue_is_recorded_in_both_directions_for_teardown() {
+        let mut t = UnixTable::new();
+        let s = t.alloc(SockType::Dgram, creds(1));
+        t.attach_dgram_queue(s, 77);
+        assert_eq!(t.get(s).unwrap().rx, 77);
+        assert_eq!(
+            t.get(s).unwrap().tx,
+            77,
+            "tx unset — pipe_close_write would never run and the queue would leak"
+        );
+        assert!(t.channel(77).is_some(), "no framing metadata for the queue");
+    }
+}
+
+// ============================================================================
 // Credentials
 // ============================================================================
 
 mod credentials {
     use super::*;
+
+    /// Both ends of a `socketpair` report each other's credentials.
+    ///
+    /// They belong to the same process, so this is the calling process's own
+    /// pid. Leaving `peer_creds` at its default made `SO_PEERCRED` answer
+    /// **pid 0** on every socketpair — caught by `nettest-unix peercred`
+    /// against the Linux control arm, not by any test written in advance, which
+    /// is why the probe checks a value it could have taken on trust.
+    #[test]
+    fn socketpair_ends_see_each_others_credentials() {
+        let mut t = UnixTable::new();
+        let a = t.alloc(SockType::Stream, creds(11));
+        let b = t.alloc(SockType::Stream, creds(11));
+        t.pair(a, b, 10, 11);
+        assert_eq!(t.get(a).unwrap().peer_creds, creds(11));
+        assert_eq!(t.get(b).unwrap().peer_creds, creds(11));
+        assert_ne!(
+            t.get(a).unwrap().peer_creds,
+            Ucred::default(),
+            "SO_PEERCRED would report pid 0"
+        );
+    }
 
     /// Captured at **connect**, not at send. A daemon that authorises by uid
     /// must see the uid the client had when it connected; otherwise a client can
