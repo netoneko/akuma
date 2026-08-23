@@ -9,10 +9,14 @@ bundles — none of which are re-derived here — see
 
 > **Stability: B (watch).** Changed 2026-08-11: `mount`/`umount2` are now
 > host-only, and `mount_in_ns` gained a `data` argument and the `overlay`
-> fstype. The open item lives one
-> layer down: `sys_reattach`'s channel delegation is correct at this boundary,
-> but the target thread's wake-up can fail to take effect (see Background) —
-> a scheduler/threading bug, not a validation bug in this file.
+> fstype. **Fixed 2026-08-23:** the reattach input stall (see Background) was
+> never a wake failure — the wake fires correctly. `sys_read`'s stdin loop and
+> `sys_poll_input_event` each captured their `Arc<ProcessChannel>` once before
+> blocking and reused it across the whole wait; `reattach` repoints
+> `Process::channel` to a new `Arc`, which an already-parked read never saw, so
+> it kept draining the abandoned channel forever while new input landed
+> elsewhere. Fixed in `src/syscall/fs.rs`/`src/syscall/term.rs` by
+> re-resolving the channel every loop iteration instead of once outside it.
 
 ## register_box / kill_box
 
@@ -104,8 +108,10 @@ drop its `/` — a box's root can be set once and never removed or redirected.
   for `sys_reattach` (kernel-mediated I/O delegation, replacing `box`'s old
   manual byte-proxy).
 - `archive/KNOWN_ISSUES.md` #4 "`reattach` fails to wake target process" —
-  open: the target thread stays `WAITING` despite an observed wake call,
-  even with the "Sticky Wake" logic in `threading.rs`/`process.rs`.
+  the symptom (target stays unresponsive after reattach) was real but the
+  original diagnosis was wrong: the thread does wake. **Fixed 2026-08-23** —
+  see the Stability note above for the actual cause (a stale channel `Arc`
+  cached across the blocking wait).
 - `archive/BOX_DOCKER_COMPAT.md` — the overlay fstype, the root-swap one-shot,
   and the mount lockdown.
 - `archive/SYSCALL_ERRNO_COMPLIANCE_CHANGES.md` — `sys_reattach`/`sys_kill_box`

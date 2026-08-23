@@ -300,11 +300,11 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
     match fd {
         akuma_exec::process::FileDescriptor::Stdin => {
-            let ch = if let Some(c) = akuma_exec::process::current_channel() { c } else {
+            if akuma_exec::process::current_channel().is_none() {
                 let mut temp = alloc::vec![0u8; count];
                 let Some(proc) = akuma_exec::process::current_process_shared() else { return EBADF };
                 let n = proc.read_stdin(&mut temp);
-                if n > 0 
+                if n > 0
                     && copy_to_user(buf_ptr, &temp[..n]).is_err() {
                         return EFAULT;
                     }
@@ -312,11 +312,26 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     crate::safe_print!(128, "[syscall] read(stdin) fallback returned {}\n", n);
                 }
                 return n as u64;
-            };
+            }
 
             let mut kernel_buf = alloc::vec![0u8; count];
-            
+
             loop {
+                // Re-resolve the channel every iteration rather than reusing the
+                // `ch` captured before the loop: `box grab`/`sys_reattach` can
+                // repoint this process's channel to a new one (e.g. a different
+                // SSH session's) while a read is already parked here. Reusing the
+                // stale `Arc` meant the wake fired correctly (the waker lives on
+                // `terminal_state`, unaffected by reattach) but this loop kept
+                // reading the abandoned old channel, which never receives the
+                // reattached session's input — the reattached process looked
+                // permanently hung despite `write_to_process_stdin` reporting
+                // bytes accepted. See docs/archive/KNOWN_ISSUES.md #4.
+                let ch = match akuma_exec::process::current_channel() {
+                    Some(c) => c,
+                    None => return 0,
+                };
+
                 // `is_pipe` selects raw pass-through (no canonical line
                 // discipline, no echo) over cooked terminal input. A spawned
                 // child whose stdin is a pipe (non-terminal channel — e.g. the

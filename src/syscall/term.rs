@@ -427,6 +427,17 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
         }
 
         bytes_read = loop {
+            // Re-resolve every iteration: `box grab`/`sys_reattach` can repoint
+            // this process's channel to a new one while this wait is already
+            // parked, and the waker (registered once above, on `terminal_state`,
+            // which reattach never touches) fires correctly against the new
+            // input either way. Reusing the `proc_channel` captured before the
+            // loop would keep draining the abandoned old channel forever — same
+            // bug as the `sys_read` stdin loop in `fs.rs`.
+            let proc_channel = match akuma_exec::process::current_channel() {
+                Some(c) => c,
+                None => break 0,
+            };
             let n = proc_channel.read_stdin(&mut kernel_buf);
             if n > 0 {
                 break n;
