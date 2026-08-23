@@ -234,6 +234,8 @@
   /* ── overview: prose + figures left, mark + link right ──────── */
   .split { display: grid; grid-template-columns: 1fr; gap: clamp(1.1rem, 2.8vw, 2.4rem); align-items: start; }
   @media (min-width: 60rem) { .split { grid-template-columns: minmax(0, 1fr) auto; } }
+  /* .even -- both columns carry prose/tables, so neither may size to content */
+  @media (min-width: 60rem) { .split.even { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
   .split .col { display: flex; flex-direction: column; gap: clamp(0.8rem, 1.9vh, 1.4rem); min-width: 0; }
   .mark { display: flex; flex-direction: column; gap: clamp(0.7rem, 1.8vh, 1.1rem); width: clamp(12rem, 22vw, 20rem); max-width: 100%; }
   pre.logo {
@@ -338,7 +340,7 @@
   <section class="slide">
     <div class="num">02</div>
     <div class="body">
-      <p class="eyebrow">622 documented, dated, fixed</p>
+      <p class="eyebrow">680 documented, dated, fixed</p>
       <h2>The checks got <em>cheap too</em></h2>
       <p>More code generated means more code to check. <strong>But the same shift that made
       the code cheap makes the checks cheap</strong> — probes, tripwires, self-tests, boot
@@ -354,33 +356,21 @@
     <div class="num">03</div>
     <div class="body">
       <p class="eyebrow">Act I · the landscape</p>
-      <h2>What it is, and <em>where the bugs were</em></h2>
+      <h2>What is <em>Akuma?</em></h2>
       <div class="split">
         <div class="col">
-          <p><strong>Bare-metal AArch64 kernel in Rust</strong>, <code>no_std</code>, on QEMU virt:
-          preemptive scheduling with shared-kernel SMP, per-process address spaces with demand paging
-	  and CoW fork, dynamic libraries, ext2, <code>smoltcp</code> networking stack, <strong>limited Linux binary compatibility</strong>, runs Docker images like <code>redis:alpine</code>. Comes with <code>apk</code> package manager and Go 1.26.3, Rust and Cargo (stable and nightly),
-          clang / gcc / tcc, git, Bun.</p>
-          <div class="scroller">
-            <table class="dense">
-              <thead><tr><th>subsystem</th><th class="r">fixes</th><th class="r">%</th><th class="r">/kLoC</th></tr></thead>
-              <tbody>
-                <tr><td>Syscall / ABI</td><td class="r">127</td><td class="r">23.7%</td><td class="r">21.4</td></tr>
-                <tr><td>Memory &amp; VM</td><td class="r">112</td><td class="r">20.9%</td><td class="r hot">23.8</td></tr>
-                <tr><td>SMP &amp; Locking</td><td class="r">79</td><td class="r">14.8%</td><td class="r">37.6</td></tr>
-                <tr><td>Scheduler &amp; Process</td><td class="r">75</td><td class="r">14.0%</td><td class="r">7.5</td></tr>
-                <tr><td>Networking</td><td class="r">56</td><td class="r">10.5%</td><td class="r">12.4</td></tr>
-                <tr><td>Containers</td><td class="r">19</td><td class="r">3.6%</td><td class="r">17.1</td></tr>
-                <tr><td>VFS &amp; Filesystem</td><td class="r">15</td><td class="r">2.8%</td><td class="r">3.7</td></tr>
-                <tr><td>Console &amp; Terminal</td><td class="r">15</td><td class="r">2.8%</td><td class="r">16.5</td></tr>
-                <tr><td>Misc / cross-cutting</td><td class="r">14</td><td class="r">2.6%</td><td class="r">50.9</td></tr>
-                <tr><td>Signals &amp; Exceptions</td><td class="r">12</td><td class="r">2.2%</td><td class="r">3.6</td></tr>
-                <tr><td>Boot &amp; Drivers</td><td class="r">11</td><td class="r">2.1%</td><td class="r">3.7</td></tr>
-                <tr class="self"><td><strong>kernel</strong></td><td class="r"><strong>535</strong></td><td class="r">100%</td><td class="r">13.4</td></tr>
-                <tr><td>outside it — apps, toolchain, ssh</td><td class="r">87</td><td class="r">—</td><td class="r">—</td></tr>
-              </tbody>
-            </table>
-          </div>
+          <p><strong>Bare-metal AArch64 kernel in Rust</strong>, <code>no_std</code>:
+          preemptive scheduling with shared-kernel SMP, per-process address spaces with
+          demand paging and CoW fork, dynamic libraries, ext2, <code>smoltcp</code>
+          networking stack, <strong>limited Linux binary compatibility</strong>, runs Docker
+          images like <code>redis:alpine</code>. Comes with <code>apk</code> and Go 1.26.3,
+          Rust and Cargo (stable and nightly), clang / gcc / tcc, git, Bun.</p>
+          <p><strong>Runs on QEMU and AWS</strong>, verified on <code>m6g.metal</code> —
+          Graviton2, 64 cores — under Firecracker v1.16.1 on KVM, answering SSH from across
+          the internet.</p>
+          <p class="pull">A developer oriented operating system inspired by early 2000s
+          experience, with modern tooling. The first program written for Akuma
+          <em class="q">inside Akuma</em> was written by GLM-4.7 on 22 Aug 2026.</p>
         </div>
         <div class="mark">
           <pre class="logo" aria-hidden="true">                      =#=      .-
@@ -399,10 +389,10 @@
                   ::::---#@%%*</pre>
           <p class="link"><a href="https://github.com/netoneko/akuma">github.com/netoneko/akuma</a></p>
           <div class="figs">
-            <div class="fig"><span class="v">39,885</span><span class="k">prod lines</span></div>
-            <div class="fig"><span class="v">27,845</span><span class="k">test lines</span></div>
-            <div class="fig"><span class="v">~140</span><span class="k">linux syscalls</span></div>
-            <div class="fig"><span class="v hot">622</span><span class="k">documented fixes</span></div>
+            <div class="fig"><span class="v">43,700</span><span class="k">prod lines</span></div>
+            <div class="fig"><span class="v">29,302</span><span class="k">test lines</span></div>
+            <div class="fig"><span class="v">~170</span><span class="k">linux syscalls</span></div>
+            <div class="fig"><span class="v hot">680</span><span class="k">documented fixes</span></div>
           </div>
         </div>
       </div>
@@ -422,20 +412,21 @@
             <tr><td>since</td><td>2015</td><td>~2022</td><td>2026</td></tr>
             <tr><td>people</td><td>team + nonprofit</td><td>50+, 3 universities</td><td><strong>1</strong></td></tr>
             <tr><td>funding</td><td>EU NGI grants</td><td>Ant Group + Intel</td><td>none</td></tr>
-            <tr><td>high-water</td><td>COSMIC desktop, packages</td><td><span class="hot">nginx faster than Linux</span>, Firefox, Redis at parity</td><td>Redis + official image, Go, rustc, llama.cpp</td></tr>
-            <tr class="self"><td>builds itself</td><td>not yet</td><td>probably</td><td><strong>yes</strong></td></tr>
+            <tr><td>high-water</td><td>COSMIC desktop, packages</td><td><span class="hot">nginx faster than Linux</span>, Firefox, Redis at parity</td><td>nginx, Redis + official image, Go, rustc, llama.cpp</td></tr>
+            <tr><td>runs on</td><td>real hardware</td><td>QEMU, cloud VMs — <span class="hot">in production at Alibaba Cloud</span></td><td>QEMU · <strong>Graviton2 metal, Firecracker/KVM</strong></td></tr>
+            <tr class="self"><td>builds itself</td><td>not yet</td><td>undocumented</td><td><strong>yes</strong></td></tr>
           </tbody>
         </table>
       </div>
       <p><strong>Asterinas is the one worth studying.</strong> A <em>framekernel</em>: all
       <code>unsafe</code> is confined to one library (OSTD, ~15k lines, <strong>14% of the
       kernel</strong> — about the size of seL4's verified core), so every service above it
-      is written in <strong>100% safe Rust</strong>.</p>
-      <p><strong>And they drew a hard boundary around formal verification.</strong> They verify
-      the tiny TCB for memory safety — tractable at 15k lines — then say memory safety is
-      effectively solved and focus shifts to <em>bugs beyond safety</em>. For those they
-      reach for <strong>model checking and tests</strong>, not proofs. Logic-level
-      verification is explicitly aspirational.</p>
+      is written in <strong>100% safe Rust</strong>. They verify that tiny TCB for memory
+      safety, then reach for <strong>model checking and tests</strong> for everything past
+      it. Logic-level verification is explicitly aspirational.</p>
+      <p class="pull">Measuring against Linux and against them is <em class="q">good
+      practice</em> — a better reference turns "this feels slow" into something to go fix.
+      It is where a lot of this work came from.</p>
     </div>
   </section>
 
@@ -451,7 +442,7 @@
           <tbody>
             <tr><td>Redox</td><td><strong>Banned</strong>, Feb 2026, enforced — LLM-labelled contributions closed on sight; bypassing it is a project ban</td></tr>
             <tr><td>Asterinas</td><td><strong>Welcomed and automated</strong> — <em>"AI is welcome, but the human is responsible"</em>; ships an AI PR-review bot</td></tr>
-            <tr class="self"><td>Akuma</td><td>No policy. Built with AI from the start</td></tr>
+            <tr><td>Akuma</td><td>No policy</td></tr>
           </tbody>
         </table>
       </div>
@@ -466,6 +457,41 @@
   <section class="slide">
     <div class="num">06</div>
     <div class="body">
+      <p class="eyebrow">Act I · the landscape</p>
+      <h2>the bugs</h2>
+      <div class="figs">
+        <div class="fig"><span class="v hot">680</span><span class="k">documented fixes</span></div>
+        <div class="fig"><span class="v">43,700</span><span class="k">prod lines</span></div>
+        <div class="fig"><span class="v">29,302</span><span class="k">test lines</span></div>
+        <div class="fig"><span class="v">340</span><span class="k">investigation docs</span></div>
+      </div>
+      <div class="scroller">
+        <table class="dense">
+          <thead><tr><th>subsystem</th><th class="r">fixes</th><th class="r">%</th><th class="r">/kLoC</th></tr></thead>
+          <tbody>
+            <tr><td>Syscall / ABI</td><td class="r">128</td><td class="r">22.1%</td><td class="r">20.5</td></tr>
+            <tr><td>Memory &amp; VM</td><td class="r">113</td><td class="r">19.5%</td><td class="r hot">23.3</td></tr>
+            <tr><td>SMP &amp; Locking</td><td class="r">86</td><td class="r">14.8%</td><td class="r hot">41.3</td></tr>
+            <tr><td>Scheduler &amp; Process</td><td class="r">76</td><td class="r">13.1%</td><td class="r">6.9</td></tr>
+            <tr><td>Networking</td><td class="r">69</td><td class="r">11.9%</td><td class="r">11.9</td></tr>
+            <tr><td>Boot &amp; Drivers</td><td class="r">23</td><td class="r">4.0%</td><td class="r">6.0</td></tr>
+            <tr><td>Misc / cross-cutting</td><td class="r">22</td><td class="r">3.8%</td><td class="r">58.7</td></tr>
+            <tr><td>Containers</td><td class="r">19</td><td class="r">3.3%</td><td class="r">17.0</td></tr>
+            <tr><td>VFS &amp; Filesystem</td><td class="r">17</td><td class="r">2.9%</td><td class="r">4.2</td></tr>
+            <tr><td>Console &amp; Terminal</td><td class="r">15</td><td class="r">2.6%</td><td class="r">15.6</td></tr>
+            <tr><td>Signals &amp; Exceptions</td><td class="r">12</td><td class="r">2.1%</td><td class="r">3.5</td></tr>
+            <tr class="self"><td><strong>kernel</strong></td><td class="r"><strong>580</strong></td><td class="r">100%</td><td class="r">13.3</td></tr>
+            <tr><td>outside it — apps, toolchain, ssh</td><td class="r">100</td><td class="r">—</td><td class="r">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 07 -->
+  <section class="slide">
+    <div class="num">07</div>
+    <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Have a concrete goal: <em>run X</em></h2>
       <p><strong>Compatibility with X, in order to run X.</strong></p>
@@ -477,6 +503,7 @@
             <tr><td><strong>rust / cargo</strong></td><td><code>MAP_SHARED</code> writeback, 128 KB argv, thread-group reaping, <code>getpriority</code></td></tr>
             <tr><td><strong>golang</strong></td><td>signals on a foreign signal stack, pidfd, <code>waitid</code> parentage, fork/exec</td></tr>
             <tr><td><strong>llama.cpp</strong></td><td>lazy mmap, file-page eviction, heap-growth headroom</td></tr>
+            <tr><td><strong>nginx</strong></td><td>zero new syscalls — then three kernel defects behind <em>"stops answering after enough traffic"</em>: a stubbed <code>shutdown(2)</code>, listener-backlog exhaustion, socket reclaim</td></tr>
           </tbody>
         </table>
       </div>
@@ -485,9 +512,9 @@
     </div>
   </section>
 
-  <!-- 07 -->
+  <!-- 08 -->
   <section class="slide">
-    <div class="num">07</div>
+    <div class="num">08</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Self-hosting: <em>it compiles itself</em></h2>
@@ -499,7 +526,6 @@
         <div class="fig"><span class="v hot">20/20</span><span class="k">clean builds, first try</span></div>
         <div class="fig"><span class="v">107–128 s</span><span class="k">per trial, in-guest</span></div>
         <div class="fig"><span class="v">3.8 MB</span><span class="k">elf · it boots</span></div>
-        <div class="fig"><span class="v">0</span><span class="k">retries needed</span></div>
       </div>
       <p><strong>Almost no hobby operating system gets to self-hosting.</strong> Redox reached <em>running</em> rustc and
       cargo natively in January 2026 — a decade in, on the third attempt — and does not yet
@@ -510,9 +536,9 @@
     </div>
   </section>
 
-  <!-- 08 -->
+  <!-- 09 -->
   <section class="slide">
-    <div class="num">08</div>
+    <div class="num">09</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Audit before touching code</h2>
@@ -530,9 +556,9 @@
     </div>
   </section>
 
-  <!-- 09 -->
+  <!-- 10 -->
   <section class="slide">
-    <div class="num">09</div>
+    <div class="num">10</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Isolate theories with probes, <em>then discredit them</em></h2>
@@ -546,9 +572,9 @@
     </div>
   </section>
 
-  <!-- 10 -->
+  <!-- 11 -->
   <section class="slide">
-    <div class="num">10</div>
+    <div class="num">11</div>
     <div class="body">
       <p class="eyebrow">Act II · the workflow</p>
       <h2>Then A/B it on <em>real workloads</em></h2>
@@ -568,9 +594,9 @@
     </div>
   </section>
 
-  <!-- 11 -->
+  <!-- 12 -->
   <section class="slide">
-    <div class="num">11</div>
+    <div class="num">12</div>
     <div class="body">
       <p class="eyebrow hot">Act III · how it's built</p>
       <h2>AI-assisted development: <span class="hot">build your intuition</span></h2>
@@ -582,7 +608,7 @@
           <tbody>
             <tr><td><code>runbooks/</code></td><td>do X, expect Y — ends in <strong>Verify</strong></td></tr>
             <tr><td><code>reference/</code></td><td>current state only, each page graded <strong>A / B / C</strong> for how far to trust it</td></tr>
-            <tr><td><code>archive/</code></td><td>200+ investigations, verbatim, <strong>never rewritten</strong> — including the wrong theories</td></tr>
+            <tr><td><code>archive/</code></td><td>340 investigations, verbatim, <strong>never rewritten</strong> — including the wrong theories</td></tr>
             <tr><td>agent context</td><td>the standing rules, so they're never re-litigated</td></tr>
           </tbody>
         </table>
@@ -596,25 +622,25 @@
     </div>
   </section>
 
-  <!-- 12 -->
+  <!-- 13 -->
   <section class="slide">
-    <div class="num">12</div>
+    <div class="num">13</div>
     <div class="body">
       <p class="eyebrow hot">Act III · how it's built</p>
       <h2>Learn from history</h2>
-      <p><strong>A full OS development cycle is a surprisingly large dataset.</strong> 1,547
-      commits, 196 investigation docs. What can be mined:</p>
+      <p><strong>A full OS development cycle is a surprisingly large dataset.</strong> 2,009
+      commits, 340 investigation docs. What can be mined:</p>
       <ul>
-        <li><strong>622 distinct fixes</strong> across 15 subsystems, itemised, dated, cross-referenced.</li>
+        <li><strong>680 distinct fixes</strong> across 15 subsystems, itemised, dated, cross-referenced.</li>
         <li><strong>Two crisis windows, from commit volume alone</strong> — an independent churn-per-file measure lands on the same two months.</li>
         <li><strong>Recurring defect types.</strong> ~3% of all fixes are the same underlying bug rediscovered in a different subsystem: stale address-space pointer ×3, lock-held-across-blocking ×4, readiness gaps ×6 across four files. The most-repeated shape: <strong>a raw index outliving the thing it names.</strong></li>
       </ul>
     </div>
   </section>
 
-  <!-- 13 -->
+  <!-- 14 -->
   <section class="slide">
-    <div class="num">13</div>
+    <div class="num">14</div>
     <div class="body">
       <p class="eyebrow hot">Act III · how it's built</p>
       <h2>Clean up after yourself</h2>
@@ -649,9 +675,9 @@
     </div>
   </section>
 
-  <!-- 14 -->
+  <!-- 15 -->
   <section class="slide">
-    <div class="num">14</div>
+    <div class="num">15</div>
     <div class="body">
       <p class="eyebrow hot">Act III · how it's built</p>
       <h2>mood</h2>
@@ -665,14 +691,16 @@
 <span class="d">2026-04-03</span>  why are we here? just to suffer?
 <span class="d">2026-08-06</span>  more tests and fixes, cargo remains undefeated
 <span class="d">2026-08-11</span>  curious case of nothingburger
-<span class="d">2026-08-13</span>  java crossover episode</pre>
+<span class="d">2026-08-13</span>  java crossover episode
+<span class="d">2026-08-21</span>  lmao lost networking but how
+<span class="d">2026-08-21</span>  hell yeah graviton</pre>
       <p class="pull">Time honored Eastern European tradition: curse, complain, then complain some more, still do the job.</p>
     </div>
   </section>
 
-  <!-- 15 -->
+  <!-- 16 -->
   <section class="slide">
-    <div class="num">15</div>
+    <div class="num">16</div>
     <div class="body">
       <p class="eyebrow"><code>go build</code> defeated</p>
       <pre>akuma:~$ apk add go git
@@ -697,6 +725,7 @@ akuma:~$ ./playground
   </section>
 
 </main>
+
 
 <p class="hint"><kbd>↑</kbd> <kbd>↓</kbd> to navigate</p>
 

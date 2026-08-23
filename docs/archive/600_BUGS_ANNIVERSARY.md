@@ -2,13 +2,18 @@
 
 **Kirill Maksimov · 2026-08-17**
 
-**Status:** draft 19. The *content* of a talk plus speaker notes.
+**Status:** draft 20. The *content* of a talk plus speaker notes.
 
 **Rendered deck:** [`bootstrap/public/600-bugs/index.html`](../../bootstrap/public/600-bugs/index.html)
-— 14 slides, keyboard-navigable (↑/↓, Home/End), self-contained apart from
-`lock_in.jpg` beside it. Served at `/600-bugs/`. Served from `bootstrap/public/`, so it is reachable from the
-VM's own httpd. **This file stays the source of truth**: edit the script here, then
-mirror into the HTML.
+— 16 slides, keyboard-navigable (↑/↓, Home/End), self-contained apart from
+`lock_in.jpg` and `slop_factory.jpg` beside it. Served at `/600-bugs/`. Served from
+`bootstrap/public/`, so it is reachable from the VM's own httpd.
+
+> **The HTML is the source of truth, as of draft 20.** Earlier drafts said the
+> reverse and the two drifted anyway: draft 19's markdown was missing slide 15
+> ("Clean up after yourself") entirely, which had been in the rendered deck for two
+> drafts. Edit the HTML, then mirror back into this file. Speaker notes live only
+> here — the HTML has no place for them.
 
 **Subject: the workflow that actually built this thing**, and what AI-assisted
 development looks like in practice.
@@ -16,49 +21,30 @@ development looks like in practice.
 Deliberately **not** a numbers talk. Drafts 1–6 were organised around ten
 "lessons" derived from line counts and bug densities; that framing is dropped —
 the statistics live in [`LINE_COUNT_ANALYSIS.md`](LINE_COUNT_ANALYSIS.md) where
-they belong, and the deck now shows the loop that produced them.
+they belong, and the deck now shows the loop that produced them. Slide 06 is the
+one place the ledger is shown, and it closes Act I rather than opening it.
 
 **Slides carry headlines and evidence, not paragraphs.** If a slide below runs
 past ~8 lines of content it is still too long. The prose under each slide is
 speaker material, not slide text.
 
-### Changes from draft 18
+### Changes from draft 19
+
+Occasioned by six days of work (2026-08-17 → 2026-08-23) that moved enough
+capability to invalidate the deck's own numbers.
 
 | Change | Reason |
 |---|---|
-| **New slide 03 — "What it is, and where the bugs were"**, opening Act I ahead of the peer comparison: a capability paragraph, the line/fix figures, the per-subsystem bug table, the project mark and the GitHub link | Requested. The deck compared itself to Redox and Asterinas without ever saying what it was, and the two ledgers it draws on were never shown. Stats only — the readings stay in speaker notes and `LINE_COUNT_ANALYSIS.md` § Stat 7 |
-| Slides 03–13 renumbered to 04–14 | Consequence of the above. **Prose cross-references in the back-matter were already stale before this change** (they point at draft-7 numbering) and were left alone |
-
-### Changes from draft 17
-
-| Change | Reason |
-|---|---|
-| **All ten "Lesson N" slides deleted** | Per review — retrofitted and weak. The density tables, robustness test and retraction stay in `LINE_COUNT_ANALYSIS.md` § Stat 6 |
-| **Four workflow slides added** (goal → audit → probe → A/B) | Per review. This is the actual method, stated as a loop |
-| **AI-assisted development slide added** | Per review: cognitive docs and project-specific intuition, from [`DEVELOPMENT_PRACTICES_REVIEW_AND_ASSESSMENT.md`](DEVELOPMENT_PRACTICES_REVIEW_AND_ASSESSMENT.md) §3–§4 |
-| **"The records are the product" kept as slide 10**, reframed on how much is minable from one full OS cycle | Per review — the one surviving idea from the lessons draft. Now carries the recurring-defect-shape finding, which is the most actionable thing in the whole archive |
-| **Slide 09 rewritten** — reviewing Claude's diff, a 4.5k-line file, one function; no technical detail, calmer tone | Per review |
-| **"Three things I deleted and had to put back" cut** | Per review. The deck now opens straight into the workflow; the git archaeology stays in this doc's Background note below |
-| **Slide 06's examples removed entirely** — the slide now just makes the case that instrumentation and data-flow tracking always pay off | Per review. The example material stays findable in Background |
-| **Slide 01 reframed** — project credentials dropped; the point is now that more generated code means more checks, and the same shift makes those checks cheap | Per review ("remove glazing") |
-| **Asterinas comparison moved up to slide 02** and expanded — safe Rust, the 14% TCB, and their scoping of formal verification | Per review. It now *sets up* the workflow act instead of trailing it: the best-resourced team in the peer group also reached for practical tools past the part proofs can cover |
-| **Slide 02 renamed "Competitive landscape"; the AI-policy slide moved up to 03** | Per review. Both landscape slides now sit together as Act I, so the deck establishes where it sits and who bans what *before* the method rather than after |
-| Peer group, AI policy, `go build` defeated | Kept per review |
-| Content per slide cut hard throughout | Per review — "way too much content" |
-| **Title set: "AI will write 600 bugs and I will write 600 more"**, subtitle *"at some point you gotta do some real engineering"* | Per review. Slide 01 now leads with it; 622 documented fixes is the number behind it |
-| **Slide 10 renamed "Learn from history"**, the unsubstantiated "almost nobody mines their own" removed, and five real commit messages added | Per review |
-| **"one maintainer" dropped** from the subject line, the AI-policy row and slide 10 | Per review — "no one cares" |
-| **Deck rendered to HTML** and both files renamed `600_BUGS_ANNIVERSARY` | Per review |
-| **Title slide split in two** — 01 is title + subtitle + meme only, 02 carries the "checks got cheap too" argument | Per review. The image needs to land on its own before the argument starts |
-| **The commit-message block became its own slide, 10, titled `mood`** | Per review — eleven lines was too much to share with the docs slide. `mood` is itself one of the commit messages (2026-02-22, ×3) |
-| **Byline added** — Kirill Maksimov · 2026-08-17, on slide 01 and this doc's header | Per review |
-| **Negative framing audited and four instances rewritten** — see § "Negative framing" | Per review |
-| **New slide 06 — self-hosting**, same shape as the `go build` slide: transcript, numbers, and how few Rust OSes get there | Per review |
-| **"Reading the diff" dropped entirely** | Per review |
-| **`mood` moved to 12**, after "Learn from history" | Per review |
-| **Slide 06's transcript replaced** with the real in-guest recipe (`git clone` from GitHub, then `cargo build --release`) and in-guest measurements — 20/20 first try, 107–128 s, 3.8 MB ELF | Per review. The figures I had first were host-shaped, and the ELF size was wrong (4.3 MB) |
-| **Asterinas compiler-hosting claim corrected** to "undocumented, not unlikely" | Per review — with 210+ syscalls, Firefox and QEMU running, a compiler almost certainly works; the distinct claim here is *self-build* |
-| **"That last one is worth more than any single fix"** paragraph cut, and a leftover 5-line commit block removed from slide 11 | Per review |
+| **Every statistic re-measured.** Production lines 39,885 → **43,700**; test lines 27,845 → **29,302** (0.70x → 0.67x); documented fixes 622 → **680** (580 kernel-attributable, was 535); syscalls ~140 → **~170**; commits 1,547 → **2,009**; investigation docs 196 → **340** | Requested. The whole Stat 7 bugs/kLoC join was re-derived in [`LINE_COUNT_ANALYSIS.md`](LINE_COUNT_ANALYSIS.md) against the new line areas and the new bug ledger |
+| **Slide 03 renamed "What is Akuma?"** and reduced to capability only — the line/fix figures and the per-subsystem table moved off it | Per review. It was doing two jobs under a title that promised both and landed neither |
+| **New slide 06, "the bugs"** — the per-subsystem fix table, now closing Act I | Per review. The ledger is a conclusion to the landscape act, not an introduction to it |
+| **Slide 04 reframed**: a `runs on` row added, Asterinas' Alibaba Cloud deployment recorded, and the closing note changed from "they publish throughput numbers and I have none" to the case that measuring against Linux and against them is good practice and a source of direction | Per review. The old caveat was obsolete the moment nginx was benchmarked; the replacement is the reason to keep the comparison rather than a verdict on it |
+| **Slide 05's Akuma row de-emphasised** — no highlight, and the cell reads just "No policy" | Per review |
+| **"0 retries needed" dropped** from the self-hosting figures | Per review |
+| **Slide 15 "Clean up after yourself" added to this file** | It has been in the rendered deck since draft 18 and was never mirrored here — the drift that made the HTML the source of truth |
+| **nginx added to slide 07's "run X" table**, and two new commit messages to `mood` | New material |
+| Slides renumbered throughout: old 06–14 → 07–11, 12–13, 15–16 | Consequence of inserting slide 06. **The back-matter's prose cross-references were already stale before this change** (they point at draft-7 numbering) and are left alone |
+| **A benchmarks / Firecracker slide was drafted and cut** | Per review. The Graviton2 port survives as one line on slide 03; the nginx-vs-Docker and llama.cpp numbers are **not in the deck** and live in [`NGINX_MISSING_SYSCALLS.md`](NGINX_MISSING_SYSCALLS.md), [`AKUMA_NET_ISSUES.md`](AKUMA_NET_ISSUES.md) and [`CROSS_CORE_THREAD_COLLAPSE.md`](CROSS_CORE_THREAD_COLLAPSE.md) |
 
 ---
 
@@ -67,8 +53,9 @@ speaker material, not slide text.
 > **The problem with writing throwaway software is that people don't actually
 > throw away software.**
 
-Fourteen slides. The opener states the trade, Act I places the project, Act II is
-the workflow and what it produced, Act III is how it's built.
+Sixteen slides. The opener states the trade, Act I places the project and closes
+on its own bug ledger, Act II is the workflow and what it produced, Act III is how
+it's built.
 
 **Title:** **AI will write 600 bugs and I will write 600 more**
 **Subtitle:** *at some point you gotta do some real engineering*
@@ -91,7 +78,7 @@ the workflow and what it produced, Act III is how it's built.
 
 ### 02 — The checks got cheap too
 
-**622 documented, dated, fixed.**
+**680 documented, dated, fixed.**
 
 More code generated means more code to check. **But the same shift that made the code
 cheap makes the checks cheap** — probes, tripwires, self-tests, boot suites, A/B runs
@@ -105,57 +92,50 @@ volume it produces has to be met with a matching volume of checking, and fortuna
 that got cheap at the same time and for the same reason. The workflow act is what I
 actually spend the checking budget on.
 
+The number moved from 622 to 680 in six days, which is worth saying out loud if
+anyone asks: that is not a bad week, it is a week where two new subsystems
+(Firecracker, the NIC path) got the same treatment everything else got.
+
 ---
 
 ## Act I — The landscape
 
-### 03 — What it is, and where the bugs were
+### 03 — What is Akuma?
 
-**Bare-metal AArch64 kernel in Rust**, `no_std`, on QEMU virt: preemptive
-scheduling with shared-kernel SMP, per-process address spaces with demand paging
-and CoW fork, **~140 Linux syscalls**, dynamically linked ELF against musl, ext2 on
-virtio-blk, smoltcp TCP/IP, containers with per-box roots, a userspace `sshd` and
-TLS 1.3. On top of it, **unmodified**: Redis — including the official
-`redis:alpine` image off Docker Hub — Go 1.26.3, two rustc toolchains,
-clang / gcc / tcc, git, Bun.
+**Bare-metal AArch64 kernel in Rust**, `no_std`: preemptive scheduling with
+shared-kernel SMP, per-process address spaces with demand paging and CoW fork,
+dynamic libraries, ext2, `smoltcp` networking stack, **limited Linux binary
+compatibility**, runs Docker images like `redis:alpine`. Comes with `apk` and
+Go 1.26.3, Rust and Cargo (stable and nightly), clang / gcc / tcc, git, Bun.
+
+**Runs on QEMU and AWS**, verified on `m6g.metal` — Graviton2, 64 cores — under
+Firecracker v1.16.1 on KVM, answering SSH from across the internet.
+
+**A developer oriented operating system inspired by early 2000s experience, with
+modern tooling. The first program written for Akuma *inside Akuma* was written by
+GLM-4.7 on 22 Aug 2026.**
 
 | | |
 |---|---|
-| prod lines | **39,885** |
-| test lines | **27,845** (0.70x) |
-| linux syscalls | **~140** |
-| documented fixes | **622** |
-
-| subsystem | fixes | % | /kLoC |
-|---|---:|---:|---:|
-| Syscall / ABI | 127 | 23.7% | 21.4 |
-| Memory & VM | 112 | 20.9% | 23.8 |
-| SMP & Locking | 79 | 14.8% | 37.6 |
-| Scheduler & Process | 75 | 14.0% | 7.5 |
-| Networking | 56 | 10.5% | 12.4 |
-| Containers | 19 | 3.6% | 17.1 |
-| VFS & Filesystem | 15 | 2.8% | 3.7 |
-| Console & Terminal | 15 | 2.8% | 16.5 |
-| Misc / cross-cutting | 14 | 2.6% | 50.9 |
-| Signals & Exceptions | 12 | 2.2% | 3.6 |
-| Boot & Drivers | 11 | 2.1% | 3.7 |
-| **kernel** | **535** | 100% | 13.4 |
-| outside it — apps, toolchain, ssh | 87 | — | — |
+| prod lines | **43,700** |
+| test lines | **29,302** (0.67x) |
+| linux syscalls | **~170** |
+| documented fixes | **680** |
 
 The project mark (`src/akuma_40.txt`) and a link to
 [github.com/netoneko/akuma](https://github.com/netoneko/akuma) sit in the right
 column.
 
 *Speaker:* the deck compares itself to Redox and Asterinas on the next slide, so
-this one says what the thing actually is first, and hands over the two ledgers the
-rest of the talk draws on. **Just the stats — no reading of them on the slide.** If
-asked: memory and the syscall layer cost ~6× per line what the filesystem and driver
-code did under every grouping tested, the largest area by lines carries the
-*fewest* bugs per line, and the concurrency rows are the fragile ones — see
-[`LINE_COUNT_ANALYSIS.md`](LINE_COUNT_ANALYSIS.md) § Stat 7 for why the grouping
-decides that answer. Bug set is the **535 kernel-attributable** fixes of the 622;
-the other 87 are userspace apps, toolchain and SSH, none of which has a kernel
-line-area to join against.
+this one says what the thing actually is first. **Capability only — the bug ledger
+is slide 06 and it closes this act.** The capability table that sat here through
+draft 20's first cut was cut again: it restated the prose above it.
+
+The GLM-4.7 line is the one to let land. It is the point at which the thing stopped
+being only a target and started being a place you can work — a program written for
+Akuma, from inside Akuma, by a model. The platform line is the one that changed
+most recently and it is worth pausing on: until 2026-08-21 every claim in this deck
+was a claim about QEMU.
 
 ---
 
@@ -166,18 +146,19 @@ line-area to join against.
 | since | 2015 | ~2022 | 2026 |
 | people | team + nonprofit | 50+, 3 universities | **1** |
 | funding | EU NGI grants | Ant Group + Intel | none |
-| high-water | COSMIC desktop, packages | nginx **faster than Linux**, Firefox, Redis at parity | Redis + official image, Go, rustc, llama.cpp |
+| high-water | COSMIC desktop, packages | nginx **faster than Linux**, Firefox, Redis at parity | nginx, Redis + official image, Go, rustc, llama.cpp |
+| runs on | real hardware | QEMU, cloud VMs — **in production at Alibaba Cloud** | QEMU · **Graviton2 metal, Firecracker/KVM** |
 | builds itself | not yet | undocumented | **yes** |
 
 **Asterinas is the one worth studying.** A *framekernel*: all `unsafe` is confined
 to one library (OSTD, ~15k lines, **14% of the kernel** — about the size of seL4's
-verified core), so every service above it is written in **100% safe Rust.**
+verified core), so every service above it is written in **100% safe Rust.** They
+verify that tiny TCB for memory safety, then reach for **model checking and tests**
+for everything past it. Logic-level verification is explicitly aspirational.
 
-**And they drew a hard boundary around formal verification.** They verify the tiny
-TCB for memory safety — tractable at 15k lines — and then say memory safety is
-effectively solved, so focus shifts to *bugs beyond safety*. For those they reach
-for **model checking and tests**, not proofs. Logic-level verification is
-explicitly aspirational.
+**Measuring against Linux and against them is good practice** — a better reference
+turns "this feels slow" into something to go fix. It is where a lot of this work
+came from.
 
 *Speaker:* this slide sets up Act II. The team most invested in formal
 verification, with the funding and the university muscle to do it, scoped proofs to
@@ -186,16 +167,35 @@ workloads, tests — for everything else. That's the argument for the workflow: 
 no formal verification and no proofs, so the practical half is all there is, and it
 turns out that's what the serious people spend most of their effort on too.
 
-Two honest notes: Asterinas is bigger, faster, better funded and more rigorously
+Three honest notes: Asterinas is bigger, faster, better funded and more rigorously
 verified than this project **and hosts no compiler** — capability is not one axis.
-And where they overlap me on Redis, they publish throughput numbers and I have
-none. "Runs it" and "runs it at parity" are different claims.
+They are **deployed in production at Alibaba Cloud** (see Sourcing). And where they
+overlap me on Redis, they publish throughput numbers.
+
+**Measuring against Linux and against Asterinas is good practice, and it is where a
+lot of the work came from.** Having a reference that is unambiguously better is what
+turns a vague "this feels slow" into a specific thing to go fix, and most of the
+performance work on this project started by putting a Docker container next to the
+VM and running the same binary in both. Asterinas plays the same role one level up:
+they published nginx throughput against Linux, so nginx became a thing worth running
+here. The comparison is a source of direction and inspiration — that is the reason
+to keep making it, and it does not need to resolve into a verdict about who is
+ahead.
 
 **Sourcing:** the safe-Rust and 14%-TCB claims are from their USENIX ATC'25
 abstract and their own blog; the verification-boundary framing is from the blog and
 LWN's coverage. A stronger verbatim version of the "formal verification says
 nothing about implementation correctness" line may exist in their conference talk —
 **unverified, do not quote it as theirs** until the video is checked.
+
+**Asterinas runs in production at Alibaba Cloud.** Stated by the presenters in the
+USENIX ATC'25 talk; recorded here 2026-08-23 on Kirill Maksimov's recall of the
+video, and consistent with the project's backing (Ant Group). **Provenance grade:
+recalled from a talk, no timestamp, no written citation yet.** Before it is
+presented: find it in the ATC'25 video and record the timestamp here, or replace it
+with a written source (the Asterinas blog or an Ant Group/Alibaba Cloud engineering
+post). If neither can be found, keep the note in this doc and drop the claim from
+the slide.
 
 ---
 
@@ -205,21 +205,80 @@ nothing about implementation correctness" line may exist in their conference tal
 |---|---|
 | **Redox** | **banned**, Feb 2026, enforced — LLM-labelled contributions closed on sight; bypassing it is a project ban |
 | **Asterinas** | **welcomed and automated** — *"AI is welcome, but the human is responsible"*; ships an AI PR-review bot |
-| **Akuma** | no policy. Built with AI from the start |
+| Akuma | no policy |
 
 Same pressure — generation outpacing review capacity. Two structurally opposite
 answers, both from funded, multi-institution projects.
 
-*Speaker:* both policies legislate *who writes the code*. Neither addresses who
-keeps it. With no second reviewer there's no bottleneck to legislate, which is
+**Both policies legislate *who writes the code*. Neither addresses who keeps it.**
+
+*Speaker:* with no second reviewer there's no bottleneck to legislate, which is
 why the mechanised parts — lints that deny by default, a pre-commit hook stricter
 than most CI — matter more here, not less. They are the review.
 
+The Akuma row is deliberately flat and unhighlighted as of draft 20: it is the
+control in the comparison, not the punchline.
+
 ---
 
-## Act II — The workflow
+### 06 — the bugs
 
-### 06 — Have a concrete goal: run X
+*Closes Act I. Figures first, then the table — no prose on the slide.*
+
+| | |
+|---|---|
+| documented fixes | **680** |
+| prod lines | **43,700** |
+| test lines | **29,302** |
+| investigation docs | **340** |
+
+| subsystem | fixes | % | /kLoC |
+|---|---:|---:|---:|
+| Syscall / ABI | 128 | 22.1% | 20.5 |
+| Memory & VM | 113 | 19.5% | 23.3 |
+| SMP & Locking | 86 | 14.8% | 41.3 |
+| Scheduler & Process | 76 | 13.1% | 6.9 |
+| Networking | 69 | 11.9% | 11.9 |
+| Boot & Drivers | 23 | 4.0% | 6.0 |
+| Misc / cross-cutting | 22 | 3.8% | 58.7 |
+| Containers | 19 | 3.3% | 17.0 |
+| VFS & Filesystem | 17 | 2.9% | 4.2 |
+| Console & Terminal | 15 | 2.6% | 15.6 |
+| Signals & Exceptions | 12 | 2.1% | 3.5 |
+| **kernel** | **580** | 100% | 13.3 |
+| outside it — apps, toolchain, ssh | 100 | — | — |
+
+*Speaker:* this is the ledger the rest of the talk draws on, and it belongs at the
+end of the landscape act rather than the start — the audience needs to know what the
+thing is and who else is in the field before a density table means anything. The
+slide is figures and table only; everything below is spoken, not shown.
+
+Bug set is the **580 kernel-attributable** fixes of the 680; the other 100 are
+userspace apps, toolchain and SSH, none of which has a kernel line-area to join
+against.
+
+**Memory and the syscall layer cost ~4× per line** what the filesystem and driver
+code did, under every regrouping tested. That multiple is **drifting and must be
+quoted with its date**: it was ~6× on 2026-08-17 and is ~4× on 2026-08-23, not
+because memory got safer but because the Firecracker port put twelve documented
+fixes into Boot & Drivers and lifted that denominator off the floor. The direction
+has survived two measurements; the multiple has not.
+
+**Nothing about concurrency survives regrouping.** One file, `exceptions.rs`, swings
+SMP & Locking between 10.5 and 41.3 bugs/kLoC depending only on where it is filed.
+If challenged on that row, concede it immediately — it is the most interesting thing
+in the data. An earlier cut of this analysis concluded concurrency was *the*
+high-density area and named two files as the refactoring queue; re-deriving the
+grouping reversed it. Full working, including the retraction, in
+[`LINE_COUNT_ANALYSIS.md`](LINE_COUNT_ANALYSIS.md) § Stat 7.
+
+**Bug counts measure *found and fixed*, not present.** Every density figure is as
+much a measure of attention as of defect — VFS at 4.2 is either genuinely simpler or
+simply less examined, and this join cannot tell those apart.
+
+---
+
+### 07 — Have a concrete goal: run X
 
 **Compatibility with X, in order to run X.**
 
@@ -229,6 +288,7 @@ than most CI — matter more here, not less. They are the review.
 | **rust / cargo** | `MAP_SHARED` writeback, 128 KB argv, thread-group reaping, `getpriority` |
 | **golang** | signals on a foreign signal stack, pidfd, `waitid` parentage, fork/exec |
 | **llama.cpp** | lazy mmap, file-page eviction, heap-growth headroom |
+| **nginx** | zero new syscalls — then three kernel defects behind *"stops answering after enough traffic"*: a stubbed `shutdown(2)`, listener-backlog exhaustion, socket reclaim |
 
 **A real program is a specification you didn't write and can't argue with.**
 
@@ -236,9 +296,18 @@ than most CI — matter more here, not less. They are the review.
 what "done" means, it fails in a specific place, and it can't be negotiated with.
 Pick the program and the roadmap writes itself.
 
+The nginx row is the newest and the best illustration of the point, because the
+opening question was wrong. I assumed it would need user-management syscalls —
+"it can't drop privileges because there are no users in this system." The answer
+was **zero syscalls**; it needed an `/etc/passwd`. Then the interesting part:
+"nginx stops answering after enough traffic" turned out to be **three kernel
+defects and nothing whatsoever to do with nginx.** A listener that used to die at
+80 churned connections now survives 1088. The program found bugs I was not looking
+for, in a subsystem I would not have audited.
+
 ---
 
-### 07 — Self-hosting: it compiles itself
+### 08 — Self-hosting: it compiles itself
 
 Cloned from GitHub and built **inside Akuma**, on a nightly musl toolchain:
 
@@ -253,7 +322,6 @@ akuma:/tmp$ git clone https://github.com/netoneko/akuma.git && cd /tmp/akuma && 
 |---|---|
 | clean builds run | **20** (10 per arm of an A/B, two different kernels) |
 | succeeded first try | **20 / 20** — `EXIT=0`, full `deps/` tree, **3.8 MB ELF** |
-| retries needed | **0** |
 | wall clock | **107–128 s** per trial, boot + `cargo clean` + `-j4` build |
 | memory-corruption tripwires | **all 0** |
 | units | **147 / 147** — and the self-built ELF **boots** |
@@ -266,13 +334,15 @@ builds under it.
 
 *Speaker:* the closer does the same thing for `go build`; this is that shape one rung
 up, and it lands here because "run X" pointed at the compiler eventually. Every
-number above is in-guest, not host.
+number above is in-guest, not host. (The "0 retries needed" figure was dropped from
+the slide in draft 20 — "20/20 first try" already says it, and the zero was reading
+as filler.)
 
 Be precise about the scarcity, because it is easy to overclaim: "hosts a compiler" is
 not the rare part — Asterinas runs Firefox and QEMU, so a compiler running there is
 near-certain and simply undocumented. The rare part is **the kernel building itself
 and the result booting**, which is a claim someone has to make and verify. The stability claim is the interesting half:
-twenty consecutive first-try builds, zero retries — a failed clean build today is a
+twenty consecutive first-try builds — a failed clean build today is a
 regression finding, not weather. That is a recent change; most of the self-hosting
 doc is written around riding out intermittent rustc SIGSEGVs with a supervisor
 script, and that procedure is retired.
@@ -284,7 +354,7 @@ desktop, drivers and packages.
 
 ---
 
-### 08 — Audit before touching code
+### 09 — Audit before touching code
 
 **Update the references and the diagrams first. Then reason about where the problem
 could be.**
@@ -299,9 +369,13 @@ from a number that was wrong. Updating the reference docs and diagrams isn't
 bookkeeping — it's how you discover your mental model and the code have diverged,
 and it's much cheaper than discovering it from a fault address.
 
+Draft 20 is itself an instance: re-measuring for this deck moved every headline
+figure, and the bugs/kLoC multiple on slide 06 went from ~6× to ~4× without anyone
+touching the memory subsystem.
+
 ---
 
-### 09 — Isolate theories with probes, then discredit them
+### 10 — Isolate theories with probes, then discredit them
 
 **Build the smallest thing that can tell two theories apart. Kill theories until
 one survives.**
@@ -321,9 +395,15 @@ hypothesis that turned out wrong were repeatedly still the thing that found the 
 cause, or caught an unrelated bug later. That's why it's worth doing even when it
 feels like a detour from the fix.
 
+The NIC audit is the cleanest recent example. Neither existing profiler could answer
+"where does a round trip spend its time", so a per-packet recorder went in at the
+virtio boundary. It compiles to nothing when off. It is what turned "networking is
+slow" into "there is no virtio-net interrupt and every waiter parks until a 3 ms
+timer tick."
+
 ---
 
-### 10 — Then A/B it on real workloads
+### 11 — Then A/B it on real workloads
 
 **Any change to architecture or implementation detail triggers an A/B spree — on
 real software, once the probes pass.** Same binary, one variable, zero tolerance.
@@ -340,29 +420,39 @@ person who wrote the bug. The bar is that a real workload behaves identically
 across two builds differing in one thing. Keep one workload as a control that
 *should* be unaffected — if it moves, the theory was wrong.
 
+Two traps this method walked into recently, both worth mentioning if there's time.
+**A single-core boot suite does not verify an SMP primitive**: one change scored a
+clean 286/0 at `SMP=1` on a kernel that froze at `SMP=4`. And **back-to-back runs
+are not independent** — runs 4–5 of an arm scored *half* runs 1–3 with no code
+change, purely from run order, because the TCP stack holds `TimeWait` for 10 s. Any
+arm measured second would have been condemned.
+
 ---
 
 ## Act III — How it's built
 
-### 11 — AI-assisted development: docs as cognition
+### 12 — AI-assisted development: build your intuition
 
-**Every session starts with an assistant that has no memory of yesterday.** That
-one fact determines the whole documentation system.
+**LLMs are stateless, engineers aren't. Good intuition indicates a strong mental
+model.**
+
+Documenting the development process and helping the LLM discover the context by
+itself is cheap and always pays off.
 
 | tier | job |
 |---|---|
 | `runbooks/` | do X, expect Y — ends in **Verify** |
 | `reference/` | current state only, each page graded **A / B / C** for how far to trust it |
-| `archive/` | 200+ investigations, verbatim, **never rewritten** — including the wrong theories |
-| agent-context files | the standing rules, so they're never re-litigated |
+| `archive/` | 340 investigations, verbatim, **never rewritten** — including the wrong theories |
+| agent context | the standing rules, so they're never re-litigated |
 
 **Written to reconstitute project-specific intuition in a reader who starts from
 zero.**
 
 **The failure mode this guards against**, logged once in the archive: during what
 should have been a mechanical port, two syscalls were **rewritten instead of
-copied** — breaking an ABI. Caught and reverted, and named in the doc as exactly
-that.
+copied** — breaking an ABI. Caught and reverted. There is no way to know how many
+similar substitutions weren't.
 
 *Speaker:* this is the part I'd argue is genuinely new. The archive isn't history,
 it's a cache of hard-won judgement — correctness rules learned the hard way, so
@@ -378,12 +468,12 @@ amount of documentation tiers fixes it — only a diff you actually read.
 
 ---
 
-### 12 — Learn from history
+### 13 — Learn from history
 
-**A full OS development cycle is a surprisingly large dataset.** 1,547 commits, 196
+**A full OS development cycle is a surprisingly large dataset.** 2,009 commits, 340
 investigation docs. What falls out of it:
 
-- **622 distinct fixes** across 15 subsystems, itemised, dated, cross-referenced.
+- **680 distinct fixes** across 15 subsystems, itemised, dated, cross-referenced.
 - **Two crisis windows, from commit volume alone** — and an independent
   churn-per-file measure lands on the same two months.
 - **Recurring defect *shapes*.** ~3% of all fixes are the same underlying bug
@@ -392,13 +482,42 @@ investigation docs. What falls out of it:
   most-repeated shape: **a raw index outliving the thing it names.**
 
 *Speaker:* the records only became interrogable once they existed in bulk.
-Cross-joining lines against bugs turned up a real signal, and also caught me out: my first cut of that analysis
-concluded concurrency was the riskiest code per line, and re-deriving the grouping
-reversed it. Same data, different filing, opposite answer.
+Cross-joining lines against bugs turned up a real signal, and also caught me out: my
+first cut of that analysis concluded concurrency was the riskiest code per line, and
+re-deriving the grouping reversed it. Same data, different filing, opposite answer.
 
 ---
 
-### 13 — mood
+### 14 — Clean up after yourself
+
+**Generation is cheap, so the default move is a second copy.** A clone detector over
+the kernel found **5,370 duplicated lines** — 5.6% of the tree, and that is the
+floor, not the estimate. What the copies cost:
+
+| written more than once | copies | what it cost |
+|---|---:|---|
+| the CoW break path, `exceptions.rs` | 3 | a refcount underflow in the page-fault path — frames freed while still mapped. Three separate fixes |
+| `X` and `X_from_path`, down a whole call chain | 4 pairs | a **second, hand-rolled ELF parser** — which one validates your dynamic linker depends on which `execve` path ran |
+| the bounded channel write | 2 | the stream-truncation fix landed on stdout, never on stdin |
+| errno tables | 5 | `-12` (`ENOMEM`) returned under a comment reading `ENXIO`. 116 definitions → **39** |
+| the runtime-registration pattern | 3 | every network poll took a spinlock to read a function pointer |
+| production logic, re-typed inside its own test | 13 | the test exercises its copy, so production drifts for free — plus 25 more that assert `true == true` |
+
+> **"Coding is solved."**
+> — some guy with a $2T company
+
+*Speaker:* **this slide was in the rendered deck from draft 18 and was missing from
+this file until draft 20** — which is itself the argument for making the HTML the
+source of truth.
+
+The last row is the one to dwell on. Thirteen places where production logic was
+re-typed inside the test that was supposed to check it: the test passes forever
+because it is exercising its own copy. Twenty-five more assert `true == true`. That
+is not a testing gap you find by measuring coverage.
+
+---
+
+### 15 — mood
 
 ```
 2025-11-28  does not actually detect ram
@@ -412,10 +531,12 @@ reversed it. Same data, different filing, opposite answer.
 2026-08-06  more tests and fixes, cargo remains undefeated
 2026-08-11  curious case of nothingburger
 2026-08-13  java crossover episode
+2026-08-21  lmao lost networking but how
+2026-08-21  hell yeah graviton
 ```
 
-The four tiers document the *reasoning*. The commit log documents the *state of
-mind* — and it is still a record you can mine.
+**Time honored Eastern European tradition: curse, complain, then complain some
+more, still do the job.**
 
 *Speaker:* not a joke reel — read in order it's a legible progression. "This is
 getting out of hand" recurs four times across two months before it graduates to
@@ -424,13 +545,16 @@ the first era; and the 2026-08 lines are from the period where every claim carri
 measurement. The tone survived, the rigour arrived. None of it was written for an
 audience, which is exactly why it's usable evidence now.
 
+The last two are from the Firecracker session and land eleven hours apart, in that
+order. That is the whole method compressed into two commit messages.
+
 *(`mood` is itself one of the commit messages, from the middle era.)*
 
 ---
 
 ## Closing
 
-### 14 — `go build` defeated
+### 16 — `go build` defeated
 
 ```
 akuma:~$ apk add go git
@@ -453,13 +577,13 @@ months.**
 > Pick a real program. Audit before you touch anything. Probe until a theory dies.
 > A/B on the real workload. Write it down for whoever starts from zero tomorrow.
 >
-> None of that got harder. It got cheaper at exactly the same rate the code did.
+> **LLMs are statistical engines and it is your job to turn the stats in your
+> favor.**
 
 *Speaker:* measured while these slides were being drafted, on a separate VM. The
 cold number is the honest one — 112 s is mostly building the Go cache from nothing.
 
 ---
-
 ## Negative framing — audited and fixed
 
 Scanned both files for the *not-X-but-Y* construction. Four instances were doing
