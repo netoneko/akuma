@@ -187,7 +187,9 @@ fn cmd_open(args: libakuma::Args) -> ! {
                 }
 
                 if interactive {
-                    if libakuma::reattach(res.pid) != 0 {
+                    // Freshly spawned by this call — nobody else can already
+                    // hold it, so there's nothing to force past.
+                    if libakuma::reattach(res.pid, false) != 0 {
                         print("box: reattach failed\n");
                         exit(1);
                     }
@@ -255,7 +257,9 @@ fn cmd_use(args: libakuma::Args) -> ! {
             }
 
             if interactive {
-                if libakuma::reattach(res.pid) != 0 {
+                // Freshly spawned by this call — nobody else can already
+                // hold it, so there's nothing to force past.
+                if libakuma::reattach(res.pid, false) != 0 {
                     print("box use: reattach failed\n");
                     exit(1);
                 }
@@ -272,17 +276,38 @@ fn cmd_use(args: libakuma::Args) -> ! {
     }
 }
 
+/// The kernel's negated-errno encoding (`x0 = -errno`) for `EBUSY` — the one
+/// `sys_reattach` returns for "already attached", distinguishing it from every
+/// other failure (which collapses to `ESRCH`, matching `docs/reference/subsystems/
+/// syscalls/container.md`). See `crates/akuma-primitives/src/errno.rs`.
+const EBUSY: i32 = -16;
+
 fn cmd_grab(mut args: libakuma::Args) -> ! {
-    let target = match args.next() {
+    // `-d`/`--detach` (screen -d-style): if the target is already grabbed by
+    // a live previous `box grab`, detach it (SIGTERM) and take over instead
+    // of refusing. Scan for it anywhere among the args rather than requiring
+    // a fixed position, matching `box use`'s flag handling.
+    let mut positional: Vec<&str> = Vec::new();
+    let mut detach = false;
+    for a in args.by_ref() {
+        if a == "-d" || a == "--detach" {
+            detach = true;
+        } else {
+            positional.push(a);
+        }
+    }
+    let mut positional = positional.into_iter();
+
+    let target = match positional.next() {
         Some(t) => t,
-        None => { print("Usage: box grab <name|id> [pid]\n"); exit(1); }
+        None => { print("Usage: box grab [-d] <name|id> [pid]\n"); exit(1); }
     };
 
     let target_id = resolve_target_id(target).unwrap_or_else(|| {
         print("box grab: target box not found\n"); exit(1);
     });
 
-    let specific_pid = args.next().and_then(|s| {
+    let specific_pid = positional.next().and_then(|s| {
         let mut p = 0u32;
         for b in s.as_bytes() { if *b >= b'0' && *b <= b'9' { p = p * 10 + (*b - b'0') as u32; } }
         if p > 0 { Some(p) } else { None }
@@ -307,11 +332,28 @@ fn cmd_grab(mut args: libakuma::Args) -> ! {
     };
 
     print("box: grabbing PID "); libakuma::print_dec(pid_to_grab as usize); print("\n");
-    if libakuma::reattach(pid_to_grab) == 0 {
+    let rc = libakuma::reattach(pid_to_grab, detach);
+    if rc == 0 {
         loop {
             if let Some((_, code)) = waitpid(pid_to_grab) { exit(code); }
+            // `waitpid` only ever reports a real child's exit — the grabbed
+            // process usually isn't one, so it always returns `None` here
+            // regardless of whether the target is still alive. Fall back to
+            // a plain existence probe (`kill(pid, 0)`) so this loop actually
+            // notices the target exiting instead of spinning forever after
+            // it's gone. See docs/archive/REATTACH_STALE_CHANNEL_HANG.md.
+            if libakuma::kill_signal(pid_to_grab, 0) != 0 {
+                println("box grab: process exited");
+                exit(0);
+            }
             libakuma::sleep_ms(100);
         }
+    } else if rc == EBUSY {
+        println(&format!(
+            "box grab: PID {} is already attached. Use -d to detach it and take over.",
+            pid_to_grab
+        ));
+        exit(1);
     } else {
         print("box grab: failed to reattach\n");
         exit(1);

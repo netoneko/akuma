@@ -325,6 +325,7 @@ impl Process {
             namespace: akuma_isolation::global_namespace(),
             channel: None,
             delegate_pid: None,
+            grabbed_by: None,
             clear_child_tid: 0,
             robust_list_head: 0,
             robust_list_len: 0,

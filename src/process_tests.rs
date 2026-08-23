@@ -7062,7 +7062,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<akuma_exec::process::Pro
         thread_id: None, spawner_pid: None,
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
-        channel: None, delegate_pid: None, clear_child_tid: 0,
+        channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: 0,
         robust_list_head: 0, robust_list_len: 0,
         signal_actions: Arc::new(SharedSignalTable::new()),
         signal_mask: 0,

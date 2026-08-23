@@ -140,8 +140,9 @@ fn execute_external_reattach(args: &[String]) {
     println("");
 
     if let Some(res) = spawn(&path, Some(&arg_refs)) {
-        // Delegate our I/O to the child
-        reattach(res.pid);
+        // Delegate our I/O to the child. Freshly spawned — nobody else can
+        // already hold it, so there's nothing to force past.
+        reattach(res.pid, false);
         
         // Wait for child to exit
         loop {

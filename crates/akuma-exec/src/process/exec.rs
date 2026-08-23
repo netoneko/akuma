@@ -216,8 +216,17 @@ where
     Ok(exit_code)
 }
 
-/// Reattach I/O from a caller process (or kernel) to a target PID
-pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<(), &'static str> {
+/// Reattach I/O from a caller process (or kernel) to a target PID.
+///
+/// `force` mirrors `screen -d`: if another still-live pid already holds this
+/// target's I/O (`Process::grabbed_by`), a non-`force` call is refused
+/// (`"Already attached"`) rather than silently stealing the channel out from
+/// under whoever is currently watching it. `force` detaches the previous
+/// holder first — `kill_process_with_signal(existing, SIGTERM)` — so its own
+/// (now pointless) wait loop actually exits instead of spinning forever with
+/// no channel. See `docs/archive/REATTACH_STALE_CHANNEL_HANG.md` for why a
+/// grabber's wait loop needs to be able to observe this at all.
+pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid, force: bool) -> Result<(), &'static str> {
     // 1. Validate hierarchy permissions
     let (caller_box_id, channel) = if let Some(pid) = caller_pid {
         let caller = lookup_process_shared(pid).ok_or("Caller not found")?;
@@ -253,6 +262,24 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<
         return Err("Permission denied: cannot reattach process outside hierarchy");
     }
 
+    // 1b. Already-attached check. `grabbed_by` is trusted only if that pid is
+    // still alive — a grabber that already exited leaves a harmless stale
+    // value here, self-correcting on the next check rather than needing an
+    // explicit clear on every exit path.
+    let existing_grabber = lookup_process_shared(target_pid)
+        .and_then(|target| target.grabbed_by)
+        .filter(|&existing| Some(existing) != caller_pid && lookup_process_shared(existing).is_some());
+
+    if let Some(existing) = existing_grabber {
+        if !force {
+            return Err("Already attached");
+        }
+        // Detach the previous holder: SIGTERM its grabbing process so its own
+        // wait loop (which has no other way to learn it's been superseded)
+        // exits instead of spinning forever against a channel nobody reads.
+        let _ = crate::process::kill_process_with_signal(existing, 15 /* SIGTERM */);
+    }
+
     // 2. Perform the delegation
     if let Some(pid) = caller_pid {
         crate::process::table::with_process(pid, |p| p.delegate_pid = Some(target_pid))
@@ -264,7 +291,10 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<
 
     // Target process now uses caller's output channel. Move the pre-built
     // Option<Arc> in; the replaced value's drop is only a refcount decrement.
-    crate::process::table::with_process(target_pid, |p| p.channel = channel)
+    crate::process::table::with_process(target_pid, |p| {
+        p.channel = channel;
+        p.grabbed_by = caller_pid;
+    })
         .ok_or("Target not found")?;
 
     if config().syscall_debug_info_enabled {
@@ -275,7 +305,7 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid) -> Result<
 }
 
 /// Reattach I/O from the current process to a target PID
-pub fn reattach_process(target_pid: Pid) -> Result<(), &'static str> {
+pub fn reattach_process(target_pid: Pid, force: bool) -> Result<(), &'static str> {
     let caller_pid = read_current_pid(); // Can be None for kernel threads
-    reattach_process_ext(caller_pid, target_pid)
+    reattach_process_ext(caller_pid, target_pid, force)
 }

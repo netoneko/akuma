@@ -791,7 +791,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-containers")]
         nr::KILL_BOX => container::sys_kill_box(args[0]),
         #[cfg(feature = "sc-containers")]
-        nr::REATTACH => container::sys_reattach(args[0] as u32),
+        nr::REATTACH => container::sys_reattach(args[0] as u32, args[1] as u32),
         nr::SET_TID_ADDRESS => proc::sys_set_tid_address(args[0]),
         // Same never-return contract as nr::EXIT above.
         nr::EXIT_GROUP => {

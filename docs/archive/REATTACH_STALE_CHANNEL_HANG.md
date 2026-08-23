@@ -1,9 +1,15 @@
-# `box grab` reattach: input silently swallowed by a stale cached channel
+# `box grab` reattach: stale cached channel, then detach and exit-detection
 
 **Date:** 2026-08-23. **Status:** FIXED and verified on-device (isolated QEMU
-instance, disk clone + private ports — the reporting user's own running VM was
-never touched). **Kernel at capture:** devbox-smoltcp, `smp-shared` default
-feature set, `SMP=4`.
+instances, disk clones + private ports — no live VM the reporting user was
+using was ever touched). **Kernel at capture:** devbox-smoltcp, `smp-shared`
+default feature set, `SMP=4`.
+
+Three fixes, same day, same feature, in the order they were found: §1-§5 is
+the original bug (input silently swallowed by a stale cached channel); §6 is
+what surfaced immediately afterward once `box grab` actually worked well
+enough to use for real — no way to detach a previous session (`-d`, like
+`screen -d`) and no way for `box grab` to notice its target had exited.
 
 **One line:** `sys_read`'s stdin loop (`src/syscall/fs.rs`) and
 `sys_poll_input_event` (`src/syscall/term.rs`) each fetched the process's
@@ -231,6 +237,95 @@ devbox-smoltcp,no-tests` are all clean. Host unit tests
 (`cargo test --target <host-triple>`) pass unchanged (this fix touches only
 `no_std` kernel syscall bodies, not host-testable crate logic).
 
+## 6. Follow-on (2026-08-23): detach-and-take-over, and `box grab` never noticing the target exit
+
+Two more gaps surfaced immediately once the channel-staleness fix above made
+`box grab` usable for real interactive sessions.
+
+### 6.1 No protection against stealing a live session (`-d`, like `screen -d`)
+
+Nothing before this stopped a second `box grab` on the same pid from silently
+stealing the channel out from under a first, still-active grab — no warning,
+no error, and (worse, see §6.2) the first grabber had no way to notice and
+would just sit there forever, uselessly, with no channel. `screen -r` refuses
+this by default and only proceeds with an explicit `-d`; `box grab` had no
+such concept at all.
+
+Added `Process::grabbed_by: Option<Pid>` (`crates/akuma-exec/src/process/mod.rs`),
+set by a successful reattach, trusted only while that pid is still alive (a
+grabber that already exited leaves a harmless stale value — self-correcting
+on the next check, no exit-path cleanup needed). `reattach_process_ext` gained
+a `force: bool` parameter:
+
+- Without it, reattaching to an already-(live-)held target now fails with a
+  distinct error (`"Already attached"`), mapped to a new `EBUSY` errno
+  (`crates/akuma-primitives/src/errno.rs` — the one errno table; `EBUSY = 16`
+  had never been needed anywhere in the tree before, unlike most of that
+  table's entries, which consolidated pre-existing scattered definitions).
+- With it (`force = true`), the previous holder is sent `SIGTERM`
+  (`akuma_exec::process::kill_process_with_signal`) before the reattach
+  proceeds, so its own wait loop actually exits instead of spinning forever
+  against an abandoned channel — the detach has to be *observable* by the
+  detachee, which is exactly §6.2's fix on the read side.
+
+`sys_reattach`'s signature changed from `(pid)` to `(pid, force)` — every
+caller updated: `libakuma::reattach(pid, force)`, and in `userspace/box`
+(`main.rs`'s `cmd_open`/`cmd_use`, `run.rs`'s `box run`) and
+`userspace/paws` (`execute_external_reattach`), all pass `force = false` —
+each of those reattaches a process it *just* spawned itself, which cannot
+already have a holder. `box grab` exposes the flag as `-d`/`--detach` and
+prints a `screen`-style refusal (`PID N is already attached. Use -d to detach
+it and take over.`) when it isn't passed and the target is held.
+
+### 6.2 `box grab` never exiting when its target does
+
+Separately reported: even with the channel fix, `box grab` would sit forever
+after the grabbed process exited on its own (no second grab involved at all).
+Root cause: `cmd_grab`'s loop polls `waitpid(pid_to_grab)`
+(`userspace/box/src/main.rs`), but `reattach` does not reparent anything — the
+grabbed pid is essentially never `box grab`'s own child. `wait4`/`waitpid`
+semantics (here, same as Linux) only report a *child's* exit; on a non-child
+pid the kernel syscall returns an error indistinguishable, at the
+`libakuma::waitpid()` wrapper level, from "still running" (`waitpid_status`
+maps both `result == 0` and `result < 0` to `None`). So the loop could never
+tell "target is gone" from "target is fine," regardless of anything else —
+this was true before the channel-staleness fix too, just impossible to notice
+until reattach actually worked well enough to sit and watch a real session.
+
+Fixed by falling back to a plain liveness probe when `waitpid` reports
+nothing: `libakuma::kill_signal(pid_to_grab, 0)` (a `kill(2)`-style existence
+check that delivers nothing) returning non-zero means the target is gone, at
+which point `box grab` prints `process exited` and exits 0. `waitpid` is
+tried first and still wins when the target genuinely is `box grab`'s own
+child (not the common case, but not excluded either) — the probe is purely a
+fallback for the case `waitpid` can never resolve on its own.
+
+### 6.3 Verification
+
+Same isolated-QEMU technique as §5 (fresh disk clone + `e2fsck -fy` +
+`INSTANCE=1`-shifted ports; the userspace binaries were re-staged into
+`bootstrap/bin/` by `userspace/build.sh --box-only`/`--paws-only` and the disk
+repopulated with `--bin-only` before boot — no live VM was touched). Three
+scenarios, each confirmed on-device:
+
+1. Session A: foreground `cat`. Session B: `box grab 0 <pid>` (no `-d`,
+   nothing held yet) — succeeds, input/output round-trips.
+2. Session C: `box grab 0 <pid>` **without** `-d` while B still holds it —
+   refused, prints the `already attached` message, exit code 1; B is
+   untouched and keeps working.
+3. Session C: `box grab -d 0 <pid>` — B is observably killed (its ssh client
+   exits with a nonzero status and its connection closes) and C takes over
+   the same live `cat`, confirmed by typing into C and seeing it echoed.
+4. A process that exits on its own (`sh -c 'sleep 3; echo done'`) while
+   grabbed: its final output (`done`) streams through as expected, and `box
+   grab` prints `process exited` and exits 0 immediately after, rather than
+   hanging.
+
+`cargo build`/`cargo clippy` (default and `devbox-smoltcp,no-tests` feature
+sets) and `cargo test --target <host-triple>` (which now also exercises the
+new `EBUSY` table entry via `errno::tests::every_value_is_the_linux_number`)
+are all clean.
+
 ## Background
 
 - [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) #4 "`reattach` fails to wake target
@@ -252,9 +347,16 @@ devbox-smoltcp,no-tests` are all clean. Host unit tests
   neither caused nor fixed the other — but anyone touching this loop again
   should read both.
 - [`crates/akuma-exec/src/process/exec.rs`](../../crates/akuma-exec/src/process/exec.rs)
-  → `reattach_process_ext` (`:220`) — unchanged by this fix; confirmed correct
-  throughout the investigation.
+  → `reattach_process_ext` (`:229`) — unchanged by §1-§5; gained the
+  `force`/`grabbed_by` detach-and-take-over logic in §6.1.
 - [`crates/akuma-exec/src/threading/mod.rs`](../../crates/akuma-exec/src/threading/mod.rs)
   → `ThreadWaker::wake` (`:3561`) — unchanged by this fix; confirmed correct
   (generation check, CAS, SGI trigger all behave as designed) via the debug
   trace in §3.
+- [`crates/akuma-primitives/src/errno.rs`](../../crates/akuma-primitives/src/errno.rs)
+  — the one errno table (`docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`
+  §5.7); gained `EBUSY = 16` for §6.1's "already attached" case, pinned in
+  `every_value_is_the_linux_number`.
+- [`userspace/box/README.md`](../../userspace/box/README.md) → `box grab`
+  options — the `-d`/`--detach` flag and the exit-on-target-exit behavior,
+  user-facing.

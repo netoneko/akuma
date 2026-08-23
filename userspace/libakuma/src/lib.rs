@@ -1629,9 +1629,13 @@ pub const SIGTERM: u32 = 15;
 /// `SIGKILL` — uncatchable.
 pub const SIGKILL: u32 = 9;
 
-/// Reattach I/O to a target process
-pub fn reattach(pid: u32) -> i32 {
-    syscall(syscall::REATTACH, pid as u64, 0, 0, 0, 0, 0) as i32
+/// Reattach I/O to a target process. `force` mirrors `screen -d`: if the
+/// target already has a live holder (a previous `reattach` caller that hasn't
+/// exited), a non-`force` call fails with `EBUSY` instead of silently
+/// stealing its channel; `force` detaches that previous holder (delivers it
+/// `SIGTERM`) and proceeds.
+pub fn reattach(pid: u32, force: bool) -> i32 {
+    syscall(syscall::REATTACH, pid as u64, force as u64, 0, 0, 0, 0) as i32
 }
 
 /// What [`fork`] returned, from the perspective of whoever is asking.

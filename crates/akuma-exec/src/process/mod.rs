@@ -539,6 +539,15 @@ pub struct Process {
     pub namespace: Arc<akuma_isolation::Namespace>,
     pub channel: Option<Arc<ProcessChannel>>,
     pub delegate_pid: Option<Pid>,
+    /// The pid currently holding this process's I/O via `sys_reattach` (`box
+    /// grab`/`box use -i`), so a second `reattach` can tell "nobody's watching"
+    /// from "already attached" and refuse (or, with `force`, detach the
+    /// previous holder) instead of silently stealing the channel out from under
+    /// it. `None` for a process that was never reattached, or whose most recent
+    /// grabber has since exited — checked for liveness at read time rather than
+    /// cleared on the grabber's exit, so a stale pid here is self-correcting the
+    /// next time anyone asks. See `reattach_process_ext`.
+    pub grabbed_by: Option<Pid>,
     pub clear_child_tid: u64,
     pub robust_list_head: u64,
     pub robust_list_len: usize,
@@ -756,6 +765,7 @@ impl Process {
             lazy_regions: Spinlock::new(LazyRegionMap::new()),
             thread_id: None,
             delegate_pid: None,
+            grabbed_by: None,
             robust_list_head: 0,
             robust_list_len: 0,
 

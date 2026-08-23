@@ -25,7 +25,7 @@ box close demo                                   # stop a box
 | `box open <name> [opts] [cmd] [args...]` | Create a plain box and run a command in it |
 | `box ps` | List active boxes |
 | `box use <name\|id> [opts] <cmd> [args...]` | Run a command inside an existing box |
-| `box grab <name\|id> [pid]` | Reattach terminal to a process in a box |
+| `box grab [-d] <name\|id> [pid]` | Reattach terminal to a process in a box |
 | `box cp <src> <dest>` | Copy a directory tree |
 | `box close <name\|id>` | Stop a box and kill its processes |
 | `box show <name\|id>` | Display box details and member processes |
@@ -59,6 +59,21 @@ would break every bare program name.
 - `--image <name>` — legacy: use an image's flat `rootfs/` as the box root.
   **`box pull` no longer creates that directory** — use `box run`.
 - `-I` / `--interactive`, `-d` / `--detached`
+
+### `box grab` options
+
+- `-d` / `--detach` — like `screen -d`: if the target process is already
+  reattached to another, still-live `box grab`, detach that one (it gets
+  `SIGTERM`'d, its own session ends) and take over instead. Without `-d`, a
+  target that's already attached elsewhere is refused (`already attached...
+  use -d`) rather than silently stealing its channel out from under whoever
+  is currently watching it.
+
+`box grab` exits on its own once the grabbed process exits (or once it's
+detached by a later `-d` grab) — it doesn't wait for you to notice the
+process is gone. See
+[`../../docs/archive/REATTACH_STALE_CHANNEL_HANG.md`](../../docs/archive/REATTACH_STALE_CHANNEL_HANG.md)
+for why neither of those was true before 2026-08-23.
 
 ## How it works
 

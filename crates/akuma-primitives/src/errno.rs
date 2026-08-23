@@ -91,6 +91,7 @@ errno_table! {
     ENOMEM = 12;
     EACCES = 13;
     EFAULT = 14;
+    EBUSY = 16;
     EEXIST = 17;
     ENODEV = 19;
     ENOTDIR = 20;
@@ -228,6 +229,10 @@ mod tests {
             ("ENOTTY", ENOTTY, 25),
             ("EOPNOTSUPP", EOPNOTSUPP, 95),
             ("EPFNOSUPPORT", EPFNOSUPPORT, 96),
+            // Added 2026-08-23 for `sys_reattach`'s "already attached" case
+            // (`box grab`'s `-d`/screen-style detach) — never existed under
+            // any of the old tables, so it has no history to pin against.
+            ("EBUSY", EBUSY, 16),
         ];
         for &(name, actual, want) in expected {
             assert_eq!(actual, want, "{name} is not the Linux value");

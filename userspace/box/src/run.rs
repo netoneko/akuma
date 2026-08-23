@@ -277,7 +277,9 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
     // foreground run always does it — `-i` only matters for keeping stdin
     // hooked up. Without this the container runs to completion in silence.
     let _ = interactive;
-    if libakuma::reattach(res.pid) != 0 {
+    // Freshly spawned by this call — nobody else can already hold it, so
+    // there's nothing to force past.
+    if libakuma::reattach(res.pid, false) != 0 {
         print("box run: reattach failed\n");
         exit(1);
     }

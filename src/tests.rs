@@ -3540,7 +3540,7 @@ fn make_test_process(
             akuma_terminal::TerminalState::default(),
         )),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
-        channel: None, delegate_pid: None, clear_child_tid: 0,
+        channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: 0,
         robust_list_head: 0, robust_list_len: 0,
         signal_actions: alloc::sync::Arc::new(akuma_exec::process::SharedSignalTable::new()),
         signal_mask: 0,

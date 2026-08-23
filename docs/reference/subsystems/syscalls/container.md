@@ -17,6 +17,11 @@ bundles — none of which are re-derived here — see
 > it kept draining the abandoned channel forever while new input landed
 > elsewhere. Fixed in `src/syscall/fs.rs`/`src/syscall/term.rs` by
 > re-resolving the channel every loop iteration instead of once outside it.
+> **Also 2026-08-23:** `sys_reattach` gained a `force` argument (`screen
+> -d`-style detach-and-take-over, see "reattach" below) and `box grab` no
+> longer hangs forever after its target exits — it was polling `waitpid()`
+> on a pid that is essentially never its own child, which can never report
+> that pid's exit.
 
 ## register_box / kill_box
 
@@ -31,14 +36,43 @@ failure mode is not distinguished.
 
 ## reattach
 
-`sys_reattach(pid)` (`container.rs:43`) delegates entirely to
+`sys_reattach(pid, force)` (`container.rs:74`) delegates entirely to
 `akuma_exec::process::reattach_process`, which re-points the target process's
 output channel at the caller's and checks box-hierarchy permission (same box,
 host/box-0 caller, or caller created the target's box). At the syscall
-boundary the only outcome this file adds is the errno mapping: unknown `pid`
-→ `ESRCH`. Permission-denied and other `Err` cases from
-`reattach_process` also collapse to `ESRCH` here — the syscall does not
-distinguish "no such process" from "not allowed to reattach to it".
+boundary this file adds two errno mappings: unknown `pid` (or a permission
+denial) → `ESRCH`, and — added 2026-08-23 — "already attached" → `EBUSY`.
+`ESRCH` still does not distinguish "no such process" from "not allowed to
+reattach to it".
+
+**`force` (added 2026-08-23), `screen -d`-style.** Each process tracks who
+currently holds its I/O in `Process::grabbed_by` (`Option<Pid>`, set by a
+successful reattach, trusted only while that pid is still alive — a grabber
+that already exited leaves a harmless stale value that self-corrects on the
+next check rather than needing an explicit clear on every exit path). If the
+target already has a different, live holder:
+
+- `force == 0`: refused, `EBUSY`. Nobody's channel gets stolen out from under
+  them by accident.
+- `force != 0`: the previous holder is sent `SIGTERM`
+  (`kill_process_with_signal`) before the reattach proceeds — otherwise its
+  own wait loop has no way to learn it's been superseded and would spin
+  forever against a channel nobody reads from anymore (see `box grab`'s exit
+  detection, next paragraph, for the same "no way to learn" shape on the
+  read side).
+
+`userspace/box`'s `box grab` exposes this as `-d`/`--detach`; `box run`/`box
+open -i`/`box use -i`/`paws`'s reattach-into-shell path all pass `force =
+false` — freshly spawned children can't already have a holder.
+
+**`box grab`'s exit-on-target-exit** is a userspace fix, not a kernel one, but
+worth recording next to this: the grabbed process is essentially never `box
+grab`'s own child (`reattach` doesn't reparent), so `waitpid()` on it can
+never report an exit — Linux `wait4` semantics require an actual parent-child
+relationship, and this kernel is no different. `box grab`'s loop now falls
+back to a plain `kill(pid, 0)` existence probe to notice the target is gone
+and exit on its own instead of spinning forever after it. See
+`docs/archive/REATTACH_STALE_CHANNEL_HANG.md`.
 
 ## mount / umount2
 

@@ -71,11 +71,16 @@ pub(super) fn sys_kill_box(box_id: u64) -> u64 {
     0
 }
 
-pub(super) fn sys_reattach(pid: u32) -> u64 {
-
-    // reattach_process only fails when the target pid does not exist.
-    if akuma_exec::process::reattach_process(pid).is_ok() { 0 } else { ESRCH }
-
+pub(super) fn sys_reattach(pid: u32, force: u32) -> u64 {
+    match akuma_exec::process::reattach_process(pid, force != 0) {
+        Ok(()) => 0,
+        // `box grab` (screen -d-style) distinguishes "already attached" —
+        // pass `force` to detach the previous holder — from every other
+        // failure (unknown pid, permission denied), which the syscall
+        // boundary has never distinguished from each other.
+        Err("Already attached") => EBUSY,
+        Err(_) => ESRCH,
+    }
 }
 
 /// A box's mount namespace is composed **entirely from outside**, by box 0,
