@@ -493,10 +493,17 @@ Two layers, both worth doing:
 
 ## Issue 6: `tail -f` ignores `^C` over SSH — signal doesn't break the blocking read
 
-**Status: OPEN.** Found 2026-08-11 during the same self-host session as
-Issue 5 (`docs/archive/UART_SMP_INTERLEAVE_FIX.md`). Not investigated
-beyond a positive repro — adding here so it doesn't get lost; would
-benefit from a gdb repro before any fix.
+**Status: FIXED 2026-08-24.** Found 2026-08-11 during the same self-host
+session as Issue 5 (`docs/archive/UART_SMP_INTERLEAVE_FIX.md`). All three
+"likely shape" theories below were wrong — this was never an `EINTR`/
+`SA_RESTART`/signal-masking bug in `sys_read`. Real cause: Akuma had no tty
+line discipline at all, so Ctrl-C's `0x03` byte was never translated into a
+delivered `SIGINT` in the first place — it just got forwarded as ordinary
+stdin data (which `tail -f` never reads). Full root-cause + fix:
+[`CTRL_C_SIGINT_DELIVERY.md`](CTRL_C_SIGINT_DELIVERY.md). Verified
+interactively (`ssh -tt`, real pty) on `devbox-smoltcp`: prompt returns
+immediately on `^C`, and a second SSH session confirms `tail` is actually
+gone, not just detached.
 
 ### Symptom
 
@@ -1425,9 +1432,25 @@ overlay, as above.
 
 ## Issue 19: long-running `ssh <host> <cmd>` dies at ~300 s with `rc=255`
 
-**Status: OPEN, observed 2026-08-19, mechanism NOT attributed.** Found running
-`llama-bench` over ssh for the benchmark in
+**Status: OPEN, observed 2026-08-19, mechanism NOT attributed.** Found
+running `llama-bench` over ssh for the benchmark in
 `BENCHMARK_PERFORMANCE_ATTEMPT_0.md`.
+
+**Update 2026-08-24 — a real, adjacent bug was found and fixed, but it does
+not close this issue.** sshd never replied to `SSH_MSG_GLOBAL_REQUEST` (e.g.
+OpenSSH's `keepalive@openssh.com`), which would eventually drop a session
+with the client-side message `Timeout, server X not responding` once
+`ServerAliveCountMax` probes went unanswered
+(`userspace/sshd/docs/SSH_KEEPALIVE_TIMEOUT_FIX.md`). It can't be what
+killed *this* session: the fix only matters when the client is actually
+sending those probes (`ServerAliveInterval` set), and this issue's own
+repro explicitly had `ServerAliveInterval=0` (disabled) — consistent with
+"the folklore explanation is wrong" below, not a contradiction of it.
+Discriminating test 2 (`-o ServerAliveInterval=30`) is now more informative
+than when it was written: before the fix, setting that flag would have
+introduced a *second*, unrelated way to drop the connection (probes sent,
+never acknowledged) on top of whatever this issue's real cause is; now it
+isolates the one variable the test was meant to isolate.
 
 ```
 ssh -p 2222 root@localhost 'llama-bench -m /root/qwen3.5-0.8b-q4.gguf ...'
