@@ -240,24 +240,174 @@ Whatever else is true, c=1 is roughly **2x faster than when §4 was written**, s
 longer the live number — the gap to re-explain is closer to ~300 µs. Re-measure
 the decomposition before quoting §4's arithmetic.
 
-### 8b. The measurement includes QEMU, and nobody has subtracted it
+### 8b. It is not the network stack, and it is not QEMU — MEASURED
 
-`scripts/benchmarks/redis_conc_sweep.py` runs `redis-benchmark -h 127.0.0.1 -p
-<hostfwd port>` **on the host**. Every round trip therefore crosses QEMU's
-**SLIRP** userspace TCP stack in the QEMU main loop, then virtio-net, then
-Akuma. The Docker control it is compared against goes through Docker Desktop's
-VM networking instead — a different, much shorter path. **An unknown share of
-the 3.7x gap is the emulated NIC, not the kernel**, and no arm in this document
-or in `REDIS_ROUND_TRIP_STAGE_TRACE.md` has isolated it.
+Holding client and server binaries fixed (box 0's own apk `redis-server` 8.8.0
+and `redis-benchmark`), `c=1`, `SMP=4`, three runs each, and varying only the
+transport:
 
-The cheap experiment nobody has run: `redis-benchmark` **inside the guest**
-against `127.0.0.1`, which drops SLIRP, virtio and the host stack out of the
-loop. It bounds Akuma's own socket path rather than subtracting SLIRP exactly
-(in-guest loopback is the loopback ring, not the NIC path), but it is the
-difference between "Akuma is 3.7x slower than Docker" and a claim that survives
-questioning. **Do this before quoting any Akuma-vs-Docker ratio.**
+| path | µs/rt | delta |
+|---|---:|---:|
+| UNIX socket, both ends in-guest | 312 | — |
+| TCP over guest loopback | 383 | +71 |
+| TCP out through virtio + SLIRP to the host | 401 | +18 |
 
-## 7. Handoff — in value order
+**Deleting QEMU's entire emulated network path is worth 18 µs of 401 (4 %).**
+The TCP/IP stack above it is worth another 71. What was left was 312 µs of two
+processes ping-ponging through a UNIX socket with no networking in it at all.
+
+A pipelining sweep then showed that residue was a **fixed per-round-trip
+stall**, not per-byte work — the round trip stayed flat while throughput scaled
+58x:
+
+| -P | ops/s | µs per round trip | µs per request |
+|---:|---:|---:|---:|
+| 1 | 3,297 | 303 | 303 |
+| 8 | 25,432 | 315 | 39 |
+| 64 | 191,755 | 334 | 5.2 |
+
+Both readings were correct. **The conclusion drawn from them was wrong** — see
+§9. The stall was not the cost of waking a process. It was `printf`.
+
+## 9. The 300 µs was an ungated debug trace
+
+`src/syscall/poll.rs:462` printed **on every successful `epoll_ctl` ADD/MOD**,
+with no gate:
+
+```rust
+if let Some(kind) = added_as {
+    let ev_events = event.map_or(0, |(e, _)| e);
+    crate::tprint!(96, "[epoll] ctl {} epfd={} fd={} events=0x{:x}\n", ...);
+}
+```
+
+Every *other* trace in that file sits behind `SYSCALL_DEBUG_EPOLL_EDGE` or
+`SYSCALL_DEBUG_NET_ENABLED`, both compiled `false`. This one had no gate at
+all, so it ran in every build including the benchmark ones. An epoll-driven
+server re-arms its interest per request, so a redis PING round trip emitted
+about three of these — each ~40 bytes out of the emulated 16550 UART, **one
+MMIO trap per byte**, on the request path.
+
+**It was 99.3 % of the guest's entire console output**: 244,414 of 246,045
+lines in an 11 MB log from one benchmark run.
+
+Gating it (`c=1`, `SMP=4`, three runs, same guest, `cmp`-verified distinct
+binaries):
+
+| path | before | after | |
+|---|---:|---:|---:|
+| UNIX socket | 3,297 ops/s — 303 µs/rt | **24,331 ops/s — 41 µs/rt** | **7.4x** |
+| TCP loopback | 2,612 ops/s — 383 µs/rt | **8,838 ops/s — 113 µs/rt** | **3.4x** |
+
+Console output for a whole benchmark run went from 11 MB / 246,045 lines to
+**26 KB / 479 lines** — 400x less. And Akuma's TCP-loopback round trip is now
+**113 µs against the Docker control's 114 µs.**
+
+Nine more ungated traces in the same class — `[syscall] socket`,
+`[syscall] connect`, `[unix] socket/connect/accept` — were gated behind
+`SYSCALL_DEBUG_NET_ENABLED` at the same time. Those fire per *connection*
+rather than per request, so they are invisible to a keep-alive redis benchmark
+and would have shown up as a mystery in any HTTP benchmark with connection
+churn (nginx/httpd). Check for this before comparing web servers.
+
+### 9a. What this does and does NOT retire — the overclaim, corrected
+
+The first draft of this section claimed the trace explained §4's 688 µs. **It
+does not, and the check that caught it is worth more than the claim was.**
+
+Re-running the *official* host-driven sweep with the trace gated moved nothing:
+
+| clients | before | after | |
+|---:|---:|---:|---:|
+| 1 | 2,373 | 2,228 | 0.94x |
+| 2 | 3,213 | 3,207 | 1.00x |
+| 4 | 16,807 | 16,750 | 1.00x |
+| 32 | 20,284 | 19,646 | 0.97x |
+
+The reason is in the boot logs: the sweep's guest emitted **167** `[epoll] ctl`
+lines for an entire benchmark run, against 244,414 in the arm where the fix was
+measured. **The two arms were running different redis servers.**
+
+- `redis_smp_sweep.py` uses the **container `redis:alpine`**, deliberately, so
+  the binary matches the Docker control (§2 of the sweep script). It registers
+  epoll interest per *connection*.
+- The 7.4x measurement used box 0's **apk `redis-server` 8.8.0**, which re-arms
+  interest per *request* — three `epoll_ctl` calls, three console lines, per
+  round trip.
+
+So both results are real and they do not conflict:
+
+- **The trace bug is severe** for any server that calls `epoll_ctl` on the
+  request path — a very common event-loop shape (toggling `EPOLLOUT` interest
+  around a partial write). For redis 8.8.0 it was 7.4x.
+- **It is invisible** to the sweep's workload, and therefore explains **none**
+  of §4's 688 µs or the sweep's ~430 µs at `c=1`. **That number is still
+  unexplained.**
+
+What is genuinely retired: the transport decomposition in §8b, and the
+pipelining table above it, were both measured on the traced kernel with apk
+redis — so their **absolute** values are trace-inflated and must not be quoted.
+Re-measure them before use.
+
+**Two hypotheses died here, in this order, and neither died by argument.**
+First "a large share is QEMU's SLIRP". Then "it is the cost of waking an idle
+vCPU under HVF" — which matched the shape (a fixed ~150 µs per wake, twice per
+round trip), matched §4's "the aged VM keeps a core spinning" observation, and
+had a ready fix in a spin-before-WFI at `smp_shared.rs:1001`. **It was about to
+be implemented.** What killed it was noticing the SMP=1 arm was inexplicably
+slow, opening the console log, and finding it 11 MB.
+
+### 9c. The decomposition, re-measured on the gated kernel
+
+Everything below is `c=1`, `SMP=4`, three runs, median, **after** the trace fix.
+This supersedes §8b, which was measured on the traced kernel.
+
+| arm | µs/rt |
+|---|---:|
+| Akuma, in-guest, **UNIX socket** | **41** |
+| Docker, in-container, TCP loopback | 38 |
+| Akuma, in-guest, TCP loopback (container redis) | 147 |
+| Akuma, in-guest, TCP loopback (apk redis 8.8.0) | 142 |
+| Docker, **host** → container | 114 |
+| Akuma, **host** → guest (what the sweep reports) | 476 |
+
+Three things fall out, and they point somewhere different from every earlier
+section of this document:
+
+1. **Akuma's scheduling and IPC are not the problem.** A UNIX-socket round trip
+   is **41 µs against Docker's 38 µs TCP loopback**. Whatever is slow, it is not
+   the cost of getting a blocked process running again — which is precisely the
+   thing §4, §8b and the abandoned spin-before-WFI hypothesis all blamed.
+2. **Akuma's TCP/loopback path costs ~100 µs** on top of that (41 → 147), and
+   the redis build is irrelevant to it (147 vs 142). **This is the real
+   in-kernel target**, and it is a much smaller and better-localised number than
+   "688 µs of unexplained latency".
+3. **The host-driven sweep is ~70 % QEMU.** 476 µs host-driven against 147 µs
+   in-guest: **329 µs is SLIRP plus the host stack**. Docker's equivalent hop
+   costs 76 µs (114 − 38). So the headline "Akuma is ~4x slower than Docker" is
+   measured through an emulated NIC that is itself ~4.3x more expensive than
+   Docker Desktop's.
+
+**On a fair, like-for-like comparison — both clients in-guest, TCP loopback —
+Akuma is 147 µs against Docker's 38 µs.** That is the number to quote and to
+work on. The 4x ratio survives; where it lives does not.
+
+The original SLIRP hypothesis of §8b was therefore **right, and was discarded on
+bad evidence**: the traced kernel inflated the in-guest arms so much (303–383 µs
+of `printf`) that SLIRP's real 329 µs looked like 18. A contaminated measurement
+does not merely add noise — it inverted a conclusion.
+
+### 9b. The method rule this earns
+
+**Look at the log volume before believing a latency number.** A guest whose
+serial console is emitting a quarter of a million lines during a benchmark is
+not measuring what the benchmark says it measures. `wc -l` on the boot log is
+a one-second check and it invalidated two days of hypothesis at a stroke.
+
+Related, and cheap: `sed -E 's/[0-9]+/N/g' boot.log | sort | uniq -c | sort -rn
+| head` prints the trace histogram. Any line firing per-request is a bug.
+
+## 7. Handoff — in value order## 7. Handoff — in value order
 
 1. **Diagnose §5.** It blocks every guest-level verification. Start from
    `[BKL] dropped window preserved across IRQ` — find who holds the dropped

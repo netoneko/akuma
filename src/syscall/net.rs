@@ -125,7 +125,9 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
             if nonblock {
                 proc.set_nonblock(fd);
             }
-            crate::safe_print!(96, "[syscall] socket(type={}) = fd {}\n", if base_type == 2 { "UDP" } else { "TCP" }, fd);
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                crate::safe_print!(96, "[syscall] socket(type={}) = fd {}\n", if base_type == 2 { "UDP" } else { "TCP" }, fd);
+            }
             return u64::from(fd);
         }
         // Process gone between alloc_socket and current_process.
@@ -332,7 +334,9 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
         return EFAULT;
     }
     let addr = sa.to_addr();
-    crate::safe_print!(96, "[syscall] connect(fd={}, ip={}.{}.{}.{}:{})\n", fd, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port);
+    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        crate::safe_print!(96, "[syscall] connect(fd={}, ip={}.{}.{}.{}:{})\n", fd, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port);
+    }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return EBADF,
@@ -340,15 +344,21 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     let nonblock = fd_is_nonblock(fd);
     match socket::socket_connect(idx, addr, nonblock) {
         Ok(()) => {
-            crate::safe_print!(64, "[syscall] connect(fd={}) = OK\n", fd);
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                crate::safe_print!(64, "[syscall] connect(fd={}) = OK\n", fd);
+            }
             0
         }
         Err(e) if e == libc_errno::EINPROGRESS => {
-            crate::safe_print!(64, "[syscall] connect(fd={}) = EINPROGRESS\n", fd);
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                crate::safe_print!(64, "[syscall] connect(fd={}) = EINPROGRESS\n", fd);
+            }
             EINPROGRESS
         }
         Err(e) => {
-            crate::safe_print!(64, "[syscall] connect(fd={}) = err {}\n", fd, e);
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                crate::safe_print!(64, "[syscall] connect(fd={}) = err {}\n", fd, e);
+            }
             neg_errno(e)
         }
     }

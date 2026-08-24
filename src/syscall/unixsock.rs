@@ -349,7 +349,9 @@ pub fn sys_socket_unix(sock_type: i32, cloexec: bool, nonblock: bool) -> u64 {
     if nonblock {
         proc.set_nonblock(fd);
     }
-    crate::safe_print!(96, "[unix] socket(type={}) = fd {}\n", ty.to_raw(), fd);
+    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        crate::safe_print!(96, "[unix] socket(type={}) = fd {}\n", ty.to_raw(), fd);
+    }
     u64::from(fd)
 }
 
@@ -488,7 +490,9 @@ pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> u64 {
         let outcome = with_table(|t| t.connect(sock, &name, creds));
         match outcome {
             Ok(ConnectOutcome::DgramPeerSet { .. }) => {
-                crate::safe_print!(96, "[unix] connect(fd={}) dgram peer set\n", fd);
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    crate::safe_print!(96, "[unix] connect(fd={}) dgram peer set\n", fd);
+                }
                 return 0;
             }
             Ok(ConnectOutcome::Queued { listener, server_sock }) => {
@@ -522,7 +526,9 @@ pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> u64 {
                     });
                 }
                 wake_accept_waiters(listener);
-                crate::safe_print!(96, "[unix] connect(fd={}) queued\n", fd);
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    crate::safe_print!(96, "[unix] connect(fd={}) queued\n", fd);
+                }
                 return 0;
             }
             // A full backlog is transient: a blocking client waits for the
@@ -606,7 +612,9 @@ pub fn sys_accept(fd: u32, addr_ptr: u64, addrlen_ptr: u64, flags: u32) -> u64 {
             crate::safe_print!(96, "[unix] accept: addr copyout failed\n");
         }
     }
-    crate::safe_print!(96, "[unix] accept(fd={}) = fd {}\n", fd, new_fd);
+    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        crate::safe_print!(96, "[unix] accept(fd={}) = fd {}\n", fd, new_fd);
+    }
     u64::from(new_fd)
 }
 

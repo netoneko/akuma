@@ -458,7 +458,16 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
         }
     });
 
-    if let Some(kind) = added_as {
+    // Gated, like every other trace in this file. Ungated, this fires on EVERY
+    // successful `epoll_ctl` ADD/MOD — and an epoll-driven server re-arms its
+    // interest per request, so a redis PING round trip emitted ~3 of these. Each
+    // line is ~40 bytes out the emulated 16550, one MMIO trap per byte, INSIDE
+    // the request path. Measured 2026-08-24: 244,414 of 246,045 lines of a
+    // running guest's console output (99.3 %) were this single statement, and
+    // removing it took the c=1 redis round trip from 303 us to the numbers in
+    // `docs/archive/LONG_ROAD_TO_REDIS_PART_2.md` §9. Debug tracing must never
+    // be on by default on a request path.
+    if crate::config::SYSCALL_DEBUG_NET_ENABLED && let Some(kind) = added_as {
         let ev_events = event.map_or(0, |(e, _)| e);
         crate::tprint!(96, "[epoll] ctl {} epfd={} fd={} events=0x{:x}\n", kind, epfd, fd, ev_events);
     }
