@@ -82,32 +82,119 @@ and `more-fixes` did not move the compile-time needle.
 
 ---
 
-## 2. Redis — SMP=4, `more-fixes`
+## 2. Redis — measured 2026-08-24/25, `more-fixes` + trace gating
 
-*(running — `scripts/benchmarks/redis_matrix.sh`, results in
-`logs/redis_bench_smp4/`)*
+All figures `c=1` PING unless stated, median of 3, `SMP=4`, on the kernel with
+the ungated `epoll_ctl` trace fixed
+([`LONG_ROAD_TO_REDIS_PART_2.md`](LONG_ROAD_TO_REDIS_PART_2.md) §9 — pre-fix
+numbers are not comparable to anything).
 
-## 3. Redis — SMP=1, `more-fixes`
+### 2a. Apples-to-apples: client and server both inside the box
 
-*(pending)*
+This is the comparison that isolates the OS. Same benchmark, same transport,
+client in the same container/guest as the server.
 
-## 4. Redis — SMP=4, `main`
+| arm | µs/rt | **rps** | **% of Docker** | Docker faster by |
+|---|---:|---:|---:|---:|
+| Akuma, UNIX socket | 41 | **24,390** | — | — |
+| Docker, TCP loopback | 38 | **26,316** | 100 % | 1.0x |
+| Akuma, TCP loopback | 114 | **8,772** | **33 %** | **3.0x** |
 
-*(pending)*
+Two readings:
 
-## 5. Redis — SMP=1, `main`
+- **Akuma's IPC is at parity.** Its UNIX-socket round trip (24,390 rps) is
+  within 8 % of Docker's *TCP loopback* (26,316 rps). Scheduling and process
+  wakeup are not the deficit. (No Docker UNIX-socket control was taken, so this
+  is indicative, not a like-for-like win.)
+- **The gap is Akuma's TCP path**: 41 → 114 µs, i.e. ~70 µs, which is
+  24,390 → 8,772 rps. **That ~70 µs is the whole in-kernel target.**
 
-*(pending)*
+Stability: 41/114 µs reproduced on three separate boots and did not move after
+2,400 connections (41→44, 114→110). Use it as a **boot health check** — a boot
+reading far above it is degraded and its other numbers must be discarded.
 
-## 6. nginx — all arms
+### 2b. Host-driven — what `redis_smp_sweep.py` reports
 
-*(pending — `scripts/benchmarks/bench_nic_rtt.py --mode http`, akuma box on
-port 8080 with `sendfile off` set via a custom `conf.d/default.conf`, Docker on
-port 8082 with stock config)*
+Client on the macOS host through QEMU `hostfwd`. Docker column from
+[`REDIS_ROUND_TRIP_STAGE_TRACE.md`](REDIS_ROUND_TRIP_STAGE_TRACE.md) §4.
+
+| clients | Akuma rps | Docker rps | **Akuma % of Docker** | Docker faster by |
+|---:|---:|---:|---:|---:|
+| 1 | 2,373 | 8,734 | **27 %** | 3.7x |
+| 2 | 3,213 | 15,699 | **20 %** | 4.9x |
+| 4 | 16,807 | 22,422 | **75 %** | 1.3x |
+| 32 | 20,284 | 64,516 | **31 %** | 3.2x |
+
+**~70 % of the host-driven deficit is QEMU, not Akuma.** Host-driven `c=1` is
+476 µs against 114 µs in-guest, so **329 µs is SLIRP plus the host stack**.
+Docker's equivalent hop costs 76 µs (114 → 38). Quote §2a for OS comparisons
+and §2b only as "what our benchmark harness reports".
+
+## 3-5. Redis — other core counts / `main`
+
+*(not run this session)*
+
+## 6. nginx and httpd — NOT ESTABLISHED, and why that is itself the finding
+
+**No trustworthy HTTP number came out of this session.** The same two servers,
+same kernel, same docroot, measured across boots:
+
+| server | measurements across boots |
+|---|---|
+| Akuma `httpd` | 890, 1,100, 1,880 µs (status-validated) |
+| Akuma nginx | 114, 308, 513, **17,800** µs |
+| Docker nginx (in-container control) | ~79 µs (**12,658 rps**) |
+
+nginx spans **150x**. Within any one boot it is tight — 17.2 / 17.0 / 17.5 ms,
+0 failures — so this is a **bimodal system state, not measurement noise**.
+Redis does not do it (41/114 µs every healthy boot), which is what makes the
+asymmetry interesting.
+
+### 6a. The 17 ms is the epoll backstop — a lost wakeup
+
+Characterised while a guest was in the slow regime (`ab -n 100`):
+
+| arm | rps | ms/req |
+|---|---:|---:|
+| nginx `-c 1` | 56 | 17.8 |
+| nginx `-c 4` | 134 | 29.7 |
+| nginx `-c 1 -k` (keep-alive) | 116 | **8.6** |
+
+**Keep-alive exactly halves it**, and 8.6 ms sits right under
+`BLOCKING_POLL_INTERVAL_US` = **10 ms**, the epoll family's `backstop_us`
+(`src/syscall/poll.rs:55`). The shape is ~2 backstop waits per non-keep-alive
+request, ~1 with. So nginx is not computing slowly — **its `epoll_wait` is
+missing the readiness wake and being rescued by the backstop timer.**
+
+This reframes Part B ([`LONG_ROAD_TO_REDIS_PART_2.md`](LONG_ROAD_TO_REDIS_PART_2.md)
+§8): lowering the backstop 10 ms → 1 ms improved sweep `c=1` by ~10 %, which
+now looks like it was **shortening the rescue rather than fixing the miss**.
+**Find the lost wakeup; do not tune the backstop.** Hypothesis, not proof — it
+rests on the 8.6/17.8 ms shape and the constant matching, not on a traced miss.
+
+### 6b. Harness requirements, learned the hard way
+
+Four defects produced the 150x spread before any of it was believable:
+
+1. **Validate status.** `curl -w '%{time_total}'` reports a time for a
+   *connection-refused* request, so a dead server measures as very fast. This
+   produced a phantom "6.8x faster with logging off" that a code change was
+   built on and then reverted. Record `%{http_code}`; discard runs not all-200.
+2. **`--no-keepalive` is TCP keepalive probes**, not HTTP connection reuse. Use
+   `-H 'Connection: close'`, or `ab -k` for the reuse arm.
+3. **One server per boot.** Four servers up made nginx read 6,149 µs where it
+   otherwise read 308.
+4. **The harness degrades the guest.** Repeated `pkill`/start cycles plus
+   thousands of connections drove a guest to where servers stopped starting at
+   all. Take the §2a redis reading each boot to detect it.
+
+`ab` is not in the devbox image; `apk add apache2-utils` installs it and is
+worth doing before any HTTP work — a `/bin/curl` shell loop puts client cost
+inside the measurement.
 
 ## 7. llama.cpp — all arms
 
-*(pending — `scripts/benchmarks/bench_llama.py`)*
+*(not run this session)*
 
 ## 8. Comparison to attempt 0
 

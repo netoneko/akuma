@@ -32,6 +32,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 
 | Symptom | Start here |
 |---|---|
+| nginx (or any epoll server) serves at **~17 ms/request** on some boots and ~0.1 ms on others, 0 failed requests, tight within a boot | A **lost epoll wakeup** rescued by the 10 ms `backstop_us` — `ab -k` halves it, and Akuma's own blocking `httpd` on the same boot is 16x faster. **Do not tune the backstop**: [`archive/NGINX_LOST_WAKEUP.md`](archive/NGINX_LOST_WAKEUP.md) |
 | VM won't boot / hangs early | [`runbooks/debug-boot-hang.md`](runbooks/debug-boot-hang.md) |
 | SSH unreachable or slow to connect | [`runbooks/debug-devbox.md`](runbooks/debug-devbox.md) (devbox) / [`runbooks/debug-ssh-latency.md`](runbooks/debug-ssh-latency.md) |
 | `ssh -p 2222` refused / `Connection reset by peer`, but the box booted fine and herd logged `Started sshd` | Disk populated before 2026-08-10: `sshd.conf` still says `--port 23`, so the box answers on **`-p 2323`**. Re-overlay `bootstrap/etc/` to move it to 22. [`archive/BUILTIN_SSH_REMOVAL.md`](archive/BUILTIN_SSH_REMOVAL.md) |

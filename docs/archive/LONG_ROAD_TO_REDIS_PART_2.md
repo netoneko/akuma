@@ -454,6 +454,47 @@ UNIX/TCP-loopback reading on the same boot as a health check — 41/114 µs is
 the known-good signature, and anything far above it means the boot is degraded
 and its numbers must be thrown away.
 
+### 9e. The 17 ms nginx stall is the epoll backstop — a LOST WAKEUP
+
+Caught while a guest was in the slow regime (`ab -n 100`, all 200s, 0 failures):
+
+| arm | rps | ms/req |
+|---|---:|---:|
+| nginx `-c 1` | 56 | 17.8 |
+| nginx `-c 4` | 134 | 29.7 |
+| nginx `-c 1 -k` (keep-alive) | 116 | **8.6** |
+
+**Keep-alive exactly halves the per-request time**, and 8.6 ms sits just under
+`BLOCKING_POLL_INTERVAL_US` = **10 ms** — the epoll family's `backstop_us`
+(`src/syscall/poll.rs:55`, `WaitPolicy::epoll`). That is ~2 backstop waits per
+non-keep-alive request and ~1 with. nginx is not computing slowly: **its
+`epoll_wait` is missing the readiness wake and the backstop timer is rescuing
+it.**
+
+This is the same shape as `sys_pselect6` registering no waker (§2a) — a wait
+that can only end on the tick — except here the waker exists and the wake is
+being *lost*, not never registered.
+
+**It reframes §8.** Dropping the backstop 10 ms → 1 ms improved sweep `c=1` by
+~10 % and cost 5 % at `c=32`. That now reads as **shortening the rescue rather
+than fixing the miss**. Do not tune `backstop_us`; find the lost wakeup. The
+1 ms arm's `c=1` win is the size of the miss rate, not a scheduling
+improvement.
+
+It also explains the **bimodality** nothing else in this document accounts for:
+nginx measured 114 µs on one boot and 17,800 µs on another, tight within each.
+A boot either lands in a state where these wakes are delivered or one where
+they are not. Redis never shows it (41/114 µs on every healthy boot), so
+whatever is lost is specific to nginx's epoll usage — a different `epoll_ctl`
+re-arm pattern, `EPOLLOUT` interest toggling, or the listening-socket path.
+
+**Status: hypothesis with strong circumstantial support** — the halving, the
+constant matching 10 ms, and 0 failed requests. Nobody has yet traced an actual
+missed wake. The way to prove it: run with `SYSCALL_DEBUG_NET_ENABLED` on a
+slow-regime boot and check whether `epoll_pwait` returns are landing on the
+backstop deadline rather than on a waker, or A/B a 1 ms backstop kernel — if
+the stall becomes ~1.7 ms, it is the backstop by construction.
+
 ### 9b. The method rule this earns
 
 **Look at the log volume before believing a latency number.** A guest whose
