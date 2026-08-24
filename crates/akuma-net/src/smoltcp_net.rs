@@ -1654,9 +1654,27 @@ pub fn socket_create() -> Option<SocketHandle> {
         let tx_buffer = tcp::SocketBuffer::new(vec![0; TCP_TX_BUFFER_SIZE]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
-        // Disable delayed ACK so receive-heavy workloads aren't throttled
-        // to ~65KB/10ms by piggyback waiting.
-        socket.set_ack_delay(None);
+        // Delayed ACK, so a request/response exchange costs ONE transmit
+        // instead of two.
+        //
+        // With `None`, smoltcp ACKs the request the moment it lands — before
+        // the server has produced a reply — so every round trip emits a bare
+        // ACK *and* the response. Measured on redis PING at every core count:
+        // exactly 1.97-2.00 tx packets per rx packet. Each transmit costs
+        // ~14.9 us of `add_notify_wait_pop` spin inside the `NETWORK` lock
+        // (`virtio_rings.rs` header), so the duplicate is ~15 us of the 69 us
+        // serialized budget that sets the throughput ceiling.
+        //
+        // The old comment here justified `None` as avoiding a ~65KB/10ms
+        // throttle on receive-heavy workloads. That does not apply to smoltcp
+        // 0.12: `immediate_ack_to_transmit()` forces an immediate ACK once one
+        // full MSS of unacked data has arrived (the Linux rule), and
+        // `window_to_update()` forces one whenever the receive window doubles.
+        // Bulk receive therefore still ACKs per segment; only the sub-MSS
+        // request/response case waits, which is exactly the case that wants to
+        // piggyback. The timer never actually expires here — redis replies in
+        // ~100 us, far inside the delay — so this costs no latency.
+        socket.set_ack_delay(Some(smoltcp::time::Duration::from_millis(10)));
         SOCKETS_LIVE.fetch_add(1, Ordering::Relaxed);
         Some(net.sockets.add(socket))
     }).flatten()
