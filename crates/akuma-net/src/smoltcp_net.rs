@@ -1786,6 +1786,7 @@ pub fn register_socket_waker(handle: SocketHandle, is_udp: bool, waker: &core::t
     .is_some()
 }
 
+#[must_use]
 pub fn udp_can_recv(handle: SocketHandle) -> bool {
     with_network(|net| {
         net.sockets.get::<udp::Socket>(handle).can_recv()
