@@ -2,11 +2,13 @@
 
 **Date:** 2026-08-24. **Scope:** `src/` and `crates/*/src` (excludes
 `tests.rs`, `#[test]`-gated modules, and anything under a `tests/` directory).
-**Status:** survey (§Findings) **partially remediated**. #1 (`map_user_page`)
+**Status:** survey (§Findings) **fully remediated**. #1 (`map_user_page`)
 fixed 2026-08-24 as `bf0aa54b "use fixed type for page tables"` — verified via
 `docs/runbooks/verify-trim-fat-change.md` Tiers 1/3/5 (host clippy ×4 + tests,
 live fault-path probes, 3/3 clean self-host build trials). #2 (`socket.rs`
-`SOCKET_TABLE`) in progress. #3 (`irq.rs`) still open.
+`SOCKET_TABLE`) fixed. #3 (`irq.rs`) fixed 2026-08-24 — **and its severity
+assessment here was wrong: it is a deadlock, not a style issue, and the fix
+this document prescribed would not have closed it.** See #3.
 
 **One line:** of 301 non-test `Vec<...>` usages, the overwhelming majority are
 legitimately variable-length (path components, `/proc` snapshots, ELF program
@@ -101,7 +103,7 @@ methods (`.iter()`, `.get()`, indexing) the same as `&mut Vec<T>` did.
 Verified: all 4 Tier-1 clippy configs clean, `akuma-net` host tests 138/138,
 full host suite 727/0 (unchanged from before the change).
 
-### 3. `src/irq.rs:36-55` — IRQ handler table
+### 3. `src/irq.rs:36-55` — IRQ handler table — **FIXED 2026-08-24; this finding's severity call was WRONG**
 
 ```rust
 struct IrqHandlers { handlers: Vec<Option<IrqHandler>> }
@@ -110,14 +112,59 @@ while handlers.handlers.len() <= irq as usize { handlers.handlers.push(None); }
 handlers.handlers[irq as usize] = Some(handler);
 ```
 
-The IRQ line count is a fixed property of the GIC, known at boot (and in
-practice bounded well below any register-registration hot loop). Growing the
+The IRQ line count is a fixed property of the GIC, known at boot. Growing the
 vector one `None` at a time up to whatever the highest-registered IRQ number
 happens to be is both an unnecessary heap allocation and a slightly odd
 "vector as sparse array" pattern. A fixed `[Option<IrqHandler>; MAX_IRQ]`
-would be simpler and alloc-free. Lower priority than #1/#2: registration
-happens at boot only, and the per-IRQ-dispatch lookup (`handlers.get(irq)`)
-is O(1) either way — the cost here is design cleanliness, not runtime cost.
+is simpler and alloc-free.
+
+> **The original entry ended here, with: "Lower priority than #1/#2:
+> registration happens at boot only, and the per-IRQ-dispatch lookup is O(1)
+> either way — the cost here is design cleanliness, not runtime cost."
+> Both halves of that are backwards, and the remedy it prescribed is
+> incomplete.** Recorded rather than deleted, because the reasoning error is
+> the reusable lesson: the audit classified every hit on the axis it set out
+> to measure (is this container the right shape?) and never asked the
+> question that actually mattered here (what else is true of the lock this
+> container lives under?).
+
+**This is a deadlock, not a cleanliness issue.** `dispatch_irq` takes
+`IRQ_HANDLERS` — a plain, non-reentrant `spinning_top::Spinlock`, no IRQ
+masking — **from the interrupt vector** (`src/exceptions.rs:2672`, `:2696`).
+`register_handler` called `crate::gic::enable_irq(irq)` **while still holding
+that same lock**. If the line it just enabled delivers on this core before the
+guard drops, the core spins forever against itself. It does so **with the BKL
+held**, which is what promotes a one-core self-deadlock into the
+`[BKL] stuck: owner=N` storm every other core piles into.
+
+**"Registration happens at boot only" is what makes it dangerous, not safe.**
+Boot is the one moment a line gets enabled underneath the lock its own handler
+needs — and it is also when the window is widest, because the `Vec` growth
+loop ran up to 49 heap allocations inside the lock before `enable_irq` was
+reached.
+
+**The prescribed fix (swap `Vec` → array) is necessary but NOT sufficient.**
+It removes the allocations and shrinks the window to a few instructions, but
+leaves `enable_irq` under the lock, so the deadlock survives — rarer, and
+therefore harder to ever diagnose. The landed fix does both halves:
+
+- `handlers: [Option<IrqHandler>; MAX_IRQ]` with `MAX_IRQ = 256` (~2 KB
+  `.bss`), so the hold is O(1) and allocation-free;
+- the publish happens inside `with_irqs_disabled`, and **`enable_irq` moved
+  outside the lock entirely.**
+
+**Evidence, and its limits.** Observed once directly: an `SMP=4` boot froze
+between two adjacent prints — `[SmolNet] Initialized successfully (VirtIO +
+Loopback)` and `[Net] virtio-net IRQ: slot 0 -> INTID 48`, i.e. inside
+`register_handler` — with `[BKL] stuck: owner=1 waiter=2/3/4 (aff0+1)`, so
+core 0 held the BKL and all three secondaries were behind it. The static
+argument above is solid on its own; the causal link to that particular freeze
+is strong but rests on **one** reproduction, and the failure is intermittent
+by nature (it needs an interrupt inside the window). Do not upgrade it to
+"the cause of the SMP=4 storms" without more runs — the `tag=511` storm class
+is load-driven and predates this
+(`docs/archive/BKL_TAG511_STORM_IS_LOAD_DRIVEN` / the memory note of the same
+name).
 
 ## Checked and ruled out — bounded, but `Vec` is still correct
 
@@ -173,6 +220,15 @@ is O(1) either way — the cost here is design cleanliness, not runtime cost.
 
 ## Suggested next step
 
-#1 and #2 are done (see their sections above). `irq.rs`'s IRQ handler table
-(#3) is the only one left — boot-time-only, lowest priority, same shape as
-#2 (`[Option<IrqHandler>; MAX_IRQ]` sized to the GIC's fixed IRQ line count).
+All three findings are remediated. Two things this audit did **not** cover are
+worth a follow-up:
+
+1. **The terminal `canon_buffer` gap** flagged under "checked and ruled out"
+   is a real unbounded-growth bug, not a Vec-vs-buffer question:
+   `crates/akuma-terminal/src/lib.rs:237,248` `push` per byte with no cap,
+   where Linux's N_TTY stops a canonical line at 4095. It is still open.
+2. **Re-read the "ruled out" list for lock context, not container shape.**
+   #3's mistake was that the audit asked only whether the container was the
+   right shape. The question that caught the real bug was "what else runs
+   under this lock, and from what context?" — every remaining `Vec` behind a
+   lock that IRQ or fault context can also take deserves that second pass.

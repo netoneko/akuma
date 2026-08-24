@@ -1,6 +1,5 @@
 // IRQ handler registration and dispatch
 
-use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
 // ============================================================================
@@ -35,26 +34,53 @@ pub use akuma_primitives::irq::{mask_irqs_sync as disable_irqs, unmask_irqs as e
 
 type IrqHandler = fn(u32);
 
+/// INTIDs this kernel can register a handler for. The GIC's SPI space ends at
+/// 1020, but every registration in the tree is either the timer PPI (27) or a
+/// virtio-mmio SPI (`VIRTIO_INTID_BASE` 48 + slot, 32 slots on qemu-virt), so
+/// 256 covers the space with room to spare at a cost of 2 KB of `.bss`.
+const MAX_IRQ: usize = 256;
+
 struct IrqHandlers {
-    handlers: Vec<Option<IrqHandler>>,
+    /// Fixed table, **not** a `Vec`. This is an IRQ-context data structure:
+    /// `dispatch_irq` takes the lock below from the interrupt vector, so
+    /// anything that can allocate — or merely take a while — while the lock is
+    /// held is a deadlock waiting for the right interrupt. The `Vec` this
+    /// replaced grew by `push`ing `None` one entry at a time until it reached
+    /// the requested INTID, i.e. up to 49 heap allocations **inside** that
+    /// lock, on the boot path, with the BKL held.
+    handlers: [Option<IrqHandler>; MAX_IRQ],
 }
 
 static IRQ_HANDLERS: Spinlock<IrqHandlers> = Spinlock::new(IrqHandlers {
-    handlers: Vec::new(),
+    handlers: [None; MAX_IRQ],
 });
 
 /// Register an IRQ handler
 pub fn register_handler(irq: u32, handler: IrqHandler) {
-    let mut handlers = IRQ_HANDLERS.lock();
-
-    // Ensure the handlers vector is large enough
-    while handlers.handlers.len() <= irq as usize {
-        handlers.handlers.push(None);
+    let idx = irq as usize;
+    if idx >= MAX_IRQ {
+        // Out of range for the table. Match `gic::enable_irq`'s posture for an
+        // invalid INTID (ignore) rather than enabling a line nothing can service.
+        return;
     }
 
-    handlers.handlers[irq as usize] = Some(handler);
+    // Publish the handler with IRQs masked and the lock dropped BEFORE the line
+    // is enabled. Both halves matter, and both were wrong:
+    //
+    // 1. `enable_irq` used to run while this lock was held. `dispatch_irq` takes
+    //    the same NON-reentrant spinlock from the interrupt vector, so if the
+    //    newly-enabled line delivered on this core before the guard dropped, the
+    //    core deadlocked against itself — while holding the BKL, which promotes a
+    //    one-core stall into the `[BKL] stuck: owner=N` storm every other core
+    //    piles into. Enabling after the guard drops closes that window.
+    // 2. Masking keeps the hold atomic against this core's own interrupts, so an
+    //    ALREADY-enabled line (the timer PPI is registered twice — probe handler,
+    //    then the real one) cannot re-enter the lock mid-update either.
+    with_irqs_disabled(|| {
+        IRQ_HANDLERS.lock().handlers[idx] = Some(handler);
+    });
 
-    // Enable the IRQ in GIC
+    // Outside the lock: this can deliver `irq` on this core immediately.
     crate::gic::enable_irq(irq);
 }
 

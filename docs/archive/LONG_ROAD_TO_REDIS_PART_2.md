@@ -181,6 +181,14 @@ Traps from this investigation worth keeping:
   the QEMU process. The "wedge" sat at 4.5 %, which is an idle guest — the one
   reading that is inconsistent with the "i.e. a spin" the log line was taken to
   mean.
+- **A console line is not atomic at SMP>1** — the console lock is currently
+  off, so another core can split a line mid-write. A real boot produced
+  `[herd] Started [syscall] socket(type=TCP) = fd 3` / `sshd (pid= 2)`, i.e.
+  `Started sshd` cut in half, and a boot-health check that grepped for that
+  marker reported a **false failure on a healthy VM**. Any marker grep can be
+  split this way, `grep -ac PASSED` included. Where the thing being tested is
+  reachability, probe the service (an actual SSH round-trip); where it must be
+  a grep, match a fragment that cannot straddle the split.
 
 ## 6. What did NOT happen
 

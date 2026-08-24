@@ -42,6 +42,11 @@ pub mod cc_index {
     pub const VEOL: usize   = 11;
 }
 
+/// Maximum bytes buffered for one canonical-mode input line, matching Linux
+/// N_TTY's ceiling. Input beyond this is discarded until a line terminator
+/// arrives; see [`TerminalState::canon_buffer`].
+pub const MAX_CANON: usize = 4095;
+
 /// Represents the state of a virtual terminal for an SSH session.
 #[derive(Debug)]
 pub struct TerminalState {
@@ -73,7 +78,12 @@ pub struct TerminalState {
     /// Waker for tasks waiting on input
     pub input_waker: Spinlock<Option<core::task::Waker>>,
 
-    /// Canonical mode line buffer (current line being edited)
+    /// Canonical mode line buffer (current line being edited).
+    ///
+    /// Bounded by [`MAX_CANON`]: this grows one byte per keystroke and is only
+    /// drained by a line terminator, so without a cap a peer that writes to a
+    /// tty in canonical mode and never sends `\n` grows kernel heap without
+    /// limit. Linux's N_TTY has the same ceiling for the same reason.
     pub canon_buffer: alloc::vec::Vec<u8>,
     /// Canonical mode ready buffer (completed lines awaiting read)
     pub canon_ready: VecDeque<u8>,
@@ -244,11 +254,18 @@ impl TerminalState {
                 }
                 let line: alloc::vec::Vec<u8> = self.canon_buffer.drain(..).collect();
                 self.canon_ready.extend(line);
-            } else {
+            } else if self.canon_buffer.len() < MAX_CANON {
                 self.canon_buffer.push(byte);
                 if echo_on {
                     echo.push(byte);
                 }
+            } else {
+                // Line is at MAX_CANON with no terminator yet: drop the byte,
+                // and do NOT echo it — echoing input that was discarded would
+                // desynchronise the user's view of the line from its contents.
+                // The `\n`/VEOF branches above deliberately stay uncapped so a
+                // full line can always still be terminated and drained; capping
+                // those would wedge the line instead of truncating it.
             }
         }
 
@@ -483,6 +500,31 @@ mod tests {
         assert_eq!(partial, b"hello");
         let rest = ts.drain_canon_ready(64);
         assert_eq!(rest, b" world\n");
+    }
+
+    #[test]
+    fn canon_buffer_is_capped_at_max_canon() {
+        // Without the MAX_CANON cap this asserts 10_000 == 4095 and fails:
+        // the buffer grew one byte per keystroke with nothing to stop it, so a
+        // peer writing to a tty in canonical mode and never sending `\n` grew
+        // kernel heap without bound.
+        let mut ts = default_ts();
+        ts.process_canon_input(&[b'x'; 10_000]);
+        assert_eq!(ts.canon_buffer.len(), MAX_CANON);
+        assert!(ts.canon_ready.is_empty(), "no terminator seen, nothing is ready");
+    }
+
+    #[test]
+    fn capped_line_can_still_be_terminated() {
+        // The cap must truncate the line, not wedge it: `\n` is still accepted
+        // on a full buffer and still completes the line.
+        let mut ts = default_ts();
+        ts.process_canon_input(&[b'x'; 10_000]);
+        ts.process_canon_input(b"\n");
+        assert!(ts.canon_buffer.is_empty(), "terminator must drain the line");
+        let ready = ts.drain_canon_ready(usize::MAX);
+        assert_eq!(ready.len(), MAX_CANON + 1, "truncated line plus its \\n");
+        assert_eq!(*ready.last().unwrap(), b'\n');
     }
 
     #[test]
