@@ -203,6 +203,60 @@ Traps from this investigation worth keeping:
 - **`extreme-size` clippy** was not run (`cargo test` and the other clippy legs
   were, and are clean).
 
+## 8. Part B — the epoll backstop, measured
+
+`WaitPolicy::epoll`'s `backstop_us` is `BLOCKING_POLL_INTERVAL_US`
+(`src/syscall/poll.rs:55`), one constant with one call site. §7 item 5 proposed
+lowering it toward `wait_until`'s 3 ms. Measured, `--smp 4 --repeats 3`, against
+the Step A control in §7:
+
+| clients | Step A (10 ms) | 1 ms | delta |
+|---:|---:|---:|---:|
+| 1 | 2,373 | **2,606** | **+9.8 %** |
+| 2 | 3,213 | 4,026 | +25 % |
+| 4 | 16,807 | 16,447 | −2.1 % |
+| 32 | 20,284 | **19,268** | **−5.0 %** |
+
+**The c=1 gain is real and the c=32 loss is real; the middle is noise.** At
+c=1 the three runs went 2303/2373/2477 → 2550/2606/2735 — **no overlap**, every
+1 ms run beating every 10 ms run. At c=32, 20080/20284/20367 → 19194/19268/19960,
+which is barely disjoint. c=2 and c=4 overlap and prove nothing on their own
+(c=2's control spread is 125 %, see §7). This is a latency/throughput trade of
+the same family as the 1 ms scheduler tick one, and it should be read as such.
+
+**It is not where the hole is.** c=1 moved 421 → 384 µs/rt against Docker's
+114 µs. The backstop was worth ~37 µs, not the ~600 µs §4 of
+[`REDIS_ROUND_TRIP_STAGE_TRACE.md`](REDIS_ROUND_TRIP_STAGE_TRACE.md) is looking
+for. The hypothesis that a missed wake routinely costs a full backstop is
+**disconfirmed**: if it were, cutting the backstop 10x would have moved c=1 far
+more than 10 %.
+
+### 8a. §4's "688 µs" is stale, and the number matters for how it is quoted
+
+That figure comes from a c=1 arm running **1,321 rps / 757 µs per round trip**.
+The same sweep on a fresh boot today gives **2,373–2,606 rps / 384–421 µs**.
+Whatever else is true, c=1 is roughly **2x faster than when §4 was written**, so
+"688 µs unexplained, nine times the entire saturated round-trip budget" is no
+longer the live number — the gap to re-explain is closer to ~300 µs. Re-measure
+the decomposition before quoting §4's arithmetic.
+
+### 8b. The measurement includes QEMU, and nobody has subtracted it
+
+`scripts/benchmarks/redis_conc_sweep.py` runs `redis-benchmark -h 127.0.0.1 -p
+<hostfwd port>` **on the host**. Every round trip therefore crosses QEMU's
+**SLIRP** userspace TCP stack in the QEMU main loop, then virtio-net, then
+Akuma. The Docker control it is compared against goes through Docker Desktop's
+VM networking instead — a different, much shorter path. **An unknown share of
+the 3.7x gap is the emulated NIC, not the kernel**, and no arm in this document
+or in `REDIS_ROUND_TRIP_STAGE_TRACE.md` has isolated it.
+
+The cheap experiment nobody has run: `redis-benchmark` **inside the guest**
+against `127.0.0.1`, which drops SLIRP, virtio and the host stack out of the
+loop. It bounds Akuma's own socket path rather than subtracting SLIRP exactly
+(in-guest loopback is the loopback ring, not the NIC path), but it is the
+difference between "Akuma is 3.7x slower than Docker" and a claim that survives
+questioning. **Do this before quoting any Akuma-vs-Docker ratio.**
+
 ## 7. Handoff — in value order
 
 1. **Diagnose §5.** It blocks every guest-level verification. Start from

@@ -755,6 +755,9 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
         // nested IRQ from ever observing this core "holding NETWORK, wanting the BKL".
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_open();
+        // The drain below is `#[cfg(feature = "smoltcp")]`, so on a rump-only
+        // build nothing ever assigns this and the `mut` is genuinely unused.
+        #[cfg_attr(not(feature = "smoltcp"), allow(unused_mut))]
         let mut progress = false;
         for _ in 0..budget {
             #[cfg(feature = "smoltcp")]
@@ -1030,6 +1033,9 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
         // `sys_epoll_pwait` poll() call above.
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_open();
+        // The drain below is `#[cfg(feature = "smoltcp")]`, so on a rump-only
+        // build nothing ever assigns this and the `mut` is genuinely unused.
+        #[cfg_attr(not(feature = "smoltcp"), allow(unused_mut))]
         let mut progress = false;
         for _ in 0..budget {
             #[cfg(feature = "smoltcp")]
@@ -1460,6 +1466,9 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
         // `sys_epoll_pwait` poll() call above.
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_open();
+        // The drain below is `#[cfg(feature = "smoltcp")]`, so on a rump-only
+        // build nothing ever assigns this and the `mut` is genuinely unused.
+        #[cfg_attr(not(feature = "smoltcp"), allow(unused_mut))]
         let mut progress = false;
         for _ in 0..budget {
             #[cfg(feature = "smoltcp")]
