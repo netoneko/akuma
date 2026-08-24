@@ -3,10 +3,12 @@
 Current-state architecture for the VFS layer, file descriptors, ext2, procfs,
 mount namespaces, and pipes/PTY.
 
-> **Stability: A (stable).** VFS/ext2/procfs have been dormant since Mar 2026 —
-> the lowest-churn subsystem. The `VFS_LOCK_OPTIMIZATION_PLAN.md` is planning,
-> not a fire. Safe to trust; verify the SubdirFs box-root limitations if doing
-> container rootfs isolation.
+> **Stability: A (stable).** VFS/ext2/procfs were dormant from Mar 2026 until
+> **2026-08-24 ("mount now works")**, which landed real `umount2`/`MS_REMOUNT`,
+> multi-disk `mount(2)`, real `statfs`/`fstatfs`, and `/proc/mounts` +
+> `/proc/filesystems` + `/etc/mtab` — see "Mount table" and "procfs" below.
+> The `VFS_LOCK_OPTIMIZATION_PLAN.md` is planning, not a fire. Safe to trust;
+> verify the SubdirFs box-root limitations if doing container rootfs isolation.
 
 ## VFS layer
 
@@ -23,6 +25,43 @@ the `akuma_vfs` crate.
   paths. See `archive/CWD.md`.
 - **`write_at` syscall** (`archive/WRITE_AT_SYSCALL.md`) — the streaming write
   optimization that avoids slurping into kernel heap.
+- **Remount / unmount** (`vfs/mod.rs:179,190`, `#[cfg(feature =
+  "sc-containers")]`): `remount` flips the global table's stored `MS_RDONLY`
+  bit; `unmount` refuses `/` (`FsError::PermissionDenied`) and otherwise drops
+  the entry. Both operate on the global table only — a box's namespace mounts
+  are composed from outside via `MOUNT_IN_NS` and torn down with the box, so
+  neither of these can empty a box's namespace and trigger the `with_fs`
+  global-fallback hazard below. Real since 2026-08-24 — before, `sys_umount2`
+  returned `EPERM` unconditionally. Syscall boundary:
+  [`syscalls/container.md`](syscalls/container.md) "mount / umount2".
+- **`statfs`/`fstatfs`** (`vfs/mod.rs:660` `stats_for_path`, called from
+  `syscall::fs`, not `syscall::container`): resolves a path the same way file
+  operations do and returns the mount's real `FsStats` + `MS_RDONLY` as
+  `ST_RDONLY`. Real since 2026-08-24 — before, `fstatfs` returned hardcoded
+  numbers for every fd and `statfs` was undispatched. Detail:
+  [`syscalls/fs.md`](syscalls/fs.md) "statfs / fstatfs".
+- **`/proc/mounts` / `/proc/filesystems` / `/etc/mtab`** (added 2026-08-24):
+  `render_mounts` (`vfs/mod.rs:687`) renders `/proc/mounts` rows
+  allocation-free into a caller stack buffer while holding the mount locks,
+  via `akuma_primitives::console::FmtBuf` — **not** a hand-rolled writer; the
+  console-print rule (`console.md` "Printing rules") applies here too even
+  though this isn't a console path, per the pre-commit hook's blanket
+  `impl core::fmt::Write` grep. Mount set = the target process's namespace
+  mounts, then any global mounts the namespace doesn't already shadow — the
+  same set `with_fs` can actually resolve. **Box policy:** a boxed viewer sees
+  *which* paths are mounted into it, never *where they came from* — the
+  source column reports `none`; the host sees real sources. `/etc/mtab` is
+  virtual too, intercepted before `with_fs` (`is_mtab`/`mtab_rows`,
+  `vfs/mod.rs:628`) and rendered from the same live tables on every read —
+  nothing is stored on disk, so it can never drift stale the way a real file
+  would the moment a mount changes.
+- **Multi-disk `mount(2)`** (added 2026-08-24): `crate::block` now tracks up to
+  `MAX_BLOCK_DEVICES = 4` virtio-blk devices (`vda`..`vdd`,
+  `crates/akuma-virtio/src/block.rs`), not just the boot disk. `mount(2)` with
+  fstype `"ext2"` and a `source` device name calls
+  `crate::vfs::ext2::mount_device(idx, Some(16 MiB))` — a fixed, small cache
+  cap rather than the root's global budget, which never shrinks. See "ext2"
+  below.
 
 ## File descriptors
 
@@ -47,8 +86,15 @@ CLOEXEC stripping at exec). epoll fds are stripped on fork (not refcounted).
 
 ## ext2
 
-`src/vfs/ext2.rs` bridges `akuma_ext2` to the kernel block device
-(`KernelBlockDevice` → `src/block.rs` VirtIO block). Mount at boot.
+`src/vfs/ext2.rs` bridges `akuma_ext2` to the kernel block devices
+(`KernelBlockDevice { idx }` → `crate::block::{read,write}_bytes_at` — VirtIO
+block, `crates/akuma-virtio/src/block.rs`). Boot mounts device 0 (`vda`) at
+`/`; `mount_device(idx, cache_cap)` (added 2026-08-24) mounts any other
+registered device (`crate::block::device_index_by_name`), giving a runtime
+data disk its own `Ext2Filesystem` instance with a small fixed cache rather
+than sharing or re-committing the root's global cache budget. See "Mount
+table" above and [`syscalls/container.md`](syscalls/container.md) "mount /
+umount2".
 
 - **`first_data_block`:** off-by-one fix (`archive/EXT2_FIRST_DATA_BLOCK_FIX.md`).
 - **`getdents64`:** directory cache fix (`archive/GETDENTS64_DIR_CACHE_FIX.md`).
@@ -71,6 +117,9 @@ CLOEXEC stripping at exec). epoll fds are stripped on fork (not refcounted).
 | `/proc/self/…` | resolves to the calling process's pid (see below) |
 | `/proc/cores` | static single-row table (`0 online bsp`) |
 | `/proc/boxes` | box listing |
+| `/proc/mounts` | the caller's mount set (its namespace if boxed, the global table on the host) — `crate::vfs::render_mounts`, added 2026-08-24 |
+| `/proc/filesystems` | supported fstypes, one per line: `ext2`/`proc`/`tmpfs`, plus `overlay` under `sc-containers` — added 2026-08-24 |
+| `/etc/mtab` | not procfs, but the same idea and the same renderer: a virtual file, intercepted in `src/vfs/mod.rs` before any real filesystem is touched — see "Mount table" above |
 
 > `ps`/`top` parse `/proc/<pid>/stat` (compact), not `status`. The `stat` file
 > was added after `ps` showed nothing (`archive/PROCFS.md`).
@@ -141,3 +190,6 @@ namespace.
 - `archive/VFS_LOCK_OPTIMIZATION_PLAN.md` (planning, not a fire).
 - `archive/BOX_SUBDIR_FS_LIMITATIONS.md`, `archive/STAT_AND_UNLINKAT_FIX.md`,
   `archive/PIPE_TTY_FIX.md`, `archive/WRITE_AT_SYSCALL.md`.
+- `archive/MOUNT_MISSING_SYSCALLS.md` — the pre-2026-08-24 audit of everything
+  under "Mount table" above: what was missing (`umount2`, `MS_REMOUNT`, real
+  `statfs`, `/proc/mounts`, multi-disk) and why, before it was built.

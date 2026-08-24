@@ -26,6 +26,16 @@ bundles — none of which are re-derived here — see
 > `SIGWINCH`, and a `force`-displaced holder gets a terminal-reset escape
 > sequence and a real, disposition-aware `SIGTERM` rather than a raw
 > force-stop — see "reattach" below for both.
+> **Changed 2026-08-24 ("mount now works",** `docs/archive/MOUNT_MISSING_SYSCALLS.md`
+> **§7 build list):** `sys_umount2` actually unmounts now (still `EBUSY` on
+> `/`); `sys_mount` honors `MS_REMOUNT` (flips the stored `MS_RDONLY` bit via
+> `crate::vfs::remount`) and gained a real `"ext2"` fstype for mounting a
+> second virtio-blk disk by device name (`source`, up to 4 devices —
+> `crate::block::device_index_by_name`). `statfs`/`fstatfs` now report the
+> resolved mount's real stats instead of hardcoded numbers — see
+> [`fs.md`](fs.md) "statfs / fstatfs", which is also where that code now
+> lives (moved out of `container.rs` so it still builds without
+> `sc-containers`, since both syscalls dispatch unconditionally).
 
 ## register_box / kill_box
 
@@ -109,24 +119,56 @@ and exit on its own instead of spinning forever after it. See
 
 ## mount / umount2
 
-`sys_mount` and `sys_umount2` are **host-only, and umount2 always fails.**
+`sys_mount` and `sys_umount2` are **host-only** (`caller_may_mount`: `box_id ==
+0`). Until 2026-08-24 `umount2` failed unconditionally and `mount` ignored
+`source`/`flags`; both now do real work — see the Stability note above.
 
 `sys_mount` copies `target`/`fstype` as NUL-terminated strings
-(`copy_from_user_str`, capped at 256/64 bytes) and hard-codes the mountable
-filesystem set to two types: `"proc"` → `ProcFilesystem`, `"tmpfs"` →
-`MemoryFilesystem`; anything else is `ENODEV`. It operates on the global VFS
-mount table, because only box 0 can reach it.
+(`copy_from_user_str`, capped at 256/64 bytes) and operates on the global VFS
+mount table, because only box 0 can reach it. `flags & MS_REMOUNT` takes a
+short-circuit path: `crate::vfs::remount` just flips the stored `MS_RDONLY`
+bit on an existing mount (`fs`/`source` args ignored, matching Linux) and
+returns before the fstype switch runs — Linux requires the target to already
+be a mount point, which `remount` enforces via `NotFound`.
 
-A caller whose `box_id != 0` gets `EPERM` from both. Until 2026-08-11 a boxed
-process could mount into its own namespace and unmount anything except `/`; now
-a box's namespace is composed entirely from outside, by box 0, before the box
-runs — see [`../containers.md`](../containers.md) -> "Mount policy: composed
-from outside, once" for why, and for the consequence that a container cannot
-build a container. `sys_umount2` validates its pointer argument and then fails
-for everyone: box 0 never used it either.
+For a fresh mount, `target` must resolve to an existing directory (`ENOTDIR`/
+the resolve error otherwise — this never gates `/` or `/proc` at boot, which
+bypass this arm). The fstype set is now three, not two:
 
-`_source_ptr`/`_flags`/`_data_ptr` on `sys_mount` are accepted but unused —
-loopback devices, bind mounts, and mount flags are not implemented.
+| `fstype` | Filesystem | `source` |
+|---|---|---|
+| `"proc"` | `ProcFilesystem` | ignored |
+| `"tmpfs"` | `MemoryFilesystem` | ignored |
+| `"ext2"` | `crate::vfs::ext2::mount_device` on the device `source` names | required — `crate::block::device_index_by_name(source)`, `ENODEV` if no such device or it has no ext2 magic |
+| anything else | — | `ENODEV` |
+
+Any device already registered by `crate::block::init` (`vda`..`vdd`, up
+to `MAX_BLOCK_DEVICES = 4`) can be mounted this way, including `vda` itself
+(already mounted at `/`, so the duplicate-path check is what stops a second
+root). A data-disk instance gets a small fixed 16 MiB cache cap rather than the
+root's global budget, which never shrinks. `mount_errno` maps the VFS error to
+its Linux errno (`NoSpace`→`ENOMEM`, `AlreadyExists`→`EBUSY`, `NotFound`→
+`ENOENT`, `NotADirectory`→`ENOTDIR`, `ReadOnly`→`EROFS`, else `EINVAL`) instead
+of folding everything into `EINVAL` as before.
+
+A caller whose `box_id != 0` gets `EPERM` from both `mount` and `umount2`.
+Until 2026-08-11 a boxed process could mount into its own namespace and
+unmount anything except `/`; now a box's namespace is composed entirely from
+outside, by box 0, before the box runs — see
+[`../containers.md`](../containers.md) -> "Mount policy: composed from
+outside, once" for why, and for the consequence that a container cannot build
+a container.
+
+`sys_umount2` canonicalizes `target`, refuses `/` unconditionally (`EBUSY`,
+like Linux — the boot root stays for the boot's lifetime), and otherwise calls
+`crate::vfs::unmount` on the global table. It only ever touches the global
+table: a box's namespace mounts are composed from outside via `MOUNT_IN_NS`
+and torn down with the box, so this arm cannot empty a box's namespace and
+trigger the `with_fs` global-table fallback hazard documented in
+[`../vfs.md`](../vfs.md).
+
+`_data_ptr` on `sys_mount` is still accepted but unused — bind mounts and
+loopback devices are not implemented.
 
 ## mount_in_ns
 

@@ -57,6 +57,7 @@ repeated.
 | `dup` | 23 | `sys_dup` |
 | `dup3` | 24 | `sys_dup3` |
 | `fcntl` | 25 | `sys_fcntl` |
+| `statfs` | 43 | `sys_statfs` |
 | `fstatfs` | 44 | `sys_fstatfs` |
 | `renameat2` | 276 | `sys_renameat2` |
 | `statx` | 291 | `sys_statx` |
@@ -217,6 +218,35 @@ clears `dir_cache` on seek-to-zero) or closing and reopening the fd. See
 `../vfs.md` "ext2" `GETDENTS64_DIR_CACHE_FIX.md` for why this caching exists
 at all (a directory-cache bug, not a design from scratch).
 
+## `statfs` / `fstatfs` — real mount stats since 2026-08-24
+
+Before 2026-08-24, `fstatfs` returned hardcoded fiction (`f_type=0xEF53`,
+65536 blocks) for every fd and `statfs` was undispatched entirely — every
+filesystem sized identically to `df`-style tools
+(`docs/archive/MOUNT_MISSING_SYSCALLS.md` §3.2). Both now resolve the target
+the way file operations do (`crate::vfs::stats_for_path`, which goes through
+the same spawn-override → namespace → global-table order as every other path
+lookup) and report the real mount's `FsStats` plus its `MS_RDONLY` bit as
+`ST_RDONLY`.
+
+`sys_fstatfs` (`fs.rs:1420`) resolves the fd to its `File`'s path first —
+non-file fds (pipes, sockets) have no path, so it reports the root mount
+instead, matching what nothing in-tree actually branches on. `sys_statfs`
+(`fs.rs`, next to it) resolves a user-supplied path directly. Both funnel
+through the same `statfs_into` writer, which fills the standard 120-byte
+`struct statfs` layout and maps `Filesystem::name()` to a `statfs` magic
+number (`fs_magic`: `ext2`→`0xEF53`, `proc`→`0x9FA0`, `memfs`/`tmpfs`→
+`0x01021994`, `overlay`/`subdirfs`→`0x794C7630`, else `0xADF5`).
+
+**This code lives in `fs.rs`, not `container.rs`, on purpose.** `STATFS`/
+`FSTATFS` dispatch unconditionally in `syscall/mod.rs` — they are ordinary
+POSIX syscalls, not container-specific — but `container` is `#[cfg(feature =
+"sc-containers")]`-gated and absent from the `extreme-size` build. The
+functions were briefly implemented in `container.rs` during the same change
+and had to move once `extreme-size` clippy caught the missing-module
+compile error; `mount`/`umount2`/`mount_in_ns` and everything else box-shaped
+stay in `container.rs`, correctly gated.
+
 ## Other syscall-boundary gaps worth knowing
 
 - **`linkat` is not a real hardlink.** `sys_linkat` (`fs.rs:2177`) implements
@@ -266,3 +296,6 @@ at all (a directory-cache bug, not a design from scratch).
   that `READ_EBADF_TRACE` (`fs.rs:20`) exists to localize.
 - `archive/WRITE_AT_SYSCALL.md` — the streaming write path `sys_write`/
   `sys_pwrite64` call into (full detail in `../vfs.md`, not here).
+- `archive/MOUNT_MISSING_SYSCALLS.md` §3.2 — the `statfs`/`fstatfs` audit
+  behind the real-stats fix above; §3.11 behind `mount_errno`'s errno mapping
+  (see [`container.md`](container.md) "mount / umount2").

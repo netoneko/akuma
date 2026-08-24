@@ -49,7 +49,7 @@ the box's recorded `creator_pid`.
 | `SET_BOX_STACK` | `can_access_box` | `EPERM` |
 | `MOUNT_IN_NS` | caller must be box 0. With fstype `overlay` at `/`, the target box must additionally have **no processes** and a still-pristine root | `EPERM` |
 | `MOUNT` | caller must be box 0 (since 2026-08-11 — a boxed process could previously mount into its own namespace) | `EPERM` |
-| `UMOUNT2` | nobody: box 0 never used it, and a box may not take mounts away any more than it may add them (since 2026-08-11 — a box could previously unmount anything but `/`) | `EPERM` |
+| `UMOUNT2` | caller must be box 0 (since 2026-08-11 — a box could previously unmount anything but `/`); real since 2026-08-24, always `EBUSY` on `/` | `EPERM` |
 
 `SubdirFs` resolves `.`/`..` and clamps at the virtual root before prefixing, so
 a `..` cannot ascend out of `box_root` even if a caller reaches the filesystem
@@ -333,6 +333,10 @@ boxed service.
 - `archive/BOX_DOCKER_COMPAT.md` — `box run`, the layer store and `OverlayFs`,
   the mount lockdown, and the two bugs found underneath (busybox tar +
   `linkat`-copies-files; `spawn_ext` and shebangs).
+- `archive/MOUNT_MISSING_SYSCALLS.md` — the audit behind `umount2`/`MS_REMOUNT`/
+  multi-disk `mount(2)` becoming real 2026-08-24; see
+  [`syscalls/container.md`](syscalls/container.md) "mount / umount2" for the
+  current syscall-boundary behavior.
 - `userspace/box/docs/OCI_IMAGE_PULL.md`, `userspace/herd/docs/CORE_AWARE_SCHEDULING.md`.
 - `archive/REDIS_END_TO_END.md` — running the official `redis:alpine` image end
   to end: what `#!`-in-spawn, the `PATH`, the credential syscalls and
