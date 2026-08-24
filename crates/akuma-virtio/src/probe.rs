@@ -154,3 +154,40 @@ pub fn probe_with<T>(
     }
     None
 }
+
+/// Visit **every** virtio-mmio slot advertising `device_id`, not just the first.
+///
+/// `f` receives `(slot_index, transport)` for each match and returns whether to
+/// keep scanning (`true`) or stop early (`false`). Same per-slot skip-and-log
+/// behaviour as [`probe_with`]: a slot whose transport fails to init is logged
+/// and the sweep moves on.
+///
+/// This is the multi-device discovery primitive — `block::init` uses it to
+/// register every virtio-blk on the machine (vda, vdb, …) rather than stopping
+/// at the first.
+pub fn probe_each(
+    device_id: u32,
+    mut f: impl FnMut(usize, SteppedMmioTransport<'static>) -> bool,
+) {
+    for (i, addr) in (0..num_slots()).map(|i| (i, slot_addr(i))) {
+        if device_id_at(addr) != device_id {
+            continue;
+        }
+
+        let Some(header) = core::ptr::NonNull::new(addr as *mut VirtIOHeader) else {
+            continue;
+        };
+
+        // SAFETY: same as `probe_with` — header points at a virtio-mmio header
+        // whose DeviceID we just matched.
+        let mmio_size = akuma_primitives::addr::virtio_stride();
+        let Ok(transport) = (unsafe { MmioTransport::new(header, mmio_size) }) else {
+            crate::safe_print!(64, "[virtio] slot {i}: device {device_id} transport init failed\n");
+            continue;
+        };
+
+        if !f(i, SteppedMmioTransport::new(transport)) {
+            return;
+        }
+    }
+}

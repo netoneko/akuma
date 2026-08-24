@@ -72,11 +72,11 @@ mod path_tests {
 }
 
 #[cfg(test)]
-mod mount_tests {
-    extern crate alloc;
-    use alloc::sync::Arc;
+ mod mount_tests {
+     extern crate alloc;
+     use alloc::sync::Arc;
 #[allow(unused_imports)]
-    use crate::{MountTable, MemoryFilesystem, Filesystem};
+     use crate::{MountTable, MemoryFilesystem, MountSnapshot, Filesystem, FsError, MS_RDONLY};
 
     #[test]
     fn mount_and_resolve() {
@@ -132,6 +132,55 @@ mod mount_tests {
         mt.mount("/tmp", Arc::new(MemoryFilesystem::new())).unwrap();
         let mounts = mt.list_mounts();
         assert_eq!(mounts.len(), 2);
+    }
+
+    #[test]
+    fn mount_with_records_source_and_rdonly_flag() {
+        let mut mt = MountTable::new();
+        mt.mount_with("/data", Some("/dev/vdb"), MS_RDONLY | 0x4000 /* ignored bits dropped */,
+                      Arc::new(MemoryFilesystem::new())).unwrap();
+        let mut rows = [MountSnapshot::EMPTY; 4];
+        let n = mt.copy_mounts_into(&mut rows);
+        assert_eq!(n, 1);
+        assert_eq!(rows[0].path, "/data");
+        assert_eq!(rows[0].source, Some("/dev/vdb"));
+        assert_eq!(rows[0].fs_type, "memfs");
+        assert_eq!(rows[0].flags, MS_RDONLY);
+    }
+
+    #[test]
+    fn resolve_arc_with_flags_reports_resolved_mount() {
+        let mut mt = MountTable::new();
+        mt.mount_with("/", Some("/dev/vda"), 0, Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.mount_with("/ro", None, MS_RDONLY, Arc::new(MemoryFilesystem::new())).unwrap();
+        let (_, _, flags_root) = mt.resolve_arc_with_flags("/etc/passwd").unwrap();
+        let (_, _, flags_ro) = mt.resolve_arc_with_flags("/ro/file").unwrap();
+        assert_eq!(flags_root, 0);
+        assert_eq!(flags_ro, MS_RDONLY);
+    }
+
+    #[test]
+    fn remount_flips_rdonly() {
+        let mut mt = MountTable::new();
+        mt.mount_with("/", Some("/dev/vda"), 0, Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.remount("/", MS_RDONLY).unwrap();
+        assert_eq!(mt.resolve_arc_with_flags("/x").unwrap().2, MS_RDONLY);
+        mt.remount("/", 0).unwrap();
+        assert_eq!(mt.resolve_arc_with_flags("/x").unwrap().2, 0);
+        assert!(matches!(mt.remount("/nope", 0), Err(FsError::NotFound)));
+    }
+
+    #[test]
+    fn copy_mounts_into_truncates_to_buffer() {
+        let mut mt = MountTable::new();
+        mt.mount("/", Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/a", Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/b", Arc::new(MemoryFilesystem::new())).unwrap();
+        let mut rows = [MountSnapshot::EMPTY; 2];
+        let n = mt.copy_mounts_into(&mut rows);
+        assert_eq!(n, 2);
+        // Longest-first ordering means "/" is beyond the truncation point.
+        assert!(rows.iter().all(|r| r.path != "/"));
     }
 }
 

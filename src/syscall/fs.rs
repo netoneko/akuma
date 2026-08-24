@@ -1418,10 +1418,47 @@ pub(super) fn sys_pvec2(
 }
 
 pub(super) fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
-    if !validate_user_ptr(buf_ptr, 120) { return EFAULT; }
-    if let Some(proc) = akuma_exec::process::current_process_shared() {
-        if proc.get_fd(fd).is_none() { return EBADF; }
-    } else { return ENOSYS; }
+    // Resolve the fd's path to the mount it sits on and report that mount's
+    // real statistics. Before 2026-08-24 this returned hardcoded fiction
+    // (f_type=0xEF53, 65536 blocks) for every fd, so `df`-style tools sized
+    // every filesystem identically (`docs/archive/MOUNT_MISSING_SYSCALLS.md`
+    // §3.2). Non-file fds (pipes, sockets) have no path to resolve; Linux
+    // reports their own pseudo-filesystem there, we report the root mount —
+    // nothing in-tree branches on those.
+    let Some(proc) = akuma_exec::process::current_process_shared() else { return ENOSYS; };
+    let fd_path = match proc.get_fd(fd) {
+        Some(akuma_exec::process::FileDescriptor::File(f)) => Some(f.path),
+        Some(_) => None, // non-file fd: report the root mount (see doc comment)
+        None => return EBADF,
+    };
+    let path = fd_path.unwrap_or_else(|| String::from("/"));
+    match crate::vfs::stats_for_path(&path) {
+        Ok(view) => statfs_into(&view, buf_ptr),
+        Err(e) => fs_error_to_errno(e),
+    }
+}
+
+/// `statfs` magic numbers, keyed by `Filesystem::name()`. `memfs` is the
+/// implementation behind every `tmpfs` mount, so it reports `TMPFS_MAGIC`
+/// like Linux does.
+fn fs_magic(name: &str) -> i64 {
+    match name {
+        "ext2" => 0xEF53,
+        "proc" => 0x9FA0,
+        "memfs" | "tmpfs" => 0x0102_1994,
+        "overlay" => 0x794C_7630,
+        "subdirfs" => 0x794C_7630, // jail under an overlay: report overlay
+        _ => 0xADF5,
+    }
+}
+
+/// Shared `statfs`/`fstatfs` writer: resolve a path to its mount's real
+/// statistics (the old `fstatfs` returned hardcoded fiction for every fd —
+/// `docs/archive/MOUNT_MISSING_SYSCALLS.md` §3.2).
+pub(super) fn statfs_into(view: &crate::vfs::FsView, buf_ptr: u64) -> u64 {
+    if !validate_user_ptr(buf_ptr, 120) {
+        return EFAULT;
+    }
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct Statfs {
@@ -1438,24 +1475,39 @@ pub(super) fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
         f_flags: i64,
         f_spare: [i64; 4],
     }
+    let bs = i64::from(view.stats.block_size);
     let st = Statfs {
-        f_type: 0xEF53,
-        f_bsize: 4096,
-        f_blocks: 65536,
-        f_bfree: 32768,
-        f_bavail: 32768,
-        f_files: 16384,
-        f_ffree: 8192,
+        f_type: fs_magic(&view.fs_name),
+        f_bsize: bs,
+        f_blocks: view.stats.total_blocks as i64,
+        f_bfree: view.stats.free_blocks as i64,
+        f_bavail: view.stats.free_blocks as i64,
+        f_files: 0,
+        f_ffree: 0,
         f_fsid: [0, 0],
         f_namelen: 255,
-        f_frsize: 4096,
-        f_flags: 0,
+        f_frsize: bs,
+        f_flags: view.flags as i64,
         f_spare: [0; 4],
     };
     if write_user_val(buf_ptr, &st).is_err() {
         return EFAULT;
     }
     0
+}
+
+/// `statfs(2)` (nr 43) — resolve `path` the way file operations do and report
+/// the mount it lands on. Undispatched before 2026-08-24, which is what broke
+/// busybox `df`.
+pub(super) fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
+    let path = match copy_from_user_str(path_ptr, 256) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    match crate::vfs::stats_for_path(&path) {
+        Ok(view) => statfs_into(&view, buf_ptr),
+        Err(e) => fs_error_to_errno(e),
+    }
 }
 
 pub(super) fn sys_dup(oldfd: u32) -> u64 {

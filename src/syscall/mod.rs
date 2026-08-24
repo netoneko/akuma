@@ -273,6 +273,7 @@ pub mod nr {
     pub const FCNTL: u64 = 25;
     pub const DUP: u64 = 23;
     pub const FSTATFS: u64 = 44;
+    pub const STATFS: u64 = 43;
     pub const DUP3: u64 = 24;
     pub const PIPE2: u64 = 59;
     pub const NEWFSTATAT: u64 = 79;
@@ -678,7 +679,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::WRITEV => fs::sys_writev(args[0], args[1], args[2] as usize),
         nr::IOCTL => term::sys_ioctl(args[0] as u32, args[1] as u32, args[2]),
         nr::DUP => fs::sys_dup(args[0] as u32),
-        nr::FSTATFS => fs::sys_fstatfs(args[0] as u32, args[1]),
+         nr::FSTATFS => fs::sys_fstatfs(args[0] as u32, args[1]),
+         nr::STATFS => fs::sys_statfs(args[0], args[1]),
         nr::DUP3 => fs::sys_dup3(args[0] as u32, args[1] as u32, args[2] as u32),
         nr::PIPE2 => pipe::sys_pipe2(args[0], args[1] as u32),
         nr::BRK => mem::sys_brk(args[0] as usize),

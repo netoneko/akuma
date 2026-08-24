@@ -68,6 +68,29 @@ fn caller_box_id() -> u64 {
     akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id)
 }
 
+/// Render a `/proc/mounts` listing for the **read** paths. The mount
+/// spinlocks are held only inside `crate::vfs::render_mounts`, which writes
+/// into the stack buffer below allocation-free; the `.to_vec()` copy happens
+/// after the locks are gone and exists only because the `Filesystem` trait's
+/// `read_file` returns `Vec<u8>` — the same contract every procfs virtual
+/// file (`boxes`, `net/tcp`, …) already lives with. `metadata` and `exists`
+/// use `render_mounts` directly and do not go through here.
+///
+/// `target_pid` selects whose mount set is listed; `None` (or an unknown
+/// pid) means the global table. Returns `None` when the viewer may not see
+/// the target (box rule) — callers turn that into `NotFound`.
+pub fn mounts_bytes(target_pid: Option<Pid>, viewer_box_id: u64) -> Option<Vec<u8>> {
+    if let Some(pid) = target_pid {
+        let proc = process::lookup_process_shared(pid)?;
+        if viewer_box_id != 0 && proc.box_id != viewer_box_id {
+            return None;
+        }
+    }
+    let mut buf = [0u8; 2048];
+    let n = crate::vfs::render_mounts(viewer_box_id, target_pid, &mut buf);
+    Some(buf[..n].to_vec())
+}
+
 fn proc_cmdline_bytes(p: &process::Process) -> Vec<u8> {
     if p.args.is_empty() {
         let mut v: Vec<u8> = p.name.as_bytes().to_vec();
@@ -382,6 +405,22 @@ impl Filesystem for ProcFilesystem {
                 size: 0,
             });
 
+            // Mount listing + supported filesystems. Rendered per-viewer: a
+            // boxed process sees its own namespace's mounts with no source
+            // column (crate::vfs::render_mounts).
+            entries.push(DirEntry {
+                name: String::from("mounts"),
+                is_dir: false,
+                is_symlink: false,
+                size: 0,
+            });
+            entries.push(DirEntry {
+                name: String::from("filesystems"),
+                is_dir: false,
+                is_symlink: false,
+                size: 0,
+            });
+
             // Add recently-exited PIDs that still have retained syscall logs.
             // This runs AFTER the box filter above and must repeat it — appending
             // the unfiltered list here is what put every host pid into a
@@ -468,6 +507,12 @@ impl Filesystem for ProcFilesystem {
                     is_symlink: false,
                     size: 0,
                 });
+                pid_entries.push(DirEntry {
+                    name: String::from("mounts"),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 0,
+                });
             }
             if crate::config::PROC_SYSCALL_LOG_ENABLED
                 && crate::syscall::log::get_formatted(pid, current_box_id).is_some()
@@ -522,13 +567,15 @@ impl Filesystem for ProcFilesystem {
         let path = path.as_ref();
 
         // Handle virtual files first (boxes, cores, net/tcp, sysvipc/msg,
-        // <pid>/syscalls, etc.). This list must name every path `read_file`
-        // renders — `metadata` and `list_dir` advertising a file that `read_at`
-        // does not forward is how `/proc/cores` came to `open()` and `stat()`
-        // fine while every `read()` returned NotFound
+        // mounts, filesystems, <pid>/syscalls, etc.). This list must name every
+        // path `read_file` renders — `metadata` and `list_dir` advertising a
+        // file that `read_at` does not forward is how `/proc/cores` came to
+        // `open()` and `stat()` fine while every `read()` returned NotFound
         // (docs/archive/DEVBOX_ISSUES.md Issue 4).
         if path == "boxes"
             || path == "cores"
+            || path == "mounts"
+            || path == "filesystems"
             || path.starts_with("net/")
             || path == "sysvipc/msg"
         {
@@ -539,6 +586,22 @@ impl Filesystem for ProcFilesystem {
             let n = buf.len().min(data.len() - offset);
             buf[..n].copy_from_slice(&data[offset..offset + n]);
             return Ok(n);
+        }
+
+        // Handle <pid>/mounts — the target's namespace mounts, box-filtered.
+        {
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            if parts.len() == 2 && parts[1] == "mounts"
+                && let Ok(pid) = parts[0].parse::<Pid>() {
+                    let data = mounts_bytes(Some(pid), caller_box_id())
+                        .ok_or(FsError::NotFound)?;
+                    if offset >= data.len() {
+                        return Ok(0);
+                    }
+                    let n = buf.len().min(data.len() - offset);
+                    buf[..n].copy_from_slice(&data[offset..offset + n]);
+                    return Ok(n);
+                }
         }
 
         // Handle <pid>/syscalls. `get_formatted` applies the box rule itself —
@@ -692,6 +755,25 @@ impl Filesystem for ProcFilesystem {
             return Ok(String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n").into_bytes());
         }
 
+        // /proc/mounts — the viewer's own mount set (its namespace if boxed,
+        // the global table on the host). A box sees which paths are mounted
+        // into it, never where they came from — crate::vfs::render_mounts
+        // enforces that and keeps the whole render allocation-free.
+        if path == "mounts" {
+            let pid = process::current_process_shared().map(|p| p.pid);
+            return Ok(mounts_bytes(pid, current_box_id).unwrap_or_default());
+        }
+
+        // /proc/filesystems — the kernel's supported fstypes, one per line.
+        if path == "filesystems" {
+            let out = if cfg!(feature = "sc-containers") {
+                "ext2\nproc\ntmpfs\noverlay\n"
+            } else {
+                "ext2\nproc\ntmpfs\n"
+            };
+            return Ok(String::from(out).into_bytes());
+        }
+
         // Real Linux `/proc/net/dev` format, verbatim (header + `%6s: %7llu
         // %7llu %4llu %4llu %4llu %5llu %10llu %9llu %8llu %7llu %4llu %4llu
         // %4llu %5llu %7llu %10llu` per interface, from `net/core/net-procfs.c`)
@@ -744,6 +826,17 @@ impl Filesystem for ProcFilesystem {
             if parts.len() == 2 && parts[1] == "syscalls"
                 && let Ok(pid) = parts[0].parse::<Pid>() {
                     return crate::syscall::log::get_formatted(pid, current_box_id)
+                        .ok_or(FsError::NotFound);
+                }
+        }
+
+        // Handle <pid>/mounts — the target's namespace mounts. Same box rule
+        // as <pid>/status: a box only sees pids in its own box.
+        {
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            if parts.len() == 2 && parts[1] == "mounts"
+                && let Ok(pid) = parts[0].parse::<Pid>() {
+                    return mounts_bytes(Some(pid), current_box_id)
                         .ok_or(FsError::NotFound);
                 }
         }
@@ -836,6 +929,20 @@ impl Filesystem for ProcFilesystem {
             return current_box_id == 0;
         }
 
+        if path == "mounts" || path == "filesystems" {
+            return true;
+        }
+
+        // <pid>/mounts — same visibility rule as <pid>/status; no render
+        // needed to answer an existence question.
+        {
+            let parts: Vec<&str> = path.split('/').collect();
+            if parts.len() == 2 && parts[1] == "mounts"
+                && let Ok(pid) = parts[0].parse::<Pid>() {
+                    return Self::process_visible(pid, caller_box_id());
+            }
+        }
+
         if path == "net" || path == "net/tcp" || path == "net/udp" || path == "net/dev" {
             return true;
         }
@@ -914,6 +1021,51 @@ impl Filesystem for ProcFilesystem {
                 modified: None,
                 accessed: None,
             });
+        }
+
+        if path == "mounts" || path == "filesystems" {
+            // Size without allocating: render into a stack buffer and take the
+            // byte count (the Vec-returning `mounts_bytes` is for the read
+            // path only — `metadata` must not build the whole listing).
+            let size = if path == "mounts" {
+                let pid = process::current_process_shared().map(|p| p.pid);
+                let mut probe = [0u8; 2048];
+                crate::vfs::render_mounts(caller_box_id(), pid, &mut probe) as u64
+            } else {
+                0
+            };
+            return Ok(Metadata {
+                is_dir: false,
+                size,
+                inode,
+                mode: 0o100444,
+                created: None,
+                modified: None,
+                accessed: None,
+            });
+        }
+
+        // <pid>/mounts — same visibility rule as <pid>/status; the size probe
+        // renders into a stack buffer, no allocation.
+        {
+            let parts: Vec<&str> = path.split('/').collect();
+            if parts.len() == 2 && parts[1] == "mounts"
+                && let Ok(pid) = parts[0].parse::<Pid>() {
+                    if !Self::process_visible(pid, caller_box_id()) {
+                        return Err(FsError::NotFound);
+                    }
+                    let mut probe = [0u8; 2048];
+                    let size = crate::vfs::render_mounts(caller_box_id(), Some(pid), &mut probe) as u64;
+                    return Ok(Metadata {
+                        is_dir: false,
+                        size,
+                        inode,
+                        mode: 0o100444,
+                        created: None,
+                        modified: None,
+                        accessed: None,
+                    });
+                }
         }
 
         if path == "net" {

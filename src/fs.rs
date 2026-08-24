@@ -105,13 +105,13 @@ pub fn init() -> Result<(), FsError> {
 
     // Mount ext2 filesystem at root
     let ext2_fs = vfs::ext2::mount()?;
-    vfs::mount("/", ext2_fs)?;
+    vfs::mount_with("/", Some("/dev/vda"), 0, ext2_fs)?;
 
     log("[FS] Ext2 filesystem mounted at /\n");
 
     // Mount procfs at /proc
     let proc_fs = alloc::sync::Arc::new(vfs::proc::ProcFilesystem::new());
-    vfs::mount("/proc", proc_fs)?;
+    vfs::mount_with("/proc", Some("proc"), 0, proc_fs)?;
 
     log("[FS] Procfs mounted at /proc\n");
 

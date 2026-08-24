@@ -334,10 +334,6 @@ impl ClockBlockCache {
     }
 }
 
-/// Tracks which thread (by slot ID) currently holds the ext2 state write lock.
-/// 0 means no write lock is held. Used to detect orphaned locks from killed processes.
-static EXT2_WRITE_LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
-
 /// Diagnostic (2026-08-15 zero-page hunt): cache hits whose bytes did not match
 /// a direct disk re-read (`[E2C-BAD]`). Non-zero means this layer is serving
 /// stale data — the "wrong bytes" half of the self-host ICE residue.
@@ -784,6 +780,10 @@ impl core::ops::Deref for Ext2ReadGuard<'_> {
 struct Ext2WriteGuard<'a> {
     // See `Ext2ReadGuard` for why `inner` must precede `hold`.
     inner: spinning_top::lock_api::RwLockWriteGuard<'a, spinning_top::RawRwSpinlock, Ext2State>,
+    /// The owning filesystem's per-instance owner cell. `drop` runs before the
+    /// fields are dropped, so the owner is cleared *before* `inner` releases
+    /// the lock — same ordering contract the old global static had.
+    owner: &'a AtomicUsize,
     #[allow(dead_code)]
     hold: StateHoldGuard,
 }
@@ -804,7 +804,7 @@ impl core::ops::DerefMut for Ext2WriteGuard<'_> {
 impl Drop for Ext2WriteGuard<'_> {
     fn drop(&mut self) {
         // Clear ownership before the inner guard releases the lock
-        EXT2_WRITE_LOCK_OWNER.store(0, Ordering::Release);
+        self.owner.store(0, Ordering::Release);
     }
 }
 
@@ -824,6 +824,10 @@ pub struct Ext2Filesystem<B: BlockDevice> {
     state: RwSpinlock<Ext2State>,
     #[cfg(not(kernel_profile_extreme))]
     block_cache: Spinlock<BlockCache>,
+    /// Per-instance write-lock owner for orphaned-lock recovery (see the
+    /// `Ext2WriteGuard` docs). Per-instance, not global, because two mounted
+    /// ext2 filesystems must not force-unlock each other's state.
+    write_lock_owner: AtomicUsize,
     /// Inodes unlinked while a mapping still pinned them — see [`DeferredFrees`].
     deferred: DeferredFrees,
 }
@@ -835,12 +839,47 @@ type BlockCache = ClockBlockCache;
 #[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
 type BlockCache = BlockRingCache;
 
+/// Build the block cache for a new filesystem instance. `cap` is the
+/// per-instance override from [`Ext2Filesystem::new_with_cache_cap`]; `None`
+/// sizes from the crate-global cap as before.
+#[cfg(all(not(kernel_profile_extreme), ext2_fs_cache))]
+fn make_block_cache(block_size: usize, cap: Option<usize>) -> BlockCache {
+    match cap {
+        Some(bytes) => {
+            let slots = core::cmp::max(64, bytes / block_size.max(1));
+            ClockBlockCache::with_capacity_blocks(block_size, slots)
+        }
+        None => ClockBlockCache::new(block_size),
+    }
+}
+
+#[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
+fn make_block_cache(block_size: usize, _cap: Option<usize>) -> BlockCache {
+    BlockRingCache::new(block_size)
+}
+
 impl<B: BlockDevice> Ext2Filesystem<B> {
-    /// Create a new Ext2 filesystem backed by `dev`.
+    /// Create a new Ext2 filesystem backed by `dev`, with the block cache
+    /// sized from the crate-global cap (`set_cache_cap_bytes`).
     ///
     /// `utc_time_us` returns the current UTC time in microseconds since epoch;
     /// pass `|| 0` if timestamps are not needed.
     pub fn new(dev: B, utc_time_us: fn() -> u64) -> Result<Self, FsError> {
+        Self::new_with_cache_cap(dev, utc_time_us, None)
+    }
+
+    /// [`Self::new`] with an explicit block-cache cap in bytes, for the
+    /// *second* and later ext2 instances a runtime `mount(2)` creates: the
+    /// global cap is a budget for the root filesystem alone, and applying it
+    /// per-instance again would double the committed heap (the cache never
+    /// shrinks — see `src/fs.rs`). `None` means "use the global cap".
+    /// Ignored on profiles without the large cache (`extreme`, no `fs-cache`).
+    #[allow(unused_variables)]
+    pub fn new_with_cache_cap(
+        dev: B,
+        utc_time_us: fn() -> u64,
+        cache_cap_bytes: Option<usize>,
+    ) -> Result<Self, FsError> {
         let mut sb_buf = [0u8; 1024];
         dev.read_bytes(SUPERBLOCK_OFFSET, &mut sb_buf).map_err(|_| FsError::IoError)?;
 
@@ -885,7 +924,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             time_fn: utc_time_us,
             state: RwSpinlock::new(state),
             #[cfg(not(kernel_profile_extreme))]
-            block_cache: Spinlock::new(BlockCache::new(block_size)),
+            block_cache: Spinlock::new(make_block_cache(block_size, cache_cap_bytes)),
+            write_lock_owner: AtomicUsize::new(0),
             deferred: DeferredFrees::new(),
         })
     }
@@ -916,11 +956,11 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
             // Check if there's an orphaned write lock blocking reads
             if attempt > 0 && attempt % 10_000 == 0 {
-                let owner = EXT2_WRITE_LOCK_OWNER.load(Ordering::Acquire);
+                let owner = self.write_lock_owner.load(Ordering::Acquire);
                 if owner != 0 && is_thread_dead(owner) {
                     // SAFETY: The owner thread is dead so it can't be using the lock.
                     unsafe { self.state.force_unlock_write(); }
-                    EXT2_WRITE_LOCK_OWNER.store(0, Ordering::Release);
+                    self.write_lock_owner.store(0, Ordering::Release);
                     let hold = state_hold_guard();
                     if let Some(inner) = self.state.try_read() {
                         return Some(Ext2ReadGuard { inner, hold });
@@ -962,10 +1002,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
             // Check for orphaned write lock periodically
             if attempt % 10_000 == 0 {
-                let owner = EXT2_WRITE_LOCK_OWNER.load(Ordering::Acquire);
+                let owner = self.write_lock_owner.load(Ordering::Acquire);
                 if owner != 0 && is_thread_dead(owner) {
                     unsafe { self.state.force_unlock_write(); }
-                    EXT2_WRITE_LOCK_OWNER.store(0, Ordering::Release);
+                    self.write_lock_owner.store(0, Ordering::Release);
                     continue;
                 }
             }
@@ -987,8 +1027,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         loop {
             let hold = state_hold_guard();
             if let Some(inner) = self.state.try_write() {
-                EXT2_WRITE_LOCK_OWNER.store(current_tid, Ordering::Release);
-                return Ext2WriteGuard { inner, hold };
+                self.write_lock_owner.store(current_tid, Ordering::Release);
+                return Ext2WriteGuard { inner, owner: &self.write_lock_owner, hold };
             }
             drop(hold);
 
@@ -996,10 +1036,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
             // Check for orphaned write lock periodically
             if attempt % 10_000 == 0 {
-                let owner = EXT2_WRITE_LOCK_OWNER.load(Ordering::Acquire);
+                let owner = self.write_lock_owner.load(Ordering::Acquire);
                 if owner != 0 && is_thread_dead(owner) {
                     unsafe { self.state.force_unlock_write(); }
-                    EXT2_WRITE_LOCK_OWNER.store(0, Ordering::Release);
+                    self.write_lock_owner.store(0, Ordering::Release);
                     continue;
                 }
             }

@@ -153,7 +153,28 @@ fn caller_may_mount() -> bool {
     akuma_exec::process::current_process_shared().is_none_or(|p| p.box_id == 0)
 }
 
-pub(super) fn sys_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64, _flags: u64, _data_ptr: u64) -> u64 {
+/// Map a mount-table error to its Linux errno. The arms used to fold
+/// everything into `EINVAL`, which made `mount` report nonsense for the two
+/// cases scripts actually branch on: table full (`ENOMEM`) and target already
+/// mounted (`EBUSY`) — `docs/archive/MOUNT_MISSING_SYSCALLS.md` §3.11.
+fn mount_errno(e: crate::vfs::FsError) -> u64 {
+    match e {
+        crate::vfs::FsError::NoSpace => ENOMEM,
+        crate::vfs::FsError::AlreadyExists => EBUSY,
+        crate::vfs::FsError::NotFound => ENOENT,
+        crate::vfs::FsError::NotADirectory => ENOTDIR,
+        crate::vfs::FsError::ReadOnly => EROFS,
+        _ => EINVAL,
+    }
+}
+
+pub(super) fn sys_mount(
+    source_ptr: u64,
+    target_ptr: u64,
+    fstype_ptr: u64,
+    flags: u64,
+    _data_ptr: u64,
+) -> u64 {
     if !caller_may_mount() {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(128, "[mount] denied: boxed processes may not mount\n");
@@ -169,16 +190,13 @@ pub(super) fn sys_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64, _fla
         Ok(s) => s,
         Err(e) => return e,
     };
-
-    let fs: alloc::sync::Arc<dyn crate::vfs::Filesystem> = match fstype.as_str() {
-        "proc" => alloc::sync::Arc::new(crate::vfs::proc::ProcFilesystem::new()),
-        "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
-        _ => {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[mount] unsupported fstype: {}\n", fstype);
-            }
-            return ENODEV;
+    let source = if source_ptr != 0 {
+        match copy_from_user_str(source_ptr, 64) {
+            Ok(s) => s,
+            Err(e) => return e,
         }
+    } else {
+        String::new()
     };
 
     // `MountNamespace::resolve` compares mount points literally, so an
@@ -188,25 +206,95 @@ pub(super) fn sys_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64, _fla
     let target = crate::vfs::canonicalize_path(&target);
 
     // Only box 0 reaches here, so this is always the global mount table.
-    match crate::vfs::mount(&target, fs) {
+    if flags & akuma_vfs::MS_REMOUNT != 0 {
+        // Remount only flips stored flags; `fs`/`source` args are advisory.
+        // Linux requires the target to already be a mount point.
+        return match crate::vfs::remount(&target, flags) {
+            Ok(()) => 0,
+            Err(e) => mount_errno(e),
+        };
+    }
+
+    // A mount needs a directory to land on (Linux: `ENOTDIR`). Boot mounts
+    // bypass this arm entirely, so this never gates `/` or `/proc` at boot.
+    match crate::vfs::metadata(&target) {
+        Ok(m) if m.is_dir => {}
+        Ok(_) => return ENOTDIR,
+        Err(e) => return mount_errno(e),
+    }
+
+    let fs: alloc::sync::Arc<dyn crate::vfs::Filesystem> = match fstype.as_str() {
+        "proc" => alloc::sync::Arc::new(crate::vfs::proc::ProcFilesystem::new()),
+        "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
+        "ext2" => {
+            // The source must name a registered block device (vdb, /dev/vdb, …).
+            // The boot disk (vda) is deliberately mountable here too — it is
+            // already mounted at `/`, so the duplicate check is the guard.
+            let Some(idx) = crate::block::device_index_by_name(&source) else {
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[mount] no such device: {}\n", source);
+                }
+                return ENODEV;
+            };
+            // Runtime data disks get a small, fixed cache budget: the global
+            // cap belongs to the root filesystem, and the cache never shrinks
+            // (`docs/archive/MOUNT_MISSING_SYSCALLS.md` §5 Tier B).
+            const DATA_DISK_CACHE_BYTES: usize = 16 * 1024 * 1024;
+            match crate::vfs::ext2::mount_device(idx, Some(DATA_DISK_CACHE_BYTES)) {
+                Ok(fs) => fs,
+                Err(_) => return ENODEV, // no ext2 magic on that device
+            }
+        }
+        _ => {
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(128, "[mount] unsupported fstype: {}\n", fstype);
+            }
+            return ENODEV;
+        }
+    };
+
+    let recorded_source = if source.is_empty() {
+        fstype.as_str()
+    } else {
+        source.as_str()
+    };
+    match crate::vfs::mount_with(&target, Some(recorded_source), flags, fs) {
         Ok(()) => 0,
-        Err(_) => EINVAL,
+        Err(e) => mount_errno(e),
     }
 }
 
-/// Unmounting is host-only, and the host does not unmount through this syscall
-/// either — so it always fails. See [`caller_may_mount`] for why a box may not
-/// take mounts away any more than it may add them; the specific hazard for `/`
-/// is that emptying a box's namespace makes `with_fs` fall back to the GLOBAL
-/// mount table, handing the box the whole host filesystem.
+/// Unmount a global mount. Real since 2026-08-24 (before, every caller got
+/// `EPERM`, host included).
+///
+/// Box policy is unchanged — see [`caller_may_mount`]: a box may not take
+/// mounts away any more than it may add them; the specific hazard for `/` is
+/// that emptying a box's namespace makes `with_fs` fall back to the GLOBAL
+/// mount table, handing the box the whole host filesystem. Two guards keep
+/// that invariant intact here:
+///
+/// - the **global** `/` is never unmountable (`EBUSY`, like Linux);
+/// - this arm only ever touches the global table — a box's namespace mounts
+///   are composed from outside via `MOUNT_IN_NS` and torn down with the box.
 pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> u64 {
-    if let Err(e) = copy_from_user_str(target_ptr, 256) {
-        return e;
+    if !caller_may_mount() {
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(128, "[umount2] denied: boxed processes may not unmount\n");
+        }
+        return EPERM;
     }
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED && !caller_may_mount() {
-        crate::safe_print!(128, "[umount2] denied: boxed processes may not unmount\n");
+    let target = match copy_from_user_str(target_ptr, 256) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let target = crate::vfs::canonicalize_path(&target);
+    if target == "/" {
+        return EBUSY;
     }
-    EPERM
+    match crate::vfs::unmount(&target) {
+        Ok(()) => 0,
+        Err(e) => mount_errno(e),
+    }
 }
 
 /// Build an `OverlayFs` from a `lowerdir=…,upperdir=…` option string.

@@ -15,6 +15,7 @@ use spinning_top::Spinlock;
 // Re-export everything from the crate so existing `use crate::vfs::*` keeps working.
 pub use akuma_vfs::{
     DirEntry, Filesystem, FsError, FsStats, Metadata, MountInfo,
+    MS_RDONLY, ST_RDONLY,
     canonicalize_path, resolve_path, split_path,
 };
 
@@ -156,11 +157,44 @@ pub fn init() {
     }
 }
 
-/// Mount a filesystem at the given path
-pub fn mount(path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
+/// [`mount`] recording the mount's `source` (`/dev/vda`, `proc`, …) and
+/// `MS_*` flags. Only `MS_RDONLY` is stored; the kernel's write chokepoints
+/// enforce it as `FsError::ReadOnly`.
+pub fn mount_with(
+    path: &str,
+    source: Option<&str>,
+    flags: u64,
+    fs: Arc<dyn Filesystem>,
+) -> Result<(), FsError> {
     let mut table = MOUNT_TABLE.lock();
     let table = table.as_mut().ok_or(FsError::NotInitialized)?;
-    table.mount(path, fs)
+    table.mount_with(path, source, flags, fs)
+}
+
+/// Replace the flags of an existing global mount (`MS_REMOUNT` leg of
+/// `mount(2)`; only the `MS_RDONLY` bit is kept).
+///
+/// Only consumed by `syscall::container::sys_mount`, so it follows the same gate.
+#[cfg(feature = "sc-containers")]
+pub fn remount(path: &str, flags: u64) -> Result<(), FsError> {
+    let mut table = MOUNT_TABLE.lock();
+    let table = table.as_mut().ok_or(FsError::NotInitialized)?;
+    table.remount(path, flags)
+}
+
+/// Unmount a path from the global table. Refuses `/` — the boot root stays
+/// for the boot's lifetime (`umount2` maps this to `EBUSY`).
+///
+/// Only consumed by `syscall::container::sys_umount2`, so it follows the same gate.
+#[cfg(feature = "sc-containers")]
+pub fn unmount(path: &str) -> Result<(), FsError> {
+    let normalized = canonicalize_path(path);
+    if normalized == "/" {
+        return Err(FsError::PermissionDenied);
+    }
+    let mut table = MOUNT_TABLE.lock();
+    let table = table.as_mut().ok_or(FsError::NotInitialized)?;
+    table.unmount(&normalized)
 }
 
 /// Get the `Arc<dyn Filesystem>` for a global mount point (e.g., "/" for ext2).
@@ -175,6 +209,44 @@ pub fn get_root_fs() -> Option<Arc<dyn Filesystem>> {
 // Public API - File Operations (delegates to mounted filesystems)
 // ============================================================================
 
+/// Resolve `path` to `(filesystem, relative_path, mount_flags)` following the
+/// same order [`with_fs`] documents: spawn override → process namespace →
+/// global table. `None` when nothing resolves.
+///
+/// Locks are held for the resolution only (the `Arc` outlives them), so no I/O
+/// or allocation happens under a mount-table lock.
+fn resolve_mount(path: &str) -> Option<(Arc<dyn Filesystem>, String, u64)> {
+    // Check spawn namespace override (set during container ELF loading).
+    {
+        let tid = akuma_exec::threading::current_thread_id();
+        let overrides = SPAWN_NS_OVERRIDE.lock();
+        if let Some(ns) = overrides.get(&tid) {
+            let cwd = akuma_exec::process::current_process_shared()
+                .map_or_else(|| String::from("/"), |p| p.cwd.clone());
+            let absolute = resolve_path(&cwd, path);
+            let ns_mount = ns.mount.lock();
+            return ns_mount.resolve_arc_with_flags(&absolute);
+        }
+    }
+
+    if let Some(proc) = akuma_exec::process::current_process_shared() {
+        let absolute = resolve_path(&proc.cwd, path);
+
+        // Try process namespace first (lock released before I/O).
+        if let Some(resolved) = proc.namespace.mount.lock().resolve_arc_with_flags(&absolute) {
+            return Some(resolved);
+        }
+
+        // Fall back to global mount table (lock released before I/O).
+        let table = MOUNT_TABLE.lock();
+        return table.as_ref()?.resolve_arc_with_flags(&absolute);
+    }
+
+    let normalized = resolve_without_cwd(path);
+    let table = MOUNT_TABLE.lock();
+    table.as_ref()?.resolve_arc_with_flags(&normalized)
+}
+
 /// Helper to get filesystem for a path.
 ///
 /// Resolution order:
@@ -186,53 +258,22 @@ fn with_fs<F, R>(path: &str, f: F) -> Result<R, FsError>
 where
     F: FnOnce(&dyn Filesystem, &str) -> Result<R, FsError>,
 {
-    // Check spawn namespace override (set during container ELF loading).
-    // Use resolve_arc so the lock is dropped before any I/O.
-    {
-        let tid = akuma_exec::threading::current_thread_id();
-        let maybe_arc = {
-            let overrides = SPAWN_NS_OVERRIDE.lock();
-            if let Some(ns) = overrides.get(&tid) {
-                let cwd = akuma_exec::process::current_process_shared()
-                    .map_or_else(|| String::from("/"), |p| p.cwd.clone());
-                let absolute = resolve_path(&cwd, path);
-                let ns_mount = ns.mount.lock();
-                ns_mount.resolve_arc(&absolute)
-            } else {
-                None
-            }
-        };
-        if let Some((fs, rel)) = maybe_arc {
-            return f(fs.as_ref(), &rel);
-        }
+    let (fs, rel, _) = resolve_mount(path).ok_or(FsError::NotFound)?;
+    f(fs.as_ref(), &rel)
+}
+
+/// [`with_fs`] for mutating operations: the resolved mount's `MS_RDONLY` flag
+/// is consulted first, so every write chokepoint below enforces read-only
+/// mounts uniformly (`FsError::ReadOnly` → `EROFS` at the syscall boundary).
+fn with_fs_write<F, R>(path: &str, f: F) -> Result<R, FsError>
+where
+    F: FnOnce(&dyn Filesystem, &str) -> Result<R, FsError>,
+{
+    let (fs, rel, flags) = resolve_mount(path).ok_or(FsError::NotFound)?;
+    if flags & MS_RDONLY != 0 {
+        return Err(FsError::ReadOnly);
     }
-
-    if let Some(proc) = akuma_exec::process::current_process_shared() {
-        let absolute = resolve_path(&proc.cwd, path);
-
-        // Try process namespace first (lock released before I/O).
-        let ns_arc = proc.namespace.mount.lock().resolve_arc(&absolute);
-        if let Some((fs, rel)) = ns_arc {
-            return f(fs.as_ref(), &rel);
-        }
-
-        // Fall back to global mount table (lock released before I/O).
-        let global_arc = {
-            let table = MOUNT_TABLE.lock();
-            let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-            table.resolve_arc(&absolute).ok_or(FsError::NotFound)?
-        };
-        f(global_arc.0.as_ref(), &global_arc.1)
-    } else {
-        let normalized = resolve_without_cwd(path);
-
-        let global_arc = {
-            let table = MOUNT_TABLE.lock();
-            let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-            table.resolve_arc(&normalized).ok_or(FsError::NotFound)?
-        };
-        f(global_arc.0.as_ref(), &global_arc.1)
-    }
+    f(fs.as_ref(), &rel)
 }
 
 /// List directory contents
@@ -256,13 +297,19 @@ pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, FsError> {
 
 /// Read entire file contents as bytes
 pub fn read_file(path: &str) -> Result<Vec<u8>, FsError> {
+    if let Some(rows) = mtab_rows(path) {
+        return Ok(rows);
+    }
     with_fs(path, |fs, rel| fs.read_file(rel))
 }
 
 
 /// Write data to a file (creates or truncates)
 pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
-    let r = with_fs(path, |fs, rel| fs.write_file(rel, data));
+    if is_mtab(path) {
+        return Err(FsError::NotSupported); // virtual, kernel-owned
+    }
+    let r = with_fs_write(path, |fs, rel| fs.write_file(rel, data));
     invalidate_file_pages(path);
     r
 }
@@ -292,6 +339,14 @@ fn invalidate_file_pages(path: &str) {
 
 /// Read data from a specific offset within a file
 pub fn read_at(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+    if let Some(rows) = mtab_rows(path) {
+        if offset >= rows.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(rows.len() - offset);
+        buf[..n].copy_from_slice(&rows[offset..offset + n]);
+        return Ok(n);
+    }
     with_fs(path, |fs, rel| fs.read_at(rel, offset, buf))
 }
 
@@ -307,14 +362,17 @@ pub fn read_at_by_inode(path: &str, inode: u32, offset: usize, buf: &mut [u8]) -
 
 /// Write data at a specific offset within a file
 pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
-    let r = with_fs(path, |fs, rel| fs.write_at(rel, offset, data));
+    if is_mtab(path) {
+        return Err(FsError::NotSupported); // virtual, kernel-owned
+    }
+    let r = with_fs_write(path, |fs, rel| fs.write_at(rel, offset, data));
     invalidate_file_pages(path);
     r
 }
 
 /// Create a directory
 pub fn create_dir(path: &str) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| fs.create_dir(rel))
+    with_fs_write(path, |fs, rel| fs.create_dir(rel))
 }
 
 /// Remove a file
@@ -322,16 +380,19 @@ pub fn remove_file(path: &str) -> Result<(), FsError> {
     // Resolve BEFORE the unlink — afterwards the path no longer names the inode,
     // and ext2 is free to hand that number to the next file created.
     invalidate_file_pages(path);
-    with_fs(path, |fs, rel| fs.remove_file(rel))
+    with_fs_write(path, |fs, rel| fs.remove_file(rel))
 }
 
 /// Remove an empty directory
 pub fn remove_dir(path: &str) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| fs.remove_dir(rel))
+    with_fs_write(path, |fs, rel| fs.remove_dir(rel))
 }
 
 /// Check if a path exists
 pub fn exists(path: &str) -> bool {
+    if is_mtab(path) {
+        return true;
+    }
     with_fs(path, |fs, rel| Ok(fs.exists(rel))).unwrap_or(false)
 }
 
@@ -342,24 +403,35 @@ pub fn file_size(path: &str) -> Result<u64, FsError> {
 
 /// Get metadata for a path
 pub fn metadata(path: &str) -> Result<Metadata, FsError> {
+    if let Some(rows) = mtab_rows(path) {
+        return Ok(Metadata {
+            is_dir: false,
+            size: rows.len() as u64,
+            inode: u64::MAX - 1, // synthetic, stable
+            mode: 0o100444,
+            created: None,
+            modified: None,
+            accessed: None,
+        });
+    }
     with_fs(path, |fs, rel| fs.metadata(rel))
 }
 
 /// Change file permissions
 pub fn chmod(path: &str, mode: u32) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| fs.chmod(rel, mode))
+    with_fs_write(path, |fs, rel| fs.chmod(rel, mode))
 }
 
 /// Truncate a file to a specified length
 pub fn truncate(path: &str, length: u64) -> Result<(), FsError> {
-    let r = with_fs(path, |fs, rel| fs.truncate(rel, length));
+    let r = with_fs_write(path, |fs, rel| fs.truncate(rel, length));
     invalidate_file_pages(path);
     r
 }
 
 /// Preallocate disk space for a file
 pub fn fallocate(path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
-    let r = with_fs(path, |fs, rel| fs.fallocate(rel, mode, offset, len));
+    let r = with_fs_write(path, |fs, rel| fs.fallocate(rel, mode, offset, len));
     invalidate_file_pages(path);
     r
 }
@@ -388,26 +460,48 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let ns_arcs = {
             let ns_mount = proc.namespace.mount.lock();
-            match (ns_mount.resolve_arc(&old_abs), ns_mount.resolve_arc(&new_abs)) {
-                (Some(o), Some(n)) => Some((o.0, o.1, n.1)),
+            match (
+                ns_mount.resolve_arc_with_flags(&old_abs),
+                ns_mount.resolve_arc_with_flags(&new_abs),
+            ) {
+                (Some((o_fs, o_rel, o_flags)), Some((n_fs, n_rel, n_flags))) => {
+                    Some((o_fs, o_rel, o_flags, n_fs, n_rel, n_flags))
+                }
                 _ => None,
             }
         };
-        if let Some((old_fs, old_rel, new_rel)) = ns_arcs {
+        if let Some((old_fs, old_rel, old_flags, new_fs, new_rel, new_flags)) = ns_arcs {
+            // Same-mount check is `Arc::ptr_eq`, **not** a name comparison:
+            // two ext2 instances (two disks) share the name "ext2", and a
+            // rename between them is a cross-device `EXDEV`, not a same-fs
+            // operation that happens to typecheck.
+            if !Arc::ptr_eq(&old_fs, &new_fs) {
+                return Err(FsError::NotSupported);
+            }
+            if old_flags & MS_RDONLY != 0 || new_flags & MS_RDONLY != 0 {
+                return Err(FsError::ReadOnly);
+            }
             return old_fs.rename(&old_rel, &new_rel);
         }
     }
 
-    let (old_arc, old_rel, new_rel) = {
+    let (old_arc, old_rel, new_arc, new_rel) = {
         let table = MOUNT_TABLE.lock();
         let table = table.as_ref().ok_or(FsError::NotInitialized)?;
-        let (old_fs, old_r) = table.resolve_arc(&old_abs).ok_or(FsError::NotFound)?;
-        let (new_fs, new_r) = table.resolve_arc(&new_abs).ok_or(FsError::NotFound)?;
-        if old_fs.name() != new_fs.name() {
+        let (old_fs, old_r, old_flags) =
+            table.resolve_arc_with_flags(&old_abs).ok_or(FsError::NotFound)?;
+        let (new_fs, new_r, new_flags) =
+            table.resolve_arc_with_flags(&new_abs).ok_or(FsError::NotFound)?;
+        // `Arc::ptr_eq`, not name comparison — see the namespace arm above.
+        if !Arc::ptr_eq(&old_fs, &new_fs) {
             return Err(FsError::NotSupported);
         }
-        (old_fs, old_r, new_r)
+        if old_flags & MS_RDONLY != 0 || new_flags & MS_RDONLY != 0 {
+            return Err(FsError::ReadOnly);
+        }
+        (old_fs, old_r, new_fs, new_r)
     };
+    drop(new_arc);
     old_arc.rename(&old_rel, &new_rel)
 }
 
@@ -422,7 +516,7 @@ static SYMLINKS: Spinlock<Option<BTreeMap<String, String>>> = Spinlock::new(None
 
 pub fn create_symlink(link_path: &str, target: &str) -> Result<(), FsError> {
     // Try on-disk first via the mounted filesystem
-    match with_fs(link_path, |fs, rel| fs.create_symlink(rel, target)) {
+    match with_fs_write(link_path, |fs, rel| fs.create_symlink(rel, target)) {
         Ok(()) => return Ok(()),
         Err(FsError::NotSupported) => {}
         Err(e) => return Err(e),
@@ -444,7 +538,7 @@ pub fn create_symlink(link_path: &str, target: &str) -> Result<(), FsError> {
 /// regular file is the substitution that made a conformant client refuse to
 /// connect to a working socket (`docs/archive/UNIX_SOCKET_IMPROVEMENTS.md` G7).
 pub fn create_socket_node(path: &str) -> Result<(), FsError> {
-    with_fs(path, |fs, rel| fs.create_socket_node(rel))
+    with_fs_write(path, |fs, rel| fs.create_socket_node(rel))
 }
 
 pub fn read_symlink(path: &str) -> Option<String> {
@@ -519,4 +613,143 @@ fn get_child_mount_points(parent_path: &str) -> Vec<DirEntry> {
     }
 
     entries
+}
+
+// ============================================================================
+// statfs / mount listing
+// ============================================================================
+
+/// `/etc/mtab` is virtual: same rows as `/proc/mounts`, rendered from the
+/// live mount tables on every read. Nothing is stored on disk — an ext2 file
+/// would drift stale the first time a mount changed, which is exactly when
+/// `umount`-family tools read it. Intercepts at these chokepoints *before*
+/// `with_fs` so the on-disk `/etc` never participates; a cheap `ends_with`
+/// pre-check keeps the hot path allocation-free.
+const MTAB_PATH: &str = "/etc/mtab";
+
+/// `Some(rows)` when `path` resolves to the virtual `/etc/mtab`, `None` for
+/// every other path (the caller proceeds normally).
+fn mtab_rows(path: &str) -> Option<Vec<u8>> {
+    if !path.ends_with("mtab") {
+        return None;
+    }
+    if resolve_absolute(path) != MTAB_PATH {
+        return None;
+    }
+    let proc = akuma_exec::process::current_process_shared();
+    Some(proc::mounts_bytes(proc.as_ref().map(|p| p.pid), proc.as_ref().map_or(0, |p| p.box_id)).unwrap_or_default())
+}
+
+/// Whether `path` resolves to the virtual `/etc/mtab` (existence check only —
+/// no render, no allocation).
+fn is_mtab(path: &str) -> bool {
+    path.ends_with("mtab") && resolve_absolute(path) == MTAB_PATH
+}
+
+/// What `statfs`/`fstatfs` need from the mount a path resolves to.
+pub struct FsView {
+    pub stats: FsStats,
+    /// `ST_RDONLY` when the resolved mount is read-only, else `0`.
+    pub flags: u64,
+    pub fs_name: String,
+}
+
+/// Resolve `path` the way file operations do and report the mount's real
+/// statistics. `statfs(2)` and `fstatfs(2)` both land here. All locks are
+/// released by `resolve_mount` before the (allocating) name copy runs.
+pub fn stats_for_path(path: &str) -> Result<FsView, FsError> {
+    let (fs, _rel, flags) = resolve_mount(path).ok_or(FsError::NotFound)?;
+    let stats = fs.stats()?;
+    let fs_name = String::from(fs.name());
+    Ok(FsView {
+        stats,
+        flags: if flags & MS_RDONLY != 0 { ST_RDONLY } else { 0 },
+        fs_name,
+    })
+}
+
+/// Render `/proc/mounts` rows for the process identified by `target_pid`
+/// (whose namespace decides the mount set), as seen by `viewer_box_id`, into
+/// `buf`; returns the byte count written.
+///
+/// Mount set = the target's namespace mounts, then any global mounts whose
+/// path the namespace does not already cover — the same set the target can
+/// actually *resolve* (`with_fs` tries the namespace, then falls back to the
+/// global table), so the listing cannot advertise a mount the target cannot
+/// reach, nor hide one it can.
+///
+/// Box policy (`docs/archive/MOUNT_MISSING_SYSCALLS.md` §2): a boxed viewer
+/// learns *which* paths are mounted into it, never *where they came from* —
+/// the source column is `none`. The host sees real sources.
+///
+/// Allocation-free end to end: rows render into `buf` via [`FmtBuf`] while the
+/// mount lock is held, and the caller copies the bytes out afterwards.
+pub fn render_mounts(viewer_box_id: u64, target_pid: Option<u32>, buf: &mut [u8]) -> usize {
+    use akuma_primitives::console::FmtBuf;
+    use core::fmt::Write as _;
+
+    let mut pos = 0usize;
+    let mut w = FmtBuf { buf, pos: &mut pos };
+
+    // Namespace paths already listed, so the global pass can skip entries it
+    // shadows (resolution tries the namespace first — the listing must agree).
+    // Fixed store: `for_each_mount` runs under the namespace spinlock, where
+    // nothing may allocate.
+    struct Seen {
+        paths: [[u8; 64]; 16],
+        lens: [usize; 16],
+        n: usize,
+    }
+    impl Seen {
+        fn record(&mut self, path: &[u8]) {
+            if self.n < self.paths.len() && !path.is_empty() && path.len() <= 64 {
+                self.paths[self.n][..path.len()].copy_from_slice(path);
+                self.lens[self.n] = path.len();
+                self.n += 1;
+            }
+        }
+        fn contains(&self, path: &[u8]) -> bool {
+            (0..self.n).any(|i| {
+                let l = self.lens[i];
+                path.len() == l && &self.paths[i][..l] == path
+            })
+        }
+    }
+
+    fn emit(w: &mut FmtBuf<'_>, seen: &mut Seen, record: bool, viewer_box_id: u64,
+            row: akuma_vfs::MountSnapshot<'_>) {
+        if record {
+            seen.record(row.path.as_bytes());
+        }
+        // A box never sees where a mount came from — see the doc comment.
+        let source = if viewer_box_id == 0 {
+            row.source.unwrap_or("none")
+        } else {
+            "none"
+        };
+        let opts = if row.flags & MS_RDONLY != 0 { "ro" } else { "rw" };
+        let _ = writeln!(w, "{source} {} {} {opts} 0 0", row.path, row.fs_type);
+    }
+
+    let mut seen = Seen { paths: [[0; 64]; 16], lens: [0; 16], n: 0 };
+
+    if let Some(pid) = target_pid
+        && let Some(proc) = akuma_exec::process::lookup_process_shared(pid)
+        && proc.box_id != 0
+    {
+        let ns_mount = proc.namespace.mount.lock();
+        ns_mount.for_each_mount(|row| emit(&mut w, &mut seen, true, viewer_box_id, row));
+    }
+
+    let table = MOUNT_TABLE.lock();
+    if let Some(t) = table.as_ref() {
+        t.for_each_mount(|row| {
+            // Skip global mounts the namespace already lists at this path.
+            if !seen.contains(row.path.as_bytes()) {
+                emit(&mut w, &mut seen, false, viewer_box_id, row);
+            }
+        });
+    }
+
+    pos
 }

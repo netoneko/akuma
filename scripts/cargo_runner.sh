@@ -226,6 +226,23 @@ fi
 
 echo "[cargo_runner] -smp $SMP" >&2
 
+# Optional second data disk (DISK2=path). Attached on virtio-mmio-bus.5 (buses:
+# 0=net, 1=hd0, 2=rng, 3=sound, 4=rump-nic). The kernel registers every
+# virtio-blk it finds (vda=hd0, vdb=this one); mount it in-guest with
+#   mkdir /mnt && mount /dev/vdb /mnt -t ext2
+# Build a data image with: DISK=disk_data.img scripts/create_disk.sh 64
+DISK2="${DISK2:-}"
+DISK2_ARGS=()
+if [ -n "$DISK2" ]; then
+  if [ ! -f "$DISK2" ]; then
+    echo "[cargo_runner] ERROR: DISK2=$DISK2 not found" >&2
+    exit 1
+  fi
+  DISK2_ARGS=(-drive "if=none,format=raw,file=$DISK2,id=hd1" \
+              -device virtio-blk-device,drive=hd1,bus=virtio-mmio-bus.5)
+  echo "[cargo_runner] data disk: $DISK2 -> /dev/vdb (virtio-mmio-bus.5)" >&2
+fi
+
 exec qemu-system-aarch64 \
   -semihosting \
   -machine virt,gic-version=3 \
@@ -241,6 +258,7 @@ exec qemu-system-aarch64 \
   -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
   -device virtio-rng-device,bus=virtio-mmio-bus.2 \
   "${RUMP_NIC_ARGS[@]}" \
+  "${DISK2_ARGS[@]}" \
   "${FB_ARGS[@]}" \
   "${SOUND_ARGS[@]}" \
   -kernel "$BIN" \

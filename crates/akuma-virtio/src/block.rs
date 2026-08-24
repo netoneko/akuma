@@ -205,90 +205,171 @@ impl VirtioBlockDevice {
 // Global Block Device State
 // ============================================================================
 
-/// The virtio-blk device, behind a plain `Spinlock`.
+/// How many virtio-blk devices the kernel can have mounted-side by side.
 ///
-/// **`no-bkl-vfs` invariant:** this lock is held across a full virtio round-trip
-/// ([`VirtioBlockDevice::read_sectors`] busy-polls the virtqueue; it never yields), so it
-/// must not be stranded by a context switch or nested exception on a core running an fs
-/// syscall *without* the Big Kernel Lock. It isn't, and not by accident: every path that
-/// reaches it does so through the kernel's `vfs::ext2` `BlockDevice` impl, i.e. from
-/// inside `akuma-ext2`'s `read_block`/`write_block`/`write_superblock`, all of which
-/// require an `Ext2State` guard — and that guard carries the `PreemptGuard` (preemption
-/// off + IRQs masked) under `no-bkl-vfs`. So the hold is already covered transitively and
-/// needs no guard of its own; a nested one would only re-save an already-masked DAIF.
+/// The real bound is the machine's virtio-mmio slot count (8 on QEMU `virt`,
+/// shared with NIC(s), rng, sound, the rump tap), so 4 is generous for every
+/// configuration that exists. QEMU only wires a second `-drive` when the runner
+/// asks for one (`docs/archive/MOUNT_MISSING_SYSCALLS.md` §5).
+pub const MAX_BLOCK_DEVICES: usize = 4;
+
+/// `/dev`-style names for the device table, indexed by discovery order.
+/// `vda`, `vdb`, … — no allocation, just a static table lookup.
+const DEVICE_NAMES: [&str; MAX_BLOCK_DEVICES] = ["vda", "vdb", "vdc", "vdd"];
+
+/// The registered virtio-blk devices, by index. Slot 0 is the boot disk
+/// (`vda`); further slots are data disks, mounted at runtime through
+/// `mount(2)` with `source=/dev/vdX`.
 ///
-/// The one exception is [`is_initialized`], a momentary probe from `fs::init` during
-/// single-threaded boot.
+/// **`no-bkl-vfs` invariant (unchanged from the single-device era):** each
+/// per-device lock is held across a full virtio round-trip
+/// ([`VirtioBlockDevice::read_sectors`] busy-polls the virtqueue; it never
+/// yields), so it must not be stranded by a context switch or nested exception
+/// on a core running an fs syscall *without* the Big Kernel Lock. It isn't, and
+/// not by accident: every path that reaches it does so through the kernel's
+/// `vfs::ext2` `BlockDevice` impl, i.e. from inside `akuma-ext2`'s
+/// `read_block`/`write_block`/`write_superblock`, all of which require an
+/// `Ext2State` guard — and that guard carries the `PreemptGuard` (preemption
+/// off + IRQs masked) under `no-bkl-vfs`. So the hold is already covered
+/// transitively and needs no guard of its own; a nested one would only re-save
+/// an already-masked DAIF.
 ///
-/// If a *new* caller ever reaches [`with_device`] from outside an ext2 state guard, it
-/// must take an `akuma_primitives::PreemptGuard` itself — otherwise it reopens the AB-BA
-/// window (this core holding BLOCK_DEVICE while a nested IRQ hard-spins for the BKL).
-static BLOCK_DEVICE: Spinlock<Option<VirtioBlockDevice>> = Spinlock::new(None);
+/// The one exception is [`is_initialized`], a momentary probe from `fs::init`
+/// during single-threaded boot.
+///
+/// If a *new* caller ever reaches [`with_device_at`] from outside an ext2 state
+/// guard, it must take an `akuma_primitives::PreemptGuard` itself — otherwise
+/// it reopens the AB-BA window (this core holding a device lock while a nested
+/// IRQ hard-spins for the BKL).
+static BLOCK_DEVICES: [Spinlock<Option<VirtioBlockDevice>>; MAX_BLOCK_DEVICES] =
+    [const { Spinlock::new(None) }; MAX_BLOCK_DEVICES];
 
 // ============================================================================
 // Public API
 // ============================================================================
 
-/// Initialize the block device driver
-/// Scans for virtio-blk devices and initializes the first one found
+/// Initialize the block device driver.
+///
+/// Registers **every** virtio-blk the machine exposes, in slot order: the
+/// first becomes `vda` (the boot disk), the rest `vdb`… Devices past
+/// [`MAX_BLOCK_DEVICES`] are logged and skipped rather than aborting the
+/// boot — the first disk is what boot needs, extras are runtime conveniences.
 pub fn init() -> Result<(), BlockError> {
     log("[Block] Initializing block device driver...\n");
 
-    // Find virtio-blk device. `probe_with` keeps scanning if a matching slot
-    // fails to yield a working device, which is what the hand-rolled loop did.
-    let found_device = probe::probe_with(probe::device_id::BLOCK, |i, transport| {
+    let mut registered = 0usize;
+
+    // Find virtio-blk devices. `probe_each` visits every matching slot; a slot
+    // whose `VirtIOBlk::new` fails is logged and skipped, not fatal.
+    probe::probe_each(probe::device_id::BLOCK, |i, transport| {
+        if registered >= MAX_BLOCK_DEVICES {
+            crate::safe_print!(96, "[Block] slot {i}: device table full ({MAX_BLOCK_DEVICES}), ignoring\n");
+            return false;
+        }
+
         log("[Block] Found virtio-blk at slot ");
         crate::safe_print!(32, "{}\n", i);
 
         let Ok(blk) = VirtIOBlk::<VirtioHal, SteppedMmioTransport<'static>>::new(transport) else {
             log("[Block] Failed to init virtio device\n");
-            return None;
+            return true; // keep scanning
         };
 
         let device = VirtioBlockDevice::new(blk);
-        log("[Block] Capacity: ");
+        log("[Block] Registered ");
         crate::safe_print!(
-            64,
-            "{} MB ({} sectors)\n",
+            96,
+            "{}: {} MB ({} sectors)\n",
+            DEVICE_NAMES[registered],
             device.capacity_bytes() / 1024 / 1024,
             device.capacity_sectors()
         );
 
-        Some(device)
+        *BLOCK_DEVICES[registered].lock() = Some(device);
+        registered += 1;
+        true
     });
 
-    let device = found_device.ok_or(BlockError::NotFound)?;
+    if registered == 0 {
+        return Err(BlockError::NotFound);
+    }
 
-    // Store in global state
-    *BLOCK_DEVICE.lock() = Some(device);
-
-    log("[Block] Block device initialized\n");
+    log("[Block] Block devices initialized: ");
+    crate::safe_print!(32, "{}\n", registered);
     Ok(())
 }
 
-/// Check if block device is initialized
+/// Check whether at least one block device is registered.
 pub fn is_initialized() -> bool {
-    BLOCK_DEVICE.lock().is_some()
+    BLOCK_DEVICES[0].lock().is_some()
 }
 
-/// Execute a closure with access to the block device
-/// Returns None if the block device is not initialized
+/// How many block devices are registered (and thus nameable as `/dev/vdX`).
+#[must_use]
+pub fn device_count() -> usize {
+    (0..MAX_BLOCK_DEVICES)
+        .filter(|&i| BLOCK_DEVICES[i].lock().is_some())
+        .count()
+}
+
+/// The `/dev` name (`vda`…`vdd`) of device `idx`, if it exists.
+#[must_use]
+pub fn device_name(idx: usize) -> Option<&'static str> {
+    (idx < MAX_BLOCK_DEVICES && BLOCK_DEVICES[idx].lock().is_some()).then_some(DEVICE_NAMES[idx])
+}
+
+/// The index of the device a `/dev/`-style name refers to. Accepts both
+/// `vdb` and `/dev/vdb` — `mount(2)`'s `source` arrives either way depending
+/// on the caller.
+#[must_use]
+pub fn device_index_by_name(name: &str) -> Option<usize> {
+    let name = name.strip_prefix("/dev/").unwrap_or(name);
+    DEVICE_NAMES
+        .iter()
+        .position(|n| *n == name)
+        .filter(|&i| BLOCK_DEVICES[i].lock().is_some())
+}
+
+/// Execute a closure with access to device `idx`.
+/// Returns `None` if the device does not exist.
+pub fn with_device_at<F, R>(idx: usize, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtioBlockDevice) -> R,
+{
+    if idx >= MAX_BLOCK_DEVICES {
+        return None;
+    }
+    let guard = BLOCK_DEVICES[idx].lock();
+    guard.as_ref().map(f)
+}
+
+/// Read bytes at an arbitrary offset from device `idx`.
+pub fn read_bytes_at(idx: usize, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+    with_device_at(idx, |dev| dev.read_bytes(offset, buf)).ok_or(BlockError::NotInitialized)?
+}
+
+/// Write bytes at an arbitrary offset to device `idx`.
+pub fn write_bytes_at(idx: usize, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
+    with_device_at(idx, |dev| dev.write_bytes(offset, buf)).ok_or(BlockError::NotInitialized)?
+}
+
+/// Execute a closure with access to the boot device (`vda`).
+/// Returns `None` if no block device is initialized.
 pub fn with_device<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&VirtioBlockDevice) -> R,
 {
-    let guard = BLOCK_DEVICE.lock();
-    guard.as_ref().map(f)
+    with_device_at(0, f)
 }
 
-/// Read bytes at an arbitrary offset
+/// Read bytes at an arbitrary offset from the boot device (`vda`).
 pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-    with_device(|dev| dev.read_bytes(offset, buf)).ok_or(BlockError::NotInitialized)?
+    read_bytes_at(0, offset, buf)
 }
 
-/// Write bytes at an arbitrary offset
+/// Write bytes at an arbitrary offset to the boot device (`vda`).
 pub fn write_bytes(offset: u64, buf: &[u8]) -> Result<(), BlockError> {
-    with_device(|dev| dev.write_bytes(offset, buf)).ok_or(BlockError::NotInitialized)?
+    write_bytes_at(0, offset, buf)
 }
 
 // ============================================================================
