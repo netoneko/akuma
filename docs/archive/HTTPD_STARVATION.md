@@ -131,6 +131,25 @@ Until this is understood, **`overlays/devbox/rootfs/etc/herd/enabled/httpd.conf`
 should not ship enabled** — it costs the image its ssh access, which is the only
 way in.
 
+## 2026-08-25 update: QEMU repro of a harder sibling (same trigger)
+
+Next step 1 above was run, in QEMU instead of Firecracker, and produced a
+**harder failure with the same trigger** (second server started after a listener
+is already bound):
+
+- **SMP=1, QEMU HVF, `devbox-smoltcp,no-tests`, devbox.img, herd/sshd running**
+  — starting `/bin/httpd <port>` and then any further server (`nginx`, a second
+  `httpd`) from the SSH session froze the **whole kernel**: no ticks, no
+  heartbeats, no panic, QEMU parked at ~3 % CPU. 3/3 freezes; the freezing
+  syscall varied (`execve`, port-conflict `bind`).
+- **SMP=4, same image, same day** — sshd + nginx + httpd + redis (four
+  listeners) all ran and answered; no freeze. Single-core is the common factor
+  with this doc's Firecracker host (1 vCPU).
+
+Full conditions, freeze sites, and what is already ruled out (nginx itself,
+port conflict, the 2026-06 HVF `isv` fix regressing) are in
+[`SECOND_LISTENER_SMP1_FREEZE.md`](SECOND_LISTENER_SMP1_FREEZE.md).
+
 ## Background
 
 Found while deploying `main` (`2c1eb9d0`) to the AWS Firecracker host and adding
