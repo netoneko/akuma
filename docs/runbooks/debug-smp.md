@@ -46,6 +46,7 @@ SMP=4 cargo run --profile release-smp-shared --features smp-shared     # -smp 4
 
 | Symptom / signature | Cause | Fix / next step |
 |---|---|---|
+| Boot freezes at `SMP>1` between `[SmolNet] Initialized successfully` and `[Net] virtio-net IRQ: slot 0 -> INTID 48`, with `[BKL] stuck: owner=1 waiter=2/3/4 (aff0+1)` repeating — i.e. **core 0** holds the BKL and every secondary is behind it | `register_handler` called `gic::enable_irq()` **while holding `IRQ_HANDLERS`**, a non-reentrant spinlock that `dispatch_irq` takes from the interrupt vector. If the line delivered on that core before the guard dropped, the core spun against itself — with the BKL still held. It also held that lock across up to 49 `Vec::push` heap allocations, widening the window | **FIXED 2026-08-24**: fixed `[Option<IrqHandler>; 256]` table (no allocation), publish under `with_irqs_disabled`, and `enable_irq` moved **outside** the lock — the half that actually closes it. [`../archive/IRQ_HANDLER_TABLE_DEADLOCK.md`](../archive/IRQ_HANDLER_TABLE_DEADLOCK.md) |
 | SMP=4 `[BKL] stuck: owner=N waiter=M tag=511` **storm** (idle boot ~13 s in, or under rustc/fork load), often preceded by an EL1 crash dump with `ELR=0x8` or ELR in kernel *data*, `SP` outside the reported thread's stack, DAIF fully masked | **FIXED (2026-08-02): cross-core stack-sharing races** — a peer core picked up a thread that was still executing (or mid-switch) on another core's stack: (a) the switch-out tail after POOL release but before the vector asm's `mov sp, x0`; (b) wake-before-switch-out (`schedule_blocking` stores WAITING while still running; a peer wake-pass/futex-wake made it READY and a peer resumed it from stale `ctx.sp`). The storm is the corpse: the wild branch happens BKL-held and the core never releases. Same root cause as `BKL_RUSTC_SCALING_BASELINE.md` §5.1's ERET-to-EL0 with a kernel register file. | Fixed by the **ON_CPU scheduler gate** (pickers and the slot recycler skip threads whose gate is set; cleared by `rust_switch_finished` from the vector asm after `mov sp`). Full write-up: [`../archive/SMP_SHARED_ONCPU_GATE.md`](../archive/SMP_SHARED_ONCPU_GATE.md). If a storm reappears, check the `[SVC POISON]`/`[IRQ POISON]`/`[SGI-S STACK]` tripwires and the EL1 dump's `x30` line first. |
 | `SMP=4` boot suite stops emitting after ~23 tests (QEMU alive, serial log frozen), ~81 `[BKL] stuck owner=1` lines then silence, freeze right after `smp_shared_cooperative_wait PASSED` — while `SMP=1` reports a clean 286/0 | **Someone changed `blocking_relax`.** Its leading `yield_now` is what lets a spawn/exec/reap waiter run a READY peer on its own core; halting instead leaves the peer unscheduled and the wait never resolves — the original socket-recv / `exec_with_io_cwd` wedge. Reproduced deterministically 2026-08-20 by dropping the yield kernel-wide. | Put the yield back in `blocking_relax`. If the motive was network throughput, use `blocking_relax_net` (no yield) wired into `NetRuntime::blocking_relax` **only** — that keeps +30 % req/s and passes 294/0. **Acceptance signal is the line `smp_shared_blocking_wait_peer_progress PASSED`, not the pass count, and NOT the `[BKL] stuck` count — that is ~85 on healthy and wedged kernels alike.** [`../archive/BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md`](../archive/BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md) |
 | `[BKL] stuck: owner=N waiter=M` **flood that never stops**, no forward progress | A core is wedged in EL1 holding the BKL (real deadlock) — OR the BSP panicked while holding it (see the panic dump just above the flood). | If preceded by a panic dump, it's that panic — fix the panic, the flood is an artifact. Else attach gdb (below) and find what `owner`'s core is spinning on. |
@@ -211,6 +212,33 @@ crash). `parallel_processes` timing out here used to be the SMP=4 race; that is 
 BKL + idle_halt) — if it recurs, treat it as a fresh regression, not "re-run and hope".
 
 ## Gotchas
+
+**`[BKL] dropped window preserved across IRQ xN` is NOT a spin signature.**
+`note_preserved_window` (`crates/akuma-exec/src/bkl.rs`) logs only when
+`n.is_power_of_two()` — **the doubling is the sampler, not the phenomenon**.
+Because the gap between lines doubles, it is disproportionately often the last
+line in any log that stops for an unrelated reason, which makes it look like a
+freeze cause. It appears on perfectly healthy VMs: a 4-second devbox boot that
+went on to serve SSH emitted `x128 … x1024`. Read it as a counter. The real
+`[BKL]` signature is `[BKL] stuck: owner=N`.
+
+**`tag=511` in `[BKL] stuck` is always meaningless** — the holder-tag profiler
+is off by default, so it reads 511 regardless. Read `owner=`, and remember
+`(aff0+1)` means the numbers are core+1, so `owner=1` is **core 0**.
+
+**Tell an idle hang from a spin from the host**, before theorising:
+`ps -o %cpu -p $(pgrep -f qemu-system-aarch64)`. ~4 % is an idle guest waiting
+for a wake that never came; ~100 %/core is a real spin. The two have completely
+different causes and the console log looks identical.
+
+**A console line is not atomic at SMP>1** (the console lock is currently off),
+so another core can split one mid-write. A real boot produced
+`[herd] Started [syscall] socket(type=TCP) = fd 3` / `sshd (pid= 2)` — i.e.
+`Started sshd` cut in half — and a health check grepping for that marker
+reported a **false failure on a working VM**. `grep -ac PASSED` can be split the
+same way. Probe the service (an actual SSH round-trip) rather than grepping,
+where you can.
+
 
 - **Console garble** makes `grep` miss lines. Sanitize first:
   `LC_ALL=C tr -d '\r' < run.log | LC_ALL=C tr -c '[:print:]\n' ' '`.

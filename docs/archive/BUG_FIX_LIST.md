@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 691
-- **Docs contributing at least one fix:** 217
+- **Total distinct fixes counted:** 699
+- **Docs contributing at least one fix:** 222
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 128 | 18.5% | 18 |
-| Memory & Virtual Memory | 113 | 16.4% | 35 |
-| Scheduler & Process Management | 76 | 11.0% | 19 |
-| SMP & Locking | 86 | 12.4% | 37 |
-| Networking | 49 | 7.1% | 19 |
-| Userspace Apps & Libraries | 37 | 5.4% | 20 |
-| Rump Kernel & Syscall Proxy | 26 | 3.8% | 6 |
-| Toolchain & Self-Hosting | 37 | 5.4% | 5 |
-| SSH | 26 | 3.8% | 15 |
-| VFS & Filesystem | 17 | 2.5% | 12 |
+| Syscall / ABI Compatibility Audits | 128 | 18.3% | 18 |
+| Memory & Virtual Memory | 113 | 16.2% | 35 |
+| Scheduler & Process Management | 76 | 10.9% | 19 |
+| SMP & Locking | 87 | 12.4% | 38 |
+| Networking | 54 | 7.7% | 21 |
+| Userspace Apps & Libraries | 37 | 5.3% | 20 |
+| Rump Kernel & Syscall Proxy | 26 | 3.7% | 6 |
+| Toolchain & Self-Hosting | 37 | 5.3% | 5 |
+| SSH | 26 | 3.7% | 15 |
+| VFS & Filesystem | 17 | 2.4% | 12 |
 | Boot & Drivers | 23 | 3.3% | 8 |
-| Signals & Exceptions | 12 | 1.7% | 5 |
-| Misc / Cross-cutting | 22 | 3.2% | 5 |
-| Console & Terminal | 15 | 2.2% | 7 |
-| Containers | 24 | 3.5% | 6 |
-| **Total** | **691** | **100.0%** | **217** |
+| Signals & Exceptions | 13 | 1.9% | 6 |
+| Misc / Cross-cutting | 22 | 3.1% | 5 |
+| Console & Terminal | 16 | 2.3% | 8 |
+| Containers | 24 | 3.4% | 6 |
+| **Total** | **699** | **100.0%** | **222** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -478,7 +478,10 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - Expired sleepers/pollers rejoined the back of the round-robin queue instead of running next, and the 10 ms timer tick meant every sleep/poll deadline paid a full round (~35 ms floor at SMP=1, ~13 ms more per additional runnable thread) — measured as terminal output forwarded in ~27 Hz bursts; fixed via `WAKE_DEADLINE_PREEMPT` (arms the existing `PREEMPT_WAKE_TID` run-next hint from the deadline wake-pass instead of only from `ThreadWaker::wake`) plus dropping `TIMER_INTERVAL_US` 10 000→1 000, profile-gated (`extreme-size` keeps 10 ms) — A/B'd clean on release SMP=1/SMP=4, the 4 MB extreme-size floor, and devbox-smoltcp SMP=4
 
 
-## SMP & Locking (86 fixes, 37 docs)
+## SMP & Locking (87 fixes, 38 docs)
+
+### docs/archive/IRQ_HANDLER_TABLE_DEADLOCK.md
+- `register_handler` called `gic::enable_irq()` **while holding `IRQ_HANDLERS`**, the non-reentrant spinlock `dispatch_irq` takes from the interrupt vector, so a line delivering on that core before the guard dropped self-deadlocked it — with the BKL still held, surfacing as an `SMP>1` boot freeze with `[BKL] stuck: owner=1 waiter=2/3/4`. Fixed with a fixed `[Option<IrqHandler>; 256]` table (also removing up to 49 `Vec::push` heap allocations inside that lock), publishing under `with_irqs_disabled`, and moving `enable_irq` outside the lock
 
 ### docs/archive/SMP_GO_STRESS_CORRUPTION_FIX.md
 (standalone writeup of the same 2026-07-22 investigation SMP_SHARED.md's own
@@ -647,7 +650,16 @@ aren't recorded anywhere else.)
 ### docs/archive/BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md
 - Commit `1a29c9c3` dropped `blocking_relax()`'s leading `yield_now()` for every caller to speed up the socket wait loop (+27% HTTP throughput), but the spawn/exec/reap waiters — woken by another thread on their own core, not by a device interrupt — genuinely need that yield to hand off, so removing it kernel-wide permanently wedged `SMP=4` in the spawn/exec/reap path (boot suite: 294 passed → 23 passed, wedged); fixed by splitting the primitive into `blocking_relax_net` (no yield) wired only into `NetRuntime::blocking_relax`, keeping the yield everywhere else (294 passed, +30% HTTP throughput preserved)
 
-## Networking (49 fixes, 19 docs)
+## Networking (54 fixes, 21 docs)
+
+### docs/archive/LONG_ROAD_TO_REDIS_PART_2.md
+- `sys_pselect6` passed `None` for its waker, alone among the three poll syscalls, so `select(2)` could only ever wake on the 10 ms `BLOCKING_POLL_INTERVAL_US` tick however fast the peer answered — cargo's vendored libcurl compiles the `select()` branch, so every cargo network wait rode the tick while `poll(2)` callers were woken immediately
+- `sys_pselect6` had no `should_interrupt_blocking_syscall()` check, which `epoll_pwait` and `ppoll` both had: a process blocked in `select()` could not be interrupted by Ctrl-C or `kill`, and `alarm()` + `select()` slept through its own signal (the unfixed kernel slept the full 300 ms timeout and returned 0 instead of `EINTR`)
+- `dup`/`dup3`/`fcntl(F_DUPFD)` matched only 4 of the 6 `FileDescriptor` variants then `_ => {}`, so `dup(eventfd)` and `dup(rump_socket)` produced unreferenced aliases and the first `close()` destroyed the object under the survivor; the three drifted copies were deleted for one `akuma_exec::process::clone_fd_refs`, shared with `clone_deep_for_fork`
+- The `[epoll] ctl` trace in `src/syscall/poll.rs` was **ungated** while every neighbouring trace sat behind a compiled-`false` flag, so it printed on every `epoll_ctl` ADD/MOD — ~40 bytes out the emulated 16550 at one MMIO trap per byte, on the request path, and 99.3 % of a running guest's console output. Gating it took a redis 8.8.0 UNIX-socket round trip from 303 µs to 41 µs; 14 further per-operation traces (`socket`, `connect`, `sendto`, `setsockopt`, unix-socket and timerfd/eventfd creation) were gated with it
+
+### docs/archive/REDIS_ROUND_TRIP_CEILING.md
+- Akuma emitted a bare ACK **and** the response for every request — 1.97-2.00 TX packets per RX packet in every `[NICSTAT]` window, at every core count and on both branches — because `socket.set_ack_delay(None)` disabled delayed ACK outright rather than tuning it. Removing the duplicate ACK is **+43 %** on the round-trip ceiling
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - `MAX_BACKLOG = 8` (`crates/akuma-net/src/socket.rs`) was a hard ceiling on **simultaneous connection arrivals**, not the soft hint `listen(2)`'s backlog is on Linux: this stack has no SYN queue, a listener *is* a fixed pool of pre-created sockets sitting in `Listen` that `socket_accept` replenishes one at a time, so arrivals past the 8th got a RST regardless of how fast the server accepted. Every caller's requested backlog was silently clamped to it (`libakuma`'s `TcpListener::bind` asks for 128). Measured on devbox-smoltcp/SMP=4: 8/8 connections clean, 12/16, 17/24 before; 16/16 and 24/24 after. Raised to 32 behind the default-on `many-sessions` feature, which also lifts the smoltcp socket table from 32 to 128 on `small-sockets` builds — a 32-deep backlog is meaningless against a 32-socket budget. `kernel_profile_extreme` overrides both back down, so the 4 MB floor is unaffected
@@ -1056,7 +1068,10 @@ aren't recorded anywhere else.)
 - `rng.rs`: `VirtqAvail`/`VirtqUsed`'s `idx`/`flags`/`*_event` fields were read/written as plain `u16`s with no synchronization between producer and consumer; fixed by making them `AtomicU16` with a release store on publish and an acquire load on completion (the pre-notify `fence(SeqCst)` kept, since it orders against a Device-memory MMIO store the atomics don't cover)
 
 
-## Signals & Exceptions (12 fixes, 5 docs)
+## Signals & Exceptions (13 fixes, 6 docs)
+
+### docs/archive/CTRL_C_SIGINT_DELIVERY.md
+- Ctrl-C never interrupted a foreground child over `ssh -tt` (repro: `tail -f`): **no line discipline in the tree generated `SIGINT` at all**. Fixed in the kernel as a process-group broadcast; the first attempt — patching sshd to target `foreground_pgid` as a single pid — was wrong and is recorded as such
 
 ### docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md
 - `ITIMER_DEADLINE`/`ITIMER_INTERVAL` lived outside `scrub_thread_slot`'s per-slot reset discipline, so an armed-and-abandoned itimer (e.g. busybox `wget -T`) outlived its process and fired an instant, unconditional SIGALRM against the next unrelated process to reuse that thread slot, killing `git-remote-https` before it even resolved DNS; now scrubbed to `(0, 0)` on every slot claim like the rest of the per-slot registers
@@ -1128,7 +1143,10 @@ aren't recorded anywhere else.)
 - The `[TESTS] low-mem … skipping boot self-test suite` message printed with no `cfg` guard, so every `no-tests`/`size` image — which never compiled a suite at all — falsely claimed at boot that it had skipped one; now gated on the same condition as the suite itself
 
 
-## Console & Terminal (15 fixes, 7 docs)
+## Console & Terminal (16 fixes, 8 docs)
+
+### docs/archive/VEC_AUDIT.md
+- `crates/akuma-terminal`'s canonical-mode `canon_buffer` grew one byte per keystroke with no cap and was drained only by a line terminator, so a peer writing to a tty in canonical mode and never sending `\n` grew kernel heap without limit. Capped at `MAX_CANON = 4095` (Linux N_TTY's own ceiling), dropping — and deliberately not echoing — input beyond it, while the `\n`/VEOF paths stay uncapped so a full line can always still be terminated
 
 ### docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md
 - The blocking stdin read (`sys_poll_input_event`, mirrored by `sys_read`'s `Stdin` arm) took `term_state_lock` and its nested `input_waker` spinlock with **preemption disabled but IRQs enabled**, so the post-wake re-acquire could sit in that state for as long as the holder took to become schedulable — 94 seconds in the captured incident — and the preemption watchdog declared the whole VM stuck; all 6 sites now use a per-attempt `try_lock()` retry that holds the preemption guard only on success, bounding the spin regardless of who the holder is
@@ -1202,6 +1220,8 @@ aren't recorded anywhere else.)
 ---
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
+
+Also re-scanned 2026-08-25 (the `more-fixes` branch, ahead of merging it): BENCHMARK_PERFOMANCE_ATTEMPT_1 (a benchmark record; its one actionable finding — nginx's lost epoll wakeup — is open and lives in NGINX_LOST_WAKEUP), MOUNT_MISSING_SYSCALLS ("nothing in this doc is implemented by this session" by its own status line; §7 is a build list), NGINX_LOST_WAKEUP (**open**: nginx's `epoll_wait` misses readiness wakes and is rescued by the 10 ms `backstop_us`, so requests cost ~17 ms; hypothesis with strong circumstantial support, no fix), HTTPD_ACCEPT_HANG (**open**: `httpd` stops answering while the process is still alive and logs no error; observed 2-3 times, not reliably reproduced, failing stage not established), REDIS_BENCHMARK_HOST_CONTENTION_LIVELOCK (resolved, but the `while(1)` is in `redis-benchmark`'s own `writeHandler` — "the guest is not involved in the hang at all", so no fix landed in this codebase), REDIS_ROUND_TRIP_STAGE_TRACE (read entirely out of already-checked-in logs — no new boot, no new build; its §4 "688 µs" framing is retired by LONG_ROAD_TO_REDIS_PART_2 §9, counted there), and SYSCALL_LAYER_AUDIT (the duplication audit that *found* the `dup`/`dup3`/`fcntl` refcount gap; the fix is counted under LONG_ROAD_TO_REDIS_PART_2, not duplicated here). VEC_AUDIT's findings #1 (`map_user_page`'s per-call page-table frame list) and #2 (`SOCKET_TABLE`) are `Vec`-to-fixed-array conversions with no bug attached and are not counted; its #3 is the `irq.rs` deadlock, counted under IRQ_HANDLER_TABLE_DEADLOCK; only its terminal `canon_buffer` fix is counted (Console & Terminal, above).
 
 Also re-scanned 2026-08-07: DEVELOPMENT_PRACTICES_REVIEW_AND_ASSESSMENT (pure meta-analysis of process/git history, zero concrete bug-fix content) and BKL_RUSTC_SCALING_BASELINE (re-verified still accurate as perf-not-bugs; its inconclusive `big.rs`-failure investigation is fully resolved later by SMP_SHARED_ONCPU_GATE.md and STALE_THREAD_SLOT_KILL.md, counted there).
 

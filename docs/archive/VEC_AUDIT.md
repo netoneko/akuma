@@ -224,9 +224,15 @@ All three findings are remediated. Two things this audit did **not** cover are
 worth a follow-up:
 
 1. **The terminal `canon_buffer` gap** flagged under "checked and ruled out"
-   is a real unbounded-growth bug, not a Vec-vs-buffer question:
-   `crates/akuma-terminal/src/lib.rs:237,248` `push` per byte with no cap,
-   where Linux's N_TTY stops a canonical line at 4095. It is still open.
+   was a real unbounded-growth bug, not a Vec-vs-buffer question:
+   `crates/akuma-terminal/src/lib.rs` pushed per byte with no cap, so a peer
+   writing to a tty in canonical mode and never sending `\n` grew kernel heap
+   without limit. **FIXED 2026-08-24**: `MAX_CANON = 4095` (Linux N_TTY's own
+   ceiling); input beyond it is dropped and deliberately **not** echoed, while
+   the `\n`/VEOF branches stay uncapped so a full line can always still be
+   terminated rather than wedging. Two host tests
+   (`canon_buffer_is_capped_at_max_canon`, `capped_line_can_still_be_terminated`)
+   were verified to fail with the cap removed.
 2. **Re-read the "ruled out" list for lock context, not container shape.**
    #3's mistake was that the audit asked only whether the container was the
    right shape. The question that caught the real bug was "what else runs
