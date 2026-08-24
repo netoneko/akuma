@@ -3037,19 +3037,50 @@ pub fn yield_now() {
 #[cfg(target_os = "none")]
 pub fn idle_halt() {
     let tid = current_thread_id();
-    // Disable preemption for the duration of the halt. Without this, a
-    // preemptible idle thread (e.g. the network poller) would be billed and
-    // switched out by the timer tick *mid-WFI* — the residency including the
-    // halt lands in its CPU-time bucket before we can correct it, and the
-    // correction (start_time_us bump below) is discarded at the next switch-in.
-    // With preemption disabled the timer's involuntary schedule_indices returns
-    // None early (`!voluntary && is_preemption_disabled()`), so the halt is
-    // neither billed nor switched. WFI still wakes on the very same timer IRQ
-    // (and on device IRQs), and the voluntary yield_now() that follows this in
-    // the idle loop bypasses the preemption check, so readying a thread still
-    // reschedules immediately. The watchdog (100 ms WARN) tolerates a ≤1-tick
-    // (~10 ms) disabled window.
-    disable_preemption();
+    // Non-idle halters must stay PREEMPTIBLE (SMP=1 freeze fix, 2026-08-25).
+    //
+    // The preemption disable below exists so an *idle* thread's halt is
+    // neither billed nor switched out mid-WFI (see the original comment).
+    // Applied to a NON-idle halter — a socket waiter parked via
+    // `blocking_relax_net` (`wait_until` → Promiscuous park), or the netpoll
+    // thread between laps — it is fatal at SMP=1: the parked waiter stays
+    // RUNNING, sole owner of the only core, inside a preempt-disabled `wfi`;
+    // every timer tick runs the wake-pass but `schedule_indices` then
+    // declines the switch (`!voluntary && is_preemption_disabled()`), and no
+    // running thread remains to raise the voluntary SGI that could
+    // un-suppress it. Whole-kernel freeze, no panic, ~3 % host CPU:
+    // docs/archive/SECOND_LISTENER_SMP1_FREEZE.md §2a (GDB-proven).
+    //
+    // The idle loop escapes this shape only because its trailing
+    // `yield_now()` is a voluntary switch; the socket variant deliberately
+    // has no yield (removing it bought +27 % req/s — see
+    // `blocking_relax_net`). Keeping the halt preemptible hands the tick
+    // exactly the displacement power that yield provides, at zero cost in
+    // the common case: if nothing else is READY, no switch happens and the
+    // halt is uninterrupted as before.
+    //
+    // Cost accepted: a non-idle waiter's halt residency can now land in its
+    // cpu_us bucket (billing-only skew — the original motivation for the
+    // disable), and if it is displaced mid-halt the quantum-shift correction
+    // below is clamped to `now` so it can never push a quantum start into
+    // the future.
+    let is_idle = tid < MAX_THREADS && IS_IDLE_THREAD[tid].load(Ordering::Relaxed);
+    if is_idle {
+        // Disable preemption for the duration of the halt. Without this, a
+        // preemptible idle thread would be billed and switched out by the
+        // timer tick *mid-WFI* — the residency including the halt lands in
+        // its CPU-time bucket before we can correct it, and the correction
+        // (start_time_us bump below) is discarded at the next switch-in.
+        // With preemption disabled the timer's involuntary schedule_indices
+        // returns None early (`!voluntary && is_preemption_disabled()`), so
+        // the halt is neither billed nor switched. WFI still wakes on the
+        // very same timer IRQ (and on device IRQs), and the voluntary
+        // yield_now() that follows this in the idle loop bypasses the
+        // preemption check, so readying a thread still reschedules
+        // immediately. The watchdog (100 ms WARN) tolerates a ≤1-tick
+        // (~10 ms) disabled window.
+        disable_preemption();
+    }
     let entered = (runtime().uptime_us)();
     // Real shared-kernel SMP: an idle core must not hold the Big Kernel Lock while
     // halted, or peer cores can't enter the kernel. Drop it before WFI; the IRQ that
@@ -3074,7 +3105,7 @@ pub fn idle_halt() {
         // IS_IDLE_THREAD because non-idle callers use `idle_halt()` as a plain wait and
         // must keep their own excursion's tag.
         #[cfg(kernel_smp_shared)]
-        if tid < MAX_THREADS && IS_IDLE_THREAD[tid].load(Ordering::Relaxed) {
+        if is_idle {
             crate::sync::set_holder_tag(crate::bkl::current_core_id(), crate::sync::HOLD_TAG_IDLE);
         }
     }
@@ -3083,12 +3114,20 @@ pub fn idle_halt() {
         let _guard = IrqGuard::new();
         if let Some(mut pool) = POOL.try_lock() {
             // Shift the quantum start forward by the halt duration so the next
-            // switch-out's `now - start_time_us` excludes the time we spent halted.
-            pool.slots[tid].start_time_us =
-                pool.slots[tid].start_time_us.saturating_add(halted);
+            // switch-out's `now - start_time_us` excludes the time we spent
+            // halted. Clamped to now: a non-idle halter can be descheduled
+            // mid-halt now (that is the fix above), and the scheduler's
+            // switch-in already reset start_time_us — an unclamped shift would
+            // push the quantum start into the future and under-bill every
+            // slice until it caught up.
+            let shifted = pool.slots[tid].start_time_us.saturating_add(halted);
+            let now_us = entered.saturating_add(halted);
+            pool.slots[tid].start_time_us = shifted.min(now_us);
         }
     }
-    enable_preemption();
+    if is_idle {
+        enable_preemption();
+    }
 }
 
 #[cfg(not(target_os = "none"))]

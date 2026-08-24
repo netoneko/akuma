@@ -29,6 +29,11 @@ path = "src/main.rs"
 # `http2` enables nghttp2 in the vendored libcurl, matching cargo's libcurl.
 curl = { version = "0.4", default-features = false, features = ["http2", "ssl", "static-curl", "static-ssl"] }
 
+# parkprobe mode only: fork/waitpid/kill for the SMP=1 scheduler-freeze
+# acceptance probe (docs/archive/SECOND_LISTENER_SMP1_FREEZE.md). Everything
+# else in the binary is std + curl.
+libc = "0.2"
+
 # Empty [workspace] table opts out of the parent userspace/Cargo.toml workspace
 # (whose target is aarch64-unknown-none). Mirrors the pattern used by
 # userspace/selfhost_repro.

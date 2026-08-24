@@ -82,6 +82,7 @@ name = "nettest"
 version = "0.1.0"
 dependencies = [
  "curl",
+ "libc",
 ]
 
 [[package]]

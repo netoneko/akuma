@@ -312,6 +312,144 @@ fn worker_loop(incoming: Receiver<Message>, multiplex: bool) {
 }
 
 // ============================================================================
+// parkprobe — the SMP=1 idle_halt scheduler-freeze acceptance probe
+// ============================================================================
+//
+// Reproduces, in one process tree with zero external binaries, the exact
+// scheduling configuration that froze single-core kernels before the
+// `idle_halt` preemption fix (docs/archive/SECOND_LISTENER_SMP1_FREEZE.md):
+//
+//   child A   binds a loopback listener and parks in blocking `accept(2)` —
+//             the `wait_until` → `blocking_relax_net` → `idle_halt` path —
+//             on a quiet network (nothing will ever connect first);
+//   child B   forked next and `_exit()`s immediately — the "READY, never yet
+//             run" thread (the second server's exec in the original repro);
+//   parent    parks in blocking `wait4(B)` — a waker-only park whose wake is
+//             B's exit (the session shell in the original repro).
+//
+// Healthy kernel: B runs within a tick, the parent reaps it, then the parent
+// CONNECTS to A's listener — exercising the wake path end to end (loopback
+// frame → netpoll doorbell → stack poll → accept returns) — echoes one byte,
+// SIGKILLs A while it is parked in the *next* accept, and reaps it.
+//
+// Frozen kernel: the probe never prints its PASS line — the frozen
+// preempt-disabled halt parks the probe's own parent, so nothing userland can
+// self-timeout. **The harness's timeout is the failure signal.**
+//
+// Usage: nettest parkprobe
+
+fn run_parkprobe() -> Result<Duration, String> {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    const REQ: u8 = b'Q';
+    const RSP: u8 = b'R';
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("bind loopback listener: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?
+        .port();
+
+    // Readiness pipe: A announces itself just before entering accept. Raw
+    // libc pipe, because this must survive fork() (an mpsc channel would be
+    // duplicated, not shared).
+    let mut rdy_pipe = [0i32; 2];
+    if unsafe { libc::pipe(rdy_pipe.as_mut_ptr()) } != 0 {
+        return Err(format!("pipe: {}", std::io::Error::last_os_error()));
+    }
+
+    let t0 = Instant::now();
+    let pid_a = unsafe { libc::fork() };
+    if pid_a < 0 {
+        return Err(format!("fork A: {}", std::io::Error::last_os_error()));
+    }
+    if pid_a == 0 {
+        // Child A: the parked socket waiter. Announce, then serve one echo
+        // connection and park in the next accept — where the parent kills us.
+        unsafe {
+            libc::close(rdy_pipe[0]);
+            let byte = [1u8; 1];
+            let _ = libc::write(rdy_pipe[1], byte.as_ptr().cast(), 1);
+            libc::close(rdy_pipe[1]);
+        }
+        eprintln!("[parkprobe] A: parked in accept on 127.0.0.1:{port}");
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut b = [0u8; 1];
+            let _ = s.read(&mut b);
+            let _ = s.write_all(&[RSP]);
+        }
+        std::process::exit(0); // unreachable: killed while parked above
+    }
+
+    // Parent: wait for A's announcement (a blocking pipe read — A is running
+    // now, this returns within a scheduling slice on any healthy kernel).
+    unsafe {
+        libc::close(rdy_pipe[1]);
+        let mut b = [0u8; 1];
+        let n = libc::read(rdy_pipe[0], b.as_mut_ptr().cast(), 1);
+        libc::close(rdy_pipe[0]);
+        if n != 1 {
+            return Err("A never announced readiness".into());
+        }
+    }
+
+    // The trigger: B is forked while A holds the accept park. On the frozen
+    // kernel B never gets scheduled and the wait4 below never returns.
+    let pid_b = unsafe { libc::fork() };
+    if pid_b < 0 {
+        return Err(format!("fork B: {}", std::io::Error::last_os_error()));
+    }
+    if pid_b == 0 {
+        // Child B: exit before ever being scheduled, if the scheduler is
+        // healthy. Code 7 so the parent can verify it reaped the RIGHT child.
+        unsafe { libc::_exit(7) };
+    }
+    eprintln!("[parkprobe] parent: B forked (pid {pid_b}), parking in wait4");
+
+    let mut status: i32 = 0;
+    if unsafe { libc::waitpid(pid_b, &mut status, 0) } != pid_b {
+        return Err(format!("wait4(B): {}", std::io::Error::last_os_error()));
+    }
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 7 {
+        return Err(format!("B exited abnormally: status={status:#x}"));
+    }
+    let reaped_at = t0.elapsed();
+    eprintln!("[parkprobe] parent: B reaped after {reaped_at:?} — scheduler escaped the park");
+
+    // Wake-path check: connect to A's listener. This is the part the freeze
+    // doc's original repro never reached — a surviving machine whose accept
+    // park forgot how to wake would hang here instead.
+    let mut conn = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| format!("connect to A's listener: {e}"))?;
+    conn.set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    conn.write_all(&[REQ])
+        .map_err(|e| format!("write to A: {e}"))?;
+    let mut b = [0u8; 1];
+    conn.read_exact(&mut b)
+        .map_err(|e| format!("read echo from A: {e}"))?;
+    if b[0] != RSP {
+        return Err(format!("echo mismatch: sent {REQ:?}, got {:?}", b[0]));
+    }
+    drop(conn);
+    let echoed_at = t0.elapsed();
+
+    // Cleanup under fire: SIGKILL A while it sits in the NEXT accept park —
+    // signal delivery to a preempt-disabled (old kernel: frozen; new kernel:
+    // merely halted) socket waiter.
+    unsafe {
+        libc::kill(pid_a, libc::SIGKILL);
+        let mut st: i32 = 0;
+        libc::waitpid(pid_a, &mut st, 0);
+    }
+
+    Ok(t0.elapsed())
+}
+
+// ============================================================================
 // CLI
 // ============================================================================
 
@@ -319,10 +457,15 @@ fn usage() -> ! {
     eprintln!("nettest <mode> [url]");
     eprintln!();
     eprintln!("modes (cargo pattern, see src/main.rs header for the source-mapping table):");
-    eprintln!("  easy11   Easy2 + HTTP/1.1, no Multi, no worker thread  (curl CLI equivalent)");
-    eprintln!("  easy2    Easy2 + HTTP/2 + pipewait, no Multi, no worker thread");
-    eprintln!("  multi11  Multi + worker thread, multiplexing OFF");
-    eprintln!("  multi2   Multi + worker thread + multiplexing  (cargo's exact pattern)");
+    eprintln!("  easy11    Easy2 + HTTP/1.1, no Multi, no worker thread  (curl CLI equivalent)");
+    eprintln!("  easy2     Easy2 + HTTP/2 + pipewait, no Multi, no worker thread");
+    eprintln!("  multi11   Multi + worker thread, multiplexing OFF");
+    eprintln!("  multi2    Multi + worker thread + multiplexing  (cargo's exact pattern)");
+    eprintln!();
+    eprintln!("scheduler probes (no url):");
+    eprintln!("  parkprobe SMP=1 idle_halt freeze probe — parked accept + fork-exit + wait4;");
+    eprintln!("            PASS = reap+echo+kill complete; a hang needs the harness timeout");
+    eprintln!("            (docs/archive/SECOND_LISTENER_SMP1_FREEZE.md)");
     eprintln!();
     eprintln!("default url: https://index.crates.io/config.json  (the cargo failure)");
     std::process::exit(2);
@@ -334,6 +477,22 @@ fn main() {
         usage();
     }
     let mode = args[1].as_str();
+
+    // parkprobe takes no url and must not touch curl at all.
+    if mode == "parkprobe" {
+        eprintln!("[nettest] mode=parkprobe (scheduler freeze probe)");
+        match run_parkprobe() {
+            Ok(total) => {
+                println!("[nettest] mode=parkprobe OK total={total:?}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("[nettest] mode=parkprobe FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let url = args
         .get(2)
         .cloned()
