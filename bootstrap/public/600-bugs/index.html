@@ -340,7 +340,7 @@
   <section class="slide">
     <div class="num">02</div>
     <div class="body">
-      <p class="eyebrow">680 documented, dated, fixed</p>
+      <p class="eyebrow">699 documented, dated, fixed</p>
       <h2>The checks got <em>cheap too</em></h2>
       <p>More code generated means more code to check. <strong>But the same shift that made
       the code cheap makes the checks cheap</strong> — probes, tripwires, self-tests, boot
@@ -392,7 +392,7 @@
             <div class="fig"><span class="v">43,700</span><span class="k">prod lines</span></div>
             <div class="fig"><span class="v">29,302</span><span class="k">test lines</span></div>
             <div class="fig"><span class="v">~170</span><span class="k">linux syscalls</span></div>
-            <div class="fig"><span class="v hot">680</span><span class="k">documented fixes</span></div>
+            <div class="fig"><span class="v hot">699</span><span class="k">documented fixes</span></div>
           </div>
         </div>
       </div>
@@ -460,28 +460,28 @@
       <p class="eyebrow">Act I · the landscape</p>
       <h2>the bugs</h2>
       <div class="figs">
-        <div class="fig"><span class="v hot">680</span><span class="k">documented fixes</span></div>
+        <div class="fig"><span class="v hot">699</span><span class="k">documented fixes</span></div>
         <div class="fig"><span class="v">43,700</span><span class="k">prod lines</span></div>
         <div class="fig"><span class="v">29,302</span><span class="k">test lines</span></div>
-        <div class="fig"><span class="v">340</span><span class="k">investigation docs</span></div>
+        <div class="fig"><span class="v">355</span><span class="k">investigation docs</span></div>
       </div>
       <div class="scroller">
         <table class="dense">
           <thead><tr><th>subsystem</th><th class="r">fixes</th><th class="r">%</th><th class="r">/kLoC</th></tr></thead>
           <tbody>
-            <tr><td>Syscall / ABI</td><td class="r">128</td><td class="r">22.1%</td><td class="r">20.5</td></tr>
-            <tr><td>Memory &amp; VM</td><td class="r">113</td><td class="r">19.5%</td><td class="r hot">23.3</td></tr>
-            <tr><td>SMP &amp; Locking</td><td class="r">86</td><td class="r">14.8%</td><td class="r hot">41.3</td></tr>
-            <tr><td>Scheduler &amp; Process</td><td class="r">76</td><td class="r">13.1%</td><td class="r">6.9</td></tr>
-            <tr><td>Networking</td><td class="r">69</td><td class="r">11.9%</td><td class="r">11.9</td></tr>
+            <tr><td>Syscall / ABI</td><td class="r">128</td><td class="r">22.3%</td><td class="r">20.5</td></tr>
+            <tr><td>Memory &amp; VM</td><td class="r">113</td><td class="r">19.7%</td><td class="r hot">23.3</td></tr>
+            <tr><td>SMP &amp; Locking</td><td class="r">87</td><td class="r">15.2%</td><td class="r hot">41.8</td></tr>
+            <tr><td>Scheduler &amp; Process</td><td class="r">76</td><td class="r">13.3%</td><td class="r">6.9</td></tr>
+            <tr><td>Networking</td><td class="r">54</td><td class="r">9.4%</td><td class="r">9.3</td></tr>
+            <tr><td>Containers</td><td class="r">24</td><td class="r">4.2%</td><td class="r hot">21.5</td></tr>
             <tr><td>Boot &amp; Drivers</td><td class="r">23</td><td class="r">4.0%</td><td class="r">6.0</td></tr>
             <tr><td>Misc / cross-cutting</td><td class="r">22</td><td class="r">3.8%</td><td class="r">58.7</td></tr>
-            <tr><td>Containers</td><td class="r">19</td><td class="r">3.3%</td><td class="r">17.0</td></tr>
-            <tr><td>VFS &amp; Filesystem</td><td class="r">17</td><td class="r">2.9%</td><td class="r">4.2</td></tr>
-            <tr><td>Console &amp; Terminal</td><td class="r">15</td><td class="r">2.6%</td><td class="r">15.6</td></tr>
-            <tr><td>Signals &amp; Exceptions</td><td class="r">12</td><td class="r">2.1%</td><td class="r">3.5</td></tr>
-            <tr class="self"><td><strong>kernel</strong></td><td class="r"><strong>580</strong></td><td class="r">100%</td><td class="r">13.3</td></tr>
-            <tr><td>outside it — apps, toolchain, ssh</td><td class="r">100</td><td class="r">—</td><td class="r">—</td></tr>
+            <tr><td>VFS &amp; Filesystem</td><td class="r">17</td><td class="r">3.0%</td><td class="r">4.2</td></tr>
+            <tr><td>Console &amp; Terminal</td><td class="r">16</td><td class="r">2.8%</td><td class="r">16.6</td></tr>
+            <tr><td>Signals &amp; Exceptions</td><td class="r">13</td><td class="r">2.3%</td><td class="r">3.8</td></tr>
+            <tr class="self"><td><strong>kernel</strong></td><td class="r"><strong>573</strong></td><td class="r">100%</td><td class="r">13.1</td></tr>
+            <tr><td>outside it — apps, toolchain, ssh, rump</td><td class="r">126</td><td class="r">—</td><td class="r">—</td></tr>
           </tbody>
         </table>
       </div>
@@ -628,10 +628,10 @@
     <div class="body">
       <p class="eyebrow hot">Act III · how it's built</p>
       <h2>Learn from history</h2>
-      <p><strong>A full OS development cycle is a surprisingly large dataset.</strong> 2,009
-      commits, 340 investigation docs. What can be mined:</p>
+      <p><strong>A full OS development cycle is a surprisingly large dataset.</strong> 2,039
+      commits, 355 investigation docs. What can be mined:</p>
       <ul>
-        <li><strong>680 distinct fixes</strong> across 15 subsystems, itemised, dated, cross-referenced.</li>
+        <li><strong>699 distinct fixes</strong> across 15 subsystems, itemised, dated, cross-referenced.</li>
         <li><strong>Two crisis windows, from commit volume alone</strong> — an independent churn-per-file measure lands on the same two months.</li>
         <li><strong>Recurring defect types.</strong> ~3% of all fixes are the same underlying bug rediscovered in a different subsystem: stale address-space pointer ×3, lock-held-across-blocking ×4, readiness gaps ×6 across four files. The most-repeated shape: <strong>a raw index outliving the thing it names.</strong></li>
       </ul>
