@@ -11,8 +11,12 @@ deleted code has no `unsafe` in it.
 **This doc tracks.** It is a live work list, not a frozen investigation — unlike
 its neighbours in `archive/`, update it as phases land.
 
-**Progress: Phases 0, 1, 2a, 2b, 3 all done, and Phase 4's blocked half is
-COMPLETE (2026-08-13).** `crates/akuma-primitives` exists and all six rungs
+**Progress: Phases 0, 1, 2a, 2b, 3, 5, 6 and 7 are all done, and Phase 4's
+blocked half is COMPLETE (2026-08-13).** What is left is **Phase 8** (the
+quality floor — not started) and the three deferred audits at the end of this
+document: bare `unwrap()`/`expect()`, the 7g atomics audit, and the
+`Pte`/`PageTable` newtype. Phase 6's heading and two of the three "still
+deferred" rows were stale until 2026-08-24; see the corrections in place below. `crates/akuma-primitives` exists and all six rungs
 landed: `OnceCopy`, the console primitives, every DAIF access in the tree, the
 clock hook, the thread-slot preemption table + `PreemptGuard`, and the identity
 phys/virt translators. **Three crates — `akuma-ext2`, `akuma-virtio`,
@@ -2181,7 +2185,12 @@ now rewrites each arm once, and every arm it touches already returns a named
 constant, so a converted arm's return value is reviewable without re-deriving a
 number.
 
-### Phase 6 — remaining duplication — IN PROGRESS
+### Phase 6 — remaining duplication — DONE 2026-08-14
+
+> **Status corrected 2026-08-24.** This header read `IN PROGRESS` while every
+> row of its own "Still open" table below was already struck through — the last
+> one (the fork/CoW pile) landed 2026-08-14 and the heading was never updated.
+> Nothing was left; the label was the only thing outstanding.
 
 **DONE 2026-08-13:** the `mount.rs` shared half into `akuma-vfs` (§8 item 3) as
 one `MountSet<const MAX: usize>`, and with it the bin crate's third path
@@ -2339,10 +2348,20 @@ item and this does not subsume it: item 8 removed duplicate *walks*, not the raw
 the file now has one range walk and two fixed walks instead of eight — so the
 newtype, if it is ever done, has far fewer sites to convert.
 
-Still deferred, genuinely: `Mmio<T>` (~−25 `unsafe`), safe sysreg readers (~−27,
-relocation not removal), the `Pte`/`PageTable` newtype (~−50). Specifically do
-**not** pick up `Mmio<T>` while in the driver layer for Phase 3 — it reaches into
-GIC, console and pmm and has a different blast radius.
+**Re-checked against the tree 2026-08-24**, because two of the three rows below
+had gone stale in opposite directions:
+
+| Item | State |
+|---|---|
+| ~~`Mmio<T>` (~−25 `unsafe`)~~ | **DONE.** `MmioReg<T>` lives at `crates/akuma-primitives/src/mmio.rs:40` (`read()` `:61`, `write()` `:69`) with four consumers: `src/fw_cfg.rs`, `akuma-virtio/src/rng.rs`, `akuma-virtio/src/probe.rs`, `akuma-net/src/smoltcp_net.rs`. The "do not pick this up during Phase 3 driver work" warning below is doubly obsolete — the driver layer is exactly where it landed |
+| Safe sysreg readers | **HALF DONE, and the halves landed under different phases.** DAIF is centralised: `akuma_primitives::irq` exports `read_daif`, `DAIF_I_MASKED`, `irq_save_mask`, `mask_irqs_sync`, `IrqGuard`, consumed across crates (e.g. `akuma-exec/src/threading/mod.rs:3001`) — that was Phase 4 rung 3, and this row was never updated to say so. The **general** readers are open: raw `asm!("mrs"/"msr")` remains in `src/{gic,gic_v3,timer,smp_shared,main,exceptions}.rs` and `src/syscall/{proc,mem}.rs`, and `gic_v3.rs:116-127` still defines its *own* local `read_sysreg!`/`write_sysreg!` macros instead of a shared one. **The ~−27 estimate is too high**: the `msr daifclr, #2` sites in `exceptions.rs:186,193` and `threading/mod.rs:1939` are inside naked / `global_asm!` vector code and cannot be abstracted at all |
+| `Pte`/`PageTable` newtype (~−50) | **Still open, and this row was accurate.** `PageTable` exists (`akuma-exec/src/mmu/types.rs:57`) but as `pub entries: [u64; ENTRIES_PER_TABLE]` — a raw `u64` array, with no `Pte` type anywhere under `mmu/`. The struct existing is probably what makes this look done. The item's real target is unchanged: **54 raw `read_volatile`/`write_volatile` remain, all in `crates/akuma-exec/src/mmu/mod.rs`** |
+
+The general lesson, since it is now the third instance in this document: an item
+finished under a *different* phase does not update its own row. Phase 4's DAIF
+rung closed half of the sysreg item and said so only in Phase 4's section; the
+`Mmio<T>` work closed a row that still carried a warning against doing it. When
+closing an item, grep this file for every row that names it.
 
 ### Deferred, inherited from BKL Phase 7: the **7g atomics audit**
 

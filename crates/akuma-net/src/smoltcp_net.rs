@@ -1739,7 +1739,53 @@ pub fn udp_socket_recv(handle: SocketHandle, buf: &mut [u8]) -> Result<(usize, s
     }).unwrap_or(Err(()))
 }
 
+/// Register `waker` on the **smoltcp socket itself**, so a state change wakes
+/// it from inside `process_tcp` rather than from `wake_all`'s list walk after
+/// `poll()` has released `NETWORK`.
+///
+/// # Why this exists
+///
+/// `net-waker-park`'s measurement (root `Cargo.toml`) found the targeted park
+/// *slower* than the promiscuous halt, and named the reason: `wake_all` drains,
+/// so a waiter's registration survives exactly one wake and anything arriving
+/// during its 64-poll drain lands on the 3 ms backstop. smoltcp's own
+/// registration is one-shot too — `WakerRegistration::wake` also `take()`s —
+/// but it fires at the state transition (`tcp.rs:848`, `:1327`, `:2072`), so the
+/// window it can be lost in is a few instructions rather than a whole lap.
+///
+/// # Lock discipline
+///
+/// This runs under `NETWORK` via [`with_network`], and the waker it stores is
+/// later fired from *inside* `iface.poll()` — i.e. with `NETWORK` held and IRQs
+/// masked. That is only safe because `ThreadWaker::wake`
+/// (`akuma-exec/src/threading/mod.rs:3569`) is lock-free: a generation gate, a
+/// sticky store, a `WAITING`→`READY` CAS, then an SGI. It touches neither
+/// `SOCKET_TABLE` nor the console, so it cannot recreate the AB-BA that
+/// [`poll`] defers `wake_all` past `drop(guard)` to avoid. **Do not register a
+/// waker here whose `wake` takes any lock.**
+///
+/// Both halves are registered: a waiter may be blocked on either direction and
+/// the caller's `condition` closure is opaque to us.
+///
+/// Returns `false` when the stack is not up, so nothing was registered. The
+/// caller still parks — its backstop is exactly the fallback for a wake that
+/// cannot arrive — but it is not a silent no-op.
 #[must_use]
+pub fn register_socket_waker(handle: SocketHandle, is_udp: bool, waker: &core::task::Waker) -> bool {
+    with_network(|net| {
+        if is_udp {
+            let s = net.sockets.get_mut::<udp::Socket>(handle);
+            s.register_recv_waker(waker);
+            s.register_send_waker(waker);
+        } else {
+            let s = net.sockets.get_mut::<tcp::Socket>(handle);
+            s.register_recv_waker(waker);
+            s.register_send_waker(waker);
+        }
+    })
+    .is_some()
+}
+
 pub fn udp_can_recv(handle: SocketHandle) -> bool {
     with_network(|net| {
         net.sockets.get::<udp::Socket>(handle).can_recv()

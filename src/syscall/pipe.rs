@@ -132,6 +132,20 @@ pub fn pipe_add_poller(id: u32, tid: usize) {
     });
 }
 
+/// How many threads are registered as pollers on this pipe.
+///
+/// The pipe counterpart to `akuma_net::socket::KernelSocket::waker_count`, and
+/// it exists for the same reason: evidence that a waiter actually announced
+/// itself, rather than silently riding the `BLOCKING_POLL_INTERVAL_US` tick.
+/// `sys_pselect6` passed `None` for its waker for as long as nobody could see
+/// this number — see `run_pselect6_registers_waker_test`.
+#[cfg(kernel_tests)]
+pub fn pipe_poller_count(id: u32) -> usize {
+    crate::irq::with_irqs_disabled(|| {
+        PIPES.lock().get(&id).map_or(0, |p| p.pollers.len())
+    })
+}
+
 /// Write data to a pipe. Returns Ok(n) for the number of bytes accepted, or Err(EPIPE)
 /// if the pipe has been destroyed (no readers left or pipe removed). On Linux, writing
 /// to a broken pipe delivers SIGPIPE and returns EPIPE; callers must replicate this.

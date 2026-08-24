@@ -8,6 +8,7 @@ default-members = [
     "crates/akuma-isolation",
     "crates/akuma-kacho",
     "crates/akuma-net",
+    "crates/akuma-net-yarn",
     "crates/akuma-pmm",
     "crates/akuma-primitives",
     "crates/akuma-rump",
@@ -425,6 +426,28 @@ net-noalloc = ["akuma-net/net-noalloc"]
 #
 # Measurements: docs/archive/AKUMA_NET_ISSUES.md §8.
 net-waker-park = ["akuma-net/net-waker-park"]
+# Park blocking socket waiters with a waker registered on the SMOLTCP socket
+# (`rx_waker`/`tx_waker`) rather than on the kernel socket's drained list.
+#
+# This is `net-waker-park`'s idea with the loss window closed. That feature is
+# off because it measured worse, and the note above says exactly why: `wake_all`
+# DRAINS, so a targeted waiter's registration survives one wake and anything
+# arriving during its 64-poll drain lands on the 3 ms backstop. smoltcp's own
+# registration fires from inside `process_tcp` at the state transition
+# (`tcp.rs:848`, `:1327`, `:2072`) — still one-shot, but the window shrinks from
+# a whole lap to a few instructions.
+#
+# Safe to fire from inside `iface.poll()` (NETWORK held, IRQs masked) ONLY
+# because `ThreadWaker::wake` is lock-free — a generation gate, a sticky store,
+# a CAS, an SGI. It touches neither SOCKET_TABLE nor the console, so it cannot
+# recreate the AB-BA that `poll()` defers `wake_all` past `drop(guard)` to
+# avoid. See `smoltcp_net::register_socket_waker`.
+#
+# Supersedes `net-waker-park` when both are on. It does NOT remove `wake_all`'s
+# 128-slot walk — that is a separate change; this tests the wake-LATENCY
+# hypothesis (REDIS_ROUND_TRIP_STAGE_TRACE.md §4's 688 us at c=1), not the walk
+# cost. UNMEASURED as of 2026-08-24; policy lives in `akuma-net-yarn`.
+net-direct-waker = ["akuma-net/net-direct-waker"]
 
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device

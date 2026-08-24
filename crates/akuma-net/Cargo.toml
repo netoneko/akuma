@@ -38,6 +38,10 @@ net-noalloc = []
 # instead of `blocking_relax`. OFF — it MEASURED WORSE. See the kernel feature
 # of the same name in the root Cargo.toml for the numbers and why.
 net-waker-park = []
+# Register the waiter's waker on the SMOLTCP socket instead of the kernel
+# socket's drained list, so a state change wakes it from inside process_tcp.
+# Supersedes net-waker-park when both are on. See akuma-net-yarn's ParkKind.
+net-direct-waker = []
 # Raise the per-listener backlog (socket.rs `MAX_BACKLOG`) and, on the
 # size-constrained profiles, the total socket budget (smoltcp_net.rs
 # `MAX_SOCKETS`), so a server can absorb more simultaneous *arrivals* than the
@@ -86,6 +90,10 @@ akuma-rump = { path = "../akuma-rump", optional = true }
 # dependency on the whole execution crate — and now lives in the dependency-free
 # leaf, so the sharing is free.
 akuma-primitives = { path = "../akuma-primitives" }
+# The `wait_until` readiness state machine, extracted so its five
+# incident-driven rules have host tests instead of only a devbox boot.
+# See crates/akuma-net-yarn/src/lib.rs.
+akuma-net-yarn = { path = "../akuma-net-yarn" }
 # The shared `Hal` impl and MMIO probe. Both used to be duplicated here — see
 # akuma-virtio's hal.rs for why this crate no longer carries its own.
 akuma-virtio = { path = "../akuma-virtio" }

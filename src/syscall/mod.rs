@@ -48,6 +48,10 @@ pub use net::run_net_bounce_tests;
 pub use net::run_socket_timeout_tests;
 #[cfg(kernel_tests)]
 pub use poll::run_pselect6_exceptfds_test;
+#[cfg(kernel_tests)]
+pub use poll::run_pselect6_registers_waker_test;
+#[cfg(kernel_tests)]
+pub use poll::run_pselect6_eintr_test;
 /// Boot self-test for `writev`'s short-write rule (see `fs::writev_stops_after`).
 #[cfg(kernel_tests)]
 pub use fs::run_writev_short_write_tests;

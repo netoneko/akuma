@@ -41,6 +41,14 @@ pub fn run_network_tests() {
     #[cfg(kernel_tests)]
     crate::syscall::run_pselect6_exceptfds_test();
 
+    // The other two divergences of the same drifted loop family — see
+    // docs/archive/REDIS_ROUND_TRIP_STAGE_TRACE.md and the tests' own headers.
+    #[cfg(kernel_tests)]
+    crate::syscall::run_pselect6_registers_waker_test();
+
+    #[cfg(kernel_tests)]
+    crate::syscall::run_pselect6_eintr_test();
+
     #[cfg(all(kernel_tests, feature = "smoltcp"))]
     crate::syscall::run_socket_timeout_tests();
 

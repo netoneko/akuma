@@ -15,6 +15,13 @@ use spinning_top::Spinlock;
 
 #[cfg(feature = "smoltcp")]
 use crate::smoltcp_net::{self, SocketHandle, with_network};
+
+/// The extracted readiness state machine. Every rule this loop enforces lives
+/// there and has host tests; this module supplies only the effects.
+#[cfg(feature = "smoltcp")]
+use akuma_net_yarn::{
+    Observation, ParkKind, RelapReason, WaitError, WaitMachine, WaitPolicy, WaitStep,
+};
 #[cfg(feature = "smoltcp")]
 use crate::runtime::runtime;
 // Only `with_table` uses this, and that is smoltcp-only — without the gate a
@@ -654,15 +661,10 @@ pub fn socket_timeout(idx: usize, is_recv: bool) -> Option<u64> {
 // Socket Operations (Blocking with Yield)
 // ============================================================================
 
-/// Longest a parked socket waiter sleeps before re-checking on its own.
-///
-/// A BACKSTOP for the directed wake, not the mechanism. Deliberately the
-/// scheduler tick and not `poll.rs`'s 10 ms `BLOCKING_POLL_INTERVAL_US`: this
-/// path used to land on the tick via `blocking_relax`, so anchoring here means
-/// a wake that never arrives is no worse than the old behaviour, while a wake
-/// that does arrive is immediate.
-#[cfg(all(feature = "smoltcp", feature = "net-waker-park"))]
-const WAIT_PARK_BACKSTOP_US: u64 = 3_000;
+// The backstop sleep, the 64-poll drain budget and the 4-lap fruitless escape
+// all moved to `akuma_net_yarn` (`DEFAULT_BACKSTOP_US`, `DEFAULT_DRAIN_BUDGET`,
+// `DEFAULT_FRUITLESS_LIMIT`), where each one has host tests naming the incident
+// that produced it.
 
 /// Block until `condition` holds, driving the network stack while we wait.
 ///
@@ -685,10 +687,7 @@ fn wait_until<F>(idx: usize, mut condition: F, timeout_us: Option<u64>) -> Resul
 where F: FnMut() -> bool
 {
     let start = (runtime().uptime_us)();
-
-    // Consecutive rounds where poll() reported progress but `condition` stayed
-    // false. See the relax logic below.
-    let mut fruitless_progress_rounds: u32 = 0;
+    let mut machine = WaitMachine::new(start, timeout_us, active_wait_policy());
 
     loop {
         // Wake epoch, read BEFORE we poll. `POLL_COUNT` is bumped by
@@ -701,78 +700,69 @@ where F: FnMut() -> bool
         // any wake landing during the poll x64 below was simply lost. A counter
         // cannot be lost — if it moved, we notice, whenever we get around to
         // looking.
-        let epoch = smoltcp_net::poll_count();
+        let budget = machine.lap_start(smoltcp_net::poll_count() as u64);
 
         // Drain all pending network work (not just one poll)
-        let mut any_progress = false;
-        for _ in 0..64 {
+        let mut progress = false;
+        for _ in 0..budget {
             if !smoltcp_net::poll() {
                 break;
             }
-            any_progress = true;
+            progress = true;
         }
 
-        if condition() {
-            return Ok(());
-        }
+        // `condition` first, and `is_current_interrupted` only if it does not
+        // hold. The short-circuit is deliberate: a wait that is already
+        // satisfied must never report EINTR for work it actually completed,
+        // and this keeps the syscall off the interrupt check on the fast path.
+        let condition_met = condition();
+        let obs = Observation {
+            now_us: (runtime().uptime_us)(),
+            poll_epoch: smoltcp_net::poll_count() as u64,
+            progress,
+            condition_met,
+            interrupted: !condition_met && (runtime().is_current_interrupted)(),
+        };
 
-        if (runtime().is_current_interrupted)() {
-            return Err(libc_errno::EINTR);
-        }
-
-        if let Some(timeout) = timeout_us
-            && (runtime().uptime_us)() - start > timeout {
-                return Err(libc_errno::ETIMEDOUT);
-            }
-
-        if !any_progress {
-            fruitless_progress_rounds = 0;
-            // Someone ELSE advanced the stack while we were polling and checking.
-            // Our own `any_progress` is false because our polls found nothing,
-            // but the state we just judged `condition` against is already stale.
-            // Re-check rather than parking on it: parking here is precisely how a
-            // wake gets missed and the wait lands on the 3 ms tick instead.
-            if smoltcp_net::poll_count() != epoch {
+        match machine.lap_end(&obs) {
+            WaitStep::Ready => return Ok(()),
+            WaitStep::Failed(WaitError::Interrupted) => return Err(libc_errno::EINTR),
+            WaitStep::Failed(WaitError::TimedOut) => return Err(libc_errno::ETIMEDOUT),
+            WaitStep::Relap(RelapReason::EpochMoved) => {
                 crate::nicstat::record_epoch_save();
-                continue;
             }
-            let relax_t = crate::nicstat::start();
-            // Tell the NIC interrupt this core has someone waiting on it, so it
-            // can target its wake instead of broadcasting to every core.
-            // Park properly instead of the old `blocking_relax()` (yield + WFI).
-            // That left this thread READY, so nothing could target it: `wake_all`
-            // walked an empty list and the only thing that ended the halt was an
-            // unrelated interrupt — measured as httpd's `accept` phase costing
-            // 80-88 % of a request (docs/archive/AKUMA_NET_ISSUES.md §8).
-            //
-            // Register first, re-check, then park — see this function's header
-            // for why that order is the correctness argument.
-            //
-            // Parking still drops the BKL (`schedule_blocking` switches away), so
-            // a peer core can drive the RX that satisfies `condition` — the
-            // property the old `blocking_relax` was chosen for is preserved.
-            wait_park(idx, &mut condition, start, timeout_us);
-            crate::nicstat::record_relax(relax_t);
-        } else {
-            // poll() made progress but not the progress WE need. Under sustained
-            // unrelated traffic (a torrent's dozens of peers, DHT chatter) poll()
-            // reports progress on nearly every call, so the `!any_progress` branch
-            // never runs — and under shared-kernel SMP this loop then busy-spins
-            // HOLDING the Big Kernel Lock for the entire wait (an accept with no
-            // timeout: forever), starving every peer core. Reproduced 2026-07-24:
-            // baseline SMP=4 hard-wedged ([BKL] stuck, owner frozen) the moment
-            // aria2c's swarm traffic started. Bound the hold: after a few fruitless
-            // progress rounds, relax anyway. `blocking_relax` wakes on the next IRQ
-            // (RX under active traffic, else the 10ms tick), so the added latency on
-            // a soon-to-be-ready socket is small, and the fast path — condition met
-            // within the first rounds — is unchanged.
-            fruitless_progress_rounds = fruitless_progress_rounds.wrapping_add(1);
-            if fruitless_progress_rounds >= 4 {
+            // poll() made progress but not the progress WE need, and the
+            // fruitless budget is not spent. Spin: the condition is usually
+            // about to hold.
+            WaitStep::Relap(RelapReason::FruitlessProgress) => {}
+            WaitStep::Park { kind, deadline_us } => {
                 let relax_t = crate::nicstat::start();
-                wait_park(idx, &mut condition, start, timeout_us);
+                wait_park(idx, &mut condition, kind, deadline_us);
                 crate::nicstat::record_relax(relax_t);
             }
         }
+    }
+}
+
+/// Which park policy this build selects.
+///
+/// The three arms are mutually exclusive and ordered by specificity, so a build
+/// that somehow enables both features gets the newer one rather than a compile
+/// error in a cfg thicket. [`ParkKind::LightSleep`] is deliberately
+/// unreachable: it has no kernel implementation (see [`wait_park`]).
+#[cfg(feature = "smoltcp")]
+const fn active_wait_policy() -> WaitPolicy {
+    #[cfg(feature = "net-direct-waker")]
+    {
+        WaitPolicy::direct_waker()
+    }
+    #[cfg(all(not(feature = "net-direct-waker"), feature = "net-waker-park"))]
+    {
+        WaitPolicy::targeted()
+    }
+    #[cfg(all(not(feature = "net-direct-waker"), not(feature = "net-waker-park")))]
+    {
+        WaitPolicy::promiscuous()
     }
 }
 
@@ -781,49 +771,81 @@ where F: FnMut() -> bool
 /// Returns nothing: the caller loops and re-evaluates `condition` immediately,
 /// so the re-check here exists only to close the lost-wake window, not to report
 /// a result.
+/// The three park mechanisms, one arm each. `deadline_us` is absolute and has
+/// already been clamped to the caller's own timeout by [`WaitMachine`].
 #[cfg(feature = "smoltcp")]
-fn wait_park<F>(idx: usize, condition: &mut F, start: u64, timeout_us: Option<u64>)
+fn wait_park<F>(idx: usize, condition: &mut F, kind: ParkKind, deadline_us: u64)
 where F: FnMut() -> bool
 {
-    #[cfg(feature = "net-waker-park")]
-    {
-        // 1. Announce ourselves BEFORE the final check.
-        socket_add_waker(idx, (runtime().current_waker)());
-
-        // 2. Re-check. A state change that landed during the poll loop above is
-        //    caught here; anything later is caught by the waker we just
-        //    registered.
-        if (*condition)() {
-            return;
+    match kind {
+        ParkKind::Promiscuous => {
+            // Yield, then halt until ANY interrupt. Imprecise — nothing can
+            // target this thread, because it never enters WAITING — but under
+            // load the NIC raises ~6,300 interrupts per 5 s window, so the wake
+            // is plentiful. It measured FASTER than the targeted park; see the
+            // `net-waker-park` feature notes in the root Cargo.toml.
+            //
+            // Under shared-kernel SMP this DROPS the Big Kernel Lock across the
+            // wait (a plain `yield_now` would spin holding it, freezing every
+            // peer core — the meow->LLM `connect`+recv wedge), so a peer's
+            // async-main poller can drive the RX that satisfies `condition`.
+            (runtime().blocking_relax)();
         }
 
-        // 3. Park. The deadline is the backstop; the waker is the mechanism.
-        let now = (runtime().uptime_us)();
-        let backstop = now.saturating_add(WAIT_PARK_BACKSTOP_US);
-        let deadline = match timeout_us {
-            // Never sleep past the caller's own timeout, or a `SO_RCVTIMEO`
-            // would fire a whole backstop late.
-            Some(t) => backstop.min(start.saturating_add(t)),
-            None => backstop,
-        };
-        (runtime().park_until)(deadline);
+        // Register, re-check, park. The ordering is the correctness argument,
+        // not an optimisation — see this module's `wait_until` header. Both
+        // targeted kinds share it and differ only in WHERE the waker is parked.
+        ParkKind::Targeted | ParkKind::DirectWaker => {
+            // 1. Announce ourselves BEFORE the final check.
+            if matches!(kind, ParkKind::DirectWaker) {
+                // On the smoltcp socket itself, so the wake fires at the state
+                // transition instead of from a list `poll()` walks after it has
+                // released NETWORK.
+                // A listener has a pool of handles rather than one, so there is
+                // nothing to hang a waker on; that waiter rides the backstop.
+                if let Some((handle, is_udp)) = smoltcp_handle_for(idx) {
+                    let _registered = smoltcp_net::register_socket_waker(
+                        handle,
+                        is_udp,
+                        &(runtime().current_waker)(),
+                    );
+                }
+            } else {
+                socket_add_waker(idx, (runtime().current_waker)());
+            }
+
+            // 2. Re-check. A state change that landed during the poll loop is
+            //    caught here; anything later is caught by the waker we just
+            //    registered.
+            if (*condition)() {
+                return;
+            }
+
+            // 3. Park. The deadline is the backstop; the waker is the mechanism.
+            (runtime().park_until)(deadline_us);
+        }
+
+        // No kernel implementation — it needs a scheduler "light sleep" state
+        // (targetable AND ended by any interrupt). `active_wait_policy` never
+        // selects it; degrade to the shipping default rather than hanging on a
+        // park nothing can end.
+        ParkKind::LightSleep => (runtime().blocking_relax)(),
     }
-    #[cfg(not(feature = "net-waker-park"))]
-    {
-        let _ = (idx, start, timeout_us);
-        let _ = &mut *condition;
-        // Yield, then halt until ANY interrupt. Imprecise — nothing can target
-        // this thread, because it never enters WAITING — but under load the NIC
-        // raises ~6,300 interrupts per 5 s window, so the wake is plentiful. It
-        // measured FASTER than the targeted park; see the `net-waker-park`
-        // feature notes in the root Cargo.toml.
-        //
-        // Under shared-kernel SMP this DROPS the Big Kernel Lock across the wait
-        // (a plain `yield_now` would spin holding it, freezing every peer core —
-        // the meow->LLM `connect`+recv wedge), so a peer's async-main poller can
-        // drive the RX that satisfies `condition`.
-        (runtime().blocking_relax)();
-    }
+}
+
+/// The smoltcp handle behind socket-table slot `idx`, and whether it is UDP.
+///
+/// `None` for a listener (a pool of handles, not one) and for AF_UNIX, neither
+/// of which has a single smoltcp socket to hang a waker on. Callers fall back
+/// to the backstop in that case, which is why this returns an `Option` rather
+/// than panicking.
+#[cfg(feature = "smoltcp")]
+fn smoltcp_handle_for(idx: usize) -> Option<(SocketHandle, bool)> {
+    with_table(|table| match table.get(idx)?.as_ref()?.inner {
+        SocketType::Stream(h) => Some((h, false)),
+        SocketType::Datagram { handle, .. } => Some((handle, true)),
+        SocketType::Listener { .. } => None,
+    })
 }
 
 /// The port a `bind` records: the requested one, or a freshly allocated

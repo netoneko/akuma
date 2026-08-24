@@ -8,9 +8,14 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{exec,ext2,isolation,kacho,net,pmm,primitives,rump,terminal,timer,vfs,virtio}`.
+  `akuma-{exec,ext2,isolation,kacho,net,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`.
   `akuma-kacho` is the shared observe/decide/hysteresis layer every self-tuning
   policy uses (timer-tick demotion, file-page cache cap, netpoll wake rate).
+  `akuma-net-yarn` is the socket readiness wait loop (`wait_until`) as a pure
+  state machine — the kernel supplies only the effects, so the drain budget,
+  the fruitless-progress escape, the epoch guard and the park policy all have
+  host tests instead of a devbox boot. It also carries a differential test
+  against the pre-extraction loop; keep that oracle in the shipped loop's shape.
   `akuma-scheduler` is host-only and **not** in `default-members`: it models
   scheduler placement / netpoll wake policies so a candidate can be ranked in a
   second instead of a devbox boot (`docs/archive/AKUMA_SCHEDULING_EXTRACTION.md`).

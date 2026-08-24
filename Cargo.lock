@@ -75,6 +75,7 @@ version = "0.1.0"
 name = "akuma-net"
 version = "0.1.0"
 dependencies = [
+ "akuma-net-yarn",
  "akuma-primitives",
  "akuma-rump",
  "akuma-virtio",
@@ -84,6 +85,10 @@ dependencies = [
  "spinning_top",
  "virtio-drivers",
 ]
+
+[[package]]
+name = "akuma-net-yarn"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-pmm"

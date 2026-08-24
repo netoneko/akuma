@@ -1011,6 +1011,20 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
 
     let start_time = crate::timer::uptime_us();
 
+    // Register the calling thread as a waker on each polled fd, exactly as
+    // `sys_epoll_pwait` and `sys_ppoll` do, so a peer write wakes us
+    // IMMEDIATELY (sticky WOKEN_STATES -> schedule_blocking returns at once)
+    // instead of only at the next `BLOCKING_POLL_INTERVAL_US` re-poll.
+    //
+    // This was passing `None` — alone among the three wait loops — which capped
+    // every `select(2)` wait at the 10 ms tick no matter how fast the peer
+    // answered. It is the same drift that left the EINTR check below missing:
+    // three copies of one loop, and a fix applied to the copies someone
+    // remembered. The victim is named in this function's doc comment above:
+    // cargo's vendored libcurl compiles the `select()` branch, so every cargo
+    // network wait rode the tick while `poll(2)` callers were woken at once.
+    let waker = akuma_exec::threading::current_thread_waker();
+
     // Rump sockets have no push readiness yet (MSG_PEEK probe only), so a
     // shorter per-iteration sleep ceiling keeps their poll cadence tight.
     let has_rump_fd = fd_set_wants_rump_poll_interval(&orig_read, &orig_write, nfds);
@@ -1049,7 +1063,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
             if in_read { requested |= EPOLLIN; }
             if in_write { requested |= EPOLLOUT; }
 
-            let revents = epoll_check_fd_readiness(fd as u32, requested, None);
+            let revents = epoll_check_fd_readiness(fd as u32, requested, Some(&waker));
             if in_read && (revents & EPOLLIN != 0) { out_read[word] |= mask; ready_count += 1; }
             if in_write && (revents & EPOLLOUT != 0) { out_write[word] |= mask; ready_count += 1; }
         }
@@ -1088,6 +1102,22 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
                 return EFAULT;
             }
             return 0;
+        }
+
+        // Without this, a pending signal (e.g. SIGALRM from setitimer/alarm())
+        // just wakes schedule_blocking below, finds nothing ready, and goes
+        // right back to sleep — the signal is never delivered because nothing
+        // ever returns to the syscall-return path that dispatches it, so
+        // `alarm()` + `select()` hangs instead of interrupting.
+        //
+        // `sys_epoll_pwait` and `sys_ppoll` both make this check; ppoll's
+        // comment records that it was *added* there after exactly this bug.
+        // pselect6 was the third copy and never got the fix.
+        //
+        // Return without writing the fd sets: Linux leaves them unmodified on
+        // EINTR, and that is what ppoll does too.
+        if akuma_exec::process::should_interrupt_blocking_syscall() {
+            return EINTR;
         }
 
         let abs_deadline = if infinite { u64::MAX } else { start_time + timeout_us };
@@ -1186,6 +1216,167 @@ pub fn run_pselect6_exceptfds_test() {
         crate::safe_print!(160,
             "  [FAIL] pselect6_clears_exceptfds ready_ok={} ready_cleared={} timeout_ok={} timeout_cleared={}\n",
             ready_ok, ready_except_cleared, timeout_ok, timeout_except_cleared);
+    }
+}
+
+/// Regression: `pselect6` must register the calling thread as a waker.
+///
+/// It passed `None` to [`epoll_check_fd_readiness`] — alone among the three
+/// wait loops in this file — so a `select(2)` waiter announced itself to
+/// nothing and could only ever be woken by the `BLOCKING_POLL_INTERVAL_US`
+/// 10 ms tick, however fast the peer answered. `sys_epoll_pwait` (`Some(&waker)`)
+/// and `sys_ppoll` (`Some(&waker)`) both did it correctly; this was the third
+/// copy of a loop that had drifted.
+///
+/// The victim is the same one named in `sys_pselect6`'s doc comment: cargo's
+/// vendored libcurl compiles `Curl_poll()`'s `select()` branch, so every cargo
+/// network wait rode the tick.
+///
+/// A zero timeout is enough to prove it — the readiness scan runs before the
+/// timeout check, so one non-blocking call registers if it is going to.
+#[cfg(kernel_tests)]
+pub fn run_pselect6_registers_waker_test() {
+    use akuma_exec::process::{
+        register_process, register_thread_pid, unregister_process, unregister_thread_pid,
+        FileDescriptor,
+    };
+
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 8042u32;
+    register_process(pid, crate::process_tests::make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    let proc = akuma_exec::process::current_process_shared().unwrap();
+    let pipe_id = super::pipe::pipe_create();
+    let wfd = proc.alloc_fd(FileDescriptor::PipeWrite(pipe_id));
+    let rfd = proc.alloc_fd(FileDescriptor::PipeRead(pipe_id));
+
+    let before = super::pipe::pipe_poller_count(pipe_id);
+
+    // An empty pipe is not readable, so this takes the not-ready path — which
+    // is precisely the path that has to have registered a waker before it
+    // decides to sleep.
+    let mut rset = [0u64; 16];
+    rset[(rfd / 64) as usize] |= 1u64 << (rfd % 64);
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let rc = sys_pselect6(
+        (rfd + 1) as usize,
+        &raw mut rset as u64,
+        0,
+        0,
+        &raw mut ts as u64,
+        0,
+    );
+
+    let after = super::pipe::pipe_poller_count(pipe_id);
+
+    proc.remove_fd(wfd);
+    proc.remove_fd(rfd);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    let pass = rc == 0 && before == 0 && after >= 1;
+    if pass {
+        crate::safe_print!(128, "  [PASS] pselect6_registers_waker\n");
+    } else {
+        crate::safe_print!(
+            160,
+            "  [FAIL] pselect6_registers_waker rc={} pollers {} -> {} (want 0 -> >=1)\n",
+            rc,
+            before,
+            after
+        );
+    }
+}
+
+/// Regression: `pselect6` must return `EINTR` when a signal is pending.
+///
+/// `sys_epoll_pwait` and `sys_ppoll` both call
+/// `should_interrupt_blocking_syscall()` before parking; pselect6 did not. The
+/// comment on ppoll's check records that it was *added* there after exactly
+/// this bug — "alarm()+pause() hang instead of interrupting" — and pselect6,
+/// the third copy, never got the fix. So `alarm()` + `select()` slept through
+/// its own signal: `schedule_blocking` woke, found nothing ready, and went
+/// straight back to sleep, because nothing ever returned to the syscall-return
+/// path that dispatches signals.
+///
+/// The timeout is short so that a regression is a slow test rather than a hang.
+#[cfg(kernel_tests)]
+pub fn run_pselect6_eintr_test() {
+    use alloc::sync::Arc;
+    use akuma_exec::process::{
+        register_process, register_thread_pid, unregister_process, unregister_thread_pid,
+        FileDescriptor,
+    };
+
+    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid = 8043u32;
+    register_process(pid, crate::process_tests::make_test_process(pid));
+    register_thread_pid(tid, pid);
+
+    // `interrupt_thread` sets the flag on the channel registered for `tid`, and
+    // the boot test thread has none — without this it is a silent no-op and the
+    // test can never observe the interrupt. Same setup as
+    // `process_tests::test_sys_kill_sets_interrupted_flag`.
+    let prior = akuma_exec::process::channel::get_channel(tid);
+    if prior.is_none() {
+        akuma_exec::process::channel::register_channel(
+            tid,
+            Arc::new(akuma_exec::process::ProcessChannel::new()),
+        );
+    }
+
+    let proc = akuma_exec::process::current_process_shared().unwrap();
+    let pipe_id = super::pipe::pipe_create();
+    let wfd = proc.alloc_fd(FileDescriptor::PipeWrite(pipe_id));
+    let rfd = proc.alloc_fd(FileDescriptor::PipeRead(pipe_id));
+
+    akuma_exec::process::interrupt_thread(tid);
+
+    // An empty pipe never becomes readable, so without the EINTR check this
+    // sleeps to the 300 ms timeout and returns 0.
+    let mut rset = [0u64; 16];
+    rset[(rfd / 64) as usize] |= 1u64 << (rfd % 64);
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 300_000_000 };
+    let started = crate::timer::uptime_us();
+    let rc = sys_pselect6(
+        (rfd + 1) as usize,
+        &raw mut rset as u64,
+        0,
+        0,
+        &raw mut ts as u64,
+        0,
+    );
+    let elapsed = crate::timer::uptime_us().saturating_sub(started);
+
+    if let Some(ch) = akuma_exec::process::current_channel() {
+        ch.clear_interrupted();
+    }
+    if prior.is_none() {
+        let _ = akuma_exec::process::channel::remove_channel(tid);
+    }
+    proc.remove_fd(wfd);
+    proc.remove_fd(rfd);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    // Both halves matter: the right errno, and returning it promptly rather
+    // than after a full timeout that happened to be reported as an error.
+    let pass = rc == EINTR && elapsed < 200_000;
+    if pass {
+        crate::safe_print!(128, "  [PASS] pselect6_returns_eintr\n");
+    } else {
+        crate::safe_print!(
+            160,
+            "  [FAIL] pselect6_returns_eintr rc={} (want {}) elapsed={}us\n",
+            rc,
+            EINTR,
+            elapsed
+        );
     }
 }
 
