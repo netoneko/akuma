@@ -1996,8 +1996,12 @@ fn net_ifaces() -> [NetIface; 2] {
     let ip_bits = u32::from_be_bytes(info.ip);
     [
         NetIface {
+            // Broadcast is 0.0.0.0, matching real Linux: `lo` isn't
+            // broadcast-capable (no `IFF_BROADCAST` in its flags below), so
+            // `ifconfig` never prints `Bcast:` for it — this value is only
+            // observable through a direct `SIOCGIFBRDADDR`.
             name: b"lo", ip: [127, 0, 0, 1], netmask: [255, 0, 0, 0],
-            broadcast: [127, 255, 255, 255], mac: [0; 6], mtu: 65536, flags: 0x49,
+            broadcast: [0, 0, 0, 0], mac: [0; 6], mtu: 65536, flags: 0x49,
         },
         NetIface {
             name: b"eth0", ip: info.ip, netmask: mask_bits.to_be_bytes(),

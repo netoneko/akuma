@@ -1002,17 +1002,211 @@ fn run_churn(addrs: &[V4], n: u32, opts: &Opts) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// ifconfig — SIOCGIF* / SIOCGIFCONF ioctl checks
+// ---------------------------------------------------------------------------
+//
+// The one direct test of `src/syscall/net.rs`'s `sys_ioctl_siocgifreq` /
+// `sys_ioctl_siocgifconf` (`docs/reference/subsystems/networking.md`
+// "Interface introspection"): everything else that exercised them so far was
+// a manual `ifconfig` run against a live boot, not a repeatable check. It
+// exists because the first implementation had exactly the kind of bug this
+// would have caught immediately: `SIOCGIFCONF`'s per-record stride was 32
+// bytes (name + the 16-byte `sockaddr` a single field needs) instead of the
+// 40 callers actually stride by (`sizeof(struct ifreq)`, sized to the
+// union's largest member) — record 0 read fine, record 1 landed mid-`sockaddr`
+// and busybox's `ifconfig -a` failed with a garbage device name. The
+// `siocgifconf` check below cross-references every `SIOCGIFCONF` record
+// against the same interface's direct `SIOCGIFADDR`/`SIOCGIFFLAGS` query,
+// which is exactly the comparison a stride bug breaks.
+//
+// Hand-rolled `ioctl`/struct layout rather than `libc`'s (which doesn't
+// consistently expose `ifreq`/`ifconf`/`SIOCGIF*` for the musl target this
+// binary is built for) — same reasoning the top of this file gives for
+// spelling out the `poll` bits rather than importing them.
+
+extern "C" {
+    fn ioctl(fd: c_int, request: u64, arg: *mut c_void) -> c_int;
+}
+
+const SIOCGIFCONF: u64 = 0x8912;
+const SIOCGIFFLAGS: u64 = 0x8913;
+const SIOCGIFADDR: u64 = 0x8915;
+const SIOCGIFBRDADDR: u64 = 0x8919;
+const SIOCGIFNETMASK: u64 = 0x891b;
+const SIOCGIFMTU: u64 = 0x8921;
+const SIOCGIFHWADDR: u64 = 0x8927;
+
+const IFF_UP: i16 = 0x1;
+const IFF_BROADCAST: i16 = 0x2;
+const IFF_LOOPBACK: i16 = 0x8;
+
+/// `struct ifreq`: 16-byte name + the union, sized to its largest member
+/// (`struct ifmap`) rather than to any one request's actual payload — the
+/// exact assumption the stride bug above got wrong.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawIfReq {
+    name: [u8; 16],
+    data: [u8; 24],
+}
+
+impl RawIfReq {
+    fn named(name: &str) -> Self {
+        let mut n = [0u8; 16];
+        let b = name.as_bytes();
+        let len = b.len().min(15);
+        n[..len].copy_from_slice(&b[..len]);
+        RawIfReq { name: n, data: [0; 24] }
+    }
+
+    fn name_str(&self) -> String {
+        let len = self.name.iter().position(|&b| b == 0).unwrap_or(16);
+        String::from_utf8_lossy(&self.name[..len]).into_owned()
+    }
+
+    // `data[0..16]` is the `sockaddr`-shaped union member every SIOCGIF*
+    // below except FLAGS/MTU writes: `sin_family(2) sin_port(2) sin_addr(4)
+    // sin_zero(8)` for the address ioctls, `sa_family(2) mac(6) pad(8)` for
+    // SIOCGIFHWADDR.
+    fn flags(&self) -> i16 { i16::from_ne_bytes([self.data[0], self.data[1]]) }
+    fn ipv4(&self) -> [u8; 4] { [self.data[4], self.data[5], self.data[6], self.data[7]] }
+    fn mac(&self) -> [u8; 6] {
+        [self.data[2], self.data[3], self.data[4], self.data[5], self.data[6], self.data[7]]
+    }
+    fn mtu(&self) -> i32 {
+        i32::from_ne_bytes([self.data[0], self.data[1], self.data[2], self.data[3]])
+    }
+}
+
+fn ioctl_ifreq(fd: c_int, request: u64, name: &str) -> Result<RawIfReq, i32> {
+    let mut req = RawIfReq::named(name);
+    let rc = unsafe { ioctl(fd, request, (&raw mut req).cast::<c_void>()) };
+    if rc < 0 { Err(errno()) } else { Ok(req) }
+}
+
+fn run_ifconfig_check() -> i32 {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        println!("[probe] ifconfig: socket() failed: {}", errno_name(errno()));
+        return 1;
+    }
+
+    let mut failures = 0u32;
+    let mut checks = 0u32;
+    let mut check = |desc: &str, ok: bool| {
+        checks += 1;
+        if ok {
+            println!("[probe]   PASS {desc}");
+        } else {
+            println!("[probe]   FAIL {desc}");
+            failures += 1;
+        }
+    };
+
+    for (name, want_loopback) in [("lo", true), ("eth0", false)] {
+        let flags = ioctl_ifreq(fd, SIOCGIFFLAGS, name);
+        check(&format!("{name} SIOCGIFFLAGS succeeds"), flags.is_ok());
+        if let Ok(f) = flags {
+            let f = f.flags();
+            check(&format!("{name} IFF_UP set (flags=0x{f:x})"), f & IFF_UP != 0);
+            check(
+                &format!("{name} IFF_LOOPBACK {}", if want_loopback { "set" } else { "clear" }),
+                (f & IFF_LOOPBACK != 0) == want_loopback,
+            );
+            check(
+                &format!("{name} IFF_BROADCAST {}", if want_loopback { "clear" } else { "set" }),
+                (f & IFF_BROADCAST != 0) != want_loopback,
+            );
+        }
+
+        let addr = ioctl_ifreq(fd, SIOCGIFADDR, name);
+        check(&format!("{name} SIOCGIFADDR succeeds"), addr.is_ok());
+        if let Ok(a) = addr {
+            let ip = a.ipv4();
+            if want_loopback {
+                check(&format!("{name} addr is 127.0.0.1 (got {ip:?})"), ip == [127, 0, 0, 1]);
+            } else {
+                check(&format!("{name} addr is non-zero (got {ip:?})"), ip != [0, 0, 0, 0]);
+            }
+        }
+
+        let mask = ioctl_ifreq(fd, SIOCGIFNETMASK, name);
+        check(&format!("{name} SIOCGIFNETMASK succeeds"), mask.is_ok());
+        if let (true, Ok(m)) = (want_loopback, mask) {
+            check(&format!("{name} netmask is 255.0.0.0 (got {:?})", m.ipv4()), m.ipv4() == [255, 0, 0, 0]);
+        }
+
+        let mtu = ioctl_ifreq(fd, SIOCGIFMTU, name);
+        check(&format!("{name} SIOCGIFMTU succeeds"), mtu.is_ok());
+        if let Ok(m) = mtu {
+            check(&format!("{name} mtu > 0 (got {})", m.mtu()), m.mtu() > 0);
+        }
+
+        let hw = ioctl_ifreq(fd, SIOCGIFHWADDR, name);
+        check(&format!("{name} SIOCGIFHWADDR succeeds"), hw.is_ok());
+        if let (false, Ok(h)) = (want_loopback, hw) {
+            check(&format!("{name} mac is non-zero (got {:02x?})", h.mac()), h.mac() != [0; 6]);
+        }
+
+        if !want_loopback {
+            let bcast = ioctl_ifreq(fd, SIOCGIFBRDADDR, name);
+            check(&format!("{name} SIOCGIFBRDADDR succeeds"), bcast.is_ok());
+        }
+    }
+
+    // Cross-check SIOCGIFCONF's enumeration against the per-name results
+    // above — the comparison a stride bug breaks.
+    #[repr(C)]
+    struct IfConf { len: c_int, _pad: c_int, buf: *mut RawIfReq }
+    let mut buf = [RawIfReq::named(""); 8];
+    let mut conf = IfConf {
+        len: (buf.len() * std::mem::size_of::<RawIfReq>()) as c_int,
+        _pad: 0,
+        buf: buf.as_mut_ptr(),
+    };
+    let rc = unsafe { ioctl(fd, SIOCGIFCONF, (&raw mut conf).cast::<c_void>()) };
+    check("SIOCGIFCONF succeeds", rc >= 0);
+    if rc >= 0 {
+        let rec_size = std::mem::size_of::<RawIfReq>() as c_int;
+        check(
+            &format!("SIOCGIFCONF ifc_len is a multiple of sizeof(ifreq)={rec_size} (got {})", conf.len),
+            conf.len % rec_size == 0,
+        );
+        let count = (conf.len / rec_size).max(0) as usize;
+        let names: Vec<String> = buf[..count.min(buf.len())].iter().map(RawIfReq::name_str).collect();
+        println!("[probe]   SIOCGIFCONF listed: {names:?}");
+        for want in ["lo", "eth0"] {
+            check(&format!("SIOCGIFCONF lists {want}"), names.iter().any(|n| n == want));
+        }
+        for rec in &buf[..count.min(buf.len())] {
+            let name = rec.name_str();
+            if let Ok(direct) = ioctl_ifreq(fd, SIOCGIFADDR, &name) {
+                check(
+                    &format!("SIOCGIFCONF addr for {name} matches direct SIOCGIFADDR"),
+                    rec.ipv4() == direct.ipv4(),
+                );
+            }
+        }
+    }
+
+    unsafe { libc::close(fd) };
+    println!("[probe] SUMMARY ifconfig checks={checks} failures={failures}");
+    if failures == 0 { 0 } else { 1 }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
 fn usage() -> ! {
     eprintln!(
         "usage:
-  nettest-connect resolve <host>
-  nettest-connect one     <host> <port>
-  nettest-connect all     <host> <port>
-  nettest-connect he      <host> <port>
-  nettest-connect churn   <host> <port> <n>
+  nettest-connect resolve  <host>
+  nettest-connect one      <host> <port>
+  nettest-connect all      <host> <port>
+  nettest-connect he       <host> <port>
+  nettest-connect churn    <host> <port> <n>
+  nettest-connect ifconfig          # SIOCGIF*/SIOCGIFCONF checks, no host needed
 
 flags:
   --wait poll0|poll|select|epoll   readiness syscall (default poll0, libcurl's own)
@@ -1027,6 +1221,12 @@ flags:
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    if argv.len() < 2 {
+        usage();
+    }
+    if argv[1] == "ifconfig" {
+        std::process::exit(run_ifconfig_check());
+    }
     if argv.len() < 3 {
         usage();
     }

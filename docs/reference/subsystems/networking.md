@@ -442,6 +442,21 @@ producing a garbage name and `ifconfig: : error fetching interface
 information: Device not found`. Padding the record to the full 40 bytes fixed
 it. `sys_ioctl_siocgifconf` in `src/syscall/net.rs` has the record layout.
 
+**Test coverage: `nettest-connect ifconfig`** (`userspace/nettest/rust/connect`),
+added the same day specifically because the stride bug above was caught by a
+one-off manual `ifconfig` run, not by anything repeatable — every other check
+on this path up to that point was "run `ifconfig`, read the output." It calls
+every `SIOCGIF*` ioctl directly on both interfaces, and cross-references each
+`SIOCGIFCONF` record's address against that interface's own direct
+`SIOCGIFADDR` — the exact comparison a stride bug breaks — rather than trusting
+`ifconfig`'s own parsing to surface a mismatch. Hand-rolled `ioctl`/`ifreq`
+layout (same reasoning as this file's `poll` bits: `libc` doesn't consistently
+expose these for the musl target). Verified 2026-08-24: **29/29** against
+Akuma and, since it is a static `aarch64-unknown-linux-musl` binary, **29/29**
+against real Linux too (`docker run --platform linux/arm64 alpine`) — the A/B
+this file's philosophy asks for. Not yet wired into the boot suite or
+`docs/runbooks/verify-trim-fat-change.md`'s Tier 3 table.
+
 ## Port forwarding (host → guest)
 
 `scripts/cargo_runner.sh` sets up SLIRP `hostfwd` rules:
