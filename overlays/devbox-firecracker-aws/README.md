@@ -36,6 +36,54 @@ the image is `limactl copy`'d in and the disk is built locally with
 | `Dockerfile` | the root filesystem as an OCI image: `FROM scratch`, one `COPY` per top-level tree so `bin/` (163 MB, near-static) becomes its own cached layer |
 | `build-rootfs-image.sh` | the canonical merge, and the only place that decides which `/etc` wins. Emits an OCI image, a `tar.xz`, or a staged directory |
 
+## What the merge stages beyond the file trees
+
+`bootstrap/` is a set of file trees; a *bootable, usable* image needs four things
+that are not in any of them. Each is ported from the step of
+`overlays/devbox/bootstrap.sh` that does the same job for the QEMU disk — that
+script is the reference, and divergence between the two is a bug.
+
+| Step | What | Devbox equivalent | Skip with |
+|---|---|---|---|
+| 1b | **busybox applet symlinks** | step 4 | — |
+| 1c | apk database, **real `git`**, C toolchain (`clang lld gcc binutils make musl-dev`) | steps 5-7 | `DEVBOX_APK_PACKAGES=false` |
+| 1d | **nightly Rust** into `/usr/local` | step 7b | `DEVBOX_NIGHTLY_RUST=false` |
+| 1e | cargo network policy | step 7c | — |
+
+`DEVBOX_RUST_TOOLCHAIN=false` drops the C toolchain; `DEVBOX_STABLE_RUST=true`
+adds apk's `rust`/`cargo` alongside nightly.
+
+**The applet links are the load-bearing one.** `bootstrap/bin` ships the busybox
+*binary* and no applet links at all — on a normal system `ls`, `ps` and `cat` are
+each a symlink to it, and the devbox creates those inside the mounted ext2 image
+rather than in `bootstrap/bin`. An image built without that step boots, accepts
+ssh, and answers **every** command with "not found", which reads as an empty
+disk rather than as missing symlinks.
+
+The list comes from `busybox --list` (305 applets), never from a hand-written
+one: the static fallback inherited from `bootstrap.sh` omits `ls`. The binary is
+aarch64, so on a foreign-arch workstation the builder runs it under docker to
+read the list, and only falls back — loudly — if that is unavailable.
+
+Existing non-symlink binaries are never clobbered, so `vi`, `top`, `git`, `tcc`,
+`meow` and `curl` keep the real thing.
+
+## Two gaps this image still has
+
+**No wall clock.** Firecracker exposes no RTC on aarch64 and the kernel has no
+`clock_settime`, so the guest boots at epoch 0 and every TLS certificate reads as
+`certificate is not yet valid`. In-guest `git clone` over HTTPS and `cargo fetch`
+are therefore impossible regardless of connectivity —
+[`../../docs/archive/MISSING_NTP_SYSCALLS.md`](../../docs/archive/MISSING_NTP_SYSCALLS.md).
+Work around it by vendoring (`cargo vendor` on the host, staged into the image
+with a `[source.crates-io]` replacement) — that path is verified: a full kernel
+build runs offline in the guest.
+
+**One herd service only.** Enabling a second service alongside `sshd` starves
+sshd — it binds its port and never sends a banner —
+[`../../docs/archive/HTTPD_STARVATION.md`](../../docs/archive/HTTPD_STARVATION.md).
+This is why `httpd.conf` ships in `/etc/herd/available/`, not `enabled/`.
+
 ## Usage
 
 ```bash

@@ -146,9 +146,15 @@ is already bound):
   listeners) all ran and answered; no freeze. Single-core is the common factor
   with this doc's Firecracker host (1 vCPU).
 
-Full conditions, freeze sites, and what is already ruled out (nginx itself,
-port conflict, the 2026-06 HVF `isv` fix regressing) are in
-[`SECOND_LISTENER_SMP1_FREEZE.md`](SECOND_LISTENER_SMP1_FREEZE.md).
+Full conditions, freeze sites, what is ruled out (nginx itself, port conflict,
+the 2026-06 HVF `isv` fix regressing), and the **GDB diagnosis** are in
+[`SECOND_LISTENER_SMP1_FREEZE.md`](SECOND_LISTENER_SMP1_FREEZE.md): the frozen
+thread is a socket waiter parked in `idle_halt` (the yield-less
+`blocking_relax_net`) holding the only core preempt-disabled — ticks deliver,
+the wake-pass runs, but the switch is suppressed and no running thread remains
+to raise a voluntary reschedule. Same trigger, same single-core condition as
+this doc's Firecracker host; whether the milder starvation here is the same
+mechanism is the doc's remaining follow-up.
 
 ## Background
 
