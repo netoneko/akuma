@@ -563,6 +563,10 @@ akuma-terminal = { path = "crates/akuma-terminal" }
 akuma-vfs = { path = "crates/akuma-vfs" }
 akuma-ext2 = { path = "crates/akuma-ext2" }
 akuma-net = { path = "crates/akuma-net", default-features = false }
+# The readiness wait loop as a pure state machine. Used directly by
+# `src/syscall/poll.rs` (epoll_pwait / pselect6 / ppoll) as well as through
+# akuma-net's `wait_until`, so the kernel depends on it in its own right.
+akuma-net-yarn = { path = "crates/akuma-net-yarn" }
 # virtio Hal + MMIO probe + the block/rng/audio drivers.
 akuma-virtio = { path = "crates/akuma-virtio" }
 akuma-exec = { path = "crates/akuma-exec" }

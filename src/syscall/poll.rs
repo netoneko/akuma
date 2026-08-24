@@ -1,6 +1,12 @@
 use super::*;
 #[cfg(feature = "smoltcp")]
 use akuma_net::socket;
+/// The readiness wait loop, shared with `akuma_net::socket::wait_until`. All
+/// three syscalls here drive the same machine under
+/// [`WaitPolicy::epoll`](akuma_net_yarn::WaitPolicy::epoll); every way this
+/// family differs from the socket family is a field on that policy rather than
+/// a difference between three open-coded loops.
+use akuma_net_yarn::{Observation, WaitError, WaitMachine, WaitPolicy, WaitStep};
 #[cfg(feature = "sc-epoll")]
 use core::sync::atomic::AtomicU64;
 use core::task::Waker;
@@ -151,14 +157,12 @@ fn fd_set_wants_rump_poll_interval(_readfds: &[u64], _writefds: &[u64], _nfds: u
     false
 }
 
-#[cfg(feature = "sc-epoll")]
-pub fn epoll_wait_deadline(timeout: i32, start_time: u64, timeout_us: u64, now: u64) -> u64 {
-    match timeout.cmp(&0) {
-        core::cmp::Ordering::Greater => start_time + timeout_us,
-        core::cmp::Ordering::Equal => 0,
-        core::cmp::Ordering::Less => now + BLOCKING_POLL_INTERVAL_US,
-    }
-}
+// `epoll_wait_deadline` lived here and computed the same thing
+// `akuma_net_yarn::WaitMachine::park_deadline` now computes for all three wait
+// loops. It was deleted 2026-08-24 rather than left beside the machine: a
+// second implementation of the deadline, with its own tests, is how the three
+// loops drifted apart in the first place. Its `timeout == 0` sentinel is gone
+// too — that case is now the policy's inclusive `>=` expiring on lap one.
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -721,8 +725,25 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
     let waker = akuma_exec::threading::current_thread_waker();
 
     let mut iterations = 0u64;
+
+    // The wait policy this syscall has always had, stated instead of
+    // open-coded — shared with `sys_ppoll` and `sys_pselect6`. See
+    // `akuma_net_yarn::WaitPolicy::epoll`. The backstop is refreshed per lap
+    // below, because the interest list can gain or lose a rump fd underneath
+    // us and rump fds want a 1 ms cadence.
+    //
+    // `timeout == 0` maps to `Some(0)`, which the policy's inclusive `>=`
+    // comparison expires on the first lap — that is the non-blocking
+    // `epoll_wait(.., 0)` contract.
+    let mut machine = WaitMachine::new(
+        start_time,
+        if timeout < 0 { None } else { Some(timeout_us) },
+        WaitPolicy::epoll(effective_poll_interval_us(false)),
+    );
+
     loop {
         iterations += 1;
+        let budget = machine.lap_start(0);
 
         // Drive network stack (only once per loop). BKL carve-out (Phase 7b piece 1,
         // docs/archive/BKL_PHASE7_AUDIT.md §3): every piece of state `poll()` touches is
@@ -734,8 +755,13 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
         // nested IRQ from ever observing this core "holding NETWORK, wanting the BKL".
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_open();
-        #[cfg(feature = "smoltcp")]
-        akuma_net::smoltcp_net::poll();
+        let mut progress = false;
+        for _ in 0..budget {
+            #[cfg(feature = "smoltcp")]
+            {
+                progress = akuma_net::smoltcp_net::poll();
+            }
+        }
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_close();
 
@@ -851,102 +877,61 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             }
         }
 
-        if ready_count > 0 {
-            if copy_to_user(
-                events_ptr as u64,
-                &as_user_bytes(&kernel_events)[..ready_count * EPOLL_EVENT_SIZE],
-            )
-            .is_err()
-            {
-                return EFAULT;
-            }
-            log_epoll_pwait_return(
-                epfd,
-                timeout,
-                ready_count,
-                iterations,
-                start_time,
-                0,
-                &kernel_events,
-                "",
-            );
-            return ready_count as u64;
-        }
+        // The per-lap backstop: `epoll_ctl` can change the interest list under
+        // us, and a rump fd in it wants 1 ms rather than 10 ms.
+        machine.set_backstop(effective_poll_interval_us(any_fd_wants_rump_poll_interval(fds)));
 
-        if timeout == 0 {
-            log_epoll_pwait_return(
-                epfd,
-                timeout,
-                0,
-                iterations,
-                start_time,
-                0,
-                &[],
-                "",
-            );
-            return 0;
-        }
+        let ready = ready_count > 0;
+        let obs = Observation {
+            now_us: crate::timer::uptime_us(),
+            poll_epoch: 0, // no epoch guard in this family — see WaitPolicy::epoll
+            progress,
+            condition_met: ready,
+            interrupted: !ready && akuma_exec::process::should_interrupt_blocking_syscall(),
+        };
 
-        if timeout > 0 {
-            let elapsed = crate::timer::uptime_us() - start_time;
-            if elapsed >= timeout_us {
-                log_epoll_pwait_return(
-                    epfd,
-                    timeout,
-                    0,
-                    iterations,
-                    start_time,
-                    0,
-                    &[],
-                    "timeout_expired",
-                );
-                return 0;
-            }
-        }
-
-        // Periodic log for long waits (every ~5 seconds = 500 iterations × 10ms)
+        // Periodic log for long waits (every ~5 seconds = 500 iterations x 10ms)
         if crate::config::SYSCALL_DEBUG_NET_ENABLED && iterations.is_multiple_of(500) {
             let elapsed = crate::timer::uptime_us() - start_time;
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-            crate::tprint!(192, "[epoll] pwait still waiting: pid={} epfd={} {}us elapsed\n", 
+            crate::tprint!(192, "[epoll] pwait still waiting: pid={} epfd={} {}us elapsed\n",
                 pid, epfd, elapsed);
         }
 
-        if akuma_exec::process::should_interrupt_blocking_syscall() {
-            log_epoll_pwait_return(
-                epfd,
-                timeout,
-                0,
-                iterations,
-                start_time,
-                0,
-                &[],
-                "EINTR",
-            );
-            return EINTR;
+        match machine.lap_end(&obs) {
+            WaitStep::Ready => {
+                if copy_to_user(
+                    events_ptr as u64,
+                    &as_user_bytes(&kernel_events)[..ready_count * EPOLL_EVENT_SIZE],
+                )
+                .is_err()
+                {
+                    return EFAULT;
+                }
+                log_epoll_pwait_return(
+                    epfd, timeout, ready_count, iterations, start_time, 0, &kernel_events, "",
+                );
+                return ready_count as u64;
+            }
+            WaitStep::Failed(WaitError::TimedOut) => {
+                // Two tags, as before: a `timeout == 0` probe is a different
+                // event from a real wait that ran out.
+                let tag = if timeout == 0 { "" } else { "timeout_expired" };
+                log_epoll_pwait_return(epfd, timeout, 0, iterations, start_time, 0, &[], tag);
+                return 0;
+            }
+            WaitStep::Failed(WaitError::Interrupted) => {
+                log_epoll_pwait_return(epfd, timeout, 0, iterations, start_time, 0, &[], "EINTR");
+                return EINTR;
+            }
+            WaitStep::Relap(_) => {}
+            WaitStep::Park { deadline_us, .. } => {
+                // With the waker mechanism this blocks efficiently; the backstop
+                // is a cap for resources that do not support wakers (TimerFd),
+                // and network events wake us immediately.
+                akuma_exec::threading::schedule_blocking(deadline_us);
+            }
         }
-
-        // With the waker mechanism, we can now block more efficiently.
-        // We still use a 10ms cap for safety and for resources that don't
-        // yet support wakers (like TimerFd), but network events will
-        // now wake us up IMMEDIATELY.
-        let abs_deadline = epoll_wait_deadline(timeout, start_time, timeout_us, crate::timer::uptime_us());
-        if abs_deadline == 0 {
-            log_epoll_pwait_return(
-                epfd,
-                timeout,
-                0,
-                iterations,
-                start_time,
-                0,
-                &[],
-                "deadline_abs0",
-            );
-            return 0;
-        }
-        let deadline = abs_deadline.min(crate::timer::uptime_us() + effective_poll_interval_us(any_fd_wants_rump_poll_interval(fds)));
-
-        akuma_exec::threading::schedule_blocking(deadline);
     }
 }
 
@@ -1029,13 +1014,29 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
     // shorter per-iteration sleep ceiling keeps their poll cadence tight.
     let has_rump_fd = fd_set_wants_rump_poll_interval(&orig_read, &orig_write, nfds);
 
+    // Same policy as `sys_ppoll` and `sys_epoll_pwait` — see
+    // `akuma_net_yarn::WaitPolicy::epoll`. A zero timeout expiring on the first
+    // lap (the `>=` comparison) is what makes `select(fds, 0)` non-blocking.
+    let mut machine = WaitMachine::new(
+        start_time,
+        if infinite { None } else { Some(timeout_us) },
+        WaitPolicy::epoll(effective_poll_interval_us(has_rump_fd)),
+    );
+
     loop {
+        let budget = machine.lap_start(0);
+
         // BKL carve-out (Phase 7b piece 1) — see the identical comment on the
         // `sys_epoll_pwait` poll() call above.
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_open();
-        #[cfg(feature = "smoltcp")]
-        akuma_net::smoltcp_net::poll();
+        let mut progress = false;
+        for _ in 0..budget {
+            #[cfg(feature = "smoltcp")]
+            {
+                progress = akuma_net::smoltcp_net::poll();
+            }
+        }
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_close();
         let mut ready_count: u64 = 0;
@@ -1068,7 +1069,17 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
             if in_write && (revents & EPOLLOUT != 0) { out_write[word] |= mask; ready_count += 1; }
         }
 
-        if ready_count > 0 {
+        let ready = ready_count > 0;
+        let obs = Observation {
+            now_us: crate::timer::uptime_us(),
+            poll_epoch: 0, // no epoch guard in this family — see WaitPolicy::epoll
+            progress,
+            condition_met: ready,
+            interrupted: !ready && akuma_exec::process::should_interrupt_blocking_syscall(),
+        };
+        let step = machine.lap_end(&obs);
+
+        if matches!(step, WaitStep::Ready) {
             if readfds_ptr != 0
                 && copy_to_user(readfds_ptr, &as_user_bytes(&out_read)[..fd_set_bytes]).is_err()
             {
@@ -1090,7 +1101,10 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
             return ready_count;
         }
 
-        if !infinite && (crate::timer::uptime_us() - start_time) >= timeout_us {
+        if matches!(step, WaitStep::Failed(WaitError::TimedOut)) {
+            // select(2) reports its result by OVERWRITING all three sets, so
+            // "nothing ready" has to be written down, not left alone — see this
+            // function's doc comment and `run_pselect6_exceptfds_test`.
             let cleared = [0u8; MAX_FDS / 8];
             if readfds_ptr != 0 && copy_to_user(readfds_ptr, &cleared[..fd_set_bytes]).is_err() {
                 return EFAULT;
@@ -1116,13 +1130,15 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
         //
         // Return without writing the fd sets: Linux leaves them unmodified on
         // EINTR, and that is what ppoll does too.
-        if akuma_exec::process::should_interrupt_blocking_syscall() {
-            return EINTR;
+        match step {
+            // Linux leaves the fd sets unmodified on EINTR, and so does ppoll.
+            WaitStep::Failed(WaitError::Interrupted) => return EINTR,
+            WaitStep::Park { deadline_us, .. } => {
+                akuma_exec::threading::schedule_blocking(deadline_us);
+            }
+            // Ready and TimedOut are handled above; Relap just re-drains.
+            WaitStep::Ready | WaitStep::Failed(WaitError::TimedOut) | WaitStep::Relap(_) => {}
         }
-
-        let abs_deadline = if infinite { u64::MAX } else { start_time + timeout_us };
-        let deadline = abs_deadline.min(crate::timer::uptime_us() + effective_poll_interval_us(has_rump_fd));
-        akuma_exec::threading::schedule_blocking(deadline);
     }
 }
 
@@ -1427,13 +1443,30 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
     // shorter per-iteration sleep ceiling keeps their poll cadence tight.
     let has_rump_fd = kernel_fds.iter().any(|p| fd_wants_rump_poll_interval(p.fd));
 
+    // The wait policy this syscall has always had, now stated instead of
+    // open-coded: one poll per lap, no fruitless-progress spin, no epoch guard,
+    // `>=` timeout, and a park whose waker was registered during the scan
+    // above. See `akuma_net_yarn::WaitPolicy::epoll`.
+    let mut machine = WaitMachine::new(
+        start_time,
+        if infinite { None } else { Some(timeout_us) },
+        WaitPolicy::epoll(effective_poll_interval_us(has_rump_fd)),
+    );
+
     loop {
+        let budget = machine.lap_start(0);
+
         // BKL carve-out (Phase 7b piece 1) — see the identical comment on the
         // `sys_epoll_pwait` poll() call above.
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_open();
-        #[cfg(feature = "smoltcp")]
-        akuma_net::smoltcp_net::poll();
+        let mut progress = false;
+        for _ in 0..budget {
+            #[cfg(feature = "smoltcp")]
+            {
+                progress = akuma_net::smoltcp_net::poll();
+            }
+        }
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_close();
         let mut ready_count = 0;
@@ -1458,29 +1491,34 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
             }
         }
 
-        if ready_count > 0 {
-            if nfds > 0 && copy_to_user(fds_ptr, as_user_bytes(&kernel_fds)).is_err() {
-                return EFAULT;
+        let ready = ready_count > 0;
+        let obs = Observation {
+            now_us: crate::timer::uptime_us(),
+            poll_epoch: 0, // no epoch guard in this family — see WaitPolicy::epoll
+            progress,
+            condition_met: ready,
+            // Short-circuit, as the open-coded loop did: a poll that is already
+            // satisfied must not report EINTR for work it actually completed.
+            interrupted: !ready && akuma_exec::process::should_interrupt_blocking_syscall(),
+        };
+
+        match machine.lap_end(&obs) {
+            WaitStep::Ready => {
+                if nfds > 0 && copy_to_user(fds_ptr, as_user_bytes(&kernel_fds)).is_err() {
+                    return EFAULT;
+                }
+                return ready_count as u64;
             }
-            return ready_count as u64;
+            // A timeout is a normal return for poll(2): zero fds ready.
+            WaitStep::Failed(WaitError::TimedOut) => return 0,
+            // The signal is delivered by the syscall-return path; without
+            // returning to it the wake is consumed and ppoll sleeps through
+            // its own SIGALRM.
+            WaitStep::Failed(WaitError::Interrupted) => return EINTR,
+            WaitStep::Relap(_) => {}
+            WaitStep::Park { deadline_us, .. } => {
+                akuma_exec::threading::schedule_blocking(deadline_us);
+            }
         }
-
-        if !infinite && (crate::timer::uptime_us() - start_time) >= timeout_us {
-            return 0;
-        }
-
-        // Without this, a pending signal (e.g. SIGALRM from setitimer/alarm())
-        // just wakes schedule_blocking below, finds nothing ready, and goes
-        // right back to sleep — the signal is never delivered because nothing
-        // ever returns to the syscall-return path that dispatches it. This is
-        // the same check sys_epoll_pwait makes above; ppoll was missing it,
-        // which made alarm()+pause() hang instead of interrupting.
-        if akuma_exec::process::should_interrupt_blocking_syscall() {
-            return EINTR;
-        }
-
-        let abs_deadline = if infinite { u64::MAX } else { start_time + timeout_us };
-        let deadline = abs_deadline.min(crate::timer::uptime_us() + effective_poll_interval_us(has_rump_fd));
-        akuma_exec::threading::schedule_blocking(deadline);
     }
 }

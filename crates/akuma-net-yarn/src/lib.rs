@@ -111,6 +111,16 @@ pub enum ParkKind {
     /// `take()`s — but the window it can be lost in is a few instructions
     /// instead of a whole 64-poll drain.
     DirectWaker,
+    /// The waker was already registered during the readiness scan, so the park
+    /// step just sleeps until the deadline.
+    ///
+    /// This is what the `epoll_pwait` / `ppoll` / `pselect6` family does:
+    /// `epoll_check_fd_readiness(fd, requested, Some(&waker))` registers on
+    /// each fd's underlying primitive as it checks it. The register → re-check →
+    /// park ordering still holds — registration simply happens *inside* the
+    /// scan rather than after it — which is why this needs no separate
+    /// registration step and must not be given one.
+    ScanRegistered,
     /// Targetable **and** woken by any NIC interrupt. The hypothesis the root
     /// `Cargo.toml` names as the only thing that can beat
     /// [`Self::Promiscuous`].
@@ -124,12 +134,16 @@ impl ParkKind {
     /// Does this kind require the waiter to announce itself before parking?
     ///
     /// [`Self::Promiscuous`] does not — that is exactly its weakness and its
-    /// strength. Everything else must register **before** the final condition
-    /// re-check, or a wake landing in between is lost and the wait hangs until
-    /// the backstop.
+    /// strength. [`Self::ScanRegistered`] does not either, because its
+    /// registration already happened inside the readiness scan; giving it a
+    /// second one would register twice per lap.
+    ///
+    /// Everything else must register **before** the final condition re-check,
+    /// or a wake landing in between is lost and the wait hangs until the
+    /// backstop.
     #[must_use]
     pub const fn needs_registration(self) -> bool {
-        !matches!(self, Self::Promiscuous)
+        !matches!(self, Self::Promiscuous | Self::ScanRegistered)
     }
 
     /// Is a wake for this kind delivered to the thread specifically, rather
@@ -153,11 +167,36 @@ impl ParkKind {
 /// Tunables. Split out so a model can sweep them without touching the machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaitPolicy {
-    /// Polls per lap. See [`DEFAULT_DRAIN_BUDGET`].
+    /// Polls per lap. See [`DEFAULT_DRAIN_BUDGET`]. The epoll family uses 1 —
+    /// it drives the stack once and then judges.
     pub drain_budget: u32,
     /// Fruitless-progress laps before parking anyway. See
-    /// [`DEFAULT_FRUITLESS_LIMIT`].
+    /// [`DEFAULT_FRUITLESS_LIMIT`]. **0 disables the escape**, so unrelated
+    /// progress never buys a spin — which is what the epoll family does today.
     pub fruitless_limit: u32,
+    /// Re-lap instead of parking when a peer advanced the stack mid-lap.
+    ///
+    /// `wait_until` has this; the epoll family does **not**, which is why they
+    /// are separate fields rather than one shared constant. Turning it on for
+    /// `epoll_pwait` is a behaviour change and belongs in its own A/B — see
+    /// `docs/archive/REDIS_ROUND_TRIP_STAGE_TRACE.md` §4.
+    pub epoch_guard: bool,
+    /// When a signal is pending **and** the timeout has expired in the same
+    /// lap, which wins?
+    ///
+    /// A fifth divergence between the families, found while wiring them onto
+    /// this machine. `wait_until` checks the signal first (`EINTR`); the epoll
+    /// family checks the timeout first (returns 0 rows). Both are defensible —
+    /// this field exists so adopting the machine does not silently pick one.
+    pub interrupt_precedence: bool,
+    /// Does the caller's timeout expire at `>=` rather than `>`?
+    ///
+    /// The two families disagree and always have: `pselect6`/`ppoll` use
+    /// `now - start >= timeout_us`, `wait_until` used `> timeout`. It is not
+    /// cosmetic — with `>=`, a **zero** timeout expires on the first lap, which
+    /// is exactly the non-blocking `select(fds, 0)` / `epoll_wait(.., 0)`
+    /// semantics. With `>`, a zero timeout would park.
+    pub timeout_inclusive: bool,
     /// Backstop sleep. Ignored by [`ParkKind::Promiscuous`], which has no
     /// deadline of its own.
     pub backstop_us: u64,
@@ -166,14 +205,44 @@ pub struct WaitPolicy {
 }
 
 impl WaitPolicy {
-    /// The shipping default: promiscuous halt, 64-poll drain, 4 fruitless laps.
+    /// The shipping default: promiscuous halt, 64-poll drain, 4 fruitless laps,
+    /// epoch guard on, exclusive timeout.
     #[must_use]
     pub const fn promiscuous() -> Self {
         Self {
             drain_budget: DEFAULT_DRAIN_BUDGET,
             fruitless_limit: DEFAULT_FRUITLESS_LIMIT,
+            epoch_guard: true,
+            interrupt_precedence: true,
+            timeout_inclusive: false,
             backstop_us: DEFAULT_BACKSTOP_US,
             park: ParkKind::Promiscuous,
+        }
+    }
+
+    /// What `sys_epoll_pwait` / `sys_ppoll` / `sys_pselect6` do **today**.
+    ///
+    /// Deliberately not the defaults: one poll per lap, no fruitless-progress
+    /// spin, no epoch guard, inclusive timeout, and a park whose waker was
+    /// registered during the readiness scan. `backstop_us` is the caller's
+    /// `effective_poll_interval_us()` — 10 ms normally, 1 ms when a rump fd is
+    /// in the set — so it stays a per-call value rather than a constant.
+    ///
+    /// Every difference from [`Self::promiscuous`] is a real divergence between
+    /// the two families, not an accident of this constructor. They are worth
+    /// experimenting with **one at a time**; this constructor's job is to
+    /// reproduce today's behaviour exactly so the refactor can be shown to
+    /// change nothing.
+    #[must_use]
+    pub const fn epoll(backstop_us: u64) -> Self {
+        Self {
+            drain_budget: 1,
+            fruitless_limit: 0,
+            epoch_guard: false,
+            interrupt_precedence: false,
+            timeout_inclusive: true,
+            backstop_us,
+            park: ParkKind::ScanRegistered,
         }
     }
 
@@ -310,6 +379,18 @@ impl WaitMachine {
         self.policy
     }
 
+    /// Update the backstop between laps.
+    ///
+    /// `sys_epoll_pwait` recomputes `effective_poll_interval_us()` from the
+    /// interest list on **every** lap, because `epoll_ctl` can add or remove a
+    /// rump fd underneath it and rump fds want a 1 ms cadence rather than
+    /// 10 ms. Its two siblings hoist the same computation above their loops.
+    /// Keeping this settable preserves that difference instead of quietly
+    /// picking one.
+    pub const fn set_backstop(&mut self, backstop_us: u64) {
+        self.policy.backstop_us = backstop_us;
+    }
+
     /// Open a lap. `poll_epoch` must be sampled **before** driving the stack —
     /// that ordering is what makes the guard in [`lap_end`](Self::lap_end)
     /// mean anything. Returns the drain budget for this lap.
@@ -329,11 +410,21 @@ impl WaitMachine {
         if obs.condition_met {
             return WaitStep::Ready;
         }
-        if obs.interrupted {
-            return WaitStep::Failed(WaitError::Interrupted);
-        }
-        if self.expired(obs.now_us) {
-            return WaitStep::Failed(WaitError::TimedOut);
+        // Order is a policy, not a detail — see `interrupt_precedence`.
+        if self.policy.interrupt_precedence {
+            if obs.interrupted {
+                return WaitStep::Failed(WaitError::Interrupted);
+            }
+            if self.expired(obs.now_us) {
+                return WaitStep::Failed(WaitError::TimedOut);
+            }
+        } else {
+            if self.expired(obs.now_us) {
+                return WaitStep::Failed(WaitError::TimedOut);
+            }
+            if obs.interrupted {
+                return WaitStep::Failed(WaitError::Interrupted);
+            }
         }
 
         if obs.progress {
@@ -352,7 +443,7 @@ impl WaitMachine {
         // Someone ELSE advanced the stack while this lap was checking. Our own
         // `progress` is false because our polls found nothing, but the state we
         // just judged the condition against is already stale.
-        if obs.poll_epoch != self.lap_epoch {
+        if self.policy.epoch_guard && obs.poll_epoch != self.lap_epoch {
             self.stats.epoch_saves += 1;
             return WaitStep::Relap(RelapReason::EpochMoved);
         }
@@ -367,7 +458,10 @@ impl WaitMachine {
     #[must_use]
     pub const fn expired(&self, now_us: u64) -> bool {
         match self.timeout_us {
-            Some(t) => now_us.saturating_sub(self.start_us) > t,
+            Some(t) => {
+                let elapsed = now_us.saturating_sub(self.start_us);
+                if self.policy.timeout_inclusive { elapsed >= t } else { elapsed > t }
+            }
             None => false,
         }
     }

@@ -466,3 +466,96 @@ fn relap_reasons_match_the_branch_that_produced_them() {
     );
     assert_eq!(m.stats().epoch_saves, 1);
 }
+
+// ===========================================================================
+// The epoll family's policy — what `sys_epoll_pwait` / `ppoll` / `pselect6` do
+// ===========================================================================
+
+const EPOLL_INTERVAL_US: u64 = 10_000;
+
+fn epoll_machine(timeout_us: Option<u64>) -> WaitMachine {
+    WaitMachine::new(1_000, timeout_us, WaitPolicy::epoll(EPOLL_INTERVAL_US))
+}
+
+/// A **zero** timeout must expire on the first lap, not park.
+///
+/// This is `select(fds, 0)` and `epoll_wait(.., 0)` — poll once, report what is
+/// ready, return. It works only because the family compares `>=`; with
+/// `wait_until`'s `>` the same call would sleep to the backstop.
+#[test]
+fn epoll_zero_timeout_never_parks() {
+    let mut m = epoll_machine(Some(0));
+    m.lap_start(7);
+    assert_eq!(
+        m.lap_end(&idle(1_000, 7)),
+        WaitStep::Failed(WaitError::TimedOut)
+    );
+    assert_eq!(m.stats().parks, 0);
+
+    // …and the same machine under the socket family's policy would park, which
+    // is exactly the divergence `timeout_inclusive` encodes.
+    let mut socket_style = WaitMachine::new(1_000, Some(0), WaitPolicy::promiscuous());
+    socket_style.lap_start(7);
+    assert!(matches!(
+        socket_style.lap_end(&idle(1_000, 7)),
+        WaitStep::Park { .. }
+    ));
+}
+
+/// A ready fd still wins over an expired zero timeout — the readiness scan runs
+/// before the timeout check in all three syscalls.
+#[test]
+fn epoll_zero_timeout_still_reports_ready() {
+    let mut m = epoll_machine(Some(0));
+    m.lap_start(7);
+    let obs = Observation { condition_met: true, ..idle(1_000, 7) };
+    assert_eq!(m.lap_end(&obs), WaitStep::Ready);
+}
+
+/// No epoch guard: a peer advancing the stack mid-lap does **not** buy a
+/// re-lap. Today's behaviour, and the thing worth A/B-ing separately.
+#[test]
+fn epoll_has_no_epoch_guard() {
+    let mut m = epoll_machine(None);
+    m.lap_start(7);
+    assert!(matches!(m.lap_end(&idle(1_100, 999)), WaitStep::Park { .. }));
+    assert_eq!(m.stats().epoch_saves, 0);
+}
+
+/// `fruitless_limit: 0` disables the spin — unrelated progress parks at once
+/// rather than buying three laps.
+#[test]
+fn epoll_never_spins_on_unrelated_progress() {
+    let mut m = epoll_machine(None);
+    for lap in 0..3 {
+        m.lap_start(7);
+        let obs = Observation { progress: true, ..idle(1_100 + lap, 7) };
+        assert!(matches!(m.lap_end(&obs), WaitStep::Park { .. }), "lap {lap}");
+    }
+}
+
+/// One poll per lap, and the park needs no separate registration — it already
+/// happened inside the readiness scan.
+#[test]
+fn epoll_policy_shape() {
+    let mut m = epoll_machine(None);
+    assert_eq!(m.lap_start(0), 1);
+    assert!(!ParkKind::ScanRegistered.needs_registration());
+    assert!(ParkKind::ScanRegistered.is_targeted());
+    assert!(!ParkKind::ScanRegistered.woken_by_any_irq());
+}
+
+/// The deadline the family computes today: `min(start + timeout, now + interval)`
+/// for a finite timeout, and `now + interval` for an infinite one.
+#[test]
+fn epoll_deadline_matches_the_shipped_arithmetic() {
+    let m = epoll_machine(None);
+    assert_eq!(m.park_deadline(5_000), 5_000 + EPOLL_INTERVAL_US);
+
+    let m = epoll_machine(Some(1_000_000));
+    assert_eq!(m.park_deadline(5_000), 5_000 + EPOLL_INTERVAL_US);
+
+    // Caller timeout nearer than the backstop.
+    let m = epoll_machine(Some(2_000));
+    assert_eq!(m.park_deadline(1_500), 3_000);
+}

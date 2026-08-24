@@ -1516,18 +1516,12 @@ pub(super) fn sys_dup(oldfd: u32) -> u64 {
         Some(e) => e,
         None => return EBADF,
     };
-    match &entry {
-        akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
-        akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
-        akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
-            super::pipe::pipe_clone_ref(*rx, false);
-            super::pipe::pipe_clone_ref(*tx, true);
-            super::unixsock::unix_sock_clone_ref(*sock);
-        }
-        #[cfg(feature = "smoltcp")]
-        akuma_exec::process::FileDescriptor::Socket(idx) => socket::socket_clone_ref(*idx),
-        _ => {}
-    }
+    // One list, in `akuma_exec::process::clone_fd_refs`. This was a local
+    // four-arm copy that had drifted: `EventFd` and `RumpSocket` are
+    // refcounted but were handled only on the fork path, so a dup of
+    // either produced an unreferenced alias and the first close
+    // destroyed the object under the surviving fd.
+    akuma_exec::process::clone_fd_refs(&entry);
     let newfd = proc.alloc_fd(entry);
     proc.clear_cloexec(newfd);
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -1552,18 +1546,12 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     // Increment refcount for the new entry BEFORE atomically swapping it in.
     // This must happen before swap_fd so the pipe isn't prematurely destroyed
     // if another thread closes oldfd between these two steps.
-    match &entry {
-        akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
-        akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
-        akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
-            super::pipe::pipe_clone_ref(*rx, false);
-            super::pipe::pipe_clone_ref(*tx, true);
-            super::unixsock::unix_sock_clone_ref(*sock);
-        }
-        #[cfg(feature = "smoltcp")]
-        akuma_exec::process::FileDescriptor::Socket(idx) => socket::socket_clone_ref(*idx),
-        _ => {}
-    }
+    // One list, in `akuma_exec::process::clone_fd_refs`. This was a local
+    // four-arm copy that had drifted: `EventFd` and `RumpSocket` are
+    // refcounted but were handled only on the fork path, so a dup of
+    // either produced an unreferenced alias and the first close
+    // destroyed the object under the surviving fd.
+    akuma_exec::process::clone_fd_refs(&entry);
 
     // Atomically replace newfd and retrieve the old entry in one operation.
     // This prevents a TOCTOU race on shared fd tables (CLONE_FILES goroutines).
@@ -2530,19 +2518,13 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let entry = match proc.get_fd(fd) { Some(e) => e, None => return EBADF };
-            // Bump pipe/socket refcounts before inserting the duplicate entry.
-            match &entry {
-                akuma_exec::process::FileDescriptor::PipeWrite(id) => super::pipe::pipe_clone_ref(*id, true),
-                akuma_exec::process::FileDescriptor::PipeRead(id) => super::pipe::pipe_clone_ref(*id, false),
-                akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
-                    super::pipe::pipe_clone_ref(*rx, false);
-                    super::pipe::pipe_clone_ref(*tx, true);
-                    super::unixsock::unix_sock_clone_ref(*sock);
-                }
-                #[cfg(feature = "smoltcp")]
-                akuma_exec::process::FileDescriptor::Socket(idx) => socket::socket_clone_ref(*idx),
-                _ => {}
-            }
+            // Bump refcounts before inserting the duplicate entry. One list, in
+            // `akuma_exec::process::clone_fd_refs`. This was a local four-arm
+            // copy that had drifted: `EventFd` and `RumpSocket` are refcounted
+            // but were handled only on the fork path, so a dup of either
+            // produced an unreferenced alias and the first close destroyed the
+            // object under the surviving fd.
+            akuma_exec::process::clone_fd_refs(&entry);
             let new_fd = proc.alloc_fd_from(arg as u32, entry);
             if cmd == F_DUPFD_CLOEXEC {
                 proc.set_cloexec(new_fd);

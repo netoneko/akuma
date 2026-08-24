@@ -825,6 +825,13 @@ where F: FnMut() -> bool
             (runtime().park_until)(deadline_us);
         }
 
+        // The epoll family's kind: the waker was registered during the
+        // readiness scan, so there is nothing to announce here. `wait_until`
+        // never selects it (its condition closure is opaque — there is no scan
+        // to fold a registration into), so reaching this arm from here is a
+        // policy bug; park on the deadline, which is the safe reading.
+        ParkKind::ScanRegistered => (runtime().park_until)(deadline_us),
+
         // No kernel implementation — it needs a scheduler "light sleep" state
         // (targetable AND ended by any interrupt). `active_wait_policy` never
         // selects it; degrade to the shipping default rather than hanging on a

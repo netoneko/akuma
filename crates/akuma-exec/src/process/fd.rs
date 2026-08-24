@@ -14,6 +14,66 @@ pub struct SharedFdTable {
     pub nonblock: Spinlock<BTreeSet<u32>>,
 }
 
+/// Take a second reference to whatever `entry` refers to.
+///
+/// **Call this from every site that copies a `FileDescriptor` into another
+/// slot** — `fork`, `dup`, `dup3`, `fcntl(F_DUPFD)`. A copy that skips it is a
+/// bare alias, and the *first* `close` of either slot destroys the object under
+/// the other one.
+///
+/// # Why this is one function
+///
+/// It used to be four. This list lived here, inside `clone_deep_for_fork`, and
+/// `sys_dup` / `sys_dup3` / `sys_fcntl(F_DUPFD)` each carried their own
+/// four-arm copy handling only `PipeWrite`, `PipeRead`, `UnixSocket` and
+/// `Socket`. Both refcounted families added later — `EventFd` and `RumpSocket`
+/// — were added *here* and to none of the copies, so `dup(eventfd)` and
+/// `dup(rump_socket)` produced unreferenced aliases.
+///
+/// The `RumpSocket` arm below records what that costs: the same omission on the
+/// fork path destroyed the accepted socket under sshd's forked child and killed
+/// every session at kex on the rump devbox
+/// (`docs/archive/RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md`). It was found,
+/// fixed here, and never propagated to the three syscall copies — found again
+/// 2026-08-24 (`docs/archive/SYSCALL_LAYER_AUDIT.md`).
+///
+/// Adding a refcounted `FileDescriptor` variant means adding an arm here, and
+/// only here.
+pub fn clone_fd_refs(entry: &FileDescriptor) {
+    match entry {
+        FileDescriptor::PipeWrite(id) => (runtime().pipe_clone_ref)(*id, true),
+        FileDescriptor::PipeRead(id) => (runtime().pipe_clone_ref)(*id, false),
+        FileDescriptor::UnixSocket { rx, tx, sock } => {
+            (runtime().pipe_clone_ref)(*rx, false);
+            (runtime().pipe_clone_ref)(*tx, true);
+            // The socket table entry is refcounted alongside the pipes: the
+            // copy is a real reference, and without this the first close would
+            // destroy the name binding and the record boundaries under the
+            // other still-open fd.
+            (runtime().unix_sock_clone_ref)(*sock);
+        }
+        FileDescriptor::EventFd(id) => (runtime().eventfd_clone_ref)(*id),
+        // Sockets are refcounted like pipes: an fd-table copy is a real
+        // reference, so the first close (child exit / exec cloexec sweep /
+        // close of a dup) must not destroy the socket under the live fd.
+        FileDescriptor::Socket(idx) => (runtime().socket_clone_ref)(*idx),
+        // Rump sockets need the same reference the native ones take, and for
+        // the same reason — but they were the one refcounted family missing
+        // from this list, so the copy was a bare alias. sshd's
+        // process-per-session pattern is exactly the shape that breaks on
+        // that: the parent `drop`s its copy of the accepted socket right
+        // after `fork`, expecting the refcount to keep the child's alive,
+        // and instead `proxy_close` sent a real NetBSD `close(rump_fd)` to
+        // `rump_server` and destroyed the socket the child was about to
+        // speak SSH over. Every session died at kex on the rump devbox
+        // (`docs/archive/RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md`).
+        FileDescriptor::RumpSocket { rump_fd, box_id, .. } => {
+            (runtime().rump_socket_clone_ref)(*box_id, *rump_fd);
+        }
+        _ => {}
+    }
+}
+
 impl SharedFdTable {
     pub fn new() -> Self {
         Self {
@@ -47,6 +107,10 @@ impl SharedFdTable {
 
     /// Deep copy for fork (separate fd table, with pipe ref bumps).
     /// Strips EpollFd entries since epoll instances are not reference-counted.
+    ///
+    /// The per-entry reference bumps are [`clone_fd_refs`] — shared with `dup`,
+    /// `dup3` and `fcntl(F_DUPFD)`, which used to carry their own copies of the
+    /// list and had drifted. See that function's header.
     #[must_use]
     pub fn clone_deep_for_fork(&self) -> Self {
         let cloned: BTreeMap<u32, FileDescriptor> = with_irqs_disabled(|| {
@@ -56,38 +120,7 @@ impl SharedFdTable {
                 .collect()
         });
         for entry in cloned.values() {
-            match entry {
-                FileDescriptor::PipeWrite(id) => (crate::runtime::runtime().pipe_clone_ref)(*id, true),
-                FileDescriptor::PipeRead(id) => (crate::runtime::runtime().pipe_clone_ref)(*id, false),
-                FileDescriptor::UnixSocket { rx, tx, sock } => {
-                    (crate::runtime::runtime().pipe_clone_ref)(*rx, false);
-                    (crate::runtime::runtime().pipe_clone_ref)(*tx, true);
-                    // The socket table entry is refcounted alongside the pipes:
-                    // the child's copy is a real reference, and without this the
-                    // child's first close would destroy the name binding and the
-                    // record boundaries under the parent's still-open fd.
-                    (crate::runtime::runtime().unix_sock_clone_ref)(*sock);
-                }
-                FileDescriptor::EventFd(id) => (crate::runtime::runtime().eventfd_clone_ref)(*id),
-                // Sockets are refcounted like pipes: the child's fd-table copy is a
-                // real reference, so the first close (child exit / exec cloexec
-                // sweep) must not destroy the socket under the parent's live fd.
-                FileDescriptor::Socket(idx) => (crate::runtime::runtime().socket_clone_ref)(*idx),
-                // Rump sockets need the same reference the native ones take, and for
-                // the same reason — but they were the one refcounted family missing
-                // from this list, so the child's copy was a bare alias. sshd's
-                // process-per-session pattern is exactly the shape that breaks on
-                // that: the parent `drop`s its copy of the accepted socket right
-                // after `fork`, expecting the refcount to keep the child's alive,
-                // and instead `proxy_close` sent a real NetBSD `close(rump_fd)` to
-                // `rump_server` and destroyed the socket the child was about to
-                // speak SSH over. Every session died at kex on the rump devbox
-                // (`docs/archive/RUMP_SSHD_FORKED_SESSION_CLOSES_SOCKET.md`).
-                FileDescriptor::RumpSocket { rump_fd, box_id, .. } => {
-                    (crate::runtime::runtime().rump_socket_clone_ref)(*box_id, *rump_fd);
-                }
-                _ => {}
-            }
+            clone_fd_refs(entry);
         }
         let cloexec_clone = with_irqs_disabled(|| self.cloexec.lock().clone());
         let nonblock_clone = with_irqs_disabled(|| self.nonblock.lock().clone());

@@ -11,11 +11,17 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `akuma-{exec,ext2,isolation,kacho,net,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`.
   `akuma-kacho` is the shared observe/decide/hysteresis layer every self-tuning
   policy uses (timer-tick demotion, file-page cache cap, netpoll wake rate).
-  `akuma-net-yarn` is the socket readiness wait loop (`wait_until`) as a pure
-  state machine — the kernel supplies only the effects, so the drain budget,
-  the fruitless-progress escape, the epoch guard and the park policy all have
-  host tests instead of a devbox boot. It also carries a differential test
-  against the pre-extraction loop; keep that oracle in the shipped loop's shape.
+  `akuma-net-yarn` is the readiness wait loop as a pure state machine, driven by
+  **all four** blocking-wait paths: `akuma_net::socket::wait_until` and
+  `src/syscall/poll.rs`'s `sys_epoll_pwait` / `sys_pselect6` / `sys_ppoll`.
+  Callers supply only the effects, so the drain budget, fruitless-progress
+  escape, epoch guard, timeout comparison, interrupt precedence and park kind
+  are `WaitPolicy` fields with host tests instead of a devbox boot. **The two
+  families differ in six of those fields and every difference is a real
+  divergence** — don't "unify" one without measuring it (`docs/reference/
+  subsystems/syscalls/poll.md` § "The wait loop is one machine"). The crate also
+  carries a differential test against the pre-extraction `wait_until`; keep that
+  oracle in the shipped loop's shape rather than tidying it.
   `akuma-scheduler` is host-only and **not** in `default-members`: it models
   scheduler placement / netpoll wake policies so a candidate can be ranked in a
   second instead of a devbox boot (`docs/archive/AKUMA_SCHEDULING_EXTRACTION.md`).

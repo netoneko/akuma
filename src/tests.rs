@@ -7279,20 +7279,49 @@ fn test_epoll_event_is_16_bytes_on_arm64() -> bool {
 fn test_epoll_infinite_wait_uses_bounded_deadline() -> bool {
     console::print("\n[TEST] epoll infinite wait uses bounded deadline\n");
 
+    // Retargeted 2026-08-24 at the machine the three wait loops actually run
+    // (`akuma_net_yarn`), rather than at the standalone `epoll_wait_deadline`
+    // helper this used to call — that helper was a second implementation of the
+    // same arithmetic and has been deleted. Same property, live path.
+    use akuma_net_yarn::{Observation, WaitError, WaitMachine, WaitPolicy, WaitStep};
+
     let start_time = 1_000_000u64;
     let timeout_us = 42_000u64;
     let now = 1_234_567u64;
+    const INTERVAL: u64 = 10_000;
+    let policy = WaitPolicy::epoll(INTERVAL);
 
-    let finite = crate::syscall::epoll_wait_deadline_for_test(10, start_time, timeout_us, now);
-    let zero = crate::syscall::epoll_wait_deadline_for_test(0, start_time, timeout_us, now);
-    let infinite = crate::syscall::epoll_wait_deadline_for_test(-1, start_time, timeout_us, now);
+    // An INFINITE wait must still park on a bounded deadline, never u64::MAX —
+    // the whole point of this test.
+    let infinite = WaitMachine::new(start_time, None, policy).park_deadline(now);
 
-    let pass = finite == start_time + timeout_us
-        && zero == 0
-        && infinite == now + 10_000
-        && infinite != u64::MAX;
+    // A finite wait parks at whichever comes FIRST: its own deadline or the
+    // backstop. In this fixture `now` (1_234_567) is already well past the
+    // caller's deadline (start + timeout = 1_042_000), so the caller's deadline
+    // is the nearer one and the clamp must pick it — never the backstop, which
+    // would sleep past a timeout the caller asked for.
+    let finite = WaitMachine::new(start_time, Some(timeout_us), policy).park_deadline(now);
+
+    // A ZERO timeout must not park at all: the policy's inclusive `>=` expires
+    // it on the first lap. That is the non-blocking `epoll_wait(.., 0)`
+    // contract, and it replaces the old `deadline == 0` sentinel.
+    let mut zero_m = WaitMachine::new(start_time, Some(0), policy);
+    zero_m.lap_start(0);
+    let zero_step = zero_m.lap_end(&Observation {
+        now_us: start_time,
+        poll_epoch: 0,
+        progress: false,
+        condition_met: false,
+        interrupted: false,
+    });
+
+    let pass = infinite == now + INTERVAL
+        && infinite != u64::MAX
+        && finite == start_time + timeout_us
+        && zero_step == WaitStep::Failed(WaitError::TimedOut)
+        && zero_m.stats().parks == 0;
     if !pass {
-        crate::safe_print!(128, "  finite={} zero={} infinite={}\n", finite, zero, infinite);
+        crate::safe_print!(128, "  finite={} infinite={} zero={:?}\n", finite, infinite, zero_step);
     }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass

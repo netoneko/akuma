@@ -12,6 +12,7 @@ dependencies = [
  "akuma-isolation",
  "akuma-kacho",
  "akuma-net",
+ "akuma-net-yarn",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-rump",

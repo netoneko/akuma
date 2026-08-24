@@ -160,6 +160,50 @@ table keyed by an internal `epoll_id` (not by fd) — an `EpollFd(id)`
    (e.g. `TimerFd`), but a woken thread returns immediately rather than
    waiting for the next tick.
 
+## The wait loop is one machine, not three (2026-08-24)
+
+`sys_epoll_pwait`, `sys_pselect6` and `sys_ppoll` used to carry three
+open-coded copies of the same loop — drive the stack, scan for readiness,
+return if ready, check timeout, check signal, park on a deadline. They now all
+drive [`akuma_net_yarn::WaitMachine`](../../../../crates/akuma-net-yarn/src/lib.rs)
+under `WaitPolicy::epoll(effective_poll_interval_us(..))`, and supply only the
+effects. `akuma_net::socket::wait_until` drives the same machine under a
+different policy.
+
+**Read the policy, not the loop.** Every way this family differs from the
+socket family is a field on `WaitPolicy`, each of which is a real divergence
+that predates the extraction:
+
+| Field | epoll family | `wait_until` |
+|---|---|---|
+| `drain_budget` | 1 poll per lap | 64 |
+| `fruitless_limit` | 0 — never spin on unrelated progress | 4 |
+| `epoch_guard` | off | on |
+| `timeout_inclusive` | `>=` — this is what makes a **zero** timeout non-blocking | `>` |
+| `interrupt_precedence` | timeout wins a tie | signal wins |
+| `backstop_us` | `effective_poll_interval_us()` — 10 ms, 1 ms with a rump fd | 3 ms |
+| `park` | `ScanRegistered` — the waker was registered during the readiness scan | `Promiscuous` |
+
+`epoll_pwait` refreshes `backstop_us` every lap (`machine.set_backstop`)
+because `epoll_ctl` can add or remove a rump fd underneath it; its two
+siblings hoist the computation above their loops.
+
+**Why it was worth doing:** the three copies had drifted, and the drift was
+bugs. `sys_pselect6` passed `None` for its waker (so `select(2)` could only
+wake on the 10 ms tick — cargo's libcurl compiles the `select()` branch) and
+had no `should_interrupt_blocking_syscall()` check at all (so a process
+blocked in `select()` could not be interrupted by Ctrl-C or `kill`, and
+`alarm()` + `select()` slept through its own signal). Both fixed 2026-08-24
+with `run_pselect6_registers_waker_test` and `run_pselect6_eintr_test`; both
+verified to fail on the unfixed kernel. Full account:
+[`../../../archive/SYSCALL_LAYER_AUDIT.md`](../../../archive/SYSCALL_LAYER_AUDIT.md)
+and [`../../../archive/REDIS_ROUND_TRIP_STAGE_TRACE.md`](../../../archive/REDIS_ROUND_TRIP_STAGE_TRACE.md) §10.
+
+The deadline arithmetic lives in `WaitMachine::park_deadline` and nowhere
+else. A standalone `epoll_wait_deadline` helper used to compute the same thing
+next to it; it was **deleted**, not kept, because a second implementation with
+its own tests is how the three loops drifted apart to begin with.
+
 `epoll_destroy(epoll_id)` removes the instance outright — see the Stability
 callout above; it is invoked from `sys_close`'s `EpollFd` arm and from the
 CLOEXEC-fd-closing path on `execve`, and (per the fork fix below) `EpollFd`
