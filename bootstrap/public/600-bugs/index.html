@@ -158,6 +158,9 @@
     padding-top: clamp(0.7rem, 1.6vh, 1.1rem);
   }
   .pull.cool { border-top-color: var(--ai); }
+  /* .pull is a 36ch block, so pushing it right needs the BOX moved (margin-left:auto)
+     as well as the text aligned -- text-align alone leaves it hugging the left. */
+  .pull.right { margin-left: auto; text-align: right; }
 
   /* a quote is a .pull that is someone else's words, so it reuses it */
   blockquote.quote { margin: 0; }
@@ -214,6 +217,12 @@
   .fig .v { display: block; font-family: var(--mono); font-size: clamp(1.2rem, 2.5vw, 1.85rem); letter-spacing: -0.03em; color: var(--ink); line-height: 1.05; font-variant-numeric: tabular-nums; }
   .fig .v.hot { color: var(--shu); }
   .fig .k { display: block; margin-top: 0.45rem; font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.13em; text-transform: uppercase; color: var(--dim); }
+  /* .body is a flex column with a uniform gap, so a figure row and the prose
+     under it read as two unrelated blocks. .group re-parents them with a
+     SMALLER gap than .body's, which binds them by proximity, and a shared
+     max-width so the panel row and the text share one measure. */
+  .group { display: flex; flex-direction: column; gap: clamp(0.45rem, 1vh, 0.75rem); max-width: 62ch; }
+  .group > p { margin: 0; }
 
   /* ── opener ─────────────────────────────────────────────────── */
   .hero { display: grid; grid-template-columns: 1fr; gap: clamp(1.2rem, 3vw, 2.5rem); align-items: center; }
@@ -730,15 +739,15 @@ akuma:~$ ./playground
     <div class="body">
       <p class="eyebrow">and it did not stop</p>
       <h2>Another week, another 100</h2>
-      <div class="figs">
-        <div class="fig"><span class="v">622</span><span class="k">17 Aug · deck rendered</span></div>
-        <div class="fig"><span class="v hot">699</span><span class="k">25 Aug · today</span></div>
-        <div class="fig"><span class="v">8</span><span class="k">days</span></div>
-        <div class="fig"><span class="v">~10</span><span class="k">fixes / day</span></div>
+      <div class="group">
+        <div class="figs">
+          <div class="fig"><span class="v">622</span><span class="k">17 Aug · deck rendered</span></div>
+          <div class="fig"><span class="v hot">699</span><span class="k">25 Aug · today</span></div>
+        </div>
+        <p><strong>The previous version of this presentation was finished a week ago.</strong>
+        Another <strong>77 bugs</strong> have been documented and fixed yet I am sure <strong>there will be more than I can imagine</strong>.</p>
       </div>
-      <p><strong>The previous version of this presentation was finished a week ago.</strong>
-      Another <strong>77 bugs</strong> have been documented and fixed yet I am sure <strong>there will be more than I can imagine</strong>.</p>
-      <p class="pull">Conclusion: <em>try to avoid rolling your own operating system.</em></p>
+      <p class="pull">Conclusion: <em class="hot">try to avoid rolling your own operating system.</em></p>
     </div>
   </section>
 
