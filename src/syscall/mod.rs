@@ -448,6 +448,31 @@ pub mod nr {
     pub const MSGRCV: u64 = 188;
     #[cfg(feature = "sc-sysv-ipc")]
     pub const MSGSND: u64 = 189;
+
+    // The 23 syscalls `handle_syscall` used to dispatch by raw numeric literal
+    // instead of a name — named here so a stray digit can't silently drift onto
+    // the wrong syscall the way `SCHED_SETSCHEDULER`'s body did (see its call site).
+    #[cfg(feature = "sc-aio")]
+    pub const IO_SETUP: u64 = 0;
+    #[cfg(feature = "sc-aio")]
+    pub const IO_DESTROY: u64 = 1;
+    #[cfg(feature = "sc-aio")]
+    pub const IO_SUBMIT: u64 = 2;
+    #[cfg(feature = "sc-aio")]
+    pub const IO_CANCEL: u64 = 3;
+    #[cfg(feature = "sc-aio")]
+    pub const IO_GETEVENTS: u64 = 4;
+    /// First of the extended-attributes family (`setxattr`..`fremovexattr`,
+    /// 5-16) — all twelve are matched as one inclusive range,
+    /// `SETXATTR..=FREMOVEXATTR`, since they share one `EOPNOTSUPP` body.
+    pub const SETXATTR: u64 = 5;
+    pub const FREMOVEXATTR: u64 = 16;
+    pub const SCHED_SETPARAM: u64 = 118;
+    pub const SCHED_SETSCHEDULER: u64 = 119;
+    pub const SCHED_YIELD: u64 = 124;
+    pub const RESTART_SYSCALL: u64 = 128;
+    pub const SETPRIORITY: u64 = 140;
+    pub const GETPRIORITY: u64 = 141;
 }
 
 /// Thread CPU statistics for top command
@@ -624,7 +649,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLOCK_GETTIME => { syscall_counters::inc_clock(); }
         nr::IOCTL => { syscall_counters::inc_ioctl(); }
         nr::FSTAT | nr::NEWFSTATAT => { syscall_counters::inc_fstat(); }
-        124 => { syscall_counters::inc_yield(); }
+        nr::SCHED_YIELD => { syscall_counters::inc_yield(); }
         nr::MADVISE => { syscall_counters::inc_madvise(); }
         nr::MREMAP => { syscall_counters::inc_mremap(); }
         nr::LSEEK => { syscall_counters::inc_lseek(); }
@@ -865,16 +890,30 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         nr::SCHED_SETAFFINITY => 0,
         // setpriority(which, who, prio) — we don't schedule by nice value; accept it.
-        140 => 0,
+        nr::SETPRIORITY => 0,
         // getpriority(which, who) — the raw syscall returns `20 - nice` (kept >= 0 so
         // a real nice can't look like an errno); musl computes the caller-visible nice
         // as `20 - ret`. Return 20 => normal priority (nice 0). Leaving this
         // unimplemented returned ENOSYS, which rustc's threadpool then used as a
         // pointer → [WILD-DA] SIGSEGV that intermittently killed a build unit
         // (docs/AKUMA_SELF_HOSTING.md §7i).
-        141 => 20,
-        118 => { 0 }
-        119 => {
+        nr::GETPRIORITY => 20,
+        // sched_setparam(pid, *param) — we don't implement real-time scheduling
+        // params; accept unconditionally and ignore the pointer.
+        nr::SCHED_SETPARAM => { 0 }
+        // sched_setscheduler(pid, policy, *param) — args[1] is `policy`, an int,
+        // not a pointer. This arm predates the named constant above and was
+        // dispatched under the raw literal `119`; its body writes a zero
+        // `sched_priority` into `args[1]` treated as a user pointer, which is the
+        // shape of `sched_getparam`'s OUT-param (unistd nr 121, currently
+        // undispatched — falls through to the `_` arm's `ENOSYS`), not
+        // `sched_setscheduler`'s. In practice this is harmless: `policy` is a
+        // tiny int (0-6), so `write_user_val` almost always rejects it as an
+        // unmapped address and the `let _ =` discards the error, leaving `0`
+        // (success) either way — but the logic itself answers the wrong
+        // syscall. Flagged, not fixed, in this pass — naming the constant
+        // (rather than the raw `119`) is what made the mismatch visible.
+        nr::SCHED_SETSCHEDULER => {
             let param_ptr = args[1] as usize;
             if param_ptr != 0 {
                 let zero: i32 = 0;
@@ -882,15 +921,15 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             }
             0
         }
-        124 => {
+        nr::SCHED_YIELD => {
             akuma_exec::threading::yield_now();
             0
         }
-        // restart_syscall (ARM64 = 128): kernel-internal mechanism to restart interrupted
+        // restart_syscall: kernel-internal mechanism to restart interrupted
         // syscalls after signal delivery. We don't implement SA_RESTART semantics, so the
         // best we can do is return EINTR so callers know to retry the operation.  Returning
         // ENOSYS causes Go's runtime to crash because it doesn't check for ENOSYS here.
-        128 => EINTR,
+        nr::RESTART_SYSCALL => EINTR,
         #[cfg(feature = "sc-sysv-ipc")]
         nr::MSGGET => msgqueue::sys_msgget(args[0] as i32, args[1] as i32),
         #[cfg(feature = "sc-sysv-ipc")]
@@ -968,22 +1007,22 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 akuma_exec::process::read_current_pid().unwrap_or(0));
             ENOSYS
         }
-        // Linux AIO syscalls (io_setup=0, io_destroy=1, io_submit=2, io_cancel=3, io_getevents=4)
         #[cfg(feature = "sc-aio")]
-        0 => aio::sys_io_setup(args[0], args[1]),
+        nr::IO_SETUP => aio::sys_io_setup(args[0], args[1]),
         #[cfg(feature = "sc-aio")]
-        1 => aio::sys_io_destroy(args[0]),
+        nr::IO_DESTROY => aio::sys_io_destroy(args[0]),
         #[cfg(feature = "sc-aio")]
-        2 => aio::sys_io_submit(args[0], args[1] as i64, args[2]),
+        nr::IO_SUBMIT => aio::sys_io_submit(args[0], args[1] as i64, args[2]),
         #[cfg(feature = "sc-aio")]
-        3 => aio::sys_io_cancel(args[0], args[1], args[2]),
+        nr::IO_CANCEL => aio::sys_io_cancel(args[0], args[1], args[2]),
         #[cfg(feature = "sc-aio")]
-        4 => aio::sys_io_getevents(args[0], args[1] as i64, args[2] as i64, args[3], args[4]),
-        // Extended attributes syscalls (5-16) - return EOPNOTSUPP (95) on Linux
-        // AArch64. Must be encoded as `x0 = -95` (0xffffffa1), never `!95`
-        // which is `-96` (0xffffffa0 = EPFNOSUPPORT) and breaks musl/Go callers.
-        // Pinned by `errno::tests::eopnotsupp_encodes_as_negation_not_complement`.
-        5..=16 => {
+        nr::IO_GETEVENTS => aio::sys_io_getevents(args[0], args[1] as i64, args[2] as i64, args[3], args[4]),
+        // Extended attributes syscalls (setxattr..fremovexattr, 5-16) - return
+        // EOPNOTSUPP (95) on Linux AArch64. Must be encoded as `x0 = -95`
+        // (0xffffffa1), never `!95` which is `-96` (0xffffffa0 = EPFNOSUPPORT)
+        // and breaks musl/Go callers. Pinned by
+        // `errno::tests::eopnotsupp_encodes_as_negation_not_complement`.
+        nr::SETXATTR..=nr::FREMOVEXATTR => {
             // setxattr, lsetxattr, fsetxattr, getxattr, lgetxattr, fgetxattr
             // listxattr, llistxattr, flistxattr, removexattr, lremovexattr, fremovexattr
             EOPNOTSUPP
