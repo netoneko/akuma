@@ -413,15 +413,12 @@ pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> u64 {
     {
         create_socket_node(p);
     }
-    if let Some(path) = name.path_bytes() {
-        crate::safe_print!(
-            160,
-            "[unix] bind(fd={}) path len={}\n",
-            fd,
-            path.len()
-        );
-    } else {
-        crate::safe_print!(96, "[unix] bind(fd={}) abstract\n", fd);
+    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        if let Some(path) = name.path_bytes() {
+            crate::safe_print!(160, "[unix] bind(fd={}) path len={}\n", fd, path.len());
+        } else {
+            crate::safe_print!(96, "[unix] bind(fd={}) abstract\n", fd);
+        }
     }
     0
 }
@@ -457,7 +454,9 @@ pub fn sys_listen(fd: u32, backlog: i32) -> u64 {
     };
     match with_table(|t| t.listen(sock, backlog)) {
         Ok(()) => {
-            crate::safe_print!(96, "[unix] listen(fd={}, backlog={})\n", fd, backlog);
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                crate::safe_print!(96, "[unix] listen(fd={}, backlog={})\n", fd, backlog);
+            }
             0
         }
         Err(e) => neg_errno(e),

@@ -99,7 +99,9 @@ pub fn eventfd_clone_ref(id: u32) {
         let mut efds = EVENTFDS.lock();
         if let Some(efd) = efds.get_mut(&id) {
             efd.ref_count += 1;
-            crate::safe_print!(96, "[eventfd] clone_ref id={} ref_count={}\n", id, efd.ref_count);
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                crate::safe_print!(96, "[eventfd] clone_ref id={} ref_count={}\n", id, efd.ref_count);
+            }
         }
     });
 }
@@ -111,7 +113,9 @@ pub fn eventfd_close(id: u32) {
         let mut efds = EVENTFDS.lock();
         if let Some(efd) = efds.get_mut(&id) {
             efd.ref_count = efd.ref_count.saturating_sub(1);
-            crate::safe_print!(96, "[eventfd] close id={} ref_count={}\n", id, efd.ref_count);
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                crate::safe_print!(96, "[eventfd] close id={} ref_count={}\n", id, efd.ref_count);
+            }
             if efd.ref_count == 0 {
                 efds.remove(&id);
             }
@@ -137,6 +141,8 @@ pub(super) fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
     if flags & EFD_NONBLOCK != 0 {
         proc.set_nonblock(fd);
     }
-    crate::tprint!(96, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {} (id={})\n", initval, flags, fd, efd_id);
+    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        crate::tprint!(96, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {} (id={})\n", initval, flags, fd, efd_id);
+    }
     u64::from(fd)
 }

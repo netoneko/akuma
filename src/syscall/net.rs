@@ -214,7 +214,9 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
         super::unixsock::socketpair_rollback(sock0, sock1);
         return EFAULT;
     }
-    crate::safe_print!(96, "[syscall] socketpair(AF_UNIX) = ({}, {})\n", fd0, fd1);
+    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        crate::safe_print!(96, "[syscall] socketpair(AF_UNIX) = ({}, {})\n", fd0, fd1);
+    }
     0
 }
 
@@ -560,7 +562,12 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
                 return EFAULT;
             }
             let a = sa.to_addr();
-            crate::safe_print!(96, "[syscall] sendto(fd={}, len={}, dest={}.{}.{}.{}:{})\n", fd, len, a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.port);
+            // Gated like the DNS trace directly below it — this fires on EVERY
+            // sendto, i.e. per datagram on the UDP send path. Same class as the
+            // ungated `epoll_ctl` trace in poll.rs (LONG_ROAD_TO_REDIS_PART_2.md §9).
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                crate::safe_print!(96, "[syscall] sendto(fd={}, len={}, dest={}.{}.{}.{}:{})\n", fd, len, a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.port);
+            }
             // Extra debug for DNS traffic
             if crate::config::SYSCALL_DEBUG_NET_ENABLED && a.port == 53 {
                 crate::tprint!(128, "[DNS] query sent: fd={} len={} to {}.{}.{}.{}:53\n", 
@@ -829,7 +836,9 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                     }
                 }
                 _ => {
-                    crate::tprint!(128, "[setsockopt] SOL_SOCKET optname={} ignored\n", optname);
+                    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                        crate::tprint!(128, "[setsockopt] SOL_SOCKET optname={} ignored\n", optname);
+                    }
                     0
                 }
             }
@@ -848,13 +857,17 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                     0
                 }
                 _ => {
-                    crate::tprint!(128, "[setsockopt] IPPROTO_TCP optname={} ignored\n", optname);
+                    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                        crate::tprint!(128, "[setsockopt] IPPROTO_TCP optname={} ignored\n", optname);
+                    }
                     0
                 }
             }
         }
         _ => {
-            crate::tprint!(128, "[setsockopt] level={} optname={} ignored\n", level, optname);
+            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                crate::tprint!(128, "[setsockopt] level={} optname={} ignored\n", level, optname);
+            }
             0
         }
     }

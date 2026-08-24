@@ -370,7 +370,9 @@ pub fn sys_epoll_create1(flags: u32) -> u64 {
         if flags & EPOLL_CLOEXEC != 0 {
             proc.set_cloexec(fd);
         }
-        crate::tprint!(96, "[epoll] create1() id={} fd={} cloexec={}\n", epoll_id, fd, flags & EPOLL_CLOEXEC != 0);
+        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            crate::tprint!(96, "[epoll] create1() id={} fd={} cloexec={}\n", epoll_id, fd, flags & EPOLL_CLOEXEC != 0);
+        }
         u64::from(fd)
     } else {
         EBADF

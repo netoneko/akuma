@@ -397,6 +397,38 @@ bad evidence**: the traced kernel inflated the in-guest arms so much (303–383 
 of `printf`) that SLIRP's real 329 µs looked like 18. A contaminated measurement
 does not merely add noise — it inverted a conclusion.
 
+### 9d. nginx vs Akuma's httpd, same kernel, same docroot
+
+In-guest, `/public/index.html`, `/bin/curl` client, 200 requests per run,
+median of 3, on the gated kernel:
+
+| server | connection mode | req/s | µs/req |
+|---|---|---:|---:|
+| nginx | persistent (reuse) | 4,367 | **229** |
+| nginx | close per request | 3,247 | **308** |
+| Akuma `httpd` | forces close | 1,092 | **916** |
+
+`userspace/httpd` sends `Connection: close` on every response
+(`src/resp.rs:172`, `src/main.rs:436,587`), so it can never reuse a connection.
+The comparison must therefore be made against nginx **in the same mode**, and
+that splits httpd's deficit in two:
+
+- **~79 µs** is the missing keep-alive (nginx 308 → 229 when it may reuse).
+- **~600 µs is httpd's own per-request work** — it is 3.0x slower than nginx
+  (916 vs 308) with connection handling held equal.
+
+**The kernel is not the limit here.** nginx serves the same file from the same
+kernel at 229 µs. Optimising the syscall layer for this workload would be
+chasing the wrong process.
+
+> **Harness note, learned by getting it wrong.** curl's `--no-keepalive`
+> disables **TCP keepalive probes**, not HTTP persistent connections. A first
+> pass used it as the "new connection each time" arm and got numbers identical
+> to the persistent arm for both servers — because nothing had changed. Forcing
+> `-H 'Connection: close'` is what actually varies it. Any web benchmark that
+> reports no difference between "keep-alive" and "no keep-alive" is not
+> measuring what it says.
+
 ### 9b. The method rule this earns
 
 **Look at the log volume before believing a latency number.** A guest whose
