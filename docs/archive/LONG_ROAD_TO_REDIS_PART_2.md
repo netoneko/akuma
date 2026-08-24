@@ -397,37 +397,62 @@ bad evidence**: the traced kernel inflated the in-guest arms so much (303–383 
 of `printf`) that SLIRP's real 329 µs looked like 18. A contaminated measurement
 does not merely add noise — it inverted a conclusion.
 
-### 9d. nginx vs Akuma's httpd, same kernel, same docroot
+### 9d. nginx vs Akuma's httpd — ATTEMPTED, NOT ESTABLISHED
 
-In-guest, `/public/index.html`, `/bin/curl` client, 200 requests per run,
-median of 3, on the gated kernel:
+**No trustworthy nginx-vs-httpd number came out of this session.** The attempt
+is recorded because the ways it failed are reusable, and because a later
+session will otherwise repeat them.
 
-| server | connection mode | req/s | µs/req |
-|---|---|---:|---:|
-| nginx | persistent (reuse) | 4,367 | **229** |
-| nginx | close per request | 3,247 | **308** |
-| Akuma `httpd` | forces close | 1,092 | **916** |
+What was tried: `/public/index.html`, in-guest `/bin/curl` client, N requests
+per run, median of 3, on the gated kernel. What came out, across four separate
+boots, for the *same* two servers:
 
-`userspace/httpd` sends `Connection: close` on every response
-(`src/resp.rs:172`, `src/main.rs:436,587`), so it can never reuse a connection.
-The comparison must therefore be made against nginx **in the same mode**, and
-that splits httpd's deficit in two:
+| boot | httpd | nginx |
+|---|---:|---:|
+| A | 916 µs | 308 µs (close-per-req) |
+| B (degraded) | 761 / 806 µs | 558 µs |
+| C | 810 µs | 114 µs |
+| D (fresh, validated) | 1,880 µs | — |
 
-- **~79 µs** is the missing keep-alive (nginx 308 → 229 when it may reuse).
-- **~600 µs is httpd's own per-request work** — it is 3.0x slower than nginx
-  (916 vs 308) with connection handling held equal.
+**Spread of 3–6x on identical binaries.** Any conclusion drawn from one of
+those rows is an artifact. Four distinct harness defects produced it:
 
-**The kernel is not the limit here.** nginx serves the same file from the same
-kernel at 229 µs. Optimising the syscall layer for this workload would be
-chasing the wrong process.
+1. **No status validation.** `curl -w '%{time_total}'` reports a time for a
+   *connection-refused* request too. A server that failed to start therefore
+   measured as blazingly fast — this produced a "httpd is 6.8x faster with
+   logging off (119 µs)" result that was entirely a dead port. Every HTTP
+   measurement must record `%{http_code}` and discard any run that is not all
+   200s.
+2. **`--no-keepalive` is not "no HTTP keep-alive".** It disables TCP keepalive
+   *probes*. Used as the connection-churn arm, it produced numbers identical to
+   the persistent arm — because nothing had changed. Use
+   `-H 'Connection: close'`.
+3. **Concurrent servers.** Running four servers and benchmarking one gave
+   nginx 6,149 µs where it otherwise measured 308.
+4. **Guest degradation under the harness itself.** Repeated `pkill`/start
+   cycles plus thousands of connections drove one guest to the point where
+   `HTTPD_QUIET=1` measured 3,477 µs and then servers **stopped starting at
+   all** (`http_code=` empty). The redis arm on that same boot read 452 µs
+   against a reproducible 110–114 µs, which is how the degradation was caught.
 
-> **Harness note, learned by getting it wrong.** curl's `--no-keepalive`
-> disables **TCP keepalive probes**, not HTTP persistent connections. A first
-> pass used it as the "new connection each time" arm and got numbers identical
-> to the persistent arm for both servers — because nothing had changed. Forcing
-> `-H 'Connection: close'` is what actually varies it. Any web benchmark that
-> reports no difference between "keep-alive" and "no keep-alive" is not
-> measuring what it says.
+**What was actually settled:** httpd's per-request logging is *not* a
+significant cost. On the one fresh, fully-validated boot, verbose 1,880 µs vs
+`HTTPD_QUIET=1` 1,754 µs — ~7 %, i.e. noise — with the log-line counts (604 vs
+2) confirming the flag really did take effect. A change making httpd quiet by
+default was written on the strength of the bad 6.8x number and **reverted**
+once this replicated.
+
+`userspace/httpd` does send `Connection: close` on every response
+(`src/resp.rs:172`, `src/main.rs:436,587`), so it genuinely cannot reuse a
+connection. That is a real difference from nginx and worth fixing on its
+merits — but this session produced no sound measurement of what it costs.
+
+**Before retrying:** get a real load generator into the guest (`ab`/`wrk` are
+absent; `/bin/curl` in a shell loop puts client cost inside the measurement),
+one server per boot, validate every status code, and take a redis
+UNIX/TCP-loopback reading on the same boot as a health check — 41/114 µs is
+the known-good signature, and anything far above it means the boot is degraded
+and its numbers must be thrown away.
 
 ### 9b. The method rule this earns
 
