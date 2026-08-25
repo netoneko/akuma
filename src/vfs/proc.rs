@@ -21,8 +21,8 @@ use alloc::format;
 use core::fmt::Write as _;
 
 use super::{DirEntry, Filesystem, FsError, FsStats, Metadata};
-use crate::config::PROC_STDOUT_MAX_SIZE;
-use akuma_exec::process::{self, Pid, ProcessState};
+use crate::config::{MAX_THREADS, PROC_STDOUT_MAX_SIZE};
+use akuma_exec::{process::{self, Pid, ProcessState}, threading};
 
 // ============================================================================
 // /proc/<pid>/cmdline + status (Linux-style)
@@ -166,6 +166,14 @@ fn proc_stat_text(p: &process::Process) -> String {
     };
     let pid = p.pid;
     let ppid = p.parent_pid;
+    // `utime` is real, in USER_HZ jiffies, off the same per-thread microsecond
+    // counter `top`'s CORE column already reads via `sys_get_cpu_stats`
+    // (`akuma_exec::threading::get_thread_cpu_time`) — busybox `top`/`ps` parse
+    // *this* file (not `status`) for it. We don't split user/kernel time, so
+    // all of it lands in `utime`; `stime` stays 0.
+    let utime_jiffies = p.thread_id
+        .map(|tid| threading::get_thread_cpu_time(tid) / JIFFY_US)
+        .unwrap_or(0);
     // pid comm state ppid pgrp session tty_nr tpgid flags minflt cminflt
     // majflt cmajflt utime stime cutime cstime priority nice num_threads
     // itrealvalue starttime vsize rss rsslim startcode endcode startstack
@@ -173,8 +181,143 @@ fn proc_stat_text(p: &process::Process) -> String {
     // exit_signal processor rt_priority policy delayacct_blkio_ticks
     // guest_time cguest_time
     format!(
-        "{pid} ({comm}) {state} {ppid} {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+        "{pid} ({comm}) {state} {ppid} {pid} {pid} 0 -1 0 0 0 0 0 {utime_jiffies} 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
     )
+}
+
+/// USER_HZ: Linux's jiffy rate for every `/proc` CPU-time field (`utime`,
+/// `stime`, the `/proc/stat` `cpu` line, …) is 100 Hz on every arch that
+/// matters here, regardless of the kernel's actual timer tick
+/// (`config::TIMER_INTERVAL_US`) — it's an ABI constant `sysconf(_SC_CLK_TCK)`
+/// reports, not a reflection of how often we actually interrupt.
+const JIFFY_US: u64 = 10_000;
+
+/// Number of cores the CPU-time accounting should treat as "the system" —
+/// `smp_shared::probed_core_count()` under real SMP, 1 otherwise (including
+/// the legacy `smp` multikernel feature, which doesn't track a shared count).
+#[cfg(kernel_smp_shared)]
+fn active_core_count() -> usize {
+    crate::smp_shared::probed_core_count().max(1)
+}
+#[cfg(not(kernel_smp_shared))]
+fn active_core_count() -> usize {
+    1
+}
+
+/// Sum every thread slot's live CPU time (`akuma_exec::threading::get_thread_cpu_time`,
+/// the same counter `sys_get_cpu_stats`/`top`'s CORE column reads) into a
+/// system-wide busy total and a per-core busy total, bucketed by each
+/// thread's last-run core. Free slots contribute 0 (their counter is reset on
+/// free), so this needs no separate liveness check. Per-core bucketing is an
+/// approximation — a thread that migrated mid-quantum is billed entirely to
+/// wherever it happened to run last — but it's the only per-core signal this
+/// kernel keeps, and it's exactly what already backs `top`'s CORE column.
+fn cpu_time_snapshot() -> (u64, Vec<u64>) {
+    let cores = active_core_count();
+    let mut per_core = alloc::vec![0u64; cores];
+    let mut total = 0u64;
+    for tid in 0..MAX_THREADS {
+        let us = threading::get_thread_cpu_time(tid);
+        if us == 0 {
+            continue;
+        }
+        total += us;
+        let core = threading::get_thread_last_core(tid) as usize;
+        if core < cores {
+            per_core[core] += us;
+        }
+    }
+    (total, per_core)
+}
+
+/// `/proc/stat` (Linux `cpu`/`cpuN`/`processes`/`procs_running`/`procs_blocked`
+/// lines) — what busybox `top` reads to compute overall CPU%; without this
+/// file `top` refuses to start at all (`xfopen_for_read("/proc/stat")` is
+/// unconditional). We don't track a user/kernel-time split, so all busy time
+/// is attributed to the `user` field; `idle` is derived as `wall_time_per_core
+/// - busy_time`, which is exactly what makes the number move sensibly between
+/// two reads (the only thing `top` actually needs from it).
+fn proc_stat_system_text() -> String {
+    let uptime_us = crate::timer::uptime_us();
+    let (busy_total, busy_per_core) = cpu_time_snapshot();
+    let cores = busy_per_core.len() as u64;
+    let idle_total = (uptime_us.saturating_mul(cores)).saturating_sub(busy_total) / JIFFY_US;
+    let user_total = busy_total / JIFFY_US;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "cpu  {user_total} 0 0 {idle_total} 0 0 0 0 0 0");
+    for (i, busy) in busy_per_core.iter().enumerate() {
+        let idle = uptime_us.saturating_sub(*busy) / JIFFY_US;
+        let user = busy / JIFFY_US;
+        let _ = writeln!(out, "cpu{i} {user} 0 0 {idle} 0 0 0 0 0 0");
+    }
+
+    let processes = process::list_processes();
+    let running = processes.iter().filter(|p| p.state == "ready" || p.state == "running").count();
+    let blocked = processes.iter().filter(|p| p.state == "blocked").count();
+    let total_forked = process::NEXT_PID.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(1);
+
+    let _ = writeln!(out, "intr 0");
+    let _ = writeln!(out, "ctxt 0");
+    let _ = writeln!(out, "btime 0");
+    let _ = writeln!(out, "processes {total_forked}");
+    let _ = writeln!(out, "procs_running {running}");
+    let _ = writeln!(out, "procs_blocked {blocked}");
+    out
+}
+
+/// `/proc/meminfo` — what busybox `free` reads (`MemTotal`/`MemFree`/
+/// `Buffers`/`Cached`/`SwapTotal`/`SwapFree`, matched by key prefix, not by
+/// column position). Real numbers off the PMM page allocator
+/// (`crate::pmm::stats`) and the file page cache (`crate::file_page_cache::len`,
+/// the reclaimable-on-demand cache `MemAvailable` accounts for). No swap
+/// exists on this kernel, so the `Swap*` fields are always 0 — a legitimate
+/// value, not a placeholder.
+fn proc_meminfo_text() -> String {
+    let (total_pages, _allocated, free_pages) = crate::pmm::stats();
+    let page_kb = (akuma_pmm::PAGE_SIZE / 1024) as u64;
+    let total_kb = total_pages as u64 * page_kb;
+    let free_kb = free_pages as u64 * page_kb;
+    let cached_kb = crate::file_page_cache::len() as u64 * page_kb;
+    let available_kb = free_kb + cached_kb;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "MemTotal:       {total_kb:>10} kB");
+    let _ = writeln!(out, "MemFree:        {free_kb:>10} kB");
+    let _ = writeln!(out, "MemAvailable:   {available_kb:>10} kB");
+    let _ = writeln!(out, "Buffers:        {:>10} kB", 0);
+    let _ = writeln!(out, "Cached:         {cached_kb:>10} kB");
+    let _ = writeln!(out, "SwapCached:     {:>10} kB", 0);
+    let _ = writeln!(out, "SwapTotal:      {:>10} kB", 0);
+    let _ = writeln!(out, "SwapFree:       {:>10} kB", 0);
+    let _ = writeln!(out, "Shmem:          {:>10} kB", 0);
+    out
+}
+
+/// `/proc/uptime` — `uptime_seconds idle_seconds`. `idle_seconds` follows
+/// Linux SMP semantics (summed across every core, so it can exceed wall time).
+fn proc_uptime_text() -> String {
+    let uptime_us = crate::timer::uptime_us();
+    let (busy_total, busy_per_core) = cpu_time_snapshot();
+    let cores = busy_per_core.len() as u64;
+    let idle_us = (uptime_us.saturating_mul(cores)).saturating_sub(busy_total);
+    format!(
+        "{}.{:02} {}.{:02}\n",
+        uptime_us / 1_000_000, (uptime_us / 10_000) % 100,
+        idle_us / 1_000_000, (idle_us / 10_000) % 100,
+    )
+}
+
+/// `/proc/loadavg` — this kernel doesn't track a decaying run-queue average,
+/// so the three load figures are always `0.00` (an honest "not tracked", not
+/// a plausible-looking fake); the `runnable/total` and `last_pid` fields are
+/// real.
+fn proc_loadavg_text() -> String {
+    let processes = process::list_processes();
+    let running = processes.iter().filter(|p| p.state == "ready" || p.state == "running").count();
+    let total = processes.len();
+    let last_pid = process::NEXT_PID.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(1);
+    format!("0.00 0.00 0.00 {running}/{total} {last_pid}\n")
 }
 
 // ============================================================================
@@ -426,6 +569,17 @@ impl Filesystem for ProcFilesystem {
                 size: 0,
             });
 
+            // System-wide stats — `free`/`top` (busybox) read these; visible
+            // to every box, same as `mounts`/`filesystems` above.
+            for name in ["meminfo", "stat", "uptime", "loadavg"] {
+                entries.push(DirEntry {
+                    name: String::from(name),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 0,
+                });
+            }
+
             // Add recently-exited PIDs that still have retained syscall logs.
             // This runs AFTER the box filter above and must repeat it — appending
             // the unfiltered list here is what put every host pid into a
@@ -581,6 +735,10 @@ impl Filesystem for ProcFilesystem {
             || path == "cores"
             || path == "mounts"
             || path == "filesystems"
+            || path == "meminfo"
+            || path == "stat"
+            || path == "uptime"
+            || path == "loadavg"
             || path.starts_with("net/")
             || path == "sysvipc/msg"
         {
@@ -760,6 +918,22 @@ impl Filesystem for ProcFilesystem {
             return Ok(String::from("LOCAL_PORT,REMOTE_ADDR,STATE,BOX\n").into_bytes());
         }
 
+        // /proc/meminfo, /proc/stat, /proc/uptime, /proc/loadavg — system-wide,
+        // same visibility as /proc/mounts/filesystems (every box sees them;
+        // real Linux containers do too absent a dedicated cgroup shim).
+        if path == "meminfo" {
+            return Ok(proc_meminfo_text().into_bytes());
+        }
+        if path == "stat" {
+            return Ok(proc_stat_system_text().into_bytes());
+        }
+        if path == "uptime" {
+            return Ok(proc_uptime_text().into_bytes());
+        }
+        if path == "loadavg" {
+            return Ok(proc_loadavg_text().into_bytes());
+        }
+
         // /proc/mounts — the viewer's own mount set (its namespace if boxed,
         // the global table on the host). A box sees which paths are mounted
         // into it, never where they came from — crate::vfs::render_mounts
@@ -934,7 +1108,8 @@ impl Filesystem for ProcFilesystem {
             return current_box_id == 0;
         }
 
-        if path == "mounts" || path == "filesystems" {
+        if path == "mounts" || path == "filesystems"
+            || path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg" {
             return true;
         }
 
@@ -1039,6 +1214,26 @@ impl Filesystem for ProcFilesystem {
             } else {
                 0
             };
+            return Ok(Metadata {
+                is_dir: false,
+                size,
+                inode,
+                mode: 0o100444,
+                created: None,
+                modified: None,
+                accessed: None,
+            });
+        }
+
+        // /proc/meminfo, /proc/stat, /proc/uptime, /proc/loadavg — sized by
+        // rendering (these already allocate on read, unlike mounts above).
+        if path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg" {
+            let size = match path {
+                "meminfo" => proc_meminfo_text().len(),
+                "stat" => proc_stat_system_text().len(),
+                "uptime" => proc_uptime_text().len(),
+                _ => proc_loadavg_text().len(),
+            } as u64;
             return Ok(Metadata {
                 is_dir: false,
                 size,

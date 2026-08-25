@@ -205,7 +205,23 @@ umount2".
 | `/proc/boxes` | box listing |
 | `/proc/mounts` | the caller's mount set (its namespace if boxed, the global table on the host) — `crate::vfs::render_mounts`, added 2026-08-24 |
 | `/proc/filesystems` | supported fstypes, one per line: `ext2`/`proc`/`tmpfs`, plus `overlay` under `sc-containers` — added 2026-08-24 |
+| `/proc/meminfo` | `MemTotal`/`MemFree`/`MemAvailable`/`Cached`/`Swap*`, real numbers off `pmm::stats()` + `file_page_cache::len()` — added 2026-08-25, what busybox `free` reads |
+| `/proc/stat` | `cpu`/`cpuN` lines + `processes`/`procs_running`/`procs_blocked` — added 2026-08-25, what busybox `top` reads (unconditionally; missing this file makes `top` refuse to start at all) |
+| `/proc/uptime` | `uptime_seconds idle_seconds`, Linux SMP semantics (idle summed across cores) — added 2026-08-25 |
+| `/proc/loadavg` | `runnable/total` and `last_pid` are real; the three load-average figures are always `0.00` — no decaying run-queue average is tracked — added 2026-08-25 |
 | `/etc/mtab` | not procfs, but the same idea and the same renderer: a virtual file, intercepted in `src/vfs/mod.rs` before any real filesystem is touched — see "Mount table" above |
+
+**`/proc/stat`'s `cpu`/`cpuN` lines and `/proc/<pid>/stat`'s `utime` field are
+real**, off the same per-thread microsecond counter the custom `/bin/top`
+binary's CORE column already reads via `sys_get_cpu_stats`
+(`akuma_exec::threading::get_thread_cpu_time`; bucketed by core in `proc.rs`'s
+`cpu_time_snapshot`). There is no user/kernel-time split tracked, so all busy
+time lands in `utime`/the `user` field; `idle` is derived as
+`wall_time_per_core - busy_time`, which is enough for busybox `top`'s %CPU
+(computed from two reads' deltas) to move correctly. Before 2026-08-25 neither
+file existed at all: busybox `free` errored `can't open '/proc/meminfo'` and
+busybox `top` errored `can't open 'stat'` — not a parsing bug, the files were
+simply missing.
 
 > `ps`/`top` parse `/proc/<pid>/stat` (compact), not `status`. The `stat` file
 > was added after `ps` showed nothing (`archive/PROCFS.md`).
