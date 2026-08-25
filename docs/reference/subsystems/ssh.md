@@ -116,9 +116,12 @@ limitations accepted and documented rather than silently left).
   cursor, clear_screen, `poll_input_event` (blocking/non-blocking/timed). Raw
   mode forwards SSH channel bytes unmodified; cooked mode does line editing +
   echo in the shell.
-- **PTY / winsize:** `TerminalState` is `Arc<Spinlock<…>>` (`term_width`,
-  `term_height`, `input_waker`). `TIOCGWINSZ` (`0x5413`) reads; `TIOCSWINSZ`
-  (`0x5414`) writes (kernel `src/syscall/term.rs`). **pty spawn**
+- **PTY / winsize:** `TerminalState` (`crates/akuma-terminal/src/lib.rs` —
+  mode flags, termios `iflag`/`oflag`/`cflag`/`lflag`, the canonical-mode
+  line buffer, `c_cc`) is `Arc<Spinlock<…>>` (`term_width`, `term_height`,
+  `input_waker`). `TIOCGWINSZ` (`0x5413`) reads; `TIOCSWINSZ`
+  (`0x5414`) writes (kernel `src/syscall/term.rs`, the syscall entry point —
+  the state itself lives in the crate, not that file). **pty spawn**
   (`SPAWN_FLAG_PTY`): child gets a **fresh** Arc so multiplexed daemons (sshd)
   don't alias `input_waker` slots across sessions — this is why sshd reaches the
   child's state via `TIOCSWINSZ` on the `ChildStdout(pid)` fd rather than its own.

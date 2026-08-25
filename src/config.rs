@@ -356,6 +356,30 @@ pub const RUN_SLOW_FORKTEST_PARENT_MMAP: bool = false;
 /// Enable DHCP for automatic IP configuration
 pub const ENABLE_DHCP: bool = true;
 
+/// Try a boot-time SNTP round trip when the RTC left the clock unset — the
+/// platform switch for `docs/archive/MISSING_NTP_SYSCALLS.md`: QEMU `virt`'s
+/// PL031 always sets the clock in `kernel_main`, so this only ever fires on a
+/// platform with no RTC (Firecracker). Best-effort and non-fatal either way —
+/// see `src/ntp_boot.rs`.
+pub const ENABLE_NTP_BOOTSTRAP: bool = true;
+
+/// NTP server the boot-time fallback queries — an IP literal, deliberately,
+/// not a hostname. `akuma_net::smoltcp_net::dns_query` fast-paths an IP
+/// literal without any DNS lookup, which matters because the one platform
+/// this fallback exists for has broken DNS: `overlays/devbox-firecracker`'s
+/// README documents that `QEMU_DNS_SERVER` (`10.0.2.3`, smoltcp_net.rs) is
+/// SLIRP's forwarder address, hardcoded, and nothing listens there under
+/// Firecracker (`guest-setup.sh`'s dnsmasq answers on `10.0.2.2` instead) — a
+/// hostname here would just time out on the exact platform that needs this
+/// fallback most. `216.239.35.0` is Google Public NTP's anycast address
+/// (`time.google.com`), stable since ~2014.
+pub const NTP_SERVER_HOSTNAME: &str = "216.239.35.0";
+
+/// How long the boot-time SNTP round trip waits for a response before giving
+/// up. Runs pre-IRQ-unmask on a busy-poll loop, so this is real boot latency
+/// on any platform that hits it — kept short since a timeout is not fatal.
+pub const NTP_BOOTSTRAP_TIMEOUT_US: u64 = 3_000_000;
+
 /// Skip filesystem initialization (for debugging crashes)
 ///
 /// When enabled, skips block device and filesystem init.

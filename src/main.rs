@@ -69,6 +69,7 @@ mod network_tests;
 #[cfg(feature = "net-profile")]
 mod nic_profile;
 mod klog;
+mod ntp_boot;
 mod platform;
 mod pmm;
 #[cfg(kernel_tests)]
@@ -1603,6 +1604,18 @@ fn run_async_main() -> ! {
     }
 
     console::print("--- Network Initialization Done ---\n\n");
+
+    // Platform switch for docs/archive/MISSING_NTP_SYSCALLS.md: QEMU virt's
+    // PL031 already set the clock back in kernel_main (init_utc_from_rtc), so
+    // this is a no-op there. A platform with no RTC (Firecracker) leaves
+    // utc_time_us() None at this point — that IS the "no RTC" signal, no
+    // separate board check needed — so fall back to a boot-time SNTP round
+    // trip instead of leaving the clock stuck at 1970. Runs before IRQs are
+    // unmasked below, so it busy-polls the network stack directly; see
+    // ntp_boot::try_bootstrap_clock. Never fatal either way.
+    if timer::utc_time_us().is_none() {
+        ntp_boot::try_bootstrap_clock();
+    }
 
     // rump feature: bind the BSP's rump tap (/dev/net/tap0) to NIC1 on virtio-mmio-bus.4
     // (RUMP_NIC=1), leaving NIC0 on smoltcp above. Bound to that SPECIFIC slot — not "the 2nd

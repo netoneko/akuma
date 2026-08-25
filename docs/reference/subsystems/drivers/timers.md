@@ -122,6 +122,15 @@ it once to compute the UTC offset (uptime-relative), after which
 certificate verification and `DateTime`/ISO-8601 formatting for
 userspace-visible timestamps.
 
+`akuma-timer` only ever *reads* the offset that `set_utc_time_us` writes;
+the writers — `clock_settime`/`adjtimex`/`clock_adjtime`, and the boot-time
+SNTP fallback for platforms with no PL031 (Firecracker) — live in the
+sibling `akuma-time` crate. See
+[`../syscalls/time.md`](../syscalls/time.md) § "boot-time clock source and
+the Firecracker fallback". Don't confuse the two crates by name: `akuma-timer`
+is the hardware/tick-policy crate this file documents, `akuma-time` is the
+syscall/NTP crate.
+
 ## Background
 
 - `archive/AKUMA_TIME_EXTRACTION.md` — the 2026-08-18 extraction, the HVF

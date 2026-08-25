@@ -17,6 +17,7 @@ dependencies = [
  "akuma-primitives",
  "akuma-rump",
  "akuma-terminal",
+ "akuma-time",
  "akuma-timer",
  "akuma-vfs",
  "akuma-virtio",
@@ -119,6 +120,16 @@ name = "akuma-terminal"
 version = "0.1.0"
 dependencies = [
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-time"
+version = "0.1.0"
+dependencies = [
+ "akuma-exec",
+ "akuma-primitives",
+ "akuma-timer",
+ "log",
 ]
 
 [[package]]

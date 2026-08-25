@@ -1,0 +1,14 @@
+[package]
+name = "akuma-time"
+version = "0.1.0"
+edition = "2024"
+description = "Time syscalls (clock_gettime/settime, itimers, adjtimex) and the boot-time SNTP client for platforms with no RTC"
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-exec = { path = "../akuma-exec" }
+akuma-timer = { path = "../akuma-timer" }
+log = { version = "0.4", default-features = false }

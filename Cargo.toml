@@ -13,6 +13,7 @@ default-members = [
     "crates/akuma-primitives",
     "crates/akuma-rump",
     "crates/akuma-terminal",
+    "crates/akuma-time",
     "crates/akuma-timer",
     "crates/akuma-vfs",
     "crates/akuma-virtio",
@@ -600,6 +601,10 @@ log = { version = "0.4", default-features = false }
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 virtio-drivers = { version = "0.13", default-features = false }
 akuma-timer = { path = "crates/akuma-timer" }
+# Time syscalls (clock_gettime/settime, itimers, adjtimex) and the boot-time
+# SNTP fallback for platforms with no RTC (Firecracker) — extracted from
+# src/syscall/time.rs, see docs/archive/MISSING_NTP_SYSCALLS.md.
+akuma-time = { path = "crates/akuma-time" }
 embedded-io-async = { version = "0.6", default-features = false }
 
 [patch.crates-io]

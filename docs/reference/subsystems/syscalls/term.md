@@ -1,9 +1,12 @@
 # term syscalls
 
 `ioctl` (29) + the rich terminal syscalls (307–313) and `get_cpu_stats`
-(314). Source: `src/syscall/term.rs`. For the SSH-side terminal state
-(`TerminalState`, PTY winsize routing via `ChildStdout(pid)`, raw/cooked
-key translation), see [`../ssh.md`](../ssh.md) "Terminal handling" — not
+(314). Source: `src/syscall/term.rs`. `TerminalState` itself (mode flags,
+termios fields, the canonical-mode line buffer) is the `akuma-terminal`
+crate, `crates/akuma-terminal/src/lib.rs` — no dedicated subsystem doc yet
+(deferred gap, `reference/README.md` § "Not yet written"). For the SSH-side
+usage (PTY winsize routing via `ChildStdout(pid)`, raw/cooked key
+translation), see [`../ssh.md`](../ssh.md) "Terminal handling" — not
 duplicated here.
 
 > **Stability: B (watch) — one OPEN wedge.** A `TIOCSWINSZ`/`TIOCGWINSZ`

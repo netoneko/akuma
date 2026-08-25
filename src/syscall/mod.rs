@@ -65,7 +65,10 @@ pub mod unixsock;
 pub mod signal;
 mod sync;
 mod term;
-mod time;
+/// Itimers, clock_gettime/settime/getres, nanosleep, adjtimex — moved to the
+/// `akuma-time` crate 2026-08-25 (docs/archive/MISSING_NTP_SYSCALLS.md); this
+/// alias keeps every `time::sys_*` call site below unchanged.
+use akuma_time as time;
 #[cfg(feature = "sc-timerfd")]
 mod timerfd;
 
@@ -279,6 +282,12 @@ pub mod nr {
     pub const NEWFSTATAT: u64 = 79;
     pub const FACCESSAT: u64 = 48;
     pub const CLOCK_GETTIME: u64 = 113;
+    /// See `docs/archive/MISSING_NTP_SYSCALLS.md`: `clock_settime`/`adjtimex`/
+    /// `clock_adjtime` were the missing half of clock support — `clock_gettime`
+    /// alone gives no way to ever correct a wrong clock.
+    pub const CLOCK_SETTIME: u64 = 112;
+    pub const ADJTIMEX: u64 = 171;
+    pub const CLOCK_ADJTIME: u64 = 266;
     pub const CLONE3: u64 = 435;
     pub const FACCESSAT2: u64 = 439;
     pub const WAIT4: u64 = 260;
@@ -817,6 +826,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::NEWFSTATAT => fs::sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
         nr::FACCESSAT => fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, 0),
         nr::CLOCK_GETTIME => time::sys_clock_gettime(args[0], args[1]),
+        nr::CLOCK_SETTIME => time::sys_clock_settime(args[0] as u32, args[1]),
+        nr::ADJTIMEX => time::sys_adjtimex(args[0]),
+        nr::CLOCK_ADJTIME => time::sys_clock_adjtime(args[0] as u32, args[1]),
         nr::FACCESSAT2 => fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
         nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),

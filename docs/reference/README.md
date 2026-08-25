@@ -82,6 +82,12 @@ Tier C (niche) remains:
   `subsystems/syscalls/fb.md`, which covers the `fb.rs` syscall wrapper, not
   the ramfb device itself). No generic `drivers/virtio.md` overview exists;
   VirtIO-blk specifics live in `drivers/block.md`.
+- **`akuma-terminal`** (`crates/akuma-terminal/src/lib.rs` — `TerminalState`:
+  termios fields, mode flags, the canonical-mode line buffer): no dedicated
+  crate doc. Covered only in passing by
+  [`subsystems/syscalls/term.md`](subsystems/syscalls/term.md) and
+  [`subsystems/ssh.md`](subsystems/ssh.md) § "Terminal handling", which
+  document its *callers*, not its own state machine.
 
 For these, consult `archive/` directly in the meantime.
 
