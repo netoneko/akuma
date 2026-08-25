@@ -154,7 +154,8 @@ fn proc_status_text(p: &process::Process) -> String {
 /// neutral placeholder — enough for `ps`/`top` to list PID/PPID/STATE/
 /// COMMAND, which is what they read this file for; real per-process CPU/mem
 /// stats are a separate, larger feature.
-fn proc_stat_text(p: &process::Process) -> String {
+fn render_pid_stat(p: &process::Process, buf: &mut [u8]) -> usize {
+    use akuma_primitives::console::FmtBuf;
     let name = p.name.as_str();
     // Linux's `comm` is the executable's basename, truncated to 15 bytes.
     let base = name.rsplit('/').next().unwrap_or(name);
@@ -172,17 +173,20 @@ fn proc_stat_text(p: &process::Process) -> String {
     // *this* file (not `status`) for it. We don't split user/kernel time, so
     // all of it lands in `utime`; `stime` stays 0.
     let utime_jiffies = p.thread_id
-        .map(|tid| threading::get_thread_cpu_time(tid) / JIFFY_US)
-        .unwrap_or(0);
+        .map_or(0, |tid| threading::get_thread_cpu_time(tid) / JIFFY_US);
     // pid comm state ppid pgrp session tty_nr tpgid flags minflt cminflt
     // majflt cmajflt utime stime cutime cstime priority nice num_threads
     // itrealvalue starttime vsize rss rsslim startcode endcode startstack
     // kstkesp kstkeip signal blocked sigignore sigcatch wchan nswap cnswap
     // exit_signal processor rt_priority policy delayacct_blkio_ticks
     // guest_time cguest_time
-    format!(
-        "{pid} ({comm}) {state} {ppid} {pid} {pid} 0 -1 0 0 0 0 0 {utime_jiffies} 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
-    )
+    let mut pos = 0usize;
+    let mut w = FmtBuf { buf, pos: &mut pos };
+    let _ = writeln!(
+        w,
+        "{pid} ({comm}) {state} {ppid} {pid} {pid} 0 -1 0 0 0 0 0 {utime_jiffies} 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+    );
+    pos
 }
 
 /// USER_HZ: Linux's jiffy rate for every `/proc` CPU-time field (`utime`,
@@ -192,12 +196,17 @@ fn proc_stat_text(p: &process::Process) -> String {
 /// reports, not a reflection of how often we actually interrupt.
 const JIFFY_US: u64 = 10_000;
 
+use akuma_exec::threading::types::MAX_CORES;
+
 /// Number of cores the CPU-time accounting should treat as "the system" —
 /// `smp_shared::probed_core_count()` under real SMP, 1 otherwise (including
 /// the legacy `smp` multikernel feature, which doesn't track a shared count).
+/// Clamped to `MAX_CORES` (the SMP bringup cap `LAST_CORE` values are already
+/// bounded by), so callers can size a fixed `[_; MAX_CORES]` array instead of
+/// allocating.
 #[cfg(kernel_smp_shared)]
 fn active_core_count() -> usize {
-    crate::smp_shared::probed_core_count().max(1)
+    crate::smp_shared::probed_core_count().clamp(1, MAX_CORES)
 }
 #[cfg(not(kernel_smp_shared))]
 fn active_core_count() -> usize {
@@ -212,9 +221,14 @@ fn active_core_count() -> usize {
 /// approximation — a thread that migrated mid-quantum is billed entirely to
 /// wherever it happened to run last — but it's the only per-core signal this
 /// kernel keeps, and it's exactly what already backs `top`'s CORE column.
-fn cpu_time_snapshot() -> (u64, Vec<u64>) {
+///
+/// Returns `(total_busy_us, [u64; MAX_CORES], cores)` — a fixed array rather
+/// than a `Vec`: this runs on every `/proc/stat`/`/proc/uptime` read, which
+/// `top` hits on every refresh, so it stays off the heap like the rest of
+/// this module's virtual-file renderers (`render_mounts` et al.).
+fn cpu_time_snapshot() -> (u64, [u64; MAX_CORES], usize) {
     let cores = active_core_count();
-    let mut per_core = alloc::vec![0u64; cores];
+    let mut per_core = [0u64; MAX_CORES];
     let mut total = 0u64;
     for tid in 0..MAX_THREADS {
         let us = threading::get_thread_cpu_time(tid);
@@ -227,7 +241,7 @@ fn cpu_time_snapshot() -> (u64, Vec<u64>) {
             per_core[core] += us;
         }
     }
-    (total, per_core)
+    (total, per_core, cores)
 }
 
 /// `/proc/stat` (Linux `cpu`/`cpuN`/`processes`/`procs_running`/`procs_blocked`
@@ -237,33 +251,32 @@ fn cpu_time_snapshot() -> (u64, Vec<u64>) {
 /// is attributed to the `user` field; `idle` is derived as `wall_time_per_core
 /// - busy_time`, which is exactly what makes the number move sensibly between
 /// two reads (the only thing `top` actually needs from it).
-fn proc_stat_system_text() -> String {
+fn render_stat_system(buf: &mut [u8]) -> usize {
+    use akuma_primitives::console::FmtBuf;
     let uptime_us = crate::timer::uptime_us();
-    let (busy_total, busy_per_core) = cpu_time_snapshot();
-    let cores = busy_per_core.len() as u64;
-    let idle_total = (uptime_us.saturating_mul(cores)).saturating_sub(busy_total) / JIFFY_US;
+    let (busy_total, busy_per_core, cores) = cpu_time_snapshot();
+    let idle_total = (uptime_us.saturating_mul(cores as u64)).saturating_sub(busy_total) / JIFFY_US;
     let user_total = busy_total / JIFFY_US;
 
-    let mut out = String::new();
-    let _ = writeln!(out, "cpu  {user_total} 0 0 {idle_total} 0 0 0 0 0 0");
-    for (i, busy) in busy_per_core.iter().enumerate() {
+    let mut pos = 0usize;
+    let mut w = FmtBuf { buf, pos: &mut pos };
+    let _ = writeln!(w, "cpu  {user_total} 0 0 {idle_total} 0 0 0 0 0 0");
+    for (i, busy) in busy_per_core[..cores].iter().enumerate() {
         let idle = uptime_us.saturating_sub(*busy) / JIFFY_US;
         let user = busy / JIFFY_US;
-        let _ = writeln!(out, "cpu{i} {user} 0 0 {idle} 0 0 0 0 0 0");
+        let _ = writeln!(w, "cpu{i} {user} 0 0 {idle} 0 0 0 0 0 0");
     }
 
-    let processes = process::list_processes();
-    let running = processes.iter().filter(|p| p.state == "ready" || p.state == "running").count();
-    let blocked = processes.iter().filter(|p| p.state == "blocked").count();
+    let (_total, running, blocked) = process::count_process_states();
     let total_forked = process::NEXT_PID.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(1);
 
-    let _ = writeln!(out, "intr 0");
-    let _ = writeln!(out, "ctxt 0");
-    let _ = writeln!(out, "btime 0");
-    let _ = writeln!(out, "processes {total_forked}");
-    let _ = writeln!(out, "procs_running {running}");
-    let _ = writeln!(out, "procs_blocked {blocked}");
-    out
+    let _ = writeln!(w, "intr 0");
+    let _ = writeln!(w, "ctxt 0");
+    let _ = writeln!(w, "btime 0");
+    let _ = writeln!(w, "processes {total_forked}");
+    let _ = writeln!(w, "procs_running {running}");
+    let _ = writeln!(w, "procs_blocked {blocked}");
+    pos
 }
 
 /// `/proc/meminfo` — what busybox `free` reads (`MemTotal`/`MemFree`/
@@ -273,7 +286,8 @@ fn proc_stat_system_text() -> String {
 /// the reclaimable-on-demand cache `MemAvailable` accounts for). No swap
 /// exists on this kernel, so the `Swap*` fields are always 0 — a legitimate
 /// value, not a placeholder.
-fn proc_meminfo_text() -> String {
+fn render_meminfo(buf: &mut [u8]) -> usize {
+    use akuma_primitives::console::FmtBuf;
     let (total_pages, _allocated, free_pages) = crate::pmm::stats();
     let page_kb = (akuma_pmm::PAGE_SIZE / 1024) as u64;
     let total_kb = total_pages as u64 * page_kb;
@@ -281,43 +295,50 @@ fn proc_meminfo_text() -> String {
     let cached_kb = crate::file_page_cache::len() as u64 * page_kb;
     let available_kb = free_kb + cached_kb;
 
-    let mut out = String::new();
-    let _ = writeln!(out, "MemTotal:       {total_kb:>10} kB");
-    let _ = writeln!(out, "MemFree:        {free_kb:>10} kB");
-    let _ = writeln!(out, "MemAvailable:   {available_kb:>10} kB");
-    let _ = writeln!(out, "Buffers:        {:>10} kB", 0);
-    let _ = writeln!(out, "Cached:         {cached_kb:>10} kB");
-    let _ = writeln!(out, "SwapCached:     {:>10} kB", 0);
-    let _ = writeln!(out, "SwapTotal:      {:>10} kB", 0);
-    let _ = writeln!(out, "SwapFree:       {:>10} kB", 0);
-    let _ = writeln!(out, "Shmem:          {:>10} kB", 0);
-    out
+    let mut pos = 0usize;
+    let mut w = FmtBuf { buf, pos: &mut pos };
+    let _ = writeln!(w, "MemTotal:       {total_kb:>10} kB");
+    let _ = writeln!(w, "MemFree:        {free_kb:>10} kB");
+    let _ = writeln!(w, "MemAvailable:   {available_kb:>10} kB");
+    let _ = writeln!(w, "Buffers:        {:>10} kB", 0);
+    let _ = writeln!(w, "Cached:         {cached_kb:>10} kB");
+    let _ = writeln!(w, "SwapCached:     {:>10} kB", 0);
+    let _ = writeln!(w, "SwapTotal:      {:>10} kB", 0);
+    let _ = writeln!(w, "SwapFree:       {:>10} kB", 0);
+    let _ = writeln!(w, "Shmem:          {:>10} kB", 0);
+    pos
 }
 
 /// `/proc/uptime` — `uptime_seconds idle_seconds`. `idle_seconds` follows
 /// Linux SMP semantics (summed across every core, so it can exceed wall time).
-fn proc_uptime_text() -> String {
+fn render_uptime(buf: &mut [u8]) -> usize {
+    use akuma_primitives::console::FmtBuf;
     let uptime_us = crate::timer::uptime_us();
-    let (busy_total, busy_per_core) = cpu_time_snapshot();
-    let cores = busy_per_core.len() as u64;
-    let idle_us = (uptime_us.saturating_mul(cores)).saturating_sub(busy_total);
-    format!(
-        "{}.{:02} {}.{:02}\n",
+    let (busy_total, _busy_per_core, cores) = cpu_time_snapshot();
+    let idle_us = (uptime_us.saturating_mul(cores as u64)).saturating_sub(busy_total);
+    let mut pos = 0usize;
+    let mut w = FmtBuf { buf, pos: &mut pos };
+    let _ = writeln!(
+        w,
+        "{}.{:02} {}.{:02}",
         uptime_us / 1_000_000, (uptime_us / 10_000) % 100,
         idle_us / 1_000_000, (idle_us / 10_000) % 100,
-    )
+    );
+    pos
 }
 
 /// `/proc/loadavg` — this kernel doesn't track a decaying run-queue average,
 /// so the three load figures are always `0.00` (an honest "not tracked", not
 /// a plausible-looking fake); the `runnable/total` and `last_pid` fields are
 /// real.
-fn proc_loadavg_text() -> String {
-    let processes = process::list_processes();
-    let running = processes.iter().filter(|p| p.state == "ready" || p.state == "running").count();
-    let total = processes.len();
+fn render_loadavg(buf: &mut [u8]) -> usize {
+    use akuma_primitives::console::FmtBuf;
+    let (total, running, _blocked) = process::count_process_states();
     let last_pid = process::NEXT_PID.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(1);
-    format!("0.00 0.00 0.00 {running}/{total} {last_pid}\n")
+    let mut pos = 0usize;
+    let mut w = FmtBuf { buf, pos: &mut pos };
+    let _ = writeln!(w, "0.00 0.00 0.00 {running}/{total} {last_pid}");
+    pos
 }
 
 // ============================================================================
@@ -735,10 +756,6 @@ impl Filesystem for ProcFilesystem {
             || path == "cores"
             || path == "mounts"
             || path == "filesystems"
-            || path == "meminfo"
-            || path == "stat"
-            || path == "uptime"
-            || path == "loadavg"
             || path.starts_with("net/")
             || path == "sysvipc/msg"
         {
@@ -748,6 +765,25 @@ impl Filesystem for ProcFilesystem {
             }
             let n = buf.len().min(data.len() - offset);
             buf[..n].copy_from_slice(&data[offset..offset + n]);
+            return Ok(n);
+        }
+
+        // /proc/meminfo, /proc/stat, /proc/uptime, /proc/loadavg — rendered
+        // straight into the caller's buffer, no intermediate `Vec`: this is
+        // what busybox `top`/`free` re-`read()` on every refresh.
+        if path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg" {
+            let mut scratch = [0u8; 1024];
+            let len = match path {
+                "meminfo" => render_meminfo(&mut scratch),
+                "stat" => render_stat_system(&mut scratch),
+                "uptime" => render_uptime(&mut scratch),
+                _ => render_loadavg(&mut scratch),
+            };
+            if offset >= len {
+                return Ok(0);
+            }
+            let n = buf.len().min(len - offset);
+            buf[..n].copy_from_slice(&scratch[offset..offset + n]);
             return Ok(n);
         }
 
@@ -785,10 +821,34 @@ impl Filesystem for ProcFilesystem {
                 }
         }
 
+        // Handle <pid>/stat separately, straight into the caller's buffer with
+        // no intermediate `Vec` — this is what `top`/`ps` re-read on every
+        // refresh for every visible process, unlike `cmdline`/`status` below.
+        {
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            if parts.len() == 2 && parts[1] == "stat"
+                && let Ok(pid) = parts[0].parse::<Pid>() {
+                    let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
+                    let current_box_id =
+                        akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id);
+                    if current_box_id != 0 && proc.box_id != current_box_id {
+                        return Err(FsError::NotFound);
+                    }
+                    let mut stat_buf = [0u8; 256];
+                    let len = render_pid_stat(proc, &mut stat_buf);
+                    if offset >= len {
+                        return Ok(0);
+                    }
+                    let n = buf.len().min(len - offset);
+                    buf[..n].copy_from_slice(&stat_buf[offset..offset + n]);
+                    return Ok(n);
+                }
+        }
+
         // Handle <pid>/cmdline and <pid>/status
         {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
-            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat")
+            if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status")
                 && let Ok(pid) = parts[0].parse::<Pid>() {
                     let proc = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
                     let current_box_id =
@@ -798,7 +858,6 @@ impl Filesystem for ProcFilesystem {
                     }
                     let data = match parts[1] {
                         "cmdline" => proc_cmdline_bytes(proc),
-                        "stat" => proc_stat_text(proc).into_bytes(),
                         _ => proc_status_text(proc).into_bytes(),
                     };
                     if offset >= data.len() {
@@ -921,17 +980,20 @@ impl Filesystem for ProcFilesystem {
         // /proc/meminfo, /proc/stat, /proc/uptime, /proc/loadavg — system-wide,
         // same visibility as /proc/mounts/filesystems (every box sees them;
         // real Linux containers do too absent a dedicated cgroup shim).
-        if path == "meminfo" {
-            return Ok(proc_meminfo_text().into_bytes());
-        }
-        if path == "stat" {
-            return Ok(proc_stat_system_text().into_bytes());
-        }
-        if path == "uptime" {
-            return Ok(proc_uptime_text().into_bytes());
-        }
-        if path == "loadavg" {
-            return Ok(proc_loadavg_text().into_bytes());
+        // `read_at` (what `top`/`free`'s actual `read()` calls land in) renders
+        // these directly into its own buffer and never reaches here; this path
+        // exists for callers that want the whole file as a `Vec` (e.g. `cat`
+        // via a full-file read), so the one allocation below is the trait
+        // boundary's, not this renderer's.
+        if path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg" {
+            let mut scratch = [0u8; 1024];
+            let len = match path {
+                "meminfo" => render_meminfo(&mut scratch),
+                "stat" => render_stat_system(&mut scratch),
+                "uptime" => render_uptime(&mut scratch),
+                _ => render_loadavg(&mut scratch),
+            };
+            return Ok(scratch[..len].to_vec());
         }
 
         // /proc/mounts — the viewer's own mount set (its namespace if boxed,
@@ -1031,7 +1093,11 @@ impl Filesystem for ProcFilesystem {
                     }
                     return Ok(match parts[1] {
                         "cmdline" => proc_cmdline_bytes(proc),
-                        "stat" => proc_stat_text(proc).into_bytes(),
+                        "stat" => {
+                            let mut stat_buf = [0u8; 256];
+                            let len = render_pid_stat(proc, &mut stat_buf);
+                            stat_buf[..len].to_vec()
+                        }
                         _ => proc_status_text(proc).into_bytes(),
                     });
                 }
@@ -1226,13 +1292,14 @@ impl Filesystem for ProcFilesystem {
         }
 
         // /proc/meminfo, /proc/stat, /proc/uptime, /proc/loadavg — sized by
-        // rendering (these already allocate on read, unlike mounts above).
+        // rendering into a stack buffer, same as `mounts` above.
         if path == "meminfo" || path == "stat" || path == "uptime" || path == "loadavg" {
+            let mut scratch = [0u8; 1024];
             let size = match path {
-                "meminfo" => proc_meminfo_text().len(),
-                "stat" => proc_stat_system_text().len(),
-                "uptime" => proc_uptime_text().len(),
-                _ => proc_loadavg_text().len(),
+                "meminfo" => render_meminfo(&mut scratch),
+                "stat" => render_stat_system(&mut scratch),
+                "uptime" => render_uptime(&mut scratch),
+                _ => render_loadavg(&mut scratch),
             } as u64;
             return Ok(Metadata {
                 is_dir: false,
@@ -1366,7 +1433,10 @@ impl Filesystem for ProcFilesystem {
                 }
                 let size = match parts[1] {
                     "cmdline" => proc_cmdline_bytes(proc).len() as u64,
-                    "stat" => proc_stat_text(proc).len() as u64,
+                    "stat" => {
+                        let mut stat_buf = [0u8; 256];
+                        render_pid_stat(proc, &mut stat_buf) as u64
+                    }
                     _ => proc_status_text(proc).len() as u64,
                 };
                 return Ok(Metadata {

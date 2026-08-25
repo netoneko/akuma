@@ -460,6 +460,40 @@ pub fn process_count() -> usize {
     count
 }
 
+/// `(total, running_or_ready, blocked)` — a scalar tally over every active
+/// process's `state`, with no `Vec`. `/proc/stat`'s `procs_running`/
+/// `procs_blocked` and `/proc/loadavg`'s `runnable/total` need exactly these
+/// three numbers, and `top`/`free` (via those files) read them on every
+/// refresh; `collect_process_info`/`list_processes` would answer the same
+/// question but always allocate (a `Vec`, plus a `String` clone per process),
+/// which is unnecessary for a plain count. Same locking shape as
+/// `collect_process_info`: `PROCESS_SLOTS` pointers are only valid to
+/// dereference with IRQs disabled.
+pub fn count_process_states() -> (usize, usize, usize) {
+    let mut total = 0usize;
+    let mut running = 0usize;
+    let mut blocked = 0usize;
+    with_irqs_disabled(|| {
+        for i in 0..MAX_PROCESSES {
+            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
+                continue;
+            }
+            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
+            if ptr.is_null() {
+                continue;
+            }
+            total += 1;
+            match unsafe { &*ptr }.state {
+                crate::process::types::ProcessState::Ready
+                | crate::process::types::ProcessState::Running => running += 1,
+                crate::process::types::ProcessState::Blocked => blocked += 1,
+                crate::process::types::ProcessState::Zombie(_) => {}
+            }
+        }
+    });
+    (total, running, blocked)
+}
+
 // ── Thread PID map and lazy regions (unchanged) ─────────────────────────
 
 /// Maps kernel thread IDs to PIDs for CLONE_THREAD children.
