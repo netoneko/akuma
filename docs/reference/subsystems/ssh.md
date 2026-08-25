@@ -125,6 +125,26 @@ limitations accepted and documented rather than silently left).
   (`SPAWN_FLAG_PTY`): child gets a **fresh** Arc so multiplexed daemons (sshd)
   don't alias `input_waker` slots across sessions — this is why sshd reaches the
   child's state via `TIOCSWINSZ` on the `ChildStdout(pid)` fd rather than its own.
+- **Fresh terminal on a box crossing, independent of `pty`.** The inheritance
+  decision (`spawn_inherits_terminal`, `crates/akuma-exec/src/process/spawn.rs`)
+  is `!pty && box_id == 0`, not just `!pty`. `SPAWN_EXT` — what `box
+  run`/herd's per-service launch use — always passes `pty=false` (a boxed
+  process's stdin is correctly a plain pipe, not a pty), but before
+  2026-08-26 that meant a spawn into a *different* box still inherited the
+  caller's `TerminalState` object rather than getting its own. Sharing it
+  across the box boundary was a real leak, not just an `isatty()` mismatch:
+  every spawn overwrites `foreground_pgid` on whichever object it ends up
+  with, so the boxed process's pid silently became the *caller's own
+  terminal's* `Ctrl+C` target too, and any raw-mode/`ECHO` ioctl the boxed
+  process made mutated the caller's termios right along with it. `box_id ==
+  0` (`SPAWN_EXT`'s "stay in the caller's box" case, and every plain
+  `sys_spawn`) is unaffected and keeps inheriting, matching a real shell
+  subprocess sharing its parent's controlling terminal. Host-tested directly
+  (`spawn.rs`'s `terminal_inheritance_tests`) and end-to-end
+  (`test_box_crossing_spawn_gets_fresh_terminal_state`,
+  `src/process_tests.rs`, `sc-containers`-gated): registers a `TerminalState`
+  under the test thread's id, spawns once same-box and once into a fresh
+  box, and compares `Arc` identity both times.
 - **Key translation** (`akuma_ssh::util::translate_input_keys`): the
   `EscapeState` machine (Normal→Escape→Bracket→`BracketNum(u8)`→Normal) turns
   xterm sequences into actions: Delete `\x1b[3~`, Home `\x1b[1~`, End `\x1b[4~`,

@@ -65,6 +65,14 @@ which left every ancestry check blind. Full write-up:
 [`../../archive/BOX_ISOLATION_SECURITY_FIXES.md`](../../archive/BOX_ISOLATION_SECURITY_FIXES.md).
 Regression: `test_box_isolation_syscall_guards` in the boot suite.
 
+**A `SPAWN_EXT(box_id != 0)` that clears `can_access_box` still needs its own
+`TerminalState`, not the caller's.** That's a data-isolation gap, not an
+access-control one — `can_access_box` correctly decides *whether* the spawn
+is allowed, but until 2026-08-26 nothing stopped the spawned process from
+sharing the calling shell's termios/`foreground_pgid`/`input_waker` object
+once it was. See [`ssh.md`](ssh.md) "Terminal handling" § "Fresh terminal on
+a box crossing" for the mechanism and the regression tests.
+
 ### Two ways a box gets rump
 
 1. **`rump-default` (devbox):** the kernel marks box 0 rump at boot and brings

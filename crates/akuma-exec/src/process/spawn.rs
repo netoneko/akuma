@@ -187,6 +187,23 @@ pub fn spawn_process_with_channel_cwd(
     spawn_process_with_channel_ext(path, args, env, stdin, cwd, 0, false)
 }
 
+/// Whether a spawn should inherit the caller's `TerminalState` rather than
+/// get a fresh one.
+///
+/// `false` on either condition alone is enough — a `pty` spawn always gets a
+/// fresh terminal (a multiplexing daemon's sessions must not alias
+/// `input_waker`), and so does any spawn that crosses into a different box
+/// (`box_id != 0`, `SPAWN_EXT`'s "enter this box" signal): sharing the
+/// object across the box boundary lets a boxed process's ioctl or
+/// foreground-pgid change reach back into the caller's own terminal. Pulled
+/// out as a pure function so the decision is host-testable without a running
+/// kernel — see `spawn_process_with_channel_ext`'s doc comment for the full
+/// story and `docs/reference/subsystems/ssh.md` "Terminal handling".
+#[must_use]
+const fn spawn_inherits_terminal(pty: bool, box_id: u64) -> bool {
+    !pty && box_id == 0
+}
+
 /// Extended version of spawn_process_with_channel.
 ///
 /// `pty`: when `true`, the child's channel is marked as a real terminal
@@ -194,6 +211,12 @@ pub fn spawn_process_with_channel_cwd(
 /// echo, line editing) runs on its stdin — for interactive sessions that
 /// allocate a pty (e.g. sshd handling a client's `pty-req` for a login shell).
 /// When `false` (the default for piped spawns) the child's stdin is a raw pipe.
+///
+/// `box_id`: `0` stays in the caller's own box (an ordinary same-session
+/// spawn); nonzero crosses into that box. Independent of `pty`, a nonzero
+/// `box_id` also forces a **fresh** `TerminalState` instead of inheriting the
+/// caller's — see the box-crossing branch below for why sharing one across
+/// the box boundary is a real leak, not just an isatty() mismatch.
 pub fn spawn_process_with_channel_ext(
     path: &str,
     args: Option<&[&str]>,
@@ -379,10 +402,11 @@ pub fn spawn_process_with_channel_ext(
     process.channel = Some(channel.clone());
 
     // Inherit terminal state from caller if available — but NOT for a `pty`
-    // spawn. `pty` means "give the child a brand-new controlling terminal"
-    // (real Unix semantics: allocating a new pty starts a new session, it
-    // does not share the allocator's terminal). A multiplexing daemon — one
-    // OS process/thread serving many independent interactive sessions, e.g.
+    // spawn, and NOT for a spawn that crosses into a different box. `pty`
+    // means "give the child a brand-new controlling terminal" (real Unix
+    // semantics: allocating a new pty starts a new session, it does not
+    // share the allocator's terminal). A multiplexing daemon — one OS
+    // process/thread serving many independent interactive sessions, e.g.
     // userspace sshd handling several concurrent SSH connections — has
     // exactly one `terminal_state` on itself; inheriting it for every
     // spawned pty session would make them all share one `input_waker` slot
@@ -390,13 +414,29 @@ pub fn spawn_process_with_channel_ext(
     // waker there, but a stdin write for session A wakes whatever waker is
     // *currently* in that shared slot instead of targeting the right pid —
     // so B can permanently miss its wakeup while A keeps using its terminal,
-    // and only resumes once A exits and stops re-registering. `Process::new`
-    // already gives every process its own fresh `TerminalState`
-    // (`process/mod.rs`), so a `pty` spawn just keeps that instead of
-    // overwriting it. Non-pty spawns (plain fork/exec within an existing
-    // session) keep inheriting, matching a real shell subprocess sharing its
-    // parent's controlling terminal.
-    if !pty && let Some(shared_state) = current_terminal_state() {
+    // and only resumes once A exits and stops re-registering.
+    //
+    // `box_id != 0` is the same shape of bug at the box boundary rather than
+    // the session boundary: `SPAWN_EXT` (what `box run`/herd's per-service
+    // launch use) always passes `pty=false` — a boxed process's stdin is a
+    // plain pipe by default, not a pty, so line discipline stays correctly
+    // off — but before this check that meant the box's init process kept
+    // *sharing* the calling shell's `TerminalState` object rather than
+    // getting its own. That's not just a naming mismatch: `foreground_pgid`
+    // gets overwritten to the box's pid a few lines below on the SAME shared
+    // object, silently repointing the caller's own terminal's `Ctrl+C`
+    // target at a process in a different box; and any ioctl the boxed
+    // process makes against its "own" termios (raw mode, ECHO) mutates the
+    // caller's terminal too. `box_id == 0` (SPAWN_EXT's "stay in the
+    // caller's box" case, and every non-EXT `sys_spawn` call) is unaffected
+    // and keeps inheriting, matching a real shell subprocess sharing its
+    // parent's controlling terminal. See `docs/reference/subsystems/ssh.md`
+    // "Terminal handling".
+    //
+    // `Process::new` already gives every process its own fresh
+    // `TerminalState` (`process/mod.rs`), so either condition just keeps
+    // that instead of overwriting it.
+    if spawn_inherits_terminal(pty, box_id) && let Some(shared_state) = current_terminal_state() {
         if config().syscall_debug_info_enabled {
             log::debug!("[Process] Inheriting shared terminal state at {:p} for PID {}", Arc::as_ptr(&shared_state), process.pid);
         }
@@ -404,6 +444,8 @@ pub fn spawn_process_with_channel_ext(
     } else if config().syscall_debug_info_enabled {
         if pty {
             log::debug!("[Process] Fresh (non-inherited) terminal state for pty spawn PID {}", process.pid);
+        } else if box_id != 0 {
+            log::debug!("[Process] Fresh (non-inherited) terminal state for box-crossing spawn (box={}) PID {}", box_id, process.pid);
         } else {
             log::debug!("[Process] NO shared terminal state found for caller thread {}, using default for PID {}", crate::threading::current_thread_id(), process.pid);
         }
@@ -567,6 +609,40 @@ pub(crate) fn run_registered_process(pid: Pid) -> ! {
     }
     // Reached only if the process vanished between spawn and first run.
     panic!("Process not found in run_registered_process");
+}
+
+#[cfg(test)]
+mod terminal_inheritance_tests {
+    use super::spawn_inherits_terminal;
+
+    /// Plain same-box spawn (`sys_spawn`, or `SPAWN_EXT` with `box_id == 0`)
+    /// — a shell subprocess sharing its parent's controlling terminal.
+    #[test]
+    fn same_box_non_pty_spawn_inherits() {
+        assert!(spawn_inherits_terminal(false, 0));
+    }
+
+    /// `SPAWN_FLAG_PTY` (sshd handling a client `pty-req`) always gets a
+    /// fresh terminal, box-crossing or not.
+    #[test]
+    fn pty_spawn_never_inherits_even_in_the_same_box() {
+        assert!(!spawn_inherits_terminal(true, 0));
+    }
+
+    /// The bug this predicate fixes: `box run`/herd's per-service launch go
+    /// through `SPAWN_EXT` with `pty=false` and a nonzero target `box_id` —
+    /// before this existed, that combination inherited the caller's
+    /// `TerminalState`, leaking `foreground_pgid`/termios changes across the
+    /// box boundary (docs/reference/subsystems/ssh.md "Terminal handling").
+    #[test]
+    fn box_crossing_spawn_never_inherits_even_without_pty() {
+        assert!(!spawn_inherits_terminal(false, 7));
+    }
+
+    #[test]
+    fn box_crossing_pty_spawn_never_inherits() {
+        assert!(!spawn_inherits_terminal(true, 7));
+    }
 }
 
 #[cfg(test)]

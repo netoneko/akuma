@@ -324,6 +324,8 @@ pub fn run_all_tests() {
     // Test that a spawned child's channel is non-terminal (isatty == false)
     test_spawned_child_not_a_tty();
     test_spawned_child_pty_is_a_tty();
+    #[cfg(feature = "sc-containers")]
+    test_box_crossing_spawn_gets_fresh_terminal_state();
 
     // Test Linux compatibility bridging (vfork/execve)
     test_linux_process_abi();
@@ -7863,6 +7865,97 @@ fn test_spawned_child_pty_is_a_tty() {
         crate::safe_print!(96, "[Test] FAIL: pty spawn's channel is not a terminal (isatty would be false)\n");
     }
     akuma_exec::threading::cleanup_terminated();
+}
+
+/// Regression test for the cross-box `TerminalState` leak fixed 2026-08-26
+/// (`spawn_inherits_terminal` in `crates/akuma-exec/src/process/spawn.rs`):
+/// `SPAWN_EXT` (what `box run`/herd's per-service launch use) always passes
+/// `pty=false`, so before the fix a spawn into a *different* box still
+/// inherited the caller's `TerminalState` object — the same one `pty=false`
+/// alone was already correctly protecting for same-box spawns. That let a
+/// boxed process's raw-mode ioctl, or the `foreground_pgid` overwrite every
+/// spawn does on whichever object it ends up with, reach back into the
+/// calling shell's own terminal. See `docs/reference/subsystems/ssh.md`
+/// "Terminal handling".
+///
+/// Real end-to-end coverage (not just the pure predicate in `spawn.rs`'s own
+/// `terminal_inheritance_tests`): registers a `TerminalState` under this
+/// test's own thread id — exactly what `current_terminal_state()` checks
+/// first — then spawns once same-box (must inherit it) and once into a
+/// fresh box (must not), comparing `Arc` identity both times.
+#[cfg(feature = "sc-containers")]
+fn test_box_crossing_spawn_gets_fresh_terminal_state() {
+    use akuma_exec::process::{
+        spawn_process_with_channel_ext, register_terminal_state, remove_terminal_state,
+        lookup_process_shared, register_box, unregister_box, BoxInfo,
+    };
+    use akuma_exec::threading::current_thread_id;
+    use alloc::sync::Arc;
+    use alloc::string::String;
+    use spinning_top::Spinlock;
+
+    const HELLO_PATH: &str = "/bin/hello";
+    if !check_binary_exists(HELLO_PATH) {
+        crate::safe_print!(64, "[Test] box-crossing-spawn-fresh-terminal: SKIPPED (binary absent)\n");
+        return;
+    }
+
+    const TEST_BOX: u64 = 0x005E_C0FF;
+    register_box(BoxInfo {
+        id: TEST_BOX,
+        name: String::from("ttyleak_test"),
+        root_dir: String::from("/"),
+        creator_pid: 1,
+        primary_pid: 1,
+        parent_box_id: Some(0),
+    });
+
+    let tid = current_thread_id();
+    let injected = Arc::new(Spinlock::new(akuma_terminal::TerminalState::default()));
+    register_terminal_state(tid, injected.clone());
+
+    let mut fails = 0u32;
+    let args = &["1", "1"];
+
+    match spawn_process_with_channel_ext(HELLO_PATH, Some(args), None, None, None, 0, false) {
+        Ok((_tid, _ch, pid)) => {
+            let inherited = lookup_process_shared(pid)
+                .is_some_and(|p| Arc::ptr_eq(&p.terminal_state, &injected));
+            if !inherited {
+                fails += 1;
+                crate::safe_print!(96, "[Test] FAIL: same-box spawn did not inherit terminal_state\n");
+            }
+        }
+        Err(e) => {
+            fails += 1;
+            crate::safe_print!(96, "[Test] FAIL: same-box hello spawn failed: {}\n", e);
+        }
+    }
+
+    match spawn_process_with_channel_ext(HELLO_PATH, Some(args), None, None, None, TEST_BOX, false) {
+        Ok((_tid, _ch, pid)) => {
+            let leaked = lookup_process_shared(pid)
+                .is_some_and(|p| Arc::ptr_eq(&p.terminal_state, &injected));
+            if leaked {
+                fails += 1;
+                crate::safe_print!(96, "[Test] FAIL: box-crossing spawn leaked the caller's terminal_state\n");
+            }
+        }
+        Err(e) => {
+            fails += 1;
+            crate::safe_print!(96, "[Test] FAIL: boxed hello spawn failed: {}\n", e);
+        }
+    }
+
+    remove_terminal_state(tid);
+    unregister_box(TEST_BOX);
+    akuma_exec::threading::cleanup_terminated();
+
+    if fails == 0 {
+        crate::safe_print!(64, "[Test] box-crossing-spawn-fresh-terminal: PASSED\n");
+    } else {
+        panic!("test_box_crossing_spawn_gets_fresh_terminal_state: {fails} case(s) failed");
+    }
 }
 
 /// POSIX requires that on exec, custom signal handlers are reset to SIG_DFL and
