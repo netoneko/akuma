@@ -100,8 +100,9 @@ ready) and `/proc/self/exe` before ever touching the real filesystem — see
 
 Only `open()` behavior lives here. **What a device path *is*** — whether it
 exists, and what `stat` reports — comes from one table (`akuma_vfs::dev`, via
-`crate::vfs::dev_node`); see `../vfs.md` "/dev", including why `open()` on
-`/dev/vda`..`vdd` is `ENODEV` and why a box sees no synthetic `/dev`.
+`crate::vfs::dev_node`); see `../vfs.md` "/dev", including the raw block fd
+`open()` on `/dev/vda`..`vdd` now returns (write-open refused `EBUSY` on a
+mounted device) and why a box sees no synthetic `/dev`.
 
 For a real path:
 - File doesn't exist and `O_CREAT` not set → `ENOENT`.

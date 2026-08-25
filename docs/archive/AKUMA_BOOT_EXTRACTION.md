@@ -173,56 +173,35 @@ reboot mechanism itself — recorded so the next session doesn't re-derive them.
 
 ## 5. Open: no `/dev` at all
 
-> **Half closed 2026-08-25, and re-validated the same day.** The "no `/dev` at
-> all" premise below is **no longer true** — `/dev` now lists and `stat`s, so
-> the devtmpfs-equivalent half of this section's two options is done
-> (`DEVFS_MISSING.md`, [`../reference/subsystems/vfs.md`](../reference/subsystems/vfs.md)
-> "/dev"). **The loop is still blocked**, on the *other* half.
+> **Closed 2026-08-25, both halves, and the full loop driven live.** The "no
+> `/dev` at all" premise below is **no longer true** either half: `/dev` lists
+> and `stat`s (`DEVFS_MISSING.md`), and `open()` on `vda`..`vdd` now returns a
+> working raw block fd
+> ([`RAW_BLOCK_DEVICE_FD.md`](RAW_BLOCK_DEVICE_FD.md)) —
+> [`../reference/subsystems/vfs.md`](../reference/subsystems/vfs.md) "/dev" is
+> current state for both.
 >
 > Measured on a `devbox-smoltcp` boot with `KERNEL_DROPOFF=1` (`INSTANCE=1`,
-> `DISK=devbox.img`, ssh `:2322`). The kernel enumerates both drives —
-> `[Block] Registered vda: 6144 MB` and `[Block] Registered vdb: 1 MB`, the
-> drop-off drive — and in-guest:
+> `DISK=devbox.img`, ssh `:2322`), after the fix:
 >
 > ```
-> # ls -l /dev
-> brw-rw----  1 root root  254,  0  vda
-> brw-rw----  1 root root  254, 16  vdb        <- the drop-off drive, now visible
-> # stat /dev/vdb
->   Size: 0   Blocks: 0   IO Block: 4096   block special file
->   Device type: fe,10   Inode: 33   Access: (0660/brw-rw----)
-> # dd if=/dev/zero of=/dev/vdb bs=512 count=1
-> dd: can't open '/dev/vdb': No such device      <- rc=1
-> # dd if=/dev/vdb of=/dev/null bs=512 count=1
-> dd: can't open '/dev/vdb': No such device      <- rc=1, reads fail too
+> # dd if=/tmp/randchunk of=/dev/vdb bs=512 count=4   # 4+0 records out
+> # dd if=/dev/vdb of=/tmp/vdb_readback bs=512 count=4 && md5sum /tmp/vdb_readback
+> 211bb9b1e03b62129335e27ad650a1c6  /tmp/vdb_readback   # matches the source
+> # dd if=/dev/zero of=/dev/vda bs=512 count=1
+> dd: can't open '/dev/vda': Resource busy            <- mounted-device write refused, by design
 > ```
 >
-> So the remaining blocker is now exact and singular: **`open()` on a block
-> device node returns `ENODEV`**, by deliberate design —
-> `DEVFS_MISSING.md` §4 ruled a raw block fd out of scope for having "no
-> consumer today", and `sys_openat` refuses those nodes explicitly so the
-> generic path cannot hand out a `File` fd that fails on first `read()`.
-> **This loop is that consumer**, which retires §4's rationale.
->
-> What it takes to finish, all of it contained (the block layer already
-> exposes byte-granular, arbitrary-offset `read_bytes_at(idx, off, buf)` /
-> `write_bytes_at(idx, off, buf)`, so no sector-alignment work lands on the
-> caller):
->
-> 1. A `FileDescriptor::BlockDev { idx, pos }` variant — it needs a position,
->    since `dd` reads and writes sequentially.
-> 2. `sys_openat`: for a block `dev_node`, resolve the name through
->    `block::device_index_by_name` and allocate that fd instead of returning
->    `ENODEV`.
-> 3. `sys_read` / `sys_write` arms at the fd's position, advancing it and
->    clamping at `capacity_bytes()`; `sys_lseek` for `SEEK_END` sizing.
-> 4. `fstat` on the fd, and a name for it in `/proc/<pid>/fd` (`vfs/proc.rs`).
->
-> One design question to settle first, which is *not* mechanical: a raw write
-> to `vda` goes behind `Ext2Filesystem`'s cache, leaving it stale against the
-> disk. Harmless for `vdb` (never mounted), silently corrupting for a mounted
-> device. Either refuse `O_WRONLY`/`O_RDWR` on a mounted device or invalidate
-> the cache on write — decide before wiring step 3.
+> Then the loop itself: `reboot -f` from inside the guest (plain `reboot`
+> fails `EPERM` — busybox tries to signal init first, unrelated to this
+> kernel) exited QEMU cleanly, and `cargo_runner.sh`'s `KERNEL_DROPOFF` loop
+> relaunched with the same `akuma.bin` and booted clean — the mechanism the
+> self-host build closes the loop with, procedure in
+> `docs/runbooks/selfhost-kernel-build.md` § "Swap the running kernel in
+> place". Full writeup, the design decision on mounted-device writes (settled:
+> refuse with `EBUSY`, not invalidate the cache), and an unrelated `cargo run`
+> ambiguity this work also fixed:
+> [`RAW_BLOCK_DEVICE_FD.md`](RAW_BLOCK_DEVICE_FD.md).
 >
 > The original text follows verbatim; note its claim that `mount /dev/vdb /mnt
 > -t ext2` "does not actually work today" is about the *path* not existing.

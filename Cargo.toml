@@ -72,6 +72,11 @@ name = "akuma"
 version = "0.0.7"
 edition = "2024"
 license = "BSD-2-Clause"
+# Disambiguates `cargo run` at the workspace root now that akuma-scheduler's
+# `sched-sim` bin sits in `default-members` alongside this package — without
+# it, `cargo run` (bare, the command CLAUDE.md and every `overlays/devbox/run*.sh`
+# script actually invoke) refuses to guess between the two and errors out.
+default-run = "akuma"
 
 [[bin]]
 name = "akuma"

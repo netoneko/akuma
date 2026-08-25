@@ -215,6 +215,16 @@ pub enum FileDescriptor {
     TimerFd(u32),
     EpollFd(u32),
     PidFd(u32),
+    /// Raw fd onto a virtio block device (`/dev/vdX`), addressed by
+    /// `akuma_virtio::block` index. `pos` is the byte offset `read`/`write`
+    /// advance (`dd` is sequential; `lseek` also updates it). `writable` is
+    /// fixed at open time: an `O_RDONLY` fd cannot be upgraded by anything
+    /// after the open-time mounted-device check
+    /// (`proposals/RAW_BLOCK_DEVICE_FD.md` §3 — a raw write to a *mounted*
+    /// device bypasses `Ext2Filesystem`'s cache, so write-open of a mounted
+    /// device is refused with `EBUSY` and only ever an unmounted device like
+    /// the `KERNEL_DROPOFF` drive gets a writable fd).
+    BlockDev { idx: u32, pos: u64, writable: bool },
 }
 
 /// Cached directory entry for stable getdents64 enumeration.

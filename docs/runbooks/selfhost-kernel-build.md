@@ -764,6 +764,70 @@ Decoding the load base from the kernel's own `[IA-DP]` line
 `_armv8_sve2_probe`, `_armv8_cpuid_probe`, `_armv8_sm3_probe`) immediately
 followed by `CRYPTO_memcmp` / `OPENSSL_cleanse`.
 
+## 7. Swap the running kernel in place (`KERNEL_DROPOFF`)
+
+Everything above ends with pulling the built ELF *out* of the guest and
+booting it on a fresh disk/VM (§"Verify" below) — useful for a one-off check,
+but it never actually lets the guest boot into what it just built. As of
+2026-08-25 there's a shorter loop: raw block-device fds
+([`../archive/RAW_BLOCK_DEVICE_FD.md`](../archive/RAW_BLOCK_DEVICE_FD.md))
+mean a guest process can `dd` a new kernel straight onto the drop-off drive
+and `reboot(2)` into it, with the host-side relaunch handled automatically.
+
+**Prerequisite:** boot with `KERNEL_DROPOFF=1`. This mounts the host's own
+`akuma.bin` — the exact file `-kernel` points QEMU at — as a second
+virtio-blk drive (`/dev/vdb` on a fresh devbox-smoltcp boot, next to `/dev/vda`
+the rootfs). `scripts/cargo_runner.sh` pairs it with `-action reboot=shutdown`
+unconditionally, so a guest `reboot(2)` exits QEMU cleanly and the runner's own
+`while` loop relaunches, re-reading `-kernel` from whatever is now on disk.
+
+```sh
+INSTANCE=1 KERNEL_DROPOFF=1 DEVBOX_DISK=devbox.img overlays/devbox/run-smoltcp.sh
+```
+
+**In guest**, after a self-host build (§4/§5) produces a fresh ELF, flatten it
+and drop it onto the drive:
+
+```sh
+rust-objcopy -O binary target/aarch64-unknown-none/release/akuma /tmp/new_akuma.bin
+dd if=/tmp/new_akuma.bin of=/dev/vdb bs=1M
+reboot -f
+```
+
+**`reboot -f`, not bare `reboot`** — busybox's plain `reboot` tries to signal
+an init process first and fails `EPERM` on this kernel (no init to signal);
+`-f` calls `reboot(2)` directly and is what actually exits QEMU.
+
+If the guest toolchain has no `rust-objcopy`/`llvm-objcopy`, pull the ELF out
+and flatten it on the host first (§"Verify" below has the `base64` extraction
+command), then `scp`/base64 the `.bin` back in before the final `dd` — the
+`dd`-onto-`/dev/vdb` step is the same either way.
+
+**Host side**, confirm the relaunch and that it's actually the new build:
+
+```sh
+grep -a 'relaunching with the current' <boot.log>
+ssh -o UserKnownHostsFile=/dev/null -p <ssh-port> root@localhost uname -a
+```
+
+**Gate on the `uname -a` git hash over ssh, not on a console string** —
+cross-core console interleaving can tear boot markers at `SMP>1`
+([`../archive/DEVBOX_ISSUES.md`](../archive/DEVBOX_ISSUES.md) Issue 3).
+
+Two things that bite:
+
+- **`/dev/vdb` under `KERNEL_DROPOFF=1` *is* `akuma.bin`, live, not
+  snapshotted** — unlike `DISK` under `INSTANCE>0`. A bad `dd` here corrupts
+  the exact file the next relaunch boots from. Back it up, or be ready to
+  rebuild it (`cargo build --release`, then `rust-objcopy -O binary <elf>
+  <elf>.bin` — what `cargo_runner.sh` does unconditionally on every `cargo
+  run`) before trusting the next reboot.
+- **This only works against the unmounted drop-off drive.** Write-open of a
+  *mounted* device — i.e. trying the same trick against `/dev/vda`, the
+  rootfs — is refused `EBUSY` by design, so it can't be used to self-modify
+  the running root filesystem's backing image this way. Reads are
+  unrestricted on every device.
+
 ## Verify
 
 - `/usr/local/bin/rustc --version` contains `"nightly"`.

@@ -16,11 +16,14 @@ session; §5 is the ordered build list for when the work starts.
 >    decision to keep this simple, not part of the original design. `null` and
 >    `zero` still `stat` in a box so nothing regresses; `/dev/net/tap0` is
 >    unaffected, so a `stack = rump` box keeps its NIC. See vfs.md.
-> 2. **`open()` on `vda`..`vdd` returns `ENODEV`** rather than falling through.
->    §4 rules out a raw block fd, but once `crate::fs::exists` knows the node,
->    the generic path would hand out a `File` fd whose first `read()` fails
->    against ext2 — an error at the wrong syscall. `ENODEV` matches the
->    `/dev/net/tap0` precedent in the same function.
+> 2. **`open()` on `vda`..`vdd` returned `ENODEV`** rather than falling
+>    through, matching the `/dev/net/tap0` precedent in the same function —
+>    §4 ruled out a raw block fd, since once `crate::fs::exists` knew the
+>    node, the generic path would otherwise hand out a `File` fd whose first
+>    `read()` fails against ext2. **Superseded 2026-08-25**: §4's rationale
+>    ("no consumer today") was retired once the `KERNEL_DROPOFF` loop became
+>    that consumer — `open()` on a block node now returns a working raw fd.
+>    See [`RAW_BLOCK_DEVICE_FD.md`](RAW_BLOCK_DEVICE_FD.md).
 > 3. **`getdents64` and `sys_fchmodat` were converted too**, beyond §5's four
 >    steps: the former so device nodes report `DT_CHR`/`DT_BLK` instead of
 >    `DT_REG`, the latter because its `/dev/null || /dev/zero` no-op was a fifth

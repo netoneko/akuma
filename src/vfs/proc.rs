@@ -259,6 +259,10 @@ impl ProcFilesystem {
             FileDescriptor::Stderr => String::from("/dev/stderr"),
             FileDescriptor::ChildStdout(child_pid) => format!("pipe:[child:{child_pid}]"),
             FileDescriptor::PidFd(id) => format!("anon_inode:[pidfd:{id}]"),
+            FileDescriptor::BlockDev { idx, .. } => match crate::block::device_name(*idx as usize) {
+                Some(name) => format!("/dev/{name}"),
+                None => format!("blockdev:[{idx}]"),
+            },
         }
     }
 

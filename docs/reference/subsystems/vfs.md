@@ -105,7 +105,7 @@ Two halves, deliberately kept apart:
 | Concern | Where | Covers |
 |---|---|---|
 | **What exists** (`ls`, `stat`, `statx`, `access`, `chmod`) | `akuma_vfs::dev`, one table | `null`, `zero`, `random`, `urandom`, `dsp`/`audio`, `vda`..`vdd` |
-| **What `open()` does** | `sys_openat`'s per-device blocks (`src/syscall/fs.rs`) | the same list minus `vd*`, plus `/dev/net/tap0` |
+| **What `open()` does** | `sys_openat`'s per-device blocks (`src/syscall/fs.rs`) | the same list, plus `vda`..`vdd` (raw block fd) and `/dev/net/tap0` |
 
 `akuma_vfs::dev` (`crates/akuma-vfs/src/dev.rs`) is pure data: every entry is a
 function of a `DevProbe` (`audio`, `block_slots`, `in_box`), so the whole table
@@ -128,14 +128,20 @@ each hardcoded `/dev/null` and `/dev/zero` independently, so `/dev/random`,
 
 Details that bite:
 
-- **`open()` on `vda`..`vdd` is `ENODEV`, deliberately.** They list and `stat`,
-  but nothing reads a disk except through `Ext2Filesystem`, so a raw block fd
-  has no consumer. `mount(2)` resolves its `source` by *name*
+- **`open()` on `vda`..`vdd` returns a working raw block fd**
+  (`FileDescriptor::BlockDev { idx, pos, writable }`,
+  [`../../archive/RAW_BLOCK_DEVICE_FD.md`](../../archive/RAW_BLOCK_DEVICE_FD.md),
+  implemented 2026-08-25) — `read`/`write`/`lseek`/`fstat` all work, backed by
+  the block driver's byte-granular `read_bytes_at`/`write_bytes_at`
+  (`crates/akuma-virtio/src/block.rs`), so no sector-alignment burden lands on
+  the syscall layer. **Write-open of a *mounted* device is refused with
+  `EBUSY`** (`crate::vfs::device_is_mounted`) — a raw write bypasses
+  `Ext2Filesystem`'s cache, so this is what keeps a stray `dd` onto the
+  mounted root (`vda`) from silently corrupting it. Reads are unrestricted on
+  every device. `mount(2)` still resolves its `source` by *name*
   (`device_index_by_name` strips an optional `/dev/` prefix and never touches
-  the filesystem), so mounting a second disk needs none of this. The explicit
-  refusal exists because `crate::fs::exists` now says yes — without it the
-  generic path would hand out a `File` fd whose first `read()` fails against
-  ext2, moving the error to the wrong syscall.
+  the filesystem or this fd machinery), so mounting a second disk needs none
+  of this.
 - **`/dev` itself is synthesized when the image has no real one**, otherwise
   `ls /dev` would fail at `open("/dev")` before reaching the listing.
 - **A real on-disk node shadows a synthetic one**, matching how a mount point

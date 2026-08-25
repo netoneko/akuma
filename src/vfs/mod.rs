@@ -766,6 +766,30 @@ pub fn is_dev_dir(path: &str) -> bool {
     resolve_absolute(trimmed) == DEV_DIR
 }
 
+/// Whether `name` (a `/dev`-relative block device name, e.g. `"vda"`) is the
+/// source of any mount in the global table — the check that keeps a raw
+/// write-open off a device `Ext2Filesystem` is caching
+/// (`proposals/RAW_BLOCK_DEVICE_FD.md` §3). Root mounts with source
+/// `/dev/vda` (`src/fs.rs`), so this strips an optional `/dev/` prefix off
+/// each recorded source before comparing.
+///
+/// Only the global table needs scanning: block nodes are invisible inside a
+/// box (`DevProbe::in_box`), so a raw block open never reaches here for a
+/// per-namespace mount.
+pub fn device_is_mounted(name: &str) -> bool {
+    let table = MOUNT_TABLE.lock();
+    let Some(t) = table.as_ref() else { return false };
+    let mut found = false;
+    t.for_each_mount(|row| {
+        if let Some(source) = row.source
+            && source.strip_prefix("/dev/").unwrap_or(source) == name
+        {
+            found = true;
+        }
+    });
+    found
+}
+
 /// The synthetic entries `ls /dev` should show, empty for every other path.
 fn dev_entries(path: &str) -> Vec<DirEntry> {
     if !is_dev_dir(path) {

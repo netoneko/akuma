@@ -531,6 +531,31 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 Err(e) => fs_error_to_errno(e)
             }
         }
+        akuma_exec::process::FileDescriptor::BlockDev { idx, pos, .. } => {
+            // Raw block read (`proposals/RAW_BLOCK_DEVICE_FD.md`) — same BKL
+            // discipline as the `File` arm above, since it's the same
+            // underlying disk I/O `crate::vfs::ext2` drives.
+            let _vfs_bkl = VfsBklGuard::new();
+            let capacity = crate::block::with_device_at(idx as usize, akuma_virtio::block::VirtioBlockDevice::capacity_bytes).unwrap_or(0);
+            if pos >= capacity {
+                0 // EOF: dd reading past the end of the device
+            } else {
+                let to_read = count.min((capacity - pos) as usize).min(64 * 1024);
+                let mut temp = alloc::vec![0u8; to_read];
+                match crate::block::read_bytes_at(idx as usize, pos, &mut temp) {
+                    Ok(()) => {
+                        if copy_to_user(buf_ptr, &temp).is_err() {
+                            return EFAULT;
+                        }
+                        if let Some(proc) = akuma_exec::process::current_process_shared() {
+                            proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::BlockDev { pos, .. } = entry { *pos += to_read as u64; });
+                        }
+                        to_read as u64
+                    }
+                    Err(_) => EIO,
+                }
+            }
+        }
         #[cfg(feature = "smoltcp")]
         akuma_exec::process::FileDescriptor::Socket(idx) => {
             // read(2) on a TCP socket is sshd's hot recv path — run it BKL-free
@@ -899,7 +924,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // the O_APPEND `file_size` probe below already hits the VFS — so the guard spans the
     // function and is armed only for `File` fds (`new_if`). Every other fd kind (tty,
     // pipe, socket, /dev/*) keeps the BKL.
-    let _vfs_bkl = VfsBklGuard::new_if(matches!(fd, akuma_exec::process::FileDescriptor::File(_)));
+    let _vfs_bkl = VfsBklGuard::new_if(matches!(fd, akuma_exec::process::FileDescriptor::File(_) | akuma_exec::process::FileDescriptor::BlockDev { .. }));
 
     // For File descriptors, reserve the initial position now (before the loop) —
     // atomically read-and-advance, not a clone-then-write-back-later. `fd` is a
@@ -920,6 +945,12 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 None => f.position,
             }
         }
+    } else if let akuma_exec::process::FileDescriptor::BlockDev { pos, .. } = fd {
+        // No `reserve_write_pos`-style upfront reservation — the one intended
+        // consumer (`dd` onto the drop-off drive, `proposals/RAW_BLOCK_DEVICE_FD.md`)
+        // is a single sequential writer; two processes racing writable fds on
+        // the same unmounted device is unguarded, same as Linux raw block I/O.
+        pos as usize
     } else {
         0
     };
@@ -1059,6 +1090,28 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         return fs_error_to_errno(e);
                     }
                 }
+            }
+            akuma_exec::process::FileDescriptor::BlockDev { idx, writable, .. } => {
+                if !writable {
+                    if total_written > 0 { return total_written as u64; }
+                    return EBADF;
+                }
+                let capacity = crate::block::with_device_at(idx as usize, akuma_virtio::block::VirtioBlockDevice::capacity_bytes).unwrap_or(0);
+                if write_pos as u64 >= capacity {
+                    if total_written > 0 { return total_written as u64; }
+                    return ENOSPC;
+                }
+                let clamped = this_chunk.min((capacity - write_pos as u64) as usize);
+                if crate::block::write_bytes_at(idx as usize, write_pos as u64, &buf_slice[..clamped]).is_err() {
+                    if total_written > 0 { return total_written as u64; }
+                    return EIO;
+                }
+                write_pos += clamped;
+                let new_pos = write_pos as u64;
+                if let Some(proc) = akuma_exec::process::current_process_shared() {
+                    proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::BlockDev { pos, .. } = entry { *pos = new_pos; });
+                }
+                clamped as u64
             }
             #[cfg(feature = "smoltcp")]
             akuma_exec::process::FileDescriptor::Socket(idx) => {
@@ -1754,14 +1807,50 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         return ESRCH;
     }
 
+    // Raw block device open (`/dev/vdX`) — `proposals/RAW_BLOCK_DEVICE_FD.md`.
+    // `dev_node` only reports a block node here for the host (box_id == 0);
+    // boxes get no synthetic /dev, so this never fires for a box process.
+    if let Some(node) = crate::vfs::dev_node(&path)
+        && node.is_block
+    {
+        let Some(idx) = crate::block::device_index_by_name(node.name) else {
+            return ENODEV;
+        };
+        let accmode = flags & 0x3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+        let wants_write = accmode != akuma_exec::process::open_flags::O_RDONLY;
+        // A raw write to a *mounted* device would bypass `Ext2Filesystem`'s
+        // cache and corrupt it silently — refuse write-open, not write() itself,
+        // so the failure lands at the syscall the caller can actually see
+        // (§3's "Refuse write-open of a mounted device" option).
+        if wants_write && crate::vfs::device_is_mounted(node.name) {
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(128, "[syscall] openat({}) EBUSY (mounted, write requested)\n", &path);
+            }
+            return EBUSY;
+        }
+        if let Some(proc) = akuma_exec::process::current_process_shared() {
+            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::BlockDev {
+                idx: idx as u32,
+                pos: 0,
+                writable: wants_write,
+            });
+            if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+                proc.set_cloexec(fd);
+            }
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
+            }
+            return u64::from(fd);
+        }
+        return ESRCH;
+    }
+
     // Every device with `open()` behavior has returned by now. Anything still in
-    // the table is a node this kernel can list and `stat` but not open — the
-    // block devices, deliberately (`DEVFS_MISSING.md` §4: nothing reads a disk
-    // except through `Ext2Filesystem`, so a raw block fd has no consumer, and
-    // `mount(2)` resolves its source by name, not by fd). Refuse here: now that
-    // `crate::fs::exists` knows about them, the generic path below would
-    // otherwise hand out a `File` fd whose first `read()` fails against ext2 —
-    // a failure at the wrong syscall. `ENODEV` matches `/dev/net/tap0` above.
+    // the table is a node this kernel can list and `stat` but not open — chardevs
+    // with no fd behavior of their own. Refuse here: now that `crate::fs::exists`
+    // knows about them, the generic path below would otherwise hand out a `File`
+    // fd whose first `read()` fails against ext2 — a failure at the wrong
+    // syscall. `ENODEV` matches `/dev/net/tap0` above.
     if crate::vfs::dev_node(&path).is_some() {
         if crate::config::SYSCALL_DEBUG_IO_ENABLED {
             crate::safe_print!(256, "[syscall] openat({}) ENODEV (no fd behavior)\n", &path);
@@ -1989,33 +2078,48 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
         // exception can wait on the BKL from inside it, which is what makes the drop safe.
         let _vfs_bkl = VfsBklGuard::new_if(matches!(
             proc.get_fd(fd),
-            Some(akuma_exec::process::FileDescriptor::File(_))
+            Some(akuma_exec::process::FileDescriptor::File(_) | akuma_exec::process::FileDescriptor::BlockDev { .. })
         ));
 
         let mut new_pos = 0i64;
         let mut success = false;
         let mut bad_fd = true;
-        let mut is_file = false;
+        let mut is_seekable = false;
         proc.update_fd(fd, |entry| {
             bad_fd = false;
-            if let akuma_exec::process::FileDescriptor::File(f) = entry {
-                is_file = true;
-                let size = crate::fs::file_size(&f.path).unwrap_or(0) as i64;
-                new_pos = match whence { 0 => offset, 1 => f.position as i64 + offset, 2 => size + offset, _ => -1 };
-                if new_pos >= 0 {
-                    f.position = new_pos as usize;
-                    if new_pos == 0 { f.dir_cache = None; }
-                    success = true;
+            match entry {
+                akuma_exec::process::FileDescriptor::File(f) => {
+                    is_seekable = true;
+                    let size = crate::fs::file_size(&f.path).unwrap_or(0) as i64;
+                    new_pos = match whence { 0 => offset, 1 => f.position as i64 + offset, 2 => size + offset, _ => -1 };
+                    if new_pos >= 0 {
+                        f.position = new_pos as usize;
+                        if new_pos == 0 { f.dir_cache = None; }
+                        success = true;
+                    }
                 }
+                akuma_exec::process::FileDescriptor::BlockDev { idx, pos, .. } => {
+                    is_seekable = true;
+                    // SEEK_END needs the device's byte capacity — what `dd
+                    // seek=`/`skip=` (past the drop-off drive's known size)
+                    // and a plain size probe both need.
+                    let size = crate::block::with_device_at(*idx as usize, akuma_virtio::block::VirtioBlockDevice::capacity_bytes).unwrap_or(0) as i64;
+                    new_pos = match whence { 0 => offset, 1 => *pos as i64 + offset, 2 => size + offset, _ => -1 };
+                    if new_pos >= 0 {
+                        *pos = new_pos as u64;
+                        success = true;
+                    }
+                }
+                _ => {}
             }
         });
         if success {
             new_pos as u64
         } else if bad_fd {
             EBADF
-        } else if is_file {
-            // The fd is a real, seekable file but the requested offset/whence is
-            // invalid (negative result or unknown `whence`) → EINVAL.
+        } else if is_seekable {
+            // The fd is a real, seekable file/block device but the requested
+            // offset/whence is invalid (negative result or unknown `whence`) → EINVAL.
             EINVAL
         } else {
             // The fd exists but refers to a pipe, socket, terminal, eventfd, etc.
@@ -2057,6 +2161,30 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
         Some(akuma_exec::process::FileDescriptor::DevZero) => {
             stat = Stat { st_dev: 0, st_ino: 5, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 5), st_blksize: 4096, ..Default::default() };
             0
+        }
+        Some(akuma_exec::process::FileDescriptor::BlockDev { idx, .. }) => {
+            // Mirrors `sys_newfstatat`'s `dev_node` lookup for mode/major/minor/ino;
+            // `st_size` here is the one thing that lookup can't give (`DevNode` has
+            // no size field) — the raw fd knows its device index, so ask the block
+            // driver directly.
+            let node = crate::block::device_name(idx as usize).and_then(crate::vfs::dev_node_named);
+            let capacity = crate::block::with_device_at(idx as usize, akuma_virtio::block::VirtioBlockDevice::capacity_bytes).unwrap_or(0);
+            if let Some(node) = node {
+                stat = Stat {
+                    st_dev: 0,
+                    st_ino: node.ino,
+                    st_size: capacity as i64,
+                    st_mode: node.mode(),
+                    st_nlink: 1,
+                    st_rdev: makedev(u64::from(node.major), u64::from(node.minor)),
+                    st_blksize: 512,
+                    st_blocks: (capacity as i64) / 512,
+                    ..Default::default()
+                };
+                0
+            } else {
+                ENODEV
+            }
         }
         Some(akuma_exec::process::FileDescriptor::Tap { .. }) => {
             // /dev/net/tap0: char device. Linux's TUN/TAP is misc major 10, minor 200.
