@@ -83,10 +83,27 @@ PL031 at all** — `archive/MISSING_NTP_SYSCALLS.md` found the guest
 permanently stuck at epoch 0 with no `clock_settime` to even correct it.
 
 The fix is a platform switch with no separate "which board is this" check:
-in `run_async_main` (`src/main.rs`), right after network init, `if
-timer::utc_time_us().is_none() { ntp_boot::try_bootstrap_clock(); }` — an
-unset clock at that point in boot **is** the "no RTC" signal. `ntp_boot`
-(`#[cfg(feature = "smoltcp")]`, no-op stub otherwise):
+in `run_async_main` (`src/main.rs`), right after network init, an unset
+clock at that point in boot **is** the "no RTC" signal —
+```rust
+if timer::utc_time_us().is_none() && config::ENABLE_NTP_BOOTSTRAP {
+    match ntp_boot::try_bootstrap_clock() {
+        Ok(()) => safe_print!(96, "[NTP] boot-time clock sync succeeded: {}\n", timer::utc_iso8601()),
+        Err(e) => safe_print!(128, "[NTP] boot-time clock sync failed: {}\n", e),
+    }
+}
+```
+`try_bootstrap_clock` (`#[cfg(feature = "smoltcp")]`, a stub returning
+`Err(...)` otherwise) itself does no logging — it returns
+`Result<(), &'static str>` (same shape as `akuma_net::init`) and leaves
+reporting to this one call site, which is why it's a single `safe_print!`
+per outcome rather than several `console::print` calls in a row: the wait
+loop below cooperatively yields while polling, so another ready thread can
+genuinely run *between* separate `console::print` calls at this point in
+boot and tear the line (reproduced live — see below); a `safe_print!`
+formats into one stack buffer and flushes it as a single `emit()`, so it
+can't be interleaved mid-message. Steps 1-3 below are all inside
+`try_bootstrap_clock`:
 
 1. Resolves `config::NTP_SERVER_HOSTNAME` via `akuma_net::smoltcp_net::
    dns_query`. **This is an IP literal (`216.239.35.0`, Google Public NTP's
@@ -110,18 +127,27 @@ unset clock at that point in boot **is** the "no RTC" signal. `ntp_boot`
    over `(t4_up - t1_up)` and `(T3_srv - T2_srv)` instead. See the doc
    comment on `akuma_time::sntp` for the derivation.
 4. On success, `akuma_timer::set_utc_time_us(result.unix_epoch_us,
-   result.anchor_uptime_us)`. On any failure (no route, timeout, malformed
-   reply), logs via `log::warn!` and boot continues with the clock unset —
-   never fatal.
+   result.anchor_uptime_us)` and `Ok(())`. On any failure (DNS failure, no
+   socket, bind failure, send failure, timeout, or a malformed/spoofed
+   reply), `Err(&'static str)` describing which — never a panic, and boot
+   continues with the clock unset if the caller's log shows a failure.
 
 **Verified live** on the Lima Firecracker host (`overlays/devbox-firecracker`,
 genuinely no PL031), 2026-08-25:
 ```
 Warning: RTC not available, UTC time not set
-[SmolNet] DHCP deconfigured - reverting to static fallback
-[I] [NTP] boot-time clock set from 216.239.35.0 (2026-08-25T12:24:23.715781Z)
+[NTP] boot-time clock sync succeeded: 2026-08-25T12:45:17.621299Z
 ```
-Boot suite still 302/0/0 afterward.
+Boot suite still 302/0/0 (confirmed via `herd`/`httpd` starting normally
+afterward). An earlier revision of this call site used three sequential
+`console::print` calls instead of one `safe_print!`, and one live boot
+reproduced exactly the predicted tear: the label and timestamp came out
+fine but the trailing newline was pushed out by another thread's
+`[AS-FREE]` line landing in the gap between calls, all three findable in
+`archive/UART_SMP_INTERLEAVE_FIX.md`'s class of bug despite this being a
+single-vCPU boot — the interleaving source there is cross-*core*, here it's
+a cooperative `yield_now()` inside the wait loop letting another thread run
+between two otherwise-unrelated `console::print` calls.
 
 ## nanosleep
 

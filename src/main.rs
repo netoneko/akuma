@@ -1612,9 +1612,21 @@ fn run_async_main() -> ! {
     // separate board check needed — so fall back to a boot-time SNTP round
     // trip instead of leaving the clock stuck at 1970. Runs before IRQs are
     // unmasked below, so it busy-polls the network stack directly; see
-    // ntp_boot::try_bootstrap_clock. Never fatal either way.
-    if timer::utc_time_us().is_none() {
-        ntp_boot::try_bootstrap_clock();
+    // ntp_boot::try_bootstrap_clock. Never fatal either way — just report
+    // which of the two happened.
+    //
+    // One safe_print! call per outcome, not several console::print calls in
+    // a row: this runs with IRQs still masked, but try_bootstrap_clock's own
+    // wait loop cooperatively yields while polling, so other ready threads
+    // (boot self-test suite spawns, at this point in boot) can genuinely run
+    // between separate console::print calls and tear the line — safe_print!
+    // formats into one stack buffer and flushes it as a single emit(), so
+    // it can't be interleaved mid-message.
+    if timer::utc_time_us().is_none() && config::ENABLE_NTP_BOOTSTRAP {
+        match ntp_boot::try_bootstrap_clock() {
+            Ok(()) => safe_print!(96, "[NTP] boot-time clock sync succeeded: {}\n", timer::utc_iso8601()),
+            Err(e) => safe_print!(128, "[NTP] boot-time clock sync failed: {}\n", e),
+        }
     }
 
     // rump feature: bind the BSP's rump tap (/dev/net/tap0) to NIC1 on virtio-mmio-bus.4
