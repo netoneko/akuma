@@ -349,6 +349,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext2probe"
+version = "0.1.0"
+dependencies = [
+ "libakuma",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

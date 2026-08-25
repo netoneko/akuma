@@ -1,0 +1,11 @@
+[package]
+name = "ext2probe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ext2probe"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma" }

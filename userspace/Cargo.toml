@@ -17,6 +17,7 @@ members = [
     "forkprobe",
     "fpcprobe",
     "shareprobe",
+    "ext2probe",
     "hello",
     "paws",
     "herd",
