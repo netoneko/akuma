@@ -238,13 +238,17 @@ window size set on the client pty so `TIOCGWINSZ` carries real dimensions):
 - `cargo test` (host target, all crates), plus `release`/`devbox`/
   `devbox-smoltcp`/`extreme-size` rebuilds: all green, no regressions.
 
-### Known follow-up (not fixed, lower severity)
+### Follow-up: `FIONREAD` (fixed)
 
 Round 2 also deleted the `FIONREAD` arm for `Stdin` (`current_channel()
-.stdin_bytes_available()`); it now falls to the generic `_ => 0` arm, so
-`ioctl(FIONREAD)` on stdin/`/dev/tty` always reports zero bytes buffered
-regardless of actual pending input. Lower severity than the two above (a
-conservative "nothing waiting" answer, not a hang or a wrong-answer crash),
-but a program that polls `FIONREAD` before a non-blocking read to decide
-whether to proceed will never see it return non-zero. Not reproduced against
-a concrete failure yet — flagged here so it doesn't get lost.
+.stdin_bytes_available()`); it fell to the generic `_ => 0` arm, so
+`ioctl(FIONREAD)` on stdin/`/dev/tty` always reported zero bytes buffered
+regardless of actual pending input — lower severity than the two regressions
+above (a conservative "nothing waiting" answer, not a hang or a wrong-answer
+crash), but a program that polls `FIONREAD` before a non-blocking read to
+decide whether to proceed would never see it return non-zero.
+
+Restored in `src/syscall/term.rs`'s `FIONREAD` arm, extended to `DevTty` for
+the same reason as the ioctl gate above. Verified live: typed bytes injected
+into the pty while a test program slept before reading were reported via
+`FIONREAD` (`r=0`, non-zero count) instead of the old unconditional `0`.

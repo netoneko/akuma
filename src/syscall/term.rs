@@ -61,6 +61,18 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         FIONREAD => {
             let fd_entry = proc.get_fd(fd);
             let count: i32 = match fd_entry {
+                // Restores the arm `b19ae838` ("more tty shenanigans") dropped when it
+                // reworked the terminal-ioctl gate — see TTY_SHENANIGANS.md round 3's
+                // "known follow-up". Without it, FIONREAD on stdin/`/dev/tty` always
+                // answered 0, so a program that polls FIONREAD before a non-blocking
+                // read to decide whether input is waiting never saw it go non-zero.
+                // DevTty shares fd 0's channel (same reasoning as the ioctl gate and
+                // `sys_read`/`sys_write`/`epoll_check_fd_readiness`), so it belongs here.
+                Some(akuma_exec::process::FileDescriptor::Stdin
+                | akuma_exec::process::FileDescriptor::DevTty) => {
+                    akuma_exec::process::current_channel()
+                        .map_or(0, |ch| ch.stdin_bytes_available() as i32)
+                }
                 Some(akuma_exec::process::FileDescriptor::PipeRead(pipe_id)) => {
                     super::pipe::pipe_bytes_available(pipe_id) as i32
                 }
