@@ -150,6 +150,20 @@ pub enum FileDescriptor {
     Stdin,
     Stdout,
     Stderr,
+    /// `/dev/tty` — the calling process's controlling terminal.
+    ///
+    /// Pagers (`less`, `more`) and other full-screen programs read keyboard
+    /// input from `/dev/tty`, NEVER from stdin, because stdin is the pipe
+    /// carrying the content being paged. Without this node, `git log | less`
+    /// opened `/dev/tty`, failed, and fell back to reading stdin — the pipe —
+    /// for keystrokes: it never saw a key, hung forever, and the bytes typed
+    /// while it hung drained into whatever consumed the pipe.
+    ///
+    /// Backed by the same `ProcessChannel`/`TerminalState` as fd 0/1/2 (resolved
+    /// per-syscall via `current_channel()`/`current_terminal_state()`, so a
+    /// `box grab`/reattach repoint is honoured), which is why it carries no
+    /// payload: the identity IS "this process's console".
+    DevTty,
     Socket(usize),
     File(KernelFile),
     ChildStdout(Pid),

@@ -255,6 +255,7 @@ impl ProcFilesystem {
             FileDescriptor::Tap { .. } => String::from("/dev/net/tap0"),
             FileDescriptor::RumpSocket { rump_fd, .. } => format!("socket:[rump:{rump_fd}]"),
             FileDescriptor::Stdin => String::from("/dev/stdin"),
+            FileDescriptor::DevTty => String::from("/dev/tty"),
             FileDescriptor::Stdout => String::from("/dev/stdout"),
             FileDescriptor::Stderr => String::from("/dev/stderr"),
             FileDescriptor::ChildStdout(child_pid) => format!("pipe:[child:{child_pid}]"),

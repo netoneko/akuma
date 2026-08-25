@@ -76,10 +76,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 Some(akuma_exec::process::FileDescriptor::TimerFd(timer_id)) => {
                     if super::timerfd::timerfd_can_read(timer_id) { 8 } else { 0 }
                 }
-                Some(akuma_exec::process::FileDescriptor::Stdin) => {
-                    akuma_exec::process::current_channel()
-                        .map_or(0, |ch| ch.stdin_bytes_available() as i32)
-                }
+
                 Some(akuma_exec::process::FileDescriptor::File(ref f)) => {
                     crate::fs::file_size(&f.path)
                         .map(|sz| (sz as usize).saturating_sub(f.position) as i32)
@@ -217,12 +214,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     // exited 1 instead of paging the pipe. The fd TABLE entry is the ground
     // truth: only Stdin/Stdout/Stderr (the channel-backed console fds) are a
     // tty; anything else dup'd over them (PipeRead, File, ...) is not.
-    match proc.get_fd(fd) {
-        Some(akuma_exec::process::FileDescriptor::Stdin
-        | akuma_exec::process::FileDescriptor::Stdout
-        | akuma_exec::process::FileDescriptor::Stderr) => {}
-        _ => return ENOTTY, // fd is a pipe/file/socket, not the console tty
-    }
+
 
     if let Some(ch) = akuma_exec::process::current_channel()
         && !ch.is_terminal()

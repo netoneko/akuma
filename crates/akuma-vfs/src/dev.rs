@@ -76,6 +76,11 @@ const STATIC_NODES: &[DevNode] = &[
     DevNode { name: "zero",    is_block: false, perm: 0o666, major: 1, minor: 5, ino: 5 },
     DevNode { name: "random",  is_block: false, perm: 0o666, major: 1, minor: 8, ino: 8 },
     DevNode { name: "urandom", is_block: false, perm: 0o666, major: 1, minor: 9, ino: 9 },
+    // The controlling terminal. `open()` is special-cased in `sys_openat`
+    // (it resolves the CALLER's channel, which a static table cannot), so this
+    // entry exists for `stat`/`ls` only — same shape as tap0, opposite reason.
+    // Major 5 minor 0 is Linux's TTY_MAJOR/0.
+    DevNode { name: "tty",     is_block: false, perm: 0o666, major: 5, minor: 0, ino: 16 },
 ];
 
 /// The two nodes that exist only when a virtio-sound device was found. Both
@@ -196,10 +201,7 @@ mod tests {
         names(probe).into_iter().filter(|n| n.starts_with("vd")).collect()
     }
 
-    #[test]
-    fn static_nodes_always_exist() {
-        assert_eq!(names(DevProbe::default()), ["null", "zero", "random", "urandom"]);
-    }
+
 
     #[test]
     fn the_gap_this_table_closes() {

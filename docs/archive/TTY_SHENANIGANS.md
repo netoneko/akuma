@@ -69,3 +69,69 @@ it now get `ENOTTY` — which is what Linux returns, so this should strictly
 improve correctness, but it is a observable change: watch the next boot
 acceptance run for anything that probed termios on a redirected fd and
 previously "succeeded".
+
+---
+
+## Round 2: `less` hangs even when the pipe is paged — no `/dev/tty`
+
+Date: 2026-02 (branch `even-more-fixes`, uncommitted working tree)
+
+### Symptom
+
+With the isatty fix in, `cat README.md | less` no longer prints usage — but a
+pager invoked as `git log | less` (or any `... | less` where less decides to
+page) hung forever. Keystrokes were never seen by less; the bytes typed while
+it hung drained into the pipe.
+
+### Root cause
+
+Pagers read keyboard input from `/dev/tty` — the controlling terminal —
+**never** from stdin, because stdin is the pipe carrying the content being
+paged. Akuma had no `/dev/tty`: the `open("/dev/tty")` failed, and busybox
+less fell back to reading stdin for keystrokes. Stdin was the pipe. It never
+saw a key, hung forever, and the typed bytes were consumed as pipe input.
+
+### Fix (working tree)
+
+- `crates/akuma-exec/src/process/types.rs` — new `FileDescriptor::DevTty`
+  variant. Carries no payload: its identity IS "this process's console",
+  resolved per-syscall via `current_channel()`/`current_terminal_state()`, so
+  a `box grab`/reattach repoint is honoured.
+- `crates/akuma-vfs/src/dev.rs` — static `/dev/tty` node (major 5 minor 0,
+  Linux's TTY_MAJOR/0) so `stat`/`ls` see it. The actual `open()` is
+  special-cased in `sys_openat` because it must resolve the *caller's*
+  channel, which a static table cannot.
+- `src/syscall/fs.rs` — `sys_openat("/dev/tty")`: returns `ENODEV` when the
+  caller's channel is not a terminal (Linux says `ENXIO`; this errno set has
+  no ENXIO — see the header note in `akuma-primitives/src/errno.rs` — and
+  ENODEV is the nearest "device not attached" answer). Otherwise allocates a
+  `DevTty` fd, honouring `O_CLOEXEC`. `sys_read` routes `DevTty` through the
+  exact `Stdin` path (same channel, line discipline, canonical/echo);
+  `sys_write` routes it with `Stdout`/`Stderr`; `sys_fstat` reports it as a
+  character device (`st_rdev` major 136, same as the console fds).
+- `src/syscall/poll.rs` — `DevTty` shares fd 0's epoll readiness and waker.
+- `src/vfs/proc.rs` — `/proc/<pid>/fd` link target for `DevTty` is
+  `/dev/tty`.
+
+### Also in this working tree (needs verification before commit)
+
+- `src/syscall/term.rs` — the fd-table gate added in round 1 (the
+  `match proc.get_fd(fd) { Stdin|Stdout|Stderr => {} _ => ENOTTY }` block)
+  **and** the `FIONREAD` `Stdin` arm were removed. With the gate gone,
+  terminal ioctls on fd 0/1/2 are again decided by `fd <= 2` plus the channel
+  check alone — i.e. the original `cat file | less` usage-banner bug is
+  potentially back unless something else now covers it. `FIONREAD` on stdin
+  now falls to the catch-all `0`.
+- `crates/akuma-vfs/src/dev.rs` — the `static_nodes_always_exist` test was
+  deleted (it asserted exactly the four pre-/dev/tty names).
+
+### Verification
+
+- Not yet run: `cargo check`/`cargo test` on this tree, and the live re-test
+  (kernel rebuild + VM reboot). After reboot, check all of:
+  - `git log | less` pages and responds to `q` via /dev/tty;
+  - `cat README.md | less` still pages the pipe (regression check for the
+    gate removal above);
+  - `test -t 0` inside a pipeline still reports not-a-tty;
+  - `ls -l /dev/tty` shows the node; a non-terminal-channel process opening
+    `/dev/tty` gets an error, not the command stream.

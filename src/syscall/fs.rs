@@ -299,7 +299,12 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     }
 
     match fd {
-        akuma_exec::process::FileDescriptor::Stdin => {
+        // `/dev/tty` reads take the exact Stdin path: same channel, same line
+        // discipline, same canonical/echo handling. A pager holding both fd 0
+        // (the content pipe) and a /dev/tty fd gets keyboard bytes here and
+        // only here.
+        akuma_exec::process::FileDescriptor::Stdin
+        | akuma_exec::process::FileDescriptor::DevTty => {
             if akuma_exec::process::current_channel().is_none() {
                 let mut temp = alloc::vec![0u8; count];
                 let Some(proc) = akuma_exec::process::current_process_shared() else { return EBADF };
@@ -971,7 +976,8 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         let buf_slice = &kernel_buf[..this_chunk];
         
         let written = match fd {
-            akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
+            akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr
+            | akuma_exec::process::FileDescriptor::DevTty => {
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                     if total_written == 0 {
                       crate::safe_print!(96, "[OUT] pid={} fd={} len={}\n", pid, fd_num, count);
@@ -1766,6 +1772,34 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         return ESRCH;
     }
 
+    // /dev/tty — the calling process's controlling terminal. Pagers (`less`,
+    // `more`) read keyboard input from here, NEVER from stdin: stdin is the
+    // pipe carrying the content being paged (`git log | less`). Handing less a
+    // real fd here is what lets it see keys at all; before this node existed
+    // the open failed and less fell back to reading stdin — the pipe — for
+    // keystrokes, hanging forever while the typed bytes drained into the pipe.
+    //
+    // ENXIO when the process's channel is not a terminal (Linux's answer for
+    // "no controlling terminal"): a non-terminal channel is the exec bridge's
+    // command stream, and letting a pager read it would corrupt the stream.
+    if path == "/dev/tty" {
+        let Some(proc) = akuma_exec::process::current_process_shared() else { return ESRCH };
+        if !akuma_exec::process::current_channel().is_some_and(|ch| ch.is_terminal()) {
+            // Linux says ENXIO for "no controlling terminal"; this errno set
+            // has no ENXIO (see akuma-primitives/src/errno.rs header note), and
+            // ENODEV is the nearest "device not attached" answer.
+            return ENODEV;
+        }
+        let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevTty);
+        if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+            proc.set_cloexec(fd);
+        }
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(256, "[syscall] openat(/dev/tty) = fd {} flags=0x{:x}\n", fd, flags);
+        }
+        return u64::from(fd);
+    }
+
     // /dev/dsp — virtio-sound output. Only opens when a sound device was found at
     // boot (audio::is_available()); otherwise falls through to the normal path
     // (→ ENOENT), so the node simply doesn't exist when the feature is off.
@@ -2198,7 +2232,8 @@ akuma_exec::process::FileDescriptor::EpollFd(_)) => {
         }
         Some(akuma_exec::process::FileDescriptor::Stdin |
 akuma_exec::process::FileDescriptor::Stdout |
-akuma_exec::process::FileDescriptor::Stderr) => {
+akuma_exec::process::FileDescriptor::Stderr |
+akuma_exec::process::FileDescriptor::DevTty) => {
             stat = Stat { st_dev: 0, st_ino: 0, st_size: 0, st_mode: 0o20620, st_nlink: 1, st_rdev: makedev(136, 0), st_blksize: 1024, ..Default::default() };
             0
         }

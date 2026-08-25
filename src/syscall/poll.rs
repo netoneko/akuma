@@ -658,7 +658,9 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                 }
             }
         }
-        akuma_exec::process::FileDescriptor::Stdin => {
+        // `/dev/tty` shares fd 0's channel: same readiness, same waker.
+        akuma_exec::process::FileDescriptor::Stdin
+        | akuma_exec::process::FileDescriptor::DevTty => {
             if requested & EPOLLIN != 0
                 && let Some(ch) = akuma_exec::process::current_channel() {
                     if waker.is_some() {
