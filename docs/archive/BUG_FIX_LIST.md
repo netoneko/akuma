@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 699
-- **Docs contributing at least one fix:** 222
+- **Total distinct fixes counted:** 712
+- **Docs contributing at least one fix:** 230
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 128 | 18.3% | 18 |
-| Memory & Virtual Memory | 113 | 16.2% | 35 |
-| Scheduler & Process Management | 76 | 10.9% | 19 |
-| SMP & Locking | 87 | 12.4% | 38 |
-| Networking | 54 | 7.7% | 21 |
-| Userspace Apps & Libraries | 37 | 5.3% | 20 |
+| Syscall / ABI Compatibility Audits | 130 | 18.3% | 19 |
+| Memory & Virtual Memory | 113 | 15.9% | 35 |
+| Scheduler & Process Management | 77 | 10.8% | 20 |
+| SMP & Locking | 88 | 12.4% | 39 |
+| Networking | 54 | 7.6% | 21 |
+| Userspace Apps & Libraries | 37 | 5.2% | 20 |
 | Rump Kernel & Syscall Proxy | 26 | 3.7% | 6 |
-| Toolchain & Self-Hosting | 37 | 5.3% | 5 |
+| Toolchain & Self-Hosting | 38 | 5.3% | 6 |
 | SSH | 26 | 3.7% | 15 |
-| VFS & Filesystem | 17 | 2.4% | 12 |
-| Boot & Drivers | 23 | 3.3% | 8 |
-| Signals & Exceptions | 13 | 1.9% | 6 |
+| VFS & Filesystem | 19 | 2.7% | 14 |
+| Boot & Drivers | 24 | 3.4% | 9 |
+| Signals & Exceptions | 13 | 1.8% | 6 |
 | Misc / Cross-cutting | 22 | 3.1% | 5 |
-| Console & Terminal | 16 | 2.3% | 8 |
+| Console & Terminal | 21 | 2.9% | 9 |
 | Containers | 24 | 3.4% | 6 |
-| **Total** | **699** | **100.0%** | **222** |
+| **Total** | **712** | **100.0%** | **230** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -45,7 +45,7 @@ from several subsystems under one write-up.
 
 ---
 
-## Syscall / ABI Compatibility Audits (128 fixes, 18 docs)
+## Syscall / ABI Compatibility Audits (130 fixes, 19 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -173,6 +173,10 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/NCA_MISSING_SYSCALLS.md
 - `flock(2)` (syscall 32) was a bare `=> 0` no-op stub — every call unconditionally reported success with zero actual locking, so `sh`'s `flock` applet never errored and a lock-contention probe never saw a second caller block on a first caller's held lock; fixed with real advisory locking (`src/syscall/flock.rs`) keyed by path string, blocking `LOCK_EX`/`LOCK_SH` via 10ms poll-retry, and auto-unlock-on-close wired into both `sys_close` and `SharedFdTable::close_all` — implemented and clean under `cargo check`/`build`/`clippy --release`, not yet re-verified against a booted kernel
+
+### docs/archive/MISSING_NTP_SYSCALLS.md
+- `clock_settime` (112), `adjtimex` (171) and `clock_adjtime` (266) were all unimplemented — Akuma could read the clock but never set it, so `date -s`, `rdate`, and `ntpd -q` all had no way to apply a correction; implemented in the new `crates/akuma-time` crate, with `adjtimex`/`clock_adjtime` applying `ADJ_OFFSET`/`ADJ_SETOFFSET` as an immediate step rather than a gradual PLL slew
+- On a platform with no RTC (Firecracker exposes no PL031 on aarch64), the guest booted at epoch 0 with no way to correct it, so every outbound TLS connection failed certificate-validity checks ("certificate is not yet valid") even though the CA bundle, DNS, and TCP were all fine; fixed with a boot-time SNTP client (`crates/akuma-time::{boot, sntp}`, wired via `src/ntp_boot.rs`) that runs whenever `utc_time_us()` comes up unset, deriving the wall-clock offset from uptime-relative round-trip timestamps (since the client's own clock has no absolute epoch yet to plug into the classic four-timestamp NTP formula) and applying it via `set_utc_time_us` before IRQs are unmasked
 
 ## Memory & Virtual Memory (113 fixes, 35 docs)
 
@@ -360,7 +364,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - The file-page cache cap was a fixed `RAM/8` with no headroom, so a single mmap'd file larger than the cap (a 532 MB llama.cpp model against a 512 MB cap at `MEMORY=4096`) evicted its own still-mapped hot pages every pass, costing the next mapper of the same file a `read_at` off ext2; fixed with an elastic cap (`FPCACHE_INFLATE_PCT`, default +20%, granted when free RAM clears a 2x headroom threshold and withdrawn only below 1x, hysteresis-gated so a workload parked on the line can't flap the cap) — real for any workload with more than one mapper of the same oversized file (concurrent `rustc`s on one `.so`, boxes sharing a rootfs), though it did not move the single-mapper llama.cpp throughput it was raised to fix
 
 
-## Scheduler & Process Management (76 fixes, 19 docs)
+## Scheduler & Process Management (77 fixes, 20 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -477,8 +481,11 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/SCHEDULING_INVESTIGATION.md
 - Expired sleepers/pollers rejoined the back of the round-robin queue instead of running next, and the 10 ms timer tick meant every sleep/poll deadline paid a full round (~35 ms floor at SMP=1, ~13 ms more per additional runnable thread) — measured as terminal output forwarded in ~27 Hz bursts; fixed via `WAKE_DEADLINE_PREEMPT` (arms the existing `PREEMPT_WAKE_TID` run-next hint from the deadline wake-pass instead of only from `ThreadWaker::wake`) plus dropping `TIMER_INTERVAL_US` 10 000→1 000, profile-gated (`extreme-size` keeps 10 ms) — A/B'd clean on release SMP=1/SMP=4, the 4 MB extreme-size floor, and devbox-smoltcp SMP=4
 
+### docs/archive/SELFHOST_CARGO_BUILD_REGRESSION.md
+- `fork_process`'s CoW-fork path collected every sibling thread's eager mmap regions into a fixed `Vec::with_capacity(2048)`, silently dropping regions past the cap with only a warning; a `cargo`/`rustc` build's many concurrently-live worker threads routinely crossed 2048 aggregate sibling regions, and if the dropped set held the child's about-to-be-used heap/stack range, its very next syscall (observed: `chdir()` on `std::process::Command`'s fork-before-exec path) faulted `EFAULT` — fixed with a two-pass collect (count under IRQs-disabled, allocate exactly that size, then collect) instead of a fixed-capacity guess
 
-## SMP & Locking (87 fixes, 38 docs)
+
+## SMP & Locking (88 fixes, 39 docs)
 
 ### docs/archive/IRQ_HANDLER_TABLE_DEADLOCK.md
 - `register_handler` called `gic::enable_irq()` **while holding `IRQ_HANDLERS`**, the non-reentrant spinlock `dispatch_irq` takes from the interrupt vector, so a line delivering on that core before the guard dropped self-deadlocked it — with the BKL still held, surfacing as an `SMP>1` boot freeze with `[BKL] stuck: owner=1 waiter=2/3/4`. Fixed with a fixed `[Option<IrqHandler>; 256]` table (also removing up to 49 `Vec::push` heap allocations inside that lock), publishing under `with_irqs_disabled`, and moving `enable_irq` outside the lock
@@ -649,6 +656,9 @@ aren't recorded anywhere else.)
 
 ### docs/archive/BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md
 - Commit `1a29c9c3` dropped `blocking_relax()`'s leading `yield_now()` for every caller to speed up the socket wait loop (+27% HTTP throughput), but the spawn/exec/reap waiters — woken by another thread on their own core, not by a device interrupt — genuinely need that yield to hand off, so removing it kernel-wide permanently wedged `SMP=4` in the spawn/exec/reap path (boot suite: 294 passed → 23 passed, wedged); fixed by splitting the primitive into `blocking_relax_net` (no yield) wired only into `NetRuntime::blocking_relax`, keeping the yield everywhere else (294 passed, +30% HTTP throughput preserved)
+
+### docs/archive/SECOND_LISTENER_SMP1_FREEZE.md
+- At `SMP=1`, a non-idle socket waiter parked via `idle_halt` (the yield-less `blocking_relax_net` path) disabled preemption for the whole halt without ever marking itself WAITING, so it stayed the only RUNNING thread on the sole core, holding it in an uninterruptible `wfi` loop that no timer tick or voluntary reschedule could ever displace — reproduced by starting a second listening server (`httpd`/`nginx`) after a first one was already bound and parked in `accept`, freezing the whole kernel with no panic; fixed by gating the preempt-disable (and matching `HOLD_TAG_IDLE`) on `IS_IDLE_THREAD[tid]`, so a non-idle halter's `wfi` stays preemptible
 
 ## Networking (54 fixes, 21 docs)
 
@@ -870,7 +880,7 @@ aren't recorded anywhere else.)
 - On the rump devbox, every ssh session reset at kex (`kex_exchange_identification: Connection reset by peer`): `RumpSocket` was the one fd family `clone_deep_for_fork` did not refcount, so a forked sshd session's parent `drop(stream)` closed the socket out from under its own still-running child; fixed by refcounting `RumpSocket` the same way every other fd family already was (superseded the wrong DHCP-path diagnosis in `DEVBOX_ISSUES.md` Issue 10)
 
 
-## Toolchain & Self-Hosting (37 fixes, 5 docs)
+## Toolchain & Self-Hosting (38 fixes, 6 docs)
 
 ### docs/archive/AKUMA_SELF_HOSTING.md
 - §3: boot self-test VA collision causing MEMORY≥8G `map_user_page` crash
@@ -920,6 +930,8 @@ aren't recorded anywhere else.)
 - `llama-cli` and `nca` were in the copy list even though their own build scripts install them into `bootstrap/bin`, so every successful build printed `Warning: Binary … not found` for both
 - every path in the script is relative to `userspace/` while the documented invocation is `userspace/build.sh` from the repo root, where the first `cargo build -p libakuma` resolved against the kernel workspace and failed; fixed by anchoring with `cd "$(dirname "$0")"`, which also fixes toolchain/target resolution for the out-of-workspace members
 
+### docs/archive/RAW_BLOCK_DEVICE_FD.md
+- Adding `crates/akuma-scheduler`'s `sched-sim` CLI binary to the workspace's `default-members` made a bare `cargo run --release` (and every `overlays/devbox/run*.sh` script) fail with "could not determine which binary to run" since cargo now had two candidate binaries; fixed with `default-run = "akuma"` in the root `Cargo.toml`, disambiguating `cargo run` without touching `cargo build`/`cargo test`
 
 ## SSH (26 fixes, 15 docs)
 
@@ -981,7 +993,7 @@ aren't recorded anywhere else.)
 
 ---
 
-## VFS & Filesystem (17 fixes, 12 docs)
+## VFS & Filesystem (19 fixes, 14 docs)
 
 ### docs/archive/STAT_AND_UNLINKAT_FIX.md
 - Root cause 1: `stat()` returned `st_ino=0` for every file
@@ -1024,8 +1036,13 @@ aren't recorded anywhere else.)
 ### docs/archive/APK_OTMPFILE_DIR_FD.md
 - `sys_openat` neither implemented `O_TMPFILE` nor rejected write-mode opens of directories, so apk-tools 3's atomic-write path (`openat(dirfd, ".", O_RDWR|O_TMPFILE)`) silently succeeded with a writable fd on the directory itself, and every subsequent `write()` failed `EISDIR` at the wrong syscall — `apk update`/`apk add` installed files but never wrote the database; fixed by answering `O_TMPFILE` with `EINVAL` (apk falls back to `.tmp`+`renameat`, which works) and write-mode opens of an existing directory with `EISDIR` at open() time (closes `DEVBOX_ISSUES.md` Issue 20)
 
+### docs/archive/DEVFS_MISSING.md
+- `/dev` had no real directory backing — `ls /dev` showed nothing, and `stat`/`newfstatat`/`statx` only recognized `/dev/null` and `/dev/zero` via two independently-hardcoded copies, so `/dev/random`, `/dev/urandom`, `/dev/dsp`, and every block device all `stat()`ed `ENOENT` despite `open()`ing successfully; fixed with a single device table (`crates/akuma-vfs/src/dev.rs`) wired into `list_dir`/`metadata`/`exists`, replacing the duplicated `sys_newfstatat`/`sys_statx` special-casing — boxes deliberately get no synthetic `/dev` entries at all (except `null`/`zero`/the rump tap)
 
-## Boot & Drivers (23 fixes, 8 docs)
+### docs/archive/RAW_BLOCK_DEVICE_FD.md
+- `open()` on a `/dev/vdX` block-device node returned `ENODEV` unconditionally since a raw block fd had no consumer; fixed with a `BlockDev` file-descriptor variant wired through `read`/`write`/`lseek`/`fstat`, with a write-open of a *mounted* device refused `EBUSY` (checked once at `open()` time via `device_is_mounted`) so a raw write can't go behind `Ext2Filesystem`'s block cache
+
+## Boot & Drivers (24 fixes, 9 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
@@ -1066,6 +1083,9 @@ aren't recorded anywhere else.)
 ### docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md
 - `rng.rs`: `copy_len` was clamped to the caller's requested remaining length rather than `to_read` (the actual descriptor-completion length), and a `copy_len == 0` completion spun the outer loop forever since `bytes_read` never advanced; fixed by clamping to `to_read` and rejecting zero-length completions
 - `rng.rs`: `VirtqAvail`/`VirtqUsed`'s `idx`/`flags`/`*_event` fields were read/written as plain `u16`s with no synchronization between producer and consumer; fixed by making them `AtomicU16` with a release store on publish and an acquire load on completion (the pre-notify `fence(SeqCst)` kept, since it orders against a Device-memory MMIO store the atomics don't cover)
+
+### docs/archive/AKUMA_BOOT_EXTRACTION.md
+- The `devbox-smoltcp` boot's `sshd.conf` carried `start_delay_ms = 10000`, tuning inherited from the rump profile's DHCP-handshake wait, but under smoltcp the network stack is already up synchronously before `herd` even starts, so the delay was pure dead time on every boot; set to `0` in `overlays/devbox/rootfs/etc/herd/enabled/sshd.conf` (the rump case still needs the 10s value, kept in `bootstrap/etc/herd/core2/sshd-rump.conf`)
 
 
 ## Signals & Exceptions (13 fixes, 6 docs)
@@ -1143,7 +1163,7 @@ aren't recorded anywhere else.)
 - The `[TESTS] low-mem … skipping boot self-test suite` message printed with no `cfg` guard, so every `no-tests`/`size` image — which never compiled a suite at all — falsely claimed at boot that it had skipped one; now gated on the same condition as the suite itself
 
 
-## Console & Terminal (16 fixes, 8 docs)
+## Console & Terminal (21 fixes, 9 docs)
 
 ### docs/archive/VEC_AUDIT.md
 - `crates/akuma-terminal`'s canonical-mode `canon_buffer` grew one byte per keystroke with no cap and was drained only by a line terminator, so a peer writing to a tty in canonical mode and never sending `\n` grew kernel heap without limit. Capped at `MAX_CANON = 4095` (Linux N_TTY's own ceiling), dropping — and deliberately not echoing — input beyond it, while the `\n`/VEOF paths stay uncapped so a full line can always still be terminated
@@ -1177,6 +1197,13 @@ aren't recorded anywhere else.)
 
 ### docs/archive/SERIAL_TRACE_TRAFFIC_AUDIT.md
 - Three per-event kernel traces (`[IA-DP] file region:` demand-page, `[pipe]` lifecycle, `[mmap]`/`[mprotect]`) printed unconditionally, saturating the single shared UART under a parallel `-j4` build (~270 KB/s, a 115200-baud line ~20x over-saturated) and serializing every logging core on the console lock — turning an in-VM self-host build from "never completes in over an hour" into a 2m21s green run once gated; `DEMAND_PAGE_LOG_ENABLED`, the flag meant to gate the largest of the three, was dead — defined and documented but with zero readers anywhere in the tree — so fixing it required wiring a live check, not flipping an existing one
+
+### docs/archive/TTY_SHENANIGANS.md
+- `isatty(0)` (the `TCGETS` path of `sys_ioctl`) decided tty-ness from the process's I/O *channel* rather than the fd table, so a `cat file | less` pipeline child — fd 0 `dup2`'d to a `PipeRead` but still inheriting the shell's terminal channel — reported itself as a tty, making busybox `less` take its no-FILE-argument tty branch and print a usage banner instead of paging the pipe; fixed by gating on the fd table entry for fd 0/1/2 first (only `Stdin`/`Stdout`/`Stderr` are a tty), keeping the channel check as a second gate for the sshd exec-channel case
+- Akuma had no `/dev/tty`, so a pager reading keystrokes from the controlling terminal (never from stdin, which for `git log | less` is the pipe carrying the paged content) fell back to reading stdin instead and hung forever with typed keys draining into the pipe; fixed with a `FileDescriptor::DevTty` variant resolved per-syscall via the caller's channel, plus a static `/dev/tty` device-table node so `stat`/`ls` see it
+- Adding `/dev/tty` support deleted the fd-table type gate from the `isatty` fix above, reopening the exact `cat file | less` usage-banner regression; fixed by restoring a single fd-table type match (`Stdin | Stdout | Stderr | DevTty` pass, else `ENOTTY`) that covers both the original tty fds and the new `/dev/tty` fd
+- The same regression left `sys_ioctl`'s terminal-ioctl gate as a bare `fd > 2` cutoff, which unconditionally rejected the newly-introduced `/dev/tty` fd (never 0/1/2) for every terminal ioctl — breaking `crossterm`'s raw-mode setup (`tcgetattr`/`tcsetattr` issued directly on an opened `/dev/tty` fd) with a `reader source not set` panic in Helix; fixed by the same fd-table type match above rather than a numeric cutoff
+- The `/dev/tty` work also dropped the `FIONREAD` arm for `Stdin`, so `ioctl(FIONREAD)` on stdin or `/dev/tty` always reported zero buffered bytes regardless of actual pending input; restored, and extended to cover `DevTty` for the same reason as the ioctl gate
 
 
 ## Containers (24 fixes, 6 docs)
