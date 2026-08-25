@@ -22,7 +22,16 @@ the `akuma_vfs` crate.
   the spinlock — the priority-inversion fix). **Never `yield_now()` or do slow
   I/O inside** (see [`scheduler.md`](scheduler.md)).
 - **CWD** per-process; `canonicalize_path` / `resolve_path` handle relative
-  paths. See `archive/CWD.md`.
+  paths. See `archive/CWD.md`. Both are **single-allocation**: the returned
+  `String` is the only thing allocated. `resolve_path` runs on every VFS
+  operation (`resolve_mount` calls it before touching any mount) and used to
+  cost three — a `format!` to join base and path, a scratch `Vec<&str>` of
+  components, and the result. It now walks the two halves straight into the
+  output buffer, handling `..` by truncating at the last `/`; feeding the
+  halves in sequence is exactly canonicalizing their concatenation, so `..`
+  still crosses the base boundary (`/a` + `../b` → `/b`) and still clamps at
+  the root. `path_components` returns an iterator for the same reason —
+  `akuma_ext2`'s `lookup_path_internal` walks it on every path resolution.
 - **`write_at` syscall** (`archive/WRITE_AT_SYSCALL.md`) — the streaming write
   optimization that avoids slurping into kernel heap.
 - **Remount / unmount** (`vfs/mod.rs:179,190`, `#[cfg(feature =
@@ -102,7 +111,16 @@ Two halves, deliberately kept apart:
 function of a `DevProbe` (`audio`, `block_slots`, `in_box`), so the whole table
 is host-unit-tested with no boot. `src/vfs/mod.rs::dev_probe` is the only thing
 that reads live state (`crate::audio::is_available`, `crate::block::device_name`,
-`box_id`). `dev_node(path)` / `dev_node_named(name)` are the single lookup behind
+`box_id`).
+
+**Nothing on this path allocates.** All three tables (static, audio, block) are
+`&'static [DevNode]`, `lookup` and `list` return iterators borrowing from them,
+and `DevProbe` is a 3-byte `Copy` struct passed by value — so a `stat` on a
+device path walks at most ten `&'static DevNode`s and allocates nothing at all.
+The only `Vec` is the `DirEntry` listing `vfs::dev_entries` was going to build
+anyway; "does `/dev` have any nodes?" is `list(probe).next().is_none()`.
+
+`dev_node(path)` / `dev_node_named(name)` are the single lookup behind
 every stat-family syscall — before 2026-08-25 `sys_newfstatat` and `sys_statx`
 each hardcoded `/dev/null` and `/dev/zero` independently, so `/dev/random`,
 `/dev/urandom` and `/dev/dsp` `open()`ed fine and `stat()`ed `ENOENT`

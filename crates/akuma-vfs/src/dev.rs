@@ -17,8 +17,6 @@
 //! probed (sound device present? which block slots filled?) instead of this
 //! module reaching into `crate::block` / `crate::audio` itself.
 
-use alloc::vec::Vec;
-
 /// `S_IFCHR` — character device.
 const S_IFCHR: u32 = 0o20000;
 /// `S_IFBLK` — block device.
@@ -36,8 +34,6 @@ pub const DT_BLK: u8 = 6;
 /// design, and a mismatch is caught by [`DevProbe::block_slots`] simply having
 /// no bit set above what the driver registered.
 pub const MAX_BLOCK_SLOTS: usize = 4;
-
-const BLOCK_NAMES: [&str; MAX_BLOCK_SLOTS] = ["vda", "vdb", "vdc", "vdd"];
 
 /// One entry in the device table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,8 +85,17 @@ const AUDIO_NODES: &[DevNode] = &[
     DevNode { name: "audio", is_block: false, perm: 0o666, major: 14, minor: 4, ino: 15 },
 ];
 
-/// Base inode for `vda`..`vdd`, above every static node's.
-const BLOCK_INO_BASE: u64 = 32;
+/// `vda`..`vdd`, gated per-slot on [`DevProbe::block_slots`]. Spelled out
+/// rather than computed so the whole table is static data the lookup can
+/// borrow from. `254` is virtio-blk's major; the minor spacing of 16 mirrors
+/// Linux reserving 16 minors per disk for partitions this kernel does not have.
+/// Inodes start at 32, above every static node's.
+const BLOCK_NODES: &[DevNode; MAX_BLOCK_SLOTS] = &[
+    DevNode { name: "vda", is_block: true, perm: 0o660, major: 254, minor: 0,  ino: 32 },
+    DevNode { name: "vdb", is_block: true, perm: 0o660, major: 254, minor: 16, ino: 33 },
+    DevNode { name: "vdc", is_block: true, perm: 0o660, major: 254, minor: 32, ino: 34 },
+    DevNode { name: "vdd", is_block: true, perm: 0o660, major: 254, minor: 48, ino: 35 },
+];
 
 /// Live kernel state the table needs, plus who is asking.
 ///
@@ -124,7 +129,7 @@ pub struct DevProbe {
 }
 
 /// Whether `node` is visible to the caller described by `probe`.
-fn visible(probe: &DevProbe, node: &DevNode, listing: bool) -> bool {
+fn visible(probe: DevProbe, node: &DevNode, listing: bool) -> bool {
     if !probe.in_box {
         return true;
     }
@@ -133,28 +138,20 @@ fn visible(probe: &DevProbe, node: &DevNode, listing: bool) -> bool {
 }
 
 /// Every node that exists for `probe`, in a stable order.
-fn all_nodes(probe: &DevProbe) -> Vec<DevNode> {
-    let mut nodes: Vec<DevNode> = Vec::new();
-    nodes.extend_from_slice(STATIC_NODES);
-    if probe.audio {
-        nodes.extend_from_slice(AUDIO_NODES);
-    }
-    for (idx, name) in BLOCK_NAMES.iter().enumerate() {
-        if probe.block_slots & (1 << idx) == 0 {
-            continue;
-        }
-        nodes.push(DevNode {
-            name,
-            is_block: true,
-            perm: 0o660,
-            // Virtio-blk's major. Minor spacing of 16 mirrors Linux reserving
-            // 16 minors per disk for partitions this kernel does not have.
-            major: 254,
-            minor: (idx * 16) as u32,
-            ino: BLOCK_INO_BASE + idx as u64,
-        });
-    }
-    nodes
+///
+/// Borrows from the three static tables — no allocation, so `lookup` on a hot
+/// `stat` path costs a walk of at most ten `&'static DevNode`s and nothing else.
+fn all_nodes(probe: DevProbe) -> impl Iterator<Item = &'static DevNode> {
+    STATIC_NODES
+        .iter()
+        .chain(AUDIO_NODES.iter().filter(move |_| probe.audio))
+        .chain(
+            BLOCK_NODES
+                .iter()
+                .enumerate()
+                .filter(move |(idx, _)| probe.block_slots & (1u8 << idx) != 0)
+                .map(|(_, node)| node),
+        )
 }
 
 /// The node named by `name` (a `/dev/`-relative name, no slash), if it exists
@@ -163,80 +160,81 @@ fn all_nodes(probe: &DevProbe) -> Vec<DevNode> {
 /// This is the single lookup behind `stat`, `statx`, `faccessat2` and `access`
 /// on a device path.
 #[must_use]
-pub fn lookup(probe: &DevProbe, name: &str) -> Option<DevNode> {
+pub fn lookup(probe: DevProbe, name: &str) -> Option<DevNode> {
     all_nodes(probe)
-        .into_iter()
         .find(|n| n.name == name && visible(probe, n, false))
+        .copied()
 }
 
 /// Every node that should appear in `ls /dev`, in a stable order.
 ///
-/// Empty inside a box — see [`DevProbe::in_box`].
-#[must_use]
-pub fn list(probe: &DevProbe) -> Vec<DevNode> {
-    all_nodes(probe)
-        .into_iter()
-        .filter(|n| visible(probe, n, true))
-        .collect()
+/// Yields nothing inside a box — see [`DevProbe::in_box`]. Returns an iterator
+/// rather than a collection so a caller that only needs "is there anything
+/// here?" pays nothing; the one caller that needs a real listing
+/// (`vfs::dev_entries`) allocates the `DirEntry` vector it was going to build
+/// anyway.
+pub fn list(probe: DevProbe) -> impl Iterator<Item = &'static DevNode> {
+    all_nodes(probe).filter(move |n| visible(probe, n, true))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     /// A host probe: sound device present, two disks, not in a box.
     fn host() -> DevProbe {
         DevProbe { audio: true, block_slots: 0b0011, in_box: false }
     }
 
-    fn names(nodes: &[DevNode]) -> Vec<&'static str> {
-        nodes.iter().map(|n| n.name).collect()
+    /// Collecting is the test's own convenience — the crate itself never does.
+    fn names(probe: DevProbe) -> Vec<&'static str> {
+        list(probe).map(|n| n.name).collect()
+    }
+
+    fn block_names(probe: DevProbe) -> Vec<&'static str> {
+        names(probe).into_iter().filter(|n| n.starts_with("vd")).collect()
     }
 
     #[test]
     fn static_nodes_always_exist() {
-        let bare = DevProbe::default();
-        assert_eq!(names(&list(&bare)), ["null", "zero", "random", "urandom"]);
+        assert_eq!(names(DevProbe::default()), ["null", "zero", "random", "urandom"]);
     }
 
     #[test]
     fn the_gap_this_table_closes() {
         // The bug from DEVFS_MISSING.md §1.2: these three `open()`ed fine but
         // `stat()`ed ENOENT because only null/zero were in the stat path.
-        let p = host();
         for name in ["random", "urandom", "dsp"] {
-            assert!(lookup(&p, name).is_some(), "{name} must stat");
+            assert!(lookup(host(), name).is_some(), "{name} must stat");
         }
     }
 
     #[test]
     fn audio_nodes_gated_on_the_probe() {
         let mut p = host();
-        assert!(lookup(&p, "dsp").is_some());
-        assert!(lookup(&p, "audio").is_some());
+        assert!(lookup(p, "dsp").is_some());
+        assert!(lookup(p, "audio").is_some());
         p.audio = false;
-        assert!(lookup(&p, "dsp").is_none());
-        assert!(lookup(&p, "audio").is_none());
+        assert!(lookup(p, "dsp").is_none());
+        assert!(lookup(p, "audio").is_none());
     }
 
     #[test]
     fn block_nodes_track_populated_slots() {
-        let p = host();
-        assert_eq!(names(&list(&p)).into_iter().filter(|n| n.starts_with("vd")).collect::<Vec<_>>(),
-                   ["vda", "vdb"]);
-        assert!(lookup(&p, "vdc").is_none());
+        assert_eq!(block_names(host()), ["vda", "vdb"]);
+        assert!(lookup(host(), "vdc").is_none());
 
         // A gap in the middle still names the right letters: slot index, not
         // registration order, picks the name (matching `device_name(idx)`).
         let sparse = DevProbe { block_slots: 0b1001, ..Default::default() };
-        assert_eq!(names(&list(&sparse)).into_iter().filter(|n| n.starts_with("vd")).collect::<Vec<_>>(),
-                   ["vda", "vdd"]);
+        assert_eq!(block_names(sparse), ["vda", "vdd"]);
     }
 
     #[test]
     fn block_nodes_are_block_type_with_partition_spaced_minors() {
         let p = DevProbe { block_slots: 0b1111, ..Default::default() };
-        let vdc = lookup(&p, "vdc").unwrap();
+        let vdc = lookup(p, "vdc").unwrap();
         assert!(vdc.is_block);
         assert_eq!(vdc.d_type(), DT_BLK);
         assert_eq!(vdc.mode(), 0o60660);
@@ -245,49 +243,56 @@ mod tests {
 
     #[test]
     fn null_and_zero_keep_the_values_the_old_hardcoded_blocks_reported() {
-        let p = host();
-        let null = lookup(&p, "null").unwrap();
+        let null = lookup(host(), "null").unwrap();
         assert_eq!((null.mode(), null.ino, null.major, null.minor), (0o20666, 1, 1, 3));
-        let zero = lookup(&p, "zero").unwrap();
+        let zero = lookup(host(), "zero").unwrap();
         assert_eq!((zero.mode(), zero.ino, zero.major, zero.minor), (0o20666, 5, 1, 5));
     }
 
     #[test]
     fn inodes_are_unique() {
         let p = DevProbe { audio: true, block_slots: 0b1111, in_box: false };
-        let mut inos: Vec<u64> = list(&p).iter().map(|n| n.ino).collect();
+        let mut inos: Vec<u64> = list(p).map(|n| n.ino).collect();
         let total = inos.len();
         inos.sort_unstable();
         inos.dedup();
         assert_eq!(inos.len(), total);
     }
 
+    /// Every table entry must be reachable by name, or it can never be `stat`ed.
+    #[test]
+    fn every_listed_node_is_also_lookupable() {
+        let p = DevProbe { audio: true, block_slots: 0b1111, in_box: false };
+        for node in list(p) {
+            assert_eq!(lookup(p, node.name).as_ref(), Some(node), "{}", node.name);
+        }
+    }
+
     #[test]
     fn a_box_gets_no_listing_at_all() {
         let p = DevProbe { audio: true, block_slots: 0b1111, in_box: true };
-        assert!(list(&p).is_empty());
+        assert_eq!(list(p).count(), 0);
     }
 
     #[test]
     fn a_box_never_sees_host_hardware() {
         let p = DevProbe { audio: true, block_slots: 0b1111, in_box: true };
         for name in ["vda", "vdb", "vdc", "vdd", "dsp", "audio", "random", "urandom"] {
-            assert!(lookup(&p, name).is_none(), "{name} must not leak into a box");
+            assert!(lookup(p, name).is_none(), "{name} must not leak into a box");
         }
     }
 
     #[test]
     fn a_box_keeps_the_two_devices_that_already_stat_today() {
         let p = DevProbe { in_box: true, ..Default::default() };
-        assert_eq!(lookup(&p, "null").map(|n| n.mode()), Some(0o20666));
-        assert_eq!(lookup(&p, "zero").map(|n| n.mode()), Some(0o20666));
+        assert_eq!(lookup(p, "null").map(|n| n.mode()), Some(0o20666));
+        assert_eq!(lookup(p, "zero").map(|n| n.mode()), Some(0o20666));
     }
 
     #[test]
     fn unknown_names_and_paths_never_match() {
-        let p = host();
         for name in ["", "vde", "nul", "null/", "net/tap0", "console"] {
-            assert!(lookup(&p, name).is_none(), "{name:?} must not resolve");
+            assert!(lookup(host(), name).is_none(), "{name:?} must not resolve");
         }
     }
 }

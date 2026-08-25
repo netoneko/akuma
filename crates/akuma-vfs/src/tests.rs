@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod path_tests {
     extern crate alloc;
-    use alloc::vec;
     use alloc::vec::Vec;
     use crate::path::*;
 
@@ -65,9 +64,26 @@ mod path_tests {
 
     #[test]
     fn path_components_basic() {
-        assert_eq!(path_components("/foo/bar/baz"), vec!["foo", "bar", "baz"]);
-        assert_eq!(path_components("/"), Vec::<&str>::new());
-        assert_eq!(path_components("//foo///bar//"), vec!["foo", "bar"]);
+        let c = |p| path_components(p).collect::<Vec<_>>();
+        assert_eq!(c("/foo/bar/baz"), ["foo", "bar", "baz"]);
+        assert_eq!(c("/"), Vec::<&str>::new());
+        assert_eq!(c("//foo///bar//"), ["foo", "bar"]);
+    }
+
+    /// `..` must cross the base/relative boundary, and must clamp at the root
+    /// rather than escaping it — the two properties `resolve_path`'s
+    /// single-allocation rewrite had to preserve.
+    #[test]
+    fn resolve_path_dotdot_crosses_base_and_clamps_at_root() {
+        assert_eq!(resolve_path("/a", "../b"), "/b");
+        assert_eq!(resolve_path("/a/b/c", "../../d"), "/a/d");
+        assert_eq!(resolve_path("/", ".."), "/");
+        assert_eq!(resolve_path("/a", "../../../.."), "/");
+        assert_eq!(canonicalize_path("/.."), "/");
+        assert_eq!(canonicalize_path("../.."), "/");
+        assert_eq!(canonicalize_path("/a/./b/../c"), "/a/c");
+        // A relative base behaves as it always did: no leading slash invented.
+        assert_eq!(resolve_path("/x", "y/../z"), "/x/z");
     }
 }
 

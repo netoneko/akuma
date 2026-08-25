@@ -751,7 +751,7 @@ pub fn dev_node(path: &str) -> Option<DevNode> {
 /// `name` is `/dev`-relative and must not contain a slash; a nested path such
 /// as `net/tap0` simply matches nothing.
 pub fn dev_node_named(name: &str) -> Option<DevNode> {
-    akuma_vfs::dev::lookup(&dev_probe(), name)
+    akuma_vfs::dev::lookup(dev_probe(), name)
 }
 
 /// Whether `path` resolves to `/dev` itself.
@@ -771,8 +771,7 @@ fn dev_entries(path: &str) -> Vec<DirEntry> {
     if !is_dev_dir(path) {
         return Vec::new();
     }
-    akuma_vfs::dev::list(&dev_probe())
-        .into_iter()
+    akuma_vfs::dev::list(dev_probe())
         .map(|node| DirEntry {
             name: String::from(node.name),
             is_dir: false,
@@ -787,7 +786,8 @@ fn dev_entries(path: &str) -> Vec<DirEntry> {
 /// fail at the `open("/dev")` existence probe before ever reaching
 /// [`dev_entries`].
 fn dev_dir_metadata(path: &str) -> Option<Metadata> {
-    if !is_dev_dir(path) || akuma_vfs::dev::list(&dev_probe()).is_empty() {
+    // `list` is an iterator, so "has any node" costs one step, not a listing.
+    if !is_dev_dir(path) || akuma_vfs::dev::list(dev_probe()).next().is_none() {
         return None;
     }
     Some(Metadata {

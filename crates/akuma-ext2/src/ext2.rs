@@ -2047,15 +2047,14 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     }
 
     fn lookup_path_internal(&self, state: &Ext2State, path: &str) -> Result<u32, FsError> {
-        let components = path_components(path);
-
-        if components.is_empty() {
-            return Ok(ROOT_INODE);
-        }
-
+        // `path_components` is an iterator, so this walk allocates nothing —
+        // it runs on every path resolution. The empty-path case needs no
+        // special handling: zero components means the loop never runs and
+        // `ROOT_INODE` falls through, which is what the old explicit
+        // `is_empty()` early-return did.
         let mut current_inode = ROOT_INODE;
 
-        for component in components {
+        for component in path_components(path) {
             let inode = self.read_inode(state, current_inode)?;
 
             if (inode.type_perms & 0xF000) != S_IFDIR {
