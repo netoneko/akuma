@@ -260,10 +260,23 @@ ACTION_ARGS=()
 case "$KERNEL_DROPOFF" in
   0|off|no|false|FALSE) ;;
   1|on|yes|true|TRUE)
+    # virtio-blk reports a FIXED capacity to the guest, set once from $BIN's byte
+    # size at the moment QEMU opens it — it can't grow for the life of this qemu
+    # process. Pad $BIN out to $SIZE_LIMIT (the same ceiling the size guard above
+    # already enforces, so this never legitimizes an oversized kernel) so an
+    # in-guest self-hosted rebuild that's merely bigger than *this boot's*
+    # kernel — not bigger than the policy ceiling — still fits. Without this, a
+    # `dd` of a larger-but-still-in-budget kernel ENOSPCs partway through and
+    # corrupts the live $BIN (unsnapshotted, since /dev/vdb *is* this file) —
+    # see docs/runbooks/selfhost-kernel-build.md §7. Trailing zero bytes past
+    # the real kernel are harmless: -kernel loads them into RAM after the
+    # image, and the kernel's own layout comes from linker symbols, not the
+    # file's on-disk length.
+    truncate -s "$SIZE_LIMIT" "$BIN"
     DROPOFF_ARGS=(-drive "file=${BIN},if=none,format=raw,id=kdrop" \
                   -device virtio-blk-device,drive=kdrop,bus=virtio-mmio-bus.6)
     ACTION_ARGS=(-action reboot=shutdown)
-    echo "[cargo_runner] KERNEL_DROPOFF=1: $BIN also mounted as its own virtio-blk drive; a guest reboot(2) exits qemu and this script relaunches with the current $BIN" >&2
+    echo "[cargo_runner] KERNEL_DROPOFF=1: $BIN padded to $((SIZE_LIMIT / 1024))KB and mounted as its own virtio-blk drive; a guest reboot(2) exits qemu and this script relaunches with the current $BIN" >&2
     ;;
   *)
     echo "[cargo_runner] ERROR: KERNEL_DROPOFF must be 0|1 (got '$KERNEL_DROPOFF')" >&2

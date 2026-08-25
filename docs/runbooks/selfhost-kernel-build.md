@@ -830,6 +830,20 @@ Two things that bite:
   rebuild it (`cargo build --release`, then `rust-objcopy -O binary <elf>
   <elf>.bin` — what `cargo_runner.sh` does unconditionally on every `cargo
   run`) before trusting the next reboot.
+  - **Corollary, hit 2026-08-25**: virtio-blk reports a *fixed* capacity to
+    the guest, set once from `$BIN`'s byte size at the moment this QEMU
+    process opened it — it cannot grow for the life of that process. An
+    in-guest self-hosted rebuild that's bigger than *this boot's* kernel (even
+    if still under the size-guard ceiling) will `ENOSPC` partway through the
+    `dd`, and since the drive is the live file, that partial write **lands** —
+    corrupting `akuma.bin` into a truncated image before you ever get to
+    `reboot -f`. Recovered the same way: `rust-objcopy -O binary <elf>
+    <elf>.bin` from the still-intact ELF. `cargo_runner.sh` now pads `$BIN` up
+    to the size guard's own ceiling (`$SIZE_LIMIT` — 4 MB for
+    release/devbox-smoltcp) whenever `KERNEL_DROPOFF=1`, precisely so a rebuild
+    has room to grow without hitting this — but only up to that ceiling; a
+    kernel that grows past 4 MB still needs a host-side QEMU restart to pick up
+    a bigger drop-off drive.
 - **This only works against the unmounted drop-off drive.** Write-open of a
   *mounted* device — i.e. trying the same trick against `/dev/vda`, the
   rootfs — is refused `EBUSY` by design, so it can't be used to self-modify
