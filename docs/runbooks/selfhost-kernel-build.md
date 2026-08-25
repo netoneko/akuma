@@ -786,22 +786,30 @@ INSTANCE=1 KERNEL_DROPOFF=1 DEVBOX_DISK=devbox.img overlays/devbox/run-smoltcp.s
 ```
 
 **In guest**, after a self-host build (§4/§5) produces a fresh ELF, flatten it
-and drop it onto the drive:
+and drop it onto the drive with `scripts/dropoff_kernel.sh` — checked in at
+the repo root the guest's own `/root/akuma` checkout already has, busybox-sh
+compatible, and it refuses to run anywhere that isn't Akuma (`uname -s`):
 
 ```sh
-rust-objcopy -O binary target/aarch64-unknown-none/release/akuma /tmp/new_akuma.bin
-dd if=/tmp/new_akuma.bin of=/dev/vdb bs=1M
+scripts/dropoff_kernel.sh                      # defaults: the release ELF -> /dev/vdb
+scripts/dropoff_kernel.sh <elf-path> <drive>    # override either
 reboot -f
 ```
+
+It does the same three steps as the raw commands (objcopy, `dd`, done) —
+`rust-objcopy` then `llvm-objcopy`, whichever is on `PATH`; errors out with a
+clear message, not a silent no-op, if neither is; and does **not** reboot
+itself, so you always get a chance to look at its output first.
 
 **`reboot -f`, not bare `reboot`** — busybox's plain `reboot` tries to signal
 an init process first and fails `EPERM` on this kernel (no init to signal);
 `-f` calls `reboot(2)` directly and is what actually exits QEMU.
 
-If the guest toolchain has no `rust-objcopy`/`llvm-objcopy`, pull the ELF out
-and flatten it on the host first (§"Verify" below has the `base64` extraction
-command), then `scp`/base64 the `.bin` back in before the final `dd` — the
-`dd`-onto-`/dev/vdb` step is the same either way.
+If the guest toolchain has neither `rust-objcopy` nor `llvm-objcopy`
+(`dropoff_kernel.sh` will say so and exit 1 rather than guess), pull the ELF
+out and flatten it on the host first (§"Verify" below has the `base64`
+extraction command), then `scp`/base64 the `.bin` back in and `dd` it onto
+`/dev/vdb` directly — the script is only for the in-guest objcopy step.
 
 **Host side**, confirm the relaunch and that it's actually the new build:
 
