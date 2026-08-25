@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 set -e
 # Build the devbox kernel: plain `--release` codegen plus a
 # feature set that makes the NetBSD rump stack the DEFAULT network stack for box 0

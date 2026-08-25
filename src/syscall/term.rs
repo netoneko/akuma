@@ -209,6 +209,21 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     // isatty() probes) so shells like busybox run non-interactively over the
     // SSH-into-box bridge instead of launching a line editor that hangs on an
     // ESC[6n cursor query. Console/boot processes keep is_terminal == true.
+    //
+    // The CHANNEL check alone is not enough: a fork+exec pipeline child
+    // (`cat file | less`) has fd 0 dup2'd to a PipeRead, but still inherits the
+    // shell's terminal channel — so isatty(0) returned true inside a pipeline
+    // and busybox less (no FILE arg, stdin "a tty") printed its usage and
+    // exited 1 instead of paging the pipe. The fd TABLE entry is the ground
+    // truth: only Stdin/Stdout/Stderr (the channel-backed console fds) are a
+    // tty; anything else dup'd over them (PipeRead, File, ...) is not.
+    match proc.get_fd(fd) {
+        Some(akuma_exec::process::FileDescriptor::Stdin
+        | akuma_exec::process::FileDescriptor::Stdout
+        | akuma_exec::process::FileDescriptor::Stderr) => {}
+        _ => return ENOTTY, // fd is a pipe/file/socket, not the console tty
+    }
+
     if let Some(ch) = akuma_exec::process::current_channel()
         && !ch.is_terminal()
     {

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Push a freshly HOST-built kernel onto an ALREADY-RUNNING KERNEL_DROPOFF
 # guest's drop-off drive, then trigger the reboot that picks it up.
 #

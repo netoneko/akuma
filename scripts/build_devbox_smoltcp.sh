@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 set -e
 # Build the devbox-smoltcp kernel: the DEFAULT devbox going forward.
 #

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 set -e
 # extreme-size: like `size` but with the non-essential syscall families gated
 # out. There is no in-kernel TLS or cryptography at all any more (purged

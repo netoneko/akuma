@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Capture QEMU serial (mon:stdio) to a file while running Akuma for forktest / mmap investigation.
 #
 # Usage:
