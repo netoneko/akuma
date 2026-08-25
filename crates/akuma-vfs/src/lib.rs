@@ -7,11 +7,13 @@
 
 extern crate alloc;
 
+pub mod dev;
 mod memfs;
 mod mount;
 mod path;
 mod types;
 
+pub use dev::{DevNode, DevProbe};
 pub use memfs::MemoryFilesystem;
 pub use mount::{MountSet, MountSnapshot, MountTable, MS_RDONLY, MS_REMOUNT, ST_RDONLY};
 pub use path::{canonicalize_path, path_components, resolve_path, split_path};

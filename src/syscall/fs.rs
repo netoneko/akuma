@@ -1754,6 +1754,21 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         return ESRCH;
     }
 
+    // Every device with `open()` behavior has returned by now. Anything still in
+    // the table is a node this kernel can list and `stat` but not open — the
+    // block devices, deliberately (`DEVFS_MISSING.md` §4: nothing reads a disk
+    // except through `Ext2Filesystem`, so a raw block fd has no consumer, and
+    // `mount(2)` resolves its source by name, not by fd). Refuse here: now that
+    // `crate::fs::exists` knows about them, the generic path below would
+    // otherwise hand out a `File` fd whose first `read()` fails against ext2 —
+    // a failure at the wrong syscall. `ENODEV` matches `/dev/net/tap0` above.
+    if crate::vfs::dev_node(&path).is_some() {
+        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            crate::safe_print!(256, "[syscall] openat({}) ENODEV (no fd behavior)\n", &path);
+        }
+        return ENODEV;
+    }
+
     let path = if path == "/proc/self/exe" {
         if let Some(proc) = akuma_exec::process::current_process_shared() {
             proc.name.clone()
@@ -2110,12 +2125,22 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
 
     let mut stat = Stat::default();
     let res = (|| {
-        if resolved_path == "/dev/null" {
-            stat = Stat { st_dev: 0, st_ino: 1, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 3), st_blksize: 4096, ..Default::default() };
-            return 0;
-        }
-        if resolved_path == "/dev/zero" {
-            stat = Stat { st_dev: 0, st_ino: 5, st_size: 0, st_mode: 0o20666, st_nlink: 1, st_rdev: makedev(1, 5), st_blksize: 4096, ..Default::default() };
+        // One table lookup where `/dev/null` and `/dev/zero` used to be two
+        // hand-copied arms — which is why `/dev/random`, `/dev/urandom` and
+        // `/dev/dsp` all `open()`ed fine and then `stat()`ed `ENOENT`
+        // (`DEVFS_MISSING.md` §1.2). `Metadata` has no `rdev` field, so this
+        // calls `dev_node` rather than going through `crate::vfs::metadata`.
+        if let Some(node) = crate::vfs::dev_node(&resolved_path) {
+            stat = Stat {
+                st_dev: 0,
+                st_ino: node.ino,
+                st_size: 0,
+                st_mode: node.mode(),
+                st_nlink: 1,
+                st_rdev: makedev(u64::from(node.major), u64::from(node.minor)),
+                st_blksize: 4096,
+                ..Default::default()
+            };
             return 0;
         }
 
@@ -2240,7 +2265,10 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
     };
     let path = crate::vfs::resolve_symlinks(&path);
 
-    if path == "/dev/null" || path == "/dev/zero" {
+    // chmod on a device node is a no-op that succeeds. Was `/dev/null` and
+    // `/dev/zero` only; through the table it covers every node, so
+    // `chmod /dev/urandom` stops returning `ENOENT` for a path that exists.
+    if crate::vfs::dev_node(&path).is_some() {
         return 0;
     }
 
@@ -2369,10 +2397,10 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
 
     let (mode, ino, size, nlink, atime, mtime, ctime, rdev_major, rdev_minor) =
-        if resolved_path == "/dev/null" {
-            (0o20666u16, 1u64, 0u64, 1u32, 0i64, 0i64, 0i64, 1u32, 3u32)
-        } else if resolved_path == "/dev/zero" {
-            (0o20666u16, 5u64, 0u64, 1u32, 0i64, 0i64, 0i64, 1u32, 5u32)
+        // The second copy of `sys_newfstatat`'s device arms, now the same
+        // single lookup — see the comment there.
+        if let Some(node) = crate::vfs::dev_node(&resolved_path) {
+            (node.mode() as u16, node.ino, 0u64, 1u32, 0i64, 0i64, 0i64, node.major, node.minor)
         } else if !follow && crate::vfs::is_symlink(&resolved_path) {
             let target = crate::vfs::read_symlink(&resolved_path).unwrap_or_default();
             (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0)
@@ -2851,11 +2879,25 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
             Ok(e) => e,
             Err(e) => return fs_error_to_errno(e),
         };
+        // `DirEntry` carries only is_dir/is_symlink, so a device node would
+        // otherwise report DT_REG. Only `/dev` can hold one, so the check is
+        // hoisted out of the per-entry map: every other directory listing pays
+        // one string compare total, not a table lookup per entry.
+        let is_dev = crate::vfs::is_dev_dir(&f.path);
         let cache: alloc::vec::Vec<akuma_exec::process::types::DirCacheEntry> = dir_entries
             .iter()
             .map(|e| akuma_exec::process::types::DirCacheEntry {
                 name: e.name.clone(),
-                d_type: if e.is_dir { 4 } else if e.is_symlink { 10 } else { 8 },
+                d_type: if e.is_dir {
+                    4
+                } else if e.is_symlink {
+                    10
+                } else {
+                    match is_dev.then(|| crate::vfs::dev_node_named(&e.name)).flatten() {
+                        Some(node) => node.d_type(),
+                        None => 8,
+                    }
+                },
             })
             .collect();
         let snapshot = cache.clone();

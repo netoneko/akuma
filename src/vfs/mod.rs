@@ -14,7 +14,7 @@ use spinning_top::Spinlock;
 
 // Re-export everything from the crate so existing `use crate::vfs::*` keeps working.
 pub use akuma_vfs::{
-    DirEntry, Filesystem, FsError, FsStats, Metadata, MountInfo,
+    DevNode, DevProbe, DirEntry, Filesystem, FsError, FsStats, Metadata, MountInfo,
     MS_RDONLY, ST_RDONLY,
     canonicalize_path, resolve_path, split_path,
 };
@@ -281,7 +281,26 @@ where
 /// This includes both entries from the underlying filesystem and any
 /// mount points that appear as direct children of the listed directory.
 pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, FsError> {
-    let mut entries = with_fs(path, |fs, rel| fs.read_dir(rel))?;
+    // Synthetic /dev nodes, computed before the on-disk read so a `/dev` that
+    // isn't on the image at all still lists. Empty for every other path, and
+    // empty inside a box.
+    let dev_entries = dev_entries(path);
+
+    let mut entries = match with_fs(path, |fs, rel| fs.read_dir(rel)) {
+        Ok(entries) => entries,
+        // No real `/dev` directory, but the table has nodes: list those rather
+        // than reporting a `/dev` that `stat` and `open` both say exists.
+        Err(_) if !dev_entries.is_empty() => Vec::new(),
+        Err(e) => return Err(e),
+    };
+
+    // A real on-disk node of the same name shadows the synthetic one, matching
+    // how a mount point shadows an existing directory below.
+    for entry in dev_entries {
+        if !entries.iter().any(|e| e.name == entry.name) {
+            entries.push(entry);
+        }
+    }
 
     // Add mount points that are direct children of this directory
     let mount_entries = get_child_mount_points(path);
@@ -393,7 +412,13 @@ pub fn exists(path: &str) -> bool {
     if is_mtab(path) {
         return true;
     }
-    with_fs(path, |fs, rel| Ok(fs.exists(rel))).unwrap_or(false)
+    if dev_node(path).is_some() {
+        return true;
+    }
+    if with_fs(path, |fs, rel| Ok(fs.exists(rel))).unwrap_or(false) {
+        return true;
+    }
+    dev_dir_metadata(path).is_some()
 }
 
 /// Get file size
@@ -414,7 +439,22 @@ pub fn metadata(path: &str) -> Result<Metadata, FsError> {
             accessed: None,
         });
     }
-    with_fs(path, |fs, rel| fs.metadata(rel))
+    // Device nodes. `Metadata` carries no `rdev`, so `sys_newfstatat` /
+    // `sys_statx` call `dev_node` directly for the full `stat` — this arm is
+    // what makes `faccessat2` and every other `metadata` caller agree with
+    // them about what exists.
+    if let Some(node) = dev_node(path) {
+        return Ok(Metadata {
+            is_dir: false,
+            size: 0,
+            inode: node.ino,
+            mode: node.mode(),
+            created: None,
+            modified: None,
+            accessed: None,
+        });
+    }
+    with_fs(path, |fs, rel| fs.metadata(rel)).or_else(|e| dev_dir_metadata(path).ok_or(e))
 }
 
 /// Change file permissions
@@ -644,6 +684,121 @@ fn mtab_rows(path: &str) -> Option<Vec<u8>> {
 /// no render, no allocation).
 fn is_mtab(path: &str) -> bool {
     path.ends_with("mtab") && resolve_absolute(path) == MTAB_PATH
+}
+
+// ============================================================================
+// /dev
+// ============================================================================
+
+/// `/dev` is virtual in the same shape `/etc/mtab` is: a resolve-time check
+/// ahead of `with_fs`, not a mounted `Filesystem`. The nodes themselves live in
+/// `akuma_vfs::dev` as pure data; this section is the only thing that knows
+/// what the kernel actually probed (`crate::block`, `crate::audio`) and who is
+/// asking (`box_id`). Background: `docs/archive/DEVFS_MISSING.md`.
+///
+/// Content is *not* served here — `sys_openat` intercepts a device path before
+/// the VFS is reached and serves bytes from the `FileDescriptor` variant. This
+/// layer answers "what exists" only.
+const DEV_DIR: &str = "/dev";
+
+/// Synthetic inode for the `/dev` directory itself, when the image has no real
+/// one. Sits next to `/etc/mtab`'s `u64::MAX - 1`, well clear of ext2's range.
+const DEV_DIR_INO: u64 = u64::MAX - 2;
+
+/// Live kernel state plus caller identity, assembled for `akuma_vfs::dev`.
+fn dev_probe() -> DevProbe {
+    let mut block_slots = 0u8;
+    for idx in 0..akuma_vfs::dev::MAX_BLOCK_SLOTS {
+        if crate::block::device_name(idx).is_some() {
+            block_slots |= 1 << idx;
+        }
+    }
+    DevProbe {
+        audio: crate::audio::is_available(),
+        block_slots,
+        // Boxes get no synthetic /dev — see `DevProbe::in_box` for why, and
+        // for the two carve-outs (`null`/`zero` stat, and `/dev/net/tap0`,
+        // which was never in this table and keeps working through `sys_openat`
+        // so a `stack = rump` box still has a NIC).
+        in_box: akuma_exec::process::current_process_shared().is_some_and(|p| p.box_id != 0),
+    }
+}
+
+/// The device node `path` names, if it is one and the caller may see it.
+///
+/// The single lookup behind `stat`/`statx`/`access` on a device path — the
+/// replacement for the four copy-pasted `if resolved_path == "/dev/null"`
+/// blocks `DEVFS_MISSING.md` §1.2 catalogued.
+///
+/// Absolute paths — the shape every syscall-layer caller passes — resolve with
+/// no allocation. A relative one pays a single `String`, the same one
+/// `resolve_mount` allocates on the very next line.
+pub fn dev_node(path: &str) -> Option<DevNode> {
+    if let Some(name) = path.strip_prefix("/dev/") {
+        return dev_node_named(name);
+    }
+    if path.starts_with('/') {
+        return None;
+    }
+    let absolute = resolve_absolute(path);
+    dev_node_named(absolute.strip_prefix("/dev/")?)
+}
+
+/// [`dev_node`] for a caller that already knows the entry sits directly under
+/// `/dev` and has only the bare name — `sys_getdents64`, filling `d_type`.
+/// Saves building a path just to strip the prefix back off.
+///
+/// `name` is `/dev`-relative and must not contain a slash; a nested path such
+/// as `net/tap0` simply matches nothing.
+pub fn dev_node_named(name: &str) -> Option<DevNode> {
+    akuma_vfs::dev::lookup(&dev_probe(), name)
+}
+
+/// Whether `path` resolves to `/dev` itself.
+pub fn is_dev_dir(path: &str) -> bool {
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
+    if trimmed == DEV_DIR {
+        return true;
+    }
+    if trimmed.starts_with('/') {
+        return false;
+    }
+    resolve_absolute(trimmed) == DEV_DIR
+}
+
+/// The synthetic entries `ls /dev` should show, empty for every other path.
+fn dev_entries(path: &str) -> Vec<DirEntry> {
+    if !is_dev_dir(path) {
+        return Vec::new();
+    }
+    akuma_vfs::dev::list(&dev_probe())
+        .into_iter()
+        .map(|node| DirEntry {
+            name: String::from(node.name),
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+        })
+        .collect()
+}
+
+/// Metadata for the `/dev` *directory*, used only when the image has no real
+/// one but the table does have nodes to show. Without this, `ls /dev` would
+/// fail at the `open("/dev")` existence probe before ever reaching
+/// [`dev_entries`].
+fn dev_dir_metadata(path: &str) -> Option<Metadata> {
+    if !is_dev_dir(path) || akuma_vfs::dev::list(&dev_probe()).is_empty() {
+        return None;
+    }
+    Some(Metadata {
+        is_dir: true,
+        size: 0,
+        inode: DEV_DIR_INO,
+        mode: 0o40755,
+        created: None,
+        modified: None,
+        accessed: None,
+    })
 }
 
 /// What `statfs`/`fstatfs` need from the mount a path resolves to.

@@ -98,6 +98,11 @@ file only calls into it.
 ready) and `/proc/self/exe` before ever touching the real filesystem — see
 `../vfs.md` "procfs" for what those resolve to.
 
+Only `open()` behavior lives here. **What a device path *is*** — whether it
+exists, and what `stat` reports — comes from one table (`akuma_vfs::dev`, via
+`crate::vfs::dev_node`); see `../vfs.md` "/dev", including why `open()` on
+`/dev/vda`..`vdd` is `ENODEV` and why a box sees no synthetic `/dev`.
+
 For a real path:
 - File doesn't exist and `O_CREAT` not set → `ENOENT`.
 - File doesn't exist, `O_CREAT` set, but the **parent directory** doesn't
@@ -281,10 +286,14 @@ stay in `container.rs`, correctly gated.
   of `remove_file`; without the flag, a plain `unlinkat` also always calls
   `crate::vfs::remove_symlink` first (harmless no-op if the target isn't a
   symlink) before `remove_file`.
-- **`statx`** synthesizes `/dev/null`/`/dev/zero` stat data inline (does not
-  consult the VFS) and supports `AT_EMPTY_PATH` (empty path + valid `dirfd`
-  → stat the fd itself) and `AT_SYMLINK_NOFOLLOW`; only `STATX_BASIC_STATS`
-  fields are ever populated regardless of the requested `mask`.
+- **`statx`** takes device stat data from `crate::vfs::dev_node` (one table,
+  shared with `newfstatat`; it does not go through `crate::vfs::metadata`
+  because `Metadata` carries no `rdev`) and supports `AT_EMPTY_PATH` (empty
+  path + valid `dirfd` → stat the fd itself) and `AT_SYMLINK_NOFOLLOW`; only
+  `STATX_BASIC_STATS` fields are ever populated regardless of the requested
+  `mask`. Until 2026-08-25 it synthesized `/dev/null`/`/dev/zero` inline, as a
+  second independent copy of `newfstatat`'s — which is why every *other* device
+  `stat`ed `ENOENT` (`../../archive/DEVFS_MISSING.md`).
 
 ## Background
 

@@ -84,6 +84,68 @@ the `akuma_vfs` crate.
 (`archive/SHARED_FD_TABLES.md`). Across **fork** the table is copied (with
 CLOEXEC stripping at exec). epoll fds are stripped on fork (not refcounted).
 
+## /dev
+
+`/dev` is virtual, in the same shape `/etc/mtab` is: a resolve-time check ahead
+of `with_fs` in `src/vfs/mod.rs`, **not** a mounted `Filesystem`. There is no
+`DevFilesystem` and no `mknod` — the set is fixed at boot from what was actually
+probed.
+
+Two halves, deliberately kept apart:
+
+| Concern | Where | Covers |
+|---|---|---|
+| **What exists** (`ls`, `stat`, `statx`, `access`, `chmod`) | `akuma_vfs::dev`, one table | `null`, `zero`, `random`, `urandom`, `dsp`/`audio`, `vda`..`vdd` |
+| **What `open()` does** | `sys_openat`'s per-device blocks (`src/syscall/fs.rs`) | the same list minus `vd*`, plus `/dev/net/tap0` |
+
+`akuma_vfs::dev` (`crates/akuma-vfs/src/dev.rs`) is pure data: every entry is a
+function of a `DevProbe` (`audio`, `block_slots`, `in_box`), so the whole table
+is host-unit-tested with no boot. `src/vfs/mod.rs::dev_probe` is the only thing
+that reads live state (`crate::audio::is_available`, `crate::block::device_name`,
+`box_id`). `dev_node(path)` / `dev_node_named(name)` are the single lookup behind
+every stat-family syscall — before 2026-08-25 `sys_newfstatat` and `sys_statx`
+each hardcoded `/dev/null` and `/dev/zero` independently, so `/dev/random`,
+`/dev/urandom` and `/dev/dsp` `open()`ed fine and `stat()`ed `ENOENT`
+([`../../archive/DEVFS_MISSING.md`](../../archive/DEVFS_MISSING.md)).
+
+Details that bite:
+
+- **`open()` on `vda`..`vdd` is `ENODEV`, deliberately.** They list and `stat`,
+  but nothing reads a disk except through `Ext2Filesystem`, so a raw block fd
+  has no consumer. `mount(2)` resolves its `source` by *name*
+  (`device_index_by_name` strips an optional `/dev/` prefix and never touches
+  the filesystem), so mounting a second disk needs none of this. The explicit
+  refusal exists because `crate::fs::exists` now says yes — without it the
+  generic path would hand out a `File` fd whose first `read()` fails against
+  ext2, moving the error to the wrong syscall.
+- **`/dev` itself is synthesized when the image has no real one**, otherwise
+  `ls /dev` would fail at `open("/dev")` before reaching the listing.
+- **A real on-disk node shadows a synthetic one**, matching how a mount point
+  shadows an existing directory.
+- **`/dev/net/tap0` is not in the table** — nested path, `open()`-only, rump
+  feature. It is unaffected by all of the above.
+- **`getdents64` asks the table for `d_type`** (`DT_CHR`/`DT_BLK`), because
+  `DirEntry` carries only `is_dir`/`is_symlink` and would otherwise report
+  `DT_REG`. The check is hoisted: non-`/dev` listings pay one string compare.
+
+### Boxes get no synthetic /dev
+
+A scope decision made 2026-08-25 to keep this simple, not a limitation
+discovered. `DevProbe::in_box` (set when `box_id != 0`) empties the table, so a
+box sees only whatever its own rootfs holds — the host's disks and sound card
+never appear in a box's `ls /dev`. Two carve-outs:
+
+- `null` and `zero` still answer `stat` in a box, because they did before the
+  table existed and turning `stat("/dev/null")` into `ENOENT` inside a box would
+  be a regression. They are still absent from the *listing* — the asymmetry
+  preserves the old behavior rather than inventing new behavior for boxes.
+- **`/dev/net/tap0` keeps working**, since it was never in the table and
+  `sys_openat` is untouched. A `stack = rump` box's `rump_server` opens it to
+  drive the NetBSD stack ([`rump-stack.md`](rump-stack.md)), so this is the one
+  device a box genuinely needs.
+
+Expand later if something asks for it; nothing does today.
+
 ## ext2
 
 `src/vfs/ext2.rs` bridges `akuma_ext2` to the kernel block devices

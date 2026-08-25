@@ -1869,6 +1869,78 @@ QEMU's address has not moved in the lifetime of the project — which is precise
 why this is a note rather than a task.
 
 
+## Issue 26: `[FUTEX-DUMP] table empty` + a QEMU `unhandled exception ec=0x20`, with no observed effect
+
+**Status: OPEN — observed, not investigated** (reported 2026-08-25). Recorded
+so the next person who sees these two lines has a prior, not because anything
+was diagnosed. **No repro, no root cause, and no known consequence**: the run
+that produced them was not reported as failing, and nothing downstream was
+noticed to misbehave.
+
+### What was seen
+
+Two adjacent lines in the log:
+
+```
+[T5040.14] [FUTEX-DUMP] table empty
+qemu-system-aarch64: 0x401e9dd8: unhandled exception ec=0x20
+```
+
+### What each line means
+
+**Line 1 is ours and is benign on its own.** `[FUTEX-DUMP]` comes from
+`futex_dump` (`src/syscall/sync.rs:504`), printed by the Thread-0 heartbeat
+under `config::DEADLOCK_THREAD_DUMP_ENABLED` (`src/config.rs:269`, **`true` by
+default**) once `>= 2` threads are `WAITING`. So the dump firing means only that
+the heartbeat's threshold was crossed — a routine condition under build load —
+not that anything is stuck.
+
+`table empty` is the specific outcome, and it is the *informative* half. Per
+that function's own doc comment, the whole point of the dump is to split a jam
+into two cases: a waiter still queued at `(tgid, uaddr)` means no wake was
+delivered to that key; a waiter queued **nowhere** means it was dequeued by a
+wake that then failed to make it runnable — the defect is in the wake/scheduler
+handoff, not the queueing. `table empty` is the strongest form of the second
+case: the parked threads the heartbeat counted are not on any futex queue at
+all. That is the signature the lost-wakeup work
+(`SELFHOST_DEVBOX_SMOLTCP.md` "Open issue #2", and the `-j4` scheduler wakeup
+bug fixed 2026-08-05) was chasing. It is equally consistent with the threads
+being parked on something that is not a futex, which is why this is not by
+itself evidence of a bug.
+
+**Line 2 is QEMU's, not the kernel's.** The string does not appear anywhere in
+`src/` or `crates/` (grep: 0 hits), and the `qemu-system-aarch64:` prefix is
+QEMU's own `error_report` format. `ec=0x20` decodes per this repo's own table
+(`src/exceptions.rs:2870` — "0x24/0x25 = data abort, 0x20/0x21 = instr abort")
+as an **instruction abort taken from a lower exception level**, i.e. EL0 branched
+somewhere it could not fetch from. `0x401e9dd8` is in the kernel's load range
+(QEMU virt puts the image at `0x4000_0000`+), not a user VA — which is the part
+that does not obviously fit "EL0 instruction abort" and is the first thing to
+pin down.
+
+### Why it is filed rather than fixed
+
+The two lines are adjacent in the log but nothing establishes they are related.
+Both are the *shape* of real bugs this repo has hit before — a lost wakeup
+(fixed 2026-08-05) and a stale-`Process` entry-point abort (the RELR/N×
+`INTERP_BASE` class, fixed 2026-08-06) — which is exactly why a silent
+recurrence is worth a note.
+
+### If you see it again
+
+1. **Capture the surrounding `[THR-DUMP]` lines.** `futex_dump` prints next to
+   `[THR-DUMP]`/`[PIPE-DUMP]`; the dump alone cannot tell "the waker never ran"
+   from "the waker ran and published nothing" — the thread dump is what names
+   the parked threads and their resume points.
+2. **Resolve `0x401e9dd8` against the running kernel**, not a rebuilt one:
+   `aarch64-none-elf-addr2line -f -e target/aarch64-unknown-none/release/akuma
+   0x401e9dd8`. A different build's symbols are worse than none here.
+3. **Do not treat it as a hang.** Per
+   [`../runbooks/recover-wedged-vm.md`](../runbooks/recover-wedged-vm.md) and
+   the Issue 3 sweep note above, gate "is it actually stuck" on an ssh
+   round-trip rather than on console strings.
+
+
 ## Background
 
 - [`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md)
