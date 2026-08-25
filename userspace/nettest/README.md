@@ -6,6 +6,7 @@ nothing but a directory, and are built by two different scripts.
 | Probe | Directory | Client stack | Investigation | Build |
 |---|---|---|---|---|
 | `nettest` | `rust/` | libcurl (vendored, static OpenSSL + nghttp2) | cargo-vs-curl HTTPS divergence | `rust/build.sh` (Alpine docker) |
+| `nettest parkprobe` (mode) | `rust/` | fork/waitpid/kill + blocking TCP, no curl | SMP=1 `idle_halt` scheduler freeze acceptance ([`SECOND_LISTENER_SMP1_FREEZE.md`](../../docs/archive/SECOND_LISTENER_SMP1_FREEZE.md)) | `rust/build.sh` (Alpine docker) |
 | `nettest-connect` | `rust/connect/` | raw `connect(2)` + `poll`/`select`/`epoll` — no library at all | cargo-vs-curl HTTPS divergence | `rust/build-musl.sh` (host cross) |
 | `nettest-std` | `rust/stdlib/` | `std::net` + `poll(2)` + sync rustls — no runtime | delayed first byte | `rust/build-musl.sh` (host cross) |
 | `nettest-reqwest` | `rust/reqwest/` | tokio + hyper 1.x + reqwest 0.12 + rustls — nca's stack | delayed first byte | `rust/build-musl.sh` (host cross) |

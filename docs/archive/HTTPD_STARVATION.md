@@ -156,6 +156,13 @@ to raise a voluntary reschedule. Same trigger, same single-core condition as
 this doc's Firecracker host; whether the milder starvation here is the same
 mechanism is the doc's remaining follow-up.
 
+**That bug is now FIXED** (`2439994b`, 2026-08-25: non-idle halters stay
+preemptible in `idle_halt`, verified by A/B and the `nettest parkprobe`
+acceptance probe). The fix is expected to cover this doc's starvation too —
+same park path, same 1-vCPU topology — but it has **not been retested on the
+Firecracker host**. Retest: enable two herd services per this doc's §Reproduce
+and check both answer.
+
 ## Background
 
 Found while deploying `main` (`2c1eb9d0`) to the AWS Firecracker host and adding

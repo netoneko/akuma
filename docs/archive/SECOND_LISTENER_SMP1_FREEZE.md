@@ -1,11 +1,11 @@
 # Second server after a bound listener: whole-kernel freeze at SMP=1 (2026-08-25)
 
-**Status: mechanism DIAGNOSED by GDB on the frozen VM (§2a); the fix is not yet
-designed.** Reproduced 4/4 in QEMU at SMP=1; the identical trigger at SMP=4
-(same 1024 MiB RAM) survives. Sibling of
-[`HTTPD_STARVATION.md`](HTTPD_STARVATION.md) (same trigger, harder failure) and
-probably unrelated to [`NGINX_LOST_WAKEUP.md`](NGINX_LOST_WAKEUP.md) (no epoll,
-no backstop rescue — the tick itself stops).
+**Status: FIXED (2026-08-25, `2439994b`).** Mechanism diagnosed by GDB on the
+frozen VM (§2a); fix = `idle_halt` keeps non-idle halters preemptible (§5,
+option 1, implemented). Verified by A/B against the parent commit and by the
+`nettest parkprobe` acceptance probe (§7). The Firecracker starvation sibling
+([`HTTPD_STARVATION.md`](HTTPD_STARVATION.md)) is expected to be covered by
+the same fix but has **not** been retested there yet.
 
 > **The one-line answer.** On a single-core QEMU boot with herd's sshd running
 > (one listener bound, in its accept loop), starting a **second server process
@@ -161,40 +161,38 @@ Anomaly worth recording: at SMP=1 the netpoll thread (tid=1) accumulated
 — the loop never reached its halt even before anything went wrong. Unknown
 whether related.
 
-## 5. Fix directions (not yet implemented)
+## 5. The fix (implemented as §5-option-1) and the alternatives considered
 
-The mechanism suggests three candidate fixes, in ascending invasiveness:
+Three candidate fixes, in ascending invasiveness:
 
-1. **Make `idle_halt` displacement-safe for non-idle callers.** The preempt
-   disable exists to keep halt residency out of the halter's CPU-time billing
-   (`threading/mod.rs:3040-3052`). For a *non-idle* thread (a socket waiter via
-   `blocking_relax_net`), being switched out mid-halt is acceptable — the
-   billing argument can be preserved by gating the disable on
-   `IS_IDLE_THREAD[tid]`, or by re-enabling preemption just before `wfi` and
-   re-disabling after (the halt itself is then preemptible; a tick landing in
-   it can displace the waiter, which is exactly what SMP=1 needs).
+1. **Make `idle_halt` displacement-safe for non-idle callers — IMPLEMENTED**
+   (`2439994b`). The preempt disable exists to keep halt residency out of the
+   halter's CPU-time billing (`threading/mod.rs`). For a *non-idle* thread (a
+   socket waiter via `blocking_relax_net`), being switched out mid-halt is
+   acceptable: the shipped fix gates the disable (and the matching re-enable,
+   and the `HOLD_TAG_IDLE` tag) on `IS_IDLE_THREAD[tid]`, so a non-idle
+   halter's `wfi` is preemptible and a timer tick can displace it — exactly
+   the displacement power the idle loop gets from its trailing `yield_now()`.
+   The quantum-shift correction is now clamped to `now` because a non-idle
+   halter can legitimately be descheduled mid-halt. Accepted cost: a socket
+   waiter's halt residency can land in its `cpu_us` bucket (billing-only
+   skew — the original motivation for the disable).
 2. **Park socket waiters via `schedule_blocking` (WAITING + backstop deadline)
    instead of `idle_halt` when `core_count() == 1`.** Deadline-driven parks are
    rescued by the wake-pass itself (it CASes WAITING→READY on every scheduler
    entry, even preempt-disabled ones), and the park's entry raises a voluntary
    SGI that immediately hands the core away. This is a policy split inside
    `blocking_relax_net`, mirroring the `net-waker-park`/promiscuous split
-   already modelled in `akuma-net-yarn` — and measurable there first.
+   already modelled in `akuma-net-yarn` — and measurable there first. Not
+   needed once (1) landed; kept here as the fallback if (1) regresses.
 3. **Scheduler-side: let the wake-pass escalate.** If a tick's wake-pass readied
    a thread but the current thread is preempt-disabled-and-parked (in
    `idle_halt`), treat the *next* scheduler entry as voluntary. Broad, risky,
-   and probably the wrong first move — listed for completeness.
+   and probably the wrong first move — listed for completeness. Not taken.
 
-Whichever is chosen, the acceptance test is §6's trigger at SMP=1 plus the
-SMP=4 four-listener soak, and the healthy-boot sshd-park case (§2a's open
-sub-question) should be measured before/after — the fix changes the park path
-every socket waiter takes.
+The acceptance test (§7's trigger + probe at SMP=1, SMP=4 sanity) passed.
 
-Remaining diagnosis follow-ups: (a) verify the traffic-seam hypothesis for
-healthy sshd parks (§2a open sub-question); (b) run §1's trigger on the
-Firecracker/Lima setup to confirm the starvation is the same mechanism.
-
-## 6. Reproducing the measurement
+## 6. Reproducing the (pre-fix) freeze
 
 ```bash
 cargo build --release --features devbox-smoltcp,no-tests
@@ -203,12 +201,44 @@ INSTANCE=1 MEMORY=1024 SMP=1 DISK=devbox.img scripts/cargo_runner.sh "$ELF" &
 # wait for "[herd] Starting service: sshd" in the log, then:
 ssh -o StrictHostKeyChecking=no -p 2322 root@localhost \
   '/bin/httpd 8090 >/tmp/h.log 2>&1 & sleep 1; nginx'
-# expect: log goes silent mid-trigger, ssh dead, QEMU ~3% CPU
+# pre-fix expect: log goes silent mid-trigger, ssh dead, QEMU ~3% CPU
+# post-fix expect: SURVIVED; /tmp/nettest parkprobe completes in <200 ms
 ```
 
 Beware the artifact trap from §3: after any `overlays/devbox-firecracker/build.sh`,
 rebuild the QEMU kernel before booting it (`cargo build --release --features
 devbox-smoltcp,no-tests` restores the cached artifact).
+
+## 7. Verification (2026-08-25, fix `2439994b` vs parent `0fa61f9f`)
+
+A/B against the parent commit (worktree build, same image, same
+`MEMORY=1024`), plus `nettest parkprobe` — a new nettest mode that reproduces
+the freeze configuration in one process tree (child A parked in blocking
+`accept` on a quiet loopback listener; child B forked and `_exit`s; parent
+parks in `wait4(B)`, then connects/echoes through A's listener and SIGKILLs A
+mid-park). PASS = reap+echo+kill completes; a frozen kernel hangs the probe
+itself, so the harness timeout is the failure signal. Build:
+`userspace/nettest/rust/build.sh` → `bootstrap/bin/nettest`.
+
+| check | parent `0fa61f9f` (pre-fix) | fix `2439994b` |
+|---|---|---|
+| SMP=1 freeze trigger (§1, all variants) | freezes; even `pkill nginx; /bin/httpd …` froze | survives; SSH answers throughout |
+| SMP=1 `parkprobe` | n/a (hangs by construction) | 5/5 PASS, ~70 ms total |
+| SMP=1 nginx `ab -n 100 -c 1` (pristine boot) | 11.9 ms/req, 0 failed | 10.5 / 13.1 / 12.4 ms/req, 0 failed ×3 |
+| SMP=1 httpd started AFTER nginx + `ab` | **froze at the start step** | survives; 15.1 ms/req, 0 failed |
+| SMP=4 `parkprobe` | — | PASS, 38.9 ms |
+| SMP=4 nginx `ab -n 100 -c 1` (clean) | 0.55–0.86 ms/req (same-day baseline) | 0.34 ms/req |
+
+No performance regression at either core count. A first-run `ab` against a
+port that already carried leftover listeners from the trigger (two httpds +
+nginx all on 8080) reports mass "failed requests" — that is port contention,
+not the fix; measure on a clean port.
+
+Remaining follow-ups: (a) the §2a open sub-question (why healthy boots
+tolerated sshd's accept parks) is now historical — the fix removes the
+mechanism — but the traffic-seam hypothesis was never verified; (b) retest
+[`HTTPD_STARVATION.md`](HTTPD_STARVATION.md) on the Firecracker host — the fix
+is expected to cover it, unproven.
 
 ## Background
 
