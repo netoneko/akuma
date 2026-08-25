@@ -252,3 +252,91 @@ Restored in `src/syscall/term.rs`'s `FIONREAD` arm, extended to `DevTty` for
 the same reason as the ioctl gate above. Verified live: typed bytes injected
 into the pty while a test program slept before reading were reported via
 `FIONREAD` (`r=0`, non-zero count) instead of the old unconditional `0`.
+
+---
+
+## Round 4: `box run` shared the caller's `TerminalState` across the box boundary
+
+Date: 2026-08-26. Not triggered by a live symptom report this time — found by
+re-reading `spawn.rs`'s terminal-inheritance logic (the doc comment written
+for round 2/3's sshd-multiplexing fix) while auditing whether ttys are
+allocated per box with no cross leak, and confirmed real before anything was
+changed.
+
+### Root cause
+
+The inheritance decision in `spawn_process_with_channel_ext`
+(`crates/akuma-exec/src/process/spawn.rs`) was `if !pty && let Some(shared) =
+current_terminal_state() { … }` — share the caller's `TerminalState` Arc
+unless the spawn is a `pty` spawn. That single condition conflates two
+different things `pty` was never meant to answer together: "does this
+child's stdin get line discipline" (correctly `pty`-gated) and "does this
+child get an *independent* terminal object" (which should also trip on a box
+crossing, and didn't).
+
+`SPAWN_EXT` — `box run`, herd's per-service launch — always calls
+`spawn_process_with_channel_ext(.., box_id, false)`: `pty` is hardcoded
+`false` (a boxed process's stdin is correctly a plain pipe by default), and
+`SpawnOptions` has no pty field at all. So every `box run`, including one
+that targets a box entirely unrelated to the caller's own, took the
+`!pty` branch and inherited the calling shell's `TerminalState` object
+verbatim — the exact `input_waker`-aliasing hazard round 2/3's doc comment
+already described for sshd's multiplexed sessions, just at the box boundary
+instead of the session boundary, and with a `box`-shaped guard nowhere in
+sight to catch it.
+
+This is a real leak, not a naming mismatch: `spawn_process_with_channel_ext`
+unconditionally sets `process.terminal_state.lock().foreground_pgid =
+process.pid` a few lines after the inheritance decision, on whichever object
+the child ended up with. Shared Arc ⇒ that write lands on the *caller's own*
+terminal too, silently repointing its `Ctrl+C` target at the just-spawned
+boxed process. Any raw-mode/`ECHO` ioctl the boxed process makes against its
+"own" termios mutates the caller's terminal the same way.
+
+### Fix
+
+`box_id != 0` now forces a fresh terminal independent of `pty`, extracted as
+a pure predicate so the decision doesn't need a running kernel to test:
+
+```rust
+const fn spawn_inherits_terminal(pty: bool, box_id: u64) -> bool {
+    !pty && box_id == 0
+}
+```
+
+`box_id == 0` (`SPAWN_EXT`'s "stay in the caller's box" case, and every plain
+`sys_spawn`) is unaffected — still inherits, matching a real shell
+subprocess sharing its parent's controlling terminal. `channel.set_terminal(pty)`
+(the actual line-discipline/`isatty()` decision) is untouched — still driven
+by `pty` alone, so a piped `box run` still correctly gets a raw pipe on
+stdin, not a tty.
+
+### Verification (done, live, isolated instance — not the self-hosting VM)
+
+- 4 new host-run unit tests on the pure predicate
+  (`spawn.rs`'s `terminal_inheritance_tests`): same-box non-pty inherits,
+  pty spawn never inherits (same box or not), box-crossing spawn never
+  inherits (pty or not). `cargo test -p akuma-exec`: 269/269 pass.
+- New boot-suite integration test,
+  `test_box_crossing_spawn_gets_fresh_terminal_state`
+  (`src/process_tests.rs`, `sc-containers`-gated): registers a
+  `TerminalState` under the test thread's own id (what `current_terminal_state()`
+  checks first), spawns once same-box (must inherit — `Arc::ptr_eq` true) and
+  once into a fresh box (must not — `Arc::ptr_eq` false). Booted on a private
+  QEMU instance (own disk clone, own ports, `INSTANCE=7`): **PASSED**, both
+  cases.
+- `box run redis-alpine redis-server` on the same instance: spawned, showed
+  up in `box ps`, closed cleanly via `box close` — no regression from the
+  `pty`/`box_id` split.
+- `cargo clippy` clean on `akuma-exec` (host target), `akuma --release`, and
+  `akuma --profile extreme-size` (`-D warnings`, matching the pre-commit
+  hook's three passes).
+
+### Docs
+
+`docs/reference/subsystems/ssh.md` "Terminal handling" and
+`docs/reference/subsystems/containers.md` "Box permissions" both cross-reference
+this fix — the latter specifically notes it's a data-isolation gap
+(`TerminalState` sharing), distinct from the `can_access_box` *authorization*
+table right above it, which was already correctly gating `SPAWN_EXT(box_id !=
+0)` and never the problem here.
