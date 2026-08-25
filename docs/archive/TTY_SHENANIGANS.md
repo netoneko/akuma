@@ -135,3 +135,116 @@ saw a key, hung forever, and the typed bytes were consumed as pipe input.
   - `test -t 0` inside a pipeline still reports not-a-tty;
   - `ls -l /dev/tty` shows the node; a non-terminal-channel process opening
     `/dev/tty` gets an error, not the command stream.
+
+---
+
+## Round 3: both flagged regressions were real, plus two unrelated red herrings
+
+Date: 2026-08-25 (branch `even-more-fixes`, after round 2 landed as commits
+`73d1b099`/`b19ae838`). Triggered by a live report: `hx <file>` failed with
+`Error: unable to start Helix / Caused by: No such file or directory (os
+error 2)` on the `devbox-smoltcp` instance, and `nca` appeared to fail the
+same way. The working hypothesis going in was that the round-1/round-2 tty
+work had broken file-resolution or tty-inheritance somewhere. **Neither
+guess was the actual cause of the reported crashes** — but chasing them down
+surfaced two real bugs the round-2 diff's own "needs verification" section
+had already flagged and never checked.
+
+### The two reported crashes were red herrings
+
+- **`hx <file>`: "No such file or directory (os error 2)"**, reproducible
+  even via a non-interactive SSH exec (no tty involved at all). Root cause
+  found with `SYSCALL_DEBUG_IO_ENABLED=true` (`src/config.rs`) + a
+  syscall-trace capture: Helix shells out to `tput cols`/`tput lines` during
+  startup (as `terminal_size` crate's supplementary probe) and
+  `execve("*/tput", …)` failed for all 6 `$PATH` candidates — `ncurses` /
+  `ncurses-terminfo-base` was never installed on the devbox rootfs, so
+  neither `tput` nor a terminfo database exists. **This looked like the fix
+  at first (`apk add ncurses` got `hx` past the crash) but was a dead-end: it
+  is not actually needed.** Once the real bug below was fixed, `hx` launches
+  fine with `ncurses` *removed again* — `terminal_size`'s ioctl-on-`/dev/tty`
+  probe succeeds once `/dev/tty` ioctls work at all (see below), and the
+  `tput` fallback path is simply never reached. `newfstatat`/`execve`
+  correctly reported ENOENT for a file that genuinely doesn't exist; the
+  bug was upstream of that, in why Helix ever needed to ask `tput` in the
+  first place. Explains "neither hx nor nca required ncurses before" — they
+  still don't; nothing needs to be added to `overlays/devbox/bootstrap.sh`.
+- **`nca` "read error: No such device (os error 19)" / crashing in both TUI
+  and non-TUI mode**: reproduced ONLY when driving it through `ssh host
+  "nca"` (an SSH **exec** channel request). `userspace/sshd/src/protocol.rs`'s
+  `run_exec_session` always spawns with `spawn(...)` (`pty=false`), by
+  design — exec-style SSH commands are piped, not ttys, on purpose. Under a
+  **real interactive** session (`ssh -tt host`, then typing at the prompt —
+  `run_shell_session`, `spawn_pty`, `pty=true`), `nca` launched its
+  alternate-screen TUI with no error at all. The "regression" was an
+  artifact of testing method (exec vs. shell channel), not a kernel bug.
+  Also disproved along the way: `is_terminal`, `isatty(0)`, `tcgetattr(0)`,
+  `open("/dev/tty")`, and `TIOCGWINSZ` window-size propagation (including a
+  0×0-vs-real-size A/B) all work correctly end-to-end in a genuine
+  interactive session — the "tty inheritance" guess doesn't hold up either.
+
+### The two real, verified regressions (both from round 2, `b19ae838`)
+
+Installing `ncurses` (temporarily, for investigation — see the correction
+above) got `hx` past the `tput` crash, but it then hit a NEW failure:
+`thread 'main' (12) panicked at .../crossterm-0.28.1/src/event/read.rs:39:30:
+reader source not set`. That panic, plus the round-2 diff's own unresolved
+"needs verification" note above, pointed at `src/syscall/term.rs`'s
+terminal-ioctl gate:
+
+1. **The `cat file | less` usage-banner bug (round 1's fix) is back.**
+   Round 2 deleted the fd-table type check (`match proc.get_fd(fd) {
+   Stdin|Stdout|Stderr => {} _ => ENOTTY }`) entirely, leaving only the
+   channel-level `is_terminal()` check — which round 1's own writeup already
+   established is insufficient for a fork+exec pipeline child (it inherits
+   the shell's terminal *channel* even though its fd 0 is a `PipeRead`).
+   Verified live: `cat file | less` printed the busybox usage banner instead
+   of paging, on the round-2 kernel.
+2. **`if fd > 2 { return ENOTTY; }` unconditionally rejects the new
+   `/dev/tty` fd.** `DevTty` fds are allocated fresh by `sys_openat` and are
+   never 0/1/2, so this numeric cutoff — added in round 1, never revisited
+   when `DevTty` was introduced in round 2 — meant **every terminal ioctl
+   issued directly on a `/dev/tty` fd returned `ENOTTY`**, unconditionally,
+   regardless of channel state. This is exactly how `crossterm`'s Unix event
+   source (and pagers generally) use `/dev/tty`: open it, then `tcgetattr`/
+   `tcsetattr` *on that fd* for raw-mode control — not on fd 0. That failure
+   is what left crossterm's internal event reader uninitialized, producing
+   the `reader source not set` panic.
+
+### Fix
+
+`src/syscall/term.rs`, `sys_ioctl`: replaced the `fd > 2` cutoff with a
+single fd-table type match — `Stdin | Stdout | Stderr | DevTty` pass,
+anything else gets `ENOTTY` — restoring round 1's fix and extending it to
+cover `DevTty`. One gate now serves both regressions; the channel-level
+`is_terminal()` check below it is unchanged (still needed for the
+sshd-exec-channel case that motivated it originally).
+
+### Verification (done, live)
+
+Both on the round-2 kernel (broken) and the round-3 kernel (fixed), via a
+real interactive SSH session (`ssh -tt`, pty allocated, realistic non-zero
+window size set on the client pty so `TIOCGWINSZ` carries real dimensions):
+
+- `cat file | less` — round 2: usage banner, exit 1. Round 3: pages the
+  content correctly (cursor positioning + line erase escapes visible).
+- `hx <file>` (with `ncurses` installed) — round 2: `reader source not set`
+  panic, `SIGABRT`. Round 3: full TUI renders — status line, mode indicator,
+  the file's actual content, syntax-highlighted.
+- **Decisive check**: `apk del ncurses ncurses-terminfo-base libncursesw` on
+  the round-3 kernel, then `hx <file>` again — still launches fine, no
+  `tput` needed. Confirms the `tput`/`ncurses` angle was purely downstream of
+  the `/dev/tty` ioctl bug, not an independent fix.
+- `cargo test` (host target, all crates), plus `release`/`devbox`/
+  `devbox-smoltcp`/`extreme-size` rebuilds: all green, no regressions.
+
+### Known follow-up (not fixed, lower severity)
+
+Round 2 also deleted the `FIONREAD` arm for `Stdin` (`current_channel()
+.stdin_bytes_available()`); it now falls to the generic `_ => 0` arm, so
+`ioctl(FIONREAD)` on stdin/`/dev/tty` always reports zero bytes buffered
+regardless of actual pending input. Lower severity than the two above (a
+conservative "nothing waiting" answer, not a hang or a wrong-answer crash),
+but a program that polls `FIONREAD` before a non-blocking read to decide
+whether to proceed will never see it return non-zero. Not reproduced against
+a concrete failure yet — flagged here so it doesn't get lost.

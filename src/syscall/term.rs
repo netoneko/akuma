@@ -197,10 +197,6 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         _ => {}
     }
 
-    if fd > 2 {
-        return ENOTTY; // terminal ioctls on non-TTY fds
-    }
-
     // A spawned child's stdin/stdout is a pipe (ProcessChannel), not a real
     // terminal. Report ENOTTY for the terminal ioctls below (TCGETS is what
     // isatty() probes) so shells like busybox run non-interactively over the
@@ -212,9 +208,23 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     // shell's terminal channel — so isatty(0) returned true inside a pipeline
     // and busybox less (no FILE arg, stdin "a tty") printed its usage and
     // exited 1 instead of paging the pipe. The fd TABLE entry is the ground
-    // truth: only Stdin/Stdout/Stderr (the channel-backed console fds) are a
-    // tty; anything else dup'd over them (PipeRead, File, ...) is not.
-
+    // truth: only Stdin/Stdout/Stderr/DevTty (the channel-backed console fds,
+    // `/dev/tty` included) are a tty; anything else dup'd over them
+    // (PipeRead, File, ...) is not.
+    //
+    // This replaces a plain `fd > 2` cutoff, which predates `DevTty` and
+    // always rejected it: `/dev/tty` is opened as a fresh fd (never 0/1/2),
+    // so every terminal ioctl issued directly on the `/dev/tty` fd itself —
+    // exactly how programs that open it for raw-mode control (pagers,
+    // crossterm's Unix event source) use it — returned `ENOTTY`
+    // unconditionally. See `TTY_SHENANIGANS.md` round 3.
+    match proc.get_fd(fd) {
+        Some(akuma_exec::process::FileDescriptor::Stdin
+        | akuma_exec::process::FileDescriptor::Stdout
+        | akuma_exec::process::FileDescriptor::Stderr
+        | akuma_exec::process::FileDescriptor::DevTty) => {}
+        _ => return ENOTTY, // fd is a pipe/file/socket, not the console tty
+    }
 
     if let Some(ch) = akuma_exec::process::current_channel()
         && !ch.is_terminal()
