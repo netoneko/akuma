@@ -2656,8 +2656,29 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         // local IRQ mask, so the BKL is its only cross-core lock. It therefore has to
         // run before the window opens. The code already collected into a local Vec; the
         // only change is that it now happens up front rather than mid-copy.
+        //
+        // Two passes, not one fixed-capacity guess: a long-lived heavily-threaded
+        // process (e.g. `cargo`/`rustc` mid-build — many live worker threads, each
+        // with its own musl-malloc mmap arenas registered as its own eager region)
+        // routinely carries *tens of thousands* of live sibling regions, blowing past
+        // any small fixed cap. A silent truncation here isn't a size hiccup: it drops
+        // whichever sibling stacks/arenas didn't fit from the CHILD's address space,
+        // and the child faults the moment it touches one of them (observed as an
+        // EFAULT chdir() on a heap/stack pointer moments after fork — see
+        // docs/archive/SELFHOST_CARGO_BUILD_REGRESSION.md). Count first (still
+        // IRQs-disabled, no alloc), allocate exactly that many between passes (IRQs
+        // enabled here), then collect. The `overflow` guard stays as a fallback for the
+        // narrow TOCTOU window where a sibling mmaps concurrently on another core
+        // between the two passes — now a rare race instead of a routine drop.
         let sibling_ranges: alloc::vec::Vec<(usize, usize)> = {
-            let mut ranges: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(2048);
+            let mut needed: usize = 0;
+            table::for_each_process(|p| {
+                if p.tgid == parent_tgid && p.pid != parent_pid {
+                    needed += p.mmap_regions.iter().filter(|r| r.pages > 0).count();
+                }
+            });
+
+            let mut ranges: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(needed);
             let mut overflow = false;
             table::for_each_process(|p| {
                 if p.tgid == parent_tgid && p.pid != parent_pid {
@@ -2673,7 +2694,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 }
             });
             if overflow {
-                lifecycle_trace("[FORK-COW] WARNING: sibling mmap region list truncated (>2048 regions)\n");
+                lifecycle_trace("[FORK-COW] WARNING: sibling mmap region list truncated (grew between count and collect passes)\n");
             }
             ranges
         };
