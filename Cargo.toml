@@ -144,6 +144,10 @@ default = [
     # without it the stack RSTs past 8 simultaneous arrivals and sshd cannot
     # reach its own max_sessions of 24.
     "many-sessions",
+    # Linux reboot(2) -> PSCI SYSTEM_RESET/SYSTEM_OFF. In `default` since
+    # 2026-08-25 — see the `sc-reboot` feature definition below for why it was
+    # gated and why that reason no longer applies.
+    "sc-reboot",
 ]
 no-tests = ["akuma-net/small-sockets"]
 
@@ -468,13 +472,30 @@ net-direct-waker = ["akuma-net/net-direct-waker"]
 rump = ["akuma-net/rump", "dep:akuma-rump"]
 
 # Linux `reboot(2)` -> PSCI SYSTEM_RESET/SYSTEM_OFF (src/syscall/reboot.rs).
-# Devbox-only: NOT in `default`, so `release`/`extreme-size` never carry the
-# syscall (nr 142 stays ENOSYS there). Wired into `devbox`/`devbox-smoltcp`
-# below. Exists for the self-host workflow (docs/runbooks/selfhost-kernel-build.md):
-# rebuild the kernel in-guest, dd it over the file backing both `-kernel` and a
-# virtio-blk drive (scripts/cargo_runner.sh's KERNEL_DROPOFF), then reboot(2)
-# straight into the new build instead of a host-side extract + relaunch cycle.
-sc-reboot = ["dep:akuma-boot"]
+# In `default` since 2026-08-25 (so plain `release` carries it too; nr 142 was
+# ENOSYS there before). Originally gated devbox-only because the plan was to
+# land it together with a self-hosted kexec-style warm reboot — kexec was
+# scoped and rejected (docs/archive/AKUMA_BOOT_EXTRACTION.md; the running-kernel
+# state is the wrong shape for `boot.rs`'s clean-boot assumptions), leaving a
+# plain PSCI reset with no kexec counterpart to cluster with, so there's no
+# reason left to keep it out of `default`. `extreme-size` still excludes it
+# (that build passes `--no-default-features` with its own explicit feature
+# list, which doesn't name `sc-reboot`) — the 4 MB floor has no self-host
+# workflow to serve. Exists for the self-host workflow
+# (docs/runbooks/selfhost-kernel-build.md): rebuild the kernel in-guest, dd it
+# over the file backing both `-kernel` and a virtio-blk drive
+# (scripts/cargo_runner.sh's KERNEL_DROPOFF), then reboot(2) straight into the
+# new build instead of a host-side extract + relaunch cycle.
+#
+# Depends on `smp-shared`: `src/syscall/reboot.rs` calls `crate::smp_shared`
+# unconditionally for the PSCI SMC/HVC plumbing, and that module only exists
+# under `smp-shared` (`#[cfg(kernel_smp_shared)]`, src/main.rs). Without this,
+# any `--no-default-features` build that lists `sc-reboot` but not
+# `smp-shared` fails with "cannot find `smp_shared` in `crate`" — confirmed
+# pre-existing on `scripts/build_devbox.sh` (rump-only `devbox`, deferred)
+# independent of the `default` change above; fixed here rather than left as a
+# trap for the next feature set that lists `sc-reboot`.
+sc-reboot = ["dep:akuma-boot", "smp-shared"]
 # The native smoltcp TCP/IP stack (NIC0): the in-kernel socket syscalls, DNS/HTTP,
 # and the built-in SSH server are all built on it. In `default`; the devbox build
 # drops it (rump is the only stack) via --no-default-features, which compiles the
@@ -554,10 +575,10 @@ rump-default = ["rump"]
 userspace-sshd = []
 
 # The devbox meta-feature: rump is the default stack and there is no built-in
-# SSH. Selected with `--features devbox` (+ the `devbox` profile). Phase 2 will
-# additionally build this with `--no-default-features` to compile `smoltcp` (and
-# the smoltcp-coupled built-in SSH) out entirely; for now it layers on top of the
-# default set, so the build still carries smoltcp but never routes box 0 to it.
+# SSH. Selected with `--features devbox` (+ the `devbox` profile). Built with
+# `--no-default-features` (scripts/build_devbox.sh), so `sc-reboot` is listed
+# here explicitly even though it's also in `default` now — this feature set
+# doesn't get `default`'s members for free.
 devbox = ["rump-default", "userspace-sshd", "sc-reboot"]
 
 # ── devbox-smoltcp: the DEFAULT devbox going forward ─────────────────────────
@@ -567,10 +588,12 @@ devbox = ["rump-default", "userspace-sshd", "sc-reboot"]
 # shared-kernel SMP (`smp-shared`). The INVERSE of `devbox` (rump-default):
 # keep smoltcp, drop the built-in ssh, add real SMP. Built with the
 # plain `--release` by scripts/build_devbox_smoltcp.sh and layered on
-# the default (smoltcp-carrying) feature set. Because smoltcp stays in, the
+# the default (smoltcp-carrying) feature set — which is also where it now gets
+# `sc-reboot` from, since unlike `devbox` this build does NOT pass
+# `--no-default-features`. Because smoltcp stays in, the
 # `userspace-sshd` compile guard in main.rs is satisfied. See
 # docs/reference/subsystems/smp-shared.md and overlays/devbox/README.md.
-devbox-smoltcp = ["userspace-sshd", "smp-shared", "sc-reboot"]
+devbox-smoltcp = ["userspace-sshd", "smp-shared"]
 
 [lints]
 workspace = true
