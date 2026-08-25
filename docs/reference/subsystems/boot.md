@@ -68,14 +68,17 @@ For debugging, see [`../../runbooks/debug-boot-hang.md`](../../runbooks/debug-bo
 - **Benchmarks** (`run_cow_benchmarks`, `run_benchmarks`) print grep-able
   `[BENCH]` lines and **never fail**.
 
-## Reboot (`sc-reboot` only)
+## Reboot (`sc-reboot`, in `default` since 2026-08-25)
 
 There is no warm in-kernel reboot (no kexec) — `reboot(2)`'s `Restart`/`PowerOff`
 actions (`docs/reference/subsystems/syscalls/proc.md#reboot`) issue a real PSCI
 `SYSTEM_RESET`/`SYSTEM_OFF`, so QEMU replays this entire boot sequence from
 stage 1 exactly as it does for the very first boot — the design was chosen
 specifically to avoid needing any of the machinery (SMP park/quiesce, cache/MMU
-teardown, self-relocation) a software-driven warm reboot would.
+teardown, self-relocation) a software-driven warm reboot would. Because the
+reset takes the whole machine (every box) down with it, the syscall is
+restricted to box 0 (`caller_may_reboot`, `src/syscall/reboot.rs`) — a boxed
+caller gets `EPERM`, the same restriction `mount`/`umount` already have.
 `archive/AKUMA_BOOT_EXTRACTION.md` has the full reasoning.
 
 ## Background

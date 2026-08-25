@@ -54,8 +54,8 @@ HTTPS client anywhere in this tree now; use a userspace tool.
 | `rump-tests` | Compiles only `rump_tests` even under `no-tests` — used by the devbox to verify rump regression guards at boot without pulling in the full boot-test suite. | `Cargo.toml:142` |
 | `userspace-sshd` | Selects the herd-less startup path: `AUTO_START_HERD` off, kernel spawns `/bin/sshd` directly via `AUTO_START_SSHD`. Drives `config::ENABLE_USERSPACE_SSHD`. There is only ever one sshd (userspace) now — this no longer toggles between a built-in and a userspace server, only who starts the userspace one. | `Cargo.toml:386` |
 | `many-sessions` | Deepens the per-listener backlog (8→32) and raises the socket budget on `small-sockets` builds — the kernel half of the process-per-session `/bin/sshd` (its `fork-sessions` feature is the userspace half). **In `default`** since 2026-08-10 — without it the stack RSTs past 8 simultaneous arrivals. Costs ~1 MB heap per listening socket + ~44 KB BSS. `kernel_profile_extreme` overrides the constants back to 8/32 regardless. | `Cargo.toml:138` |
-| `devbox` | Meta-feature = `["rump-default", "userspace-sshd", "sc-reboot"]`. | `Cargo.toml:393` |
-| `devbox-smoltcp` | Meta-feature = `["userspace-sshd", "smp-shared", "sc-reboot"]` — the **default** devbox. Keeps smoltcp; `smp-shared` is a no-op here since it's already in `default`. | `Cargo.toml:405` |
+| `devbox` | Meta-feature = `["rump-default", "userspace-sshd", "sc-reboot"]`. Built `--no-default-features` (`scripts/build_devbox.sh`), so `sc-reboot` is listed explicitly here even though it's also in `default` now — this feature set doesn't inherit `default`'s members. | `Cargo.toml:393` |
+| `devbox-smoltcp` | Meta-feature = `["userspace-sshd", "smp-shared"]` — the **default** devbox. Keeps smoltcp; both members are no-ops here since they're already in `default` (this build does NOT pass `--no-default-features`) — `sc-reboot` used to be listed a third time for the same reason before it moved into `default` itself (2026-08-25). | `Cargo.toml:405` |
 
 > **Drift note:** `overlays/devbox/README.md:142,211`
 > still say "Phase 2 will build with `--no-default-features`" and "smoltcp is
@@ -78,7 +78,7 @@ re-add what they need. `Cargo.toml:361-369`.
 | `sc-eventfd` | 2 (needs ExecRuntime stub when off) | |
 | `sc-pidfd` | 2 | |
 | `sc-epoll` | 2 | |
-| `sc-reboot` | — | **OFF by default**, the opposite of every other row in this table: only in `devbox`/`devbox-smoltcp`, never in `release`/`extreme-size`. Linux `reboot(2)` (`nr` 142) → PSCI `SYSTEM_RESET`/`SYSTEM_OFF`. ABI decode in `crates/akuma-boot` (host-tested); the PSCI call reuses `smp_shared`'s existing SMC/HVC conduit code. See [`syscalls/proc.md`](syscalls/proc.md#reboot) and [`../../archive/AKUMA_BOOT_EXTRACTION.md`](../../archive/AKUMA_BOOT_EXTRACTION.md). |
+| `sc-reboot` | — | **In `default`** since 2026-08-25 (was devbox-only before — the plan had been to land it alongside a self-hosted kexec, which was scoped and rejected, so there was no reason left to gate it). `extreme-size` still excludes it (`--no-default-features`, own explicit list). Linux `reboot(2)` (`nr` 142) → PSCI `SYSTEM_RESET`/`SYSTEM_OFF`. ABI decode in `crates/akuma-boot` (host-tested); the PSCI call reuses `smp_shared`'s existing SMC/HVC conduit code, so `sc-reboot` depends on `smp-shared`. **Box-0 only**: `caller_may_reboot` (`src/syscall/reboot.rs`) returns `EPERM` for any caller with `box_id != 0` — a whole-machine PSCI reset/off would take every other box down with it, so it gets the same host-only restriction `mount`/`umount` already have (`caller_may_mount`, `src/syscall/container.rs`). See [`syscalls/proc.md`](syscalls/proc.md#reboot) and [`../../archive/AKUMA_BOOT_EXTRACTION.md`](../../archive/AKUMA_BOOT_EXTRACTION.md). |
 
 ### Other
 

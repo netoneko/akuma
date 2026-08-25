@@ -34,11 +34,13 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   (`src/main.rs`, `--bin sched-sim`) stays plain `std` and is gated behind
   `required-features = ["cli"]` so a bare `cargo build`/`test` at the repo root
   never tries to cross-compile it for the kernel's own target.
-  `akuma-boot` holds the Linux `reboot(2)` ABI decode for the devbox-only
-  `sc-reboot` syscall (`src/syscall/reboot.rs`) — the PSCI SMC call itself stays
-  in `src/smp_shared.rs`, which already owns SMC/HVC conduit selection for
-  `CPU_ON`. Named `-boot`, not `-reboot`: a natural future home for
-  `src/boot.rs`'s logic too.
+  `akuma-boot` holds the Linux `reboot(2)` ABI decode for the `sc-reboot`
+  syscall (`src/syscall/reboot.rs`) — in `default` since 2026-08-25 (only
+  `extreme-size`, which builds `--no-default-features`, excludes it) — the
+  PSCI SMC call itself stays in `src/smp_shared.rs`, which already owns
+  SMC/HVC conduit selection for `CPU_ON`; `sc-reboot` depends on
+  `smp-shared` for exactly that reason. Named `-boot`, not `-reboot`: a
+  natural future home for `src/boot.rs`'s logic too.
 - `userspace/` — ELF binaries (musl libc); current member list + one-liners: `docs/reference/userspace-layout.md`
 - `docs/` — Documentation (see below)
 - `scripts/` — Build and debug helpers
