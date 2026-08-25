@@ -41,6 +41,8 @@ const STACK_SHIFT: usize = 16;
 
 // PSCI (matches crate::smp — QEMU `virt` exposes PSCI over the DTB-declared conduit).
 const PSCI_CPU_ON: u64 = 0xC400_0003;
+// SYSTEM_OFF/SYSTEM_RESET function IDs live in akuma_boot alongside the rest of
+// the reboot ABI (`sc-reboot` only) — nothing hardware-specific about a constant.
 
 // --- DTB-probed topology, stashed before the heap can overwrite the DTB ------------
 static PROBED: AtomicBool = AtomicBool::new(false);
@@ -649,6 +651,38 @@ pub fn bringup_secondaries() {
 #[allow(dead_code)]
 pub fn online_secondary_count() -> usize {
     ONLINE_COUNT.load(Ordering::Acquire)
+}
+
+/// Whole-machine PSCI `SYSTEM_RESET`. Called from `src/syscall/reboot.rs`.
+///
+/// Unlike a self-hosted kexec (considered and rejected — see
+/// `docs/runbooks/selfhost-kernel-build.md` background) this needs no in-kernel
+/// SMP park/quiesce dance: QEMU/firmware tears every core and device back down
+/// to the same clean reset state `boot.rs` already assumes, so a plain PSCI
+/// reset gets that for free. `-kernel` bytes are cached by QEMU at process
+/// startup and are not re-read on an in-process reset, so this only picks up a
+/// freshly built kernel when combined with `-action reboot=shutdown` and a
+/// host-side relaunch — see `scripts/cargo_runner.sh`'s `KERNEL_DROPOFF`.
+#[cfg(feature = "sc-reboot")]
+pub fn system_reset() -> ! {
+    let use_hvc = USE_HVC.load(Ordering::Relaxed);
+    psci_call(use_hvc, akuma_boot::PSCI_SYSTEM_RESET, 0, 0, 0);
+    // SYSTEM_RESET does not return on success; reaching here means the call
+    // itself failed (e.g. no PSCI conduit). Nothing sensible to do but spin —
+    // the syscall dispatcher isn't set up to receive a return from this path.
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Whole-machine PSCI `SYSTEM_OFF`. See `system_reset` for the shared reasoning.
+#[cfg(feature = "sc-reboot")]
+pub fn system_off() -> ! {
+    let use_hvc = USE_HVC.load(Ordering::Relaxed);
+    psci_call(use_hvc, akuma_boot::PSCI_SYSTEM_OFF, 0, 0, 0);
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Number of cores the DTB reported (including the BSP). See `online_secondary_count`.

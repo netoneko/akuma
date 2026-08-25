@@ -243,23 +243,67 @@ if [ -n "$DISK2" ]; then
   echo "[cargo_runner] data disk: $DISK2 -> /dev/vdb (virtio-mmio-bus.5)" >&2
 fi
 
-exec qemu-system-aarch64 \
-  -semihosting \
-  -machine virt,gic-version=3 \
-  "${ACCEL_ARGS[@]}" \
-  -smp "$SMP" \
-  -m "$MEMORY" \
-  -serial mon:stdio \
-  -display none \
-  -netdev "user,id=net0,hostfwd=tcp::${TEL_PORT}-:23,hostfwd=tcp::${SSH_PORT}-:22,hostfwd=tcp::${HTTP_PORT}-:8080,hostfwd=tcp::${P44_PORT}-:44,hostfwd=tcp::${P4444_PORT}-:4444,hostfwd=tcp::${MODEL_PORT}-:11434" \
-  -global virtio-mmio.force-legacy=false \
-  -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \
-  -drive "$DRIVE_OPTS" \
-  -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1 \
-  -device virtio-rng-device,bus=virtio-mmio-bus.2 \
-  "${RUMP_NIC_ARGS[@]}" \
-  "${DISK2_ARGS[@]}" \
-  "${FB_ARGS[@]}" \
-  "${SOUND_ARGS[@]}" \
-  -kernel "$BIN" \
+# KERNEL_DROPOFF=1 mounts $BIN itself as a second virtio-blk drive (bus.6, the
+# next free slot after net/hd0/rng/sound/rump-nic/DISK2's 0-5), so a guest that
+# rebuilds the kernel in-guest can `dd`/objcopy straight over the exact file
+# this same invocation loaded via -kernel. -action reboot=shutdown makes a
+# guest-triggered PSCI SYSTEM_RESET (sc-reboot's reboot(2), devbox-only) exit
+# qemu instead of resetting in place — QEMU caches -kernel's bytes at process
+# startup and does not re-read the file on an in-process reset, so picking up
+# what the guest just wrote needs a real process relaunch. This script then
+# loops: the guest's dd + reboot(2) cycle re-launches straight into the new
+# build with no host-side extraction step and no manual `cargo run` per build.
+# Off by default — every other invocation keeps the single exec below.
+KERNEL_DROPOFF="${KERNEL_DROPOFF:-0}"
+DROPOFF_ARGS=()
+ACTION_ARGS=()
+case "$KERNEL_DROPOFF" in
+  0|off|no|false|FALSE) ;;
+  1|on|yes|true|TRUE)
+    DROPOFF_ARGS=(-drive "file=${BIN},if=none,format=raw,id=kdrop" \
+                  -device virtio-blk-device,drive=kdrop,bus=virtio-mmio-bus.6)
+    ACTION_ARGS=(-action reboot=shutdown)
+    echo "[cargo_runner] KERNEL_DROPOFF=1: $BIN also mounted as its own virtio-blk drive; a guest reboot(2) exits qemu and this script relaunches with the current $BIN" >&2
+    ;;
+  *)
+    echo "[cargo_runner] ERROR: KERNEL_DROPOFF must be 0|1 (got '$KERNEL_DROPOFF')" >&2
+    exit 1
+    ;;
+esac
+
+QEMU_ARGS=(
+  -semihosting
+  -machine virt,gic-version=3
+  "${ACCEL_ARGS[@]}"
+  -smp "$SMP"
+  -m "$MEMORY"
+  -serial mon:stdio
+  -display none
+  -netdev "user,id=net0,hostfwd=tcp::${TEL_PORT}-:23,hostfwd=tcp::${SSH_PORT}-:22,hostfwd=tcp::${HTTP_PORT}-:8080,hostfwd=tcp::${P44_PORT}-:44,hostfwd=tcp::${P4444_PORT}-:4444,hostfwd=tcp::${MODEL_PORT}-:11434"
+  -global virtio-mmio.force-legacy=false
+  -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0
+  -drive "$DRIVE_OPTS"
+  -device virtio-blk-device,drive=hd0,bus=virtio-mmio-bus.1
+  -device virtio-rng-device,bus=virtio-mmio-bus.2
+  "${RUMP_NIC_ARGS[@]}"
+  "${DISK2_ARGS[@]}"
+  "${FB_ARGS[@]}"
+  "${SOUND_ARGS[@]}"
+  "${DROPOFF_ARGS[@]}"
+  "${ACTION_ARGS[@]}"
+  -kernel "$BIN"
   "${GDB_ARGS[@]}"
+)
+
+if [ "$KERNEL_DROPOFF" = "1" ] || [ "$KERNEL_DROPOFF" = "on" ] || [ "$KERNEL_DROPOFF" = "yes" ] || [ "$KERNEL_DROPOFF" = "true" ] || [ "$KERNEL_DROPOFF" = "TRUE" ]; then
+  # No `exec`: this shell must survive qemu's exit to relaunch it. Never
+  # re-runs objcopy (that would stomp the guest's dropped-off kernel with the
+  # stale host-built $ELF again) — just restarts the same $BIN.
+  while true; do
+    rc=0
+    qemu-system-aarch64 "${QEMU_ARGS[@]}" || rc=$?
+    echo "[cargo_runner] qemu exited rc=$rc — relaunching with the current $BIN (KERNEL_DROPOFF loop; Ctrl-C to stop)" >&2
+  done
+else
+  exec qemu-system-aarch64 "${QEMU_ARGS[@]}"
+fi

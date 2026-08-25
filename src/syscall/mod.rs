@@ -25,6 +25,8 @@ use akuma_exec::mmu::user_access::copy_from_user_safe;
 
 #[cfg(feature = "sc-aio")]
 mod aio;
+#[cfg(feature = "sc-reboot")]
+mod reboot;
 #[cfg(feature = "sc-containers")]
 mod container;
 #[cfg(feature = "sc-pidfd")]
@@ -288,6 +290,8 @@ pub mod nr {
     pub const CLOCK_SETTIME: u64 = 112;
     pub const ADJTIMEX: u64 = 171;
     pub const CLOCK_ADJTIME: u64 = 266;
+    #[cfg(feature = "sc-reboot")]
+    pub const REBOOT: u64 = 142;
     pub const CLONE3: u64 = 435;
     pub const FACCESSAT2: u64 = 439;
     pub const WAIT4: u64 = 260;
@@ -786,6 +790,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::READLINKAT => fs::sys_readlinkat(args[0] as i32, args[1], args[2], args[3] as usize),
         nr::SPAWN => proc::sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5]),
         nr::KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
+        #[cfg(feature = "sc-reboot")]
+        nr::REBOOT => reboot::sys_reboot(args[0] as u32, args[1] as u32, args[2] as u32),
         nr::WAITPID => proc::sys_waitpid(args[0] as u32, args[1]),
         nr::GETRANDOM => proc::sys_getrandom(args[0], args[1] as usize),
         nr::TIME => time::sys_time(),

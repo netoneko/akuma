@@ -7,10 +7,25 @@ publish = false
 
 [dependencies]
 akuma-kacho = { path = "../akuma-kacho" }
+# f64::sqrt isn't on core's f64 (std-only, backed by a platform intrinsic) — the
+# no_std build needs it spelled out. Squaring in `finish()` avoided needing pow().
+libm = { version = "0.2", default-features = false }
 
+# `sched-sim`'s CLI report is plain std (println! reporting) and can't cross-compile
+# for the workspace's ambient no_std target. `required-features` makes cargo skip
+# building this bin unless `cli` is explicitly requested — so a bare `cargo
+# build`/`cargo test`/`cargo check` at the repo root (default-members, ambient
+# aarch64-unknown-none target) never touches it, while `cargo run -p akuma-scheduler
+# --bin sched-sim --features cli --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`
+# still works. Simpler than a second crate: no duplicated dependency wiring, one
+# Cargo.toml, and the split isn't load-bearing — it's one bin target gated by one flag.
 [[bin]]
 name = "sched-sim"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+cli = []
 
 [lints]
 workspace = true

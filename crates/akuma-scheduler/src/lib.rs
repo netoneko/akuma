@@ -39,8 +39,13 @@
 //! Caches, TLBs, memory bandwidth, the BKL, and any EL1 excursion. So the
 //! simulator can rank placement policies and size a netpoll wake period; it
 //! **cannot** predict tok/s. Read ratios from it, never absolutes.
+#![cfg_attr(not(test), no_std)]
 
-use std::collections::VecDeque;
+extern crate alloc;
+
+use alloc::collections::VecDeque;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Simulation timestep. Fine enough to resolve a barrier hand-off, coarse
 /// enough that a 10 s scenario is a million steps and runs instantly.
@@ -745,7 +750,14 @@ impl Sim {
         let n = self.iter_intervals.len() as f64;
         let mean = if n > 0.0 { self.iter_intervals.iter().sum::<u64>() as f64 / n } else { 0.0 };
         let var = if n > 0.0 {
-            self.iter_intervals.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / n
+            self.iter_intervals
+                .iter()
+                .map(|&x| {
+                    let d = x as f64 - mean;
+                    d * d
+                })
+                .sum::<f64>()
+                / n
         } else {
             0.0
         };
@@ -767,7 +779,7 @@ impl Sim {
             iterations: self.iterations,
             iters_per_sec: self.iterations as f64 / secs,
             iter_mean_us: mean,
-            iter_stddev_us: var.sqrt(),
+            iter_stddev_us: libm::sqrt(var),
             iter_p99_us: p99,
             compute_preemptions: self.compute_preemptions,
             barrier_parks: self.barrier_parks,
@@ -791,6 +803,7 @@ impl Sim {
 
 pub mod scenarios {
     use super::{Config, NetpollPolicy, Report, SchedPolicy, Sim, WakePlacement};
+    use alloc::vec::Vec;
 
     /// The netpoll policy proposed in the open items: RX still wakes it
     /// instantly, the periodic wake backs off to 100 ms when the trailing 10 s

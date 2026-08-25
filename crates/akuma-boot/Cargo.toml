@@ -1,0 +1,8 @@
+[package]
+name = "akuma-boot"
+version = "0.1.0"
+edition = "2024"
+description = "Boot/reboot logic. Currently just reboot(2) ABI decode for the devbox-only PSCI SYSTEM_RESET/SYSTEM_OFF syscall; a natural home for src/boot.rs's logic later."
+
+[lints]
+workspace = true

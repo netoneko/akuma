@@ -10,8 +10,10 @@ default-members = [
     "crates/akuma-net",
     "crates/akuma-net-yarn",
     "crates/akuma-pmm",
+    "crates/akuma-boot",
     "crates/akuma-primitives",
     "crates/akuma-rump",
+    "crates/akuma-scheduler",
     "crates/akuma-terminal",
     "crates/akuma-time",
     "crates/akuma-timer",
@@ -459,6 +461,15 @@ net-direct-waker = ["akuma-net/net-direct-waker"]
 # 4 MB floor). NIC1 itself only exists when the QEMU runner is started with
 # RUMP_NIC=1; without it, tap init no-ops and /dev/net/tap0 returns ENODEV.
 rump = ["akuma-net/rump", "dep:akuma-rump"]
+
+# Linux `reboot(2)` -> PSCI SYSTEM_RESET/SYSTEM_OFF (src/syscall/reboot.rs).
+# Devbox-only: NOT in `default`, so `release`/`extreme-size` never carry the
+# syscall (nr 142 stays ENOSYS there). Wired into `devbox`/`devbox-smoltcp`
+# below. Exists for the self-host workflow (docs/runbooks/selfhost-kernel-build.md):
+# rebuild the kernel in-guest, dd it over the file backing both `-kernel` and a
+# virtio-blk drive (scripts/cargo_runner.sh's KERNEL_DROPOFF), then reboot(2)
+# straight into the new build instead of a host-side extract + relaunch cycle.
+sc-reboot = ["dep:akuma-boot"]
 # The native smoltcp TCP/IP stack (NIC0): the in-kernel socket syscalls, DNS/HTTP,
 # and the built-in SSH server are all built on it. In `default`; the devbox build
 # drops it (rump is the only stack) via --no-default-features, which compiles the
@@ -542,7 +553,7 @@ userspace-sshd = []
 # additionally build this with `--no-default-features` to compile `smoltcp` (and
 # the smoltcp-coupled built-in SSH) out entirely; for now it layers on top of the
 # default set, so the build still carries smoltcp but never routes box 0 to it.
-devbox = ["rump-default", "userspace-sshd"]
+devbox = ["rump-default", "userspace-sshd", "sc-reboot"]
 
 # ── devbox-smoltcp: the DEFAULT devbox going forward ─────────────────────────
 # A dev image on the NATIVE smoltcp stack (NOT rump — rump_server work is
@@ -554,7 +565,7 @@ devbox = ["rump-default", "userspace-sshd"]
 # the default (smoltcp-carrying) feature set. Because smoltcp stays in, the
 # `userspace-sshd` compile guard in main.rs is satisfied. See
 # docs/reference/subsystems/smp-shared.md and overlays/devbox/README.md.
-devbox-smoltcp = ["userspace-sshd", "smp-shared"]
+devbox-smoltcp = ["userspace-sshd", "smp-shared", "sc-reboot"]
 
 [lints]
 workspace = true
@@ -583,6 +594,10 @@ akuma-primitives = { path = "crates/akuma-primitives" }
 # Kernel-side sysproxy client (rumpsp wire + Linux↔NetBSD translation); only the
 # `rump` feature needs it directly (akuma-net already pulls it for rump_tap).
 akuma-rump = { path = "crates/akuma-rump", optional = true }
+# Linux reboot(2) ABI decode for the devbox-only `sc-reboot` syscall
+# (src/syscall/reboot.rs); the PSCI SMC call itself stays in smp_shared.rs.
+# Named `-boot`, not `-reboot`: a natural future home for src/boot.rs's logic too.
+akuma-boot = { path = "crates/akuma-boot", optional = true }
 akuma-isolation = { path = "crates/akuma-isolation" }
 # Machine description read from the FDT at run time. Required, not optional:
 # Firecracker's GIC redistributor base moves with `vcpu_count`, so no

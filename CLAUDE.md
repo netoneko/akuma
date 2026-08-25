@@ -27,9 +27,18 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   subsystems/syscalls/poll.md` § "The wait loop is one machine"). The crate also
   carries a differential test against the pre-extraction `wait_until`; keep that
   oracle in the shipped loop's shape rather than tidying it.
-  `akuma-scheduler` is host-only and **not** in `default-members`: it models
-  scheduler placement / netpoll wake policies so a candidate can be ranked in a
-  second instead of a devbox boot (`docs/archive/AKUMA_SCHEDULING_EXTRACTION.md`).
+  `akuma-scheduler` models scheduler placement / netpoll wake policies so a
+  candidate can be ranked in a second instead of a devbox boot
+  (`docs/archive/AKUMA_SCHEDULING_EXTRACTION.md`). The simulator core (`lib.rs`)
+  is `no_std` and in `default-members` like its siblings; only its CLI report
+  (`src/main.rs`, `--bin sched-sim`) stays plain `std` and is gated behind
+  `required-features = ["cli"]` so a bare `cargo build`/`test` at the repo root
+  never tries to cross-compile it for the kernel's own target.
+  `akuma-boot` holds the Linux `reboot(2)` ABI decode for the devbox-only
+  `sc-reboot` syscall (`src/syscall/reboot.rs`) — the PSCI SMC call itself stays
+  in `src/smp_shared.rs`, which already owns SMC/HVC conduit selection for
+  `CPU_ON`. Named `-boot`, not `-reboot`: a natural future home for
+  `src/boot.rs`'s logic too.
 - `userspace/` — ELF binaries (musl libc); current member list + one-liners: `docs/reference/userspace-layout.md`
 - `docs/` — Documentation (see below)
 - `scripts/` — Build and debug helpers

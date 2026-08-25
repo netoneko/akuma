@@ -1,5 +1,5 @@
-//! Runs the scenario matrix and prints it. `cargo run -p akuma-sched-sim
-//! --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`.
+//! Runs the scenario matrix and prints it. `cargo run -p akuma-scheduler --bin
+//! sched-sim --features cli --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`.
 
 use akuma_scheduler::scenarios::{adaptive_netpoll, shape, sweep, sweep_with};
 use akuma_scheduler::{Config, NetpollPolicy, Report, SchedPolicy, Sim, WakePlacement};

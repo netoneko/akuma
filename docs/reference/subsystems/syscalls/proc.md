@@ -262,6 +262,32 @@ table). Linux wait-status encoding (`encode_wait_status`): normal exit
   `interrupt_thread` flags first, then pend** — the reverse order races
   (wake before flag → thread re-blocks).
 
+## reboot
+
+`sys_reboot` (`REBOOT` 142, `src/syscall/reboot.rs`) — **`sc-reboot` only**,
+wired into `devbox`/`devbox-smoltcp`, absent from `release`/`extreme-size`
+(see [`../config-flags.md`](../config-flags.md)). ABI decode (magic1/magic2/cmd
+→ `Action`) is pure and host-tested in `crates/akuma-boot`, not here — this
+function has no decision logic of its own, just `args[]` unpacking and a
+dispatch:
+
+| `Action` | Effect |
+|---|---|
+| `Restart` (`CMD_RESTART`/`CMD_RESTART2`) | `smp_shared::system_reset()` — PSCI `SYSTEM_RESET`, diverges (`-> !`) |
+| `PowerOff` (`CMD_POWER_OFF`) | `smp_shared::system_off()` — PSCI `SYSTEM_OFF`, diverges |
+| `Noop` (`CMD_HALT`/`CMD_CAD_ON`/`CMD_CAD_OFF`) | Returns `0` — no ACPI/watchdog/CAD state exists to act on |
+| bad magic, or an unrecognized `cmd` with good magics | `EINVAL` |
+
+Both PSCI calls reuse `smp_shared`'s existing `psci_call` helper and `USE_HVC`
+conduit state — the same ones `bringup_secondaries`'s `CPU_ON` already uses —
+so there remains exactly one PSCI call site in the kernel. `SYSTEM_RESET` is a
+real hardware reset: QEMU tears every core and device back to the same clean
+state the very first boot starts from, so this needs none of a self-hosted
+kexec's SMP park/quiesce or cache/MMU teardown machinery (that design was
+considered and rejected). Full writeup, including why `-kernel` needs pairing
+with `KERNEL_DROPOFF`/`-action reboot=shutdown` to actually pick up a rebuilt
+kernel: [`../../../archive/AKUMA_BOOT_EXTRACTION.md`](../../../archive/AKUMA_BOOT_EXTRACTION.md).
+
 ## Background
 
 - `archive/ON_DEMAND_ELF_LOADER.md`, `archive/PROPER_EXECVE_PLAN.md`.
@@ -273,3 +299,5 @@ table). Linux wait-status encoding (`encode_wait_status`): normal exit
 - `archive/REDIS_END_TO_END.md` §3-§4 — where the `#!` and credential gaps
   above were found, and why two plausible fixes for the capability failure
   each changed nothing.
+- `archive/AKUMA_BOOT_EXTRACTION.md` — `reboot`'s design, why kexec was
+  rejected, and the `KERNEL_DROPOFF` self-host iteration loop it exists for.

@@ -68,7 +68,19 @@ For debugging, see [`../../runbooks/debug-boot-hang.md`](../../runbooks/debug-bo
 - **Benchmarks** (`run_cow_benchmarks`, `run_benchmarks`) print grep-able
   `[BENCH]` lines and **never fail**.
 
+## Reboot (`sc-reboot` only)
+
+There is no warm in-kernel reboot (no kexec) — `reboot(2)`'s `Restart`/`PowerOff`
+actions (`docs/reference/subsystems/syscalls/proc.md#reboot`) issue a real PSCI
+`SYSTEM_RESET`/`SYSTEM_OFF`, so QEMU replays this entire boot sequence from
+stage 1 exactly as it does for the very first boot — the design was chosen
+specifically to avoid needing any of the machinery (SMP park/quiesce, cache/MMU
+teardown, self-relocation) a software-driven warm reboot would.
+`archive/AKUMA_BOOT_EXTRACTION.md` has the full reasoning.
+
 ## Background
 
 - `archive/MEMORY_LAYOUT.md`, `archive/DYNAMIC_DTB.md`,
   `archive/QEMU_HVF_ISV_BUG.md`, `archive/IDENTITY_MAPPING_DEPENDENCIES.md`.
+- `archive/AKUMA_BOOT_EXTRACTION.md` — the `reboot(2)` syscall this boot
+  sequence gets replayed for, and the `KERNEL_DROPOFF` self-host iteration loop.
