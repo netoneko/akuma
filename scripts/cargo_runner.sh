@@ -70,9 +70,7 @@ P44_PORT=$((44 + PORT_SHIFT))
 P4444_PORT=$((4444 + PORT_SHIFT))
 GDB_PORT="${GDB_PORT:-$((1234 + INSTANCE))}"
 
-# Convert ELF to flat binary.
-# The binary starts with a branch instruction (not ARM64 Image magic),
-# so QEMU loads it at RAM_BASE (0x40000000) without any offset.
+# Convert ELF to flat binary, and enforce the size ceiling.
 #
 # ALWAYS regenerate. This used to be guarded by `[ "$ELF" -nt "$BIN" ]`, which is
 # unsound: cargo *uplifts* a cached artifact into target/ when you switch back to a
@@ -88,27 +86,14 @@ GDB_PORT="${GDB_PORT:-$((1234 + INSTANCE))}"
 # thread" and served the in-kernel banner, because the .bin was from a plain
 # `smp-shared` build minutes earlier.
 #
-# objcopy on a 4 MB image is ~50 ms, so unconditional regeneration costs nothing. The
-# temp-file + atomic `mv` preserves the original guard's purpose (two concurrent runs
-# must not read a half-written .bin) without depending on timestamps.
-BIN_TMP="${BIN}.$$.tmp"
-rust-objcopy -O binary "$ELF" "$BIN_TMP"
-mv -f "$BIN_TMP" "$BIN"
-
-# Size guard: catch binary bloat before it silently breaks boot.
-BIN_BYTES=$(wc -c < "$BIN")
-if echo "$ELF" | grep -q "/extreme-size/"; then
-  SIZE_LIMIT=$((1 * 1024 * 1024))   # 1 MB for the extreme-size profile
-  SIZE_LABEL="1 MB"
-else
-  SIZE_LIMIT=$((4 * 1024 * 1024))   # 4 MB for release (incl. smp-shared/devbox-smoltcp)
-  SIZE_LABEL="4 MB"
-fi
-if [ "$BIN_BYTES" -gt "$SIZE_LIMIT" ]; then
-  echo "[cargo_runner] ERROR: kernel binary is $(( BIN_BYTES / 1024 )) KB, exceeds ${SIZE_LABEL} limit" >&2
-  exit 1
-fi
-echo "[cargo_runner] kernel size: $(( BIN_BYTES / 1024 )) KB (limit ${SIZE_LABEL})" >&2
+# scripts/link_kernel.sh (the `-C linker=` wrapper) now also writes this .bin at link
+# time, so a plain `cargo build` leaves a current one. That does NOT make the
+# regeneration here redundant: on an uplift-from-cache there is no link, so the wrapper
+# does not run. objcopy on a 4 MB image is ~50 ms, so unconditional regeneration costs
+# nothing and is the only thing that closes the uplift hole.
+mkbin_out=$(scripts/mkbin.sh "$ELF" "$BIN" --enforce-size)
+BIN_BYTES=${mkbin_out%% *}
+SIZE_LIMIT=${mkbin_out##* }
 
 GDB_ARGS=()
 if [ -n "$GDB_WAIT" ]; then

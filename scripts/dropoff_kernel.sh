@@ -35,20 +35,17 @@ if [ ! -b "$DRIVE" ]; then
     exit 1
 fi
 
-OBJCOPY=""
-for candidate in rust-objcopy llvm-objcopy; do
-    if command -v "$candidate" >/dev/null 2>&1; then
-        OBJCOPY="$candidate"
-        break
-    fi
-done
-if [ -z "$OBJCOPY" ]; then
-    echo "dropoff_kernel.sh: no rust-objcopy/llvm-objcopy on PATH" >&2
-    exit 1
-fi
-
-echo "dropoff_kernel.sh: $OBJCOPY -O binary $ELF -> $BIN"
-"$OBJCOPY" -O binary "$ELF" "$BIN"
+# Flattening (and objcopy discovery) is scripts/mkbin.sh's job — the same
+# helper scripts/link_kernel.sh and scripts/cargo_runner.sh use, so there is one
+# discovery chain rather than three. It tries rust-objcopy, llvm-objcopy, then
+# plain `objcopy` — and `objcopy` is the one that matters here: the self-host
+# rootfs gets it from apk `binutils` (installed by scripts/populate_disk.sh
+# --with-rust-toolchain), while rustup's rust-objcopy needs the llvm-tools
+# component that image does not carry. GNU objcopy's `-O binary` output was
+# verified byte-identical to rust-objcopy's on 2026-08-26.
+HERE=$(dirname "$0")
+echo "dropoff_kernel.sh: flattening $ELF -> $BIN"
+"$HERE/mkbin.sh" "$ELF" "$BIN" >/dev/null
 
 echo "dropoff_kernel.sh: dd $BIN -> $DRIVE"
 dd if="$BIN" of="$DRIVE" bs=1M

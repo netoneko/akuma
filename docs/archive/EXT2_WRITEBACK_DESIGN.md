@@ -232,6 +232,38 @@ makes akuma-ext2's `build.rs` set `kernel_profile_extreme`, and
 nothing to construct it — `-D dead-code` fails. Pre-existing at
 `4b086f3d`; use the documented dev-profile invocation.
 
+## What is still open (audited 2026-08-26, after the A/B)
+
+Landed and verified: **D-1** (write-back in the block cache), **D-2** (data
+before metadata, asserted in the write log), **D-3** (invalidate-on-free never
+flushes, with the poison test), **D-5** (in-slot sub-block patch — worth one
+device write per file), **D-6** (bitmap cursor), **D-7** (`sync_all_filesystems`
+on `reboot(2)`), **D-11** (no extraction).
+
+Not done:
+
+- **D-4 — zero-copy reads: NOT IMPLEMENTED.** `read_block` still does
+  `data.to_vec()` on every cache hit (`ext2.rs`, the `cache.get` arm), so each
+  hit costs one heap allocation plus a full block copy. The decision text says
+  "`read_block` stops cloning on hit (borrow guard)"; nothing in the shipped
+  code does that. This is the largest remaining *cheap* win now that device I/O
+  is mostly gone — with reads served from RAM, the memcpy is a visible share of
+  what `seq_read`'s remaining 43 ms actually is. Blocked on giving callers a
+  borrow that outlives the cache lock, which is why it was skipped.
+- **D-9 — per-box/mount scoping of the file page cache.** Deliberately not
+  bundled. Still the fix for **F-1** above (the global page cache keys on inode
+  number alone, so two independent ext2 mounts share a keyspace) — a latent
+  correctness bug, not tidiness.
+- **D-10 — the `DataCache` proposal was never written.** `proposals/` has no
+  such document. Until it exists, the mmap-vs-read double-cache seam stands.
+- **Verification ladder step 5's functional half.** The real-kernel A/B ran, but
+  the standalone live functional check it is paired with (nested dirs, 50-file
+  content verify, rename, `rm -rf`) has not been run against the write-back
+  kernel as a deliberate pass.
+- **Host-test coverage gaps** (unchanged from the step-1 note): the fixture is a
+  single-group image, so `is_alloc_meta`'s BGD span and cross-group cursor
+  restarts are thinly exercised; the `extreme` arms are host-invisible.
+
 ## Background
 
 Spawned from the ext2 performance line of work:

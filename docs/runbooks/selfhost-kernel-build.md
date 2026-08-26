@@ -796,20 +796,39 @@ scripts/dropoff_kernel.sh <elf-path> <drive>    # override either
 reboot -f
 ```
 
-It does the same three steps as the raw commands (objcopy, `dd`, done) —
-`rust-objcopy` then `llvm-objcopy`, whichever is on `PATH`; errors out with a
-clear message, not a silent no-op, if neither is; and does **not** reboot
-itself, so you always get a chance to look at its output first.
+It does the same three steps as the raw commands (objcopy, `dd`, done) and does
+**not** reboot itself, so you always get a chance to look at its output first.
+Flattening is delegated to `scripts/mkbin.sh`, which tries `rust-objcopy`, then
+`llvm-objcopy`, then plain **`objcopy`** — and on this image it is the last one
+that fires: the rootfs gets GNU objcopy from apk `binutils`
+(`populate_disk.sh --with-rust-toolchain`), whereas `rust-objcopy` needs the
+rustup `llvm-tools` component the image does not carry. Verified 2026-08-26:
+GNU `objcopy -O binary` on the kernel ELF is **byte-identical** to
+`rust-objcopy -O binary` (md5 `cc25e983…`, 3 322 096 B), so nothing about the
+resulting image depends on which one ran.
+
+**Since 2026-08-26 you can usually skip the flatten entirely.** `.cargo/config.toml`
+points the kernel target's linker at `scripts/link_kernel.sh`, which links and
+then writes `<elf>.bin` in the same step — so an in-guest `cargo build --release`
+already leaves `target/aarch64-unknown-none/release/akuma.bin` next to the ELF.
+`dropoff_kernel.sh` still re-flattens (it is cheap and it is the one path that
+cannot be stale), but if you are `dd`-ing by hand, the `.bin` is already there.
+The wrapper is POSIX sh and never fails the link: on a rootfs with no objcopy at
+all it prints `[mkbin] no objcopy found` and the build still succeeds with a
+working ELF, just no `.bin`. Verified in-guest on the devbox rootfs (busybox
+`/bin/sh`, no objcopy): wrapper exits 0, link unaffected.
 
 **`reboot -f`, not bare `reboot`** — busybox's plain `reboot` tries to signal
 an init process first and fails `EPERM` on this kernel (no init to signal);
 `-f` calls `reboot(2)` directly and is what actually exits QEMU.
 
-If the guest toolchain has neither `rust-objcopy` nor `llvm-objcopy`
-(`dropoff_kernel.sh` will say so and exit 1 rather than guess), pull the ELF
-out and flatten it on the host first (§"Verify" below has the `base64`
-extraction command), then `scp`/base64 the `.bin` back in and `dd` it onto
-`/dev/vdb` directly — the script is only for the in-guest objcopy step.
+If the guest toolchain has none of `rust-objcopy` / `llvm-objcopy` / `objcopy`
+(`mkbin.sh` will say so and exit 1 rather than guess), pull the ELF out and
+flatten it on the host first (§"Verify" below has the `base64` extraction
+command), then `scp`/base64 the `.bin` back in and `dd` it onto `/dev/vdb`
+directly — the script is only for the in-guest objcopy step. Installing apk
+`binutils` in the guest is the cheaper fix, and the self-host image already
+has it.
 
 **Host side**, confirm the relaunch and that it's actually the new build:
 
@@ -867,9 +886,10 @@ ssh -p <port> root@localhost \
   '/bin/busybox base64 /root/akuma/target/aarch64-unknown-none/release-smp-shared/akuma' \
   | base64 -d > selfhost_akuma.elf
 
-# 2. flatten it — run this from the repo so rust-toolchain.toml selects the
-#    toolchain that actually has llvm-tools, else rust-objcopy is "not found"
-rust-objcopy -O binary selfhost_akuma.elf selfhost_akuma.bin
+# 2. flatten it — scripts/mkbin.sh picks whichever objcopy exists
+#    (rust-objcopy needs rustup's llvm-tools component; GNU objcopy from
+#    binutils produces a byte-identical image, verified 2026-08-26)
+scripts/mkbin.sh selfhost_akuma.elf selfhost_akuma.bin
 
 # 3. boot it on its own disk clone and ports (never the image a live VM holds)
 qemu-system-aarch64 -machine virt,gic-version=3 -accel hvf -cpu host -smp 4 \

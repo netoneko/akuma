@@ -6,4 +6,10 @@ target = "aarch64-unknown-none"
 #   MEMORY=512M cargo run --release
 runner = "scripts/cargo_runner.sh"
 
+# Wraps rust-lld: links, then objcopies the kernel to a flat .bin (the form
+# QEMU's -kernel needs to speak the Linux boot protocol and pass a DTB). This is
+# the only hook that runs after the ELF exists and still inside `cargo build` —
+# cargo has no post-build hook. See scripts/link_kernel.sh.
+linker = "scripts/link_kernel.sh"
+
 rustflags = ["-C", "link-arg=-Tlinker.ld"]
