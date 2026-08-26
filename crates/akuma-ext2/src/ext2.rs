@@ -692,9 +692,9 @@ struct DirEntryRaw {
 // Ext2 Filesystem State
 // ============================================================================
 
-/// Internal filesystem state. Public for testing only.
-#[cfg(test)]
-pub struct Ext2State {
+/// Internal filesystem state. `pub(crate)` so `mod tests` can reach `fs.state`;
+/// nothing outside the crate names it.
+pub(crate) struct Ext2State {
     superblock: Superblock,
     block_size: usize,
     inodes_per_group: u32,
@@ -702,17 +702,25 @@ pub struct Ext2State {
     block_group_count: u32,
     blocks_per_group: u32,
     first_data_block: u32,
-}
 
-#[cfg(not(test))]
-struct Ext2State {
-    superblock: Superblock,
-    block_size: usize,
-    inodes_per_group: u32,
-    inode_size: u16,
-    block_group_count: u32,
-    blocks_per_group: u32,
-    first_data_block: u32,
+    // ---- deferred metadata writeback (see `flush_meta`) ----
+    //
+    // The superblock free counts and every block-group descriptor's free counts
+    // are updated on *every* block/inode allocate and free. Writing them through
+    // per operation cost a full 1 KB superblock write + a BGD-block RMW per
+    // allocated block — ~1000 device writes for a 2 MB file (see
+    // `crates/akuma-ext2/README.md` § Performance). These fields hold the
+    // authoritative in-memory copy; `flush_meta` writes the dirty ones to disk
+    // at the end of every mutating `Filesystem` method and on `sync()`. Only the
+    // write-locked allocator paths touch them, so a plain `Vec` is safe (no
+    // concurrent readers of *these* fields — read-only paths that call
+    // `read_bgd` only ever read `bgd.inode_table`, which never changes).
+    /// `bgd_cache[g]` = the current BGD for group `g`, `None` until first read.
+    bgd_cache: Vec<Option<BlockGroupDescriptor>>,
+    /// `bgd_dirty[g]` = group `g`'s BGD differs from disk.
+    bgd_dirty: Vec<bool>,
+    /// The in-memory superblock is ahead of disk.
+    sb_dirty: bool,
 }
 
 /// Non-preemption/IRQ guard held for the lifetime of an [`Ext2State`] lock hold under
@@ -817,11 +825,8 @@ pub struct Ext2Filesystem<B: BlockDevice> {
     dev: B,
     time_fn: fn() -> u64,
     /// Internal state protected by RwSpinlock. Read operations can proceed concurrently.
-    /// Public for testing only.
-    #[cfg(test)]
-    pub state: RwSpinlock<Ext2State>,
-    #[cfg(not(test))]
-    state: RwSpinlock<Ext2State>,
+    /// `pub(crate)` for `mod tests`; not reachable outside the crate.
+    pub(crate) state: RwSpinlock<Ext2State>,
     #[cfg(not(kernel_profile_extreme))]
     block_cache: Spinlock<BlockCache>,
     /// Per-instance write-lock owner for orphaned-lock recovery (see the
@@ -917,6 +922,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             block_group_count,
             blocks_per_group,
             first_data_block,
+            bgd_cache: vec![None; block_group_count as usize],
+            bgd_dirty: vec![false; block_group_count as usize],
+            sb_dirty: false,
         };
 
         Ok(Self {
@@ -1192,6 +1200,67 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         Ok(())
     }
 
+    // ========================================================================
+    // Deferred metadata writeback
+    // ========================================================================
+    //
+    // `read_bgd_staged` / `stage_bgd` / `stage_sb` are used *only* by the four
+    // allocator functions (`allocate_block`, `free_block`, `allocate_inode`,
+    // `free_inode`), which all hold `&mut Ext2State`. They keep the
+    // authoritative BGD + superblock free counts in memory and defer the disk
+    // write to `flush_meta`, called at the end of every mutating `Filesystem`
+    // method and on `sync()`. Read-only callers keep using `read_bgd` and only
+    // ever read `bgd.inode_table`, which no allocation changes — so a BGD that
+    // is dirty-in-memory but stale-on-disk is invisible to them.
+
+    /// BGD for `group`, from the in-memory cache if present, else read from disk
+    /// and cached.
+    fn read_bgd_staged(&self, state: &mut Ext2State, group: u32) -> Result<BlockGroupDescriptor, FsError> {
+        let g = group as usize;
+        if g >= state.bgd_cache.len() {
+            return Err(FsError::Internal);
+        }
+        if let Some(bgd) = state.bgd_cache[g] {
+            return Ok(bgd);
+        }
+        let bgd = self.read_bgd(state, group)?;
+        state.bgd_cache[g] = Some(bgd);
+        Ok(bgd)
+    }
+
+    /// Record an updated BGD in memory and mark it for the next `flush_meta`.
+    fn stage_bgd(&self, state: &mut Ext2State, group: u32, bgd: &BlockGroupDescriptor) {
+        let g = group as usize;
+        if g < state.bgd_cache.len() {
+            state.bgd_cache[g] = Some(*bgd);
+            state.bgd_dirty[g] = true;
+        }
+    }
+
+    /// Mark the (already updated in memory) superblock for the next `flush_meta`.
+    fn stage_sb(state: &mut Ext2State) {
+        state.sb_dirty = true;
+    }
+
+    /// Write every BGD and the superblock that `stage_*` marked dirty. Cheap when
+    /// nothing is dirty (the common case for a read or a pure-rename op).
+    fn flush_meta(&self, state: &mut Ext2State) -> Result<(), FsError> {
+        for group in 0..state.block_group_count {
+            if !state.bgd_dirty[group as usize] {
+                continue;
+            }
+            let bgd = state.bgd_cache[group as usize]
+                .expect("bgd_dirty implies bgd_cache is populated");
+            self.write_bgd(state, group, &bgd)?;
+            state.bgd_dirty[group as usize] = false;
+        }
+        if state.sb_dirty {
+            self.write_superblock(state)?;
+            state.sb_dirty = false;
+        }
+        Ok(())
+    }
+
     fn read_inode(&self, state: &Ext2State, inode_num: u32) -> Result<Inode, FsError> {
         if inode_num == 0 {
             return Err(FsError::NotFound);
@@ -1269,14 +1338,25 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // Block Allocation
     // ========================================================================
 
+    /// Allocate one block and zero it on disk. Callers that immediately overwrite
+    /// the whole block use [`Self::allocate_block_inner`] with `zero_new = false`.
     fn allocate_block(&self, state: &mut Ext2State) -> Result<u32, FsError> {
+        self.allocate_block_inner(state, true)
+    }
+
+    /// `zero_new = false` skips the post-allocation zero-fill write — one full
+    /// block write per allocation that is pure waste when the caller is about to
+    /// write the entire block anyway (`write_inode_data`, the full-block arm of
+    /// `write_at`). Never pass `false` for a metadata block (indirect pointer
+    /// block, new directory block) or a partially-written data block.
+    fn allocate_block_inner(&self, state: &mut Ext2State, zero_new: bool) -> Result<u32, FsError> {
         let unalloc = state.superblock.unallocated_blocks;
         if unalloc == 0 {
             return Err(FsError::NoSpace);
         }
 
         for group in 0..state.block_group_count {
-            let mut bgd = self.read_bgd(state, group)?;
+            let mut bgd = self.read_bgd_staged(state, group)?;
             let free_count = bgd.free_blocks_count;
             if free_count == 0 {
                 continue;
@@ -1290,28 +1370,19 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 if !Self::get_bit(&bitmap, bit) {
                     // Found free block
                     Self::set_bit(&mut bitmap, bit, true);
-                    if let Err(e) = self.write_block(state, bitmap_block, &bitmap) {
-                        return Err(e);
-                    }
+                    self.write_block(state, bitmap_block, &bitmap)?;
 
-                    // Update BGD
+                    // Update BGD + superblock in memory; flushed by flush_meta.
                     bgd.free_blocks_count = free_count - 1;
-                    if let Err(e) = self.write_bgd(state, group, &bgd) {
-                        return Err(e);
-                    }
-
-                    // Update superblock
+                    self.stage_bgd(state, group, &bgd);
                     state.superblock.unallocated_blocks = unalloc - 1;
-                    if let Err(e) = self.write_superblock(state) {
-                        return Err(e);
-                    }
+                    Self::stage_sb(state);
 
                     let block_num = state.first_data_block + group * state.blocks_per_group + bit;
 
-                    // Zero the block
-                    let zeros = vec![0u8; state.block_size];
-                    if let Err(e) = self.write_block(state, block_num, &zeros) {
-                        return Err(e);
+                    if zero_new {
+                        let zeros = vec![0u8; state.block_size];
+                        self.write_block(state, block_num, &zeros)?;
                     }
 
                     return Ok(block_num);
@@ -1332,7 +1403,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let group = adjusted / state.blocks_per_group;
         let bit = adjusted % state.blocks_per_group;
 
-        let mut bgd = self.read_bgd(state, group)?;
+        let mut bgd = self.read_bgd_staged(state, group)?;
         let bitmap_block = bgd.block_bitmap;
         let mut bitmap = self.read_block(state, bitmap_block)?;
 
@@ -1340,10 +1411,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         self.write_block(state, bitmap_block, &bitmap)?;
 
         bgd.free_blocks_count += 1;
-        self.write_bgd(state, group, &bgd)?;
-
+        self.stage_bgd(state, group, &bgd);
         state.superblock.unallocated_blocks += 1;
-        self.write_superblock(state)?;
+        Self::stage_sb(state);
 
         Ok(())
     }
@@ -1365,7 +1435,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
 
         for group in 0..state.block_group_count {
-            let mut bgd = self.read_bgd(state, group)?;
+            let mut bgd = self.read_bgd_staged(state, group)?;
             let free_count = bgd.free_inodes_count;
             if free_count == 0 {
                 continue;
@@ -1383,10 +1453,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     if is_dir {
                         bgd.used_dirs_count += 1;
                     }
-                    self.write_bgd(state, group, &bgd)?;
-
+                    self.stage_bgd(state, group, &bgd);
                     state.superblock.unallocated_inodes = unalloc - 1;
-                    self.write_superblock(state)?;
+                    Self::stage_sb(state);
 
                     let inode_num = group * state.inodes_per_group + bit + 1;
                     return Ok(inode_num);
@@ -1460,7 +1529,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let group = inode_idx / state.inodes_per_group;
         let bit = inode_idx % state.inodes_per_group;
 
-        let mut bgd = self.read_bgd(state, group)?;
+        let mut bgd = self.read_bgd_staged(state, group)?;
         let bitmap_block = bgd.inode_bitmap;
         let mut bitmap = self.read_block(state, bitmap_block)?;
 
@@ -1471,10 +1540,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         if is_dir && bgd.used_dirs_count > 0 {
             bgd.used_dirs_count -= 1;
         }
-        self.write_bgd(state, group, &bgd)?;
-
+        self.stage_bgd(state, group, &bgd);
         state.superblock.unallocated_inodes += 1;
-        self.write_superblock(state)?;
+        Self::stage_sb(state);
 
         Ok(())
     }
@@ -1545,17 +1613,23 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         block[offset..offset + 4].copy_from_slice(&bytes);
     }
 
-    /// Ensure a block exists at the given logical position, allocating if needed
+    /// Ensure a block exists at the given logical position, allocating if needed.
+    ///
+    /// `zero_leaf` controls only the **data** block: `false` skips its
+    /// post-allocation zero-fill for callers that write the whole block
+    /// immediately afterward (see [`Self::allocate_block_inner`]). Indirect and
+    /// double-indirect pointer blocks are always zeroed regardless.
     fn ensure_block(&self,
         state: &mut Ext2State,
         inode: &mut Inode,
         logical_block: u32,
+        zero_leaf: bool,
     ) -> Result<u32, FsError> {
         let ptrs_per_block = (state.block_size / 4) as u32;
 
         if logical_block < 12 {
             if inode.direct_blocks[logical_block as usize] == 0 {
-                let new_block = self.allocate_block(state)?;
+                let new_block = self.allocate_block_inner(state, zero_leaf)?;
                 inode.direct_blocks[logical_block as usize] = new_block;
                 inode.sectors_used += (state.block_size / 512) as u32;
             }
@@ -1575,7 +1649,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             let mut block = Self::read_block_ptr(&indirect, lb as usize);
 
             if block == 0 {
-                block = self.allocate_block(state)?;
+                block = self.allocate_block_inner(state, zero_leaf)?;
                 Self::write_block_ptr(&mut indirect, lb as usize, block);
                 self.write_block(state, inode.indirect_block, &indirect)?;
                 inode.sectors_used += (state.block_size / 512) as u32;
@@ -1610,7 +1684,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             let mut block = Self::read_block_ptr(&indirect, idx2);
 
             if block == 0 {
-                block = self.allocate_block(state)?;
+                block = self.allocate_block_inner(state, zero_leaf)?;
                 Self::write_block_ptr(&mut indirect, idx2, block);
                 self.write_block(state, indirect_block, &indirect)?;
                 inode.sectors_used += (state.block_size / 512) as u32;
@@ -1663,7 +1737,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let blocks_needed = (data.len() + state.block_size - 1) / state.block_size;
 
         for logical_block in 0..blocks_needed as u32 {
-            let phys_block = match self.ensure_block(state, inode, logical_block) {
+            // `zero_leaf = false`: every iteration writes a full block below
+            // (zero-padded past `data`), so the allocator's zero-fill is redundant.
+            let phys_block = match self.ensure_block(state, inode, logical_block, false) {
                 Ok(b) => b,
                 Err(e) => {
                     return Err(e);
@@ -2306,6 +2382,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
                 self.truncate_inode(&mut state, &mut inode)?;
                 self.write_inode_data(&mut state, inode_num, &mut inode, data)?;
+                self.flush_meta(&mut state)?;
                 Ok(())
             }
             Err(FsError::NotFound) => {
@@ -2334,6 +2411,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
                 // Add directory entry
                 self.add_dir_entry(&mut state, parent_inode, &name, inode_num, FT_REG_FILE)?;
+                self.flush_meta(&mut state)?;
 
                 Ok(())
             }
@@ -2432,10 +2510,15 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             let logical_block = (pos / block_size) as u32;
             let offset_in_block = pos % block_size;
             let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
+            let full_block = offset_in_block == 0 && chunk == block_size;
 
-            let phys_block = self.ensure_block(&mut state, &mut inode, logical_block)?;
+            // A partial write reads the block back before patching it, so a
+            // freshly allocated block there MUST be zeroed first; a full-block
+            // write overwrites every byte, so it need not be.
+            let phys_block =
+                self.ensure_block(&mut state, &mut inode, logical_block, !full_block)?;
 
-            if offset_in_block == 0 && chunk == block_size {
+            if full_block {
                 // Full block write — no need to read first
                 let mut block_data = vec![0u8; block_size];
                 block_data.copy_from_slice(&data[written..written + chunk]);
@@ -2458,6 +2541,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         }
         inode.modification_time = self.current_time();
         self.write_inode(&state, inode_num, &inode)?;
+        self.flush_meta(&mut state)?;
 
         Ok(written)
     }
@@ -2540,6 +2624,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
         // Add entry to parent
         self.add_dir_entry(&mut state, parent_inode_num, &name, inode_num, FT_DIR)?;
+        self.flush_meta(&mut state)?;
 
         Ok(())
     }
@@ -2592,6 +2677,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
                 self.deferred.push(inode_num);
                 inode.hard_links = 0;
                 self.write_inode(&state, inode_num, &inode)?;
+                self.flush_meta(&mut state)?;
                 return Ok(());
             }
 
@@ -2610,6 +2696,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             self.write_inode(&state, inode_num, &inode)?;
         }
 
+        self.flush_meta(&mut state)?;
         Ok(())
     }
 
@@ -2657,6 +2744,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         // Free inode
         self.free_inode(&mut state, inode_num, true)?;
 
+        self.flush_meta(&mut state)?;
         Ok(())
     }
 
@@ -2666,7 +2754,9 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         }
         let (parent_inode, name) = self.lookup_parent(link_path)?;
         let mut state = self.write_state();
-        self.create_symlink_internal(&mut state, parent_inode, &name, target)
+        self.create_symlink_internal(&mut state, parent_inode, &name, target)?;
+        self.flush_meta(&mut state)?;
+        Ok(())
     }
 
     fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
@@ -2679,7 +2769,9 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         }
         let (parent_inode, name) = self.lookup_parent(path)?;
         let mut state = self.write_state();
-        self.create_socket_node_internal(&mut state, parent_inode, &name)
+        self.create_socket_node_internal(&mut state, parent_inode, &name)?;
+        self.flush_meta(&mut state)?;
+        Ok(())
     }
 
     fn read_symlink(&self, path: &str) -> Result<String, FsError> {
@@ -2724,6 +2816,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
         self.add_dir_entry(&mut state, dst_parent, &dst_name, src_inode_num, ft)?;
         self.remove_dir_entry(&mut state, src_parent, &src_name)?;
+        self.flush_meta(&mut state)?;
 
         Ok(())
     }
@@ -2781,7 +2874,8 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         let last_block = (offset + len - 1) / block_size;
 
         for lb in first_block..=last_block {
-            self.ensure_block(&mut state, &mut inode, lb as u32)?;
+            // fallocate writes no data — the preallocated blocks must read as zero.
+            self.ensure_block(&mut state, &mut inode, lb as u32, true)?;
         }
 
         let end = offset + len;
@@ -2792,6 +2886,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         }
         inode.modification_time = self.current_time();
         self.write_inode(&state, inode_num, &inode)?;
+        self.flush_meta(&mut state)?;
         Ok(())
     }
 
@@ -2834,7 +2929,13 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn sync(&self) -> Result<(), FsError> {
-        Ok(())
+        // Flush any superblock / block-group-descriptor free-count updates that
+        // `stage_*` deferred. Every mutating method already flushes its own, so
+        // this normally has nothing to do; it is the backstop for unmount and
+        // for an explicit `fsync`/`sync` syscall. Data + inode + bitmap blocks
+        // are always written through, so there is nothing else to push.
+        let mut state = self.write_state();
+        self.flush_meta(&mut state)
     }
 
     fn resolve_inode(&self, path: &str) -> Result<u32, FsError> {

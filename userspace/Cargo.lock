@@ -50,6 +50,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-ext2"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+ "akuma-vfs",
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-primitives"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-ssh-crypto"
 version = "0.1.0"
 dependencies = [
@@ -58,6 +71,13 @@ dependencies = [
  "ed25519-dalek",
  "hmac",
  "sha2",
+]
+
+[[package]]
+name = "akuma-vfs"
+version = "0.1.0"
+dependencies = [
+ "spinning_top",
 ]
 
 [[package]]
@@ -352,6 +372,8 @@ dependencies = [
 name = "ext2probe"
 version = "0.1.0"
 dependencies = [
+ "akuma-ext2",
+ "akuma-vfs",
  "libakuma",
 ]
 

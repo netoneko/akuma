@@ -1,6 +1,14 @@
 # ext2 performance after a bulk delete — audit
 
-**Status: theories written up, benchmarked, no regression reproduced.**
+**Status: RESOLVED 2026-08-26 by a host I/O-probe follow-up — the cause is
+unconditional write amplification, not a post-delete regression. See
+"2026-08-26 follow-up" at the bottom, and
+[`crates/akuma-ext2/README.md`](../../crates/akuma-ext2/README.md#performance-characteristics)
+for the full write-up. First two fixes (deferred superblock/BGD metadata,
+skipped redundant zero-fill) landed the same day: 2 MB write 5.7× → 4.1×
+amplification, create 11.3 → 9.3 device writes/file. Directory-rewrite O(N²)
+and the write-back block cache are still pending.**
+
 Recorded 2026-08-25, triggered by a report of "fs performance looks like
 shit" after running `rm -rf /tmp/akuma` on a live `devbox-smoltcp` guest.
 
@@ -170,9 +178,87 @@ the benchmark's own design rather than a real effect. This means:
    `ext2probe`'s stress phase to match rather than guessing from the
    `go-build`-cache precedent.
 
+## 2026-08-26 follow-up — the actual cause (host I/O probe)
+
+The 2026-08-25 benchmark asked the wrong question. It measured op timings
+*before vs after* a bulk delete and looked for a delta. There is no delta —
+the cost is a **constant multiplier that applies to every write, always**, so a
+before/after ratio is ~1.0 (which is exactly what it saw, and the "faster after"
+was cache warmth as the audit already suspected). Fragmentation (theories 3, 4)
+and the deferred-free leak (theories 1, 2) are not involved.
+
+### Method
+
+Not a devbox boot. `Ext2Filesystem` (the `crates/akuma-ext2` crate, host-linked
+against `std`) mounted over an in-RAM copy of a real 256 MB `mke2fs` image
+(`-b 4096`, 2 block groups), with a `BlockDevice` shim that counts every
+`read_bytes` / `write_bytes` call and buckets it by on-disk region (superblock /
+GDT / bitmap / inode-table / data). Call count is the right metric: each
+`write_bytes` is one synchronous, busy-polled virtqueue round-trip on the guest
+(`crates/akuma-virtio/src/block.rs`), and it is a *sector* read-modify-write, so
+a 1 KB superblock write is a 2-sector read + 2-sector write.
+
+### Findings
+
+| operation | device **write calls** | write bytes | note |
+|---|---:|---:|---|
+| create 1 × 4 KB file | **11.3** | ~39 KB | sb×2, gdt×2, bitmap×2, inode-table×2, data×3.3 |
+| delete 1 × 4 KB file | **10.0** | ~34 KB | sb×2, gdt×2, bitmap×2, inode-table×2, data×2 |
+| 2 MB sequential write | **3327** | **11.7 MB → 5.7× amplification** | 514 superblock writes alone |
+| 2 MB read back (warm) | 0 | 0 | block cache absorbs it |
+| build 3200-file tree | 11.1 / file | linear | |
+| mass-delete 3200-file tree | 9.1 / file | linear | |
+| Nth file into one flat dir | **11 → 18** as N: 0 → 2000 | grows | dir rewrite is O(N) → fill/empty is O(N²) |
+
+Ranked causes (full detail in the crate README):
+
+1. **No write-back / write coalescing at any layer.** Every `write_block`,
+   `write_inode`, `write_bgd`, `write_superblock` goes straight to the device.
+   The block cache is *invalidated* on write, never updated. `sync()` is a no-op.
+2. **Full 1 KB superblock rewrite on every block and every inode alloc/free** —
+   only to adjust `unallocated_blocks` / `unallocated_inodes`.
+3. **Full BGD rewrite the same way** (`free_*_count`).
+4. **`allocate_block` zero-fills each new block with its own device write**, then
+   the caller overwrites it immediately — one wasted full-block write per block.
+5. **`add_dir_entry` / `remove_dir_entry` rewrite the entire directory** on every
+   entry → O(N²) to fill or empty one directory.
+6. `allocate_block` linear-scans the block bitmap from bit 0 every call.
+
+"Slow after `rm -rf /tmp/akuma`" was the `rm -rf` *itself* (files × ~9 synchronous
+device writes = tens to hundreds of thousands of virtqueue round-trips), plus
+every subsequent build `create` costing ~11 writes. Nothing about the delete
+degraded the filesystem's later state.
+
+The harness also confirmed a separate concern: the crate allocates freely — and
+in `read_inode_data`'s case, *unboundedly* (whole directory into a `Vec` on every
+path-lookup component) — while the `no-bkl-vfs` `PreemptGuard` holds local IRQs
+masked. See the README's "Allocation audit".
+
+### Fixes applied 2026-08-26 (checkpoint 1)
+
+Two low-risk changes in `crates/akuma-ext2/src/ext2.rs`, host-tested (63/63) and
+kernel-build-clean:
+
+- **Fix A — skip redundant zero-fill.** `ensure_block` takes a `zero_leaf` flag;
+  `write_inode_data` and the full-block arm of `write_at` pass `false` because
+  they write every byte of the block immediately after. Removes one full-block
+  device write per allocated data block (512 on a 2 MB write). Indirect pointer
+  blocks and partially-written blocks are still zeroed.
+- **Fix B — defer superblock + BGD writes.** `Ext2State` gains an in-memory
+  `bgd_cache` + `bgd_dirty` + `sb_dirty`; the four allocators stage updates in
+  memory and `flush_meta` writes the dirty ones once at the end of every mutating
+  `Filesystem` method and on `sync()` (no longer a no-op). On-disk metadata stays
+  consistent at every syscall boundary.
+
+Probe deltas (`ext2probe-host`, `disk.img`): create 11.3 → 9.3 wr/file, delete
+10.0 → 9.0, 2 MB write 3327 → 2300 calls / 5.7× → 4.1×, tree build −18%,
+mass-delete −11%. Pending: incremental directory writes (the O(N²)), write-back
+block cache (read-after-write is still cold), bitmap-scan cursor.
+
 ## Background
 
 [`GETDENTS64_DIR_CACHE_FIX.md`](GETDENTS64_DIR_CACHE_FIX.md) (the
 256-subdirectory tree size this benchmark's default is modeled on),
 [[project_isolated_qemu_verification]] (isolated-VM verification recipe this
-followed).
+followed), [`crates/akuma-ext2/README.md`](../../crates/akuma-ext2/README.md)
+(the 2026-08-26 follow-up's home, with diagrams and the allocation audit).

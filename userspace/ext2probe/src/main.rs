@@ -1,18 +1,16 @@
-//! `ext2probe` — file create/write/read/list throughput benchmark, run once
-//! on a clean directory and again after a large create-then-mass-delete
-//! churn, to test the `docs/archive/EXT2_PERFORMANCE_AUDIT.md` theory that
-//! ordinary ext2 file operations measurably regress after a bulk `rm -rf`
-//! (free-block/inode bitmap fragmentation, the deferred-inode-free list,
-//! file-page-cache pinning — see that doc for the full writeup and which of
-//! these this probe can and can't distinguish).
+//! `ext2probe` (guest binary) — file create/write/read/list throughput against
+//! the live kernel filesystem, run once on a clean directory and again after a
+//! large create-then-mass-delete churn, to test whether ordinary ext2 ops
+//! measurably regress after a bulk `rm -rf` (see
+//! `docs/archive/EXT2_PERFORMANCE_AUDIT.md`).
+//!
+//! Workload shapes are shared with the host device-I/O probe (`ext2probe-host`)
+//! via the crate library — see `src/lib.rs`.
 //!
 //! Usage: `ext2probe [stress_files_per_dir] [stress_dirs]`
 //!   Defaults: 200 files/dir, 16 dirs (3200 files, ~12.5 MB) for the stress
-//!   phase — sized to approximate a mid-size build-cache tree like the
-//!   256-subdirectory `/.cache/go-build` tree in
-//!   `docs/archive/GETDENTS64_DIR_CACHE_FIX.md`.
-//!
-//! Verdict line for a log grep: `ext2probe: REGRESSION` / `ext2probe: NO REGRESSION`.
+//!   phase. Verdict line for a log grep: `ext2probe: REGRESSION` /
+//!   `ext2probe: NO REGRESSION`.
 
 #![no_std]
 #![no_main]
@@ -20,33 +18,111 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::vec;
 
+use ext2probe::{
+    workload, FsOps, BASE_N, DEFAULT_TREE_DIRS, DEFAULT_TREE_FILES, FILE_SIZE, SEQ_BYTES, SEQ_CHUNK,
+};
 use libakuma::open_flags::{O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY};
 use libakuma::{
     clock_gettime, close, exit, mkdir, open, print, print_dec, println, read, read_dir, rmdir,
     unlink, write, Timespec, CLOCK_MONOTONIC,
 };
 
-const FILE_SIZE: usize = 4096;
-const BASE_N: usize = 300;
-const SEQ_BYTES: usize = 2 * 1024 * 1024;
-const SEQ_CHUNK: usize = 8192;
-const DEFAULT_STRESS_FILES: usize = 200;
-const DEFAULT_STRESS_DIRS: usize = 16;
-
-/// A degradation this large on any single op after the mass delete is called
-/// out as a regression in the final verdict line.
+/// A degradation this large on any single op after the mass delete is called out
+/// as a regression in the final verdict line.
 const REGRESSION_PCT: i64 = 20;
-
-/// Linux/musl `EEXIST` — not exported by libakuma, hardcoded per the ABI docs
-/// (`docs/reference/abi/`) since the kernel's syscall ABI mirrors Linux's.
+/// Linux/musl `EEXIST` — not exported by libakuma, hardcoded per the ABI docs.
 const EEXIST: i32 = 17;
 
-fn now_us() -> u64 {
-    let mut ts = Timespec::default();
-    clock_gettime(CLOCK_MONOTONIC, &mut ts);
-    (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
+/// [`FsOps`] over libakuma syscalls, against the real kernel filesystem.
+struct GuestFsOps;
+
+impl FsOps for GuestFsOps {
+    fn mkdir(&self, path: &str) {
+        let r = mkdir(path);
+        if r != 0 && r != -EEXIST {
+            print("ext2probe: WARNING mkdir(");
+            print(path);
+            print(") rc=");
+            print_dec((-r) as usize);
+            println("");
+        }
+    }
+    fn rmdir(&self, path: &str) {
+        rmdir(path);
+    }
+    fn create_write(&self, path: &str, data: &[u8]) {
+        let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC);
+        if fd < 0 {
+            print("ext2probe: WARNING open failed for ");
+            println(path);
+            return;
+        }
+        let mut off = 0;
+        while off < data.len() {
+            let w = write(fd, &data[off..]);
+            if w <= 0 {
+                break;
+            }
+            off += w as usize;
+        }
+        close(fd);
+    }
+    fn seq_write(&self, path: &str, total: usize, chunk: usize) {
+        let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC);
+        if fd < 0 {
+            println("ext2probe: WARNING seq_write open failed");
+            return;
+        }
+        let buf = [0xCDu8; SEQ_CHUNK];
+        let mut written = 0;
+        while written < total {
+            let want = core::cmp::min(chunk.min(SEQ_CHUNK), total - written);
+            let n = write(fd, &buf[..want]);
+            if n <= 0 {
+                break;
+            }
+            written += n as usize;
+        }
+        close(fd);
+    }
+    fn read_all(&self, path: &str) -> usize {
+        let fd = open(path, O_RDONLY);
+        if fd < 0 {
+            println("ext2probe: WARNING read open failed");
+            return 0;
+        }
+        let mut buf = [0u8; SEQ_CHUNK];
+        let mut total = 0;
+        loop {
+            let n = read(fd, &mut buf);
+            if n <= 0 {
+                break;
+            }
+            total += n as usize;
+        }
+        close(fd);
+        total
+    }
+    fn unlink(&self, path: &str) {
+        unlink(path);
+    }
+    fn list_dir(&self, path: &str) -> usize {
+        read_dir(path).map(Iterator::count).unwrap_or(0)
+    }
+    fn stat(&self, path: &str) {
+        // No direct stat wrapper here; an O_RDONLY open + close is the closest
+        // metadata touch and is all the deep-path scenario needs.
+        let fd = open(path, O_RDONLY);
+        if fd >= 0 {
+            close(fd);
+        }
+    }
+    fn now_us(&self) -> u64 {
+        let mut ts = Timespec::default();
+        clock_gettime(CLOCK_MONOTONIC, &mut ts);
+        (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
+    }
 }
 
 fn print_us(label: &str, us: u64) {
@@ -55,121 +131,29 @@ fn print_us(label: &str, us: u64) {
     println(" us");
 }
 
-fn mkdir_ignore_exists(path: &str) {
-    let r = mkdir(path);
-    if r != 0 && r != -EEXIST {
-        print("ext2probe: WARNING mkdir(");
-        print(path);
-        print(") rc=");
-        print_dec((-r) as usize);
-        println("");
-    }
-}
-
-/// Create `n` files of `size` bytes each directly under `dir`, named
-/// `00000.dat`.. Returns elapsed microseconds.
-fn create_files(dir: &str, n: usize, size: usize) -> u64 {
-    let buf = vec![0xABu8; size];
-    let t0 = now_us();
-    for i in 0..n {
-        let path = format!("{}/{:05}.dat", dir, i);
-        let fd = open(&path, O_CREAT | O_WRONLY | O_TRUNC);
-        if fd < 0 {
-            print("ext2probe: WARNING open failed for ");
-            println(&path);
-            continue;
-        }
-        let mut off = 0;
-        while off < buf.len() {
-            let w = write(fd, &buf[off..]);
-            if w <= 0 {
-                break;
-            }
-            off += w as usize;
-        }
-        close(fd);
-    }
-    now_us() - t0
-}
-
-/// Unlink the `n` files `create_files` made under `dir`, then rmdir `dir`
-/// itself. Returns elapsed microseconds — the `rm -rf` analogue this whole
-/// probe exists to time.
-fn delete_files(dir: &str, n: usize) -> u64 {
-    let t0 = now_us();
-    for i in 0..n {
-        let path = format!("{}/{:05}.dat", dir, i);
-        unlink(&path);
-    }
-    rmdir(dir);
-    now_us() - t0
-}
-
-fn seq_write(path: &str, total: usize, chunk: usize) -> u64 {
-    let buf = vec![0xCDu8; chunk];
-    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC);
-    if fd < 0 {
-        println("ext2probe: WARNING seq_write open failed");
-        return 0;
-    }
-    let t0 = now_us();
-    let mut written = 0;
-    while written < total {
-        let n = write(fd, &buf);
-        if n <= 0 {
-            break;
-        }
-        written += n as usize;
-    }
-    let elapsed = now_us() - t0;
-    close(fd);
-    elapsed
-}
-
-fn seq_read(path: &str, chunk: usize) -> (u64, usize) {
-    let mut buf = vec![0u8; chunk];
-    let fd = open(path, O_RDONLY);
-    if fd < 0 {
-        println("ext2probe: WARNING seq_read open failed");
-        return (0, 0);
-    }
-    let t0 = now_us();
-    let mut total = 0;
-    loop {
-        let n = read(fd, &mut buf);
-        if n <= 0 {
-            break;
-        }
-        total += n as usize;
-    }
-    let elapsed = now_us() - t0;
-    close(fd);
-    (elapsed, total)
-}
-
-fn list_dir(dir: &str) -> (u64, usize) {
-    let t0 = now_us();
-    let count = read_dir(dir).map(Iterator::count).unwrap_or(0);
-    (now_us() - t0, count)
-}
-
 /// One (create N files, seq write+read a big file, list, delete) pass.
 /// Returns (create_us, write_us, read_us, list_us).
-fn baseline_pass(tag: &str, dir: &str) -> (u64, u64, u64, u64) {
+fn baseline_pass(ops: &GuestFsOps, tag: &str, dir: &str) -> (u64, u64, u64, u64) {
     println("");
     print("ext2probe: --- ");
     print(tag);
     println(" pass ---");
-    mkdir_ignore_exists(dir);
+    ops.mkdir(dir);
 
-    let create_us = create_files(dir, BASE_N, FILE_SIZE);
+    let t0 = ops.now_us();
+    workload::create_files(ops, dir, BASE_N, FILE_SIZE);
+    let create_us = ops.now_us() - t0;
     print_us("ext2probe: create:    ", create_us);
 
-    let big = format!("{}/big.dat", dir);
-    let write_us = seq_write(&big, SEQ_BYTES, SEQ_CHUNK);
+    let big = format!("{dir}/big.dat");
+    let t0 = ops.now_us();
+    workload::seq_write(ops, &big, SEQ_BYTES, SEQ_CHUNK);
+    let write_us = ops.now_us() - t0;
     print_us("ext2probe: seq_write: ", write_us);
 
-    let (read_us, read_bytes) = seq_read(&big, SEQ_CHUNK);
+    let t0 = ops.now_us();
+    let read_bytes = ops.read_all(&big);
+    let read_us = ops.now_us() - t0;
     print_us("ext2probe: seq_read:  ", read_us);
     if read_bytes != SEQ_BYTES {
         print("ext2probe: WARNING seq_read got ");
@@ -179,25 +163,26 @@ fn baseline_pass(tag: &str, dir: &str) -> (u64, u64, u64, u64) {
         println("");
     }
 
-    let (list_us, listed) = list_dir(dir);
+    let t0 = ops.now_us();
+    let listed = ops.list_dir(dir);
+    let list_us = ops.now_us() - t0;
     print_us("ext2probe: list_dir:  ", list_us);
     print("ext2probe:   (");
     print_dec(listed);
     println(" entries)");
 
-    unlink(&big);
-    let delete_us = delete_files(dir, BASE_N);
+    ops.unlink(&big);
+    let t0 = ops.now_us();
+    workload::delete_files(ops, dir, BASE_N);
+    let delete_us = ops.now_us() - t0;
     print_us("ext2probe: delete:    ", delete_us);
 
     (create_us, write_us, read_us, list_us)
 }
 
-/// Build a `dirs`-subdirectory, `files_per_dir`-file-each tree (matching the
-/// 256-subdirectory `go-build`-cache shape from
-/// `docs/archive/GETDENTS64_DIR_CACHE_FIX.md`) and mass-delete it in one
-/// timed pass — the `rm -rf /tmp/akuma`-shaped operation this probe exists to
-/// reproduce. Returns (delete_us, total_files).
-fn stress_pass(root: &str, dirs: usize, files_per_dir: usize) -> (u64, usize) {
+/// Build a `dirs × files_per_dir` tree and mass-delete it in one timed pass —
+/// the `rm -rf`-shaped operation. Returns (delete_us, total_files).
+fn stress_pass(ops: &GuestFsOps, root: &str, dirs: usize, files_per_dir: usize) -> (u64, usize) {
     println("");
     println("ext2probe: --- stress pass (simulated `rm -rf` of a big tree) ---");
     print("ext2probe: building ");
@@ -206,26 +191,13 @@ fn stress_pass(root: &str, dirs: usize, files_per_dir: usize) -> (u64, usize) {
     print_dec(files_per_dir);
     println(" files");
 
-    mkdir_ignore_exists(root);
-    let t0 = now_us();
-    for d in 0..dirs {
-        let sub = format!("{}/d{:04}", root, d);
-        mkdir_ignore_exists(&sub);
-        create_files(&sub, files_per_dir, FILE_SIZE);
-    }
-    print_us("ext2probe: build tree:  ", now_us() - t0);
+    let t0 = ops.now_us();
+    workload::build_tree(ops, root, dirs, files_per_dir);
+    print_us("ext2probe: build tree:  ", ops.now_us() - t0);
 
-    let t0 = now_us();
-    for d in 0..dirs {
-        let sub = format!("{}/d{:04}", root, d);
-        for i in 0..files_per_dir {
-            let path = format!("{}/{:05}.dat", sub, i);
-            unlink(&path);
-        }
-        rmdir(&sub);
-    }
-    rmdir(root);
-    let delete_us = now_us() - t0;
+    let t0 = ops.now_us();
+    workload::mass_delete_tree(ops, root, dirs, files_per_dir);
+    let delete_us = ops.now_us() - t0;
     print_us("ext2probe: mass delete: ", delete_us);
 
     (delete_us, dirs * files_per_dir)
@@ -260,10 +232,12 @@ fn print_delta(label: &str, before: u64, after: u64) -> bool {
 pub extern "C" fn main() {
     let stress_files: usize = libakuma::arg(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_STRESS_FILES);
+        .unwrap_or(DEFAULT_TREE_FILES);
     let stress_dirs: usize = libakuma::arg(2)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_STRESS_DIRS);
+        .unwrap_or(DEFAULT_TREE_DIRS);
+
+    let ops = GuestFsOps;
 
     println("ext2probe: starting");
     print("ext2probe: params base_n=");
@@ -276,11 +250,11 @@ pub extern "C" fn main() {
     print_dec(stress_dirs);
     println("");
 
-    mkdir_ignore_exists("/probe");
+    ops.mkdir("/probe");
 
-    let (c1, w1, r1, l1) = baseline_pass("BEFORE", "/probe/base1");
+    let (c1, w1, r1, l1) = baseline_pass(&ops, "BEFORE", "/probe/base1");
 
-    let (mass_delete_us, total_files) = stress_pass("/probe/stress", stress_dirs, stress_files);
+    let (mass_delete_us, total_files) = stress_pass(&ops, "/probe/stress", stress_dirs, stress_files);
     print("ext2probe: mass delete rate: ");
     if mass_delete_us > 0 {
         print_dec((total_files as u64 * 1_000_000 / mass_delete_us) as usize);
@@ -289,7 +263,7 @@ pub extern "C" fn main() {
     }
     println(" files/sec");
 
-    let (c2, w2, r2, l2) = baseline_pass("AFTER", "/probe/base2");
+    let (c2, w2, r2, l2) = baseline_pass(&ops, "AFTER", "/probe/base2");
 
     println("");
     println("ext2probe: --- comparison (before vs after mass delete) ---");

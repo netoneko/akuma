@@ -3,9 +3,35 @@ name = "ext2probe"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/lib.rs"
+
+# Guest ELF: drives the live kernel fs through libakuma syscalls, times each op,
+# prints the REGRESSION / NO REGRESSION verdict. Built by `userspace/build.sh`.
 [[bin]]
 name = "ext2probe"
 path = "src/main.rs"
+required-features = ["akuma"]
+
+# Host binary: links akuma-ext2, mounts an in-RAM copy of a real ext2 image, and
+# counts device I/O per operation. Not built for the guest target.
+#   cargo run -p ext2probe --bin ext2probe-host --no-default-features \
+#     --features host-probe --target "$(rustc -vV | grep '^host:' | cut -d' ' -f2)" -- disk.img
+[[bin]]
+name = "ext2probe-host"
+path = "src/bin/host.rs"
+required-features = ["host-probe"]
+
+[features]
+default = ["akuma"]
+# The guest half — libakuma defines #[panic_handler]/#[global_allocator], so it
+# can never link a std target. `--no-default-features` drops it for the host bin.
+akuma = ["dep:libakuma"]
+# The host half — pulls in akuma-ext2 (+ its `fs-cache`, matching the kernel
+# default) and std.
+host-probe = ["dep:akuma-ext2", "dep:akuma-vfs"]
 
 [dependencies]
-libakuma = { path = "../libakuma" }
+libakuma = { path = "../libakuma", optional = true }
+akuma-ext2 = { path = "../../crates/akuma-ext2", features = ["fs-cache"], optional = true }
+akuma-vfs = { path = "../../crates/akuma-vfs", optional = true }
