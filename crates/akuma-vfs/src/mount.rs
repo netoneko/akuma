@@ -335,6 +335,16 @@ impl<const MAX: usize> MountSet<MAX> {
         Ok(())
     }
 
+    /// Every mounted filesystem, cloned out of the table. For callers that
+    /// must not hold the table lock across the (I/O-performing) operation —
+    /// the kernel's reboot-time sync collects with this, then syncs each fs
+    /// lock-free, matching this file's "no I/O under the mount-table lock"
+    /// discipline.
+    #[must_use]
+    pub fn filesystems(&self) -> Vec<Arc<dyn Filesystem>> {
+        self.mounts.iter().map(|m| m.fs.clone()).collect()
+    }
+
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.mounts.is_empty()

@@ -1009,11 +1009,382 @@ fn concurrent_create_and_lookup() {
 }
 
 // ============================================================================
+// Write-back cache tests (design doc: docs/archive/EXT2_WRITEBACK_DESIGN.md)
+// ============================================================================
+
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// Shared in-memory device that records every device read/write. The `Arc`
+/// inner lets a test open a *second* `Ext2Filesystem` over the same bytes —
+/// the persistence oracle: after an op returns (or `sync()`), what the device
+/// holds must be a complete, self-consistent filesystem.
+struct RecordingDevice {
+    inner: spinning_top::Spinlock<Vec<u8>>,
+    reads: AtomicU64,
+    writes: AtomicU64,
+    /// `(offset, len)` of every write, in order — for flush-ordering asserts.
+    write_log: spinning_top::Spinlock<alloc::vec::Vec<(u64, usize)>>,
+}
+
+impl RecordingDevice {
+    fn from_fixture(name: &str) -> Self {
+        let path = alloc::format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
+        extern crate std;
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("failed to read fixture {path}: {e}"));
+        Self {
+            inner: spinning_top::Spinlock::new(bytes),
+            reads: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            write_log: spinning_top::Spinlock::new(alloc::vec::Vec::new()),
+        }
+    }
+
+    fn read_count(&self) -> u64 {
+        self.reads.load(AtomicOrdering::Relaxed)
+    }
+}
+
+/// Mounted through `&RecordingDevice` so one device (and its counters/log)
+/// can back two filesystem instances — the persistence-oracle tests.
+impl BlockDevice for &RecordingDevice {
+    fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+        (**self).read_bytes(offset, buf)
+    }
+
+    fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
+        (**self).write_bytes(offset, data)
+    }
+}
+
+impl BlockDevice for RecordingDevice {
+    fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+        self.reads.fetch_add(1, AtomicOrdering::Relaxed);
+        let data = self.inner.lock();
+        let off = offset as usize;
+        if off + buf.len() > data.len() {
+            return Err(());
+        }
+        buf.copy_from_slice(&data[off..off + buf.len()]);
+        Ok(())
+    }
+
+    fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
+        self.writes.fetch_add(1, AtomicOrdering::Relaxed);
+        self.write_log.lock().push((offset, data.len()));
+        let mut inner = self.inner.lock();
+        let off = offset as usize;
+        if off + data.len() > inner.len() {
+            return Err(());
+        }
+        inner[off..off + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+}
+
+/// Read-after-write must not re-read the file's **data** blocks: write-back
+/// keeps them dirty-resident, so the read-back's device reads are limited to
+/// *metadata* re-fills (inode table, BGD, dirent block) that the small 64-slot
+/// ring may have evicted mid-op. The old write-through cache paid a cold
+/// device read per data block on top of that — 4 for this file. What this
+/// asserts: data blocks contribute zero, i.e. reads ≤ the metadata working
+/// set, and — the sharp version, under `fs-cache` where nothing evicts —
+/// exactly zero.
+#[test]
+fn writeback_read_after_write_is_warm() {
+    let dev = RecordingDevice::from_fixture("test.ext2");
+    let fs = Ext2Filesystem::new(&dev, || 0).unwrap();
+    fs.write_file("/warm.bin", &[0xA5u8; 4096]).unwrap();
+
+    let reads_before = dev.read_count();
+    let got = fs.read_file("/warm.bin").unwrap();
+    assert_eq!(got.len(), 4096);
+    assert!(got.iter().all(|&b| 0xA5 == b));
+    let reads = dev.read_count() - reads_before;
+    // 4 data blocks + ≤9 metadata blocks (superblock uncached, BGD ×groups,
+    // inode table, bitmaps, dirent). Anything above that means data blocks
+    // came back from the device — the write-through behavior we replaced.
+    assert!(
+        reads <= 9,
+        "read-after-write performed {reads} device reads; data blocks must be cache hits (write-through residue?)"
+    );
+    #[cfg(feature = "fs-cache")]
+    assert_eq!(reads, 0, "fs-cache is big enough that nothing evicts; expected zero reads");
+}
+
+/// Every mutating op ends in `flush_meta`, so when the op returns the device
+/// already holds the data — verified by mounting a *fresh* filesystem over the
+/// same device bytes and reading the file back (the persistence oracle).
+#[test]
+fn writeback_data_reaches_device_by_op_end() {
+    let dev = RecordingDevice::from_fixture("test.ext2");
+    let fs = Ext2Filesystem::new(&dev, || 0).unwrap();
+    fs.write_file("/persist.bin", b"WRITEBACK PERSISTED").unwrap();
+
+    let fs2 = Ext2Filesystem::new(&dev, || 0).unwrap();
+    assert_eq!(
+        fs2.read_file("/persist.bin").unwrap(),
+        b"WRITEBACK PERSISTED",
+        "flush_meta must have pushed dirty data to the device before the op returned"
+    );
+}
+
+/// The one real correctness hazard of write-back (design doc D-3): a freed
+/// block's stale dirty copy must be *dropped*, never flushed nor served. Poison
+/// recipe: fill block with junk, delete (free), reallocate the same block, do a
+/// **partial** write — the un-written tail must read back as zeros, not junk.
+/// (The partial write's read-back would hit the stale cached copy if
+/// invalidate-on-free were missing.)
+#[test]
+fn writeback_free_realloc_has_no_stale_bytes() {
+    let dev = RecordingDevice::from_fixture("test.ext2");
+    let fs = Ext2Filesystem::new(&dev, || 0).unwrap();
+
+    // File A: one full block of junk.
+    fs.write_file("/a.junk", &[0xEEu8; 4096]).unwrap();
+    fs.remove_file("/a.junk").unwrap();
+
+    // File B reuses the block; only byte 0 is written.
+    fs.write_at("/b.fresh", 0, &[0x42]).unwrap();
+    let got = fs.read_file("/b.fresh").unwrap();
+    assert_eq!(got.len(), 1, "size must be 1 byte");
+
+    // Now extend with a partial write past the block start and read the tail.
+    fs.write_at("/b.fresh", 8, &[0x99]).unwrap();
+    let got = fs.read_file("/b.fresh").unwrap();
+    assert_eq!(got.len(), 9);
+    assert_eq!(got[0], 0x42);
+    assert_eq!(got[8], 0x99);
+    for (i, &b) in got[1..8].iter().enumerate() {
+        assert_eq!(b, 0, "byte {} of the reallocated block must be zero, got {:#x}", i + 1, b);
+    }
+
+    // And the device copy must agree (no junk ever flushed).
+    let fs2 = Ext2Filesystem::new(&dev, || 0).unwrap();
+    let got2 = fs2.read_file("/b.fresh").unwrap();
+    assert_eq!(got, got2, "device and cache must agree after flush");
+}
+
+/// Flush ordering (design doc D-2): within one mutating op, the file's data
+/// block must reach the device *before* the superblock (phase 2 metadata). A
+/// crash between the two leaks an allocated block (e2fsck-recoverable) instead
+/// of publishing free counts that disagree with the data.
+#[test]
+fn writeback_flushes_data_before_superblock() {
+    let dev = RecordingDevice::from_fixture("test.ext2");
+    let fs = Ext2Filesystem::new(&dev, || 0).unwrap();
+    fs.write_file("/order.bin", b"ORDER-MAGIC-1234").unwrap();
+
+    let log = dev.write_log.lock();
+    let inner = dev.inner.lock();
+    let data_idx = log
+        .iter()
+        .position(|&(off, len)| {
+            let start = off as usize;
+            if start + len > inner.len() {
+                return false;
+            }
+            inner[start..start + len].windows(4).any(|w| w == b"RDER" || w == b"MAGI" || w == b"1234")
+        })
+        .expect("the file data block must have been written to the device");
+    let sb_idx = log
+        .iter()
+        .rposition(|&(off, _)| off == 1024)
+        .expect("the superblock must have been written (free counts changed)");
+    assert!(
+        data_idx < sb_idx,
+        "data block write (log[{data_idx}]) must precede the superblock write (log[{sb_idx}])"
+    );
+}
+
+/// Dirty-ring eviction must flush victims (design doc D-1): write far more
+/// blocks than the 64-slot ring holds, then verify from a fresh mount that
+/// every byte landed. This drives the run through `alloc_slot`'s flush path.
+#[test]
+fn writeback_ring_eviction_flushes_dirty_victims() {
+    let dev = RecordingDevice::from_fixture("test.ext2");
+    let fs = Ext2Filesystem::new(&dev, || 0).unwrap();
+    // ~150 KB across blocks well past the ring's 64 slots (block size 1024).
+    let mut pattern = alloc::vec![0u8; 150 * 1024];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    fs.write_file("/big.bin", &pattern).unwrap();
+
+    let fs2 = Ext2Filesystem::new(&dev, || 0).unwrap();
+    let got = fs2.read_file("/big.bin").unwrap();
+    assert_eq!(got.len(), pattern.len());
+    let first_bad = got.iter().zip(pattern.iter()).position(|(a, b)| a != b);
+    assert!(
+        first_bad.is_none(),
+        "evicted dirty blocks lost data, first divergence at {first_bad:?}"
+    );
+}
+
+/// Bitmap-scan cursor correctness (design doc D-6): fragmentation must not
+/// make the allocator miss free bits. Fill, punch holes, refill — every
+/// allocation must succeed and the reopened device must agree.
+#[test]
+fn writeback_fragmented_allocation_finds_holes() {
+    let dev = RecordingDevice::from_fixture("test.ext2");
+    let fs = Ext2Filesystem::new(&dev, || 0).unwrap();
+
+    for i in 0..24 {
+        let name = alloc::format!("/frag{i}.dat");
+        let fill = [0xF0u8 ^ (i as u8); 2048];
+        fs.write_file(&name, &fill).unwrap();
+    }
+    // Punch holes: delete every even file.
+    for i in (0..24).step_by(2) {
+        let name = alloc::format!("/frag{i}.dat");
+        fs.remove_file(&name).unwrap();
+    }
+    // Refill with new files — the cursor must find the freed bits (wrapping
+    // past them or being pulled back), never report NoSpace early.
+    for i in 0..12 {
+        let name = alloc::format!("/refill{i}.dat");
+        let fill = [0x0Fu8 | (i as u8); 2048];
+        fs.write_file(&name, &fill).unwrap();
+    }
+
+    // Oracle: fresh mount over the device bytes.
+    let fs2 = Ext2Filesystem::new(&dev, || 0).unwrap();
+    for i in (1..24).step_by(2) {
+        let name = alloc::format!("/frag{i}.dat");
+        let want = [0xF0u8 ^ (i as u8); 2048];
+        assert_eq!(fs2.read_file(&name).unwrap(), want, "{name} corrupted");
+    }
+    for i in 0..12 {
+        let name = alloc::format!("/refill{i}.dat");
+        let want = [0x0Fu8 | (i as u8); 2048];
+        assert_eq!(fs2.read_file(&name).unwrap(), want, "{name} corrupted");
+    }
+}
+
+/// Mixed adversarial workload + persistence oracle: create/extend/truncate/
+/// rename/delete interleaved, then a fresh mount must see exactly the
+/// surviving set with the right contents. This is the host stand-in for the
+/// E2C-BAD coherence hunt: cache-ahead-of-disk is fine *until an op ends*;
+/// after that, device bytes are the truth.
+#[test]
+fn writeback_mixed_workload_persists_coherently() {
+    let dev = RecordingDevice::from_fixture("test.ext2");
+    let fs = Ext2Filesystem::new(&dev, || 0).unwrap();
+
+    fs.create_dir("/mix").unwrap();
+    for i in 0..10 {
+        let name = alloc::format!("/mix/f{i}");
+        let body = alloc::vec![(i * 7 % 256) as u8; 1024 + i * 100];
+        fs.write_file(&name, &body).unwrap();
+    }
+    // Extend a couple (partial blocks both ends).
+    fs.write_at("/mix/f3", 500, &[0xAB; 300]).unwrap();
+    fs.write_at("/mix/f7", 1400, &[0xCD; 50]).unwrap();
+    // Truncate-by-rewrite one.
+    fs.write_file("/mix/f5", b"tiny now").unwrap();
+    // Rename one.
+    fs.rename("/mix/f9", "/mix/f9-renamed").unwrap();
+    // Delete some. Stepping by 4 (f0/f4/f8) deliberately spares f3/f5/f7 — the
+    // three the mutation phase above touched, whose patched contents are the
+    // point of the oracle below.
+    for i in (0..9).step_by(4) {
+        let name = alloc::format!("/mix/f{i}");
+        fs.remove_file(&name).unwrap();
+    }
+    fs.sync().unwrap();
+
+    let fs2 = Ext2Filesystem::new(&dev, || 0).unwrap();
+    for i in 0..10 {
+        let name = if i == 9 {
+            alloc::string::String::from("/mix/f9-renamed")
+        } else {
+            alloc::format!("/mix/f{i}")
+        };
+        if i % 4 == 0 {
+            assert!(!fs2.exists(&name), "{name} should be deleted");
+            continue;
+        }
+        let got = fs2.read_file(&name).unwrap();
+        // The writer's fill, plus whatever the mutation phase patched into it.
+        let want: alloc::vec::Vec<u8> = if i == 5 {
+            b"tiny now".to_vec()
+        } else {
+            let mut v = alloc::vec![(i * 7 % 256) as u8; 1024 + i * 100];
+            if i == 3 {
+                v[500..800].copy_from_slice(&[0xAB; 300]);
+            }
+            if i == 7 {
+                v[1400..1450].copy_from_slice(&[0xCD; 50]);
+            }
+            v
+        };
+        assert_eq!(got, want, "{name} content mismatch after mixed workload");
+    }
+}
+
+/// The `[E2C-BAD]` coherence oracle as a host test (design doc §"Race-safety
+/// argument"): flip `E2_VERIFY_HITS` on, run a mixed adversarial workload, and
+/// require every cache hit to match a direct device re-read. Under write-back
+/// a dirty hit legitimately differs, so `verify_cached_block` skips dirty
+/// blocks — what this hunts is exactly "clean slot ≠ disk". The global knob is
+/// process-wide, so the test takes the serial guard; a mismatch aborts the
+/// whole suite loudly either way.
+#[test]
+fn writeback_coherence_oracle_zero_mismatches() {
+    use crate::ext2::{E2_CACHE_VERIFY_MISMATCH, E2_VERIFY_HITS};
+    let _serial = pin_test_serial();
+    let prev = E2_VERIFY_HITS.swap(true, AtomicOrdering::SeqCst);
+    E2_CACHE_VERIFY_MISMATCH.store(0, AtomicOrdering::SeqCst);
+
+    let dev = RecordingDevice::from_fixture("test.ext2");
+    let fs = Ext2Filesystem::new(&dev, || 0).unwrap();
+
+    fs.create_dir("/oracle").unwrap();
+    for i in 0..8 {
+        let name = alloc::format!("/oracle/w{i}");
+        let body = alloc::vec![0xC0 ^ (i as u8); 3 * 1024 + i * 37];
+        fs.write_file(&name, &body).unwrap();
+        // Interleave reads (hits under verification) with more writes.
+        let _ = fs.read_file(&name).unwrap();
+    }
+    // Rewrite some blocks in place (write-then-read coherence).
+    fs.write_at("/oracle/w2", 512, &[0x11; 600]).unwrap();
+    let _ = fs.read_file("/oracle/w2").unwrap();
+    // Free/realloc churn while verifying.
+    fs.remove_file("/oracle/w4").unwrap();
+    fs.write_file("/oracle/after4", &[0x77; 1024]).unwrap();
+    let _ = fs.read_file("/oracle/after4").unwrap();
+    fs.sync().unwrap();
+    // Post-sync: every slot is clean, so every hit is now unconditionally
+    // verified against the device.
+    for i in 0..8 {
+        if i == 4 {
+            continue;
+        }
+        let name = alloc::format!("/oracle/w{i}");
+        let _ = fs.read_file(&name).unwrap();
+    }
+
+    let mismatches = E2_CACHE_VERIFY_MISMATCH.load(AtomicOrdering::SeqCst);
+    E2_VERIFY_HITS.store(prev, AtomicOrdering::SeqCst);
+    assert_eq!(
+        mismatches, 0,
+        "E2C-BAD: {mismatches} cache hits served bytes the disk does not have"
+    );
+}
+
+// ============================================================================
 // ClockBlockCache (large block cache, feature `fs-cache`) unit tests.
 // Compiled whenever `cfg(test)` is active (the cache type is `cfg(any(ext2_fs_cache, test))`).
 // ============================================================================
 
 use crate::ext2::{ClockBlockCache, cache_stats, set_cache_cap_bytes};
+
+/// No-op device flush for cache unit tests (nothing is ever dirty-clean evicted
+/// with wrong bytes here; tests that care assert on the flush sequence).
+fn noop_flush() -> impl FnMut(u32, &[u8]) -> Result<(), akuma_vfs::FsError> {
+    |_bn, _bytes| Ok(())
+}
 
 /// A distinct 4-byte-tagged block of `block_size` bytes for block number `n`.
 fn blk(n: u32, block_size: usize) -> Vec<u8> {
@@ -1027,7 +1398,7 @@ fn clock_cache_basic_hit_and_miss() {
     let bs = 1024;
     let mut c = ClockBlockCache::with_capacity_blocks(bs, 8);
     assert!(c.get(5).is_none(), "empty cache must miss");
-    c.insert(5, &blk(5, bs));
+    c.insert(5, &blk(5, bs), &mut noop_flush()).unwrap();
     let got = c.get(5).expect("inserted block must hit");
     assert_eq!(&got[0..4], &5u32.to_le_bytes(), "wrong block data returned");
 }
@@ -1036,11 +1407,11 @@ fn clock_cache_basic_hit_and_miss() {
 fn clock_cache_dedup_insert() {
     let bs = 1024;
     let mut c = ClockBlockCache::with_capacity_blocks(bs, 8);
-    c.insert(7, &blk(7, bs));
-    c.insert(7, &blk(7, bs)); // duplicate: must not create a second slot
+    c.insert(7, &blk(7, bs), &mut noop_flush()).unwrap();
+    c.insert(7, &blk(7, bs), &mut noop_flush()).unwrap(); // duplicate: must not create a second slot
     // Fill the rest; if the dup created a slot we'd evict 7 one round early.
     for n in 100..107 {
-        c.insert(n, &blk(n, bs));
+        c.insert(n, &blk(n, bs), &mut noop_flush()).unwrap();
     }
     assert!(c.get(7).is_some(), "block 7 should still be resident (no dup slot)");
 }
@@ -1049,12 +1420,12 @@ fn clock_cache_dedup_insert() {
 fn clock_cache_remove_invalidates() {
     let bs = 512;
     let mut c = ClockBlockCache::with_capacity_blocks(bs, 8);
-    c.insert(3, &blk(3, bs));
+    c.insert(3, &blk(3, bs), &mut noop_flush()).unwrap();
     assert!(c.get(3).is_some());
     c.remove(3);
     assert!(c.get(3).is_none(), "removed block must miss");
     // The freed slot must be reusable.
-    c.insert(9, &blk(9, bs));
+    c.insert(9, &blk(9, bs), &mut noop_flush()).unwrap();
     assert!(c.get(9).is_some(), "freed slot must be reusable");
 }
 
@@ -1065,17 +1436,17 @@ fn clock_cache_second_chance_spares_referenced_block() {
     let bs = 256;
     let mut c = ClockBlockCache::with_capacity_blocks(bs, 4);
     for n in 0..4 {
-        c.insert(n, &blk(n, bs)); // slots 0..3, all ref=1, hand=0
+        c.insert(n, &blk(n, bs), &mut noop_flush()).unwrap(); // slots 0..3, all ref=1, hand=0
     }
     // Full + all bits set => first eviction is FIFO (block 0). This is correct
     // clock behaviour, not a bug — every block had its chance.
-    c.insert(4, &blk(4, bs));
+    c.insert(4, &blk(4, bs), &mut noop_flush()).unwrap();
     assert!(c.get(0).is_none(), "block 0 should be evicted (FIFO when all referenced)");
     // Now present: 4,1,2,3 with ref=[1,0,0,0]. Touch 1 and 2; leave 3 cold.
     assert!(c.get(1).is_some());
     assert!(c.get(2).is_some());
     // Insert 5: the hand clears 1 and 2 (second chance) and evicts the cold 3.
-    c.insert(5, &blk(5, bs));
+    c.insert(5, &blk(5, bs), &mut noop_flush()).unwrap();
     assert!(c.get(3).is_none(), "cold block 3 should be evicted");
     assert!(c.get(1).is_some(), "referenced block 1 must be spared");
     assert!(c.get(2).is_some(), "referenced block 2 must be spared");
@@ -1090,7 +1461,7 @@ fn clock_cache_capacity_floor() {
     set_cache_cap_bytes(1024);
     let mut c = ClockBlockCache::new(bs);
     for n in 0..64 {
-        c.insert(n, &blk(n, bs));
+        c.insert(n, &blk(n, bs), &mut noop_flush()).unwrap();
     }
     // All 64 fit (floor is 64 slots), so the first is still present.
     assert!(c.get(0).is_some(), "64-slot floor not honored");
@@ -1101,4 +1472,135 @@ fn cache_stats_default_zero() {
     // With no reads issued through a filesystem, the global counters report a
     // valid tuple (exercises the public accessor under `cfg(test)`).
     let (_h, _m) = cache_stats();
+}
+
+// ── ClockBlockCache write-back (dirty bit, D-1/D-3/D-5) ─────────────
+
+/// `write` defers the device write: dirty immediately, device pushed only by
+/// `flush_dirty` (and exactly once).
+#[test]
+fn clock_cache_write_defers_until_flush() {
+    let bs = 1024;
+    let mut c = ClockBlockCache::with_capacity_blocks(bs, 8);
+    let flushed: alloc::rc::Rc<core::cell::RefCell<alloc::vec::Vec<u32>>> =
+        alloc::rc::Rc::new(core::cell::RefCell::new(alloc::vec::Vec::new()));
+    let mut sink = {
+        let flushed = alloc::rc::Rc::clone(&flushed);
+        move |bn: u32, _: &[u8]| -> Result<(), akuma_vfs::FsError> {
+            flushed.borrow_mut().push(bn);
+            Ok(())
+        }
+    };
+    c.write(5, &blk(5, bs), &mut sink).unwrap();
+    assert!(c.is_dirty(5), "written block must be dirty before flush");
+    assert!(flushed.borrow().is_empty(), "write itself must not touch the device");
+    // data is already readable through the cache
+    assert_eq!(&c.get(5).unwrap()[0..4], &5u32.to_le_bytes());
+
+    c.flush_dirty(&|_| true, &mut sink).unwrap();
+    assert!(!c.is_dirty(5), "flush must clear the dirty bit");
+    assert_eq!(&*flushed.borrow(), &[5], "flush must push exactly the dirty block");
+
+    // Second flush is a no-op.
+    c.flush_dirty(&|_| true, &mut sink).unwrap();
+    assert_eq!(flushed.borrow().len(), 1, "clean blocks must not be re-flushed");
+}
+
+/// Evicting a dirty victim flushes it first (the D-1 eviction path).
+#[test]
+fn clock_cache_dirty_eviction_flushes_victim() {
+    let bs = 256;
+    let mut c = ClockBlockCache::with_capacity_blocks(bs, 2);
+    let flushed: alloc::rc::Rc<core::cell::RefCell<alloc::vec::Vec<u32>>> =
+        alloc::rc::Rc::new(core::cell::RefCell::new(alloc::vec::Vec::new()));
+    let mut sink = {
+        let flushed = alloc::rc::Rc::clone(&flushed);
+        move |bn: u32, _: &[u8]| -> Result<(), akuma_vfs::FsError> {
+            flushed.borrow_mut().push(bn);
+            Ok(())
+        }
+    };
+    c.write(1, &blk(1, bs), &mut sink).unwrap();
+    c.write(2, &blk(2, bs), &mut sink).unwrap();
+    // Third write forces eviction of a dirty victim; capacity 2, both dirty.
+    c.write(3, &blk(3, bs), &mut sink).unwrap();
+    assert!(
+        flushed.borrow().contains(&1) || flushed.borrow().contains(&2),
+        "evicting a dirty victim must flush it (flushed so far: {:?})",
+        flushed.borrow()
+    );
+    assert!(flushed.borrow().iter().all(|&b| b != 3), "the new block must stay dirty in cache");
+}
+
+/// `patch` overwrites a sub-range of a resident block and marks it dirty —
+/// the inode-table / BGD fast path (design doc D-5).
+#[test]
+fn clock_cache_patch_dirties_resident_block() {
+    let bs = 1024;
+    let mut c = ClockBlockCache::with_capacity_blocks(bs, 4);
+    let mut sink = |_bn: u32, _: &[u8]| -> Result<(), akuma_vfs::FsError> { Ok(()) };
+    c.insert(9, &blk(9, bs), &mut sink).unwrap();
+    assert!(!c.is_dirty(9));
+
+    assert!(c.patch(9, 64, &[0xDE, 0xAD, 0xBE, 0xEF]), "resident block must be patchable");
+    assert!(c.is_dirty(9), "patch must mark the block dirty");
+    assert_eq!(&c.get(9).unwrap()[64..68], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    assert_eq!(&c.get(9).unwrap()[0..4], &9u32.to_le_bytes(), "bytes before the patch must survive");
+
+    assert!(!c.patch(12345, 0, &[1]), "absent block must report unpatched");
+}
+
+/// `remove` drops a dirty block silently (invalidate-on-free, D-3): no flush,
+/// no dirty residue, slot reusable.
+#[test]
+fn clock_cache_remove_drops_dirty_silently() {
+    let bs = 1024;
+    let mut c = ClockBlockCache::with_capacity_blocks(bs, 4);
+    let flushed: alloc::rc::Rc<core::cell::RefCell<alloc::vec::Vec<u32>>> =
+        alloc::rc::Rc::new(core::cell::RefCell::new(alloc::vec::Vec::new()));
+    let mut sink = {
+        let flushed = alloc::rc::Rc::clone(&flushed);
+        move |bn: u32, _: &[u8]| -> Result<(), akuma_vfs::FsError> {
+            flushed.borrow_mut().push(bn);
+            Ok(())
+        }
+    };
+    c.write(6, &blk(6, bs), &mut sink).unwrap();
+    assert!(c.is_dirty(6));
+    c.remove(6);
+    assert!(c.get(6).is_none(), "removed block must miss");
+    assert!(!c.is_dirty(6), "removed block must not be dirty");
+    c.flush_dirty(&|_| true, &mut sink).unwrap();
+    assert!(
+        flushed.borrow().is_empty(),
+        "a freed block's bytes must never be flushed (D-3), flushed: {:?}",
+        flushed.borrow()
+    );
+}
+
+/// `flush_dirty`'s `keep` filter implements the D-2 ordering: only blocks the
+/// filter admits are pushed, the rest stay dirty for a later phase.
+#[test]
+fn clock_cache_flush_dirty_respects_keep_filter() {
+    let bs = 512;
+    let mut c = ClockBlockCache::with_capacity_blocks(bs, 8);
+    let flushed: alloc::rc::Rc<core::cell::RefCell<alloc::vec::Vec<u32>>> =
+        alloc::rc::Rc::new(core::cell::RefCell::new(alloc::vec::Vec::new()));
+    let mut sink = {
+        let flushed = alloc::rc::Rc::clone(&flushed);
+        move |bn: u32, _: &[u8]| -> Result<(), akuma_vfs::FsError> {
+            flushed.borrow_mut().push(bn);
+            Ok(())
+        }
+    };
+    c.write(10, &blk(10, bs), &mut sink).unwrap();
+    c.write(11, &blk(11, bs), &mut sink).unwrap();
+
+    c.flush_dirty(&|bn| bn != 11, &mut sink).unwrap();
+    assert_eq!(&*flushed.borrow(), &[10], "only admitted blocks are flushed");
+    assert!(!c.is_dirty(10), "flushed block is clean");
+    assert!(c.is_dirty(11), "filtered-out block stays dirty");
+
+    c.flush_dirty(&|_| true, &mut sink).unwrap();
+    assert_eq!(&*flushed.borrow(), &[10, 11], "the second phase picks up the rest");
 }

@@ -62,13 +62,28 @@ const BLOCK_CACHE_ENTRIES: usize = 64;
 /// N, so when the cache is dropped or pressure forces reclaim, the whole backing
 /// buffer frees in one shot rather than leaving N scattered Vec headers across
 /// the PMM-claimed heap span.
+///
+/// **Write-back**: slots carry a dirty bit; `write`/`patch` update the slot and
+/// defer the device write to `flush_dirty` (called from `flush_meta`/`sync`,
+/// see `docs/archive/EXT2_WRITEBACK_DESIGN.md`). Evicting a dirty victim
+/// flushes it first via the caller-supplied device callback. `remove` drops a
+/// block *without* flushing — the invalidate-on-free rule (D-3): a freed
+/// block's stale bytes must never reach a disk block that may have been
+/// reallocated.
 #[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
 struct BlockRingCache {
     backing: Vec<u8>,
     tags: [u32; BLOCK_CACHE_ENTRIES],
+    dirty: [bool; BLOCK_CACHE_ENTRIES],
     head: usize,
     block_size: usize,
 }
+
+/// Device-write callback for cache flushes (eviction and `flush_dirty`).
+/// `FnMut(block_num, bytes) -> device write result` — callers pass a closure
+/// over `&self.dev`, which is field-disjoint from the `block_cache` lock.
+#[cfg(not(kernel_profile_extreme))]
+pub(crate) type DevFlush<'a> = &'a mut dyn FnMut(u32, &[u8]) -> Result<(), FsError>;
 
 #[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
 impl BlockRingCache {
@@ -76,6 +91,7 @@ impl BlockRingCache {
         Self {
             backing: vec![0u8; BLOCK_CACHE_ENTRIES * block_size],
             tags: [u32::MAX; BLOCK_CACHE_ENTRIES],
+            dirty: [false; BLOCK_CACHE_ENTRIES],
             head: 0,
             block_size,
         }
@@ -91,27 +107,110 @@ impl BlockRingCache {
         None
     }
 
-    fn insert(&mut self, block_num: u32, data: &[u8]) {
+    fn slot_of(&self, block_num: u32) -> Option<usize> {
+        self.tags.iter().position(|&tag| tag == block_num)
+    }
+
+    /// Write a block into the cache, marking it dirty (device write deferred).
+    /// If the ring slot it lands in holds a dirty victim, that victim is
+    /// flushed first — a dirty block must never be silently overwritten.
+    fn write(&mut self, block_num: u32, data: &[u8], flush: DevFlush<'_>) -> Result<(), FsError> {
+        if let Some(i) = self.slot_of(block_num) {
+            let s = i * self.block_size;
+            self.backing[s..s + self.block_size].copy_from_slice(data);
+            self.dirty[i] = true;
+            return Ok(());
+        }
+        let slot = self.head;
+        self.evict_into(slot, flush)?;
+        let s = slot * self.block_size;
+        self.backing[s..s + self.block_size].copy_from_slice(data);
+        self.tags[slot] = block_num;
+        self.dirty[slot] = true;
+        self.head = (self.head + 1) % BLOCK_CACHE_ENTRIES;
+        Ok(())
+    }
+
+    /// Overwrite a sub-block range of a resident block, marking it dirty.
+    /// Returns `false` (no-op) when the block is not cached — the caller
+    /// falls back to fill-then-patch.
+    fn patch(&mut self, block_num: u32, off: usize, data: &[u8]) -> bool {
+        match self.slot_of(block_num) {
+            Some(i) => {
+                let s = i * self.block_size + off;
+                self.backing[s..s + data.len()].copy_from_slice(data);
+                self.dirty[i] = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Prepare `slot` for a new occupant, flushing its dirty predecessor.
+    fn evict_into(&mut self, slot: usize, flush: DevFlush<'_>) -> Result<(), FsError> {
+        let victim = self.tags[slot];
+        if victim != u32::MAX && self.dirty[slot] {
+            let s = slot * self.block_size;
+            flush(victim, &self.backing[s..s + self.block_size])?;
+        }
+        self.dirty[slot] = false;
+        Ok(())
+    }
+
+    /// Insert a clean block (device read fill). Same duplicate and dirty-victim
+    /// rules as [`Self::write`].
+    fn insert(&mut self, block_num: u32, data: &[u8], flush: DevFlush<'_>) -> Result<(), FsError> {
         // If already cached (another thread beat us to it), don't add a duplicate.
         // Duplicates would let a stale copy survive a remove() that only clears
         // the first match, which would poison later reads after a write.
         if self.tags.contains(&block_num) {
-            return;
+            return Ok(());
         }
         let slot = self.head;
-        self.tags[slot] = block_num;
+        self.evict_into(slot, flush)?;
         let s = slot * self.block_size;
         self.backing[s..s + self.block_size].copy_from_slice(data);
+        self.tags[slot] = block_num;
+        self.dirty[slot] = false;
         self.head = (self.head + 1) % BLOCK_CACHE_ENTRIES;
+        Ok(())
     }
 
+    /// Drop a block without flushing, dirty or not (invalidate-on-free, D-3).
     fn remove(&mut self, block_num: u32) {
-        for tag in &mut self.tags {
+        for (i, tag) in self.tags.iter_mut().enumerate() {
             if *tag == block_num {
                 *tag = u32::MAX;
+                self.dirty[i] = false;
                 return;
             }
         }
+    }
+
+    /// Is `block_num` resident with unflushed bytes? The `[E2C-BAD]` oracle
+    /// skips dirty blocks: cache-ahead-of-disk is the write-back invariant,
+    /// not a coherence failure.
+    fn is_dirty(&self, block_num: u32) -> bool {
+        match self.slot_of(block_num) {
+            Some(i) => self.dirty[i],
+            None => false,
+        }
+    }
+
+    /// Write every dirty block whose number passes `keep` out to the device
+    /// (via `flush`), clearing the bits as they land. `keep` implements the
+    /// flush ordering (D-2): data/inode blocks first, allocation metadata
+    /// (bitmaps, BGD table) only after.
+    fn flush_dirty(&mut self, keep: &dyn Fn(u32) -> bool, flush: DevFlush<'_>) -> Result<(), FsError> {
+        for i in 0..BLOCK_CACHE_ENTRIES {
+            let tag = self.tags[i];
+            if tag != u32::MAX && self.dirty[i] && keep(tag) {
+                let s = i * self.block_size;
+                flush(tag, &self.backing[s..s + self.block_size])?;
+                self.dirty[i] = false;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -214,6 +313,9 @@ const CACHE_CHUNK_BYTES: usize = 1 << 20; // 1 MB
 /// Clock (second-chance) block cache. Slots are allocated lazily (one backing
 /// chunk at a time) up to `capacity_blocks`; thereafter the clock hand sweeps,
 /// clearing reference bits, and evicts the first unreferenced slot.
+///
+/// **Write-back**: same dirty-bit contract as [`BlockRingCache`] — see the
+/// struct docs there and `docs/archive/EXT2_WRITEBACK_DESIGN.md`.
 #[cfg(any(ext2_fs_cache, test))]
 pub(crate) struct ClockBlockCache {
     /// Slot data, split into fixed-size chunks of `chunk_blocks` slots each.
@@ -228,6 +330,9 @@ pub(crate) struct ClockBlockCache {
     /// Clock reference bit per slot. `Cell` so a read (`get`) can set the bit
     /// through `&self` (it runs under the cache's spinlock, so no real sharing).
     ref_bits: Vec<Cell<bool>>,
+    /// Write-back dirty bit per slot. Plain `bool`: only `&mut self` methods
+    /// touch it, unlike `ref_bits`.
+    dirty_bits: Vec<bool>,
     /// `block_num -> slot` for O(log n) lookup.
     index: BTreeMap<u32, usize>,
     hand: usize,
@@ -253,6 +358,7 @@ impl ClockBlockCache {
             chunk_blocks: core::cmp::max(1, CACHE_CHUNK_BYTES / block_size.max(1)),
             tags: Vec::new(),
             ref_bits: Vec::new(),
+            dirty_bits: Vec::new(),
             index: BTreeMap::new(),
             hand: 0,
             block_size,
@@ -277,8 +383,9 @@ impl ClockBlockCache {
 
     /// Pick a slot for a new block: grow the backing while under capacity —
     /// pushing at most one `CACHE_CHUNK_BYTES` chunk, and only when the current
-    /// chunk is full — otherwise run the clock.
-    fn alloc_slot(&mut self) -> usize {
+    /// chunk is full — otherwise run the clock. A dirty victim is flushed
+    /// through `flush` before its slot is reused.
+    fn alloc_slot(&mut self, flush: DevFlush<'_>) -> Result<usize, FsError> {
         let slots = self.tags.len();
         if slots < self.capacity_blocks {
             if slots % self.chunk_blocks == 0 {
@@ -288,8 +395,9 @@ impl ClockBlockCache {
             }
             self.tags.push(u32::MAX);
             self.ref_bits.push(Cell::new(false));
+            self.dirty_bits.push(false);
             CACHE_SLOTS_USED.store(self.tags.len(), Ordering::Relaxed);
-            return slots;
+            return Ok(slots);
         }
         loop {
             if self.hand >= slots {
@@ -299,20 +407,22 @@ impl ClockBlockCache {
                 self.ref_bits[self.hand].set(false);
                 self.hand = (self.hand + 1) % slots;
             } else {
-                let victim = self.hand;
-                self.hand = (self.hand + 1) % slots;
-                return victim;
+                let victim_slot = self.hand;
+                let victim = self.tags[victim_slot];
+                if victim != u32::MAX && self.dirty_bits[victim_slot] {
+                    let (chunk, off) = self.slot_pos(victim_slot);
+                    let bs = self.block_size;
+                    flush(victim, &self.chunks[chunk][off..off + bs])?;
+                }
+                self.hand = (victim_slot + 1) % slots;
+                return Ok(victim_slot);
             }
         }
     }
 
-    pub(crate) fn insert(&mut self, block_num: u32, data: &[u8]) {
-        // Already present (another thread beat us, or a re-read): don't duplicate.
-        if self.index.contains_key(&block_num) {
-            return;
-        }
-        let slot = self.alloc_slot();
-        // Evict the slot's prior occupant from the index, if any.
+    /// Occupy `slot` with `block_num`/`data` at dirtiness `dirty`, evicting the
+    /// slot's prior occupant from the index.
+    fn occupy(&mut self, slot: usize, block_num: u32, data: &[u8], dirty: bool) {
         let prev = self.tags[slot];
         if prev != u32::MAX {
             self.index.remove(&prev);
@@ -322,15 +432,85 @@ impl ClockBlockCache {
         self.chunks[chunk][off..off + bs].copy_from_slice(data);
         self.tags[slot] = block_num;
         self.ref_bits[slot].set(true);
+        self.dirty_bits[slot] = dirty;
         self.index.insert(block_num, slot);
     }
 
-    /// Invalidate a block (on write-through) so a stale copy can't survive a write.
+    /// Insert a clean block (device read fill). No duplicates; a dirty eviction
+    /// victim is flushed first.
+    pub(crate) fn insert(&mut self, block_num: u32, data: &[u8], flush: DevFlush<'_>) -> Result<(), FsError> {
+        // Already present (another thread beat us, or a re-read): don't duplicate.
+        if self.index.contains_key(&block_num) {
+            return Ok(());
+        }
+        let slot = self.alloc_slot(flush)?;
+        self.occupy(slot, block_num, data, false);
+        Ok(())
+    }
+
+    /// Write a block's bytes into the cache, marking it dirty (write-back).
+    pub(crate) fn write(&mut self, block_num: u32, data: &[u8], flush: DevFlush<'_>) -> Result<(), FsError> {
+        if let Some(&slot) = self.index.get(&block_num) {
+            let (chunk, off) = self.slot_pos(slot);
+            let bs = self.block_size;
+            self.chunks[chunk][off..off + bs].copy_from_slice(data);
+            self.dirty_bits[slot] = true;
+            self.ref_bits[slot].set(true);
+            return Ok(());
+        }
+        let slot = self.alloc_slot(flush)?;
+        self.occupy(slot, block_num, data, true);
+        Ok(())
+    }
+
+    /// Overwrite a sub-block range of a resident block, marking it dirty.
+    /// `false` (no-op) when not cached — caller falls back to fill-then-patch.
+    pub(crate) fn patch(&mut self, block_num: u32, off: usize, data: &[u8]) -> bool {
+        match self.index.get(&block_num) {
+            Some(&slot) => {
+                let (chunk, base) = self.slot_pos(slot);
+                self.chunks[chunk][base + off..base + off + data.len()].copy_from_slice(data);
+                self.dirty_bits[slot] = true;
+                self.ref_bits[slot].set(true);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop a block without flushing, dirty or not (invalidate-on-free, D-3).
     pub(crate) fn remove(&mut self, block_num: u32) {
         if let Some(slot) = self.index.remove(&block_num) {
             self.tags[slot] = u32::MAX;
             self.ref_bits[slot].set(false);
+            self.dirty_bits[slot] = false;
         }
+    }
+
+    /// Is `block_num` resident with unflushed bytes? (See [`BlockRingCache::is_dirty`].)
+    pub(crate) fn is_dirty(&self, block_num: u32) -> bool {
+        match self.index.get(&block_num) {
+            Some(&slot) => self.dirty_bits[slot],
+            None => false,
+        }
+    }
+
+    /// Flush dirty blocks passing `keep` to the device, in slot order (D-2).
+    pub(crate) fn flush_dirty(
+        &mut self,
+        keep: &dyn Fn(u32) -> bool,
+        flush: DevFlush<'_>,
+    ) -> Result<(), FsError> {
+        for slot in 0..self.tags.len() {
+            let tag = self.tags[slot];
+            if tag != u32::MAX && self.dirty_bits[slot] && keep(tag) {
+                let (chunk, off) = self.slot_pos(slot);
+                let bs = self.block_size;
+                flush(tag, &self.chunks[chunk][off..off + bs])?;
+                self.dirty_bits[slot] = false;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -729,6 +909,14 @@ pub(crate) struct Ext2State {
     /// source of truth for them; `flush_meta` writes the dirty ones. Bounded by
     /// `2 * block_group_count` entries, populated lazily.
     bitmap_cache: Vec<(u32, Vec<u8>, bool)>,
+    /// Next-free-bit scan cursor per group for `allocate_block_inner`
+    /// (design doc D-6). Sequential allocation used to rescan the bitmap from
+    /// bit 0 on every call — O(N²) in blocks allocated. The cursor is only a
+    /// hint (a miss wraps and rescans from 0), so it can never skip a free
+    /// bit; frees pull it back so deleted-file space is reused immediately.
+    block_hint: Vec<u32>,
+    /// Same cursor for `allocate_inode` / `free_inode`.
+    inode_hint: Vec<u32>,
 }
 
 /// Non-preemption/IRQ guard held for the lifetime of an [`Ext2State`] lock hold under
@@ -934,6 +1122,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             bgd_dirty: vec![false; block_group_count as usize],
             sb_dirty: false,
             bitmap_cache: Vec::new(),
+            block_hint: vec![0; block_group_count as usize],
+            inode_hint: vec![0; block_group_count as usize],
         };
 
         Ok(Self {
@@ -1093,10 +1283,23 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
         #[cfg(not(kernel_profile_extreme))]
         {
-            self.block_cache.lock().insert(block_num, &buf);
+            let mut cache = self.block_cache.lock();
+            let mut flush = self.dev_flush(state);
+            cache.insert(block_num, &buf, &mut flush)?;
         }
 
         Ok(buf)
+    }
+
+    /// The device-write closure cache flushes use — borrows `self.dev`, which
+    /// is field-disjoint from `self.block_cache`, so it coexists with a held
+    /// cache-lock guard.
+    #[cfg(not(kernel_profile_extreme))]
+    fn dev_flush<'s>(&'s self, state: &'s Ext2State) -> impl FnMut(u32, &[u8]) -> Result<(), FsError> + 's {
+        let bs = state.block_size as u64;
+        move |bn: u32, bytes: &[u8]| {
+            self.dev.write_bytes(bn as u64 * bs, bytes).map_err(|_| FsError::IoError)
+        }
     }
 
     /// Diagnostic (2026-08-15 zero-page hunt): re-read a block straight from the
@@ -1110,6 +1313,11 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     #[cfg(not(kernel_profile_extreme))]
     fn verify_cached_block(&self, state: &Ext2State, block_num: u32, cached: &[u8]) {
         if !E2_VERIFY_HITS.load(Ordering::Relaxed) {
+            return;
+        }
+        // Write-back: a dirty resident block is legitimately ahead of the
+        // disk — that is the cache's job now, not staleness.
+        if self.block_cache.lock().is_dirty(block_num) {
             return;
         }
         let bs = state.block_size;
@@ -1129,15 +1337,32 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
     }
 
+    /// Write a block: mark it dirty in the cache (device write deferred to
+    /// `flush_meta`/`sync`/eviction — write-back). `extreme` has no cache and
+    /// writes through to the device, preserving its old durability model.
     fn write_block(&self, state: &Ext2State, block_num: u32, data: &[u8]) -> Result<(), FsError> {
         if data.len() != state.block_size {
             return Err(FsError::Internal);
         }
         #[cfg(not(kernel_profile_extreme))]
-        { self.block_cache.lock().remove(block_num); }
-        let offset = block_num as u64 * state.block_size as u64;
-        self.dev.write_bytes(offset, data).map_err(|_| FsError::IoError)?;
-        Ok(())
+        {
+            let mut cache = self.block_cache.lock();
+            let mut flush = self.dev_flush(state);
+            cache.write(block_num, data, &mut flush)
+        }
+        #[cfg(kernel_profile_extreme)]
+        {
+            let offset = block_num as u64 * state.block_size as u64;
+            self.dev.write_bytes(offset, data).map_err(|_| FsError::IoError)
+        }
+    }
+
+    /// Drop any cached copy of `block_num` **without** flushing it — the
+    /// invalidate-on-free rule (design doc D-3): a freed block's stale bytes
+    /// must never be written back over a block the allocator may hand out again.
+    #[cfg(not(kernel_profile_extreme))]
+    fn invalidate_block(&self, block_num: u32) {
+        self.block_cache.lock().remove(block_num);
     }
 
     fn write_superblock(&self, state: &Ext2State) -> Result<(), FsError> {
@@ -1157,40 +1382,58 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             + group as u64 * size_of::<BlockGroupDescriptor>() as u64
     }
 
-    /// Read a sub-block byte range *through the block cache* (feature `fs-cache`).
-    /// Caller guarantees the range lies within a single block — true for inode-table
-    /// and BGD-table entries (entry size divides the block size and the tables start
-    /// block-aligned, so neither ever straddles a block boundary).
-    #[cfg(ext2_fs_cache)]
-    fn read_range_cached(&self, state: &Ext2State, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
-        let bs = state.block_size as u64;
-        let block_num = (offset / bs) as u32;
-        let off = (offset % bs) as usize;
-        let block = self.read_block(state, block_num)?;
-        buf.copy_from_slice(&block[off..off + buf.len()]);
-        Ok(())
+    /// Read a sub-block byte range. With a block cache this goes through it
+    /// (the cached copy is authoritative under write-back); `extreme` reads
+    /// the device. Caller guarantees the range lies within a single block —
+    /// true for inode-table and BGD-table entries (entry size divides the
+    /// block size and the tables start block-aligned, so neither ever
+    /// straddles a block boundary).
+    fn read_range(&self, state: &Ext2State, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        #[cfg(not(kernel_profile_extreme))]
+        {
+            let bs = state.block_size as u64;
+            let block_num = (offset / bs) as u32;
+            let off = (offset % bs) as usize;
+            let block = self.read_block(state, block_num)?;
+            buf.copy_from_slice(&block[off..off + buf.len()]);
+            Ok(())
+        }
+        #[cfg(kernel_profile_extreme)]
+        {
+            let _ = state; // no cache to consult on this profile
+            self.dev.read_bytes(offset, buf).map_err(|_| FsError::IoError)
+        }
     }
 
-    /// Write a sub-block byte range through the block cache via read-modify-write,
-    /// so a cached inode-table / BGD block can't go stale after a metadata write.
-    /// Same single-block invariant as `read_range_cached`.
-    #[cfg(ext2_fs_cache)]
-    fn write_range_cached(&self, state: &Ext2State, offset: u64, data: &[u8]) -> Result<(), FsError> {
-        let bs = state.block_size as u64;
-        let block_num = (offset / bs) as u32;
-        let off = (offset % bs) as usize;
-        let mut block = self.read_block(state, block_num)?;
-        block[off..off + data.len()].copy_from_slice(data);
-        self.write_block(state, block_num, &block)
+    /// Write a sub-block byte range. Cache builds: patch the cached block in
+    /// place when resident (no read-back, no allocation — design doc D-5);
+    /// otherwise fill-then-patch through the cache. `extreme` writes the
+    /// device directly. Same single-block invariant as [`Self::read_range`].
+    fn write_range(&self, state: &Ext2State, offset: u64, data: &[u8]) -> Result<(), FsError> {
+        #[cfg(not(kernel_profile_extreme))]
+        {
+            let bs = state.block_size as u64;
+            let block_num = (offset / bs) as u32;
+            let off = (offset % bs) as usize;
+            if self.block_cache.lock().patch(block_num, off, data) {
+                return Ok(());
+            }
+            let mut block = self.read_block(state, block_num)?;
+            block[off..off + data.len()].copy_from_slice(data);
+            self.write_block(state, block_num, &block)?;
+            Ok(())
+        }
+        #[cfg(kernel_profile_extreme)]
+        {
+            let _ = state; // no cache to patch on this profile
+            self.dev.write_bytes(offset, data).map_err(|_| FsError::IoError)
+        }
     }
 
     fn read_bgd(&self, state: &Ext2State, group: u32) -> Result<BlockGroupDescriptor, FsError> {
         let offset = Self::bgd_offset(state, group);
         let mut buf = [0u8; size_of::<BlockGroupDescriptor>()];
-        #[cfg(ext2_fs_cache)]
-        self.read_range_cached(state, offset, &mut buf)?;
-        #[cfg(not(ext2_fs_cache))]
-        self.dev.read_bytes(offset, &mut buf).map_err(|_| FsError::IoError)?;
+        self.read_range(state, offset, &mut buf)?;
         Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const _) })
     }
 
@@ -1202,11 +1445,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 size_of::<BlockGroupDescriptor>(),
             )
         };
-        #[cfg(ext2_fs_cache)]
-        self.write_range_cached(state, offset, buf)?;
-        #[cfg(not(ext2_fs_cache))]
-        self.dev.write_bytes(offset, buf).map_err(|_| FsError::IoError)?;
-        Ok(())
+        self.write_range(state, offset, buf)
     }
 
     // ========================================================================
@@ -1263,11 +1502,59 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         Ok(state.bitmap_cache.len() - 1)
     }
 
+    /// Is `bn` an *allocation-metadata* block (a bitmap block, a BGD-table
+    /// block, or the superblock's block)? Used by `flush_meta` to order
+    /// write-back: file data + inode-table blocks reach the disk first, so a
+    /// crash never leaves a bitmap/BGD claiming space whose data never landed
+    /// (journal-less ordering, design doc D-2). The superblock's block is
+    /// included defensively although nothing ever caches it (it is reserved,
+    /// so no read/insert path names it).
+    #[cfg(not(kernel_profile_extreme))]
+    fn is_alloc_meta(state: &Ext2State, bn: u32) -> bool {
+        if state.bitmap_cache.iter().any(|(b, _, _)| *b == bn) {
+            return true;
+        }
+        let bgd_first = state.first_data_block + 1;
+        let bgd_span = (state.block_group_count as usize * size_of::<BlockGroupDescriptor>()
+            + state.block_size
+            - 1)
+            / state.block_size;
+        if bn >= bgd_first && ((bn - bgd_first) as usize) < bgd_span {
+            return true;
+        }
+        let sb_block = (SUPERBLOCK_OFFSET / state.block_size.max(1) as u64) as u32;
+        bn == sb_block
+    }
+
+    /// Push every dirty cache block passing `keep` out to the device.
+    #[cfg(not(kernel_profile_extreme))]
+    fn flush_dirty_blocks(
+        &self,
+        state: &Ext2State,
+        keep: &dyn Fn(u32) -> bool,
+    ) -> Result<(), FsError> {
+        let mut cache = self.block_cache.lock();
+        let mut flush = self.dev_flush(state);
+        cache.flush_dirty(keep, &mut flush)
+    }
+
     /// Write every bitmap block, BGD, and the superblock that the allocators
-    /// marked dirty. Cheap when nothing is dirty (a read, or a pure-rename op).
+    /// marked dirty, plus every dirty data/inode block in the cache. Cheap when
+    /// nothing is dirty (a read, or a pure-rename op).
+    ///
+    /// Ordering (design doc D-2): dirty **data + inode-table + indirect**
+    /// blocks are flushed to the device *first*, then bitmaps/BGDs/superblock
+    /// are written and flushed. An unclean crash can then leak an allocated
+    /// block (recoverable by e2fsck) but never publishes a bitmap claiming
+    /// blocks whose contents never landed.
     fn flush_meta(&self, state: &mut Ext2State) -> Result<(), FsError> {
-        // Bitmap blocks. Move the cache out so `write_block(state, …)` can borrow
-        // `state` while we iterate; put it back (with dirty flags cleared) after.
+        // Phase 1 — everything dirty except allocation metadata.
+        #[cfg(not(kernel_profile_extreme))]
+        self.flush_dirty_blocks(state, &|bn| !Self::is_alloc_meta(state, bn))?;
+
+        // Phase 2 — allocation metadata, staged by the allocators. Bitmap
+        // blocks: move the cache out so `write_block(state, …)` can borrow
+        // `state` while we iterate; put it back (with dirty flags cleared).
         if state.bitmap_cache.iter().any(|(_, _, d)| *d) {
             let mut bmaps = core::mem::take(&mut state.bitmap_cache);
             let mut err = Ok(());
@@ -1296,6 +1583,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             self.write_superblock(state)?;
             state.sb_dirty = false;
         }
+
+        // Phase 3 — the metadata writes above went through the cache; push
+        // them (and anything else left dirty) to the device.
+        #[cfg(not(kernel_profile_extreme))]
+        self.flush_dirty_blocks(state, &|_| true)?;
+
         Ok(())
     }
 
@@ -1314,10 +1607,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             + index_in_group as u64 * state.inode_size as u64;
 
         let mut buf = vec![0u8; state.inode_size as usize];
-        #[cfg(ext2_fs_cache)]
-        self.read_range_cached(state, inode_offset, &mut buf)?;
-        #[cfg(not(ext2_fs_cache))]
-        self.dev.read_bytes(inode_offset, &mut buf).map_err(|_| FsError::IoError)?;
+        self.read_range(state, inode_offset, &mut buf)?;
 
         Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const _) })
     }
@@ -1339,11 +1629,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let buf = unsafe {
             core::slice::from_raw_parts(inode as *const Inode as *const u8, size_of::<Inode>())
         };
-        #[cfg(ext2_fs_cache)]
-        self.write_range_cached(state, inode_offset, buf)?;
-        #[cfg(not(ext2_fs_cache))]
-        self.dev.write_bytes(inode_offset, buf).map_err(|_| FsError::IoError)?;
-        Ok(())
+        self.write_range(state, inode_offset, buf)
     }
 
     // ========================================================================
@@ -1402,12 +1688,17 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
             let bi = self.bitmap_slot(state, bgd.block_bitmap)?;
 
-            // Find first free bit
-            for bit in 0..state.blocks_per_group {
+            // Find first free bit, resuming from the group's cursor and
+            // wrapping once (D-6). The group has `free_count > 0`, so a free
+            // bit exists and one of the two ranges finds it.
+            let start = state.block_hint[group as usize];
+            let scan = (start..state.blocks_per_group).chain(0..start);
+            for bit in scan {
                 if !Self::get_bit(&state.bitmap_cache[bi].1, bit) {
                     // Found free block — set the bit in memory, defer the write.
                     Self::set_bit(&mut state.bitmap_cache[bi].1, bit, true);
                     state.bitmap_cache[bi].2 = true;
+                    state.block_hint[group as usize] = bit + 1;
 
                     // Update BGD + superblock in memory; flushed by flush_meta.
                     bgd.free_blocks_count = free_count - 1;
@@ -1445,6 +1736,21 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         Self::set_bit(&mut state.bitmap_cache[bi].1, bit, false);
         state.bitmap_cache[bi].2 = true;
 
+        // Pull the scan cursor back so the freed block is the next candidate
+        // (immediate reuse of deleted-file space).
+        let hint = &mut state.block_hint[group as usize];
+        if bit < *hint {
+            *hint = bit;
+        }
+
+        // Invalidate-on-free (design doc D-3): drop any cached copy of the
+        // freed block *without* flushing it. Flushing would push stale bytes
+        // onto a block the allocator may hand out again before the flush
+        // lands; dropping them is always safe (disk keeps the old contents
+        // until reallocation, which always rewrites).
+        #[cfg(not(kernel_profile_extreme))]
+        self.invalidate_block(block_num);
+
         bgd.free_blocks_count += 1;
         self.stage_bgd(state, group, &bgd);
         state.superblock.unallocated_blocks += 1;
@@ -1478,10 +1784,13 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
             let bi = self.bitmap_slot(state, bgd.inode_bitmap)?;
 
-            for bit in 0..state.inodes_per_group {
+            let start = state.inode_hint[group as usize];
+            let scan = (start..state.inodes_per_group).chain(0..start);
+            for bit in scan {
                 if !Self::get_bit(&state.bitmap_cache[bi].1, bit) {
                     Self::set_bit(&mut state.bitmap_cache[bi].1, bit, true);
                     state.bitmap_cache[bi].2 = true;
+                    state.inode_hint[group as usize] = bit + 1;
 
                     bgd.free_inodes_count = free_count - 1;
                     if is_dir {
@@ -1567,6 +1876,11 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let bi = self.bitmap_slot(state, bgd.inode_bitmap)?;
         Self::set_bit(&mut state.bitmap_cache[bi].1, bit, false);
         state.bitmap_cache[bi].2 = true;
+
+        let hint = &mut state.inode_hint[group as usize];
+        if bit < *hint {
+            *hint = bit;
+        }
 
         bgd.free_inodes_count += 1;
         if is_dir && bgd.used_dirs_count > 0 {
@@ -2381,7 +2695,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 #[cfg(not(kernel_profile_extreme))]
                 {
                     let bn = run_start_phys + (run_pos / block_size) as u32;
-                    self.block_cache.lock().insert(bn, &run_buf[run_pos..run_pos + block_size]);
+                    let mut cache = self.block_cache.lock();
+                    let mut flush = self.dev_flush(&state);
+                    cache.insert(bn, &run_buf[run_pos..run_pos + block_size], &mut flush)?;
                 }
                 pos += chunk;
                 total_read += chunk;

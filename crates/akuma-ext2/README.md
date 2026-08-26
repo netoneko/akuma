@@ -203,10 +203,12 @@ currently honour that — see the [allocation audit](#allocation-audit).
 
 ## The block cache
 
-A single `Spinlock<BlockCache>`, separate from the state lock. **Read-only and
-write-invalidated**: `write_block` calls `cache.remove(block_num)` *before*
-writing the device, so a subsequent read re-fetches from disk. There is no dirty
-list and no write-back.
+A single `Spinlock<BlockCache>`, separate from the state lock. **Write-back**:
+`write_block` updates the cached slot and marks it dirty; the device write is
+deferred to `flush_meta` (end of every mutating op), `sync()`, or eviction of a
+dirty victim. Read-after-write is therefore a cache hit, and repeated writes to
+one block coalesce into a single device write. Design + rationale:
+`docs/archive/EXT2_WRITEBACK_DESIGN.md`.
 
 ```
 read_block(b):
@@ -216,8 +218,24 @@ read_block(b):
    dev.read_bytes(b*bs, buf)  ─▶  cache.lock().insert(b, buf)  ─▶  return
 
 write_block(b, data):
-   cache.lock().remove(b)  ─▶  dev.write_bytes(b*bs, data)      (always device I/O)
+   cache.lock().write(b, data)        (marks slot dirty; flushes a dirty
+                                       eviction victim via the dev callback)
+
+flush_meta() / sync():
+   flush_dirty(keep = !alloc_meta)    (data + inode blocks — phase 1)
+   ...staged bitmaps / BGDs / superblock written through the cache...
+   flush_dirty(keep = all)            (phase 3)
 ```
+
+Two invariants the write-back adds:
+
+- **Invalidate-on-free never flushes** (`free_block` → `invalidate_block` →
+  `cache.remove`): a freed block's stale dirty copy is dropped, not written,
+  so it can never clobber a reallocated block.
+- **Data before allocation metadata** in `flush_meta` (`is_alloc_meta` +
+  the two `flush_dirty` phases): an unclean crash can leak an allocated
+  block (e2fsck-recoverable) but never publishes a bitmap/BGD claiming
+  blocks whose contents never landed.
 
 ### `BlockRingCache` (default without `fs-cache`)
 
@@ -233,15 +251,18 @@ time up to `capacity_blocks`; slots never move once allocated. `block_num → sl
 set survives cold blocks streaming past. Instrumented: `cache_stats()` →
 `(hits, misses)`, `cache_occupancy()` → `(slots_used, slots_cap)`.
 
-Under `fs-cache`, inode-table and GDT reads are also routed through the block
-cache (`read_range_cached` / `write_range_cached` — single-block RMW), so a hot
-`Inode` read is a memcpy.
+Under the block cache (all non-`extreme` profiles), inode-table, GDT,
+bitmap and directory reads are routed through it (`read_range` /
+`write_range`; sub-block writes patch a resident slot in place — no RMW
+clone), so a hot `Inode` read is a memcpy.
 
 ### Coherence instrumentation (default off)
 
 `E2_VERIFY_HITS` gates `verify_cached_block`, which re-reads every cache hit
-straight from the device and compares (`[E2C-BAD]` on mismatch). Doubles read
-I/O — only for chasing the self-host zero-page class
+straight from the device and compares (`[E2C-BAD]` on mismatch). Under
+write-back a *dirty* hit legitimately differs from the disk, so dirty blocks
+are skipped — the oracle now hunts exactly "clean slot ≠ disk", i.e. real
+staleness. Doubles read I/O — only for chasing the self-host zero-page class
 (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md`). `E2_READ_AT_EOF` counts
 `read_at_by_inode` calls whose offset is past `i_size` (`[E2-EOF]`) — an i_size
 incoherence signal, not a normal EOF.
@@ -380,43 +401,53 @@ Measured with `userspace/ext2probe` (the `ext2probe-host` binary — see
 counts are the metric because each `write_bytes` is one synchronous busy-polled
 virtqueue round-trip on the guest, and a *sector* read-modify-write at that.
 
-**Status 2026-08-26 (intermittent — work in progress).** Four fixes landed:
-Fix A (skip redundant zero-fill), Fix B (defer superblock + BGD writes), Fix C
-(incremental directory block writes — kills the O(N²)), Fix D-lite (defer bitmap
-writes + keep bitmap blocks resident). Write-back for data/inode blocks is still
-pending.
+**Status 2026-08-26.** Five changes landed: Fix A (skip redundant zero-fill),
+Fix B (defer superblock + BGD writes), Fix C (incremental directory block writes
+— kills the O(N²)), Fix D-lite (defer bitmap writes + keep bitmap blocks
+resident), and **write-back** (the block cache is now authoritative and dirty
+blocks are flushed at op end / eviction / `sync()` instead of the cache being
+invalidated on every write — `docs/archive/EXT2_WRITEBACK_DESIGN.md`).
 
 Device I/O per operation (`ext2probe-host`, `disk.img`), baseline → each fix:
 
-| Operation | baseline | +A+B | +C | +A+B+C+D-lite | note |
-|---|---:|---:|---:|---:|---|
-| create 1 × 4 KB file (300 in one dir) | 11.3 wr | 9.3 | 9.0 | **9.0 wr** (reads −29%) | sb 2→1, zero-fill + bitmap re-reads gone |
-| delete 1 × 4 KB file | 10.0 wr | 9.0 | 8.0 | **8.0 wr** (reads −29%) | |
-| 2 MB sequential write (256 × 8 KB `write()`) | 3327 / 5.7× | 2300 / 4.1× | 2299 / 4.1× | **2042 / 3.6×** | sb 514→256, gdt 514→257, bitmap 514→257, 512 zero-fills gone |
-| 2 MB read right after that write | 514 reads | 514 | 514 | 514 | write-invalidate — still cold (write-back pending) |
-| build 3200-file tree (16 × 200) | 35 404 wr | — | 28 987 | **28 987 wr / reads 22 538 → 16 107** | Fix C −18% writes; D-lite −28% reads |
-| mass-delete that tree | 28 970 wr | — | 25 753 | **25 753 wr / reads −28%** | |
-| **Nth file into one flat directory** | 11 → **18** as N: 0→2000 | 9 → 16 | **9.0 flat** | **9.0 flat** | Fix C: O(N²) → O(1) |
+| Operation | baseline | +A+B | +C | +A+B+C+D-lite | **+write-back** | note |
+|---|---:|---:|---:|---:|---:|---|
+| create 1 × 4 KB file (300 in one dir) | 11.3 wr | 9.3 | 9.0 | 9.0 wr | **8.0 wr** (reads 1502 → **18**) | inode-table block patched in place, not re-read |
+| delete 1 × 4 KB file | 10.0 wr | 9.0 | 8.0 | 8.0 wr | **7.0 wr** (reads 1496 → **0**) | |
+| 2 MB sequential write (256 × 8 KB `write()`) | 3327 / 5.7× | 2300 / 4.1× | 2299 / 4.1× | 2042 / 3.6× | **1789 / 3.1×** | reads 1014 → **0** |
+| 2 MB read right after that write | 514 reads | 514 | 514 | 514 | **0 reads** | the write-back headline: fully warm |
+| build 3200-file tree (16 × 200) | 35 404 wr | — | 28 987 | 28 987 wr / 16 107 rd | **25 613 wr / 205 rd** | 9.1 → 8.0 wr per file; reads −99% |
+| mass-delete that tree | 28 970 wr | — | 25 753 | 25 753 wr / 16 115 rd | **22 396 wr / 0 rd** | 8.0 → 7.0 wr per file |
+| 100 × warm `stat()` on a 7-component path | — | — | — | 3 reads | **0 reads** | |
+| **Nth file into one flat directory** | 11 → **18** as N: 0→2000 | 9 → 16 | 9.0 flat | 9.0 flat | **8.0 flat** | Fix C: O(N²) → O(1) |
 
-Real-kernel A/B (QEMU boot, `ext2probe` guest, BEFORE-pass, patched-ext2 = all
-four fixes vs unpatched-ext2, median of 3 runs):
+Write-back removes essentially *all* remaining device reads (the read side is now
+a warm cache) and one write per file (the inode-table block is patched in place —
+design doc D-5 — instead of read-modify-written).
 
-| op | unpatched | patched | Δ |
-|---|---:|---:|---:|
-| create 300 × 4 KB | 3194 ms | 1966 ms | **−38%** |
-| seq_write 2 MB | 1869 ms | 978 ms | **−48%** |
-| seq_read 2 MB | 213 ms | 183 ms | −14% |
-| delete 300 | 1813 ms | 1171 ms | **−35%** |
-| build 3200-file tree | 25.6 s | 21.5 s | **−16%** |
-| mass-delete 3200 | 11.1 s | 12.4 s | within noise |
+Real-kernel A/B (QEMU boot, `ext2probe` guest, BEFORE-pass, median of 3 runs,
+2026-08-26): A–D (commit `4b086f3d`) vs the same tree **+ write-back**.
 
-**Caveat:** wall-clock A/B on this host has large run-to-run variance (unpatched
-`create` spanned 2.4–3.6 s across three runs; `mass delete` 9.8–17.1 s), worse
-when other VMs contend for CPU. The deterministic **device-I/O counts above are
-the number to trust**; wall-clock confirms direction and rough magnitude. The
-`create`/`seq_write`/`delete` improvements exceed their device-write predictions
-because Fix D-lite also removes the per-allocation bitmap *re-read*. An earlier,
-less contended A/B of Fix A+B alone showed seq_write −25%, mass-delete −13%.
+| op | A–D | +write-back | Δ | A–D range | +wb range |
+|---|---:|---:|---:|---:|---:|
+| create 300 × 4 KB | 1858 ms | 1433 ms | **−23%** | 1699–1874 | 1286–1441 |
+| seq_write 2 MB | 858 ms | 669 ms | **−22%** | 803–895 | 637–753 |
+| seq_read 2 MB (after write) | 143 ms | 43 ms | **−70%** | 122–175 | 42–54 |
+| delete 300 | 1062 ms | 809 ms | **−24%** | 955–1075 | 713–850 |
+| build 3200-file tree | 19.3 s | 15.9 s | **−18%** | 18.0–19.7 | 13.5–15.9 |
+| mass-delete 3200 | 11.4 s | 7.5 s | **−35%** | 11.3–12.0 | 7.5–8.6 |
+
+Unusually for wall-clock on this host, **the two arms' ranges are disjoint on
+every one of the six ops** — the slowest write-back run beats the fastest A–D run
+each time. That is what makes this A/B carry a claim on its own; the earlier A–D
+A/B did not (see the caveat below), and the deterministic device-I/O counts
+remain the primary evidence.
+
+**Caveat (still true):** wall-clock A/B on this host has large run-to-run
+variance, worse when other VMs contend for CPU — the A–D measurement it was
+written for spanned 2.4–3.6 s on unpatched `create` and 9.8–17.1 s on `mass
+delete`. Treat the **device-I/O counts as the number to trust**; wall-clock
+confirms direction and magnitude.
 
 ### Reference: the same workload on real Linux ext2
 
@@ -425,37 +456,38 @@ less contended A/B of Fix A+B alone showed seq_write −25%, mass-delete −13%.
 files / 2 MB / 3200-file-tree shapes, median of 3, BEFORE pass. Two mount modes:
 `-o sync` (durable on every syscall — Akuma's own model) and default (writeback).
 
-| op | Linux ext2 `-o sync` | Linux ext2 default | **Akuma patched** | Akuma vs `-o sync` |
+| op | Linux ext2 `-o sync` | Linux ext2 default | **Akuma +write-back** | Akuma vs `-o sync` |
 |---|---:|---:|---:|---:|
-| create 300 × 4 KB | 71 ms | 1.1 ms | 1966 ms | **~28×** |
-| seq_write 2 MB | 65 ms | 0.35 ms | 978 ms | **~15×** |
-| seq_read 2 MB (after write) | 0.14 ms | 0.14 ms | 183 ms | **~1300×** |
-| delete 300 | 5.4 ms | 0.4 ms | 1171 ms | **~220×** |
-| build 3200-file tree | 1.06 s | 11 ms | 21.5 s | **~20×** |
-| mass-delete 3200 | 96 ms (33k files/s) | 3.9 ms (820k files/s) | 12.4 s (~250 files/s) | **~130×** |
+| create 300 × 4 KB | 71 ms | 1.1 ms | 1433 ms | **~20×** (was ~28×) |
+| seq_write 2 MB | 65 ms | 0.35 ms | 669 ms | **~10×** (was ~15×) |
+| seq_read 2 MB (after write) | 0.14 ms | 0.14 ms | 43 ms | **~310×** (was ~1300×) |
+| delete 300 | 5.4 ms | 0.4 ms | 809 ms | **~150×** (was ~220×) |
+| build 3200-file tree | 1.06 s | 11 ms | 15.9 s | **~15×** (was ~20×) |
+| mass-delete 3200 | 96 ms (33k files/s) | 3.9 ms (820k files/s) | 7.5 s (~427 files/s) | **~78×** (was ~130×) |
 
 (The container's own overlay/ext4 root — a third data point — matches the
 default-writeback column: create ~1.8 ms, tree build ~18 ms.)
 
 Two gaps:
 
-- **vs default (writeback) Linux ext2: ~1800–3200×** across every op. Inherent —
-  a real OS batches every dirty page and flushes asynchronously, and serves reads
-  from the page cache. Akuma has neither, and every write is a synchronous
-  busy-polled virtqueue round-trip.
+- **vs default (writeback) Linux ext2: still ~1300–2000×** across every op.
+  Inherent — a real OS batches every dirty page and flushes asynchronously.
+  Akuma flushes at every syscall boundary by design (`flush_meta`), and every
+  write is a synchronous busy-polled virtqueue round-trip.
 - **vs `-o sync` Linux ext2 (durable every op, the same guarantee Akuma gives):
-  ~15–1300×**, and *this* is the achievable target. Even fully synchronous, Linux
-  still coalesces the dirty inode/bitmap within one `write()`, keeps a buffer
-  cache for reads, and lets the block layer queue and merge requests. Akuma's
-  remaining gap is:
-  - **`seq_read` after a write: ~1300× (183 ms vs 0.14 ms)** — pure
-    write-invalidate cold cache. A write-back block cache fixes this outright and
-    is the single highest-value pending change.
-  - **`delete`: ~220×** — Linux `-o sync` unlinks 300 files in 5 ms; Akuma does
-    ~8 synchronous device writes per unlink.
-  - `create` / `seq_write` (~15–28×) are the closest — Fixes A–D already brought
-    these down; the residue is data + inode blocks still written through one at a
-    time, plus the virtio sector-RMW.
+  ~10–310×**, and *this* is the achievable target. Write-back closed the read
+  half of the gap; what is left is all on the write side:
+  - ~~**`seq_read` after a write** — pure write-invalidate cold cache.~~
+    **Fixed by write-back:** 0 device reads, 143 ms → 43 ms, and the ratio vs
+    Linux fell ~1300× → ~310×. The residual 43 ms is the guest's own `read()`
+    syscall + copy path, not device I/O.
+  - **`delete`: ~150×** — Linux `-o sync` unlinks 300 files in 5 ms; Akuma still
+    does ~7 synchronous device *writes* per unlink.
+  - `create` / `seq_write` (~10–20×) are the closest. The residue is the ~8
+    writes per file that `flush_meta` must still issue at every syscall
+    boundary (sb + gdt + 2 bitmap + inode table + data), plus the virtio
+    sector-RMW. Coalescing those across syscalls means weakening the
+    every-syscall durability guarantee — a separate decision, not a bug fix.
 
 ### Root causes, and status
 
@@ -465,10 +497,13 @@ Two gaps:
    bitmap_cache}` + dirty flags) and written by `flush_meta` once at the end of
    every mutating `Filesystem` method and on `sync()`. On-disk metadata is still
    consistent at every syscall boundary — same guarantee the per-block writes
-   gave. `sync()` is no longer a no-op. **Data + inode blocks are still
-   write-through**, and the block cache still *invalidates* on write, so
-   read-after-write is cold — a proper write-back block cache is the remaining
-   piece.
+   gave. `sync()` is no longer a no-op. **Data + inode blocks are now write-back
+   too:** `write_block` marks the cache slot dirty and the device write is
+   deferred to dirty-victim eviction, `flush_meta` (end of every mutating op) or
+   `sync()`, so read-after-write is warm (0 device reads). Freed blocks are
+   invalidated *without* flushing (design doc D-3) so a stale copy can never
+   land on a reallocated block. What remains is coalescing writes *across*
+   syscall boundaries, which would weaken the durability guarantee.
 2. ~~The superblock (full 1 KB) is rewritten on every block/inode alloc/free.~~
    **Fixed (Fix B).**
 3. ~~The block-group descriptor is rewritten the same way.~~ **Fixed (Fix B).**

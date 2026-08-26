@@ -157,6 +157,39 @@ pub fn init() {
     }
 }
 
+/// Sync every filesystem visible anywhere: the global mount table and every
+/// box namespace (the same fs may appear in both; `sync` is idempotent, and a
+/// duplicate flush of an already-clean cache is free). Called from
+/// `sys_reboot` before PSCI reset/poweroff — with the ext2 write-back cache,
+/// dirty data otherwise dies with the machine. Collects the `Arc<dyn
+/// Filesystem>` set under the table/namespace locks, then syncs lock-free:
+/// `sync` does real block I/O and must not run under a mount-table lock.
+///
+/// Gated on `sc-reboot` because that syscall is its only caller: `extreme-size`
+/// builds `--no-default-features` without it, and an ungated definition is
+/// dead code there (`-D dead-code` fails the build).
+#[cfg(feature = "sc-reboot")]
+pub fn sync_all_filesystems() -> Result<(), FsError> {
+    let mut seen: Vec<Arc<dyn Filesystem>> = Vec::new();
+    {
+        let table = MOUNT_TABLE.lock();
+        if let Some(t) = table.as_ref() {
+            seen.extend(t.filesystems());
+        }
+    }
+    {
+        let namespaces = BOX_NAMESPACES.lock();
+        for ns in namespaces.values() {
+            let mounts = ns.mount.lock();
+            seen.extend(mounts.filesystems());
+        }
+    }
+    for fs in &seen {
+        fs.sync()?;
+    }
+    Ok(())
+}
+
 /// [`mount`] recording the mount's `source` (`/dev/vda`, `proc`, …) and
 /// `MS_*` flags. Only `MS_RDONLY` is stored; the kernel's write chokepoints
 /// enforce it as `FsError::ReadOnly`.
