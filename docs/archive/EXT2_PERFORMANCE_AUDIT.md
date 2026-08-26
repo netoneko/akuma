@@ -4,10 +4,12 @@
 unconditional write amplification, not a post-delete regression. See
 "2026-08-26 follow-up" at the bottom, and
 [`crates/akuma-ext2/README.md`](../../crates/akuma-ext2/README.md#performance-characteristics)
-for the full write-up. First two fixes (deferred superblock/BGD metadata,
-skipped redundant zero-fill) landed the same day: 2 MB write 5.7× → 4.1×
-amplification, create 11.3 → 9.3 device writes/file. Directory-rewrite O(N²)
-and the write-back block cache are still pending.**
+for the full write-up. Four fixes landed the same day (deferred superblock/BGD
+metadata, skipped redundant zero-fill, incremental directory writes killing the
+O(N²), deferred bitmap writes): 2 MB write 5.7× → 3.6× amplification, create
+11.3 → 9.0 device writes/file, flat-directory cost O(N²) → O(1). Real-kernel
+A/B confirms −7…−25% wall-clock, no regressions. A proper write-back block
+cache for data/inode blocks is still pending.**
 
 Recorded 2026-08-25, triggered by a report of "fs performance looks like
 shit" after running `rm -rf /tmp/akuma` on a live `devbox-smoltcp` guest.
@@ -234,26 +236,55 @@ in `read_inode_data`'s case, *unboundedly* (whole directory into a `Vec` on ever
 path-lookup component) — while the `no-bkl-vfs` `PreemptGuard` holds local IRQs
 masked. See the README's "Allocation audit".
 
-### Fixes applied 2026-08-26 (checkpoint 1)
+### Fixes applied 2026-08-26
 
-Two low-risk changes in `crates/akuma-ext2/src/ext2.rs`, host-tested (63/63) and
-kernel-build-clean:
+Four changes in `crates/akuma-ext2/src/ext2.rs`, host-tested (63/63),
+kernel-build-clean, clippy-clean:
 
 - **Fix A — skip redundant zero-fill.** `ensure_block` takes a `zero_leaf` flag;
-  `write_inode_data` and the full-block arm of `write_at` pass `false` because
-  they write every byte of the block immediately after. Removes one full-block
-  device write per allocated data block (512 on a 2 MB write). Indirect pointer
-  blocks and partially-written blocks are still zeroed.
+  `write_inode_data`, the full-block arm of `write_at`, and `write_dir_range`
+  pass `false` because they write every byte of the block immediately after.
+  Removes one full-block device write per allocated data block.
 - **Fix B — defer superblock + BGD writes.** `Ext2State` gains an in-memory
-  `bgd_cache` + `bgd_dirty` + `sb_dirty`; the four allocators stage updates in
-  memory and `flush_meta` writes the dirty ones once at the end of every mutating
-  `Filesystem` method and on `sync()` (no longer a no-op). On-disk metadata stays
-  consistent at every syscall boundary.
+  `bgd_cache` + `sb_dirty`; the four allocators stage updates and `flush_meta`
+  writes the dirty ones once at the end of every mutating `Filesystem` method and
+  on `sync()` (no longer a no-op). On-disk metadata stays consistent at every
+  syscall boundary.
+- **Fix C — incremental directory writes.** `write_dir_range` writes only the
+  directory block(s) overlapping the bytes a dirent edit changed, instead of
+  `write_inode_data` rewriting every block. `add_dir_entry` /
+  `remove_dir_entry` were O(directory size) per call → O(N²) to fill/empty a
+  directory; now O(1). Also fixed a latent cross-block `rec_len` merge bug.
+- **Fix D-lite — defer bitmap writes + keep bitmap blocks resident.**
+  `Ext2State::bitmap_cache`; the allocators mutate bitmap blocks in memory and
+  `flush_meta` writes them. Big *read* reduction (no per-allocation bitmap
+  re-read); write reduction shows on large single ops.
 
-Probe deltas (`ext2probe-host`, `disk.img`): create 11.3 → 9.3 wr/file, delete
-10.0 → 9.0, 2 MB write 3327 → 2300 calls / 5.7× → 4.1×, tree build −18%,
-mass-delete −11%. Pending: incremental directory writes (the O(N²)), write-back
-block cache (read-after-write is still cold), bitmap-scan cursor.
+Probe deltas (`ext2probe-host`, `disk.img`), baseline → all four:
+- create 1 file: 11.3 → **9.0** wr/file (reads −29%)
+- delete 1 file: 10.0 → **8.0** wr/file
+- 2 MB write: 3327 → **2042** calls, 5.7× → **3.6×** amplification
+- flat directory, file #2000: **18 → 9.0** wr/file (O(N²) → O(1))
+- 3200-file tree build: 35 404 → 28 987 writes, reads 22 538 → 16 107
+
+Real-kernel A/B (QEMU boot, guest `ext2probe`, all four fixes vs unpatched,
+median of 3, BEFORE pass): create −38%, seq_write 2 MB −48%, delete −35%, tree
+build −16%. Wall-clock A/B on this host is noisy (create spanned 2.4–3.6 s
+unpatched); the deterministic device-I/O counts are the reliable number, the
+wall-clock confirms direction.
+
+Reference — same workload on real Linux ext2 in Docker (`ext2probe-stdfs`,
+median of 3): mounted `-o sync` (Akuma's own durability model) create ~71 ms /
+seq_write ~64 ms / delete ~5 ms / mass-delete ~95 ms; mounted default (writeback)
+everything ≤10 ms. So Akuma-patched is ~15–220× slower than `-o sync` Linux ext2
+(the achievable target) and ~2000–3000× slower than writeback Linux. The worst
+single op is `seq_read` right after a write (183 ms vs 0.12 ms) — pure
+write-invalidate cold cache.
+
+Still pending: a proper write-back block cache for data + inode blocks
+(read-after-write is still cold — the biggest remaining win); bitmap-scan cursor;
+every-N-ops metadata flush (needs `sync_all()` wired into reboot first — nothing
+calls it today).
 
 ## Background
 

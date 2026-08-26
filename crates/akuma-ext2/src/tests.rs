@@ -604,23 +604,32 @@ fn pin_test_serial() -> std::sync::MutexGuard<'static, ()> {
     PIN_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Inodes reported through [`crate::init_inode_freed_hook`], newest last.
-static FREED_INODES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+std::thread_local! {
+    /// Inodes reported through [`crate::init_inode_freed_hook`] **on this test
+    /// thread**, newest last. Thread-local, not a shared `Mutex<Vec>`: the hook
+    /// is one global registration, but it always fires synchronously on the
+    /// thread that called `remove_file`/`remove_dir`, and `cargo test` runs each
+    /// `#[test]` on its own thread — so a concurrent unrelated test freeing an
+    /// inode with the same (low, fresh-fs) number can't pollute this test's
+    /// recording. Was a `static Mutex<Vec<u32>>`; that flaked ~1/15 on the
+    /// `!contains(&deferred)` assertion below.
+    static FREED_INODES: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
-/// Register the recorder once; `Registered` ignores repeat calls, so every test
-/// that needs it shares this one hook (they are serialized by `pin_test_serial`).
+/// Register the recorder once (`Registered` ignores repeat calls) and clear this
+/// thread's buffer.
 fn record_freed_inodes() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::init_inode_freed_hook(|inode| {
-            FREED_INODES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(inode);
+            FREED_INODES.with(|v| v.borrow_mut().push(inode));
         });
     });
-    FREED_INODES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+    FREED_INODES.with(|v| v.borrow_mut().clear());
 }
 
 fn freed_inodes() -> Vec<u32> {
-    FREED_INODES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    FREED_INODES.with(|v| v.borrow().clone())
 }
 
 /// Reissuing an inode number must drop anything keyed on it.

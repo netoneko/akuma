@@ -18,8 +18,13 @@
 //!   guest, so the counts convert straight back to the wall-clock story without
 //!   a boot and without timing variance.
 //!
-//! Both call the [`workload`] helpers below through the [`FsOps`] trait, so the
-//! shapes under test (300 × 4 KB files, a 2 MB sequential write, a
+//! * **std::fs probe** (`src/bin/stdfs.rs`, `ext2probe-stdfs`, feature
+//!   `std-probe`): the same workload against the host OS filesystem, for a
+//!   real-kernel reference point (a Docker container against ext2 mounted
+//!   `-o sync` and default — see `crates/akuma-ext2/README.md`).
+//!
+//! All three call the [`workload`] helpers below through the [`FsOps`] trait, so
+//! the shapes under test (300 × 4 KB files, a 2 MB sequential write, a
 //! `dirs × files` tree, a flat directory) are defined exactly once.
 //!
 //! Build / run:
@@ -30,7 +35,7 @@
 //!   --target "$(rustc -vV | grep '^host:' | cut -d' ' -f2)" -- disk.img
 //! ```
 
-#![cfg_attr(not(any(feature = "host-probe", test)), no_std)]
+#![cfg_attr(not(any(feature = "host-probe", feature = "std-probe", test)), no_std)]
 
 extern crate alloc;
 
@@ -39,6 +44,9 @@ use alloc::vec;
 
 #[cfg(feature = "host-probe")]
 pub mod host;
+
+#[cfg(feature = "std-probe")]
+pub mod stdfs;
 
 /// The filesystem surface both probes drive. The guest implements it over
 /// libakuma syscalls; the host implements it over `akuma_ext2::Ext2Filesystem`.

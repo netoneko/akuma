@@ -721,6 +721,14 @@ pub(crate) struct Ext2State {
     bgd_dirty: Vec<bool>,
     /// The in-memory superblock is ahead of disk.
     sb_dirty: bool,
+    /// Allocation bitmap blocks (block-bitmap / inode-bitmap) touched by the
+    /// allocators, `(physical block number, contents, dirty)`. Same rationale as
+    /// `bgd_cache`: a 2 MB write set + cleared ~512 bits in one block, each a
+    /// full-block RMW device write. Only the four allocators touch a bitmap
+    /// block, and only through [`Self::bitmap_slot`], so this is the single
+    /// source of truth for them; `flush_meta` writes the dirty ones. Bounded by
+    /// `2 * block_group_count` entries, populated lazily.
+    bitmap_cache: Vec<(u32, Vec<u8>, bool)>,
 }
 
 /// Non-preemption/IRQ guard held for the lifetime of an [`Ext2State`] lock hold under
@@ -925,6 +933,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             bgd_cache: vec![None; block_group_count as usize],
             bgd_dirty: vec![false; block_group_count as usize],
             sb_dirty: false,
+            bitmap_cache: Vec::new(),
         };
 
         Ok(Self {
@@ -1242,9 +1251,38 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         state.sb_dirty = true;
     }
 
-    /// Write every BGD and the superblock that `stage_*` marked dirty. Cheap when
-    /// nothing is dirty (the common case for a read or a pure-rename op).
+    /// Index of bitmap block `block_num` in `state.bitmap_cache`, loading it from
+    /// disk on first touch. The allocators mutate `bitmap_cache[idx].1` in place
+    /// and set `.2 = true`; `flush_meta` writes it back.
+    fn bitmap_slot(&self, state: &mut Ext2State, block_num: u32) -> Result<usize, FsError> {
+        if let Some(i) = state.bitmap_cache.iter().position(|(b, _, _)| *b == block_num) {
+            return Ok(i);
+        }
+        let data = self.read_block(state, block_num)?;
+        state.bitmap_cache.push((block_num, data, false));
+        Ok(state.bitmap_cache.len() - 1)
+    }
+
+    /// Write every bitmap block, BGD, and the superblock that the allocators
+    /// marked dirty. Cheap when nothing is dirty (a read, or a pure-rename op).
     fn flush_meta(&self, state: &mut Ext2State) -> Result<(), FsError> {
+        // Bitmap blocks. Move the cache out so `write_block(state, …)` can borrow
+        // `state` while we iterate; put it back (with dirty flags cleared) after.
+        if state.bitmap_cache.iter().any(|(_, _, d)| *d) {
+            let mut bmaps = core::mem::take(&mut state.bitmap_cache);
+            let mut err = Ok(());
+            for (bn, data, dirty) in &mut bmaps {
+                if *dirty {
+                    if let e @ Err(_) = self.write_block(state, *bn, data) {
+                        err = e;
+                        break;
+                    }
+                    *dirty = false;
+                }
+            }
+            state.bitmap_cache = bmaps;
+            err?;
+        }
         for group in 0..state.block_group_count {
             if !state.bgd_dirty[group as usize] {
                 continue;
@@ -1362,15 +1400,14 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 continue;
             }
 
-            let bitmap_block = bgd.block_bitmap;
-            let mut bitmap = self.read_block(state, bitmap_block)?;
+            let bi = self.bitmap_slot(state, bgd.block_bitmap)?;
 
             // Find first free bit
             for bit in 0..state.blocks_per_group {
-                if !Self::get_bit(&bitmap, bit) {
-                    // Found free block
-                    Self::set_bit(&mut bitmap, bit, true);
-                    self.write_block(state, bitmap_block, &bitmap)?;
+                if !Self::get_bit(&state.bitmap_cache[bi].1, bit) {
+                    // Found free block — set the bit in memory, defer the write.
+                    Self::set_bit(&mut state.bitmap_cache[bi].1, bit, true);
+                    state.bitmap_cache[bi].2 = true;
 
                     // Update BGD + superblock in memory; flushed by flush_meta.
                     bgd.free_blocks_count = free_count - 1;
@@ -1404,11 +1441,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let bit = adjusted % state.blocks_per_group;
 
         let mut bgd = self.read_bgd_staged(state, group)?;
-        let bitmap_block = bgd.block_bitmap;
-        let mut bitmap = self.read_block(state, bitmap_block)?;
-
-        Self::set_bit(&mut bitmap, bit, false);
-        self.write_block(state, bitmap_block, &bitmap)?;
+        let bi = self.bitmap_slot(state, bgd.block_bitmap)?;
+        Self::set_bit(&mut state.bitmap_cache[bi].1, bit, false);
+        state.bitmap_cache[bi].2 = true;
 
         bgd.free_blocks_count += 1;
         self.stage_bgd(state, group, &bgd);
@@ -1441,13 +1476,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 continue;
             }
 
-            let bitmap_block = bgd.inode_bitmap;
-            let mut bitmap = self.read_block(state, bitmap_block)?;
+            let bi = self.bitmap_slot(state, bgd.inode_bitmap)?;
 
             for bit in 0..state.inodes_per_group {
-                if !Self::get_bit(&bitmap, bit) {
-                    Self::set_bit(&mut bitmap, bit, true);
-                    self.write_block(state, bitmap_block, &bitmap)?;
+                if !Self::get_bit(&state.bitmap_cache[bi].1, bit) {
+                    Self::set_bit(&mut state.bitmap_cache[bi].1, bit, true);
+                    state.bitmap_cache[bi].2 = true;
 
                     bgd.free_inodes_count = free_count - 1;
                     if is_dir {
@@ -1530,11 +1564,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let bit = inode_idx % state.inodes_per_group;
 
         let mut bgd = self.read_bgd_staged(state, group)?;
-        let bitmap_block = bgd.inode_bitmap;
-        let mut bitmap = self.read_block(state, bitmap_block)?;
-
-        Self::set_bit(&mut bitmap, bit, false);
-        self.write_block(state, bitmap_block, &bitmap)?;
+        let bi = self.bitmap_slot(state, bgd.inode_bitmap)?;
+        Self::set_bit(&mut state.bitmap_cache[bi].1, bit, false);
+        state.bitmap_cache[bi].2 = true;
 
         bgd.free_inodes_count += 1;
         if is_dir && bgd.used_dirs_count > 0 {
@@ -1848,6 +1880,40 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         entries
     }
 
+    /// Write back only the directory blocks overlapping bytes `[start, end)` of
+    /// `dir_data`, instead of every block (`write_inode_data`). A dirent edit
+    /// touches one block; rewriting the whole directory made `add_dir_entry` /
+    /// `remove_dir_entry` O(directory size) per call — O(N²) to fill or empty a
+    /// directory. `dir_data` must otherwise match what is on disk (it came from
+    /// `read_inode_data`). Grows the directory (allocating the block) when
+    /// `dir_data` is longer than `i_size` — the append case.
+    fn write_dir_range(
+        &self,
+        state: &mut Ext2State,
+        dir_inode_num: u32,
+        dir_inode: &mut Inode,
+        dir_data: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<(), FsError> {
+        let bs = state.block_size;
+        debug_assert!(start < end && end <= dir_data.len());
+        for lb in (start / bs)..=((end - 1) / bs) {
+            // zero_leaf = false: the whole block is written just below.
+            let phys = self.ensure_block(state, dir_inode, lb as u32, false)?;
+            let s = lb * bs;
+            let e = core::cmp::min(s + bs, dir_data.len());
+            let mut block = vec![0u8; bs];
+            block[..e - s].copy_from_slice(&dir_data[s..e]);
+            self.write_block(state, phys, &block)?;
+        }
+        if dir_data.len() as u32 > dir_inode.size_lower {
+            dir_inode.size_lower = dir_data.len() as u32;
+        }
+        dir_inode.modification_time = self.current_time();
+        self.write_inode(state, dir_inode_num, dir_inode)
+    }
+
     fn add_dir_entry(&self,
         state: &mut Ext2State,
         dir_inode_num: u32,
@@ -1881,7 +1947,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             let free_space = entry.rec_len as usize - actual_len;
 
             if free_space >= aligned_len {
-                // Split this entry
+                // Split this entry. Everything changed lies inside this one
+                // directory block (an entry never crosses a block boundary).
+                let edit_start = offset;
                 if entry.inode != 0 {
                     // Shrink existing entry
                     let new_rec_len = actual_len as u16;
@@ -1910,7 +1978,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     ..offset + DIR_ENTRY_HEADER_SIZE + name_bytes.len()]
                     .copy_from_slice(name_bytes);
 
-                self.write_inode_data(state, dir_inode_num, &mut dir_inode, &dir_data)?;
+                let edit_end = offset + DIR_ENTRY_HEADER_SIZE + name_bytes.len();
+                self.write_dir_range(
+                    state, dir_inode_num, &mut dir_inode, &dir_data, edit_start, edit_end,
+                )?;
                 return Ok(());
             }
 
@@ -1942,7 +2013,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             ..new_block_offset + DIR_ENTRY_HEADER_SIZE + name_bytes.len()]
             .copy_from_slice(name_bytes);
 
-        self.write_inode_data(state, dir_inode_num, &mut dir_inode, &dir_data)?;
+        // Only the newly appended block changed.
+        self.write_dir_range(
+            state, dir_inode_num, &mut dir_inode, &dir_data, new_block_offset, new_size,
+        )?;
         Ok(())
     }
 
@@ -1973,28 +2047,35 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     if let Ok(entry_name) = core::str::from_utf8(&dir_data[name_start..name_end]) {
                         if entry_name == name {
                             let removed_inode = entry.inode;
+                            let bs = state.block_size;
 
-                            if let Some(prev) = prev_offset {
-                                // Merge with previous entry
-                                let prev_entry: DirEntryRaw = unsafe {
-                                    core::ptr::read_unaligned(dir_data[prev..].as_ptr() as *const _)
-                                };
-                                let new_rec_len = prev_entry.rec_len + entry.rec_len;
-                                dir_data[prev + 4] = new_rec_len as u8;
-                                dir_data[prev + 5] = (new_rec_len >> 8) as u8;
-                            } else {
-                                // Zero out the inode field
-                                dir_data[offset] = 0;
-                                dir_data[offset + 1] = 0;
-                                dir_data[offset + 2] = 0;
-                                dir_data[offset + 3] = 0;
-                            }
+                            // Merge into the previous entry only when it is in
+                            // the *same* directory block — a dirent's rec_len
+                            // must never cross a block boundary. Otherwise (the
+                            // removed entry is first in its block) just clear
+                            // the inode field, leaving a gap `add_dir_entry`
+                            // can reuse.
+                            let (edit_start, edit_end) = match prev_offset {
+                                Some(prev) if prev / bs == offset / bs => {
+                                    let prev_entry: DirEntryRaw = unsafe {
+                                        core::ptr::read_unaligned(dir_data[prev..].as_ptr() as *const _)
+                                    };
+                                    let new_rec_len = prev_entry.rec_len + entry.rec_len;
+                                    dir_data[prev + 4] = new_rec_len as u8;
+                                    dir_data[prev + 5] = (new_rec_len >> 8) as u8;
+                                    (prev, prev + DIR_ENTRY_HEADER_SIZE)
+                                }
+                                _ => {
+                                    dir_data[offset] = 0;
+                                    dir_data[offset + 1] = 0;
+                                    dir_data[offset + 2] = 0;
+                                    dir_data[offset + 3] = 0;
+                                    (offset, offset + 4)
+                                }
+                            };
 
-                            self.write_inode_data(
-                                state,
-                                dir_inode_num,
-                                &mut dir_inode,
-                                &dir_data,
+                            self.write_dir_range(
+                                state, dir_inode_num, &mut dir_inode, &dir_data, edit_start, edit_end,
                             )?;
                             return Ok(removed_inode);
                         }

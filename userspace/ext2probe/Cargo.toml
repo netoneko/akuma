@@ -22,6 +22,13 @@ name = "ext2probe-host"
 path = "src/bin/host.rs"
 required-features = ["host-probe"]
 
+# Runs the shared workload against the real OS filesystem (std::fs) — a
+# real-kernel reference point, e.g. in a Docker container.
+[[bin]]
+name = "ext2probe-stdfs"
+path = "src/bin/stdfs.rs"
+required-features = ["std-probe"]
+
 [features]
 default = ["akuma"]
 # The guest half — libakuma defines #[panic_handler]/#[global_allocator], so it
@@ -30,6 +37,8 @@ akuma = ["dep:libakuma"]
 # The host half — pulls in akuma-ext2 (+ its `fs-cache`, matching the kernel
 # default) and std.
 host-probe = ["dep:akuma-ext2", "dep:akuma-vfs"]
+# std::fs workload runner — std only, no akuma-ext2.
+std-probe = []
 
 [dependencies]
 libakuma = { path = "../libakuma", optional = true }
