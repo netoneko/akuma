@@ -1261,34 +1261,82 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // Block I/O
     // ========================================================================
 
-    fn read_block(&self, state: &Ext2State, block_num: u32) -> Result<Vec<u8>, FsError> {
+    /// Run `f` over block `block_num`'s bytes **without copying them out**
+    /// (design doc D-4). On a cache hit `f` sees the cached slot directly; only
+    /// on a miss is a buffer allocated, and then only because the device read
+    /// needs somewhere to land.
+    ///
+    /// Every read path that just copies bytes somewhere — `read_range`,
+    /// `get_block_num`'s indirect walks, `read_inode_data`, `read_at_by_inode`
+    /// — goes through this. Before D-4 each of those paid a `Vec` allocation
+    /// plus a full block memcpy *per hit*, which is pure overhead once
+    /// write-back means hits are the common case.
+    ///
+    /// **`f` must not re-enter the filesystem.** On the hit path it runs with
+    /// the `block_cache` lock held, so anything that touches the cache
+    /// (`read_block`, `write_block`, `free_block`, `invalidate_block`, or any
+    /// `Filesystem` method) deadlocks on the same spinlock. Keep `f` to pure
+    /// inspection/copying of the bytes. This is why the `truncate_inode` /
+    /// `free_inode_blocks` indirect walks still take the owned
+    /// [`Self::read_block`]: they call `free_block` inside the loop.
+    ///
+    /// Lock-hold time is unchanged from the old code, which also memcpy'd
+    /// (`to_vec`) with the lock held — this just drops the allocation.
+    fn with_block<R>(
+        &self,
+        state: &Ext2State,
+        block_num: u32,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, FsError> {
         #[cfg(not(kernel_profile_extreme))]
         {
-            let cache = self.block_cache.lock();
-            if let Some(data) = cache.get(block_num) {
-                #[cfg(any(ext2_fs_cache, test))]
-                CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-                let snapshot = data.to_vec();
-                drop(cache);
-                self.verify_cached_block(state, block_num, &snapshot);
-                return Ok(snapshot);
+            {
+                let cache = self.block_cache.lock();
+                if let Some(data) = cache.get(block_num) {
+                    #[cfg(any(ext2_fs_cache, test))]
+                    CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                    // The E2C coherence oracle needs a snapshot to compare
+                    // against the device, and `verify_cached_block` re-locks
+                    // the cache — so when it is armed (off by default) fall
+                    // back to the old copy-then-verify shape rather than
+                    // deadlocking. Zero-copy is the default path.
+                    if E2_VERIFY_HITS.load(Ordering::Relaxed) {
+                        let snapshot = data.to_vec();
+                        drop(cache);
+                        self.verify_cached_block(state, block_num, &snapshot);
+                        return Ok(f(&snapshot));
+                    }
+                    return Ok(f(data));
+                }
             }
+            #[cfg(any(ext2_fs_cache, test))]
+            CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+
+            let mut buf = vec![0u8; state.block_size];
+            let offset = block_num as u64 * state.block_size as u64;
+            self.dev.read_bytes(offset, &mut buf).map_err(|_| FsError::IoError)?;
+            {
+                let mut cache = self.block_cache.lock();
+                let mut flush = self.dev_flush(state);
+                cache.insert(block_num, &buf, &mut flush)?;
+            }
+            Ok(f(&buf))
         }
-        #[cfg(any(ext2_fs_cache, test))]
-        CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-
-        let mut buf = vec![0u8; state.block_size];
-        let offset = block_num as u64 * state.block_size as u64;
-        self.dev.read_bytes(offset, &mut buf).map_err(|_| FsError::IoError)?;
-
-        #[cfg(not(kernel_profile_extreme))]
+        #[cfg(kernel_profile_extreme)]
         {
-            let mut cache = self.block_cache.lock();
-            let mut flush = self.dev_flush(state);
-            cache.insert(block_num, &buf, &mut flush)?;
+            let mut buf = vec![0u8; state.block_size];
+            let offset = block_num as u64 * state.block_size as u64;
+            self.dev.read_bytes(offset, &mut buf).map_err(|_| FsError::IoError)?;
+            Ok(f(&buf))
         }
+    }
 
-        Ok(buf)
+    /// [`Self::with_block`] materialised into an owned `Vec`. For the callers
+    /// that genuinely need ownership — they mutate the block and write it back,
+    /// or park it in `bitmap_cache` — or that must call back into the fs while
+    /// holding the contents. Read-only callers should use `with_block`.
+    fn read_block(&self, state: &Ext2State, block_num: u32) -> Result<Vec<u8>, FsError> {
+        self.with_block(state, block_num, <[u8]>::to_vec)
     }
 
     /// The device-write closure cache flushes use — borrows `self.dev`, which
@@ -1394,9 +1442,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             let bs = state.block_size as u64;
             let block_num = (offset / bs) as u32;
             let off = (offset % bs) as usize;
-            let block = self.read_block(state, block_num)?;
-            buf.copy_from_slice(&block[off..off + buf.len()]);
-            Ok(())
+            let len = buf.len();
+            self.with_block(state, block_num, |block| {
+                buf.copy_from_slice(&block[off..off + len]);
+            })
         }
         #[cfg(kernel_profile_extreme)]
         {
@@ -1915,8 +1964,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             if inode.indirect_block == 0 {
                 return Ok(None);
             }
-            let indirect = self.read_block(state, inode.indirect_block)?;
-            let block = Self::read_block_ptr(&indirect, logical_block as usize);
+            let idx = logical_block as usize;
+            let block =
+                self.with_block(state, inode.indirect_block, |b| Self::read_block_ptr(b, idx))?;
             return Ok(if block == 0 { None } else { Some(block) });
         }
 
@@ -1929,14 +1979,13 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             let idx1 = (logical_block / ptrs_per_block) as usize;
             let idx2 = (logical_block % ptrs_per_block) as usize;
 
-            let double_indirect = self.read_block(state, inode.double_indirect_block)?;
-            let indirect_block = Self::read_block_ptr(&double_indirect, idx1);
+            let indirect_block = self
+                .with_block(state, inode.double_indirect_block, |b| Self::read_block_ptr(b, idx1))?;
             if indirect_block == 0 {
                 return Ok(None);
             }
 
-            let indirect = self.read_block(state, indirect_block)?;
-            let block = Self::read_block_ptr(&indirect, idx2);
+            let block = self.with_block(state, indirect_block, |b| Self::read_block_ptr(b, idx2))?;
             return Ok(if block == 0 { None } else { Some(block) });
         }
 
@@ -2060,10 +2109,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
         for logical_block in 0..blocks_needed as u32 {
             if let Some(phys_block) = self.get_block_num(state, inode, logical_block)? {
-                let block_data = self.read_block(state, phys_block)?;
                 let remaining = size - data.len();
                 let to_copy = core::cmp::min(remaining, state.block_size);
-                data.extend_from_slice(&block_data[..to_copy]);
+                self.with_block(state, phys_block, |b| data.extend_from_slice(&b[..to_copy]))?;
             } else {
                 let remaining = size - data.len();
                 let to_copy = core::cmp::min(remaining, state.block_size);
@@ -2845,9 +2893,10 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             let chunk = core::cmp::min(block_size - offset_in_block, end - pos);
 
             if let Some(phys_block) = self.get_block_num(&state, &inode, logical_block)? {
-                let block_data = self.read_block(&state, phys_block)?;
-                buf[total_read..total_read + chunk]
-                    .copy_from_slice(&block_data[offset_in_block..offset_in_block + chunk]);
+                self.with_block(&state, phys_block, |b| {
+                    buf[total_read..total_read + chunk]
+                        .copy_from_slice(&b[offset_in_block..offset_in_block + chunk]);
+                })?;
             } else {
                 // Sparse block — fill with zeros
                 buf[total_read..total_read + chunk].fill(0);

@@ -236,21 +236,61 @@ nothing to construct it — `-D dead-code` fails. Pre-existing at
 
 Landed and verified: **D-1** (write-back in the block cache), **D-2** (data
 before metadata, asserted in the write log), **D-3** (invalidate-on-free never
-flushes, with the poison test), **D-5** (in-slot sub-block patch — worth one
-device write per file), **D-6** (bitmap cursor), **D-7** (`sync_all_filesystems`
-on `reboot(2)`), **D-11** (no extraction).
+flushes, with the poison test), **D-4** (zero-copy reads — see below),
+**D-5** (in-slot sub-block patch — worth one device write per file),
+**D-6** (bitmap cursor), **D-7** (`sync_all_filesystems` on `reboot(2)`),
+**D-11** (no extraction).
+
+### D-4 landed 2026-08-26 — and did not buy what it was predicted to
+
+Implemented as `Ext2Filesystem::with_block(state, block_num, f)`: on a cache hit
+`f` runs against the cached slot directly, so no `Vec` and no block memcpy.
+`read_block` is now `with_block(.., <[u8]>::to_vec)` for callers that genuinely
+need ownership. Converted: `read_range`, `get_block_num`'s single- and
+double-indirect walks, `read_inode_data`, and `Filesystem::read_at`.
+Deliberately NOT converted — `write_range`'s miss path, `bitmap_slot`,
+`set_block_num`, and the `truncate_inode` / free walks: they either mutate the
+block and write it back, park it in `bitmap_cache`, or call `free_block` inside
+the loop, which re-enters the cache lock and would deadlock. That constraint is
+documented on `with_block` itself.
+
+Lock-hold time is unchanged: the old code also memcpy'd (`to_vec`) with the
+cache lock held, so this only removes the allocation.
+
+**Measured (guest, 3 runs per arm, back-to-back in one session):**
+
+| op | without D-4 | with D-4 | delta | verdict |
+|---|---:|---:|---:|---|
+| create 300 | 779 ms | 724 ms | -7% | ranges overlap - noise |
+| seq_write 2 MB | 369 ms | 363 ms | -2% | noise |
+| seq_read 2 MB | 26.8 ms | 26.6 ms | -1% | noise |
+| delete 300 | 412 ms | 412 ms | 0% | noise |
+| **build 3200-file tree** | **7.90 s** | **7.57 s** | **-4%** | **3/3 disjoint** |
+| mass-delete 3200 | 4.43 s | 4.47 s | +1% | noise |
+
+A focused warm-read benchmark (20 x `cat` of an 8 MB file - 40 960 block
+accesses - minus a spawn-only control) came out **1.90 s on both arms**: no
+measurable read-path win at all.
+
+**Why the prediction was wrong.** The design text above assumed the block memcpy
+was a visible share of `seq_read`. It is not. `Filesystem::read_at` re-resolves
+the *path* on every `read(2)` - `src/syscall/fs.rs` passes `&f.path`, so each
+call does a full `lookup_path_internal` directory walk plus `read_inode`, and
+allocates a temp buffer of up to 64 KB. At ~46 us per 4 KB block accessed, that
+per-syscall work dominates; the 4 KB copy D-4 removes is roughly 1 us of it. The
+gain shows up only on `build tree`, which is metadata-access-dense (every create
+walks the inode table via `read_range` and the indirects via `get_block_num`)
+rather than syscall-dominated.
+
+D-4 stays: it is strictly less work, and it removes a 4 KB alloc/free per block
+access - heap-churn relief the allocator's spinlock feels under SMP even where
+wall-clock cannot see it. But **the next real read lever is per-fd inode
+caching, not the block cache**: resolve the path once at `open(2)` and let
+`read(2)` use `read_at_by_inode` (which the mmap/exec fault path already does)
+instead of re-walking the tree on every call.
 
 Not done:
 
-- **D-4 — zero-copy reads: NOT IMPLEMENTED.** `read_block` still does
-  `data.to_vec()` on every cache hit (`ext2.rs`, the `cache.get` arm), so each
-  hit costs one heap allocation plus a full block copy. The decision text says
-  "`read_block` stops cloning on hit (borrow guard)"; nothing in the shipped
-  code does that. This is the largest remaining *cheap* win now that device I/O
-  is mostly gone — with reads served from RAM, the memcpy is a visible share of
-  what `seq_read`'s remaining 43 ms actually is. Blocked on giving callers a
-  borrow that outlives the cache lock, which is why it was skipped.
-- **D-9 — per-box/mount scoping of the file page cache.** Deliberately not
   bundled. Still the fix for **F-1** above (the global page cache keys on inode
   number alone, so two independent ext2 mounts share a keyspace) — a latent
   correctness bug, not tidiness.
@@ -265,6 +305,10 @@ Not done:
   restarts are thinly exercised; the `extreme` arms are host-invisible.
 
 ## Background
+
+Defects found and fixed while finishing this work (build-profile traps, the
+stale-`akuma.bin` A/B corruption, the guest-shell blocker, and D-4's wrong
+premise): [`EXT2_WRITEBACK_FOLLOWUP_FIXES.md`](EXT2_WRITEBACK_FOLLOWUP_FIXES.md).
 
 Spawned from the ext2 performance line of work:
 [`EXT2_PERFORMANCE_AUDIT.md`] (prior audit and its ratio-measurement flaw),
