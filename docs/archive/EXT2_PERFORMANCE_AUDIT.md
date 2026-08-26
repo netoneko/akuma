@@ -8,8 +8,11 @@ for the full write-up. Four fixes landed the same day (deferred superblock/BGD
 metadata, skipped redundant zero-fill, incremental directory writes killing the
 O(N²), deferred bitmap writes): 2 MB write 5.7× → 3.6× amplification, create
 11.3 → 9.0 device writes/file, flat-directory cost O(N²) → O(1). Real-kernel
-A/B confirms −7…−25% wall-clock, no regressions. A proper write-back block
-cache for data/inode blocks is still pending.**
+A/B confirms the improvement, no regressions. Against the same workload on real
+Linux ext2 (Docker), Akuma-patched is still ~15–1300× slower than a `-o sync`
+mount (the achievable target) — worst op `seq_read`-after-write, 183 ms vs
+0.14 ms. A proper write-back block cache for data/inode blocks is the biggest
+pending win.**
 
 Recorded 2026-08-25, triggered by a report of "fs performance looks like
 shit" after running `rm -rf /tmp/akuma` on a live `devbox-smoltcp` guest.
@@ -273,13 +276,24 @@ build −16%. Wall-clock A/B on this host is noisy (create spanned 2.4–3.6 s
 unpatched); the deterministic device-I/O counts are the reliable number, the
 wall-clock confirms direction.
 
-Reference — same workload on real Linux ext2 in Docker (`ext2probe-stdfs`,
-median of 3): mounted `-o sync` (Akuma's own durability model) create ~71 ms /
-seq_write ~64 ms / delete ~5 ms / mass-delete ~95 ms; mounted default (writeback)
-everything ≤10 ms. So Akuma-patched is ~15–220× slower than `-o sync` Linux ext2
-(the achievable target) and ~2000–3000× slower than writeback Linux. The worst
-single op is `seq_read` right after a write (183 ms vs 0.12 ms) — pure
-write-invalidate cold cache.
+Reference — the same workload on real Linux ext2, `ext2probe-stdfs` in a Docker
+`--privileged` container against a loop-mounted 256 MB ext2 image, median of 3,
+BEFORE pass:
+
+| op | Linux `-o sync` | Linux default | Akuma patched | vs `-o sync` |
+|---|---:|---:|---:|---:|
+| create 300 × 4 KB | 71 ms | 1.1 ms | 1966 ms | ~28× |
+| seq_write 2 MB | 65 ms | 0.35 ms | 978 ms | ~15× |
+| seq_read 2 MB (after write) | 0.14 ms | 0.14 ms | 183 ms | **~1300×** |
+| delete 300 | 5.4 ms | 0.4 ms | 1171 ms | ~220× |
+| build 3200-file tree | 1.06 s | 11 ms | 21.5 s | ~20× |
+| mass-delete 3200 | 96 ms (33k files/s) | 3.9 ms | 12.4 s (~250 files/s) | ~130× |
+
+So Akuma-patched is **~15–1300× slower than `-o sync` Linux ext2** (durable every
+op — the achievable target) and **~1800–3200× slower than writeback Linux** (an
+inherent gap: no page cache, no async flush, synchronous busy-polled virtio).
+The worst single op is `seq_read` right after a write (183 ms vs 0.14 ms) — pure
+write-invalidate cold cache, and exactly what a write-back block cache fixes.
 
 Still pending: a proper write-back block cache for data + inode blocks
 (read-after-write is still cold — the biggest remaining win); bitmap-scan cursor;

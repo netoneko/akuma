@@ -420,31 +420,42 @@ less contended A/B of Fix A+B alone showed seq_write −25%, mass-delete −13%.
 
 ### Reference: the same workload on real Linux ext2
 
-`ext2probe-stdfs` (the shared workload over `std::fs`) in a Docker container,
-same 300 files / 2 MB / 3200-file-tree shapes, median of 3, BEFORE pass:
+`ext2probe-stdfs` (the shared `workload::*` over `std::fs`) run in a Docker
+`--privileged` container against a loop-mounted 256 MB ext2 image — same 300
+files / 2 MB / 3200-file-tree shapes, median of 3, BEFORE pass. Two mount modes:
+`-o sync` (durable on every syscall — Akuma's own model) and default (writeback).
 
-| op | Linux ext2, `-o sync` | Linux ext2, default | **Akuma (patched)** |
-|---|---:|---:|---:|
-| create 300 × 4 KB | ~71 ms | ~1.0 ms | 1966 ms |
-| seq_write 2 MB | ~64 ms | ~0.34 ms | 978 ms |
-| seq_read 2 MB | ~0.12 ms | ~0.13 ms | 183 ms |
-| delete 300 | ~5.3 ms | ~0.4 ms | 1171 ms |
-| build 3200-file tree | ~1.0 s | ~10 ms | 21.5 s |
-| mass-delete 3200 | ~95 ms (33k files/s) | ~3.9 ms (820k files/s) | 12.4 s (~250 files/s) |
+| op | Linux ext2 `-o sync` | Linux ext2 default | **Akuma patched** | Akuma vs `-o sync` |
+|---|---:|---:|---:|---:|
+| create 300 × 4 KB | 71 ms | 1.1 ms | 1966 ms | **~28×** |
+| seq_write 2 MB | 65 ms | 0.35 ms | 978 ms | **~15×** |
+| seq_read 2 MB (after write) | 0.14 ms | 0.14 ms | 183 ms | **~1300×** |
+| delete 300 | 5.4 ms | 0.4 ms | 1171 ms | **~220×** |
+| build 3200-file tree | 1.06 s | 11 ms | 21.5 s | **~20×** |
+| mass-delete 3200 | 96 ms (33k files/s) | 3.9 ms (820k files/s) | 12.4 s (~250 files/s) | **~130×** |
+
+(The container's own overlay/ext4 root — a third data point — matches the
+default-writeback column: create ~1.8 ms, tree build ~18 ms.)
 
 Two gaps:
 
-- **vs default (writeback) Linux ext2: ~2000–3000×.** Inherent — a real OS
-  batches every dirty page and flushes async, and serves reads from the page
-  cache. Akuma has neither and every write is a synchronous busy-polled virtqueue
-  round-trip.
-- **vs `-o sync` Linux ext2 (durable every op, Akuma's own model): ~15–220×**,
-  and *this* is the achievable target. Even fully synchronous, Linux still
-  coalesces metadata within a `write()`, has a buffer cache for reads, and lets
-  the block layer queue/merge. Akuma's remaining gap is (a) no write-back block
-  cache → `seq_read` after a write is fully cold (183 ms vs 0.12 ms — the worst
-  single ratio, and the one a write-back cache fixes outright), (b) data + inode
-  blocks still write-through one at a time, (c) the virtio sector-RMW.
+- **vs default (writeback) Linux ext2: ~1800–3200×** across every op. Inherent —
+  a real OS batches every dirty page and flushes asynchronously, and serves reads
+  from the page cache. Akuma has neither, and every write is a synchronous
+  busy-polled virtqueue round-trip.
+- **vs `-o sync` Linux ext2 (durable every op, the same guarantee Akuma gives):
+  ~15–1300×**, and *this* is the achievable target. Even fully synchronous, Linux
+  still coalesces the dirty inode/bitmap within one `write()`, keeps a buffer
+  cache for reads, and lets the block layer queue and merge requests. Akuma's
+  remaining gap is:
+  - **`seq_read` after a write: ~1300× (183 ms vs 0.14 ms)** — pure
+    write-invalidate cold cache. A write-back block cache fixes this outright and
+    is the single highest-value pending change.
+  - **`delete`: ~220×** — Linux `-o sync` unlinks 300 files in 5 ms; Akuma does
+    ~8 synchronous device writes per unlink.
+  - `create` / `seq_write` (~15–28×) are the closest — Fixes A–D already brought
+    these down; the residue is data + inode blocks still written through one at a
+    time, plus the virtio sector-RMW.
 
 ### Root causes, and status
 
