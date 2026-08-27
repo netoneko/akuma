@@ -618,6 +618,9 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
 }
 
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
+    // Outer span for `read-profile` (ZST otherwise): started before the pid
+    // lookup and counter bumps below, so `hs - sr` names this prologue/epilogue.
+    let rp_span = crate::read_profile::Span::new();
     CURRENT_SYSCALL_NR.store(syscall_num, Ordering::Relaxed);
 
     akuma_exec::threading::set_thread_current_syscall(syscall_num);
@@ -1140,6 +1143,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     }
 
     CURRENT_SYSCALL_NR.store(!0u64, Ordering::Relaxed);
+    rp_span.end_handle_syscall();
     result
 }
 

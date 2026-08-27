@@ -260,6 +260,10 @@ const fn makedev(major: u64, minor: u64) -> u64 {
 }
 
 pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
+    // Per-stage fixed-cost attribution (`read-profile`; ZST otherwise). Created
+    // before the first line of real work and committed only on the `File` arm —
+    // see `crate::read_profile`.
+    let mut rec = crate::read_profile::Rec::new();
     if !validate_user_ptr(buf_ptr, count) {
         if crate::config::SYSCALL_DEBUG_PIPE_READ {
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
@@ -274,6 +278,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         return EFAULT;
     }
+    rec.lap(crate::read_profile::S_VALIDATE);
     // Deliberately scoped: `current_process_shared()` hands out `&'static Process`, but
     // that lifetime is not one the process table can honour across a blocking park. The
     // RETIRED + `PROCESS_RECLAIM_COOLDOWN_US` scheme bounds a *lookup-then-use* span of
@@ -293,6 +298,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         };
         (proc.pid, fd)
     };
+    rec.lap(crate::read_profile::S_FD);
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
         crate::safe_print!(128, "[syscall] read(stdin, count={})\n", count);
@@ -514,23 +520,30 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             // THIS arm on purpose: the Stdin arm parks in `schedule_blocking` while taking
             // non-IRQ-masked terminal-state locks, which this carve-out has not audited.
             let _vfs_bkl = VfsBklGuard::new();
+            rec.lap(crate::read_profile::S_BKL);
             let limit = 64 * 1024;
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
+            rec.lap(crate::read_profile::S_ALLOC);
 
-            match crate::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), f.position, &mut temp) {
+            let read_result = crate::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), f.position, &mut temp);
+            rec.lap(crate::read_profile::S_FS);
+            match read_result {
                 Ok(n) => {
                     if n > 0 {
                         if copy_to_user(buf_ptr, &temp[..n]).is_err() {
                             return EFAULT;
                         }
+                        rec.lap(crate::read_profile::S_COPY);
                         if let Some(proc) = akuma_exec::process::current_process_shared() {
                             proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
                         }
+                        rec.lap(crate::read_profile::S_POS);
                     }
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                         crate::safe_print!(256, "[syscall] read(fd={}, file={}, pos={}, req={}) = {}\n", fd_num, &f.path, f.position, to_read, n);
                     }
+                    rec.commit(to_read);
                     n as u64
                 }
                 Err(e) => fs_error_to_errno(e)

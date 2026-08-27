@@ -500,7 +500,15 @@ Two gaps:
     per-fd inode caching removed the per-read directory walk, and widening the
     user-copy loop from one byte per iteration to 64 removed the per-byte cost
     (`docs/archive/USER_COPY_BYTE_LOOP.md`). Now **5 ms, ~36×**. What is left is
-    *per-syscall fixed cost* (~17 µs × 256 reads ≈ 4.4 ms of the 5), not bytes.
+    *per-syscall* cost, not bytes — but **not 17 µs of it**, as this line used to
+    say. Measured from inside the kernel, a warm 8 KB `read(2)` excursion is
+    ~2.4 µs and a 4 KB one ~2.0 µs, of which `copy_to_user` is 133 ns and ext2
+    itself 882 ns; the ~17 µs was inferred from wall time, never measured, and
+    most of that wall time is not in `read(2)` at all. The dominant term is the
+    syscall **round trip** — an Akuma `read(2)` that moves zero bytes costs
+    5.1 µs against Linux's 137 ns on the same silicon with the same binary. Full
+    per-stage table and the Linux comparison:
+    `docs/archive/EXT2_READ_PATH_STAGE_PROFILE.md`.
   - **`delete`: ~150×** — Linux `-o sync` unlinks 300 files in 5 ms; Akuma still
     does ~7 synchronous device *writes* per unlink.
   - `create` / `seq_write` (~10–20×) are the closest. The residue is the ~8

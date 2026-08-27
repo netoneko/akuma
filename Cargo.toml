@@ -352,6 +352,19 @@ bkl-profile = []
 # Parsed by scripts/benchmarks/bench_nic_rtt.py.
 net-profile = ["akuma-net/net-profile"]
 
+# Per-stage `read(2)` fixed-cost attribution (measurement builds only — never
+# ship it). Makes `sys_read`'s `File` arm, `handle_syscall` and the EL0 handler
+# time themselves and print a `[READPROF]` line every 1024 file reads: which
+# part of the ~17 us that a warm 8 KB read costs is validation, fd lookup, the
+# staging allocation, ext2, the user copy, or the two wrappers around them.
+# The BKL profiler answers "which syscall held the lock" and `net-profile`
+# answers "how long was the device busy"; neither can split a single syscall.
+# Costs two CNTVCT reads per stage on the read path and is single-core only
+# (the wrapper spans are handed up by one flag) — run it with `SMP=1`:
+#   cargo build --release --features read-profile
+# Read `cal=` before believing any stage: it is the cost of the measurement.
+read-profile = []
+
 # Static RX/TX frame rings and a non-blocking transmit path in the virtio-net
 # device (`crates/akuma-net/src/virtio_rings.rs`). NOT in `default` — opt-in.
 #

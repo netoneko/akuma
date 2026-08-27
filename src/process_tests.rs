@@ -3072,12 +3072,23 @@ fn test_procfs_box_isolation() {
     let fs = ProcFilesystem::new();
     let tid = akuma_exec::threading::current_thread_id();
     let mut fails = 0u32;
+    let mut cases = 0u32;
     let mut check = |what: &str, got: bool, want: bool| {
+        cases += 1;
         if got != want {
             fails += 1;
             crate::safe_print!(96, "[Test] procfs isolation {} FAILED got={}\n", what, got);
         }
     };
+    // `<pid>/syscalls` only exists when the per-syscall log is compiled in
+    // (`src/vfs/proc.rs` gates `read_at`/`metadata` on this flag, and
+    // `syscall::log::record` above is a no-op without it). The negative cases
+    // below hold either way — a file that does not exist is one a box cannot
+    // read — but the POSITIVE ones assert a facility the flag removes, so they
+    // must not run when it is off. Turning `PROC_SYSCALL_LOG_ENABLED` off is a
+    // supported configuration (`kernel_profile_extreme` forces it), and without
+    // this gate it fails three cases here and panics the boot.
+    let log_on = crate::config::PROC_SYSCALL_LOG_ENABLED;
 
     // --- As the boxed process: the host's process must be invisible. ---
     register_thread_pid(tid, boxed_pid);
@@ -3100,7 +3111,9 @@ fn test_procfs_box_isolation() {
     // assertion above passes because procfs answers nothing.
     let own_syscalls = format!("{boxed_pid}/syscalls");
     check("box sees own pid dir", fs.exists(&format!("{boxed_pid}")), true);
-    check("box reads own syscalls", fs.read_at(&own_syscalls, 0, &mut buf).is_ok(), true);
+    if log_on {
+        check("box reads own syscalls", fs.read_at(&own_syscalls, 0, &mut buf).is_ok(), true);
+    }
     let own_listed = fs.read_dir("").map(|e| e.iter().any(|d| d.name == format!("{boxed_pid}"))).unwrap_or(false);
     check("box lists own pid in /proc", own_listed, true);
 
@@ -3108,17 +3121,19 @@ fn test_procfs_box_isolation() {
     unregister_thread_pid(tid);
     register_thread_pid(tid, host_pid);
     check("host sees boxed pid dir", fs.exists(&format!("{boxed_pid}")), true);
-    check("host reads boxed syscalls", fs.read_at(&own_syscalls, 0, &mut buf).is_ok(), true);
-    check("host sees own syscalls", fs.read_at(&host_syscalls, 0, &mut buf).is_ok(), true);
+    if log_on {
+        check("host reads boxed syscalls", fs.read_at(&own_syscalls, 0, &mut buf).is_ok(), true);
+        check("host sees own syscalls", fs.read_at(&host_syscalls, 0, &mut buf).is_ok(), true);
+    }
 
     unregister_thread_pid(tid);
     unregister_process(host_pid);
     unregister_process(boxed_pid);
 
     if fails == 0 {
-        crate::safe_print!(128, "[Test] procfs_box_isolation PASSED (13 cases)\n");
+        crate::safe_print!(128, "[Test] procfs_box_isolation PASSED ({} cases)\n", cases);
     } else {
-        crate::safe_print!(96, "[Test] procfs_box_isolation FAILED ({} of 13 cases)\n", fails);
+        crate::safe_print!(96, "[Test] procfs_box_isolation FAILED ({} of {} cases)\n", fails, cases);
         panic!("test_procfs_box_isolation: {fails} of 13 cases failed");
     }
 }
@@ -4207,10 +4222,33 @@ fn test_fchmodat() {
     }
 }
 
-/// The `fs-cache` block cache must turn a second read of the same file into cache
-/// hits (no disk re-read) — the whole point of keeping the toolchain resident
+/// The `fs-cache` block cache must serve reads of a resident file without
+/// touching the device — the whole point of keeping the toolchain resident
 /// across the many spawns in a self-host build. Writes a multi-block temp file,
-/// reads it twice, and asserts the second pass is served entirely from cache.
+/// reads it twice, and asserts both passes are pure cache hits.
+///
+/// # Why "cold pass" is gone
+///
+/// This test used to require the FIRST read after the write to miss
+/// (`cold_misses > 0`), because `write_block` was write-through and dropped the
+/// block it had just written. Since f0edc4e0 it is **write-back**: the write
+/// leaves the block resident and dirty, and the device write is deferred to
+/// `flush_meta`/`sync`/eviction. So a just-written file needs no read-back at
+/// all, and the old assertion was demanding the disk read that change exists to
+/// remove — it failed on every boot of this branch.
+///
+/// The replacement is not a weakening. `cold_misses == 0` is a *stronger*
+/// statement than `cold_misses > 0` was: it fails if `write_block` ever
+/// regresses to write-through, which the old form could not detect, while
+/// `warm_misses == 0` still covers the original re-read property. Both were
+/// confirmed by flipping `write_block` back to write-through in place, which
+/// turns this test red again.
+///
+/// There is deliberately no coverage here of "a device read populates the
+/// cache". Forcing a genuinely cold block would need a cache-drop API that does
+/// not exist (`CACHE_CAP_BYTES` is read only when the cache is constructed), and
+/// inventing one purely to keep this assertion alive is not worth a new public
+/// entry point into the cache.
 #[cfg(feature = "fs-cache")]
 fn test_fs_cache_warm_reread_hits() {
     const PATH: &str = "/tmp/fs_cache_selftest.bin";
@@ -4224,22 +4262,28 @@ fn test_fs_cache_warm_reread_hits() {
 
     let mut buf = alloc::vec![0u8; LEN];
 
-    // Pass 1: cold — populates the cache (write-through invalidated the blocks).
-    let (_, m0) = akuma_ext2::cache_stats();
+    // Pass 1: the blocks are already resident and dirty from the write-back
+    // above, so this must be all hits — no read-back of what we just wrote.
+    let (h0, m0) = akuma_ext2::cache_stats();
     let _ = crate::fs::read_at(PATH, 0, &mut buf);
     let (h1, m1) = akuma_ext2::cache_stats();
 
-    // Pass 2: warm — every block should now be a hit, zero new misses.
+    // Pass 2: re-read the same blocks — still all hits, no fresh disk reads.
     let _ = crate::fs::read_at(PATH, 0, &mut buf);
     let (h2, m2) = akuma_ext2::cache_stats();
 
-    let cold_misses = m1.saturating_sub(m0);
+    let first_hits = h1.saturating_sub(h0);
+    let first_misses = m1.saturating_sub(m0);
     let warm_hits = h2.saturating_sub(h1);
     let warm_misses = m2.saturating_sub(m1);
 
-    // The cold pass must have read blocks from disk; the warm pass must be all
-    // hits with no fresh disk reads.
-    let data_ok = cold_misses > 0 && warm_hits >= cold_misses && warm_misses == 0;
+    // Both passes must be served entirely from cache: hits on every block and
+    // not one device read. `first_misses == 0` is the write-back assertion,
+    // `warm_misses == 0` the re-read one.
+    let data_ok = first_hits > 0
+        && first_misses == 0
+        && warm_hits >= first_hits
+        && warm_misses == 0;
 
     // Metadata caching (inode table + BGD blocks): a repeated path resolution must
     // also be served entirely from cache — proves read_inode/read_bgd now ride the
@@ -4256,12 +4300,12 @@ fn test_fs_cache_warm_reread_hits() {
 
     if data_ok && meta_ok {
         crate::safe_print!(224,
-            "[Test] fs_cache_warm_reread_hits PASSED (data: cold_miss={} warm_hit={} warm_miss={}; meta: hit={} miss={})\n",
-            cold_misses, warm_hits, warm_misses, meta_hits, meta_misses);
+            "[Test] fs_cache_warm_reread_hits PASSED (data: first={}h/{}m warm={}h/{}m; meta: hit={} miss={})\n",
+            first_hits, first_misses, warm_hits, warm_misses, meta_hits, meta_misses);
     } else {
         crate::safe_print!(224,
-            "[Test] fs_cache_warm_reread_hits FAILED: data_ok={} (cold_miss={} warm_hit={} warm_miss={}) meta_ok={} (hit={} miss={})\n",
-            data_ok, cold_misses, warm_hits, warm_misses, meta_ok, meta_hits, meta_misses);
+            "[Test] fs_cache_warm_reread_hits FAILED: data_ok={} (first={}h/{}m warm={}h/{}m) meta_ok={} (hit={} miss={})\n",
+            data_ok, first_hits, first_misses, warm_hits, warm_misses, meta_ok, meta_hits, meta_misses);
     }
 }
 

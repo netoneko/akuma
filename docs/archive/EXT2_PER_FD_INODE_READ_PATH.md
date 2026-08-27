@@ -252,7 +252,10 @@ boot.
   page cache ([`FPCACHE_MOUNT_IDENTITY.md`](FPCACHE_MOUNT_IDENTITY.md)).
   **Measured: no wall-clock effect.** Six runs per arm, every range overlapping,
   the two 1 KB cases moving in opposite directions — removing two heap
-  allocations per read is invisible at ~17 us of per-read fixed cost. The change
+  allocations per read is invisible at ~17 us of per-read fixed cost. (That
+  17 us figure was later measured and is wrong — a warm read excursion is
+  ~2 us; see `EXT2_READ_PATH_STAGE_PROFILE.md`. The conclusion here survives
+  it: the allocations are still a minority of the syscall.) The change
   is a correctness fix that happens to do strictly less work, and the allocation
   thesis behind it did not survive measurement. See "Known gaps" in
   [`USER_COPY_BYTE_LOOP.md`](USER_COPY_BYTE_LOOP.md) § Result for what the fixed

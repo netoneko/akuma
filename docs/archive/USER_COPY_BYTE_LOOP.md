@@ -1,5 +1,13 @@
 # The user-copy byte loop, and what it costs (2026-08-27)
 
+> **Superseded in one part (2026-08-27, same day).** The measurement of the
+> change itself stands. The closing section's "**~17 µs of fixed cost per
+> `read(2)`**" does not — it was inferred from wall time, not measured, and a
+> direct per-stage measurement puts a warm 8 KB `read(2)` excursion at ~2.4 µs.
+> The forward-looking list it hands off is reordered accordingly by
+> [`EXT2_READ_PATH_STAGE_PROFILE.md`](EXT2_READ_PATH_STAGE_PROFILE.md). Text
+> below is unchanged.
+
 Status: **history — implemented 2026-08-27.** Written up as an investigation
 first, then landed; the plan below is what shipped, and § "Result" records the
 measurement against it. Kept separate from the ext2 docs because the finding was

@@ -21,3 +21,6 @@ logs_*.txt
 akuma_*.bin
 akuma_*.elf
 akuma-fc.bin
+
+# Built probe binaries (scripts/probes/*.c are the sources)
+scripts/probes/read_syscall_cost
