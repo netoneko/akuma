@@ -197,6 +197,7 @@ pub fn run_all_tests() {
     // `PreemptGuard` must actually disable preemption. Cheap, no spawning, and it
     // catches a failure mode that is otherwise invisible — see the fn doc.
     test_preempt_guard_is_live();
+    test_identity_lazy_restamp();
 
     // Real (shared-kernel) SMP M0: confirm every secondary the DTB reported came up
     // on the shared kernel. Runs FIRST so it is observed even if a later, unrelated
@@ -19457,6 +19458,113 @@ fn test_pmm_heap_lock_order_smp() {
         "[Test] pmm_heap_lock_order_smp {}\n",
         if pass { "PASSED" } else { "FAILED" }
     );
+}
+
+/// The identity cache's lazy re-stamp: a stamped-but-unresolved entry must
+/// repair itself on the next lookup, and an entry that can never resolve must
+/// stop paying for table scans.
+///
+/// Before 2026-08-28 `identity_store_locked` ran exactly once per thread, at
+/// `thread_pid_map_insert`. If that insert beat `register_process` the entry was
+/// stamped `INVALID_SLOT` and stayed that way for the thread's whole life, so
+/// every syscall on it took the lock + map walk + table scan the identity cache
+/// exists to remove. Measured at a sub-1% hit rate under thread churn —
+/// docs/archive/IDENTITY_CACHE_LAZY_RESTAMP.md.
+///
+/// The bound is as load-bearing as the repair: without it an entry whose pid
+/// never registers would trade one permanent slow path for a permanent table
+/// scan, which is strictly worse than what was there before.
+fn test_identity_lazy_restamp() {
+    use akuma_exec::process::table::{self, test_hooks as ih};
+    use core::sync::atomic::Ordering;
+
+    let tid = akuma_exec::threading::current_thread_id();
+    // The suite runs on a kernel thread, before userspace exists: it has no pid
+    // of its own and there is no process in the table to borrow. Both earlier
+    // shapes of this test SKIPped on every boot for those two reasons, so it
+    // registers its own process — pid picked clear of the 77xx block the
+    // at-syscall tests use.
+    const TEST_PID: u32 = 7801;
+    akuma_exec::process::register_process(TEST_PID, make_test_process(TEST_PID));
+    let live_pid = TEST_PID;
+
+    let repairs0 = table::IDENTITY_REPAIRS.load(Ordering::Relaxed);
+    let failed0 = table::IDENTITY_REPAIR_FAILED.load(Ordering::Relaxed);
+
+    // (1) Repairable: a real, registered pid stamped with no slot. The next
+    // lookup must resolve it and leave a usable cache entry behind.
+    ih::stamp_unresolved(tid, live_pid);
+    let (_, slot_before, _) = ih::state(tid);
+    let stamped_unresolved = slot_before == ih::INVALID_SLOT_FOR_TEST;
+
+    let resolved = table::current_thread_own_process().map(|(p, _)| p);
+    let (_, slot_after, attempts_after) = ih::state(tid);
+    let repaired = resolved == Some(live_pid)
+        && slot_after != ih::INVALID_SLOT_FOR_TEST
+        && attempts_after == 0
+        && table::IDENTITY_REPAIRS.load(Ordering::Relaxed) == repairs0 + 1;
+
+    // (2) Unrepairable and bounded: a pid no process has. PIDs are small and
+    // monotonic, so this one cannot collide with a live process.
+    const GHOST_PID: u32 = 0x7F00_0001;
+    ih::stamp_unresolved(tid, GHOST_PID);
+    let budget = ih::max_repair_attempts();
+    // One extra call beyond the budget: the last one must NOT scan again.
+    for _ in 0..(budget as usize + 3) {
+        let _ = table::current_thread_own_process();
+    }
+    let (_, ghost_slot, ghost_attempts) = ih::state(tid);
+    let failed_delta = table::IDENTITY_REPAIR_FAILED.load(Ordering::Relaxed) - failed0;
+    let bounded = ghost_slot == ih::INVALID_SLOT_FOR_TEST
+        && ghost_attempts == budget
+        && failed_delta == u64::from(budget);
+
+    // (2b) The half-resolvable case, and the one that actually shipped a hang:
+    // a CLONE_THREAD sibling whose OWN pid resolves but whose group leader has
+    // exited. If the repair budget resets on the own half alone, every syscall
+    // prologue — which asks for the TGID half — repairs, resets and repairs
+    // again forever, at two table scans a time. That timed `pthread_kill_eintr`
+    // out at SMP=1 (420 s against an `ok` baseline) while SMP=4 stayed green.
+    const ORPHAN_PID: u32 = 7802;
+    const ABSENT_LEADER: u32 = 7803; // deliberately never registered
+    let mut orphan = make_test_process(ORPHAN_PID);
+    orphan.tgid = ABSENT_LEADER;
+    akuma_exec::process::register_process(ORPHAN_PID, orphan);
+    ih::stamp_unresolved(tid, ORPHAN_PID);
+    for _ in 0..(budget as usize + 3) {
+        let _ = table::current_thread_tgid_process();
+    }
+    let (_, _, orphan_attempts) = ih::state(tid);
+    // The own half must still be usable — only the unresolvable half gives up.
+    let own_still_hits = table::current_thread_own_process().map(|(p, _)| p) == Some(ORPHAN_PID);
+    let half_bounded = orphan_attempts == budget && own_still_hits;
+    akuma_exec::process::unregister_process(ORPHAN_PID);
+
+    // (3) A cleared entry is unrepairable by construction: `identity_clear_locked`
+    // zeroes the pid, so the repair path never sees it. This is what stops the
+    // repair from resurrecting an identity `thread_pid_map_remove` revoked.
+    ih::clear(tid);
+    let (cleared_pid, cleared_slot, _) = ih::state(tid);
+    let cleared_is_unstamped =
+        cleared_pid == 0 && cleared_slot == ih::INVALID_SLOT_FOR_TEST;
+
+    // Put the thread back the way we found it. This runs on a kernel thread, so
+    // "as we found it" is NO identity — binding it to `live_pid` would leave the
+    // suite's own thread impersonating some process for every later test.
+    ih::clear(tid);
+    let (restored_pid, restored_slot, _) = ih::state(tid);
+    let restored = restored_pid == 0 && restored_slot == ih::INVALID_SLOT_FOR_TEST;
+
+    akuma_exec::process::unregister_process(TEST_PID);
+
+    if stamped_unresolved && repaired && bounded && half_bounded && cleared_is_unstamped && restored {
+        console::print("[Test] identity_lazy_restamp PASSED\n");
+    } else {
+        crate::safe_print!(240,
+            "[Test] identity_lazy_restamp FAILED: stamped={} repaired={} bounded={} half_bounded={} cleared_unstamped={} restored={} (attempts={} failed_delta={} orphan_attempts={} budget={})\n",
+            stamped_unresolved, repaired, bounded, half_bounded, cleared_is_unstamped, restored,
+            ghost_attempts, failed_delta, orphan_attempts, budget);
+    }
 }
 
 /// Kernel stack overflow must be *reported*, not silent.

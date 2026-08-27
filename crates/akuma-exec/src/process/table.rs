@@ -543,7 +543,31 @@ pub struct ThreadIdentity {
     tgid: AtomicU32,
     tgid_slot: AtomicU16,
     tgid_ptr: AtomicPtr<Process>,
+    /// Failed lazy re-stamps for this entry, bounded by [`MAX_REPAIR_ATTEMPTS`].
+    ///
+    /// The stamp is written once, at `thread_pid_map_insert`. If the map insert
+    /// raced ahead of `register_process` the pid does not resolve to a slot yet
+    /// and the entry is stamped `INVALID_SLOT` — which used to be **permanent**,
+    /// so that thread took the lock + map walk + table scan on every syscall for
+    /// the rest of its life. Measured 2026-08-28 at a sub-1% hit rate under
+    /// thread churn (`docs/archive/IDENTITY_CACHE_LAZY_RESTAMP.md`).
+    ///
+    /// `identity_get` now repairs such an entry on the miss, and this counter is
+    /// what keeps an entry that will *never* resolve (its process died before
+    /// registering) from paying a table scan per syscall forever. Reset to 0 on
+    /// every successful stamp and on clear.
+    repair_attempts: AtomicU8,
 }
+
+/// How many times a miss may pay a table scan trying to re-resolve before the
+/// entry is left on the slow path for good.
+///
+/// The repairable population is threads whose `register_process` had not landed
+/// at map-insert time, and that lands within microseconds — so the first attempt
+/// after it does succeeds and every later syscall on that thread is a hit. A
+/// handful of attempts covers that with room to spare; the bound exists only to
+/// cap the unresolvable case, not to tune the common one.
+const MAX_REPAIR_ATTEMPTS: u8 = 4;
 
 const INVALID_SLOT: u16 = u16::MAX;
 
@@ -556,6 +580,7 @@ impl ThreadIdentity {
             tgid: AtomicU32::new(0),
             tgid_slot: AtomicU16::new(INVALID_SLOT),
             tgid_ptr: AtomicPtr::new(core::ptr::null_mut()),
+            repair_attempts: AtomicU8::new(0),
         }
     }
 }
@@ -596,8 +621,17 @@ pub static EPILOGUE_IDENTITY_MOVED: AtomicU64 = AtomicU64::new(0);
 /// - `UNSTAMPED` — the entry was never written (`own_pid == 0`): a kernel/idle
 ///   thread, or a user thread resolving before `thread_pid_map_insert` lands.
 ///   Expected; costs only the slow path.
-/// - `CLEARED` — the entry *was* stamped and is now invalid. A genuine cache
-///   loss: the thread had an identity and lost it.
+/// - `CLEARED` — a pid is stamped but it does not resolve to a live slot, and
+///   the bounded lazy re-stamp did not fix it. **Its meaning narrowed on
+///   2026-08-28.** It used to also cover entries invalidated by
+///   `thread_pid_map_remove`, which stored `INVALID_SLOT` while leaving
+///   `own_pid` set — so a thread that had simply been torn down, and one that
+///   never resolved at all, landed in the same bucket. That is why this counter
+///   read 556M against 164 UNSTAMPED in the measurement that prompted the fix:
+///   it was not reporting cache loss, it was reporting a permanently
+///   unresolved stamp. `identity_clear_locked` now zeroes the pids, so a
+///   cleared entry reads as UNSTAMPED and this counter means only what its
+///   description says.
 /// - `INACTIVE` — cached slot is no longer ACTIVE (retired/free). This is the
 ///   guard that makes a retired process fall back correctly.
 /// - `NULL` — cached pointer is null.
@@ -605,6 +639,18 @@ pub static IDENTITY_FB_UNSTAMPED: AtomicU64 = AtomicU64::new(0);
 pub static IDENTITY_FB_CLEARED: AtomicU64 = AtomicU64::new(0);
 pub static IDENTITY_FB_INACTIVE: AtomicU64 = AtomicU64::new(0);
 pub static IDENTITY_FB_NULL: AtomicU64 = AtomicU64::new(0);
+
+/// Misses that the lazy re-stamp turned back into a live cache entry, and misses
+/// where the re-scan still could not resolve the pid.
+///
+/// `repairs` is the whole point of the fix: each one converts a thread that
+/// would have taken the slow path for the rest of its life into a cache hit
+/// from that syscall on, so this counts *threads rescued*, not work done.
+/// `repair_failed` is the bounded waste — at most [`MAX_REPAIR_ATTEMPTS`] table
+/// scans per entry — and a large value means processes are dying before they
+/// register, which is a different bug than this one.
+pub static IDENTITY_REPAIRS: AtomicU64 = AtomicU64::new(0);
+pub static IDENTITY_REPAIR_FAILED: AtomicU64 = AtomicU64::new(0);
 
 /// Successful cache resolutions — the denominator without which the miss counts
 /// above cannot be turned into a hit rate. Only counted while [`IDENTITY_STATS`]
@@ -670,6 +716,31 @@ fn identity_store_locked(tid: usize, pid: Pid) {
     e.tgid.store(tgid, Ordering::Relaxed);
     e.tgid_slot.store(tgid_slot, Ordering::Relaxed);
     e.tgid_ptr.store(tgid_ptr, Ordering::Release);
+    // Fresh budget only when BOTH halves resolved. The bound in `identity_get`
+    // is unreachable otherwise, and it has now been got wrong twice in the same
+    // way, so the reasoning is worth spelling out:
+    //
+    //   * Resetting unconditionally means each failed repair zeroes the counter
+    //     it is about to increment. The entry sits at 1 attempt forever and
+    //     re-scans the whole table on every syscall — the permanent-scan
+    //     regression the bound exists to prevent. Caught by the boot test:
+    //     `attempts=1 failed_delta=7 budget=4`.
+    //   * Resetting on `own_slot` alone has the same effect for a thread whose
+    //     OWN half resolves and whose TGID half does not — a `CLONE_THREAD`
+    //     sibling whose group leader has exited, which is a *normal* state, not
+    //     an exotic one. Every `current_thread_tgid_process()` (i.e. every
+    //     syscall prologue) then repaired, reset, and repaired again, at TWO
+    //     table scans a time since `identity_store_locked` makes a second pass
+    //     for the tgid half. Caught by `pthread_kill_eintr` timing out at
+    //     SMP=1 — 420 s against an `ok` baseline, reproduced 2/2, while SMP=4
+    //     stayed green because the other cores absorbed the scans.
+    //
+    // A half that cannot resolve must be allowed to exhaust the budget and stop.
+    // The other half is unaffected: once `own_slot` is valid, `identity_get`
+    // hits on it and never reaches the repair path at all.
+    if own_slot != INVALID_SLOT && tgid_slot != INVALID_SLOT {
+        e.repair_attempts.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Invalidate `tid`'s cached identity. Caller must hold IRQs masked.
@@ -682,6 +753,17 @@ fn identity_clear_locked(tid: usize) {
     e.own_ptr.store(core::ptr::null_mut(), Ordering::Release);
     e.tgid_slot.store(INVALID_SLOT, Ordering::Relaxed);
     e.tgid_ptr.store(core::ptr::null_mut(), Ordering::Release);
+    // The pids go too, and that is load-bearing rather than tidiness: this is
+    // the DELIBERATE invalidation (`thread_pid_map_remove`), and `identity_get`
+    // decides whether a miss may be lazily re-stamped by asking whether a pid is
+    // still stamped. Leaving `own_pid` set would let the repair path resolve the
+    // process again and hand back an identity this call just revoked — undoing
+    // the only sanctioned invalidation in the cache. Zeroing makes a cleared
+    // entry read as UNSTAMPED, which is both unrepairable and the honest
+    // description: this thread has no identity, rather than a lost one.
+    e.own_pid.store(0, Ordering::Relaxed);
+    e.tgid.store(0, Ordering::Relaxed);
+    e.repair_attempts.store(0, Ordering::Relaxed);
 }
 
 /// Publish `tid` → `pid` in `THREAD_PID_MAP` **and** refresh the identity
@@ -715,20 +797,51 @@ fn identity_get(own: bool) -> Option<(Pid, &'static Process)> {
         return None;
     }
     let e = &THREAD_IDENTITY[tid];
-    let slot = if own { e.own_slot.load(Ordering::Acquire) } else { e.tgid_slot.load(Ordering::Acquire) };
+    let mut slot = if own { e.own_slot.load(Ordering::Acquire) } else { e.tgid_slot.load(Ordering::Acquire) };
     if slot == INVALID_SLOT {
-        IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
         // Split the miss by cause: a thread that never had an identity (kernel
-        // /idle thread, or a user thread resolving before its map entry lands)
-        // is expected and harmless, whereas an entry that *was* stamped and is
-        // now invalid is a real cache loss. Lumping the two together is what
-        // made the raw `IDENTITY_FALLBACKS` total unreadable as a health check.
-        if e.own_pid.load(Ordering::Relaxed) == 0 {
+        // /idle thread) or one whose entry was deliberately cleared reads as
+        // UNSTAMPED and is left alone. An entry that carries a pid but no slot
+        // is the repairable class — `identity_store_locked` ran before
+        // `register_process` and stamped the invalid marker.
+        let stamped_pid = e.own_pid.load(Ordering::Relaxed);
+        if stamped_pid == 0 {
+            IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
             IDENTITY_FB_UNSTAMPED.fetch_add(1, Ordering::Relaxed);
-        } else {
-            IDENTITY_FB_CLEARED.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
-        return None;
+
+        // Lazy re-stamp. Before this existed the marker was permanent and the
+        // thread paid the slow path for the rest of its life; measured at a
+        // sub-1% hit rate under thread churn, ~10M fallbacks/s
+        // (docs/archive/IDENTITY_CACHE_LAZY_RESTAMP.md). The repair is bounded
+        // so an entry that can never resolve does not trade one permanent slow
+        // path for a permanent table scan, which would be strictly worse.
+        //
+        // IRQs are masked only for the scan, which is what
+        // `identity_store_locked` documents as its precondition. Nesting is
+        // fine (`IrqGuard` saves and restores DAIF) and nothing here takes
+        // `THREAD_PID_MAP`, so this cannot deadlock against the insert path
+        // that calls the same function with the lock held.
+        if e.repair_attempts.load(Ordering::Relaxed) >= MAX_REPAIR_ATTEMPTS {
+            IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            IDENTITY_FB_CLEARED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        with_irqs_disabled(|| identity_store_locked(tid, stamped_pid));
+        slot = if own { e.own_slot.load(Ordering::Acquire) } else { e.tgid_slot.load(Ordering::Acquire) };
+        if slot == INVALID_SLOT {
+            // Still unresolvable. `identity_store_locked` reset the budget on
+            // its way out (it resets unconditionally), so charge the attempt
+            // AFTER it, or the bound never bites and this becomes the per-
+            // syscall table scan it exists to prevent.
+            e.repair_attempts.fetch_add(1, Ordering::Relaxed);
+            IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            IDENTITY_FB_CLEARED.fetch_add(1, Ordering::Relaxed);
+            IDENTITY_REPAIR_FAILED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        IDENTITY_REPAIRS.fetch_add(1, Ordering::Relaxed);
     }
     let slot = slot as usize;
     if slot >= MAX_PROCESSES || SLOT_STATES[slot].load(Ordering::Relaxed) != slot_state::ACTIVE {
@@ -750,6 +863,58 @@ fn identity_get(own: bool) -> Option<(Pid, &'static Process)> {
     }
     let pid = if own { e.own_pid.load(Ordering::Relaxed) } else { e.tgid.load(Ordering::Relaxed) };
     Some((pid, unsafe { &*ptr }))
+}
+
+/// Test hooks for the lazy re-stamp (`process_tests::test_identity_lazy_restamp`).
+///
+/// The repair only fires on an entry that carries a pid but no slot, and that
+/// state is produced by a race (`thread_pid_map_insert` landing before
+/// `register_process`) which a boot test cannot schedule. These let a test put
+/// an entry into it deliberately, and read back what the repair did.
+pub mod test_hooks {
+    use super::*;
+
+    /// Force `tid`'s entry into the repairable state: pid stamped, slot invalid,
+    /// repair budget full. This is exactly what `identity_store_locked` leaves
+    /// behind when it cannot resolve `pid`.
+    pub fn stamp_unresolved(tid: usize, pid: Pid) {
+        if tid >= MAX_THREADS {
+            return;
+        }
+        let e = &THREAD_IDENTITY[tid];
+        e.own_pid.store(pid, Ordering::Relaxed);
+        e.own_slot.store(INVALID_SLOT, Ordering::Relaxed);
+        e.own_ptr.store(core::ptr::null_mut(), Ordering::Release);
+        e.tgid.store(pid, Ordering::Relaxed);
+        e.tgid_slot.store(INVALID_SLOT, Ordering::Relaxed);
+        e.tgid_ptr.store(core::ptr::null_mut(), Ordering::Release);
+        e.repair_attempts.store(0, Ordering::Relaxed);
+    }
+
+    /// `(own_pid, own_slot, repair_attempts)` — enough to tell a repaired entry
+    /// from one that gave up.
+    pub fn state(tid: usize) -> (Pid, u16, u8) {
+        if tid >= MAX_THREADS {
+            return (0, INVALID_SLOT, 0);
+        }
+        let e = &THREAD_IDENTITY[tid];
+        (
+            e.own_pid.load(Ordering::Relaxed),
+            e.own_slot.load(Ordering::Relaxed),
+            e.repair_attempts.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Restore an entry to "no identity", the state a kernel thread sits in.
+    pub fn clear(tid: usize) {
+        with_irqs_disabled(|| identity_clear_locked(tid));
+    }
+
+    pub fn max_repair_attempts() -> u8 {
+        MAX_REPAIR_ATTEMPTS
+    }
+
+    pub const INVALID_SLOT_FOR_TEST: u16 = INVALID_SLOT;
 }
 
 /// The current thread's **tgid** and its thread-group leader's `Process` —

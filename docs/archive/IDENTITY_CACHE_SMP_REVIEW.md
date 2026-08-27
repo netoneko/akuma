@@ -8,6 +8,21 @@ trusting SMP=4 numbers."*
 **Status:** two defects found **by inspection**, not by reproduction. See
 §"What the soak actually proves" before treating a green run as a clearance.
 
+> **Update 2026-08-28 — measured.** Finding A did **not** fire under thread-churn
+> load at SMP=4 (`epi_stale=0 epi_moved=0` throughout), so it is rare rather than
+> cleared. The same run turned up a separate, larger, *performance* defect the
+> counters had never been read for: **the identity cache runs at under 1 % hit
+> rate under thread churn** — ~556 M slow-path fallbacks — because the stamp is
+> one-shot and the miss path never repairs. Full data and mechanism:
+> §"Measured 2026-08-28". Fix Findings A/B for safety; fix that one for the
+> 410 ns → 150 ns win, which is currently absent under multithreaded load.
+>
+> **That one is now FIXED** — lazy re-stamp, hit rate 0.11 % → 99.999 % on the
+> same load: [`IDENTITY_CACHE_LAZY_RESTAMP.md`](IDENTITY_CACHE_LAZY_RESTAMP.md).
+> It raises the stakes on **Finding B**: with the cache actually hitting, the
+> recycled-slot window is reached far more often than it was, because before the
+> fix almost every resolution took the slow path that re-validates.
+
 ## Summary
 
 The syscall audit (`c2a0e630`) took `getpid` from 410 ns to 150 ns by replacing
@@ -204,6 +219,101 @@ observe ACTIVE paired with a stale stamp. The cache stamps the generation on
 write and re-checks it on read. One extra load, no `Process` deref (so
 `read_current_pid`, which only wants the pid scalar, stays off the `Process`
 cache line).
+
+## Measured 2026-08-28: Finding A did not fire, and something else did
+
+`IDENTITY_AUDIT` flipped to `true`, `cargo build --release`, booted `SMP=4
+MEMORY=2048` on `66cb5268`, then driven with 6 rounds of `bssfork 20 8 1` +
+`forkprobe` + `pthread_kill_eintr` + `stackstress` alongside
+`forktest_parent -duration=45s` — thread-group churn plus the open-ended
+dispatches (`ppoll`/futex/blocking `read`) Finding A needs.
+
+### Finding A: not reproduced
+
+```
+[IDENT] epi_stale=0 epi_moved=0 audit=1
+```
+
+Zero on every heartbeat, through the whole load and after it. **This is not a
+clearance.** The window is real by construction and the audit only samples the
+excursions that actually happened; what the run establishes is that it is *rare*
+under this workload, not that it is closed. Read it as "do not fix this first",
+not "there is nothing here".
+
+### What the same counters did show: the cache is ~0 % hit under thread churn
+
+The fallback counters are **not** gated on `IDENTITY_AUDIT` and had never been
+read under load. Same run, `[IDENT] hits=… miss=… cleared=…`:
+
+| phase | hits | miss / cleared |
+|---|---|---|
+| early boot | 264,574 | 6,817 |
+| during load | 617,271 | 63,872,533 |
+| after load, **idle, 4 consecutive heartbeats** | 1.33M → 2.41M, climbing | **556,569,997 — frozen, identical all four** |
+
+Two readings, and the second is the finding:
+
+1. **At idle the cache is perfect.** `miss` does not move at all across four
+   30 s heartbeats while `hits` climbs steadily. Nothing is wrong with the cache
+   in steady state.
+2. **Under thread churn it collapses.** ~556 M misses accumulated during the
+   load window against ~2.4 M lifetime hits — a hit rate under 1 %, at roughly
+   10 M slow-path resolutions per second. The lock + map walk + IRQ-masked table
+   scan that `c2a0e630` deleted from the fast path is running at that rate
+   instead. **The 410 ns → 150 ns win is absent from exactly the multithreaded
+   workload it was built for.**
+
+Present on the shipping config too (`audit=0`), just smaller because the gate's
+boot is not thread-heavy: `verify_smp4.log` shows `cleared` climbing 42,450 →
+67,978 → 110,597 across three heartbeats, and `verify_smp1.log` the same shape.
+So this is not an artifact of turning the audit on, and not new with the
+`akuma-syscalls-linux` extraction — it moved `const`s and `repr(C)` types only.
+
+### Mechanism: the stamp is one-shot and the miss path never repairs
+
+`identity_store_locked` is called from exactly one place,
+`thread_pid_map_insert`, at thread-map insert time. `identity_get`'s miss arm
+increments a counter and returns `None` — **it never re-stamps.** So an entry
+that is `INVALID_SLOT` once is `INVALID_SLOT` for the rest of that tid's life,
+and every syscall on that thread takes the slow path forever.
+
+The way in is documented and dismissed, in `identity_store_locked`'s own header:
+
+> An unresolvable pid (insert raced ahead of `register_process`) stores the
+> invalid marker: fast paths miss, slow paths answer, **nothing is wrong**.
+
+Nothing is wrong *for correctness*. But the marker is permanent, so losing that
+race once at thread creation disables the cache for that thread permanently —
+and under thread churn a large fraction of new threads lose it.
+`thread_pid_map_insert`'s own doc already names the failure mode ("or none, so
+the thread runs on the slow path forever"); it just attributes it to callers
+bypassing the wrapper, when the sanctioned wrapper reaches it too.
+
+**The counter naming hides this.** `own_pid` is stored even when slot resolution
+failed, and the miss arm classifies on `own_pid != 0`, so a thread that *never
+resolved* is counted as `cleared` — "had an identity and lost it" — rather than
+`unstamped`. That is why `unstamped` sits at 164 while `cleared` reads 556 M.
+The classification is also indifferent to which half was asked for: a miss on
+the **tgid** half (what the syscall prologue uses) is classified by looking at
+`own_pid`.
+
+### What to do with this
+
+**Done — see [`IDENTITY_CACHE_LAZY_RESTAMP.md`](IDENTITY_CACHE_LAZY_RESTAMP.md).**
+The fix is a bounded lazy re-stamp on the miss; this section is the measurement
+it was judged against, and the numbers below are the "before" arm.
+
+The original sketch, kept because the reasoning still applies: The shape of a fix is a **lazy re-stamp on miss**: `identity_get`
+cannot scan the table itself (it runs unmasked on the fast path), but the miss
+arm can mark the entry for repair, or the slow path that answers the miss can
+re-run `identity_store_locked`. Either way the cost lands only on the miss, and
+the win is bounded by the same `read_syscall_cost` measurement the dispatch work
+uses — **measure before and after**, because a repair that runs a table scan per
+miss can be worse than the miss.
+
+Sequencing note: this is a *performance* defect and Findings A and B are
+*safety* ones. They are independent — this one is about entries that resolve to
+nothing, those are about entries that resolve to something freed.
 
 ## The soak harness was broken in four independent ways
 

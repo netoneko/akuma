@@ -1880,6 +1880,12 @@ fn run_async_main() -> ! {
                     table::EPILOGUE_STALE_IDENTITY.load(Ordering::Relaxed),
                     table::EPILOGUE_IDENTITY_MOVED.load(Ordering::Relaxed),
                     u8::from(crate::config::IDENTITY_AUDIT));
+                // Lazy re-stamp (docs/archive/IDENTITY_CACHE_LAZY_RESTAMP.md).
+                // `repairs` counts threads rescued from a permanent slow path;
+                // `repair_failed` is the bounded waste and should stay near 0.
+                crate::safe_print!(96, "[IDENT] repairs={} repair_failed={}\n",
+                    table::IDENTITY_REPAIRS.load(Ordering::Relaxed),
+                    table::IDENTITY_REPAIR_FAILED.load(Ordering::Relaxed));
             }
             // Per-core exception-vector entry counts (docs/archive/PAGE_TABLE_UAF_BKL_STORM.md):
             // a core stuck in the unreachable-vector storm never gets past the vector's own
