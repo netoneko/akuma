@@ -143,8 +143,10 @@ count 0 (cache bytes == device bytes after every flush).
 4. Clippy per-crate + `--release` + `extreme-size`; kernel builds.
    — **DONE**, see below
 5. Only then: QEMU boot, live functional check (nested dirs, 50-file
-   content verify, rename, rm -rf), real-kernel A/B. — **DONE (A/B)**, see
-   below; the standalone functional check is still owed.
+   content verify, rename, rm -rf), real-kernel A/B. — **DONE**, both halves:
+   the A/B below, and the functional pass recorded in
+   [`EXT2_WRITEBACK_FOLLOWUP_FIXES.md`](EXT2_WRITEBACK_FOLLOWUP_FIXES.md)
+   § Verification performed.
 
 ### Host-test results (2026-08-26, after implementation)
 
@@ -304,15 +306,12 @@ mmap, which is `SELFHOST_ZERO_PAGE_HUNT.md` §14 reached by a second route.
 
 Not done:
 
+- **D-9 — per-box/mount scoping of the file page cache**, which this work never
   bundled. Still the fix for **F-1** above (the global page cache keys on inode
   number alone, so two independent ext2 mounts share a keyspace) — a latent
   correctness bug, not tidiness.
 - **D-10 — the `DataCache` proposal was never written.** `proposals/` has no
   such document. Until it exists, the mmap-vs-read double-cache seam stands.
-- **Verification ladder step 5's functional half.** The real-kernel A/B ran, but
-  the standalone live functional check it is paired with (nested dirs, 50-file
-  content verify, rename, `rm -rf`) has not been run against the write-back
-  kernel as a deliberate pass.
 - **Host-test coverage gaps** (unchanged from the step-1 note): the fixture is a
   single-group image, so `is_alloc_meta`'s BGD span and cross-group cursor
   restarts are thinly exercised; the `extreme` arms are host-invisible.

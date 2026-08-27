@@ -34,6 +34,14 @@ __arch_copy_user_memory:  ldrb w3,[x1],#1 / strb w3,[x0],#1 / subs x2,x2,#1 / b.
 __arch_copy_user_fault:   mov x0, #14 ; ret          // 14 = EFAULT
 ```
 
+> **The byte width is not load-bearing, and it is expensive.** Measured
+> 2026-08-27 at ~16x the per-byte cost of an in-kernel `memcpy` on the same
+> machine — the dominant term in a warm `read(2)`. The recovery mechanism below
+> is width-independent, so widening it is open;
+> [`USER_COPY_BYTE_LOOP.md`](USER_COPY_BYTE_LOOP.md) has the measurements, the
+> plan, and the one sharp edge (the trampoline `ret`s through `x30`, so a
+> replacement must stay a leaf, stackless function).
+
 The Rust wrapper registers the trampoline as the thread's user-copy fault handler,
 runs the loop, clears the handler. Recovery happens through the exception vector:
 on an unmapped page the loop takes an EL1 data abort, and `src/exceptions.rs`
