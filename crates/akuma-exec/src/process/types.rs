@@ -325,24 +325,15 @@ impl KernelFile {
     }
 }
 
-/// File open flags (Linux compatible)
-pub mod open_flags {
-    pub const O_RDONLY: u32 = 0;
-    pub const O_WRONLY: u32 = 1;
-    pub const O_RDWR: u32 = 2;
-    pub const O_CREAT: u32 = 0o100;
-    pub const O_TRUNC: u32 = 0o1000;
-    pub const O_APPEND: u32 = 0o2000;
-    pub const O_CLOEXEC: u32 = 0o2000000;
-    /// `__O_TMPFILE | O_DIRECTORY` in the **arm64** encoding — arm64 keeps the
-    /// 32-bit ARM fcntl values (`O_DIRECTORY = 0o40000`), *not* the asm-generic
-    /// ones x86/riscv use (`0o200000`); this is what musl, glibc and Go all
-    /// pass on this target. The kernel does not implement tmpfiles;
-    /// `sys_openat` rejects the flag so portable callers (apk-tools 3's atomic
-    /// writes) take their `.tmp` + `renameat` fallback instead of writing into
-    /// a directory fd.
-    pub const O_TMPFILE: u32 = 0o20040000;
-}
+/// File open flags (Linux compatible).
+///
+/// The definitions moved to `akuma_syscalls_linux::flags::open` on 2026-08-27.
+/// They were declared here, in the process/exec crate, which put the *file
+/// open* ABI in a crate that has nothing to do with it — and left the two bits
+/// this module never had (`O_NONBLOCK`, `O_DIRECTORY`) to be redeclared
+/// locally in `src/syscall/fs.rs` and `src/syscall/pidfd.rs`, at two different
+/// widths. This alias keeps every `open_flags::O_*` call site unchanged.
+pub use akuma_syscalls_linux::flags::open as open_flags;
 
 /// Source of data for a lazy region page.
 #[derive(Clone)]

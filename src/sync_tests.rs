@@ -111,12 +111,13 @@ fn test_futex_unaligned_addr() {
 ");
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
+// The fourth of the five `struct timespec` definitions this tree carried,
+// collapsed into `akuma-syscalls-linux` on 2026-08-27.
+// `test_clock_gettime_struct_layout` below stays a boot test even though the
+// same layout is now a `const _` assertion and a host test in that crate: it is
+// the only one of the three that checks the type the *running kernel* was
+// compiled with.
+use akuma_syscalls_linux::Timespec;
 
 /// FUTEX_WAIT with a 10 ms timeout must return ETIMEDOUT.
 fn test_futex_timeout() {

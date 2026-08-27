@@ -1,0 +1,10 @@
+[package]
+name = "akuma-syscalls-linux"
+version = "0.1.0"
+edition = "2024"
+description = "The Linux/aarch64 syscall ABI: numbers, repr(C) wire structs and their layout assertions, and the flag tables. Pure data — no kernel state, no effects, no I/O."
+
+[lints]
+workspace = true
+
+[dependencies]

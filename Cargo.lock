@@ -17,6 +17,7 @@ dependencies = [
  "akuma-pmm",
  "akuma-primitives",
  "akuma-rump",
+ "akuma-syscalls-linux",
  "akuma-terminal",
  "akuma-time",
  "akuma-timer",
@@ -42,6 +43,7 @@ dependencies = [
  "akuma-isolation",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-syscalls-linux",
  "akuma-terminal",
  "elf",
  "embedded-io-async",
@@ -122,6 +124,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-syscalls-linux"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-terminal"
 version = "0.1.0"
 dependencies = [
@@ -134,6 +140,7 @@ version = "0.1.0"
 dependencies = [
  "akuma-exec",
  "akuma-primitives",
+ "akuma-syscalls-linux",
  "akuma-timer",
  "log",
 ]

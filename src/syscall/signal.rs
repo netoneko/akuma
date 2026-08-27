@@ -1,32 +1,11 @@
 use super::*;
 
-const SIG_DFL: usize = 0;
-const SIG_IGN: usize = 1;
-
-/// `stack_t`. Was declared identically inside both arms of `sys_sigaltstack`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct StackT { sp: u64, flags: i32, _pad: i32, size: u64 }
-
-/// The `siginfo_t` prefix `rt_sigtimedwait` fills. 128 bytes, matching Linux.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Siginfo { si_signo: i32, si_errno: i32, si_code: i32, _pad: [i32; 29] }
-
-// The two sizes the copies used to state as literals (`STACK_T_SIZE`, `128`) are now
-// taken from the types, so pin the layouts instead of the lengths: a field added to
-// either struct is a compile error rather than a silently short copy to userspace.
-const _: () = assert!(core::mem::size_of::<StackT>() == 24, "stack_t is 24 bytes on aarch64");
-const _: () = assert!(core::mem::size_of::<Siginfo>() == 128, "siginfo_t is 128 bytes on aarch64");
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct KernelSigaction {
-    sa_handler: usize,
-    sa_flags: u64,
-    sa_restorer: usize,
-    sa_mask: u64,
-}
+// `stack_t` (declared identically inside both arms of `sys_sigaltstack`), the
+// `siginfo_t` prefix `rt_sigtimedwait` fills, and the kernel's `struct
+// sigaction` moved to `akuma-syscalls-linux` on 2026-08-27, taking their
+// layout assertions with them. `StackT`/`Siginfo`/`KernelSigaction` arrive
+// through `use super::*`; only the two handler sentinels are named here.
+use akuma_syscalls_linux::signal::{SIG_DFL, SIG_IGN};
 
 pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigsetsize: usize) -> u64 {
     if sig == 0 || sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }
@@ -107,9 +86,7 @@ pub fn signal_is_fatal_default(sig: u32) -> bool {
 /// oldset: pointer to store old signal mask
 /// sigsetsize: size of signal set (must be 8)
 pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigsetsize: usize) -> u64 {
-    const SIG_BLOCK: u32 = 0;
-    const SIG_UNBLOCK: u32 = 1;
-    const SIG_SETMASK: u32 = 2;
+    use akuma_syscalls_linux::signal::sigmask_how::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
 
     if sigsetsize != 8 {
         return EINVAL;

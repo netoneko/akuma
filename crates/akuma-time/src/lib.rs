@@ -33,13 +33,19 @@ pub mod sntp;
 use akuma_exec::mmu::user_access::{copy_to_user, read_user_into, write_user_val};
 use akuma_exec::threading::MAX_THREADS;
 use akuma_primitives::errno::negated::{EFAULT, EINVAL};
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LocalTimespec {
-    tv_sec: u64,
-    tv_nsec: u64,
-}
+// The four `Local*` ABI structs this module used to declare — `LocalTimespec`,
+// `LocalTimeval`, `LocalItimerval`, `LocalTimex` — moved to
+// `akuma-syscalls-linux` on 2026-08-27. The `Local` in their names was the
+// problem, not a description: this crate *is* the timespec syscalls, and it
+// spelled `struct timespec` a second time only because the bin crate's
+// definition was unreachable from a library crate.
+//
+// The two time structs are signed there (Linux's `time_t`/`long` both are);
+// they were unsigned here. That difference is real — the sleep and settime
+// paths below do unsigned saturating arithmetic on the raw bits — so those
+// sites keep doing exactly that, now through the explicit `bits()`/`from_bits()`
+// reinterpretation rather than through a struct definition that hid it.
+use akuma_syscalls_linux::{Itimerval, Timespec, Timeval, Timex};
 
 // ---------------------------------------------------------------------------
 // ITIMER_REAL / alarm() support
@@ -51,55 +57,6 @@ struct LocalTimespec {
 // register — see docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md for the bug
 // that motivated moving this out of a syscall-module-local static.
 // ---------------------------------------------------------------------------
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LocalTimeval {
-    tv_sec: u64,
-    tv_usec: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LocalItimerval {
-    it_interval: LocalTimeval,
-    it_value: LocalTimeval,
-}
-
-/// aarch64 Linux `struct timex` (`<linux/timex.h>`), 208 bytes. Every `long`
-/// field is 8 bytes on this ABI, which is why `modes`/`status`/`shift` each
-/// need explicit 4-byte padding to keep the following `i64` 8-byte aligned —
-/// get this wrong and every field after the first padding gap silently reads
-/// the wrong bytes.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LocalTimex {
-    modes: u32,
-    _pad0: u32,
-    offset: i64,
-    freq: i64,
-    maxerror: i64,
-    esterror: i64,
-    status: i32,
-    _pad1: u32,
-    constant: i64,
-    precision: i64,
-    tolerance: i64,
-    time_sec: i64,
-    time_usec: i64,
-    tick: i64,
-    ppsfreq: i64,
-    jitter: i64,
-    shift: i32,
-    _pad2: u32,
-    stabil: i64,
-    jitcnt: i64,
-    calcnt: i64,
-    errcnt: i64,
-    stbcnt: i64,
-    tai: i32,
-    _reserved: [i32; 11],
-}
 
 /// Check and fire expired ITIMER_REAL timers. Called from the timer tick
 /// (`akuma_exec::alarms::on_timer_interrupt`). Sends SIGALRM (14) to each thread
@@ -193,30 +150,26 @@ pub fn sys_setitimer(which: u32, new_ptr: u64, old_ptr: u64) -> u64 {
         let (old_deadline, old_interval) = akuma_exec::threading::get_itimer(tid);
         let now = akuma_timer::uptime_us();
         let remaining = old_deadline.saturating_sub(now);
-        let old = LocalItimerval {
-            it_interval: LocalTimeval {
-                tv_sec: old_interval / 1_000_000,
-                tv_usec: old_interval % 1_000_000,
-            },
-            it_value: LocalTimeval {
-                tv_sec: remaining / 1_000_000,
-                tv_usec: remaining % 1_000_000,
-            },
+        let old = Itimerval {
+            it_interval: Timeval::from_bits(old_interval / 1_000_000, old_interval % 1_000_000),
+            it_value: Timeval::from_bits(remaining / 1_000_000, remaining % 1_000_000),
         };
         let _ = write_user_val(old_ptr, &old);
     }
 
     // Read and apply new timer state if requested
     if new_ptr != 0 {
-        let mut new_val = LocalItimerval::default();
+        let mut new_val = Itimerval::default();
         if read_user_into(&mut new_val, new_ptr).is_err() {
             return EFAULT;
         }
 
-        let interval_us =
-            new_val.it_interval.tv_sec.saturating_mul(1_000_000) + new_val.it_interval.tv_usec;
-        let value_us =
-            new_val.it_value.tv_sec.saturating_mul(1_000_000) + new_val.it_value.tv_usec;
+        // Unsigned arithmetic over the raw bits, which is what this path did
+        // when the struct itself was `u64` — see the `bits()` note at the top.
+        let (int_sec, int_usec) = new_val.it_interval.bits();
+        let (val_sec, val_usec) = new_val.it_value.bits();
+        let interval_us = int_sec.saturating_mul(1_000_000) + int_usec;
+        let value_us = val_sec.saturating_mul(1_000_000) + val_usec;
 
         let now = akuma_timer::uptime_us();
         if value_us > 0 {
@@ -269,7 +222,7 @@ pub fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
         ((us / 1_000_000), ((us % 1_000_000) * 1_000))
     };
 
-    let ts = LocalTimespec { tv_sec: sec, tv_nsec: nsec };
+    let ts = Timespec::from_bits(sec, nsec);
     if write_user_val(tp_ptr, &ts).is_err() {
         return EFAULT;
     }
@@ -287,11 +240,12 @@ pub fn sys_clock_settime(clock_id: u32, tp_ptr: u64) -> u64 {
     if clock_id != CLOCK_REALTIME {
         return EINVAL;
     }
-    let mut ts = LocalTimespec::default();
+    let mut ts = Timespec::default();
     if read_user_into(&mut ts, tp_ptr).is_err() {
         return EFAULT;
     }
-    let unix_epoch_us = ts.tv_sec.saturating_mul(1_000_000).saturating_add(ts.tv_nsec / 1_000);
+    let (sec, nsec) = ts.bits();
+    let unix_epoch_us = sec.saturating_mul(1_000_000).saturating_add(nsec / 1_000);
     akuma_timer::set_utc_time_us(unix_epoch_us, akuma_timer::uptime_us());
     0
 }
@@ -323,7 +277,7 @@ pub fn sys_clock_adjtime(clock_id: u32, buf_ptr: u64) -> u64 {
     if clock_id != CLOCK_REALTIME {
         return EINVAL;
     }
-    let mut tx = LocalTimex::default();
+    let mut tx = Timex::default();
     if read_user_into(&mut tx, buf_ptr).is_err() {
         return EFAULT;
     }
@@ -380,7 +334,7 @@ fn step_utc_by(delta_us: i64) {
 pub fn sys_clock_getres(clock_id: u32, res_ptr: usize) -> u64 {
     let _ = clock_id;
     if res_ptr != 0 {
-        let ts = LocalTimespec { tv_sec: 0, tv_nsec: 1 };
+        let ts = Timespec { tv_sec: 0, tv_nsec: 1 };
         let _ = write_user_val(res_ptr as u64, &ts);
     }
     0
@@ -392,9 +346,9 @@ pub fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
     // - Linux/musl: a0 = pointer to struct timespec {tv_sec, tv_nsec}
     // - libakuma:   a0 = seconds (raw), a1 = nanoseconds (raw)
     // Distinguish by checking if a0 looks like a user-space pointer (>= PAGE_SIZE).
-    let mut ts = LocalTimespec::default();
+    let mut ts = Timespec::default();
     let (sec, nsec) = if a0 >= 4096 && read_user_into(&mut ts, a0).is_ok() {
-        (ts.tv_sec, ts.tv_nsec)
+        ts.bits()
     } else {
         (a0, a1)
     };
@@ -431,11 +385,12 @@ pub fn sys_clock_nanosleep(clock_id: u32, flags: i32, request_ptr: u64, remain_p
     const TIMER_ABSTIME: i32 = 1;
     let _ = remain_ptr; // Linux only fills this on an interrupted *relative* sleep; sys_nanosleep doesn't either.
 
-    let mut ts = LocalTimespec::default();
+    let mut ts = Timespec::default();
     if read_user_into(&mut ts, request_ptr).is_err() {
         return EFAULT;
     }
-    let req_us = (ts.tv_sec.saturating_mul(1_000_000)).saturating_add(ts.tv_nsec / 1_000);
+    let (sec, nsec) = ts.bits();
+    let req_us = (sec.saturating_mul(1_000_000)).saturating_add(nsec / 1_000);
 
     let deadline = if flags & TIMER_ABSTIME != 0 {
         // Absolute deadline in `clock_id`'s own time base. Mirrors `sys_clock_gettime`'s

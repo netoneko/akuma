@@ -33,25 +33,20 @@ static NEXT_EPOLL_ID: AtomicU32 = AtomicU32::new(1);
 #[cfg(feature = "sc-epoll")]
 static EPOLL_PWAIT_ZERO_ZERO_COUNT: AtomicU64 = AtomicU64::new(0);
 
-// EPOLLIN/OUT/ERR/HUP/RDHUP are generic poll-event bits shared by ppoll/pselect
-// and epoll_check_fd_readiness, so they stay regardless of sc-epoll. EPOLLET and
-// EPOLL_EVENT_MASK are only used by the epoll surface.
-const EPOLLIN: u32 = 0x001;
-const EPOLLOUT: u32 = 0x004;
-const EPOLLERR: u32 = 0x008;
-const EPOLLHUP: u32 = 0x010;
-const EPOLLRDHUP: u32 = 0x2000;
+// The bit values live in `akuma-syscalls-linux` (2026-08-27), unconditionally
+// — a bit is not feature-dependent. The `#[cfg]`s survive on the *imports*,
+// because `unused_imports` is `deny` here and a name nothing in this build
+// mentions is a hard error: EPOLLIN/OUT/ERR/HUP/RDHUP are generic poll-event
+// bits shared by ppoll/pselect and `epoll_check_fd_readiness`, so they stay
+// regardless of `sc-epoll`; the rest are only reachable from the epoll surface.
+use akuma_syscalls_linux::flags::epoll::{EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT};
+// Only the native-TCP readiness arm reads it, which a rump-only build omits.
+#[cfg(feature = "smoltcp")]
+use akuma_syscalls_linux::flags::epoll::EPOLLRDHUP;
 #[cfg(feature = "sc-epoll")]
-const EPOLLET: u32 = 1 << 31;
-#[cfg(feature = "sc-epoll")]
-const EPOLL_EVENT_MASK: u32 = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-
-#[cfg(feature = "sc-epoll")]
-const EPOLL_CTL_ADD: i32 = 1;
-#[cfg(feature = "sc-epoll")]
-const EPOLL_CTL_DEL: i32 = 2;
-#[cfg(feature = "sc-epoll")]
-const EPOLL_CTL_MOD: i32 = 3;
+use akuma_syscalls_linux::flags::epoll::{
+    EPOLLET, EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLL_EVENT_MASK,
+};
 const BLOCKING_POLL_INTERVAL_US: u64 = 10_000;
 
 /// Shorter per-iteration sleep ceiling when a polled fd is a rump socket.
@@ -164,24 +159,15 @@ fn fd_set_wants_rump_poll_interval(_readfds: &[u64], _writefds: &[u64], _nfds: u
 // loops drifted apart in the first place. Its `timeout == 0` sentinel is gone
 // too — that case is now the policy's inclusive `>=` expiring on lap one.
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
-
-// On ARM64, epoll_event is NOT packed (unlike x86_64).
-// Layout: events (4 bytes) + padding (4 bytes) + data (8 bytes) = 16 bytes total
+// `struct pollfd` and `struct epoll_event` moved to `akuma-syscalls-linux` on
+// 2026-08-27, with the "NOT packed on ARM64, unlike x86_64" note and a test
+// that proves the 16-byte stride. Re-exported so
+// `crate::syscall::poll::EpollEvent` (kernel tests) keeps its spelling — and no
+// longer behind `sc-epoll`, since `EpollEvent`'s *layout* does not depend on
+// whether this build dispatches `epoll_ctl`.
+pub use super::PollFd;
 #[cfg(feature = "sc-epoll")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct EpollEvent {
-    pub(crate) events: u32,
-    pub(crate) _pad: u32,  // ARM64 ABI padding
-    pub(crate) data: u64,
-}
+pub use super::EpollEvent;
 
 /// One line per epoll_pwait return. Suppresses most `timeout=0, nready=0` returns (see config).
 #[cfg(feature = "sc-epoll")]
@@ -353,9 +339,6 @@ pub fn epoll_on_fd_drained(fd: u32) {
 pub fn epoll_on_fd_write_blocked(fd: u32) {
     epoll_reset_edge(fd, EPOLLOUT);
 }
-
-#[cfg(feature = "sc-epoll")]
-const EPOLL_CLOEXEC: u32 = 0o2000000;
 
 #[cfg(feature = "sc-epoll")]
 pub fn sys_epoll_create1(flags: u32) -> u64 {

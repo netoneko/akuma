@@ -185,79 +185,15 @@ pub(super) fn resolve_path_at(dirfd: i32, raw_path: &str) -> String {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(super) struct IoVec {
-    pub(super) iov_base: u64,
-    pub(super) iov_len: usize,
-}
+// `struct iovec`, `struct stat`, `struct statx_timestamp`, `struct statx` and
+// `makedev` moved to `akuma-syscalls-linux` on 2026-08-27, along with the
+// offset assertions that used to sit right here — they are the same
+// assertions, checked by `cargo test` on the host instead of only by whatever
+// build happened to compile this file. Re-exported so
+// `crate::syscall::fs::Stat` (boot tests) and `super::fs::IoVec` (net.rs)
+// keep their spelling.
+pub use super::{IoVec, Stat, Statx, StatxTimestamp, makedev};
 
-#[repr(C)] #[derive(Clone, Copy, Default)] pub struct Stat { pub st_dev: u64, pub st_ino: u64, pub st_mode: u32, pub st_nlink: u32, pub st_uid: u32, pub st_gid: u32, pub st_rdev: u64, pub __pad1: u64, pub st_size: i64, pub st_blksize: i32, pub __pad2: i32, pub st_blocks: i64, pub st_atime: i64, pub st_atime_nsec: i64, pub st_mtime: i64, pub st_mtime_nsec: i64, pub st_ctime: i64, pub st_ctime_nsec: i64, pub __unused: [i32; 2] }
-
-/// `struct statx_timestamp` — 16 bytes, and the `__reserved` word is why it is not
-/// just a pair.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct StatxTimestamp {
-    pub tv_sec: i64,
-    pub tv_nsec: u32,
-    pub __reserved: i32,
-}
-
-/// `struct statx` (256 bytes), the `statx(2)` buffer.
-///
-/// `sys_statx` used to fill this with 20 `core::ptr::write(p.add(N).cast::<T>())` calls
-/// into a stack buffer, each offset a literal beside a comment naming the field —
-/// `UNSAFE_AUDIT.md` §4 P1's third block. The offsets are now the struct's, and the
-/// assertions below pin the ones the old comments claimed.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct Statx {
-    pub stx_mask: u32,
-    pub stx_blksize: u32,
-    pub stx_attributes: u64,
-    pub stx_nlink: u32,
-    pub stx_uid: u32,
-    pub stx_gid: u32,
-    pub stx_mode: u16,
-    pub __spare0: u16,
-    pub stx_ino: u64,
-    pub stx_size: u64,
-    pub stx_blocks: u64,
-    pub stx_attributes_mask: u64,
-    pub stx_atime: StatxTimestamp,
-    pub stx_btime: StatxTimestamp,
-    pub stx_ctime: StatxTimestamp,
-    pub stx_mtime: StatxTimestamp,
-    pub stx_rdev_major: u32,
-    pub stx_rdev_minor: u32,
-    pub stx_dev_major: u32,
-    pub stx_dev_minor: u32,
-    pub stx_mnt_id: u64,
-    pub stx_dio_mem_align: u32,
-    pub stx_dio_offset_align: u32,
-    pub __spare3: [u64; 12],
-}
-
-// The offsets `sys_statx` used to spell as literals. A layout change that moves any of
-// them is now a build failure rather than a userspace `stat` reading the wrong field.
-const _: () = assert!(core::mem::size_of::<Statx>() == 256);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_nlink) == 16);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_mode) == 28);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_ino) == 32);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_size) == 40);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_blocks) == 48);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_atime) == 64);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_btime) == 80);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_ctime) == 96);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_mtime) == 112);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_rdev_major) == 128);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_dev_major) == 136);
-const _: () = assert!(core::mem::offset_of!(Statx, stx_mnt_id) == 144);
-
-const fn makedev(major: u64, minor: u64) -> u64 {
-    (major << 8) | minor
-}
 
 pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // Per-stage fixed-cost attribution (`read-profile`; ZST otherwise). Created
@@ -1528,24 +1464,11 @@ fn fs_magic(name: &str) -> i64 {
 /// statistics (the old `fstatfs` returned hardcoded fiction for every fd —
 /// `docs/archive/MOUNT_MISSING_SYSCALLS.md` §3.2).
 pub(super) fn statfs_into(view: &crate::vfs::FsView, buf_ptr: u64) -> u64 {
-    if !validate_user_ptr(buf_ptr, 120) {
+    // The `120` was a literal beside a function-local struct nothing could
+    // check it against; it is `size_of::<Statfs>()` now, asserted in
+    // `akuma-syscalls-linux`.
+    if !validate_user_ptr(buf_ptr, core::mem::size_of::<Statfs>()) {
         return EFAULT;
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Statfs {
-        f_type: i64,
-        f_bsize: i64,
-        f_blocks: i64,
-        f_bfree: i64,
-        f_bavail: i64,
-        f_files: i64,
-        f_ffree: i64,
-        f_fsid: [i32; 2],
-        f_namelen: i64,
-        f_frsize: i64,
-        f_flags: i64,
-        f_spare: [i64; 4],
     }
     let bs = i64::from(view.stats.block_size);
     let st = Statfs {
@@ -1841,7 +1764,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         }
         if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Tap {
-                nonblock: flags & 0x800 != 0, // O_NONBLOCK
+                nonblock: flags & akuma_exec::process::open_flags::O_NONBLOCK != 0,
             });
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
@@ -2335,8 +2258,7 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
             return 0;
         }
 
-        const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
-        let follow = _flags & AT_SYMLINK_NOFOLLOW == 0;
+        let follow = _flags & akuma_syscalls_linux::flags::at::AT_SYMLINK_NOFOLLOW == 0;
 
         if !follow && crate::vfs::is_symlink(&resolved_path) {
             let target = crate::vfs::read_symlink(&resolved_path).unwrap_or_default();
@@ -2547,8 +2469,7 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
     let mut fd_inode: u32 = 0;
     let mut fd_mount: u32 = 0;
     let resolved_path = if path.is_empty() {
-        const AT_EMPTY_PATH: u32 = 0x1000;
-        if flags & AT_EMPTY_PATH != 0 && dirfd >= 0 {
+        if flags & akuma_syscalls_linux::flags::at::AT_EMPTY_PATH != 0 && dirfd >= 0 {
             if let Some(proc) = akuma_exec::process::current_process_shared() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                     fd_inode = f.inode();
@@ -2593,8 +2514,7 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
     // is interleaved with the fs work.
     let _vfs_bkl = VfsBklGuard::new();
 
-    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
-    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let follow = flags & akuma_syscalls_linux::flags::at::AT_SYMLINK_NOFOLLOW == 0;
 
     let (mode, ino, size, nlink, atime, mtime, ctime, rdev_major, rdev_minor) =
         // The second copy of `sys_newfstatat`'s device arms, now the same
@@ -2718,24 +2638,22 @@ pub(super) fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
 }
 
 pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
-    const F_DUPFD: u32 = 0;
-    const F_GETFD: u32 = 1;
-    const F_SETFD: u32 = 2;
-    const F_GETFL: u32 = 3;
-    const F_SETFL: u32 = 4;
-    // Advisory record locking — no-op stubs (we have no lock state)
-    const F_SETLK: u32 = 6;
-    const F_SETLKW: u32 = 7;
-    const F_GETLK: u32 = 5;
-    const F_DUPFD_CLOEXEC: u32 = 1030;
-    // SIGIO owner for a fd — paired with ioctl(FIOASYNC) (src/syscall/term.rs).
-    // No-op like the advisory locks below: Akuma delivers no SIGIO, but nginx's
-    // ngx_spawn_process treats a failing F_SETOWN as fatal before it ever calls
-    // fork(), so accepting it is what lets the worker process actually spawn.
-    const F_SETOWN: u32 = 8;
-    const F_GETOWN: u32 = 9;
-    const FD_CLOEXEC: u64 = 1;
-    const O_NONBLOCK: u64 = 0x800;
+    // The command table, and the two flag bits `fcntl` moves, from
+    // `akuma-syscalls-linux`. `F_SETLK`/`F_SETLKW`/`F_GETLK` are advisory
+    // record locking — no-op stubs, we have no lock state. `F_SETOWN`/
+    // `F_GETOWN` set the SIGIO owner for an fd, paired with `ioctl(FIOASYNC)`
+    // (src/syscall/term.rs); also a no-op, because Akuma delivers no SIGIO —
+    // but nginx's `ngx_spawn_process` treats a failing `F_SETOWN` as fatal
+    // before it ever calls fork(), so accepting it is what lets the worker
+    // process actually spawn.
+    use akuma_syscalls_linux::flags::fcntl::{
+        F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_GETOWN, F_SETFD, F_SETFL, F_SETLK,
+        F_SETLKW, F_SETOWN,
+    };
+    // `arg` and this function's return are the raw 64-bit syscall registers, so
+    // the two bits tested against them are widened once, here.
+    const FD_CLOEXEC: u64 = akuma_syscalls_linux::flags::fcntl::FD_CLOEXEC as u64;
+    const O_NONBLOCK: u64 = akuma_syscalls_linux::flags::open::O_NONBLOCK as u64;
 
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
 
@@ -2901,8 +2819,7 @@ pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
         }
     }
 
-    const AT_REMOVEDIR: u32 = 0x200;
-    if flags & AT_REMOVEDIR != 0 {
+    if flags & akuma_syscalls_linux::flags::at::AT_REMOVEDIR != 0 {
         match crate::fs::remove_dir(&resolved) {
             Ok(()) => 0,
             Err(e) => fs_error_to_errno(e),

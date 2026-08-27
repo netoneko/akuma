@@ -8777,10 +8777,10 @@ fn test_aio_stubs_valid_ctx_returns_zero() -> bool {
 fn test_map_shared_readonly_returns_success() -> bool {
     console::print("\n[TEST] MAP_SHARED warning suppression logic\n");
 
-    const MAP_ANONYMOUS: u32 = 0x20;
-    const MAP_SHARED: u32 = 0x01;
-    const PROT_READ: u32 = 0x1;
-    const PROT_WRITE: u32 = 0x2;
+    // From `akuma-syscalls-linux`, not restated locally: a test that redefines
+    // the bits it is testing cannot catch a wrong bit.
+    use akuma_syscalls_linux::flags::map::{MAP_ANONYMOUS, MAP_SHARED};
+    use akuma_syscalls_linux::flags::prot::{PROT_READ, PROT_WRITE};
 
     // Helper: does this combination trigger the writable MAP_SHARED warning?
     // Mirrors the exact condition in sys_mmap:

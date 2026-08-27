@@ -1,28 +1,21 @@
 use super::*;
 
-// Linux AIO ring buffer magic — glibc checks this to decide whether to read
-// events directly from the ring or fall back to the io_getevents syscall.
-const AIO_RING_MAGIC: u32 = 0xa10a10a1;
-const AIO_RING_HEADER_SIZE: u32 = 32; // sizeof(struct aio_ring)
-const AIO_RING_EVENT_SIZE: usize = 32; // sizeof(struct io_event)
+// Linux's `struct aio_ring` and its magic moved to `akuma-syscalls-linux` on
+// 2026-08-27. The two `32`s that used to be literals here — `sizeof(struct
+// aio_ring)` and `sizeof(struct io_event)` — come from there now; the first is
+// derived from the struct, so it cannot drift away from what this file writes
+// into the ring's own `header_length` field.
+//
+// The ctx_idp written by io_setup IS the VA of this ring — userspace reads it
+// directly via the shared-memory path in glibc's io_getevents wrapper.
+use akuma_syscalls_linux::io::{
+    AIO_RING_EVENT_SIZE, AIO_RING_HEADER_SIZE, AIO_RING_MAGIC, AioRingHeader,
+};
+
+// One page per ring is Akuma's sizing policy, not ABI, so it stays here.
 const PAGE_SIZE: usize = 4096;
 const AIO_MAX_NR_EVENTS: u32 =
     ((PAGE_SIZE - AIO_RING_HEADER_SIZE as usize) / AIO_RING_EVENT_SIZE) as u32; // 126
-
-// Layout of Linux's struct aio_ring (first 32 bytes of the mapped page).
-// The ctx_idp written by io_setup IS the VA of this ring — userspace reads it
-// directly via the shared-memory path in glibc's io_getevents wrapper.
-#[repr(C)]
-struct AioRingHeader {
-    id: u32,
-    nr: u32,
-    head: u32,
-    tail: u32,
-    magic: u32,
-    compat_features: u32,
-    incompat_features: u32,
-    header_length: u32,
-}
 
 struct AioContext {
     // ring_va is also used as the BTreeMap key (== ctx value written to user).

@@ -59,19 +59,16 @@ pub(super) type MmBklGuard = ToggledGuard<MmBkl>;
 // ── Linux mmap flag constants ────────────────────────────────────────────────
 //
 // Lifted from `sys_mmap` to module scope so the same bits are used by both
-// `sys_mmap` and the diagnostic helpers below. Values match Linux AArch64.
+// `sys_mmap` and the diagnostic helpers below; moved on from there to
+// `akuma-syscalls-linux` on 2026-08-27, which is where the "values match Linux
+// AArch64" claim is now actually checked. Re-exported so
+// `crate::syscall::mem::MAP_FIXED` (kernel tests) keeps its spelling.
 
-pub const MAP_SHARED: u32 = 0x01;
-pub const MAP_PRIVATE: u32 = 0x02;
-pub const MAP_FIXED: u32 = 0x10;
-pub const MAP_ANONYMOUS: u32 = 0x20;
-pub const MAP_NORESERVE: u32 = 0x4000;
-pub const MAP_POPULATE: u32 = 0x8000;
-pub const MAP_STACK: u32 = 0x20000; // hint-only on Linux; ignored here
-pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
-
-pub const PROT_NONE: u32 = 0;
-pub const PROT_WRITE: u32 = 0x2;
+pub use akuma_syscalls_linux::flags::map::{
+    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE,
+    MAP_SHARED, MAP_STACK,
+};
+pub use akuma_syscalls_linux::flags::prot::{PROT_NONE, PROT_WRITE};
 
 // ── `MADV_DONTNEED` share-breaking audit ─────────────────────────────────────
 //
@@ -702,7 +699,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> u64 {
     if new_size == 0 { return EINVAL; }
     if old_addr & 0xFFF != 0 { return EINVAL; }
-    const MREMAP_MAYMOVE: u32 = 1;
+    use akuma_syscalls_linux::flags::mremap::MREMAP_MAYMOVE;
 
     let va_limit = user_va_limit() as usize;
     if old_addr >= va_limit { return EFAULT; }
@@ -1091,9 +1088,7 @@ fn madvise_dontneed_range(
 }
 
 pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
-    const MADV_WILLNEED: i32 = 3;
-    const MADV_DONTNEED: i32 = 4;
-    const MADV_FREE: i32 = 8;
+    use akuma_syscalls_linux::flags::madvise::{MADV_DONTNEED, MADV_FREE, MADV_WILLNEED};
 
     match advice {
         MADV_WILLNEED => {

@@ -38,8 +38,7 @@ pub fn pidfd_close(id: u32) {
 }
 
 pub(super) fn sys_pidfd_open(pid: u32, flags: u32) -> u64 {
-    const O_NONBLOCK: u32 = 0x800;
-    const O_CLOEXEC: u32 = 0x80000;
+    use akuma_syscalls_linux::flags::open::{O_CLOEXEC, O_NONBLOCK};
 
     // Only flags 0, O_NONBLOCK, and O_CLOEXEC are valid.
     if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {

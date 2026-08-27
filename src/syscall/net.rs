@@ -310,8 +310,7 @@ pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u
                 let _ = write_user_val(addr_ptr, &sa);
             }
             let new_fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx));
-            const SOCK_CLOEXEC: u32 = 0x80000;
-            const SOCK_NONBLOCK: u32 = 0x800;
+            use akuma_syscalls_linux::net::sock_flags::{SOCK_CLOEXEC, SOCK_NONBLOCK};
             if flags & SOCK_CLOEXEC != 0 { proc.set_cloexec(new_fd); }
             if flags & SOCK_NONBLOCK != 0 { proc.set_nonblock(new_fd); }
             u64::from(new_fd)
@@ -736,16 +735,6 @@ pub(super) fn sys_shutdown(fd: u32, how: i32) -> u64 {
 #[cfg(not(feature = "smoltcp"))]
 pub(super) fn sys_shutdown(_fd: u32, _how: i32) -> u64 { 0 }
 
-/// AArch64 `struct timeval` — `{ time_t tv_sec; suseconds_t tv_usec; }`, both
-/// 64-bit, 16 bytes total. musl passes this shape for `SO_RCVTIMEO`/`SO_SNDTIMEO`.
-#[cfg(feature = "smoltcp")]
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Timeval {
-    tv_sec: i64,
-    tv_usec: i64,
-}
-
 /// Read a `struct timeval` option value and convert it to microseconds.
 ///
 /// Returns `Ok(None)` for an all-zero timeval, because POSIX says zero means
@@ -997,20 +986,6 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
     0
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct MsgHdr {
-    msg_name: u64,
-    msg_namelen: u32,
-    _pad1: u32,
-    msg_iov: u64,
-    msg_iovlen: u32,
-    _pad2: u32,
-    msg_control: u64,
-    msg_controllen: u64,
-    msg_flags: i32,
-}
-
 /// Gather every iovec of a `msghdr` into one kernel buffer.
 ///
 /// **This is the fix for a silent data loss.** The AF_UNIX arm of the smoltcp
@@ -1116,9 +1091,6 @@ pub(super) fn unix_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, op
         // A 12-byte `struct ucred`, not the 4-byte int most options use.
         SO_PEERCRED => {
             let cred = super::unixsock::peer_cred_of(fd)?;
-            #[repr(C)]
-            #[derive(Clone, Copy)]
-            struct Ucred { pid: u32, uid: u32, gid: u32 }
             let out = Ucred { pid: cred.pid, uid: cred.uid, gid: cred.gid };
             let sz = core::mem::size_of::<Ucred>();
             if (len as usize) < sz || !validate_user_ptr(optval, sz) {
@@ -1705,9 +1677,6 @@ pub fn run_socket_timeout_tests() {
     const SO_RCVTIMEO: i32 = 20;
     const SO_SNDTIMEO: i32 = 21;
 
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-    struct Timeval { tv_sec: i64, tv_usec: i64 }
     let tv_len = core::mem::size_of::<Timeval>() as u32;
 
     let tid = akuma_exec::threading::current_thread_id();
@@ -2052,13 +2021,6 @@ fn ip_sockaddr(ip: [u8; 4]) -> SockAddrIn {
     SockAddrIn { sin_family: 2, sin_port: 0, sin_addr: u32::from_ne_bytes(ip), sin_zero: [0; 8] }
 }
 
-/// `sockaddr` shape for `SIOCGIFHWADDR`: `sa_family = ARPHRD_ETHER` (1) + the
-/// 6-byte MAC, zero-padded to the same 16 bytes as [`SockAddrIn`].
-#[cfg(feature = "smoltcp")]
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct SockAddrHw { sa_family: u16, mac: [u8; 6], pad: [u8; 8] }
-
 /// `SIOCGIFFLAGS` / `SIOCGIFADDR` / `SIOCGIFNETMASK` / `SIOCGIFBRDADDR` /
 /// `SIOCGIFMTU` / `SIOCGIFHWADDR`: read the requested `ifr_name` from `arg`
 /// (`struct ifreq`, offset 0), write the cmd-specific union member at `arg+16`.
@@ -2068,14 +2030,16 @@ pub(super) fn sys_ioctl_siocgifreq(cmd: u32, arg: u64) -> u64 {
     if read_user_into(&mut req_name, arg).is_err() { return EFAULT; }
     let requested = ifname_bytes(&req_name);
     let Some(iface) = net_ifaces().into_iter().find(|f| f.name == requested) else { return ENODEV; };
-    let union_ptr = arg + 16;
+    let union_ptr = arg + akuma_syscalls_linux::net::IFREQ_UNION_OFFSET as u64;
     let write_ok = match cmd {
         SIOCGIFFLAGS => write_user_val(union_ptr, &iface.flags).is_ok(),
         SIOCGIFADDR => write_user_val(union_ptr, &ip_sockaddr(iface.ip)).is_ok(),
         SIOCGIFNETMASK => write_user_val(union_ptr, &ip_sockaddr(iface.netmask)).is_ok(),
         SIOCGIFBRDADDR => write_user_val(union_ptr, &ip_sockaddr(iface.broadcast)).is_ok(),
         SIOCGIFMTU => write_user_val(union_ptr, &(iface.mtu as i32)).is_ok(),
-        SIOCGIFHWADDR => write_user_val(union_ptr, &SockAddrHw { sa_family: 1, mac: iface.mac, pad: [0; 8] }).is_ok(),
+        SIOCGIFHWADDR => write_user_val(union_ptr, &SockAddrHw {
+            sa_family: akuma_syscalls_linux::net::ARPHRD_ETHER, mac: iface.mac, pad: [0; 8],
+        }).is_ok(),
         _ => return ENOTTY,
     };
     if write_ok { 0 } else { EFAULT }
@@ -2090,16 +2054,21 @@ pub(super) fn sys_ioctl_siocgifreq(cmd: u32, arg: u64) -> u64 {
 /// common "query the size first" caller pattern.
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_ioctl_siocgifconf(arg: u64) -> u64 {
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct IfConfHdr { len: i32, _pad: i32, buf: u64 }
-    // Full `sizeof(struct ifreq)` (40 bytes: 16-byte name + the union sized to
-    // its largest member, `struct ifmap`, not the 16-byte `sockaddr` this
-    // record actually uses) — callers stride `ifc_buf` by `sizeof(struct
-    // ifreq)`, not by how much of the union a given record fills.
+    // The one record type that stays here rather than moving to
+    // `akuma-syscalls-linux`: it embeds `SockAddrIn`, which lives in
+    // `akuma-net`, and the ABI crate is a dependency-free leaf on purpose.
+    //
+    // `_union_pad` brings this to the full `sizeof(struct ifreq)` (40 bytes:
+    // 16-byte name + the union sized to its largest member, `struct ifmap`,
+    // not the 16-byte `sockaddr` this record actually uses) — callers stride
+    // `ifc_buf` by `sizeof(struct ifreq)`, not by how much of the union a
+    // given record fills.
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
     struct GifreqAddr { name: [u8; 16], addr: SockAddrIn, _union_pad: [u8; 8] }
+    const _: () = assert!(
+        core::mem::size_of::<GifreqAddr>() == akuma_syscalls_linux::net::SIZEOF_IFREQ
+    );
 
     let mut hdr = IfConfHdr::default();
     if read_user_into(&mut hdr, arg).is_err() { return EFAULT; }

@@ -11,4 +11,5 @@ workspace = true
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-exec = { path = "../akuma-exec" }
 akuma-timer = { path = "../akuma-timer" }
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 log = { version = "0.4", default-features = false }

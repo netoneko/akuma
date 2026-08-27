@@ -427,11 +427,9 @@ pub(super) fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child
 /// Internal clone implementation that optionally writes a pidfd to `pidfd_out_ptr`.
 /// `pidfd_out_ptr = 0` means no pidfd requested (used by sys_clone).
 pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64, pidfd_out_ptr: u64) -> u64 {
-    const CLONE_VM: u64 = 0x100;
-    const CLONE_THREAD: u64 = 0x10000;
-    const CLONE_VFORK: u64 = 0x4000;
+    use akuma_syscalls_linux::proc::clone_flags::{CLONE_THREAD, CLONE_VFORK, CLONE_VM};
     #[cfg(feature = "sc-pidfd")]
-    const CLONE_PIDFD: u64 = 0x1000;
+    use akuma_syscalls_linux::proc::clone_flags::CLONE_PIDFD;
     // pidfd_out_ptr is only consumed by the CLONE_PIDFD block below, which is
     // gated out when pidfd support is compiled away.
     #[cfg(not(feature = "sc-pidfd"))]
@@ -587,19 +585,9 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
 }
 
 pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct CloneArgs {
-        flags: u64,
-        pidfd: u64,
-        child_tid: u64,
-        parent_tid: u64,
-        exit_signal: u64,
-        stack: u64,
-        stack_size: u64,
-        tls: u64,
-    }
-
+    // `struct clone_args` is `akuma_syscalls_linux::CloneArgs` since
+    // 2026-08-27, reached here through `use super::*`. The short-copy contract
+    // that makes its field order unchangeable has a host test there.
     let struct_size = size.min(core::mem::size_of::<CloneArgs>());
     let mut cl_args = CloneArgs::default();
     if copy_from_user(
@@ -1043,16 +1031,12 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
 }
 
 pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 {
-    const SIGINFO_SIZE: usize = 128;
-    const P_ALL: u32 = 0;
-    const P_PID: u32 = 1;
+    use akuma_syscalls_linux::proc::wait_idtype::{P_ALL, P_PID};
     #[cfg(feature = "sc-pidfd")]
-    const P_PIDFD: u32 = 3;
-    const WNOHANG: i32 = 1;
-    const WNOWAIT: i32 = 0x0100_0000;
-    const SIGCHLD: u32 = 17;
-    const CLD_EXITED: i32 = 1;
-    const CLD_KILLED: i32 = 2;
+    use akuma_syscalls_linux::proc::wait_idtype::P_PIDFD;
+    use akuma_syscalls_linux::proc::wait_options::{WNOHANG, WNOWAIT};
+    use akuma_syscalls_linux::signal::cld::{CLD_EXITED, CLD_KILLED};
+    use akuma_syscalls_linux::signal::{SIGCHLD, SIGINFO_SIZE};
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(128, "[syscall] waitid(idtype={}, id={}, options=0x{:x})\n", idtype, id, options);
@@ -1174,17 +1158,6 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
             // 8-byte aligned, so si_pid starts at offset 16, NOT 12. musl agrees
             // (`__pad[128 - 2*sizeof(int) - sizeof(long)]`); the kernel's own
             // signal frame writes `si_addr` at offset 16 too.
-            #[repr(C)]
-            #[derive(Clone, Copy)]
-            struct SigChld {
-                si_signo:  u32,
-                si_errno:  u32,
-                si_code:   i32,
-                __pad0:    u32,
-                si_pid:    u32,
-                si_uid:    u32,
-                si_status: i32,
-            }
             let (si_code, si_status) = if code < 0 { (CLD_KILLED, -code) } else { (CLD_EXITED, code) };
             let info = SigChld { si_signo: SIGCHLD, si_errno: 0, si_code, __pad0: 0,
                                  si_pid: child_pid, si_uid: 0, si_status };
@@ -1205,13 +1178,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
 
 pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: u64) -> u64 {
     if old_rlim != 0 {
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct Rlimit {
-            rlim_cur: u64,
-            rlim_max: u64,
-        }
-        const RLIM_INFINITY: u64 = !0u64;
+        use akuma_syscalls_linux::proc::rlimit::RLIM_INFINITY;
         let (cur, max) = match resource {
             3 => {
                 let stack_size = akuma_exec::runtime::config().user_stack_size as u64;
@@ -1229,27 +1196,22 @@ pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: 
 }
 
 pub(super) fn sys_sysinfo(info_ptr: usize) -> u64 {
-    if !validate_user_ptr(info_ptr as u64, 112) { return EFAULT; }
-    let mut info = [0u8; 112];
-    let total_pages = crate::pmm::total_count() as u64;
-    let free_pages = crate::pmm::free_count() as u64;
-    let uptime_secs = crate::timer::uptime_us() / 1_000_000;
-    // struct sysinfo layout (AArch64, 8-byte unsigned long):
-    //   0: uptime (8), 8: loads[3] (24), 32: totalram (8), 40: freeram (8),
-    //   48: sharedram (8), 56: bufferram (8), 64: totalswap (8), 72: freeswap (8),
-    //   80: procs (2), 82: pad (2), 84: [align 4], 88: totalhigh (8),
-    //   96: freehigh (8), 104: mem_unit (4), 108: _f[0], pad to 112
-    unsafe {
-        let ptr = info.as_mut_ptr().cast::<u64>();
-        core::ptr::write(ptr.add(0), uptime_secs);          // offset 0
-        core::ptr::write(ptr.add(4), total_pages * 4096);   // offset 32: totalram
-        core::ptr::write(ptr.add(5), free_pages * 4096);    // offset 40: freeram
-        let procs_ptr = info.as_mut_ptr().add(80).cast::<u16>();
-        core::ptr::write(procs_ptr, 1);                     // offset 80: procs
-        let memunit_ptr = info.as_mut_ptr().add(104).cast::<u32>();
-        core::ptr::write(memunit_ptr, 1);                   // offset 104: mem_unit
-    }
-    if copy_to_user(info_ptr as u64, &info).is_err() {
+    // This used to be a `[u8; 112]` filled by five `core::ptr::write(ptr.add(N))`
+    // calls under a comment listing the AArch64 offsets. The comment was
+    // correct and nothing checked that it stayed correct; the offsets are
+    // `akuma_syscalls_linux::Sysinfo`'s now, asserted there. Every field the
+    // old code left at zero still is — `Default` zeroes the struct exactly as
+    // the array did.
+    if !validate_user_ptr(info_ptr as u64, core::mem::size_of::<Sysinfo>()) { return EFAULT; }
+    let info = Sysinfo {
+        uptime: (crate::timer::uptime_us() / 1_000_000).cast_signed(),
+        totalram: crate::pmm::total_count() as u64 * 4096,
+        freeram: crate::pmm::free_count() as u64 * 4096,
+        procs: 1,
+        mem_unit: 1,
+        ..Sysinfo::default()
+    };
+    if write_user_val(info_ptr as u64, &info).is_err() {
         return EFAULT;
     }
     0

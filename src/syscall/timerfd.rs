@@ -20,27 +20,23 @@ pub fn timerfd_add_poller(id: u32, tid: usize) {
     });
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LocalTimespec {
-    tv_sec: u64,
-    tv_nsec: u64,
-}
+// `LocalTimespec` (a second `struct timespec`, spelled `u64`) is
+// `akuma_syscalls_linux::Timespec` since 2026-08-27, reached through
+// `use super::*`. The `bits()`/`from_bits()` pair below is what keeps this
+// path's arithmetic unsigned, exactly as it was — see that type's doc comment.
 
 fn timespec_to_us_safe(ptr: usize) -> Result<u64, u64> {
     if ptr == 0 { return Ok(0); }
-    let mut ts = LocalTimespec::default();
+    let mut ts = Timespec::default();
     if read_user_into(&mut ts, ptr as u64).is_err() {
         return Err(EFAULT);
     }
-    Ok(ts.tv_sec * 1_000_000 + ts.tv_nsec / 1_000)
+    let (sec, nsec) = ts.bits();
+    Ok(sec * 1_000_000 + nsec / 1_000)
 }
 
 fn us_to_timespec_safe(us: u64, ptr: usize) -> Result<(), u64> {
-    let ts = LocalTimespec {
-        tv_sec: us / 1_000_000,
-        tv_nsec: (us % 1_000_000) * 1_000,
-    };
+    let ts = Timespec::from_bits(us / 1_000_000, (us % 1_000_000) * 1_000);
     if write_user_val(ptr as u64, &ts).is_err() {
         return Err(EFAULT);
     }

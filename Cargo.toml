@@ -14,6 +14,7 @@ default-members = [
     "crates/akuma-primitives",
     "crates/akuma-rump",
     "crates/akuma-scheduler",
+    "crates/akuma-syscalls-linux",
     "crates/akuma-terminal",
     "crates/akuma-time",
     "crates/akuma-timer",
@@ -661,6 +662,12 @@ akuma-timer = { path = "crates/akuma-timer" }
 # SNTP fallback for platforms with no RTC (Firecracker) — extracted from
 # src/syscall/time.rs, see docs/archive/MISSING_NTP_SYSCALLS.md.
 akuma-time = { path = "crates/akuma-time" }
+# The Linux/aarch64 syscall ABI: the `nr::` number table, the repr(C) wire
+# structs and their layout assertions, and the flag tables — all host-tested,
+# none of which was possible while they lived in this bin crate
+# (proposals/syscall-abi-and-shape-crates.md). Not optional: `nr::` is the
+# dispatch table, so every build target needs it.
+akuma-syscalls-linux = { path = "crates/akuma-syscalls-linux" }
 embedded-io-async = { version = "0.6", default-features = false }
 
 [patch.crates-io]

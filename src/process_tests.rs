@@ -5081,10 +5081,11 @@ fn test_poll_bkl_drop() {
 
     const POLLOUT: i16 = 4;
 
-    #[repr(C)]
-    struct TestPollFd { fd: i32, events: i16, revents: i16 }
-    #[repr(C)]
-    struct TestTimespec { tv_sec: u64, tv_nsec: u64 }
+    // The last two hand-rolled copies of `struct pollfd` and `struct timespec`,
+    // collapsed into `akuma-syscalls-linux` on 2026-08-27. A test that builds
+    // its own idea of the ABI can pass while the kernel's disagrees, which is
+    // the one failure a layout test must not have.
+    use akuma_syscalls_linux::{PollFd as TestPollFd, Timespec as TestTimespec};
 
     let tid = current_thread_id();
     let pid: u32 = 7705;
@@ -5141,7 +5142,7 @@ fn test_poll_bkl_drop() {
         let write_fd = fds_buf[1];
 
         let mut pfd = TestPollFd { fd: write_fd, events: POLLOUT, revents: 0 };
-        let ts = TestTimespec { tv_sec: 0, tv_nsec: 0 };
+        let ts = TestTimespec::default();
         let r = handle_syscall(nr::PPOLL, &[(&raw mut pfd) as u64, 1, (&raw const ts) as u64, 0, 0, 0]);
         if r != 1 || pfd.revents & POLLOUT == 0 {
             fails += 1;
@@ -5150,7 +5151,7 @@ fn test_poll_bkl_drop() {
         balanced("ppoll(pipe write fd)", &mut fails);
 
         let mut writefds: u64 = 1u64 << write_fd;
-        let ts2 = TestTimespec { tv_sec: 0, tv_nsec: 0 };
+        let ts2 = TestTimespec::default();
         let r = handle_syscall(nr::PSELECT6, &[
             (write_fd as u64) + 1,
             0,
@@ -7417,9 +7418,7 @@ fn test_rt_sigtimedwait_timeout() {
     let mut mask: u64 = 0;
     
     // 3. Prepare a very short timeout (1ms)
-    #[repr(C)]
-    struct Timespec { tv_sec: i64, tv_nsec: i64 }
-    let ts = Timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+    let ts = akuma_syscalls_linux::Timespec { tv_sec: 0, tv_nsec: 1_000_000 };
     
     // 4. Call sigtimedwait
     crate::syscall::BYPASS_VALIDATION.store(true, core::sync::atomic::Ordering::Release);
