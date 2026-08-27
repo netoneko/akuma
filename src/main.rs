@@ -72,9 +72,6 @@ mod klog;
 mod ntp_boot;
 mod platform;
 mod pmm;
-// Per-stage `read(2)` fixed-cost attribution (`read-profile`). Always compiled;
-// a ZST with the feature off — see the module docs.
-mod read_profile;
 #[cfg(kernel_tests)]
 mod process_tests;
 #[cfg(kernel_tests)]

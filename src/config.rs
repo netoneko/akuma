@@ -698,6 +698,24 @@ pub const PROC_SYSVIPC_ENABLED: bool = false;
 /// Verbose file I/O logging (openat, read, readv, fstat paths + sizes).
 pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
 
+/// Print a line every time userspace calls a syscall this kernel does not
+/// implement (`[ENOSYS] nr=…`, plus the named `io_uring`/`inotify`/
+/// `process_vm_readv` variants).
+///
+/// Off by default because it is per *call*, not per syscall-number, and a
+/// console line is milliseconds. Probing for a syscall and falling back is
+/// ordinary libc behaviour and it happens in loops: musl only reaches
+/// `pwritev2` when `flags` is nonzero, so a build missing all four
+/// `p{read,write}v` variants printed a line **per write** — the `[ENOSYS]
+/// nr=287` flood (`docs/archive/DEVBOX_ISSUES.md` Issue 13). That was fixed by
+/// implementing the syscall; the next missing one someone's runtime probes in a
+/// loop brings it straight back.
+///
+/// Flip to `true` when the question is "which syscall is this binary missing?"
+/// — that is the only thing it answers, and one line is as good as ten
+/// thousand. `ENOSYS` is returned either way.
+pub const SYSCALL_ENOSYS_DIAG: bool = false;
+
 /// Poison-and-quarantine freed physical frames to catch use-after-free writes
 /// (`pmm::quarantine_push`).
 ///

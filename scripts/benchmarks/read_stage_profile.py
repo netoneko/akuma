@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Drive the `[READPROF]` per-stage `read(2)` profiler and summarise its windows.
 
-Companion to `src/read_profile.rs` (kernel feature `read-profile`) and to
+Companion to `src/syscall/utils/read_profile.rs` (kernel feature `read-profile`) and to
 `read_path_ab.py`, which answers a different question: that script measures how
 much a `read(2)` spends *re-resolving its path* by differencing two path depths
 in userspace, and cannot see inside a single syscall. This one reads the
@@ -33,7 +33,7 @@ change to the read path can move. `--keep-dirty` shows the rejects too.
 The kernel's window dump costs ~55 ms of serial console per 256 reads, inside a
 `read(2)`. The `bs=...:` lines below are printed so you can see the workload ran,
 not so you can compare them to anything. Per-read wall cost comes from a plain
-`--release` build and `scripts/probes/read_syscall_cost.c`.
+`--release` build and `userspace/ext2probe/c/read_syscall_cost.c`.
 
 # Reading the output
 
@@ -100,6 +100,10 @@ def parse_windows(text):
             kind = "mean" if " mean " in line else "min"
             for k, v in re.findall(r"(exc|hs|sr|wrap|pro_epi|resid)=(\d+)ns", line):
                 w[f"{kind}_{k}"] = int(v)
+        elif "commit mean=" in line:
+            m = re.search(r"commit mean=(\d+)ns min=(\d+)ns", line)
+            if m:
+                w["mean_commit"], w["min_commit"] = int(m.group(1)), int(m.group(2))
         elif "exc_us" in line:
             for k, v in re.findall(r"([<\d][^:\s]*):(\d+)", line.split("exc_us", 1)[1]):
                 w["hist"][k] = int(v)
@@ -146,14 +150,28 @@ def report(by_size, label):
         ws = by_size[size]
         med = lambda k: int(statistics.median([w[k] for w in ws if k in w]))  # noqa: E731
         print(f"\n== {label}  bs={size}  ({len(ws)} clean window(s), {sum(w['n'] for w in ws)} reads)")
-        print(f"   cal={med('cal')}ns/lap   exc={med('mean_exc')}ns   (min {med('min_exc')}ns)")
-        total = med("mean_exc") or 1
-        rows = [("wrap (EL0 handler)", med("mean_wrap")),
-                ("pro_epi (handle_syscall)", med("mean_pro_epi"))]
-        rows += [(f"  {s}", med(f"mean_{s}")) for s in STAGES]
-        rows += [("  resid", med("mean_resid"))]
-        for name, v in rows:
-            print(f"   {name:<26} {v:>7}ns  {100.0 * v / total:5.1f}%")
+        print(f"   cal={med('cal')}ns/lap   exc: min={med('min_exc')}ns  mean={med('mean_exc')}ns")
+        # `min` is the number to read, and `mean` is here only to show how much
+        # interference the window carried. Even after the dirty-window filter,
+        # sub-threshold stalls inflate every mean — enough that the mean stage
+        # table once put `pro_epi` at 572 ns inside a syscall whose whole
+        # undisturbed round trip is 440 ns. A stage cannot cost more than the
+        # syscall containing it; that contradiction is what the minima resolve.
+        total = med("min_exc") or 1
+        rows = [("wrap (EL0 handler)", "wrap"), ("pro_epi (handle_syscall)", "pro_epi")]
+        rows += [(f"  {s}", s) for s in STAGES] + [("  resid", "resid")]
+        print(f"   {'stage':<26} {'min':>7}  {'%of min exc':>11}   {'mean':>8}")
+        for name, key in rows:
+            mn, mean = med(f"min_{key}"), med(f"mean_{key}")
+            print(f"   {name:<26} {mn:>5}ns  {100.0 * mn / total:10.1f}%   {mean:>6}ns")
+        named = sum(med(f"min_{s}") for s in STAGES)
+        print(f"   {'-- named stages (min sum)':<26} {named:>5}ns  "
+              f"{100.0 * named / total:10.1f}%")
+        if any("min_commit" in w for w in ws):
+            c = med("min_commit")
+            print(f"   {'-- of which instrument:':<26} {c:>5}ns of pro_epi is "
+                  f"commit()'s own atomics -> real pro_epi ~"
+                  f"{med('min_pro_epi') - c}ns")
 
 
 def main():

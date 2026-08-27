@@ -504,10 +504,10 @@ Two gaps:
     say. Measured from inside the kernel, a warm 8 KB `read(2)` excursion is
     ~2.4 µs and a 4 KB one ~2.0 µs, of which `copy_to_user` is 133 ns and ext2
     itself 882 ns; the ~17 µs was inferred from wall time, never measured, and
-    most of that wall time is not in `read(2)` at all. The dominant term is the
-    syscall **round trip** — an Akuma `read(2)` that moves zero bytes costs
-    5.1 µs against Linux's 137 ns on the same silicon with the same binary. Full
-    per-stage table and the Linux comparison:
+    most of that wall time is not in `read(2)` at all. Against Linux, same static musl
+    binary and same silicon, a warm 4 KB read is **2050 ns vs 249 ns (8.2×)**:
+    440 ns of that is the bare syscall round trip (Linux 147 ns, so 3.0×) and
+    ~1410 ns is the read work itself (Linux 77 ns). Full per-stage table:
     `docs/archive/EXT2_READ_PATH_STAGE_PROFILE.md`.
   - **`delete`: ~150×** — Linux `-o sync` unlinks 300 files in 5 ms; Akuma still
     does ~7 synchronous device *writes* per unlink.

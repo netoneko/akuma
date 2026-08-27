@@ -6,6 +6,12 @@
  * same instruction stream issues the same `svc` on the same silicon. See
  * `docs/archive/EXT2_READ_PATH_STAGE_PROFILE.md`.
  *
+ * Lives next to `ext2probe` because it answers the question `ext2probe` raises
+ * and cannot settle: `ext2probe` times a whole workload from userspace, so its
+ * `seq_read` number is syscall + userspace + scheduling together. This splits
+ * the syscall out, and the kernel-side companion (`--features read-profile`)
+ * splits that syscall into stages. Three tools, three altitudes, one question.
+ *
  * Three arms, because "a read costs N ns" is not one number:
  *
  *   zero   read(2) of `len` bytes from /dev/zero  — syscall + a kernel memset,
@@ -31,15 +37,17 @@
  *          cost there — worth knowing, but it is not part of `read`.
  *   min    the cheapest single read seen, from the `timed` loop. A preempted
  *          read is hundreds of microseconds and no averaging removes it
- *          (`src/read_profile.rs` § STAGE_MIN), so the minimum is the only
+ *          (`src/syscall/utils/read_profile.rs` § STAGE_MIN), so the minimum is the only
  *          interference-free per-read figure the harness can produce — but it
  *          is floored by the clock's resolution, which on Akuma is 1 us.
  *
- * Build (Linux):  gcc -O2 -static -o read_syscall_cost read_syscall_cost.c
- * Build (Akuma):  see scripts/probes/build_read_syscall_cost.sh
+ * Built by `userspace/build.sh` into `bootstrap/bin/`, so a populated disk has
+ * it at /bin/read_syscall_cost. `userspace/ext2probe/c/build.sh` builds it
+ * standalone and can push it into an already-running Akuma or Lima guest.
  */
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <sys/syscall.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,20 +134,59 @@ static double pass(int fd, char *buf, size_t len, int iters, long long *minp,
 static void arm(const char *name, int fd, char *buf, size_t len, int iters, int reps,
                 int use_pread, off_t span) {
     long long mn = (long long)1 << 62;
-    long long *batch = malloc(sizeof(long long) * reps);
+    /* Many short passes for the batched arm — see the `getpid` block in main().
+     * A long pass reliably catches one of the multi-hundred-microsecond stalls
+     * that land a few times per thousand syscalls, so with long passes even the
+     * minimum measures interference. Same total work, hundredfold better floor. */
+    int npass = reps * 20, per = iters / 20 > 0 ? iters / 20 : 1;
+    long long *batch = malloc(sizeof(long long) * npass);
     long long *each = malloc(sizeof(long long) * reps);
-    for (int r = 0; r < reps; r++) {
-        batch[r] = (long long)(pass_batched(fd, buf, len, iters, use_pread, span) * 1000);
+    for (int r = 0; r < npass; r++)
+        batch[r] = (long long)(pass_batched(fd, buf, len, per, use_pread, span) * 1000);
+    for (int r = 0; r < reps; r++)
         each[r] = (long long)(pass(fd, buf, len, iters, &mn, use_pread, span) * 1000);
-    }
-    qsort(batch, reps, sizeof(long long), cmp_ll);
+    qsort(batch, npass, sizeof(long long), cmp_ll);
     qsort(each, reps, sizeof(long long), cmp_ll);
     /* `batch` is the number to compare across kernels; `timed` and `min` carry
-     * the per-call harness and are only meaningful within one kernel. */
-    printf("%-6s len=%-6zu batch=%8.0f ns/read   timed=%8.0f   min=%7lld   (%d x %d)\n",
-           name, len, batch[reps / 2] / 1000.0, each[reps / 2] / 1000.0, mn, reps, iters);
+     * the per-call harness and are only meaningful within one kernel.
+     *
+     * `best` — the cheapest whole pass — is what a kernel A/B should read. This
+     * host's wall clock moves several-fold between boots, and a kernel A/B
+     * cannot interleave its arms (each needs a reboot), so a median across
+     * passes inside one boot still carries whatever the host was doing during
+     * that boot. The minimum pass is the least-disturbed one, and interference
+     * can only ever add. A 17% difference measured on medians here reversed
+     * sign on the arms either side of it. */
+    printf("%-6s len=%-6zu median=%8.0f ns/read  best=%8.0f  timed=%8.0f  (%d x %d)\n",
+           name, len, batch[npass / 2] / 1000.0, batch[0] / 1000.0,
+           each[reps / 2] / 1000.0, npass, per);
+    (void)mn;
     free(batch);
     free(each);
+}
+
+/* The floor: a syscall that does no work at all.
+ *
+ * `getpid` reaches the dispatch table and returns a field. If this costs the
+ * same as a 0-byte `read`, then nothing in the read path is worth looking at
+ * and the cost is the EL0 round trip — the `svc`, the vector asm's register
+ * save/restore, and the `eret`. Raw `syscall()` rather than the libc wrapper so
+ * no libc can cache it. */
+static double pass_syscall(long nr, int iters) {
+    long long t0 = now_ns();
+    for (int i = 0; i < iters; i++) syscall(nr);
+    return (double)(now_ns() - t0) / iters;
+}
+
+/* Many short passes, take the minimum — see the comment in main(). */
+static void floor_arm(const char *name, long nr, int iters, int reps) {
+    int npass = reps * 20, per = iters / 20 > 0 ? iters / 20 : 1;
+    long long *g = malloc(sizeof(long long) * npass);
+    for (int r = 0; r < npass; r++) g[r] = (long long)(pass_syscall(nr, per) * 1000);
+    qsort(g, npass, sizeof(long long), cmp_ll);
+    printf("%-8s nr=%-4ld median=%8.0f ns/call  best=%8.0f  (%d x %d)\n",
+           name, nr, g[npass / 2] / 1000.0, g[0] / 1000.0, npass, per);
+    free(g);
 }
 
 int main(int argc, char **argv) {
@@ -164,6 +211,38 @@ int main(int argc, char **argv) {
         long long mn = (long long)1 << 62;
         pass(ff, buf, 65536, (int)(span / 65536), &mn, 1, span);
     }
+
+    printf("== floor: syscalls that do (almost) nothing\n");
+    /* MANY SHORT passes, not few long ones, and report the minimum.
+     *
+     * Interference here arrives as a handful of multi-hundred-microsecond
+     * stalls per thousand calls. A 2000-call pass almost always catches one, so
+     * every pass is contaminated and even the minimum is an interference
+     * measurement — which is how this arm first reported a 3.0 us `getpid`.
+     * Short passes make a clean pass likely, and the cheapest of a hundred of
+     * them is the syscall itself. Same total work either way.
+     *
+     * Three numbers, not one: if they disagree, the cheap ones are taking a
+     * path the dispatcher's common prologue does not. `getppid` is the control
+     * for `getpid`; 4095 is deliberately not a syscall, so it must traverse the
+     * whole dispatch and return ENOSYS. */
+    floor_arm("getpid", SYS_getpid, iters, reps);
+    floor_arm("getppid", SYS_getppid, iters, reps);
+    /* An unimplemented syscall, which is what a libc probing for a feature and
+     * falling back actually does. 107 is `timer_create`: allocated in the
+     * aarch64 ABI, not implemented by this kernel, so it reaches the
+     * dispatcher's ENOSYS arm.
+     *
+     * The number matters. An earlier version used 4095 on the reasoning that
+     * "not a syscall" was the cleanest possible case, and measured 2 ms — which
+     * was then attributed to the ENOSYS console print. Wrong path entirely:
+     * `src/exceptions.rs` treats **any number above 500** as a stale-I-cache
+     * JIT artifact and answers with `ic iallu` + an instruction replay, not with
+     * ENOSYS. The 4095 arm below still measures that, deliberately, because it
+     * is worth knowing what the JIT band costs — but it is not the ENOSYS
+     * number and must never be read as one. */
+    floor_arm("ENOSYS", 107, iters, reps);
+    floor_arm("JITband", 4095, iters, reps);
 
     printf("== fixed cost (no bytes moved)\n");
     arm("null", ff, buf, 0, iters, reps, 1, span);

@@ -580,6 +580,9 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
 /// page-table-walk **per byte**: 4096 walks for a `PATH_MAX` path. The string reader
 /// does its own per-byte limit check and relies on the byte loop's fixup for
 /// mapped-ness, which is the correct shape for an unknown-length read.
+/// Measurement helpers for this layer — see [`utils`].
+pub mod utils;
+
 pub fn copy_from_user_byte(ptr: u64) -> Result<u8, u64> {
     let mut b: u8 = 0;
     // SAFETY: one byte into a live local; the user side is covered by the recovery
@@ -620,7 +623,7 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // Outer span for `read-profile` (ZST otherwise): started before the pid
     // lookup and counter bumps below, so `hs - sr` names this prologue/epilogue.
-    let rp_span = crate::read_profile::Span::new();
+    let rp_span = crate::syscall::utils::read_profile::Span::new();
     CURRENT_SYSCALL_NR.store(syscall_num, Ordering::Relaxed);
 
     akuma_exec::threading::set_thread_current_syscall(syscall_num);
@@ -905,8 +908,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRUSAGE => time::sys_getrusage(args[0] as i32, args[1] as usize),
         nr::MSYNC => mem::sys_msync(args[0] as usize, args[1] as usize, args[2] as u32),
         nr::PROCESS_VM_READV => {
-            crate::tprint!(96, "[ENOSYS] nr=270 (process_vm_readv) pid={}\n",
-                akuma_exec::process::read_current_pid().unwrap_or(0));
+            if crate::config::SYSCALL_ENOSYS_DIAG {
+                crate::tprint!(96, "[ENOSYS] nr=270 (process_vm_readv) pid={}\n",
+                    akuma_exec::process::read_current_pid().unwrap_or(0));
+            }
             ENOSYS
         }
         nr::SCHED_SETAFFINITY => 0,
@@ -1024,8 +1029,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-timerfd")]
         nr::TIMERFD_GETTIME => timerfd::sys_timerfd_gettime(args[0], args[1]),
         nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
-            crate::tprint!(96, "[ENOSYS] nr={} (io_uring) pid={}\n", syscall_num,
-                akuma_exec::process::read_current_pid().unwrap_or(0));
+            // `io_uring_enter` is a *loop* call in any runtime that gets as far
+            // as trying it, so this one especially must not print per call.
+            if crate::config::SYSCALL_ENOSYS_DIAG {
+                crate::tprint!(96, "[ENOSYS] nr={} (io_uring) pid={}\n", syscall_num,
+                    akuma_exec::process::read_current_pid().unwrap_or(0));
+            }
             ENOSYS
         }
         #[cfg(feature = "sc-aio")]
@@ -1049,8 +1058,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             EOPNOTSUPP
         }
         nr::INOTIFY_INIT1 | nr::INOTIFY_ADD_WATCH | nr::INOTIFY_RM_WATCH => {
-            crate::tprint!(128, "[ENOSYS] nr={} (inotify) pid={}\n", syscall_num,
-                akuma_exec::process::read_current_pid().unwrap_or(0));
+            if crate::config::SYSCALL_ENOSYS_DIAG {
+                crate::tprint!(128, "[ENOSYS] nr={} (inotify) pid={}\n", syscall_num,
+                    akuma_exec::process::read_current_pid().unwrap_or(0));
+            }
             ENOSYS
         }
         #[cfg(feature = "sc-containers")]
@@ -1060,9 +1071,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-containers")]
         nr::MOUNT_IN_NS => container::sys_mount_in_ns(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5]),
         _ => {
-            crate::safe_print!(128, "[ENOSYS] nr={} pid={} args=[0x{:x}, 0x{:x}, 0x{:x}]\n",
-                syscall_num, akuma_exec::process::read_current_pid().unwrap_or(0),
-                args[0], args[1], args[2]);
+            if crate::config::SYSCALL_ENOSYS_DIAG {
+                crate::safe_print!(128,
+                    "[ENOSYS] nr={} pid={} args=[0x{:x}, 0x{:x}, 0x{:x}]\n",
+                    syscall_num, akuma_exec::process::read_current_pid().unwrap_or(0),
+                    args[0], args[1], args[2]);
+            }
             ENOSYS
         }
         },
@@ -1143,7 +1157,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     }
 
     CURRENT_SYSCALL_NR.store(!0u64, Ordering::Relaxed);
-    rp_span.end_handle_syscall();
+    rp_span.end_handle_syscall(syscall_num);
     result
 }
 

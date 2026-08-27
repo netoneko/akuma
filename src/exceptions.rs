@@ -3638,8 +3638,8 @@ pub fn spurious_svc_count() -> u64 {
 extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
     // Outermost span for `read-profile` (ZST otherwise): started before the BKL
     // acquire and the entry tripwires, so `exc - hs` names everything this
-    // wrapper does around the dispatch. See `crate::read_profile`.
-    let rp_span = crate::read_profile::Span::new();
+    // wrapper does around the dispatch. See `crate::syscall::utils::read_profile`.
+    let rp_span = crate::syscall::utils::read_profile::Span::new();
     note_exception_entry();
     note_exc_class(0);
     SYNC_EC_EL0[((esr >> 26) & 0x3F) as usize]

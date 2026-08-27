@@ -301,6 +301,19 @@ echo "Building mmap_file (C, file-backed mmap OOM probe)..."
 cp forktest/c_stress/mmap_file ../bootstrap/bin/
 echo "mmap_file (C) copied to bootstrap/bin/"
 
+# Build read_syscall_cost: pure-C, static musl. The cross-kernel half of the
+# read-path work — the SAME binary runs here and on a Linux VM, so the two
+# columns differ by the kernel and nothing else (see the source header and
+# docs/archive/EXT2_READ_PATH_STAGE_PROFILE.md). Built unconditionally: it is
+# tiny, and a probe that is not on the disk does not get run.
+echo "Building read_syscall_cost (C, syscall/read cost probe)..."
+(
+    cd ext2probe/c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o read_syscall_cost read_syscall_cost.c
+)
+cp ext2probe/c/read_syscall_cost ../bootstrap/bin/
+echo "read_syscall_cost (C) copied to bootstrap/bin/"
+
 # mprotectlb + clonearg: deterministic thread-spawn / mprotect probes. Both are
 # one-shot (no stress loop) and calibrated against real Linux, so a FAIL is a
 # kernel divergence and nothing else. mprotectlb is the regression guard for the
