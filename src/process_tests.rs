@@ -3371,6 +3371,12 @@ fn test_read_uses_the_fd_inode() {
             _ => 0,
         }
     };
+    let fd_mount = |fd: u64| -> u32 {
+        match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd as u32)) {
+            Some(akuma_exec::process::FileDescriptor::File(f)) => f.mount_id(),
+            _ => 0,
+        }
+    };
 
     let mut fails = 0u32;
 
@@ -3379,10 +3385,14 @@ fn test_read_uses_the_fd_inode() {
     let want_inode = crate::vfs::resolve_inode(&doomed).unwrap_or(0);
     let p = cstr(&doomed);
     let fd = openat(&p, open_flags::O_RDONLY);
-    if (fd as i64) < 0 || want_inode == 0 || fd_inode(fd) != want_inode {
+    // Both halves, together: an inode number applied to the wrong filesystem is
+    // the cross-mount aliasing the pair exists to prevent, so an fd that captured
+    // one without the other would be worse than capturing neither.
+    if (fd as i64) < 0 || want_inode == 0 || fd_inode(fd) != want_inode || fd_mount(fd) == 0 {
         fails += 1;
-        crate::safe_print!(128, "[Test] fd-inode bind FAILED fd={} fd_inode={} want={}\n",
-            fd, fd_inode(fd), want_inode);
+        crate::safe_print!(160,
+            "[Test] fd-inode bind FAILED fd={} fd_inode={} want={} fd_mount={}\n",
+            fd, fd_inode(fd), want_inode, fd_mount(fd));
     }
 
     // 2. Unlinked but still open: the name goes, the fd keeps reading the file.
@@ -3476,9 +3486,10 @@ fn test_read_uses_the_fd_inode() {
         let mut buf = [0u8; 128];
         let n = read(fd, &mut buf);
         let live = (n as i64) > 0 && buf[..n as usize].contains(&b'/');
-        if fd_inode(fd) != 0 || !live {
+        if fd_inode(fd) != 0 || fd_mount(fd) != 0 || !live {
             fails += 1;
-            crate::safe_print!(128, "[Test] fd-inode mtab FAILED inode={} n={}\n", fd_inode(fd), n);
+            crate::safe_print!(160, "[Test] fd-inode mtab FAILED inode={} mount={} n={}\n",
+                fd_inode(fd), fd_mount(fd), n);
         }
         close(fd);
     }

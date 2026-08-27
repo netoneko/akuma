@@ -458,11 +458,48 @@ pub fn resolve_file_id(path: &str) -> Option<(u32, u32)> {
 /// Directories need no exclusion: `read_at_by_inode` refuses `S_IFDIR` exactly
 /// where the path-based `read_at` does, so a `read(2)` on a directory fd still
 /// gets `NotAFile` either way.
-pub fn open_file_inode(path: &str) -> Option<u32> {
+pub fn open_file_ids(path: &str) -> Option<(u32, u32)> {
     if is_mtab(path) {
         return None;
     }
-    with_fs(path, |fs, rel| fs.resolve_inode(rel)).ok().filter(|&inode| inode != 0)
+    resolve_file_id(path)
+}
+
+/// The filesystem an fd (or a mapping) captured, found by the mount id it stored.
+///
+/// Searched in the same order [`resolve_mount`] searches for a path — spawn
+/// override, the process's namespace, then the global table — so an fd resolves
+/// through the same view its opener did.
+///
+/// `None` means that mount is **gone**: unmounted, or re-rooted, which mints a
+/// new id precisely so the old one stops resolving. Ids are never reused, so this
+/// can never return a different filesystem than the caller meant.
+///
+/// Callers must **not** fall back to resolving the path when this returns `None`.
+/// That is the whole hazard: the path would resolve to whatever is mounted there
+/// now, and applying the fd's inode number to that filesystem is exactly the
+/// cross-mount aliasing the id exists to prevent. A vanished mount is an error.
+fn fs_for_mount_id(id: u32) -> Option<Arc<dyn Filesystem>> {
+    if id == 0 {
+        return None;
+    }
+    {
+        let tid = akuma_exec::threading::current_thread_id();
+        let overrides = SPAWN_NS_OVERRIDE.lock();
+        if let Some(ns) = overrides.get(&tid) {
+            let found = ns.mount.lock().fs_by_id(id);
+            if found.is_some() {
+                return found;
+            }
+        }
+    }
+    if let Some(proc) = akuma_exec::process::current_process_shared()
+        && let Some(fs) = proc.namespace.mount.lock().fs_by_id(id)
+    {
+        return Some(fs);
+    }
+    let table = MOUNT_TABLE.lock();
+    table.as_ref()?.fs_by_id(id)
 }
 
 /// Read for an open file description, by the inode `open(2)` bound to it when
@@ -478,6 +515,7 @@ pub fn open_file_inode(path: &str) -> Option<u32> {
 /// have — so it is recorded here rather than papered over.
 pub fn read_at_open_file(
     path: &str,
+    mount_id: u32,
     inode: u32,
     offset: usize,
     buf: &mut [u8],
@@ -485,6 +523,7 @@ pub fn read_at_open_file(
     if inode == 0 {
         return read_at(path, offset, buf);
     }
+    let _ = mount_id;
     with_fs(path, |fs, _rel| fs.read_at_by_inode(inode, offset, buf))
 }
 
@@ -499,14 +538,18 @@ pub fn read_at_open_file(
 ///
 /// Inherits [`read_at_open_file`]'s mount-aliasing caveat verbatim: the path
 /// still selects the filesystem.
-pub fn metadata_open_file(path: &str, inode: u32) -> Result<Metadata, FsError> {
+pub fn metadata_open_file(path: &str, mount_id: u32, inode: u32) -> Result<Metadata, FsError> {
     if inode == 0 {
         return metadata(path);
     }
-    with_fs(path, |fs, _rel| fs.metadata_by_inode(inode))
+    let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
+    fs.metadata_by_inode(inode)
         // A filesystem that resolved an inode for this fd but cannot stat by one
         // is not a case that exists today (the two are implemented together), but
         // falling back costs nothing and keeps this from being a new way to fail.
+        // Safe to resolve by path here, unlike the vanished-mount case above: the
+        // mount is the one this fd was opened on, so the path is being asked of
+        // the right filesystem.
         .or_else(|_| metadata(path))
 }
 

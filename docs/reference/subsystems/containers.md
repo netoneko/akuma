@@ -173,6 +173,14 @@ holding paths and cwds resolved against the old one. The complementary rule is
 `umount2`, which never lets a box lose its `/` (an empty namespace makes
 `with_fs` fall back to the **global** mount table — the whole host filesystem).
 
+**A box can still be *born* in that state.** `create_box_namespace` installs the
+jail only when `root_dir != "/"`, so a box registered with `/` as its root has no
+namespace at all and resolves every path against the host's mounts — and `"/"` is
+the default in `box create`. A jail whose mount fails is discarded silently too
+(`let _ = ns.mount.lock().mount(...)`). `umount2` guards the way *into* this
+state, nothing guards starting in it. Deferred fix:
+[`../../../proposals/jailed-boxes-by-default.md`](../../../proposals/jailed-boxes-by-default.md).
+
 **Consequence: no nested OCI images.** Composing a container root requires an
 overlay mount, and no box can mount. Nested **boxes** are unaffected — they are
 process and network-stack grouping, and a box may still register a child box

@@ -260,6 +260,15 @@ pub struct KernelFile {
     /// The inode `open(2)` resolved this path to, or `0` for "no inode: read by
     /// path". See [`KernelFile::inode`].
     inode: u32,
+    /// Which mount `inode` belongs to (`akuma_vfs::ResolvedMount::id`), captured
+    /// with it at `open(2)`.
+    ///
+    /// An inode number is only unique within one filesystem, so this is the other
+    /// half of the fd's file identity — and it is what lets `read(2)` find the
+    /// filesystem **without touching the path at all**: no `resolve_path`, no
+    /// mount-relative rewrite, and no chance of the path resolving somewhere else
+    /// than it did at `open(2)`.
+    mount_id: u32,
     /// Keeps `inode`'s data alive for as long as this descriptor exists.
     ///
     /// Nothing reads this field; like [`LazySource::File`]'s, it is load-bearing
@@ -279,21 +288,26 @@ impl KernelFile {
             flags,
             dir_cache: None,
             inode: 0,
+            mount_id: 0,
             pin: akuma_primitives::InodePin::none(),
         }
     }
 
-    /// Bind this descriptor to the inode `open(2)` resolved its path to.
+    /// Bind this descriptor to the `(mount, inode)` pair `open(2)` resolved.
     ///
     /// `read(2)` then reads by inode number instead of re-walking the directory
     /// tree on every call — the whole point of resolving here — and the pin
     /// taken alongside it gives the fd Linux's "unlinked but still open"
     /// semantics, which is what makes reading by a number that the filesystem
-    /// could otherwise reissue safe. See `src/vfs::open_file_inode` for which
-    /// opens get one and why the rest keep reading by path.
+    /// could otherwise reissue safe. See `src/vfs::open_file_ids` for which opens
+    /// get one and why the rest keep reading by path.
+    ///
+    /// The two are set together and never separately: an inode number applied to
+    /// the wrong filesystem is the aliasing this pair exists to prevent.
     #[must_use]
-    pub fn with_inode(mut self, inode: u32) -> Self {
+    pub fn with_inode(mut self, mount_id: u32, inode: u32) -> Self {
         self.inode = inode;
+        self.mount_id = mount_id;
         self.pin = akuma_primitives::InodePin::new(inode);
         self
     }
@@ -302,6 +316,12 @@ impl KernelFile {
     #[must_use]
     pub const fn inode(&self) -> u32 {
         self.inode
+    }
+
+    /// The mount this fd was opened on, or `0` when it must resolve by path.
+    #[must_use]
+    pub const fn mount_id(&self) -> u32 {
+        self.mount_id
     }
 }
 

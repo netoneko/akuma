@@ -518,7 +518,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
 
-            match crate::fs::read_at_open_file(&f.path, f.inode(), f.position, &mut temp) {
+            match crate::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), f.position, &mut temp) {
                 Ok(n) => {
                     if n > 0 {
                         if copy_to_user(buf_ptr, &temp[..n]).is_err() {
@@ -850,7 +850,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
             let limit = 64 * 1024;
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
-            match crate::fs::read_at_open_file(&f.path, f.inode(), offset as usize, &mut temp) {
+            match crate::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), offset as usize, &mut temp) {
                 Ok(n) => {
                     if n > 0
                         && copy_to_user(buf_ptr, &temp[..n]).is_err() {
@@ -1986,8 +1986,8 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         // without which reading by a number the filesystem may reissue would be
         // the `SELFHOST_ZERO_PAGE_HUNT` defect with an fd in place of an mmap.
         let file = akuma_exec::process::KernelFile::new(path.clone(), flags);
-        let file = match crate::vfs::open_file_inode(&path) {
-            Some(inode) => file.with_inode(inode),
+        let file = match crate::vfs::open_file_ids(&path) {
+            Some((mount_id, inode)) => file.with_inode(mount_id, inode),
             None => file,
         };
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::File(file));
@@ -2138,7 +2138,7 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
                     // the file is after its name is gone, instead of silently
                     // treating an unlinked-but-open fd as a zero-length file and
                     // seeking to `offset`.
-                    let size = crate::fs::metadata_open_file(&f.path, f.inode())
+                    let size = crate::fs::metadata_open_file(&f.path, f.mount_id(), f.inode())
                         .map_or(0, |m| m.size) as i64;
                     new_pos = match whence { 0 => offset, 1 => f.position as i64 + offset, 2 => size + offset, _ => -1 };
                     if new_pos >= 0 {
@@ -2191,7 +2191,7 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
             // Only this arm reaches the on-disk VFS; every other arm below synthesizes a
             // Stat from constants (or forwards cross-core, which must keep the BKL).
             let _vfs_bkl = VfsBklGuard::new();
-            if let Ok(meta) = crate::vfs::metadata_open_file(&f.path, f.inode()) {
+            if let Ok(meta) = crate::vfs::metadata_open_file(&f.path, f.mount_id(), f.inode()) {
                 stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                     crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
@@ -2532,12 +2532,14 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
     // once the fd's name is gone. Every other form takes a *path* (the dirfd
     // below is only a base to join onto), which no inode number can stand in for.
     let mut fd_inode: u32 = 0;
+    let mut fd_mount: u32 = 0;
     let resolved_path = if path.is_empty() {
         const AT_EMPTY_PATH: u32 = 0x1000;
         if flags & AT_EMPTY_PATH != 0 && dirfd >= 0 {
             if let Some(proc) = akuma_exec::process::current_process_shared() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                     fd_inode = f.inode();
+                    fd_mount = f.mount_id();
                     f.path
                 } else {
                     return EBADF;
@@ -2591,7 +2593,7 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
             (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0)
         } else {
             let final_path = if follow { crate::vfs::resolve_symlinks(&resolved_path) } else { resolved_path };
-            if let Ok(meta) = crate::vfs::metadata_open_file(&final_path, fd_inode) {
+            if let Ok(meta) = crate::vfs::metadata_open_file(&final_path, fd_mount, fd_inode) {
                 (meta.mode as u16, meta.inode, meta.size,
                  if meta.is_dir { 2 } else { 1 },
                  meta.accessed.unwrap_or(0) as i64,

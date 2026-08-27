@@ -187,20 +187,20 @@ pub fn read_at(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsErr
 
 /// Read for an open file description — by the inode `open(2)` resolved, when it
 /// resolved one. See [`vfs::read_at_open_file`].
-pub fn read_at_open_file(path: &str, inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+pub fn read_at_open_file(path: &str, mount_id: u32, inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
     if !is_initialized() {
         return Err(FsError::NotInitialized);
     }
-    vfs::read_at_open_file(path, inode, offset, buf)
+    vfs::read_at_open_file(path, mount_id, inode, offset, buf)
 }
 
 /// `stat` for an open file description — by the inode `open(2)` resolved, when
 /// it resolved one. See [`vfs::metadata_open_file`].
-pub fn metadata_open_file(path: &str, inode: u32) -> Result<crate::vfs::Metadata, FsError> {
+pub fn metadata_open_file(path: &str, mount_id: u32, inode: u32) -> Result<crate::vfs::Metadata, FsError> {
     if !is_initialized() {
         return Err(FsError::NotInitialized);
     }
-    vfs::metadata_open_file(path, inode)
+    vfs::metadata_open_file(path, mount_id, inode)
 }
 
 /// Write data at a specific offset within a file
