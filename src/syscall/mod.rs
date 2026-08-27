@@ -625,13 +625,24 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // lookup and counter bumps below, so `hs - sr` names this prologue/epilogue.
     let rp_span = crate::syscall::utils::read_profile::Span::new();
     CURRENT_SYSCALL_NR.store(syscall_num, Ordering::Relaxed);
+    crate::syscall::utils::read_profile::floor_laps::start(syscall_num);
 
     akuma_exec::threading::set_thread_current_syscall(syscall_num);
-    let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
+    // One resolution per excursion, from the per-thread identity cache
+    // (`table::THREAD_IDENTITY`): the tgid + leader `Process` pair the whole
+    // prologue/epilogue below wants. The cache is one validated slot-state
+    // load; the previous shape re-derived this up to five times per syscall
+    // (lock + map walk + IRQ-masked table scan each) and was most of the gap
+    // to Linux on a bare `getpid` (docs/archive/AKUMA_SYSCALL_PERFORMANCE_AUDIT.md).
+    let cur = akuma_exec::process::table::current_thread_tgid_process();
+    let owner_pid = cur.map_or(0, |(pid, _)| pid);
+    if let Some((_, proc)) = cur {
         proc.last_syscall.store(syscall_num, Ordering::Relaxed);
         proc.current_syscall.store(syscall_num, Ordering::Relaxed);
     }
+    crate::syscall::utils::read_profile::floor_laps::lap(
+        crate::syscall::utils::read_profile::F_LAP_IDENT,
+    );
 
     if akuma_exec::process::is_current_interrupted() {
         // Plain `Process`-field writes still rely on the BKL for cross-core exclusion
@@ -646,6 +657,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         });
         return EINTR;
     }
+    crate::syscall::utils::read_profile::floor_laps::lap(
+        crate::syscall::utils::read_profile::F_LAP_INTRPT,
+    );
 
 
     if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PSELECT6 && syscall_num != nr::PPOLL && syscall_num != nr::BRK && syscall_num != nr::MMAP && syscall_num != nr::MUNMAP && syscall_num != nr::MREMAP && syscall_num != nr::CLOSE && syscall_num != nr::FSTAT && syscall_num != nr::LSEEK && syscall_num != nr::RT_SIGPROCMASK && syscall_num != nr::NANOSLEEP && syscall_num != nr::WAITPID && syscall_num != nr::UPTIME && syscall_num != nr::FUTEX && syscall_num != nr::MEMBARRIER && syscall_num != nr::RT_SIGACTION && syscall_num != nr::SCHED_SETAFFINITY && syscall_num != nr::SCHED_GETAFFINITY {
@@ -679,15 +693,15 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     }
 
     let track_time = crate::config::PROCESS_SYSCALL_STATS;
-    if track_time {
-        let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-        if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
-            proc.syscall_stats.inc(syscall_num);
-        }
+    if track_time && let Some((_, proc)) = cur {
+        proc.syscall_stats.inc(syscall_num);
     }
 
     let need_timing = track_time || crate::config::PROC_SYSCALL_LOG_ENABLED;
     let t0 = if need_timing { crate::timer::uptime_us() } else { 0 };
+    crate::syscall::utils::read_profile::floor_laps::lap(
+        crate::syscall::utils::read_profile::F_LAP_HOOKS,
+    );
 
     // For a `stack=rump` box, the proxy intercepts socket-family syscalls (and
     // read/write/close on rump-owned fds) and forwards them to the box's
@@ -1081,32 +1095,37 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         },
     };
+    crate::syscall::utils::read_profile::floor_laps::lap(
+        crate::syscall::utils::read_profile::F_LAP_DISP,
+    );
 
     akuma_exec::threading::set_thread_current_syscall(!0u64);
-    if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
+    if let Some((_, proc)) = cur {
         proc.current_syscall.store(!0u64, Ordering::Relaxed);
     }
+    crate::syscall::utils::read_profile::floor_laps::lap(
+        crate::syscall::utils::read_profile::F_LAP_EPI1,
+    );
 
     if need_timing {
         let elapsed = crate::timer::uptime_us().saturating_sub(t0);
-        let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
         let logging = crate::config::PROC_SYSCALL_LOG_ENABLED && owner_pid != 0;
-        // One lookup feeding both consumers. The log needs `box_id` because it
-        // outlives the process: `/proc/<pid>/syscalls` stays readable after exit,
-        // and by then the process table can no longer say which box produced it.
-        let proc = if track_time || logging {
-            akuma_exec::process::lookup_process_shared(owner_pid)
-        } else {
-            None
-        };
-        if track_time && let Some(p) = &proc {
+        // `cur` is the prologue's resolution, still valid for this excursion:
+        // the own-process lifetime guarantee is exactly what
+        // `lookup_process_shared` documents for this call shape, so the
+        // epilogue's second read_current_pid + lookup pair was pure duplicate
+        // work.
+        if track_time && let Some((_, p)) = cur {
             p.syscall_stats.add_time_us(syscall_num, elapsed);
         }
         if logging {
-            let box_id = proc.as_ref().map_or(0, |p| p.box_id);
+            let box_id = cur.map_or(0, |(_, p)| p.box_id);
             log::record(owner_pid, box_id, syscall_num, t0, elapsed, result);
         }
     }
+    crate::syscall::utils::read_profile::floor_laps::lap(
+        crate::syscall::utils::read_profile::F_LAP_EPI2,
+    );
 
     // Log when a syscall returns a dangerous negative error code.  Go's runtime may
     // not check the error and dereference the negative return value as a pointer,

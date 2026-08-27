@@ -155,13 +155,39 @@ mod disabled {
             Self::new()
         }
     }
+
+    /// Floor-arm lap markers — no-ops without `read-profile`. The enabled
+    /// half lives in [`floor_laps`]; both exist so `handle_syscall` can call
+    /// them unconditionally.
+    pub mod floor_laps {
+        #[inline(always)]
+        pub fn start(_nr: u64) {}
+        #[inline(always)]
+        pub fn lap(_stage: usize) {}
+    }
 }
+
+/// Floor-arm lap indices: the suspects inside `handle_syscall`'s prologue and
+/// epilogue, timed only on the `getpid` floor arm (`FLOOR_NR`). Public so
+/// `handle_syscall` can name its lap boundaries; the statics stay private to
+/// the enabled module.
+pub const F_LAP_IDENT: usize = 0;
+pub const F_LAP_INTRPT: usize = 1;
+pub const F_LAP_HOOKS: usize = 2;
+pub const F_LAP_DISP: usize = 3;
+pub const F_LAP_EPI1: usize = 4;
+pub const F_LAP_EPI2: usize = 5;
+#[cfg_attr(not(feature = "read-profile"), allow(dead_code))]
+pub const N_FLOOR_LAPS: usize = 6;
+#[cfg_attr(not(feature = "read-profile"), allow(dead_code))]
+pub const FLOOR_LAP_NAMES: [&str; N_FLOOR_LAPS] =
+    ["ident", "intrpt", "hooks", "disp", "epi1", "epi2"];
 
 #[cfg(feature = "read-profile")]
 mod enabled {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{N_STAGES, STAGE_NAMES};
+    use super::{FLOOR_LAP_NAMES, N_STAGES, STAGE_NAMES};
 
     /// Reads per dump window.
     ///
@@ -274,6 +300,56 @@ mod enabled {
     /// `end_exception` knows to close its outer span too. Same handoff as
     /// `PENDING`, and mutually exclusive with it.
     static FLOOR_PENDING: AtomicU64 = AtomicU64::new(0);
+
+    /// Floor-arm laps (see the `F_LAP_*` constants above): per-lap tick totals,
+    /// minima, the lap-boundary timestamps for the call in flight, and whether
+    /// one is in flight. SMP=1-only like everything here: a floor call
+    /// preempted mid-flight by another thread's `getpid` interleaves laps, which
+    /// is why `n_lap` is printed — it must equal the floor `n=`.
+    #[allow(clippy::declare_interior_mutable_const, reason = "array initialiser")]
+    const FZERO: AtomicU64 = AtomicU64::new(0);
+    static FLOOR_LAP_TICKS: [AtomicU64; super::N_FLOOR_LAPS] = [FZERO; super::N_FLOOR_LAPS];
+    static FLOOR_LAP_MIN: [AtomicU64; super::N_FLOOR_LAPS] = [MAXV; super::N_FLOOR_LAPS];
+    static FLOOR_LAP_T: [AtomicU64; super::N_FLOOR_LAPS] = [FZERO; super::N_FLOOR_LAPS];
+    static FLOOR_LAP_ACTIVE: AtomicU64 = AtomicU64::new(0);
+    static N_FLOOR_LAPS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+    /// Floor-lap recording, driven from `handle_syscall`. `start` arms the lap
+    /// clock on the floor syscall only; `lap` closes one named boundary. Each
+    /// boundary is an `isb; mrs` pair (~`cal`), so a lap reads ~`cal` high —
+    /// subtract `N_FLOOR_LAPS x cal` from the lap sum before comparing it with
+    /// `hs`.
+    pub mod floor_laps {
+        use super::super::N_FLOOR_LAPS;
+        use super::{now, FLOOR_LAP_ACTIVE, FLOOR_LAP_MIN, FLOOR_LAP_T, FLOOR_LAP_TICKS};
+        use super::{FLOOR_NR, N_FLOOR_LAPS_SEEN};
+        use core::sync::atomic::Ordering;
+
+        #[inline]
+        pub fn start(nr: u64) {
+            if nr == FLOOR_NR {
+                FLOOR_LAP_ACTIVE.store(1, Ordering::Relaxed);
+                FLOOR_LAP_T[0].store(now(), Ordering::Relaxed);
+            }
+        }
+
+        #[inline]
+        pub fn lap(stage: usize) {
+            if stage >= N_FLOOR_LAPS || FLOOR_LAP_ACTIVE.load(Ordering::Relaxed) == 0 {
+                return;
+            }
+            let t = now();
+            let d = t.wrapping_sub(FLOOR_LAP_T[stage].load(Ordering::Relaxed));
+            if stage + 1 < N_FLOOR_LAPS {
+                FLOOR_LAP_T[stage + 1].store(t, Ordering::Relaxed);
+            } else {
+                FLOOR_LAP_ACTIVE.store(0, Ordering::Relaxed);
+                N_FLOOR_LAPS_SEEN.fetch_add(1, Ordering::Relaxed);
+            }
+            FLOOR_LAP_TICKS[stage].fetch_add(d, Ordering::Relaxed);
+            FLOOR_LAP_MIN[stage].fetch_min(d, Ordering::Relaxed);
+        }
+    }
 
     /// Windows printed so far — the `w=` field, so a truncated log still says
     /// which pass it came from.
@@ -457,6 +533,13 @@ mod enabled {
                     let d = now().wrapping_sub(self.start);
                     FLOOR_EXC.fetch_add(d, Ordering::Relaxed);
                     FLOOR_EXC_MIN.fetch_min(d, Ordering::Relaxed);
+                    // Floor-only workloads never open a read window, so without
+                    // this the floor block below would only ever print when a
+                    // `read(2)` happened to dump. Self-dump on the same cadence
+                    // (`N_FLOOR` was already counted by `end_handle_syscall`).
+                    if N_FLOOR.load(Ordering::Relaxed) % DUMP_EVERY == 0 {
+                        dump();
+                    }
                 }
                 return;
             }
@@ -605,6 +688,30 @@ mod enabled {
                 one(FLOOR_HS_MIN.swap(u64::MAX, Ordering::Relaxed)),
                 ns(FLOOR_HS.swap(0, Ordering::Relaxed), freq) / nf.max(1),
             );
+        }
+        // Floor laps: what `hs` is made of. One line per lap for the same
+        // fixed-buffer reason as the read stages. `n_lap` must equal the floor
+        // `n=` above — a smaller value means laps were lost (no floor `start`
+        // reached), a larger one means interleaving.
+        {
+            let nl = N_FLOOR_LAPS_SEEN.swap(0, Ordering::Relaxed).max(1);
+            crate::safe_print!(
+                160,
+                "[READPROF] w={} floorlaps n_lap={} cal={}ns (subtract per lap)\n",
+                w,
+                nl,
+                per(CAL_TICKS.load(Ordering::Relaxed)),
+            );
+            for (i, name) in FLOOR_LAP_NAMES.iter().enumerate() {
+                crate::safe_print!(
+                    128,
+                    "[READPROF] w={} flap {}: min={}ns mean={}ns\n",
+                    w,
+                    name,
+                    one(FLOOR_LAP_MIN[i].swap(u64::MAX, Ordering::Relaxed)),
+                    ns(FLOOR_LAP_TICKS[i].swap(0, Ordering::Relaxed), freq) / nl,
+                );
+            }
         }
         crate::safe_print!(
             192,

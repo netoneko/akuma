@@ -254,9 +254,17 @@ pub fn current_channel() -> Option<Arc<ProcessChannel>> {
 /// Called by syscall handlers to detect interrupt signal.
 /// Returns true if the process should terminate.
 pub fn is_current_interrupted() -> bool {
-    current_channel()
-        .map(|ch| ch.is_interrupted())
-        .unwrap_or(false)
+    // Borrowed read: this runs on every syscall (handle_syscall prologue), and
+    // `current_process_shared` is an identity-cache hit, so the whole check is
+    // a couple of loads. The old shape cloned the channel `Arc` here.
+    if let Some(proc) = current_process_shared() {
+        if let Some(ref ch) = proc.channel {
+            return ch.is_interrupted();
+        }
+        // No channel on the process → legacy kernel-thread fallback below.
+    }
+    let thread_id = crate::threading::current_thread_id();
+    get_channel(thread_id).map(|ch| ch.is_interrupted()).unwrap_or(false)
 }
 
 /// Interrupt a process by thread ID
@@ -366,6 +374,12 @@ pub static TGID_RESOLVE_MISSES: core::sync::atomic::AtomicU64 =
 /// tables, or the live TTBR0 has no process info page mapped (a bare
 /// `UserAddressSpace`), or the page says pid 0.
 pub fn read_current_pid() -> Option<Pid> {
+    // Identity cache fast path: one validated slot-state load replaces the
+    // lock + map walk + tgid table-scan this function used to pay on every
+    // resolution (several per syscall — see `table::THREAD_IDENTITY`).
+    if let Some((tgid, _)) = crate::process::table::current_thread_tgid_process() {
+        return Some(tgid);
+    }
     // vfork fast-path: a shared-AS child reads the *parent's* PROCESS_INFO page,
     // so the page no longer uniquely identifies the caller.  THREAD_PID_MAP is
     // authoritative for every user thread; resolve it to the owning process's
@@ -673,6 +687,11 @@ pub fn fault_slot_release(as_owner: Pid, page_va: usize) {
 /// object). Same lifetime caveat as [`lookup_process_shared`]: valid only
 /// while the process stays registered.
 pub fn current_process_shared() -> Option<&'static Process> {
+    // Identity cache fast path (own-process half): the map value's `Process`
+    // in two validated loads — same resolution, same fallbacks.
+    if let Some((_, proc)) = crate::process::table::current_thread_own_process() {
+        return Some(proc);
+    }
     lookup_process_shared(current_pid()?)
 }
 
@@ -691,6 +710,10 @@ pub fn with_current_process<T>(f: impl FnOnce(&mut Process) -> T) -> Option<T> {
 
 /// Resolve the current process PID (checking THREAD_PID_MAP first, then ProcessInfo page).
 pub fn current_pid() -> Option<Pid> {
+    // Identity cache fast path — the map's own-pid value, without the lock.
+    if let Some((pid, _)) = crate::process::table::current_thread_own_process() {
+        return Some(pid);
+    }
     let tid = crate::threading::current_thread_id();
     let thread_pid = with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().get(&tid).copied()

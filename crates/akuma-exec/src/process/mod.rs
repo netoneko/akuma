@@ -401,9 +401,7 @@ pub fn init() {
 
 /// Callback invoked by the threading subsystem when a thread slot is recycled.
 fn on_thread_cleanup(tid: usize) {
-    let pid_opt = with_irqs_disabled(|| {
-        table::THREAD_PID_MAP.lock().remove(&tid)
-    });
+    let pid_opt = table::thread_pid_map_remove(tid);
 
     if let Some(pid) = pid_opt {
         let remaining_threads = with_irqs_disabled(|| {
@@ -1639,9 +1637,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
             // process running the same binary collides (see `futex_key_tgid`).
             let owner = with_irqs_disabled(|| THREAD_PID_MAP.lock().get(tid).copied());
             if owner == Some(*sib_pid) {
-                with_irqs_disabled(|| {
-                    THREAD_PID_MAP.lock().remove(tid);
-                });
+                table::thread_pid_map_remove(*tid);
             }
             // The wake stays unconditional. Already marked terminated in phase 1 (or
             // self-terminated at the boundary under smp-shared); wake in case it is
@@ -1776,9 +1772,7 @@ fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
             }
             crate::threading::mark_thread_terminated(*tid);
             crate::threading::get_waker_for_thread(*tid).wake();
-            with_irqs_disabled(|| {
-                THREAD_PID_MAP.lock().remove(tid);
-            });
+            table::thread_pid_map_remove(*tid);
         }
         // NOTE: clear_lazy_regions(*pid) is intentionally NOT called here — the
         // per-process `lazy_regions` field drops inside `Process::drop` on the
@@ -1899,9 +1893,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     }
     
     // Clean up THREAD_PID_MAP entry for thread clones
-    with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().remove(&tid);
-    });
+    table::thread_pid_map_remove(tid);
 
     // CLONE_CHILD_CLEARTID: write 0 to the TID address and wake futex.
     // Must happen while user address space is still active.
@@ -2183,9 +2175,7 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
         channel.set_exited(exit_code);
     }
 
-    with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().remove(&tid);
-    });
+    table::thread_pid_map_remove(tid);
 
     // SKIP: CLEARTID write — would re-trigger EC=0x25
     // SKIP: robust futex list cleanup — would re-trigger EC=0x25
@@ -2403,9 +2393,7 @@ fn spawn_child_thread_and_publish(
 
     // See the doc comment: this is what makes `current_process_shared()` resolve to
     // the child rather than to whatever `PROCESS_INFO_ADDR` currently says.
-    with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().insert(tid, child_pid);
-    });
+    table::thread_pid_map_insert(tid, child_pid);
 
     match sigaltstack {
         ChildSigaltstack::Inherit => {

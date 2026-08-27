@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicPtr, Ordering};
 use spinning_top::Spinlock;
 
 use crate::process::Process;
@@ -502,16 +502,214 @@ pub fn count_process_states() -> (usize, usize, usize) {
 pub static THREAD_PID_MAP: Spinlock<BTreeMap<usize, Pid>> =
     Spinlock::new(BTreeMap::new());
 
-pub fn register_thread_pid(tid: usize, pid: Pid) {
+// ── Per-thread identity cache (the `current` this kernel never had) ──────
+//
+// `THREAD_PID_MAP` is authoritative but resolving through it costs a
+// spinlock + a BTreeMap walk per lookup, and the interesting resolutions then
+// need an IRQ-masked scan of the process table — the syscall entry path was
+// doing that *nine times per excursion* (prologue identity, interrupt check,
+// stats hooks, the dispatch arm's own `read_current_pid`, epilogue), which is
+// the bulk of why a bare syscall cost 3x Linux
+// (docs/archive/AKUMA_SYSCALL_PERFORMANCE_AUDIT.md).
+//
+// This array caches, per thread slot, both resolutions a caller can want:
+//
+// - **own**: the map's value for this thread — its per-thread `Process`
+//   (`clone_thread` gives every thread its own `Process` sharing the group's
+//   address space). `current_channel`/`current_process_shared` semantics.
+// - **tgid**: the thread-group leader's pid and `Process` — what
+//   `read_current_pid` + `lookup_process_shared(owner)` compute for the
+//   syscall prologue, stats and log attribution.
+//
+// Invariant: entries are written **only** inside the same IRQ-masked critical
+// section that writes `THREAD_PID_MAP` (`thread_pid_map_insert` /
+// `thread_pid_map_remove`), so map and cache can never disagree for longer
+// than one critical section. Every fast-path read re-validates the slot state
+// against `SLOT_STATES`, so a process that retired (ACTIVE→RETIRED) while a
+// straggler thread still runs falls back to the slow path — exactly what an
+// uncached lookup would do — instead of touching the entry.
+//
+// The pointer stays valid across RETIRED (deferred reclamation keeps the
+// `Process` alive) and is cleared when the map entry is removed, which is the
+// same lifetime `lookup_process_shared` documents for own-thread lookups.
+
+/// Cached identity for one thread slot. 24 B × `MAX_THREADS` — a couple of
+/// cache lines, touched by exactly one thread each.
+pub struct ThreadIdentity {
+    own_pid: AtomicU32,
+    /// Slot of the OWN process, or `INVALID_SLOT` when empty/unresolved.
+    own_slot: AtomicU16,
+    own_ptr: AtomicPtr<Process>,
+    tgid: AtomicU32,
+    tgid_slot: AtomicU16,
+    tgid_ptr: AtomicPtr<Process>,
+}
+
+const INVALID_SLOT: u16 = u16::MAX;
+
+impl ThreadIdentity {
+    const fn new() -> Self {
+        Self {
+            own_pid: AtomicU32::new(0),
+            own_slot: AtomicU16::new(INVALID_SLOT),
+            own_ptr: AtomicPtr::new(core::ptr::null_mut()),
+            tgid: AtomicU32::new(0),
+            tgid_slot: AtomicU16::new(INVALID_SLOT),
+            tgid_ptr: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+}
+
+use crate::threading::types::MAX_THREADS;
+static THREAD_IDENTITY: [ThreadIdentity; MAX_THREADS] = {
+    const INIT: ThreadIdentity = ThreadIdentity::new();
+    [INIT; MAX_THREADS]
+};
+
+/// Fast-path fallbacks: reads that missed the cache and took the slow path.
+/// Diagnostic only — nonzero steady-state means a writer site bypassed the
+/// wrappers and the map and cache have diverged.
+pub static IDENTITY_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Resolve `pid` in the table and store both identity halves for `tid`.
+/// Caller must hold IRQs masked (scans the slots like `get_process_ptr_inner`).
+/// An unresolvable pid (insert raced ahead of `register_process`) stores the
+/// invalid marker: fast paths miss, slow paths answer, nothing is wrong.
+fn identity_store_locked(tid: usize, pid: Pid) {
+    if tid >= MAX_THREADS {
+        return;
+    }
+    let e = &THREAD_IDENTITY[tid];
+    let mut tgid = pid;
+    let mut tgid_slot = INVALID_SLOT;
+    let mut tgid_ptr: *mut Process = core::ptr::null_mut();
+    let mut own_slot = INVALID_SLOT;
+    let mut own_ptr: *mut Process = core::ptr::null_mut();
+    for i in 0..MAX_PROCESSES {
+        if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
+            continue;
+        }
+        let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
+        if ptr.is_null() {
+            continue;
+        }
+        let p = unsafe { &*ptr };
+        if p.pid == pid {
+            own_slot = i as u16;
+            own_ptr = ptr;
+            tgid = p.tgid;
+            tgid_slot = i as u16;
+            tgid_ptr = ptr;
+            break;
+        }
+    }
+    // A CLONE_THREAD child's own pid differs from its tgid: resolve the leader
+    // in a second pass (the first pass stopped at the own hit).
+    if tgid != pid {
+        tgid_slot = INVALID_SLOT;
+        tgid_ptr = core::ptr::null_mut();
+        for i in 0..MAX_PROCESSES {
+            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
+                continue;
+            }
+            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
+            if !ptr.is_null() && unsafe { (*ptr).pid } == tgid {
+                tgid_slot = i as u16;
+                tgid_ptr = ptr;
+                break;
+            }
+        }
+    }
+    e.own_pid.store(pid, Ordering::Relaxed);
+    e.own_slot.store(own_slot, Ordering::Relaxed);
+    e.own_ptr.store(own_ptr, Ordering::Release);
+    e.tgid.store(tgid, Ordering::Relaxed);
+    e.tgid_slot.store(tgid_slot, Ordering::Relaxed);
+    e.tgid_ptr.store(tgid_ptr, Ordering::Release);
+}
+
+/// Invalidate `tid`'s cached identity. Caller must hold IRQs masked.
+fn identity_clear_locked(tid: usize) {
+    if tid >= MAX_THREADS {
+        return;
+    }
+    let e = &THREAD_IDENTITY[tid];
+    e.own_slot.store(INVALID_SLOT, Ordering::Relaxed);
+    e.own_ptr.store(core::ptr::null_mut(), Ordering::Release);
+    e.tgid_slot.store(INVALID_SLOT, Ordering::Relaxed);
+    e.tgid_ptr.store(core::ptr::null_mut(), Ordering::Release);
+}
+
+/// Publish `tid` → `pid` in `THREAD_PID_MAP` **and** refresh the identity
+/// cache, atomically w.r.t. both. Every non-test map insert must go through
+/// here — a bare `THREAD_PID_MAP.lock().insert` leaves a stale cache entry
+/// behind (or none, so the thread runs on the slow path forever).
+pub fn thread_pid_map_insert(tid: usize, pid: Pid) {
     with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().insert(tid, pid);
+        identity_store_locked(tid, pid);
     });
 }
 
-pub fn unregister_thread_pid(tid: usize) {
+/// Remove `tid`'s map entry **and** invalidate the identity cache, atomically.
+/// Every non-test map removal must go through here. Returns the removed pid
+/// (the map's `remove` semantics — `on_thread_cleanup` decides reaping on it).
+pub fn thread_pid_map_remove(tid: usize) -> Option<Pid> {
     with_irqs_disabled(|| {
-        THREAD_PID_MAP.lock().remove(&tid);
-    });
+        let prev = THREAD_PID_MAP.lock().remove(&tid);
+        identity_clear_locked(tid);
+        prev
+    })
+}
+
+/// Read one half of the current thread's cached identity, re-validating the
+/// slot state the same way `get_process_ptr_inner` does (state first, then
+/// pointer). `own=false` selects the tgid-leader half.
+fn identity_get(own: bool) -> Option<(Pid, &'static Process)> {
+    let tid = crate::threading::current_thread_id();
+    if tid >= MAX_THREADS {
+        return None;
+    }
+    let e = &THREAD_IDENTITY[tid];
+    let slot = if own { e.own_slot.load(Ordering::Acquire) } else { e.tgid_slot.load(Ordering::Acquire) };
+    if slot == INVALID_SLOT {
+        IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let slot = slot as usize;
+    if slot >= MAX_PROCESSES || SLOT_STATES[slot].load(Ordering::Relaxed) != slot_state::ACTIVE {
+        IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let ptr = if own { e.own_ptr.load(Ordering::Acquire) } else { e.tgid_ptr.load(Ordering::Acquire) };
+    if ptr.is_null() {
+        IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let pid = if own { e.own_pid.load(Ordering::Relaxed) } else { e.tgid.load(Ordering::Relaxed) };
+    Some((pid, unsafe { &*ptr }))
+}
+
+/// The current thread's **tgid** and its thread-group leader's `Process` —
+/// the `read_current_pid()` + `lookup_process_shared(owner)` pair the syscall
+/// entry path wants, in two validated loads. `None` → use the slow paths.
+pub fn current_thread_tgid_process() -> Option<(Pid, &'static Process)> {
+    identity_get(false)
+}
+
+/// The current thread's **own** pid and per-thread `Process` — the
+/// `current_pid()` + `lookup_process_shared` pair (`current_process_shared`
+/// semantics) in two validated loads.
+pub fn current_thread_own_process() -> Option<(Pid, &'static Process)> {
+    identity_get(true)
+}
+
+pub fn register_thread_pid(tid: usize, pid: Pid) {
+    thread_pid_map_insert(tid, pid);
+}
+
+pub fn unregister_thread_pid(tid: usize) {
+    thread_pid_map_remove(tid);
 }
 
 /// The pid that currently owns thread slot `tid`, or `None` if nobody claims it.

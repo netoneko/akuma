@@ -1,8 +1,8 @@
 # Why a bare syscall costs 3x Linux (2026-08-27)
 
-Status: **open — handoff brief.** The floor is measured and the rig to measure
-it is in the tree. The cause is not established. Four candidates have been
-tested and killed; one strong lead has been read in the source but never timed.
+Status: **RESOLVED (same day) — cause established, fixed, re-measured.** See
+"Resolution" at the bottom. The original handoff brief is preserved below
+verbatim, followed by the deferred follow-ups.
 
 Scope: **the syscall boundary only** — `svc` in, `eret` out, with nothing in
 between. Read-path work is a different document
@@ -176,6 +176,71 @@ used a stale binary). Unknown, cheap to test, and the natural companion to the
    syscall, cheap individually, on a shared line.
 4. **`is_current_interrupted()`** in the prologue, before the dispatch.
 
+## Deferred: audit for duplicate instrumentation machinery
+
+**Deferred — pick up with the waste sweep above.** Reading the entry path for
+this audit found several *overlapping* recorders paying for the same fact on
+every syscall, grown one diagnostic at a time:
+
+- "What syscall is running" is recorded **four times** per excursion:
+  `CURRENT_SYSCALL_NR` (global), `THREAD_CURRENT_SYSCALL[tid]`
+  (`set_thread_current_syscall`), `Process::current_syscall`, and
+  `Process::last_syscall` — the last two via a full process lookup.
+- Two independent counters systems (`syscall_counters::inc_*` with its own
+  22-arm `match` before dispatch, and `ProcessSyscallStats` keyed off
+  `PROCESS_SYSCALL_STATS`), plus the `PROC_SYSCALL_LOG` ring (`log::record`:
+  spinlock + BTreeMap + VecDeque push per syscall).
+- The wrap layer adds `note_exception_entry`, `note_exc_class`,
+  `SYNC_EC_EL0[ec]`, `record_el0_trap` — several unconditional.
+- `with_irqs_disabled` itself hides a per-call `isb`
+  (`crates/akuma-primitives/src/irq.rs` `IrqGuard::new`), so every masked
+  region — a dozen per syscall with the flags on — pays a context-sync
+  barrier. Whether that `isb` is required for `DAIF` masking semantics at all
+  (Linux's `arch_local_irq_disable` has none) is part of this audit.
+
+The audit should determine, per recorder: who reads it, is that reader still
+alive, and what one shared recording point would cost instead.
+
+## Deferred: a per-syscall-path waste sweep
+
+**Deferred — do after the `current`-resolution fix lands and is re-measured.**
+The identity-lookup finding below generalizes: the syscall layer was grown one
+diagnostic at a time, and nobody has audited the *whole* dispatch path for
+work that is repeated, uncached, or allocated where a fixed buffer would do.
+When picked up:
+
+- **Clustered lookups**: values that arms routinely consume *together* (pid +
+  tgid-leader `Process` + `channel` + `box_id`, the fd-table pointer) should
+  come back as **one** cached resolution — ideally one struct per thread so a
+  conjunction of N values costs the same one or two validated loads as any
+  single value, instead of N accessor calls each re-validating. The identity
+  cache added by this audit already clusters the pid/`Process` pair; extending
+  the cluster is cheaper than adding more parallel caches, because each
+  parallel cache is another set of writers to keep in sync. Decide cluster
+  membership empirically: log which fields each syscall family actually reads
+  (read/write/openat/futex first), then cluster what co-occurs.
+- **Repeated resolution**: count every call to `read_current_pid`,
+  `current_process_shared`, `lookup_process_shared`, `current_channel`,
+  `with_current_process`, `uptime_us` *per syscall* (each entry arm, not just
+  `getpid`) — anything resolved more than once per excursion is a candidate to
+  hoist to one resolution threaded through the arm. The floor work found
+  4×/5× per `getpid`; read/write arms start with `current_process_shared`
+  again inside `sys_*` and are unaudited.
+- **Mismanaged allocations**: per-syscall heap churn that a stack buffer or a
+  per-thread scratch buffer would remove (`Vec`/`String` builds in hot arms,
+  `Arc` clones where a borrowed read suffices — `current_channel`'s
+  `Arc<ProcessChannel>` clone per syscall is the known example).
+- **Not caching results**: any pure function of the process/thread re-derived
+  per call (pid, tgid, box_id, fd-table pointer, signal state) belongs in the
+  per-thread identity cache or the `Process`, not re-derived.
+- **Redundant flag/counter work**: the per-syscall counter `match` (22 arms
+  before dispatch) and tripwires that run even when their diagnostic is off at
+  runtime.
+
+Method: same as this audit — ablation A/B on a plain build, spans on a
+`read-profile` build, arithmetic that closes. Start from the biggest syscall
+families (read/write/openat/futex) since they dominate real workloads.
+
 ## The measurement rig
 
 ```bash
@@ -234,8 +299,66 @@ wrapper in front of each `svc`, worth ~1.5 µs on the Linux side.
 Linux does a bare `getpid` in ~147 ns on this hardware including its own
 hardening. Akuma has no KPTI, no seccomp, no audit, and a single core — so the
 floor should be *at or below* Linux's, not 2–3× above it. There is no structural
-reason for the gap; it is accumulated per-syscall bookkeeping that has never
-been measured, which is exactly what this document exists to hand over.
+reason for the gap; it is accumulated per-syscall bookkeeping that has never been
+measured, which is exactly what this document exists to hand over.
+
+## Resolution (2026-08-27, same day)
+
+**Cause confirmed: the prime lead was right, and bigger than written here.**
+The unconditional prologue/epilogue re-derived "who am I" up to **nine times
+per syscall** (not the 2–3 counted above): `read_current_pid` ×4 (prologue,
+stats block, `sys_getpid`'s own arm, epilogue), `lookup_process_shared` ×5
+(prologue, `is_current_interrupted` → `current_process_shared`, stats, epilogue
+clear, epilogue timing), each costing an `isb` (every `with_irqs_disabled`
+executes one — `IrqGuard::new`), a spinlock+BTreeMap walk, and a
+**256**-slot masked scan (`MAX_PROCESSES` is 256 now, not 64 as this brief
+said). Ablation ladder on the plain kernel priced the pieces (best-of-100×100,
+same day, same host):
+
+| arm | getpid | delta | names |
+|---|---:|---:|---|
+| R0 baseline (shipping flags) | 410 | | |
+| A2 − `is_current_interrupted` | 370 | 40 | lock+map+scan + `Arc` clone |
+| A3 − prologue/epilogue identity block | 330 | 40 | `read_current_pid` + lookup + stores |
+| R0f flags off (pre-fix) | 240 | | → flags' own hooks ≈ 90 ns |
+| **F1 fixed, shipping flags** | **150** | **−260** | |
+| F1f fixed, flags off | 120 | 30 | remaining flag tax: `log::record` + `uptime_us` ×2 + inc/add |
+| Linux, same probe (Lima `vz`) | 147 | | parity (different hypervisor caveat) |
+
+The lap instrument added to `read_profile` (floor-arm laps, `F_LAP_*`) bounded
+each cluster at ≤~41 ns warm but is tick-floored (41.7 ns) — the ablations
+above are the numbers to trust. `read-profile`'s own overhead measured ~450 ns
+with the laps today (~210 without, matching the brief's estimate).
+
+**Fix**: a per-thread identity cache, `table::THREAD_IDENTITY`
+(`crates/akuma-exec/src/process/table.rs`) — for each thread slot, both
+resolutions a caller can want (own pid+`Process` for `current_process_shared`
+semantics; tgid+leader `Process` for the syscall prologue/stats/log), written
+only inside the same IRQ-masked critical section that writes `THREAD_PID_MAP`
+(`thread_pid_map_insert`/`_remove` wrappers; every non-test map write site was
+converted), re-validated against `SLOT_STATES` on every fast read so a retired
+process falls back exactly like an uncached lookup. `handle_syscall` resolves
+once and threads it through; `is_current_interrupted` reads the borrowed
+channel instead of cloning the `Arc`. `IDENTITY_FALLBACKS` counts slow-path
+fallbacks (health check: nonzero *steady-state* means a writer bypassed the
+wrappers).
+
+Collateral: warm 4 KB `pread` 2110 → **1100 ns** (the `fd` stage's
+`current_process_shared` is now a cache hit); guest `rustc` self-host build
+passes on the fixed kernel.
+
+Validation: full host suite 824/824, `akuma-exec` 269/269, clippy clean,
+`read-profile` arm builds, in-kernel boot suite passes, devbox boots sshd/shell
+and runs the full probe. **Not yet soaked at SMP>1** (measured at `SMP=1`;
+the cache is written under the map's existing IRQ-mask+lock discipline but the
+`forktest_smp_matrix` should run before trusting `SMP=4` numbers).
+
+Observed once, pre-existing (also on the unfixed kernel): a guest read-back
+anomaly — `md5sum` of a freshly-pushed file disagreed with its true md5 while
+`exec` read it correctly, and one guest `cargo` run died parsing its own dep-info
+`.d` file as non-UTF-8 (a user rebuild did not reproduce). Signature points at
+ext2 page-cache coherence, not this change. Uninvestigated — needs its own doc
+if it recurs.
 
 ## Background
 

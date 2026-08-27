@@ -556,10 +556,9 @@ pub fn spawn_process_with_channel_ext(
         }) {
             // Register in THREAD_PID_MAP so on_thread_cleanup can reap this
             // process when the thread slot is recycled.  Without this, the
-            // process becomes a permanent zombie.
-            crate::runtime::with_irqs_disabled(|| {
-                crate::process::table::THREAD_PID_MAP.lock().insert(tid, pid);
-            });
+            // process becomes a permanent zombie. The wrapper also refreshes
+            // the per-thread identity cache (same critical section).
+            crate::process::table::thread_pid_map_insert(tid, pid);
 
             // Move the channel registration to the correct TID
             remove_channel(0);
