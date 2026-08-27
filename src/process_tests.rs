@@ -869,6 +869,11 @@ pub fn run_all_tests() {
     // must preserve.
     test_openat();
 
+    // Per-fd inode caching: read(2) serves the inode open(2) resolved, so an fd
+    // survives its name being unlinked or renamed over — and the ext2 pin checks
+    // that makes safe. Runs right after test_openat, whose fixtures it mirrors.
+    test_read_uses_the_fd_inode();
+
     // procfs read_at's whitelist must cover every path read_file renders — the
     // gap that made /proc/cores open and stat fine but 404 on every read.
     test_procfs_virtual_files_are_readable();
@@ -3305,6 +3310,166 @@ fn test_pvec2() {
 /// dirfd — same family as the unlinkat regression) must resolve against fd 7, the
 /// `/dev/null` early return keeps the BKL and still allocates a usable fd, and every
 /// error path (EBADF before the window, ENOENT inside it) leaves the window balanced.
+/// `read(2)` reads by the inode `open(2)` resolved, not by re-walking the path
+/// on every call. Four consequences, and this pins all four:
+///
+/// 1. **The fd is bound to a file, not to a name.** Unlink it and the fd goes on
+///    reading it — POSIX "unlinked but still open", which the path-based read
+///    answered `ENOENT`. The pin `KernelFile::with_inode` takes is what makes
+///    that safe rather than a read of a recycled inode number.
+/// 2. **Rename-over is the same story**, and the dangerous one: atomic replace
+///    (`write .tmp`, `rename` over) is what `cargo` and `apk` do all day, and
+///    ext2's `rename` used to free the destination inode with no pin check at
+///    all (`Ext2Filesystem::release_last_link`). Reading by inode without that
+///    fix is the `SELFHOST_ZERO_PAGE_HUNT.md` §14 defect with an fd in place of
+///    an mmap.
+/// 3. **A directory fd still refuses to read**, `EISDIR` — `read_at_by_inode`
+///    had no `S_IFDIR` check because until now no `read(2)` reached it.
+/// 4. **A path with no inode identity keeps reading by path.** `/etc/mtab` is
+///    the case that matters: it is a resolve-time synthetic served ahead of the
+///    mount, so an fd that bound itself to a real on-disk `/etc/mtab` would
+///    serve stale bytes instead of the live mount list.
+///
+/// Runs against the real syscalls and the real ext2, for the reason the pin test
+/// above gives: every one of these defects lives in the interaction between the
+/// two, and a mock of either would pass throughout.
+fn test_read_uses_the_fd_inode() {
+    use crate::syscall::{handle_syscall, nr};
+    use akuma_exec::process::open_flags;
+
+    const AT_FDCWD: i32 = -100;
+    const ROOT: &str = "/tmp/fdinode_selftest";
+    const OLD: &[u8] = b"THE BYTES THE FD OPENED";
+    const NEW: &[u8] = b"a replacement file!!!!!";
+
+    let victim = format!("{ROOT}/victim.txt");
+    let replacement = format!("{ROOT}/replacement.txt");
+    let doomed = format!("{ROOT}/doomed.txt");
+
+    // Best-effort clean slate (a crashed prior run may have left the tree).
+    clean_at_test_tree(ROOT, &["victim.txt", "replacement.txt", "doomed.txt"]);
+    let _ = crate::fs::create_dir(ROOT);
+
+    let pid: u32 = 7706;
+    let tid = register_at_syscall_process(pid, ROOT.to_string());
+
+    let openat = |path: &[u8], flags: u32| -> u64 {
+        handle_syscall(nr::OPENAT, &[AT_FDCWD as u64, path.as_ptr() as u64, u64::from(flags), 0, 0, 0])
+    };
+    let read = |fd: u64, buf: &mut [u8]| -> u64 {
+        handle_syscall(nr::READ, &[fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0])
+    };
+    let close = |fd: u64| { handle_syscall(nr::CLOSE, &[fd, 0, 0, 0, 0, 0]); };
+    let fd_inode = |fd: u64| -> u32 {
+        match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd as u32)) {
+            Some(akuma_exec::process::FileDescriptor::File(f)) => f.inode(),
+            _ => 0,
+        }
+    };
+
+    let mut fails = 0u32;
+
+    // 1. open() binds the fd to the file's inode, and read() serves its bytes.
+    let _ = crate::fs::write_file(&doomed, OLD);
+    let want_inode = crate::vfs::resolve_inode(&doomed).unwrap_or(0);
+    let p = cstr(&doomed);
+    let fd = openat(&p, open_flags::O_RDONLY);
+    if (fd as i64) < 0 || want_inode == 0 || fd_inode(fd) != want_inode {
+        fails += 1;
+        crate::safe_print!(128, "[Test] fd-inode bind FAILED fd={} fd_inode={} want={}\n",
+            fd, fd_inode(fd), want_inode);
+    }
+
+    // 2. Unlinked but still open: the name goes, the fd keeps reading the file.
+    //    Path-based reads answered ENOENT here.
+    if (fd as i64) >= 0 {
+        let _ = crate::fs::remove_file(&doomed);
+        let mut buf = [0u8; 32];
+        let n = read(fd, &mut buf);
+        if n != OLD.len() as u64 || &buf[..OLD.len()] != OLD {
+            fails += 1;
+            crate::safe_print!(160, "[Test] fd-inode read-after-unlink FAILED n={} (want {})\n",
+                n, OLD.len());
+        }
+        close(fd);
+    }
+
+    // 3. Atomic replace: the fd keeps the file it opened, the *name* gets the
+    //    new one. Before ext2's rename honoured the pin, the old inode was
+    //    freed here and this read came back short (or as another file).
+    let _ = crate::fs::write_file(&victim, OLD);
+    let _ = crate::fs::write_file(&replacement, NEW);
+    let p = cstr(&victim);
+    let fd = openat(&p, open_flags::O_RDONLY);
+    if (fd as i64) < 0 {
+        fails += 1;
+        crate::safe_print!(96, "[Test] fd-inode rename fixture FAILED fd={}\n", fd);
+    } else {
+        let renamed = crate::fs::rename(&replacement, &victim).is_ok();
+        let mut buf = [0u8; 32];
+        let n = read(fd, &mut buf);
+        let mut fresh = [0u8; 32];
+        let fresh_n = crate::fs::read_at(&victim, 0, &mut fresh).unwrap_or(0);
+        if !renamed || n != OLD.len() as u64 || &buf[..OLD.len()] != OLD {
+            fails += 1;
+            crate::safe_print!(192,
+                "[Test] fd-inode read-after-rename-over FAILED renamed={} n={} (want {})\n",
+                renamed, n, OLD.len());
+        }
+        // ...and the name now serves the replacement, so this is a real
+        // rename-over and not a no-op that would pass the check above trivially.
+        if fresh_n != NEW.len() || &fresh[..NEW.len()] != NEW {
+            fails += 1;
+            crate::safe_print!(160, "[Test] fd-inode rename-over did not replace the name (n={})\n",
+                fresh_n);
+        }
+        close(fd);
+    }
+
+    // 4. A directory fd still refuses to read. `read_at_by_inode` grew the
+    //    S_IFDIR check for exactly this call.
+    let p = cstr(ROOT);
+    let fd = openat(&p, open_flags::O_RDONLY);
+    if (fd as i64) < 0 {
+        fails += 1;
+        crate::safe_print!(96, "[Test] fd-inode dir open FAILED fd={}\n", fd);
+    } else {
+        let mut buf = [0u8; 32];
+        let n = read(fd, &mut buf);
+        if n != EISDIR {
+            fails += 1;
+            crate::safe_print!(96, "[Test] fd-inode dir read FAILED n={} (want EISDIR)\n", n);
+        }
+        close(fd);
+    }
+
+    // 5. `/etc/mtab` must NOT bind an inode: it is synthesised at read time, and
+    //    an fd bound to a same-named on-disk file would serve stale bytes.
+    let p = cstr("/etc/mtab");
+    let fd = openat(&p, open_flags::O_RDONLY);
+    if (fd as i64) >= 0 {
+        let mut buf = [0u8; 128];
+        let n = read(fd, &mut buf);
+        let live = (n as i64) > 0 && buf[..n as usize].contains(&b'/');
+        if fd_inode(fd) != 0 || !live {
+            fails += 1;
+            crate::safe_print!(128, "[Test] fd-inode mtab FAILED inode={} n={}\n", fd_inode(fd), n);
+        }
+        close(fd);
+    }
+
+    unregister_at_syscall_process(pid, tid);
+    clean_at_test_tree(ROOT, &["victim.txt", "replacement.txt", "doomed.txt"]);
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] read_uses_the_fd_inode PASSED (inode {} bound, survived unlink and rename-over)\n",
+            want_inode);
+    } else {
+        crate::safe_print!(96, "[Test] read_uses_the_fd_inode FAILED ({} checks)\n", fails);
+        panic!("read_uses_the_fd_inode");
+    }
+}
+
 fn test_openat() {
     use crate::syscall::{handle_syscall, nr};
     use akuma_exec::process::open_flags;

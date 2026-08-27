@@ -16,9 +16,13 @@
 //! attempted for full POSIX fidelity.
 //!
 //! Locked by **path string**, not inode — two different paths to the same
-//! inode (hardlinks, bind mounts) are NOT recognised as the same lock. Same
-//! trade-off `KernelFile` itself already makes (it stores a path, not an
-//! inode number), so this doesn't give up anything `KernelFile` already had.
+//! inode (hardlinks, bind mounts) are NOT recognised as the same lock. This
+//! used to be the same trade-off `KernelFile` made, and so cost nothing extra;
+//! since per-fd inode caching a `KernelFile` *does* carry the inode
+//! (`KernelFile::inode`), so keying locks on it is now a small, self-contained
+//! change rather than a missing mechanism. Not done here: the lock table is
+//! path-keyed end to end (`flock_release` takes a `&str`), and nothing in tree
+//! flocks a hardlink.
 
 use super::*;
 use alloc::sync::Arc;

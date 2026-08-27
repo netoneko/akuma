@@ -289,6 +289,17 @@ caching, not the block cache**: resolve the path once at `open(2)` and let
 `read(2)` use `read_at_by_inode` (which the mmap/exec fault path already does)
 instead of re-walking the tree on every call.
 
+**Landed 2026-08-27** — [`EXT2_PER_FD_INODE_READ_PATH.md`](EXT2_PER_FD_INODE_READ_PATH.md).
+Measured as a within-boot difference (deep path vs shallow path, same bytes),
+because absolute times across boots are exactly the trap §8 describes: the
+per-read path walk went from **177 us/read with disjoint ranges to 16 us/read
+inside the noise**, and a host test puts the tree walks at 64 -> 0 and the
+block-cache accesses at 20 -> 2 per read. It also turned up three pre-existing
+ext2 defects that had to be fixed before reading by a raw inode number was safe
+- chiefly that `rename` freed its destination inode with **no `is_pinned`
+check at all**, i.e. atomic replace could pull an inode out from under a live
+mmap, which is `SELFHOST_ZERO_PAGE_HUNT.md` §14 reached by a second route.
+
 Not done:
 
   bundled. Still the fix for **F-1** above (the global page cache keys on inode

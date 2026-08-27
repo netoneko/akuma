@@ -811,6 +811,184 @@ fn repeated_pin_unlink_cycles_do_not_exhaust_the_deferral_list() {
     );
 }
 
+/// The read lever itself, measured deterministically instead of timed.
+///
+/// `Filesystem::read_at` re-resolves the path on **every** call — a full
+/// `lookup_path_internal` walk plus a `read_inode` per component — which is
+/// what `docs/archive/EXT2_WRITEBACK_DESIGN.md` § D-4 identified as the real
+/// cost of a `read(2)` once the block cache had made the data itself warm.
+/// `read_at_by_inode` skips all of it, and per-fd inode caching is what lets
+/// `read(2)` use it.
+///
+/// Wall-clock cannot carry this claim on this host — the same probe has
+/// measured the same commit 2x apart between sessions (`README.md`
+/// § Performance) — but the work counts do not move at all between runs.
+/// Measured here (5 components, 3000-byte file, 64 reads): **20 block-cache
+/// accesses per read by path, 2 by inode**, and 64 tree walks against 0.
+#[test]
+fn reading_by_inode_does_no_path_walk() {
+    let fs = mount_empty();
+    fs.create_dir("/deep").unwrap();
+    fs.create_dir("/deep/tree").unwrap();
+    fs.create_dir("/deep/tree/of").unwrap();
+    fs.create_dir("/deep/tree/of/dirs").unwrap();
+    const PATH: &str = "/deep/tree/of/dirs/payload.bin";
+    fs.write_file(PATH, &[0x5Au8; 3000]).unwrap();
+    let inode = fs.resolve_inode(PATH).unwrap();
+
+    // Warm every block both forms touch, so what follows is the steady-state
+    // cost of a repeated read and not a cold-mount artifact.
+    let mut buf = [0u8; 3000];
+    fs.read_at(PATH, 0, &mut buf).unwrap();
+    fs.read_at_by_inode(inode, 0, &mut buf).unwrap();
+
+    const READS: u64 = 64;
+
+    let (w0, b0) = fs.work_counters();
+    for _ in 0..READS {
+        assert_eq!(fs.read_at(PATH, 0, &mut buf).unwrap(), 3000);
+    }
+    let (w1, b1) = fs.work_counters();
+    for _ in 0..READS {
+        assert_eq!(fs.read_at_by_inode(inode, 0, &mut buf).unwrap(), 3000);
+    }
+    let (w2, b2) = fs.work_counters();
+
+    let (path_walks, path_blocks) = (w1 - w0, b1 - b0);
+    let (inode_walks, inode_blocks) = (w2 - w1, b2 - b1);
+
+    assert_eq!(path_walks, READS, "read_at walks the tree once per call");
+    assert_eq!(inode_walks, 0, "read_at_by_inode must never walk the tree");
+    assert!(
+        inode_blocks < path_blocks,
+        "reading by inode must touch fewer blocks per read \
+         (by path: {path_blocks} for {READS} reads, by inode: {inode_blocks})",
+    );
+    // The saving is the walk: one `read_inode` plus one directory-data read per
+    // component, five components deep here. Asserted as a floor rather than an
+    // exact figure so a future change to how a directory is read is a
+    // measurement to re-take, not a test to silence.
+    assert!(
+        path_blocks - inode_blocks >= READS * 5,
+        "a 5-component walk should cost at least one block access per component \
+         (by path: {path_blocks}, by inode: {inode_blocks}, over {READS} reads)",
+    );
+}
+
+/// The gap the per-fd inode cache closed: `rename` unlinks its destination's
+/// last name exactly as `remove_file` does, but only `remove_file` consulted the
+/// pin. Atomic replace (`write foo.tmp; rename foo.tmp foo`) is what `cargo` and
+/// `apk` do all day, so this was the *likeliest* way to pull an inode out from
+/// under a live reader — an mmap region, or an fd opened before the rename.
+#[test]
+fn rename_over_a_pinned_inode_keeps_its_data_readable() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/config", b"THE OPEN READER'S BYTES").unwrap();
+    let victim = fs.resolve_inode("/config").unwrap();
+    let pin = akuma_primitives::InodePin::new(victim);
+
+    fs.write_file("/config.tmp", b"replacement").unwrap();
+    fs.rename("/config.tmp", "/config").unwrap();
+
+    // The name now resolves to the replacement...
+    assert_ne!(fs.resolve_inode("/config").unwrap(), victim);
+    assert_eq!(fs.read_file("/config").unwrap(), b"replacement");
+    // ...and the reader that opened the old one still reads the old one, in
+    // full. Before the fix this read `Ok(0)` (i_size truncated to zero), and
+    // after reissue it read the next file created.
+    let mut buf = [0u8; 23];
+    assert_eq!(
+        fs.read_at_by_inode(victim, 0, &mut buf).unwrap(),
+        23,
+        "a pinned inode must not read short after being renamed over",
+    );
+    assert_eq!(&buf, b"THE OPEN READER'S BYTES");
+    assert_eq!(fs.deferred_free_len(), 1, "the free must be queued, not lost");
+
+    drop(pin);
+}
+
+/// The unchanged path: with nothing holding it, a renamed-over destination is
+/// still freed on the spot, so the fix costs nothing on the common case.
+#[test]
+fn rename_over_an_unpinned_inode_frees_immediately() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/dst", b"doomed").unwrap();
+    let victim = fs.resolve_inode("/dst").unwrap();
+    fs.write_file("/src", b"winner").unwrap();
+
+    fs.rename("/src", "/dst").unwrap();
+
+    assert_eq!(fs.deferred_free_len(), 0, "nothing to defer");
+    let mut buf = [0u8; 6];
+    assert_eq!(
+        fs.read_at_by_inode(victim, 0, &mut buf).unwrap(),
+        0,
+        "an unpinned destination is truncated and freed as before",
+    );
+    assert_eq!(fs.read_file("/dst").unwrap(), b"winner");
+    assert!(!fs.exists("/src"), "the source name must be gone");
+}
+
+/// POSIX: renaming a name onto itself does nothing and succeeds. The old code
+/// unlinked the shared inode, dropped its last link, freed it, then re-added a
+/// dirent pointing at the freed number — `mv a a` destroyed the file.
+#[test]
+fn rename_onto_itself_keeps_the_file() {
+    let fs = mount_empty();
+    fs.write_file("/keepme", b"still here").unwrap();
+    let inode = fs.resolve_inode("/keepme").unwrap();
+
+    fs.rename("/keepme", "/keepme").unwrap();
+
+    assert_eq!(fs.resolve_inode("/keepme").unwrap(), inode, "same inode");
+    assert_eq!(fs.read_file("/keepme").unwrap(), b"still here");
+}
+
+/// A fast symlink stores its target *string* in `direct_blocks`, so truncating
+/// one frees whatever block numbers those characters happen to spell.
+/// `remove_file` guarded against that; `rename` reached the same truncate
+/// without the guard. Stray frees show up as free blocks appearing from nowhere.
+#[test]
+fn rename_over_a_fast_symlink_frees_no_stray_blocks() {
+    let fs = mount_empty();
+    fs.create_symlink("/link", "some/relative/target.txt").unwrap();
+    fs.write_file("/newfile", b"replaces the link").unwrap();
+    let free_before = fs.stats().unwrap().free_blocks;
+
+    fs.rename("/newfile", "/link").unwrap();
+
+    assert_eq!(
+        fs.stats().unwrap().free_blocks,
+        free_before,
+        "renaming over a fast symlink must free no data blocks at all",
+    );
+    assert_eq!(fs.read_file("/link").unwrap(), b"replaces the link");
+}
+
+/// `read(2)` on a directory fd reaches `read_at_by_inode` now that the fd
+/// carries an inode, and must refuse exactly where the path-based `read_at`
+/// does rather than handing back raw dirent bytes.
+#[test]
+fn read_at_by_inode_refuses_a_directory() {
+    let fs = mount_empty();
+    fs.create_dir("/somedir").unwrap();
+    let inode = fs.resolve_inode("/somedir").unwrap();
+
+    let mut buf = [0u8; 32];
+    assert_eq!(
+        fs.read_at_by_inode(inode, 0, &mut buf).unwrap_err(),
+        akuma_vfs::FsError::NotAFile,
+    );
+    assert_eq!(
+        fs.read_at("/somedir", 0, &mut buf).unwrap_err(),
+        akuma_vfs::FsError::NotAFile,
+        "and the two must agree",
+    );
+}
+
 #[test]
 fn remove_file_from_dir_does_not_affect_file() {
     let fs = mount_empty();

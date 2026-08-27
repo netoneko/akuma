@@ -1031,6 +1031,28 @@ pub struct Ext2Filesystem<B: BlockDevice> {
     write_lock_owner: AtomicUsize,
     /// Inodes unlinked while a mapping still pinned them — see [`DeferredFrees`].
     deferred: DeferredFrees,
+    /// Directory-tree walks and block-cache accesses this instance has done, for
+    /// [`Self::work_counters`].
+    ///
+    /// **Per-instance, and that is the point**: the crate's other counters
+    /// (`CACHE_HITS`, `E2_READ_AT_EOF`) are global statics, so a test asserting
+    /// on a delta across them races every other test `cargo test` runs in
+    /// parallel. These belong to one mount and answer for one test's work only.
+    #[cfg(test)]
+    counters: WorkCounters,
+}
+
+/// Deterministic work counters for one filesystem instance — see
+/// [`Ext2Filesystem::work_counters`]. Test-only: nothing outside `cargo test`
+/// reads them, and the increments must not exist on the hot path in a shipped
+/// kernel.
+#[cfg(test)]
+#[derive(Default)]
+struct WorkCounters {
+    /// Calls to `lookup_path_internal`, i.e. full directory-tree walks.
+    path_walks: core::sync::atomic::AtomicU64,
+    /// Calls to `with_block`, i.e. block-cache accesses (hit or miss).
+    block_accesses: core::sync::atomic::AtomicU64,
 }
 
 /// The active block cache type: the large clock cache under the `fs-cache`
@@ -1134,6 +1156,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             block_cache: Spinlock::new(make_block_cache(block_size, cache_cap_bytes)),
             write_lock_owner: AtomicUsize::new(0),
             deferred: DeferredFrees::new(),
+            #[cfg(test)]
+            counters: WorkCounters::default(),
         })
     }
 
@@ -1288,6 +1312,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         block_num: u32,
         f: impl FnOnce(&[u8]) -> R,
     ) -> Result<R, FsError> {
+        #[cfg(test)]
+        self.counters.block_accesses.fetch_add(1, Ordering::Relaxed);
         #[cfg(not(kernel_profile_extreme))]
         {
             {
@@ -1858,8 +1884,29 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         Err(FsError::NoSpace)
     }
 
-    /// Complete the frees deferred by [`Self::remove_file`] for inodes whose
-    /// last pin has since dropped.
+    /// Inodes *this* filesystem has queued for a deferred free. The global
+    /// [`deferred_free_pending`] counter aggregates every mount, so it cannot be
+    /// asserted on by tests that run in parallel — this can.
+    /// `(path walks, block-cache accesses)` this instance has done so far.
+    ///
+    /// The deterministic half of the read-path measurement: wall-clock on this
+    /// host swings several-fold between runs (`README.md` § Performance), but
+    /// "how many directory walks did these reads cost" does not move at all.
+    #[cfg(test)]
+    pub fn work_counters(&self) -> (u64, u64) {
+        (
+            self.counters.path_walks.load(Ordering::Relaxed),
+            self.counters.block_accesses.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn deferred_free_len(&self) -> usize {
+        self.deferred.slots.iter().filter(|s| s.load(Ordering::Relaxed) != 0).count()
+    }
+
+    /// Complete the frees deferred by [`Self::release_last_link`] for inodes
+    /// whose last pin has since dropped.
     ///
     /// Called with the state write lock already held, from the two places that
     /// care: every unlink (which keeps the list short on a build workload) and
@@ -1870,14 +1917,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// time: a mapping created *after* the unlink still names this inode, and
     /// freeing it would reintroduce exactly the defect the deferral exists to
     /// prevent.
-    /// Inodes *this* filesystem has queued for a deferred free. The global
-    /// [`deferred_free_pending`] counter aggregates every mount, so it cannot be
-    /// asserted on by tests that run in parallel — this can.
-    #[cfg(test)]
-    pub fn deferred_free_len(&self) -> usize {
-        self.deferred.slots.iter().filter(|s| s.load(Ordering::Relaxed) != 0).count()
-    }
-
     fn drain_deferred_frees(&self, state: &mut Ext2State) {
         for slot in &self.deferred.slots {
             let inode_num = slot.load(Ordering::Acquire);
@@ -1903,6 +1942,65 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             }
             let _ = self.free_inode(state, inode_num, false);
         }
+    }
+
+    /// Drop the last directory-entry reference to `inode_num`, whose link count
+    /// the caller has already decremented to zero, and write the inode back.
+    ///
+    /// A live reader may still name this inode. Linux keeps an unlinked inode
+    /// alive until its last reference goes; this kernel has no open-file object
+    /// to hang that on, so an [`akuma_primitives::inode_pin::InodePin`] is the
+    /// reference — held by every lazy mmap region and, since per-fd inode
+    /// caching, by every open `File` descriptor.
+    ///
+    /// Freeing regardless is what produced root cause #2 of the self-host ICE:
+    /// the truncate zeroes `i_size`, so the reader's next fill gets `Ok(0)` and
+    /// installs a zero page, and once `free_inode` returns the number to the
+    /// bitmap the next file created inherits it, handing that reader another
+    /// file's bytes (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14). So for a
+    /// pinned inode: drop the name, keep the inode. Size and block pointers stay
+    /// exactly as they are, which is what lets the reader go on reading correct
+    /// data, and [`Self::drain_deferred_frees`] finishes the job once the last
+    /// pin drops.
+    ///
+    /// **This is one function because it has two callers.** `remove_file` had
+    /// the pin check; `rename` — which unlinks its destination's last name in
+    /// exactly the same way — did not, and freed it outright. That is the
+    /// atomic-replace pattern (`write foo.tmp`, `rename foo.tmp foo`) that
+    /// `cargo`, `apk` and every editor use, so the one path most likely to pull
+    /// an inode out from under a live reader was the path that never checked.
+    /// The fast-symlink guard was asymmetric the same way: `truncate_inode`
+    /// reads `direct_blocks` as block numbers, but a fast symlink stores its
+    /// target *string* there, so truncating one frees whatever blocks those
+    /// characters happen to spell — `remove_file` guarded, `rename` did not.
+    ///
+    /// `flush_meta` stays with the caller, which has more to stage than this.
+    fn release_last_link(
+        &self,
+        state: &mut Ext2State,
+        inode_num: u32,
+        inode: &mut Inode,
+    ) -> Result<(), FsError> {
+        if akuma_primitives::inode_pin::is_pinned(inode_num) {
+            // If the deferral list is full the inode is *leaked*, not freed: it
+            // stays allocated with no name and no queued free, and only `e2fsck`
+            // reclaims it. `DeferredFrees::push` counts that case. Leaking blocks
+            // is recoverable; handing a reader another file's bytes is not, so
+            // the overflow falls this way deliberately.
+            self.deferred.push(inode_num);
+            inode.hard_links = 0;
+            return self.write_inode(state, inode_num, inode);
+        }
+
+        let is_fast_symlink = (inode.type_perms & 0xF000) == S_IFLNK
+            && inode.sectors_used == 0
+            && (inode.size_lower as usize) <= FAST_SYMLINK_MAX;
+        if !is_fast_symlink {
+            self.truncate_inode(state, inode)?;
+        }
+        inode.deletion_time = self.current_time();
+        self.write_inode(state, inode_num, inode)?;
+        self.free_inode(state, inode_num, false)
     }
 
     fn free_inode(&self, state: &mut Ext2State, inode_num: u32, is_dir: bool) -> Result<(), FsError> {
@@ -2566,6 +2664,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     }
 
     fn lookup_path_internal(&self, state: &Ext2State, path: &str) -> Result<u32, FsError> {
+        #[cfg(test)]
+        self.counters.path_walks.fetch_add(1, Ordering::Relaxed);
         // `path_components` is an iterator, so this walk allocates nothing —
         // it runs on every path resolution. The empty-path case needs no
         // special handling: zero components means the loop never runs and
@@ -2624,6 +2724,16 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
         let state = self.read_state();
         let inode = self.read_inode(&state, inode_num)?;
+
+        // Same refusal `read_at` makes for a path naming a directory. Until
+        // `read(2)` grew a per-fd inode (`KernelFile::inode`) the only callers
+        // here were the mmap/exec fill paths, which never name a directory, so
+        // the check was merely absent rather than wrong. Now a `read(2)` on a
+        // directory fd reaches this function, and without it the caller would
+        // get raw dirent bytes instead of `EISDIR`.
+        if (inode.type_perms & 0xF000) == S_IFDIR {
+            return Err(FsError::NotAFile);
+        }
 
         let file_size = inode.size_lower as usize;
         if offset >= file_size {
@@ -3099,45 +3209,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         inode.hard_links = inode.hard_links.saturating_sub(1);
 
         if inode.hard_links == 0 {
-            // A live mapping still names this inode. Linux keeps an unlinked
-            // inode alive until its last reference goes; this kernel has no
-            // open-file object to hang that on, so the mapping's `InodePin` is
-            // the reference — see `akuma_primitives::inode_pin`.
-            //
-            // Freeing here is what produced root cause #2 of the self-host ICE:
-            // the truncate below zeroes `i_size`, so the mapper's next fill
-            // reads `Ok(0)` and installs a zero page, and once `free_inode`
-            // returns the number to the bitmap the next file created inherits
-            // it, handing that mapper another file's bytes
-            // (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14).
-            //
-            // So: drop the name, keep the inode. Size and block pointers stay
-            // exactly as they are, which is precisely what lets the mapping go
-            // on reading correct data.
-            if akuma_primitives::inode_pin::is_pinned(inode_num) {
-                // If the deferral list is full the inode is *leaked*, not freed:
-                // it stays allocated with no name and no queued free, and only
-                // `e2fsck` reclaims it. `defer_free` counts that case. Leaking
-                // blocks is recoverable; handing a mapper another file's bytes
-                // is not, so the overflow falls this way deliberately.
-                self.deferred.push(inode_num);
-                inode.hard_links = 0;
-                self.write_inode(&state, inode_num, &inode)?;
-                self.flush_meta(&mut state)?;
-                return Ok(());
-            }
-
-            let is_fast_symlink = (inode.type_perms & 0xF000) == S_IFLNK
-                && inode.sectors_used == 0
-                && (inode.size_lower as usize) <= FAST_SYMLINK_MAX;
-            if !is_fast_symlink {
-                self.truncate_inode(&mut state, &mut inode)?;
-            }
-            inode.deletion_time = self.current_time();
-            self.write_inode(&state, inode_num, &inode)?;
-
-            // Free inode
-            self.free_inode(&mut state, inode_num, false)?;
+            self.release_last_link(&mut state, inode_num, &mut inode)?;
         } else {
             self.write_inode(&state, inode_num, &inode)?;
         }
@@ -3245,16 +3317,27 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         let src_inode = self.read_inode(&state, src_inode_num)?;
         let ft = if (src_inode.type_perms & 0xF000) == S_IFDIR { FT_DIR } else { FT_REG_FILE };
 
+        // Retire anything whose readers have since gone away, for the reason
+        // `remove_file` does it: renaming over a destination is an unlink, and a
+        // build renames constantly, so this is where the deferral list drains.
+        self.drain_deferred_frees(&mut state);
+
         // If destination exists, remove it first
         if let Ok(dst_inode_num) = self.lookup_path_internal(&state, new_path) {
+            // POSIX: if the two names already resolve to the same inode — the
+            // same path twice, or two hard links to one file — `rename` does
+            // nothing and succeeds. Without this the code below unlinks that
+            // single shared inode, drops its last link, frees it, and then
+            // re-adds a directory entry pointing at the freed number: `mv a a`
+            // destroyed the file and left a dangling entry behind.
+            if dst_inode_num == src_inode_num {
+                return Ok(());
+            }
             let mut dst_inode = self.read_inode(&state, dst_inode_num)?;
             self.remove_dir_entry(&mut state, dst_parent, &dst_name)?;
             dst_inode.hard_links = dst_inode.hard_links.saturating_sub(1);
             if dst_inode.hard_links == 0 {
-                self.truncate_inode(&mut state, &mut dst_inode)?;
-                dst_inode.deletion_time = self.current_time();
-                self.write_inode(&state, dst_inode_num, &dst_inode)?;
-                self.free_inode(&mut state, dst_inode_num, false)?;
+                self.release_last_link(&mut state, dst_inode_num, &mut dst_inode)?;
             } else {
                 self.write_inode(&state, dst_inode_num, &dst_inode)?;
             }

@@ -122,6 +122,29 @@ For a real path:
   locking semantics will not get them here.
 - `O_CLOEXEC` is honored (`proc.set_cloexec`); `O_APPEND` is honored at
   `read`/`write` time (see below), not at open time.
+- **The fd is bound to an inode here, once** (`vfs::open_file_inode`), together
+  with an `InodePin` on it, so `read`/`pread64` need no directory walk of their
+  own — see `read`/`pread64` below.
+
+## `read` / `pread64` — bound to an inode, not to a name
+
+Since 2026-08-27 (`../../../archive/EXT2_PER_FD_INODE_READ_PATH.md`) a `File`
+fd carries the inode `open(2)` resolved, and `read`/`pread64` serve it via
+`read_at_by_inode` rather than re-resolving `KernelFile::path` on every call.
+`readv`, `preadv` and `preadv2` route through those two, so they inherit it.
+
+Consequences at this boundary:
+
+- **Unlinked-but-open works.** `read` on an fd whose name has been removed, or
+  renamed over, returns the file the fd opened. It used to return `ENOENT` (for
+  the unlink) or the *new* file's bytes (for the rename) — both wrong per POSIX.
+- **`EISDIR` is unchanged** for a `read` on a directory fd: `read_at_by_inode`
+  refuses `S_IFDIR` exactly where `read_at` does.
+- **`fstat`/`lseek(SEEK_END)` did not follow** — they still resolve `f.path`, so
+  on an unlinked-but-open fd they fail while `read` succeeds. Not a regression
+  (both used to fail); it needs a `Filesystem::metadata_by_inode`.
+- **An fd whose filesystem has no inode addressing keeps reading by path**
+  (`inode == 0`): procfs, `MemoryFilesystem`, synthetic nodes, and `/etc/mtab`.
 
 ## `write`/`pwrite64` and `O_APPEND`
 

@@ -79,7 +79,7 @@ the `akuma_vfs` crate.
 | Variant | Backing |
 |---|---|
 | `Stdin` / `Stdout` / `Stderr` | console |
-| `File(KernelFile)` | a VFS file handle |
+| `File(KernelFile)` | a VFS file handle: path, position, flags, **the inode `open(2)` resolved, and an `InodePin` on it** |
 | `Socket(usize)` | smoltcp TcpSocket handle |
 | `ChildStdout(Pid)` | a child process's stdout (used for PTY winsize routing) |
 | `PipeRead(u32)` / `PipeWrite(u32)` | kernel pipe ends |
@@ -92,6 +92,31 @@ the `akuma_vfs` crate.
 **Shared FD tables:** `CLONE_FILES` shares the table across threads
 (`archive/SHARED_FD_TABLES.md`). Across **fork** the table is copied (with
 CLOEXEC stripping at exec). epoll fds are stripped on fork (not refcounted).
+
+**Per-fd inode caching** (2026-08-27,
+[`../../archive/EXT2_PER_FD_INODE_READ_PATH.md`](../../archive/EXT2_PER_FD_INODE_READ_PATH.md)):
+`sys_openat` resolves the path to an inode once (`vfs::open_file_inode`) and
+stores it on the `KernelFile`; `read`/`pread64` — and so `readv`/`preadv`/
+`preadv2`, which route through them — then call `read_at_by_inode` instead of
+re-running a full `lookup_path_internal` directory walk **per syscall**. Three
+things follow:
+
+- **An fd is bound to a file, not to a name.** It keeps reading what it opened
+  after that name is unlinked or renamed over, which is what POSIX has always
+  said and what path-based reads answered `ENOENT` to. The `InodePin` the fd
+  holds is what makes reading by a reissuable number safe: ext2 defers the free
+  of a pinned inode (`release_last_link`, and see `inode_pin`).
+- **`inode == 0` means "read by path"**, and that is the path every filesystem
+  without inode addressing takes — procfs, `MemoryFilesystem`, synthetic nodes —
+  plus `/etc/mtab`, which must stay a resolve-time synthetic.
+- **The mount is still selected by path.** `with_fs` resolves the fd's path to
+  find the filesystem, then the inode number is applied to it, so a mount
+  replaced under an open fd (or an fd used from a namespace that resolves its
+  path elsewhere) aliases. Inherited from the mmap fill path, not introduced;
+  the fix is an fd holding its `Arc<dyn Filesystem>`.
+- **`fstat` and `lseek(SEEK_END)` still resolve by path**, so on an
+  unlinked-but-open fd they fail while `read` succeeds. Needs a
+  `Filesystem::metadata_by_inode`.
 
 ## /dev
 

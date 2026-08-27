@@ -284,11 +284,18 @@ incoherence signal, not a normal EOF.
    does one `read_block` per logical block.
 
 Reads are cheap once warm — no device writes, and the cache absorbs metadata
-(`stat()` on a 7-deep path is ~0.03 device reads/call). But **read-after-write
-is never warm**: `write_block` calls `cache.remove` for every block it writes, so
-reading back a file you just wrote re-fetches every block from the device (the
-514-read row above). A write-*through* cache that kept the just-written bytes in
-its slot would fix this — one of the pending items.
+(`stat()` on a 7-deep path is ~0.03 device reads/call). Read-after-write is warm
+too since the write-back cache landed: `write_block` marks its slot dirty instead
+of removing it, so reading back a file you just wrote costs **zero** device reads
+(`docs/archive/EXT2_WRITEBACK_DESIGN.md` D-1; the 515-read row went to 0).
+
+**Step 2 is what the path form pays and the inode form does not**, and once the
+data is warm it is most of what a read costs: one `read_inode` plus one
+directory-data read per component, on *every* call. Measured on a 5-component
+path, 3000-byte file: **20 block-cache accesses per `read_at`, 2 per
+`read_at_by_inode`** (`reading_by_inode_does_no_path_walk`). That is why
+`read(2)` resolves its inode once at `open(2)` and calls the inode form
+thereafter — `docs/archive/EXT2_PER_FD_INODE_READ_PATH.md`.
 
 ### Write (`write_at`) — the expensive path
 
@@ -365,8 +372,17 @@ zero page) and `free_inode` would hand the number to the next `create` (mapper
 faults read **another file's bytes**). Both were silent — root cause #2 of the
 self-host `rustc` ICE (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14).
 
+**Two callers, not one.** `remove_file` and `rename` both drop a last name, and
+both now go through `release_last_link`, which is where the check below lives.
+Until 2026-08-27 only `remove_file` had it — so atomic replace (`write foo.tmp`,
+`rename foo.tmp foo`) freed the destination inode out from under any live
+reader, which is the same defect by a second route
+(`docs/archive/EXT2_PER_FD_INODE_READ_PATH.md`). Since the same date every open
+`File` fd holds a pin too, not just every mapping.
+
 ```
-remove_file("/x"):  hard_links -> 0
+remove_file("/x") / rename over "/x":  hard_links -> 0
+  release_last_link(n):
     inode_pin::is_pinned(n) ?
       no  -> truncate_inode + free_inode now
       yes -> deferred.push(n); keep i_size and block pointers; return

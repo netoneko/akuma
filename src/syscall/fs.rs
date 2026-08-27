@@ -518,7 +518,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
 
-            match crate::fs::read_at(&f.path, f.position, &mut temp) {
+            match crate::fs::read_at_open_file(&f.path, f.inode(), f.position, &mut temp) {
                 Ok(n) => {
                     if n > 0 {
                         if copy_to_user(buf_ptr, &temp[..n]).is_err() {
@@ -850,7 +850,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
             let limit = 64 * 1024;
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
-            match crate::fs::read_at(&f.path, offset as usize, &mut temp) {
+            match crate::fs::read_at_open_file(&f.path, f.inode(), offset as usize, &mut temp) {
                 Ok(n) => {
                     if n > 0
                         && copy_to_user(buf_ptr, &temp[..n]).is_err() {
@@ -1980,7 +1980,17 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             }
             let _ = crate::fs::write_file(&path, &[]);
         }
-        let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::File(akuma_exec::process::KernelFile::new(path.clone(), flags)));
+        // One path walk here replaces one per `read(2)` for the life of the fd
+        // (`crate::vfs::open_file_inode` says which opens qualify), and the pin
+        // it takes gives the descriptor "unlinked but still open" semantics —
+        // without which reading by a number the filesystem may reissue would be
+        // the `SELFHOST_ZERO_PAGE_HUNT` defect with an fd in place of an mmap.
+        let file = akuma_exec::process::KernelFile::new(path.clone(), flags);
+        let file = match crate::vfs::open_file_inode(&path) {
+            Some(inode) => file.with_inode(inode),
+            None => file,
+        };
+        let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::File(file));
         if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
             proc.set_cloexec(fd);
         }

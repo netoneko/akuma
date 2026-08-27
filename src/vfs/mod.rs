@@ -412,6 +412,62 @@ pub fn read_at_by_inode(path: &str, inode: u32, offset: usize, buf: &mut [u8]) -
     with_fs(path, |fs, _rel| fs.read_at_by_inode(inode, offset, buf))
 }
 
+/// The inode `open(2)` should bind an fd to, or `None` when this fd has to go on
+/// reading by path.
+///
+/// `read(2)` re-resolved `KernelFile::path` on every call — a full
+/// `lookup_path_internal` directory walk plus a `read_inode`, per syscall, on
+/// the hot on-disk read path. Resolving once here and reading by inode
+/// afterwards is what `docs/archive/EXT2_WRITEBACK_DESIGN.md` § D-4 identified
+/// as the next real read lever after the block cache, and it is what the
+/// mmap/exec fault path has always done.
+///
+/// `None` for anything whose bytes do not come from an inode this filesystem
+/// can address:
+///
+/// - **Filesystems with no inode addressing.** `resolve_inode` /
+///   `read_at_by_inode` default to `NotSupported` in the `Filesystem` trait, so
+///   procfs, the memory filesystem and every synthetic node land here and keep
+///   their existing path-based read.
+/// - **`/etc/mtab`.** It is a resolve-time synthetic served by [`read_at`]
+///   *ahead of* `with_fs`; an image that happens to carry a real `/etc/mtab`
+///   file would otherwise have its stale on-disk bytes served instead of the
+///   live mount list.
+/// - **Inode 0**, which is `InodePin`'s "no inode" sentinel and never a file.
+///
+/// Directories need no exclusion: `read_at_by_inode` refuses `S_IFDIR` exactly
+/// where the path-based `read_at` does, so a `read(2)` on a directory fd still
+/// gets `NotAFile` either way.
+pub fn open_file_inode(path: &str) -> Option<u32> {
+    if is_mtab(path) {
+        return None;
+    }
+    with_fs(path, |fs, rel| fs.resolve_inode(rel)).ok().filter(|&inode| inode != 0)
+}
+
+/// Read for an open file description, by the inode `open(2)` bound to it when
+/// there is one and by path otherwise.
+///
+/// The path is still what selects the *mount* (`with_fs`), so this inherits the
+/// same aliasing exposure the mmap fill path has carried since it started
+/// reading by inode: if the mount under `path` is replaced while the fd is open,
+/// or the fd is used from a process whose namespace resolves `path` to a
+/// different mount, the inode number is interpreted against the wrong
+/// filesystem. Closing that properly means an fd holding its resolved
+/// `Arc<dyn Filesystem>` — a real open-file object, which this kernel does not
+/// have — so it is recorded here rather than papered over.
+pub fn read_at_open_file(
+    path: &str,
+    inode: u32,
+    offset: usize,
+    buf: &mut [u8],
+) -> Result<usize, FsError> {
+    if inode == 0 {
+        return read_at(path, offset, buf);
+    }
+    with_fs(path, |fs, _rel| fs.read_at_by_inode(inode, offset, buf))
+}
+
 /// Write data at a specific offset within a file
 pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
     if is_mtab(path) {

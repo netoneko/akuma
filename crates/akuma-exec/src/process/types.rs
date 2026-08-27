@@ -257,11 +257,51 @@ pub struct KernelFile {
     /// Snapshot of directory entries taken on the first getdents64 call.
     /// Prevents position drift when entries are deleted between calls.
     pub dir_cache: Option<Vec<DirCacheEntry>>,
+    /// The inode `open(2)` resolved this path to, or `0` for "no inode: read by
+    /// path". See [`KernelFile::inode`].
+    inode: u32,
+    /// Keeps `inode`'s data alive for as long as this descriptor exists.
+    ///
+    /// Nothing reads this field; like [`LazySource::File`]'s, it is load-bearing
+    /// purely through `Clone`/`Drop`, which is what makes `dup`, `fork`'s
+    /// `clone_deep_for_fork`, `close`, `close_all` and `exec`'s table clear
+    /// balanced without any of them knowing the pin exists. Always constructed
+    /// together with `inode` in [`KernelFile::with_inode`] so the two cannot
+    /// drift apart.
+    pin: akuma_primitives::InodePin,
 }
 
 impl KernelFile {
     pub fn new(path: String, flags: u32) -> Self {
-        Self { path, position: 0, flags, dir_cache: None }
+        Self {
+            path,
+            position: 0,
+            flags,
+            dir_cache: None,
+            inode: 0,
+            pin: akuma_primitives::InodePin::none(),
+        }
+    }
+
+    /// Bind this descriptor to the inode `open(2)` resolved its path to.
+    ///
+    /// `read(2)` then reads by inode number instead of re-walking the directory
+    /// tree on every call — the whole point of resolving here — and the pin
+    /// taken alongside it gives the fd Linux's "unlinked but still open"
+    /// semantics, which is what makes reading by a number that the filesystem
+    /// could otherwise reissue safe. See `src/vfs::open_file_inode` for which
+    /// opens get one and why the rest keep reading by path.
+    #[must_use]
+    pub fn with_inode(mut self, inode: u32) -> Self {
+        self.inode = inode;
+        self.pin = akuma_primitives::InodePin::new(inode);
+        self
+    }
+
+    /// The inode this fd was opened on, or `0` when it must read by path.
+    #[must_use]
+    pub const fn inode(&self) -> u32 {
+        self.inode
     }
 }
 

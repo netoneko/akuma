@@ -547,12 +547,21 @@ impl Filesystem for OverlayFs {
     /// would collide with real ones and hand the page-fault path the contents
     /// of an unrelated file.
     fn read_at_by_inode(&self, inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        // The upper layer's error is what propagates when no layer serves the
+        // inode, rather than a blanket `NotFound`. Every layer sits on the same
+        // underlying filesystem (see above), so a *refusal* — `NotAFile` for a
+        // directory, which `read(2)` on a directory fd now reaches — is the same
+        // refusal from every layer, and reporting it as "no such file" would
+        // turn an `EISDIR` into an `ENOENT` for anything inside a box.
+        let mut upper_err = FsError::NotFound;
         for l in 0..self.layer_count() {
-            if let Ok(n) = self.layer(l).read_at_by_inode(inode, offset, buf) {
-                return Ok(n);
+            match self.layer(l).read_at_by_inode(inode, offset, buf) {
+                Ok(n) => return Ok(n),
+                Err(e) if l == 0 => upper_err = e,
+                Err(_) => {}
             }
         }
-        Err(FsError::NotFound)
+        Err(upper_err)
     }
 }
 
