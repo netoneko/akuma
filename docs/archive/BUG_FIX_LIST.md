@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 712
-- **Docs contributing at least one fix:** 230
+- **Total distinct fixes counted:** 728
+- **Docs contributing at least one fix:** 235
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 130 | 18.3% | 19 |
-| Memory & Virtual Memory | 113 | 15.9% | 35 |
-| Scheduler & Process Management | 77 | 10.8% | 20 |
-| SMP & Locking | 88 | 12.4% | 39 |
-| Networking | 54 | 7.6% | 21 |
-| Userspace Apps & Libraries | 37 | 5.2% | 20 |
-| Rump Kernel & Syscall Proxy | 26 | 3.7% | 6 |
-| Toolchain & Self-Hosting | 38 | 5.3% | 6 |
-| SSH | 26 | 3.7% | 15 |
-| VFS & Filesystem | 19 | 2.7% | 14 |
-| Boot & Drivers | 24 | 3.4% | 9 |
+| Syscall / ABI Compatibility Audits | 130 | 17.9% | 19 |
+| Memory & Virtual Memory | 114 | 15.7% | 36 |
+| Scheduler & Process Management | 77 | 10.6% | 20 |
+| SMP & Locking | 88 | 12.1% | 39 |
+| Networking | 54 | 7.4% | 21 |
+| Userspace Apps & Libraries | 37 | 5.1% | 20 |
+| Rump Kernel & Syscall Proxy | 26 | 3.6% | 6 |
+| Toolchain & Self-Hosting | 43 | 5.9% | 7 |
+| SSH | 26 | 3.6% | 15 |
+| VFS & Filesystem | 25 | 3.4% | 16 |
+| Boot & Drivers | 24 | 3.3% | 9 |
 | Signals & Exceptions | 13 | 1.8% | 6 |
-| Misc / Cross-cutting | 22 | 3.1% | 5 |
-| Console & Terminal | 21 | 2.9% | 9 |
-| Containers | 24 | 3.4% | 6 |
-| **Total** | **712** | **100.0%** | **230** |
+| Misc / Cross-cutting | 25 | 3.4% | 6 |
+| Console & Terminal | 22 | 3.0% | 9 |
+| Containers | 24 | 3.3% | 6 |
+| **Total** | **728** | **100.0%** | **235** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -178,7 +178,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `clock_settime` (112), `adjtimex` (171) and `clock_adjtime` (266) were all unimplemented — Akuma could read the clock but never set it, so `date -s`, `rdate`, and `ntpd -q` all had no way to apply a correction; implemented in the new `crates/akuma-time` crate, with `adjtimex`/`clock_adjtime` applying `ADJ_OFFSET`/`ADJ_SETOFFSET` as an immediate step rather than a gradual PLL slew
 - On a platform with no RTC (Firecracker exposes no PL031 on aarch64), the guest booted at epoch 0 with no way to correct it, so every outbound TLS connection failed certificate-validity checks ("certificate is not yet valid") even though the CA bundle, DNS, and TCP were all fine; fixed with a boot-time SNTP client (`crates/akuma-time::{boot, sntp}`, wired via `src/ntp_boot.rs`) that runs whenever `utc_time_us()` comes up unset, deriving the wall-clock offset from uptime-relative round-trip timestamps (since the client's own clock has no absolute epoch yet to plug into the classic four-timestamp NTP formula) and applying it via `set_utc_time_us` before IRQs are unmasked
 
-## Memory & Virtual Memory (113 fixes, 35 docs)
+## Memory & Virtual Memory (114 fixes, 36 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -362,6 +362,10 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/AKUMA_SCHEDULING_EXTRACTION.md
 - The file-page cache cap was a fixed `RAM/8` with no headroom, so a single mmap'd file larger than the cap (a 532 MB llama.cpp model against a 512 MB cap at `MEMORY=4096`) evicted its own still-mapped hot pages every pass, costing the next mapper of the same file a `read_at` off ext2; fixed with an elastic cap (`FPCACHE_INFLATE_PCT`, default +20%, granted when free RAM clears a 2x headroom threshold and withdrawn only below 1x, hysteresis-gated so a workload parked on the line can't flap the cap) — real for any workload with more than one mapper of the same oversized file (concurrent `rustc`s on one `.so`, boxes sharing a rootfs), though it did not move the single-mapper llama.cpp throughput it was raised to fix
+
+### docs/archive/FPCACHE_MOUNT_IDENTITY.md
+(Fixes finding F-1 of `EXT2_WRITEBACK_DESIGN.md` plus the keying half of D-9. D-9's capacity half is still open, and the doc's "a defect found and left alone" is by its own title not fixed here.)
+- The file page cache was keyed without any notion of *which* filesystem a page came from, so the same inode number on two different mounts shared one cache entry — a box and the host, or two mounts of different images, could read each other's file data; fixed by assigning each mount an identity at mount time and folding it into the key, with invalidation deliberately left identity-free
 
 
 ## Scheduler & Process Management (77 fixes, 20 docs)
@@ -880,7 +884,7 @@ aren't recorded anywhere else.)
 - On the rump devbox, every ssh session reset at kex (`kex_exchange_identification: Connection reset by peer`): `RumpSocket` was the one fd family `clone_deep_for_fork` did not refcount, so a forked sshd session's parent `drop(stream)` closed the socket out from under its own still-running child; fixed by refcounting `RumpSocket` the same way every other fd family already was (superseded the wrong DHCP-path diagnosis in `DEVBOX_ISSUES.md` Issue 10)
 
 
-## Toolchain & Self-Hosting (38 fixes, 6 docs)
+## Toolchain & Self-Hosting (43 fixes, 7 docs)
 
 ### docs/archive/AKUMA_SELF_HOSTING.md
 - §3: boot self-test VA collision causing MEMORY≥8G `map_user_page` crash
@@ -932,6 +936,14 @@ aren't recorded anywhere else.)
 
 ### docs/archive/RAW_BLOCK_DEVICE_FD.md
 - Adding `crates/akuma-scheduler`'s `sched-sim` CLI binary to the workspace's `default-members` made a bare `cargo run --release` (and every `overlays/devbox/run*.sh` script) fail with "could not determine which binary to run" since cargo now had two candidate binaries; fixed with `default-run = "akuma"` in the root `Cargo.toml`, disambiguating `cargo run` without touching `cargo build`/`cargo test`
+
+### docs/archive/EXT2_WRITEBACK_FOLLOWUP_FIXES.md
+(§2's three `#[allow(...)]` removals and §3's six clippy warnings are cleanup with no defect attached; §7 answers a question, §8 records host wall-clock drift, and §9 retires D-4's premise — none is a fix.)
+- `extreme-size` did not build
+- A test in the write-back suite asserted nothing, so it passed regardless of the behaviour it named
+- `ext2probe-host` could never be built `--release` — the profile had never been exercised, so the release path was broken on first use
+- `cargo build --release` left a stale `akuma.bin` behind: the flat binary is produced by a separate step, so a plain `cargo build` silently kept the previous image and every boot ran the old kernel
+- The linker wrapper would have broken the self-hosted build
 
 ## SSH (26 fixes, 15 docs)
 
@@ -993,7 +1005,7 @@ aren't recorded anywhere else.)
 
 ---
 
-## VFS & Filesystem (19 fixes, 14 docs)
+## VFS & Filesystem (25 fixes, 16 docs)
 
 ### docs/archive/STAT_AND_UNLINKAT_FIX.md
 - Root cause 1: `stat()` returned `st_ino=0` for every file
@@ -1041,6 +1053,18 @@ aren't recorded anywhere else.)
 
 ### docs/archive/RAW_BLOCK_DEVICE_FD.md
 - `open()` on a `/dev/vdX` block-device node returned `ENODEV` unconditionally since a raw block fd had no consumer; fixed with a `BlockDev` file-descriptor variant wired through `read`/`write`/`lseek`/`fstat`, with a write-open of a *mounted* device refused `EBUSY` (checked once at `open()` time via `device_is_mounted`) so a raw write can't go behind `Ext2Filesystem`'s block cache
+
+### docs/archive/EXT2_PER_FD_INODE_READ_PATH.md
+(The per-fd inode cache itself is a read-path optimization and is not counted; these are the four pre-existing defects that had to be fixed before an fd could hold an inode across calls, found by asking "what else can free an inode a reader still names?")
+- `read_at_by_inode` did not refuse directories, so a `read(2)` on a directory fd walked directory blocks as file data instead of returning `EISDIR`
+- `rename` freed its destination inode with no pin check, so an fd holding that inode was left naming a freed number — the same class the per-fd cache would have made reachable on every open file
+- `truncate_inode` reads `direct_blocks` as block numbers, but a fast symlink stores its target *string* there; `remove_file` guarded against it and `rename` did not, so renaming a file over a symlink freed whatever blocks the target characters happened to spell
+- `rename(a, a)` (the same path twice, or two hard links to one inode) unlinked the shared inode, dropped its last link, freed it, then re-added a directory entry pointing at the freed number — `mv a a` destroyed the file and left a dangling entry, where POSIX requires a successful no-op
+
+### docs/archive/EXT2_PERFORMANCE_AUDIT.md
+(2026-08-26 follow-up only. Fixes A, B and D-lite of that section are write-deferral/zero-fill optimizations with no defect attached and are not counted; these two are the defects found alongside them.)
+- `write_dir_range`'s cross-block `rec_len` merge was latent-wrong when a dirent edit spanned a block boundary
+- `add_dir_entry` / `remove_dir_entry` rewrote every block of the directory per call via `write_inode_data`, making filling or emptying a directory O(N²) in its size rather than O(1) per edit
 
 ## Boot & Drivers (24 fixes, 9 docs)
 
@@ -1116,7 +1140,7 @@ aren't recorded anywhere else.)
 - The `EC=0x0` (undefined-instruction) exception handler hard-killed the process instead of delivering SIGILL, so OpenSSL's ARM-feature-probe idiom (deliberately executing an unsupported instruction inside a SIGILL handler) could never recover, crashing nightly `cargo` under HVF at a fixed PC (`SM3SS1`, FEAT_SM3); fixed by routing `EC=0x0` through `try_deliver_signal` like the other fatal-fault arms
 
 
-## Misc / Cross-cutting (22 fixes, 5 docs)
+## Misc / Cross-cutting (25 fixes, 6 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md
 (Host-side tooling for the AWS metal Firecracker host, `../akuma-terraform`. §9's eight bugs; the §10 Akuma-side results are verifications of fixes counted elsewhere, not new fixes, and §7's traps are AWS behaviours rather than bugs in this project.)
@@ -1162,8 +1186,14 @@ aren't recorded anywhere else.)
 - `scripts/populate_disk.sh`'s `busybox --install -s /mnt/disk/bin` linked every applet to the path busybox was *invoked* as (the populate container's mount point), dangling 295 of 304 `/bin` symlinks in the guest (`/bin/head -> /mnt/disk/bin/busybox`); replaced with `busybox --list` + relative `ln -sf`
 - The `[TESTS] low-mem … skipping boot self-test suite` message printed with no `cfg` guard, so every `no-tests`/`size` image — which never compiled a suite at all — falsely claimed at boot that it had skipped one; now gated on the same condition as the suite itself
 
+### docs/archive/IDENTITY_CACHE_SMP_REVIEW.md
+(Harness fixes only. The doc's two identity-cache findings — the syscall epilogue reusing the prologue's `Process` across an open-ended dispatch, and `identity_get`'s ACTIVE check not covering slot recycling — are **open**: both were found by inspection, and an SMP=4 audit build instrumented to observe the first counted zero occurrences, so no kernel change was made. The added `IDENTITY_AUDIT` counters are instrumentation, not a fix.)
+- `scripts/forktest_smp_matrix.py` reported 14/14 FAIL at SMP=2 and SMP=4 on a healthy kernel: five of the seven configs passed no `-duration`, and `forktest_parent` defaults that flag to 0 = "run until all children finish", so those runs could never complete inside the harness's own `duration + 30` s timeout
+- The harness's reader thread returned at the boot marker, leaving nothing draining QEMU's stdout: every per-test log stopped at boot (so the `[PANIC]`/`WILD-DA`/`[SGI-S POISON]`/`[WATCHDOG]` grep could only ever match boot output, and reported "no crash" for a run it could not see), and once the 64 KB pipe filled QEMU blocked on write and the VM stalled — turning a 14 s `combined_light` into a 50 s "timeout". Closing the log under that still-running thread also raised `ValueError: I/O operation on closed file`
+- Readiness was decided by matching `"Started sshd"` in console text, which an unlocked UART tears across herd's separate `print()` calls (`[herd] Started ` + another core's `[syscall] bind(...)` + `sshd (pid= 2)`) — 4 of 7 SMP=4 boots, 0 of 7 at SMP=2; replaced with an SSH-banner probe, since a bare `connect()` is not readiness either (QEMU's user-mode hostfwd accepts before the guest listens)
 
-## Console & Terminal (21 fixes, 9 docs)
+
+## Console & Terminal (22 fixes, 9 docs)
 
 ### docs/archive/VEC_AUDIT.md
 - `crates/akuma-terminal`'s canonical-mode `canon_buffer` grew one byte per keystroke with no cap and was drained only by a line terminator, so a peer writing to a tty in canonical mode and never sending `\n` grew kernel heap without limit. Capped at `MAX_CANON = 4095` (Linux N_TTY's own ceiling), dropping — and deliberately not echoing — input beyond it, while the `\n`/VEOF paths stay uncapped so a full line can always still be terminated
@@ -1204,6 +1234,7 @@ aren't recorded anywhere else.)
 - Adding `/dev/tty` support deleted the fd-table type gate from the `isatty` fix above, reopening the exact `cat file | less` usage-banner regression; fixed by restoring a single fd-table type match (`Stdin | Stdout | Stderr | DevTty` pass, else `ENOTTY`) that covers both the original tty fds and the new `/dev/tty` fd
 - The same regression left `sys_ioctl`'s terminal-ioctl gate as a bare `fd > 2` cutoff, which unconditionally rejected the newly-introduced `/dev/tty` fd (never 0/1/2) for every terminal ioctl — breaking `crossterm`'s raw-mode setup (`tcgetattr`/`tcsetattr` issued directly on an opened `/dev/tty` fd) with a `reader source not set` panic in Helix; fixed by the same fd-table type match above rather than a numeric cutoff
 - The `/dev/tty` work also dropped the `FIONREAD` arm for `Stdin`, so `ioctl(FIONREAD)` on stdin or `/dev/tty` always reported zero buffered bytes regardless of actual pending input; restored, and extended to cover `DevTty` for the same reason as the ioctl gate
+- Round 4: `box run` handed the box's process the *caller's* `TerminalState` instead of one scoped to the box, so terminal mode changes made inside a box leaked across the box boundary onto the caller's terminal
 
 
 ## Containers (24 fixes, 6 docs)
@@ -1247,6 +1278,8 @@ aren't recorded anywhere else.)
 ---
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
+
+Also scanned 2026-08-27 (the `obviously-more-fixes` branch, ahead of closing it for the syscalls-refactor branch): AKUMA_SYSCALL_PERFORMANCE_AUDIT (the `getpid` floor taken 410 ns → 150 ns by a per-thread identity cache — an optimization with no defect attached, counted the same way LTO_RELEASE_PROFILE and BKL_RUSTC_SCALING_BASELINE are; its four deferred follow-ups are open, and the SMP>1 soak it defers is IDENTITY_CACHE_SMP_REVIEW, whose two findings are also open), EXT2_READ_PATH_STAGE_PROFILE ("instrument landed, no behaviour changed" by its own status line — the `read-profile` feature and two probes, nothing on the read path modified), EXT2_WRITEBACK_DESIGN (in-flight design record; its finding F-1 is fixed by FPCACHE_MOUNT_IDENTITY, counted there, and its D-9 capacity half and §237 "what is still open" list remain open), USER_COPY_BYTE_LOOP (widening the user-copy byte loop — a measured optimization, no defect; its own header retracts the "~17 µs of fixed cost" claim as inferred rather than measured), and USER_MANAGEMENT_AND_BOXES ("Design investigation. Nothing here is implemented."). ERROR_HANDLING_AUDIT is a classification of the tree's 139 production `let _ =` discards ending in a recommendation to gate-and-triage rather than blanket-ban; its findings carry fix shapes, not fixes — including a **confirmed physical-frame leak** in `sys_mmap`'s `MAP_FIXED` path (`src/syscall/mem.rs:448`), which is open. USER_COPY_FOLD gained only a cross-reference note pointing at USER_COPY_BYTE_LOOP — no change to its existing count.
 
 Also re-scanned 2026-08-25 (the `more-fixes` branch, ahead of merging it): BENCHMARK_PERFOMANCE_ATTEMPT_1 (a benchmark record; its one actionable finding — nginx's lost epoll wakeup — is open and lives in NGINX_LOST_WAKEUP), MOUNT_MISSING_SYSCALLS ("nothing in this doc is implemented by this session" by its own status line; §7 is a build list), NGINX_LOST_WAKEUP (**open**: nginx's `epoll_wait` misses readiness wakes and is rescued by the 10 ms `backstop_us`, so requests cost ~17 ms; hypothesis with strong circumstantial support, no fix), HTTPD_ACCEPT_HANG (**open**: `httpd` stops answering while the process is still alive and logs no error; observed 2-3 times, not reliably reproduced, failing stage not established), REDIS_BENCHMARK_HOST_CONTENTION_LIVELOCK (resolved, but the `while(1)` is in `redis-benchmark`'s own `writeHandler` — "the guest is not involved in the hang at all", so no fix landed in this codebase), REDIS_ROUND_TRIP_STAGE_TRACE (read entirely out of already-checked-in logs — no new boot, no new build; its §4 "688 µs" framing is retired by LONG_ROAD_TO_REDIS_PART_2 §9, counted there), and SYSCALL_LAYER_AUDIT (the duplication audit that *found* the `dup`/`dup3`/`fcntl` refcount gap; the fix is counted under LONG_ROAD_TO_REDIS_PART_2, not duplicated here). VEC_AUDIT's findings #1 (`map_user_page`'s per-call page-table frame list) and #2 (`SOCKET_TABLE`) are `Vec`-to-fixed-array conversions with no bug attached and are not counted; its #3 is the `irq.rs` deadlock, counted under IRQ_HANDLER_TABLE_DEADLOCK; only its terminal `canon_buffer` fix is counted (Console & Terminal, above).
 
