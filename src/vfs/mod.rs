@@ -523,8 +523,8 @@ pub fn read_at_open_file(
     if inode == 0 {
         return read_at(path, offset, buf);
     }
-    let _ = mount_id;
-    with_fs(path, |fs, _rel| fs.read_at_by_inode(inode, offset, buf))
+    let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
+    fs.read_at_by_inode(inode, offset, buf)
 }
 
 /// [`metadata`] for an open file description, by the inode `open(2)` bound to it
