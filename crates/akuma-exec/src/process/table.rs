@@ -46,6 +46,28 @@ static RETIRE_TIME: [AtomicU64; MAX_PROCESSES] = {
     [INIT; MAX_PROCESSES]
 };
 
+/// Per-slot reuse generation — the thing that makes `SLOT_STATES[i] == ACTIVE`
+/// mean "still the occupant you cached" rather than merely "somebody is here".
+///
+/// The slot lifecycle is ACTIVE → RETIRED → (reclaim frees the `Process`) → FREE
+/// → claimed again → ACTIVE. Validating on state alone cannot see the round
+/// trip: a recycled slot reads ACTIVE while a cached pointer into it dangles, so
+/// the check passes and the deref is a use-after-free
+/// (`docs/archive/IDENTITY_CACHE_SMP_REVIEW.md` Finding B).
+///
+/// **Pointer equality is not a substitute.** `Process` is a fixed-size
+/// allocation, so the allocator can hand the same address to the new occupant —
+/// that comparison passes while returning the wrong identity.
+///
+/// Bumped in exactly one place, `reclaim_retired_processes_internal`, between
+/// the pointer swap and the `FREE` store. The slot is RETIRED across the bump
+/// and every reader already falls back on a non-ACTIVE state, so no reader can
+/// observe ACTIVE paired with a stale stamp.
+static SLOT_GEN: [AtomicU32; MAX_PROCESSES] = {
+    const INIT: AtomicU32 = AtomicU32::new(0);
+    [INIT; MAX_PROCESSES]
+};
+
 /// Register a process in the table (takes ownership via Box).
 ///
 /// Finds a free slot via CAS, stores the Process pointer.
@@ -252,6 +274,12 @@ fn reclaim_retired_processes_internal(ignore_cooldown: bool) -> usize {
         if old.is_null() {
             continue;
         }
+        // Retire the generation BEFORE the slot becomes claimable. Ordering is
+        // the whole safety argument: the state is RETIRED across this bump, and
+        // every reader rejects a non-ACTIVE state, so nobody can read ACTIVE
+        // together with the pre-bump generation. Release-paired with the
+        // Acquire load in `identity_get`.
+        SLOT_GEN[i].fetch_add(1, Ordering::AcqRel);
         SLOT_STATES[i].store(slot_state::FREE, Ordering::Release);
         RETIRE_TIME[i].store(0, Ordering::Relaxed);
         crate::process::reclaim::clear_retired_slot(i);
@@ -543,6 +571,11 @@ pub struct ThreadIdentity {
     tgid: AtomicU32,
     tgid_slot: AtomicU16,
     tgid_ptr: AtomicPtr<Process>,
+    /// `SLOT_GEN` at the moment each half was stamped. A slot that has been
+    /// recycled since reads ACTIVE with a different generation, which is the
+    /// only thing that distinguishes "still ours" from "freed and re-issued".
+    own_gen: AtomicU32,
+    tgid_gen: AtomicU32,
     /// Failed lazy re-stamps for this entry, bounded by [`MAX_REPAIR_ATTEMPTS`].
     ///
     /// The stamp is written once, at `thread_pid_map_insert`. If the map insert
@@ -580,6 +613,8 @@ impl ThreadIdentity {
             tgid: AtomicU32::new(0),
             tgid_slot: AtomicU16::new(INVALID_SLOT),
             tgid_ptr: AtomicPtr::new(core::ptr::null_mut()),
+            own_gen: AtomicU32::new(0),
+            tgid_gen: AtomicU32::new(0),
             repair_attempts: AtomicU8::new(0),
         }
     }
@@ -639,6 +674,17 @@ pub static IDENTITY_FB_UNSTAMPED: AtomicU64 = AtomicU64::new(0);
 pub static IDENTITY_FB_CLEARED: AtomicU64 = AtomicU64::new(0);
 pub static IDENTITY_FB_INACTIVE: AtomicU64 = AtomicU64::new(0);
 pub static IDENTITY_FB_NULL: AtomicU64 = AtomicU64::new(0);
+
+/// Cached slot is ACTIVE but has been **recycled** since it was stamped — a
+/// different process now occupies it. Every one of these is a use-after-free
+/// that did not happen: before the generation check
+/// (`IDENTITY_CACHE_SMP_REVIEW.md` Finding B) this read passed validation and
+/// dereferenced a freed `Process`.
+///
+/// A nonzero value is therefore **expected and healthy** — it is the guard
+/// working, not a defect. What it does say is that the window is live on this
+/// workload, which inspection alone could not establish.
+pub static IDENTITY_FB_STALE_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// Misses that the lazy re-stamp turned back into a live cache entry, and misses
 /// where the re-scan still could not resolve the pid.
@@ -709,6 +755,14 @@ fn identity_store_locked(tid: usize, pid: Pid) {
                 break;
             }
         }
+    }
+    // Stamp the generation BEFORE publishing the pointer, so a reader that sees
+    // the new pointer (Acquire on `*_ptr`) cannot still see the old stamp.
+    if own_slot != INVALID_SLOT {
+        e.own_gen.store(SLOT_GEN[own_slot as usize].load(Ordering::Acquire), Ordering::Relaxed);
+    }
+    if tgid_slot != INVALID_SLOT {
+        e.tgid_gen.store(SLOT_GEN[tgid_slot as usize].load(Ordering::Acquire), Ordering::Relaxed);
     }
     e.own_pid.store(pid, Ordering::Relaxed);
     e.own_slot.store(own_slot, Ordering::Relaxed);
@@ -849,6 +903,24 @@ fn identity_get(own: bool) -> Option<(Pid, &'static Process)> {
         IDENTITY_FB_INACTIVE.fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    // Finding B: ACTIVE alone cannot tell "still ours" from "freed and
+    // re-issued" — the slot may have gone ACTIVE → RETIRED → freed → FREE →
+    // claimed since we cached it, and the pointer below would then be a
+    // use-after-free. The state is read FIRST (above) and the generation
+    // SECOND: reclaim bumps the generation while the slot is RETIRED, so
+    // observing ACTIVE here means some occupant is installed, and a matching
+    // generation means it is still the one we stamped. `PROCESS_SLOTS[i]` is
+    // written once per generation (`try_claim_free_slot`, after the CAS) and
+    // nulled once (reclaim's swap), so within a generation the slot's pointer is
+    // immutable and a matching stamp already proves the cached pid is right —
+    // which is why no pid re-check is needed and the `Process` cache line is
+    // never touched.
+    let stamped_gen = if own { e.own_gen.load(Ordering::Relaxed) } else { e.tgid_gen.load(Ordering::Relaxed) };
+    if SLOT_GEN[slot].load(Ordering::Acquire) != stamped_gen {
+        IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        IDENTITY_FB_STALE_GEN.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let ptr = if own { e.own_ptr.load(Ordering::Acquire) } else { e.tgid_ptr.load(Ordering::Acquire) };
     if ptr.is_null() {
         IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
@@ -912,6 +984,22 @@ pub mod test_hooks {
 
     pub fn max_repair_attempts() -> u8 {
         MAX_REPAIR_ATTEMPTS
+    }
+
+    /// `(own_slot, stamped own generation, live generation of that slot)`.
+    /// A test asserts on the last two diverging after a recycle.
+    pub fn generation_state(tid: usize) -> (u16, u32, u32) {
+        if tid >= MAX_THREADS {
+            return (INVALID_SLOT, 0, 0);
+        }
+        let e = &THREAD_IDENTITY[tid];
+        let slot = e.own_slot.load(Ordering::Relaxed);
+        let live = if slot == INVALID_SLOT || slot as usize >= MAX_PROCESSES {
+            0
+        } else {
+            SLOT_GEN[slot as usize].load(Ordering::Acquire)
+        };
+        (slot, e.own_gen.load(Ordering::Relaxed), live)
     }
 
     pub const INVALID_SLOT_FOR_TEST: u16 = INVALID_SLOT;

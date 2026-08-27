@@ -198,6 +198,7 @@ pub fn run_all_tests() {
     // catches a failure mode that is otherwise invisible — see the fn doc.
     test_preempt_guard_is_live();
     test_identity_lazy_restamp();
+    test_identity_recycled_slot_rejected();
 
     // Real (shared-kernel) SMP M0: confirm every secondary the DTB reported came up
     // on the shared kernel. Runs FIRST so it is observed even if a later, unrelated
@@ -19458,6 +19459,76 @@ fn test_pmm_heap_lock_order_smp() {
         "[Test] pmm_heap_lock_order_smp {}\n",
         if pass { "PASSED" } else { "FAILED" }
     );
+}
+
+/// Finding B of docs/archive/IDENTITY_CACHE_SMP_REVIEW.md: a recycled process
+/// slot must not be handed back through the identity cache.
+///
+/// The slot lifecycle is ACTIVE -> RETIRED -> (reclaim frees the `Process`) ->
+/// FREE -> claimed again -> ACTIVE. Validating on `SLOT_STATES[i] == ACTIVE`
+/// alone cannot see that round trip: the state reads ACTIVE again while the
+/// cached pointer dangles, so the check passed and the deref was a
+/// use-after-free. Pointer equality is not a fix either — `Process` is a
+/// fixed-size allocation, so the allocator can hand the same address to the new
+/// occupant.
+///
+/// This drives the round trip deliberately and asserts the cache refuses.
+fn test_identity_recycled_slot_rejected() {
+    use akuma_exec::process::table::{self, test_hooks as ih};
+    use core::sync::atomic::Ordering;
+
+    const FIRST_PID: u32 = 7811;
+    const SECOND_PID: u32 = 7812;
+    let tid = akuma_exec::threading::current_thread_id();
+    let stale0 = table::IDENTITY_FB_STALE_GEN.load(Ordering::Relaxed);
+
+    // Occupy a slot and cache an identity pointing at it.
+    akuma_exec::process::register_process(FIRST_PID, make_test_process(FIRST_PID));
+    akuma_exec::process::table::register_thread_pid(tid, FIRST_PID);
+    let cached_ok = table::current_thread_own_process().map(|(p, _)| p) == Some(FIRST_PID);
+    let (slot, gen_stamped, gen_live) = ih::generation_state(tid);
+    let stamped_ok = slot != ih::INVALID_SLOT_FOR_TEST && gen_stamped == gen_live;
+
+    // Retire and actually FREE it, which is what bumps the generation. Without
+    // the force variant the cooldown leaves the slot RETIRED and the slot is
+    // never reissued, so the test would pass for the wrong reason.
+    akuma_exec::process::unregister_process(FIRST_PID);
+    let freed = akuma_exec::process::table::reclaim_retired_processes_force();
+
+    // Reissue. `try_claim_free_slot` scans from 0, so the slot just freed is the
+    // first FREE one and the new process lands in it — the recycle this is about.
+    akuma_exec::process::register_process(SECOND_PID, make_test_process(SECOND_PID));
+    let (slot_after, gen_stamped2, gen_live2) = ih::generation_state(tid);
+    let recycled_same_slot = slot_after == slot;
+    let generation_moved = gen_live2 != gen_stamped2;
+
+    // The cache must refuse: the stale entry must NOT resolve to either process.
+    // Returning FIRST_PID would be the use-after-free; returning SECOND_PID would
+    // be the wrong identity handed to the wrong thread.
+    let resolved = table::current_thread_own_process().map(|(p, _)| p);
+    let refused = resolved.is_none();
+    let counted = table::IDENTITY_FB_STALE_GEN.load(Ordering::Relaxed) > stale0;
+
+    ih::clear(tid);
+    akuma_exec::process::unregister_process(SECOND_PID);
+    let _ = akuma_exec::process::table::reclaim_retired_processes_force();
+
+    // `recycled_same_slot` is the precondition, not an assertion about the
+    // kernel: if some other core claimed that slot first the recycle never
+    // happened here and the run proves nothing, so say so instead of passing.
+    if !(cached_ok && stamped_ok && freed >= 1 && recycled_same_slot) {
+        crate::safe_print!(224,
+            "[Test] identity_recycled_slot_rejected INCONCLUSIVE: cached={} stamped={} freed={} same_slot={} (slot={} -> {})\n",
+            cached_ok, stamped_ok, freed, recycled_same_slot, slot, slot_after);
+        return;
+    }
+    if generation_moved && refused && counted {
+        console::print("[Test] identity_recycled_slot_rejected PASSED\n");
+    } else {
+        crate::safe_print!(224,
+            "[Test] identity_recycled_slot_rejected FAILED: gen_moved={} refused={} counted={} resolved={:?} (stamped={} live={})\n",
+            generation_moved, refused, counted, resolved, gen_stamped2, gen_live2);
+    }
 }
 
 /// The identity cache's lazy re-stamp: a stamped-but-unresolved entry must
