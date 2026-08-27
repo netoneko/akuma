@@ -39,7 +39,7 @@ instrumentation.
 - file page cache: **no per-box or per-mount structure at all**
   (`PAGES: BTreeMap<(u32, usize), Entry>`, `file_page_cache.rs` ~80).
 
-### Finding F-1 (latent, pre-existing)
+### Finding F-1 (fixed 2026-08-27 — [`FPCACHE_MOUNT_IDENTITY.md`](FPCACHE_MOUNT_IDENTITY.md))
 
 The global page-cache key is inode number alone. Two concurrent ext2 mounts
 (`MOUNT_IN_NS` supports mounting a second ext2 from a registered block
@@ -306,10 +306,14 @@ mmap, which is `SELFHOST_ZERO_PAGE_HUNT.md` §14 reached by a second route.
 
 Not done:
 
-- **D-9 — per-box/mount scoping of the file page cache**, which this work never
-  bundled. Still the fix for **F-1** above (the global page cache keys on inode
-  number alone, so two independent ext2 mounts share a keyspace) — a latent
-  correctness bug, not tidiness.
+- **D-9 — per-box/mount scoping of the file page cache.** The **keying half is
+  done** (2026-08-27,
+  [`FPCACHE_MOUNT_IDENTITY.md`](FPCACHE_MOUNT_IDENTITY.md)): the cache key is now
+  `(inode, mount id, offset)`, which closes **F-1** above — two independent ext2
+  mounts no longer share a keyspace, and an in-kernel oracle test proves the old
+  key served one mount another's page. The **capacity half is still open**:
+  `CAP_PAGES`, eviction and `shrink` remain one global pool, so a box can still
+  evict box 0's cached pages, and box 0 is the busiest box there is.
 - **D-10 — the `DataCache` proposal was never written.** `proposals/` has no
   such document. Until it exists, the mmap-vs-read double-cache seam stands.
 - **Host-test coverage gaps** (unchanged from the step-1 note): the fixture is a

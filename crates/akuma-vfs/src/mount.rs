@@ -17,6 +17,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::types::{DirEntry, Filesystem, FsError, MountInfo};
 
@@ -27,8 +28,28 @@ pub const MS_REMOUNT: u64 = 32;
 /// `ST_RDONLY` — the `statfs`/`fstatfs` `f_flags` bit for a read-only mount.
 pub const ST_RDONLY: u64 = 1;
 
+/// Source of [`MountEntry::id`].
+///
+/// One counter across every [`MountSet`] in the kernel — the global table and
+/// each box's namespace — because the thing keyed on these ids (the file page
+/// cache) is itself global, so an id must mean one mount system-wide.
+///
+/// Starts at 1 so `0` can keep meaning "no mount identity". **Monotonic and
+/// never reused**: an unmount drops its entry, and handing that number to the
+/// next mount would let a stale cache entry from the old filesystem match the
+/// new one — the exact aliasing this exists to prevent, merely delayed. At one
+/// id per `mount(2)` a `u32` cannot realistically wrap.
+///
+/// Nothing outside this module can set an id. That is deliberate: identity is
+/// assigned by the mount table, never asserted by the filesystem being mounted,
+/// so no `Filesystem` implementation can claim to be another one and be handed
+/// its cached pages.
+static NEXT_MOUNT_ID: AtomicU32 = AtomicU32::new(1);
+
 struct MountEntry {
     path: String,
+    /// This mount's identity — see [`NEXT_MOUNT_ID`].
+    id: u32,
     /// Device/source this fs was mounted from (`/dev/vda`, `proc`, …), if the
     /// mount came from a source that had one. Boot mounts and `MOUNT_IN_NS`
     /// set it; a plain `mount("tmpfs")` leaves it `None`.
@@ -38,6 +59,26 @@ struct MountEntry {
     /// accepted and dropped.
     flags: u64,
     fs: Arc<dyn Filesystem>,
+}
+
+/// A path resolved to the mount that serves it.
+///
+/// Carries the mount's [identity](Self::id) as well as its filesystem, because
+/// an inode number means nothing without knowing which filesystem issued it —
+/// see [`NEXT_MOUNT_ID`] and finding F-1 of
+/// `docs/archive/EXT2_WRITEBACK_DESIGN.md`.
+pub struct ResolvedMount {
+    /// The filesystem serving this path.
+    pub fs: Arc<dyn Filesystem>,
+    /// `path` rewritten relative to the mount point.
+    pub rel: String,
+    /// The mount's stored `MS_*` bits (only `MS_RDONLY` is honoured).
+    pub flags: u64,
+    /// Which mount this is. Unique kernel-wide and never reused, so it is safe
+    /// to use as a cache key alongside an inode number, and safe to store on
+    /// something long-lived (an fd, a mapping) that must later be sure it is
+    /// still talking about the same filesystem.
+    pub id: u32,
 }
 
 /// A set of mounted filesystems, holding at most `MAX` of them.
@@ -92,6 +133,7 @@ impl<const MAX: usize> MountSet<MAX> {
         }
         self.mounts.push(MountEntry {
             path: String::from(path),
+            id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
             source: source.map(String::from),
             flags: flags & MS_RDONLY,
             fs,
@@ -173,6 +215,10 @@ impl<const MAX: usize> MountSet<MAX> {
             return Err(FsError::PermissionDenied);
         }
         current.fs = fs;
+        // A fresh identity, not the jail's: everything keyed on the old id
+        // (cached pages of the `SubdirFs` root) belongs to the filesystem being
+        // replaced, and must not be served for the overlay replacing it.
+        current.id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -214,27 +260,60 @@ impl<const MAX: usize> MountSet<MAX> {
     /// path landed on.
     #[must_use]
     pub fn resolve_arc_with_flags(&self, path: &str) -> Option<(Arc<dyn Filesystem>, String, u64)> {
+        self.resolve_arc_full(path).map(|r| (r.fs, r.rel, r.flags))
+    }
+
+    /// The full resolution: filesystem, path relative to the mount point, the
+    /// mount's `MS_*` flags, and its [identity](ResolvedMount::id).
+    ///
+    /// The other two resolvers delegate here and drop what they do not need, so
+    /// there is one scan and one place the matching rules live.
+    #[must_use]
+    pub fn resolve_arc_full(&self, path: &str) -> Option<ResolvedMount> {
         let normalized = normalize_mount_path(path);
 
         for mount in &self.mounts {
-            if mount.path == "/" {
-                return Some((mount.fs.clone(), normalized.into(), mount.flags));
-            }
-            if normalized == mount.path {
-                return Some((mount.fs.clone(), String::from("/"), mount.flags));
-            }
-            if normalized.starts_with(&mount.path[..]) {
+            let rel = if mount.path == "/" {
+                Some(String::from(normalized))
+            } else if normalized == mount.path {
+                Some(String::from("/"))
+            } else if normalized.starts_with(&mount.path[..]) {
                 let rest = &normalized[mount.path.len()..];
                 if rest.is_empty() {
-                    return Some((mount.fs.clone(), String::from("/"), mount.flags));
+                    Some(String::from("/"))
+                } else if rest.starts_with('/') {
+                    Some(String::from(rest))
+                } else {
+                    None
                 }
-                if rest.starts_with('/') {
-                    return Some((mount.fs.clone(), rest.into(), mount.flags));
-                }
+            } else {
+                None
+            };
+            if let Some(rel) = rel {
+                return Some(ResolvedMount {
+                    fs: mount.fs.clone(),
+                    rel,
+                    flags: mount.flags,
+                    id: mount.id,
+                });
             }
         }
 
         None
+    }
+
+    /// The filesystem mounted under `id`, if this set still holds that mount.
+    ///
+    /// `None` means the mount is gone — unmounted, or re-rooted, which mints a
+    /// new id precisely so the old one stops resolving. Ids are never reused, so
+    /// this can never hand back a different filesystem than the one the caller
+    /// meant.
+    #[must_use]
+    pub fn fs_by_id(&self, id: u32) -> Option<Arc<dyn Filesystem>> {
+        self.mounts
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.fs.clone())
     }
 
     /// Copy up to `out.len()` mounts into `out` as borrowed rows, returning the

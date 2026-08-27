@@ -1695,8 +1695,10 @@ mod lazy_region_propagation_tests {
         map.clone_all().into_values().collect()
     }
 
+    /// Mount id 1 throughout: these tests are about region propagation across
+    /// fork, not about which filesystem the inode came from.
     fn file_source(path: &str, inode: u32) -> LazySource {
-        LazySource::file(alloc::string::String::from(path), inode, 0, 0x2000, 0x2000_0000)
+        LazySource::file(alloc::string::String::from(path), 1, inode, 0, 0x2000, 0x2000_0000)
     }
 
     #[test]

@@ -58,7 +58,7 @@ pub(super) enum MapStrategy<'a> {
     Eager,
     /// Register each PT_LOAD as a lazy region backed by the file; nothing is
     /// read until the process faults on it.
-    Deferred { path: &'a str, inode: u32 },
+    Deferred { path: &'a str, mount_id: u32, inode: u32 },
 }
 
 /// Load an ELF binary from memory.
@@ -77,7 +77,7 @@ pub fn load_elf_from_path(
     file_size: usize,
     interp_prefix: Option<&str>,
 ) -> Result<LoadedElf, ElfError> {
-    let inode = (runtime().resolve_inode)(path).unwrap_or(0);
+    let (mount_id, inode) = (runtime().resolve_file_id)(path).unwrap_or((0, 0));
 
     if DEBUG_ELF_LOADING {
         log::debug!(
@@ -90,7 +90,7 @@ pub fn load_elf_from_path(
 
     load_image(
         ElfSource::Path(path),
-        &MapStrategy::Deferred { path, inode },
+        &MapStrategy::Deferred { path, mount_id, inode },
         interp_prefix,
     )
 }
@@ -191,7 +191,7 @@ fn load_image(
                 log_segment("Segment", vaddr, phdr.p_filesz as usize, memsz, phdr.p_flags);
                 map_segment_eager(src, &mut address_space, base, phdr, &mut mapped_pages)?;
             }
-            MapStrategy::Deferred { path, inode } => {
+            MapStrategy::Deferred { path, mount_id, inode } => {
                 // Boundary-page fix (see `boundary_extended_filesz`): when this
                 // segment's file-backed data ends mid-page and the *next* segment
                 // begins in that same page, the demand-pager would map the page on
@@ -208,6 +208,7 @@ fn load_image(
                     page_flags: segment_page_flags(phdr.p_flags),
                     file_source: Some(FileSegmentSource {
                         path: String::from(path),
+                        mount_id,
                         inode,
                         file_offset: phdr.p_offset as usize,
                         filesz,

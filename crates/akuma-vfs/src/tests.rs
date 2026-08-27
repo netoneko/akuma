@@ -165,6 +165,75 @@ mod path_tests {
     }
 
     #[test]
+    fn mount_ids_are_unique_and_never_reused() {
+        // The property the file page cache depends on: an inode number is only
+        // meaningful next to the mount that issued it, so two mounts must never
+        // share an id — and an unmounted id must never come back, or a stale
+        // cached page would match the filesystem that replaced it.
+        let mut mt = MountTable::new();
+        mt.mount("/", Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/a", Arc::new(MemoryFilesystem::new())).unwrap();
+        let root = mt.resolve_arc_full("/x").unwrap().id;
+        let a = mt.resolve_arc_full("/a/x").unwrap().id;
+        assert_ne!(root, a, "two mounts must not share an id");
+        assert_ne!(root, 0, "0 means 'no identity' and is never issued");
+
+        mt.unmount("/a").unwrap();
+        mt.mount("/a", Arc::new(MemoryFilesystem::new())).unwrap();
+        let a2 = mt.resolve_arc_full("/a/x").unwrap().id;
+        assert_ne!(a2, a, "an unmounted id must never be reissued");
+        assert_ne!(a2, root);
+    }
+
+    #[test]
+    fn fs_by_id_finds_the_mount_and_forgets_it_on_unmount() {
+        let mut mt = MountTable::new();
+        mt.mount("/", Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.mount("/data", Arc::new(MemoryFilesystem::new())).unwrap();
+        let data = mt.resolve_arc_full("/data/f").unwrap();
+
+        let found = mt.fs_by_id(data.id).expect("live mount resolves by id");
+        assert!(Arc::ptr_eq(&found, &data.fs), "must be the same filesystem");
+
+        mt.unmount("/data").unwrap();
+        assert!(
+            mt.fs_by_id(data.id).is_none(),
+            "an unmounted id must stop resolving rather than land on another mount",
+        );
+    }
+
+    #[test]
+    fn re_rooting_mints_a_new_id() {
+        // `replace_pristine_root` swaps the filesystem under `/`. Anything keyed
+        // on the old id belongs to the jail being replaced, so the overlay must
+        // not inherit it.
+        let mut mt = MountTable::new();
+        mt.mount("/", Arc::new(MemoryFilesystem::new())).unwrap();
+        let before = mt.resolve_arc_full("/x").unwrap().id;
+        mt.replace_pristine_root("memfs", Arc::new(MemoryFilesystem::new()))
+            .unwrap();
+        let after = mt.resolve_arc_full("/x").unwrap().id;
+        assert_ne!(before, after, "a re-rooted mount must not keep its identity");
+        assert!(mt.fs_by_id(before).is_none(), "the old id must stop resolving");
+    }
+
+    #[test]
+    fn resolve_arc_full_agrees_with_the_narrower_resolvers() {
+        // The two older resolvers delegate here; if they ever diverge, the
+        // mount-matching rules have been forked.
+        let mut mt = MountTable::new();
+        mt.mount_with("/", Some("/dev/vda"), 0, Arc::new(MemoryFilesystem::new())).unwrap();
+        mt.mount_with("/ro", None, MS_RDONLY, Arc::new(MemoryFilesystem::new())).unwrap();
+        for path in ["/etc/passwd", "/ro", "/ro/file", "/"] {
+            let full = mt.resolve_arc_full(path).unwrap();
+            let (fs, rel, flags) = mt.resolve_arc_with_flags(path).unwrap();
+            assert!(Arc::ptr_eq(&fs, &full.fs), "{path}: fs differs");
+            assert_eq!(rel, full.rel, "{path}: rel differs");
+            assert_eq!(flags, full.flags, "{path}: flags differ");
+        }
+    }
+
+    #[test]
     fn resolve_arc_with_flags_reports_resolved_mount() {
         let mut mt = MountTable::new();
         mt.mount_with("/", Some("/dev/vda"), 0, Arc::new(MemoryFilesystem::new())).unwrap();

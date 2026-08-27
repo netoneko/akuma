@@ -11,6 +11,8 @@ pub const DEBUG_ELF_LOADING: bool = true;
 /// File-backed source for a deferred lazy segment.
 pub struct FileSegmentSource {
     pub path: String,
+    /// Which mount `inode` belongs to — see `LazySource::File::mount_id`.
+    pub mount_id: u32,
     pub inode: u32,
     pub file_offset: usize,
     pub filesz: usize,

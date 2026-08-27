@@ -331,6 +331,16 @@ pub enum LazySource {
     File {
         path: String,
         inode: u32,
+        /// Which mount `inode` belongs to (`akuma_vfs::ResolvedMount::id`),
+        /// captured with it at mmap time. `0` means "no identity", which
+        /// disables page-cache sharing for this region.
+        ///
+        /// An inode number alone does not name a file: a second `mount(2)` puts
+        /// another filesystem's numbers in the same range, and the page cache is
+        /// global. Carrying the pair is what stops a mapping of inode 12 on one
+        /// mount being served the cached page of inode 12 on another — finding
+        /// F-1 of `docs/archive/EXT2_WRITEBACK_DESIGN.md`.
+        mount_id: u32,
         file_offset: usize,
         filesz: usize,
         segment_va: usize,
@@ -358,6 +368,7 @@ impl LazySource {
     #[must_use]
     pub fn file(
         path: String,
+        mount_id: u32,
         inode: u32,
         file_offset: usize,
         filesz: usize,
@@ -366,6 +377,7 @@ impl LazySource {
         Self::File {
             path,
             inode,
+            mount_id,
             file_offset,
             filesz,
             segment_va,

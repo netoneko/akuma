@@ -14,7 +14,7 @@ use spinning_top::Spinlock;
 
 // Re-export everything from the crate so existing `use crate::vfs::*` keeps working.
 pub use akuma_vfs::{
-    DevNode, DevProbe, DirEntry, Filesystem, FsError, FsStats, Metadata, MountInfo,
+    DevNode, DevProbe, DirEntry, Filesystem, FsError, FsStats, Metadata, MountInfo, ResolvedMount,
     MS_RDONLY, ST_RDONLY,
     canonicalize_path, resolve_path, split_path,
 };
@@ -248,7 +248,7 @@ pub fn get_root_fs() -> Option<Arc<dyn Filesystem>> {
 ///
 /// Locks are held for the resolution only (the `Arc` outlives them), so no I/O
 /// or allocation happens under a mount-table lock.
-fn resolve_mount(path: &str) -> Option<(Arc<dyn Filesystem>, String, u64)> {
+fn resolve_mount(path: &str) -> Option<ResolvedMount> {
     // Check spawn namespace override (set during container ELF loading).
     {
         let tid = akuma_exec::threading::current_thread_id();
@@ -258,7 +258,7 @@ fn resolve_mount(path: &str) -> Option<(Arc<dyn Filesystem>, String, u64)> {
                 .map_or_else(|| String::from("/"), |p| p.cwd.clone());
             let absolute = resolve_path(&cwd, path);
             let ns_mount = ns.mount.lock();
-            return ns_mount.resolve_arc_with_flags(&absolute);
+            return ns_mount.resolve_arc_full(&absolute);
         }
     }
 
@@ -266,18 +266,18 @@ fn resolve_mount(path: &str) -> Option<(Arc<dyn Filesystem>, String, u64)> {
         let absolute = resolve_path(&proc.cwd, path);
 
         // Try process namespace first (lock released before I/O).
-        if let Some(resolved) = proc.namespace.mount.lock().resolve_arc_with_flags(&absolute) {
+        if let Some(resolved) = proc.namespace.mount.lock().resolve_arc_full(&absolute) {
             return Some(resolved);
         }
 
         // Fall back to global mount table (lock released before I/O).
         let table = MOUNT_TABLE.lock();
-        return table.as_ref()?.resolve_arc_with_flags(&absolute);
+        return table.as_ref()?.resolve_arc_full(&absolute);
     }
 
     let normalized = resolve_without_cwd(path);
     let table = MOUNT_TABLE.lock();
-    table.as_ref()?.resolve_arc_with_flags(&normalized)
+    table.as_ref()?.resolve_arc_full(&normalized)
 }
 
 /// Helper to get filesystem for a path.
@@ -291,8 +291,8 @@ fn with_fs<F, R>(path: &str, f: F) -> Result<R, FsError>
 where
     F: FnOnce(&dyn Filesystem, &str) -> Result<R, FsError>,
 {
-    let (fs, rel, _) = resolve_mount(path).ok_or(FsError::NotFound)?;
-    f(fs.as_ref(), &rel)
+    let r = resolve_mount(path).ok_or(FsError::NotFound)?;
+    f(r.fs.as_ref(), &r.rel)
 }
 
 /// [`with_fs`] for mutating operations: the resolved mount's `MS_RDONLY` flag
@@ -302,11 +302,11 @@ fn with_fs_write<F, R>(path: &str, f: F) -> Result<R, FsError>
 where
     F: FnOnce(&dyn Filesystem, &str) -> Result<R, FsError>,
 {
-    let (fs, rel, flags) = resolve_mount(path).ok_or(FsError::NotFound)?;
-    if flags & MS_RDONLY != 0 {
+    let r = resolve_mount(path).ok_or(FsError::NotFound)?;
+    if r.flags & MS_RDONLY != 0 {
         return Err(FsError::ReadOnly);
     }
-    f(fs.as_ref(), &rel)
+    f(r.fs.as_ref(), &r.rel)
 }
 
 /// List directory contents
@@ -410,6 +410,26 @@ pub fn resolve_inode(path: &str) -> Result<u32, FsError> {
 /// Read from a file by inode number, bypassing path lookup.
 pub fn read_at_by_inode(path: &str, inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
     with_fs(path, |fs, _rel| fs.read_at_by_inode(inode, offset, buf))
+}
+
+/// Resolve `path` to the `(mount id, inode)` pair that actually names a file.
+///
+/// An inode number on its own does not identify a file: a second `mount(2)`
+/// (`MOUNT_IN_NS`) brings up another filesystem issuing numbers from the same
+/// range, so anything that stores an inode across time — the file page cache, a
+/// lazy mapping, an fd — must store which mount it came from too. That is
+/// finding **F-1** of `docs/archive/EXT2_WRITEBACK_DESIGN.md`.
+///
+/// The id comes from the mount table, which assigns it and never reuses it. It
+/// is deliberately not something the filesystem reports about itself.
+///
+/// `None` when the path does not resolve, or when the filesystem has no inode
+/// addressing at all (procfs, memfs, synthetic nodes) — callers then fall back to
+/// working by path, exactly as before.
+pub fn resolve_file_id(path: &str) -> Option<(u32, u32)> {
+    let resolved = resolve_mount(path)?;
+    let inode = resolved.fs.resolve_inode(&resolved.rel).ok()?;
+    (inode != 0).then_some((resolved.id, inode))
 }
 
 /// The inode `open(2)` should bind an fd to, or `None` when this fd has to go on
@@ -948,12 +968,12 @@ pub struct FsView {
 /// statistics. `statfs(2)` and `fstatfs(2)` both land here. All locks are
 /// released by `resolve_mount` before the (allocating) name copy runs.
 pub fn stats_for_path(path: &str) -> Result<FsView, FsError> {
-    let (fs, _rel, flags) = resolve_mount(path).ok_or(FsError::NotFound)?;
-    let stats = fs.stats()?;
-    let fs_name = String::from(fs.name());
+    let r = resolve_mount(path).ok_or(FsError::NotFound)?;
+    let stats = r.fs.stats()?;
+    let fs_name = String::from(r.fs.name());
     Ok(FsView {
         stats,
-        flags: if flags & MS_RDONLY != 0 { ST_RDONLY } else { 0 },
+        flags: if r.flags & MS_RDONLY != 0 { ST_RDONLY } else { 0 },
         fs_name,
     })
 }

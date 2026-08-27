@@ -117,7 +117,12 @@ pub struct ExecRuntime {
     // VFS (for elf_loader)
     pub read_file: fn(&str) -> Result<alloc::vec::Vec<u8>, i32>,
     pub read_at: fn(&str, usize, &mut [u8]) -> Result<usize, i32>,
-    pub resolve_inode: fn(&str) -> Result<u32, i32>,
+    /// Resolve a path to `(mount id, inode)` — the pair that actually names a
+    /// file. The mount id comes from the kernel's mount table
+    /// (`akuma_vfs::ResolvedMount::id`); an inode number on its own is
+    /// ambiguous across two mounted filesystems, which is what makes it unsafe
+    /// as a page-cache key (F-1, `docs/archive/EXT2_WRITEBACK_DESIGN.md`).
+    pub resolve_file_id: fn(&str) -> Result<(u32, u32), i32>,
     /// Takes the path as well as the inode: the VFS is multi-root (`with_fs`
     /// dispatches on the path prefix), so an inode alone does not name a file.
     /// The prefault fill in `mmu/user_access.rs` calls this for every

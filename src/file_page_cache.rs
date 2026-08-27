@@ -71,13 +71,31 @@ struct Entry {
     icache_done: bool,
 }
 
-/// `(inode, page-aligned file offset)` → frame.
+/// `(inode, mount id, page-aligned file offset)` → frame.
+///
+/// **Inode-major on purpose.** Lookups are exact-key, so their order is free;
+/// [`invalidate_inode`] is a *range* scan over one inode across every mount, and
+/// only this ordering makes that a `log n + k` walk instead of a full sweep of
+/// the table on every `write(2)`.
+///
+/// The mount id is finding **F-1** of `docs/archive/EXT2_WRITEBACK_DESIGN.md`.
+/// This key used to be the inode number alone, but an inode number means nothing
+/// without the filesystem that issued it: `mount(2)` can bring up a second ext2
+/// over another disk (`MOUNT_IN_NS`), which put both filesystems' numbers in one
+/// keyspace — a mapping of inode 12 on `/data` could be handed the cached page of
+/// inode 12 on `/`. Silent wrong bytes, in the one cache whose entries become
+/// executable text.
+///
+/// The id comes from the mount table (`akuma_vfs::ResolvedMount::id`), which
+/// assigns it and never reuses it. It is deliberately **not** something a
+/// `Filesystem` reports about itself: identity that the identified object gets to
+/// assert is identity that can be forged into another filesystem's keyspace.
 ///
 /// IRQs are masked around every access for the same reason `FUTEX_WAITERS` masks
 /// them: this table is reachable from the BKL-free fault window, and a nested IRQ
 /// that hard-spins for the BKL while a peer core holds this lock is the AB-BA
 /// shape `docs/reference/subsystems/locking.md` warns about.
-static PAGES: Spinlock<BTreeMap<(u32, usize), Entry>> = Spinlock::new(BTreeMap::new());
+static PAGES: Spinlock<BTreeMap<(u32, u32, usize), Entry>> = Spinlock::new(BTreeMap::new());
 
 /// Rotating eviction cursor, so successive evictions sweep the keyspace
 /// (clock-like) instead of always dropping the numerically lowest inode.
@@ -223,13 +241,18 @@ pub use akuma_exec::memmath::is_shareable_mapping;
 /// `want_exec` upgrades the I-cache state: a frame first cached as plain RO data
 /// has never been through `ic ivau`, so an `RX` mapper needs to do that before
 /// executing from it. Returns `(frame, needs_icache_maintenance)`.
-pub fn lookup_and_ref(inode: u32, file_off: usize, want_exec: bool) -> Option<(PhysFrame, bool)> {
-    if !crate::config::SHARED_FILE_PAGES_ENABLED || inode == 0 {
+pub fn lookup_and_ref(
+    mount_id: u32,
+    inode: u32,
+    file_off: usize,
+    want_exec: bool,
+) -> Option<(PhysFrame, bool)> {
+    if !crate::config::SHARED_FILE_PAGES_ENABLED || inode == 0 || mount_id == 0 {
         return None;
     }
     let hit = crate::irq::with_irqs_disabled(|| {
         let pages = PAGES.lock();
-        let hit = pages.get(&(inode, file_off)).copied();
+        let hit = pages.get(&(inode, mount_id, file_off)).copied();
         if let Some(ref h) = hit {
             // Take the mapper's reference while the entry is still present.
             // Every free path (insert-eviction, invalidate_inode, shrink)
@@ -251,12 +274,12 @@ pub fn lookup_and_ref(inode: u32, file_off: usize, want_exec: bool) -> Option<(P
 }
 
 /// Record that `frame` has had I-cache maintenance, so later `RX` mappers can skip it.
-pub fn mark_icache_clean(inode: u32, file_off: usize, frame: PhysFrame) {
+pub fn mark_icache_clean(mount_id: u32, inode: u32, file_off: usize, frame: PhysFrame) {
     if !crate::config::SHARED_FILE_PAGES_ENABLED {
         return;
     }
     crate::irq::with_irqs_disabled(|| {
-        if let Some(e) = PAGES.lock().get_mut(&(inode, file_off))
+        if let Some(e) = PAGES.lock().get_mut(&(inode, mount_id, file_off))
             && e.pa == frame.addr
         {
             e.icache_done = true;
@@ -269,8 +292,8 @@ pub fn mark_icache_clean(inode: u32, file_off: usize, frame: PhysFrame) {
 /// Call this only for a page that satisfies every eligibility rule in the module
 /// docs; `frame` must be fully filled (and I-cache-maintained if `icache_done`)
 /// *before* publishing, since a peer core can map it the instant it lands.
-pub fn insert(inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) {
-    if !crate::config::SHARED_FILE_PAGES_ENABLED || inode == 0 {
+pub fn insert(mount_id: u32, inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) {
+    if !crate::config::SHARED_FILE_PAGES_ENABLED || inode == 0 || mount_id == 0 {
         return;
     }
     // Re-derive the elastic cap on a coarse cadence. Placed before the read
@@ -291,10 +314,10 @@ pub fn insert(inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) 
         // Lost the race to a peer filling the same page: keep the existing entry
         // so both mappers converge on one frame, and let the caller's frame stay
         // private (it is already correct, just not shared).
-        if pages.contains_key(&(inode, file_off)) {
+        if pages.contains_key(&(inode, mount_id, file_off)) {
             return None;
         }
-        pages.insert((inode, file_off), Entry { pa: frame.addr, icache_done });
+        pages.insert((inode, mount_id, file_off), Entry { pa: frame.addr, icache_done });
         // The cache's own reference, taken while the entry is being published
         // and only when it actually was. Taking it after this closure left a
         // window where the entry was visible with no cache reference — every
@@ -326,11 +349,17 @@ pub fn insert(inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) 
         let cursor = EVICT_CURSOR.load(Ordering::Relaxed);
         let mut unmapped = None;
         let mut fallback = None;
+        // NOTE: the cursor is inert and always has been — `(0, ..)` sorts below
+        // every real key (inode 0 is never cached), so the first range is the
+        // whole table and the second is empty, and the scan starts at the lowest
+        // inode every time rather than sweeping. Preserved verbatim through the
+        // key change so this commit alters no eviction behaviour; fixing it is
+        // its own change, with its own A/B.
         for (k, v) in pages
-            .range((0u32, cursor)..)
-            .chain(pages.range(..(0u32, cursor)))
+            .range((0u32, 0u32, cursor)..)
+            .chain(pages.range(..(0u32, 0u32, cursor)))
             .map(|(k, v)| (*k, *v))
-            .filter(|(k, _)| *k != (inode, file_off))
+            .filter(|(k, _)| *k != (inode, mount_id, file_off))
             .take(EVICT_SCAN)
         {
             if fallback.is_none() {
@@ -344,7 +373,7 @@ pub fn insert(inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) 
         let took_mapped = unmapped.is_none();
         let (vk, ve) = unmapped.or(fallback)?;
         pages.remove(&vk);
-        EVICT_CURSOR.store(vk.1.wrapping_add(4096), Ordering::Relaxed);
+        EVICT_CURSOR.store(vk.2.wrapping_add(4096), Ordering::Relaxed);
         Some((ve.pa, took_mapped))
     });
 
@@ -359,19 +388,30 @@ pub fn insert(inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) 
     }
 }
 
-/// Drop every cached page belonging to `inode`.
+/// Drop every cached page belonging to `inode`, **on every mount**.
 ///
-/// Called from the mutating VFS entry points. Cheap when the inode is absent,
-/// which is the common case: build outputs are written far more often than the
-/// toolchain images that populate this cache are mapped.
+/// Called from the mutating VFS entry points, and from ext2's inode-freed hook.
+///
+/// Deliberately id-blind, and that is what keeps identity out of the filesystem
+/// layer entirely. The hook fires from inside `Ext2Filesystem::free_inode`, which
+/// has no idea which mount it is reached through — and it must not be told,
+/// because a filesystem that knows its own cache identity is a filesystem that
+/// can name someone else's. Dropping a few extra entries costs a re-read;
+/// keeping one stale entry hands a mapper another file's bytes. So this over-
+/// invalidates by construction and the hook stays `fn(u32)`.
+///
+/// Cheap when the inode is absent, which is the common case: build outputs are
+/// written far more often than the toolchain images that populate this cache are
+/// mapped. The inode-major key ordering is what makes it a range scan rather than
+/// a full sweep — see [`PAGES`].
 pub fn invalidate_inode(inode: u32) {
     if !crate::config::SHARED_FILE_PAGES_ENABLED || inode == 0 {
         return;
     }
     let dropped: alloc::vec::Vec<usize> = crate::irq::with_irqs_disabled(|| {
         let mut pages = PAGES.lock();
-        let keys: alloc::vec::Vec<(u32, usize)> = pages
-            .range((inode, 0)..=(inode, usize::MAX))
+        let keys: alloc::vec::Vec<(u32, u32, usize)> = pages
+            .range((inode, 0u32, 0usize)..=(inode, u32::MAX, usize::MAX))
             .map(|(k, _)| *k)
             .collect();
         keys.iter().filter_map(|k| pages.remove(k).map(|e| e.pa)).collect()
@@ -404,7 +444,7 @@ pub fn shrink(want: usize) -> usize {
     }
     let dropped: alloc::vec::Vec<usize> = crate::irq::with_irqs_disabled(|| {
         let mut pages = PAGES.lock();
-        let victims: alloc::vec::Vec<(u32, usize)> = pages
+        let victims: alloc::vec::Vec<(u32, u32, usize)> = pages
             .iter()
             // refcount 1 == cached with no mappers: freeing it actually returns memory.
             .filter(|(_, e)| crate::pmm::cow_ref_get(e.pa) <= 1)

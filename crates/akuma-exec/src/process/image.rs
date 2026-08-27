@@ -104,6 +104,7 @@ fn push_deferred_regions(lazy: &mut LazyRegionMap, segments: &[DeferredLazySegme
         let source = match &seg.file_source {
             Some(fs) => LazySource::file(
                 fs.path.clone(),
+                fs.mount_id,
                 fs.inode,
                 fs.file_offset,
                 fs.filesz,

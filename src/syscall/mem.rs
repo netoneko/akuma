@@ -360,13 +360,23 @@ pub(super) fn sys_brk(new_brk: usize) -> u64 {
 /// `len`) but `inode` is zeroed, which disables both `lookup_and_ref` and `insert` —
 /// without a size there is no way to tell a real page from a past-EOF one, and
 /// refusing to share is the safe direction.
-fn resolve_file_extent(path: &str, offset: usize, len: usize) -> (u32, usize) {
+///
+/// The **mount id** rides along with the inode for the same reason it does on an
+/// fd: an inode number is ambiguous across two mounted filesystems, and this pair
+/// is what the page cache keys on (F-1,
+/// `docs/archive/EXT2_WRITEBACK_DESIGN.md`). Resolved together, from one call, so
+/// the two can never describe different mounts.
+fn resolve_file_extent(path: &str, offset: usize, len: usize) -> (u32, u32, usize) {
     match crate::vfs::file_size(path) {
-        Ok(file_len) => (
-            crate::vfs::resolve_inode(path).unwrap_or(0),
-            core::cmp::min(len, (file_len as usize).saturating_sub(offset)),
-        ),
-        Err(_) => (0, len),
+        Ok(file_len) => {
+            let (mount_id, inode) = crate::vfs::resolve_file_id(path).unwrap_or((0, 0));
+            (
+                mount_id,
+                inode,
+                core::cmp::min(len, (file_len as usize).saturating_sub(offset)),
+            )
+        }
+        Err(_) => (0, 0, len),
     }
 }
 
@@ -386,12 +396,12 @@ fn mmap_eager_to_lazy_fallback(
             let path = f.path.clone();
             // On-disk metadata read — dropped-BKL window like the other read paths
             // (Phase 2e of the no-bkl-vfs carve-out).
-            let (inode, filesz) = {
+            let (mount_id, inode, filesz) = {
                 let _vfs_window = super::fs::VfsBklGuard::new();
                 resolve_file_extent(&path, offset, len)
             };
             let source = akuma_exec::process::LazySource::file(
-                path, inode, offset, filesz, mmap_addr,
+                path, mount_id, inode, offset, filesz, mmap_addr,
             );
             let count = akuma_exec::process::push_lazy_region_with_source(
                 proc.tgid, mmap_addr, pages * 4096, page_flags, source);
@@ -510,12 +520,13 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             // Path→inode resolution reads ext2 metadata (real I/O on a cold cache) —
             // take the dropped-BKL window for it like every other on-disk read path
             // (Phase 2e of the no-bkl-vfs carve-out).
-            let (inode, filesz) = {
+            let (mount_id, inode, filesz) = {
                 let _vfs_window = super::fs::VfsBklGuard::new();
                 resolve_file_extent(&path, offset, len)
             };
             let source = akuma_exec::process::LazySource::file(
                 path.clone(),
+                mount_id,
                 inode,
                 offset,
                 filesz,

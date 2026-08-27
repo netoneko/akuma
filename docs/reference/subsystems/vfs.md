@@ -18,6 +18,23 @@ the `akuma_vfs` crate.
 
 - **Mount table:** `Spinlock<Option<MountTable>>`. Global root is the ext2
   mount; boxes get a scoped namespace (see Namespaces below).
+- **Every mount carries an id** (`ResolvedMount::id`, assigned by
+  `MountSet::mount_with` from a counter private to `akuma-vfs`, never reused —
+  including after unmount, and `replace_pristine_root` mints a fresh one). It is
+  what makes an inode number mean something: an inode is only unique *within* a
+  filesystem, and `mount(2)` can bring up a second ext2 whose numbers come from
+  the same range. Anything storing an inode across time stores the pair —
+  the file page cache's key, and `LazySource::File`. See
+  [`../../archive/FPCACHE_MOUNT_IDENTITY.md`](../../archive/FPCACHE_MOUNT_IDENTITY.md).
+  **Identity is assigned by the table, never reported by the filesystem**: a
+  `Filesystem` that could declare its own id could claim another's cached pages,
+  and those pages are mapped as executable text.
+- **Resolution falls through to the global table.** `resolve_mount` tries the
+  spawn override, then the process's namespace, then the global table — so a box
+  whose namespace does not resolve a path reaches the host's mounts. A jailed box
+  (`root_dir != "/"`) has a `SubdirFs` at `/`, and the `path == "/"` arm matches
+  everything, so it never falls through; a box created with `root_dir == "/"`
+  gets **no** namespace mount at all and therefore resolves everything globally.
 - **`with_fs`** is the VFS critical-section entry (disables preemption before
   the spinlock — the priority-inversion fix). **Never `yield_now()` or do slow
   I/O inside** (see [`scheduler.md`](scheduler.md)).

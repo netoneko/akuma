@@ -508,7 +508,7 @@ pub(crate) fn build_exec_runtime(
         exec_bkl_drop_enabled: || false,
         read_file: |path| crate::fs::read_file(path).map_err(|_| -1),
         read_at: |path, off, buf| crate::vfs::read_at(path, off, buf).map_err(|_| -1),
-        resolve_inode: |path| crate::vfs::resolve_inode(path).map_err(|_| -1),
+        resolve_file_id: |path| crate::vfs::resolve_file_id(path).ok_or(-1),
         // Real implementation, not a stub: `prefault_user_range` fills every
         // inode-backed lazy file page through this hook (the path is required —
         // `with_fs` dispatches on its prefix). A previous `Err(-1)` stub made

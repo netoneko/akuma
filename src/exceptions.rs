@@ -1198,7 +1198,7 @@ fn demand_page_lazy_region(
     let shareable_mapping = crate::file_page_cache::is_shareable_mapping(map_flags);
 
     if let akuma_exec::process::LazySource::File {
-        ref path, inode, file_offset, filesz, segment_va, ..
+        ref path, inode, mount_id, file_offset, filesz, segment_va, ..
     } = *source
     {
         if crate::config::DEMAND_PAGE_LOG_ENABLED {
@@ -1232,7 +1232,7 @@ fn demand_page_lazy_region(
                     let full = va >= segment_va && va + 0x1000 <= segment_va + filesz;
                     let hit = if full && shareable_mapping {
                         let file_off = file_offset + (va - segment_va);
-                        crate::file_page_cache::lookup_and_ref(inode, file_off, is_exec)
+                        crate::file_page_cache::lookup_and_ref(mount_id, inode, file_off, is_exec)
                     } else {
                         None
                     };
@@ -1352,7 +1352,7 @@ fn demand_page_lazy_region(
                     let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
                     akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
                     let file_off = file_offset + (cur_va - segment_va);
-                    crate::file_page_cache::mark_icache_clean(inode, file_off, pf);
+                    crate::file_page_cache::mark_icache_clean(mount_id, inode, file_off, pf);
                 }
                 filled.push((cur_va, pf, owns_ref));
                 cur_va += 0x1000;
@@ -1432,7 +1432,7 @@ fn demand_page_lazy_region(
             {
                 if fill_complete {
                     let file_off = file_offset + (cur_va - segment_va);
-                    crate::file_page_cache::insert(inode, file_off, pf, is_exec);
+                    crate::file_page_cache::insert(mount_id, inode, file_off, pf, is_exec);
                 } else {
                     crate::pmm::dp_count(&crate::pmm::DP_FILE_FILL_UNPUBLISHED, 1);
                 }

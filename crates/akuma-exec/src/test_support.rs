@@ -91,7 +91,7 @@ pub fn ensure_test_runtime() {
         exec_bkl_drop_enabled: || false,
         read_file: |_| Err(0),
         read_at: |_, _, _| Err(0),
-        resolve_inode: |_| Err(0),
+        resolve_file_id: |_| Err(0),
         read_at_by_inode: |_, _, _, _| Err(0),
         on_process_exit: |_| {},
         remove_socket: |_| {},
