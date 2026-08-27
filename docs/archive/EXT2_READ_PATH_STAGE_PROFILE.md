@@ -229,6 +229,11 @@ instructions or bytes, and reject the number if the arithmetic does not close.*
 
 ## The syscall floor, and four theories about it
 
+> The floor is now its own open investigation with its own handoff brief:
+> [`AKUMA_SYSCALL_PERFORMANCE_AUDIT.md`](AKUMA_SYSCALL_PERFORMANCE_AUDIT.md).
+> This section is what that document was built from.
+
+
 `getpid` is instrumented with the *same two spans* as `read` (`FLOOR_NR` in
 `src/syscall/utils/read_profile.rs`), so the shared part of every syscall can be measured
 rather than inferred. Minima, `SMP=1`, `--features read-profile,no-tests`:
