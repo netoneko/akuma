@@ -28,8 +28,14 @@ the host has affects both alike, so `deep - shallow` survives it.
 control — the same bytes with 64x fewer syscalls, where a per-syscall effect
 must shrink by roughly that factor or it was never per-syscall.
 
+**Check the host is idle first.** These same arms have measured 20x apart
+depending on whether something else was using the CPU
+(`docs/archive/EXT2_PER_FD_INODE_READ_PATH.md` § Background). A loaded host does
+not just add noise, it changes the answer.
+
 Usage:
     scripts/benchmarks/read_path_ab.py --label with-fd-inode --runs 5
+    scripts/benchmarks/read_path_ab.py --sweep          # gap vs syscall count
     scripts/benchmarks/read_path_ab.py --label baseline --runs 5 \
         --out /tmp/baseline.json
 
@@ -162,12 +168,40 @@ def compare(a, b):
             )
 
 
+def sweep(runs):
+    """The depth gap at four block sizes: same 8 MB, 64x range of syscall counts.
+
+    A per-syscall cost tracks the call count; a per-byte one does not move at
+    all. Reading by path, the gap falls with the call count; reading by inode it
+    is gone at every size.
+    """
+    total = MB * 1024 * 1024
+    print(f"fixture: {setup()}")
+    print(
+        f"\n{'block size':>10} {'read() calls':>13} {'deep ms':>9} "
+        f"{'shallow ms':>11} {'gap ms':>8} {'us/read':>9}"
+    )
+    for bs in (1024, 4096, 16384, 65536):
+        count = total // bs
+        d = statistics.median(timed_read(DEEP, bs, count) for _ in range(runs))
+        sh_ = statistics.median(timed_read(SHALLOW, bs, count) for _ in range(runs))
+        print(
+            f"{bs:>10} {count:>13} {d:>9.1f} {sh_:>11.1f} "
+            f"{d - sh_:>8.1f} {(d - sh_) * 1000 / count:>9.1f}"
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", default="arm")
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--out")
     ap.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"))
+    ap.add_argument(
+        "--sweep",
+        action="store_true",
+        help="report the depth gap at four block sizes instead of two",
+    )
     args = ap.parse_args()
 
     if args.compare:
@@ -176,6 +210,10 @@ def main():
         with open(args.compare[1]) as f:
             after = json.load(f)
         compare(before, after)
+        return
+
+    if args.sweep:
+        sweep(max(args.runs, 1))
         return
 
     print(f"fixture: {setup()}")

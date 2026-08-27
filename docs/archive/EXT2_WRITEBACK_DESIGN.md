@@ -290,11 +290,13 @@ caching, not the block cache**: resolve the path once at `open(2)` and let
 instead of re-walking the tree on every call.
 
 **Landed 2026-08-27** — [`EXT2_PER_FD_INODE_READ_PATH.md`](EXT2_PER_FD_INODE_READ_PATH.md).
-Measured as a within-boot difference (deep path vs shallow path, same bytes),
-because absolute times across boots are exactly the trap §8 describes: the
-per-read path walk went from **177 us/read with disjoint ranges to 16 us/read
-inside the noise**, and a host test puts the tree walks at 64 -> 0 and the
-block-cache accesses at 20 -> 2 per read. It also turned up three pre-existing
+A host test puts the tree walks at 64 -> 0 and the block-cache accesses at
+**20 -> 2 per read**; on a quiet host, 8 MB read as 8192 x 1 KB `read(2)` calls
+went **490 ms -> 196 ms (-60%, disjoint ranges)** five components deep, and
+**294 ms -> 196 ms (-33%)** for a file sitting directly in `/`. Measured as a
+within-boot deep-vs-shallow *difference* rather than across boots, because §8's
+trap is worse than §8 knew: the same arms measured 20x apart depending on host
+load. It also turned up three pre-existing
 ext2 defects that had to be fixed before reading by a raw inode number was safe
 - chiefly that `rename` freed its destination inode with **no `is_pinned`
 check at all**, i.e. atomic replace could pull an inode out from under a live

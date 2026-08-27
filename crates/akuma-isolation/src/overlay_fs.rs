@@ -563,6 +563,19 @@ impl Filesystem for OverlayFs {
         }
         Err(upper_err)
     }
+
+    /// Same layer walk, same soundness condition, as `read_at_by_inode` above.
+    fn metadata_by_inode(&self, inode: u32) -> Result<Metadata, FsError> {
+        let mut upper_err = FsError::NotFound;
+        for l in 0..self.layer_count() {
+            match self.layer(l).metadata_by_inode(inode) {
+                Ok(m) => return Ok(m),
+                Err(e) if l == 0 => upper_err = e,
+                Err(_) => {}
+            }
+        }
+        Err(upper_err)
+    }
 }
 
 #[cfg(test)]

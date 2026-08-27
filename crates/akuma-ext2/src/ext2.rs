@@ -2717,6 +2717,22 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         self.lookup_path(path)
     }
 
+    /// The `Metadata` view of one inode. Shared by `metadata` (which looks the
+    /// number up by path first) and `metadata_by_inode` (which is handed it), so
+    /// an fd's `fstat` and a path's `stat` can never disagree about the same file.
+    fn metadata_of(&self, state: &Ext2State, inode_num: u32) -> Result<Metadata, FsError> {
+        let inode = self.read_inode(state, inode_num)?;
+        Ok(Metadata {
+            is_dir: (inode.type_perms & 0xF000) == S_IFDIR,
+            size: inode.size_lower as u64,
+            inode: inode_num as u64,
+            mode: inode.type_perms as u32,
+            created: Some(inode.creation_time as u64),
+            modified: Some(inode.modification_time as u64),
+            accessed: Some(inode.access_time as u64),
+        })
+    }
+
     pub fn read_at_by_inode(&self, inode_num: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
         if buf.is_empty() {
             return Ok(0);
@@ -3357,19 +3373,12 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
         let state = self.read_state();
         let inode_num = self.lookup_path_internal(&state, path)?;
-        let inode = self.read_inode(&state, inode_num)?;
+        self.metadata_of(&state, inode_num)
+    }
 
-        let is_dir = (inode.type_perms & 0xF000) == S_IFDIR;
-
-        Ok(Metadata {
-            is_dir,
-            size: inode.size_lower as u64,
-            inode: inode_num as u64,
-            mode: inode.type_perms as u32,
-            created: Some(inode.creation_time as u64),
-            modified: Some(inode.modification_time as u64),
-            accessed: Some(inode.access_time as u64),
-        })
+    fn metadata_by_inode(&self, inode_num: u32) -> Result<Metadata, FsError> {
+        let state = self.read_state();
+        self.metadata_of(&state, inode_num)
     }
 
     fn chmod(&self, path: &str, mode: u32) -> Result<(), FsError> {

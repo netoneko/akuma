@@ -468,6 +468,28 @@ pub fn read_at_open_file(
     with_fs(path, |fs, _rel| fs.read_at_by_inode(inode, offset, buf))
 }
 
+/// [`metadata`] for an open file description, by the inode `open(2)` bound to it
+/// when there is one and by path otherwise.
+///
+/// The `stat` counterpart of [`read_at_open_file`], and it exists for the same
+/// two reasons: it skips a directory walk, and it keeps answering after the fd's
+/// name is gone. Before this, an unlinked-but-open fd could `read` fine while
+/// `fstat` on the same fd returned `ENOENT` — the fd knew which file it held and
+/// `stat` did not.
+///
+/// Inherits [`read_at_open_file`]'s mount-aliasing caveat verbatim: the path
+/// still selects the filesystem.
+pub fn metadata_open_file(path: &str, inode: u32) -> Result<Metadata, FsError> {
+    if inode == 0 {
+        return metadata(path);
+    }
+    with_fs(path, |fs, _rel| fs.metadata_by_inode(inode))
+        // A filesystem that resolved an inode for this fd but cannot stat by one
+        // is not a case that exists today (the two are implemented together), but
+        // falling back costs nothing and keeps this from being a new way to fail.
+        .or_else(|_| metadata(path))
+}
+
 /// Write data at a specific offset within a file
 pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
     if is_mtab(path) {

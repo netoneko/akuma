@@ -2134,7 +2134,12 @@ pub(super) fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
             match entry {
                 akuma_exec::process::FileDescriptor::File(f) => {
                     is_seekable = true;
-                    let size = crate::fs::file_size(&f.path).unwrap_or(0) as i64;
+                    // By inode, like `read` — so `SEEK_END` still knows how big
+                    // the file is after its name is gone, instead of silently
+                    // treating an unlinked-but-open fd as a zero-length file and
+                    // seeking to `offset`.
+                    let size = crate::fs::metadata_open_file(&f.path, f.inode())
+                        .map_or(0, |m| m.size) as i64;
                     new_pos = match whence { 0 => offset, 1 => f.position as i64 + offset, 2 => size + offset, _ => -1 };
                     if new_pos >= 0 {
                         f.position = new_pos as usize;
@@ -2186,7 +2191,7 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
             // Only this arm reaches the on-disk VFS; every other arm below synthesizes a
             // Stat from constants (or forwards cross-core, which must keep the BKL).
             let _vfs_bkl = VfsBklGuard::new();
-            if let Ok(meta) = crate::vfs::metadata(&f.path) {
+            if let Ok(meta) = crate::vfs::metadata_open_file(&f.path, f.inode()) {
                 stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                     crate::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
@@ -2521,11 +2526,18 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
         Err(e) => return e,
     };
 
+    // `fd_inode` is non-zero only for the `AT_EMPTY_PATH` form — "stat the open
+    // file description itself", i.e. `fstat` spelled as `statx`. That form gets
+    // the same inode-first treatment `sys_fstat` does, so it too keeps answering
+    // once the fd's name is gone. Every other form takes a *path* (the dirfd
+    // below is only a base to join onto), which no inode number can stand in for.
+    let mut fd_inode: u32 = 0;
     let resolved_path = if path.is_empty() {
         const AT_EMPTY_PATH: u32 = 0x1000;
         if flags & AT_EMPTY_PATH != 0 && dirfd >= 0 {
             if let Some(proc) = akuma_exec::process::current_process_shared() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
+                    fd_inode = f.inode();
                     f.path
                 } else {
                     return EBADF;
@@ -2579,7 +2591,7 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
             (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0)
         } else {
             let final_path = if follow { crate::vfs::resolve_symlinks(&resolved_path) } else { resolved_path };
-            if let Ok(meta) = crate::vfs::metadata(&final_path) {
+            if let Ok(meta) = crate::vfs::metadata_open_file(&final_path, fd_inode) {
                 (meta.mode as u16, meta.inode, meta.size,
                  if meta.is_dir { 2 } else { 1 },
                  meta.accessed.unwrap_or(0) as i64,

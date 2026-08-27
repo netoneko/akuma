@@ -140,9 +140,15 @@ Consequences at this boundary:
   the unlink) or the *new* file's bytes (for the rename) — both wrong per POSIX.
 - **`EISDIR` is unchanged** for a `read` on a directory fd: `read_at_by_inode`
   refuses `S_IFDIR` exactly where `read_at` does.
-- **`fstat`/`lseek(SEEK_END)` did not follow** — they still resolve `f.path`, so
-  on an unlinked-but-open fd they fail while `read` succeeds. Not a regression
-  (both used to fail); it needs a `Filesystem::metadata_by_inode`.
+- **`fstat`, `statx(AT_EMPTY_PATH)` and `lseek(SEEK_END)` followed**, via
+  `vfs::metadata_open_file` → `Filesystem::metadata_by_inode`. They must: with
+  `read` by inode and `stat` by path, the same fd read a file happily and was
+  then told it did not exist (`fstat` → `ENOENT`), and `SEEK_END` reported a
+  live 23-byte file as **0 bytes** — a silent wrong answer for anything sizing
+  its input that way (`tail -c`, an append-seeking archive writer).
+  `newfstatat`'s dirfd stays path-based on purpose: there the fd is a base to
+  join a relative path onto. `ftruncate`/`fchmod`/`fallocate`/`flock` still
+  resolve the name and so still fail on an unlinked-but-open fd.
 - **An fd whose filesystem has no inode addressing keeps reading by path**
   (`inode == 0`): procfs, `MemoryFilesystem`, synthetic nodes, and `/etc/mtab`.
 

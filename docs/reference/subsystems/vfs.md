@@ -114,9 +114,13 @@ things follow:
   replaced under an open fd (or an fd used from a namespace that resolves its
   path elsewhere) aliases. Inherited from the mmap fill path, not introduced;
   the fix is an fd holding its `Arc<dyn Filesystem>`.
-- **`fstat` and `lseek(SEEK_END)` still resolve by path**, so on an
-  unlinked-but-open fd they fail while `read` succeeds. Needs a
-  `Filesystem::metadata_by_inode`.
+- **`fstat`, `statx(AT_EMPTY_PATH)` and `lseek(SEEK_END)` go by inode too**
+  (`vfs::metadata_open_file` → `Filesystem::metadata_by_inode`), so they stay
+  coherent with `read` on an unlinked-but-open fd. They did not, briefly:
+  `fstat` answered `ENOENT` and `SEEK_END` answered `0` — silently reporting a
+  live file as empty. Still path-based, and still failing on an unlinked fd:
+  `ftruncate`, `fchmod`, `fallocate`, `flock`, and `newfstatat`'s dirfd (that
+  one correctly — it is a base for a relative path, not a file identity).
 
 ## /dev
 

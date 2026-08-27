@@ -179,6 +179,14 @@ impl Filesystem for SubdirFs {
     fn read_at_by_inode(&self, inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
         self.inner.read_at_by_inode(inode, offset, buf)
     }
+
+    /// Forwarded unchanged, like `read_at_by_inode`: an inode number is already
+    /// the inner filesystem's, so there is no prefix to apply. The `SubdirFs`
+    /// jail is enforced where paths are — a caller only obtains this number by
+    /// resolving a path through this instance in the first place.
+    fn metadata_by_inode(&self, inode: u32) -> Result<Metadata, FsError> {
+        self.inner.metadata_by_inode(inode)
+    }
 }
 
 #[cfg(test)]

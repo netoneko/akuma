@@ -875,6 +875,46 @@ fn reading_by_inode_does_no_path_walk() {
     );
 }
 
+/// `metadata_by_inode` must agree with `metadata` on a live file, and keep
+/// answering on a pinned inode whose name is gone — the `stat` half of the same
+/// guarantee `unlink_of_a_pinned_inode_keeps_its_data_readable` makes for reads.
+///
+/// Without it an unlinked-but-open fd could `read` perfectly well while `fstat`
+/// on the same fd returned `ENOENT`: the fd knew which file it held and `stat`
+/// did not.
+#[test]
+fn metadata_by_inode_matches_metadata_and_survives_unlink() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.create_dir("/statdir").unwrap();
+    fs.write_file("/statdir/f", &[7u8; 1234]).unwrap();
+    let inode = fs.resolve_inode("/statdir/f").unwrap();
+
+    let by_path = fs.metadata("/statdir/f").unwrap();
+    let by_inode = fs.metadata_by_inode(inode).unwrap();
+    assert_eq!(by_inode.size, 1234);
+    assert_eq!(by_inode.inode, by_path.inode);
+    assert_eq!(by_inode.size, by_path.size);
+    assert_eq!(by_inode.mode, by_path.mode);
+    assert_eq!(by_inode.is_dir, by_path.is_dir);
+
+    // A directory reports itself as one, so `fstat` on a directory fd is right.
+    let dir_inode = fs.resolve_inode("/statdir").unwrap();
+    assert!(fs.metadata_by_inode(dir_inode).unwrap().is_dir);
+
+    // The name goes; a reader still holds the inode. Size must survive, or
+    // `lseek(SEEK_END)` on that fd silently treats the file as empty.
+    let pin = akuma_primitives::InodePin::new(inode);
+    fs.remove_file("/statdir/f").unwrap();
+    assert!(fs.metadata("/statdir/f").is_err(), "the name must be gone");
+    assert_eq!(
+        fs.metadata_by_inode(inode).unwrap().size,
+        1234,
+        "a pinned inode must still report its real size after unlink",
+    );
+    drop(pin);
+}
+
 /// The gap the per-fd inode cache closed: `rename` unlinks its destination's
 /// last name exactly as `remove_file` does, but only `remove_file` consulted the
 /// pin. Atomic replace (`write foo.tmp; rename foo.tmp foo`) is what `cargo` and

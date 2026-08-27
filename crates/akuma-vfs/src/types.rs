@@ -201,4 +201,19 @@ pub trait Filesystem: Send + Sync {
     ) -> Result<usize, FsError> {
         Err(FsError::NotSupported)
     }
+
+    /// [`Filesystem::metadata`] for a caller that already holds the inode
+    /// number — the `stat` half of [`Filesystem::read_at_by_inode`].
+    ///
+    /// An open fd carries the inode `open(2)` resolved (`KernelFile::inode`), so
+    /// `fstat`, `statx(AT_EMPTY_PATH)` and `lseek(SEEK_END)` can answer without
+    /// walking the directory tree — and, more importantly, can still answer once
+    /// the fd's *name* is gone. Without this they resolve `f.path` and fail on an
+    /// unlinked-but-open fd whose `read` works perfectly well.
+    ///
+    /// Defaults to `NotSupported`, so a filesystem with no inode addressing keeps
+    /// serving those syscalls by path exactly as before.
+    fn metadata_by_inode(&self, _inode: u32) -> Result<Metadata, FsError> {
+        Err(FsError::NotSupported)
+    }
 }

@@ -35,10 +35,18 @@ calls `read_at_by_inode`. The fd had no such thing to resolve *to*.
 | `inode: u32` | resolved once in `sys_openat`; `0` means "read by path" |
 | `pin: InodePin` | keeps that inode's data alive for the fd's lifetime |
 
-`sys_openat` resolves through `crate::vfs::open_file_inode`; `sys_read` and
-`sys_pread64` (and so `readv`/`preadv`/`preadv2`, which route through them) call
-`crate::fs::read_at_open_file`, which reads by inode when there is one and by
-path when there is not.
+`sys_openat` resolves through `crate::vfs::open_file_inode`. Two families then
+use it:
+
+| syscall | helper | filesystem method |
+|---|---|---|
+| `read`, `pread64` (so `readv`/`preadv`/`preadv2`, which route through them) | `fs::read_at_open_file` | `Filesystem::read_at_by_inode` |
+| `fstat`, `statx(AT_EMPTY_PATH)`, `lseek(SEEK_END)` | `vfs::metadata_open_file` | `Filesystem::metadata_by_inode` |
+
+Both fall back to the path form when the fd carries no inode.
+
+`newfstatat` with a dirfd deliberately stays path-based: there the fd is a
+*base* to join a relative path onto, which an inode number cannot stand in for.
 
 Both fields are private, and `with_inode` is the only way to set either — the pin
 and the number cannot drift apart. Everything else is `Clone`/`Drop`: `dup`,
@@ -113,10 +121,12 @@ they were found by asking "what else can free an inode a reader still names?"
 
 ### The deterministic half
 
-Wall-clock cannot carry this claim on this host: `EXT2_WRITEBACK_FOLLOWUP_FIXES.md`
-§8 records the same probe measuring the same commit ~2x apart between sessions,
-and this session saw ~10% swings between minutes — the same order as the effect.
-So the primary evidence is a work count, which does not move between runs at all.
+Wall-clock on this host has to be earned: `EXT2_WRITEBACK_FOLLOWUP_FIXES.md` §8
+records the same probe measuring the same commit ~2x apart between sessions, and
+this session measured the same arms **20x apart** depending on whether the host
+was otherwise busy (see Background). So the primary evidence is a work count,
+which does not move between runs at all — the timings below are real, but they
+are the corroboration, not the claim.
 
 `reading_by_inode_does_no_path_walk` (`crates/akuma-ext2/src/tests.rs`) counts
 directory-tree walks and block-cache accesses on a per-instance counter — per
@@ -139,31 +149,76 @@ paths of different depth, back-to-back and interleaved, within one boot:
 
 Identical bytes, identical blocks, identical inode work. The only difference is
 four extra components to walk, so `deep - shallow` is the path-walk cost and the
-host's drift cancels out of it. `bs=1024` (8192 read calls) is the signal;
-`bs=65536` (128 calls, same bytes) is the control — a per-syscall effect must
-shrink by roughly 64x there or it was never per-syscall.
+host's drift cancels out of it. Varying the block size varies the **number of
+`read(2)` calls over the same bytes**, which is the other half of the design: a
+per-syscall cost must track the call count, not the byte count.
 
-Four runs per arm, `MEMORY=2048`, arms confirmed distinct (see Verification):
+#### Headline, 6 runs per arm, `bs=1024` (8192 reads over 8 MB)
 
-| arm | 8192 x 1 KB reads, deep | shallow | **gap = path-walk cost** | verdict |
+| | baseline (by path) | with per-fd inode | delta | ranges |
 |---|---:|---:|---:|---|
-| baseline (read by path) | 4981 ms<br>(4304-5577) | 3532 ms<br>(2844-4205) | **1449 ms = 177 us/read** | ranges **disjoint** |
-| with per-fd inode | 4083 ms<br>(3781-4243) | 3955 ms<br>(3559-4330) | **128 ms = 16 us/read** | ranges overlap |
+| deep (5 components) | **490 ms** (444-526) | **196 ms** (142-198) | **-60%** | disjoint |
+| shallow (1 component) | **294 ms** (236-312) | **196 ms** (184-207) | **-33%** | disjoint |
+| deep - shallow = walk | 196 ms = **24 us/read** | 0.5 ms = **0 us/read** | | disjoint -> overlap |
 
-The control behaved as a control must: over 128 x 64 KB reads (same bytes, 64x
-fewer syscalls) neither arm shows a gap worth reading — baseline `-107 ms`,
-with-inode `+8 ms`, both with overlapping ranges and one of them negative.
+Per `read(2)` of 1 KB: **60 us -> 24 us on the deep path (2.5x), 36 us -> 24 us
+on the shallow one (1.5x)**. The shallow row is the one worth noticing — a file
+sitting directly in `/` was still paying a real per-read walk, so this is not
+only a deep-path win.
 
-**The claim is the gap, not the totals.** Reading five components deep used to
-cost 177 us per `read(2)` more than reading one component deep, every call,
-reproducibly enough that the two ranges do not touch. It now costs 16 us — the
-same size as the noise, and in two of the four runs the *shallow* path measured
-slower, which is what "no signal" looks like. The walk moved to `open(2)`, where
-it happens once.
+#### The same thing across block sizes (3 runs per point, medians)
 
-Absolute times moved the way that implies (deep 1 KB reads: 4981 -> 4083 ms
-median, -18%), but that number spans two boots and this host's drift is the same
-order, so it is a consistency check and not the result.
+The bytes and the blocks are constant down each column; only the syscall count
+changes.
+
+| block size | `read(2)` calls | baseline gap | baseline per read | with-inode gap | with-inode per read |
+|---|---:|---:|---:|---:|---:|
+| 1 KB | 8192 | **+158.8 ms** | 19.4 us | +1.5 ms | 0.2 us |
+| 4 KB | 2048 | **+80.7 ms** | 39.4 us | -3.4 ms | -1.7 us |
+| 16 KB | 512 | **+23.0 ms** | 44.9 us | +2.2 ms | 4.2 us |
+| 64 KB | 128 | **+4.8 ms** | 37.2 us | -4.5 ms | -35.0 us |
+
+Baseline: the gap **tracks the call count** — 64x fewer syscalls over the same
+8 MB shrinks it 33x — which is the signature of a per-syscall cost and not a
+per-byte one. With per-fd inode caching it is gone at every block size, twice
+going negative, which is what "no signal" looks like.
+
+(The baseline's *per-read* cost is not flat: ~19 us at 1 KB, ~40 us at 4 KB and
+above. The same walk cannot get more expensive on its own, so something about
+the surrounding read makes it so — plausibly the larger `copy_to_user` evicting
+the walk's working set from CPU cache. **Unverified**, recorded because the
+number is in the table and would otherwise look like an error. Nothing here
+rests on it: the gap disappears either way.)
+
+## The `stat` half, added the same day
+
+Reads went by inode first; `fstat`, `statx(AT_EMPTY_PATH)` and `lseek(SEEK_END)`
+were left resolving `f.path`. That is not merely slower, it is **incoherent**:
+the same fd would read a file happily and then be told the file does not exist.
+
+Measured directly by reverting `metadata_open_file` to the path form and booting
+(the in-kernel test catches it, so the oracle arm panics at boot):
+
+| on an unlinked-but-open fd | by path | by inode |
+|---|---|---|
+| `read` | the file's bytes | the file's bytes |
+| `fstat` | **`ENOENT` (-2)** | `0`, correct size |
+| `lseek(fd, 0, SEEK_END)` | **`0`** on a 23-byte file | `23` |
+
+The `lseek` row is the dangerous one. `fstat` failing is at least an error the
+caller can see; `SEEK_END` returning 0 silently reports an unlinked-but-open file
+as empty, and anything sizing its input that way — `tail -c`, an archive writer
+seeking to append — quietly produces the wrong result instead of failing.
+
+`Filesystem::metadata_by_inode` is the new trait method (default
+`NotSupported`, so filesystems without inode addressing are untouched), and
+ext2's `metadata` and `metadata_by_inode` now share one `metadata_of` body so a
+path `stat` and an fd `fstat` cannot disagree about the same file.
+
+Verified in the guest with the tools that actually use these calls:
+`tail -c 4 <&3` on an unlinked fd returns the right last four bytes, `wc -c <&3`
+returns 16 for a 16-byte unlinked file, and after an atomic replace the fd
+reports the **old** file's 5 bytes while the name reports the new one's 23.
 
 ## What this also fixed, for free
 
@@ -190,9 +245,13 @@ boot.
   introduced — the mmap fill path has read `read_at_by_inode(path, inode, ..)`
   the same way since it was written. Closing it means an fd holding its resolved
   `Arc<dyn Filesystem>`: a real open-file object, which this kernel does not have.
-- **`fstat` and `lseek(SEEK_END)` still go by path**, so on an unlinked-but-open
-  fd they fail while `read` succeeds. Not a regression (both used to fail), but
-  now visibly inconsistent. Fixing it needs a `Filesystem::metadata_by_inode`.
+- ~~`fstat` and `lseek(SEEK_END)` still go by path~~ — **closed the same day**,
+  see "The `stat` half" above. What is still path-based: `newfstatat`'s dirfd
+  (correctly — it is a base for a relative path), and every other fd operation
+  that names a path, notably `ftruncate`, `fchmod`, `fallocate` and `flock`.
+  Those mutate through the *name*, so on an unlinked-but-open fd they still fail
+  where `read`/`fstat` now succeed. Same fix shape (`*_by_inode` on the trait),
+  more surface; nothing in tree needs it yet.
 - **The pin table is 1024 slots and shared with mmap.** Every open file fd now
   takes one. On overflow `is_pinned` answers `true` for everything and nothing
   can be freed, so the failure mode is deferred frees piling up rather than
@@ -201,10 +260,13 @@ boot.
 
 ## Verification performed
 
-- `cargo test -p akuma-ext2`: 82/82, and 82/82 again with `--features fs-cache`.
+- `cargo test -p akuma-ext2`: 83/83, and 83/83 again with `--features fs-cache`.
 - Each of the four new ext2 correctness tests confirmed to **fail** against the
   pre-fix code (reverted in place, re-run, restored) — the fifth is a
-  deliberate unchanged-path control and correctly passes on both arms.
+  deliberate unchanged-path control and correctly passes on both arms. The
+  `stat`-half regression was confirmed the same way, at the kernel: an oracle
+  arm with `metadata_open_file` forced back to the path form panics at boot on
+  `fstat=-2 seek_end=0`.
 - `cargo test` (whole workspace, host): all suites green.
 - `cargo clippy -p akuma-ext2 --all-targets`: back to HEAD's 18 pre-existing
   warnings, none added. `cargo clippy --release` on the kernel: clean.
@@ -221,10 +283,18 @@ boot.
 
 ## Background
 
-Method note for whoever measures the next read change: the first attempt here
-compared absolute `dd` times across two boots and produced a *negative* result
-that was pure noise — the same baseline arm measured 4065 ms and 4488 ms medians
-twenty minutes apart, against an expected effect of ~14%. The depth-difference
-design came out of that failure, and it is the reason the numbers above are worth
-anything. `ext2probe`'s mixed workload is even less usable for a per-syscall
-effect; see §8 of the followup doc for the same lesson learned the same way.
+**Method note, and the reason there are two sets of numbers in this session's
+history: check the host's load before believing a guest measurement.** The first
+A/B here ran while the host was busy, and every number came out roughly **20x
+slower** — 8192 x 1 KB reads took 4083 ms instead of 196 ms — with run-to-run
+swings large enough to bury the effect entirely. It produced a *negative* result:
+the same baseline arm measured 4065 ms and 4488 ms medians twenty minutes apart,
+against an expected effect the noise band swallowed whole. Re-run on a quiet
+host, the identical arms and the identical script give disjoint ranges and a
+-60% deep-path result.
+
+Two things saved it. The depth-difference design, which cancels drift *within*
+one boot and so still showed the right shape (177 us/read -> 16 us/read) even
+under load; and the deterministic host counters, which never depended on the
+clock at all. `ext2probe`'s mixed workload showed nothing usable in either
+condition — see §8 of the followup doc for the same lesson learned the same way.

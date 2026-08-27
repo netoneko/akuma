@@ -3311,7 +3311,7 @@ fn test_pvec2() {
 /// `/dev/null` early return keeps the BKL and still allocates a usable fd, and every
 /// error path (EBADF before the window, ENOENT inside it) leaves the window balanced.
 /// `read(2)` reads by the inode `open(2)` resolved, not by re-walking the path
-/// on every call. Four consequences, and this pins all four:
+/// on every call. Five consequences, and this pins all five:
 ///
 /// 1. **The fd is bound to a file, not to a name.** Unlink it and the fd goes on
 ///    reading it — POSIX "unlinked but still open", which the path-based read
@@ -3323,9 +3323,14 @@ fn test_pvec2() {
 ///    all (`Ext2Filesystem::release_last_link`). Reading by inode without that
 ///    fix is the `SELFHOST_ZERO_PAGE_HUNT.md` §14 defect with an fd in place of
 ///    an mmap.
-/// 3. **A directory fd still refuses to read**, `EISDIR` — `read_at_by_inode`
+/// 3. **`fstat` and `lseek(SEEK_END)` answer from that same inode**, so they do
+///    not disagree with `read` about a file whose name has gone. They resolved
+///    `f.path` until `Filesystem::metadata_by_inode` existed, which left an
+///    unlinked-but-open fd reading fine while `fstat` said `ENOENT` — and, worse,
+///    left `lseek(SEEK_END)` silently treating it as a zero-length file.
+/// 4. **A directory fd still refuses to read**, `EISDIR` — `read_at_by_inode`
 ///    had no `S_IFDIR` check because until now no `read(2)` reached it.
-/// 4. **A path with no inode identity keeps reading by path.** `/etc/mtab` is
+/// 5. **A path with no inode identity keeps reading by path.** `/etc/mtab` is
 ///    the case that matters: it is a resolve-time synthetic served ahead of the
 ///    mount, so an fd that bound itself to a real on-disk `/etc/mtab` would
 ///    serve stale bytes instead of the live mount list.
@@ -3394,6 +3399,26 @@ fn test_read_uses_the_fd_inode() {
         close(fd);
     }
 
+    // 2b. `fstat` and `lseek(SEEK_END)` must agree with `read` about that same
+    //     unlinked file, rather than reporting ENOENT / size 0.
+    let _ = crate::fs::write_file(&doomed, OLD);
+    let p = cstr(&doomed);
+    let fd = openat(&p, open_flags::O_RDONLY);
+    if (fd as i64) >= 0 {
+        let _ = crate::fs::remove_file(&doomed);
+        let mut st = [0u8; core::mem::size_of::<crate::syscall::fs::Stat>()];
+        let rc = handle_syscall(nr::FSTAT, &[fd, st.as_mut_ptr() as u64, 0, 0, 0, 0]);
+        // SEEK_END with offset 0 returns the file size.
+        let end = handle_syscall(nr::LSEEK, &[fd, 0, 2, 0, 0, 0]);
+        if rc != 0 || end != OLD.len() as u64 {
+            fails += 1;
+            crate::safe_print!(192,
+                "[Test] fd-inode fstat/lseek after unlink FAILED fstat={} seek_end={} (want 0 / {})\n",
+                rc, end, OLD.len());
+        }
+        close(fd);
+    }
+
     // 3. Atomic replace: the fd keeps the file it opened, the *name* gets the
     //    new one. Before ext2's rename honoured the pin, the old inode was
     //    freed here and this read came back short (or as another file).
@@ -3426,7 +3451,7 @@ fn test_read_uses_the_fd_inode() {
         close(fd);
     }
 
-    // 4. A directory fd still refuses to read. `read_at_by_inode` grew the
+    // 5. A directory fd still refuses to read. `read_at_by_inode` grew the
     //    S_IFDIR check for exactly this call.
     let p = cstr(ROOT);
     let fd = openat(&p, open_flags::O_RDONLY);
@@ -3443,7 +3468,7 @@ fn test_read_uses_the_fd_inode() {
         close(fd);
     }
 
-    // 5. `/etc/mtab` must NOT bind an inode: it is synthesised at read time, and
+    // 6. `/etc/mtab` must NOT bind an inode: it is synthesised at read time, and
     //    an fd bound to a same-named on-disk file would serve stale bytes.
     let p = cstr("/etc/mtab");
     let fd = openat(&p, open_flags::O_RDONLY);
