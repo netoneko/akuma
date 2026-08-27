@@ -151,6 +151,14 @@ Consequences at this boundary:
   resolve the name and so still fail on an unlinked-but-open fd.
 - **An fd whose filesystem has no inode addressing keeps reading by path**
   (`inode == 0`): procfs, `MemoryFilesystem`, synthetic nodes, and `/etc/mtab`.
+- **Where the time goes now** (measured 2026-08-27, warm, zero device I/O):
+  ~17 us of fixed cost per call plus ~0.6 ns/byte. The per-byte term used to be
+  ~5 ns and was the whole story; widening the user-copy loop
+  (`../../../archive/USER_COPY_BYTE_LOOP.md`) cut it ~9x and left `read(2)`
+  **fixed-cost-bound**. Removing heap allocations from the path has been measured
+  and is invisible at this scale — the remaining suspects are syscall entry/exit,
+  `validate_user_range`'s per-page table walks, the BKL guard, and the staging
+  buffer's `alloc_zeroed` memset.
 
 ## `write`/`pwrite64` and `O_APPEND`
 

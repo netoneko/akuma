@@ -178,5 +178,9 @@ Spawned from the per-fd inode work
 ([`EXT2_PER_FD_INODE_READ_PATH.md`](EXT2_PER_FD_INODE_READ_PATH.md)), which
 needed the same question answered — "what names a file across time?" — and
 documented the mount-aliasing exposure as a known gap. The mount id is the answer
-for both; putting it on the fd as well is the next step, and removes three of the
-five heap allocations a warm `read(2)` still makes.
+for both. Putting it on the fd landed the same day
+([`EXT2_PER_FD_INODE_READ_PATH.md`](EXT2_PER_FD_INODE_READ_PATH.md) § Known
+gaps): it closes that aliasing and removes two of the five heap allocations a
+warm `read(2)` makes — though the allocations turned out to be **invisible** in
+wall-clock, which is what redirected the performance work to the user-copy loop
+([`USER_COPY_BYTE_LOOP.md`](USER_COPY_BYTE_LOOP.md)).

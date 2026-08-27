@@ -126,11 +126,14 @@ things follow:
 - **`inode == 0` means "read by path"**, and that is the path every filesystem
   without inode addressing takes — procfs, `MemoryFilesystem`, synthetic nodes —
   plus `/etc/mtab`, which must stay a resolve-time synthetic.
-- **The mount is still selected by path.** `with_fs` resolves the fd's path to
-  find the filesystem, then the inode number is applied to it, so a mount
-  replaced under an open fd (or an fd used from a namespace that resolves its
-  path elsewhere) aliases. Inherited from the mmap fill path, not introduced;
-  the fix is an fd holding its `Arc<dyn Filesystem>`.
+- **The fd names its mount, so the path is not re-resolved.** `KernelFile` carries
+  the mount id next to the inode, and `vfs::fs_for_mount_id` finds the filesystem
+  by identity — searching spawn override, then the process's namespace, then the
+  global table, the same order `resolve_mount` uses. If that mount is gone
+  (unmounted, or re-rooted, which mints a new id) the operation **fails**; it must
+  not fall back to the path, because resolving the path would hand this fd's inode
+  number to whatever is mounted there now. That is the aliasing the id exists to
+  prevent.
 - **`fstat`, `statx(AT_EMPTY_PATH)` and `lseek(SEEK_END)` go by inode too**
   (`vfs::metadata_open_file` → `Filesystem::metadata_by_inode`), so they stay
   coherent with `read` on an unlinked-but-open fd. They did not, briefly:

@@ -153,6 +153,12 @@ host's drift cancels out of it. Varying the block size varies the **number of
 `read(2)` calls over the same bytes**, which is the other half of the design: a
 per-syscall cost must track the call count, not the byte count.
 
+> **These numbers predate the user-copy widening** (same day,
+> [`USER_COPY_BYTE_LOOP.md`](USER_COPY_BYTE_LOOP.md)), which cut the per-byte term
+> ~9x and moved the whole read path. They are still the correct A/B *for this
+> change* — both arms were measured against the same byte-loop copy — but do not
+> read the absolute milliseconds as current.
+
 #### Headline, 6 runs per arm, `bs=1024` (8192 reads over 8 MB)
 
 | | baseline (by path) | with per-fd inode | delta | ranges |
@@ -237,14 +243,20 @@ boot.
 
 ## Known gaps
 
-- **The mount is still selected by path.** `read_at_open_file` resolves the fd's
-  path through `with_fs` to find the *filesystem*, then applies the inode number
-  to it. If the mount under that path is replaced while the fd is open, or the fd
-  is used from a process whose namespace resolves the path to a different mount,
-  the number is interpreted against the wrong filesystem. This is inherited, not
-  introduced — the mmap fill path has read `read_at_by_inode(path, inode, ..)`
-  the same way since it was written. Closing it means an fd holding its resolved
-  `Arc<dyn Filesystem>`: a real open-file object, which this kernel does not have.
+- ~~The mount is still selected by path~~ — **closed 2026-08-27.** The fd now
+  carries the mount id alongside the inode (`KernelFile::mount_id`,
+  `vfs::fs_for_mount_id`), so `read`/`fstat`/`lseek`/`statx` find the filesystem
+  by identity instead of re-resolving a path that may since resolve elsewhere. A
+  vanished mount is an error, never a silent fallback to whatever is mounted
+  there now — that fallback *is* the aliasing. The same mount id keys the file
+  page cache ([`FPCACHE_MOUNT_IDENTITY.md`](FPCACHE_MOUNT_IDENTITY.md)).
+  **Measured: no wall-clock effect.** Six runs per arm, every range overlapping,
+  the two 1 KB cases moving in opposite directions — removing two heap
+  allocations per read is invisible at ~17 us of per-read fixed cost. The change
+  is a correctness fix that happens to do strictly less work, and the allocation
+  thesis behind it did not survive measurement. See "Known gaps" in
+  [`USER_COPY_BYTE_LOOP.md`](USER_COPY_BYTE_LOOP.md) § Result for what the fixed
+  cost actually turned out to be dominated by.
 - ~~`fstat` and `lseek(SEEK_END)` still go by path~~ — **closed the same day**,
   see "The `stat` half" above. What is still path-based: `newfstatat`'s dirfd
   (correctly — it is a base for a relative path), and every other fd operation
