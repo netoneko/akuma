@@ -1099,6 +1099,30 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         crate::syscall::utils::read_profile::F_LAP_DISP,
     );
 
+    // MEASUREMENT ONLY — no behaviour change below this block. `cur` is the
+    // PROLOGUE's resolution, and the dispatch above can be open-ended
+    // (ppoll/futex/blocking read). `kill_thread_group` retires a still-blocked
+    // sibling's `Process` and only *then* wakes it, and every secondary core's
+    // idle loop drains retired processes once the 10 ms cooldown expires
+    // (src/smp_shared.rs), so the prologue's `Process` may already be freed by
+    // the time we get here. The pre-cache epilogue re-did this lookup and
+    // skipped its writes on `None`; that behaviour is the oracle. Counting the
+    // divergence first — rather than fixing on inference — is the whole point:
+    // see docs/archive/IDENTITY_CACHE_SMP_REVIEW.md.
+    if crate::config::IDENTITY_AUDIT && let Some((audit_pid, audit_proc)) = cur {
+        match akuma_exec::process::lookup_process_shared(audit_pid) {
+            None => {
+                akuma_exec::process::table::EPILOGUE_STALE_IDENTITY
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Some(live) if !core::ptr::eq(live, audit_proc) => {
+                akuma_exec::process::table::EPILOGUE_IDENTITY_MOVED
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
     akuma_exec::threading::set_thread_current_syscall(!0u64);
     if let Some((_, proc)) = cur {
         proc.current_syscall.store(!0u64, Ordering::Relaxed);

@@ -571,6 +571,50 @@ static THREAD_IDENTITY: [ThreadIdentity; MAX_THREADS] = {
 /// wrappers and the map and cache have diverged.
 pub static IDENTITY_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
+/// The syscall epilogue found the identity its prologue resolved no longer
+/// registered — `lookup_process_shared` returns `None` where the prologue had a
+/// `Process`. The pre-cache epilogue re-did that lookup and skipped its writes
+/// on `None`; `handle_syscall` now reuses the prologue's `&'static Process`
+/// across the whole dispatch, so each count here is one excursion that wrote
+/// through a pointer an uncached lookup would have refused.
+///
+/// Only counted when `config::IDENTITY_AUDIT` is on (the check costs exactly
+/// the lookup the cache removed). See `docs/archive/IDENTITY_CACHE_SMP_REVIEW.md`.
+pub static EPILOGUE_STALE_IDENTITY: AtomicU64 = AtomicU64::new(0);
+
+/// As above, but the pid still resolves — to a *different* `Process`. The slot
+/// was retired, reclaimed and reissued while the dispatch ran, so the prologue's
+/// pointer is dangling rather than merely retired.
+pub static EPILOGUE_IDENTITY_MOVED: AtomicU64 = AtomicU64::new(0);
+
+/// Miss breakdown for [`IDENTITY_FALLBACKS`], which on its own is unreadable:
+/// it sums causes with completely different meanings. Measured under a SMP=4
+/// forktest load the raw total ran at ~5 per syscall, which says nothing about
+/// whether the cache is broken or merely being consulted by threads that have
+/// no identity to cache.
+///
+/// - `UNSTAMPED` — the entry was never written (`own_pid == 0`): a kernel/idle
+///   thread, or a user thread resolving before `thread_pid_map_insert` lands.
+///   Expected; costs only the slow path.
+/// - `CLEARED` — the entry *was* stamped and is now invalid. A genuine cache
+///   loss: the thread had an identity and lost it.
+/// - `INACTIVE` — cached slot is no longer ACTIVE (retired/free). This is the
+///   guard that makes a retired process fall back correctly.
+/// - `NULL` — cached pointer is null.
+pub static IDENTITY_FB_UNSTAMPED: AtomicU64 = AtomicU64::new(0);
+pub static IDENTITY_FB_CLEARED: AtomicU64 = AtomicU64::new(0);
+pub static IDENTITY_FB_INACTIVE: AtomicU64 = AtomicU64::new(0);
+pub static IDENTITY_FB_NULL: AtomicU64 = AtomicU64::new(0);
+
+/// Successful cache resolutions — the denominator without which the miss counts
+/// above cannot be turned into a hit rate. Only counted while [`IDENTITY_STATS`]
+/// is on, since this increment would otherwise sit on the kernel's hottest path.
+pub static IDENTITY_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Enables [`IDENTITY_HITS`]. Set at boot from `config::IDENTITY_AUDIT`.
+pub static IDENTITY_STATS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Resolve `pid` in the table and store both identity halves for `tid`.
 /// Caller must hold IRQs masked (scans the slots like `get_process_ptr_inner`).
 /// An unresolvable pid (insert raced ahead of `register_process`) stores the
@@ -674,17 +718,35 @@ fn identity_get(own: bool) -> Option<(Pid, &'static Process)> {
     let slot = if own { e.own_slot.load(Ordering::Acquire) } else { e.tgid_slot.load(Ordering::Acquire) };
     if slot == INVALID_SLOT {
         IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        // Split the miss by cause: a thread that never had an identity (kernel
+        // /idle thread, or a user thread resolving before its map entry lands)
+        // is expected and harmless, whereas an entry that *was* stamped and is
+        // now invalid is a real cache loss. Lumping the two together is what
+        // made the raw `IDENTITY_FALLBACKS` total unreadable as a health check.
+        if e.own_pid.load(Ordering::Relaxed) == 0 {
+            IDENTITY_FB_UNSTAMPED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            IDENTITY_FB_CLEARED.fetch_add(1, Ordering::Relaxed);
+        }
         return None;
     }
     let slot = slot as usize;
     if slot >= MAX_PROCESSES || SLOT_STATES[slot].load(Ordering::Relaxed) != slot_state::ACTIVE {
         IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        IDENTITY_FB_INACTIVE.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let ptr = if own { e.own_ptr.load(Ordering::Acquire) } else { e.tgid_ptr.load(Ordering::Acquire) };
     if ptr.is_null() {
         IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        IDENTITY_FB_NULL.fetch_add(1, Ordering::Relaxed);
         return None;
+    }
+    // Gated: the miss paths above are meant to be rare, but a hit counter sits
+    // on the hottest path in the kernel, so it must not cost anything in a
+    // shipping build. One relaxed load of a hot static when disabled.
+    if IDENTITY_STATS.load(Ordering::Relaxed) {
+        IDENTITY_HITS.fetch_add(1, Ordering::Relaxed);
     }
     let pid = if own { e.own_pid.load(Ordering::Relaxed) } else { e.tgid.load(Ordering::Relaxed) };
     Some((pid, unsafe { &*ptr }))

@@ -676,6 +676,29 @@ pub const PROC_SYSCALL_LOG_ENABLED: bool = true;
 #[cfg(kernel_profile_extreme)]
 pub const PROC_SYSCALL_LOG_ENABLED: bool = false;
 
+/// Audit `handle_syscall`'s reuse of the prologue identity in its epilogue.
+///
+/// **Measurement only, and deliberately expensive**: it performs exactly the
+/// `lookup_process_shared` the identity cache removed, once per syscall, and
+/// compares the answer against the pointer the prologue resolved. That is the
+/// pre-cache behaviour used as an oracle, so a non-zero count is a *direct
+/// observation* of the epilogue writing through a `Process` an uncached lookup
+/// would have refused — not an inference.
+///
+/// Reads out as `[IDENT]` in the periodic diagnostic dump:
+/// - `epi_stale` — the process was no longer registered by the epilogue
+///   (`lookup_process_shared` → `None`). The old code skipped its writes here;
+///   the current code writes anyway.
+/// - `epi_moved` — still registered, but at a *different* `Process` — the slot
+///   was recycled under us.
+/// - `fallbacks` — `table::IDENTITY_FALLBACKS`, cache misses taking the slow
+///   path. Non-zero *steady-state* means a writer bypassed the map wrappers.
+///
+/// Leave `false` in the tree: turning it on re-adds the per-syscall lookup this
+/// audit deleted (getpid 150 ns → ~200+ ns) and invalidates any perf number
+/// taken on that build. See `docs/archive/IDENTITY_CACHE_SMP_REVIEW.md`.
+pub const IDENTITY_AUDIT: bool = false;
+
 /// Number of most-recent syscall entries to retain per process. Each entry is
 /// 32 B, so this caps the ring buffer at `N × 32 B` of heap per live/recently-dead
 /// process. 64 keeps the last ~64 syscalls — enough to see the lead-up to a fault

@@ -1081,6 +1081,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print("Initializing threading...\n");
     threading::init();
     process::init(); // Initialize process subsystem (registers cleanup callback)
+    // Identity-cache hit counting rides with the epilogue audit: both are
+    // measurement, and the hit count is only meaningful next to the miss
+    // breakdown. See `config::IDENTITY_AUDIT`.
+    akuma_exec::process::table::IDENTITY_STATS
+        .store(config::IDENTITY_AUDIT, core::sync::atomic::Ordering::Relaxed);
     // Per-tid state owned by THIS crate, dropped when a thread slot is recycled. The
     // threading crate scrubs its own per-slot arrays but cannot reach kernel tables that
     // are keyed by tid — chiefly `FUTEX_WAITERS`, where a tid left queued by a thread that
@@ -1852,6 +1857,29 @@ fn run_async_main() -> ! {
                 crate::safe_print!(128, "[TLB] stale_write_faults={} repeats={}\n",
                     exceptions::STALE_TLB_WRITE_FAULTS.load(Ordering::Relaxed),
                     exceptions::STALE_TLB_REPEATS.load(Ordering::Relaxed));
+            }
+            // Per-thread identity cache health. `fallbacks` is expected to be
+            // non-zero only transiently (a thread resolving before its map entry
+            // lands); a climbing steady-state value means a writer bypassed the
+            // `thread_pid_map_insert`/`_remove` wrappers. `epi_stale`/`epi_moved`
+            // are the epilogue audit and only move when `config::IDENTITY_AUDIT`
+            // is on — both must stay 0. See
+            // docs/archive/IDENTITY_CACHE_SMP_REVIEW.md.
+            {
+                use core::sync::atomic::Ordering;
+                use akuma_exec::process::table;
+                crate::safe_print!(160,
+                    "[IDENT] hits={} miss={} unstamped={} cleared={} inactive={} null={}\n",
+                    table::IDENTITY_HITS.load(Ordering::Relaxed),
+                    table::IDENTITY_FALLBACKS.load(Ordering::Relaxed),
+                    table::IDENTITY_FB_UNSTAMPED.load(Ordering::Relaxed),
+                    table::IDENTITY_FB_CLEARED.load(Ordering::Relaxed),
+                    table::IDENTITY_FB_INACTIVE.load(Ordering::Relaxed),
+                    table::IDENTITY_FB_NULL.load(Ordering::Relaxed));
+                crate::safe_print!(128, "[IDENT] epi_stale={} epi_moved={} audit={}\n",
+                    table::EPILOGUE_STALE_IDENTITY.load(Ordering::Relaxed),
+                    table::EPILOGUE_IDENTITY_MOVED.load(Ordering::Relaxed),
+                    u8::from(crate::config::IDENTITY_AUDIT));
             }
             // Per-core exception-vector entry counts (docs/archive/PAGE_TABLE_UAF_BKL_STORM.md):
             // a core stuck in the unreachable-vector storm never gets past the vector's own
