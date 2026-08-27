@@ -476,7 +476,7 @@ files / 2 MB / 3200-file-tree shapes, median of 3, BEFORE pass. Two mount modes:
 |---|---:|---:|---:|---:|
 | create 300 × 4 KB | 71 ms | 1.1 ms | 1433 ms | **~20×** (was ~28×) |
 | seq_write 2 MB | 65 ms | 0.35 ms | 669 ms | **~10×** (was ~15×) |
-| seq_read 2 MB (after write) | 0.14 ms | 0.14 ms | 43 ms | **~310×** (was ~1300×) |
+| seq_read 2 MB (after write) | 0.14 ms | 0.14 ms | **5 ms** | **~36×** (was ~310× → ~1300×) |
 | delete 300 | 5.4 ms | 0.4 ms | 809 ms | **~150×** (was ~220×) |
 | build 3200-file tree | 1.06 s | 11 ms | 15.9 s | **~15×** (was ~20×) |
 | mass-delete 3200 | 96 ms (33k files/s) | 3.9 ms (820k files/s) | 7.5 s (~427 files/s) | **~78×** (was ~130×) |
@@ -495,8 +495,12 @@ Two gaps:
   half of the gap; what is left is all on the write side:
   - ~~**`seq_read` after a write** — pure write-invalidate cold cache.~~
     **Fixed by write-back:** 0 device reads, 143 ms → 43 ms, and the ratio vs
-    Linux fell ~1300× → ~310×. The residual 43 ms is the guest's own `read()`
-    syscall + copy path, not device I/O.
+    Linux fell ~1300× → ~310×. The residual was the guest's own `read()` syscall
+    + copy path, not device I/O — and that has since been halved twice more:
+    per-fd inode caching removed the per-read directory walk, and widening the
+    user-copy loop from one byte per iteration to 64 removed the per-byte cost
+    (`docs/archive/USER_COPY_BYTE_LOOP.md`). Now **5 ms, ~36×**. What is left is
+    *per-syscall fixed cost* (~17 µs × 256 reads ≈ 4.4 ms of the 5), not bytes.
   - **`delete`: ~150×** — Linux `-o sync` unlinks 300 files in 5 ms; Akuma still
     does ~7 synchronous device *writes* per unlink.
   - `create` / `seq_write` (~10–20×) are the closest. The residue is the ~8

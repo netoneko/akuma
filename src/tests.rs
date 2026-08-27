@@ -262,6 +262,7 @@ pub fn run_memory_tests() -> bool {
 
     // Safe user access fault redirection tests
     run_test!(test_safe_user_access_fault, "safe_user_access_fault");
+    run_test!(test_user_copy_wide_and_faults, "user_copy_wide_and_faults");
     run_test!(test_copy_from_user_str_fault, "copy_from_user_str_fault");
 
     // Kernel identity-mapping regression tests (opencode crash fix)
@@ -7568,6 +7569,111 @@ fn test_safe_user_access_fault() -> bool {
         }
     };
     
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// The widened user-copy loop must move exactly the same bytes the byte loop did,
+/// at every length and every alignment — and still return `EFAULT` from a fault
+/// **part way through** a copy rather than returning to garbage.
+///
+/// `__arch_copy_user_memory` was one byte per four instructions until 2026-08-27
+/// (`docs/archive/USER_COPY_BYTE_LOOP.md`). Widening it to 64/16/8-byte chunks
+/// introduces two failure modes a whole-range-bad test cannot see:
+///
+/// 1. **Head/tail handling.** The chunk loops only handle multiples; lengths that
+///    are not, and source/destination pairs that are relatively misaligned, are
+///    where a hand-written wide copy goes wrong. Swept below across every length
+///    0..=80 and both alignments 0..8, which covers every path through the
+///    64/16/8/byte ladder and every combination of relative alignment.
+/// 2. **The leaf-function invariant.** The fault trampoline returns through `x30`,
+///    which only holds if the copy routine never writes `x30` or `sp`. A version
+///    written with a normal prologue passes every success case and then returns to
+///    a garbage address on the first mid-copy fault. The straddling case below is
+///    that regression test: it faults with bytes already copied, which is exactly
+///    when a clobbered `x30` would show.
+fn test_user_copy_wide_and_faults() -> bool {
+    console::print("\n[TEST] user copy: widened loop, all lengths/alignments, mid-copy fault\n");
+    use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
+
+    let mut ok = true;
+
+    // ── 1. Correctness sweep. Kernel buffers both sides: this exercises the copy
+    //       loop itself, which is direction-agnostic (both wrappers call it).
+    let mut src = [0u8; 128];
+    for (i, b) in src.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+    }
+    let mut dst = [0u8; 128];
+    let mut bad: Option<(usize, usize, usize)> = None;
+    for len in 0..=80usize {
+        for soff in 0..8usize {
+            for doff in 0..8usize {
+                dst.fill(0xA5);
+                let r = unsafe {
+                    copy_to_user_safe(
+                        dst.as_mut_ptr().add(doff),
+                        src.as_ptr().add(soff),
+                        len,
+                    )
+                };
+                if r.is_err() {
+                    bad = Some((len, soff, doff));
+                    break;
+                }
+                if dst[doff..doff + len] != src[soff..soff + len] {
+                    bad = Some((len, soff, doff));
+                    break;
+                }
+                // Nothing outside the range may be touched — a chunk loop that
+                // over-copies would land here and nowhere else.
+                if dst[..doff].iter().any(|&b| b != 0xA5)
+                    || dst[doff + len..].iter().any(|&b| b != 0xA5)
+                {
+                    bad = Some((len, soff, doff));
+                    break;
+                }
+            }
+            if bad.is_some() { break; }
+        }
+        if bad.is_some() { break; }
+    }
+    if let Some((len, soff, doff)) = bad {
+        ok = false;
+        crate::safe_print!(128,
+            "  FAILED: wrong bytes or overrun at len={} src_off={} dst_off={}\n",
+            len, soff, doff);
+    } else {
+        console::print("  OK: 81 lengths x 8 x 8 alignments copy exactly, no overrun\n");
+    }
+
+    // ── 2. A whole-range-bad copy still returns EFAULT.
+    let unmapped = (akuma_exec::mmu::kernel_va_end() + 0x4000_0000) as *const u8;
+    let mut sink = [0u8; 64];
+    let r = unsafe { copy_from_user_safe(sink.as_mut_ptr(), unmapped, 64) };
+    if r.is_err() {
+        console::print("  OK: fully unmapped source returns EFAULT\n");
+    } else {
+        ok = false;
+        console::print("  FAILED: unmapped source did not fault\n");
+    }
+
+    // ── 3. THE ONE THAT MATTERS: fault part way through a long copy.
+    //       Start in mapped kernel memory and run off its end, so the first chunks
+    //       succeed and a later one faults. If `x30` were clobbered by a prologue,
+    //       the trampoline's `ret` would not come back here and this test would
+    //       not return at all — a hang or a wild jump, not a FAILED line.
+    let straddle_len = 0x2000usize; // 8 KB: many 64-byte chunks before the cliff
+    let near_end = (akuma_exec::mmu::kernel_va_end() - 0x400) as *const u8;
+    let mut big = alloc::vec![0u8; straddle_len];
+    let r = unsafe { copy_from_user_safe(big.as_mut_ptr(), near_end, straddle_len) };
+    if r.is_err() {
+        console::print("  OK: mid-copy fault returned EFAULT (trampoline still returns correctly)\n");
+    } else {
+        ok = false;
+        console::print("  FAILED: copy running off mapped memory did not fault\n");
+    }
+
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }

@@ -55,17 +55,74 @@ global_asm!(
 
 // x0 = dst, x1 = src, x2 = len
 // Returns 0 on success, non-zero (EFAULT) on error
+//
+// Widest-first: 64, then 16, then 8, then the byte tail. This used to be a
+// single byte-at-a-time loop, which cost ~16x an in-kernel memcpy per byte and
+// was the dominant term in a warm read(2) — measurements and the reasoning are
+// in docs/archive/USER_COPY_BYTE_LOOP.md.
+//
+// THREE INVARIANTS, all load-bearing:
+//
+//   1. LEAF AND STACKLESS. `__arch_copy_user_fault` returns through x30, which
+//      only works because nothing here writes x30 or sp. On a fault the
+//      exception handler rewrites ELR_EL1 to that trampoline, and its `ret`
+//      must land back in the Rust caller. Give this function a prologue and a
+//      mid-copy fault returns to garbage. Do not add one.
+//   2. CALLER-SAVED REGISTERS ONLY (x3-x10 here). AAPCS64 says x0-x17 are the
+//      caller's to lose, and the trampoline restores nothing.
+//   3. UNALIGNED IS ALLOWED. SCTLR_EL1.A is 0 (src/boot.rs forces SA/SA0 off
+//      and leaves A at its reset value, which is clear on both QEMU virt and
+//      Firecracker/KVM), so unaligned ldp/stp to Normal memory is fine. Device
+//      memory would fault on multi-register access regardless of A; no user VA
+//      is Device-mapped.
+//
+// A fault mid-chunk can leave the destination partly written. That was already
+// true byte-wise, and the contract is a bare EFAULT rather than Linux's
+// bytes-not-copied, so the granularity is not observable.
 __arch_copy_user_memory:
-    // Check for 0 length
-    cbz x2, 2f
-1:
-    // Byte copy loop
-    ldrb w3, [x1], #1
-    strb w3, [x0], #1
-    subs x2, x2, #1
-    b.ne 1b
-2:
-    mov x0, #0
+    cbz     x2, 9f
+
+    cmp     x2, #64
+    b.lo    2f
+1:  // 64 bytes per iteration
+    ldp     x3, x4, [x1, #0]
+    ldp     x5, x6, [x1, #16]
+    ldp     x7, x8, [x1, #32]
+    ldp     x9, x10, [x1, #48]
+    stp     x3, x4, [x0, #0]
+    stp     x5, x6, [x0, #16]
+    stp     x7, x8, [x0, #32]
+    stp     x9, x10, [x0, #48]
+    add     x1, x1, #64
+    add     x0, x0, #64
+    sub     x2, x2, #64
+    cmp     x2, #64
+    b.hs    1b
+
+2:  cmp     x2, #16
+    b.lo    4f
+3:  // 16 bytes per iteration
+    ldp     x3, x4, [x1], #16
+    stp     x3, x4, [x0], #16
+    sub     x2, x2, #16
+    cmp     x2, #16
+    b.hs    3b
+
+4:  cmp     x2, #8
+    b.lo    6f
+    // one 8-byte chunk; x2 < 16 here, so this cannot loop
+    ldr     x3, [x1], #8
+    str     x3, [x0], #8
+    sub     x2, x2, #8
+
+6:  cbz     x2, 9f
+7:  // byte tail, at most 7
+    ldrb    w3, [x1], #1
+    strb    w3, [x0], #1
+    subs    x2, x2, #1
+    b.ne    7b
+
+9:  mov     x0, #0
     ret
 
 // Fault handler - jumped to by exception handler
@@ -518,7 +575,7 @@ pub fn read_user_into_with<T: Copy>(
 /// Returns Ok(()) on success, Err(EFAULT) on failure.
 ///
 /// **Raw primitive — prefer [`copy_from_user`].** This checks nothing: it is the
-/// byte loop plus the fault trampoline. Every remaining caller is either the safe
+/// copy loop plus the fault trampoline. Every remaining caller is either the safe
 /// wrapper above or a path that documents why it validates differently.
 pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Result<(), u64> {
     set_user_copy_fault_handler(__arch_copy_user_fault as *const () as usize as u64);
@@ -541,11 +598,14 @@ pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> R
 /// Copy to user memory from kernel memory safely.
 /// Returns Ok(()) on success, Err(EFAULT) on failure.
 ///
-/// **Raw primitive — prefer [`copy_to_user`].** Note this is byte-for-byte the same
+/// **Raw primitive — prefer [`copy_to_user`].** Note this is literally the same
 /// routine as [`copy_from_user_safe`]: the loop is symmetric, so the direction lives
 /// only in the name and swapping the arguments compiles.
 pub unsafe fn copy_to_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Result<(), u64> {
-    // Same implementation logic for now (byte copy handles both directions)
+    // One routine serves both directions: the copy loop is symmetric, so this is
+    // an argument swap and not a second implementation. Worth stating because it
+    // is also what made widening that loop (64/16/8-byte chunks, 2026-08-27) a
+    // single edit that sped up user->kernel and kernel->user alike.
     unsafe { copy_from_user_safe(dst, src, len) }
 }
 
