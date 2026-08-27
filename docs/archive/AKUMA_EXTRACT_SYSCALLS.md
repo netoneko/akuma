@@ -219,7 +219,7 @@ Per [`../runbooks/verify-trim-fat-change.md`](../runbooks/verify-trim-fat-change
 
 **Tier 1 — host only.** All four clippy configurations (release, extreme-size,
 devbox-smoltcp, devbox-rump) end in `Finished` with **0 warnings and 0 errors**.
-Host tests **824 → 857**: +33, exactly the new crate's own tests, 0 failed,
+Host tests **824 → 858**: +34, exactly the new crate's own tests, 0 failed,
 nothing removed.
 
 Three of the four clippy configurations caught something the default one did
@@ -237,7 +237,61 @@ userspace binary reads a `struct stat` the kernel wrote.
 
 ### 6.1 Tier 2 / Tier 3 results
 
-<!-- filled in from the gate run; see §6.1 table -->
+`scripts/verify_trim.py --tier all` on `869928e6`, 2026-08-28, 257 s:
+
+| | SMP=1 | SMP=4 |
+|---|---|---|
+| booted | True | True |
+| `[PASS]` | **99** | **99** |
+| failure set | **empty** | **empty** |
+| `passed_marker` | 305 | 313 |
+| `host_timejumps` | **0** | **0** |
+| `bkl_stuck` | 0 | 114 |
+| exercises | 16/16 as expected | 15/16 as expected |
+
+Host arm: all four clippy configurations clean, **858 tests / 0 failed**.
+
+Two entries need reading rather than counting:
+
+- **`smp4.ex.cowstale: UNEXPECTED` / `Segmentation fault`.** In the gate's
+  known-benign register, and not a finding here. `cowstale` is the stale-write-fault
+  class: a write fault judged against state a sibling's CoW break already consumed.
+  It has been A/B'd on both arms twice (2026-08-14 at SMP=2, 2026-08-19 at SMP=1)
+  and failed on the unmodified tree both times. It also **cannot plausibly be this
+  change** — `cowstale` is a fork/CoW probe that reads no `repr(C)` struct this
+  crate moved, and it passed at SMP=1 in the same run.
+- **`smp4.bkl_stuck: 114`.** Load-driven — see the `[BKL] stuck tag=511` row of
+  the gate's known-benign table
+  ([`../runbooks/verify-trim-fat-change.md`](../runbooks/verify-trim-fat-change.md)).
+  A real storm is thousands of lines. `host_timejumps: 0` says the host was not
+  starving QEMU, so this is guest-side contention at 4 cores, which is its normal
+  shape.
+
+**Tier 3 evidence specific to this change.** The gate's own exercises are
+fork/CoW/fault-path probes and **none of them reads a struct whose offsets this
+crate moved** — so a green gate, on its own, would not have been evidence for the
+thing most likely to break. Four round-trips were run by hand on the same boot
+(SMP=1, `MEMORY=2048`), each chosen because a userspace binary parses a structure
+the kernel wrote:
+
+| Probe | Type exercised | Result |
+|---|---|---|
+| `busybox stat /bin/busybox` | `Stat` | size 1116408, blocks 2181, mode `0755`, links 1, all three timestamps `2026-08-26 18:15:11` — every field at the right offset |
+| `busybox df` | `Statfs` | 2097152 1K-blocks, 82 % used — `f_blocks`/`f_bfree`/`f_bavail`/`f_bsize` consistent |
+| `busybox free` | `Sysinfo` | `total 2097152` KB = exactly the `MEMORY=2048` the VM booted with. **This is the one that matters**: `Sysinfo` is the struct whose conversion from a zeroed `[u8; 112]` introduced the 4-byte info leak in §5 |
+| `nettest-connect ifconfig` | `IfConfHdr`, `SockAddrHw` | `checks=29 failures=0`, including `ifc_len is a multiple of sizeof(ifreq)=40` — a direct packing assertion |
+
+Also run, as the broader ABI check: `nettest-unix all` → 8 `OK` + 2
+`UNSUPPORTED` (`passfd`, `syslog`; both are known gaps, not regressions),
+exercising `MsgHdr`, `IoVec` and `Ucred` — three more types this crate moved.
+And `ext2probe 25 4` → `NO REGRESSION`.
+
+**Tier 4 / Tier 5 not run, deliberately** — see §6. **The baseline arm
+(`64de70c8`) is not in this table**: a worktree was prepared for it, but the A/B
+was deferred rather than run on a contended host, since a starved run's
+`cowstale`/`bkl_stuck` readings are exactly the ones that mislead. The arm above
+was captured on a quiet host (`host_timejumps: 0` at both levels), so it stands
+on its own for everything except a same-day comparison of the two flaky entries.
 
 ## 7. What was not built: `akuma-syscalls` (the shape crate)
 

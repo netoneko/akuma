@@ -1,7 +1,18 @@
 # Verify a trim-the-fat change (no-regression gate)
 
 **Grade: A** — every command here was run end-to-end on 2026-08-13 for Phase 6
-item 1 (the `channel.rs` FIFO merge).
+item 1 (the `channel.rs` FIFO merge). **Probe inventory refreshed 2026-08-28**
+(the `akuma-syscalls-linux` extraction): both stale baselines re-measured, and
+the four probes built between 2026-08-19 and 2026-08-27 added to Tier 3 with
+their real output — see "Probes built since this runbook was last revised".
+
+> **The prose and the script are deliberately out of step right now.** The new
+> Tier 3 probes are documented here but are **not** in `verify_trim.py`'s
+> `EXERCISES`. That is not an oversight to fix blindly: the automated set is
+> fork/CoW/fault-path only, and adding a *network* probe to it means the gate
+> starts reporting network flakes as refactor regressions. Add them when you
+> have A/B'd their stability across arms, not before — the `cowstale` entry in
+> the known-benign table is what that mistake costs.
 
 For deduplication / extraction work from
 [`../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md).
@@ -85,7 +96,18 @@ cargo test --target "$HOST" 2>&1 \
   | paste -sd+ - | bc
 ```
 
-> **Baseline as of 2026-08-14: 521** — after the Phase 5 user-copy sweep (+5
+> **Baseline as of 2026-08-28: 858, 0 failed** (`869928e6`, the
+> `akuma-syscalls-linux` extraction). The number has moved by a factor of 1.6 in
+> two weeks and every step was a crate arriving, not tests being written into
+> `src/`: `akuma-firecracker` (2026-08-21, DTB fixtures), `akuma-net-yarn`
+> (2026-08-24), `akuma-time` and `akuma-boot` (2026-08-25),
+> `akuma-syscalls-linux` (+34, 2026-08-28). **That is the mechanism to expect:**
+> an extraction's whole point is to make a body of logic host-testable, so the
+> count jumps by the new crate's own test count on the commit that lands it, and
+> a +34 that matches the new crate exactly is the healthy shape — not a
+> suspicious one. What must never happen is the count going *down*.
+>
+> **Superseded: 521 as of 2026-08-14** — after the Phase 5 user-copy sweep (+5
 > `user_range_ok` tests in `akuma-exec`). Was **516** after the §5.7 errno-table
 > merge (+4 in `akuma-primitives`), and **512** earlier the same day: the arm-2 count of that
 > day's DA/IA
@@ -153,13 +175,23 @@ makes plain `grep` treat the file as binary and print nothing.
 ### Verify
 
 ```bash
-grep -ac '\[PASS\]' /tmp/mine.log                       # expect 94
-grep -aoE '\[FAIL\] [a-z_0-9]+' /tmp/mine.log | sort -u  # expect exactly one line
+grep -ac '\[PASS\]' /tmp/mine.log                       # expect 99
+grep -aoE '\[FAIL\] [a-z_0-9]+' /tmp/mine.log | sort -u  # expect an empty set
 ```
 
-**Baseline 2026-08-13: 94 `[PASS]`, and the failure set is exactly
-`retired_reclaim_ab`** — that one fails on an unmodified tree (threshold too
-tight, `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §8.5 Phase 0).
+**Baseline 2026-08-28 (`869928e6`): 99 `[PASS]` at both SMP=1 and SMP=4, and the
+failure set is EMPTY at both** — `host_timejumps: 0` on both boots, so the host
+was quiet enough for the reading to mean something. `passed_marker` was 305 at
+SMP=1 and 313 at SMP=4; the two levels are not expected to agree, because
+several tests SKIP or report INCONCLUSIVE depending on core count (see the
+`passed_marker` row in the known-benign table).
+
+**Superseded baseline 2026-08-13: 94 `[PASS]`, failure set exactly
+`retired_reclaim_ab`** — that one used to fail on an unmodified tree (threshold
+too tight, `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §8.5 Phase 0). It did not
+appear in either arm on 2026-08-28. **Do not read that as fixed**: the note
+below records it flipping run to run, and two clean boots cannot distinguish a
+repaired threshold from two lucky samples.
 
 > **`retired_reclaim_ab` flips run to run — so `94` is really `94 or 95`.**
 > Measured at SMP=4 on 2026-08-13, five boots: the working tree scored
@@ -266,6 +298,62 @@ Memory / fork / CoW binaries already on `disk.img` — all self-reporting:
 | `mmap_file <path>` | `mmap_file: touched all pages` |
 | `allocstress` | `allocstress: reached 2,000,000 allocations without failure!` |
 | `eager_mprotect_probe` | `RESULT: PASS` — but it reports **`RESULT: FAIL` on an unmodified tree today** (both phases, "write succeeded, no SIGSEGV — mprotect was defeated", measured 2026-08-15 on `24f7e1c1` at SMP=1 and SMP=4). `verify_trim.py` carries it in `KNOWN_FAIL_EXERCISES` so it reads `KNOWN-FAIL (expected)` instead of masquerading as a regression. See `../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §3, §6a |
+
+### Probes built since this runbook was last revised (added 2026-08-28)
+
+Everything in the table above is a **fork / CoW / fault-path** probe, because
+that is what the gate was built to guard. Between 2026-08-19 and 2026-08-27 four
+more probes landed against *other* subsystems — AF_UNIX, the socket ioctls, the
+ext2 read path — and none of them were in this runbook or in
+`verify_trim.py`'s `EXERCISES`. Each row below was **run on a booted VM on
+2026-08-28** (`869928e6`, SMP=1, `MEMORY=2048`) and its marker copied from that
+run's actual output, per the selection rules in `verify_trim.py`'s module
+comment.
+
+| Command | Healthy output | Cost | What it guards |
+|---|---|---|---|
+| `nettest-unix all` | 10 `[probe] RESULT <mode> verdict=…` lines; **8 `OK` + 2 `UNSUPPORTED`** (`passfd`, `syslog`), **exit 0** | 0.2 s | The AF_UNIX object added 2026-08-23. Two of the defects its audit found were *silent* — `SOCK_SEQPACKET` merging messages and `sendmsg` sending only the first iovec — so this is a data-corruption probe, not a liveness one. **`UNSUPPORTED` is an acceptable verdict and is counted as such by the binary's own exit status**: `passfd` (no `SCM_RIGHTS`) and `syslog` (nothing bound to `/dev/log`) are known gaps, not regressions. Only `TRUNCATED`/`LEAK`/`READINESS`/`FAIL` are findings. Calibrated: same static binary runs on Linux arm64, so **run the Linux arm first** — a mode that fails there is a probe bug |
+| `nettest-connect ifconfig` | `[probe] SUMMARY ifconfig checks=29 failures=0` | 0.1 s | 29 `SIOCGIF*` / `SIOCGIFCONF` checks against `lo` and `eth0`. **Needs no host and no network**, unlike every other mode of this binary — which is what makes it gate-safe. It is also the only probe anywhere that reads back `struct ifreq` **packing**: `ifc_len is a multiple of sizeof(ifreq)=40` fails loudly if a `repr(C)` socket type drifts |
+| `ext2probe [files_per_dir] [dirs]` | `ext2probe: NO REGRESSION` (the alternative verdict is `ext2probe: REGRESSION`) | **3.4 s at `25 4`** (measured). The `200 16` default is 32x the stress tree and was **not** timed — do not assume it is 32x the wall clock either, since the fixed `base_n = 300` before/after passes dominate this run | Whether ordinary ext2 create/write/read/list measurably degrade *after* a bulk delete ([`../archive/EXT2_PERFORMANCE_AUDIT.md`](../archive/EXT2_PERFORMANCE_AUDIT.md)). **Its verdict is a timing comparison** (>20 % degradation on any single op), so it is the one probe here that a loaded host can flip on its own — check `Time jump detected` before believing a `REGRESSION`. It also **writes ~12.5 MB and deletes it again**; on a disk already at 82 % (measured 2026-08-28) prefer the small argument form |
+| `read_syscall_cost` | see "Performance guards" below — this one is a **measurement, not a verdict** | — | **Not staged on `disk.img`.** It was built 2026-08-27 into `bootstrap/bin/`, and the image was last populated 2026-08-26, so `/bin/read_syscall_cost` does not exist in the guest. Re-run `scripts/populate_disk.sh` before reaching for it |
+
+Two host-side probes landed in the same window and are driven from the host, not
+over ssh, so they sit outside the exercise table:
+
+| Probe | Use it when |
+|---|---|
+| [`scripts/probes/listener_backlog_churn.py`](../../scripts/probes/listener_backlog_churn.py) | The change touches `accept`/`listen`/socket teardown. It escalates connect+RST churn and reports the first count that permanently kills a listener, which is what separates "the server leaked its connection pool" (ceiling ~512) from "Akuma's listener pool eroded" (ceiling `MAX_BACKLOG` = 32). Read the `BACKLOG` column of `/proc/net/tcp` alongside it: `0/0/32` is a dead listener |
+| [`scripts/probes/redis_write_probe.py`](../../scripts/probes/redis_write_probe.py) | You suspect **partial writes under host load** on a forwarded port. 20 clients × 2000 PINGs, logging actual `send()`/`recv()` sizes — ground truth without tcpdump or sudo |
+
+Three more multi-mode probes sit in the same gap (built 2026-08-17, after the
+exercise list above was last extended on 2026-08-15). They are **not measured
+here** — each takes a subcommand and, for two of them, a network peer, so there
+is no single marker to quote. Reach for them by symptom:
+
+| Probe | Reach for it when |
+|---|---|
+| `ncaprobe <mode>` (`userspace/ncaprobe/`, build with its `build-musl.sh`) | The change touches **epoll/ET edges, pipes, pidfd, `waitid` or pty**. Modes: `tokio`, `eofedge`, `ptyedge`, `epoll`, `cross`, `fds`, `waitid`, `timeoutleak`, `raw`. Written for [`../archive/TOKIO_PIPE_EPOLL_HANG.md`](../archive/TOKIO_PIPE_EPOLL_HANG.md); every mode is built to run **unchanged under Docker on real Linux**, and that A/B is the whole point |
+| `nettest-std`, `nettest-reqwest` (`userspace/nettest/rust/{stdlib,reqwest}/`) | A guest TCP client hangs when the server's **first response byte is delayed**. The pair cuts a four-layer client (tokio + hyper + reqwest + rustls) into one axis at a time: `nettest-std` is the dependency-free half, `nettest-reqwest` is nca's exact stack. Same command grammar and same `[probe]` line vocabulary, so the two runs diff directly. Background: [`../archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md`](../archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md) |
+
+### Performance guards (syscall-dispatch and read-path changes)
+
+None of the tiers above measure *cost*, and two of this repo's optimisation
+efforts have a floor recorded that a refactor can silently give back —
+`handle_syscall` at **150 ns** (down from 410 ns) with the ~120 ns `wrap` layer
+still to come (`../archive/AKUMA_SYSCALL_PERFORMANCE_AUDIT.md`), and the ext2
+read path (`../archive/EXT2_READ_PATH_STAGE_PROFILE.md`). Three tools at three
+altitudes, all added 2026-08-25..27:
+
+| Tool | Altitude |
+|---|---|
+| `userspace/ext2probe/c/read_syscall_cost.c` (build: `userspace/ext2probe/c/build.sh`) | **One `read(2)`, split into fixed and per-byte cost.** Three arms — `zero` (`/dev/zero`, no filesystem), `file` (warm `pread`), `null` (zero-length read = the fixed cost, *measured* rather than fitted). Built musl-static from one source for **both** kernels, so an Akuma number and a Linux number differ by the kernel and nothing else |
+| [`scripts/benchmarks/read_path_ab.py`](../../scripts/benchmarks/read_path_ab.py) | The same split **inferred** from outside, by fitting a line through two block sizes (`--sweep`). The two disagreeing is itself a finding |
+| [`scripts/benchmarks/read_stage_profile.py`](../../scripts/benchmarks/read_stage_profile.py) + `--features read-profile` (`src/syscall/utils/read_profile.rs`) | Splits that one syscall into **kernel-side stages** |
+
+Run these only when the change is in the dispatch or the read path, and A/B them
+the same way as everything else — a single number is not a result. They are
+**not** part of `--tier all`: they need a quiet host, and the gate deliberately
+runs `cargo` immediately before booting.
 
 Omitted from the automated suite **because they do not terminate**, not because
 they are uninteresting — measured 2026-08-15, all still running with nothing but
@@ -376,6 +464,25 @@ shapes mean different things:
 | `*** MEMORY ERROR DETECTED ***` with an address | The fault path served a wrong or stale frame — a **data** bug. This is the outcome this tier exists to catch; capture the log and A/B it |
 | The process dies with SIGSEGV, or `[Fault] Process N (redis-server) SIGSEGV` in the boot log | OOM, not corruption: the escalation gave up and killed the process. Compare `MEMORY=` and the free-page count against the baseline before calling it a regression |
 | `apk add` fails, or `redis-server: not found` | Networking or a full disk (`df` above), not the memory path |
+
+### The redis A/B harnesses (added 2026-08-20..24)
+
+`--test-memory` is the *memory* arm of this tier. Since it was written, a set of
+host-side redis harnesses landed for the **network/server** arm — use them when
+the change is in the socket table, the poll path or the scheduler rather than
+the PMM. All are A/B tools: they take two arms and report the difference, so
+none of them has a "healthy number" to quote here.
+
+| Harness | Question it answers |
+|---|---|
+| [`scripts/benchmarks/run_redis_arm.py`](../../scripts/benchmarks/run_redis_arm.py) | Runs one arm end to end; the building block for the rest |
+| [`scripts/benchmarks/redis_bulk_ab.py`](../../scripts/benchmarks/redis_bulk_ab.py) (+ `redis_bulk_check.sh`) | Bulk throughput, arm vs arm |
+| [`scripts/benchmarks/redis_conc_sweep.py`](../../scripts/benchmarks/redis_conc_sweep.py) | Does it fall over as concurrency climbs? |
+| [`scripts/benchmarks/redis_smp_sweep.py`](../../scripts/benchmarks/redis_smp_sweep.py) | Does adding cores help or hurt? |
+| [`scripts/benchmarks/redis_feature_ab.py`](../../scripts/benchmarks/redis_feature_ab.py) | Attributes a delta to one feature flag |
+| [`scripts/benchmarks/redis_socket_table_scaling.py`](../../scripts/benchmarks/redis_socket_table_scaling.py) | Whether cost grows with the *socket table*, not the load |
+| [`scripts/benchmarks/rtt_load.py`](../../scripts/benchmarks/rtt_load.py), [`nicstat_breakdown.py`](../../scripts/benchmarks/nicstat_breakdown.py) | Round-trip latency under load; where NIC time goes |
+| [`scripts/benchmarks/gssh.py`](../../scripts/benchmarks/gssh.py) | Drives the guest over ssh from Python — `ssh` is blocked by policy for the agent, and this is the shared wrapper the others use |
 
 Also run it at a size that does **not** fit, once, when the change touches the
 escalation: `--test-memory 8192` in a 4 GiB box must SIGSEGV the process and
