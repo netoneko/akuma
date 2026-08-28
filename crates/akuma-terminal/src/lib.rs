@@ -1,4 +1,11 @@
 #![cfg_attr(not(test), no_std)]
+// This crate is unsafe-free by design and stays that way: `forbid` (not
+// `deny`) so no module can opt back in with a local `allow`. Cargo cannot
+// host this per-crate — `[lints] workspace = true` and crate-local lints are
+// mutually exclusive ("cannot override `workspace.lints` in `lints`"), and
+// spelling the ban in Cargo.toml would mean duplicating the whole workspace
+// lint table into every crate that wants it.
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 

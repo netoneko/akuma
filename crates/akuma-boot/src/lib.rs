@@ -1,4 +1,11 @@
 #![no_std]
+// This crate is unsafe-free by design and stays that way: `forbid` (not
+// `deny`) so no module can opt back in with a local `allow`. Cargo cannot
+// host this per-crate — `[lints] workspace = true` and crate-local lints are
+// mutually exclusive ("cannot override `workspace.lints` in `lints`"), and
+// spelling the ban in Cargo.toml would mean duplicating the whole workspace
+// lint table into every crate that wants it.
+#![forbid(unsafe_code)]
 //! Linux `reboot(2)` ABI decode — pure, host-testable.
 //!
 //! The actual PSCI SMC call stays in `src/smp_shared.rs`, which already owns
