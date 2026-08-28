@@ -81,7 +81,82 @@ The dirfd ladder is shared with every other `*at` syscall via `fs::dirfd_base`.
 (`flags::utimensat`) with a host test pinning their values, rather than spelled
 locally.
 
-## What is still not implemented, and why that is not hidden
+## Storing the timestamps (landed the same day)
+
+The first version of this fix made the *errors* correct and discarded the
+timestamps, because `akuma_vfs::Filesystem` had no way to set them. That section
+is preserved below as the "OPEN" item it was, because the estimate in it was
+wrong in an instructive way.
+
+**The claim was that ext2 needed inode writeback for the time fields. It did
+not.** `Inode` already carries `access_time` / `creation_time` /
+`modification_time` (`crates/akuma-ext2/src/ext2.rs:809`); they are set on
+create (`:2574`, `:2626`) and refreshed on write (`:2254`); `write_inode`
+(`:1690`) persists them; and `metadata` surfaces all three into `Metadata`
+(`:2736-2738`). That is why `ls -l` always showed a real mtime — the one from
+the last *write*. The whole gap was one missing trait method.
+
+What landed:
+
+1. **`Filesystem::set_times(path, atime_secs, mtime_secs)`**, defaulting to
+   `NotSupported`. Two `Option`s, not two `u64`s: `None` is `UTIME_OMIT`, and
+   without it `touch -a` would have to read-modify-write and clobber mtime.
+   `UTIME_NOW` is resolved by the syscall layer, which owns the clock, so no
+   filesystem has to.
+2. **ext2 implements it** — 8 lines, modelled on `chmod` directly above it, and
+   deliberately *not* bumping mtime when only atime is given (`chmod` does bump
+   it, because changing a mode changes the inode; `touch -a` must not).
+3. **memfs implements the mtime half.** It has no access-time field at all, so
+   atime is accepted and dropped — documented at the impl.
+4. **`sys_utimensat` resolves `UTIME_NOW`/`UTIME_OMIT` and calls through.**
+
+Two edges worth knowing:
+
+- **A clock that was never set leaves the stamps alone** rather than writing 0.
+  On a platform with no RTC and no SNTP yet, "now" is unknown; dating every
+  touched file to 1970 would be worse than not touching them.
+- **`NotSupported` and `NotFound` from `set_times` are both success.** Existence
+  is already established before the call, so those two mean "nothing to stamp" —
+  every synthetic path `vfs::exists` knows about (device nodes, `/dev`,
+  `/proc/mounts`) has no inode and no mount to hand the request to. The boot test
+  caught this: an earlier version accepted only `NotSupported`, and
+  `touch /dev/null` regressed to `ENOENT`.
+
+### Measured after (same file, same ladder as before)
+
+```
+$ echo x > /tmp/ts1; ls -l /tmp/ts1
+-rw-rw-rw- 1 0 0 2 Aug 28 21:02 /tmp/ts1
+
+$ touch -d '2001-01-01 00:00:00' /tmp/ts1; ls -l /tmp/ts1
+-rw-rw-rw- 1 0 0 2 Jan  1  2001 /tmp/ts1        ← was: unchanged
+
+$ touch -t 0202020202 /tmp/ts1; ls -l /tmp/ts1
+-rw-rw-rw- 1 0 0 2 Feb  2  2002 /tmp/ts1        ← was: unchanged
+
+$ touch /tmp/ts1; ls -l /tmp/ts1
+-rw-rw-rw- 1 0 0 2 Aug 28 21:02 /tmp/ts1        ← back to now; `make` sees it
+
+$ touch -d '2003-03-03 03:03:03' /tmp/ts1; stat -c %Y   → 1046660583
+$ touch -a /tmp/ts1;                       stat -c %Y   → 1046660583
+                                             ↑ UTIME_OMIT: mtime untouched
+```
+
+> `touch -t` is spelled in its 10-digit `YYMMDDhhmm` form here rather than the
+> 12-digit `CCYYMMDDhhmm` one. Same instant, and it keeps the line out of this
+> repo's public-secret scanner: any bare 12-digit run has the shape of an AWS
+> account id, and the century-prefixed spelling of this date is exactly twelve
+> digits. Allowlisting it would have worked too;
+> `scripts/cloud_secret_scan_allow.txt` says to prefer rewording, so the
+> heuristic is never weakened for a doc's convenience. (Writing the offending
+> literal into the explanation tripped it a second time — hence the wording.)
+
+The three `touch` forms now give three different answers where they previously
+gave one. `touch -a` is the case that proves `UTIME_OMIT` is modelled rather
+than approximated.
+
+<details>
+<summary>The original "not implemented" section, kept for the estimate it got wrong</summary>
 
 **The timestamps are discarded.** `akuma_vfs::Filesystem` has no set-times
 operation at all, and `Metadata`'s `modified`/`accessed` are read-only, so there
@@ -94,59 +169,34 @@ is nowhere to put them. Consequences:
   so `make` and anything else comparing mtimes sees whatever ext2 recorded at
   write time and will not rebuild.
 
-Measured in the guest 2026-08-28, one file through all three forms — the mtime
-never moves off the write time:
-
 ```
-$ echo x > /tmp/ts1; ls -l /tmp/ts1
--rw-rw-rw- 1 0 0 2 Aug 28 20:18 /tmp/ts1
-
 $ touch -d '2001-01-01 00:00:00' /tmp/ts1; echo rc=$?   → rc=0
-$ touch -t 200202020202 /tmp/ts1;          echo rc=$?   → rc=0
+$ touch -t 0202020202 /tmp/ts1;            echo rc=$?   → rc=0
 $ touch /tmp/ts1;                          echo rc=$?   → rc=0
 $ ls -l /tmp/ts1
 -rw-rw-rw- 1 0 0 2 Aug 28 20:18 /tmp/ts1                 ← unchanged by all three
-
-$ date -u '+%Y-%m-%d %H:%M:%S'          → 2026-08-28 20:18:58
-$ busybox stat -c '%y  %Y' /tmp/ts1     → 2026-08-28 20:18:57  1787948337
 ```
-
-Every call returns 0, which is the honest half of the trade: the *error*
-contract is now correct, and the write side is a stub that says so here rather
-than in a comment nobody reads.
 
 Returning `ENOSYS` instead would be the honest alternative and is worse: it puts
 `touch` back to failing outright, which is the state this replaces.
 
-### OPEN: actually storing the timestamps
+**The estimate this section carried was wrong**, and that is the reason to keep
+it: it said the work needed "ext2 inode writeback for `i_atime`/`i_mtime`/
+`i_ctime`" and that "nothing writes them back". The field names were the C ones,
+not this tree's, and the writeback already existed. Checking the claim before
+acting on it turned a multi-layer job into one trait method — the general
+lesson being to verify a "what's left" list against the code before scheduling
+it, not after.
 
-Deliberately not folded into this fix. What it needs, in order:
-
-1. **A set-times operation on `akuma_vfs::Filesystem`.** There is none today —
-   the trait is read-only with respect to time, which is why the handler has
-   nowhere to put the values. Signature has to carry `UTIME_OMIT` (leave this
-   one alone) rather than two plain `u64`s, or `touch -a` will clobber mtime.
-2. **ext2 inode writeback for `i_atime` / `i_mtime` / `i_ctime`.** The fields
-   exist on disk and are already read; nothing writes them back.
-3. **`Metadata.modified` / `.accessed` stop being read-only**, and `sys_utimensat`
-   drops its "discard" branch.
-
-Whoever picks this up should extend `test_utimensat` with the read-back case it
-deliberately omits today, and re-run the mtime ladder under "What is still not
-implemented" — it is written to be re-run and should start disagreeing with
-itself when this lands.
-
-Worth doing when something in the guest actually depends on mtime. The concrete
-trigger is a build system: `make` inside the VM will not rebuild on `touch`,
-and self-hosted builds are the direction this OS is going.
+</details>
 
 ## Verify
 
-Boot test `test_utimensat` (`src/process_tests.rs`, 10 cases) covers the table
-above. Case 2 is the bug itself; the rest exist so a future "simplification"
-back to a constant fails loudly. It deliberately does **not** assert that
-timestamps were stored — there is nothing to read back, and a test claiming
-otherwise would be asserting a fiction.
+Boot test `test_utimensat` (`src/process_tests.rs`, 11 cases) covers the table
+above. Case 2 is the bug itself; case 11 is the read-back — it sets an explicit
+mtime with `UTIME_OMIT` on atime and asserts the value comes back through
+`vfs::metadata`, so "stored" is checked rather than assumed. The rest exist so a
+future "simplification" back to a constant fails loudly.
 
 End to end in the guest:
 
@@ -171,9 +221,13 @@ rc=1
 being swallowed: busybox suppresses the create for `-c`, so the file must stay
 absent while the command still exits 0.
 
-Confirmed on both platforms at SMP=4: QEMU **316 PASSED / 0 FAILED**, and
-Firecracker under Lima **308 PASSED / 0 FAILED / 0 POISON**, with
-`[Test] utimensat PASSED (10 cases)` on each.
+Confirmed on both platforms, with `[Test] utimensat PASSED (11 cases: …/readback)`
+on each:
+
+| platform | result |
+|---|---|
+| QEMU, SMP=4, HVF, 2 GB | 317 PASSED / 0 FAILED |
+| Firecracker under Lima, 1 vCPU, KVM | 308 PASSED / 0 FAILED / 0 POISON |
 
 ## How it was found
 

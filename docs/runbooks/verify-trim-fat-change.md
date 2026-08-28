@@ -276,6 +276,41 @@ idle loops (`idle_halt`, netpoll WFI), poll intervals, or the timer crate.
 
 ---
 
+### Two ways of sampling a flaky probe, and why they disagree
+
+Recorded 2026-08-28, after two independent A/B runs of `cowstale`/`bssfork`
+produced **different pass rates and the same verdict**:
+
+| method | `cowstale` | `bssfork` |
+|---|---|---|
+| one boot, probe re-invoked 5× over ssh | 0/5 both arms | 2/5 both arms |
+| fresh boot per run, via `verify_trim.py --tier 2` | 2/5 both arms | 5/5 both arms |
+
+**Re-invoking inside one boot is the harsher test**, and it is not the thing the
+gate measures. Each `cowstale` run builds and breaks CoW mappings; the residue —
+fragmentation, page-cache state, whatever the previous run left retired — is
+still there when the next one starts, so later runs in a boot fail more often
+than the first. The gate boots fresh for each sample and therefore reports a
+kinder number.
+
+Neither is wrong. They answer different questions: in-boot repetition asks "does
+this survive repeated use", the gate asks "does one run pass on a clean system".
+The mistake is **comparing a rate from one method against a rate from the other**
+— which is what makes a change look like a regression when the only thing that
+changed was the harness.
+
+Two rules follow:
+
+1. **Sample both arms with the same method**, and say which method next to the
+   number. A bare "2/5" is not a result.
+2. **Trust the arm-vs-arm comparison, not the absolute rate.** Both methods above
+   agreed the two arms were identical, which is the only claim either supports.
+
+Related: host load moves these numbers too, and the `Time jump detected` row in
+the failure table above is the tell. Do not run two arms concurrently on one
+host — Tier 3 is timing-sensitive, and a second QEMU pinning several cores is
+easily enough to change a verdict.
+
 ## Tier 3 — live paths (only if the change touches I/O)
 
 Skip unless the change is in the stdio / VFS / net path. `ssh` is blocked by
@@ -308,9 +343,9 @@ Memory / fork / CoW binaries already on `disk.img` — all self-reporting:
 | `elftest` | `elftest: ALL tests PASSED` (**exit code 42 is success**, by design) |
 | `forkprobe` | `forkprobe: ALL PASS` |
 | `stackstress` | `stackstress: PASSED after …` |
-| `bssfork` | `failures=0` … `bssfork PASS` — **but it is stochastic at SMP=4, and a single sample means nothing.** Measured 2026-08-28, five runs per arm on one boot each: **2/5 PASS on both** a changed tree and an unmodified worktree at its parent. The gate's one-shot Tier 3 therefore reports `ok` or `UNEXPECTED`/`Segmentation fault` for this row essentially at random. Treat a `bssfork` difference between arms as unresolved until you have sampled five runs per arm, exactly as the `cowstale` rows below already require. The `bssfork 20 8 1` control was 5/5 PASS on both arms in the same session, which is what separates "this probe is flaky" from "fork is broken" |
+| `bssfork` | `failures=0` … `bssfork PASS`. **Its pass rate at SMP=4 depends on how you sample it — see "Two ways of sampling" below.** Two measurements the same day disagreed: 2/5 on both arms when the probe was re-invoked repeatedly inside one long-lived boot, and 5/5 on both arms when each run got a fresh boot through the gate. Both agreed the arms were identical, which is the part to trust. Treat a `bssfork` difference between arms as unresolved until sampled five times per arm by the *same* method on both sides. The `bssfork 20 8 1` control was 5/5 everywhere, which is what separates "this probe is flaky" from "fork is broken" |
 | `bssfork 20 8 1` | `failures=0` … `bssfork PASS`. **Not `bssfork spread=1`** — the binary's CLI is positional (`bssfork [rounds] [threads] [spread]`), not `key=value`; running the literal string `spread=1` feeds it into `rounds`, `strtoul` parses that as `0`, and `spread` silently defaults to `0` too. `rounds=0` skips the fork loop entirely, so `g_stop` fires almost instantly and the liveness check flags threads `[never ran]` before they get scheduled at all — nothing to do with CoW or the kernel. **Corrected 2026-08-14**: the "BROKEN PRE-EXISTING" verdict recorded here on 2026-08-13 (`failures=7`/`8`, `ticks=0`, "unexplained regression") was this same mis-invocation on both `main` and the branch; the real control, invoked correctly, passed 8/8 clean runs at SMP=4 on first re-check. See `docs/archive/PMM_EXTRACT.md` §8 for the full correction |
-| `cowstale` | `reader_faults=0 failures=0` … `cowstale PASS`. **At SMP=4 it does not reach that today: measured 2026-08-28, 0/5 on both arms** (changed tree and an unmodified worktree at its parent, same boot conditions, `HVF=0`, 2 GB). That is consistent with — and stronger than — the SMP=1/SMP=2 rows in the failure table above, which record the same probe failing pre-existing at lower core counts. It means a `cowstale: UNEXPECTED` at SMP=4 carries **no** information about your change; it is the expected reading. Do not spend time on it without first re-establishing a passing baseline |
+| `cowstale` | `reader_faults=0 failures=0` … `cowstale PASS`. **It fails at SMP=4 too, pre-existing — but the rate depends on sampling method (see below).** Measured 2026-08-28 on two arms by two methods: 0/5 on both arms sampling inside one boot, 2/5 on both arms sampling with a fresh boot per run through the gate. Both arms equal under both methods, and confirmed independently against `main` HEAD `64de70c8` (2/5) versus branch HEAD `e76b6357` (2/5). The SMP=4 fault signature is **byte-identical** to the SMP=1 one already documented in the failure table above — `FAR=0x420260 ELR=0x400868 ISS=0x4f`, `va=0x420000 cow_ref=0 ap_rw=true` — so this is the same long-known stale-write-fault class at a third core count, not a new bug. A `cowstale: UNEXPECTED` at SMP=4 therefore carries **no** information about your change |
 | `madvshared` | `madvshared: ALL PASS`. `MADV_DONTNEED` on a CoW-shared frame must not touch the peer's page — the null-`Rc` mechanism (`../archive/CARGO_HEAP_NULL_RC.md`), fixed 2026-08-14. Deterministic, milliseconds, no allocator involved, and **calibrated**: the identical static binary PASSes all three phases on real Linux arm64 (`docker run --rm --platform linux/arm64 -v "$PWD:/w:ro" alpine /w/madvshared`), so a FAIL is the kernel, not the probe. Before the fix it reported `2 FAIL` at both SMP=1 and SMP=4 |
 | `mmapsum <path>` | six digests; **needs a path argument**. `read:`/`mmap1:`/`mmap2:`/`madv:` must all be **the same value** — `madv:` is the regression check for the 2026-07-25 `MADV_WILLNEED`-installs-zeroed-frames bug. `mtA:`/`mtB:` hash **one half each** and are *supposed* to differ from that value and from each other; only their stability across runs means anything |
 | `forktest_parent -duration=20s` | `All children processed via epoll. Parent exiting.` |
