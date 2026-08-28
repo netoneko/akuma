@@ -100,3 +100,4 @@ For these, consult `archive/` directly in the meantime.
 3. Use `file:line` references into `src/` for the authoritative source.
 4. Cross-link runbooks that build on this reference.
 5. Add a stability grade at the top (A/B/C) with a one-line justification.
+- [`crate-safety.md`](crate-safety.md) — which extracted crates are enforced `#![forbid(unsafe_code)]`, which cannot be, and why the ban is not in `Cargo.toml`.

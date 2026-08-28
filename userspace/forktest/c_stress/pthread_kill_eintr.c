@@ -22,9 +22,54 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define NOT_RETURNED (-999)
+
+// A probe that hangs teaches the gate nothing. Before this watchdog, every
+// PHASE1 failure also wedged PHASE2 — main parked forever in `pthread_join`
+// while the helper it was waiting for never exited — so `verify_trim.py`
+// reported `TIMEOUT (still running after 420s)` and the summary could not
+// distinguish "the kernel failed this probe" from "the kernel wedged". Both
+// readings were available in the boot log and neither was in the gate.
+//
+// Two mechanisms, because they answer different questions:
+//   * bounded joins, so the ORDINARY failure path still reaches the normal
+//     RESULT: line and names which phase and why;
+//   * this alarm, as the backstop for anything the bounded joins do not cover.
+// 30 s is ~10x the probe's healthy runtime (~3 s) and far below the gate's
+// 420 s per-exercise timeout, so the watchdog always wins that race.
+#define WATCHDOG_SECS 30
+#define JOIN_TIMEOUT_SECS 5
+
+static volatile sig_atomic_t g_phase = 0;
+
+// Async-signal-safe: write(2) only, no stdio, no formatting.
+static void watchdog_fired(int sig)
+{
+    (void)sig;
+    static const char msg[] =
+        "WATCHDOG: probe did not terminate; phase = ";
+    static const char tail[] = "\nRESULT: FAIL\n";
+    char d = (char)('0' + (g_phase % 10));
+    (void)!write(1, msg, sizeof msg - 1);
+    (void)!write(1, &d, 1);
+    (void)!write(1, tail, sizeof tail - 1);
+    _exit(1);
+}
+
+// `pthread_join` with a deadline. Returns 0 on join, ETIMEDOUT on give-up.
+static int join_bounded(pthread_t t)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        // No clock: fall back to the plain join and let the alarm cover us.
+        return pthread_join(t, NULL);
+    }
+    ts.tv_sec += JOIN_TIMEOUT_SECS;
+    return pthread_timedjoin_np(t, NULL, &ts);
+}
 
 struct helper {
     int         fd;             // read end the helper blocks on
@@ -86,23 +131,50 @@ static int run_phase(int sig, int extra_flags, pthread_t *t, struct helper *h,
     return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     pthread_t t;
     struct helper h;
     int pipefd[2];
     int failures = 0;
 
+    // Arm the watchdog before anything can block. Every exit path below is
+    // either bounded or covered by this.
+    struct sigaction wd;
+    memset(&wd, 0, sizeof wd);
+    wd.sa_handler = watchdog_fired;
+    if (sigaction(SIGALRM, &wd, NULL) != 0) { perror("sigaction SIGALRM"); return 2; }
+    alarm(WATCHDOG_SECS);
+
+    // `selftest-wedge` proves the watchdog itself works: block forever and
+    // expect WATCHDOG + RESULT: FAIL rather than a hang. A guard mechanism that
+    // has never been seen to fire is not a guard.
+    if (argc > 1 && strcmp(argv[1], "selftest-wedge") == 0) {
+        g_phase = 9;
+        printf("SELFTEST: wedging on purpose; watchdog must fire in %d s\n",
+               WATCHDOG_SECS);
+        fflush(stdout);
+        for (;;) pause();
+    }
+
     // ---- Phase 1: no SA_RESTART -> must interrupt with EINTR ----------------
+    g_phase = 1;
     if (run_phase(SIGUSR1, 0, &t, &h, pipefd) != 0) return 2;
 
     if (h.ret == NOT_RETURNED) {
-        // Still blocked: joining would hang forever, so report and move on.
-        printf("PHASE1 FAIL: read() never returned; helper thread leaked "
-               "(handler ran %d times)\n", (int)sig_count);
+        // Still blocked. Closing both ends below makes the blocked read return
+        // EOF, so the helper CAN be reaped — but bounded, because the whole
+        // point of this branch is that the thread is not behaving.
+        printf("PHASE1 FAIL: read() never returned within %d attempts "
+               "(handler ran %d times)\n", 100, (int)sig_count);
         failures++;
+        close(pipefd[0]); close(pipefd[1]);
+        if (join_bounded(t) != 0)
+            printf("PHASE1 INFO: helper thread did not exit after both pipe "
+                   "ends were closed; leaked\n");
+        goto phase2;
     } else {
-        pthread_join(t, NULL);
+        join_bounded(t);
         if (h.ret == -1 && h.err == EINTR) {
             printf("PHASE1 PASS: read() = -1 EINTR after %d handler runs\n",
                    (int)sig_count);
@@ -114,11 +186,13 @@ int main(void)
     }
     close(pipefd[0]); close(pipefd[1]);
 
+phase2:
     // ---- Phase 2: SA_RESTART -> must NOT report EINTR -----------------------
+    g_phase = 2;
     if (run_phase(SIGUSR2, SA_RESTART, &t, &h, pipefd) != 0) return 2;
 
     if (h.ret != NOT_RETURNED) {
-        pthread_join(t, NULL);
+        join_bounded(t);
         printf("PHASE2 FAIL: SA_RESTART read() returned %d errno = %d (%s) — "
                "an SA_RESTART handler must restart the syscall, not interrupt it\n",
                h.ret, h.err, strerror(h.err));
@@ -128,7 +202,12 @@ int main(void)
         // not wedged: feed it a byte and expect it back.
         char c = 'x';
         if (write(pipefd[1], &c, 1) != 1) { perror("write"); return 2; }
-        pthread_join(t, NULL);
+        if (join_bounded(t) != 0) {
+            printf("PHASE2 FAIL: helper did not return from read() within %d s "
+                   "of the write — the wake was lost, not merely late\n",
+                   JOIN_TIMEOUT_SECS);
+            failures++;
+        }
         if (h.ret == 1) {
             printf("PHASE2 PASS: SA_RESTART read() never reported EINTR, "
                    "then returned 1 byte\n");
@@ -153,6 +232,7 @@ int main(void)
     }
     close(pipefd[0]); close(pipefd[1]);
 
+    alarm(0);   // past every blocking step; do not let the backstop fire late
     printf("RESULT: %s\n", failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;
 }

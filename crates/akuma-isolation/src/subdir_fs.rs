@@ -44,7 +44,14 @@ macro_rules! full_path {
             if !is_root {
                 buf[prefix.len()..].copy_from_slice(path.as_bytes());
             }
-            unsafe { core::str::from_utf8_unchecked(&buf[..need]) }
+            // Valid UTF-8 by construction: `buf` is exactly two `&str`s
+            // concatenated. `from_utf8_unchecked` only skipped the validation
+            // pass, and that pass is a walk over a path of a few tens of bytes
+            // — far too cheap to buy an `unsafe` block with, and dropping it is
+            // what lets this crate carry `#![forbid(unsafe_code)]`. The `Err`
+            // arm is unreachable; it yields an empty path, which fails the
+            // lookup that follows rather than fabricating one.
+            core::str::from_utf8(&buf[..need]).unwrap_or("")
         } else {
             _heap_buf = if is_root {
                 String::from(prefix)

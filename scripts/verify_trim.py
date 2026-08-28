@@ -514,7 +514,23 @@ def exercise_suite(port, smp, results):
                 if "__EX_DONE__" in out:
                     break
             if "__EX_DONE__" not in out:
+                # A bare TIMEOUT cannot be acted on: "the kernel failed this
+                # probe" and "the kernel wedged" read identically, and the
+                # difference decides whether you debug the change or the
+                # scheduler. Report how far the probe got, so the summary says
+                # which. Measured 2026-08-28: `pthread_kill_eintr` failed PHASE1
+                # and then wedged in PHASE2's `pthread_join`, so the gate said
+                # only TIMEOUT while the boot log had both facts
+                # (PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md § "Re-verified").
+                # Probes should also self-terminate — that probe now carries a
+                # watchdog — but the gate must not depend on every probe being
+                # well-behaved to produce a usable reading.
                 results[key] = "TIMEOUT (still running after 420s)"
+                lines = [l for l in out.splitlines()
+                         if l.strip() and "__EX_DONE__" not in l]
+                results[key + ".tail"] = (
+                    f"{len(lines)} line(s) before the timeout; last: {lines[-1][:80]}"
+                    if lines else "(no output at all — probe never printed)")
                 continue
             # `healthy` is a substring for most probes and a predicate for the
             # ones whose verdict is a relation between output lines rather than a

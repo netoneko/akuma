@@ -1,4 +1,8 @@
 #![no_std]
+// Unsafe-free as of 2026-08-28: the one `from_utf8_unchecked` in
+// `subdir_fs.rs` was a validation skip over a short path, not a necessity.
+// `forbid`, not `deny`, so no module can opt back in with a local `allow`.
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
