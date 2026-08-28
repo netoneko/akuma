@@ -440,7 +440,7 @@ pub(crate) fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize
 /// docs/LOW_MEMORY_ENVIRONMENT.md.
 pub(crate) fn compute_thread_limit(user_pages_size: usize) -> usize {
     if config::THREAD_LIMIT_OVERRIDE != 0 {
-        return config::THREAD_LIMIT_OVERRIDE.min(config::MAX_THREADS);
+        return config::THREAD_LIMIT_OVERRIDE;
     }
     let reserved = config::RESERVED_THREADS;
     let sys_total = reserved.saturating_sub(1) * config::SYSTEM_THREAD_STACK_SIZE;
@@ -1226,9 +1226,8 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                                 console::print("\n!!! THREADING TESTS FAILED - HALTING !!!\n");
                                 if !config::IGNORE_THREADING_TESTS {
                                     halt();
-                                } else {
-                                    console::print("WARNING: Threading tests failed but continuing...\n");
                                 }
+                                console::print("WARNING: Threading tests failed but continuing...\n");
                             }
 
                             // Spawn-heavy suites (futex spawns, process exec,
@@ -1826,7 +1825,7 @@ fn run_async_main() -> ! {
                 let (hits, misses) = akuma_ext2::cache_stats();
                 let (used, cap) = akuma_ext2::cache_occupancy();
                 let total = hits + misses;
-                let pct = if total == 0 { 0 } else { hits * 100 / total };
+                let pct = (hits * 100).checked_div(total).unwrap_or(0);
                 crate::safe_print!(192,
                     "[FSCACHE] hits={} misses={} hit_pct={} slots={}/{} pmm_free={} pmm_total={} heap_mb={}\n",
                     hits, misses, pct, used, cap,

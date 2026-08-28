@@ -76,7 +76,7 @@ impl ProcessSyscallStats {
 
         let secs = elapsed_us / 1_000_000;
         let frac = (elapsed_us % 1_000_000) / 10_000;
-        let rate = if elapsed_us > 0 { total * 1_000_000 / elapsed_us } else { 0 };
+        let rate = (total * 1_000_000).checked_div(elapsed_us).unwrap_or(0);
         let (pmm_total, _pmm_alloc, pmm_free) = akuma_pmm::stats();
         let pf = self.pagefaults.load(Ordering::Relaxed);
         let pf_pg = self.pagefault_pages.load(Ordering::Relaxed);

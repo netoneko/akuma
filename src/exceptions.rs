@@ -1984,10 +1984,16 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // that evidence to report EINTR. Recording here rather than at the seven call
     // sites keeps the two in step: a new delivery path gets it for free.
     // docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md
-    akuma_exec::threading::note_delivered_signal(
-        akuma_exec::threading::current_thread_id(),
-        signal,
-    );
+    // One resolution for the whole function: this is a plain register read, but it
+    // is read four times below and the slot cannot change under us (we are this
+    // thread).
+    let thread_slot = akuma_exec::threading::current_thread_id();
+    akuma_exec::threading::note_delivered_signal(thread_slot, signal);
+    // And bound delivery's priority over resuming the interrupted syscall to one
+    // handler per unit of userspace progress. Set here, at the same chokepoint,
+    // so a new delivery path is bounded for free.
+    // docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md § "Re-verified"
+    akuma_exec::threading::note_sigframe_installed(thread_slot);
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let proc = match akuma_exec::process::lookup_process_shared(pid) {
         Some(p) => p,
@@ -2059,7 +2065,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // execution so a second delivery goes to the default action = termination).
     // Use per-thread sigaltstack (indexed by kernel thread slot) so that
     // CLONE_VM threads each maintain their own independent gsignal stack.
-    let thread_slot = akuma_exec::threading::current_thread_id();
+    // (`thread_slot` resolved once at the top of this function.)
     let (alt_sp, alt_size, _alt_flags) = akuma_exec::threading::get_sigaltstack(thread_slot);
 
     // `fault_pc` is the saved ELR at exception entry — i.e. the user PC where the
@@ -3559,7 +3565,7 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
         );
 
         // Calculate percentage without floating point (integer percentage)
-        let stack_pct = if stack_size > 0 { (stack_used * 100) / stack_size } else { 0 };
+        let stack_pct = (stack_used * 100).checked_div(stack_size).unwrap_or(0);
         safe_print!(256, "    SP_EL0={user_sp:#x}, used={stack_used} bytes ({stack_pct}%)\n");
 
         safe_print!(256, "    Heap: brk={:#x} (initial={:#x}), grown={} bytes\n",
@@ -4057,9 +4063,20 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // SP/PC. We must set frame.x0 = saved_x0 before delivering so
                     // that sigreturn from the nested handler restores the right value.
                     let sig_mask = akuma_exec::threading::thread_signal_mask();
+                    // ...but bounded. Re-delivering here while the frame we just
+                    // restored carries a syscall return userspace has not observed
+                    // yet is how `pthread_kill` starved a blocking `read`: the
+                    // handler ran 45-66 times and the caller never saw its
+                    // `-1/EINTR`. The signal stays pending and is delivered at the
+                    // next kernel exit instead — the next syscall, or the next
+                    // timer tick at the latest.
+                    // docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md
+                    let thread_slot = akuma_exec::threading::current_thread_id();
+                    if akuma_exec::threading::sigframe_active(thread_slot) {
+                        return saved_x0;
+                    }
                     if let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) {
                         // For async signals like SIGURG, check if sigaltstack is ready
-                        let thread_slot = akuma_exec::threading::current_thread_id();
                         let (alt_sp, _, _) = akuma_exec::threading::get_sigaltstack(thread_slot);
                         if sig == 23 && alt_sp == 0 {
                             crate::tprint!(96, "[SIGURG] re-pend tid={} (alt_sp=0, sigreturn)\n", thread_slot);

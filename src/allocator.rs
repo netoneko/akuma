@@ -647,8 +647,7 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
         let result = TALC
             .lock()
             .malloc(actual_layout)
-            .map(core::ptr::NonNull::as_ptr)
-            .unwrap_or(ptr::null_mut());
+            .map_or(ptr::null_mut(), core::ptr::NonNull::as_ptr);
 
         if result.is_null() {
             let heap_total = HEAP_SIZE.load(Ordering::Relaxed);
@@ -660,7 +659,7 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
                 user_size,
                 heap_total / 1024 / 1024,
                 heap_used / 1024 / 1024,
-                if heap_total > 0 { heap_used * 100 / heap_total } else { 0 },
+                (heap_used * 100).checked_div(heap_total).unwrap_or(0),
                 heap_peak / 1024 / 1024,
                 heap_count);
             crate::syscall::syscall_counters::dump();
@@ -854,8 +853,7 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
             let new_actual_ptr = TALC
                 .lock()
                 .malloc(new_actual_layout)
-                .map(core::ptr::NonNull::as_ptr)
-                .unwrap_or(ptr::null_mut());
+                .map_or(ptr::null_mut(), core::ptr::NonNull::as_ptr);
             
             if new_actual_ptr.is_null() {
                 return ptr::null_mut();

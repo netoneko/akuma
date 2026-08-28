@@ -8865,7 +8865,7 @@ fn bench_mmap_eager() {
     let free_us  = t_end.saturating_sub(t_alloc);
     let total_us = t_end.saturating_sub(t0);
     let kb = (PAGES * 4) as u64;
-    let throughput = if alloc_us > 0 { kb * 1_000_000 / alloc_us } else { 0 };
+    let throughput = (kb * 1_000_000).checked_div(alloc_us).unwrap_or(0);
 
     crate::safe_print!(128,
         "{} pages ({}KB): alloc={}µs free={}µs total={}µs alloc_throughput={}KB/s\n",
@@ -8889,7 +8889,7 @@ fn bench_demand_page() {
         if let Some(f) = pmm::alloc_page_zeroed() { pmm::free_page(f); done += 1; } else { crate::safe_print!(32, "OOM at {}\n", i); break; }
     }
     let elapsed_us = uptime_us().saturating_sub(t0);
-    let per_page_ns = if done > 0 { elapsed_us * 1000 / done } else { 0 };
+    let per_page_ns = (elapsed_us * 1000).checked_div(done).unwrap_or(0);
 
     crate::safe_print!(128,
         "{} iters in {}µs = {}ns/page\n",
@@ -8930,7 +8930,7 @@ fn bench_fork_clone() {
     for f in dst_frames { pmm::free_page(f); }
 
     let total_kb = (copied * 4) as u64;
-    let mb_s = if elapsed_us > 0 { total_kb * 1_000_000 / elapsed_us / 1024 } else { 0 };
+    let mb_s = (total_kb * 1_000_000).checked_div(elapsed_us).unwrap_or(0) / 1024;
 
     crate::safe_print!(128,
         "{} pages ({}KB) copied in {}µs = {}MB/s\n",

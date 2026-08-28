@@ -49,11 +49,8 @@ pub(super) fn timerfd_can_read(timer_id: u32) -> bool {
         if state.initial_us == 0 { return false; }
         let elapsed = now.saturating_sub(state.armed_at_us);
         if elapsed < state.initial_us { return false; }
-        let total = if state.interval_us > 0 {
-            1 + (elapsed - state.initial_us) / state.interval_us
-        } else {
-            1
-        };
+        let total =
+            1 + (elapsed - state.initial_us).checked_div(state.interval_us).unwrap_or(0);
         total > state.expirations_consumed
     })
 }
@@ -166,11 +163,8 @@ pub(super) fn timerfd_read(timer_id: u32) -> u64 {
     let elapsed = now.saturating_sub(state.armed_at_us);
     if elapsed < state.initial_us { return EAGAIN; }
 
-    let total_expirations = if state.interval_us > 0 {
-        1 + (elapsed - state.initial_us) / state.interval_us
-    } else {
-        1
-    };
+    let total_expirations =
+        1 + (elapsed - state.initial_us).checked_div(state.interval_us).unwrap_or(0);
 
     let new_expirations = total_expirations.saturating_sub(state.expirations_consumed);
     if new_expirations == 0 { return EAGAIN; }

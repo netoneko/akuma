@@ -63,7 +63,9 @@ read?"), a task list, and the subsystem index. Read it before searching docs by 
 docs/runbooks/     Action-first procedures. "Do X, expect to see Y." Debugging + building.
 docs/reference/    Current-state architecture and invariants. No history.
 docs/userspace/    Per-binary docs (pointers to source-co-located docs).
-docs/archive/      200+ historical investigation docs, verbatim. Linked from new docs, never rewritten.
+docs/archive/      200+ historical investigation docs. Linked from new docs. Correct a
+                   doc whose findings a later measurement disproves — a stale "FIXED"
+                   is worse than an edited record; date the correction.
 ```
 
 - Reference subsystem docs live in `docs/reference/subsystems/` (memory, scheduler,
@@ -139,6 +141,15 @@ plain `grep` treat the log as binary.
 If the VM wedges (100% CPU, unresponsive), see `docs/runbooks/recover-wedged-vm.md`.
 
 ## Kernel conventions
+
+**Analyze every new or changed path for allocations.** The best code allocates
+nothing; every kernel allocation is a potential problem — it can fail, it can
+fragment, it can recurse into the allocator on the path that is trying to report
+the allocator broke, and it can turn a bounded operation into an unbounded one.
+Before finishing a change, look at what it allocates and justify each one: prefer
+fixed arrays, `static` per-slot state, stack buffers and borrows over `Vec`,
+`String`, `Box` and `format!`. Fallible allocation beats infallible on any path
+that can run under memory pressure.
 
 **Console output must use `safe_print!` / `tprint!`.** No heap allocation on
 any path that ends at the console — no `format!`, no `String`, no hand-rolled

@@ -1,5 +1,5 @@
 #![cfg_attr(not(test), no_std)]
-#![feature(never_type)]
+// `never_type` became stable in 1.100.0-nightly; the attribute is now a warning.
 #![feature(allocator_api)]
 #![allow(
     clippy::future_not_send,

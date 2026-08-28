@@ -118,7 +118,7 @@ fn mark_lock_held(lock_level: u8) {
         LOCK_LEVEL_NETWORK => 0,
         LOCK_LEVEL_SOCKET_TABLE => 1,
         LOCK_LEVEL_SOCKET => 2,
-        _ => panic!("Unknown lock level: {}", lock_level),
+        _ => panic!("Unknown lock level: {lock_level}"),
     };
     HELD_LOCKS.fetch_or(1 << bit, Ordering::Relaxed);
 }
@@ -129,7 +129,7 @@ fn mark_lock_released(lock_level: u8) {
         LOCK_LEVEL_NETWORK => 0,
         LOCK_LEVEL_SOCKET_TABLE => 1,
         LOCK_LEVEL_SOCKET => 2,
-        _ => panic!("Unknown lock level: {}", lock_level),
+        _ => panic!("Unknown lock level: {lock_level}"),
     };
     HELD_LOCKS.fetch_and(!(1 << bit), Ordering::Relaxed);
 }
@@ -151,7 +151,7 @@ fn can_acquire_lock(lock_level: u8) -> bool {
             // Per-socket lock requires socket table lock to be held first
             held & (1 << 1) != 0
         }
-        _ => panic!("Unknown lock level: {}", lock_level),
+        _ => panic!("Unknown lock level: {lock_level}"),
     }
 }
 

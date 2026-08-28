@@ -365,7 +365,7 @@ pub unsafe fn install_fdt_device_map(dtb_ptr: usize) -> FdtMapOutcome {
     // Geometry must match the map the probe will walk. Cap the slot count at what
     // fits the reserved VA span, so a machine advertising 32 slots (QEMU virt)
     // cannot make the probe walk past the mapping.
-    let slot_cap = if stride == 0 { 1 } else { addr::DEV_VIRTIO_SIZE / stride };
+    let slot_cap = addr::DEV_VIRTIO_SIZE.checked_div(stride).unwrap_or(1);
     addr::set_virtio_geometry(stride, slots.len().clamp(1, slot_cap.max(1)));
 
     FdtMapOutcome::Installed { gicr_pa, moved: gicr_pa != machine::GICR_PA }

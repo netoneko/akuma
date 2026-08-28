@@ -252,7 +252,7 @@ impl Process {
             let (allocated, heap_size) = (runtime().heap_stats)();
             log::debug!("[Process] heap before ELF load: {}MB / {}MB ({}%)",
                 allocated / 1024 / 1024, heap_size / 1024 / 1024,
-                if heap_size > 0 { allocated * 100 / heap_size } else { 0 });
+                (allocated * 100).checked_div(heap_size).unwrap_or(0));
         }
         let mut loaded = source.load(args, env, interp_prefix)?;
 

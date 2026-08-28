@@ -3,8 +3,14 @@
 **Date:** 2026-08-28
 **Scope:** exposed by [`IDENTITY_CACHE_LAZY_RESTAMP.md`](IDENTITY_CACHE_LAZY_RESTAMP.md),
 which made the syscall path fast enough to lose a race it had always been running.
-**Status:** **FIXED.** `pthread_kill_eintr` PHASE1 + PHASE2 pass; the guard is
-that probe, which is a Tier 3 exercise rather than a boot test.
+**Status:** **FIXED — but only after a second fix.** The `DELIVERED_SIGNALS` mask
+below is necessary and is retained; it was **not sufficient**, and the "FIXED"
+claim originally recorded here was wrong. `scripts/verify_trim.py` — which this
+document says was deliberately not run — reports
+`smp1.ex.pthread_kill_eintr: TIMEOUT` on the very commit that landed it, and the
+probe failed **9 of 10** by-hand runs at SMP=1. See
+[§ Re-verified 2026-08-28](#re-verified-2026-08-28--the-first-fix-did-not-hold).
+The guard is that probe, a Tier 3 exercise rather than a boot test.
 
 ## Summary
 
@@ -146,6 +152,129 @@ clippy configurations clean; host tests **858 / 0 failed**.
 **`scripts/verify_trim.py` was NOT run**, deliberately: it opens with a blanket
 `pkill -f qemu-system-aarch64` in four places, and another QEMU belonging to the
 user was running. Run the full gate when the box is free.
+
+## Re-verified 2026-08-28 — the first fix did not hold
+
+Everything above this line is the original investigation, kept as written. This
+section is the correction.
+
+### What the gate said
+
+`scripts/verify_trim.py --tier all` on `649cdb38` (the commit that landed the
+mask), 659 s. Every other measurement sat exactly on the runbook's 2026-08-28
+baseline — clippy 4/4 clean, host tests 858/0, `pass_marker` 99 at both SMP
+levels, `fail_set` empty at both, `host_timejumps: 0` at both, `eager_mprotect`
+KNOWN-FAIL as expected, `smp4.cowstale` UNEXPECTED (the documented pre-existing
+~40 %). One line deviated:
+
+```
+smp1.ex.pthread_kill_eintr: TIMEOUT (still running after 420s)
+smp4.ex.pthread_kill_eintr: ok
+```
+
+SMP=4 passing proves nothing — Lesson 2 below says so, and it was right.
+
+By hand at SMP=1, `MEMORY=2048`, same commit, 10 runs: **1 PASS, 9
+`PHASE1 FAIL: read() never returned; helper thread leaked (handler ran 45-57
+times)`**. Every failing run also *never terminated* — main parked in `futex` on
+`pthread_join` (`uaddr=0x10465f48`) with the phase-2 helper alive at
+`cpu_us=25`, which is why the gate reports TIMEOUT rather than a FAIL marker.
+**A probe that wedges on failure is a weak guard**; that is a second finding.
+
+### How it was identified: measure from userspace, not from the console
+
+Lesson 3 below says "if instrumenting it makes it pass, stop reading code" — but
+the instrument it warns about is a `safe_print!` *in the wait loop*. The way out
+is an instrument that costs the loop nothing: a **userspace** probe
+(`pkdiag.c`) that records to memory and prints only after the run. It answered
+in one build what three rounds of code reading could not:
+
+| Measurement | Reading |
+|---|---|
+| `pthread_kill` vs raw `SYS_tkill` | Identical. Handlers land 100 % on the helper (`main=0 helper=65`) — the tid plumbing is correct |
+| `read` return value | **Always** `-1/EINTR`. Nothing is lost — `DELIVERED_SIGNALS` does its job |
+| 100-signal storm | `read` returns at ~1.20 s, i.e. **28 ms after the 100-attempt window closed**; `handler_total` 65 |
+| **ONE** signal | `read` returns **13-27 ms** later, 1 handler run. So the storm is not the bug |
+| Split of that round trip | `signal->handler` **9.5-20.5 ms**; `handler->read_ret` 0.24-6.9 ms |
+| 50 ms cadence instead of 10 ms | **Passes**, one signal, 13.7 ms |
+| Pipe *data* wake, no signals at all | `write -> read_ret` **~1005 us** — one 1 ms tick |
+
+The last two rows are the whole diagnosis: the mechanism is a **rate**, not a
+lost wakeup. A kernel trace (`uptime_us` stamps, not console prose) pinned the
+rest: `pend -> helper actually running` **4405 us**, then `EINTR` decision ->
+handler-frame setup **185 us**. The tick was 1000 us with no governor demotion,
+so 4.4 ms is ~4 ticks, not one.
+
+### Root cause: two costs, and the mask addressed neither
+
+**1. Eligibility is not execution.** `pend_signal_for_thread` wakes the target
+correctly (the `WAITING->READY` CAS fires, an SGI goes out), and then the thread
+joins the **back of the round-robin queue** — so it waits ~`tick x
+runnable-threads` before it can look at the bit the mask so carefully preserved.
+This is the *same floor* `WAKE_DEADLINE_PREEMPT` was added for on 2026-08-18
+(`SCHEDULING_AUDIT.md`), reached by a different path: that arm covers the
+*deadline* wake-pass, and a signal wake never touches it.
+
+**2. Delivery's priority over resuming the interrupted syscall was unbounded.**
+This is the original document's own sentence — "delivery has strict priority over
+resuming the interrupted syscall, and nothing bounds how long it keeps that
+priority" — and the mask does not bound it. The `EINTR` is computed and stashed
+in the trap frame's `x0`, then a handler frame is installed on top, and
+`rt_sigreturn` takes the next pending signal **immediately** after restoring the
+handler's context. Userspace therefore never executes the instruction after its
+`svc` while signals keep arriving. Linux has the same re-check on its exit path
+and does not starve, because a delivery round trip there costs microseconds;
+Akuma's costs milliseconds, and against a 10 ms sender the chain refills faster
+than it drains.
+
+### The second fix
+
+Both halves are needed; each was measured on its own.
+
+- **`threading::SIGNAL_WAKE_PREEMPT`** — arm the existing one-slot
+  `PREEMPT_WAKE_TID` hint from `pend_signal_for_thread`, so a signal-woken thread
+  runs on the *next* switch. This is a third, independently gated arm on that
+  hint, deliberately **not** the blanket `WAKEUP_LOCALITY_HINT` (still off: it
+  preempts a producer with compute left and cost llama decode 2.5 -> 1.15 tok/s).
+  A signal wake is not a compute handoff, it is rare, and the woken thread's next
+  act is to return to userspace.
+- **`threading::SIGFRAME_ACTIVE`** — bound delivery to **one handler per unit of
+  userspace progress**. Set at the `try_deliver_signal` chokepoint; consulted by
+  `rt_sigreturn`, which now returns to the restored context instead of
+  re-delivering; cleared at syscall entry, with the **same `rt_sigreturn`
+  exemption** the mask already needed and for the same reason. A signal that loses
+  the race stays pending and is delivered at the next kernel exit — which is
+  Linux's model minus the unbounded same-exit re-arm. All three delivery sites are
+  syscall paths, so the flag cannot get stuck.
+
+### Verification
+
+| Tree | Result at SMP=1 |
+|---|---|
+| `649cdb38` (mask only) | **1 / 10** PASS, `handler ran 45-57 times`, failures never terminate |
+| \+ `SIGNAL_WAKE_PREEMPT` | **9 / 10** PASS — better, still margin, still `51 / 38 / 66` handler runs |
+| \+ `SIGFRAME_ACTIVE` | **15 / 15** PASS, and **`after 1 handler runs` on every single run** |
+
+That last column is the point: the first signal interrupts, deterministically,
+instead of the chain racing the sender's cadence. `98 [PASS]` boot suite with
+failure set `{retired_reclaim_ab}` (the documented flake the runbook says to read
+as equal to empty).
+
+### Corrected lessons
+
+1. **A margin fix reads exactly like a real fix at 1 sample.** The original
+   verification ran the probe once, got PASS, and wrote FIXED. The distribution
+   was 1-in-10. Run a probe that guards a *race* ten times, not once — the
+   runbook already says a single SMP=1 exercise run proves nothing.
+2. **"Deliberately not run" is where the bug was.** The one gate this document
+   declined to run is the one that caught it, and the stated reason (someone
+   else's QEMU) had expired long before the claim was written down.
+3. **Lesson 3 needs a corollary.** "Instrumenting it makes it pass" rules out
+   *console* instruments, not all instruments. A userspace probe that records to
+   memory perturbs the loop by nothing and answered this in one build.
+4. **Two mechanisms can wear one symptom.** `PENDING_SIGNALS` being cleared by
+   delivery was real, and fixing it was necessary. It was not what made the
+   probe fail.
 
 ## Lessons
 

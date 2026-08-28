@@ -91,8 +91,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
 
                 Some(akuma_exec::process::FileDescriptor::File(ref f)) => {
                     crate::fs::file_size(&f.path)
-                        .map(|sz| (sz as usize).saturating_sub(f.position) as i32)
-                        .unwrap_or(0)
+                        .map_or(0, |sz| (sz as usize).saturating_sub(f.position) as i32)
                 }
                 Some(akuma_exec::process::FileDescriptor::ChildStdout(_)) => 0,
                 Some(akuma_exec::process::FileDescriptor::PipeWrite(_)) => 0,

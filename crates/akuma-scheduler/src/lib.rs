@@ -362,7 +362,7 @@ impl Sim {
         }
         let queue: VecDeque<usize> = (0..cfg.compute_threads).collect();
         let on_core = vec![None; cfg.cores];
-        let next_packet_at = if cfg.traffic_pps == 0 { u64::MAX } else { 1_000_000 / cfg.traffic_pps };
+        let next_packet_at = 1_000_000u64.checked_div(cfg.traffic_pps).unwrap_or(u64::MAX);
 
         Self {
             cfg,

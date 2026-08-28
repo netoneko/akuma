@@ -585,9 +585,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     // Block until data arrives or process exits
                     akuma_exec::threading::schedule_blocking(u64::MAX);
                 }
-            } else {
-                EBADF
             }
+            EBADF
         }
         // PipeRead: forktest_parent drains child stdout; correlate **`[pipe-read]`** / EFAULT with
         // **`[sigsegv-syscall] x8=63`** (`read`) — **`GO_FORKTEST_DEBUG.md`** Pattern 2.
@@ -1883,7 +1882,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             && flags & (akuma_exec::process::open_flags::O_WRONLY
                 | akuma_exec::process::open_flags::O_RDWR)
                 != 0
-            && crate::vfs::metadata(&path).map(|m| m.is_dir).unwrap_or(false)
+            && crate::vfs::metadata(&path).is_ok_and(|m| m.is_dir)
         {
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(128, "[syscall] openat({:?}): write open of directory -> EISDIR\n", path);

@@ -2917,8 +2917,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
                     0
                 } else {
                     self.read_inode(&state, inode_num)
-                        .map(|i| i.size_lower as u64)
-                        .unwrap_or(0)
+                        .map_or(0, |i| i.size_lower as u64)
                 };
                 DirEntry { name, is_dir, is_symlink, size }
             })

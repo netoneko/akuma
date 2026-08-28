@@ -3106,7 +3106,7 @@ fn test_procfs_box_isolation() {
     let mut buf = [0u8; 64];
     check("box reads host syscalls", fs.read_at(&host_syscalls, 0, &mut buf).is_ok(), false);
     check("box lists host pid dir", fs.read_dir(&host_dir).is_ok(), false);
-    let listed = fs.read_dir("").map(|e| e.iter().any(|d| d.name == host_dir)).unwrap_or(false);
+    let listed = fs.read_dir("").is_ok_and(|e| e.iter().any(|d| d.name == host_dir));
     check("box lists host pid in /proc", listed, false);
 
     // Positive control, same box: its own process must be fully visible, or every
@@ -3116,7 +3116,7 @@ fn test_procfs_box_isolation() {
     if log_on {
         check("box reads own syscalls", fs.read_at(&own_syscalls, 0, &mut buf).is_ok(), true);
     }
-    let own_listed = fs.read_dir("").map(|e| e.iter().any(|d| d.name == format!("{boxed_pid}"))).unwrap_or(false);
+    let own_listed = fs.read_dir("").is_ok_and(|e| e.iter().any(|d| d.name == format!("{boxed_pid}")));
     check("box lists own pid in /proc", own_listed, true);
 
     // --- As the host: the same probes must all succeed. ---
@@ -3856,7 +3856,7 @@ fn test_mkdirat() {
     // 1. Absolute path -> directory created.
     let p = cstr(&format!("{ROOT}/abs_dir"));
     let r = mkdirat(AT_FDCWD, &p);
-    if r != 0 || !crate::vfs::metadata(&format!("{ROOT}/abs_dir")).map(|m| m.is_dir).unwrap_or(false) {
+    if r != 0 || !crate::vfs::metadata(&format!("{ROOT}/abs_dir")).is_ok_and(|m| m.is_dir) {
         fails += 1;
         crate::safe_print!(64, "[Test] mkdirat abs FAILED r={}\n", r);
     }
@@ -3864,7 +3864,7 @@ fn test_mkdirat() {
     // 2. AT_FDCWD-relative (cwd=/tmp).
     let p = cstr("mkdirat_selftest/rel_dir");
     let r = mkdirat(AT_FDCWD, &p);
-    if r != 0 || !crate::vfs::metadata(&format!("{ROOT}/rel_dir")).map(|m| m.is_dir).unwrap_or(false) {
+    if r != 0 || !crate::vfs::metadata(&format!("{ROOT}/rel_dir")).is_ok_and(|m| m.is_dir) {
         fails += 1;
         crate::safe_print!(64, "[Test] mkdirat rel(cwd) FAILED r={}\n", r);
     }
@@ -3873,7 +3873,7 @@ fn test_mkdirat() {
     //    regression family as unlinkat/openat/renameat.
     let p = cstr("dirfd_dir");
     let r = mkdirat(7, &p);
-    if r != 0 || !crate::vfs::metadata(&format!("{ROOT}/sub/dirfd_dir")).map(|m| m.is_dir).unwrap_or(false) {
+    if r != 0 || !crate::vfs::metadata(&format!("{ROOT}/sub/dirfd_dir")).is_ok_and(|m| m.is_dir) {
         fails += 1;
         crate::safe_print!(64, "[Test] mkdirat dirfd FAILED r={}\n", r);
     }
@@ -6559,9 +6559,9 @@ fn test_madvise_dontneed_range_semantics() {
     use crate::syscall::mem::dontneed_zero_range;
 
     // Aligned start: identical to Linux — [start, PAGE_ALIGN(start+len)).
-    assert!(dontneed_zero_range(0x4000, 4096) == (0x4000, 1));
-    assert!(dontneed_zero_range(0x4000, 4097) == (0x4000, 2));
-    assert!(dontneed_zero_range(0x4000, 1) == (0x4000, 1));
+    assert_eq!(dontneed_zero_range(0x4000, 4096), (0x4000, 1));
+    assert_eq!(dontneed_zero_range(0x4000, 4097), (0x4000, 2));
+    assert_eq!(dontneed_zero_range(0x4000, 1), (0x4000, 1));
 
     // Unaligned start: Linux returns EINVAL and clears nothing. This rounds down,
     // so the zeroed range begins BELOW the address the caller named — the bytes in
@@ -6572,7 +6572,7 @@ fn test_madvise_dontneed_range_semantics() {
     assert!(pages == 2, "unaligned start spills into a second page: {pages}");
 
     // Zero length still clears the head page when the start is unaligned.
-    assert!(dontneed_zero_range(0x4800, 0) == (0x4000, 1));
+    assert_eq!(dontneed_zero_range(0x4800, 0), (0x4000, 1));
 
     // The per-page rule. `cow_ref` counts ADDRESS SPACES and the first share
     // inserts 2, so 2 is the smallest value that means "someone else can see this
@@ -6580,13 +6580,13 @@ fn test_madvise_dontneed_range_semantics() {
     // page. 1 is a peer that has already gone (exited, or broke CoW itself), 0 was
     // never shared; both are ours alone and take the cheap path.
     use crate::syscall::mem::{DontneedAction, dontneed_page_action};
-    assert!(dontneed_page_action(false, 0) == DontneedAction::Nothing);
+    assert_eq!(dontneed_page_action(false, 0), DontneedAction::Nothing);
     assert!(dontneed_page_action(false, 7) == DontneedAction::Nothing,
         "an unmapped VA has nothing to break, whatever the frame's count says");
-    assert!(dontneed_page_action(true, 0) == DontneedAction::ZeroInPlace);
-    assert!(dontneed_page_action(true, 1) == DontneedAction::ZeroInPlace);
-    assert!(dontneed_page_action(true, 2) == DontneedAction::BreakSharing);
-    assert!(dontneed_page_action(true, u16::MAX) == DontneedAction::BreakSharing);
+    assert_eq!(dontneed_page_action(true, 0), DontneedAction::ZeroInPlace);
+    assert_eq!(dontneed_page_action(true, 1), DontneedAction::ZeroInPlace);
+    assert_eq!(dontneed_page_action(true, 2), DontneedAction::BreakSharing);
+    assert_eq!(dontneed_page_action(true, u16::MAX), DontneedAction::BreakSharing);
 
     console::print("[Test] madvise_dontneed_range PASSED\n");
 }
@@ -7801,13 +7801,12 @@ fn test_elftest() {
                 ELFTEST_PATH
             );
             panic!("Required test binary not found");
-        } else {
-            crate::safe_print!(96, 
-                "[Test] {} not found, skipping ELF loading test\n",
-                ELFTEST_PATH
-            );
-            return;
         }
+        crate::safe_print!(96, 
+            "[Test] {} not found, skipping ELF loading test\n",
+            ELFTEST_PATH
+        );
+        return;
     }
 
     crate::safe_print!(96, "[Test] Executing {}...\n", ELFTEST_PATH);
@@ -7842,13 +7841,12 @@ fn test_stdcheck() {
                 STDCHECK_PATH
             );
             panic!("Required test binary not found");
-        } else {
-            crate::safe_print!(96, 
-                "[Test] {} not found, skipping mmap allocator test\n",
-                STDCHECK_PATH
-            );
-            return;
         }
+        crate::safe_print!(96, 
+            "[Test] {} not found, skipping mmap allocator test\n",
+            STDCHECK_PATH
+        );
+        return;
     }
 
     crate::safe_print!(128, "[Test] Executing {} with mmap allocator...\n", STDCHECK_PATH);
@@ -7908,9 +7906,8 @@ fn test_echo2() {
             if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
                 crate::safe_print!(64, "[Test] {} not found - FAIL\n", ECHO2_PATH);
                 panic!("Required test binary not found");
-            } else {
-                crate::safe_print!(64, "[Test] {} not found, skipping test\n", ECHO2_PATH);
             }
+            crate::safe_print!(64, "[Test] {} not found, skipping test\n", ECHO2_PATH);
         }
     }
 }
@@ -7921,10 +7918,9 @@ fn check_binary_exists(path: &str) -> bool {
         if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
             crate::safe_print!(64, "[Test] {} not found - FAIL\n", path);
             panic!("Required test binary not found");
-        } else {
-            crate::safe_print!(96, "[Test] {} not found, skipping procfs test\n", path);
-            return false;
         }
+        crate::safe_print!(96, "[Test] {} not found, skipping procfs test\n", path);
+        return false;
     }
     true
 }
@@ -11645,10 +11641,9 @@ fn test_child_stdout_blocking_read() {
         if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
             crate::safe_print!(64, "[Test] {} not found - FAIL\n", path);
             panic!("Required test binary not found");
-        } else {
-            crate::safe_print!(96, "[Test] {} not found, skipping child_stdout_blocking_read test\n", path);
-            return;
         }
+        crate::safe_print!(96, "[Test] {} not found, skipping child_stdout_blocking_read test\n", path);
+        return;
     }
 
     let args = ["/bin/hello", "1", "100"];

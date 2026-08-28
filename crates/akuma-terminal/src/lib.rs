@@ -240,7 +240,7 @@ impl TerminalState {
                 if self.canon_buffer.is_empty() {
                     eof = true;
                 } else {
-                    let line: alloc::vec::Vec<u8> = self.canon_buffer.drain(..).collect();
+                    let line: alloc::vec::Vec<u8> = core::mem::take(&mut self.canon_buffer);
                     self.canon_ready.extend(line);
                 }
             } else if byte == b'\n' {
@@ -252,7 +252,7 @@ impl TerminalState {
                         echo.push(b'\n');
                     }
                 }
-                let line: alloc::vec::Vec<u8> = self.canon_buffer.drain(..).collect();
+                let line: alloc::vec::Vec<u8> = core::mem::take(&mut self.canon_buffer);
                 self.canon_ready.extend(line);
             } else if self.canon_buffer.len() < MAX_CANON {
                 self.canon_buffer.push(byte);
@@ -308,7 +308,7 @@ impl TerminalState {
     /// Used when the channel closes so partial input isn't lost.
     pub fn flush_canon_buffer(&mut self) {
         if !self.canon_buffer.is_empty() {
-            let line: alloc::vec::Vec<u8> = self.canon_buffer.drain(..).collect();
+            let line: alloc::vec::Vec<u8> = core::mem::take(&mut self.canon_buffer);
             self.canon_ready.extend(line);
         }
     }

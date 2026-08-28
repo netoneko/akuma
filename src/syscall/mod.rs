@@ -394,9 +394,13 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // that is about to resume — the exact starvation this mask fixes. See
     // docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md.
     if syscall_num != nr::RT_SIGRETURN {
-        akuma_exec::threading::clear_delivered_signals(
-            akuma_exec::threading::current_thread_id(),
-        );
+        let slot = akuma_exec::threading::current_thread_id();
+        akuma_exec::threading::clear_delivered_signals(slot);
+        // Reaching any other syscall proves userspace ran, which is the unit of
+        // progress that re-arms signal delivery. Same `rt_sigreturn` exemption and
+        // for the same reason: the handler returns THROUGH it, so userspace has not
+        // run yet at that point.
+        akuma_exec::threading::clear_sigframe_active(slot);
     }
     // One resolution per excursion, from the per-thread identity cache
     // (`table::THREAD_IDENTITY`): the tgid + leader `Process` pair the whole

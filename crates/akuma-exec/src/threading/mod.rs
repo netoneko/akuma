@@ -622,6 +622,40 @@ static DISPLACE_DEFER: [AtomicU8; MAX_THREADS] = {
 /// the rest wait their rotation as before.
 const WAKE_DEADLINE_PREEMPT: bool = true;
 
+/// Signal-wake preemption (2026-08-28,
+/// `docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md` §"Re-verified"):
+/// arm [`PREEMPT_WAKE_TID`] when [`pend_signal_for_thread`] promotes a thread
+/// READY, so a thread that must report `EINTR` runs on the NEXT switch instead
+/// of a full round-robin pass later.
+///
+/// This is the third, independently-gated arm on the same one-slot hint, and it
+/// exists because the other two do not cover signals:
+///
+/// - [`WAKEUP_LOCALITY_HINT`] arms it for *every* explicit `wake()`
+///   (futex/cond). Measured harmful and stays off — it preempts a producer that
+///   still has compute left (llama decode 2.5 -> 1.15 tok/s).
+/// - [`WAKE_DEADLINE_PREEMPT`] arms it from the *deadline* wake-pass only, so a
+///   signal-woken thread never sees it.
+///
+/// The measurement that motivates this arm: `pthread_kill` a thread blocked in
+/// a pipe `read`, single signal, SMP=1, 1 ms tick. The pending bit is observed
+/// correctly (`DELIVERED_SIGNALS` does its job) and the `EINTR` decision ->
+/// handler-frame setup takes 185 us — but the woken thread waits **4.4 ms** to
+/// be picked, and needs a further round to get back out to EL0, for a
+/// **11-27 ms** per-signal round trip. jobserver-rs re-signals every **10 ms**
+/// and gives up after 100 attempts, so the report lands after the caller has
+/// already declared the thread leaked. That is the same "eligibility is not
+/// execution" floor [`WAKE_DEADLINE_PREEMPT`] was added for, reached by a
+/// different path.
+///
+/// Why the llama regression does not apply here: a signal wake is not a
+/// compute-handoff. It means "this thread must observe something now", it is
+/// rare (not a per-iteration hot path), and the woken thread's next act is to
+/// return to userspace rather than to consume a work item a peer is still
+/// producing. Fairness is unchanged from the deadline arm: the hint fires once
+/// per wake and the preempted thread stays READY, keeping its rotation slot.
+const SIGNAL_WAKE_PREEMPT: bool = true;
+
 /// Real shared-kernel SMP: which thread slots are per-core idle threads. Idle threads
 /// are skipped by the round-robin scan — a core only ever runs ITS OWN idle, chosen
 /// explicitly as the fallback in `schedule_indices` — so one core can never pick
@@ -735,6 +769,67 @@ static DELIVERED_SIGNALS: [AtomicU64; MAX_THREADS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_THREADS]
 };
+
+/// Per-thread "a signal handler frame is on the stack and userspace has not run
+/// since we installed it".
+///
+/// # Why delivery needs a bound, not just a record
+///
+/// [`DELIVERED_SIGNALS`] makes the *interrupt* observable. It does not make the
+/// interrupted syscall's **return value** observable, and those are different
+/// problems. The `EINTR` is computed by the wait loop and stashed in the trap
+/// frame's `x0`, but the return-to-EL0 path then installs a handler frame on top
+/// of it, and `rt_sigreturn` takes the next pending signal *immediately* after
+/// restoring the handler's context. So userspace never executes the instruction
+/// after its `svc` while signals keep arriving: the handler runs, and runs, and
+/// the caller never sees `-1/EINTR`.
+///
+/// Linux has the same re-check on its exit path and does not starve, because a
+/// delivery round trip there costs microseconds. Akuma's costs milliseconds —
+/// dispatch is tick-quantised, and the round trip needs two scheduling rounds
+/// (measured 11-27 ms at a 1 ms tick, SMP=1). Against a sender at 10 ms —
+/// jobserver-rs's exact cadence — the chain refills faster than it drains, and
+/// that is unbounded: nothing in it depends on how long the caller has waited.
+///
+/// This flag is the bound. Delivery keeps its priority over resuming the
+/// interrupted syscall for exactly **one** handler per unit of userspace
+/// progress. A signal that loses the race stays pending and is delivered at the
+/// next kernel exit — the next syscall, or the next timer tick at the latest —
+/// which is Linux's own "signals are delivered at kernel exit" model, minus the
+/// unbounded same-exit re-arm.
+///
+/// Set in `try_deliver_signal` (the single delivery chokepoint). Cleared
+/// wherever userspace demonstrably ran: syscall entry — **except
+/// `rt_sigreturn`**, which is the syscall the handler returns *through*, so
+/// clearing there would erase the very evidence this flag exists to carry — and
+/// the timer/IRQ delivery path, which by definition interrupted running
+/// userspace.
+static SIGFRAME_ACTIVE: [AtomicBool; MAX_THREADS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; MAX_THREADS]
+};
+
+/// Note that a handler frame was just installed for `slot`. See [`SIGFRAME_ACTIVE`].
+pub fn note_sigframe_installed(slot: usize) {
+    if slot < MAX_THREADS {
+        SIGFRAME_ACTIVE[slot].store(true, Ordering::Release);
+    }
+}
+
+/// Is a handler frame outstanding for `slot` with no userspace progress since?
+/// `rt_sigreturn` consults this to decide whether re-delivering now would starve
+/// the interrupted syscall's return.
+pub fn sigframe_active(slot: usize) -> bool {
+    slot < MAX_THREADS && SIGFRAME_ACTIVE[slot].load(Ordering::Acquire)
+}
+
+/// Record that userspace has run for `slot`, so the next delivery may proceed.
+pub fn clear_sigframe_active(slot: usize) {
+    if slot < MAX_THREADS {
+        SIGFRAME_ACTIVE[slot].store(false, Ordering::Release);
+    }
+}
 
 /// Record that `sig` was delivered to `slot`. Called from every delivery site in
 /// `src/exceptions.rs`, right where `take_pending_signal` clears the pending bit.
@@ -1302,7 +1397,7 @@ pub fn has_pending_kill(tid: usize) -> bool {
 /// process teardown (address space, fds) is already in progress.
 pub fn mark_thread_ready(idx: usize) {
     if idx < MAX_THREADS {
-        let _ = THREAD_STATES[idx].fetch_update(
+        let _ = THREAD_STATES[idx].try_update(
             Ordering::SeqCst,
             Ordering::SeqCst,
             |s| (s != thread_state::TERMINATED).then_some(thread_state::READY),
@@ -2680,7 +2775,7 @@ impl ThreadPool {
                     }
                     // Atomic re-READY of the outgoing thread — see commit_switch for
                     // why this must not be a check-then-store.
-                    let _ = THREAD_STATES[current_idx].fetch_update(
+                    let _ = THREAD_STATES[current_idx].try_update(
                         Ordering::SeqCst,
                         Ordering::SeqCst,
                         |s| (s != thread_state::TERMINATED && s != thread_state::WAITING)
@@ -2853,7 +2948,7 @@ impl ThreadPool {
         // resurrecting a killed thread whose address space teardown is already
         // under way. It would then be picked by a peer and run on freed (and
         // possibly recycled) page tables.
-        let _ = THREAD_STATES[current_idx].fetch_update(
+        let _ = THREAD_STATES[current_idx].try_update(
             Ordering::SeqCst,
             Ordering::SeqCst,
             |s| (s != thread_state::TERMINATED && s != thread_state::WAITING)
@@ -3871,7 +3966,7 @@ fn publish_waiting_and_take_pending_wake(tid: usize, wake_time_us: u64) -> bool 
 /// overwritten by the resume. Only ever called by the thread itself as it comes out
 /// of a park, where every state except TERMINATED means "we own the slot again".
 fn resume_running_unless_terminated(tid: usize) {
-    let _ = THREAD_STATES[tid].fetch_update(
+    let _ = THREAD_STATES[tid].try_update(
         Ordering::SeqCst,
         Ordering::SeqCst,
         |s| (s != thread_state::TERMINATED).then_some(thread_state::RUNNING),
@@ -4087,6 +4182,17 @@ pub fn pend_signal_for_thread(tid: usize, sig: u32) {
         let bit = 1u64 << (sig - 1);
         PENDING_SIGNALS[tid].fetch_or(bit, Ordering::Release);
         get_waker_for_thread(tid).wake();
+        // A signal is only useful if the target gets to look at it. `wake()` has
+        // made the slot READY, which is eligibility, not execution: without the
+        // hint the thread joins the back of the round-robin queue and does not
+        // report its `EINTR` for ~tick x runnable-threads. See
+        // [`SIGNAL_WAKE_PREEMPT`] for the measurement.
+        if SIGNAL_WAKE_PREEMPT
+            && tid != current_thread_id()
+            && THREAD_STATES[tid].load(Ordering::SeqCst) == thread_state::READY
+        {
+            PREEMPT_WAKE_TID.store(tid, Ordering::SeqCst);
+        }
     }
 }
 

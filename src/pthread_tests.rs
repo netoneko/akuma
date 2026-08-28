@@ -127,28 +127,28 @@ fn test_sigprocmask_block_unblock_setmask() {
     set_bypass(true);
 
     // SETMASK replaces wholesale.
-    assert!(sys_sigprocmask(SIG_SETMASK, bit(SIGUSR1) | bit(SIGUSR2)) == 0);
+    assert_eq!(sys_sigprocmask(SIG_SETMASK, bit(SIGUSR1) | bit(SIGUSR2)), 0);
     assert!(
         sys_get_mask() == bit(SIGUSR1) | bit(SIGUSR2),
         "SETMASK did not install the requested set"
     );
 
     // BLOCK adds SIGTERM without disturbing the rest.
-    assert!(sys_sigprocmask(SIG_BLOCK, bit(SIGTERM)) == 0);
+    assert_eq!(sys_sigprocmask(SIG_BLOCK, bit(SIGTERM)), 0);
     assert!(
         sys_get_mask() == bit(SIGUSR1) | bit(SIGUSR2) | bit(SIGTERM),
         "BLOCK did not OR the new bit"
     );
 
     // UNBLOCK clears just SIGUSR1.
-    assert!(sys_sigprocmask(SIG_UNBLOCK, bit(SIGUSR1)) == 0);
+    assert_eq!(sys_sigprocmask(SIG_UNBLOCK, bit(SIGUSR1)), 0);
     assert!(
         sys_get_mask() == bit(SIGUSR2) | bit(SIGTERM),
         "UNBLOCK did not clear exactly the requested bit"
     );
 
     // Restore.
-    assert!(sys_sigprocmask(SIG_SETMASK, 0) == 0);
+    assert_eq!(sys_sigprocmask(SIG_SETMASK, 0), 0);
     set_bypass(false);
     console::print("  [PASS] test_sigprocmask_block_unblock_setmask\n");
 }
@@ -157,18 +157,18 @@ fn test_sigprocmask_block_unblock_setmask() {
 fn test_sigprocmask_cannot_block_kill_stop() {
     set_bypass(true);
 
-    assert!(sys_sigprocmask(SIG_SETMASK, bit(SIGKILL) | bit(SIGSTOP) | bit(SIGUSR1)) == 0);
+    assert_eq!(sys_sigprocmask(SIG_SETMASK, bit(SIGKILL) | bit(SIGSTOP) | bit(SIGUSR1)), 0);
     let m = sys_get_mask();
     assert!(m & bit(SIGKILL) == 0, "SIGKILL must not be blockable");
     assert!(m & bit(SIGSTOP) == 0, "SIGSTOP must not be blockable");
     assert!(m & bit(SIGUSR1) != 0, "blockable signal was lost");
 
     // BLOCK of KILL/STOP is also a no-op for those bits.
-    assert!(sys_sigprocmask(SIG_BLOCK, bit(SIGKILL) | bit(SIGSTOP)) == 0);
+    assert_eq!(sys_sigprocmask(SIG_BLOCK, bit(SIGKILL) | bit(SIGSTOP)), 0);
     let m = sys_get_mask();
-    assert!(m & (bit(SIGKILL) | bit(SIGSTOP)) == 0);
+    assert_eq!(m & (bit(SIGKILL) | bit(SIGSTOP)), 0);
 
-    assert!(sys_sigprocmask(SIG_SETMASK, 0) == 0);
+    assert_eq!(sys_sigprocmask(SIG_SETMASK, 0), 0);
     set_bypass(false);
     console::print("  [PASS] test_sigprocmask_cannot_block_kill_stop\n");
 }
@@ -481,8 +481,8 @@ fn test_take_pending_respects_mask_and_order() {
     // Lowest-numbered first.
     threading::pend_signal_for_thread(slot, SIGUSR2); // 12
     threading::pend_signal_for_thread(slot, SIGUSR1); // 10
-    assert!(threading::take_pending_signal(0) == Some(SIGUSR1));
-    assert!(threading::take_pending_signal(0) == Some(SIGUSR2));
+    assert_eq!(threading::take_pending_signal(0), Some(SIGUSR1));
+    assert_eq!(threading::take_pending_signal(0), Some(SIGUSR2));
     assert!(threading::take_pending_signal(0).is_none());
 
     threading::pend_signal_for_thread(slot, 0); // cleanup
@@ -494,7 +494,7 @@ fn test_tkill_validation_and_signal_boundary() {
     let slot = threading::current_thread_id() as u64;
 
     // sig 0 is a no-op success (existence probe).
-    assert!(crate::syscall::handle_syscall(NR_TKILL, &[slot, 0, 0, 0, 0, 0]) == 0);
+    assert_eq!(crate::syscall::handle_syscall(NR_TKILL, &[slot, 0, 0, 0, 0, 0]), 0);
     // Out-of-range signal → EINVAL.
     assert!(
         crate::syscall::handle_syscall(NR_TKILL, &[slot, 65, 0, 0, 0, 0]) == EINVAL,
@@ -508,8 +508,8 @@ fn test_tkill_validation_and_signal_boundary() {
         "sig 64 must be accepted (MAX_SIGNALS boundary)"
     );
     // tgkill forwards with the same validation.
-    assert!(crate::syscall::handle_syscall(NR_TGKILL, &[0, slot, 0, 0, 0, 0]) == 0);
-    assert!(crate::syscall::handle_syscall(NR_TGKILL, &[0, slot, 65, 0, 0, 0]) == EINVAL);
+    assert_eq!(crate::syscall::handle_syscall(NR_TGKILL, &[0, slot, 0, 0, 0, 0]), 0);
+    assert_eq!(crate::syscall::handle_syscall(NR_TGKILL, &[0, slot, 65, 0, 0, 0]), EINVAL);
 
     threading::pend_signal_for_thread(slot as usize, 0); // clear any stray pend
     console::print("  [PASS] test_tkill_validation_and_signal_boundary\n");
@@ -663,16 +663,16 @@ fn test_sigaltstack_lifecycle() {
     // Start from a known disabled state.
     threading::set_sigaltstack(slot, 0, 0, SS_DISABLE);
     let mut out = StackT { sp: 0, flags: 0, _pad: 0, size: 0 };
-    assert!(
-        crate::syscall::handle_syscall(NR_SIGALTSTACK, &[0, &raw mut out as u64, 0, 0, 0, 0]) == 0
+    assert_eq!(
+        crate::syscall::handle_syscall(NR_SIGALTSTACK, &[0, &raw mut out as u64, 0, 0, 0, 0]), 0
     );
     assert!(out.flags == SS_DISABLE && out.sp == 0, "default sigaltstack not disabled");
 
     // Set a valid stack.
     let mut backing = [0u8; 8192];
     let ss = StackT { sp: backing.as_mut_ptr() as u64, flags: 0, _pad: 0, size: 8192 };
-    assert!(
-        crate::syscall::handle_syscall(NR_SIGALTSTACK, &[&raw const ss as u64, 0, 0, 0, 0, 0]) == 0
+    assert_eq!(
+        crate::syscall::handle_syscall(NR_SIGALTSTACK, &[&raw const ss as u64, 0, 0, 0, 0, 0]), 0
     );
     let mut got = StackT { sp: 0, flags: 0, _pad: 0, size: 0 };
     crate::syscall::handle_syscall(NR_SIGALTSTACK, &[0, &raw mut got as u64, 0, 0, 0, 0]);
@@ -779,16 +779,16 @@ fn test_gettid_unique_per_thread() {
 /// signal 64 is in range (returns ENOSYS in boot context, not EINVAL).
 fn test_sigaction_validation() {
     // sig 0
-    assert!(crate::syscall::handle_syscall(NR_RT_SIGACTION, &[0, 0, 0, 8, 0, 0]) == EINVAL);
+    assert_eq!(crate::syscall::handle_syscall(NR_RT_SIGACTION, &[0, 0, 0, 8, 0, 0]), EINVAL);
     // SIGKILL / SIGSTOP can't be caught.
-    assert!(
-        crate::syscall::handle_syscall(NR_RT_SIGACTION, &[u64::from(SIGKILL), 0, 0, 8, 0, 0]) == EINVAL
+    assert_eq!(
+        crate::syscall::handle_syscall(NR_RT_SIGACTION, &[u64::from(SIGKILL), 0, 0, 8, 0, 0]), EINVAL
     );
-    assert!(
-        crate::syscall::handle_syscall(NR_RT_SIGACTION, &[u64::from(SIGSTOP), 0, 0, 8, 0, 0]) == EINVAL
+    assert_eq!(
+        crate::syscall::handle_syscall(NR_RT_SIGACTION, &[u64::from(SIGSTOP), 0, 0, 8, 0, 0]), EINVAL
     );
     // Out of range.
-    assert!(crate::syscall::handle_syscall(NR_RT_SIGACTION, &[65, 0, 0, 8, 0, 0]) == EINVAL);
+    assert_eq!(crate::syscall::handle_syscall(NR_RT_SIGACTION, &[65, 0, 0, 8, 0, 0]), EINVAL);
     // Top valid signal: in range, so it passes validation and only then fails
     // for lack of a current process in boot context — ENOSYS, NOT EINVAL.
     let r = crate::syscall::handle_syscall(NR_RT_SIGACTION, &[64, 0, 0, 8, 0, 0]);
