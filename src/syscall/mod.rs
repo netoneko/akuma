@@ -22,6 +22,10 @@ pub use akuma_exec::mmu::user_access::{
 // `copy_from_user_byte`, which reads a NUL-terminated string one byte at a time and
 // therefore has no range to validate — see its doc comment.
 use akuma_exec::mmu::user_access::copy_from_user_safe;
+// The excursion shape crate: which counter bucket a number falls in, which
+// hooks run, and where the epilogue's identity comes from. Decisions only — see
+// `EXCURSION_HOOKS` and docs/archive/AKUMA_EXTRACT_SYSCALLS.md §7.
+use akuma_syscalls::Counter;
 
 #[cfg(feature = "sc-aio")]
 mod aio;
@@ -66,6 +70,9 @@ pub mod proc;
 pub mod unixsock;
 pub mod signal;
 mod sync;
+/// `akuma_get_version` — the build identity packed into the return register,
+/// and the floor control for the syscall boundary. See the module docs.
+pub mod version;
 mod term;
 /// Itimers, clock_gettime/settime/getres, nanosleep, adjtimex — moved to the
 /// `akuma-time` crate 2026-08-25 (docs/archive/MISSING_NTP_SYSCALLS.md); this
@@ -378,10 +385,56 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
     }
 }
 
+/// This build's excursion gates, handed to `akuma-syscalls` as data.
+///
+/// The crate takes the config consts as a parameter rather than reading them,
+/// which is what makes every gate combination reachable from a host test —
+/// `PROCESS_SYSCALL_STATS` and `PROC_SYSCALL_LOG_ENABLED` are `true` in every
+/// profile but `kernel_profile_extreme`, so the off-arms were previously only
+/// testable by building a different kernel.
+///
+/// `identity` is the one field that is a decision rather than a mirror of an
+/// existing const — see `akuma_syscalls::IdentitySource` and the note on
+/// `EPILOGUE_IDENTITY` below.
+const EXCURSION_HOOKS: akuma_syscalls::HookConfig = akuma_syscalls::HookConfig {
+    process_stats: crate::config::PROCESS_SYSCALL_STATS,
+    proc_log: crate::config::PROC_SYSCALL_LOG_ENABLED,
+    debug_io: crate::config::SYSCALL_DEBUG_IO_ENABLED,
+    errno_diag: crate::config::SYSCALL_ERRNO_DIAG_ENABLED,
+    identity_audit: crate::config::IDENTITY_AUDIT,
+    identity: EPILOGUE_IDENTITY,
+};
+
+/// Which resolution the epilogue writes through.
+///
+/// `Prologue` — reuse the pointer resolved before the dispatch — is what
+/// shipped from the syscall audit until 2026-08-28, and it is a use-after-free:
+/// `akuma_syscalls::slot` enumerates the table's `claim / retire / reclaim /
+/// stamp / validate` lifecycle and finds a witness **two peer operations deep**
+/// (`Retire(0)`, `Reclaim(0)`), which is `kill_thread_group` retiring a sibling
+/// that is still inside a blocking syscall, followed by any idle core's reclaim
+/// drain 10 ms later. `IDENTITY_CACHE_SMP_REVIEW.md` Finding A argued this;
+/// the crate's search settles it, and the same search finds no witness for
+/// `Reresolve` anywhere in its bound.
+///
+/// Re-reading costs one cache read — a validated slot-state load and a
+/// generation load — against the lock + map walk + IRQ-masked table scan the
+/// pre-cache epilogue paid twice for the same guard. Measured: no change to the
+/// `getpid` floor (230 ns either way, best of 100x100).
+pub const EPILOGUE_IDENTITY: akuma_syscalls::IdentitySource =
+    akuma_syscalls::IdentitySource::Reresolve;
+
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // Outer span for `read-profile` (ZST otherwise): started before the pid
     // lookup and counter bumps below, so `hs - sr` names this prologue/epilogue.
     let rp_span = crate::syscall::utils::read_profile::Span::new();
+    // The generic shape of this excursion: which counter bucket, whether the
+    // signal-state clear applies, whether each hook runs, and where the
+    // epilogue gets its identity. Decisions only — every effect below is still
+    // performed here. All of it is `const fn` over plain data, so it inlines
+    // into the branches it replaced rather than adding a call.
+    let excursion = akuma_syscalls::Excursion::new(syscall_num, EXCURSION_HOOKS);
+    let plan = excursion.prologue();
     CURRENT_SYSCALL_NR.store(syscall_num, Ordering::Relaxed);
     crate::syscall::utils::read_profile::floor_laps::start(syscall_num);
 
@@ -392,8 +445,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // `rt_sigreturn` (139) is deliberately exempt: the handler returns THROUGH it,
     // so clearing there would erase the record belonging to the blocking syscall
     // that is about to resume — the exact starvation this mask fixes. See
-    // docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md.
-    if syscall_num != nr::RT_SIGRETURN {
+    // docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md and
+    // `akuma_syscalls::clears_signal_state`, which is where that exemption now
+    // has a test.
+    if plan.clear_signal_state {
         let slot = akuma_exec::threading::current_thread_id();
         akuma_exec::threading::clear_delivered_signals(slot);
         // Reaching any other syscall proves userspace ran, which is the unit of
@@ -436,43 +491,56 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     );
 
 
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED && syscall_num != nr::WRITE && syscall_num != nr::READ && syscall_num != nr::READV && syscall_num != nr::WRITEV && syscall_num != nr::IOCTL && syscall_num != nr::PSELECT6 && syscall_num != nr::PPOLL && syscall_num != nr::BRK && syscall_num != nr::MMAP && syscall_num != nr::MUNMAP && syscall_num != nr::MREMAP && syscall_num != nr::CLOSE && syscall_num != nr::FSTAT && syscall_num != nr::LSEEK && syscall_num != nr::RT_SIGPROCMASK && syscall_num != nr::NANOSLEEP && syscall_num != nr::WAITPID && syscall_num != nr::UPTIME && syscall_num != nr::FUTEX && syscall_num != nr::MEMBARRIER && syscall_num != nr::RT_SIGACTION && syscall_num != nr::SCHED_SETAFFINITY && syscall_num != nr::SCHED_GETAFFINITY {
+    // The suppression list this gate used to spell inline lives in
+    // `akuma_syscalls::debug_io_suppressed`, which is the only place a test can
+    // reach it: no shipping profile sets `SYSCALL_DEBUG_IO_ENABLED`, so a number
+    // silently added to or dropped from the list changes nothing observable
+    // until someone turns the flag on to debug something else.
+    if plan.debug_print {
         crate::safe_print!(128, "[SC] nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x}\n", syscall_num, args[0], args[1], args[2]);
     }
 
     syscall_counters::inc_total();
-    match syscall_num {
-        nr::MMAP => { syscall_counters::inc_mmap((args[1] as usize).div_ceil(4096)); }
-        nr::MUNMAP => { syscall_counters::inc_munmap(); }
-        nr::BRK => { syscall_counters::inc_brk(); }
-        nr::READ | nr::READV | nr::PREAD64 | nr::PREADV | nr::PREADV2 => { syscall_counters::inc_read(); }
-        nr::WRITE | nr::WRITEV | nr::PWRITE64 | nr::PWRITEV | nr::PWRITEV2 => { syscall_counters::inc_write(); }
-        nr::OPENAT => { syscall_counters::inc_openat(); }
-        nr::CLOSE => { syscall_counters::inc_close(); }
-        nr::MPROTECT => { syscall_counters::inc_mprotect(); }
-        nr::FUTEX => { syscall_counters::inc_futex(); }
-        nr::RT_SIGPROCMASK => { syscall_counters::inc_sigprocmask(); }
-        nr::RT_SIGACTION => { syscall_counters::inc_sigaction(); }
-        nr::CLOCK_GETTIME => { syscall_counters::inc_clock(); }
-        nr::IOCTL => { syscall_counters::inc_ioctl(); }
-        nr::FSTAT | nr::NEWFSTATAT => { syscall_counters::inc_fstat(); }
-        nr::SCHED_YIELD => { syscall_counters::inc_yield(); }
-        nr::MADVISE => { syscall_counters::inc_madvise(); }
-        nr::MREMAP => { syscall_counters::inc_mremap(); }
-        nr::LSEEK => { syscall_counters::inc_lseek(); }
-        nr::GETRANDOM => { syscall_counters::inc_getrandom(); }
-        nr::GETPID => { syscall_counters::inc_getpid(); }
-        nr::FCNTL => { syscall_counters::inc_fcntl(); }
-        _ => { syscall_counters::inc_other(syscall_num); }
+    // Classification is `akuma_syscalls::counter_for` (host-tested against the
+    // arms this `match` used to hold); the counters themselves stay here. Both
+    // halves are `match`es over a C-like enum with no indirection between them,
+    // so this compiles back to the single dispatch it replaced — checked by
+    // measurement, not assumed.
+    match plan.counter {
+        // The one arm with a payload: `pages` comes from `args[1]`, which the
+        // classifier never sees.
+        Counter::Mmap => { syscall_counters::inc_mmap((args[1] as usize).div_ceil(4096)); }
+        Counter::Munmap => { syscall_counters::inc_munmap(); }
+        Counter::Brk => { syscall_counters::inc_brk(); }
+        Counter::Read => { syscall_counters::inc_read(); }
+        Counter::Write => { syscall_counters::inc_write(); }
+        Counter::Openat => { syscall_counters::inc_openat(); }
+        Counter::Close => { syscall_counters::inc_close(); }
+        Counter::Mprotect => { syscall_counters::inc_mprotect(); }
+        Counter::Futex => { syscall_counters::inc_futex(); }
+        Counter::SigProcMask => { syscall_counters::inc_sigprocmask(); }
+        Counter::SigAction => { syscall_counters::inc_sigaction(); }
+        Counter::Clock => { syscall_counters::inc_clock(); }
+        Counter::Ioctl => { syscall_counters::inc_ioctl(); }
+        Counter::Fstat => { syscall_counters::inc_fstat(); }
+        Counter::Yield => { syscall_counters::inc_yield(); }
+        Counter::Madvise => { syscall_counters::inc_madvise(); }
+        Counter::Mremap => { syscall_counters::inc_mremap(); }
+        Counter::Lseek => { syscall_counters::inc_lseek(); }
+        Counter::Getrandom => { syscall_counters::inc_getrandom(); }
+        Counter::Getpid => { syscall_counters::inc_getpid(); }
+        Counter::Fcntl => { syscall_counters::inc_fcntl(); }
+        Counter::Other => { syscall_counters::inc_other(syscall_num); }
     }
 
-    let track_time = crate::config::PROCESS_SYSCALL_STATS;
-    if track_time && let Some((_, proc)) = cur {
+    if plan.record_stats && let Some((_, proc)) = cur {
         proc.syscall_stats.inc(syscall_num);
     }
 
-    let need_timing = track_time || crate::config::PROC_SYSCALL_LOG_ENABLED;
-    let t0 = if need_timing { crate::timer::uptime_us() } else { 0 };
+    // One clock read serves both hooks; `need_timing` is their union, decided
+    // once in the prologue and read again in the epilogue rather than
+    // recomputed there.
+    let t0 = if plan.need_timing { crate::timer::uptime_us() } else { 0 };
     crate::syscall::utils::read_profile::floor_laps::lap(
         crate::syscall::utils::read_profile::F_LAP_HOOKS,
     );
@@ -567,6 +635,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLONE3 => proc::sys_clone3(args[0], args[1] as usize),
         nr::EXECVE => proc::sys_execve(args[0], args[1], args[2]),
         nr::UPTIME => time::sys_uptime(),
+        // The floor control: no arguments read, no user memory touched, no
+        // process resolved — a constant into x0. Everything this arm's cost
+        // consists of is the boundary itself, which is the point.
+        nr::AKUMA_GET_VERSION => version::sys_akuma_get_version(),
         #[cfg(feature = "smoltcp")]
         nr::RESOLVE_HOST => net::sys_resolve_host(args[0], args[1] as usize, args[2]),
         #[cfg(not(feature = "smoltcp"))]
@@ -873,17 +945,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         crate::syscall::utils::read_profile::F_LAP_DISP,
     );
 
-    // MEASUREMENT ONLY — no behaviour change below this block. `cur` is the
-    // PROLOGUE's resolution, and the dispatch above can be open-ended
-    // (ppoll/futex/blocking read). `kill_thread_group` retires a still-blocked
-    // sibling's `Process` and only *then* wakes it, and every secondary core's
-    // idle loop drains retired processes once the 10 ms cooldown expires
-    // (src/smp_shared.rs), so the prologue's `Process` may already be freed by
-    // the time we get here. The pre-cache epilogue re-did this lookup and
-    // skipped its writes on `None`; that behaviour is the oracle. Counting the
-    // divergence first — rather than fixing on inference — is the whole point:
-    // see docs/archive/IDENTITY_CACHE_SMP_REVIEW.md.
-    if crate::config::IDENTITY_AUDIT && let Some((audit_pid, audit_proc)) = cur {
+    let epi = excursion.epilogue(u64::from(owner_pid), result == EFAULT);
+
+    // MEASUREMENT ONLY. `cur` is the PROLOGUE's resolution, and the dispatch
+    // above can be open-ended (ppoll/futex/blocking read). `kill_thread_group`
+    // retires a still-blocked sibling's `Process` and only *then* wakes it, and
+    // every secondary core's idle loop drains retired processes once the 10 ms
+    // cooldown expires (src/smp_shared.rs), so the prologue's `Process` may
+    // already be freed by the time we get here. These counters observe that
+    // window directly; the fix for it is `epi.identity` below.
+    // See docs/archive/IDENTITY_CACHE_SMP_REVIEW.md Finding A.
+    if epi.audit_identity && let Some((audit_pid, audit_proc)) = cur {
         match akuma_exec::process::lookup_process_shared(audit_pid) {
             None => {
                 akuma_exec::process::table::EPILOGUE_STALE_IDENTITY
@@ -897,27 +969,43 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
     }
 
+    // The identity every `Process` write below goes through. Under
+    // `IdentitySource::Reresolve` this is a fresh read of the per-thread
+    // identity cache, which re-validates the slot state AND its reuse
+    // generation — so a process retired during the dispatch yields `None` and
+    // every write below is skipped, exactly as the pre-cache epilogue's
+    // `lookup_process_shared` returning `None` did. Two loads, against the
+    // lock + map walk + IRQ-masked table scan that guard used to cost twice.
+    //
+    // Under `IdentitySource::Prologue` it is the pointer from before the
+    // dispatch, which `akuma_syscalls::slot` proves is a use-after-free two
+    // peer operations deep. See `EPILOGUE_IDENTITY`.
+    let epi_cur = match epi.identity {
+        akuma_syscalls::IdentitySource::Prologue => cur,
+        akuma_syscalls::IdentitySource::Reresolve => {
+            akuma_exec::process::table::current_thread_tgid_process()
+        }
+    };
+
     akuma_exec::threading::set_thread_current_syscall(!0u64);
-    if let Some((_, proc)) = cur {
+    if epi.clear_current_syscall && let Some((_, proc)) = epi_cur {
         proc.current_syscall.store(!0u64, Ordering::Relaxed);
     }
     crate::syscall::utils::read_profile::floor_laps::lap(
         crate::syscall::utils::read_profile::F_LAP_EPI1,
     );
 
-    if need_timing {
+    if plan.need_timing {
         let elapsed = crate::timer::uptime_us().saturating_sub(t0);
-        let logging = crate::config::PROC_SYSCALL_LOG_ENABLED && owner_pid != 0;
-        // `cur` is the prologue's resolution, still valid for this excursion:
-        // the own-process lifetime guarantee is exactly what
-        // `lookup_process_shared` documents for this call shape, so the
-        // epilogue's second read_current_pid + lookup pair was pure duplicate
-        // work.
-        if track_time && let Some((_, p)) = cur {
+        // `epi_cur`, not `cur`: these dereference a `Process`, so they take the
+        // validated identity. `owner_pid` stays the prologue's — it is a scalar
+        // copy and the ring is keyed by it, so a process that retired mid-call
+        // still files its last entry under the pid it had, with `box_id` 0.
+        if epi.record_time && let Some((_, p)) = epi_cur {
             p.syscall_stats.add_time_us(syscall_num, elapsed);
         }
-        if logging {
-            let box_id = cur.map_or(0, |(_, p)| p.box_id);
+        if epi.log {
+            let box_id = epi_cur.map_or(0, |(_, p)| p.box_id);
             log::record(owner_pid, box_id, syscall_num, t0, elapsed, result);
         }
     }
@@ -929,7 +1017,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // not check the error and dereference the negative return value as a pointer,
     // causing a WILD-DA crash (FAR = the error code).
     // TEMP DEBUG nca-build EFAULT: EINVAL floods readlinkat probes during cargo builds.
-    if crate::config::SYSCALL_ERRNO_DIAG_ENABLED && result == EFAULT {
+    if epi.errno_diag {
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
         let err_name = if result == EFAULT { "EFAULT" } else if result == ENOSYS { "ENOSYS" } else { "EINVAL" };
 

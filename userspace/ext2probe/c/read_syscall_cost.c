@@ -53,6 +53,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdint.h>
 
 static long long now_ns(void) {
     struct timespec ts;
@@ -178,6 +179,26 @@ static double pass_syscall(long nr, int iters) {
     return (double)(now_ns() - t0) / iters;
 }
 
+/* Same, for a syscall that needs one argument. `uname` is the reason: it is the
+ * only other call that reports the build identity, so it is the natural
+ * comparison for `akuma_version` — but it cannot be timed by `floor_arm`,
+ * because it writes a 390-byte `struct utsname` and needs somewhere to put it. */
+static double pass_syscall1(long nr, long a0, int iters) {
+    long long t0 = now_ns();
+    for (int i = 0; i < iters; i++) syscall(nr, a0);
+    return (double)(now_ns() - t0) / iters;
+}
+
+static void floor_arm1(const char *name, long nr, long a0, int iters, int reps) {
+    int npass = reps * 20, per = iters / 20 > 0 ? iters / 20 : 1;
+    long long *g = malloc(sizeof(long long) * npass);
+    for (int r = 0; r < npass; r++) g[r] = (long long)(pass_syscall1(nr, a0, per) * 1000);
+    qsort(g, npass, sizeof(long long), cmp_ll);
+    printf("%-8s nr=%-4ld median=%8.0f ns/call  best=%8.0f  (%d x %d)\n",
+           name, nr, g[npass / 2] / 1000.0, g[0] / 1000.0, npass, per);
+    free(g);
+}
+
 /* Many short passes, take the minimum — see the comment in main(). */
 static void floor_arm(const char *name, long nr, int iters, int reps) {
     int npass = reps * 20, per = iters / 20 > 0 ? iters / 20 : 1;
@@ -242,6 +263,40 @@ int main(int argc, char **argv) {
      * is worth knowing what the JIT band costs — but it is not the ENOSYS
      * number and must never be read as one. */
     floor_arm("ENOSYS", 107, iters, reps);
+
+    /* THE floor, and the reason the three arms above are not it.
+     *
+     * `getpid` has been standing in for "a syscall that does nothing", but its
+     * arm still resolves a process, so what it measures is the boundary PLUS an
+     * arm. Akuma-private 328 (`akuma_get_version`) reads no arguments, touches
+     * no user memory and resolves nothing: it returns a compile-time constant
+     * packed into x0. Its cost is the EL0 round trip, the wrapper layer and
+     * `handle_syscall`'s prologue/epilogue, and nothing else — which is exactly
+     * the quantity docs/archive/AKUMA_SYSCALL_PERFORMANCE_AUDIT.md is pricing.
+     *
+     * `getpid - version` is therefore what `getpid`'s own arm costs, measured
+     * rather than assumed. On a Linux guest 328 is not a syscall, so this arm
+     * reports that kernel's ENOSYS path and must not be compared across kernels.
+     *
+     * `uname` is the control that makes the point: it reports the SAME build
+     * identity from the same compile-time constants and computes nothing, but
+     * it has to deliver it through a 390-byte `struct utsname`. The gap between
+     * the two arms is what the ABI's shape costs, with the work held at zero. */
+    floor_arm("version", 328, iters, reps);
+    static char uts[390];
+    floor_arm1("uname", SYS_uname, (long)(uintptr_t)uts, iters, reps);
+
+    /* LAST, and that placement is the whole point. This arm is not a syscall:
+     * `src/exceptions.rs` treats any number above 500 as a stale-I-cache JIT
+     * artifact and answers with `ic iallu` + an instruction replay. On QEMU
+     * `ic iallu` calls tb_flush(), so 10,000 calls here throw away the entire
+     * instruction cache and translation buffer 10,000 times.
+     *
+     * It used to run fourth, and every arm after it measured a cold machine:
+     * `version` — an arm that returns a constant — read 290-410 ns against
+     * `getpid`'s 160-200, which looks exactly like a dispatch finding and is
+     * not one. Anything that flushes global state belongs at the end of a
+     * measurement, not in the middle of one. */
     floor_arm("JITband", 4095, iters, reps);
 
     printf("== fixed cost (no bytes moved)\n");

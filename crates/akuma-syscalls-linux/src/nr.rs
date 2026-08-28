@@ -123,6 +123,16 @@ pub const CLOSE_CHILD_STDIN: u64 = 326;
 /// multikernel (docs/archive/TRIM_FAT_MULTIKERNEL.md). herd still calls this
 /// to try pinning a service to a secondary core.
 pub const CORE_INIT: u64 = 327;
+/// The build identity, packed into the return register. No arguments, no user
+/// memory, no process lookup — the dispatch arm is one immediate.
+///
+/// `uname(2)` already carries the same facts (`CARGO_PKG_VERSION` and
+/// `AKUMA_GIT_SHA`-`<profile>`) from the same `env!`s and computes nothing —
+/// but it moves ~780 bytes and validates twice to deliver ~30 bytes of static
+/// text, so it measures the user-copy path rather than the boundary. This one
+/// is the floor control: the arm is one immediate. Layout and reasoning in
+/// `src/syscall/version.rs`.
+pub const AKUMA_GET_VERSION: u64 = 328;
 pub const GETPID: u64 = 172;
 pub const GETPPID: u64 = 173;
 pub const GETUID: u64 = 174;

@@ -1,0 +1,15 @@
+[package]
+name = "akuma-syscalls"
+version = "0.1.0"
+edition = "2024"
+description = "The shape of a syscall excursion: the generic prologue/epilogue decisions `handle_syscall` makes around the family dispatch, plus a model of the per-thread identity cache's slot lifecycle. Decisions only — the effects stay in the kernel."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The only dependency, and deliberately the zero-dependency one: this crate
+# classifies syscall NUMBERS, so it needs the number table and nothing else.
+# Depending on anything with kernel state here would rebuild the second kernel
+# `AKUMA_EXTRACT_SYSCALLS.md` §7 exists to refuse.
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }

@@ -156,36 +156,69 @@ pub(super) fn sys_setsid() -> u64 {
     }
 }
 
-pub(super) fn sys_uname(buf: u64) -> u64 {
-    const FIELD_LEN: usize = 65;
-    if !validate_user_ptr(buf, FIELD_LEN * 6) { return EFAULT; }
+/// One `utsname` field. The Linux ABI is six of these, NUL-padded.
+const UTS_FIELD_LEN: usize = 65;
+/// The whole `struct utsname`: 390 bytes, of which ~30 are ever non-zero. That
+/// is the ABI's shape, not this kernel's — Linux's `new_utsname` is the same
+/// size and copies the same 390 bytes.
+const UTS_LEN: usize = UTS_FIELD_LEN * 6;
 
-    let mut kernel_buf = [0u8; FIELD_LEN * 6];
-
-    fn write_field(base: &mut [u8], offset: usize, value: &[u8]) {
-        let start = offset * FIELD_LEN;
-        let len = value.len().min(FIELD_LEN - 1);
-        base[start..start + len].copy_from_slice(&value[..len]);
+/// Write one NUL-padded field into a `utsname` image at compile time.
+///
+/// A `const fn` taking and returning the array rather than a `&mut` one,
+/// because that is what `static` initialization can use. Hand-rolled byte loop
+/// because `copy_from_slice` is not `const`.
+const fn uts_field(mut buf: [u8; UTS_LEN], index: usize, value: &[u8]) -> [u8; UTS_LEN] {
+    let start = index * UTS_FIELD_LEN;
+    // Leave at least one byte for the terminator, exactly as the runtime
+    // version did — a field that filled all 65 bytes would come back unterminated.
+    let max = UTS_FIELD_LEN - 1;
+    let len = if value.len() < max { value.len() } else { max };
+    let mut i = 0;
+    while i < len {
+        buf[start + i] = value[i];
+        i += 1;
     }
+    buf
+}
 
-    // `release` tracks the kernel crate version, and `version` carries the build
-    // identity `<git-sha>-<profile>` (e.g. `a1b2c3d-release-smp-shared`) that build.rs
-    // embeds — enough for `uname -a` to say which commit and build target is running.
-    // See docs/archive/UNAME.md. sysname/nodename/domainname stay static literals:
-    // sethostname/setdomainname are not wired into the dispatch table, so there is no
-    // write path for them to track.
-    write_field(&mut kernel_buf, 0, b"Akuma");
-    write_field(&mut kernel_buf, 1, b"akuma");
-    write_field(&mut kernel_buf, 2, env!("CARGO_PKG_VERSION").as_bytes());
-    write_field(
-        &mut kernel_buf,
+/// The answer `uname(2)` gives, built once at compile time and copied out
+/// verbatim.
+///
+/// Every field is a compile-time constant — two literals, `CARGO_PKG_VERSION`,
+/// and the `<git-sha>-<profile>` identity `build.rs` embeds — so there has
+/// never been anything to compute per call. It used to be assembled anyway:
+/// a 390-byte stack memset plus six `copy_from_slice`s on every `uname`, and
+/// then a second 390-byte pass into userspace. That is ~780 bytes moved and a
+/// 390-byte stack frame to deliver ~30 bytes of static text.
+///
+/// As a `static` it lives in `.rodata` and the syscall is one `copy_to_user`,
+/// which is what Linux does (it copies straight out of `init_uts_ns.name`).
+///
+/// `release` tracks the kernel crate version, and `version` carries the build
+/// identity `<git-sha>-<profile>` (e.g. `a1b2c3d-release-smp-shared`) — enough
+/// for `uname -a` to say which commit and build target is running. See
+/// docs/archive/UNAME.md. sysname/nodename/domainname stay static literals:
+/// sethostname/setdomainname are not wired into the dispatch table, so there is
+/// no write path for them to track — which is also what makes baking the whole
+/// image into `.rodata` correct rather than merely cheaper.
+static UTSNAME: [u8; UTS_LEN] = {
+    let b = [0u8; UTS_LEN];
+    let b = uts_field(b, 0, b"Akuma");
+    let b = uts_field(b, 1, b"akuma");
+    let b = uts_field(b, 2, env!("CARGO_PKG_VERSION").as_bytes());
+    let b = uts_field(
+        b,
         3,
         concat!(env!("AKUMA_GIT_SHA"), "-", env!("AKUMA_BUILD_PROFILE")).as_bytes(),
     );
-    write_field(&mut kernel_buf, 4, b"aarch64");
-    write_field(&mut kernel_buf, 5, b"(none)");
+    let b = uts_field(b, 4, b"aarch64");
+    uts_field(b, 5, b"(none)")
+};
 
-    if copy_to_user(buf, &kernel_buf).is_err() {
+pub(super) fn sys_uname(buf: u64) -> u64 {
+    if !validate_user_ptr(buf, UTS_LEN) { return EFAULT; }
+    if copy_to_user(buf, &UTSNAME).is_err() {
         return EFAULT;
     }
     0

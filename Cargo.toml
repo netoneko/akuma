@@ -14,6 +14,7 @@ default-members = [
     "crates/akuma-primitives",
     "crates/akuma-rump",
     "crates/akuma-scheduler",
+    "crates/akuma-syscalls",
     "crates/akuma-syscalls-linux",
     "crates/akuma-terminal",
     "crates/akuma-time",
@@ -668,6 +669,12 @@ akuma-time = { path = "crates/akuma-time" }
 # (proposals/syscall-abi-and-shape-crates.md). Not optional: `nr::` is the
 # dispatch table, so every build target needs it.
 akuma-syscalls-linux = { path = "crates/akuma-syscalls-linux" }
+# Crate 2 of the same pair: the SHAPE of an excursion — the generic
+# prologue/epilogue decisions `handle_syscall` makes around the family dispatch,
+# with the effects left here. Pure data and `const fn`s, so it inlines away;
+# that is a requirement, not a happy accident (docs/archive/
+# AKUMA_EXTRACT_SYSCALLS.md §7 — the dispatch is the hottest function here).
+akuma-syscalls = { path = "crates/akuma-syscalls" }
 embedded-io-async = { version = "0.6", default-features = false }
 
 [patch.crates-io]

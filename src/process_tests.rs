@@ -266,6 +266,8 @@ pub fn run_all_tests() {
     test_preempt_guard_is_live();
     test_identity_lazy_restamp();
     test_identity_recycled_slot_rejected();
+    test_epilogue_identity_revalidated_after_dispatch();
+    test_akuma_get_version();
 
     // Is the widened user-copy asm itself correct? Deterministic, kernel-memory
     // only, and it separates "the asm is buggy" from "the asm is fine and the
@@ -19621,6 +19623,137 @@ fn test_identity_recycled_slot_rejected() {
         crate::safe_print!(224,
             "[Test] identity_recycled_slot_rejected FAILED: stale entry resolved to {:?}\n",
             resolved);
+    }
+}
+
+/// `akuma_get_version` must reach the dispatch and return the packed constant.
+///
+/// It is the floor control for the syscall boundary
+/// (docs/archive/AKUMA_SYSCALL_PERFORMANCE_AUDIT.md), and a floor control is
+/// only honest if the arm really does nothing — so what this asserts is that
+/// the number is **wired**, which a direct call to `sys_akuma_get_version`
+/// would not show. If the arm ever fell through to the `_ => ENOSYS` case the
+/// probe would silently be timing the ENOSYS path instead, and every floor
+/// number taken with it would be wrong in a way nothing else notices.
+///
+/// The expected value is rebuilt from `unpack`, not written out as a literal:
+/// a test you have to edit to keep passing checks nothing.
+fn test_akuma_get_version() {
+    use akuma_syscalls_linux::nr;
+    use crate::syscall::handle_syscall;
+    use crate::syscall::version::{self, AKUMA_VERSION};
+
+    let dispatched = handle_syscall(nr::AKUMA_GET_VERSION, &[0, 0, 0, 0, 0, 0]);
+    let wired = dispatched == AKUMA_VERSION;
+
+    let (major, minor, patch, commit) = version::unpack(dispatched);
+    let triple_ok = [major, minor, patch] == version::VERSION_TRIPLE;
+    let commit_ok = commit == version::COMMIT;
+
+    // The reserved top byte. Load-bearing, not cosmetic: with bit 63 set a libc
+    // wrapper would read the return as a negative errno.
+    let non_negative = (dispatched >> 56) == 0 && (dispatched as i64) > 0;
+
+    // And it must not read as an error at all — ENOSYS is what a missing arm
+    // would return, and it must be distinguishable from a real answer.
+    let not_enosys = dispatched != ENOSYS;
+
+    if wired && triple_ok && commit_ok && non_negative && not_enosys {
+        console::print("[Test] akuma_get_version PASSED\n");
+    } else {
+        crate::safe_print!(240,
+            "[Test] akuma_get_version FAILED: wired={} triple_ok={} commit_ok={} non_negative={} not_enosys={} (got {:#x}, want {:#x})\n",
+            wired, triple_ok, commit_ok, non_negative, not_enosys, dispatched, AKUMA_VERSION);
+    }
+}
+
+/// Finding A of docs/archive/IDENTITY_CACHE_SMP_REVIEW.md: the syscall
+/// epilogue must not write through the identity the PROLOGUE resolved.
+///
+/// The dispatch between them is open-ended — `ppoll`, futex, a blocking
+/// `read` — and `kill_thread_group` retires a still-blocked sibling's
+/// `Process` and only *then* wakes it. The woken sibling unwinds into the
+/// epilogue holding a pointer to a process that is already RETIRED, and any
+/// idle core's reclaim drain frees it once the 10 ms cooldown expires. The
+/// pre-cache epilogue re-did its lookup and skipped its writes on `None`;
+/// **that lookup was the guard**, and hoisting it away was the defect.
+///
+/// `akuma_syscalls::slot` enumerates the slot lifecycle and finds the witness
+/// two peer operations deep — `Retire(0)`, `Reclaim(0)` — and finds none for
+/// the re-reading policy. This is that witness driven against the real table.
+///
+/// Distinct from `test_identity_recycled_slot_rejected`, which drives the full
+/// round trip to a *reissued* slot. The window that matters here opens at the
+/// first of those two ops: merely RETIRED, nothing reclaimed, nothing
+/// recycled. A guard that only caught the reissue would still let the epilogue
+/// write into a retired process for the whole cooldown.
+fn test_epilogue_identity_revalidated_after_dispatch() {
+    use akuma_exec::process::table::{self, test_hooks as ih};
+    use core::sync::atomic::Ordering;
+
+    // The tgid half, for the same reason the recycled-slot test uses it:
+    // `unregister_process` clears the identity of every thread mapped to the
+    // dying pid, so retiring our OWN process would invalidate the entry by a
+    // different route and prove nothing about the leader pointer. Nothing
+    // invalidates a sibling's cached leader pointer — that is the window.
+    const SIBLING_PID: u32 = 7821;
+    const LEADER_PID: u32 = 7822;
+    let tid = akuma_exec::threading::current_thread_id();
+    let inactive0 = table::IDENTITY_FB_INACTIVE.load(Ordering::Relaxed);
+
+    akuma_exec::process::register_process(LEADER_PID, make_test_process(LEADER_PID));
+    let mut sib = make_test_process(SIBLING_PID);
+    sib.tgid = LEADER_PID; // a CLONE_THREAD sibling of the leader
+    akuma_exec::process::register_process(SIBLING_PID, sib);
+    akuma_exec::process::table::register_thread_pid(tid, SIBLING_PID);
+
+    // The prologue's resolution. If this misses the run proves nothing, so it
+    // is reported as INCONCLUSIVE rather than passing vacuously.
+    let prologue = table::current_thread_tgid_process().map(|(p, _)| p);
+    let prologue_ok = prologue == Some(LEADER_PID);
+
+    // --- the dispatch window: the leader retires while we are "inside" it ---
+    // RETIRED only. No reclaim, no reissue: this is `Retire(0)` alone, the
+    // first half of the enumerated witness.
+    akuma_exec::process::unregister_process(LEADER_PID);
+
+    // The epilogue's resolution. MUST miss — that miss is what makes the
+    // kernel skip `current_syscall.store` and `syscall_stats.add_time_us`.
+    let epilogue = table::current_thread_tgid_process().map(|(p, _)| p);
+    let refused_while_retired = epilogue.is_none();
+    // …and it must have missed on the state arm, not by never having resolved.
+    let counted = table::IDENTITY_FB_INACTIVE.load(Ordering::Relaxed) > inactive0;
+
+    // `Reclaim(0)`: the second half. The pointer the prologue held is now a
+    // freed allocation, and the answer must still be a miss.
+    let freed = akuma_exec::process::table::reclaim_retired_processes_force();
+    let refused_after_free = table::current_thread_tgid_process().is_none();
+
+    // The policy this test guards. `IdentitySource::Prologue` reuses the
+    // pointer resolved before the dispatch, which every assertion above exists
+    // to reject; flipping the const back must fail here rather than silently
+    // reopen a use-after-free nothing else observes.
+    let policy_ok = matches!(
+        crate::syscall::EPILOGUE_IDENTITY,
+        akuma_syscalls::IdentitySource::Reresolve
+    );
+
+    ih::clear(tid);
+    akuma_exec::process::unregister_process(SIBLING_PID);
+    let _ = akuma_exec::process::table::reclaim_retired_processes_force();
+
+    if !(prologue_ok && freed >= 1) {
+        crate::safe_print!(224,
+            "[Test] epilogue_identity_revalidated INCONCLUSIVE: prologue={:?} freed={}\n",
+            prologue, freed);
+        return;
+    }
+    if refused_while_retired && refused_after_free && counted && policy_ok {
+        console::print("[Test] epilogue_identity_revalidated PASSED\n");
+    } else {
+        crate::safe_print!(240,
+            "[Test] epilogue_identity_revalidated FAILED: retired_refused={} freed_refused={} inactive_counted={} policy_reresolve={} (epilogue resolved to {:?})\n",
+            refused_while_retired, refused_after_free, counted, policy_ok, epilogue);
     }
 }
 

@@ -17,6 +17,7 @@ dependencies = [
  "akuma-pmm",
  "akuma-primitives",
  "akuma-rump",
+ "akuma-syscalls",
  "akuma-syscalls-linux",
  "akuma-terminal",
  "akuma-time",
@@ -121,6 +122,13 @@ version = "0.1.0"
 dependencies = [
  "akuma-kacho",
  "libm",
+]
+
+[[package]]
+name = "akuma-syscalls"
+version = "0.1.0"
+dependencies = [
+ "akuma-syscalls-linux",
 ]
 
 [[package]]
