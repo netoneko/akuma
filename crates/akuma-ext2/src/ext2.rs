@@ -2259,6 +2259,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
     fn truncate_inode(&self, state: &mut Ext2State, inode: &mut Inode) -> Result<(), FsError> {
         // Free all direct blocks
+        // Indexed, not iterated, and clippy's `needless_range_loop` cannot be
+        // honoured here: `Inode` is packed, so `&mut inode.direct_blocks[..]`
+        // is a reference to a field of a packed struct — rejected as unaligned
+        // (E0793), and UB even if never dereferenced. Copy-in/copy-out through
+        // the index is the only sound form.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..12 {
             if inode.direct_blocks[i] != 0 {
                 self.free_block(state, inode.direct_blocks[i])?;

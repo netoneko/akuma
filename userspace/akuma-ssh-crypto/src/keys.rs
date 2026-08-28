@@ -79,10 +79,8 @@ pub fn base64_decode(data: &str) -> Option<Vec<u8>> {
         for (i, &b) in chunk.iter().enumerate() {
             vals[i] = if b == b'=' {
                 0
-            } else if let Some(pos) = BASE64_ALPHABET.iter().position(|&c| c == b) {
-                pos as u8
             } else {
-                return None;
+                BASE64_ALPHABET.iter().position(|&c| c == b)? as u8
             };
         }
 

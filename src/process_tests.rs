@@ -1372,7 +1372,7 @@ fn print_bkl_wait_by_holder(label: &str) {
         .map(|t| (t, wait_by_holder(t)))
         .filter(|&(_, w)| w > 0)
         .collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.sort_by_key(|a| core::cmp::Reverse(a.1));
     crate::safe_print!(96, "[Test] {} BKL-wait by holder (top excursions):\n", label);
     for (tag, w) in top.iter().take(8) {
         let holder = if *tag as u64 == HOLD_TAG_FAULT {
@@ -7874,41 +7874,38 @@ fn test_echo2() {
     const ECHO2_PATH: &str = "/bin/echo2";
 
     // Check if the binary exists
-    match fs::read_file(ECHO2_PATH) {
-        Ok(data) => {
-            crate::safe_print!(96, 
-                "[Test] Found {} ({} bytes), attempting to execute...\n",
-                ECHO2_PATH,
-                data.len()
-            );
+    if let Ok(data) = fs::read_file(ECHO2_PATH) {
+        crate::safe_print!(96, 
+            "[Test] Found {} ({} bytes), attempting to execute...\n",
+            ECHO2_PATH,
+            data.len()
+        );
 
-            // Try to create a process from the ELF
-            match process::Process::from_elf("echo2", &alloc::vec!["echo2".to_string()], &[], &data, None) {
-                Ok(proc) => {
-                    crate::safe_print!(96, 
-                        "[Test] Process created: PID={}, entry={:#x}\n",
-                        proc.pid, proc.context.pc
-                    );
-                    console::print("[Test] echo2 test PASSED (process creation succeeded)\n");
+        // Try to create a process from the ELF
+        match process::Process::from_elf("echo2", &alloc::vec!["echo2".to_string()], &[], &data, None) {
+            Ok(proc) => {
+                crate::safe_print!(96, 
+                    "[Test] Process created: PID={}, entry={:#x}\n",
+                    proc.pid, proc.context.pc
+                );
+                console::print("[Test] echo2 test PASSED (process creation succeeded)\n");
 
-                    // Note: Actually executing the process would require
-                    // the full scheduler integration. For now, we just verify
-                    // that the ELF can be loaded.
-                    drop(proc);
-                }
-                Err(e) => {
-                    crate::safe_print!(64, "[Test] Failed to load echo2: {}\n", e);
-                    console::print("[Test] echo2 test FAILED\n");
-                }
+                // Note: Actually executing the process would require
+                // the full scheduler integration. For now, we just verify
+                // that the ELF can be loaded.
+                drop(proc);
+            }
+            Err(e) => {
+                crate::safe_print!(64, "[Test] Failed to load echo2: {}\n", e);
+                console::print("[Test] echo2 test FAILED\n");
             }
         }
-        Err(_) => {
-            if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
-                crate::safe_print!(64, "[Test] {} not found - FAIL\n", ECHO2_PATH);
-                panic!("Required test binary not found");
-            }
-            crate::safe_print!(64, "[Test] {} not found, skipping test\n", ECHO2_PATH);
+    } else {
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            crate::safe_print!(64, "[Test] {} not found - FAIL\n", ECHO2_PATH);
+            panic!("Required test binary not found");
         }
+        crate::safe_print!(64, "[Test] {} not found, skipping test\n", ECHO2_PATH);
     }
 }
 

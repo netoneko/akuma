@@ -148,15 +148,11 @@ pub fn raise_sigchld_for_parent(child_pid: Pid, exit_code: i32) {
 /// signal-counting handler, so the guard is worth keeping.
 pub fn publish_child_exit(child_pid: Pid, exit_code: i32) {
     let published = match get_child_channel(child_pid) {
-        Some(ch) => {
-            if !ch.has_exited() {
-                ch.set_exited(exit_code);
-                true
-            } else {
-                false
-            }
+        Some(ch) if !ch.has_exited() => {
+            ch.set_exited(exit_code);
+            true
         }
-        None => false,
+        _ => false,
     };
     if published {
         raise_sigchld_for_parent(child_pid, exit_code);

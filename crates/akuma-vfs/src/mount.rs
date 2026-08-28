@@ -138,7 +138,7 @@ impl<const MAX: usize> MountSet<MAX> {
             flags: flags & MS_RDONLY,
             fs,
         });
-        self.mounts.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        self.mounts.sort_by_key(|a| core::cmp::Reverse(a.path.len()));
         Ok(())
     }
 

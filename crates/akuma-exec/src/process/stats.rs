@@ -72,7 +72,7 @@ impl ProcessSyscallStats {
         if total == 0 { return; }
 
         // Sort by time spent (descending) — shows the slowest syscalls first
-        entries.sort_by(|a, b| b.2.cmp(&a.2));
+        entries.sort_by_key(|a| core::cmp::Reverse(a.2));
 
         let secs = elapsed_us / 1_000_000;
         let frac = (elapsed_us % 1_000_000) / 10_000;
