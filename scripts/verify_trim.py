@@ -355,7 +355,13 @@ def read_log(path):
 
 
 def boot_once(smp, instance, memory, logdir, results, run_exercises):
-    subprocess.run(["pkill", "-f", "qemu-system-aarch64"], capture_output=True)
+    # Kill only THIS instance's stale QEMU, matched on its own forwarded ssh port.
+    # A bare `pkill -f qemu-system-aarch64` — what this line used to be — also kills
+    # every other VM the user has running, including a concurrent baseline run of
+    # this very script. CLAUDE.md § "Waiting for a VM" bans the broad form for
+    # exactly that reason.
+    port = 2222 + 100 * (instance or 0)
+    subprocess.run(["pkill", "-f", f"hostfwd=tcp::{port}-:22"], capture_output=True)
     time.sleep(2)
 
     log_path = os.path.join(logdir, f"verify_smp{smp}.log")
@@ -376,7 +382,7 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
     vm = subprocess.Popen(["cargo", "run", "--release"], cwd=REPO, env=env,
                           stdout=log, stderr=subprocess.STDOUT)
     try:
-        booted = wait_for_marker(log_path, port=port, proc=qemu)
+        booted = wait_for_marker(log_path, port=port, proc=vm)
         results[f"smp{smp}.booted"] = booted
         if not booted:
             # A failed boot is the case that most needs triage, so report the three
@@ -459,7 +465,8 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
         except subprocess.TimeoutExpired:
             vm.kill()
         log.close()
-        subprocess.run(["pkill", "-f", "qemu-system-aarch64"], capture_output=True)
+        # Narrow, for the same reason as the kill at the top of this function.
+        subprocess.run(["pkill", "-f", f"hostfwd=tcp::{port}-:22"], capture_output=True)
         time.sleep(1)
 
 
@@ -574,7 +581,9 @@ def tier4_redis_memtest(results, memory, logdir, build):
         results["redis.stage"] = "SKIP (no devbox.img — overlays/devbox/bootstrap.sh)"
         return
 
-    subprocess.run(["pkill", "-f", "qemu-system-aarch64"], capture_output=True)
+    # Narrow: the devbox runner forwards 2222, so match that and leave any other
+    # INSTANCE's VM — or a concurrent baseline run — alone.
+    subprocess.run(["pkill", "-f", "hostfwd=tcp::2222-:22"], capture_output=True)
     time.sleep(2)
     log_path = os.path.join(logdir, "verify_redis.log")
     log = open(log_path, "w")
@@ -644,7 +653,7 @@ def tier4_redis_memtest(results, memory, logdir, build):
         except subprocess.TimeoutExpired:
             vm.kill()
         log.close()
-        subprocess.run(["pkill", "-f", "qemu-system-aarch64"], capture_output=True)
+        subprocess.run(["pkill", "-f", "hostfwd=tcp::2222-:22"], capture_output=True)
         time.sleep(1)
 
 

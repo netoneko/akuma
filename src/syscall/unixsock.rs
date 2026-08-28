@@ -393,20 +393,17 @@ pub fn socketpair_rollback(a: u32, b: u32) {
 /// were created first and the table claim then failed with `EADDRINUSE`, the
 /// failed `bind` would have left a file behind that nothing owns — the exact
 /// stale node that makes the *next* daemon start look like a live conflict.
-pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> u64 {
+pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
     let Some(sock) = fd_sock(fd) else {
-        return if fd_parts(fd).is_some() { EOPNOTSUPP } else { ENOTSOCK };
+        return if fd_parts(fd).is_some() { Err(EOPNOTSUPP) } else { Err(ENOTSOCK) };
     };
-    let name = match read_sockaddr(addr_ptr, addrlen) {
-        Ok(n) => n,
-        Err(e) => return e,
-    };
+    let name = read_sockaddr(addr_ptr, addrlen)?;
     // A filesystem name whose node exists but whose socket does not is stale:
     // a daemon died without unlinking. Linux reports EADDRINUSE and expects the
     // daemon to unlink first, so a client sees a node it cannot connect to
     // rather than silently talking to the wrong process.
     if let Err(e) = with_table(|t| t.bind(sock, name.clone())) {
-        return neg_errno(e);
+        return Err(neg_errno(e));
     }
     if let Some(path) = name.path_bytes()
         && let Ok(p) = core::str::from_utf8(path)
@@ -420,7 +417,7 @@ pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> u64 {
             crate::safe_print!(96, "[unix] bind(fd={}) abstract\n", fd);
         }
     }
-    0
+    Ok(0)
 }
 
 /// Create the filesystem presence for a pathname bind: a real `S_IFSOCK` node.
@@ -474,14 +471,11 @@ pub fn sys_listen(fd: u32, backlog: i32) -> u64 {
 /// client may write its request immediately and have it buffered. Linux behaves
 /// this way and clients rely on it — deferring the wiring to `accept` would
 /// lose every byte written in between.
-pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> u64 {
+pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
     let Some(sock) = fd_sock(fd) else {
-        return if fd_parts(fd).is_some() { EOPNOTSUPP } else { ENOTSOCK };
+        return if fd_parts(fd).is_some() { Err(EOPNOTSUPP) } else { Err(ENOTSOCK) };
     };
-    let name = match read_sockaddr(addr_ptr, addrlen) {
-        Ok(n) => n,
-        Err(e) => return e,
-    };
+    let name = read_sockaddr(addr_ptr, addrlen)?;
     let creds = current_creds();
     let nonblock = super::net::fd_is_nonblock(fd);
 
@@ -492,7 +486,7 @@ pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> u64 {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                     crate::safe_print!(96, "[unix] connect(fd={}) dgram peer set\n", fd);
                 }
-                return 0;
+                return Ok(0);
             }
             Ok(ConnectOutcome::Queued { listener, server_sock }) => {
                 // Create the channel now so the client can write before the
@@ -528,14 +522,14 @@ pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> u64 {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                     crate::safe_print!(96, "[unix] connect(fd={}) queued\n", fd);
                 }
-                return 0;
+                return Ok(0);
             }
             // A full backlog is transient: a blocking client waits for the
             // server to catch up rather than failing a live service.
             Err(e) if e == libc_errno::EAGAIN && !nonblock => {
                 akuma_exec::threading::schedule_blocking(10_000);
             }
-            Err(e) => return neg_errno(e),
+            Err(e) => return Err(neg_errno(e)),
         }
     }
 }

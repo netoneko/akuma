@@ -174,27 +174,18 @@ pub(super) fn sys_mount(
     fstype_ptr: u64,
     flags: u64,
     _data_ptr: u64,
-) -> u64 {
+) -> SysResult {
     if !caller_may_mount() {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(128, "[mount] denied: boxed processes may not mount\n");
         }
-        return EPERM;
+        return Err(EPERM);
     }
 
-    let target = match copy_from_user_str(target_ptr, 256) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let fstype = match copy_from_user_str(fstype_ptr, 64) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
+    let target = copy_from_user_str(target_ptr, 256)?;
+    let fstype = copy_from_user_str(fstype_ptr, 64)?;
     let source = if source_ptr != 0 {
-        match copy_from_user_str(source_ptr, 64) {
-            Ok(s) => s,
-            Err(e) => return e,
-        }
+        copy_from_user_str(source_ptr, 64)?
     } else {
         String::new()
     };
@@ -210,8 +201,8 @@ pub(super) fn sys_mount(
         // Remount only flips stored flags; `fs`/`source` args are advisory.
         // Linux requires the target to already be a mount point.
         return match crate::vfs::remount(&target, flags) {
-            Ok(()) => 0,
-            Err(e) => mount_errno(e),
+            Ok(()) => Ok(0),
+            Err(e) => Err(mount_errno(e)),
         };
     }
 
@@ -219,8 +210,8 @@ pub(super) fn sys_mount(
     // bypass this arm entirely, so this never gates `/` or `/proc` at boot.
     match crate::vfs::metadata(&target) {
         Ok(m) if m.is_dir => {}
-        Ok(_) => return ENOTDIR,
-        Err(e) => return mount_errno(e),
+        Ok(_) => return Err(ENOTDIR),
+        Err(e) => return Err(mount_errno(e)),
     }
 
     let fs: alloc::sync::Arc<dyn crate::vfs::Filesystem> = match fstype.as_str() {
@@ -234,7 +225,7 @@ pub(super) fn sys_mount(
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                     crate::safe_print!(128, "[mount] no such device: {}\n", source);
                 }
-                return ENODEV;
+                return Err(ENODEV);
             };
             // Runtime data disks get a small, fixed cache budget: the global
             // cap belongs to the root filesystem, and the cache never shrinks
@@ -242,14 +233,14 @@ pub(super) fn sys_mount(
             const DATA_DISK_CACHE_BYTES: usize = 16 * 1024 * 1024;
             match crate::vfs::ext2::mount_device(idx, Some(DATA_DISK_CACHE_BYTES)) {
                 Ok(fs) => fs,
-                Err(_) => return ENODEV, // no ext2 magic on that device
+                Err(_) => return Err(ENODEV), // no ext2 magic on that device
             }
         }
         _ => {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(128, "[mount] unsupported fstype: {}\n", fstype);
             }
-            return ENODEV;
+            return Err(ENODEV);
         }
     };
 
@@ -259,8 +250,8 @@ pub(super) fn sys_mount(
         source.as_str()
     };
     match crate::vfs::mount_with(&target, Some(recorded_source), flags, fs) {
-        Ok(()) => 0,
-        Err(e) => mount_errno(e),
+        Ok(()) => Ok(0),
+        Err(e) => Err(mount_errno(e)),
     }
 }
 
@@ -276,24 +267,21 @@ pub(super) fn sys_mount(
 /// - the **global** `/` is never unmountable (`EBUSY`, like Linux);
 /// - this arm only ever touches the global table — a box's namespace mounts
 ///   are composed from outside via `MOUNT_IN_NS` and torn down with the box.
-pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> u64 {
+pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> SysResult {
     if !caller_may_mount() {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
             crate::safe_print!(128, "[umount2] denied: boxed processes may not unmount\n");
         }
-        return EPERM;
+        return Err(EPERM);
     }
-    let target = match copy_from_user_str(target_ptr, 256) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
+    let target = copy_from_user_str(target_ptr, 256)?;
     let target = crate::vfs::canonicalize_path(&target);
     if target == "/" {
-        return EBUSY;
+        return Err(EBUSY);
     }
     match crate::vfs::unmount(&target) {
-        Ok(()) => 0,
-        Err(e) => mount_errno(e),
+        Ok(()) => Ok(0),
+        Err(e) => Err(mount_errno(e)),
     }
 }
 
@@ -345,24 +333,24 @@ fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn crate::vfs::Files
     Ok(alloc::sync::Arc::new(OverlayFs::new(upper, layers)))
 }
 
-pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, fstype_ptr: u64, fstype_len: usize, data_ptr: u64) -> u64 {
+pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, fstype_ptr: u64, fstype_len: usize, data_ptr: u64) -> SysResult {
     let caller_box = akuma_exec::process::current_process_shared()
         .map_or(0, |p| p.box_id);
     if caller_box != 0 {
-        return EPERM;
+        return Err(EPERM);
     }
 
-    if !validate_user_ptr(target_ptr, target_len) { return EFAULT; }
-    if !validate_user_ptr(fstype_ptr, fstype_len) { return EFAULT; }
+    if !validate_user_ptr(target_ptr, target_len) { return Err(EFAULT); }
+    if !validate_user_ptr(fstype_ptr, fstype_len) { return Err(EFAULT); }
 
     let mut target_buf = alloc::vec![0u8; target_len];
     let mut fstype_buf = alloc::vec![0u8; fstype_len];
     
     if copy_from_user(&mut target_buf, target_ptr).is_err() {
-        return EFAULT;
+        return Err(EFAULT);
     }
     if copy_from_user(&mut fstype_buf, fstype_ptr).is_err() {
-        return EFAULT;
+        return Err(EFAULT);
     }
 
     // Same reason as sys_mount: mount points are matched literally.
@@ -372,11 +360,8 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
     let fs: alloc::sync::Arc<dyn crate::vfs::Filesystem> = match fstype {
         "proc" => alloc::sync::Arc::new(crate::vfs::proc::ProcFilesystem::new()),
         "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
-        "overlay" => match build_overlay(data_ptr) {
-            Ok(fs) => fs,
-            Err(e) => return e,
-        },
-        _ => return ENODEV,
+        "overlay" => build_overlay(data_ptr)?,
+        _ => return Err(ENODEV),
     };
 
     // A box's namespace already has its `SubdirFs` jail at "/", and an overlay
@@ -393,17 +378,17 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                 crate::safe_print!(160, "[mount] refusing to re-root live box {}\n", box_id);
             }
-            return EPERM;
+            return Err(EPERM);
         }
         return match crate::vfs::replace_box_root(box_id, fs) {
-            Ok(()) => 0,
-            Err(crate::vfs::FsError::PermissionDenied) => EPERM,
-            Err(_) => EINVAL,
+            Ok(()) => Ok(0),
+            Err(crate::vfs::FsError::PermissionDenied) => Err(EPERM),
+            Err(_) => Err(EINVAL),
         };
     }
 
     match crate::vfs::mount_in_namespace(box_id, &target, fs) {
-        Ok(()) => 0,
-        Err(_) => EINVAL,
+        Ok(()) => Ok(0),
+        Err(_) => Err(EINVAL),
     }
 }

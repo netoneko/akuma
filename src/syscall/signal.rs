@@ -223,28 +223,26 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
 /// info: pointer to siginfo_t structure (ignored for now)
 /// timeout: pointer to timespec structure
 /// sigsetsize: size of signal set (must be 8)
-pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigsetsize: usize) -> u64 {
+pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigsetsize: usize) -> SysResult {
     if sigsetsize != 8 {
-        return EINVAL;
+        return Err(EINVAL);
     }
 
     let _proc = match akuma_exec::process::current_process_shared() {
         Some(p) => p,
-        None => return ENOSYS,
+        None => return Err(ENOSYS),
     };
 
     let mut wait_mask: u64 = 0;
+    // `read_user_into` reports a POSITIVE errno — see `flat` in mod.rs. `?` here
+    // would return a success-looking 14.
     if read_user_into(&mut wait_mask, set_ptr).is_err() {
-        return EFAULT;
+        return Err(EFAULT);
     }
 
     // A NULL timeout is `rt_sigtimedwait`'s "wait forever", which this loop
     // spells as a `u64::MAX` deadline rather than a separate flag.
-    let timeout_us = match time::read_timeout_us(timeout_ptr) {
-        Ok(Some(us)) => us,
-        Ok(None) => u64::MAX,
-        Err(e) => return e,
-    };
+    let timeout_us = time::read_timeout_us(timeout_ptr)?.unwrap_or(u64::MAX);
 
     let start_time = crate::timer::uptime_us();
 
@@ -259,17 +257,17 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
                 let info = Siginfo { si_signo: sig as i32, si_errno: 0, si_code: 0, _pad: [0; 29] };
                 let _ = write_user_val(info_ptr, &info);
             }
-            return u64::from(sig);
+            return Ok(u64::from(sig));
         }
 
         let now = crate::timer::uptime_us();
         let elapsed = now.saturating_sub(start_time);
         if timeout_ptr != 0 && elapsed >= timeout_us {
-            return EAGAIN; // Timeout
+            return Err(EAGAIN); // Timeout
         }
 
         if akuma_exec::process::should_interrupt_blocking_syscall() {
-            return EINTR;
+            return Err(EINTR);
         }
 
         // Sleep until next tick or timeout

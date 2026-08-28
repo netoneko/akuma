@@ -1493,14 +1493,11 @@ pub(super) fn statfs_into(view: &crate::vfs::FsView, buf_ptr: u64) -> u64 {
 /// `statfs(2)` (nr 43) — resolve `path` the way file operations do and report
 /// the mount it lands on. Undispatched before 2026-08-24, which is what broke
 /// busybox `df`.
-pub(super) fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
-    let path = match copy_from_user_str(path_ptr, 256) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
+pub(super) fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> SysResult {
+    let path = copy_from_user_str(path_ptr, 256)?;
     match crate::vfs::stats_for_path(&path) {
-        Ok(view) => statfs_into(&view, buf_ptr),
-        Err(e) => fs_error_to_errno(e),
+        Ok(view) => Ok(statfs_into(&view, buf_ptr)),
+        Err(e) => Err(fs_error_to_errno(e)),
     }
 }
 
@@ -1589,11 +1586,8 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     u64::from(newfd)
 }
 
-pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u64 {
-    let raw_path = match copy_from_user_str(path_ptr, 1024) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> SysResult {
+    let raw_path = copy_from_user_str(path_ptr, 1024)?;
 
     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
         crate::tprint!(128, "[syscall] openat(dirfd={}, path={:?}, flags=0x{:x}, mode=0x{:x})\n", dirfd, raw_path, flags, mode);
@@ -1615,7 +1609,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         if crate::config::SYSCALL_DEBUG_IO_ENABLED {
             crate::safe_print!(128, "[syscall] openat({:?}): O_TMPFILE unsupported -> EINVAL\n", raw_path);
         }
-        return EINVAL;
+        return Err(EINVAL);
     }
 
     let path = if raw_path.starts_with('/') {
@@ -1635,10 +1629,10 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
                     if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                         crate::safe_print!(128, "[syscall] openat: bad dirfd={}\n", dirfd);
                     }
-                    return EBADF;
+                    return Err(EBADF);
                 }
             } else {
-                return EBADF;
+                return Err(EBADF);
             }
         } else {
             String::from("/")
@@ -1674,9 +1668,9 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat(/dev/null) = fd {} flags=0x{:x}\n", fd, flags);
             }
-            return u64::from(fd);
+            return Ok(u64::from(fd));
         }
-        return ESRCH;
+        return Err(ESRCH);
     }
 
     if path == "/dev/urandom" || path == "/dev/random" {
@@ -1688,9 +1682,9 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
             }
-            return u64::from(fd);
+            return Ok(u64::from(fd));
         }
-        return ESRCH;
+        return Err(ESRCH);
     }
 
     if path == "/dev/zero" {
@@ -1702,9 +1696,9 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat(/dev/zero) = fd {} flags=0x{:x}\n", fd, flags);
             }
-            return u64::from(fd);
+            return Ok(u64::from(fd));
         }
-        return ESRCH;
+        return Err(ESRCH);
     }
 
     // /dev/tty — the calling process's controlling terminal. Pagers (`less`,
@@ -1718,12 +1712,12 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
     // "no controlling terminal"): a non-terminal channel is the exec bridge's
     // command stream, and letting a pager read it would corrupt the stream.
     if path == "/dev/tty" {
-        let Some(proc) = akuma_exec::process::current_process_shared() else { return ESRCH };
+        let Some(proc) = akuma_exec::process::current_process_shared() else { return Err(ESRCH) };
         if !akuma_exec::process::current_channel().is_some_and(|ch| ch.is_terminal()) {
             // Linux says ENXIO for "no controlling terminal"; this errno set
             // has no ENXIO (see akuma-primitives/src/errno.rs header note), and
             // ENODEV is the nearest "device not attached" answer.
-            return ENODEV;
+            return Err(ENODEV);
         }
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevTty);
         if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
@@ -1732,7 +1726,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         if crate::config::SYSCALL_DEBUG_IO_ENABLED {
             crate::safe_print!(256, "[syscall] openat(/dev/tty) = fd {} flags=0x{:x}\n", fd, flags);
         }
-        return u64::from(fd);
+        return Ok(u64::from(fd));
     }
 
     // /dev/dsp — virtio-sound output. Only opens when a sound device was found at
@@ -1747,9 +1741,9 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
             }
-            return u64::from(fd);
+            return Ok(u64::from(fd));
         }
-        return ESRCH;
+        return Err(ESRCH);
     }
 
     // /dev/net/tap0 — raw L2 packet device for the rump kernel feature. Only
@@ -1759,7 +1753,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
     #[cfg(feature = "rump")]
     if path == "/dev/net/tap0" {
         if !akuma_net::rump_tap::is_ready() {
-            return ENODEV;
+            return Err(ENODEV);
         }
         if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Tap {
@@ -1771,9 +1765,9 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat(/dev/net/tap0) = fd {} flags=0x{:x}\n", fd, flags);
             }
-            return u64::from(fd);
+            return Ok(u64::from(fd));
         }
-        return ESRCH;
+        return Err(ESRCH);
     }
 
     // Raw block device open (`/dev/vdX`) — `proposals/RAW_BLOCK_DEVICE_FD.md`.
@@ -1783,7 +1777,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         && node.is_block
     {
         let Some(idx) = crate::block::device_index_by_name(node.name) else {
-            return ENODEV;
+            return Err(ENODEV);
         };
         let accmode = flags & 0x3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
         let wants_write = accmode != akuma_exec::process::open_flags::O_RDONLY;
@@ -1795,7 +1789,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(128, "[syscall] openat({}) EBUSY (mounted, write requested)\n", &path);
             }
-            return EBUSY;
+            return Err(EBUSY);
         }
         if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::BlockDev {
@@ -1809,9 +1803,9 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
             }
-            return u64::from(fd);
+            return Ok(u64::from(fd));
         }
-        return ESRCH;
+        return Err(ESRCH);
     }
 
     // Every device with `open()` behavior has returned by now. Anything still in
@@ -1824,14 +1818,14 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         if crate::config::SYSCALL_DEBUG_IO_ENABLED {
             crate::safe_print!(256, "[syscall] openat({}) ENODEV (no fd behavior)\n", &path);
         }
-        return ENODEV;
+        return Err(ENODEV);
     }
 
     let path = if path == "/proc/self/exe" {
         if let Some(proc) = akuma_exec::process::current_process_shared() {
             proc.name.clone()
         } else {
-            return ENOENT;
+            return Err(ENOENT);
         }
     } else {
         path
@@ -1850,7 +1844,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(256, "[syscall] openat({}) ENOENT flags=0x{:x}\n", &path, flags);
             }
-            return ENOENT;
+            return Err(ENOENT);
         }
 
         let (parent_raw, _) = crate::vfs::split_path(&path);
@@ -1864,7 +1858,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
                 if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                     crate::safe_print!(256, "[syscall] openat({}) parent {} not found flags=0x{:x}\n", &path, &parent_path, flags);
                 }
-                return ENOENT;
+                return Err(ENOENT);
             }
         }
     }
@@ -1887,7 +1881,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(128, "[syscall] openat({:?}): write open of directory -> EISDIR\n", path);
             }
-            return EISDIR;
+            return Err(EISDIR);
         }
 
         if !file_existed && (flags & akuma_exec::process::open_flags::O_CREAT != 0) {
@@ -1932,8 +1926,8 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> u6
         if crate::config::SYSCALL_DEBUG_IO_ENABLED {
             crate::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
         }
-        u64::from(fd)
-    } else { ESRCH }
+        Ok(u64::from(fd))
+    } else { Err(ESRCH) }
 }
 
 pub fn sys_close(fd: u32) -> u64 {
@@ -2201,12 +2195,9 @@ akuma_exec::process::FileDescriptor::PipeWrite(_)) => {
     res
 }
 
-pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> u64 {
-    let path = match copy_from_user_str(path_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
+pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u32) -> SysResult {
+    let path = copy_from_user_str(path_ptr, 512)?;
+    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return Err(EFAULT); }
 
     let resolved_path = if path.starts_with('/') {
          String::from(&path)
@@ -2215,20 +2206,20 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
              if let Some(proc) = akuma_exec::process::current_process_shared() {
                  proc.cwd.clone()
              } else {
-                 return ESRCH;
+                 return Err(ESRCH);
              }
         } else if dirfd >= 0 {
              if let Some(proc) = akuma_exec::process::current_process_shared() {
                  if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                      f.path
                  } else {
-                     return EBADF;
+                     return Err(EBADF);
                  }
              } else {
-                 return ESRCH;
+                 return Err(ESRCH);
              }
         } else {
-            return EBADF;
+            return Err(EBADF);
         };
         crate::vfs::resolve_path(&base_path, &path)
     };
@@ -2316,9 +2307,9 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
     })();
 
     if res == 0 && write_user_val(stat_ptr, &stat).is_err() {
-        return EFAULT;
+        return Err(EFAULT);
     }
-    res
+    Ok(res)
 }
 
 pub(super) fn sys_fchmod(fd: u32, mode: u32) -> u64 {
@@ -2335,11 +2326,8 @@ pub(super) fn sys_fchmod(fd: u32, mode: u32) -> u64 {
     }
 }
 
-pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
-    let raw_path = match copy_from_user_str(path_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
+    let raw_path = copy_from_user_str(path_ptr, 512)?;
 
     // Build the dirfd-relative base path (fd-table lookup only, no disk I/O) before
     // entering the VFS BKL window — mirrors sys_unlinkat/sys_mkdirat/sys_renameat.
@@ -2348,19 +2336,19 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
     } else if dirfd == -100 {
         match akuma_exec::process::current_process_shared() {
             Some(proc) => Some(proc.cwd.clone()),
-            None => return EBADF,
+            None => return Err(EBADF),
         }
     } else if dirfd >= 0 {
         let proc = match akuma_exec::process::current_process_shared() {
             Some(p) => p,
-            None => return EBADF,
+            None => return Err(EBADF),
         };
         match proc.get_fd(dirfd as u32) {
             Some(akuma_exec::process::FileDescriptor::File(f)) => Some(f.path),
-            _ => return EBADF,
+            _ => return Err(EBADF),
         }
     } else {
-        return EBADF;
+        return Err(EBADF);
     };
 
     // `resolve_symlinks` does a real on-disk symlink-target lookup (same class of
@@ -2381,12 +2369,12 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> u64 {
     // `/dev/zero` only; through the table it covers every node, so
     // `chmod /dev/urandom` stops returning `ENOENT` for a path that exists.
     if crate::vfs::dev_node(&path).is_some() {
-        return 0;
+        return Ok(0);
     }
 
     match crate::vfs::chmod(&path, mode) {
-        Ok(()) => 0,
-        Err(e) => fs_error_to_errno(e),
+        Ok(()) => Ok(0),
+        Err(e) => Err(fs_error_to_errno(e)),
     }
 }
 
@@ -2432,33 +2420,27 @@ pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
     }
 }
 
-pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> u64 {
-    let path = match copy_from_user_str(path_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> SysResult {
+    let path = copy_from_user_str(path_ptr, 512)?;
     let resolved = if path.starts_with('/') {
         path
     } else if let Some(proc) = akuma_exec::process::current_process_shared() {
         crate::vfs::resolve_path(&proc.cwd, &path)
     } else {
-        return EBADF;
+        return Err(EBADF);
     };
     match crate::vfs::truncate(&resolved, length as u64) {
-        Ok(()) => 0,
-        Err(e) => fs_error_to_errno(e),
+        Ok(()) => Ok(0),
+        Err(e) => Err(fs_error_to_errno(e)),
     }
 }
 
-pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64) -> u64 {
+pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64) -> SysResult {
     // Early-out before any fs work; the copy at the end validates again for real. Sized
     // from the struct so the two can no longer disagree.
-    if !validate_user_ptr(buf_ptr, core::mem::size_of::<Statx>()) { return EFAULT; }
+    if !validate_user_ptr(buf_ptr, core::mem::size_of::<Statx>()) { return Err(EFAULT); }
 
-    let path = match copy_from_user_str(path_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+    let path = copy_from_user_str(path_ptr, 512)?;
 
     // `fd_inode` is non-zero only for the `AT_EMPTY_PATH` form — "stat the open
     // file description itself", i.e. `fstat` spelled as `statx`. That form gets
@@ -2475,13 +2457,13 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
                     fd_mount = f.mount_id();
                     f.path
                 } else {
-                    return EBADF;
+                    return Err(EBADF);
                 }
             } else {
-                return EBADF;
+                return Err(EBADF);
             }
         } else {
-            return ENOENT;
+            return Err(ENOENT);
         }
     } else if path.starts_with('/') {
         String::from(&path)
@@ -2490,20 +2472,20 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
             if let Some(proc) = akuma_exec::process::current_process_shared() {
                 proc.cwd.clone()
             } else {
-                return EBADF;
+                return Err(EBADF);
             }
         } else if dirfd >= 0 {
             if let Some(proc) = akuma_exec::process::current_process_shared() {
                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                     f.path
                 } else {
-                    return EBADF;
+                    return Err(EBADF);
                 }
             } else {
-                return EBADF;
+                return Err(EBADF);
             }
         } else {
-            return EINVAL;
+            return Err(EINVAL);
         };
         crate::vfs::resolve_path(&base_path, &path)
     };
@@ -2536,7 +2518,7 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
                 let target = crate::vfs::read_symlink(&final_path).unwrap_or_default();
                 (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0)
             } else {
-                return ENOENT;
+                return Err(ENOENT);
             }
         };
 
@@ -2570,16 +2552,13 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
     };
 
     if write_user_val(buf_ptr, &statx).is_err() {
-        return EFAULT;
+        return Err(EFAULT);
     }
-    0
+    Ok(0)
 }
 
-pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> u64 {
-    let path = match copy_from_user_str(path_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> SysResult {
+    let path = copy_from_user_str(path_ptr, 512)?;
     
     let resolved_path = if path.starts_with('/') {
          path
@@ -2588,32 +2567,32 @@ pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32)
              if let Some(proc) = akuma_exec::process::current_process_shared() {
                  proc.cwd.clone()
              } else {
-                 return ESRCH;
+                 return Err(ESRCH);
              }
         } else if dirfd >= 0 {
              if let Some(proc) = akuma_exec::process::current_process_shared() {
                  if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
                      f.path
                  } else {
-                     return EBADF;
+                     return Err(EBADF);
                  }
              } else {
-                 return ESRCH;
+                 return Err(ESRCH);
              }
         } else {
-            return EBADF;
+            return Err(EBADF);
         };
         crate::vfs::resolve_path(&base_path, &path)
     };
     
     let final_path = crate::vfs::resolve_symlinks(&resolved_path);
     if crate::fs::exists(&final_path) || crate::vfs::is_symlink(&resolved_path) {
-        0
+        Ok(0)
     } else {
         if crate::config::SYSCALL_DEBUG_IO_ENABLED {
             crate::safe_print!(128, "[syscall] faccessat: ENOENT {}\n", final_path);
         }
-        ENOENT
+        Err(ENOENT)
     }
 }
 
@@ -2709,11 +2688,8 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     }
 }
 
-pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
-    let raw_path = match copy_from_user_str(path_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> SysResult {
+    let raw_path = copy_from_user_str(path_ptr, 512)?;
 
     // Build the dirfd-relative base path (fd-table lookup only, no disk I/O) before
     // entering the VFS BKL window — mirrors sys_unlinkat/sys_renameat: early-return
@@ -2724,19 +2700,19 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
     } else if dirfd == -100 {
         match akuma_exec::process::current_process_shared() {
             Some(proc) => Some(proc.cwd.clone()),
-            None => return EBADF,
+            None => return Err(EBADF),
         }
     } else if dirfd >= 0 {
         let proc = match akuma_exec::process::current_process_shared() {
             Some(p) => p,
-            None => return EBADF,
+            None => return Err(EBADF),
         };
         match proc.get_fd(dirfd as u32) {
             Some(akuma_exec::process::FileDescriptor::File(f)) => Some(f.path),
-            _ => return EBADF,
+            _ => return Err(EBADF),
         }
     } else {
-        return EBADF;
+        return Err(EBADF);
     };
 
     // `crate::fs::create_dir` takes the ext2 write guard for the on-disk inode
@@ -2755,16 +2731,13 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> u64 {
     }
 
     match crate::fs::create_dir(&path) {
-        Ok(()) => 0,
-        Err(e) => fs_error_to_errno(e),
+        Ok(()) => Ok(0),
+        Err(e) => Err(fs_error_to_errno(e)),
     }
 }
 
-pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
-    let path = match copy_from_user_str(path_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> SysResult {
+    let path = copy_from_user_str(path_ptr, 512)?;
 
     // Build the dirfd-relative base path (fd-table lookups only, no disk I/O) before
     // entering the VFS BKL window — matches sys_statx/sys_newfstatat: the early-return
@@ -2778,19 +2751,19 @@ pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
     } else if dirfd == -100 {
         match akuma_exec::process::current_process_shared() {
             Some(proc) => Some(proc.cwd.clone()),
-            None => return EBADF,
+            None => return Err(EBADF),
         }
     } else if dirfd >= 0 {
         let proc = match akuma_exec::process::current_process_shared() {
             Some(p) => p,
-            None => return EBADF,
+            None => return Err(EBADF),
         };
         match proc.get_fd(dirfd as u32) {
             Some(akuma_exec::process::FileDescriptor::File(f)) => Some(f.path),
-            _ => return EBADF,
+            _ => return Err(EBADF),
         }
     } else {
-        return EBADF;
+        return Err(EBADF);
     };
 
     // From here on is pure VFS work (directory walk + ext2 inode/block deallocation, which
@@ -2820,27 +2793,21 @@ pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> u64 {
 
     if flags & akuma_syscalls_linux::flags::at::AT_REMOVEDIR != 0 {
         match crate::fs::remove_dir(&resolved) {
-            Ok(()) => 0,
-            Err(e) => fs_error_to_errno(e),
+            Ok(()) => Ok(0),
+            Err(e) => Err(fs_error_to_errno(e)),
         }
     } else {
         crate::vfs::remove_symlink(&resolved);
         match crate::fs::remove_file(&resolved) {
-            Ok(()) => 0,
-            Err(e) => fs_error_to_errno(e),
+            Ok(()) => Ok(0),
+            Err(e) => Err(fs_error_to_errno(e)),
         }
     }
 }
 
-pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64) -> u64 {
-    let raw_old = match copy_from_user_str(oldpath_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    let raw_new = match copy_from_user_str(newpath_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64) -> SysResult {
+    let raw_old = copy_from_user_str(oldpath_ptr, 512)?;
+    let raw_new = copy_from_user_str(newpath_ptr, 512)?;
 
     // From here on is pure VFS work (dirfd/cwd-relative path resolution — fd-table +
     // string ops only, no disk I/O — plus the on-disk directory-entry rewrite in
@@ -2853,30 +2820,24 @@ pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpa
     let newpath = resolve_path_at(newdirfd, &raw_new);
     crate::safe_print!(256, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
     match crate::fs::rename(&oldpath, &newpath) {
-        Ok(()) => 0,
-        Err(e) => fs_error_to_errno(e),
+        Ok(()) => Ok(0),
+        Err(e) => Err(fs_error_to_errno(e)),
     }
 }
 
 const RENAME_NOREPLACE: u32 = 1;
 const RENAME_EXCHANGE: u32 = 2;
 
-pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64, flags: u32) -> u64 {
+pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64, flags: u32) -> SysResult {
     if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 {
-        return super::EINVAL;
+        return Err(super::EINVAL);
     }
     if flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0 {
-        return super::EINVAL;
+        return Err(super::EINVAL);
     }
 
-    let raw_old = match copy_from_user_str(oldpath_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    let raw_new = match copy_from_user_str(newpath_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+    let raw_old = copy_from_user_str(oldpath_ptr, 512)?;
+    let raw_new = copy_from_user_str(newpath_ptr, 512)?;
 
     // See sys_renameat above: path resolution is fd-table/string work only, and the
     // window also covers the `exists` probe (a real lookup) and `crate::fs::rename`
@@ -2887,60 +2848,51 @@ pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newp
     let newpath = resolve_path_at(newdirfd, &raw_new);
 
     if flags & RENAME_NOREPLACE != 0 && crate::vfs::exists(&newpath) {
-        return super::EEXIST;
+        return Err(super::EEXIST);
     }
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(256, "[syscall] renameat2: {} -> {} flags=0x{:x}\n", oldpath, newpath, flags);
     }
     match crate::fs::rename(&oldpath, &newpath) {
-        Ok(()) => 0,
-        Err(e) => fs_error_to_errno(e),
+        Ok(()) => Ok(0),
+        Err(e) => Err(fs_error_to_errno(e)),
     }
 }
 
-pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> u64 {
-    let target = match copy_from_user_str(target_ptr, 1024) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    let raw_link = match copy_from_user_str(linkpath_ptr, 1024) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> SysResult {
+    let target = copy_from_user_str(target_ptr, 1024)?;
+    let raw_link = copy_from_user_str(linkpath_ptr, 1024)?;
     let link_path = resolve_path_at(newdirfd, &raw_link);
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(256, "[syscall] symlinkat: {} -> {}\n", link_path, target);
     }
     match crate::vfs::create_symlink(&link_path, &target) {
-        Ok(()) => 0,
-        Err(e) => fs_error_to_errno(e),
+        Ok(()) => Ok(0),
+        Err(e) => Err(fs_error_to_errno(e)),
     }
 }
 
-pub(super) fn sys_linkat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpath_ptr: u64, _flags: u32) -> u64 {
-    let oldpath = match copy_from_user_str(oldpath_ptr, 1024) { Ok(p) => p, Err(e) => return e };
-    let newpath = match copy_from_user_str(newpath_ptr, 1024) { Ok(p) => p, Err(e) => return e };
+pub(super) fn sys_linkat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpath_ptr: u64, _flags: u32) -> SysResult {
+    let oldpath = copy_from_user_str(oldpath_ptr, 1024)?;
+    let newpath = copy_from_user_str(newpath_ptr, 1024)?;
     let src = resolve_path_at(_olddirfd, &oldpath);
     let dst = resolve_path_at(_newdirfd, &newpath);
     match crate::fs::read_file(&src) {
         Ok(data) => match crate::fs::write_file(&dst, &data) {
-            Ok(()) => 0,
-            Err(e) => fs_error_to_errno(e),
+            Ok(()) => Ok(0),
+            Err(e) => Err(fs_error_to_errno(e)),
         },
-        Err(e) => fs_error_to_errno(e),
+        Err(e) => Err(fs_error_to_errno(e)),
     }
 }
 
-pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> u64 {
-    let raw_path = match copy_from_user_str(path_ptr, 1024) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> SysResult {
+    let raw_path = copy_from_user_str(path_ptr, 1024)?;
     let path = resolve_path_at(dirfd, &raw_path);
 
     if path == "/proc/self/exe" {
-        if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
+        if !validate_user_ptr(buf_ptr, bufsize) { return Err(EFAULT); }
         let exe = if let Some(proc) = akuma_exec::process::current_process_shared() {
             proc.name.clone()
         } else {
@@ -2949,9 +2901,9 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
         let bytes = exe.as_bytes();
         let copy_len = bytes.len().min(bufsize);
         if copy_to_user(buf_ptr, &bytes[..copy_len]).is_err() {
-            return EFAULT;
+            return Err(EFAULT);
         }
-        return copy_len as u64;
+        return Ok(copy_len as u64);
     }
 
     // Try filesystem symlinks first (includes File fds in procfs)
@@ -2960,19 +2912,19 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
         .or_else(|| crate::vfs::proc::proc_fd_description(&path));
 
     if let Some(target) = target {
-        if !validate_user_ptr(buf_ptr, bufsize) { return EFAULT; }
+        if !validate_user_ptr(buf_ptr, bufsize) { return Err(EFAULT); }
         let bytes = target.as_bytes();
         let copy_len = bytes.len().min(bufsize);
         if copy_to_user(buf_ptr, &bytes[..copy_len]).is_err() {
-            return EFAULT;
+            return Err(EFAULT);
         }
-        return copy_len as u64;
+        return Ok(copy_len as u64);
     }
 
     if crate::vfs::exists(&path) {
-        EINVAL
+        Err(EINVAL)
     } else {
-        ENOENT
+        Err(ENOENT)
     }
 }
 
@@ -3083,11 +3035,8 @@ pub(super) fn sys_fchdir(fd: u32) -> u64 {
     ENOTDIR
 }
 
-pub(super) fn sys_chdir(ptr: u64) -> u64 {
-    let path = match copy_from_user_str(ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+pub(super) fn sys_chdir(ptr: u64) -> SysResult {
+    let path = copy_from_user_str(ptr, 512)?;
     
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let new_cwd = crate::vfs::resolve_path(&proc.cwd, &path);
@@ -3097,9 +3046,9 @@ pub(super) fn sys_chdir(ptr: u64) -> u64 {
                 && meta.is_dir {
                     // Pre-built String moved into the IRQ-masked closure (no alloc inside).
                     akuma_exec::process::with_current_process(|p| p.cwd = new_cwd);
-                    return 0;
+                    return Ok(0);
                 }
-        return ENOENT;
+        return Err(ENOENT);
     }
-    ESRCH
+    Err(ESRCH)
 }

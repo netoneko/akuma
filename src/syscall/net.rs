@@ -472,26 +472,23 @@ pub(super) const MSG_TRUNC: i32 = 0x20;
 /// **not** the same as passing an unnamed address: the first means "no
 /// destination given" (fine on a connected socket), the second is a malformed
 /// one. `read_dest` keeps them apart.
-fn unix_send_user(fd: u32, buf_ptr: u64, len: usize, flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
-    let dest = match super::unixsock::read_dest(dest_addr, addr_len) {
-        Ok(d) => d,
-        Err(e) => return e,
-    };
+fn unix_send_user(fd: u32, buf_ptr: u64, len: usize, flags: i32, dest_addr: u64, addr_len: usize) -> SysResult {
+    let dest = super::unixsock::read_dest(dest_addr, addr_len)?;
     let dontwait = flags & MSG_DONTWAIT != 0;
     if len == 0 {
-        return super::unixsock::unix_sendto(fd, &[], dest.as_ref(), dontwait);
+        return Ok(super::unixsock::unix_sendto(fd, &[], dest.as_ref(), dontwait));
     }
     if !validate_user_ptr(buf_ptr, len) {
-        return EFAULT;
+        return Err(EFAULT);
     }
     let mut kbuf = match alloc_net_bounce(len) {
         Some(b) => b,
-        None => return ENOMEM,
+        None => return Err(ENOMEM),
     };
     if copy_from_user(&mut kbuf, buf_ptr).is_err() {
-        return EFAULT;
+        return Err(EFAULT);
     }
-    super::unixsock::unix_sendto(fd, &kbuf, dest.as_ref(), dontwait)
+    Ok(super::unixsock::unix_sendto(fd, &kbuf, dest.as_ref(), dontwait))
 }
 
 /// Receive from a unix socket into a user buffer. Returns `(ret, truncated)`.
@@ -528,7 +525,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
     // also take, which must not happen in the BKL-free window (AB-BA with a
     // nested IRQ's enter_kernel — see NetBklGuard).
     if fd_is_unix_socket(fd) {
-        return unix_send_user(fd, buf_ptr, len, _flags, dest_addr, addr_len);
+        return flat(unix_send_user(fd, buf_ptr, len, _flags, dest_addr, addr_len));
     }
     let _net_bkl = NetBklGuard::new();
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
@@ -703,7 +700,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
 #[cfg(not(feature = "smoltcp"))]
 pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _dest_addr: u64, _addr_len: usize) -> u64 {
     if fd_is_unix_socket(fd) {
-        return unix_send_user(fd, buf_ptr, len, _flags, _dest_addr, _addr_len);
+        return flat(unix_send_user(fd, buf_ptr, len, _flags, _dest_addr, _addr_len));
     }
     EBADF
 }
@@ -1134,7 +1131,7 @@ pub(super) fn unix_recvmsg_entry(fd: u32, msg_ptr: u64, flags: i32) -> u64 {
     if msg.msg_iovlen != 0 && copy_from_user(as_user_bytes_mut(&mut iovs), msg.msg_iov).is_err() {
         return EFAULT;
     }
-    unix_recvmsg(fd, msg_ptr, &mut msg, &iovs, flags)
+    flat(unix_recvmsg(fd, msg_ptr, &mut msg, &iovs, flags))
 }
 
 /// `sendmsg` on an AF_UNIX fd: gather every iovec, then one framed send.
@@ -1144,28 +1141,22 @@ pub(super) fn unix_recvmsg_entry(fd: u32, msg_ptr: u64, flags: i32) -> u64 {
 /// separately. Ignoring it would make `sendmsg` work on connected sockets only,
 /// silently, and datagram libraries reach for `sendmsg` precisely when they have
 /// both a destination and multiple buffers.
-fn unix_sendmsg(fd: u32, msg: &MsgHdr, iovs: &[super::fs::IoVec], flags: i32) -> u64 {
-    let dest = match super::unixsock::read_dest(msg.msg_name, msg.msg_namelen as usize) {
-        Ok(d) => d,
-        Err(e) => return e,
-    };
-    let buf = match gather_iovecs(iovs) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-    super::unixsock::unix_sendto(fd, &buf, dest.as_ref(), flags & MSG_DONTWAIT != 0)
+fn unix_sendmsg(fd: u32, msg: &MsgHdr, iovs: &[super::fs::IoVec], flags: i32) -> SysResult {
+    let dest = super::unixsock::read_dest(msg.msg_name, msg.msg_namelen as usize)?;
+    let buf = gather_iovecs(iovs)?;
+    Ok(super::unixsock::unix_sendto(fd, &buf, dest.as_ref(), flags & MSG_DONTWAIT != 0))
 }
 
 /// `recvmsg` on an AF_UNIX fd: one framed receive, then scatter across the
 /// iovecs. Writes `msg_flags`/`msg_controllen` back through `msg_ptr`.
-fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVec], flags: i32) -> u64 {
+fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVec], flags: i32) -> SysResult {
     let capacity: usize = iovs.iter().map(|v| v.iov_len).sum();
     let mut kbuf = if capacity == 0 {
         alloc::vec::Vec::new()
     } else {
         match alloc_net_bounce(capacity) {
             Some(b) => b,
-            None => return ENOMEM,
+            None => return Err(ENOMEM),
         }
     };
     let (ret, truncated) = super::unixsock::unix_recv(
@@ -1175,22 +1166,19 @@ fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVe
         flags & MSG_PEEK != 0,
     );
     if (ret as i64) < 0 {
-        return ret;
+        return Ok(ret);
     }
     let n = (ret as usize).min(kbuf.len());
-    let written = match scatter_iovecs(iovs, &kbuf[..n]) {
-        Ok(w) => w,
-        Err(e) => return e,
-    };
+    let written = scatter_iovecs(iovs, &kbuf[..n])?;
     // Ancillary data is not implemented (Phase 4), so report none rather than
     // leaving the caller's `msg_controllen` untouched — a stale non-zero value
     // would make it parse whatever was in its own buffer as a cmsg header.
     msg.msg_controllen = 0;
     msg.msg_flags = if truncated { MSG_TRUNC } else { 0 };
     if write_user_val(msg_ptr, msg).is_err() {
-        return EFAULT;
+        return Err(EFAULT);
     }
-    written as u64
+    Ok(written as u64)
 }
 
 #[cfg(feature = "smoltcp")]
@@ -1215,7 +1203,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     // zero-length message on a framed socket is a real, deliverable datagram,
     // and returning 0 without sending it makes the peer wait forever.
     if fd_is_unix_socket(fd) {
-        return unix_sendmsg(fd, &msg, &iovs, _flags);
+        return flat(unix_sendmsg(fd, &msg, &iovs, _flags));
     }
 
     if msg.msg_iovlen == 0 { return 0; }
@@ -1367,7 +1355,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     // other one untouched — so a caller reading a fixed header into iov[0] and
     // a payload into iov[1] got the header and silently nothing else.
     if fd_is_unix_socket(fd) {
-        return unix_recvmsg(fd, msg_ptr, &mut msg, &iovs, _flags);
+        return flat(unix_recvmsg(fd, msg_ptr, &mut msg, &iovs, _flags));
     }
 
     if msg.msg_iovlen == 0 { return 0; }
@@ -1841,7 +1829,7 @@ pub(super) fn dispatch_socket(domain: i32, sock_type: i32, proto: i32) -> u64 {
 /// `bind(2)`.
 pub(super) fn dispatch_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if fd_is_unix_socket(fd) {
-        return super::unixsock::sys_bind(fd, addr_ptr, len);
+        return flat(super::unixsock::sys_bind(fd, addr_ptr, len));
     }
     #[cfg(feature = "smoltcp")]
     {
@@ -1894,7 +1882,7 @@ pub(super) fn dispatch_accept(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) 
 /// `connect(2)`.
 pub(super) fn dispatch_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     if fd_is_unix_socket(fd) {
-        return super::unixsock::sys_connect(fd, addr_ptr, len);
+        return flat(super::unixsock::sys_connect(fd, addr_ptr, len));
     }
     #[cfg(feature = "smoltcp")]
     {

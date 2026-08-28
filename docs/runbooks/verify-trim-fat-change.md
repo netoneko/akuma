@@ -34,11 +34,33 @@ parent commit. Read its module docstring first: every measurement in it is there
 because doing that measurement by hand gave a wrong answer at least once.
 
 ```bash
-scripts/verify_trim.py --out mine.txt
+VERIFY_LOGDIR=/tmp/v-mine scripts/verify_trim.py --out mine.txt
 git worktree add /tmp/base <parent-commit>
-(cd /tmp/base && scripts/verify_trim.py --instance 1 --out /tmp/base.txt)
+cp scripts/verify_trim.py /tmp/base/scripts/          # see "the baseline's own gate" below
+(cd /tmp/base && VERIFY_LOGDIR=/tmp/v-base scripts/verify_trim.py --instance 1 --out /tmp/base.txt)
 diff /tmp/base.txt mine.txt
 ```
+
+**Set `VERIFY_LOGDIR` per arm.** It defaults to `/tmp` for both, so the second
+run overwrites `verify_smp1.log` / `verify_smp4.log` from the first — and those
+are exactly the files the `passed_marker ±1` row below tells you to `diff` when
+a row moves. Losing them turns a two-minute confirmation into another pair of
+four-minute runs. (Added 2026-08-28, after doing precisely that.)
+
+**Run the two arms sequentially, not in parallel.** Each boot kills stale QEMU
+first; until 2026-08-28 that kill was a bare `pkill -f qemu-system-aarch64`,
+which takes down the *other* arm's VM mid-run — and every other VM on the
+machine, which CLAUDE.md § "Waiting for a VM" bans for that reason. It is now
+matched on the arm's own `hostfwd` port, so parallel runs no longer kill each
+other; sequential is still the safer default, because both arms contend for host
+CPU and Tier 3 is timing-sensitive.
+
+**The baseline's own gate may be broken.** `verify_trim.py` is a *tool*, not the
+thing under test, so copy your fixed copy into the baseline worktree rather than
+running whatever shipped at that commit. Concretely: at `dacbe557` and earlier,
+`boot_once` called `wait_for_marker(log_path, port=port, proc=qemu)` with
+**neither name bound** — an `UnboundLocalError` that aborts the run before the
+first boot. Fixed 2026-08-28; any baseline older than that needs the copy.
 
 `--instance 1` shifts the forwarded ports and opens the **main** worktree's
 `disk.img` in snapshot mode (writes discarded), so the baseline worktree can boot
@@ -286,9 +308,9 @@ Memory / fork / CoW binaries already on `disk.img` — all self-reporting:
 | `elftest` | `elftest: ALL tests PASSED` (**exit code 42 is success**, by design) |
 | `forkprobe` | `forkprobe: ALL PASS` |
 | `stackstress` | `stackstress: PASSED after …` |
-| `bssfork` | `failures=0` … `bssfork PASS` |
+| `bssfork` | `failures=0` … `bssfork PASS` — **but it is stochastic at SMP=4, and a single sample means nothing.** Measured 2026-08-28, five runs per arm on one boot each: **2/5 PASS on both** a changed tree and an unmodified worktree at its parent. The gate's one-shot Tier 3 therefore reports `ok` or `UNEXPECTED`/`Segmentation fault` for this row essentially at random. Treat a `bssfork` difference between arms as unresolved until you have sampled five runs per arm, exactly as the `cowstale` rows below already require. The `bssfork 20 8 1` control was 5/5 PASS on both arms in the same session, which is what separates "this probe is flaky" from "fork is broken" |
 | `bssfork 20 8 1` | `failures=0` … `bssfork PASS`. **Not `bssfork spread=1`** — the binary's CLI is positional (`bssfork [rounds] [threads] [spread]`), not `key=value`; running the literal string `spread=1` feeds it into `rounds`, `strtoul` parses that as `0`, and `spread` silently defaults to `0` too. `rounds=0` skips the fork loop entirely, so `g_stop` fires almost instantly and the liveness check flags threads `[never ran]` before they get scheduled at all — nothing to do with CoW or the kernel. **Corrected 2026-08-14**: the "BROKEN PRE-EXISTING" verdict recorded here on 2026-08-13 (`failures=7`/`8`, `ticks=0`, "unexplained regression") was this same mis-invocation on both `main` and the branch; the real control, invoked correctly, passed 8/8 clean runs at SMP=4 on first re-check. See `docs/archive/PMM_EXTRACT.md` §8 for the full correction |
-| `cowstale` | `reader_faults=0 failures=0` … `cowstale PASS` |
+| `cowstale` | `reader_faults=0 failures=0` … `cowstale PASS`. **At SMP=4 it does not reach that today: measured 2026-08-28, 0/5 on both arms** (changed tree and an unmodified worktree at its parent, same boot conditions, `HVF=0`, 2 GB). That is consistent with — and stronger than — the SMP=1/SMP=2 rows in the failure table above, which record the same probe failing pre-existing at lower core counts. It means a `cowstale: UNEXPECTED` at SMP=4 carries **no** information about your change; it is the expected reading. Do not spend time on it without first re-establishing a passing baseline |
 | `madvshared` | `madvshared: ALL PASS`. `MADV_DONTNEED` on a CoW-shared frame must not touch the peer's page — the null-`Rc` mechanism (`../archive/CARGO_HEAP_NULL_RC.md`), fixed 2026-08-14. Deterministic, milliseconds, no allocator involved, and **calibrated**: the identical static binary PASSes all three phases on real Linux arm64 (`docker run --rm --platform linux/arm64 -v "$PWD:/w:ro" alpine /w/madvshared`), so a FAIL is the kernel, not the probe. Before the fix it reported `2 FAIL` at both SMP=1 and SMP=4 |
 | `mmapsum <path>` | six digests; **needs a path argument**. `read:`/`mmap1:`/`mmap2:`/`madv:` must all be **the same value** — `madv:` is the regression check for the 2026-07-25 `MADV_WILLNEED`-installs-zeroed-frames bug. `mtA:`/`mtB:` hash **one half each** and are *supposed* to differ from that value and from each other; only their stability across runs means anything |
 | `forktest_parent -duration=20s` | `All children processed via epoll. Parent exiting.` |

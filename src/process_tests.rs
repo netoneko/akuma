@@ -7492,6 +7492,7 @@ fn test_sa_restart_logic() {
 
 /// Verify that rt_sigtimedwait correctly returns EAGAIN on timeout.
 fn test_rt_sigtimedwait_timeout() {
+    use crate::syscall::flat;
     use crate::syscall::signal::sys_rt_sigtimedwait;
     use akuma_exec::threading::current_thread_id;
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
@@ -7512,12 +7513,12 @@ fn test_rt_sigtimedwait_timeout() {
     
     // 4. Call sigtimedwait
     crate::syscall::BYPASS_VALIDATION.store(true, core::sync::atomic::Ordering::Release);
-    let res = sys_rt_sigtimedwait(
+    let res = flat(sys_rt_sigtimedwait(
         &raw mut mask as u64,
         0,
         &raw const ts as u64,
         8
-    );
+    ));
     crate::syscall::BYPASS_VALIDATION.store(false, core::sync::atomic::Ordering::Release);
 
     // Cleanup
@@ -7609,6 +7610,7 @@ fn test_shared_signal_handlers() {
 fn test_rt_sigtimedwait() {
     use akuma_exec::threading::{pend_signal_for_thread, current_thread_id};
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
+    use crate::syscall::flat;
     use crate::syscall::signal::sys_rt_sigtimedwait;
 
     let tid = current_thread_id();
@@ -7627,7 +7629,7 @@ fn test_rt_sigtimedwait() {
     // 3. Call sigtimedwait (bypass validation since we use kernel stack)
     crate::syscall::BYPASS_VALIDATION.store(true, core::sync::atomic::Ordering::Release);
     let mut mask_val = wait_mask;
-    let res = sys_rt_sigtimedwait(&raw mut mask_val as u64, 0, 0, 8);
+    let res = flat(sys_rt_sigtimedwait(&raw mut mask_val as u64, 0, 0, 8));
     crate::syscall::BYPASS_VALIDATION.store(false, core::sync::atomic::Ordering::Release);
 
     // Cleanup

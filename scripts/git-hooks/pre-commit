@@ -9,6 +9,15 @@ HOST_TARGET="$(rustc -vV | grep '^host:' | cut -d' ' -f2)"
 # console. Two cheap, high-confidence greps for the two worst violation shapes;
 # both are full-tree, matching the clippy loop below.
 
+# errno-sign rule (src/syscall/mod.rs `flat`): `akuma_exec::mmu::user_access`'s
+# helpers return a POSITIVE errno, this layer's own return the NEGATED form. A
+# syscall arm returning `SysResult` can `?` the wrong one and hand userspace a
+# positive value, which decodes as SUCCESS. Cheap grep, versioned in scripts/.
+echo "errno-sign rule: no \`?\` on a positive-errno user_access helper"
+if [ -x scripts/check_errno_sign.py ]; then
+    scripts/check_errno_sign.py || exit 1
+fi
+
 echo "console-print rule: no reimplemented core::fmt::Write writers"
 VIOLATIONS="$(grep -rnE 'impl(<[^>]*>)? core::fmt::Write for' src/ crates/*/src/ --include='*.rs' \
     | grep -v '^crates/akuma-primitives/src/console\.rs:')"

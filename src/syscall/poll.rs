@@ -959,10 +959,10 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
 /// failed with `[7] Could not connect to server` about one RTT into a connection
 /// that had in fact succeeded. `poll(2)` callers were unaffected, which is why
 /// apk cargo and `/bin/curl` always worked.
-pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64, _sigmask_ptr: u64) -> u64 {
-    if nfds == 0 { return 0; }
+pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64, _sigmask_ptr: u64) -> SysResult {
+    if nfds == 0 { return Ok(0); }
     const MAX_FDS: usize = 1024;
-    if nfds > MAX_FDS { return EINVAL; }
+    if nfds > MAX_FDS { return Err(EINVAL); }
     let nwords = nfds.div_ceil(64);
     let fd_set_bytes = nwords * 8;
 
@@ -973,22 +973,21 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
         && copy_from_user(&mut as_user_bytes_mut(&mut orig_read)[..fd_set_bytes], readfds_ptr)
             .is_err()
     {
-        return EFAULT;
+        return Err(EFAULT);
     }
     if writefds_ptr != 0
         && copy_from_user(&mut as_user_bytes_mut(&mut orig_write)[..fd_set_bytes], writefds_ptr)
             .is_err()
     {
-        return EFAULT;
+        return Err(EFAULT);
     }
 
     // NULL timeout = block indefinitely. `infinite`/`timeout_us` stay two
     // locals because the wait loops below read them separately; the pair is
     // derived from one `Option` so they cannot disagree.
-    let (infinite, timeout_us) = match time::read_timeout_us(timeout_ptr) {
-        Ok(Some(us)) => (false, us),
-        Ok(None) => (true, 0),
-        Err(e) => return e,
+    let (infinite, timeout_us) = match time::read_timeout_us(timeout_ptr)? {
+        Some(us) => (false, us),
+        None => (true, 0),
     };
 
     let start_time = crate::timer::uptime_us();
@@ -1083,22 +1082,22 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
             if readfds_ptr != 0
                 && copy_to_user(readfds_ptr, &as_user_bytes(&out_read)[..fd_set_bytes]).is_err()
             {
-                return EFAULT;
+                return Err(EFAULT);
             }
             if writefds_ptr != 0
                 && copy_to_user(writefds_ptr, &as_user_bytes(&out_write)[..fd_set_bytes]).is_err()
             {
-                return EFAULT;
+                return Err(EFAULT);
             }
             // No exceptional conditions exist here, but the set still has to be
             // written — see this function's doc comment.
             if exceptfds_ptr != 0 {
                 let cleared = [0u8; MAX_FDS / 8];
                 if copy_to_user(exceptfds_ptr, &cleared[..fd_set_bytes]).is_err() {
-                    return EFAULT;
+                    return Err(EFAULT);
                 }
             }
-            return ready_count;
+            return Ok(ready_count);
         }
 
         if matches!(step, WaitStep::Failed(WaitError::TimedOut)) {
@@ -1107,15 +1106,15 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
             // function's doc comment and `run_pselect6_exceptfds_test`.
             let cleared = [0u8; MAX_FDS / 8];
             if readfds_ptr != 0 && copy_to_user(readfds_ptr, &cleared[..fd_set_bytes]).is_err() {
-                return EFAULT;
+                return Err(EFAULT);
             }
             if writefds_ptr != 0 && copy_to_user(writefds_ptr, &cleared[..fd_set_bytes]).is_err() {
-                return EFAULT;
+                return Err(EFAULT);
             }
             if exceptfds_ptr != 0 && copy_to_user(exceptfds_ptr, &cleared[..fd_set_bytes]).is_err() {
-                return EFAULT;
+                return Err(EFAULT);
             }
-            return 0;
+            return Ok(0);
         }
 
         // Without this, a pending signal (e.g. SIGALRM from setitimer/alarm())
@@ -1132,7 +1131,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
         // EINTR, and that is what ppoll does too.
         match step {
             // Linux leaves the fd sets unmodified on EINTR, and so does ppoll.
-            WaitStep::Failed(WaitError::Interrupted) => return EINTR,
+            WaitStep::Failed(WaitError::Interrupted) => return Err(EINTR),
             WaitStep::Park { deadline_us, .. } => {
                 akuma_exec::threading::schedule_blocking(deadline_us);
             }
@@ -1194,14 +1193,14 @@ pub fn run_pselect6_exceptfds_test() {
     // Ready path: the write fd is writable, so pselect6 returns > 0.
     let mut wset = bit(wfd);
     let mut eset = bit(wfd);
-    let rc_ready = sys_pselect6(
+    let rc_ready = flat(sys_pselect6(
         (wfd + 1) as usize,
         0,
         &raw mut wset as u64,
         &raw mut eset as u64,
         &raw mut ts as u64,
         0,
-    );
+    ));
     let ready_ok = rc_ready > 0 && wset[(wfd / 64) as usize] & (1u64 << (wfd % 64)) != 0;
     let ready_except_cleared = eset[(wfd / 64) as usize] & (1u64 << (wfd % 64)) == 0;
 
@@ -1209,14 +1208,14 @@ pub fn run_pselect6_exceptfds_test() {
     // must still have cleared the set it was handed.
     let mut rset = bit(rfd);
     let mut eset2 = bit(rfd);
-    let rc_timeout = sys_pselect6(
+    let rc_timeout = flat(sys_pselect6(
         (rfd + 1) as usize,
         &raw mut rset as u64,
         0,
         &raw mut eset2 as u64,
         &raw mut ts as u64,
         0,
-    );
+    ));
     let timeout_ok = rc_timeout == 0;
     let timeout_except_cleared = eset2[(rfd / 64) as usize] & (1u64 << (rfd % 64)) == 0;
 
@@ -1277,14 +1276,14 @@ pub fn run_pselect6_registers_waker_test() {
     let mut rset = [0u64; 16];
     rset[(rfd / 64) as usize] |= 1u64 << (rfd % 64);
     let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-    let rc = sys_pselect6(
+    let rc = flat(sys_pselect6(
         (rfd + 1) as usize,
         &raw mut rset as u64,
         0,
         0,
         &raw mut ts as u64,
         0,
-    );
+    ));
 
     let after = super::pipe::pipe_poller_count(pipe_id);
 
@@ -1359,14 +1358,14 @@ pub fn run_pselect6_eintr_test() {
     rset[(rfd / 64) as usize] |= 1u64 << (rfd % 64);
     let mut ts = Timespec { tv_sec: 0, tv_nsec: 300_000_000 };
     let started = crate::timer::uptime_us();
-    let rc = sys_pselect6(
+    let rc = flat(sys_pselect6(
         (rfd + 1) as usize,
         &raw mut rset as u64,
         0,
         0,
         &raw mut ts as u64,
         0,
-    );
+    ));
     let elapsed = crate::timer::uptime_us().saturating_sub(started);
 
     if let Some(ch) = akuma_exec::process::current_channel() {
@@ -1396,7 +1395,7 @@ pub fn run_pselect6_eintr_test() {
     }
 }
 
-pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> u64 {
+pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> SysResult {
     // nfds == 0 is NOT "nothing to do, return immediately" — Linux blocks until
     // the timeout (or forever, if timeout is NULL) or a signal, and musl's
     // pause() is implemented as exactly `ppoll(NULL, 0, NULL, ...)`. Returning 0
@@ -1404,15 +1403,14 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
     // instantly instead of blocking. fds_ptr/fds_size stay unvalidated/unused
     // below when nfds == 0, matching musl passing a NULL fds pointer.
     let fds_size = nfds * core::mem::size_of::<PollFd>();
-    if nfds > 0 && !validate_user_ptr(fds_ptr, fds_size) { return EFAULT; }
+    if nfds > 0 && !validate_user_ptr(fds_ptr, fds_size) { return Err(EFAULT); }
 
     // NULL timeout = block indefinitely. `infinite`/`timeout_us` stay two
     // locals because the wait loops below read them separately; the pair is
     // derived from one `Option` so they cannot disagree.
-    let (infinite, timeout_us) = match time::read_timeout_us(timeout_ptr) {
-        Ok(Some(us)) => (false, us),
-        Ok(None) => (true, 0),
-        Err(e) => return e,
+    let (infinite, timeout_us) = match time::read_timeout_us(timeout_ptr)? {
+        Some(us) => (false, us),
+        None => (true, 0),
     };
 
     if crate::config::SYSCALL_DEBUG_NET_ENABLED && nfds > 0 {
@@ -1424,7 +1422,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
     let start_time = crate::timer::uptime_us();
     let mut kernel_fds = alloc::vec![PollFd { fd: 0, events: 0, revents: 0 }; nfds];
     if nfds > 0 && copy_from_user(as_user_bytes_mut(&mut kernel_fds), fds_ptr).is_err() {
-        return EFAULT;
+        return Err(EFAULT);
     }
 
     // Register the calling thread as a waker on each polled fd's underlying
@@ -1506,16 +1504,16 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
         match machine.lap_end(&obs) {
             WaitStep::Ready => {
                 if nfds > 0 && copy_to_user(fds_ptr, as_user_bytes(&kernel_fds)).is_err() {
-                    return EFAULT;
+                    return Err(EFAULT);
                 }
-                return ready_count as u64;
+                return Ok(ready_count as u64);
             }
             // A timeout is a normal return for poll(2): zero fds ready.
-            WaitStep::Failed(WaitError::TimedOut) => return 0,
+            WaitStep::Failed(WaitError::TimedOut) => return Ok(0),
             // The signal is delivered by the syscall-return path; without
             // returning to it the wake is consumed and ppoll sleeps through
             // its own SIGALRM.
-            WaitStep::Failed(WaitError::Interrupted) => return EINTR,
+            WaitStep::Failed(WaitError::Interrupted) => return Err(EINTR),
             WaitStep::Relap(_) => {}
             WaitStep::Park { deadline_us, .. } => {
                 akuma_exec::threading::schedule_blocking(deadline_us);

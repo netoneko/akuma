@@ -273,6 +273,48 @@ pub struct ThreadCpuStat {
 pub use akuma_primitives::errno::negated::*;
 pub use akuma_primitives::errno::neg_errno;
 
+/// A syscall arm that reports failure through `Err` instead of a bare `-errno`.
+///
+/// `Ok` carries the success value, `Err` a **negated** errno — the same
+/// convention the plain-`u64` arms return, just typed. [`flat`] collapses the
+/// two back into `x0`.
+pub type SysResult = Result<u64, u64>;
+
+/// Collapse a [`SysResult`] into the raw `x0` value the dispatch returns.
+///
+/// This is a type change, not a conversion: both halves are already in the
+/// ABI's return convention, so `Ok(v)` and `Err(v)` produce the same `x0`.
+/// That property is why converting an arm to `SysResult` cannot change
+/// behaviour even if a value is classified into the "wrong" variant — the
+/// worst case is a misleading type, not a different syscall result.
+///
+/// # The sign trap this exists next to
+///
+/// **Two families of `Result<_, u64>` meet in this module and their `Err`
+/// values have opposite signs.**
+///
+/// - This module's own helpers — [`copy_from_user_str`], [`copy_from_user_byte`]
+///   — carry the **negated** form, because they are written for syscall arms.
+/// - `akuma_exec::mmu::user_access`'s helpers (`copy_from_user`,
+///   `read_user_into`, `write_user_val`, …) carry the **positive** form. That
+///   is deliberate and documented at its definition: *"`x0 = -errno` happens at
+///   the syscall boundary, not here"*, because that crate is also used off the
+///   syscall path.
+///
+/// So `read_user_into(&mut ts, ptr)?` inside a `SysResult` arm compiles and is
+/// **wrong**: it returns `Err(14)`, and userspace reads a positive 14 as a
+/// successful syscall returning 14. Every call site therefore uses
+/// `.is_err()` and returns this module's `EFAULT` explicitly. Audited
+/// 2026-08-28: zero violations, and `scripts/check_errno_sign.py` keeps it
+/// that way — the risk is new, because before `SysResult` there was no `?` in
+/// these functions for the mistake to hide in.
+#[must_use]
+pub const fn flat(r: SysResult) -> u64 {
+    match r {
+        Ok(v) | Err(v) => v,
+    }
+}
+
 /// ENETDOWN as the syscall ABI expects it. Used by the AF_INET dispatch arms on a
 /// rump-only build (smoltcp compiled out): a socket syscall that somehow reaches
 /// native dispatch (it normally can't — the rump proxy short-circuits it) gets a
@@ -594,11 +636,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::IOCTL => term::sys_ioctl(args[0] as u32, args[1] as u32, args[2]),
         nr::DUP => fs::sys_dup(args[0] as u32),
          nr::FSTATFS => fs::sys_fstatfs(args[0] as u32, args[1]),
-         nr::STATFS => fs::sys_statfs(args[0], args[1]),
+         nr::STATFS => flat(fs::sys_statfs(args[0], args[1])),
         nr::DUP3 => fs::sys_dup3(args[0] as u32, args[1] as u32, args[2] as u32),
         nr::PIPE2 => pipe::sys_pipe2(args[0], args[1] as u32),
         nr::BRK => mem::sys_brk(args[0] as usize),
-        nr::OPENAT => fs::sys_openat(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
+        nr::OPENAT => flat(fs::sys_openat(args[0] as i32, args[1], args[2] as u32, args[3] as u32)),
         nr::CLOSE => fs::sys_close(args[0] as u32),
         nr::LSEEK => fs::sys_lseek(args[0] as u32, args[1] as i64, args[2] as i32),
         nr::FSTAT => fs::sys_fstat(args[0] as u32, args[1]),
@@ -658,24 +700,24 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(not(feature = "smoltcp"))]
         nr::RESOLVE_HOST => net_enetdown(),
         nr::GETDENTS64 => fs::sys_getdents64(args[0] as u32, args[1], args[2] as usize),
-        nr::PSELECT6 => poll::sys_pselect6(args[0] as usize, args[1], args[2], args[3], args[4], args[5]),
-        nr::PPOLL => poll::sys_ppoll(args[0], args[1] as usize, args[2], args[3]),
-        nr::MKDIRAT => fs::sys_mkdirat(args[0] as i32, args[1], args[2] as u32),
-        nr::UNLINKAT => fs::sys_unlinkat(args[0] as i32, args[1], args[2] as u32),
-        nr::SYMLINKAT => fs::sys_symlinkat(args[0], args[1] as i32, args[2]),
-        nr::LINKAT => fs::sys_linkat(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32),
-        nr::RENAMEAT => fs::sys_renameat(args[0] as i32, args[1], args[2] as i32, args[3]),
-        nr::RENAMEAT2 => fs::sys_renameat2(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32),
-        nr::STATX => fs::sys_statx(args[0] as i32, args[1], args[2] as u32, args[3] as u32, args[4]),
-        nr::READLINKAT => fs::sys_readlinkat(args[0] as i32, args[1], args[2], args[3] as usize),
-        nr::SPAWN => proc::sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5]),
+        nr::PSELECT6 => flat(poll::sys_pselect6(args[0] as usize, args[1], args[2], args[3], args[4], args[5])),
+        nr::PPOLL => flat(poll::sys_ppoll(args[0], args[1] as usize, args[2], args[3])),
+        nr::MKDIRAT => flat(fs::sys_mkdirat(args[0] as i32, args[1], args[2] as u32)),
+        nr::UNLINKAT => flat(fs::sys_unlinkat(args[0] as i32, args[1], args[2] as u32)),
+        nr::SYMLINKAT => flat(fs::sys_symlinkat(args[0], args[1] as i32, args[2])),
+        nr::LINKAT => flat(fs::sys_linkat(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32)),
+        nr::RENAMEAT => flat(fs::sys_renameat(args[0] as i32, args[1], args[2] as i32, args[3])),
+        nr::RENAMEAT2 => flat(fs::sys_renameat2(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32)),
+        nr::STATX => flat(fs::sys_statx(args[0] as i32, args[1], args[2] as u32, args[3] as u32, args[4])),
+        nr::READLINKAT => flat(fs::sys_readlinkat(args[0] as i32, args[1], args[2], args[3] as usize)),
+        nr::SPAWN => flat(proc::sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5])),
         nr::KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
         #[cfg(feature = "sc-reboot")]
         nr::REBOOT => reboot::sys_reboot(args[0] as u32, args[1] as u32, args[2] as u32),
         nr::WAITPID => proc::sys_waitpid(args[0] as u32, args[1]),
         nr::GETRANDOM => proc::sys_getrandom(args[0], args[1] as usize),
         nr::TIME => time::sys_time(),
-        nr::CHDIR => fs::sys_chdir(args[0]),
+        nr::CHDIR => flat(fs::sys_chdir(args[0])),
         nr::FCHDIR => fs::sys_fchdir(args[0] as u32),
         nr::SET_TERMINAL_ATTRIBUTES => term::sys_set_terminal_attributes(args[0], args[1], args[2]),
         nr::GET_TERMINAL_ATTRIBUTES => term::sys_get_terminal_attributes(args[0], args[1]),
@@ -685,7 +727,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLEAR_SCREEN => term::sys_clear_screen(),
         nr::POLL_INPUT_EVENT => term::sys_poll_input_event(args[0], args[1] as usize, args[2]),
         nr::GET_CPU_STATS => term::sys_get_cpu_stats(args[0], args[1] as usize),
-        nr::SPAWN_EXT => proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5]),
+        nr::SPAWN_EXT => flat(proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5])),
         nr::SET_BOX_STACK => proc::sys_set_box_stack(args[0], args[1]),
         nr::CLOSE_CHILD_STDIN => proc::sys_close_child_stdin(args[0] as u32),
         nr::CORE_INIT => proc::sys_core_init(args[0] as usize, args[1]),
@@ -704,18 +746,18 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         nr::RT_SIGPROCMASK => signal::sys_rt_sigprocmask(args[0] as u32, args[1], args[2], args[3] as usize),
         nr::RT_SIGSUSPEND => signal::sys_rt_sigsuspend(args[0], args[1] as usize),
-        nr::RT_SIGTIMEDWAIT => signal::sys_rt_sigtimedwait(args[0], args[1], args[2], args[3] as usize),
+        nr::RT_SIGTIMEDWAIT => flat(signal::sys_rt_sigtimedwait(args[0], args[1], args[2], args[3] as usize)),
         nr::RT_SIGRETURN => 0,
         nr::RT_SIGACTION => signal::sys_rt_sigaction(args[0] as u32, args[1] as usize, args[2] as usize, args[3] as usize),
         nr::GETCWD => fs::sys_getcwd(args[0], args[1] as usize),
         nr::FCNTL => fs::sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
-        nr::NEWFSTATAT => fs::sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
-        nr::FACCESSAT => fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, 0),
+        nr::NEWFSTATAT => flat(fs::sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32)),
+        nr::FACCESSAT => flat(fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, 0)),
         nr::CLOCK_GETTIME => time::sys_clock_gettime(args[0], args[1]),
         nr::CLOCK_SETTIME => time::sys_clock_settime(args[0] as u32, args[1]),
         nr::ADJTIMEX => time::sys_adjtimex(args[0]),
         nr::CLOCK_ADJTIME => time::sys_clock_adjtime(args[0] as u32, args[1]),
-        nr::FACCESSAT2 => fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
+        nr::FACCESSAT2 => flat(fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32)),
         nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),
         nr::SET_TPIDR_EL0 => proc::sys_set_tpidr_el0(args[0]),
@@ -746,10 +788,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FDATASYNC => 0,
         nr::FSYNC => 0,
         nr::FCHMOD => fs::sys_fchmod(args[0] as u32, args[1] as u32),
-        nr::FCHMODAT => fs::sys_fchmodat(args[0] as i32, args[1], args[2] as u32),
+        nr::FCHMODAT => flat(fs::sys_fchmodat(args[0] as i32, args[1], args[2] as u32)),
         nr::FCHOWNAT => 0,
         nr::FCHOWN => 0,
-        nr::TRUNCATE => fs::sys_truncate(args[0], args[1] as i64),
+        nr::TRUNCATE => flat(fs::sys_truncate(args[0], args[1] as i64)),
         nr::FTRUNCATE => fs::sys_ftruncate(args[0] as u32, args[1] as i64),
         nr::FALLOCATE => fs::sys_fallocate(args[0] as u32, args[1] as i32, args[2] as i64, args[3] as i64),
         nr::MADVISE => mem::sys_madvise(args[0] as usize, args[1] as usize, args[2] as i32),
@@ -899,7 +941,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-timerfd")]
         nr::TIMERFD_CREATE => timerfd::sys_timerfd_create(args[0] as i32, args[1] as i32),
         #[cfg(feature = "sc-timerfd")]
-        nr::TIMERFD_SETTIME => timerfd::sys_timerfd_settime(args[0] as u32, args[1] as i32, args[2] as usize, args[3] as usize),
+        nr::TIMERFD_SETTIME => flat(timerfd::sys_timerfd_settime(args[0] as u32, args[1] as i32, args[2] as usize, args[3] as usize)),
         #[cfg(feature = "sc-timerfd")]
         nr::TIMERFD_GETTIME => timerfd::sys_timerfd_gettime(args[0], args[1]),
         nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
@@ -939,11 +981,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             ENOSYS
         }
         #[cfg(feature = "sc-containers")]
-        nr::MOUNT => container::sys_mount(args[0], args[1], args[2], args[3], args[4]),
+        nr::MOUNT => flat(container::sys_mount(args[0], args[1], args[2], args[3], args[4])),
         #[cfg(feature = "sc-containers")]
-        nr::UMOUNT2 => container::sys_umount2(args[0], args[1] as i32),
+        nr::UMOUNT2 => flat(container::sys_umount2(args[0], args[1] as i32)),
         #[cfg(feature = "sc-containers")]
-        nr::MOUNT_IN_NS => container::sys_mount_in_ns(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5]),
+        nr::MOUNT_IN_NS => flat(container::sys_mount_in_ns(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5])),
         _ => {
             if crate::config::SYSCALL_ENOSYS_DIAG {
                 crate::safe_print!(128,

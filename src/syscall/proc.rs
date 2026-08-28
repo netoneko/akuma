@@ -1476,15 +1476,12 @@ pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
 /// `libakuma::SPAWN_FLAG_PTY`.
 const SPAWN_FLAG_PTY: u64 = 1;
 
-pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_len: usize, flags: u64) -> u64 {
+pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_len: usize, flags: u64) -> SysResult {
     // arg6 carries spawn flags. Bit 0 (SPAWN_FLAG_PTY) marks the child's stdin
     // as a terminal so the kernel line discipline runs (sshd sets it for an
     // interactive login shell — the client's `pty-req`).
     let pty = (flags & SPAWN_FLAG_PTY) != 0;
-    let path = match copy_from_user_str(path_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+    let path = copy_from_user_str(path_ptr, 512)?;
     
     let args_vec = parse_argv_array(argv_ptr);
     let env_vec = parse_argv_array(envp_ptr);
@@ -1497,10 +1494,10 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     
     let stdin_data = if stdin_ptr != 0 {
         if !BYPASS_VALIDATION.load(Ordering::Acquire)
-            && !validate_user_ptr(stdin_ptr, stdin_len) { return EFAULT; }
+            && !validate_user_ptr(stdin_ptr, stdin_len) { return Err(EFAULT); }
         let mut data = alloc::vec![0u8; stdin_len];
         if copy_from_user(&mut data, stdin_ptr).is_err() {
-            return EFAULT;
+            return Err(EFAULT);
         }
         Some(data)
     } else {
@@ -1513,14 +1510,14 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
         Ok((_tid, ch, pid)) => {
             if let Some(proc) = akuma_exec::process::current_process_shared() {
                 akuma_exec::process::register_child_channel(pid, ch, proc.pid);
-                return u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32);
+                return Ok(u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32));
             }
         }
         Err(e) => {
             crate::safe_print!(128, "[sys_spawn] path={} failed: {}\n", path, e);
         }
     }
-    ENOMEM
+    Err(ENOMEM)
 }
 
 /// The size of `SpawnOptions` before `env_ptr`/`env_len` were appended.
@@ -1538,13 +1535,10 @@ const SPAWN_OPTIONS_V1_SIZE: usize = 72;
 /// original 72-byte layout", which is what every binary built before the field
 /// was added passes (the argument was ignored and they leave it at whatever the
 /// register held — the wrapper zeroes it).
-pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
-    let path = match copy_from_user_str(path_ptr, 512) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64, _a4: u64, _a5: u64) -> SysResult {
+    let path = copy_from_user_str(path_ptr, 512)?;
 
-    if options_ptr == 0 { return EINVAL; }
+    if options_ptr == 0 { return Err(EINVAL); }
     // Zeroed, then filled only as far as the caller actually wrote: every field
     // the caller does not know about reads as 0, which is each one's "unset".
     let mut o = SpawnOptions::default();
@@ -1555,12 +1549,12 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
         (options_len as usize).min(known)
     };
     if supplied < SPAWN_OPTIONS_V1_SIZE {
-        return EINVAL;
+        return Err(EINVAL);
     }
     {
         let bytes = as_user_bytes_mut(core::slice::from_mut(&mut o));
         if copy_from_user(&mut bytes[..supplied], options_ptr).is_err() {
-            return EFAULT;
+            return Err(EFAULT);
         }
     }
 
@@ -1573,14 +1567,14 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
         let (caller_box, caller_pid) = super::caller_box_and_pid();
         let registry = akuma_exec::process::registry_snapshot();
         if !akuma_exec::process::box_access::can_access_box(&registry, caller_box, o.box_id, caller_pid) {
-            return EPERM;
+            return Err(EPERM);
         }
     }
 
     let cwd = if o.cwd_ptr != 0 {
         let mut kernel_cwd = alloc::vec![0u8; o.cwd_len];
         if copy_from_user(&mut kernel_cwd, o.cwd_ptr).is_err() {
-            return EFAULT;
+            return Err(EFAULT);
         }
         Some(alloc::string::String::from_utf8(kernel_cwd).unwrap_or_else(|_| String::from("/")))
     } else {
@@ -1601,7 +1595,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
     let stdin_data = if o.stdin_ptr != 0 {
         let mut data = alloc::vec![0u8; o.stdin_len];
         if copy_from_user(&mut data, o.stdin_ptr).is_err() {
-            return EFAULT;
+            return Err(EFAULT);
         }
         Some(data)
     } else {
@@ -1627,10 +1621,10 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
         }
         if let Some(proc) = akuma_exec::process::current_process_shared() {
             akuma_exec::process::register_child_channel(pid, ch, proc.pid);
-            return u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32);
+            return Ok(u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32));
         }
     }
-    ENOMEM
+    Err(ENOMEM)
 }
 
 /// `SET_BOX_STACK(box_id, stack)` — select a box's network stack. `stack == 1`

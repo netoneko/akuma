@@ -37,6 +37,37 @@ Linux). The central helper is `neg_errno(i32) -> u64` (`src/syscall/mod.rs`).
 - `ENOSYS` (-38) is returned for every undispatched number — decode the log
   line against the asm-generic table.
 
+### Two `Result<_, u64>` families, opposite signs
+
+**The sign is not uniform across the crate boundary, and getting it wrong is
+silent.** Two families of fallible helper meet in `src/syscall/`:
+
+| helper | lives in | `Err` carries |
+|---|---|---|
+| `copy_from_user_str`, `copy_from_user_byte` | `src/syscall/mod.rs` | **negated** (`-14`) |
+| `copy_from_user`, `copy_to_user`, `read_user_into`, `write_user_val`, … | `akuma_exec::mmu::user_access` | **positive** (`14`) |
+
+The second is deliberate and documented at its definition — *"`x0 = -errno`
+happens at the syscall boundary, not here"* — because that crate is used off the
+syscall path too.
+
+Since 2026-08-28 a syscall arm may return `syscall::SysResult`
+(`Result<u64, u64>`, `Err` = negated) and use `?`. That makes the mismatch
+reachable: `read_user_into(&mut v, p)?` compiles and returns `Err(14)`, which
+userspace decodes as **a syscall that succeeded and returned 14** — a wrong
+answer, not a fault. Every call site instead spells it:
+
+```rust
+if read_user_into(&mut v, p).is_err() {
+    return Err(EFAULT);          // this module's EFAULT: negated
+}
+```
+
+`scripts/check_errno_sign.py` (pre-commit) fails the build on the `?` form.
+Audited 2026-08-28: zero violations at the time `SysResult` was introduced. The
+`flat` helper in `src/syscall/mod.rs` carries the same explanation next to the
+code.
+
 ## Pointer validation
 
 `validate_user_ptr` + `copy_from_user_str` + `copy_from_user_safe` /

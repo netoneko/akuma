@@ -67,10 +67,10 @@ pub(super) fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
     }
 }
 
-pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old_value: usize) -> u64 {
+pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old_value: usize) -> SysResult {
     let timer_id = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd_num)) {
         Some(akuma_exec::process::FileDescriptor::TimerFd(id)) => id,
-        _ => return EBADF,
+        _ => return Err(EBADF),
     };
 
     let mut table = TIMERFD_TABLE.lock();
@@ -81,20 +81,20 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
             let elapsed = now.saturating_sub(state.armed_at_us);
             let remaining = state.initial_us.saturating_sub(elapsed);
             // struct itimerspec { it_interval at 0, it_value at 16 }
-            if us_to_timespec_safe(state.interval_us, old_value).is_err() { return EFAULT; }      // it_interval
-            if us_to_timespec_safe(remaining, old_value + 16).is_err() { return EFAULT; }         // it_value (remaining time)
+            if us_to_timespec_safe(state.interval_us, old_value).is_err() { return Err(EFAULT); }      // it_interval
+            if us_to_timespec_safe(remaining, old_value + 16).is_err() { return Err(EFAULT); }         // it_value (remaining time)
         } else {
             let zero = [0u8; 32];
             if copy_to_user(old_value as u64, &zero).is_err() {
-                return EFAULT;
+                return Err(EFAULT);
             }
         }
     }
 
     // struct itimerspec { struct timespec it_interval; struct timespec it_value; }
     // it_interval is at offset 0, it_value (initial) is at offset 16
-    let interval_us = match timespec_to_us_safe(new_value) { Ok(v) => v, Err(e) => return e };       // it_interval
-    let initial_us = match timespec_to_us_safe(new_value + 16) { Ok(v) => v, Err(e) => return e };   // it_value (initial expiration)
+    let interval_us = timespec_to_us_safe(new_value)?;       // it_interval
+    let initial_us = timespec_to_us_safe(new_value + 16)?;   // it_value (initial expiration)
 
     const TFD_TIMER_ABSTIME: i32 = 1;
     let now = crate::timer::uptime_us();
@@ -119,7 +119,7 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
         });
     }
 
-    0
+    Ok(0)
 }
 
 pub(super) fn sys_timerfd_gettime(fd_arg0: u64, out_ptr: u64) -> u64 {
