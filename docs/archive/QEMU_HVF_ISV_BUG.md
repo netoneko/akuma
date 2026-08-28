@@ -100,6 +100,46 @@ single-register `ldr`/`str` with base-register-only addressing — ISV=1 on ever
 optimization level. This is the general rule for MMIO on hardware/HVF: never let
 the compiler pick the addressing mode for a device access.
 
+## Root cause 5 — under-provisioned RAM on a boot-test build (added 2026-08-28)
+
+The four causes above are all fixed and the boot suite has run under HVF ever
+since. This one is not a kernel defect at all — it is a **runner argument** —
+but it presents identically (`Assertion failed: (isv)`, QEMU exits 134) and it
+cost an hour of chasing a phantom regression, so it belongs here.
+
+`src/tests.rs`'s user-copy trampoline test deliberately faults twice. Section 2
+reads from an address far past the identity map, which the guest's own page
+tables reject, so EL1 handles it and the test prints
+`OK: fully unmapped source returns EFAULT`. Section 3 — *the one that matters*,
+the one that proves `x30` survives the fault trampoline — starts at
+`kernel_va_end() - 0x400` and copies `0x2000` bytes, deliberately running off
+the end of mapped kernel memory.
+
+With `MEMORY=1024M`, that cliff lands where **HVF cannot resolve the access as
+plain RAM**, so it reports ISV=0 and QEMU asserts before the guest ever sees a
+fault. The faulting instruction is `LDP` (`0xa9401023`), which never carries a
+syndrome, so there is nothing for QEMU to decode.
+
+Measured 2026-08-28, `SMP=4`, HVF, on the **unmodified** tree (`339bc4d5`, built
+in a clean worktree specifically to rule out a local change):
+
+| `MEMORY` | result |
+|---|---|
+| `1024M` | `Assertion failed: (isv), … hvf.c, line 2437`, QEMU exits 134 |
+| `2048M` | 316 PASSED, 0 FAILED, 0 panics, boots to SSH |
+
+So: **`MEMORY=2048M` is a floor for HVF runs of a `kernel_tests` build**, not a
+preference. `HVF=0` also works, but reaching for TCG here is the wrong instinct
+— HVF is the accelerator closest to real hardware and it is the one worth
+running the suite under.
+
+The exact page-table detail (why the cliff resolves differently at 1 GB and
+2 GB) was not chased; what is established is the reproduction, the RAM
+threshold, and that it predates any local change. Two follow-ups if this is
+ever worth closing properly: have the runner refuse `MEMORY` below 2048 for a
+boot-test build, or have the test derive its cliff from detected RAM end rather
+than `kernel_va_end()`.
+
 ## Result
 
 `llama-cli -m /models/stories15M-q4_0.gguf -p "Once upon a time" -n 16 -t 1 -c 256 -st`

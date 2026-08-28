@@ -67,7 +67,17 @@ leading underscore in their signatures).
 **`sys_ppoll`**: `nfds == 0` → `0` immediately (no error). Buffer sized
 `nfds * size_of::<PollFd>()` is validated → `EFAULT`. A null `timeout_ptr`
 means infinite wait; otherwise it's read as a 16-byte `timespec` → `EFAULT`
-on a bad pointer. Negative `fd` entries in the array are skipped (matches
+on a bad pointer.
+
+> Both of these read their timeout through
+> `akuma_syscalls_time::read_timeout_us`, which returns `Option<u64>` —
+> `None` is the null-pointer "wait forever". Until 2026-08-28 they carried
+> byte-identical ten-line copies of the copy-in and the arithmetic, and a
+> separate `infinite` flag beside `timeout_us` that every later use had to
+> remember to consult. The two locals still exist because the wait loops read
+> them separately, but they are now derived from one value and cannot
+> disagree. Rationale and the overflow behaviour it fixed:
+> [`time.md`](time.md) § "the timespec-to-timeout conversion". Negative `fd` entries in the array are skipped (matches
 POSIX `poll()`: negative fd means "ignore this slot").
 
 **`sys_pselect6`**: `nfds == 0` → `0`. `nfds > 1024` (`MAX_FDS`) → `EINVAL` —

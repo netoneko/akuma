@@ -167,6 +167,48 @@ deadlines convert through `akuma_timer::utc_time_us()` the same way
 `std::thread::sleep` on `target_os = "linux"` calls this syscall
 specifically, not plain `nanosleep`.
 
+## the timespec-to-timeout conversion (shared)
+
+Every blocking syscall that takes a `struct timespec *` timeout used to do the
+copy-in and the arithmetic itself. As of 2026-08-28 there is one of each:
+
+- **`Timespec::to_us()` / `Timeval::to_us()`** (`crates/akuma-syscalls-linux/
+  src/time.rs`) — the arithmetic. Pure `const fn`, host-tested, lives with the
+  wire struct.
+- **`read_timeout_us(ptr) -> Result<Option<u64>, u64>`**
+  (`crates/akuma-syscalls-time/src/lib.rs`) — the copy-in. `Ok(None)` for a
+  NULL pointer, which is every caller's "block indefinitely"; `Err(EFAULT)` for
+  an unreadable one. It lives here because this crate *is* the timespec
+  syscalls, and the split is the same one the crate family already has:
+  arithmetic is pure data and belongs to the ABI crate, a user-memory read is
+  an effect and belongs to a syscall crate.
+
+**Why it mattered, not just tidiness.** Seven sites had spelled the conversion
+by hand, in two arithmetics that differed only in overflow behaviour — five
+wrapping (`pselect6`, `ppoll`, `rt_sigtimedwait`, `futex`, `timerfd`), three
+saturating (`nanosleep`, `clock_nanosleep`, `clock_settime`). Both cast to
+`u64` first (`tv_sec as u64` and `Timespec::bits` are the same
+reinterpretation), so the only difference was what a too-large value does, and
+the two families were one careless edit away from silently swapping. The shared
+method saturates, which is a behaviour change at the five wrapping sites — and
+the witness does not need a hostile input: `tv_sec = 18_446_744_073_710` is an
+ordinary positive `i64`, and `× 1_000_000` wraps to **448_384**, so a `ppoll`
+asked to wait ~584942 years returned after 0.45 seconds. That value is asserted
+in `time::tests::to_us_saturates_where_the_old_arithmetic_wrapped`.
+
+What this deliberately does *not* do is add Linux's `EINVAL` for a negative
+`tv_sec` or an out-of-range `tv_nsec`. None of the seven sites implemented it,
+and adding it inside a conversion helper would change syscall behaviour behind
+its callers' backs. `read_timeout_us`'s caller is where that belongs if it is
+ever wanted — `src/syscall/net.rs`'s `read_timeval_us` already does exactly
+that for `SO_RCVTIMEO`/`SO_SNDTIMEO`, and is the model.
+
+Callers: `sys_pselect6` / `sys_ppoll` (`src/syscall/poll.rs`),
+`sys_rt_sigtimedwait` (`src/syscall/signal.rs`), `sys_futex`
+(`src/syscall/sync.rs`, which keeps its own pre-validation and
+`futex_dequeue`-on-error and shares only the arithmetic), `timerfd`'s
+`timespec_to_us_safe`, and this crate's own sleep and `clock_settime` paths.
+
 ## setitimer / itimers
 
 `sys_setitimer` (`lib.rs:179`, `ITIMER_REAL` only) arms/disarms the

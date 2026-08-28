@@ -27,6 +27,7 @@ host-test.
 | `akuma-net-yarn` | the socket readiness wait loop as a pure state machine |
 | `akuma-rump` | device-independent orchestration for the rump raw-L2 path |
 | `akuma-scheduler` | discrete-event simulator for placement / netpoll wake policy |
+| `akuma-syscalls` | the shape of a syscall excursion (prologue/epilogue decisions, identity-slot model) |
 | `akuma-terminal` | terminal/line-discipline state |
 | `akuma-syscalls-time` | time syscalls + the boot-time SNTP client |
 | `akuma-vfs` | the `Filesystem` trait and common FS types |
