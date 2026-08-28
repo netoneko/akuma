@@ -1,4 +1,5 @@
 use super::*;
+use crate::{FastPath, fast_path, needs_identity, takes_no_args};
 use crate::slot::{
     ALL_OPS, EpilogueSource, Fault, Op, Policy, SlotState, Validation, World, search,
 };
@@ -220,9 +221,15 @@ fn gate_matrix() -> impl Iterator<Item = (bool, bool, bool, bool)> {
 
 /// The extracted prologue must make **the same decisions** as the one it
 /// replaced, for every syscall number and every gate combination.
+///
+/// [`FastPath::Leaf`] numbers are excluded here and tested separately, because
+/// they are a deliberate behaviour change and this oracle models the behaviour
+/// before it. Excluding them would be a hole if that were the end of it — so
+/// `leaf_diverges_from_the_oracle_in_exactly_the_documented_places` pins both
+/// halves: which fields the fast path may change, and which it must not.
 #[test]
 fn prologue_matches_the_shipped_handle_syscall() {
-    for nr_val in probe_numbers() {
+    for nr_val in probe_numbers().filter(|n| fast_path(*n) == FastPath::Full) {
         for (debug_io, stats, proc_log, resolved) in gate_matrix() {
             let cfg = HookConfig {
                 process_stats: stats,
@@ -260,6 +267,7 @@ fn prologue_matches_the_shipped_handle_syscall() {
 /// over every gate combination, both `owner_pid` cases and both result cases.
 #[test]
 fn epilogue_matches_the_shipped_handle_syscall() {
+    assert_eq!(fast_path(nr::READ), FastPath::Full, "this test's nr must be a full excursion");
     for (errno_diag, stats, proc_log, audit) in gate_matrix() {
         for owner_pid in [0u64, 42] {
             for is_efault in [false, true] {
@@ -306,6 +314,95 @@ fn epilogue_matches_the_shipped_handle_syscall() {
             }
         }
     }
+}
+
+/// The fast path is a deliberate divergence from the oracle. This pins it on
+/// both sides: exactly which fields it may change, and — the half that actually
+/// protects anything — which it must leave alone.
+///
+/// Getting the second half wrong is how a "harmless" fast path drops a
+/// signal-state clear or a counter bump and nothing notices for months.
+#[test]
+fn leaf_diverges_from_the_oracle_in_exactly_the_documented_places() {
+    let leaves: Vec<u64> = probe_numbers().filter(|n| fast_path(*n) == FastPath::Leaf).collect();
+    assert_eq!(
+        leaves,
+        vec![nr::UPTIME, nr::AKUMA_GET_VERSION],
+        "the Leaf membership changed — every entry needs the four admission \
+         criteria checked against its arm, not assumed"
+    );
+
+    for nr_val in leaves {
+        for (debug_io, stats, proc_log, _) in gate_matrix() {
+            let cfg = HookConfig {
+                process_stats: stats,
+                proc_log,
+                debug_io,
+                errno_diag: true,
+                identity_audit: true,
+                identity: IdentitySource::Reresolve,
+            };
+            let ex = Excursion::new(nr_val, cfg);
+            let got = ex.prologue();
+            let want = reference::prologue(nr_val, true, debug_io, stats, proc_log);
+            let ctx = format!("nr={nr_val} gates=({debug_io},{stats},{proc_log})");
+
+            // MUST NOT change. These are correctness, not bookkeeping.
+            assert_eq!(
+                got.clear_signal_state, want.clears_signals,
+                "a leaf must still clear signal state — {ctx}"
+            );
+            assert_eq!(
+                counter_name(got.counter),
+                ref_counter_name(want.counter),
+                "a leaf must still land in its counter bucket — {ctx}"
+            );
+            assert_eq!(
+                got.debug_print, want.prints_debug,
+                "a leaf must still honour the debug-IO gate — {ctx}"
+            );
+
+            // MAY change, and must, in this exact direction: everything that
+            // needs an identity is off, whatever the gates say.
+            assert!(!got.resolve_identity, "leaf must not resolve identity — {ctx}");
+            assert!(!got.record_stats, "leaf must not record per-process stats — {ctx}");
+            assert!(!got.need_timing, "leaf must read no clock — {ctx}");
+
+            let epi = ex.epilogue(42, true);
+            assert!(!epi.clear_current_syscall, "leaf stamped nothing to clear — {ctx}");
+            assert!(!epi.record_time, "leaf must not add time — {ctx}");
+            assert!(!epi.log, "leaf must not log — {ctx}");
+            assert!(!epi.audit_identity, "leaf has no identity to audit — {ctx}");
+            // The errno diagnostic is NOT identity work — it must survive.
+            assert!(epi.errno_diag, "leaf must still report EFAULT — {ctx}");
+        }
+    }
+}
+
+/// The two predicates must genuinely cross, or one of them is redundant and the
+/// pair is a more complicated way of writing a single flag.
+#[test]
+fn the_two_fast_path_predicates_are_independent() {
+    // Takes no arguments, but is entirely about identity.
+    assert!(takes_no_args(nr::GETPID));
+    assert!(needs_identity(nr::GETPID));
+    assert_eq!(fast_path(nr::GETPID), FastPath::Full);
+
+    // Takes no arguments and needs no identity.
+    assert!(takes_no_args(nr::AKUMA_GET_VERSION));
+    assert!(!needs_identity(nr::AKUMA_GET_VERSION));
+    assert_eq!(fast_path(nr::AKUMA_GET_VERSION), FastPath::Leaf);
+
+    // Reads arguments and needs identity.
+    assert!(!takes_no_args(nr::READ));
+    assert!(needs_identity(nr::READ));
+    assert_eq!(fast_path(nr::READ), FastPath::Full);
+
+    // `sched_yield` takes no arguments and is deliberately NOT a leaf: it
+    // reaches the scheduler, which is about the current thread.
+    assert!(takes_no_args(nr::SCHED_YIELD));
+    assert!(needs_identity(nr::SCHED_YIELD));
+    assert_eq!(fast_path(nr::SCHED_YIELD), FastPath::Full);
 }
 
 fn counter_name(c: Counter) -> &'static str {

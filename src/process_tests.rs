@@ -19658,12 +19658,54 @@ fn test_akuma_get_version() {
     // would return, and it must be distinguishable from a real answer.
     let not_enosys = dispatched != ENOSYS;
 
-    if wired && triple_ok && commit_ok && non_negative && not_enosys {
+    // The leaf fast path, counted rather than asserted about.
+    //
+    // The suite runs on a kernel thread with NO identity, so every resolution
+    // attempt misses and bumps `IDENTITY_FALLBACKS` — which turns that counter
+    // into a direct probe for "how many times did this excursion ask who am I?".
+    //
+    // `akuma_get_version` is `FastPath::Leaf`, so the prologue's resolve, both
+    // `Process` stamps and the epilogue's re-resolve are all skipped. What is
+    // NOT skipped is `is_current_interrupted()`, which runs between them and is
+    // deliberately outside the fast path: it decides whether a killed process
+    // keeps executing syscalls, and moving a signal check for 2 loads is not a
+    // trade to make casually. On a miss it costs exactly two resolutions, and
+    // the count is a mechanism, not an observation to be fitted:
+    //
+    //   is_current_interrupted -> current_process_shared
+    //       -> current_thread_own_process            = miss 1
+    //       -> lookup_process_shared(current_pid()?)
+    //            -> current_pid -> current_thread_own_process = miss 2
+    //
+    // So the leaf's expected count is 2, and pinning it is the point: if the
+    // interrupted check ever joins the fast path, or a new identity consumer
+    // creeps into the prologue, this trips and somebody decides on purpose.
+    //
+    // `getpid` is the control, and it is load-bearing: without it, a fast path
+    // that had silently stopped being taken would still satisfy a bare
+    // upper-bound check if the counter simply stopped moving for every syscall.
+    use core::sync::atomic::Ordering as O;
+    let fb0 = akuma_exec::process::table::IDENTITY_FALLBACKS.load(O::Relaxed);
+    let _ = handle_syscall(nr::AKUMA_GET_VERSION, &[0, 0, 0, 0, 0, 0]);
+    let fb_leaf = akuma_exec::process::table::IDENTITY_FALLBACKS.load(O::Relaxed) - fb0;
+    let fb1 = akuma_exec::process::table::IDENTITY_FALLBACKS.load(O::Relaxed);
+    let _ = handle_syscall(nr::GETPID, &[0, 0, 0, 0, 0, 0]);
+    let fb_full = akuma_exec::process::table::IDENTITY_FALLBACKS.load(O::Relaxed) - fb1;
+    const LEAF_EXPECTED_RESOLVES: u64 = 2; // is_current_interrupted, and only it
+    let leaf_resolved_nothing = fb_leaf == LEAF_EXPECTED_RESOLVES;
+    let control_did_resolve = fb_full > fb_leaf;
+
+    if wired && triple_ok && commit_ok && non_negative && not_enosys
+        && leaf_resolved_nothing && control_did_resolve
+    {
         console::print("[Test] akuma_get_version PASSED\n");
     } else {
         crate::safe_print!(240,
-            "[Test] akuma_get_version FAILED: wired={} triple_ok={} commit_ok={} non_negative={} not_enosys={} (got {:#x}, want {:#x})\n",
-            wired, triple_ok, commit_ok, non_negative, not_enosys, dispatched, AKUMA_VERSION);
+            "[Test] akuma_get_version FAILED: wired={} triple_ok={} commit_ok={} non_negative={} not_enosys={} leaf_resolves={} (want {}) control_resolves_more={} (got {:#x}, want {:#x}, fb_leaf={} fb_full={})\n",
+            wired, triple_ok, commit_ok, non_negative, not_enosys,
+            leaf_resolved_nothing, LEAF_EXPECTED_RESOLVES, control_did_resolve,
+            dispatched, AKUMA_VERSION,
+            fb_leaf, fb_full);
     }
 }
 

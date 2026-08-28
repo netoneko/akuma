@@ -43,10 +43,12 @@
 //! C-like enum, so the whole crate inlines into the caller and compiles away
 //! into the same branches it replaced.
 //!
-//! Measured on this tree, `SMP=1`, `read_syscall_cost … 2000 5`, best of
-//! 100 × 100: `getpid` **230 ns before, 230 ns after**; the `read-profile`
-//! `wrap` control **167 ns before, 167 ns after** — see
-//! `AKUMA_EXTRACT_SYSCALLS.md` §7.
+//! Measured `SMP=4`, `read_syscall_cost … 2000 5`, best of 100 × 100, each arm
+//! a separate build measured alone: `getpid` **130 ns before, 130 ns after** —
+//! the extraction and the Finding A fix together cost nothing. The
+//! `read-profile` `wrap` control (the wrapper layer outside `handle_syscall`,
+//! which this crate cannot touch) reads 167 ns on both. Full four-arm table in
+//! `AKUMA_EXTRACT_SYSCALLS.md` §7.3.
 //!
 //! # Why an excursion is a state machine at all
 //!
@@ -292,6 +294,115 @@ pub const fn debug_io_suppressed(nr: u64) -> bool {
     )
 }
 
+/// How much of the generic excursion a syscall number actually needs.
+///
+/// Two independent facts about a number, which is why they are two predicates
+/// ([`takes_no_args`] and [`needs_identity`]) rather than one flag:
+///
+/// - **Arguments.** Whether the arm reads `args` at all.
+/// - **Identity.** Whether anything in the excursion — the arm, or the
+///   prologue/epilogue bookkeeping done on its behalf — needs to know which
+///   process is calling.
+///
+/// They cross: `getpid` takes no arguments but is *entirely* about identity;
+/// a hypothetical `write`-like call needs identity and arguments both. Only the
+/// corner where both are false can skip the generic work.
+///
+/// # What each tier may skip, and what it may not
+///
+/// [`Self::Leaf`] skips the identity resolve, the `Process` syscall stamps, the
+/// per-process stats, the `/proc/<pid>/syscalls` entry, the clock reads that
+/// feed them, and the epilogue's re-resolve. It does **not** skip
+/// `CURRENT_SYSCALL_NR` / `set_thread_current_syscall` (two global stores, and
+/// they are what a crash dump reads to say which syscall a thread was in) or
+/// the `syscall_counters` bump (one or two relaxed atomics, and the totals
+/// would silently stop adding up).
+///
+/// Dropping the per-process stats and the log entry **is** an observable
+/// change: those syscalls stop appearing in `/proc/<pid>/syscalls`. That is the
+/// price of admission and it is why the membership below is short.
+///
+/// # Admission criteria
+///
+/// A number joins [`Self::Leaf`] only when all four hold, checked by reading
+/// the arm, not by assuming:
+///
+/// 1. the arm reads no element of `args`;
+/// 2. the arm touches no `Process`, no process table, no fd table, no address
+///    space — nothing reachable from "who is calling";
+/// 3. the arm cannot block, so no window opens between prologue and epilogue;
+/// 4. losing its `/proc/<pid>/syscalls` rows is acceptable.
+///
+/// Today exactly two numbers qualify, and that is not an accident of effort —
+/// criterion 2 is genuinely rare. The tier earns its keep anyway, because
+/// `akuma_get_version` is the floor control, so the gap between it and `getpid`
+/// is a **live, permanent measurement** of what the prologue and epilogue cost:
+/// the audit's ablation ladder, as an instrument rather than a one-off build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastPath {
+    /// The full excursion. Everything that is not provably in a cheaper tier.
+    Full,
+    /// Reads no arguments and needs no identity. See the criteria above.
+    Leaf,
+}
+
+/// Does the arm for `nr` read no element of `args`?
+///
+/// Broader than [`FastPath::Leaf`] on purpose — `getpid` and friends take no
+/// arguments and are still entirely about identity. On its own this predicate
+/// buys **nothing** in the generic path today, and saying so is more useful
+/// than implying otherwise: `handle_syscall` does no generic argument
+/// validation (validation is per-arm, inside `sys_*`), so there is no check
+/// here for it to skip.
+///
+/// It is carried for two reasons. It is half of `Leaf`'s definition, and it is
+/// the precondition for the one place a real saving is available and not yet
+/// taken: the entry vector saves and restores ~34 GPRs on every trap
+/// (`AKUMA_SYSCALL_PERFORMANCE_AUDIT.md` § "Other untested surface", item 2),
+/// and a call that reads no arguments does not need `x0`-`x5` restored. That is
+/// an assembly change, and it needs this classification before it can be tried.
+#[must_use]
+pub const fn takes_no_args(nr: u64) -> bool {
+    matches!(
+        nr,
+        nr::AKUMA_GET_VERSION
+            | nr::UPTIME
+            | nr::GETPID
+            | nr::GETPPID
+            | nr::GETUID
+            | nr::GETEUID
+            | nr::GETGID
+            | nr::GETEGID
+            | nr::GETTID
+            | nr::SCHED_YIELD
+    )
+}
+
+/// Does anything in this excursion need to know which process is calling?
+///
+/// True for all but the numbers listed, and the list is short because
+/// criterion 2 above is strict: `sched_yield` is excluded even though it takes
+/// no arguments, because it reaches the scheduler and the scheduler is about
+/// the current thread. `getpid` is excluded because it *is* the identity.
+///
+/// - `akuma_get_version` returns a compile-time constant.
+/// - `uptime` returns `akuma_timer::uptime_us()` — a counter read, and nothing
+///   else in the body.
+#[must_use]
+pub const fn needs_identity(nr: u64) -> bool {
+    !matches!(nr, nr::AKUMA_GET_VERSION | nr::UPTIME)
+}
+
+/// Which tier `nr` is in. The conjunction of the two predicates above.
+#[must_use]
+pub const fn fast_path(nr: u64) -> FastPath {
+    if takes_no_args(nr) && !needs_identity(nr) {
+        FastPath::Leaf
+    } else {
+        FastPath::Full
+    }
+}
+
 /// The prologue's decisions, and the state the epilogue needs.
 ///
 /// Built once per excursion, before the dispatch, and consumed after it. The
@@ -330,6 +441,13 @@ pub struct ProloguePlan {
     /// answer, and the kernel expresses that half with its own `if let` — see
     /// [`Excursion::prologue`].
     pub record_stats: bool,
+    /// Resolve "who am I" at all.
+    ///
+    /// False for [`FastPath::Leaf`], and it is the field the whole tier exists
+    /// for: with it off the prologue skips the identity read and the two
+    /// `Process` syscall stamps, and the epilogue skips its re-resolve, its
+    /// stats and its log entry.
+    pub resolve_identity: bool,
     /// Sample `uptime_us()` into `t0`. False means the epilogue reads no clock
     /// either, which is the whole point of computing it once here.
     pub need_timing: bool,
@@ -393,14 +511,17 @@ impl Excursion {
     /// same shape as [`EpiloguePlan::audit_identity`].
     #[must_use]
     pub const fn prologue(self) -> ProloguePlan {
+        let leaf_needs_identity = !matches!(fast_path(self.nr), FastPath::Leaf);
         ProloguePlan {
             clear_signal_state: clears_signal_state(self.nr),
             debug_print: self.cfg.debug_io && !debug_io_suppressed(self.nr),
             counter: counter_for(self.nr),
-            record_stats: self.cfg.process_stats,
+            record_stats: self.cfg.process_stats && leaf_needs_identity,
             // One clock read serves both hooks, so the union is computed here
             // and the epilogue re-reads the same decision rather than its own.
-            need_timing: self.cfg.process_stats || self.cfg.proc_log,
+            // A leaf needs neither, so it reads no clock at all.
+            need_timing: (self.cfg.process_stats || self.cfg.proc_log) && leaf_needs_identity,
+            resolve_identity: leaf_needs_identity,
         }
     }
 
@@ -412,11 +533,15 @@ impl Excursion {
     /// crate that must depend on neither.
     #[must_use]
     pub const fn epilogue(self, owner_pid: u64, is_efault: bool) -> EpiloguePlan {
-        let need_timing = self.cfg.process_stats || self.cfg.proc_log;
+        let leaf = matches!(fast_path(self.nr), FastPath::Leaf);
+        let need_timing = (self.cfg.process_stats || self.cfg.proc_log) && !leaf;
         EpiloguePlan {
-            audit_identity: self.cfg.identity_audit,
+            audit_identity: self.cfg.identity_audit && !leaf,
             identity: self.cfg.identity,
-            clear_current_syscall: true,
+            // A leaf never stamped `current_syscall`, so there is nothing to
+            // clear — and clearing it would mean resolving the identity this
+            // tier exists to avoid resolving.
+            clear_current_syscall: !leaf,
             record_time: need_timing && self.cfg.process_stats,
             // `owner_pid == 0` means the prologue never resolved an identity,
             // and the ring is keyed by pid — there is nothing to file it under.

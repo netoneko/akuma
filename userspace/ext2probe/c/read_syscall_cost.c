@@ -54,6 +54,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <errno.h>
 
 static long long now_ns(void) {
     struct timespec ts;
@@ -210,6 +211,27 @@ static void floor_arm(const char *name, long nr, int iters, int reps) {
     free(g);
 }
 
+/* `floor_arm` for a number that is SUPPOSED to be unimplemented, with the
+ * "supposed to" verified rather than asserted in a comment.
+ *
+ * The ENOSYS arm is the one row here whose meaning depends on a fact about the
+ * kernel underneath it, and that fact has been wrong twice (see the call site).
+ * One probe call before timing settles it. If the number turns out to be a real
+ * syscall, the row is still printed — it is a real measurement of something —
+ * but it is labelled so it cannot be read as an ENOSYS cost or dropped into a
+ * cross-kernel table. */
+static void enosys_arm(const char *name, long nr, int iters, int reps) {
+    errno = 0;
+    long ret = syscall(nr);
+    int really_enosys = (ret == -1 && errno == ENOSYS);
+    floor_arm(name, nr, iters, reps);
+    if (!really_enosys) {
+        printf("  ^^ NOT ENOSYS on this kernel (ret=%ld errno=%d): this row times a REAL\n"
+               "     syscall and must not be compared across kernels. Pick another number.\n",
+               ret, errno);
+    }
+}
+
 int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] : "/tmp/rsc.bin";
     int iters = argc > 2 ? atoi(argv[2]) : 2000;
@@ -250,19 +272,30 @@ int main(int argc, char **argv) {
     floor_arm("getpid", SYS_getpid, iters, reps);
     floor_arm("getppid", SYS_getppid, iters, reps);
     /* An unimplemented syscall, which is what a libc probing for a feature and
-     * falling back actually does. 107 is `timer_create`: allocated in the
-     * aarch64 ABI, not implemented by this kernel, so it reaches the
-     * dispatcher's ENOSYS arm.
+     * falling back actually does.
      *
-     * The number matters. An earlier version used 4095 on the reasoning that
-     * "not a syscall" was the cleanest possible case, and measured 2 ms — which
-     * was then attributed to the ENOSYS console print. Wrong path entirely:
-     * `src/exceptions.rs` treats **any number above 500** as a stale-I-cache
-     * JIT artifact and answers with `ic iallu` + an instruction replay, not with
-     * ENOSYS. The 4095 arm below still measures that, deliberately, because it
-     * is worth knowing what the JIT band costs — but it is not the ENOSYS
-     * number and must never be read as one. */
-    floor_arm("ENOSYS", 107, iters, reps);
+     * The number matters, and getting it wrong has cost two separate false
+     * readings:
+     *
+     * 1. An early version used 4095, on the reasoning that "not a syscall" was
+     *    the cleanest possible case, and measured 2 ms — then blamed the ENOSYS
+     *    console print. Wrong path entirely: `src/exceptions.rs` treats any
+     *    number ABOVE 500 as a stale-I-cache JIT artifact and answers with
+     *    `ic iallu` + an instruction replay, not with ENOSYS. The JITband arm
+     *    at the end still measures that deliberately; it is not this number.
+     * 2. The version after that used 107 (`timer_create`) — unimplemented on
+     *    Akuma, but Linux IMPLEMENTS it. On the comparison guest the arm timed
+     *    a real syscall that allocates and validates: 390 ns against a 136 ns
+     *    `getpid`, which reads like a catastrophic ENOSYS path and is nothing
+     *    of the kind.
+     *
+     * 245 is inside the aarch64 `arch_specific_syscall` block (244-259), which
+     * arm64 leaves unallocated, so it is unimplemented on BOTH kernels and
+     * below Akuma's 500 JIT band. But the arm no longer RELIES on that: it
+     * checks the call really does fail with ENOSYS on whatever kernel it is
+     * running on, and says so loudly when it does not. A comment cannot notice
+     * a kernel that implements the number later. A check can. */
+    enosys_arm("ENOSYS", 245, iters, reps);
 
     /* THE floor, and the reason the three arms above are not it.
      *

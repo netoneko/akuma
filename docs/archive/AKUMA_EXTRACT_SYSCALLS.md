@@ -293,44 +293,360 @@ was deferred rather than run on a contended host, since a starved run's
 was captured on a quiet host (`host_timejumps: 0` at both levels), so it stands
 on its own for everything except a same-day comparison of the two flaky entries.
 
-## 7. What was not built: `akuma-syscalls` (the shape crate)
+## 7. `akuma-syscalls` — the shape crate
 
-Still proposed, still not started, and the sequencing reason has not changed:
-crate 1 is additive and low-risk; crate 2 touches `handle_syscall`, the hottest
-function in the kernel. **They should land separately, and this is the first
-one landing.**
+**Built and verified, 2026-08-28.** This section used to say "what was not
+built"; it is now the record of what was, what it decided, and the one thing it
+found that nobody was looking for.
 
-The case for it is unchanged:
+The sequencing held: crate 1 was additive, crate 2 touches `handle_syscall`, and
+they landed separately.
 
-- It would model the generic part of a syscall excursion — identity resolve →
-  interrupt check → stats/log hooks → dispatch handoff → epilogue — as a state
-  machine with the effects injected, exactly as `akuma-net-yarn` does for the
-  readiness wait loop.
-- **It must not contain the family implementations.** A crate holding the 16.5k
-  lines of `src/syscall/` would depend on vfs, ext2, net, exec, mm, pmm and
-  terminal — a second kernel, whose tests would need all of that mocked. That is
-  less testable, not more.
-- It would make the open identity-cache questions in
-  [`IDENTITY_CACHE_SMP_REVIEW.md`](IDENTITY_CACHE_SMP_REVIEW.md) **decidable by
-  enumeration** rather than by stress-testing. Both findings there are narrow
-  interleavings whose failure mode is a silent write into a reallocated block; a
-  bounded exhaustive search over `claim / retire / reclaim / stamp / validate`
-  at 2 cores × 2 slots settles whether the ordering is admissible at all.
+### 7.1 What it is
 
-Two risks recorded with it, both still live:
+`crates/akuma-syscalls` — the generic part of a syscall excursion, with the
+effects left in the kernel. Its only dependency is crate 1, because it
+classifies syscall *numbers* and needs nothing else.
 
-- **The dispatch is the hot path.** `handle_syscall` was taken from 410 ns to
-  150 ns and the ~120 ns `wrap` layer is the next target. Any abstraction has to
-  stay monomorphic and inlined; an extraction that adds an indirect call to the
-  dispatch would eat the entire win. Re-measure with
-  `userspace/ext2probe/c/read_syscall_cost.c` on each step. *(Crate 1 does not
-  touch this: it moves `const`s and `repr(C)` definitions, which are compiled
-  away identically.)*
-- **A shape crate can pass its own tests and still be wrong.**
-  `akuma-net-yarn` carries a differential test against the pre-extraction
-  `wait_until` for this reason; crate 2 needs the same oracle, or a green suite
-  only proves the model is self-consistent with itself.
+| module | holds |
+|---|---|
+| `lib` | `HookConfig`, `Excursion` → `ProloguePlan` / `EpiloguePlan`, `Counter` + `counter_for`, `clears_signal_state`, `debug_io_suppressed`, `IdentitySource` |
+| `slot` | the process-table slot lifecycle as an enumerable model — `claim / retire / reclaim / stamp / validate`, three validation schemes, two epilogue policies, and an exhaustive search |
+| `tests` | 17 tests: the differential oracle, the gate matrix, and the six enumeration verdicts |
 
+`handle_syscall` now reads as the state machine plus injected effects: it builds
+one `Excursion`, reads plan fields where it used to spell conditions inline, and
+performs every effect itself. **§7's original ban still holds and is worth
+restating: the family implementations are not in it, and must not be.**
+
+### 7.2 The shape: decisions, not injected effects
+
+The template is `akuma-net-yarn`, and the load-bearing thing about that template
+is what it does *not* do. There is no `trait Effects`, no generic parameter, no
+`dyn`. The caller performs the effects and calls pure methods between them.
+
+That is not style. It is the only shape that survives the hot path, which was
+risk 1 below. Everything public in the crate is a plain-data struct or a
+`const fn` returning a C-like enum, so it inlines into the caller and compiles
+back into the branches it replaced. The 22-arm counter `match` became
+`counter_for(nr)` (host-tested) feeding a `match` on the enum — two matches
+with no indirection between them, which LLVM fuses. That was checked by
+measurement, not assumed.
+
+### 7.3 Risk 1: the dispatch is the hot path
+
+Held — and then some. Four arms, each a **separate real build measured alone**
+with no peer VM, `read_syscall_cost … 2000 5` (100 passes × 100 calls, take the
+minimum), boot suite green on every one:
+
+| arm | what it is |
+|---|---|
+| **A** | `1dd2def6` — before crate 2 |
+| **B** | `052d581d` — crate 2 + the Finding A fix |
+| **C** | + the leaf fast path + `akuma_get_version` on the BKL opt-out list |
+| **D** | C with the BKL opt-out entry removed, to split C's win |
+
+`best` column, `SMP=4` (the low-variance environment — see below):
+
+| arm | A | B | C | D |
+|---|---:|---:|---:|---:|
+| `getpid` | 130 | 130 | 130 | 130 |
+| `getppid` | 130 | 130 | 130 | — |
+| `ENOSYS` | 120 | 130 | 130 | — |
+| `akuma_get_version` | 130¹ | 130 | **90** | 100 |
+| `uname` | **170** | **140** | 140 | 130 |
+
+¹ Not implemented on A, so that cell is its ENOSYS path — which measures the
+same, as every floor row does.
+
+Four readings:
+
+1. **Crate 2 is not a regression.** `getpid` 130 → 130. The extraction *and*
+   the Finding A fix — which adds an identity-cache read to every epilogue —
+   cost nothing measurable.
+2. **The `uname` static image is worth 30 ns** (170 → 140, 18 %), landed in B.
+   See §7.6 B.
+3. **The leaf fast path is worth 30 ns** (130 → 100, arm D against arm B).
+4. **The BKL enter/leave pair is worth ≤10 ns** (100 → 90, arm C against D).
+   That is exactly one counter tick, so it is *bounded*, not priced — method
+   warning #3 in the audit.
+
+`SMP=1` is noisier and agrees: `version` 210 → 160 for the fast path, `uname`
+290 → 250 → 240.
+
+**`SMP=4` is the better measurement environment, which is worth writing down.**
+Every floor arm reads 130 ns there against 180-230 at `SMP=1`, and the six
+samples per arm are frequently identical. The probe gets a core to itself
+instead of interleaving with netpoll, timer and reclaim work on the only core.
+The audit's rig says `SMP=1`; for floor measurements that is the wrong default.
+
+The `read-profile` `wrap` span — the wrapper layer *outside* `handle_syscall`,
+which this work cannot touch — is the control, and it reads 167 ns, reproducing
+the audit's figure exactly. Full rig and every raw number:
+`logs/crate2/BASELINE.md`, `logs/crate2/sweep3.txt`, `logs/crate2/legD.txt`.
+
+**A build-identity trap caught mid-flight, recorded because it nearly landed.**
+An earlier version of this sweep measured "after" against "before" and found a
+60 ns regression. The "after" binary had been built `--features no-tests`
+several steps earlier while debugging a dead-code error: 2050 KB against the
+"before" arm's 3386 KB. Two different kernels. The audit's method warning #4
+says to verify the build before believing a boot; the sweep now prints
+`[mkbin] kernel size` and the boot-suite `PASSED`/`FAILED` counts next to every
+arm's numbers, so a mismatched build is visible in the results table itself
+rather than needing to be remembered.
+
+### 7.4 Risk 2: a shape crate can pass its own tests and still be wrong
+
+Addressed the way `akuma-net-yarn` addressed it. `tests::reference` is the
+prologue/epilogue decision logic of `handle_syscall` **as it shipped at
+`1dd2def6`**, transcribed rather than re-derived: the long chain of `!=`
+comparisons, the 22-arm `match` named after the `inc_*` each arm called, the
+`track_time` / `need_timing` / `logging` locals in the original's order. Its doc
+comment says do not tidy it, for the same reason yarn's does — a tidied oracle
+proves the model agrees with a tidied oracle.
+
+The differential runs the whole ABI range plus the bands above it (512, 600,
+1024, 4095, `u64::MAX`) against all 16 gate combinations. Two of those gate
+combinations are otherwise only reachable by building a different kernel:
+`PROCESS_SYSCALL_STATS` and `PROC_SYSCALL_LOG_ENABLED` are `true` in every
+profile but `kernel_profile_extreme`.
+
+### 7.5 The payoff: the identity-cache questions are decidable, and were decided
+
+This is what §7 promised and it delivered more sharply than expected.
+`IDENTITY_CACHE_SMP_REVIEW.md` records two use-after-free findings, both by
+inspection, both with the same failure mode — a silent write into a reallocated
+block — and neither reproducible on demand. Finding A read `epi_stale=0` through
+a full SMP=4 thread-churn soak, which the doc was careful to call "rare, not
+cleared".
+
+`slot::search` enumerates every interleaving of `claim / retire / reclaim` over
+2 slots to depth 6 and checks the epilogue's write at every prefix. Six
+verdicts, each a test:
+
+| question | verdict |
+|---|---|
+| Finding A — epilogue writes through the prologue's pointer | **witness at depth 2**: `Retire(0)`, `Reclaim(0)` |
+| …epilogue re-reads the cache instead | no witness |
+| Finding B — `ACTIVE`-only validation | **witness at depth 3**, and it is the *wrong-occupant* kind |
+| …`Validation::Generation` (what shipped) | no witness |
+| …`Validation::PointerOnly` | **witness** — address reuse, mechanising the doc's argument |
+| …`Validation::PointerAndPid` | no witness — sound, and costlier |
+
+The depth-2 witness is exactly `kill_thread_group` retiring a sibling that is
+still inside a blocking syscall, followed by any idle core's reclaim drain. It
+took under a millisecond to find what a soak could not.
+
+**So Finding A is fixed here rather than deferred.** `EPILOGUE_IDENTITY` in
+`src/syscall/mod.rs` is `IdentitySource::Reresolve`: the epilogue reads the
+identity cache again after the dispatch and skips its `Process` writes on a
+miss, restoring exactly what the pre-cache epilogue's `lookup_process_shared`
+returning `None` did — at one validated cache read instead of the lock + map
+walk + IRQ-masked table scan that guard used to cost twice. `owner_pid` stays
+the prologue's scalar copy, so a process that retires mid-call still files its
+last log entry under the pid it had.
+
+`src/process_tests.rs::test_epilogue_identity_revalidated_after_dispatch` drives
+the witness against the real table: register a leader and a `CLONE_THREAD`
+sibling, resolve, retire the leader **only** (no reclaim, no reissue — the
+window opens at the first of the two ops), and assert the cache refuses, that it
+refused on the state arm rather than by never having resolved, and that
+`EPILOGUE_IDENTITY` is still `Reresolve`. That last assertion is the point: the
+defect's whole nature is that nothing observes it, so flipping the const back
+must fail a test rather than silently reopen a use-after-free.
+
+**Keep the two instruments apart. Enumeration answers "can it?", the soak
+answers "does it?", and the second is not a substitute for the first.** Nothing
+here models memory ordering, the BKL, or how often a window is reached — a
+witness at depth 2 says nothing about how often depth 2 occurs, which is exactly
+why Finding A could read `epi_stale=0` and still be a defect.
+
+### 7.6 What this work found that nobody was looking for
+
+**A. `getpid` was the right floor by luck, and now there is one by
+construction.** Every floor number in
+[`AKUMA_SYSCALL_PERFORMANCE_AUDIT.md`](AKUMA_SYSCALL_PERFORMANCE_AUDIT.md) is a
+`getpid`, whose arm *looks* like it resolves a process. It doesn't cost
+anything: the identity cache that audit added means `sys_getpid` reads a value
+the prologue already warmed. True, and never checked.
+
+`akuma_get_version` (Akuma-private **328**, `src/syscall/version.rs`) is the
+control that checks it: no arguments read, no user memory touched, nothing
+resolved — a compile-time constant into `x0`. It measures the same as `getpid`,
+within the counter's resolution. So the ~190 ns floor is the boundary — EL0
+round trip, `wrap`, and `handle_syscall`'s prologue/epilogue — and nothing else.
+
+It is not only a probe: a packed `[major, minor, patch, commit]` in one register
+is what a compatibility check wants, and the top byte is reserved zero so no
+libc wrapper can read the value as a negative errno.
+
+**B. `uname(2)` was rebuilding a constant.** It reports the same version and git
+SHA from the same `env!`s and computes nothing, but it assembled the 390-byte
+`utsname` on the stack every call — a 390-byte memset plus six
+`copy_from_slice`s — and *then* copied it out. ~780 bytes moved and a 390-byte
+stack frame to deliver ~30 bytes of compile-time text. It is now a `static` in
+`.rodata` and one `copy_to_user`, which is what Linux does (it copies straight
+out of `init_uts_ns.name`). Measured after: one tick above the floor.
+
+The cross-kernel column is the useful one. Same binary both sides, Linux in
+Lima under Apple `vz`:
+
+| | Akuma | Linux |
+|---|---:|---:|
+| `getpid` | ~190 | 136 |
+| `uname` | ~220 | 154 |
+| **`uname`/`getpid`** | **1.16×** | **1.13×** |
+
+The 390-byte copy costs ~25 ns on Akuma and ~18 ns on Linux. **`copy_to_user`
+is not where Akuma loses**; the whole gap is the fixed boundary. And that gap is
+now 1.4×, on a host that is not idle, against the 3.0× this document's sibling
+audit opened with.
+
+**C. A tenth method warning, which cost a false finding.** `JITband` (4095) is
+not a syscall: `src/exceptions.rs` answers anything above 500 with `ic iallu` +
+an instruction replay, and on QEMU `ic iallu` calls `tb_flush()`. The arm ran
+fourth of six, so every arm after it measured a cold machine.
+`akuma_get_version` — an arm that returns a constant — read **290-410 ns**
+against `getpid`'s 160-200, consistently, across three runs, with a plausible
+mechanism ready to explain it ("the Akuma-private 300+ numbers sit deep in the
+dispatch tree"). Moving the arm to the end collapsed the gap to zero.
+
+> **Anything that flushes global state belongs at the end of a measurement, not
+> in the middle of one — and three consistent runs of a wrong number are still a
+> wrong number.** Repeatability is not evidence when every run shares the same
+> systematic contaminant.
+
+**D. The probe's `ENOSYS` arm is Akuma-only.** Number 107 is `timer_create`,
+which Linux *implements* — it reads 390 ns there against a 136 ns `getpid`,
+which looks like a catastrophic ENOSYS path and is nothing of the kind. The arm
+now says so in the source. `getpid` / `getppid` / `uname` are the portable rows.
+
+**E. The handoff's open question was not one.** It flagged "`wrap` is 167 or
+~120 ns — the two docs disagree" as live. They do not: 167 ns is the `wrap` span
+on a `read-profile` build, and ~120 ns is the audit's `F1f` row — a whole
+plain-kernel `getpid` with the debug flags off. Different quantities, never in
+conflict. Checking whether an inherited uncertainty is real is cheap; inheriting
+it is not.
+
+### 7.7 The leaf fast path
+
+Two facts about a syscall number, deliberately two predicates rather than one
+flag, because they cross:
+
+- `takes_no_args(nr)` — the arm reads no element of `args`.
+- `needs_identity(nr)` — anything in the excursion needs to know who is calling.
+
+`getpid` takes no arguments and is *entirely* about identity; `read` needs both.
+Only the corner where both are false, `FastPath::Leaf`, can skip the generic
+work. A leaf skips the identity resolve, both `Process` syscall stamps, the
+per-process stats, the `/proc/<pid>/syscalls` entry, the clock reads that feed
+them, and the epilogue's re-resolve. It does **not** skip `CURRENT_SYSCALL_NR` /
+`set_thread_current_syscall` (a crash dump reads those to say which syscall a
+thread was in) or the `syscall_counters` bump (the totals would stop adding up).
+
+**Admission needs all four, checked against the arm rather than assumed:** reads
+no argument; touches no `Process`, process table, fd table or address space;
+cannot block; and losing its `/proc/<pid>/syscalls` rows is acceptable — because
+that is a real observable change and it is the price.
+
+Exactly two numbers qualify today (`akuma_get_version`, `uptime`), and that is
+criterion 2 being strict, not effort being short. `sched_yield` takes no
+arguments and is excluded: it reaches the scheduler, which is about the current
+thread.
+
+**`takes_no_args` on its own currently buys nothing**, and saying so is more
+useful than implying otherwise: `handle_syscall` does no generic argument
+validation — validation is per-arm, inside `sys_*` — so there is no check here
+for it to skip. It is carried because it is half of `Leaf`'s definition, and
+because it is the precondition for the one real saving not yet taken: the entry
+vector saves and restores ~34 GPRs on every trap
+([`AKUMA_SYSCALL_PERFORMANCE_AUDIT.md`](AKUMA_SYSCALL_PERFORMANCE_AUDIT.md)
+§ "Other untested surface" item 2), and a call that reads no arguments does not
+need `x0`-`x5` restored. That is an assembly change and it needs this
+classification first.
+
+`akuma_get_version` also joined the Phase 7f BKL opt-out seed — the easiest
+entry that list will ever get, since the arm returns a `const` and there is no
+shared state for the BKL to protect.
+
+**Worth 30 ns and ≤10 ns respectively (§7.3).** And the tier pays for itself
+beyond that: because `akuma_get_version` is the floor control, the gap between
+it and `getpid` is now a **live, permanent measurement of what the prologue and
+epilogue cost** — the audit's ablation ladder as an instrument rather than a
+one-off build.
+
+The differential oracle flagged this as a divergence the moment it was added,
+which is what it is for. It is not excluded from the comparison: the leaf test
+pins **both** halves — which fields the fast path may change, and which it must
+not (signal-state clear, counter bucket, debug-IO gate, EFAULT diagnostic).
+Getting the second half wrong is how a "harmless" fast path quietly drops a
+signal-state clear.
+
+`test_akuma_get_version` **counts** rather than asserting: the suite runs on a
+kernel thread with no identity, so every resolution attempt misses and bumps
+`IDENTITY_FALLBACKS`, which turns that counter into a direct probe for "how many
+times did this excursion ask who am I?".
+
+That test failed the first time it ran, and it was right to. The claim it was
+written against — "a leaf resolves no identity at all" — was too strong, because
+`is_current_interrupted()` runs between the gated prologue and the gated
+epilogue and is **deliberately not** in the fast path: it decides whether a
+killed process keeps executing syscalls, and relocating a signal check to save
+two loads is not a trade to make casually. On a miss it costs exactly two
+resolutions, and that number is a mechanism rather than an observation fitted to
+the failure:
+
+```
+is_current_interrupted -> current_process_shared
+    -> current_thread_own_process                      = miss 1
+    -> lookup_process_shared(current_pid()?)
+         -> current_pid -> current_thread_own_process   = miss 2
+```
+
+So the test pins the leaf at 2 and requires the `getpid` control to be strictly
+higher. The control is load-bearing: without it a fast path that had silently
+stopped being taken would still satisfy a bare upper bound if the counter simply
+stopped moving for every syscall. And pinning 2 is the point — if the interrupted
+check ever joins the fast path, or a new identity consumer creeps into the
+prologue, this trips and somebody decides on purpose.
+
+The 30 ns in §7.3 was measured **with** that check still running, so it is a
+floor on the tier's value, not a ceiling.
+
+### 7.8 What is still open
+
+- **The entry-vector GPR fast path** described above. `takes_no_args` exists for
+  it; nothing has tried it.
+- **More `Leaf` members.** The tier is worth 30 ns to whoever qualifies, and the
+  bottleneck is criterion 2, so the candidates are calls that answer from a
+  global rather than from a process — not the `get*id` family.
+- **`is_current_interrupted` is the last identity consumer in a leaf
+  excursion**, and it costs two resolutions (the chain above). Whether a leaf
+  can skip it is a *signal-delivery* question, not a performance one — the
+  deferred-kill handling at the EL1→EL0 boundary may already cover it, and
+  "may" is not an argument. It needs its own analysis before anyone touches it.
+- `sys_uname` still calls `validate_user_ptr` and then `copy_to_user` over the
+  same range, validating twice. Unmeasured, and probably inside the tick floor.
+- `src/syscall/utils/read_profile.rs` has a pre-existing
+  `clippy::manual_is_multiple_of` error under `--features read-profile`. Not
+  reached by the pre-commit hook, which does not lint that feature set.
+- **The audit's headline is stale in a good way.** It opens with Akuma at
+  **3.0×** Linux on a bare `getpid` (440 vs 147 ns). Measured today with the
+  same probe binary on both guests — Linux being Ubuntu in Lima under Apple
+  `vz`, 4 vCPUs, so `SMP=4` is the like-for-like row:
+
+  | | Akuma `SMP=4` | Akuma `SMP=1` | Linux (4 vCPU) |
+  |---|---:|---:|---:|
+  | `getpid` | **130** | 190 | **136** |
+  | `uname` | 140 | 240 | 154 |
+  | leaf (`akuma_get_version`) | **90** | 160 | — |
+
+  Parity at `SMP=4`, 1.4× at `SMP=1`, and a leaf syscall *below* Linux's floor.
+  The `uname`/`getpid` ratio is the honest cross-kernel number for the user-copy
+  path — 1.08× on Akuma against 1.13× on Linux — which says `copy_to_user` is
+  not where Akuma loses; the whole remaining gap is the fixed boundary at
+  `SMP=1`. That document should be updated rather than left to read as current:
+  its analysis stands, its headline does not.
 ## 8. Family implementations
 
 Unchanged from the proposal: keep extracting families **opportunistically**, on

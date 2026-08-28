@@ -463,7 +463,21 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // load; the previous shape re-derived this up to five times per syscall
     // (lock + map walk + IRQ-masked table scan each) and was most of the gap
     // to Linux on a bare `getpid` (docs/archive/AKUMA_SYSCALL_PERFORMANCE_AUDIT.md).
-    let cur = akuma_exec::process::table::current_thread_tgid_process();
+    // Skipped entirely for a `FastPath::Leaf` number (`akuma_syscalls::fast_path`):
+    // an arm that reads no arguments and touches nothing reachable from "who is
+    // calling" has no use for an identity, and the bookkeeping done on its behalf
+    // has nothing to write. That drops the resolve, both `Process` stamps, the
+    // per-process stats, the clock reads and the epilogue's re-resolve. It does
+    // NOT drop `CURRENT_SYSCALL_NR`/`set_thread_current_syscall` above (a crash
+    // dump reads those to say which syscall a thread was in) or the counters
+    // below (the totals would stop adding up). Membership and the four admission
+    // criteria are in the crate; the cost of admission is that those syscalls
+    // stop appearing in `/proc/<pid>/syscalls`.
+    let cur = if plan.resolve_identity {
+        akuma_exec::process::table::current_thread_tgid_process()
+    } else {
+        None
+    };
     let owner_pid = cur.map_or(0, |(pid, _)| pid);
     if let Some((_, proc)) = cur {
         proc.last_syscall.store(syscall_num, Ordering::Relaxed);
@@ -980,10 +994,16 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // Under `IdentitySource::Prologue` it is the pointer from before the
     // dispatch, which `akuma_syscalls::slot` proves is a use-after-free two
     // peer operations deep. See `EPILOGUE_IDENTITY`.
-    let epi_cur = match epi.identity {
-        akuma_syscalls::IdentitySource::Prologue => cur,
-        akuma_syscalls::IdentitySource::Reresolve => {
-            akuma_exec::process::table::current_thread_tgid_process()
+    let epi_cur = if !epi.clear_current_syscall && !epi.record_time && !epi.log {
+        // A leaf: nothing below writes through a `Process`, so resolving one
+        // would be the work this tier exists to skip.
+        None
+    } else {
+        match epi.identity {
+            akuma_syscalls::IdentitySource::Prologue => cur,
+            akuma_syscalls::IdentitySource::Reresolve => {
+                akuma_exec::process::table::current_thread_tgid_process()
+            }
         }
     };
 

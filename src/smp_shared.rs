@@ -27,6 +27,9 @@
 #![cfg_attr(not(kernel_tests), allow(dead_code))]
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+// The syscall number table (crate 1). The BKL opt-out seed below names its
+// entries rather than spelling their numbers — see the note above the seed.
+use akuma_syscalls_linux::nr;
 
 /// Maximum cores we bring up. Comfortably under the `aff0 < 16` single-cluster limit
 /// on QEMU `virt`.
@@ -246,27 +249,35 @@ pub fn set_irq_bkl_drop_enabled(on: bool) {
 /// validated it. Entries must already run their entire body under a whole-fn
 /// carve-out guard (so conversion only deletes the entry/exit lock round-trip) —
 /// audit the code outside the guard before adding one.
+//
+// Spelled with `nr::` constants rather than bare numbers. It used to be numbers
+// with the name in a trailing comment, which is a comment that can drift from
+// its value with nothing checking — the exact failure
+// `docs/archive/AKUMA_EXTRACT_SYSCALLS.md` was written to end ("the table lived
+// somewhere the other caller could not reach"). Since crate 1 landed there is
+// not even a historical excuse: `akuma_syscalls_linux::nr` is a public crate and
+// its consts are usable in this `const` context.
 const SYSCALL_BKL_OPTOUT_SEED: &[u64] = &[
     // Phase 7f tranche 1: the `no-bkl-network` family — whole-fn `NetBklGuard`
     // since Phase 2, so the body already runs BKL-free; nothing outside the guard
     // but the dispatch-arm casts. sendto/recvfrom/sendmsg/recvmsg are deliberately
     // ABSENT: their unix-socket routing arm must stay BKL-held (AB-BA, locking.md).
-    198, // socket
-    200, // bind
-    201, // listen
-    202, // accept — window spans the blocking wait, exactly as its guard already did
-    203, // connect — blocking wait, same note as accept
-    204, // getsockname
-    205, // getpeername
-    208, // setsockopt
-    209, // getsockopt
-    242, // accept4
+    nr::SOCKET,
+    nr::BIND,
+    nr::LISTEN,
+    nr::ACCEPT,
+    nr::CONNECT,
+    nr::GETSOCKNAME,
+    nr::GETPEERNAME,
+    nr::SETSOCKOPT,
+    nr::GETSOCKOPT,
+    nr::ACCEPT4,
     // getrandom (no-bkl-drivers family): DriverBklGuard covered everything but
     // validate_user_ptr, which now also runs BKL-free — same exposure it already has
     // inside every whole-fn net/vfs window (see the archive doc's follow-up note on
     // folding ensure_user_pages_mapped under as_lock).
-    278, // getrandom
-    300, // resolve_host (Akuma-private DNS) — blocking wait, same note as accept
+    nr::GETRANDOM,
+    nr::RESOLVE_HOST,
     // Phase 7f tranche 2a: syscalls whose whole body was audited to touch no
     // plain `Process` field and no process-table state beyond a bounded lookup.
     // `rt_sigprocmask`: the POSIX mask is PER-THREAD (`threading::
@@ -275,7 +286,7 @@ const SYSCALL_BKL_OPTOUT_SEED: &[u64] = &[
     // process-table state at all. Only `validate_user_ptr` + two user copies sit
     // outside it, the same exposure class `getrandom` already joined in tranche 1
     // (and now folded under `as_lock` by this tranche's pre-flight).
-    135, // rt_sigprocmask
+    nr::RT_SIGPROCMASK,
     // Phase 7f tranche 2b: the first conversion cleared by the blocking-window
     // analysis (archive doc §4). `nanosleep`'s window spans `schedule_blocking`,
     // but it carries NO `Process`-derived reference across the wait — the loop is
@@ -285,7 +296,7 @@ const SYSCALL_BKL_OPTOUT_SEED: &[u64] = &[
     // Every lookup-then-use is bounded far inside the 10ms reclaim cooldown. The
     // BKL was never held across the wait anyway (§4.1): `reconcile_for_spsr`
     // re-points the per-core lock at whichever thread the core resumes.
-    101, // nanosleep
+    nr::NANOSLEEP,
     // Phase 7f tranche 3: `futex`, the second blocking conversion, cleared once its
     // named prerequisite landed. The archive doc's §4.3 verdict was
     // "cleared-in-principle, BLOCKED on the second gate" — `FUTEX_WAITERS` was a bare
@@ -302,7 +313,19 @@ const SYSCALL_BKL_OPTOUT_SEED: &[u64] = &[
     // `current_thread_id`), lock-free timer reads (`uptime_us`; `utc_time_us` became an
     // atomic in this tranche for exactly this reason), and `get_waker_for_thread`, which
     // builds a `RawWaker` from a thread id and takes no lock.
-    98, // futex
+    nr::FUTEX,
+    // Phase 7f tranche 4, and the easiest entry this list will ever get:
+    // `akuma_get_version` returns a compile-time constant. It reads no
+    // arguments, touches no user memory, resolves no process and cannot block,
+    // so there is no shared state for the BKL to be protecting — the audit that
+    // every other entry needed is one line here.
+    //
+    // It is also the floor control for the syscall boundary
+    // (docs/archive/AKUMA_SYSCALL_PERFORMANCE_AUDIT.md), which makes it the one
+    // number where the opt-out's own cost is directly visible: the BKL
+    // enter/leave pair is inside the 167 ns `wrap` span, and this is the only
+    // arm with nothing else in it to hide that.
+    nr::AKUMA_GET_VERSION,
 ];
 
 /// Syscalls that must NEVER be opted out, mechanism-level (not merely "not yet
@@ -310,7 +333,7 @@ const SYSCALL_BKL_OPTOUT_SEED: &[u64] = &[
 /// path and their teardown must run BKL-held (`return_to_kernel`'s ledger reset is a
 /// safety net, not a design), and `rt_sigreturn` (139) is dispatched from the trap
 /// prologue before the opt-out window's assumptions about the excursion shape hold.
-const SYSCALL_BKL_OPTOUT_DENIED: &[u64] = &[93, 94, 139];
+const SYSCALL_BKL_OPTOUT_DENIED: &[u64] = &[nr::EXIT, nr::EXIT_GROUP, nr::RT_SIGRETURN];
 
 /// Bitmap of syscall numbers (0..512 covers every Linux + Akuma-private number in
 /// `syscall::nr`) currently opted out of the syscall-entry BKL.
