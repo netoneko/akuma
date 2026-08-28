@@ -112,6 +112,60 @@ reproduce** while busybox reproduced freely in the same boot.
 | **RELR shared-page accumulation** (the still-open bug in [`instr_abort_relr_wedge`-class work](CARGO_NULL_RC_MEMORY_REFERENCE_AUDIT.md)) | The accumulation shape predicts a rate that grows with exec count. Measured across 600 additional `busybox true` execs: **8/20 → 8/20 → 4/20**, i.e. flat/noisy, not growing |
 | **Path/`open` specific** | Fails via stdin too (`busybox md5sum < /tmp/ident.bin`: 12 correct, 8 wrong over 20) |
 
+## Three more eliminations (same day, after the table above)
+
+**It is not our busybox binary, our build, or PIE-vs-static.** A completely
+independent busybox — Alpine's own `/bin/busybox`, a different version built by a
+different toolchain, **dynamically linked PIE** — staged into the guest via
+Docker, fails the same way:
+
+| binary | wrong / 16 | distinct |
+|---|---:|---:|
+| Alpine busybox (dynamic PIE, different build) | **4** | 3 |
+| our busybox (static, control, same boot) | **8** | 2 |
+
+That kills the PIE/RELR hypothesis outright — a static non-PIE build and a
+dynamic PIE build both miscompute — and it moves the defect firmly kernel-side:
+two independently-built programs get it wrong on the same kernel.
+
+**It is not the shared file-page cache.** One-flag A/B on
+`config::SHARED_FILE_PAGES_ENABLED` (`src/file_page_cache.rs`'s documented kill
+switch), full rebuild, fresh SMP=4 boot: **11/20 still wrong, 4 distinct
+values**. A per-box shared page handed out wrongly after eviction was a natural
+suspect — the files here are tiny, so there is nothing to evict — and the flag
+settles it.
+
+**The wrong digests are not a digest of any simple mangling of the file.** The
+forensic search was extended from ~300 to ~1300 candidate contents, now
+including length-changing mutations: every 4096-byte page duplicated, every page
+skipped, an offset-reset at each page boundary, and the same three at 64-byte
+md5-block granularity. Against eight distinct observed wrong digests: **zero
+matches**. So busybox is not hashing a re-ordered, duplicated, truncated or
+shifted version of the bytes. Whatever it hashes is not a permutation of the
+file.
+
+### Staging non-busybox binaries via Docker (recipe, and where it stops)
+
+Worth recording because the obvious comparison — a non-busybox `md5sum` — is
+still not made. Docker on the host can produce arm64 Alpine binaries:
+
+```bash
+docker run --rm --platform linux/arm64 -v "$OUT:/out" alpine sh -c \
+  'apk add --no-cache coreutils >/dev/null; cp /usr/bin/md5sum /out/; \
+   cp /lib/ld-musl-aarch64.so.1 /out/; cp -L /usr/lib/libcrypto.so.3 /out/'
+```
+
+Push them in over ssh and `chmod +x`. The guest has **no** `/lib/ld-musl-aarch64.so.1`
+of its own, so the loader must be staged too — after which Alpine's busybox runs
+(that is how the comparison above was made; note it dispatches on `argv[0]`, so
+it must be named `busybox`).
+
+Coreutils `md5sum` still could not be run: it pulls a chain of shared libraries
+(`libcrypto.so.3`, `libacl.so.1`, `libattr.so.1`, then `libutmps.so.0.1`, …).
+Either keep staging them, or build a static non-busybox md5 with the local
+`aarch64-linux-musl-gcc` — the latter is probably faster and also gives a
+*static* non-busybox implementation, which is the missing cell in the table.
+
 ## Leading hypotheses, none confirmed
 
 1. **libbb's shared hash driver.** md5/sha1/sha512 are the failing set and they
@@ -120,18 +174,24 @@ reproduce** while busybox reproduced freely in the same boot.
    `cksum`/`base64` do not use it. The next measurement is to read busybox's
    source for that driver and instrument it, or disassemble the md5 applet, and
    find what it touches that a stateless chunk loop does not.
-2. **PIE + RELR.** busybox is a PIE with a `.relr.dyn` section; **every** probe
-   above is `-static` non-PIE, which is a real confound. This is **untested**,
-   and three routes to testing it were tried and are all blocked in this
-   environment:
-   - `-static-pie` with the local `musl-cross` 0.9.11 fails to link
-     ("read-only segment has dynamic relocations" — its `libc.a` is not PIC).
-   - `apk add coreutils` for a non-busybox `md5sum` fails: the guest could not
-     reach the network, and `/bin/md5sum` is only a symlink to busybox.
-   - A dynamically-linked PIE cannot run in the guest at all — there is no
-     `/lib/ld-musl-aarch64.so.1`.
+2. ~~**PIE + RELR.**~~ **Dead** — see "Three more eliminations": a static
+   non-PIE busybox and a dynamic PIE busybox both miscompute.
 
-   Unblocking needs a PIC-capable musl on the host, or a working `apk` path.
+3. **busybox's `bb_common_bufsiz1`, or wherever the hash context lives.** The
+   failing set (md5/sha1/sha512) shares libbb's hash driver; the passing set in
+   the same binary (`cksum`, `base64`) does not, and that split survives across
+   two independent builds. busybox keeps a global scratch buffer
+   (`bb_common_bufsiz1`) that applets share, and the hash driver carries a
+   multi-word context plus a partial-block buffer **across** every `read(2)`.
+   The probe arms above put a *read destination* in `.bss`, on the stack, and in
+   anonymous mmap and found nothing — but none of them placed **live state that
+   must survive a syscall** at busybox's particular addresses.
+
+   Concrete next measurement: disassemble the md5 applet (the binary is
+   stripped, so work from the `.rodata` md5 constant table backwards) to find
+   where the context lives, then check whether the kernel writes anywhere near
+   it on a syscall return — signal-frame setup, TLS, or the initial
+   stack/auxv region are the candidates with prior form in this tree.
 
 ### A corroborating symptom, noticed in passing
 
