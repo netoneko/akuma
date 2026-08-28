@@ -982,15 +982,13 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
         return EFAULT;
     }
 
-    let infinite = timeout_ptr == 0;
-    let timeout_us = if !infinite {
-        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        if read_user_into(&mut ts, timeout_ptr).is_err() {
-            return EFAULT;
-        }
-        (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
-    } else {
-        0
+    // NULL timeout = block indefinitely. `infinite`/`timeout_us` stay two
+    // locals because the wait loops below read them separately; the pair is
+    // derived from one `Option` so they cannot disagree.
+    let (infinite, timeout_us) = match time::read_timeout_us(timeout_ptr) {
+        Ok(Some(us)) => (false, us),
+        Ok(None) => (true, 0),
+        Err(e) => return e,
     };
 
     let start_time = crate::timer::uptime_us();
@@ -1408,15 +1406,13 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
     let fds_size = nfds * core::mem::size_of::<PollFd>();
     if nfds > 0 && !validate_user_ptr(fds_ptr, fds_size) { return EFAULT; }
 
-    let infinite = timeout_ptr == 0;
-    let timeout_us = if !infinite {
-        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        if read_user_into(&mut ts, timeout_ptr).is_err() {
-            return EFAULT;
-        }
-        (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
-    } else {
-        0
+    // NULL timeout = block indefinitely. `infinite`/`timeout_us` stay two
+    // locals because the wait loops below read them separately; the pair is
+    // derived from one `Option` so they cannot disagree.
+    let (infinite, timeout_us) = match time::read_timeout_us(timeout_ptr) {
+        Ok(Some(us)) => (false, us),
+        Ok(None) => (true, 0),
+        Err(e) => return e,
     };
 
     if crate::config::SYSCALL_DEBUG_NET_ENABLED && nfds > 0 {

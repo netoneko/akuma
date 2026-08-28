@@ -28,7 +28,7 @@ host-test.
 | `akuma-rump` | device-independent orchestration for the rump raw-L2 path |
 | `akuma-scheduler` | discrete-event simulator for placement / netpoll wake policy |
 | `akuma-terminal` | terminal/line-discipline state |
-| `akuma-time` | time syscalls + the boot-time SNTP client |
+| `akuma-syscalls-time` | time syscalls + the boot-time SNTP client |
 | `akuma-vfs` | the `Filesystem` trait and common FS types |
 
 `akuma-isolation` joined this list on 2026-08-28 rather than being born into it.

@@ -25,7 +25,7 @@
 //! Not here: the 16.5 k lines of `src/syscall/`. §7 of the proposal is explicit
 //! about why. A crate holding the family implementations would depend on vfs,
 //! ext2, net, exec, mm, pmm and terminal — a second kernel, whose tests need
-//! all of that mocked. Families move out one at a time on the `akuma-time`
+//! all of that mocked. Families move out one at a time on the `akuma-syscalls-time`
 //! model, when a family has real pure logic worth testing.
 //!
 //! # The shape it follows: decisions, not injected effects

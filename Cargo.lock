@@ -19,8 +19,8 @@ dependencies = [
  "akuma-rump",
  "akuma-syscalls",
  "akuma-syscalls-linux",
+ "akuma-syscalls-time",
  "akuma-terminal",
- "akuma-time",
  "akuma-timer",
  "akuma-vfs",
  "akuma-virtio",
@@ -136,14 +136,7 @@ name = "akuma-syscalls-linux"
 version = "0.1.0"
 
 [[package]]
-name = "akuma-terminal"
-version = "0.1.0"
-dependencies = [
- "spinning_top",
-]
-
-[[package]]
-name = "akuma-time"
+name = "akuma-syscalls-time"
 version = "0.1.0"
 dependencies = [
  "akuma-exec",
@@ -151,6 +144,13 @@ dependencies = [
  "akuma-syscalls-linux",
  "akuma-timer",
  "log",
+]
+
+[[package]]
+name = "akuma-terminal"
+version = "0.1.0"
+dependencies = [
+ "spinning_top",
 ]
 
 [[package]]

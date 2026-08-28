@@ -2,10 +2,10 @@
 
 `clock_gettime` / `clock_settime` / `clock_getres` / `adjtimex` /
 `clock_adjtime` / `nanosleep` / `clock_nanosleep` / `setitimer` / `times` /
-`getrusage` / `time` / `uptime`. Source: `crates/akuma-time/src/lib.rs` —
+`getrusage` / `time` / `uptime`. Source: `crates/akuma-syscalls-time/src/lib.rs` —
 moved out of the bin crate 2026-08-25 (nothing in it actually needed
 bin-crate privilege; see that file's module doc). `src/syscall/mod.rs`
-aliases `use akuma_time as time;`, so every `time::sys_*` call site in the
+aliases `use akuma_syscalls_time as time;`, so every `time::sys_*` call site in the
 dispatch table is unchanged. The boot-time SNTP fallback
 ([below](#boot-time-clock-source-and-the-firecracker-fallback)) lives in the
 same crate's `sntp`/`boot` submodules, host-tested there; the wiring into
@@ -114,18 +114,18 @@ can't be interleaved mid-message. Steps 1-3 below are all inside
    `QEMU_DNS_SERVER` (`10.0.2.3`) has nothing listening on it under
    Firecracker. A hostname here would time out on exactly the platform that
    needs this fallback.
-2. Opens a UDP socket, sends one SNTP request (`akuma_time::sntp::
+2. Opens a UDP socket, sends one SNTP request (`akuma_syscalls_time::sntp::
    build_request`), and busy-polls (`akuma_net::smoltcp_net::poll()` +
    `yield_now`, no `blocking_relax`/interrupt park — this runs **before**
    `akuma_primitives::irq::unmask_irqs()`) up to
    `config::NTP_BOOTSTRAP_TIMEOUT_US` (3 s) for a response.
-3. `akuma_time::sntp::parse_response` validates mode/stratum/origin-echo
+3. `akuma_syscalls_time::sntp::parse_response` validates mode/stratum/origin-echo
    (rejects a stale or off-path-spoofed reply) and computes the estimated
    Unix time from **uptime deltas**, not absolute client time — the
    client's own clock has no absolute epoch yet, which is the entire reason
    this is running, so the classic four-timestamp offset formula is applied
    over `(t4_up - t1_up)` and `(T3_srv - T2_srv)` instead. See the doc
-   comment on `akuma_time::sntp` for the derivation.
+   comment on `akuma_syscalls_time::sntp` for the derivation.
 4. On success, `akuma_timer::set_utc_time_us(result.unix_epoch_us,
    result.anchor_uptime_us)` and `Ok(())`. On any failure (DNS failure, no
    socket, bind failure, send failure, timeout, or a malformed/spoofed

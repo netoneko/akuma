@@ -791,7 +791,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                     futex_dequeue(key, tid);
                     return EFAULT;
                 }
-                let timeout_us = (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000;
+                let timeout_us = ts.to_us();
                 // Timeout interpretation per Linux semantics, NOT op-flag-agnostic:
                 //   - FUTEX_WAIT (plain): timeout is RELATIVE to now.
                 //   - FUTEX_WAIT_BITSET: timeout is ABSOLUTE. Default clock is

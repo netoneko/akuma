@@ -125,10 +125,10 @@ userspace-visible timestamps.
 `akuma-timer` only ever *reads* the offset that `set_utc_time_us` writes;
 the writers — `clock_settime`/`adjtimex`/`clock_adjtime`, and the boot-time
 SNTP fallback for platforms with no PL031 (Firecracker) — live in the
-sibling `akuma-time` crate. See
+sibling `akuma-syscalls-time` crate. See
 [`../syscalls/time.md`](../syscalls/time.md) § "boot-time clock source and
 the Firecracker fallback". Don't confuse the two crates by name: `akuma-timer`
-is the hardware/tick-policy crate this file documents, `akuma-time` is the
+is the hardware/tick-policy crate this file documents, `akuma-syscalls-time` is the
 syscall/NTP crate.
 
 ## Background

@@ -236,6 +236,37 @@ pub fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
     0
 }
 
+/// Read a `struct timespec` timeout argument from user memory.
+///
+/// `Ok(None)` for a NULL pointer, which every caller spells as "block
+/// indefinitely"; `Ok(Some(us))` otherwise; `Err(EFAULT)` for a pointer that
+/// cannot be read.
+///
+/// This lives here because `akuma-syscalls-time` **is** the timespec syscalls, and it
+/// is the copy-in half of the split this crate and `akuma-syscalls-linux`
+/// already have: the arithmetic is pure data and belongs to
+/// [`Timespec::to_us`], the user-memory read is an effect and belongs here.
+///
+/// Four callers spelled the whole thing inline before 2026-08-28, and two of
+/// them — `sys_pselect6` and `sys_ppoll` in `src/syscall/poll.rs` — were
+/// byte-identical ten-line blocks. Returning `Option` rather than a
+/// `(bool, u64)` pair is the part that matters: those two carried a separate
+/// `infinite` flag beside `timeout_us`, and every later use had to remember to
+/// consult both.
+///
+/// The NULL check is deliberately *not* folded into `read_user_into`'s EFAULT:
+/// address 0 is a legal "no timeout" argument here, not a bad pointer.
+pub fn read_timeout_us(ptr: u64) -> Result<Option<u64>, u64> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let mut ts = Timespec::default();
+    if read_user_into(&mut ts, ptr).is_err() {
+        return Err(EFAULT);
+    }
+    Ok(Some(ts.to_us()))
+}
+
 /// `clock_settime(2)`, `CLOCK_REALTIME` only (Linux also errors on the other
 /// clock ids — `CLOCK_MONOTONIC` etc. aren't settable there either).
 ///
@@ -251,9 +282,7 @@ pub fn sys_clock_settime(clock_id: u32, tp_ptr: u64) -> u64 {
     if read_user_into(&mut ts, tp_ptr).is_err() {
         return EFAULT;
     }
-    let (sec, nsec) = ts.bits();
-    let unix_epoch_us = sec.saturating_mul(1_000_000).saturating_add(nsec / 1_000);
-    akuma_timer::set_utc_time_us(unix_epoch_us, akuma_timer::uptime_us());
+    akuma_timer::set_utc_time_us(ts.to_us(), akuma_timer::uptime_us());
     0
 }
 
@@ -354,12 +383,11 @@ pub fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
     // - libakuma:   a0 = seconds (raw), a1 = nanoseconds (raw)
     // Distinguish by checking if a0 looks like a user-space pointer (>= PAGE_SIZE).
     let mut ts = Timespec::default();
-    let (sec, nsec) = if a0 >= 4096 && read_user_into(&mut ts, a0).is_ok() {
-        ts.bits()
+    let total_us = if a0 >= 4096 && read_user_into(&mut ts, a0).is_ok() {
+        ts.to_us()
     } else {
-        (a0, a1)
+        Timespec::from_bits(a0, a1).to_us()
     };
-    let total_us = sec.saturating_mul(1_000_000).saturating_add(nsec / 1_000);
     if total_us == 0 { return 0; }
     let deadline = akuma_timer::uptime_us().saturating_add(total_us);
     loop {
@@ -396,8 +424,7 @@ pub fn sys_clock_nanosleep(clock_id: u32, flags: i32, request_ptr: u64, remain_p
     if read_user_into(&mut ts, request_ptr).is_err() {
         return EFAULT;
     }
-    let (sec, nsec) = ts.bits();
-    let req_us = (sec.saturating_mul(1_000_000)).saturating_add(nsec / 1_000);
+    let req_us = ts.to_us();
 
     let deadline = if flags & TIMER_ABSTIME != 0 {
         // Absolute deadline in `clock_id`'s own time base. Mirrors `sys_clock_gettime`'s

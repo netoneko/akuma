@@ -3,7 +3,7 @@
 //!
 //! Moved out of `src/syscall/mod.rs` 2026-08-27. It sat in the bin crate for
 //! the same reason the errno table did — and with the same consequence: no
-//! library crate could name a syscall it implements. `akuma-time` owns six of
+//! library crate could name a syscall it implements. `akuma-syscalls-time` owns six of
 //! the numbers below and could not reach any of them.
 //!
 //! **The `#[cfg(feature = ...)]` gates the bin crate's copy carried are gone.**

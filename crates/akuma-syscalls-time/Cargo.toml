@@ -1,5 +1,5 @@
 [package]
-name = "akuma-time"
+name = "akuma-syscalls-time"
 version = "0.1.0"
 edition = "2024"
 description = "Time syscalls (clock_gettime/settime, itimers, adjtimex) and the boot-time SNTP client for platforms with no RTC"

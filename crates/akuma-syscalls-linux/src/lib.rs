@@ -21,7 +21,7 @@
 //! It had already produced the same result for struct layouts.
 //! `struct timespec` existed five times in two representations when this crate
 //! was written, and the two copies named `LocalTimespec` carried the reason in
-//! the name — `akuma-time` **is** the timespec syscalls and could not reach the
+//! the name — `akuma-syscalls-time` **is** the timespec syscalls and could not reach the
 //! bin crate's definition, so it made its own.
 //!
 //! The failure mode is worse here than for errno. A wrong errno is visible at

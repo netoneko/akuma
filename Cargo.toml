@@ -17,7 +17,7 @@ default-members = [
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-linux",
     "crates/akuma-terminal",
-    "crates/akuma-time",
+    "crates/akuma-syscalls-time",
     "crates/akuma-timer",
     "crates/akuma-vfs",
     "crates/akuma-virtio",
@@ -662,7 +662,7 @@ akuma-timer = { path = "crates/akuma-timer" }
 # Time syscalls (clock_gettime/settime, itimers, adjtimex) and the boot-time
 # SNTP fallback for platforms with no RTC (Firecracker) — extracted from
 # src/syscall/time.rs, see docs/archive/MISSING_NTP_SYSCALLS.md.
-akuma-time = { path = "crates/akuma-time" }
+akuma-syscalls-time = { path = "crates/akuma-syscalls-time" }
 # The Linux/aarch64 syscall ABI: the `nr::` number table, the repr(C) wire
 # structs and their layout assertions, and the flag tables — all host-tested,
 # none of which was possible while they lived in this bin crate

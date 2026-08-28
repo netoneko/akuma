@@ -238,14 +238,12 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
         return EFAULT;
     }
 
-    let timeout_us = if timeout_ptr != 0 {
-        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        if read_user_into(&mut ts, timeout_ptr).is_err() {
-            return EFAULT;
-        }
-        (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
-    } else {
-        u64::MAX
+    // A NULL timeout is `rt_sigtimedwait`'s "wait forever", which this loop
+    // spells as a `u64::MAX` deadline rather than a separate flag.
+    let timeout_us = match time::read_timeout_us(timeout_ptr) {
+        Ok(Some(us)) => us,
+        Ok(None) => u64::MAX,
+        Err(e) => return e,
     };
 
     let start_time = crate::timer::uptime_us();

@@ -5,16 +5,16 @@
 //! microVM exposes no PL031 at all, which is why
 //! `docs/archive/MISSING_NTP_SYSCALLS.md` found the guest permanently stuck
 //! at epoch 0 with no way to even correct it (`clock_settime` was missing
-//! too — see `akuma-time`). By the time `run_async_main` reaches network
+//! too — see `akuma-syscalls-time`). By the time `run_async_main` reaches network
 //! init, `timer::utc_time_us()` still being `None` IS that platform signal —
 //! no separate "which board am I on" check needed — so this runs one
 //! best-effort SNTP round trip instead. Never fatal: the caller logs the
 //! `Result` and boot continues with the clock unset on failure, exactly as
 //! it did before this existed.
 //!
-//! All the protocol/retry logic lives in `akuma_time::{sntp, boot}` (host
+//! All the protocol/retry logic lives in `akuma_syscalls_time::{sntp, boot}` (host
 //! tested there); this module is just the wiring — DNS resolve, UDP socket,
-//! and handing `akuma_net::smoltcp_net`'s calls to `akuma_time::boot`'s
+//! and handing `akuma_net::smoltcp_net`'s calls to `akuma_syscalls_time::boot`'s
 //! effects. Returns `Result<(), &'static str>` (same shape as
 //! `akuma_net::init`) rather than logging itself, so the caller in
 //! `main.rs` — which decided to attempt this in the first place — is the
@@ -43,7 +43,7 @@ pub fn try_bootstrap_clock() -> Result<(), &'static str> {
 
     let remote = smoltcp::wire::IpEndpoint::new(
         smoltcp::wire::IpAddress::Ipv4(ip),
-        akuma_time::sntp::NTP_PORT,
+        akuma_syscalls_time::sntp::NTP_PORT,
     );
 
     let mut send = |req: &[u8]| akuma_net::smoltcp_net::udp_socket_send(handle, req, remote).is_ok();
@@ -54,7 +54,7 @@ pub fn try_bootstrap_clock() -> Result<(), &'static str> {
     let mut uptime_us = akuma_timer::uptime_us;
     let mut yield_now = akuma_exec::threading::yield_now;
 
-    let mut effects = akuma_time::boot::BootstrapEffects {
+    let mut effects = akuma_syscalls_time::boot::BootstrapEffects {
         send: &mut send,
         recv: &mut recv,
         poll_network: &mut poll_network,
@@ -62,10 +62,10 @@ pub fn try_bootstrap_clock() -> Result<(), &'static str> {
         yield_now: &mut yield_now,
     };
 
-    let result = akuma_time::boot::bootstrap_over_udp(&mut effects, crate::config::NTP_BOOTSTRAP_TIMEOUT_US)
+    let result = akuma_syscalls_time::boot::bootstrap_over_udp(&mut effects, crate::config::NTP_BOOTSTRAP_TIMEOUT_US)
         .map_err(|e| {
-            use akuma_time::boot::BootstrapError;
-            use akuma_time::sntp::SntpError;
+            use akuma_syscalls_time::boot::BootstrapError;
+            use akuma_syscalls_time::sntp::SntpError;
             match e {
                 BootstrapError::SendFailed => "UDP send failed",
                 BootstrapError::Timeout => "no response within timeout",

@@ -75,9 +75,9 @@ mod sync;
 pub mod version;
 mod term;
 /// Itimers, clock_gettime/settime/getres, nanosleep, adjtimex — moved to the
-/// `akuma-time` crate 2026-08-25 (docs/archive/MISSING_NTP_SYSCALLS.md); this
+/// `akuma-syscalls-time` crate 2026-08-25 (docs/archive/MISSING_NTP_SYSCALLS.md); this
 /// alias keeps every `time::sys_*` call site below unchanged.
-use akuma_time as time;
+use akuma_syscalls_time as time;
 #[cfg(feature = "sc-timerfd")]
 mod timerfd;
 
@@ -235,7 +235,7 @@ pub use akuma_exec::mmu::user_access::BYPASS_VALIDATION;
 ///
 /// Moved to `akuma_syscalls_linux::nr` on 2026-08-27 — 261 lines of table that
 /// lived in the bin crate, so no library crate could name a syscall it
-/// implements (`akuma-time` owns six of them). Re-exported rather than
+/// implements (`akuma-syscalls-time` owns six of them). Re-exported rather than
 /// imported per-module: every `nr::FOO` below, and every submodule reaching it
 /// through `use super::*`, keeps its spelling.
 ///

@@ -8,12 +8,21 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{exec,ext2,firecracker,isolation,kacho,net,net-yarn,pmm,primitives,rump,terminal,time,timer,vfs,virtio}`.
-  `akuma-time` is the time syscalls (`clock_gettime`/`clock_settime`/
-  `adjtimex`/itimers/`nanosleep`) plus the boot-time SNTP client for
-  platforms with no RTC (Firecracker) — `docs/reference/subsystems/
-  syscalls/time.md`. Don't confuse it with `akuma-timer`, the hardware
-  CNTV/PL031 + tick-policy crate below.
+  `akuma-{exec,ext2,firecracker,isolation,kacho,net,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
+  plus the `akuma-syscalls*` family below.
+  The **syscall family** is three crates, layered leaf-first and named so the
+  layering is visible: `akuma-syscalls-linux` is the ABI (numbers, `repr(C)`
+  wire structs and their layout assertions, flag tables — zero dependencies);
+  `akuma-syscalls` is the *shape* of an excursion (which counter bucket, which
+  hooks run, where the epilogue's identity comes from) and depends only on the
+  ABI crate; `akuma-syscalls-time` is one syscall *family* implementation —
+  `clock_gettime`/`clock_settime`/`adjtimex`/itimers/`nanosleep` plus the
+  boot-time SNTP client for platforms with no RTC (Firecracker) —
+  `docs/reference/subsystems/syscalls/time.md`. It was named `akuma-time`
+  until 2026-08-28; the rename is what stops it reading as a sibling of
+  `akuma-timer`, the hardware CNTV/PL031 + tick-policy crate below, which it
+  is not. Further families move out on the same model when a family has real
+  pure logic worth testing.
   `akuma-kacho` is the shared observe/decide/hysteresis layer every self-tuning
   policy uses (timer-tick demotion, file-page cache cap, netpoll wake rate).
   `akuma-net-yarn` is the readiness wait loop as a pure state machine, driven by

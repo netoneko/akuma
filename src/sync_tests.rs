@@ -113,10 +113,21 @@ fn test_futex_unaligned_addr() {
 
 // The fourth of the five `struct timespec` definitions this tree carried,
 // collapsed into `akuma-syscalls-linux` on 2026-08-27.
-// `test_clock_gettime_struct_layout` below stays a boot test even though the
-// same layout is now a `const _` assertion and a host test in that crate: it is
-// the only one of the three that checks the type the *running kernel* was
-// compiled with.
+//
+// `test_clock_gettime_struct_layout` was deleted here on 2026-08-28. It kept a
+// comment claiming it was "the only one of the three that checks the type the
+// running kernel was compiled with", and that was wrong: the `const _: () =
+// assert!(size_of::<Timespec>() == 16)` family in that crate is evaluated when
+// the crate is compiled, and the kernel build compiles it for
+// `aarch64-unknown-none` like any other dependency. So the layout of the type
+// the running kernel uses is already checked — at build time, in every profile,
+// including the ones that compile no boot tests at all. The boot test could
+// only ever fail after a QEMU boot of a `kernel_tests` build, strictly later
+// and strictly less often, for the same fact.
+//
+// The byte-pattern half (field order, little-endian) moved to
+// `time::tests::timespec_field_order_is_sec_then_nsec` in that crate, which
+// keeps the same two magic constants.
 use akuma_syscalls_linux::Timespec;
 
 /// FUTEX_WAIT with a 10 ms timeout must return ETIMEDOUT.
@@ -2443,33 +2454,12 @@ fn test_clock_getres_null_ptr() {
     console::print("  [PASS] test_clock_getres_null_ptr\n");
 }
 
-fn test_clock_gettime_struct_layout() {
-    // Verify struct timespec matches Linux ABI (16 bytes, tv_sec at offset 0, tv_nsec at offset 8)
-    assert!(core::mem::size_of::<Timespec>() == 16,
-        "struct timespec size mismatch: {} != 16", core::mem::size_of::<Timespec>());
-    assert!(core::mem::align_of::<Timespec>() == 8,
-        "struct timespec alignment mismatch: {} != 8", core::mem::align_of::<Timespec>());
-
-    // Verify field offsets
-    let ts = Timespec { tv_sec: 0x1234_5678_9ABC_DEF0u64 as i64, tv_nsec: 0xFEDC_BA98_7654_3210u64 as i64 };
-    let bytes = unsafe { core::slice::from_raw_parts((&raw const ts).cast::<u8>(), 16) };
-
-    // tv_sec at offset 0 (little-endian)
-    assert!(bytes[0] == 0xF0, "tv_sec byte 0 mismatch");
-    assert!(bytes[7] == 0x12, "tv_sec byte 7 mismatch");
-    // tv_nsec at offset 8
-    assert!(bytes[8] == 0x10, "tv_nsec byte 0 mismatch");
-    assert!(bytes[15] == 0xFE, "tv_nsec byte 7 mismatch");
-
-    console::print("  [PASS] test_clock_gettime_struct_layout\n");
-}
 
 pub fn run_all_tests() {
     console::print("
 --- Futex Sync Tests ---
 ");
     // clock_gettime tests first (simple, fast)
-    test_clock_gettime_struct_layout();
     test_clock_gettime_realtime();
     test_clock_gettime_monotonic();
     test_clock_gettime_all_clock_ids();

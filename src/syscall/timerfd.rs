@@ -31,8 +31,7 @@ fn timespec_to_us_safe(ptr: usize) -> Result<u64, u64> {
     if read_user_into(&mut ts, ptr as u64).is_err() {
         return Err(EFAULT);
     }
-    let (sec, nsec) = ts.bits();
-    Ok(sec * 1_000_000 + nsec / 1_000)
+    Ok(ts.to_us())
 }
 
 fn us_to_timespec_safe(us: u64, ptr: usize) -> Result<(), u64> {

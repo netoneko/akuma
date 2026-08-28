@@ -24,7 +24,7 @@ not ship its own libc. For the syscall ABI that makes this possible, see
 | `__init_tls` runs before user code | auxv (`AT_PHDR`/`AT_RANDOM`/`AT_PAGESZ`/`AT_ENTRY`) + PT_INTERP mapping | `crates/akuma-exec/src/elf/mod.rs` |
 | `getrandom` for stack canaries / ASLR | nr 278 | `src/syscall/proc.rs` |
 | `/dev/urandom` for crypto seed | `DevUrandom` fd | see `archive/ON_DEMAND_ELF_LOADER.md` |
-| `clock_gettime(CLOCK_REALTIME/MONOTONIC)` | nr 113, ns resolution | `crates/akuma-time/src/lib.rs` |
+| `clock_gettime(CLOCK_REALTIME/MONOTONIC)` | nr 113, ns resolution | `crates/akuma-syscalls-time/src/lib.rs` |
 
 ## posix_spawn and CLONE_VFORK
 

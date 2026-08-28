@@ -100,7 +100,8 @@ cargo test --target "$HOST" 2>&1 \
 > `akuma-syscalls-linux` extraction). The number has moved by a factor of 1.6 in
 > two weeks and every step was a crate arriving, not tests being written into
 > `src/`: `akuma-firecracker` (2026-08-21, DTB fixtures), `akuma-net-yarn`
-> (2026-08-24), `akuma-time` and `akuma-boot` (2026-08-25),
+> (2026-08-24), `akuma-time` (renamed `akuma-syscalls-time` 2026-08-28) and
+> `akuma-boot` (2026-08-25),
 > `akuma-syscalls-linux` (+34, 2026-08-28). **That is the mechanism to expect:**
 > an extraction's whole point is to make a body of logic host-testable, so the
 > count jumps by the new crate's own test count on the commit that lands it, and

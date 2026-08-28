@@ -755,9 +755,7 @@ fn read_timeval_us(optval: u64, optlen: u32) -> Result<Option<u64>, ()> {
     if tv.tv_sec < 0 || tv.tv_usec < 0 {
         return Err(());
     }
-    let us = (tv.tv_sec as u64)
-        .saturating_mul(1_000_000)
-        .saturating_add(tv.tv_usec as u64);
+    let us = tv.to_us();
     Ok(if us == 0 { None } else { Some(us) })
 }
 
