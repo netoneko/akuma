@@ -12,6 +12,13 @@ defect was invisible; the 2026-08-27 widening put live data in x3-x10, so a
 handler state** instead of file bytes, 24 bytes per page, with `read` reporting
 the full count. Fixed by making the vector transparent to x4-x18; guarded by
 `test_el1_sync_exception_preserves_gprs`.
+
+**The mechanism was called by Kirill Maksimov, well before it was measured** —
+*"unless someone is swapping registers under us"*. That is the whole answer, and
+it was on the table while the investigation spent two sessions on ext2, the page
+cache, NEON state, `.rodata`, PIE/RELR, straddling stores and allocator arms. See
+§ "What this cost, and the transferable lesson" for how it got retired.
+
 **Grade: A** — established by single-variable A/B on the vector's save/restore
 (below), with the clobbered register set matching the corrupted byte offsets
 register for register.
@@ -411,6 +418,11 @@ candidate fixes.
 
 ### How it was actually cracked (method, not luck)
 
+(Written before the cause was known. A third decisive move belongs in this list
+and came from the same place: Kirill's "unless someone is swapping registers
+under us", which named the mechanism outright. It is the one that should have been
+followed first, and the section above records why it was not.)
+
 Worth recording because the two decisive moves were both *stepping outside the
 probe-writing loop*, and both came from the reviewer rather than from the
 investigation's own momentum:
@@ -696,6 +708,25 @@ Three sessions, ~15 userspace probes, and a dozen retired mechanisms — and the
 cause was a register save list in the exception vector, which no probe could see.
 Two habits would have shortened it:
 
+- **The right hypothesis came from Kirill and a bad experiment buried it.**
+  It was proposed as *"unless someone is swapping registers under us"*, and a
+  session then wrote it into the tier-4 comment in `user_access.rs` almost
+  verbatim — *"the EL1 … path is not preserving this leaf function's live
+  registers (x3-x10)"* — and
+  tier 4 tested it by masking **IRQs**. That could never have worked: the IRQ
+  vector saves a full 832-byte frame including NEON, and the defect was in the
+  **synchronous** vector, reached by a data abort, which IRQ masking does not
+  suppress. The measurement came back 9/20 still wrong and the doc recorded
+  *"'an interrupt tears the copy' is falsified"* — true, and irrelevant. The
+  lesson is not "trust hypotheses more"; it is **name the mechanism precisely
+  enough that the experiment can only be aimed at it.** "An exception clobbers
+  our registers" and "an interrupt tears the copy" differ by one word and by
+  which of two vectors you go read.
+- Invariant 2 in that same asm header actively argued against the answer:
+  "CALLER-SAVED REGISTERS ONLY … AAPCS64 says x0-x17 are the caller's to lose."
+  True of a *call*. An exception is not a call, and a resolve-and-retry path needs
+  the faulting instruction's inputs intact. A comment that reassures is worth
+  re-deriving before you trust it.
 - **When a symptom dies as soon as the code uses fewer registers, suspect
   registers.** The tier A/B already contained that signal: byte loop clean (x3
   only), widened loop broken (x3-x10). It was read as "wide stores are the

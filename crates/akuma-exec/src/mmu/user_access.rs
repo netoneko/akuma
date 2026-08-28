@@ -69,8 +69,10 @@ global_asm!(
 //      exception handler rewrites ELR_EL1 to that trampoline, and its `ret`
 //      must land back in the Rust caller. Give this function a prologue and a
 //      mid-copy fault returns to garbage. Do not add one.
-//   2. CALLER-SAVED REGISTERS ONLY (x3-x10 here). AAPCS64 says x0-x17 are the
-//      caller's to lose, and the trampoline restores nothing.
+//   2. CALLER-SAVED REGISTERS ONLY (x3-x10 here), because the trampoline restores
+//      nothing before returning EFAULT. Note what this does NOT license: AAPCS64
+//      says x0-x17 are the *caller's* to lose, but an exception is not a call, and
+//      invariant 3 is the half that bites.
 //   3. THE EXCEPTION MUST NOT EAT x3-x10. A store here can fault (the first
 //      touch of a lazy destination page), and `try_resolve_el1_user_copy_lazy_fault`
 //      resolves it and ERETs back to RE-EXECUTE that store — so every register
