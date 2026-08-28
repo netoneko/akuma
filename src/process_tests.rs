@@ -218,6 +218,42 @@ fn test_user_copy_loop_differential_sweep() {
     }
 }
 
+/// An EL1 sync exception must be transparent to x4-x18.
+///
+/// `docs/archive/BUSYBOX_HASH_MISCOMPUTE.md`: `try_resolve_el1_cow_fault` and
+/// `try_resolve_el1_user_copy_lazy_fault` resolve a kernel-side fault and `eret`
+/// back to **re-execute** the faulting instruction, so every register that
+/// instruction reads has to survive the handler. The vector saved x0-x3/x29/x30
+/// only, which was invisible while `__arch_copy_user_memory` was a byte loop
+/// living in x3 — and became silent `read(2)` corruption the moment the loop was
+/// widened to hold data in x3-x10.
+///
+/// This is the deterministic half of that story: the differential sweep proves
+/// the copy asm agrees with the byte loop, and this proves the exception cannot
+/// eat the registers it runs on.
+#[cfg(target_os = "none")]
+fn test_el1_sync_exception_preserves_gprs() {
+    // The probe faults on purpose and the EL1 handler dumps every data abort
+    // before it consults the recovery handler, so one exception dump in the boot
+    // log here is expected rather than a symptom.
+    crate::safe_print!(160,
+        "  [test] el1_sync_exception_preserves_gprs: the EL1 abort dump below is deliberate\n");
+    let (mask, aborts) = crate::exceptions::el1_sync_gpr_clobber_mask();
+    if aborts == 0 {
+        // The probe's store did not fault, so nothing was tested. Report that as a
+        // failure rather than a pass: a vacuous assertion here would hide exactly
+        // the corruption this test exists to catch.
+        crate::safe_print!(224,
+            "  [FAIL] el1_sync_exception_preserves_gprs: no EL1 data abort fired — vacuous\n");
+    } else if mask == 0 {
+        crate::safe_print!(192,
+            "  [PASS] test_el1_sync_exception_preserves_gprs ({aborts} abort(s), x4-x18 intact)\n");
+    } else {
+        crate::safe_print!(224,
+            "  [FAIL] el1_sync_exception_preserves_gprs: clobbered mask={mask:#x} (bit n => x[4+n])\n");
+    }
+}
+
 pub fn run_all_tests() {
     console::print("\n--- Process Execution Tests ---\n");
 
@@ -237,6 +273,7 @@ pub fn run_all_tests() {
     // (docs/archive/BUSYBOX_HASH_MISCOMPUTE.md).
     #[cfg(target_os = "none")]
     test_user_copy_loop_differential_sweep();
+
 
     // Real (shared-kernel) SMP M0: confirm every secondary the DTB reported came up
     // on the shared kernel. Runs FIRST so it is observed even if a later, unrelated
@@ -1016,6 +1053,17 @@ pub fn run_all_tests() {
     // suite assertion. Runs LAST for the same coverage reason as the two above.
     #[cfg(kernel_smp_shared)]
     test_no_stale_window_heals();
+
+    // LAST on purpose: this one provokes a real EL1 data abort, and the handler
+    // dumps every data abort before it consults the recovery handler, so it both
+    // prints and shifts timing. Nothing downstream should have to be robust to
+    // that. (`retired_reclaim_ab` was suspected of being disturbed by it and is
+    // not: measured 2026-08-28 at SMP=1, it fails with the identical message on
+    // an unmodified tree too, 1 boot in 6. It is independently flaky — it needs
+    // two retired processes to exist by the time it runs and sometimes finds one.)
+    // (docs/archive/BUSYBOX_HASH_MISCOMPUTE.md)
+    #[cfg(target_os = "none")]
+    test_el1_sync_exception_preserves_gprs();
 
     console::print("--- Process Execution Tests Done ---\n\n");
 }

@@ -45,8 +45,6 @@ use crate::threading::set_user_copy_fault_handler;
 unsafe extern "C" {
     fn __arch_copy_user_memory(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn __arch_copy_user_memory_bytes(dst: *mut u8, src: *const u8, len: usize) -> u64;
-    fn __arch_copy_user_memory_no64(dst: *mut u8, src: *const u8, len: usize) -> u64;
-    fn __arch_copy_user_memory_x8(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn __arch_copy_user_fault();
 }
 
@@ -73,7 +71,16 @@ global_asm!(
 //      mid-copy fault returns to garbage. Do not add one.
 //   2. CALLER-SAVED REGISTERS ONLY (x3-x10 here). AAPCS64 says x0-x17 are the
 //      caller's to lose, and the trampoline restores nothing.
-//   3. UNALIGNED IS ALLOWED. SCTLR_EL1.A is 0 (src/boot.rs forces SA/SA0 off
+//   3. THE EXCEPTION MUST NOT EAT x3-x10. A store here can fault (the first
+//      touch of a lazy destination page), and `try_resolve_el1_user_copy_lazy_fault`
+//      resolves it and ERETs back to RE-EXECUTE that store — so every register
+//      the store reads has to survive `sync_el1_handler`. That vector saved
+//      x0-x3/x29/x30 only, which was invisible while this was a byte loop living
+//      in x3 and became silent read(2) corruption the moment it widened into
+//      x3-x10 (docs/archive/BUSYBOX_HASH_MISCOMPUTE.md). Widening this loop
+//      further, or moving it to other registers, is safe only as long as the
+//      vector saves them: `test_el1_sync_exception_preserves_gprs` is the guard.
+//   4. UNALIGNED IS ALLOWED. SCTLR_EL1.A is 0 (src/boot.rs forces SA/SA0 off
 //      and leaves A at its reset value, which is clear on both QEMU virt and
 //      Firecracker/KVM), so unaligned ldp/stp to Normal memory is fine. Device
 //      memory would fault on multi-register access regardless of A; no user VA
@@ -128,62 +135,11 @@ __arch_copy_user_memory:
 9:  mov     x0, #0
     ret
 
-// Same routine minus the 64-byte tier: starts at 16-byte chunks. Third arm of
-// the A/B, to find WHICH tier of the 2026-08-27 widening corrupts.
-.global __arch_copy_user_memory_no64
-__arch_copy_user_memory_no64:
-    cbz     x2, 29f
-22: cmp     x2, #16
-    b.lo    24f
-23: ldp     x3, x4, [x1], #16
-    stp     x3, x4, [x0], #16
-    sub     x2, x2, #16
-    cmp     x2, #16
-    b.hs    23b
-24: cmp     x2, #8
-    b.lo    26f
-    ldr     x3, [x1], #8
-    str     x3, [x0], #8
-    sub     x2, x2, #8
-26: cbz     x2, 29f
-27: ldrb    w3, [x1], #1
-    strb    w3, [x0], #1
-    subs    x2, x2, #1
-    b.ne    27b
-29: mov     x0, #0
-    ret
-
-// Single-register 8-byte variant: `ldr`/`str` of one x-register, never a pair.
-// The missing rung of the bisect. Widths measured so far: 64-byte groups lose 360
-// bytes, 16-byte pairs lose 120, the byte loop loses nothing. This arm answers
-// whether the defect is the PAIRED access (`ldp`/`stp` touching two registers, so
-// 16 bytes per instruction) or merely the width/speed of the copy:
-//   corrupts => width or speed, not the pair instruction
-//   clean    => it is specifically the multi-register access
-.global __arch_copy_user_memory_x8
-__arch_copy_user_memory_x8:
-    cbz     x2, 39f
-32: cmp     x2, #8
-    b.lo    36f
-33: ldr     x3, [x1], #8
-    str     x3, [x0], #8
-    sub     x2, x2, #8
-    cmp     x2, #8
-    b.hs    33b
-36: cbz     x2, 39f
-37: ldrb    w3, [x1], #1
-    strb    w3, [x0], #1
-    subs    x2, x2, #1
-    b.ne    37b
-39: mov     x0, #0
-    ret
-
-// Byte-at-a-time variant, kept ONLY as an A/B control for
-// docs/archive/BUSYBOX_HASH_MISCOMPUTE.md: it is the pre-2026-08-27 loop, before
-// the 64/16/8-byte widening, so flipping `USER_COPY_BYTES_ONLY` isolates the
-// widening as a single variable without checking out an older tree. Same three
-// invariants as above — leaf, stackless, caller-saved registers only — because
-// the same fault trampoline returns through x30 for both.
+// Byte-at-a-time variant: the pre-2026-08-27 loop, kept as the reference oracle
+// for `copy_loop_differential_sweep` — the widened loop above is only trustworthy
+// against an implementation too simple to be wrong. Same invariants as above,
+// leaf and stackless, because the same fault trampoline returns through x30 for
+// both. Not reachable from any copy path.
 .global __arch_copy_user_memory_bytes
 __arch_copy_user_memory_bytes:
     cbz     x2, 19f
@@ -201,26 +157,6 @@ __arch_copy_user_fault:
     ret
     "#
 );
-
-/// A/B control for `docs/archive/BUSYBOX_HASH_MISCOMPUTE.md`.
-///
-/// `0` = the shipped widened loop (64/16/8/byte tiers, 2026-08-27).
-/// `1` = the pre-widening byte loop. **Measured to make the corruption vanish**
-///       (`md5probe whole` 0/16, busybox `md5sum` 0/12, against 9-10/16 and
-///       6-8/12 on `0`), which is what identified the widening as the cause.
-/// `2` = widened loop minus the 64-byte tier, to isolate which tier corrupts.
-/// `3` = widened loop, page-split so no multi-register access straddles a page
-///       boundary. **Measured: still corrupts (12/20)** — the straddle
-///       hypothesis is dead.
-/// `4` = widened loop with IRQs masked across the copy. Diagnostic for
-///       "an interrupt mid-copy tears it"; never ship it. **Measured: still
-///       corrupts (9/20)** — interrupts are not the mechanism.
-/// `5` = single-register 8-byte `ldr`/`str` loop, no paired access. Separates
-///       "the paired instruction" from "width/speed".
-///
-/// Ship as `0` once the real defect is found; `1` is the safe mitigation in the
-/// meantime, at the cost of the 2026-08-27 read-path speedup.
-const USER_COPY_TIER: u8 = 1;
 
 /// `EFAULT`, as the byte loop's trampoline returns it and as the syscall ABI wants
 /// it (`x0 = -errno` happens at the syscall boundary, not here).
@@ -672,53 +608,10 @@ pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> R
     // Ensure compiler doesn't reorder these calls
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    let res = match USER_COPY_TIER {
-        1 => unsafe { __arch_copy_user_memory_bytes(dst, src, len) },
-        2 => unsafe { __arch_copy_user_memory_no64(dst, src, len) },
-        3 => {
-            // Candidate FIX, and a test of the straddling-store hypothesis: keep
-            // the wide loop, but never let one `ldp`/`stp` span a page boundary
-            // on either side. Each segment is bounded by the nearer of the two
-            // next page boundaries, so every multi-register access lands wholly
-            // inside one page of both the source and the destination — while the
-            // 64-byte tier still does the bulk of the work inside each page.
-            let mut d = dst;
-            let mut sp = src;
-            let mut left = len;
-            let mut r = 0u64;
-            while left > 0 {
-                let to_d_edge = 4096 - (d as usize & 0xFFF);
-                let to_s_edge = 4096 - (sp as usize & 0xFFF);
-                let chunk = left.min(to_d_edge).min(to_s_edge);
-                r = unsafe { __arch_copy_user_memory(d, sp, chunk) };
-                if r != 0 {
-                    break;
-                }
-                // SAFETY: `chunk <= left`, so both stay inside the caller's ranges.
-                d = unsafe { d.add(chunk) };
-                sp = unsafe { sp.add(chunk) };
-                left -= chunk;
-            }
-            r
-        }
-        5 => unsafe { __arch_copy_user_memory_x8(dst, src, len) },
-        4 => {
-            // Tests "an interrupt during the copy tears it": run the SAME widened
-            // loop with IRQs masked, so no timer tick, no scheduler SGI and no
-            // preemption can land between its stores. If this is clean while
-            // tier 0 corrupts, the tear is caused by taking an interrupt mid-copy
-            // — which would mean the EL1 interrupt/context-switch path is not
-            // preserving this leaf function's live registers (x3-x10), or is
-            // resuming it with stale x0/x1/x2.
-            //
-            // DIAGNOSTIC ONLY: masking IRQs across a 64 KB copy is a latency
-            // disaster and must never ship.
-            akuma_primitives::irq::with_irqs_disabled(
-                || unsafe { __arch_copy_user_memory(dst, src, len) },
-            )
-        }
-        _ => unsafe { __arch_copy_user_memory(dst, src, len) },
-    };
+    // SAFETY: the fault trampoline registered above turns an unmapped user
+    // address into EFAULT instead of an EL1 panic; the caller owns the kernel-side
+    // length invariant (the safe wrappers take slices so it cannot disagree).
+    let res = unsafe { __arch_copy_user_memory(dst, src, len) };
 
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     set_user_copy_fault_handler(0);

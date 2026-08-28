@@ -417,10 +417,14 @@ echo "Building pthread_kill_eintr (C, pthread_kill EINTR probe)..."
 cp forktest/c_stress/pthread_kill_eintr ../bootstrap/bin/
 echo "pthread_kill_eintr (C) copied to bootstrap/bin/"
 
-# The user-copy corruption probe set (docs/archive/BUSYBOX_HASH_MISCOMPUTE.md).
+# The user-copy corruption probe set (docs/archive/BUSYBOX_HASH_MISCOMPUTE.md,
+# FIXED 2026-08-28 — the EL1 sync vector did not preserve the registers the
+# widened copy loop holds live across a store).
 # `md5probe whole` is the regression guard for that bug: fstat + malloc an
 # UNTOUCHED buffer + ONE large read + hash, one iteration per fresh exec. It must
-# print the same digest every run. The other three are the elimination arms that
+# print the same digest every run — and on failure it prints the histogram of
+# *in-page* offsets of the bad words, which is what named the registers. Run it
+# under HVF: TCG does not reproduce this class. The other three are the elimination arms that
 # localized it, kept because each rules out a mechanism this symptom invites:
 #   readback     — are the BYTES wrong? (self-identifying file, read + mmap arms)
 #   computecheck — is GPR/FP computation stable across preemption?

@@ -374,6 +374,35 @@ int main(int argc, char **argv)
                     printf("      -> data belonging at offset %u, delta %+ld%s\n", fg, dl,
                            (dl % 4096 == 0) ? " (PAGE ALIASING)" : "");
                 } else printf("      -> foreign data: %#x\n", fg);
+                // The damage is not one window: it repeats at the SAME
+                // in-page offsets on consecutive pages. So report the histogram
+                // of in-page offsets over ALL bad words — that names the shape
+                // in one line — plus the raw values on the first two pages.
+                printf("      dst=%p (page offset %#zx)\n", (void *)b, (size_t)b & 0xFFF);
+                {
+                    static int hist[1024];
+                    memset(hist, 0, sizeof hist);
+                    for (size_t o = 0; o + 4 <= got; o += 4) {
+                        uint32_t want2 = (uint32_t)o, g2;
+                        memcpy(&g2, b + o, 4);
+                        if (g2 != want2) hist[(((size_t)b + o) & 0xFFF) / 4]++;
+                    }
+                    printf("      bad in-page offsets (offset:pages):");
+                    for (int i = 0; i < 1024; i++)
+                        if (hist[i]) printf(" %d:%d", i * 4, hist[i]);
+                    printf("\n");
+                    size_t page0 = ((size_t)b + 0xFFF) & ~(size_t)0xFFF;
+                    for (int pg = 0; pg < 2; pg++) {
+                        size_t pv = page0 + (size_t)pg * 4096;
+                        if (pv + 64 > (size_t)b + got) break;
+                        printf("      page %#zx in-page 0..63:", pv >> 12);
+                        for (int j = 0; j < 8; j++) {
+                            uint64_t v; memcpy(&v, (char *)pv + j * 8, 8);
+                            printf(" %llx", (unsigned long long)v);
+                        }
+                        printf("\n");
+                    }
+                }
             }
             if (!k) memcpy(first, h, 33);
             else if (strcmp(first, h) != 0) diff++;

@@ -74,8 +74,39 @@ default_exception_handler:
     eret
 
 // Synchronous exception from EL1 (kernel fault)
+//
+// THIS HANDLER MUST BE TRANSPARENT TO EVERY GPR. It is not just a crash
+// reporter: `try_resolve_el1_cow_fault` and `try_resolve_el1_user_copy_lazy_fault`
+// both *resolve* the fault and return, and the `eret` below then re-executes the
+// faulting instruction. A retry is only correct if that instruction's input
+// registers still hold what they held when it aborted — so anything
+// `rust_sync_el1_handler` clobbers is silently written into memory by the retry.
+//
+// Saving x0-x3/x29/x30 was enough only by accident: the pre-2026-08-27
+// `__arch_copy_user_memory` byte loop kept its one live datum in x3. The
+// 64/16/8-byte widening put live data in x3-x10, and x4-x10 were destroyed
+// across the fault — so a `read(2)` whose destination page was faulted in
+// mid-copy stored leftover handler state instead of file bytes, 24 bytes per
+// page, while reporting the full byte count
+// (docs/archive/BUSYBOX_HASH_MISCOMPUTE.md).
+//
+// x19-x28 need no save here: `rust_sync_el1_handler` is `extern "C"`, so AAPCS64
+// obliges it to preserve them. x18 does, because Rust treats the platform
+// register as a temporary on this target unless told otherwise. FP/SIMD state is
+// still NOT saved — no kernel copy path holds live NEON across a store, and the
+// EL0/IRQ vectors that do save it are the ones that need it.
 sync_el1_handler:
-    // Save minimal context
+    // Save the volatile registers a retried instruction may still need. FIRST,
+    // so the block handed to Rust below keeps its documented layout.
+    stp     x4, x5, [sp, #-16]!
+    stp     x6, x7, [sp, #-16]!
+    stp     x8, x9, [sp, #-16]!
+    stp     x10, x11, [sp, #-16]!
+    stp     x12, x13, [sp, #-16]!
+    stp     x14, x15, [sp, #-16]!
+    stp     x16, x17, [sp, #-16]!
+    str     x18, [sp, #-16]!        // 8 bytes + 8 padding: keep sp 16-byte aligned
+
     stp     x29, x30, [sp, #-16]!
     stp     x0, x1, [sp, #-16]!
     stp     x2, x3, [sp, #-16]!     // Save extra regs for IL bit fix
@@ -94,6 +125,15 @@ sync_el1_handler:
     ldp     x2, x3, [sp], #16
     ldp     x0, x1, [sp], #16
     ldp     x29, x30, [sp], #16
+
+    ldr     x18, [sp], #16
+    ldp     x16, x17, [sp], #16
+    ldp     x14, x15, [sp], #16
+    ldp     x12, x13, [sp], #16
+    ldp     x10, x11, [sp], #16
+    ldp     x8, x9, [sp], #16
+    ldp     x6, x7, [sp], #16
+    ldp     x4, x5, [sp], #16
     eret
 
 // Synchronous exception from EL0 (user mode)
@@ -4900,4 +4940,133 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             fatal_signal_group_exit(-4) // never returns; SIGILL
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Regression probe: is the EL1 sync exception transparent to x4-x18?
+//
+// Gated on `kernel_tests` like `src/process_tests.rs`, its only caller: the
+// extreme-size profile drops the boot suite, and a probe that provokes a data
+// abort has no business in a build that will never assert on it.
+// ---------------------------------------------------------------------------
+
+#[cfg(kernel_tests)]
+unsafe extern "C" {
+    fn __el1_gpr_transparency_probe(out: *mut u64, base: u64) -> u64;
+}
+
+#[cfg(kernel_tests)]
+global_asm!(
+    r#"
+.text
+.global __el1_gpr_transparency_probe
+.global __el1_gpr_transparency_landing
+
+// x0 = out (15 u64 slots), x1 = pattern base.
+// Loads `base + N` into xN for N in 4..=18, takes ONE EL1 data abort, and writes
+// what those registers hold *after* the exception into `out`. The caller compares.
+//
+// Leaf and stackless on purpose, for the same reason __arch_copy_user_memory is:
+// the recovery rewrites ELR_EL1 to the landing label below, so anything this
+// function pushed would never be popped. It also keeps the live pattern out of
+// x0-x3/x29/x30, which the vector has always saved — those would pass even with
+// the bug.
+__el1_gpr_transparency_probe:
+    add     x4,  x1, #4
+    add     x5,  x1, #5
+    add     x6,  x1, #6
+    add     x7,  x1, #7
+    add     x8,  x1, #8
+    add     x9,  x1, #9
+    add     x10, x1, #10
+    add     x11, x1, #11
+    add     x12, x1, #12
+    add     x13, x1, #13
+    add     x14, x1, #14
+    add     x15, x1, #15
+    add     x16, x1, #16
+    add     x17, x1, #17
+    add     x18, x1, #18
+
+    mov     x2, x0                  // out pointer: x2 is saved by the vector
+    // A high user VA nothing maps or lazily backs. NOT a low one like 0x1000:
+    // measured 2026-08-28, a store there did not fault during the boot suite, so
+    // the first version of this test passed vacuously on a kernel with the bug.
+    movz    x3, #0x6000, lsl #32    // 0x0000_6000_0000_0000
+    str     x4, [x3]                // <-- the abort. ELR is rewritten to 1f, or
+                                    //     a resolved fault retries this store.
+__el1_gpr_transparency_landing:
+1:  stp     x4,  x5,  [x2, #0]
+    stp     x6,  x7,  [x2, #16]
+    stp     x8,  x9,  [x2, #32]
+    stp     x10, x11, [x2, #48]
+    stp     x12, x13, [x2, #64]
+    stp     x14, x15, [x2, #80]
+    stp     x16, x17, [x2, #96]
+    str     x18,      [x2, #112]
+    mov     x0, #0
+    ret
+    "#
+);
+
+/// Which of x4..x18 an EL1 sync exception failed to preserve — a bitmask where
+/// bit `n - 4` means register `xn` came back wrong. `0` is the healthy answer.
+///
+/// The property under test is that `sync_el1_handler` is transparent to every
+/// GPR, because `try_resolve_el1_cow_fault` and
+/// `try_resolve_el1_user_copy_lazy_fault` resolve the fault and `eret` back to
+/// **re-execute the faulting instruction**. A retry is only correct if that
+/// instruction's inputs survived, so a register the handler clobbers is stored
+/// into memory by the retry as if it were data.
+///
+/// The vector used to save x0-x3/x29/x30 only. That was enough while
+/// `__arch_copy_user_memory` was a byte loop holding its one live datum in x3;
+/// the 2026-08-27 widening put live data in x3-x10, and a `read(2)` whose
+/// destination page faulted in mid-copy then stored leftover handler state —
+/// 24 bytes per page, with `read` reporting the full count
+/// (`docs/archive/BUSYBOX_HASH_MISCOMPUTE.md`).
+///
+/// Runs on whichever recovery arm the fault takes: the resolve-and-retry paths if
+/// the VA turns out to be lazily mappable, otherwise the registered user-copy
+/// trampoline. Both return through this same vector, so either pins the fix.
+///
+/// Returns `(clobber_mask, aborts_taken)`. **`aborts_taken` is not decoration** —
+/// if VA `0x1000` were mapped in the current address space the store would simply
+/// succeed, no exception would fire, and the mask would read `0` for a kernel with
+/// the bug wide open. A test that cannot fail is worse than no test
+/// (`docs/archive/SMP_ADOPTED_IDLE_STACK_CLOBBER.md` is the local precedent), so
+/// the caller must require that the count moved.
+#[must_use]
+#[cfg(kernel_tests)]
+pub fn el1_sync_gpr_clobber_mask() -> (u32, u64) {
+    const BASE: u64 = 0x5A5A_0000;
+    const EC_DATA_ABORT_EL1: usize = 0x25;
+    let mut out = [0u64; 15];
+
+    let before = SYNC_EC_EL1[EC_DATA_ABORT_EL1].load(core::sync::atomic::Ordering::Relaxed);
+
+    // The trampoline arm needs a registered handler, or an unrecoverable EL1
+    // abort would kill the current process instead of landing at the label.
+    akuma_exec::threading::set_user_copy_fault_handler(
+        __el1_gpr_transparency_landing as *const () as usize as u64,
+    );
+    // SAFETY: `out` has the 15 slots the probe writes, and the abort it takes is
+    // recovered by the handler registered just above.
+    unsafe { __el1_gpr_transparency_probe(out.as_mut_ptr(), BASE) };
+    akuma_exec::threading::set_user_copy_fault_handler(0);
+
+    let after = SYNC_EC_EL1[EC_DATA_ABORT_EL1].load(core::sync::atomic::Ordering::Relaxed);
+
+    let mut mask = 0u32;
+    for (i, got) in out.iter().enumerate() {
+        if *got != BASE + (i as u64 + 4) {
+            mask |= 1 << i;
+        }
+    }
+    (mask, after.wrapping_sub(before))
+}
+
+#[cfg(kernel_tests)]
+unsafe extern "C" {
+    fn __el1_gpr_transparency_landing();
 }

@@ -1,18 +1,109 @@
 # `md5sum`/`sha*sum` return wrong digests for correct bytes
 
 **Date:** 2026-08-28
-**Status:** **CAUSE FOUND (2026-08-27 user-copy widening), exact defect still
-open. 100 % reproducible under TCG (`HVF=0`).** A single-variable A/B
-identifies the 2026-08-27 user-copy widening (`__arch_copy_user_memory`'s
-64/16/8-byte tiers) as the cause: reverting to the byte loop makes it vanish on
-both a controlled probe and busybox, and the damage per failure scales with store
-width (360 B / 120 B / 0 B for 64-byte / 16-byte / 1-byte stores). Mitigated in
-the tree by `USER_COPY_TIER = 1`. The precise fault in those `stp` stores is not
-yet identified — see § ROOT CAUSE.
-**Grade: B** — every measurement below was run end-to-end on 2026-08-28 at
-`SMP=4`, `MEMORY=2048`, on the default `cargo build --release` kernel. The
-elimination table is the durable part; the hypotheses at the end are not
-confirmed.
+**Status: ROOT-CAUSED AND FIXED.** `sync_el1_handler` (`src/exceptions.rs`) saved
+only x0-x3/x29/x30, but the two EL1 fault paths that *resolve* a fault
+(`try_resolve_el1_cow_fault`, `try_resolve_el1_user_copy_lazy_fault`) `eret` back
+to **re-execute the faulting instruction**. A retry is only correct if that
+instruction's input registers survived the handler — and x4-x18 did not. While
+`__arch_copy_user_memory` was a byte loop holding its one live datum in x3 the
+defect was invisible; the 2026-08-27 widening put live data in x3-x10, so a
+`read(2)` whose destination page was faulted in mid-copy stored **leftover
+handler state** instead of file bytes, 24 bytes per page, with `read` reporting
+the full count. Fixed by making the vector transparent to x4-x18; guarded by
+`test_el1_sync_exception_preserves_gprs`.
+**Grade: A** — established by single-variable A/B on the vector's save/restore
+(below), with the clobbered register set matching the corrupted byte offsets
+register for register.
+
+## The fix, and the evidence for it
+
+Two lines of evidence, both from 2026-08-28 at `SMP=4`, `MEMORY=2048`, HVF, on
+the default `cargo build --release` kernel with the **widened** copy loop:
+
+| `sync_el1_handler` saves | `md5probe whole` | busybox `md5sum` | boot test |
+|---|---:|---:|---|
+| x0-x3/x29/x30 (as shipped 2026-08-27) | **10/20 wrong**, always 90 bad words | 21/40 wrong | `[FAIL] mask=0x7ff3` |
+| + x4-x18 (the fix) | **0/40** | 0/40 | `[PASS] 1 abort, x4-x18 intact` |
+
+Nothing else changed between those rows. Full post-fix matrix — 268 measurements,
+zero failures: `md5probe whole`/`whole-mmap`/`whole-warm`/`whole-touch` 0/40 each,
+`whole` on a 1 MB file 0/12, `whole` under concurrent anon+file-cache pressure
+0/24, busybox `md5sum` 0/40 (64 KB) and 0/12 (1 MB), and `md5sum`/`sha1sum`/
+`sha512sum`/`cksum` each returning exactly one distinct digest over 12 runs.
+
+`mask=0x7ff3` names the damage precisely: x4, x5 and x8-x18 came back clobbered,
+x6 and x7 survived. That is the same register set the corrupted bytes decode to
+(see "How the byte offsets name the registers"), which is what makes this a
+diagnosis rather than a correlation.
+
+### Why the register save was ever enough
+
+Because the copy loop used to live entirely in registers the vector already
+saved. The pre-2026-08-27 loop is `ldrb w3 / strb w3`: one live datum, in x3.
+Widening it to 64/16/8-byte tiers spread live data across x3-x10 — and x4-x10
+were destroyed by every resolved fault. So the widening did not *introduce* a
+bug; it **exposed** a latent one in the exception vector, which is why reverting
+the widening (`USER_COPY_TIER = 1`) made the symptom vanish and looked like a
+fix. It was a timing-and-register-allocation mask.
+
+That also retires the "damage scales with store width" reading in § ROOT CAUSE
+below: 360 B lost with 64-byte groups vs 120 B with 16-byte pairs is not a race
+against wall-clock work, it is simply how many live registers each loop shape
+holds across the faulting store.
+
+### Two claims in this document were wrong; both are corrected here
+
+1. **"Under TCG it fails 100 % of the time; under HVF ~20 %."** Re-measured
+   2026-08-28 on the same tree (HEAD `2386520c`): under TCG, `md5probe whole` is
+   **0/24** and busybox `md5sum` **24/24 correct** — TCG does not reproduce it at
+   all. HVF reproduces at **~60 %** (24/40, 23/40, 25/40 across three probe
+   arms). The reproducer is **HVF, not TCG**; anyone continuing this class of
+   work should not spend a TCG run expecting a signal. (Why TCG hides it is not
+   established and no longer matters: whether QEMU's software MMU takes the same
+   translation fault at the same point in the loop is an emulator detail.)
+2. **"The 2026-08-27 user-copy widening is the cause."** It is the *trigger*, not
+   the cause. The A/B that identified it was sound and its measurements stand;
+   the conclusion drawn from it was one level too shallow. The cause is the
+   exception vector, and the tell was there in the elimination table all along:
+   a mechanism that survives page-splitting, IRQ masking and every allocator
+   arm, yet dies the moment the copy uses fewer registers, is about **registers**.
+
+### How the byte offsets name the registers
+
+The measurement that cracked it was a histogram of *in-page* offsets of the bad
+words, rather than a first-bad offset. The damage is not one contiguous window —
+which is how it was read for two sessions — but **the same few words in every
+destination page**:
+
+```
+malloc dest (b = page+0x20):  bad in-page offsets 8,12,16,20,24,28   x 15 pages = 90 words
+mmap dest   (b = page+0):     bad in-page offsets 8,12,40,44,48,52,56,60 x 16   = 129 words
+```
+
+Line the malloc case up against the 64-byte tier. The group that first stores
+into the new page runs `stp x3,x4,[x0,#0] / stp x5,x6,[x0,#16] /
+stp x7,x8,[x0,#32] / stp x9,x10,[x0,#48]`. Its first store into that page faults
+(first touch of a lazy page), `try_resolve_el1_user_copy_lazy_fault` maps the page
+and ERETs to retry — and the retried stores write whatever the handler left
+behind. The bytes that come back wrong are exactly the second half of the
+`x7,x8` pair and both halves of the `x9,x10` pair: **x8, x9, x10**. In the mmap
+case, whose group boundaries sit differently against the page, the wrong bytes
+are **x4** plus **x8, x9, x10**.
+
+And the leftover values are unmistakably the fault handler's own working set —
+per destination page, three consecutive words:
+
+```
+page 0x10421: 0x10421  0x123  0
+page 0x10422: 0x10422  0x124  6
+page 0x1042f: 0x1042f  0x131  0
+```
+
+The first word is the faulting page's own VA >> 12; the second increments once
+per page. Those are `page_va`, a frame index, and a small flag — the handler's
+locals, stored into the user's buffer by the retry, while `read` reported 65536
+of 65536.
 
 ## Summary
 
@@ -22,9 +113,10 @@ bytes are not wrong: the same file verifies byte-exact through `read(2)` and
 through `mmap`, and `busybox cksum` and `busybox base64` — which read every byte
 of the same file — are perfectly stable across runs.
 
-**Read § ROOT CAUSE first if you only want the answer**: the multi-register user-copy
-loop added 2026-08-27 loses a window of bytes while reporting a complete `read`.
-Everything between here and there is the elimination trail — worth keeping,
+**The answer is at the top of this file**: the EL1 exception vector did not
+preserve the registers the widened user-copy loop holds live across a store, so a
+resolved page fault mid-copy made the retry store handler state. Everything from
+here down is the elimination trail — worth keeping,
 because it retires a dozen plausible mechanisms (ext2, the page cache, mmap,
 NEON/FP state, `.rodata`, PIE/RELR, signals, the shared file-page cache) that
 this symptom otherwise invites, and because *why* it looked like a userspace
@@ -268,7 +360,18 @@ converts a 50 %-of-the-time guest symptom into a deterministic unit test, and it
 is the kind of test `docs/archive/USER_COPY_BYTE_LOOP.md` should have shipped
 with the widening.
 
-## ROOT CAUSE: the 2026-08-27 user-copy widening
+## The 2026-08-27 user-copy widening (the trigger, not the cause)
+
+**Superseded by the section at the top of this file — read that first.** The A/B
+below is still the measurement that narrowed the search from "userspace
+miscomputes" to "the user copy loses bytes", and it is kept for that. Its
+conclusion ("the defect is in the multi-register `stp` stores") is wrong: the
+defect is that the EL1 exception vector did not preserve the registers those
+stores read. The tier harness the section describes (`USER_COPY_TIER`, the
+`no64`/`x8`/page-split/IRQ-masked arms) was removed once the cause was known;
+`__arch_copy_user_memory_bytes` stays as the differential sweep's oracle.
+
+### Original section: ROOT CAUSE: the 2026-08-27 user-copy widening
 
 Confirmed by single-variable A/B, not by reading code. `USER_COPY_TIER` in
 `crates/akuma-exec/src/mmu/user_access.rs` selects the copy loop; nothing else
@@ -295,7 +398,7 @@ Supporting detail: in the `malloc` arm the first bad word sits at offset **4072*
 starts straddling into the next page. No `EFAULT` is ever returned and `read`
 reports the full byte count, so this is not the copy aborting on a fault.
 
-### Mitigation currently in the tree
+### Mitigation formerly in the tree (removed 2026-08-28)
 
 `USER_COPY_TIER = 1` (the byte loop) — the only arm measured clean on **both**
 the probe and busybox (0/16 and 0/12 at SMP=4, re-verified 0/20 and 0/20 with the
@@ -426,7 +529,16 @@ marker idea is worth retrying, restrict it to the user demand-paging allocator
 (`alloc_page_zeroed_user`) and expect programs that rely on zeroed `.bss` to
 misbehave.
 
-### What to do next
+### What to do next *(as written before the cause was found — answered above)*
+
+The first two items below were done and are what cracked it: the in-page offset
+histogram is the "instrument the frame lifecycle" item's real payoff (the frames
+were never swapped — the *registers* were), and the boot-test sweep proved the asm
+innocent, which is what forced the search out of the copy loop and into the
+vector. The third item, "does a straddling `stp` behave correctly", has the answer
+"yes — straddling was never involved".
+
+#### Original list
 
 - **Instrument the frame lifecycle, without printing.** The remaining hypothesis
   is that the destination frames are written by someone else after the copy.
@@ -450,7 +562,15 @@ misbehave.
 - Re-check whether `main` (or any commit before the widening) is clean — expected
   to be, given arm `1` above, but worth one confirmation.
 
-## Leading hypotheses, none confirmed
+## Leading hypotheses, none confirmed *(all superseded — see the top of this file)*
+
+Both surviving hypotheses below are **dead**. The failing set being md5/sha and
+not `cksum`/`base64` has nothing to do with libbb's hash driver: it is that the
+hash applets issue one large `read(2)` into a fresh untouched buffer, which is
+the only shape that faults a destination page in mid-copy. `cksum` and `base64`
+read in small chunks into a buffer they have already touched.
+
+### Original hypotheses
 
 1. **libbb's shared hash driver.** md5/sha1/sha512 are the failing set and they
    share `libbb`'s hash plumbing (a common read buffer — busybox has a global
@@ -526,3 +646,67 @@ right in the same process**, and **clean at or below one page**.
   accumulation prediction is falsified above
 - [`../runbooks/verify-trim-fat-change.md`](../runbooks/verify-trim-fat-change.md)
   — `mmapsum`'s digest-agreement check, the existing probe closest in spirit
+
+## Verify
+
+The fix is in `sync_el1_handler` (`src/exceptions.rs`) and the guard is a boot
+test, so the cheap check is the boot log:
+
+```
+  [PASS] test_user_copy_loop_differential_sweep (114048 cases, wide == byte everywhere)
+  [test] el1_sync_exception_preserves_gprs: the EL1 abort dump below is deliberate
+  [PASS] test_el1_sync_exception_preserves_gprs (1 abort(s), x4-x18 intact)
+```
+
+Two things to insist on in that output. **`1 abort(s)` is load-bearing**: the
+probe stores to `0x0000_6000_0000_0000` and reports how far `SYNC_EC_EL1[0x25]`
+moved, because the first version of the test stored to `0x1000` — which turned out
+to be mapped during the boot suite — took no exception at all, and passed
+vacuously on a kernel with the bug wide open. A `[FAIL] ... vacuous` line means
+the chosen VA became mappable, not that the vector regressed. And the EL1
+exception dump that follows the marker line **is** the test; a clean boot has 5 of
+those, not 4.
+
+One unrelated thing you will hit while doing repeat boots: `retired_reclaim_ab`
+fails intermittently at `SMP=1` — measured 1 boot in 6 on an **unmodified** tree,
+with the identical `OFF recovered 0p (retired 1), ON recovered 0p (retired 0)`
+message. It needs two retired processes to exist by the time it runs and
+sometimes finds one. It is not this fix, and it is not the boot test above.
+
+End-to-end, on HVF (**not** TCG — TCG does not reproduce this class):
+
+```bash
+SMP=4 MEMORY=2048 cargo run --release &
+python3 scripts/vm_ready.py 2222 600
+# a self-identifying file: the 4-byte word at offset o holds o
+python3 -c "import sys;sys.stdout.buffer.write(b''.join(o.to_bytes(4,'little') for o in range(0,65536,4)))" > ident.bin
+# push it, verify st_size is 65536, then ONE iteration per FRESH exec:
+#   /tmp/md5probe whole /tmp/ident.bin 1     -> expect badwords=0 every time
+#   busybox md5sum /tmp/ident.bin            -> expect f67ea8aaa3735fcf05215a86495be8f7
+```
+
+`userspace/forktest/c_stress/md5probe.c` prints, on any failure, the histogram of
+**in-page** offsets of the bad words. That histogram is the diagnostic worth
+keeping: a first-bad offset made this look like one lost window for two sessions,
+and the histogram named the registers in one run.
+
+## What this cost, and the transferable lesson
+
+Three sessions, ~15 userspace probes, and a dozen retired mechanisms — and the
+cause was a register save list in the exception vector, which no probe could see.
+Two habits would have shortened it:
+
+- **When a symptom dies as soon as the code uses fewer registers, suspect
+  registers.** The tier A/B already contained that signal: byte loop clean (x3
+  only), widened loop broken (x3-x10). It was read as "wide stores are the
+  problem" instead of "the extra registers are the problem", and the next
+  experiment (a single-register 8-byte loop) was designed but never run.
+- **Ask where the damage is, not where it starts.** Every report until the third
+  session gave a first-bad offset and a count. One histogram of in-page offsets
+  turned "90 lost bytes somewhere" into "x8, x9, x10, once per page" — and from
+  there the vector is two greps away.
+
+The other lesson is about this document: it carried "CAUSE FOUND" for a cause
+that was one level too shallow, and a reproducer platform (TCG) that was exactly
+backwards. Both cost real time in the session that inherited them. A confident
+status line is worth re-measuring before you build on it.
