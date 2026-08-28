@@ -128,15 +128,45 @@ import subprocess
 subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", "-p", "2222", "root@localhost", "<cmd>"])
 ```
 
-To wait for VM boot, poll the log file — NEVER call `job_output` with `wait: true` on the QEMU process (it runs forever):
+### Waiting for a VM
+
+**Poll the guest with an ssh round-trip. Never grep the boot log for a marker,
+and NEVER** call `job_output` with `wait: true` on the QEMU process (it runs
+forever).
+
 ```bash
-until grep -aqE "sshd started|Started sshd" 01_verify_apk_bootstrap_acceptance.log 2>/dev/null; do sleep 2; done
+scripts/vm_ready.py 2222            # exits 0 once the guest answers ssh
+# or, in Python:  import vm_ready; vm_ready.wait_ready(port=2222, proc=qemu)
 ```
 
-Two markers because there are two startup paths: `extreme-size` has the kernel
-spawn sshd (`[Main] sshd started`), every other profile lets herd do it
-(`[herd] Started sshd`). `-a` is required — QEMU emits a control byte that makes
-plain `grep` treat the log as binary.
+The old `grep -aqE "sshd started|Started sshd"` recipe is wrong in **both**
+directions and cost real time in both:
+
+- **False negative.** At SMP>1 the cores interleave console output, so the line
+  arrives torn (`[herd] Starting service: sshd` / `sshd (pid= 2)`). Worse, some
+  builds never print either spelling: measured 2026-08-28, a VM served ssh for
+  570 s with `bind=1 listen=1 accept=371380` in `[PSTATS]` and **zero** marker
+  matches, so a 10-minute wait timed out against a VM that was ready in seconds.
+- **False positive.** The marker means sshd *started*, not that it can accept —
+  and it never expires, so a stale log from the previous run reads as ready.
+
+Connecting to the forwarded TCP port is not readiness either: QEMU opens the
+`hostfwd` listener on the host the moment it starts, long before the guest is up.
+Only a completed command counts.
+
+`scripts/vm_ready.py` is the one implementation; harnesses import it rather than
+re-deriving the check. Marker greps that remain in `scripts/` are fallbacks for
+the "ssh never came up at all" diagnostic path only.
+
+If you *are* reading a boot log for something else, `-a` is mandatory — QEMU
+emits a control byte that makes plain `grep` treat the log as binary and print
+nothing. And note there are two startup paths for sshd: `extreme-size` has the
+kernel spawn it, every other profile lets herd do it.
+
+**Never `pkill -f qemu-system-aarch64`.** Other VMs belonging to the user may be
+running (they use `INSTANCE=N`, which maps ssh to `2222 + 100*N`). Kill only the
+instance you started, matched on its own forward, e.g.
+`hostfwd=tcp::2222-:22` for INSTANCE=0.
 
 If the VM wedges (100% CPU, unresponsive), see `docs/runbooks/recover-wedged-vm.md`.
 

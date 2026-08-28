@@ -13,6 +13,10 @@ established for F8, since the wedge can show zero watchdog time-jump lines.
 """
 import os, re, subprocess, sys, time
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__))))
+import vm_ready
+
 REPO = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                       capture_output=True, text=True, check=True).stdout.strip()
 ELF = os.path.join(REPO, "target/aarch64-unknown-none/release/akuma")
@@ -77,7 +81,7 @@ def attempt(n):
         time.sleep(3)
         try:
             with open(log_path, "rb") as f:
-                if re.search(rb"Started sshd|sshd started", f.read()):
+                if vm_ready.ssh_probe(2222) or re.search(rb"Started sshd|sshd started", f.read()):
                     booted = True
                     break
         except FileNotFoundError:

@@ -8,6 +8,10 @@ import time
 import os
 import sys
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__))))
+import vm_ready
+
 SMP_LEVELS = [2, 4]
 TEST_DURATION = 30  # seconds
 
@@ -44,7 +48,7 @@ def run_forktest_quick(smp):
             break
         log_file.write(line)
         log_file.flush()
-        if "Started sshd" in line:
+        if "Started sshd" in line or vm_ready.ssh_probe(2222):
             sshd_ready = True
             print("sshd ready!")
             break

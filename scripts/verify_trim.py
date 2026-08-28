@@ -48,6 +48,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vm_ready
+
 REPO = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                       capture_output=True, text=True, check=True).stdout.strip()
 
@@ -312,30 +315,29 @@ def tier1_tests(results, logdir="/tmp"):
         pass  # never let logging break the gate
 
 
-def wait_for_marker(log_path, timeout=480):
-    """Poll the log file. Never wait on the QEMU process itself — it runs forever.
+def wait_for_marker(log_path, timeout=480, port=None, proc=None):
+    """Readiness is an **ssh round-trip**, not a log grep. See `vm_ready.py`.
 
-    `sshd \\(pid=` is in the alternation because **the marker line can arrive torn in
-    half**. At SMP=4 the cores interleave console output, and `[herd] Started sshd
-    (pid= 2)` was observed (2026-08-16) split across two lines as
+    The log-marker check this used to rely on is wrong in both directions: at
+    SMP>1 the line arrives torn across cores (`[herd] Starting service: sshd` /
+    `sshd (pid= 2)`, observed 2026-08-16), and some builds never print either
+    spelling at all — measured 2026-08-28, a VM served ssh for 570 s of guest
+    uptime with zero marker matches, so a 10-minute wait timed out against a
+    healthy VM. The marker also never expires, so a stale log reads as ready.
 
-        [herd] Starting service: sshd
-        sshd (pid= 2)
-
-    with the `[herd] Started ` prefix separated from its tail, so neither `Started
-    sshd` nor `sshd started` appears contiguously anywhere in a log whose VM is
-    perfectly healthy — herd at PID 1, sshd at PID 2 accepting, a session handler at
-    PID 3. That reports `booted: False`, which reads exactly like a broken commit;
-    it is the same misreading this script's header calls out for the missing-disk
-    case. The torn tail is what survives, so match it too.
-
-    A contiguous string in an SMP console log is never a safe assumption. The
-    strictly better gate is an ssh round-trip, which no other core's printf can tear
-    — this stays log-based only because it must also work for the `booted: False`
-    diagnostics path, which needs to run before ssh is reachable.
+    An ssh round-trip cannot be torn by another core's printf and tests the thing
+    the gate needs: that the guest answers commands. The log marker is kept only
+    as a fallback for the `booted: False` diagnostics path, which must still say
+    something useful when ssh never comes up at all.
     """
+    if port is not None:
+        if vm_ready.wait_ready(port=port, timeout=timeout, proc=proc):
+            return True
+        # Fall through: ssh never answered. Say whether the guest got as far as
+        # printing a marker, because "booted but unreachable" and "never booted"
+        # are different bugs.
     marker = re.compile(rb"Started sshd|sshd started|sshd \(pid=")
-    deadline = time.time() + timeout
+    deadline = time.time() + (15 if port is not None else timeout)
     while time.time() < deadline:
         try:
             with open(log_path, "rb") as f:
@@ -374,7 +376,7 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
     vm = subprocess.Popen(["cargo", "run", "--release"], cwd=REPO, env=env,
                           stdout=log, stderr=subprocess.STDOUT)
     try:
-        booted = wait_for_marker(log_path)
+        booted = wait_for_marker(log_path, port=port, proc=qemu)
         results[f"smp{smp}.booted"] = booted
         if not booted:
             # A failed boot is the case that most needs triage, so report the three
@@ -581,7 +583,7 @@ def tier4_redis_memtest(results, memory, logdir, build):
     vm = subprocess.Popen([os.path.join(REPO, "overlays", "devbox", "run-smoltcp.sh")],
                           cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT)
     try:
-        if not wait_for_marker(log_path):
+        if not wait_for_marker(log_path, port=port, proc=qemu):
             results["redis.stage"] = "BOOT FAILED"
             return
         port = 2222

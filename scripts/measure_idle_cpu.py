@@ -34,6 +34,10 @@ import subprocess
 import sys
 import time
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__))))
+import vm_ready
+
 REPO = subprocess.run(
     ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
 ).stdout.strip()
@@ -42,7 +46,11 @@ REPO = subprocess.run(
 # `[herd] Started sshd (pid= 2)` can land split across two lines, so neither
 # full marker appears on a perfectly healthy boot. See the trim-fat runbook,
 # "Before calling anything a regression" §4.
-BOOT_MARKERS = ("Started sshd", "sshd started", "sshd (pid=")
+# Readiness is an ssh round-trip, not this log marker — the marker is torn
+# across cores at SMP>1 and absent entirely on some builds, so grepping for
+# it times out against healthy VMs. See scripts/vm_ready.py (measurements)
+# and CLAUDE.md § "Waiting for a VM".
+BOOT_MARKERS = ("Started sshd", "sshd started", "sshd (pid=")  # fallback only
 
 
 def cpu_seconds(pid):

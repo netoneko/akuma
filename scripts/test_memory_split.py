@@ -8,6 +8,10 @@ crashed and any fault FAR + free-RAM. Writes a summary to logs/split_summary.txt
 """
 import subprocess, time, os, signal, re, sys
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__))))
+import vm_ready
+
 ROOT = "/Users/netoneko/github.com/netoneko/akuma"
 os.chdir(ROOT)
 
@@ -46,7 +50,7 @@ def wait_boot(log, timeout=240):
     while time.time() - t0 < timeout:
         try:
             with open(log) as f:
-                if any(m in f.read() for m in ("sshd started", "Started sshd")):
+                if vm_ready.ssh_probe(2222) or any(m in f.read() for m in ("sshd started", "Started sshd")):
                     return True
         except FileNotFoundError:
             pass

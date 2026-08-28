@@ -70,6 +70,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vm_ready
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = "/tmp"
 SSH_PORT = 2222          # rump arms listen on 2223 (their own SLIRP); set per arm
@@ -195,11 +198,15 @@ def run_arm(name, cfg, probes, tag):
             if qemu.poll() is not None:
                 print(f"[{tag}] QEMU exited rc={qemu.returncode}", flush=True)
                 return None
-            if log_count(logp, b"sshd started") or log_count(logp, b"Started sshd"):
+            # Readiness = an ssh round-trip, not a log marker: at SMP>1 the
+            # marker line arrives torn across cores and some builds never print
+            # it at all, so grepping for it times out against healthy VMs
+            # (scripts/vm_ready.py has the measurements).
+            if vm_ready.ssh_probe(SSH_PORT):
                 break
             time.sleep(2)
         else:
-            print(f"[{tag}] boot marker never appeared", flush=True)
+            print(f"[{tag}] guest never answered ssh", flush=True)
             return None
         time.sleep(8)  # let herd settle
         res["boot_s"] = round(time.time() - t0)
