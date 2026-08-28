@@ -1,7 +1,13 @@
 # `md5sum`/`sha*sum` return wrong digests for correct bytes
 
 **Date:** 2026-08-28
-**Status:** **OPEN — reproduced and heavily localized, not root-caused.**
+**Status:** **CAUSE FOUND, exact defect still open.** A single-variable A/B
+identifies the 2026-08-27 user-copy widening (`__arch_copy_user_memory`'s
+64/16/8-byte tiers) as the cause: reverting to the byte loop makes it vanish on
+both a controlled probe and busybox, and the damage per failure scales with store
+width (360 B / 120 B / 0 B for 64-byte / 16-byte / 1-byte stores). Mitigated in
+the tree by `USER_COPY_TIER = 1`. The precise fault in those `stp` stores is not
+yet identified — see § ROOT CAUSE.
 **Grade: B** — every measurement below was run end-to-end on 2026-08-28 at
 `SMP=4`, `MEMORY=2048`, on the default `cargo build --release` kernel. The
 elimination table is the durable part; the hypotheses at the end are not
@@ -14,6 +20,14 @@ file, roughly **40–50 % of invocations**, for files larger than one page. The
 bytes are not wrong: the same file verifies byte-exact through `read(2)` and
 through `mmap`, and `busybox cksum` and `busybox base64` — which read every byte
 of the same file — are perfectly stable across runs.
+
+**Read § ROOT CAUSE first if you only want the answer**: the multi-register user-copy
+loop added 2026-08-27 loses a window of bytes while reporting a complete `read`.
+Everything between here and there is the elimination trail — worth keeping,
+because it retires a dozen plausible mechanisms (ext2, the page cache, mmap,
+NEON/FP state, `.rodata`, PIE/RELR, signals, the shared file-page cache) that
+this symptom otherwise invites, and because *why* it looked like a userspace
+compute bug for so long is itself the lesson.
 
 This is **silent data corruption in userspace computation**, and it matters well
 beyond `md5sum`: in-guest integrity checking is built on exactly these
@@ -165,6 +179,144 @@ Coreutils `md5sum` still could not be run: it pulls a chain of shared libraries
 Either keep staging them, or build a static non-busybox md5 with the local
 `aarch64-linux-musl-gcc` — the latter is probably faster and also gives a
 *static* non-busybox implementation, which is the missing cell in the table.
+
+## Session 2 (same day): a controlled reproducer, and five more falsifications
+
+**The headline: this is no longer a busybox story.** A purpose-written 300-line
+static probe (`md5probe`, own MD5, calibrated correct on the host) reproduces it,
+so the reproducer is now something we control end to end.
+
+### The reproducer
+
+`md5probe whole <path>` does exactly what `[PSTATS]` showed busybox doing —
+measured from the kernel side, busybox issues `fstatat` and **one** `read` for a
+64 KB file, no `mmap` of the input:
+
+```c
+fstat(fd, &st);
+b = malloc(st.st_size);        /* NOT touched */
+read(fd, b, st.st_size);       /* ONE large read */
+md5(b, st.st_size);
+```
+
+Run one iteration per **fresh exec**: **8–10 of 16 runs wrong**. Run several
+iterations *inside* one process: all correct — the same first-pass-only signature
+busybox has.
+
+### The damage is deterministic, and `read` lies about it
+
+| destination | bad words | first bad offset | content found there |
+|---|---:|---:|---|
+| untouched `malloc` | **90** (of 16384) | **4072** (24 B before the page boundary) | `0x10421` — foreign, not from this file |
+| untouched `mmap` | **129** | **12** | **zero** — the page's own initial zeroes |
+
+In every failing run `st_size=65536` and **`read` returned 65536**. So a small
+contiguous window is missing while the syscall reports complete success. The
+extent is identical run to run for a given shape, which is the shape of an
+alignment/length bug far more than of a race.
+
+### Falsified — do not re-run these either
+
+Each was a plausible mechanism, tested and killed:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| **A page fault *during* the copy loses bytes** | Pre-touch all 16 destination pages, then punch exactly ONE back to a fresh `MAP_FIXED` page, so the copy has exactly one possible fault at a known page. Five hole positions | **0/12 corrupted at every position.** A guaranteed mid-copy fault corrupts nothing |
+| **It scales with the number of lazy pages** | Same, punching 0, 1, 2, 4, 8, 12, 16 pages | **0/12 at every count**, including all 16 lazy |
+| **One large lazy region vs many small ones** | Punch the whole 64 KB as a single `MAP_FIXED` region instead of 16 one-page regions | **0/12** |
+| **Fresh-address-space state right after `execve`** | `whole-warm`: identical to `whole` but with a throwaway 1 MB mmap+memset+munmap first | **10/16 still wrong** — warming changes nothing |
+| **`malloc` (brk/heap) vs `mmap` destination** | `whole-mmap` | **9/16 wrong** — mmap is *not* immune, so an early clean 0/20 reading on this arm was luck. What is robust is untouched-vs-pre-touched, not the allocator |
+| **Installed signal handlers** (busybox issues `rt_sigaction` ×2; the probe issued none) | `SIGH=1` arm installing 7 handlers | 0/14 wrong, and `handler_runs=0` — no signal was ever delivered, so this is **untested rather than refuted** |
+
+The one manipulation that reliably *fixes* it remains `memset`-ing the
+destination before the read (`whole-touch`: **0/20**).
+
+### It is a Heisenbug, precisely measured
+
+A temporary trace in the file-read arm fingerprinting every chunk on both sides
+of `copy_to_user` (`k=` kernel buffer, `u=` re-read from the user buffer) made
+the corruption **disappear: 8/8 correct**. The per-byte readback is slow enough
+to shift the timing.
+
+Two consequences. First, timing matters, so the deterministic-extent reading
+above and this are in tension — the mechanism is probably deterministic *given* a
+timing window that opens ~50 % of the time. Second, and more practically:
+**there is still no kernel-side fingerprint from a failing run**, so "the kernel
+buffer `temp` was already correct before `copy_to_user`" is **unverified**. The
+next attempt must not print: accumulate the fingerprint into a `static` and read
+it back out of band.
+
+### The strongest remaining lead
+
+`__arch_copy_user_memory` (`crates/akuma-exec/src/mmu/user_access.rs`) — the
+user-copy asm — **was widened from a byte loop to 64/16/8-byte chunks on
+2026-08-27**, which is the same day this symptom was first observed
+(`AKUMA_SYSCALL_PERFORMANCE_AUDIT.md` § Resolution), and there is a later
+`8cf0747c fix copy byte loop` commit. Every clean arm of every probe reads in
+4096-byte chunks; every corrupting arm issues **one 64 KB read**, which is the
+only shape that drives the 64-byte tier hard.
+
+The loop inspects correct by eye (tier arithmetic and post-index updates are
+consistent), so the way to settle it is not more reading:
+
+**Sweep it deterministically as a boot test.** Drive
+`__arch_copy_user_memory` directly over the cross-product of source alignment,
+destination alignment, and length (especially lengths that straddle 64/16/8
+boundaries and page boundaries), comparing against a byte-wise reference. That
+converts a 50 %-of-the-time guest symptom into a deterministic unit test, and it
+is the kind of test `docs/archive/USER_COPY_BYTE_LOOP.md` should have shipped
+with the widening.
+
+## ROOT CAUSE: the 2026-08-27 user-copy widening
+
+Confirmed by single-variable A/B, not by reading code. `USER_COPY_TIER` in
+`crates/akuma-exec/src/mmu/user_access.rs` selects the copy loop; nothing else
+changes between arms:
+
+| `USER_COPY_TIER` | copy shape | `md5probe whole` | `busybox md5sum` | bad words per failure |
+|---|---|---:|---:|---:|
+| `0` | shipped: 64/16/8/byte tiers | **9-10 / 16 wrong** | **6-8 / 12 wrong** | **90** (360 B) |
+| `2` | same minus the 64-byte tier | **7 / 16 wrong** | **3 / 12 wrong** | **30** (120 B) |
+| `1` | pre-widening byte loop | **0 / 16** | **0 / 12** | 0 |
+
+Two things follow, and the second is the useful one:
+
+1. **The widened user-copy loop causes the corruption.** The byte loop is clean
+   on both the probe and busybox, in the same boot, on the same file.
+2. **The damage scales with store width** — 360 bytes lost per failure with
+   64-byte groups, 120 with 16-byte pairs, zero with single-byte stores. So the
+   defect is in the **multi-register `stp` stores to user memory**, not in the
+   loop's length arithmetic (which inspects correct, and which a length bug would
+   break deterministically rather than ~50 % of the time).
+
+Supporting detail: in the `malloc` arm the first bad word sits at offset **4072**
+— 24 bytes before the page boundary — which is exactly where a 16-byte `stp`
+starts straddling into the next page. No `EFAULT` is ever returned and `read`
+reports the full byte count, so this is not the copy aborting on a fault.
+
+### Mitigation currently in the tree
+
+`USER_COPY_TIER = 1` (the byte loop). Correctness over speed: this reverts the
+2026-08-27 speedup (warm 4 KB `pread` was 2110 -> 1100 ns, and the byte loop cost
+~16x an in-kernel memcpy per byte), so it is a placeholder, not the fix. Flip to
+`0` to reproduce, `2` to bisect.
+
+### What to do next
+
+- **Sweep `__arch_copy_user_memory` as a boot test** over (src alignment, dst
+  alignment, length), especially lengths and destinations that make an `stp`
+  straddle a page boundary, comparing against a byte-wise reference. That is the
+  test the widening should have shipped with
+  (`docs/archive/USER_COPY_BYTE_LOOP.md`).
+- **Check the straddling-store hypothesis directly**: does a `stp` whose two
+  halves land in different pages behave correctly when both pages are freshly
+  prefaulted? `map_user_page` does issue `dsb ishst; tlbi vaae1is; dsb ish; isb`
+  on install (checked — it passes `flush = true`), so a missing barrier is ruled
+  out at that site; the remaining suspects are the emulator's handling of a
+  page-straddling multi-register store, and anything that re-maps the second page
+  between the prefault and the store.
+- Re-check whether `main` (or any commit before the widening) is clean — expected
+  to be, given arm `1` above, but worth one confirmation.
 
 ## Leading hypotheses, none confirmed
 

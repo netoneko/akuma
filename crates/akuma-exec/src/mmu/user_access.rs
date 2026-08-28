@@ -44,6 +44,8 @@ use crate::threading::set_user_copy_fault_handler;
 
 unsafe extern "C" {
     fn __arch_copy_user_memory(dst: *mut u8, src: *const u8, len: usize) -> u64;
+    fn __arch_copy_user_memory_bytes(dst: *mut u8, src: *const u8, len: usize) -> u64;
+    fn __arch_copy_user_memory_no64(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn __arch_copy_user_fault();
 }
 
@@ -125,6 +127,47 @@ __arch_copy_user_memory:
 9:  mov     x0, #0
     ret
 
+// Same routine minus the 64-byte tier: starts at 16-byte chunks. Third arm of
+// the A/B, to find WHICH tier of the 2026-08-27 widening corrupts.
+.global __arch_copy_user_memory_no64
+__arch_copy_user_memory_no64:
+    cbz     x2, 29f
+22: cmp     x2, #16
+    b.lo    24f
+23: ldp     x3, x4, [x1], #16
+    stp     x3, x4, [x0], #16
+    sub     x2, x2, #16
+    cmp     x2, #16
+    b.hs    23b
+24: cmp     x2, #8
+    b.lo    26f
+    ldr     x3, [x1], #8
+    str     x3, [x0], #8
+    sub     x2, x2, #8
+26: cbz     x2, 29f
+27: ldrb    w3, [x1], #1
+    strb    w3, [x0], #1
+    subs    x2, x2, #1
+    b.ne    27b
+29: mov     x0, #0
+    ret
+
+// Byte-at-a-time variant, kept ONLY as an A/B control for
+// docs/archive/BUSYBOX_HASH_MISCOMPUTE.md: it is the pre-2026-08-27 loop, before
+// the 64/16/8-byte widening, so flipping `USER_COPY_BYTES_ONLY` isolates the
+// widening as a single variable without checking out an older tree. Same three
+// invariants as above — leaf, stackless, caller-saved registers only — because
+// the same fault trampoline returns through x30 for both.
+.global __arch_copy_user_memory_bytes
+__arch_copy_user_memory_bytes:
+    cbz     x2, 19f
+18: ldrb    w3, [x1], #1
+    strb    w3, [x0], #1
+    subs    x2, x2, #1
+    b.ne    18b
+19: mov     x0, #0
+    ret
+
 // Fault handler - jumped to by exception handler
 // Returns EFAULT (14)
 __arch_copy_user_fault:
@@ -132,6 +175,18 @@ __arch_copy_user_fault:
     ret
     "#
 );
+
+/// A/B control for `docs/archive/BUSYBOX_HASH_MISCOMPUTE.md`.
+///
+/// `0` = the shipped widened loop (64/16/8/byte tiers, 2026-08-27).
+/// `1` = the pre-widening byte loop. **Measured to make the corruption vanish**
+///       (`md5probe whole` 0/16, busybox `md5sum` 0/12, against 9-10/16 and
+///       6-8/12 on `0`), which is what identified the widening as the cause.
+/// `2` = widened loop minus the 64-byte tier, to isolate which tier corrupts.
+///
+/// Ship as `0` once the real defect is found; `1` is the safe mitigation in the
+/// meantime, at the cost of the 2026-08-27 read-path speedup.
+const USER_COPY_TIER: u8 = 1;
 
 /// `EFAULT`, as the byte loop's trampoline returns it and as the syscall ABI wants
 /// it (`x0 = -errno` happens at the syscall boundary, not here).
@@ -583,7 +638,11 @@ pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> R
     // Ensure compiler doesn't reorder these calls
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-    let res = unsafe { __arch_copy_user_memory(dst, src, len) };
+    let res = match USER_COPY_TIER {
+        1 => unsafe { __arch_copy_user_memory_bytes(dst, src, len) },
+        2 => unsafe { __arch_copy_user_memory_no64(dst, src, len) },
+        _ => unsafe { __arch_copy_user_memory(dst, src, len) },
+    };
 
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     set_user_copy_fault_handler(0);
