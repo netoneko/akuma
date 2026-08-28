@@ -3694,17 +3694,44 @@ fn test_openat() {
         close(r);
     }
 
-    // 6. EBADF: dirfd in valid range but not present in the fd table. (Negative
-    //    non-AT_FDCWD dirfds are NOT rejected by sys_openat — unlike sys_unlinkat it
-    //    falls through to base="/" — so that case is deliberately omitted here; it is
-    //    a pre-existing divergence, runs before the guard opens, and is out of scope
-    //    for the carve-out. This case validates the early-return EBADF path that DOES
-    //    fire, and that it stays balanced.)
+    // 6. EBADF: dirfd in valid range but not present in the fd table. Validates the
+    //    early-return EBADF path and that the BKL guard stays balanced on it.
     let p = cstr("anything");
     let r = openat(999, &p, open_flags::O_RDONLY, 0);
     if r != EBADF {
         fails += 1;
         crate::safe_print!(64, "[Test] openat unopen-dirfd FAILED r={} (want EBADF)\n", r);
+    }
+
+    // 6b. EBADF: a NEGATIVE dirfd that is not AT_FDCWD.
+    //
+    //     This case used to be deliberately omitted, with a comment recording that
+    //     `sys_openat` did not reject it: it fell through to base="/" and opened a
+    //     DIFFERENT FILE successfully. Eight sites open-coded the `AT_FDCWD` ladder
+    //     and gave four different answers here (`/`, EBADF, EINVAL, ESRCH); they are
+    //     one `fs::dirfd_base` since 2026-08-28 and the answer is EBADF, which is
+    //     what Linux returns and what 5 of the 8 already did.
+    //
+    //     Pinning it here because the failure mode of getting it wrong is silent:
+    //     a bogus dirfd producing a successful open reads as working code.
+    let p = cstr("anything");
+    let r = openat(-5, &p, open_flags::O_RDONLY, 0);
+    if r != EBADF {
+        fails += 1;
+        crate::safe_print!(80, "[Test] openat negative-dirfd FAILED r={} (want EBADF)\n", r);
+    }
+
+    // 6c. AT_FDCWD still resolves against the cwd rather than erroring — the other
+    //     half of the fold. `dirfd_base` deliberately does NOT return EBADF when
+    //     there is no current process here, because AT_FDCWD supplies no fd to be
+    //     bad and the boot path relies on it.
+    let p = cstr(&format!("{ROOT}/atfdcwd_probe.txt"));
+    let r = openat(AT_FDCWD, &p, open_flags::O_CREAT | open_flags::O_RDWR, 0o644);
+    if (r as i64) < 0 {
+        fails += 1;
+        crate::safe_print!(80, "[Test] openat AT_FDCWD FAILED r={} (want an fd)\n", r);
+    } else {
+        close(r);
     }
 
     // 7. ENOENT: missing target, no O_CREAT. Exercises the error path THROUGH the
@@ -3793,7 +3820,7 @@ fn test_openat() {
     clean_at_test_tree(ROOT, &LEFTOVERS);
 
     if fails == 0 {
-        crate::safe_print!(128, "[Test] openat PASSED (10 cases: O_CREAT/O_TRUNC/dirfd/cwd-rel/dev-null/EBADF/ENOENT/symlink/dir-write-EISDIR/O_TMPFILE-EINVAL)\n");
+        crate::safe_print!(128, "[Test] openat PASSED (12 cases: O_CREAT/O_TRUNC/dirfd/cwd-rel/dev-null/EBADF/neg-dirfd-EBADF/AT_FDCWD/ENOENT/symlink/dir-write-EISDIR/O_TMPFILE-EINVAL)\n");
     } else {
         crate::safe_print!(64, "[Test] openat FAILED ({} of 10 cases)\n", fails);
         panic!("test_openat: {fails} of 10 cases failed");
@@ -3883,19 +3910,25 @@ fn test_renameat() {
         crate::safe_print!(96, "[Test] renameat2 NOREPLACE FAILED r={} (want EEXIST)\n", r);
     }
 
-    // 5. dirfd in valid range but not present in the fd table. Unlike sys_unlinkat
-    //    (which explicitly checks and returns EBADF), sys_renameat has no such check —
-    //    resolve_path_at falls through to base="/" for an unresolvable dirfd (same
-    //    pre-existing divergence test_openat's case 6 documents for sys_openat). So
-    //    "anything" resolves to "/anything", which doesn't exist -> ENOENT. This case
-    //    exists to pin that behavior (not to change it) and to exercise the error path
-    //    with an unusual dirfd through the dropped-BKL window.
+    // 5. dirfd in valid range but not present in the fd table -> EBADF.
+    //
+    //    This case used to expect ENOENT, and the comment here explained why: the old
+    //    `resolve_path_at` fell through to base="/" for an unresolvable dirfd, so
+    //    "anything" became "/anything" and failed at lookup instead of at the fd. It
+    //    said it existed "to pin that behavior (not to change it)".
+    //
+    //    Changed deliberately 2026-08-28: that fallback was the divergence, not the
+    //    contract. `sys_unlinkat` already returned EBADF for the identical input, and
+    //    Linux does too — an unresolvable dirfd is a bad descriptor, and reporting it
+    //    as "no such file" sends the caller looking in the wrong place. Both now go
+    //    through `fs::dirfd_base`. Still exercises the error path through the
+    //    dropped-BKL window, which is the other thing this case is for.
     let op = cstr("anything");
     let np = cstr("anything-else");
     let r = renameat(999, &op, AT_FDCWD, &np);
-    if r != ENOENT {
+    if r != EBADF {
         fails += 1;
-        crate::safe_print!(64, "[Test] renameat unopen-dirfd FAILED r={} (want ENOENT)\n", r);
+        crate::safe_print!(64, "[Test] renameat unopen-dirfd FAILED r={} (want EBADF)\n", r);
     }
 
     // 6. ENOENT: missing source. Exercises the error path THROUGH the dropped-BKL window.

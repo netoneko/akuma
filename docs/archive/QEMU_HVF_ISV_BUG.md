@@ -125,8 +125,15 @@ in a clean worktree specifically to rule out a local change):
 
 | `MEMORY` | result |
 |---|---|
-| `1024M` | `Assertion failed: (isv), … hvf.c, line 2437`, QEMU exits 134 |
+| `256M` (the runner's **default**) | `Assertion failed: (isv)`, QEMU exits 134 |
+| `512M` | same |
+| `1024M` | same — `… hvf.c, line 2437` |
 | `2048M` | 316 PASSED, 0 FAILED, 0 panics, boots to SSH |
+
+The default is the broken one, which is why this is worth a guard rather than a
+note: a bare `cargo run --release` on a `kernel_tests` build under HVF dies here,
+and the failure looks like a kernel crash. The threshold is sharp — every value
+below 2048 tested so far asserts, 2048 passes.
 
 So: **`MEMORY=2048M` is a floor for HVF runs of a `kernel_tests` build**, not a
 preference. `HVF=0` also works, but reaching for TCG here is the wrong instinct

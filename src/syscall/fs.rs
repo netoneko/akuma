@@ -155,34 +155,86 @@ pub fn fs_error_to_errno(e: crate::vfs::FsError) -> u64 {
     }
 }
 
-pub(super) fn resolve_path_at(dirfd: i32, raw_path: &str) -> String {
+/// The `*at(2)` base directory `raw_path` should be resolved against.
+///
+/// `Ok(None)` means `raw_path` is absolute and there is nothing to resolve it
+/// against — the shape `sys_unlinkat`/`sys_mkdirat`/`sys_fchmodat` want, because
+/// they hand the raw path straight on in that case.
+///
+/// Only fd-table and `cwd` reads happen here — no disk I/O — which is what lets
+/// every caller build its base *before* entering the VFS BKL window and take the
+/// `EBADF` early-outs without paying a BKL drop/reacquire
+/// (`docs/archive/BKL_VFS_CARVE_OUT.md` §11.6).
+///
+/// # This is one answer where there used to be four
+///
+/// Eight sites open-coded the `AT_FDCWD` / `dirfd >= 0` / else ladder before
+/// 2026-08-28, and they did not agree. For a **negative `dirfd` that is not
+/// `AT_FDCWD`** they returned, variously:
+///
+/// | site | answer |
+/// |---|---|
+/// | `resolve_path_at` (the old helper), `sys_openat` | resolve against `/` — no error at all |
+/// | `sys_newfstatat`, `sys_faccessat2`, `sys_fchmodat`, `sys_mkdirat`, `sys_unlinkat` | `EBADF` |
+/// | `sys_statx` | `EINVAL` |
+///
+/// and for **no current process** they split three ways again: `/`, `ESRCH`
+/// (`newfstatat`, `faccessat2`) and `EBADF` (`statx`, `fchmodat`, `mkdirat`,
+/// `unlinkat`). So `openat(-5, "rel")` and `newfstatat(-5, "rel")` disagreed
+/// about whether that is even an error — a real ABI divergence, not noise.
+///
+/// The answers here, and why:
+///
+/// * **A bad fd is `EBADF`** — 5 of the 8 already said so and it is what Linux
+///   returns. `statx`'s `EINVAL` was the outlier; `openat`'s silent fallback to
+///   `/` was the dangerous one, since it turned a bogus `dirfd` into a
+///   *successful open of a different file*.
+/// * **`AT_FDCWD` with no current process resolves against `/`**, and is not an
+///   error. `EBADF` would be a lie: `AT_FDCWD` supplies no file descriptor to be
+///   bad. This is the old helper's behaviour and the boot path depends on it —
+///   a kernel thread has no `Process` and still opens relative paths.
+/// * **A real `dirfd` with no current process is `EBADF`**, because there *is* an
+///   fd and it cannot be resolved.
+pub(super) fn dirfd_base(dirfd: i32, raw_path: &str) -> Result<Option<String>, u64> {
+    use akuma_syscalls_linux::flags::at::AT_FDCWD;
+
     if raw_path.starts_with('/') {
-        return crate::vfs::canonicalize_path(raw_path);
+        return Ok(None);
     }
-    let base = if dirfd == -100 {
-        if let Some(proc) = akuma_exec::process::current_process_shared() {
-            proc.cwd.clone()
-        } else {
-            String::from("/")
-        }
-    } else if dirfd >= 0 {
-        if let Some(proc) = akuma_exec::process::current_process_shared() {
-            if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                f.path
-            } else {
-                String::from("/")
-            }
-        } else {
-            String::from("/")
-        }
-    } else {
-        String::from("/")
+    if dirfd == AT_FDCWD {
+        return Ok(Some(
+            akuma_exec::process::current_process_shared()
+                .map_or_else(|| String::from("/"), |proc| proc.cwd.clone()),
+        ));
+    }
+    if dirfd < 0 {
+        return Err(EBADF);
+    }
+    let Some(proc) = akuma_exec::process::current_process_shared() else {
+        return Err(EBADF);
     };
-    if raw_path == "." || raw_path.is_empty() {
+    match proc.get_fd(dirfd as u32) {
+        Some(akuma_exec::process::FileDescriptor::File(f)) => Ok(Some(f.path)),
+        _ => Err(EBADF),
+    }
+}
+
+/// `raw_path` resolved against `dirfd` — [`dirfd_base`] plus the join.
+///
+/// An absolute path is canonicalized (`.`/`..` folded), which is what the old
+/// helper did; the sites that used to spell this inline passed an absolute path
+/// through raw, so `newfstatat("/a/../b")` now stats `/b` rather than the
+/// literal string. `crate::vfs::resolve_mount` canonicalizes on the next line
+/// either way, so this only changes what the *tracing* shows.
+pub(super) fn resolve_path_at(dirfd: i32, raw_path: &str) -> Result<String, u64> {
+    let Some(base) = dirfd_base(dirfd, raw_path)? else {
+        return Ok(crate::vfs::canonicalize_path(raw_path));
+    };
+    Ok(if raw_path == "." || raw_path.is_empty() {
         base
     } else {
         crate::vfs::resolve_path(&base, raw_path)
-    }
+    })
 }
 
 // `struct iovec`, `struct stat`, `struct statx_timestamp`, `struct statx` and
@@ -1612,35 +1664,17 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
         return Err(EINVAL);
     }
 
-    let path = if raw_path.starts_with('/') {
-        crate::vfs::canonicalize_path(&raw_path)
-    } else {
-        let base = if dirfd == -100 {
-            if let Some(proc) = akuma_exec::process::current_process_shared() {
-                proc.cwd.clone()
-            } else {
-                String::from("/")
+    // Was an eighth copy of the `AT_FDCWD` ladder, and one of the two that
+    // resolved a bogus negative `dirfd` against `/` instead of failing — which
+    // turned `openat(-5, "rel")` into a successful open of a *different file*.
+    // It is `EBADF` now; see `dirfd_base`.
+    let path = match resolve_path_at(dirfd, &raw_path) {
+        Ok(p) => p,
+        Err(e) => {
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED && e == EBADF {
+                crate::safe_print!(128, "[syscall] openat: bad dirfd={}\n", dirfd);
             }
-        } else if dirfd >= 0 {
-            if let Some(proc) = akuma_exec::process::current_process_shared() {
-                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                    f.path
-                } else {
-                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                        crate::safe_print!(128, "[syscall] openat: bad dirfd={}\n", dirfd);
-                    }
-                    return Err(EBADF);
-                }
-            } else {
-                return Err(EBADF);
-            }
-        } else {
-            String::from("/")
-        };
-        if raw_path == "." || raw_path.is_empty() {
-            base
-        } else {
-            crate::vfs::resolve_path(&base, &raw_path)
+            return Err(e);
         }
     };
 
@@ -2199,30 +2233,7 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
     let path = copy_from_user_str(path_ptr, 512)?;
     if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return Err(EFAULT); }
 
-    let resolved_path = if path.starts_with('/') {
-         String::from(&path)
-    } else {
-        let base_path = if dirfd == -100 {
-             if let Some(proc) = akuma_exec::process::current_process_shared() {
-                 proc.cwd.clone()
-             } else {
-                 return Err(ESRCH);
-             }
-        } else if dirfd >= 0 {
-             if let Some(proc) = akuma_exec::process::current_process_shared() {
-                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                     f.path
-                 } else {
-                     return Err(EBADF);
-                 }
-             } else {
-                 return Err(ESRCH);
-             }
-        } else {
-            return Err(EBADF);
-        };
-        crate::vfs::resolve_path(&base_path, &path)
-    };
+    let resolved_path = resolve_path_at(dirfd, &path)?;
 
     // Path resolution + `metadata` below are pure VFS work — run them BKL-free.
     let _vfs_bkl = VfsBklGuard::new();
@@ -2331,25 +2342,7 @@ pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
 
     // Build the dirfd-relative base path (fd-table lookup only, no disk I/O) before
     // entering the VFS BKL window — mirrors sys_unlinkat/sys_mkdirat/sys_renameat.
-    let base: Option<String> = if raw_path.starts_with('/') {
-        None
-    } else if dirfd == -100 {
-        match akuma_exec::process::current_process_shared() {
-            Some(proc) => Some(proc.cwd.clone()),
-            None => return Err(EBADF),
-        }
-    } else if dirfd >= 0 {
-        let proc = match akuma_exec::process::current_process_shared() {
-            Some(p) => p,
-            None => return Err(EBADF),
-        };
-        match proc.get_fd(dirfd as u32) {
-            Some(akuma_exec::process::FileDescriptor::File(f)) => Some(f.path),
-            _ => return Err(EBADF),
-        }
-    } else {
-        return Err(EBADF);
-    };
+    let base: Option<String> = dirfd_base(dirfd, &raw_path)?;
 
     // `resolve_symlinks` does a real on-disk symlink-target lookup (same class of
     // real lookup as renameat2's RENAME_NOREPLACE `exists` probe, §14.2), and
@@ -2465,29 +2458,8 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
         } else {
             return Err(ENOENT);
         }
-    } else if path.starts_with('/') {
-        String::from(&path)
     } else {
-        let base_path = if dirfd == -100 {
-            if let Some(proc) = akuma_exec::process::current_process_shared() {
-                proc.cwd.clone()
-            } else {
-                return Err(EBADF);
-            }
-        } else if dirfd >= 0 {
-            if let Some(proc) = akuma_exec::process::current_process_shared() {
-                if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                    f.path
-                } else {
-                    return Err(EBADF);
-                }
-            } else {
-                return Err(EBADF);
-            }
-        } else {
-            return Err(EINVAL);
-        };
-        crate::vfs::resolve_path(&base_path, &path)
+        resolve_path_at(dirfd, &path)?
     };
 
     // Everything from here on is symlink resolution + `metadata` — pure VFS, BKL-free.
@@ -2560,30 +2532,7 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
 pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> SysResult {
     let path = copy_from_user_str(path_ptr, 512)?;
     
-    let resolved_path = if path.starts_with('/') {
-         path
-    } else {
-        let base_path = if dirfd == -100 {
-             if let Some(proc) = akuma_exec::process::current_process_shared() {
-                 proc.cwd.clone()
-             } else {
-                 return Err(ESRCH);
-             }
-        } else if dirfd >= 0 {
-             if let Some(proc) = akuma_exec::process::current_process_shared() {
-                 if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(dirfd as u32) {
-                     f.path
-                 } else {
-                     return Err(EBADF);
-                 }
-             } else {
-                 return Err(ESRCH);
-             }
-        } else {
-            return Err(EBADF);
-        };
-        crate::vfs::resolve_path(&base_path, &path)
-    };
+    let resolved_path = resolve_path_at(dirfd, &path)?;
     
     let final_path = crate::vfs::resolve_symlinks(&resolved_path);
     if crate::fs::exists(&final_path) || crate::vfs::is_symlink(&resolved_path) {
@@ -2695,25 +2644,7 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> SysResult {
     // entering the VFS BKL window — mirrors sys_unlinkat/sys_renameat: early-return
     // EBADF paths must not pay for a BKL drop/reacquire when no on-disk work will
     // happen.
-    let base: Option<String> = if raw_path.starts_with('/') {
-        None
-    } else if dirfd == -100 {
-        match akuma_exec::process::current_process_shared() {
-            Some(proc) => Some(proc.cwd.clone()),
-            None => return Err(EBADF),
-        }
-    } else if dirfd >= 0 {
-        let proc = match akuma_exec::process::current_process_shared() {
-            Some(p) => p,
-            None => return Err(EBADF),
-        };
-        match proc.get_fd(dirfd as u32) {
-            Some(akuma_exec::process::FileDescriptor::File(f)) => Some(f.path),
-            _ => return Err(EBADF),
-        }
-    } else {
-        return Err(EBADF);
-    };
+    let base: Option<String> = dirfd_base(dirfd, &raw_path)?;
 
     // `crate::fs::create_dir` takes the ext2 write guard for the on-disk inode
     // allocation + directory-entry write — attribution named `mkdirat` (syscall 34)
@@ -2746,25 +2677,7 @@ pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> SysResult {
     // The path walk + inode deletion below is exactly the on-disk mutating work Phase 2c
     // targets: `unlinkat` (syscall 35) measured 72.6% of all cross-core BKL wait —
     // docs/archive/BKL_VFS_CARVE_OUT.md §11.6.
-    let base: Option<String> = if path.starts_with('/') {
-        None
-    } else if dirfd == -100 {
-        match akuma_exec::process::current_process_shared() {
-            Some(proc) => Some(proc.cwd.clone()),
-            None => return Err(EBADF),
-        }
-    } else if dirfd >= 0 {
-        let proc = match akuma_exec::process::current_process_shared() {
-            Some(p) => p,
-            None => return Err(EBADF),
-        };
-        match proc.get_fd(dirfd as u32) {
-            Some(akuma_exec::process::FileDescriptor::File(f)) => Some(f.path),
-            _ => return Err(EBADF),
-        }
-    } else {
-        return Err(EBADF);
-    };
+    let base: Option<String> = dirfd_base(dirfd, &path)?;
 
     // From here on is pure VFS work (directory walk + ext2 inode/block deallocation, which
     // takes the ext2 write guard) — run it BKL-free. `remove_file` of a large file can hold
@@ -2816,8 +2729,8 @@ pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpa
     // BKL holder after `unlinkat`/`openat`: docs/archive/BKL_VFS_CARVE_OUT.md §14.
     let _vfs_bkl = VfsBklGuard::new();
 
-    let oldpath = resolve_path_at(olddirfd, &raw_old);
-    let newpath = resolve_path_at(newdirfd, &raw_new);
+    let oldpath = resolve_path_at(olddirfd, &raw_old)?;
+    let newpath = resolve_path_at(newdirfd, &raw_new)?;
     crate::safe_print!(256, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
     match crate::fs::rename(&oldpath, &newpath) {
         Ok(()) => Ok(0),
@@ -2844,8 +2757,8 @@ pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newp
     // (the ext2-write-guarded directory-entry rewrite).
     let _vfs_bkl = VfsBklGuard::new();
 
-    let oldpath = resolve_path_at(olddirfd, &raw_old);
-    let newpath = resolve_path_at(newdirfd, &raw_new);
+    let oldpath = resolve_path_at(olddirfd, &raw_old)?;
+    let newpath = resolve_path_at(newdirfd, &raw_new)?;
 
     if flags & RENAME_NOREPLACE != 0 && crate::vfs::exists(&newpath) {
         return Err(super::EEXIST);
@@ -2863,7 +2776,7 @@ pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newp
 pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> SysResult {
     let target = copy_from_user_str(target_ptr, 1024)?;
     let raw_link = copy_from_user_str(linkpath_ptr, 1024)?;
-    let link_path = resolve_path_at(newdirfd, &raw_link);
+    let link_path = resolve_path_at(newdirfd, &raw_link)?;
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         crate::safe_print!(256, "[syscall] symlinkat: {} -> {}\n", link_path, target);
     }
@@ -2876,8 +2789,8 @@ pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -
 pub(super) fn sys_linkat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpath_ptr: u64, _flags: u32) -> SysResult {
     let oldpath = copy_from_user_str(oldpath_ptr, 1024)?;
     let newpath = copy_from_user_str(newpath_ptr, 1024)?;
-    let src = resolve_path_at(_olddirfd, &oldpath);
-    let dst = resolve_path_at(_newdirfd, &newpath);
+    let src = resolve_path_at(_olddirfd, &oldpath)?;
+    let dst = resolve_path_at(_newdirfd, &newpath)?;
     match crate::fs::read_file(&src) {
         Ok(data) => match crate::fs::write_file(&dst, &data) {
             Ok(()) => Ok(0),
@@ -2889,7 +2802,7 @@ pub(super) fn sys_linkat(_olddirfd: i32, oldpath_ptr: u64, _newdirfd: i32, newpa
 
 pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> SysResult {
     let raw_path = copy_from_user_str(path_ptr, 1024)?;
-    let path = resolve_path_at(dirfd, &raw_path);
+    let path = resolve_path_at(dirfd, &raw_path)?;
 
     if path == "/proc/self/exe" {
         if !validate_user_ptr(buf_ptr, bufsize) { return Err(EFAULT); }

@@ -203,6 +203,35 @@ if [ "$use_hvf" = "1" ]; then
   ACCEL_ARGS=(-accel hvf -cpu host)
   FB_ARGS=()
   echo "[cargo_runner] accelerator: HVF (-accel hvf -cpu host; ramfb disabled). HVF=0 to force TCG." >&2
+
+  # HVF + a boot-test build + under 2 GB = `Assertion failed: (isv)` and QEMU
+  # exits 134 before the suite finishes. `src/tests.rs`'s user-copy trampoline
+  # test deliberately runs a copy off the end of mapped kernel memory; below
+  # 2048 that cliff lands where HVF cannot resolve the access as plain RAM, so
+  # it reports ISV=0 and QEMU asserts instead of the guest taking the fault.
+  # The faulting instruction is an LDP, which never carries a syndrome.
+  #
+  # Measured 2026-08-28 on an unmodified tree, SMP=4: 256M (this script's own
+  # default), 512M and 1024M all assert; 2048M passes 316/0 and boots to SSH.
+  # Warn rather than fail, because a `no-tests` build (devbox, extreme-size)
+  # compiles none of that and is genuinely fine at 256M — and this script
+  # cannot tell the two apart from the ELF alone.
+  #
+  # docs/archive/QEMU_HVF_ISV_BUG.md "Root cause 5".
+  mem_mb="$MEMORY"
+  case "$mem_mb" in
+    *[Gg]) mem_mb=$(( ${mem_mb%[Gg]} * 1024 )) ;;
+    *[Mm]) mem_mb=${mem_mb%[Mm]} ;;
+  esac
+  if [[ "$mem_mb" =~ ^[0-9]+$ ]] && [ "$mem_mb" -lt 2048 ]; then
+    echo "[cargo_runner] WARNING: MEMORY=$MEMORY (<2048M) under HVF." >&2
+    echo "[cargo_runner]   A build WITH boot tests will die here with" >&2
+    echo "[cargo_runner]   'Assertion failed: (isv) ... hvf.c' and qemu exit 134 —" >&2
+    echo "[cargo_runner]   that is this configuration, NOT a kernel bug." >&2
+    echo "[cargo_runner]   Use MEMORY=2048M, or HVF=0 for TCG. A no-tests build" >&2
+    echo "[cargo_runner]   (devbox / extreme-size) is unaffected; ignore this." >&2
+    echo "[cargo_runner]   docs/archive/QEMU_HVF_ISV_BUG.md 'Root cause 5'." >&2
+  fi
 else
   ACCEL_ARGS=(-accel tcg -cpu max)
   FB_ARGS=(-device ramfb)
