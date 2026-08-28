@@ -942,6 +942,7 @@ pub fn run_all_tests() {
     // sys_unlinkat entry point: dirfd resolution, AT_REMOVEDIR, errno contract —
     // pins what the Phase 2c VfsBklGuard conversion (carve-out doc §12) must preserve.
     test_unlinkat();
+    test_utimensat();
 
     // sys_openat entry point: O_CREAT/O_TRUNC, dirfd resolution, /dev/null fast path,
     // errno contract — pins what the Phase 2b VfsBklGuard conversion (carve-out doc §13)
@@ -2860,6 +2861,115 @@ fn unregister_at_syscall_process(pid: u32, tid: usize) {
 /// the historically-regressing **dirfd-relative** case (`archive/STAT_AND_UNLINKAT_FIX.md`:
 /// `rm` recursing with `unlinkat(dirfd, "name", 0)` — dirfd used to be ignored) and that the
 /// dropped-BKL window stays balanced on error paths too.
+/// `utimensat` (syscall 88) — the errors busybox `touch` branches on.
+///
+/// This syscall was `nr::UTIMENSAT => 0` until 2026-08-28: it answered success
+/// to every input, including a path that does not exist. `touch newfile` then
+/// exited 0 and created nothing, because busybox tries `utimensat` first and
+/// only creates the file when it sees `ENOENT`. Case 2 is that bug; the rest pin
+/// the argument checking around it so a future "simplification" back to a
+/// constant fails loudly. See `docs/archive/UTIMENSAT_STUB_TOUCH.md`.
+///
+/// What is deliberately NOT asserted: that the timestamps were stored. They are
+/// discarded — `akuma_vfs::Filesystem` has no set-times operation — so there is
+/// nothing to read back. A test claiming otherwise would be asserting a fiction.
+fn test_utimensat() {
+    use akuma_syscalls_linux::Timespec;
+    use crate::syscall::{handle_syscall, nr::UTIMENSAT};
+
+    const AT_FDCWD: i32 = -100;
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const ROOT: &str = "/tmp/utimensat_selftest";
+
+    clean_at_test_tree(ROOT, &[]);
+    let _ = crate::fs::create_dir(ROOT);
+    let _ = crate::fs::write_file(&format!("{ROOT}/present.txt"), b"here");
+
+    let pid: u32 = 7709;
+    let tid = register_at_syscall_process(pid, alloc::string::String::from(ROOT));
+
+    let utimensat = |dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32| -> u64 {
+        handle_syscall(UTIMENSAT, &[dirfd as u64, path_ptr, times_ptr, u64::from(flags), 0, 0])
+    };
+    let mut fails = 0u32;
+    let mut check = |cond: bool, name: &str, r: u64, want: &str| {
+        if !cond {
+            fails += 1;
+            crate::safe_print!(96, "[Test] utimensat {} FAILED r={} (want {})\n", name, r, want);
+        }
+    };
+
+    // 1. An existing file with NULL times ("both to now") succeeds.
+    let p = cstr(&format!("{ROOT}/present.txt"));
+    let r = utimensat(AT_FDCWD, p.as_ptr() as u64, 0, 0);
+    check(r == 0, "present", r, "0");
+
+    // 2. THE BUG: a missing path must be ENOENT, not success. This is the case
+    //    that makes `touch newfile` create the file.
+    let p = cstr(&format!("{ROOT}/missing.txt"));
+    let r = utimensat(AT_FDCWD, p.as_ptr() as u64, 0, 0);
+    check(r == ENOENT, "missing", r, "ENOENT");
+
+    // 3. A negative dirfd that is not AT_FDCWD, with a relative path -> EBADF
+    //    (shared with `fs::dirfd_base`; see test_openat case 6b).
+    let p = cstr("rel.txt");
+    let r = utimensat(-5, p.as_ptr() as u64, 0, 0);
+    check(r == EBADF, "neg-dirfd", r, "EBADF");
+
+    // 4. A dirfd in range but absent from the fd table -> EBADF.
+    let p = cstr("rel.txt");
+    let r = utimensat(999, p.as_ptr() as u64, 0, 0);
+    check(r == EBADF, "unopen-dirfd", r, "EBADF");
+
+    // 5. NULL path is futimens(dirfd): an unopened fd is EBADF, and there is no
+    //    path to resolve, so AT_FDCWD is not meaningful here either.
+    let r = utimensat(999, 0, 0, 0);
+    check(r == EBADF, "futimens-badfd", r, "EBADF");
+
+    // 6. An unreadable `times` pointer is EFAULT.
+    let p = cstr(&format!("{ROOT}/present.txt"));
+    let r = utimensat(AT_FDCWD, p.as_ptr() as u64, 0xdead_0000_u64, 0);
+    check(r == EFAULT, "times-EFAULT", r, "EFAULT");
+
+    // 7. A `tv_nsec` that is neither a legal nanosecond count nor one of the two
+    //    sentinels is EINVAL — and it is rejected BEFORE the path is looked at,
+    //    which is why this uses a path that does not exist. A handler that
+    //    resolved first would answer ENOENT here.
+    let bad = [Timespec { tv_sec: 0, tv_nsec: 1_000_000_000 }, Timespec { tv_sec: 0, tv_nsec: UTIME_NOW }];
+    let p = cstr(&format!("{ROOT}/missing.txt"));
+    let r = utimensat(AT_FDCWD, p.as_ptr() as u64, (&raw const bad) as u64, 0);
+    check(r == EINVAL, "nsec-EINVAL", r, "EINVAL");
+
+    // 8. Both sentinels are legal `tv_nsec` values and must not be rejected.
+    let ok = [Timespec { tv_sec: 0, tv_nsec: UTIME_NOW }, Timespec { tv_sec: 0, tv_nsec: (1 << 30) - 2 }];
+    let p = cstr(&format!("{ROOT}/present.txt"));
+    let r = utimensat(AT_FDCWD, p.as_ptr() as u64, (&raw const ok) as u64, 0);
+    check(r == 0, "sentinels", r, "0");
+
+    // 9. An undefined flag bit is EINVAL.
+    let p = cstr(&format!("{ROOT}/present.txt"));
+    let r = utimensat(AT_FDCWD, p.as_ptr() as u64, 0, 0x4000);
+    check(r == EINVAL, "bad-flags", r, "EINVAL");
+
+    // 10. `/dev/null` exists as far as `vfs::exists` is concerned, so stamping it
+    //     succeeds the way it does on Linux — `AT_SYMLINK_NOFOLLOW` included, to
+    //     cover the branch that skips symlink resolution.
+    let p = cstr("/dev/null");
+    let r = utimensat(AT_FDCWD, p.as_ptr() as u64, 0, AT_SYMLINK_NOFOLLOW);
+    check(r == 0, "dev-null", r, "0");
+
+    unregister_at_syscall_process(pid, tid);
+    clean_at_test_tree(ROOT, &[]);
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] utimensat PASSED (10 cases: present/ENOENT/neg-dirfd/unopen-dirfd/futimens/EFAULT/EINVALx2/sentinels/dev-null)\n");
+    } else {
+        crate::safe_print!(64, "[Test] utimensat FAILED ({} of 10 cases)\n", fails);
+        panic!("test_utimensat: {fails} of 10 cases failed");
+    }
+}
+
 fn test_unlinkat() {
     use crate::syscall::{handle_syscall, nr::UNLINKAT};
 

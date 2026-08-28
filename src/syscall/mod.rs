@@ -784,7 +784,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::UNAME => proc::sys_uname(args[0]),
         nr::FLOCK => flock::sys_flock(args[0] as u32, args[1] as u32),
         nr::UMASK => 0o022,
-        nr::UTIMENSAT => 0,
+        nr::UTIMENSAT => flat(fs::sys_utimensat(args[0] as i32, args[1], args[2], args[3] as u32)),
         nr::FDATASYNC => 0,
         nr::FSYNC => 0,
         nr::FCHMOD => fs::sys_fchmod(args[0] as u32, args[1] as u32),

@@ -62,6 +62,18 @@ pub mod at {
     pub const AT_EMPTY_PATH: u32 = 0x1000;
 }
 
+/// `utimensat(2)` sentinel values for `timespec.tv_nsec`.
+///
+/// They occupy the `tv_nsec` field, not a flags word, which is why they are
+/// `i64`: `Timespec::tv_nsec` is signed on this ABI. Both are just under
+/// `1 << 30`, so they can never collide with a real nanosecond value (< 1e9).
+pub mod utimensat {
+    /// Set this timestamp to the current time, ignoring `tv_sec`.
+    pub const UTIME_NOW: i64 = (1 << 30) - 1;
+    /// Leave this timestamp unchanged, ignoring `tv_sec`.
+    pub const UTIME_OMIT: i64 = (1 << 30) - 2;
+}
+
 /// `fcntl(2)` commands.
 pub mod fcntl {
     pub const F_DUPFD: u32 = 0;
@@ -252,6 +264,11 @@ mod tests {
     #[test]
     fn at_flags_are_distinct_bits_and_fdcwd_is_not_one() {
         assert_eq!(at::AT_FDCWD, -100);
+        // `<sys/stat.h>`: both sentinels sit just under 1<<30, above every legal
+        // nanosecond value, which is what makes them unambiguous in `tv_nsec`.
+        assert_eq!(utimensat::UTIME_NOW, 0x3fff_ffff);
+        assert_eq!(utimensat::UTIME_OMIT, 0x3fff_fffe);
+        assert!(utimensat::UTIME_OMIT > 999_999_999);
         let all = [
             at::AT_SYMLINK_NOFOLLOW, at::AT_REMOVEDIR, at::AT_SYMLINK_FOLLOW,
             at::AT_NO_AUTOMOUNT, at::AT_EMPTY_PATH,

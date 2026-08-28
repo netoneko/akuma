@@ -2529,6 +2529,95 @@ pub(super) fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_p
     Ok(0)
 }
 
+/// `utimensat(2)` — set a file's timestamps.
+///
+/// **This was `nr::UTIMENSAT => 0` in the dispatch table until 2026-08-28: a
+/// bare stub that answered "success" to everything, including a path that does
+/// not exist.** That is not a harmless approximation, because of how the
+/// canonical caller is written. busybox `touch` does:
+///
+/// ```c
+/// if (utimensat(AT_FDCWD, path, ts, 0) != 0) {
+///     if (errno == ENOENT) { fd = open(path, O_RDWR | O_CREAT, 0666); ... }
+/// }
+/// ```
+///
+/// — it tries to stamp the file first and treats `ENOENT` as "so create it".
+/// Against a stub that always returns 0, the `if` never fires, so `touch newfile`
+/// **exits 0 and creates nothing**. Silent, and it looks like the filesystem lost
+/// the write rather than like a missing syscall
+/// (`docs/archive/UTIMENSAT_STUB_TOUCH.md`).
+///
+/// # What is real here and what is not
+///
+/// The *errors* are real: `ENOENT` for a missing path, `EBADF` for a bad `dirfd`
+/// or `fd`, `EFAULT` for an unreadable `times`, `EINVAL` for a malformed one.
+/// Those are what callers branch on, and they are the whole reason this exists.
+///
+/// The *timestamps are still discarded*, and that is a genuine limitation rather
+/// than an oversight: `akuma_vfs::Filesystem` has no set-times operation at all
+/// and `Metadata`'s `modified`/`accessed` are read-only, so there is nowhere to
+/// put them. So `touch file` now works and `touch -d '2001-01-01' file` silently
+/// does not change the date. Fixing that means adding a write path to the VFS
+/// trait and ext2 inode writeback — out of scope here, and noted in the write-up.
+///
+/// Reporting `ENOSYS` instead would be the honest alternative, and it is worse:
+/// it puts `touch` back to failing outright, which is the state this replaces.
+pub(super) fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> SysResult {
+    use akuma_syscalls_linux::flags::at::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
+    use akuma_syscalls_linux::flags::utimensat::{UTIME_NOW, UTIME_OMIT};
+
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+
+    // A NULL `times` means "both to now" and needs no read. Otherwise it is two
+    // `struct timespec`, and a malformed one is EINVAL *before* any lookup —
+    // Linux validates the argument regardless of whether the path resolves.
+    if times_ptr != 0 {
+        let mut times = [Timespec::default(); 2];
+        // `read_user_into` reports a POSITIVE errno; `?` here would hand
+        // userspace a success-looking 14. See `flat` in mod.rs.
+        if read_user_into(&mut times, times_ptr).is_err() {
+            return Err(EFAULT);
+        }
+        for t in &times {
+            let ns = t.tv_nsec;
+            if ns != UTIME_NOW && ns != UTIME_OMIT && !(0..1_000_000_000).contains(&ns) {
+                return Err(EINVAL);
+            }
+        }
+    }
+
+    // `path == NULL` is glibc/musl's `futimens(fd)`: the target is `dirfd`
+    // itself, so there is no path to resolve and `AT_FDCWD` is not meaningful.
+    if path_ptr == 0 {
+        if dirfd < 0 {
+            return Err(EBADF);
+        }
+        let Some(proc) = akuma_exec::process::current_process_shared() else {
+            return Err(EBADF);
+        };
+        return if proc.get_fd(dirfd as u32).is_some() { Ok(0) } else { Err(EBADF) };
+    }
+
+    let raw_path = copy_from_user_str(path_ptr, 512)?;
+    let resolved = resolve_path_at(dirfd, &raw_path)?;
+    // `AT_SYMLINK_NOFOLLOW` stamps the link itself; without it we follow, so the
+    // existence test must be of the target — a dangling symlink is ENOENT.
+    let target = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        crate::vfs::resolve_symlinks(&resolved)
+    } else {
+        resolved
+    };
+    // `vfs::exists` already covers the device table, `/dev` itself and mtab, so
+    // `touch /dev/null` succeeds the way it does on Linux.
+    if !crate::vfs::exists(&target) {
+        return Err(ENOENT);
+    }
+    Ok(0)
+}
+
 pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> SysResult {
     let path = copy_from_user_str(path_ptr, 512)?;
     
