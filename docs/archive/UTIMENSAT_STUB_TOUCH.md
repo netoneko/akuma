@@ -87,15 +87,58 @@ locally.
 operation at all, and `Metadata`'s `modified`/`accessed` are read-only, so there
 is nowhere to put them. Consequences:
 
-- `touch file` — works.
-- `touch -d '2001-01-01' file` — succeeds and does not change the date.
-- `make`, and anything else that compares mtimes, sees whatever ext2 recorded on
-  write, not what `touch` asked for.
+- `touch file` — creates the file. Works.
+- `touch -d <date>` / `touch -t <stamp>` — succeed and change nothing.
+- **Plain `touch` on an *existing* file does not refresh its mtime either.**
+  That is the consequential one: `touch` as a "mark this newer" idiom is inert,
+  so `make` and anything else comparing mtimes sees whatever ext2 recorded at
+  write time and will not rebuild.
+
+Measured in the guest 2026-08-28, one file through all three forms — the mtime
+never moves off the write time:
+
+```
+$ echo x > /tmp/ts1; ls -l /tmp/ts1
+-rw-rw-rw- 1 0 0 2 Aug 28 20:18 /tmp/ts1
+
+$ touch -d '2001-01-01 00:00:00' /tmp/ts1; echo rc=$?   → rc=0
+$ touch -t 200202020202 /tmp/ts1;          echo rc=$?   → rc=0
+$ touch /tmp/ts1;                          echo rc=$?   → rc=0
+$ ls -l /tmp/ts1
+-rw-rw-rw- 1 0 0 2 Aug 28 20:18 /tmp/ts1                 ← unchanged by all three
+
+$ date -u '+%Y-%m-%d %H:%M:%S'          → 2026-08-28 20:18:58
+$ busybox stat -c '%y  %Y' /tmp/ts1     → 2026-08-28 20:18:57  1787948337
+```
+
+Every call returns 0, which is the honest half of the trade: the *error*
+contract is now correct, and the write side is a stub that says so here rather
+than in a comment nobody reads.
 
 Returning `ENOSYS` instead would be the honest alternative and is worse: it puts
-`touch` back to failing outright, which is the state this replaces. Storing the
-times properly means adding a write path to the `Filesystem` trait plus ext2
-inode writeback — a real change, deliberately not folded in here.
+`touch` back to failing outright, which is the state this replaces.
+
+### OPEN: actually storing the timestamps
+
+Deliberately not folded into this fix. What it needs, in order:
+
+1. **A set-times operation on `akuma_vfs::Filesystem`.** There is none today —
+   the trait is read-only with respect to time, which is why the handler has
+   nowhere to put the values. Signature has to carry `UTIME_OMIT` (leave this
+   one alone) rather than two plain `u64`s, or `touch -a` will clobber mtime.
+2. **ext2 inode writeback for `i_atime` / `i_mtime` / `i_ctime`.** The fields
+   exist on disk and are already read; nothing writes them back.
+3. **`Metadata.modified` / `.accessed` stop being read-only**, and `sys_utimensat`
+   drops its "discard" branch.
+
+Whoever picks this up should extend `test_utimensat` with the read-back case it
+deliberately omits today, and re-run the mtime ladder under "What is still not
+implemented" — it is written to be re-run and should start disagreeing with
+itself when this lands.
+
+Worth doing when something in the guest actually depends on mtime. The concrete
+trigger is a build system: `make` inside the VM will not rebuild on `touch`,
+and self-hosted builds are the direction this OS is going.
 
 ## Verify
 
@@ -127,6 +170,10 @@ rc=1
 `touch -c` is the case that proves the `ENOENT` is doing real work rather than
 being swallowed: busybox suppresses the create for `-c`, so the file must stay
 absent while the command still exits 0.
+
+Confirmed on both platforms at SMP=4: QEMU **316 PASSED / 0 FAILED**, and
+Firecracker under Lima **308 PASSED / 0 FAILED / 0 POISON**, with
+`[Test] utimensat PASSED (10 cases)` on each.
 
 ## How it was found
 
