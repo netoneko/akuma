@@ -171,6 +171,31 @@ pub trait Filesystem: Send + Sync {
         Err(FsError::NotSupported)
     }
 
+    /// Set a file's access and modification times, in **seconds since the Unix
+    /// epoch**. `None` leaves that one unchanged.
+    ///
+    /// `None` is `utimensat`'s `UTIME_OMIT`, and modelling it is the whole
+    /// reason this takes two `Option`s rather than two `u64`s: `touch -a` sets
+    /// only atime, and a signature that could not say "leave mtime alone" would
+    /// force the caller to read-modify-write and clobber a concurrent update.
+    /// `UTIME_NOW` is resolved by the caller — the syscall layer owns the clock,
+    /// so a filesystem never has to.
+    ///
+    /// Defaults to `NotSupported` rather than `Ok(())`, deliberately. A
+    /// filesystem that silently accepted timestamps it does not store would make
+    /// `touch -d '2001-01-01' f` report success and change nothing — which is
+    /// the exact shape of the bug that motivated the whole handler
+    /// (`docs/archive/UTIMENSAT_STUB_TOUCH.md`): a success return that suppresses
+    /// the caller's fallback.
+    fn set_times(
+        &self,
+        _path: &str,
+        _atime_secs: Option<u64>,
+        _mtime_secs: Option<u64>,
+    ) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
     fn truncate(&self, _path: &str, _length: u64) -> Result<(), FsError> {
         Err(FsError::NotSupported)
     }

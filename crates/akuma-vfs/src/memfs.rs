@@ -331,6 +331,30 @@ impl Filesystem for MemoryFilesystem {
         Self::navigate(&root, path).is_ok()
     }
 
+    /// `atime` is accepted and dropped: `FsNode::File` has no access-time field
+    /// (its `metadata` reports `accessed: None`), so there is nowhere to put it.
+    /// That is not the silent-success failure the trait's default guards against
+    /// — `mtime`, the one anything actually compares, is stored — but it is why
+    /// `touch -a` on a memfs path is a no-op.
+    fn set_times(
+        &self,
+        path: &str,
+        _atime_secs: Option<u64>,
+        mtime_secs: Option<u64>,
+    ) -> Result<(), FsError> {
+        let Some(m) = mtime_secs else { return Ok(()) };
+        let mut root = self.root.lock();
+        let (parent, filename) = Self::navigate_parent(&mut root, path)?;
+        match parent.get_mut(&filename) {
+            Some(FsNode::File { modified, .. }) => {
+                *modified = m;
+                Ok(())
+            }
+            Some(FsNode::Directory { .. }) => Err(FsError::NotAFile),
+            None => Err(FsError::NotFound),
+        }
+    }
+
     fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
         let root = self.root.lock();
         let node = Self::navigate(&root, path)?;

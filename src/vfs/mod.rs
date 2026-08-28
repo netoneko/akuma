@@ -636,6 +636,12 @@ pub fn chmod(path: &str, mode: u32) -> Result<(), FsError> {
     with_fs_write(path, |fs, rel| fs.chmod(rel, mode))
 }
 
+/// Set a file's access/modification times (seconds since the epoch); `None`
+/// leaves that one alone. See `Filesystem::set_times`.
+pub fn set_times(path: &str, atime_secs: Option<u64>, mtime_secs: Option<u64>) -> Result<(), FsError> {
+    with_fs_write(path, |fs, rel| fs.set_times(rel, atime_secs, mtime_secs))
+}
+
 /// Truncate a file to a specified length
 pub fn truncate(path: &str, length: u64) -> Result<(), FsError> {
     let r = with_fs_write(path, |fs, rel| fs.truncate(rel, length));

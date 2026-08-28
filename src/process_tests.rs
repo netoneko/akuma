@@ -2959,14 +2959,39 @@ fn test_utimensat() {
     let r = utimensat(AT_FDCWD, p.as_ptr() as u64, 0, AT_SYMLINK_NOFOLLOW);
     check(r == 0, "dev-null", r, "0");
 
+    // 11. READ-BACK: an explicit mtime must actually land on the inode. This is
+    //     the case the first version of this test deliberately omitted, because
+    //     timestamps were discarded then; it is the whole point of the storage
+    //     work, so it asserts the value rather than just the return code.
+    let stamp: i64 = 1_000_000_000; // 2001-09-09, and nothing else here uses it
+    let times = [
+        Timespec { tv_sec: 0, tv_nsec: (1 << 30) - 2 }, // UTIME_OMIT: leave atime
+        Timespec { tv_sec: stamp, tv_nsec: 0 },
+    ];
+    let p = cstr(&format!("{ROOT}/present.txt"));
+    let r = utimensat(AT_FDCWD, p.as_ptr() as u64, (&raw const times) as u64, 0);
+    check(r == 0, "readback-call", r, "0");
+    match crate::vfs::metadata(&format!("{ROOT}/present.txt")) {
+        Ok(m) if m.modified == Some(stamp as u64) => {}
+        Ok(m) => {
+            fails += 1;
+            crate::safe_print!(96, "[Test] utimensat readback FAILED mtime={:?} (want {})\n",
+                m.modified, stamp);
+        }
+        Err(_) => {
+            fails += 1;
+            crate::safe_print!(64, "[Test] utimensat readback FAILED (metadata error)\n");
+        }
+    }
+
     unregister_at_syscall_process(pid, tid);
     clean_at_test_tree(ROOT, &[]);
 
     if fails == 0 {
-        crate::safe_print!(128, "[Test] utimensat PASSED (10 cases: present/ENOENT/neg-dirfd/unopen-dirfd/futimens/EFAULT/EINVALx2/sentinels/dev-null)\n");
+        crate::safe_print!(160, "[Test] utimensat PASSED (11 cases: present/ENOENT/neg-dirfd/unopen-dirfd/futimens/EFAULT/EINVALx2/sentinels/dev-null/readback)\n");
     } else {
-        crate::safe_print!(64, "[Test] utimensat FAILED ({} of 10 cases)\n", fails);
-        panic!("test_utimensat: {fails} of 10 cases failed");
+        crate::safe_print!(64, "[Test] utimensat FAILED ({} of 11 cases)\n", fails);
+        panic!("test_utimensat: {fails} of 11 cases failed");
     }
 }
 

@@ -2574,7 +2574,18 @@ pub(super) fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u3
     // A NULL `times` means "both to now" and needs no read. Otherwise it is two
     // `struct timespec`, and a malformed one is EINVAL *before* any lookup —
     // Linux validates the argument regardless of whether the path resolves.
-    if times_ptr != 0 {
+    // Wall-clock seconds, for a NULL `times` and for `UTIME_NOW`. `None` means the
+    // clock has never been set (no RTC and no SNTP yet), in which case there is no
+    // meaningful "now" to store — the stamps are left alone rather than set to 0,
+    // which would date every touched file to 1970.
+    let now_secs = crate::timer::utc_time_us().map(|us| us / 1_000_000);
+
+    // A NULL `times` means "both to now". Otherwise it is two `struct timespec`,
+    // and a malformed one is EINVAL *before* any lookup — Linux validates the
+    // argument regardless of whether the path resolves.
+    let (atime, mtime) = if times_ptr == 0 {
+        (now_secs, now_secs)
+    } else {
         let mut times = [Timespec::default(); 2];
         // `read_user_into` reports a POSITIVE errno; `?` here would hand
         // userspace a success-looking 14. See `flat` in mod.rs.
@@ -2587,7 +2598,18 @@ pub(super) fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u3
                 return Err(EINVAL);
             }
         }
-    }
+        // `times[0]` is atime, `times[1]` mtime. `UTIME_OMIT` -> leave alone
+        // (`None`); `UTIME_NOW` -> the clock; otherwise the supplied `tv_sec`.
+        // Sub-second precision is dropped: ext2 stores whole seconds.
+        let pick = |t: &Timespec| -> Option<u64> {
+            match t.tv_nsec {
+                UTIME_OMIT => None,
+                UTIME_NOW => now_secs,
+                _ => Some(t.tv_sec.cast_unsigned()),
+            }
+        };
+        (pick(&times[0]), pick(&times[1]))
+    };
 
     // `path == NULL` is glibc/musl's `futimens(fd)`: the target is `dirfd`
     // itself, so there is no path to resolve and `AT_FDCWD` is not meaningful.
@@ -2615,7 +2637,25 @@ pub(super) fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u3
     if !crate::vfs::exists(&target) {
         return Err(ENOENT);
     }
-    Ok(0)
+    // Existence is already established above, so the two "there is no inode to
+    // stamp" answers are success, not failure:
+    //
+    //   * `NotSupported` — the filesystem has no `set_times` (the trait default).
+    //   * `NotFound`     — the path resolves to no filesystem at all. Every
+    //     synthetic path `vfs::exists` knows about lands here: device nodes,
+    //     `/dev` itself, `/proc/mounts`. `with_fs_write` has no mount to hand
+    //     them to.
+    //
+    // Reporting either as an error would put `touch /dev/null` back to failing,
+    // which is what the boot test caught when this arm only accepted
+    // `NotSupported`. The one thing it costs: if a peer unlinks the file between
+    // the `exists` check and here, Linux would say `ENOENT` and this says 0 — a
+    // benign divergence under a race, against a real regression for every device
+    // node on every run.
+    match crate::vfs::set_times(&target, atime, mtime) {
+        Ok(()) | Err(crate::vfs::FsError::NotSupported | crate::vfs::FsError::NotFound) => Ok(0),
+        Err(e) => Err(fs_error_to_errno(e)),
+    }
 }
 
 pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32) -> SysResult {

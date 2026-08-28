@@ -3396,6 +3396,38 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         Ok(())
     }
 
+    /// `utimensat` backing. Modelled on `chmod` directly above — the inode
+    /// already carries all three stamps and `write_inode` already persists them,
+    /// so this is the plumbing that was missing rather than new capability.
+    ///
+    /// Deliberately does NOT touch `modification_time` when only `atime_secs` is
+    /// given: `chmod` bumps mtime because changing the mode is a change to the
+    /// inode, but `touch -a` must leave mtime exactly as it was — that is the
+    /// whole point of `UTIME_OMIT`. Times narrow to the on-disk `u32` (ext2 is a
+    /// 2038 format); saturating rather than wrapping so a far-future stamp pins
+    /// at the maximum instead of silently becoming 1970.
+    fn set_times(
+        &self,
+        path: &str,
+        atime_secs: Option<u64>,
+        mtime_secs: Option<u64>,
+    ) -> Result<(), FsError> {
+        if atime_secs.is_none() && mtime_secs.is_none() {
+            return Ok(());
+        }
+        let inode_num = self.lookup_path(path)?;
+        let state = self.write_state();
+        let mut inode = self.read_inode(&state, inode_num)?;
+        if let Some(a) = atime_secs {
+            inode.access_time = u32::try_from(a).unwrap_or(u32::MAX);
+        }
+        if let Some(m) = mtime_secs {
+            inode.modification_time = u32::try_from(m).unwrap_or(u32::MAX);
+        }
+        self.write_inode(&state, inode_num, &inode)?;
+        Ok(())
+    }
+
     fn fallocate(&self, path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
         if mode != 0 {
             return Err(FsError::NotSupported);
