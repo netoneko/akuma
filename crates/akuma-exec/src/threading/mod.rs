@@ -700,6 +700,79 @@ static PENDING_SIGNALS: [AtomicU64; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// Per-thread bitmask of signals that have been **delivered** since this
+/// thread's current syscall began. Bit N set = signal (N+1) was delivered.
+///
+/// # Why a second mask exists
+///
+/// `PENDING_SIGNALS` is cleared by `take_pending_signal` the moment a signal is
+/// delivered, and delivery happens on the return-to-EL0 paths in
+/// `src/exceptions.rs` — including the `rt_sigreturn` path, which takes the next
+/// pending signal immediately after restoring the previous handler's context.
+///
+/// A blocking syscall reports `EINTR` by *observing* the pending bit in its wait
+/// loop. So a signal source fast enough to keep the deliver → handler →
+/// `rt_sigreturn` → deliver chain saturated clears every bit before the blocked
+/// loop is ever scheduled to look at it: the handler runs over and over while
+/// the syscall it was supposed to interrupt never returns. That is a
+/// **starvation bug**, not merely a race — delivery has strict priority over
+/// resuming the interrupted syscall, and nothing bounds it.
+///
+/// It was latent for as long as it took the slow path to be slow enough. Fixing
+/// the identity cache (`docs/archive/IDENTITY_CACHE_LAZY_RESTAMP.md`) removed
+/// the microseconds the loop had been winning by, and `pthread_kill_eintr`
+/// hung: `PHASE1 FAIL: read() never returned; helper thread leaked (handler ran
+/// 64 times)`. Adding a `safe_print!` to the wait loop made it pass again, which
+/// is the signature of a timing window rather than a wrong branch.
+///
+/// This mask makes the observation **sticky**: a delivered signal stays visible
+/// to the blocking loop until that loop consumes it, so the EINTR decision no
+/// longer depends on winning a race against the delivery path.
+///
+/// Cleared at syscall entry (a fresh excursion starts with no record) with one
+/// deliberate exception, `rt_sigreturn` — see `clear_delivered_signals`.
+static DELIVERED_SIGNALS: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Record that `sig` was delivered to `slot`. Called from every delivery site in
+/// `src/exceptions.rs`, right where `take_pending_signal` clears the pending bit.
+pub fn note_delivered_signal(slot: usize, sig: u32) {
+    if slot < MAX_THREADS && sig > 0 && sig <= 64 {
+        DELIVERED_SIGNALS[slot].fetch_or(1u64 << (sig - 1), Ordering::AcqRel);
+    }
+}
+
+/// Signals delivered to `slot` since its current syscall began.
+pub fn delivered_signals_raw(slot: usize) -> u64 {
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    DELIVERED_SIGNALS[slot].load(Ordering::Acquire)
+}
+
+/// Consume `bits` from `slot`'s delivered set — the blocking loop calls this
+/// once it has turned them into an `EINTR`, so the record cannot fire twice.
+pub fn consume_delivered_signals(slot: usize, bits: u64) {
+    if slot < MAX_THREADS {
+        DELIVERED_SIGNALS[slot].fetch_and(!bits, Ordering::AcqRel);
+    }
+}
+
+/// Drop `slot`'s delivered record. Called at syscall entry so a record cannot
+/// leak into an unrelated later syscall and fabricate an `EINTR` there.
+///
+/// **`rt_sigreturn` must not clear it.** The handler returns through that
+/// syscall, so clearing there would erase the very record the interrupted
+/// blocking syscall is about to resume and read — which is the bug this whole
+/// mask exists to fix.
+pub fn clear_delivered_signals(slot: usize) {
+    if slot < MAX_THREADS {
+        DELIVERED_SIGNALS[slot].store(0, Ordering::Release);
+    }
+}
+
 /// Per-thread **signal mask** (blocked-signal set). Bit N set = signal (N+1)
 /// blocked. This MUST be per-thread, not per-process: Linux/POSIX signal masks
 /// are per-thread (`pthread_sigmask`), and `read_current_pid()` collapses every

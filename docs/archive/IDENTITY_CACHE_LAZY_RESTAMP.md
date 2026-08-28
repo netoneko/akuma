@@ -196,6 +196,20 @@ Note also that the before/after runs were on the same host in different power
 states, so **do not read wall-clock or per-second rates across them** — the
 comparison that holds is hits-vs-misses within each run.
 
+## It exposed a latent starvation bug
+
+Making the syscall path fast removed the margin a *different* bug had been
+losing by. `pthread_kill_eintr` began hanging at SMP=1 (and only SMP=1): signal
+delivery clears the pending bit that a blocking wait loop uses to decide `EINTR`,
+and `rt_sigreturn` immediately takes the next pending signal, so a fast signal
+source starves the interrupted syscall of any chance to notice. Root-caused and
+fixed separately —
+[`PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md`](PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md).
+
+Worth carrying forward: **a performance change can be a correctness change**, and
+the SMP=4 arm was green for every single run of both the regression and its
+baseline.
+
 ## What this does not fix
 
 Findings A and B of [`IDENTITY_CACHE_SMP_REVIEW.md`](IDENTITY_CACHE_SMP_REVIEW.md)

@@ -386,6 +386,18 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     crate::syscall::utils::read_profile::floor_laps::start(syscall_num);
 
     akuma_exec::threading::set_thread_current_syscall(syscall_num);
+    // A fresh excursion starts with no delivered-signal record, so one delivery
+    // cannot fabricate an EINTR in an unrelated later syscall.
+    //
+    // `rt_sigreturn` (139) is deliberately exempt: the handler returns THROUGH it,
+    // so clearing there would erase the record belonging to the blocking syscall
+    // that is about to resume — the exact starvation this mask fixes. See
+    // docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md.
+    if syscall_num != nr::RT_SIGRETURN {
+        akuma_exec::threading::clear_delivered_signals(
+            akuma_exec::threading::current_thread_id(),
+        );
+    }
     // One resolution per excursion, from the per-thread identity cache
     // (`table::THREAD_IDENTITY`): the tgid + leader `Process` pair the whole
     // prologue/epilogue below wants. The cache is one validated slot-state

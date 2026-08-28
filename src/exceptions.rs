@@ -1977,6 +1977,17 @@ pub fn syscall_is_non_restartable(nr: u64) -> bool {
 /// rt_sigframe on the user stack and redirecting ELR to the handler.
 /// Returns true if delivery succeeded (caller should return signal number as x0).
 fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, is_fault: bool, entry_esr: u64) -> bool {
+    // Record the delivery for the blocking-syscall EINTR path BEFORE anything can
+    // return early. `take_pending_signal` has already cleared the pending bit at
+    // every caller, so this record is the only remaining evidence that this thread
+    // was signalled during its current syscall — and a blocking wait loop needs
+    // that evidence to report EINTR. Recording here rather than at the seven call
+    // sites keeps the two in step: a new delivery path gets it for free.
+    // docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md
+    akuma_exec::threading::note_delivered_signal(
+        akuma_exec::threading::current_thread_id(),
+        signal,
+    );
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let proc = match akuma_exec::process::lookup_process_shared(pid) {
         Some(p) => p,

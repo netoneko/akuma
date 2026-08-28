@@ -309,11 +309,23 @@ pub fn current_thread_has_pending_interrupt() -> bool {
     // Hot path: one relaxed-ish atomic load for the overwhelmingly common
     // "nothing pending" case, before any lookup or lock.
     let tid = crate::threading::current_thread_id();
+    // Two sources, and the second is why `pthread_kill` can interrupt a blocking
+    // syscall at all under a fast signal source:
+    //
+    //   pending    not yet delivered — the ordinary case.
+    //   delivered  ALREADY delivered since this syscall began. `take_pending_signal`
+    //              cleared the pending bit at the return-to-EL0 path, so without
+    //              this the blocking loop has no way to learn it was interrupted.
+    //              The deliver -> handler -> rt_sigreturn -> deliver chain can stay
+    //              saturated indefinitely, and the loop never gets a look in.
+    //              See `threading::DELIVERED_SIGNALS` and
+    //              docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md.
     let pending = crate::threading::pending_signals_raw(tid);
-    if pending == 0 {
+    let delivered = crate::threading::delivered_signals_raw(tid);
+    if pending | delivered == 0 {
         return false;
     }
-    let deliverable = pending & !crate::threading::thread_signal_mask();
+    let deliverable = (pending | delivered) & !crate::threading::thread_signal_mask();
     if deliverable == 0 {
         return false;
     }
@@ -338,6 +350,11 @@ pub fn current_thread_has_pending_interrupt() -> bool {
         if matches!(action.handler, crate::process::SignalHandler::UserFn(_))
             && action.flags & SA_RESTART == 0
         {
+            // Consume the delivered record for THIS signal only, and only once
+            // we have decided it produces an EINTR — otherwise a single delivery
+            // could interrupt several later syscalls in a row. `pending` bits are
+            // left alone: the delivery path still owns those.
+            crate::threading::consume_delivered_signals(tid, 1u64 << idx);
             return true;
         }
     }
