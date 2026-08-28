@@ -187,6 +187,37 @@ fn test_so_keepalive_arms_smoltcp() {
 }
 
 /// Run all process tests
+/// The widened user-copy loop must agree with the byte loop, byte for byte, at
+/// every alignment and length.
+///
+/// `docs/archive/BUSYBOX_HASH_MISCOMPUTE.md`: the 64/16/8-byte widening landed
+/// 2026-08-27 and an A/B identifies it as the cause of a silent `read(2)`
+/// corruption — but the loop's tier arithmetic inspects correct, and a length or
+/// alignment bug would corrupt *deterministically*, not ~50 % of the time. This
+/// test is what tells those two apart, and it runs on **kernel** memory so page
+/// faults, the prefault path and user-page handling cannot muddy the answer:
+///
+///   * FAIL  => the asm is wrong in isolation, and the printed
+///     (src_align, dst_align, len) is the exact case to fix.
+///   * PASS  => the asm is correct on its own, so the corruption lives in its
+///     interaction with user pages — look there, not here.
+///
+/// Cheap and deterministic: ~114k cases of pure register/memory work, no
+/// spawning, no allocation.
+#[cfg(target_os = "none")]
+fn test_user_copy_loop_differential_sweep() {
+    let (checked, bad, key) = akuma_exec::mmu::user_access::copy_loop_differential_sweep();
+    if bad == 0 {
+        crate::safe_print!(160,
+            "  [PASS] test_user_copy_loop_differential_sweep ({} cases, wide == byte everywhere)\n",
+            checked);
+    } else {
+        crate::safe_print!(224,
+            "  [FAIL] user_copy_loop_differential_sweep: {}/{} cases disagree; first at src_align={} dst_align={} len={}\n",
+            bad, checked, key >> 32, (key >> 16) & 0xFFFF, key & 0xFFFF);
+    }
+}
+
 pub fn run_all_tests() {
     console::print("\n--- Process Execution Tests ---\n");
 
@@ -199,6 +230,13 @@ pub fn run_all_tests() {
     test_preempt_guard_is_live();
     test_identity_lazy_restamp();
     test_identity_recycled_slot_rejected();
+
+    // Is the widened user-copy asm itself correct? Deterministic, kernel-memory
+    // only, and it separates "the asm is buggy" from "the asm is fine and the
+    // bug is in its interaction with user pages"
+    // (docs/archive/BUSYBOX_HASH_MISCOMPUTE.md).
+    #[cfg(target_os = "none")]
+    test_user_copy_loop_differential_sweep();
 
     // Real (shared-kernel) SMP M0: confirm every secondary the DTB reported came up
     // on the shared kernel. Runs FIRST so it is observed even if a later, unrelated

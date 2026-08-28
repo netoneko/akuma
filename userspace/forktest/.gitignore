@@ -33,3 +33,15 @@ c_stress/futexkey
 c_stress/pthread_kill_eintr
 c_stress/cowstale
 c_stress/bssfork
+# User-copy corruption probe set (docs/archive/BUSYBOX_HASH_MISCOMPUTE.md).
+# Built by userspace/build.sh; sources are tracked, binaries are not.
+c_stress/md5probe
+c_stress/readback
+c_stress/computecheck
+c_stress/neonstate
+
+# rodatacheck is GENERATED: gen_rodatacheck.py (tracked) emits ~800 KB of
+# .rodata initializers, so the generator is the source of truth and both its
+# output and the binary stay out of the tree.
+c_stress/rodatacheck
+c_stress/rodatacheck.c

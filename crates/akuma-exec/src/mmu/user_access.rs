@@ -46,6 +46,7 @@ unsafe extern "C" {
     fn __arch_copy_user_memory(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn __arch_copy_user_memory_bytes(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn __arch_copy_user_memory_no64(dst: *mut u8, src: *const u8, len: usize) -> u64;
+    fn __arch_copy_user_memory_x8(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn __arch_copy_user_fault();
 }
 
@@ -152,6 +153,31 @@ __arch_copy_user_memory_no64:
 29: mov     x0, #0
     ret
 
+// Single-register 8-byte variant: `ldr`/`str` of one x-register, never a pair.
+// The missing rung of the bisect. Widths measured so far: 64-byte groups lose 360
+// bytes, 16-byte pairs lose 120, the byte loop loses nothing. This arm answers
+// whether the defect is the PAIRED access (`ldp`/`stp` touching two registers, so
+// 16 bytes per instruction) or merely the width/speed of the copy:
+//   corrupts => width or speed, not the pair instruction
+//   clean    => it is specifically the multi-register access
+.global __arch_copy_user_memory_x8
+__arch_copy_user_memory_x8:
+    cbz     x2, 39f
+32: cmp     x2, #8
+    b.lo    36f
+33: ldr     x3, [x1], #8
+    str     x3, [x0], #8
+    sub     x2, x2, #8
+    cmp     x2, #8
+    b.hs    33b
+36: cbz     x2, 39f
+37: ldrb    w3, [x1], #1
+    strb    w3, [x0], #1
+    subs    x2, x2, #1
+    b.ne    37b
+39: mov     x0, #0
+    ret
+
 // Byte-at-a-time variant, kept ONLY as an A/B control for
 // docs/archive/BUSYBOX_HASH_MISCOMPUTE.md: it is the pre-2026-08-27 loop, before
 // the 64/16/8-byte widening, so flipping `USER_COPY_BYTES_ONLY` isolates the
@@ -183,6 +209,14 @@ __arch_copy_user_fault:
 ///       (`md5probe whole` 0/16, busybox `md5sum` 0/12, against 9-10/16 and
 ///       6-8/12 on `0`), which is what identified the widening as the cause.
 /// `2` = widened loop minus the 64-byte tier, to isolate which tier corrupts.
+/// `3` = widened loop, page-split so no multi-register access straddles a page
+///       boundary. **Measured: still corrupts (12/20)** — the straddle
+///       hypothesis is dead.
+/// `4` = widened loop with IRQs masked across the copy. Diagnostic for
+///       "an interrupt mid-copy tears it"; never ship it. **Measured: still
+///       corrupts (9/20)** — interrupts are not the mechanism.
+/// `5` = single-register 8-byte `ldr`/`str` loop, no paired access. Separates
+///       "the paired instruction" from "width/speed".
 ///
 /// Ship as `0` once the real defect is found; `1` is the safe mitigation in the
 /// meantime, at the cost of the 2026-08-27 read-path speedup.
@@ -641,6 +675,48 @@ pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> R
     let res = match USER_COPY_TIER {
         1 => unsafe { __arch_copy_user_memory_bytes(dst, src, len) },
         2 => unsafe { __arch_copy_user_memory_no64(dst, src, len) },
+        3 => {
+            // Candidate FIX, and a test of the straddling-store hypothesis: keep
+            // the wide loop, but never let one `ldp`/`stp` span a page boundary
+            // on either side. Each segment is bounded by the nearer of the two
+            // next page boundaries, so every multi-register access lands wholly
+            // inside one page of both the source and the destination — while the
+            // 64-byte tier still does the bulk of the work inside each page.
+            let mut d = dst;
+            let mut sp = src;
+            let mut left = len;
+            let mut r = 0u64;
+            while left > 0 {
+                let to_d_edge = 4096 - (d as usize & 0xFFF);
+                let to_s_edge = 4096 - (sp as usize & 0xFFF);
+                let chunk = left.min(to_d_edge).min(to_s_edge);
+                r = unsafe { __arch_copy_user_memory(d, sp, chunk) };
+                if r != 0 {
+                    break;
+                }
+                // SAFETY: `chunk <= left`, so both stay inside the caller's ranges.
+                d = unsafe { d.add(chunk) };
+                sp = unsafe { sp.add(chunk) };
+                left -= chunk;
+            }
+            r
+        }
+        5 => unsafe { __arch_copy_user_memory_x8(dst, src, len) },
+        4 => {
+            // Tests "an interrupt during the copy tears it": run the SAME widened
+            // loop with IRQs masked, so no timer tick, no scheduler SGI and no
+            // preemption can land between its stores. If this is clean while
+            // tier 0 corrupts, the tear is caused by taking an interrupt mid-copy
+            // — which would mean the EL1 interrupt/context-switch path is not
+            // preserving this leaf function's live registers (x3-x10), or is
+            // resuming it with stale x0/x1/x2.
+            //
+            // DIAGNOSTIC ONLY: masking IRQs across a 64 KB copy is a latency
+            // disaster and must never ship.
+            akuma_primitives::irq::with_irqs_disabled(
+                || unsafe { __arch_copy_user_memory(dst, src, len) },
+            )
+        }
         _ => unsafe { __arch_copy_user_memory(dst, src, len) },
     };
 
@@ -666,6 +742,118 @@ pub unsafe fn copy_to_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Res
     // is also what made widening that loop (64/16/8-byte chunks, 2026-08-27) a
     // single edit that sped up user->kernel and kernel->user alike.
     unsafe { copy_from_user_safe(dst, src, len) }
+}
+
+/// Differential sweep: does the widened copy loop agree with the byte loop?
+///
+/// `docs/archive/BUSYBOX_HASH_MISCOMPUTE.md` A/B'd the 2026-08-27 widening as the
+/// cause of a silent read corruption, but eyeballing the loop finds no defect and
+/// a length/tier bug would corrupt deterministically rather than ~50 % of the
+/// time. This settles the question the only way that scales: run **both**
+/// routines over the cross-product of source alignment, destination alignment and
+/// length, on KERNEL memory only, and compare every byte.
+///
+/// Kernel memory on purpose. It takes user pages, page faults, the prefault path
+/// and the emulator's user-page handling entirely out of the picture, so:
+///
+///   * mismatches here  => the asm itself is wrong, and this names the exact
+///     (src_align, dst_align, len) that breaks it;
+///   * no mismatches    => the asm is correct in isolation and the corruption
+///     lives in its interaction with user pages — which is where to look next.
+///
+/// Returns `(cases_checked, mismatches, first_bad_key)`, where the key packs
+/// `src_align << 32 | dst_align << 16 | len` for the first disagreement.
+#[cfg(target_os = "none")]
+#[must_use]
+pub fn copy_loop_differential_sweep() -> (u32, u32, u64) {
+    const BUF: usize = 8192;
+    // Static, not heap: this runs from a boot test and must not depend on the
+    // allocator being healthy.
+    static mut SRC: [u8; BUF] = [0; BUF];
+    static mut GOT_WIDE: [u8; BUF] = [0; BUF];
+    static mut GOT_BYTE: [u8; BUF] = [0; BUF];
+
+    // SAFETY: single-threaded boot-test context; these are private to this fn.
+    let (src, wide, byte) = unsafe {
+        (
+            &mut *core::ptr::addr_of_mut!(SRC),
+            &mut *core::ptr::addr_of_mut!(GOT_WIDE),
+            &mut *core::ptr::addr_of_mut!(GOT_BYTE),
+        )
+    };
+    for (i, b) in src.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+    }
+
+    let mut checked = 0u32;
+    let mut bad = 0u32;
+    let mut first_bad = 0u64;
+
+    // Alignments 0..=71 cover every byte offset within a 64-byte group, plus a
+    // little past it so a group can start mid-way through the next one.
+    //
+    // Lengths are chosen so that every tier boundary and every tail remainder is
+    // hit exactly. The widened loop is `64-byte groups -> 16-byte pairs -> one
+    // 8-byte -> byte tail`, so what matters is which tiers a length activates and
+    // what it leaves over for the next one:
+    const LENS: [usize; 22] = [
+        1,    // byte tail only, minimum non-empty copy
+        2,    // byte tail, more than one iteration of it
+        7,    // byte tail at its maximum (8 would promote to the 8-byte tier)
+        8,    // the 8-byte tier exactly, nothing left over
+        9,    // 8-byte tier + 1 byte of tail
+        15,   // 8-byte tier + 7 bytes of tail: the largest pre-16 case
+        16,   // one 16-byte pair exactly, no tail
+        17,   // one 16-byte pair + 1 byte
+        23,   // one pair + 7 bytes: pair tier then the full byte tail
+        31,   // one pair + 8 + 7: every sub-64 tier active at once
+        32,   // two 16-byte pairs exactly
+        63,   // the largest length that never enters the 64-byte tier
+        64,   // one 64-byte group exactly — the first length that does
+        65,   // one group + 1 byte, i.e. group then straight to the byte tail
+        79,   // one group + 15: group, then 8-byte tier, then tail
+        80,   // one group + one pair exactly
+        127,  // one group + 63: group then every lower tier
+        128,  // two groups exactly
+        129,  // two groups + 1
+        1023, // 15 groups + 63: long run, then every tier drains
+        1024, // 16 groups exactly, a page-quarter, all tiers idle after
+        4097, // one page + 1 byte: the smallest length whose copy must cross a
+              // page boundary, which is where a straddling `stp` would land
+    ];
+    let mut sa = 0usize;
+    while sa <= 71 {
+        let mut da = 0usize;
+        while da <= 71 {
+            for &len in &LENS {
+                if sa + len >= BUF || da + len >= BUF {
+                    continue;
+                }
+                wide[da..da + len].fill(0xA5);
+                byte[da..da + len].fill(0xA5);
+                // SAFETY: both ranges are in bounds of their static buffers, and
+                // kernel memory never faults, so the trampoline is not needed.
+                unsafe {
+                    let _ = __arch_copy_user_memory(
+                        wide.as_mut_ptr().add(da), src.as_ptr().add(sa), len);
+                    let _ = __arch_copy_user_memory_bytes(
+                        byte.as_mut_ptr().add(da), src.as_ptr().add(sa), len);
+                }
+                checked += 1;
+                if wide[da..da + len] != byte[da..da + len]
+                    || wide[da..da + len] != src[sa..sa + len]
+                {
+                    if bad == 0 {
+                        first_bad = ((sa as u64) << 32) | ((da as u64) << 16) | len as u64;
+                    }
+                    bad += 1;
+                }
+            }
+            da += 1;
+        }
+        sa += 1;
+    }
+    (checked, bad, first_bad)
 }
 
 #[cfg(test)]

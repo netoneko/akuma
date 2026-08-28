@@ -1,7 +1,8 @@
 # `md5sum`/`sha*sum` return wrong digests for correct bytes
 
 **Date:** 2026-08-28
-**Status:** **CAUSE FOUND, exact defect still open.** A single-variable A/B
+**Status:** **CAUSE FOUND (2026-08-27 user-copy widening), exact defect still
+open. 100 % reproducible under TCG (`HVF=0`).** A single-variable A/B
 identifies the 2026-08-27 user-copy widening (`__arch_copy_user_memory`'s
 64/16/8-byte tiers) as the cause: reverting to the byte loop makes it vanish on
 both a controlled probe and busybox, and the damage per failure scales with store
@@ -296,13 +297,144 @@ reports the full byte count, so this is not the copy aborting on a fault.
 
 ### Mitigation currently in the tree
 
-`USER_COPY_TIER = 1` (the byte loop). Correctness over speed: this reverts the
-2026-08-27 speedup (warm 4 KB `pread` was 2110 -> 1100 ns, and the byte loop cost
-~16x an in-kernel memcpy per byte), so it is a placeholder, not the fix. Flip to
-`0` to reproduce, `2` to bisect.
+`USER_COPY_TIER = 1` (the byte loop) — the only arm measured clean on **both**
+the probe and busybox (0/16 and 0/12 at SMP=4, re-verified 0/20 and 0/20 with the
+boot suite at 99 `[PASS]`, empty failure set). Correctness over speed: it reverts
+the 2026-08-27 speedup (warm 4 KB `pread` was 2110 -> 1100 ns, and the byte loop
+costs ~16x an in-kernel memcpy per byte), so it is a placeholder, not the fix.
+
+Flip to `0` to reproduce, `2` to bisect tiers, `3`/`4` to see the failed
+candidate fixes.
+
+### How it was actually cracked (method, not luck)
+
+Worth recording because the two decisive moves were both *stepping outside the
+probe-writing loop*, and both came from the reviewer rather than from the
+investigation's own momentum:
+
+1. **Gate the suspect change and A/B it.** After ~15 userspace probes had each
+   come back clean, the question "can you roll the copy change back, or gate it,
+   and see if it still reproduces?" settled in two builds what no amount of
+   further probe-writing would have. A suspect with a date on it
+   (`git log`: the widening landed 2026-08-27, the symptom was first seen
+   2026-08-27) is a one-variable experiment, not a hypothesis.
+2. **Read the failing program from the kernel side.** The push to disassemble
+   busybox led instead to `[PSTATS]`, which reports a per-process syscall
+   histogram — and it showed busybox issuing `fstatat` plus exactly **one 64 KB
+   `read`**, no `mmap`. That is the shape every probe had missed: a single large
+   read into an *untouched* destination. Reproducing it took one more probe mode
+   (`md5probe whole`) and moved the reproducer from "busybox does something
+   strange" to 300 lines under our control.
+
+The counter-lesson, stated plainly because it cost the most time: writing more
+probes that *fail to reproduce* feels like progress and is not. Nine clean arms
+in a row was the signal to stop and go after the diff, not to write a tenth.
+
+Two claims made during this session were also **wrong and retracted here**, both
+worth knowing about:
+
+- *"`malloc` vs `mmap` destination is the differentiator"* — no: the `mmap` arm
+  fails too (9/16). An early 0/20 reading on it was luck, believed because it fit
+  the story being told at the time.
+- *"A page fault during the copy loses the bytes"* — falsified by a controlled
+  test (pre-touch every destination page, punch exactly one back to a fresh
+  `MAP_FIXED` page): **0/12 corrupted at five different hole positions**. A
+  guaranteed mid-copy fault corrupts nothing. That test only got written because
+  the claim was challenged rather than accepted.
+
+### Two candidate fixes tried, both failed
+
+Recorded so nobody re-tries them. Both keep the wide stores and target a
+specific mechanism; both still corrupt.
+
+| `USER_COPY_TIER` | idea | result |
+|---|---|---:|
+| `3` | **Page-split**: bound every segment by the nearer next page boundary of src and dst, so no `ldp`/`stp` ever straddles a page, while the 64-byte tier still does the bulk inside each page | **12/20 wrong** (`whole`), 11/20 (`whole-mmap`) |
+| `4` | **IRQs masked** across the whole copy (`with_irqs_disabled`), so no tick, no scheduler SGI, no preemption can land between the stores | **9/20 wrong**, 5/20, busybox 11/20 |
+
+Tier 4 is the one that matters: **"an interrupt tears the copy" is falsified.**
+Masking interrupts for the entire 64 KB changes nothing. Combined with the
+earlier hole test (a guaranteed mid-copy *fault* corrupts nothing) and the fact
+that no `EFAULT` is ever returned, the tear is neither a fault nor an interrupt.
+
+### One more clue: SMP matters, but not for both programs
+
+Shipped widened loop (`tier 0`) at **SMP=1**:
+
+| | wrong / 20 |
+|---|---:|
+| `md5probe whole` | **0** — clean, vs 9-12/20 at SMP=4 |
+| `busybox md5sum` | **6** — still fails |
+
+So the probe's corruption looks **cross-core**, while busybox still miscomputes on
+a single core. Either busybox reaches a second path (it does more startup I/O
+than the probe), or the probe's rate at SMP=1 is low rather than zero and 20 runs
+missed it. **Do not read this as "two bugs" without more samples** — but do note
+that the byte loop (`tier 1`) makes *both* clean at SMP=4, so the wide stores are
+implicated in both.
+
+### Where that leaves the mechanism
+
+Everything ruled out so far — fault, interrupt, straddle, page count, laziness,
+region granularity, barriers at the PTE install — leaves a race between the
+copy's stores and **something else touching those frames**: frame
+zeroing/recycling, a concurrent PTE edit, or a reclaim path. The width scaling
+is the strongest hint: a faster copy loses *more* bytes, which is the signature
+of racing against work that lands at a fixed wall-clock offset rather than
+against anything the copy itself does.
+
+### Session 3: a 100 % reproducer, and the source buffer cleared
+
+**Under TCG it fails 100 % of the time.** `HVF=0` (software emulation) instead of
+HVF, same kernel, same probe: `md5probe whole` **24/24 wrong**, busybox `md5sum`
+**24/24 wrong (14 distinct digests)**, always exactly 90 bad words. Under HVF the
+same case is ~20 %. So this is not an HVF quirk — TCG simply holds the window
+open — and **anyone continuing this should work under TCG**, where the signal is
+deterministic instead of a coin flip.
+
+**The kernel's own buffer is correct; `copy_to_user` loses the bytes.** The
+probe file is self-identifying, so the read path can verify just the 90-word
+window that comes back wrong — 90 comparisons, printing *only* on mismatch, so
+the common path stays silent. Result: **0 occurrences of `[KBUF-BAD]` across a
+run where 8/40 invocations were corrupted.** `temp` held the right bytes every
+time. That retires ext2, the file-page cache and the read-into-`temp` path for
+good; the loss is on the user side of the copy.
+
+### Every in-kernel instrumentation of this path suppresses it
+
+This is the defining practical property of the bug, and it has now bitten three
+times:
+
+| instrumentation | effect |
+|---|---|
+| Per-chunk fingerprint on both sides of `copy_to_user` (per-byte readback) | **8/8 clean** — bug gone |
+| Read-only page-table walk before/after the copy (`translate_current_user_va`) plus one frame read through the kernel alias | **0/6 clean under TCG**, where the uninstrumented kernel is 24/24 |
+| The 90-word check on the *kernel* buffer only (no user access, no PTE walk, silent unless wrong) | bug still present (8/40) — **the only instrumentation that survived** |
+
+So the budget for anything added to that path is tiny: no printing, no user
+access, no page-table walk. Prefer capturing into `static`s and reading them out
+of band, and re-confirm the corruption is still occurring in the same run before
+believing a negative result.
+
+### A misstep worth not repeating
+
+Filling freshly allocated pages with a `0xDEADF00D` marker instead of zeroes — to
+tell "never written" from "written then zeroed" — **wedged the kernel** in a
+`[BKL] stuck` storm. `alloc_page_zeroed` also backs **page tables and kernel
+structures**, not just user anon pages, so a non-zero fill poisons them. If the
+marker idea is worth retrying, restrict it to the user demand-paging allocator
+(`alloc_page_zeroed_user`) and expect programs that rely on zeroed `.bss` to
+misbehave.
 
 ### What to do next
 
+- **Instrument the frame lifecycle, without printing.** The remaining hypothesis
+  is that the destination frames are written by someone else after the copy.
+  Record `(va, frame_pa)` at prefault, then after the copy re-read the PTE and
+  confirm it still points at the same frame and that the frame holds what was
+  copied. Accumulate the result into `static` counters and read them out of band
+  — a `safe_print!` on this path suppresses the bug (measured: the per-byte
+  readback trace made it 8/8 clean).
 - **Sweep `__arch_copy_user_memory` as a boot test** over (src alignment, dst
   alignment, length), especially lengths and destinations that make an `stp`
   straddle a page boundary, comparing against a byte-wise reference. That is the

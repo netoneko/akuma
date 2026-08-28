@@ -22,5 +22,3 @@ akuma_*.bin
 akuma_*.elf
 akuma-fc.bin
 
-# Built C probe binaries (the .c files next to them are the sources)
-userspace/ext2probe/c/read_syscall_cost

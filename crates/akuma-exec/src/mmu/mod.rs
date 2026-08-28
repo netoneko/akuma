@@ -2222,6 +2222,24 @@ fn resolve_user_leaf(l0_ptr: *const u64, va: usize) -> Option<UserLeaf> {
 
 /// Translate a user VA to its physical address using the given L0 page table.
 /// Returns None if the page is not mapped.
+/// [`translate_user_va`] for the **current** address space: resolves the L0 from
+/// `TTBR0_EL1` itself, so a caller with no `&Process` can ask "what physical frame
+/// is behind this user VA right now?".
+///
+/// Added for the frame-lifecycle diagnostic in
+/// `docs/archive/BUSYBOX_HASH_MISCOMPUTE.md`: comparing the answer before and
+/// after a `copy_to_user` says whether the frame under the destination was
+/// swapped out from under the copy.
+#[must_use]
+pub fn translate_current_user_va(va: usize) -> Option<usize> {
+    let ttbr0 = get_current_ttbr0();
+    if ttbr0 == 0 {
+        return None;
+    }
+    let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    translate_user_va(phys_to_virt(l0_addr) as *const u64, va)
+}
+
 pub fn translate_user_va(l0_ptr: *const u64, va: usize) -> Option<usize> {
     resolve_user_leaf(l0_ptr, va).map(|leaf| leaf.phys(va))
 }

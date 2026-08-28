@@ -417,6 +417,28 @@ echo "Building pthread_kill_eintr (C, pthread_kill EINTR probe)..."
 cp forktest/c_stress/pthread_kill_eintr ../bootstrap/bin/
 echo "pthread_kill_eintr (C) copied to bootstrap/bin/"
 
+# The user-copy corruption probe set (docs/archive/BUSYBOX_HASH_MISCOMPUTE.md).
+# `md5probe whole` is the regression guard for that bug: fstat + malloc an
+# UNTOUCHED buffer + ONE large read + hash, one iteration per fresh exec. It must
+# print the same digest every run. The other three are the elimination arms that
+# localized it, kept because each rules out a mechanism this symptom invites:
+#   readback     — are the BYTES wrong? (self-identifying file, read + mmap arms)
+#   computecheck — is GPR/FP computation stable across preemption?
+#   neonstate    — are the upper 64 bits of the V registers preserved?
+# All four are calibrated: each must report the same result on real Linux arm64
+#   docker run --rm --platform linux/arm64 -v "$PWD:/w:ro" alpine /w/<probe>
+echo "Building user-copy corruption probes (md5probe, readback, computecheck, neonstate)..."
+(
+    cd forktest/c_stress
+    for p in md5probe readback computecheck neonstate; do
+        aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o "$p" "$p.c"
+    done
+)
+for p in md5probe readback computecheck neonstate; do
+    cp "forktest/c_stress/$p" ../bootstrap/bin/
+done
+echo "user-copy probes (C) copied to bootstrap/bin/"
+
 # eager_mprotect_probe: does mprotect still hold on an EAGER mmap after the
 # Failure-A recovery path (MmapRegion::flags + [EAGER-UPGRADE])? Guards against
 # the upgrade gate firing when mprotect downgraded the region to read-only or
