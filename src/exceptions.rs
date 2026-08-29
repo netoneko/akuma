@@ -3085,35 +3085,36 @@ pub fn stale_write_fault_absorbed_in(l0: *const u64, page_va: usize, tid: usize)
 /// alike: a page whose content is intact but whose permissions were lost (an
 /// accounting bug) versus one that has already been wiped (the frame is gone).
 ///
-/// The protection a **lazy** region records for `va`, if it records one.
+/// The protection a region **states** for `va`, if it states one.
 ///
 /// `None` means no usable record, and must never be read as "not writable": an
-/// ELF `.data`/`.bss` page has no region at all, and a lazy region that recorded
-/// nothing carries `flags == 0`. Both take the historical path.
+/// ELF `.data`/`.bss` page has no region at all, a lazy region that recorded
+/// nothing carries `flags == 0`, and an eager region built without explicit flags
+/// carries `NONE` as a *default* rather than a statement. All three take the
+/// historical path.
 ///
-/// # Why eager regions are deliberately NOT consulted
+/// # Eager regions are consulted again, and why that is safe now
 ///
-/// They were, and it corrupted `rustc`. `update_eager_region_flags` records a
-/// sub-range `mprotect` against the **whole** region — its own comment says that
-/// widening is safe *"because the fault handler only ever uses these flags to
-/// grant a write"*. That is true for granting and false for refusing: a guard
-/// page `mprotect(PROT_NONE)`-ed inside a larger eager mapping records `NONE` for
-/// every page of it, and a deny gate then refuses the legitimate CoW break on all
-/// the others. Measured in a devbox self-host build: three `[MPROTECT-DENY]`
-/// addresses, three `SIGSEGV`s at exactly those addresses, `thiserror-impl` and
-/// `zerocopy-derive` dead.
+/// They were consulted, and it corrupted `rustc`: `update_eager_region_flags`
+/// recorded a sub-range `mprotect` against the **whole** region, so a guard page
+/// `mprotect(PROT_NONE)`-ed inside a larger mapping marked every page of it and
+/// this gate refused the legitimate CoW break on all the others — three
+/// `[MPROTECT-DENY]` addresses, three `SIGSEGV`s at exactly those addresses.
 ///
-/// Eager flags are whole-region by construction, so no per-page decision can be
-/// built on them. Lazy regions split on `mprotect` (`update_lazy_region_flags`)
-/// and are per-range precise, which is why the gate keeps them.
+/// The record is now page-accurate: `mprotect` **splits** the region
+/// (`akuma_mmap::mprotect_eager_regions_in_range`), so a piece's flags describe
+/// that piece and nothing else. `MmapRegion::recorded_prot()` separately answers
+/// "did this region ever state a protection", which is what keeps the unrecorded
+/// `NONE` default from reading as `PROT_NONE`.
 ///
-/// The cost: `mprotect` on an **eager** region is still not enforced across a
-/// fork — `eager_mprotect_probe` fails as it did before any of this. Fixing that
-/// needs eager regions to split like lazy ones do; recording the protection more
-/// precisely is the prerequisite, not the deny gate.
+/// Both halves are needed. Precision without `recorded_prot` refuses writes to
+/// never-`mprotect`ed regions; `recorded_prot` without precision refuses writes to
+/// a guard page's neighbours. Removing either brings the `rustc` crash back.
 fn recorded_protection(pid: u32, va: usize) -> Option<u64> {
-    akuma_exec::process::lazy_region_lookup_for_page_fault(pid, va)
-        .map(|(f, ..)| f)
+    akuma_exec::process::eager_region_recorded_prot_for_page_fault(pid, va)
+        .or_else(|| {
+            akuma_exec::process::lazy_region_lookup_for_page_fault(pid, va).map(|(f, ..)| f)
+        })
         .filter(|f| *f != 0)
 }
 

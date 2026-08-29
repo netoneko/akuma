@@ -756,12 +756,25 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         }
 
         // A remap moves and resizes a mapping; it does not reprotect it, so the new
-        // region carries the old one's recorded protection.
-        let old_flags = proc.vm_with_regions(|r| {
-            r.iter().find(|reg| reg.start_va == old_addr).map(|reg| reg.flags)
+        // region carries the old one's recorded protection — **including whether
+        // the old one recorded anything at all**.
+        //
+        // This used to be `old_flags.unwrap_or(NONE)` fed to `owned_with_flags`,
+        // which turns "the source said nothing" into "the source said PROT_NONE".
+        // `owned_with_flags` marks its value as a statement, so every `mremap`
+        // whose source was not found by exact `start_va` — a lazy source, or a
+        // remap of a sub-range — recorded an explicit `PROT_NONE` on a writable
+        // mapping. Allocators call `mremap` on every `realloc`, so this killed
+        // `rustc`: `[WPF] … eager=0x60000000000080 cow_ref=1` with no `mprotect`
+        // anywhere in the log. See mem.md § "A `mprotect` bug this gate found".
+        let old_prot = proc.vm_with_regions(|r| {
+            r.iter().find(|reg| reg.start_va == old_addr).and_then(MmapRegion::recorded_prot)
         });
-        proc.vm_with_regions(|r| r.push(MmapRegion::owned_with_flags(
-            new_addr, new_frames, old_flags.unwrap_or(akuma_exec::mmu::user_flags::NONE))));
+        let region = match old_prot {
+            Some(f) => MmapRegion::owned_with_flags(new_addr, new_frames, f),
+            None => MmapRegion::owned(new_addr, new_frames),
+        };
+        proc.vm_with_regions(|r| r.push(region));
 
         let mut found_eager = false;
         // Remove the old region under the lock, then unmap/free its frames after

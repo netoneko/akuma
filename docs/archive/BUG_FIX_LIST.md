@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 728
-- **Docs contributing at least one fix:** 235
+- **Total distinct fixes counted:** 744
+- **Docs contributing at least one fix:** 239
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 130 | 17.9% | 19 |
-| Memory & Virtual Memory | 114 | 15.7% | 36 |
-| Scheduler & Process Management | 77 | 10.6% | 20 |
-| SMP & Locking | 88 | 12.1% | 39 |
-| Networking | 54 | 7.4% | 21 |
-| Userspace Apps & Libraries | 37 | 5.1% | 20 |
-| Rump Kernel & Syscall Proxy | 26 | 3.6% | 6 |
-| Toolchain & Self-Hosting | 43 | 5.9% | 7 |
-| SSH | 26 | 3.6% | 15 |
+| Syscall / ABI Compatibility Audits | 130 | 17.5% | 19 |
+| Memory & Virtual Memory | 121 | 16.3% | 38 |
+| Scheduler & Process Management | 77 | 10.3% | 20 |
+| SMP & Locking | 88 | 11.8% | 39 |
+| Networking | 54 | 7.3% | 21 |
+| Userspace Apps & Libraries | 37 | 5.0% | 20 |
+| Rump Kernel & Syscall Proxy | 26 | 3.5% | 6 |
+| Toolchain & Self-Hosting | 43 | 5.8% | 7 |
+| SSH | 26 | 3.5% | 15 |
 | VFS & Filesystem | 25 | 3.4% | 16 |
-| Boot & Drivers | 24 | 3.3% | 9 |
-| Signals & Exceptions | 13 | 1.8% | 6 |
+| Boot & Drivers | 24 | 3.2% | 9 |
+| Signals & Exceptions | 13 | 1.7% | 6 |
 | Misc / Cross-cutting | 25 | 3.4% | 6 |
-| Console & Terminal | 22 | 3.0% | 9 |
-| Containers | 24 | 3.3% | 6 |
-| **Total** | **728** | **100.0%** | **235** |
+| Console & Terminal | 31 | 4.2% | 11 |
+| Containers | 24 | 3.2% | 6 |
+| **Total** | **744** | **100.0%** | **239** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -178,7 +178,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `clock_settime` (112), `adjtimex` (171) and `clock_adjtime` (266) were all unimplemented — Akuma could read the clock but never set it, so `date -s`, `rdate`, and `ntpd -q` all had no way to apply a correction; implemented in the new `crates/akuma-time` crate, with `adjtimex`/`clock_adjtime` applying `ADJ_OFFSET`/`ADJ_SETOFFSET` as an immediate step rather than a gradual PLL slew
 - On a platform with no RTC (Firecracker exposes no PL031 on aarch64), the guest booted at epoch 0 with no way to correct it, so every outbound TLS connection failed certificate-validity checks ("certificate is not yet valid") even though the CA bundle, DNS, and TCP were all fine; fixed with a boot-time SNTP client (`crates/akuma-time::{boot, sntp}`, wired via `src/ntp_boot.rs`) that runs whenever `utc_time_us()` comes up unset, deriving the wall-clock offset from uptime-relative round-trip timestamps (since the client's own clock has no absolute epoch yet to plug into the classic four-timestamp NTP formula) and applying it via `set_utc_time_us` before IRQs are unmasked
 
-## Memory & Virtual Memory (114 fixes, 36 docs)
+## Memory & Virtual Memory (121 fixes, 38 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -366,6 +366,17 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/FPCACHE_MOUNT_IDENTITY.md
 (Fixes finding F-1 of `EXT2_WRITEBACK_DESIGN.md` plus the keying half of D-9. D-9's capacity half is still open, and the doc's "a defect found and left alone" is by its own title not fixed here.)
 - The file page cache was keyed without any notion of *which* filesystem a page came from, so the same inode number on two different mounts shared one cache entry — a box and the host, or two mounts of different images, could read each other's file data; fixed by assigning each mount an identity at mount time and folding it into the key, with invalidation deliberately left identity-free
+
+### docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md
+- `mprotect(PROT_READ)`/`mprotect(PROT_NONE)` was not enforced across `fork` — the write-fault handler's CoW-break arm fired on `cow_ref > 0` alone and handed the writer a private writable copy regardless of protection; fixed by gating the CoW break on the region's recorded protection
+- `MmapRegion::owned()` defaulted `flags` to `NONE`, documented as "protection unrecorded", with no way to distinguish that from an explicit `PROT_NONE` once `flags` gained a denying reader — every region built without explicit flags was silently denied a write; fixed by `MmapRegion::prot_recorded`/`recorded_prot()`
+- `update_eager_region_flags` recorded a sub-range `mprotect` against the *whole* region, so `mprotect(PROT_NONE)` on one page also marked its neighbours' pages as denied; `mprotect` now splits eager regions (`akuma_mmap::mprotect_eager_regions_in_range`) so each piece's flags describe only that piece
+- `sys_mremap` turned an unknown source protection into an explicit `PROT_NONE` via `old_flags.unwrap_or(NONE)`, denying every `mremap` of a lazy or sub-range source — hit on every allocator `realloc`; fixed to fall back to `MmapRegion::owned()` (unrecorded) instead
+- `fork`'s region copy carried only the `flags` value and dropped whether it had ever been recorded, so a child of an unrecorded parent stated an explicit `NONE` and was denied writes its parent would have granted; fixed by carrying `prot_recorded` through the copy too
+
+### docs/archive/AKUMA_EXTRACT_MMAP.md
+- `madvise(addr, len, MADV_DONTNEED)`'s zero-range rounding guarded the first addition (`saturating_add`) but not the page-alignment rounding after it, so a `len` near `usize::MAX` wrapped `end` to 0 and produced a ~4.5e15 page count — an unbounded kernel loop inside an `MmBklGuard` window, reachable from unprivileged userspace since `len` was passed straight from a user register with no validation; fixed by validating the range against the user VA limit at the syscall boundary (`madvise::range_fits_user_va`) before any page-count arithmetic, plus saturating arithmetic as a second line of defense
+- `MAP_FIXED`'s kernel-VA overlap guard (`fixed_overlaps_kernel_va`) computed `pages * 4096` with no overflow protection, so a mapping length near `usize::MAX` wrapped the computed `map_end` back down to `addr` and the guard answered "no overlap" for a mapping spanning the kernel's own identity map; presented as a hang rather than a compromise, since `sys_mmap` then looped `for i in 0..pages { aspace.unmap_page(va) }` before it could corrupt anything; fixed by validating `len` at the syscall boundary (`mmap::len_too_large`) plus saturating arithmetic
 
 
 ## Scheduler & Process Management (77 fixes, 20 docs)
@@ -1193,7 +1204,7 @@ aren't recorded anywhere else.)
 - Readiness was decided by matching `"Started sshd"` in console text, which an unlocked UART tears across herd's separate `print()` calls (`[herd] Started ` + another core's `[syscall] bind(...)` + `sshd (pid= 2)`) — 4 of 7 SMP=4 boots, 0 of 7 at SMP=2; replaced with an SSH-banner probe, since a bare `connect()` is not readiness either (QEMU's user-mode hostfwd accepts before the guest listens)
 
 
-## Console & Terminal (22 fixes, 9 docs)
+## Console & Terminal (31 fixes, 11 docs)
 
 ### docs/archive/VEC_AUDIT.md
 - `crates/akuma-terminal`'s canonical-mode `canon_buffer` grew one byte per keystroke with no cap and was drained only by a line terminator, so a peer writing to a tty in canonical mode and never sending `\n` grew kernel heap without limit. Capped at `MAX_CANON = 4095` (Linux N_TTY's own ceiling), dropping — and deliberately not echoing — input beyond it, while the `\n`/VEOF paths stay uncapped so a full line can always still be terminated
@@ -1235,6 +1246,19 @@ aren't recorded anywhere else.)
 - The same regression left `sys_ioctl`'s terminal-ioctl gate as a bare `fd > 2` cutoff, which unconditionally rejected the newly-introduced `/dev/tty` fd (never 0/1/2) for every terminal ioctl — breaking `crossterm`'s raw-mode setup (`tcgetattr`/`tcsetattr` issued directly on an opened `/dev/tty` fd) with a `reader source not set` panic in Helix; fixed by the same fd-table type match above rather than a numeric cutoff
 - The `/dev/tty` work also dropped the `FIONREAD` arm for `Stdin`, so `ioctl(FIONREAD)` on stdin or `/dev/tty` always reported zero buffered bytes regardless of actual pending input; restored, and extended to cover `DevTty` for the same reason as the ioctl gate
 - Round 4: `box run` handed the box's process the *caller's* `TerminalState` instead of one scoped to the box, so terminal mode changes made inside a box leaked across the box boundary onto the caller's terminal
+
+### docs/archive/CONSOLE_LOG_COST.md
+- The `syscall/mod.rs` epilogue's `[EFAULT]` diagnostic cost ~250 µs per call (~2,400 ns/byte of console output, one `write_volatile` VM exit per byte with no buffering) on every EFAULT-returning syscall — 99.94% of the syscall's own cost and userspace-drivable by looping a bad-address call, degrading the whole VM since console writes serialise across cores; fixed by turning it off (`SYSCALL_ERRNO_DIAG_ENABLED = false`), 249,806 ns → 150 ns
+- The errno-diag gate had narrowed to `result == EFAULT` only — a workaround for an `EINVAL` flood from `readlinkat` probes during cargo builds — silently making its `ENOSYS`/`EINVAL` arms and the whole `mmap`-`EINVAL` decode its own comment called load-bearing unreachable dead code; fixed by widening the gate to `EFAULT || ENOSYS || EINVAL` so the code handles what it claims to
+- `madvise_dontneed_range`'s first pass took `lazy_region_lookup_for_pid` — a process-table walk, IRQ mask and `lazy_regions.lock()` — once **per page** of a `MADV_DONTNEED` range, to consult a map that never changed; fixed by taking the lock once for the whole range (30.1× → 4.8× median vs `getpid`, loaded host)
+
+### docs/archive/SYSCALL_TRACE_AUDIT.md
+- `akuma-syscalls-time`'s `[clock-diag]` performed two user-memory reads plus a ~130-byte two-line `log::warn!` on every `clock_gettime(clock_id > 0x1000_0000)` call from userspace — the worst single instance found, since it also read user memory before printing; gated behind the `akuma-syscalls-time/debug-info` feature, off by default
+- 25 previously-ungated print sites across `src/syscall/` (`aio.rs`, `msgqueue.rs`, `mem.rs`, `fs.rs`, `timerfd.rs`, `pidfd.rs`, `proc.rs`, `net.rs`, `pipe.rs`, `mod.rs`), each reachable in an unprivileged userspace loop, gated behind existing subsystem flags (`SYSCALL_DEBUG_INFO_ENABLED`, `MEM_SYSCALL_TRACE_ENABLED`, `SYSCALL_DEBUG_NET_ENABLED`, `PIPE_TRACE_ENABLED`) with no new knobs added
+- `akuma-exec`'s per-thread-recycle trace ran unconditionally on every thread recycle, which a `-j4` build triggers constantly; gated behind `lifecycle_trace_on()`, folded to `cfg!(feature = "debug-info") && config().syscall_debug_info_enabled` so the compile-time half is checked first and the whole call site can fold away (measured −4,460 bytes `.text` / −1,688 bytes `.rodata` on `release`)
+- Three `syscall/aio.rs` stubs (`io_submit`/`io_cancel`/`io_getevents`) computed an IRQ-masked `AIO_CONTEXTS.lock().contains_key(&ctx)` probe on every call, outside their debug gate, purely to choose which string to print, even though all three unconditionally return 0; moved inside the gate, so the stubs are now bare `return 0`
+- The generic `[SC]` prologue trace formatted `args[0..3]` for every syscall number not on a hand-maintained "noise" list, but the list was never updated when new argument-less `FastPath::Leaf` syscalls (`AKUMA_GET_VERSION`, the uid/gid additions) were added, so it would have printed stale register contents for exactly the calls the entry-vector change stops restoring `x0`–`x5` for; fixed by deriving `debug_io_suppressed` from `takes_no_args(nr) || <noise list>` so the predicate can't drift from the contract again
+- `scripts/mem_suite.py`'s no-silent-pass guard treated a dropped ssh round-trip identically to a dead probe and failed the whole suite on a `SILENT (rc=0)` result that reran clean by hand; fixed by retrying once, and only on `SILENT` — a `FAIL` line or bad exit code is never retried
 
 
 ## Containers (24 fixes, 6 docs)

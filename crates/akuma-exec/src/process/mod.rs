@@ -2932,8 +2932,17 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 // Carry the parent's recorded protection: the child's copy of an
                 // eagerly-forked region is the same mapping, and losing `flags` here
                 // would cost the child the fault handler's eager-region repair path.
-                child_mmap_regions.push(
-                    MmapRegion::owned_with_flags(*va_start, child_frames, region.flags));
+                //
+                // Carry *whether it was recorded* too, not just the value. Using
+                // `owned_with_flags` unconditionally turns a parent that never
+                // stated a protection into a child that states `NONE`, and the
+                // write-fault handler then refuses the child's legitimate CoW
+                // breaks — the same shape as the `mremap` bug this pattern caused
+                // (`MmapRegion::prot_recorded`).
+                let mut child_region = MmapRegion::owned_with_flags(
+                    *va_start, child_frames, region.flags);
+                child_region.prot_recorded = region.prot_recorded;
+                child_mmap_regions.push(child_region);
             } else {
                 if config().syscall_debug_info_enabled {
                     log::debug!("[fork] OOM copying mmap region 0x{:x}, skipping rest", va_start);

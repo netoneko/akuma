@@ -113,40 +113,41 @@ counterpart.
 
 Reproduce the Linux side with `userspace/memprobe/c/build.sh --push-lima fc`.
 
-**A `mprotect` bug this gate found — partially fixed, and the limit is the
-interesting part (2026-08-29).** A child writing to a page its parent had
-`mprotect(PROT_READ)`-ed did not `SIGSEGV`: the EL0 write-fault handler's
-CoW-break arm fired on `cow_ref > 0` alone and handed the writer a private
-*writable* copy. A CoW-demoted page and an `mprotect`-downgraded page are both
-read-only in the PTE; `MmapRegion::flags` / `LazyRegion::flags` exist to
-disambiguate them, and the CoW arm never consulted either.
+**A `mprotect` bug this gate found — fixed 2026-08-29, and the fix is four
+changes because the bug was four writers.** A child writing to a page its parent
+had `mprotect(PROT_READ)`-ed did not `SIGSEGV`: the EL0 write-fault handler's
+CoW-break arm fires on `cow_ref > 0` alone and hands the writer a private
+*writable* copy. A CoW-demoted page and an `mprotect`-demoted page are both
+read-only in the PTE; the region's recorded protection is what distinguishes them,
+and the CoW arm never consulted it.
 
-The repair paths are now gated on the recorded protection (`user_flags::is_write`),
-**but only for LAZY regions.** Eager regions are deliberately excluded, and the
-reason is a real constraint rather than an oversight:
+Gating the CoW break on that record is correct in principle and broke `rustc`
+three times in a row in practice, because **`MmapRegion::flags` had only ever been
+read to GRANT a write, and every writer was sloppy in a way that is invisible to a
+granting reader and fatal to a denying one**:
 
-> `update_eager_region_flags` records a sub-range `mprotect` against the **whole**
-> region. Its own comment says that widening is safe *"because the fault handler
-> only ever uses these flags to grant a write"* — true for granting, false for
-> refusing. A guard page `mprotect(PROT_NONE)`-ed inside a larger eager mapping
-> records `NONE` for every page of it, so a deny gate refuses the legitimate CoW
-> break on all the others.
+| writer | wrote | denied |
+|---|---|---|
+| `MmapRegion::owned()` | `NONE` meaning "unrecorded" | every region built without explicit flags |
+| `update_eager_region_flags` | a sub-range `mprotect` against the **whole** region | a guard page's neighbours |
+| `sys_mremap` | `old_flags.unwrap_or(NONE)` | every `mremap` of a lazy or sub-range source — i.e. every `realloc` |
+| `fork`'s region copy | the value without "was it recorded" | a child of an unrecorded parent |
 
-That is not theoretical: gating on eager flags killed `rustc` in a devbox
-self-host build — three `[MPROTECT-DENY]` addresses, three `SIGSEGV`s at exactly
-those addresses, `thiserror-impl` and `zerocopy-derive` dead. Lazy regions split
-per-range on `mprotect` and are precise, so they keep the gate.
+All four are fixed: `MmapRegion::prot_recorded` / `recorded_prot()` separate a
+statement from a default; `mprotect` now **splits** the region
+(`akuma_mmap::mprotect_eager_regions_in_range`) so a piece's flags describe that
+piece alone; `mremap` produces `MmapRegion::owned()` for an unknown source; and
+`fork` carries `prot_recorded`. Removing any one brings the crash back.
 
-**Consequence, stated plainly:** `mprotect` on an *eager* region is still not
-enforced across a fork, and `eager_mprotect_probe` fails — as it did before any of
-this. Enforcing it requires eager regions to split like lazy ones do; recording
-protection at page granularity is the prerequisite, not the gate.
+The bug class, the three failed fixes, and the two structural tells that a record
+is grant-only are written up in
+[`archive/GRANT_RECORDS_VS_DENY_RECORDS.md`](../../../archive/GRANT_RECORDS_VS_DENY_RECORDS.md).
+Read it before adding a reader to any permission record.
 
-Two supporting pieces landed and are worth keeping even though the eager case is
-unfixed: `akuma_mmap::user_flags::is_write` (the missing predicate, host-tested
-against `from_prot` across the whole table) and `MmapRegion::recorded_prot()`,
-which separates "protection unrecorded" from "explicitly `PROT_NONE`" — the same
-`NONE` value meant both, which is its own latent trap.
+Verified: `eager_mprotect_probe` both phases, and an in-VM `cargo build --release`
+of Akuma in devbox-smoltcp — the reproducer that killed `thiserror-impl` and
+`zerocopy-derive` on every run — now finishes in 1m 39s with **0 SIGSEGV and 0
+`[MPROTECT-DENY]`**.
 
 Probe: `userspace/forktest/c_stress/eager_mprotect_probe`.
 

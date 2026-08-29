@@ -82,7 +82,15 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   changed when it moved. `is_write` is what tells an `mprotect(PROT_READ)` page
   from a CoW-demoted one — both are read-only in the PTE, and the EL0 write-fault
   handler used to break CoW on either, silently defeating `mprotect` across a
-  fork (`docs/archive/AKUMA_EXTRACT_MMAP.md` §10.4).
+  fork. It also owns `mprotect_eager_regions_in_range`, which **splits** a region
+  rather than recording a sub-range `mprotect` against the whole of it, and
+  `MmapRegion::prot_recorded`, which separates "this region states a protection"
+  from the unrecorded `NONE` default. Those three exist together for one reason:
+  `flags` had only ever been read to GRANT a write, so every writer was allowed to
+  under-state, and reading it to DENY one turned each of those into a false
+  refusal that killed `rustc` mid-build. **Before reading any permission record to
+  refuse something, enumerate every writer** —
+  `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`.
   `akuma-kacho` is the shared observe/decide/hysteresis layer every self-tuning
   policy uses (timer-tick demotion, file-page cache cap, netpoll wake rate).
   `akuma-net-yarn` is the readiness wait loop as a pure state machine, driven by

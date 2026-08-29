@@ -1326,40 +1326,24 @@ pub fn eager_regions_containing(pid: Pid, va: usize) -> alloc::vec::Vec<(usize, 
 pub fn update_eager_region_flags(pid: Pid, range_start: usize, range_size: usize, new_flags: u64) {
     let Some(proc) = lookup_process_shared(pid) else { return };
     let range_end = range_start.saturating_add(range_size);
-    // Widening an **upgrade** is the case the doc comment above does not cover, and
-    // it is not safe: it records "writable" for pages outside the `mprotect` range,
-    // which is precisely the input the fault handler uses to grant a write. Report
-    // each occurrence (with the region it lies about) so the `[EAGER-UPGRADE]`
-    // repairs seen during a self-host build can be attributed to it or ruled out.
-    // See docs/archive/CARGO_HEAP_NULL_RC.md.
-    let grants_write = new_flags & crate::mmu::flags::AP_MASK == crate::mmu::flags::AP_RW_ALL;
-    let mut widened: Option<(usize, usize, u64)> = None;
-    proc.vm_with_regions(|r| {
-        for reg in r.iter_mut() {
-            let reg_end = reg.start_va + reg.len_bytes();
-            if reg.start_va < range_end && reg_end > range_start {
-                let fully_covered = range_start <= reg.start_va && range_end >= reg_end;
-                if grants_write && !fully_covered && widened.is_none() {
-                    widened = Some((reg.start_va, reg.len_bytes(), reg.flags));
-                }
-                reg.flags = new_flags;
-                // `mprotect` IS a statement about protection, whatever the value.
-                // Without this an `mprotect(PROT_NONE)` would keep looking
-                // unrecorded and the deny gate could not tell it from a region
-                // that simply never said anything. See `MmapRegion::prot_recorded`.
-                reg.prot_recorded = true;
-            }
-        }
+    // SPLITS now, rather than recording the new protection against the whole
+    // overlapping region. The old widening was justified as safe "because the
+    // fault handler only ever uses these flags to grant a write" — true for
+    // granting, false for refusing, and the day the write-fault handler started
+    // refusing on this record a guard page `mprotect(PROT_NONE)`-ed inside a
+    // larger mapping marked every page of it and killed `rustc` mid-build.
+    //
+    // The algebra is `akuma_mmap::mprotect_eager_regions_in_range`, host-tested
+    // against every shape (head/middle/tail, fully covered, multi-region,
+    // CoW-inherited, and that neighbours keep whatever the original region said).
+    // Splitting frames in step is the same walk `detach_eager_regions_in_range`
+    // has always done — the old "we cannot split `frames`" objection was never
+    // true. See docs/reference/subsystems/syscalls/mem.md.
+    let touched = proc.vm_with_regions(|r| {
+        akuma_mmap::mprotect_eager_regions_in_range(r, range_start, range_end, new_flags)
     });
-    if let Some((reg_start, reg_len, old_flags)) = widened {
-        EAGER_FLAG_WIDENED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let mut w = akuma_primitives::console::StackWriter::<224>::new();
-        let _ = core::fmt::Write::write_fmt(&mut w, format_args!(
-            "[MPROT-WIDEN] pid={} region=[{:#x}+{:#x}) mprotect=[{:#x}+{:#x}) old={:#x} new={:#x} \
-             — {} pages outside the call are now recorded writable\n",
-            pid, reg_start, reg_len, range_start, range_size, old_flags, new_flags,
-            (reg_len.saturating_sub(range_size)) / 4096));
-        w.flush();
+    if touched > 0 {
+        EAGER_FLAG_WIDENED.fetch_add(0, core::sync::atomic::Ordering::Relaxed);
     }
 }
 

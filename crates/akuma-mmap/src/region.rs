@@ -195,6 +195,102 @@ pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> allo
         .collect()
 }
 
+/// Apply `new_flags` to exactly `[range_start, range_end)`, **splitting** any
+/// region the range only partly covers.
+///
+/// # Why this exists
+///
+/// `mprotect` used to record its new protection against the *whole* overlapping
+/// region, and the comment justifying that said the widening was safe "because
+/// the fault handler only ever uses these flags to grant a write". That is true
+/// for granting and false for refusing — and the moment the EL0 write-fault
+/// handler started using the record to *refuse* a CoW break, a guard page
+/// `mprotect(PROT_NONE)`-ed inside a larger mapping recorded `NONE` for every page
+/// of it and killed `rustc` mid-build (three `[MPROTECT-DENY]` addresses, three
+/// `SIGSEGV`s at exactly those addresses).
+///
+/// The old objection to splitting was that "`MmapRegion` keys its frame list to
+/// `start_va`, and splitting one would have to split `frames` in step".
+/// [`detach_eager_regions_in_range`] has done exactly that all along; this is the
+/// same walk, keeping every piece instead of handing the middle back.
+///
+/// Every surviving piece — including the untouched head and tail — is a real
+/// region with its own frames, so the record is now page-accurate and a *deny*
+/// decision can be built on it.
+///
+/// Returns the number of regions the range touched, for the caller's counter.
+pub fn mprotect_eager_regions_in_range(
+    regions: &mut alloc::vec::Vec<MmapRegion>,
+    range_start: usize,
+    range_end: usize,
+    new_flags: u64,
+) -> usize {
+    if range_end <= range_start {
+        return 0;
+    }
+    // Single pass into a fresh vector. The in-place `remove`/`push` shape that
+    // `detach_eager_regions_in_range` uses cannot be borrowed here: the middle
+    // piece it pushes is *fully covered* by the range, so the loop re-examines it,
+    // takes the fast path and counts it a second time. Draining sidesteps that
+    // entirely — every input region is considered exactly once.
+    let mut touched = 0usize;
+    let mut out: alloc::vec::Vec<MmapRegion> = alloc::vec::Vec::with_capacity(regions.len() + 2);
+    for mut reg in regions.drain(..) {
+        let reg_start = reg.start_va;
+        let reg_end = reg_start + reg.pages * crate::PAGE_SIZE;
+        if reg_start >= range_end || reg_end <= range_start {
+            out.push(reg);
+            continue;
+        }
+        let clip_start = range_start.max(reg_start);
+        let clip_end = range_end.min(reg_end);
+        let head_pages = (clip_start - reg_start) / crate::PAGE_SIZE;
+        let mid_pages = (clip_end - clip_start) / crate::PAGE_SIZE;
+        let tail_pages = (reg_end - clip_end) / crate::PAGE_SIZE;
+
+        // Fully covered: no split, and the common "mprotect a whole mapping" case
+        // does not churn the vector.
+        if head_pages == 0 && tail_pages == 0 {
+            reg.flags = new_flags;
+            reg.prot_recorded = true;
+            touched += 1;
+            out.push(reg);
+            continue;
+        }
+
+        let old_flags = reg.flags;
+        let shared_anon = reg.shared_anon;
+        let was_recorded = reg.prot_recorded;
+        // `filter_map(next)` tolerates a CoW-inherited region (`frames` empty):
+        // each piece then carries its page count and no frames, which is right.
+        let mut it = reg.frames.into_iter();
+        let head: alloc::vec::Vec<PhysFrame> = (0..head_pages).filter_map(|_| it.next()).collect();
+        let mid: alloc::vec::Vec<PhysFrame> = (0..mid_pages).filter_map(|_| it.next()).collect();
+        let tail: alloc::vec::Vec<PhysFrame> = it.collect();
+
+        // Head and tail keep what the ORIGINAL region said — including whether it
+        // said anything at all. Only the middle was named by this `mprotect`.
+        if head_pages > 0 {
+            out.push(MmapRegion {
+                start_va: reg_start, pages: head_pages, frames: head,
+                flags: old_flags, shared_anon, prot_recorded: was_recorded });
+        }
+        if mid_pages > 0 {
+            out.push(MmapRegion {
+                start_va: clip_start, pages: mid_pages, frames: mid,
+                flags: new_flags, shared_anon, prot_recorded: true });
+            touched += 1;
+        }
+        if tail_pages > 0 {
+            out.push(MmapRegion {
+                start_va: clip_end, pages: tail_pages, frames: tail,
+                flags: old_flags, shared_anon, prot_recorded: was_recorded });
+        }
+    }
+    *regions = out;
+    touched
+}
+
 /// Detach every eager region overlapping `[range_start, range_end)`.
 ///
 /// Partial regions are clipped at both ends, and one `(base_va, pages, owned_frames)`
@@ -459,6 +555,119 @@ mod mmap_region_inheritance_tests {
             assert_eq!(r.len(), 2, "middle detach leaves a head and a tail");
             for survivor in &r {
                 assert_eq!(survivor.recorded_prot().is_some(), recorded, "{want:?}");
+            }
+        }
+    }
+
+    // ── `mprotect_eager_regions_in_range` — the split that makes the record
+    // page-accurate. Every shape is pinned: this function's imprecision is what
+    // killed `rustc`, so "it works on the whole-region case" is not enough.
+
+    /// The whole-region case takes the fast path: flags updated, no split.
+    #[test]
+    fn mprotect_fully_covered_region_is_not_split() {
+        let mut r = alloc::vec![MmapRegion::owned_with_flags(0x1000_0000, frames(4), user_flags::RW)];
+        let n = mprotect_eager_regions_in_range(&mut r, 0x1000_0000, 0x1000_4000, user_flags::RO);
+        assert_eq!(n, 1);
+        assert_eq!(r.len(), 1, "no split needed");
+        assert_eq!(r[0].recorded_prot(), Some(user_flags::RO));
+        assert_eq!(r[0].pages, 4);
+    }
+
+    /// **The regression shape.** A guard page in the middle must leave the pages
+    /// around it untouched — this is precisely what the old whole-region widening
+    /// got wrong, and what refused `rustc`'s legitimate writes.
+    #[test]
+    fn mprotect_middle_page_leaves_its_neighbours_writable() {
+        let mut r = alloc::vec![MmapRegion::owned_with_flags(0x1000_0000, frames(8), user_flags::RW)];
+        let n = mprotect_eager_regions_in_range(&mut r, 0x1000_3000, 0x1000_4000, user_flags::NONE);
+        assert_eq!(n, 1);
+        assert_eq!(r.len(), 3, "head + guard + tail");
+        assert_eq!(total_pages(&r), 8, "no page invented or lost");
+        let guard = r.iter().find(|x| x.start_va == 0x1000_3000).expect("guard piece");
+        assert_eq!(guard.pages, 1);
+        assert_eq!(guard.recorded_prot(), Some(user_flags::NONE));
+        for other in r.iter().filter(|x| x.start_va != 0x1000_3000) {
+            assert_eq!(
+                other.recorded_prot(),
+                Some(user_flags::RW),
+                "a neighbour of the guard page must stay writable — the rustc bug"
+            );
+        }
+    }
+
+    /// Frames follow their pages across the split, or a survivor points at the
+    /// wrong physical memory.
+    #[test]
+    fn mprotect_split_moves_frames_in_step_with_pages() {
+        let mut r = alloc::vec![MmapRegion::owned_with_flags(0x1000_0000, frames(6), user_flags::RW)];
+        mprotect_eager_regions_in_range(&mut r, 0x1000_2000, 0x1000_4000, user_flags::RO);
+        for piece in &r {
+            assert_eq!(piece.frames.len(), piece.pages, "frame count must track extent");
+            for i in 0..piece.pages {
+                let va = piece.start_va + i * 4096;
+                let want = 0x4000_0000 + (va - 0x1000_0000);
+                assert_eq!(piece.frame_for(va).map(|f| f.addr), Some(want), "va {va:#x}");
+            }
+        }
+    }
+
+    /// A prefix and a suffix `mprotect` each split into exactly two.
+    #[test]
+    fn mprotect_prefix_and_suffix_split_into_two() {
+        for (start, end, marked_at) in
+            [(0x1000_0000usize, 0x1000_2000usize, 0x1000_0000usize),
+             (0x1000_4000, 0x1000_6000, 0x1000_4000)]
+        {
+            let mut r = alloc::vec![MmapRegion::owned_with_flags(0x1000_0000, frames(6), user_flags::RW)];
+            mprotect_eager_regions_in_range(&mut r, start, end, user_flags::RO);
+            assert_eq!(r.len(), 2);
+            assert_eq!(total_pages(&r), 6);
+            let marked = r.iter().find(|x| x.start_va == marked_at).unwrap();
+            assert_eq!(marked.recorded_prot(), Some(user_flags::RO));
+        }
+    }
+
+    /// A CoW-inherited region owns no frames but has every page mapped; splitting
+    /// it must produce pieces with correct extents and no frames.
+    #[test]
+    fn mprotect_splits_a_cow_inherited_region_by_pages() {
+        let mut r = alloc::vec![MmapRegion::inherited_with_flags(0x2000_0000, 4, user_flags::RW)];
+        mprotect_eager_regions_in_range(&mut r, 0x2000_1000, 0x2000_2000, user_flags::RO);
+        assert_eq!(total_pages(&r), 4);
+        for piece in &r {
+            assert!(piece.frames.is_empty(), "inherited pieces own no frames");
+        }
+    }
+
+    /// A range covering several regions marks each of them, and an empty or
+    /// non-overlapping range does nothing and terminates.
+    #[test]
+    fn mprotect_spans_regions_and_ignores_empty_ranges() {
+        let mut r = alloc::vec![
+            MmapRegion::owned_with_flags(0x1000_0000, frames(2), user_flags::RW),
+            MmapRegion::owned_with_flags(0x1000_2000, frames(2), user_flags::RW),
+        ];
+        assert_eq!(mprotect_eager_regions_in_range(&mut r, 0x1000_0000, 0x1000_4000, user_flags::RO), 2);
+        assert!(r.iter().all(|x| x.recorded_prot() == Some(user_flags::RO)));
+        assert_eq!(mprotect_eager_regions_in_range(&mut r, 0x9000_0000, 0x9000_1000, user_flags::RW), 0);
+        assert_eq!(mprotect_eager_regions_in_range(&mut r, 0x1000_0000, 0x1000_0000, user_flags::RW), 0);
+        assert_eq!(total_pages(&r), 4);
+    }
+
+    /// Head and tail keep whether the ORIGINAL region had recorded anything —
+    /// an `mprotect` names the middle, and says nothing about the rest.
+    #[test]
+    fn mprotect_split_preserves_the_neighbours_recorded_state() {
+        let mut r = alloc::vec![MmapRegion::owned(0x1000_0000, frames(4))];
+        assert_eq!(r[0].recorded_prot(), None);
+        mprotect_eager_regions_in_range(&mut r, 0x1000_1000, 0x1000_2000, user_flags::RO);
+        assert_eq!(r.len(), 3);
+        for piece in &r {
+            if piece.start_va == 0x1000_1000 {
+                assert_eq!(piece.recorded_prot(), Some(user_flags::RO));
+            } else {
+                assert_eq!(piece.recorded_prot(), None, "neighbours were never named");
             }
         }
     }

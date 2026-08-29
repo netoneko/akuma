@@ -661,22 +661,42 @@ precisely what `MmapRegion::flags` was added to disambiguate — and the CoW arm
 never consulted it. It also runs *before* the eager-region gate, whose
 `AP_RW_ALL` check was therefore never reached on a forked child.
 
-Fixed by gating all three repair paths on the recorded protection:
+Gating the repair paths on that record is right in principle and **broke `rustc`
+three times** in practice, because `MmapRegion::flags` had only ever been read to
+*grant* a write, and every writer of it was sloppy in a way a granting reader
+cannot see:
 
-- New `akuma_mmap::user_flags::is_write` — the predicate that was missing, with
-  host tests pairing it against `from_prot` across the whole table.
-- New `recorded_protection` / `write_allowed_by_record` in `exceptions.rs`.
-  **`None` means "no record", not "not writable"** — an ELF `.data`/`.bss` page has
-  no region at all, and a lazy region that recorded nothing carries `flags == 0`;
-  both must keep the historical path or `cowstale` breaks.
-- The CoW break now declines when a record says the mapping is not writable.
-- The lazy-upgrade arm's gate was `!is_none(region_flags)`, which admits
-  `PROT_READ` — the same hole on lazy regions. Now `is_write`, and it installs
-  the region's *recorded* flags instead of a hardcoded `RW_NO_EXEC`.
+| writer | wrote | denied |
+|---|---|---|
+| `MmapRegion::owned()` | `NONE` meaning "unrecorded" | every region built without explicit flags |
+| `update_eager_region_flags` | a sub-range `mprotect` against the **whole** region | a guard page's neighbours |
+| `sys_mremap` | `old_flags.unwrap_or(NONE)` | every `mremap` of a lazy or sub-range source — every `realloc` |
+| `fork`'s region copy | the value without "was it recorded" | a child of an unrecorded parent |
 
-Verified: probe PASSes; boot suite 0 FAILED / 0 POISON; the new `[MPROTECT-DENY]`
-trace fired 6 times, all at the probe's own addresses in phase pairs — the
-intended SIGSEGVs, no false positives.
+All four are fixed, and removing any one brings the crash back:
+
+- `akuma_mmap::user_flags::is_write` — the missing predicate, host-tested against
+  `from_prot` across the whole table.
+- `MmapRegion::prot_recorded` / `recorded_prot()` — a statement, distinguished from
+  a default.
+- `akuma_mmap::mprotect_eager_regions_in_range` — `mprotect` **splits** the region,
+  so a piece's flags describe that piece alone. (The old "we cannot split `frames`"
+  objection was never true: `detach_eager_regions_in_range` had always done it.)
+- `sys_mremap` produces `MmapRegion::owned()` for an unknown source; `fork` carries
+  `prot_recorded`.
+
+**`None` still means "no record", not "not writable"** — an ELF `.data`/`.bss` page
+has no region at all, and treating absence as denial breaks `cowstale`.
+
+Verified: `eager_mprotect_probe` both phases, and the reproducer that caught every
+earlier attempt — an in-VM `cargo build --release` of Akuma in devbox-smoltcp,
+which killed `thiserror-impl` and `zerocopy-derive` on every run — now finishes in
+1m 39s with **0 SIGSEGV and 0 `[MPROTECT-DENY]`**.
+
+The bug class, the three failed fixes, and the two structural tells that a record
+is grant-only are in
+[`GRANT_RECORDS_VS_DENY_RECORDS.md`](GRANT_RECORDS_VS_DENY_RECORDS.md). Read it
+before adding a reader to any permission record.
 
 `cowstale` remains red and is **not** this change's doing: it fails on `main`
 (2 of 4 runs SEGV), it is load-driven, and `[MPROTECT-DENY]` fired **zero** times

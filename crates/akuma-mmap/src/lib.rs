@@ -66,5 +66,8 @@ mod region;
 mod types;
 
 pub use frame::PhysFrame;
-pub use region::{MmapRegion, detach_eager_regions_in_range, inherit_mmap_regions_for_cow_child};
+pub use region::{
+    MmapRegion, detach_eager_regions_in_range, inherit_mmap_regions_for_cow_child,
+    mprotect_eager_regions_in_range,
+};
 pub use types::{PAGE_SHIFT, PAGE_SIZE, flags, user_flags};

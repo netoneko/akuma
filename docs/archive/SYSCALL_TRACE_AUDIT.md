@@ -299,9 +299,11 @@ checkpoint, before any of the print or lock work.
 
 | platform | result |
 |---|---|
-| QEMU, `SMP=4` (3 boots) | **315 / 316 / 316 PASSED, 0 FAILED** |
+| QEMU, `SMP=4` (6 boots across two rounds) | **313–316 PASSED, 0 FAILED** every boot |
 | Firecracker under Lima (KVM, nested virt) | **307 PASSED, 0 FAILED, 0 POISON** |
-| `scripts/mem_suite.py` | **10/10 probes, 3 DIVERGE** |
+| `scripts/mem_suite.py` | **10/10 probes, 3 DIVERGE** (one run in six showed 9/10 — `cowstale`, the known flake) |
+| in-VM `cargo build --release` of Akuma, devbox-smoltcp | **completes, 0 SIGSEGV** |
+| clean builds after `cargo clean` (×2 rounds, 4 targets each) | all OK — release 14s, extreme-size 16s, devbox-smoltcp 5s, firecracker 8s |
 | `test_mmap_madvise_hostile_length_is_refused` | PASS on both platforms |
 | `[EFAULT]` / `[FORK-DBG]` / `[TRAMP]` / `[Cleanup] Thread` lines in a boot | **0** |
 | `akuma-fc.bin` | 3,426,536 → **3,414,248** bytes (−12,288) |
