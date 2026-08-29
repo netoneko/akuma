@@ -1996,8 +1996,16 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // NOW set to FREE - cleanup is complete, spawn can safely claim this slot
             THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
             
-            // Safe print without heap allocation
-            safe_print!(128, "[Cleanup] Thread {} recycled after {}us cooldown\n", i, cooldown);
+            // Gated as a LIFECYCLE trace (2026-08-29). This fires once per thread
+            // recycle, and a thread-heavy workload — an in-VM `-j4` build, say —
+            // recycles constantly, so it was ~70 bytes of console per recycle at
+            // ~2.4 us/byte (docs/archive/CONSOLE_LOG_COST.md). Exactly the class
+            // `syscall_debug_info_enabled` already covers: its own doc records
+            // the `[FORK-DBG]`/`[TRAMP]` traces costing ~20 serial lines per
+            // `fork()` for the same reason. A recycle is a lifecycle event.
+            if crate::process::lifecycle_trace_on() {
+                safe_print!(128, "[Cleanup] Thread {} recycled after {}us cooldown\n", i, cooldown);
+            }
             
             count += 1;
         }

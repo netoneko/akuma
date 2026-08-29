@@ -233,7 +233,98 @@ one barely moved. On an idle host the same arm measured 13.1× before the fix.
 Correctness unchanged: `scripts/mem_suite.py` 10/10, boot suite 315 PASSED / 0
 failures.
 
-## 10. How to re-measure
+## 10. Applying it: marking syscalls for bypass
+
+Removing work from a syscall is only half the point. `akuma_syscalls::FastPath`
+already has a `Leaf` tier that skips the identity read, the two `Process` syscall
+stamps, the epilogue re-resolve, the stats row, the `/proc/<pid>/syscalls` entry
+and the clock read entirely — it just had **two members**, `uptime` and
+`akuma_get_version`, because criterion 2 ("touches no `Process`, no process
+table, no fd table, no address space") is genuinely rare.
+
+Scanning every `sys_*` arm for a constant return with no argument use found four
+more that qualify unconditionally: **`getuid`, `geteuid`, `getgid`, `getegid`**.
+Three are literally `nr::GETUID => 0` in `handle_syscall`'s match; `geteuid`
+calls a function whose entire body is `0`. There is no user model in this kernel,
+so none of them consults a `Process`. They were already in `takes_no_args`; only
+`needs_identity` was holding them back.
+
+`getpid`, `gettid` and `getppid` deliberately stay `Full` — they read
+`read_current_pid()`, the thread id and the process table respectively. All three
+*are* identity.
+
+**`shutdown` is the trap worth recording.** A scan for constant-return arms
+flags it, because `sys_shutdown` has a `#[cfg(not(feature = "smoltcp"))]`
+variant whose body is `0`. The shipping (smoltcp) build resolves an fd and calls
+`socket_shutdown`. Classifying it `Leaf` on the strength of the stub would have
+been wrong in every profile anyone runs. Check the arm you actually ship.
+
+### 10.1 What the bypass buys
+
+`mem_op_cost` gained a `getuid_leaf` arm next to `getpid`, and the pair is now a
+permanent instrument rather than a one-off: both take no arguments and return one
+integer, so **the gap between them is the prologue+epilogue cost**.
+
+| arm | tier | ns (idle host, 3 runs) |
+|---|---|---|
+| `getpid` | `Full` | 152 / 134 / 134 — median **134** |
+| `getuid_leaf` | `Leaf` | 110 / 100 / 98 — median **100** |
+
+**~34 ns, ~25% of the call.** On four of the syscalls a libc startup calls most.
+
+### 10.2 The conditional case, and why it was left alone
+
+The `aio` stubs (§8.1) are constant-return *once the debug lookup is inside the
+gate* — but only then. With `SYSCALL_DEBUG_INFO_ENABLED` on, `io_submit` reads
+`ctx` and `_nr` to format its line, which violates criterion 1.
+
+A config-dependent tier would work: `HookConfig` already carries the flags into
+the crate, so `fast_path` could take `&cfg` and admit a "leaf when untraced" set.
+**Not built.** Criterion 1 exists to unlock an entry-vector change that skips
+restoring `x0`–`x5` for argument-less calls
+(`AKUMA_SYSCALL_PERFORMANCE_AUDIT.md` § "Other untested surface"), and a tier
+whose membership depends on a debug flag would make that assembly change unsafe
+to reason about — the classification has to hold in every build, not the common
+one. Recorded here so the option is not re-derived; the four unconditional
+additions above were the available win.
+
+## 11. The same audit inside `crates/`
+
+`src/syscall/` was not the whole surface. Every print under `crates/*/src/` was
+classified the same way: **166 sites, 66 with no gate of any kind.**
+
+The result is much better than the raw number suggests, and the reason is worth
+stating: **almost every ungated print in `crates/` is an anomaly report** —
+`[RUN-REFUSED]`, `[REVIVE]`, `[KTG-STALE]`, `[PROC-ORPHAN]`,
+`[TTBR SAVE-MISMATCH]`, `[BKL] stuck`, `[SGI-S FATAL]`, the stale-tid warnings
+in `signal.rs` and `table.rs`. Those fire when an invariant has already been
+violated, they are what the `docs/archive/` investigations were solved with, and
+gating them would be a straight loss. They stay.
+
+Two patterns already in the tree are the ones to copy:
+
+- `[SGI-DBG]` on the scheduler-IPI path is behind a `SGI_DEBUG_ONCE` one-shot.
+- `[SGI] POOL contended` is **rate-limited** — `if n.is_multiple_of(1000)`.
+  That is the amortisation §5 considered and rejected for `errno_diag`, already
+  deployed where it was needed.
+
+**One genuine find**, the crates-side twin of §8.1: `[Cleanup] Thread {}
+recycled after {}us cooldown` in the thread reaper fired **once per thread
+recycle**, unconditionally. A thread-heavy workload — an in-VM `-j4` build —
+recycles constantly, so that was ~70 bytes of console per recycle. Now behind
+`lifecycle_trace_on()`, which is `syscall_debug_info_enabled`: exactly the class
+that flag already covers, since its own doc records the `[FORK-DBG]`/`[TRAMP]`
+traces costing ~20 serial lines per `fork()` for the same reason. A recycle is a
+lifecycle event.
+
+The scan is also a lesson in its own right: a first pass that grepped only for
+`config::UPPER_CASE` reported **130** ungated sites in `crates/`. Crates cannot
+see `src/config.rs` — they gate through `config().syscall_debug_info_enabled`,
+`lifecycle_trace()`, a local `if debug`, or a rate limiter. Half the "findings"
+were the scanner not knowing the codebase's own idioms.
+
+## 12. How to re-measure
+
 
 
 ```bash

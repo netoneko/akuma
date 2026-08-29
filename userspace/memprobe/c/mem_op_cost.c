@@ -226,6 +226,16 @@ int main(int argc, char **argv) {
      * distance from it. */
     ARM("getpid", LONG_WANT_ANY, syscall(SYS_getpid));
 
+    /* `getuid` is a `FastPath::Leaf` (2026-08-29): its arm is literally
+     * `nr::GETUID => 0`, so the prologue skips the identity read and the two
+     * `Process` syscall stamps, and the epilogue skips its re-resolve, its
+     * stats row and its `/proc/<pid>/syscalls` entry. `getpid` is `Full` and
+     * otherwise identical in shape — it also takes no arguments and returns one
+     * integer — so **the gap between these two arms IS the prologue+epilogue
+     * cost**, measured live on every run rather than inferred from an ablation
+     * build. Keep them adjacent. */
+    ARM("getuid_leaf", LONG_WANT_ANY, syscall(SYS_getuid));
+
     /* Decode-only rejection: MAP_FIXED with an unaligned address. Rejected
      * before any process lookup, which is the ordering `sys_mmap` guarantees. */
     ARM("mmap_einval", EINVAL,

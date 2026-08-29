@@ -325,9 +325,32 @@ fn epilogue_matches_the_shipped_handle_syscall() {
 #[test]
 fn leaf_diverges_from_the_oracle_in_exactly_the_documented_places() {
     let leaves: Vec<u64> = probe_numbers().filter(|n| fast_path(*n) == FastPath::Leaf).collect();
+    // Membership, with the criteria checked against each arm in `handle_syscall`:
+    //
+    //   UPTIME             `akuma_timer::uptime_us()` — a counter read, nothing else.
+    //   AKUMA_GET_VERSION  returns a compile-time constant.
+    //   GETUID/GETGID/GETEGID  literally `nr::GETUID => 0` in the match arm.
+    //   GETEUID            `sys_geteuid()`, whose entire body is `0`.
+    //
+    // All six: read no `args`, touch no `Process`/table/fd/address space, cannot
+    // block, and their `/proc/<pid>/syscalls` rows say only "returned a constant".
+    //
+    // NOT here, and each for a reason worth keeping written down: `getpid` reads
+    // `read_current_pid()`, `gettid` reads the thread id, `getppid` walks the
+    // process table — all three *are* identity. `sched_yield` reaches the
+    // scheduler. `shutdown` looks constant but only in the `cfg(not(smoltcp))`
+    // build; the shipping arm resolves an fd and calls `socket_shutdown`.
     assert_eq!(
         leaves,
-        vec![nr::UPTIME, nr::AKUMA_GET_VERSION],
+        // `probe_numbers()` yields ascending, so this list is in numeric order.
+        vec![
+            nr::GETUID,
+            nr::GETEUID,
+            nr::GETGID,
+            nr::GETEGID,
+            nr::UPTIME,
+            nr::AKUMA_GET_VERSION,
+        ],
         "the Leaf membership changed — every entry needs the four admission \
          criteria checked against its arm, not assumed"
     );
