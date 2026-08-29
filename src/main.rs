@@ -1308,7 +1308,11 @@ fn run_async_main_preemptive() -> ! {
                 // Clean up every 10 iterations (not too frequent to avoid overhead)
                 if loop_counter.is_multiple_of(10) {
                     let cleaned = threading::cleanup_terminated();
-                    if cleaned > 0 {
+                    // Per cleanup pass, i.e. continuously under any fork-heavy
+                    // workload — 39 lines in a plain boot-suite run. The COUNT is
+                    // the whole content, and `[PSTATS]` already reports thread
+                    // churn, so this is a trace and belongs behind the flag.
+                    if cleaned > 0 && config::SYSCALL_DEBUG_INFO_ENABLED {
                         // Safe print without heap allocation to prevent panics
                         console::print("[Thread0] Cleaned ");
                         console::print_dec(cleaned);

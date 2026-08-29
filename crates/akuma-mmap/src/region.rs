@@ -57,6 +57,25 @@ pub struct MmapRegion {
     /// Must propagate to inherited regions too, or a grandchild silently stops
     /// sharing. Probe: `userspace/forktest/c_stress/shmanon.c`.
     pub shared_anon: bool,
+
+    /// Whether [`flags`](Self::flags) is a **statement** about this mapping's
+    /// protection, or merely the safe default.
+    ///
+    /// This exists because `NONE` is otherwise two different facts in one `u64`:
+    /// [`MmapRegion::owned`] uses it to mean "protection unrecorded" (see its doc
+    /// for why that default is the safe one), and `from_prot(PROT_NONE)` produces
+    /// the identical value to mean "the caller asked for no access".
+    ///
+    /// Telling them apart did not matter while `flags` was only ever used to
+    /// **grant** a write the fault handler would otherwise refuse — `NONE` grants
+    /// nothing either way. It matters the moment `flags` is used to **deny** one:
+    /// treating "unrecorded" as "not writable" refuses legitimate CoW breaks on
+    /// every region built without explicit flags, which killed `rustc` mid-build
+    /// with `[WPF] … eager=0x60000000000080 cow_ref=1` — `NONE`, exactly.
+    ///
+    /// Use [`recorded_prot`](Self::recorded_prot) rather than reading this
+    /// directly.
+    pub prot_recorded: bool,
 }
 
 impl MmapRegion {
@@ -70,26 +89,47 @@ impl MmapRegion {
     /// Callers that know the real protection use [`MmapRegion::owned_with_flags`].
     #[must_use]
     pub fn owned(start_va: usize, frames: Vec<PhysFrame>) -> Self {
-        Self::owned_with_flags(start_va, frames, crate::user_flags::NONE)
+        let mut r = Self::owned_with_flags(start_va, frames, crate::user_flags::NONE);
+        // `NONE` here is the safe default, NOT a statement — see `prot_recorded`.
+        r.prot_recorded = false;
+        r
     }
 
     /// Region created by this process, with its real protection recorded.
     #[must_use]
     pub fn owned_with_flags(start_va: usize, frames: Vec<PhysFrame>, flags: u64) -> Self {
-        Self { start_va, pages: frames.len(), frames, flags, shared_anon: false }
+        Self {
+            start_va, pages: frames.len(), frames, flags,
+            shared_anon: false, prot_recorded: true,
+        }
     }
 
     /// Region inherited by a CoW-forked child: extent known, no owned frames,
     /// protection unrecorded (`NONE` — see [`MmapRegion::owned`] for why).
     #[must_use]
     pub fn inherited(start_va: usize, pages: usize) -> Self {
-        Self::inherited_with_flags(start_va, pages, crate::user_flags::NONE)
+        let mut r = Self::inherited_with_flags(start_va, pages, crate::user_flags::NONE);
+        r.prot_recorded = false;
+        r
     }
 
     /// Region inherited by a CoW-forked child, carrying the parent's protection.
     #[must_use]
     pub fn inherited_with_flags(start_va: usize, pages: usize, flags: u64) -> Self {
-        Self { start_va, pages, frames: Vec::new(), flags, shared_anon: false }
+        Self {
+            start_va, pages, frames: Vec::new(), flags,
+            shared_anon: false, prot_recorded: true,
+        }
+    }
+
+    /// The protection this region **states**, or `None` if it never recorded one.
+    ///
+    /// The accessor a *deny* decision must use. A *grant* decision can read
+    /// [`flags`](Self::flags) directly, because the unrecorded default (`NONE`)
+    /// grants nothing anyway.
+    #[must_use]
+    pub const fn recorded_prot(&self) -> Option<u64> {
+        if self.prot_recorded { Some(self.flags) } else { None }
     }
 
     /// Mark this region `MAP_SHARED | MAP_ANONYMOUS`. See [`MmapRegion::shared_anon`].
@@ -144,7 +184,10 @@ pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> allo
     parent_regions
         .iter()
         .map(|r| {
-            let inherited = MmapRegion::inherited_with_flags(r.start_va, r.pages, r.flags);
+            let mut inherited = MmapRegion::inherited_with_flags(r.start_va, r.pages, r.flags);
+            // Carry `prot_recorded` too: a child of an unrecorded region is itself
+            // unrecorded, and a child of an `mprotect`ed one keeps the statement.
+            inherited.prot_recorded = r.prot_recorded;
             // Must carry `shared_anon` across, or a grandchild silently stops sharing:
             // the child would CoW-share a mapping its parent shares by identity.
             if r.shared_anon { inherited.shared_anon() } else { inherited }
@@ -209,6 +252,8 @@ pub fn detach_eager_regions_in_range(
         // A partial unmap changes extent, not identity: both survivors are still the
         // same `MAP_SHARED|MAP_ANONYMOUS` object if the original was.
         let shared_anon = reg.shared_anon;
+        // A partial unmap changes extent, not what the region states about itself.
+        let prot_recorded = reg.prot_recorded;
         let mut it = reg.frames.into_iter();
         let head: alloc::vec::Vec<PhysFrame> = (0..head_pages).filter_map(|_| it.next()).collect();
         let mid: alloc::vec::Vec<PhysFrame> = (0..clip_pages).filter_map(|_| it.next()).collect();
@@ -220,11 +265,13 @@ pub fn detach_eager_regions_in_range(
         // and cannot loop.
         if head_pages > 0 {
             regions.push(MmapRegion {
-                start_va: reg_start, pages: head_pages, frames: head, flags, shared_anon });
+                start_va: reg_start, pages: head_pages, frames: head, flags,
+                shared_anon, prot_recorded });
         }
         if tail_pages > 0 {
             regions.push(MmapRegion {
-                start_va: clip_end, pages: tail_pages, frames: tail, flags, shared_anon });
+                start_va: clip_end, pages: tail_pages, frames: tail, flags,
+                shared_anon, prot_recorded });
         }
         if clip_pages > 0 {
             pieces.push((clip_start, clip_pages, mid));
@@ -350,6 +397,71 @@ mod mmap_region_inheritance_tests {
     // pinned here rather than inferred: the pieces handed back must account for
     // exactly the pages inside the range, the survivors must account for exactly
     // the pages outside it, and frames must follow their pages in both directions.
+
+    /// `NONE` is two different facts, and `recorded_prot` is what separates them.
+    ///
+    /// `owned()`/`inherited()` default to `NONE` meaning "protection unrecorded";
+    /// `from_prot(PROT_NONE)` yields the identical value meaning "no access". A
+    /// *grant* decision may read `flags` directly — `NONE` grants nothing either
+    /// way — but a *deny* decision must not, and this is the regression that
+    /// proved it: treating unrecorded as read-only refused legitimate CoW breaks
+    /// and killed `rustc` mid-build.
+    #[test]
+    fn unrecorded_none_and_explicit_prot_none_are_distinguishable() {
+        let unrecorded = MmapRegion::owned(0x1000_0000, frames(1));
+        assert_eq!(unrecorded.flags, user_flags::NONE, "the safe default is still NONE");
+        assert_eq!(unrecorded.recorded_prot(), None, "…but it states nothing");
+
+        let explicit = MmapRegion::owned_with_flags(0x1000_0000, frames(1), user_flags::NONE);
+        assert_eq!(explicit.flags, unrecorded.flags, "identical in the flags field");
+        assert_eq!(
+            explicit.recorded_prot(),
+            Some(user_flags::NONE),
+            "and yet distinguishable — this is the whole point"
+        );
+    }
+
+    /// Same for the inherited constructors, because a CoW child of an unrecorded
+    /// region is itself unrecorded.
+    #[test]
+    fn inherited_constructors_split_the_same_way() {
+        assert_eq!(MmapRegion::inherited(0x1000_0000, 2).recorded_prot(), None);
+        assert_eq!(
+            MmapRegion::inherited_with_flags(0x1000_0000, 2, user_flags::RW).recorded_prot(),
+            Some(user_flags::RW)
+        );
+    }
+
+    /// A CoW child must carry the bit, or every forked process looks unrecorded
+    /// and `mprotect` stops being enforced exactly where the probe exercises it.
+    #[test]
+    fn cow_inheritance_carries_whether_protection_was_recorded() {
+        let parent = alloc::vec![
+            MmapRegion::owned_with_flags(0x1000_0000, frames(1), user_flags::RO),
+            MmapRegion::owned(0x2000_0000, frames(1)),
+        ];
+        let child = inherit_mmap_regions_for_cow_child(&parent);
+        assert_eq!(child[0].recorded_prot(), Some(user_flags::RO), "statement survives fork");
+        assert_eq!(child[1].recorded_prot(), None, "and so does its absence");
+    }
+
+    /// Splitting changes extent, not what a region states about itself — both
+    /// survivors keep it.
+    #[test]
+    fn detach_survivors_keep_the_recorded_flag() {
+        for (recorded, want) in [(true, Some(user_flags::RW)), (false, None)] {
+            let mut r = alloc::vec![if recorded {
+                MmapRegion::owned_with_flags(0x1000_0000, frames(6), user_flags::RW)
+            } else {
+                MmapRegion::owned(0x1000_0000, frames(6))
+            }];
+            let _ = detach_eager_regions_in_range(&mut r, 0x1000_2000, 0x1000_4000);
+            assert_eq!(r.len(), 2, "middle detach leaves a head and a tail");
+            for survivor in &r {
+                assert_eq!(survivor.recorded_prot().is_some(), recorded, "{want:?}");
+            }
+        }
+    }
 
     /// Total pages a region list covers, for conservation assertions.
     fn total_pages(r: &[MmapRegion]) -> usize {

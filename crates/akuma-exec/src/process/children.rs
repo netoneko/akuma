@@ -1262,6 +1262,31 @@ pub fn eager_region_flags_for_page_fault(pid: Pid, va: usize) -> Option<u64> {
     lookup(pid)
 }
 
+/// The protection an eager region **states** for `va`, if it states one.
+///
+/// The *deny*-side counterpart of [`eager_region_flags_for_page_fault`]. That one
+/// answers "what flags does the record hold", which is right for granting a write
+/// — the unrecorded default is `NONE` and grants nothing. This one answers "did
+/// the region actually say anything", which is what a refusal needs: treating an
+/// unrecorded region as read-only refuses legitimate CoW breaks and kills `rustc`.
+///
+/// See `MmapRegion::prot_recorded` for the `NONE`-is-two-facts problem this exists
+/// to resolve.
+pub fn eager_region_recorded_prot_for_page_fault(pid: Pid, va: usize) -> Option<u64> {
+    let lookup = |p: Pid| -> Option<u64> {
+        let proc = lookup_process_shared(p)?;
+        proc.vm_with_regions(|r| {
+            r.iter().find(|reg| reg.contains(va)).and_then(MmapRegion::recorded_prot)
+        })
+    };
+    if let Some(owner) = address_space_owner_pid_for_fault()
+        && let Some(f) = lookup(owner)
+    {
+        return Some(f);
+    }
+    lookup(pid)
+}
+
 /// Every eager region covering `va`, as `(start_va, pages, flags)`.
 ///
 /// [`eager_region_flags_for_page_fault`] answers from the **first** `Vec` match,
@@ -1318,6 +1343,11 @@ pub fn update_eager_region_flags(pid: Pid, range_start: usize, range_size: usize
                     widened = Some((reg.start_va, reg.len_bytes(), reg.flags));
                 }
                 reg.flags = new_flags;
+                // `mprotect` IS a statement about protection, whatever the value.
+                // Without this an `mprotect(PROT_NONE)` would keep looking
+                // unrecorded and the deny gate could not tell it from a region
+                // that simply never said anything. See `MmapRegion::prot_recorded`.
+                reg.prot_recorded = true;
             }
         }
     });

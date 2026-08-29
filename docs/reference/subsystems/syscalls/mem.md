@@ -113,16 +113,42 @@ counterpart.
 
 Reproduce the Linux side with `userspace/memprobe/c/build.sh --push-lima fc`.
 
-**A `mprotect` bug this gate found (fixed 2026-08-29).** A child writing to a page
-its parent had `mprotect(PROT_READ)`-ed did not `SIGSEGV`: the EL0 write-fault
-handler's CoW-break arm fired on `cow_ref > 0` alone and handed the writer a
-private *writable* copy. A CoW-demoted page and an `mprotect`-downgraded page are
-both read-only in the PTE and indistinguishable from hardware state — that is what
-`MmapRegion::flags` exists to disambiguate, and the CoW arm never consulted it. All
-three repair paths are now gated on the recorded protection via
-`akuma_mmap::user_flags::is_write`. **`None` means "no record", not "not
-writable"**: an ELF `.data`/`.bss` page has no region at all and must keep the
-historical path. Probe: `userspace/forktest/c_stress/eager_mprotect_probe`.
+**A `mprotect` bug this gate found — partially fixed, and the limit is the
+interesting part (2026-08-29).** A child writing to a page its parent had
+`mprotect(PROT_READ)`-ed did not `SIGSEGV`: the EL0 write-fault handler's
+CoW-break arm fired on `cow_ref > 0` alone and handed the writer a private
+*writable* copy. A CoW-demoted page and an `mprotect`-downgraded page are both
+read-only in the PTE; `MmapRegion::flags` / `LazyRegion::flags` exist to
+disambiguate them, and the CoW arm never consulted either.
+
+The repair paths are now gated on the recorded protection (`user_flags::is_write`),
+**but only for LAZY regions.** Eager regions are deliberately excluded, and the
+reason is a real constraint rather than an oversight:
+
+> `update_eager_region_flags` records a sub-range `mprotect` against the **whole**
+> region. Its own comment says that widening is safe *"because the fault handler
+> only ever uses these flags to grant a write"* — true for granting, false for
+> refusing. A guard page `mprotect(PROT_NONE)`-ed inside a larger eager mapping
+> records `NONE` for every page of it, so a deny gate refuses the legitimate CoW
+> break on all the others.
+
+That is not theoretical: gating on eager flags killed `rustc` in a devbox
+self-host build — three `[MPROTECT-DENY]` addresses, three `SIGSEGV`s at exactly
+those addresses, `thiserror-impl` and `zerocopy-derive` dead. Lazy regions split
+per-range on `mprotect` and are precise, so they keep the gate.
+
+**Consequence, stated plainly:** `mprotect` on an *eager* region is still not
+enforced across a fork, and `eager_mprotect_probe` fails — as it did before any of
+this. Enforcing it requires eager regions to split like lazy ones do; recording
+protection at page granularity is the prerequisite, not the gate.
+
+Two supporting pieces landed and are worth keeping even though the eager case is
+unfixed: `akuma_mmap::user_flags::is_write` (the missing predicate, host-tested
+against `from_prot` across the whole table) and `MmapRegion::recorded_prot()`,
+which separates "protection unrecorded" from "explicitly `PROT_NONE`" — the same
+`NONE` value meant both, which is its own latent trap.
+
+Probe: `userspace/forktest/c_stress/eager_mprotect_probe`.
 
 ## Syscall table
 

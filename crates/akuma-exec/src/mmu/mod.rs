@@ -537,11 +537,25 @@ fn asid_exhausted_warn() {
 /// stuck core's TTBR0 (ASID + L0 physical), and these lines are what link that
 /// L0 back to a pid and a teardown path in the console log.
 pub(crate) fn as_trace(args: core::fmt::Arguments) {
-    // Was a fifth function-local copy of the stack writer. `print_args` is the
-    // `Arguments`-shaped entry point to the shared one — this helper takes
-    // pre-built `Arguments` rather than being a macro, so it can't use
-    // `safe_print!` directly.
-    akuma_primitives::console::print_args::<160>(args);
+    // Gated as a LIFECYCLE trace (2026-08-29). It was unconditional, and it is the
+    // single largest console producer in the tree: `[AS-NEW]`/`[AS-EXEC]`/
+    // `[AS-FREE]`/`[AS-DEFER]` fire on every address-space create, exec and free,
+    // which is once or more per process. A plain boot-suite run emitted **1,342**
+    // of these lines; an in-VM `-j4` build is orders more, and each costs ~160
+    // bytes at ~2.4 us/byte (docs/archive/CONSOLE_LOG_COST.md).
+    //
+    // Address-space create/exec/free is exactly what `syscall_debug_info_enabled`
+    // already covers — its own doc is about `[FORK-DBG]`/`[TRAMP]` costing ~20
+    // serial lines per `fork()`. `lifecycle_trace_on()` folds to a compile-time
+    // `false` without the `debug-info` feature, so with it off this call and its
+    // `Arguments` construction disappear entirely.
+    if crate::process::lifecycle_trace_on() {
+        // Was a fifth function-local copy of the stack writer. `print_args` is the
+        // `Arguments`-shaped entry point to the shared one — this helper takes
+        // pre-built `Arguments` rather than being a macro, so it can't use
+        // `safe_print!` directly.
+        akuma_primitives::console::print_args::<160>(args);
+    }
 }
 
 // ===== Per-core live-TTBR0 registry =====

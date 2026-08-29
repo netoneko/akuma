@@ -371,13 +371,21 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
             crate::tprint!(128, "[exit_group] pid={} name={} code={} after {}.{:02}s\n",
                 proc.pid, proc.name, code, secs, frac);
         }
-        // Unconditional (not gated by SYSCALL_DEBUG_NET_ENABLED): correlates with
+        // Gated 2026-08-29. It was unconditional for the reason below, and that
+        // reason has aged out: the J4 investigation is archived, while the line
+        // fires once per process exit — 262 in a plain boot-suite run, thousands
+        // in an in-VM build, at ~160 bytes and ~2.4 us/byte. Turn
+        // `syscall-debug-info` on to get it back for a rerun of that hunt.
+        //
+        // Was: unconditional (not gated by SYSCALL_DEBUG_NET_ENABLED): correlates with
         // the `[syscall] execve(path=..., args=...)` line by pid to answer "did the
         // linker's own exit_group report success" for the truncated-linker-output
         // investigation — see
         // docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §4.
-        crate::tprint!(160, "[PROC-EXIT] pid={} tgid={} name={} code={}\n",
-            proc.pid, proc.tgid, proc.name, code);
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::tprint!(160, "[PROC-EXIT] pid={} tgid={} name={} code={}\n",
+                proc.pid, proc.tgid, proc.name, code);
+        }
         let pid = proc.pid;
         let tgid = proc.tgid;
         let proc_tid = proc.thread_id;
