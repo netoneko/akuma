@@ -1,0 +1,16 @@
+[package]
+name = "akuma-syscalls-poll"
+version = "0.1.0"
+edition = "2024"
+description = "The epoll/poll/select family's pure logic: the fd-state -> event-bits readiness map, the interest list and its epoll_ctl errno set, the EPOLLET armed-state decision, and the ppoll/pselect6 wire marshalling. Decisions and one data structure — every probe, lock and wake stays in the kernel."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The ABI (EPOLL*/POLL* bits, EPOLL_CTL_* ops, EPOLL_EVENT_MASK) and the errno
+# table. Both are leaves. Deliberately NOT akuma-exec: this crate must not know
+# what a `FileDescriptor` is — it is handed the facts a probe already
+# established, which is what `readiness::FdState` is for. See the crate docs.
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+akuma-primitives = { path = "../akuma-primitives" }

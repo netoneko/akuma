@@ -29,6 +29,7 @@ host-test.
 | `akuma-scheduler` | discrete-event simulator for placement / netpoll wake policy |
 | `akuma-syscalls` | the shape of a syscall excursion (prologue/epilogue decisions, identity-slot model) |
 | `akuma-syscalls-sync` | the futex family: op decode, waiter table, deadline algebra, `WAKE_OP`, wait-loop outcome |
+| `akuma-syscalls-poll` | the epoll/poll/select family: the fd-state → event-bits readiness map, the interest list and its `epoll_ctl` errno set, the `EPOLLET` armed-state decision, the `ppoll`/`pselect6` wire marshalling |
 | `akuma-terminal` | terminal/line-discipline state |
 | `akuma-syscalls-time` | time syscalls + the boot-time SNTP client |
 | `akuma-vfs` | the `Filesystem` trait and common FS types |

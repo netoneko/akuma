@@ -7,26 +7,31 @@ use akuma_net::socket;
 /// family differs from the socket family is a field on that policy rather than
 /// a difference between three open-coded loops.
 use akuma_net_yarn::{Observation, WaitError, WaitMachine, WaitPolicy, WaitStep};
+/// The family's pure logic: the state -> event-bits readiness map, the interest
+/// list and its `epoll_ctl` errno set, the `EPOLLET` armed-state decision, and
+/// the `ppoll`/`pselect6` wire marshalling. Every probe, lock, waker
+/// registration and user-memory access stays here — see the crate docs for the
+/// seam, and note that it stops at the readiness edge: the wait loop above is
+/// `akuma-net-yarn` and this change did not touch it.
+use akuma_syscalls_poll::readiness::{FdState, readiness};
+use akuma_syscalls_poll::{fdset, pollfd};
+#[cfg(feature = "sc-epoll")]
+use akuma_syscalls_poll::{InterestList, ctl, edge};
 #[cfg(feature = "sc-epoll")]
 use core::sync::atomic::AtomicU64;
 use core::task::Waker;
 #[cfg(feature = "sc-epoll")]
 use alloc::collections::BTreeMap;
 
+/// The interest lists, keyed by the internal epoll id an `EpollFd(id)`
+/// descriptor is a handle into.
+///
+/// The list itself — the registrations, `epoll_ctl`'s errno set and the
+/// `EPOLLET` bookkeeping — is
+/// [`akuma_syscalls_poll::InterestList`]. What stays here is the lock around it
+/// and the IRQ discipline that lock needs; see `epoll_reset_edge`.
 #[cfg(feature = "sc-epoll")]
-struct EpollEntry {
-    events: u32,
-    data: u64,
-    last_ready: u32,
-}
-
-#[cfg(feature = "sc-epoll")]
-struct EpollInstance {
-    interest_list: BTreeMap<u32, EpollEntry>,
-}
-
-#[cfg(feature = "sc-epoll")]
-static EPOLL_TABLE: Spinlock<BTreeMap<u32, EpollInstance>> = Spinlock::new(BTreeMap::new());
+static EPOLL_TABLE: Spinlock<BTreeMap<u32, InterestList>> = Spinlock::new(BTreeMap::new());
 #[cfg(feature = "sc-epoll")]
 static NEXT_EPOLL_ID: AtomicU32 = AtomicU32::new(1);
 /// Counts `epoll_pwait(timeout=0)` returns with `nready=0` for rate-limited logging.
@@ -34,19 +39,15 @@ static NEXT_EPOLL_ID: AtomicU32 = AtomicU32::new(1);
 static EPOLL_PWAIT_ZERO_ZERO_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // The bit values live in `akuma-syscalls-linux` (2026-08-27), unconditionally
-// — a bit is not feature-dependent. The `#[cfg]`s survive on the *imports*,
+// — a bit is not feature-dependent. The `#[cfg]` survives on the *import*,
 // because `unused_imports` is `deny` here and a name nothing in this build
-// mentions is a hard error: EPOLLIN/OUT/ERR/HUP/RDHUP are generic poll-event
-// bits shared by ppoll/pselect and `epoll_check_fd_readiness`, so they stay
-// regardless of `sc-epoll`; the rest are only reachable from the epoll surface.
-use akuma_syscalls_linux::flags::epoll::{EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT};
-// Only the native-TCP readiness arm reads it, which a rump-only build omits.
-#[cfg(feature = "smoltcp")]
-use akuma_syscalls_linux::flags::epoll::EPOLLRDHUP;
-#[cfg(feature = "sc-epoll")]
-use akuma_syscalls_linux::flags::epoll::{
-    EPOLLET, EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLL_EVENT_MASK,
-};
+// mentions is a hard error.
+//
+// Only the two edge re-arm hooks name a bit directly now: everything else
+// either goes through `akuma_syscalls_poll` (which owns the masking rules) or
+// through `Entry::requested`, which is what keeps a registration-only bit out
+// of a `revents`.
+use akuma_syscalls_linux::flags::epoll as ep;
 const BLOCKING_POLL_INTERVAL_US: u64 = 10_000;
 
 /// Shorter per-iteration sleep ceiling when a polled fd is a rump socket.
@@ -124,27 +125,7 @@ fn any_fd_wants_rump_poll_interval(_fds: &[u32]) -> bool {
 /// (typically a handful).
 #[cfg(feature = "rump")]
 fn fd_set_wants_rump_poll_interval(readfds: &[u64], writefds: &[u64], nfds: usize) -> bool {
-    let nwords = nfds.div_ceil(64);
-    for word_idx in 0..nwords {
-        let bits = readfds.get(word_idx).copied().unwrap_or(0)
-            | writefds.get(word_idx).copied().unwrap_or(0);
-        if bits == 0 {
-            continue;
-        }
-        for bit in 0..64u64 {
-            if bits & (1u64 << bit) == 0 {
-                continue;
-            }
-            let fd = word_idx * 64 + bit as usize;
-            if fd >= nfds {
-                break;
-            }
-            if fd_wants_rump_poll_interval(fd as i32) {
-                return true;
-            }
-        }
-    }
-    false
+    fdset::set_fds(readfds, writefds, nfds).any(|fd| fd_wants_rump_poll_interval(fd as i32))
 }
 
 #[cfg(not(feature = "rump"))]
@@ -222,10 +203,10 @@ fn log_epoll_pwait_return(
         return;
     }
     for (i, ev) in kernel_events.iter().take(6).enumerate() {
-        let in_flag = if ev.events & EPOLLIN != 0 { "IN" } else { "" };
-        let out_flag = if ev.events & EPOLLOUT != 0 { "OUT" } else { "" };
-        let hup_flag = if ev.events & EPOLLHUP != 0 { "HUP" } else { "" };
-        let err_flag = if ev.events & EPOLLERR != 0 { "ERR" } else { "" };
+        let in_flag = if ev.events & ep::EPOLLIN != 0 { "IN" } else { "" };
+        let out_flag = if ev.events & ep::EPOLLOUT != 0 { "OUT" } else { "" };
+        let hup_flag = if ev.events & ep::EPOLLHUP != 0 { "HUP" } else { "" };
+        let err_flag = if ev.events & ep::EPOLLERR != 0 { "ERR" } else { "" };
         crate::tprint!(
             128,
             "[epoll]    ev[{}] data=0x{:x} {}{}{}{}\n",
@@ -258,12 +239,11 @@ pub fn epoll_on_fd_write_blocked(_fd: u32) {}
 /// instance watching `fd`, so the next time those bits go ready they count as a
 /// fresh edge.
 ///
-/// The `last_ready` mask exists because `sys_epoll_pwait` recomputes readiness
-/// from scratch on each pass and reports `revents & !last_ready`. It is
-/// refreshed only *inside* that loop, which means a level transition that
-/// happens and un-happens between two passes is invisible — the mask still says
-/// "already reported" and the edge never fires again. The I/O syscalls are the
-/// only code that witnesses those transitions, so they have to report them.
+/// Why the mask needs an outside-in reset at all — and why the level-triggered
+/// guard is stated rather than dropped — is in
+/// [`InterestList::reset_edge`](akuma_syscalls_poll::InterestList::reset_edge).
+/// What is kernel-only, and stays here, is the loop over instances and the
+/// locking discipline below.
 #[cfg(feature = "sc-epoll")]
 fn epoll_reset_edge(fd: u32, bits: u32) {
     // IRQ-masked holds: this is called from the TCP send/recv syscalls, which
@@ -293,11 +273,7 @@ fn epoll_reset_edge(fd: u32, bits: u32) {
     crate::irq::with_irqs_disabled(|| {
         let mut table = EPOLL_TABLE.lock();
         for inst in table.values_mut() {
-            if let Some(entry) = inst.interest_list.get_mut(&fd)
-                && entry.events & EPOLLET != 0
-            {
-                entry.last_ready &= !bits;
-            }
+            inst.reset_edge(fd, bits);
         }
     });
 }
@@ -307,7 +283,7 @@ fn epoll_reset_edge(fd: u32, bits: u32) {
 /// drain to `EAGAIN`). Re-arms the `EPOLLIN` edge so the next arrival fires.
 #[cfg(feature = "sc-epoll")]
 pub fn epoll_on_fd_drained(fd: u32) {
-    epoll_reset_edge(fd, EPOLLIN);
+    epoll_reset_edge(fd, ep::EPOLLIN);
 }
 
 /// Called when a socket write could not take everything the caller offered —
@@ -337,7 +313,7 @@ pub fn epoll_on_fd_drained(fd: u32) {
 /// completed. See `docs/runbooks/debug-delayed-first-byte.md`.
 #[cfg(feature = "sc-epoll")]
 pub fn epoll_on_fd_write_blocked(fd: u32) {
-    epoll_reset_edge(fd, EPOLLOUT);
+    epoll_reset_edge(fd, ep::EPOLLOUT);
 }
 
 #[cfg(feature = "sc-epoll")]
@@ -345,16 +321,14 @@ pub fn sys_epoll_create1(flags: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
         crate::irq::with_irqs_disabled(|| {
-            EPOLL_TABLE.lock().insert(epoll_id, EpollInstance {
-                interest_list: BTreeMap::new(),
-            });
+            EPOLL_TABLE.lock().insert(epoll_id, InterestList::new());
         });
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::EpollFd(epoll_id));
-        if flags & EPOLL_CLOEXEC != 0 {
+        if flags & ep::EPOLL_CLOEXEC != 0 {
             proc.set_cloexec(fd);
         }
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-            crate::tprint!(96, "[epoll] create1() id={} fd={} cloexec={}\n", epoll_id, fd, flags & EPOLL_CLOEXEC != 0);
+            crate::tprint!(96, "[epoll] create1() id={} fd={} cloexec={}\n", epoll_id, fd, flags & ep::EPOLL_CLOEXEC != 0);
         }
         u64::from(fd)
     } else {
@@ -373,74 +347,39 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
         _ => return EBADF,
     };
 
+    // Decoded before the hold because the answer decides whether a user copy
+    // happens at all — `EPOLL_CTL_DEL`'s fourth argument is routinely NULL.
+    let ctl = ctl::decode(op);
+
     // The user copy is hoisted out of the EPOLL_TABLE hold, and must stay there:
     // `read_user_into` prefaults, and the prefault's `LazySource::File` arm reads the
     // page in through the VFS — while the hold below masks IRQs, where block I/O is
     // barred outright (locking.md). The membership probe keeps EBADF ahead of EFAULT,
     // which is the precedence the un-hoisted code had.
-    let event = match op {
-        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
-            if !crate::irq::with_irqs_disabled(|| EPOLL_TABLE.lock().contains_key(&epoll_id)) {
-                return EBADF;
-            }
-            let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
-            if read_user_into(&mut ev, event_ptr as u64).is_err() {
-                return EFAULT;
-            }
-            Some(({ ev.events }, { ev.data }))
+    let event = if ctl.needs_event() {
+        if !crate::irq::with_irqs_disabled(|| EPOLL_TABLE.lock().contains_key(&epoll_id)) {
+            return EBADF;
         }
-        _ => None,
+        let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
+        if read_user_into(&mut ev, event_ptr as u64).is_err() {
+            return EFAULT;
+        }
+        Some(({ ev.events }, { ev.data }))
+    } else {
+        None
     };
+    let (ev_events, ev_data) = event.unwrap_or((0, 0));
 
-    // Outcome of the ADD arm, logged after the hold is released — a UART write is far
-    // too slow to sit inside an IRQ-masked spinlock hold.
-    let mut added_as: Option<&'static str> = None;
+    // Outcome, logged after the hold is released — a UART write is far too slow
+    // to sit inside an IRQ-masked spinlock hold.
+    let mut outcome = None;
 
     let result = crate::irq::with_irqs_disabled(|| {
         let mut table = EPOLL_TABLE.lock();
-        let instance = match table.get_mut(&epoll_id) {
-            Some(inst) => inst,
-            None => return EBADF,
-        };
-
-        match op {
-            EPOLL_CTL_ADD => {
-                let (ev_events, ev_data) = event.expect("ADD populates `event` above");
-                if let Some(entry) = instance.interest_list.get_mut(&fd) {
-                    entry.events = ev_events;
-                    entry.data = ev_data;
-                    entry.last_ready = 0;
-                    added_as = Some("ADD->MOD");
-                } else {
-                    instance.interest_list.insert(fd, EpollEntry {
-                        events: ev_events,
-                        data: ev_data,
-                        last_ready: 0,
-                    });
-                    added_as = Some("ADD");
-                }
-                0
-            }
-            EPOLL_CTL_MOD => {
-                let (ev_events, ev_data) = event.expect("MOD populates `event` above");
-                match instance.interest_list.get_mut(&fd) {
-                    Some(entry) => {
-                        entry.events = ev_events;
-                        entry.data = ev_data;
-                        entry.last_ready = 0;
-                        0
-                    }
-                    None => ENOENT,
-                }
-            }
-            EPOLL_CTL_DEL => {
-                match instance.interest_list.remove(&fd) {
-                    Some(_) => 0,
-                    None => ENOENT,
-                }
-            }
-            _ => EINVAL,
-        }
+        let Some(instance) = table.get_mut(&epoll_id) else { return EBADF };
+        let o = instance.apply(ctl, fd, ev_events, ev_data);
+        outcome = Some(o);
+        o.errno()
     });
 
     // Gated, like every other trace in this file. Ungated, this fires on EVERY
@@ -452,13 +391,30 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
     // removing it took the c=1 redis round trip from 303 us to the numbers in
     // `docs/archive/LONG_ROAD_TO_REDIS_PART_2.md` §9. Debug tracing must never
     // be on by default on a request path.
-    if crate::config::SYSCALL_DEBUG_NET_ENABLED && let Some(kind) = added_as {
-        let ev_events = event.map_or(0, |(e, _)| e);
+    if crate::config::SYSCALL_DEBUG_NET_ENABLED
+        && let Some(kind) = outcome.and_then(akuma_syscalls_poll::CtlOutcome::trace_tag)
+    {
         crate::tprint!(96, "[epoll] ctl {} epfd={} fd={} events=0x{:x}\n", kind, epfd, fd, ev_events);
     }
     result
 }
 
+/// Probe `fd_num` and map what it finds onto poll event bits.
+///
+/// The single readiness dispatch behind `epoll_pwait`, `ppoll` and `pselect6`
+/// alike. It does two things, and only one of them is here: it **probes** the
+/// fd — resolving it, registering `waker` with the underlying resource so a
+/// producer-side write wakes this thread directly instead of waiting for the
+/// next poll tick, and asking the resource what it can do — and then hands the
+/// facts to [`akuma_syscalls_poll::readiness`], which decides the bits.
+///
+/// That split is where the family's whole bug history lives. Which bits a
+/// state earns, which of them are maskable, and whether a resource has a state
+/// the map forgot about are all decisions with host tests now; the probes are
+/// effects and stay here. See the crate docs for the seam, and note the
+/// `requested` gating below: an arm that probes conditionally does so because
+/// the same branch registers a poller, and registering one for an event nobody
+/// asked about would add a wakeup source out of nowhere.
 pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Waker>) -> u32 {
     let fd_entry = akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd_num));
     let Some(fd_entry) = fd_entry else {
@@ -468,13 +424,16 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
             crate::tprint!(96, "[pollmiss] fd={} -> EPOLLHUP|EPOLLERR (no fd entry)\n", fd_num);
         }
-        return EPOLLHUP | EPOLLERR;
+        return readiness(FdState::Missing, requested);
     };
 
-    let mut ready = 0u32;
     let tid = akuma_exec::threading::current_thread_id();
+    // Deferred so the trace can report what came *out* of the map, which is the
+    // only place a lost edge is visible at all. Emitted below, after the map runs.
+    #[cfg(feature = "smoltcp")]
+    let mut tcp_trace: Option<(usize, bool)> = None;
 
-    match fd_entry {
+    let state = match fd_entry {
         #[cfg(feature = "smoltcp")]
         akuma_exec::process::FileDescriptor::Socket(idx) => {
             if let Some(w) = waker {
@@ -482,43 +441,37 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
             }
 
             if socket::is_udp_socket(idx) {
-                if let Some(handle) = super::net::socket_get_udp_handle(idx) {
-                    let can_recv = akuma_net::smoltcp_net::udp_can_recv(handle);
-                    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                        crate::tprint!(96, "[epoll] check UDP fd={} can_recv={}\n", fd_num, can_recv);
+                match super::net::socket_get_udp_handle(idx) {
+                    Some(handle) => {
+                        let can_recv = akuma_net::smoltcp_net::udp_can_recv(handle);
+                        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                            crate::tprint!(96, "[epoll] check UDP fd={} can_recv={}\n", fd_num, can_recv);
+                        }
+                        FdState::Udp {
+                            can_recv,
+                            can_send: requested & ep::EPOLLOUT != 0
+                                && akuma_net::smoltcp_net::udp_can_send(handle),
+                        }
                     }
-                    if requested & EPOLLIN != 0 && can_recv {
-                        ready |= EPOLLIN;
-                    }
-                    if requested & EPOLLOUT != 0 && akuma_net::smoltcp_net::udp_can_send(handle) {
-                        ready |= EPOLLOUT;
-                    }
+                    // No smoltcp handle: nothing ready, not an error.
+                    None => FdState::Udp { can_recv: false, can_send: false },
                 }
+            } else if super::net::socket_is_dead_tcp(idx) {
+                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    crate::tprint!(96, "[pollhup] fd={} idx={} state={} req=0x{:x}\n",
+                        fd_num, idx, super::net::socket_tcp_state_str(idx), requested);
+                }
+                FdState::Tcp { dead: true, can_recv: false, can_send: false, peer_closed: false }
             } else {
-                // EPOLLHUP: unconditionally set when the socket is fully dead (not
-                // connected and not connecting).  This lets the caller detect a
-                // timed-out or reset connection without spinning on EPOLLIN.
-                if super::net::socket_is_dead_tcp(idx) {
-                    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                        crate::tprint!(96, "[pollhup] fd={} idx={} state={} req=0x{:x}\n",
-                            fd_num, idx, super::net::socket_tcp_state_str(idx), requested);
-                    }
-                    ready |= EPOLLHUP;
-                } else {
-                    let can_recv = super::net::socket_can_recv_tcp(idx);
-                    if requested & EPOLLIN != 0 && can_recv {
-                        ready |= EPOLLIN;
-                    }
-                    if requested & EPOLLOUT != 0 && super::net::socket_can_send_tcp(idx) {
-                        ready |= EPOLLOUT;
-                    }
-                    if requested & EPOLLRDHUP != 0 && super::net::socket_peer_closed_tcp(idx) {
-                        ready |= EPOLLRDHUP;
-                    }
-                    if crate::config::SYSCALL_DEBUG_EPOLL_EDGE {
-                        crate::tprint!(96, "[epoll-tcp] fd={} idx={} req=0x{:x} can_recv={} ready=0x{:x}\n",
-                            fd_num, idx, requested, can_recv, ready);
-                    }
+                let can_recv = super::net::socket_can_recv_tcp(idx);
+                tcp_trace = Some((idx, can_recv));
+                FdState::Tcp {
+                    dead: false,
+                    can_recv,
+                    can_send: requested & ep::EPOLLOUT != 0
+                        && super::net::socket_can_send_tcp(idx),
+                    peer_closed: requested & ep::EPOLLRDHUP != 0
+                        && super::net::socket_peer_closed_tcp(idx),
                 }
             }
         }
@@ -527,26 +480,21 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
             if waker.is_some() {
                 super::eventfd::eventfd_add_poller(efd_id, tid);
             }
-            let can_read = super::eventfd::eventfd_can_read(efd_id);
-            if requested & EPOLLIN != 0 && can_read {
-                ready |= EPOLLIN;
-            }
-            if requested & EPOLLOUT != 0 {
-                ready |= EPOLLOUT;
-            }
+            FdState::EventFd { can_read: super::eventfd::eventfd_can_read(efd_id) }
         }
         akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
-            if requested & EPOLLIN != 0 {
-                if let Some(ch) = akuma_exec::process::get_child_channel(child_pid) {
-                    if waker.is_some() {
-                        ch.add_poller(tid);
-                    }
-                    if ch.has_stdout_data() || ch.has_exited() {
-                        ready |= EPOLLIN;
-                    }
-                } else {
-                    ready |= EPOLLHUP;
+            if requested & ep::EPOLLIN == 0 {
+                FdState::ChildStdout { channel_gone: false, has_data: false }
+            } else if let Some(ch) = akuma_exec::process::get_child_channel(child_pid) {
+                if waker.is_some() {
+                    ch.add_poller(tid);
                 }
+                FdState::ChildStdout {
+                    channel_gone: false,
+                    has_data: ch.has_stdout_data() || ch.has_exited(),
+                }
+            } else {
+                FdState::ChildStdout { channel_gone: true, has_data: false }
             }
         }
         akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
@@ -554,145 +502,116 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
             if waker.is_some() {
                 super::pipe::pipe_add_poller(pipe_id, tid);
             }
-            if requested & EPOLLIN != 0 && super::pipe::pipe_can_read(pipe_id) {
-                ready |= EPOLLIN;
-            }
-            // `EPOLLHUP` is reported whether or not the caller asked for it —
-            // Linux does the same, and it is never maskable. It matters here
-            // beyond parity: losing the last writer is the *only* state change
-            // an edge-triggered reader gets between "drained, writer alive"
-            // and EOF. `pipe_can_read` is already true in both states (it
-            // folds "has bytes" and "at EOF" into one `EPOLLIN`), so without a
-            // distinct bit `revents & !last_ready` is 0 and the EOF edge is
-            // silently swallowed — `tokio`'s `read_to_end` then waits forever
-            // on a pipe that is sitting at EOF.
-            // See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
-            if super::pipe::pipe_hup(pipe_id) {
-                ready |= EPOLLHUP;
+            FdState::PipeRead {
+                can_read: requested & ep::EPOLLIN != 0 && super::pipe::pipe_can_read(pipe_id),
+                hup: super::pipe::pipe_hup(pipe_id),
             }
         }
         akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => {
-            if requested & EPOLLOUT != 0 {
+            if requested & ep::EPOLLOUT == 0 {
+                FdState::PipeWrite { can_write: false }
+            } else {
                 super::pipe::pipe_add_poller(pipe_id, tid);
-                if super::pipe::pipe_can_write(pipe_id) {
-                    ready |= EPOLLOUT;
-                }
+                FdState::PipeWrite { can_write: super::pipe::pipe_can_write(pipe_id) }
             }
         }
         // AF_UNIX socket. A connected endpoint is readable when `rx` has data
         // and writable when `tx`'s peer is still open; a **listener** has no
-        // pipes at all and is readable when its backlog is non-empty.
-        //
-        // The listener case is the one genuinely new readiness predicate
-        // AF_UNIX adds, and it is checked first because a listening socket's
-        // `rx`/`tx` are 0 — falling through to the pipe arms would ask
-        // `pipe_can_read(0)`, which is `false` for a pipe that does not exist,
-        // so an `accept`-ready listener would poll as "nothing" forever and
-        // every event-loop server would hang. It must report identically
-        // through poll/select/epoll; the AF_INET side of that same contract is
-        // what the `_exceptfds_ptr` bug violated
-        // (docs/runbooks/cargo-cannot-reach-crates-io.md §3).
+        // pipes at all and is readable when its backlog is non-empty. The
+        // listener probe runs first for the reason its `FdState` variant
+        // records: its `rx`/`tx` are 0, so falling through would ask
+        // `pipe_can_read(0)`.
         akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, .. } => {
             if let Some(accept_ready) =
                 super::unixsock::listener_ready(fd_num, waker.is_some().then_some(tid))
             {
-                if requested & EPOLLIN != 0 && accept_ready {
-                    ready |= EPOLLIN;
-                }
-                return ready;
-            }
-            if requested & EPOLLIN != 0 {
-                if waker.is_some() {
-                    super::pipe::pipe_add_poller(rx, tid);
-                }
-                if super::pipe::pipe_can_read(rx) {
-                    ready |= EPOLLIN;
-                }
-            }
-            if requested & EPOLLOUT != 0 {
-                super::pipe::pipe_add_poller(tx, tid);
-                if super::pipe::pipe_can_write(tx) {
-                    ready |= EPOLLOUT;
-                }
+                FdState::UnixListener { accept_ready }
+            } else {
+                let can_read = if requested & ep::EPOLLIN == 0 {
+                    false
+                } else {
+                    if waker.is_some() {
+                        super::pipe::pipe_add_poller(rx, tid);
+                    }
+                    super::pipe::pipe_can_read(rx)
+                };
+                let can_write = if requested & ep::EPOLLOUT == 0 {
+                    false
+                } else {
+                    super::pipe::pipe_add_poller(tx, tid);
+                    super::pipe::pipe_can_write(tx)
+                };
+                FdState::UnixStream { can_read, can_write }
             }
         }
         #[cfg(feature = "sc-timerfd")]
         akuma_exec::process::FileDescriptor::TimerFd(timer_id) => {
-            if requested & EPOLLIN != 0 {
+            if requested & ep::EPOLLIN == 0 {
+                FdState::TimerFd { can_read: false }
+            } else {
                 if waker.is_some() {
                     super::timerfd::timerfd_add_poller(timer_id, tid);
                 }
-                if super::timerfd::timerfd_can_read(timer_id) {
-                    ready |= EPOLLIN;
-                }
+                FdState::TimerFd { can_read: super::timerfd::timerfd_can_read(timer_id) }
             }
         }
         #[cfg(feature = "sc-pidfd")]
         akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => {
             // A pidfd becomes readable (EPOLLIN) when the tracked process has exited.
-            if requested & EPOLLIN != 0 {
+            if requested & ep::EPOLLIN == 0 {
+                FdState::PidFd { can_read: false }
+            } else {
                 if let Some(target_pid) = super::pidfd::pidfd_get_pid(pidfd_id)
                     && let Some(ch) = akuma_exec::process::get_child_channel(target_pid)
                         && waker.is_some() {
                             ch.add_poller(tid);
                         }
-                if super::pidfd::pidfd_can_read(pidfd_id) {
-                    ready |= EPOLLIN;
-                }
+                FdState::PidFd { can_read: super::pidfd::pidfd_can_read(pidfd_id) }
             }
         }
         // `/dev/tty` shares fd 0's channel: same readiness, same waker.
         akuma_exec::process::FileDescriptor::Stdin
         | akuma_exec::process::FileDescriptor::DevTty => {
-            if requested & EPOLLIN != 0
+            if requested & ep::EPOLLIN != 0
                 && let Some(ch) = akuma_exec::process::current_channel() {
                     if waker.is_some() {
                         ch.add_poller(tid);
                     }
-                    if ch.has_stdin_data() {
-                        ready |= EPOLLIN;
-                    }
+                    FdState::Stdin { has_data: ch.has_stdin_data() }
+                } else {
+                    FdState::Stdin { has_data: false }
                 }
         }
         akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr => {
-            if requested & EPOLLOUT != 0 {
-                ready |= EPOLLOUT;
-            }
+            FdState::Sink
         }
         // A rump socket (stack=rump box): POLLIN comes from a non-blocking
         // MSG_PEEK probe forwarded to the rump server; POLLOUT is assumed ready
         // (sends are blocking-synchronous through the proxy). This lets a client
         // like sic multiplex stdin + the IRC socket instead of blocking in recv.
-        // Each readiness check is a sysproxy round-trip (proxy latency applies).
+        // Each readiness check is a sysproxy round-trip (proxy latency applies),
+        // which is why it is skipped when EPOLLIN was not asked for.
         #[cfg(feature = "rump")]
-        akuma_exec::process::FileDescriptor::RumpSocket { rump_fd, .. } => {
-            if requested & EPOLLIN != 0 && crate::rump_proxy::rump_socket_readable(rump_fd) {
-                ready |= EPOLLIN;
-            }
-            if requested & EPOLLOUT != 0 {
-                ready |= EPOLLOUT;
-            }
-        }
+        akuma_exec::process::FileDescriptor::RumpSocket { rump_fd, .. } => FdState::RumpSocket {
+            readable: requested & ep::EPOLLIN != 0
+                && crate::rump_proxy::rump_socket_readable(rump_fd),
+        },
         #[cfg(feature = "rump")]
-        akuma_exec::process::FileDescriptor::Tap { .. } => {
-            // Was falling through to the `_` catch-all below, which reports
-            // EPOLLIN/EPOLLOUT unconditionally regardless of actual readiness —
-            // fine for fd types that don't reach poll(), but /dev/net/tap0 does
-            // (rumpcomp_tap.c's RX fiber calls rumpuser_akuma_wait_fd on it), so
-            // that default turned every "wait for a packet" into an instant,
-            // always-ready return: a busy-spin hidden behind a blocking-looking
-            // poll() call.
-            if requested & EPOLLIN != 0 && akuma_net::rump_tap::has_frame() {
-                ready |= EPOLLIN;
-            }
-            if requested & EPOLLOUT != 0 {
-                ready |= EPOLLOUT;
-            }
-        }
-        _ => {
-            if requested & EPOLLIN != 0 { ready |= EPOLLIN; }
-            if requested & EPOLLOUT != 0 { ready |= EPOLLOUT; }
-        }
+        akuma_exec::process::FileDescriptor::Tap { .. } => FdState::Tap {
+            has_frame: requested & ep::EPOLLIN != 0
+                && akuma_net::rump_tap::has_frame(),
+        },
+        _ => FdState::Unmodelled,
+    };
+
+    let ready = readiness(state, requested);
+
+    #[cfg(feature = "smoltcp")]
+    if crate::config::SYSCALL_DEBUG_EPOLL_EDGE
+        && let Some((idx, can_recv)) = tcp_trace
+    {
+        crate::tprint!(96, "[epoll-tcp] fd={} idx={} req=0x{:x} can_recv={} ready=0x{:x}\n",
+            fd_num, idx, requested, can_recv, ready);
     }
 
     ready
@@ -777,14 +696,14 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             let table = EPOLL_TABLE.lock();
             let instance = table.get(&epoll_id)?;
 
-            let count = instance.interest_list.len();
+            let count = instance.len();
             if count <= STACK_SNAPSHOT_SIZE {
-                for (i, (&fd, _)) in instance.interest_list.iter().enumerate() {
+                for (i, fd) in instance.fds().enumerate() {
                     stack_snapshot[i] = fd;
                 }
                 Some((count, None))
             } else {
-                Some((count, Some(instance.interest_list.keys().copied().collect::<alloc::vec::Vec<u32>>())))
+                Some((count, Some(instance.fds().collect::<alloc::vec::Vec<u32>>())))
             }
         });
         let (snapshot_count, heap_snapshot) = match snapshot {
@@ -804,12 +723,11 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             // Re-acquire lock to get entry details (MUST NOT hold during readiness check)
             let entry_info = crate::irq::with_irqs_disabled(|| {
                 let table = EPOLL_TABLE.lock();
-                table.get(&epoll_id).and_then(|inst| inst.interest_list.get(&fd)).map(|e| (e.events, e.data, e.last_ready))
+                table.get(&epoll_id).and_then(|inst| inst.get(fd))
             });
 
-            let (raw_events, data, last_ready) = match entry_info {
-                Some(info) => info,
-                None => continue, // FD removed from epoll interest during loop
+            let Some(entry) = entry_info else {
+                continue; // FD removed from epoll interest during loop
             };
 
             // Real Linux implicitly drops a fd from every epoll instance's interest
@@ -827,28 +745,25 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             if akuma_exec::process::current_process_shared().is_none_or(|p| p.get_fd(fd).is_none()) {
                 crate::irq::with_irqs_disabled(|| {
                     if let Some(inst) = EPOLL_TABLE.lock().get_mut(&epoll_id) {
-                        inst.interest_list.remove(&fd);
+                        inst.prune(fd);
                     }
                 });
                 continue;
             }
 
-            let is_et = raw_events & EPOLLET != 0;
-            let requested = raw_events & EPOLL_EVENT_MASK;
-            
             // Pass waker to register interest for event-driven wakeups.
             // epoll_check_fd_readiness locks PROCESS_TABLE.
-            let revents = epoll_check_fd_readiness(fd, requested, Some(&waker));
+            let revents = epoll_check_fd_readiness(fd, entry.requested(), Some(&waker));
 
-            if is_et {
-                let new_bits = revents & !last_ready;
-                // Update last_ready in the table
+            // Level- vs edge-triggered, and what the entry remembers afterwards.
+            // See `akuma_syscalls_poll::edge::scan`.
+            let step = edge::scan(entry.events, revents, entry.last_ready);
+
+            if let Some(record) = step.record {
                 crate::irq::with_irqs_disabled(|| {
-                    let mut table = EPOLL_TABLE.lock();
-                    if let Some(inst) = table.get_mut(&epoll_id)
-                        && let Some(entry) = inst.interest_list.get_mut(&fd) {
-                            entry.last_ready = revents;
-                        }
+                    if let Some(inst) = EPOLL_TABLE.lock().get_mut(&epoll_id) {
+                        inst.record_ready(fd, record);
+                    }
                 });
                 // One line per ready fd, showing whether the edge bookkeeping
                 // let this event through. A lost edge is invisible in every
@@ -861,17 +776,15 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
                         epfd,
                         fd,
                         revents,
-                        last_ready,
-                        new_bits,
-                        if new_bits == 0 { "SUPPRESSED" } else { "deliver" }
+                        entry.last_ready,
+                        step.report,
+                        if step.report == 0 { "SUPPRESSED" } else { "deliver" }
                     );
                 }
-                if new_bits != 0 {
-                    kernel_events.push(EpollEvent { events: new_bits, _pad: 0, data });
-                    ready_count += 1;
-                }
-            } else if revents != 0 {
-                kernel_events.push(EpollEvent { events: revents, _pad: 0, data });
+            }
+
+            if step.report != 0 {
+                kernel_events.push(EpollEvent { events: step.report, _pad: 0, data: entry.data });
                 ready_count += 1;
             }
         }
@@ -961,13 +874,15 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
 /// apk cargo and `/bin/curl` always worked.
 pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64, _sigmask_ptr: u64) -> SysResult {
     if nfds == 0 { return Ok(0); }
-    const MAX_FDS: usize = 1024;
-    if nfds > MAX_FDS { return Err(EINVAL); }
-    let nwords = nfds.div_ceil(64);
-    let fd_set_bytes = nwords * 8;
+    // The cap, the word arithmetic and the bit marshalling are
+    // `akuma_syscalls_poll::fdset` — pure, and untested until it existed. The
+    // buffers stay here: they are stack storage the copy-in/copy-out below
+    // reads and writes, which is a user-memory access, not arithmetic.
+    if !fdset::nfds_ok(nfds) { return Err(EINVAL); }
+    let fd_set_bytes = fdset::bytes(nfds);
 
-    let mut orig_read = [0u64; MAX_FDS / 64];
-    let mut orig_write = [0u64; MAX_FDS / 64];
+    let mut orig_read = [0u64; fdset::MAX_WORDS];
+    let mut orig_write = [0u64; fdset::MAX_WORDS];
 
     if readfds_ptr != 0
         && copy_from_user(&mut as_user_bytes_mut(&mut orig_read)[..fd_set_bytes], readfds_ptr)
@@ -1039,33 +954,15 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
         #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_close();
         let mut ready_count: u64 = 0;
-        let mut out_read = [0u64; MAX_FDS / 64];
-        let mut out_write = [0u64; MAX_FDS / 64];
+        let mut out_read = [0u64; fdset::MAX_WORDS];
+        let mut out_write = [0u64; fdset::MAX_WORDS];
 
-        for fd in 0..nfds {
-            let word = fd / 64;
-            let bit = fd % 64;
-            let mask = 1u64 << bit;
-
-            let in_read = orig_read[word] & mask != 0;
-            let in_write = orig_write[word] & mask != 0;
-            if !in_read && !in_write { continue; }
-
-            let _socket_idx = if fd > 2 {
-                if let Some(proc) = akuma_exec::process::current_process_shared() {
-                    if let Some(akuma_exec::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd as u32) {
-                        Some(idx)
-                    } else { None }
-                } else { None }
-            } else { None };
-
-            let mut requested = 0u32;
-            if in_read { requested |= EPOLLIN; }
-            if in_write { requested |= EPOLLOUT; }
-
-            let revents = epoll_check_fd_readiness(fd as u32, requested, Some(&waker));
-            if in_read && (revents & EPOLLIN != 0) { out_read[word] |= mask; ready_count += 1; }
-            if in_write && (revents & EPOLLOUT != 0) { out_write[word] |= mask; ready_count += 1; }
+        for interest in fdset::interests(&orig_read, &orig_write, nfds) {
+            let revents =
+                epoll_check_fd_readiness(interest.fd as u32, interest.requested(), Some(&waker));
+            // Adds TWO for an fd ready in both directions: `select(2)` returns
+            // the number of bits left set, not the number of fds.
+            ready_count += interest.record(revents, &mut out_read, &mut out_write);
         }
 
         let ready = ready_count > 0;
@@ -1092,7 +989,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
             // No exceptional conditions exist here, but the set still has to be
             // written — see this function's doc comment.
             if exceptfds_ptr != 0 {
-                let cleared = [0u8; MAX_FDS / 8];
+                let cleared = [0u8; fdset::MAX_FDS / 8];
                 if copy_to_user(exceptfds_ptr, &cleared[..fd_set_bytes]).is_err() {
                     return Err(EFAULT);
                 }
@@ -1104,7 +1001,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
             // select(2) reports its result by OVERWRITING all three sets, so
             // "nothing ready" has to be written down, not left alone — see this
             // function's doc comment and `run_pselect6_exceptfds_test`.
-            let cleared = [0u8; MAX_FDS / 8];
+            let cleared = [0u8; fdset::MAX_FDS / 8];
             if readfds_ptr != 0 && copy_to_user(readfds_ptr, &cleared[..fd_set_bytes]).is_err() {
                 return Err(EFAULT);
             }
@@ -1474,16 +1371,17 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
             fd.revents = 0;
             if fd.fd < 0 { continue; }
 
-            let mut requested = 0u32;
-            if fd.events & 1 != 0 { requested |= EPOLLIN; }
-            if fd.events & 4 != 0 { requested |= EPOLLOUT; }
-
-            let revents = epoll_check_fd_readiness(fd.fd as u32, requested, Some(&waker));
-            
-            if (revents & EPOLLIN != 0) && (fd.events & 1 != 0) { fd.revents |= 1; }
-            if (revents & EPOLLOUT != 0) && (fd.events & 4 != 0) { fd.revents |= 4; }
-            if revents & EPOLLHUP != 0 { fd.revents |= 16; } // POLLHUP = 0x10
-            if revents & EPOLLERR != 0 { fd.revents |= 8; }  // POLLERR = 0x08
+            // `POLL*` <-> `EPOLL*` in both directions, including which bits are
+            // maskable and which are not — see `akuma_syscalls_poll::pollfd`,
+            // which also records what this translation drops (`POLLRDHUP`,
+            // `POLLPRI`, `POLLNVAL`). The bit numbers used to be written here
+            // as `1`/`4`/`16`/`8` with the names in trailing comments.
+            let revents = epoll_check_fd_readiness(
+                fd.fd as u32,
+                pollfd::requested(fd.events),
+                Some(&waker),
+            );
+            fd.revents = pollfd::report(fd.events, revents);
 
             if fd.revents != 0 {
                 ready_count += 1;

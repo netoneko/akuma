@@ -16,6 +16,7 @@ default-members = [
     "crates/akuma-scheduler",
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-linux",
+    "crates/akuma-syscalls-poll",
     "crates/akuma-syscalls-sync",
     "crates/akuma-terminal",
     "crates/akuma-syscalls-time",
@@ -682,6 +683,15 @@ akuma-syscalls = { path = "crates/akuma-syscalls" }
 # §8), taken first because every futex bug in docs/archive/ is a property of one
 # of those four things and each one previously cost a -j4 self-host build to find.
 akuma-syscalls-sync = { path = "crates/akuma-syscalls-sync" }
+# The epoll/poll/select family's pure logic: the fd-state -> event-bits
+# readiness map, the interest list and its epoll_ctl errno set, the EPOLLET
+# armed-state decision, and the ppoll/pselect6 wire marshalling. The second
+# family implementation (AKUMA_EXTRACT_SYSCALLS.md §8.2), taken because every
+# epoll incident in BUG_FIX_LIST.md except the lock inversion is one of those
+# four things, and each one previously cost a live VM and a network client to
+# find. The wait loop is NOT here — it is `akuma-net-yarn`, and this extraction
+# stops at the readiness edge.
+akuma-syscalls-poll = { path = "crates/akuma-syscalls-poll" }
 embedded-io-async = { version = "0.6", default-features = false }
 
 [patch.crates-io]

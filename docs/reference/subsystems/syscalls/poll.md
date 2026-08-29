@@ -12,6 +12,11 @@ child channels), see `../networking.md` and [`../vfs.md`](../vfs.md) — this
 doc covers only the syscall entry points: argument validation, the
 epoll interest-list semantics, and known instability history.
 
+The family's **pure logic** — the readiness map, the interest list, the
+`EPOLLET` decision and the two wire marshallings — lives in
+`crates/akuma-syscalls-poll` since 2026-08-29; `src/syscall/poll.rs` keeps
+every effect. See "Where the logic lives" below before changing either.
+
 > **Stability: B (mostly stable, one open gotcha).** The March 2026 EL1-crash
 > /stack-overflow/DNS-hang cohort (6 root causes) is resolved and dormant —
 > no epoll crash fixes since. One item stays genuinely **OPEN**:
@@ -22,6 +27,80 @@ epoll interest-list semantics, and known instability history.
 > `current_process()` (`PROCESS_TABLE`) or a resource's own lock, and two
 > historical whole-kernel deadlocks (`EPOLL_TABLE` ↔ `PROCESS_TABLE`,
 > `NETWORK` ↔ `SOCKET_TABLE`) came from violating exactly that ordering.
+
+## Where the logic lives (2026-08-29)
+
+The family's pure logic is `crates/akuma-syscalls-poll`; `src/syscall/poll.rs`
+keeps every effect. The seam is inside what used to be one function:
+`epoll_check_fd_readiness` **probed** an fd and **mapped** what it found onto
+event bits in a single `match`, and only the second half was ever testable.
+
+| decision | where | what it is |
+|---|---|---|
+| fd state → event bits | `akuma_syscalls_poll::readiness` | one `FdState` variant per fd kind the kernel models, plus which bits are maskable |
+| the interest list | `akuma_syscalls_poll::interest` | fd → `{events, data, last_ready}`, and `epoll_ctl`'s effect on it |
+| `epoll_ctl` op decode + errno set | `akuma_syscalls_poll::ctl` | `ADD`/`MOD`/`DEL`/unknown, whether an op reads a user `epoll_event`, `ENOENT`/`EINVAL` |
+| the `EPOLLET` armed-state decision | `akuma_syscalls_poll::edge` | `revents & !last_ready`, and what the entry records afterwards |
+| `select(2)` fd-set marshalling | `akuma_syscalls_poll::fdset` | the `MAX_FDS` cap, word arithmetic, bit set/test, the bits-not-fds count |
+| `poll(2)` `POLL*`↔`EPOLL*` | `akuma_syscalls_poll::pollfd` | both directions, including which bits `events` masks |
+| **the wait loop** | `akuma-net-yarn` | already extracted 2026-08-24 — see the section below, and do not merge it with anything |
+| every probe | `src/syscall/poll.rs` | `socket_can_recv_tcp`, `pipe_hup`, `listener_ready`, `rump_socket_readable`, … |
+| every waker registration | `src/syscall/poll.rs` | which arms register a poller, and under which requested bit |
+| `EPOLL_TABLE`'s lock + IRQ masking | `src/syscall/poll.rs` | the AB-BA argument, and the `EPOLL_TABLE` ↔ `PROCESS_TABLE` ordering |
+| the interest-list snapshot | `src/syscall/poll.rs` | 128-entry stack array before a heap `Vec` — an allocation policy, kept out of an IRQ-masked hold |
+| the `EBADF` checks | `src/syscall/poll.rs` | fd-table lookups, including the membership probe that keeps `EBADF` ahead of `EFAULT` |
+
+The crate cannot take a lock, touch user memory, probe an fd or wake a thread,
+because it has no way to. `#![forbid(unsafe_code)]`.
+
+**Why the `requested` gating appears on both sides.** Several kernel arms probe
+*conditionally* — `PipeWrite` only asks `pipe_can_write` when `EPOLLOUT` was
+requested, because the same branch registers a poller, and registering one for
+an event nobody asked about adds a wakeup source out of nowhere. Those arms
+report `false` for facts they never established. That is safe only because
+every use of such a fact in the map is already `&&`-ed with the same requested
+bit, so an unprobed `false` and a probed `true` give the same answer. The
+kernel's copy decides which *effects* run; the crate's decides which *bits* come
+out. Pinned by `an_unprobed_fact_cannot_change_the_answer_for_an_unrequested_bit`.
+
+Background: [`../../../archive/AKUMA_EXTRACT_SYSCALLS.md`](../../../archive/AKUMA_EXTRACT_SYSCALLS.md) §8.2.
+
+## Known divergences from Linux
+
+Each is **preserved, not fixed** — an extraction that quietly fixes something
+cannot be A/B'd against what it replaced. Each is pinned by a host test named
+to say what it is, and `epollops` reports the first as a `DIVERGE` line rather
+than a failure (the same static binary answers `PASS` on Linux, which is what
+proves the probe is asking the right question).
+
+| divergence | Linux | here | pinned by |
+|---|---|---|---|
+| `EPOLL_CTL_ADD` on an fd already in the interest list | `EEXIST`, registration untouched | overwrites it like a `MOD` — events, data and edge state — and returns 0 | `an_add_on_a_present_fd_overwrites_instead_of_reporting_eexist`; `epollops` `epoll_ctl_add_twice` |
+| `poll(2)` on an fd the process does not have | `POLLNVAL` | `POLLHUP\|POLLERR` (the fd reaches the map as `FdState::Missing`) | `a_bad_fd_reports_pollhup_pollerr_rather_than_pollnval` |
+| `poll(2)` asked for `POLLRDHUP` | reports a half-close | dropped in both directions, though `epoll` on the same socket reports `EPOLLRDHUP` | `pollrdhup_and_pollpri_are_dropped_in_both_directions` |
+| `select(2)` with a high `nfds` | no limit | `nfds > 1024` is `EINVAL`, a cap `ppoll`/`epoll` do not have | `nfds_above_the_hard_cap_is_rejected` |
+| more ready fds than `maxevents` | a ready-list rotation, so nobody starves | the interest list is walked in ascending fd order and truncated, deterministically | `the_interest_list_is_walked_in_ascending_fd_order` |
+| `epoll_pwait`/`ppoll`/`pselect6` `sigmask` | applied for the duration of the wait | accepted and discarded (see "Argument validation" below) | — |
+| an fd `close()`d while still in an interest list | dropped implicitly by `eventpoll_release_file` | pruned lazily, on the next `epoll_pwait` scan | `pruning_a_closed_fd_is_what_stops_a_synthetic_hup_err` |
+
+`POLLPRI`/`exceptfds` being always empty is **not** on this list: Akuma has no
+out-of-band TCP data, so "none" is the honest answer. What matters there is
+that it is *written down* — see `exceptfds` below.
+
+## Testing
+
+| gate | what it covers | how to run |
+|---|---|---|
+| crate host tests | the readiness map, the interest list, `epoll_ctl`'s errno set, the `EPOLLET` decision, both marshallings — 36 tests, milliseconds, no VM | `cargo test -p akuma-syscalls-poll --target $(rustc -vV \| grep '^host:' \| cut -d' ' -f2)` |
+| `epollops` | the same questions asked of a live kernel, op by op: ET re-arm on a drained read and on a blocked write, the pipe EOF edge, `epoll_ctl`'s errno set, a zero timeout being non-blocking, level-triggered repetition, `poll(2)`'s unrequested `POLLHUP`, `select(2)` overwriting `exceptfds` and counting bits, and the TCP group | `scripts/epoll_suite.py --port 2322` |
+| the same binary on Linux | proves the probe itself is right — every `FAIL` in the guest should be a `PASS` there, and every `DIVERGE` too | `scripts/epoll_suite.py --linux` |
+| boot suite | `test_epoll_eintr_when_signal_pending`, `epoll_edge_rearm_symmetry`, `epoll_pipe_eof_edge_after_partial_drain`, `run_pselect6_*` | any `cargo run --release` without `no-tests` |
+| cost A/B/A | that a change to this family is free: seven non-parking arms, ratio against a `getpid` control | `scripts/benchmarks/epoll_ab_run.sh <label> <outdir> 4 12` |
+
+Tests here are named for the **incident**, not the function: a test called
+`test_epoll_wait` tells the next person nothing, while
+`a_pipe_at_eof_reports_hup_so_the_eof_transition_is_an_edge` tells them what
+breaks and roughly how long they will spend finding it in a VM.
 
 ## Syscall table
 

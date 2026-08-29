@@ -1,6 +1,7 @@
 forktest_child
 forktest_parent
 pattern2_minimal.bin
+c_stress/epollops
 c_stress/smapsdirty
 c_stress/shmanon
 c_stress/fpcpoison

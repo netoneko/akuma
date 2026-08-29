@@ -10,8 +10,9 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 - `crates/` — Host-testable extracted crates:
   `akuma-{exec,ext2,firecracker,isolation,kacho,net,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
   plus the `akuma-syscalls*` family below.
-  The **syscall family** is three crates, layered leaf-first and named so the
-  layering is visible: `akuma-syscalls-linux` is the ABI (numbers, `repr(C)`
+  The **syscall family** is three layers, leaf-first and named so the
+  layering is visible — an ABI crate, a shape crate, and one crate per syscall
+  family (three of those so far): `akuma-syscalls-linux` is the ABI (numbers, `repr(C)`
   wire structs and their layout assertions, flag tables — zero dependencies);
   `akuma-syscalls` is the *shape* of an excursion (which counter bucket, which
   hooks run, where the epilogue's identity comes from) and depends only on the
@@ -30,6 +31,22 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `src/syscall/sync.rs`. Gates: `scripts/futex_suite.py` (correctness) and
   `userspace/futexprobe/` + `scripts/benchmarks/futex_ab_run.sh` (cost, run
   A/B/A — `docs/reference/subsystems/syscalls/sync.md`).
+  `akuma-syscalls-poll` is the third family (2026-08-29): the fd-state ->
+  event-bits **readiness map**, the interest list and `epoll_ctl`'s errno set,
+  the `EPOLLET` armed-state decision, and the `ppoll`/`pselect6` wire
+  marshalling — chosen because every epoll incident in `docs/archive/` except
+  the lock inversion is one of those, and each previously cost a live VM and a
+  network client (bun, tokio, nginx, cargo's libcurl) to find. The seam is
+  inside what was one function: `epoll_check_fd_readiness` **probed** an fd and
+  **mapped** the result in one `match`, and only the mapping was testable.
+  Every probe, waker registration, `EPOLL_TABLE` hold and user copy stays in
+  `src/syscall/poll.rs`. **The wait loop is NOT in it** — that is
+  `akuma-net-yarn`, load-bearing for four syscalls; this extraction stops at
+  the readiness edge. Seven known divergences from Linux are preserved and
+  pinned rather than fixed. Gates: `scripts/epoll_suite.py` (correctness;
+  `--linux` runs the same static binary on real Linux to prove the probe) and
+  `userspace/epollprobe/` + `scripts/benchmarks/epoll_ab_run.sh` (cost, run
+  A/B/A — `docs/reference/subsystems/syscalls/poll.md`).
   Further families move out on the same model when a family has real
   pure logic worth testing.
   `akuma-kacho` is the shared observe/decide/hysteresis layer every self-tuning

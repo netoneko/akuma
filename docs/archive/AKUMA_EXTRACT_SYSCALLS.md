@@ -1,7 +1,9 @@
 # Extracting the syscall ABI: `akuma-syscalls-linux`
 
-Status: **crate 1 built and verified, 2026-08-28.** Crate 2 (the shape crate)
-proposed and deliberately not started — see §7.
+Status: **crate 1 (the ABI) and crate 2 (the shape) both built and verified,
+2026-08-28** — §2 and §7. Family implementations then followed
+opportunistically on the rule in §8: `akuma-syscalls-sync` (futex, §8.1) and
+`akuma-syscalls-poll` (epoll/poll/select, §8.2), both 2026-08-29.
 
 Raised 2026-08-27 while closing out the syscall performance audit
 ([`AKUMA_SYSCALL_PERFORMANCE_AUDIT.md`](AKUMA_SYSCALL_PERFORMANCE_AUDIT.md),
@@ -749,6 +751,131 @@ with futexes. Isolated by rebuilding both arms without the boot suite:
 `--features no-tests` differs by **+1,432 bytes (+0.05%)**, and the size-gated
 `extreme-size` build is **byte-identical**. Any measurement of this kernel's
 image size has to hold the test suite constant or it is measuring LTO weather.
+
+### 8.2 `akuma-syscalls-poll` — the epoll/poll/select family (2026-08-29)
+
+The second family, on the same criterion and with the same shape. `src/syscall/
+poll.rs` was 1,523 lines, but the argument was again the bug history: every
+epoll incident in [`BUG_FIX_LIST.md`](BUG_FIX_LIST.md) except the lock inversion
+is a **state → event-bits mapping** or an **edge re-arm decision**, and every one
+of them was found by pointing a real network client at a live socket and waiting
+to see whether it hung.
+
+| incident | what was actually wrong | now a host test |
+|---|---|---|
+| bun HTTPS fetch hang | `EPOLLET`'s edge not re-armed after a drained `recvfrom`/`recvmsg` | `a_drained_read_rearms_the_in_edge_only_for_et_entries` |
+| epoll spin on a dead connection | `EPOLLHUP` not emitted for a fully-closed TCP socket | `a_dead_tcp_socket_reports_hup_whether_or_not_it_was_asked_for` |
+| an epoll server that never accepts | `EPOLLIN` never reported for a listening TCP socket | `a_listening_socket_is_readable_through_the_same_can_recv_fact` |
+| a client that never sees the last response | `EPOLLIN` not reported after the peer closed | `a_peer_close_reports_in_and_rdhup_together` |
+| tap RX busy-spinning behind a blocking `poll()` | no arm for `FileDescriptor::Tap`, so it fell to the always-ready catch-all | `a_tap_with_no_frame_is_not_ready_unlike_the_catch_all` |
+| `tokio`'s `read_to_end` waiting forever on a pipe at EOF | `pipe_can_read` folds "has bytes" and "at EOF" into one bit, so the EOF transition had no edge | `a_pipe_at_eof_reports_hup_so_the_eof_transition_is_an_edge` |
+| an intermittent half-written request (2 runs in 3 at 64 KiB) | the `EPOLLOUT` edge had no re-arm counterpart | `a_short_write_rearms_the_out_edge_without_disturbing_the_in_edge` |
+
+**The seam is inside one function.** `epoll_check_fd_readiness` did two jobs in a
+single `match`: it **probed** the fd — resolving it, registering the caller's
+waker with the underlying resource, asking a socket whether it can receive,
+asking the rump server over a sysproxy round trip — and it **mapped** what it
+found onto event bits. Every incident above is in the second half. The kernel
+keeps the probe and hands the facts over as an `FdState`.
+
+**What moved:** the readiness map, the interest list, `epoll_ctl`'s op decode and
+errno set, the `EPOLLET` armed-state decision, and the `ppoll`/`pselect6` wire
+marshalling — 36 tests, milliseconds, no mocking. **What stayed:** every probe,
+every waker registration, `EPOLL_TABLE`'s `Spinlock` and its IRQ masking (there
+is a known `EPOLL_TABLE` ↔ `PROCESS_TABLE` inversion to stay on the right side
+of), the 128-entry stack snapshot that keeps an allocation out of an IRQ-masked
+hold, the `EBADF` fd-table lookups, and every user copy. `src/syscall/poll.rs`
+1,523 → 1,421 lines.
+
+**What deliberately did not move, and is the trap in this family:** the wait
+loop. It was already extracted, in 2026-08-24, as `akuma-net-yarn`, and it is
+driven by four call sites whose `WaitPolicy` differs in six fields — each
+difference a real divergence that predates the extraction. Sixth on the incident
+list above, `epoll_pwait` computing an absolute deadline instead of a
+per-iteration sleep, is *that* crate's business and is why this one stops at the
+readiness edge. Nothing here touches it.
+
+**Seven divergences from Linux were preserved, not fixed** — an extraction that
+quietly fixes something cannot be A/B'd against what it replaced. Each is pinned
+by a test named to say what it is, and they are tabulated under "Known
+divergences" in [`../reference/subsystems/syscalls/poll.md`](../reference/subsystems/syscalls/poll.md).
+The loudest is `EPOLL_CTL_ADD` on an fd already in the interest list: Linux
+answers `EEXIST` and leaves the registration alone, this kernel overwrites it
+like a `MOD` and returns 0.
+
+**Correctness gate, which had to be built first.** Unlike futex, this family had
+**no in-guest probe at all** — the gate *was* "run bun and see". So
+`userspace/forktest/c_stress/epollops.c` was written alongside the move: 15
+op-by-op probes covering the incidents above plus `epoll_ctl`'s errno set, the
+non-blocking zero timeout, level-triggered repetition, `poll(2)`'s unrequested
+`POLLHUP`, `select(2)` overwriting `exceptfds` and counting bits rather than fds,
+and a TCP group over loopback. `scripts/epoll_suite.py` runs it and keeps
+`futex_suite.py`'s property that a silent probe is not a pass.
+
+The probe reports a **`DIVERGE`** verdict separately from `FAIL`, which is what
+lets a documented difference stay green without hiding it. The same static musl
+binary run on Linux (`scripts/epoll_suite.py --linux`, through Docker) is what
+proves the probe is asking the right questions: **15/15 PASS, 0 DIVERGE** there.
+On Akuma, **14 PASS / 0 FAIL / 1 DIVERGE** — the `EEXIST` case — and, the point
+of the exercise, **byte-identical verdicts on the before and after kernels**.
+
+**Cost A/B/A.** `userspace/epollprobe/c/epoll_op_cost.c`, seven arms that return
+*without parking* (a parking arm measures the scheduler, whose variance would
+swamp anything this change could do). It emits `futex_op_cost`'s line format on
+purpose, so `scripts/benchmarks/futex_op_ab.py` drives it unchanged — that
+aggregator is arm-agnostic, and a second copy of its 146 lines would be a second
+place to get the ratio-not-ns rule wrong. `SMP=4`, 12 rounds per arm, median of
+the drift-invariant `arm / getpid` ratio:
+
+| arm | B (before) | A1 (after) | A2 (after) | A−B |
+|---|---:|---:|---:|---:|
+| `getpid` (control) | 1.00 | 1.00 | 1.00 | — |
+| `epwait_empty` | 3.37 | 3.30 | 3.35 | −0.05 |
+| `epwait_1fd` | 4.03 | 3.92 | 4.00 | −0.07 |
+| `epwait_ready` | 4.42 | 4.33 | 4.31 | −0.10 |
+| `epctl_mod` | 1.45 | 1.42 | 1.42 | −0.02 |
+| `ppoll_1fd` | 3.90 | 3.86 | 3.90 | −0.02 |
+| `select_1fd` | **3.85** | **3.59** | **3.64** | **−0.24** |
+
+Absolute floors were 137 / 138 / 141 ns, so the three boots were comparable.
+Every epoll arm moves by ≤0.10 in a metric whose round-to-round spread is about
+that — free, which is the only outcome an extraction is allowed to have.
+
+`select_1fd` is the exception, and it is the one that satisfies the A/B/A test:
+it reproduces in **both** A runs (−0.26 and −0.21) while the middle arm dissents,
+which is exactly the pattern a real code effect makes and boot drift does not.
+The cause is a line the move deleted rather than moved. `sys_pselect6`'s scan
+carried a `let _socket_idx = ...` — a `current_process_shared()` + `get_fd()`
+lookup whose result was bound to an underscore and never read. Dead by the
+compiler's reckoning, except that it is a `PROCESS_TABLE` round trip **per fd per
+lap**, which no optimiser will remove. Replacing the open-coded fd-set walk with
+`fdset::interests` left nowhere to put it, so it went. ~28 ns per polled fd per
+lap, on the syscall cargo's libcurl uses for every network wait.
+
+**Image size, holding the boot suite constant** (the ThinLTO lesson from §8.1 —
+measure with `--features no-tests` or you are measuring where LTO decided to put
+the test code):
+
+| build | before | after | delta |
+|---|---:|---:|---:|
+| `--release --features no-tests` | 2,099,320 | 2,091,128 | **−8,192 B (−0.39 %)** |
+| `extreme-size` | 670,152 | 670,152 | **byte-identical** |
+
+Read the first as "it shrank, by no more than 8 KiB" rather than as a precise
+figure: −8,192 is exactly one section-alignment step, so the true reduction is
+somewhere in `(0, 8192]`. The `extreme-size` build has no `sc-epoll` at all, so
+only the readiness map and the two marshallings are reachable there — and they
+compile to the same bytes they replaced, which is the strongest single statement
+that the seam is free.
+
+**One method note, not a new one but newly cheap to state.** The three arms above
+took three boots and about twenty minutes. The 36 host tests ask most of the same
+questions in milliseconds, and they were what caught the two places where the
+first draft of the extraction had quietly changed behaviour — probing
+`socket_can_send_tcp`/`socket_peer_closed_tcp` unconditionally when the kernel had
+short-circuited them on `requested`, which is a lock acquisition per fd per lap,
+not a style difference.
+
 
 ## Background
 
