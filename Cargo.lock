@@ -44,6 +44,7 @@ name = "akuma-exec"
 version = "0.1.0"
 dependencies = [
  "akuma-isolation",
+ "akuma-mmap",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-syscalls-linux",
@@ -81,6 +82,10 @@ dependencies = [
 
 [[package]]
 name = "akuma-kacho"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-mmap"
 version = "0.1.0"
 
 [[package]]

@@ -44,6 +44,10 @@ no-bkl-process = []
 [dependencies]
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-pmm = { path = "../akuma-pmm" }
+# Region bookkeeping: `MmapRegion`, `PhysFrame`, the CoW-inherit and munmap-detach
+# algebra, and the PTE permission vocabulary. Sits BELOW this crate so a future
+# `akuma-syscalls-mem` can name `MmapRegion` without depending on all of exec.
+akuma-mmap = { path = "../akuma-mmap" }
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 spinning_top = "0.3"
 lock_api = "0.4"

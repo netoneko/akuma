@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -236,6 +237,13 @@ class FileCount:
     test_comment: int = 0
     test_code: int = 0
     whole_file_test: bool = False
+    #: `unsafe` keyword sites lexed in CODE context — not in comments, string
+    #: literals or `asm!` bodies, which a grep cannot tell apart. `unsafe_code`
+    #: (as in `#![forbid(unsafe_code)]`) lexes as one identifier and is not
+    #: counted; `#[unsafe(no_mangle)]` (edition 2024) is.
+    unsafe_sites: int = 0
+    #: This file carries a crate-level `#![forbid(unsafe_code)]`.
+    forbids_unsafe: bool = False
 
     @property
     def lines(self) -> int:
@@ -307,6 +315,7 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
     pending_line = 0  # line the gating attribute started on
     awaiting_item = False  # currently inside a test-gated item's header
     last_ident = ""  # most recent identifier token
+    unsafe_sites = 0  # `unsafe` tokens lexed in code context
 
     def close_span(sp):
         for ln in range(sp["start"], line + 1):
@@ -476,6 +485,11 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
             while j < n and _is_ident_char(text[j]):
                 j += 1
             last_ident = text[i:j]
+            if last_ident == "unsafe":
+                # Reached only from the identifier branch, which strings, comments,
+                # char literals and `asm!` bodies never fall through to — so this
+                # counts real `unsafe` sites, unlike a grep over the file.
+                unsafe_sites += 1
             i = j
             continue
 
@@ -509,7 +523,12 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
         for ln in range(sp["start"], line + 1):
             test.add(ln)
 
-    return code, comment, test, all_file_test
+    return code, comment, test, all_file_test, unsafe_sites
+
+
+#: A crate-level `#![forbid(unsafe_code)]`, at the start of a line so a mention
+#: inside a doc comment ("carries `#![forbid(unsafe_code)]`") does not match.
+FORBID_RE = re.compile(r"^\s*#!\[forbid\([^)]*\bunsafe_code\b", re.M)
 
 
 def count_file(path: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> FileCount:
@@ -520,10 +539,12 @@ def count_file(path: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> Fi
 
 def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> FileCount:
     nlines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
-    code, comment, test, inner_test = scan(text, spec, kernel_gate)
+    code, comment, test, inner_test, unsafe_sites = scan(text, spec, kernel_gate)
 
     fc = FileCount(path=relpath, lang=spec.name)
     fc.whole_file_test = is_test_path(relpath) or inner_test
+    fc.unsafe_sites = unsafe_sites
+    fc.forbids_unsafe = FORBID_RE.search(text) is not None
 
     for ln in range(1, nlines + 1):
         is_test = fc.whole_file_test or ln in test
@@ -678,10 +699,16 @@ class Agg:
     test_comment: int = 0
     test_code: int = 0
     test_files: int = 0
+    unsafe_sites: int = 0
+    #: True once ANY file in this component carried `#![forbid(unsafe_code)]` —
+    #: in practice its `lib.rs`, since the attribute is crate-level.
+    forbids_unsafe: bool = False
 
     def add(self, fc: FileCount):
         self.files += 1
         self.test_files += 1 if fc.whole_file_test else 0
+        self.unsafe_sites += fc.unsafe_sites
+        self.forbids_unsafe = self.forbids_unsafe or fc.forbids_unsafe
         for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code"):
             setattr(self, f, getattr(self, f) + getattr(fc, f))
 
@@ -769,6 +796,8 @@ def print_report(files: list, paths: list, ignored: int, by_file: bool, top: int
         )
     print(rule(W))
 
+    print_unsafe_report(by_comp, W)
+
     if top:
         print()
         print(rule(W))
@@ -798,6 +827,51 @@ def print_report(files: list, paths: list, ignored: int, by_file: bool, top: int
         print(rule(W))
 
 
+def print_unsafe_report(by_comp: dict, W: int) -> None:
+    """`unsafe` density per crate, and how much code lives in enforced-safe crates.
+
+    Exists because the same two numbers were being hand-maintained in
+    `docs/reference/crate-safety.md` and went stale: its prose said "Ten of the
+    eighteen" while its own tables listed 12 and 9. Numbers a document cannot
+    regenerate are numbers that drift, so regenerate them.
+
+    Only `crates/*` rows can be enforced-safe — `src` is the bin crate and carries
+    no crate-level ban.
+    """
+    crates = {c: a for c, a in by_comp.items() if c.startswith("crates" + os.sep)}
+    if not crates:
+        return
+
+    print()
+    print(rule(W))
+    print(f"{'Unsafe by crate':<28}{'code':>9}{'unsafe':>9}{'per kloc':>11}{'enforced':>11}")
+    print(rule(W))
+    for comp, agg in sorted(crates.items(), key=lambda kv: (-kv[1].unsafe_sites, kv[0])):
+        per_kloc = (1000.0 * agg.unsafe_sites / agg.total_code) if agg.total_code else 0.0
+        mark = "forbid" if agg.forbids_unsafe else ""
+        print(
+            f"{comp:<28}{agg.total_code:>9}{agg.unsafe_sites:>9}"
+            f"{per_kloc:>11.1f}{mark:>11}"
+        )
+    print(rule(W))
+
+    safe = [a for a in crates.values() if a.forbids_unsafe]
+    safe_code = sum(a.total_code for a in safe)
+    all_code = sum(a.total_code for a in crates.values())
+    all_unsafe = sum(a.unsafe_sites for a in crates.values())
+    leaked = sum(a.unsafe_sites for a in safe)
+
+    print(f"enforced unsafe-free ... {len(safe)} of {len(crates)} crates")
+    print(f"code in those crates ... {safe_code} of {all_code} ({pct(safe_code, all_code).strip()})")
+    print(f"unsafe sites ........... {all_unsafe} across crates/, {leaked} inside enforced crates")
+    if leaked:
+        # `forbid` makes this a hard compile error, so a non-zero count means the
+        # counter is wrong (or an `#[unsafe(...)]` attribute was counted), not that
+        # the ban was bypassed.
+        print("  !! non-zero inside a `forbid(unsafe_code)` crate — check the counter")
+    print(rule(W))
+
+
 def emit_json(files: list, paths: list) -> None:
     total = Agg()
     by_lang: dict = {}
@@ -818,6 +892,8 @@ def emit_json(files: list, paths: list) -> None:
             "test_code": agg.test_code,
             "prod_comment": agg.comment,
             "test_comment": agg.test_comment,
+            "unsafe_sites": agg.unsafe_sites,
+            "forbids_unsafe": agg.forbids_unsafe,
         }
 
     print(
@@ -836,6 +912,8 @@ def emit_json(files: list, paths: list) -> None:
                         "prod_code": fc.code,
                         "test_code": fc.test_code,
                         "test_file": fc.whole_file_test,
+                        "unsafe_sites": fc.unsafe_sites,
+                        "forbids_unsafe": fc.forbids_unsafe,
                     }
                     for fc in sorted(files, key=lambda f: f.path)
                 ],

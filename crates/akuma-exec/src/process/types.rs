@@ -5,7 +5,6 @@
 
 #![allow(dead_code)]
 
-use crate::runtime::PhysFrame;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -406,110 +405,16 @@ pub struct LazyRegion {
     pub source: LazySource,
 }
 
-/// An eagerly-mapped `mmap` region (all pages resident at mmap time).
+/// An eagerly-mapped `mmap` region, re-exported from `akuma-mmap`.
 ///
-/// `pages` — not `frames.len()` — is the authoritative extent of the region.
-/// The two are equal for a region this process created itself via `mmap`, but a
-/// **CoW-forked child inherits `pages` with an empty `frames`**: the child maps
-/// every page (read-only, shared with the parent) but owns none of them, so it
-/// has no per-region frame list to record. Frame ownership for such a child is
-/// tracked solely in `UserAddressSpace::user_frames`, which is refcounted.
-///
-/// Deriving the extent from `frames.len()` therefore reports 0 pages for any
-/// inherited region, which is how a *grandchild* fork used to lose its parent's
-/// mmap regions entirely — `cow_share_range` skipped them as zero-length, and
-/// the grandchild took an unrecoverable translation fault on first touch (see
-/// `docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md`). Use `pages` for extent
-/// (sharing, demotion, munmap sizing) and `frames` only when a real PA is
-/// required, guarding the index against a short/empty list.
-#[derive(Clone)]
-pub struct MmapRegion {
-    pub start_va: usize,
-    pub pages: usize,
-    pub frames: Vec<PhysFrame>,
-    /// The protection this mapping is *supposed* to have, in `mmu::user_flags`
-    /// terms — the eager counterpart of `LazyRegion::flags`.
-    ///
-    /// Without it an eager region records extent and frames but no permission, so
-    /// the EL0 write-permission-fault handler cannot tell a PTE that is wrongly
-    /// read-only (page state lost some other way) from a mapping that is
-    /// legitimately read-only (`mprotect(PROT_READ)`). Lazy regions carry flags and
-    /// therefore get a permission upgrade; eager regions had no such path and died
-    /// with SIGSEGV instead. See
-    /// `docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §3.
-    pub flags: u64,
-
-    /// `MAP_SHARED | MAP_ANONYMOUS`: this mapping must survive `fork` as **one
-    /// object**, not as a copy-on-write copy.
-    ///
-    /// Everything else in an address space is private, so fork demotes it to RO and
-    /// lets the first write break CoW. Doing that to a `MAP_SHARED` anonymous
-    /// mapping silently gives parent and child separate pages — a child's write is
-    /// then invisible to the parent, which is the opposite of what the flag asks
-    /// for. Regions carrying this take
-    /// [`share_rw_range`](crate::process::share_rw_range) at fork instead: same
-    /// frames, mapped writable in the child, parent left alone.
-    ///
-    /// Must propagate to inherited regions too, or a grandchild silently stops
-    /// sharing. Probe: `userspace/forktest/c_stress/shmanon.c`.
-    pub shared_anon: bool,
-}
-
-impl MmapRegion {
-    /// Region created by this process: it owns every frame, protection unrecorded.
-    ///
-    /// Defaults to `NONE` **deliberately**. `flags` exists so the fault handler can
-    /// grant a write it would otherwise refuse, so an unknown protection has to be
-    /// the one that grants nothing: a wrong `RW` default would silently defeat
-    /// `mprotect(PROT_READ)` on any region built through this constructor. `NONE`
-    /// leaves such a region behaving exactly as it did before `flags` existed.
-    /// Callers that know the real protection use [`MmapRegion::owned_with_flags`].
-    pub fn owned(start_va: usize, frames: Vec<PhysFrame>) -> Self {
-        Self::owned_with_flags(start_va, frames, crate::mmu::user_flags::NONE)
-    }
-
-    /// Region created by this process, with its real protection recorded.
-    pub fn owned_with_flags(start_va: usize, frames: Vec<PhysFrame>, flags: u64) -> Self {
-        Self { start_va, pages: frames.len(), frames, flags, shared_anon: false }
-    }
-
-    /// Region inherited by a CoW-forked child: extent known, no owned frames,
-    /// protection unrecorded (`NONE` — see [`MmapRegion::owned`] for why).
-    pub fn inherited(start_va: usize, pages: usize) -> Self {
-        Self::inherited_with_flags(start_va, pages, crate::mmu::user_flags::NONE)
-    }
-
-    /// Region inherited by a CoW-forked child, carrying the parent's protection.
-    pub fn inherited_with_flags(start_va: usize, pages: usize, flags: u64) -> Self {
-        Self { start_va, pages, frames: Vec::new(), flags, shared_anon: false }
-    }
-
-    /// Mark this region `MAP_SHARED | MAP_ANONYMOUS`. See [`MmapRegion::shared_anon`].
-    #[must_use]
-    pub fn shared_anon(mut self) -> Self {
-        self.shared_anon = true;
-        self
-    }
-
-
-    pub fn len_bytes(&self) -> usize {
-        self.pages * 4096
-    }
-
-    pub fn contains(&self, va: usize) -> bool {
-        va >= self.start_va && va < self.start_va + self.len_bytes()
-    }
-
-    /// Physical frame backing `va`, if this process owns a frame list covering it.
-    /// Returns `None` for CoW-inherited regions (no owned frames) and for any VA
-    /// outside the owned prefix.
-    pub fn frame_for(&self, va: usize) -> Option<PhysFrame> {
-        if !self.contains(va) {
-            return None;
-        }
-        self.frames.get((va - self.start_va) / 4096).copied()
-    }
-}
+/// The type and its two pure operations — `inherit_mmap_regions_for_cow_child` and
+/// `detach_eager_regions_in_range` — moved there so region algebra could be host
+/// tested without this crate, and so a future `akuma-syscalls-mem` can name a region
+/// without depending on all of `akuma-exec`. What stayed here is everything that
+/// needs a process or a lock: `Process::mmap_regions` itself, the `vm_lock` /
+/// `vm_with_regions` discipline that guards it, and every pid-keyed accessor in
+/// `process::children`.
+pub use akuma_mmap::MmapRegion;
 
 /// Process state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

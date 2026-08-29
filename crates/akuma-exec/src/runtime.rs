@@ -10,27 +10,14 @@ pub use akuma_primitives::OnceCopy;
 
 use akuma_primitives::Registered;
 
-/// Physical page frame (mirrors kernel pmm::PhysFrame).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PhysFrame {
-    pub addr: usize,
-}
-
-impl PhysFrame {
-    pub const fn new(addr: usize) -> Self {
-        Self {
-            addr: addr & !(4096 - 1),
-        }
-    }
-
-    pub fn containing_address(addr: usize) -> Self {
-        Self::new(addr)
-    }
-
-    pub fn start_address(&self) -> usize {
-        self.addr
-    }
-}
+/// Physical page frame (mirrors kernel `pmm::PhysFrame`).
+///
+/// Moved to `akuma-mmap` so `MmapRegion` — whose `frames` field is a
+/// `Vec<PhysFrame>` — could move below this crate. It is a `Copy` newtype over a
+/// `usize` with no `Drop`, so hosting it costs that crate no allocator and no PMM.
+/// Re-exported here so existing `akuma_exec::runtime::PhysFrame` imports (45 of them
+/// in `mmu/mod.rs` alone) keep working unchanged.
+pub use akuma_mmap::PhysFrame;
 
 /// Allocation source for debug frame tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

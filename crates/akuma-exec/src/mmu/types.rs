@@ -4,8 +4,16 @@
 
 #![allow(dead_code)]
 
-pub const PAGE_SIZE: usize = 4096;
-pub const PAGE_SHIFT: usize = 12;
+/// Page geometry and the PTE permission vocabulary, re-exported from `akuma-mmap`.
+///
+/// They moved so `MmapRegion` could: a region's `flags` field is a `user_flags`
+/// value and `detach_eager_regions_in_range` divides by `PAGE_SIZE`, so both had to
+/// sit at or below the crate that owns the region. Same move, same reason, as the
+/// device-window table below. Everything else in this file — `PageTable`, the MAIR
+/// attributes, `attr_index`, the block sizes, and the `FaultAccess`/`lazy_map_flags`
+/// demand-paging policy — stays here with the walker and the fault path that use it.
+pub use akuma_mmap::{PAGE_SHIFT, PAGE_SIZE, flags, user_flags};
+
 pub const ENTRIES_PER_TABLE: usize = 512;
 pub const BITS_PER_LEVEL: usize = 9;
 
@@ -25,25 +33,6 @@ pub const MAIR_NORMAL_NC: u64 = 1;
 pub const MAIR_NORMAL_WT: u64 = 2;
 pub const MAIR_NORMAL_WB: u64 = 3;
 
-pub mod flags {
-    pub const VALID: u64 = 1 << 0;
-    pub const TABLE: u64 = 1 << 1;
-    pub const BLOCK: u64 = 0 << 1;
-    pub const AF: u64 = 1 << 10;
-    pub const SH_INNER: u64 = 3 << 8;
-    pub const SH_OUTER: u64 = 2 << 8;
-    pub const AP_RW_EL1: u64 = 0 << 6;
-    pub const AP_RW_ALL: u64 = 1 << 6;
-    pub const AP_RO_EL1: u64 = 2 << 6;
-    pub const AP_RO_ALL: u64 = 3 << 6;
-    /// AP field mask (bits [7:6]) — isolates the access-permission bits from a PTE
-    /// or a `user_flags` value so the two can be compared.
-    pub const AP_MASK: u64 = 3 << 6;
-    pub const USER: u64 = 1 << 6;
-    pub const PXN: u64 = 1 << 53;
-    pub const UXN: u64 = 1 << 54;
-    pub const NG: u64 = 1 << 11;
-}
 
 #[inline]
 pub const fn attr_index(idx: u64) -> u64 {
@@ -64,40 +53,6 @@ impl PageTable {
     }
 }
 
-pub mod user_flags {
-    use super::flags;
-    /// PROT_NONE: EL1-only access, EL0 gets no read/write/exec.
-    pub const NONE: u64 = flags::AP_RO_EL1 | flags::UXN | flags::PXN;
-    pub const RO: u64 = flags::AP_RO_ALL;
-    pub const RW: u64 = flags::AP_RW_ALL;
-    pub const EXEC: u64 = flags::AP_RO_ALL;
-    pub const RW_NO_EXEC: u64 = flags::AP_RW_ALL | flags::UXN | flags::PXN;
-    pub const RX: u64 = flags::AP_RO_ALL | flags::PXN;
-
-    pub fn from_prot(prot: u32) -> u64 {
-        if prot == 0 { return NONE; }
-        match (prot & 0x2 != 0, prot & 0x4 != 0) {
-            (true, _)      => RW_NO_EXEC,
-            (false, true)  => RX,
-            (false, false) => RO,
-        }
-    }
-
-    pub fn is_none(flags: u64) -> bool {
-        flags == NONE
-    }
-
-    /// Whether a mapping with these flags lets EL0 *fetch instructions* from the page.
-    ///
-    /// This is the predicate that decides whether a demand-paged frame needs the
-    /// `dc cvau` + `ic ivau` sequence: I-cache maintenance is only load-bearing for a
-    /// page some PE will fetch from. It reads `UXN` and nothing else, deliberately —
-    /// `AP` decides read/write, `PXN` decides EL1 fetch, and neither is relevant to
-    /// what EL0 can execute.
-    pub const fn is_exec(flags: u64) -> bool {
-        flags & flags::UXN == 0
-    }
-}
 
 /// Which EL0 abort a demand-paging fault arrived through.
 ///
@@ -175,34 +130,6 @@ mod tests {
         for (i, &e) in pt.entries.iter().enumerate() {
             assert_eq!(e, 0, "entry {} should be 0", i);
         }
-    }
-
-    #[test]
-    fn user_flags_from_prot() {
-        // prot 0 = PROT_NONE (no EL0 access)
-        assert_eq!(user_flags::from_prot(0), user_flags::NONE);
-        assert!(user_flags::is_none(user_flags::from_prot(0)));
-        // prot 1 = PROT_READ
-        assert_eq!(user_flags::from_prot(1), user_flags::RO);
-        assert!(!user_flags::is_none(user_flags::from_prot(1)));
-        // prot 2 = PROT_WRITE
-        assert_eq!(user_flags::from_prot(2), user_flags::RW_NO_EXEC);
-        // prot 4 = PROT_EXEC
-        assert_eq!(user_flags::from_prot(4), user_flags::RX);
-    }
-
-    #[test]
-    fn user_flags_is_exec_reads_only_uxn() {
-        assert!(user_flags::is_exec(user_flags::RX));
-        assert!(user_flags::is_exec(user_flags::EXEC));
-        assert!(!user_flags::is_exec(user_flags::RW_NO_EXEC));
-        assert!(!user_flags::is_exec(user_flags::NONE));
-        // `RO`/`RW` carry no UXN, so they are exec by this predicate — that is the
-        // AArch64 encoding, not an oversight: a PTE without UXN *is* EL0-executable.
-        assert!(user_flags::is_exec(user_flags::RO));
-        // PXN (EL1 fetch) must not influence the answer.
-        assert!(user_flags::is_exec(user_flags::RO | flags::PXN));
-        assert!(!user_flags::is_exec(user_flags::RO | flags::UXN));
     }
 
     /// The full policy table of the merged DA/IA demand-paging body: for every

@@ -1,0 +1,14 @@
+[package]
+name = "akuma-mmap"
+version = "0.1.0"
+edition = "2024"
+description = "Virtual-memory region bookkeeping: the MmapRegion record, CoW-fork inheritance, and munmap's range detach/split algebra, plus the PTE permission vocabulary those speak. Region algebra only — every page-table edit, frame allocation and lock stays in akuma-exec."
+
+[lints]
+workspace = true
+
+# No dependencies, by design. This crate sits BELOW `akuma-exec` so both it and a
+# future `akuma-syscalls-mem` can name `MmapRegion` without either depending on the
+# other. It owns region *algebra* and nothing else: it cannot allocate a frame, edit
+# a page table, take a lock, or name a `Process`. See the crate docs for the line.
+[dependencies]

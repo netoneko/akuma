@@ -479,9 +479,92 @@ worth flagging rather than smoothing over.
 
 ---
 
-## Stat 3: 44.1% comment-to-code
+## Stat 3: 47.7% comment-to-code — and the extraction programme is why it moved
 
 High for a systems codebase; `~15–20%` is the usual range quoted for Linux.
+
+**Re-measured 2026-08-29** (`scripts/cloc_akuma.py src crates`). Only this stat was
+re-measured on that date; everything else in this document still carries the
+2026-08-23 figures.
+
+| point | comment / code |
+|---|---|
+| `v0.0.7` (2026-06-19) | **21.2%** |
+| 2026-08-23 | 44.1% |
+| 18c60d1a (2026-08-29, before `akuma-mmap`) | 47.6% |
+| after `akuma-mmap` | 47.7% |
+
+**The `v0.0.7` row is the one that reframes this stat.** Ten weeks ago the ratio
+was 21.2% — inside the `15–20%` band this section quotes for Linux, not above it.
+So "high for a systems codebase" describes a *recent* state, not a standing
+characteristic of the codebase. Over those ten weeks code grew 48%
+(57,775 → 85,472) while comments grew **233%** (12,259 → 40,809).
+
+The +3.6 is **not** a drift in how existing code is commented — it is the
+extraction programme showing up in the aggregate. Extracted leaves document their
+own seam and run far above the tree mean, so every extraction moves lines from a
+45%-commented bin crate into a 67–89%-commented leaf:
+
+| component | code | comment | ratio |
+|---|---|---|---|
+| `src` | 30,887 | 14,022 | 45.4% |
+| `crates/akuma-exec` | 16,083 | 9,900 | 61.6% |
+| `crates/akuma-syscalls-poll` | 740 | 657 | **88.8%** |
+| `crates/akuma-syscalls-sync` | 741 | 517 | 69.8% |
+| `crates/akuma-mmap` | 398 | 266 | 66.8% |
+
+Three syscall-family extractions landed between the last two measurements
+(`akuma-syscalls-time`, `-sync`, `-poll`); `akuma-mmap` accounts for only +0.1 of
+the +3.6. See [`AKUMA_EXTRACT_MMAP.md`](AKUMA_EXTRACT_MMAP.md) §6.
+
+### The same window, in `unsafe`
+
+`scripts/cloc_akuma.py` gained `unsafe`-site counting on 2026-08-29, and it runs
+under `--rev`, so the same window can be measured rather than asserted:
+
+| | `v0.0.7` | `v0.0.7-akuma-on-aws` | 2026-08-29 |
+|---|---:|---:|---:|
+| date | 2026-06-19 | 2026-08-21 | 2026-08-29 |
+| crates | 10 | 14 | 22 |
+| code (`src` + `crates`) | 57,775 | 72,865 | 85,472 |
+| comment / code | 21.2% | 44.1% | 47.7% |
+| `unsafe` sites, tree-wide | **777** | 656 | **680** |
+| … in `src/` | 536 | 308 | 313 |
+| … in `crates/` | 241 | 348 | 367 |
+| `unsafe` per kloc | 13.4 | 9.0 | **8.0** |
+| crates with `#![forbid(unsafe_code)]` | **0 of 10** | **0 of 14** | 13 of 22 |
+| code in those crates | 0 | 0 | 9,623 |
+
+`v0.0.7-akuma-on-aws` is the tag this document's own 2026-08-23 measurement was
+taken at — the 44.1% row and that tag agree exactly, which is a useful check on
+both.
+
+Two windows, two different stories, and the second is the honest one to quote for
+recent work:
+
+- **`v0.0.7` → now (10 weeks).** The tree grew 48% and `unsafe` fell 12.5% in
+  absolute terms. `src/` shed 42% of its sites.
+- **`akuma-on-aws` → now (8 days).** `unsafe` *rose* 656 → 680. Half of the +24 is
+  one crate: `akuma-syscalls-linux`'s 12 `transmute` layout assertions, which are
+  `unsafe` that buys safety — they pin `repr(C)` ABI structs against Linux headers
+  at compile time. The rest is `akuma-exec` +6 and `src` +5 against ~12,600 lines
+  of growth, and `akuma-isolation` −1 (its last site, removed deliberately).
+  Density still fell, 9.0 → 8.0 per kloc.
+
+The `forbid` row is the one to notice: **the entire enforcement discipline is
+eight days old.** At `akuma-on-aws` not one of the fourteen crates banned `unsafe`;
+thirteen of twenty-two do now. That is not a slow trend, it is a sweep — which
+means it has not yet been tested by much subsequent change.
+
+Over the full ten weeks the codebase grew by half and shed an eighth of its
+`unsafe` in absolute terms. The `src/` and `crates/` rows show the mechanism:
+extraction does not delete `unsafe`, it *relocates* it — out of the bin crate, into a crate where it is
+either irreducible and documented as such, or absent and enforced absent. The
+`forbid` discipline did not exist at all at `v0.0.7`.
+
+Read against Stat 3's Reading B (comment density as a complexity tell), these two
+tables are the counter-evidence: the prose grew alongside a measured *fall* in the
+construct that most needs prose to be safe.
 
 **Reading A — a debugging-history artifact.** Much of Akuma's commentary records
 *why* an invariant exists, often citing the archived investigation that
@@ -494,7 +577,12 @@ whose invariants aren't expressible in its structure. The BKL carve-out comments
 are the test case: they exist because "which lock protects this, under which
 feature combination" cannot currently be read off the types.
 
-Both readings are consistent with the same measurement.
+Both readings are consistent with the same measurement, and the per-crate table
+above sharpens the second one. `akuma-syscalls-poll` at 88.8% is the case to watch:
+a seam needing 657 lines of prose to say what must not cross it is a seam a reader
+cannot infer from the types. `akuma-mmap` at 66.8% is the mild case — its central
+claim ("this crate cannot lock or allocate") is expressed structurally, in an empty
+`[dependencies]` table, and the prose only points at it.
 
 ---
 
@@ -803,7 +891,7 @@ tracks pain almost perfectly** — which is both a compliment and a prediction.
   whose build nothing verifies automatically.
 - **Comments assert intent that stopped being true.** `cleanup_box_queues`'
   "Called from sys_kill_box" is false in-source; `src/tests.rs:3` points readers at
-  a dead entry point. At 44.1% comment density (Stat 3) comments are load-bearing,
+  a dead entry point. At 47.7% comment density (Stat 3) comments are load-bearing,
   so wrong ones actively mislead rather than merely age.
 - **Invariants are enforced per-site rather than derived.** The
   `caller_box != 0 → EPERM` rule appears at 3 sites in `src/syscall/container.rs`
