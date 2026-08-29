@@ -582,6 +582,32 @@ document: [`CONSOLE_LOG_COST.md`](CONSOLE_LOG_COST.md). It is a logging finding,
 not a memory one; it is recorded there so it is findable by the next person
 measuring a syscall, not buried in an extraction writeup.
 
+### 10.3.3 `madvise` took a lock per page
+
+`madv_unmapped` was the second-loudest arm in `mem_op_cost` and clean of console
+writes, so the cost was real work — just far more of it than the job needed.
+
+`madvise_dontneed_range`'s first pass filtered the range with
+`lazy_region_lookup_for_pid(proc.tgid, va)` **once per page**, and that helper is
+`lookup_process_shared` + `with_irqs_disabled` + `lazy_regions.lock()` + lookup.
+A 64-page `MADV_DONTNEED` therefore did 64 process-table walks, 64 IRQ
+mask/unmask pairs and 64 spinlock round-trips — to read one map that never
+changed, and to re-find a `Process` the caller already held as `proc`.
+
+Now one lock for the whole range, with the `Vec` reserved *before* the hold
+(a `collect()` inside it would allocate with IRQs masked and a spinlock held).
+A/B/A on a loaded host, ratio to `getpid`:
+
+| | median | spread |
+|---|---|---|
+| lock per page | **30.1×** | 4.0× |
+| lock per range | **4.8×** | 1.5× |
+
+**6.3× on the median**, 2.3× comparing the baseline's best run against the fixed
+version's worst. The stability is the second result: 64 lock acquisitions are 64
+chances to contend, so the old version degraded badly under load. Full method in
+[`CONSOLE_LOG_COST.md`](CONSOLE_LOG_COST.md) §9.
+
 ### 10.4 The correctness gate, and what it found
 
 `scripts/mem_suite.py` (new) runs the ten probes already in

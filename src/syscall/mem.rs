@@ -360,15 +360,19 @@ fn mmap_eager_to_lazy_fallback(
             );
             let count = akuma_exec::process::push_lazy_region_with_source(
                 proc.tgid, mmap_addr, pages * 4096, page_flags, source);
-            crate::tprint!(128, "[mmap] eager OOM -> lazy-file fallback pid={} pages={} ({} regions)\n",
+            if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+                crate::tprint!(128, "[mmap] eager OOM -> lazy-file fallback pid={} pages={} ({} regions)\n",
                 proc.pid, pages, count);
+            }
             return mmap_addr as u64;
         }
         return ENOMEM;
     }
     let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
-    crate::tprint!(128, "[mmap] eager OOM -> lazy fallback pid={} pages={} ({} regions)\n",
+    if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+        crate::tprint!(128, "[mmap] eager OOM -> lazy fallback pid={} pages={} ({} regions)\n",
         proc.pid, pages, count);
+    }
     mmap_addr as u64
 }
 
@@ -420,8 +424,10 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         // guard a process can map user pages at e.g. 0x8000_0000, overlapping the
         // kernel's physical-RAM identity map and causing silent memory corruption.
         if mmap_fixed_overlaps_kernel_va(addr, pages * 4096) {
-            crate::tprint!(128, "[mmap] REJECT MAP_FIXED kernel VA: pid={} addr=0x{:x} len=0x{:x}\n",
+            if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+                crate::tprint!(128, "[mmap] REJECT MAP_FIXED kernel VA: pid={} addr=0x{:x} len=0x{:x}\n",
                 proc.pid, addr, pages * 4096);
+            }
             return EINVAL;
         }
         if is_fixed {
@@ -437,10 +443,12 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         }
         addr
     } else if let Some(a) = proc.vm_alloc_mmap(pages * 4096) { a } else {
-        crate::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
+        if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+            crate::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
             proc.pid, pages * 4096,
             proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed),
             proc.memory.mmap_limit);
+        }
         return ENOMEM;
     };
 
@@ -974,15 +982,33 @@ fn madvise_dontneed_range(
     // the zero-frame design does not apply.
     //
     // MADV_DONTNEED_SHARED_FRAME.md "Still open" item 2.
-    let file_vas: alloc::vec::Vec<usize> = (0..pages)
-        .map(|i| aligned_addr + i * 4096)
-        .filter(|va| {
-            matches!(
-                akuma_exec::process::lazy_region_lookup_for_pid(proc.tgid, *va),
+    // ONE lock acquisition for the whole range, not one per page.
+    //
+    // This was `lazy_region_lookup_for_pid(proc.tgid, va)` per page, and that
+    // helper does `lookup_process_shared(pid)` + `with_irqs_disabled` +
+    // `lazy_regions.lock()` + the lookup — so a 64-page `MADV_DONTNEED` performed
+    // 64 process-table walks, 64 IRQ mask/unmask pairs and 64 spinlock
+    // round-trips, to consult one map that never changed and to re-find a
+    // `Process` the caller already holds as `proc`. Measured 2026-08-29:
+    // `madv_unmapped` was 32.7 ns/page with nothing mapped and nothing to do.
+    //
+    // The `Vec` is reserved BEFORE the lock on purpose: `collect()` inside the
+    // hold would allocate with IRQs masked and a spinlock held, which is the
+    // re-entrancy hazard `CLAUDE.md` § "Kernel conventions" is about. Reserving
+    // `pages` is the exact worst case, so no push inside can grow it.
+    let mut file_vas: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(pages);
+    crate::irq::with_irqs_disabled(|| {
+        let lr = proc.lazy_regions.lock();
+        for i in 0..pages {
+            let va = aligned_addr + i * 4096;
+            if matches!(
+                lr.lookup(va),
                 Some((_, akuma_exec::process::LazySource::File { .. }, _, _))
-            )
-        })
-        .collect();
+            ) {
+                file_vas.push(va);
+            }
+        }
+    });
     if !file_vas.is_empty() {
         let mut dropped: alloc::vec::Vec<crate::pmm::PhysFrame> =
             alloc::vec::Vec::with_capacity(file_vas.len());

@@ -1186,7 +1186,9 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         }
                         Ok(n) => break n as u64,
                         Err(e) => {
-                            crate::safe_print!(128, "[syscall] write: PipeWrite fd={} pipe_id={} EPIPE ({} bytes)\n", fd_num, pipe_id, buf_slice.len());
+                            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                crate::safe_print!(128, "[syscall] write: PipeWrite fd={} pipe_id={} EPIPE ({} bytes)\n", fd_num, pipe_id, buf_slice.len());
+                            }
                             if total_written > 0 { return total_written as u64; }
                             return (-i64::from(e)) as u64;
                         }
@@ -2759,8 +2761,10 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
         F_GETLK | F_SETLK | F_SETLKW => 0,
         F_SETOWN | F_GETOWN => 0,
         _ => {
-            crate::safe_print!(192, "[fcntl] UNSUPPORTED: pid={} fd={} cmd={} arg={:#x}\n",
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::safe_print!(192, "[fcntl] UNSUPPORTED: pid={} fd={} cmd={} arg={:#x}\n",
                 proc.pid, fd, cmd, arg);
+            }
             EINVAL
         },
     }
@@ -2860,7 +2864,9 @@ pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpa
 
     let oldpath = resolve_path_at(olddirfd, &raw_old)?;
     let newpath = resolve_path_at(newdirfd, &raw_new)?;
-    crate::safe_print!(256, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(256, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
+    }
     match crate::fs::rename(&oldpath, &newpath) {
         Ok(()) => Ok(0),
         Err(e) => Err(fs_error_to_errno(e)),

@@ -52,7 +52,9 @@ pub fn sys_msgget(key: i32, flags: i32) -> u64 {
             let msqid = NEXT_MSQID.fetch_add(1, Ordering::SeqCst);
             let mode = (flags & 0o777) as u32;
             table.insert((box_id, msqid), MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new(), recv_pollers: PollerMap::new(), send_pollers: PollerMap::new() });
-            crate::tprint!(96, "[msgget] box={} IPC_PRIVATE -> msqid={}\n", box_id, msqid);
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::tprint!(96, "[msgget] box={} IPC_PRIVATE -> msqid={}\n", box_id, msqid);
+            }
             u64::from(msqid)
         } else {
             let found = table.iter()
@@ -62,13 +64,17 @@ pub fn sys_msgget(key: i32, flags: i32) -> u64 {
                 if flags & IPC_EXCL != 0 {
                     return EEXIST;
                 }
-                crate::tprint!(96, "[msgget] box={} key={} found msqid={}\n", box_id, key, msqid);
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::tprint!(96, "[msgget] box={} key={} found msqid={}\n", box_id, key, msqid);
+                }
                 u64::from(msqid)
             } else if flags & IPC_CREAT != 0 {
                 let msqid = NEXT_MSQID.fetch_add(1, Ordering::SeqCst);
                 let mode = (flags & 0o777) as u32;
                 table.insert((box_id, msqid), MsgQueue { key, mode, cbytes: 0, messages: VecDeque::new(), recv_pollers: PollerMap::new(), send_pollers: PollerMap::new() });
-                crate::tprint!(96, "[msgget] box={} IPC_CREAT key={} -> msqid={}\n", box_id, key, msqid);
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::tprint!(96, "[msgget] box={} IPC_CREAT key={} -> msqid={}\n", box_id, key, msqid);
+                }
                 u64::from(msqid)
             } else {
                 ENOENT
@@ -95,7 +101,9 @@ pub fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
             for handle in pollers_to_wake {
                 wake_by_handle(handle);
             }
-            crate::tprint!(96, "[msgctl] box={} IPC_RMID msqid={}\n", box_id, msqid);
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::tprint!(96, "[msgctl] box={} IPC_RMID msqid={}\n", box_id, msqid);
+            }
             0
         }
         IPC_STAT => {

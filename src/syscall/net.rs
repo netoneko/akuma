@@ -155,7 +155,9 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
     let nonblock = sock_type & 0x800 != 0;
     // Only AF_UNIX (1); accept SOCK_STREAM (1) and SOCK_SEQPACKET (5).
     if domain != 1 || (base_type != 1 && base_type != 5) {
-        crate::safe_print!(96, "[syscall] socketpair(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
+        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            crate::safe_print!(96, "[syscall] socketpair(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
+        }
         return EAFNOSUPPORT;
     }
     if !validate_user_ptr(sv_ptr, 8) {

@@ -839,10 +839,11 @@ pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = false;
 /// this line is what names the syscall that produced it — so turn it on while
 /// hunting exactly that, and turn it back off.
 ///
-/// **Read `CONSOLE_LOG_COST.md` §3 before re-enabling**: the errno set was
-/// narrowed to EFAULT alone as a cost workaround, which silently made this
-/// block's `ENOSYS`/`EINVAL` names and its whole `mmap`-EINVAL decode
-/// unreachable. Re-enabling as-is gets you less than the code appears to offer.
+/// Covers `EFAULT`, `ENOSYS` and `EINVAL`. It had silently collapsed to `EFAULT`
+/// alone — a cost workaround that made this block's other two names and its whole
+/// `mmap`-EINVAL decode unreachable; fixed 2026-08-29 (`CONSOLE_LOG_COST.md` §3).
+/// So turning this on now also brings back the `readlinkat` `EINVAL` flood the
+/// narrowing was avoiding, at ~250 µs a line. Budget for it.
 pub const SYSCALL_ERRNO_DIAG_ENABLED: bool = false;
 
 /// Stale-instruction-cache **spurious-SVC** guard (§7k.4 root cause).

@@ -66,6 +66,8 @@ pub(super) fn sys_pidfd_open(pid: u32, flags: u32) -> u64 {
         proc.set_nonblock(fd);
     }
 
-    crate::tprint!(96, "[pidfd] open pid={} → fd={} (pidfd_id={})\n", pid, fd, pidfd_id);
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::tprint!(96, "[pidfd] open pid={} → fd={} (pidfd_id={})\n", pid, fd, pidfd_id);
+    }
     u64::from(fd)
 }

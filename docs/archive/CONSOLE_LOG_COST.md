@@ -79,8 +79,13 @@ and the workaround was reasonable. The consequence was not noticed:
   own comment says *"the §E investigation hinges on"* — is **unreachable**.
 
 So the code paid 250 µs per EFAULT to print a line, while the part described as
-load-bearing had been dead since the narrowing. Anyone re-enabling this gets less
-than the source appears to offer. **Fix that before trusting it.**
+load-bearing had been dead since the narrowing.
+
+**Fixed 2026-08-29.** The parameter is now `is_diag_errno` and the kernel passes
+`result == EFAULT || result == ENOSYS || result == EINVAL`, so the block handles
+what it claims to. Turning the flag on now costs the `readlinkat` flood as well
+as the per-line cost — that is the caller's trade, but it is at least the trade
+the source describes.
 
 ## 4. Why it mattered beyond tidiness
 
@@ -137,7 +142,99 @@ the console. `CLAUDE.md` already forbids *allocating* on the console path; this
 is the same argument one step further out — the console is expensive even when
 you allocate nothing.
 
-## 8. How to re-measure
+## 8. The audit that followed: 25 ungated prints, and one lock-per-call
+
+If one trace could be 99.94% of a syscall, the obvious next question is how many
+others there are. Every `safe_print!`/`tprint!`/`console::print` under
+`src/syscall/` was classified — **279 sites**, of which **80 had no config gate
+at all**.
+
+Most of those 80 are fine: periodic dumps (`[PIPE-DUMP]`, `[FUTEX-DUMP]`,
+`[SC-STATS]`), kernel-test `[PASS]`/`[FAIL]` lines, anomaly reports
+(`[MUNMAP-STALE]`, `[DONTNEED-FILE]`) and the read-path profiler. Those fire on
+paths userspace cannot drive in a loop.
+
+**25 could be driven in a loop**, and are now gated behind the flag that already
+exists for their subsystem — no new knobs:
+
+| sites | where | flag |
+|---|---|---|
+| 8 | `aio.rs` — every `io_setup`/`io_submit`/`io_cancel`/`io_getevents`/`io_destroy` | `SYSCALL_DEBUG_INFO_ENABLED` |
+| 4 | `msgqueue.rs` — every `msgget`/`msgctl` | `SYSCALL_DEBUG_INFO_ENABLED` |
+| 4 | `mem.rs` — `[mmap] REJECT` (×2) and the eager-OOM fallbacks | `MEM_SYSCALL_TRACE_ENABLED` |
+| 3 | `fs.rs` — every `renameat`, `fcntl` with an unsupported cmd, pipe-write `EPIPE` | `SYSCALL_DEBUG_INFO_ENABLED` |
+| 1 each | `timerfd_settime`, `pidfd_open`, `prctl` unsupported, `socketpair` unsupported, pipe-write warn, `copy_from_user_str` bad UTF-8 | subsystem flag |
+
+`SYSCALL_DEBUG_INFO_ENABLED` was the natural home: its own doc already records
+the same lesson from the last time round — the `[FORK-DBG]`/`[TRAMP]` traces
+"were unconditional and cost ~20 serial lines per `fork()` … enough to dominate
+the log and shift the timing of the paths they trace."
+
+### 8.1 Gating a print is not enough if the *argument* is the work
+
+Three of the `aio` stubs opened with:
+
+```rust
+let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
+```
+
+`sys_io_submit`, `sys_io_cancel` and `sys_io_getevents` return `0`
+unconditionally. `exists` had exactly one consumer: choosing which debug string
+to print. So each of those three syscalls **masked IRQs, took a spinlock and
+probed a map** to decide the wording of a line that no shipping profile prints.
+
+Wrapping the `print` alone would have left all of that. The lookup moved inside
+the gate, so with the flag off (every shipping profile) the three stubs are now
+`return 0` and nothing else.
+
+**That is the general shape to look for**: not "is the print gated" but "is
+anything computed *for* the print gated with it". A print that formats
+`current_thread_id()` or `current_trap_frame_elr()` forces the kernel to resolve
+state the syscall itself never needed — which is the same reason
+`akuma_syscalls::fast_path` exists, and the reason a `FastPath::Leaf` syscall
+must not have a diagnostic that resolves identity behind its back.
+
+## 9. The same question one layer down: a lock per page
+
+Drilling into `madv_unmapped` — the second-loudest arm in `mem_op_cost`, and
+clean of console writes (§7) — found the same shape without a print involved.
+
+`madvise_dontneed_range`'s first pass filtered the range with
+
+```rust
+lazy_region_lookup_for_pid(proc.tgid, va)   // once PER PAGE
+```
+
+and that helper is `lookup_process_shared(pid)` + `with_irqs_disabled` +
+`lazy_regions.lock()` + the lookup. A 64-page `MADV_DONTNEED` therefore performed
+**64 process-table walks, 64 IRQ mask/unmask pairs and 64 spinlock round-trips**,
+to consult one map that never changed — and to re-find a `Process` the caller
+was already holding as `proc`.
+
+Fixed by taking the lock **once for the range**. The `Vec` is reserved *before*
+the hold, because `collect()` inside it would allocate with IRQs masked and a
+spinlock held — the re-entrancy hazard `CLAUDE.md` § "Kernel conventions" is
+about.
+
+Measured A/B/A, 2 baseline and 2 fixed runs interleaved on a **loaded** host, so
+read the ratio to `getpid` and not the ns:
+
+| | ratio to `getpid` | spread |
+|---|---|---|
+| one lock per page | 12.5 – 49.7, median **30.1×** | 4.0× |
+| one lock per range | 3.6 – 5.5, median **4.8×** | 1.5× |
+
+**6.3× faster on the median; 2.3× comparing the baseline's best run to the
+fixed version's worst.** The *stability* is the second result and arguably the
+more interesting one: 64 lock acquisitions are 64 opportunities to contend or be
+preempted, so the per-page version degraded badly under load while the hoisted
+one barely moved. On an idle host the same arm measured 13.1× before the fix.
+
+Correctness unchanged: `scripts/mem_suite.py` 10/10, boot suite 315 PASSED / 0
+failures.
+
+## 10. How to re-measure
+
 
 ```bash
 userspace/memprobe/c/build.sh --push-akuma 2322

@@ -421,7 +421,9 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
     }
     
     if let Ok(s) = core::str::from_utf8(&bytes) { Ok(String::from(s)) } else {
-        crate::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
+        }
         Err(EINVAL)
     }
 }
@@ -1000,7 +1002,19 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         crate::syscall::utils::read_profile::F_LAP_DISP,
     );
 
-    let epi = excursion.epilogue(u64::from(owner_pid), result == EFAULT);
+    // The errno set the diagnostic below covers. It was `result == EFAULT` alone
+    // — a cost workaround for an `EINVAL` flood from `readlinkat` probes during
+    // cargo builds — and that narrowing silently made the block's `ENOSYS` and
+    // `EINVAL` names, and its whole `mmap`-EINVAL decode, UNREACHABLE: `result`
+    // could only ever be `EFAULT` inside it. The cost that forced the workaround
+    // is gone (`SYSCALL_ERRNO_DIAG_ENABLED` is off by default now, measured at
+    // ~250 µs per line — docs/archive/CONSOLE_LOG_COST.md), so the gate matches
+    // what the code below claims to handle again. Turning the flag on now costs
+    // the flood as well as the cost; that is the caller's trade, made knowingly.
+    let epi = excursion.epilogue(
+        u64::from(owner_pid),
+        result == EFAULT || result == ENOSYS || result == EINVAL,
+    );
 
     // MEASUREMENT ONLY. `cur` is the PROLOGUE's resolution, and the dispatch
     // above can be open-ended (ppoll/futex/blocking read). `kill_thread_group`
@@ -1077,7 +1091,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // Log when a syscall returns a dangerous negative error code.  Go's runtime may
     // not check the error and dereference the negative return value as a pointer,
     // causing a WILD-DA crash (FAR = the error code).
-    // TEMP DEBUG nca-build EFAULT: EINVAL floods readlinkat probes during cargo builds.
+    //
+    // Reachable for EFAULT, ENOSYS and EINVAL — see the `epilogue()` call above
+    // for why that had silently collapsed to EFAULT alone, and what it cost.
     if epi.errno_diag {
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
         let err_name = if result == EFAULT { "EFAULT" } else if result == ENOSYS { "ENOSYS" } else { "EINVAL" };

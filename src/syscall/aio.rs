@@ -110,7 +110,9 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
         return EFAULT;
     }
 
-    crate::tprint!(64, "[io_setup] nr_events={} ring_va=0x{:x}\n", capped_nr, ring_va);
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::tprint!(64, "[io_setup] nr_events={} ring_va=0x{:x}\n", capped_nr, ring_va);
+    }
     0
 }
 
@@ -120,11 +122,19 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
 /// CRITICAL: Must never return a negative value.  Go treats negative returns as
 /// pointers (e.g. EINVAL=-22, then Go accesses *(x0+16) = *(-6) → WILD-DA).
 pub(super) fn sys_io_submit(ctx: u64, _nr: i64, _iocbpp: u64) -> u64 {
-    let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
-    if !exists {
-        crate::tprint!(96, "[io_submit] ctx=0x{:x} not found → 0\n", ctx);
-    } else {
-        crate::tprint!(128, "[io_submit] ctx=0x{:x} nr={} → stub 0\n", ctx, _nr);
+    // The context lookup is INSIDE the gate on purpose. It is a
+    // `with_irqs_disabled` + `AIO_CONTEXTS.lock()` + map probe, and its only
+    // consumer is the message below — this function returns 0 either way. With
+    // the flag off (every shipping profile) that made three stub syscalls each
+    // mask IRQs and take a lock to decide a string nobody prints. See
+    // docs/archive/CONSOLE_LOG_COST.md §9.
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
+        if exists {
+            crate::tprint!(128, "[io_submit] ctx=0x{:x} nr={} → stub 0\n", ctx, _nr);
+        } else {
+            crate::tprint!(96, "[io_submit] ctx=0x{:x} not found → 0\n", ctx);
+        }
     }
     0
 }
@@ -134,11 +144,19 @@ pub(super) fn sys_io_submit(ctx: u64, _nr: i64, _iocbpp: u64) -> u64 {
 /// Stub: always returns 0.  We never submit I/O so there is nothing to cancel.
 /// CRITICAL: Must never return a negative value — same WILD-DA risk as io_submit.
 pub(super) fn sys_io_cancel(ctx: u64, _iocb: u64, _result: u64) -> u64 {
-    let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
-    if !exists {
-        crate::tprint!(128, "[io_cancel] ctx=0x{:x} not found → 0\n", ctx);
-    } else {
-        crate::tprint!(128, "[io_cancel] ctx=0x{:x} → 0\n", ctx);
+    // The context lookup is INSIDE the gate on purpose. It is a
+    // `with_irqs_disabled` + `AIO_CONTEXTS.lock()` + map probe, and its only
+    // consumer is the message below — this function returns 0 either way. With
+    // the flag off (every shipping profile) that made three stub syscalls each
+    // mask IRQs and take a lock to decide a string nobody prints. See
+    // docs/archive/CONSOLE_LOG_COST.md §9.
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
+        if exists {
+            crate::tprint!(128, "[io_cancel] ctx=0x{:x} → 0\n", ctx);
+        } else {
+            crate::tprint!(128, "[io_cancel] ctx=0x{:x} not found → 0\n", ctx);
+        }
     }
     0
 }
@@ -150,9 +168,17 @@ pub(super) fn sys_io_cancel(ctx: u64, _iocb: u64, _result: u64) -> u64 {
 /// to dereference it as a pointer → WILD-DA at FAR=0xffffffffffffffda.  Returning
 /// EINVAL (-22) has the same risk: Go accesses *(x0+offset) → WILD-DA.
 pub(super) fn sys_io_getevents(ctx: u64, _min_nr: i64, _nr: i64, _events: u64, _timeout: u64) -> u64 {
-    let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
-    if !exists {
-        crate::tprint!(128, "[io_getevents] ctx=0x{:x} not found → 0\n", ctx);
+    // The context lookup is INSIDE the gate on purpose. It is a
+    // `with_irqs_disabled` + `AIO_CONTEXTS.lock()` + map probe, and its only
+    // consumer is the message below — this function returns 0 either way. With
+    // the flag off (every shipping profile) that made three stub syscalls each
+    // mask IRQs and take a lock to decide a string nobody prints. See
+    // docs/archive/CONSOLE_LOG_COST.md §9.
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
+        if !exists {
+            crate::tprint!(128, "[io_getevents] ctx=0x{:x} not found → 0\n", ctx);
+        }
     }
     // Ring is always empty (head == tail), so 0 events are ready.
     0
@@ -171,10 +197,14 @@ pub(super) fn sys_io_destroy(ctx: u64) -> u64 {
         // freed when the process exits (or we could unmap it here, but
         // leaving it mapped until exit is safe since bun never reuses the
         // address and the page is read-only after io_destroy).
-        crate::tprint!(64, "[io_destroy] ctx=0x{:x} destroyed\n", ctx);
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::tprint!(64, "[io_destroy] ctx=0x{:x} destroyed\n", ctx);
+        }
         0
     } else {
-        crate::tprint!(96, "[io_destroy] ctx=0x{:x} not found → 0 (avoid EINVAL for Go)\n", ctx);
+        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            crate::tprint!(96, "[io_destroy] ctx=0x{:x} not found → 0 (avoid EINVAL for Go)\n", ctx);
+        }
         0
     }
 }

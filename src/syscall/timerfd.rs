@@ -104,8 +104,10 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
         initial_us
     };
 
-    crate::safe_print!(128, "[timerfd] settime id={} initial={}us interval={}us\n",
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::safe_print!(128, "[timerfd] settime id={} initial={}us interval={}us\n",
         timer_id, effective_initial, interval_us);
+    }
 
     if initial_us == 0 && interval_us == 0 {
         table.remove(&timer_id);

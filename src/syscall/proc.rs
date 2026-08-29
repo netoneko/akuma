@@ -1835,8 +1835,10 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
             0
         }
         _ => {
-            crate::tprint!(128, "[prctl] unsupported option={} arg2={:#x} arg3={:#x} arg4={:#x} arg5={:#x}\n",
+            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                crate::tprint!(128, "[prctl] unsupported option={} arg2={:#x} arg3={:#x} arg4={:#x} arg5={:#x}\n",
                 option, arg2, arg3, arg4, arg5);
+            }
             0
         }
     }

@@ -528,11 +528,18 @@ impl Excursion {
     /// Everything the kernel does after the dispatch returns.
     ///
     /// `owner_pid` is the prologue's tgid (0 when it did not resolve) and
-    /// `is_efault` is `result == EFAULT`. Both are values the kernel already
-    /// holds; passing them keeps errno constants and process state out of a
-    /// crate that must depend on neither.
+    /// `is_diag_errno` is "the result is one of the errnos the diagnostic
+    /// covers" — `EFAULT`, `ENOSYS` or `EINVAL`. Both are values the kernel
+    /// already holds; passing them keeps errno constants and process state out
+    /// of a crate that must depend on neither.
+    ///
+    /// The parameter was `is_efault` (literally `result == EFAULT`) until
+    /// 2026-08-29. That narrowing was a cost workaround, and it silently made
+    /// the caller's `ENOSYS`/`EINVAL` branches — including its whole
+    /// `mmap`-EINVAL decode — unreachable. See
+    /// `docs/archive/CONSOLE_LOG_COST.md` §3.
     #[must_use]
-    pub const fn epilogue(self, owner_pid: u64, is_efault: bool) -> EpiloguePlan {
+    pub const fn epilogue(self, owner_pid: u64, is_diag_errno: bool) -> EpiloguePlan {
         let leaf = matches!(fast_path(self.nr), FastPath::Leaf);
         let need_timing = (self.cfg.process_stats || self.cfg.proc_log) && !leaf;
         EpiloguePlan {
@@ -546,7 +553,7 @@ impl Excursion {
             // `owner_pid == 0` means the prologue never resolved an identity,
             // and the ring is keyed by pid — there is nothing to file it under.
             log: need_timing && self.cfg.proc_log && owner_pid != 0,
-            errno_diag: self.cfg.errno_diag && is_efault,
+            errno_diag: self.cfg.errno_diag && is_diag_errno,
         }
     }
 }

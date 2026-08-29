@@ -184,7 +184,9 @@ pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
 
             Ok(n)
         } else {
-            crate::safe_print!(128, "[pipe] write WARN: pipe id={} not found (len={})\n", id, data.len());
+            if crate::config::PIPE_TRACE_ENABLED {
+                crate::safe_print!(128, "[pipe] write WARN: pipe id={} not found (len={})\n", id, data.len());
+            }
             Err(false)
         }
     });
