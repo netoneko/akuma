@@ -22,6 +22,24 @@ Same static-musl aarch64 binary on both kernels, same host, same silicon
 | same, with the two debug flags off (below) | | **330 ns** | 2.2× |
 | `getppid` (control — must match `getpid`) | ~150 ns | 460 ns | |
 
+> **This table is superseded — do not quote it as current (noted 2026-08-28).**
+> It is the *problem statement*, preserved as written. The cause was found and
+> fixed the same day (see "Resolution" below), and the numbers were re-measured
+> on 2026-08-28 with the same probe binary on both guests while extracting
+> `akuma-syscalls`:
+>
+> | | Akuma `SMP=4` | Akuma `SMP=1` | Linux (4 vCPU) |
+> |---|---:|---:|---:|
+> | `getpid` | **130 ns** | 190 ns | **136 ns** |
+> | `uname` | 140 ns | 240 ns | 154 ns |
+> | leaf (`akuma_get_version`) | **90 ns** | 160 ns | — |
+>
+> Parity at `SMP=4`, 1.4× at `SMP=1`, and a leaf syscall *below* Linux's floor.
+> The `uname`/`getpid` ratio — 1.08× on Akuma against 1.13× on Linux — says
+> `copy_to_user` is not where Akuma loses; what remains at `SMP=1` is the fixed
+> boundary. **The analysis below still stands; only this headline does not.**
+> Source: [`AKUMA_EXTRACT_SYSCALLS.md`](AKUMA_EXTRACT_SYSCALLS.md) §7.8.
+
 Linux is Ubuntu 26.04 in Lima under Apple `vz`; Akuma is `cargo build --release`
 under QEMU HVF. Different hypervisors, which is a caveat on the absolute ratio —
 but not on the internal decomposition below, and not on any A/B, all of which

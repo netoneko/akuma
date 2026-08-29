@@ -630,7 +630,12 @@ floor on the tier's value, not a ceiling.
 - `src/syscall/utils/read_profile.rs` has a pre-existing
   `clippy::manual_is_multiple_of` error under `--features read-profile`. Not
   reached by the pre-commit hook, which does not lint that feature set.
-- **The audit's headline is stale in a good way.** It opens with Akuma at
+- ~~**The audit's headline is stale in a good way.**~~ **Done 2026-08-29:** the
+  audit's headline table now carries a dated "superseded" block with the
+  re-measured numbers, and `docs/README.md`'s symptom row — which still routed
+  readers to the audit as **OPEN** at 440 ns — was rewritten to say RESOLVED and
+  to point at the two sweeps it actually deferred. The original text of this
+  item follows, since it is where the numbers came from. It opens with Akuma at
   **3.0×** Linux on a bare `getpid` (440 vs 147 ns). Measured today with the
   same probe binary on both guests — Linux being Ubuntu in Lima under Apple
   `vz`, 4 vCPUs, so `SMP=4` is the like-for-like row:
@@ -655,6 +660,95 @@ family has real pure logic worth testing — never as a batch move of 16k lines.
 Now that ABI marshalling has moved out, what is left in `fs.rs` / `net.rs` is
 thinner glue over `akuma-vfs` / `akuma-ext2` / `akuma-net`, which are already
 crates.
+
+### 8.1 `akuma-syscalls-sync` — the futex family (2026-08-29)
+
+The first family taken on that rule, and chosen for **falsifiability** rather
+than size. `src/syscall/sync.rs` was 1,131 lines, but the argument was the bug
+history: every futex incident in `docs/archive/` is a property of the queue
+algebra, the key namespace or the deadline arithmetic, and every one of them was
+found by running a `-j4` rustc self-host build in QEMU for minutes and reading a
+wedged thread dump afterwards.
+
+| incident | what was actually wrong | now a host test |
+|---|---|---|
+| `pthread_join` hangs forever | `futex_wake` published only to the `tgid=0` queue | `an_unresolved_identity_is_degraded_not_shared`, the namespace tests |
+| `typenum` build stalls | a requeued waiter leaving by timeout stranded its tid on the target, where it ate a later wake | `a_requeued_waiter_is_found_on_the_target_not_its_original_key` |
+| rustc "futex deadlock", worse the longer the VM had been up | `FUTEX_WAIT_BITSET`'s absolute deadline treated as relative | `wait_bitset_timeouts_are_absolute_and_plain_wait_timeouts_are_relative` |
+| a wake landing on a thread that was never waiting | a dead tid left queued by a thread killed while parked, slot then recycled | `purge_crosses_every_namespace_because_the_recycler_has_no_context` |
+| cross-process lost wakeups under `-j4` only | musl's `__thread_list_lock` is a fixed VA with `priv = 0`; no ASLR, so every process shared one queue | `a_non_private_op_on_ordinary_memory_still_keys_by_address_space` |
+
+**What moved:** op decode, the `(tgid, uaddr)` waiter table, the key-namespace
+policy, the deadline algebra, the `WAKE_OP` opcode, and the wait loop's outcome
+decision — 42 tests, milliseconds, no mocking. **What stayed:** the `Spinlock`,
+the IRQ masking, the `Prefault::No` in-hold user read, every wake, and all the
+diagnostic machinery. The crate cannot take a lock, touch user memory or wake a
+thread; the waiter identity it holds exposes only `tid()`, for finding queue
+entries. `src/syscall/sync.rs` 1,131 → 933 lines.
+
+The `futex` opcodes went to `akuma-syscalls-linux` (`flags::futex`), not into
+the new crate — they are ABI, they pass crate 1's membership test, and leaving
+them in the bin crate would have forced the second copy this whole effort
+exists to prevent.
+
+**Correctness gate.** `scripts/futex_suite.py` builds, pushes and runs the three
+existing probes and refuses to call a silent probe a pass. All three pass on
+both arms: `futexops` (op-by-op vs Linux) 0 divergences, `futexkey` 3/3,
+`futextest` 7/7 phases, plus the boot suite's own `test_futex_*` set.
+
+**Cost gate, and the method it cost to get right.** `userspace/futexprobe/c/futex_op_cost.c`
+times six futex ops that return *without parking* — a parking arm measures the
+scheduler, whose variance would swamp anything a table refactor could do. Three
+findings about the measurement itself, each of which produced a wrong answer
+first:
+
+1. **A probe's own warm-up can invalidate it.** The first draft calibrated the
+   clock with 200,000 `clock_gettime` calls — 200,000 real syscalls on Akuma.
+   Every arm after it read ~2x the floor this kernel's other probe reported on
+   the same boot, with a per-pass mean 8x its own minimum. A process that has
+   just issued a quarter-million syscalls is not a representative process.
+   Bounding the warm-up fixed it, and the arms then ordered monotonically by the
+   work they do, which they had not before.
+2. **`floor+N` is not drift-invariant, and the first A/B was wrong because of
+   it.** Subtracting the `getpid` control from each arm looks like it removes
+   boot-to-boot drift. It does not: a boot whose floor read 180 ns instead of
+   130 showed every arm's `floor+N` inflated *proportionally*. The drift is
+   multiplicative — a slower boot slows the whole syscall path, not just its
+   fixed part. Read the ratio `arm / getpid`, and prefer `SMP=4`, which was
+   dramatically steadier here than `SMP=1`.
+3. **The resolution floor is the microsecond clock, not the 41.7 ns counter.**
+   Each pass is timed once around N calls, so the counter's granularity divides
+   by N; what binds is `clock_gettime`'s microsecond truncation, 1000/N ns per
+   call. That makes every `calls=100` number a multiple of 10 and invites the
+   suspicion that a `+30` reading is three quanta of nothing. Swept on one boot:
+   `wake_empty` +20/+23/+22 and `wake_op` +70/+65/+65 at 100/500/2000 calls per
+   pass. The costs survive a 20x finer quantum, so they are real work.
+
+**The result, by the A/B/A the drift forces** (arms cannot be interleaved, each
+needs a reboot, so a code effect must reproduce in both A runs while the middle
+arm dissents). `SMP=4`, 12 rounds each, median absolute ns:
+
+| | B-before | A1-after | A2-after |
+|---|---:|---:|---:|
+| `getpid` (control) | 135 | 140 | 140 |
+| `wake_empty` | 160 | 160 | 160 |
+| `wait_eagain` | 160 | 165 | 165 |
+| `requeue` | 160 | 165 | 160 |
+| `wake_op` | 200 | 200 | 200 |
+
+Every difference is ≤5 ns against a 10 ns/call resolution — the extraction is
+free. An earlier `SMP=1` pair appeared to show a +15…+55 ns regression; that was
+one unlucky boot, and it is the reason the protocol is A/B/A rather than A/B.
+
+**One size surprise, worth not misreading.** The default `cargo build --release`
+image grew **+337 KB**, which is not what a refactor that shrank its own
+functions should do (`nm`: `futex_requeue_table` −1564 B, `futex_purge_tid`
+−1252 B, `futex_do_wake` −728 B). It is ThinLTO reshuffling *test* code:
+`tests::run_memory_tests` alone accounts for +225 KB, and it has nothing to do
+with futexes. Isolated by rebuilding both arms without the boot suite:
+`--features no-tests` differs by **+1,432 bytes (+0.05%)**, and the size-gated
+`extreme-size` build is **byte-identical**. Any measurement of this kernel's
+image size has to hold the test suite constant or it is measuring LTO weather.
 
 ## Background
 

@@ -165,6 +165,87 @@ pub mod epoll {
     pub const EPOLL_CLOEXEC: u32 = 0o2000000;
 }
 
+/// `futex(2)` operations and bitfields — `<linux/futex.h>`.
+///
+/// These were function-local `const`s inside `sys_futex` until 2026-08-29, one
+/// of the last such blocks left after the flag sweep above. They move here for
+/// the same reason as the rest, plus one specific to this family: the futex
+/// *logic* now lives in `akuma-syscalls-sync`, a crate that cannot see the bin
+/// crate's privates, so leaving the opcodes in `src/syscall/sync.rs` would have
+/// meant a second copy — the exact duplication this crate exists to end.
+///
+/// The two flag bits are ORed into the `op` argument and must be masked off
+/// before the command is matched; [`cmd_of`] and [`is_private`] are the two
+/// halves of that split, spelled once here so no caller re-derives them.
+pub mod futex {
+    pub const FUTEX_WAIT: i32 = 0;
+    pub const FUTEX_WAKE: i32 = 1;
+    /// Removed from Linux in 2.6.26 and unimplemented here — kept named so a
+    /// `2` in a log is identifiable rather than mysterious.
+    pub const FUTEX_FD: i32 = 2;
+    pub const FUTEX_REQUEUE: i32 = 3;
+    pub const FUTEX_CMP_REQUEUE: i32 = 4;
+    pub const FUTEX_WAKE_OP: i32 = 5;
+    pub const FUTEX_LOCK_PI: i32 = 6;
+    pub const FUTEX_UNLOCK_PI: i32 = 7;
+    pub const FUTEX_TRYLOCK_PI: i32 = 8;
+    pub const FUTEX_WAIT_BITSET: i32 = 9;
+    pub const FUTEX_WAKE_BITSET: i32 = 10;
+    pub const FUTEX_WAIT_REQUEUE_PI: i32 = 11;
+    pub const FUTEX_CMP_REQUEUE_PI: i32 = 12;
+
+    /// Scopes the futex to one address space.
+    ///
+    /// **Not** the same question as which key namespace Akuma uses — see
+    /// `akuma_syscalls_sync::key`, which documents why Linux keys anonymous
+    /// memory by address space whether or not this bit is set.
+    pub const FUTEX_PRIVATE_FLAG: i32 = 128;
+    /// Selects `CLOCK_REALTIME` for the timeout of `FUTEX_WAIT_BITSET`
+    /// (and `FUTEX_WAIT_REQUEUE_PI`). Ignored for plain `FUTEX_WAIT`, whose
+    /// timeout is relative and therefore clock-agnostic.
+    pub const FUTEX_CLOCK_REALTIME: i32 = 256;
+
+    /// The bitset a plain `FUTEX_WAIT`/`FUTEX_WAKE` behaves as, i.e. "any".
+    pub const FUTEX_BITSET_MATCH_ANY: u32 = 0xFFFF_FFFF;
+
+    /// The command, with both flag bits removed.
+    #[must_use]
+    pub const fn cmd_of(op: i32) -> i32 {
+        op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME)
+    }
+
+    /// Whether `op` carries [`FUTEX_PRIVATE_FLAG`].
+    #[must_use]
+    pub const fn is_private(op: i32) -> bool {
+        (op & FUTEX_PRIVATE_FLAG) != 0
+    }
+
+    /// Whether `op` carries [`FUTEX_CLOCK_REALTIME`].
+    #[must_use]
+    pub const fn is_realtime(op: i32) -> bool {
+        (op & FUTEX_CLOCK_REALTIME) != 0
+    }
+
+    /// `FUTEX_WAKE_OP`'s `val3` encoding:
+    /// `{ shift[31], op[30:28], cmp[27:24], oparg[23:12], cmparg[11:0] }`.
+    pub mod wake_op {
+        pub const FUTEX_OP_SET: u32 = 0;
+        pub const FUTEX_OP_ADD: u32 = 1;
+        pub const FUTEX_OP_OR: u32 = 2;
+        pub const FUTEX_OP_ANDN: u32 = 3;
+        pub const FUTEX_OP_XOR: u32 = 4;
+        /// ORed into the op nibble: `oparg` is used as `1 << oparg`.
+        pub const FUTEX_OP_OPARG_SHIFT: u32 = 8;
+
+        pub const FUTEX_OP_CMP_EQ: u32 = 0;
+        pub const FUTEX_OP_CMP_NE: u32 = 1;
+        pub const FUTEX_OP_CMP_LT: u32 = 2;
+        pub const FUTEX_OP_CMP_LE: u32 = 3;
+        pub const FUTEX_OP_CMP_GT: u32 = 4;
+        pub const FUTEX_OP_CMP_GE: u32 = 5;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

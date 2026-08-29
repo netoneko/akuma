@@ -1,0 +1,16 @@
+[package]
+name = "akuma-syscalls-sync"
+version = "0.1.0"
+edition = "2024"
+description = "The futex family's pure logic: op decode, the (tgid, uaddr) waiter table, the deadline algebra, the WAKE_OP opcode and the wait loop's outcome decision. Decisions and one data structure — every effect stays in the kernel."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The ABI (opcodes, flag bits, the WAKE_OP encoding) and the errno table. Both
+# are leaves. Deliberately NOT akuma-exec: this crate must not know what a
+# thread is, only that a waiter has an identity that can be compared — which is
+# what `WaiterId` is for. See the crate docs.
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+akuma-primitives = { path = "../akuma-primitives" }

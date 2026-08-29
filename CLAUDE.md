@@ -21,7 +21,16 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `docs/reference/subsystems/syscalls/time.md`. It was named `akuma-time`
   until 2026-08-28; the rename is what stops it reading as a sibling of
   `akuma-timer`, the hardware CNTV/PL031 + tick-policy crate below, which it
-  is not. Further families move out on the same model when a family has real
+  is not. `akuma-syscalls-sync` is the second family (2026-08-29): the futex
+  op decode, the `(tgid, uaddr)` waiter table, the deadline algebra, the
+  `WAKE_OP` opcode and the wait loop's outcome decision — chosen because every
+  futex bug in `docs/archive/` is a property of one of those four things and
+  each previously cost a `-j4` self-host build to find. The crate decides; the
+  lock, the IRQ masking, the in-hold user read and every wake stay in
+  `src/syscall/sync.rs`. Gates: `scripts/futex_suite.py` (correctness) and
+  `userspace/futexprobe/` + `scripts/benchmarks/futex_ab_run.sh` (cost, run
+  A/B/A — `docs/reference/subsystems/syscalls/sync.md`).
+  Further families move out on the same model when a family has real
   pure logic worth testing.
   `akuma-kacho` is the shared observe/decide/hysteresis layer every self-tuning
   policy uses (timer-tick demotion, file-page cache cap, netpoll wake rate).

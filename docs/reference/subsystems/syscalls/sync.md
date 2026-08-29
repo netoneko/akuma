@@ -1,10 +1,31 @@
 # sync syscalls
 
-`futex` (98) — the only syscall in this family. Source: `src/syscall/sync.rs`.
+`futex` (98) — the only syscall in this family. Source: `src/syscall/sync.rs`
+and **`crates/akuma-syscalls-sync`**, split 2026-08-29.
 For the general Waker/wait-queue blocking pattern and the
 "never block inside a preemption-disabled closure" rule, see
 [`../syscalls.md`](../syscalls.md) "Blocking vs non-blocking" — not
 duplicated here.
+
+## Where the logic lives
+
+The family is in two halves, and knowing which half a question belongs to is
+the fastest way to answer it:
+
+| in the crate (`crates/akuma-syscalls-sync`, host-tested) | in the kernel (`src/syscall/sync.rs`) |
+|---|---|
+| op decode, alignment/mapping rules, `Action` | `validate_user_ptr`, the user reads and writes |
+| the `(tgid, uaddr)` waiter table and every queue operation | the `Spinlock`, the IRQ masking, the `Prefault::No` in-hold read |
+| the key-namespace policy (`Namespace`) | resolving pid and shared-mapping state; the degraded-key tripwire |
+| the deadline algebra (relative/absolute/realtime, revalidation) | `uptime_us`, `utc_time_us`, `schedule_blocking` |
+| `WAKE_OP` opcode decode, RMW arithmetic, signed compare | the read-modify-write of user memory |
+| the wait loop's outcome decision (`Step`) | firing wakers, the event ring, the orphan/wake-ring dumps |
+
+The rule the split follows: **the crate decides, the kernel acts.** Nothing in
+the crate can take a lock, touch user memory or wake a thread — the waiter
+identity it holds exposes only `tid()`, for finding queue entries. 42 host tests
+cover the left column and run in milliseconds; the right column still needs a
+boot. If a change is entirely in the left column, `cargo test` is the gate.
 
 > **Stability: C (active risk).** Touched repeatedly through Jun–Aug 2026
 > (`futex fix`, `fixes for futex`, `pthreads fixes in progress` — the last
@@ -107,9 +128,14 @@ purely a safety net bolted onto the park loop.
 
 ## Waiter table & the tgid key
 
-`FUTEX_WAITERS: Spinlock<BTreeMap<(u32, usize), Vec<(usize, u32)>>>`
-(`src/syscall/sync.rs:39`) keys each wait queue by `(tgid, uaddr)`. Each
-queued entry is `(tid, bitset)`:
+`FUTEX_WAITERS: Spinlock<WaiterTable<QueuedWaiter>>` keys each wait queue by
+`(tgid, uaddr)`. Each queued entry is `(handle, bitset)`, where the handle is a
+**generation-tagged `WakeHandle`, not a bare tid** — wakes fire outside the
+table hold, so a bare tid held across a preemption could name a recycled slot
+and wake its new occupant. The table itself is
+`akuma_syscalls_sync::WaiterTable`; the `Spinlock` around it and the IRQ masking
+on every access stay in the kernel, because they are an argument about *this
+kernel's* IRQ discipline rather than about queue algebra:
 
 - **`bitset`** is `BITSET_MATCH_ANY` (`0xFFFFFFFF`) for plain `FUTEX_WAIT` /
   `FUTEX_WAKE`, or `val3` for `FUTEX_WAIT_BITSET`. `FUTEX_WAKE_BITSET` only
@@ -227,6 +253,45 @@ forever — with a perfectly ordinary, correctly-queued waiter in `[FUTEX-DUMP]`
   `op` register (e.g. `-1`) reaching here, which historically indicated
   either register corruption across a context switch or a stale I-cache
   mis-decode (see the `§7k` comment at `src/syscall/sync.rs:641`).
+
+## Known divergences from Linux
+
+- **A pending signal beats an already-delivered wake.** The wait loop checks for
+  a pending signal *before* it checks whether it is still queued, so a waiter
+  that a `FUTEX_WAKE` has already dequeued still returns `EINTR`. The waker
+  counted that wake as delivered, so it is consumed: a caller that treats
+  `EINTR` as "nothing happened" rather than re-checking its condition can lose
+  it. Linux reports success in this race and delivers the signal afterwards.
+  Found while extracting the crate — the behaviour is unchanged, because an
+  extraction that quietly fixes something cannot be A/B'd against what it
+  replaced. Pinned by `signal_beats_an_already_delivered_wake` so that changing
+  it is a decision rather than an accident.
+- **A futex key resolves to a namespace, not a bare tgid.** An unresolvable
+  identity (`read_current_pid() == None`, or a `tgid` of 0) is reported as
+  `Namespace::Degraded` and warns, rather than silently keying to the VA-only
+  global namespace. The `Some(0)` case was previously silent; it is measured at
+  zero occurrences and is a tripwire, not a branch.
+- The PI family (`FUTEX_LOCK_PI` and friends) is `ENOSYS`, deliberately: glibc
+  falls back on `ENOSYS`, but nothing can detect a PI lock that merely fails to
+  boost priority.
+
+## Testing
+
+```bash
+# The pure logic — 42 tests, milliseconds, no VM:
+cargo test -p akuma-syscalls-sync --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
+
+# The three in-guest probes, against a running VM (build, push, run, gate):
+scripts/futex_suite.py --port 2322
+```
+
+`futexops` (op-by-op vs Linux), `futexkey` (cross-address-space key leak,
+deterministic) and `futextest` (7 phases of real pthread traffic) are the
+correctness gate; `userspace/futexprobe/c/futex_op_cost.c` with
+`scripts/benchmarks/futex_op_ab.py` is the cost gate. Arms cannot be
+interleaved, so use A/B/A — see
+[`../../../archive/AKUMA_EXTRACT_SYSCALLS.md`](../../../archive/AKUMA_EXTRACT_SYSCALLS.md)
+§8.1 for the measured protocol and why `floor+N` is not drift-invariant.
 
 ## Background
 

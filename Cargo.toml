@@ -16,6 +16,7 @@ default-members = [
     "crates/akuma-scheduler",
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-linux",
+    "crates/akuma-syscalls-sync",
     "crates/akuma-terminal",
     "crates/akuma-syscalls-time",
     "crates/akuma-timer",
@@ -675,6 +676,12 @@ akuma-syscalls-linux = { path = "crates/akuma-syscalls-linux" }
 # that is a requirement, not a happy accident (docs/archive/
 # AKUMA_EXTRACT_SYSCALLS.md §7 — the dispatch is the hottest function here).
 akuma-syscalls = { path = "crates/akuma-syscalls" }
+# The futex family's pure logic: op decode, the (tgid, uaddr) waiter table, the
+# deadline algebra, the WAKE_OP opcode and the wait loop's outcome decision. A
+# family implementation on the akuma-syscalls-time model (AKUMA_EXTRACT_SYSCALLS.md
+# §8), taken first because every futex bug in docs/archive/ is a property of one
+# of those four things and each one previously cost a -j4 self-host build to find.
+akuma-syscalls-sync = { path = "crates/akuma-syscalls-sync" }
 embedded-io-async = { version = "0.6", default-features = false }
 
 [patch.crates-io]

@@ -314,6 +314,19 @@ echo "Building read_syscall_cost (C, syscall/read cost probe)..."
 cp ext2probe/c/read_syscall_cost ../bootstrap/bin/
 echo "read_syscall_cost (C) copied to bootstrap/bin/"
 
+# Build futex_op_cost: the same construction, one subsystem over. Every arm is a
+# futex op that returns WITHOUT parking, so it measures the syscall's own decode
+# + waiter-table work rather than the scheduler's wake path — which is what makes
+# it usable as a before/after gate on `src/syscall/sync.rs` refactors (see the
+# source header and docs/archive/AKUMA_EXTRACT_SYSCALLS.md §8).
+echo "Building futex_op_cost (C, futex op cost probe)..."
+(
+    cd futexprobe/c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o futex_op_cost futex_op_cost.c
+)
+cp futexprobe/c/futex_op_cost ../bootstrap/bin/
+echo "futex_op_cost (C) copied to bootstrap/bin/"
+
 # mprotectlb + clonearg: deterministic thread-spawn / mprotect probes. Both are
 # one-shot (no stress loop) and calibrated against real Linux, so a FAIL is a
 # kernel divergence and nothing else. mprotectlb is the regression guard for the
