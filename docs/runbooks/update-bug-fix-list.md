@@ -28,6 +28,44 @@ inside the file itself, and don't note which branch or commit a fix came
 from; `git blame`/`git log` already answer that and a hand-copied branch name
 just goes stale the moment the branch is deleted.
 
+## Which docs need checking
+
+A fix does **not** have to arrive in a new file, and this is the step that gets
+skipped. Three shapes all need an entry, and only the first is obvious:
+
+1. **A new `docs/archive/*.md`.** Easy to spot, usually remembered.
+2. **A new `## Bug N` / `### Fix` / `## Root cause N` section in a doc that
+   already has a `###` subsection here.** Its bullet count and its category
+   header both need bumping. Nothing about the file's appearance changes, so
+   nothing prompts you.
+3. **A doc currently in `## Files scanned with zero counted fixes` that has since
+   gained a fix.** It must be *removed from that section* and given a real `###`
+   subsection under its category. This is the easiest one to miss entirely,
+   because the doc *is* mentioned in the file — a grep for its name succeeds — it
+   is just mentioned in the place that means "this one contributes nothing".
+
+Before writing anything, list the archive docs your work touched — added **and**
+modified — and check each against all three shapes:
+
+```bash
+git diff --name-only $(git merge-base main HEAD)..HEAD -- docs/archive/ | grep '\.md$'
+git status --short -- docs/archive/ | awk '{print $NF}' | grep '\.md$'
+```
+
+For each one that is already listed, diff it and look for fix-shaped additions
+rather than trusting your memory of what you changed:
+
+```bash
+git diff $(git merge-base main HEAD)..HEAD -- docs/archive/<DOC>.md \
+  | grep '^+' | grep -iE '^\+#{2,4} |fixed|resolution|root cause'
+```
+
+**Beware the cross-reference.** A doc often notes that a bug it describes was
+fixed *elsewhere* ("that one is now FIXED — see `OTHER_DOC.md`"). That is not a
+fix belonging to this doc and must not get a bullet here, or the same fix is
+counted twice under two subsections. Count a fix under the doc that *documents
+the fix*, not every doc that mentions it.
+
 ## Steps
 
 1. **Find the right category section.** `BUG_FIX_LIST.md` groups entries under
@@ -132,6 +170,35 @@ EOF
 - Sum all category header `N`/`M` values and confirm they equal the top
   `## Statistics` block's `Total distinct fixes counted` / `Docs contributing
   at least one fix`, and the breakdown table's `**Total**` row.
+- **Coverage of what you touched.** The recount above proves the file is
+  *self*-consistent; it cannot see a doc nobody added. This catches that. Note it
+  is scoped to **your change**, not the whole archive: the zero-fixes section is a
+  running narrative of scan passes, not an exhaustive index of all ~380 docs, so a
+  whole-archive sweep produces ~160 false positives and teaches you to ignore it.
+
+  ```bash
+  BASE=$(git merge-base main HEAD)
+  { git diff --name-only "$BASE"..HEAD -- docs/archive/ ;
+    git status --short -- docs/archive/ | awk '{print $NF}' ; } \
+    | grep '\.md$' | sort -u | while read -r f; do
+      b=$(basename "$f"); [ "$b" = "BUG_FIX_LIST.md" ] && continue
+      grep -q "^### docs/archive/$b\$" docs/archive/BUG_FIX_LIST.md && s=listed \
+        || { grep -q "${b%.md}" docs/archive/BUG_FIX_LIST.md && s=mentioned || s=UNACCOUNTED; }
+      printf '%-52s %s\n' "$b" "$s"
+    done
+  ```
+
+  - `UNACCOUNTED` — nobody has judged it. Give it a `###` subsection or name it in
+    the zero-fixes section. Never leave it silent.
+  - `mentioned` — named in the zero-fixes narrative, or referenced from another
+    doc's bullet. Re-read it: **a doc parked as zero-fixes can since have gained
+    one**, and then it must be moved out into a real subsection.
+  - `listed` — has a subsection already, so shape 1 is satisfied. It does **not**
+    tell you whether new bullets are owed; only the per-doc diff above does.
+
+  A sweep on 2026-08-30 found five docs `UNACCOUNTED` across a single branch, plus
+  a `listed` doc that had silently gained a whole new `## Root cause` section.
+
 - `git diff docs/archive/BUG_FIX_LIST.md` should show exactly: the new `###`
   subsection (or bullets added to an existing one), its category header's
   count bumped, the `## Statistics` numbers bumped, and the breakdown table's

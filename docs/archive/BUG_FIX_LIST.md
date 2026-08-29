@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 744
-- **Docs contributing at least one fix:** 239
+- **Total distinct fixes counted:** 752
+- **Docs contributing at least one fix:** 244
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 130 | 17.5% | 19 |
-| Memory & Virtual Memory | 121 | 16.3% | 38 |
-| Scheduler & Process Management | 77 | 10.3% | 20 |
-| SMP & Locking | 88 | 11.8% | 39 |
-| Networking | 54 | 7.3% | 21 |
-| Userspace Apps & Libraries | 37 | 5.0% | 20 |
+| Syscall / ABI Compatibility Audits | 132 | 17.6% | 20 |
+| Memory & Virtual Memory | 122 | 16.2% | 39 |
+| Scheduler & Process Management | 78 | 10.4% | 21 |
+| SMP & Locking | 88 | 11.7% | 39 |
+| Networking | 54 | 7.2% | 21 |
+| Userspace Apps & Libraries | 37 | 4.9% | 20 |
 | Rump Kernel & Syscall Proxy | 26 | 3.5% | 6 |
-| Toolchain & Self-Hosting | 43 | 5.8% | 7 |
+| Toolchain & Self-Hosting | 43 | 5.7% | 7 |
 | SSH | 26 | 3.5% | 15 |
-| VFS & Filesystem | 25 | 3.4% | 16 |
+| VFS & Filesystem | 27 | 3.6% | 17 |
 | Boot & Drivers | 24 | 3.2% | 9 |
-| Signals & Exceptions | 13 | 1.7% | 6 |
-| Misc / Cross-cutting | 25 | 3.4% | 6 |
-| Console & Terminal | 31 | 4.2% | 11 |
+| Signals & Exceptions | 15 | 2.0% | 7 |
+| Misc / Cross-cutting | 25 | 3.3% | 6 |
+| Console & Terminal | 31 | 4.1% | 11 |
 | Containers | 24 | 3.2% | 6 |
-| **Total** | **744** | **100.0%** | **239** |
+| **Total** | **752** | **100.0%** | **244** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -45,7 +45,7 @@ from several subsystems under one write-up.
 
 ---
 
-## Syscall / ABI Compatibility Audits (130 fixes, 19 docs)
+## Syscall / ABI Compatibility Audits (132 fixes, 20 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -178,7 +178,11 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `clock_settime` (112), `adjtimex` (171) and `clock_adjtime` (266) were all unimplemented — Akuma could read the clock but never set it, so `date -s`, `rdate`, and `ntpd -q` all had no way to apply a correction; implemented in the new `crates/akuma-time` crate, with `adjtimex`/`clock_adjtime` applying `ADJ_OFFSET`/`ADJ_SETOFFSET` as an immediate step rather than a gradual PLL slew
 - On a platform with no RTC (Firecracker exposes no PL031 on aarch64), the guest booted at epoch 0 with no way to correct it, so every outbound TLS connection failed certificate-validity checks ("certificate is not yet valid") even though the CA bundle, DNS, and TCP were all fine; fixed with a boot-time SNTP client (`crates/akuma-time::{boot, sntp}`, wired via `src/ntp_boot.rs`) that runs whenever `utc_time_us()` comes up unset, deriving the wall-clock offset from uptime-relative round-trip timestamps (since the client's own clock has no absolute epoch yet to plug into the classic four-timestamp NTP formula) and applying it via `set_utc_time_us` before IRQs are unmasked
 
-## Memory & Virtual Memory (121 fixes, 38 docs)
+### docs/archive/AKUMA_EXTRACT_SYSCALLS.md
+- Converting `sys_sysinfo`'s hand-written `[u8; 112]` byte-offset writes into a `repr(C)` `Sysinfo` struct left its tail padding uninitialized (`#[derive(Default)]` does not zero padding), so the first version handed userspace 4 bytes of live kernel stack on every `sysinfo(2)` call — an info leak invisible to every gate tier because nothing reads those bytes; fixed with a named `_f: [u8; 4]` field plus `defaulted_sysinfo_has_no_uninitialised_bytes`, asserting all 112 bytes are zero
+- The syscall epilogue re-used the prologue's process identity across the whole dispatch (Finding A of `IDENTITY_CACHE_SMP_REVIEW.md`, left open there), reachable when `kill_thread_group` retires a `CLONE_THREAD` sibling still inside a blocking syscall and a reclaim drain runs before the epilogue writes — a witness found at depth 2 by exhaustively enumerating `claim`/`retire`/`reclaim` interleavings rather than by a soak; fixed by having the epilogue re-resolve the identity cache after dispatch (`IdentitySource::Reresolve`) and skip its `Process` writes on a miss
+
+## Memory & Virtual Memory (122 fixes, 39 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -378,8 +382,11 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `madvise(addr, len, MADV_DONTNEED)`'s zero-range rounding guarded the first addition (`saturating_add`) but not the page-alignment rounding after it, so a `len` near `usize::MAX` wrapped `end` to 0 and produced a ~4.5e15 page count — an unbounded kernel loop inside an `MmBklGuard` window, reachable from unprivileged userspace since `len` was passed straight from a user register with no validation; fixed by validating the range against the user VA limit at the syscall boundary (`madvise::range_fits_user_va`) before any page-count arithmetic, plus saturating arithmetic as a second line of defense
 - `MAP_FIXED`'s kernel-VA overlap guard (`fixed_overlaps_kernel_va`) computed `pages * 4096` with no overflow protection, so a mapping length near `usize::MAX` wrapped the computed `map_end` back down to `addr` and the guard answered "no overlap" for a mapping spanning the kernel's own identity map; presented as a hang rather than a compromise, since `sys_mmap` then looped `for i in 0..pages { aspace.unmap_page(va) }` before it could corrupt anything; fixed by validating `len` at the syscall boundary (`mmap::len_too_large`) plus saturating arithmetic
 
+### docs/archive/BUSYBOX_HASH_MISCOMPUTE.md
+- `sync_el1_handler` (`src/exceptions.rs`) saved only x0-x3/x29/x30, but the EL1 paths that *resolve* a fault (`try_resolve_el1_cow_fault`, `try_resolve_el1_user_copy_lazy_fault`) `eret` back to re-execute the faulting instruction, so a page fault mid-copy replayed the widened multi-register `stp` store with x4-x18 holding leftover handler state instead of the copy's own live data — busybox `md5sum`/`sha*sum` returned a wrong, non-deterministic digest for an unmodified file roughly 40-50% of the time, for any file over one page; fixed by making the vector transparent to x4-x18, guarded by `test_el1_sync_exception_preserves_gprs`
 
-## Scheduler & Process Management (77 fixes, 20 docs)
+
+## Scheduler & Process Management (78 fixes, 21 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -499,6 +506,8 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/SELFHOST_CARGO_BUILD_REGRESSION.md
 - `fork_process`'s CoW-fork path collected every sibling thread's eager mmap regions into a fixed `Vec::with_capacity(2048)`, silently dropping regions past the cap with only a warning; a `cargo`/`rustc` build's many concurrently-live worker threads routinely crossed 2048 aggregate sibling regions, and if the dropped set held the child's about-to-be-used heap/stack range, its very next syscall (observed: `chdir()` on `std::process::Command`'s fork-before-exec path) faulted `EFAULT` — fixed with a two-pass collect (count under IRQs-disabled, allocate exactly that size, then collect) instead of a fixed-capacity guess
 
+### docs/archive/IDENTITY_CACHE_LAZY_RESTAMP.md
+- The per-thread identity cache added to speed up `getpid` was stamped once at thread-map insert time and never repaired on a lost race, so under thread churn the cache ran at a **0.11% hit rate** — ~556 million slow-path table scans (lock + map walk + IRQ-masked process-table scan) per run instead of the fast path it was built to replace; fixed via a bounded lazy re-stamp on miss (`identity_get` re-runs `identity_store_locked` under an IRQ mask, `MAX_REPAIR_ATTEMPTS = 4`, budget reset only when both the pid and tgid halves have resolved — two earlier reset rules each made an unresolvable entry re-scan the whole table on every syscall instead of exhausting its budget), restoring a 99.999% hit rate
 
 ## SMP & Locking (88 fixes, 39 docs)
 
@@ -1016,7 +1025,7 @@ aren't recorded anywhere else.)
 
 ---
 
-## VFS & Filesystem (25 fixes, 16 docs)
+## VFS & Filesystem (27 fixes, 17 docs)
 
 ### docs/archive/STAT_AND_UNLINKAT_FIX.md
 - Root cause 1: `stat()` returned `st_ino=0` for every file
@@ -1077,6 +1086,10 @@ aren't recorded anywhere else.)
 - `write_dir_range`'s cross-block `rec_len` merge was latent-wrong when a dirent edit spanned a block boundary
 - `add_dir_entry` / `remove_dir_entry` rewrote every block of the directory per call via `write_inode_data`, making filling or emptying a directory O(N²) in its size rather than O(1) per edit
 
+### docs/archive/UTIMENSAT_STUB_TOUCH.md
+- `utimensat` (`nr::UTIMENSAT`) was a bare `=> 0` stub that always reported success, so busybox `touch`'s ENOENT-then-create idiom never fired and `touch newfile` exited 0 while creating nothing — a stub whose success return actively suppressed the file creation; fixed with a real handler (`fs::sys_utimensat`) returning `ENOENT`/`EBADF`/`EFAULT`/`EINVAL` from the real dirfd/path/times validation, matching Linux's argument-before-path-lookup ordering
+- `akuma_vfs::Filesystem` had no operation to set an inode's timestamps at all, so `touch -d`/`touch -t` silently changed nothing and a plain re-`touch` of an existing file never refreshed its mtime (`make` would never see a target as newer); fixed via `Filesystem::set_times(path, atime, mtime)` (each an `Option`, `None` meaning `UTIME_OMIT`) implemented in ext2 (mirroring `chmod`, deliberately not bumping mtime for an atime-only call) and the mtime half in memfs
+
 ## Boot & Drivers (24 fixes, 9 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
@@ -1123,7 +1136,7 @@ aren't recorded anywhere else.)
 - The `devbox-smoltcp` boot's `sshd.conf` carried `start_delay_ms = 10000`, tuning inherited from the rump profile's DHCP-handshake wait, but under smoltcp the network stack is already up synchronously before `herd` even starts, so the delay was pure dead time on every boot; set to `0` in `overlays/devbox/rootfs/etc/herd/enabled/sshd.conf` (the rump case still needs the 10s value, kept in `bootstrap/etc/herd/core2/sshd-rump.conf`)
 
 
-## Signals & Exceptions (13 fixes, 6 docs)
+## Signals & Exceptions (15 fixes, 7 docs)
 
 ### docs/archive/CTRL_C_SIGINT_DELIVERY.md
 - Ctrl-C never interrupted a foreground child over `ssh -tt` (repro: `tail -f`): **no line discipline in the tree generated `SIGINT` at all**. Fixed in the kernel as a process-group broadcast; the first attempt — patching sshd to target `foreground_pgid` as a single pid — was wrong and is recorded as such
@@ -1149,6 +1162,10 @@ aren't recorded anywhere else.)
 
 ### docs/archive/NIGHTLY_CARGO_HVF_SIGILL.md
 - The `EC=0x0` (undefined-instruction) exception handler hard-killed the process instead of delivering SIGILL, so OpenSSL's ARM-feature-probe idiom (deliberately executing an unsupported instruction inside a SIGILL handler) could never recover, crashing nightly `cargo` under HVF at a fixed PC (`SM3SS1`, FEAT_SM3); fixed by routing `EC=0x0` through `try_deliver_signal` like the other fatal-fault arms
+
+### docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md
+- `PENDING_SIGNALS` is cleared at the moment of delivery and was the only bit `current_thread_has_pending_interrupt` read, so `rt_sigreturn`'s immediate re-delivery of the next queued signal always cleared it before a blocked syscall's wait loop was scheduled to notice — under a signal source fast enough to keep the deliver→handler→`rt_sigreturn`→deliver chain saturated, `pthread_kill` could never interrupt the blocking syscall it targeted; fixed (necessary but, on its own, not sufficient) via a separate per-thread `DELIVERED_SIGNALS` mask, set once at the `try_deliver_signal` chokepoint and consulted alongside the pending bit
+- Even with that mask, a signal-woken thread rejoined the back of the round-robin run queue, and signal delivery had unbounded priority over resuming the syscall it interrupted (each handler return re-delivered the next pending signal immediately), so under a 10ms-cadence signal sender the interrupted syscall was starved indefinitely rather than merely raced; fixed via `SIGNAL_WAKE_PREEMPT` (runs a signal-woken thread on the next switch) plus `SIGFRAME_ACTIVE` (bounds delivery to one handler per unit of userspace progress, consulted by `rt_sigreturn`)
 
 
 ## Misc / Cross-cutting (25 fixes, 6 docs)
