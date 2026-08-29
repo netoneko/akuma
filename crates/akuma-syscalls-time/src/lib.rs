@@ -203,7 +203,16 @@ pub fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
     // FAR=0x10 with memclr ELR (see docs/GO_FORKTEST_DEBUG.md).
     const MAX_REASONABLE_CLOCK_ID: u64 = 0x1000_0000;
     if clock_id_arg > MAX_REASONABLE_CLOCK_ID {
-        // Diagnostic: read instruction bytes at ELR and ELR-4 to identify the caller
+        // Diagnostic: read instruction bytes at ELR and ELR-4 to identify the caller.
+        //
+        // Behind `debug-info` since 2026-08-29. `clock_id` is a USER argument, so
+        // this whole block is reachable in a loop from an unprivileged process —
+        // and it is not cheap: the trap-frame ELR, two `read_user_into` calls, and
+        // a ~130-byte two-line `log::warn!` at ~2.4 us per console byte
+        // (docs/archive/CONSOLE_LOG_COST.md). The EINVAL below is the behaviour;
+        // this is instrumentation for one specific hunt (GO_FORKTEST_DEBUG crash5)
+        // and should be compiled in only while that hunt is live.
+        #[cfg(feature = "debug-info")]
         if let Some(elr) = akuma_exec::threading::current_trap_frame_elr() {
             let mut instr_before = [0u8; 4];
             let mut instr_at = [0u8; 4];

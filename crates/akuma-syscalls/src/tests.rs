@@ -122,7 +122,25 @@ mod reference {
             && syscall_num != nr::MEMBARRIER
             && syscall_num != nr::RT_SIGACTION
             && syscall_num != nr::SCHED_SETAFFINITY
-            && syscall_num != nr::SCHED_GETAFFINITY;
+            && syscall_num != nr::SCHED_GETAFFINITY
+            // …and every argument-less number, spelled out rather than delegated
+            // to `takes_no_args` — this oracle is only worth having while it is an
+            // INDEPENDENT transcription of the intent. The intent: the `[SC]` line
+            // formats `args[0..3]`, so it must not fire for a syscall whose arm
+            // reads none, or `takes_no_args`'s contract is false and the
+            // entry-vector change that stops restoring `x0`-`x5` would print stale
+            // registers. `uptime` was already excluded above, by luck of being
+            // high-rate; `akuma_get_version` was not.
+            && syscall_num != nr::AKUMA_GET_VERSION
+            && syscall_num != nr::GETPID
+            && syscall_num != nr::GETPPID
+            && syscall_num != nr::GETUID
+            && syscall_num != nr::GETEUID
+            && syscall_num != nr::GETGID
+            && syscall_num != nr::GETEGID
+            && syscall_num != nr::GETTID
+            && syscall_num != nr::SCHED_YIELD
+;
 
         let counter = match syscall_num {
             nr::MMAP => RefCounter::IncMmap,
@@ -346,19 +364,6 @@ fn leaf_diverges_from_the_oracle_in_exactly_the_documented_places() {
     // look up the context and format `ctx`/`nr`, so they read arguments and take
     // a lock. Membership is therefore per-BUILD, never per-run — see
     // `flat_when_untraced`.
-    #[cfg(not(feature = "debug-info"))]
-    let want = vec![
-        nr::IO_SUBMIT,
-        nr::IO_CANCEL,
-        nr::IO_GETEVENTS,
-        nr::GETUID,
-        nr::GETEUID,
-        nr::GETGID,
-        nr::GETEGID,
-        nr::UPTIME,
-        nr::AKUMA_GET_VERSION,
-    ];
-    #[cfg(feature = "debug-info")]
     let want = vec![
         nr::GETUID,
         nr::GETEUID,
@@ -530,7 +535,9 @@ fn rt_sigreturn_is_the_only_signal_state_exemption() {
 #[test]
 fn debug_io_suppresses_exactly_the_high_rate_numbers() {
     let suppressed: Vec<u64> = probe_numbers().filter(|n| debug_io_suppressed(*n)).collect();
-    assert_eq!(suppressed.len(), 23, "suppression list changed: {suppressed:?}");
+    // 23 high-rate numbers, plus every argument-less one (see
+    // `takes_no_args_implies_suppressed`).
+    assert_eq!(suppressed.len(), 32, "suppression list changed: {suppressed:?}");
     for n in [nr::READ, nr::WRITE, nr::FUTEX, nr::CLOCK_GETTIME] {
         // clock_gettime is deliberately NOT on the list even though it is a
         // high-rate call; this asserts the list as it is, not as it might be.
@@ -750,28 +757,74 @@ fn the_search_space_is_what_it_claims_to_be() {
     }
 }
 
-/// The feature must actually move the classification, in both directions.
+/// The AIO stubs must stay `Full` in **both** feature states.
 ///
-/// A `flat_when_untraced` that silently returned `false` in every build would
-/// leave the AIO trio permanently `Full` and this file would still pass its other
-/// tests — the failure mode is a missing optimisation, which nothing else
-/// notices. This is the test that would.
+/// They look flat — all three return 0 unconditionally, and with `debug-info` off
+/// their bodies contain nothing else. A `flat_when_untraced()` predicate keyed on
+/// the feature was written and then removed, because the body is not the arm:
+/// `handle_syscall` dispatches them as
+/// `nr::IO_SUBMIT => aio::sys_io_submit(args[0], args[1] as i64, args[2])`, so the
+/// arm reads `args[0..2]` whatever the callee does. `takes_no_args` is a property
+/// of the ARM and the precondition for the entry-vector change that stops
+/// restoring `x0`-`x5`.
+///
+/// This test is the guard against re-adding it without also making the dispatch
+/// arm feature-conditional.
 #[test]
-fn debug_info_feature_decides_the_aio_trio() {
-    for nr_val in [nr::IO_SUBMIT, nr::IO_CANCEL, nr::IO_GETEVENTS] {
-        let is_leaf = fast_path(nr_val) == FastPath::Leaf;
-        if cfg!(feature = "debug-info") {
-            assert!(!is_leaf, "{nr_val} must be Full when the trace reads its args");
-        } else {
-            assert!(is_leaf, "{nr_val} must be Leaf when the trace compiles out");
-        }
-        // Whichever way it lands, the two predicates must agree — `fast_path` is
-        // their conjunction and a disagreement would make it accidentally right.
-        assert_eq!(is_leaf, takes_no_args(nr_val) && !needs_identity(nr_val));
+fn the_aio_stubs_are_never_leaf_because_the_arm_reads_args() {
+    for nr_val in [nr::IO_SUBMIT, nr::IO_CANCEL, nr::IO_GETEVENTS, nr::IO_SETUP, nr::IO_DESTROY] {
+        assert_eq!(
+            fast_path(nr_val),
+            FastPath::Full,
+            "nr {nr_val}: the dispatch arm reads args[..], so it cannot be Leaf \
+             regardless of what its body does with them"
+        );
+        assert!(!takes_no_args(nr_val));
     }
-    // `io_setup` and `io_destroy` do real work in every build and must never be
-    // admitted by a widening of the list above.
-    for nr_val in [nr::IO_SETUP, nr::IO_DESTROY] {
-        assert_eq!(fast_path(nr_val), FastPath::Full, "{nr_val} allocates or removes");
+}
+
+/// `takes_no_args` must imply `debug_io_suppressed`, for every number.
+///
+/// `takes_no_args`'s contract is "the arm reads no element of `args`", and it is
+/// the precondition for the entry-vector change that stops restoring `x0`-`x5`
+/// for argument-less calls. The `[SC] nr=… a0=… a1=… a2=…` trace formats
+/// `args[0..3]`, so if it can fire for such a number the contract is false and
+/// that change would print stale registers.
+///
+/// This held for `uptime` by luck — it was on the noise list — and was **false**
+/// for `akuma_get_version`, the original `Leaf` and the floor control, until
+/// 2026-08-29. A pure list would let it break again the next time a number is
+/// added to `takes_no_args`; the implication is what makes it stay true.
+#[test]
+fn takes_no_args_implies_suppressed() {
+    for nr_val in probe_numbers() {
+        if takes_no_args(nr_val) {
+            assert!(
+                debug_io_suppressed(nr_val),
+                "nr {nr_val} reads no args but the [SC] trace would still format \
+                 args[0..3] for it — the entry vector may stop restoring x0-x5"
+            );
+        }
+    }
+}
+
+/// Every `FastPath::Leaf` is suppressed too — a corollary of the above, since
+/// `Leaf` is a subset of `takes_no_args`, but worth asserting in its own right:
+/// `Leaf` is the tier the asm change actually targets.
+#[test]
+fn every_leaf_is_suppressed() {
+    for nr_val in probe_numbers().filter(|n| fast_path(*n) == FastPath::Leaf) {
+        assert!(debug_io_suppressed(nr_val), "Leaf nr {nr_val} is not suppressed");
+    }
+}
+
+/// The widening must not have swallowed the noise list: the high-traffic numbers
+/// it was created for are still suppressed, and they are NOT `takes_no_args`
+/// (they all take arguments), so they can only be coming from the `matches!`.
+#[test]
+fn the_noise_list_still_does_its_job() {
+    for nr_val in [nr::READ, nr::WRITE, nr::MMAP, nr::MUNMAP, nr::FUTEX, nr::IOCTL] {
+        assert!(!takes_no_args(nr_val), "{nr_val} takes args; it must come from the noise list");
+        assert!(debug_io_suppressed(nr_val), "{nr_val} dropped off the noise list");
     }
 }

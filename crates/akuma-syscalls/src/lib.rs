@@ -264,10 +264,32 @@ pub const fn clears_signal_state(nr: u64) -> bool {
 /// exactly why it was worth moving somewhere a test can reach it. A number
 /// silently added to or dropped from that chain changes nothing observable
 /// until someone turns the flag on to debug something else.
+///
+/// # `takes_no_args` implies suppressed (2026-08-29)
+///
+/// The `matches!` below is a **noise** list — high-traffic numbers. That left a
+/// hole: the `[SC] nr=… a0=… a1=… a2=…` line formats `args[0..3]` for every
+/// number *not* on it, including every [`FastPath::Leaf`]. `AKUMA_GET_VERSION` —
+/// the original `Leaf`, and the floor control the whole tier is measured against
+/// — was not on the list, nor were the four uid/gid additions.
+///
+/// That directly contradicts [`takes_no_args`]'s contract ("the arm reads no
+/// element of `args`"), which is the stated precondition for the entry-vector
+/// change that stops restoring `x0`-`x5` for argument-less calls
+/// (`AKUMA_SYSCALL_PERFORMANCE_AUDIT.md` § "Other untested surface"). With that
+/// change landed and this flag on, the line would print **stale register
+/// contents** for exactly the syscalls the optimisation targets.
+///
+/// So the predicate now *starts* from `takes_no_args`. It is structural rather
+/// than a list to remember: printing `a0=…` for a syscall that takes no
+/// arguments was meaningless even before the asm change made it wrong, and
+/// `takes_no_args_implies_suppressed` pins the implication so a future addition
+/// to either list cannot re-open the hole.
 #[must_use]
 pub const fn debug_io_suppressed(nr: u64) -> bool {
-    matches!(
-        nr,
+    takes_no_args(nr)
+        || matches!(
+            nr,
         nr::WRITE
             | nr::READ
             | nr::READV
@@ -290,8 +312,8 @@ pub const fn debug_io_suppressed(nr: u64) -> bool {
             | nr::MEMBARRIER
             | nr::RT_SIGACTION
             | nr::SCHED_SETAFFINITY
-            | nr::SCHED_GETAFFINITY
-    )
+                | nr::SCHED_GETAFFINITY
+        )
 }
 
 /// How much of the generic excursion a syscall number actually needs.
@@ -356,36 +378,34 @@ pub enum FastPath {
 /// disagreement is exactly the failure this constant exists to make impossible.
 pub const DEBUG_INFO: bool = cfg!(feature = "debug-info");
 
-/// Arms that are a bare constant return **only because the trace that would read
-/// their arguments compiles out**.
-///
-/// `sys_io_submit`, `sys_io_cancel` and `sys_io_getevents` are AIO stubs that
-/// return 0 unconditionally. Their bodies contain a debug block that looks up
-/// the context (`with_irqs_disabled` + `AIO_CONTEXTS.lock()`) and formats `ctx`
-/// and `nr` — so with tracing ON they read arguments and take a lock, and with
-/// it OFF they are `0` and nothing else.
-///
-/// **This is keyed on a Cargo feature, not a runtime flag, and that is the whole
-/// point.** `FastPath` membership feeds the entry-vector change that skips
-/// restoring `x0`-`x5` for argument-less calls
-/// (`AKUMA_SYSCALL_PERFORMANCE_AUDIT.md` § "Other untested surface"). A tier
-/// whose membership depended on a *runtime* flag would make that assembly change
-/// impossible to reason about — the same build could have both answers. A
-/// feature is resolved at compile time, so within any one binary the
-/// classification is a constant, which is exactly what the asm needs.
-///
-/// See `docs/archive/CONSOLE_LOG_COST.md` §10.2.
-#[cfg(not(feature = "debug-info"))]
-const fn flat_when_untraced(nr: u64) -> bool {
-    matches!(nr, nr::IO_SUBMIT | nr::IO_CANCEL | nr::IO_GETEVENTS)
-}
-
-/// With tracing compiled in, those three arms read `ctx`/`nr` and take a lock,
-/// so none of them is flat.
-#[cfg(feature = "debug-info")]
-const fn flat_when_untraced(_nr: u64) -> bool {
-    false
-}
+// Why the AIO stubs are **not** admitted, though they look flat.
+//
+// `sys_io_submit`/`sys_io_cancel`/`sys_io_getevents` return 0 unconditionally,
+// and with `debug-info` off their bodies contain nothing else — so a scan for
+// "constant-return arms" proposes all three, and a `flat_when_untraced()`
+// predicate keyed on the feature was written and then removed.
+//
+// **The body is not the arm.** `handle_syscall` dispatches them as
+//
+// ```text
+// nr::IO_SUBMIT => aio::sys_io_submit(args[0], args[1] as i64, args[2]),
+// ```
+//
+// so the *arm* reads `args[0..2]` regardless of what the callee does with them.
+// [`takes_no_args`] is documented as a property of the arm, and it is the
+// precondition for the entry-vector change that stops restoring `x0`-`x5`: with
+// that landed, this dispatch would read unrestored registers. Harmless in effect
+// — the callee discards them — but the invariant would be false, and an
+// invariant that is false in a corner is not one an assembly change can be
+// built on.
+//
+// The members that ARE admitted all dispatch without touching `args`:
+// `nr::GETUID => 0`, `nr::GETEUID => proc::sys_geteuid()`,
+// `nr::AKUMA_GET_VERSION => version::sys_akuma_get_version()`.
+//
+// Admitting the trio would need the dispatch arm made feature-conditional too,
+// which is three `#[cfg]` pairs and a per-feature signature for marginal gain on
+// three stubs. See `docs/archive/CONSOLE_LOG_COST.md` §10.2.
 
 /// Does the arm for `nr` read no element of `args`?
 ///
@@ -404,8 +424,7 @@ const fn flat_when_untraced(_nr: u64) -> bool {
 /// an assembly change, and it needs this classification before it can be tried.
 #[must_use]
 pub const fn takes_no_args(nr: u64) -> bool {
-    flat_when_untraced(nr)
-        || matches!(
+    matches!(
         nr,
         nr::AKUMA_GET_VERSION
             | nr::UPTIME
@@ -417,7 +436,7 @@ pub const fn takes_no_args(nr: u64) -> bool {
             | nr::GETEGID
             | nr::GETTID
             | nr::SCHED_YIELD
-        )
+    )
 }
 
 /// Does anything in this excursion need to know which process is calling?
@@ -445,16 +464,10 @@ pub const fn takes_no_args(nr: u64) -> bool {
 ///   where the prologue/epilogue overhead is most worth not paying.
 #[must_use]
 pub const fn needs_identity(nr: u64) -> bool {
-    !(flat_when_untraced(nr)
-        || matches!(
-            nr,
-            nr::AKUMA_GET_VERSION
-                | nr::UPTIME
-                | nr::GETUID
-                | nr::GETEUID
-                | nr::GETGID
-                | nr::GETEGID
-        ))
+    !matches!(
+        nr,
+        nr::AKUMA_GET_VERSION | nr::UPTIME | nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID
+    )
 }
 
 /// Which tier `nr` is in. The conjunction of the two predicates above.

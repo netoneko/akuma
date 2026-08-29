@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "Time syscalls (clock_gettime/settime, itimers, adjtimex) and the boot-time SNTP client for platforms with no RTC"
 
+[features]
+# Mirrors the bin crate's `syscall-debug-info`. OFF by default. Gates the
+# `[clock-diag]` block in `sys_clock_gettime`, which on an out-of-range clock_id
+# reads the trap-frame ELR, performs TWO user-memory reads and formats a
+# ~130-byte two-line `log::warn!` — all on a path userspace drives by choosing
+# `clock_id`. See docs/archive/CONSOLE_LOG_COST.md §11.3.
+debug-info = []
+
 [lints]
 workspace = true
 

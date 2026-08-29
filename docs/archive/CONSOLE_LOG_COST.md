@@ -142,57 +142,33 @@ the console. `CLAUDE.md` already forbids *allocating* on the console path; this
 is the same argument one step further out — the console is expensive even when
 you allocate nothing.
 
-## 8. The audit that followed: 25 ungated prints, and one lock-per-call
+## 8. The audit that followed
 
-If one trace could be 99.94% of a syscall, the obvious next question is how many
-others there are. Every `safe_print!`/`tprint!`/`console::print` under
-`src/syscall/` was classified — **279 sites**, of which **80 had no config gate
-at all**.
+If one trace could be 99.94% of a syscall, the next question is how many others
+there are. Every print under `src/syscall/` and `crates/*/src/` was classified —
+**and the instances live in their own document**, because the list is long and
+this one is about the method:
 
-Most of those 80 are fine: periodic dumps (`[PIPE-DUMP]`, `[FUTEX-DUMP]`,
-`[SC-STATS]`), kernel-test `[PASS]`/`[FAIL]` lines, anomaly reports
-(`[MUNMAP-STALE]`, `[DONTNEED-FILE]`) and the read-path profiler. Those fire on
-paths userspace cannot drive in a loop.
+> **[`SYSCALL_TRACE_AUDIT.md`](SYSCALL_TRACE_AUDIT.md)** — every instance found,
+> what each cost, what was done about it, and what was deliberately left
+> unconditional.
 
-**25 could be driven in a loop**, and are now gated behind the flag that already
-exists for their subsystem — no new knobs:
+Headline: 279 sites under `src/syscall/`, 80 with no gate, **25 of them
+userspace-drivable** and now gated behind the flag that already existed for their
+subsystem. Plus two in `crates/`, one of which (`[clock-diag]`) is the worst
+instance in the whole audit.
 
-| sites | where | flag |
-|---|---|---|
-| 8 | `aio.rs` — every `io_setup`/`io_submit`/`io_cancel`/`io_getevents`/`io_destroy` | `SYSCALL_DEBUG_INFO_ENABLED` |
-| 4 | `msgqueue.rs` — every `msgget`/`msgctl` | `SYSCALL_DEBUG_INFO_ENABLED` |
-| 4 | `mem.rs` — `[mmap] REJECT` (×2) and the eager-OOM fallbacks | `MEM_SYSCALL_TRACE_ENABLED` |
-| 3 | `fs.rs` — every `renameat`, `fcntl` with an unsupported cmd, pipe-write `EPIPE` | `SYSCALL_DEBUG_INFO_ENABLED` |
-| 1 each | `timerfd_settime`, `pidfd_open`, `prctl` unsupported, `socketpair` unsupported, pipe-write warn, `copy_from_user_str` bad UTF-8 | subsystem flag |
-
-`SYSCALL_DEBUG_INFO_ENABLED` was the natural home: its own doc already records
-the same lesson from the last time round — the `[FORK-DBG]`/`[TRAMP]` traces
-"were unconditional and cost ~20 serial lines per `fork()` … enough to dominate
-the log and shift the timing of the paths they trace."
-
-### 8.1 Gating a print is not enough if the *argument* is the work
-
-Three of the `aio` stubs opened with:
+The one rule worth repeating here, because it is a *method* point and not an
+instance: **gate the argument, not just the print.** Three AIO stubs opened with
 
 ```rust
 let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
 ```
 
-`sys_io_submit`, `sys_io_cancel` and `sys_io_getevents` return `0`
-unconditionally. `exists` had exactly one consumer: choosing which debug string
-to print. So each of those three syscalls **masked IRQs, took a spinlock and
-probed a map** to decide the wording of a line that no shipping profile prints.
-
-Wrapping the `print` alone would have left all of that. The lookup moved inside
-the gate, so with the flag off (every shipping profile) the three stubs are now
-`return 0` and nothing else.
-
-**That is the general shape to look for**: not "is the print gated" but "is
-anything computed *for* the print gated with it". A print that formats
-`current_thread_id()` or `current_trap_frame_elr()` forces the kernel to resolve
-state the syscall itself never needed — which is the same reason
-`akuma_syscalls::fast_path` exists, and the reason a `FastPath::Leaf` syscall
-must not have a diagnostic that resolves identity behind its back.
+and all three return `0` unconditionally — `exists` had one consumer, choosing
+which debug string to print. Wrapping the `print!` alone would have left an IRQ
+mask, a spinlock and a map probe on every call. Ask not "is the print gated" but
+"is anything computed *for* the print gated with it".
 
 ## 9. The same question one layer down: a lock per page
 
@@ -272,42 +248,38 @@ integer, so **the gap between them is the prologue+epilogue cost**.
 
 **~34 ns, ~25% of the call.** On four of the syscalls a libc startup calls most.
 
-### 10.2 The conditional case — solved with a Cargo feature
+### 10.2 The conditional case — attempted, and reverted
 
-The `aio` stubs (§8.1) are constant-return *once the debug lookup is inside the
-gate* — but only then. With tracing on, `io_submit` reads `ctx` and `_nr` to
-format its line and takes `AIO_CONTEXTS.lock()`, which violates criteria 1 and 2.
+The `aio` stubs are constant-return once the debug lookup is inside the gate, so
+a Cargo feature looked like the clean answer: unlike a runtime flag it is resolved
+at compile time, so `FastPath` membership stays constant within a build, which is
+what the entry-vector change needs. `akuma-syscalls` gained a `debug-info`
+feature and a `flat_when_untraced()` predicate admitting
+`IO_SUBMIT`/`IO_CANCEL`/`IO_GETEVENTS`.
 
-The first attempt at this was to leave them `Full`, on the reasoning that a tier
-whose membership depended on a **runtime** flag would make the entry-vector
-change (skip restoring `x0`–`x5` for argument-less calls) impossible to reason
-about — the same binary could have both answers.
+**It was wrong, and reverted.** The body is not the arm:
 
-**A Cargo feature removes that objection entirely**: it is resolved at compile
-time, so within any one binary the classification is a constant, which is exactly
-what the assembly change needs. So:
-
-- `akuma-syscalls` gained a `debug-info` feature and `flat_when_untraced(nr)`,
-  which admits `IO_SUBMIT`/`IO_CANCEL`/`IO_GETEVENTS` when it is off.
-- The bin crate gained `syscall-debug-info`, which forwards to it, and
-  `config::SYSCALL_DEBUG_INFO_ENABLED` is now **derived** from that feature
-  rather than hand-set.
-- `src/syscall/mod.rs` carries a `const _: () = assert!(…)` that the kernel const
-  and `akuma_syscalls::DEBUG_INFO` agree.
-
-That last one is the load-bearing part. If the two ever disagreed,
-`FastPath::Leaf` would be a *lie* — the prologue would skip the identity read for
-a stub that then reads `ctx` and takes a lock. Verified by forcing a mismatch:
-
-```
-error[E0080]: evaluation panicked: config::SYSCALL_DEBUG_INFO_ENABLED disagrees
-with akuma-syscalls' debug-info feature; FastPath::Leaf membership would be
-wrong for the AIO stubs
+```rust
+nr::IO_SUBMIT => aio::sys_io_submit(args[0], args[1] as i64, args[2]),
 ```
 
-`io_setup` and `io_destroy` are **not** admitted in either build — one allocates
-a ring, the other removes an entry — and a test pins that so a widening of the
-list cannot quietly take them.
+The *dispatch arm* reads `args[0..2]` regardless of what the callee does with
+them, and [`takes_no_args`] is documented as a property of the arm. With the
+`x0`–`x5` change landed, that dispatch would read unrestored registers — harmless
+in effect, since the callee discards them, but the invariant would be false, and
+an invariant that is false in a corner cannot carry an assembly change.
+
+Every member that *is* admitted dispatches without touching `args`:
+`nr::GETUID => 0`, `nr::GETEUID => proc::sys_geteuid()`,
+`nr::AKUMA_GET_VERSION => version::sys_akuma_get_version()`.
+
+Admitting the trio needs the dispatch arms made feature-conditional too — three
+`#[cfg]` pairs and a per-feature signature, for three stubs. Deferred to 0.0.8. A
+test (`the_aio_stubs_are_never_leaf_because_the_arm_reads_args`) guards against
+re-adding the predicate without that.
+
+The `syscall-debug-info` feature itself **stays** — it gates real console work in
+`akuma-syscalls-time` and `aio.rs`, which was always its main job.
 
 ### 10.3 Where the flat share stands
 
@@ -323,56 +295,61 @@ a syscall is normally *for*. The remaining four members of `takes_no_args` —
 `getpid`, `getppid`, `gettid`, `sched_yield` — are all identity or scheduler by
 definition and will never be admitted.
 
-### 10.4 A pre-existing hazard this surfaced
+### 10.4 A pre-existing hazard this surfaced — FIXED
 
 `takes_no_args` is documented as "the arm reads no element of `args`", and it is
-the stated precondition for the entry-vector change. **The generic prologue trace
-violates it today.** `[SC] nr=… a0=… a1=… a2=…` formats `args[0..3]` for every
-non-suppressed syscall, and `debug_io_suppressed` is a *noise* list (high-traffic
-calls), not an argument list — `AKUMA_GET_VERSION`, the original `Leaf` and the
-floor control, is not on it, nor are the four uid/gid additions.
+the stated precondition for the entry-vector change that stops restoring
+`x0`–`x5` for argument-less calls. **The generic prologue trace violated it.**
+`[SC] nr=… a0=… a1=… a2=…` formats `args[0..3]` for every number not on
+`debug_io_suppressed`, and that was a **noise** list — high-traffic calls — not an
+argument list. `AKUMA_GET_VERSION`, the original `Leaf` and the floor control the
+whole tier is measured against, was not on it; neither were the four uid/gid
+additions. `uptime` was covered only by the luck of also being high-rate.
 
-So if the `x0`–`x5` change lands while `SYSCALL_DEBUG_IO_ENABLED` is on, that
-line prints stale register contents for exactly the syscalls the optimisation
-targets. Not fixed here — it needs its own change, and the natural fix is to make
-`debug_io_suppressed` return true for anything `takes_no_args`, since `a0=…` for
-an argument-less syscall is meaningless anyway. Recorded so the asm change starts
-by reading this.
+With the asm change landed and `SYSCALL_DEBUG_IO_ENABLED` on, that line would
+print **stale register contents** for exactly the syscalls the optimisation
+targets.
+
+Fixed by making the predicate *start* from the contract rather than restate it:
+
+```rust
+pub const fn debug_io_suppressed(nr: u64) -> bool {
+    takes_no_args(nr) || matches!(nr, /* the high-rate noise list */)
+}
+```
+
+Structural, not a list to remember — and correct on its own merits well before
+the asm change, since `a0=…` for an argument-less syscall was always meaningless.
+Three tests pin it:
+
+- `takes_no_args_implies_suppressed` — the implication, over every number.
+- `every_leaf_is_suppressed` — the corollary for the tier the asm change targets.
+- `the_noise_list_still_does_its_job` — that the widening did not swallow the
+  original purpose: `read`/`write`/`mmap`/`futex` take arguments, so they can
+  only still be suppressed via the `matches!`.
+
+The independent oracle in `tests.rs` was updated to spell the new exclusions out
+rather than delegate to the predicate — an oracle that calls the code it checks
+is not an oracle.
 
 ## 11. The same audit inside `crates/`
 
-`src/syscall/` was not the whole surface. Every print under `crates/*/src/` was
-classified the same way: **166 sites, 66 with no gate of any kind.**
+Also in [`SYSCALL_TRACE_AUDIT.md`](SYSCALL_TRACE_AUDIT.md), including the two
+things the scan got wrong before it got them right — crate gating idioms, and the
+`log` facade, which was missed entirely on the first pass and hid the worst
+instance found.
 
-The result is much better than the raw number suggests, and the reason is worth
-stating: **almost every ungated print in `crates/` is an anomaly report** —
-`[RUN-REFUSED]`, `[REVIVE]`, `[KTG-STALE]`, `[PROC-ORPHAN]`,
-`[TTBR SAVE-MISMATCH]`, `[BKL] stuck`, `[SGI-S FATAL]`, the stale-tid warnings
-in `signal.rs` and `table.rs`. Those fire when an invariant has already been
-violated, they are what the `docs/archive/` investigations were solved with, and
-gating them would be a straight loss. They stay.
+Two results from it belong here rather than there, because they are about method:
 
-Two patterns already in the tree are the ones to copy:
-
-- `[SGI-DBG]` on the scheduler-IPI path is behind a `SGI_DEBUG_ONCE` one-shot.
-- `[SGI] POOL contended` is **rate-limited** — `if n.is_multiple_of(1000)`.
-  That is the amortisation §5 considered and rejected for `errno_diag`, already
-  deployed where it was needed.
-
-**One genuine find**, the crates-side twin of §8.1: `[Cleanup] Thread {}
-recycled after {}us cooldown` in the thread reaper fired **once per thread
-recycle**, unconditionally. A thread-heavy workload — an in-VM `-j4` build —
-recycles constantly, so that was ~70 bytes of console per recycle. Now behind
-`lifecycle_trace_on()`, which is `syscall_debug_info_enabled`: exactly the class
-that flag already covers, since its own doc records the `[FORK-DBG]`/`[TRAMP]`
-traces costing ~20 serial lines per `fork()` for the same reason. A recycle is a
-lifecycle event.
-
-The scan is also a lesson in its own right: a first pass that grepped only for
-`config::UPPER_CASE` reported **130** ungated sites in `crates/`. Crates cannot
-see `src/config.rs` — they gate through `config().syscall_debug_info_enabled`,
-`lifecycle_trace()`, a local `if debug`, or a rate limiter. Half the "findings"
-were the scanner not knowing the codebase's own idioms.
+- **The leaf-most crates on the memory path emit nothing at all.** `akuma-mmap`
+  and `akuma-syscalls-mem` have **0 print sites** — the first because it is
+  dependency-free by construction, the second because it forbids `unsafe` and has
+  no console dependency. A crate that cannot reach the console cannot have this
+  bug, which is an argument for the extraction programme independent of testing.
+- **Most ungated prints in `crates/` are anomaly detectors and must stay that
+  way.** `[PMM-UAF]`, `[KTG-STALE]`, `[TRAMP-MISMATCH]` fire when an invariant is
+  already violated. "Ungated" is not a synonym for "wrong"; the question is
+  always whether *userspace* chooses the trigger.
 
 ## 12. How to re-measure
 

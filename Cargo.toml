@@ -142,7 +142,7 @@ debug = true
 # `flat_when_untraced`), and `FastPath` membership must be constant within a
 # build. `config::SYSCALL_DEBUG_INFO_ENABLED` is derived from this feature, and
 # `src/syscall/mod.rs` const-asserts the two agree.
-syscall-debug-info = ["akuma-syscalls/debug-info"]
+syscall-debug-info = ["akuma-syscalls/debug-info", "akuma-syscalls-time/debug-info"]
 
 default = [
     # Real (shared-kernel) SMP is the default since 2026-08-10 — this is *the* SMP.
