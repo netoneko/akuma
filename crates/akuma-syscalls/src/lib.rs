@@ -346,6 +346,47 @@ pub enum FastPath {
     Leaf,
 }
 
+/// Whether this build compiled the argument-reading syscall traces in.
+///
+/// Exported so the kernel can `const`-assert that its
+/// `config::SYSCALL_DEBUG_INFO_ENABLED` and this crate's `debug-info` feature
+/// agree. They must: if the kernel prints while this crate classifies the arm as
+/// flat, `FastPath::Leaf` is a lie — the prologue would skip the identity read
+/// for a syscall that goes on to read its arguments and take a lock. A silent
+/// disagreement is exactly the failure this constant exists to make impossible.
+pub const DEBUG_INFO: bool = cfg!(feature = "debug-info");
+
+/// Arms that are a bare constant return **only because the trace that would read
+/// their arguments compiles out**.
+///
+/// `sys_io_submit`, `sys_io_cancel` and `sys_io_getevents` are AIO stubs that
+/// return 0 unconditionally. Their bodies contain a debug block that looks up
+/// the context (`with_irqs_disabled` + `AIO_CONTEXTS.lock()`) and formats `ctx`
+/// and `nr` — so with tracing ON they read arguments and take a lock, and with
+/// it OFF they are `0` and nothing else.
+///
+/// **This is keyed on a Cargo feature, not a runtime flag, and that is the whole
+/// point.** `FastPath` membership feeds the entry-vector change that skips
+/// restoring `x0`-`x5` for argument-less calls
+/// (`AKUMA_SYSCALL_PERFORMANCE_AUDIT.md` § "Other untested surface"). A tier
+/// whose membership depended on a *runtime* flag would make that assembly change
+/// impossible to reason about — the same build could have both answers. A
+/// feature is resolved at compile time, so within any one binary the
+/// classification is a constant, which is exactly what the asm needs.
+///
+/// See `docs/archive/CONSOLE_LOG_COST.md` §10.2.
+#[cfg(not(feature = "debug-info"))]
+const fn flat_when_untraced(nr: u64) -> bool {
+    matches!(nr, nr::IO_SUBMIT | nr::IO_CANCEL | nr::IO_GETEVENTS)
+}
+
+/// With tracing compiled in, those three arms read `ctx`/`nr` and take a lock,
+/// so none of them is flat.
+#[cfg(feature = "debug-info")]
+const fn flat_when_untraced(_nr: u64) -> bool {
+    false
+}
+
 /// Does the arm for `nr` read no element of `args`?
 ///
 /// Broader than [`FastPath::Leaf`] on purpose — `getpid` and friends take no
@@ -363,7 +404,8 @@ pub enum FastPath {
 /// an assembly change, and it needs this classification before it can be tried.
 #[must_use]
 pub const fn takes_no_args(nr: u64) -> bool {
-    matches!(
+    flat_when_untraced(nr)
+        || matches!(
         nr,
         nr::AKUMA_GET_VERSION
             | nr::UPTIME
@@ -375,7 +417,7 @@ pub const fn takes_no_args(nr: u64) -> bool {
             | nr::GETEGID
             | nr::GETTID
             | nr::SCHED_YIELD
-    )
+        )
 }
 
 /// Does anything in this excursion need to know which process is calling?
@@ -403,10 +445,16 @@ pub const fn takes_no_args(nr: u64) -> bool {
 ///   where the prologue/epilogue overhead is most worth not paying.
 #[must_use]
 pub const fn needs_identity(nr: u64) -> bool {
-    !matches!(
-        nr,
-        nr::AKUMA_GET_VERSION | nr::UPTIME | nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID
-    )
+    !(flat_when_untraced(nr)
+        || matches!(
+            nr,
+            nr::AKUMA_GET_VERSION
+                | nr::UPTIME
+                | nr::GETUID
+                | nr::GETEUID
+                | nr::GETGID
+                | nr::GETEGID
+        ))
 }
 
 /// Which tier `nr` is in. The conjunction of the two predicates above.

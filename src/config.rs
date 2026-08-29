@@ -455,7 +455,12 @@ pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = false;
 /// and cost ~20 serial lines per `fork()`, 5 per `execve`, and 2 per thread
 /// spawn — enough to dominate the log and shift the timing of the paths they
 /// trace under an in-VM `-j4` build.
-pub const SYSCALL_DEBUG_INFO_ENABLED: bool = false;
+/// Derived from the `syscall-debug-info` Cargo feature, NOT hand-set. Three AIO
+/// stubs are `FastPath::Leaf` only when these traces compile out, so the kernel
+/// const and `akuma-syscalls`' `debug-info` feature must agree — deriving both
+/// from one feature is what makes that structural rather than a convention.
+/// `src/syscall/mod.rs` const-asserts it.
+pub const SYSCALL_DEBUG_INFO_ENABLED: bool = cfg!(feature = "syscall-debug-info");
 
 /// Print a `[TMR] t=… T=… p=… f=…` scheduler heartbeat from the timer IRQ every
 /// 1000 ticks — and every **100** while any fork is in progress. Left over from

@@ -272,21 +272,72 @@ integer, so **the gap between them is the prologue+epilogue cost**.
 
 **~34 ns, ~25% of the call.** On four of the syscalls a libc startup calls most.
 
-### 10.2 The conditional case, and why it was left alone
+### 10.2 The conditional case — solved with a Cargo feature
 
 The `aio` stubs (§8.1) are constant-return *once the debug lookup is inside the
-gate* — but only then. With `SYSCALL_DEBUG_INFO_ENABLED` on, `io_submit` reads
-`ctx` and `_nr` to format its line, which violates criterion 1.
+gate* — but only then. With tracing on, `io_submit` reads `ctx` and `_nr` to
+format its line and takes `AIO_CONTEXTS.lock()`, which violates criteria 1 and 2.
 
-A config-dependent tier would work: `HookConfig` already carries the flags into
-the crate, so `fast_path` could take `&cfg` and admit a "leaf when untraced" set.
-**Not built.** Criterion 1 exists to unlock an entry-vector change that skips
-restoring `x0`–`x5` for argument-less calls
-(`AKUMA_SYSCALL_PERFORMANCE_AUDIT.md` § "Other untested surface"), and a tier
-whose membership depends on a debug flag would make that assembly change unsafe
-to reason about — the classification has to hold in every build, not the common
-one. Recorded here so the option is not re-derived; the four unconditional
-additions above were the available win.
+The first attempt at this was to leave them `Full`, on the reasoning that a tier
+whose membership depended on a **runtime** flag would make the entry-vector
+change (skip restoring `x0`–`x5` for argument-less calls) impossible to reason
+about — the same binary could have both answers.
+
+**A Cargo feature removes that objection entirely**: it is resolved at compile
+time, so within any one binary the classification is a constant, which is exactly
+what the assembly change needs. So:
+
+- `akuma-syscalls` gained a `debug-info` feature and `flat_when_untraced(nr)`,
+  which admits `IO_SUBMIT`/`IO_CANCEL`/`IO_GETEVENTS` when it is off.
+- The bin crate gained `syscall-debug-info`, which forwards to it, and
+  `config::SYSCALL_DEBUG_INFO_ENABLED` is now **derived** from that feature
+  rather than hand-set.
+- `src/syscall/mod.rs` carries a `const _: () = assert!(…)` that the kernel const
+  and `akuma_syscalls::DEBUG_INFO` agree.
+
+That last one is the load-bearing part. If the two ever disagreed,
+`FastPath::Leaf` would be a *lie* — the prologue would skip the identity read for
+a stub that then reads `ctx` and takes a lock. Verified by forcing a mismatch:
+
+```
+error[E0080]: evaluation panicked: config::SYSCALL_DEBUG_INFO_ENABLED disagrees
+with akuma-syscalls' debug-info feature; FastPath::Leaf membership would be
+wrong for the AIO stubs
+```
+
+`io_setup` and `io_destroy` are **not** admitted in either build — one allocates
+a ring, the other removes an entry — and a test pins that so a widening of the
+list cannot quietly take them.
+
+### 10.3 Where the flat share stands
+
+| | flat | of 192 dispatched |
+|---|---:|---:|
+| before this work | 2 | **1.0%** |
+| `--features syscall-debug-info` | 6 | 3.1% |
+| **default (traces off)** | **9** | **4.7%** |
+
+Nearly a 5x increase, and the ceiling is low by construction: criterion 2
+("touches no `Process`, no process table, no fd table, no address space") is what
+a syscall is normally *for*. The remaining four members of `takes_no_args` —
+`getpid`, `getppid`, `gettid`, `sched_yield` — are all identity or scheduler by
+definition and will never be admitted.
+
+### 10.4 A pre-existing hazard this surfaced
+
+`takes_no_args` is documented as "the arm reads no element of `args`", and it is
+the stated precondition for the entry-vector change. **The generic prologue trace
+violates it today.** `[SC] nr=… a0=… a1=… a2=…` formats `args[0..3]` for every
+non-suppressed syscall, and `debug_io_suppressed` is a *noise* list (high-traffic
+calls), not an argument list — `AKUMA_GET_VERSION`, the original `Leaf` and the
+floor control, is not on it, nor are the four uid/gid additions.
+
+So if the `x0`–`x5` change lands while `SYSCALL_DEBUG_IO_ENABLED` is on, that
+line prints stale register contents for exactly the syscalls the optimisation
+targets. Not fixed here — it needs its own change, and the natural fix is to make
+`debug_io_suppressed` return true for anything `takes_no_args`, since `a0=…` for
+an argument-less syscall is meaningless anyway. Recorded so the asm change starts
+by reading this.
 
 ## 11. The same audit inside `crates/`
 

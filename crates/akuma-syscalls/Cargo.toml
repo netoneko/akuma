@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "The shape of a syscall excursion: the generic prologue/epilogue decisions `handle_syscall` makes around the family dispatch, plus a model of the per-thread identity cache's slot lifecycle. Decisions only — the effects stay in the kernel."
 
+[features]
+# Mirrors the bin crate's `syscall-debug-info`. OFF by default, and the fact that
+# it is a CARGO FEATURE rather than a runtime flag is what makes
+# `flat_when_untraced` admissible: `FastPath` membership has to be constant
+# within a build, or the entry-vector change that skips restoring `x0`-`x5` for
+# argument-less calls cannot reason about it. See `flat_when_untraced`.
+debug-info = []
+
 [lints]
 workspace = true
 

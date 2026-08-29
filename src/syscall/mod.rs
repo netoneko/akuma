@@ -1143,6 +1143,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     result
 }
 
+// The kernel's trace const and `akuma-syscalls`' `debug-info` feature must be the
+// same answer. If they diverge, `FastPath::Leaf` becomes a lie: the prologue would
+// skip the identity read for an AIO stub that then reads `ctx`, formats it and
+// takes `AIO_CONTEXTS.lock()`. Both derive from the `syscall-debug-info` feature,
+// so this can only fire if someone hand-edits one of them — which is the point.
+const _: () = assert!(
+    crate::config::SYSCALL_DEBUG_INFO_ENABLED == akuma_syscalls::DEBUG_INFO,
+    "config::SYSCALL_DEBUG_INFO_ENABLED disagrees with akuma-syscalls' debug-info \
+     feature; FastPath::Leaf membership would be wrong for the AIO stubs"
+);
+
 /// `Display` shim for an optional ELR value: prints `0x…` or `?`.
 struct ElrFmt(Option<u64>);
 impl core::fmt::Display for ElrFmt {

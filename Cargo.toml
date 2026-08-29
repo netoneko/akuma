@@ -135,6 +135,15 @@ inherits = "release"
 debug = true
 
 [features]
+# Compile the `[syscall]`/`[FORK-DBG]`/AIO-stub debug traces in. OFF by default.
+#
+# It is a FEATURE and not just `src/config.rs` const because three AIO stubs are
+# `FastPath::Leaf` only when their trace compiles out (`akuma-syscalls`'
+# `flat_when_untraced`), and `FastPath` membership must be constant within a
+# build. `config::SYSCALL_DEBUG_INFO_ENABLED` is derived from this feature, and
+# `src/syscall/mod.rs` const-asserts the two agree.
+syscall-debug-info = ["akuma-syscalls/debug-info"]
+
 default = [
     # Real (shared-kernel) SMP is the default since 2026-08-10 — this is *the* SMP.
     # The multikernel (one-kernel-per-core) alternative was removed 2026-08-10 —

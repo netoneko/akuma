@@ -340,17 +340,35 @@ fn leaf_diverges_from_the_oracle_in_exactly_the_documented_places() {
     // process table — all three *are* identity. `sched_yield` reaches the
     // scheduler. `shutdown` looks constant but only in the `cfg(not(smoltcp))`
     // build; the shipping arm resolves an fd and calls `socket_shutdown`.
+    // `probe_numbers()` yields ascending, so these lists are in numeric order.
+    //
+    // The AIO trio is admitted only with `debug-info` OFF: with it on, those arms
+    // look up the context and format `ctx`/`nr`, so they read arguments and take
+    // a lock. Membership is therefore per-BUILD, never per-run — see
+    // `flat_when_untraced`.
+    #[cfg(not(feature = "debug-info"))]
+    let want = vec![
+        nr::IO_SUBMIT,
+        nr::IO_CANCEL,
+        nr::IO_GETEVENTS,
+        nr::GETUID,
+        nr::GETEUID,
+        nr::GETGID,
+        nr::GETEGID,
+        nr::UPTIME,
+        nr::AKUMA_GET_VERSION,
+    ];
+    #[cfg(feature = "debug-info")]
+    let want = vec![
+        nr::GETUID,
+        nr::GETEUID,
+        nr::GETGID,
+        nr::GETEGID,
+        nr::UPTIME,
+        nr::AKUMA_GET_VERSION,
+    ];
     assert_eq!(
-        leaves,
-        // `probe_numbers()` yields ascending, so this list is in numeric order.
-        vec![
-            nr::GETUID,
-            nr::GETEUID,
-            nr::GETGID,
-            nr::GETEGID,
-            nr::UPTIME,
-            nr::AKUMA_GET_VERSION,
-        ],
+        leaves, want,
         "the Leaf membership changed — every entry needs the four admission \
          criteria checked against its arm, not assumed"
     );
@@ -729,5 +747,31 @@ fn the_search_space_is_what_it_claims_to_be() {
             }
         };
         assert!(reachable, "{op:?} is never enabled — the search space is smaller than it looks");
+    }
+}
+
+/// The feature must actually move the classification, in both directions.
+///
+/// A `flat_when_untraced` that silently returned `false` in every build would
+/// leave the AIO trio permanently `Full` and this file would still pass its other
+/// tests — the failure mode is a missing optimisation, which nothing else
+/// notices. This is the test that would.
+#[test]
+fn debug_info_feature_decides_the_aio_trio() {
+    for nr_val in [nr::IO_SUBMIT, nr::IO_CANCEL, nr::IO_GETEVENTS] {
+        let is_leaf = fast_path(nr_val) == FastPath::Leaf;
+        if cfg!(feature = "debug-info") {
+            assert!(!is_leaf, "{nr_val} must be Full when the trace reads its args");
+        } else {
+            assert!(is_leaf, "{nr_val} must be Leaf when the trace compiles out");
+        }
+        // Whichever way it lands, the two predicates must agree — `fast_path` is
+        // their conjunction and a disagreement would make it accidentally right.
+        assert_eq!(is_leaf, takes_no_args(nr_val) && !needs_identity(nr_val));
+    }
+    // `io_setup` and `io_destroy` do real work in every build and must never be
+    // admitted by a widening of the list above.
+    for nr_val in [nr::IO_SETUP, nr::IO_DESTROY] {
+        assert_eq!(fast_path(nr_val), FastPath::Full, "{nr_val} allocates or removes");
     }
 }
