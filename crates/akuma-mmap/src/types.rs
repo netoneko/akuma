@@ -54,6 +54,21 @@ pub mod user_flags {
         flags == NONE
     }
 
+    /// Whether a mapping with these flags lets EL0 **write** to the page.
+    ///
+    /// The predicate every permission-repair path in the EL0 fault handler needs,
+    /// and the one whose absence let `mprotect` be defeated: a CoW-shared page and
+    /// an `mprotect(PROT_READ)` page are both read-only in the PTE and cannot be
+    /// told apart from the hardware state alone. `MmapRegion::flags` records which
+    /// one it is; this reads that record.
+    ///
+    /// Reads the `AP` field and nothing else — `UXN`/`PXN` decide execution, which
+    /// is irrelevant to whether a store may proceed.
+    #[must_use]
+    pub const fn is_write(flags: u64) -> bool {
+        flags & flags::AP_MASK == flags::AP_RW_ALL
+    }
+
     /// Whether a mapping with these flags lets EL0 *fetch instructions* from the page.
     ///
     /// This is the predicate that decides whether a demand-paged frame needs the
@@ -97,6 +112,34 @@ mod tests {
         // PXN (EL1 fetch) must not influence the answer.
         assert!(user_flags::is_exec(user_flags::RO | flags::PXN));
         assert!(!user_flags::is_exec(user_flags::RO | flags::UXN));
+    }
+
+    /// The write predicate, across the whole `user_flags` table. `RW`/`RW_NO_EXEC`
+    /// permit a store; `RO`, `RX`, `EXEC` and `NONE` must not — those four are
+    /// exactly the states a repair path must refuse to upgrade.
+    #[test]
+    fn user_flags_is_write_reads_only_the_ap_field() {
+        assert!(user_flags::is_write(user_flags::RW));
+        assert!(user_flags::is_write(user_flags::RW_NO_EXEC));
+        assert!(!user_flags::is_write(user_flags::RO));
+        assert!(!user_flags::is_write(user_flags::RX));
+        assert!(!user_flags::is_write(user_flags::EXEC));
+        assert!(!user_flags::is_write(user_flags::NONE));
+        // UXN/PXN must not influence the answer either way.
+        assert!(user_flags::is_write(user_flags::RW | flags::UXN | flags::PXN));
+        assert!(!user_flags::is_write(user_flags::RO | flags::UXN | flags::PXN));
+    }
+
+    /// `from_prot` and `is_write` must agree: anything carrying `PROT_WRITE` is
+    /// writable, and nothing else is. This is the pair the fault handler relies on
+    /// to tell an `mprotect` downgrade from a CoW demotion.
+    #[test]
+    fn from_prot_and_is_write_agree() {
+        for prot in 0u32..8 {
+            let want = prot & 0x2 != 0;
+            assert_eq!(user_flags::is_write(user_flags::from_prot(prot)), want,
+                       "prot={prot:#x}");
+        }
     }
 
     #[test]

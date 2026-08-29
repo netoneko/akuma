@@ -8,11 +8,11 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{exec,ext2,firecracker,isolation,kacho,net,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
+  `akuma-{exec,ext2,firecracker,isolation,kacho,mmap,net,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
   plus the `akuma-syscalls*` family below.
   The **syscall family** is three layers, leaf-first and named so the
   layering is visible — an ABI crate, a shape crate, and one crate per syscall
-  family (three of those so far): `akuma-syscalls-linux` is the ABI (numbers, `repr(C)`
+  family (four of those so far): `akuma-syscalls-linux` is the ABI (numbers, `repr(C)`
   wire structs and their layout assertions, flag tables — zero dependencies);
   `akuma-syscalls` is the *shape* of an excursion (which counter bucket, which
   hooks run, where the epilogue's identity comes from) and depends only on the
@@ -47,8 +47,42 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `--linux` runs the same static binary on real Linux to prove the probe) and
   `userspace/epollprobe/` + `scripts/benchmarks/epoll_ab_run.sh` (cost, run
   A/B/A — `docs/reference/subsystems/syscalls/poll.md`).
+  `akuma-syscalls-mem` is the fourth family (2026-08-29): `sys_mmap`'s
+  **mapping-kind plan** (lazy vs eager, file-backed, shared-writable,
+  `shared_anon`) and `MAP_FIXED` validation, `sys_mremap`'s move-vs-expand,
+  `sys_madvise`'s advice decode and `MADV_DONTNEED`'s range + per-page rule,
+  `munmap`'s sizing, and `membarrier`'s command decode. It depends on
+  `{akuma-syscalls-linux, akuma-primitives}` and **deliberately NOT on
+  `akuma-mmap`** — the mapping-kind decision is a function of the argument bits
+  and never sees a region; if a change makes it want `MmapRegion`, the seam is
+  drawn in the wrong place, so move the seam rather than add the dependency.
+  Seven known divergences from Linux are preserved and pinned. Two of the moved
+  functions failed their first host test with an **overflow reachable from
+  unprivileged userspace** — `madvise(addr, -1, MADV_DONTNEED)` computed ~4.5e15
+  pages and looped unbounded in an `MmBklGuard` window, and `MAP_FIXED`'s
+  kernel-VA overlap guard wrapped to "no overlap"; both are fixed by validating
+  `len` at the syscall boundary (`docs/archive/AKUMA_EXTRACT_MMAP.md` §10.1).
+  Gates: `scripts/mem_suite.py` (correctness — runs the ten `c_stress` memory
+  probes, refuses to score a *silent* probe as a pass, treats `DIVERGE` as green)
+  and `userspace/memprobe/` + `scripts/benchmarks/mem_ab_run.sh` (cost, run
+  A/B/A — `docs/reference/subsystems/syscalls/mem.md`). `mem_op_cost` takes a
+  third argument `hostile`; `hostile=0` skips the two arms a pre-fix kernel
+  cannot survive, which is what lets a baseline arm run at all.
   Further families move out on the same model when a family has real
   pure logic worth testing.
+  `akuma-mmap` is virtual-memory **region bookkeeping**: `MmapRegion`,
+  `PhysFrame`, CoW-fork inheritance, `munmap`'s clip-and-split, and the PTE
+  permission vocabulary (`user_flags`, including `is_write`). Its
+  `[dependencies]` table is **empty** (one of six such crates, with `-boot`,
+  `-kacho`, `-net-yarn`, `-primitives`, `-rump`), and here that emptiness is the
+  enforcement rather than a coincidence — it cannot lock, allocate a frame, edit
+  a page table or name a `Process`, so `Process::vm_lock` and the
+  `vm_with_regions` discipline stay in `akuma-exec` by construction. It sits
+  BELOW `akuma-exec`, which re-exports everything it owns, so no call site
+  changed when it moved. `is_write` is what tells an `mprotect(PROT_READ)` page
+  from a CoW-demoted one — both are read-only in the PTE, and the EL0 write-fault
+  handler used to break CoW on either, silently defeating `mprotect` across a
+  fork (`docs/archive/AKUMA_EXTRACT_MMAP.md` §10.4).
   `akuma-kacho` is the shared observe/decide/hysteresis layer every self-tuning
   policy uses (timer-tick demotion, file-page cache cap, netpoll wake rate).
   `akuma-net-yarn` is the readiness wait loop as a pure state machine, driven by

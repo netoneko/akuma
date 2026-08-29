@@ -3085,6 +3085,37 @@ pub fn stale_write_fault_absorbed_in(l0: *const u64, page_va: usize, tid: usize)
 /// alike: a page whose content is intact but whose permissions were lost (an
 /// accounting bug) versus one that has already been wiped (the frame is gone).
 ///
+/// The protection a region *records* for `va`, if any region records one.
+///
+/// `None` means **no record**, which is not the same as "not writable" and must
+/// never be treated as such: an ELF `.data`/`.bss` page has no region at all
+/// (`COW_STALE_WRITE_FAULT` / `cowstale`), and a lazy region that recorded nothing
+/// carries `flags == 0`. Both take the historical path, where the fault itself is
+/// the only evidence available.
+///
+/// `Some(f)` means a region positively states the protection — which is the whole
+/// reason `MmapRegion::flags` exists. A CoW-demoted page and an
+/// `mprotect(PROT_READ)` page are both read-only in the PTE and indistinguishable
+/// from hardware state alone; this is what tells them apart.
+///
+/// Eager first, then lazy: a VA can only be in one of the two maps, and the eager
+/// lookup is the cheaper of the pair.
+fn recorded_protection(pid: u32, va: usize) -> Option<u64> {
+    akuma_exec::process::eager_region_flags_for_page_fault(pid, va)
+        .or_else(|| {
+            akuma_exec::process::lazy_region_lookup_for_page_fault(pid, va).map(|(f, ..)| f)
+        })
+        .filter(|f| *f != 0)
+}
+
+/// Whether a write to `va` is permitted by whatever protection is recorded for it.
+///
+/// Unrecorded (`None`) answers **true**: the historical behaviour, and the one the
+/// no-region cases depend on.
+fn write_allowed_by_record(pid: u32, va: usize) -> bool {
+    recorded_protection(pid, va).is_none_or(akuma_exec::mmu::user_flags::is_write)
+}
+
 /// Runs only on anomaly paths (`EAGER-UPGRADE`, `WILD-DA`), never per-fault.
 fn print_page_forensics(tag: &str, pid: u32, va: usize) {
     let page_va = va & !0xFFF;
@@ -4272,6 +4303,23 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         return unsafe { (*frame).x0 };
                     }
 
+                    // A CoW break hands the writer a PRIVATE, WRITABLE copy, so it
+                    // must not run when the region says the mapping is not writable.
+                    // `mprotect(PROT_READ)` leaves the PTE read-only — exactly like a
+                    // CoW demotion — and this arm used to fire on both, silently
+                    // restoring write access to a page the process had just asked to
+                    // protect. It runs BEFORE the eager gate below, whose
+                    // `AP_RW_ALL` check was therefore never reached on a forked
+                    // child. Probe: `userspace/forktest/c_stress/eager_mprotect_probe`.
+                    //
+                    // An unrecorded page still breaks CoW: see `write_allowed_by_record`.
+                    if !write_allowed_by_record(pid, far_usize) {
+                        // Fall through to SIGSEGV, which is what the protection asked for.
+                        crate::tprint!(160,
+                            "[MPROTECT-DENY] pid={} va={:#x} write refused by recorded protection\n",
+                            pid, page_va);
+                    } else {
+
                     // Serialize CoW fault handling per-page to prevent races
                     // when multiple CLONE_VM threads fault on the same page.
                     // Holder-tracked so a sibling can reclaim the slot if the
@@ -4315,12 +4363,17 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         // Not a CoW page (or no owner): return the unused frame.
                         crate::pmm::free_page(new_frame);
                     }
+                    } // end write_allowed_by_record
                     // OOM or not-CoW: fall through to the lazy permission upgrade / SIGSEGV.
                 }
 
                 // Lazy region permission upgrade (e.g. demand-paged RO → RW after mprotect)
+                // `is_write`, not `!is_none`: the old gate admitted `PROT_READ` (which
+                // is neither `NONE` nor writable) and then installed RW_NO_EXEC,
+                // defeating `mprotect(PROT_READ)` on a LAZY region the same way the
+                // CoW arm above did on an eager one.
                 if let Some((region_flags, _source, _region_start, _region_size)) = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize)
-                    && !akuma_exec::mmu::user_flags::is_none(region_flags) {
+                    && akuma_exec::mmu::user_flags::is_write(region_flags) {
                         let page_va = far_usize & !(0xFFF);
                         if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                             // PTE permission edit under `as_lock` (shared-kernel SMP); free
@@ -4329,7 +4382,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
                             #[cfg(not(kernel_smp_shared))]
                             let _ = &owner;
-                            akuma_exec::mmu::update_current_user_page_flags(page_va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+                            // Install what the region RECORDS, not a hardcoded RW: a
+                            // region mprotect'd to `PROT_READ|PROT_WRITE|PROT_EXEC`
+                            // must not silently lose its exec bit to `RW_NO_EXEC`.
+                            akuma_exec::mmu::update_current_user_page_flags(page_va, region_flags);
                             return unsafe { (*frame).x0 };
                         }
                     }
@@ -4349,8 +4405,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 if is_write
                     && let Some(region_flags) =
                         akuma_exec::process::eager_region_flags_for_page_fault(pid, far_usize)
-                    && region_flags & akuma_exec::mmu::flags::AP_MASK
-                        == akuma_exec::mmu::flags::AP_RW_ALL
+                    && akuma_exec::mmu::user_flags::is_write(region_flags)
                 {
                     let page_va = far_usize & !(0xFFF);
                     // "The PTE already grants this write" is handled at the top of the

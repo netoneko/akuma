@@ -7,12 +7,81 @@ eviction, see [`../memory.md`](../memory.md) — this doc covers only the
 syscall entry-point layer: argument validation, error codes, and quirks
 visible at the syscall boundary.
 
-> **Stability: C (active risk).** Inherits `memory.md`'s grade — mmap/munmap
-> is the single highest-churn syscall file in the tree (22 commits, last
-> 2026-06-19), because region-boundary bugs surface here first. The recurring
-> lesson: **validate arguments before calling `lookup_process`** — an
-> `EINVAL`/`EFAULT` check done first keeps a kernel-test caller (no current
+> **Stability: B (verify behaviour).** Upgraded from C on 2026-08-29: the
+> family's decisions and its region algebra now have 62 host tests behind them
+> (`akuma-syscalls-mem` 41, `akuma-mmap` 21) and a live gate that runs all ten
+> probes (`scripts/mem_suite.py`), where before there was neither. Still not A —
+> region-boundary bugs surface here first, `cowstale` is a known open flake, and
+> the fault-path half is untouched by any of that.
+>
+> The recurring lesson: **validate arguments before calling `lookup_process`** —
+> an `EINVAL`/`EFAULT` check done first keeps a kernel-test caller (no current
 > process) from getting `ESRCH` instead of the argument error Linux expects.
+> Two 2026-08-29 defects were the same lesson at a different scale: `len` was
+> not validated at all, so `mmap(len=-1)` and `madvise(len=-1)` became unbounded
+> kernel loops reachable from unprivileged userspace.
+
+## Where the logic lives (2026-08-29)
+
+The family's pure decisions and its region algebra were extracted so they could be
+host-tested instead of boot-tested. Three homes, and the split is the point:
+
+| what | where | why there |
+|---|---|---|
+| mapping-kind plan (lazy/eager, file-backed, shared-writable, `shared_anon`), `MAP_FIXED` validation, `munmap` sizing, mremap's move-vs-expand, madvise's advice decode, `MADV_DONTNEED`'s range + per-page rule, membarrier decode | [`crates/akuma-syscalls-mem`](../../../../crates/akuma-syscalls-mem) | pure over the argument bits; **never sees a region**, which is what keeps it a leaf beside `-sync` and `-poll` |
+| `MmapRegion`, `PhysFrame`, CoW-fork inheritance, `munmap`'s clip-and-split, the PTE permission vocabulary (`user_flags`, `is_write`) | [`crates/akuma-mmap`](../../../../crates/akuma-mmap) | region *algebra*; zero dependencies, so it cannot lock, allocate or name a `Process` |
+| every probe, lock, frame, page-table edit, TLB flush, user-memory access; `Process::vm_lock` / `vm_with_regions`; `dontneed_count_shared` / `dontneed_apply`; the fault path | `src/syscall/mem.rs`, `src/exceptions.rs` | effects, and arguments about locking and hardware |
+
+If a change to `akuma-syscalls-mem` finds itself wanting `MmapRegion`, the seam is
+drawn in the wrong place — move the seam, do not add the dependency.
+
+## Known divergences from Linux
+
+Preserved on purpose and pinned by a test named to say what it is, so an
+extraction stays A/B-able against what it replaced. Numbering matches
+`akuma_syscalls_mem`'s crate docs.
+
+| # | divergence | pinned by |
+|---|---|---|
+| 1 | `munmap(addr, 0)` unmaps **one page**; Linux returns `EINVAL` | `diverge_munmap_zero_length_unmaps_one_page` |
+| 2 | `MADV_DONTNEED` with an unaligned start rounds **down**, clearing a strict superset of Linux's range including the caller's partial head page; Linux returns `EINVAL` | `diverge_unaligned_start_rounds_down_and_covers_the_head_page`, counted by `DONTNEED_UNALIGNED` |
+| 3 | `MADV_FREE` returns `EINVAL` — deliberate: Redis reads it as "older kernel" and starts, where a fabricated 0 sends it into a self-check it cannot pass without `/proc/<pid>/smaps` | `diverge_madv_free_is_einval_not_success` |
+| 4 | every other advice returns success without acting, including ones Linux implements | `diverge_unknown_advice_reports_success` |
+| 5 | a shrinking `mremap` returns the old address and leaves the tail mapped; Linux unmaps it | `diverge_shrink_is_in_place_and_leaves_the_tail_mapped` |
+| 6 | `MAP_FIXED_NOREPLACE` is alignment-validated then treated as `MAP_FIXED`, without the "fail if occupied" check | — |
+| 7 | `membarrier` recognises only `QUERY`/`PRIVATE_EXPEDITED`/`REGISTER_PRIVATE_EXPEDITED`; `GLOBAL` (1) and the `SYNC_CORE` family are `EINVAL` | `diverge_global_and_unknown_commands_are_einval` |
+
+`/proc/<pid>/` is not populated (no `smaps`, `maps`, `statm`), which `smapsdirty`
+reports as DIVERGE rather than FAIL.
+
+## Testing
+
+```bash
+# Host, milliseconds — the decisions and the region algebra
+cargo test -p akuma-syscalls-mem -p akuma-mmap --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
+
+# Live guest — all ten c_stress memory probes
+scripts/mem_suite.py --port 2322            # add --only <a,b> for a subset
+
+# Cost, A/B/A, ratio-to-getpid not ns
+scripts/benchmarks/mem_ab_run.sh <label> <outdir> 4
+```
+
+`mem_suite.py` refuses to score a **silent** probe as a pass — output must exist,
+exit must be 0, no `FAIL` word — and treats `DIVERGE` as green. `mem_op_cost`
+takes a third argument `hostile` (default 1); `hostile=0` skips the two arms a
+pre-2026-08-29 kernel cannot survive, so a baseline A/B arm can still run.
+
+**A `mprotect` bug this gate found (fixed 2026-08-29).** A child writing to a page
+its parent had `mprotect(PROT_READ)`-ed did not `SIGSEGV`: the EL0 write-fault
+handler's CoW-break arm fired on `cow_ref > 0` alone and handed the writer a
+private *writable* copy. A CoW-demoted page and an `mprotect`-downgraded page are
+both read-only in the PTE and indistinguishable from hardware state — that is what
+`MmapRegion::flags` exists to disambiguate, and the CoW arm never consulted it. All
+three repair paths are now gated on the recorded protection via
+`akuma_mmap::user_flags::is_write`. **`None` means "no record", not "not
+writable"**: an ELF `.data`/`.bss` page has no region at all and must keep the
+historical path. Probe: `userspace/forktest/c_stress/eager_mprotect_probe`.
 
 ## Syscall table
 

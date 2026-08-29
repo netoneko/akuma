@@ -38,6 +38,40 @@
 #endif
 
 static int failures;
+static int diverges;
+
+/* Three outcomes, not two.
+ *
+ * This probe is calibrated on Linux, where all four checks PASS. Three of them
+ * do not pass on Akuma and are NOT expected to: `/proc/<pid>/` is not populated,
+ * and MADV_FREE returns EINVAL on purpose (see probe 3). Reporting those as FAIL
+ * made the probe permanently red, which is the state in which nobody reads it —
+ * and it hid the one check that must stay green (probe 4).
+ *
+ * DIVERGE means "differs from Linux, documented, and the difference is the
+ * intended behaviour". It is reported and does not fail the run. FAIL is
+ * reserved for a difference nobody has signed off on — including a DOCUMENTED
+ * divergence that has changed shape, which is why each site below tests for the
+ * specific expected deviation rather than for "not PASS".
+ *
+ * Matches `scripts/mem_suite.py`, which inherits the distinction from
+ * `epoll_suite.py`. */
+enum outcome { OUT_PASS, OUT_FAIL, OUT_DIVERGE };
+
+static void report_out(const char *name, enum outcome o, const char *fmt, ...)
+{
+    va_list ap;
+    printf("%-28s %s  ", name,
+           o == OUT_PASS ? "PASS" : (o == OUT_DIVERGE ? "DIVERGE" : "FAIL"));
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    putchar('\n');
+    if (o == OUT_FAIL)
+        failures++;
+    else if (o == OUT_DIVERGE)
+        diverges++;
+}
 
 static void report(const char *name, int ok, const char *fmt, ...)
 {
@@ -83,12 +117,17 @@ static void probe_smaps_present(void)
 {
     FILE *f = fopen("/proc/self/smaps", "r");
     if (!f) {
-        report("smaps-present", 0, "fopen(/proc/self/smaps) errno=%d (%s)",
-               errno, strerror(errno));
+        /* ENOENT is the documented Akuma state: /proc/<pid>/ is not populated
+         * (docs/archive/LONG_ROAD_TO_REDIS.md). Any OTHER errno is a genuine
+         * failure — a permissions or I/O error here would be new information. */
+        report_out("smaps-present", errno == ENOENT ? OUT_DIVERGE : OUT_FAIL,
+                   "fopen(/proc/self/smaps) errno=%d (%s)%s",
+                   errno, strerror(errno),
+                   errno == ENOENT ? " — /proc/<pid>/ not populated, known" : "");
         return;
     }
     fclose(f);
-    report("smaps-present", 1, "-");
+    report_out("smaps-present", OUT_PASS, "-");
 }
 
 /* ---- probe 2: the rest of /proc/<pid>/, which Redis is only the first to miss */
@@ -107,17 +146,24 @@ static void probe_proc_files(void)
             strncat(miss, " ", sizeof(miss) - strlen(miss) - 2);
         }
     }
-    report("proc-self-files", missing == 0, "%d missing: %s",
-           missing, missing ? miss : "-");
+    /* Same documented gap as probe 1: absent, not broken. */
+    report_out("proc-self-files", missing == 0 ? OUT_PASS : OUT_DIVERGE,
+               "%d missing: %s", missing, missing ? miss : "-");
 }
 
 /* ---- probe 3: MADV_FREE return value ----------------------------------
- * Linux returns 0 and really does defer the free. Akuma returns 0 and does
- * NOTHING (src/syscall/mem.rs `MADV_FREE => 0`). A no-op success is legal
- * under POSIX but defeats capability probes: returning EINVAL would make
- * Redis skip its check ("older kernel, presumably not affected") and start.
- * We can only observe the return value here, so 0 counts as PASS — see
- * probe 4 for what actually distinguishes the two. */
+ * Linux returns 0 and really does defer the free.
+ *
+ * CORRECTED 2026-08-29. This comment used to say Akuma returns 0 and does
+ * nothing, and scored 0 as PASS. That is no longer true and the expectation was
+ * backwards: Akuma now returns EINVAL **on purpose**, because a no-op success
+ * defeats capability probes — Redis reads EINVAL as "older kernel, presumably
+ * not affected" and starts, where a fabricated 0 sent it into a THP self-check
+ * it cannot pass without /proc/<pid>/smaps (LONG_ROAD_TO_REDIS.md §5, and
+ * `akuma_syscalls_mem::madvise::action`'s divergence 3).
+ *
+ * So EINVAL is the DIVERGE outcome and 0 is PASS-on-Linux; anything else is a
+ * real failure. Probe 4 is what checks the consequence. */
 static void probe_madv_free(void)
 {
     long ps = sysconf(_SC_PAGESIZE);
@@ -130,8 +176,11 @@ static void probe_madv_free(void)
     *(volatile char *)p = 1;
     errno = 0;
     int ret = madvise(p, ps, MADV_FREE);
-    report("madv-free-accepted", ret == 0, "ret=%d errno=%d (%s)",
-           ret, errno, ret < 0 ? strerror(errno) : "-");
+    enum outcome o = (ret == 0) ? OUT_PASS
+                   : (ret < 0 && errno == EINVAL) ? OUT_DIVERGE : OUT_FAIL;
+    report_out("madv-free-accepted", o, "ret=%d errno=%d (%s)%s",
+               ret, errno, ret < 0 ? strerror(errno) : "-",
+               o == OUT_DIVERGE ? " — deliberate, see probe 4" : "");
     munmap(p, ps);
 }
 
@@ -204,6 +253,6 @@ int main(void)
     probe_proc_files();
     probe_madv_free();
     probe_redis_check();
-    printf("\n%d failure(s)\n", failures);
+    printf("\n%d failure(s), %d documented divergence(s)\n", failures, diverges);
     return failures ? 1 : 0;
 }

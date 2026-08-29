@@ -477,30 +477,106 @@ Three caveats before anyone enables it:
    `overflow-checks = true` is a test/CI profile where an abort is a loud signal,
    not the shipped kernel.
 
-### 10.3 Performance: not measured, and why
+### 10.3 Performance: measured twice, no effect either time
 
-The A/B/A cost gate was **not run**. The host was on battery at a low power setting
-for this session, which throttles the CPU and inflates variance — and the change
-under test is one compare-and-branch at two syscall entry points, far below the
-noise floor that introduces. `floor+N` is not drift-invariant (the drift is
-multiplicative), so a throttled run would produce numbers that look like data and
-are not. It is still owed; see §10.2.
+**Run 2 (2026-08-29, idle host) is the definitive one.** Five boots at SMP=4,
+`mem_op_cost 100 500`: three of the working tree (A, extraction + length guards +
+the `mprotect` fix) against two of `f49ca08f` (B, everything but the `mprotect`
+fix). The `getpid` control read **134 ns on all five boots — 0.0% spread**, which
+is the cleanest control this tree has produced and is what makes the rest
+readable.
 
-### 10.2 Still owed
+| arm | A med | B med | delta | A-to-A spread |
+|---|---:|---:|---:|---:|
+| `mmap_einval` | 1.00 | 1.00 | **0.0%** | 1.5% |
+| `munmap_noent` | 3.04 | 3.05 | −0.2% | 26.9% |
+| `mprotect_noop` | 2.82 | 2.81 | +0.3% | 22.8% |
+| `madv_unmapped` | 13.70 | 13.57 | +0.9% | 1.8% |
+| `membarrier` | 0.99 | 0.99 | −0.8% | 3.0% |
+| `brk_query` | 1.28 | 1.29 | −0.6% | 2.3% |
+| `mmap_enomem` | 1.00 | 1.00 | **0.0%** | 3.0% |
+| `madv_einval` | 0.99 | 0.99 | −0.8% | 4.5% |
 
-Stage 2 changes how syscalls decide, so unlike stage 1 it does **not** get the
-build-only exemption. Outstanding:
+Every delta is ≤0.9%, against a control that did not move at all. **No effect.**
 
-- `scripts/mem_suite.py` — a runner for the ten probes already in
-  `userspace/forktest/c_stress/` (`mmap_stress`, `mmapsum`, `mmap_file`,
-  `mprotectlb`, `mremapmove`, `madvshared`, `shmanon`, `cowstale`,
-  `eager_mprotect_probe`, `smapsdirty`), on the `epoll_suite.py` model, refusing to
-  score a silent probe as a pass and keeping the `DIVERGE`-vs-`FAIL` distinction.
-- `userspace/memprobe/c/mem_op_cost.c` + `scripts/benchmarks/mem_ab_run.sh`, A/B/A,
-  arms `getpid` / `mmap_einval` / `munmap_noent` / `mprotect_noop` /
-  `madvise_dontneed_unmapped` / `membarrier` / `brk_query`.
-- `docs/reference/subsystems/syscalls/mem.md` — "Where the logic lives" table,
-  the seven known divergences, Testing section.
+Run 1 (an earlier, noisier boot set against `e848fbe8`) agreed but resolved less:
+control spread 5.1%, deltas ≤3.1%, and `munmap_noent` sat exactly at its own
+resolution limit. Recorded because the *disagreement between the two runs is
+itself the method's point*: run 1's apparent +2.7% on `munmap_noent` vanished at
+0.0% control spread, so it was drift, not code.
+
+#### The `mprotect` gate on the fault path
+
+§10.4's fix adds a region lookup (`eager_region_flags_for_page_fault`, which takes
+`vm_lock`) to the EL0 write-fault path. Lock order forbids moving it inside the
+`as_lock` hold where `cow_ref` is already known, so it runs on every
+write-permission fault that survives `stale_write_fault_absorbed` — which is a
+real design concern, not a hypothetical, and none of the arms above touch it.
+
+`userspace/memprobe/c/cow_fault_cost.c` (new) measures it: a child faults N
+pages its parent has already made resident, and two page counts bracket the cycle
+so `fork` and `exit` cancel — `per-fault = (cow_512p − cow_1p) / 511`.
+
+| | per CoW write fault |
+|---|---|
+| A (with the gate) | 1236 / 1099 / 1311 ns — median **1236** |
+| B (without) | 1387 / 1129 ns — median **1258** |
+| delta | **−22 ns (−1.7%)**, against a 212 ns A-to-A spread |
+
+Inside the noise, and nominally negative. A CoW fault costs ~1.2 µs; one region
+lookup does not show up in that. **So the placement stands** — the measurement is
+what says not to optimise it, and the lock-order argument is what says not to move
+it. Do not "fix" this without re-running the probe.
+
+### 10.4 The correctness gate, and what it found
+
+`scripts/mem_suite.py` (new) runs the ten probes already in
+`userspace/forktest/c_stress/`, which had no runner. Its verdict is layered
+because the ten are heterogeneous: **output must exist** (a silent probe is never
+a pass), non-zero exit fails, any `FAIL` word fails, and `DIVERGE` is reported
+without failing. Result on the fixed tree: **9/10, 3 DIVERGE**.
+
+It found one real bug immediately, unrelated to this extraction and present on
+`main`:
+
+**`mprotect` was defeated by a fork.** `eager_mprotect_probe` failed on `main`,
+on `08d4c805` and on this branch: a child writing to a page its parent had
+`mprotect(PROT_READ)`-ed did **not** SIGSEGV. Root cause: the EL0 write-fault
+handler's CoW-break arm fires on `cow_ref > 0` alone and hands the writer a
+private **writable** copy. A CoW-demoted page and an `mprotect(PROT_READ)` page
+are both read-only in the PTE and indistinguishable from hardware state — which is
+precisely what `MmapRegion::flags` was added to disambiguate — and the CoW arm
+never consulted it. It also runs *before* the eager-region gate, whose
+`AP_RW_ALL` check was therefore never reached on a forked child.
+
+Fixed by gating all three repair paths on the recorded protection:
+
+- New `akuma_mmap::user_flags::is_write` — the predicate that was missing, with
+  host tests pairing it against `from_prot` across the whole table.
+- New `recorded_protection` / `write_allowed_by_record` in `exceptions.rs`.
+  **`None` means "no record", not "not writable"** — an ELF `.data`/`.bss` page has
+  no region at all, and a lazy region that recorded nothing carries `flags == 0`;
+  both must keep the historical path or `cowstale` breaks.
+- The CoW break now declines when a record says the mapping is not writable.
+- The lazy-upgrade arm's gate was `!is_none(region_flags)`, which admits
+  `PROT_READ` — the same hole on lazy regions. Now `is_write`, and it installs
+  the region's *recorded* flags instead of a hardcoded `RW_NO_EXEC`.
+
+Verified: probe PASSes; boot suite 0 FAILED / 0 POISON; the new `[MPROTECT-DENY]`
+trace fired 6 times, all at the probe's own addresses in phase pairs — the
+intended SIGSEGVs, no false positives.
+
+`cowstale` remains red and is **not** this change's doing: it fails on `main`
+(2 of 4 runs SEGV), it is load-driven, and `[MPROTECT-DENY]` fired **zero** times
+across four `cowstale` runs on the fixed kernel, which exonerates the new gate
+directly. Known issue, tracked elsewhere.
+
+`smapsdirty` was red for a different reason: it is Linux-calibrated, and three of
+its four checks test things Akuma deliberately does not do. Its own comment for
+`MADV_FREE` had gone stale — it claimed Akuma returns 0, when returning `EINVAL`
+is the intended behaviour and the reason Redis starts. The probe now has a third
+outcome and reports those three as DIVERGE, testing for the *specific* expected
+deviation so an undocumented change still fails.
 
 ---
 
