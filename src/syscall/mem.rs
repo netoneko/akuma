@@ -68,7 +68,6 @@ pub use akuma_syscalls_linux::flags::map::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE,
     MAP_SHARED, MAP_STACK,
 };
-pub use akuma_syscalls_linux::flags::prot::{PROT_NONE, PROT_WRITE};
 
 // ── `MADV_DONTNEED` share-breaking audit ─────────────────────────────────────
 //
@@ -114,59 +113,21 @@ pub static DONTNEED_SHARE_BREAK_SKIPPED: core::sync::atomic::AtomicUsize =
 pub static DONTNEED_FILE_BACKED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// The page range `MADV_DONTNEED` actually zeroes for `(addr, len)`, as
-/// `(start_va, pages)`.
+/// `MADV_DONTNEED`'s range rule and per-page rule, re-exported from
+/// `akuma-syscalls-mem`.
 ///
-/// Extracted so the divergence from Linux is assertable at the boundary rather
-/// than inferred from the handler (same reasoning as
-/// [`mmap_fixed_addr_unaligned_einval`]). Linux requires a page-aligned `start`
-/// and rejects anything else with `EINVAL`, then zeroes
-/// `[start, PAGE_ALIGN(start+len))`. This rounds an unaligned start **down**
-/// instead, so for `addr & 0xFFF != 0` the range Akuma clears is a strict
-/// superset of Linux's — it includes the caller's partial head page, whose live
-/// bytes Linux would never have touched.
-pub fn dontneed_zero_range(addr: usize, len: usize) -> (usize, usize) {
-    let start = addr & !0xFFF;
-    let end = (addr.saturating_add(len) + 0xFFF) & !0xFFF;
-    (start, (end - start) / 4096)
-}
-
-/// What `MADV_DONTNEED` must do with one page of the range, given the page's
-/// state. Pure so the rule can be host-tested at the boundary instead of being
-/// inferred from the handler (same reasoning as [`dontneed_zero_range`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DontneedAction {
-    /// Nothing mapped at this VA: a lazy region (or a later fault) already
-    /// yields zeroes, so there is nothing to do.
-    Nothing,
-    /// This address space is the frame's only holder — zeroing it in place is
-    /// indistinguishable from Linux's drop-and-refault and costs no allocation.
-    ZeroInPlace,
-    /// Another address space maps this frame too. Zeroing it would wipe *their*
-    /// live page, which is the null-`Rc` corruption. Give this address space a
-    /// private zero frame instead and drop its share reference.
-    BreakSharing,
-}
-
-/// The per-page rule, over the two facts the handler can observe: whether the VA
-/// is mapped, and how many address spaces hold the frame.
+/// Both are functions of their arguments, so they moved to the crate with the rest
+/// of the family's decisions and took a wider set of host tests with them —
+/// including the two overflow defects the move found (see the crate's
+/// `preserved_overflow_*` tests). `DontneedAction` keeps its kernel-side spelling so
+/// the ~250 lines of handler below and the boot suite are unchanged.
 ///
-/// `cow_ref` counts **address spaces**, and the first share inserts 2 (see
-/// `akuma_pmm::cow_ref_inc`) — so `>= 2` is the only value that means "someone
-/// else can see this frame". `1` is a peer that has already gone away (a
-/// `file_page_cache` entry mapped nowhere else, or a fork sibling that exited or
-/// broke CoW), and `0` is a frame that was never shared; neither has a peer to
-/// corrupt, so both take the cheap path.
-#[must_use]
-pub fn dontneed_page_action(mapped: bool, cow_ref: u16) -> DontneedAction {
-    if !mapped {
-        DontneedAction::Nothing
-    } else if cow_ref >= 2 {
-        DontneedAction::BreakSharing
-    } else {
-        DontneedAction::ZeroInPlace
-    }
-}
+/// `dontneed_count_shared` and `dontneed_apply` deliberately did NOT move: they take
+/// a live `UserAddressSpace` and mutate page tables, and the defect they exist to
+/// catch is cross-address-space, which no host test can see.
+pub use akuma_syscalls_mem::madvise::{
+    PageAction as DontneedAction, dontneed_page_action, dontneed_zero_range,
+};
 
 /// One-line summary of the `MADV_DONTNEED` audit counters for the PSTATS block.
 /// Writes into the caller's buffer instead of returning a `String` — same
@@ -299,32 +260,29 @@ pub(super) fn sys_msync(addr: usize, len: usize, _flags: u32) -> u64 {
     0
 }
 
-/// Returns `true` if a MAP_FIXED / MAP_FIXED_NOREPLACE call with the given
-/// `addr` and `flags` would be rejected with `EINVAL` for **page misalignment**.
+/// `MAP_FIXED` alignment validation, re-exported from `akuma-syscalls-mem`.
 ///
-/// Mirrors the alignment guard in `sys_mmap`. Pure function over the syscall
-/// inputs so kernel tests can assert that errno-shaped argument values
-/// (e.g. crash14: `addr = 0xffffffffffffffea`) genuinely map to EINVAL when
-/// MAP_FIXED is set, and *do not* trip this branch when it is not.
-pub fn mmap_fixed_addr_unaligned_einval(addr: usize, flags: u32) -> bool {
-    let is_fixed = (flags & MAP_FIXED) != 0;
-    let is_fixed_noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
-    (is_fixed || is_fixed_noreplace) && addr != 0 && (addr & 0xFFF) != 0
-}
+/// Called *before* `lookup_process` in `sys_mmap`, deliberately: a kernel-test
+/// caller with no current task must get `EINVAL`, not `ESRCH`. That ordering is
+/// what `test_mmap_einval_through_handle_syscall` asserts, and it stays in the boot
+/// suite because it is a property of where the call sits, not of what it returns.
+pub use akuma_syscalls_mem::mmap::fixed_addr_unaligned_einval as mmap_fixed_addr_unaligned_einval;
 
-/// Returns `true` if a MAP_FIXED mapping would overlap the kernel
-/// identity-map VA range (and thus be rejected with `EINVAL`).
+/// Whether a `MAP_FIXED` mapping would overlap the kernel identity-map VA range.
 ///
-/// Same predicate as the in-line guard in `sys_mmap`; kept here so the
-/// diagnostic logger can derive a one-token reason hint without re-walking
-/// the syscall body.
+/// Thin forwarder: the crate takes the window as arguments because `kernel_va_end()`
+/// **scales with detected RAM**, so the guard cannot be expressed as a constant.
+/// Supplying it here keeps the crate a leaf and lets the host tests sweep RAM sizes,
+/// which is how the overflow defect in it became visible.
+#[must_use]
 pub fn mmap_fixed_overlaps_kernel_va(addr: usize, len: usize) -> bool {
     use akuma_exec::process::types::ProcessMemory;
-    let pages = len.div_ceil(4096);
-    let map_end = addr.saturating_add(pages * 4096);
-    // kernel_va_end() scales with detected RAM so this guard catches MAP_FIXED
-    // overlaps with the full RAM identity map, not just a fixed 2GB window.
-    addr < akuma_exec::mmu::kernel_va_end() && map_end > ProcessMemory::KERNEL_VA_START
+    akuma_syscalls_mem::mmap::fixed_overlaps_kernel_va(
+        addr,
+        len,
+        ProcessMemory::KERNEL_VA_START,
+        akuma_exec::mmu::kernel_va_end(),
+    )
 }
 
 pub(super) fn sys_brk(new_brk: usize) -> u64 {
@@ -421,10 +379,17 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 
     let _ = MAP_STACK; // silence unused-import lint; flag accepted but ignored
 
-    let is_lazy = prot == PROT_NONE && (flags & MAP_ANONYMOUS != 0);
+    // The mapping-kind decision — lazy vs eager, file-backed vs anonymous,
+    // shared-writable, shared-anon — is a function of the argument bits and the page
+    // count, so it lives in `akuma-syscalls-mem` where it is host-tested against the
+    // threshold, `MAP_POPULATE`'s precedence and the `MAP_SHARED` matrix. Everything
+    // below acts on it.
+    let plan = akuma_syscalls_mem::mmap::plan(
+        prot, flags, fd, pages, crate::config::MMAP_EAGER_MAX_PAGES,
+    );
     let is_fixed = flags & MAP_FIXED != 0;
     let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
-    let map_populate = flags & MAP_POPULATE != 0;
+    let _ = MAP_POPULATE; // consumed by `plan`; subsumed by the lazy fallback below
 
     // Like `len == 0`, an unaligned MAP_FIXED / MAP_FIXED_NOREPLACE address is
     // EINVAL before any process lookup. Otherwise `handle_syscall` from kernel
@@ -471,7 +436,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         return ENOMEM;
     };
 
-    let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
+    let is_file_backed = plan.is_file_backed;
 
     // Writable MAP_SHARED on a file-backed mapping has true shared-page semantics:
     // writes through the mapping must become visible in the file. Akuma has no
@@ -479,7 +444,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // writable, populated from the file) and writing the pages back to the file on
     // munmap/msync/exit (see SHARED_FILE_MAPPINGS). Read-only MAP_SHARED has no
     // writes to flush, so it stays on the cheap lazy MAP_PRIVATE-equivalent path.
-    let is_shared_writable = (flags & MAP_SHARED != 0) && is_file_backed && (prot & PROT_WRITE != 0);
+    let is_shared_writable = plan.is_shared_writable;
 
     // MAP_POPULATE requests eager pre-faulting; it suppresses lazy allocation.
     // MADV_WILLNEED can also trigger pre-faulting on existing lazy regions.
@@ -489,11 +454,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // pages that are never touched are never allocated, which cuts the physical
     // footprint (the rustc trace ended near OOM from eager over-commit). Small
     // mappings stay eager — see config::MMAP_EAGER_MAX_PAGES for the rationale.
-    let use_lazy = !is_file_backed && !map_populate && (
-        is_lazy ||
-        (flags & MAP_NORESERVE != 0) ||
-        pages > crate::config::MMAP_EAGER_MAX_PAGES
-    );
+    let use_lazy = plan.use_lazy;
 
     if use_lazy {
         let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
@@ -511,7 +472,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // LazySource::File, same mechanism as demand-paged ELFs.
     // Writable MAP_SHARED is forced eager (see below) so its pages are all
     // resident for writeback; everything else may demand-page lazily.
-    if crate::config::MMAP_FILE_BACKED_LAZY && is_file_backed && !is_shared_writable
+    if crate::config::MMAP_FILE_BACKED_LAZY && plan.file_lazy_eligible
         && let Some(akuma_exec::process::FileDescriptor::File(ref f)) = proc.get_fd(fd as u32) {
             let path = f.path.clone();
             // Path→inode resolution reads ext2 metadata (real I/O on a cold cache) —
@@ -569,7 +530,6 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             return mmap_eager_to_lazy_fallback(proc, is_file_backed, fd, offset, len, mmap_addr, pages, page_flags);
         }
     };
-    let _ = map_populate; // populate is now subsumed by the lazy fallback above
 
     // Fill file-backed frames from disk BEFORE installing them. The frames are still
     // private here (unmapped, untracked), so no sibling thread can observe — or munmap
@@ -686,30 +646,30 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // -backed `MAP_SHARED` is a different mechanism entirely (SHARED_FILE_MAPPINGS
     // writeback), so this is the anonymous case only.
     let region = MmapRegion::owned_with_flags(mmap_addr, frames, page_flags);
-    let region = if (flags & MAP_SHARED != 0) && !is_file_backed {
-        region.shared_anon()
-    } else {
-        region
-    };
+    let region = if plan.shared_anon { region.shared_anon() } else { region };
     proc.vm_with_regions(|r| r.push(region));
 
     mmap_addr as u64
 }
 
 pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: u32) -> u64 {
-    if new_size == 0 { return EINVAL; }
-    if old_addr & 0xFFF != 0 { return EINVAL; }
-    use akuma_syscalls_linux::flags::mremap::MREMAP_MAYMOVE;
-
-    let va_limit = user_va_limit() as usize;
-    if old_addr >= va_limit { return EFAULT; }
-
+    // Argument validation and the shrink short-circuit are pure, and they run
+    // BEFORE any process lookup on purpose — a kernel-test caller with no current
+    // task must see the argument errno, not ESRCH.
+    let (new_pages, may_move) = match akuma_syscalls_mem::mremap::plan(
+        old_addr, old_size, new_size, flags, user_va_limit() as usize,
+    ) {
+        akuma_syscalls_mem::mremap::Plan::Fail(errno) => return errno,
+        // A shrink returns the old address with the tail still mapped — a preserved
+        // divergence from Linux, pinned by the crate's
+        // `diverge_shrink_is_in_place_and_leaves_the_tail_mapped`.
+        akuma_syscalls_mem::mremap::Plan::InPlace => return old_addr as u64,
+        akuma_syscalls_mem::mremap::Plan::Grow { new_pages, may_move } => (new_pages, may_move),
+    };
+    // The old extent, for tearing the source mapping down after the copy. The plan
+    // used the same value to decide, but that was a decision and this is an effect —
+    // the crate does not hand back extents it only needed internally.
     let old_pages = old_size.div_ceil(4096);
-    let new_pages = new_size.div_ceil(4096);
-
-    if new_pages <= old_pages {
-        return old_addr as u64;
-    }
 
     // Resolve the address-space owner ONCE, while the BKL is still held, and reuse
     // this reference for the rest of the call — the process table itself has no
@@ -721,11 +681,14 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
     let proc = akuma_exec::process::lookup_process_shared(owner_pid);
     let _mm_window = MmBklGuard::new();
 
-    if flags & MREMAP_MAYMOVE == 0 {
+    // Gated on `!may_move`, exactly as before: this probe is three lookups and a
+    // `vm_lock` acquisition, so running it on every growing mremap would be a lock
+    // per call. The crate reports `may_move` rather than deciding, for that reason.
+    if !may_move {
         let is_mapped = akuma_exec::mmu::is_current_user_page_mapped(old_addr)
             || akuma_exec::process::lazy_region_lookup_for_pid(owner_pid, old_addr).is_some()
             || proc.is_some_and(|p| p.vm_with_regions(|r| r.iter().any(|reg| reg.contains(old_addr))));
-        return if is_mapped { ENOMEM } else { EFAULT };
+        return akuma_syscalls_mem::mremap::no_move_errno(is_mapped);
     }
 
     let proc = match proc {
@@ -1088,10 +1051,10 @@ fn madvise_dontneed_range(
 }
 
 pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
-    use akuma_syscalls_linux::flags::madvise::{MADV_DONTNEED, MADV_FREE, MADV_WILLNEED};
+    use akuma_syscalls_mem::madvise::Action;
 
-    match advice {
-        MADV_WILLNEED => {
+    match akuma_syscalls_mem::madvise::action(advice) {
+        Action::Willneed => {
             // Pre-fault pages in lazy regions that aren't yet mapped.
             // This is advisory; OOM during pre-faulting is silently ignored.
             let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
@@ -1153,7 +1116,7 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             });
             0
         }
-        MADV_DONTNEED => {
+        Action::Dontneed => {
             let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
             let proc = match akuma_exec::process::lookup_process_shared(owner_pid) {
@@ -1191,28 +1154,31 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
         // exactly that measurable — if `DONTNEED_SHARED_FRAME` starts climbing,
         // fixing MADV_DONTNEED to break sharing rather than zero in place is the
         // prerequisite, not backing this out.
-        MADV_FREE => EINVAL,
-        _ => 0,
+        // `MADV_FREE` -> EINVAL and every unrecognised advice -> success are both
+        // decided by the crate and pinned there (`diverge_madv_free_is_einval_not_success`,
+        // `diverge_unknown_advice_reports_success`). The long rationale above is why.
+        Action::Fail(errno) => errno,
+        Action::Ignore => 0,
     }
 }
 
+/// `membarrier(2)`.
+///
+/// The command decode is `akuma_syscalls_mem::membarrier`; the barrier itself stays
+/// here because it is inline assembly, which that crate forbids — the right split,
+/// not an inconvenience.
 pub fn membarrier_cmd(cmd: u32) -> u64 {
-    const CMD_QUERY: u32 = 0;
-    const CMD_PRIVATE_EXPEDITED: u32 = 8;
-    const CMD_REGISTER_PRIVATE_EXPEDITED: u32 = 16;
-    const SUPPORTED: u64 = 0x18;
-
-    match cmd {
-        CMD_QUERY => SUPPORTED,
-        CMD_REGISTER_PRIVATE_EXPEDITED => 0,
-        CMD_PRIVATE_EXPEDITED => {
+    use akuma_syscalls_mem::membarrier::{Command, command};
+    match command(cmd) {
+        Command::Barrier => {
             unsafe {
                 core::arch::asm!("dsb ish");
                 core::arch::asm!("isb");
             }
             0
         }
-        _ => EINVAL,
+        // Query / Register / Invalid all answer without the kernel acting.
+        other => other.immediate_result().unwrap_or(0),
     }
 }
 
@@ -1286,7 +1252,10 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     };
     let _mm_window = MmBklGuard::new();
 
-    let unmap_len = if len > 0 { (len + 4095) & !4095 } else { 4096 };
+    // `munmap(addr, 0)` unmaps ONE page here where Linux returns EINVAL — a
+    // preserved divergence, pinned by the crate's
+    // `diverge_munmap_zero_length_unmaps_one_page`.
+    let unmap_len = akuma_syscalls_mem::mmap::munmap_len(len);
 
     // Detach EVERY eager region overlapping the range, clipping partial ones at
     // both ends, under vm_lock (pure Vec ops only). The actual page unmap + frame

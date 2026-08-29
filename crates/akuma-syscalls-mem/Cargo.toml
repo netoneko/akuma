@@ -1,0 +1,17 @@
+[package]
+name = "akuma-syscalls-mem"
+version = "0.1.0"
+edition = "2024"
+description = "The memory-syscall family's pure decisions: mmap's mapping-kind plan and MAP_FIXED validation, mremap's move-vs-expand decision, madvise's advice decode and MADV_DONTNEED's per-page rule, munmap's sizing, and membarrier's command decode. Decisions only — every probe, lock, frame and page-table edit stays in the kernel."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The ABI (MAP_*/PROT_*/MREMAP_*/MADV_* tables) and the errno table. Both are
+# leaves. Deliberately NOT akuma-exec, and deliberately NOT akuma-mmap: this crate
+# decides what KIND of mapping a request asks for, which is a function of the
+# argument bits alone — it never sees a region. If it ever needs `MmapRegion`, the
+# seam is in the wrong place. See the crate docs.
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+akuma-primitives = { path = "../akuma-primitives" }

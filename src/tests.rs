@@ -185,7 +185,6 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_robust_list_cleanup_wakes_futex, "robust_list_cleanup_wakes_futex");
 
     // membarrier command dispatch
-    run_test!(test_membarrier_query_returns_bitmask, "membarrier_query_returns_bitmask");
     run_test!(test_membarrier_private_expedited_succeeds, "membarrier_private_expedited_succeeds");
 
     // Regression: PMM contiguous allocation (extract-syscalls branch)
@@ -230,7 +229,6 @@ pub fn run_memory_tests() -> bool {
     // Regression: forktest §E `[EINVAL] nr=222` (docs/GO_FORKTEST_DEBUG.md).
     // Pin the alignment-EINVAL helper so the mmap diagnostic decode and
     // sys_mmap guard cannot drift apart. crash14 shape: addr=-22, FIXED set.
-    run_test!(test_mmap_fixed_addr_unaligned_einval_helper, "mmap_fixed_addr_unaligned_einval_helper");
     run_test!(test_mmap_einval_through_handle_syscall,      "mmap_einval_through_handle_syscall");
 
     // Common memory allocation patterns
@@ -5765,20 +5763,6 @@ fn test_robust_list_cleanup_wakes_futex() -> bool {
 // membarrier tests
 // ============================================================================
 
-/// Test that MEMBARRIER_CMD_QUERY returns the supported commands bitmask.
-fn test_membarrier_query_returns_bitmask() -> bool {
-    console::print("\n[TEST] membarrier: CMD_QUERY returns bitmask\n");
-
-    let expected: u64 = 0x18;
-    let result = crate::syscall::membarrier_cmd(0);
-    let pass = result == expected;
-    if !pass {
-        crate::safe_print!(64, "  expected={:#x} got={:#x}\n", expected, result);
-    }
-    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
-    pass
-}
-
 /// Test that MEMBARRIER_CMD_PRIVATE_EXPEDITED returns success.
 fn test_membarrier_private_expedited_succeeds() -> bool {
     console::print("\n[TEST] membarrier: PRIVATE_EXPEDITED returns 0\n");
@@ -8113,51 +8097,6 @@ fn test_pipe_cloexec_cleanup_preserves_live_writer() -> bool {
     crate::syscall::pipe::pipe_close_read(id);  // read=0, destroyed
 
     let pass = write_ok && read_ok;
-    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
-    pass
-}
-
-/// Regression: forktest §E `[EINVAL] nr=222` with errno-shaped `addr`.
-///
-/// `crash14` (docs/GO_FORKTEST_DEBUG.md) shows `mmap` syscalls where `x0` is
-/// `0xffffffffffffffea` (-22 = EINVAL). The kernel's `sys_mmap` already rejects
-/// such calls — but only when `MAP_FIXED` (or `MAP_FIXED_NOREPLACE`) is set.
-/// This test pins the alignment-EINVAL helper so future refactors cannot
-/// silently break the diagnostic decode path or the `sys_mmap` guard.
-fn test_mmap_fixed_addr_unaligned_einval_helper() -> bool {
-    console::print("\n[TEST] mmap_fixed_addr_unaligned_einval helper (crash14 shapes)\n");
-    use crate::syscall::{
-        mmap_fixed_addr_unaligned_einval, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE,
-        MAP_PRIVATE,
-    };
-
-    // crash14 hint shape: addr looks like an errno (-22), various flag bitmasks.
-    let crash14_addr = 0xffffffffffffffea_usize;
-    let aligned_fixed = 0x4000_0000_usize;
-    let normal_anon_flags = MAP_ANONYMOUS | MAP_PRIVATE;       // musl mmap(NULL, ...) usual flags
-    let fixed_anon_flags = MAP_FIXED | normal_anon_flags;
-    let fnr_anon_flags = MAP_FIXED_NOREPLACE | normal_anon_flags;
-
-    // (label, addr, flags, expected_einval)
-    let cases: &[(&str, usize, u32, bool)] = &[
-        ("crash14 + FIXED",        crash14_addr,  fixed_anon_flags,   true),
-        ("crash14 + FIXED_NOREP",  crash14_addr,  fnr_anon_flags,     true),
-        ("crash14 no FIXED",       crash14_addr,  normal_anon_flags,  false),
-        ("aligned + FIXED",        aligned_fixed, fixed_anon_flags,   false),
-        ("addr=0 + FIXED",         0,             fixed_anon_flags,   false),
-        ("aligned no FIXED",       aligned_fixed, normal_anon_flags,  false),
-    ];
-
-    let mut pass = true;
-    for &(label, addr, flags, expected) in cases {
-        let got = mmap_fixed_addr_unaligned_einval(addr, flags);
-        if got != expected {
-            crate::safe_print!(192,
-                "  FAIL ({}): addr={:#x} flags={:#x} expected={} got={}\n",
-                label, addr, flags, expected, got);
-            pass = false;
-        }
-    }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

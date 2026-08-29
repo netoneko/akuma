@@ -112,9 +112,8 @@ pub use fs::sys_close_range;
 // Re-export the mmap alignment-EINVAL helper + the flag bits used by kernel
 // tests. `mod mem` is private; these wrappers keep the module boundary intact.
 #[cfg(kernel_tests)]
-pub use mem::mmap_fixed_addr_unaligned_einval;
 #[cfg(kernel_tests)]
-pub use mem::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE};
+pub use mem::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE};
 
 
 pub static CURRENT_SYSCALL_NR: AtomicU64 = AtomicU64::new(9999);

@@ -17,6 +17,7 @@ default-members = [
     "crates/akuma-scheduler",
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-linux",
+    "crates/akuma-syscalls-mem",
     "crates/akuma-syscalls-poll",
     "crates/akuma-syscalls-sync",
     "crates/akuma-terminal",
@@ -693,6 +694,15 @@ akuma-syscalls-sync = { path = "crates/akuma-syscalls-sync" }
 # find. The wait loop is NOT here — it is `akuma-net-yarn`, and this extraction
 # stops at the readiness edge.
 akuma-syscalls-poll = { path = "crates/akuma-syscalls-poll" }
+
+# The memory family's pure decisions: mmap's mapping-kind plan and MAP_FIXED
+# validation, mremap's move-vs-expand decision, madvise's advice decode and
+# MADV_DONTNEED's per-page rule, munmap's sizing, membarrier's command decode.
+# The third family (AKUMA_EXTRACT_MMAP.md §7). Unlike the region bookkeeping in
+# `akuma-mmap`, this crate never sees a `MmapRegion` — the mapping-kind decision
+# is a function of the argument bits alone, which is what keeps it a leaf beside
+# `-sync` and `-poll` rather than a dependant of `akuma-exec`.
+akuma-syscalls-mem = { path = "crates/akuma-syscalls-mem" }
 embedded-io-async = { version = "0.6", default-features = false }
 
 [patch.crates-io]

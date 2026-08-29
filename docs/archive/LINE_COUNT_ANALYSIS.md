@@ -528,10 +528,12 @@ under `--rev`, so the same window can be measured rather than asserted:
 | crates | 10 | 14 | 22 |
 | code (`src` + `crates`) | 57,775 | 72,865 | 85,472 |
 | comment / code | 21.2% | 44.1% | 47.7% |
-| `unsafe` sites, tree-wide | **777** | 656 | **680** |
-| … in `src/` | 536 | 308 | 313 |
-| … in `crates/` | 241 | 348 | 367 |
-| `unsafe` per kloc | 13.4 | 9.0 | **8.0** |
+| `unsafe` sites, tree-wide | 777 | 656 | 680 |
+| … **production** `unsafe` | **659** | 525 | **535** |
+| … … in `src/` | 424 | 194 | 197 |
+| … … in `crates/` | 235 | 331 | 338 |
+| … test-only `unsafe` | 118 | 131 | 145 |
+| production `unsafe` per kloc | **17.3** | 12.0 | **10.5** |
 | crates with `#![forbid(unsafe_code)]` | **0 of 10** | **0 of 14** | 13 of 22 |
 | code in those crates | 0 | 0 | 9,623 |
 
@@ -562,7 +564,42 @@ extraction does not delete `unsafe`, it *relocates* it — out of the bin crate,
 either irreducible and documented as such, or absent and enforced absent. The
 `forbid` discipline did not exist at all at `v0.0.7`.
 
-Read against Stat 3's Reading B (comment density as a complexity tell), these two
+### Production `unsafe` fell 19% while production code grew 34%
+
+The tree-wide row above mixes in test `unsafe` (145 sites now, 21% of the total —
+the boot suite builds page tables and forges trap frames by hand, which is its
+job). The number that matters is **production**: 659 → 535, **−18.8%**, against
++34.1% more production code. Density 17.3 → 10.5 sites per kloc, **−39.5%**.
+
+It did not fall monotonically. It **peaked at 841 on 2026-08-07**, then dropped to
+496 by 2026-08-15. Decomposing that peak against today:
+
+| | sites |
+|---|---:|
+| peak, 2026-08-07 | 841 |
+| in files deleted since (in-kernel SSH/shell/editor, multikernel, `rng`, `audio`) | −158 |
+| **surviving files, reduced in place** | **−247** |
+| in files added since | +99 |
+| now | 535 |
+
+**The in-place reduction is the larger term**, which is the opposite of what the
+"we deleted the fat" story predicts. It is concentrated in the syscall layer:
+
+| file | then → now |
+|---|---|
+| `src/syscall/net.rs` | 52 → **0** |
+| `src/syscall/fs.rs` | 40 → 3 |
+| `src/syscall/proc.rs` | 28 → 3 |
+| `src/syscall/term.rs` | 15 → 2 |
+| `src/syscall/poll.rs` | 12 → **0** |
+| `src/exceptions.rs` | 132 → 98 |
+| `crates/akuma-exec/src/elf/mod.rs` | 17 → **0** |
+
+Those five syscall files went from 147 sites to 8. So the honest summary is that
+**deletion and extraction each helped, but rewriting the syscall layer onto checked
+user-memory helpers helped more than either.**
+
+Read against Stat 3's Reading B (comment density as a complexity tell), these
 tables are the counter-evidence: the prose grew alongside a measured *fall* in the
 construct that most needs prose to be safe.
 

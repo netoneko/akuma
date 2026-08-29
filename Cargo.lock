@@ -19,6 +19,7 @@ dependencies = [
  "akuma-rump",
  "akuma-syscalls",
  "akuma-syscalls-linux",
+ "akuma-syscalls-mem",
  "akuma-syscalls-poll",
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
@@ -141,6 +142,14 @@ dependencies = [
 [[package]]
 name = "akuma-syscalls-linux"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-syscalls-mem"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+ "akuma-syscalls-linux",
+]
 
 [[package]]
 name = "akuma-syscalls-poll"

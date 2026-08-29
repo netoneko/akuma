@@ -361,6 +361,89 @@ any.
 
 ---
 
+## 10. Stage 2 landed: `akuma-syscalls-mem`
+
+Built 2026-08-29, on top of stage 1 and answering §7's open question in the
+affirmative: **it needs nothing from `akuma-mmap`.** Its dependency list is
+`{akuma-syscalls-linux, akuma-primitives}` — byte-identical to `akuma-syscalls-sync`
+and `akuma-syscalls-poll`. The mapping-kind decision reads raw `prot`/`MAP_*` bits,
+which the ABI crate already owns; it never sees a region. That is the seam holding.
+
+439 lines, 37 host tests, `#![forbid(unsafe_code)]`, no crate-level allow block.
+
+| module | holds |
+|---|---|
+| `mmap` | `plan()` (the mapping-kind decision), `MAP_FIXED` validation, `munmap_len` |
+| `mremap` | `plan()` (argument errors, shrink short-circuit, grow) and `no_move_errno` |
+| `madvise` | `action()` (advice decode), `dontneed_zero_range`, `dontneed_page_action` |
+| `membarrier` | `command()` decode; the `dsb ish; isb` stays in the kernel |
+
+**The gated probe was preserved.** `mremap::Plan::Grow` reports `may_move` rather
+than deciding, so the kernel runs the "is `old_addr` mapped?" probe only when
+`MREMAP_MAYMOVE` is absent — three lookups and a `vm_lock` acquisition that would
+otherwise be paid on every growing `mremap`. This is the exact trap the epoll
+extraction fell into on its first draft; a host test
+(`may_move_is_reported_so_the_probe_stays_gated`) pins it.
+
+Boot tests removed as subsumed: `test_membarrier_query_returns_bitmask`,
+`test_mmap_fixed_addr_unaligned_einval_helper`,
+`test_madvise_dontneed_range_semantics`. Kept deliberately:
+`test_membarrier_private_expedited_succeeds` (executes a real barrier) and
+`test_mmap_einval_through_handle_syscall` (asserts validation runs *before*
+`lookup_process`, a property of where the call sits — see §7).
+
+Workspace host tests: 961 → **998**.
+
+### 10.1 What the extraction found: two reachable overflow defects
+
+Host tests run with overflow checks on; the kernel ships `--release`, where the
+same expressions wrap silently. Two of the moved functions failed immediately.
+
+**Defect A — `madvise` unbounded loop.** `dontneed_zero_range`'s
+`(addr.saturating_add(len) + 0xFFF) & !0xFFF` guards the first addition but not the
+rounding. For `len` near `usize::MAX`, `end` wraps to 0, `end - start` underflows,
+and the page count comes out **4,503,599,627,370,495** (~4.5e15).
+`syscall/mod.rs` passes `len` straight from a user register with no validation, and
+`madvise_dontneed_range`'s pass 0 then runs
+`(0..pages).map(..).filter(..).collect()` — a lazy-region lookup per page, inside an
+`MmBklGuard` window. **`madvise(addr, -1, MADV_DONTNEED)` from unprivileged
+userspace is an unbounded kernel loop.**
+
+**Defect B — `MAP_FIXED` kernel-VA guard bypass.** `fixed_overlaps_kernel_va`'s
+`pages * 4096` overflows for the same class of `len`, wrapping `map_end` back down
+to `addr`, so the guard answers "no overlap" for a mapping spanning the whole
+address space — including the kernel identity map the guard exists to protect. In
+practice `sys_mmap` then hangs in `for i in 0..pages { aspace.unmap_page(va) }`
+before it can corrupt anything, so it presents as a hang rather than a compromise.
+
+Both are **preserved, not fixed** — the arithmetic is now spelled `wrapping_*` so
+host and kernel agree, and each is pinned by a test named `preserved_overflow_*`
+that states the hazard. An extraction that quietly fixes something cannot be A/B'd
+against what it replaced. The fix is a length cap in `sys_madvise` / `sys_mmap`, in
+its own change with its own verification.
+
+That these sat in a bin crate for months and fell out within a minute of the same
+code compiling under `cargo test` is the clearest argument for the extraction
+programme this document contains.
+
+### 10.2 Still owed
+
+Stage 2 changes how syscalls decide, so unlike stage 1 it does **not** get the
+build-only exemption. Outstanding:
+
+- `scripts/mem_suite.py` — a runner for the ten probes already in
+  `userspace/forktest/c_stress/` (`mmap_stress`, `mmapsum`, `mmap_file`,
+  `mprotectlb`, `mremapmove`, `madvshared`, `shmanon`, `cowstale`,
+  `eager_mprotect_probe`, `smapsdirty`), on the `epoll_suite.py` model, refusing to
+  score a silent probe as a pass and keeping the `DIVERGE`-vs-`FAIL` distinction.
+- `userspace/memprobe/c/mem_op_cost.c` + `scripts/benchmarks/mem_ab_run.sh`, A/B/A,
+  arms `getpid` / `mmap_einval` / `munmap_noent` / `mprotect_noop` /
+  `madvise_dontneed_unmapped` / `membarrier` / `brk_query`.
+- `docs/reference/subsystems/syscalls/mem.md` — "Where the logic lives" table,
+  the seven known divergences, Testing section.
+
+---
+
 ## Background
 
 - [`AKUMA_EXTRACT_SYSCALLS.md`](AKUMA_EXTRACT_SYSCALLS.md) §8.1, §8.2 — the

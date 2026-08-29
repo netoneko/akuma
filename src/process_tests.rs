@@ -904,7 +904,6 @@ pub fn run_all_tests() {
     test_cow_break_on_shared_view_leaks_both_frames();
     test_fork_cow_share_incs_once_per_frame();
     test_cow_ref_ledger_records_history();
-    test_madvise_dontneed_range_semantics();
     test_madvise_dontneed_spares_shared_frame();
 
     // A write fault the page table already permits must be absorbed, not turned
@@ -6803,48 +6802,6 @@ fn test_stale_write_fault_absorbed() {
     if let Some(f) = p.address_space.unmap_and_free_page(WRITABLE_VA) { crate::pmm::free_page(f); }
     if let Some(f) = p.address_space.unmap_and_free_page(READONLY_VA) { crate::pmm::free_page(f); }
     console::print("[Test] stale_write_fault_absorbed PASSED\n");
-}
-
-/// `MADV_DONTNEED` zeroes a strict superset of the range Linux would clear when
-/// the start address is unaligned — the head page it pulls in belongs to the
-/// caller and holds live bytes (theory 3 of docs/archive/CARGO_HEAP_NULL_RC.md).
-///
-/// Pins the divergence as a fact rather than a reading of the handler, so the
-/// audit counter it feeds has a defined meaning.
-fn test_madvise_dontneed_range_semantics() {
-    use crate::syscall::mem::dontneed_zero_range;
-
-    // Aligned start: identical to Linux — [start, PAGE_ALIGN(start+len)).
-    assert_eq!(dontneed_zero_range(0x4000, 4096), (0x4000, 1));
-    assert_eq!(dontneed_zero_range(0x4000, 4097), (0x4000, 2));
-    assert_eq!(dontneed_zero_range(0x4000, 1), (0x4000, 1));
-
-    // Unaligned start: Linux returns EINVAL and clears nothing. This rounds down,
-    // so the zeroed range begins BELOW the address the caller named — the bytes in
-    // [0x4000, 0x4800) are live data Linux would never have touched.
-    let (start, pages) = dontneed_zero_range(0x4800, 4096);
-    assert!(start == 0x4000, "unaligned start must round down today: {start:#x}");
-    assert!(start < 0x4800, "zeroed range must be shown to precede the caller's addr");
-    assert!(pages == 2, "unaligned start spills into a second page: {pages}");
-
-    // Zero length still clears the head page when the start is unaligned.
-    assert_eq!(dontneed_zero_range(0x4800, 0), (0x4000, 1));
-
-    // The per-page rule. `cow_ref` counts ADDRESS SPACES and the first share
-    // inserts 2, so 2 is the smallest value that means "someone else can see this
-    // frame" — and the only one where zeroing in place would destroy a peer's
-    // page. 1 is a peer that has already gone (exited, or broke CoW itself), 0 was
-    // never shared; both are ours alone and take the cheap path.
-    use crate::syscall::mem::{DontneedAction, dontneed_page_action};
-    assert_eq!(dontneed_page_action(false, 0), DontneedAction::Nothing);
-    assert!(dontneed_page_action(false, 7) == DontneedAction::Nothing,
-        "an unmapped VA has nothing to break, whatever the frame's count says");
-    assert_eq!(dontneed_page_action(true, 0), DontneedAction::ZeroInPlace);
-    assert_eq!(dontneed_page_action(true, 1), DontneedAction::ZeroInPlace);
-    assert_eq!(dontneed_page_action(true, 2), DontneedAction::BreakSharing);
-    assert_eq!(dontneed_page_action(true, u16::MAX), DontneedAction::BreakSharing);
-
-    console::print("[Test] madvise_dontneed_range PASSED\n");
 }
 
 /// `MADV_DONTNEED` on a CoW-shared page must leave the **peer's** page alone.
