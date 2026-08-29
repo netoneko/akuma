@@ -91,6 +91,32 @@ of damage.
 | `[PTLOCK]`, `[FILL-SHORT/prefault]` | Already conditional — a hold-duration threshold and a short-read check |
 | kernel-test `[PASS]`/`[FAIL]`, `[PSTATS]`, the read-path profiler | Not userspace-drivable |
 
+### The remaining crates, inspected
+
+`akuma-net` (13), `akuma-virtio` (15), `akuma-primitives` (4) and `akuma-ext2` (1)
+were counted in the first sweep but not read. They have now been read
+individually, and **none warrants gating**:
+
+| crate | what the ungated sites are |
+|---|---|
+| `akuma-net` | `[SmolNet] Initialized` / `DHCP configured` / `IP:` / `DHCP deconfigured` — boot and lease-change lifecycle, one-shot or rare. Plus `[NET] CORRUPT HANDLE` ×3, which is a detector: *"a corrupted async state machine could overwrite `handle_index` with garbage; catch it here instead of panicking inside smoltcp"* |
+| `akuma-virtio` | `[SND]`, `[Block]`, `[virtio] slot N`, `[RNG] Found virtio-rng at slot` — all inside `probe::scan()` device enumeration, boot-time only |
+| `akuma-primitives` | `[WATCHDOG] preemption disabled Nms` — gated on `duration >= PREEMPTION_WATCHDOG_PANIC_US`; the rest is `console.rs`'s own plumbing and a unit test |
+| `akuma-ext2` | `[E2-EOF]` — **already rate-limited**: `if prev < 32`, behind an `E2_READ_AT_EOF` counter, and only for `offset > file_size` (an ordinary read *at* EOF is deliberately silent and uncounted) |
+
+Other console mechanisms were swept too, not just the macros: direct
+`StackWriter` uses, `print_args`/`print_args_if_registered`, and every `.flush()`.
+They resolve to `src/klog.rs` (the logger), boot/heartbeat paths in `main.rs`,
+`[BKL] stuck`/`[BKL] RECOVERED` (anomaly), and
+`log_memory_stats_on_crash` — which runs immediately before `loop { wfe }`, i.e.
+once, at a kernel halt.
+
+**The audit is closed.** Every remaining ungated console path in the tree is a
+crash handler, a corruption detector, a boot/device probe, a watchdog threshold,
+or already rate-limited. That is a measured statement, not an untested
+assumption — which is the difference between this line and the one the first
+sweep would have supported.
+
 ## What the scan missed, twice
 
 Both misses are worth recording, because both produced a confident wrong number.
