@@ -41,6 +41,15 @@ no-bkl-vfs = ["akuma-primitives/no-bkl-vfs"]
 # with `smp-shared`.
 no-bkl-process = []
 
+# Mirrors the bin crate's `syscall-debug-info`. OFF by default.
+#
+# `lifecycle_trace_on()` was a pure RUNTIME read (`config().syscall_debug_info_enabled`),
+# so its 43 call sites kept their format strings in `.rodata` and their formatting
+# code in `.text` in every build, and paid a load + branch each. Making the gate
+# `cfg!(feature = "debug-info") && config()...` lets the whole thing constant-fold
+# away when the feature is off, while keeping the runtime toggle when it is on.
+debug-info = []
+
 [dependencies]
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-pmm = { path = "../akuma-pmm" }

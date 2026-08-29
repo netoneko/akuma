@@ -10,9 +10,15 @@ visible at the syscall boundary.
 > **Stability: B (verify behaviour).** Upgraded from C on 2026-08-29: the
 > family's decisions and its region algebra now have 62 host tests behind them
 > (`akuma-syscalls-mem` 41, `akuma-mmap` 21) and a live gate that runs all ten
-> probes (`scripts/mem_suite.py`), where before there was neither. Still not A —
-> region-boundary bugs surface here first, `cowstale` is a known open flake, and
-> the fault-path half is untouched by any of that.
+> probes (`scripts/mem_suite.py`), where before there was neither. Verified the
+> same day on **both** platforms — QEMU (3 boots, 0 FAILED) and Firecracker under
+> Lima (307 PASSED, 0 FAILED, 0 POISON) — with `mem_suite` 10/10, and benchmarked
+> against real Linux (see below).
+>
+> Still not A, and the reasons are specific: region-boundary bugs surface here
+> first, `cowstale` is a known open flake that also fails on `main`, and the fault
+> path — where the measured gap to Linux actually is — is untouched by any of the
+> above.
 >
 > The recurring lesson: **validate arguments before calling `lookup_process`** —
 > an `EINVAL`/`EFAULT` check done first keeps a kernel-test caller (no current
@@ -71,6 +77,41 @@ scripts/benchmarks/mem_ab_run.sh <label> <outdir> 4
 exit must be 0, no `FAIL` word — and treats `DIVERGE` as green. `mem_op_cost`
 takes a third argument `hostile` (default 1); `hostile=0` skips the two arms a
 pre-2026-08-29 kernel cannot survive, so a baseline A/B arm can still run.
+
+### Where this family stands, measured (2026-08-29)
+
+`mem_op_cost` is built as one static musl binary and run on **both** kernels, so
+the code is identical and only the kernel differs. Ratios are to each kernel's own
+`getpid`, because Akuma runs under QEMU and the Linux baseline under Apple `vz` —
+absolute nanoseconds across the two are not comparable.
+
+| arm | Akuma | Linux | Akuma / Linux |
+|---|---:|---:|---:|
+| `mremap_inplace` | 0.97x | 1.30x | **0.75x** |
+| `mmap_einval` | 1.00x | 1.18x | 0.85x |
+| `mremap_efault` | 1.00x | 1.18x | 0.85x |
+| `madv_willneed` | 1.24x | 1.46x | 0.85x |
+| `membarrier` | 0.94x | 0.97x | 0.97x |
+| `brk_query` | 1.22x | 1.02x | 1.20x |
+| `mprotect_noop` | 2.76x | 1.34x | **2.06x** |
+| `munmap_noent` | 2.99x | 1.12x | **2.66x** |
+| `madv_unmapped` | 4.38x | 1.61x | **2.72x** |
+
+**The split is clean and it says where to work.** Every *decode* path — the part
+`akuma-syscalls-mem` owns — is at or better than Linux. The whole remaining gap is
+the three arms that do real page work: TLB maintenance, region bookkeeping and the
+per-page walk. Nothing in the extracted crates is on the critical path for those.
+
+The most recent win there shows the shape of what is available: `madv_unmapped`
+was **13.94x** before `madvise_dontneed_range` stopped taking a lock per page
+(`docs/archive/CONSOLE_LOG_COST.md` §9), and is 4.38x now — still 2.72x Linux.
+
+Syscall floor for scale: Akuma 152 ns, Linux 105 ns (1.45x, different
+hypervisors). `getuid` is `FastPath::Leaf` and costs **0.72x** Akuma's own
+`getpid`; the same call on Linux is 1.00x of its own — that tier has no Linux
+counterpart.
+
+Reproduce the Linux side with `userspace/memprobe/c/build.sh --push-lima fc`.
 
 **A `mprotect` bug this gate found (fixed 2026-08-29).** A child writing to a page
 its parent had `mprotect(PROT_READ)`-ed did not `SIGSEGV`: the EL0 write-fault

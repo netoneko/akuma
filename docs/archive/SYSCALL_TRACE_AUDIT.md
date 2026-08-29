@@ -211,6 +211,139 @@ for most of their body. Those are different claims and the distinction is exactl
 what the carve-out phases have been buying. Anyone quoting a BKL number should
 say which one they mean.
 
+## Are the gates themselves features?
+
+Asked after the fact, and the answer was **mixed** — three different mechanisms
+were in play, and only one of them mattered.
+
+| gate | kind | codegen when off |
+|---|---|---|
+| `SYSCALL_DEBUG_INFO_ENABLED` (~19 sites) | `cfg!(feature = "syscall-debug-info")` | eliminated |
+| `MEM_SYSCALL_TRACE_ENABLED` (4), `SYSCALL_DEBUG_NET_ENABLED` (1), `PIPE_TRACE_ENABLED` (1) | plain `const bool = false` | eliminated |
+| `lifecycle_trace_on()` in `akuma-exec` (43 sites) | **runtime** — `config().syscall_debug_info_enabled` | **kept** |
+
+The middle row is worth stating plainly rather than "fixing": a
+`const bool = false` is dead-code-eliminated exactly as a feature is. The only
+difference is ergonomic — a feature flips from the command line, a const needs a
+source edit. There is no cost argument for converting those six.
+
+The third row was different in kind. A runtime field read cannot fold, so all 43
+call sites kept their format strings in `.rodata`, their formatting code in
+`.text`, and paid a load and a branch each, in **every** build including
+`extreme-size`. Fixed by putting the compile-time test first so the whole
+expression folds:
+
+```rust
+pub(crate) fn lifecycle_trace_on() -> bool {
+    cfg!(feature = "debug-info") && config().syscall_debug_info_enabled
+}
+```
+
+With the feature on the runtime toggle still works, so a build can compile the
+traces in and still switch them off.
+
+### Measured
+
+Matched A/B, same command, same profile:
+
+| | baseline | folded | delta |
+|---|---:|---:|---:|
+| `release` `.text` | 2,832,240 | 2,827,780 | **−4,460** |
+| `release` `.rodata` | 434,976 | 433,288 | **−1,688** |
+| `release` total | 4,507,966 | 4,501,818 | −6,148 (−0.14%) |
+| `extreme-size` `.text` | 536,376 | 534,648 | −1,728 |
+| `extreme-size` `.rodata` | 75,168 | 73,584 | **−1,584 (−2.1%)** |
+| `extreme-size` total | 1,015,642 | 1,012,330 | −3,312 |
+
+The `.rodata` delta is the check on the whole measurement: the format strings
+behind that gate were counted at **~1,617 bytes**, and `release` `.rodata` fell
+by **1,688**. Within 4% of the prediction, which is what says the number is the
+traces and not build noise.
+
+**A measurement trap, hit and recorded.** The first attempt read
+`.text 2,283,224` for the baseline and `2,827,780` after — a *544 KB increase*
+from deleting code. The "baseline" was a stale binary left in the target
+directory by the preceding `cargo clippy` runs, which use different feature sets.
+`cargo clippy` does not rebuild the final binary, so the ELF on disk belonged to
+some other configuration entirely. Both arms must be built with the same explicit
+command, back to back, before either number is read — the same rule
+`AKUMA_EXTRACT_MMAP.md` §10.3 records for `akuma.bin`.
+
+## A false FAIL the suite produced, and the fix
+
+`scripts/mem_suite.py`'s headline property is that it **refuses to score a silent
+probe as a pass** — output must exist, or it fails. On 2026-08-29 that fired on
+`smapsdirty`: `SILENT (rc=0) — probe printed nothing`. Run by hand immediately
+after, the same binary on the same VM produced full output 3/3. The ssh
+round-trip had dropped it.
+
+The guard was right to refuse — but "probe died" and "transport hiccup" need
+opposite verdicts and are indistinguishable from one sample. The suite now
+retries **once, and only on SILENT**:
+
+- Silent twice still fails, so the no-silent-pass rule is intact.
+- A `FAIL` line or a bad exit code is *never* retried, so a probe cannot pass by
+  being run until it gets lucky.
+
+Also seen and worth writing down: `mprotectlb` failed once in the same run and
+then passed 4/4 on a fresh boot. Between them, two of the ten probes produced a
+spurious failure in a single suite run. **A red probe is worth one re-run before
+it is worth an investigation** — but only one, and only for the flavours above.
+
+## Verification: both platforms, and against Linux
+
+Run 2026-08-29 on an idle host. Baseline is `f49ca08f` — the `akuma-syscalls-mem`
+checkpoint, before any of the print or lock work.
+
+### No regressions
+
+| platform | result |
+|---|---|
+| QEMU, `SMP=4` (3 boots) | **315 / 316 / 316 PASSED, 0 FAILED** |
+| Firecracker under Lima (KVM, nested virt) | **307 PASSED, 0 FAILED, 0 POISON** |
+| `scripts/mem_suite.py` | **10/10 probes, 3 DIVERGE** |
+| `test_mmap_madvise_hostile_length_is_refused` | PASS on both platforms |
+| `[EFAULT]` / `[FORK-DBG]` / `[TRAMP]` / `[Cleanup] Thread` lines in a boot | **0** |
+| `akuma-fc.bin` | 3,426,536 → **3,414,248** bytes (−12,288) |
+
+### Gains, and where they are
+
+Ratios to each kernel's **own** `getpid`. Absolute nanoseconds are not comparable
+across the two rightmost columns — Akuma runs under QEMU and the Linux baseline
+under Apple's `vz` — which is exactly why the comparison is normalised.
+
+| arm | Akuma before | Akuma now | Linux | vs before | vs Linux |
+|---|---:|---:|---:|---:|---:|
+| `mremap_efault` | **1895.14x** | **1.00x** | 1.18x | **−100%** | 0.85x |
+| `madv_unmapped` | 13.94x | 4.38x | 1.61x | **−69%** | 2.72x |
+| `munmap_noent` | 3.17x | 2.99x | 1.12x | −6% | 2.66x |
+| `mprotect_noop` | 2.93x | 2.76x | 1.34x | −6% | 2.06x |
+| `madv_willneed` | 1.30x | 1.24x | 1.46x | −4% | 0.85x |
+| `brk_query` | 1.26x | 1.22x | 1.02x | −3% | 1.20x |
+| `mmap_einval` | 1.01x | 1.00x | 1.18x | −1% | 0.85x |
+| `mremap_inplace` | 0.99x | 0.97x | 1.30x | −1% | **0.75x** |
+| `membarrier` | 0.99x | 0.94x | 0.97x | −5% | 0.97x |
+
+Two real gains and no regressions. Everything in the −1% to −6% band is inside the
+control's own boot-to-boot drift and should be read as "unchanged".
+
+### What the Linux column says
+
+- **The decode paths are at or better than Linux.** `mremap_inplace` 0.75x,
+  `mmap_einval` / `mremap_efault` / `madv_willneed` 0.85x, `membarrier` 0.97x.
+  That is the part these extractions touched, and it is not where the work is
+  left.
+- **The remaining gap is exactly the three arms that do real page work**:
+  `munmap_noent` 2.66x, `madv_unmapped` 2.72x, `mprotect_noop` 2.06x. TLB
+  maintenance, region bookkeeping and the per-page walk — not decode, not
+  logging. That is where a next round belongs, and the `madv_unmapped` lock hoist
+  (13.94x → 4.38x) is the shape of what is available: it is still 2.72x Linux.
+- **Syscall floor**: Akuma 152 ns vs Linux 105 ns, **1.45x** — under different
+  hypervisors, so treat it as an order-of-magnitude statement, not a score.
+- **`FastPath::Leaf` has no Linux counterpart.** `getuid` costs **0.72x** Akuma's
+  own `getpid`; on Linux the same call is 1.00x its own. The tier is a real
+  structural advantage, not just recovered overhead.
+
 ## Verification
 
 Every change here is behaviour-preserving with the flags in their shipping

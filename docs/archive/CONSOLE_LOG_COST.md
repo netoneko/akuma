@@ -122,6 +122,13 @@ after — and read §3 first.
 the EINVAL path that was never traced — exactly where an argument-decode
 rejection should sit.
 
+Re-measured against the pre-work checkpoint `f49ca08f` on an idle host, in ratio
+terms: **1895.14x → 1.00x of `getpid`**. For scale, the same arm on Linux — same
+static binary, run in the Lima VM — is 1.18x of its own `getpid`, so the path is
+now *below* Linux's. Full three-way table, both platforms' regression runs, and
+where the remaining gap to Linux actually is:
+[`SYSCALL_TRACE_AUDIT.md`](SYSCALL_TRACE_AUDIT.md) § "Verification".
+
 ## 7. The rest of the audit
 
 Every other `bool = true` debug flag in `src/config.rs` was checked. **The errno

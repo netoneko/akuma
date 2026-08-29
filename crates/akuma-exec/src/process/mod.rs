@@ -99,9 +99,19 @@ pub use akuma_primitives::console::FmtBuf;
 /// worse, it perturbs the timing of exactly the paths where the remaining
 /// thread-spawn race lives. Keep them (they are genuinely useful when a fork
 /// wedges) but behind the flag.
+/// Two gates, and the order matters.
+///
+/// `cfg!` is first so that with `debug-info` off the whole expression folds to
+/// `false` at compile time: the `config()` read disappears, and so does every
+/// caller's string construction and format-string literal. It was a pure runtime
+/// read before, which meant 43 call sites carried ~1.6 KB of `.rodata` and their
+/// formatting code in `.text` in *every* build, plus a load and a branch each.
+///
+/// With the feature on, the runtime flag still works — so a build can compile the
+/// traces in and still toggle them. See `docs/archive/SYSCALL_TRACE_AUDIT.md`.
 #[inline]
 pub(crate) fn lifecycle_trace_on() -> bool {
-    config().syscall_debug_info_enabled
+    cfg!(feature = "debug-info") && config().syscall_debug_info_enabled
 }
 
 /// Emit one lifecycle trace line, when [`lifecycle_trace_on`].

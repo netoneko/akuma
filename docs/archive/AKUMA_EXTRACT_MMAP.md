@@ -608,6 +608,38 @@ version's worst. The stability is the second result: 64 lock acquisitions are 64
 chances to contend, so the old version degraded badly under load. Full method in
 [`CONSOLE_LOG_COST.md`](CONSOLE_LOG_COST.md) §9.
 
+### 10.3.4 Final verification, both platforms, and against Linux
+
+Re-run 2026-08-29 on an idle host after all of §10.3.1–§10.3.3 landed, against
+`f49ca08f` (the checkpoint before any of it):
+
+| | QEMU `SMP=4` | Firecracker / Lima |
+|---|---|---|
+| boot suite | 315 / 316 / 316 PASSED, **0 FAILED** | 307 PASSED, **0 FAILED, 0 POISON** |
+| `mem_suite.py` | **10/10**, 3 DIVERGE | — |
+
+Two real gains, no regressions — every other arm moved −1% to −6%, inside the
+control's own drift:
+
+| arm | before | after | Linux |
+|---|---:|---:|---:|
+| `mremap_efault` | 1895.14x | **1.00x** | 1.18x |
+| `madv_unmapped` | 13.94x | **4.38x** | 1.61x |
+
+**And the Linux column is the useful part.** Every decode path this extraction
+touched is now at or better than Linux (`mremap_inplace` 0.75x, `mmap_einval` /
+`mremap_efault` / `madv_willneed` 0.85x). The entire remaining gap is the three
+arms doing real page work — `munmap_noent` 2.66x, `madv_unmapped` 2.72x,
+`mprotect_noop` 2.06x of Linux — i.e. TLB maintenance and region bookkeeping,
+none of which is in `akuma-syscalls-mem` or `akuma-mmap`. **The extracted layer is
+not where the time is.** That is a good outcome for the extraction and a clear
+pointer for whatever comes next.
+
+Full method and the three-way table: [`SYSCALL_TRACE_AUDIT.md`](SYSCALL_TRACE_AUDIT.md)
+§ "Verification"; the reference-doc summary is in
+[`syscalls/mem.md`](../reference/subsystems/syscalls/mem.md) § "Where this family
+stands".
+
 ### 10.4 The correctness gate, and what it found
 
 `scripts/mem_suite.py` (new) runs the ten probes already in

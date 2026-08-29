@@ -161,6 +161,19 @@ def main():
         push(a.port, SRC / name, f"/tmp/{name}")
         out, rc = ssh(a.port, f"/tmp/{name} {args} 2>&1", timeout=timeout)
         ok, why, div = verdict(name, out, rc)
+        # Retry ONCE, and only on SILENT. A probe that printed nothing is either
+        # dead or the ssh round-trip dropped its output, and those need opposite
+        # verdicts — a second attempt is what separates them. Observed 2026-08-29:
+        # `smapsdirty` reported SILENT once and then ran clean 3/3 by hand.
+        #
+        # This does not weaken the no-silent-pass rule: silent twice still fails,
+        # and a FAIL or a bad exit code is never retried, so a probe cannot pass by
+        # being run until it gets lucky.
+        if not ok and why.startswith("SILENT"):
+            out, rc = ssh(a.port, f"/tmp/{name} {args} 2>&1", timeout=timeout)
+            ok, why, div = verdict(name, out, rc)
+            if ok:
+                why += " (first attempt returned nothing — transport, not the probe)"
         total_div += div
         results[name] = {"ok": ok, "why": why, "rc": rc,
                          "diverge": div, "digests": digests(out),
