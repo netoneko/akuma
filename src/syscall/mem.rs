@@ -374,6 +374,14 @@ fn mmap_eager_to_lazy_fallback(
 
 pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usize) -> u64 {
     if len == 0 { return EINVAL; }
+    // A length larger than the user address space cannot be mapped, and must be
+    // refused BEFORE it is turned into a page count — `pages` drives
+    // `for i in 0..pages` loops on the MAP_FIXED path below, so an unchecked
+    // `len` was an unbounded loop reachable from userspace. Linux answers ENOMEM.
+    // See docs/archive/AKUMA_EXTRACT_MMAP.md §10.1 defect B.
+    if akuma_syscalls_mem::mmap::len_too_large(len, user_va_limit() as usize) {
+        return ENOMEM;
+    }
     let pages = len.div_ceil(4096);
     let page_flags = akuma_exec::mmu::user_flags::from_prot(prot);
 
@@ -1052,6 +1060,16 @@ fn madvise_dontneed_range(
 
 pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
     use akuma_syscalls_mem::madvise::Action;
+
+    // Range validation FIRST — before the advice decode and before any process
+    // lookup, so a bad range is EINVAL rather than ESRCH (the same ordering rule
+    // `sys_mmap` follows). `len` arrives straight from a user register; without
+    // this, `madvise(addr, -1, MADV_DONTNEED)` produced a ~4.5e15 page count and an
+    // unbounded loop inside an `MmBklGuard` window.
+    // See docs/archive/AKUMA_EXTRACT_MMAP.md §10.1 defect A.
+    if !akuma_syscalls_mem::madvise::range_fits_user_va(addr, len, user_va_limit() as usize) {
+        return EINVAL;
+    }
 
     match akuma_syscalls_mem::madvise::action(advice) {
         Action::Willneed => {

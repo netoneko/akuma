@@ -394,37 +394,97 @@ Boot tests removed as subsumed: `test_membarrier_query_returns_bitmask`,
 
 Workspace host tests: 961 → **998**.
 
-### 10.1 What the extraction found: two reachable overflow defects
+### 10.1 What the extraction found: two reachable overflow defects — FIXED
 
 Host tests run with overflow checks on; the kernel ships `--release`, where the
 same expressions wrap silently. Two of the moved functions failed immediately.
 
 **Defect A — `madvise` unbounded loop.** `dontneed_zero_range`'s
-`(addr.saturating_add(len) + 0xFFF) & !0xFFF` guards the first addition but not the
-rounding. For `len` near `usize::MAX`, `end` wraps to 0, `end - start` underflows,
-and the page count comes out **4,503,599,627,370,495** (~4.5e15).
+`(addr.saturating_add(len) + 0xFFF) & !0xFFF` guarded the first addition but not the
+rounding. For `len` near `usize::MAX`, `end` wrapped to 0, `end - start` underflowed,
+and the page count came out **4,503,599,627,370,495** (~4.5e15).
 `syscall/mod.rs` passes `len` straight from a user register with no validation, and
 `madvise_dontneed_range`'s pass 0 then runs
 `(0..pages).map(..).filter(..).collect()` — a lazy-region lookup per page, inside an
-`MmBklGuard` window. **`madvise(addr, -1, MADV_DONTNEED)` from unprivileged
-userspace is an unbounded kernel loop.**
+`MmBklGuard` window. `madvise(addr, -1, MADV_DONTNEED)` from unprivileged userspace
+was an unbounded kernel loop.
 
 **Defect B — `MAP_FIXED` kernel-VA guard bypass.** `fixed_overlaps_kernel_va`'s
-`pages * 4096` overflows for the same class of `len`, wrapping `map_end` back down
-to `addr`, so the guard answers "no overlap" for a mapping spanning the whole
+`pages * 4096` overflowed for the same class of `len`, wrapping `map_end` back down
+to `addr`, so the guard answered "no overlap" for a mapping spanning the whole
 address space — including the kernel identity map the guard exists to protect. In
-practice `sys_mmap` then hangs in `for i in 0..pages { aspace.unmap_page(va) }`
-before it can corrupt anything, so it presents as a hang rather than a compromise.
+practice `sys_mmap` then hung in `for i in 0..pages { aspace.unmap_page(va) }` before
+it could corrupt anything, so it presented as a hang rather than a compromise.
 
-Both are **preserved, not fixed** — the arithmetic is now spelled `wrapping_*` so
-host and kernel agree, and each is pinned by a test named `preserved_overflow_*`
-that states the hazard. An extraction that quietly fixes something cannot be A/B'd
-against what it replaced. The fix is a length cap in `sys_madvise` / `sys_mmap`, in
-its own change with its own verification.
+**Fixed 2026-08-29.** Saturating arithmetic alone is *not* the fix — a correctly
+saturated 4.5e15-page range is still 4.5e15 pages to walk. The fix is input
+validation at the syscall boundary, which neither handler had:
+
+| | |
+|---|---|
+| `mmap::len_too_large(len, va_limit)` | `sys_mmap` returns `ENOMEM` for a length exceeding the user address space, **before** it becomes a page count |
+| `madvise::range_fits_user_va(addr, len, va_limit)` | `sys_madvise` returns `EINVAL` for a range that escapes the address space or overflows `usize`, before the advice decode and before any process lookup |
+
+The arithmetic was made saturating as well, so the page count is monotonic in `len`
+and `end` can never fall below `start` even if a future caller skips the guard.
+
+Verification:
+
+- Crate: 41 host tests, including `huge_len_saturates_instead_of_wrapping`,
+  `range_that_overflows_usize_is_rejected`,
+  `huge_len_still_reports_the_kernel_va_overlap`, and
+  `saturation_does_not_make_the_guard_unconditional` (the fix must not turn the
+  overlap guard into "always true").
+- Boot suite: `test_mmap_madvise_hostile_length_is_refused` drives all four hostile
+  shapes plus one legitimate call through `handle_syscall`. **Its value is that it
+  returns at all** — pre-fix it would hang the boot suite rather than fail it.
+- Both platforms: QEMU and Firecracker-under-Lima, `PASSED=307 FAILED=0 POISON=0`.
 
 That these sat in a bin crate for months and fell out within a minute of the same
 code compiling under `cargo test` is the clearest argument for the extraction
 programme this document contains.
+
+### 10.1.1 Why `--release` did not catch them: overflow checks, measured
+
+`overflow-checks` defaults to `false` in Cargo's release profile and nothing in this
+tree overrides it. **Bounds checks are unaffected** — those are a language-level
+guarantee present in every profile, confirmed by the `index out of bounds` panic
+strings in the shipped `release` (4), `extreme-size` (3) and `devbox` (3) binaries.
+Only integer overflow checking is off.
+
+Measured cost of turning it on (`aarch64-linux-musl-size -A`, 2026-08-29):
+
+| profile | `.text` | `.rodata` | total |
+|---|---|---|---|
+| `release` (opt 3, thin LTO) | 2,875,040 → 2,589,664 (**−9.9%**) | 434,408 → 465,912 | 4,551,338 → 4,297,706 (**−5.6%**) |
+| `extreme-size` (opt z, fat LTO) | 538,228 → 554,604 (**+3.0%**) | 75,968 → 93,648 (+23%) | 1,018,294 → 1,052,350 (**+3.3%**) |
+
+**The direction reverses by profile**, which is the useful part. At `opt-level = 3`
+the extra panic branches raise LLVM's inline cost estimate and suppress inlining
+that was bloating `.text` — the checks pay for themselves and then some. At
+`opt-level = "z"` there is no inlining bloat to suppress, so the cost is what you
+expect: more code, and 23% more `.rodata` for the panic strings.
+
+Three caveats before anyone enables it:
+
+1. **Smaller `.text` is not faster.** Less inlining may well cost more at runtime
+   than the checks save in I-cache. Unmeasured — see §10.3.
+2. **With `panic = "abort"`, an overflow check in a syscall path turns a silent
+   wrap into a kernel abort.** For arithmetic on user-supplied input that is a
+   userspace-triggerable kernel panic: a crash instead of a hang, not a fix.
+3. It is therefore a **detection** tool, not a mitigation. The defects above are
+   fixed by validating input, which is what §10.1 did. The natural home for
+   `overflow-checks = true` is a test/CI profile where an abort is a loud signal,
+   not the shipped kernel.
+
+### 10.3 Performance: not measured, and why
+
+The A/B/A cost gate was **not run**. The host was on battery at a low power setting
+for this session, which throttles the CPU and inflates variance — and the change
+under test is one compare-and-branch at two syscall entry points, far below the
+noise floor that introduces. `floor+N` is not drift-invariant (the drift is
+multiplicative), so a throttled run would produce numbers that look like data and
+are not. It is still owed; see §10.2.
 
 ### 10.2 Still owed
 

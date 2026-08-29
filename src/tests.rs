@@ -230,6 +230,7 @@ pub fn run_memory_tests() -> bool {
     // Pin the alignment-EINVAL helper so the mmap diagnostic decode and
     // sys_mmap guard cannot drift apart. crash14 shape: addr=-22, FIXED set.
     run_test!(test_mmap_einval_through_handle_syscall,      "mmap_einval_through_handle_syscall");
+    run_test!(test_mmap_madvise_hostile_length_is_refused, "mmap_madvise_hostile_length_is_refused");
 
     // Common memory allocation patterns
     // NOTE: These tests hang during preemption - need investigation
@@ -8097,6 +8098,60 @@ fn test_pipe_cloexec_cleanup_preserves_live_writer() -> bool {
     crate::syscall::pipe::pipe_close_read(id);  // read=0, destroyed
 
     let pass = write_ok && read_ok;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: a hostile `len` must be refused, not turned into a page loop.
+///
+/// `sys_mmap` and `sys_madvise` take `len` straight from a user register. Before
+/// 2026-08-29 neither validated it: `mmap`'s `MAP_FIXED` path ran
+/// `for i in 0..pages { aspace.unmap_page(va) }` over a wrapped page count, and
+/// `madvise(addr, -1, MADV_DONTNEED)` produced ~4.5e15 pages and walked them one at
+/// a time inside an `MmBklGuard` window. Both pinned a core with no way out — an
+/// unprivileged local denial of service.
+///
+/// The value of this test is that it **returns at all**: pre-fix it would hang the
+/// boot suite here rather than fail. See docs/archive/AKUMA_EXTRACT_MMAP.md §10.1.
+fn test_mmap_madvise_hostile_length_is_refused() -> bool {
+    console::print("\n[TEST] hostile mmap/madvise length is refused (no unbounded loop)\n");
+    use crate::syscall::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE};
+    use akuma_primitives::errno::negated::ENOMEM;
+    const NR_MMAP: u64 = 222;
+    const NR_MADVISE: u64 = 233;
+    const MADV_DONTNEED: u64 = 4;
+
+    let anon_flags = u64::from(MAP_ANONYMOUS | MAP_PRIVATE);
+
+    // mmap(NULL, -1, RW, ANON|PRIVATE) — a length spanning the address space.
+    let huge_anon = crate::syscall::handle_syscall(
+        NR_MMAP, &[0, !0u64, 0x3, anon_flags, !0u64, 0]);
+    let huge_anon_ok = huge_anon == ENOMEM;
+
+    // The MAP_FIXED variant, which is the one that reached the unmap loop and also
+    // slipped past the kernel-VA overlap guard when `pages * 4096` wrapped.
+    let fixed_flags = u64::from(MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE);
+    let huge_fixed = crate::syscall::handle_syscall(
+        NR_MMAP, &[0x1000, !0u64, 0x3, fixed_flags, !0u64, 0]);
+    let huge_fixed_ok = huge_fixed == ENOMEM;
+
+    // madvise(0x1000, -1, MADV_DONTNEED) — the unbounded-loop shape.
+    let huge_madv = crate::syscall::handle_syscall(
+        NR_MADVISE, &[0x1000, !0u64, MADV_DONTNEED, 0, 0, 0]);
+    let huge_madv_ok = huge_madv == EINVAL;
+
+    // A legitimate small madvise must still be accepted — the guard must not have
+    // become "reject everything".
+    let ok_madv = crate::syscall::handle_syscall(
+        NR_MADVISE, &[0x1000, 0x1000, MADV_DONTNEED, 0, 0, 0]);
+    let ok_madv_ok = ok_madv == 0;
+
+    let pass = huge_anon_ok && huge_fixed_ok && huge_madv_ok && ok_madv_ok;
+    if !pass {
+        crate::safe_print!(255,
+            "  FAIL: huge_anon={:#x} huge_fixed={:#x} huge_madv={:#x} ok_madv={:#x}\n",
+            huge_anon, huge_fixed, huge_madv, ok_madv);
+    }
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }

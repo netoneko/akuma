@@ -99,13 +99,14 @@ pub fn fixed_addr_unaligned_einval(addr: usize, flags: u32) -> bool {
 /// The Go runtime commits its heap arenas with `MAP_FIXED`; without this guard a
 /// process can map user pages over the kernel's physical-RAM identity map and
 /// corrupt it silently.
-/// # Overflow is preserved, not fixed
+/// # Overflow
 ///
-/// `pages * 4096` overflows for a `len` near `usize::MAX`, wrapping `map_end` back
-/// down to `addr` and making the guard answer "no overlap" for a mapping that spans
-/// the whole address space. Spelled `wrapping_mul` so the debug host tests compute
-/// what the `--release` kernel computes; pinned by
-/// `preserved_overflow_huge_len_defeats_the_kernel_va_guard`.
+/// `pages * 4096` used to overflow for a `len` near `usize::MAX`, wrapping
+/// `map_end` back down to `addr` so the guard answered "no overlap" for a mapping
+/// spanning the whole address space — including the kernel identity map this exists
+/// to protect. `saturating_mul` since 2026-08-29; a mapping that big now saturates
+/// to `usize::MAX` and correctly reports an overlap.
+/// `docs/archive/AKUMA_EXTRACT_MMAP.md` §10.1 defect B.
 #[must_use]
 pub fn fixed_overlaps_kernel_va(
     addr: usize,
@@ -114,8 +115,19 @@ pub fn fixed_overlaps_kernel_va(
     kernel_va_end: usize,
 ) -> bool {
     let pages = len.div_ceil(4096);
-    let map_end = addr.saturating_add(pages.wrapping_mul(4096));
+    let map_end = addr.saturating_add(pages.saturating_mul(4096));
     addr < kernel_va_end && map_end > kernel_va_start
+}
+
+/// Whether `mmap` should refuse this length outright with `ENOMEM`.
+///
+/// `sys_mmap` takes `len` from a user register and converts it to a page count that
+/// drives `for i in 0..pages { … }` loops on the `MAP_FIXED` path. Without this a
+/// caller could name a length spanning the address space and pin a core in the
+/// kernel. Linux answers `ENOMEM` for a length it cannot map; so do we.
+#[must_use]
+pub const fn len_too_large(len: usize, va_limit: usize) -> bool {
+    len > va_limit
 }
 
 /// The byte length `munmap` actually unmaps for a requested `len`.
@@ -265,26 +277,37 @@ mod tests {
         assert!(fixed_overlaps_kernel_va(addr, 0x1000, S, 0x1_0000_0000));
     }
 
-    /// **PRESERVED DEFECT — not a divergence, a bug.** `pages * 4096` overflows for
-    /// a huge `len`, wrapping `map_end` back to `addr`, so the guard reports "no
-    /// overlap" for a mapping that covers the entire address space — including the
-    /// kernel identity map it exists to protect.
-    ///
-    /// Reachable the same way as the `madvise` defect: `sys_mmap` takes `len`
-    /// straight from a user register. In practice the call then hangs in
-    /// `for i in 0..pages { aspace.unmap_page(va) }` before it can do damage, which
-    /// is why this reads as a hang rather than a corruption.
-    ///
-    /// Pinned rather than fixed, so the extraction stays A/B-able.
+    /// **REGRESSION GUARD (fixed 2026-08-29).** `pages * 4096` used to overflow for
+    /// a huge `len`, wrapping `map_end` back to `addr` so the guard reported "no
+    /// overlap" for a mapping covering the entire address space — the kernel
+    /// identity map included. It now saturates and answers correctly.
     #[test]
-    fn preserved_overflow_huge_len_defeats_the_kernel_va_guard() {
-        // The honest answer is `true` — this mapping obviously overlaps.
+    fn huge_len_still_reports_the_kernel_va_overlap() {
         assert!(
-            !fixed_overlaps_kernel_va(0x1000, usize::MAX, 0x4000_0000, 0x8000_0000),
-            "guard wrongly reports no overlap — this is the defect"
+            fixed_overlaps_kernel_va(0x1000, usize::MAX, 0x4000_0000, 0x8000_0000),
+            "a mapping spanning the address space overlaps the kernel window"
         );
-        // A merely large but non-overflowing length is still caught correctly.
+        // Monotonic: growing the length can never turn an overlap into a non-overlap.
         assert!(fixed_overlaps_kernel_va(0x1000, 1 << 40, 0x4000_0000, 0x8000_0000));
+        assert!(fixed_overlaps_kernel_va(0x1000, 1 << 62, 0x4000_0000, 0x8000_0000));
+    }
+
+    /// A mapping genuinely below the window still reports no overlap — the fix must
+    /// not turn the guard into "always true".
+    #[test]
+    fn saturation_does_not_make_the_guard_unconditional() {
+        assert!(!fixed_overlaps_kernel_va(0x1000, 0x1000, 0x4000_0000, 0x8000_0000));
+        assert!(!fixed_overlaps_kernel_va(0x8000_0000, 0x1000, 0x4000_0000, 0x8000_0000));
+    }
+
+    /// A length larger than the whole user address space is `ENOMEM`, not a loop.
+    #[test]
+    fn oversized_length_is_refused() {
+        const LIMIT: usize = 1 << 48;
+        assert!(len_too_large(usize::MAX, LIMIT));
+        assert!(len_too_large(LIMIT + 1, LIMIT));
+        assert!(!len_too_large(LIMIT, LIMIT));
+        assert!(!len_too_large(4096, LIMIT));
     }
 
     /// **Divergence 1.** `munmap(addr, 0)` unmaps one page; Linux returns `EINVAL`.

@@ -56,24 +56,42 @@ pub const fn action(advice: i32) -> Action {
 /// live bytes Linux would never touch. Counted by `DONTNEED_UNALIGNED` rather than
 /// fixed; it has never been observed to read back non-zero
 /// (`docs/archive/CARGO_HEAP_NULL_RC.md`, follow-on 1).
-/// # Overflow is preserved, not fixed
+/// # Range validity
 ///
-/// `saturating_add` guards the first addition but **not** the `+ 0xFFF` rounding,
-/// so a huge `len` wraps `end` to 0 and `end - start` underflows to a near-`usize`
-/// page count. The kernel ships `--release` (overflow checks off), where that wraps
-/// silently; the host tests run in debug, where the same expression would panic.
-/// The ops below are therefore spelled `wrapping_*` so **both** builds compute what
-/// the shipped kernel computes, and the result is pinned by
-/// `preserved_overflow_huge_len_wraps_to_an_enormous_page_count`.
+/// Callers **must** reject the range with `EINVAL` first, via
+/// [`range_fits_user_va`]. This function assumes a range that fits in the user
+/// address space and only rounds it to pages.
 ///
-/// This is a live defect, not a curiosity — see that test. It is preserved here
-/// because an extraction that quietly fixes something cannot be A/B'd against what
-/// it replaced; the fix belongs in its own change with its own verification.
+/// It used to be reachable with any `len` at all, and the arithmetic wrapped:
+/// `saturating_add` guarded the first addition but not the `+ 0xFFF` rounding, so
+/// `madvise(addr, -1, MADV_DONTNEED)` produced a page count of ~4.5e15 and an
+/// unbounded loop in `madvise_dontneed_range`. Fixed 2026-08-29 by the caller-side
+/// check plus the saturating arithmetic below —
+/// `docs/archive/AKUMA_EXTRACT_MMAP.md` §10.1 defect A.
 #[must_use]
 pub const fn dontneed_zero_range(addr: usize, len: usize) -> (usize, usize) {
     let start = addr & !0xFFF;
-    let end = addr.saturating_add(len).wrapping_add(0xFFF) & !0xFFF;
-    (start, end.wrapping_sub(start) / 4096)
+    // Saturate the rounding too, not just the addition: `usize::MAX + 0xFFF` used to
+    // wrap to 0xFFE and take `end` below `start`.
+    let end = addr.saturating_add(len).saturating_add(0xFFF) & !0xFFF;
+    (start, end.saturating_sub(start) / 4096)
+}
+
+/// Whether `[addr, addr + len)` lies inside the user address space.
+///
+/// The guard the memory syscalls were missing. `sys_madvise` and `sys_mmap` take
+/// `len` straight from a user register (`syscall/mod.rs`), so without this a
+/// caller could name a range covering the whole 64-bit space and the handlers would
+/// iterate it a page at a time under an `MmBklGuard` window.
+///
+/// A range that overflows `usize` is rejected outright rather than clamped: an
+/// `addr + len` that wraps is not a range the caller can have meant.
+#[must_use]
+pub const fn range_fits_user_va(addr: usize, len: usize, va_limit: usize) -> bool {
+    match addr.checked_add(len) {
+        Some(end) => end <= va_limit,
+        None => false,
+    }
 }
 
 /// What `MADV_DONTNEED` must do with one page, given the page's state.
@@ -167,30 +185,43 @@ mod tests {
         assert_eq!(dontneed_zero_range(0x1800, 0), (0x1000, 1));
     }
 
-    /// **PRESERVED DEFECT — not a divergence, a bug.** A huge `len` overflows the
-    /// `+ 0xFFF` rounding, wrapping `end` to 0 and underflowing `end - start` into a
-    /// page count of ~4.5 quadrillion.
+    /// **REGRESSION GUARD (fixed 2026-08-29).** A huge `len` used to overflow the
+    /// `+ 0xFFF` rounding, wrapping `end` below `start` and underflowing the page
+    /// count to ~4.5e15 — an unbounded loop in `madvise_dontneed_range`, reachable
+    /// as `madvise(addr, -1, MADV_DONTNEED)` from unprivileged userspace.
     ///
-    /// `sys_madvise` takes `len` straight from a user register with no validation
-    /// (`syscall/mod.rs`: `nr::MADVISE => mem::sys_madvise(args[0], args[1], ...)`),
-    /// and `madvise_dontneed_range`'s pass 0 then runs
-    /// `(0..pages).map(..).filter(..).collect()` — a per-page lazy-region lookup,
-    /// inside an `MmBklGuard` window. So `madvise(addr, -1, MADV_DONTNEED)` from
-    /// unprivileged userspace is an unbounded loop in the kernel.
-    ///
-    /// Pinned rather than fixed so the extraction stays behaviour-preserving and
-    /// A/B-able. The fix is a length cap in `sys_madvise`, in its own change.
+    /// The arithmetic now saturates, so the count is monotonic in `len` and `end`
+    /// can never fall below `start`. The caller-side rejection is
+    /// [`range_fits_user_va`], guarded separately below.
     #[test]
-    fn preserved_overflow_huge_len_wraps_to_an_enormous_page_count() {
+    fn huge_len_saturates_instead_of_wrapping() {
         let (start, pages) = dontneed_zero_range(0x1000, usize::MAX);
         assert_eq!(start, 0x1000);
-        assert_eq!(pages, 4_503_599_627_370_495, "the wrapped count, ~4.5e15 pages");
-        // Sanity: the honest answer would have been ~4.5e15 too, but ANCHORED at
-        // the top of the address space, not wrapped through zero. The tell is that
-        // `end` came out BELOW `start`.
-        let end = 0x1000usize.saturating_add(usize::MAX).wrapping_add(0xFFF) & !0xFFF;
-        assert_eq!(end, 0);
-        assert!(end < start, "end wrapped below start — this is the defect");
+        let end_would_be = 0x1000usize.saturating_add(usize::MAX).saturating_add(0xFFF) & !0xFFF;
+        assert!(end_would_be >= start, "end must never wrap below start");
+        // Monotonic: a bigger length can never produce a smaller range.
+        let (_, small) = dontneed_zero_range(0x1000, 1 << 20);
+        assert!(pages >= small, "page count must be monotonic in len");
+    }
+
+    /// The guard that makes the saturation moot in practice: a range escaping the
+    /// user address space is rejected before any of this runs.
+    #[test]
+    fn range_outside_user_va_is_rejected() {
+        const LIMIT: usize = 1 << 48;
+        assert!(range_fits_user_va(0x1000, 0x1000, LIMIT));
+        assert!(range_fits_user_va(0, LIMIT, LIMIT));
+        assert!(!range_fits_user_va(0x1000, LIMIT, LIMIT));
+        assert!(!range_fits_user_va(LIMIT, 1, LIMIT));
+    }
+
+    /// An `addr + len` that wraps `usize` is rejected, not clamped — the exact shape
+    /// that produced the unbounded loop.
+    #[test]
+    fn range_that_overflows_usize_is_rejected() {
+        assert!(!range_fits_user_va(0x1000, usize::MAX, 1 << 48));
+        assert!(!range_fits_user_va(usize::MAX, 1, 1 << 48));
+        assert!(!range_fits_user_va(usize::MAX, usize::MAX, usize::MAX));
     }
 
     /// An unmapped page needs no work at all — this is the hot arm on a lazy region.
