@@ -528,6 +528,60 @@ lookup does not show up in that. **So the placement stands** — the measurement
 what says not to optimise it, and the lock-order argument is what says not to move
 it. Do not "fix" this without re-running the probe.
 
+### 10.3.1 The arms that were missing, and two probe bugs they exposed
+
+The first probe pass measured the decode paths and stopped there. Widening it
+(2026-08-29) closed four gaps, every one of them inside the extracted crates'
+blast radius:
+
+| gap | arm added | measured |
+|---|---|---|
+| `mremap` had **no arm at all**, despite being in the crate | `mremap_inplace`, `mremap_efault` | 132 ns / see below |
+| `MADV_WILLNEED` — the other implemented advice | `madv_willneed` | 176 ns (floor+28) |
+| `brk` growth allocates and maps per page; only `brk(0)` was timed | `brk_noop`, `brk_grow_*` | 182 ns / 299 ns per page |
+| demand paging is a *translation* fault, a different path from CoW's *permission* fault | `demand_1p`/`demand_512p` | **798 ns** per fault |
+| `plan()`'s central lazy-vs-eager decision — its two outcomes were never priced | `mmap_lazy`/`mmap_eager` | 859 vs 1752 ns, **893 ns** eager premium |
+
+For reference, `per_cow_fault` is **2213 ns** — about 2.8x a demand fault, which
+is what copying 4 KiB buys you.
+
+**Probe bug 1: `mmap_lazy`/`mmap_eager` were quantisation, not measurement.**
+One mmap+munmap cycle is ~1 µs and `clock_gettime` truncates to microseconds
+here, so the arms read exactly 1000 and 2000 ns and produced a beautiful "ratio
+2.00" that was two clock ticks. Fixed with a 1000-rep inner loop; the honest
+ratio is 2.04. This is method warning 3 from `mem_op_cost.c` biting the file
+that documents it.
+
+**Probe bug 2: `brk_grow` reported 0 ns for growing 2 MB.** The arm shrank back
+with `brk(base)` after each pass to keep passes comparable — but a brk shrink
+does **not** unmap. Pass 2 found every page already mapped, `set_brk`'s
+allocation loop was skipped, and `best_of` takes the *minimum*, so it reported
+the warm pass. An arm that is not idempotent cannot be minimised over. Now grows
+monotonically, so every pass allocates fresh.
+
+Both were caught by the numbers looking wrong, not by a test. That is the case
+for reading a probe's output rather than diffing it.
+
+### 10.3.2 A finding the new arms surfaced: EFAULT cost 250 µs — FIXED
+
+`mremap_efault` read **~250 µs, ~1600x the syscall floor**, for what is argument
+decode and nothing else. It was not the decode: `config::SYSCALL_ERRNO_DIAG_ENABLED`
+was `true` by default, and the epilogue wrote a ~103-byte `[EFAULT] …` line to the
+serial console on every EFAULT-returning syscall. At ~2,400 ns per byte — one
+trapping MMIO store each — that made the trace **99.94%** of the call, on a path
+userspace controls.
+
+The gate has been turned **off** (2026-08-29), taking the arm from 249,806 ns to
+**150 ns**, and a probe run's boot-log contribution from ~160,000 lines to 55.
+
+The full investigation — the per-byte cost model and its three-build fit, the
+dead `mmap`-EINVAL decode the EFAULT-only narrowing had silently created, the
+options weighed (including a rate limiter, built and then dropped as unnecessary
+complexity), and an audit of every other default-on console trace — is its own
+document: [`CONSOLE_LOG_COST.md`](CONSOLE_LOG_COST.md). It is a logging finding,
+not a memory one; it is recorded there so it is findable by the next person
+measuring a syscall, not buried in an extraction writeup.
+
 ### 10.4 The correctness gate, and what it found
 
 `scripts/mem_suite.py` (new) runs the ten probes already in

@@ -44,12 +44,27 @@ echo "[arm $LABEL] timing"
 userspace/memprobe/c/build.sh > /dev/null
 python3 - "$PORT" <<'PY'
 import base64, subprocess, sys
-b = open("userspace/memprobe/c/mem_op_cost", "rb").read()
-subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "LogLevel=ERROR", "-p", sys.argv[1], "root@localhost",
-                "base64 -d > /tmp/mem_op_cost && chmod +x /tmp/mem_op_cost"],
-               input=base64.b64encode(b), capture_output=True)
+# Both probes: `mem_op_cost` (no arm faults or allocates) and `mem_fault_cost`
+# (every arm does). They answer different questions and an arm run against the
+# wrong build is worse than no number.
+for probe in ("mem_op_cost", "mem_fault_cost"):
+    b = open(f"userspace/memprobe/c/{probe}", "rb").read()
+    subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "LogLevel=ERROR", "-p", sys.argv[1], "root@localhost",
+                    f"base64 -d > /tmp/{probe} && chmod +x /tmp/{probe}"],
+                   input=base64.b64encode(b), capture_output=True)
 PY
 scripts/benchmarks/futex_op_ab.py --port "$PORT" --exe /tmp/mem_op_cost \
     --rounds "$ROUNDS" --label "$LABEL" --save "$OUT/mem.$LABEL.json"
+
+# The fault/allocation half. `futex_op_ab.py` cannot drive this one — its arms
+# report per-unit BRACKETS (a subtraction of two page counts), not one line per
+# call — so it is run directly and its output kept for a side-by-side diff.
+# Three repeats, because a fork-heavy arm is noisier than a decode arm.
+echo "[arm $LABEL] fault-path timing"
+for i in 1 2 3; do
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+      -p "$PORT" root@localhost "/tmp/mem_fault_cost 20 2>&1"
+done > "$OUT/memfault.$LABEL.txt"
+grep -E "per_|eager_extra" "$OUT/memfault.$LABEL.txt" || true
 echo "[arm $LABEL] done (suite: $SUITE)"

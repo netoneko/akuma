@@ -13,22 +13,31 @@
 #   userspace/memprobe/c/build.sh --push-lima  fc    # + push to a Lima VM
 set -euo pipefail
 cd "$(dirname "$0")"
-OUT=mem_op_cost
+# Two probes, and the split is deliberate: `mem_op_cost` arms never fault or
+# allocate, `mem_fault_cost` arms do nothing else. Mixing them would put the
+# PMM's variance on top of a decode measurement.
+PROBES="mem_op_cost mem_fault_cost"
 
-aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o "$OUT" mem_op_cost.c
-echo "built $PWD/$OUT ($(wc -c < "$OUT") bytes)"
+for OUT in $PROBES; do
+  aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o "$OUT" "$OUT.c"
+  echo "built $PWD/$OUT ($(wc -c < "$OUT") bytes)"
+done
 
 case "${1:-}" in
   --push-akuma)
     PORT="${2:-2222}"
     # base64 over SSH: the guest has no scp, and the disk image cannot be
     # written from the host while QEMU holds it open.
+    for OUT in $PROBES; do
     base64 < "$OUT" | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -o LogLevel=ERROR -p "$PORT" root@localhost \
       "base64 -d > /tmp/$OUT && chmod +x /tmp/$OUT && ls -l /tmp/$OUT"
+    done
     ;;
   --push-lima)
     VM="${2:-fc}"
+    for OUT in $PROBES; do
     limactl shell "$VM" -- sh -c "cat > /tmp/$OUT && chmod +x /tmp/$OUT && ls -l /tmp/$OUT" < "$OUT"
+    done
     ;;
 esac

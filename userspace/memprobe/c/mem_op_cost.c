@@ -52,6 +52,28 @@
  *                 only; the QUERY arm issues no barrier.
  *   brk_query     brk(0) -> current break. The cheapest real memory syscall,
  *                 and a second floor-ish reading next to getpid.
+ *   brk_noop      brk(current) -> the same break. Reaches `set_brk` and takes
+ *                 its no-growth exit, so it prices the call without the page
+ *                 allocation a real grow does (that is `mem_fault_cost`).
+ *   mremap_inplace  mremap() shrinking within the pages already held. The
+ *                 shrink short-circuit: pure decision, returns the old address
+ *                 before any process is resolved. Idempotent across passes
+ *                 precisely BECAUSE of divergence 5 — the tail stays mapped.
+ *   mremap_efault mremap() with an out-of-range old address. Decode only in
+ *                 principle — but the kernel writes an `[EFAULT]` diagnostic
+ *                 line to the serial console on EVERY EFAULT-returning syscall
+ *                 (`config::SYSCALL_ERRNO_DIAG_ENABLED`, gated `&& is_efault`,
+ *                 on by default outside `extreme` for the GO_FORKTEST_DEBUG §E
+ *                 investigation). So this arm reads ~250 us, ~1600x the floor,
+ *                 and what it measures is a UART write. Kept, because that IS
+ *                 what an EFAULT costs on this kernel today and userspace can
+ *                 trigger it at will; the `>50x floor` marker says so out loud.
+ *                 Turn the flag off and it should collapse to about
+ *                 `mmap_einval` — the EINVAL path, which is NOT traced.
+ *   madv_willneed MADV_WILLNEED over an already-resident page: the advice
+ *                 decode plus a walk that finds nothing to prefault, so it
+ *                 allocates nothing. The prefaulting case is a PMM measurement
+ *                 and lives in `mem_fault_cost`.
  *
  * A/B NOTE. `mmap_enomem` and `madv_einval` exercise guards that did not exist
  * before 2026-08-29. Against a pre-fix baseline they do not return a number —
@@ -102,6 +124,8 @@ static long long now_ns(void) {
 static char *rw_page;      /* one resident, writable page for mprotect_noop */
 static char *reserved;     /* PROT_NONE reservation, never touched */
 static char *hole;         /* page-aligned VA with nothing mapped at it */
+static char *remap2;       /* two resident pages, for the mremap shrink arm */
+static long  cur_brk;      /* the break as it stands, for the no-op brk arm */
 
 #define RESERVE_BYTES (64 * 4096)
 
@@ -129,10 +153,20 @@ static char *hole;         /* page-aligned VA with nothing mapped at it */
         int ok = ((want) == LONG_WANT_ANY) ? (check >= 0)                      \
                  : (check == (want) || (check == -1 && errno == (want)));      \
         if (floor_ns < 0) floor_ns = best;                                     \
-        printf("%-14s %6lld ns   (floor%+5lld)   mean %6lld   worst %7lld   "  \
-               "ret=%ld %s\n",                                                 \
+        /* An arm dozens of times the syscall floor is not measuring a decode.\
+         * `mremap_efault` read 1600x on 2026-08-29: the kernel writes a ~192-byte\
+         * `[EFAULT]` line to the SERIAL CONSOLE on every EFAULT-returning syscall\
+         * (`config::SYSCALL_ERRNO_DIAG_ENABLED`, gated `&& is_efault`), so the arm\
+         * was timing a UART write. Silence would have put a console write in a\
+         * decode-cost table — the same class of error as an arm returning the\
+         * wrong value, so it gets the same treatment. It FLAGS, it does not fail:\
+         * some arms legitimately do real work (`madv_unmapped` walks 64 pages). */\
+        int loud = floor_ns > 0 && best > floor_ns * 50;              \
+        printf("%-14s %6lld ns   (floor%+5lld)   mean %6lld   worst %7lld   "\
+               "ret=%ld %s%s\n",                                      \
                name, best, best - floor_ns, total / passes, worst, check,      \
-               ok ? "" : "  <-- UNEXPECTED RETURN, arm is not measuring what it says"); \
+               ok ? "" : "  <-- UNEXPECTED RETURN, arm is not measuring what it says",\
+               loud ? "  <-- >50x floor: something other than the named op dominates" : "");\
         if (!ok) bad++;                                                        \
     } while (0)
 
@@ -176,6 +210,18 @@ int main(int argc, char **argv) {
     if (hole == MAP_FAILED) { fprintf(stderr, "mmap hole failed\n"); return 2; }
     munmap(hole, 4096);
 
+    /* Two pages for the mremap shrink arm. It must stay repeatable, and it does:
+     * a shrink here returns the old address WITHOUT unmapping the tail
+     * (divergence 5), so pass 2 sees exactly what pass 1 did. */
+    remap2 = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (remap2 == MAP_FAILED) { fprintf(stderr, "mmap remap2 failed\n"); return 2; }
+    remap2[0] = 1;
+    remap2[4096] = 1;
+
+    cur_brk = syscall(SYS_brk, 0);
+    if (cur_brk <= 0) { fprintf(stderr, "brk(0) failed\n"); return 2; }
+
     /* Control: the syscall floor. MUST stay first — every later arm prints its
      * distance from it. */
     ARM("getpid", LONG_WANT_ANY, syscall(SYS_getpid));
@@ -190,8 +236,23 @@ int main(int argc, char **argv) {
     ARM("mprotect_noop", 0, mprotect(rw_page, 4096, PROT_READ | PROT_WRITE));
     ARM("madv_unmapped", 0, madvise(reserved, RESERVE_BYTES, MADV_DONTNEED));
 
+    /* The shrink short-circuit: decided from the arguments, before any process
+     * lookup. `old_size` stays 2 pages every pass because the tail is never
+     * unmapped — see divergence 5, which is what makes this arm repeatable. */
+    ARM("mremap_inplace", (long)(intptr_t)remap2,
+        (long)(intptr_t)mremap(remap2, 2 * 4096, 4096, MREMAP_MAYMOVE));
+
+    /* Out-of-range old address: EFAULT from the decode, nothing resolved. */
+    ARM("mremap_efault", EFAULT,
+        (long)(intptr_t)mremap((void *)(1UL << 48), 4096, 2 * 4096, MREMAP_MAYMOVE));
+
+    /* Advice decode + a walk that finds every page already resident, so the
+     * prefault list comes back empty and no frame is allocated. */
+    ARM("madv_willneed", 0, madvise(rw_page, 4096, MADV_WILLNEED));
+
     ARM("membarrier", LONG_WANT_ANY, syscall(__NR_membarrier, 0, 0));
     ARM("brk_query", LONG_WANT_ANY, syscall(SYS_brk, 0));
+    ARM("brk_noop", LONG_WANT_ANY, syscall(SYS_brk, cur_brk));
 
     /* The two guards added 2026-08-29, LAST and behind a flag on purpose.
      *

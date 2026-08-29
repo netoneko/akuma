@@ -822,10 +822,28 @@ pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = false;
 /// returns `EINVAL` per POSIX, and cargo/rustc probe "is this a symlink?" on
 /// every file of every extracted crate during a build, which floods this at
 /// tens of thousands of lines/build (docs/archive/SELFHOST_DEVBOX_SMOLTCP.md).
-/// Flip to `false` to silence it (e.g. for a quieter self-host build run);
-/// leave `true` to keep the WILD-DA-crash diagnostic live for the general case.
-/// TEMP DEBUG nca-build EFAULT: narrowed to EFAULT only (EINVAL floods readlinkat).
-pub const SYSCALL_ERRNO_DIAG_ENABLED: bool = true;
+///
+/// **OFF since 2026-08-29, and it should stay off unless you are actively
+/// reading these lines.** Measured cost: one line is ~103 bytes, the console
+/// writes one byte per `write_volatile` to the PL011 data register, and under
+/// emulation each of those traps out of the guest — **~2,400 ns per byte**, so
+/// ~250 µs per line against a ~150 ns syscall. That made the trace **99.94% of
+/// an EFAULT-returning call**, on a path *userspace controls*: a loop on
+/// `mremap` with a bad address drove the serial console at ~4,000 lines/s, and
+/// console writes serialise across cores. Full measurement, and the same audit
+/// for every other default-on console trace, in
+/// `docs/archive/CONSOLE_LOG_COST.md`.
+///
+/// Turning it on costs that again. It is a real diagnostic — a Go runtime that
+/// dereferences an unchecked negative return crashes with `FAR` = the errno, and
+/// this line is what names the syscall that produced it — so turn it on while
+/// hunting exactly that, and turn it back off.
+///
+/// **Read `CONSOLE_LOG_COST.md` §3 before re-enabling**: the errno set was
+/// narrowed to EFAULT alone as a cost workaround, which silently made this
+/// block's `ENOSYS`/`EINVAL` names and its whole `mmap`-EINVAL decode
+/// unreachable. Re-enabling as-is gets you less than the code appears to offer.
+pub const SYSCALL_ERRNO_DIAG_ENABLED: bool = false;
 
 /// Stale-instruction-cache **spurious-SVC** guard (§7k.4 root cause).
 ///
