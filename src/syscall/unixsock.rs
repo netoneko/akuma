@@ -1,13 +1,13 @@
 //! Kernel half of AF_UNIX: the one table, and the syscall bodies.
 //!
-//! The decisions live in [`akuma_net::unix`], which is a pure state machine
+//! The decisions live in [`akuma_net_unix`], which is a pure state machine
 //! with no kernel dependencies and 88 host tests. This module is the thin,
 //! deliberately boring layer around it: it owns the single global
 //! [`UnixTable`], copies addresses in and out of userspace, creates and wires
 //! the kernel pipes that carry the bytes, and parks/wakes threads.
 //!
 //! Nothing here decides an errno on its own. If a rule needs asserting, it
-//! belongs in `akuma_net::unix` where `cargo test` can reach it — that split is
+//! belongs in `akuma_net_unix` where `cargo test` can reach it — that split is
 //! the point of the whole design (`docs/archive/UNIX_SOCKET_IMPROVEMENTS.md`
 //! §3.1), and code drifting back into this file is the way it erodes.
 //!
@@ -72,9 +72,9 @@ use super::*;
 use akuma_exec::process::FileDescriptor;
 use akuma_exec::threading::{WakeHandle, wake_by_handle, wake_handle_for_thread};
 use akuma_net::socket::libc_errno;
-use akuma_net::unix::{
-    self, ConnectOutcome, Pending, SOCKADDR_UN_LEN, SockAddrUn, SockState, SockType, Ucred,
-    UnixName, UnixTable, plan_read, plan_write,
+use akuma_net_unix::{
+    self as unix, ConnectOutcome, Pending, SOCKADDR_UN_LEN, SockAddrUn, SockState, SockType,
+    Ucred, UnixName, UnixTable, plan_read, plan_write,
 };
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -757,7 +757,7 @@ pub fn listener_ready(fd: u32, tid: Option<usize>) -> Option<bool> {
 /// types.
 ///
 /// The ordering here is the bytes/boundaries sync rule from
-/// [`akuma_net::unix`]: [`plan_write`] decides, the pipe takes the bytes, and
+/// [`akuma_net_unix`]: [`plan_write`] decides, the pipe takes the bytes, and
 /// only then is the boundary recorded. Recording first and writing second would
 /// leave a boundary behind for bytes a failed `pipe_write` never accepted, and
 /// every subsequent record on that channel would be wrong by the shortfall.

@@ -64,7 +64,7 @@ pub use fs::run_writev_short_write_tests;
 pub mod pipe;
 pub mod poll;
 pub mod proc;
-/// AF_UNIX sockets. The decisions live in `akuma_net::unix` (host-tested); this
+/// AF_UNIX sockets. The decisions live in `akuma_net_unix` (host-tested); this
 /// module is the kernel half — the one table, the user-pointer copies, and the
 /// pipes that carry the bytes. See docs/archive/UNIX_SOCKET_IMPROVEMENTS.md.
 pub mod unixsock;

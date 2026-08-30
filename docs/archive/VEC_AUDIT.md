@@ -173,7 +173,7 @@ name).
   up in a `VecDeque<KernelMsg>`. A fixed `[u8; 8192]` per queued message would
   make every queued message cost 8 KB regardless of actual size — worse than
   today's exact-sized allocation.
-- **`crates/akuma-net/src/unix.rs`** — `UnixName::Abstract(Vec<u8>)` /
+- **`crates/akuma-net-unix/src/lib.rs`** (was `akuma-net/src/unix.rs`) — `UnixName::Abstract(Vec<u8>)` /
   `Path(Vec<u8>)` are capped by `SUN_PATH_LEN = 108`, but the file's own doc
   comment (around line 200) explains that the *wire* struct (`SockAddrUn`)
   deliberately keeps `[u8; 108]` + a separate `len` rather than trusting a NUL

@@ -21,8 +21,15 @@ the same binary on Akuma and on Linux so every claim has a control arm.
 
 | Piece | Where |
 |---|---|
-| The pure state machine — codec, name table, rendezvous, framing, shutdown, credentials, datagram resolution | `crates/akuma-net/src/unix.rs`, **un-gated** on `smoltcp` |
-| 101 host tests for it | `crates/akuma-net/src/unix_tests.rs` (`cargo test -p akuma-net`: 138 total) |
+> **Moved 2026-08-30.** Everything below that says `akuma-net/src/unix.rs` /
+> `unix_tests.rs` is now `crates/akuma-net-unix/src/lib.rs` / `tests.rs`, and
+> the import is `akuma_net_unix::` rather than `akuma_net::unix::`. Nothing
+> about the design changed — the module was lifted whole, its only coupling
+> being `libc_errno`, which now comes from `akuma_primitives::errno` directly.
+> Rationale: `docs/archive/AKUMA_NET_SPLIT.md` §5.1 extraction A.
+
+| The pure state machine — codec, name table, rendezvous, framing, shutdown, credentials, datagram resolution | `crates/akuma-net-unix/src/lib.rs` (was `akuma-net/src/unix.rs` until 2026-08-30) |
+| 101 host tests for it | `crates/akuma-net-unix/src/tests.rs` (`cargo test -p akuma-net-unix`: 90) |
 | Kernel half — the one table, user-pointer copies, pipes, parking | `src/syscall/unixsock.rs` |
 | `socket`/`bind`/`listen`/`accept`/`accept4`/`connect`/`getsockname`/`getpeername`/`shutdown`/`getsockopt`/`setsockopt`/`recvmsg` dispatched **unconditionally** via `net::dispatch_*` | `src/syscall/net.rs`, `src/syscall/mod.rs` |
 | `S_IFSOCK` + `EXT2_FT_SOCK` + `create_socket_node` | `crates/akuma-ext2/src/ext2.rs`, `crates/akuma-vfs/src/types.rs`, `src/vfs/mod.rs` (5 host tests) |

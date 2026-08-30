@@ -355,13 +355,36 @@ near-zero risk.
 
 ### 5.1 Crate extractions, in order
 
-**A. `akuma-net-unix`** — `unix.rs` + `unix_tests.rs`, 2,476 lines, 29% of the
-crate. Zero smoltcp, zero `unsafe`, one dependency (`akuma-primitives`, for
-errno). Already a self-contained pure state machine with a full suite, so the
-seam needs no design work. Two arguments beyond size: it is not networking in
-this crate's sense (no NIC, no IP, no port — it is IPC over the kernel's pipes),
-and the rump-only devbox currently pulls all of `akuma-net` *just* to get
-AF_UNIX for `rump_server`'s fd 3. Nearly free.
+**A. `akuma-net-unix` — DONE 2026-08-30.** `unix.rs` + `unix_tests.rs`, 2,476
+lines, 28% of the crate. Zero smoltcp, zero `unsafe`, one dependency
+(`akuma-primitives`, for errno). Two arguments beyond size: it is not
+networking in this crate's sense (no NIC, no IP, no port — it is IPC over the
+kernel's pipes), and the rump-only devbox pulled all of `akuma-net` *just* to
+get AF_UNIX for `rump_server`'s fd 3.
+
+What it actually cost, since "nearly free" was the claim:
+
+- `unix.rs` → `crates/akuma-net-unix/src/lib.rs`, `unix_tests.rs` → `src/tests.rs`
+  (`git mv`, so history follows).
+- **One import line** was the whole coupling: `use crate::socket::libc_errno`
+  became `use akuma_primitives::errno as libc_errno`. Nothing else in
+  `akuma-net` referenced `crate::unix`, and nothing in `unix.rs` referenced
+  anything else in `akuma-net`.
+- Crate boilerplate: `#![cfg_attr(not(test), no_std)]` + `extern crate alloc;`,
+  which the module inherited from `akuma-net` before.
+- Consumers: **one** — `src/syscall/unixsock.rs`'s import block, switched to
+  `use akuma_net_unix::{self as unix, …}` so every `unix::` call site in that
+  file is unchanged.
+- Workspace `default-members`, and the kernel's `[dependencies]`.
+
+**Not re-exported from `akuma-net`.** `akuma-mmap` is re-exported by
+`akuma-exec` precisely so no call site changes, but the situation is the
+opposite here: reaching AF_UNIX through the TCP/IP crate is the coupling the
+move exists to remove, so leaving a re-export would keep the devbox's dependency
+alive and make the split cosmetic.
+
+Result: `akuma-net` 8,845 → 6,367 lines and 138 → 48 host tests; the 90 AF_UNIX
+tests now run as `cargo test -p akuma-net-unix`. Total across both is unchanged.
 
 **B. `akuma-virtio-net`** — the device layer: `VirtioSmoltcpDevice`,
 `LoopbackAwareDevice`, `virtio_rings.rs`, `rump_tap.rs`, `nicstat.rs`, and after

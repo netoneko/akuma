@@ -13,6 +13,7 @@ dependencies = [
  "akuma-isolation",
  "akuma-kacho",
  "akuma-net",
+ "akuma-net-unix",
  "akuma-net-yarn",
  "akuma-pmm",
  "akuma-primitives",
@@ -102,6 +103,13 @@ dependencies = [
  "smoltcp",
  "spinning_top",
  "virtio-drivers",
+]
+
+[[package]]
+name = "akuma-net-unix"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
 ]
 
 [[package]]

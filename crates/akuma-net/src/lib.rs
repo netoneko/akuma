@@ -55,11 +55,11 @@ pub mod socket;
 #[cfg(feature = "smoltcp")]
 pub mod dns;
 
-// The AF_UNIX socket state machine. Unconditional, like `socket`'s address
-// types: AF_UNIX must exist on the rump-only devbox build, where box 0's
-// `rump_server` answers every proxied syscall over a `UnixSocket` at fd 3.
-// Contains no smoltcp references. See docs/archive/UNIX_SOCKET_IMPROVEMENTS.md.
-pub mod unix;
+// The AF_UNIX state machine moved OUT to `akuma-net-unix` on 2026-08-30. It is
+// IPC over pipes, not networking: no NIC, no IP, no port, no smoltcp — and
+// keeping it here forced the rump-only devbox to pull this whole crate to reach
+// it. Not re-exported: reaching AF_UNIX through the TCP/IP crate is the
+// coupling the move removes. See docs/archive/AKUMA_NET_SPLIT.md §5.1.
 // Device-level traffic/latency counters. Always compiled (the module's public
 // API is the same either way); the counters themselves only exist under the
 // `net-profile` feature.
@@ -68,8 +68,6 @@ pub mod nicstat;
 
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod unix_tests;
 
 pub use runtime::NetRuntime;
 

@@ -2,10 +2,17 @@
 //! `struct ucred`, and the `ifreq`/`ifconf` shapes.
 //!
 //! **`sockaddr_in` and `sockaddr_un` are deliberately not here.** They already
-//! live in `akuma-net` (`socket::SockAddrIn`, `unix::SockAddrUn`), which is a
-//! library crate every caller can reach — the condition this crate exists to
-//! create. Moving them would be motion, not de-duplication, and it would put a
-//! dependency on `akuma-net` into what is otherwise a leaf.
+//! live in `akuma-net` (`socket::SockAddrIn`) and `akuma-net-unix`
+//! (`SockAddrUn`) — library crates every caller can reach, which is the
+//! condition this crate exists to create. Moving them would be motion, not
+//! de-duplication, and it would put a dependency on those crates into what is
+//! otherwise a leaf.
+//!
+//! The 2026-08-30 split of `akuma-net-unix` out of `akuma-net`
+//! (`docs/archive/AKUMA_NET_SPLIT.md` §5.1) **strengthens** this, it does not
+//! weaken it: `SockAddrUn` now lives in a dependency-light leaf that is cheaper
+//! to reach than the TCP/IP crate was, so the "already reachable" premise holds
+//! more firmly than before.
 //!
 //! For the same reason the `SIOCGIFCONF` record type stays in
 //! `src/syscall/net.rs`: it embeds a `SockAddrIn`, so it cannot be defined here

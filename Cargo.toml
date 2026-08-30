@@ -9,6 +9,7 @@ default-members = [
     "crates/akuma-kacho",
     "crates/akuma-mmap",
     "crates/akuma-net",
+    "crates/akuma-net-unix",
     "crates/akuma-net-yarn",
     "crates/akuma-pmm",
     "crates/akuma-boot",
@@ -635,6 +636,10 @@ akuma-terminal = { path = "crates/akuma-terminal" }
 akuma-vfs = { path = "crates/akuma-vfs" }
 akuma-ext2 = { path = "crates/akuma-ext2" }
 akuma-net = { path = "crates/akuma-net", default-features = false }
+# The AF_UNIX state machine. A dependency in its own right, not reached through
+# akuma-net: it is IPC over pipes with no NIC, no IP and no smoltcp, and the
+# rump-only devbox needs it whether or not the native stack is compiled in.
+akuma-net-unix = { path = "crates/akuma-net-unix" }
 # The readiness wait loop as a pure state machine. Used directly by
 # `src/syscall/poll.rs` (epoll_pwait / pselect6 / ppoll) as well as through
 # akuma-net's `wait_until`, so the kernel depends on it in its own right.

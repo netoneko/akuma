@@ -9,10 +9,10 @@
 //! user data, and the ones that would be invisible in production are marked as
 //! such in their doc comments.
 //!
-//! Run: `cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`
+//! Run: `cargo test -p akuma-net-unix --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`
 
-use crate::socket::libc_errno;
-use crate::unix::{
+use akuma_primitives::errno as libc_errno;
+use crate::{
     AF_UNIX, Channel, ConnectOutcome, DEFAULT_BACKLOG, MAX_BACKLOG, Pending, Record, Shutdown,
     SOCKADDR_UN_LEN, SUN_PATH_LEN, SUN_PATH_OFFSET, SockAddrUn, SockState, SockType, Ucred,
     UnixName, UnixTable, plan_read, plan_write,
@@ -426,7 +426,7 @@ mod channels {
         assert_eq!(ch.queued_bytes(), 0);
         assert_eq!(ch.queued_records(), 0);
         assert_eq!(ch.pending_bytes, 0);
-        assert_eq!(ch.sndbuf, crate::unix::DEFAULT_SNDBUF);
+        assert_eq!(ch.sndbuf, crate::DEFAULT_SNDBUF);
     }
 
     /// A plain stream read drains the counter, so the accounting returns to

@@ -172,7 +172,7 @@ pub enum FileDescriptor {
     /// `rx` is the pipe this endpoint reads from; `tx` is the pipe it writes to.
     /// The peer endpoint has rx/tx swapped.
     ///
-    /// `sock` indexes the entry in `akuma_net::unix::UnixTable` carrying
+    /// `sock` indexes the entry in `akuma_net_unix::UnixTable` carrying
     /// everything a pipe pair cannot express: the bound name, the socket type,
     /// the peer's identity and credentials, shutdown state, a listener's
     /// backlog, and the record boundaries that make `SOCK_SEQPACKET` and

@@ -1,0 +1,16 @@
+[package]
+name = "akuma-net-unix"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Only for `errno`. That single edge is the whole of this crate's coupling —
+# it was `crate::socket::libc_errno` in `akuma-net`, which was itself a
+# re-export of exactly this. See the crate docs' "Why this is its own crate".
+akuma-primitives = { path = "../akuma-primitives" }
+
+[features]
+default = []

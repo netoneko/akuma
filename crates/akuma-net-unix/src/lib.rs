@@ -1,6 +1,26 @@
 //! AF_UNIX socket state machine.
 //!
-//! # Why this lives in `akuma-net` and not in `src/syscall/`
+//! # Why this is its own crate
+//!
+//! It lived in `akuma-net` until 2026-08-30, and the move is a decoupling, not
+//! a tidy-up. AF_UNIX is not networking in `akuma-net`'s sense — no NIC, no IP,
+//! no port, no smoltcp — it is IPC over the kernel's pipes. Keeping it beside
+//! the TCP/IP stack cost two things:
+//!
+//! - The **rump-only devbox** had to pull the whole of `akuma-net` (with
+//!   `default-features = false`) just to reach AF_UNIX, because box 0's
+//!   `rump_server` answers every proxied syscall over a `UnixSocket` at fd 3
+//!   (`src/rump_proxy.rs`).
+//! - It was 2,476 of `akuma-net`'s 8,845 lines — 28% of a crate whose size was
+//!   the reason a split was being considered at all
+//!   (`docs/archive/AKUMA_NET_SPLIT.md` §5.1 extraction A).
+//!
+//! The cut cost one import line: this module's only coupling to `akuma-net` was
+//! `crate::socket::libc_errno`, itself a re-export of
+//! [`akuma_primitives::errno`], which is now the dependency directly. There is
+//! no `smoltcp`, no `alloc`-free constraint, and no `unsafe` anywhere in it.
+//!
+//! # Why it is not in `src/syscall/`
 //!
 //! Before this module, the kernel's entire AF_UNIX implementation was
 //! `sys_socketpair` plus special-case arms in eight syscalls, all of it in
@@ -13,8 +33,8 @@
 //! The *decisions* AF_UNIX has to make — is this connect refused, does this
 //! datagram fit, where does this record end, which endpoint does a shutdown
 //! make readable — need no NIC, no timer, and no page table. So they live here,
-//! as a pure state machine over plain integers, and `cargo test -p akuma-net`
-//! asserts them in a second. The kernel keeps only what it must: user-pointer
+//! as a pure state machine over plain integers, and
+//! `cargo test -p akuma-net-unix` asserts them in a second. The kernel keeps only what it must: user-pointer
 //! copies, fd allocation, waker registration, and the VFS calls.
 //!
 //! # The bytes/boundaries split
@@ -35,17 +55,23 @@
 //! returns `EAGAIN` for a datagram that does not fit *entirely*, rather than a
 //! short count.
 //!
-//! # Not gated on `smoltcp`
+//! # No feature gates
 //!
-//! AF_UNIX must exist on the rump-only devbox build: box 0's `rump_server`
-//! answers every proxied syscall over a `UnixSocket` at fd 3
-//! (`src/rump_proxy.rs`). So this module is compiled unconditionally, like
-//! `socket`'s address types, and contains no smoltcp references.
+//! AF_UNIX must exist on the rump-only devbox build (see the top of this file),
+//! so nothing here is conditional. That is now a property of the crate rather
+//! than a `#[cfg]` discipline inside a bigger one — which is most of the point.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
-use crate::socket::libc_errno;
+use akuma_primitives::errno as libc_errno;
+
+#[cfg(test)]
+mod tests;
 
 // ============================================================================
 // Constants

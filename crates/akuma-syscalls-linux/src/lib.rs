@@ -49,8 +49,8 @@
 //! - **Akuma-specific types** — `SpawnOptions`, `ThreadCpuStat`, the container
 //!   syscalls. Those are Akuma ABI, not Linux ABI. The test for membership here
 //!   is "can it be checked against a Linux header?", and they cannot.
-//! - **`sockaddr_in` / `sockaddr_un`.** Already in `akuma-net`, already
-//!   reachable. See [`net`]'s module docs.
+//! - **`sockaddr_in` / `sockaddr_un`.** Already in `akuma-net` and
+//!   `akuma-net-unix` respectively, already reachable. See [`net`]'s module docs.
 //! - **Effects.** Nothing here reads or writes user memory, takes a lock, or
 //!   touches a process. This crate is a leaf with no dependencies, and keeping
 //!   it that way is what makes it free to depend on from anywhere.

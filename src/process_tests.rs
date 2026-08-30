@@ -573,7 +573,7 @@ pub fn run_all_tests() {
     test_socketpair_recv_send_via_socket_syscalls();
     // AF_UNIX as a socket family (bind/listen/accept/connect, framing,
     // readiness, teardown). The state machine behind these is host-tested in
-    // `akuma_net::unix`; these cover the kernel wiring.
+    // `akuma_net_unix`; these cover the kernel wiring.
     test_unix_socket_not_eafnosupport();
     test_unix_abstract_connect_accept_roundtrip();
     test_unix_connect_refused_when_unbound();
@@ -11164,7 +11164,7 @@ fn test_socketpair_recv_send_via_socket_syscalls() {
 // AF_UNIX: the socket family, not just socketpair
 // ============================================================================
 //
-// The state machine these drive is host-tested in `akuma_net::unix` (88 tests,
+// The state machine these drive is host-tested in `akuma_net_unix` (88 tests,
 // `cargo test -p akuma-net`). What CANNOT be host-tested is the wiring: the fd
 // table, the pipes, the syscall dispatch, and the readiness path. These tests
 // cover exactly that seam — everything below goes through `handle_syscall`, the

@@ -120,7 +120,7 @@ errno_table! {
     /// The AF_UNIX framed types (`SOCK_DGRAM`/`SOCK_SEQPACKET`) must report this
     /// rather than blocking: a message that cannot fit atomically can never be
     /// sent, and a partial write is unrepresentable for a framed socket
-    /// (`akuma_net::unix::plan_write`).
+    /// (`akuma_net_unix::plan_write`).
     EMSGSIZE = 90;
     /// The peer's socket type does not match this one's.
     ///
@@ -233,7 +233,7 @@ mod tests {
             ("ENOTEMPTY", ENOTEMPTY, 39),
             ("EDESTADDRREQ", EDESTADDRREQ, 89),
             // Added 2026-08-23 for the AF_UNIX socket family
-            // (`akuma_net::unix`); no history under the old tables.
+            // (`akuma_net_unix`); no history under the old tables.
             ("ENOTSOCK", ENOTSOCK, 88),
             ("EMSGSIZE", EMSGSIZE, 90),
             ("EPROTOTYPE", EPROTOTYPE, 91),
