@@ -1,6 +1,9 @@
 # Splitting `akuma-exec`: survey, the three cycles, and an ordered proposal
 
-**Date:** 2026-08-30. **Status:** proposal — nothing here has landed.
+**Date:** 2026-08-30. **Status:** **LANDED** — all five moves are in the tree.
+§7 records what the plan got wrong, which was mostly in the direction of the work
+being *cheaper* than budgeted. Read §7 before using §§1-5 as a guide to anything;
+the survey there is still accurate, the cost estimates are not.
 
 `akuma-exec` is 16,087 lines (12,706 production) across 33 files and **209
 production `unsafe` sites** — more code than every `#![forbid(unsafe_code)]`
@@ -458,3 +461,165 @@ size delta means something was dropped or duplicated, not moved.
 - `docs/reference/crate-safety.md` — where the 209 sites and the 37.9% come from.
 - `docs/reference/subsystems/smp-shared.md` — the BKL semantics §3.4 extracts.
 - `docs/reference/subsystems/containers.md` — the box registry §3.1 moves.
+
+---
+
+## 7. What actually landed (2026-08-30)
+
+All five moves are in. The plan was directionally right and wrong about cost in
+four places, three of them cheaper than budgeted.
+
+### 7.1 The order in §3 is topologically impossible
+
+`elf` is listed second because it looked like the cleanest one-way body — which
+it is. But it needs `bkl::enter_kernel` and `mmu::UserAddressSpace`, so it cannot
+move until **both** of those crates exist. Extracting it second would have meant
+inventing two traits and then deleting them. The order that works is the reverse
+of "cheapest first":
+
+```
+1. box_mod   -> akuma-isolation   (no new crate, no new edge)
+2. memmath   -> akuma-mmap        (no new crate)
+3. sync/bkl  -> akuma-bkl         (depends only on akuma-primitives)
+4. user_access.rs -> process/     (pure file move, no crate boundary)
+5. mmu       -> akuma-mmu         (needs akuma-bkl from step 3)
+6. elf       -> akuma-elf         (needs akuma-bkl AND akuma-mmu)
+```
+
+### 7.2 `akuma-bkl` needed one hook, not four
+
+§3.4 budgeted a four-item `BklHost` vtable. The real number is **one**.
+`MAX_THREADS`, `current_tid`, `disable_preemption`, `enable_preemption`,
+`irq_save_mask`/`irq_restore`, `PreemptGuard` and `safe_print!` had *already*
+migrated to `akuma-primitives` in earlier rounds — `akuma-exec`'s
+`threading::{disable_preemption, enable_preemption}` are literally
+`pub use akuma_primitives::preempt::…`, and `current_thread_id()` is a one-line
+wrapper over `preempt::current_tid()`. The only genuinely upward call left is
+`yield_now`, the scheduler's own entry point.
+
+The lesson generalises: **before designing a vtable to break a cycle, check
+whether the leaf crate already exports the thing.** Four of the five items were
+already there and the survey in §2 counted them as `threading::` because that is
+the path the call site spelled.
+
+### 7.3 `akuma-mmu` needed no `ExecRuntime` at all
+
+Predicted in §3.5 and confirmed. After `user_access.rs` moved up and the trace
+became a feature, the crate's only remaining `runtime()` reference was one
+`print_str` in `asid_exhausted_warn` — a fixed `&'static str`, converted to
+`safe_print!` per the console rule. Final manifest is
+`{akuma-primitives, akuma-mmap, akuma-pmm, akuma-bkl, spinning_top, log}` plus a
+**two**-item `SchedHooks`.
+
+`akuma-elf` did need a table: four VFS callbacks (`read_file`, `read_at`,
+`resolve_file_id`, `exec_bkl_drop_enabled`). Those `require()` rather than
+degrade — a stub registration turns inode-backed reads into silent zeros, which
+is the `[FILL-SHORT/prefault]` self-host ICE.
+
+### 7.4 `memmath` split in half; it did not move
+
+§3.3 said all 71 lines go to `akuma-mmap`. Only one of the two functions could:
+`mapping_is_read_only_to_user` is pure `AP`-field arithmetic and is now
+`akuma_mmap::user_flags::is_read_only_to_user`, beside `is_write`/`is_exec`/
+`from_prot` where it always belonged (it was also carrying a fourth private copy
+of `AP_MASK`, now deleted). `is_shareable_mapping` **stays in `akuma-exec`**: it
+is that predicate ANDed with `config().shared_file_pages_enabled`, and
+`akuma-mmap` has an empty `[dependencies]` table by design, so it cannot read an
+`ExecConfig`. The arithmetic is `akuma-mmap`'s, the kill switch is `akuma-exec`'s,
+and two tests pin the seam.
+
+Writing the move surfaced a real gap in the pair's contract. `is_write` and
+`is_read_only_to_user` are **mutually exclusive but not exhaustive** — `AP` has
+three EL0-reachable values, and the third (`AP_RO_EL1` = `user_flags::NONE`, the
+`PROT_NONE` encoding) answers `false` to both. Code reaching for `!is_write(..)`
+as a stand-in for the sharing predicate would wrongly treat a `PROT_NONE` page as
+shareable. Neither function had a test tying them together while they lived in
+different crates; `write_and_read_only_are_exclusive_but_not_exhaustive` is now
+that test. (The first version of it asserted complementarity and failed
+immediately on `from_prot(0)` — which is how the gap was found.)
+
+### 7.5 The `[AS-*]` trace lost its runtime half, deliberately
+
+`akuma_exec::process::lifecycle_trace_on()` was
+`cfg!(feature = "debug-info") && config().syscall_debug_info_enabled`.
+`akuma-mmu`'s replacement is the `cfg!` alone. With the feature off — every
+shipping profile — behaviour is identical and the whole thing constant-folds. With
+it on, the trace no longer also consults `syscall_debug_info_enabled`. That is a
+narrow, deliberate behaviour change on a debug-only path, taken because the
+alternative was a `fn() -> bool` hook on the address-space create/exec/free path,
+which is precisely the indirect call the `cfg!` shape exists to avoid.
+
+`as_trace` also had to become `pub` **and** `#[inline]`. Inside one crate the
+empty body folded for free; across a crate boundary the `#[inline]` is what lets
+LLVM delete the caller's `format_args!` construction too.
+
+### 7.6 Verification
+
+| gate | result |
+|---|---|
+| host tests | **1,019 pass**, 28 test binaries, 0 failures |
+| per-crate `clippy -- -D warnings` (all 28) | clean |
+| `clippy --release`, `clippy --profile extreme-size` | clean |
+| `cargo build --release` | builds |
+| `scripts/build_extreme_size.sh` | builds, 707 KB ELF |
+| boot suite, `MEMORY=2048` | 178 `[TEST]`, `[FS Tests] Complete: 6 passed, 0 failed`, 0 panics |
+
+Test counts reconcile exactly, which is the check that nothing was silently
+dropped: `akuma-exec` 219 -> 155, and 38 + 15 + 11 = 64 appear in
+`akuma-bkl` / `akuma-elf` / `akuma-mmu`. `akuma-isolation` 43 -> 75 (box's 32),
+`akuma-mmap` 32 -> 35 (the three new predicate tests).
+
+**On booting under HVF:** the first run died with
+`Assertion failed: (isv), function hvf_handle_exception, hvf.c:2437`. That is not
+a kernel bug and not this change — `scripts/cargo_runner.sh` prints a banner
+predicting it, because a **tests-carrying build under HVF with the default
+`MEMORY=256M`** always hits it (`docs/archive/QEMU_HVF_ISV_BUG.md` "Root cause
+5"). `MEMORY=2048` is the fix. Worth restating here because the assertion looks
+exactly like a page-table regression, which is the most alarming thing this
+particular change could have caused.
+
+### 7.7 The image got **214 KB smaller**, and that needs explaining
+
+`cargo build --release`, same features, same toolchain:
+
+| | bytes | `.text` |
+|---|---:|---:|
+| HEAD (`ca31fb65`) | 4,327,864 | 2,851,392 |
+| after the split | 4,113,400 | 2,648,604 |
+| delta | **-214,464 (-4.96%)** | **-202,788** |
+
+§5 says "a size delta means something was dropped or duplicated, not moved" — so
+this had to be chased. Nothing was dropped: every key symbol is present, the boot
+suite runs *more* `[TEST]` lines than the log that died early, and the host test
+count reconciles. `.rodata` went *up* 3,360 bytes and `.data`/`.bss` are flat
+(+112/+128); a real feature loss would show as `.rodata` and `.data` falling
+together.
+
+The cause is **ThinLTO inlining less across the new crate boundaries**. The
+profile is `lto = "thin"` and its comment in `Cargo.toml` names exactly this:
+cross-crate calls are inlined "only if the callee carries `#[inline]` — which
+just ~10% of `crates/`' `pub fn` do, while the hot paths (mmu, the fault helpers)
+all live there." Those hot paths just crossed a crate boundary. `.text` shrinking
+by 200 KB is the *duplication from inlining* going away, not code.
+
+**This is a latent performance regression, not a win, and it is not measured.**
+The fault path (`map_user_page`, `resolve_user_leaf`, the `copy_*_user` helpers)
+is the most-executed code in the kernel and it is now behind a call. Nothing in
+the boot suite times it. Before treating the smaller image as good news, someone
+should A/B a fault-heavy workload — `scripts/run_selfhost_kernelbuild.py` is the
+obvious one, since `rustc` is ext2 + mmap bound — and if it regresses, the fix is
+`#[inline]` on the handful of `akuma-mmu` entry points the fault path calls, not
+undoing the split.
+
+### 7.8 Still open
+
+- **The `threading` <-> `process` cycle**, untouched as planned (§4). 14 back-edges
+  through the thread-identity map.
+- **`akuma-pmm` (5 sites) and `akuma-bkl` (4 sites)** are now small enough to audit
+  for `forbid(unsafe_code)`. Deferred deliberately until the moves are confirmed
+  regression-free — an `unsafe` audit and a code move in the same change would
+  make a bisect useless.
+- **The inlining measurement in §7.7.**
+- Enforced-safe code is **16,592 of 42,634 (38.9%)**, from 16,052 of 42,317
+  (37.9%). Note the crate *ratio* fell, 18-of-25 to 18-of-28, exactly as §4
+  predicted — three new crates, none of them `forbid`-able.
