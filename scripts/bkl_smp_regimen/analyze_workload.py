@@ -27,6 +27,10 @@ import sys
 WINDOW_RE = re.compile(r"\[BKLPROF\] w(\d+) t=(\d+)s spins=(\d+) attributed=(\d+)")
 TAG_RE = re.compile(r"\[BKLPROF\]\s+(\S+) tag=(\d+) [\d.]+% spins=(\d+)")
 # `[T<sec>.<frac>] [syscall] execve(path="…", args=[…])` — the regimen's footprint.
+# Gated behind the `syscall-debug-info` feature since 2026-08-30 (it was
+# unconditional before): a log from a default build matches nothing here and the
+# window comes back empty. Build the kernel with `--features syscall-debug-info`
+# for any capture this script is meant to read.
 EXECVE_RE = re.compile(r"\[T(\d+)\.\d+\] \[syscall\] execve\(path=\"([^\"]*)\", args=\[([^\]]*)\]")
 # Commands only the regimen runs (job.sh and the four phases). `curl` also appears
 # during apk bootstrap on some boots, which is why `job.sh` anchors the start.

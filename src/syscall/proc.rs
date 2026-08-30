@@ -703,13 +703,23 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 
     let env = parse_argv_array(envp_ptr);
 
-    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    // 192 bytes truncated a linker's full argv (output path included) well before
-    // the interesting part — see
+    // Gated 2026-08-30, same reasoning as the `[PROC-EXIT]` line above: it was
+    // unconditional for the reason below, and that reason has aged out. The line
+    // fires once per `execve` at up to 2048 bytes — a `cargo build` in the guest
+    // prints a full rustc/ld command line per compilation unit, which is what
+    // makes the serial log unreadable during an in-VM build. Turn
+    // `syscall-debug-info` on to get it back (that also re-enables the
+    // pre-resolution `argv_ptr`/`envp_ptr` line above, and is what
+    // `scripts/bkl_smp_regimen/analyze_workload.py` now needs).
+    //
+    // Was: unconditional. 192 bytes truncated a linker's full argv (output path
+    // included) well before the interesting part — see
     // docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §4.5,
     // "no `ld` line names the crate proves nothing". Widened so the `-o <output>`
     // argument survives for `cc`/`collect2`/`ld` invocations.
-    crate::tprint!(2048, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
+    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        crate::tprint!(2048, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
+    }
 
     do_execve(resolved_path, args, env)
 }

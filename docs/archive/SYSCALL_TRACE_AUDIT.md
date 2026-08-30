@@ -117,9 +117,18 @@ or already rate-limited. That is a measured statement, not an untested
 assumption — which is the difference between this line and the one the first
 sweep would have supported.
 
-## What the scan missed, twice
+> **Correction, 2026-08-30.** That claim was wrong when written.
+> `sys_execve`'s `[syscall] execve(path=…, args=…)` line — ungated,
+> userspace-drivable, up to 2048 bytes, once per `execve` — is none of those five
+> things, and it was in scope for the scan. It is now gated; see
+> §"What the scan missed, three times" ¶3. Read "closed" as "closed against the
+> idioms it scanned for", which is a weaker statement than the one this paragraph
+> made.
 
-Both misses are worth recording, because both produced a confident wrong number.
+## What the scan missed, three times
+
+All three misses are worth recording, because each produced a confident wrong
+number or a confident wrong all-clear.
 
 **1. Crate gating idioms.** A first pass grepping `config::UPPER_CASE` reported
 **130** ungated sites in `crates/`. Crates cannot see `src/config.rs` — they gate
@@ -143,6 +152,38 @@ document.
 console" is a question with more than one right answer in this tree, and a scan
 that assumes one idiom will report a clean bill of health for the paths that use
 another.
+
+**3. `sys_execve`'s own argv trace — found 2026-08-30, gated the same day.**
+`src/syscall/proc.rs` printed
+
+```rust
+crate::tprint!(2048, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", ...)
+```
+
+**ungated**, one line per `execve`, with the buffer deliberately widened to 2048
+bytes so a linker's full argv survived. This one is not an idiom gap: it is a
+`tprint!` in `src/syscall/`, the exact macro and the exact directory the scan
+covered, and it appears in none of Classes A–D nor in the deliberately-unconditional
+table above. The function's *other* execve trace, twelve lines earlier, was already
+behind `SYSCALL_DEBUG_INFO_ENABLED` — which is likely why a reader scanning
+`sys_execve` saw a gate and moved on.
+
+Cost, predicted from this document's own fitted ~2.4 µs/byte: a `cargo` build's
+`rustc` command lines run several hundred bytes once `--extern` and `--check-cfg`
+are expanded, so **~0.7–1.2 ms of serial write per compilation unit**, plus the
+same again for each `cc`/`ld` exec. That is why an in-VM build's console is
+unreadable, and it is a per-`execve` tax paid by every build, not a rare path.
+
+Disposition: wrapped in `if crate::config::SYSCALL_DEBUG_INFO_ENABLED` — Class C
+treatment, no new knob, and the pre-existing `[PROC-EXIT]` gate (2026-08-29) uses
+the same flag, so the pid-correlation workflow the two lines exist for still works
+in a `syscall-debug-info` build. `scripts/bkl_smp_regimen/analyze_workload.py`
+parses this line and now carries a note that it needs such a build.
+
+**What this one adds to the lesson:** misses 1 and 2 were scans looking in the
+wrong place. This was a scan looking in exactly the right place at a function
+that *contained a gate* — and a gate in the body is not evidence that the body is
+gated.
 
 ## Follow-on: categorising syscalls by what they lock
 
