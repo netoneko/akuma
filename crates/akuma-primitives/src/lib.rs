@@ -62,3 +62,14 @@ pub use irq::{
 pub use once::{OnceCopy, Registered, TakeOnce};
 pub use net_runtime::{NetRuntime, register as register_net_runtime, runtime as net_runtime, try_runtime as try_net_runtime};
 pub use inode_pin::InodePin;
+
+/// Process id.
+///
+/// Lives here rather than in `akuma-exec` because two crates below that one now
+/// name it — `akuma-isolation`'s box registry (`BoxInfo::creator_pid`,
+/// `primary_pid`, and every `access` check) and `akuma-exec` itself, which
+/// re-exports this as `akuma_exec::process::Pid` so its ~1,300 call sites are
+/// unchanged. It is a plain alias, so the two spellings were already the same
+/// type; hoisting it just stops the box registry needing a dependency on the
+/// execution crate to say "pid".
+pub type Pid = u32;

@@ -3,6 +3,22 @@
 //! Tracks active boxes and their metadata. The registry is global and
 //! protected by a spinlock with IRQs disabled for safe access from
 //! syscall and interrupt context.
+//!
+//! # Why this lives in `akuma-isolation`
+//!
+//! It was `akuma_exec::box_registry` until 2026-08-30. Nothing in it is about
+//! *executing* anything: a `BoxInfo` is an id, a name, a root directory and two
+//! pids, and the `hierarchy`/`access` halves are a tree walk and a permission
+//! predicate over that. What it *is* about is the container identity sitting
+//! directly on top of this crate's mount and network namespaces — the same
+//! subsystem (`docs/reference/subsystems/containers.md`), split across two crates
+//! for no reason but where the first caller happened to be.
+//!
+//! Moving it here cost no `cargo tree` edge, because `akuma-exec` already
+//! depended on `akuma-isolation`, and it brought 496 lines (55% of them test)
+//! inside this crate's `#![forbid(unsafe_code)]`. `akuma_exec::box_registry` and
+//! `akuma_exec::process::box_*` remain as re-exports, so no call site moved.
+//! Survey and rationale: `docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.1.
 
 pub mod hierarchy;
 pub mod access;
@@ -12,8 +28,8 @@ use alloc::vec::Vec;
 
 use spinning_top::Spinlock;
 
-use crate::process::Pid;
-use crate::runtime::with_irqs_disabled;
+use akuma_primitives::Pid;
+use akuma_primitives::irq::with_irqs_disabled;
 
 /// Information about an active box (container)
 #[derive(Debug, Clone)]
@@ -34,10 +50,11 @@ static BOX_REGISTRY: Spinlock<alloc::collections::BTreeMap<u64, BoxInfo>> =
 pub fn register_box(info: BoxInfo) {
     with_irqs_disabled(|| {
         BOX_REGISTRY.lock().insert(info.id, info);
-    })
+    });
 }
 
 /// Unregister a box from the global registry
+#[must_use]
 pub fn unregister_box(id: u64) -> Option<BoxInfo> {
     with_irqs_disabled(|| {
         BOX_REGISTRY.lock().remove(&id)
@@ -45,6 +62,7 @@ pub fn unregister_box(id: u64) -> Option<BoxInfo> {
 }
 
 /// List all active boxes
+#[must_use]
 pub fn list_boxes() -> Vec<BoxInfo> {
     with_irqs_disabled(|| {
         BOX_REGISTRY.lock().values().cloned().collect()
@@ -52,6 +70,7 @@ pub fn list_boxes() -> Vec<BoxInfo> {
 }
 
 /// Find a box ID by name
+#[must_use]
 pub fn find_box_by_name(name: &str) -> Option<u64> {
     with_irqs_disabled(|| {
         BOX_REGISTRY.lock().values().find(|b| b.name == name).map(|b| b.id)
@@ -59,6 +78,7 @@ pub fn find_box_by_name(name: &str) -> Option<u64> {
 }
 
 /// Get a box's name by ID
+#[must_use]
 pub fn get_box_name(id: u64) -> Option<String> {
     with_irqs_disabled(|| {
         BOX_REGISTRY.lock().get(&id).map(|b| b.name.clone())
@@ -66,6 +86,7 @@ pub fn get_box_name(id: u64) -> Option<String> {
 }
 
 /// Look up a box by ID (returns a clone)
+#[must_use]
 pub fn get_box_info(id: u64) -> Option<BoxInfo> {
     with_irqs_disabled(|| {
         BOX_REGISTRY.lock().get(&id).cloned()
@@ -74,6 +95,7 @@ pub fn get_box_info(id: u64) -> Option<BoxInfo> {
 
 /// Find the box whose primary PID matches, excluding Box 0.
 /// Returns the box ID if found.
+#[must_use]
 pub fn find_primary_box(pid: Pid) -> Option<u64> {
     with_irqs_disabled(|| {
         BOX_REGISTRY.lock().values()
@@ -95,6 +117,7 @@ pub fn init_box_registry() {
 }
 
 /// Get a snapshot of the registry (for hierarchy queries without holding the lock)
+#[must_use]
 pub fn registry_snapshot() -> alloc::collections::BTreeMap<u64, BoxInfo> {
     with_irqs_disabled(|| {
         BOX_REGISTRY.lock().clone()

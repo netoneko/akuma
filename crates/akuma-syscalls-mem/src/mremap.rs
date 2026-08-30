@@ -27,7 +27,7 @@ pub enum Plan {
 
 /// Decide from the arguments alone.
 ///
-/// `va_limit` is `akuma_exec::mmu::user_access::USER_VA_LIMIT`, passed in rather
+/// `va_limit` is `akuma_exec::process::user_access::USER_VA_LIMIT`, passed in rather
 /// than imported so this crate stays a leaf.
 ///
 /// Order is load-bearing: every check here happens **before** the kernel resolves a

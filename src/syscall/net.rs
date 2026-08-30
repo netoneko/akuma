@@ -1659,7 +1659,7 @@ pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> 
 pub fn run_socket_timeout_tests() {
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
 
-    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+    let _bypass = akuma_exec::process::user_access::BypassValidationGuard::new();
 
     const SOL_SOCKET: i32 = 1;
     const SO_RCVTIMEO: i32 = 20;

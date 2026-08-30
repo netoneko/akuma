@@ -120,7 +120,7 @@ impl<const N: usize> Default for DroppedWindowLedger<N> {
 /// IRQ epilogue on the resuming core reads the entry after the scheduler's `commit_switch`
 /// published the thread, so it observes the depth the thread had when it was switched out.
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
-static DROPPED_WINDOWS: DroppedWindowLedger<{ crate::threading::MAX_THREADS }> =
+static DROPPED_WINDOWS: DroppedWindowLedger<{ akuma_primitives::MAX_THREADS }> =
     DroppedWindowLedger::new();
 
 /// How many times an eret epilogue preserved a dropped window that the pre-ledger code
@@ -137,7 +137,7 @@ static WINDOWS_PRESERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
 #[inline]
 pub fn dropped_window_open() {
-    DROPPED_WINDOWS.open(crate::threading::current_thread_id());
+    DROPPED_WINDOWS.open(akuma_primitives::preempt::current_tid());
     leave_kernel();
 }
 
@@ -150,7 +150,7 @@ pub fn dropped_window_open() {
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
 #[inline]
 pub fn dropped_window_close() {
-    if DROPPED_WINDOWS.close(crate::threading::current_thread_id()) {
+    if DROPPED_WINDOWS.close(akuma_primitives::preempt::current_tid()) {
         enter_kernel();
     }
 }
@@ -171,7 +171,7 @@ pub fn dropped_window_close() {
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
 #[inline]
 pub fn dropped_window_close_no_reacquire() {
-    let _ = DROPPED_WINDOWS.close(crate::threading::current_thread_id());
+    let _ = DROPPED_WINDOWS.close(akuma_primitives::preempt::current_tid());
 }
 
 /// `true` if the current thread is inside a deliberately-dropped-BKL window, i.e. its
@@ -179,7 +179,7 @@ pub fn dropped_window_close_no_reacquire() {
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
 #[inline]
 pub fn in_dropped_window() -> bool {
-    DROPPED_WINDOWS.is_open(crate::threading::current_thread_id())
+    DROPPED_WINDOWS.is_open(akuma_primitives::preempt::current_tid())
 }
 
 /// RAII pause of the current thread's dropped-BKL window(s): construction closes every
@@ -231,7 +231,7 @@ impl Drop for DroppedWindowPause {
 /// its EL1 excursions would silently run BKL-free).
 #[cfg(all(kernel_smp_shared, target_os = "none"))]
 pub fn reset_dropped_windows() -> u32 {
-    let prior = DROPPED_WINDOWS.reset(crate::threading::current_thread_id());
+    let prior = DROPPED_WINDOWS.reset(akuma_primitives::preempt::current_tid());
     if prior != 0 {
         // The thread believed it was BKL-free; the invariant restore needs a real hold.
         enter_kernel();

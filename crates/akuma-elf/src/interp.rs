@@ -11,7 +11,7 @@ use alloc::string::String;
 
 use elf::abi::{EM_AARCH64, PT_LOAD};
 
-use crate::mmu::UserAddressSpace;
+use akuma_mmu::UserAddressSpace;
 
 use super::load::{apply_relocations, map_segment_eager};
 use super::source::{ElfSource, parse_headers};
@@ -66,13 +66,13 @@ pub(super) fn load_interp_for(
         // and the read touches only VFS/block + the self-locked heap — no BKL state is
         // mutated during the window. Re-take BEFORE the `?` so an error return doesn't leave
         // the BKL dropped for the caller. No-op off shared-SMP (`bkl` calls compile away).
-        let drop_bkl = (crate::runtime::runtime().exec_bkl_drop_enabled)();
+        let drop_bkl = (crate::vfs().exec_bkl_drop_enabled)();
         if drop_bkl {
-            crate::bkl::leave_kernel();
+            akuma_bkl::bkl::leave_kernel();
         }
-        let read_res = (crate::runtime::runtime().read_file)(&resolved);
+        let read_res = (crate::vfs().read_file)(&resolved);
         if drop_bkl {
-            crate::bkl::enter_kernel();
+            akuma_bkl::bkl::enter_kernel();
         }
         let interp_data =
             read_res.map_err(|_| ElfError::InvalidFormat("Cannot read interpreter"))?;

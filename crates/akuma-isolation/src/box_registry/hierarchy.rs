@@ -11,6 +11,7 @@ use super::BoxInfo;
 /// Get the ancestry chain from a box to the root (host).
 /// Returns `[box_id, parent_id, grandparent_id, ..., 0]` where 0 is the host.
 /// Returns an empty vec if `box_id` is not in the registry.
+#[must_use]
 pub fn get_ancestry_chain(registry: &BTreeMap<u64, BoxInfo>, box_id: u64) -> Vec<u64> {
     let mut chain = Vec::new();
     let mut current = box_id;
@@ -21,12 +22,9 @@ pub fn get_ancestry_chain(registry: &BTreeMap<u64, BoxInfo>, box_id: u64) -> Vec
             break;
         }
         match registry.get(&current) {
-            Some(info) => match info.parent_box_id {
-                Some(parent) => current = parent,
-                None => {
-                    chain.push(0);
-                    break;
-                }
+            Some(info) => if let Some(parent) = info.parent_box_id { current = parent } else {
+                chain.push(0);
+                break;
             },
             None => break,
         }
@@ -36,6 +34,7 @@ pub fn get_ancestry_chain(registry: &BTreeMap<u64, BoxInfo>, box_id: u64) -> Vec
 }
 
 /// Check if `ancestor_id` is an ancestor of `box_id`.
+#[must_use]
 pub fn is_ancestor(registry: &BTreeMap<u64, BoxInfo>, box_id: u64, ancestor_id: u64) -> bool {
     if box_id == ancestor_id {
         return false;
@@ -45,6 +44,7 @@ pub fn is_ancestor(registry: &BTreeMap<u64, BoxInfo>, box_id: u64, ancestor_id: 
 }
 
 /// Get all direct children of a box.
+#[must_use]
 pub fn get_children(registry: &BTreeMap<u64, BoxInfo>, parent_id: u64) -> Vec<u64> {
     registry.values()
         .filter(|b| b.parent_box_id == Some(parent_id) || (parent_id == 0 && b.parent_box_id.is_none() && b.id != 0))
@@ -53,6 +53,7 @@ pub fn get_children(registry: &BTreeMap<u64, BoxInfo>, parent_id: u64) -> Vec<u6
 }
 
 /// Get all descendants (children, grandchildren, etc.) of a box.
+#[must_use]
 pub fn get_descendants(registry: &BTreeMap<u64, BoxInfo>, parent_id: u64) -> Vec<u64> {
     let mut result = Vec::new();
     let mut stack = get_children(registry, parent_id);

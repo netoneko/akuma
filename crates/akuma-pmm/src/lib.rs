@@ -909,7 +909,7 @@ static ALLOCATED_PAGES: AtomicUsize = AtomicUsize::new(0);
 /// the periodic `[Mem]` stats line.
 static DOUBLE_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// File-page fills in `akuma_exec::mmu::user_access::prefault_user_range` that
+/// File-page fills in `akuma_exec::process::user_access::prefault_user_range` that
 /// came back short or errored, counted per page.
 ///
 /// The prefault fill is the one file-fill site in the tree the demand-fault

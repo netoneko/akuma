@@ -113,12 +113,12 @@ pub use akuma_primitives::preempt::PreemptGuard;
 #[inline]
 pub fn lock_bounded<T>(lock: &spinning_top::Spinlock<T>) -> PreemptBoundedGuard<'_, T> {
     loop {
-        crate::threading::disable_preemption();
+        akuma_primitives::preempt::disable_preemption();
         if let Some(inner) = lock.try_lock() {
             return PreemptBoundedGuard { inner, _preempt: PreemptDisabledOnDrop };
         }
-        crate::threading::enable_preemption();
-        crate::threading::yield_now();
+        akuma_primitives::preempt::enable_preemption();
+        crate::yield_now();
     }
 }
 
@@ -129,7 +129,7 @@ struct PreemptDisabledOnDrop;
 impl Drop for PreemptDisabledOnDrop {
     #[inline]
     fn drop(&mut self) {
-        crate::threading::enable_preemption();
+        akuma_primitives::preempt::enable_preemption();
     }
 }
 
@@ -301,7 +301,7 @@ impl<const N: usize> Default for ThreadTagTable<N> {
 }
 
 /// The kernel's per-thread tag table, indexed by thread id.
-static THREAD_TAG: ThreadTagTable<{ crate::threading::MAX_THREADS }> = ThreadTagTable::new();
+static THREAD_TAG: ThreadTagTable<{ akuma_primitives::MAX_THREADS }> = ThreadTagTable::new();
 
 /// Record what the **current thread** is doing on entering kernel code, and mirror it to
 /// `core_id`'s sampling cache. Called by the exception entry paths (syscall number at
@@ -316,7 +316,7 @@ pub fn set_holder_tag(core_id: u32, tag: u64) {
         return;
     }
     let tag = tag.min((PROFILE_BUCKETS - 1) as u64);
-    THREAD_TAG.set(crate::threading::current_thread_id(), tag);
+    THREAD_TAG.set(akuma_primitives::preempt::current_tid(), tag);
     let c = core_id as usize;
     if c < PROFILE_MAX_CORES {
         HOLDER_TAG[c].0.store(tag, Ordering::Relaxed);

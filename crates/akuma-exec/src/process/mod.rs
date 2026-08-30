@@ -2,6 +2,17 @@
 //!
 //! Manages user processes including creation, execution, and termination.
 
+/// User memory access: the range check, the prefault, and the copy.
+///
+/// **Moved here from `mmu/` on 2026-08-30** (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md`
+/// §3.5). It sat under `mmu/` because it edits PTEs, but every one of its upward
+/// references — `address_space_owner_pid_for_fault`, `lookup_process_shared`,
+/// `lazy_region_lookup`, `LazySource::File`, `read_current_pid` — is a *process*
+/// concept, and those eight references were the whole of the `mmu <-> process`
+/// cycle. Prefaulting a lazy file page needs to know which process owns the
+/// address space and what the region is backed by; page-table mechanics do not.
+/// Moving the file moved the cycle, rather than papering it over with a callback.
+pub mod user_access;
 pub mod types;
 pub mod table;
 pub mod channel;
@@ -737,7 +748,8 @@ pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
             // kill_process handles unregistering and thread termination
             let _ = kill_process(pid);
         }
-        unregister_box(id);
+        // The removed `BoxInfo` is not needed here — the box is being torn down.
+        let _ = unregister_box(id);
     }
 
     Ok(())
@@ -3248,10 +3260,10 @@ fn record_clone_snapshot(tid: usize, stack: u64, parent_pid: Pid, parent_tid: us
     // the kernel on a diagnostic read. `Prefault::No` because this runs on the clone
     // path — a diagnostic read must never allocate frames or take `as_lock` — and
     // because the raw copy it replaces never demand-paged either.
-    let ok = crate::mmu::user_access::copy_from_user_with(
-        crate::mmu::user_access::as_user_bytes_mut(&mut words),
+    let ok = crate::process::user_access::copy_from_user_with(
+        crate::process::user_access::as_user_bytes_mut(&mut words),
         stack,
-        crate::mmu::user_access::Prefault::No,
+        crate::process::user_access::Prefault::No,
     )
     .is_ok();
     CLONE_SNAP_STACK[tid].store(stack, Ordering::Release);
@@ -3289,10 +3301,10 @@ pub fn clone_snapshot(tid: usize) -> Option<CloneSnapshot> {
 pub fn reread_clone_handoff(snap: &CloneSnapshot) -> Option<(u64, u64)> {
     let mut words = [0u64; 2];
     // As `record_clone_snapshot`: a re-read at thread start, never a prefault.
-    crate::mmu::user_access::copy_from_user_with(
-        crate::mmu::user_access::as_user_bytes_mut(&mut words),
+    crate::process::user_access::copy_from_user_with(
+        crate::process::user_access::as_user_bytes_mut(&mut words),
         snap.stack,
-        crate::mmu::user_access::Prefault::No,
+        crate::process::user_access::Prefault::No,
     )
     .ok()?;
     Some(words.into())

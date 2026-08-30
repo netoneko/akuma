@@ -18,8 +18,8 @@ use alloc::vec::Vec;
 use elf::abi::{EM_AARCH64, ET_DYN, ET_EXEC, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
 use elf::segment::ProgramHeader;
 
-use crate::mmu::{PAGE_SIZE, UserAddressSpace, user_flags};
-use crate::runtime::runtime;
+use akuma_mmap::{PAGE_SIZE, user_flags};
+use akuma_mmu::UserAddressSpace;
 
 use super::interp::load_interp_for;
 use super::source::{ElfHeaders, ElfSource, parse_headers};
@@ -77,7 +77,7 @@ pub fn load_elf_from_path(
     file_size: usize,
     interp_prefix: Option<&str>,
 ) -> Result<LoadedElf, ElfError> {
-    let (mount_id, inode) = (runtime().resolve_file_id)(path).unwrap_or((0, 0));
+    let (mount_id, inode) = (crate::vfs().resolve_file_id)(path).unwrap_or((0, 0));
 
     if DEBUG_ELF_LOADING {
         log::debug!(
@@ -349,7 +349,7 @@ pub(super) fn map_segment_eager(
 
         let chunk = src.read_at(offset + page_start_in_segment, copy_len)?;
         unsafe {
-            let dst = crate::mmu::phys_to_virt(frame_addr + copy_start);
+            let dst = akuma_primitives::addr::phys_to_virt(frame_addr + copy_start);
             core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, copy_len);
         }
     }
@@ -429,7 +429,7 @@ pub(super) fn apply_relocations(
             };
 
             unsafe {
-                let ptr = crate::mmu::phys_to_virt(pa + (vaddr & (PAGE_SIZE - 1))) as *mut usize;
+                let ptr = akuma_primitives::addr::phys_to_virt(pa + (vaddr & (PAGE_SIZE - 1))) as *mut usize;
                 *ptr = value;
             }
             applied += 1;
@@ -513,7 +513,7 @@ pub(super) fn boundary_extended_filesz(
 #[cfg(test)]
 mod boundary_tests {
     use super::boundary_extended_filesz;
-    use crate::mmu::PAGE_SIZE;
+    use akuma_mmap::PAGE_SIZE;
 
     // Regression: the demand-paged ELF loader zeroed a following segment's
     // file-backed bytes that shared a page with the prior segment, corrupting

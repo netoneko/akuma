@@ -10,7 +10,7 @@
 //! the `stack=rump` dispatch hook) come next.
 
 use crate::syscall::pipe;
-use akuma_exec::mmu::user_access::{copy_from_user, copy_to_user, write_user_val};
+use akuma_exec::process::user_access::{copy_from_user, copy_to_user, write_user_val};
 use akuma_exec::{process, threading};
 use akuma_rump::sysproxy::{Client, ClientMem, NoMem, PipeIo, PipeTransport, MAX_TRANSFER};
 use akuma_rump::syscall_translation as translation;

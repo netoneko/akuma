@@ -11,13 +11,13 @@ workspace = true
 # (build_extreme_size.sh). Lets this crate's build.rs emit
 # `cfg(kernel_profile_extreme)` so threading can trim the warm-stack floor and
 # right-size kernel stacks for the extreme low-memory target. NOT a syscall gate.
-extreme = ["akuma-primitives/extreme"]
+extreme = ["akuma-primitives/extreme", "akuma-elf/extreme"]
 
 # Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared` feature.
 # Lets this crate's build.rs emit `cfg(kernel_smp_shared)` so the Big Kernel Lock
 # (`bkl`) is active; with it off, `bkl` compiles to zero-overhead no-ops and the
 # default/other builds are unaffected. See docs/reference/subsystems/smp-shared.md.
-smp-shared = ["akuma-primitives/smp-shared"]
+smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared", "akuma-elf/smp-shared"]
 
 # Disable BKL usage for network operations (Phase 2 testing).
 # When enabled, network syscalls skip BKL acquisition and use the new
@@ -48,10 +48,25 @@ no-bkl-process = []
 # code in `.text` in every build, and paid a load + branch each. Making the gate
 # `cfg!(feature = "debug-info") && config()...` lets the whole thing constant-fold
 # away when the feature is off, while keeping the runtime toggle when it is on.
-debug-info = []
+debug-info = ["akuma-mmu/debug-info"]
 
 [dependencies]
 akuma-primitives = { path = "../akuma-primitives" }
+# The BKL protocol + spinlocks, extracted 2026-08-30
+# (docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md §3.4). This crate re-exports it as
+# `akuma_exec::{sync, bkl}` so its ~120 call sites here and the 121 in `src/` are
+# unchanged, and registers the one hook it needs (`threading::yield_now`) in
+# `threading::init`.
+akuma-bkl = { path = "../akuma-bkl" }
+# Page tables, UserAddressSpace, ASIDs and the TTBR free gate, extracted
+# 2026-08-30 (docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md §3.5). Re-exported as
+# `akuma_exec::mmu` so the ~388 `akuma_exec::mmu::*` call sites in `src/` are
+# unchanged. This crate registers its two scheduler hooks in `init`.
+akuma-mmu = { path = "../akuma-mmu" }
+# The ELF loader, extracted 2026-08-30 (AKUMA_EXEC_SPLIT_AGAIN.md §3.2).
+# Re-exported as `akuma_exec::elf_loader`; this crate registers its four VFS
+# hooks in `init`.
+akuma-elf = { path = "../akuma-elf" }
 akuma-pmm = { path = "../akuma-pmm" }
 # Region bookkeeping: `MmapRegion`, `PhysFrame`, the CoW-inherit and munmap-detach
 # algebra, and the PTE permission vocabulary. Sits BELOW this crate so a future

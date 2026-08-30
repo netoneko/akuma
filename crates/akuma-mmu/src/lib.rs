@@ -1,18 +1,202 @@
-//! MMU (Memory Management Unit) for AArch64
+//! Virtual memory: page tables, address spaces, ASIDs, and the TTBR free gate.
 //!
-//! Implements page table management for virtual memory.
-//! Uses 4KB granule with 4-level page tables (L0-L3).
+//! AArch64, 4 KB granule, 4-level page tables (L0-L3).
+//!
+//! # Why this is a crate
+//!
+//! Extracted from `akuma-exec` on 2026-08-30
+//! (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.5). Two numbers made it the
+//! highest-value body to isolate: it held **41% of `akuma-exec`'s entire `unsafe`
+//! budget** (86 of 209 sites) at the **lowest test coverage in that crate**
+//! (7.9%). Concentrating it here is the `akuma-net-nic` move — "irreducible is a
+//! property of a body of code, not of a crate" — and it is the state in which
+//! `akuma-net` first became reviewable, and then `forbid`-able.
+//!
+//! `UserAddressSpace`'s `Drop`, the deferred-free path (`free_or_defer_as_frames`,
+//! `drain_pending_ttbr_frees`) and the per-core `ACTIVE_L0`/`PREV_L0` gate are the
+//! mechanism behind the page-table-UAF BKL storm
+//! (`docs/archive/PAGE_TABLE_UAF_BKL_STORM.md`) and the F8 saved-context TTBR0
+//! gate. The gate in particular is a decision function over
+//! `(l0_phys, per-core published L0s, saved contexts)` — exactly the shape that
+//! hosts well, and which previously needed a devbox boot to exercise.
+//!
+//! # This crate is *virtual* memory. `akuma-pmm` is *physical*.
+//!
+//! That seam is load-bearing and this crate must not erode it. `akuma-pmm`
+//! allocates frames — 1,139 lines, 5 `unsafe` sites, and a stated invariant that
+//! it takes no dependency on `akuma-exec`. This crate maps them, and carries 71
+//! `unsafe` sites plus a hook into the scheduler. Folding the two together would
+//! take the frame allocator from 5 `unsafe` sites to 91 and drag `akuma-mmap`,
+//! `akuma-ext2` and `akuma-virtio` downstream of all of them. The memory family is
+//! three crates, bottom-up: `akuma-pmm` (frames) -> `akuma-mmap` (region records,
+//! `forbid`) -> `akuma-mmu` (page tables).
+//!
+//! # The one upward dependency
+//!
+//! [`SchedHooks`]: two questions only the scheduler can answer, both about
+//! whether an address space is still live on some core. Everything else this
+//! crate needed from `akuma-exec` either moved down to `akuma-primitives`
+//! already, moved *up* out of here (`user_access.rs`, whose eight process
+//! references were the whole of the old `mmu <-> process` cycle), or became the
+//! `debug-info` feature.
 
-#![allow(dead_code)]
+#![cfg_attr(not(test), no_std)]
+// Inherited verbatim from `akuma-exec`'s crate-root `allow` list. This code did
+// not change when it moved out on 2026-08-30, so its lint posture must not
+// either — a split that silently turns 20 warnings on is not behaviour-preserving,
+// and fixing them in the same commit would hide the move in the diff. Tighten
+// these deliberately, later, one lint at a time.
+#![allow(
+    clippy::too_long_first_doc_paragraph,
+    clippy::must_use_candidate,
+    clippy::redundant_pub_crate,
+    clippy::unnecessary_cast,
+    clippy::ptr_as_ptr,
+    clippy::verbose_bit_mask,
+    clippy::single_match_else,
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::new_without_default,
+    clippy::manual_div_ceil,
+    clippy::cast_lossless,
+    clippy::vec_init_then_push,
+    clippy::unused_self,
+    clippy::semicolon_if_nothing_returned,
+    clippy::needless_continue,
+    clippy::manual_is_multiple_of,
+    clippy::identity_op,
+    clippy::collapsible_if,
+    clippy::cast_possible_wrap,
+    clippy::inline_always,
+    clippy::missing_safety_doc,
+    clippy::uninlined_format_args,
+    clippy::doc_markdown,
+    clippy::cast_ptr_alignment,
+    clippy::declare_interior_mutable_const,
+    clippy::missing_const_for_fn,
+    clippy::too_many_lines,
+    clippy::borrow_as_ptr,
+    clippy::ref_as_ptr,
+    clippy::items_after_statements,
+    clippy::redundant_else,
+    clippy::option_if_let_else,
+    clippy::needless_range_loop,
+    clippy::collapsible_else_if,
+    clippy::significant_drop_tightening,
+    clippy::unreadable_literal,
+    clippy::similar_names,
+    clippy::implicit_saturating_sub,
+    clippy::manual_let_else,
+    clippy::let_and_return,
+    clippy::use_self,
+    unused_unsafe,
+    unused_mut,
+    dead_code,
+)]
 
-pub mod types;
+extern crate alloc;
+
 pub mod asid;
-pub mod user_access;
+pub mod types;
+
+/// The tree's one heap-free print macro, re-exported so this crate's
+/// `crate::safe_print!(…)` call sites resolve unchanged.
+pub use akuma_primitives::safe_print;
+
+/// Allocation source for debug frame tracking — the `akuma-exec` enum, mirrored
+/// here so this crate can attribute page-table and user-data frames without
+/// depending on the execution crate. Converted at the `akuma-pmm` boundary
+/// exactly as `akuma_exec::runtime::track_frame` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSource {
+    Kernel,
+    UserPageTable,
+    UserData,
+    ElfLoader,
+    Unknown,
+}
+
+/// Attribute a frame to a source in the PMM's tracker.
+pub fn track_frame(frame: PhysFrame, source: FrameSource) {
+    let src = match source {
+        FrameSource::Kernel => akuma_pmm::FrameSource::Kernel,
+        FrameSource::UserPageTable => akuma_pmm::FrameSource::UserPageTable,
+        FrameSource::UserData => akuma_pmm::FrameSource::UserData,
+        FrameSource::ElfLoader => akuma_pmm::FrameSource::ElfLoader,
+        FrameSource::Unknown => akuma_pmm::FrameSource::Unknown,
+    };
+    akuma_pmm::track_frame(frame.addr, src);
+}
+
+/// The scheduler questions this crate cannot answer for itself.
+///
+/// Both are about whether an address space is still live somewhere. The TTBR free
+/// gate must not free an L0 that a core's saved context still points at — that is
+/// the F8 defect (`[SGI-S FREED-L0]` must never print) — and only the thread table
+/// knows. Registered once by `akuma_exec::init`.
+///
+/// This is the **whole** of this crate's upward surface. It is a two-item table
+/// rather than the "just call `threading::`" it replaced, because the alternative
+/// is a dependency cycle: `akuma-exec` maps pages through this crate on every
+/// fault.
+#[derive(Clone, Copy)]
+pub struct SchedHooks {
+    /// Is any thread's *saved* context still pointing at this L0 base? Returns
+    /// `(tid, state)` of the first one found. The free gate's second arm.
+    pub any_saved_ctx_on_l0: fn(u64) -> Option<(usize, u8)>,
+    /// Record the TTBR0 the current thread is expected to run under, so a
+    /// mismatch at switch-in is detectable.
+    pub note_current_expected_l0: fn(u64),
+}
+
+static SCHED: akuma_primitives::Registered<SchedHooks> = akuma_primitives::Registered::new(
+    "akuma-mmu: SchedHooks not registered — call akuma_exec::init() first",
+);
+
+/// Register the scheduler hooks. Call once, from `akuma_exec::init`.
+pub fn register_sched_hooks(h: SchedHooks) {
+    SCHED.register(h);
+}
+
+/// Whether any thread's saved context still references `l0_base`.
+///
+/// Degrades to `None` before registration — during early boot there are no saved
+/// contexts to conflict with, and a panic here would fire before the console is
+/// useful.
+#[inline]
+fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
+    SCHED.get().and_then(|h| (h.any_saved_ctx_on_l0)(l0_base))
+}
+
+/// Record the current thread's expected TTBR0. No-op before registration.
+#[inline]
+fn note_current_expected_l0(ttbr0: u64) {
+    if let Some(h) = SCHED.get() {
+        (h.note_current_expected_l0)(ttbr0);
+    }
+}
+
+/// Whether the `[AS-*]` address-space lifecycle trace is compiled in.
+///
+/// **A compile-time gate, by design.** It replaced
+/// `akuma_exec::process::lifecycle_trace_on()`, which was
+/// `cfg!(feature = "debug-info") && config().syscall_debug_info_enabled` — the
+/// runtime half is dropped, so with the feature compiled in the trace is always
+/// on rather than also consulting `syscall_debug_info_enabled`. That is a
+/// deliberate, narrow behaviour change on a debug-only path: the feature is off
+/// in every shipping profile, so the default build is byte-identical, and having
+/// opted in at compile time is opt-in enough. Keeping the runtime half would have
+/// meant a `fn() -> bool` hook on the address-space create/exec/free path, which
+/// is exactly the indirect call the `cfg!` shape exists to avoid.
+#[inline(always)]
+const fn lifecycle_trace_on() -> bool {
+    cfg!(feature = "debug-info")
+}
 
 pub use types::*;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use crate::runtime::{PhysFrame, FrameSource, with_irqs_disabled, IrqGuard, track_frame};
+use akuma_mmap::PhysFrame;
+use akuma_primitives::irq::{with_irqs_disabled, IrqGuard};
 
 /// MMU initialization state
 static MMU_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -524,7 +708,12 @@ fn asid_exhausted_warn() {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 5 || n.is_multiple_of(100) {
-        (crate::runtime::runtime().print_str)(
+        // `safe_print!`, not an `ExecRuntime` hook: this is a fixed `&'static str`
+        // on the path that reports the ASID space is exhausted, and the console is
+        // what survives when allocation is what broke
+        // (docs/reference/subsystems/console.md § "Printing rules"). It was the
+        // last `runtime()` reference in this crate.
+        crate::safe_print!(160,
             "[asid] EXHAUSTED: no free ASID (MAX_ASID=256) — address-space creation failing; \
              suspect leaked ASIDs from address spaces whose Drop never ran\n");
     }
@@ -536,7 +725,12 @@ fn asid_exhausted_warn() {
 /// (docs/archive/PAGE_TABLE_UAF_BKL_STORM.md): a lockprobe capture gives the
 /// stuck core's TTBR0 (ASID + L0 physical), and these lines are what link that
 /// L0 back to a pid and a teardown path in the console log.
-pub(crate) fn as_trace(args: core::fmt::Arguments) {
+/// `#[inline]` is load-bearing across the crate boundary: callers build the
+/// `Arguments` with `format_args!` at the call site, and it is only when this
+/// body inlines to nothing (feature off) that LLVM can delete that construction
+/// too. Inside one crate that happened for free.
+#[inline]
+pub fn as_trace(args: core::fmt::Arguments) {
     // Gated as a LIFECYCLE trace (2026-08-29). It was unconditional, and it is the
     // single largest console producer in the tree: `[AS-NEW]`/`[AS-EXEC]`/
     // `[AS-FREE]`/`[AS-DEFER]` fire on every address-space create, exec and free,
@@ -549,7 +743,7 @@ pub(crate) fn as_trace(args: core::fmt::Arguments) {
     // serial lines per `fork()`. `lifecycle_trace_on()` folds to a compile-time
     // `false` without the `debug-info` feature, so with it off this call and its
     // `Arguments` construction disappear entirely.
-    if crate::process::lifecycle_trace_on() {
+    if crate::lifecycle_trace_on() {
         // Was a fifth function-local copy of the stack writer. `print_args` is the
         // `Arguments`-shaped entry point to the shared one — this helper takes
         // pre-built `Arguments` rather than being a macro, so it can't use
@@ -606,8 +800,8 @@ static PREV_L0: [AtomicU64; TTBR_TRACK_CORES] = [ATOMIC_U64_ZERO; TTBR_TRACK_COR
 /// must already be masked so the pair can't migrate cores). Returns the core
 /// index to pass to [`publish_l0_end`].
 #[inline]
-pub(crate) fn publish_l0_begin(new_ttbr0: u64) -> usize {
-    let core = (crate::bkl::current_core_id() as usize) % TTBR_TRACK_CORES;
+pub fn publish_l0_begin(new_ttbr0: u64) -> usize {
+    let core = (akuma_bkl::bkl::current_core_id() as usize) % TTBR_TRACK_CORES;
     let old = ACTIVE_L0[core].load(Ordering::Relaxed);
     PREV_L0[core].store(old, Ordering::SeqCst);
     ACTIVE_L0[core].store(new_ttbr0 & L0_BASE_MASK, Ordering::SeqCst);
@@ -616,7 +810,7 @@ pub(crate) fn publish_l0_begin(new_ttbr0: u64) -> usize {
 
 /// Finish a TTBR0 transition: the `msr` has retired, only ACTIVE covers us now.
 #[inline]
-pub(crate) fn publish_l0_end(core: usize) {
+pub fn publish_l0_end(core: usize) {
     PREV_L0[core].store(0, Ordering::SeqCst);
 }
 
@@ -734,7 +928,7 @@ fn free_or_defer_as_frames(
     // Park the frames instead; the reference dissolves at the slot's next
     // context save (post-`deactivate()` switch-out), recycle (context zeroed) or
     // spawn re-seed, and the next drain frees them.
-    if let Some((tid, state)) = crate::threading::any_saved_ctx_on_l0(l0_addr as u64 & L0_BASE_MASK) {
+    if let Some((tid, state)) = crate::any_saved_ctx_on_l0(l0_addr as u64 & L0_BASE_MASK) {
         as_trace(format_args!(
             "[AS-FREE-DEFER] l0=0x{:x} asid=0x{:x} path={} held_by_ctx tid={} state={}\n",
             l0_addr, asid, path, tid, state));
@@ -746,7 +940,7 @@ fn free_or_defer_as_frames(
         return;
     }
     as_trace(format_args!("[AS-FREE] l0=0x{:x} asid=0x{:x} path={} core={}\n",
-        l0_addr, asid, path, crate::bkl::current_core_id()));
+        l0_addr, asid, path, akuma_bkl::bkl::current_core_id()));
     free_as_frames_now(l0_frame, &user_frames, &pt_frames);
 }
 
@@ -788,7 +982,7 @@ pub fn drain_pending_ttbr_frees() -> usize {
             // close for entries parked by the saved-context gate.
             let l0 = pending[i].l0_frame.addr;
             if any_core_on_l0(l0).is_none()
-                && crate::threading::any_saved_ctx_on_l0(l0 as u64 & L0_BASE_MASK).is_none()
+                && crate::any_saved_ctx_on_l0(l0 as u64 & L0_BASE_MASK).is_none()
             {
                 ready.push(pending.swap_remove(i));
             } else {
@@ -801,7 +995,7 @@ pub fn drain_pending_ttbr_frees() -> usize {
     let n = ready.len();
     for e in ready {
         as_trace(format_args!("[AS-FREE] l0=0x{:x} asid=0x{:x} path=drained core={}\n",
-            e.l0_frame.addr, e.asid, crate::bkl::current_core_id()));
+            e.l0_frame.addr, e.asid, akuma_bkl::bkl::current_core_id()));
         free_as_frames_now(e.l0_frame, &e.user_frames, &e.pt_frames);
     }
     n
@@ -1534,7 +1728,7 @@ impl UserAddressSpace {
             publish_l0_end(_core);
         }
         flush_tlb_all();
-        crate::threading::note_current_expected_l0(_ttbr0);
+        crate::note_current_expected_l0(_ttbr0);
     }
 
     pub fn deactivate() {
@@ -1549,7 +1743,7 @@ impl UserAddressSpace {
             publish_l0_end(_core);
         }
         flush_tlb_all();
-        crate::threading::note_current_expected_l0(_boot_ttbr0);
+        crate::note_current_expected_l0(_boot_ttbr0);
     }
 }
 
@@ -1571,7 +1765,7 @@ impl Drop for UserAddressSpace {
                 log::debug!("[FORK-DBG] AS owner L0=0x{:x} DEFERRING free (siblings alive)", l0_addr);
                 // #endregion
                 as_trace(format_args!("[AS-DEFER] l0=0x{:x} asid=0x{:x} core={}\n",
-                    l0_addr, self.asid, crate::bkl::current_core_id()));
+                    l0_addr, self.asid, akuma_bkl::bkl::current_core_id()));
                 let user_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.user_frames.lock()) };
                 let pt_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.page_table_frames.lock()) };
                 let l0 = self.l0_frame;

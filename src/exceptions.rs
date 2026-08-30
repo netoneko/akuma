@@ -853,10 +853,10 @@ pub fn emulate_dc_zva(addr: u64) {
     let aligned_addr = addr & !(block_size as u64 - 1);
     let zeros = [0u8; 2048];
     // Fault-time store: `Prefault::No` for the reason in `read_user_instr`.
-    let _ = akuma_exec::mmu::user_access::copy_to_user_with(
+    let _ = akuma_exec::process::user_access::copy_to_user_with(
         aligned_addr,
         &zeros[..block_size],
-        akuma_exec::mmu::user_access::Prefault::No,
+        akuma_exec::process::user_access::Prefault::No,
     );
 }
 
@@ -869,13 +869,13 @@ pub fn emulate_dc_zva(addr: u64) {
 /// resolved in place by [`try_resolve_el1_user_copy_lazy_fault`], which is the
 /// mechanism designed for it.
 ///
-/// [`prefault_user_range`]: akuma_exec::mmu::user_access::prefault_user_range
+/// [`prefault_user_range`]: akuma_exec::process::user_access::prefault_user_range
 fn read_user_instr(va: u64) -> Option<u32> {
     let mut buf = [0u8; 4];
-    akuma_exec::mmu::user_access::copy_from_user_with(
+    akuma_exec::process::user_access::copy_from_user_with(
         &mut buf,
         va,
-        akuma_exec::mmu::user_access::Prefault::No,
+        akuma_exec::process::user_access::Prefault::No,
     )
     .ok()
     .map(|()| u32::from_le_bytes(buf))
@@ -885,10 +885,10 @@ fn read_user_instr(va: u64) -> Option<u32> {
 /// Writes 16 zero bytes to `addr`.
 fn emulate_stp_xzr_xzr(addr: u64) {
     let zeros = [0u8; 16];
-    let _ = akuma_exec::mmu::user_access::copy_to_user_with(
+    let _ = akuma_exec::process::user_access::copy_to_user_with(
         addr,
         &zeros,
-        akuma_exec::mmu::user_access::Prefault::No,
+        akuma_exec::process::user_access::Prefault::No,
     );
 }
 
@@ -1130,10 +1130,10 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
     // `mov x19,x0`). Dump that block so the reuse pattern — free-list cell, small
     // integer, or string — is on the record without a second run.
     let mut probe = [0u64; 4];
-    let ok = akuma_exec::mmu::user_access::copy_from_user_with(
-        akuma_exec::mmu::user_access::as_user_bytes_mut(&mut probe),
+    let ok = akuma_exec::process::user_access::copy_from_user_with(
+        akuma_exec::process::user_access::as_user_bytes_mut(&mut probe),
         frame.x19,
-        akuma_exec::mmu::user_access::Prefault::No,
+        akuma_exec::process::user_access::Prefault::No,
     )
     .is_ok();
     if ok {
@@ -2289,10 +2289,10 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // allowed — the `ensure_user_page_mapped` + `ensure_cow_page_writable` pre-flight
     // above is the fault-safe form of the same job, and it has already run for both
     // pages this frame can span.
-    if akuma_exec::mmu::user_access::write_user_val_with(
+    if akuma_exec::process::user_access::write_user_val_with(
         new_sp as u64,
         &sf,
-        akuma_exec::mmu::user_access::Prefault::No,
+        akuma_exec::process::user_access::Prefault::No,
     )
     .is_err()
     {
@@ -2470,10 +2470,10 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
     // read adds over the old presence test is the AP check — a frame SP inside an
     // EL1-only mapping is now rejected instead of read (`USER_COPY_FOLD.md` §7).
     let mut sf = sigframe::RtSigFrame::zeroed();
-    if akuma_exec::mmu::user_access::read_user_into_with(
+    if akuma_exec::process::user_access::read_user_into_with(
         &mut sf,
         sigframe_sp,
-        akuma_exec::mmu::user_access::Prefault::No,
+        akuma_exec::process::user_access::Prefault::No,
     )
     .is_err()
     {
@@ -4635,10 +4635,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         {
                             let elr = frame_ref.elr_el1;
                             let mut ib = [0u8; 8];
-                            let ok = akuma_exec::mmu::user_access::copy_from_user_with(
+                            let ok = akuma_exec::process::user_access::copy_from_user_with(
                                 &mut ib,
                                 elr.wrapping_sub(4),
-                                akuma_exec::mmu::user_access::Prefault::No,
+                                akuma_exec::process::user_access::Prefault::No,
                             )
                             .is_ok();
                             if ok {

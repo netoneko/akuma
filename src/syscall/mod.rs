@@ -13,7 +13,7 @@ use spinning_top::Spinlock;
 // rather than imported per-module: every syscall submodule reaches these through
 // `use super::*`, which is how it already reached the raw pair.
 // `docs/archive/UNSAFE_AUDIT.md` §4 P0.
-pub use akuma_exec::mmu::user_access::{
+pub use akuma_exec::process::user_access::{
     Prefault, as_user_bytes, as_user_bytes_mut, copy_from_user, copy_to_user,
     copy_to_user_with, read_user_into, read_user_into_with, write_user_val,
     write_user_val_with,
@@ -21,7 +21,7 @@ pub use akuma_exec::mmu::user_access::{
 // The raw byte-loop primitive. One caller left in this crate's syscall layer:
 // `copy_from_user_byte`, which reads a NUL-terminated string one byte at a time and
 // therefore has no range to validate — see its doc comment.
-use akuma_exec::mmu::user_access::copy_from_user_safe;
+use akuma_exec::process::user_access::copy_from_user_safe;
 // The excursion shape crate: which counter bucket a number falls in, which
 // hooks run, and where the epilogue's identity comes from. Decisions only — see
 // `EXCURSION_HOOKS` and docs/archive/AKUMA_EXTRACT_SYSCALLS.md §7.
@@ -225,10 +225,10 @@ pub mod syscall_counters {
 
 /// Flag to bypass pointer validation during kernel-originated syscall tests.
 ///
-/// Re-export: the flag moved to `akuma_exec::mmu::user_access` with the check it
+/// Re-export: the flag moved to `akuma_exec::process::user_access` with the check it
 /// disables, so the copy helpers can honour it. The ~50 boot-test call sites keep
 /// spelling it `crate::syscall::BYPASS_VALIDATION`.
-pub use akuma_exec::mmu::user_access::BYPASS_VALIDATION;
+pub use akuma_exec::process::user_access::BYPASS_VALIDATION;
 
 /// Syscall numbers (Linux-compatible subset).
 ///
@@ -294,7 +294,7 @@ pub type SysResult = Result<u64, u64>;
 ///
 /// - This module's own helpers — [`copy_from_user_str`], [`copy_from_user_byte`]
 ///   — carry the **negated** form, because they are written for syscall arms.
-/// - `akuma_exec::mmu::user_access`'s helpers (`copy_from_user`,
+/// - `akuma_exec::process::user_access`'s helpers (`copy_from_user`,
 ///   `read_user_into`, `write_user_val`, …) carry the **positive** form. That
 ///   is deliberate and documented at its definition: *"`x0 = -errno` happens at
 ///   the syscall boundary, not here"*, because that crate is also used off the
@@ -352,28 +352,28 @@ pub fn user_va_limit_value() -> u64 {
 /// Exposed for kernel tests only — see `test_ensure_user_pages_mapped_as_lock`.
 #[cfg(kernel_tests)]
 pub fn ensure_user_pages_mapped_for_test(start: usize, len: usize) -> bool {
-    akuma_exec::mmu::user_access::prefault_user_range(start, len)
+    akuma_exec::process::user_access::prefault_user_range(start, len)
 }
 
-/// The 48-bit user VA limit. Now `akuma_exec::mmu::user_access::USER_VA_LIMIT` —
+/// The 48-bit user VA limit. Now `akuma_exec::process::user_access::USER_VA_LIMIT` —
 /// see there for why it is not a smaller cap (Go's high arenas).
 fn user_va_limit() -> u64 {
-    akuma_exec::mmu::user_access::USER_VA_LIMIT
+    akuma_exec::process::user_access::USER_VA_LIMIT
 }
 
 /// Validate a user pointer range, faulting lazy pages in.
 ///
 /// Thin forwarder: the body — the range tests *and* the demand-paging half — moved
-/// to `akuma_exec::mmu::user_access` so the copy helpers could fold it in and stop
+/// to `akuma_exec::process::user_access` so the copy helpers could fold it in and stop
 /// being skippable (`docs/archive/UNSAFE_AUDIT.md` §4 P0). Kept as a named function
 /// because plenty of syscall arms validate a pointer they never copy through
 /// (`futex` addresses, `mmap` args), and because `Prefault::Yes` is the right
 /// default for every caller on a syscall stack.
 fn validate_user_ptr(ptr: u64, len: usize) -> bool {
-    akuma_exec::mmu::user_access::validate_user_range(
+    akuma_exec::process::user_access::validate_user_range(
         ptr,
         len,
-        akuma_exec::mmu::user_access::Prefault::Yes,
+        akuma_exec::process::user_access::Prefault::Yes,
     )
 }
 

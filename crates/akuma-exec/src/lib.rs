@@ -84,25 +84,46 @@
 extern crate alloc;
 
 pub mod runtime;
-pub mod sync;
-pub mod bkl;
-/// Host-only model checker + concurrency stress harness for the Big Kernel Lock protocol
-/// (deadlock / mutual-exclusion / starvation checks). Compiled only for `cargo test`.
-#[cfg(test)]
-mod bkl_model;
+/// Spinlocks and the recursive Big Kernel Lock — **moved to `akuma-bkl` on
+/// 2026-08-30** (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.4), together with
+/// `bkl` and the host model checker that proves the protocol. Re-exported under
+/// the old paths so every `crate::sync::…` / `akuma_exec::sync::…` call site
+/// resolves unchanged.
+pub use akuma_bkl::sync;
+/// The BKL enter/leave protocol and its per-thread dropped-window ledger — see
+/// [`sync`] for why this now lives in `akuma-bkl`.
+pub use akuma_bkl::bkl;
 
 /// Shared host-test scaffolding (stub `ExecRuntime`/`ExecConfig` registration).
 #[cfg(test)]
 pub mod test_support;
-pub mod mmu;
+/// Page tables, `UserAddressSpace`, ASIDs, TLB maintenance and the per-core TTBR
+/// free gate — **moved to `akuma-mmu` on 2026-08-30**
+/// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.5). It carried 41% of this
+/// crate's `unsafe` budget at its lowest test coverage; concentrating it is the
+/// `akuma-net-nic` move. Re-exported under the old path so every
+/// `crate::mmu::…` / `akuma_exec::mmu::…` call site resolves unchanged.
+///
+/// `user_access` did **not** go with it — it moved *up*, to [`process::user_access`],
+/// because its eight process references were the whole of the old `mmu <-> process`
+/// cycle.
+pub use akuma_mmu as mmu;
 pub mod memmath;
-#[path = "elf/mod.rs"]
-pub mod elf_loader;
+/// The ELF loader — **moved to `akuma-elf` on 2026-08-30**
+/// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.2). Re-exported under the old
+/// name so `process::image`'s three call sites and
+/// `akuma_exec::elf_loader::INTERP_BASE` in `src/exceptions.rs` are unchanged.
+pub use akuma_elf as elf_loader;
 pub mod threading;
 pub mod alarms;
 pub mod process;
-#[path = "box_mod/mod.rs"]
-pub mod box_registry;
+/// The box (container) registry — **moved to `akuma-isolation` on 2026-08-30**
+/// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.1), where it joins the mount and
+/// network namespaces it has always sat on top of and gains that crate's
+/// `#![forbid(unsafe_code)]`. Re-exported under the old path so every
+/// `crate::box_registry::…` and `akuma_exec::process::box_*` call site resolves
+/// unchanged.
+pub use akuma_isolation::box_registry;
 #[cfg(target_os = "none")]
 pub mod kernel_tests;
 
@@ -121,4 +142,27 @@ pub use akuma_primitives::safe_print;
 /// * `cfg` — Kernel configuration constants
 pub fn init(rt: ExecRuntime, cfg: ExecConfig) {
     runtime::register(rt, cfg);
+    // `akuma-bkl`'s single upward dependency: the scheduler's yield entry point.
+    // Registered here rather than in `threading::init` because `sync::lock_bounded`
+    // is reachable long before the thread pool exists — see `akuma_bkl`'s module
+    // header for why the hook degrades to a spin hint instead of panicking.
+    akuma_bkl::set_yield_hook(threading::yield_now);
+    // `akuma-mmu`'s whole upward surface: the two questions the TTBR free gate
+    // has to ask the scheduler. Without these the gate degrades to "no saved
+    // context conflicts", which is correct only before any thread has run — so
+    // register them here, alongside the runtime table, not lazily.
+    akuma_mmu::register_sched_hooks(akuma_mmu::SchedHooks {
+        any_saved_ctx_on_l0: threading::any_saved_ctx_on_l0,
+        note_current_expected_l0: threading::note_current_expected_l0,
+    });
+    // `akuma-elf`'s four VFS callbacks, forwarded from the same `ExecRuntime`
+    // fields the loader used to read directly. These `require()` at use — a stub
+    // registration turns inode-backed reads into silent zeros, which is the
+    // `[FILL-SHORT/prefault]` self-host ICE.
+    akuma_elf::register_vfs_hooks(akuma_elf::VfsHooks {
+        read_file: rt.read_file,
+        read_at: rt.read_at,
+        resolve_file_id: rt.resolve_file_id,
+        exec_bkl_drop_enabled: rt.exec_bkl_drop_enabled,
+    });
 }

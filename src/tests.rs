@@ -7171,8 +7171,8 @@ fn test_kernel_va_rejected_as_user_pointer() -> bool {
     // present — deliberately, so it never re-maps a guard page — so on its own it
     // reports success for this very address, on every `Prefault::Yes` path, which is
     // most syscalls.
-    let prefault_rejected = !akuma_exec::mmu::user_access::validate_user_range(
-        kernel_va as u64, 128, akuma_exec::mmu::user_access::Prefault::Yes);
+    let prefault_rejected = !akuma_exec::process::user_access::validate_user_range(
+        kernel_va as u64, 128, akuma_exec::process::user_access::Prefault::Yes);
 
     UserAddressSpace::deactivate();
     drop(kernel_buf);
@@ -7543,7 +7543,7 @@ fn test_safe_user_access_fault() -> bool {
     // Deliberately the RAW primitive, not `copy_to_user`: what this test exercises is
     // the byte loop's fault-recovery trampoline, and the folded API would reject this
     // address at the range check and never reach the copy at all.
-    let res = unsafe { akuma_exec::mmu::user_access::copy_to_user_safe(invalid_addr, kernel_buf.as_ptr(), 16) };
+    let res = unsafe { akuma_exec::process::user_access::copy_to_user_safe(invalid_addr, kernel_buf.as_ptr(), 16) };
     
     let ok = match res {
         Err(14) => {
@@ -7585,7 +7585,7 @@ fn test_safe_user_access_fault() -> bool {
 ///    when a clobbered `x30` would show.
 fn test_user_copy_wide_and_faults() -> bool {
     console::print("\n[TEST] user copy: widened loop, all lengths/alignments, mid-copy fault\n");
-    use akuma_exec::mmu::user_access::{copy_from_user_safe, copy_to_user_safe};
+    use akuma_exec::process::user_access::{copy_from_user_safe, copy_to_user_safe};
 
     let mut ok = true;
 

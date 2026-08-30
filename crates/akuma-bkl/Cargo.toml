@@ -1,0 +1,26 @@
+[package]
+name = "akuma-bkl"
+version = "0.1.0"
+edition = "2024"
+description = "The Big Kernel Lock protocol: RwSpinlock, KernelLock, hold-tag attribution, and the per-thread dropped-window ledger — plus the host model checker for all of it"
+
+[lints]
+workspace = true
+
+[features]
+# Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared` feature.
+# Makes this crate's build.rs emit `cfg(kernel_smp_shared)`, which is what turns
+# `KernelLock` from a set of zero-overhead no-ops into a real lock. Off, every
+# `enter_kernel`/`leave_kernel` call in the tree compiles to nothing.
+smp-shared = ["akuma-primitives/smp-shared"]
+
+[dependencies]
+# The whole dependency list. `MAX_THREADS`, `current_tid`, `disable_preemption`,
+# `enable_preemption`, `irq_save_mask`/`irq_restore`, `PreemptGuard` and
+# `safe_print!` all live in the leaf already — which is why extracting this crate
+# needed exactly one hook (`yield_now`) rather than the four-item vtable the plan
+# in AKUMA_EXEC_SPLIT_AGAIN.md §3.4 budgeted for.
+akuma-primitives = { path = "../akuma-primitives" }
+spinning_top = "0.3"
+# `RwSpinlock` is `lock_api::RwLock` over this crate's `RawRwSpinlock`.
+lock_api = "0.4"

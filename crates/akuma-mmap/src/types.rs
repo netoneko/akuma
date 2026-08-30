@@ -80,11 +80,81 @@ pub mod user_flags {
     pub const fn is_exec(flags: u64) -> bool {
         flags & flags::UXN == 0
     }
+
+    /// Whether a mapping with these flags gives EL0 **no write access** — true only
+    /// for `AP_RO_ALL`, i.e. [`RO`] and [`RX`].
+    ///
+    /// The exact complement of [`is_write`] over the `AP` field, kept as its own
+    /// name because the two are read for opposite purposes: `is_write` is asked
+    /// whether a store may proceed, this is asked whether a page may be *shared*.
+    /// Sharing a page that EL0 can write would need copy-on-write first, which is
+    /// why ELF data segments carrying relocations stay private.
+    ///
+    /// Moved here from `akuma_exec::memmath` on 2026-08-30
+    /// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.3). It is a pure function of
+    /// this module's own vocabulary and never belonged a crate up; the version it
+    /// replaced also carried a fourth private copy of `AP_MASK`, which this one
+    /// reads from [`flags`] instead. The *gated* form — the same predicate ANDed
+    /// with the `SHARED_FILE_PAGES_ENABLED` kill switch — stays in `akuma-exec`,
+    /// because reading a runtime config is exactly what this crate has no
+    /// dependencies to do.
+    #[must_use]
+    pub const fn is_read_only_to_user(flags: u64) -> bool {
+        flags & flags::AP_MASK == flags::AP_RO_ALL
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only `AP_RO_ALL` mappings are read-only to EL0. Moved with the predicate
+    /// from `akuma_exec::memmath` (`AKUMA_EXEC_SPLIT_AGAIN.md` §3.3).
+    #[test]
+    fn only_user_read_only_mappings_are_read_only() {
+        assert!(user_flags::is_read_only_to_user(user_flags::RO));
+        assert!(user_flags::is_read_only_to_user(user_flags::RX));
+        assert!(!user_flags::is_read_only_to_user(user_flags::RW));
+        assert!(!user_flags::is_read_only_to_user(user_flags::RW_NO_EXEC));
+    }
+
+    /// The predicate must read *only* the AP field: a page that is RO to EL0 stays
+    /// read-only whatever its execute/attr bits say, and a writable one is never
+    /// rescued by them.
+    #[test]
+    fn read_only_predicate_ignores_bits_outside_the_ap_field() {
+        let other = flags::UXN | flags::PXN | flags::AF;
+        assert!(user_flags::is_read_only_to_user(user_flags::RO | other));
+        assert!(!user_flags::is_read_only_to_user(user_flags::RW | other));
+    }
+
+    /// [`user_flags::is_write`] and [`user_flags::is_read_only_to_user`] are
+    /// **mutually exclusive but not exhaustive**, and the gap is load-bearing.
+    ///
+    /// `AP` has three values an EL0 mapping can take, not two: `AP_RW_ALL`
+    /// (writable), `AP_RO_ALL` (read-only *to EL0*, shareable), and `AP_RO_EL1` —
+    /// which is [`user_flags::NONE`], the `PROT_NONE` encoding, where EL0 has no
+    /// access at all. A `PROT_NONE` page is therefore neither writable nor
+    /// "read-only to user", and code that reaches for `!is_write(..)` as a stand-in
+    /// for the sharing predicate would wrongly treat it as shareable.
+    ///
+    /// Neither predicate had a test tying them together while they lived in
+    /// different crates; this is the one that says why they are two functions.
+    #[test]
+    fn write_and_read_only_are_exclusive_but_not_exhaustive() {
+        for prot in 0..8u32 {
+            let f = user_flags::from_prot(prot);
+            assert!(
+                !(user_flags::is_write(f) && user_flags::is_read_only_to_user(f)),
+                "from_prot({prot}) = {f:#x} claims both"
+            );
+        }
+        // The gap, named: PROT_NONE answers `false` to both.
+        let none = user_flags::NONE;
+        assert!(!user_flags::is_write(none));
+        assert!(!user_flags::is_read_only_to_user(none));
+        assert!(user_flags::is_none(none));
+    }
 
     #[test]
     fn user_flags_from_prot() {

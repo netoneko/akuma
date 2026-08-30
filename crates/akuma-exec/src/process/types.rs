@@ -80,8 +80,14 @@ impl ProcessInfo {
 
 const _: () = assert!(core::mem::size_of::<ProcessInfo>() == 1024);
 
-/// Process ID type
-pub type Pid = u32;
+/// Process id.
+///
+/// Hoisted to `akuma-primitives` on 2026-08-30 so `akuma-isolation`'s box
+/// registry could name it without depending on this crate
+/// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.1). Re-exported here — it is a
+/// plain alias, so this was always the same type, and the ~1,300
+/// `akuma_exec::process::Pid` call sites are unchanged.
+pub use akuma_primitives::Pid;
 
 /// Stdio buffer for procfs visibility
 pub struct StdioBuffer {

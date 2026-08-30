@@ -38,15 +38,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-bkl"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+ "lock_api",
+ "spinning_top",
+]
+
+[[package]]
 name = "akuma-boot"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-elf"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-mmap",
+ "akuma-mmu",
+ "akuma-primitives",
+ "elf",
+ "log",
+]
 
 [[package]]
 name = "akuma-exec"
 version = "0.1.0"
 dependencies = [
+ "akuma-bkl",
+ "akuma-elf",
  "akuma-isolation",
  "akuma-mmap",
+ "akuma-mmu",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-syscalls-linux",
@@ -78,6 +102,7 @@ dependencies = [
 name = "akuma-isolation"
 version = "0.1.0"
 dependencies = [
+ "akuma-primitives",
  "akuma-vfs",
  "spinning_top",
 ]
@@ -89,6 +114,18 @@ version = "0.1.0"
 [[package]]
 name = "akuma-mmap"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-mmu"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-mmap",
+ "akuma-pmm",
+ "akuma-primitives",
+ "log",
+ "spinning_top",
+]
 
 [[package]]
 name = "akuma-net"

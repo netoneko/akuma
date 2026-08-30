@@ -316,7 +316,7 @@ pub fn validate_user_range(ptr: u64, len: usize, prefault: Prefault) -> bool {
     if !user_range_ok(ptr, len) {
         return false;
     }
-    if super::is_current_user_range_mapped(ptr as usize, len) {
+    if crate::mmu::is_current_user_range_mapped(ptr as usize, len) {
         return true;
     }
     match prefault {
@@ -329,7 +329,7 @@ pub fn validate_user_range(ptr: u64, len: usize, prefault: Prefault) -> bool {
         // allocation and possibly file I/O.
         Prefault::Yes => {
             prefault_user_range(ptr as usize, len)
-                && super::is_current_user_range_mapped(ptr as usize, len)
+                && crate::mmu::is_current_user_range_mapped(ptr as usize, len)
         }
         Prefault::No => false,
     }
@@ -360,7 +360,7 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
         .and_then(crate::process::lookup_process_shared);
     let mut va = page_start;
     while va < page_end {
-        if !super::is_current_user_page_mapped(va) {
+        if !crate::mmu::is_current_user_page_mapped(va) {
             let Some((flags, source, _region_start, _region_size)) =
                 crate::process::lazy_region_lookup(va)
             else {
@@ -368,9 +368,9 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
             };
             let map_flags = match &source {
                 crate::process::LazySource::File { .. } => {
-                    if flags == 0 { super::user_flags::RW_NO_EXEC } else { flags }
+                    if flags == 0 { crate::mmu::user_flags::RW_NO_EXEC } else { flags }
                 }
-                _ => super::user_flags::RW_NO_EXEC,
+                _ => crate::mmu::user_flags::RW_NO_EXEC,
             };
             let Some(page_addr) = akuma_pmm::alloc_page_zeroed() else {
                 return false;
@@ -386,7 +386,7 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
                     let dst_off = pg_data_start - va;
                     let file_off = file_offset + (pg_data_start - segment_va);
                     let read_len = pg_data_end - pg_data_start;
-                    let page_ptr = super::phys_to_virt(page_frame.addr);
+                    let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
                     // SAFETY: `page_ptr` is the kernel mapping of a page just
                     // allocated here and not yet published to any page table, so
                     // this is the only reference to it; `dst_off + read_len` is
@@ -436,7 +436,7 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
                 // this loop has just confirmed unmapped, with a frame nothing else
                 // references yet.
                 let (table_frames, installed) =
-                    unsafe { super::map_user_page(va, page_frame.addr, map_flags) };
+                    unsafe { crate::mmu::map_user_page(va, page_frame.addr, map_flags) };
                 if let Some(owner) = owner {
                     if installed {
                         owner.address_space.track_user_frame(page_frame);

@@ -34,7 +34,6 @@ use elf::section::{SectionHeader, SectionHeaderTable};
 use elf::segment::{ProgramHeader, SegmentTable};
 use elf::symbol::SymbolTable;
 
-use crate::runtime::runtime;
 
 use super::types::{ELF64_EHDR_SIZE, ELF_MAGIC, ElfError};
 
@@ -78,7 +77,7 @@ fn file_read_exact(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, Elf
         return Ok(Vec::new());
     }
     let mut buf = alloc::vec![0u8; len];
-    let n = (runtime().read_at)(path, offset, &mut buf)
+    let n = (crate::vfs().read_at)(path, offset, &mut buf)
         .map_err(|_| ElfError::InvalidFormat("File read failed"))?;
     if n < len {
         return Err(ElfError::InvalidFormat("Short read"));

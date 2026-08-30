@@ -18,7 +18,7 @@
 //! directly instead; the one diagnostic print goes through the `log` facade
 //! (`akuma-net`'s pattern — see `src/klog.rs`) instead of `crate::safe_print!`.
 //! Everything else it touches (`akuma_exec::threading`, `akuma_exec::process`,
-//! `akuma_exec::mmu::user_access`, `akuma_primitives::errno`) was already a
+//! `akuma_exec::process::user_access`, `akuma_primitives::errno`) was already a
 //! regular crate dependency.
 //!
 //! # Closing the missing-syscall gap
@@ -37,7 +37,7 @@
 pub mod boot;
 pub mod sntp;
 
-use akuma_exec::mmu::user_access::{copy_to_user, read_user_into, write_user_val};
+use akuma_exec::process::user_access::{copy_to_user, read_user_into, write_user_val};
 use akuma_exec::threading::MAX_THREADS;
 use akuma_primitives::errno::negated::{EFAULT, EINVAL};
 // The four `Local*` ABI structs this module used to declare — `LocalTimespec`,

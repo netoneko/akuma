@@ -4,7 +4,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::mmu::{PAGE_SIZE, UserAddressSpace, user_flags};
+use akuma_mmap::{PAGE_SIZE, user_flags};
+use akuma_mmu::UserAddressSpace;
 
 use super::load::{LoadedElf, load_elf, load_elf_from_path};
 use super::types::{AuxEntry, DEBUG_ELF_LOADING, DeferredLazySegment, ElfError, auxv};
@@ -39,11 +40,11 @@ pub struct UserStack {
     pub stack_bottom: usize,
     pub stack_top: usize,
     pub sp: usize,
-    pub frames: Vec<crate::runtime::PhysFrame>,
+    pub frames: Vec<akuma_mmap::PhysFrame>,
 }
 
 impl UserStack {
-    pub fn new(stack_bottom: usize, stack_top: usize, frames: Vec<crate::runtime::PhysFrame>) -> Self {
+    pub fn new(stack_bottom: usize, stack_top: usize, frames: Vec<akuma_mmap::PhysFrame>) -> Self {
         Self {
             stack_bottom,
             stack_top,
@@ -66,7 +67,7 @@ impl UserStack {
             let chunk_len = core::cmp::min(bytes.len() - written, PAGE_SIZE - offset);
 
             unsafe {
-                let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset);
+                let dst = akuma_primitives::addr::phys_to_virt(self.frames[frame_idx].addr + offset);
                 core::ptr::copy_nonoverlapping(bytes.as_ptr().add(written), dst as *mut u8, chunk_len);
             }
             written += chunk_len;
@@ -77,7 +78,7 @@ impl UserStack {
         let frame_idx = (va - self.stack_bottom) / PAGE_SIZE;
         let offset = va % PAGE_SIZE;
         unsafe {
-            let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset) as *mut u8;
+            let dst = akuma_primitives::addr::phys_to_virt(self.frames[frame_idx].addr + offset) as *mut u8;
             *dst = 0;
         }
 
@@ -90,7 +91,7 @@ impl UserStack {
         let frame_idx = (self.sp - self.stack_bottom) / PAGE_SIZE;
         let offset = self.sp % PAGE_SIZE;
         unsafe {
-            let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset) as *mut u64;
+            let dst = akuma_primitives::addr::phys_to_virt(self.frames[frame_idx].addr + offset) as *mut u64;
             *dst = val;
         }
     }
@@ -106,7 +107,7 @@ impl UserStack {
             let chunk_len = core::cmp::min(data.len() - written, PAGE_SIZE - offset);
 
             unsafe {
-                let dst = crate::mmu::phys_to_virt(self.frames[frame_idx].addr + offset);
+                let dst = akuma_primitives::addr::phys_to_virt(self.frames[frame_idx].addr + offset);
                 core::ptr::copy_nonoverlapping(data.as_ptr().add(written), dst as *mut u8, chunk_len);
             }
             written += chunk_len;

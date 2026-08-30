@@ -1,0 +1,37 @@
+[package]
+name = "akuma-elf"
+version = "0.1.0"
+edition = "2024"
+description = "The ELF loader: parsing, PT_LOAD segment placement (eager or demand-paged), relocations, the dynamic interpreter, and the initial user stack"
+
+[lints]
+workspace = true
+
+[features]
+# Profile discriminator forwarded from the bin crate's `extreme` feature, via
+# `akuma-exec`. Selects the demand-paged segment loader and the page-by-page
+# interpreter load. See build.rs — the cfg is emitted from the `size` opt-level
+# *and* this feature, exactly as in `akuma-exec`.
+extreme = []
+
+# Real (shared-kernel) SMP: only reaches `akuma-bkl`, whose `enter_kernel` /
+# `leave_kernel` bracket the interpreter's whole-file read.
+smp-shared = ["akuma-bkl/smp-shared"]
+
+[dependencies]
+# `phys_to_virt` for the segment writes, and `safe_print!`.
+akuma-primitives = { path = "../akuma-primitives" }
+# `PhysFrame` and `PAGE_SIZE`.
+akuma-mmap = { path = "../akuma-mmap" }
+# `UserAddressSpace` — the loader maps its segments into one.
+#
+# The split plan (AKUMA_EXEC_SPLIT_AGAIN.md §3.2) proposed a trait here instead,
+# to avoid depending on a crate that did not exist yet. It exists now, and one
+# `UserAddressSpace` reference does not pay for a trait: the indirection would be
+# real and the decoupling notional, since a loader that cannot name an address
+# space cannot place a segment. Revisit if a second implementation ever appears.
+akuma-mmu = { path = "../akuma-mmu" }
+# `enter_kernel`/`leave_kernel` around the interpreter's whole-file read.
+akuma-bkl = { path = "../akuma-bkl" }
+elf = { version = "0.7", default-features = false }
+log = { version = "0.4", default-features = false }

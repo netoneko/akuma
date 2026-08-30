@@ -1065,7 +1065,7 @@ pub fn run_pselect6_exceptfds_test() {
         FileDescriptor,
     };
 
-    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+    let _bypass = akuma_exec::process::user_access::BypassValidationGuard::new();
 
     let tid = akuma_exec::threading::current_thread_id();
     let pid = 8041u32;
@@ -1153,7 +1153,7 @@ pub fn run_pselect6_registers_waker_test() {
         FileDescriptor,
     };
 
-    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+    let _bypass = akuma_exec::process::user_access::BypassValidationGuard::new();
 
     let tid = akuma_exec::threading::current_thread_id();
     let pid = 8042u32;
@@ -1223,7 +1223,7 @@ pub fn run_pselect6_eintr_test() {
         FileDescriptor,
     };
 
-    let _bypass = akuma_exec::mmu::user_access::BypassValidationGuard::new();
+    let _bypass = akuma_exec::process::user_access::BypassValidationGuard::new();
 
     let tid = akuma_exec::threading::current_thread_id();
     let pid = 8043u32;

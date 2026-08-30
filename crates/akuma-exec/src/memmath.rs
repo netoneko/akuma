@@ -1,63 +1,50 @@
-//! Memory arithmetic and the decisions built directly on it.
+//! The `SHARED_FILE_PAGES_ENABLED` gate over `akuma-mmap`'s sharing predicate.
 //!
-//! # Why this module exists
+//! # What is left here, and why only this
 //!
-//! What's left is the mapping predicates: does a page's AP bits give EL0 write
-//! access, and is a mapping eligible for the shared file-page cache. Both used
-//! to live in `src/` — the kernel binary, which no host test can reach — so
-//! they were checked by booting a VM instead of a unit test.
-//! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.11 has the full
-//! argument, including why this is a module in `akuma-exec` rather than a new
-//! crate: nothing outside `akuma-exec` and `src/` consumes it, so a crate would
-//! cut no `cargo tree` edge — the one criterion `akuma-primitives` exists to
-//! satisfy.
+//! This module used to be "memory arithmetic and the decisions built directly on
+//! it". Two rounds of extraction have taken almost all of it away, each time to
+//! the crate that already owned the concept:
 //!
-//! # It used to hold the PMM's arithmetic too
+//! - **The PMM's arithmetic** — the user-page reserve, the reclaim escalation's
+//!   decision (`next_reclaim_step`), the quarantine poison codec — went to
+//!   `akuma-pmm` in `docs/archive/PMM_EXTRACT.md` §7 Step 6, with its 8 host
+//!   tests. Genuinely PMM concepts, parked here only because no PMM crate
+//!   existed yet and `src/` was host-unreachable.
+//! - **The pure mapping predicate** — `mapping_is_read_only_to_user` — went to
+//!   `akuma_mmap::user_flags::is_read_only_to_user` on 2026-08-30
+//!   (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.3), joining `is_write`,
+//!   `is_exec` and `from_prot`, which were already there. It reads the `AP`
+//!   field of a PTE and nothing else, so it belongs with the vocabulary that
+//!   defines `AP`. It also stopped carrying a fourth private copy of `AP_MASK`
+//!   in the move.
 //!
-//! The user-page reserve, the reclaim escalation's decision, and the quarantine
-//! poison codec all lived here for a stretch (`docs/archive/PMM_EXTRACT.md` §5)
-//! — genuinely PMM concepts, parked in `akuma-exec` only because no PMM crate
-//! existed yet and `src/` was host-unreachable. They migrated to `akuma-pmm` for
-//! real in that plan's §7 Step 6, along with their 8 host tests (the reserve's 3
-//! and the poison codec's 4 portable ones; the escalation's decision had already
-//! moved in Step 4). Not everything followed: `poison_word_frame`, the thin
-//! wrapper that gates the codec on `config().pmm_uaf_quarantine` and supplies
-//! the *live* `mmu::ram_base()`/`ram_end()` window, needs this crate's `mmu` —
-//! it moved to `src/pmm.rs` instead, next to its one caller
-//! (`report_poison_value`), which already lived there for the identical reason.
-//!
-//! # The config gate
-//!
-//! `is_shareable_mapping` is gated by a kill switch, and the gate lives here
-//! with it rather than as a wrapper in `src/`: `ExecConfig` is *injectable*
-//! (`runtime::register_config_for_test`), so a gate is no reason to leave a
-//! decision unreachable. `ExecConfig::for_test()` sets it **on**, for the same
-//! reason it sets `syscall_debug_info_enabled` — a gate left off makes every
-//! test of the gated path skip the branch it exists to cover. The gated
-//! function delegates to a **pure predicate**
-//! ([`mapping_is_read_only_to_user`]) tested exhaustively on its own, and the
-//! gated wrapper is checked for agreeing with it.
+//! What could not follow is the **gate**: [`is_shareable_mapping`] is that
+//! predicate ANDed with `config().shared_file_pages_enabled`, and `akuma-mmap`
+//! has an empty `[dependencies]` table by design — it cannot read an
+//! `ExecConfig`. That line is the seam, and it is the honest one: the arithmetic
+//! is `akuma-mmap`'s, the kill switch is this crate's. The two tests below pin
+//! it, so logic that leaks back into the wrapper is visible.
 //!
 //! Fork's own copy-range math (`process::fork_code_start`,
 //! `process::fork_page_count_for_len`) stays next to `fork_process`, its only
-//! consumer; this module is for arithmetic shared across subsystems.
+//! consumer.
 
 use crate::mmu;
 use crate::runtime::config;
 
 // ============================================================================
-// Mapping predicates — this module's only section since Step 6 moved
-// everything else out (see the module doc).
+// The gated mapping predicate — all that is left here since 2026-08-30.
 // ============================================================================
 
-/// Pure: does a mapping with `map_flags` give EL0 **no write access**? True only
-/// for `AP_RO_ALL`, i.e. `mmu::user_flags::RO` and `RX`.
-#[must_use]
-#[inline]
-pub fn mapping_is_read_only_to_user(map_flags: u64) -> bool {
-    const AP_MASK: u64 = 3 << 6;
-    (map_flags & AP_MASK) == mmu::flags::AP_RO_ALL
-}
+/// Pure: does a mapping with `map_flags` give EL0 **no write access**?
+///
+/// **Moved to `akuma_mmap::user_flags::is_read_only_to_user`** on 2026-08-30
+/// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.3) — it is a pure function of
+/// that crate's own `AP`-field vocabulary and reads no kernel state. Kept as a
+/// re-export here so this module's own doc history stays followable; new call
+/// sites should name it through `mmu::user_flags`.
+pub use akuma_mmap::user_flags::is_read_only_to_user as mapping_is_read_only_to_user;
 
 /// Is a page mapped with `map_flags` eligible for the shared file-page cache?
 ///
@@ -65,10 +52,16 @@ pub fn mapping_is_read_only_to_user(map_flags: u64) -> bool {
 /// ELF data segments carrying relocations stay private. Gated by
 /// `config().shared_file_pages_enabled` (the `SHARED_FILE_PAGES_ENABLED` kill
 /// switch), which makes every page ineligible when off.
+///
+/// **This is the half of the old `memmath` that could not move down.** Its
+/// partner predicate went to `akuma-mmap`, whose `[dependencies]` table is empty
+/// by design — reading an `ExecConfig` is exactly what a crate with no
+/// dependencies cannot do. Splitting the pair along that line is the seam: the
+/// arithmetic is `akuma-mmap`'s, the kill switch is this crate's.
 #[must_use]
 #[inline]
 pub fn is_shareable_mapping(map_flags: u64) -> bool {
-    config().shared_file_pages_enabled && mapping_is_read_only_to_user(map_flags)
+    config().shared_file_pages_enabled && mmu::user_flags::is_read_only_to_user(map_flags)
 }
 
 #[cfg(test)]
@@ -77,24 +70,6 @@ mod tests {
 
     fn setup() {
         crate::runtime::register_config_for_test();
-    }
-
-    #[test]
-    fn only_user_read_only_mappings_are_shareable() {
-        assert!(mapping_is_read_only_to_user(mmu::user_flags::RO));
-        assert!(mapping_is_read_only_to_user(mmu::user_flags::RX));
-        assert!(!mapping_is_read_only_to_user(mmu::user_flags::RW));
-        assert!(!mapping_is_read_only_to_user(mmu::user_flags::RW_NO_EXEC));
-    }
-
-    /// The predicate must read *only* the AP field: a page that is RO to EL0 stays
-    /// shareable whatever its execute/attr bits say, and a writable one is never
-    /// rescued by them.
-    #[test]
-    fn predicate_ignores_bits_outside_the_ap_field() {
-        let other = mmu::flags::UXN | mmu::flags::PXN | mmu::flags::AF;
-        assert!(mapping_is_read_only_to_user(mmu::user_flags::RO | other));
-        assert!(!mapping_is_read_only_to_user(mmu::user_flags::RW | other));
     }
 
     /// **A non-executable mapping is never shareable.**
@@ -142,7 +117,8 @@ mod tests {
 
     /// With the gate injected **on**, the gated form must agree with the pure
     /// predicate for every flag combination — i.e. the gate adds nothing but the
-    /// kill switch.
+    /// kill switch. This is the test that pins the seam: if it ever fails, logic
+    /// has leaked into the wrapper that belongs in `akuma-mmap`.
     #[test]
     fn gated_shareable_agrees_with_the_predicate_when_enabled() {
         setup();
@@ -153,7 +129,10 @@ mod tests {
             mmu::user_flags::RW,
             mmu::user_flags::RW_NO_EXEC,
         ] {
-            assert_eq!(is_shareable_mapping(flags), mapping_is_read_only_to_user(flags));
+            assert_eq!(
+                is_shareable_mapping(flags),
+                mmu::user_flags::is_read_only_to_user(flags)
+            );
         }
     }
 }

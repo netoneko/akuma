@@ -1,0 +1,38 @@
+[package]
+name = "akuma-mmu"
+version = "0.1.0"
+edition = "2024"
+description = "Virtual memory: AArch64 page tables, UserAddressSpace, ASID allocation, TLB maintenance, and the per-core TTBR free gate"
+
+[lints]
+workspace = true
+
+[features]
+# Mirrors the bin crate's `syscall-debug-info`. OFF by default. Gates the
+# `[AS-NEW]`/`[AS-EXEC]`/`[AS-FREE]`/`[AS-DEFER]` lifecycle trace, the single
+# largest console producer in the tree (1,342 lines on a plain boot-suite run).
+#
+# It is a *feature* and not a hook, deliberately: the predicate it replaced
+# (`akuma_exec::process::lifecycle_trace_on`) was the only thing left keeping
+# this code coupled to the process table, and turning it into a `fn() -> bool`
+# would have converted a constant-foldable gate into a runtime indirect call on
+# every address-space create, exec and free. See
+# `docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.5.
+debug-info = []
+
+# Real (shared-kernel) SMP, forwarded from the bin crate. Only reaches
+# `akuma-bkl`, whose `current_core_id` this crate uses for the TTBR free gate.
+smp-shared = ["akuma-bkl/smp-shared", "akuma-primitives/smp-shared"]
+
+[dependencies]
+# irq masking, the console, phys_to_virt/virt_to_phys.
+akuma-primitives = { path = "../akuma-primitives" }
+# PhysFrame, PAGE_SIZE/PAGE_SHIFT, and the `flags`/`user_flags` PTE vocabulary.
+akuma-mmap = { path = "../akuma-mmap" }
+# Frame allocation and free for page tables and user pages.
+akuma-pmm = { path = "../akuma-pmm" }
+# `current_core_id`, for the per-core ACTIVE_L0/PREV_L0 free gate.
+akuma-bkl = { path = "../akuma-bkl" }
+spinning_top = "0.3"
+# Three `log::debug!` sites on the address-space free path ([FORK-DBG], [MMU]).
+log = { version = "0.4", default-features = false }

@@ -6,7 +6,7 @@
 use alloc::collections::BTreeMap;
 use super::BoxInfo;
 use super::hierarchy;
-use crate::process::Pid;
+use akuma_primitives::Pid;
 
 /// Check if a process in `source_box` can access/create boxes in `target_box`.
 ///
@@ -15,6 +15,7 @@ use crate::process::Pid;
 /// 2. A box can access itself
 /// 3. A box can access its descendants
 /// 4. Creator PID check as fallback
+#[must_use]
 pub fn can_access_box(
     registry: &BTreeMap<u64, BoxInfo>,
     source_box_id: u64,
@@ -33,11 +34,10 @@ pub fn can_access_box(
         return true;
     }
 
-    if let Some(target) = registry.get(&target_box_id) {
-        if target.creator_pid == source_pid {
+    if let Some(target) = registry.get(&target_box_id)
+        && target.creator_pid == source_pid {
             return true;
         }
-    }
 
     false
 }
@@ -46,6 +46,7 @@ pub fn can_access_box(
 ///
 /// Similar to `can_access_box` but also considers cascade implications.
 /// A box can kill its descendants (which will cascade to their children).
+#[must_use]
 pub fn can_kill_box(
     registry: &BTreeMap<u64, BoxInfo>,
     killer_box_id: u64,
@@ -67,6 +68,11 @@ pub fn can_kill_box(
 /// [`hierarchy::validate_nested_root`]).
 ///
 /// Returns the parent box id to record, or the reason the caller may not do this.
+/// `match`, not `if let`/`else`: the two arms are the two cases this function
+/// exists to tell apart — re-registration of a live box vs. creation of a new one
+/// — and each carries the comment explaining its rule. Collapsing it hides the
+/// symmetry.
+#[allow(clippy::single_match_else)]
 pub fn can_register_box(
     registry: &BTreeMap<u64, BoxInfo>,
     caller_box_id: u64,
@@ -119,6 +125,7 @@ fn validate_root_under_caller(
 /// Get the ordered list of box IDs to kill when cascade-killing `target_box_id`.
 /// Returns descendants in reverse depth order (deepest children first)
 /// so that cleanup proceeds leaf-to-root.
+#[must_use]
 pub fn cascade_kill_order(
     registry: &BTreeMap<u64, BoxInfo>,
     target_box_id: u64,
