@@ -9,16 +9,16 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 763
-- **Docs contributing at least one fix:** 247
+- **Total distinct fixes counted:** 767
+- **Docs contributing at least one fix:** 248
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 132 | 17.3% | 20 |
-| Memory & Virtual Memory | 122 | 16.0% | 39 |
-| Scheduler & Process Management | 79 | 10.4% | 22 |
-| SMP & Locking | 89 | 11.7% | 39 |
+| Syscall / ABI Compatibility Audits | 132 | 17.2% | 20 |
+| Memory & Virtual Memory | 122 | 15.9% | 39 |
+| Scheduler & Process Management | 79 | 10.3% | 22 |
+| SMP & Locking | 89 | 11.6% | 39 |
 | Networking | 58 | 7.6% | 22 |
 | Userspace Apps & Libraries | 37 | 4.8% | 20 |
 | Rump Kernel & Syscall Proxy | 26 | 3.4% | 6 |
@@ -27,10 +27,10 @@ from several subsystems under one write-up.
 | VFS & Filesystem | 27 | 3.5% | 17 |
 | Boot & Drivers | 24 | 3.1% | 9 |
 | Signals & Exceptions | 15 | 2.0% | 7 |
-| Misc / Cross-cutting | 29 | 3.8% | 7 |
+| Misc / Cross-cutting | 33 | 4.3% | 8 |
 | Console & Terminal | 32 | 4.2% | 11 |
 | Containers | 24 | 3.1% | 6 |
-| **Total** | **763** | **100.0%** | **247** |
+| **Total** | **767** | **100.0%** | **248** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -1178,7 +1178,14 @@ aren't recorded anywhere else.)
 - Even with that mask, a signal-woken thread rejoined the back of the round-robin run queue, and signal delivery had unbounded priority over resuming the syscall it interrupted (each handler return re-delivered the next pending signal immediately), so under a 10ms-cadence signal sender the interrupted syscall was starved indefinitely rather than merely raced; fixed via `SIGNAL_WAKE_PREEMPT` (runs a signal-woken thread on the next switch) plus `SIGFRAME_ACTIVE` (bounds delivery to one handler per unit of userspace progress, consulted by `rt_sigreturn`)
 
 
-## Misc / Cross-cutting (29 fixes, 7 docs)
+## Misc / Cross-cutting (33 fixes, 8 docs)
+
+### docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md
+(The `akuma-exec` crate split itself is a refactor and is not counted; these are the defects it surfaced and fixed along the way. The `akuma-bkl` dead-`RawRwSpinlock` deletion is a removal with no bug attached, and the `akuma-ext2` generation bug it points at is **open**, counted nowhere — see `AKUMA_EXT2_CLEANUP.md` in the zero-fixes section.)
+- `test_utimensat`'s "unreadable `times` pointer" was the hardcoded constant `0xdead_0000` (3.48 GiB); RAM starts at `0x4000_0000`, so from `MEMORY=4096` upward that address sits inside the kernel RAM identity map, the copy succeeds and the case returns 0 — panicking the whole boot suite on exactly the 6-16 GB configurations self-hosting uses, while passing at 2048. Not a kernel hole: the fixture sets `BYPASS_VALIDATION` (the boot suite has no user address space, so its `cstr` buffers *are* kernel addresses), so `validate_user_range` short-circuits and only the copy trampoline — which fires on unmapped addresses only — can raise `EFAULT`. The address now derives from `mmu::kernel_va_end()`, which scales with detected RAM, plus a twelfth case asserting it is genuinely unmapped so a future mapping reports the precondition rather than a confusing `utimensat` failure
+- `akuma-pmm`'s zero-and-clean loop hardcoded `CACHE_LINE_SIZE = 64` as its `dc cvac` step, in three byte-identical copies, which **under-cleans** on any core whose `CTR_EL0.DminLine` is below 64 bytes — the loop strides past lines it never cleans, so a device or another core reading the frame outside this core's cache sees stale data instead of the zeros just written; the single surviving copy steps by the runtime `DminLine` (the architectural minimum, so it can only ever over-clean)
+- `map_segment_eager`'s page-span expression `(vaddr + memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)` returned **1** page for a zero-length `PT_LOAD` at an unaligned `vaddr` and **0** at an aligned one — the same empty segment mapped a frame or not depending only on its alignment; `akuma_mmap::span::segment_span` returns 0 both ways
+- `scripts/verify_trim.py --tier 4` (the redis memtest) died with `UnboundLocalError: cannot access local variable 'port'` before booting anything — `wait_for_marker(log_path, port=port, proc=qemu)` read `port` one line before its assignment and named `qemu` where the local is `vm`; the tier is opt-in rather than part of `--tier all`, which is how it stayed broken unnoticed
 
 ### docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md
 (Host-side tooling for the AWS metal Firecracker host, `../akuma-terraform`. §9's eight bugs; the §10 Akuma-side results are verifications of fixes counted elsewhere, not new fixes, and §7's traps are AWS behaviours rather than bugs in this project.)
@@ -1336,6 +1343,8 @@ aren't recorded anywhere else.)
 ---
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
+
+Also scanned 2026-08-30 (the `akuma-exec` split branch, ahead of closing it): AKUMA_EXT2_CLEANUP (an `unsafe` audit and cleanup plan for `akuma-ext2` — **nothing in it is implemented**. Its §4.2a is a real, root-caused defect but **Status: OPEN**: the orphaned-write-lock recovery stores a bare tid in `write_lock_owner`, and tids are recycled 256-slot indices, so if the dead owner's slot is reissued before the next filesystem operation finishes its 10,000-spin poll, `is_thread_dead(tid)` reads the *new* occupant and the recovery never fires — the mechanism that exists to prevent a permanently wedged filesystem silently stops working in exactly the case it was built for. Same class `WakeHandle` was created to fix for wait queues. Fail-to-recover only, never a spurious unlock. Not fixed, counted nowhere; the four struct-blit/layout-assertion items in its §2 and §5 are likewise a plan, not a landing.) AKUMA_EXEC_SPLIT_AGAIN's own crate-split content is a refactor and is not counted — only the four defects it surfaced along the way are, under Misc / Cross-cutting above.
 
 Also scanned 2026-08-27 (the `obviously-more-fixes` branch, ahead of closing it for the syscalls-refactor branch): AKUMA_SYSCALL_PERFORMANCE_AUDIT (the `getpid` floor taken 410 ns → 150 ns by a per-thread identity cache — an optimization with no defect attached, counted the same way LTO_RELEASE_PROFILE and BKL_RUSTC_SCALING_BASELINE are; its four deferred follow-ups are open, and the SMP>1 soak it defers is IDENTITY_CACHE_SMP_REVIEW, whose Finding A was since fixed 2026-08-29 and is counted under AKUMA_EXTRACT_SYSCALLS, leaving only its Finding B open), EXT2_READ_PATH_STAGE_PROFILE ("instrument landed, no behaviour changed" by its own status line — the `read-profile` feature and two probes, nothing on the read path modified), EXT2_WRITEBACK_DESIGN (in-flight design record; its finding F-1 is fixed by FPCACHE_MOUNT_IDENTITY, counted there, and its D-9 capacity half and §237 "what is still open" list remain open), USER_COPY_BYTE_LOOP (widening the user-copy byte loop — a measured optimization, no defect; its own header retracts the "~17 µs of fixed cost" claim as inferred rather than measured), and USER_MANAGEMENT_AND_BOXES ("Design investigation. Nothing here is implemented."). USER_COPY_FOLD gained only a cross-reference note pointing at USER_COPY_BYTE_LOOP — no change to its existing count. (ERROR_HANDLING_AUDIT, mentioned below as carrying fix shapes rather than fixes, **since gained four real fixes on 2026-08-30** and now has its own subsection under Misc / Cross-cutting. ASID_EXHAUSTION_TIGHT_THREAD_LOOP is root-caused and measured but **Status: OPEN** — `pthread_create` fails at ~251 serial iterations in a tight loop because ASIDs leak from address spaces whose `Drop` never ran, against `MAX_ASID = 256`; not fixed, counted nowhere.)
 

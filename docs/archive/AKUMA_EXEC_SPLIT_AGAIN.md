@@ -896,6 +896,14 @@ better starting position than the same extraction attempted before this split.
 - The rest of the `akuma-cpu` conversions: `akuma-mmu` (33 `asm!` sites),
   `src/exceptions.rs` (48), `akuma-timer` (9), `akuma-exec` (15). Only
   `akuma-pmm` has been converted.
+- **`scripts/verify_trim.py --tier 4` had never run.** Fixed 2026-08-30: the
+  redis-memtest tier died with `UnboundLocalError: cannot access local variable
+  'port'` before booting anything — `wait_for_marker(log_path, port=port,
+  proc=qemu)` referenced `port` one line *before* its assignment, and `qemu`
+  where the local is `vm`. Tier 4 is opt-in (deliberately excluded from
+  `--tier all` because it builds and boots a different profile), which is exactly
+  how it stayed broken without anyone noticing: the tier nobody runs by default is
+  the tier that rots.
 - An in-guest `cargo build` that runs to completion. The attempt on 2026-08-30
   compiled ~10 crates and then died at 461 s on an **ssh channel timeout**
   (exit 255), with the guest kernel showing 0 panics and 0 SIGSEGV — a harness

@@ -592,10 +592,14 @@ def tier4_redis_memtest(results, memory, logdir, build):
     vm = subprocess.Popen([os.path.join(REPO, "overlays", "devbox", "run-smoltcp.sh")],
                           cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT)
     try:
-        if not wait_for_marker(log_path, port=port, proc=qemu):
+        # `port` must be bound BEFORE the readiness wait, and the process handle is
+        # `vm` — this line read `port=port, proc=qemu` until 2026-08-30, so tier 4
+        # died with `UnboundLocalError` before ever booting anything. It is opt-in
+        # (not part of `--tier all`), which is how it stayed broken.
+        port = 2222
+        if not wait_for_marker(log_path, port=port, proc=vm):
             results["redis.stage"] = "BOOT FAILED"
             return
-        port = 2222
 
         # devbox.img fills across sessions and ENOSPC surfaces as an `apk add` network
         # error, so record the free space rather than discovering it the hard way.
