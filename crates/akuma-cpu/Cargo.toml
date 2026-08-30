@@ -1,0 +1,12 @@
+[package]
+name = "akuma-cpu"
+version = "0.1.0"
+edition = "2024"
+description = "AArch64 instructions that are safe to execute, behind safe functions: barriers, cache and TLB maintenance, core parking, and read-only system registers"
+
+[lints]
+workspace = true
+
+[dependencies]
+# None, deliberately. Everything here is one instruction; a dependency would put
+# something between a caller and a `dsb`.

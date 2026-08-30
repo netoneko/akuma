@@ -4,6 +4,37 @@
 //! [`OnceCopy`] for a `Copy` value read from anywhere, [`Registered`] for a
 //! callback table with a diagnostic, and [`TakeOnce`] for a large `static`
 //! buffer that exactly one owner needs `&'static mut` to.
+//!
+//! # Why this is its own crate
+//!
+//! Split out of `akuma-primitives` on 2026-08-30. It was that crate's last five
+//! `unsafe` sites and the only ones that were **not** platform-specific — the
+//! other sixteen are system-register `asm!` and MMIO. Grouping a
+//! `UnsafeCell<MaybeUninit<T>>` with `msr daifset` under one crate meant neither
+//! could be reviewed as one idea.
+//!
+//! # Why it will never take a dependency
+//!
+//! [`Registered`] is the mechanism by which every *other* extracted crate calls
+//! back up into the kernel without a dependency cycle — `akuma-bkl`'s yield hook,
+//! `akuma-mmu`'s `SchedHooks`, `akuma-elf`'s `VfsHooks`, `akuma-pmm`'s
+//! `PmmHooks`, `akuma-ext2`'s thread hooks. Nine crates plus the bin use it, so
+//! anything this crate depended on would become a de-facto dependency of the
+//! whole tree. `core` only, permanently.
+//!
+//! # Why the `unsafe` is irreducible
+//!
+//! The obvious safe alternative is `Spinlock<Option<T>>`. It would be a real
+//! regression: [`Registered::get`] sits on the hottest indirection in the kernel
+//! — every `runtime()` call goes through one — and it is a relaxed atomic load
+//! plus a read out of an already-initialised cell. Trading that for a lock
+//! acquire on every syscall's callback lookup is not a safety win worth having.
+//!
+//! # The name
+//!
+//! Not even once.
+
+#![cfg_attr(not(test), no_std)]
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;

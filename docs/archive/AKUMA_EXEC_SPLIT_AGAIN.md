@@ -775,3 +775,122 @@ separate crate, so `#![forbid]` on the lib does not cover it. That would put
 `akuma-pmm`'s 1,139 production lines inside a `forbid` boundary. The open question
 is whether `dc cvac` and raw-frame zeroing belong in the dependency-free leaf, or
 whether that is just relocating the problem to the crate everything depends on.
+
+---
+
+## 8. Deferred work
+
+Scoped out deliberately on 2026-08-30: this document is about `akuma-exec`, and
+everything below is about the tree around it. Recorded here because the survey
+work is done and re-deriving it costs more than reading it.
+
+### 8.1 `akuma-not-even-once` — LANDED
+
+Not deferred; noted here because it is the one piece of the leaf that did move.
+`akuma_primitives::once` (`OnceCopy`, `Registered`, `TakeOnce`) is now
+`crates/akuma-not-even-once`, re-exported from `akuma-primitives` so all nine
+consuming crates plus the bin are unchanged. It took `akuma-primitives` from 19
+production `unsafe` sites to 14, and separates a `UnsafeCell<MaybeUninit<T>>`
+from the system-register `asm!` it was sharing a crate with.
+
+It has **no dependencies and must never gain any**: `Registered<T>` is the
+mechanism every extracted crate uses to call back up into the kernel
+(`akuma-bkl`'s yield hook, `akuma-mmu`'s `SchedHooks`, `akuma-elf`'s `VfsHooks`,
+`akuma-pmm`'s `PmmHooks`, `akuma-ext2`'s thread hooks), so anything it depended on
+would become a de-facto dependency of the whole tree.
+
+Its five `unsafe` sites are irreducible for a *performance* reason, which is worth
+stating because it is not the usual one: the safe alternative is
+`Spinlock<Option<T>>`, and `Registered::get()` is on the hottest indirection in
+the kernel — every `runtime()` call goes through one.
+
+### 8.2 The `asm!` survey
+
+~230 `asm!` sites tree-wide. By family, with the crate that owns them:
+
+| family | sites | where |
+|---|---:|---|
+| barriers `dsb`/`isb` | 52 | akuma-mmu 25, src 22, pmm 3 |
+| park `wfi`/`wfe`/`sev` | 28 | src 21, exec 5 |
+| `daif` mask | 25 | src 18, primitives 7 |
+| cache `dc`/`ic` | 16 | src 11, pmm 3, mmu 2 |
+| exception state `esr`/`elr`/`far`/`spsr` | 16 | src only |
+| timer `cntv`/`cntfrq` | 12 | akuma-timer 8, src 4 |
+| `ttbr` | 10 | src 6, mmu 2, exec 2 |
+| identity `mpidr`/`tpidr` | 10 | src 6, primitives 2, exec 2 |
+
+**The headline: roughly 160 of the ~230 are reads or side-effect-only
+instructions.** Executing `dsb ish`, `isb`, `ic iallu`, `dc cvau`, `tlbi`, `wfi`,
+or reading `ESR_EL1` cannot violate memory safety. They carry `unsafe` for a
+*syntactic* reason — `asm!` is unconditionally unsafe — not a semantic one. That
+is the same defect `akuma_primitives::mmio` was built to fix for device registers
+("`unsafe` marking the wrong thing"), at about ten times the scale.
+
+The ~70 that stay genuinely unsafe are the writes that change control flow or
+address space: `msr elr_el1`/`spsr_el1` (resolve-and-retry), TTBR writes,
+`msr vbar_el1`, `msr tpidr_el1`/`tpidrro_el0`, `mov sp`, raw `ldr`/`str`.
+
+**This also corrects an earlier idea in this document.** §8's first framing was to
+split an `akuma-cpu` out of `akuma-primitives`. The survey says that is close to
+pointless on its own: only **12 of ~230** sites are in `akuma-primitives`. The
+value is in the wrapper being available to `akuma-mmu` (33), `src/exceptions.rs`
+(48), `akuma-pmm` and `akuma-timer` — the leaf is a rounding error.
+
+### 8.3 `akuma-cpu` — written, tested, **not wired to anything**
+
+`crates/akuma-cpu` exists and is green (3 host tests), with safe wrappers for
+`barrier::{dsb_ish, dsb_ishst, dsb_sy, isb}`, `cache::{dc_cvau, dc_cvac, ic_ivau,
+ic_iallu, line_size}`, `tlb::{vmalle1, vmalle1is, vaae1, vaae1is, aside1is}`,
+`park::{wfi, wfe, sev, nop}` and 15 read-only `sysreg::*` accessors. Deliberately
+absent: every register **write** that changes control flow or address space.
+
+**No crate depends on it yet.** Converting consumers is the actual work and was
+not started. An unconsumed crate is dead weight until then — either wire it or
+delete it; do not leave it drifting.
+
+One trap it already caught, recorded so the next person does not repeat it: the
+`cfg` gate must be **`target_os = "none"`, not `target_arch = "aarch64"`**. The
+development host *is* `aarch64-apple-darwin`, so a `target_arch` gate is true
+under `cargo test`, the wrappers really execute, and `tlbi`/`dc cvau`/
+`mrs esr_el1` are EL1-only — the first host test died with `SIGILL`. Every
+bare-metal gate in this tree keys on `target_os = "none"` for this reason.
+
+Expected effect if wired: `akuma-mmu` sheds ~27 of its 71 sites, and
+**`akuma-pmm`'s `dc cvac` blocker disappears** — that was the thing standing
+between it and `forbid` (§7.9's last section). `akuma-pmm` would then need only
+its four `write_bytes` zeroing blocks and the one UAF test resolved.
+
+### 8.4 Extracting `src/exceptions.rs`
+
+Attractive, and **the `asm!` is not what makes it hard.** Measured: 2,984
+production code lines, 0% test coverage, 48 `asm!` sites — of which ~40 are
+reads/barriers that §8.3's wrappers would absorb, leaving ~8 genuine control-flow
+writes (`msr elr_el1`, `msr vbar_el1`, `msr tpidr_el1`).
+
+The blocker is coupling. What the fault handler reaches into:
+
+```
+124 akuma_exec::process     97 akuma_exec::mmu        79 crate::pmm
+ 77 akuma_exec::threading   25 akuma_exec::bkl        17 crate::syscall
+ 16 crate::config            8 akuma_exec::sync        7 crate::gic
+  6 crate::vfs               6 crate::smp_shared       4 crate::file_page_cache
+```
+
+That is ~380 references across eleven subsystems, and unlike `akuma-elf` (three
+call sites) or `akuma-mmu` (a two-item vtable) there is no thin seam visible from
+outside. The honest read is that `exceptions.rs` is not one body of code with a
+few dependencies; it is the place where every subsystem's fault path meets, and
+extracting it means first deciding what the *handler* owns versus what it merely
+calls. That analysis has not been done.
+
+What would make it durable, and is worth doing regardless: the crates it would
+need — `akuma-cpu`, `akuma-mmu`, `akuma-bkl` — now exist and are stable. A future
+`akuma-exceptions` would sit on those three plus `akuma-exec`, which is a far
+better starting position than the same extraction attempted before this split.
+
+### 8.5 Also still open, from §7
+
+- The ThinLTO inlining measurement (§7.7) — the -214 KB `.text` is un-measured
+  and is a suspected fault-path regression, not a win.
+- `akuma-pmm`'s `forbid` (§7.9), which §8.3 would partly unblock.
+- The `threading` <-> `process` cycle (§4), untouched by design.

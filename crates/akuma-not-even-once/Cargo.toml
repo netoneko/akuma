@@ -1,0 +1,16 @@
+[package]
+name = "akuma-not-even-once"
+version = "0.1.0"
+edition = "2024"
+description = "Single-shot, lock-free cells for boot-registered values: OnceCopy, Registered, TakeOnce"
+
+[lints]
+workspace = true
+
+[dependencies]
+# None, and this one is structural rather than incidental. This crate is the
+# mechanism every *other* extracted crate uses to call back up into the kernel
+# (`akuma-bkl`'s yield hook, `akuma-mmu`'s SchedHooks, `akuma-elf`'s VfsHooks,
+# `akuma-pmm`'s PmmHooks, `akuma-ext2`'s thread hooks...). Nine crates plus the
+# bin depend on it, so anything it depended on would become a de-facto dependency
+# of the whole tree. It uses `core` and nothing else.

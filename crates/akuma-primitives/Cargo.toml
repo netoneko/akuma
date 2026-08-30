@@ -29,3 +29,8 @@ no-bkl-vfs = []
 # so anything added here is added to the whole tree's dependency closure. If a
 # primitive needs a crate, it does not belong here.
 [dependencies]
+# The boot-registration cells (`OnceCopy`/`Registered`/`TakeOnce`), split out
+# 2026-08-30 — they were this crate's last non-platform `unsafe`. Re-exported
+# from `lib.rs`, so the nine crates that use them are unchanged. This is this
+# crate's only dependency, and it is on a crate that itself has none.
+akuma-not-even-once = { path = "../akuma-not-even-once" }

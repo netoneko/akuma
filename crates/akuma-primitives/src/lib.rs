@@ -48,7 +48,6 @@ pub mod inode_pin;
 pub mod irq;
 pub mod mmio;
 pub mod net_runtime;
-pub mod once;
 pub mod preempt;
 pub mod toggled_guard;
 
@@ -61,7 +60,12 @@ pub use irq::{
     DAIF_I_MASKED, IrqGuard, irq_restore, irq_save_mask, mask_irqs_sync, read_daif, unmask_irqs,
     unmask_irqs_sync, with_irqs_disabled,
 };
-pub use once::{OnceCopy, Registered, TakeOnce};
+/// The single-shot boot-registration cells — **moved to `akuma-not-even-once`
+/// on 2026-08-30**, where their `UnsafeCell` lives apart from this crate's
+/// system-register `asm!`. Re-exported here (and as `primitives::once`) so all
+/// nine consuming crates resolve unchanged.
+pub use akuma_not_even_once as once;
+pub use akuma_not_even_once::{OnceCopy, Registered, TakeOnce};
 pub use net_runtime::{NetRuntime, register as register_net_runtime, runtime as net_runtime, try_runtime as try_net_runtime};
 pub use inode_pin::InodePin;
 
