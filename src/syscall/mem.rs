@@ -437,7 +437,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             proc.with_address_space(|aspace| {
                 for i in 0..pages {
                     let va = addr + i * 4096;
-                    let _ = aspace.unmap_page(va);
+                    aspace.unmap_page(va);
                 }
             });
         }
@@ -800,7 +800,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                         // last reference; an aliased/shared PA is freed by its
                         // surviving owner instead.
                         Some(&frame) => {
-                            let _ = aspace.unmap_page(va);
+                            aspace.unmap_page(va);
                             if aspace.remove_user_frame(frame) {
                                 to_free.push(frame);
                             }
@@ -1267,7 +1267,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
             for i in 0..pages {
                 let va = addr + i * 4096;
                 if aspace.is_mapped(va) {
-                    let _ = aspace.update_page_flags_no_flush(va, new_flags);
+                    aspace.update_page_flags_no_flush(va, new_flags);
                     any_updated = true;
                 }
             }

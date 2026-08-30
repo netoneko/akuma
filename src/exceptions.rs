@@ -2320,8 +2320,8 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         // PTE permission edits under `as_lock` (`with_address_space`); the
         // icache invalidates ride in the same short hold to keep the old order.
         proc.with_address_space(|aspace| {
-            let _ = aspace.update_page_flags(handler_va, akuma_exec::mmu::user_flags::RX);
-            let _ = aspace.update_page_flags(restorer_va, akuma_exec::mmu::user_flags::RX);
+            aspace.update_page_flags(handler_va, akuma_exec::mmu::user_flags::RX);
+            aspace.update_page_flags(restorer_va, akuma_exec::mmu::user_flags::RX);
             aspace.invalidate_icache_for_page_va(handler_va);
             aspace.invalidate_icache_for_page_va(restorer_va);
         });

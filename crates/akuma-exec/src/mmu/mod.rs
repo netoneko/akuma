@@ -1318,22 +1318,32 @@ impl UserAddressSpace {
         unsafe { l3_slot_in(phys_to_virt(self.l0_frame.addr) as *mut u64, va) }
     }
 
-    pub fn unmap_page(&mut self, va: usize) -> Result<(), &'static str> {
-        let r = self.unmap_page_no_flush(va);
+    /// Clear the L3 PTE for `va` and flush its TLB entry.
+    ///
+    /// Infallible, and returns `()` rather than a `Result` since 2026-08-30. It
+    /// used to return `Result<(), &'static str>` that was **structurally always
+    /// `Ok`** — an unmapped or already-invalid `va` takes the `else { return }`
+    /// path, which is the normal case for `MAP_FIXED` over a lazy range, not an
+    /// error. Every caller wrote `let _ = `, and the audit that found them
+    /// initially read those as swallowed failures. They were not; the signature
+    /// was. A `Result` no implementation can populate teaches callers that
+    /// checking is optional here, which is the habit that makes a *real*
+    /// discarded error elsewhere look ordinary
+    /// (`docs/archive/ERROR_HANDLING_AUDIT.md` §4.2).
+    pub fn unmap_page(&mut self, va: usize) {
+        self.unmap_page_no_flush(va);
         flush_tlb_page(va);
-        r
     }
 
     /// Clear the L3 PTE for `va` **without** flushing the TLB.  The caller must
     /// issue `flush_tlb_range_all_asid` (or equivalent) over the range before
     /// the unmapped VAs could be accessed again.  Used by `munmap`/teardown to
     /// batch one barrier per region instead of one per page.
-    pub fn unmap_page_no_flush(&mut self, va: usize) -> Result<(), &'static str> {
+    pub fn unmap_page_no_flush(&mut self, va: usize) {
         let _irq_guard = IrqGuard::new();
-        let Some(pte) = self.l3_slot(va) else { return Ok(()) };
+        let Some(pte) = self.l3_slot(va) else { return };
         // Unconditional: this copy has never read the leaf before clearing it.
         unsafe { pte.write_volatile(0); }
-        Ok(())
     }
 
     /// Unmap a page and return its physical frame, also removing it from user_frames.
@@ -1424,9 +1434,9 @@ impl UserAddressSpace {
 
     /// Update the permission bits of an existing L3 page table entry.
     /// Preserves the physical address and fixed flags, replaces only user permission bits.
-    pub fn update_page_flags(&mut self, va: usize, new_flags: u64) -> Result<(), &'static str> {
+    /// Infallible; returns `()` since 2026-08-30 — see [`Self::unmap_page`].
+    pub fn update_page_flags(&mut self, va: usize, new_flags: u64) {
         self.update_page_flags_inner(va, new_flags, true);
-        Ok(())
     }
 
     /// Same as `update_page_flags` but skips the TLB flush.
@@ -1434,10 +1444,10 @@ impl UserAddressSpace {
     /// Use when updating a large range of pages (e.g. mprotect over many pages).
     /// After calling this for all pages, issue a single `flush_tlb_range` or
     /// `flush_tlb_asid` to make the permission changes visible to userspace.
-    pub fn update_page_flags_no_flush(&mut self, va: usize, new_flags: u64) -> Result<(), &'static str> {
+    /// Infallible; returns `()` since 2026-08-30 — see [`Self::unmap_page`].
+    pub fn update_page_flags_no_flush(&mut self, va: usize, new_flags: u64) {
         // No TLB flush — caller must call flush_tlb_range after the batch.
         self.update_page_flags_inner(va, new_flags, false);
-        Ok(())
     }
 
     /// The body behind the two `update_page_flags*` variants, which differed only in

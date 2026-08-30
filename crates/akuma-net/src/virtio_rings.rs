@@ -150,11 +150,19 @@ unsafe fn tx_buf(slot: usize) -> *mut u8 {
 
 /// A whole frame slot as a mutable slice.
 ///
+/// Returns a raw slice pointer, not `&'static mut [u8]`, since 2026-08-30. The
+/// reference form let two calls with the same `slot` mint two `&mut` aliases to
+/// the same bytes — UB by the language's rules whether or not the device races
+/// them, and an obligation no caller could discharge because the `'static`
+/// lifetime outlives every lock hold that was supposed to make it safe. Callers
+/// now build a reference at the point of use, so its lifetime ends with the
+/// borrow instead of the program (`docs/archive/ERROR_HANDLING_AUDIT.md` §5.1).
+///
 /// # Safety
 /// `slot < RX_RING` and the caller holds `NETWORK`.
 #[must_use]
-pub unsafe fn rx_frame(slot: usize) -> &'static mut [u8] {
-    unsafe { core::slice::from_raw_parts_mut(rx_buf(slot), FRAME_BUF) }
+pub unsafe fn rx_frame(slot: usize) -> *mut [u8] {
+    unsafe { core::ptr::slice_from_raw_parts_mut(rx_buf(slot), FRAME_BUF) }
 }
 
 /// The discard buffer for a frame with no slot, as a mutable slice.
@@ -162,9 +170,11 @@ pub unsafe fn rx_frame(slot: usize) -> &'static mut [u8] {
 /// # Safety
 /// Caller holds `NETWORK`. The contents are never read back — see
 /// [`TX_DISCARD`].
+/// Safe for the same reason as `smoltcp_net::rx_buffer`: forming the pointer is
+/// safe, dereferencing it is not, and only the caller can honour the contract.
 #[must_use]
-pub unsafe fn tx_discard() -> &'static mut [u8] {
-    unsafe { core::slice::from_raw_parts_mut((&raw mut TX_DISCARD).cast::<u8>(), FRAME_BUF) }
+pub fn tx_discard() -> *mut [u8] {
+    core::ptr::slice_from_raw_parts_mut((&raw mut TX_DISCARD).cast::<u8>(), FRAME_BUF)
 }
 
 /// A whole transmit slot as a mutable slice.
@@ -172,8 +182,8 @@ pub unsafe fn tx_discard() -> &'static mut [u8] {
 /// # Safety
 /// `slot < TX_RING` and the caller holds `NETWORK`.
 #[must_use]
-pub unsafe fn tx_frame(slot: usize) -> &'static mut [u8] {
-    unsafe { core::slice::from_raw_parts_mut(tx_buf(slot), FRAME_BUF) }
+pub unsafe fn tx_frame(slot: usize) -> *mut [u8] {
+    unsafe { core::ptr::slice_from_raw_parts_mut(tx_buf(slot), FRAME_BUF) }
 }
 
 // ============================================================================
@@ -211,7 +221,7 @@ impl RxRing {
             // SAFETY: `slot < RX_RING`; the caller holds `NETWORK`. The buffer
             // stays untouched by us until `receive_complete` hands it back,
             // which is the borrow `VirtIONetRaw::receive_begin` requires.
-            let buf = unsafe { rx_frame(slot) };
+            let buf = unsafe { &mut *rx_frame(slot) };
             match unsafe { dev.receive_begin(buf) } {
                 Ok(token) => {
                     crate::nicstat::record_rx_begin(t);
@@ -243,7 +253,7 @@ impl RxRing {
         // SAFETY: `slot` came from our own table, so it is in range, and this is
         // the same buffer that was passed to `receive_begin` for `token` —
         // which is what `receive_complete` requires.
-        let buf = unsafe { rx_frame(slot) };
+        let buf = unsafe { &mut *rx_frame(slot) };
         let (hdr_len, pkt_len) = unsafe { dev.receive_complete(token, buf) }.ok()?;
         self.tokens[slot] = None;
 

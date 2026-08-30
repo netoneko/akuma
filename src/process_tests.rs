@@ -637,6 +637,7 @@ pub fn run_all_tests() {
 
     // Deferred kill (smp-shared): pending kill doesn't strand locks
     test_deferred_kill_does_not_strand_locks();
+    test_pending_kill_interrupts_blocking_wait();
 
     // exit_group ordering fix (kill siblings before close_all, yield after)
     test_exit_group_kills_siblings_before_close_all();
@@ -5836,7 +5837,7 @@ fn test_munmap_spans_multiple_eager_regions() {
                         let va = base + i * 0x1000;
                         match frames.get(i) {
                             Some(&f) => {
-                                let _ = p.address_space.unmap_page(va);
+                                p.address_space.unmap_page(va);
                                 if p.address_space.remove_user_frame(f) {
                                     crate::pmm::free_page(f);
                                 }
@@ -6795,8 +6796,7 @@ fn test_stale_write_fault_absorbed() {
 
     // A changed PTE means real work happened in between — the same shape a CoW
     // break produces — so the budget starts over instead of staying spent.
-    assert!(p.address_space.update_page_flags(WRITABLE_VA, user_flags::RW_NO_EXEC).is_ok(),
-        "flag update failed");
+    p.address_space.update_page_flags(WRITABLE_VA, user_flags::RW_NO_EXEC);
     assert!(absorbed(WRITABLE_VA), "a changed PTE must get a fresh retry budget");
 
     if let Some(f) = p.address_space.unmap_and_free_page(WRITABLE_VA) { crate::pmm::free_page(f); }
@@ -9182,10 +9182,10 @@ fn test_update_page_flags_rw_to_rx_clears_uxn() {
         crate::safe_print!(64, "[Test] update_page_flags_rw_rx FAILED: RW_NO_EXEC should set UXN\n");
         return;
     }
-    if p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX).is_err() {
-        crate::safe_print!(64, "[Test] update_page_flags_rw_rx FAILED: update_page_flags\n");
-        return;
-    }
+    // The edit is infallible; the read-back below is what actually proves it
+    // landed. (This used to test `.is_err()` on a Result that was structurally
+    // always `Ok` — a branch that could never be taken.)
+    p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
     let Some(e2) = p.address_space.read_l3_page_entry(va) else {
         crate::safe_print!(64, "[Test] update_page_flags_rw_rx FAILED: read pte after RX\n");
         return;
@@ -9198,7 +9198,7 @@ fn test_update_page_flags_rw_to_rx_clears_uxn() {
         );
         return;
     }
-    let _ = p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
+    p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
     let Some(e3) = p.address_space.read_l3_page_entry(va) else {
         crate::safe_print!(64, "[Test] update_page_flags_idempotent_rx FAILED: read\n");
         return;
@@ -9254,8 +9254,8 @@ fn test_kernel_identity_va_walk_stops_at_block() {
     let victim = (mmu::phys_to_virt(va & !0x1F_FFFF) as usize + (((va >> 12) & 0x1FF) * 8)) as *mut u64;
     let before = unsafe { core::ptr::read_volatile(victim) };
 
-    let _ = p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
-    let _ = p.address_space.unmap_page_no_flush(va);
+    p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+    p.address_space.unmap_page_no_flush(va);
 
     let after = unsafe { core::ptr::read_volatile(victim) };
     if before != after {
@@ -14269,6 +14269,92 @@ fn test_kill_thread_group_terminates_before_cleanup() {
 /// was preempted mid-critical-section leaked its spinlocks (BLOCK_DEVICE).
 /// Under smp-shared, kill_thread_group posts `request_thread_kill` and the
 /// sibling self-terminates at its EL1→EL0 boundary instead.
+/// A pending deferred-kill must END a blocking wait, not merely wake it.
+///
+/// `request_thread_kill` wakes the target so it reaches its EL1→EL0 boundary and
+/// self-terminates. A thread blocked in an untimed wait wakes, re-evaluates, finds
+/// no signal and no readiness, and parks again — it never reaches a boundary, so
+/// before 2026-08-30 it could only die when `kill_thread_group`'s 2 s
+/// `KILL_GRACE_US` expired and hard-terminated it. Measured cost: 60 `[ktg] grace
+/// expired` lines in a 90 s guest `cargo` build, each a full 2 s stall in
+/// `exit_group`. See `docs/archive/KTG_GRACE_EXPIRY_KILL_INTERRUPT.md`.
+///
+/// Both readers are asserted because they are separate code paths: the yarn-driven
+/// families (epoll/ppoll/pselect/socket) go through
+/// `should_interrupt_blocking_syscall`, while `sys_futex` peeks against an explicit
+/// tid and had to grow the same arm independently.
+fn test_pending_kill_interrupts_blocking_wait() {
+    use akuma_exec::threading::{
+        claim_test_thread_slots, current_thread_id, has_pending_kill, mark_thread_terminated,
+        peek_pending_signal, release_test_thread_slot, request_thread_kill,
+        take_kill_request_via_tid,
+    };
+    use akuma_exec::process::should_interrupt_blocking_syscall;
+
+    // --- Half 1: the arm `sys_futex` adds to `step`'s interrupt input.
+    //
+    // Asserted against a claimed slot rather than the current thread, because the
+    // boot suite runs as the IDLE thread and `request_thread_kill` deliberately
+    // refuses that slot — arming "succeeded" silently and the whole test read
+    // false. This is the tid-explicit expression `src/syscall/sync.rs` evaluates.
+    let claimed = claim_test_thread_slots(1);
+    if claimed.is_empty() {
+        console::print("[Test] pending_kill_interrupts_blocking_wait SKIPPED: no free slots\n");
+        return;
+    }
+    let tid = claimed[0];
+
+    let armed_before = peek_pending_signal(tid) != 0 || has_pending_kill(tid);
+    request_thread_kill(tid);
+    let futex_arm_sees_it = peek_pending_signal(tid) != 0 || has_pending_kill(tid);
+    let took = take_kill_request_via_tid(tid);
+    let futex_arm_cleared = !(peek_pending_signal(tid) != 0 || has_pending_kill(tid));
+
+    mark_thread_terminated(tid);
+    release_test_thread_slot(tid);
+
+    // --- Half 2: the same arm inside `should_interrupt_blocking_syscall`, which
+    // every yarn-driven family (epoll/ppoll/pselect/socket) routes through. It
+    // reads the CURRENT thread, so it can only be exercised when this thread can
+    // actually be armed — not when the suite is running as idle. Skipped rather
+    // than faked; half 1 is the deterministic half.
+    let cur = current_thread_id();
+    let helper_checked;
+    let helper_ok;
+    if should_interrupt_blocking_syscall() {
+        helper_checked = false;
+        helper_ok = true; // already interrupted for another reason; inconclusive
+    } else {
+        request_thread_kill(cur);
+        if has_pending_kill(cur) {
+            helper_checked = true;
+            let saw = should_interrupt_blocking_syscall();
+            // Consume it here so this thread never carries the request to an
+            // EL1->EL0 boundary, where it would self-terminate the suite.
+            let cleared = take_kill_request_via_tid(cur) && !should_interrupt_blocking_syscall();
+            helper_ok = saw && cleared;
+        } else {
+            // Idle thread (or out of range): `request_thread_kill` is a no-op there.
+            helper_checked = false;
+            helper_ok = true;
+        }
+    }
+
+    let ok = !armed_before && futex_arm_sees_it && took && futex_arm_cleared && helper_ok;
+    if ok {
+        if helper_checked {
+            console::print("[Test] pending_kill_interrupts_blocking_wait PASSED\n");
+        } else {
+            console::print(
+                "[Test] pending_kill_interrupts_blocking_wait PASSED (futex arm; helper arm not armable here)\n");
+        }
+    } else {
+        crate::safe_print!(192,
+            "[Test] pending_kill_interrupts_blocking_wait FAILED: pre={} futex={} took={} cleared={} helper_ok={} helper_checked={}\n",
+            armed_before, futex_arm_sees_it, took, futex_arm_cleared, helper_ok, helper_checked);
+    }
+}
+
 fn test_deferred_kill_does_not_strand_locks() {
     use akuma_exec::threading::{
         claim_test_thread_slots, release_test_thread_slot,

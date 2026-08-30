@@ -359,11 +359,34 @@ pub fn current_thread_has_pending_interrupt() -> bool {
 
 /// Should the current blocking syscall give up and return `EINTR`?
 ///
-/// Combines the process-wide Ctrl-C / `sys_kill` path
-/// ([`is_current_interrupted`]) with the per-thread `pthread_kill` path
-/// ([`current_thread_has_pending_interrupt`]). Blocking loops should call this
-/// rather than either half.
+/// Combines the deferred thread-kill path ([`crate::threading::has_pending_kill`]),
+/// the process-wide Ctrl-C / `sys_kill` path ([`is_current_interrupted`]) and the
+/// per-thread `pthread_kill` path ([`current_thread_has_pending_interrupt`]).
+/// Blocking loops should call this rather than any one half.
+///
+/// **The kill arm is checked first, and it is not a signal.**
+/// `kill_thread_group` does not hard-terminate a sibling — that would leak the
+/// locks it holds — it posts a deferred request via
+/// [`crate::threading::request_thread_kill`] and *wakes* the thread, expecting it
+/// to self-terminate at its EL1→EL0 boundary. A thread blocked in an untimed wait
+/// wakes, finds no signal and no readiness, and parks again: it never reaches a
+/// boundary, so it can only die when the 2 s `KILL_GRACE_US` expires and the
+/// group kill hard-terminates it. Every blocking family had that hole — the wake
+/// was delivered and then discarded by the very loop it was meant to end.
+///
+/// Measured 2026-08-30: **60 `[ktg] grace expired` lines in a 90 s guest `cargo`
+/// build**, each one a guaranteed full 2 s stall in `exit_group`. See
+/// `docs/archive/KTG_GRACE_EXPIRY_KILL_INTERRUPT.md`.
+///
+/// Returning `EINTR` here is safe precisely because the thread is dying: it
+/// unwinds to the EL1→EL0 boundary, `take_thread_kill_request` fires, and it
+/// self-terminates without ever handing the errno to userspace. The flag is
+/// cleared on slot reset and on recycle (`threading/mod.rs`), so a recycled slot's
+/// next occupant cannot inherit a spurious interrupt.
 pub fn should_interrupt_blocking_syscall() -> bool {
+    if crate::threading::has_pending_kill(crate::threading::current_thread_id()) {
+        return true;
+    }
     if is_current_interrupted() {
         return true;
     }

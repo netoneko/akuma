@@ -950,10 +950,18 @@ pub fn spawn_worker_demo() {
         return;
     }
     // A few workers (cores + 1) so there is usually one runnable when a core wakes.
+    // Spawning is best-effort (slot-limited), so report what was actually created,
+    // not what was attempted: `cores + 1` was printed unconditionally, which turned
+    // a partial spawn into a confident false count in the boot log — and
+    // `cores_that_ran_workers()` below feeds a boot self-test that is read against
+    // exactly this line.
+    let mut spawned = 0u32;
     for _ in 0..=cores {
-        let _ = akuma_exec::threading::spawn_system_thread_fn(smp_worker);
+        if akuma_exec::threading::spawn_system_thread_fn(smp_worker).is_ok() {
+            spawned += 1;
+        }
     }
-    crate::safe_print!(64, "[SMP-shared] spawned {} demo workers\n", cores + 1);
+    crate::safe_print!(64, "[SMP-shared] spawned {} demo workers\n", spawned);
 }
 
 /// Self-test waiter that parks in a pure `blocking_relax()` loop — exactly what a thread

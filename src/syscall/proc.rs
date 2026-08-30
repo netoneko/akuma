@@ -995,7 +995,14 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     }
                     if status_ptr != 0 {
                         let status = encode_wait_status(code);
-                        let _ = write_user_val(status_ptr, &status);
+                        // Report BEFORE reaping, and refuse to reap if the report failed.
+                        // The zombie is the only remaining copy of this exit status: reaping
+                        // after a failed copy_to_user destroys it permanently and hands the
+                        // caller a pid as though it had been reported, with nothing left to
+                        // wait on. Linux returns EFAULT here and leaves the child reapable.
+                        if write_user_val(status_ptr, &status).is_err() {
+                            return EFAULT;
+                        }
                     }
                     // Reap the zombie: remove from process table + child channels.
                     // On Linux, waitpid is the only way to reap a zombie.
@@ -1015,7 +1022,14 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     let code = ch.exit_code();
                     if status_ptr != 0 {
                         let status = encode_wait_status(code);
-                        let _ = write_user_val(status_ptr, &status);
+                        // Report BEFORE reaping, and refuse to reap if the report failed.
+                        // The zombie is the only remaining copy of this exit status: reaping
+                        // after a failed copy_to_user destroys it permanently and hands the
+                        // caller a pid as though it had been reported, with nothing left to
+                        // wait on. Linux returns EFAULT here and leaves the child reapable.
+                        if write_user_val(status_ptr, &status).is_err() {
+                            return EFAULT;
+                        }
                     }
                     akuma_exec::process::clear_lazy_regions(p);
                     let _ = akuma_exec::process::unregister_process(p);
@@ -1049,7 +1063,14 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 }
                 if status_ptr != 0 {
                     let status = encode_wait_status(code);
-                    let _ = write_user_val(status_ptr, &status);
+                    // Report BEFORE reaping, and refuse to reap if the report failed.
+                    // The zombie is the only remaining copy of this exit status: reaping
+                    // after a failed copy_to_user destroys it permanently and hands the
+                    // caller a pid as though it had been reported, with nothing left to
+                    // wait on. Linux returns EFAULT here and leaves the child reapable.
+                    if write_user_val(status_ptr, &status).is_err() {
+                        return EFAULT;
+                    }
                 }
                 // Reap the zombie
                 akuma_exec::process::clear_lazy_regions(child_pid);
@@ -1072,7 +1093,14 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 }
                 if status_ptr != 0 {
                     let status = encode_wait_status(code);
-                    let _ = write_user_val(status_ptr, &status);
+                    // Report BEFORE reaping, and refuse to reap if the report failed.
+                    // The zombie is the only remaining copy of this exit status: reaping
+                    // after a failed copy_to_user destroys it permanently and hands the
+                    // caller a pid as though it had been reported, with nothing left to
+                    // wait on. Linux returns EFAULT here and leaves the child reapable.
+                    if write_user_val(status_ptr, &status).is_err() {
+                        return EFAULT;
+                    }
                 }
                 // Reap the zombie
                 akuma_exec::process::clear_lazy_regions(child_pid);
@@ -1226,7 +1254,11 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
             let (si_code, si_status) = if code < 0 { (CLD_KILLED, -code) } else { (CLD_EXITED, code) };
             let info = SigChld { si_signo: SIGCHLD, si_errno: 0, si_code, __pad0: 0,
                                  si_pid: child_pid, si_uid: 0, si_status };
-            let _ = write_user_val(infop, &info);
+            // Same rule as wait4 above: the reap below is irreversible, so a failed
+            // siginfo copy must not consume the zombie.
+            if write_user_val(infop, &info).is_err() {
+                return EFAULT;
+            }
         }
         if (options & WNOWAIT) == 0 {
             // Reap the zombie (unless WNOWAIT says "don't consume")

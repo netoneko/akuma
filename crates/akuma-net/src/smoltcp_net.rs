@@ -454,14 +454,22 @@ pub const RX_BUFFER_LEN: usize = if cfg!(kernel_profile_extreme) {
 #[cfg(not(feature = "net-noalloc"))]
 static mut RX_BUFFER: [u8; RX_BUFFER_LEN] = [0; RX_BUFFER_LEN];
 
-/// [`RX_BUFFER`] as a mutable slice.
+/// A raw slice pointer to [`RX_BUFFER`].
 ///
-/// # Safety
-/// Caller holds `NETWORK`, and must not hold a second borrow: the device owns
-/// this buffer from `receive_begin` until `receive_complete`.
+/// **Safe since 2026-08-30**, and that is the point: it was an `unsafe fn`
+/// returning `&'static mut [u8]`, which put an aliasing obligation on a caller
+/// that could not discharge it — the `'static` lifetime outlives every `NETWORK`
+/// hold that was supposed to make the borrow exclusive. Forming the pointer is
+/// safe; *dereferencing* it is where the obligation actually lives, so each
+/// caller now writes its own `unsafe { &mut * }` and the borrow ends with the
+/// statement instead of with the program.
+///
+/// What callers must still honour at the deref: hold `NETWORK`, and take no
+/// second borrow — the device owns this buffer from `receive_begin` until
+/// `receive_complete`.
 #[cfg(not(feature = "net-noalloc"))]
-unsafe fn rx_buffer() -> &'static mut [u8] {
-    unsafe { core::slice::from_raw_parts_mut((&raw mut RX_BUFFER).cast::<u8>(), RX_BUFFER_LEN) }
+fn rx_buffer() -> *mut [u8] {
+    core::ptr::slice_from_raw_parts_mut((&raw mut RX_BUFFER).cast::<u8>(), RX_BUFFER_LEN)
 }
 
 pub struct VirtioSmoltcpDevice {
@@ -536,8 +544,10 @@ impl VirtioSmoltcpDevice {
             };
             // SAFETY: `slot` came from the ring's own table and `NETWORK` is
             // held; `hdr + len <= FRAME_BUF` was checked by `take_frame`.
+            // No intermediate reference: the caller wants a pointer, so go
+            // pointer-to-pointer and never mint a `&mut` that could alias.
             let base = unsafe { crate::virtio_rings::rx_frame(slot) };
-            Some((unsafe { base.as_mut_ptr().add(hdr) }, len))
+            Some((unsafe { base.cast::<u8>().add(hdr) }, len))
         }
         #[cfg(not(feature = "net-noalloc"))]
         {
@@ -553,7 +563,7 @@ impl VirtioSmoltcpDevice {
                 // (`RX_BUFFERS_POSTED` below) are safe; console I/O is not.
                 // SAFETY: `NETWORK` is held and there is no outstanding borrow —
                 // `rx_token` is `None`, so the device does not own the buffer.
-                let Ok(token) = (unsafe { self.inner.receive_begin(rx_buffer()) })
+                let Ok(token) = (unsafe { self.inner.receive_begin(&mut *rx_buffer()) })
                 else {
                     RX_BEGIN_FAILURES.fetch_add(1, Ordering::Relaxed);
                     return None;
@@ -572,7 +582,7 @@ impl VirtioSmoltcpDevice {
                 let t = nicstat::start();
                 // SAFETY: the same buffer that was passed to `receive_begin`,
                 // which `receive_complete`'s contract requires.
-                let buf = unsafe { rx_buffer() };
+                let buf = unsafe { &mut *rx_buffer() };
                 if let Ok((hdr_len, pkt_len)) =
                     unsafe { self.inner.receive_complete(token, buf) }
                 {
@@ -616,7 +626,7 @@ impl VirtioSmoltcpDevice {
             use crate::virtio_rings::{FRAME_BUF, tx_discard, tx_frame};
             if let Some(slot) = self.tx.claim(&mut self.inner) {
                 // SAFETY: `slot < TX_RING` by construction; `NETWORK` is held.
-                let frame = unsafe { tx_frame(slot) };
+                let frame = unsafe { &mut *tx_frame(slot) };
                 // `transmit_begin` sends whatever is in the buffer verbatim, so
                 // the virtio header has to be written into it here — unlike
                 // `send`, which prepends its own.
@@ -645,7 +655,7 @@ impl VirtioSmoltcpDevice {
             // A diverted (loopback) frame is unaffected by NIC saturation, so it
             // is still delivered.
             // SAFETY: `NETWORK` is held, so nothing else is touching the buffer.
-            let discard = unsafe { tx_discard() };
+            let discard = unsafe { &mut *tx_discard() };
             let end = len.min(FRAME_BUF);
             let res = fill(&mut discard[..end]);
             if divert(&discard[..end]) {

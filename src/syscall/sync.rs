@@ -747,7 +747,16 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 // interrupted, and which queue (if any) still has to be cleaned
                 // up — is `akuma_syscalls_sync::step`. Five inputs, five
                 // outcomes, all host-tested; the effects are here.
-                let signal_pending = akuma_exec::threading::peek_pending_signal(tid) != 0;
+                // `step`'s interrupt input is "something wants this wait to end",
+                // not "a signal arrived". A pending deferred-kill belongs in it for
+                // the reason spelled out on `should_interrupt_blocking_syscall`: the
+                // futex path does not call that helper (it peeks rather than consumes,
+                // and against an explicit tid), so it needs the same arm added here or
+                // a killed thread parked on an untimed FUTEX_WAIT re-parks forever and
+                // dies only to the 2 s grace-expiry hard kill. This was the dominant
+                // case — rustc's rayon workers park exactly here.
+                let signal_pending = akuma_exec::threading::peek_pending_signal(tid) != 0
+                    || akuma_exec::threading::has_pending_kill(tid);
                 match akuma_syscalls_sync::step(
                     located,
                     signal_pending,

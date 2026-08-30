@@ -5300,7 +5300,13 @@ fn test_mprotect_flag_update_with_cache_maintenance() -> bool {
     }
 
     // Update flags to RX (simulating mprotect PROT_READ|PROT_EXEC)
-    let update_ok = addr_space.update_page_flags(test_va, akuma_exec::mmu::user_flags::RX).is_ok();
+    addr_space.update_page_flags(test_va, akuma_exec::mmu::user_flags::RX);
+    // Prove the edit landed by reading the leaf back — RX must clear UXN. This
+    // was `.is_ok()` on an always-`Ok` Result, i.e. a term that contributed
+    // nothing to `pass` below.
+    let update_ok = addr_space
+        .read_l3_page_entry(test_va)
+        .is_some_and(|e| e & akuma_exec::mmu::flags::UXN == 0);
 
     // Run the IC IALLU cache maintenance path (as sys_mprotect now does).
     // Clean the data cache via the kernel-mapped address of the frame, NOT the
@@ -5357,7 +5363,7 @@ fn test_mprotect_large_region_completes() -> bool {
     // Update all to RX
     for i in 0..num_pages {
         let va = base_va + i * 4096;
-        let _ = addr_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
+        addr_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
     }
 
     // Run the optimized cache maintenance path: DC CVAU loop + single IC IALLU.

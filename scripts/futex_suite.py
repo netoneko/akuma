@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Push and run the futex correctness probes against a running guest.
 
-The three probes are the futex family's regression gate, and each answers a
-question the other two cannot:
+The four probes are the futex family's regression gate, and each answers a
+question the others cannot:
 
   futexops   op-by-op against Linux semantics (WAKE_OP, REQUEUE, CMP_REQUEUE,
              WAIT_BITSET, the PI family's ENOSYS). Prints PASS/FAIL per probe.
@@ -13,6 +13,11 @@ question the other two cannot:
   futextest  seven phases of real pthread/futex traffic (spawn+join, mutex,
              condvar, barrier, raw park/unpark). Each phase prints "[N] start"
              then "[N] ok" — a missing "ok" names the phase that hung.
+  futexkill  is a sibling parked in an UNTIMED FUTEX_WAIT interrupted by the
+             deferred kill that `exit_group` posts, or does it survive until the
+             2 s kill grace expires? Times exit_group -> reaped. This is a
+             latency probe, not a correctness one: the pre-fix kernel produced
+             the right answer, 2 s late, ~60 times per 90 s of guest build.
 
 They live in `userspace/forktest/c_stress/`; this builds them from source and
 pushes them, so what runs in the guest is what is in the tree right now.
@@ -30,7 +35,7 @@ import re
 import subprocess
 import sys
 
-PROBES = ["futexops", "futexkey", "futextest"]
+PROBES = ["futexops", "futexkey", "futextest", "futexkill"]
 SRC = pathlib.Path(__file__).resolve().parent.parent / "userspace/forktest/c_stress"
 
 
