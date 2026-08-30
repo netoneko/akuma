@@ -19,6 +19,7 @@ default-members = [
     "crates/akuma-pmm",
     "crates/akuma-bkl",
     "crates/akuma-boot",
+    "crates/akuma-locks-rw",
     "crates/akuma-primitives",
     "crates/akuma-rump",
     "crates/akuma-scheduler",

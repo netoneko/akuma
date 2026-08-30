@@ -1,0 +1,16 @@
+[package]
+name = "akuma-locks-rw"
+version = "0.1.0"
+edition = "2024"
+description = "Reader/writer spinlock whose release is the same CAS-guarded operation as its dead-holder recovery — the orphaned-lock protocol from docs/archive/AKUMA_EXT2_CLEANUP.md §4.3a, with a host model checker"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `current_tid` (the native acquire-side identity read) and `MAX_THREADS` (the
+# per-tid reader-hold table's bound).
+akuma-primitives = { path = "../akuma-primitives" }
+# `Registered` — the one upward wire, the 10k-spin backstop kicker, degrading to
+# a plain spin when unregistered (§4.5).
+akuma-not-even-once = { path = "../akuma-not-even-once" }
