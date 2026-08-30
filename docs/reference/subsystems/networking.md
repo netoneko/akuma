@@ -480,6 +480,19 @@ this file's philosophy asks for. Not yet wired into the boot suite or
   SLIRP (`cargo_runner.sh:166`). This is how you reach the devbox's userspace
   sshd.
 
+## Crate layout (2026-08-30)
+
+| crate | what | `unsafe` |
+|---|---|---|
+| `akuma-net` | smoltcp stack (`smoltcp_net/`, 14 modules), the AF_INET socket table, DNS | none — `forbid(unsafe_code)` |
+| `akuma-net-nic` | DMA frame arenas, the virtio-net wrapper, smoltcp's `Device` impls, the MMIO doorbell, `nicstat`, the rump tap | **all of it** |
+| `akuma-net-unix` | the AF_UNIX state machine | none — `forbid` |
+| `akuma-net-yarn` | the readiness wait loop | none — `forbid` |
+
+Every `unsafe` line in networking is in `akuma-net-nic`, behind one stated DMA
+contract (`crates/akuma-net-nic/src/nic.rs`). Rationale and the moves that got
+there: [`../../archive/AKUMA_NET_SPLIT.md`](../../archive/AKUMA_NET_SPLIT.md) §5.
+
 ## Background
 
 - `archive/SMOLTCP_MIGRATION_SUMMARY.md` — the smoltcp migration post-mortem.

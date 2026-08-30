@@ -568,6 +568,86 @@ Order of work:
    because it needs `iface.context()` alongside the socket.
 5. Split `net-sockets` / `net-smoltcp` — by then a file move.
 
+### 5.1d `akuma-net-nic` — DONE 2026-08-30. `akuma-net` is unsafe-free.
+
+Steps 1-2 of §5.1c landed, and step 4's transmute problem turned out not to need
+the trait at all. Result:
+
+| crate | prod lines | unsafe sites | |
+|---|---|---|---|
+| `akuma-net` | 2,020 | **0** | `forbid(unsafe_code)` |
+| `akuma-net-unix` | 589 | 0 | `forbid(unsafe_code)` |
+| `akuma-net-yarn` | 222 | 0 | `forbid(unsafe_code)` |
+| `akuma-net-nic` | 1,161 | 23 | all of networking's `unsafe`, one crate |
+
+```
+enforced unsafe-free    16 of 24  ->  17 of 25 crates
+code in those crates    31.2%     ->  36.8%   (+2,379 lines)
+```
+
+**Step 1 — `NetRuntime` to `akuma-primitives`.** It had to go below everything:
+three sibling crates need it and none may depend on another. It was already a
+`Copy` struct of `fn` pointers behind `Registered`, which lives there too, so
+the move was mechanical. `akuma-net::runtime` stays as a re-export so the call
+sites inside the crate did not change.
+
+**Step 2 — `akuma-net-nic`.** `frames`, `nic`, `virtio_rings`, `nicstat`,
+`irq`, both `Device` impls, the four per-packet counters, and `rump_tap` (a NIC
+driver, so it belongs with the other one). Two details:
+
+- `irq` gained `bind(slot, mmio_base)` so `init` no longer writes
+  `NIC_MMIO_BASE`/`NIC_SLOT` directly; they are private to the crate now.
+- `smoltcp_net::consts` re-export had to become `pub(crate) use`, because once
+  `rx_counters` left, nothing in it was public and rustc rejects a `pub use`
+  glob that re-exports nothing.
+
+**Step 4, done early and without the trait — the two `SocketHandle` transmutes.**
+
+```rust
+// was: smoltcp keeps SocketHandle(usize) private, so extract the index
+unsafe { transmute::<SocketHandle, usize>(handle) } < MAX_SOCKETS
+// now:
+sockets.iter().any(|(h, _)| h == handle)
+```
+
+**This is a bug fix, not a tidy-up.** `SocketSet::get_mut` panics two ways:
+
+```rust
+match self.sockets[handle.0].inner.as_mut() {   // (1) index out of range
+    Some(item) => ...,
+    None => panic!("handle does not refer to a valid socket"),   // (2) stale
+}
+```
+
+The old guard covered only (1). (2) was reachable — `socket_close` queues a
+handle on `pending_removal`, the GC sweep frees the slot, and anything still
+holding that handle lands on `None`. This kernel's `#[panic_handler]` calls
+`halt()`, so that is not a killed process or an errno: **every core stops and
+the machine needs a reboot.** It is the exact crash
+[`SOCKETSET_EXHAUSTION_FIX.md`](SOCKETSET_EXHAUSTION_FIX.md)'s `purge_connecting`
+was written to prevent, and the test for it says so — "called `sockets.get()` on
+an already-removed handle and crashed the kernel".
+
+The bookkeeping discipline is unchanged and still correct; this is a **backstop**
+under it. If `connecting`/`pending_removal` ever desync again, the result is a
+`[NET] CORRUPT HANDLE` line and a failed socket operation instead of a dead
+machine.
+
+Cost is `O(live sockets)`, and every call site was checked before choosing it:
+the two that look hot walk `net.connecting` / `net.pending_removal`, which hold
+a handful of entries; none is per-packet. Two sites moved inside their existing
+`with_network` because the guard now needs the set.
+
+The three host tests written for the transmute went with it — they tested a
+function that no longer exists — and the `purge_connecting` tests now mint real
+handles from a real `SocketSet` rather than transmuting indices, which is closer
+to what production does anyway.
+
+**Steps 3 and 5 remain, and their payoff has changed.** They are no longer about
+`forbid` — `akuma-net` already has it. What is left is host-testing the socket
+table against a mock `TcpStack`, which is the zero-coverage hole §2 identified.
+Weigh that against the 7 multi-op lock holds the trait has to preserve.
+
 ### 5.2 Module splits — cheap, independent, do first
 
 - `socket.rs` (1,791) → `socket/{addr,table,wait,tcp,udp,opts,stat}.rs`. The 60
@@ -709,11 +789,61 @@ line-level safe.
 
 ---
 
+### 6.6 Verification of the crate split (2026-08-30)
+
+Host and build, at every step: 50 workspace test targets, clippy clean, all four
+build targets, and each feature set individually (`net-noalloc`, `net-profile`,
+`many-sessions`, `rump`, `--no-default-features`).
+
+**Native stack**, `MEMORY=2048M SMP=2`: 316 PASSED / 0 failures; DNS; 1 MB
+download md5 `b6d81b36…`; 40/40 byte-identical loopback fetches; zero
+`[NET] CORRUPT HANDLE` lines.
+
+**Guest-side probes** (`userspace/nettest`, `userspace/epollprobe`):
+
+| probe | result |
+|---|---|
+| `nettest-connect ifconfig` | **29 checks, 0 failures** (SIOCGIF*, SIOCGIFCONF vs direct) |
+| `nettest-connect all` | 2/2 addresses CONNECTED, 0 failed |
+| `nettest-connect churn 100` | **100/100 connected**, 0 pollerr, 0 soerror |
+| `nettest-connect --wait poll` / `select` / `epoll` | all three CONNECTED |
+| `nettest-std raw / poll / tls` | 200 in all three; TLS negotiated TLSv1_3 |
+| `nettest-unix all` | 8 OK, 2 UNSUPPORTED (SCM_RIGHTS, and no syslog daemon — the probe says so itself) |
+| `scripts/epoll_suite.py` | 14 PASS, 0 FAIL, 1 known DIVERGE |
+
+The churn run matters most: 100 socket create/connect/close cycles is exactly
+what exercises the rewritten `is_valid_handle` and the `pending_removal` sweep.
+
+**Rump stack** — the path `rump_tap` moved onto, so it needed its own run:
+
+- `RUMP_NIC=1` on the native kernel: `[Test] rump_tap PASSED`, NIC1 bound to
+  `/dev/net/tap0` (bus.4, MAC `52:54:00:12:34:57`), **319 PASSED** — three more
+  than without NIC1, which is the rump suite actually running rather than
+  skipping.
+- The **rump-only devbox** (`scripts/build_devbox.sh`, no smoltcp compiled in at
+  all): boots, `rump_server` handshakes its sysproxy channel, userspace sshd
+  comes up, and the box answers ssh over the NetBSD stack. Over it: DNS, HTTP,
+  **1 MB download with the same md5**, HTTPS via rustls (TLSv1_3, 200), and
+  `churn 20` = 20/20 connected.
+- `nettest-unix all` on that devbox: same 8 OK. That is the §5.1 extraction-A
+  claim verified end to end — AF_UNIX works in a build with no smoltcp, which is
+  the configuration `akuma-net-unix` was split out to serve, and box 0's
+  `rump_server` is itself talking over a `UnixSocket` at fd 3 the whole time.
+
+One pre-existing failure, unrelated: `/bin/nettest` (the libcurl probe) cannot
+load `libgcc_s.so.1` on this disk image. A packaging gap, not a networking one.
+
+
 ## 7. What is left
 
-- The split itself (§5). Nothing in §4 blocks it; extraction B is now much
-  better defined, because `frames.rs` + `nic.rs` are exactly the pieces that
-  move with the device layer.
+- **Steps 3 and 5 of §5.1c** — the `TcpStack` trait in `akuma-primitives` and
+  the `net-sockets` / `net-smoltcp` split. The payoff has changed: no longer
+  `forbid` (`akuma-net` already has it), but **host-testing the socket table
+  against a mock**, which is §2's zero-coverage hole. Weigh that against the 7
+  multi-op lock holds the trait must preserve.
+- `akuma-net-nic` could take `#![deny(unsafe_op_in_unsafe_fn)]` and shrink
+  further if the `RxToken` carried a `FrameLease` rather than a raw slice —
+  §5.1c's option (b), still open now that the Device impls live beside the arena.
 - `rump_tap.rs`'s 3 `unsafe` are unchanged and appropriate: two are the
   `RawNic` impl (the pattern §4.3 copies) and one is `MmioTransport::new`,
   which is transport construction, not a buffer lifetime.
