@@ -39,7 +39,7 @@ use core::cell::Cell;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::mem::size_of;
+use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 #[cfg(not(kernel_profile_extreme))]
 use spinning_top::Spinlock;
@@ -730,7 +730,7 @@ const DEFAULT_SOCKET_PERMS: u16 = S_IFSOCK | 0o755;
 
 /// Maximum target length for fast (inline) symlinks.
 /// Stored in direct_blocks[12] + indirect + double_indirect + triple_indirect = 60 bytes.
-const FAST_SYMLINK_MAX: usize = 60;
+pub(crate) const FAST_SYMLINK_MAX: usize = 60;
 
 /// Directory entry file type constants
 const FT_REG_FILE: u8 = 1;
@@ -741,93 +741,110 @@ const FT_SOCK: u8 = 6;
 const FT_SYMLINK: u8 = 7;
 
 /// Minimum directory entry size (inode + rec_len + name_len + file_type)
-const DIR_ENTRY_HEADER_SIZE: usize = 8;
+pub(crate) const DIR_ENTRY_HEADER_SIZE: usize = 8;
 
 // ============================================================================
 // On-disk Structures
 // ============================================================================
+//
+// Layout is pinned twice, on purpose (docs/archive/AKUMA_EXT2_CLEANUP.md §2.2):
+//
+// 1. `repr(C)` + the `offset_of!`/`size_of` assertions below state the
+//    on-disk layout the ext2 spec defines, and a wrong field order or width is
+//    a compile error instead of a silent misparse of a real filesystem. The
+//    structs were `packed` while code reinterpreted them as raw bytes; the
+//    codec below made that unnecessary, and `repr(C)` keeps every asserted
+//    offset (all fields land naturally aligned, which the size assertions
+//    prove — any accidental padding changes the size and fails the build).
+// 2. The `parse`/`serialize` impls under "On-disk layout codec" restate each
+//    offset as an explicit little-endian read/write, bounds-checked and
+//    host-endian-independent. Round-trip tests in `src/tests.rs` prove the two
+//    statements agree; a misplaced offset fails a test instead of a live disk.
+//
+// Nothing reinterprets these structs as bytes any more — every read from a
+// device buffer goes through `parse` and every write through `serialize`.
 
 /// Ext2 Superblock (located at byte offset 1024)
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct Superblock {
-    total_inodes: u32,
-    total_blocks: u32,
-    superuser_blocks: u32,
-    unallocated_blocks: u32,
-    unallocated_inodes: u32,
-    first_data_block: u32,
-    block_size_log: u32,
-    fragment_size_log: u32,
-    blocks_per_group: u32,
-    fragments_per_group: u32,
-    inodes_per_group: u32,
-    last_mount_time: u32,
-    last_written_time: u32,
-    mount_count: u16,
-    max_mount_count: u16,
-    magic: u16,
-    fs_state: u16,
-    error_handling: u16,
-    version_minor: u16,
-    last_check_time: u32,
-    check_interval: u32,
-    creator_os: u32,
-    version_major: u32,
-    reserved_uid: u16,
-    reserved_gid: u16,
-    first_inode: u32,
-    inode_size: u16,
-    block_group: u16,
-    feature_compat: u32,
-    feature_incompat: u32,
-    feature_ro_compat: u32,
-    uuid: [u8; 16],
-    volume_name: [u8; 16],
-    last_mounted: [u8; 64],
-    algo_bitmap: u32,
-    _padding: [u8; 820],
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Superblock {
+    pub(crate) total_inodes: u32,
+    pub(crate) total_blocks: u32,
+    pub(crate) superuser_blocks: u32,
+    pub(crate) unallocated_blocks: u32,
+    pub(crate) unallocated_inodes: u32,
+    pub(crate) first_data_block: u32,
+    pub(crate) block_size_log: u32,
+    pub(crate) fragment_size_log: u32,
+    pub(crate) blocks_per_group: u32,
+    pub(crate) fragments_per_group: u32,
+    pub(crate) inodes_per_group: u32,
+    pub(crate) last_mount_time: u32,
+    pub(crate) last_written_time: u32,
+    pub(crate) mount_count: u16,
+    pub(crate) max_mount_count: u16,
+    pub(crate) magic: u16,
+    pub(crate) fs_state: u16,
+    pub(crate) error_handling: u16,
+    pub(crate) version_minor: u16,
+    pub(crate) last_check_time: u32,
+    pub(crate) check_interval: u32,
+    pub(crate) creator_os: u32,
+    pub(crate) version_major: u32,
+    pub(crate) reserved_uid: u16,
+    pub(crate) reserved_gid: u16,
+    pub(crate) first_inode: u32,
+    pub(crate) inode_size: u16,
+    pub(crate) block_group: u16,
+    pub(crate) feature_compat: u32,
+    pub(crate) feature_incompat: u32,
+    pub(crate) feature_ro_compat: u32,
+    pub(crate) uuid: [u8; 16],
+    pub(crate) volume_name: [u8; 16],
+    pub(crate) last_mounted: [u8; 64],
+    pub(crate) algo_bitmap: u32,
+    pub(crate) _padding: [u8; 820],
 }
 
 /// Block Group Descriptor
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct BlockGroupDescriptor {
-    block_bitmap: u32,
-    inode_bitmap: u32,
-    inode_table: u32,
-    free_blocks_count: u16,
-    free_inodes_count: u16,
-    used_dirs_count: u16,
-    _padding: u16,
-    _reserved: [u8; 12],
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BlockGroupDescriptor {
+    pub(crate) block_bitmap: u32,
+    pub(crate) inode_bitmap: u32,
+    pub(crate) inode_table: u32,
+    pub(crate) free_blocks_count: u16,
+    pub(crate) free_inodes_count: u16,
+    pub(crate) used_dirs_count: u16,
+    pub(crate) _padding: u16,
+    pub(crate) _reserved: [u8; 12],
 }
 
 /// Inode structure
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct Inode {
-    type_perms: u16,
-    uid: u16,
-    size_lower: u32,
-    access_time: u32,
-    creation_time: u32,
-    modification_time: u32,
-    deletion_time: u32,
-    gid: u16,
-    hard_links: u16,
-    sectors_used: u32,
-    flags: u32,
-    os_specific_1: u32,
-    direct_blocks: [u32; 12],
-    indirect_block: u32,
-    double_indirect_block: u32,
-    triple_indirect_block: u32,
-    generation: u32,
-    file_acl: u32,
-    size_upper: u32,
-    fragment_addr: u32,
-    os_specific_2: [u8; 12],
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Inode {
+    pub(crate) type_perms: u16,
+    pub(crate) uid: u16,
+    pub(crate) size_lower: u32,
+    pub(crate) access_time: u32,
+    pub(crate) creation_time: u32,
+    pub(crate) modification_time: u32,
+    pub(crate) deletion_time: u32,
+    pub(crate) gid: u16,
+    pub(crate) hard_links: u16,
+    pub(crate) sectors_used: u32,
+    pub(crate) flags: u32,
+    pub(crate) os_specific_1: u32,
+    pub(crate) direct_blocks: [u32; 12],
+    pub(crate) indirect_block: u32,
+    pub(crate) double_indirect_block: u32,
+    pub(crate) triple_indirect_block: u32,
+    pub(crate) generation: u32,
+    pub(crate) file_acl: u32,
+    pub(crate) size_upper: u32,
+    pub(crate) fragment_addr: u32,
+    pub(crate) os_specific_2: [u8; 12],
 }
 
 impl Default for Inode {
@@ -859,13 +876,365 @@ impl Default for Inode {
 }
 
 /// Directory entry (variable size on disk)
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct DirEntryRaw {
-    inode: u32,
-    rec_len: u16,
-    name_len: u8,
-    file_type: u8,
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DirEntryRaw {
+    pub(crate) inode: u32,
+    pub(crate) rec_len: u16,
+    pub(crate) name_len: u8,
+    pub(crate) file_type: u8,
+}
+
+// Layout assertions — see the section header above. The offsets are the ext2
+// spec positions; the codec's explicit offsets must agree with these, which is
+// what the round-trip tests prove.
+const _: () = assert!(size_of::<Superblock>() == 1024);
+const _: () = assert!(offset_of!(Superblock, magic) == 56);
+const _: () = assert!(offset_of!(Superblock, version_major) == 76);
+const _: () = assert!(offset_of!(Superblock, inode_size) == 88);
+const _: () = assert!(offset_of!(Superblock, first_data_block) == 20);
+const _: () = assert!(offset_of!(Superblock, block_size_log) == 24);
+const _: () = assert!(offset_of!(Superblock, blocks_per_group) == 32);
+const _: () = assert!(offset_of!(Superblock, inodes_per_group) == 40);
+const _: () = assert!(offset_of!(Superblock, total_blocks) == 4);
+const _: () = assert!(offset_of!(Superblock, total_inodes) == 0);
+const _: () = assert!(offset_of!(Superblock, unallocated_blocks) == 12);
+const _: () = assert!(offset_of!(Superblock, unallocated_inodes) == 16);
+
+const _: () = assert!(size_of::<BlockGroupDescriptor>() == 32);
+const _: () = assert!(offset_of!(BlockGroupDescriptor, block_bitmap) == 0);
+const _: () = assert!(offset_of!(BlockGroupDescriptor, inode_bitmap) == 4);
+const _: () = assert!(offset_of!(BlockGroupDescriptor, inode_table) == 8);
+const _: () = assert!(offset_of!(BlockGroupDescriptor, free_blocks_count) == 12);
+const _: () = assert!(offset_of!(BlockGroupDescriptor, free_inodes_count) == 14);
+const _: () = assert!(offset_of!(BlockGroupDescriptor, used_dirs_count) == 16);
+
+const _: () = assert!(size_of::<Inode>() == 128);
+const _: () = assert!(offset_of!(Inode, type_perms) == 0);
+const _: () = assert!(offset_of!(Inode, uid) == 2);
+const _: () = assert!(offset_of!(Inode, size_lower) == 4);
+const _: () = assert!(offset_of!(Inode, gid) == 24);
+const _: () = assert!(offset_of!(Inode, hard_links) == 26);
+const _: () = assert!(offset_of!(Inode, sectors_used) == 28);
+const _: () = assert!(offset_of!(Inode, direct_blocks) == 40);
+const _: () = assert!(offset_of!(Inode, indirect_block) == 88);
+const _: () = assert!(offset_of!(Inode, double_indirect_block) == 92);
+const _: () = assert!(offset_of!(Inode, triple_indirect_block) == 96);
+const _: () = assert!(offset_of!(Inode, generation) == 100);
+const _: () = assert!(offset_of!(Inode, file_acl) == 104);
+const _: () = assert!(offset_of!(Inode, size_upper) == 108);
+const _: () = assert!(offset_of!(Inode, fragment_addr) == 112);
+
+const _: () = assert!(size_of::<DirEntryRaw>() == DIR_ENTRY_HEADER_SIZE);
+const _: () = assert!(offset_of!(DirEntryRaw, inode) == 0);
+const _: () = assert!(offset_of!(DirEntryRaw, rec_len) == 4);
+const _: () = assert!(offset_of!(DirEntryRaw, name_len) == 6);
+const _: () = assert!(offset_of!(DirEntryRaw, file_type) == 7);
+
+// ============================================================================
+// On-disk layout codec
+// ============================================================================
+//
+// Explicit offset-based parse/serialize for the four on-disk structures
+// (docs/archive/AKUMA_EXT2_CLEANUP.md §2.2). This replaces the old
+// `read_unaligned`/`from_raw_parts` blits: every offset below is stated twice
+// by hand (read and write), is checkable against the ext2 spec by eye, and is
+// bounds-checked — a short or corrupt buffer yields `None`, never an out-of-
+// bounds read. All multi-byte fields are `from_le_bytes`/`to_le_bytes`, so the
+// format's little-endianness is explicit instead of borrowing the host's.
+//
+// The padding/reserved fields are carried verbatim (not interpreted) so a
+// write-back of a parsed structure is byte-faithful to what was read; ext2
+// reserves those bytes and e2fsck notices when drivers scribble on them.
+
+/// Little-endian `u16` at byte offset `at`, or `None` past the end of `buf`.
+fn le_u16(buf: &[u8], at: usize) -> Option<u16> {
+    let b: [u8; 2] = buf.get(at..at + 2)?.try_into().ok()?;
+    Some(u16::from_le_bytes(b))
+}
+
+/// Little-endian `u32` at byte offset `at`, or `None` past the end of `buf`.
+fn le_u32(buf: &[u8], at: usize) -> Option<u32> {
+    let b: [u8; 4] = buf.get(at..at + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(b))
+}
+
+fn put_u16(out: &mut [u8], at: usize, v: u16) {
+    out[at..at + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32(out: &mut [u8], at: usize, v: u32) {
+    out[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+impl Superblock {
+    pub(crate) const SIZE: usize = size_of::<Self>();
+
+    /// Parse the 1024-byte superblock image read from [`SUPERBLOCK_OFFSET`].
+    /// `None` on a short buffer — the caller has already checked the magic by
+    /// the time validation matters, and every disk-supplied *arithmetic* input
+    /// is validated at the mount path (see `Ext2Filesystem::new_with_cache_cap`).
+    pub(crate) fn parse(buf: &[u8]) -> Option<Self> {
+        Some(Self {
+            total_inodes: le_u32(buf, 0)?,
+            total_blocks: le_u32(buf, 4)?,
+            superuser_blocks: le_u32(buf, 8)?,
+            unallocated_blocks: le_u32(buf, 12)?,
+            unallocated_inodes: le_u32(buf, 16)?,
+            first_data_block: le_u32(buf, 20)?,
+            block_size_log: le_u32(buf, 24)?,
+            fragment_size_log: le_u32(buf, 28)?,
+            blocks_per_group: le_u32(buf, 32)?,
+            fragments_per_group: le_u32(buf, 36)?,
+            inodes_per_group: le_u32(buf, 40)?,
+            last_mount_time: le_u32(buf, 44)?,
+            last_written_time: le_u32(buf, 48)?,
+            mount_count: le_u16(buf, 52)?,
+            max_mount_count: le_u16(buf, 54)?,
+            magic: le_u16(buf, 56)?,
+            fs_state: le_u16(buf, 58)?,
+            error_handling: le_u16(buf, 60)?,
+            version_minor: le_u16(buf, 62)?,
+            last_check_time: le_u32(buf, 64)?,
+            check_interval: le_u32(buf, 68)?,
+            creator_os: le_u32(buf, 72)?,
+            version_major: le_u32(buf, 76)?,
+            reserved_uid: le_u16(buf, 80)?,
+            reserved_gid: le_u16(buf, 82)?,
+            first_inode: le_u32(buf, 84)?,
+            inode_size: le_u16(buf, 88)?,
+            block_group: le_u16(buf, 90)?,
+            feature_compat: le_u32(buf, 92)?,
+            feature_incompat: le_u32(buf, 96)?,
+            feature_ro_compat: le_u32(buf, 100)?,
+            uuid: buf.get(104..120)?.try_into().ok()?,
+            volume_name: buf.get(120..136)?.try_into().ok()?,
+            last_mounted: buf.get(136..200)?.try_into().ok()?,
+            algo_bitmap: le_u32(buf, 200)?,
+            // Bytes 204..1024: reserved. Carried verbatim so a write-back is
+            // byte-identical to the image we mounted.
+            _padding: buf.get(204..Self::SIZE)?.try_into().ok()?,
+        })
+    }
+
+    /// Serialize to the exact-size superblock image (1024 bytes). `out` shorter
+    /// than that panics — callers pass a `[u8; 1024]`.
+    pub(crate) fn serialize(&self, out: &mut [u8]) {
+        put_u32(out, 0, self.total_inodes);
+        put_u32(out, 4, self.total_blocks);
+        put_u32(out, 8, self.superuser_blocks);
+        put_u32(out, 12, self.unallocated_blocks);
+        put_u32(out, 16, self.unallocated_inodes);
+        put_u32(out, 20, self.first_data_block);
+        put_u32(out, 24, self.block_size_log);
+        put_u32(out, 28, self.fragment_size_log);
+        put_u32(out, 32, self.blocks_per_group);
+        put_u32(out, 36, self.fragments_per_group);
+        put_u32(out, 40, self.inodes_per_group);
+        put_u32(out, 44, self.last_mount_time);
+        put_u32(out, 48, self.last_written_time);
+        put_u16(out, 52, self.mount_count);
+        put_u16(out, 54, self.max_mount_count);
+        put_u16(out, 56, self.magic);
+        put_u16(out, 58, self.fs_state);
+        put_u16(out, 60, self.error_handling);
+        put_u16(out, 62, self.version_minor);
+        put_u32(out, 64, self.last_check_time);
+        put_u32(out, 68, self.check_interval);
+        put_u32(out, 72, self.creator_os);
+        put_u32(out, 76, self.version_major);
+        put_u16(out, 80, self.reserved_uid);
+        put_u16(out, 82, self.reserved_gid);
+        put_u32(out, 84, self.first_inode);
+        put_u16(out, 88, self.inode_size);
+        put_u16(out, 90, self.block_group);
+        put_u32(out, 92, self.feature_compat);
+        put_u32(out, 96, self.feature_incompat);
+        put_u32(out, 100, self.feature_ro_compat);
+        out[104..120].copy_from_slice(&self.uuid);
+        out[120..136].copy_from_slice(&self.volume_name);
+        out[136..200].copy_from_slice(&self.last_mounted);
+        put_u32(out, 200, self.algo_bitmap);
+        out[204..Self::SIZE].copy_from_slice(&self._padding);
+    }
+}
+
+impl BlockGroupDescriptor {
+    pub(crate) const SIZE: usize = size_of::<Self>();
+
+    /// Parse one 32-byte block-group descriptor out of the BGD table block.
+    pub(crate) fn parse(buf: &[u8]) -> Option<Self> {
+        Some(Self {
+            block_bitmap: le_u32(buf, 0)?,
+            inode_bitmap: le_u32(buf, 4)?,
+            inode_table: le_u32(buf, 8)?,
+            free_blocks_count: le_u16(buf, 12)?,
+            free_inodes_count: le_u16(buf, 14)?,
+            used_dirs_count: le_u16(buf, 16)?,
+            _padding: le_u16(buf, 18)?,
+            _reserved: buf.get(20..Self::SIZE)?.try_into().ok()?,
+        })
+    }
+
+    /// Serialize to the exact-size 32-byte descriptor image.
+    pub(crate) fn serialize(&self, out: &mut [u8]) {
+        put_u32(out, 0, self.block_bitmap);
+        put_u32(out, 4, self.inode_bitmap);
+        put_u32(out, 8, self.inode_table);
+        put_u16(out, 12, self.free_blocks_count);
+        put_u16(out, 14, self.free_inodes_count);
+        put_u16(out, 16, self.used_dirs_count);
+        put_u16(out, 18, self._padding);
+        out[20..Self::SIZE].copy_from_slice(&self._reserved);
+    }
+}
+
+/// The 15 block-pointer words of an inode (`direct_blocks[0..12]` plus the
+/// three indirection pointers): bytes 40..100 of the serialized form. A fast
+/// symlink's target lives in exactly this window — Linux's convention, so a
+/// target written here is readable by Linux and e2fsck unchanged
+/// (docs/archive/AKUMA_EXT2_CLEANUP.md §3).
+pub(crate) const INODE_POINTER_WORDS: usize = 15;
+pub(crate) const INODE_POINTERS_OFFSET: usize = offset_of!(Inode, direct_blocks);
+
+impl Inode {
+    pub(crate) const SIZE: usize = size_of::<Self>();
+
+    /// The `i`-th pointer word (0..[`INODE_POINTER_WORDS`]) as a plain field
+    /// access. This is what lets the fast-symlink window be read and written
+    /// byte-exactly without ever taking a reference into a packed struct or
+    /// reinterpreting the inode as bytes.
+    fn pointer_word(&self, i: usize) -> u32 {
+        debug_assert!(i < INODE_POINTER_WORDS);
+        match i {
+            0..=11 => self.direct_blocks[i],
+            12 => self.indirect_block,
+            13 => self.double_indirect_block,
+            14 => self.triple_indirect_block,
+            _ => 0,
+        }
+    }
+
+    /// Mutable form of [`Self::pointer_word`].
+    fn pointer_word_mut(&mut self, i: usize) -> &mut u32 {
+        debug_assert!(i < INODE_POINTER_WORDS);
+        match i {
+            0..=11 => &mut self.direct_blocks[i],
+            12 => &mut self.indirect_block,
+            13 => &mut self.double_indirect_block,
+            _ => &mut self.triple_indirect_block,
+        }
+    }
+
+    /// Store a fast-symlink target in the pointer-word window, zeroing it
+    /// first. `target` longer than [`FAST_SYMLINK_MAX`] is truncated by the
+    /// caller (the fast/slow split happens before this is reached).
+    pub(crate) fn set_fast_symlink_target(&mut self, target: &[u8]) {
+        for w in 0..INODE_POINTER_WORDS {
+            *self.pointer_word_mut(w) = 0;
+        }
+        for (i, &b) in target.iter().take(FAST_SYMLINK_MAX).enumerate() {
+            *self.pointer_word_mut(i / 4) |= u32::from(b) << (8 * (i % 4));
+        }
+    }
+
+    /// Read back a fast-symlink target of `len` bytes (≤ [`FAST_SYMLINK_MAX`])
+    /// from the pointer-word window, little-endian — the exact inverse of
+    /// [`Self::set_fast_symlink_target`], and the exact bytes 40..100 of the
+    /// serialized inode.
+    pub(crate) fn fast_symlink_target(&self, len: usize) -> [u8; FAST_SYMLINK_MAX] {
+        let mut out = [0u8; FAST_SYMLINK_MAX];
+        for (i, b) in out.iter_mut().take(len).enumerate() {
+            *b = (self.pointer_word(i / 4) >> (8 * (i % 4))) as u8;
+        }
+        out
+    }
+
+    /// Parse one [`Self::SIZE`]-byte inode-table entry. `buf` may be longer
+    /// (rev-1 filesystems with larger on-disk inodes): only the first 128 bytes
+    /// are read, and bounds-checking makes a short buffer `None` instead of an
+    /// over-read — the mount path separately rejects `inode_size < 128`.
+    pub(crate) fn parse(buf: &[u8]) -> Option<Self> {
+        let mut direct_blocks = [0u32; 12];
+        for (i, w) in direct_blocks.iter_mut().enumerate() {
+            *w = le_u32(buf, INODE_POINTERS_OFFSET + i * 4)?;
+        }
+        Some(Self {
+            type_perms: le_u16(buf, 0)?,
+            uid: le_u16(buf, 2)?,
+            size_lower: le_u32(buf, 4)?,
+            access_time: le_u32(buf, 8)?,
+            creation_time: le_u32(buf, 12)?,
+            modification_time: le_u32(buf, 16)?,
+            deletion_time: le_u32(buf, 20)?,
+            gid: le_u16(buf, 24)?,
+            hard_links: le_u16(buf, 26)?,
+            sectors_used: le_u32(buf, 28)?,
+            flags: le_u32(buf, 32)?,
+            os_specific_1: le_u32(buf, 36)?,
+            direct_blocks,
+            indirect_block: le_u32(buf, 88)?,
+            double_indirect_block: le_u32(buf, 92)?,
+            triple_indirect_block: le_u32(buf, 96)?,
+            generation: le_u32(buf, 100)?,
+            file_acl: le_u32(buf, 104)?,
+            size_upper: le_u32(buf, 108)?,
+            fragment_addr: le_u32(buf, 112)?,
+            os_specific_2: buf.get(116..Self::SIZE)?.try_into().ok()?,
+        })
+    }
+
+    /// Serialize to the exact-size 128-byte inode-table entry.
+    pub(crate) fn serialize(&self, out: &mut [u8]) {
+        put_u16(out, 0, self.type_perms);
+        put_u16(out, 2, self.uid);
+        put_u32(out, 4, self.size_lower);
+        put_u32(out, 8, self.access_time);
+        put_u32(out, 12, self.creation_time);
+        put_u32(out, 16, self.modification_time);
+        put_u32(out, 20, self.deletion_time);
+        put_u16(out, 24, self.gid);
+        put_u16(out, 26, self.hard_links);
+        put_u32(out, 28, self.sectors_used);
+        put_u32(out, 32, self.flags);
+        put_u32(out, 36, self.os_specific_1);
+        for (i, w) in self.direct_blocks.iter().enumerate() {
+            put_u32(out, INODE_POINTERS_OFFSET + i * 4, *w);
+        }
+        put_u32(out, 88, self.indirect_block);
+        put_u32(out, 92, self.double_indirect_block);
+        put_u32(out, 96, self.triple_indirect_block);
+        put_u32(out, 100, self.generation);
+        put_u32(out, 104, self.file_acl);
+        put_u32(out, 108, self.size_upper);
+        put_u32(out, 112, self.fragment_addr);
+        out[116..Self::SIZE].copy_from_slice(&self.os_specific_2);
+    }
+}
+
+impl DirEntryRaw {
+    /// Parse the fixed 8-byte header at the start of `buf` (callers pass the
+    /// directory slice from the entry's own offset). `None` on a short tail —
+    /// every caller's loop guard already promises 8 bytes, so this is belt
+    /// and braces, not the primary defense.
+    pub(crate) fn parse(buf: &[u8]) -> Option<Self> {
+        Some(Self {
+            inode: le_u32(buf, 0)?,
+            rec_len: le_u16(buf, 4)?,
+            name_len: *buf.get(6)?,
+            file_type: *buf.get(7)?,
+        })
+    }
+
+    /// Serialize the 8-byte header into `out` at its start. The entry's
+    /// `rec_len` padding (a real entry's `rec_len` may exceed
+    /// header + name length) lives outside the header and is untouched here.
+    pub(crate) fn serialize(&self, out: &mut [u8]) {
+        put_u32(out, 0, self.inode);
+        put_u16(out, 4, self.rec_len);
+        out[6] = self.name_len;
+        out[7] = self.file_type;
+    }
 }
 
 // ============================================================================
@@ -1106,8 +1475,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let mut sb_buf = [0u8; 1024];
         dev.read_bytes(SUPERBLOCK_OFFSET, &mut sb_buf).map_err(|_| FsError::IoError)?;
 
-        let superblock: Superblock =
-            unsafe { core::ptr::read_unaligned(sb_buf.as_ptr() as *const _) };
+        let superblock = Superblock::parse(&sb_buf).ok_or(FsError::Corrupt)?;
 
         let magic = superblock.magic;
         let block_size_log = superblock.block_size_log;
@@ -1122,12 +1490,44 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Err(FsError::NoFilesystem);
         }
 
+        // ── On-disk arithmetic validation (AKUMA_EXT2_CLEANUP.md §2.3) ──────
+        //
+        // Everything below feeds a division, a shift, or a heap allocation
+        // length further down. A corrupt-but-magic-matching image used to be
+        // able to panic at mount (÷0, shift overflow) or read past a heap
+        // allocation (`read_inode` blitting 128 bytes out of an
+        // `inode_size`-byte buffer). A filesystem driver must survive a
+        // corrupted disk image, so reject it here instead.
+        //
+        // Max block size 64 KiB: `block_size_log` 0..=6 is the range Linux
+        // accepts (mke2fs -b 1024..65536); anything above would wrap the
+        // shift into a garbage block size.
+        if block_size_log > 6 {
+            return Err(FsError::Corrupt);
+        }
+        if blocks_per_group == 0 || inodes_per_group == 0 {
+            // Both divide: block_group_count below, and inode-table indexing
+            // (`inode_idx / inodes_per_group`) on every inode read.
+            return Err(FsError::Corrupt);
+        }
+        if total_blocks < superblock.first_data_block {
+            // `block_group_count` subtracts these; the underflow used to wrap
+            // into a garbage group count on a corrupt image.
+            return Err(FsError::Corrupt);
+        }
+
         let block_size = 1024usize << block_size_log;
         let inode_size = if version_major >= 1 {
             sb_inode_size
         } else {
+            // Revision 0 has no inode_size field; the entry is 128 bytes.
             128
         };
+        // A whole `Inode` is read out of each `inode_size`-byte table entry —
+        // anything smaller is the heap over-read §2.3 documents.
+        if (inode_size as usize) < size_of::<Inode>() {
+            return Err(FsError::Corrupt);
+        }
         let first_data_block = superblock.first_data_block;
         let block_group_count =
             (total_blocks - first_data_block + blocks_per_group - 1) / blocks_per_group;
@@ -1440,13 +1840,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     }
 
     fn write_superblock(&self, state: &Ext2State) -> Result<(), FsError> {
-        let buf = unsafe {
-            core::slice::from_raw_parts(
-                &state.superblock as *const Superblock as *const u8,
-                size_of::<Superblock>(),
-            )
-        };
-        self.dev.write_bytes(SUPERBLOCK_OFFSET, buf).map_err(|_| FsError::IoError)?;
+        let mut buf = [0u8; size_of::<Superblock>()];
+        state.superblock.serialize(&mut buf);
+        self.dev.write_bytes(SUPERBLOCK_OFFSET, &buf).map_err(|_| FsError::IoError)?;
         Ok(())
     }
 
@@ -1509,18 +1905,14 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let offset = Self::bgd_offset(state, group);
         let mut buf = [0u8; size_of::<BlockGroupDescriptor>()];
         self.read_range(state, offset, &mut buf)?;
-        Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const _) })
+        BlockGroupDescriptor::parse(&buf).ok_or(FsError::Corrupt)
     }
 
     fn write_bgd(&self, state: &Ext2State, group: u32, bgd: &BlockGroupDescriptor) -> Result<(), FsError> {
         let offset = Self::bgd_offset(state, group);
-        let buf = unsafe {
-            core::slice::from_raw_parts(
-                bgd as *const BlockGroupDescriptor as *const u8,
-                size_of::<BlockGroupDescriptor>(),
-            )
-        };
-        self.write_range(state, offset, buf)
+        let mut buf = [0u8; size_of::<BlockGroupDescriptor>()];
+        bgd.serialize(&mut buf);
+        self.write_range(state, offset, &buf)
     }
 
     // ========================================================================
@@ -1684,7 +2076,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let mut buf = vec![0u8; state.inode_size as usize];
         self.read_range(state, inode_offset, &mut buf)?;
 
-        Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const _) })
+        Inode::parse(&buf).ok_or(FsError::Corrupt)
     }
 
     fn write_inode(&self, state: &Ext2State, inode_num: u32, inode: &Inode) -> Result<(), FsError> {
@@ -1701,10 +2093,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let inode_offset = inode_table as u64 * state.block_size as u64
             + index_in_group as u64 * state.inode_size as u64;
 
-        let buf = unsafe {
-            core::slice::from_raw_parts(inode as *const Inode as *const u8, size_of::<Inode>())
-        };
-        self.write_range(state, inode_offset, buf)
+        let mut buf = [0u8; size_of::<Inode>()];
+        inode.serialize(&mut buf);
+        self.write_range(state, inode_offset, &buf)
     }
 
     // ========================================================================
@@ -2322,8 +2713,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let mut offset = 0;
 
         while offset + DIR_ENTRY_HEADER_SIZE <= data.len() {
-            let entry: DirEntryRaw =
-                unsafe { core::ptr::read_unaligned(data[offset..].as_ptr() as *const _) };
+            let entry: DirEntryRaw = DirEntryRaw::parse(&data[offset..])
+                .expect("loop guard promises DIR_ENTRY_HEADER_SIZE bytes");
 
             if entry.rec_len == 0 {
                 break;
@@ -2397,8 +2788,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         // Try to find space in existing entries
         let mut offset = 0;
         while offset + DIR_ENTRY_HEADER_SIZE <= dir_data.len() {
-            let entry: DirEntryRaw =
-                unsafe { core::ptr::read_unaligned(dir_data[offset..].as_ptr() as *const _) };
+            let entry: DirEntryRaw = DirEntryRaw::parse(&dir_data[offset..])
+                .expect("loop guard promises DIR_ENTRY_HEADER_SIZE bytes");
 
             if entry.rec_len == 0 {
                 break;
@@ -2433,13 +2824,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     file_type,
                 };
 
-                let entry_bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        &new_entry as *const DirEntryRaw as *const u8,
-                        DIR_ENTRY_HEADER_SIZE,
-                    )
-                };
-                dir_data[offset..offset + DIR_ENTRY_HEADER_SIZE].copy_from_slice(entry_bytes);
+                new_entry.serialize(&mut dir_data[offset..offset + DIR_ENTRY_HEADER_SIZE]);
                 dir_data[offset + DIR_ENTRY_HEADER_SIZE
                     ..offset + DIR_ENTRY_HEADER_SIZE + name_bytes.len()]
                     .copy_from_slice(name_bytes);
@@ -2467,14 +2852,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             file_type,
         };
 
-        let entry_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &new_entry as *const DirEntryRaw as *const u8,
-                DIR_ENTRY_HEADER_SIZE,
-            )
-        };
-        dir_data[new_block_offset..new_block_offset + DIR_ENTRY_HEADER_SIZE]
-            .copy_from_slice(entry_bytes);
+        new_entry.serialize(&mut dir_data[new_block_offset..new_block_offset + DIR_ENTRY_HEADER_SIZE]);
         dir_data[new_block_offset + DIR_ENTRY_HEADER_SIZE
             ..new_block_offset + DIR_ENTRY_HEADER_SIZE + name_bytes.len()]
             .copy_from_slice(name_bytes);
@@ -2498,8 +2876,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let mut prev_offset: Option<usize> = None;
 
         while offset + DIR_ENTRY_HEADER_SIZE <= dir_data.len() {
-            let entry: DirEntryRaw =
-                unsafe { core::ptr::read_unaligned(dir_data[offset..].as_ptr() as *const _) };
+            let entry: DirEntryRaw = DirEntryRaw::parse(&dir_data[offset..])
+                .expect("loop guard promises DIR_ENTRY_HEADER_SIZE bytes");
 
             if entry.rec_len == 0 {
                 break;
@@ -2523,9 +2901,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                             // can reuse.
                             let (edit_start, edit_end) = match prev_offset {
                                 Some(prev) if prev / bs == offset / bs => {
-                                    let prev_entry: DirEntryRaw = unsafe {
-                                        core::ptr::read_unaligned(dir_data[prev..].as_ptr() as *const _)
-                                    };
+                                    let prev_entry: DirEntryRaw = DirEntryRaw::parse(&dir_data[prev..])
+                                        .expect("prev points at a header the scan already read");
                                     let new_rec_len = prev_entry.rec_len + entry.rec_len;
                                     dir_data[prev + 4] = new_rec_len as u8;
                                     dir_data[prev + 5] = (new_rec_len >> 8) as u8;
@@ -2580,12 +2957,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         };
 
         if target_bytes.len() <= FAST_SYMLINK_MAX {
-            // Fast symlink: store target directly in the block pointer fields.
-            // Inode is packed, so use addr_of_mut! to avoid misaligned references.
-            let dst_ptr = core::ptr::addr_of_mut!(inode.direct_blocks) as *mut u8;
-            unsafe {
-                core::ptr::copy_nonoverlapping(target_bytes.as_ptr(), dst_ptr, target_bytes.len());
-            }
+            // Fast symlink: store the target across the 15 pointer words —
+            // bytes 40..100 of the serialized inode, Linux's exact convention
+            // (docs/archive/AKUMA_EXT2_CLEANUP.md §3).
+            inode.set_fast_symlink_target(target_bytes);
         } else {
             // Slow symlink: allocate data block(s)
             self.write_inode_data(state, inode_num, &mut inode, target_bytes)?;
@@ -2642,10 +3017,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
         let len = inode.size_lower as usize;
         if inode.sectors_used == 0 && len <= FAST_SYMLINK_MAX {
-            // Fast symlink: read from block pointer fields.
-            let src_ptr = core::ptr::addr_of!(inode.direct_blocks) as *const u8;
-            let mut buf = [0u8; FAST_SYMLINK_MAX];
-            unsafe { core::ptr::copy_nonoverlapping(src_ptr, buf.as_mut_ptr(), len); }
+            // Fast symlink: the target is in the 15 pointer words — bytes
+            // 40..100 of the serialized inode, not just `direct_blocks`.
+            let buf = inode.fast_symlink_target(len);
             let s = core::str::from_utf8(&buf[..len]).map_err(|_| FsError::IoError)?;
             Ok(String::from(s))
         } else {
@@ -3165,13 +3539,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             name_len: 1,
             file_type: FT_DIR,
         };
-        let entry_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &dot_entry as *const DirEntryRaw as *const u8,
-                DIR_ENTRY_HEADER_SIZE,
-            )
-        };
-        dir_data[0..DIR_ENTRY_HEADER_SIZE].copy_from_slice(entry_bytes);
+        dot_entry.serialize(&mut dir_data[0..DIR_ENTRY_HEADER_SIZE]);
         dir_data[DIR_ENTRY_HEADER_SIZE] = b'.';
 
         // .. entry
@@ -3181,13 +3549,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             name_len: 2,
             file_type: FT_DIR,
         };
-        let entry_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &dotdot_entry as *const DirEntryRaw as *const u8,
-                DIR_ENTRY_HEADER_SIZE,
-            )
-        };
-        dir_data[12..12 + DIR_ENTRY_HEADER_SIZE].copy_from_slice(entry_bytes);
+        dotdot_entry.serialize(&mut dir_data[12..12 + DIR_ENTRY_HEADER_SIZE]);
         dir_data[12 + DIR_ENTRY_HEADER_SIZE] = b'.';
         dir_data[12 + DIR_ENTRY_HEADER_SIZE + 1] = b'.';
 

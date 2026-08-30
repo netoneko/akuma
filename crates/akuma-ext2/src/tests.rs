@@ -1822,3 +1822,293 @@ fn clock_cache_flush_dirty_respects_keep_filter() {
     c.flush_dirty(&|_| true, &mut sink).unwrap();
     assert_eq!(&*flushed.borrow(), &[10, 11], "the second phase picks up the rest");
 }
+
+// ============================================================================
+// On-disk layout codec (docs/archive/AKUMA_EXT2_CLEANUP.md §2.2, §5 step 2)
+// ============================================================================
+
+use crate::ext2::{
+    BlockGroupDescriptor, DirEntryRaw, Inode, Superblock, DIR_ENTRY_HEADER_SIZE,
+    FAST_SYMLINK_MAX, INODE_POINTERS_OFFSET,
+};
+
+/// A superblock with a distinct value in every field, so a round-trip catches
+/// a wrong offset (two swapped fields of the same width cannot both survive).
+fn sample_superblock() -> Superblock {
+    Superblock {
+        total_inodes: 0x0102_0304,
+        total_blocks: 0x1112_1314,
+        superuser_blocks: 5,
+        unallocated_blocks: 0x2122_2324,
+        unallocated_inodes: 0x3132_3334,
+        first_data_block: 1,
+        block_size_log: 0,
+        fragment_size_log: 0,
+        blocks_per_group: 8192,
+        fragments_per_group: 8192,
+        inodes_per_group: 2048,
+        last_mount_time: 1_000,
+        last_written_time: 2_000,
+        mount_count: 3,
+        max_mount_count: 20,
+        magic: 0xEF53,
+        fs_state: 1,
+        error_handling: 1,
+        version_minor: 4,
+        last_check_time: 3_000,
+        check_interval: 18_000,
+        creator_os: 0,
+        version_major: 1,
+        reserved_uid: 0,
+        reserved_gid: 0,
+        first_inode: 11,
+        inode_size: 128,
+        block_group: 0,
+        feature_compat: 0x4,
+        feature_incompat: 0x1,
+        feature_ro_compat: 0x2,
+        uuid: [0xA5; 16],
+        volume_name: *b"akuma-test-image",
+        last_mounted: [b'/'; 64],
+        algo_bitmap: 7,
+        _padding: core::array::from_fn(|i| (i % 251) as u8),
+    }
+}
+
+/// `parse(serialize(x)) == x` for the superblock — the test a misplaced offset
+/// fails instead of a live disk. The padding is part of the contract: a
+/// write-back must be byte-faithful to what was read, reserved bytes included.
+#[test]
+fn superblock_roundtrip() {
+    let sb = sample_superblock();
+    let mut buf = [0u8; Superblock::SIZE];
+    buf.fill(0xEE); // serialize must overwrite every byte, padding included
+    sb.serialize(&mut buf);
+    assert_eq!(Superblock::parse(&buf), Some(sb));
+}
+
+/// The magic the mount path checks sits at the spec's offset 56 — parse and
+/// the fixture images agree, which the mount tests exercise end to end.
+#[test]
+fn superblock_parse_reads_fixture_magic() {
+    let dev = load_fixture("test.ext2");
+    let mut sb_buf = [0u8; Superblock::SIZE];
+    dev.read_bytes(1024, &mut sb_buf).unwrap();
+    let sb = Superblock::parse(&sb_buf).expect("fixture superblock parses");
+    assert_eq!(sb.magic, 0xEF53);
+    assert_eq!(sb.block_size_log, 0, "fixture is a 1 KiB-block image");
+}
+
+#[test]
+fn superblock_parse_rejects_short_buffer() {
+    let sb = sample_superblock();
+    let mut buf = [0u8; Superblock::SIZE];
+    sb.serialize(&mut buf);
+    assert_eq!(Superblock::parse(&buf[..1023]), None);
+}
+
+fn sample_bgd() -> BlockGroupDescriptor {
+    BlockGroupDescriptor {
+        block_bitmap: 0x0102_0304,
+        inode_bitmap: 0x1112_1314,
+        inode_table: 0x2122_2324,
+        free_blocks_count: 0x3132,
+        free_inodes_count: 0x4142,
+        used_dirs_count: 0x5152,
+        _padding: 0,
+        _reserved: [0; 12],
+    }
+}
+
+#[test]
+fn bgd_roundtrip() {
+    let bgd = sample_bgd();
+    let mut buf = [0u8; BlockGroupDescriptor::SIZE];
+    buf.fill(0xEE);
+    bgd.serialize(&mut buf);
+    assert_eq!(BlockGroupDescriptor::parse(&buf), Some(bgd));
+    assert_eq!(BlockGroupDescriptor::parse(&buf[..31]), None);
+}
+
+fn sample_inode() -> Inode {
+    Inode {
+        type_perms: 0o100_644,
+        uid: 1000,
+        size_lower: 0x0102_0304,
+        access_time: 1_111,
+        creation_time: 2_222,
+        modification_time: 3_333,
+        deletion_time: 0,
+        gid: 1001,
+        hard_links: 2,
+        sectors_used: 0x4142_4344,
+        flags: 0x5152_5354,
+        os_specific_1: 0x6162_6364,
+        direct_blocks: core::array::from_fn(|i| 100 + i as u32),
+        indirect_block: 0x7172_7374,
+        double_indirect_block: 0x8182_8384,
+        triple_indirect_block: 0x9192_9394,
+        generation: 0xA1A2_A3A4,
+        file_acl: 0xB1B2_B3B4,
+        size_upper: 0xC1C2_C3C4,
+        fragment_addr: 0xD1D2_D3D4,
+        os_specific_2: [0x5A; 12],
+    }
+}
+
+#[test]
+fn inode_roundtrip() {
+    let inode = sample_inode();
+    let mut buf = [0u8; Inode::SIZE];
+    buf.fill(0xEE);
+    inode.serialize(&mut buf);
+    assert_eq!(Inode::parse(&buf), Some(inode));
+    assert_eq!(Inode::parse(&buf[..127]), None);
+}
+
+/// A larger on-disk inode (rev-1 filesystems commonly use 256) parses from its
+/// first 128 bytes — the tail is other people's data and must not be read.
+#[test]
+fn inode_parse_reads_only_the_first_128_bytes_of_a_big_entry() {
+    let inode = sample_inode();
+    let mut entry = [0u8; 256];
+    entry[128..].fill(0x99);
+    inode.serialize(&mut entry[..Inode::SIZE]);
+    assert_eq!(Inode::parse(&entry), Some(inode));
+}
+
+/// The fast-symlink window is bytes 40..100 of the *serialized* inode — all
+/// 15 pointer words, not just `direct_blocks` (§3). Stopping at 48 bytes would
+/// cap targets at 48 and break on-disk Linux compatibility.
+#[test]
+fn fast_symlink_target_is_bytes_40_to_100_of_the_serialized_inode() {
+    let target: Vec<u8> = (0..FAST_SYMLINK_MAX).map(|i| b"0123456789abcdef"[i % 16]).collect();
+    assert_eq!(target.len(), 60);
+
+    let mut inode = Inode::default();
+    inode.set_fast_symlink_target(&target);
+
+    let mut buf = [0u8; Inode::SIZE];
+    inode.serialize(&mut buf);
+    assert_eq!(&buf[INODE_POINTERS_OFFSET..INODE_POINTERS_OFFSET + 60], &target[..]);
+
+    assert_eq!(&inode.fast_symlink_target(60), target.as_slice());
+}
+
+/// Exactly 60 bytes works (the maximum), and the untouched window tail reads
+/// back as zeros so a shorter target cannot smuggle stale pointer bytes.
+#[test]
+fn fast_symlink_window_beyond_the_target_is_zeroed() {
+    let mut inode = Inode::default();
+    inode.set_fast_symlink_target(b"short");
+    let raw = inode.fast_symlink_target(FAST_SYMLINK_MAX);
+    assert_eq!(&raw[..5], b"short");
+    assert!(raw[5..].iter().all(|&b| b == 0));
+
+    // And a fresh target overwrites a previous one completely.
+    inode.set_fast_symlink_target(&[0xFF; FAST_SYMLINK_MAX]);
+    let raw = inode.fast_symlink_target(FAST_SYMLINK_MAX);
+    assert!(raw.iter().all(|&b| b == 0xFF));
+}
+
+fn sample_dirent() -> DirEntryRaw {
+    DirEntryRaw { inode: 0x0102_0304, rec_len: 0x1112, name_len: 0x13, file_type: 2 }
+}
+
+#[test]
+fn dirent_roundtrip() {
+    let entry = sample_dirent();
+    let mut buf = [0u8; DIR_ENTRY_HEADER_SIZE];
+    buf.fill(0xEE);
+    entry.serialize(&mut buf);
+    assert_eq!(DirEntryRaw::parse(&buf), Some(entry));
+    assert_eq!(DirEntryRaw::parse(&buf[..7]), None);
+}
+
+/// A real directory entry's `rec_len` usually exceeds header + name (entries
+/// are padded toward the next 4-byte boundary, and the last one in a block
+/// absorbs the rest). The header parses identically whatever the padding.
+#[test]
+fn dirent_with_padded_rec_len_roundtrips() {
+    let entry = DirEntryRaw { inode: 42, rec_len: 1004, name_len: 3, file_type: 1 };
+    let mut dir_data = vec![0u8; 1024];
+    entry.serialize(&mut dir_data);
+    dir_data[DIR_ENTRY_HEADER_SIZE..DIR_ENTRY_HEADER_SIZE + 3].copy_from_slice(b"abc");
+    // rec_len 1004 covers the rest of the block; the name bytes beyond "abc"
+    // are padding garbage and must not affect the parsed header.
+    dir_data[DIR_ENTRY_HEADER_SIZE + 3] = 0xAA;
+
+    let parsed = DirEntryRaw::parse(&dir_data).expect("full-block dirent parses");
+    assert_eq!(parsed, entry);
+}
+
+// ── Mount-path validation of disk-supplied arithmetic (§2.3) ────────────────
+//
+// Each of these crafts a corrupt-but-magic-matching image by patching one
+// superblock field of the fixture. Before §2.3 these panicked at mount (÷0,
+// shift overflow), wrapped into garbage (the block_group_count underflow), or
+// read past a heap allocation (inode_size < 128). A filesystem driver must
+// reject them, not die on them.
+
+/// Patch one little-endian superblock field in a copy of the fixture image.
+fn fixture_with_sb_field(offset: u64, bytes: &[u8]) -> MemBlockDevice {
+    let path = alloc::format!(
+        "{}/tests/fixtures/test.ext2",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    extern crate std;
+    let mut image = std::fs::read(&path).expect("read fixture");
+    let at = 1024 + offset as usize;
+    image[at..at + bytes.len()].copy_from_slice(bytes);
+    MemBlockDevice::from_bytes(&image)
+}
+
+fn assert_mount_rejected(dev: MemBlockDevice) {
+    match Ext2Filesystem::new(dev, || 0) {
+        Err(akuma_vfs::FsError::Corrupt) => {}
+        Err(e) => panic!("expected FsError::Corrupt, got {e:?}"),
+        Ok(_) => panic!("expected FsError::Corrupt, got a successful mount"),
+    }
+}
+
+/// `inode_size < 128` made `read_inode` blit a whole `Inode` out of a smaller
+/// heap buffer — the one §2.3 finding that was memory-unsafe, not just a panic.
+#[test]
+fn mount_rejects_inode_size_below_the_inode_struct() {
+    assert_mount_rejected(fixture_with_sb_field(88, &64u16.to_le_bytes()));
+}
+
+#[test]
+fn mount_rejects_zero_inode_size() {
+    assert_mount_rejected(fixture_with_sb_field(88, &0u16.to_le_bytes()));
+}
+
+/// `block_group_count = (...)/blocks_per_group` divided by a disk-supplied 0.
+#[test]
+fn mount_rejects_zero_blocks_per_group() {
+    assert_mount_rejected(fixture_with_sb_field(32, &0u32.to_le_bytes()));
+}
+
+/// `inode_idx / inodes_per_group` on every inode read divided by 0 — this one
+/// panicked past mount, at the first lookup, before the §2.3 sweep.
+#[test]
+fn mount_rejects_zero_inodes_per_group() {
+    assert_mount_rejected(fixture_with_sb_field(40, &0u32.to_le_bytes()));
+}
+
+/// `1024usize << block_size_log` with a disk-supplied log: debug builds
+/// panicked on the shift overflow, release builds wrapped into a garbage
+/// block size that mistook every later byte on the disk.
+#[test]
+fn mount_rejects_block_size_log_over_the_spec_range() {
+    assert_mount_rejected(fixture_with_sb_field(24, &7u32.to_le_bytes()));
+    assert_mount_rejected(fixture_with_sb_field(24, &31u32.to_le_bytes()));
+    assert_mount_rejected(fixture_with_sb_field(24, &u32::MAX.to_le_bytes()));
+}
+
+/// `(total_blocks - first_data_block)` underflowed when a corrupt image put
+/// the first data block past the end of the device.
+#[test]
+fn mount_rejects_first_data_block_past_total_blocks() {
+    assert_mount_rejected(fixture_with_sb_field(20, &u32::MAX.to_le_bytes()));
+}
