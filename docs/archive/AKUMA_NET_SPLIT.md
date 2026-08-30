@@ -15,10 +15,11 @@ way the rest should be).
 
 ## 1. What is in the crate
 
-8,633 lines, second only to `akuma-exec` (28,388). But 1,951 of those are its
-own tests, so the production body is 6,682.
+At survey time 8,633 lines, second only to `akuma-exec` (28,388) — of which
+1,951 were its own tests, so the production body was 6,682. **8,845 now**: §4
+added `frames.rs`/`nic.rs` and tests, §1.2 deleted 504 lines.
 
-| file | lines | what | smoltcp-gated | `unsafe` |
+| file | lines (at survey) | what | smoltcp-gated | `unsafe` |
 |---|---|---|---|---|
 | `smoltcp_net.rs` | 2,069 | virtio device wrapper, loopback ring, `poll()`, socket set, `TcpStream` | whole file | **22** |
 | `socket.rs` | 1,791 | `SOCKET_TABLE`, bind/listen/accept/connect/send/recv, wait loop | 60 attrs | 0 |
@@ -27,7 +28,7 @@ own tests, so the production body is 6,682.
 | `tests.rs` | 488 | 37 tests | — | 0 |
 | `nicstat.rs` | 443 | `net-profile` counters | no | 0 |
 | `virtio_rings.rs` | 400 | `net-noalloc` static RX/TX rings | yes | **16** |
-| `locks.rs` + `lock_tests.rs` | 504 | lock hierarchy + 8 tests | no | 0 |
+| ~~`locks.rs` + `lock_tests.rs`~~ | ~~504~~ | ~~lock hierarchy + 8 tests~~ — **deleted, §1.2** | no | 0 |
 | `rump_tap.rs` | 151 | raw L2 NIC for rump | no | **3** |
 | `runtime.rs`, `dns.rs`, `lib.rs` | 305 | callback table, resolver, wiring | mixed | 0 |
 
@@ -78,6 +79,53 @@ the same crate as the TCP/IP stack. That is an argument *for* extraction, and it
 is a different argument from "shed dead paths".
 
 ---
+
+### 1.2 504 lines that were deleted, not split (2026-08-30)
+
+`locks.rs` (359) + `lock_tests.rs` (145) — 5.4% of the crate — are **gone**.
+
+All 15 of their public symbols (`NETWORK_LOCK`, `SOCKET_TABLE_LOCK`,
+`acquire_network_lock`, `get_lock_stats`, the `LOCK_LEVEL_*` constants, …) had
+**zero references anywhere in the repo** outside the two files themselves. They
+were Phase 1 scaffolding from
+[`BKL_FINE_GRAINED_LOCKING_PLAN.md`](BKL_FINE_GRAINED_LOCKING_PLAN.md), written
+2026-07-24 and marked "✅ COMPLETE", for a Phase 2 that took a different route:
+`PreemptGuard` plus the existing `NETWORK`/`SOCKET_TABLE` spinlocks under
+`no-bkl-network`.
+
+They were also **not merely unused — they could not have worked**, which is why
+this is a delete rather than a wire-up:
+
+```rust
+pub fn acquire_network_lock(holder_id: u32) {
+    ...
+    let _guard = NETWORK_LOCK.lock();   // drops at end of function
+    mark_lock_held(LOCK_LEVEL_NETWORK);
+}   // <- exclusion ends here
+pub fn release_network_lock() {         // never touches NETWORK_LOCK
+    mark_lock_released(LOCK_LEVEL_NETWORK);
+    NETWORK_LOCK_HOLDER.store(LOCK_HOLDER_NONE, Ordering::Relaxed);
+}
+```
+
+The guard dropped at function return, so the "lock" granted no mutual exclusion
+at all; `HELD_LOCKS` was a single global `AtomicU32` rather than per-thread, so
+two cores would corrupt each other's ordering bits under `smp-shared`; and
+`LOCK_LEVEL_SOCKET` had no lock object behind it. A caller who trusted the doc
+comments would have gotten silent data races. That analysis is not new — it is
+[`REDIS_ROUND_TRIP_STAGE_TRACE.md`](REDIS_ROUND_TRIP_STAGE_TRACE.md) §2, which
+quotes the code and is now its surviving record.
+
+**One trap worth naming.** [`TRIM_FAT_DEAD_CODE.md`](TRIM_FAT_DEAD_CODE.md)
+records a near-miss: someone almost deleted `lock_tests.rs` alone, and that
+would have been wrong — it covered code that still existed. Deleting *both*
+together does not hit that trap. The "the tests use it, so it isn't dead"
+argument is circular once the tests are the only consumer; the question to ask
+is whether the module is reachable from *production*, and this one never was.
+
+Host tests went 149 → 138, which is exactly the 11 tests that covered only the
+deleted code. `cargo build --release`, `--no-default-features`, and clippy are
+all clean.
 
 ## 2. Test coverage
 
