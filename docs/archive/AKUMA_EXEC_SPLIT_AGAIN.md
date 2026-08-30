@@ -888,9 +888,20 @@ better starting position than the same extraction attempted before this split.
 ### 8.5 Also still open, from §7
 
 - The ThinLTO inlining measurement (§7.7) — the -214 KB `.text` is un-measured
-  and is a suspected fault-path regression, not a win.
-- `akuma-pmm`'s `forbid` (§7.9), which §8.3 would partly unblock.
+  and is a suspected fault-path regression, not a win. **This is the largest
+  unverified claim in this document.**
+- `akuma-pmm`'s `forbid` — **closed as won't-do**, not open: §8.6 explains why the
+  three remaining sites cannot leave the crate without a safe signature that lies.
 - The `threading` <-> `process` cycle (§4), untouched by design.
+- The rest of the `akuma-cpu` conversions: `akuma-mmu` (33 `asm!` sites),
+  `src/exceptions.rs` (48), `akuma-timer` (9), `akuma-exec` (15). Only
+  `akuma-pmm` has been converted.
+- An in-guest `cargo build` that runs to completion. The attempt on 2026-08-30
+  compiled ~10 crates and then died at 461 s on an **ssh channel timeout**
+  (exit 255), with the guest kernel showing 0 panics and 0 SIGSEGV — a harness
+  problem, not a kernel one (long exec channels need `nohup`, per
+  `docs/archive/`'s sshd keepalive note). Re-run it before trusting the ELF
+  loader change on a long workload.
 
 ---
 
@@ -1088,3 +1099,77 @@ Verified at `MEMORY=6144`, which previously panicked on both HEAD and this branc
                          dev-null/readback)
 PANIC count: 0    [TEST] count: 178
 ```
+
+---
+
+## 8.8 `akuma-elf` reached `forbid` — the write found an owner
+
+§8.7 got the crate to one `unsafe` site and called the rest irreducible. It was
+not. The obstacle was never the write itself; it was that no type in scope could
+*prove* the frame was owned.
+
+### What was missing, and where it turned out to be
+
+The safety argument for writing into a frame is "the caller owns this page". Three
+candidate owners were considered and two are lies:
+
+| candidate | proof? |
+|---|---|
+| a `PhysFrame` value | **no** — `PhysFrame::new` is safe, so anyone can mint one; the value proves nothing about ownership |
+| `akuma-pmm`'s allocator | **no** — it hands out frames but does not track who holds them (§8.6) |
+| `&mut UserAddressSpace` | **yes** — `&mut` proves exclusive access and the mapping is that object's own state |
+
+Every one of `akuma-elf`'s six writes went into a page that
+`UserAddressSpace::alloc_and_map` had just returned — the segment loader's, the
+relocation pass's, and the stack's alike. The owner was in scope the whole time,
+or one parameter away.
+
+So the primitive is a method, not a free function:
+
+```rust
+impl UserAddressSpace {
+    pub fn write_page_bytes(&mut self, page_va: usize, offset: usize, bytes: &[u8]) -> bool
+}
+```
+
+It lives in `akuma-mmu` (71 `unsafe` sites, the designated sink), re-derives the
+frame from its own page tables via `translate` rather than trusting a caller's PA,
+and asserts the window stays inside the page.
+
+### The three conversions
+
+- **`map_segment_eager`** already had `address_space: &mut UserAddressSpace`.
+- **`apply_relocations`** took only `mapped_pages: &BTreeMap<usize, usize>`, a PA
+  cache, by shared reference. It now takes `&mut UserAddressSpace` too — a
+  signature change that is an improvement on its own, because the write no longer
+  trusts a cached PA that could disagree with the live mapping.
+- **`UserStack`** held `frames: Vec<PhysFrame>` and indexed by frame number. It is
+  now `UserStack<'a>` borrowing the address space and keying by page VA. The
+  borrow works out under NLL: the stack's last use (`setup_linux_stack`) precedes
+  the address space's next use (the heap pre-alloc), so the borrow ends in time
+  and `loaded.address_space` still moves into `LoadedWithStack`.
+
+### Result
+
+| | before today | §8.7 | now |
+|---|---:|---:|---:|
+| `akuma-elf` `unsafe` sites | 6 | 1 | **0** (`forbid`) |
+
+`akuma-mmu` gained 1. That is the trade this document has argued for throughout:
+concentrate the `unsafe` in the crate whose job is the thing being vouched for,
+and let everything above it be checked.
+
+**Two crates that started 2026-08-30 in the "irreducible" column now carry
+`forbid`** — `akuma-bkl` (§7.9) and `akuma-elf`. In both cases the first analysis
+said it could not be done, and in both cases the analysis was wrong for the same
+reason: it examined the `unsafe` block and asked whether the *operation* could be
+made safe, instead of asking who owned the thing being operated on. The operation
+never changes. The owner is the question.
+
+### Verification
+
+Tree 1,031 tests; all 30 crates clippy `-D warnings` clean; `--release` and
+`--profile extreme-size` clean; boot suite unchanged. The no-regression gate is
+`scripts/verify_trim.py --tier all` diffed against a baseline worktree — this code
+runs on **every `exec`**, so a fault here is not subtle, but it is also not
+something a host test can reach.
