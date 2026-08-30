@@ -130,7 +130,7 @@ pub fn poll() -> bool {
             let mut i = 0;
             while i < net.pending_removal.len() {
                 let (handle, added_at) = net.pending_removal[i];
-                if !is_valid_handle(handle) {
+                if !is_valid_handle(&net.sockets, handle) {
                     corrupt_handles = corrupt_handles.saturating_add(1);
                     net.pending_removal.swap_remove(i);
                     continue;
@@ -156,7 +156,7 @@ pub fn poll() -> bool {
             let mut i = 0;
             while i < net.connecting.len() {
                 let (handle, started_at) = net.connecting[i];
-                if !is_valid_handle(handle) {
+                if !is_valid_handle(&net.sockets, handle) {
                     net.connecting.swap_remove(i);
                     continue;
                 }

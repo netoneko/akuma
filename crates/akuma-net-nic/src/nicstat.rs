@@ -202,7 +202,7 @@ mod imp {
     /// "elapsed = now" out of the sums.
     #[inline]
     pub(super) fn now_us() -> Option<u64> {
-        crate::runtime::try_runtime().map(|rt| (rt.uptime_us)())
+        akuma_primitives::net_runtime::try_runtime().map(|rt| (rt.uptime_us)())
     }
 
     pub(super) fn snapshot() -> NicStat {

@@ -1,0 +1,34 @@
+[package]
+name = "akuma-net-nic"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+# Static RX/TX frame rings + a non-blocking transmit path. Forwarded from the
+# kernel feature of the same name; OFF by default — it measured worse on
+# latency. See docs/archive/AKUMA_NET_ISSUES.md §7.
+net-noalloc = []
+# Per-packet RX/TX/poll timing. MEASUREMENT BUILDS ONLY.
+net-profile = []
+# Raise the socket budget on size-constrained profiles.
+many-sessions = []
+# The raw L2 path for NIC1 (`/dev/net/tap0`). A NIC driver, so it lives here
+# with the others — the device-independent half is `akuma-rump`.
+rump = ["dep:akuma-rump"]
+small-sockets = []
+
+[lints]
+workspace = true
+
+[dependencies]
+# NetRuntime (uptime_us, wake_netpoll), PreemptGuard, mmio::MmioReg, errno.
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-rump = { path = "../akuma-rump", optional = true }
+spinning_top = "0.3"
+# The shared virtio Hal + MMIO probe.
+akuma-virtio = { path = "../akuma-virtio" }
+virtio-drivers = { version = "0.13", default-features = false }
+# This crate owns the `smoltcp::phy::Device` impls, so it depends on smoltcp.
+# That is deliberate — see the crate docs' "Why smoltcp is here".
+smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"] }

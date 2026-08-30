@@ -500,6 +500,74 @@ third crate. The kernel currently reaches `akuma_net::nicstat` and
 `akuma_net::virtio_rings::ring_health` directly, so whichever way, those paths
 move or need re-exports.
 
+### 5.1c The target shape (decided 2026-08-30)
+
+§5.1b's two cycles dissolve if the *interface* moves below everything instead of
+the code moving sideways. Trait in `akuma-primitives`; the socket table, the
+smoltcp stack and the device layer become peers that each depend only on it.
+
+```
++---------------------------------------------------------------+
+| akuma-primitives   trait TcpStack/TcpSock, TcpState,           |
+|                    Handle, SocketAddrV4, NetRuntime            |
++--A--------------A------------------A------------------A-------+
+   |              |                  |                  |
++--+----------+ +-+------------+ +---+----------+ +-----+------+
+|net-sockets  | | net-smoltcp  | |  net-nic     | | net-unix   |
+|  ~1,800     | |   ~1,800     | |   ~1,750     | |   2,476    |
+| SOCKET_TABLE| | poll  init   | | frames  nic  | | untouched  |
+| wait loop   | | sockets udp  | | virtio_rings | |            |
+| mock impl   | | iface stream | | nicstat irq  | |            |
+|             | | state consts | | VirtioDevice | |            |
+|             | | impl TcpStack| | LoopbackDev  | |            |
+|  forbid OK  | |   forbid OK  | |  ALL unsafe  | |  forbid OK |
++-------------+ +------A-------+ +------A-------+ +------------+
+                       +--- uses -------+
+```
+
+**Why the trait goes in `primitives` and not its own leaf.** Raised the
+objection (it drags ~150 lines of socket vocabulary into a machine-level crate,
+and `akuma-syscalls-linux` refused `sockaddr_in` on that ground); overruled.
+Fewer crates, and a trait has no effects, which is the crate's actual membership
+test.
+
+**Why `net-nic` takes a smoltcp dependency.** The first draft kept it
+smoltcp-free so a future rump backend could share it, which put the five
+`RxToken` construction sites in `net-smoltcp` and left that crate unsafe. That
+was protecting a consumer that does not exist: the device cluster
+(`frames`/`nic`/`virtio_rings`) has exactly one user, the smoltcp device —
+`rump_tap` goes through `akuma_rump::RawNic` on a separate path entirely. So the
+`Device` impls move down with it and take their `unsafe` along.
+
+**Where the 9 `unsafe` sites in `smoltcp_net/` go:**
+
+| site | count | destination |
+|---|---|---|
+| `irq` — MMIO interrupt ack + TX doorbell | 2 | `net-nic` |
+| `device` — arena pointer to `&mut [u8]` for `RxToken` | 4 | `net-nic` |
+| `loopback` — same, loopback frame | 1 | `net-nic` |
+| `stream` — `transmute::<SocketHandle, usize>` | 2 | **deleted** |
+
+The last two go away rather than move: with the trait, `Handle` is *our* type,
+so the smoltcp impl maps `Handle -> SocketHandle` through an array it already
+keeps and `is_valid_handle` needs no transmute.
+
+**Result: 4 of 5 networking crates `forbid(unsafe_code)`, and every unsafe line
+in networking sits in one ~1,750-line crate with a single stated DMA contract.**
+
+Order of work:
+
+1. `NetRuntime` -> `akuma-primitives` (it is a `Copy` fn-pointer table behind
+   `Registered`, which already lives there).
+2. `akuma-net-nic`: `frames`, `nic`, `virtio_rings`, `nicstat`, `irq`, and the
+   two `Device` impls.
+3. Trait + neutral types into `akuma-primitives`.
+4. `socket.rs` onto the trait — 23 `with_network` blocks: 16 are single-method
+   and map 1:1, **7 batch 2-4 calls under one hold** and need the
+   borrow-inside-the-hold form or they lose atomicity, and `connect` stays whole
+   because it needs `iface.context()` alongside the socket.
+5. Split `net-sockets` / `net-smoltcp` — by then a file move.
+
 ### 5.2 Module splits — cheap, independent, do first
 
 - `socket.rs` (1,791) → `socket/{addr,table,wait,tcp,udp,opts,stat}.rs`. The 60

@@ -36,11 +36,14 @@ pub(crate) fn purge_connecting(connecting: &mut Vec<(SocketHandle, u64)>, handle
 }
 
 pub fn socket_close(handle: SocketHandle) {
-    if !is_valid_handle(handle) {
-        crate::safe_print!(72, "[NET] CORRUPT HANDLE in socket_close: handle={handle}\n");
-        return;
-    }
     with_network(|net| {
+        // Inside the hold now: the guard asks the socket set whether it still
+        // holds `handle`, so it needs the set. It was a bounds check on a
+        // transmuted index before 2026-08-30 and could run outside.
+        if !is_valid_handle(&net.sockets, handle) {
+            crate::safe_print!(72, "[NET] CORRUPT HANDLE in socket_close: handle={handle}\n");
+            return;
+        }
         let socket = net.sockets.get_mut::<tcp::Socket>(handle);
         socket.close();
         net.pending_removal.push((handle, (runtime().uptime_us)()));

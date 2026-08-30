@@ -123,7 +123,7 @@ pub fn has_frame() -> bool {
 /// kthread) sleeps efficiently instead of busy-waiting. Returns `None` only if
 /// interrupted, or if `timeout_us` elapses with no frame.
 pub fn read_frame_blocking(buf: &mut [u8], timeout_us: Option<u64>) -> Option<usize> {
-    let rt = crate::runtime::runtime();
+    let rt = akuma_primitives::net_runtime::runtime();
     let start = (rt.uptime_us)();
     loop {
         if let Some(n) = read_frame(buf) {

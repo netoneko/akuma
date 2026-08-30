@@ -3,7 +3,7 @@
 //! Device-level MMIO, deliberately separate from the smoltcp `Device` impl:
 //! `nic_irq_ack` runs from IRQ context, which must never take `NETWORK`.
 
-use super::*;
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 // NIC interrupt
 // ============================================================================
@@ -31,6 +31,18 @@ const VIRTIO_NET_QUEUE_TRANSMIT: u32 = 1;
 /// the machine. A raw MMIO base in an atomic is the same discipline the timer
 /// IRQ uses for the GIC (see the `no-bkl-irq` feature notes).
 pub(crate) static NIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// Record which virtio-mmio slot the stack bound, and its MMIO base.
+///
+/// Called once from the stack's `init` **before** the device is moved into the
+/// `NETWORK` lock: afterwards the device is only reachable under that lock, and
+/// IRQ context must never take it. Both stores are `Release` so a concurrent
+/// `nic_irq_ack` either sees a zero base and returns, or sees a fully published
+/// one.
+pub fn bind(slot: u32, mmio_base: usize) {
+    NIC_MMIO_BASE.store(mmio_base, Ordering::Release);
+    NIC_SLOT.store(slot, Ordering::Release);
+}
 
 /// virtio-mmio slot index of NIC0, or [`NIC_SLOT_NONE`] before [`init`].
 pub(crate) static NIC_SLOT: AtomicU32 = AtomicU32::new(NIC_SLOT_NONE);

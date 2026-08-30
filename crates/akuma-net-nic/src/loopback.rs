@@ -1,6 +1,12 @@
 //! `LoopbackAwareDevice` — the ring that keeps 127.x.x.x off the wire.
 
-use super::*;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use smoltcp::phy::Device;
+use smoltcp::time::Instant;
+use akuma_primitives::net_runtime::runtime;
+use crate::device::VirtioSmoltcpDevice;
+use crate::nicstat;
+use crate::frames::{FrameArena, FrameLease};
 
 // Loopback-Aware Device Wrapper
 // ============================================================================

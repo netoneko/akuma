@@ -8,14 +8,14 @@ edition = "2024"
 # native stack. The kernel disables it for the devbox (rump-only) by depending on
 # this crate with `default-features = false` and NOT re-enabling `smoltcp`.
 default = ["smoltcp"]
-small-sockets = []
+small-sockets = ["akuma-net-nic/small-sockets"]
 # Device-level NIC instrumentation (`nicstat`): per-packet RX/TX/poll timing and
 # byte counts, plus how long blocking socket waits park in `blocking_relax`.
 # MEASUREMENT BUILDS ONLY — never ship it. Off by default and every recorder is
 # an empty inline body when off, so a normal build is byte-for-byte unchanged
 # (same discipline as the kernel's `bkl-profile`). Forwarded from the kernel's
 # feature of the same name; the kernel prints the windowed delta as `[NICSTAT]`.
-net-profile = []
+net-profile = ["akuma-net-nic/net-profile"]
 # Static RX/TX frame rings + a non-blocking transmit path (`virtio_rings`).
 # OFF by default; forwarded from the kernel feature of the same name, which is
 # NOT in the kernel's `default` set either.
@@ -33,7 +33,7 @@ net-profile = []
 # Cargo.toml, and docs/archive/AKUMA_NET_ISSUES.md §7.
 #
 # Costs ~32 KB of BSS (8 + 8 slots of 2 KB).
-net-noalloc = []
+net-noalloc = ["akuma-net-nic/net-noalloc"]
 # Park blocking socket waiters with a registered waker (`schedule_blocking`)
 # instead of `blocking_relax`. OFF — it MEASURED WORSE. See the kernel feature
 # of the same name in the root Cargo.toml for the numbers and why.
@@ -48,7 +48,7 @@ net-direct-waker = []
 # default 8. Costs ~1 MB of heap per listening socket, so it is opt-in.
 # Paired with `userspace/sshd`'s `fork-sessions` feature — see that crate's
 # `[features]` for why the two are turned on together.
-many-sessions = []
+many-sessions = ["akuma-net-nic/many-sessions"]
 # Real shared-kernel SMP. Gates the `PreemptGuard` critical-section preemption
 # guards (runtime.rs): under the Big Kernel Lock the base NETWORK/SOCKET_TABLE
 # spinlocks must never be held across a context switch. A no-op otherwise, so
@@ -77,7 +77,7 @@ smoltcp = ["dep:smoltcp"]
 # kernel's `rump` feature. Adds crate::rump_tap (the hardware half); the
 # device-independent orchestration lives in the host-tested `akuma-rump` crate.
 # Smoltcp-free — usable with `smoltcp` off.
-rump = ["dep:akuma-rump"]
+rump = ["dep:akuma-rump", "akuma-net-nic/rump"]
 
 [lints]
 workspace = true
@@ -90,6 +90,9 @@ akuma-rump = { path = "../akuma-rump", optional = true }
 # dependency on the whole execution crate — and now lives in the dependency-free
 # leaf, so the sharing is free.
 akuma-primitives = { path = "../akuma-primitives" }
+# The virtio-net device: DMA buffers, the NIC wrapper, and smoltcp's `Device`
+# impls. Every `unsafe` in networking lives there, which is why it is a crate.
+akuma-net-nic = { path = "../akuma-net-nic" }
 # The `wait_until` readiness state machine, extracted so its five
 # incident-driven rules have host tests instead of only a devbox boot.
 # See crates/akuma-net-yarn/src/lib.rs.

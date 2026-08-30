@@ -48,26 +48,6 @@ pub(crate) const SOCKET_SOFT_CAP_START: usize = if MAX_SOCKETS < 128 { MAX_SOCKE
 // Reduced from 64KB to 16KB per direction to save heap memory.
 // 40 sockets × 32KB = 1.25MB vs 40 × 128KB = 5MB.
 // 16KB is still plenty for TLS handshakes and HTTP requests.
-/// RX-path counters. Plain atomics rather than log statements on purpose: this
-/// path runs inside the `NETWORK` critical section with preemption disabled, where
-/// console I/O can deadlock (see `poll()`). Read them with [`rx_counters`].
-pub(crate) static RX_BUFFERS_POSTED: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static RX_BEGIN_FAILURES: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static RX_FRAMES_RECEIVED: AtomicUsize = AtomicUsize::new(0);
-
-/// `(buffers posted, receive_begin failures, frames received)`.
-///
-/// A receive path that posts buffers but never receives a frame is otherwise
-/// invisible: the device has nowhere to put frames, drops them all, and it reads
-/// as "the network is down" rather than "nothing consumed our buffer".
-#[must_use]
-pub fn rx_counters() -> (usize, usize, usize) {
-    (
-        RX_BUFFERS_POSTED.load(Ordering::Relaxed),
-        RX_BEGIN_FAILURES.load(Ordering::Relaxed),
-        RX_FRAMES_RECEIVED.load(Ordering::Relaxed),
-    )
-}
 
 pub(crate) const TCP_RX_BUFFER_SIZE: usize = 16384;
 pub(crate) const TCP_TX_BUFFER_SIZE: usize = 16384;

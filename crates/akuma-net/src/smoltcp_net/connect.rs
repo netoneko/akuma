@@ -23,12 +23,12 @@ pub async fn tcp_connect(addr: IpAddress, port: u16) -> Result<(TcpStream, Socke
 
     // Wait for connection to be established
     core::future::poll_fn(|cx| {
-        if !is_valid_handle(handle) {
-            return Poll::Ready(Err(TcpError::WriteError));
-        }
         // Drive the network stack forward
         poll();
         with_network(|net| {
+            if !is_valid_handle(&net.sockets, handle) {
+                return Poll::Ready(Err(TcpError::WriteError));
+            }
             let socket = net.sockets.get_mut::<tcp::Socket>(handle);
             match socket.state() {
                 tcp::State::Established => Poll::Ready(Ok(())),

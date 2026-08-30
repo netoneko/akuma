@@ -18,8 +18,7 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
             // Record the slot and its MMIO base for the IRQ handler before the
             // device is moved into `NETWORK` — afterwards it is only reachable
             // under the lock, which IRQ context must not take.
-            NIC_MMIO_BASE.store(akuma_virtio::slot_addr(i), Ordering::Release);
-            NIC_SLOT.store(i as u32, Ordering::Release);
+            akuma_net_nic::irq::bind(i as u32, akuma_virtio::slot_addr(i));
             found_device = Some(dev);
         }
     }

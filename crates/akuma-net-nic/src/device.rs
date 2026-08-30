@@ -1,6 +1,17 @@
 //! `VirtioSmoltcpDevice` — smoltcp's `Device` over virtio-net.
 
-use super::*;
+use core::sync::atomic::Ordering;
+use smoltcp::phy::Device;
+use smoltcp::time::Instant;
+// The single-buffer receive path and its counters exist only without
+// `net-noalloc`; with it, `virtio_rings` owns the buffers and the accounting.
+#[cfg(not(feature = "net-noalloc"))]
+use crate::counters::{RX_BEGIN_FAILURES, RX_BUFFERS_POSTED, RX_FRAMES_RECEIVED};
+#[cfg(not(feature = "net-noalloc"))]
+use crate::frames::{FrameArena, FrameLease};
+use crate::counters::TX_DROP_COUNT;
+use crate::nic::Nic;
+use crate::nicstat;
 
 // VirtIO Smoltcp Device Wrapper
 // ============================================================================

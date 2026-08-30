@@ -12,16 +12,10 @@ pub(crate) static NETWORK_READY: AtomicBool = AtomicBool::new(false);
 /// Atomic counter incremented when progress is made (e.g. packets processed)
 pub(crate) static POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Counter for silently dropped TX packets (`VirtIO` send failures)
-pub(crate) static TX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
 pub fn is_ready() -> bool {
     NETWORK_READY.load(Ordering::Acquire)
 }
 
-pub fn tx_drop_count() -> usize {
-    TX_DROP_COUNT.load(Ordering::Relaxed)
-}
 
 /// Returns true once DHCP has acquired a lease (Configured event was processed).
 /// Returns true immediately if DHCP is disabled.

@@ -354,8 +354,8 @@ impl TxRing {
                 self.submitted[slot] = Some(crate::nicstat::start());
                 // Unconditional: `transmit_begin`'s own notify is suppressible
                 // and nothing here spins to wait the suppression out. See
-                // `smoltcp_net::nic_kick_tx`.
-                crate::smoltcp_net::nic_kick_tx();
+                // `irq::nic_kick_tx`.
+                crate::irq::nic_kick_tx();
                 true
             }
             Err(_) => false,

@@ -420,11 +420,33 @@ mod recv_eof_state_tests {
 /// handle's `connecting` entry in the same step that queues it for removal.
 #[cfg(all(test, feature = "smoltcp"))]
 mod connecting_bookkeeping_tests {
-    use crate::smoltcp_net::{purge_connecting, test_socket_handle};
+    use crate::smoltcp_net::purge_connecting;
+    use smoltcp::iface::{SocketHandle, SocketSet};
+    use smoltcp::socket::tcp;
+
+    /// `n` real handles.
+    ///
+    /// These used to come from `test_socket_handle(i)`, which `transmute`d an
+    /// index into a `SocketHandle`. That function is gone with the rest of the
+    /// handle transmutes (2026-08-30), and it is not missed: letting smoltcp
+    /// mint the handles is both safe and closer to what production does.
+    fn handles(n: usize) -> (SocketSet<'static>, alloc::vec::Vec<SocketHandle>) {
+        let mut set = SocketSet::new(alloc::vec::Vec::new());
+        let hs = (0..n)
+            .map(|_| {
+                set.add(tcp::Socket::new(
+                    tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+                    tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
+                ))
+            })
+            .collect();
+        (set, hs)
+    }
 
     #[test]
     fn closing_a_connecting_handle_removes_its_entry() {
-        let h = test_socket_handle(3);
+        let (_set, hs) = handles(1);
+        let h = hs[0];
         let mut connecting = vec![(h, 1_000u64)];
         purge_connecting(&mut connecting, h);
         assert!(connecting.is_empty(), "the closed handle must not survive in `connecting`");
@@ -436,8 +458,8 @@ mod connecting_bookkeeping_tests {
     /// dereferences it.
     #[test]
     fn only_the_closed_handles_own_entry_is_removed() {
-        let closed = test_socket_handle(1);
-        let still_connecting = test_socket_handle(2);
+        let (_set, hs) = handles(2);
+        let (closed, still_connecting) = (hs[0], hs[1]);
         let mut connecting = vec![(closed, 1_000u64), (still_connecting, 2_000u64)];
         purge_connecting(&mut connecting, closed);
         assert_eq!(connecting, vec![(still_connecting, 2_000u64)]);
@@ -445,8 +467,8 @@ mod connecting_bookkeeping_tests {
 
     #[test]
     fn closing_a_handle_never_in_connecting_is_a_no_op() {
-        let established = test_socket_handle(5);
-        let connecting_handle = test_socket_handle(6);
+        let (_set, hs) = handles(2);
+        let (established, connecting_handle) = (hs[0], hs[1]);
         let mut connecting = vec![(connecting_handle, 1_000u64)];
         purge_connecting(&mut connecting, established);
         assert_eq!(connecting, vec![(connecting_handle, 1_000u64)]);
@@ -487,86 +509,3 @@ mod listener_backlog_tests {
     }
 }
 
-/// `SocketHandle` -> index, checked against the real type instead of assumed.
-///
-/// `smoltcp_net::socket_handle_index` transmutes smoltcp's `SocketHandle` to a
-/// `usize` because the field is private and there is no accessor. The const
-/// assertions at that function check size and alignment, which is not the same
-/// as checking that the *value* is the socket-set index — a future smoltcp
-/// could add a field, reorder, or change `repr` and keep every assertion true
-/// while the function silently returned garbage.
-///
-/// This would be invisible in production and dangerous: five call sites use it
-/// through `is_valid_handle` to decide whether a handle is safe to look up.
-/// So these tests build an actual `SocketSet`, let smoltcp mint the handles,
-/// and hold the function to what smoltcp itself says the index is.
-#[cfg(feature = "smoltcp")]
-mod socket_handle_layout_tests {
-    use crate::smoltcp_net::socket_handle_index;
-    use smoltcp::iface::{SocketSet, SocketStorage};
-    use smoltcp::socket::tcp;
-
-    fn tcp_socket() -> tcp::Socket<'static> {
-        tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; 64]),
-            tcp::SocketBuffer::new(vec![0u8; 64]),
-        )
-    }
-
-    /// The property the transmute actually claims: handle N out of a fresh set
-    /// is index N. `SocketSet::add` fills the first free storage slot, so the
-    /// handles come back in order.
-    #[test]
-    fn handle_index_matches_the_socket_sets_own_ordering() {
-        let mut storage = [SocketStorage::EMPTY; 8];
-        let mut set = SocketSet::new(&mut storage[..]);
-        for expected in 0..8 {
-            let h = set.add(tcp_socket());
-            assert_eq!(
-                socket_handle_index(h),
-                expected,
-                "handle {h} should be index {expected} — smoltcp's SocketHandle \
-                 layout changed and the transmute in socket_handle_index is now wrong"
-            );
-        }
-    }
-
-    /// Cross-check against the only accessor smoltcp actually exposes:
-    /// `Display` prints `#{index}`. Independent of the transmute, so if the two
-    /// ever disagree the transmute is what broke.
-    #[test]
-    fn handle_index_agrees_with_smoltcps_display() {
-        let mut storage = [SocketStorage::EMPTY; 4];
-        let mut set = SocketSet::new(&mut storage[..]);
-        for _ in 0..4 {
-            let h = set.add(tcp_socket());
-            let shown = format!("{h}");
-            let from_display: usize = shown
-                .trim_start_matches('#')
-                .parse()
-                .expect("smoltcp SocketHandle Display is `#<index>`");
-            assert_eq!(socket_handle_index(h), from_display);
-        }
-    }
-
-    /// A removed socket's slot is reused, so the index is a slot number and not
-    /// a monotonic counter. `is_valid_handle` bounds-checks against
-    /// `MAX_SOCKETS` on that assumption.
-    #[test]
-    fn a_freed_slot_is_reused_so_the_index_is_a_slot_not_a_counter() {
-        let mut storage = [SocketStorage::EMPTY; 4];
-        let mut set = SocketSet::new(&mut storage[..]);
-        let first = set.add(tcp_socket());
-        let second = set.add(tcp_socket());
-        assert_eq!(socket_handle_index(first), 0);
-        assert_eq!(socket_handle_index(second), 1);
-
-        set.remove(first);
-        let reused = set.add(tcp_socket());
-        assert_eq!(
-            socket_handle_index(reused),
-            0,
-            "a freed slot must come back, or MAX_SOCKETS is not a bound on the index"
-        );
-    }
-}

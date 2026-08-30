@@ -50,16 +50,16 @@ use akuma_virtio::VirtioTransport;
 use akuma_virtio::VirtioHal;
 use crate::runtime::runtime;
 use crate::runtime::PreemptGuard;
-use crate::nicstat;
-use crate::frames::{FrameArena, FrameLease};
-use crate::nic::Nic;
+use akuma_net_nic::nicstat;
+use akuma_net_nic::nic::Nic;
+pub use akuma_net_nic::{VirtioSmoltcpDevice, LoopbackAwareDevice,
+    LoopbackAwareRxToken, LoopbackAwareTxToken, VirtioRxToken, VirtioTxToken,
+    RX_BUFFER_LEN, loopback_drop_count, nic_irq_ack, nic_irq_count, nic_slot,
+    NIC_SLOT_NONE, rx_counters, tx_drop_count};
 use akuma_primitives::TakeOnce;
 
 pub mod consts;
 pub mod state;
-pub mod irq;
-pub mod device;
-pub mod loopback;
 pub mod init;
 pub mod poll;
 pub mod resolve;
@@ -70,11 +70,12 @@ pub mod iface;
 pub mod lifecycle;
 pub mod stream;
 
-pub use consts::*;
+// `pub(crate)`, not `pub`: since the device counters moved to `akuma-net-nic`,
+// nothing in `consts` is part of this module's public surface — it is all
+// tunables the sibling modules read. A `pub use` of it re-exports nothing and
+// rustc rejects the glob outright.
+pub(crate) use consts::*;
 pub use state::*;
-pub use irq::*;
-pub use device::*;
-pub use loopback::*;
 pub use init::*;
 pub use poll::*;
 pub use resolve::*;

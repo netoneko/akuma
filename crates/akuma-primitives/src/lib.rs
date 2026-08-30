@@ -46,6 +46,7 @@ pub mod errno;
 pub mod inode_pin;
 pub mod irq;
 pub mod mmio;
+pub mod net_runtime;
 pub mod once;
 pub mod preempt;
 pub mod toggled_guard;
@@ -59,4 +60,5 @@ pub use irq::{
     unmask_irqs_sync, with_irqs_disabled,
 };
 pub use once::{OnceCopy, Registered, TakeOnce};
+pub use net_runtime::{NetRuntime, register as register_net_runtime, runtime as net_runtime, try_runtime as try_net_runtime};
 pub use inode_pin::InodePin;

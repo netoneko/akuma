@@ -9,6 +9,7 @@ default-members = [
     "crates/akuma-kacho",
     "crates/akuma-mmap",
     "crates/akuma-net",
+    "crates/akuma-net-nic",
     "crates/akuma-net-unix",
     "crates/akuma-net-yarn",
     "crates/akuma-pmm",

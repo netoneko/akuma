@@ -1,4 +1,15 @@
 #![cfg_attr(not(test), no_std)]
+// Unsafe-free by design, and `forbid` so no module can opt back in with a local
+// `allow`. Same reasoning as `akuma-net-yarn` and `akuma-syscalls-sync`.
+//
+// This crate held every `unsafe` in networking until 2026-08-30. Two moves
+// emptied it: the device layer left for `akuma-net-nic` (DMA buffers, the NIC
+// wrapper, smoltcp's `Device` impls, the MMIO doorbell, the rump tap), and the
+// last two — `transmute`ing smoltcp's private `SocketHandle` to an index —
+// were deleted rather than moved, because asking the socket set whether it
+// still holds a handle needs no transmute and catches strictly more (see
+// `smoltcp_net::stream::is_valid_handle`).
+#![forbid(unsafe_code)]
 #![allow(clippy::future_not_send)]
 
 extern crate alloc;
@@ -15,14 +26,15 @@ pub mod runtime;
 /// separated that attribute from the module below — see there.
 pub use akuma_primitives::safe_print;
 
-// BSS frame storage with bounds- and borrow-checked slot access. Unconditional:
-// both the smoltcp device and the rump tap path stage frames in it. See
-// `frames.rs` for what it replaced and why the buffers are not struct fields.
-pub mod frames;
-// The virtio-net device wrapper. THE one place virtio-drivers' unsafe
-// begin/complete API is called — see the module header before adding another.
-#[cfg(feature = "smoltcp")]
-pub mod nic;
+// The device layer moved OUT to `akuma-net-nic` on 2026-08-30: DMA buffers, the
+// NIC wrapper, smoltcp's `Device` impls, the MMIO doorbell and the per-packet
+// counters. It holds every `unsafe` in networking, which is the point — see
+// that crate's docs and docs/archive/AKUMA_NET_SPLIT.md §5.1c.
+//
+// Re-exported at the old paths so the kernel's call sites did not move.
+pub use akuma_net_nic::{frames, nic, nicstat};
+#[cfg(feature = "net-noalloc")]
+pub use akuma_net_nic::virtio_rings;
 
 // The native smoltcp stack + the smoltcp-coupled protocol modules. Optional so a
 // rump-only build (devbox) compiles them out; the rump path below is smoltcp-free.
@@ -41,13 +53,9 @@ pub mod nic;
 // point of the edit. Keep the attribute adjacent to `pub mod`.
 #[cfg(feature = "smoltcp")]
 pub mod smoltcp_net;
-// Static RX/TX frame rings backing the async transmit path. Only meaningful
-// with the smoltcp device, and only compiled when `net-noalloc` selects it.
-#[cfg(all(feature = "smoltcp", feature = "net-noalloc"))]
-pub mod virtio_rings;
-// Raw L2 packet path (second NIC → /dev/net/tap0) for the kernel `rump` feature.
+// The rump tap NIC moved to `akuma-net-nic` with the other drivers.
 #[cfg(feature = "rump")]
-pub mod rump_tap;
+pub use akuma_net_nic::rump_tap;
 // `socket` stays compiled (its address/errno/stat types are used pervasively by
 // non-network code); the smoltcp socket-table internals inside it are gated on
 // `smoltcp` (see socket.rs).
@@ -60,10 +68,6 @@ pub mod dns;
 // keeping it here forced the rump-only devbox to pull this whole crate to reach
 // it. Not re-exported: reaching AF_UNIX through the TCP/IP crate is the
 // coupling the move removes. See docs/archive/AKUMA_NET_SPLIT.md §5.1.
-// Device-level traffic/latency counters. Always compiled (the module's public
-// API is the same either way); the counters themselves only exist under the
-// `net-profile` feature.
-pub mod nicstat;
 
 
 #[cfg(test)]

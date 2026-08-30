@@ -42,7 +42,7 @@ fn reclaim_pending_slots(net: &mut NetworkState, want: usize) -> usize {
     while freed < want {
         let mut oldest: Option<(usize, u64)> = None;
         for (i, &(handle, added_at)) in net.pending_removal.iter().enumerate() {
-            if !is_valid_handle(handle) {
+            if !is_valid_handle(&net.sockets, handle) {
                 continue;
             }
             let state = net.sockets.get::<tcp::Socket>(handle).state();

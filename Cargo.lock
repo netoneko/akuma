@@ -94,12 +94,25 @@ version = "0.1.0"
 name = "akuma-net"
 version = "0.1.0"
 dependencies = [
+ "akuma-net-nic",
  "akuma-net-yarn",
  "akuma-primitives",
  "akuma-rump",
  "akuma-virtio",
  "embedded-io-async",
  "log",
+ "smoltcp",
+ "spinning_top",
+ "virtio-drivers",
+]
+
+[[package]]
+name = "akuma-net-nic"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+ "akuma-rump",
+ "akuma-virtio",
  "smoltcp",
  "spinning_top",
  "virtio-drivers",
