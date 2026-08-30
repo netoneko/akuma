@@ -1,5 +1,32 @@
 # Fork-from-a-threaded-process kills the process — SOLVED 2026-08-08
 
+> **Residual fixed 2026-08-30 (two-stage re-check); one rare survivor class remains.**
+> The blockquote below records the residual as found 2026-08-14. Root shape: the
+> absorb ran ONCE at EL0 write-arm entry — before the loser waited on the per-page
+> fault slot — so a loser whose PTE read predated the winner's repair declined
+> silently, then reached `cow_ref_get == 0` (the winner had consumed the reference)
+> with no region record to claim the page, and died for a write the PTE already
+> granted. Fixed by re-asking the page table twice more, both bounded by the same
+> per-(VA, PTE) limit: (1) after acquiring the fault slot, before concluding
+> "not a CoW page" (`src/exceptions.rs`, EL0 write arm, the `did_cow == false`
+> fall-through); (2) at the moment of killing — the SIGSEGV delivery path for
+> write *permission* faults re-checks the PTE and retries instead of delivering
+> when the live table grants the write, because on a fork-storm page the next
+> fork's demote can re-demote the page between any earlier check and the kill.
+> Boot self-test extended for the decline-then-absorb sequence
+> (`test_stale_write_fault_absorbed`). Regression probe: `cowstale hammer`
+> (`userspace/forktest/c_stress/cowstale.c`), whose 6-worker `.bss` storm killed
+> 4/10 runs pre-fix and 1/15 at SMP=4 post-fix (classic: 3/5 → 0/8 same method;
+> `bssfork 20 8 1` control clean throughout). **The survivor**: a hammer kill on
+> the fixed kernel still printed `ap_rw=true cow_ref=0` with no `[TLB-STALE]`
+> line — every re-check declined on a then-read-only PTE and the print caught a
+> sibling's later repair. Since the demote increments the refcount *before*
+> demoting under the same `as_lock` (`akuma-exec/src/process/mod.rs` fork CoW
+> share, Phase A), a sustained read-only + `cow_ref==0` window should not exist;
+> closing it needs the refcount and PTE captured at the fatal *decision*, not at
+> the `[WPF]` print, plus an A/B at SMP=1/SMP=2 (both untested post-fix). Do not
+> mark this fully closed until that survivor is explained.
+>
 > **Residual at SMP=2, found 2026-08-14.** The fix below holds at SMP=1 and SMP=4
 > (the gate's default widths, clean on every run since). At **SMP=2**, `cowstale`
 > still reproduces the original signature — `FAR=0x420908 ELR=0x403a90 ISS=0x4f`,

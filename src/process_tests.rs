@@ -6784,6 +6784,16 @@ fn test_stale_write_fault_absorbed() {
     assert!(!absorbed(READONLY_VA), "an RO page must not be absorbed as a stale fault");
     assert!(!absorbed(UNMAPPED_VA), "an unmapped VA must not be absorbed as a stale fault");
 
+    // The residual `cowstale` shape (fixed 2026-08-30): the EL0 write arm re-asks
+    // the decision AFTER waiting on the per-page fault slot, because while it
+    // waited, the slot holder repaired the page — which is exactly a decline on a
+    // read-only PTE followed by an absorb on the same VA once the repair lands.
+    // The new PTE is a fresh budget key, so this second call must absorb even
+    // back-to-back with the decline above.
+    p.address_space.update_page_flags(READONLY_VA, user_flags::RW_NO_EXEC);
+    assert!(absorbed(READONLY_VA),
+        "a peer repair landing after the entry decline must be absorbed (the cowstale residual)");
+
     // The case the probe hits: PTE grants the write, so the fault is stale.
     assert!(absorbed(WRITABLE_VA), "a write the PTE already permits must be absorbed");
     assert!(absorbed(WRITABLE_VA), "the second retry is still within budget");

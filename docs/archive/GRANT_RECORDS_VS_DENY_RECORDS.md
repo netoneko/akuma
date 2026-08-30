@@ -148,6 +148,16 @@ either sweep, which is the check that matters: the deny gate is not involved in
 `cowstale` remains a known open flake that fails on `main`. It is tracked
 separately and is not evidence for or against anything here.
 
+> **Update 2026-08-30:** the residual got its second fix stage — the absorb now
+> re-checks after the fault-slot wait and at SIGSEGV delivery
+> ([`COWSTALE_FORK_THREAD_SEGV.md`](COWSTALE_FORK_THREAD_SEGV.md) header) —
+> cutting the SMP=4 in-boot rate from ~30-60% to 1/15 (hammer storm) and 0/8
+> (classic). The `[MPROTECT-DENY]`-gate verdict above is unaffected: the new
+> checks read the live PTE only and never consult region records, so the deny
+> gate still has no vote in this class. One hammer survivor with the old
+> signature remains; see the archive header before treating `cowstale` as
+> fully closed.
+
 ## Background
 
 - [`reference/subsystems/syscalls/mem.md`](../reference/subsystems/syscalls/mem.md)

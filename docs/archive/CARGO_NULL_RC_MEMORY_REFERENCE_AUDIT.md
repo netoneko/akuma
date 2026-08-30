@@ -14,6 +14,14 @@ already killed. Branch `stabilize-devbox`.
 it was never a corrupted pointer, it was the fault handler judging a write
 permission fault against state a sibling thread had already moved past (§12).
 Whether that was also cargo's null `Rc` is a separate question, still open.
+**2026-08-30:** §12's fix had a residual — the absorb ran only at EL0 write-arm
+entry, before the loser waited on the per-page fault slot, so a queued loser
+still reached `cow_ref==0` with no region record and died for a legal write
+(`ap_rw=true`); the absorb now runs again post-slot-wait and at SIGSEGV
+delivery, and `c_stress/cowstale hammer` is the storm repro. Rate at SMP=4
+in-boot: 1/15 hammer / 0/8 classic post-fix — **one survivor class remains**;
+current state and open questions in the
+[`COWSTALE_FORK_THREAD_SEGV.md`](COWSTALE_FORK_THREAD_SEGV.md) header.
 
 **Active brief for continuing this work:**
 [`COWSTALE_FORK_THREAD_SEGV.md`](COWSTALE_FORK_THREAD_SEGV.md).

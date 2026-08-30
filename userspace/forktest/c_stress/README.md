@@ -124,6 +124,24 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   trigger is **>=2 threads**, not two rounds. One round fails too, just less often
   (`bssfork 1 3`: 5/25). Prefer `bssfork` for the regression; it isolates the same
   defect without the mmap machinery this probe carries for other reasons.
+  **`hammer` mode** (`cowstale hammer [rounds] [pages] [threads]`, defaults
+  200/4/8) is the amplifier for the *residual* flake — the
+  `va=0x420000 cow_ref=0 ap_rw=true` SIGSEGV that fired at every SMP width
+  (see `docs/runbooks/verify-trim-fat-change.md`). Workers whose only work is
+  incrementing adjacent `.bss` counters contend on ONE page, so at each fork's
+  demote all of them fault together and lose the race as a group: measured
+  2026-08-30 pre-fix at SMP=4, four workers died in the same tick with FARs
+  across `g_hammer[0..3]`, while classic kills remain single-thread
+  (`g_reader_checks`). That same day the kernel got its second fix stage — the
+  absorb re-checks the PTE after the fault-slot wait and again at the moment of
+  killing (`archive/COWSTALE_FORK_THREAD_SEGV.md` header) — and the same
+  in-boot method went **hammer 1/15, classic 0/8, `bssfork 20 8 1` clean**
+  (pre-fix: hammer 4/10, classic 3/5). The single hammer survivor still printed
+  `ap_rw=true cow_ref=0`, so the class is *suppressed*, not closed — treat any
+  `cowstale`/`cowstale hammer` SIGSEGV as a finding now, not as the known
+  benign flake. At SMP=1 keep threads <= 3 (CPU-bound workers starve the box)
+  and lean on more rounds. PASSES on real Linux aarch64
+  (pass-by-construction; nothing in it is racy).
 - `clonearg` — does a freshly cloned thread see the memory its parent wrote
   immediately before `clone()`? Clones raw (musl `__clone`'s exact register
   shape) so the child's first instructions are the ones the rustc thread-spawn

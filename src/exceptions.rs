@@ -4378,6 +4378,31 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         if did_cow {
                             return unsafe { (*frame).x0 };
                         }
+                        // The fault may already have been resolved while we waited
+                        // on the slot: the sibling that held it repaired the page —
+                        // its CoW break is why `cow_ref` reads 0, the reference was
+                        // consumed by *it* — and its PTE rewrite makes this write
+                        // legal. The `stale_write_fault_absorbed` at arm entry ran
+                        // BEFORE the wait, against the still-read-only PTE, so it
+                        // could not see that, and the refcount alone is not ground
+                        // truth about whether the write may proceed. Re-ask the page
+                        // table now that the slot serialises us: with the slot held,
+                        // no peer repair of this page can land after this read.
+                        //
+                        // This is the residual `cowstale` hole — the
+                        // `va=0x420000 cow_ref=0 ap_rw=true` SIGSEGV that kept
+                        // firing at every SMP width (known-benign rows in
+                        // `docs/runbooks/verify-trim-fat-change.md`; root shape
+                        // in `docs/archive/COWSTALE_FORK_THREAD_SEGV.md`): a
+                        // losing thread with no region record for the page
+                        // reached this point and died for a write the PTE had
+                        // already granted. Bounded by the same per-(VA, PTE)
+                        // limit as the entry check; a repair that landed between
+                        // entry and here changes the PTE, so it draws a fresh
+                        // budget rather than a spent one.
+                        if stale_write_fault_absorbed(page_va) {
+                            return unsafe { (*frame).x0 };
+                        }
                         // Not a CoW page (or no owner): return the unused frame.
                         crate::pmm::free_page(new_frame);
                     }
@@ -4709,6 +4734,26 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             {
                 let fr = unsafe { &*frame };
                 maybe_print_sigsegv_syscall_diag(elr, far, fr);
+            }
+            // Last-chance re-check, at the moment of killing. Every repair and
+            // absorb decision above read the page table *earlier in handler
+            // time*; on a fork-storm page any of those reads can be stale in
+            // both directions — a sibling's repair, or the NEXT fork's demote,
+            // can land after them and before this point (the residual `cowstale`
+            // kill survived the in-arm re-check exactly this way: the re-check
+            // saw the page re-demoted, a still-running sibling repaired it, and
+            // the `[WPF]` line then printed `ap_rw=true` over a dead process).
+            // The page table, read now, is the only authority that matters: if
+            // it grants this write, the process must not die for it. Gated to
+            // write *permission* faults so wild-pointer aborts keep their
+            // SIGSEGV; bounded by the same per-(VA, PTE) limit as everywhere
+            // else, so a page that keeps faulting despite its RW PTE still
+            // falls through after two retries.
+            if (iss & 0x3C) == 0x0C
+                && (iss & (1 << 6)) != 0
+                && stale_write_fault_absorbed((far as usize) & !0xFFF)
+            {
+                return unsafe { (*frame).x0 };
             }
             if try_deliver_signal(frame, 11, far, true, esr) {
                 return 11; // signal number in x0 for the handler

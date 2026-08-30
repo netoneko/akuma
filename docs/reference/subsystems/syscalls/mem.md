@@ -16,9 +16,14 @@ visible at the syscall boundary.
 > against real Linux (see below).
 >
 > Still not A, and the reasons are specific: region-boundary bugs surface here
-> first, `cowstale` is a known open flake that also fails on `main`, and the fault
+> first, and the fault
 > path — where the measured gap to Linux actually is — is untouched by any of the
-> above.
+> above. ~~`cowstale` is a known open flake that also fails on `main`~~ —
+> **corrected 2026-08-30**: the stale-write-fault residual got its second fix
+> stage (absorb re-checks after the fault-slot wait and at SIGSEGV delivery,
+> `archive/COWSTALE_FORK_THREAD_SEGV.md` header); at SMP=4 in-boot it went
+> hammer 1/15, classic 0/8, but the hammer survivor keeps the class off grade-A
+> until explained.
 >
 > The recurring lesson: **validate arguments before calling `lookup_process`** —
 > an `EINVAL`/`EFAULT` check done first keeps a kernel-test caller (no current
