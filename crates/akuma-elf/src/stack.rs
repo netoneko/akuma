@@ -4,7 +4,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use akuma_mmap::{PAGE_SIZE, user_flags};
+use akuma_mmap::{PAGE_SIZE, span, user_flags};
 use akuma_mmu::UserAddressSpace;
 
 use super::load::{LoadedElf, load_elf, load_elf_from_path};
@@ -44,6 +44,29 @@ pub struct UserStack {
 }
 
 impl UserStack {
+    /// Copy `bytes` into the stack starting at virtual address `va`.
+    ///
+    /// Splits across frames via [`span::PageChunks`], so no write crosses a page.
+    /// `&mut self` is deliberate and `needless_pass_by_ref_mut` stays allowed.
+    /// The borrow checker sees only reads of `self.frames`, because the write
+    /// goes through a *physical* alias of the stack's pages that it cannot track
+    /// — but this call does mutate the stack's contents, and `&self` would let
+    /// two shared borrows write the same frame concurrently. The signature is
+    /// what makes the aliasing rule enforceable at the call sites.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn write_at(&mut self, va: usize, bytes: &[u8]) {
+        for c in span::PageChunks::new(self.stack_bottom, va, bytes.len()) {
+            // `self.frames[..]` is bounds-checked, and `frame_write` asserts the
+            // window stays inside the frame — between them, an arithmetic slip
+            // panics instead of writing into whatever frame follows.
+            crate::frame_write(
+                self.frames[c.page_index].addr,
+                c.offset,
+                &bytes[c.src_offset..c.src_offset + c.len],
+            );
+        }
+    }
+
     pub fn new(stack_bottom: usize, stack_top: usize, frames: Vec<akuma_mmap::PhysFrame>) -> Self {
         Self {
             stack_bottom,
@@ -58,60 +81,30 @@ impl UserStack {
         let len = bytes.len() + 1;
         self.sp -= len;
 
-        // Copy string byte-by-byte or in chunks to handle page boundaries correctly
-        let mut written = 0;
-        while written < bytes.len() {
-            let va = self.sp + written;
-            let frame_idx = (va - self.stack_bottom) / PAGE_SIZE;
-            let offset = va % PAGE_SIZE;
-            let chunk_len = core::cmp::min(bytes.len() - written, PAGE_SIZE - offset);
-
-            unsafe {
-                let dst = akuma_primitives::addr::phys_to_virt(self.frames[frame_idx].addr + offset);
-                core::ptr::copy_nonoverlapping(bytes.as_ptr().add(written), dst as *mut u8, chunk_len);
-            }
-            written += chunk_len;
-        }
-
-        // Null terminator
-        let va = self.sp + bytes.len();
-        let frame_idx = (va - self.stack_bottom) / PAGE_SIZE;
-        let offset = va % PAGE_SIZE;
-        unsafe {
-            let dst = akuma_primitives::addr::phys_to_virt(self.frames[frame_idx].addr + offset) as *mut u8;
-            *dst = 0;
-        }
-
+        let sp = self.sp;
+        self.write_at(sp, bytes);
+        self.write_at(sp + bytes.len(), &[0u8]);
         self.sp
     }
 
+    /// Push one native-endian `u64`.
+    ///
+    /// This used to assert by comment that "since SP was aligned to 8 or 16, a
+    /// u64 won't cross a 4KB boundary" and then write through a single raw
+    /// pointer. It no longer has to be true: `write_at` splits across pages if it
+    /// ever is, so an alignment change upstream cannot silently corrupt the frame
+    /// after this one.
     pub fn push_u64(&mut self, val: u64) {
         self.sp -= 8;
-        // Since SP was aligned to 8 or 16, a u64 won't cross a 4KB boundary
-        let frame_idx = (self.sp - self.stack_bottom) / PAGE_SIZE;
-        let offset = self.sp % PAGE_SIZE;
-        unsafe {
-            let dst = akuma_primitives::addr::phys_to_virt(self.frames[frame_idx].addr + offset) as *mut u64;
-            *dst = val;
-        }
+        let sp = self.sp;
+        self.write_at(sp, &val.to_ne_bytes());
     }
 
     pub fn push_raw(&mut self, data: &[u8]) -> usize {
         self.sp -= data.len();
 
-        let mut written = 0;
-        while written < data.len() {
-            let va = self.sp + written;
-            let frame_idx = (va - self.stack_bottom) / PAGE_SIZE;
-            let offset = va % PAGE_SIZE;
-            let chunk_len = core::cmp::min(data.len() - written, PAGE_SIZE - offset);
-
-            unsafe {
-                let dst = akuma_primitives::addr::phys_to_virt(self.frames[frame_idx].addr + offset);
-                core::ptr::copy_nonoverlapping(data.as_ptr().add(written), dst as *mut u8, chunk_len);
-            }
-            written += chunk_len;
-        }
+        let sp = self.sp;
+        self.write_at(sp, data);
         self.sp
     }
 

@@ -957,3 +957,98 @@ any of it to escape.
 `--release` + `--profile extreme-size` clean, boot suite unchanged. The zeroing
 path runs on every page allocation, so the boot suite exercises it heavily; the
 cache-line-step change makes that non-cosmetic.
+
+---
+
+## 8.7 `akuma-elf`: 6 `unsafe` sites -> 1, and the arithmetic moved to `akuma-mmap`
+
+### The six were one operation
+
+Every `unsafe` in the crate was *put these bytes in that frame*, written six
+times: two in the segment loader (a `PT_LOAD` copy, an `SHT_RELA` value) and four
+in `UserStack` (`push_str`, its NUL terminator, `push_u64`, `push_raw`). Each
+carried its own inlined page/offset arithmetic and **none bounded the write**.
+`push_u64` asserted by *comment* — "since SP was aligned to 8 or 16, a u64 won't
+cross a 4KB boundary" — where the frame after it would have taken the overflow.
+
+They are now one `pub(crate) fn frame_write(frame_pa, offset, bytes)` in
+`lib.rs`, with an `assert!` that the window stays inside the page. It is a safe
+`fn` on a real invariant, not a convenient one: every caller has just taken
+`frame_pa` from `UserAddressSpace::alloc_and_map` for the page being filled, so
+the frame is mapped, owned by the address space under construction, and reachable
+by nothing else — the loader has not handed the image to a thread yet.
+
+### The arithmetic went to `akuma-mmap::span`
+
+`akuma-syscalls-mem` is scoped to syscall families and ELF loading is not one;
+`akuma-mmap` defines `PAGE_SIZE` and already does clip-and-split span math for
+`MmapRegion`, so the arithmetic went there — inside that crate's
+`#![forbid(unsafe_code)]`, with **19 new host tests**.
+
+- `segment_span(vaddr, memsz) -> (first page, count)`
+- `segment_page_copy(page_va, vaddr, filesz) -> Option<(dst_off, src_off, len)>`
+- `PageChunks::new(base_va, start_va, len)` — an iterator of page-bounded `Chunk`s
+
+The tests worth having are the invariant ones, because they are what the safe
+callers now lean on: `chunks_never_cross_a_page_boundary`,
+`a_copy_window_never_leaves_its_page`, and two tiling properties
+(`the_windows_tile_the_file_bytes_exactly_once`,
+`chunks_tile_the_source_exactly_once`) that catch a gap or an overlap rather than
+just a wrong length.
+
+### One behaviour change, deliberate
+
+`segment_span(vaddr, 0)` now returns **0** pages. The old expression
+`(vaddr + memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)` returned 0 pages for a
+page-aligned `vaddr` and **1** for an unaligned one — the same empty segment
+mapped a frame or not depending only on its alignment. Harmless either way (a
+`PT_LOAD` with `p_memsz == 0` has `p_filesz == 0`, so nothing is copied and the
+frame would be an unreferenced zero page), but an arbitrary difference is what an
+extracted, tested version should settle rather than preserve.
+
+### Two clippy suggestions that would have been unsound
+
+`needless_pass_by_ref_mut` fired on both `page_bytes_mut` and `write_at`,
+suggesting `&self`. Taking it would have been a real defect, not a style change:
+these hand out or perform writes through a *physical* alias of the page that the
+borrow checker cannot see, so `&self` would permit two shared borrows writing the
+same frame concurrently. Both carry an `#[allow]` naming the reason. **A lint that
+proposes weakening a borrow is worth reading twice when `unsafe` is downstream of
+it.**
+
+### Verification
+
+`akuma-elf` 1 site (from 6); `akuma-mmap` 57 tests (from 38); tree 1,031 tests;
+all-crate clippy `-D warnings` + `--release` + `--profile extreme-size` clean;
+boot suite **178 `[TEST]` lines byte-identical to HEAD**, FS 6/0, 0 panics; and
+in-guest `cargo build` on the devbox image, which is the real exercise — this code
+runs on every `exec`.
+
+### A pre-existing failure this surfaced: `utimensat` at `MEMORY >= ~3.5 GB`
+
+Booting at `MEMORY=6144` panics the boot suite:
+
+```
+[Test] utimensat times-EFAULT FAILED r=0 (want EFAULT)
+!!! PANIC !!! src/process_tests.rs:2994
+```
+
+**Not caused by this change** — `HEAD` fails identically at 6144, and the same
+build passes at `MEMORY=2048`. The cause is in the test, not the kernel:
+
+```rust
+// src/process_tests.rs:2932 — "an unreadable `times` pointer is EFAULT"
+let r = utimensat(AT_FDCWD, p.as_ptr() as u64, 0xdead_0000_u64, 0);
+```
+
+`0xdead_0000` is **3.48 GiB**. RAM starts at `0x4000_0000`, so once `MEMORY`
+exceeds ~3.5 GB that address is inside the RAM identity map — mapped, readable,
+no fault, `r == 0`. `user_range_ok` deliberately does not exclude the kernel
+identity-mapped range (`process/user_access.rs`'s header, consequence #1), so
+nothing else catches it either.
+
+The fix is to pick the address relative to `mmu::kernel_va_end()` rather than
+hardcoding a constant that only happens to be unmapped on small VMs. Left
+unfixed here: it is a test bug in `src/`, unrelated to this split, and folding it
+in would muddy the A/B. Worth doing before anyone runs the boot suite on the
+6-16 GB configurations self-hosting uses.

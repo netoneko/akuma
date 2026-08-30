@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use elf::abi::{EM_AARCH64, ET_DYN, ET_EXEC, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
 use elf::segment::ProgramHeader;
 
-use akuma_mmap::{PAGE_SIZE, user_flags};
+use akuma_mmap::{PAGE_SIZE, span, user_flags};
 use akuma_mmu::UserAddressSpace;
 
 use super::interp::load_interp_for;
@@ -296,6 +296,7 @@ fn log_segment(what: &str, vaddr: usize, filesz: usize, memsz: usize, flags: u32
     }
 }
 
+
 /// Map one PT_LOAD segment eagerly: allocate each page and copy its file-backed
 /// bytes in.
 ///
@@ -316,9 +317,10 @@ pub(super) fn map_segment_eager(
     let offset = phdr.p_offset as usize;
     let page_flags = segment_page_flags(phdr.p_flags);
 
-    let start_page = vaddr & !(PAGE_SIZE - 1);
-    let end_page = (vaddr + memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let num_pages = (end_page - start_page) / PAGE_SIZE;
+    // Page span and per-page copy window are `akuma_mmap::span`'s, and host-tested
+    // there — see that module's header for why arithmetic next to a raw write is
+    // the worst place for it.
+    let (start_page, num_pages) = span::segment_span(vaddr, memsz);
 
     for i in 0..num_pages {
         let page_va = start_page + i * PAGE_SIZE;
@@ -334,24 +336,16 @@ pub(super) fn map_segment_eager(
             }
         };
 
-        // Where this page starts within the segment; past `filesz` it is .bss,
-        // and alloc_and_map already handed us a zeroed frame.
-        let page_start_in_segment = if page_va >= vaddr { page_va - vaddr } else { 0 };
-        if page_start_in_segment >= filesz {
+        // `None` means the page holds no file bytes: it is past `filesz` and so
+        // pure .bss, which `alloc_and_map` already handed us zeroed.
+        let Some((dst_offset, src_offset, copy_len)) =
+            span::segment_page_copy(page_va, vaddr, filesz)
+        else {
             continue;
-        }
+        };
 
-        let copy_start = if page_va < vaddr { vaddr - page_va } else { 0 };
-        let copy_len = core::cmp::min(PAGE_SIZE - copy_start, filesz - page_start_in_segment);
-        if copy_len == 0 {
-            continue;
-        }
-
-        let chunk = src.read_at(offset + page_start_in_segment, copy_len)?;
-        unsafe {
-            let dst = akuma_primitives::addr::phys_to_virt(frame_addr + copy_start);
-            core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, copy_len);
-        }
+        let chunk = src.read_at(offset + src_offset, copy_len)?;
+        crate::frame_write(frame_addr, dst_offset, &chunk);
     }
 
     Ok(())
@@ -428,10 +422,7 @@ pub(super) fn apply_relocations(
                 _ => continue,
             };
 
-            unsafe {
-                let ptr = akuma_primitives::addr::phys_to_virt(pa + (vaddr & (PAGE_SIZE - 1))) as *mut usize;
-                *ptr = value;
-            }
+            crate::frame_write(pa, vaddr & (PAGE_SIZE - 1), &value.to_ne_bytes());
             applied += 1;
         }
     }
