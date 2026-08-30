@@ -554,7 +554,10 @@ asking a question that cannot be answered.
 Device-I/O counters over the full `ext2probe-host` workload are **identical**
 to `86c2cfd7`, and `e2fsck -fn` on the dumped image exits 0. `verify_trim
 --tier all`: clippy clean on all four feature sets, 1078 host tests (0 fail),
-and the boot summary **identical on all 46 keys** at SMP=1 and SMP=4.
+and the boot summary **identical on all 46 keys** at SMP=1 and SMP=4. A guest
+(in-VM self-host) release build of the kernel then completed in 48 s — the
+heaviest ext2 exercise there is, and the one that would surface a lock
+regression under real thread churn rather than a boot suite's.
 
 The end-to-end probe cannot resolve the lock itself — the whole run is ~0.21 s,
 mostly reading the image into RAM, against a 10 ms host clock — so the fast path
