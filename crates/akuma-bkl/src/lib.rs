@@ -39,6 +39,15 @@
 //! not know what a thread is.
 
 #![cfg_attr(not(test), no_std)]
+// Zero `unsafe` as of 2026-08-30. Two things got it here, neither of them a
+// rewrite: the hand-rolled `RawRwSpinlock` (3 sites — an `unsafe impl
+// lock_api::RawRwLock` and its two `unsafe fn` unlocks) turned out to have no
+// consumers at all and was deleted, and `current_core_id`'s `mrs mpidr_el1` (1
+// site) moved to `akuma_primitives::cpu`, beside the `TPIDRRO_EL0` read the leaf
+// already owned. `forbid`, not `deny`, so no module can opt back in with a local
+// `allow`. See `sync.rs`'s header for how the dead lock hid, and
+// `docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §7.9.
+#![forbid(unsafe_code)]
 // Inherited verbatim from `akuma-exec`'s crate-root `allow` list. This code did
 // not change when it moved out on 2026-08-30, so its lint posture must not
 // either — a split that silently turns 20 warnings on is not behaviour-preserving,

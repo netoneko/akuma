@@ -658,11 +658,120 @@ undoing the split.
 
 - **The `threading` <-> `process` cycle**, untouched as planned (§4). 14 back-edges
   through the thread-identity map.
-- **`akuma-pmm` (5 sites) and `akuma-bkl` (4 sites)** are now small enough to audit
-  for `forbid(unsafe_code)`. Deferred deliberately until the moves are confirmed
-  regression-free — an `unsafe` audit and a code move in the same change would
-  make a bisect useless.
+- **`akuma-pmm` (5 sites)** is still to audit — see §7.9 for why its shape is
+  harder than `akuma-bkl`'s was.
+- ~~**`akuma-bkl` (4 sites)**~~ — **done, §7.9. It carries `forbid` now.**
 - **The inlining measurement in §7.7.**
-- Enforced-safe code is **16,592 of 42,634 (38.9%)**, from 16,052 of 42,317
-  (37.9%). Note the crate *ratio* fell, 18-of-25 to 18-of-28, exactly as §4
-  predicted — three new crates, none of them `forbid`-able.
+- Enforced-safe code is **18,026 of 42,429 (42.5%)**, from 16,052 of 42,317
+  (37.9%) — and 19 of 28 crates, up from 18 of 25. §4 predicted three new crates,
+  "none of them `forbid`-able". That was wrong about `akuma-bkl` (§7.9).
+
+---
+
+## 7.9 `akuma-bkl` reached `forbid` — by deleting, not rewriting
+
+Follow-up on the same day. The audit §7.8 deferred turned out to be four sites of
+which **three were dead code and one was in the wrong crate**. Neither needed a
+rewrite.
+
+### The prediction was wrong
+
+The first read of this crate said:
+
+> Three of four are the `lock_api::RawRwLock` contract — you cannot implement that
+> trait safely, the `unsafe fn` signatures are the trait's. `akuma-bkl` cannot
+> reach `forbid` without dropping `lock_api`, which would mean hand-rolling
+> `RwLock`/guards. Not worth it.
+
+Every clause of that is true and the conclusion is still wrong, because it never
+asked whether anything *used* the lock. It does not: `RawRwSpinlock`,
+`RwSpinlock<T>` and its two guards had **zero consumers** outside their own 11
+tests. Deleted, `akuma-bkl` went from 4 `unsafe` sites to 1.
+
+### How it hid — and why grep confirmed the wrong answer
+
+`spinning_top` **already exports `RwSpinlock` and `RawRwSpinlock`**, under exactly
+those names. Every real user in the tree — `akuma-ext2`'s `Ext2State`, the
+orphaned-lock recovery test in `src/tests.rs` — imports
+`spinning_top::RwSpinlock`. A grep for `RwSpinlock` therefore returns a healthy
+list of call sites, and reads as proof the type is load-bearing. It is proof that
+a *different type with the same name* is load-bearing.
+
+`docs/archive/TRIM_FAT_DEAD_CODE.md` had already looked at this and listed
+`RawRwLock` as a **false positive** — correctly for the question it asked. Its
+reasoning was that trait methods have no textual call site, so grep cannot see
+them. True. But the trait impl is only reachable through
+`lock_api::RwLock<RawRwSpinlock, T>`, and *instantiating* that requires naming
+`RawRwSpinlock`, which is greppable. The scan generalised "grep can't see trait
+dispatch" into "assume live", and the assumption stuck for two years.
+
+**The technique that settles it in one command** — cheaper and more certain than
+any amount of reading:
+
+```rust
+#[deprecated(note = "DEADCODE-PROBE")]
+pub struct RawRwSpinlock(AtomicU32);
+```
+
+`cargo build --release` then reports every use, across all crates and features, in
+whatever way it is reached. Result: 19 warnings, **all of them inside the file
+that defined it**. That is the answer grep could not give.
+
+For the next dead-code sweep: when a candidate is reached through a trait, don't
+ask "who calls the methods" — ask **"who names the type"**, and settle it with a
+`#[deprecated]` probe rather than a judgement call.
+
+### The last site was in the wrong crate
+
+`current_core_id`'s `mrs mpidr_el1` moved to `akuma_primitives::cpu`, beside
+`preempt::current_tid`'s `TPIDRRO_EL0` read — the leaf already owned "per-CPU
+registers" in `crate-safety.md`'s own description of it. Re-exported from
+`akuma_bkl::bkl`, so no call site changed.
+
+One trap worth recording: the `cfg` is `all(kernel_smp_shared, target_os = "none")`,
+and it is tempting to simplify to `target_os = "none"` on the grounds that a
+bare-metal single-core build reads aff0 = 0 anyway. **Don't.** The multikernel
+build (`smp` — one whole kernel per core) runs on cores with non-zero aff0 while
+`kernel_smp_shared` is off, and every caller there expects the shim's `0`.
+Widening the gate would silently repoint that build's per-core tables.
+
+### What it cost, and what it bought
+
+`sync.rs` lost ~145 lines of lock plus 11 tests; the crate lost its `lock_api`
+dependency. `SPIN_WARN_THRESHOLD` and `LOST_TICKET_RECOVERY_SPINS` stayed —
+both are read by `KernelLock::acquire`, which is what they were really tuned for.
+
+**The Big Kernel Lock protocol is now enforced unsafe-free** — the crate whose bug
+history (the dropped-window ledger, the `tag=511` storms, the ON_CPU race) is the
+reason it was extracted in the first place, and which ships its own deadlock /
+mutual-exclusion / starvation model checker.
+
+| | before | after |
+|---|---:|---:|
+| `akuma-bkl` `unsafe` sites | 4 | **0** (`forbid`) |
+| enforced-safe crates | 18 of 28 | **19 of 28** |
+| enforced-safe code | 16,592 / 42,634 (38.9%) | **18,026 / 42,429 (42.5%)** |
+
+Host tests 1,020 -> 1,009 (the 11 deleted lock tests), 0 failures; all-crate
+clippy `-D warnings`, `--release` and `--profile extreme-size` clean.
+
+### `akuma-pmm` is the harder one, and it is still open
+
+Its 4 production sites are four near-copies of `phys_to_virt(pa)` ->
+`write_bytes(.., 0, PAGE_SIZE)` -> a `dc cvac` cache-clean loop, in
+`alloc_page_zeroed` and its contiguous/multi-page siblings; the 5th is a test that
+performs a deliberate use-after-free write to prove the quarantine detector fires.
+
+**Moving the zeroing to `akuma-mmu` does not work** — `akuma-mmu` already depends
+on `akuma-pmm`, so `alloc_page_zeroed` calling up into it is a cycle. Moving
+`alloc_page_zeroed` itself up means touching **142 call sites**, and dragging
+`alloc_page_zeroed_user` with it would pull the reclaim escalation (`PmmHooks`,
+`next_reclaim_step`) into the MMU, which is worse than the problem.
+
+The shape that could work, unverified: hoist one `zero_and_clean(pa, pages)` into
+`akuma-primitives` (which already owns `phys_to_virt`), collapsing 4 sites to 0,
+and move the UAF test to `crates/akuma-pmm/tests/` — an integration test is a
+separate crate, so `#![forbid]` on the lib does not cover it. That would put
+`akuma-pmm`'s 1,139 production lines inside a `forbid` boundary. The open question
+is whether `dc cvac` and raw-frame zeroing belong in the dependency-free leaf, or
+whether that is just relocating the problem to the crate everything depends on.

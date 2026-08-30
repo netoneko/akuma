@@ -41,6 +41,7 @@
 
 pub mod addr;
 pub mod clock;
+pub mod cpu;
 pub mod console;
 pub mod errno;
 pub mod inode_pin;
@@ -52,6 +53,7 @@ pub mod preempt;
 pub mod toggled_guard;
 
 pub use addr::{phys_to_virt, virt_to_phys};
+pub use cpu::current_core_id;
 pub use toggled_guard::{GuardToggle, ToggledGuard};
 pub use console::{FmtBuf, StackWriter};
 pub use preempt::{MAX_THREADS, PreemptGuard};

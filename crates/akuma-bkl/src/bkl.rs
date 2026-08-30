@@ -269,24 +269,14 @@ pub fn dropped_window_open_for_tid_test(tid: usize) {
     DROPPED_WINDOWS.open(tid);
 }
 
-/// This core's identity (MPIDR aff0). Matches the `mpidr & 0xff` indexing used by the
-/// SMP bringup path and `trigger_sgi_core`. Always `0` on non-SMP builds and on host
-/// tests, so callers (e.g. the scheduler's per-core idle) can use it unconditionally.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
-#[inline]
-pub fn current_core_id() -> u32 {
-    let mpidr: u64;
-    // SAFETY: reading the affinity register has no side effects.
-    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)) };
-    (mpidr & 0xff) as u32
-}
-
-/// Non-SMP / host shim: a single-core build is always core 0.
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
-#[inline(always)]
-pub fn current_core_id() -> u32 {
-    0
-}
+/// This core's identity (MPIDR aff0).
+///
+/// **Moved to `akuma_primitives::cpu` on 2026-08-30** — it was this crate's last
+/// `unsafe` site, and hoisting it (beside `current_tid`'s `TPIDRRO_EL0` read,
+/// which the leaf already owned) is what let this crate carry
+/// `#![forbid(unsafe_code)]`. Re-exported so the ~40 `bkl::current_core_id()`
+/// call sites here, in `akuma-mmu` and in `src/` are unchanged.
+pub use akuma_primitives::cpu::current_core_id;
 
 /// Acquire the BKL for this core — call on entering kernel code from EL0. Spins if
 /// another core holds it; idempotent if this core already does. No-op unless

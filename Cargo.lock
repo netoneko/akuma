@@ -42,7 +42,6 @@ name = "akuma-bkl"
 version = "0.1.0"
 dependencies = [
  "akuma-primitives",
- "lock_api",
  "spinning_top",
 ]
 

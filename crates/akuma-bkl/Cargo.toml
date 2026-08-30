@@ -22,5 +22,3 @@ smp-shared = ["akuma-primitives/smp-shared"]
 # in AKUMA_EXEC_SPLIT_AGAIN.md §3.4 budgeted for.
 akuma-primitives = { path = "../akuma-primitives" }
 spinning_top = "0.3"
-# `RwSpinlock` is `lock_api::RwLock` over this crate's `RawRwSpinlock`.
-lock_api = "0.4"
