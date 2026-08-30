@@ -418,6 +418,88 @@ Same discipline as `akuma-syscalls-sync`: pick the four things every incident
 doc is actually about. Depends only on smoltcp's `tcp::State` enum plus
 `akuma-primitives`.
 
+### 5.1a `smoltcp_net.rs` -> `smoltcp_net/` — DONE 2026-08-30
+
+Step one of lifting the native stack into `akuma-net-smoltcp`: cut the
+2,134-line file into 14 modules along the seam that move will follow.
+
+`mod.rs` re-exports every module flat (`pub use consts::*;` …), so
+`akuma_net::smoltcp_net::X` resolves exactly as before and **none of the nine
+kernel files using those paths changed**.
+
+| module | lines | | module | lines |
+|---|---|---|---|---|
+| `device` | 359 | | `irq` | 127 |
+| `loopback` | 293 | | `consts` | 108 |
+| `poll` | 268 | | `init` | 100 |
+| `sockets` | 192 | | `resolve` | 75 |
+| `stream` | 177 | | `lifecycle` | 49 |
+| `state` | 168 | | `iface` | 49 |
+| `udp_api` | 131 | | `connect` | 47 |
+
+Three things worth recording, because each cost a cycle to find:
+
+- **Cut boundaries must not split an item from its doc comment.** Two chunks
+  ended on a `///` block whose item was in the next chunk. The compiler caught
+  two; an automated boundary audit (does a chunk end on `///`/`#[`? does it
+  start on `}`?) caught a third it had not reached yet. Run that audit before
+  compiling, not after.
+- **A mid-file `use` is module-scoped.** `use core::task::Poll;` sat at line
+  1964 and served code 400 lines above it. Splitting the file stranded it;
+  it is in `mod.rs` now.
+- **`udp` had to become `udp_api`.** A submodule named `udp` shadows smoltcp's
+  own `udp` socket module in path position, breaking 13 call sites. The other
+  13 names were checked for the same clash and are clear — the apparent hits
+  are fully-qualified paths (`smoltcp::iface::`, `virtio_drivers::device::`)
+  where the leading segment disambiguates.
+
+Visibility was tightened rather than left blanket-wide: every previously-private
+item was promoted to `pub(crate)` to get it compiling, then 24 of them were
+demoted again once a crate-wide usage check showed they were used only in their
+defining module. Two genuinely *are* cross-module and now say so —
+`VirtioSmoltcpDevice::take_rx_frame` and `emit_frame`, which `loopback` drives
+directly.
+
+Verified: 48 host tests, all three feature sets (`default`, `net-noalloc`,
+`--no-default-features`), clippy clean, all four build targets, and a boot —
+**316 PASSED, 0 failures**, DNS + 1 MB download (md5 correct) + 40/40
+byte-identical loopback fetches. An item census confirmed all 107 top-level
+items survived the cut and none were invented.
+
+### 5.1b `akuma-net-smoltcp` — BLOCKED on two dependency cycles
+
+The module split is done; the crate move is not, because two edges run the wrong
+way and neither is mechanical to reverse.
+
+**Cycle 1 — the device.** `smoltcp_net::device` uses
+`virtio_rings::{RxRing, TxRing, RX_ARENA, TX_DISCARD_ARENA, FRAME_BUF}`, and
+`virtio_rings::submit` calls back into `smoltcp_net::irq::nic_kick_tx`. The fix
+is not to break the cycle but to *move `irq` down*: NIC MMIO (interrupt ack, TX
+doorbell) is device code that runs from IRQ context and must never take
+`NETWORK`. It belongs beside `nic`/`virtio_rings`, not in the stack. Cheap, but
+it moves `nic_irq_ack`/`nic_slot`/`nic_irq_count` off their current public path.
+
+**Cycle 2 — the socket table.** `poll()` reaches *up* into the kernel socket
+table twice: `socket::mark_connect_timed_out(handle)` in the `SynSent` timeout
+sweep, and `socket::with_table(..)` to wake every waiter after a state change.
+Options:
+
+1. **Invert with a callback table** — exactly the shape `runtime::NetRuntime`
+   already is (`Registered<T>`, lock-free `OnceCopy`, so a fn-pointer call, not
+   a lock). `socket.rs` registers the two hooks; the stack calls down. Costs an
+   indirect call once per `poll()` lap, not per packet.
+2. **Move the socket table down**, so `poll()` calls it downward instead. Larger
+   move, and it drags `MAX_SOCKETS`/backlog policy with it.
+
+There is also a **layering question the name hides**: `frames`, `nic`,
+`virtio_rings`, `nicstat` and `runtime` all sit *below* the stack, and `runtime`
+is also used by `rump_tap`, which stays. So either they go into
+`akuma-net-smoltcp` and `akuma-net` depends on it (upper -> lower, which is the
+natural direction and lets `rump_tap` reach `runtime` there), or they become a
+third crate. The kernel currently reaches `akuma_net::nicstat` and
+`akuma_net::virtio_rings::ring_health` directly, so whichever way, those paths
+move or need re-exports.
+
 ### 5.2 Module splits — cheap, independent, do first
 
 - `socket.rs` (1,791) → `socket/{addr,table,wait,tcp,udp,opts,stat}.rs`. The 60
