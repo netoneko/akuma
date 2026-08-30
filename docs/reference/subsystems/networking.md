@@ -106,7 +106,7 @@ spawn. Source: `crates/akuma-rump/src/syscall_translation.rs`,
 
 ## `connect(2)` semantics on the native stack
 
-**A connect is bounded.** `CONNECT_TIMEOUT_US` (10 s, `crates/akuma-net/src/smoltcp_net.rs`)
+**A connect is bounded.** `CONNECT_TIMEOUT_US` (10 s, `crates/akuma-net/src/smoltcp_net/consts.rs`)
 caps how long a socket may sit in `SynSent`; `poll()` sweeps a small
 `connecting` list and aborts anything past the deadline, flagging it so
 `SO_ERROR` answers `ETIMEDOUT` rather than the `ECONNREFUSED` a bare `Closed`

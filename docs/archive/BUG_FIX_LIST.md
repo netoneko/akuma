@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 759
-- **Docs contributing at least one fix:** 246
+- **Total distinct fixes counted:** 763
+- **Docs contributing at least one fix:** 247
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 132 | 17.4% | 20 |
-| Memory & Virtual Memory | 122 | 16.1% | 39 |
+| Syscall / ABI Compatibility Audits | 132 | 17.3% | 20 |
+| Memory & Virtual Memory | 122 | 16.0% | 39 |
 | Scheduler & Process Management | 79 | 10.4% | 22 |
 | SMP & Locking | 89 | 11.7% | 39 |
-| Networking | 54 | 7.1% | 21 |
-| Userspace Apps & Libraries | 37 | 4.9% | 20 |
+| Networking | 58 | 7.6% | 22 |
+| Userspace Apps & Libraries | 37 | 4.8% | 20 |
 | Rump Kernel & Syscall Proxy | 26 | 3.4% | 6 |
-| Toolchain & Self-Hosting | 43 | 5.7% | 7 |
+| Toolchain & Self-Hosting | 43 | 5.6% | 7 |
 | SSH | 26 | 3.4% | 15 |
-| VFS & Filesystem | 27 | 3.6% | 17 |
-| Boot & Drivers | 24 | 3.2% | 9 |
+| VFS & Filesystem | 27 | 3.5% | 17 |
+| Boot & Drivers | 24 | 3.1% | 9 |
 | Signals & Exceptions | 15 | 2.0% | 7 |
 | Misc / Cross-cutting | 29 | 3.8% | 7 |
 | Console & Terminal | 32 | 4.2% | 11 |
-| Containers | 24 | 3.2% | 6 |
-| **Total** | **759** | **100.0%** | **246** |
+| Containers | 24 | 3.1% | 6 |
+| **Total** | **763** | **100.0%** | **247** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -688,7 +688,13 @@ aren't recorded anywhere else.)
 ### docs/archive/SECOND_LISTENER_SMP1_FREEZE.md
 - At `SMP=1`, a non-idle socket waiter parked via `idle_halt` (the yield-less `blocking_relax_net` path) disabled preemption for the whole halt without ever marking itself WAITING, so it stayed the only RUNNING thread on the sole core, holding it in an uninterruptible `wfi` loop that no timer tick or voluntary reschedule could ever displace — reproduced by starting a second listening server (`httpd`/`nginx`) after a first one was already bound and parked in `accept`, freezing the whole kernel with no panic; fixed by gating the preempt-disable (and matching `HOLD_TAG_IDLE`) on `IS_IDLE_THREAD[tid]`, so a non-idle halter's `wfi` stays preemptible
 
-## Networking (54 fixes, 21 docs)
+## Networking (58 fixes, 22 docs)
+
+### docs/archive/AKUMA_NET_SPLIT.md
+- `VirtioSmoltcpDevice::receive` built its tx token as `unsafe { &mut *(&raw mut *self) }` while the rx token was live, so two `&mut` to the same device existed at once — UB by the language's rules independently of whether the NIC raced them. The fix is a reorder, and works because `take_rx_frame` returns a raw pointer whose provenance is the BSS frame arena rather than `self`; `LoopbackAwareDevice::receive` had already solved the same problem 200 lines below
+- The frame-slot accessors (`rx_buf`, `tx_buf`, `loopback_buf`) were `unsafe fn` whose stated contract was `slot < RING`, computing `base.add(slot * LEN)` with nothing enforcing it — a slot index that desynchronised from its ring wrote past the array into whatever BSS followed, with no fault and no counter. Replaced by `FrameArena::slot_ptr`, which bounds-checks and returns `None`, plus a per-slot borrow flag so a second exclusive borrow is refused rather than aliased
+- `MsgHdr` was 56 bytes with only 52 named, the one struct in `akuma-syscalls-linux` carrying *implicit* padding, so the layout test's `transmute` to `[u8; 56]` read four uninitialised bytes. `sys_recvmsg` is safe today only because `read_user_into` overwrites all 56 from user memory first — a property of one call flow, not of the type. Fixed by naming the tail (`_pad3: u32`, no size or offset change) and pinned with a `const` assertion
+- `is_valid_handle` transmuted smoltcp's private `SocketHandle` to an index and bounds-checked it against `MAX_SOCKETS`, which covers only one of the two ways `SocketSet::get_mut` panics: an in-range handle whose socket had already been freed by the `pending_removal` sweep reached `None` and panicked, and this kernel's `#[panic_handler]` calls `halt()` — every core stops. Replaced by a membership test against the live socket set, which needs no transmute and catches both
 
 ### docs/archive/LONG_ROAD_TO_REDIS_PART_2.md
 - `sys_pselect6` passed `None` for its waker, alone among the three poll syscalls, so `select(2)` could only ever wake on the 10 ms `BLOCKING_POLL_INTERVAL_US` tick however fast the peer answered — cargo's vendored libcurl compiles the `select()` branch, so every cargo network wait rode the tick while `poll(2)` callers were woken immediately

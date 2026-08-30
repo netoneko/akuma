@@ -25,7 +25,7 @@ box picks a stack and how packets flow at the box-routing level, see
 |---|---|---|
 | `rump_server` binary | `userspace/rumpkernel/rumpuser/src/rump_server.rs` (feature `rump_server_main`) | The process that owns the NetBSD stack + `/dev/net/tap0`. ~14 MB, Rust `main` (ported from a C wrapper; NetBSD's C sysproxy server is still linked as-is). |
 | Kernel sysproxy client | `src/rump_proxy.rs` (1,458 lines) | Forwards box processes' socket syscalls to the server over fd 3; owns per-box dispatch, isolation, and the `rump-default` box-0 bring-up. |
-| Rump tap driver | `crates/akuma-net/src/rump_tap.rs`, `rumpcomp_tap.c` | Raw L2 frame path on NIC1 → `/dev/net/tap0`. |
+| Rump tap driver | `crates/akuma-net-nic/src/rump_tap.rs`, `rumpcomp_tap.c` | Raw L2 frame path on NIC1 → `/dev/net/tap0`. |
 | Sysproxy protocol client | `crates/akuma-rump/src/sysproxy.rs` | The rumpsp wire client (handshake + COPYIN/COPYOUT/ANONMMAP callback loop), generic over a `Transport` + `ClientMem`. Host-tested. |
 | Syscall translation | `crates/akuma-rump/src/syscall_translation.rs` | Linux aarch64 sysno ↔ NetBSD sysno + `Op` enum; `sockaddr_in` Linux↔NetBSD; errno map; the socket-family isolation guard. Host-tested. |
 | Fiber (cooperative) backend | `userspace/rumpkernel/rumpuser/src/fiber.rs` (~580 lines) | Rust port of NetBSD's `rumpfiber.c`: collapses rump's ~19 pthread kthreads onto **one OS thread**. **Default** (`threads_fiber` cargo feature, on by default; `--no-default-features` for the legacy pthread backend). |

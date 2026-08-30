@@ -8,8 +8,11 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{exec,ext2,firecracker,isolation,kacho,mmap,net,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
+  `akuma-{exec,ext2,firecracker,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
   plus the `akuma-syscalls*` family below.
+  **18 of the 25 carry `#![forbid(unsafe_code)]`** — which crates, and why the
+  other seven cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
+  with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).
   The **syscall family** is three layers, leaf-first and named so the
   layering is visible — an ABI crate, a shape crate, and one crate per syscall
   family (four of those so far): `akuma-syscalls-linux` is the ABI (numbers, `repr(C)`
@@ -93,6 +96,27 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`.
   `akuma-kacho` is the shared observe/decide/hysteresis layer every self-tuning
   policy uses (timer-tick demotion, file-page cache cap, netpoll wake rate).
+  The **networking family** is four crates since 2026-08-30
+  (`docs/archive/AKUMA_NET_SPLIT.md`), split so that all but one of them can
+  forbid `unsafe`. `akuma-net` is the smoltcp stack (`smoltcp_net/`, 14 modules)
+  plus the AF_INET socket table and DNS; it holds **no `unsafe`**.
+  `akuma-net-nic` is the device — DMA frame arenas (`frames`), the virtio-net
+  wrapper (`nic`), the `net-noalloc` rings, `nicstat`, the NIC MMIO doorbell
+  (`irq`), the rump tap, and smoltcp's two `Device` impls. **Every `unsafe` line
+  in networking is in it**, behind one stated DMA contract at the top of
+  `nic.rs`: a buffer handed to `receive_begin`/`transmit_begin` is owned by the
+  device until the matching completion. `frames` discharges that by owning the
+  storage and handing out `FrameLease` guards, so `nic`'s safe entry points take
+  an arena slot rather than a caller's buffer — if you find yourself adding a
+  method that takes `&mut [u8]`, that is the seam being drawn in the wrong place.
+  The `Device` impls live here *because* of those five `RxToken` sites; keeping
+  the crate smoltcp-free would strand them in `akuma-net` and cost it its ban.
+  `akuma-net-unix` is the AF_UNIX state machine — IPC over pipes, no NIC, no IP,
+  no smoltcp — a separate crate because the rump-only devbox (`--no-default-features`,
+  smoltcp compiled out) needs AF_UNIX for box 0's `rump_server` at fd 3 and
+  should not pull the TCP/IP stack to get it. It is NOT re-exported from
+  `akuma-net`: reaching AF_UNIX through the TCP/IP crate is the coupling the
+  split removes.
   `akuma-net-yarn` is the readiness wait loop as a pure state machine, driven by
   **all four** blocking-wait paths: `akuma_net::socket::wait_until` and
   `src/syscall/poll.rs`'s `sys_epoll_pwait` / `sys_pselect6` / `sys_ppoll`.
