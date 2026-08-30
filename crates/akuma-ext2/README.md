@@ -50,7 +50,7 @@ flowchart TD
     MM["mmap demand-fill"] --> RABI["Ext2Filesystem::read_at_by_inode"]
     VFS --> EXT2["akuma-ext2 :: Ext2Filesystem&lt;B&gt;"]
     RABI --> EXT2
-    EXT2 --> ST["RwSpinlock&lt;Ext2State&gt;<br/>superblock + geometry"]
+    EXT2 --> ST["RecoverableCell&lt;Ext2State&gt;<br/>superblock + geometry"]
     EXT2 --> BC["Spinlock&lt;BlockCache&gt;<br/>read-only, write-invalidated"]
     EXT2 --> DF["DeferredFrees<br/>256 atomic slots"]
     EXT2 --> DEV["B: BlockDevice<br/>read_bytes / write_bytes"]
@@ -112,7 +112,7 @@ allocate data blocks.
 | Type | What it is |
 |---|---|
 | `Ext2Filesystem<B: BlockDevice>` | the public handle; owns `dev`, `state`, `block_cache`, `deferred`, `write_lock_owner`, `time_fn` |
-| `Ext2State` | parsed superblock + geometry, behind `RwSpinlock`; also the in-memory `bgd_cache` / `bgd_dirty` / `sb_dirty` for deferred metadata writeback (see below) |
+| `Ext2State` | parsed superblock + geometry, behind a `RecoverableCell`; also the in-memory `bgd_cache` / `bgd_dirty` / `sb_dirty` for deferred metadata writeback (see below) |
 | `Ext2ReadGuard` / `Ext2WriteGuard` | RAII lock guards that also carry the `StateHoldGuard` (see below); `Ext2WriteGuard::drop` clears `write_lock_owner` |
 | `BlockCache` | `ClockBlockCache` with the `fs-cache` feature, else the 64-slot `BlockRingCache`; absent entirely on `extreme` |
 | `DeferredFrees` | 256 `AtomicU32` slots for inodes unlinked while still mmap-pinned |
@@ -161,12 +161,32 @@ kernel derives it as `min(RAM/8, 128 MB)`.
 
 ## Locking, and the IRQ-masked hold
 
-`Ext2State` is an `RwSpinlock`. Reads run concurrently; writes are exclusive.
-Both `read_state()` and `write_state()` are **unbounded** `try_*` + backoff
-loops with a periodic orphaned-lock check: every 10 000 attempts they look at
-`write_lock_owner`, and if that thread is dead (`ThreadHooks::is_thread_dead`)
-they `force_unlock_write()`. This exists because an fs syscall can be killed
-mid-hold.
+`Ext2State` lives in an `akuma_locks_rw_cell::RecoverableCell`. Reads run
+concurrently; writes are exclusive; writers have priority over arriving readers.
+`read_state()` and `write_state()` are one line each — the unbounded `try_*` +
+backoff loop lives in `akuma-locks-rw` as `read_as_holding` / `write_as_holding`,
+which take this crate's per-attempt guard (below) on its behalf.
+
+**Recovery, because an fs syscall can be killed mid-hold.** Every shipped
+profile builds `panic = "abort"`, so a killed thread never runs its guard's
+`Drop` and the hold leaks. The lock's answer is that *release is abandon*: the
+sweep for a dead holder performs the identical CAS-guarded operation a
+legitimate release performs, so it cannot double-release and cannot touch a live
+holder. Nothing in this crate asks whether a thread is alive — the runtime
+**reports** the death by calling `Ext2Filesystem::abandon_tid`, wired from
+`src/fs.rs` to `akuma_exec::threading::set_slot_reap_callback` and fired at the
+TERMINATED→FREE transition. `src/vfs/ext2.rs` holds the small registry that
+turns one dead tid into a sweep of every mount.
+
+Until 2026-08-31 this was three copies of a hand-rolled loop that recorded the
+owner's tid and, every 10 000 attempts, asked `ThreadHooks::is_thread_dead`
+before calling `force_unlock_write()`. Two things were wrong with it. The
+question is unanswerable — thread slots are recycled, so the answer usually
+described a *live new occupant* and recovery never fired — and read holds were
+tracked by nothing at all, so a thread killed holding a read lock blocked every
+future writer forever. Both are fixed; `AKUMA_EXT2_CLEANUP.md` §4.2a and §7 have
+the full account, and the crate reached `#![forbid(unsafe_code)]` when the last
+`force_unlock_write` left.
 
 ### `StateHoldGuard`
 

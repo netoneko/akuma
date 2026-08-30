@@ -73,9 +73,14 @@ The message is stored whole rather than composed, so each crate keeps its own
 wording and names its own `init`.
 
 **Choosing `get` vs `require` is a real decision, so make it explicitly.**
-`akuma-ext2`'s thread hooks use `get`, because its lock paths genuinely run
-during early boot before `init_thread_hooks` and tid-0 / not-dead is the correct
-answer there. `akuma-exec` and `akuma-net` use `require`, because nothing reads
+`akuma-ext2`'s `InodeFreedHook` uses `get`, because the paths that free an inode
+genuinely run before the kernel registers it (and in host tests, which have no
+page cache), where "no invalidation needed" is the correct answer. Its *thread*
+hooks used `get` for the same reason until 2026-08-31, when they were deleted
+outright — the lock they served stopped asking liveness questions
+(`archive/AKUMA_EXT2_CLEANUP.md` §4.4). `akuma-locks-rw`'s backstop kicker is
+the surviving example of the same shape: unregistered, a waiter degrades to a
+plain spin. `akuma-exec` and `akuma-net` use `require`, because nothing reads
 their tables before `init`. Before this type the three crates each made that
 call in a different house style, and only one of them wrote down why.
 

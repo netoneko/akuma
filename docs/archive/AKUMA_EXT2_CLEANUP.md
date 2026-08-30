@@ -369,11 +369,11 @@ model checker adds exhaustion where the old code had one live-VM race path.
    blocks_per_group, block_size_log) as part of the new `parse`/mount path.
 3. **`akuma-recoverable`** per §4.5 — lands **without wiring**: crate, tests,
    model checker, `forbid(unsafe_code)`. Nothing imports it yet.
-4. **Wiring (separate step, later):** ext2 adopts the lock (`write_state` /
-   `read_state` collapse into it), `threading` calls `reap_tid` at the
-   TERMINATED→FREE transition, `src/fs.rs` registers the kicker,
-   `THREAD_HOOKS`/`write_lock_owner`/the three poll loops are deleted,
-   `akuma-ext2` takes `#![forbid(unsafe_code)]`.
+4. **Wiring — landed 2026-08-31.** ext2 adopts the lock, `threading` calls the
+   sweep at the TERMINATED→FREE transition, `src/fs.rs` registers the kicker,
+   `THREAD_HOOKS`/`write_lock_owner`/the three poll loops are deleted, and
+   `akuma-ext2` takes `#![forbid(unsafe_code)]`. §7 records what the step
+   actually cost and the four places the sketch above was wrong.
 
 ## 6. Verification
 
@@ -465,6 +465,127 @@ discarded when QEMU was `kill`'d. That reading cannot hold here: `sync()` ran,
 reported zero remaining writes, and the image was dumped afterward. §12.4's own
 decisive test (reproduced at SMP=1) was right that it is neither a concurrency
 tear nor a BKL effect; the cause is simply in `remove_dir`.
+
+## 7. Step 4 as built (2026-08-31)
+
+Landed as written, with four corrections the sketch could not have known.
+
+### 7.1 The value had to go one crate further out than §4.5 said
+
+§5 step 4 promised `akuma-ext2` would take `#![forbid(unsafe_code)]`, and §4.5's
+landing note said a consumer "composes its own `UnsafeCell<T>` at the value's
+owner". **Those two cannot both hold**: the deref is `unsafe`, so doing it in
+ext2 costs ext2 the ban. The promise was written before the no-`T` deviation.
+
+Resolved by making the composition parametric, in a new leaf crate
+**`akuma-locks-rw-cell`** (206 lines, 8 `unsafe` sites: six `UnsafeCell` derefs
+and the `Send`/`Sync` impls). It is generic over `T` and so never names
+`Ext2State`, which stays `pub(crate)` exactly as before — no encapsulation was
+spent to get the value out. The obligation it discharges is about the lock word,
+not the payload, which is the same bargain `lock_api` already makes for every
+`spinning_top` lock in this tree. Net: two enforced crates plus a 206-line
+unenforced one, in place of a 3,043-line unenforced driver.
+
+`lock_api::RawRwLock` was the first choice and reading the protocol ruled it
+out: it wants tid-less `lock_exclusive()` / `unsafe unlock_exclusive()` as
+separate calls, but `RecoverableRwLock` releases through a ticket's `Drop` and a
+read release needs the tid whose hold it drains. Implementing it would have
+meant `mem::forget`-ing the ticket and exposing public raw
+`release_write`/`release_read(tid)` — reintroducing the very
+"release a lock you may not hold" surface `force_unlock_write` had.
+
+A `dyn Any` formulation also works (ext2 would downcast, still writing no
+`unsafe`) and was rejected on cost, not on safety: a `Box` per mount, a downcast
+per acquire on all 25 acquisition sites, an `unwrap` on a compile-time fact, and
+the loss of `const fn new`. It buys no encapsulation the generic lacks.
+
+### 7.2 The three poll loops did not just die — they moved, once
+
+§4.4 said the loops go. They could not simply be deleted: ext2's per-attempt
+`StateHoldGuard` (a `PreemptGuard` under `no-bkl-vfs`) must cover the winning
+`try_*` and the resulting hold but **never** the backoff — masking across an
+unbounded wait starves the core's timer, and a holder on that core could then
+never run to release. A plain blocking `read()`/`write()` cannot express that.
+
+So the loop moved *into* `akuma-locks-rw` as `read_as_holding` /
+`write_as_holding`, which call a caller-supplied `hold()` before each attempt
+and drop it before each spin. ext2's three ~30-line loops became three lines
+each, and the protocol details they used to carry — the `WWAIT` re-announcement,
+the ghost-`WWAIT` heal, the backstop cadence — are now in one place that
+[`model`] speaks for.
+
+### 7.3 `akuma-exec` needed a *new* hook, not the existing one
+
+§4.5 has exec call `recoverable::reap_tid(i)`. There is no such function (the
+shipped crate has no registry), and the obvious existing hook is wrong.
+`SLOT_PURGE_CALLBACK` — the futex waiter purge — fires from **two** places, and
+one is `mark_thread_terminated`, the instant a peer kill lands: there the slot
+is merely TERMINATED, `ON_CPU` may still be set, and the thread can still be
+executing inside the critical section whose lock the sweep would release.
+Dropping a queue entry that early is safe; releasing a lock is not.
+
+So step 4 adds `set_slot_reap_callback`, invoked at exactly one point — after
+the `ON_CPU` gate, after the cooldown, after the TERMINATED→INITIALIZING CAS has
+excluded every spawn, immediately before the FREE store. That is the reap
+contract, verbatim.
+
+### 7.4 The sweep must not go through the VFS mount table
+
+The mount table already enumerates every filesystem and has the `sync_all`
+precedent, which makes it the obvious place to sweep from. It is a deadlock.
+`MountTable::resolve` returns a `&dyn Filesystem` **borrowed from the table**,
+so its callers hold `src/vfs::MOUNT_TABLE` across filesystem calls: thread A
+holds the mount table and blocks in ext2 on a lock a dead thread left held,
+while the recycler blocks on the mount table trying to release it.
+
+`src/vfs/ext2.rs` keeps its own four-slot `Weak` registry instead, written at
+mount and read at reap, never covering device I/O or a filesystem call — so it
+cannot be part of a cycle. `Weak` so a registration cannot pin an unmounted
+filesystem forever.
+
+The backstop kicker is `akuma_exec::threading::reclaim_terminated_slots`, the
+collector-independent recycler pass (`BKL_VFS_CARVE_OUT.md` §11.4). A waiter
+that has spun 10 000 times therefore drives the very sweep that frees it —
+which is the property the old `is_thread_dead` poll was reaching for, without
+asking a question that cannot be answered.
+
+### 7.5 What it cost
+
+Device-I/O counters over the full `ext2probe-host` workload are **identical**
+to `86c2cfd7`, and `e2fsck -fn` on the dumped image exits 0. `verify_trim
+--tier all`: clippy clean on all four feature sets, 1078 host tests (0 fail),
+and the boot summary **identical on all 46 keys** at SMP=1 and SMP=4.
+
+The end-to-end probe cannot resolve the lock itself — the whole run is ~0.21 s,
+mostly reading the image into RAM, against a 10 ms host clock — so the fast path
+is measured directly (`scripts/benchmarks/locks_rw_ab.sh`, best of 7 × 20 M
+uncontended acquire/release pairs, reproducible to ±0.02 ns/op):
+
+| path | `spinning_top::RwSpinlock` | `RecoverableCell` | Δ |
+|---|---:|---:|---:|
+| write acquire+release | 1.39 ns | 2.58 ns | **+1.19 ns** |
+| read acquire+release | 3.13 ns | 3.96 ns | **+0.83 ns** |
+
++86% and +27% in relative terms, and irrelevant in absolute ones: ext2 acquires
+once or twice per filesystem operation, and one operation costs microseconds —
+a warm 4 KB read excursion is ~2050 ns (`EXT2_READ_PATH_STAGE_PROFILE.md`), so
+this is ~0.05% of it, against ~8 device writes per file create at a virtio
+round-trip each. The contended path is deliberately not measured: its cost is
+dominated by how long the holder holds, which is device I/O.
+
+What it bought: the three `force_unlock_write` sites and the thread hooks are
+gone, `akuma-ext2` is enforced `#![forbid(unsafe_code)]` (3,043 production
+lines, the largest crate yet to make the move — enforced crates 21 → **22 of
+32**), the §4.2a recycled-tid bug is fixed by construction, and **leaked read
+holds are recoverable for the first time** — the old design tracked one writer
+tid and nothing else, so a thread killed holding a read lock blocked every
+future writer forever with no code path that could notice.
+
+Three regression tests in `akuma-ext2` pin it: a thread killed holding the write
+lock, one killed holding two read locks, and a sweep of an unrelated tid leaving
+a live holder alone. The first is §6's "must show it failing on the old path"
+case — the old path could not pass it at all, because nothing in a host test
+ever marks a thread dead, and recovery there was gated on asking.
 
 ## Background
 

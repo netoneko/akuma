@@ -43,8 +43,8 @@ use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 #[cfg(not(kernel_profile_extreme))]
 use spinning_top::Spinlock;
-use spinning_top::RwSpinlock;
 
+use akuma_locks_rw_cell::RecoverableCell;
 use akuma_primitives::Registered;
 use akuma_vfs::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_components, split_path};
 use crate::BlockDevice;
@@ -610,41 +610,16 @@ pub fn deferred_free_pending() -> usize {
     DEFERRED_FREE_PENDING.load(Ordering::Relaxed)
 }
 
-/// Kernel callbacks the orphaned-lock recovery path needs. Registered once at
-/// boot by `src/fs.rs`.
-#[derive(Clone, Copy)]
-struct ThreadHooks {
-    current_thread_id: fn() -> usize,
-    is_thread_dead: fn(usize) -> bool,
-}
-
-/// Thread hooks, published once at boot and read from the lock-acquisition paths.
+/// The thread hooks are **gone** (2026-08-31, `AKUMA_EXT2_CLEANUP.md` §4.4).
 ///
-/// Was a pair of `static mut Option<fn>` read without any synchronisation: on
-/// SMP that is a genuine data race (nothing ordered the boot core's write
-/// against a secondary core's read), and it made every use site `unsafe`.
-/// [`Registered`] is the tree-wide answer to exactly this shape — a release
-/// store at init paired with an acquire load at every read — and, unlike a
-/// spinlock, it can never self-deadlock against a reader that interrupted the
-/// writer.
-///
-/// This one keeps using [`Registered::get`] rather than `require()`: the ext2
-/// lock paths run during early boot before `init_thread_hooks`, and degrading
-/// (tid 0, "not dead") is correct there. That is the case the `get`/`require`
-/// split exists for.
-static THREAD_HOOKS: Registered<ThreadHooks> =
-    Registered::new("akuma-ext2: ThreadHooks not registered — call init_thread_hooks() first");
-
-/// Initialize the thread hooks. Called once by the kernel, before any
-/// filesystem operations. A second call is ignored.
-#[allow(dead_code)]
-pub fn init_thread_hooks(current_thread_id: fn() -> usize, is_thread_dead: fn(usize) -> bool) {
-    THREAD_HOOKS.register(ThreadHooks {
-        current_thread_id,
-        is_thread_dead,
-    });
-}
-
+/// `init_thread_hooks(current_thread_id, is_thread_dead)` existed only to serve
+/// the orphaned-write-lock recovery: the acquisition loops recorded a tid, and
+/// every 10 000 spins asked the scheduler whether that tid was still alive so
+/// they could `force_unlock_write()` a third-party lock. Both questions are now
+/// somebody else's — the acquire-side identity is read natively by
+/// `akuma_primitives::preempt::current_tid()` inside the lock, and liveness is
+/// never *asked*: the runtime *reports* a death by calling
+/// [`Ext2Filesystem::abandon_tid`]. This crate no longer names a tid at all.
 /// Kernel callback invoked when an inode number is returned to the allocator.
 ///
 /// The kernel's `file_page_cache` is keyed on **`(inode, file_offset)`**, so a
@@ -681,14 +656,6 @@ fn on_inode_freed(inode: u32) {
     if let Some(h) = INODE_FREED_HOOK.get() {
         (h.invalidate_pages)(inode);
     }
-}
-
-fn current_thread_id() -> usize {
-    THREAD_HOOKS.get().map_or(0, |h| (h.current_thread_id)())
-}
-
-fn is_thread_dead(tid: usize) -> bool {
-    THREAD_HOOKS.get().is_some_and(|h| (h.is_thread_dead)(tid))
 }
 
 // ============================================================================
@@ -1337,7 +1304,7 @@ struct Ext2ReadGuard<'a> {
     // Declaration order IS drop order: release the lock first, THEN restore
     // preemption/IRQs — never the other way round, or the window this guard exists to
     // close would reopen for the instant between them.
-    inner: spinning_top::lock_api::RwLockReadGuard<'a, spinning_top::RawRwSpinlock, Ext2State>,
+    inner: akuma_locks_rw_cell::ReadGuard<'a, Ext2State>,
     #[allow(dead_code)]
     hold: StateHoldGuard,
 }
@@ -1349,14 +1316,15 @@ impl core::ops::Deref for Ext2ReadGuard<'_> {
     }
 }
 
-/// RAII guard for write access to `Ext2State` that clears lock ownership on drop.
+/// RAII guard for write access to `Ext2State`.
+///
+/// The explicit owner-clearing `Drop` this used to carry is gone: the owner
+/// cell belongs to the lock now, and `WriteTicket`'s own `Drop` clears it
+/// before the writer bit falls — the same ordering, one layer down and
+/// model-checked there.
 struct Ext2WriteGuard<'a> {
     // See `Ext2ReadGuard` for why `inner` must precede `hold`.
-    inner: spinning_top::lock_api::RwLockWriteGuard<'a, spinning_top::RawRwSpinlock, Ext2State>,
-    /// The owning filesystem's per-instance owner cell. `drop` runs before the
-    /// fields are dropped, so the owner is cleared *before* `inner` releases
-    /// the lock — same ordering contract the old global static had.
-    owner: &'a AtomicUsize,
+    inner: akuma_locks_rw_cell::WriteGuard<'a, Ext2State>,
     #[allow(dead_code)]
     hold: StateHoldGuard,
 }
@@ -1374,13 +1342,6 @@ impl core::ops::DerefMut for Ext2WriteGuard<'_> {
     }
 }
 
-impl Drop for Ext2WriteGuard<'_> {
-    fn drop(&mut self) {
-        // Clear ownership before the inner guard releases the lock
-        self.owner.store(0, Ordering::Release);
-    }
-}
-
 // ============================================================================
 // Ext2 Filesystem Implementation
 // ============================================================================
@@ -1389,15 +1350,13 @@ impl Drop for Ext2WriteGuard<'_> {
 pub struct Ext2Filesystem<B: BlockDevice> {
     dev: B,
     time_fn: fn() -> u64,
-    /// Internal state protected by RwSpinlock. Read operations can proceed concurrently.
+    /// Internal state behind the recoverable reader/writer lock. Reads proceed
+    /// concurrently; a holder killed mid-hold is recovered by
+    /// [`Self::abandon_tid`] rather than by this crate inferring liveness.
     /// `pub(crate)` for `mod tests`; not reachable outside the crate.
-    pub(crate) state: RwSpinlock<Ext2State>,
+    pub(crate) state: RecoverableCell<Ext2State>,
     #[cfg(not(kernel_profile_extreme))]
     block_cache: Spinlock<BlockCache>,
-    /// Per-instance write-lock owner for orphaned-lock recovery (see the
-    /// `Ext2WriteGuard` docs). Per-instance, not global, because two mounted
-    /// ext2 filesystems must not force-unlock each other's state.
-    write_lock_owner: AtomicUsize,
     /// Inodes unlinked while a mapping still pinned them — see [`DeferredFrees`].
     deferred: DeferredFrees,
     /// Directory-tree walks and block-cache accesses this instance has done, for
@@ -1551,10 +1510,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         Ok(Self {
             dev,
             time_fn: utc_time_us,
-            state: RwSpinlock::new(state),
+            state: RecoverableCell::new(state),
             #[cfg(not(kernel_profile_extreme))]
             block_cache: Spinlock::new(make_block_cache(block_size, cache_cap_bytes)),
-            write_lock_owner: AtomicUsize::new(0),
             deferred: DeferredFrees::new(),
             #[cfg(test)]
             counters: WorkCounters::default(),
@@ -1565,41 +1523,16 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         ((self.time_fn)() / 1_000_000) as u32
     }
 
-    /// Try to acquire a read lock with a retry limit.
-    /// Returns None if the lock cannot be acquired after max_retries attempts.
-    /// 
-    /// Read locks can be held concurrently by multiple threads.
-    /// If an orphaned write lock is detected, it will be force-unlocked.
+    /// Try to acquire a read lock with a retry limit (used by unit tests only).
+    /// Returns None if it cannot be acquired within `max_retries` attempts.
     #[cfg(test)]
     pub fn try_lock_state(&self, max_retries: u32) -> Option<impl core::ops::Deref<Target = Ext2State> + '_> {
-        self.try_read_state(max_retries)
-    }
-
-    /// Try to acquire a read lock with a retry limit (used by unit tests only).
-    #[cfg(test)]
-    fn try_read_state(&self, max_retries: u32) -> Option<Ext2ReadGuard<'_>> {
-        for attempt in 0..max_retries {
+        for _ in 0..max_retries {
             let hold = state_hold_guard();
             if let Some(inner) = self.state.try_read() {
                 return Some(Ext2ReadGuard { inner, hold });
             }
             drop(hold);
-
-            // Check if there's an orphaned write lock blocking reads
-            if attempt > 0 && attempt % 10_000 == 0 {
-                let owner = self.write_lock_owner.load(Ordering::Acquire);
-                if owner != 0 && is_thread_dead(owner) {
-                    // SAFETY: The owner thread is dead so it can't be using the lock.
-                    unsafe { self.state.force_unlock_write(); }
-                    self.write_lock_owner.store(0, Ordering::Release);
-                    let hold = state_hold_guard();
-                    if let Some(inner) = self.state.try_read() {
-                        return Some(Ext2ReadGuard { inner, hold });
-                    }
-                    drop(hold);
-                }
-            }
-
             for _ in 0..100 {
                 core::hint::spin_loop();
             }
@@ -1607,78 +1540,54 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         None
     }
 
-    /// Acquire a read lock, blocking until available.
-    /// Read locks can be held concurrently by multiple threads.
+    /// Acquire a read lock, blocking until available. Reads are concurrent.
     ///
     /// The [`StateHoldGuard`] is taken *per attempt*, immediately before the
-    /// non-blocking `try_read()`, and either kept (success — it now covers the hold) or
-    /// dropped before the backoff spin. It deliberately does **not** wrap the whole loop:
-    /// under `no-bkl-vfs` that guard masks local IRQs, and this loop is unbounded (it has
-    /// a 10,000-attempt orphan-recovery path precisely because a wait can be long), so
-    /// masking across the wait would starve this core's timer for the whole contended
-    /// window — and if the current holder were a thread on this core, nothing could ever
-    /// run to release it. Masking only the try + hold gives the property we actually need
-    /// (no nested exception *while holding* the lock) with a bounded masked window.
+    /// non-blocking try, and either kept (success — it now covers the hold) or
+    /// dropped before the backoff spin. It deliberately does **not** wrap the whole
+    /// wait: under `no-bkl-vfs` that guard masks local IRQs, and this wait is
+    /// unbounded, so masking across it would starve this core's timer for the whole
+    /// contended window — and if the current holder were a thread on this core,
+    /// nothing could ever run to release it. Masking only the try + hold gives the
+    /// property we actually need (no nested exception *while holding* the lock)
+    /// with a bounded masked window.
+    ///
+    /// That discipline is why this calls `read_holding` rather than a plain
+    /// `read()`: the loop lives in `akuma-locks-rw`, which takes the guard on the
+    /// caller's behalf at exactly those two points. Before 2026-08-31 this
+    /// function *was* the loop, in one of three drifting copies, each carrying its
+    /// own 10 000-spin orphan-recovery branch that asked the scheduler whether the
+    /// recorded owner tid was dead and then `force_unlock_write()`-ed on the
+    /// answer. All of that is gone — `AKUMA_EXT2_CLEANUP.md` §4.2a for why the
+    /// question was unanswerable (a recycled tid made it read a *new* occupant's
+    /// liveness), §4.3a for what replaced it.
     #[allow(dead_code)]
     fn read_state(&self) -> Ext2ReadGuard<'_> {
-        let mut attempt = 0u32;
-        loop {
-            let hold = state_hold_guard();
-            if let Some(inner) = self.state.try_read() {
-                return Ext2ReadGuard { inner, hold };
-            }
-            drop(hold);
-
-            attempt = attempt.wrapping_add(1);
-
-            // Check for orphaned write lock periodically
-            if attempt % 10_000 == 0 {
-                let owner = self.write_lock_owner.load(Ordering::Acquire);
-                if owner != 0 && is_thread_dead(owner) {
-                    unsafe { self.state.force_unlock_write(); }
-                    self.write_lock_owner.store(0, Ordering::Release);
-                    continue;
-                }
-            }
-
-            for _ in 0..100 {
-                core::hint::spin_loop();
-            }
-        }
+        let (inner, hold) = self.state.read_holding(state_hold_guard);
+        Ext2ReadGuard { inner, hold }
     }
 
-    /// Acquire a write lock, blocking until available.
-    /// Tracks ownership for orphaned lock recovery.
-    ///
-    /// Same per-attempt [`StateHoldGuard`] discipline as [`Self::read_state`] — see there
-    /// for why the guard must not span the backoff spin.
+    /// Acquire a write lock, blocking until available. Same per-attempt
+    /// [`StateHoldGuard`] discipline as [`Self::read_state`] — see there.
     fn write_state(&self) -> Ext2WriteGuard<'_> {
-        let current_tid = current_thread_id();
-        let mut attempt = 0u32;
-        loop {
-            let hold = state_hold_guard();
-            if let Some(inner) = self.state.try_write() {
-                self.write_lock_owner.store(current_tid, Ordering::Release);
-                return Ext2WriteGuard { inner, owner: &self.write_lock_owner, hold };
-            }
-            drop(hold);
+        let (inner, hold) = self.state.write_holding(state_hold_guard);
+        Ext2WriteGuard { inner, hold }
+    }
 
-            attempt = attempt.wrapping_add(1);
-
-            // Check for orphaned write lock periodically
-            if attempt % 10_000 == 0 {
-                let owner = self.write_lock_owner.load(Ordering::Acquire);
-                if owner != 0 && is_thread_dead(owner) {
-                    unsafe { self.state.force_unlock_write(); }
-                    self.write_lock_owner.store(0, Ordering::Release);
-                    continue;
-                }
-            }
-
-            for _ in 0..100 {
-                core::hint::spin_loop();
-            }
-        }
+    /// Recover everything the dead thread `tid` held on this mount.
+    ///
+    /// The runtime calls this at the TERMINATED→FREE transition, where `tid` is
+    /// known dead and its slot cannot yet be reissued. It performs the same
+    /// CAS-guarded release a live holder's guard performs, so a sweep that
+    /// races a legitimate release, or runs twice, is a no-op — and a lock a
+    /// *live* thread holds is never touched. Returns whether anything was
+    /// recovered.
+    ///
+    /// This replaces the three `unsafe { force_unlock_write() }` sites, whose
+    /// contract ("no guard for this lock exists") was a whole-program property
+    /// no crate could check.
+    pub fn abandon_tid(&self, tid: usize) -> bool {
+        self.state.abandon_tid(tid)
     }
 
     // ========================================================================

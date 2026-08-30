@@ -20,6 +20,7 @@ default-members = [
     "crates/akuma-bkl",
     "crates/akuma-boot",
     "crates/akuma-locks-rw",
+    "crates/akuma-locks-rw-cell",
     "crates/akuma-primitives",
     "crates/akuma-rump",
     "crates/akuma-scheduler",
@@ -642,6 +643,9 @@ workspace = true
 akuma-terminal = { path = "crates/akuma-terminal" }
 akuma-vfs = { path = "crates/akuma-vfs" }
 akuma-ext2 = { path = "crates/akuma-ext2" }
+# The recoverable lock protocol — the kernel registers its waiter-side backstop in
+# `src/fs.rs` (the one upward wire, AKUMA_EXT2_CLEANUP.md §4.5).
+akuma-locks-rw = { path = "crates/akuma-locks-rw" }
 akuma-net = { path = "crates/akuma-net", default-features = false }
 # The AF_UNIX state machine. A dependency in its own right, not reached through
 # akuma-net: it is IPC over pipes with no NIC, no IP and no smoltcp, and the

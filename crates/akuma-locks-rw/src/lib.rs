@@ -206,12 +206,33 @@ impl RecoverableRwLock {
     /// [`BACKSTOP_SPINS`] is what lets a late reap unblock this waiter even
     /// if nobody else notices the dead holder.
     pub fn write_as(&self, tid: usize) -> WriteTicket<'_> {
+        self.write_as_holding(tid, || ()).0
+    }
+
+    /// [`Self::write_as`], but taking a caller-supplied guard **per attempt**:
+    /// `hold()` runs immediately before each non-blocking try and is dropped
+    /// again before each backoff spin, so only the try and the resulting hold
+    /// are covered — never the wait.
+    ///
+    /// This exists for `akuma-ext2`, whose guard masks local IRQs under
+    /// `no-bkl-vfs`. It must be held across the winning try (an IRQ landing
+    /// between acquire and mask can `enter_kernel()` and hard-spin for the BKL
+    /// while this lock is held — the AB-BA wedge) and must **not** span the
+    /// backoff (this loop is unbounded, and masking across it would starve the
+    /// core's timer, so a holder on this very core could never run to release).
+    /// Before this method that loop lived in the consumer, in three drifting
+    /// copies, and the protocol details below — the `WWAIT` re-announcement and
+    /// the backstop cadence — lived with it. Keeping one implementation here is
+    /// what lets [`crate::model`] speak for every caller.
+    pub fn write_as_holding<H>(&self, tid: usize, hold: impl Fn() -> H) -> (WriteTicket<'_>, H) {
         self.flag.fetch_or(WWAIT, Ordering::Relaxed);
         let mut spins = 0u32;
         loop {
+            let h = hold();
             if let Some(t) = self.try_write(tid) {
-                return t;
+                return (t, h);
             }
+            drop(h);
             // Re-announce before spinning: try_write consumed the bit if it
             // won; a failed attempt must leave the announcement standing.
             self.flag.fetch_or(WWAIT, Ordering::Relaxed);
@@ -264,11 +285,20 @@ impl RecoverableRwLock {
     /// waiting, which no acquire will ever consume — once the lock is fully
     /// free, so the writer-priority gate cannot outlive every writer.
     pub fn read_as(&self, tid: usize) -> ReadTicket<'_> {
+        self.read_as_holding(tid, || ()).0
+    }
+
+    /// [`Self::read_as`] with a per-attempt caller guard — see
+    /// [`Self::write_as_holding`] for why the guard must cover the winning try
+    /// and nothing else.
+    pub fn read_as_holding<H>(&self, tid: usize, hold: impl Fn() -> H) -> (ReadTicket<'_>, H) {
         let mut spins = 0u32;
         loop {
+            let h = hold();
             if let Some(t) = self.try_read(tid) {
-                return t;
+                return (t, h);
             }
+            drop(h);
             spins = spins.wrapping_add(1);
             if spins.is_multiple_of(BACKSTOP_SPINS) {
                 backstop_kick();

@@ -271,6 +271,72 @@ fn remove_dir_zeroes_the_directorys_link_count() {
     );
 }
 
+/// A thread killed mid-write must not wedge the mount — and recovery must not
+/// need anyone to *ask* whether that thread is alive.
+///
+/// This is the §4.2a bug's regression test. The old path recorded the write
+/// lock's owner tid and, every 10 000 spins, called `is_thread_terminated(tid)`
+/// to decide whether to `force_unlock_write()`. On a busy system that question
+/// is unanswerable: thread slots are recycled, so by the time anyone asked, the
+/// tid usually belonged to a *live* new occupant, the answer came back "alive",
+/// and recovery never fired — the mount stayed wedged for good. The old code
+/// could not pass this test at all, because nothing here ever marks a thread
+/// dead; the recovery below happens purely because the runtime *reports* the
+/// death by calling `abandon_tid`.
+///
+/// `mem::forget` is the kill: every shipped profile builds `panic = "abort"`,
+/// so a thread killed at an arbitrary instruction never runs its guard's
+/// `Drop` — exactly this shape.
+#[test]
+fn a_thread_killed_holding_the_write_lock_does_not_wedge_the_mount() {
+    let fs = mount_empty();
+    fs.create_dir("/before").unwrap();
+
+    // Take the write lock and die holding it.
+    let tid = akuma_primitives::preempt::current_tid();
+    core::mem::forget(fs.state.write_as(tid));
+    assert!(fs.state.try_write_as(tid + 1).is_none(), "wedged, as expected");
+
+    // The runtime reports the death at the TERMINATED->FREE transition.
+    assert!(fs.abandon_tid(tid), "the sweep recovers the orphaned write hold");
+
+    // The mount is fully usable again, and the pre-kill state is intact.
+    assert!(fs.exists("/before"));
+    fs.create_dir("/after").unwrap();
+    assert!(fs.exists("/after"));
+    fs.write_file("/after/f", b"ok").unwrap();
+    assert_eq!(fs.read_file("/after/f").unwrap(), b"ok");
+}
+
+/// Read holds were **unrecoverable** in the old design: it tracked one writer
+/// tid and nothing else, so a thread killed holding a read lock blocked every
+/// future writer forever with no code path that could ever notice.
+#[test]
+fn a_thread_killed_holding_read_locks_does_not_wedge_the_mount() {
+    let fs = mount_empty();
+    let tid = akuma_primitives::preempt::current_tid();
+    core::mem::forget(fs.state.read_as(tid));
+    core::mem::forget(fs.state.read_as(tid));
+    assert!(fs.state.try_write_as(tid + 1).is_none(), "two leaked read holds");
+
+    assert!(fs.abandon_tid(tid), "the sweep drains both");
+    fs.create_dir("/writable_again").unwrap();
+    assert!(fs.exists("/writable_again"));
+}
+
+/// Sweeping a tid that holds nothing must not steal a live holder's lock —
+/// the property that makes it safe to call the reaper on every thread death.
+#[test]
+fn sweeping_an_unrelated_tid_leaves_a_live_hold_alone() {
+    let fs = mount_empty();
+    let tid = akuma_primitives::preempt::current_tid();
+    let held = fs.state.write_as(tid);
+    assert!(!fs.abandon_tid(tid + 9), "that tid holds nothing here");
+    assert!(fs.state.try_read_as(tid + 1).is_none(), "the live hold survived");
+    drop(held);
+    assert!(fs.state.try_read_as(tid + 1).is_some());
+}
+
 // ── Metadata ────────────────────────────────────────────────────────
 
 #[test]

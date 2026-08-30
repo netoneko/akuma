@@ -12,6 +12,7 @@ dependencies = [
  "akuma-firecracker",
  "akuma-isolation",
  "akuma-kacho",
+ "akuma-locks-rw",
  "akuma-net",
  "akuma-net-unix",
  "akuma-net-yarn",
@@ -89,6 +90,7 @@ dependencies = [
 name = "akuma-ext2"
 version = "0.1.0"
 dependencies = [
+ "akuma-locks-rw-cell",
  "akuma-primitives",
  "akuma-vfs",
  "spinning_top",
@@ -120,6 +122,15 @@ version = "0.1.0"
 dependencies = [
  "akuma-not-even-once",
  "akuma-primitives",
+]
+
+[[package]]
+name = "akuma-locks-rw-cell"
+version = "0.1.0"
+dependencies = [
+ "akuma-locks-rw",
+ "akuma-primitives",
+ "spinning_top",
 ]
 
 [[package]]

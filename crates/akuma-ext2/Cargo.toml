@@ -17,7 +17,7 @@ extreme = []
 fs-cache = []
 # Run the ext2 paths without the Big Kernel Lock (Phase 4 of
 # docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate.
-# Wraps the `state` (RwSpinlock) holds — and therefore, transitively, every
+# Wraps the `state` (RecoverableCell) holds — and therefore, transitively, every
 # `block_cache` access, which is only ever reached with a state guard held — in
 # `akuma_exec::sync::PreemptGuard`, so a core running an fs syscall WITHOUT the
 # BKL can never be caught holding an ext2 inner lock while a nested IRQ
@@ -29,11 +29,16 @@ no-bkl-vfs = ["akuma-primitives/no-bkl-vfs"]
 
 [dependencies]
 akuma-vfs = { path = "../akuma-vfs" }
-# `OnceCopy` (the lock-free thread hooks) + `PreemptGuard` (the IRQ-masking
-# inner-lock guard under `no-bkl-vfs`). These two symbols were the ENTIRE reason
+# `Registered` (the lock-free `InodeFreedHook` cell) + `PreemptGuard` (the
+# IRQ-masking inner-lock guard under `no-bkl-vfs`). These two symbols were the ENTIRE reason
 # this crate depended on `akuma-exec` — the 23.8k-line execution crate, for a
 # ~40-line RAII guard and a ~40-line cell. Both live in the dependency-free leaf
 # now, so that edge is gone: see
 # docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md 5.55 / 5.555.
 akuma-primitives = { path = "../akuma-primitives" }
+# The recoverable reader/writer lock, and the value half that pairs it with
+# `Ext2State`. Together they replace `spinning_top::RwSpinlock` here plus the
+# three `force_unlock_write` sites and the thread hooks that fed them —
+# docs/archive/AKUMA_EXT2_CLEANUP.md §5 step 4.
+akuma-locks-rw-cell = { path = "../akuma-locks-rw-cell" }
 spinning_top = "0.3"

@@ -53,9 +53,26 @@ dependencies = [
 name = "akuma-ext2"
 version = "0.1.0"
 dependencies = [
+ "akuma-locks-rw-cell",
  "akuma-primitives",
  "akuma-vfs",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-locks-rw"
+version = "0.1.0"
+dependencies = [
+ "akuma-not-even-once",
+ "akuma-primitives",
+]
+
+[[package]]
+name = "akuma-locks-rw-cell"
+version = "0.1.0"
+dependencies = [
+ "akuma-locks-rw",
+ "akuma-primitives",
 ]
 
 [[package]]

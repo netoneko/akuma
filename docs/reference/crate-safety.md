@@ -1,11 +1,13 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-08-30 with `python3 scripts/cloc_akuma.py src crates`
-twice in one day: the morning run followed the networking split
-(`archive/AKUMA_NET_SPLIT.md`); the evening run followed
-[`AKUMA_EXT2_CLEANUP.md`](../archive/AKUMA_EXT2_CLEANUP.md) steps 1–3 (the ext2
-on-disk codec) and the new `akuma-locks-rw`. Every number below comes from that
-run; none was incremented by hand. Previously measured
+**Grade: A** — regenerated 2026-08-31 with `python3 scripts/cloc_akuma.py src crates`
+after [`AKUMA_EXT2_CLEANUP.md`](../archive/AKUMA_EXT2_CLEANUP.md) §5 step 4: ext2
+adopted the recoverable lock, its last three `unsafe` sites left, and the value
+half landed as `akuma-locks-rw-cell`. **22 of 32 crates** now forbid. The three
+runs before it were 2026-08-30 — the networking split
+(`archive/AKUMA_NET_SPLIT.md`) in the morning, then steps 1–3 (the ext2 on-disk
+codec) and `akuma-locks-rw` in the evening. Every number below comes from a run;
+none was incremented by hand. Previously measured
 2026-08-28 by grepping every
 `crates/*/src/` tree and confirmed by building each crate with the ban in force
 (`cargo clippy -p <crate> --target $HOST -- -D warnings`, 0 errors). `akuma-mmap`
@@ -39,6 +41,7 @@ host-test.
 | `akuma-isolation` | box/namespace path confinement (`subdir_fs`) |
 | `akuma-kacho` | the shared observe/decide/hysteresis layer for self-tuning policies |
 | `akuma-locks-rw` | the recoverable reader/writer lock: release **is** abandon (orphaned-lock recovery as a CAS on the lock's own word), plus its host model checker |
+| `akuma-ext2` | the ext2 driver: on-disk codec, block cache, directory and inode operations, deferred frees |
 | `akuma-net-yarn` | the socket readiness wait loop as a pure state machine |
 | `akuma-mmap` | `MmapRegion`, CoW-fork region inheritance, `munmap`'s clip-and-split, and the PTE permission vocabulary they speak |
 | `akuma-syscalls-mem` | the memory family's decisions: mmap's mapping-kind plan and `MAP_FIXED` validation, mremap's move-vs-expand, madvise's advice decode and `MADV_DONTNEED`'s per-page rule, munmap's sizing, membarrier's command decode |
@@ -64,8 +67,19 @@ per-tid reader holds, `abandon_tid`, the backstop kicker) is pure atomics and
 `forbid` is real, and a consumer composes its own `UnsafeCell<T>` against the
 tickets — the exclusivity proof the deref needs lives beside the value's owner.
 It is also core-only: the plan's global reap registry became a per-lock
-`abandon_tid` driven by whoever owns the locks (the mount table, at wiring
-time), which removed the crate's only reason to allocate.
+`abandon_tid` driven by whoever owns the locks (`src/vfs/ext2.rs`'s mount
+registry, since step 4), which removed the crate's only reason to allocate.
+
+`akuma-ext2` joined on **2026-08-31**, completing the plan, and the last step is
+where the "who owns the thing being vouched for" law bit back. A consumer
+composing `UnsafeCell<Ext2State>` *literally in ext2*, as the sentence above
+prescribes, would have cost ext2 its own ban — so the composition went into
+`akuma-locks-rw-cell`, **parametric over `T`**. That is the same trade `lock_api`
+already makes for every `spinning_top` lock in this tree: the obligation is
+about the lock word, not the payload, so it can be discharged once for all `T`
+without the adapter ever naming `Ext2State` (which stays `pub(crate)`). Net
+effect: two enforced crates and one 206-line unenforced one, instead of one
+enforced crate and a 3,043-line unenforced driver.
 
 `akuma-isolation` joined this list on 2026-08-28 rather than being born into it.
 It had exactly one `unsafe`: a `core::str::from_utf8_unchecked` over a path
@@ -173,6 +187,15 @@ Two jumps in one day, all on **2026-08-30**:
   the orphaned-lock protocol landed as `akuma-locks-rw` (§5 step 3): enforced
   crates 20 -> 21, `crates/` 45.4% -> **45.9%**, tree-wide 22.3% -> **22.9%**.
   ext2's residual sites are the lock-recovery ones §5 step 4 removes.
+- §5 step 4 removed them (2026-08-31): `akuma-ext2` swapped
+  `spinning_top::RwSpinlock<Ext2State>` for `akuma-locks-rw-cell`'s
+  `RecoverableCell<Ext2State>`, the three `force_unlock_write` sites and the
+  thread hooks that fed them were deleted, and the crate took `forbid`. Enforced
+  crates 21 -> **22 of 32**; `akuma-ext2`'s 3,043 production lines moved from
+  unenforced to enforced, the largest single crate to make the move so far.
+  Cost, measured (`scripts/benchmarks/locks_rw_ab.sh`): **+1.2 ns** per
+  uncontended write acquire and **+0.8 ns** per read, against filesystem
+  operations that cost microseconds.
 
 ## Not enforceable, and why
 
@@ -207,10 +230,10 @@ mention it, 221 are real sites, and the two errors happened to partly cancel.
 | `akuma-virtio` | 38 | MMIO and DMA by definition |
 | `akuma-net-nic` | 23 | DMA-visible frame arenas, virtio descriptor rings, the NIC MMIO doorbell, and smoltcp's `Device` impls |
 | `akuma-cpu` | 19 | `asm!` is unconditionally unsafe; the crate exists so ~160 tree-wide sites don't each have to say so |
-| `akuma-ext2` | 2 (prod; +1 in `cfg(test)`) | the orphaned-lock recovery: `force_unlock_write` on a third-party `RwSpinlock`. The on-disk blits (14) and the symlink pair (2) left on 2026-08-30 for the explicit codec (`AKUMA_EXT2_CLEANUP.md` §5 steps 1–2); the lock sites leave at step 4, when `akuma-locks-rw` is adopted and the three poll loops collapse into it |
 | `akuma-primitives` | 14 | IRQ masking, per-CPU registers, the console writer |
 | `akuma-timer` | 8 | CNTV/PL031 register access |
 | `akuma-not-even-once` | 5 | `UnsafeCell` boot-registration cells; the safe alternative (`Spinlock<Option<T>>`) is a lock on the hottest indirection in the kernel |
+| `akuma-locks-rw-cell` | 8 | the `UnsafeCell<T>` derefs that turn an `akuma-locks-rw` ticket into `&T` / `&mut T`, plus the two `Send`/`Sync` impls that let the cell cross cores. Stable Rust cannot mint `&mut T` from `&self` without them, which is exactly why `akuma-locks-rw` carries no value and this crate exists. Irreducible *and* deliberately tiny: 206 lines, generic over `T`, so the obligation is discharged once for every consumer — the same bargain `lock_api` makes |
 | `akuma-pmm` | 3 | the physical frame allocator's own bookkeeping — the invariant that justifies them is this crate's own bitmap state, so they cannot move |
 
 **Three crates left this table on 2026-08-30**, all from the `akuma-exec` split:

@@ -1,0 +1,32 @@
+[package]
+name = "akuma-locks-rw-cell"
+version = "0.1.0"
+edition = "2024"
+description = "Pairs akuma-locks-rw's ticket protocol with a value: the two UnsafeCell derefs that stable Rust cannot express under forbid(unsafe_code), kept parametric so no consumer's state type is ever named here"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The protocol. Everything with a bug history lives there, behind
+# `#![forbid(unsafe_code)]` and an exhaustive model checker; this crate adds a
+# value and nothing else.
+akuma-locks-rw = { path = "../akuma-locks-rw" }
+# `current_tid`, for the `read`/`write` conveniences that mirror the protocol's.
+akuma-primitives = { path = "../akuma-primitives" }
+
+# The A/B benchmark against the lock this replaced in `akuma-ext2`. Gated behind
+# `cli` and `required-features` — exactly the `akuma-scheduler` / `sched-sim`
+# precedent — so a bare `cargo build`/`test` at the repo root never tries to
+# cross-compile a `std` binary for the kernel's own target.
+[[bin]]
+name = "lock-ab"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["dep:spinning_top"]
+
+[dependencies.spinning_top]
+version = "0.3"
+optional = true

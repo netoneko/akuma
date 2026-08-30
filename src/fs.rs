@@ -41,13 +41,31 @@ pub fn init() -> Result<(), FsError> {
     // Initialize VFS subsystem
     vfs::init();
 
-    // Initialize ext2 thread hooks for orphaned lock recovery
-    // These hooks allow the filesystem to detect when a thread holding the lock has died
-    // and force-unlock to prevent permanent deadlock.
-    akuma_ext2::init_thread_hooks(
-        akuma_exec::threading::current_thread_id,
-        akuma_exec::threading::is_thread_terminated,
-    );
+    // Orphaned-lock recovery, rebuilt 2026-08-31 (`docs/archive/AKUMA_EXT2_CLEANUP.md`
+    // §4). This was `akuma_ext2::init_thread_hooks(current_thread_id,
+    // is_thread_terminated)`: ext2 recorded the write-lock owner's tid and, every 10 000
+    // spins, *asked* whether that tid was still alive so it could force-unlock. The
+    // question is unanswerable — a recycled tid makes it read a **new** occupant's
+    // liveness, so on a busy system recovery simply never fired (§4.2a) — and
+    // `force_unlock_write` is an unconditional store whose "no guard exists" contract no
+    // crate can check.
+    //
+    // Now nobody asks. Two registrations replace it, and ext2 names no tid at all:
+    //
+    // 1. The runtime *reports* a death. `reap_dead_thread` runs at the TERMINATED→FREE
+    //    transition, where the tid is genuinely dead and its slot cannot yet be
+    //    reissued, and performs the same CAS-guarded release a live holder performs.
+    // 2. The waiter-side backstop keeps the property the 10 000-spin poll actually
+    //    provided: any waiter, alone, can unblock the system when a reap is late.
+    //    `reclaim_terminated_slots` is the collector-independent recycler pass (it
+    //    exists because thread 0's idle loop does not run while the system is busy —
+    //    `BKL_VFS_CARVE_OUT.md` §11.4), so a blocked waiter drives the very sweep that
+    //    frees it. Unregistered it degrades to a plain spin, which is why host tests and
+    //    early boot need no hook.
+    akuma_exec::threading::set_slot_reap_callback(crate::vfs::ext2::reap_dead_thread);
+    akuma_locks_rw::register_backstop(|| {
+        akuma_exec::threading::reclaim_terminated_slots();
+    });
 
     // Drop `file_page_cache` entries when an inode number is reissued. The cache
     // is keyed on `(inode, file_offset)`, so without this a new file silently

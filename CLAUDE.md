@@ -10,7 +10,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 - `crates/` — Host-testable extracted crates:
   `akuma-{exec,ext2,firecracker,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
   plus the `akuma-syscalls*` family below.
-  **21 of the 31 carry `#![forbid(unsafe_code)]`** — which crates, and why the
+  **22 of the 32 carry `#![forbid(unsafe_code)]`** — which crates, and why the
   other ten cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
   with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).
   The **syscall family** is three layers, leaf-first and named so the
@@ -132,12 +132,27 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   recovery (2026-08-30, `docs/archive/AKUMA_EXT2_CLEANUP.md` §4): release **is**
   abandon — the sweep for a dead holder performs the same CAS-guarded operation
   a legitimate release performs, so a `panic = "abort"` kill can never wedge a
-  mount permanently. Carries no value (that is what lets it forbid `unsafe` — a
-  consumer composes its own `UnsafeCell<T>` against the tickets) and no global
-  registry (each lock is swept by its owner via `abandon_tid`; wiring is §5
-  step 4, not done yet — `akuma-ext2`'s three `force_unlock_write` sites still
-  stand). Host-tested by an exhaustive model checker on the `akuma-bkl`
-  `bkl_model.rs` pattern.
+  mount permanently. Carries no value and no global registry; host-tested by an
+  exhaustive model checker on the `akuma-bkl` `bkl_model.rs` pattern.
+  `akuma-locks-rw-cell` is the value half — the `UnsafeCell<T>` derefs stable
+  Rust cannot express under `forbid`, **generic over `T`** so it never names a
+  consumer's state type. That parametricity is the whole point: it is what let
+  `akuma-ext2` adopt the lock and take `forbid` itself (§5 step 4, 2026-08-31)
+  while `Ext2State` stayed `pub(crate)`. Do not reach for `dyn` here — it works,
+  but costs a `Box` per mount, a downcast per acquire and `const fn new`, and
+  buys no encapsulation the generic does not already give.
+  **The reap is wired at one point only**: `akuma_exec::threading`'s
+  `set_slot_reap_callback`, invoked at the TERMINATED→FREE transition, where the
+  tid is genuinely dead and its slot cannot yet be reissued. Deliberately NOT
+  `set_slot_purge_callback` (the futex one), which also fires from
+  `mark_thread_terminated` while the thread may still be executing inside the
+  critical section — dropping a futex queue entry that early is safe, releasing
+  a lock is not. The sweep reaches the mounts through `src/vfs/ext2.rs`'s own
+  registry rather than the VFS mount table, because `MountTable::resolve` hands
+  out a borrowed `&dyn Filesystem` and its callers therefore hold `MOUNT_TABLE`
+  across filesystem calls — a reaper taking that lock would invert against them.
+  Cost of the swap, measured with `scripts/benchmarks/locks_rw_ab.sh`: +1.2 ns
+  per uncontended write acquire, +0.8 ns per read.
   `akuma-scheduler` models scheduler placement / netpoll wake policies so a
   candidate can be ranked in a second instead of a devbox boot
   (`docs/archive/AKUMA_SCHEDULING_EXTRACTION.md`). The simulator core (`lib.rs`)

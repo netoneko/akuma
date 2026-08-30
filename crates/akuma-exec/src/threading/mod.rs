@@ -67,6 +67,27 @@ pub fn set_slot_purge_callback(cb: fn(usize)) {
     SLOT_PURGE_CALLBACK.store(cb as usize, Ordering::SeqCst);
 }
 
+/// Recover locks a thread died *holding* — the TERMINATED→FREE sweep.
+///
+/// Deliberately **not** `SLOT_PURGE_CALLBACK`, which is also called from
+/// `mark_thread_terminated` the instant a peer kill lands: there the slot is merely
+/// TERMINATED, `ON_CPU` may still be set, and the thread can still be executing inside
+/// the very critical section whose lock this would release. Dropping a queue entry that
+/// early is safe (it is of no further use to a dying thread) — releasing a lock is not.
+///
+/// `akuma-locks-rw`'s reap contract wants the one point where the tid is *100% dead and
+/// not yet reissued*: after the `ON_CPU` gate, after the cooldown, after the
+/// TERMINATED→INITIALIZING CAS has excluded every spawn, and before the FREE store. That
+/// is the single call site below, and it is why this is a second hook rather than a
+/// second consumer of the first. See `docs/archive/AKUMA_EXT2_CLEANUP.md` §4.5/§4.6.
+static SLOT_REAP_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the dead-holder lock sweep. Same lock context as the callbacks above (none of
+/// this module's locks held), so the hook may take its own.
+pub fn set_slot_reap_callback(cb: fn(usize)) {
+    SLOT_REAP_CALLBACK.store(cb as usize, Ordering::SeqCst);
+}
+
 /// Thread ID of the network polling loop (run_async_main).
 /// Set at boot by set_network_thread_id(). usize::MAX means not yet registered.
 static NETWORK_THREAD_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -1999,6 +2020,15 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // stack free); this is the catch-all that keeps the recycler's list from
             // drifting away from the claim paths' again.
             scrub_thread_slot(i);
+
+            // Release anything this thread died holding. Last thing before the slot
+            // becomes claimable, which is exactly the reap contract: the tid is dead,
+            // and no new occupant can have taken it yet. See SLOT_REAP_CALLBACK.
+            let reap_addr = SLOT_REAP_CALLBACK.load(Ordering::Relaxed);
+            if reap_addr != 0 {
+                let reap: fn(usize) = unsafe { core::mem::transmute(reap_addr) };
+                reap(i);
+            }
 
             // NOW set to FREE - cleanup is complete, spawn can safely claim this slot
             THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
