@@ -1544,24 +1544,133 @@ fn quar_slot(pa: usize) -> usize {
     (pa >> 12) & (QUAR_PRESENT_SLOTS - 1)
 }
 
-fn poison_page(pa: usize) {
-    let p = phys_to_virt(pa).cast::<u64>();
-    let word = poison_word(pa);
-    for i in 0..(PAGE_SIZE / 8) {
-        unsafe { p.add(i).write_volatile(word) };
+
+// ============================================================================
+// Raw frame access — every `unsafe` in this crate, in one module.
+// ============================================================================
+
+/// Writing to a physical frame this crate has just allocated.
+///
+/// # Why this module exists
+///
+/// These three functions are **the entire `unsafe` surface of `akuma-pmm`**. They
+/// were five sites before 2026-08-30: three byte-identical copies of a
+/// zero-then-clean loop inlined into `alloc_page_zeroed` and its contiguous and
+/// multi-page siblings, plus a hand-rolled pointer loop in each of
+/// `poison_page`/`verify_poison`. Copies of an `unsafe` block are the worst kind
+/// to have — they drift, and each one re-argues the same safety case slightly
+/// differently.
+///
+/// # Why these are safe `fn`s
+///
+/// Writing zeros to an arbitrary physical address is emphatically *not* safe, so
+/// nothing here may become `pub`. What makes them safe is a **crate invariant**,
+/// not an argument about the operation: every caller has just taken `pa` from
+/// this crate's own bitmap allocator and holds it exclusively, or — in
+/// `poison_page`'s case — is putting a frame the allocator has already reclaimed
+/// into quarantine.
+///
+/// **The module is private, and that is what discharges the obligation.** The
+/// functions inside are `pub` only so `redundant_pub_crate` is satisfied; `mod
+/// frame` has no `pub`, so nothing outside this crate can name them. Exporting
+/// any of them would be a lie — an external caller holds no such invariant, and
+/// `zero_and_clean` on an arbitrary `pa` is memory corruption with a safe
+/// signature. If one ever needs to escape this crate, it escapes as an
+/// `unsafe fn`, not as-is.
+///
+/// This is the same shape as `akuma_net_nic`'s `FrameArena`: own the storage,
+/// hand out safe operations on it, keep the raw access in one place.
+///
+/// # What is NOT here
+///
+/// The cache and barrier instructions. `dc cvac` and `dsb ish` moved to
+/// `akuma_cpu`, where they are safe by their own argument — executing a barrier
+/// cannot violate memory safety. This crate now contains no `asm!` at all.
+mod frame {
+    use super::{PAGE_SIZE, phys_to_virt};
+
+    /// Clean `pages` frames' worth of data cache starting at `pa`, then `dsb`.
+    ///
+    /// Steps by the **runtime** `CTR_EL0` line size rather than a hardcoded 64.
+    /// That is a deliberate fix, not a mechanical move: all three copies this
+    /// replaced hardcoded `CACHE_LINE_SIZE = 64`, which silently *under-cleans*
+    /// on any core whose `DminLine` is smaller than 64 bytes — the loop would
+    /// skip lines. Stepping by `DminLine` (the architectural minimum across the
+    /// D-cache levels) can only ever over-clean, which is slower and correct.
+    fn clean_range(pa: usize, pages: usize) {
+        let step = akuma_cpu::cache::line_size();
+        let start = phys_to_virt(pa) as usize;
+        let end = start + pages * PAGE_SIZE;
+        let mut addr = start;
+        while addr < end {
+            akuma_cpu::cache::dc_cvac(addr);
+            addr += step;
+        }
+        akuma_cpu::barrier::dsb_ish();
+    }
+
+    /// Zero `pages` frames starting at `pa` and clean them to the point of
+    /// coherency, so a device or another core reading the frame without going
+    /// through this core's cache sees the zeros.
+    pub fn zero_and_clean(pa: usize, pages: usize) {
+        // SAFETY: `pa` was just returned by this crate's allocator, so the
+        // `pages` frames from it are contiguous, mapped through the kernel's
+        // physical window (`phys_to_virt`), and owned exclusively by this caller
+        // — nothing else can hold a reference to a frame the bitmap has not
+        // handed out. The write is `pages * PAGE_SIZE` bytes, exactly the extent
+        // that was allocated.
+        unsafe {
+            core::ptr::write_bytes(phys_to_virt(pa), 0, pages * PAGE_SIZE);
+        }
+        clean_range(pa, pages);
+    }
+
+    /// Fill one frame with `word`, for the UAF quarantine.
+    ///
+    /// **Volatile, and it must stay volatile.** Nothing in this crate reads the
+    /// poison back in the same compilation unit as the write — `verify_poison`
+    /// runs on a later drain — so a plain store to a frame the compiler believes
+    /// is dead is exactly the kind LLVM is entitled to remove. Eliding it would
+    /// not fail loudly; it would make the quarantine silently stop detecting
+    /// use-after-free, which is the one thing it exists to do.
+    pub fn poison_fill(pa: usize, word: u64) {
+        // SAFETY: `pa` is a frame the allocator has reclaimed and parked in the
+        // quarantine ring, so no live mapping should reference it — writing the
+        // poison is how a stale writer is caught. It is a real, mapped physical
+        // frame reached through the kernel window, and the loop covers exactly
+        // one page.
+        unsafe {
+            let p = phys_to_virt(pa).cast::<u64>();
+            for i in 0..(PAGE_SIZE / 8) {
+                p.add(i).write_volatile(word);
+            }
+        }
+    }
+
+    /// Check one frame's poison. Returns `(byte offset, value found)` at the
+    /// first word that is not `want`, or `None` if the whole frame is intact.
+    pub fn poison_check(pa: usize, want: u64) -> Option<(usize, u64)> {
+        // SAFETY: as `poison_fill` — a quarantined frame, read back over exactly
+        // the page that was written.
+        unsafe {
+            let p = phys_to_virt(pa).cast::<u64>();
+            for i in 0..(PAGE_SIZE / 8) {
+                let got = p.add(i).read_volatile();
+                if got != want {
+                    return Some((i * 8, got));
+                }
+            }
+        }
+        None
     }
 }
 
+fn poison_page(pa: usize) {
+    frame::poison_fill(pa, poison_word(pa));
+}
+
 fn verify_poison(pa: usize) -> Option<(usize, u64)> {
-    let p = phys_to_virt(pa).cast::<u64>();
-    let want = poison_word(pa);
-    for i in 0..(PAGE_SIZE / 8) {
-        let got = unsafe { p.add(i).read_volatile() };
-        if got != want {
-            return Some((i * 8, got));
-        }
-    }
-    None
+    frame::poison_check(pa, poison_word(pa))
 }
 
 static PREMATURE_FREES: AtomicUsize = AtomicUsize::new(0);
@@ -1809,19 +1918,7 @@ pub fn alloc_pages_contiguous_zeroed(count: usize) -> Option<usize> {
         }
     };
 
-    unsafe {
-        let virt_addr = phys_to_virt(pa);
-        core::ptr::write_bytes(virt_addr, 0, count * PAGE_SIZE);
-
-        const CACHE_LINE_SIZE: usize = 64;
-        let mut addr = virt_addr as usize;
-        let end = addr + count * PAGE_SIZE;
-        while addr < end {
-            core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr);
-            addr += CACHE_LINE_SIZE;
-        }
-        core::arch::asm!("dsb ish");
-    }
+    frame::zero_and_clean(pa, count);
     Some(pa)
 }
 
@@ -1854,22 +1951,7 @@ pub fn total_count() -> usize {
 
 pub fn alloc_page_zeroed() -> Option<usize> {
     let pa = alloc_page()?;
-    unsafe {
-        let virt_addr = phys_to_virt(pa);
-        core::ptr::write_bytes(virt_addr, 0, PAGE_SIZE);
-
-        const CACHE_LINE_SIZE: usize = 64;
-        let mut addr = virt_addr as usize;
-        let end = addr + PAGE_SIZE;
-        while addr < end {
-            core::arch::asm!(
-                "dc cvac, {addr}",
-                addr = in(reg) addr,
-            );
-            addr += CACHE_LINE_SIZE;
-        }
-        core::arch::asm!("dsb ish");
-    }
+    frame::zero_and_clean(pa, 1);
     Some(pa)
 }
 
@@ -2155,20 +2237,11 @@ pub fn alloc_pages_zeroed(count: usize) -> Option<Vec<usize>> {
         return None;
     }
 
-    unsafe {
-        const CACHE_LINE_SIZE: usize = 64;
-        for &pa in &frames {
-            let virt_addr = phys_to_virt(pa);
-            core::ptr::write_bytes(virt_addr, 0, PAGE_SIZE);
-
-            let mut addr = virt_addr as usize;
-            let end = addr + PAGE_SIZE;
-            while addr < end {
-                core::arch::asm!("dc cvac, {addr}", addr = in(reg) addr);
-                addr += CACHE_LINE_SIZE;
-            }
-        }
-        core::arch::asm!("dsb ish");
+    // Each frame is zeroed and cleaned individually: `alloc_pages_into` returns
+    // `count` frames that are NOT necessarily contiguous, so one `pages = count`
+    // call would clean straight off the end of the first.
+    for &pa in &frames {
+        frame::zero_and_clean(pa, 1);
     }
     Some(frames)
 }
@@ -2245,12 +2318,14 @@ mod quarantine_and_escalation_effects_tests {
         free_page(pa, TID); // parked in quarantine, poisoned — NOT yet returned to the bitmap
         assert!(!is_page_free(pa), "a quarantined frame must still read as allocated");
         let (_, uaf_before) = quarantine_stats();
-        unsafe {
-            // The use-after-free: write through the dangling mapping, exactly
-            // the bug class this instrument exists to catch (the null-`Rc`
-            // autopsy this whole mechanism was built for).
-            phys_to_virt(pa).cast::<u64>().write_volatile(0xdead_beef_dead_beef);
-        }
+        // The use-after-free: write through the dangling mapping, exactly the bug
+        // class this instrument exists to catch (the null-`Rc` autopsy this whole
+        // mechanism was built for). Goes through `frame::poison_fill` rather than
+        // a raw `write_volatile` so the test carries no `unsafe` of its own — it
+        // writes the WRONG word over the whole frame, which is a strictly harder
+        // corruption for the detector to miss than the single stale word this
+        // used to write.
+        frame::poison_fill(pa, 0xdead_beef_dead_beef);
         let released = quarantine_drain_all();
         assert!(released >= 1, "the write-corrupted frame must have been in the ring to release");
         let (_, uaf_after) = quarantine_stats();

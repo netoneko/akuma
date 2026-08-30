@@ -177,6 +177,7 @@ version = "0.1.0"
 name = "akuma-pmm"
 version = "0.1.0"
 dependencies = [
+ "akuma-cpu",
  "akuma-primitives",
  "spinning_top",
 ]

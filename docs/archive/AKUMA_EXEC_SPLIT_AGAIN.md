@@ -836,7 +836,7 @@ pointless on its own: only **12 of ~230** sites are in `akuma-primitives`. The
 value is in the wrapper being available to `akuma-mmu` (33), `src/exceptions.rs`
 (48), `akuma-pmm` and `akuma-timer` — the leaf is a rounding error.
 
-### 8.3 `akuma-cpu` — written, tested, **not wired to anything**
+### 8.3 `akuma-cpu` — written, tested, wired to `akuma-pmm`
 
 `crates/akuma-cpu` exists and is green (3 host tests), with safe wrappers for
 `barrier::{dsb_ish, dsb_ishst, dsb_sy, isb}`, `cache::{dc_cvau, dc_cvac, ic_ivau,
@@ -844,9 +844,9 @@ ic_iallu, line_size}`, `tlb::{vmalle1, vmalle1is, vaae1, vaae1is, aside1is}`,
 `park::{wfi, wfe, sev, nop}` and 15 read-only `sysreg::*` accessors. Deliberately
 absent: every register **write** that changes control flow or address space.
 
-**No crate depends on it yet.** Converting consumers is the actual work and was
-not started. An unconsumed crate is dead weight until then — either wire it or
-delete it; do not leave it drifting.
+**`akuma-pmm` is its first and so far only consumer** (§8.6). The remaining
+conversions — `akuma-mmu` (33 sites), `src/exceptions.rs` (48), `akuma-timer` (9),
+`akuma-exec` (15) — are the actual work and were not started.
 
 One trap it already caught, recorded so the next person does not repeat it: the
 `cfg` gate must be **`target_os = "none"`, not `target_arch = "aarch64"`**. The
@@ -855,10 +855,7 @@ under `cargo test`, the wrappers really execute, and `tlbi`/`dc cvau`/
 `mrs esr_el1` are EL1-only — the first host test died with `SIGILL`. Every
 bare-metal gate in this tree keys on `target_os = "none"` for this reason.
 
-Expected effect if wired: `akuma-mmu` sheds ~27 of its 71 sites, and
-**`akuma-pmm`'s `dc cvac` blocker disappears** — that was the thing standing
-between it and `forbid` (§7.9's last section). `akuma-pmm` would then need only
-its four `write_bytes` zeroing blocks and the one UAF test resolved.
+Expected effect on the rest: `akuma-mmu` should shed ~27 of its 71 sites.
 
 ### 8.4 Extracting `src/exceptions.rs`
 
@@ -894,3 +891,69 @@ better starting position than the same extraction attempted before this split.
   and is a suspected fault-path regression, not a win.
 - `akuma-pmm`'s `forbid` (§7.9), which §8.3 would partly unblock.
 - The `threading` <-> `process` cycle (§4), untouched by design.
+
+---
+
+## 8.6 `akuma-pmm`: 5 `unsafe` sites -> 3, and no `asm!` at all
+
+`akuma-cpu`'s first consumer. **`akuma-pmm` does not reach `forbid`, and cannot** —
+see the end of this section for why that was the wrong target.
+
+### What changed
+
+All five production sites were two operations wearing five copies:
+
+| was | sites | now |
+|---|---:|---|
+| zero-then-clean, inlined into `alloc_pages_contiguous_zeroed`, `alloc_page_zeroed`, `alloc_pages_zeroed` | 3 | `frame::zero_and_clean(pa, pages)` |
+| hand-rolled `write_volatile` loop in `poison_page` | 1 | `frame::poison_fill(pa, word)` |
+| hand-rolled `read_volatile` loop in `verify_poison` | 1 | `frame::poison_check(pa, want)` |
+
+Plus the quarantine UAF test's own `unsafe` write, which now calls
+`frame::poison_fill` — so the crate has **zero test-bucket `unsafe`** as well.
+
+The `dc cvac` and `dsb ish` moved to `akuma_cpu::{cache, barrier}`, where they are
+safe by their own argument. **The crate now contains no `asm!` whatsoever.**
+
+### A latent bug the dedup exposed
+
+All three zeroing copies hardcoded `const CACHE_LINE_SIZE: usize = 64` as the
+clean-loop step. That **under-cleans on any core whose `CTR_EL0.DminLine` is
+smaller than 64 bytes** — the loop strides past lines it never cleans, and a
+device or another core reading the frame outside this core's cache would see
+stale data rather than the zeros. `frame::clean_range` steps by
+`akuma_cpu::cache::line_size()` instead, which reads `DminLine` at runtime.
+Stepping by the architectural minimum can only over-clean, which is slower and
+correct.
+
+This is the argument for deduplicating `unsafe` in general: three copies is three
+chances for the same reasoning to be subtly wrong, and none of them is the place
+anyone looks.
+
+### Why `forbid` is the wrong target here
+
+The remaining three are irreducible in the sense `crate-safety.md` means, and
+would stay so however they were arranged. Writing zeros to a physical address is
+memory corruption unless the caller owns the frame — and **this crate is what
+decides who owns a frame.** There is no lower crate that could hold a safe
+wrapper, because the invariant that makes it safe (the bitmap handed `pa` out and
+nothing else holds it) is this crate's own state.
+
+The earlier plan (§7.9) proposed hoisting `zero_and_clean` into
+`akuma-primitives` to get `akuma-pmm` to zero. That would have been a **lie with a
+safe signature**: `akuma_primitives::frame::zero(pa, n)` callable by anything, with
+no invariant behind it, in the crate every other crate depends on. Trading a
+truthful `unsafe` in the allocator for an untruthful safe function in the leaf is
+a worse tree, whatever the metric says.
+
+What was achievable, and was done, is **concentration**: 5 sites -> 3, all in one
+private `mod frame` with the crate invariant stated once, no `asm!`, and a doc
+comment saying exactly why the module is private and what would have to change for
+any of it to escape.
+
+### Verification
+
+`akuma-pmm` 28 tests, tree 1,012 tests, all-crate clippy `-D warnings` +
+`--release` + `--profile extreme-size` clean, boot suite unchanged. The zeroing
+path runs on every page allocation, so the boot suite exercises it heavily; the
+cache-line-step change makes that non-cosmetic.
