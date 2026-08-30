@@ -1,8 +1,8 @@
 import subprocess, time, re, sys
 BUILD = ("/bin/busybox env PATH=/usr/local/bin:/usr/bin:/bin HOME=/root CARGO_HOME=/root/.cargo "
          "RUSTC=/usr/local/bin/rustc CARGO_BUILD_TARGET=aarch64-unknown-none "
-         "CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS=-Clink-arg=-T/root/akuma/linker.ld "
-         "/usr/bin/cargo build --release -p akuma --manifest-path /root/akuma/Cargo.toml -j1")
+         "CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS=-Clink-arg=-T/src/github.com/netoneko/akuma/linker.ld "
+         "/usr/bin/cargo build --release -p akuma --manifest-path /src/github.com/netoneko/akuma/Cargo.toml -j1")
 def ssh_build(logf):
     with open(logf,"w") as f:
         p=subprocess.Popen(["ssh","-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=/dev/null",

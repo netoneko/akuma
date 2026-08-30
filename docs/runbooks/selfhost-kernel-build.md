@@ -31,7 +31,7 @@ failure today is a regression finding — capture it.**
    nor `j4_selfhost_campaign.py`.
 
    ```sh
-   cd /root/akuma && cargo clean && \
+   cd /src/github.com/netoneko/akuma && cargo clean && \
      nohup sh -c '{ cargo build --release -p akuma -j4 --offline; echo EXIT=$?; } \
        > /tmp/build.log 2>&1' &     # detached — §5.2, sshd kills long channels
    ```
@@ -63,7 +63,23 @@ a long campaign; its framing of crashes as weather is historical.
 with hard kills accumulate real filesystem damage whose symptom — a 15-minute
 boot behind a watchdog storm — impersonates a kernel regression.
 
-### How long a trial takes — **~2 min, not ~10** (re-measured 2026-08-16)
+### How long a trial takes — **~45 s on the devbox profile** (re-measured 2026-08-30)
+
+> **Re-measured 2026-08-30, devbox-smoltcp profile, in-guest clean builds.**
+> Config: the devbox image's own tree at
+> `/src/github.com/netoneko/akuma` (`52ba7d4c`), SMP=4, MEMORY=4096, HVF, and
+> the exact `build_devbox_smoltcp.sh` line:
+> `cargo clean && cargo build --release --features devbox-smoltcp,no-tests -j4 --offline`.
+> Three consecutive trials: **44.51 / 44.63 / 44.75 s** (±0.12 s), each clean
+> removing 543 files / 79 MiB and rebuilding it — real work, not a cache resume;
+> ELF 2,690,480 B. A same-day run on the identical configuration reported 41.66 s,
+> ~6 % under — inside host-load jitter. Against the 2026-08-16 baseline below the
+> build portion is **~2.2× faster**, on a different configuration (this box:
+> devbox image, 4 GB; the old record: `-p akuma` default features, 8 GB). Two
+> adjacent facts that keep the number honest: the **default-feature** build (no
+> `no-tests`) is materially slower, ~61 s — the boot suite is ~20 k lines of
+> `src/`, so `no-tests` is most of the win; and a tree with today's fault-path
+> changes builds in the same time, the delta being comments and two PTE re-reads.
 
 **A whole trial is ~2m10s of wall clock**, boot + `cargo clean` + build
 inclusive, and it is *stable*: five consecutive trials measured 131, 132, 131
@@ -82,7 +98,7 @@ DISK=devbox.img MEMORY=8192 SMP=4 cargo run --release --features devbox-smoltcp,
 cargo clean && cargo build --release -p akuma -j4 --offline
 ```
 
-— the image's own `/root/akuma`, 8 GB, four cores, `-j4`, `--offline` against a
+— the image's own `/src/github.com/netoneko/akuma`, 8 GB, four cores, `-j4`, `--offline` against a
 pre-primed registry (below). The **~7–12 min** figure recorded on 2026-08-15 is
 left in place at the top of this section rather than rewritten; it predates this
 configuration. A trial that takes ten minutes again is therefore a finding about
@@ -159,7 +175,7 @@ ran.
 
 ### Prime the cargo registry first, or `--offline` fails misleadingly
 
-The devbox image ships `/root/akuma` and the nightly toolchain at
+The devbox image ships `/src/github.com/netoneko/akuma` and the nightly toolchain at
 `/usr/local/bin/rustc`, but an **empty** `/root/.cargo/registry`. `--offline`
 then dies in *resolution* rather than compilation, naming an arbitrary
 dependency:
@@ -175,7 +191,7 @@ network and every later trial is hermetic — `cargo clean` removes `target/`,
 never `CARGO_HOME`:
 
 ```sh
-cargo fetch --manifest-path /root/akuma/Cargo.toml     # ~14 MB, one time
+cargo fetch --manifest-path /src/github.com/netoneko/akuma/Cargo.toml     # ~14 MB, one time
 ```
 
 Priming **before** the batch rather than letting the first build fetch is the
@@ -381,7 +397,7 @@ DISK=disk_selfhost.img bash scripts/populate_disk.sh \
 docker run --rm --privileged -v "$(pwd)/disk_selfhost.img:/disk.img" alpine sh -c "
   apk add git e2fsprogs &&
   mount -o loop /disk.img /mnt &&
-  git clone --depth 1 https://github.com/netoneko/akuma.git /mnt/disk/root/akuma &&
+  git clone --depth 1 https://github.com/netoneko/akuma.git /mnt/disk/src/github.com/netoneko/akuma &&
   umount /mnt"
 ```
 
@@ -401,7 +417,7 @@ SSH lands on **:2322** (INSTANCE=1). Boot verified at 6/8/10/12/14/16 GB.
 ```bash
 export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
 export CARGO_HOME=/root/.cargo
-cd /root/akuma
+cd /src/github.com/netoneko/akuma
 cargo build --release -j1            # timeout ~7200s; -j1 avoids memory spike
 ```
 
@@ -639,7 +655,7 @@ Caused by: Exec format error (os error 8)
 ```
 
 This is not a kernel bug and no amount of retrying clears it. Find them with
-`busybox find /root/akuma/target -type f -size 0` and delete the whole
+`busybox find /src/github.com/netoneko/akuma/target -type f -size 0` and delete the whole
 fingerprint directory so cargo rebuilds it. Note that `stderr` files and
 `.cargo-*lock` files are **legitimately** empty — only a zero-length *binary*
 is the defect.
@@ -689,10 +705,10 @@ including a whole orphaned copy of `userspace/`). The reconnected inode numbers
 sit in the same 44xxx range as the `[FILL-SHORT]` victims, which is consistent —
 the churned build artifacts are exactly what goes orphaned.
 
-The pre-cloned `/root/akuma` (§2) survives this and is the one to re-stage from;
+The pre-cloned `/src/github.com/netoneko/akuma` (§2) survives this and is the one to re-stage from;
 check it has `src/`, `crates/`, and `userspace/` before trusting it. Budget a
 full cold rebuild for the next arm — `target/` does not survive. `/lost+found`
-is recovered junk once you have confirmed `/root/akuma` is intact; deleting it
+is recovered junk once you have confirmed `/src/github.com/netoneko/akuma` is intact; deleting it
 reclaims the space.
 
 ### 5.6 `busybox nproc` reports the real CPU count (was: always 1)
@@ -787,7 +803,7 @@ INSTANCE=1 KERNEL_DROPOFF=1 DEVBOX_DISK=devbox.img overlays/devbox/run-smoltcp.s
 
 **In guest**, after a self-host build (§4/§5) produces a fresh ELF, flatten it
 and drop it onto the drive with `scripts/dropoff_kernel.sh` — checked in at
-the repo root the guest's own `/root/akuma` checkout already has, busybox-sh
+the repo root the guest's own `/src/github.com/netoneko/akuma` checkout already has, busybox-sh
 compatible, and it refuses to run anywhere that isn't Akuma (`uname -s`):
 
 ```sh
@@ -883,7 +899,7 @@ was unusable. Close the loop by booting what the guest built:
 ```bash
 # 1. pull the ELF out (binary-safe; the guest has busybox base64)
 ssh -p <port> root@localhost \
-  '/bin/busybox base64 /root/akuma/target/aarch64-unknown-none/release-smp-shared/akuma' \
+  '/bin/busybox base64 /src/github.com/netoneko/akuma/target/aarch64-unknown-none/release-smp-shared/akuma' \
   | base64 -d > selfhost_akuma.elf
 
 # 2. flatten it — scripts/mkbin.sh picks whichever objcopy exists
@@ -905,7 +921,7 @@ qemu-system-aarch64 -machine virt,gic-version=3 -accel hvf -cpu host -smp 4 \
 
 Expect a full boot and a working `uname -a` over ssh on :2622. `uname` prints
 the **git hash the guest built from** — check it against the commit you meant to
-self-host, because the guest's `/root/akuma` checkout drifts from the host tree
+self-host, because the guest's `/src/github.com/netoneko/akuma` checkout drifts from the host tree
 (it was 12 commits behind on 2026-08-05). Measured sizes for reference: ELF
 1,998,392 B, `.bin` 1,465,088 B, versus 1,456,901 B for the host build of the
 same tree.

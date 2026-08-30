@@ -22,7 +22,7 @@ SSH = ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/n
 ENVP = ('/bin/busybox env PATH=/usr/local/bin:/usr/bin:/bin HOME=/root '
         'CARGO_HOME=/root/.cargo RUSTC=/usr/local/bin/rustc '
         'CARGO_BUILD_TARGET=aarch64-unknown-none '
-        'CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS=-Clink-arg=-T/root/akuma/linker.ld ')
+        'CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS=-Clink-arg=-T/src/github.com/netoneko/akuma/linker.ld ')
 
 
 def sh(cmd, timeout=180):
@@ -73,13 +73,13 @@ if __name__ == '__main__':
 
     # 1. shallow clone, in-VM, over the guest's own network + TLS
     step('clone',
-         '/usr/bin/git clone --depth 1 https://github.com/netoneko/akuma.git /root/akuma',
+         '/usr/bin/git clone --depth 1 https://github.com/netoneko/akuma.git /src/github.com/netoneko/akuma',
          budget=2400)
-    print('HEAD:', sh('/bin/busybox sh -c "cd /root/akuma && /usr/bin/git log --oneline -1"').strip(), flush=True)
+    print('HEAD:', sh('/bin/busybox sh -c "cd /src/github.com/netoneko/akuma && /usr/bin/git log --oneline -1"').strip(), flush=True)
 
     # 2. make the workspace parseable by *stable* cargo
     step('manifest',
-         '/bin/busybox sh -c "cd /root/akuma && '
+         '/bin/busybox sh -c "cd /src/github.com/netoneko/akuma && '
          '/bin/busybox cp Cargo.toml Cargo.toml.selfhost-bak && '
          '/bin/busybox sed -i \\"/^cargo-features/d\\" Cargo.toml && '
          '/bin/busybox sed -i \\"s/panic = .immediate-abort./panic = \\\\\\"abort\\\\\\"/\\" Cargo.toml && '
@@ -90,15 +90,15 @@ if __name__ == '__main__':
     step('build',
          ENVP + '/usr/bin/cargo build -p akuma --profile release-smp-shared '
                 '--features devbox-smoltcp,no-tests '
-                '--manifest-path /root/akuma/Cargo.toml -j1',
+                '--manifest-path /src/github.com/netoneko/akuma/Cargo.toml -j1',
          budget=14400)
 
     print('artifact:', sh('/bin/busybox ls -la '
-                         '/root/akuma/target/aarch64-unknown-none/release-smp-shared/akuma 2>&1').strip(),
+                         '/src/github.com/netoneko/akuma/target/aarch64-unknown-none/release-smp-shared/akuma 2>&1').strip(),
           flush=True)
     print('elf magic:', sh('/bin/busybox od -A x -t x1z -N 20 '
-                           '/root/akuma/target/aarch64-unknown-none/release-smp-shared/akuma 2>&1').strip(),
+                           '/src/github.com/netoneko/akuma/target/aarch64-unknown-none/release-smp-shared/akuma 2>&1').strip(),
           flush=True)
     print('md5:', sh('/bin/busybox md5sum '
-                     '/root/akuma/target/aarch64-unknown-none/release-smp-shared/akuma 2>&1').strip(),
+                     '/src/github.com/netoneko/akuma/target/aarch64-unknown-none/release-smp-shared/akuma 2>&1').strip(),
           flush=True)
