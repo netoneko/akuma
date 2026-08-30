@@ -386,6 +386,14 @@ alive and make the split cosmetic.
 Result: `akuma-net` 8,845 → 6,367 lines and 138 → 48 host tests; the 90 AF_UNIX
 tests now run as `cargo test -p akuma-net-unix`. Total across both is unchanged.
 
+The new crate carries `#![forbid(unsafe_code)]`, joining the 15 crates that
+already do — which is the house convention for pure-logic crates and the same
+guarantee extraction B is meant to buy for the *rest* of `akuma-net`. `forbid`
+rather than `deny` is load-bearing and was verified rather than assumed: a
+probe `#[allow(unsafe_code)]` on a function containing an `unsafe` block is
+rejected with `E0453: allow(unsafe_code) incompatible with previous forbid`,
+which is exactly the edit `deny` would have permitted silently.
+
 **B. `akuma-virtio-net`** — the device layer: `VirtioSmoltcpDevice`,
 `LoopbackAwareDevice`, `virtio_rings.rs`, `rump_tap.rs`, `nicstat.rs`, and after
 §4 the `frames.rs`/`nic.rs` pair. ~1,200 lines holding **all** of the crate's

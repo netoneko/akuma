@@ -62,6 +62,14 @@
 //! than a `#[cfg]` discipline inside a bigger one — which is most of the point.
 
 #![cfg_attr(not(test), no_std)]
+// Unsafe-free by design, and `forbid` so no module can opt back in with a
+// local `allow`. Same reasoning as `akuma-net-yarn` and `akuma-syscalls-sync`,
+// and spelled here rather than in Cargo.toml for the same reason: a
+// crate-local `[lints]` table and `[lints] workspace = true` are mutually
+// exclusive. This crate has no buffer to alias and no device to hand a pointer
+// to — it is a state machine over integers and `alloc` collections — so there
+// is nothing here that could ever earn an exemption.
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 

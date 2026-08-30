@@ -8,6 +8,19 @@ to one of two buckets:
   production  — code that ships in the kernel/crates
   test        — code that only exists to test it
 
+It also reports two different `unsafe` safety numbers per crate, because they
+answer different questions and only quoting one of them misleads:
+
+  enforced    — the crate carries `#![forbid(unsafe_code)]`, so the compiler
+                refuses to let anyone write `unsafe` in it at all. A guarantee.
+  safe %      — the share of production CODE lines that do not sit inside an
+                `unsafe { .. }` block. A measurement.
+
+A crate with one 3-line block in 3,000 lines scores 0% on the first and 99.9%
+on the second. Both are true; the gap between them is the interesting part.
+Run `--self-test` to check the unsafe-line counter against the cases a plain
+`grep -c unsafe` gets wrong in both directions.
+
 A line is test code when any of these hold:
 
   1. Its file is a test file: ``tests.rs`` / ``*_tests.rs`` / ``*_test.rs`` /
@@ -240,7 +253,14 @@ class FileCount:
     #: `unsafe` keyword sites lexed in CODE context — not in comments, string
     #: literals or `asm!` bodies, which a grep cannot tell apart. `unsafe_code`
     #: (as in `#![forbid(unsafe_code)]`) lexes as one identifier and is not
-    #: counted; `#[unsafe(no_mangle)]` (edition 2024) is.
+    #: counted.
+    #:
+    #: `#[unsafe(no_mangle)]` (edition 2024) is NOT counted either. This said it
+    #: *was* until 2026-08-30, which was wrong — the lexer consumes `#[..]`
+    #: wholesale, so the keyword inside never reaches the identifier branch. The
+    #: behaviour is right and the claim was stale: the attribute marks a
+    #: declaration, not an operation the compiler stopped checking, and the tree
+    #: has a dozen of them. Pinned by `--self-test`.
     unsafe_sites: int = 0
     #: `unsafe` sites inside test code — a `#[test]` body, a test-gated item, or a
     #: whole test file. Split out because a kernel test that pokes a page table is
@@ -248,6 +268,14 @@ class FileCount:
     test_unsafe_sites: int = 0
     #: This file carries a crate-level `#![forbid(unsafe_code)]`.
     forbids_unsafe: bool = False
+    #: Production CODE lines lying inside an `unsafe { .. }` block, plus the
+    #: declaration line of an `unsafe fn`/`impl`/`trait`. This is the "how much
+    #: of what ships is the compiler NOT checking" number; `unsafe_sites` counts
+    #: how many places it happens, which is a different question — one 40-line
+    #: block is 1 site and 40 lines.
+    unsafe_code: int = 0
+    #: The same, for lines the test buckets claimed.
+    test_unsafe_code: int = 0
 
     @property
     def lines(self) -> int:
@@ -320,10 +348,24 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
     awaiting_item = False  # currently inside a test-gated item's header
     last_ident = ""  # most recent identifier token
     unsafe_lines: list = []  # line of each `unsafe` token lexed in code context
+    # Lines lying inside an `unsafe { .. }` block, plus the declaration line of an
+    # `unsafe fn`/`impl`/`trait`. A set, so nested blocks overlap harmlessly.
+    unsafe_span: set = set()
+    # An `unsafe` token is waiting to find out what it introduces. A following `{`
+    # makes it a block (span it); any other identifier makes it a declaration
+    # (`unsafe fn`, `unsafe impl`, `unsafe extern`) and any `(` makes it the
+    # edition-2024 `#[unsafe(..)]` attribute — neither of which opens an unsafe
+    # *context*, so those count one line and nothing more.
+    unsafe_pending = False
+    unsafe_spans: list = []  # open blocks: dicts of start line / brace depth
 
     def close_span(sp):
         for ln in range(sp["start"], line + 1):
             test.add(ln)
+
+    def close_unsafe(sp):
+        for ln in range(sp["start"], line + 1):
+            unsafe_span.add(ln)
 
     def start_item():
         # The gating attribute belongs to the test, so the span starts there.
@@ -489,6 +531,13 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
             while j < n and _is_ident_char(text[j]):
                 j += 1
             last_ident = text[i:j]
+            if last_ident != "unsafe" and unsafe_pending:
+                # `unsafe fn` / `unsafe impl` / `unsafe trait` / `unsafe extern`.
+                # In edition 2024 an `unsafe fn` body is NOT itself an unsafe
+                # context (`unsafe_op_in_unsafe_fn`), and this tree writes the
+                # inner `unsafe { .. }` explicitly — so spanning the body here
+                # would double-count it against those inner blocks.
+                unsafe_pending = False
             if last_ident == "unsafe":
                 # Reached only from the identifier branch, which strings, comments,
                 # char literals and `asm!` bodies never fall through to — so this
@@ -496,6 +545,8 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
                 # is kept, not just a tally, so `count_text` can split the sites into
                 # production and test using the same rule it buckets lines with.
                 unsafe_lines.append(line)
+                unsafe_span.add(line)
+                unsafe_pending = True
             i = j
             continue
 
@@ -504,6 +555,9 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
             if spans and awaiting_item and not spans[-1]["brace"] and spans[-1]["depth"] == depth:
                 spans[-1]["brace"] = True
                 awaiting_item = False
+            if unsafe_pending:
+                unsafe_spans.append({"start": line, "depth": depth})
+                unsafe_pending = False
             depth += 1
             i += 1
             continue
@@ -512,11 +566,20 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
             depth = max(0, depth - 1)
             while spans and spans[-1]["brace"] and spans[-1]["depth"] == depth:
                 close_span(spans.pop())
+            while unsafe_spans and unsafe_spans[-1]["depth"] == depth:
+                close_unsafe(unsafe_spans.pop())
             awaiting_item = any(not sp["brace"] for sp in spans)
             i += 1
             continue
 
+        if c == "(":
+            # `#[unsafe(no_mangle)]` — an attribute, not a context.
+            unsafe_pending = False
+            i += 1
+            continue
+
         if c == ";":
+            unsafe_pending = False
             if spans and awaiting_item and not spans[-1]["brace"] and spans[-1]["depth"] == depth:
                 close_span(spans.pop())
                 awaiting_item = any(not sp["brace"] for sp in spans)
@@ -528,8 +591,11 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
     for sp in spans:  # unterminated (truncated file) — count what we saw
         for ln in range(sp["start"], line + 1):
             test.add(ln)
+    for sp in unsafe_spans:
+        for ln in range(sp["start"], line + 1):
+            unsafe_span.add(ln)
 
-    return code, comment, test, all_file_test, unsafe_lines
+    return code, comment, test, all_file_test, unsafe_lines, unsafe_span
 
 
 #: A crate-level `#![forbid(unsafe_code)]`, at the start of a line so a mention
@@ -545,7 +611,7 @@ def count_file(path: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> Fi
 
 def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> FileCount:
     nlines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
-    code, comment, test, inner_test, unsafe_lines = scan(text, spec, kernel_gate)
+    code, comment, test, inner_test, unsafe_lines, unsafe_span = scan(text, spec, kernel_gate)
 
     fc = FileCount(path=relpath, lang=spec.name)
     fc.whole_file_test = is_test_path(relpath) or inner_test
@@ -559,6 +625,15 @@ def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> Fi
     for ln in range(1, nlines + 1):
         is_test = fc.whole_file_test or ln in test
         if ln in code:
+            # Only CODE lines can be unsafe: a comment or blank inside an
+            # `unsafe` block is not code the compiler stopped checking, and
+            # counting it would make a well-commented block look worse than a
+            # bare one.
+            if ln in unsafe_span:
+                if is_test:
+                    fc.test_unsafe_code += 1
+                else:
+                    fc.unsafe_code += 1
             bucket = "test_code" if is_test else "code"
         elif ln in comment:
             bucket = "test_comment" if is_test else "comment"
@@ -711,6 +786,8 @@ class Agg:
     test_files: int = 0
     unsafe_sites: int = 0
     test_unsafe_sites: int = 0
+    unsafe_code: int = 0
+    test_unsafe_code: int = 0
     #: True once ANY file in this component carried `#![forbid(unsafe_code)]` —
     #: in practice its `lib.rs`, since the attribute is crate-level.
     forbids_unsafe: bool = False
@@ -720,6 +797,8 @@ class Agg:
         self.test_files += 1 if fc.whole_file_test else 0
         self.unsafe_sites += fc.unsafe_sites
         self.test_unsafe_sites += fc.test_unsafe_sites
+        self.unsafe_code += fc.unsafe_code
+        self.test_unsafe_code += fc.test_unsafe_code
         self.forbids_unsafe = self.forbids_unsafe or fc.forbids_unsafe
         for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code"):
             setattr(self, f, getattr(self, f) + getattr(fc, f))
@@ -727,6 +806,11 @@ class Agg:
     @property
     def total_code(self) -> int:
         return self.code + self.test_code
+
+    @property
+    def safe_code(self) -> int:
+        """Production code lines the compiler is checking."""
+        return self.code - self.unsafe_code
 
     @property
     def total_comment(self) -> int:
@@ -840,7 +924,10 @@ def print_report(files: list, paths: list, ignored: int, by_file: bool, top: int
 
 
 def print_unsafe_report(by_comp: dict, W: int) -> None:
-    """`unsafe` density per crate, and how much code lives in enforced-safe crates.
+    """`unsafe` per crate: how many sites, how many LINES, and how much is enforced.
+
+    Two different safety numbers, deliberately both reported — see the comment on
+    the summary block for why quoting only the enforced one misleads.
 
     Exists because the same two numbers were being hand-maintained in
     `docs/reference/crate-safety.md` and went stale: its prose said "Ten of the
@@ -857,18 +944,15 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
     print()
     print(rule(W))
     print(
-        f"{'Unsafe by crate':<26}{'prod code':>11}{'prod':>7}{'test':>7}"
-        f"{'per kloc':>10}{'enforced':>10}"
+        f"{'Unsafe by crate':<26}{'prod code':>11}{'sites':>7}{'unsafe':>8}"
+        f"{'safe':>8}{'enforced':>10}"
     )
     print(rule(W))
-    for comp, agg in sorted(crates.items(), key=lambda kv: (-kv[1].unsafe_sites, kv[0])):
-        # Density is production sites over PRODUCTION code: mixing a test-only site
-        # into a per-kloc figure over total code understates both halves.
-        per_kloc = (1000.0 * agg.unsafe_sites / agg.code) if agg.code else 0.0
+    for comp, agg in sorted(crates.items(), key=lambda kv: (kv[1].unsafe_code, -kv[1].code, kv[0])):
         mark = "forbid" if agg.forbids_unsafe else ""
         print(
-            f"{comp:<26}{agg.code:>11}{agg.unsafe_sites:>7}{agg.test_unsafe_sites:>7}"
-            f"{per_kloc:>10.1f}{mark:>10}"
+            f"{comp:<26}{agg.code:>11}{agg.unsafe_sites:>7}{agg.unsafe_code:>8}"
+            f"{pct(agg.safe_code, agg.code):>8}{mark:>10}"
         )
     print(rule(W))
 
@@ -878,9 +962,24 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
     all_unsafe = sum(a.unsafe_sites for a in crates.values())
     all_test_unsafe = sum(a.test_unsafe_sites for a in crates.values())
     leaked = sum(a.unsafe_sites + a.test_unsafe_sites for a in safe)
+    prod_code = sum(a.code for a in crates.values())
+    prod_unsafe_code = sum(a.unsafe_code for a in crates.values())
+    prod_safe_code = prod_code - prod_unsafe_code
 
     print(f"enforced unsafe-free ... {len(safe)} of {len(crates)} crates")
     print(f"code in those crates ... {safe_code} of {all_code} ({pct(safe_code, all_code).strip()})")
+    # The two percentages answer different questions and the gap between them is
+    # the point, so both are printed. The first is a GUARANTEE: code in a crate
+    # the compiler refuses to let anyone write `unsafe` in. The second is a
+    # MEASUREMENT: lines that happen not to sit in an `unsafe` block, in crates
+    # where one still could. A crate with a single 3-line block in 3,000 lines
+    # scores 0% on the first and 99.9% on the second; neither number is wrong,
+    # and quoting only the first badly understates how much of the tree is
+    # actually compiler-checked.
+    print(
+        f"safe production code ... {prod_safe_code} of {prod_code} "
+        f"({pct(prod_safe_code, prod_code).strip()}) — lines outside any `unsafe` block"
+    )
     print(
         f"unsafe sites ........... {all_unsafe + all_test_unsafe} across crates/ "
         f"({all_unsafe} production, {all_test_unsafe} test), {leaked} inside enforced crates"
@@ -891,6 +990,126 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
         # the ban was bypassed.
         print("  !! non-zero inside a `forbid(unsafe_code)` crate — check the counter")
     print(rule(W))
+
+
+# ---------------------------------------------------------------------------
+# self-test
+# ---------------------------------------------------------------------------
+
+#: (name, source, expected production `unsafe` sites, expected `unsafe` CODE lines).
+#:
+#: These exist because the unsafe-line counter is the one number here a reader
+#: cannot check by eye against a grep — `grep -c unsafe` gets every one of them
+#: wrong in a different direction, which is the whole reason this file lexes.
+UNSAFE_CASES = [
+    ("one-line block", "fn f() {\n    unsafe { g() };\n}\n", 1, 1),
+    (
+        "multi-line block counts its body",
+        "fn f() {\n    unsafe {\n        a();\n        b();\n    }\n}\n",
+        1,
+        4,
+    ),
+    (
+        "blank and comment lines inside a block are not code",
+        "fn f() {\n    unsafe {\n        // why\n\n        a();\n    }\n}\n",
+        1,
+        3,
+    ),
+    (
+        "unsafe fn body is NOT an unsafe context (edition 2024)",
+        "unsafe fn f() {\n    a();\n    b();\n}\n",
+        1,
+        1,
+    ),
+    (
+        # The `unsafe fn` line, plus the three lines of the inner block.
+        "but an inner block inside an unsafe fn is",
+        "unsafe fn f() {\n    unsafe {\n        a();\n    }\n}\n",
+        2,
+        4,
+    ),
+    ("unsafe impl is one line", "unsafe impl Send for X {}\n", 1, 1),
+    ("unsafe trait is one line", "unsafe trait T {\n    fn a();\n}\n", 1, 1),
+    (
+        "unsafe extern block declares, it does not execute",
+        'unsafe extern "C" {\n    fn a();\n}\n',
+        1,
+        1,
+    ),
+    (
+        # NOT counted, and that is deliberate. The lexer consumes `#[..]`
+        # wholesale, so the keyword inside never reaches the identifier branch —
+        # and it should not: `#[unsafe(no_mangle)]` marks a declaration, it is
+        # not an operation the compiler stopped checking. There are a dozen of
+        # these in the tree; scoring them as unsafe *lines* would inflate the
+        # number this report exists to give.
+        "#[unsafe(..)] attribute is a declaration marker, not a site",
+        "#[unsafe(no_mangle)]\nfn f() {\n    a();\n}\n",
+        0,
+        0,
+    ),
+    (
+        "nested blocks do not double-count lines",
+        "fn f() {\n    unsafe {\n        unsafe { a() };\n    }\n}\n",
+        2,
+        3,
+    ),
+    ("the word in a line comment is not a site", "fn f() {\n    // unsafe { }\n}\n", 0, 0),
+    ("the word in a block comment is not a site", "fn f() {\n    /* unsafe */\n}\n", 0, 0),
+    ('the word in a string is not a site', 'fn f() {\n    p("unsafe { }");\n}\n', 0, 0),
+    (
+        "the word in a raw string is not a site",
+        'fn f() {\n    p(r#"unsafe { }"#);\n}\n',
+        0,
+        0,
+    ),
+    ("unsafe_code is one identifier, not `unsafe`", "#![forbid(unsafe_code)]\nfn f() {}\n", 0, 0),
+    (
+        "a test-gated block is charged to test, not production",
+        "#[cfg(test)]\nmod t {\n    fn f() {\n        unsafe { a() };\n    }\n}\n",
+        0,
+        0,
+    ),
+]
+
+
+def self_test() -> int:
+    """Check the unsafe counter against cases a grep gets wrong. Returns exit code."""
+    spec = EXT_LANGS[".rs"]
+    failures = 0
+    for name, src, want_sites, want_lines in UNSAFE_CASES:
+        fc = count_text(src, "probe.rs", spec, True)
+        got = (fc.unsafe_sites, fc.unsafe_code)
+        ok = got == (want_sites, want_lines)
+        failures += 0 if ok else 1
+        status = "ok  " if ok else "FAIL"
+        print(f"  {status} {name}")
+        if not ok:
+            print(f"       want sites={want_sites} lines={want_lines}, got sites={got[0]} lines={got[1]}")
+
+    # An invariant rather than a case: a line can only be unsafe if it is code,
+    # so the unsafe count can never exceed the code count for any real file.
+    over = []
+    for root in ("src", "crates"):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, names in os.walk(root):
+            for nm in names:
+                if not nm.endswith(".rs"):
+                    continue
+                rel = os.path.join(dirpath, nm)
+                fc = count_file(rel, rel, spec, True)
+                if fc.unsafe_code > fc.code or fc.test_unsafe_code > fc.test_code:
+                    over.append(rel)
+    if over:
+        failures += 1
+        print(f"  FAIL unsafe lines exceed code lines in {len(over)} file(s): {over[:3]}")
+    else:
+        print("  ok   unsafe lines <= code lines in every file")
+
+    print()
+    print("self-test: " + ("PASS" if failures == 0 else f"{failures} FAILURE(S)"))
+    return 0 if failures == 0 else 1
 
 
 def emit_json(files: list, paths: list) -> None:
@@ -914,6 +1133,9 @@ def emit_json(files: list, paths: list) -> None:
             "prod_comment": agg.comment,
             "test_comment": agg.test_comment,
             "unsafe_sites": agg.unsafe_sites,
+            "unsafe_code": agg.unsafe_code,
+            "test_unsafe_code": agg.test_unsafe_code,
+            "safe_code": agg.safe_code,
             "test_unsafe_sites": agg.test_unsafe_sites,
             "forbids_unsafe": agg.forbids_unsafe,
         }
@@ -935,6 +1157,8 @@ def emit_json(files: list, paths: list) -> None:
                         "test_code": fc.test_code,
                         "test_file": fc.whole_file_test,
                         "unsafe_sites": fc.unsafe_sites,
+                        "unsafe_code": fc.unsafe_code,
+                        "test_unsafe_code": fc.test_unsafe_code,
                         "test_unsafe_sites": fc.test_unsafe_sites,
                         "forbids_unsafe": fc.forbids_unsafe,
                     }
@@ -953,6 +1177,11 @@ def main() -> int:
     ap.add_argument("--top", type=int, default=15, help="show N largest files (0 = off)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument(
+        "--self-test",
+        action="store_true",
+        help="check the unsafe counter against cases a grep gets wrong",
+    )
+    ap.add_argument(
         "--no-kernel-test-gate",
         action="store_true",
         help='count #[cfg(not(any(feature = "no-tests", ...)))] items as production code',
@@ -961,6 +1190,8 @@ def main() -> int:
     ap.add_argument("--vs", metavar="REV",
                     help="also count REV and print the delta REV -> (--rev or working tree)")
     args = ap.parse_args()
+    if args.self_test:
+        return self_test()
 
     paths = args.paths or ["src", "crates"]
     kernel_gate = not args.no_kernel_test_gate
