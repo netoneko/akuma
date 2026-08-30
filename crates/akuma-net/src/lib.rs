@@ -15,6 +15,15 @@ pub mod runtime;
 /// separated that attribute from the module below — see there.
 pub use akuma_primitives::safe_print;
 
+// BSS frame storage with bounds- and borrow-checked slot access. Unconditional:
+// both the smoltcp device and the rump tap path stage frames in it. See
+// `frames.rs` for what it replaced and why the buffers are not struct fields.
+pub mod frames;
+// The virtio-net device wrapper. THE one place virtio-drivers' unsafe
+// begin/complete API is called — see the module header before adding another.
+#[cfg(feature = "smoltcp")]
+pub mod nic;
+
 // The native smoltcp stack + the smoltcp-coupled protocol modules. Optional so a
 // rump-only build (devbox) compiles them out; the rump path below is smoltcp-free.
 //

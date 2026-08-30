@@ -234,11 +234,24 @@ working hypothesis in `archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md`; see
 
 ### RX is one 2 KB buffer at a time
 
-`VirtioSmoltcpDevice` owns a **single** `rx_buffer: [u8; 2048]` and a single
-`rx_token`. A buffer is posted, the device fills it, `receive()` hands it to
-smoltcp and posts the next one. smoltcp's `iface.poll()` loops on `receive()`,
-but the freshly posted buffer is usually not filled yet by the time
-`poll_receive()` is asked, so **a poll pass commonly nets one frame**.
+`VirtioSmoltcpDevice` posts a **single** receive buffer at a time. One is
+posted, the device fills it, `receive()` hands it to smoltcp and posts the next.
+smoltcp's `iface.poll()` loops on `receive()`, but the freshly posted buffer is
+usually not filled yet by the time `poll_receive()` is asked, so **a poll pass
+commonly nets one frame**.
+
+> **Corrected 2026-08-30.** This said "a single `rx_buffer: [u8; 2048]` and a
+> single `rx_token`", which was wrong on both counts by then. The buffer is
+> `RX_BUFFER_LEN` — **65,568** bytes on every profile but `extreme-size`, which
+> keeps 2 KB — because Firecracker will not read a frame from the tap until the
+> driver has posted 65,562 bytes of receive capacity in total
+> (`archive/AKUMA_FIRECRACKER_KVM.md` §5.1). And it is not a struct field: it
+> lives in BSS, because `NetworkState` is built on the kernel stack before being
+> moved into the `NETWORK` static. It is now a one-slot
+> `akuma_net::frames::FrameArena`, and the device holds a `FrameLease` on it for
+> exactly the window the NIC owns it by DMA
+> (`archive/AKUMA_NET_SPLIT.md` §4.2/§4.3). The one-frame-per-pass property this
+> section is about is unchanged.
 
 That is a throughput property, not a correctness one — QEMU defers rather than
 drops when the guest has no free RX buffer — but it sets the ceiling: a client
@@ -476,5 +489,8 @@ this file's philosophy asks for. Not yet wired into the boot suite or
 - `archive/HIJACK_VS_KERNEL_PROXY.md` — why kernel-side routing.
 - `archive/REDIS_END_TO_END.md` — the two `connect`/`bind` bugs above, and why
   one errno for every failure hid both of them.
+- `archive/AKUMA_NET_SPLIT.md` — the crate survey, its test coverage, and the
+  `unsafe` audit that produced `frames.rs` (bounds/borrow-checked frame storage)
+  and `nic.rs` (the one place virtio-drivers' begin/complete API is called).
 - `../../runbooks/run-redis.md` — a worked end-to-end server on this stack,
   including which guest ports the runner actually forwards.

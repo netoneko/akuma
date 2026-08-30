@@ -22,6 +22,9 @@ use akuma_virtio::VirtioHal;
 use crate::runtime::runtime;
 use crate::runtime::PreemptGuard;
 use crate::nicstat;
+use crate::frames::{FrameArena, FrameLease};
+use crate::nic::Nic;
+use akuma_primitives::TakeOnce;
 
 // ============================================================================
 // Constants
@@ -404,8 +407,16 @@ fn mark_release() {
     NETWORK_HOLDER.store(NETWORK_HOLDER_NONE, Ordering::Relaxed);
 }
 
-/// Static storage for sockets (required by smoltcp)
-static mut SOCKET_STORAGE: [SocketStorage<'static>; MAX_SOCKETS] = [SocketStorage::EMPTY; MAX_SOCKETS];
+/// Static storage for sockets (required by smoltcp).
+///
+/// Static rather than a field for the usual reason — at `MAX_SOCKETS` entries
+/// it is far too large to build on the kernel stack in [`init`] — and a
+/// [`TakeOnce`] rather than a `static mut` since 2026-08-30. The `&'static mut`
+/// that `SocketSet::new` needs was previously minted with a bare `unsafe`,
+/// sound only because `init` is the sole caller; that is now enforced instead
+/// of assumed, and the call site is safe.
+static SOCKET_STORAGE: TakeOnce<[SocketStorage<'static>; MAX_SOCKETS]> =
+    TakeOnce::new([SocketStorage::EMPTY; MAX_SOCKETS]);
 
 // ============================================================================
 // VirtIO Smoltcp Device Wrapper
@@ -448,42 +459,47 @@ pub const RX_BUFFER_LEN: usize = if cfg!(kernel_profile_extreme) {
 /// In BSS rather than a [`VirtioSmoltcpDevice`] field, for the same reason
 /// `virtio_rings` keeps its frame storage there: `NetworkState` is built on the
 /// kernel stack by [`init`] and then moved into `NETWORK`, so a field this size
-/// would be a 64 KB stack temporary on a 96 KB system stack. Sound because
-/// exactly one `VirtioSmoltcpDevice` is ever constructed, and every access is
-/// under `NETWORK`.
+/// would be a 64 KB stack temporary on a 96 KB system stack.
+///
+/// A one-slot [`FrameArena`] rather than a `static mut` since 2026-08-30. What
+/// used to be an aliasing obligation on every caller ("hold `NETWORK`, take no
+/// second borrow") is now the arena's borrow flag, and the window it has to
+/// cover — `receive_begin` until `receive_complete`, when the device owns the
+/// buffer by DMA — is exactly the life of the lease
+/// `VirtioSmoltcpDevice::rx_posted` holds. See `frames.rs`.
 #[cfg(not(feature = "net-noalloc"))]
-static mut RX_BUFFER: [u8; RX_BUFFER_LEN] = [0; RX_BUFFER_LEN];
+pub(crate) static RX_ARENA: FrameArena<1, RX_BUFFER_LEN> = FrameArena::new();
 
-/// A raw slice pointer to [`RX_BUFFER`].
-///
-/// **Safe since 2026-08-30**, and that is the point: it was an `unsafe fn`
-/// returning `&'static mut [u8]`, which put an aliasing obligation on a caller
-/// that could not discharge it — the `'static` lifetime outlives every `NETWORK`
-/// hold that was supposed to make the borrow exclusive. Forming the pointer is
-/// safe; *dereferencing* it is where the obligation actually lives, so each
-/// caller now writes its own `unsafe { &mut * }` and the borrow ends with the
-/// statement instead of with the program.
-///
-/// What callers must still honour at the deref: hold `NETWORK`, and take no
-/// second borrow — the device owns this buffer from `receive_begin` until
-/// `receive_complete`.
+/// The arena slot the single-buffer path uses. There is only one.
 #[cfg(not(feature = "net-noalloc"))]
-fn rx_buffer() -> *mut [u8] {
-    core::ptr::slice_from_raw_parts_mut((&raw mut RX_BUFFER).cast::<u8>(), RX_BUFFER_LEN)
-}
+const RX_SLOT: usize = 0;
 
 pub struct VirtioSmoltcpDevice {
-    inner: VirtIONetRaw<VirtioHal, VirtioTransport, 16>,
+    inner: Nic,
     /// The single transmit buffer of the pre-`net-noalloc` path. Also the
     /// saturation-fallback staging buffer's counterpart.
     #[cfg(not(feature = "net-noalloc"))]
     tx_buffer: [u8; 2048],
-    /// Token for a pending `VirtIO` receive buffer that has been submitted to the device.
-    /// `VirtIO` requires buffers to be posted via `receive_begin()` before the device can
-    /// DMA received packets into them. We track the token so we can call `receive_complete()`
-    /// once `poll_receive()` indicates the device has filled the buffer.
+    /// The receive buffer currently posted to the device: its token, and the
+    /// arena lease that keeps the slot exclusively ours for as long as the
+    /// device owns it by DMA.
+    ///
+    /// `VirtIO` requires buffers to be posted via `receive_begin()` before the
+    /// device can DMA into them, so the token is needed to call
+    /// `receive_complete()` once `poll_receive()` says it has been filled. The
+    /// lease is the other half: holding it is what makes "untouched until
+    /// completion" a fact rather than a comment.
     #[cfg(not(feature = "net-noalloc"))]
-    rx_token: Option<u16>,
+    rx_posted: Option<(u16, FrameLease<'static, 1, RX_BUFFER_LEN>)>,
+    /// The lease for a completed frame that has been handed up to smoltcp as an
+    /// `RxToken` and not yet finished with.
+    ///
+    /// Released at the top of the next [`Self::take_rx_frame`], which is the
+    /// same point the `net-noalloc` path re-posts a released slot and for the
+    /// same reason: by the time smoltcp asks for another frame, `consume` has
+    /// returned on the previous one.
+    #[cfg(not(feature = "net-noalloc"))]
+    rx_handed_up: Option<FrameLease<'static, 1, RX_BUFFER_LEN>>,
     /// Receive slots posted to the device. Buffers live in BSS, not here — see
     /// `virtio_rings`.
     #[cfg(feature = "net-noalloc")]
@@ -495,13 +511,15 @@ pub struct VirtioSmoltcpDevice {
 
 impl VirtioSmoltcpDevice {
     #[must_use]
-    pub const fn new(inner: VirtIONetRaw<VirtioHal, VirtioTransport, 16>) -> Self {
+    pub const fn new(inner: Nic) -> Self {
         Self {
             inner,
             #[cfg(not(feature = "net-noalloc"))]
             tx_buffer: [0u8; 2048],
             #[cfg(not(feature = "net-noalloc"))]
-            rx_token: None,
+            rx_posted: None,
+            #[cfg(not(feature = "net-noalloc"))]
+            rx_handed_up: None,
             #[cfg(feature = "net-noalloc")]
             rx: crate::virtio_rings::RxRing::new(),
             #[cfg(feature = "net-noalloc")]
@@ -542,17 +560,25 @@ impl VirtioSmoltcpDevice {
                 nicstat::record_rx_empty();
                 return None;
             };
-            // SAFETY: `slot` came from the ring's own table and `NETWORK` is
-            // held; `hdr + len <= FRAME_BUF` was checked by `take_frame`.
-            // No intermediate reference: the caller wants a pointer, so go
-            // pointer-to-pointer and never mint a `&mut` that could alias.
-            let base = unsafe { crate::virtio_rings::rx_frame(slot) };
+            // Bounds-checked by the arena; `hdr + len <= FRAME_BUF` was checked
+            // by `take_frame`. No intermediate reference: the caller wants a
+            // pointer, so go pointer-to-pointer and never mint a `&mut` that
+            // could alias. The slot stays leased by the ring until the next
+            // `take_frame` releases it, which covers the RxToken's life.
+            let base = crate::virtio_rings::RX_ARENA.slot_ptr(slot)?;
+            // SAFETY: `hdr < FRAME_BUF` per the check above, so this stays
+            // inside the slot the arena just bounds-checked.
             Some((unsafe { base.cast::<u8>().add(hdr) }, len))
         }
         #[cfg(not(feature = "net-noalloc"))]
         {
+            // Release the frame handed up last time. smoltcp has finished with
+            // it — `RxToken::consume` returned before it asked for another —
+            // and the slot has to be free before phase 1 can re-post it.
+            self.rx_handed_up = None;
+
             // Phase 1: ensure a receive buffer is posted to the device.
-            if self.rx_token.is_none() {
+            if self.rx_posted.is_none() {
                 let t = nicstat::start();
                 // NOTE: do not log from here. `Device::receive` is called by
                 // `iface.poll()` from inside the `NETWORK` critical section, which
@@ -561,41 +587,37 @@ impl VirtioSmoltcpDevice {
                 // `CONSOLE_LOCK`, and on a single-vCPU guest a holder that has been
                 // preempted can never run to release it. Counters
                 // (`RX_BUFFERS_POSTED` below) are safe; console I/O is not.
-                // SAFETY: `NETWORK` is held and there is no outstanding borrow —
-                // `rx_token` is `None`, so the device does not own the buffer.
-                let Ok(token) = (unsafe { self.inner.receive_begin(&mut *rx_buffer()) })
-                else {
+                let Some(posted) = self.inner.post_rx(&RX_ARENA, RX_SLOT) else {
                     RX_BEGIN_FAILURES.fetch_add(1, Ordering::Relaxed);
                     return None;
                 };
                 nicstat::record_rx_begin(t);
-                self.rx_token = Some(token);
+                self.rx_posted = Some(posted);
                 RX_BUFFERS_POSTED.fetch_add(1, Ordering::Relaxed);
             }
             // Phase 2: has the device filled it?
             if self.inner.poll_receive().is_some() {
-                // Phase 1 above sets `rx_token` before we ever get here, so this
-                // is `Some` by construction — but this is the per-packet receive
-                // path, and a panic is not how it should report a broken
+                // Phase 1 above sets `rx_posted` before we ever get here, so
+                // this is `Some` by construction — but this is the per-packet
+                // receive path, and a panic is not how it should report a broken
                 // invariant. Drop the frame and let the next poll retry.
-                let token = self.rx_token.take()?;
+                let (token, lease) = self.rx_posted.take()?;
                 let t = nicstat::start();
-                // SAFETY: the same buffer that was passed to `receive_begin`,
-                // which `receive_complete`'s contract requires.
-                let buf = unsafe { &mut *rx_buffer() };
-                if let Ok((hdr_len, pkt_len)) =
-                    unsafe { self.inner.receive_complete(token, buf) }
-                {
-                    // A malformed VirtIO response could report a frame longer
-                    // than the buffer; slicing on that corrupts adjacent memory.
-                    if hdr_len.saturating_add(pkt_len) > buf.len() {
-                        return None;
-                    }
-                    nicstat::record_rx_packet(t, pkt_len);
-                    RX_FRAMES_RECEIVED.fetch_add(1, Ordering::Relaxed);
-                    return Some((unsafe { buf.as_mut_ptr().add(hdr_len) }, pkt_len));
-                }
-                return None;
+                // `complete_rx` validates `hdr_len + pkt_len` against the slot,
+                // so a malformed device response cannot hand smoltcp a frame
+                // that runs off the end of it.
+                let (hdr_len, pkt_len) = self.inner.complete_rx(token, lease)?;
+                nicstat::record_rx_packet(t, pkt_len);
+                RX_FRAMES_RECEIVED.fetch_add(1, Ordering::Relaxed);
+                // Re-lease the slot for the RxToken's life. The device released
+                // it at `complete_rx`; this hands it to smoltcp instead, and the
+                // release at the top of the next call is what ends it.
+                let lease = RX_ARENA.lease(RX_SLOT)?;
+                let base = RX_ARENA.slot_ptr(RX_SLOT)?;
+                self.rx_handed_up = Some(lease);
+                // SAFETY: `hdr_len + pkt_len <= RX_BUFFER_LEN` was checked by
+                // `complete_rx`, so this stays inside the slot.
+                return Some((unsafe { base.cast::<u8>().add(hdr_len) }, pkt_len));
             }
             nicstat::record_rx_empty();
             None
@@ -623,23 +645,21 @@ impl VirtioSmoltcpDevice {
     ) -> R {
         #[cfg(feature = "net-noalloc")]
         {
-            use crate::virtio_rings::{FRAME_BUF, tx_discard, tx_frame};
-            if let Some(slot) = self.tx.claim(&mut self.inner) {
-                // SAFETY: `slot < TX_RING` by construction; `NETWORK` is held.
-                let frame = unsafe { &mut *tx_frame(slot) };
+            use crate::virtio_rings::{FRAME_BUF, TX_DISCARD_ARENA};
+            if let Some(mut frame) = self.tx.claim(&mut self.inner) {
                 // `transmit_begin` sends whatever is in the buffer verbatim, so
                 // the virtio header has to be written into it here — unlike
                 // `send`, which prepends its own.
-                let hdr = self.inner.fill_buffer_header(frame).unwrap_or(0);
+                let hdr = self.inner.fill_buffer_header(&mut frame);
                 let end = hdr.saturating_add(len).min(FRAME_BUF);
                 let res = fill(&mut frame[hdr..end]);
                 if divert(&frame[hdr..end]) {
-                    // Never submitted, so the slot was never marked in flight —
-                    // there is nothing to release.
+                    // Never submitted, so the slot was never marked in flight.
+                    // Dropping the lease here is what releases it.
                     return res;
                 }
                 let t = nicstat::start();
-                let ok = self.tx.submit(&mut self.inner, slot, end);
+                let ok = self.tx.submit(&mut self.inner, frame, end);
                 nicstat::record_tx(t, end - hdr, ok);
                 if !ok {
                     TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -654,9 +674,15 @@ impl VirtioSmoltcpDevice {
             //
             // A diverted (loopback) frame is unaffected by NIC saturation, so it
             // is still delivered.
-            // SAFETY: `NETWORK` is held, so nothing else is touching the buffer.
-            let discard = unsafe { &mut *tx_discard() };
             let end = len.min(FRAME_BUF);
+            // SAFETY: the discard buffer is write-only garbage — nothing ever
+            // reads it back and it is never submitted to the device — and
+            // `NETWORK` is held, so no other core is in this function. The
+            // bounds are the arena's. Deliberately NOT `with_slot`: a refusal
+            // there would leave no correct way to honour `consume`'s contract
+            // that the fill closure runs against a buffer of the length smoltcp
+            // asked for, and handing it a shorter one can panic inside smoltcp.
+            let discard = unsafe { &mut *TX_DISCARD_ARENA.first_slot_ptr() };
             let res = fill(&mut discard[..end]);
             if divert(&discard[..end]) {
                 return res;
@@ -672,7 +698,7 @@ impl VirtioSmoltcpDevice {
                 return res;
             }
             let t = nicstat::start();
-            let ok = self.inner.send(&self.tx_buffer[..end]).is_ok();
+            let ok = self.inner.send_blocking(&self.tx_buffer[..end]);
             nicstat::record_tx(t, end, ok);
             if !ok {
                 TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -682,24 +708,28 @@ impl VirtioSmoltcpDevice {
     }
 }
 
-// `deref_addrof`: `receive` must hand out an rx and a tx token from one
-// `&mut self`, and the tx token holds the whole device — so unlike
-// `LoopbackAwareDevice` below, disjoint field borrows cannot express it.
-#[allow(clippy::deref_addrof)]
 impl Device for VirtioSmoltcpDevice {
     type RxToken<'a> = VirtioRxToken<'a>;
     type TxToken<'a> = VirtioTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let (ptr, len) = self.take_rx_frame()?;
-        // SAFETY: `take_rx_frame` returned a live L2 frame of `len` bytes in a
-        // buffer this device owns, and the token's lifetime is bounded by the
-        // `&mut self` borrow. The `&raw mut` aliasing for the tx half is the
-        // pre-existing pattern here: smoltcp's `Device` contract hands out an
-        // rx and a tx token together, and they touch disjoint state (rx frame
-        // storage vs the device/tx ring).
+        // Build the tx token FIRST, for the same reason `LoopbackAwareDevice`
+        // below chooses its frame before building one: it is what lets both
+        // tokens be plain borrows instead of the `&mut *(&raw mut *self)`
+        // self-aliasing this used to need — two live `&mut` to one place, which
+        // is UB by the language's rules whether or not the device races them.
+        //
+        // It works because `take_rx_frame` returns a **raw pointer** whose
+        // provenance is the BSS frame arena, NOT `self`: once it has returned,
+        // `self` is unborrowed and the frame does not alias it. Keep that
+        // signature — handing back a `&mut [u8]` would tie the frame to the
+        // `&mut self` borrow and the aliasing would be real again.
+        let tx = VirtioTxToken { dev: self };
+        // SAFETY: `take_rx_frame` returned a live L2 frame of `len` bytes in
+        // arena storage the device owns until the next `receive`, and the
+        // token's lifetime is bounded by the `&mut self` borrow.
         let rx = VirtioRxToken { buffer: unsafe { core::slice::from_raw_parts_mut(ptr, len) } };
-        let tx = VirtioTxToken { dev: unsafe { &mut *(&raw mut *self) } };
         Some((rx, tx))
     }
 
@@ -764,6 +794,10 @@ fn is_loopback_frame(frame: &[u8]) -> bool {
     }
 }
 
+/// A lease on one [`LOOPBACK_ARENA`] slot. Named because it appears in three
+/// signatures and the const-generic form is unreadable inline.
+type LoopbackLease = FrameLease<'static, LOOPBACK_RING, LOOPBACK_FRAME_BUF>;
+
 /// Bytes per loopback frame slot. Loopback frames are pure L2 (no virtio
 /// header, MTU 1514 — see `capabilities()`), but this matches
 /// `virtio_rings::FRAME_BUF` and every other frame buffer in this file for
@@ -779,9 +813,8 @@ const LOOPBACK_RING: usize = 32;
 /// `NetworkState` (which owns the device) is built on the stack before being
 /// moved into the `NETWORK` static, and `LOOPBACK_RING * LOOPBACK_FRAME_BUF`
 /// (64 KiB) inline would push that far past a comfortable kernel stack frame.
-/// Same reasoning as `virtio_rings`' `RX_BUFS`/`TX_BUFS`.
-static mut LOOPBACK_BUFS: [[u8; LOOPBACK_FRAME_BUF]; LOOPBACK_RING] =
-    [[0; LOOPBACK_FRAME_BUF]; LOOPBACK_RING];
+/// Same reasoning as `virtio_rings`' arenas.
+static LOOPBACK_ARENA: FrameArena<LOOPBACK_RING, LOOPBACK_FRAME_BUF> = FrameArena::new();
 
 /// Loopback frames dropped because the ring was full, or (should be
 /// impossible — `capabilities()` caps the MTU well under this) too large for
@@ -792,15 +825,6 @@ static LOOPBACK_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[must_use]
 pub fn loopback_drop_count() -> usize {
     LOOPBACK_DROP_COUNT.load(Ordering::Relaxed)
-}
-
-/// Pointer to loopback slot `slot`.
-///
-/// # Safety
-/// `slot < LOOPBACK_RING`, and the caller holds `NETWORK` — the lock that
-/// serialises every push/pop below, same as `virtio_rings::rx_buf`/`tx_buf`.
-unsafe fn loopback_buf(slot: usize) -> *mut u8 {
-    unsafe { (&raw mut LOOPBACK_BUFS).cast::<u8>().add(slot * LOOPBACK_FRAME_BUF) }
 }
 
 /// A fixed-capacity ring of loopback frames, replacing what used to be a
@@ -815,7 +839,7 @@ unsafe fn loopback_buf(slot: usize) -> *mut u8 {
 /// the same backpressure a real NIC's finite ring already gives external
 /// traffic.
 ///
-/// # Why holding raw slices into a shared static is sound
+/// # Why holding a borrow into a shared static is sound
 ///
 /// Every push and pop happens under the `NETWORK` spinlock (`push` from
 /// `TxToken::consume` during egress, `pop` from `Device::receive` during
@@ -829,6 +853,12 @@ unsafe fn loopback_buf(slot: usize) -> *mut u8 {
 /// rx closure it was handed alongside the tx token — targets `tail`, a
 /// different slot from the `head` slot still being read, as long as
 /// `LOOPBACK_RING >= 2`).
+///
+/// Since 2026-08-30 that argument is *checked* rather than asserted: slots come
+/// from [`LOOPBACK_ARENA`], `pop` hands out a [`FrameLease`] that holds the slot
+/// until the `RxToken` is consumed, and a `push` that lands on a slot still
+/// leased is refused and counted as a drop instead of overwriting a frame
+/// smoltcp is reading.
 struct LoopbackRing {
     /// Length of the frame in slot `i`, valid only while that slot is queued.
     lens: [u16; LOOPBACK_RING],
@@ -860,10 +890,17 @@ impl LoopbackRing {
             return;
         }
         let slot = self.tail;
-        // SAFETY: `slot < LOOPBACK_RING` (`tail` is kept in range by the `%`
-        // below); see the struct-level safety argument for exclusivity.
-        let dst = unsafe { core::slice::from_raw_parts_mut(loopback_buf(slot), frame.len()) };
-        dst.copy_from_slice(frame);
+        // A `None` here means the slot is still leased by an `RxToken` smoltcp
+        // has not finished with — the case the struct-level argument says
+        // cannot happen. Drop and count it rather than overwriting a frame
+        // that is being read.
+        let copied = LOOPBACK_ARENA.with_slot(slot, |dst| {
+            dst[..frame.len()].copy_from_slice(frame);
+        });
+        if copied.is_none() {
+            LOOPBACK_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         self.lens[slot] = frame.len() as u16;
         self.tail = (self.tail + 1) % LOOPBACK_RING;
         self.count += 1;
@@ -876,18 +913,21 @@ impl LoopbackRing {
         (runtime().wake_netpoll)();
     }
 
-    /// Hand back the oldest queued frame, if any, as a `'static` slice into
-    /// `LOOPBACK_BUFS`.
-    fn pop(&mut self) -> Option<&'static mut [u8]> {
+    /// Hand back the oldest queued frame, if any, as a lease on its
+    /// [`LOOPBACK_ARENA`] slot plus the frame's length.
+    ///
+    /// The lease is what keeps the slot out of `push`'s reach until the
+    /// `RxToken` carrying it has been consumed.
+    fn pop(&mut self) -> Option<(LoopbackLease, usize)> {
         if self.count == 0 {
             return None;
         }
         let slot = self.head;
         let len = self.lens[slot] as usize;
+        let lease = LOOPBACK_ARENA.lease(slot)?;
         self.head = (self.head + 1) % LOOPBACK_RING;
         self.count -= 1;
-        // SAFETY: as `push`.
-        Some(unsafe { core::slice::from_raw_parts_mut(loopback_buf(slot), len) })
+        Some((lease, len))
     }
 }
 
@@ -928,10 +968,10 @@ impl Device for LoopbackAwareDevice {
         // (`&mut self.virtio` and `&mut self.loopback`) instead of the
         // `&raw mut` aliasing this used to need: the loopback pop wants the
         // ring mutably, and the tx token wants to keep it.
-        let source = if let Some(frame) = self.loopback.pop() {
+        let source = if let Some((frame, len)) = self.loopback.pop() {
             // An internally queued frame is already in hand — no device round
             // trip, and `receive` drains these ahead of the wire.
-            FrameSource::Loopback(frame)
+            FrameSource::Loopback(frame, len)
         } else {
             let (ptr, len) = self.virtio.take_rx_frame()?;
             FrameSource::Virtio(ptr, len)
@@ -942,7 +982,7 @@ impl Device for LoopbackAwareDevice {
             loopback: &mut self.loopback,
         };
         let rx = match source {
-            FrameSource::Loopback(frame) => LoopbackAwareRxToken::Loopback(frame),
+            FrameSource::Loopback(frame, len) => LoopbackAwareRxToken::Loopback(frame, len),
             // SAFETY: `take_rx_frame` returned a live L2 frame of `len` bytes in
             // storage this device owns — with `net-noalloc` a ring slot the ring
             // has already released and will not re-post until the next
@@ -974,14 +1014,14 @@ impl Device for LoopbackAwareDevice {
 enum FrameSource {
     /// A frame popped off the internal loopback ring, borrowed `'static` out
     /// of `LOOPBACK_BUFS`.
-    Loopback(&'static mut [u8]),
+    Loopback(LoopbackLease, usize),
     /// A pointer to the L2 frame in device-owned storage, and its length.
     Virtio(*mut u8, usize),
 }
 
 pub enum LoopbackAwareRxToken<'a> {
-    /// A frame that was looped back internally.
-    Loopback(&'a mut [u8]),
+    /// A frame that was looped back internally: its arena lease and length.
+    Loopback(LoopbackLease, usize),
     /// A borrowed frame received from `VirtIO`.
     Virtio(&'a mut [u8]),
 }
@@ -992,7 +1032,7 @@ impl smoltcp::phy::RxToken for LoopbackAwareRxToken<'_> {
         F: FnOnce(&[u8]) -> R,
     {
         match self {
-            Self::Loopback(buf) => f(buf),
+            Self::Loopback(lease, len) => f(&lease[..len]),
             Self::Virtio(buf) => f(buf),
         }
     }
@@ -1046,7 +1086,7 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
     }
 
     let mut device = LoopbackAwareDevice::new(
-        VirtioSmoltcpDevice::new(found_device.ok_or("No virtio-net device found")?)
+        VirtioSmoltcpDevice::new(Nic::new(found_device.ok_or("No virtio-net device found")?))
     );
     let mac = device.mac_address();
     crate::safe_print!(
@@ -1083,7 +1123,12 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
         crate::safe_print!(80, "[SmolNet] could not add default IPv4 route: table full\n");
     }
 
-    let mut sockets = unsafe { SocketSet::new(&mut SOCKET_STORAGE[..]) };
+    // `None` means `init` ran twice, which the kernel's boot path does not do.
+    // Refusing beats handing out a second `&mut` to the same table.
+    let storage = SOCKET_STORAGE
+        .take()
+        .ok_or("smoltcp_net::init called twice — socket storage already claimed")?;
+    let mut sockets = SocketSet::new(&mut storage[..]);
 
     let dhcp_handle = if enable_dhcp {
         crate::safe_print!(32, "[SmolNet] DHCP enabled\n");
@@ -1938,16 +1983,36 @@ pub struct TcpStream {
 
 /// Extract the internal index from a `SocketHandle`.
 ///
-/// `SocketHandle` is a newtype wrapper around a single `usize` field (the socket
-/// set index). Since it has no public accessor, we use transmute to read it.
-/// This is safe because `SocketHandle` contains exactly one usize and both types
-/// have identical size and alignment.
-fn socket_handle_index(handle: SocketHandle) -> usize {
-    // Safety: SocketHandle(usize) is a single-field struct with the same
-    // layout as usize. Verified by the static_assert below.
+/// smoltcp 0.12 declares `pub struct SocketHandle(usize)` with a **private**
+/// field and no accessor beyond `Display`, so there is no safe route to the
+/// index — and the index is load-bearing: [`is_valid_handle`] guards five real
+/// paths against a corrupted handle reaching the socket set.
+///
+/// # Why the assertions below are not enough on their own
+///
+/// `size_of` proves nothing about field *offset*, and nothing at all about a
+/// future smoltcp adding a second field or changing `repr`. Both would keep
+/// this compiling and silently return garbage. The assumption is therefore
+/// checked against the real type at test time by
+/// `tests::socket_handle_layout_tests` — which builds an actual `SocketSet`,
+/// adds sockets to it, and asserts this function agrees with the handle smoltcp
+/// itself handed back. That test is what fails on the next smoltcp bump; keep
+/// it in step with any change here.
+///
+/// `pub(crate)` only so that test can reach it.
+pub(crate) fn socket_handle_index(handle: SocketHandle) -> usize {
+    // A single-field struct has its field at offset 0, so with equal size and
+    // alignment the transmute is a no-op reinterpretation. Both halves are
+    // asserted because a `repr` change upstream could break either.
     const _: () = assert!(
         core::mem::size_of::<SocketHandle>() == core::mem::size_of::<usize>()
     );
+    const _: () = assert!(
+        core::mem::align_of::<SocketHandle>() == core::mem::align_of::<usize>()
+    );
+    // SAFETY: layout-compatible per the assertions above and the test named in
+    // the doc comment. `SocketHandle` is `Copy` with no `Drop`, so no ownership
+    // is duplicated or lost.
     unsafe { core::mem::transmute::<SocketHandle, usize>(handle) }
 }
 

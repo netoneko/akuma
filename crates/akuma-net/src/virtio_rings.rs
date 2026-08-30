@@ -38,31 +38,31 @@
 //!   reaped on a later pass ([`TxRing::reap`]), which is called before every
 //!   claim. The spin is gone from the common path entirely.
 //!
-//! # Why the buffers are `static mut` and not struct fields
+//! # Why the buffers are statics and not struct fields
 //!
 //! `NetworkState` is *built on the stack* and then moved into the `NETWORK`
 //! static (`*NETWORK.lock() = Some(NetworkState { .. })`). Sixteen 2 KB frames
 //! inline would push 32 KB through a kernel stack during `init`. Keeping them in
-//! dedicated statics — exactly what `SOCKET_STORAGE` already does in
-//! `smoltcp_net.rs` — leaves `NetworkState` *smaller* than before, since the
-//! rings hold only tokens and indices.
+//! dedicated statics leaves `NetworkState` *smaller* than before, since the
+//! rings hold only tokens and leases.
 //!
-//! There is one network device, initialised once, and every access below happens
-//! under the `NETWORK` spinlock, which is what makes the aliasing sound.
+//! They are [`FrameArena`]s rather than `static mut` arrays since 2026-08-30.
+//! The rings used to hold slot indices and reach the bytes through `unsafe fn`
+//! accessors whose `slot < RING` contract nothing enforced; they now hold
+//! [`FrameLease`]es, so a slot cannot be addressed out of range and cannot be
+//! handed to the device twice. What that buys, precisely: the window the lease
+//! covers is the window the device owns the buffer — `receive_begin` to
+//! `receive_complete`, `transmit_begin` to `transmit_complete` — which is
+//! exactly the obligation `crate::nic` exists to discharge.
 
-use akuma_virtio::VirtioHal;
+use crate::frames::{FrameArena, FrameLease};
+use crate::nic::Nic;
 use core::sync::atomic::{AtomicU64, Ordering};
-use virtio_drivers::device::net::VirtIONetRaw;
-use akuma_virtio::VirtioTransport;
-
-/// The virtio-net device type this crate binds. `16` is the virtqueue depth.
-pub type NetDev = VirtIONetRaw<VirtioHal, VirtioTransport, 16>;
 
 /// Bytes per frame slot: the 1514-byte MTU plus the virtio net header, rounded
 /// up. Also the minimum `VirtIONetRaw` will accept for a receive buffer
 /// (`MIN_BUFFER_LEN` is 1526).
 pub const FRAME_BUF: usize = 2048;
-
 
 /// Receive slots posted to the device.
 ///
@@ -76,9 +76,9 @@ pub const FRAME_BUF: usize = 2048;
 /// receive capacity in total (see `smoltcp_net::RX_BUFFER_LEN`), and this ring
 /// offers `RX_RING * FRAME_BUF` = 16 KB. Reaching the threshold from a
 /// 16-descriptor queue needs `FRAME_BUF` of at least 4098, and `FRAME_BUF` is
-/// shared with `TX_BUFS`, so it is a resize of both rings rather than a constant
-/// bump — not done, because nothing enables `net-noalloc` (it measured worse;
-/// see this crate's `[features]`).
+/// shared with `TX_ARENA`, so it is a resize of both rings rather than a
+/// constant bump — not done, because nothing enables `net-noalloc` (it measured
+/// worse; see this crate's `[features]`).
 pub const RX_RING: usize = 8;
 
 /// Transmit slots that may be in flight simultaneously.
@@ -95,15 +95,18 @@ pub const TX_RING: usize = 8;
 const CLAIM_SPINS: usize = 64;
 
 /// Receive frame storage. See the module header for why this is not a field.
-static mut RX_BUFS: [[u8; FRAME_BUF]; RX_RING] = [[0; FRAME_BUF]; RX_RING];
+pub static RX_ARENA: FrameArena<RX_RING, FRAME_BUF> = FrameArena::new();
 /// Transmit frame storage.
-static mut TX_BUFS: [[u8; FRAME_BUF]; TX_RING] = [[0; FRAME_BUF]; TX_RING];
+pub static TX_ARENA: FrameArena<TX_RING, FRAME_BUF> = FrameArena::new();
 /// Write-only discard buffer for a frame that could not get a ring slot.
 ///
 /// smoltcp's `TxToken::consume` contract says the fill closure runs and its
 /// value is returned, so a dropped frame still has to be written *somewhere*.
 /// Nothing ever reads this back and it is never submitted to the device.
-static mut TX_DISCARD: [u8; FRAME_BUF] = [0; FRAME_BUF];
+pub static TX_DISCARD_ARENA: FrameArena<1, FRAME_BUF> = FrameArena::new();
+
+/// The single slot of [`TX_DISCARD_ARENA`].
+pub const TX_DISCARD_SLOT: usize = 0;
 
 /// Frames the device completed with a token no slot claims.
 ///
@@ -129,62 +132,13 @@ pub fn ring_health() -> (u64, u64) {
     )
 }
 
-/// Pointer to receive slot `slot`.
-///
-/// # Safety
-/// `slot < RX_RING`, and the caller holds `NETWORK` (the lock that serialises
-/// every device access).
-unsafe fn rx_buf(slot: usize) -> *mut u8 {
-    // `&raw mut` rather than `&mut`: taking a reference to a `static mut` is an
-    // error in edition 2024, and a raw pointer is all this needs.
-    unsafe { (&raw mut RX_BUFS).cast::<u8>().add(slot * FRAME_BUF) }
-}
+/// A receive slot the device owns: its token and the lease proving nothing else
+/// touches the buffer while DMA is live.
+type PostedRx = (u16, FrameLease<'static, RX_RING, FRAME_BUF>);
 
-/// Pointer to transmit slot `slot`.
-///
-/// # Safety
-/// As [`rx_buf`], with `slot < TX_RING`.
-unsafe fn tx_buf(slot: usize) -> *mut u8 {
-    unsafe { (&raw mut TX_BUFS).cast::<u8>().add(slot * FRAME_BUF) }
-}
-
-/// A whole frame slot as a mutable slice.
-///
-/// Returns a raw slice pointer, not `&'static mut [u8]`, since 2026-08-30. The
-/// reference form let two calls with the same `slot` mint two `&mut` aliases to
-/// the same bytes — UB by the language's rules whether or not the device races
-/// them, and an obligation no caller could discharge because the `'static`
-/// lifetime outlives every lock hold that was supposed to make it safe. Callers
-/// now build a reference at the point of use, so its lifetime ends with the
-/// borrow instead of the program (`docs/archive/ERROR_HANDLING_AUDIT.md` §5.1).
-///
-/// # Safety
-/// `slot < RX_RING` and the caller holds `NETWORK`.
-#[must_use]
-pub unsafe fn rx_frame(slot: usize) -> *mut [u8] {
-    unsafe { core::ptr::slice_from_raw_parts_mut(rx_buf(slot), FRAME_BUF) }
-}
-
-/// The discard buffer for a frame with no slot, as a mutable slice.
-///
-/// # Safety
-/// Caller holds `NETWORK`. The contents are never read back — see
-/// [`TX_DISCARD`].
-/// Safe for the same reason as `smoltcp_net::rx_buffer`: forming the pointer is
-/// safe, dereferencing it is not, and only the caller can honour the contract.
-#[must_use]
-pub fn tx_discard() -> *mut [u8] {
-    core::ptr::slice_from_raw_parts_mut((&raw mut TX_DISCARD).cast::<u8>(), FRAME_BUF)
-}
-
-/// A whole transmit slot as a mutable slice.
-///
-/// # Safety
-/// `slot < TX_RING` and the caller holds `NETWORK`.
-#[must_use]
-pub unsafe fn tx_frame(slot: usize) -> *mut [u8] {
-    unsafe { core::ptr::slice_from_raw_parts_mut(tx_buf(slot), FRAME_BUF) }
-}
+/// A transmit slot the device owns: token, lease, and the length that was
+/// submitted (`transmit_complete` must be given the same slice).
+type InflightTx = (u16, FrameLease<'static, TX_RING, FRAME_BUF>, u16);
 
 // ============================================================================
 // Receive
@@ -192,15 +146,23 @@ pub unsafe fn tx_frame(slot: usize) -> *mut [u8] {
 
 /// Which receive slots are posted to the device, and under what token.
 pub struct RxRing {
-    /// `Some(token)` when slot `i` is posted and owned by the device; `None`
-    /// when it is free to post (or currently borrowed by an `RxToken`).
-    tokens: [Option<u16>; RX_RING],
+    /// `Some((token, lease))` when slot `i` is posted and owned by the device;
+    /// `None` when it is free to post.
+    posted: [Option<PostedRx>; RX_RING],
+    /// The lease for the frame most recently handed up to smoltcp as an
+    /// `RxToken`. Released at the top of [`Self::refill`] — by then
+    /// `RxToken::consume` has returned, which is the same reasoning the
+    /// pre-lease code used to justify re-posting the slot there.
+    handed_up: Option<FrameLease<'static, RX_RING, FRAME_BUF>>,
 }
 
 impl RxRing {
     #[must_use]
     pub const fn new() -> Self {
-        Self { tokens: [None; RX_RING] }
+        Self {
+            posted: [const { None }; RX_RING],
+            handed_up: None,
+        }
     }
 
     /// Post every free slot to the device.
@@ -209,40 +171,44 @@ impl RxRing {
     /// slot released by the previous call — by then smoltcp has finished with
     /// the frame, because `RxToken::consume` has returned.
     ///
-    /// Stops at the first failure rather than trying every slot: `receive_begin`
-    /// only fails when the virtqueue is full, and the next slot would fail the
+    /// Stops at the first failure rather than trying every slot: `post_rx`
+    /// only fails when the virtqueue is full (or the slot is still leased, which
+    /// the release above has just ruled out), and the next slot would fail the
     /// same way.
-    pub fn refill(&mut self, dev: &mut NetDev) {
-        for slot in 0..RX_RING {
-            if self.tokens[slot].is_some() {
+    pub fn refill(&mut self, nic: &mut Nic) {
+        // smoltcp has finished with the previous frame; free its slot before
+        // trying to re-post it.
+        self.handed_up = None;
+        for (slot, entry) in self.posted.iter_mut().enumerate() {
+            if entry.is_some() {
                 continue;
             }
             let t = crate::nicstat::start();
-            // SAFETY: `slot < RX_RING`; the caller holds `NETWORK`. The buffer
-            // stays untouched by us until `receive_complete` hands it back,
-            // which is the borrow `VirtIONetRaw::receive_begin` requires.
-            let buf = unsafe { &mut *rx_frame(slot) };
-            match unsafe { dev.receive_begin(buf) } {
-                Ok(token) => {
-                    crate::nicstat::record_rx_begin(t);
-                    self.tokens[slot] = Some(token);
-                }
-                Err(_) => return,
-            }
+            let Some(posted) = nic.post_rx(&RX_ARENA, slot) else {
+                return;
+            };
+            crate::nicstat::record_rx_begin(t);
+            *entry = Some(posted);
         }
     }
 
     /// Complete the next frame the device has finished, if any.
     ///
-    /// Returns `(slot, offset, len)` — the frame is `rx_frame(slot)[offset..
-    /// offset + len]`, with `offset` skipping the virtio net header.
+    /// Returns `(slot, offset, len)` — the frame is `RX_ARENA.slot_ptr(slot)`
+    /// at `[offset .. offset + len]`, with `offset` skipping the virtio net
+    /// header. The slot stays leased (as `handed_up`) until the next
+    /// [`Self::refill`], covering the returned pointer's use as an `RxToken`.
     ///
     /// Completion follows the used ring's order (`peek_used` then `pop_used`,
     /// which rejects any other token), so the slot is looked up *by* the token
     /// rather than assumed.
-    pub fn take_frame(&mut self, dev: &mut NetDev) -> Option<(usize, usize, usize)> {
-        let token = dev.poll_receive()?;
-        let Some(slot) = self.tokens.iter().position(|t| *t == Some(token)) else {
+    pub fn take_frame(&mut self, nic: &mut Nic) -> Option<(usize, usize, usize)> {
+        let token = nic.poll_receive()?;
+        let Some(slot) = self
+            .posted
+            .iter()
+            .position(|p| matches!(p, Some((t, _)) if *t == token))
+        else {
             // Not one of ours. Cannot `pop_used` without the matching buffer,
             // so leave it and record it — see `ORPHAN_TOKENS`.
             ORPHAN_TOKENS.fetch_add(1, Ordering::Relaxed);
@@ -250,22 +216,16 @@ impl RxRing {
         };
 
         let t = crate::nicstat::start();
-        // SAFETY: `slot` came from our own table, so it is in range, and this is
-        // the same buffer that was passed to `receive_begin` for `token` —
-        // which is what `receive_complete` requires.
-        let buf = unsafe { &mut *rx_frame(slot) };
-        let (hdr_len, pkt_len) = unsafe { dev.receive_complete(token, buf) }.ok()?;
-        self.tokens[slot] = None;
-
-        // A malformed device response could claim a frame longer than the
-        // buffer; slicing on that would read (and let smoltcp parse) memory
-        // past the slot. This check is why the pre-existing single-buffer path
-        // has it too — see the EL1 `EC=0x25` entry in
-        // `docs/runbooks/debug-network.md`.
-        if hdr_len.saturating_add(pkt_len) > FRAME_BUF {
-            return None;
-        }
+        let (_, lease) = self.posted[slot].take()?;
+        // `complete_rx` bounds-checks `hdr_len + pkt_len` against the slot: a
+        // malformed device response claiming a frame longer than the buffer
+        // would otherwise have smoltcp parse memory past it. See the EL1
+        // `EC=0x25` entry in `docs/runbooks/debug-network.md`.
+        let (hdr_len, pkt_len) = nic.complete_rx(token, lease)?;
         crate::nicstat::record_rx_packet(t, pkt_len);
+        // Re-take the slot for the RxToken's life. The device released it at
+        // `complete_rx`; this hands it to smoltcp instead.
+        self.handed_up = RX_ARENA.lease(slot);
         Some((slot, hdr_len, pkt_len))
     }
 }
@@ -282,12 +242,11 @@ impl Default for RxRing {
 
 /// Transmit slots and the frames in flight in them.
 pub struct TxRing {
-    /// `Some(token)` while slot `i` is owned by the device.
-    inflight: [Option<u16>; TX_RING],
-    /// Bytes submitted from slot `i`. `transmit_complete` must be handed the
+    /// `Some((token, lease, len))` while slot `i` is owned by the device. The
+    /// length is remembered because `transmit_complete` must be handed the
     /// *same* slice `transmit_begin` was given — `pop_used` walks the
-    /// descriptor chain to unshare it — so the length has to be remembered.
-    lens: [u16; TX_RING],
+    /// descriptor chain to unshare it.
+    inflight: [Option<InflightTx>; TX_RING],
     /// When slot `i` was submitted, so `reap` can charge the host's consume
     /// latency to `tx_flight_us`. `transmit_begin` stopped making the caller
     /// wait for that; it did not make it go away, and it is the only way to see
@@ -302,8 +261,7 @@ impl TxRing {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            inflight: [None; TX_RING],
-            lens: [0; TX_RING],
+            inflight: [const { None }; TX_RING],
             submitted: [None; TX_RING],
             next: 0,
         }
@@ -314,21 +272,27 @@ impl TxRing {
     /// This is the half that replaces the blocking spin: the wait still happens,
     /// but it happens *later*, on somebody else's pass through the poll loop,
     /// instead of inside the `NETWORK` critical section that produced the frame.
-    pub fn reap(&mut self, dev: &mut NetDev) -> usize {
+    pub fn reap(&mut self, nic: &mut Nic) -> usize {
         let mut freed = 0;
-        while let Some(token) = dev.poll_transmit() {
-            let Some(slot) = self.inflight.iter().position(|t| *t == Some(token)) else {
+        while let Some(token) = nic.poll_transmit() {
+            let Some(slot) = self
+                .inflight
+                .iter()
+                .position(|e| matches!(e, Some((t, _, _)) if *t == token))
+            else {
                 ORPHAN_TOKENS.fetch_add(1, Ordering::Relaxed);
                 break;
             };
-            // SAFETY: same slot, same length as the matching `transmit_begin`.
-            let buf = unsafe {
-                core::slice::from_raw_parts(tx_buf(slot), self.lens[slot] as usize)
+            let Some((_, lease, len)) = self.inflight[slot].take() else {
+                break;
             };
-            if unsafe { dev.transmit_complete(token, buf) }.is_err() {
+            if let Err(lease) = nic.complete_tx(token, lease, len as usize) {
+                // Refused: the device may still own the buffer, so put the entry
+                // back rather than freeing the slot. One slot is leaked; a slot
+                // reused under live DMA would be corruption.
+                self.inflight[slot] = Some((token, lease, len));
                 break;
             }
-            self.inflight[slot] = None;
             if let Some(s) = self.submitted[slot].take() {
                 crate::nicstat::record_tx_complete(s);
             }
@@ -337,29 +301,34 @@ impl TxRing {
         freed
     }
 
-    /// Reap, then claim a free slot.
+    /// Reap, then claim a free slot, returning its lease.
     ///
     /// `None` means every slot was still in flight after [`CLAIM_SPINS`] reap
     /// attempts. The caller drops the frame; TCP retransmits, and a UDP
     /// datagram lost to a saturated NIC is a drop the protocol already allows.
     ///
-    /// It must not fall back to `VirtIONetRaw::send` — that is
+    /// It must not fall back to `Nic::send_blocking` — that is
     /// `add_notify_wait_pop`, which pops the used ring by *head* token and
     /// errors with `WrongToken` when anything else is in flight. Mixing it with
-    /// `transmit_begin` would fail the send *and* leak the descriptor chain,
+    /// `submit_tx` would fail the send *and* leak the descriptor chain,
     /// permanently shrinking the queue. The two paths cannot be interleaved, so
     /// the ring owns the send queue exclusively.
-    pub fn claim(&mut self, dev: &mut NetDev) -> Option<usize> {
+    pub fn claim(&mut self, nic: &mut Nic) -> Option<FrameLease<'static, TX_RING, FRAME_BUF>> {
         for attempt in 0..=CLAIM_SPINS {
-            self.reap(dev);
+            self.reap(nic);
             for i in 0..TX_RING {
                 let slot = (self.next + i) % TX_RING;
-                if self.inflight[slot].is_none() {
+                if self.inflight[slot].is_some() {
+                    continue;
+                }
+                // A free `inflight` entry whose lease will not take is a slot
+                // still held elsewhere; skip it rather than spinning on it.
+                if let Some(lease) = TX_ARENA.lease(slot) {
                     self.next = (slot + 1) % TX_RING;
                     if attempt > 0 {
                         TX_STALLS.fetch_add(1, Ordering::Relaxed);
                     }
-                    return Some(slot);
+                    return Some(lease);
                 }
             }
             core::hint::spin_loop();
@@ -368,19 +337,20 @@ impl TxRing {
         None
     }
 
-    /// Submit `total_len` bytes (virtio header included) from `slot`.
+    /// Submit `total_len` bytes (virtio header included) from a claimed slot.
     ///
-    /// Returns whether the device accepted it. On refusal the slot is left free,
-    /// so the next claim can reuse it.
-    pub fn submit(&mut self, dev: &mut NetDev, slot: usize, total_len: usize) -> bool {
-        // SAFETY: `slot < TX_RING`, caller holds `NETWORK`, and the buffer stays
-        // untouched until `reap` completes this token — the borrow
-        // `transmit_begin` requires.
-        let buf = unsafe { core::slice::from_raw_parts(tx_buf(slot), total_len) };
-        match unsafe { dev.transmit_begin(buf) } {
-            Ok(token) => {
-                self.inflight[slot] = Some(token);
-                self.lens[slot] = total_len as u16;
+    /// Returns whether the device accepted it. On refusal the lease is dropped,
+    /// which frees the slot for the next claim — the device never took it.
+    pub fn submit(
+        &mut self,
+        nic: &mut Nic,
+        lease: FrameLease<'static, TX_RING, FRAME_BUF>,
+        total_len: usize,
+    ) -> bool {
+        let slot = lease.slot();
+        match nic.submit_tx(lease, total_len) {
+            Ok((token, lease)) => {
+                self.inflight[slot] = Some((token, lease, total_len as u16));
                 self.submitted[slot] = Some(crate::nicstat::start());
                 // Unconditional: `transmit_begin`'s own notify is suppressible
                 // and nothing here spins to wait the suppression out. See

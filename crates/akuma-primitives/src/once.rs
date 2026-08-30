@@ -1,4 +1,9 @@
 //! Single-shot, lock-free cells for boot-registered values.
+//!
+//! Three shapes, all "written once at boot, used forever after":
+//! [`OnceCopy`] for a `Copy` value read from anywhere, [`Registered`] for a
+//! callback table with a diagnostic, and [`TakeOnce`] for a large `static`
+//! buffer that exactly one owner needs `&'static mut` to.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -274,5 +279,114 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(hits.load(Ordering::Relaxed), 8 * 10_000);
+    }
+}
+
+
+/// A `static` value that exactly one caller may take a `&'static mut` to.
+///
+/// # Why this exists
+///
+/// The alternative is `static mut BUF: [T; N]` plus `unsafe { &mut BUF }` at
+/// the one place that claims it, and the `unsafe` there is load-bearing for a
+/// reason nothing in the code can check: it is sound **only** because the
+/// caller is the sole claimer, which is a property of the whole program rather
+/// than of that statement. A second claim — added later, or on a second core —
+/// is instant UB with no diagnostic.
+///
+/// `TakeOnce` makes the claim itself the check. The first [`Self::take`] hands
+/// back the reference; every later one gets `None`. That converts "there is
+/// only one caller" from a comment into something the type enforces, and the
+/// call site stops being `unsafe` at all.
+///
+/// Used for buffers too large to live in a struct that is built on the kernel
+/// stack — smoltcp's `SocketStorage` table is the motivating case
+/// (`akuma_net::smoltcp_net::init`). For frame buffers that need *repeated*
+/// scoped borrows rather than one permanent one, see `akuma_net::frames`.
+pub struct TakeOnce<T> {
+    taken: AtomicBool,
+    value: UnsafeCell<T>,
+}
+
+// SAFETY: `take` hands out at most one `&'static mut T`, gated by an atomic
+// swap, so no two callers can hold overlapping references. `T: Send` is
+// required because the single reference may be claimed on any core.
+unsafe impl<T: Send> Sync for TakeOnce<T> {}
+
+impl<T> TakeOnce<T> {
+    #[must_use]
+    pub const fn new(value: T) -> Self {
+        Self {
+            taken: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    /// Claim the value. `Some` exactly once for the life of the program.
+    ///
+    /// The `&'static` bound on `self` is what makes the returned lifetime
+    /// honest: only a genuine `static` can hand out a `'static` borrow.
+    ///
+    /// `mut_from_ref` is allowed because the shared-in/mutable-out signature is
+    /// the whole mechanism, not an oversight: the atomic swap is what makes at
+    /// most one such reference exist, and taking `&mut self` instead would need
+    /// a caller who already had exclusive access to the `static` — the exact
+    /// thing this type is here to avoid.
+    #[allow(clippy::mut_from_ref)]
+    pub fn take(&'static self) -> Option<&'static mut T> {
+        if self.taken.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        // SAFETY: the swap above admits exactly one caller past this point for
+        // the life of the program, so this is the only reference that will ever
+        // exist to the cell's contents.
+        Some(unsafe { &mut *self.value.get() })
+    }
+
+    /// Whether the value has been claimed.
+    #[must_use]
+    pub fn is_taken(&self) -> bool {
+        self.taken.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod take_once_tests {
+    use super::TakeOnce;
+
+    #[test]
+    fn the_first_take_wins_and_the_rest_get_none() {
+        static CELL: TakeOnce<[u32; 4]> = TakeOnce::new([0; 4]);
+        assert!(!CELL.is_taken());
+        let first = CELL.take().expect("first take");
+        first[0] = 7;
+        assert!(CELL.is_taken());
+        assert!(CELL.take().is_none(), "a second &mut would be UB");
+        assert!(CELL.take().is_none());
+        assert_eq!(first[0], 7);
+    }
+
+    /// The property that matters under SMP: concurrent claimers, exactly one
+    /// winner. A `static mut` + `unsafe { &mut }` had no such guarantee.
+    #[test]
+    fn concurrent_takes_admit_exactly_one_winner() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CELL: TakeOnce<[u8; 16]> = TakeOnce::new([0; 16]);
+        let winners = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let winners = Arc::clone(&winners);
+            handles.push(std::thread::spawn(move || {
+                if CELL.take().is_some() {
+                    winners.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(winners.load(Ordering::Relaxed), 1);
     }
 }

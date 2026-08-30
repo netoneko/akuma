@@ -486,3 +486,87 @@ mod listener_backlog_tests {
         }
     }
 }
+
+/// `SocketHandle` -> index, checked against the real type instead of assumed.
+///
+/// `smoltcp_net::socket_handle_index` transmutes smoltcp's `SocketHandle` to a
+/// `usize` because the field is private and there is no accessor. The const
+/// assertions at that function check size and alignment, which is not the same
+/// as checking that the *value* is the socket-set index — a future smoltcp
+/// could add a field, reorder, or change `repr` and keep every assertion true
+/// while the function silently returned garbage.
+///
+/// This would be invisible in production and dangerous: five call sites use it
+/// through `is_valid_handle` to decide whether a handle is safe to look up.
+/// So these tests build an actual `SocketSet`, let smoltcp mint the handles,
+/// and hold the function to what smoltcp itself says the index is.
+#[cfg(feature = "smoltcp")]
+mod socket_handle_layout_tests {
+    use crate::smoltcp_net::socket_handle_index;
+    use smoltcp::iface::{SocketSet, SocketStorage};
+    use smoltcp::socket::tcp;
+
+    fn tcp_socket() -> tcp::Socket<'static> {
+        tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+        )
+    }
+
+    /// The property the transmute actually claims: handle N out of a fresh set
+    /// is index N. `SocketSet::add` fills the first free storage slot, so the
+    /// handles come back in order.
+    #[test]
+    fn handle_index_matches_the_socket_sets_own_ordering() {
+        let mut storage = [SocketStorage::EMPTY; 8];
+        let mut set = SocketSet::new(&mut storage[..]);
+        for expected in 0..8 {
+            let h = set.add(tcp_socket());
+            assert_eq!(
+                socket_handle_index(h),
+                expected,
+                "handle {h} should be index {expected} — smoltcp's SocketHandle \
+                 layout changed and the transmute in socket_handle_index is now wrong"
+            );
+        }
+    }
+
+    /// Cross-check against the only accessor smoltcp actually exposes:
+    /// `Display` prints `#{index}`. Independent of the transmute, so if the two
+    /// ever disagree the transmute is what broke.
+    #[test]
+    fn handle_index_agrees_with_smoltcps_display() {
+        let mut storage = [SocketStorage::EMPTY; 4];
+        let mut set = SocketSet::new(&mut storage[..]);
+        for _ in 0..4 {
+            let h = set.add(tcp_socket());
+            let shown = format!("{h}");
+            let from_display: usize = shown
+                .trim_start_matches('#')
+                .parse()
+                .expect("smoltcp SocketHandle Display is `#<index>`");
+            assert_eq!(socket_handle_index(h), from_display);
+        }
+    }
+
+    /// A removed socket's slot is reused, so the index is a slot number and not
+    /// a monotonic counter. `is_valid_handle` bounds-checks against
+    /// `MAX_SOCKETS` on that assumption.
+    #[test]
+    fn a_freed_slot_is_reused_so_the_index_is_a_slot_not_a_counter() {
+        let mut storage = [SocketStorage::EMPTY; 4];
+        let mut set = SocketSet::new(&mut storage[..]);
+        let first = set.add(tcp_socket());
+        let second = set.add(tcp_socket());
+        assert_eq!(socket_handle_index(first), 0);
+        assert_eq!(socket_handle_index(second), 1);
+
+        set.remove(first);
+        let reused = set.add(tcp_socket());
+        assert_eq!(
+            socket_handle_index(reused),
+            0,
+            "a freed slot must come back, or MAX_SOCKETS is not a bound on the index"
+        );
+    }
+}
