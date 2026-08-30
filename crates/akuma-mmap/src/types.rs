@@ -102,6 +102,31 @@ pub mod user_flags {
     pub const fn is_read_only_to_user(flags: u64) -> bool {
         flags & flags::AP_MASK == flags::AP_RO_ALL
     }
+
+    /// Is a page mapped with these flags eligible for the shared file-page cache?
+    ///
+    /// [`is_read_only_to_user`] ANDed with the `SHARED_FILE_PAGES_ENABLED` kill
+    /// switch, which the caller passes in. A writable private file mapping would
+    /// need copy-on-write before sharing, so ELF data segments carrying
+    /// relocations stay private.
+    ///
+    /// **The gate is a parameter, not a config read**, which is what let this
+    /// function live in a crate with an empty `[dependencies]` table. The first
+    /// version of the split left it behind in `akuma-exec` for exactly that
+    /// reason — it was written as `config().shared_file_pages_enabled && …`, and
+    /// a crate that cannot depend on anything cannot read an `ExecConfig`. But
+    /// the config read was never part of the *decision*; it was one boolean the
+    /// decision consumed. Taking it as an argument moves the whole predicate down
+    /// here and leaves the config read at the one call site that owns the switch
+    /// (`src/file_page_cache.rs`).
+    ///
+    /// It also made the tests pure: they pass `true`/`false` instead of
+    /// registering an injectable config, and the `gate == false` case — the kill
+    /// switch actually working — became testable for the first time.
+    #[must_use]
+    pub const fn is_shareable_mapping(flags: u64, shared_file_pages_enabled: bool) -> bool {
+        shared_file_pages_enabled && is_read_only_to_user(flags)
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +179,90 @@ mod tests {
         assert!(!user_flags::is_write(none));
         assert!(!user_flags::is_read_only_to_user(none));
         assert!(user_flags::is_none(none));
+    }
+
+    /// **A non-executable mapping is never shareable.**
+    ///
+    /// This is what makes the merged DA/IA demand-paging body's `is_exec` gate
+    /// inert for `file_page_cache`: both cache calls in that body
+    /// (`lookup_and_ref`'s `want_exec` and `insert`'s `icache_done`) are reached
+    /// only under `is_shareable_mapping`, so if every shareable mapping is also
+    /// executable, they can only ever be called with `is_exec == true` — which is
+    /// exactly what the instruction-abort arm used to hardcode. Sharing requires
+    /// `AP_RO_ALL`, and the only `AP_RO_ALL` values a lazy region can record
+    /// (`from_prot` and `akuma_elf::load::segment_page_flags` are the two
+    /// producers) leave `UXN` clear.
+    ///
+    /// If this ever fails, the `is_exec` gate has become observable in the shared
+    /// cache: `insert(.., false)` would start publishing `icache_done: false` for
+    /// pages that had it `true`. Still the *safe* direction, but a behaviour
+    /// change, so it should be a decision rather than a surprise. See
+    /// `docs/archive/COW_PILE_AUDIT.md` §12.1.
+    #[test]
+    fn non_exec_mappings_are_never_shareable() {
+        for f in [
+            user_flags::NONE,
+            user_flags::RO,
+            user_flags::RX,
+            user_flags::RW,
+            user_flags::RW_NO_EXEC,
+        ] {
+            if !user_flags::is_exec(f) {
+                assert!(
+                    !user_flags::is_shareable_mapping(f, true),
+                    "non-exec mapping {f:#x} must not be shareable"
+                );
+            }
+        }
+        // The two producers of a lazy region's flags, exhaustively.
+        for prot in 0..8u32 {
+            let f = user_flags::from_prot(prot);
+            assert!(
+                user_flags::is_exec(f) || !user_flags::is_shareable_mapping(f, true),
+                "from_prot({prot}) = {f:#x} is shareable but not exec"
+            );
+        }
+    }
+
+    /// With the gate on, the gated form must agree with the pure predicate for
+    /// every flag combination — i.e. the gate adds nothing but the kill switch.
+    #[test]
+    fn gated_shareable_agrees_with_the_predicate_when_enabled() {
+        for f in [
+            user_flags::NONE,
+            user_flags::RO,
+            user_flags::RX,
+            user_flags::RW,
+            user_flags::RW_NO_EXEC,
+        ] {
+            assert_eq!(
+                user_flags::is_shareable_mapping(f, true),
+                user_flags::is_read_only_to_user(f),
+                "{f:#x}"
+            );
+        }
+    }
+
+    /// **The kill switch actually kills.** Untestable until the gate became a
+    /// parameter: proving it needed an injected `ExecConfig` with the flag off,
+    /// and the host tests only ever registered one with it on
+    /// (`register_config_for_test` hardcodes `true`). So the one behaviour
+    /// `SHARED_FILE_PAGES_ENABLED` exists to provide had no test at all.
+    #[test]
+    fn the_kill_switch_makes_every_mapping_unshareable() {
+        for prot in 0..8u32 {
+            assert!(!user_flags::is_shareable_mapping(user_flags::from_prot(prot), false));
+        }
+        for f in [
+            user_flags::NONE,
+            user_flags::RO,
+            user_flags::RX,
+            user_flags::RW,
+            user_flags::RW_NO_EXEC,
+            user_flags::EXEC,
+        ] {
+            assert!(!user_flags::is_shareable_mapping(f, false), "{f:#x}");
+        }
     }
 
     #[test]

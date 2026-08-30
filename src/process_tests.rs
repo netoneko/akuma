@@ -12068,8 +12068,11 @@ fn test_oom_user_page_reserve() {
     use crate::pmm;
 
     // The boundary arithmetic (`user_alloc_would_starve` / `user_readahead_budget`
-    // at 0, at the reserve, and above it) is now host-tested in
-    // `akuma_exec::memmath` — it needed no VM, and asserting it here cost a boot.
+    // at 0, at the reserve, and above it) is now host-tested in `akuma_pmm` — it
+    // needed no VM, and asserting it here cost a boot. (This comment said
+    // `akuma_exec::memmath` until 2026-08-30; that was already stale — the reserve
+    // moved to `akuma-pmm` in PMM_EXTRACT.md §7 Step 6 — and `memmath` no longer
+    // exists at all, see AKUMA_EXEC_SPLIT_AGAIN.md §7.4.)
     // What stays is the part that genuinely needs a live PMM: that the real
     // allocator hands back a usable zeroed frame and that the reserve-exempt
     // path still works. See docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.11.

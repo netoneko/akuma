@@ -223,13 +223,34 @@ pub fn cap() -> usize {
     CAP_PAGES.load(Ordering::Relaxed)
 }
 
-// The eligibility predicate (AP-field test + the `SHARED_FILE_PAGES_ENABLED`
-// gate) lives in `akuma_exec::memmath`, where both halves are host-tested — the
-// gate reaches it through the injectable `ExecConfig` rather than
-// `crate::config`, which is what let the whole function move instead of leaving a
-// wrapper behind (docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.11).
-// Re-exported so `file_page_cache::is_shareable_mapping` call sites are unchanged.
-pub use akuma_exec::memmath::is_shareable_mapping;
+/// Is a page mapped with `map_flags` eligible for the shared file-page cache?
+///
+/// The decision is `akuma_mmap::user_flags::is_shareable_mapping`, which is pure
+/// and host-tested; this is the one place that reads the
+/// `SHARED_FILE_PAGES_ENABLED` kill switch and hands it over.
+///
+/// **Why the read is here and not in the predicate.** It used to be the other way
+/// round: the function lived in `akuma_exec::memmath` and read the gate itself
+/// through an injectable `ExecConfig`, because that injection was the only way to
+/// host-test it (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.11). That coupling is
+/// what stranded it in `akuma-exec` when the rest of `memmath` moved down —
+/// `akuma-mmap` has an empty `[dependencies]` table and cannot read an
+/// `ExecConfig`. Taking the gate as an argument dissolves the problem: the
+/// predicate is pure and testable without any injection, the switch is read at
+/// the boundary that owns it, and `memmath` is gone
+/// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §7.4).
+///
+/// Callers on the fault path should hoist this out of per-page loops —
+/// `akuma_exec::runtime::config()` returns the whole ~45-field struct **by
+/// value**, which is why `exceptions.rs` evaluates it once per fault rather than
+/// up to 512 times.
+#[must_use]
+pub fn is_shareable_mapping(map_flags: u64) -> bool {
+    akuma_exec::mmu::user_flags::is_shareable_mapping(
+        map_flags,
+        akuma_exec::runtime::config().shared_file_pages_enabled,
+    )
+}
 
 /// Look up a cached page and take a reference for a new mapper.
 ///

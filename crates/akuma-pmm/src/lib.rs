@@ -49,9 +49,18 @@
 //!   decision function; Step 6 deleted that duplicate and `alloc_page_zeroed_user`
 //!   now calls the crate's own, permanent `next_reclaim_step`.
 //!
-//! `akuma_exec::memmath` is left holding only the mapping predicates
-//! (`mapping_is_read_only_to_user`, `is_shareable_mapping`) — never PMM concepts,
-//! always `akuma-exec`'s own.
+//! `akuma_exec::memmath` was left holding only the mapping predicates
+//! (`mapping_is_read_only_to_user`, `is_shareable_mapping`) — never PMM concepts.
+//!
+//! **Correction, 2026-08-30:** they were not `akuma-exec`'s own either, and the
+//! module is now gone. Both moved to `akuma_mmap::user_flags`, beside the
+//! `is_write`/`is_exec`/`from_prot` vocabulary they read
+//! (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §7.4). What had kept them up in
+//! `akuma-exec` was the same shape this document describes for the PMM's own
+//! arithmetic: `is_shareable_mapping` read its kill switch from an injectable
+//! `ExecConfig`, so it looked like it needed the execution crate. It needed one
+//! `bool`. Passing the gate as a parameter moved the predicate down and left the
+//! config read at its one call site.
 //!
 //! # Why a leaf crate
 //!

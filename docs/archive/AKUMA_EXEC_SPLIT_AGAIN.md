@@ -516,27 +516,70 @@ became a feature, the crate's only remaining `runtime()` reference was one
 degrade — a stub registration turns inode-backed reads into silent zeros, which
 is the `[FILL-SHORT/prefault]` self-host ICE.
 
-### 7.4 `memmath` split in half; it did not move
+### 7.4 `memmath` is gone — the gate became a parameter
 
-§3.3 said all 71 lines go to `akuma-mmap`. Only one of the two functions could:
-`mapping_is_read_only_to_user` is pure `AP`-field arithmetic and is now
-`akuma_mmap::user_flags::is_read_only_to_user`, beside `is_write`/`is_exec`/
-`from_prot` where it always belonged (it was also carrying a fourth private copy
-of `AP_MASK`, now deleted). `is_shareable_mapping` **stays in `akuma-exec`**: it
-is that predicate ANDed with `config().shared_file_pages_enabled`, and
-`akuma-mmap` has an empty `[dependencies]` table by design, so it cannot read an
-`ExecConfig`. The arithmetic is `akuma-mmap`'s, the kill switch is `akuma-exec`'s,
-and two tests pin the seam.
+§3.3 said all 71 lines go to `akuma-mmap`. The first attempt moved only half and
+left `is_shareable_mapping` behind in `akuma-exec`, on this reasoning: it is the
+pure predicate ANDed with `config().shared_file_pages_enabled`, and `akuma-mmap`
+has an empty `[dependencies]` table by design, so it cannot read an `ExecConfig`.
 
-Writing the move surfaced a real gap in the pair's contract. `is_write` and
+**That reasoning was wrong, and instructively so.** The config read was never part
+of the decision — it was one `bool` the decision consumed. Taking it as an
+argument moves the whole predicate down:
+
+```rust
+// akuma_mmap::user_flags
+pub const fn is_shareable_mapping(flags: u64, shared_file_pages_enabled: bool) -> bool {
+    shared_file_pages_enabled && is_read_only_to_user(flags)
+}
+```
+
+The switch is now read at the single call site that owns it — a small wrapper in
+`src/file_page_cache.rs`, which was *already* the import path both real callers
+(`exceptions.rs`, `process_tests.rs`) went through. So no call site changed,
+`crates/akuma-exec/src/memmath.rs` is **deleted**, and `akuma-exec` loses a module
+rather than keeping a three-line one.
+
+Both moved functions now sit in `akuma_mmap::user_flags` beside `is_write`,
+`is_exec` and `from_prot` — the vocabulary they read. `mapping_is_read_only_to_user`
+became `is_read_only_to_user` and dropped a fourth private copy of `AP_MASK` on
+the way.
+
+**The general shape is worth naming**, because it is the same one this document
+describes for the PMM's arithmetic in `PMM_EXTRACT.md`: *a pure function that
+reads its own configuration looks like it depends on the world.* It does not. It
+depends on a value. Injectable config was originally introduced here to make the
+function host-testable (`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.11) — a real
+improvement at the time — but injection is a heavier tool than a parameter, and
+having reached for it once, the coupling it created is what stranded the function
+two extractions later. **Before adding a hook or an injectable table to a crate
+boundary, check whether the callee could just take the value.**
+
+Two things fell out of the parameter form that the injected form could not have:
+
+1. **The tests became pure.** They pass `true`/`false` instead of calling
+   `register_config_for_test()`.
+2. **The kill switch is tested for the first time.** Proving
+   `SHARED_FILE_PAGES_ENABLED = false` disables sharing needed an injected config
+   with the flag *off*, and `register_config_for_test` hardcodes it **on** — so
+   the one behaviour that switch exists to provide had no test at all.
+   `the_kill_switch_makes_every_mapping_unshareable` is now that test.
+
+Writing the move also surfaced a real gap in the pair's contract. `is_write` and
 `is_read_only_to_user` are **mutually exclusive but not exhaustive** — `AP` has
 three EL0-reachable values, and the third (`AP_RO_EL1` = `user_flags::NONE`, the
 `PROT_NONE` encoding) answers `false` to both. Code reaching for `!is_write(..)`
 as a stand-in for the sharing predicate would wrongly treat a `PROT_NONE` page as
 shareable. Neither function had a test tying them together while they lived in
 different crates; `write_and_read_only_are_exclusive_but_not_exhaustive` is now
-that test. (The first version of it asserted complementarity and failed
-immediately on `from_prot(0)` — which is how the gap was found.)
+that test. (Its first version asserted complementarity and failed immediately on
+`from_prot(0)` — which is how the gap was found.)
+
+Two stale docs were corrected in the same pass, both pre-dating this change:
+`akuma-pmm`'s header claimed `memmath` still held the mapping predicates and that
+they were "always `akuma-exec`'s own"; and a comment in `process_tests.rs` pointed
+the user-page-reserve arithmetic at `akuma_exec::memmath`, which had already moved
+to `akuma-pmm` in `PMM_EXTRACT.md` §7 Step 6.
 
 ### 7.5 The `[AS-*]` trace lost its runtime half, deliberately
 
@@ -557,7 +600,7 @@ LLVM delete the caller's `format_args!` construction too.
 
 | gate | result |
 |---|---|
-| host tests | **1,019 pass**, 28 test binaries, 0 failures |
+| host tests | **1,020 pass**, 28 test binaries, 0 failures |
 | per-crate `clippy -- -D warnings` (all 28) | clean |
 | `clippy --release`, `clippy --profile extreme-size` | clean |
 | `cargo build --release` | builds |
@@ -567,7 +610,7 @@ LLVM delete the caller's `format_args!` construction too.
 Test counts reconcile exactly, which is the check that nothing was silently
 dropped: `akuma-exec` 219 -> 155, and 38 + 15 + 11 = 64 appear in
 `akuma-bkl` / `akuma-elf` / `akuma-mmu`. `akuma-isolation` 43 -> 75 (box's 32),
-`akuma-mmap` 32 -> 35 (the three new predicate tests).
+`akuma-mmap` 32 -> 38 (the moved predicate + gate tests, plus three new ones).
 
 **On booting under HVF:** the first run died with
 `Assertion failed: (isv), function hvf_handle_exception, hvf.c:2437`. That is not

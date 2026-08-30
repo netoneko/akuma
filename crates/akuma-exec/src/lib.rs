@@ -108,7 +108,6 @@ pub mod test_support;
 /// because its eight process references were the whole of the old `mmu <-> process`
 /// cycle.
 pub use akuma_mmu as mmu;
-pub mod memmath;
 /// The ELF loader — **moved to `akuma-elf` on 2026-08-30**
 /// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.2). Re-exported under the old
 /// name so `process::image`'s three call sites and
