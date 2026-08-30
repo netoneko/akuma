@@ -2059,7 +2059,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         Ok(())
     }
 
-    fn read_inode(&self, state: &Ext2State, inode_num: u32) -> Result<Inode, FsError> {
+    /// `pub(crate)` for `mod tests`, which reads a record back the way `e2fsck`
+    /// does — see [`Ext2Filesystem::remove_dir`]. Not reachable outside the crate.
+    pub(crate) fn read_inode(&self, state: &Ext2State, inode_num: u32) -> Result<Inode, FsError> {
         if inode_num == 0 {
             return Err(FsError::NotFound);
         }
@@ -3034,7 +3036,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // Path Resolution
     // ========================================================================
 
-    fn lookup_path(&self, path: &str) -> Result<u32, FsError> {
+    /// `pub(crate)` for `mod tests`; not reachable outside the crate.
+    pub(crate) fn lookup_path(&self, path: &str) -> Result<u32, FsError> {
         // Block for read lock. try_lock + IoError under concurrent writers caused
         // spurious EIO on /tmp (forktest combined_stress): readers starved while
         // another thread held write_state. Orphaned write locks are recovered in
@@ -3639,6 +3642,19 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
         // Free blocks
         self.truncate_inode(&mut state, &mut inode)?;
+        // A directory carries `hard_links = 2` while it exists (`.` plus the
+        // parent's entry). Both are gone now, so the record must say so before
+        // the number returns to the allocator: `e2fsck` reads a `links_count`
+        // that survives a set `dtime` as corruption ("in use, but has dtime
+        // set"), and every `rmdir` used to leave one behind — 15 of them in a
+        // single `ext2probe-host` run, reproducible on the host after an
+        // explicit `sync()`. `unlink` never had the bug because its caller
+        // decrements to zero before `release_last_link` writes the inode
+        // (see `Self::unlink`); this path only ever decremented the *parent's*
+        // count. `docs/archive/BKL_VFS_CARVE_OUT.md` §12.4 attributed the same
+        // signature to a dirty bitmap block lost to a `kill`; that reading is
+        // superseded — see `docs/archive/AKUMA_EXT2_CLEANUP.md` §6.1.
+        inode.hard_links = 0;
         inode.deletion_time = self.current_time();
         self.write_inode(&state, inode_num, &inode)?;
 

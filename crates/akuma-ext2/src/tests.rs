@@ -230,6 +230,47 @@ fn remove_dir_works() {
     assert!(!fs.exists("/rmdir"));
 }
 
+/// `rmdir` must leave the freed inode's on-disk record claiming **zero** links.
+///
+/// A directory lives with `hard_links = 2` (`.` plus the parent's entry).
+/// `remove_dir` set `deletion_time` and returned the number to the allocator
+/// but never zeroed the count, so every `rmdir` left a record that `e2fsck`
+/// reads as corruption: *"inode N is in use, but has dtime set"*, which then
+/// cascades into "zero-length directory" and "unconnected directory". Found
+/// 2026-08-31 by `e2fsck`-ing `ext2probe-host`'s post-`sync()` image (15
+/// leaked inodes in one run, and identically so on the pre-codec baseline —
+/// `docs/archive/AKUMA_EXT2_CLEANUP.md` §6.1).
+///
+/// Read back through [`Inode::parse`] off the device rather than through the
+/// live `Inode` value, because the on-disk record is the only thing `e2fsck`
+/// ever sees.
+#[test]
+fn remove_dir_zeroes_the_directorys_link_count() {
+    // A real clock, not `mount_empty`'s `|| 0`: what `e2fsck` rejects is the
+    // *pairing* of a set `dtime` with a nonzero `links_count`, so a fixture
+    // whose `dtime` is always 0 cannot express the bug.
+    let fs = Ext2Filesystem::new(load_fixture("test.ext2"), || 1_700_000_000_000_000).unwrap();
+    fs.create_dir("/gone").unwrap();
+    let ino = fs.lookup_path("/gone").unwrap();
+
+    {
+        let state = fs.state.read();
+        let live = fs.read_inode(&state, ino).unwrap();
+        assert_eq!(live.hard_links, 2, "a fresh directory has `.` + parent");
+    }
+
+    fs.remove_dir("/gone").unwrap();
+
+    let state = fs.state.read();
+    let dead = fs.read_inode(&state, ino).unwrap();
+    assert_ne!(dead.deletion_time, 0, "rmdir must stamp dtime");
+    assert_eq!(
+        dead.hard_links, 0,
+        "a freed directory's record must not still claim links (e2fsck: \
+         \"in use, but has dtime set\")"
+    );
+}
+
 // ── Metadata ────────────────────────────────────────────────────────
 
 #[test]

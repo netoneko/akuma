@@ -919,6 +919,17 @@ path the same way → gone. Both deletion paths remove real files, and the 64 Mi
 
 ### 12.4 `e2fsck` finding: pre-existing durability bug, NOT a carve-out regression
 
+> **Corrected 2026-08-31.** The verdict below — *not a carve-out regression,
+> not a concurrency tear, reproduced at SMP=1* — stands. The **cause** named in
+> the last paragraph does not. It is not a dirty inode-bitmap block discarded
+> when QEMU was `kill`'d: `Ext2Filesystem::remove_dir` never zeroed the
+> directory's own `hard_links`, so every `rmdir` left a freed inode whose
+> record still claimed two links, which is precisely what *"in use, but has
+> dtime set"* reports. Reproduced deterministically on the host — after an
+> explicit `sync()` that reported zero remaining writes, on a freshly
+> `mke2fs`'d image, with no VM to kill — and fixed the same day. See
+> `docs/archive/AKUMA_EXT2_CLEANUP.md` §6.2.
+
 Post-campaign `e2fsck -fp devbox.img` flagged two directory inodes as *"in use, but has dtime
 set"* + *"zero-length directory"* (beyond the standing cosmetic HTREE warning). These were the
 `/tmp/delme` + `/tmp/delme/sub` the verify script `rm -rf`'d. Looked serious, so it was

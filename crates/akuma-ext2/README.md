@@ -670,6 +670,28 @@ cargo run -p ext2probe --bin ext2probe-host \
   --no-default-features --features host-probe --target "$HOST" -- ../disk.img
 ```
 
+#### `--dump`: `e2fsck` the driver's own output, with no VM
+
+`--dump PATH` writes the post-workload, **post-`sync()`** image out, so
+`e2fsck -fn` can check what this crate actually wrote. That is the check that
+catches a bad offset, and unlike an `e2fsck` after a QEMU run it has no
+unclean-shutdown confound in it — the write-back cache is flushed and the dump
+happens after.
+
+```bash
+dd if=/dev/zero of=/tmp/pristine.img bs=1m count=512
+mkfs.ext2 -F -b 4096 -L AKUMA /tmp/pristine.img && e2fsck -fn /tmp/pristine.img
+cargo run --release -p ext2probe --bin ext2probe-host \
+  --no-default-features --features host-probe --target "$HOST" \
+  -- /tmp/pristine.img --dump /tmp/after.img
+e2fsck -fn /tmp/after.img       # must exit 0
+```
+
+Start from a fresh `mke2fs` image, not `disk.img`: a long-lived `disk.img`
+carries accumulated damage from past hard kills and cannot answer the question.
+This is how the `rmdir` link-count leak was found and fixed on 2026-08-31
+(`docs/archive/AKUMA_EXT2_CLEANUP.md` §6.2).
+
 A third binary, `ext2probe-stdfs` (`--features std-probe`), runs the same
 workload shapes against the host OS filesystem via `std::fs` — the real-Linux
 reference numbers above come from running it in a Docker container against ext2

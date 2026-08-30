@@ -395,6 +395,77 @@ model checker adds exhaustion where the old code had one live-VM race path.
   the regression test lives in the new crate's suite (§4.7) and the wiring step
   must show it failing on the old path and passing on the new one.
 
+### 6.1 Verification run, 2026-08-31 — steps 1–3 carry no regression
+
+Run against `4f3cf79c` (steps 1–3 landed; `akuma-locks-rw` still unwired), with
+`b9ea61e0` — the commit **before** the codec (`a463585d`) — as the baseline arm.
+Note the baseline is not `HEAD~1`: `6f143f98` and `4f3cf79c` only add the lock
+crate and docs, and nothing imports the crate yet, so diffing against them would
+have compared the codec to itself.
+
+| check | result |
+|---|---|
+| `cargo test -p akuma-ext2` | 99 pass / 0 fail (100 after §6.2) |
+| `cargo test -p akuma-locks-rw` | 17 pass / 0 fail (model checker + API) |
+| `verify_trim.py --tier 1` | clippy clean on all four feature sets; 1064 host tests, 0 fail |
+| `verify_trim.py --tier 2`, A/B'd against `b9ea61e0` | **summaries identical**, every key: `pass_marker` 100/100, `fail_set` empty, all 16 exercises `ok`, at both SMP=1 and SMP=4 |
+| `ext2probe-host`, A/B'd against `b9ea61e0` | **every device-I/O counter identical**; the two dumped images differ in **3 bytes** — the pid digits in the probe's own `/ioprobe_<pid>` name |
+| counters vs `crates/akuma-ext2/README.md` | match the recorded `+write-back` column (create 8.0 wr/file, 2 MB write 3.1x, delete 7.0 wr/file, flat dir O(1), 0 reads on a warm `stat`) |
+
+A byte-identical on-disk image across a mixed 3200-file workload is a stronger
+statement than any count: the explicit parse/serialize codec reproduces the
+struct blits exactly.
+
+**`e2fsck` without a VM.** §6 asks for an `e2fsck` after a write-heavy run, and
+until now that meant booting, working the guest, killing QEMU and reading the
+damage — which confounds a codec bug with the write-back cache's
+no-sync-on-shutdown behaviour (`BKL_VFS_CARVE_OUT.md` §12.4). `ext2probe-host`
+now takes `--dump PATH`, writing the post-workload, **post-`sync()`** image out;
+`e2fsck -fn` on that has no VM, no kill and no dirty-cache confound in it. That
+is the check that actually catches a bad offset, and it runs in seconds:
+
+```bash
+cd userspace && HOST=$(rustc -vV | grep '^host:' | cut -d' ' -f2)
+cargo run --release -p ext2probe --bin ext2probe-host \
+  --no-default-features --features host-probe --target $HOST \
+  -- pristine.img --dump after.img
+e2fsck -fn after.img            # must exit 0
+```
+
+Start from a freshly `mke2fs`'d image (`-F -b 4096 -L AKUMA`, `e2fsck`-clean),
+not `disk.img` — a long-lived `disk.img` carries its own accumulated damage from
+past hard kills (`docs/README.md`, the `devbox.img` row) and cannot answer this
+question.
+
+### 6.2 What that `e2fsck` found: `rmdir` leaked a link count. Fixed 2026-08-31
+
+The first clean-image run reported **15 directory inodes** as *"inode N is in
+use, but has dtime set"*, cascading into *"zero-length directory"*,
+*"unallocated block #0"* and *"unconnected directory"*. The baseline arm
+reported the identical 15, so the codec was exonerated immediately — but the
+bug is real, and the deterministic host repro is what made it readable.
+
+`Ext2Filesystem::remove_dir` set `deletion_time`, wrote the inode and freed the
+number, but **never zeroed the directory's own `hard_links`**. It decremented
+only the *parent's*. A directory lives at `hard_links = 2` (`.` plus the
+parent's entry), so every `rmdir` left a freed inode whose on-disk record still
+claimed two links — exactly the pairing `e2fsck` treats as corruption. `unlink`
+never had it: its caller decrements to zero before `release_last_link` writes
+the record.
+
+One line (`inode.hard_links = 0;`) plus a crate test
+(`remove_dir_zeroes_the_directorys_link_count`, which fails `left: 2, right: 0`
+without the fix). After: `e2fsck -fn` on the dumped image **exits 0, no
+findings**, with identical file and block totals (2021 files, 4691 blocks) and
+**identical device-I/O counters** — the fix costs nothing.
+
+This supersedes `BKL_VFS_CARVE_OUT.md` §12.4, which attributed the same
+signature to an inode-bitmap block left dirty in the write-back cache and
+discarded when QEMU was `kill`'d. That reading cannot hold here: `sync()` ran,
+reported zero remaining writes, and the image was dumped afterward. §12.4's own
+decisive test (reproduced at SMP=1) was right that it is neither a concurrency
+tear nor a BKL effect; the cause is simply in `remove_dir`.
+
 ## Background
 
 - `docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §7.9, §8.6, §8.8 — the three prior

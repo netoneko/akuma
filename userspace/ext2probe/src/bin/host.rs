@@ -5,10 +5,13 @@
 //!
 //!   cargo run -p ext2probe --bin ext2probe-host \
 //!     --no-default-features --features host-probe \
-//!     --target "$(rustc -vV | grep '^host:' | cut -d' ' -f2)" -- [ext2-image]
+//!     --target "$(rustc -vV | grep '^host:' | cut -d' ' -f2)" -- [ext2-image] [--dump out.img]
 //!
 //! Default image: `disk.img` at the repo root. It is copied into RAM; the file
-//! on disk is not modified. Full analysis: `crates/akuma-ext2/README.md`.
+//! on disk is not modified. `--dump PATH` writes the post-workload, post-`sync`
+//! image to `PATH` so it can be `e2fsck -fn`'d — the check that actually catches
+//! a bad offset in the on-disk codec (`docs/archive/AKUMA_EXT2_CLEANUP.md` §6),
+//! with no VM and no unclean-shutdown confound.
 
 use ext2probe::host::{HostFsOps, Snap, REGIONS};
 use ext2probe::{workload, FsOps, BASE_N, FILE_SIZE, SEQ_BYTES, SEQ_CHUNK};
@@ -35,8 +38,19 @@ fn report(title: &str, d: Snap) {
 }
 
 fn main() {
-    let img_path = std::env::args()
-        .nth(1)
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut dump: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut it = argv.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dump" => dump = Some(it.next().expect("--dump needs a path")),
+            _ => positional.push(a),
+        }
+    }
+    let img_path = positional
+        .into_iter()
+        .next()
         .unwrap_or_else(|| repo_root().join("disk.img").to_string_lossy().into_owned());
     let bytes = std::fs::read(&img_path)
         .unwrap_or_else(|e| panic!("read {img_path}: {e}\n(pass an ext2 image, or run scripts/create_disk.sh)"));
@@ -139,6 +153,11 @@ fn main() {
     ops.sync();
     let d = snap() - a;
     report("[8] sync():", d);
+
+    if let Some(path) = dump {
+        std::fs::write(&path, ops.image_bytes()).unwrap_or_else(|e| panic!("write {path}: {e}"));
+        println!("\nwrote post-workload image to {path} (e2fsck -fn it)");
+    }
 }
 
 fn repo_root() -> std::path::PathBuf {

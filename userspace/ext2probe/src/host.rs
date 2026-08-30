@@ -170,7 +170,9 @@ impl std::ops::Sub for Snap {
 }
 
 struct CountingDev {
-    data: Mutex<Vec<u8>>,
+    /// Shared with [`HostFsOps`] so the post-workload image can be written out
+    /// for `e2fsck` — `Ext2Filesystem` owns its device and exposes no accessor.
+    data: Arc<Mutex<Vec<u8>>>,
     geom: Geom,
     c: Arc<Counters>,
 }
@@ -209,6 +211,8 @@ pub struct HostFsOps {
     fs: Ext2Filesystem<CountingDev>,
     pub counters: Arc<Counters>,
     pub geom: Geom,
+    /// The same buffer `CountingDev` writes through — see [`Self::image_bytes`].
+    image: Arc<Mutex<Vec<u8>>>,
 }
 
 impl HostFsOps {
@@ -216,13 +220,27 @@ impl HostFsOps {
     pub fn mount(image_bytes: Vec<u8>) -> HostFsOps {
         let geom = Geom::parse(&image_bytes);
         let counters = Arc::new(Counters::default());
+        let image = Arc::new(Mutex::new(image_bytes));
         let dev = CountingDev {
-            data: Mutex::new(image_bytes),
+            data: image.clone(),
             geom,
             c: counters.clone(),
         };
         let fs = Ext2Filesystem::new(dev, || 1_700_000_000_000_000).expect("mount ext2");
-        HostFsOps { fs, counters, geom }
+        HostFsOps {
+            fs,
+            counters,
+            geom,
+            image,
+        }
+    }
+
+    /// The image as the driver has written it. Call after [`Self::sync`] and
+    /// `e2fsck -fn` the result: a bad offset in the on-disk codec shows up as a
+    /// filesystem error with no VM, no boot and no unclean-shutdown confound
+    /// (`docs/archive/AKUMA_EXT2_CLEANUP.md` §6).
+    pub fn image_bytes(&self) -> Vec<u8> {
+        self.image.lock().unwrap().clone()
     }
 
     pub fn sync(&self) {
