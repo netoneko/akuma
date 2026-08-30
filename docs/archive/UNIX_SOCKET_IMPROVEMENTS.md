@@ -537,7 +537,8 @@ the milestone the probe verifies first.
 ## 5. Host tests
 
 `crates/akuma-net/src/unix_tests.rs`, registered from `lib.rs` under `#[cfg(test)]`
-next to the existing `tests`/`lock_tests` modules, run by the documented command:
+next to the existing `tests` module (there was a `lock_tests` too until it was
+deleted 2026-08-30), run by the documented command:
 
 ```bash
 cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)

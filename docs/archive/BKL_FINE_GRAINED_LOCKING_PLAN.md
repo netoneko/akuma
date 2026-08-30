@@ -120,7 +120,10 @@ This plan breaks up the Big Kernel Lock (BKL) into fine-grained subsystem locks,
    - Performance baseline measurements
 
 ### Deliverables
-- [ ] `crates/akuma-net/src/locks.rs` with lock definitions
+- [x] ~~`crates/akuma-net/src/locks.rs` with lock definitions~~ — written, never
+  wired, **deleted 2026-08-30**. Phase 2 shipped `PreemptGuard` + the existing
+  `NETWORK`/`SOCKET_TABLE` spinlocks instead; see
+  [`REDIS_ROUND_TRIP_STAGE_TRACE.md`](REDIS_ROUND_TRIP_STAGE_TRACE.md) §2.
 - [ ] Profiling integration with existing BKL profiler
 - [ ] Lock hierarchy documentation
 - [ ] Network lock contention tests

@@ -60,8 +60,6 @@ pub mod dns;
 // `rump_server` answers every proxied syscall over a `UnixSocket` at fd 3.
 // Contains no smoltcp references. See docs/archive/UNIX_SOCKET_IMPROVEMENTS.md.
 pub mod unix;
-// Lock infrastructure for fine-grained locking (Phase 1 of BKL removal)
-pub mod locks;
 // Device-level traffic/latency counters. Always compiled (the module's public
 // API is the same either way); the counters themselves only exist under the
 // `net-profile` feature.
@@ -70,8 +68,6 @@ pub mod nicstat;
 
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod lock_tests;
 #[cfg(test)]
 mod unix_tests;
 

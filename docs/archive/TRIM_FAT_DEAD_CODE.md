@@ -38,6 +38,15 @@ fact rather than folded into the findings above:
   the accessors are dead by this doc's own test-only-caller definition
   anymore. (Caught this the hard way: almost deleted `lock_tests.rs` per this
   doc's stale claim before `git log -p` on `lib.rs` turned up `a4b35ba`.)
+  **Resolved 2026-08-30: the whole module is deleted** — `locks.rs` *and*
+  `lock_tests.rs`, 504 lines. The near-miss above was real but is a different
+  question: `lock_tests.rs` alone should not have gone, because it covered code
+  that still existed. Removing *both* together does not hit that trap, and the
+  "tests keep it alive" argument is circular once the tests are the only
+  consumer. The open decision in §"doc comment describes a caller that doesn't
+  exist" below is settled the second way it offers — delete, don't wire up —
+  because the machinery could not have worked: see
+  [`REDIS_ROUND_TRIP_STAGE_TRACE.md`](REDIS_ROUND_TRIP_STAGE_TRACE.md) §2.
 - **`akuma-vfs/src/memfs.rs::with_max_size`** — kept, deliberately not deleted.
   Unlike the items above, this isn't unwired scaffolding for an abandoned
   path — it's a correct constructor with real test coverage

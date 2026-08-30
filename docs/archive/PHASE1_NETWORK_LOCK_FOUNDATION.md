@@ -1,6 +1,16 @@
 # Network Lock Foundation - Phase 1 Implementation Notes
 
-**Status**: ✅ COMPLETE  
+**Status**: ⚠️ **SUPERSEDED — code deleted 2026-08-30.** The "COMPLETE" below
+means the scaffolding was written, not that it was ever used: Phase 2 took a
+different route (`PreemptGuard` plus the existing `NETWORK`/`SOCKET_TABLE`
+spinlocks under `no-bkl-network`), nothing ever called this module, and it could
+not have worked as written — the acquire helpers dropped the spinlock guard at
+function return. Deleted with `lock_tests.rs`; the analysis is preserved in
+[`REDIS_ROUND_TRIP_STAGE_TRACE.md`](REDIS_ROUND_TRIP_STAGE_TRACE.md) §2 and the
+deletion is recorded in [`AKUMA_NET_SPLIT.md`](AKUMA_NET_SPLIT.md) §1.2.
+Read the rest of this document as a design record only.
+
+**Original status**: ✅ COMPLETE  
 **Date**: 2026-07-24  
 **Part of**: BKL Fine-Grained Locking Plan - Phase 1
 

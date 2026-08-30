@@ -133,10 +133,16 @@ For a given syscall or subsystem:
    and holding a coarse lock across that yield serializes *everything* behind
    one blocked call, which is strictly worse than the BKL (which *is* dropped
    during the wait). Instead, drop the BKL for the syscall's duration and rely
-   on the fine-grained locks that state already has. If a coarse
-   ordering-enforcement scaffold exists (`akuma_net::locks::NETWORK_LOCK`),
-   treat it as documentation/host-test-only, not a hot-path primitive, unless
-   it's been proven to survive a blocking wait.
+   on the fine-grained locks that state already has. A coarse
+   ordering-enforcement scaffold (`akuma_net::locks`) existed for this until
+   **2026-08-30**, when it was deleted: nothing ever called it, and it could not
+   have worked — `acquire_network_lock` bound the spinlock to a `_guard` that
+   dropped at function return, so it granted no exclusion at all, and its
+   `HELD_LOCKS` ordering state was one global `AtomicU32` that two cores would
+   corrupt under `smp-shared`. If you are tempted to rebuild it, read
+   [`../../archive/REDIS_ROUND_TRIP_STAGE_TRACE.md`](../../archive/REDIS_ROUND_TRIP_STAGE_TRACE.md)
+   §2 first — it preserves the code and measures why finer granularity is the
+   wrong lever here.
 3. **Write a boot self-test that drives the real syscall entry point**
    (`handle_syscall(...)`), covering: the on-disk work happening inside the
    window, dirfd/cwd-relative resolution, early-error paths staying balanced,

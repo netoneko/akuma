@@ -107,6 +107,12 @@ rather than per-thread, so on `smp-shared` two cores corrupt each other's bits.
 `LOCK_LEVEL_SOCKET` has no lock object behind it at all. It is Phase-1
 scaffolding that was never wired up.
 
+> **Update 2026-08-30: `locks.rs` and `lock_tests.rs` are deleted** (504 lines).
+> Every one of their 15 public symbols had zero references repo-wide. This
+> section is now the surviving record of what they contained and why rebuilding
+> them is not the fix — the quoted snippet above is deliberately kept for that
+> reason. See [`AKUMA_NET_SPLIT.md`](AKUMA_NET_SPLIT.md) §1.2.
+
 Three reasons finer granularity is the wrong lever, in increasing order of
 finality:
 
