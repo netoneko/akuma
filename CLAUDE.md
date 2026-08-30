@@ -10,8 +10,8 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 - `crates/` — Host-testable extracted crates:
   `akuma-{exec,ext2,firecracker,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
   plus the `akuma-syscalls*` family below.
-  **18 of the 25 carry `#![forbid(unsafe_code)]`** — which crates, and why the
-  other seven cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
+  **21 of the 31 carry `#![forbid(unsafe_code)]`** — which crates, and why the
+  other ten cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
   with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).
   The **syscall family** is three layers, leaf-first and named so the
   layering is visible — an ABI crate, a shape crate, and one crate per syscall
@@ -128,6 +128,16 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   subsystems/syscalls/poll.md` § "The wait loop is one machine"). The crate also
   carries a differential test against the pre-extraction `wait_until`; keep that
   oracle in the shipped loop's shape rather than tidying it.
+  `akuma-locks-rw` is the recoverable reader/writer lock for orphaned-lock
+  recovery (2026-08-30, `docs/archive/AKUMA_EXT2_CLEANUP.md` §4): release **is**
+  abandon — the sweep for a dead holder performs the same CAS-guarded operation
+  a legitimate release performs, so a `panic = "abort"` kill can never wedge a
+  mount permanently. Carries no value (that is what lets it forbid `unsafe` — a
+  consumer composes its own `UnsafeCell<T>` against the tickets) and no global
+  registry (each lock is swept by its owner via `abandon_tid`; wiring is §5
+  step 4, not done yet — `akuma-ext2`'s three `force_unlock_write` sites still
+  stand). Host-tested by an exhaustive model checker on the `akuma-bkl`
+  `bkl_model.rs` pattern.
   `akuma-scheduler` models scheduler placement / netpoll wake policies so a
   candidate can be ranked in a second instead of a devbox boot
   (`docs/archive/AKUMA_SCHEDULING_EXTRACTION.md`). The simulator core (`lib.rs`)

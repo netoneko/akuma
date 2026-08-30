@@ -5,6 +5,34 @@ every claim in §1–§4.2 was checked against the source; §4.2a's finding stan
 but its fix, and all of §4.3–§4.7, are superseded by the reap-based design in
 §4.5 below. The lock crate lands **without** wiring; adoption is a separate step.
 
+**Landed 2026-08-30 (steps 1–3 of §5).** The layout assertions (step 1) and the
+explicit parse/serialize codec (step 2 — all 14 blit sites plus the §3 symlink
+pair, with the §2.3 mount validation) are in `akuma-ext2`, which fell from 18
+production `unsafe` sites to 2 (+1 in `cfg(test)`); the residual three are the
+lock sites, untouched until step 4. Round-trip and corrupt-image rejection
+tests live in `crates/akuma-ext2/src/tests.rs` (`cargo test -p akuma-ext2`, 99
+green). The lock crate (step 3) landed as **`akuma-locks-rw`** with
+`#![forbid(unsafe_code)]` and the `bkl_model.rs`-pattern model checker — with
+two deliberate deviations from §4.5, both resolving in the direction of the
+§8 law:
+
+- **The lock carries no `T`.** §4.5 sketches `RecoverableRwLock<T>` behind
+  `forbid`, which stable Rust cannot express (minting `&mut T` from `&self`
+  needs an `UnsafeCell` deref). The protocol is value-free and pure atomics;
+  a consumer composes its own `UnsafeCell<T>` against the tickets, where the
+  exclusivity proof lives beside the value's owner.
+- **No global registry, no free `reap_tid(i)` sweep.** Enumerating locks is
+  the business of whoever owns them (the VFS mount table); wiring (step 4)
+  registers one reaper hook — the `init_inode_freed_hook` shape — whose body
+  calls each mount's `lock.abandon_tid(i)`. The crate allocates nothing and
+  depends on no allocator; every host test is a fresh instance.
+
+Two additions the sketch implied but did not name: a writer-priority bit
+(`WWAIT`, re-asserted per failed attempt, with a ghost-heal in the read loop)
+and a floor-guarded two-step reader-hold publication so a sweep racing an
+acquisition cannot underflow. Boot-suite (`verify_trim.py`) and `e2fsck`
+verification ran separately; §6 tracks them.
+
 Follow-on from `docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md`, which took `akuma-bkl`
 and `akuma-elf` from "irreducible" to `#![forbid(unsafe_code)]` and `akuma-pmm`
 from 5 sites to 3. `akuma-ext2` is the next-largest non-enforced crate that is

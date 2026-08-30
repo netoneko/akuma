@@ -113,7 +113,8 @@ the `crates/` row and the tree sum are the evening run's.)
 
 `src/`'s boot suite holds 113 of those 145 on its own (`tests.rs` 79,
 `process_tests.rs` 27, `sync_tests.rs` 7) — the in-kernel tests build page
-tables and forge trap frames by hand, which is the job.
+tables and forge trap frames by hand, which is the job. Production density is
+**9.7 sites per kloc of production code**.
 
 `crates/`'s *test* `unsafe` fell 29 -> 16 on 2026-08-30: 12 of those were
 `akuma-syscalls-linux`'s layout transmutes, rewritten as `offset_of!`.
@@ -143,12 +144,12 @@ It is measured against `crates/` only, and **this document has never counted
 
 | scope | total code | in enforced-safe crates | |
 |---|---:|---:|---:|
-| `crates/` | 42,912 | 19,461 | 45.4% |
-| `crates/` + `src/` | 87,186 | 19,461 | **22.3%** |
-| production only (no test code) | 51,513 | 9,294 | **18.0%** |
+| `crates/` | 44,205 | 20,296 | 45.9% |
+| `crates/` + `src/` | 88,492 | 20,296 | **22.9%** |
+| production only (no test code) | 52,759 | 11,966 | **22.7%** |
 
 And `src/` carries **315 `unsafe` sites** — none of which appear in either table
-above. The second table's 328 is the `crates/` production subtotal, not the
+above. The second table's 312 is the `crates/` production subtotal, not the
 kernel's.
 
 Two things follow. The enforced-safe crates are numerous but *small*, because the
@@ -157,7 +158,7 @@ property is easiest to keep in a leaf. And the honest headline for the tree is
 up one leaf at a time, but it starts from a bin crate that is a large share of
 the codebase.
 
-Two jumps in one day, both on **2026-08-30**:
+Two jumps in one day, all on **2026-08-30**:
 
 - Emptying `akuma-net` of `unsafe` (the device layer left for `akuma-net-nic`,
   and the two `SocketHandle` transmutes were deleted outright) took `crates/`
@@ -167,6 +168,11 @@ Two jumps in one day, both on **2026-08-30**:
   tree-wide 18.5% -> **22.3%**. That crate went from 209 `unsafe` sites to 128,
   and two of the crates carved out of it — `akuma-bkl` and `akuma-elf` — reached
   `forbid` after first being judged irreducible.
+- The ext2 on-disk codec (`AKUMA_EXT2_CLEANUP.md` §5 steps 1–2) emptied
+  `akuma-ext2`'s blit and symlink families — 16 of its 18 production sites — and
+  the orphaned-lock protocol landed as `akuma-locks-rw` (§5 step 3): enforced
+  crates 20 -> 21, `crates/` 45.4% -> **45.9%**, tree-wide 22.3% -> **22.9%**.
+  ext2's residual sites are the lock-recovery ones §5 step 4 removes.
 
 ## Not enforceable, and why
 
@@ -201,7 +207,7 @@ mention it, 221 are real sites, and the two errors happened to partly cancel.
 | `akuma-virtio` | 38 | MMIO and DMA by definition |
 | `akuma-net-nic` | 23 | DMA-visible frame arenas, virtio descriptor rings, the NIC MMIO doorbell, and smoltcp's `Device` impls |
 | `akuma-cpu` | 19 | `asm!` is unconditionally unsafe; the crate exists so ~160 tree-wide sites don't each have to say so |
-| `akuma-ext2` | 18 | `repr(C)` on-disk structures read through raw byte buffers — **14 of 18 are reducible**, see [`AKUMA_EXT2_CLEANUP.md`](../archive/AKUMA_EXT2_CLEANUP.md) |
+| `akuma-ext2` | 2 (prod; +1 in `cfg(test)`) | the orphaned-lock recovery: `force_unlock_write` on a third-party `RwSpinlock`. The on-disk blits (14) and the symlink pair (2) left on 2026-08-30 for the explicit codec (`AKUMA_EXT2_CLEANUP.md` §5 steps 1–2); the lock sites leave at step 4, when `akuma-locks-rw` is adopted and the three poll loops collapse into it |
 | `akuma-primitives` | 14 | IRQ masking, per-CPU registers, the console writer |
 | `akuma-timer` | 8 | CNTV/PL031 register access |
 | `akuma-not-even-once` | 5 | `UnsafeCell` boot-registration cells; the safe alternative (`Spinlock<Option<T>>`) is a lock on the hottest indirection in the kernel |
