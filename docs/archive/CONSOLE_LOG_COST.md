@@ -394,6 +394,124 @@ prefixes `[T{s}.{cs}]` and then writes every byte, exactly like `safe_print!`.
 It is not throttled, and nothing in the tree is. There is no cheap console
 print; the choice is whether to print at all.
 
+## 13. Follow-on 2026-08-30: the rest of the flood, measured A/B on a guest build
+
+§7 said the errno diag "was the only default-on trace writing to the console on a
+per-call path userspace can drive". §8's audit said every remaining ungated path
+was a crash handler, a detector, a probe, a watchdog or rate-limited. **Both
+statements were wrong**, and the thing that disproved them was not another audit —
+it was reading the serial console of an in-VM `cargo build` and finding it
+unreadable.
+
+### 13.1 What was gated
+
+| line | site | what it was | now gated by |
+|---|---|---|---|
+| `[syscall] execve(path=…, args=…)` | `syscall/proc.rs` | ungated, `tprint!(2048)`, one per `execve` | `SYSCALL_DEBUG_INFO_ENABLED` |
+| `[TERM] tid=… at=file:line` | `akuma-exec` `threading/mod.rs` | 4096-line budget, no gate | `lifecycle_trace_on()` |
+| `[signal] deliver` / `frame` / `Delivering` / `[sigreturn] restoring` | `exceptions.rs` ×4 | ungated | **new** `SIGNAL_TRACE_ENABLED` |
+| `[KTG] my_pid=…` | `akuma-exec` `process/mod.rs` | 512-line budget, no gate | `lifecycle_trace_on()` |
+| `[pipe] DESTROY` ×2 | `syscall/pipe.rs` | ungated **on purpose** | `PIPE_TRACE_ENABLED` |
+| `[syscall] execve: failed to read <path>` ×2 | `syscall/proc.rs` | ungated | `SYSCALL_DEBUG_INFO_ENABLED` |
+| `[FS] read_file(…)` ×2 | `fs.rs` | `if path.contains("git")` | `SYSCALL_DEBUG_IO_ENABLED` |
+
+Two of those deserve their own note.
+
+**A budget is not a gate.** `[TERM]` and `[KTG]` each had a rate-limit counter
+(4096 and 512 lines). That bounds the *total* and does nothing about the *rate*: a
+guest build spends the whole budget inside the first minute, so the trace floods
+exactly the window you are watching and is exhausted by the time anything
+interesting happens. Worse, the budget itself costs an atomic RMW on every
+termination. Both gates now short-circuit **before** the `fetch_add`.
+
+**A substring filter is not a gate either, and this one was a bug.** `[FS]
+read_file` was filtered by `path.contains("git")` — written to trace the `git`
+binary. But `"git"` is a substring of `"github"`, so on a devbox whose checkout
+lives at `/src/github.com/<user>/<repo>` it matched **every file read of the
+build**, `target/` included. It survived because `fs::read_file` is a kernel-side
+helper (ELF loads, config reads) and not the path userspace `read(2)` takes, so its
+measured volume stayed small — 1 line in the run below. The lesson is not the
+volume, it is that **a filter written against one workload silently widens under
+another, and nothing tells you**. A flag you have to turn on cannot do that.
+
+### 13.2 The measurement
+
+Two kernels, same disk image, same `snapshot=on` cold start, `SMP=4 MEMORY=4096`:
+
+- **arm A** = `013695fd`, the tree as it was when the flood was reported.
+- **arm B** = arm A + the seven gates above.
+
+Two workloads per boot. **W1** is fixed work — 200 `busybox true` execs plus 50
+`seq | wc` pipelines — so both arms do *identical* work and the byte counts are
+directly comparable. **W2** is 90 s of the real thing: `cargo build --release
+--features devbox-smoltcp,no-tests -j2` on the guest's own copy of this repo.
+
+| | arm A (ungated) | arm B (gated) | ratio |
+|---|---:|---:|---:|
+| W1 — 250 fixed exec/pipe operations | 173,800 B | **591 B** | **294×** |
+| W2 — 90 s of `cargo build` | 462,931 B | **44,046 B** | **10.5×** |
+| whole log, boot included | 642,909 B | 50,353 B | 12.8× |
+| crates compiled in the W2 window | 39 | 39 | — |
+| kernel image | 2,744,032 B | 2,708,072 B | −35,960 B |
+
+Where arm A's 642,909 bytes went, by family:
+
+| family | lines | bytes | % of log |
+|---|---:|---:|---:|
+| `execve` argv | 508 | 285,446 | **44.4%** |
+| `[TERM]` | 1,511 | 171,645 | **26.7%** |
+| `[signal]` / `[sigreturn]` | 819 | 84,811 | 13.2% |
+| `[KTG]` | 478 | 33,402 | 5.2% |
+| `[pipe] DESTROY` | 361 | 15,151 | 2.4% |
+| `[HEAP]` / `[HEAP-R]` | 153 | 7,566 | 1.2% |
+| `[PSTATS]` block | 30 | 7,485 | 1.2% |
+| `[KTG-STALE*]` | 77 | 7,104 | 1.1% |
+| `[FS] read_file`, `execve` PATH-probe | 2 | 265 | 0.0% |
+
+**The seven gated families were 91.9% of the log.** After gating, what is left is
+almost entirely what was *deliberately* kept: `[HEAP]`/`[PSTATS]` (periodic, not
+per-call) and `[KTG-STALE*]` (a detector) are 39.8% of arm B's much smaller log.
+The four surviving `[signal]` lines are `Process N terminated by signal 15` — the
+`timeout(1)` that ended W2, i.e. an outcome line, correctly ungated.
+
+### 13.3 The result that argues against this document's own instinct
+
+**Both arms compiled exactly 39 crates in the 90-second window.** The flood was
+not costing measurable build throughput, and it is worth being precise about why
+rather than assuming this document's headline applies everywhere: arm A's W2 wrote
+462,931 bytes over ~90 s, which at the ~2.4 µs/byte fitted in §2 is **~1.1 s of
+UART time in 90 s — about 1.2%**, below what a 39-crate granularity could resolve.
+
+That is the opposite shape from §1's case. There, one line was 99.94% of one
+syscall because the *ratio* of line to work was enormous. Here the same
+microsecond-per-byte cost is diluted across a build that is bound by something
+else (ext2 + mmap fault work — `RUSTC_COMPILE_EXT2_MMAP` in the archive). Same
+constant, opposite conclusion.
+
+So the honest claim for this round is **legibility, not throughput**: a 12.8×
+smaller log is the difference between a console you can read a fault out of and
+one you cannot. Anyone quoting §2's 2.4 µs/byte to predict a *speedup* should
+first check what fraction of wall-clock the writes actually are — measure the
+ratio, do not assume it.
+
+### 13.4 Reproducing it
+
+```bash
+# arm A
+git checkout <pre-gate-rev> -- src crates
+cargo build --release --features devbox-smoltcp,no-tests
+INSTANCE=6 SMP=4 MEMORY=4096 DISK=devbox.img SNAPSHOT=1 \
+  scripts/cargo_runner.sh target/aarch64-unknown-none/release/akuma > serial-armA.log 2>&1 &
+python3 scripts/vm_ready.py 2822        # never grep the log for a marker
+```
+
+then W1/W2 over ssh on :2822, `stat` the log before and after each. `snapshot=on`
+is what makes the arms comparable — every boot starts from the same `target/`.
+
+**Read the log with `grep -a`.** QEMU emits a control byte that makes plain
+`grep` treat the capture as binary and print *nothing* — a family census run
+without `-a` returns an empty table, which reads exactly like a clean result.
+
 ## Background
 
 - [`AKUMA_EXTRACT_MMAP.md`](AKUMA_EXTRACT_MMAP.md) §10.3.1–§10.3.2 — the probe

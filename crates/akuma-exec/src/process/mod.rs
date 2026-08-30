@@ -1400,7 +1400,12 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     // killer. `my_tgid` is printed separately from `my_pid` because the sibling set
     // is selected by tgid alone — a caller whose row carries somebody else's tgid
     // takes out somebody else's threads, and that is invisible from `my_pid`.
-    if KTG_TRACES.fetch_add(1, Ordering::Relaxed) < 512 {
+    // Gated 2026-08-30. "A group kill is rare" holds for a long-lived server and
+    // not for a build: every `rustc` that exits takes its rayon workers with it, so
+    // the 512-line budget is spent on routine process exits. The `[KTG-STALE]` /
+    // `[KTG-STALE-CH]` tripwires below stay ungated — those report an invariant
+    // violation, this one reports progress.
+    if lifecycle_trace_on() && KTG_TRACES.fetch_add(1, Ordering::Relaxed) < 512 {
         crate::safe_print!(176,
             "[KTG] my_pid={} my_tgid={} by_tid={} code={} siblings={} first={:?}\n",
             my_pid, tgid, crate::threading::current_thread_id(), exit_code,

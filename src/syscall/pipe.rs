@@ -292,7 +292,9 @@ pub fn pipe_close_write(id: u32) {
             }
 
             if pipe.write_count == 0 && pipe.read_count == 0 {
-                crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
+                if crate::config::PIPE_TRACE_ENABLED {
+                    crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
+                }
                 pipes.remove(&id);
                 destroyed = true;
             }
@@ -347,7 +349,9 @@ pub fn pipe_close_read(id: u32) {
             }
 
             if pipe.write_count == 0 && pipe.read_count == 0 {
-                crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
+                if crate::config::PIPE_TRACE_ENABLED {
+                    crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
+                }
                 pipes.remove(&id);
                 destroyed = true;
             }

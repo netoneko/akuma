@@ -152,15 +152,25 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, FsError> {
     if !is_initialized() {
         return Err(FsError::NotInitialized);
     }
+    // Gated 2026-08-30. The filter was `path.contains("git")` — meant to trace the
+    // `git` binary during a specific investigation, but "git" is a substring of
+    // "github", so in a devbox whose source tree lives under
+    // `/src/github.com/<user>/<repo>` it matched EVERY file read of the build,
+    // including the whole `target/` tree. At `safe_print!(128, ...)` those paths
+    // also overrun the buffer, so the lines truncate mid-path and lose their
+    // newline — which is what makes them run into the next line in the log.
+    // `SYSCALL_DEBUG_IO_ENABLED` is the existing flag for exactly this ("verbose
+    // file I/O logging"); no substring test replaces it, because a filter that
+    // silently widens is worse than a flag you have to turn on.
     match vfs::read_file(path) {
         Ok(data) => {
-            if path.contains("git") {
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(128, "[FS] read_file(\"{}\") -> {} bytes\n", path, data.len());
             }
             Ok(data)
         },
         Err(e) => {
-             if path.contains("git") {
+            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
                 crate::safe_print!(128, "[FS] read_file(\"{}\") -> Error: {}\n", path, e);
             }
             Err(e)

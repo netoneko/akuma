@@ -736,7 +736,14 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
             Ok(n) => { head.truncate(n); Some(head) }
             Err(crate::vfs::FsError::Internal) => None,
             Err(e) => {
-                crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+                // Gated 2026-08-30: this is the PATH search, not an error. A shell
+                // or cargo resolving `cc`/`rustc` probes every PATH entry in turn,
+                // so a miss per entry is the NORMAL case and the flood scales with
+                // PATH length x exec count. A genuinely unreadable binary still
+                // surfaces as the execve's errno to the caller.
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+                }
                 return super::fs::fs_error_to_errno(e);
             }
         }
@@ -761,7 +768,14 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
             Ok(data) => Some(data),
             Err(crate::vfs::FsError::Internal) => None,
             Err(e) => {
-                crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+                // Gated 2026-08-30: this is the PATH search, not an error. A shell
+                // or cargo resolving `cc`/`rustc` probes every PATH entry in turn,
+                // so a miss per entry is the NORMAL case and the flood scales with
+                // PATH length x exec count. A genuinely unreadable binary still
+                // surfaces as the execve's errno to the caller.
+                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+                }
                 return super::fs::fs_error_to_errno(e);
             }
         }

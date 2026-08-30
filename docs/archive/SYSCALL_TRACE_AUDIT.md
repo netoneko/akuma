@@ -117,13 +117,25 @@ or already rate-limited. That is a measured statement, not an untested
 assumption — which is the difference between this line and the one the first
 sweep would have supported.
 
-> **Correction, 2026-08-30.** That claim was wrong when written.
-> `sys_execve`'s `[syscall] execve(path=…, args=…)` line — ungated,
-> userspace-drivable, up to 2048 bytes, once per `execve` — is none of those five
-> things, and it was in scope for the scan. It is now gated; see
-> §"What the scan missed, three times" ¶3. Read "closed" as "closed against the
-> idioms it scanned for", which is a weaker statement than the one this paragraph
-> made.
+> **Correction, 2026-08-30.** That claim was wrong when written, and not by one
+> instance. Reading the serial console of an in-VM `cargo build` turned up **seven**
+> ungated, userspace-drivable families, none of them a crash handler, detector,
+> probe, watchdog or rate-limited line: `execve` argv, `[TERM]`, the four
+> `[signal]`/`[sigreturn]` delivery lines, `[KTG]`, `[pipe] DESTROY`, the `execve`
+> PATH-probe miss, and `[FS] read_file`. Measured A/B on a real guest build, they
+> were **91.9% of the console log** — see
+> [`CONSOLE_LOG_COST.md`](CONSOLE_LOG_COST.md) §13 for the numbers, the new
+> `SIGNAL_TRACE_ENABLED` flag, and the two anti-patterns they exposed (a
+> rate-limit budget is not a gate; a substring filter is not a gate, and
+> `path.contains("git")` matched every path under a `github.com` checkout).
+>
+> Two distinctions this correction does NOT overturn: `[KTG]` (a progress line,
+> now gated) is not `[KTG-STALE]`/`[KTG-STALE-CH]` (invariant tripwires, still
+> ungated and correctly so), and `[HEAP]`/`[PSTATS]` stay ungated because they are
+> periodic, not per-call.
+>
+> Read "closed" as "closed against the idioms it scanned for" — a weaker statement
+> than the one this paragraph made.
 
 ## What the scan missed, three times
 
@@ -179,6 +191,10 @@ treatment, no new knob, and the pre-existing `[PROC-EXIT]` gate (2026-08-29) use
 the same flag, so the pid-correlation workflow the two lines exist for still works
 in a `syscall-debug-info` build. `scripts/bkl_smp_regimen/analyze_workload.py`
 parses this line and now carries a note that it needs such a build.
+
+Measured after the fact, it was **44.4% of the console log** of a guest `cargo
+build` — the single largest family, and six more followed it out of the same log.
+[`CONSOLE_LOG_COST.md`](CONSOLE_LOG_COST.md) §13 has the full A/B.
 
 **What this one adds to the lesson:** misses 1 and 2 were scans looking in the
 wrong place. This was a scan looking in exactly the right place at a function

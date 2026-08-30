@@ -2111,9 +2111,11 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // `fault_pc` is the saved ELR at exception entry — i.e. the user PC where the
     // fault/interrupt occurred — *not* the handler we will install at handler_addr.
     // Misreading this as “handler PC” suggests ELR corruption; it is not.
-    crate::tprint!(256,
-        "[signal] deliver sig={} slot={} handler={:#x} fault_pc={:#x} user_sp={:#x} alt_sp={:#x} alt_size={:#x} sa_flags={:#x}\n",
-        signal, thread_slot, handler_addr, frame_ref.elr_el1, user_sp, alt_sp, alt_size, action.flags);
+    if crate::config::SIGNAL_TRACE_ENABLED {
+        crate::tprint!(256,
+            "[signal] deliver sig={} slot={} handler={:#x} fault_pc={:#x} user_sp={:#x} alt_sp={:#x} alt_size={:#x} sa_flags={:#x}\n",
+            signal, thread_slot, handler_addr, frame_ref.elr_el1, user_sp, alt_sp, alt_size, action.flags);
+    }
 
     if crate::config::DEBUG_PATTERN2_TRAP_TRACE && syscall_stub_elr_in_diag_window(frame_ref.elr_el1) {
         crate::tprint!(
@@ -2186,9 +2188,11 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
 
     let new_sp = (stack_top - SIGFRAME_SIZE) & !0xF;
 
-    crate::tprint!(256,
-        "[signal] frame: stack_top={:#x} new_sp={:#x} on_altstack={}\n",
-        stack_top, new_sp, stack_top != user_sp);
+    if crate::config::SIGNAL_TRACE_ENABLED {
+        crate::tprint!(256,
+            "[signal] frame: stack_top={:#x} new_sp={:#x} on_altstack={}\n",
+            stack_top, new_sp, stack_top != user_sp);
+    }
 
     // Ensure stack pages are mapped (signal frame may span 2 pages).
     // Demand-page lazy anonymous stack pages if not yet mapped.
@@ -2339,8 +2343,10 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // blocked while this handler runs.  SIGKILL (bit 8) and SIGSTOP (bit 18) are immune.
     akuma_exec::threading::or_thread_signal_mask(action.mask & !((1u64 << 8) | (1u64 << 18)));
 
-    crate::tprint!(128, "[signal] Delivering sig {} to handler {:#x} (restorer={:#x})\n",
-        signal, handler_addr, restorer);
+    if crate::config::SIGNAL_TRACE_ENABLED {
+        crate::tprint!(128, "[signal] Delivering sig {} to handler {:#x} (restorer={:#x})\n",
+            signal, handler_addr, restorer);
+    }
     true
 }
 
@@ -2494,9 +2500,11 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
         f.spsr_el1 = restored_spsr;
     }
 
-    crate::tprint!(256,
-        "[sigreturn] restoring: sp={:#x} pc={:#x} pstate={:#x} sigframe_sp={:#x}\n",
-        f.sp_el0, f.elr_el1, f.spsr_el1, sigframe_sp);
+    if crate::config::SIGNAL_TRACE_ENABLED {
+        crate::tprint!(256,
+            "[sigreturn] restoring: sp={:#x} pc={:#x} pstate={:#x} sigframe_sp={:#x}\n",
+            f.sp_el0, f.elr_el1, f.spsr_el1, sigframe_sp);
+    }
 
     if crate::config::DEBUG_PATTERN2_TRAP_TRACE && syscall_stub_elr_in_diag_window(f.elr_el1) {
         let rp = akuma_exec::process::read_current_pid().unwrap_or(0);

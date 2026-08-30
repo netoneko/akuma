@@ -411,8 +411,33 @@ pub const DEMAND_PAGE_LOG_ENABLED: bool = false;
 /// Several lines per pipe, and a parallel build makes thousands of them — 6.6k
 /// lines in one `-j4` build sample, second only to the demand-paging trace. The
 /// refcount lines are how the SIGPIPE/close-ordering deadlocks were cracked, so
-/// they stay one flag away rather than deleted. `WARN` and `DESTROY` are NOT gated.
+/// they stay one flag away rather than deleted. `WARN` is NOT gated.
+///
+/// **`DESTROY` joined this flag 2026-08-30.** It was deliberately left out —
+/// "`WARN` and `DESTROY` are NOT gated" — on the reading that a pipe teardown is
+/// an event worth seeing. It is not: it fires once per pipe destruction, and a
+/// `cargo` build in the guest destroys pipes at the rate it spawns processes, so
+/// it kept a share of the flood this flag exists to stop. It carries no anomaly
+/// information — the refcount lines above it are the ones that do.
 pub const PIPE_TRACE_ENABLED: bool = false;
+
+/// Gate the signal delivery/return trace (`[signal] deliver` / `[signal] frame` /
+/// `[signal] Delivering` / `[sigreturn] restoring`).
+///
+/// Four lines per signal delivery at 128-256 bytes each, and they were
+/// unconditional until 2026-08-30. That is fine for a single process and
+/// expensive under a build: `rustc` takes a `SIGURG` (sig 10) per Go-style
+/// preemption tick and per thread-park, so a `-j4` guest build pays ~700 bytes of
+/// serial write per signal on a path whose whole point is to be fast.
+///
+/// A dedicated flag rather than folding into `SYSCALL_DEBUG_INFO_ENABLED`, for
+/// the same reason `PIPE_TRACE_ENABLED` and `MEM_SYSCALL_TRACE_ENABLED` are
+/// dedicated: signal delivery is its own recurring investigation in this tree
+/// (sigaltstack, `sigreturn` pstate, SIGSEGV-in-handler), and those hunts want
+/// these four lines without the fork/exec/AIO flood that the catch-all brings.
+/// Anomalies on the signal path — bad handler, unmapped frame, refused delivery —
+/// are NOT gated by this and stay visible.
+pub const SIGNAL_TRACE_ENABLED: bool = false;
 
 /// Gate the per-call memory-syscall trace (`[mmap]` / `[mprotect]` / `[munmap]`).
 ///

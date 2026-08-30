@@ -1288,7 +1288,14 @@ pub fn mark_thread_terminated(idx: usize) {
         // at all. That blind spot is why a "zero `[kill]` lines" reading cannot be
         // used to rule out an external kill (docs/runbooks/debug-futex-lost-wakeup.md §4).
         // Owner comes from THREAD_PID_MAP, never the `p.thread_id` table scan.
-        if TERM_TRACES.fetch_add(1, Ordering::Relaxed) < 4096 {
+        // Gated 2026-08-30. The 4096-line budget bounds the total but not the
+        // rate: a guest `cargo` build spends it inside the first minute, so the
+        // trace was both a flood during the interesting window and exhausted by
+        // the time anything went wrong. `lifecycle_trace_on()` first, so the
+        // atomic RMW below is skipped too when tracing is off.
+        if crate::process::lifecycle_trace_on()
+            && TERM_TRACES.fetch_add(1, Ordering::Relaxed) < 4096
+        {
             let loc = core::panic::Location::caller();
             let killer = get_current_thread_register();
             safe_print!(224,
