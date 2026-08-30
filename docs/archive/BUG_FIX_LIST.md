@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 752
-- **Docs contributing at least one fix:** 244
+- **Total distinct fixes counted:** 759
+- **Docs contributing at least one fix:** 246
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 132 | 17.6% | 20 |
-| Memory & Virtual Memory | 122 | 16.2% | 39 |
-| Scheduler & Process Management | 78 | 10.4% | 21 |
-| SMP & Locking | 88 | 11.7% | 39 |
-| Networking | 54 | 7.2% | 21 |
+| Syscall / ABI Compatibility Audits | 132 | 17.4% | 20 |
+| Memory & Virtual Memory | 122 | 16.1% | 39 |
+| Scheduler & Process Management | 79 | 10.4% | 22 |
+| SMP & Locking | 89 | 11.7% | 39 |
+| Networking | 54 | 7.1% | 21 |
 | Userspace Apps & Libraries | 37 | 4.9% | 20 |
-| Rump Kernel & Syscall Proxy | 26 | 3.5% | 6 |
+| Rump Kernel & Syscall Proxy | 26 | 3.4% | 6 |
 | Toolchain & Self-Hosting | 43 | 5.7% | 7 |
-| SSH | 26 | 3.5% | 15 |
+| SSH | 26 | 3.4% | 15 |
 | VFS & Filesystem | 27 | 3.6% | 17 |
 | Boot & Drivers | 24 | 3.2% | 9 |
 | Signals & Exceptions | 15 | 2.0% | 7 |
-| Misc / Cross-cutting | 25 | 3.3% | 6 |
-| Console & Terminal | 31 | 4.1% | 11 |
+| Misc / Cross-cutting | 29 | 3.8% | 7 |
+| Console & Terminal | 32 | 4.2% | 11 |
 | Containers | 24 | 3.2% | 6 |
-| **Total** | **752** | **100.0%** | **244** |
+| **Total** | **759** | **100.0%** | **246** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -386,7 +386,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `sync_el1_handler` (`src/exceptions.rs`) saved only x0-x3/x29/x30, but the EL1 paths that *resolve* a fault (`try_resolve_el1_cow_fault`, `try_resolve_el1_user_copy_lazy_fault`) `eret` back to re-execute the faulting instruction, so a page fault mid-copy replayed the widened multi-register `stp` store with x4-x18 holding leftover handler state instead of the copy's own live data — busybox `md5sum`/`sha*sum` returned a wrong, non-deterministic digest for an unmodified file roughly 40-50% of the time, for any file over one page; fixed by making the vector transparent to x4-x18, guarded by `test_el1_sync_exception_preserves_gprs`
 
 
-## Scheduler & Process Management (78 fixes, 21 docs)
+## Scheduler & Process Management (79 fixes, 22 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -509,7 +509,10 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/IDENTITY_CACHE_LAZY_RESTAMP.md
 - The per-thread identity cache added to speed up `getpid` was stamped once at thread-map insert time and never repaired on a lost race, so under thread churn the cache ran at a **0.11% hit rate** — ~556 million slow-path table scans (lock + map walk + IRQ-masked process-table scan) per run instead of the fast path it was built to replace; fixed via a bounded lazy re-stamp on miss (`identity_get` re-runs `identity_store_locked` under an IRQ mask, `MAX_REPAIR_ATTEMPTS = 4`, budget reset only when both the pid and tgid halves have resolved — two earlier reset rules each made an unresolvable entry re-scan the whole table on every syscall instead of exhausting its budget), restoring a 99.999% hit rate
 
-## SMP & Locking (88 fixes, 39 docs)
+### docs/archive/KTG_GRACE_EXPIRY_KILL_INTERRUPT.md
+- `exit_group` paid its full 2 s kill-grace per multithreaded process: a thread parked in an untimed `FUTEX_WAIT` (or any yarn-driven blocking wait) was woken by the deferred-kill request but re-parked, because neither `sys_futex`'s re-evaluation nor `should_interrupt_blocking_syscall` consulted `PENDING_KILL` — both read only signal paths — so the wake was consumed by the very loop it was meant to end and the only exit was grace expiry plus hard kill; fixed by adding the kill check first in both readers, returning `EINTR` that unwinds to the thread's self-termination boundary (boot test `test_pending_kill_interrupts_blocking_wait`, probe `userspace/forktest/c_stress/futexkill.c`)
+
+## SMP & Locking (89 fixes, 39 docs)
 
 ### docs/archive/IRQ_HANDLER_TABLE_DEADLOCK.md
 - `register_handler` called `gic::enable_irq()` **while holding `IRQ_HANDLERS`**, the non-reentrant spinlock `dispatch_irq` takes from the interrupt vector, so a line delivering on that core before the guard dropped self-deadlocked it — with the BKL still held, surfacing as an `SMP>1` boot freeze with `[BKL] stuck: owner=1 waiter=2/3/4`. Fixed with a fixed `[Option<IrqHandler>; 256]` table (also removing up to 49 `Vec::push` heap allocations inside that lock), publishing under `with_irqs_disabled`, and moving `enable_irq` outside the lock
@@ -660,6 +663,7 @@ aren't recorded anywhere else.)
 
 ### docs/archive/COWSTALE_FORK_THREAD_SEGV.md
 - The `[EAGER-UPGRADE]` page-permission repair rewrote AP bits that already said writable — it was really just `update_current_user_page_flags`'s trailing `flush_tlb_page` doing the actual work, dressed up as a permission fix; fixed by checking the PTE first and, when the write is already permitted, only invalidating the stale TLB entry instead of rewriting page-table state that was already correct
+- The stale-write-fault absorb above ran only at EL0 write-fault entry, before the loser waited on the per-page fault slot — a queued loser still reached `cow_ref==0` with no region record and died for a legal write (`ap_rw=true`); fixed by re-running the absorb after the fault-slot wait and again at SIGSEGV delivery (SMP=4 in-boot rate ~30-60% → 1/15 hammer storm / 0/8 classic; one hammer survivor with the old signature remains)
 
 ### docs/archive/SMP_SECONDARY_IDLE_STACK_CANARY.md
 - Every `SMP=N>1` boot printed `SMP-1` false `[STACK-OVERFLOW]` reports: `adopt_current_as_core_idle` registered each secondary's static `.bss` boot stack in the pool but never painted a canary on it, and the sweep cannot tell an unpainted canary from a smashed one — which also left those per-core idle stacks permanently un-monitorable, since the reporter latches per slot on `base`; fixed by painting the canary where the stack is registered (closes `DEVBOX_ISSUES.md` Issue 11)
@@ -1168,7 +1172,7 @@ aren't recorded anywhere else.)
 - Even with that mask, a signal-woken thread rejoined the back of the round-robin run queue, and signal delivery had unbounded priority over resuming the syscall it interrupted (each handler return re-delivered the next pending signal immediately), so under a 10ms-cadence signal sender the interrupted syscall was starved indefinitely rather than merely raced; fixed via `SIGNAL_WAKE_PREEMPT` (runs a signal-woken thread on the next switch) plus `SIGFRAME_ACTIVE` (bounds delivery to one handler per unit of userspace progress, consulted by `rt_sigreturn`)
 
 
-## Misc / Cross-cutting (25 fixes, 6 docs)
+## Misc / Cross-cutting (29 fixes, 7 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md
 (Host-side tooling for the AWS metal Firecracker host, `../akuma-terraform`. §9's eight bugs; the §10 Akuma-side results are verifications of fixes counted elsewhere, not new fixes, and §7's traps are AWS behaviours rather than bugs in this project.)
@@ -1220,8 +1224,14 @@ aren't recorded anywhere else.)
 - The harness's reader thread returned at the boot marker, leaving nothing draining QEMU's stdout: every per-test log stopped at boot (so the `[PANIC]`/`WILD-DA`/`[SGI-S POISON]`/`[WATCHDOG]` grep could only ever match boot output, and reported "no crash" for a run it could not see), and once the 64 KB pipe filled QEMU blocked on write and the VM stalled — turning a 14 s `combined_light` into a 50 s "timeout". Closing the log under that still-running thread also raised `ValueError: I/O operation on closed file`
 - Readiness was decided by matching `"Started sshd"` in console text, which an unlocked UART tears across herd's separate `print()` calls (`[herd] Started ` + another core's `[syscall] bind(...)` + `sshd (pid= 2)`) — 4 of 7 SMP=4 boots, 0 of 7 at SMP=2; replaced with an SSH-banner probe, since a bare `connect()` is not readiness either (QEMU's user-mode hostfwd accepts before the guest listens)
 
+### docs/archive/ERROR_HANDLING_AUDIT.md
+- `wait4`/`waitid` discarded `write_user_val`'s error and reaped the zombie on the next line, so an unmapped `status_ptr` destroyed the child's exit status irrecoverably while `wait4` still returned the pid as though it had reported it; fixed to report-then-reap and return `EFAULT` when the report fails, at all five sites (Linux-compatible)
+- `unmap_page`/`update_page_flags` and both `_no_flush` variants returned a `Result` no implementation could ever populate with `Err`, which had taught three test call sites to grow vacuous `is_ok()`/`is_err()` assertions proving nothing; fixed by returning `()` from all four and replacing the vacuous assertions with `read_l3_page_entry` read-backs that prove the PTE actually changed
+- `spawn_worker_demo` printed the number of workers *attempted*, unconditionally, for a loop explicitly allowed to fail — a partial spawn reported as a full one in the line `cores_that_ran_workers()`'s boot self-test is read against; fixed to count successes
+- `rx_frame`/`tx_frame`/`tx_discard` handed out `&'static mut [u8]` into a `static mut` NIC buffer, so two calls with the same slot were instant aliasing UB no caller could discharge; fixed by returning `*mut [u8]` like the raw-pointer `rx_buf`/`tx_buf` accessors already in the same files
 
-## Console & Terminal (31 fixes, 11 docs)
+
+## Console & Terminal (32 fixes, 11 docs)
 
 ### docs/archive/VEC_AUDIT.md
 - `crates/akuma-terminal`'s canonical-mode `canon_buffer` grew one byte per keystroke with no cap and was drained only by a line terminator, so a peer writing to a tty in canonical mode and never sending `\n` grew kernel heap without limit. Capped at `MAX_CANON = 4095` (Linux N_TTY's own ceiling), dropping — and deliberately not echoing — input beyond it, while the `\n`/VEOF paths stay uncapped so a full line can always still be terminated
@@ -1268,6 +1278,7 @@ aren't recorded anywhere else.)
 - The `syscall/mod.rs` epilogue's `[EFAULT]` diagnostic cost ~250 µs per call (~2,400 ns/byte of console output, one `write_volatile` VM exit per byte with no buffering) on every EFAULT-returning syscall — 99.94% of the syscall's own cost and userspace-drivable by looping a bad-address call, degrading the whole VM since console writes serialise across cores; fixed by turning it off (`SYSCALL_ERRNO_DIAG_ENABLED = false`), 249,806 ns → 150 ns
 - The errno-diag gate had narrowed to `result == EFAULT` only — a workaround for an `EINVAL` flood from `readlinkat` probes during cargo builds — silently making its `ENOSYS`/`EINVAL` arms and the whole `mmap`-`EINVAL` decode its own comment called load-bearing unreachable dead code; fixed by widening the gate to `EFAULT || ENOSYS || EINVAL` so the code handles what it claims to
 - `madvise_dontneed_range`'s first pass took `lazy_region_lookup_for_pid` — a process-table walk, IRQ mask and `lazy_regions.lock()` — once **per page** of a `MADV_DONTNEED` range, to consult a map that never changed; fixed by taking the lock once for the whole range (30.1× → 4.8× median vs `getpid`, loaded host)
+- A guest `cargo build`'s serial console was unreadable: seven ungated per-call trace families userspace can drive (`execve` argv, `[TERM]`, the four `[signal]`/`[sigreturn]` delivery lines, `[KTG]`, `[pipe] DESTROY`, the execve PATH-probe miss, `[FS] read_file`) were **91.9% of the log** (12.8× reduction A/B on identical work); the `[FS] read_file` arm was its own bug — a `path.contains("git")` substring filter that silently matched every path under a `github.com` checkout — and the `[TERM]`/`[KTG]` rate-limit budgets were not gates, so their gate check moved before the counter fetch; gated behind existing subsystem flags plus one new `SIGNAL_TRACE_ENABLED`
 
 ### docs/archive/SYSCALL_TRACE_AUDIT.md
 - `akuma-syscalls-time`'s `[clock-diag]` performed two user-memory reads plus a ~130-byte two-line `log::warn!` on every `clock_gettime(clock_id > 0x1000_0000)` call from userspace — the worst single instance found, since it also read user memory before printing; gated behind the `akuma-syscalls-time/debug-info` feature, off by default
@@ -1320,7 +1331,7 @@ aren't recorded anywhere else.)
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
 
-Also scanned 2026-08-27 (the `obviously-more-fixes` branch, ahead of closing it for the syscalls-refactor branch): AKUMA_SYSCALL_PERFORMANCE_AUDIT (the `getpid` floor taken 410 ns → 150 ns by a per-thread identity cache — an optimization with no defect attached, counted the same way LTO_RELEASE_PROFILE and BKL_RUSTC_SCALING_BASELINE are; its four deferred follow-ups are open, and the SMP>1 soak it defers is IDENTITY_CACHE_SMP_REVIEW, whose Finding A was since fixed 2026-08-29 and is counted under AKUMA_EXTRACT_SYSCALLS, leaving only its Finding B open), EXT2_READ_PATH_STAGE_PROFILE ("instrument landed, no behaviour changed" by its own status line — the `read-profile` feature and two probes, nothing on the read path modified), EXT2_WRITEBACK_DESIGN (in-flight design record; its finding F-1 is fixed by FPCACHE_MOUNT_IDENTITY, counted there, and its D-9 capacity half and §237 "what is still open" list remain open), USER_COPY_BYTE_LOOP (widening the user-copy byte loop — a measured optimization, no defect; its own header retracts the "~17 µs of fixed cost" claim as inferred rather than measured), and USER_MANAGEMENT_AND_BOXES ("Design investigation. Nothing here is implemented."). ERROR_HANDLING_AUDIT is a classification of the tree's 139 production `let _ =` discards ending in a recommendation to gate-and-triage rather than blanket-ban; its findings carry fix shapes, not fixes — including a **confirmed physical-frame leak** in `sys_mmap`'s `MAP_FIXED` path (`src/syscall/mem.rs:448`), which is open. USER_COPY_FOLD gained only a cross-reference note pointing at USER_COPY_BYTE_LOOP — no change to its existing count.
+Also scanned 2026-08-27 (the `obviously-more-fixes` branch, ahead of closing it for the syscalls-refactor branch): AKUMA_SYSCALL_PERFORMANCE_AUDIT (the `getpid` floor taken 410 ns → 150 ns by a per-thread identity cache — an optimization with no defect attached, counted the same way LTO_RELEASE_PROFILE and BKL_RUSTC_SCALING_BASELINE are; its four deferred follow-ups are open, and the SMP>1 soak it defers is IDENTITY_CACHE_SMP_REVIEW, whose Finding A was since fixed 2026-08-29 and is counted under AKUMA_EXTRACT_SYSCALLS, leaving only its Finding B open), EXT2_READ_PATH_STAGE_PROFILE ("instrument landed, no behaviour changed" by its own status line — the `read-profile` feature and two probes, nothing on the read path modified), EXT2_WRITEBACK_DESIGN (in-flight design record; its finding F-1 is fixed by FPCACHE_MOUNT_IDENTITY, counted there, and its D-9 capacity half and §237 "what is still open" list remain open), USER_COPY_BYTE_LOOP (widening the user-copy byte loop — a measured optimization, no defect; its own header retracts the "~17 µs of fixed cost" claim as inferred rather than measured), and USER_MANAGEMENT_AND_BOXES ("Design investigation. Nothing here is implemented."). USER_COPY_FOLD gained only a cross-reference note pointing at USER_COPY_BYTE_LOOP — no change to its existing count. (ERROR_HANDLING_AUDIT, mentioned below as carrying fix shapes rather than fixes, **since gained four real fixes on 2026-08-30** and now has its own subsection under Misc / Cross-cutting. ASID_EXHAUSTION_TIGHT_THREAD_LOOP is root-caused and measured but **Status: OPEN** — `pthread_create` fails at ~251 serial iterations in a tight loop because ASIDs leak from address spaces whose `Drop` never ran, against `MAX_ASID = 256`; not fixed, counted nowhere.)
 
 Also re-scanned 2026-08-25 (the `more-fixes` branch, ahead of merging it): BENCHMARK_PERFOMANCE_ATTEMPT_1 (a benchmark record; its one actionable finding — nginx's lost epoll wakeup — is open and lives in NGINX_LOST_WAKEUP), MOUNT_MISSING_SYSCALLS ("nothing in this doc is implemented by this session" by its own status line; §7 is a build list), NGINX_LOST_WAKEUP (**open**: nginx's `epoll_wait` misses readiness wakes and is rescued by the 10 ms `backstop_us`, so requests cost ~17 ms; hypothesis with strong circumstantial support, no fix), HTTPD_ACCEPT_HANG (**open**: `httpd` stops answering while the process is still alive and logs no error; observed 2-3 times, not reliably reproduced, failing stage not established), REDIS_BENCHMARK_HOST_CONTENTION_LIVELOCK (resolved, but the `while(1)` is in `redis-benchmark`'s own `writeHandler` — "the guest is not involved in the hang at all", so no fix landed in this codebase), REDIS_ROUND_TRIP_STAGE_TRACE (read entirely out of already-checked-in logs — no new boot, no new build; its §4 "688 µs" framing is retired by LONG_ROAD_TO_REDIS_PART_2 §9, counted there), and SYSCALL_LAYER_AUDIT (the duplication audit that *found* the `dup`/`dup3`/`fcntl` refcount gap; the fix is counted under LONG_ROAD_TO_REDIS_PART_2, not duplicated here). VEC_AUDIT's findings #1 (`map_user_page`'s per-call page-table frame list) and #2 (`SOCKET_TABLE`) are `Vec`-to-fixed-array conversions with no bug attached and are not counted; its #3 is the `irq.rs` deadlock, counted under IRQ_HANDLER_TABLE_DEADLOCK; only its terminal `canon_buffer` fix is counted (Console & Terminal, above).
 
