@@ -1,4 +1,15 @@
 #![no_std]
+// Unsafe-free by design, and `forbid` so no module can opt back in with a local
+// `allow`. Same reasoning as `akuma-net-yarn` and `akuma-syscalls-sync`.
+//
+// This crate held out until 2026-08-30 for one reason: its layout tests proved
+// field offsets by `transmute`-ing a struct to `[u8; N]` and indexing the bytes.
+// `offset_of!` + `size_of_val` state the same facts directly — and better, since
+// a failure names the field instead of reporting a byte mismatch — so the
+// transmutes went and the ban went on. One of them — `MsgHdr`, the only struct
+// in this crate that had implicit padding — was also reading uninitialised tail
+// bytes, which is UB on its own; that struct now names its tail pad.
+#![forbid(unsafe_code)]
 // Padding and reserved fields keep the names the Linux headers give them —
 // `__pad1`, `__unused`, `__spare0`, `_pad`. They have to be `pub` (callers
 // build these structs with literal syntax) and they have to keep the leading

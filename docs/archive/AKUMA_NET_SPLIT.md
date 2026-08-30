@@ -505,6 +505,60 @@ once.
 
 ---
 
+## 6.5 `akuma-syscalls-linux` went unsafe-free too (2026-08-30)
+
+Not part of the split, but the same audit: the ABI crate was the last non-device
+crate holding `unsafe`, all 12 sites in tests, all the same shape —
+`transmute(struct) -> [u8; N]` then index the bytes to prove a field offset.
+
+Rewritten as `offset_of!` + `size_of_val`, which the crate's *own* tests already
+used elsewhere (`sigchld_overlays_the_siginfo_prefix`,
+`statx_timestamps_are_a_stride_of_16`) — the transmutes were the outliers, not
+the idiom. The rewrite is also better testing: a failure now says
+`st_size is at 52, expected 48` instead of a byte mismatch at index 48. One
+test's doc comment defended the byte dump as proving field *width* as well as
+offset; `size_of_val(&st.st_size)` states that directly.
+
+**Verified by mutation, not by "it still passes".** Eight deliberate layout
+breaks, each the bug the test's own doc comment names, all caught:
+
+| mutation | |
+|---|---|
+| `PollFd.events` `i16`→`i32` (clobbers the next `fd`) | caught |
+| `EpollEvent`: drop `_pad` (stride 16→12) | caught |
+| `Stat.__pad2` `i32`→`i64` (shifts `st_blocks`) | caught |
+| `MsgHdr`: drop `_pad1` (`msg_iov` 16→12) | caught |
+| `Sysinfo`: drop `_align` (`totalhigh` 88→84) | caught |
+| `Sysinfo`: drop `_f` (implicit tail padding returns) | caught |
+| `CloneArgs`: reorder `stack` before `exit_signal` | caught |
+| `KernelSigaction`: libc field order | caught |
+
+### The transmutes were also hiding a real defect
+
+Probing every transmuted struct for *implicit* padding found exactly one:
+**`MsgHdr` was 56 bytes with only 52 named**, so `transmute`-ing it to
+`[u8; 56]` read four uninitialised bytes — UB regardless of which bytes the test
+then looked at.
+
+It is not an information leak today: `sys_recvmsg` fills the struct with
+`read_user_into`, which copies all 56 bytes from user memory before the
+write-back, so the tail carries the caller's own data. But that is a property of
+one call flow, not of the type — and this crate's `Sysinfo` already carries an
+explicit `_f` field with a doc comment stating the rule: "`write_user_val` copies
+`size_of::<T>()` bytes straight out of the value, so an unnamed padding byte is a
+kernel-stack byte handed to userspace." `MsgHdr` had simply been missed.
+
+Fixed by naming the tail: `pub _pad3: u32`. Costs nothing — `msg_flags` ends at
+52 and the struct is 8-aligned, so the bytes existed either way — size stays 56,
+every offset is unchanged, and nothing constructs `MsgHdr` by literal. Pinned by
+a `const _: () = assert!(offset_of!(MsgHdr, _pad3) == 52)`.
+
+With that, the crate carries `#![forbid(unsafe_code)]`: **16 of 24 crates**, and
+`scripts/cloc_akuma.py` reports 31.2% of crate code enforced-safe against 96.0%
+line-level safe.
+
+---
+
 ## 7. What is left
 
 - The split itself (§5). Nothing in §4 blocks it; extraction B is now much

@@ -149,18 +149,14 @@ mod tests {
     use super::*;
 
     /// The `st_size` a 64-bit `ls` reads must land at byte 48 and be 8 bytes
-    /// wide. Written as a byte-level round trip rather than an `offset_of!`
-    /// restatement so it also proves the *width* — a `st_size: i32` would keep
-    /// every later offset only if padding happened to absorb it.
+    /// wide. Offset *and* width, because either alone is insufficient: a
+    /// `st_size: i32` could keep every later offset if padding absorbed it, and
+    /// a right-width field at the wrong offset shifts everything after it.
     #[test]
     fn stat_size_lands_at_offset_48() {
-        let mut st = Stat::default();
-        st.st_size = 0x0102_0304_0506_0708;
-        let raw: [u8; 128] = unsafe { core::mem::transmute(st) };
-        assert_eq!(
-            u64::from_le_bytes(raw[48..56].try_into().unwrap()),
-            0x0102_0304_0506_0708
-        );
+        let st = Stat::default();
+        assert_eq!(core::mem::offset_of!(Stat, st_size), 48);
+        assert_eq!(core::mem::size_of_val(&st.st_size), 8);
     }
 
     /// `st_blksize` is `i32` followed by `__pad2`: writing it must not disturb
@@ -168,13 +164,12 @@ mod tests {
     /// one field's width wrong, everything after it shifted by four bytes.
     #[test]
     fn stat_blksize_is_32_bit_and_padded() {
-        let mut st = Stat::default();
-        st.st_blksize = -1;
-        st.st_blocks = 7;
-        let raw: [u8; 128] = unsafe { core::mem::transmute(st) };
-        assert_eq!(u32::from_le_bytes(raw[56..60].try_into().unwrap()), u32::MAX);
-        assert_eq!(u32::from_le_bytes(raw[60..64].try_into().unwrap()), 0, "__pad2");
-        assert_eq!(u64::from_le_bytes(raw[64..72].try_into().unwrap()), 7);
+        let st = Stat::default();
+        assert_eq!(core::mem::offset_of!(Stat, st_blksize), 56);
+        assert_eq!(core::mem::size_of_val(&st.st_blksize), 4, "i32, not i64");
+        assert_eq!(core::mem::offset_of!(Stat, __pad2), 60, "the explicit filler");
+        assert_eq!(core::mem::size_of_val(&st.__pad2), 4);
+        assert_eq!(core::mem::offset_of!(Stat, st_blocks), 64, "undisturbed by the pair above");
     }
 
     /// The four `statx_timestamp`s are a stride of 16 starting at 64 — the

@@ -153,34 +153,46 @@ mod tests {
     /// `clone3` truncates to the caller's `size`, so a short copy must still
     /// land `flags` and `pidfd` correctly — the property that makes the field
     /// order unchangeable.
+    ///
+    /// Stated as the layout invariant that *makes* a prefix copy work, rather
+    /// than by performing one: every field a five-field caller knows about must
+    /// end at or before `stack` begins, and every later field must start at or
+    /// after it. Simulating the copy tested the same fact through a `memcpy`
+    /// that could only ever agree with the offsets it was derived from.
     #[test]
     fn clone_args_prefix_survives_a_short_copy() {
-        let full = CloneArgs {
-            flags: 0x1_0000,
-            pidfd: 0xAAAA,
-            child_tid: 0xBBBB,
-            parent_tid: 0xCCCC,
-            exit_signal: 17,
-            stack: 0xDDDD,
-            stack_size: 0x1000,
-            tls: 0xEEEE,
-        };
-        let raw: [u8; 64] = unsafe { core::mem::transmute(full) };
-
-        // A caller built against a kernel that only knew the first five fields.
-        let mut short = CloneArgs::default();
-        let n = core::mem::offset_of!(CloneArgs, stack);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                raw.as_ptr(),
-                core::ptr::from_mut(&mut short).cast::<u8>(),
-                n,
-            );
+        let a = CloneArgs::default();
+        let cut = core::mem::offset_of!(CloneArgs, stack);
+        for (name, off, size) in [
+            ("flags", core::mem::offset_of!(CloneArgs, flags), core::mem::size_of_val(&a.flags)),
+            ("pidfd", core::mem::offset_of!(CloneArgs, pidfd), core::mem::size_of_val(&a.pidfd)),
+            (
+                "child_tid",
+                core::mem::offset_of!(CloneArgs, child_tid),
+                core::mem::size_of_val(&a.child_tid),
+            ),
+            (
+                "parent_tid",
+                core::mem::offset_of!(CloneArgs, parent_tid),
+                core::mem::size_of_val(&a.parent_tid),
+            ),
+            (
+                "exit_signal",
+                core::mem::offset_of!(CloneArgs, exit_signal),
+                core::mem::size_of_val(&a.exit_signal),
+            ),
+        ] {
+            assert!(off + size <= cut, "{name} must fit entirely in the short prefix");
         }
-        assert_eq!(short.flags, 0x1_0000);
-        assert_eq!(short.exit_signal, 17);
-        assert_eq!(short.stack, 0, "past the copied prefix");
-        assert_eq!(short.tls, 0);
+        for (name, off) in [
+            ("stack", core::mem::offset_of!(CloneArgs, stack)),
+            ("stack_size", core::mem::offset_of!(CloneArgs, stack_size)),
+            ("tls", core::mem::offset_of!(CloneArgs, tls)),
+        ] {
+            assert!(off >= cut, "{name} must lie past the short prefix");
+        }
+        assert_eq!(cut, 40, "five 8-byte fields");
+        assert_eq!(core::mem::size_of::<CloneArgs>(), 64);
     }
 
     /// The whole point of `_align`: `totalhigh` is at 88, not 84. A packed or
@@ -189,16 +201,12 @@ mod tests {
     /// crash.
     #[test]
     fn sysinfo_procs_and_totalhigh_straddle_the_alignment_hole() {
-        let mut si = Sysinfo::default();
-        si.procs = 0x1234;
-        si.totalhigh = 0x0102_0304_0506_0708;
-        let raw: [u8; 112] = unsafe { core::mem::transmute(si) };
-        assert_eq!(u16::from_le_bytes(raw[80..82].try_into().unwrap()), 0x1234);
-        assert_eq!(u32::from_le_bytes(raw[84..88].try_into().unwrap()), 0, "_align");
-        assert_eq!(
-            u64::from_le_bytes(raw[88..96].try_into().unwrap()),
-            0x0102_0304_0506_0708
-        );
+        let si = Sysinfo::default();
+        assert_eq!(core::mem::offset_of!(Sysinfo, procs), 80);
+        assert_eq!(core::mem::size_of_val(&si.procs), 2);
+        assert_eq!(core::mem::offset_of!(Sysinfo, _align), 84, "the hole, spelled out");
+        assert_eq!(core::mem::size_of_val(&si._align), 4);
+        assert_eq!(core::mem::offset_of!(Sysinfo, totalhigh), 88, "88, not 84");
     }
 
     /// Every byte of a defaulted `Sysinfo` is zero, tail padding included.
@@ -209,8 +217,49 @@ mod tests {
     /// the explicit `_f` field is what preserves it.
     #[test]
     fn defaulted_sysinfo_has_no_uninitialised_bytes() {
-        let raw: [u8; 112] = unsafe { core::mem::transmute(Sysinfo::default()) };
-        assert!(raw.iter().all(|b| *b == 0), "padding byte is not zeroed");
+        let si = Sysinfo::default();
+        // Every byte is accounted for by a *named* field, so there is no
+        // implicit padding for the compiler to leave uninitialised — which is
+        // the property that matters, and a stronger statement than "the bytes
+        // happened to be zero this run". Reading padding to check it would
+        // itself be undefined behaviour.
+        let named: usize = [
+            core::mem::size_of_val(&si.uptime),
+            core::mem::size_of_val(&si.loads),
+            core::mem::size_of_val(&si.totalram),
+            core::mem::size_of_val(&si.freeram),
+            core::mem::size_of_val(&si.sharedram),
+            core::mem::size_of_val(&si.bufferram),
+            core::mem::size_of_val(&si.totalswap),
+            core::mem::size_of_val(&si.freeswap),
+            core::mem::size_of_val(&si.procs),
+            core::mem::size_of_val(&si.pad),
+            core::mem::size_of_val(&si._align),
+            core::mem::size_of_val(&si.totalhigh),
+            core::mem::size_of_val(&si.freehigh),
+            core::mem::size_of_val(&si.mem_unit),
+            core::mem::size_of_val(&si._f),
+        ]
+        .iter()
+        .sum();
+        assert_eq!(
+            named,
+            core::mem::size_of::<Sysinfo>(),
+            "an unnamed padding byte is a kernel-stack byte handed to userspace"
+        );
+        // ...and every one of those named fields defaults to zero, including the
+        // three that exist only to occupy space (`pad`, `_align`, `_f`).
+        assert_eq!(si.uptime, 0);
+        assert_eq!(si.loads, [0; 3]);
+        assert_eq!(
+            (si.totalram, si.freeram, si.sharedram, si.bufferram),
+            (0, 0, 0, 0)
+        );
+        assert_eq!((si.totalswap, si.freeswap), (0, 0));
+        assert_eq!((si.procs, si.pad, si._align), (0, 0, 0));
+        assert_eq!((si.totalhigh, si.freehigh), (0, 0));
+        assert_eq!(si.mem_unit, 0);
+        assert_eq!(si._f, [0; 4]);
     }
 
     /// The four `clone` flags `sys_clone_pidfd` branches on, against the values

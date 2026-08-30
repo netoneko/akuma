@@ -115,18 +115,11 @@ mod tests {
     /// installed handler run with another handler's flags.
     #[test]
     fn kernel_sigaction_is_handler_flags_restorer_mask() {
-        let a = KernelSigaction {
-            sa_handler: 0x1111_1111_1111_1111,
-            sa_flags: 0x2222_2222_2222_2222,
-            sa_restorer: 0x3333_3333_3333_3333,
-            sa_mask: 0x4444_4444_4444_4444,
-        };
-        let raw: [u8; 32] = unsafe { core::mem::transmute(a) };
-        let word = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
-        assert_eq!(word(0), 0x1111_1111_1111_1111, "sa_handler");
-        assert_eq!(word(1), 0x2222_2222_2222_2222, "sa_flags");
-        assert_eq!(word(2), 0x3333_3333_3333_3333, "sa_restorer");
-        assert_eq!(word(3), 0x4444_4444_4444_4444, "sa_mask");
+        assert_eq!(core::mem::offset_of!(KernelSigaction, sa_handler), 0, "sa_handler");
+        assert_eq!(core::mem::offset_of!(KernelSigaction, sa_flags), 8, "sa_flags");
+        assert_eq!(core::mem::offset_of!(KernelSigaction, sa_restorer), 16, "sa_restorer");
+        assert_eq!(core::mem::offset_of!(KernelSigaction, sa_mask), 24, "sa_mask");
+        assert_eq!(core::mem::size_of::<KernelSigaction>(), 32);
     }
 
     /// The `_pad` in `stack_t`, demonstrated: `size` is the *third* 8-byte word,
@@ -134,8 +127,10 @@ mod tests {
     #[test]
     fn stack_t_size_is_the_third_word() {
         let s = StackT { sp: 1, flags: -1, _pad: 0, size: 0xDEAD_BEEF };
-        let raw: [u8; 24] = unsafe { core::mem::transmute(s) };
-        assert_eq!(u64::from_le_bytes(raw[16..24].try_into().unwrap()), 0xDEAD_BEEF);
+        assert_eq!(core::mem::offset_of!(StackT, flags), 8);
+        assert_eq!(core::mem::size_of_val(&s.flags), 4, "flags is 32-bit; `_pad` fills the rest");
+        assert_eq!(core::mem::offset_of!(StackT, size), 16, "the third word, not 12");
+        assert_eq!(core::mem::size_of::<StackT>(), 24);
     }
 
     /// `SigChld` overlays the front of `Siginfo`: the two must agree on

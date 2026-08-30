@@ -200,13 +200,12 @@ mod tests {
     /// host test: the field order is what puts `tv_sec` in the low 8 bytes.
     #[test]
     fn timespec_field_order_is_sec_then_nsec() {
-        let ts = Timespec {
-            tv_sec: 0x1234_5678_9ABC_DEF0_u64.cast_signed(),
-            tv_nsec: 0xFEDC_BA98_7654_3210_u64.cast_signed(),
-        };
-        let raw: [u8; 16] = unsafe { core::mem::transmute(ts) };
-        assert_eq!(u64::from_le_bytes(raw[0..8].try_into().unwrap()), 0x1234_5678_9ABC_DEF0);
-        assert_eq!(u64::from_le_bytes(raw[8..16].try_into().unwrap()), 0xFEDC_BA98_7654_3210);
+        let ts = Timespec { tv_sec: 1, tv_nsec: 2 };
+        assert_eq!(core::mem::offset_of!(Timespec, tv_sec), 0, "tv_sec is the low word");
+        assert_eq!(core::mem::size_of_val(&ts.tv_sec), 8);
+        assert_eq!(core::mem::offset_of!(Timespec, tv_nsec), 8);
+        assert_eq!(core::mem::size_of_val(&ts.tv_nsec), 8);
+        assert_eq!(core::mem::size_of::<Timespec>(), 16);
     }
 
     /// `bits`/`from_bits` are a reinterpretation, not a conversion: a negative

@@ -92,10 +92,13 @@ mod tests {
     #[test]
     fn pollfd_revents_is_the_last_two_bytes() {
         let p = PollFd { fd: -1, events: 0x0102, revents: 0x0304 };
-        let raw: [u8; 8] = unsafe { core::mem::transmute(p) };
-        assert_eq!(i32::from_le_bytes(raw[0..4].try_into().unwrap()), -1);
-        assert_eq!(i16::from_le_bytes(raw[4..6].try_into().unwrap()), 0x0102);
-        assert_eq!(i16::from_le_bytes(raw[6..8].try_into().unwrap()), 0x0304);
+        assert_eq!(core::mem::offset_of!(PollFd, fd), 0);
+        assert_eq!(core::mem::size_of_val(&p.fd), 4);
+        assert_eq!(core::mem::offset_of!(PollFd, events), 4);
+        assert_eq!(core::mem::size_of_val(&p.events), 2, "an i32 here clobbers the next fd");
+        assert_eq!(core::mem::offset_of!(PollFd, revents), 6);
+        assert_eq!(core::mem::size_of_val(&p.revents), 2);
+        assert_eq!(core::mem::size_of::<PollFd>(), 8, "no tail padding after revents");
     }
 
     /// The aarch64-vs-x86-64 difference, stated as a test because it is the one
@@ -103,16 +106,13 @@ mod tests {
     /// second one at byte 16.
     #[test]
     fn epoll_event_array_stride_is_16_not_12() {
-        let evs = [
-            EpollEvent { events: 1, _pad: 0, data: 0x1111_1111_1111_1111 },
-            EpollEvent { events: 4, _pad: 0, data: 0x2222_2222_2222_2222 },
-        ];
-        let raw: [u8; 32] = unsafe { core::mem::transmute(evs) };
-        assert_eq!(u32::from_le_bytes(raw[16..20].try_into().unwrap()), 4);
-        assert_eq!(
-            u64::from_le_bytes(raw[24..32].try_into().unwrap()),
-            0x2222_2222_2222_2222
-        );
+        assert_eq!(core::mem::size_of::<EpollEvent>(), 16, "the array stride");
+        assert_eq!(core::mem::size_of::<[EpollEvent; 2]>(), 32, "so events[1] starts at 16");
+        // `_pad` is what buys the stride: without it `data` would sit at 4 and
+        // the struct would be 12.
+        assert_eq!(core::mem::offset_of!(EpollEvent, events), 0);
+        assert_eq!(core::mem::offset_of!(EpollEvent, _pad), 4);
+        assert_eq!(core::mem::offset_of!(EpollEvent, data), 8);
     }
 
     /// `iov_len` is `size_t`, so the pair is 16 bytes and a `readv` of N

@@ -37,6 +37,20 @@ pub struct MsgHdr {
     pub msg_control: u64,
     pub msg_controllen: u64,
     pub msg_flags: i32,
+    /// The four bytes of trailing struct padding, spelled out.
+    ///
+    /// Same reason `Sysinfo` carries `_f`: `write_user_val` copies
+    /// `size_of::<T>()` bytes straight out of the value, so an *unnamed* padding
+    /// byte is whatever the kernel stack held. `sys_recvmsg` happens to be safe
+    /// without this — `read_user_into` overwrites all 56 bytes from user memory
+    /// first, so the tail carries the caller's own data — but that is a property
+    /// of one call flow, not of the type, and the next writer of a `MsgHdr` need
+    /// not preserve it. Naming it also makes the struct fully accounted for, so
+    /// `transmute`-ing one to bytes is no longer reading uninitialised memory.
+    ///
+    /// Costs nothing: `msg_flags` ends at 52 and the struct is 8-aligned, so
+    /// these four bytes existed either way. Added 2026-08-30.
+    pub _pad3: u32,
 }
 
 /// Linux `struct ucred` — what `SO_PEERCRED` returns.
@@ -97,6 +111,7 @@ const _: () = assert!(core::mem::offset_of!(MsgHdr, msg_iov) == 16);
 const _: () = assert!(core::mem::offset_of!(MsgHdr, msg_control) == 32);
 const _: () = assert!(core::mem::offset_of!(MsgHdr, msg_controllen) == 40);
 const _: () = assert!(core::mem::offset_of!(MsgHdr, msg_flags) == 48);
+const _: () = assert!(core::mem::offset_of!(MsgHdr, _pad3) == 52);
 const _: () = assert!(core::mem::size_of::<Ucred>() == 12);
 const _: () = assert!(core::mem::size_of::<SockAddrHw>() == 16);
 const _: () = assert!(core::mem::size_of::<IfConfHdr>() == 16);
@@ -111,25 +126,17 @@ mod tests {
     /// and 28, and `recvmsg` would read a pointer straddling two fields.
     #[test]
     fn msghdr_pointers_land_on_word_boundaries() {
-        let m = MsgHdr {
-            msg_name: 0x1111_1111_1111_1111,
-            msg_namelen: 16,
-            _pad1: 0,
-            msg_iov: 0x2222_2222_2222_2222,
-            msg_iovlen: 3,
-            _pad2: 0,
-            msg_control: 0x3333_3333_3333_3333,
-            msg_controllen: 64,
-            msg_flags: -1,
-        };
-        let raw: [u8; 56] = unsafe { core::mem::transmute(m) };
-        let word = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
-        assert_eq!(word(0), 0x1111_1111_1111_1111, "msg_name");
-        assert_eq!(word(1), 16, "msg_namelen + zero pad");
-        assert_eq!(word(2), 0x2222_2222_2222_2222, "msg_iov");
-        assert_eq!(word(3), 3, "msg_iovlen + zero pad");
-        assert_eq!(word(4), 0x3333_3333_3333_3333, "msg_control");
-        assert_eq!(word(5), 64, "msg_controllen");
+        assert_eq!(core::mem::offset_of!(MsgHdr, msg_name), 0, "msg_name");
+        assert_eq!(core::mem::offset_of!(MsgHdr, msg_namelen), 8, "msg_namelen");
+        assert_eq!(core::mem::offset_of!(MsgHdr, _pad1), 12, "_pad1 fills the word");
+        assert_eq!(core::mem::offset_of!(MsgHdr, msg_iov), 16, "msg_iov — 16, not 12");
+        assert_eq!(core::mem::offset_of!(MsgHdr, msg_iovlen), 24, "msg_iovlen");
+        assert_eq!(core::mem::offset_of!(MsgHdr, _pad2), 28, "_pad2 fills the word");
+        assert_eq!(core::mem::offset_of!(MsgHdr, msg_control), 32, "msg_control — 32, not 28");
+        assert_eq!(core::mem::offset_of!(MsgHdr, msg_controllen), 40, "msg_controllen");
+        assert_eq!(core::mem::offset_of!(MsgHdr, msg_flags), 48, "msg_flags");
+        assert_eq!(core::mem::offset_of!(MsgHdr, _pad3), 52, "the tail pad, named");
+        assert_eq!(core::mem::size_of::<MsgHdr>(), 56, "unchanged by naming the tail");
     }
 
     /// `SOCK_CLOEXEC` and `SOCK_NONBLOCK` must not collide with the socket
