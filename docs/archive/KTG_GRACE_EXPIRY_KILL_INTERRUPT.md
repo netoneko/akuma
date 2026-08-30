@@ -162,9 +162,40 @@ scripts/futex_suite.py --port 2222        # includes the new futexkill probe
 
 `futexkill` forks a child, parks N siblings in an untimed `FUTEX_WAIT`, has the
 child signal readiness through a pipe immediately before `exit_group`, and times
-`exit_group` → reaped from the parent. A regressed kernel reports ~2000 ms per
-round; a fixed one reports single-digit ms. The limit is 500 ms — far below the
-2 s grace, far above any healthy exit.
+`exit_group` → reaped from the parent.
+
+**Measured A/B, 2026-08-30** — same disk image, same probe binary, same SMP=4
+guest, only the kernel differs:
+
+| kernel | exit_group → reaped |
+|---|---|
+| `1841b32e` (pre-fix) | 2000 ms, 2000 ms, 2000 ms — **FAIL** |
+| + this fix | 1, 1, 0, 1, 1 ms — **PASS** (worst 1 ms) |
+
+The baseline figure is not "slow", it is **exactly `KILL_GRACE_US`**. Three rounds
+landing on the constant is the signature of a deadline being waited out rather than
+work taking time, and it is why the grace expiries in §1 arrive at a ~2.1 s cadence.
+Nothing in the probe is timing-sensitive: a pre-fix kernel cannot finish faster than
+the grace period, and a fixed one has nothing to wait for. The 500 ms limit sits far
+below the 2 s grace and far above any healthy exit.
+
+`scripts/verify_trim.py` against the same baseline shows the boot suite unchanged
+apart from the new test: `passed_marker` 309 → 310 (SMP=1) and 317 → 318 (SMP=4),
+`fail_set` empty on both arms, `bkl_stuck` 102 → 103, clippy clean on all four
+feature sets, 1019 host tests / 0 failed. The one SMP=4 exercise that segfaults per
+run moves between `bssfork` (baseline) and `cowstale` (this tree) — a known
+load-driven class, unrelated.
+
+### 6.1 A pre-existing failure this verification surfaced — NOT this fix
+
+`futextest` phases 6 and 7 fail with `pthread_create: No error information`
+(`EAGAIN`). They fail **identically on `1841b32e`**, which is why the A/B above was
+run before drawing any conclusion — a futex suite going red right after a change to
+the futex wait path is exactly the thing that gets blamed on the change.
+
+Root cause is ASID-pool exhaustion under a tight `pthread_create`/`join` loop, not
+anything in this area:
+[`ASID_EXHAUSTION_TIGHT_THREAD_LOOP.md`](ASID_EXHAUSTION_TIGHT_THREAD_LOOP.md).
 
 The boot-suite half is `test_pending_kill_interrupts_blocking_wait`, which asserts
 **both** readers see an armed kill, and consumes the request before returning so
