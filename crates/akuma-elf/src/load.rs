@@ -230,7 +230,7 @@ fn load_image(
             // Static-PIE (ET_DYN) binaries self-relocate at startup via musl's _dlstart_c.
             // `base` is 0 here — a non-PIE image loads where it was linked.
             if !is_pie {
-                apply_relocations(src, &headers, base, &mapped_pages)?;
+                apply_relocations(src, &headers, base, &mut address_space, &mapped_pages)?;
             }
             if DEBUG_ELF_LOADING {
                 log::debug!(
@@ -325,16 +325,12 @@ pub(super) fn map_segment_eager(
     for i in 0..num_pages {
         let page_va = start_page + i * PAGE_SIZE;
 
-        let frame_addr = match mapped_pages.get(&page_va) {
-            Some(&pa) => pa,
-            None => {
-                let frame = address_space
-                    .alloc_and_map(page_va, page_flags)
-                    .map_err(ElfError::MappingFailed)?;
-                mapped_pages.insert(page_va, frame.addr);
-                frame.addr
-            }
-        };
+        if let alloc::collections::btree_map::Entry::Vacant(e) = mapped_pages.entry(page_va) {
+            let frame = address_space
+                .alloc_and_map(page_va, page_flags)
+                .map_err(ElfError::MappingFailed)?;
+            e.insert(frame.addr);
+        }
 
         // `None` means the page holds no file bytes: it is past `filesz` and so
         // pure .bss, which `alloc_and_map` already handed us zeroed.
@@ -345,7 +341,10 @@ pub(super) fn map_segment_eager(
         };
 
         let chunk = src.read_at(offset + src_offset, copy_len)?;
-        crate::frame_write(frame_addr, dst_offset, &chunk);
+        // `alloc_and_map` above guarantees the page is mapped in this address
+        // space, so the write cannot miss.
+        let ok = address_space.write_page_bytes(page_va, dst_offset, &chunk);
+        debug_assert!(ok, "segment page {page_va:#x} vanished between map and copy");
     }
 
     Ok(())
@@ -370,6 +369,7 @@ pub(super) fn apply_relocations(
     src: ElfSource<'_>,
     headers: &ElfHeaders<'_>,
     base: usize,
+    address_space: &mut UserAddressSpace,
     mapped_pages: &BTreeMap<usize, usize>,
 ) -> Result<usize, ElfError> {
     let shdr_bytes = headers.read_section_header_bytes(src)?;
@@ -422,8 +422,13 @@ pub(super) fn apply_relocations(
                 _ => continue,
             };
 
-            crate::frame_write(pa, vaddr & (PAGE_SIZE - 1), &value.to_ne_bytes());
-            applied += 1;
+            // `mapped_pages` says the loader mapped this page, so the write
+            // lands; `write_page_bytes` re-derives the frame from the address
+            // space rather than trusting the cached PA.
+            let _ = pa;
+            if address_space.write_page_bytes(page_va, vaddr & (PAGE_SIZE - 1), &value.to_ne_bytes()) {
+                applied += 1;
+            }
         }
     }
 

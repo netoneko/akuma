@@ -36,44 +36,49 @@ pub struct LoadedWithStack {
 }
 
 /// Helper to build a userspace stack according to Linux AArch64 ABI
-pub struct UserStack {
+/// Builds the initial user stack by writing through the address space that owns
+/// its pages.
+///
+/// It used to hold `frames: Vec<PhysFrame>` and write through `phys_to_virt`
+/// itself, which is what kept `unsafe` in this crate. Borrowing the
+/// `UserAddressSpace` instead moves that write to
+/// [`UserAddressSpace::write_page_bytes`], where `&mut self` on the address space
+/// is a real exclusivity proof — a `PhysFrame` value is not, since
+/// `PhysFrame::new` is safe and anyone can make one.
+pub struct UserStack<'a> {
     pub stack_bottom: usize,
     pub stack_top: usize,
     pub sp: usize,
-    pub frames: Vec<akuma_mmap::PhysFrame>,
+    address_space: &'a mut UserAddressSpace,
 }
 
-impl UserStack {
+impl<'a> UserStack<'a> {
     /// Copy `bytes` into the stack starting at virtual address `va`.
     ///
     /// Splits across frames via [`span::PageChunks`], so no write crosses a page.
-    /// `&mut self` is deliberate and `needless_pass_by_ref_mut` stays allowed.
-    /// The borrow checker sees only reads of `self.frames`, because the write
-    /// goes through a *physical* alias of the stack's pages that it cannot track
-    /// — but this call does mutate the stack's contents, and `&self` would let
-    /// two shared borrows write the same frame concurrently. The signature is
-    /// what makes the aliasing rule enforceable at the call sites.
-    #[allow(clippy::needless_pass_by_ref_mut)]
+    /// Copy `bytes` into the stack starting at virtual address `va`, splitting
+    /// across pages via [`span::PageChunks`] so no write crosses a boundary.
     fn write_at(&mut self, va: usize, bytes: &[u8]) {
-        for c in span::PageChunks::new(self.stack_bottom, va, bytes.len()) {
-            // `self.frames[..]` is bounds-checked, and `frame_write` asserts the
-            // window stays inside the frame — between them, an arithmetic slip
-            // panics instead of writing into whatever frame follows.
-            crate::frame_write(
-                self.frames[c.page_index].addr,
+        let base = self.stack_bottom;
+        for c in span::PageChunks::new(base, va, bytes.len()) {
+            let page_va = base + c.page_index * PAGE_SIZE;
+            let ok = self.address_space.write_page_bytes(
+                page_va,
                 c.offset,
                 &bytes[c.src_offset..c.src_offset + c.len],
             );
+            assert!(ok, "stack page {page_va:#x} is not mapped");
         }
     }
 
-    pub fn new(stack_bottom: usize, stack_top: usize, frames: Vec<akuma_mmap::PhysFrame>) -> Self {
-        Self {
-            stack_bottom,
-            stack_top,
-            sp: stack_top,
-            frames,
-        }
+    /// The pages of `[stack_bottom, stack_top)` must already be mapped in
+    /// `address_space` — [`write_at`](Self::write_at) asserts it.
+    pub fn new(
+        stack_bottom: usize,
+        stack_top: usize,
+        address_space: &'a mut UserAddressSpace,
+    ) -> Self {
+        Self { stack_bottom, stack_top, sp: stack_top, address_space }
     }
 
     pub fn push_str(&mut self, s: &str) -> usize {
@@ -114,7 +119,7 @@ impl UserStack {
 }
 
 pub fn setup_linux_stack(
-    stack: &mut UserStack,
+    stack: &mut UserStack<'_>,
     args: &[String],
     env: &[String],
     auxv: &[AuxEntry],
@@ -257,17 +262,15 @@ fn attach_stack(
     let stack_bottom = guard_page + PAGE_SIZE;
     let stack_pages = (stack_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    let mut stack_frames = Vec::new();
     for i in 0..stack_pages {
         let page_va = stack_bottom + i * PAGE_SIZE;
-        let frame = loaded
+        loaded
             .address_space
             .alloc_and_map(page_va, user_flags::RW_NO_EXEC)
             .map_err(ElfError::MappingFailed)?;
-        stack_frames.push(frame);
     }
 
-    let mut stack = UserStack::new(stack_bottom, stack_top, stack_frames);
+    let mut stack = UserStack::new(stack_bottom, stack_top, &mut loaded.address_space);
     let random_ptr = stack.push_raw(&[0u8; 16]);
 
     let actual_entry = if let Some(ref interp) = loaded.interp {

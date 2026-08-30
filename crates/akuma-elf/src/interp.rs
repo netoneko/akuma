@@ -116,7 +116,7 @@ fn load_interpreter(
 
     // Both .rela.dyn (DT_RELA) and .rela.plt (DT_JMPREL) are covered — the pass
     // walks every SHT_RELA section.
-    let applied = apply_relocations(src, &headers, base, &mapped_pages)?;
+    let applied = apply_relocations(src, &headers, base, address_space, &mapped_pages)?;
 
     if DEBUG_ELF_LOADING {
         log::debug!("[ELF] Interpreter: applied {} relocations", applied);

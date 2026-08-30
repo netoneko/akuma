@@ -1018,37 +1018,73 @@ it.**
 
 ### Verification
 
-`akuma-elf` 1 site (from 6); `akuma-mmap` 57 tests (from 38); tree 1,031 tests;
-all-crate clippy `-D warnings` + `--release` + `--profile extreme-size` clean;
-boot suite **178 `[TEST]` lines byte-identical to HEAD**, FS 6/0, 0 panics; and
-in-guest `cargo build` on the devbox image, which is the real exercise — this code
-runs on every `exec`.
+`akuma-mmap` 57 tests (from 38); tree 1,031 tests; all-crate clippy
+`-D warnings` + `--release` + `--profile extreme-size` clean; boot suite **178
+`[TEST]` lines byte-identical to HEAD**, FS 6/0, 0 panics.
 
-### A pre-existing failure this surfaced: `utimensat` at `MEMORY >= ~3.5 GB`
+This got to 1 site; §8.8 took it to **0**.
 
-Booting at `MEMORY=6144` panics the boot suite:
+### A pre-existing failure this surfaced: `utimensat` at `MEMORY >= ~4 GB`
+
+Booting at `MEMORY=6144` panicked the boot suite:
 
 ```
 [Test] utimensat times-EFAULT FAILED r=0 (want EFAULT)
 !!! PANIC !!! src/process_tests.rs:2994
 ```
 
-**Not caused by this change** — `HEAD` fails identically at 6144, and the same
-build passes at `MEMORY=2048`. The cause is in the test, not the kernel:
+**Not caused by this change** — `HEAD` failed identically at 6144, and the same
+build passed at `MEMORY=2048`.
+
+**An earlier draft of this section named the wrong mechanism.** It claimed
+`user_range_ok` "does not exclude the kernel identity-mapped range", implying a
+userspace pointer check was letting kernel addresses through. That is wrong and
+worth correcting explicitly, because it describes a privilege-escalation bug that
+does not exist. `user_range_ok` bounds against `USER_VA_LIMIT`
+(`0x0000_FFFF_FFFF_FFFF` — the whole lower half, i.e. "not TTBR1"), and
+`validate_user_range` then requires `is_current_user_range_mapped`, which walks
+the current TTBR0 **with a per-page EL0-accessibility (AP) test**. A kernel
+identity-map page fails that test.
+
+The actual cause is one line in the *test fixture*:
 
 ```rust
-// src/process_tests.rs:2932 — "an unreadable `times` pointer is EFAULT"
-let r = utimensat(AT_FDCWD, p.as_ptr() as u64, 0xdead_0000_u64, 0);
+// register_at_syscall_process, src/process_tests.rs
+crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
 ```
 
-`0xdead_0000` is **3.48 GiB**. RAM starts at `0x4000_0000`, so once `MEMORY`
-exceeds ~3.5 GB that address is inside the RAM identity map — mapped, readable,
-no fault, `r == 0`. `user_range_ok` deliberately does not exclude the kernel
-identity-mapped range (`process/user_access.rs`'s header, consequence #1), so
-nothing else catches it either.
+Its own doc says why, and the reason is sound: the boot suite has no user address
+space, so the `cstr` buffers these tests pass *are* kernel addresses, and
+`copy_from_user_str` could not read them otherwise. But `validate_user_range`
+returns `true` immediately when that flag is set — so neither `user_range_ok` nor
+the AP test runs, and the only remaining source of `EFAULT` is the copy
+trampoline, which fires on **unmapped** addresses only
+(`process/user_access.rs`'s header, consequence #1).
 
-The fix is to pick the address relative to `mmu::kernel_va_end()` rather than
-hardcoding a constant that only happens to be unmapped on small VMs. Left
-unfixed here: it is a test bug in `src/`, unrelated to this split, and folding it
-in would muddy the A/B. Worth doing before anyone runs the boot suite on the
-6-16 GB configurations self-hosting uses.
+The test then asked for `EFAULT` at a hardcoded `0xdead_0000` — **3.48 GiB**. RAM
+starts at `0x4000_0000`, so from `MEMORY=4096` upward that address is inside the
+kernel RAM identity map, which the boot-test context has in TTBR0 (the crash dump
+shows `TTBR0 == TTBR1 == 0x404af000`). Mapped, no fault, `r == 0`.
+
+**This is a test-fixture artifact, not a kernel hole.** A real process runs with
+`BYPASS_VALIDATION == false`, so both the range check and the AP test run against
+that process's own TTBR0, and `0xdead_0000` is rejected unless the process
+genuinely mapped it — which is correct behaviour.
+
+#### Fixed (2026-08-30)
+
+The address now derives from `mmu::kernel_va_end()` — the top of the identity map,
+rounded to 1 GB and **scaled with detected RAM** — plus 4 GiB of clearance. A
+twelfth case was added asserting the address is actually unmapped *before* the
+`EFAULT` case runs, so a future change that maps that range reports the
+precondition rather than a confusing `utimensat` failure. That self-check is the
+real fix; the constant was only the symptom.
+
+Verified at `MEMORY=6144`, which previously panicked on both HEAD and this branch:
+
+```
+[Test] utimensat PASSED (12 cases: present/ENOENT/neg-dirfd/unopen-dirfd/
+                         futimens/EFAULT+precondition/EINVALx2/sentinels/
+                         dev-null/readback)
+PANIC count: 0    [TEST] count: 178
+```

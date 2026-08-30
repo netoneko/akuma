@@ -1312,6 +1312,49 @@ impl UserAddressSpace {
         Ok(())
     }
 
+    /// Write `bytes` at `offset` within the page mapped at `page_va`.
+    ///
+    /// Returns `false` if `page_va` is not mapped in this address space; the
+    /// caller decides whether that is a bug or a skip.
+    ///
+    /// # Why this lives here
+    ///
+    /// It is the *only* way to put bytes into a user page from kernel code
+    /// without an `unsafe` block at the call site, and it is safe for a reason
+    /// that only this type can supply: **`&mut self` proves exclusive access to
+    /// the address space, and the mapping is this object's own state.** Nothing
+    /// else in the tree can make that argument — `akuma-pmm` cannot (it hands out
+    /// frames but does not know who holds them), and a free function taking a
+    /// `PhysFrame` cannot either (`PhysFrame::new` is safe, so a frame value
+    /// proves nothing about ownership).
+    ///
+    /// Added 2026-08-30 so `akuma-elf` could reach `#![forbid(unsafe_code)]`: its
+    /// six raw frame writes — a `PT_LOAD` segment copy, an `SHT_RELA` value, and
+    /// four `UserStack` pushes — were all into pages this method's receiver had
+    /// just returned from [`Self::alloc_and_map`]
+    /// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §8.8).
+    pub fn write_page_bytes(&mut self, page_va: usize, offset: usize, bytes: &[u8]) -> bool {
+        assert!(
+            offset + bytes.len() <= PAGE_SIZE,
+            "write_page_bytes {offset}+{} would leave the page",
+            bytes.len()
+        );
+        let page_base = page_va & !(PAGE_SIZE - 1);
+        let Some(pa) = self.translate(page_base) else {
+            return false;
+        };
+        // SAFETY: `translate` just confirmed `page_base` is mapped in *this*
+        // address space, so `pa` is a real frame reachable through the kernel's
+        // physical window. `&mut self` makes this borrow of the address space
+        // exclusive, so no other reference to those bytes exists. The assert
+        // bounds the write to the single frame backing that page.
+        unsafe {
+            let dst = akuma_primitives::addr::phys_to_virt(pa + offset);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        }
+        true
+    }
+
     pub fn alloc_and_map(&mut self, va: usize, user_flags: u64) -> Result<PhysFrame, &'static str> {
         let frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("Out of memory for user page")?;
         track_frame(frame, FrameSource::ElfLoader);

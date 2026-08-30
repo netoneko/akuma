@@ -45,6 +45,14 @@
 //! bug, not a condition to degrade through.
 
 #![cfg_attr(not(test), no_std)]
+// Zero `unsafe` as of 2026-08-30. The crate had six raw frame writes — a PT_LOAD
+// segment copy, an SHT_RELA value, and four `UserStack` pushes — all of them
+// `phys_to_virt` + a pointer store into a page that `UserAddressSpace` had just
+// mapped. They are now `UserAddressSpace::write_page_bytes`, where `&mut self` on
+// the address space is a real exclusivity proof, and the page/offset arithmetic
+// they open-coded is `akuma_mmap::span`, host-tested. `forbid`, not `deny`, so no
+// module can opt back in. See `docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §8.7-8.8.
+#![forbid(unsafe_code)]
 // Inherited verbatim from `akuma-exec`'s crate-root `allow` list. This code did
 // not change when it moved out on 2026-08-30, so its lint posture must not
 // either — a split that silently turns 20 warnings on is not behaviour-preserving,
@@ -135,47 +143,6 @@ pub fn register_vfs_hooks(h: VfsHooks) {
 #[inline]
 pub(crate) fn vfs() -> VfsHooks {
     VFS.require()
-}
-
-/// Write `bytes` at `offset` within the physical frame at `frame_pa`.
-///
-/// # The only `unsafe` in this crate
-///
-/// It replaced six open-coded `phys_to_virt` + raw-pointer writes: two in the
-/// segment loader (a `PT_LOAD` copy and an `SHT_RELA` value) and four in
-/// `UserStack` (`push_str` and its NUL, `push_u64`, `push_raw`). All six were the
-/// same operation — *put these bytes in that frame* — each with its own inlined
-/// page/offset arithmetic and none with a bounds check. `push_u64` in particular
-/// asserted by *comment* that "since SP was aligned to 8 or 16, a u64 won't cross
-/// a 4KB boundary".
-///
-/// The arithmetic those call sites open-coded now lives in `akuma_mmap::span`,
-/// host-tested, where `chunks_never_cross_a_page_boundary` and
-/// `a_copy_window_never_leaves_its_page` pin the property the assert below
-/// checks at runtime.
-///
-/// # Safety
-///
-/// Deliberately not an `unsafe fn`: it is `pub(crate)`, and every caller has just
-/// obtained `frame_pa` from `UserAddressSpace::alloc_and_map` for the page it is
-/// filling — either directly (the segment loader) or via `UserStack`'s owned
-/// `Vec<PhysFrame>`. The frame is therefore mapped, owned by the address space
-/// under construction, and referenced by nothing else: the loader has not handed
-/// the image to a thread yet. The assert bounds the write to that one frame
-/// whatever the caller computed.
-pub(crate) fn frame_write(frame_pa: usize, offset: usize, bytes: &[u8]) {
-    assert!(
-        offset + bytes.len() <= akuma_mmap::PAGE_SIZE,
-        "frame write at {offset}+{} would leave the page",
-        bytes.len()
-    );
-    // SAFETY: `frame_pa` is a frame `alloc_and_map` just returned for the page
-    // being filled, reachable through the kernel's physical window; the assert
-    // above keeps the write inside that frame.
-    unsafe {
-        let dst = akuma_primitives::addr::phys_to_virt(frame_pa + offset);
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
-    }
 }
 
 pub mod types;

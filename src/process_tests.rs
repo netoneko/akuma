@@ -2928,8 +2928,37 @@ fn test_utimensat() {
     check(r == EBADF, "futimens-badfd", r, "EBADF");
 
     // 6. An unreadable `times` pointer is EFAULT.
+    //
+    // The address is derived from `kernel_va_end()`, not hardcoded. It used to be
+    // `0xdead_0000` — 3.48 GiB — which is only unmapped while RAM ends below it.
+    // RAM starts at `0x4000_0000`, so from `MEMORY=4096` upward that constant
+    // lands *inside* the kernel RAM identity map, the copy succeeds, and this case
+    // failed (panicking the whole boot suite) on exactly the 6-16 GB
+    // configurations self-hosting uses.
+    //
+    // Note what does NOT save it: this fixture sets `BYPASS_VALIDATION` — it has
+    // to, since the boot suite has no user address space and its `cstr` buffers
+    // are kernel addresses — so `validate_user_range` returns `true` without
+    // running `user_range_ok` or the AP test. The only remaining source of EFAULT
+    // is the copy trampoline, which fires on **unmapped** addresses only
+    // (`process/user_access.rs`'s header, consequence #1). So the address has to
+    // be genuinely unmapped, at any `MEMORY`.
+    //
+    // `kernel_va_end()` is the top of the identity map rounded up to 1 GB and
+    // scales with detected RAM; a further 4 GiB clears anything the loader or a
+    // test process might have placed just above it.
+    let unmapped_times = akuma_exec::mmu::kernel_va_end() as u64 + 0x1_0000_0000;
+    // Self-check, so a future change that maps this range reports *that* rather
+    // than a confusing `utimensat` failure — the exact confusion the hardcoded
+    // constant caused.
+    check(
+        !akuma_exec::mmu::is_current_user_page_mapped(unmapped_times as usize),
+        "times-EFAULT-precondition",
+        unmapped_times,
+        "an unmapped address (test address is mapped; EFAULT case would be vacuous)",
+    );
     let p = cstr(&format!("{ROOT}/present.txt"));
-    let r = utimensat(AT_FDCWD, p.as_ptr() as u64, 0xdead_0000_u64, 0);
+    let r = utimensat(AT_FDCWD, p.as_ptr() as u64, unmapped_times, 0);
     check(r == EFAULT, "times-EFAULT", r, "EFAULT");
 
     // 7. A `tv_nsec` that is neither a legal nanosecond count nor one of the two
@@ -2988,10 +3017,10 @@ fn test_utimensat() {
     clean_at_test_tree(ROOT, &[]);
 
     if fails == 0 {
-        crate::safe_print!(160, "[Test] utimensat PASSED (11 cases: present/ENOENT/neg-dirfd/unopen-dirfd/futimens/EFAULT/EINVALx2/sentinels/dev-null/readback)\n");
+        crate::safe_print!(176, "[Test] utimensat PASSED (12 cases: present/ENOENT/neg-dirfd/unopen-dirfd/futimens/EFAULT+precondition/EINVALx2/sentinels/dev-null/readback)\n");
     } else {
-        crate::safe_print!(64, "[Test] utimensat FAILED ({} of 11 cases)\n", fails);
-        panic!("test_utimensat: {fails} of 11 cases failed");
+        crate::safe_print!(64, "[Test] utimensat FAILED ({} of 12 cases)\n", fails);
+        panic!("test_utimensat: {fails} of 12 cases failed");
     }
 }
 
