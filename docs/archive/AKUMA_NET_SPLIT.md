@@ -834,6 +834,39 @@ One pre-existing failure, unrelated: `/bin/nettest` (the libcurl probe) cannot
 load `libgcc_s.so.1` on this disk image. A packaging gap, not a networking one.
 
 
+### 6.7 `akuma-firecracker` too (2026-08-30)
+
+Its two `unsafe` were one thing — `describe_ptr(*const u8)` and the
+`Fdt::from_ptr` inside it — and they moved to the caller rather than being
+removed. Three facts made that a relocation and not a shell game:
+
+1. `describe_ptr` had **one** caller, `platform::install_fdt_device_map`, which
+   is itself an `unsafe fn` carrying the identical contract ("must point at a
+   mapped, complete FDT blob").
+2. The kernel already makes the same `unsafe { fdt::Fdt::from_ptr(..) }` call
+   thirty lines away in `smp_shared::probe_dtb`, on the same blob.
+3. It already depends on the same `fdt` version.
+
+So `describe_fdt(&Fdt)` became the public entry point, the caller materialises
+the `Fdt`, and the crate is `#![forbid(unsafe_code)]`.
+
+The point is where the audit boundary sits, not the badge: the 470 lines of FDT
+offset arithmetic — the part with real bug potential, and the reason the
+fixtures in `docs/reference/firecracker/fdt/` are unit tests — are now
+compiler-checked, while the one-line pointer materialisation sits beside its
+twin in the bin crate, which can never be `forbid` anyway.
+
+Verified: 19 crate tests, 50 workspace targets, clippy clean, and a boot —
+316 PASSED with `[Platform] FDT device map: GICR=0x80a0000` and
+`[Test] gicr-device-map PASSED (qemu-virt: GICR=0x80a0000 GICD=0x8000000
+cores=2)`, i.e. the parse still produces the right answers against a machine
+whose values are independently known.
+
+```
+enforced unsafe-free    17 of 25  ->  18 of 25 crates
+code in those crates    36.8%     ->  37.9%
+```
+
 ## 7. What is left
 
 - **Steps 3 and 5 of §5.1c** — the `TcpStack` trait in `akuma-primitives` and

@@ -305,7 +305,13 @@ pub unsafe fn install_fdt_device_map(dtb_ptr: usize) -> FdtMapOutcome {
         return FdtMapOutcome::NoFdt;
     }
     // SAFETY: the caller guarantees `dtb_ptr` is mapped and holds a complete FDT.
-    let desc = match unsafe { akuma_firecracker::describe_ptr(dtb_ptr as *const u8) } {
+    // The same call `smp_shared::probe_dtb` makes on the same blob. Done here
+    // rather than inside `akuma-firecracker` so that crate can be
+    // `forbid(unsafe_code)` — its job is parsing, and parsing needs no pointers.
+    let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8) }) else {
+        return FdtMapOutcome::NoFdt;
+    };
+    let desc = match akuma_firecracker::describe_fdt(&fdt) {
         Ok(d) => d,
         Err(akuma_firecracker::Error::BadFdt) => return FdtMapOutcome::NoFdt,
         Err(e) => return FdtMapOutcome::Rejected(e),

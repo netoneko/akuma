@@ -80,6 +80,10 @@
 //! before the FDT can be parsed.
 
 #![no_std]
+// Unsafe-free by design, and `forbid` so no module can opt back in with a local
+// `allow`. Same reasoning as `akuma-net-yarn` and `akuma-syscalls-sync`. See
+// `describe_fdt` for the one `unsafe` this crate used to have and where it went.
+#![forbid(unsafe_code)]
 
 use fdt::Fdt;
 
@@ -282,19 +286,22 @@ pub fn describe(blob: &[u8]) -> Result<MachineDescription, Error> {
     describe_fdt(&fdt)
 }
 
-/// Parse a device tree from a raw pointer — the boot path, where `x0` holds the
-/// FDT address.
+/// Parse a device tree the caller has already materialised.
 ///
-/// # Safety
+/// The boot path used to reach this crate through a `describe_ptr(*const u8)`
+/// that called `Fdt::from_ptr` internally — the crate's only `unsafe`, and the
+/// only reason it could not be `#![forbid(unsafe_code)]`. It moved to the caller
+/// on 2026-08-30, which was a relocation with three things going for it: the one
+/// caller (`platform::install_fdt_device_map`) is itself an `unsafe fn`
+/// carrying the identical contract, the kernel already makes the same
+/// `Fdt::from_ptr` call thirty lines away in `smp_shared::probe_dtb`, and it
+/// already depends on the same `fdt` version.
 ///
-/// `ptr` must point at a valid, complete FDT blob that outlives the call.
-pub unsafe fn describe_ptr(ptr: *const u8) -> Result<MachineDescription, Error> {
-    // SAFETY: the caller guarantees `ptr` points at a live, complete FDT blob.
-    let fdt = unsafe { Fdt::from_ptr(ptr) }.map_err(|_| Error::BadFdt)?;
-    describe_fdt(&fdt)
-}
-
-fn describe_fdt(fdt: &Fdt<'_>) -> Result<MachineDescription, Error> {
+/// What that buys is not a badge: the 470 lines of offset arithmetic in this
+/// crate — the part with real bug potential, and the reason the FDT fixtures in
+/// `docs/reference/firecracker/fdt/` are unit tests — are now compiler-checked,
+/// and the one-line pointer materialisation sits beside its twin in the kernel.
+pub fn describe_fdt(fdt: &Fdt<'_>) -> Result<MachineDescription, Error> {
     let ram = fdt
         .memory()
         .regions()
