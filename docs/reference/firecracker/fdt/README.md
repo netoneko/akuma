@@ -99,6 +99,9 @@ agree.
 
 ## Nodes Akuma does not get
 
-Nothing in the tree corresponds to `fw_cfg` (QEMU-only, hence `ramfb.rs` being
-gated off) or to PCI. Present but unused by Akuma: `rtc@40001000` (PL031),
+Nothing in the tree corresponds to `fw_cfg` (QEMU-only) or to PCI. The fw_cfg
+absence used to matter — it is why `ramfb.rs` was gated off here — but the
+framebuffer path was removed entirely on 2026-08-31
+([`../../../archive/FRAMEBUFFER_REMOVED.md`](../../../archive/FRAMEBUFFER_REMOVED.md)),
+so nothing in the kernel looks for it on any platform now. Present but unused by Akuma: `rtc@40001000` (PL031),
 `vmgenid`, `ptp@2149572608` (`0x80200000`), `intc/msic`, `apb-pclk`.

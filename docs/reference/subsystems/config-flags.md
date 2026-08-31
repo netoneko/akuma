@@ -32,7 +32,7 @@ Source: `Cargo.toml:73-105`.
 `default` (`Cargo.toml:109-124`):
 ```
 smp-shared, smoltcp, sound, rump, fs-cache,
-sc-aio, sc-sysv-ipc, sc-framebuffer, sc-containers,
+sc-aio, sc-sysv-ipc, sc-containers,
 sc-timerfd, sc-eventfd, sc-pidfd, sc-epoll,
 many-sessions
 ```
@@ -72,7 +72,6 @@ re-add what they need. `Cargo.toml:361-369`.
 |---|---|---|
 | `sc-aio` | 1 (dead weight) | |
 | `sc-sysv-ipc` | 1 | |
-| `sc-framebuffer` | 1 | |
 | `sc-containers` | 1 | |
 | `sc-timerfd` | 1 | |
 | `sc-eventfd` | 2 (needs ExecRuntime stub when off) | |
@@ -120,7 +119,6 @@ each is a byte-for-byte no-op on any build that doesn't set both. See
 | `bkl-profile` | `kernel_bkl_profile` | **no — measurement only** | Per-tag BKL-hold profiler + periodic `[BKLPROF]` histogram. Perturbs timing; never ship it. |
 | `read-profile` | *(feature only)* | **no — measurement only** | Per-stage `read(2)` accounting: `sys_read`'s `File` arm, `handle_syscall` and the EL0 handler each time themselves, and a `[READPROF]` window prints every 256 file reads — which stage of a warm read is validation, fd lookup, the staging allocation, ext2, the user copy, or the two wrappers. Answers what neither `bkl-profile` ("which syscall held the lock") nor `net-profile` ("how long was the device busy") can: the split *inside* one syscall. **Single-core only** (the wrapper spans are handed up by one flag — run `SMP=1`), and **never read wall-clock throughput off this build**: the dump's own console write is ~55 ms per window. Use `scripts/benchmarks/read_stage_profile.py`, which drops windows with mixed request sizes or preempted samples. Background: `docs/archive/EXT2_READ_PATH_STAGE_PROFILE.md`. |
 | `CONSOLE_LOCK` (env) | `kernel_console_lock` | **default-on in `release`; off in `extreme-size`** | Cross-core spinlock + owner-core-ID reentrancy guard around `console::emit`'s UART write loop, so two cores under `smp-shared` can't byte-interleave each other's lines at the shared PL011 register. Default-on for `release` (OPT_LEVEL != "z") since 2026-08-11 after SMP=4 verification; off in `extreme-size` (single-core target, lock is pure overhead). `CONSOLE_LOCK=0` opt-out (debug), `CONSOLE_LOCK=1` force-on in `extreme-size` (test). Background: `docs/archive/UART_SMP_INTERLEAVE_FIX.md`. |
-| `sc-framebuffer` + platform | `kernel_framebuffer` | **on for QEMU virt; off for `platform-firecracker`** | The ramfb framebuffer and the `fw_cfg` driver it is configured through. Firecracker's device tree has no `fw_cfg` node and upstream has no such device, so on that platform the driver is not merely unused but undriveable — and `ramfb::init` used to take a data abort (`EC=0x25`, `FAR=0x8000012008`) writing the selector register on an unmapped window. Gates `src/ramfb.rs`, `src/fw_cfg.rs`, `src/syscall/fb.rs`, the `FB_*` syscall numbers and their dispatch arms. Cargo features are additive and a platform cannot subtract one, so `sc-framebuffer` stays in `default` and this cfg is what the build keys off. Asserted by `test_platform_device_gates`. |
 | `sound` + platform | `kernel_audio` | **on for QEMU virt; off for `platform-firecracker`** | The virtio-sound driver and `/dev/dsp`. Firecracker implements net/block/balloon/vsock/rng and no sound device — confirmed by the FDT it emits (`docs/reference/firecracker/fdt/`), which carries three virtio nodes, none of them sound. With this off, `src/main.rs` provides a stub `audio` module mirroring `akuma-virtio`'s own feature-off `imp`, so the syscall layer compiles unchanged and `/dev/dsp` never opens (`is_available()` is false, the gate `syscall/fs.rs` already applied). The boot probe is skipped too: walking eight virtio slots to report "not available" every boot is noise. Asserted by `test_platform_device_gates`. |
 
 Each carve-out also has a **runtime** toggle (default on) for same-binary A/B and

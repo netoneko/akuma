@@ -135,22 +135,30 @@ virt's `0x080A_0000` from its own tree, where the boot suite stays at 298/0 unde
 `SMP=4` — that boot is what proves the parse against a machine whose answers are
 independently known.
 
-### 3.4 No `fw_cfg`, no RTC, no ramfb — and since 2026-08-21, none compiled in
+### 3.4 No `fw_cfg`, no RTC, no ramfb — and since 2026-08-31, none anywhere
 
-Superseded in part: the drivers are no longer merely guarded, they are absent.
-`kernel_framebuffer` and `kernel_audio` (build.rs) keep `src/ramfb.rs`,
-`src/fw_cfg.rs` and the virtio-sound driver out of a `platform-firecracker`
-image — verified by symbol count, 0 here against 14 in the QEMU build. The
-runtime guard described below still exists and still matters for any build that
-does compile them. `test_platform_device_gates` asserts the general rule: a
+Superseded twice. First (2026-08-21) the drivers stopped being merely guarded
+and became absent from a `platform-firecracker` image: `kernel_framebuffer` and
+`kernel_audio` (build.rs) kept `src/ramfb.rs`, `src/fw_cfg.rs` and the
+virtio-sound driver out — verified by symbol count, 0 here against 14 in the
+QEMU build.
+
+Then (2026-08-31) the framebuffer half was **deleted outright**, on every
+platform: `src/fw_cfg.rs`, `src/ramfb.rs`, `src/syscall/fb.rs`, the
+`sc-framebuffer` feature, `kernel_framebuffer`, `FW_CFG_PA`, `HAS_FRAMEBUFFER`
+and `DEV_FW_CFG_VA` are all gone
+([`../../archive/FRAMEBUFFER_REMOVED.md`](../../archive/FRAMEBUFFER_REMOVED.md)).
+So this section is now purely historical for the fw_cfg/ramfb part — there is no
+driver left to guard, and Firecracker's lack of an fw_cfg node costs nothing.
+The virtio-sound gate is unaffected and still live.
+
+`test_platform_device_gates` still asserts the general rule for what remains: a
 driver may only be compiled in if the machine has the device.
 
-
-
-`platform::machine::FW_CFG_PA` is `None`, and `src/fw_cfg.rs` gates both public
-entry points on it. Touching an unmapped device VA is an EL1 translation fault,
-not a read of zeroes, so the gate is required rather than defensive. `ramfb`
-declines cleanly as a result.
+The original runtime guard, for the record: `platform::machine::FW_CFG_PA` was
+`None` here and `src/fw_cfg.rs` gated both public entry points on it, because
+touching an unmapped device VA is an EL1 translation fault rather than a read of
+zeroes — the guard was required, not defensive.
 
 Firecracker does have a PL031 RTC at `0x4000_1000`, but Akuma does not map it;
 the boot log's `Warning: RTC not available` is expected.

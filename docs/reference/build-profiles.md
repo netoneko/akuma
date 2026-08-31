@@ -169,8 +169,11 @@ re-overlay `bootstrap/etc/`.
 
 The page-cache one also had a silent second effect: the stray gate had been
 un-gating `mod fw_cfg;` since June, so `release` and `size` were carrying
-`fw_cfg` unconditionally. Both are corrected — `file_page_cache` is now
-unconditional and `fw_cfg` is back under `sc-framebuffer`.
+`fw_cfg` unconditionally. Both were corrected — `file_page_cache` became
+unconditional and `fw_cfg` went back under `sc-framebuffer`. (`fw_cfg` and the
+`sc-framebuffer` feature are both gone as of 2026-08-31 —
+[`../archive/FRAMEBUFFER_REMOVED.md`](../archive/FRAMEBUFFER_REMOVED.md); this
+paragraph is kept because the page-cache half of the fix still stands.)
 
 Compiling the shared file-page cache into `extreme-size` costs **+9,888 B text
 (+1.4 %)**, and it is live there (`[FPCACHE] entries=390 hits=12` on a 64 MB
