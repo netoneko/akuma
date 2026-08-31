@@ -36,7 +36,6 @@ churn. See [`../README.md`](../README.md).
 | GIC (v2/v3 interrupt controller) | [`subsystems/drivers/gic.md`](subsystems/drivers/gic.md) | B |
 | Timers (CNTV tick + alarm queue) | [`subsystems/drivers/timers.md`](subsystems/drivers/timers.md) | B |
 | Block (VirtIO-blk + DMA HAL) | [`subsystems/drivers/block.md`](subsystems/drivers/block.md) | A |
-| fw_cfg (QEMU firmware config) | [`subsystems/drivers/fw_cfg.md`](subsystems/drivers/fw_cfg.md) | A |
 
 ### ABI
 
@@ -77,11 +76,11 @@ similarly-named "devbox-smoltcp" things.
 Tier A and B are now done (drivers above + the subsystems listed above); only
 Tier C (niche) remains:
 
-- **Drivers:** `subsystems/drivers/audio.md` (`src/audio.rs`),
-  `subsystems/drivers/framebuffer.md` (`src/ramfb.rs` — distinct from
-  `subsystems/syscalls/fb.md`, which covers the `fb.rs` syscall wrapper, not
-  the ramfb device itself). No generic `drivers/virtio.md` overview exists;
-  VirtIO-blk specifics live in `drivers/block.md`.
+- **Drivers:** `subsystems/drivers/audio.md` (`src/audio.rs`). No generic
+  `drivers/virtio.md` overview exists; VirtIO-blk specifics live in
+  `drivers/block.md`. (`drivers/framebuffer.md` and `drivers/fw_cfg.md` were
+  listed here until 2026-08-31; the framebuffer and the fw_cfg driver that
+  configured it are gone — [`../archive/FRAMEBUFFER_REMOVED.md`](../archive/FRAMEBUFFER_REMOVED.md).)
 - **`akuma-terminal`** (`crates/akuma-terminal/src/lib.rs` — `TerminalState`:
   termios fields, mode flags, the canonical-mode line buffer): no dedicated
   crate doc. Covered only in passing by

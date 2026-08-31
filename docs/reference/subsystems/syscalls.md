@@ -81,7 +81,6 @@ to an actively-churning one doesn't inherit its risk).
 | `aio.rs` | io_setup/io_submit/... | `sc-aio` | [`syscalls/aio.md`](syscalls/aio.md) | B |
 | `container.rs` | box/join_box/core_init | `sc-containers` | [`syscalls/container.md`](syscalls/container.md) | B |
 | `eventfd.rs` | eventfd | `sc-eventfd` (Tier 2) | [`syscalls/eventfd.md`](syscalls/eventfd.md) | B |
-| `fb.rs` | framebuffer ioctl | `sc-framebuffer` | [`syscalls/fb.md`](syscalls/fb.md) | A |
 | `msgqueue.rs` | SysV msg queues | `sc-sysv-ipc` | [`syscalls/msgqueue.md`](syscalls/msgqueue.md) | A |
 | `pidfd.rs` | pidfd_open/waitid | `sc-pidfd` (Tier 2) | [`syscalls/pidfd.md`](syscalls/pidfd.md) | A |
 | `timerfd.rs` | timerfd_create/settime | `sc-timerfd` | [`syscalls/timerfd.md`](syscalls/timerfd.md) | B |
@@ -89,7 +88,7 @@ to an actively-churning one doesn't inherit its risk).
 ## Feature gates & ExecRuntime stubs
 
 The `sc-*` features are compile-time gates. **Tier 1** (`sc-aio, sc-sysv-ipc,
-sc-framebuffer, sc-containers, sc-timerfd`) are pure dead weight when off —
+sc-containers, sc-timerfd`) are pure dead weight when off —
 nothing else references them. **Tier 2** (`sc-eventfd, sc-pidfd, sc-epoll`)
 each need a no-op `ExecRuntime` callback stub when off (e.g.
 `eventfd_close: noop_u32`, `epoll_destroy: noop_u32` — `src/main.rs:412,451`).

@@ -258,7 +258,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Build profiles / distributions (release, size, extreme-size, devbox, release-smp) | [`reference/build-profiles.md`](reference/build-profiles.md) | — |
 | IRQ / console / RNG / async-fs | [`reference/subsystems/irq.md`](reference/subsystems/irq.md) etc. | B / B / B / A |
 | In-kernel shell / editor | **REMOVED 2026-08-10** — the reference docs went with them. History: [`archive/IN_KERNEL_SHELL.md`](archive/IN_KERNEL_SHELL.md) / [`archive/IN_KERNEL_EDITOR_NEKO.md`](archive/IN_KERNEL_EDITOR_NEKO.md), rationale in [`archive/BUILTIN_SSH_REMOVAL.md`](archive/BUILTIN_SSH_REMOVAL.md). Userspace replacements: `/bin/paws` or busybox `sh`, and `/bin/vi` | — |
-| Drivers (GIC, timers, block, fw_cfg) | [`reference/subsystems/drivers/`](reference/subsystems/drivers/) | B / B / A / A |
+| Drivers (GIC, timers, block) | [`reference/subsystems/drivers/`](reference/subsystems/drivers/) | B / B / A |
 | Exceptions (vector table, trap frame, ESR_EL1) | [`reference/subsystems/exceptions.md`](reference/subsystems/exceptions.md) | **C** |
 | `akuma-primitives` (the dependency-free leaf: `OnceCopy`, `safe_print!`, all DAIF, `PreemptGuard`, phys/virt) | [`reference/subsystems/primitives.md`](reference/subsystems/primitives.md) | A |
 | Where `unsafe` is allowed to live (which crates forbid it, and the one enforced subtree in `src/`) | [`reference/crate-safety.md`](reference/crate-safety.md) | A |
@@ -274,9 +274,11 @@ reach for `unsafe`, read
 first: the operation belongs behind a named function in the crate that owns what
 it pokes, not behind a local `#[allow]` (which `forbid` refuses anyway).
 
-**Still undocumented (deferred gap list):** audio (`src/audio.rs`) and the
-framebuffer device itself (`src/ramfb.rs` — distinct from the `fb.rs` syscall
-wrapper, which is documented), both Tier C / niche. The full gap list is in
+**Still undocumented (deferred gap list):** audio (`src/audio.rs`), Tier C /
+niche. The framebuffer was the other entry here and is no longer a gap — the
+whole path was removed 2026-08-31
+([`archive/FRAMEBUFFER_REMOVED.md`](archive/FRAMEBUFFER_REMOVED.md)). The full
+gap list is in
 [`reference/README.md`](reference/README.md) -> Not yet written.
 
 ## When in doubt

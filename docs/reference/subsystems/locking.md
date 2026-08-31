@@ -34,8 +34,7 @@ socket `read`/`write`), `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
 `openat`, `renameat`/`renameat2`, `mkdirat`, `fchmodat`), `no-bkl-process`
 (`fork_process`'s CoW page-copy window), `no-bkl-mm`
 (`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`), `no-bkl-drivers`
-(`getrandom`, `/dev/urandom` read/pread, `/dev/dsp` write, `fb_init`/`fb_draw`/
-`fb_info`), and `no-bkl-irq` (the timer IRQ's dispatch in
+(`getrandom`, `/dev/urandom` read/pread, `/dev/dsp` write), and `no-bkl-irq` (the timer IRQ's dispatch in
 `rust_irq_handler_with_sp`). All six are default-on in `smp-shared`
 (since 2026-08-01). `no-bkl-process` is the first that is not about I/O: it overlaps a
 CPU-bound page copy with peer-core EL1 rather than a disk or wire wait, and it is
@@ -410,7 +409,7 @@ Each of these was a real bug found during a carve-out, not a hypothetical.
 Ground truth as of 2026-08-01, verified against `src/syscall/{fs,net,mem,proc,fb}.rs`
 and the inner-lock call sites in `crates/akuma-ext2/src/ext2.rs`,
 `crates/akuma-exec/src/process/fd.rs`, `src/block.rs`, `src/vfs/mod.rs`,
-`src/{rng,audio,ramfb}.rs`, and `crates/akuma-net/src/{socket,smoltcp_net}.rs` — not transcribed from the
+`src/{rng,audio}.rs`, and `crates/akuma-net/src/{socket,smoltcp_net}.rs` — not transcribed from the
 archive doc's prose. Re-derive rather than trust this table once it's more
 than a few months old; grep the guard names below to check it hasn't drifted.
 
@@ -789,13 +788,17 @@ construction), same dropped-window ledger.
 | `sys_read` → `DevUrandom` (`fs.rs`) | `fill_bytes` + `copy_to_user_safe` | `RNG_DEVICE` |
 | `sys_pread64` → `DevUrandom` (`fs.rs`, same) | same | `RNG_DEVICE` |
 | `sys_write` → `DevDsp` (`fs.rs`) | `audio::play` call | `SOUND_DEVICE` `Spinlock` (`audio.rs:205`) |
-| `sys_fb_init` (`fb.rs`, after dimension validation) | `ramfb::init` call | `FB_STATE` `Spinlock` (`ramfb.rs:39`) |
-| `sys_fb_draw` (`fb.rs`, after validation + `is_initialized` check) | whole copy+draw loop | `FB_STATE` |
-| `sys_fb_info` (`fb.rs`, after validation) | `ramfb::info` call | `FB_STATE` |
 
-**virtio-gpu does not exist** in this codebase (zero matches for `gpu`/`GPU`).
-Graphics output is via QEMU `ramfb` (a fw_cfg-backed RAM framebuffer, not a
-virtio device).
+The `sys_fb_*` framebuffer syscalls were three more rows here, guarded by
+ramfb's `FB_STATE` `Spinlock`. They were removed 2026-08-31
+([`FRAMEBUFFER_REMOVED.md`](../../archive/FRAMEBUFFER_REMOVED.md)), which cost
+this carve-out its only *real* guarded path — `sys_fb_init` took dimensions
+rather than pointers and so was the one driver syscall the boot test could call
+without a mapped user page. `test_drivers_bkl_drop` now covers early-error paths
+and the kill switch only; see its doc comment.
+
+**This kernel has no graphics output at all.** virtio-gpu never existed here
+(zero matches for `gpu`/`GPU`), and ramfb is gone.
 
 Background: [`BKL_DRIVERS_CARVE_OUT.md`](../../archive/BKL_DRIVERS_CARVE_OUT.md)
 — §1 is the full driver audit (which found most work already done by preceding

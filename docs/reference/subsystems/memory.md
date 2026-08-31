@@ -22,7 +22,7 @@ fork, and userspace address spaces. For debugging, see
 
 | Range | Use |
 |---|---|
-| `0x00000000–0x3FFFFFFF` | Device MMIO (GIC dist `0x08000000`, GIC CPU `0x08010000`, UART `0x09000000`, fw_cfg `0x09020000`, VirtIO `0x0a000000`, GICv3 redist `0x080a0000`/`0x080b0000`) |
+| `0x00000000–0x3FFFFFFF` | Device MMIO (GIC dist `0x08000000`, GIC CPU `0x08010000`, UART `0x09000000`, VirtIO `0x0a000000`, GICv3 redist `0x080a0000`/`0x080b0000`) |
 | `0x40000000` | RAM_BASE |
 | `0x40100000` | Kernel load (ARM64 Image `text_offset`=1 MB) |
 | `0x40200000` | DTB (QEMU-placed) |
