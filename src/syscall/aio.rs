@@ -68,6 +68,10 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
     };
     let ring_phys = frame.addr;
 
+    // SAFETY: `ring_va` is a fresh reservation from this process's own
+    // `vm_alloc_mmap`, so it is a user VA no PTE covers yet (`installed` can only be
+    // true, which is why it is discarded); `frame` was just allocated here and is
+    // tracked immediately below along with the table frames.
     let (table_frames, _) = unsafe {
         akuma_exec::mmu::map_user_page(
             ring_va,
@@ -80,17 +84,23 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
         proc.address_space.track_page_table_frame(tf);
     }
 
-    // ── Write the ring header into kernel-virtual space ──────────────────────
-    let ring_kva = akuma_exec::mmu::phys_to_virt(ring_phys).cast::<AioRingHeader>();
-    unsafe {
-        (*ring_kva).id = 0;
-        (*ring_kva).nr = capped_nr;
-        (*ring_kva).head = 0;
-        (*ring_kva).tail = 0;
-        (*ring_kva).magic = AIO_RING_MAGIC;
-        (*ring_kva).compat_features = 0;
-        (*ring_kva).incompat_features = 0;
-        (*ring_kva).header_length = AIO_RING_HEADER_SIZE;
+    // ── Write the ring header ────────────────────────────────────────────────
+    // Through `ring_va`, not the frame's kernel alias: the page was just mapped
+    // RW_NO_EXEC into *this* address space above, so the folded user-copy API
+    // reaches it, and `AioRingHeader` is the `repr(C)` plain-ABI type it wants.
+    // The frame came from `alloc_page_zeroed`, so the rest of the page is zero.
+    let header = AioRingHeader {
+        id: 0,
+        nr: capped_nr,
+        head: 0,
+        tail: 0,
+        magic: AIO_RING_MAGIC,
+        compat_features: 0,
+        incompat_features: 0,
+        header_length: AIO_RING_HEADER_SIZE,
+    };
+    if write_user_val(ring_va as u64, &header).is_err() {
+        return EFAULT;
     }
 
     // ── Register context and write VA to user ────────────────────────────────

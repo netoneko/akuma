@@ -191,6 +191,9 @@ pub fn writeback_shared_pages(path: &str, file_offset: usize, len: usize, pas: &
         let chunk = core::cmp::min(4096, len.saturating_sub(i * 4096));
         if chunk == 0 { break; }
         let kva = akuma_exec::mmu::phys_to_virt(pa).cast_const();
+        // SAFETY: `pas` are the resident frames of a MAP_SHARED region the caller
+        // still owns, so each is live for this read; `chunk <= 4096` is one page.
+        // Shared with the mapping process by design — this is the write-back read.
         let buf = unsafe { core::slice::from_raw_parts(kva, chunk) };
         match crate::fs::write_at(path, off, buf) {
             Ok(n) => { written += n; off += n; }
@@ -568,6 +571,9 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 let chunk = core::cmp::min(4096, len.saturating_sub(i * 4096));
                 if chunk == 0 { break; }
                 let page_kva = akuma_exec::mmu::phys_to_virt(frame.addr);
+                // SAFETY: `frame` was just allocated from the PMM by this call and is
+                // not yet installed in any page table, so this kernel-identity-map
+                // alias is the only live reference to it. `chunk <= 4096` is one page.
                 let page_buf = unsafe { core::slice::from_raw_parts_mut(page_kva, chunk) };
                 match crate::fs::read_at(&path, file_off, page_buf) {
                     Ok(n) => {
@@ -609,6 +615,9 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         let mut first_va = 0usize;
         for (i, frame) in frames.iter().enumerate() {
             let va = mmap_addr + i * 4096;
+            // SAFETY: inside `with_address_space` (contract 1), `va` is from
+            // `vm_alloc_mmap`'s user range (2), `frame` was just allocated and is
+            // owned here (3), and both halves of the return are consumed below (4).
             let (table_frames, installed) = unsafe {
                 akuma_exec::mmu::map_user_page_no_flush(va, frame.addr, page_flags)
             };
@@ -727,6 +736,10 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         // Page-table install under `as_lock` (shared-kernel SMP). PTE edits only.
         proc.with_address_space(|aspace| {
             for (i, frame) in new_frames.iter().enumerate() {
+                // SAFETY: as the eager-mmap install — inside `with_address_space`,
+                // a user VA from the mremap reservation, a frame allocated just above
+                // and tracked just below. `installed` is discarded here because the
+                // range is freshly reserved and cannot already hold a valid PTE.
                 let (table_frames, _) = unsafe { akuma_exec::mmu::map_user_page(new_addr + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC) };
                 aspace.track_user_frame(*frame);
                 for tf in table_frames {
@@ -1156,6 +1169,11 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             proc.with_address_space(|aspace| {
                 for (idx, (page_va, flags)) in prefault.into_iter().enumerate() {
                     let frame = frames[idx];
+                    // SAFETY: inside `with_address_space`; `page_va` came from the
+                    // caller's own region walk above, `frame` from the batch allocated
+                    // just above, and the range flush follows the loop. `installed` is
+                    // advisory here — MADV_WILLNEED over an already-mapped page is a
+                    // no-op, and the frame is tracked either way.
                     let (table_frames, _) = unsafe {
                         akuma_exec::mmu::map_user_page_no_flush(page_va, frame.addr, flags)
                     };

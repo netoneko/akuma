@@ -1222,7 +1222,12 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             #[cfg(feature = "sc-eventfd")]
             akuma_exec::process::FileDescriptor::EventFd(efd_id) => {
                 if this_chunk < 8 { return EINVAL; } // Should enforce 8 byte writes
-                let val = unsafe { core::ptr::read(buf_slice.as_ptr().cast::<u64>()) };
+                // `buf_slice` is a `&[u8]` into a heap buffer, so it carries no u64
+                // alignment; the old `ptr::read` of a `cast::<u64>()` was an aligned
+                // read of a 1-aligned pointer. eventfd's ABI is native-endian.
+                let mut val_bytes = [0u8; 8];
+                val_bytes.copy_from_slice(&buf_slice[..8]);
+                let val = u64::from_ne_bytes(val_bytes);
                 if val == u64::MAX { return EINVAL; }
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                     crate::tprint!(96, "[eventfd] write via fd={} id={} val={}\n", fd_num, efd_id, val);
@@ -3034,15 +3039,19 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
     for entry in entries.iter().skip(position) {
         let reclen = (19 + entry.name.len() + 1 + 7) & !7;
         if written + reclen > size { break; }
-        let p = unsafe { kernel_buf.as_mut_ptr().add(written) };
-        unsafe {
-            core::ptr::write_unaligned(p.cast::<u64>(), 1);
-            core::ptr::write_unaligned(p.add(8).cast::<u64>(), 1);
-            core::ptr::write_unaligned(p.add(16).cast::<u16>(), reclen as u16);
-            p.add(18).write(entry.d_type);
-            core::ptr::copy_nonoverlapping(entry.name.as_ptr(), p.add(19), entry.name.len());
-            p.add(19 + entry.name.len()).write(0);
-        }
+        // `struct linux_dirent64`: d_ino(8) d_off(8) d_reclen(2) d_type(1) d_name[].
+        // Written through the slice rather than a raw cursor — `kernel_buf` is a
+        // `Vec<u8>` with no u64 alignment, and the record is bounds-checked against
+        // `size` by the `break` above. The trailing pad to `reclen` is already zero
+        // from `vec![0u8; size]`.
+        let name_end = 19 + entry.name.len();
+        let rec = &mut kernel_buf[written..written + reclen];
+        rec[0..8].copy_from_slice(&1u64.to_ne_bytes());
+        rec[8..16].copy_from_slice(&1u64.to_ne_bytes());
+        rec[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+        rec[18] = entry.d_type;
+        rec[19..name_end].copy_from_slice(entry.name.as_bytes());
+        rec[name_end] = 0;
         written += reclen;
         count += 1;
     }

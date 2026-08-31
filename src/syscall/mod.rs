@@ -897,7 +897,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 #[cfg(not(kernel_smp_shared))]
                 let nr_cpus: usize = 1;
                 let mask: u64 = if nr_cpus >= 64 { u64::MAX } else { (1u64 << nr_cpus).wrapping_sub(1) };
-                unsafe { core::ptr::write(kernel_mask.as_mut_ptr().cast::<u64>(), mask); }
+                // `kernel_mask` is a `Vec<u8>` (1-aligned), so the old
+                // `ptr::write` through a `cast::<u64>()` was an aligned write to an
+                // unaligned pointer. `cpusetsize >= 8` is checked above.
+                kernel_mask[..8].copy_from_slice(&mask.to_ne_bytes());
                 let _ = copy_to_user(mask_ptr as u64, &kernel_mask);
                 // Linux returns the number of bytes placed in the mask, and
                 // musl's `sched_getaffinity` wrapper zeroes the remainder based

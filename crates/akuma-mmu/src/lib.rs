@@ -1962,6 +1962,26 @@ impl<'a> IntoIterator for &'a TableFrames {
 /// - `installed`: `true` if this call installed the PTE, `false` if the PTE was
 ///   already valid (another thread won the race).  When `false`, the caller's
 ///   data frame was NOT mapped and should be freed.
+///
+/// # Safety
+///
+/// This edits the live page tables reached through `TTBR0_EL1`. The caller must
+/// uphold all four of:
+///
+/// 1. **The address space is the caller's own and is held.** The walk reads
+///    `TTBR0_EL1`, so it always targets *the currently installed* user address
+///    space — it cannot be pointed at another process. On `smp-shared` the caller
+///    must be inside that process's `as_lock` (`Process::with_address_space`), or
+///    a concurrent unmap can free a table frame this walk is descending through.
+/// 2. **`va` is a user VA.** Nothing here range-checks it; a kernel VA would edit
+///    the kernel's own translation through the user tables.
+/// 3. **`pa` is a live frame the caller owns**, page-aligned, and not already
+///    mapped elsewhere in a way that contradicts `user_flags_val`.
+/// 4. **The return value is consumed.** Every frame in `table_frames` must be
+///    tracked (`track_page_table_frame`) or freed, or it leaks; and `installed ==
+///    false` means `pa` was *not* mapped, so the caller still owns it. Discarding
+///    that flag is how a VA-lifetime bug becomes silent memory corruption — see
+///    the `[WPF] ... cow_ref=0 lazy_self=NONE` note at `sys_mmap`'s eager install.
 pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (TableFrames, bool) {
     unsafe { map_user_page_inner(va, pa, user_flags_val, true) }
 }
@@ -2142,6 +2162,11 @@ pub fn remap_current_user_page(va: usize, pa: usize, user_flags_val: u64) -> boo
 ///
 /// The caller is responsible for issuing the TLB flush before the new
 /// mappings can be safely used by userspace.
+///
+/// # Safety
+///
+/// Every requirement of [`map_user_page`], plus: the caller must issue the range
+/// flush before userspace can reach the new mappings.
 pub unsafe fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) -> (TableFrames, bool) {
     // No TLB flush — caller must call flush_tlb_range after mapping all pages.
     unsafe { map_user_page_inner(va, pa, user_flags_val, false) }

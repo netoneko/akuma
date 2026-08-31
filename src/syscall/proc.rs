@@ -85,6 +85,12 @@ pub fn encode_wait_status(code: i32) -> u32 {
 }
 
 pub(super) fn sys_set_tpidr_el0(address: u64) -> u64 {
+    // SAFETY: `tpidr_el0` is the userspace TLS base — architecturally a scratch
+    // register EL1 never reads, so any value is well-defined here and a bad one
+    // can only fault the caller's own EL0 TLS accesses. Deliberately NOT in
+    // `akuma-cpu`: that crate holds only instructions safe to execute, and
+    // `tpidr*` writes are named in its exclusion list. The `isb` makes the new
+    // base visible before the `eret` back to EL0.
     unsafe {
         core::arch::asm!("msr tpidr_el0, {}", "isb", in(reg) address);
     }
@@ -304,7 +310,13 @@ pub(super) fn sys_exit(code: i32) -> u64 {
                     pid, proc.tgid, tid_addr, mapped);
             }
             if mapped {
-                unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
+                // Through the folded user-copy API, not a raw store: a raw
+                // `ptr::write` to a user VA has no fixup, so a page that went away
+                // (or is mapped read-only) between the check above and the store
+                // takes an unrecoverable EL1 fault. `Prefault::No` keeps the
+                // Linux behaviour of never faulting a page in for this write —
+                // `mapped` is what decides whether it happens at all.
+                let _ = write_user_val_with(tid_addr, &0u32, Prefault::No);
             }
             crate::syscall::futex_wake(proc.tgid, tid_addr as usize, i32::MAX);
         }

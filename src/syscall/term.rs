@@ -256,9 +256,10 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             kernel_buf[1] = ts.oflag;
             kernel_buf[2] = ts.cflag;
             kernel_buf[3] = ts.lflag;
-            unsafe {
-                core::ptr::copy_nonoverlapping(ts.cc.as_ptr(), kernel_buf[4..].as_mut_ptr().cast::<u8>(), 20);
-            }
+            // `cc` is 20 bytes and lands on `kernel_buf[4..]`'s 5 u32s. Both sides are
+            // kernel memory, so this is a plain slice copy through the same byte view
+            // `copy_to_user_with` uses below — the lengths cannot disagree.
+            as_user_bytes_mut(&mut kernel_buf[4..]).copy_from_slice(&ts.cc);
             if copy_to_user_with(arg, as_user_bytes(&kernel_buf), Prefault::No).is_err() {
                 return EFAULT;
             }
@@ -284,9 +285,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                     ts.iflag, ts.oflag, ts.cflag, ts.lflag);
             }
             
-            unsafe {
-                core::ptr::copy_nonoverlapping(kernel_buf[4..].as_ptr().cast::<u8>(), ts.cc.as_mut_ptr(), 20);
-            }
+            ts.cc.copy_from_slice(as_user_bytes(&kernel_buf[4..]));
 
             if let Some(ch) = akuma_exec::process::current_channel() {
                 ch.set_raw_mode(!ts.is_canonical());
