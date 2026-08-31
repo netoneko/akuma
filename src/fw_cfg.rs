@@ -8,28 +8,47 @@
 //!
 //! Reference: <https://www.qemu.org/docs/master/specs/fw_cfg.html>
 
-use core::ptr::{addr_of, read_volatile};
+use core::sync::atomic::{AtomicU32, Ordering};
 
+use akuma_exec::mmu::virt_to_phys;
 use akuma_primitives::mmio::MmioReg;
 
 /// Remapped VA for fw_cfg (physical 0x0902_0000 via L0[1])
 const FW_CFG_BASE: usize = akuma_exec::mmu::DEV_FW_CFG_VA;
 
-// The three registers below are `const` rather than built at init: the device
-// window is at a fixed VA, so naming it costs nothing and adds no init-order
-// dependency. Each `unsafe` is the whole safety argument for every access to
-// that register — see `akuma_primitives::mmio`.
-//
-// SAFETY (all three): `DEV_FW_CFG_VA` is the kernel's fixed device mapping of
-// the QEMU fw_cfg MMIO window, established before any of these are touched, and
-// the offsets and widths are the ones the fw_cfg spec defines.
+/// The fw_cfg register file.
+///
+/// The three registers differ in width, which is why they cannot be one
+/// [`MmioReg`]: the data port is byte-at-a-time, the selector is a 16-bit
+/// big-endian key, and the DMA port takes a 64-bit big-endian address.
+struct FwCfgRegs {
+    /// Data register: read/write 1 byte at a time.
+    data: MmioReg<u8>,
+    /// Selector register: write a 16-bit big-endian value to select a key.
+    selector: MmioReg<u16>,
+    /// DMA register: write a 64-bit big-endian physical address.
+    dma: MmioReg<u64>,
+}
 
-/// Data register: read/write 1 byte at a time
-const FW_CFG_DATA: MmioReg<u8> = unsafe { MmioReg::new(FW_CFG_BASE) };
-/// Selector register: write a 16-bit big-endian value to select a key
-const FW_CFG_SELECTOR: MmioReg<u16> = unsafe { MmioReg::new(FW_CFG_BASE + 0x08) };
-/// DMA register: write a 64-bit big-endian physical address
-const FW_CFG_DMA: MmioReg<u64> = unsafe { MmioReg::new(FW_CFG_BASE + 0x10) };
+/// The whole register file, vouched for once.
+///
+/// `const` rather than built at init: the device window is at a fixed VA, so
+/// naming it costs nothing and adds no init-order dependency. One `unsafe` for
+/// the whole file rather than one per register is the point of
+/// [`akuma_primitives::mmio`] — the fact that needs a human's word is "this
+/// window is the fw_cfg device", and it is true once per device, not once per
+/// register.
+///
+/// SAFETY: `DEV_FW_CFG_VA` is the kernel's fixed device mapping of the QEMU
+/// fw_cfg MMIO window, established at boot before any of these are touched, and
+/// the offsets and widths are the ones the fw_cfg spec defines.
+const REGS: FwCfgRegs = unsafe {
+    FwCfgRegs {
+        data: MmioReg::new(FW_CFG_BASE),
+        selector: MmioReg::new(FW_CFG_BASE + 0x08),
+        dma: MmioReg::new(FW_CFG_BASE + 0x10),
+    }
+};
 
 /// Does this machine have an fw_cfg device at all?
 ///
@@ -54,10 +73,19 @@ const FW_CFG_DMA_CTL_WRITE: u32 = 0x10;
 const FW_CFG_DMA_CTL_SELECT: u32 = 0x08;
 const FW_CFG_DMA_CTL_ERROR: u32 = 0x01;
 
-/// DMA access descriptor – must be naturally aligned
+/// DMA access descriptor – must be naturally aligned.
+///
+/// `control` is an [`AtomicU32`] rather than a plain `u32` because it is the one
+/// field the *device* writes: QEMU zeroes it (or sets [`FW_CFG_DMA_CTL_ERROR`])
+/// when the transfer completes, while this CPU is polling it. A plain read of a
+/// location another agent is concurrently writing is a data race no matter how
+/// volatile it is spelled; an atomic load is the operation that is actually
+/// defined, and `Acquire` is what orders the completion against whatever the
+/// transfer wrote. Same size, same alignment, same `repr(C)` layout as the `u32`
+/// the spec describes.
 #[repr(C)]
 struct FWCfgDmaAccess {
-    control: u32,
+    control: AtomicU32,
     len: u32,
     addr: u64,
 }
@@ -65,13 +93,13 @@ struct FWCfgDmaAccess {
 /// Select a fw_cfg entry by its selector number.
 fn select(key: u16) {
     // The selector register expects big-endian on MMIO
-    FW_CFG_SELECTOR.write(key.to_be());
+    REGS.selector.write(key.to_be());
 }
 
 /// Read `n` bytes from the currently selected entry via the data register.
 fn read_bytes(buf: &mut [u8]) {
     for byte in buf.iter_mut() {
-        *byte = FW_CFG_DATA.read();
+        *byte = REGS.data.read();
     }
 }
 
@@ -136,33 +164,40 @@ pub fn find_file(name: &str) -> Option<(u16, u32)> {
 /// DMA is required for write operations — the data register is read-only
 /// for most entries.
 ///
-/// # Safety
-/// `data` must be a valid byte slice whose contents match what QEMU expects.
-pub unsafe fn write_entry(selector: u16, data: &[u8]) {
+/// Safe, though it hands a device a physical address: both addresses named in
+/// the descriptor are derived from live borrows this call owns — `data` for its
+/// whole body, and the descriptor itself a local — and the spin below does not
+/// return until QEMU reports the transfer finished, so neither address outlives
+/// the device's use of it. What the caller still owes is *correctness*, not
+/// safety: `data` must be the wire layout the selected entry expects, and a
+/// mismatch misconfigures the device rather than corrupting memory.
+pub fn write_entry(selector: u16, data: &[u8]) {
     if !AVAILABLE {
         return;
     }
     // Build DMA descriptor (all fields big-endian)
     let dma = FWCfgDmaAccess {
-        control: (u32::from(selector) << 16
-            | FW_CFG_DMA_CTL_SELECT
-            | FW_CFG_DMA_CTL_WRITE)
-            .to_be(),
+        control: AtomicU32::new(
+            (u32::from(selector) << 16 | FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_WRITE).to_be(),
+        ),
         len: (data.len() as u32).to_be(),
-        addr: (data.as_ptr() as u64).to_be(),
+        addr: (virt_to_phys(data.as_ptr() as usize) as u64).to_be(),
     };
 
-    // Write the physical address of the descriptor to the DMA register (big-endian)
-    let desc_phys = addr_of!(dma) as u64;
-    FW_CFG_DMA.write(desc_phys.to_be());
+    // Write the physical address of the descriptor to the DMA register
+    // (big-endian). The kernel map is the identity, so `virt_to_phys` is a no-op
+    // — it is here to name the conversion rather than leave a bare `as u64` cast
+    // standing in for it, since a device reads these as physical addresses.
+    let desc_phys = virt_to_phys(&raw const dma as usize) as u64;
+    REGS.dma.write(desc_phys.to_be());
 
-    // Spin-wait until DMA completes (control field is zeroed by QEMU)
+    // Spin-wait until DMA completes (control field is zeroed by QEMU).
+    //
+    // Deliberately not an `MmioReg`: this polls the descriptor in ordinary RAM,
+    // which QEMU writes back by DMA. It is not a device register, so it does not
+    // belong to the register newtype.
     loop {
-        // Deliberately a raw volatile read and **not** an `MmioReg`: this polls
-        // the descriptor in ordinary RAM, which QEMU writes back by DMA. It is
-        // not a device register, so it does not belong to the register newtype.
-        let ctrl = unsafe { read_volatile(addr_of!(dma.control)) };
-        let ctrl_host = u32::from_be(ctrl);
+        let ctrl_host = u32::from_be(dma.control.load(Ordering::Acquire));
         if ctrl_host == 0 || ctrl_host & FW_CFG_DMA_CTL_ERROR != 0 {
             break;
         }

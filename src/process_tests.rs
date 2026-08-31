@@ -1008,6 +1008,11 @@ pub fn run_all_tests() {
     // real guarded path, plus the runtime kill switch.
     test_drivers_bkl_drop();
 
+    // ramfb's wire marshalling and `draw`'s bounds — the two things that stopped
+    // being spelled with raw pointers.
+    #[cfg(kernel_framebuffer)]
+    test_ramfb_wire_and_draw();
+
     // Device drivers must not be compiled for hardware this machine does not
     // have — the invariant behind `kernel_framebuffer` / `kernel_audio`.
     test_platform_device_gates();
@@ -5176,6 +5181,113 @@ fn test_platform_device_gates() {
     } else {
         crate::safe_print!(64, "[Test] platform-device-gates FAILED ({} cases)\n", fails);
         panic!("test_platform_device_gates: {fails} cases failed");
+    }
+}
+
+/// ramfb: the `etc/ramfb` wire layout and `draw`'s bounds.
+///
+/// Both used to be raw-pointer operations — the config was a
+/// `#[repr(C, packed)]` struct reinterpreted through `slice::from_raw_parts`,
+/// and `draw` reached the pixels through a `copy_nonoverlapping` onto an address
+/// held in a lock-free `AtomicUsize`. Neither is spelled that way any more, so
+/// pin what the rewrite must preserve: the exact 28 bytes QEMU parses, and the
+/// fact that `draw` stops at the *visible* framebuffer rather than at the end of
+/// the page-rounded allocation behind it.
+#[cfg(kernel_framebuffer)]
+fn test_ramfb_wire_and_draw() {
+    let mut fails = 0usize;
+
+    // ── Wire layout ───────────────────────────────────────────────────────
+    // addr(8) fourcc(4) flags(4) width(4) height(4) stride(4), all big-endian.
+    let cfg = crate::ramfb::cfg_bytes(0x0102_0304_0506_0708, 320, 200, 1280);
+    let want: [u8; 28] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // addr
+        b'4', b'2', b'R', b'X', // fourcc: XRGB8888, big-endian on the wire
+        0x00, 0x00, 0x00, 0x00, // flags
+        0x00, 0x00, 0x01, 0x40, // width  = 320
+        0x00, 0x00, 0x00, 0xC8, // height = 200
+        0x00, 0x00, 0x05, 0x00, // stride = 1280
+    ];
+    if cfg != want {
+        fails += 1;
+        crate::safe_print!(96, "[Test] ramfb: cfg wire layout FAILED\n");
+    }
+
+    // ── draw() bounds ─────────────────────────────────────────────────────
+    // main.rs initialises 320x200 at boot; if that did not happen (no ramfb on
+    // the QEMU command line) there is nothing to draw into and `draw` must say
+    // so rather than write somewhere.
+    match crate::ramfb::info() {
+        None => {
+            if crate::ramfb::draw(&[0xFFu8; 64]) != 0 {
+                fails += 1;
+                crate::safe_print!(96, "[Test] ramfb: draw with no framebuffer FAILED\n");
+            }
+        }
+        Some(fb) => {
+            // Page alignment is the entire reason `init` over-allocates a page
+            // and hand-rolls an offset; if that arithmetic is wrong this is the
+            // only thing that notices.
+            match crate::ramfb::pixels_base() {
+                Some(base) if base % 4096 == 0 => {}
+                Some(base) => {
+                    fails += 1;
+                    crate::safe_print!(
+                        96,
+                        "[Test] ramfb: base 0x{:x} not page-aligned FAILED\n",
+                        base
+                    );
+                }
+                None => {
+                    fails += 1;
+                    crate::safe_print!(96, "[Test] ramfb: info() but no base FAILED\n");
+                }
+            }
+
+            if fb.stride != fb.width * 4 {
+                fails += 1;
+                crate::safe_print!(96, "[Test] ramfb: stride {} != width*4 FAILED\n", fb.stride);
+            }
+            let visible = (fb.stride as usize) * (fb.height as usize);
+
+            // Empty source: nothing copied, no panic on the zero-length slice.
+            if crate::ramfb::draw(&[]) != 0 {
+                fails += 1;
+                crate::safe_print!(96, "[Test] ramfb: draw(empty) FAILED\n");
+            }
+
+            // Short source: copied whole.
+            let short = alloc::vec![0xA5u8; 4096];
+            if crate::ramfb::draw(&short) != short.len() {
+                fails += 1;
+                crate::safe_print!(96, "[Test] ramfb: draw(short) FAILED\n");
+            }
+
+            // Oversized source: truncated to the visible framebuffer, NOT to the
+            // block behind it. `init` over-allocates a page to page-align the
+            // framebuffer by hand, so the leaked block is `fb_size + 4096` and a
+            // run that handed out the whole of it would accept up to 4096 bytes
+            // more than the screen can show. This leg is why `init` narrows to
+            // exactly `fb_size` with the second `split_at_mut`.
+            let over = alloc::vec![0x5Au8; visible + 8192];
+            let n = crate::ramfb::draw(&over);
+            if n != visible {
+                fails += 1;
+                crate::safe_print!(
+                    96,
+                    "[Test] ramfb: draw(oversized) copied {} want {} FAILED\n",
+                    n,
+                    visible
+                );
+            }
+        }
+    }
+
+    if fails == 0 {
+        crate::safe_print!(96, "[Test] ramfb-wire-and-draw PASSED\n");
+    } else {
+        crate::safe_print!(64, "[Test] ramfb-wire-and-draw FAILED ({} cases)\n", fails);
+        panic!("test_ramfb_wire_and_draw: {fails} cases failed");
     }
 }
 
