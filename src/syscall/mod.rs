@@ -15,13 +15,9 @@ use spinning_top::Spinlock;
 // `docs/archive/UNSAFE_AUDIT.md` §4 P0.
 pub use akuma_exec::process::user_access::{
     Prefault, as_user_bytes, as_user_bytes_mut, copy_from_user, copy_to_user,
-    copy_to_user_with, read_user_into, read_user_into_with, write_user_val,
-    write_user_val_with,
+    copy_to_user_with, read_user_byte, read_user_into, read_user_into_with,
+    write_user_val, write_user_val_with,
 };
-// The raw byte-loop primitive. One caller left in this crate's syscall layer:
-// `copy_from_user_byte`, which reads a NUL-terminated string one byte at a time and
-// therefore has no range to validate — see its doc comment.
-use akuma_exec::process::user_access::copy_from_user_safe;
 // The excursion shape crate: which counter bucket a number falls in, which
 // hooks run, and where the epilogue's identity comes from. Decisions only — see
 // `EXCURSION_HOOKS` and docs/archive/AKUMA_EXTRACT_SYSCALLS.md §7.
@@ -377,26 +373,23 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     )
 }
 
-/// Safely read a single byte from user memory.
-///
-/// **The one deliberate raw-copy caller left in the syscall layer.** Its only user is
-/// [`copy_from_user_str`], which walks a NUL-terminated string one byte at a time —
-/// and the length of a NUL-terminated string is not known until it has been read, so
-/// there is no range to validate. Routing each byte through `copy_from_user` would
-/// page-table-walk **per byte**: 4096 walks for a `PATH_MAX` path. The string reader
-/// does its own per-byte limit check and relies on the byte loop's fixup for
-/// mapped-ness, which is the correct shape for an unknown-length read.
 /// Measurement helpers for this layer — see [`utils`].
 pub mod utils;
 
+/// Read a single byte from user memory.
+///
+/// The raw `copy_from_user_safe` this used to wrap moved into
+/// [`akuma_exec::process::user_access::read_user_byte`], which is the crate that owns
+/// user-memory access — the last `unsafe` block in `src/syscall/` that was about
+/// *reaching* user memory rather than editing a page table.
+///
+/// Kept as a named alias because the name says which caller it exists for:
+/// [`copy_from_user_str`], which walks a NUL-terminated string one byte at a time.
+/// The length of such a string is not known until it has been read, so there is no
+/// range to validate up front; the string reader supplies the bound (its own
+/// `max_len` and the VA limit) and the fault trampoline supplies the mapped-ness.
 pub fn copy_from_user_byte(ptr: u64) -> Result<u8, u64> {
-    let mut b: u8 = 0;
-    // SAFETY: one byte into a live local; the user side is covered by the recovery
-    // trampoline, and `copy_from_user_str` bounds `ptr` against the VA limit.
-    if unsafe { copy_from_user_safe(&raw mut b, ptr as *const u8, 1).is_err() } {
-        return Err(EFAULT);
-    }
-    Ok(b)
+    read_user_byte(ptr)
 }
 
 pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {

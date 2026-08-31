@@ -1485,6 +1485,114 @@ impl UserAddressSpace {
         self.page_table_frames.lock().push(frame);
     }
 
+    /// Map `frame` at `va` in the **currently installed** address space and adopt
+    /// everything the walk produced — the safe way to install a user page from a
+    /// syscall.
+    ///
+    /// Not to be confused with [`map_and_track`](Self::map_and_track), which is the
+    /// ELF loader's primitive: that one walks `self.l0_frame` (so it can build an
+    /// address space that is not installed yet) but allocates page tables *inside*
+    /// the call, overwrites an existing L3 entry without noticing, and issues no TLB
+    /// flush. None of those three are acceptable under `as_lock`. This one is the
+    /// `map_user_page` path: CAS install, refuses a VA that is already mapped,
+    /// hands the table frames back so they can be tracked, and flushes.
+    ///
+    /// This is [`map_user_page`]'s four-clause `# Safety` contract turned into a
+    /// signature. Every clause is discharged here rather than restated at the call
+    /// site:
+    ///
+    /// 1. **The address space is held.** `&mut UserAddressSpace` is only reachable
+    ///    through `Process::with_address_space`, which takes `as_lock` with IRQs
+    ///    masked. A caller that has one has the lock, by construction.
+    /// 2. **`va` is a user VA**, checked below — TTBR0 range and page-aligned.
+    /// 3. **`self` is the address space the walk will actually edit.** `map_user_page`
+    ///    reads `TTBR0_EL1`, so it always targets the *installed* address space, which
+    ///    is not necessarily the one you hold a `&mut` to. That mismatch is the
+    ///    stale-TTBR0 bug class this tree has hit three separate times (clone_thread,
+    ///    fork_process, vfork_process — see `overlays/devbox/README.md`), and it is
+    ///    checked here instead of assumed.
+    /// 4. **The return value cannot be dropped on the floor.** Both frame lists are
+    ///    tracked before returning, and the `installed` flag is `#[must_use]`.
+    ///
+    /// Returns `true` if this call installed the PTE. **`false` does not mean
+    /// failure and does not mean nothing happened**: `frame` is tracked either way
+    /// (it is this address space's to free at teardown regardless), but nothing maps
+    /// it, so a caller that expected fresh zeroed memory at `va` is now looking at
+    /// the previous occupant's page *and its permissions*. Only a caller that
+    /// reserved `va` itself may ignore this.
+    #[must_use = "`false` means the PTE was NOT installed — the frame is tracked for                   teardown but `va` still holds whatever was there before"]
+    // `&mut self` is the safety argument, not a mutation requirement: it is what
+    // proves the caller came through `Process::with_address_space` and therefore
+    // holds `as_lock`. The frame trackers below are `&self` (they self-lock), so
+    // clippy sees an unnecessary `&mut` — downgrading it would silently reopen
+    // clause 1 of `map_user_page`'s contract to any holder of a shared reference.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub fn map_user_page_tracked(&mut self, va: usize, frame: PhysFrame, user_flags_val: u64) -> bool {
+        self.map_user_page_tracked_inner(va, frame, user_flags_val, true)
+    }
+
+    /// [`map_user_page_tracked`](Self::map_user_page_tracked) without the per-page
+    /// TLB invalidation,
+    /// for a batch install. The caller must issue `flush_tlb_range` over the whole
+    /// span before userspace can reach any of the new mappings.
+    #[must_use = "`false` means the PTE was NOT installed — the frame is tracked for                   teardown but `va` still holds whatever was there before"]
+    // `&mut self` is the safety argument, not a mutation requirement: it is what
+    // proves the caller came through `Process::with_address_space` and therefore
+    // holds `as_lock`. The frame trackers below are `&self` (they self-lock), so
+    // clippy sees an unnecessary `&mut` — downgrading it would silently reopen
+    // clause 1 of `map_user_page`'s contract to any holder of a shared reference.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub fn map_user_page_tracked_no_flush(
+        &mut self,
+        va: usize,
+        frame: PhysFrame,
+        user_flags_val: u64,
+    ) -> bool {
+        self.map_user_page_tracked_inner(va, frame, user_flags_val, false)
+    }
+
+    // `&mut self` is the safety argument, not a mutation requirement: it is what
+    // proves the caller came through `Process::with_address_space` and therefore
+    // holds `as_lock`. The frame trackers below are `&self` (they self-lock), so
+    // clippy sees an unnecessary `&mut` — downgrading it would silently reopen
+    // clause 1 of `map_user_page`'s contract to any holder of a shared reference.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn map_user_page_tracked_inner(
+        &mut self,
+        va: usize,
+        frame: PhysFrame,
+        user_flags_val: u64,
+        flush: bool,
+    ) -> bool {
+        // Clause 2: TTBR0 covers the low half only, and the walk indexes by page.
+        if va >> 48 != 0 || va & (PAGE_SIZE - 1) != 0 {
+            log::debug!("[MMU] map_and_track refused non-user/unaligned va=0x{:x}", va);
+            debug_assert!(false, "map_and_track called with a non-user or unaligned va");
+            return false;
+        }
+        // Clause 3: refuse rather than edit somebody else's page tables. Compared on
+        // the L0 base, not the whole TTBR0 word, because the ASID field is ours and
+        // the installed value's is whatever the last context switch wrote.
+        let installed_l0 = akuma_cpu::sysreg::ttbr0_el1() & L0_BASE_MASK;
+        if installed_l0 != (self.l0_phys() as u64 & L0_BASE_MASK) {
+            log::debug!(
+                "[MMU] map_and_track refused: this AS l0=0x{:x} but TTBR0 has 0x{:x}",
+                self.l0_phys(), installed_l0
+            );
+            debug_assert!(false, "map_and_track on an address space that is not installed");
+            return false;
+        }
+        // SAFETY: clauses 1-3 are established above and by the `&mut self` receiver;
+        // clause 4 is discharged by the tracking below, which runs on both arms.
+        let (table_frames, installed) =
+            unsafe { map_user_page_inner(va, frame.addr, user_flags_val, flush) };
+        self.track_user_frame(frame);
+        for tf in table_frames {
+            self.track_page_table_frame(tf);
+        }
+        installed
+    }
+
     /// Number of distinct physical frames this address space tracks as user data
     /// (one entry per PA, regardless of how many VAs map it). Leak-debugging:
     /// compare against the VA actually mapped — a count far larger than the

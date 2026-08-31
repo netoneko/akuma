@@ -515,6 +515,33 @@ pub fn copy_from_user_with(dst: &mut [u8], src_user: u64, prefault: Prefault) ->
     unsafe { copy_from_user_safe(dst.as_mut_ptr(), src_user as *const u8, dst.len()) }
 }
 
+/// Read a single byte from user memory, without validating a range first.
+///
+/// The one folded-API entry point that deliberately skips `validate_user_range`,
+/// and the reason is that its caller has no range to validate: a NUL-terminated
+/// string's length is not known until it has been read. Routing each byte through
+/// [`copy_from_user`] would page-table-walk **per byte** — 4096 walks for a
+/// `PATH_MAX` path. What stands in for the range check is the fault trampoline:
+/// an unmapped byte returns `Err(EFAULT)` rather than faulting the kernel, so the
+/// walk stops at the first byte the process cannot read.
+///
+/// The caller still owes the *bound*: it must stop at its own length limit and
+/// must not walk past `USER_VA_LIMIT`. That is a liveness obligation (an unbounded
+/// loop), not a soundness one, which is why this is safe to call.
+///
+/// Lives here rather than in `src/syscall/` because this is the crate that owns
+/// user-memory access; the syscall layer re-exports it.
+pub fn read_user_byte(ptr: u64) -> Result<u8, u64> {
+    let mut b: u8 = 0;
+    // SAFETY: the destination is one byte of a live local. The user side is covered
+    // by the recovery trampoline, which turns a fault into `Err` instead of taking
+    // the kernel down, so an unmapped or non-user `ptr` is a returned error.
+    if unsafe { copy_from_user_safe(&raw mut b, ptr as *const u8, 1) }.is_err() {
+        return Err(EFAULT);
+    }
+    Ok(b)
+}
+
 /// Write one ABI value out to user memory. The length is `size_of::<T>()`, which
 /// kills the `(&raw const v).cast::<u8>()` + separately-written-size pairing.
 ///

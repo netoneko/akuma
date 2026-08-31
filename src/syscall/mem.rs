@@ -615,21 +615,11 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         let mut first_va = 0usize;
         for (i, frame) in frames.iter().enumerate() {
             let va = mmap_addr + i * 4096;
-            // SAFETY: inside `with_address_space` (contract 1), `va` is from
-            // `vm_alloc_mmap`'s user range (2), `frame` was just allocated and is
-            // owned here (3), and both halves of the return are consumed below (4).
-            let (table_frames, installed) = unsafe {
-                akuma_exec::mmu::map_user_page_no_flush(va, frame.addr, page_flags)
-            };
-            if !installed {
+            if !aspace.map_user_page_tracked_no_flush(va, *frame, page_flags) {
                 if declined == 0 {
                     first_va = va;
                 }
                 declined += 1;
-            }
-            aspace.track_user_frame(*frame);
-            for tf in table_frames {
-                aspace.track_page_table_frame(tf);
             }
         }
         // Single TLB flush for the entire mmap range (still under the hold).
@@ -736,15 +726,13 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         // Page-table install under `as_lock` (shared-kernel SMP). PTE edits only.
         proc.with_address_space(|aspace| {
             for (i, frame) in new_frames.iter().enumerate() {
-                // SAFETY: as the eager-mmap install — inside `with_address_space`,
-                // a user VA from the mremap reservation, a frame allocated just above
-                // and tracked just below. `installed` is discarded here because the
-                // range is freshly reserved and cannot already hold a valid PTE.
-                let (table_frames, _) = unsafe { akuma_exec::mmu::map_user_page(new_addr + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC) };
-                aspace.track_user_frame(*frame);
-                for tf in table_frames {
-                    aspace.track_page_table_frame(tf);
-                }
+                // The return is deliberately dropped: `new_addr` is a reservation
+                // this call just made, so nothing can already be mapped there.
+                let _ = aspace.map_user_page_tracked(
+                    new_addr + i * 4096,
+                    *frame,
+                    akuma_exec::mmu::user_flags::RW_NO_EXEC,
+                );
             }
         });
 
@@ -1169,18 +1157,10 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             proc.with_address_space(|aspace| {
                 for (idx, (page_va, flags)) in prefault.into_iter().enumerate() {
                     let frame = frames[idx];
-                    // SAFETY: inside `with_address_space`; `page_va` came from the
-                    // caller's own region walk above, `frame` from the batch allocated
-                    // just above, and the range flush follows the loop. `installed` is
-                    // advisory here — MADV_WILLNEED over an already-mapped page is a
-                    // no-op, and the frame is tracked either way.
-                    let (table_frames, _) = unsafe {
-                        akuma_exec::mmu::map_user_page_no_flush(page_va, frame.addr, flags)
-                    };
-                    aspace.track_user_frame(frame);
-                    for tf in table_frames {
-                        aspace.track_page_table_frame(tf);
-                    }
+                    // The return is deliberately dropped: MADV_WILLNEED is advisory,
+                    // so losing the race to an already-mapped page is a no-op, not an
+                    // error. The frame is tracked either way.
+                    let _ = aspace.map_user_page_tracked_no_flush(page_va, frame, flags);
                 }
                 // Flush the entire requested range (covers all newly mapped pages).
                 akuma_exec::mmu::flush_tlb_range(aligned_addr, (end - aligned_addr) / 4096);

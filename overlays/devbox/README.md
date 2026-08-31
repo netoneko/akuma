@@ -248,6 +248,29 @@ Papercuts surfaced by dogfooding, to fix later:
 - ~~**One-shot `ssh host <cmd>` returns no output**~~ — **FIXED**, see
   `docs/OPTIONAL_SMOLTCP.md`'s Concurrent SSH section and
   [`userspace/sshd/docs/FLOW.md`](../../userspace/sshd/docs/FLOW.md).
+- **`tcc` output segfaults unless you pass `-static`.** Not a kernel bug and not a
+  dynamic-linking bug: `clang` on the same image produces a working *dynamically*
+  linked binary from the same source, and `tcc -static` works too. Only
+  `tcc`-without-`-static` crashes, immediately, before `main` — a trivial
+  `int main(void){ printf("hi"); }` is enough to reproduce:
+
+  ```
+  tcc -o hi hi.c && ./hi          # Segmentation fault (139)
+  tcc -static -o hi hi.c && ./hi  # works
+  clang -o hi hi.c && ./hi        # works (dynamic)
+  ```
+
+  What the ELFs say, measured 2026-08-31: tcc's dynamic output has a `PT_INTERP`
+  segment whose `.interp` section is **one NUL byte** — an empty interpreter path —
+  while still carrying `NEEDED libc.musl-aarch64.so.1`, `BIND_NOW` and a `.rela.plt`.
+  clang's asks for `/lib/ld-musl-aarch64.so.1` as it should. So nothing ever loads
+  musl or applies the relocations, and the entry point runs against an unrelocated
+  PLT/GOT. (tcc also emits `EXEC` where clang emits a PIE `DYN`, which may or may not
+  be a second factor — not investigated.) Whether the empty `.interp` is tcc's own
+  bug or a misconfiguration of the image's tcc is open. **Workaround: pass `-static`,
+  or use `clang`.** The practical consequence is that tcc is not a usable way to
+  build an in-guest probe — build probes on the host with `aarch64-linux-musl-gcc`
+  and push them in (`userspace/abiprobe/c/build.sh --push-akuma`).
 - **`/bin/rump_server` is ~13 MB** — the box-0 network stack binary is huge (it dominates
   the image and its cold-load demand-paging). Trim it down later (strip / drop unused rump
   components / link-time GC).

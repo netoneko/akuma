@@ -66,23 +66,21 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
         Some(f) => f,
         None => return ENOMEM,
     };
-    let ring_phys = frame.addr;
 
-    // SAFETY: `ring_va` is a fresh reservation from this process's own
-    // `vm_alloc_mmap`, so it is a user VA no PTE covers yet (`installed` can only be
-    // true, which is why it is discarded); `frame` was just allocated here and is
-    // tracked immediately below along with the table frames.
-    let (table_frames, _) = unsafe {
-        akuma_exec::mmu::map_user_page(
+    // Under `as_lock`, which the previous raw `map_user_page` call here did NOT
+    // take: it edited the live page tables and then tracked the frames through
+    // `proc.address_space` directly, so on `smp-shared` a concurrent unmap could
+    // free a table frame this walk was descending through. The frame is allocated
+    // above, outside the hold, because the PMM's OOM/reclaim path re-enters
+    // `as_lock`. The return is dropped: `ring_va` is a reservation this call just
+    // made from `vm_alloc_mmap`, so nothing can already be mapped there.
+    proc.with_address_space(|aspace| {
+        let _ = aspace.map_user_page_tracked(
             ring_va,
-            ring_phys,
+            frame,
             akuma_exec::mmu::user_flags::RW_NO_EXEC,
-        )
-    };
-    proc.address_space.track_user_frame(frame);
-    for tf in table_frames {
-        proc.address_space.track_page_table_frame(tf);
-    }
+        );
+    });
 
     // ── Write the ring header ────────────────────────────────────────────────
     // Through `ring_va`, not the frame's kernel alias: the page was just mapped
