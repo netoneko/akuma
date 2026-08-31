@@ -97,7 +97,7 @@ numbers), `scripts/cargo_runner.sh` (`FB_ARGS`), and the four feature lists in
 deliberately: the spans are just addresses in a 2 MB window, and re-packing them
 to close a gap would churn every device for nothing.
 
-## 3. What this cost the BKL driver carve-out
+## 3. What this cost the BKL driver carve-out (and how it came back)
 
 `no-bkl-drivers` (Phase 6) rests on each driver's own fine-grained Spinlock
 standing in for the BKL — `RNG_DEVICE`, `SOUND_DEVICE`, and formerly ramfb's

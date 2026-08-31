@@ -791,11 +791,17 @@ construction), same dropped-window ledger.
 
 The `sys_fb_*` framebuffer syscalls were three more rows here, guarded by
 ramfb's `FB_STATE` `Spinlock`. They were removed 2026-08-31
-([`FRAMEBUFFER_REMOVED.md`](../../archive/FRAMEBUFFER_REMOVED.md)), which cost
-this carve-out its only *real* guarded path — `sys_fb_init` took dimensions
-rather than pointers and so was the one driver syscall the boot test could call
-without a mapped user page. `test_drivers_bkl_drop` now covers early-error paths
-and the kill switch only; see its doc comment.
+([`FRAMEBUFFER_REMOVED.md`](../../archive/FRAMEBUFFER_REMOVED.md)), which briefly
+cost this carve-out its only *real* guarded path in `test_drivers_bkl_drop`:
+`sys_fb_init` took dimensions rather than pointers, so it was the one driver
+syscall the boot test could call without a mapped user page.
+
+Recovered the same day. `sys_getrandom` now serves as that leg, using
+`BYPASS_VALIDATION` to get a kernel-stack buffer past `validate_user_range` —
+which means the guard is constructed and the whole chunked `fill_bytes` +
+`copy_to_user` body runs inside the dropped window. Read the branch tag in the
+test's PASSED line: `[filled]` is full coverage, `[EIO]` (no virtio-rng) means
+the window still opened and closed but the fill assertion did not run.
 
 **This kernel has no graphics output at all.** virtio-gpu never existed here
 (zero matches for `gpu`/`GPU`), and ramfb is gone.
