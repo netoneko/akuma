@@ -263,7 +263,7 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Drivers (GIC, timers, block) | [`reference/subsystems/drivers/`](reference/subsystems/drivers/) | B / B / A |
 | Exceptions (vector table, trap frame, ESR_EL1) | [`reference/subsystems/exceptions.md`](reference/subsystems/exceptions.md) | **C** |
 | `akuma-primitives` (the dependency-free leaf: `OnceCopy`, `safe_print!`, all DAIF, `PreemptGuard`, phys/virt) | [`reference/subsystems/primitives.md`](reference/subsystems/primitives.md) | A |
-| Where `unsafe` is allowed to live (which crates forbid it, the one enforced subtree in `src/`, and the one crate that quarantines `unsafe` on purpose) | [`reference/crate-safety.md`](reference/crate-safety.md), [`archive/AKUMA_ALLOC_EXTRACTION.md`](archive/AKUMA_ALLOC_EXTRACTION.md) | A |
+| Where `unsafe` is allowed to live (which crates forbid it, the two enforced subtrees in `src/`, and the crates that quarantine `unsafe` on purpose) | [`reference/crate-safety.md`](reference/crate-safety.md), [`archive/AKUMA_ALLOC_EXTRACTION.md`](archive/AKUMA_ALLOC_EXTRACTION.md), [`archive/AKUMA_UART_EXTRACTION.md`](archive/AKUMA_UART_EXTRACTION.md) | A |
 | `akuma-firecracker` (the machine description read from the FDT at run time: RAM, GIC distributor/redistributor, console, virtio slots) | crate docs — `crates/akuma-firecracker/src/lib.rs`. Measured fixtures from **both** machines: [`reference/firecracker/fdt/`](reference/firecracker/fdt/) (Firecracker) and `crates/akuma-firecracker/fixtures/` (QEMU virt). Not yet wired into the kernel; `src/platform.rs` still holds the literals | A |
 
 Syscalls / Linux ABI now has 17 per-family docs under

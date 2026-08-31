@@ -29,6 +29,7 @@ dependencies = [
  "akuma-syscalls-time",
  "akuma-terminal",
  "akuma-timer",
+ "akuma-uart",
  "akuma-vfs",
  "akuma-virtio",
  "embedded-io-async",
@@ -295,6 +296,13 @@ dependencies = [
  "akuma-cpu",
  "akuma-kacho",
  "arm_pl031",
+]
+
+[[package]]
+name = "akuma-uart"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
 ]
 
 [[package]]

@@ -1,15 +1,29 @@
 # Console (UART) I/O
 
-PL011 UART driver and the kernel's console output/input chokepoint. Source:
-`src/console.rs`.
+The kernel's console output/input chokepoint (`src/console.rs`) over the PL011
+UART driver (`crates/akuma-uart`).
 
-> **Stability: B (watch).** Dormant since March 2026 (`extract akuma-exec`).
+> **Stability: B (watch).** The device half moved to its own crate 2026-08-31
+> ([`AKUMA_UART_EXTRACTION.md`](../../archive/AKUMA_UART_EXTRACTION.md)); the
+> policy half is otherwise dormant since March 2026 (`extract akuma-exec`).
 
 ## UART driver
 
-`Uart` (`:19-57`) wraps the PL011 registers at `akuma_exec::mmu::DEV_UART_VA`
-(remapped VA for physical `0x0900_0000`): `write`/`read` hit the data
-register (`DR_OFFSET`), `has_data()` checks the flag register's `RXFE` bit.
+`crates/akuma-uart` wraps the PL011's two registers at
+`akuma_primitives::addr::DEV_UART_VA` (remapped VA for physical `0x0900_0000`)
+and exposes three operations: `write_byte`/`read_byte` hit the data register
+(`+0x00`), `has_data()` checks the flag register's `RXFE` bit (`+0x18`).
+
+The split is **device below, policy above**. The crate holds the one `unsafe`
+that vouches for the register window and nothing else; `src/console.rs` keeps IRQ
+masking, the opt-in cross-core `Spinlock`, the `MULTICORE` gate and all
+formatting — and carries `#![forbid(unsafe_code)]` as a result. The policy half
+stayed in the bin because it is gated on `cfg(kernel_console_lock)` (a crate only
+sees cfgs its own `build.rs` emits) and needs `akuma_exec::bkl::current_core_id`.
+
+`write_byte` does **not** wait for space in the transmit FIFO: the console's value
+is that it still emits while the kernel is failing, and a `TXFF` spin is a place
+to hang while trying to report why. A full FIFO drops the byte.
 One `static UART: Uart` (`:60`) instance; there is no lock around it.
 
 ## Output: the `emit()` chokepoint

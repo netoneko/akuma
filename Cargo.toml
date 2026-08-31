@@ -4,6 +4,7 @@ default-members = [
     ".",
     "crates/akuma-alloc",
     "crates/akuma-exec",
+    "crates/akuma-uart",
     "crates/akuma-firecracker",
     "crates/akuma-cpu",
     "crates/akuma-elf",
@@ -671,6 +672,7 @@ akuma-kacho = { path = "crates/akuma-kacho" }
 # Physical memory manager: bitmap allocator, frame tracking, UAF quarantine,
 # free/CoW event ledgers. `src/pmm.rs` is now a thin shim over this crate.
 akuma-alloc = { path = "crates/akuma-alloc" }
+akuma-uart = { path = "crates/akuma-uart" }
 akuma-pmm = { path = "crates/akuma-pmm" }
 # The dependency-free leaf: `OnceCopy`, the one stack writer + `safe_print!`.
 akuma-primitives = { path = "crates/akuma-primitives" }
