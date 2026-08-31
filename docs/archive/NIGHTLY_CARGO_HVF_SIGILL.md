@@ -4,6 +4,16 @@
 (`docs/runbooks/selfhost-kernel-build.md` §6). Linked from that runbook and from
 the `docs/README.md` symptom row for `EC=0x0` under HVF.
 
+> **Follow-on, 2026-08-31 — the same shape at a second EC.** `cargo` startup
+> was reported still printing `Unknown from EL0` lines, now interleaving
+> **`EC=0x1d`** (*access to SME functionality trapped*) with `EC=0x0`, at ELRs
+> ~27 KB from this doc's `0x112ac280`. The fix below covers `EC=0x1d` too — it
+> is the same `_ =>` catch-all arm — so the probe *should* recover; what is
+> unconfirmed is whether a handler is registered for it. Tracked as
+> [`DEVBOX_ISSUES.md`](DEVBOX_ISSUES.md) Issue 27, which also notes that this
+> doc's `EC=0x0` arm prints before it attempts delivery, so a **working** probe
+> still looks like a crash in the console.
+
 ## TL;DR
 
 Nightly `cargo` (1.99.0) died instantly under HVF at a constant

@@ -1941,6 +1941,102 @@ recurrence is worth a note.
    round-trip rather than on console strings.
 
 
+## Issue 27: `[Exception] Unknown from EL0 … delivering SIGILL` spam on every `cargo` start
+
+**Status: OPEN — reported 2026-08-31, analysed from the log lines, NOT
+reproduced in this session.** Everything below about the *mechanism* is read off
+the ESR classes and this tree's own source; the claim that it is harmless is
+**not** verified, because nobody has yet reported whether the `cargo clean` that
+produced it succeeded. That is the one thing to capture next time.
+
+### Symptom
+
+Four lines, always on `cargo clean`, **even when the cache is empty and there is
+nothing to delete**:
+
+```
+[Exception] Unknown from EL0: EC=0x0,  ISS=0x0 ELR=0x112b2b30 — delivering SIGILL
+[Exception] Unknown from EL0: EC=0x1d, ISS=0x0 ELR=0x112b2b48 — delivering SIGILL
+[Exception] Unknown from EL0: EC=0x1d, ISS=0x0 ELR=0x112b2b50 — delivering SIGILL
+[Exception] Unknown from EL0: EC=0x0,  ISS=0x0 ELR=0x112b2c44 — delivering SIGILL
+```
+
+### Why "even with an empty cache" is the informative half of the report
+
+It is what rules out the clean itself. These fire during **`cargo`'s process
+startup**, before any work is chosen — so an empty cache changes nothing, and
+the reproducer is really "start `cargo`", not "clean something". Expect the same
+lines from any `cargo` subcommand; `cargo clean` is just the cheapest one to run.
+
+### What the two EC values are
+
+- **`EC=0x0`** — undefined instruction. Already understood: this is the class
+  [`NIGHTLY_CARGO_HVF_SIGILL.md`](NIGHTLY_CARGO_HVF_SIGILL.md) root-caused as
+  OpenSSL's `OPENSSL_cpuid_setup` armcaps probe executing `SM3SS1` (FEAT_SM3),
+  which Apple Silicon lacks, at `ELR=0x112ac280`. **These ELRs sit ~27 KB from
+  that address in the same load region** — suggestive of the same feature-probe
+  machinery, not proof of the same routine.
+- **`EC=0x1d`** — `0b011101`, *access to SME functionality trapped*. This EC is
+  **not in `src/exceptions.rs`'s `esr` constant table**, so it lands in the `_ =>`
+  catch-all and gets the same treatment. It is a second, distinct probe.
+
+The interleaving of the two at strictly increasing ELRs (`b30 → b48 → b50 →
+c44`) is the shape of a **probe cascade walking forward through a detection
+routine** — which is what it looks like when SIGILL delivery is *working* and
+each handler resumes past its instruction.
+
+### This is not the kernel lying about CPU features
+
+Checked, because "userspace executed an SME instruction" would be our bug if we
+had advertised SME:
+
+- `AARCH64_HWCAP` (`crates/akuma-elf/src/types.rs`) does **not** include
+  `HWCAP_SVE` — the constant is defined but deliberately left out of the set.
+- `AT_HWCAP2` is passed as **literal `0`** (`crates/akuma-elf/src/stack.rs:295`),
+  and SME is an `AT_HWCAP2` bit.
+
+So nothing we publish claims SME or SVE. Userspace is probing the instruction
+directly instead of trusting `HWCAP2`, which is the documented OpenSSL/libgcc
+pattern and is *supposed* to fault.
+
+### So what, if anything, is the defect?
+
+Most likely **only the logging**. `src/exceptions.rs`'s catch-all emits an
+unconditional `safe_print!` before it even tries `try_deliver_signal`, so a
+probe that is working exactly as designed still prints a scary line per probe.
+An expected, handled SIGILL should not look like a crash in the console.
+
+But that is the *benign* reading and it is unconfirmed. The alternative is that
+one of these probes has **no handler registered**, in which case
+`try_deliver_signal` returns false and the process takes a fatal SIGILL — the
+pre-2026-08-06 failure mode, re-appearing for `EC=0x1d` instead of `EC=0x0`.
+The console lines look identical in both cases, which is precisely why this
+cannot be closed from the log alone.
+
+### If you see it again — settle the one open question first
+
+1. **Report whether the command succeeded.** `cargo clean; echo "rc=$?"`. That
+   single number decides between "cosmetic log spam" and "Issue 27 is the SM3
+   bug again, for SME". Everything else is secondary.
+2. If `rc != 0`, this is a real regression of the
+   [`NIGHTLY_CARGO_HVF_SIGILL.md`](NIGHTLY_CARGO_HVF_SIGILL.md) fix scoped to a
+   different EC, and the fix shape is already known.
+3. Resolve the ELRs against the **actual** `cargo` binary in the guest, not a
+   host one: `addr2line -f -e $(command -v cargo) 0x112b2b30`, or read
+   `/proc/<pid>/maps` to find which mapping `0x112b2xxx` falls in — the
+   NIGHTLY doc's value came from exactly that step.
+4. Note the accelerator. TCG (`-cpu max`) implements features HVF (`-cpu host`)
+   does not, so `HVF=0` changing the line count is itself a datapoint — that
+   asymmetry is what cracked the original.
+
+### Fix sketch, if it turns out to be cosmetic
+
+Demote the print: log at the point where delivery **fails**, not on entry, and
+leave the successful-probe path silent (or behind a counter, the way
+`SYNC_EC_EL0` already buckets EC). A per-probe `safe_print!` on a working path
+is also console traffic on every process start.
+
+
 ## Background
 
 - [`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md)

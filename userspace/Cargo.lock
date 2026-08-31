@@ -50,6 +50,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-cpu"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-ext2"
 version = "0.1.0"
 dependencies = [
@@ -83,6 +87,7 @@ version = "0.1.0"
 name = "akuma-primitives"
 version = "0.1.0"
 dependencies = [
+ "akuma-cpu",
  "akuma-not-even-once",
 ]
 
