@@ -649,14 +649,42 @@ def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> Fi
 
 
 def walk(paths: list, kernel_gate: bool):
+    """Count every source file under `paths`, each file exactly once.
+
+    **The dedup is load-bearing, not tidiness.** Roots that overlap
+    (`src crates src/syscall`) or simply repeat (`src src crates`) used to count
+    the shared files twice, and every column doubled in lockstep — `src/syscall`
+    read 46 files / 22,886 code / 9,698 comment against a true 23 / 11,443 /
+    4,849. A clean 2x is exactly what a plausible-looking number looks like, and
+    this script is what `CLAUDE.md` tells people to run to regenerate the figures
+    in `docs/reference/crate-safety.md`, so a silent doubling lands in the docs
+    as authoritative. Found 2026-08-31 by a reader who thought the *script* was
+    miscounting; it was, but only when handed overlapping arguments.
+
+    `walk_rev` has never had this bug and needs no equivalent: it filters one
+    `git ls-tree` listing, which names each path once by construction.
+    """
     files: list = []
     ignored = 0
+    seen: set = set()
+    duplicates = 0
+
+    def take(full: str, spec) -> None:
+        """Count `full` unless some earlier root already claimed it."""
+        nonlocal duplicates
+        key = os.path.realpath(full)
+        if key in seen:
+            duplicates += 1
+            return
+        seen.add(key)
+        files.append(count_file(full, full, spec, kernel_gate))
+
     for root_arg in paths:
         root_arg = root_arg.rstrip(os.sep)
         if os.path.isfile(root_arg):
             spec = EXT_LANGS.get(os.path.splitext(root_arg)[1])
             if spec:
-                files.append(count_file(root_arg, root_arg, spec, kernel_gate))
+                take(root_arg, spec)
             else:
                 ignored += 1
             continue
@@ -670,7 +698,12 @@ def walk(paths: list, kernel_gate: bool):
                 if spec is None:
                     ignored += 1
                     continue
-                files.append(count_file(full, full, spec, kernel_gate))
+                take(full, spec)
+
+    if duplicates:
+        print(f"note: {duplicates} file(s) matched more than one of {paths} and "
+              f"were counted once. Overlapping roots are fine; the totals below "
+              f"are deduplicated.", file=sys.stderr)
     return files, ignored
 
 
@@ -1142,6 +1175,27 @@ def self_test() -> int:
         print(f"  FAIL unsafe lines exceed code lines in {len(over)} file(s): {over[:3]}")
     else:
         print("  ok   unsafe lines <= code lines in every file")
+
+    # Overlapping roots must not double-count. This shipped broken: `walk`
+    # appended every file under every root arg with no dedup, so
+    # `cloc_akuma.py src crates src/syscall` doubled every column for the shared
+    # files in lockstep (`src/syscall` read 46 files / 22,886 code against a true
+    # 23 / 11,443). A clean 2x reads as a plausible number, and this script is
+    # what regenerates the figures in docs/reference/crate-safety.md, so the
+    # doubling would have landed there as authoritative. Fixed 2026-08-31; pinned
+    # here because nothing else would notice it coming back.
+    if os.path.isdir("src") and os.path.isdir(os.path.join("src", "syscall")):
+        plain, _ = walk(["src"], True)
+        overlapped, _ = walk(["src", os.path.join("src", "syscall"), "src"], True)
+        same = (len(plain) == len(overlapped)
+                and sum(f.code for f in plain) == sum(f.code for f in overlapped))
+        failures += 0 if same else 1
+        if same:
+            print(f"  ok   overlapping roots deduplicate ({len(plain)} files either way)")
+        else:
+            print(f"  FAIL overlapping roots double-count: {len(plain)} files / "
+                  f"{sum(f.code for f in plain)} code alone vs {len(overlapped)} / "
+                  f"{sum(f.code for f in overlapped)} with an overlapping root")
 
     print()
     print("self-test: " + ("PASS" if failures == 0 else f"{failures} FAILURE(S)"))

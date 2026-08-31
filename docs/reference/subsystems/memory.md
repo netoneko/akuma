@@ -288,8 +288,21 @@ with IRQs masked, so there is no verdict to print.
 
 ## Kernel heap allocator
 
-`src/allocator.rs`. **Not a slab** — a dynamic linked-list/talc allocator:
+`crates/akuma-alloc/src/lib.rs`. **Not a slab** — a dynamic linked-list/talc allocator:
 `talc::Talc<PmmOomHandler>` behind a `Spinlock`.
+
+> Was `src/allocator.rs` until 2026-08-31, when it moved wholesale into its own
+> crate to quarantine 20 `unsafe` sites out of the bin
+> ([`crate-safety.md`](../crate-safety.md) § "The allocator is a quarantine, not
+> a cleanup"). `crate::allocator::` still resolves in the bin via a `pub use`
+> alias. What changed is the crate's *reach*: it no longer depends on
+> `akuma-exec` or the syscall layer. `#[global_allocator]` and
+> `#[alloc_error_handler]` moved to `src/main.rs`, where binary-level
+> declarations belong and where the OOM policy can reach the process table; the
+> syscall-counter dump went with the handler; and the `[HEAP]` line's
+> `sc_nr`/`tid` attribution was deleted. Line references below are deliberately
+> dropped rather than renumbered. Full record:
+> [`AKUMA_ALLOC_EXTRACTION.md`](../../archive/AKUMA_ALLOC_EXTRACTION.md).
 
 - **Growth:** seeded with a small bootstrap arena; `PmmOomHandler::handle_oom`
   claims contiguous pages from PMM. `HEAP_GROW_PAGES`=64 amortised; under
@@ -299,7 +312,7 @@ with IRQs masked, so there is no verdict to print.
   `claimed_span_report()` exposes live/pinned spans.
 - **Watermark:** `is_memory_low()` (free heap < 2 MB `HEAP_LOW_WATERMARK`) —
   circuit breaker at fork/clone/spawn/SSH accept.
-- **Failure path:** `#[alloc_error_handler]` (`src/allocator.rs:499`) prints
+- **Failure path:** `#[alloc_error_handler]` (`src/main.rs`) prints
   `[OOM] allocation of N bytes failed`, calls `return_to_kernel(-12)` if
   in-process, else `panic!`.
 - **`mark_pmm_ready()`** flips from talc-only to page-backed growth after PMM init.
@@ -399,7 +412,7 @@ with IRQs masked, so there is no verdict to print.
 ## OOM decision map
 
 **Stability: B — every path here was read out of the source on 2026-08-13**
-(`src/pmm.rs`, `src/allocator.rs`, `crates/akuma-exec/src/process/reclaim.rs`).
+(`src/pmm.rs`, `crates/akuma-alloc/src/lib.rs`, `crates/akuma-exec/src/process/reclaim.rs`).
 Not A: this is the highest-churn subsystem in the tree, so re-verify the line
 numbers before relying on them. The *shape* is what this section is for.
 
@@ -513,13 +526,13 @@ has probably added a seventh; check this list first.
 | `is_memory_low` `LOW_PAGES` | 128 pages (512 KB) | fork/clone pre-flight refusal |
 | `PROCESS_RECLAIM_COOLDOWN_US` | 10 ms | how long a RETIRED slot is ineligible |
 | `USER_RECLAIM_BATCH` | 512 pages | eviction batch, amortises the sweep |
-| `HEAP_GROW_HEADROOM_PAGES` | see `allocator.rs` | extra span so talc metadata still fits |
+| `HEAP_GROW_HEADROOM_PAGES` | see `akuma-alloc` | extra span so talc metadata still fits |
 
 `user_alloc_would_starve`, `user_readahead_budget`, `next_reclaim_step`,
 `heap_grow_initial_pages` and `heap_grow_backoff` are all **pure functions** of a
 free-page count (plus, for `next_reclaim_step`, the step already performed). The first
 three live in `akuma_exec::memmath` and are host-tested; the latter two are still in
-`src/allocator.rs` and therefore reachable only from the boot suite.
+`crates/akuma-alloc/src/lib.rs` and therefore reachable only from the boot suite.
 
 `user_alloc_would_starve` is **not** re-exported from `pmm` any more: since the
 escalation became `next_reclaim_step`, the predicate has exactly one consumer, and

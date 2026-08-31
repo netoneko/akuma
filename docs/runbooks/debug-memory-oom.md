@@ -31,7 +31,7 @@ narrows the cause fast:
 | Symptom (signature) | Cause | Status | Fix / workaround |
 |---|---|---|---|
 | `!!! PANIC !!! memory allocation of N bytes failed` (N≈25 MB) in kernel | `sys_read`/`append_file` slurped whole files into kernel heap | FIXED | `read_at` streaming; 64 KB syscall cap; 16 MB ext2 cap |
-| `[OOM] allocation of N bytes failed — killing process` then exit -12 | libakuma brk/mmap returns 0 | FIXED (kernel) | `#[alloc_error_handler]` (`src/allocator.rs:499`) calls `return_to_kernel(-12)`. **NOTE:** `archive/OOM_RECOVERY_OPTIONS.md` says "no handler" — that doc is STALE. |
+| `[OOM] allocation of N bytes failed — killing process` then exit -12 | libakuma brk/mmap returns 0 | FIXED (kernel) | `#[alloc_error_handler]` (`src/main.rs`) calls `return_to_kernel(-12)`. **NOTE:** `archive/OOM_RECOVERY_OPTIONS.md` says "no handler" — that doc is STALE. |
 | `[mmap] REJECT: size 0x1000 exceeds limit` / ~196,000 allocs then OOM | VA-space exhaustion (mmap bump never reclaimed) | FIXED | `ProcessMemory::free_regions` first-fit + chunked-allocator (Talc 64 KB chunks) |
 | `realloc` hangs | `munmap` deadlocks when called from inside realloc | FIXED | Deferred-free queue (`DEFERRED_FREE_SLOTS=16`), flushed on next `dealloc` |
 | `[Exception] EC=0x25 FAR=0x5` | `read_current_pid()` read PROCESS_INFO @0x1000 through boot TTBR0 (device-mem garbage) | FIXED | TTBR0-range guard in `read_current_pid()` (boot 0x4020_0000–0x4400_0000 → None) |
@@ -73,10 +73,10 @@ the `pmm` shell command.
 | `DOUBLE-FREE` counter | `pmm::double_free_count()` | Non-zero ⇒ CoW/refcount desync — investigate immediately |
 | Demand-page counters | `DP_FILE_PAGES/DP_ANON_PAGES/DP_COW_PAGES/DP_PROTNONE_PAGES`, `EAGER_MMAP_PAGES` | Attributes RAM spikes to file/anon/CoW paths |
 | `SpanReport` | `allocator::claimed_span_report()` | `pinned` not falling back to 0 after workload exit = the "free PMM never recovered" bug |
-| `is_memory_low()` | `src/allocator.rs:556` | Circuit breaker (free heap < 2 MB); checked at fork/clone/spawn/SSH accept |
+| `is_memory_low()` | `crates/akuma-alloc/src/lib.rs` | Circuit breaker (free heap < 2 MB); checked at fork/clone/spawn/SSH accept |
 | PSTATS | per-process, on exit | `mmap/munmap/recvfrom…(Nms)`. **Note:** mmap time is preemption-inflated (IRQs on during syscalls) — not real CPU |
 | `DEBUG_FRAME_TRACKING` | `src/pmm.rs:20` (**off**) | `pmm leaks` grouping. Off by default — the BTreeMap tracker corrupted under load. |
-| `ENABLE_CANARIES` | `src/allocator.rs:25` (**off**) | Stack/guard canaries. **Breaks virtio-drivers DMA** — targeted debug only |
+| `ENABLE_CANARIES` | `crates/akuma-alloc/src/lib.rs` (**off**) | Stack/guard canaries. **Breaks virtio-drivers DMA** — targeted debug only |
 
 ## Debug procedure
 

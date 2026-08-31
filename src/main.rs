@@ -33,7 +33,45 @@ extern crate akuma_primitives;
 pub use akuma_primitives::safe_print;
 
 mod akuma;
-mod allocator;
+// The kernel heap moved to `crates/akuma-alloc` on 2026-08-31 to quarantine its
+// 18 `unsafe` sites out of the bin crate (that crate's header explains why it
+// cannot and should not `forbid`). Aliased rather than renamed at ~40 call sites,
+// which also keeps `crate::allocator::` reading the same in the boot tests.
+pub use akuma_alloc as allocator;
+
+/// Install the kernel heap.
+///
+/// `#[global_allocator]` and `#[alloc_error_handler]` are binary-level
+/// declarations, so they stay here rather than in `akuma-alloc`: a library that
+/// makes them decides the allocator for everything linking it, including a host
+/// test binary where it would fight std. The crate exports the implementation;
+/// this is the one place that installs it.
+#[global_allocator]
+static ALLOCATOR: akuma_alloc::KernelAllocator = akuma_alloc::KernelAllocator;
+
+/// OOM: kill the faulting userspace process instead of panicking the kernel.
+///
+/// This is policy, not allocation, which is why it lives in the bin — it needs
+/// the process table and the syscall counters, neither of which the heap should
+/// know about. With no current process (pure kernel context, early boot) there
+/// is nothing to kill and panicking is correct.
+#[alloc_error_handler]
+fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
+    let stats = allocator::stats();
+    safe_print!(256,
+        "\n[OOM] allocation of {} bytes failed (heap {}MB / {}MB used) — killing process\n",
+        layout.size(),
+        stats.allocated / 1024 / 1024,
+        stats.heap_size / 1024 / 1024,
+    );
+    // Whole-kernel diagnostics belong on this path, not inside `alloc`: a failed
+    // allocation returns null and arrives here immediately.
+    syscall::syscall_counters::dump();
+    if akuma_exec::process::current_process_shared().is_some() {
+        akuma_exec::process::return_to_kernel(-12); // ENOMEM
+    }
+    panic!("kernel OOM: allocation of {} bytes failed", layout.size());
+}
 // mod async_net;
 #[cfg(kernel_tests)]
 mod async_tests;

@@ -6,6 +6,7 @@ version = 4
 name = "akuma"
 version = "0.0.7"
 dependencies = [
+ "akuma-alloc",
  "akuma-boot",
  "akuma-cpu",
  "akuma-exec",
@@ -37,6 +38,16 @@ dependencies = [
  "spinning_top",
  "talc",
  "virtio-drivers",
+]
+
+[[package]]
+name = "akuma-alloc"
+version = "0.1.0"
+dependencies = [
+ "akuma-pmm",
+ "akuma-primitives",
+ "spinning_top",
+ "talc",
 ]
 
 [[package]]

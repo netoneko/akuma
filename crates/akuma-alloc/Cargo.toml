@@ -1,0 +1,14 @@
+[package]
+name = "akuma-alloc"
+version = "0.1.0"
+edition = "2024"
+description = "The kernel heap: Talc plus the on-demand PMM growth/backoff/reclaim policy around it. Quarantines the allocator's unsafe away from the bin crate."
+
+[dependencies]
+talc = "4"
+spinning_top = "0.3"
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-pmm = { path = "../akuma-pmm" }
+
+[lints]
+workspace = true

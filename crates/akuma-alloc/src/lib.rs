@@ -1,3 +1,9 @@
+#![no_std]
+// The canary reads/writes place a `u64` at an 8-byte-aligned offset either side
+// of the user pointer, which clippy sees only as `*mut u8 -> *mut u64`. The bin
+// crate carried the same allow, with the same justification, before this file
+// moved; the casts are unchanged.
+#![allow(clippy::cast_ptr_alignment)]
 //! Kernel memory allocator — Talc with on-demand PMM growth.
 //!
 //! The heap is seeded with a small bootstrap arena (~1 MB) and grows on
@@ -6,6 +12,55 @@
 //! Debug features:
 //! - ENABLE_ALLOCATION_REGISTRY: Track all allocations to detect overlaps, double frees
 //! - ENABLE_CANARIES: Add guard bytes around allocations to detect overflows
+//!
+//! # Why this is a crate
+//!
+//! Moved out of `src/allocator.rs` on 2026-08-31. **This crate cannot
+//! `forbid(unsafe_code)` and is not meant to** — it holds 18 `unsafe` sites, and
+//! that is the point: they are trusted-but-difficult operations (raw span
+//! claiming, canary reads/writes either side of a user pointer, the `GlobalAlloc`
+//! impl itself) and concentrating them in a named crate is what lets the rest of
+//! the kernel trend safe. Quarantine, not elimination.
+//!
+//! # What it deliberately does NOT depend on
+//!
+//! `akuma-primitives`, `akuma-pmm`, `talc`, `spinning_top` — and nothing else.
+//! In particular **not `akuma-exec`** and **not the syscall layer**, even though
+//! the pre-move file reached into both. An allocator that depends on the syscall
+//! layer is upside down: the syscall layer allocates.
+//!
+//! None of those five call sites was part of allocating. They were OOM *policy*
+//! and *diagnostics*, and each went where it belonged rather than being routed
+//! back through a hook:
+//!
+//! | was | now |
+//! |---|---|
+//! | `#[alloc_error_handler]` calling `current_process_shared` + `return_to_kernel` | the handler lives in `src/main.rs`. It is a **binary-level declaration** and its body is OOM policy — "kill the process, not the kernel" — which is the bin's business, not the heap's |
+//! | `#[global_allocator]` | likewise `src/main.rs`. This crate exports [`KernelAllocator`]; the bin installs it |
+//! | `syscall_counters::dump()` on allocation failure | moved into that handler. Returning null from `alloc` reaches it immediately anyway, so the dump lost nothing by moving to where whole-kernel diagnostics belong |
+//! | `current_syscall_nr()` + `current_thread_id()` on the `[HEAP]` line | **deleted.** Attribution on a 5 MB-boundary progress print did not justify an allocator knowing about syscalls or threads; the line still reports the size that drove the growth |
+//!
+//! An earlier cut of this crate kept all four as `OnceCopy` hooks. That was
+//! backwards — it preserved the inverted dependency and added a registration
+//! step to do it. Three of the four simply belong in the bin, and the fourth was
+//! not worth keeping at all.
+//!
+//! `phys_to_virt` came from `akuma_exec::mmu` and now comes from
+//! `akuma_primitives::addr`, which is where it actually lives (`akuma_exec`
+//! re-exports it).
+//!
+//! # No `build.rs`, on purpose
+//!
+//! The pre-move file had exactly one cfg, `#[cfg(kernel_tests)]` on
+//! `allocated_bytes()`. A crate only sees a cfg its **own** build script emits —
+//! `akuma-exec` once shipped a whole family of dormant `kernel_profile_extreme`
+//! gates for want of one. Rather than add a build script and a forwarded
+//! `no-tests` feature for a single three-line atomic read, the gate is gone: both
+//! callers are themselves in `kernel_tests`-gated modules, so the cfg guarded
+//! nothing, and LTO drops the function when nothing calls it. Adding a cfg to
+//! this crate later means adding a `build.rs` first.
+
+extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
@@ -13,13 +68,20 @@ use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use spinning_top::Spinlock;
 use talc::{Span, Talc};
 
-/// Enable allocation registry for debugging heap corruption
+use akuma_primitives::addr::phys_to_virt;
+use akuma_primitives::irq::with_irqs_disabled;
+use akuma_primitives::safe_print;
+
+
+/// Enable allocation registry for debugging heap corruption.
+///
 /// This tracks all allocations and detects overlaps, double frees, and invalid frees
 /// WARNING: Canaries break virtio-drivers which does address comparisons on DMA buffers
 /// WARNING: Registry causes performance issues - iterates 4096 entries per alloc
 pub const ENABLE_ALLOCATION_REGISTRY: bool = false;
 
-/// Enable canary bytes around allocations (requires ENABLE_ALLOCATION_REGISTRY)
+/// Enable canary bytes around allocations (requires `ENABLE_ALLOCATION_REGISTRY`).
+///
 /// Adds 8 bytes before and after each allocation with magic values
 /// WARNING: This breaks virtio-drivers! Only enable for targeted debugging.
 pub const ENABLE_CANARIES: bool = false;
@@ -69,7 +131,7 @@ impl talc::OomHandler for PmmOomHandler {
         // freed span is reusable for the next same-size request.
         let pages_for_layout = layout.size().div_ceil(PAGE_SIZE);
         let needed = pages_for_layout + HEAP_GROW_HEADROOM_PAGES;
-        let mut n = heap_grow_initial_pages(needed, crate::pmm::free_count());
+        let mut n = heap_grow_initial_pages(needed, akuma_pmm::free_count());
 
         // The kernel heap lives in the linear (`phys_to_virt`) map, so a heap
         // span must be *physically* contiguous. On a fragmented small-RAM pool
@@ -91,8 +153,8 @@ impl talc::OomHandler for PmmOomHandler {
         // (we were called from inside `malloc`), so the try_lock fails and the
         // reclaim is a no-op. No deadlock, no benefit; just don't rely on it here.
         loop {
-            if let Some(frame) = crate::pmm::alloc_pages_contiguous_zeroed(n) {
-                let ptr = akuma_exec::mmu::phys_to_virt(frame.addr).cast::<u8>();
+            if let Some(pa) = akuma_pmm::alloc_pages_contiguous_zeroed(n) {
+                let ptr = phys_to_virt(pa).cast::<u8>();
                 let span = Span::from_base_size(ptr, n * PAGE_SIZE);
                 return if let Ok(_heap) = unsafe { talc.claim(span) } {
                     // Record the PMM-backed span so `reclaim_to_pmm()` can
@@ -100,7 +162,7 @@ impl talc::OomHandler for PmmOomHandler {
                     // is full the span is still used as heap — it just
                     // becomes non-reclaimable (the pre-reclaim one-way
                     // behaviour).
-                    register_claimed_span(frame.addr, n);
+                    register_claimed_span(pa, n);
                     let prev = HEAP_SIZE.fetch_add(n * PAGE_SIZE, Ordering::Relaxed);
                     let now = prev + n * PAGE_SIZE;
                     // Leak-debug: log the request driving growth each time the
@@ -109,7 +171,7 @@ impl talc::OomHandler for PmmOomHandler {
                     // is alloc-free (used by the alloc error handler too).
                     const STEP: usize = 256 * 1024 * 1024;
                     if prev / STEP != now / STEP {
-                        crate::safe_print!(160,
+                        safe_print!(160,
                             "[HEAP-GROW] total={}MB used={}MB this_req={} bytes claimed={} pages\n",
                             now / 1024 / 1024,
                             ALLOCATED_BYTES.load(Ordering::Relaxed) / 1024 / 1024,
@@ -119,8 +181,7 @@ impl talc::OomHandler for PmmOomHandler {
                 } else {
                     // Couldn't establish a heap in the pages — return them to
                     // PMM rather than leaking (old code dropped them).
-                    crate::pmm::free_pages_contiguous(
-                        akuma_exec::PhysFrame::new(frame.addr), n);
+                    akuma_pmm::free_pages_contiguous(pa, n);
                     Err(())
                 };
             }
@@ -141,7 +202,9 @@ impl talc::OomHandler for PmmOomHandler {
 pub const HEAP_GROW_PAGES: usize = 64;
 
 /// Extra pages claimed above what a layout strictly needs, to cover talc's
-/// per-claimed-span metadata. Without this, an allocation whose size is an exact
+/// per-claimed-span metadata.
+///
+/// Without this, an allocation whose size is an exact
 /// multiple of the page size (e.g. a recurring 256 KB / 64-page request) never
 /// fits in a span of exactly that many pages: handle_oom claims a just-too-small
 /// span, talc re-fails, and the heap grows without bound until the PMM is drained
@@ -149,13 +212,16 @@ pub const HEAP_GROW_PAGES: usize = 64;
 /// well under one page — so 2 pages is ample headroom. See docs/LLAMA_MMAP_OOM_KERNEL_ABORT.md.
 pub const HEAP_GROW_HEADROOM_PAGES: usize = 2;
 
-/// Initial contiguous-page request for a heap-growth that must satisfy a layout
-/// needing `needed` pages, given `free` PMM pages remain. Amortise to
+/// Initial contiguous-page request for a heap growth.
+///
+/// Must satisfy a layout needing `needed` pages, given `free` PMM pages remain.
+/// Amortise to
 /// [`HEAP_GROW_PAGES`] when memory is ample; shrink to exactly `needed` under
 /// pressure (`free <= 2 * HEAP_GROW_PAGES`) so the thin `USER_PAGE_RESERVE` pool
 /// is preserved for the OOM-kill bookkeeping path. Pure fn over its inputs so the
 /// boundary is unit-testable without draining real RAM.
 #[inline]
+#[must_use]
 pub fn heap_grow_initial_pages(needed: usize, free: usize) -> usize {
     if free <= 2 * HEAP_GROW_PAGES {
         needed
@@ -164,14 +230,16 @@ pub fn heap_grow_initial_pages(needed: usize, free: usize) -> usize {
     }
 }
 
-/// Next contiguous-page request after a run of `n` pages failed to allocate, for
-/// a layout needing at least `needed` pages. Halves toward `needed` so a
+/// Next contiguous-page request after a run of `n` pages failed to allocate.
+///
+/// For a layout needing at least `needed` pages. Halves toward `needed` so a
 /// fragmented pool that can't yield the amortised run can still back off to the
 /// minimum the layout requires (and, when `needed == 1`, to a single page —
 /// satisfiable whenever any page is free). Returns `None` once `needed` itself
 /// has been tried, i.e. genuine multi-page-contiguous OOM. Pure + monotonically
 /// decreasing, so the `handle_oom` loop is guaranteed to terminate.
 #[inline]
+#[must_use]
 pub fn heap_grow_backoff(n: usize, needed: usize) -> Option<usize> {
     if n <= needed {
         None
@@ -221,7 +289,7 @@ impl ClaimedSpan {
         Self { pmm_addr: 0, pages: 0 }
     }
     fn heap_span(&self) -> Span {
-        let base = akuma_exec::mmu::phys_to_virt(self.pmm_addr).cast::<u8>();
+        let base = phys_to_virt(self.pmm_addr).cast::<u8>();
         Span::from_base_size(base, self.pages * PAGE_SIZE)
     }
 }
@@ -246,6 +314,7 @@ fn register_claimed_span(pmm_addr: usize, pages: usize) {
 }
 
 /// Return fully-free PMM-backed heap spans to the physical allocator.
+///
 /// Returns the number of pages reclaimed. Safe to call from any non-allocator
 /// context; if the `TALC` lock is held (e.g. we are reentered from inside
 /// `handle_oom`) it bails immediately via `try_lock`.
@@ -285,7 +354,7 @@ pub fn reclaim_to_pmm() -> usize {
         });
         match to_free {
             Some((addr, pages)) => {
-                crate::pmm::free_pages_contiguous(akuma_exec::PhysFrame::new(addr), pages);
+                akuma_pmm::free_pages_contiguous(addr, pages);
                 HEAP_SIZE.fetch_sub(pages * PAGE_SIZE, Ordering::Relaxed);
                 reclaimed_pages += pages;
             }
@@ -332,9 +401,12 @@ pub struct SpanReport {
     pub busy: bool,
 }
 
-/// Take a [`SpanReport`]. Safe from any non-allocator context; if Talc is held
+/// Take a [`SpanReport`].
+///
+/// Safe from any non-allocator context; if Talc is held
 /// (we were reentered from `handle_oom`) it returns `busy = true` rather than
 /// deadlocking, matching `reclaim_to_pmm`'s `try_lock` discipline.
+#[must_use]
 pub fn claimed_span_report() -> SpanReport {
     if !is_pmm_ready() {
         return SpanReport::default();
@@ -433,15 +505,15 @@ fn registry_add(addr: usize, size: usize) -> bool {
         if record.active && ranges_overlap(addr, size, record.addr, record.size) {
             // Found an overlap!
             OVERLAP_COUNT.fetch_add(1, Ordering::Relaxed);
-            crate::console::print("[ALLOC] OVERLAP DETECTED!\n");
-            crate::safe_print!(
+            akuma_primitives::console::print_str("[ALLOC] OVERLAP DETECTED!\n");
+            safe_print!(
                 80,
                 "  New: 0x{:x}-0x{:x} (size={})\n",
                 addr,
                 addr + size,
                 size
             );
-            crate::safe_print!(
+            safe_print!(
                 80,
                 "  Existing: 0x{:x}-0x{:x} (size={})\n",
                 record.addr,
@@ -464,7 +536,7 @@ fn registry_add(addr: usize, size: usize) -> bool {
     }
 
     // Registry full - just warn, don't fail allocation
-    crate::console::print("[ALLOC] Registry full, cannot track allocation\n");
+    akuma_primitives::console::print_str("[ALLOC] Registry full, cannot track allocation\n");
     !overlap_found
 }
 
@@ -487,31 +559,10 @@ fn registry_remove(addr: usize) -> bool {
 
     // Not found - this is an invalid free (could be double free or wild pointer)
     INVALID_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
-    crate::safe_print!(64, "[ALLOC] INVALID FREE at 0x{:x}\n", addr);
+    safe_print!(64, "[ALLOC] INVALID FREE at 0x{:x}\n", addr);
     false
 }
 
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
-
-/// OOM handler: kill the current userspace process instead of panicking the kernel.
-/// If there is no current process (pure kernel context), fall through to panic.
-#[alloc_error_handler]
-fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
-    let heap_total = HEAP_SIZE.load(Ordering::Relaxed);
-    let heap_used = ALLOCATED_BYTES.load(Ordering::Relaxed);
-    crate::safe_print!(256,
-        "\n[OOM] allocation of {} bytes failed (heap {}MB / {}MB used) — killing process\n",
-        layout.size(),
-        heap_used / 1024 / 1024,
-        heap_total / 1024 / 1024,
-    );
-    // Kill the current process if there is one; otherwise panic the kernel.
-    if akuma_exec::process::current_process_shared().is_some() {
-        akuma_exec::process::return_to_kernel(-12); // ENOMEM
-    }
-    panic!("kernel OOM: allocation of {} bytes failed", layout.size());
-}
 
 static TALC: Spinlock<Talc<PmmOomHandler>> = Spinlock::new(Talc::new(PmmOomHandler));
 
@@ -531,8 +582,9 @@ pub struct MemoryStats {
     pub peak_allocated: usize,
 }
 
-/// Get current allocated bytes (live allocations)
-#[cfg(kernel_tests)]
+/// Get current allocated bytes (live allocations).
+///
+/// Was `#[cfg(kernel_tests)]`; see the module header's "No `build.rs`" note.
 pub fn allocated_bytes() -> usize {
     ALLOCATED_BYTES.load(Ordering::Relaxed)
 }
@@ -551,12 +603,13 @@ pub fn stats() -> MemoryStats {
 }
 
 /// Returns true if the system is running low on physical memory.
+///
 /// Pre-PMM: checks heap slab free space. Post-PMM: checks PMM free pages,
 /// since the heap now grows on demand and the seeded slab size is irrelevant.
 pub fn is_memory_low() -> bool {
     const LOW_PAGES: usize = 128; // 512 KB threshold
     if is_pmm_ready() {
-        crate::pmm::free_count() < LOW_PAGES
+        akuma_pmm::free_count() < LOW_PAGES
     } else {
         let heap_size = HEAP_SIZE.load(Ordering::Relaxed);
         let allocated = ALLOCATED_BYTES.load(Ordering::Relaxed);
@@ -566,9 +619,6 @@ pub fn is_memory_low() -> bool {
 
 /// No-op for backwards compatibility - IRQs are now always disabled during allocation
 pub fn enable_preemption_safe_alloc() {}
-
-// Use the shared IRQ guard from the irq module
-use crate::irq::with_irqs_disabled;
 
 pub fn init(heap_start: usize, heap_size: usize) -> Result<(), &'static str> {
     if heap_size == 0 {
@@ -598,7 +648,15 @@ pub fn init(heap_start: usize, heap_size: usize) -> Result<(), &'static str> {
 // Global allocator — delegates directly to Talc
 // ============================================================================
 
-struct KernelAllocator;
+/// The kernel heap, as a `GlobalAlloc`.
+///
+/// **The bin crate installs this**, with `#[global_allocator]` in `main.rs`.
+/// Deliberately not installed here: `#[global_allocator]` and
+/// `#[alloc_error_handler]` are *binary-level* declarations, and a library that
+/// makes them silently decides the allocator for anything that links it —
+/// including a host test binary, where it fights std. Keeping them in the bin is
+/// also what lets this crate build for the host at all.
+pub struct KernelAllocator;
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -654,7 +712,7 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
             let heap_used = ALLOCATED_BYTES.load(Ordering::Relaxed);
             let heap_peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
             let heap_count = ALLOCATION_COUNT.load(Ordering::Relaxed);
-            crate::safe_print!(256,
+            safe_print!(256,
                 "\n[ALLOC FAIL] requested={} heap_total={}MB heap_used={}MB ({}%) peak={}MB allocs={}\n",
                 user_size,
                 heap_total / 1024 / 1024,
@@ -662,7 +720,9 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
                 (heap_used * 100).checked_div(heap_total).unwrap_or(0),
                 heap_peak / 1024 / 1024,
                 heap_count);
-            crate::syscall::syscall_counters::dump();
+            // Returning null sends Rust straight to `handle_alloc_error`, i.e.
+            // the bin's `#[alloc_error_handler]` — which is where any further
+            // whole-kernel diagnostics (syscall counters, and so on) belong.
             return ptr::null_mut();
         }
 
@@ -712,9 +772,7 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
         let next = NEXT_REPORT_MB.load(Ordering::Relaxed);
         if mb >= next {
             NEXT_REPORT_MB.store(mb + 5, Ordering::Relaxed);
-            let sc_nr = crate::syscall::current_syscall_nr();
-            let tid = akuma_exec::threading::current_thread_id();
-            crate::safe_print!(192, "[HEAP] {}MB used (alloc={} bytes, sc_nr={}, tid={})\n", mb, user_size, sc_nr, tid);
+            safe_print!(96, "[HEAP] {}MB used (alloc={} bytes)\n", mb, user_size);
         }
 
         user_ptr
@@ -731,7 +789,7 @@ unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
             if !registry_remove(ptr as usize) {
                 // Could be double free - check if we've seen this address before
                 DOUBLE_FREE_COUNT.fetch_add(1, Ordering::Relaxed);
-                crate::safe_print!(64, "[ALLOC] Possible DOUBLE FREE at 0x{:x}\n", ptr as usize);
+                safe_print!(64, "[ALLOC] Possible DOUBLE FREE at 0x{:x}\n", ptr as usize);
                 // Don't actually free - could cause more corruption
                 return;
             }
@@ -743,7 +801,7 @@ unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
                 let canary_before = core::ptr::read_volatile(canary_before_ptr);
                 if canary_before != CANARY_BEFORE {
                     CANARY_CORRUPTION_COUNT.fetch_add(1, Ordering::Relaxed);
-                    crate::safe_print!(
+                    safe_print!(
                         128,
                         "[ALLOC] CANARY CORRUPTION (before) at dealloc 0x{:x}: expected 0x{:x}, got 0x{:x}\n",
                         ptr as usize,
@@ -757,7 +815,7 @@ unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
                 let canary_after = core::ptr::read_volatile(canary_after_ptr);
                 if canary_after != CANARY_AFTER {
                     CANARY_CORRUPTION_COUNT.fetch_add(1, Ordering::Relaxed);
-                    crate::safe_print!(
+                    safe_print!(
                         128,
                         "[ALLOC] CANARY CORRUPTION (after) at dealloc 0x{:x}+{}: expected 0x{:x}, got 0x{:x}\n",
                         ptr as usize,
@@ -814,7 +872,7 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
                         let canary_after = core::ptr::read_volatile(ptr.add(old_user_size) as *const u64);
                         if canary_before != CANARY_BEFORE || canary_after != CANARY_AFTER {
                             CANARY_CORRUPTION_COUNT.fetch_add(1, Ordering::Relaxed);
-                            crate::console::print("[ALLOC] CANARY CORRUPTION in realloc(0)\n");
+                            akuma_primitives::console::print_str("[ALLOC] CANARY CORRUPTION in realloc(0)\n");
                         }
                     }
                 }
@@ -907,7 +965,7 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
                         let canary_after = core::ptr::read_volatile(ptr.add(old_user_size) as *const u64);
                         if canary_before != CANARY_BEFORE || canary_after != CANARY_AFTER {
                             CANARY_CORRUPTION_COUNT.fetch_add(1, Ordering::Relaxed);
-                            crate::console::print("[ALLOC] CANARY CORRUPTION in realloc\n");
+                            akuma_primitives::console::print_str("[ALLOC] CANARY CORRUPTION in realloc\n");
                         }
                     }
                 }
@@ -935,7 +993,7 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
                 let next = NEXT_REALLOC_REPORT_MB.load(Ordering::Relaxed);
                 if mb >= next {
                     NEXT_REALLOC_REPORT_MB.store(mb + 5, Ordering::Relaxed);
-                    crate::safe_print!(128, "[HEAP-R] {}MB used (realloc {}->{})\n", mb, old_user_size, new_size);
+                    safe_print!(128, "[HEAP-R] {}MB used (realloc {}->{})\n", mb, old_user_size, new_size);
                 }
             }
 

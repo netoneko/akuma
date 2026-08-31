@@ -217,7 +217,7 @@ vector table's "Current EL, SPx" row) rather than switching to `SP_EL0`.
   `return_to_kernel(-14)` instead of yielding forever (socket-table leak).
 - `archive/FAR_0x5_AND_HEAP_CORRUPTION_FIX.md` — the original TTBR0-validation
   and IRQ-protection bugs behind `FAR=0x5` kernel panics; eleven separate
-  missing-`with_irqs_disabled` fixes across `pmm.rs`/`allocator.rs`/`process.rs`,
+  missing-`with_irqs_disabled` fixes across `pmm.rs`/`akuma-alloc`/`process.rs`,
   plus the TLB-flush-after-TTBR0-switch bugs in `mmu.rs`/`threading.rs`.
 - `archive/GO_FORKTEST_DEBUG.md` — the QEMU EC=0x15 misrouting taxonomy (DC
   ZVA, `stp xzr, xzr`) behind the workarounds in the EL0 SVC arm.

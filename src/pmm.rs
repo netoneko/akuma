@@ -228,6 +228,15 @@ pub fn free_page_at(frame: PhysFrame, site: akuma_pmm::FreeSite) {
     );
 }
 
+/// Contiguous multi-page allocation, as a [`PhysFrame`].
+///
+/// `#[cfg(kernel_tests)]` since 2026-08-31: the kernel heap was this shim's only
+/// production caller, and it moved to `crates/akuma-alloc`, which talks to
+/// `akuma_pmm` in raw `usize` PAs and needs no `PhysFrame` conversion. What is
+/// left are the PMM boot self-tests in `src/tests.rs`, which do want the typed
+/// form — so the wrapper follows them. Without the gate, `extreme-size`
+/// (`no-tests` + `-D dead-code`) fails to build.
+#[cfg(kernel_tests)]
 pub fn alloc_pages_contiguous_zeroed(count: usize) -> Option<PhysFrame> {
     akuma_pmm::alloc_pages_contiguous_zeroed(count).map(PhysFrame::new)
 }
