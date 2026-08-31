@@ -23,11 +23,7 @@ const DAIF_I_BIT: u64 = 1 << 7;
 
 #[inline]
 fn read_daif() -> u64 {
-    let daif: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
-    }
-    daif
+    akuma_cpu::daif::read()
 }
 
 fn test_irq_guard_masks_and_restores() {

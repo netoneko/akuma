@@ -935,11 +935,21 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
     regenerate are numbers that drift, so regenerate them.
 
     Only `crates/*` rows can be enforced-safe — `src` is the bin crate and carries
-    no crate-level ban.
+    no crate-level ban. **`src/` rows are still listed**, marked `bin` in the
+    enforced column: leaving them out was how the biggest concentration of
+    `unsafe` in the tree stayed off the one table that measures `unsafe`, which is
+    the failure mode this whole report exists to prevent. `src/` cannot be
+    *enforced* safe; that is a fact worth showing, not a reason to hide the rows.
+    The `enforced unsafe-free` ratio below still counts `crates/*` only, because
+    a bin crate was never a candidate.
     """
     crates = {c: a for c, a in by_comp.items() if c.startswith("crates" + os.sep)}
-    if not crates:
+    bins = {c: a for c, a in by_comp.items() if not c.startswith("crates" + os.sep)}
+    if not crates and not bins:
         return
+
+    def rows(d):
+        return sorted(d.items(), key=lambda kv: (kv[1].unsafe_code, -kv[1].code, kv[0]))
 
     print()
     print(rule(W))
@@ -948,12 +958,19 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
         f"{'safe':>8}{'enforced':>10}"
     )
     print(rule(W))
-    for comp, agg in sorted(crates.items(), key=lambda kv: (kv[1].unsafe_code, -kv[1].code, kv[0])):
+    for comp, agg in rows(crates):
         mark = "forbid" if agg.forbids_unsafe else ""
         print(
             f"{comp:<26}{agg.code:>11}{agg.unsafe_sites:>7}{agg.unsafe_code:>8}"
             f"{pct(agg.safe_code, agg.code):>8}{mark:>10}"
         )
+    if bins:
+        print(rule(W))
+        for comp, agg in rows(bins):
+            print(
+                f"{comp:<26}{agg.code:>11}{agg.unsafe_sites:>7}{agg.unsafe_code:>8}"
+                f"{pct(agg.safe_code, agg.code):>8}{'bin':>10}"
+            )
     print(rule(W))
 
     safe = [a for a in crates.values() if a.forbids_unsafe]
@@ -989,6 +1006,25 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
         # counter is wrong (or an `#[unsafe(...)]` attribute was counted), not that
         # the ban was bypassed.
         print("  !! non-zero inside a `forbid(unsafe_code)` crate — check the counter")
+
+    # Production vs test `unsafe`, per scope and for the tree. `src/` is the bulk
+    # of the tree's test `unsafe` (the in-kernel boot suite forges trap frames and
+    # builds page tables by hand, which is the job) and quoting a crates/-only
+    # figure as "the tree" overstates how clean things are by a wide margin.
+    if bins:
+        def tot(d, attr):
+            return sum(getattr(a, attr) for a in d.values())
+
+        print(rule(W))
+        print(f"{'unsafe sites by scope':<26}{'total':>11}{'production':>12}{'test':>8}")
+        print(rule(W))
+        scopes = [("crates/", crates), ("src/", bins)]
+        for label, d in scopes:
+            prod, test = tot(d, "unsafe_sites"), tot(d, "test_unsafe_sites")
+            print(f"{label:<26}{prod + test:>11}{prod:>12}{test:>8}")
+        prod = sum(tot(d, "unsafe_sites") for _, d in scopes)
+        test = sum(tot(d, "test_unsafe_sites") for _, d in scopes)
+        print(f"{'tree':<26}{prod + test:>11}{prod:>12}{test:>8}")
     print(rule(W))
 
 

@@ -520,10 +520,7 @@ unsafe extern "C" {
 
 #[inline]
 fn read_mpidr() -> u64 {
-    let v: u64;
-    // SAFETY: reading the affinity register has no side effects.
-    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) v, options(nomem, nostack)) }
-    v
+    akuma_cpu::sysreg::mpidr_el1()
 }
 
 /// Issue a PSCI call over the platform conduit (`hvc`/`smc`). Returns x0 (0 = SUCCESS).
@@ -716,8 +713,7 @@ pub fn probed_core_count() -> usize {
 
 #[inline]
 fn dsb_sy() {
-    // SAFETY: full-system data synchronization barrier, no memory operands.
-    unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) }
+    akuma_cpu::barrier::dsb_sy();
 }
 
 // --- Per-PE GICv3 receive path (M2c) --------------------------------------------
@@ -780,12 +776,12 @@ fn secondary_gic_init(idx: usize) {
         let sre: u64;
         core::arch::asm!("mrs {0}, S3_0_C12_C12_5", out(reg) sre, options(nomem, nostack));
         core::arch::asm!("msr S3_0_C12_C12_5, {0}", in(reg) sre | 1, options(nomem, nostack)); // ICC_SRE_EL1.SRE
-        core::arch::asm!("isb", options(nomem, nostack));
+        akuma_cpu::barrier::isb();
         core::arch::asm!("msr S3_0_C4_C6_0, {0}", in(reg) 0xFFu64, options(nomem, nostack)); // ICC_PMR_EL1
         core::arch::asm!("msr S3_0_C12_C12_3, {0}", in(reg) 0u64, options(nomem, nostack)); // ICC_BPR1_EL1
         core::arch::asm!("msr S3_0_C12_C12_7, {0}", in(reg) 1u64, options(nomem, nostack)); // ICC_IGRPEN1_EL1
-        core::arch::asm!("isb", options(nomem, nostack));
     }
+    akuma_cpu::barrier::isb();
     let rd = gicr_base() + idx * GICR_STRIDE;
     let sgi = rd + GICR_SGI_OFFSET;
     let waker = rd + GICR_WAKER;
@@ -798,8 +794,8 @@ fn secondary_gic_init(idx: usize) {
         mmio_w32(sgi + GICR_SGI_IPRIORITYR + i * 4, 0xA0A0_A0A0);
     }
     mmio_w32(sgi + GICR_SGI_ISENABLER0, (1u32 << SCHED_SGI) | (1u32 << TIMER_PPI));
-    // SAFETY: ensure redistributor writes complete before IRQs are unmasked.
-    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+    // Ensure redistributor writes complete before IRQs are unmasked.
+    akuma_cpu::barrier::dsb_ish();
 }
 
 /// Base VA of this core's 64 KiB (`1 << STACK_SHIFT`) boot/idle stack in
@@ -1030,7 +1026,7 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
     let Some(slot) = idle else {
         crate::safe_print!(64, "[SMP-shared] core {} online but NO idle slot; parking\n", core);
         loop {
-            unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
+            akuma_cpu::park::wfe();
         }
     };
     crate::safe_print!(64, "[SMP-shared] core {} online (idle tid {})\n", core, slot);
@@ -1063,7 +1059,7 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
         akuma_exec::bkl::leave_kernel();
         // SAFETY: IRQs are enabled; the timer/device IRQ (or a cross-core wake SGI)
         // wakes us and (via the scheduler SGI) may switch us to a runnable thread.
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        akuma_cpu::park::wfi();
         // Re-take the BKL for our brief kernel work before the next halt (idempotent
         // if the waking IRQ's reconcile already re-acquired it for us).
         akuma_exec::bkl::enter_kernel();

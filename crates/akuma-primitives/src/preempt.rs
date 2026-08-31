@@ -77,11 +77,7 @@ pub const MAX_EXPECTED_CHECK_GAP_US: u64 = 100_000;
 #[inline]
 #[must_use]
 pub fn current_tid() -> usize {
-    let val: u64;
-    // SAFETY: reading TPIDRRO_EL0 has no memory effects.
-    unsafe {
-        core::arch::asm!("mrs {}, tpidrro_el0", out(reg) val);
-    }
+    let val: u64 = akuma_cpu::sysreg::tpidrro_el0();
     let tid = val as usize;
     if tid >= MAX_THREADS {
         safe_print!(
@@ -91,8 +87,7 @@ pub fn current_tid() -> usize {
             MAX_THREADS
         );
         loop {
-            // SAFETY: wait-for-interrupt on a core we are deliberately parking.
-            unsafe { core::arch::asm!("wfi") };
+            akuma_cpu::park::wfi();
         }
     }
     tid

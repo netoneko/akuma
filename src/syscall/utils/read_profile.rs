@@ -397,17 +397,9 @@ mod enabled {
     /// assumed: it is exactly what `cal=` in the dump reports.
     #[inline(always)]
     fn now() -> u64 {
-        let t: u64;
-        // SAFETY: reads a counter register available to EL1; no memory operands.
-        unsafe {
-            core::arch::asm!(
-                "isb",
-                "mrs {t}, cntvct_el0",
-                t = out(reg) t,
-                options(nostack),
-            );
-        }
-        t
+        // `_ordered`, not the bare read: an unbarriered `mrs cntvct_el0` may
+        // issue before the work being timed (see its doc comment).
+        akuma_cpu::sysreg::cntvct_el0_ordered()
     }
 
     /// Per-call stage recorder. Created at the top of `sys_read`, lapped at each

@@ -166,11 +166,7 @@ pub fn paint_boot_stack(base: usize, top: usize) {
     }
     BOOT_STACK_BASE.store(base, Ordering::Relaxed);
     BOOT_STACK_TOP.store(top, Ordering::Relaxed);
-    let sp: usize;
-    #[cfg(target_os = "none")]
-    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp); }
-    #[cfg(not(target_os = "none"))]
-    { sp = top; }
+    let sp: usize = if cfg!(target_os = "none") { akuma_cpu::reg::sp() } else { top };
     let paint_end = sp.saturating_sub(8 * 1024) & !7; // 8 KB headroom below live SP
     let mut addr = (base + 7) & !7;
     if paint_end <= addr {
@@ -2735,8 +2731,7 @@ impl ThreadPool {
         }
         // Send event to wake any threads in WFI
         if woke_any {
-            #[cfg(target_os = "none")]
-            unsafe { core::arch::asm!("sev"); }
+            akuma_cpu::park::sev();
         }
 
         // For timer-triggered preemption, first check if preemption is explicitly disabled.
@@ -3215,10 +3210,7 @@ pub fn yield_now() {
             YIELD_WITH_IRQS_MASKED.fetch_add(1, Ordering::Relaxed);
             let warns = YIELD_MASKED_WARNED.fetch_add(1, Ordering::Relaxed);
             if warns < YIELD_MASKED_WARN_LIMIT {
-                let lr: u64;
-                unsafe {
-                    core::arch::asm!("mov {}, x30", out(reg) lr, options(nomem, nostack));
-                }
+                let lr: u64 = akuma_cpu::reg::lr();
                 let tid = get_current_thread_register();
                 safe_print!(96, "[SCHED] WARNING: yield_now with IRQs masked tid={} lr={:#x}\n", tid, lr);
             }
@@ -3302,7 +3294,7 @@ pub fn idle_halt() {
     crate::bkl::leave_kernel();
     // SAFETY: WFI halts the PE until a pending IRQ. IRQs are enabled on entry, so
     // the interrupt (timer tick / device) is taken and serviced before WFI returns.
-    unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+    akuma_cpu::park::wfi();
     // Re-take the BKL for the post-halt bookkeeping below (idempotent if the waking
     // IRQ's reconcile already re-acquired it for this thread) — UNLESS this thread sits
     // inside a deliberately-dropped-BKL window (a guarded net/vfs syscall relaxing via
@@ -3492,8 +3484,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             // Save current TTBR0 to old context
             // CRITICAL: Processes set their own TTBR0 via activate(),
             // so we must save it here to restore correctly later
-            let current_ttbr0: u64;
-            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) current_ttbr0);
+            let current_ttbr0: u64 = akuma_cpu::sysreg::ttbr0_el1();
             (*old_ctx).ttbr0 = current_ttbr0;
 
             // TTBR0 tripwire, save side (§2f AS MISMATCH hunt, see EXPECTED_L0):
@@ -3548,7 +3539,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
                     "[SGI-S FATAL] new_sp={:#x} invalid! old_tid={} new_tid={} \
                      ram=[{:#x},{:#x}) aligned={}\n",
                     new_sp, old_idx, new_idx, ram_base, ram_end, new_sp % 16 == 0);
-                loop { core::arch::asm!("wfi"); }
+                loop { akuma_cpu::park::wfi(); }
             }
 
             // Update exception stack for new thread
@@ -4093,8 +4084,7 @@ pub fn schedule_blocking(wake_time_us: u64) {
         }
         
         // Wait for interrupt - timer IRQ will fire within 10ms
-        #[cfg(target_os = "none")]
-        unsafe { core::arch::asm!("wfi"); }
+        akuma_cpu::park::wfi();
     }
 
     // Restore preemption state
@@ -4930,13 +4920,7 @@ pub fn get_stack_bounds(thread_id: usize) -> Option<(usize, usize)> {
 
 /// Validate current stack pointer is within bounds
 pub fn validate_current_sp() -> bool {
-    let sp: usize;
-    #[cfg(target_os = "none")]
-    unsafe {
-        core::arch::asm!("mov {}, sp", out(reg) sp);
-    }
-    #[cfg(not(target_os = "none"))]
-    { sp = 0; }
+    let sp: usize = akuma_cpu::reg::sp();
 
     with_irqs_disabled(|| {
         let pool = POOL.lock();

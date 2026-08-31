@@ -7,6 +7,7 @@ name = "akuma"
 version = "0.0.7"
 dependencies = [
  "akuma-boot",
+ "akuma-cpu",
  "akuma-exec",
  "akuma-ext2",
  "akuma-firecracker",
@@ -71,6 +72,7 @@ name = "akuma-exec"
 version = "0.1.0"
 dependencies = [
  "akuma-bkl",
+ "akuma-cpu",
  "akuma-elf",
  "akuma-isolation",
  "akuma-mmap",
@@ -142,6 +144,7 @@ name = "akuma-mmu"
 version = "0.1.0"
 dependencies = [
  "akuma-bkl",
+ "akuma-cpu",
  "akuma-mmap",
  "akuma-pmm",
  "akuma-primitives",
@@ -205,6 +208,7 @@ dependencies = [
 name = "akuma-primitives"
 version = "0.1.0"
 dependencies = [
+ "akuma-cpu",
  "akuma-not-even-once",
 ]
 
@@ -277,6 +281,7 @@ dependencies = [
 name = "akuma-timer"
 version = "0.1.0"
 dependencies = [
+ "akuma-cpu",
  "akuma-kacho",
  "arm_pl031",
 ]

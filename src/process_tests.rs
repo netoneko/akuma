@@ -1083,7 +1083,7 @@ fn test_thread_last_core_tracked() {
         threading::mark_current_terminated();
         loop {
             threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
+            akuma_cpu::park::wfi();
         }
     }) {
         Ok(tid) => tid,
@@ -2557,7 +2557,7 @@ fn test_term_state_lock_bounded_acquire_does_not_starve_peers() {
         akuma_exec::threading::mark_current_terminated();
         loop {
             akuma_exec::threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
+            akuma_cpu::park::wfi();
         }
     });
 
@@ -2570,7 +2570,7 @@ fn test_term_state_lock_bounded_acquire_does_not_starve_peers() {
         akuma_exec::threading::mark_current_terminated();
         loop {
             akuma_exec::threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
+            akuma_cpu::park::wfi();
         }
     });
 
@@ -9773,18 +9773,15 @@ fn test_is_aarch64_svc_recogniser() {
 fn test_fault_exit_enables_irqs_before_yield() {
     #[cfg(target_os = "none")]
     {
-        let (saved, masked, enabled): (u64, u64, u64);
-        unsafe {
-            core::arch::asm!("mrs {}, daif", out(reg) saved, options(nomem, nostack));
-            // Simulate entering the fault-exit path from an IRQs-masked critical section.
-            core::arch::asm!("msr daifset, #2", "isb", options(nomem, nostack));
-            core::arch::asm!("mrs {}, daif", out(reg) masked, options(nomem, nostack));
-            // The fix: re-enable IRQs before the terminal yield loop.
-            core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack));
-            core::arch::asm!("mrs {}, daif", out(reg) enabled, options(nomem, nostack));
-            // Restore the boot thread's original IRQ state.
-            core::arch::asm!("msr daif, {}", in(reg) saved, options(nomem, nostack));
-        }
+        let saved = akuma_cpu::daif::read();
+        // Simulate entering the fault-exit path from an IRQs-masked critical section.
+        akuma_cpu::daif::mask_irq_sync();
+        let masked = akuma_cpu::daif::read();
+        // The fix: re-enable IRQs before the terminal yield loop.
+        akuma_cpu::daif::unmask_irq_sync();
+        let enabled = akuma_cpu::daif::read();
+        // Restore the boot thread's original IRQ state.
+        akuma_cpu::daif::restore(saved);
         // yield_now (threading/mod.rs) spins if DAIF.I (bit 7) is set.
         let pre_would_spin = (masked & 0x80) != 0;
         let post_can_switch = (enabled & 0x80) == 0;
@@ -9872,8 +9869,7 @@ fn test_far_kernel_identity_range_policy() {
 /// call `emulate_dc_zva` directly to exercise the zeroing path without needing a user
 /// address space. We also validate the DCZID_EL0 block-size calculation.
 fn test_dc_zva_emulation() {
-    let dczid: u64;
-    unsafe { core::arch::asm!("mrs {}, dczid_el0", out(reg) dczid); }
+    let dczid = akuma_cpu::sysreg::dczid_el0();
     let prohibited = (dczid >> 4) & 1;
     if prohibited != 0 {
         console::print("[Test] dc_zva_emulation SKIPPED: DCZID_EL0.DZP=1\n");

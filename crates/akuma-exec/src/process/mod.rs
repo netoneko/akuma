@@ -1871,11 +1871,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // returns, so the RAII guard would otherwise hold the lock forever — wedging
     // every future fork/exec/exit on the box). See `process/lifecycle.rs`.
     let lifecycle = LifecycleGuard::acquire();
-    let lr: u64;
-    #[cfg(target_os = "none")]
-    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr); }
-    #[cfg(not(target_os = "none"))]
-    { lr = 0; }
+    let lr: u64 = akuma_cpu::reg::lr();
     let tid = crate::threading::current_thread_id();
     log::debug!("[RTK] code={} tid={} LR={:#x}", exit_code, tid, lr);
     

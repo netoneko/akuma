@@ -26,10 +26,7 @@
 #[inline]
 #[must_use]
 pub fn current_core_id() -> u32 {
-    let mpidr: u64;
-    // SAFETY: reading the affinity register has no side effects.
-    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)) };
-    (mpidr & 0xff) as u32
+    (akuma_cpu::sysreg::mpidr_el1() & 0xff) as u32
 }
 
 /// Non-SMP / host shim: a single-core build is always core 0.

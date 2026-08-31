@@ -73,15 +73,13 @@ pub fn timer_irq_handler(_irq: u32) {
     let counter = akuma_timer::read_counter();
     let new_cval = counter + interval_ticks;
 
-    unsafe {
-        core::arch::asm!("msr cntv_cval_el0, {}", in(reg) new_cval);
-        // Defensively re-enable the timer on every tick: bit 0 = enable,
-        // bit 1 = !mask. If cntv_ctl_el0 ever gets corrupted (enable cleared
-        // or mask set), no further IRQs would fire, causing a permanent
-        // freeze. Writing 1 here ensures the timer keeps ticking even if
-        // something corrupted the control register.
-        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
-    }
+    akuma_cpu::vtimer::set_cval(new_cval);
+    // Defensively re-enable the timer on every tick: bit 0 = enable,
+    // bit 1 = !mask. If cntv_ctl_el0 ever gets corrupted (enable cleared
+    // or mask set), no further IRQs would fire, causing a permanent
+    // freeze. Writing 1 here ensures the timer keeps ticking even if
+    // something corrupted the control register.
+    akuma_cpu::vtimer::set_ctl(1);
 
     // This periodic virtual-timer tick is the single hardware timer for the
     // kernel. Besides driving preemption (the scheduler SGI below), it services

@@ -460,13 +460,7 @@ pub fn read_current_pid() -> Option<Pid> {
     // PROCESS_INFO_ADDR (0x1000) is only mapped in USER page tables.
     // With boot TTBR0, address 0x1000 is in the device memory region (0x0-0x40000000)
     // and reading from it returns garbage, causing FAR=0x5 crashes.
-    let ttbr0: u64;
-    #[cfg(target_os = "none")]
-    unsafe {
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
-    }
-    #[cfg(not(target_os = "none"))]
-    { ttbr0 = 0; }
+    let ttbr0: u64 = akuma_cpu::sysreg::ttbr0_el1();
     
     // Compare against actual boot TTBR0, not a range check.
     // User page tables are allocated from the same physical memory pool,

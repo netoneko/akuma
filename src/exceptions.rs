@@ -674,11 +674,7 @@ pub fn set_current_exception_stack(stack_top: u64) {
 #[inline]
 #[allow(dead_code)]
 pub fn get_current_exception_stack() -> u64 {
-    let val: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, tpidr_el1", out(reg) val);
-    }
-    val
+    akuma_cpu::sysreg::tpidr_el1()
 }
 
 /// Initialize the exception stack pointer for the boot thread
@@ -843,8 +839,7 @@ pub fn far_in_kernel_identity_user_range(far: u64) -> bool {
 /// Zeros the naturally-aligned block that contains `addr`, using the block size
 /// from DCZID_EL0.BS (4 << BS bytes, typically 64).
 pub fn emulate_dc_zva(addr: u64) {
-    let dczid: u64;
-    unsafe { core::arch::asm!("mrs {}, dczid_el0", out(reg) dczid); }
+    let dczid = akuma_cpu::sysreg::dczid_el0();
     // Bit 4 (DZP) set means DC ZVA is prohibited; skip silently.
     if dczid & (1 << 4) != 0 { return; }
     let bs = (dczid & 0xF) as u32;
@@ -1840,11 +1835,7 @@ pub fn complete_cow_break(
 
 fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
     let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
-    let ttbr0: u64;
-    #[cfg(target_os = "none")]
-    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0); }
-    #[cfg(not(target_os = "none"))]
-    { ttbr0 = 0; }
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
     if ttbr0 == 0 { return true; } // no user page tables — no CoW pages possible
 
     let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
@@ -2570,18 +2561,11 @@ pub fn init() {
 extern "C" fn rust_default_exception_handler() {
     note_exception_entry();
     note_exc_class(3);
-    let esr: u64;
-    let elr: u64;
-    let spsr: u64;
-    let ttbr0: u64;
-    let sp: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
-        core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
-        core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr);
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
-        core::arch::asm!("mov {}, sp", out(reg) sp);
-    }
+    let esr = akuma_cpu::sysreg::esr_el1();
+    let elr = akuma_cpu::sysreg::elr_el1();
+    let spsr = akuma_cpu::sysreg::spsr_el1();
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
+    let sp = akuma_cpu::reg::sp() as u64;
     let ec = (esr >> 26) & 0x3F;
     let tid = akuma_exec::threading::current_thread_id();
     
@@ -2606,7 +2590,7 @@ extern "C" fn rust_default_exception_handler() {
     if elr == 0 || (target_el == 0 && elr < 0x4000_0000) {
         crate::safe_print!(64, "  HALTING to prevent invalid ERET\n");
         loop {
-            unsafe { core::arch::asm!("wfe"); }
+            akuma_cpu::park::wfe();
         }
     }
 }
@@ -2846,8 +2830,7 @@ fn print_write_perm_fault_diag(far: u64, iss: u64, pid: u32, as_owner: u32) {
     }
     let far_usize = far as usize;
     let page_va = far_usize & !0xFFF;
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
     let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
     let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
     let pa = akuma_exec::mmu::translate_user_va(l0_ptr, page_va).map(|p| p & !0xFFF);
@@ -3024,11 +3007,7 @@ const STALE_WRITE_FAULT_RETRY_LIMIT: u32 = 2;
 /// genuinely cannot be cleared this way falls through to the normal repair instead
 /// of spinning on fault → retry → fault.
 fn stale_write_fault_absorbed(page_va: usize) -> bool {
-    let ttbr0: u64;
-    #[cfg(target_os = "none")]
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
-    #[cfg(not(target_os = "none"))]
-    { ttbr0 = 0; }
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
     if ttbr0 == 0 {
         return false;
     }
@@ -3137,11 +3116,7 @@ fn write_allowed_by_record(pid: u32, va: usize) -> bool {
 /// Runs only on anomaly paths (`EAGER-UPGRADE`, `WILD-DA`), never per-fault.
 fn print_page_forensics(tag: &str, pid: u32, va: usize) {
     let page_va = va & !0xFFF;
-    let ttbr0: u64;
-    #[cfg(target_os = "none")]
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
-    #[cfg(not(target_os = "none"))]
-    { ttbr0 = 0; }
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
     let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
     let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
     let Some(pa) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va).map(|p| p & !0xFFF) else {
@@ -3222,16 +3197,11 @@ fn print_page_forensics(tag: &str, pid: u32, va: usize) {
 /// Called before the full EL1 debug dump so normal CoW faults produce no log noise.
 fn try_resolve_el1_cow_fault() -> bool {
     // Read necessary system registers.
-    let fault_esr: u64;
-    let fault_far: u64;
-    let fault_ttbr0: u64;
-    let fault_pc: u64; // ELR_EL1 = faulting instruction address
-    unsafe {
-        core::arch::asm!("mrs {}, esr_el1",   out(reg) fault_esr);
-        core::arch::asm!("mrs {}, far_el1",   out(reg) fault_far);
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) fault_ttbr0);
-        core::arch::asm!("mrs {}, elr_el1",   out(reg) fault_pc);
-    }
+    let fault_esr = akuma_cpu::sysreg::esr_el1();
+    let fault_far = akuma_cpu::sysreg::far_el1();
+    let fault_ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
+    // ELR_EL1 = faulting instruction address
+    let fault_pc = akuma_cpu::sysreg::elr_el1();
 
     let ec = (fault_esr >> 26) & 0x3F;
     let iss = fault_esr & 0x01FF_FFFF;
@@ -3323,14 +3293,9 @@ fn try_resolve_el1_cow_fault() -> bool {
 /// resolved. If the page is already mapped (yet still faulting) we return `false`
 /// so we can't spin retrying. Anything else falls through to the kill path.
 fn try_resolve_el1_user_copy_lazy_fault() -> bool {
-    let fault_esr: u64;
-    let fault_far: u64;
-    let fault_pc: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, esr_el1", out(reg) fault_esr);
-        core::arch::asm!("mrs {}, far_el1", out(reg) fault_far);
-        core::arch::asm!("mrs {}, elr_el1", out(reg) fault_pc);
-    }
+    let fault_esr = akuma_cpu::sysreg::esr_el1();
+    let fault_far = akuma_cpu::sysreg::far_el1();
+    let fault_pc = akuma_cpu::sysreg::elr_el1();
     let ec = (fault_esr >> 26) & 0x3F;
     let dfsc = fault_esr & 0x3F;
     // EL1 data abort (0x25) + translation fault (DFSC 0x04..=0x07 = page absent, L0..L3).
@@ -3368,10 +3333,9 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
     note_exception_entry();
     note_exc_class(1);
     {
-        let esr: u64;
-        // SAFETY: reading the syndrome register has no side effects; this handler
-        // owns the trap until it reads it (IRQs still masked at entry).
-        unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) esr) };
+        // Reading the syndrome register has no side effects, and this handler
+        // owns the trap until it does (IRQs still masked at entry).
+        let esr = akuma_cpu::sysreg::esr_el1();
         SYNC_EC_EL1[((esr >> 26) & 0x3F) as usize]
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
@@ -3398,24 +3362,14 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
     // The debug dump noise for user-copy faults is acceptable.
 
     // Read ESR_EL1 to determine exception type
-    let esr: u64;
-    let elr: u64;
-    let far: u64;
-    let spsr: u64;
-    let ttbr0: u64;
-    let ttbr1: u64;
-    let sp: u64;
-    let sp_el0: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
-        core::arch::asm!("mrs {}, elr_el1", out(reg) elr);
-        core::arch::asm!("mrs {}, far_el1", out(reg) far);
-        core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr);
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
-        core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
-        core::arch::asm!("mov {}, sp", out(reg) sp);
-        core::arch::asm!("mrs {}, sp_el0", out(reg) sp_el0);
-    }
+    let esr = akuma_cpu::sysreg::esr_el1();
+    let elr = akuma_cpu::sysreg::elr_el1();
+    let far = akuma_cpu::sysreg::far_el1();
+    let spsr = akuma_cpu::sysreg::spsr_el1();
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
+    let ttbr1 = akuma_cpu::sysreg::ttbr1_el1();
+    let sp = akuma_cpu::reg::sp() as u64;
+    let sp_el0 = akuma_cpu::sysreg::sp_el0();
 
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0x1FFFFFF;
@@ -3573,9 +3527,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
 
     // Halt on kernel exceptions - they indicate bugs
     loop {
-        unsafe {
-            core::arch::asm!("wfe");
-        }
+        akuma_cpu::park::wfe();
     }
 }
 
@@ -3921,12 +3873,10 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         crate::safe_print!(192,
                             "[SPURIOUS-SVC] stale-icache: nr={} elr={:#x} insn@elr-4={:#010x} (not svc) x0={:#x} — IC flush + replay #{}\n",
                             syscall_num, elr, instr, frame_ref.x0, replays);
-                        unsafe {
-                            core::arch::asm!("ic iallu");
-                            core::arch::asm!("dsb ish");
-                            core::arch::asm!("isb");
-                            (*frame).elr_el1 = elr.wrapping_sub(4);
-                        }
+                        akuma_cpu::cache::ic_iallu();
+                        akuma_cpu::barrier::dsb_ish();
+                        akuma_cpu::barrier::isb();
+                        unsafe { (*frame).elr_el1 = elr.wrapping_sub(4); }
                         // Do NOT dispatch: return the live x0 so the epilogue restores
                         // the original (un-clobbered) register and re-runs the real insn.
                         return frame_ref.x0;
@@ -3975,9 +3925,9 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             count + 1, syscall_num, elr,
                             if prev_is_svc { "SVC(skip)" } else { "replay" });
                         unsafe {
-                            core::arch::asm!("ic iallu");
-                            core::arch::asm!("dsb ish");
-                            core::arch::asm!("isb");
+                            akuma_cpu::cache::ic_iallu();
+                            akuma_cpu::barrier::dsb_ish();
+                            akuma_cpu::barrier::isb();
                             if !prev_is_svc {
                                 (*frame).elr_el1 = elr.wrapping_sub(4);
                             }
@@ -4199,11 +4149,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
 
             // SYNC TLS: If the syscall modified TPIDR_EL0 (e.g. SET_TPIDR_EL0),
             // update the trap frame so the change persists after register restoration.
-            unsafe {
-                let current_tls: u64;
-                core::arch::asm!("mrs {}, tpidr_el0", out(reg) current_tls);
-                (*frame).tpidr_el0 = current_tls;
-            }
+            let current_tls = akuma_cpu::sysreg::tpidr_el0();
+            unsafe { (*frame).tpidr_el0 = current_tls; }
             
             // Check if process exited - if so, return to kernel
             if let Some(proc) = akuma_exec::process::current_process_shared() {
@@ -4355,8 +4302,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             // `old_pa` stays valid across the copy. Short: no alloc/IO here.
                             #[cfg(kernel_smp_shared)]
                             let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
-                            let ttbr0: u64;
-                            unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+                            let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
                             let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
                             let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
                             if let Some(old_pa_with_offset) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va) {
@@ -4960,22 +4906,16 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 // MRS (read) — emulate system register reads
                 let value = if op0 == 3 && op1 == 3 && crn == 0 && crm == 0 && op2 == 1 {
                     // CTR_EL0
-                    let ctr: u64;
-                    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr); }
-                    ctr
+                    akuma_cpu::sysreg::ctr_el0()
                 } else if op0 == 3 && op1 == 3 && crn == 14 && crm == 0 && op2 == 2 {
                     // CNTVCT_EL0 — normally never trapped (CNTKCTL_EL1.EL0VCTEN
                     // is set at bringup); real-value fallback in case a build
                     // path misses the bit. Returning 0 here froze userspace's
                     // hardware clock (CROSS_CORE_THREAD_COLLAPSE.md §3).
-                    let v: u64;
-                    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v); }
-                    v
+                    akuma_cpu::sysreg::cntvct_el0()
                 } else if op0 == 3 && op1 == 3 && crn == 14 && crm == 0 && op2 == 0 {
                     // CNTFRQ_EL0 — same fallback as CNTVCT above.
-                    let v: u64;
-                    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v); }
-                    v
+                    akuma_cpu::sysreg::cntfrq_el0()
                 } else {
                     0
                 };
@@ -4996,9 +4936,9 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // IC IVAU: op1=3, crm=5, op2=1
                     // DC ZVA:  op1=3, crm=4,  op2=1
                     if op1 == 3 && crm == 11 && op2 == 1 {
-                        unsafe { core::arch::asm!("dc cvau, {}", in(reg) addr); }
+                        akuma_cpu::cache::dc_cvau(addr as usize);
                     } else if op1 == 3 && crm == 5 && op2 == 1 {
-                        unsafe { core::arch::asm!("ic ivau, {}", in(reg) addr); }
+                        akuma_cpu::cache::ic_ivau(addr as usize);
                     } else if op1 == 3 && crm == 4 && op2 == 1 {
                         emulate_dc_zva(addr);
                     }
@@ -5038,12 +4978,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             // debugging. ELR/SPSR from the trap frame and FAR from the entry
             // snapshot — the live registers may belong to a later trap (see
             // rust_sync_el0_handler).
-            let ttbr0: u64;
-            let sp: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
-                core::arch::asm!("mov {}, sp", out(reg) sp);
-            }
+            let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
+            let sp = akuma_cpu::reg::sp() as u64;
             let tid = akuma_exec::threading::current_thread_id();
 
             crate::safe_print!(128, "  Thread={}, ELR={:#x}, FAR={:#x}, SPSR={:#x}\n", tid, elr, far, spsr);

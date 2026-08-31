@@ -640,6 +640,11 @@ devbox-smoltcp = ["userspace-sshd", "smp-shared"]
 workspace = true
 
 [dependencies]
+# The safe-to-execute AArch64 instructions (barriers, cache/TLB maintenance, core
+# parking, DAIF, read-only system registers) behind safe `#[inline(always)]`
+# functions, so the trivially-dischargeable `unsafe` blocks live in one crate
+# instead of at every call site. Zero dependencies of its own.
+akuma-cpu = { path = "crates/akuma-cpu" }
 akuma-terminal = { path = "crates/akuma-terminal" }
 akuma-vfs = { path = "crates/akuma-vfs" }
 akuma-ext2 = { path = "crates/akuma-ext2" }

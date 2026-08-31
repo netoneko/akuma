@@ -628,11 +628,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         if declined > 0 {
             // Resolve the surviving (stale) PA for the first refusal — the walk is
             // only paid on the broken path.
-            let ttbr0: u64;
-            #[cfg(target_os = "none")]
-            unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
-            #[cfg(not(target_os = "none"))]
-            { ttbr0 = 0; }
+            let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
             let l0 = akuma_exec::mmu::phys_to_virt((ttbr0 & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
             let stale_pa = akuma_exec::mmu::translate_user_va(l0, first_va).unwrap_or(0) & !0xFFF;
             crate::safe_print!(255,
@@ -1228,10 +1224,8 @@ pub fn membarrier_cmd(cmd: u32) -> u64 {
     use akuma_syscalls_mem::membarrier::{Command, command};
     match command(cmd) {
         Command::Barrier => {
-            unsafe {
-                core::arch::asm!("dsb ish");
-                core::arch::asm!("isb");
-            }
+            akuma_cpu::barrier::dsb_ish();
+            akuma_cpu::barrier::isb();
             0
         }
         // Query / Register / Invalid all answer without the kernel acting.
@@ -1278,20 +1272,16 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
         if adding_exec {
             for i in 0..pages {
                 let va = addr + i * 4096;
-                unsafe {
-                    let mut off = 0usize;
-                    while off < 4096 {
-                        core::arch::asm!("dc cvau, {}", in(reg) (va + off) as u64);
-                        off += 64;
-                    }
+                let mut off = 0usize;
+                while off < 4096 {
+                    akuma_cpu::cache::dc_cvau(va + off);
+                    off += 64;
                 }
             }
-            unsafe {
-                core::arch::asm!("dsb ish");
-                core::arch::asm!("ic iallu");
-                core::arch::asm!("dsb ish");
-                core::arch::asm!("isb");
-            }
+            akuma_cpu::barrier::dsb_ish();
+            akuma_cpu::cache::ic_iallu();
+            akuma_cpu::barrier::dsb_ish();
+            akuma_cpu::barrier::isb();
         }
         0
     } else {

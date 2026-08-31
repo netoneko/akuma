@@ -144,13 +144,11 @@ const ICC_SGI1R_EL1: &str = "S3_0_C12_C11_5";
 
 #[inline]
 fn isb() {
-    // SAFETY: instruction synchronization barrier, no memory effects.
-    unsafe { core::arch::asm!("isb", options(nomem, nostack)) }
+    akuma_cpu::barrier::isb();
 }
 #[inline]
 fn dsb_ish() {
-    // SAFETY: data synchronization barrier (inner shareable).
-    unsafe { core::arch::asm!("dsb ish", options(nomem, nostack)) }
+    akuma_cpu::barrier::dsb_ish();
 }
 
 /// Initialize the GICv3: distributor, this PE's redistributor, and the

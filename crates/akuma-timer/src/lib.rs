@@ -25,8 +25,6 @@
 
 #![no_std]
 
-#[cfg(target_os = "none")]
-use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
@@ -75,21 +73,17 @@ impl Hw for ArchHw {
     }
 
     fn arm_oneshot_ticks(&self, deadline: u64) {
-        unsafe {
-            asm!("msr cntv_cval_el0, {}", in(reg) deadline);
-            // bit 0 = enable, bit 1 = !mask
-            asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
-        }
+        akuma_cpu::vtimer::set_cval(deadline);
+        // bit 0 = enable, bit 1 = !mask
+        akuma_cpu::vtimer::set_ctl(1);
     }
 
     fn disarm(&self) {
-        unsafe {
-            asm!("msr cntv_ctl_el0, {}", in(reg) 0u64);
-        }
+        akuma_cpu::vtimer::set_ctl(0);
     }
 
     fn wfi(&self) {
-        unsafe { asm!("wfi", options(nomem, nostack)) };
+        akuma_cpu::park::wfi();
     }
 }
 
@@ -128,10 +122,8 @@ pub fn tick_us(fallback_us: u64) -> u64 {
 pub fn arm_periodic_tick() {
     let interval = ticks_from_us(read_frequency(), tick_us(10_000));
     let deadline = read_counter() + interval;
-    unsafe {
-        asm!("msr cntv_cval_el0, {}", in(reg) deadline);
-        asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
-    }
+    akuma_cpu::vtimer::set_cval(deadline);
+    akuma_cpu::vtimer::set_ctl(1);
 }
 
 /// Disarm the virtual timer (mask it).
@@ -143,9 +135,7 @@ pub fn arm_periodic_tick() {
 #[cfg(target_os = "none")]
 #[inline]
 pub fn disarm() {
-    unsafe {
-        asm!("msr cntv_ctl_el0, {}", in(reg) 0u64);
-    }
+    akuma_cpu::vtimer::set_ctl(0);
 }
 
 // ============================================================================
@@ -295,11 +285,7 @@ pub mod policy {
 #[inline]
 #[must_use]
 pub fn read_counter() -> u64 {
-    let counter: u64;
-    unsafe {
-        asm!("mrs {}, cntvct_el0", out(reg) counter);
-    }
-    counter
+    akuma_cpu::sysreg::cntvct_el0()
 }
 
 /// Read the timer frequency (CNTFRQ).
@@ -307,11 +293,7 @@ pub fn read_counter() -> u64 {
 #[inline]
 #[must_use]
 pub fn read_frequency() -> u64 {
-    let freq: u64;
-    unsafe {
-        asm!("mrs {}, cntfrq_el0", out(reg) freq);
-    }
-    freq
+    akuma_cpu::sysreg::cntfrq_el0()
 }
 
 /// Microseconds since boot (CNTVCT/CNTFRQ, u128 intermediate against

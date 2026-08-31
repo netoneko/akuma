@@ -188,9 +188,7 @@ fn halt_with_code(code: u32) -> ! {
 
     // If semihosting is not available, fall back to wfi loop
     loop {
-        // SAFETY: wfi just puts CPU in low-power state until next interrupt.
-        // It has no memory safety implications.
-        unsafe { core::arch::asm!("wfi") }
+        akuma_cpu::park::wfi();
     }
 }
 
@@ -642,9 +640,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // "or into whatever was there" inherits different behaviour per hypervisor.
     // SA0 (bit 4) in particular enables EL0 SP-alignment checking.
     {
-        let sctlr: u64;
-        // SAFETY: reading SCTLR_EL1 has no memory effects.
-        unsafe { core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr) };
+        let sctlr = akuma_cpu::sysreg::sctlr_el1();
         safe_print!(96, "[SCTLR] EL1=0x{:x} SA={} SA0={}\n",
             sctlr, (sctlr >> 3) & 1, (sctlr >> 4) & 1);
     }
@@ -2066,11 +2062,9 @@ fn run_async_main() -> ! {
         #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
         {
             akuma_exec::bkl::leave_kernel();
-            // SAFETY: IRQs are enabled; the timer/RX/SGI IRQ wakes us and its handler
+            // IRQs are enabled; the timer/RX/SGI IRQ wakes us and its handler
             // re-takes the BKL (our enter_kernel below is then idempotent).
-            unsafe {
-                core::arch::asm!("wfi", options(nomem, nostack));
-            }
+            akuma_cpu::park::wfi();
             akuma_exec::bkl::enter_kernel();
             // Profiler only: names the sliver between re-acquiring the BKL post-WFI and
             // the top-of-loop HOLD_TAG_NETPOLL_MAINT call above — negligible, but must

@@ -8,5 +8,10 @@ description = "ARM generic timer hardware access, timekeeping, and the self-tuni
 workspace = true
 
 [dependencies]
+# The safe-to-execute AArch64 instructions (barriers, cache/TLB maintenance,
+# core parking, DAIF, read-only system registers) behind safe `#[inline(always)]`
+# functions, so the trivially-dischargeable `unsafe` blocks live in one crate
+# instead of at every call site. Zero dependencies of its own.
+akuma-cpu = { path = "../akuma-cpu" }
 akuma-kacho = { path = "../akuma-kacho" }
 arm_pl031 = { version = "0.2", default-features = false }

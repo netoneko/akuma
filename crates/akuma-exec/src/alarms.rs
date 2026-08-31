@@ -198,10 +198,7 @@ pub fn on_timer_interrupt() {
 /// Wakes any cores waiting in WFE.
 #[inline(always)]
 pub fn signal_wake() {
-    #[cfg(target_os = "none")]
-    unsafe { core::arch::asm!("sev") }
-    #[cfg(not(target_os = "none"))]
-    {}
+    akuma_cpu::park::sev();
 }
 
 // ============================================================================

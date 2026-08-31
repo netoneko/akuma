@@ -272,8 +272,8 @@ pub unsafe fn ensure_boot_identity_covers(addr: usize) {
             return; // already mapped
         }
         core::ptr::write_volatile(l1.add(idx), ((idx << 30) as u64) | block_flags);
-        core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb");
     }
+    boot_table_flush_sync();
 }
 
 /// Extend the boot TTBR0 identity map to cover ALL detected RAM.
@@ -315,9 +315,24 @@ fn extend_boot_ram_identity_map(ram_base: usize, ram_size: usize) {
         let pa = (idx << 30) as u64;
         unsafe { core::ptr::write_volatile(l1.add(idx), pa | block_flags); }
     }
-    unsafe {
-        core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb");
-    }
+    boot_table_flush_sync();
+}
+
+/// `dsb ish; tlbi vmalle1; dsb ish; isb` — the core-local full-TLB flush that
+/// every *boot*-table edit in this file ends with.
+///
+/// Core-local (`vmalle1`), not the inner-shareable `flush_tlb_all`: these
+/// callers correct the boot table, which no secondary is translating through
+/// yet. Kept as one named helper because the four sites must not drift apart —
+/// dropping either `dsb` leaves the descriptor write unordered against the
+/// invalidate, and dropping the `isb` lets already-fetched instructions use the
+/// stale translation.
+#[inline(always)]
+fn boot_table_flush_sync() {
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::tlb::vmalle1();
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
 }
 
 /// Fallback kernel-RAM window bounds used before `init` (host unit tests, early
@@ -515,8 +530,8 @@ unsafe fn write_device_l3(l3_ptr: *mut u64) {
 pub unsafe fn rebuild_boot_device_table(boot_dev_l3_phys: usize) {
     unsafe {
         write_device_l3(phys_to_virt(boot_dev_l3_phys) as *mut u64);
-        core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb");
     }
+    boot_table_flush_sync();
 }
 
 /// Allocate the shared L1/L2/L3 device page tables that every user address
@@ -579,31 +594,26 @@ pub use akuma_primitives::addr::{phys_to_virt, virt_to_phys};
 /// `len == 0` is a no-op. The range is widened down to the 64-byte cache-line
 /// containing `kva` so a sub-line `len` still cleans/invalidates the whole line.
 pub fn sync_icache_range(kva: usize, len: usize) {
-    #[cfg(target_os = "none")]
-    unsafe {
-        if len == 0 {
-            return;
-        }
-        // Cache Writeback Granule is 64 bytes on every core Akuma targets; align
-        // the start down so a partial first line is still maintained.
-        let start = kva & !63;
-        let end = kva + len;
-        let mut p = start;
-        while p < end {
-            core::arch::asm!("dc cvau, {}", in(reg) p);
-            p += 64;
-        }
-        core::arch::asm!("dsb ish");
-        let mut p = start;
-        while p < end {
-            core::arch::asm!("ic ivau, {}", in(reg) p);
-            p += 64;
-        }
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
+    if len == 0 {
+        return;
     }
-    #[cfg(not(target_os = "none"))]
-    let _ = (kva, len);
+    // Cache Writeback Granule is 64 bytes on every core Akuma targets; align
+    // the start down so a partial first line is still maintained.
+    let start = kva & !63;
+    let end = kva + len;
+    let mut p = start;
+    while p < end {
+        akuma_cpu::cache::dc_cvau(p);
+        p += 64;
+    }
+    akuma_cpu::barrier::dsb_ish();
+    let mut p = start;
+    while p < end {
+        akuma_cpu::cache::ic_ivau(p);
+        p += 64;
+    }
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
 }
 
 // Real shared-kernel SMP: TLB maintenance that affects a shared/user address space must
@@ -614,16 +624,18 @@ pub fn sync_icache_range(kva: usize, len: usize) {
 // (threading) stays local — it only needs to clear the switching core's own TLB.
 #[cfg(all(target_os = "none", kernel_smp_shared))]
 pub fn flush_tlb_all() {
-    unsafe {
-        core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb");
-    }
+    akuma_cpu::barrier::dsb_ishst();
+    akuma_cpu::tlb::vmalle1is();
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
 }
 
 #[cfg(all(target_os = "none", not(kernel_smp_shared)))]
 pub fn flush_tlb_all() {
-    unsafe {
-        core::arch::asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
-    }
+    akuma_cpu::barrier::dsb_ishst();
+    akuma_cpu::tlb::vmalle1();
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
 }
 
 #[cfg(not(target_os = "none"))]
@@ -650,18 +662,18 @@ pub fn get_boot_ttbr0() -> u64 { 0 }
 // Inner-shareable under shared SMP (see `flush_tlb_all`).
 #[cfg(all(target_os = "none", kernel_smp_shared))]
 pub fn flush_tlb_asid(asid: u16) {
-    unsafe {
-        let asid_val = (asid as u64) << 48;
-        core::arch::asm!("dsb ishst", "tlbi aside1is, {}", "dsb ish", "isb", in(reg) asid_val);
-    }
+    akuma_cpu::barrier::dsb_ishst();
+    akuma_cpu::tlb::aside1is(asid);
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
 }
 
 #[cfg(all(target_os = "none", not(kernel_smp_shared)))]
 pub fn flush_tlb_asid(asid: u16) {
-    unsafe {
-        let asid_val = (asid as u64) << 48;
-        core::arch::asm!("dsb ishst", "tlbi aside1, {}", "dsb ish", "isb", in(reg) asid_val);
-    }
+    akuma_cpu::barrier::dsb_ishst();
+    akuma_cpu::tlb::aside1(asid);
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
 }
 
 #[cfg(not(target_os = "none"))]
@@ -670,18 +682,18 @@ pub fn flush_tlb_asid(_asid: u16) {}
 // Inner-shareable under shared SMP (see `flush_tlb_all`).
 #[cfg(all(target_os = "none", kernel_smp_shared))]
 pub fn flush_tlb_page(va: usize) {
-    unsafe {
-        let va_shifted = (va >> 12) as u64;
-        core::arch::asm!("dsb ishst", "tlbi vaae1is, {}", "dsb ish", "isb", in(reg) va_shifted);
-    }
+    akuma_cpu::barrier::dsb_ishst();
+    akuma_cpu::tlb::vaae1is((va >> 12) as u64);
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
 }
 
 #[cfg(all(target_os = "none", not(kernel_smp_shared)))]
 pub fn flush_tlb_page(va: usize) {
-    unsafe {
-        let va_shifted = (va >> 12) as u64;
-        core::arch::asm!("dsb ishst", "tlbi vaae1, {}", "dsb ish", "isb", in(reg) va_shifted);
-    }
+    akuma_cpu::barrier::dsb_ishst();
+    akuma_cpu::tlb::vaae1((va >> 12) as u64);
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
 }
 
 #[cfg(not(target_os = "none"))]
@@ -1969,11 +1981,7 @@ unsafe fn map_user_page_inner(
 ) -> (TableFrames, bool) { unsafe {
     let _irq_guard = IrqGuard::new();
     let mut allocated_tables = TableFrames::default();
-    let ttbr0: u64;
-    #[cfg(target_os = "none")]
-    { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
-    #[cfg(not(target_os = "none"))]
-    { ttbr0 = 0; }
+    let ttbr0: u64 = akuma_cpu::sysreg::ttbr0_el1();
     let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
     let l0_idx = (va >> 39) & 0x1FF;
     let l1_idx = (va >> 30) & 0x1FF;
@@ -2010,8 +2018,10 @@ unsafe fn map_user_page_inner(
             // actually runs under. Benign here (this arm only runs when the PTE was
             // *invalid*, and a faulting translation may not be cached), but it must
             // not look like it targets an ASID it cannot reach.
-            #[cfg(target_os = "none")]
-            { core::arch::asm!("dsb ishst", "tlbi vaae1is, {va}", "dsb ish", "isb", va = in(reg) va >> 12); }
+            akuma_cpu::barrier::dsb_ishst();
+            akuma_cpu::tlb::vaae1is((va >> 12) as u64);
+            akuma_cpu::barrier::dsb_ish();
+            akuma_cpu::barrier::isb();
         }
         (allocated_tables, true)
     } else {
@@ -2052,11 +2062,7 @@ pub fn update_current_user_page_flags(va: usize, new_flags: u64) {
 /// overwrites an invalid one, `update_current_user_page_flags` deliberately does not.
 fn current_user_l3_pte(va: usize) -> Option<*mut u64> {
     const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
-    let ttbr0: u64;
-    #[cfg(target_os = "none")]
-    { unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); } }
-    #[cfg(not(target_os = "none"))]
-    { ttbr0 = 0; }
+    let ttbr0: u64 = akuma_cpu::sysreg::ttbr0_el1();
     // SAFETY: the L0 is the one this core is *currently* translating through, so it
     // is live for as long as this core stays on it — which the caller's `IrqGuard`
     // and the per-AS `as_lock` are what guarantee.
@@ -2193,32 +2199,20 @@ pub fn flush_tlb_range_all_asid(start_va: usize, pages: usize) {
         flush_tlb_all();
         return;
     }
-    #[cfg(all(target_os = "none", kernel_smp_shared))]
-    unsafe {
-        // Inner-shareable: a range unmapped on one core must invalidate peers running
-        // the same address space in EL0 (see `flush_tlb_all`).
-        core::arch::asm!("dsb ishst");
-        let mut va = start_va;
-        for _ in 0..pages {
-            core::arch::asm!("tlbi vaae1is, {}", in(reg) (va >> 12) as u64);
-            va += 0x1000;
-        }
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
+    akuma_cpu::barrier::dsb_ishst();
+    let mut va = start_va;
+    for _ in 0..pages {
+        // Inner-shareable under shared SMP: a range unmapped on one core must
+        // invalidate peers running the same address space in EL0 (see
+        // `flush_tlb_all`). Other builds keep the cheaper core-local form.
+        #[cfg(kernel_smp_shared)]
+        akuma_cpu::tlb::vaae1is((va >> 12) as u64);
+        #[cfg(not(kernel_smp_shared))]
+        akuma_cpu::tlb::vaae1((va >> 12) as u64);
+        va += 0x1000;
     }
-    #[cfg(all(target_os = "none", not(kernel_smp_shared)))]
-    unsafe {
-        core::arch::asm!("dsb ishst");
-        let mut va = start_va;
-        for _ in 0..pages {
-            core::arch::asm!("tlbi vaae1, {}", in(reg) (va >> 12) as u64);
-            va += 0x1000;
-        }
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
-    }
-    #[cfg(not(target_os = "none"))]
-    let _ = start_va;
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
 }
 
 /// Atomically get or create a page table at `table_ptr[idx]`.
@@ -2239,8 +2233,7 @@ unsafe fn get_or_create_table_atomic(table_ptr: *mut u64, idx: usize) -> (usize,
                 // BLOCK descriptor — shatter into L3 page entries preserving the mapping
                 if let Some(frame) = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new) {
                     shatter_block_to_pages(frame.addr, entry);
-                    #[cfg(target_os = "none")]
-                    core::arch::asm!("dsb ishst");
+                    akuma_cpu::barrier::dsb_ishst();
                     let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                     match atomic.compare_exchange(entry, new_entry, Ordering::AcqRel, Ordering::Acquire) {
                         Ok(_) => return (frame.addr, Some(frame)),
@@ -2334,19 +2327,15 @@ pub fn protect_kernel_code() {
     let l0_table = get_boot_ttbr0() as *mut u64;
     unsafe {
         let l1_table = ((*l0_table) & 0x0000_FFFF_FFFF_F000) as *mut u64;
-        #[cfg(target_os = "none")]
-        core::arch::asm!("dsb ishst");
+        akuma_cpu::barrier::dsb_ishst();
         l1_table.add(1).write_volatile((l2_table as u64) | flags::VALID | flags::TABLE);
-        #[cfg(target_os = "none")]
-        core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb");
     }
+    boot_table_flush_sync();
 }
 
 #[cfg(target_os = "none")]
 pub fn get_current_ttbr0() -> usize {
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0); }
-    ttbr0 as usize
+    akuma_cpu::sysreg::ttbr0_el1() as usize
 }
 
 #[cfg(not(target_os = "none"))]
@@ -2693,7 +2682,7 @@ pub unsafe fn demote_range_to_ro(l0_ptr: *mut u64, va_start: usize, pages: usize
     // the caller will issue flush_tlb_all() which includes DSB, but this DSB here
     // guarantees ordering even if the call pattern changes.
     #[cfg(kernel_smp_shared)]
-    core::arch::asm!("dsb ish", options(nostack, nomem));
+    akuma_cpu::barrier::dsb_ish();
     demoted
 }}
 

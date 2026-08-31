@@ -25,6 +25,11 @@ debug-info = []
 smp-shared = ["akuma-bkl/smp-shared", "akuma-primitives/smp-shared"]
 
 [dependencies]
+# The safe-to-execute AArch64 instructions (barriers, cache/TLB maintenance,
+# core parking, DAIF, read-only system registers) behind safe `#[inline(always)]`
+# functions, so the trivially-dischargeable `unsafe` blocks live in one crate
+# instead of at every call site. Zero dependencies of its own.
+akuma-cpu = { path = "../akuma-cpu" }
 # irq masking, the console, phys_to_virt/virt_to_phys.
 akuma-primitives = { path = "../akuma-primitives" }
 # PhysFrame, PAGE_SIZE/PAGE_SHIFT, and the `flags`/`user_flags` PTE vocabulary.

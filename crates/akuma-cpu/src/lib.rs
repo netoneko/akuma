@@ -3,11 +3,16 @@
 //! # Why this crate exists
 //!
 //! `core::arch::asm!` is unconditionally `unsafe`, so every barrier, cache
-//! maintenance op and system-register read in the tree carried an `unsafe` block
-//! — about 160 of the ~230 `asm!` sites, spread across `akuma-mmu` (33),
-//! `src/exceptions.rs` (48), `akuma-pmm`, `akuma-timer`, `akuma-exec` and
-//! `akuma-primitives`. Every one of those blocks vouches for the same fact: that
-//! executing `dsb ish` cannot violate memory safety.
+//! maintenance op and system-register read in the tree carried an `unsafe` block.
+//! Every one of those blocks vouches for the same fact: that executing `dsb ish`
+//! cannot violate memory safety.
+//!
+//! The tree was migrated onto this crate on **2026-08-31**
+//! (`docs/archive/INLINE_ASM_CLEANUP.md`): **218 `asm!` sites outside this crate
+//! became 35**, and `unsafe` sites fell 645 -> 543 tree-wide (production 518 ->
+//! 455), as counted by `scripts/cloc_akuma.py`. What is left outside is
+//! the exclusion list below, plus raw MMIO `ldr`/`str`, the GICv3 `ICC_*` writes,
+//! the PSCI `hvc`/`smc` conduit, `adrp` symbol loads, and `global_asm!`.
 //!
 //! It cannot. Neither can `isb`, `wfi`, `ic iallu`, a `dc cvau` on any address,
 //! or reading `ESR_EL1`. These are `unsafe` for a *syntactic* reason, not a
@@ -28,13 +33,26 @@
 //! - `msr elr_el1` / `msr spsr_el1` — the resolve-and-retry mechanism; writing
 //!   these redirects where the CPU returns to.
 //! - `msr vbar_el1` — installs the vector table.
-//! - `msr tpidr_el1` / `tpidrro_el0` — re-points every per-thread static.
-//! - `mov sp, x` and raw `ldr`/`str`.
+//! - `msr tpidr_el1` / `tpidrro_el0` / `tpidr_el0` — re-points every per-thread
+//!   static, or every TLS access userspace makes.
+//! - `mov sp, x` and `mov x30, x` — retarget every later stack access, and the
+//!   next `ret`. Reading both is in [`reg`]; writing neither is.
+//! - `dc zva` — unlike every other `dc`, it **writes** the block it names.
+//! - Raw `ldr`/`str` (device MMIO), and the GICv3 `ICC_*` writes that gate
+//!   interrupt delivery for a whole PE.
 //!
 //! Those stay `unsafe` at their call sites, where the argument for them is
 //! specific. Reading `TTBR0_EL1` is here; writing it is not — the asymmetry is
 //! the point, and mirrors the seam `akuma_primitives::preempt` already documents
 //! for `TPIDRRO_EL0` ("reading moves, writing does not").
+//!
+//! Two modules sit deliberately *inside* the line rather than outside it —
+//! [`daif`] (the interrupt mask) and [`vtimer`] (the timer comparator). Both
+//! change control flow, so both look excludable; neither is, because the
+//! obligation they can break is a **discipline** property of the surrounding
+//! code (unmasking inside a critical section, arming a deadline the tick policy
+//! did not choose) that no `unsafe` block at the call site could discharge. Each
+//! module header states the argument, and names the type that does enforce it.
 //!
 //! # Inlining
 //!
@@ -248,6 +266,25 @@ pub mod tlb {
         #[cfg(not(target_os = "none"))]
         let _ = asid;
     }
+
+    /// `tlbi aside1` — invalidate every entry for one ASID, this core only.
+    ///
+    /// The core-local twin of [`aside1is`]: the non-`smp-shared` builds use it
+    /// because no peer core is running the address space being invalidated.
+    #[inline(always)]
+    pub fn aside1(asid: u16) {
+        #[cfg(target_os = "none")]
+        // SAFETY: as `vmalle1`.
+        unsafe {
+            core::arch::asm!(
+                "tlbi aside1, {}",
+                in(reg) (u64::from(asid) << 48),
+                options(nostack, preserves_flags)
+            );
+        };
+        #[cfg(not(target_os = "none"))]
+        let _ = asid;
+    }
 }
 
 /// Core parking and event signalling.
@@ -291,6 +328,201 @@ pub mod park {
         unsafe {
             core::arch::asm!("nop", options(nomem, nostack, preserves_flags));
         };
+    }
+}
+
+/// Reads of the two special-purpose general registers.
+///
+/// Not `mrs` — `mov {}, sp` and `mov {}, x30` — but the same argument: copying a
+/// register into a local reads nothing through it, so an arbitrary value coming
+/// back is not a safety problem. Both are diagnostic here: every caller in the
+/// tree prints the value or range-checks it.
+///
+/// **Writing** either is deliberately absent, and is the sharpest case of the
+/// asymmetry the crate header describes: `mov sp, x` retargets every subsequent
+/// stack access, and `mov x30, x` retargets the next `ret`.
+pub mod reg {
+    /// The current stack pointer (`SP_EL1` at EL1).
+    #[inline(always)]
+    pub fn sp() -> usize {
+        #[cfg(target_os = "none")]
+        {
+            let v: usize;
+            // SAFETY: copies SP into a local; no access is made through it.
+            unsafe {
+                core::arch::asm!("mov {}, sp", out(reg) v, options(nomem, nostack));
+            };
+            v
+        }
+        #[cfg(not(target_os = "none"))]
+        0
+    }
+
+    /// The link register, `x30` — the caller's return address.
+    #[inline(always)]
+    pub fn lr() -> u64 {
+        #[cfg(target_os = "none")]
+        {
+            let v: u64;
+            // SAFETY: as `sp`.
+            unsafe {
+                core::arch::asm!("mov {}, x30", out(reg) v, options(nomem, nostack));
+            };
+            v
+        }
+        #[cfg(not(target_os = "none"))]
+        0
+    }
+}
+
+/// The `DAIF` interrupt mask.
+///
+/// # Why masking is in this crate and not a caller's `unsafe`
+///
+/// Taking an interrupt is a control-flow change, so this looks like it belongs
+/// in the header's exclusion list. It does not, for a reason worth stating:
+/// `unsafe` cannot express the invariant these instructions can break.
+///
+/// The danger of `unmask_irq` is unmasking *inside* a critical section that
+/// assumed IRQs were off — and that is a lock-discipline property of the
+/// surrounding code, not of the instruction. No `unsafe` block at the call site
+/// could discharge it, because the block cannot see the section it sits in.
+/// What does enforce it is `akuma_primitives::irq::IrqGuard`: a scope whose
+/// `Drop` restores the saved `DAIF`. That crate has presented all six of these
+/// as **safe functions** since long before this crate existed; what moves here is
+/// the `asm!`, not the safety judgement.
+///
+/// Callers should still reach for `IrqGuard` rather than these directly.
+pub mod daif {
+    /// Read `DAIF`. Bit 7 (`I`) set means IRQs are masked.
+    #[inline(always)]
+    pub fn read() -> u64 {
+        #[cfg(target_os = "none")]
+        {
+            let v: u64;
+            // SAFETY: reading the mask has no memory effect and changes nothing.
+            unsafe {
+                core::arch::asm!("mrs {}, daif", out(reg) v, options(nomem, nostack));
+            };
+            v
+        }
+        #[cfg(not(target_os = "none"))]
+        0
+    }
+
+    /// Write `DAIF` wholesale — restoring a value from [`read`].
+    #[inline(always)]
+    pub fn restore(daif: u64) {
+        #[cfg(target_os = "none")]
+        // SAFETY: see the module header — the obligation this could break is a
+        // lock-discipline one that `unsafe` cannot express.
+        unsafe {
+            core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack));
+        };
+        #[cfg(not(target_os = "none"))]
+        let _ = daif;
+    }
+
+    /// `msr daifset, #2` — mask IRQs.
+    #[inline(always)]
+    pub fn mask_irq() {
+        #[cfg(target_os = "none")]
+        // SAFETY: as `restore`. Masking is the conservative direction besides.
+        unsafe {
+            core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+        };
+    }
+
+    /// `msr daifclr, #2` — unmask IRQs.
+    #[inline(always)]
+    pub fn unmask_irq() {
+        #[cfg(target_os = "none")]
+        // SAFETY: as `restore`.
+        unsafe {
+            core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
+        };
+    }
+
+    /// Mask IRQs and `isb`, so the mask is in force for every instruction after.
+    ///
+    /// Fused deliberately: `msr daifset` without the barrier leaves a window in
+    /// which an already-fetched instruction can still take the interrupt.
+    #[inline(always)]
+    pub fn mask_irq_sync() {
+        #[cfg(target_os = "none")]
+        // SAFETY: as `restore`.
+        unsafe {
+            core::arch::asm!("msr daifset, #2", "isb", options(nomem, nostack));
+        };
+    }
+
+    /// Unmask IRQs and `isb`. Fused for the same reason as [`mask_irq_sync`].
+    #[inline(always)]
+    pub fn unmask_irq_sync() {
+        #[cfg(target_os = "none")]
+        // SAFETY: as `restore`.
+        unsafe {
+            core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack));
+        };
+    }
+
+    /// Read `DAIF`, then mask IRQs — the acquire half of an `IrqGuard`.
+    #[inline(always)]
+    pub fn save_and_mask_irq() -> u64 {
+        let saved = read();
+        mask_irq();
+        saved
+    }
+}
+
+/// The EL1 virtual timer comparator (`CNTV_*_EL0`).
+///
+/// Arming the comparator schedules an interrupt; like `daif`, that is a
+/// control-flow effect with no memory-safety component, and the discipline it
+/// can break (arming a deadline the tick policy did not intend) is one `unsafe`
+/// cannot state. `akuma-timer` owns the policy; this owns the two instructions.
+///
+/// Reads of `CNTVCT_EL0` / `CNTFRQ_EL0` are in [`sysreg`] with the other reads.
+///
+/// # Why these two omit `nomem`
+///
+/// Every read in [`sysreg`] carries `options(nomem, nostack)`, which is right for
+/// them: the value of `ESR_EL1` does not depend on memory, so letting the
+/// optimiser move the `mrs` across a load costs nothing. Arming a comparator is
+/// not that. It is an **observable device effect** ordered against the memory the
+/// tick path publishes alongside it (the deadline it just recorded, the policy
+/// state the ISR will read), and `nomem` would license moving the `msr` across
+/// exactly those stores.
+///
+/// The open-coded `asm!` these replaced in `akuma-timer` and `src/timer.rs`
+/// carried **no options at all** — the most conservative contract there is. They
+/// were first written here with `nomem, nostack` copied from the read macro,
+/// which silently weakened that. `nostack` alone restores it.
+pub mod vtimer {
+    /// `msr cntv_cval_el0` — set the compare value, in counter ticks.
+    ///
+    /// **No `nomem`**, deliberately — see the module note below.
+    #[inline(always)]
+    pub fn set_cval(deadline: u64) {
+        #[cfg(target_os = "none")]
+        // SAFETY: writes a comparator; it dereferences nothing.
+        unsafe {
+            core::arch::asm!("msr cntv_cval_el0, {}", in(reg) deadline, options(nostack));
+        };
+        #[cfg(not(target_os = "none"))]
+        let _ = deadline;
+    }
+
+    /// `msr cntv_ctl_el0` — bit 0 enables, bit 1 **masks**. `1` is armed.
+    #[inline(always)]
+    pub fn set_ctl(ctl: u64) {
+        #[cfg(target_os = "none")]
+        // SAFETY: as `set_cval`.
+        unsafe {
+            core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) ctl, options(nostack));
+        };
+        #[cfg(not(target_os = "none"))]
+        let _ = ctl;
     }
 }
 
@@ -357,6 +589,38 @@ pub mod sysreg {
         dczid_el0, "dczid_el0");
     read_only!(/// `SCTLR_EL1` — system control.
         sctlr_el1, "sctlr_el1");
+    read_only!(/// `TPIDR_EL0` — the thread pointer EL0 runs under. Reading is
+        /// safe; **writing is not** — it re-points every TLS access userspace
+        /// makes, which is why `sys_set_tid_address`'s `msr` is not here.
+        tpidr_el0, "tpidr_el0");
+    read_only!(/// `FPCR` — floating-point control.
+        fpcr, "fpcr");
+
+    /// `CNTVCT_EL0`, preceded by an `isb`.
+    ///
+    /// **Use this, not [`cntvct_el0`], to time anything.** A bare `mrs
+    /// cntvct_el0` is not ordered against the instructions around it, so the
+    /// core may read the counter before the work being measured has issued —
+    /// measured on this project, that made an 8 KB `copy_to_user` come out at
+    /// **0 ns** (`docs/archive/`, "CNTVCT needs isb for timing"). The barrier is
+    /// fused into the same `asm!` so no optimiser can separate them.
+    ///
+    /// It costs a pipeline flush, which is why the unordered read stays
+    /// available for callers that only want a coarse timestamp.
+    #[inline(always)]
+    pub fn cntvct_el0_ordered() -> u64 {
+        #[cfg(target_os = "none")]
+        {
+            let v: u64;
+            // SAFETY: a barrier and a read of a counter register.
+            unsafe {
+                core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nostack));
+            };
+            v
+        }
+        #[cfg(not(target_os = "none"))]
+        0
+    }
 }
 
 #[cfg(test)]
@@ -382,9 +646,19 @@ mod tests {
         tlb::vaae1(0);
         tlb::vaae1is(0);
         tlb::aside1is(0);
+        tlb::aside1(0);
         park::wfe();
         park::sev();
         park::nop();
+        let _ = reg::sp();
+        let _ = reg::lr();
+        daif::restore(daif::save_and_mask_irq());
+        daif::mask_irq();
+        daif::unmask_irq();
+        daif::mask_irq_sync();
+        daif::unmask_irq_sync();
+        vtimer::set_cval(0);
+        vtimer::set_ctl(0);
         // `park::wfi()` is deliberately not called: on the host it is a no-op, but
         // a future port could make it real and hang the test runner.
     }
@@ -404,5 +678,9 @@ mod tests {
         assert_eq!(sysreg::mpidr_el1(), 0);
         assert_eq!(sysreg::esr_el1(), 0);
         assert_eq!(sysreg::cntfrq_el0(), 0);
+        assert_eq!(sysreg::tpidr_el0(), 0);
+        assert_eq!(sysreg::fpcr(), 0);
+        assert_eq!(sysreg::cntvct_el0_ordered(), 0);
+        assert_eq!(daif::read(), 0);
     }
 }

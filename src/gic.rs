@@ -270,9 +270,7 @@ pub fn trigger_sgi_core(target_aff0: u32, sgi_id: u32) {
 /// equivalent to `trigger_sgi`.
 #[cfg(all(not(feature = "gic-v2"), kernel_smp_shared))]
 pub fn trigger_sgi_self(sgi_id: u32) {
-    let mpidr: u64;
-    // SAFETY: reading the affinity register has no side effects.
-    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)) };
+    let mpidr = akuma_cpu::sysreg::mpidr_el1();
     trigger_sgi_core((mpidr & 0xff) as u32, sgi_id);
 }
 

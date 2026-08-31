@@ -33,4 +33,9 @@ no-bkl-vfs = []
 # 2026-08-30 — they were this crate's last non-platform `unsafe`. Re-exported
 # from `lib.rs`, so the nine crates that use them are unchanged. This is this
 # crate's only dependency, and it is on a crate that itself has none.
+# The safe-to-execute AArch64 instructions (barriers, cache/TLB maintenance,
+# core parking, DAIF, read-only system registers) behind safe `#[inline(always)]`
+# functions, so the trivially-dischargeable `unsafe` blocks live in one crate
+# instead of at every call site. Zero dependencies of its own.
+akuma-cpu = { path = "../akuma-cpu" }
 akuma-not-even-once = { path = "../akuma-not-even-once" }

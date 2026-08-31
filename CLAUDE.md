@@ -9,7 +9,20 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
   `akuma-{exec,ext2,firecracker,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
-  plus the `akuma-syscalls*` family below.
+  plus the `akuma-syscalls*` family below and `akuma-cpu`.
+  `akuma-cpu` holds every AArch64 instruction that is **safe to execute** —
+  barriers, cache/TLB maintenance, core parking, `DAIF`, the virtual-timer
+  comparator and read-only system registers — behind safe `#[inline(always)]`
+  functions. `asm!` is unconditionally `unsafe`, so a `dsb ish` used to need the
+  same ceremony as an `msr ttbr0_el1`; the tree was migrated onto it 2026-08-31
+  and **218 `asm!` sites outside it became 35** (`docs/archive/INLINE_ASM_CLEANUP.md`).
+  **Never open-code one of those instructions again.** What is deliberately
+  absent: writes to `ttbr0_el1`/`elr_el1`/`vbar_el1`/`tpidr*`, `mov sp,x`,
+  `dc zva`, raw `ldr`/`str` and the GIC `ICC_*` writes stay `unsafe` at their
+  call site. Reading `TTBR0_EL1` is in the crate; writing it is not, and that
+  asymmetry is the design. To time a code path use
+  `sysreg::cntvct_el0_ordered()` — a bare counter read is unordered against the
+  work it measures and once made an 8 KB copy measure as 0 ns.
   **22 of the 32 carry `#![forbid(unsafe_code)]`** — which crates, and why the
   other ten cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
   with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).

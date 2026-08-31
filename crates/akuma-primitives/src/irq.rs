@@ -54,13 +54,7 @@
 #[inline(always)]
 #[must_use]
 pub fn irq_save_mask() -> u64 {
-    let daif: u64;
-    // SAFETY: reading DAIF and setting the IRQ mask bit have no memory effects.
-    unsafe {
-        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
-        core::arch::asm!("msr daifset, #0x2", options(nomem, nostack));
-    }
-    daif
+    akuma_cpu::daif::save_and_mask_irq()
 }
 
 /// Restore `DAIF` saved by [`irq_save_mask`]. Bare-metal AArch64 only; no-op on
@@ -68,8 +62,7 @@ pub fn irq_save_mask() -> u64 {
 #[cfg(target_os = "none")]
 #[inline(always)]
 pub fn irq_restore(daif: u64) {
-    // SAFETY: restoring the previously-saved DAIF; no memory effects.
-    unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack)) };
+    akuma_cpu::daif::restore(daif);
 }
 
 #[cfg(not(target_os = "none"))]
@@ -100,8 +93,7 @@ pub fn irq_restore(_daif: u64) {}
 #[cfg(target_os = "none")]
 #[inline(always)]
 pub fn unmask_irqs() {
-    // SAFETY: clearing the DAIF IRQ mask bit has no memory effects.
-    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
+    akuma_cpu::daif::unmask_irq();
 }
 
 #[cfg(not(target_os = "none"))]
@@ -124,9 +116,7 @@ pub fn unmask_irqs() {}
 #[cfg(target_os = "none")]
 #[inline(always)]
 pub fn unmask_irqs_sync() {
-    // SAFETY: clearing the DAIF IRQ mask bit and synchronizing the context have
-    // no memory effects.
-    unsafe { core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack)) };
+    akuma_cpu::daif::unmask_irq_sync();
 }
 
 #[cfg(not(target_os = "none"))]
@@ -141,9 +131,7 @@ pub fn unmask_irqs_sync() {}
 #[cfg(target_os = "none")]
 #[inline(always)]
 pub fn mask_irqs_sync() {
-    // SAFETY: setting the DAIF IRQ mask bit and synchronizing the context have
-    // no memory effects.
-    unsafe { core::arch::asm!("msr daifset, #2", "isb", options(nomem, nostack)) };
+    akuma_cpu::daif::mask_irq_sync();
 }
 
 #[cfg(not(target_os = "none"))]
@@ -159,10 +147,7 @@ pub fn mask_irqs_sync() {}
 #[inline(always)]
 #[must_use]
 pub fn read_daif() -> u64 {
-    let daif: u64;
-    // SAFETY: reading DAIF has no memory effects.
-    unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)) };
-    daif
+    akuma_cpu::daif::read()
 }
 
 #[cfg(not(target_os = "none"))]
@@ -195,8 +180,7 @@ impl IrqGuard {
         #[cfg(target_os = "none")]
         {
             let saved_daif = irq_save_mask();
-            // SAFETY: a context synchronization barrier has no memory effects.
-            unsafe { core::arch::asm!("isb", options(nomem, nostack)) };
+            akuma_cpu::barrier::isb();
             Self { saved_daif }
         }
         #[cfg(not(target_os = "none"))]

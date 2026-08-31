@@ -2064,7 +2064,7 @@ fn test_spawn_thread() -> bool {
         threading::mark_current_terminated();
         loop {
             threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
+            akuma_cpu::park::wfi();
         }
     }) {
         Ok(tid) => {
@@ -2099,7 +2099,7 @@ fn test_spawn_and_run() -> bool {
         threading::mark_current_terminated();
         loop {
             threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
+            akuma_cpu::park::wfi();
         }
     }) {
         Ok(tid) => {
@@ -2147,7 +2147,7 @@ fn test_spawn_and_cleanup() -> bool {
         threading::mark_current_terminated();
         loop {
             threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
+            akuma_cpu::park::wfi();
         }
     }) {
         Ok(t) => {
@@ -2216,7 +2216,7 @@ fn test_spawn_multiple() -> bool {
             threading::mark_current_terminated();
             loop {
                 threading::yield_now();
-                unsafe { core::arch::asm!("wfi") };
+                akuma_cpu::park::wfi();
             }
         }) {
             Ok(_) => {}
@@ -2287,7 +2287,7 @@ fn test_spawn_and_yield() -> bool {
         threading::mark_current_terminated();
         loop {
             threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
+            akuma_cpu::park::wfi();
         }
     }) {
         Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
@@ -2348,7 +2348,7 @@ fn test_yield_cycle() -> bool {
         threading::mark_current_terminated();
         loop {
             threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
+            akuma_cpu::park::wfi();
         }
     }) {
         Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
@@ -3256,13 +3256,11 @@ fn test_irqguard_preserves_disabled_state() -> bool {
     console::print("\n[TEST] Bug 13: IrqGuard preserves disabled state\n");
 
     fn read_daif_i() -> bool {
-        let daif: u64;
-        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
-        (daif >> 7) & 1 == 1 // DAIF.I bit
+        (akuma_cpu::daif::read() >> 7) & 1 == 1 // DAIF.I bit
     }
 
     // Disable IRQs manually
-    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+    akuma_cpu::daif::mask_irq();
     let disabled_before = read_daif_i();
 
     // Create and drop an IrqGuard while IRQs are already disabled
@@ -3274,7 +3272,7 @@ fn test_irqguard_preserves_disabled_state() -> bool {
     let disabled_after = read_daif_i();
 
     // Restore IRQs
-    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+    akuma_cpu::daif::unmask_irq();
 
     let pass = disabled_before && disabled_after;
     if !pass {
@@ -3293,13 +3291,11 @@ fn test_irqguard_nesting_preserves_state() -> bool {
     console::print("\n[TEST] Bug 13: IrqGuard nesting preserves state\n");
 
     fn read_daif_i() -> bool {
-        let daif: u64;
-        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
-        (daif >> 7) & 1 == 1
+        (akuma_cpu::daif::read() >> 7) & 1 == 1
     }
 
     // IRQs start enabled
-    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+    akuma_cpu::daif::unmask_irq();
     let irqs_enabled_initially = !read_daif_i();
 
     let irqs_disabled_in_outer;
@@ -3335,13 +3331,11 @@ fn test_with_irqs_disabled_nesting() -> bool {
     console::print("\n[TEST] Bug 13: with_irqs_disabled nesting\n");
 
     fn read_daif_i() -> bool {
-        let daif: u64;
-        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
-        (daif >> 7) & 1 == 1
+        (akuma_cpu::daif::read() >> 7) & 1 == 1
     }
 
     // Disable IRQs manually (simulating exception context)
-    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+    akuma_cpu::daif::mask_irq();
 
     // Call with_irqs_disabled while already disabled
     let inner_disabled = akuma_exec::runtime::with_irqs_disabled(read_daif_i);
@@ -3350,7 +3344,7 @@ fn test_with_irqs_disabled_nesting() -> bool {
     let still_disabled = read_daif_i();
 
     // Clean up
-    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+    akuma_cpu::daif::unmask_irq();
 
     let pass = inner_disabled && still_disabled;
     if !pass {
@@ -3371,9 +3365,7 @@ fn test_map_user_page_preserves_irq_state() -> bool {
     console::print("\n[TEST] Bug 13: map_user_page preserves IRQ state\n");
 
     fn read_daif_i() -> bool {
-        let daif: u64;
-        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
-        (daif >> 7) & 1 == 1
+        (akuma_cpu::daif::read() >> 7) & 1 == 1
     }
 
     let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
@@ -3383,7 +3375,7 @@ fn test_map_user_page_preserves_irq_state() -> bool {
     let test_va: usize = 0x41_4000_0000; // 261GB
 
     // Disable IRQs (simulating exception handler context)
-    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)); }
+    akuma_cpu::daif::mask_irq();
     let disabled_before = read_daif_i();
 
     // Call map_user_page — the internal IrqGuard must not leak state
@@ -3394,7 +3386,7 @@ fn test_map_user_page_preserves_irq_state() -> bool {
     let disabled_after = read_daif_i();
 
     // Re-enable IRQs before cleanup (cleanup allocates, needs IRQs for PMM)
-    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); }
+    akuma_cpu::daif::unmask_irq();
 
     // Clean up: clear PTE and free frames
     clear_boot_ttbr0_pte(test_va, PtClear::LeafAndTables);
@@ -3635,9 +3627,8 @@ fn test_kernel_identity_mapping_full_ram() -> bool {
     } else {
         crate::safe_print!(128, "  (No high frame allocated, verifying page tables manually)\n");
         // Manual verification of TTBR0 -> L1 -> L2
+        let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
         unsafe {
-            let ttbr0: u64;
-            core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
             let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
             let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
             
@@ -4080,8 +4071,7 @@ fn clear_pte(l0_phys: usize, va: usize) {
 fn test_map_127_pages_all_ptes_exist() -> bool {
     console::print("\n[TEST] map 127 pages, verify every PTE exists\n");
 
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
     let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
 
     // Each test uses a unique 2MB-aligned VA range to avoid cross-test
@@ -4137,8 +4127,7 @@ fn test_map_127_pages_all_ptes_exist() -> bool {
 fn test_map_pages_survive_subsequent_allocs() -> bool {
     console::print("\n[TEST] map 127 pages, alloc 64 more, verify PTEs survive\n");
 
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
     let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
 
     let base_va: usize = 0x40_4000_0000; // 257GB (L1[257]), above the RAM identity map
@@ -4187,8 +4176,7 @@ fn test_map_pages_survive_subsequent_allocs() -> bool {
 fn test_map_interleaved_regions_same_l3() -> bool {
     console::print("\n[TEST] map 1+3+5+127 pages in same 2MB range, verify all PTEs\n");
 
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
     let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
 
     // 258GB (L1[258]), above the RAM identity map. Offsets within a single 2MB range.
@@ -4677,9 +4665,8 @@ enum PtClear {
 /// Silently does nothing if any level is already absent, which is the same
 /// best-effort contract every copy had.
 fn clear_boot_ttbr0_pte(va: usize, depth: PtClear) {
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
     unsafe {
-        let ttbr0: u64;
-        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
         let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
         let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
         let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
@@ -4702,9 +4689,8 @@ fn clear_boot_ttbr0_pte(va: usize, depth: PtClear) {
 
 /// Read the physical address from the L3 PTE for a given VA using current TTBR0.
 fn get_mapped_pa(va: usize) -> Option<usize> {
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
     unsafe {
-        let ttbr0: u64;
-        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0);
         let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
         let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
         let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
@@ -5315,17 +5301,15 @@ fn test_mprotect_flag_update_with_cache_maintenance() -> bool {
     // only a silent no-op under QEMU TCG). The real sys_mprotect cleans via the
     // same kernel VA — see the DC CVAU on `kva` in exceptions.rs.
     let kva = akuma_exec::mmu::phys_to_virt(frame.addr) as usize;
-    unsafe {
-        let mut off = 0usize;
-        while off < 4096 {
-            core::arch::asm!("dc cvau, {}", in(reg) (kva + off) as u64);
-            off += 64;
-        }
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("ic iallu");
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
+    let mut off = 0usize;
+    while off < 4096 {
+        akuma_cpu::cache::dc_cvau(kva + off);
+        off += 64;
     }
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::cache::ic_iallu();
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
 
     // Verify page is still mapped
     let still_mapped = addr_space.is_mapped(test_va);
@@ -5372,20 +5356,16 @@ fn test_mprotect_large_region_completes() -> bool {
     // companion note in test_mprotect_flag_update_with_cache_maintenance.
     for f in &frames {
         let kva = akuma_exec::mmu::phys_to_virt(f.addr) as usize;
-        unsafe {
-            let mut off = 0usize;
-            while off < 4096 {
-                core::arch::asm!("dc cvau, {}", in(reg) (kva + off) as u64);
-                off += 64;
-            }
+        let mut off = 0usize;
+        while off < 4096 {
+            akuma_cpu::cache::dc_cvau(kva + off);
+            off += 64;
         }
     }
-    unsafe {
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("ic iallu");
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
-    }
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::cache::ic_iallu();
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
 
     // If we got here, it completed without hanging
     crate::safe_print!(64, "  Result: PASS\n");
@@ -5810,8 +5790,7 @@ fn fpcr_rmode_thread(fpcr_val: u64, done: &'static AtomicBool) -> ! {
 
     for _ in 0..30 {
         threading::yield_now();
-        let mut read_back: u64;
-        unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) read_back); }
+        let read_back = akuma_cpu::sysreg::fpcr();
         if (read_back & (3 << 22)) != (fpcr_val & (3 << 22)) {
             errors += 1;
         }
@@ -5819,7 +5798,7 @@ fn fpcr_rmode_thread(fpcr_val: u64, done: &'static AtomicBool) -> ! {
     if errors > 0 { NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed); }
     done.store(true, Ordering::Release);
     threading::mark_current_terminated();
-    loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+    loop { threading::yield_now(); akuma_cpu::park::wfi(); }
 }
 
 /// One thread of [`test_neon_regs_across_yield`]: fill **Q0-Q3** with `pattern`,
@@ -5869,7 +5848,7 @@ fn neon_yield_thread(pattern: u64, done: &'static AtomicBool) -> ! {
     }
     done.store(true, Ordering::Release);
     threading::mark_current_terminated();
-    loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+    loop { threading::yield_now(); akuma_cpu::park::wfi(); }
 }
 
 /// One thread of [`test_neon_regs_across_preemption`]: fill **Q4-Q7** with
@@ -5925,7 +5904,7 @@ fn neon_preempt_thread(pattern: u64, label: &'static str, done: &'static AtomicB
     crate::safe_print!(64, "  {}: {} checks, {} errors\n", label, checks, errors);
     done.store(true, Ordering::Release);
     threading::mark_current_terminated();
-    loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+    loop { threading::yield_now(); akuma_cpu::park::wfi(); }
 }
 
 /// Two threads each load a distinct pattern into Q0-Q3, yield repeatedly, then
@@ -6087,14 +6066,14 @@ fn test_fp_arithmetic_across_preemption() -> bool {
                 // Spin briefly to allow preemption between batches
                 let t = crate::timer::uptime_us();
                 while crate::timer::uptime_us() - t < 500 {
-                    unsafe { core::arch::asm!("nop"); }
+                    akuma_cpu::park::nop();
                 }
             }
         }
         FP_RESULT_A.store(acc.to_bits(), Ordering::Release);
         FP_DONE_A.store(true, Ordering::Release);
         threading::mark_current_terminated();
-        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+        loop { threading::yield_now(); akuma_cpu::park::wfi(); }
     }) {
         Ok(tid) => crate::safe_print!(32, "  Thread A: tid={}\n", tid),
         Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
@@ -6108,14 +6087,14 @@ fn test_fp_arithmetic_across_preemption() -> bool {
             if i % 100 == 0 {
                 let t = crate::timer::uptime_us();
                 while crate::timer::uptime_us() - t < 500 {
-                    unsafe { core::arch::asm!("nop"); }
+                    akuma_cpu::park::nop();
                 }
             }
         }
         FP_RESULT_B.store(acc.to_bits(), Ordering::Release);
         FP_DONE_B.store(true, Ordering::Release);
         threading::mark_current_terminated();
-        loop { threading::yield_now(); unsafe { core::arch::asm!("wfi") }; }
+        loop { threading::yield_now(); akuma_cpu::park::wfi(); }
     }) {
         Ok(tid) => crate::safe_print!(32, "  Thread B: tid={}\n", tid),
         Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
@@ -7706,8 +7685,7 @@ fn test_kernel_identity_map_covers_full_ram() -> bool {
     console::print("\n[TEST] kernel identity map covers full 1GB RAM\n");
     let mut pass = true;
 
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0); }
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
     let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
 
     let check_addrs: &[usize] = &[
@@ -9233,7 +9211,7 @@ extern "C" fn waker_test_park_trampoline() -> ! {
     akuma_exec::threading::mark_current_terminated();
     loop {
         akuma_exec::threading::yield_now();
-        unsafe { core::arch::asm!("wfi") };
+        akuma_cpu::park::wfi();
     }
 }
 
