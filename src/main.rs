@@ -275,55 +275,21 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
     kernel_main(dtb_ptr)
 }
 
-/// Scan RAM for a QEMU-generated DTB when x0 is zero.
+/// Detect memory from the Device Tree Blob.
 ///
-/// Kernel is at 0x40100000 (text_offset = 1 MB); DTB is placed at
-/// ALIGN_UP(kernel_load + image_size, 2MB) = 0x40200000.
-fn scan_for_dtb() -> usize {
-    const FDT_MAGIC_LE: u32 = 0xedfe0dd0; // big-endian 0xd00dfeed read as little-endian
-
-    // DTB is at the 2MB-aligned address just above the kernel image
-    // (ALIGN_UP(0x40100000 + image_size, 2MB) = 0x40200000).
-    const DTB_LOCATION: usize = 0x4020_0000;
-
-    let magic = unsafe { core::ptr::read_volatile(DTB_LOCATION as *const u32) };
-    if magic == FDT_MAGIC_LE {
-        let total_size = u32::from_be(unsafe { core::ptr::read_volatile((DTB_LOCATION + 4) as *const u32) });
-        if (64..=16 * 1024 * 1024).contains(&total_size) {
-            console::print("[DTB] Found at 0x");
-            console::print_hex(DTB_LOCATION as u64);
-            console::print("\n");
-            return DTB_LOCATION;
-        }
-    }
-
-    console::print("[DTB] Not found at expected location 0x");
-    console::print_hex(DTB_LOCATION as u64);
-    console::print("\n");
-    0
-}
-
-/// Detect memory from Device Tree Blob.
-///
-/// QEMU does NOT set x0 for ELF kernels, so we scan RAM for the
-/// QEMU-generated DTB when x0 is zero.
-fn detect_memory(dtb_ptr: usize) -> (usize, usize) {
+/// Takes the already-parsed tree: locating and validating the blob is
+/// `akuma_fdt::locate`'s job, done once in `kernel_main`. This used to scan for
+/// the DTB and call `Fdt::from_ptr` itself — two `unsafe` operations that the
+/// device-map and SMP-topology paths each also performed on the same blob.
+fn detect_memory(fdt: Option<&akuma_fdt::Fdt<'_>>) -> (usize, usize) {
     const DEFAULT_RAM_BASE: usize = 0x4000_0000; // QEMU virt: 1 GB
 
     const DEFAULT_RAM_SIZE: usize = 256 * 1024 * 1024;
     const DTB_RESERVE: usize = 2 * 1024 * 1024; // 2 MB
 
-    let actual_dtb_ptr = if dtb_ptr != 0 { dtb_ptr } else { scan_for_dtb() };
-
-    if actual_dtb_ptr == 0 {
+    let Some(fdt) = fdt else {
         console::print("[Memory] No DTB found, using default 256MB\n");
         return (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE - DTB_RESERVE);
-    }
-
-    // SAFETY: We found a valid DTB magic at this address
-    let fdt = if let Ok(fdt) = unsafe { fdt::Fdt::from_ptr(actual_dtb_ptr as *const u8) } { fdt } else {
-        console::print("[Memory] Invalid DTB, using defaults\n");
-        return (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE);
     };
 
     // Get memory regions from DTB
@@ -772,12 +738,31 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // QEMU virt at every `SMP=N` and correct on a single-vCPU Firecracker. Print
     // the outcome either way — it is the only record of which map the GIC was
     // configured from. See docs/reference/firecracker/README.md §3.3.
+    //
+    // This block is also where the DTB is materialised, once, for all three of
+    // its consumers — the device map here, `detect_memory` and
+    // `smp_shared::probe_dtb` below. It is a block and not three statements for
+    // a reason: the blob is NOT valid for the rest of the boot, because on
+    // large-RAM configs the heap can be placed on top of it. Scoping the borrow
+    // is what makes the borrow checker enforce "read the DTB before heap init",
+    // which was previously only a comment on `probe_dtb`.
+    let (ram_base, ram_size);
     {
-        let resolved = if dtb_ptr != 0 { dtb_ptr } else { scan_for_dtb() };
-        // SAFETY: `resolved` is zero or a magic-checked FDT inside the boot
-        // identity map (extended above). Still single-threaded on the boot page
-        // table, before any user address space exists.
-        let outcome = unsafe { platform::install_fdt_device_map(resolved) };
+        // SAFETY: `dtb_ptr` is zero (scan for QEMU virt's fixed location) or the
+        // bootloader's pointer, and either way is inside the boot identity map
+        // (extended above). Still single-threaded on the boot page table, before
+        // any user address space exists. `locate` reads 8 bytes and validates the
+        // magic and declared size before trusting either. The `'_` lifetime it
+        // hands back ends with this block, ahead of heap init.
+        let dtb = unsafe { akuma_fdt::locate(dtb_ptr) };
+        if let Some(d) = &dtb {
+            safe_print!(64, "[DTB] found at 0x{:x} ({} bytes)\n", d.base(), d.len());
+        } else {
+            safe_print!(64, "[DTB] none at 0x{:x}\n", akuma_fdt::resolve(dtb_ptr));
+        }
+        let fdt = dtb.as_ref().and_then(akuma_fdt::Dtb::parse);
+
+        let outcome = platform::install_fdt_device_map(fdt.as_ref());
         match outcome {
             platform::FdtMapOutcome::Installed { gicr_pa, moved } => {
                 // SAFETY: as for the bootstrap rebuild above — boot page table,
@@ -793,15 +778,15 @@ fn kernel_main(dtb_ptr: usize) -> ! {
                 safe_print!(96, "[Platform] FDT rejected ({:?}); keeping bootstrap map\n", e);
             }
         }
+
+        (ram_base, ram_size) = detect_memory(fdt.as_ref());
+
+        // Real (shared-kernel) SMP: snapshot CPU/PSCI info from the DTB NOW, before the
+        // heap allocator (which can be placed exactly at the DTB's address on
+        // large-RAM configs) overwrites it. No-op without the `smp-shared` feature.
+        #[cfg(kernel_smp_shared)]
+        smp_shared::probe_dtb(fdt.as_ref());
     }
-
-    let (ram_base, ram_size) = detect_memory(dtb_ptr);
-
-    // Real (shared-kernel) SMP: snapshot CPU/PSCI info from the DTB NOW, before the
-    // heap allocator (which can be placed exactly at the DTB's address on
-    // large-RAM configs) overwrites it. No-op without the `smp-shared` feature.
-    #[cfg(kernel_smp_shared)]
-    smp_shared::probe_dtb(dtb_ptr);
 
     // Memory layout. All the policy (boot-stack cover, code+stack floor, the
     // extreme reserve-RAM clamp) lives in `compute_memory_layout` + `config`, so

@@ -272,22 +272,21 @@ pub enum FdtMapOutcome {
 /// the QEMU boot is what proves the parse against a machine whose answers are
 /// independently known.
 ///
-/// # Safety
+/// # Not `unsafe`
 ///
-/// `dtb_ptr` must be zero or point at a mapped, complete FDT blob.
+/// This took a raw `dtb_ptr` and called `Fdt::from_ptr` itself until 2026-09-01,
+/// which is why it was an `unsafe fn`. The blob is now materialised once per
+/// boot by `akuma_fdt::locate` and arrives here already parsed, so nothing this
+/// function does carries a proof obligation — the same reason
+/// `akuma-firecracker` could take `forbid(unsafe_code)` when its `describe_ptr`
+/// became `describe_fdt`. Passing `None` means "no device tree", which is a
+/// normal outcome on machines that supply none, not an error.
 #[must_use]
-pub unsafe fn install_fdt_device_map(dtb_ptr: usize) -> FdtMapOutcome {
-    if dtb_ptr == 0 {
-        return FdtMapOutcome::NoFdt;
-    }
-    // SAFETY: the caller guarantees `dtb_ptr` is mapped and holds a complete FDT.
-    // The same call `smp_shared::probe_dtb` makes on the same blob. Done here
-    // rather than inside `akuma-firecracker` so that crate can be
-    // `forbid(unsafe_code)` — its job is parsing, and parsing needs no pointers.
-    let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8) }) else {
+pub fn install_fdt_device_map(fdt: Option<&akuma_fdt::Fdt<'_>>) -> FdtMapOutcome {
+    let Some(fdt) = fdt else {
         return FdtMapOutcome::NoFdt;
     };
-    let desc = match akuma_firecracker::describe_fdt(&fdt) {
+    let desc = match akuma_firecracker::describe_fdt(fdt) {
         Ok(d) => d,
         Err(akuma_firecracker::Error::BadFdt) => return FdtMapOutcome::NoFdt,
         Err(e) => return FdtMapOutcome::Rejected(e),

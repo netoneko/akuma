@@ -1,0 +1,12 @@
+[package]
+name = "akuma-fdt"
+version = "0.1.0"
+edition = "2024"
+description = "Materialise a flattened device tree from a boot pointer — the kernel's single unsafe FDT entry point"
+
+[dependencies]
+# Same version akuma-firecracker and the kernel already use.
+fdt = "0.1"
+
+[lints]
+workspace = true

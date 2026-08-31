@@ -2533,11 +2533,24 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
     Some(sf.uc.uc_mcontext.regs[0])
 }
 
-/// Install exception vector table
-pub fn init() {
-    // Initialize exception stack before enabling exceptions
-    init_exception_stack();
-
+/// Point this PE's `VBAR_EL1` at the kernel's exception vector table, and `isb`
+/// so it is in effect before anything can take an exception.
+///
+/// Called once per core: by [`init`] on the BSP, and by
+/// `smp_shared::secondary_shared_start` on every PSCI-woken secondary — cores
+/// share one kernel image, so they share one vector table. Those were two
+/// independently written copies of this `msr` until 2026-09-01 (the secondary's
+/// resolved the symbol with its own `adrp`/`add` pair); a vector-table install
+/// that exists twice is a vector-table install that can drift.
+///
+/// `msr vbar_el1` is deliberately absent from `akuma-cpu` — installing a vector
+/// table is a change of control flow, so the obligation is real and stays here,
+/// discharged once.
+pub fn install_vbar() {
+    // SAFETY: installs the address of this kernel's own vector table, a linker
+    // symbol in `.text`. `&raw const` resolves the symbol without reading
+    // through it; the `isb` makes the new base effective before the next
+    // exception can be taken.
     unsafe {
         let vbar = &raw const exception_vector_table as u64;
 
@@ -2547,8 +2560,15 @@ pub fn init() {
             "isb",
             vbar = in(reg) vbar
         );
-
     }
+}
+
+/// Install exception vector table
+pub fn init() {
+    // Initialize exception stack before enabling exceptions
+    init_exception_stack();
+
+    install_vbar();
 
     // Enable IRQs by clearing DAIF.I, now that VBAR_EL1 is installed and
     // synchronized above — the ordering that makes taking an interrupt safe.

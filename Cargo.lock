@@ -11,6 +11,7 @@ dependencies = [
  "akuma-cpu",
  "akuma-exec",
  "akuma-ext2",
+ "akuma-fdt",
  "akuma-firecracker",
  "akuma-isolation",
  "akuma-kacho",
@@ -33,7 +34,6 @@ dependencies = [
  "akuma-vfs",
  "akuma-virtio",
  "embedded-io-async",
- "fdt",
  "log",
  "smoltcp",
  "spinning_top",
@@ -107,6 +107,13 @@ dependencies = [
  "akuma-primitives",
  "akuma-vfs",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-fdt"
+version = "0.1.0"
+dependencies = [
+ "fdt",
 ]
 
 [[package]]

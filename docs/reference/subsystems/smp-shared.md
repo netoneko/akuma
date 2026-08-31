@@ -57,8 +57,14 @@ real SMP) — see `scripts/build_devbox_smoltcp.sh` and
 
 ## Boot / bringup
 
-1. `probe_dtb(dtb_ptr)` (from `kernel_main`, before heap init) parses `/cpus` + `/psci`,
-   stashes MPIDRs by `aff0 = mpidr & 0xff`.
+1. `probe_dtb(fdt)` (from `kernel_main`, before heap init) parses `/cpus` + `/psci`,
+   stashes MPIDRs by `aff0 = mpidr & 0xff`. It takes the already-parsed tree —
+   `akuma_fdt::locate` materialises the blob once for all three of its consumers
+   (`../../archive/AKUMA_FDT_EXTRACTION.md`) — and the `Fdt` it borrows is scoped
+   to a block that closes before heap init, so "before heap init" is enforced by
+   the borrow checker rather than by this sentence. That matters because on
+   large-RAM configs the heap can be placed on top of the DTB, which is why the
+   topology is snapshotted into statics here instead of re-read at bringup.
 2. `bringup_secondaries()` (after `gic::init`) PSCI `CPU_ON`s each secondary at the
    `secondary_entry_shared` trampoline (asm, `.text.boot`), which loads the BSP's
    **shared** boot `TTBR0`/`TTBR1` and tail-calls `secondary_shared_start`.

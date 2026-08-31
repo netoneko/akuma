@@ -516,6 +516,12 @@ unsafe extern "C" {
     /// The secondary trampoline (asm, `.text.boot`, defined below). Taking its
     /// address gives the identity-mapped PA to hand PSCI `CPU_ON` as the entry point.
     fn secondary_entry_shared();
+
+    /// The per-core boot/idle stacks (`.bss.smp_shared`, defined in the same
+    /// `global_asm!` block below). Declared with its true type so the size the
+    /// trampoline's `add x0, x0, x20, lsl #STACK_SHIFT` walks is stated to the
+    /// compiler rather than only to the reader; see [`secondary_stack_base`].
+    static secondary_boot_stacks_shared: [u8; MAX_CORES << STACK_SHIFT];
 }
 
 #[inline]
@@ -555,37 +561,27 @@ fn psci_call(use_hvc: bool, func: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     ret
 }
 
-/// Resolve the DTB pointer the way `detect_memory` does (QEMU does not set x0 for flat
-/// kernels; the DTB sits 2 MiB-aligned above the image at 0x4020_0000).
-fn resolve_dtb(dtb_ptr: usize) -> usize {
-    const DTB_LOCATION: usize = 0x4020_0000;
-    const FDT_MAGIC_LE: u32 = 0xedfe0dd0;
-    if dtb_ptr != 0 {
-        return dtb_ptr;
-    }
-    // SAFETY: speculative read of a u32 at a fixed RAM address; magic-checked.
-    let magic = unsafe { core::ptr::read_volatile(DTB_LOCATION as *const u32) };
-    if magic == FDT_MAGIC_LE { DTB_LOCATION } else { 0 }
-}
-
 /// `true` if the PSCI conduit is `hvc` (QEMU `virt`); default to it when absent.
-fn psci_is_hvc(fdt: &fdt::Fdt) -> bool {
+fn psci_is_hvc(fdt: &akuma_fdt::Fdt<'_>) -> bool {
     fdt.find_node("/psci")
         .and_then(|n| n.property("method"))
         .is_none_or(|p| p.value.starts_with(b"hvc"))
 }
 
-/// Parse `/cpus` + `/psci` from the DTB and stash the topology. Called from
-/// `kernel_main` before heap init (the heap can land on the DTB on large-RAM configs).
-pub fn probe_dtb(dtb_ptr: usize) {
-    let resolved = resolve_dtb(dtb_ptr);
-    if resolved == 0 {
+/// Parse `/cpus` + `/psci` from the DTB and stash the topology.
+///
+/// Called from `kernel_main` before heap init — the heap can land on the DTB on
+/// large-RAM configs, which is the entire reason this snapshots into statics
+/// rather than re-reading the tree when `bringup_secondaries` needs it. That
+/// ordering used to be a comment; taking a borrowed `Fdt` makes the compiler
+/// hold it, because the borrow cannot outlive `kernel_main`'s DTB block.
+///
+/// This resolved and parsed the blob itself until 2026-09-01 — a duplicate of
+/// what `detect_memory` and `install_fdt_device_map` each did on the same
+/// bytes, and one of the six `unsafe` operations `akuma-fdt` replaced with one.
+pub fn probe_dtb(fdt: Option<&akuma_fdt::Fdt<'_>>) {
+    let Some(fdt) = fdt else {
         crate::safe_print!(64, "[SMP-shared] no DTB; staying single-core\n");
-        return;
-    }
-    // SAFETY: `resolved` points at a validated FDT blob (magic-checked above / by QEMU).
-    let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr(resolved as *const u8) }) else {
-        crate::safe_print!(64, "[SMP-shared] DTB parse failed; single-core\n");
         return;
     };
     let mut count = 0usize;
@@ -598,7 +594,7 @@ pub fn probe_dtb(dtb_ptr: usize) {
         }
     }
     NUM_CORES.store(count.max(1), Ordering::Relaxed);
-    USE_HVC.store(psci_is_hvc(&fdt), Ordering::Relaxed);
+    USE_HVC.store(psci_is_hvc(fdt), Ordering::Relaxed);
     PROBED.store(true, Ordering::Release);
     crate::safe_print!(64, "[SMP-shared] probed {} core(s)\n", count.max(1));
 }
@@ -800,34 +796,25 @@ fn secondary_gic_init(idx: usize) {
 
 /// Base VA of this core's 64 KiB (`1 << STACK_SHIFT`) boot/idle stack in
 /// `secondary_boot_stacks_shared`.
+///
+/// This was an `adrp`/`add` pair in an `unsafe` block until 2026-09-01. Taking
+/// the address of an `extern` static is safe in edition 2024 (`&raw const`
+/// resolves the symbol without reading through it), so the whole operation is
+/// expressible without `asm!` — and the array type carries the bound the asm
+/// version could only state in a comment.
 pub fn secondary_stack_base(core: usize) -> usize {
-    let addr: usize;
-    // SAFETY: resolves the `.bss.smp_shared` symbol's address; no memory access.
-    unsafe {
-        core::arch::asm!(
-            "adrp {t}, secondary_boot_stacks_shared",
-            "add {t}, {t}, :lo12:secondary_boot_stacks_shared",
-            t = out(reg) addr,
-            options(nomem, nostack),
-        );
-    }
-    addr + (core << STACK_SHIFT)
+    (&raw const secondary_boot_stacks_shared) as usize + (core << STACK_SHIFT)
 }
 
 /// Set `VBAR_EL1` to the shared exception vector table (the BSP's) so this core takes
 /// syscalls/IRQs/faults through the same handlers.
+///
+/// This had its own `adrp`/`add`/`msr` sequence until 2026-09-01. It is the same
+/// install `exceptions::init` does on the BSP — and "the same" is the whole
+/// point of shared-kernel SMP — so it now calls the one implementation instead
+/// of carrying a second copy that could drift from it.
 fn set_shared_vbar() {
-    // SAFETY: installs the kernel's exception vector base for this PE.
-    unsafe {
-        core::arch::asm!(
-            "adrp {t}, exception_vector_table",
-            "add {t}, {t}, :lo12:exception_vector_table",
-            "msr vbar_el1, {t}",
-            "isb",
-            t = out(reg) _,
-            options(nomem, nostack),
-        );
-    }
+    crate::exceptions::install_vbar();
 }
 
 /// Per-core counter of scheduler ticks each core has serviced a worker on — the M2c

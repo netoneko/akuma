@@ -5,6 +5,7 @@ default-members = [
     "crates/akuma-alloc",
     "crates/akuma-exec",
     "crates/akuma-uart",
+    "crates/akuma-fdt",
     "crates/akuma-firecracker",
     "crates/akuma-cpu",
     "crates/akuma-elf",
@@ -689,9 +690,12 @@ akuma-isolation = { path = "crates/akuma-isolation" }
 # compile-time constant can address it (docs/reference/firecracker/README.md
 # §3.3). Platform-neutral — it parses QEMU virt's tree too.
 akuma-firecracker = { path = "crates/akuma-firecracker" }
+# The one place a boot pointer becomes a device tree. Every FDT consumer in the
+# kernel (RAM detection, the device map, SMP topology) goes through it, so the
+# `unsafe` that materialises the blob exists once instead of in each of them.
+akuma-fdt = { path = "crates/akuma-fdt" }
 talc = "4"
 spinning_top = "0.3"
-fdt = "0.1"
 
 # The `log` facade, so `src/klog.rs` can install a console sink for the
 # statements `akuma-net`/smoltcp already emit. `default-features = false` drops

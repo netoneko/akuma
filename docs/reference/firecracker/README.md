@@ -107,7 +107,10 @@ silently loses its timer interrupt**, with no build or boot error.
 `platform::install_fdt_device_map` (called from `kernel_main`, after
 `mmu::ensure_boot_identity_covers` maps the blob and **before** `gic::init`)
 replaces the bootstrap map with one derived from the device tree via
-`crates/akuma-firecracker`. It **reads** the redistributor from `intc`'s second
+`crates/akuma-firecracker`. Since 2026-09-01 it takes an `Option<&Fdt>` rather
+than a raw pointer and is **not** an `unsafe fn`: `akuma_fdt::locate` does the
+pointer work once for every FDT consumer in the kernel
+(`../../archive/AKUMA_FDT_EXTRACTION.md`). It **reads** the redistributor from `intc`'s second
 `reg` entry rather than computing it from `vcpu_count` — `cpu_count * 0x2_0000`
 happens to equal the redistributor span, so a derivation would pass every test
 here and still be an address inferred from an unrelated property.
