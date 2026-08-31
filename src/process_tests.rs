@@ -13314,9 +13314,9 @@ fn test_epoll_pipe_eof_edge_after_partial_drain() {
 /// Test that multiple epoll instances waiting on the same pipe are all woken.
 fn test_epoll_multi_poller_pipe() {
     use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
-    use crate::syscall::pipe::{pipe_create, pipe_write, pipe_close_write, pipe_close_read, pipe_pollers_count};
+    use crate::syscall::pipe::{pipe_create, pipe_write, pipe_close_write, pipe_close_read, pipe_pollers_count, pipe_is_poller_registered};
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, FileDescriptor};
-    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     // The `epoll_event` buffers below are kernel STACK addresses, which are
     // EL1-only in every user address space — so since the AP-bit user-pointer
@@ -13349,35 +13349,65 @@ fn test_epoll_multi_poller_pipe() {
     static WOKEN_COUNT: AtomicU32 = AtomicU32::new(0);
     WOKEN_COUNT.store(0, Ordering::SeqCst);
 
+    // Per-poller outcome, recorded so a failure says WHY rather than only
+    // `woken=N`. `RC` is `sys_epoll_pwait`'s raw return (u64::MAX = "has not
+    // returned yet"), `RET_US` the uptime at which it landed. Without these,
+    // `woken=1` cannot distinguish "the second poller was late" from "it
+    // returned 0/EBADF/EINTR" — two completely different bugs.
+    static TH_RC: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(u64::MAX)];
+    static TH_RET_US: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    // How far each poller thread got: 1 = closure entered, 2 = registered with
+    // the process, 3 = about to call epoll_pwait, 4 = epoll_pwait returned.
+    static TH_PHASE: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+    for i in 0..2 {
+        TH_RC[i].store(u64::MAX, Ordering::SeqCst);
+        TH_RET_US[i].store(0, Ordering::SeqCst);
+        TH_PHASE[i].store(0, Ordering::SeqCst);
+    }
+
     // Spawn two threads to wait on the two epoll instances.
     // Each thread must register with the process so sys_epoll_pwait can
     // find the fd table via current_process_shared().
-    let _thread1 = akuma_exec::threading::spawn_user_thread_fn(move || {
+    let tid1 = akuma_exec::threading::spawn_user_thread_fn(move || {
+        TH_PHASE[0].store(1, Ordering::SeqCst);
         let my_tid = akuma_exec::threading::current_thread_id();
         akuma_exec::process::register_thread_pid(my_tid, pid);
+        TH_PHASE[0].store(2, Ordering::SeqCst);
         // Per-thread bypass: the parent's guard covers the parent only.
         let _bypass = akuma_exec::process::user_access::BypassValidationGuard::new();
         let mut out = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
-        if sys_epoll_pwait(epfd1 as u32, out.as_mut_ptr() as usize, 1, 5000) == 1 {
+        TH_PHASE[0].store(3, Ordering::SeqCst);
+        let rc = sys_epoll_pwait(epfd1 as u32, out.as_mut_ptr() as usize, 1, 5000);
+        TH_RC[0].store(rc, Ordering::SeqCst);
+        TH_RET_US[0].store(crate::timer::uptime_us(), Ordering::SeqCst);
+        TH_PHASE[0].store(4, Ordering::SeqCst);
+        if rc == 1 {
             WOKEN_COUNT.fetch_add(1, Ordering::SeqCst);
         }
         akuma_exec::process::unregister_thread_pid(my_tid);
         akuma_exec::threading::mark_thread_terminated(my_tid);
-        loop { akuma_exec::threading::yield_now(); }
+        loop { akuma_exec::threading::blocking_relax(); }
     }).expect("thread 1 spawn failed");
 
-    let _thread2 = akuma_exec::threading::spawn_user_thread_fn(move || {
+    let tid2 = akuma_exec::threading::spawn_user_thread_fn(move || {
+        TH_PHASE[1].store(1, Ordering::SeqCst);
         let my_tid = akuma_exec::threading::current_thread_id();
         akuma_exec::process::register_thread_pid(my_tid, pid);
+        TH_PHASE[1].store(2, Ordering::SeqCst);
         // Per-thread bypass: the parent's guard covers the parent only.
         let _bypass = akuma_exec::process::user_access::BypassValidationGuard::new();
         let mut out = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
-        if sys_epoll_pwait(epfd2 as u32, out.as_mut_ptr() as usize, 1, 5000) == 1 {
+        TH_PHASE[1].store(3, Ordering::SeqCst);
+        let rc = sys_epoll_pwait(epfd2 as u32, out.as_mut_ptr() as usize, 1, 5000);
+        TH_RC[1].store(rc, Ordering::SeqCst);
+        TH_RET_US[1].store(crate::timer::uptime_us(), Ordering::SeqCst);
+        TH_PHASE[1].store(4, Ordering::SeqCst);
+        if rc == 1 {
             WOKEN_COUNT.fetch_add(1, Ordering::SeqCst);
         }
         akuma_exec::process::unregister_thread_pid(my_tid);
         akuma_exec::threading::mark_thread_terminated(my_tid);
-        loop { akuma_exec::threading::yield_now(); }
+        loop { akuma_exec::threading::blocking_relax(); }
     }).expect("thread 2 spawn failed");
 
     // Handshake: wait until BOTH threads have actually registered as pollers on
@@ -13387,18 +13417,28 @@ fn test_epoll_multi_poller_pipe() {
     // freshly spawned thread can miss the window entirely, which pushes it onto the
     // 10ms epoll re-poll fallback. `pollers` is only ever drained by a write/close,
     // none of which has happened yet, so the count is monotonic up to 2 here.
+    //
+    // `blocking_relax()`, NOT `yield_now()` — in this loop and every other wait in
+    // this test. This is a cross-core wait: the thing being waited for runs on a
+    // PEER core, and under `smp-shared` a bare `yield_now()` loop re-takes the BKL
+    // every iteration (nothing else is READY on this core, so it returns without
+    // switching), so the peer can never enter the kernel to make the progress we
+    // are waiting for. `blocking_relax` adds the `idle_halt` that DROPS the BKL
+    // around a WFI. See `wait_out_reclaim_cooldown` above for the same rule, and
+    // `threading::blocking_relax`'s own doc comment for the mechanism.
     const REGISTER_TIMEOUT_US: u64 = 500_000;
     let wait_start = crate::timer::uptime_us();
     while pipe_pollers_count(pipe_id) < 2
         && (crate::timer::uptime_us() - wait_start < REGISTER_TIMEOUT_US)
     {
-        akuma_exec::threading::yield_now();
+        akuma_exec::threading::blocking_relax();
     }
     // Report separately from the wake count: a genuine registration bug must
     // surface here instead of being masked as a missing wakeup below.
     let registered = pipe_pollers_count(pipe_id);
 
     // Trigger event
+    let write_us = crate::timer::uptime_us();
     pipe_write(pipe_id, b"data").unwrap();
 
     // Wait for both to be woken. The budget must be comfortably larger than
@@ -13406,15 +13446,52 @@ fn test_epoll_multi_poller_pipe() {
     // interval fallback re-checks at t ~= 10ms, so a 10ms budget made the outcome a
     // coin flip between two identical timers (same doc, §4.3). 100ms is still 50x
     // under the 5000ms epoll_pwait timeout the threads themselves use.
+    //
+    // Raising this budget alone did NOT fix the flake, and could not have: with a
+    // `yield_now()` body the wait was itself the thing starving the poller, so more
+    // budget bought more starvation. The residual ~1-boot-in-6 `woken=1` at SMP=4
+    // was a BKL freeze — `[BKL] stuck: owner=1 waiter=2/3/4` immediately before the
+    // FAILED line, with the straggler RUNNING on a peer core, 1 ms of lifetime CPU,
+    // and no re-registration on the pipe since the write popped it. The poller that
+    // happened to share a core with this thread always finished (hence `woken=1`,
+    // never 0). `blocking_relax` below is the fix.
     const WAKE_BUDGET_US: u64 = 100_000;
     let wait_start = crate::timer::uptime_us();
     while WOKEN_COUNT.load(Ordering::SeqCst) < 2
         && (crate::timer::uptime_us() - wait_start < WAKE_BUDGET_US)
     {
-        akuma_exec::threading::yield_now();
+        akuma_exec::threading::blocking_relax();
     }
 
-    let final_count = WOKEN_COUNT.load(Ordering::SeqCst);
+    let budget_count = WOKEN_COUNT.load(Ordering::SeqCst);
+
+    // Diagnostic overrun: if the budget expired short, keep watching for a
+    // bounded extra window purely to record HOW late the straggler was. It does
+    // not change the verdict (`budget_count` is what is scored) — it turns
+    // `woken=1` into a number that says whether the second wake was late or lost.
+    let mut late_count = budget_count;
+    const LATE_PROBE_US: u64 = 2_000_000;
+    if budget_count < 2 {
+        let probe_start = crate::timer::uptime_us();
+        while WOKEN_COUNT.load(Ordering::SeqCst) < 2
+            && (crate::timer::uptime_us() - probe_start < LATE_PROBE_US)
+        {
+            akuma_exec::threading::blocking_relax();
+        }
+        late_count = WOKEN_COUNT.load(Ordering::SeqCst);
+    }
+
+    // Snapshot each poller's scheduler state and whether it is (still/again)
+    // registered on the pipe — both must be read before the cleanup below
+    // destroys the pipe. A straggler that is NOT in the poller set was popped by
+    // the write and has not re-lapped since; one that IS has lapped and is
+    // waiting again.
+    let (t1, t2) = (tid1, tid2);
+    let st1 = akuma_exec::threading::get_thread_state(t1);
+    let st2 = akuma_exec::threading::get_thread_state(t2);
+    let reg1 = pipe_is_poller_registered(pipe_id, t1);
+    let reg2 = pipe_is_poller_registered(pipe_id, t2);
+    let pollers_now = pipe_pollers_count(pipe_id);
 
     // Cleanup
     pipe_close_write(pipe_id);
@@ -13435,10 +13512,39 @@ fn test_epoll_multi_poller_pipe() {
             "[Test] test_epoll_multi_poller_pipe FAILED: pollers={} (expected 2) after {}ms — pollers never registered\n",
             registered, REGISTER_TIMEOUT_US / 1000
         );
-    } else if final_count == 2 {
+    } else if budget_count == 2 {
         console::print("[Test] test_epoll_multi_poller_pipe PASSED\n");
     } else {
-        crate::safe_print!(128, "[Test] test_epoll_multi_poller_pipe FAILED: woken={} (expected 2)\n", final_count);
+        // `rc=18446744073709551615` (u64::MAX) means that poller never returned
+        // at all; `lat` is microseconds from the write to its return.
+        crate::safe_print!(
+            256,
+            "[Test] test_epoll_multi_poller_pipe FAILED: woken={} (expected 2) late={} pollers_now={}\n",
+            budget_count,
+            late_count,
+            pollers_now
+        );
+        crate::safe_print!(
+            256,
+            "[Test]   p0 tid={} phase={} rc={} lat={}us st={} reg={}\n",
+            t1,
+            TH_PHASE[0].load(Ordering::SeqCst),
+            TH_RC[0].load(Ordering::SeqCst),
+            TH_RET_US[0].load(Ordering::SeqCst).saturating_sub(write_us),
+            st1,
+            reg1
+        );
+        crate::safe_print!(
+            256,
+            "[Test]   p1 tid={} phase={} rc={} lat={}us st={} reg={}\n",
+            t2,
+            TH_PHASE[1].load(Ordering::SeqCst),
+            TH_RC[1].load(Ordering::SeqCst),
+            TH_RET_US[1].load(Ordering::SeqCst).saturating_sub(write_us),
+            st2,
+            reg2
+        );
+        akuma_exec::threading::dump_thread_resume_points();
     }
 }
 

@@ -93,7 +93,6 @@ dependencies = [
  "akuma-primitives",
  "akuma-syscalls-linux",
  "akuma-terminal",
- "elf",
  "embedded-io-async",
  "lock_api",
  "log",

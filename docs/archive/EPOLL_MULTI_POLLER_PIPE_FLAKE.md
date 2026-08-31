@@ -1,8 +1,15 @@
 # `test_epoll_multi_poller_pipe`: a boot-suite flake that is a test defect, not a kernel bug
 
-**Status**: Investigated 2026-08-02 during Phase 7f tranche 2
-([`BKL_PHASE7F_OPTOUT_LIST.md`](../archive/BKL_PHASE7F_OPTOUT_LIST.md) §5.4). **Fixed
-2026-08-02** as its own change — both defects in §4 remedied exactly as §6 proposed;
+**Status**: **ROOT-CAUSED and fixed 2026-09-01 — read §9 first.** The 2026-08-02
+work (§1–§8) removed two of three mechanisms and the flake came back at ~12 % on
+`SMP=4`; the one underneath it is that the *test's own wait loop* held the Big Kernel
+Lock while spinning on `yield_now()`, freezing the peer core its second poller was
+running on. §9 has the evidence, the fix (`blocking_relax()` everywhere in the test),
+and the verification series. Still a test defect, still no kernel bug.
+
+Original status line, kept: investigated 2026-08-02 during Phase 7f tranche 2
+([`BKL_PHASE7F_OPTOUT_LIST.md`](../archive/BKL_PHASE7F_OPTOUT_LIST.md) §5.4), fixed
+2026-08-02 as its own change — both defects in §4 remedied exactly as §6 proposed;
 verification series in §8. Sections 1–5 are the original investigation, kept verbatim.
 This doc exists because the flake **cost a conversion decision**:
 it fired twice in a row immediately after a BKL opt-out entry was added, looked
@@ -229,7 +236,12 @@ or EC=0x25). Host tests and clippy clean.
 
 Zero failures in 10 does not by itself prove the mechanism is gone — at the old 31%
 rate it is p ≈ 0.02, strong but not conclusive. The reason to believe it is §4: both
-inputs to the race were removed, not merely made less likely. Note also that §5's rule
+inputs to the race were removed, not merely made less likely.
+
+> **Correction, 2026-09-01.** This caveat was right and was read too generously: two
+> of three mechanisms were removed, and the flake returned at ~12 % once measured
+> again. §6.2's budget increase in particular made the surviving mechanism *worse*.
+> See §9. Note also that §5's rule
 still applies to *other* changes: this test getting quieter does not make a single boot
 a valid A/B instrument.
 
@@ -246,3 +258,139 @@ a valid A/B instrument.
   A/B playbook whose "re-measure before quoting" rule this is a concrete case of.
 - `src/syscall/poll.rs` (`epoll_check_fd_readiness`, `BLOCKING_POLL_INTERVAL_US`),
   `src/syscall/pipe.rs` (`pipe_add_poller`, `pipe_write`, `pipe_pollers_count`).
+
+---
+
+## 9. It came back — and §6 could not have fixed it (2026-09-01)
+
+§8's ten clean boots were real, but they were not proof: the §6 fix removed the
+two mechanisms §4 identified, and a **third** one was underneath. Re-measured on
+`afc251f6` (`cargo build --release`, i.e. `smp-shared`, `SMP=4`, `DISK=disk.img`
+`MEMORY=4096 INSTANCE=60`), the same `woken=1 (expected 2)` line reappeared at
+**2 failures in 17 boots (~12 %)**. Same signature, never `woken=0`, never a hang.
+
+### 9.1 What the instrumentation showed
+
+The test now records each poller's `epoll_pwait` return value, the time it landed,
+and — on failure only — each poller's scheduler state, whether it is still
+registered on the pipe, and a `[THR-DUMP]`. Two failing boots said the same thing:
+
+```
+FAILED: woken=1 (expected 2) late=1 pollers_now=1
+  p0 tid=13 phase=3 rc=18446744073709551615 lat=0us st=2 reg=false
+  p1 tid=14 phase=4 rc=1                    lat=16us st=3 reg=true
+  tid=13 st=R pid=-1 ... last_core=2 cpu_us=1037
+```
+
+Read it in order:
+
+- The winner returned in **16 µs**. The wake path is fine, again.
+- The loser (`rc = u64::MAX`) **never returned at all** — not within the 100 ms
+  budget, and not within the extra **2.1 s** diagnostic probe that follows it. So
+  this was never a "late by a hair" problem, and no budget could have fixed it.
+- The loser is `st=2` — **RUNNING** — with `cpu_us=1037`: about 1 ms of CPU across
+  its whole life. A RUNNING thread that is not accumulating CPU is a thread
+  spinning with IRQs masked.
+- `reg=false`: the write popped it out of `pipe.pollers` and it has not re-lapped
+  since. It is stuck *inside* one `epoll_pwait` lap, not cycling through the 10 ms
+  fallback.
+- `last_core=2`. The winner's `last_core` is 0 — **the main thread's core**.
+
+And immediately above the FAILED line, ~45 consecutive lines of:
+
+```
+[BKL] stuck: owner=1 waiter=2 tag=511 (aff0+1)
+[BKL] stuck: owner=1 waiter=3 tag=511 (aff0+1)
+[BKL] stuck: owner=1 waiter=4 tag=511 (aff0+1)
+```
+
+Core 0 owns the Big Kernel Lock; cores 1, 2 and 3 are all spinning for it.
+
+### 9.2 Root cause: the test's own wait loop was the starver
+
+`test_epoll_multi_poller_pipe` waited with a bare `yield_now()` spin — in the
+registration handshake, in the wake budget, and in both poller threads' terminal
+`loop { yield_now() }` parks. Under `smp-shared` that is the documented
+cross-core freeze shape, and `threading::blocking_relax`'s own doc comment states
+it exactly:
+
+> Without the drop the loop busy-spins holding the BKL (nothing else READY on the
+> core → `yield_now` returns without switching), freezing every peer core.
+
+The boot suite runs in the kernel with the BKL held. `yield_now()` triggers an SGI
+and returns; when nothing else on this core is READY the scheduler switches
+nothing, so the lock is never released and the loop re-enters holding it. Every
+peer core is frozen out of the kernel for the entire duration of the wait.
+
+That is the whole failure:
+
+1. Both pollers register (the §6 handshake works — `pollers` reached 2).
+2. `pipe_write` pops and wakes both. Both are correctly READY.
+3. The main thread starts spinning on `yield_now()`, holding the BKL on core 0.
+4. The poller that landed on core 0 gets scheduled locally and finishes: 16 µs.
+5. The poller on a peer core is READY, gets picked, and immediately spins on the
+   BKL acquire it needs to finish its `epoll_pwait` lap. It never gets it, because
+   the thread that owns the BKL is the one waiting for it.
+
+`woken=1` and never `woken=0` falls straight out of step 4: the co-located poller
+always wins. So does the SMP≥2-only rate, and so does why §6 helped without
+curing — the handshake removed one input to the race, but **raising the budget
+from 10 ms to 100 ms made this worse, not better**: the budget *is* the starvation
+window. Ten times the budget is ten times the freeze. §8's ten clean boots
+measured a lower-probability version of a bug that was still there.
+
+The correlator is free, and it is in every log: count `[BKL] stuck` lines. This
+tree's boot-suite baseline is ~87 per boot (pre-existing, load-driven —
+`BKL_TAG511_STORM.md`). Both failing boots read 129 and 132. The ~45-line excess
+is this test.
+
+### 9.3 The fix
+
+`src/process_tests.rs`, `test_epoll_multi_poller_pipe`. Still no kernel change —
+§4.1 stands and §9.1 re-confirms it, the wake path has never been at fault.
+
+1. Every wait in the test is `blocking_relax()` instead of `yield_now()`: the
+   registration handshake, the wake budget, the diagnostic probe, and both poller
+   threads' terminal park loops. `blocking_relax` adds the `idle_halt` that
+   **drops the BKL** around a WFI, so a peer core can enter the kernel and produce
+   the progress being waited for. This is the same rule already written down for
+   `wait_out_reclaim_cooldown` in this file, and enforced by
+   `test_smp_shared_blocking_wait_peer_progress`; this test was simply never
+   converted.
+2. The failure line now carries the evidence that made §9.1 possible in two boots
+   rather than six: per-poller return value, latency from the write, phase,
+   scheduler state, pipe registration, and a `[THR-DUMP]`. A bounded 2 s probe
+   past the budget distinguishes *late* from *lost* — the single most useful bit,
+   and the one that ruled out every timing-tuning explanation immediately. The
+   verdict is still scored at the 100 ms budget; the probe only annotates it.
+
+### 9.4 The lesson that generalises
+
+A kernel-thread test that waits for work on another core must not busy-wait. The
+question to ask of any `while … { yield_now() }` in `src/process_tests.rs` is
+**"can the thing I am waiting for only happen on a peer core?"** If yes, the loop
+is a BKL freeze and the test is testing the scheduler, not its subject. There are
+~75 `yield_now()` sites in the boot suite; most wait on same-core work and are
+fine. This one was not, and it took three separate investigations to notice
+because the failure it produces is indistinguishable from scheduler jitter.
+
+Also: §8's "zero failures in 10" reasoning was sound about the mechanisms it had
+identified and wrong about the conclusion. It said so itself — "zero failures in
+10 does not by itself prove the mechanism is gone" — and then the doc got read as
+if it had. When a fix removes causes rather than symptoms, the honest claim is
+"these two are gone", not "the flake is gone".
+
+### 9.5 Verification
+
+Same configuration as §9's baseline (`SMP=4`, `disk.img`, `MEMORY=4096`,
+`INSTANCE=60`, one session), with the §9.3 fix:
+
+| arm | boots | `woken=1` failures | `[BKL] stuck` lines/boot |
+|---|---|---|---|
+| before (§9 baseline) | 17 | 2 | ~87, **129 / 132 on the two failures** |
+| after (§9.3) | 12 | 0 | 85-87, no outliers |
+
+Pass count 313/313 on every clean boot in both arms, so the change moves nothing
+else. The reason to believe it beyond the boot count is §9.2: the starver was
+identified, and it is gone by construction — the wait no longer holds the lock the
+straggler needs.
