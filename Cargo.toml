@@ -673,6 +673,10 @@ akuma-exec = { path = "crates/akuma-exec" }
 # The shared read-only file-page cache, extracted from `src/file_page_cache.rs`
 # 2026-09-01. `src/file_page_cache.rs` remains as a shim that supplies the
 # `src/config.rs` tunables and re-exports the rest.
+# Reached directly, not through `akuma_exec::bkl`: `src/smp_shared.rs` re-exports
+# `akuma_bkl::policy` (the BKL-drop toggles), and routing a policy module through
+# the exec crate that does not read it would be indirection for its own sake.
+akuma-bkl = { path = "crates/akuma-bkl" }
 akuma-fpcache = { path = "crates/akuma-fpcache" }
 akuma-kacho = { path = "crates/akuma-kacho" }
 # Physical memory manager: bitmap allocator, frame tracking, UAF quarantine,

@@ -7,6 +7,7 @@ name = "akuma"
 version = "0.0.7"
 dependencies = [
  "akuma-alloc",
+ "akuma-bkl",
  "akuma-boot",
  "akuma-cpu",
  "akuma-exec",
@@ -57,6 +58,7 @@ name = "akuma-bkl"
 version = "0.1.0"
 dependencies = [
  "akuma-primitives",
+ "akuma-syscalls-linux",
  "spinning_top",
 ]
 

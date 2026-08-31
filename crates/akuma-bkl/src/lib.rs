@@ -83,6 +83,8 @@
 
 extern crate alloc;
 
+/// The runtime BKL-drop toggles and the per-syscall opt-out bitmap.
+pub mod policy;
 pub mod bkl;
 pub mod sync;
 
