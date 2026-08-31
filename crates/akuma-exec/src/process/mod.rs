@@ -1198,6 +1198,87 @@ impl Drop for Process {
     }
 }
 
+/// Run `f` with exclusive `&mut Process` access to **the calling thread's own
+/// process** — the safe form of [`table::with_process_exclusive`].
+///
+/// That function's `# Safety` section has three clauses. Two of them are
+/// mechanical and are discharged here instead of being restated at a call site
+/// that can get them wrong:
+///
+/// - **"`pid` must be the calling thread's own process"** — resolved here from
+///   [`read_current_pid`], so there is no pid argument to pass incorrectly.
+/// - **"the call must be on a BKL-held path"** — checked against
+///   [`akuma_bkl::bkl::held_by_current`]. A caller without the BKL gets `None`
+///   rather than a `&mut` no peer core is excluded from.
+///
+/// # What is NOT proven
+///
+/// The third clause — *no other reference to this `Process` may be live on this
+/// thread across the call* — is a discipline, not a type-level proof. Nothing
+/// stops a caller nesting this inside another window. It rests on the call sites
+/// staying enumerated (currently one: `sys_execve`'s destructive window), which
+/// is the same basis on which [`Process::with_address_space`] is already a safe
+/// function in this crate. Treat a new call site as a change to that argument,
+/// not as ordinary use — and read `docs/archive/BKL_PHASE7_AUDIT.md` §5 first:
+/// Phase 7f owns converting this window properly.
+pub fn with_own_process_exclusive<T, F: FnOnce(&mut Process) -> T>(f: F) -> Option<T> {
+    let pid = read_current_pid()?;
+    if !akuma_bkl::bkl::held_by_current() {
+        crate::safe_print!(
+            128,
+            "[exec] with_own_process_exclusive without the BKL (pid={}) — refused\n",
+            pid
+        );
+        return None;
+    }
+    // SAFETY: `pid` is this thread's own process, resolved above rather than
+    // supplied; the BKL is held, which is what excludes every peer core's
+    // accessor for the closure's duration. The no-nesting clause is the caller
+    // discipline documented above.
+    unsafe { table::with_process_exclusive(pid, f) }
+}
+
+/// [`enter_user_mode`], with the one check that makes it safe to call.
+///
+/// `eret` returns to whatever exception level `SPSR_EL1.M[3:0]` names, so a
+/// context claiming `EL1h` turns this call into "jump to an arbitrary address
+/// **with kernel privilege**" — that, not the program counter, is what made the
+/// raw form `unsafe`. A context that targets EL0 can only misbehave in
+/// userspace, where a bad PC or SP faults the process and nothing else.
+///
+/// Every context this kernel builds sets `spsr = 0` (EL0t), so the check costs
+/// one compare on a path taken once per exec.
+///
+/// A context that fails it does not return either: by the time execve reaches
+/// here the old image is already gone, so there is nothing to fall back to. It
+/// halts the core with the offending value named, the same choice
+/// `akuma_primitives::preempt::current_tid` makes for a corrupt `TPIDRRO_EL0`.
+#[cfg(target_os = "none")]
+pub fn enter_user_mode_checked(ctx: &UserContext) -> ! {
+    const SPSR_M_MASK: u64 = 0b1111;
+    const SPSR_M_EL0T: u64 = 0b0000;
+    if ctx.spsr & SPSR_M_MASK != SPSR_M_EL0T {
+        crate::safe_print!(
+            192,
+            "[FATAL] enter_user_mode_checked: spsr={:#x} does not target EL0 (M={:#x})\n\
+             Refusing to eret — this would return with kernel privilege.\n",
+            ctx.spsr,
+            ctx.spsr & SPSR_M_MASK
+        );
+        loop {
+            akuma_cpu::park::wfi();
+        }
+    }
+    // SAFETY: the context targets EL0, checked above. An EL0 context cannot
+    // return into the kernel; a bad PC/SP inside it faults the process.
+    unsafe { enter_user_mode(ctx) }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn enter_user_mode_checked(_ctx: &UserContext) -> ! {
+    panic!("enter_user_mode_checked on a host build")
+}
+
 /// Enter user mode with the given context
 ///
 /// This sets up the CPU state and performs an ERET to EL0.

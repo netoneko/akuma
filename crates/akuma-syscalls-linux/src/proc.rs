@@ -286,3 +286,18 @@ mod tests {
         assert_eq!(wait_options::WNOHANG & wait_options::WNOWAIT, 0);
     }
 }
+
+/// `sched_getaffinity(2)` / `sched_setaffinity(2)` write the CPU mask as an array
+/// of `unsigned long`, so one word covers 64 CPUs.
+///
+/// Akuma's SMP scope is at most 64 cores, so exactly one word is ever written and
+/// the syscall returns `min(cpusetsize, CPU_SET_WORD_BYTES)`. That return value is
+/// load-bearing rather than cosmetic: musl's wrapper zeroes the remainder of the
+/// caller's buffer from it (`if (r < size) memset(mask+r, 0, size-r)`), so
+/// returning 0 makes musl wipe the whole mask and `nproc` reports no CPUs at all.
+pub const CPU_SET_WORD_BYTES: usize = core::mem::size_of::<u64>();
+
+/// The most CPUs one [`CPU_SET_WORD_BYTES`] word can describe.
+pub const CPU_SET_BITS_PER_WORD: usize = CPU_SET_WORD_BYTES * 8;
+
+const _: () = assert!(CPU_SET_BITS_PER_WORD == 64);

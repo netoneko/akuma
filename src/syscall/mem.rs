@@ -187,15 +187,22 @@ pub(super) fn is_shared_file_mapping(tgid: u32, uaddr: usize) -> bool {
 pub fn writeback_shared_pages(path: &str, file_offset: usize, len: usize, pas: &[usize]) -> usize {
     let mut off = file_offset;
     let mut written = 0usize;
+    // One page-sized staging buffer for the whole call, not one per page: the loop
+    // below runs once per 4 KB of a mapping that can be hundreds of megabytes, so a
+    // per-iteration allocation would be an allocation per page on the exit path —
+    // exactly where the allocator is least likely to be healthy.
+    let mut page = alloc::vec![0u8; 4096];
     for (i, &pa) in pas.iter().enumerate() {
         let chunk = core::cmp::min(4096, len.saturating_sub(i * 4096));
         if chunk == 0 { break; }
-        let kva = akuma_exec::mmu::phys_to_virt(pa).cast_const();
-        // SAFETY: `pas` are the resident frames of a MAP_SHARED region the caller
-        // still owns, so each is live for this read; `chunk <= 4096` is one page.
-        // Shared with the mapping process by design — this is the write-back read.
-        let buf = unsafe { core::slice::from_raw_parts(kva, chunk) };
-        match crate::fs::write_at(path, off, buf) {
+        // Snapshot the frame, then write the snapshot. The frame is still mapped
+        // writable in the process, so userspace may be storing into it as we read;
+        // that is inherent to writing a MAP_SHARED mapping back and is why this
+        // takes a copy rather than handing `write_at` a view of live user memory.
+        if !akuma_exec::mmu::copy_from_phys(pa, &mut page[..chunk]) {
+            break; // `pa` is not PMM-managed RAM — a corrupt mapping record
+        }
+        match crate::fs::write_at(path, off, &page[..chunk]) {
             Ok(n) => { written += n; off += n; }
             Err(_) => break,
         }
@@ -567,16 +574,21 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             let _vfs_window = super::fs::VfsBklGuard::new();
             let mut file_off = offset;
             let mut bytes_read = 0usize;
+            // One staging page for the whole fill, allocated outside the loop — see
+            // `writeback_shared_pages` for why this is not per-iteration.
+            let mut fill_buf = alloc::vec![0u8; 4096];
             for (i, frame) in frame_batch.iter().enumerate() {
                 let chunk = core::cmp::min(4096, len.saturating_sub(i * 4096));
                 if chunk == 0 { break; }
-                let page_kva = akuma_exec::mmu::phys_to_virt(frame.addr);
-                // SAFETY: `frame` was just allocated from the PMM by this call and is
-                // not yet installed in any page table, so this kernel-identity-map
-                // alias is the only live reference to it. `chunk <= 4096` is one page.
-                let page_buf = unsafe { core::slice::from_raw_parts_mut(page_kva, chunk) };
+                // Read into the staging buffer, then publish into the frame. The
+                // frame is freshly allocated and not yet in any page table, so
+                // nothing can observe the intermediate state.
+                let page_buf = &mut fill_buf[..chunk];
                 match crate::fs::read_at(&path, file_off, page_buf) {
                     Ok(n) => {
+                        if !akuma_exec::mmu::copy_to_phys(frame.addr, &fill_buf[..n]) {
+                            break; // the PMM just handed us this frame; cannot happen
+                        }
                         bytes_read += n;
                         file_off += n;
                         if n < chunk { break; }

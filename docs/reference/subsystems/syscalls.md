@@ -27,6 +27,36 @@ x0. Entry: EL0 sync exception → `src/exceptions.rs` → `handle_syscall`
 3. **Rump interception first:** `rump_proxy::intercept_box_syscall(syscall_num, args)` (`mod.rs:650`). If the current process is in a rump box and the syscall is socket-family (or operates on a rump-owned fd), it is forwarded to the box's `rump_server`. AF_UNIX socketpairs (nr 199) are excluded — always native.
 4. **Native dispatch:** a big `match syscall_num` (`mod.rs:656`). Unknown → `ENOSYS` (-38) + `[ENOSYS] nr=NNN` log line (decode against the asm-generic table).
 
+## `src/syscall/` forbids `unsafe`
+
+`src/syscall/mod.rs` carries `#![forbid(unsafe_code)]` (2026-08-31), which
+applies to every submodule in the table below. It is the first enforced ban
+outside `crates/` — a bin crate cannot take one whole (`src/exceptions.rs` alone
+has 87 sites, and trap-frame work is the job there), but this is the subtree that
+runs with **userspace-controlled arguments on every call**.
+
+**If you are adding a syscall and need a raw pointer, a page-table edit, or a
+system-register write, do not reach for `#[allow(unsafe_code)]` — `forbid`
+refuses it, deliberately.** Put the operation behind a named function in the
+crate that owns the thing it pokes, and state the obligation there. What already
+exists, and is very likely what you want:
+
+| you need to | call |
+|---|---|
+| read/write user memory | `copy_from_user` / `copy_to_user` / `write_user_val` / `read_user_into` — the folded API, re-exported from `mod.rs` |
+| read a NUL-terminated user string of unknown length | `copy_from_user_str`, or `read_user_byte` for one byte |
+| map a page into the caller's address space | `Process::with_address_space` + `UserAddressSpace::map_user_page_tracked{,_no_flush}` — it tracks the frames and refuses a VA that is not this address space's |
+| read or write a physical frame's bytes | `akuma_mmu::copy_from_phys` / `copy_to_phys` — bounds-checked against PMM-managed RAM |
+| set userspace's TLS base | `akuma_cpu::sysreg::set_tpidr_el0` |
+| eret into a user context | `akuma_exec::process::enter_user_mode_checked` |
+
+The ban means no `unsafe` is written here; it does not mean the layer is proven
+sound. One of the moved wrappers — `with_own_process_exclusive`, used by
+`execve`'s destructive window — discharges two of its three safety clauses and
+rests on staying the single enumerated call site for the third. **Adding a second
+caller of it is a change to that argument, not ordinary use.** Full accounting:
+[`archive/SYSCALL_UNSAFE_CLEANUP.md`](../../archive/SYSCALL_UNSAFE_CLEANUP.md).
+
 ## The `src/syscall/` split
 
 `src/syscall/mod.rs` is the dispatcher; per-family logic lives in submodules.

@@ -3037,21 +3037,21 @@ pub(super) fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
     let mut written = 0;
     let mut count = 0usize;
     for entry in entries.iter().skip(position) {
-        let reclen = (19 + entry.name.len() + 1 + 7) & !7;
+        let reclen = akuma_syscalls_linux::dirent::reclen(entry.name.len());
         if written + reclen > size { break; }
-        // `struct linux_dirent64`: d_ino(8) d_off(8) d_reclen(2) d_type(1) d_name[].
-        // Written through the slice rather than a raw cursor — `kernel_buf` is a
-        // `Vec<u8>` with no u64 alignment, and the record is bounds-checked against
-        // `size` by the `break` above. The trailing pad to `reclen` is already zero
-        // from `vec![0u8; size]`.
-        let name_end = 19 + entry.name.len();
-        let rec = &mut kernel_buf[written..written + reclen];
-        rec[0..8].copy_from_slice(&1u64.to_ne_bytes());
-        rec[8..16].copy_from_slice(&1u64.to_ne_bytes());
-        rec[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
-        rec[18] = entry.d_type;
-        rec[19..name_end].copy_from_slice(entry.name.as_bytes());
-        rec[name_end] = 0;
+        // The record layout — offsets, the 8-byte `d_reclen` rounding, the NUL and
+        // the pad — lives in the ABI crate with host tests, not as five bare
+        // literals here. `d_ino`/`d_off` are both 1: Akuma reports no real inode
+        // number through getdents64, and nothing seeks a directory by `d_off`.
+        let ok = akuma_syscalls_linux::dirent::encode(
+            &mut kernel_buf[written..written + reclen],
+            1,
+            1,
+            entry.d_type,
+            entry.name.as_bytes(),
+        );
+        debug_assert!(ok, "dirent::reclen and dirent::encode disagree on the record size");
+        if !ok { break; }
         written += reclen;
         count += 1;
     }

@@ -15,17 +15,34 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   comparator and read-only system registers — behind safe `#[inline(always)]`
   functions. `asm!` is unconditionally `unsafe`, so a `dsb ish` used to need the
   same ceremony as an `msr ttbr0_el1`; the tree was migrated onto it 2026-08-31
-  and **218 `asm!` sites outside it became 35** (`docs/archive/INLINE_ASM_CLEANUP.md`).
+  and **218 `asm!` sites outside it became 35** (`docs/archive/INLINE_ASM_CLEANUP.md`),
+  then 34 (below).
   **Never open-code one of those instructions again.** What is deliberately
-  absent: writes to `ttbr0_el1`/`elr_el1`/`vbar_el1`/`tpidr*`, `mov sp,x`,
-  `dc zva`, raw `ldr`/`str` and the GIC `ICC_*` writes stay `unsafe` at their
-  call site. Reading `TTBR0_EL1` is in the crate; writing it is not, and that
-  asymmetry is the design. To time a code path use
+  absent: writes to `ttbr0_el1`/`elr_el1`/`vbar_el1`/`tpidr_el1`/`tpidrro_el0`,
+  `mov sp,x`, `dc zva`, raw `ldr`/`str` and the GIC `ICC_*` writes stay `unsafe`
+  at their call site. Reading `TTBR0_EL1` is in the crate; writing it is not, and
+  that asymmetry is the design. The list read `tpidr*` until 2026-08-31; the
+  wildcard was wrong. `TPIDRRO_EL0` holds the thread id that `current_tid`
+  indexes every per-slot static with, and `TPIDR_EL1` is the kernel's own
+  per-thread base — writes to either re-point state the kernel *dereferences*.
+  `TPIDR_EL0` is userspace's TLS base, read in exactly one place in the tree (to
+  save it into the trap frame) and never dereferenced, so a garbage value can
+  only fault EL0's own accesses; it moved **into** the crate as
+  `sysreg::set_tpidr_el0` (`docs/archive/SYSCALL_UNSAFE_CLEANUP.md` §6). To time a code path use
   `sysreg::cntvct_el0_ordered()` — a bare counter read is unordered against the
   work it measures and once made an 8 KB copy measure as 0 ns.
   **22 of the 32 carry `#![forbid(unsafe_code)]`** — which crates, and why the
   other ten cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
   with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).
+  **`src/syscall/` carries the ban too** (2026-08-31), as a module attribute in
+  its `mod.rs` — the first one outside `crates/`, and the reason the crate tally
+  and the ban tally differ. It went 17 `unsafe` blocks to 0: the genuinely-unsafe
+  operations moved into `akuma-cpu`/`akuma-mmu`/`akuma-pmm`/`akuma-exec`, three
+  of them gaining a real runtime check on the way. **Do not reach for
+  `#[allow(unsafe_code)]` there** — `forbid` cannot be switched off locally,
+  which is the point; put the operation behind a named function in the crate that
+  owns what it pokes, and state the obligation there
+  (`docs/archive/SYSCALL_UNSAFE_CLEANUP.md`).
   The **syscall family** is three layers, leaf-first and named so the
   layering is visible — an ABI crate, a shape crate, and one crate per syscall
   family (four of those so far): `akuma-syscalls-linux` is the ABI (numbers, `repr(C)`

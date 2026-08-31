@@ -37,7 +37,7 @@ safe argument, and it is why these are safe *functions*, not `unsafe fn`s with a
 | `msr ttbr0_el1` | swaps the address space under live pointers |
 | `msr elr_el1` / `spsr_el1` | redirects where the CPU returns to (resolve-and-retry) |
 | `msr vbar_el1` | installs the vector table |
-| `msr tpidr_el1` / `tpidrro_el0` / `tpidr_el0` | re-points every per-thread static, or userspace's whole TLS |
+| `msr tpidr_el1` / `tpidrro_el0` | re-points every per-thread static: the kernel's own per-thread base, and the thread id `current_tid` indexes every per-slot static with |
 | `mov sp, x`, `mov x30, x` | retarget every later stack access, and the next `ret` |
 | `dc zva` | unlike every other `dc`, it **writes** the block it names |
 | raw `ldr` / `str` (device MMIO) | a real dereference of a caller-supplied address |
@@ -50,6 +50,30 @@ documents for `TPIDRRO_EL0`: reading moves, writing does not.
 
 The 35 remaining sites are exactly this table. Nothing was left behind by
 oversight — the count is the exclusion list.
+
+### Correction, 2026-08-31: `tpidr_el0` was on the wrong row
+
+The row above originally read `msr tpidr_el1` / `tpidrro_el0` / **`tpidr_el0`**,
+justified as *"re-points every per-thread static, **or** userspace's whole TLS"*.
+Those are two different arguments bundled into one sentence, and only the first
+is about soundness:
+
+- **`TPIDRRO_EL0`** holds the thread id — `akuma_primitives::preempt::current_tid`
+  indexes every per-slot static in the kernel with it and halts the core if it is
+  out of range. **`TPIDR_EL1`** is the kernel's own per-thread base. Writes to
+  either re-point kernel state the kernel then *dereferences*. Both stay here.
+- **`TPIDR_EL0`** is opaque userspace state to this kernel: read in exactly one
+  place in the tree (`src/exceptions.rs`, to save it into the trap frame), never
+  dereferenced and never indexed with. A garbage value faults EL0's own TLS
+  accesses, in userspace, contained to the process that asked for it. That is a
+  blast-radius argument, not a memory-safety one, and the crate's admission test
+  is "safe to execute".
+
+It moved into the crate as `sysreg::set_tpidr_el0`, beside the reader that was
+already there, when `src/syscall/` went to zero `unsafe`
+([`SYSCALL_UNSAFE_CLEANUP.md`](SYSCALL_UNSAFE_CLEANUP.md) §6). The exclusion
+count is now **34**, and `CLAUDE.md`'s copy of the list was corrected to match —
+its `tpidr*` wildcard read as if all three registers were one rule.
 
 ## 3. The two judgment calls
 

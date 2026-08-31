@@ -85,15 +85,7 @@ pub fn encode_wait_status(code: i32) -> u32 {
 }
 
 pub(super) fn sys_set_tpidr_el0(address: u64) -> u64 {
-    // SAFETY: `tpidr_el0` is the userspace TLS base — architecturally a scratch
-    // register EL1 never reads, so any value is well-defined here and a bad one
-    // can only fault the caller's own EL0 TLS accesses. Deliberately NOT in
-    // `akuma-cpu`: that crate holds only instructions safe to execute, and
-    // `tpidr*` writes are named in its exclusion list. The `isb` makes the new
-    // base visible before the `eret` back to EL0.
-    unsafe {
-        core::arch::asm!("msr tpidr_el0, {}", "isb", in(reg) address);
-    }
+    akuma_cpu::sysreg::set_tpidr_el0(address);
     0
 }
 
@@ -801,10 +793,6 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         return exec_shebang(resolved_path, data, args, env);
     }
 
-    let cur_pid = match akuma_exec::process::current_pid() {
-        Some(p) => p,
-        None => return ESRCH,
-    };
 
     // On the size profile file_data only holds the 256-byte shebang probe —
     // always use replace_image_from_path for the actual ELF load.
@@ -825,12 +813,13 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         0
     };
 
-    // SAFETY: `cur_pid` is the calling thread's own process on the BKL-held
-    // execve path; `replace_image*` is the destructive window that stays
-    // `&mut`-exclusive (Phase 7f owns converting it). No other Process
-    // reference is live on this thread.
-    let ret = unsafe {
-        akuma_exec::process::with_process_exclusive(cur_pid, move |proc| {
+    // The destructive window. `with_own_process_exclusive` resolves the pid from
+    // this thread itself and checks the BKL, so the two mechanical clauses of
+    // `with_process_exclusive`'s contract are discharged in the crate that owns
+    // `Process` rather than asserted here; the no-nesting clause is why this stays
+    // the one enumerated call site (Phase 7f owns converting the window itself).
+    let ret = {
+        akuma_exec::process::with_own_process_exclusive(move |proc| {
     let replace_result = if let Some(data) = file_data.take() {
         let r = proc.replace_image(&data, &args, &env);
         // Free the whole-file image buffer HERE, success or failure. The
@@ -909,8 +898,9 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
 
     proc.address_space.activate();
 
-    // Never returns (lexically inside the `with_process_exclusive` unsafe block).
-    akuma_exec::process::enter_user_mode(&proc.context);
+    // Never returns. The `_checked` form refuses a context whose SPSR does not
+    // target EL0, which is what let the raw one be `unsafe`.
+    akuma_exec::process::enter_user_mode_checked(&proc.context);
         })
     };
     // `None` means the process vanished between `current_pid` and the lookup;

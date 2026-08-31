@@ -1051,6 +1051,62 @@ pub fn shared_l0_stats() -> (usize, usize, usize) {
     })
 }
 
+/// Copy `dst.len()` bytes **out of** the physical frame at `pa`.
+///
+/// Safe because the range is checked against the RAM the PMM manages
+/// ([`akuma_pmm::contains`]) before anything is dereferenced: an arbitrary
+/// `usize` either lands in real RAM or is refused with `false`. That check is
+/// what the `phys_to_virt` + `slice::from_raw_parts` idiom at the call sites
+/// never had.
+///
+/// # What this does not promise
+///
+/// A *snapshot*, not a stable view. If the frame is also mapped writable into a
+/// live address space — which is exactly the case for `MAP_SHARED` write-back —
+/// userspace may be storing into it while this runs, so individual bytes may be
+/// pre- or post-store. That is inherent to writing a shared mapping back to disk
+/// and is what Linux's own write-back does; the improvement over the old code is
+/// that this no longer hands the compiler a `&[u8]` it is entitled to assume is
+/// unchanging.
+#[must_use]
+pub fn copy_from_phys(pa: usize, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    if !akuma_pmm::contains(pa, dst.len()) {
+        return false;
+    }
+    // SAFETY: the whole range is inside PMM-managed RAM, which is identity-mapped
+    // and readable; `dst` is a live exclusive slice and cannot overlap it (it is
+    // kernel heap or stack, never a raw frame view).
+    unsafe {
+        core::ptr::copy_nonoverlapping(phys_to_virt(pa).cast_const(), dst.as_mut_ptr(), dst.len());
+    }
+    true
+}
+
+/// Copy `src` **into** the physical frame at `pa`. The mirror of
+/// [`copy_from_phys`], with the same bounds check.
+///
+/// Intended for a frame the caller has just allocated and not yet mapped, where
+/// there is no other reference to race with. Writing into a frame that *is*
+/// mapped elsewhere will be seen by whoever has it, which is occasionally the
+/// point and otherwise a bug.
+#[must_use]
+pub fn copy_to_phys(pa: usize, src: &[u8]) -> bool {
+    if src.is_empty() {
+        return true;
+    }
+    if !akuma_pmm::contains(pa, src.len()) {
+        return false;
+    }
+    // SAFETY: as `copy_from_phys`, with the roles reversed.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), phys_to_virt(pa), src.len());
+    }
+    true
+}
+
 pub struct UserAddressSpace {
     l0_frame: PhysFrame,
     page_table_frames: Spinlock<Vec<PhysFrame>>,

@@ -1804,6 +1804,8 @@ pub fn init(ram_base: usize, ram_size: usize, kernel_end: usize) {
 
     TOTAL_PAGES.store(pmm.total_pages, Ordering::Release);
     ALLOCATED_PAGES.store(pmm.total_pages - pmm.free_pages, Ordering::Release);
+    MANAGED_BASE.store(pmm.base_addr, Ordering::Release);
+    MANAGED_END.store(pmm.base_addr + pmm.total_pages * PAGE_SIZE, Ordering::Release);
 
     if config().cow_ref_ledger {
         let words = pmm.total_pages.div_ceil(64);
@@ -1942,6 +1944,40 @@ pub fn stats() -> (usize, usize, usize) {
 pub fn free_count() -> usize {
     let (total, allocated, _) = stats();
     total.saturating_sub(allocated)
+}
+
+/// Physical bounds of the RAM this PMM manages, as `[base, end)`.
+///
+/// `(0, 0)` before [`init`], which makes [`contains`] answer `false` for
+/// everything rather than accidentally vouching for an address during boot.
+static MANAGED_BASE: AtomicUsize = AtomicUsize::new(0);
+static MANAGED_END: AtomicUsize = AtomicUsize::new(0);
+
+/// Physical address range this PMM manages, as `[base, end)`.
+#[must_use]
+pub fn managed_range() -> (usize, usize) {
+    (
+        MANAGED_BASE.load(Ordering::Acquire),
+        MANAGED_END.load(Ordering::Acquire),
+    )
+}
+
+/// Does `[pa, pa + len)` lie entirely inside the RAM this PMM manages?
+///
+/// The bounds check behind the safe physical-memory copies in `akuma-mmu`: it is
+/// what lets a caller pass an arbitrary `usize` without being able to reach
+/// device MMIO, the kernel image, or nothing at all. Says `false` before
+/// [`init`], and on any wrap.
+#[must_use]
+pub fn contains(pa: usize, len: usize) -> bool {
+    let (base, end) = managed_range();
+    if base == 0 && end == 0 {
+        return false;
+    }
+    match pa.checked_add(len) {
+        Some(last) => pa >= base && last <= end,
+        None => false,
+    }
 }
 
 #[must_use]

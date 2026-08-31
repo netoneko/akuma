@@ -72,6 +72,7 @@
 //! architecture is not planned, and gating them would mean the host test run —
 //! the only place they are ever checked — skipped all of them.
 
+pub mod dirent;
 pub mod flags;
 pub mod io;
 pub mod net;

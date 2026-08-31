@@ -2,6 +2,42 @@
 //!
 //! Implements the syscall interface for user programs.
 //! Uses Linux-compatible ABI: syscall number in x8, arguments in x0-x5.
+//!
+//! # This module forbids `unsafe`
+//!
+//! `src/syscall/` went from 17 `unsafe` blocks to 0 on 2026-08-31, and the ban
+//! below is what keeps it there. The bin crate as a whole can never be
+//! `forbid`-enforced — `exceptions.rs` alone has 87 sites, and page-table and
+//! trap-frame work is the job — but *this* subtree is the one that runs with
+//! userspace-controlled arguments on every call, so it is the subtree where a
+//! stray `unsafe` is worth a compile error.
+//!
+//! `forbid`, not `deny`: `deny` can be switched back off by a module-local
+//! `#[allow(unsafe_code)]`, which is exactly the move that would erode this.
+//!
+//! **What the ban does and does not mean.** It means no `unsafe` is written
+//! *here*. It does not mean the syscall layer is proven sound: the operations
+//! that were genuinely unsafe still are, they now live behind named functions in
+//! the crate that owns the thing being poked, where the obligation is stated once
+//! and discharged once instead of at each call site:
+//!
+//! | was, here | is, there |
+//! |---|---|
+//! | `copy_from_user_safe` byte loop | `akuma_exec::process::user_access::read_user_byte` |
+//! | `map_user_page` + hand-rolled frame tracking | `UserAddressSpace::map_user_page_tracked` |
+//! | `phys_to_virt` + `slice::from_raw_parts` | `akuma_mmu::copy_from_phys` / `copy_to_phys` |
+//! | `msr tpidr_el0` | `akuma_cpu::sysreg::set_tpidr_el0` |
+//! | `with_process_exclusive(pid, …)` | `akuma_exec::process::with_own_process_exclusive` |
+//! | `enter_user_mode` | `akuma_exec::process::enter_user_mode_checked` |
+//!
+//! Three of those became genuinely checkable in the move (a PMM-range bounds
+//! check, an installed-TTBR0 check, an SPSR-targets-EL0 check). One did not:
+//! `with_own_process_exclusive` discharges two of its three clauses and rests on
+//! the call site staying enumerated for the third — see its doc comment. Adding a
+//! second caller of it is a change to that argument.
+//!
+//! Full record: `docs/archive/SYSCALL_UNSAFE_CLEANUP.md`.
+#![forbid(unsafe_code)]
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -22,6 +58,7 @@ pub use akuma_exec::process::user_access::{
 // hooks run, and where the epilogue's identity comes from. Decisions only — see
 // `EXCURSION_HOOKS` and docs/archive/AKUMA_EXTRACT_SYSCALLS.md §7.
 use akuma_syscalls::Counter;
+use akuma_syscalls_linux::proc::{CPU_SET_BITS_PER_WORD, CPU_SET_WORD_BYTES};
 
 #[cfg(feature = "sc-aio")]
 mod aio;
@@ -877,7 +914,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SCHED_GETAFFINITY => {
             let mask_ptr = args[2] as usize;
             let cpusetsize = args[1] as usize;
-            if cpusetsize >= 8 && validate_user_ptr(mask_ptr as u64, cpusetsize) {
+            if cpusetsize >= CPU_SET_WORD_BYTES && validate_user_ptr(mask_ptr as u64, cpusetsize) {
                 let mut kernel_mask = alloc::vec![0u8; cpusetsize];
                 // CPUs the process may run on. On the real shared-kernel SMP
                 // build that is the DTB-reported core count (BSP + secondaries,
@@ -889,11 +926,16 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 let nr_cpus: usize = crate::smp_shared::probed_core_count();
                 #[cfg(not(kernel_smp_shared))]
                 let nr_cpus: usize = 1;
-                let mask: u64 = if nr_cpus >= 64 { u64::MAX } else { (1u64 << nr_cpus).wrapping_sub(1) };
+                let mask: u64 = if nr_cpus >= CPU_SET_BITS_PER_WORD {
+                    u64::MAX
+                } else {
+                    (1u64 << nr_cpus).wrapping_sub(1)
+                };
                 // `kernel_mask` is a `Vec<u8>` (1-aligned), so the old
                 // `ptr::write` through a `cast::<u64>()` was an aligned write to an
-                // unaligned pointer. `cpusetsize >= 8` is checked above.
-                kernel_mask[..8].copy_from_slice(&mask.to_ne_bytes());
+                // unaligned pointer. The `>= CPU_SET_WORD_BYTES` guard above is what
+                // makes this slice in bounds.
+                kernel_mask[..CPU_SET_WORD_BYTES].copy_from_slice(&mask.to_ne_bytes());
                 let _ = copy_to_user(mask_ptr as u64, &kernel_mask);
                 // Linux returns the number of bytes placed in the mask, and
                 // musl's `sched_getaffinity` wrapper zeroes the remainder based
@@ -901,7 +943,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 // Returning 0 made musl wipe the whole buffer, so `busybox
                 // nproc`/cargo saw 0 CPUs and fell back to 1. The mask fits in
                 // one u64 (≤64 CPUs; Akuma's SMP scope), so we wrote 8 bytes.
-                cpusetsize.min(8) as u64
+                cpusetsize.min(CPU_SET_WORD_BYTES) as u64
             } else {
                 0
             }

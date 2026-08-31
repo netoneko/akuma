@@ -261,12 +261,18 @@ The fire windows were late Feb–Mar 2026 (syscall-gap crisis) and Jun 2026
 | Drivers (GIC, timers, block, fw_cfg) | [`reference/subsystems/drivers/`](reference/subsystems/drivers/) | B / B / A / A |
 | Exceptions (vector table, trap frame, ESR_EL1) | [`reference/subsystems/exceptions.md`](reference/subsystems/exceptions.md) | **C** |
 | `akuma-primitives` (the dependency-free leaf: `OnceCopy`, `safe_print!`, all DAIF, `PreemptGuard`, phys/virt) | [`reference/subsystems/primitives.md`](reference/subsystems/primitives.md) | A |
+| Where `unsafe` is allowed to live (which crates forbid it, and the one enforced subtree in `src/`) | [`reference/crate-safety.md`](reference/crate-safety.md) | A |
 | `akuma-firecracker` (the machine description read from the FDT at run time: RAM, GIC distributor/redistributor, console, virtio slots) | crate docs — `crates/akuma-firecracker/src/lib.rs`. Measured fixtures from **both** machines: [`reference/firecracker/fdt/`](reference/firecracker/fdt/) (Firecracker) and `crates/akuma-firecracker/fixtures/` (QEMU virt). Not yet wired into the kernel; `src/platform.rs` still holds the literals | A |
 
 Syscalls / Linux ABI now has 17 per-family docs under
 [`reference/subsystems/syscalls/`](reference/subsystems/syscalls/) — grades
 vary per family; `mem`, `net`, `signal`, `sync` are **C** (active risk,
-touched in the Jun 2026 crisis).
+touched in the Jun 2026 crisis). `src/syscall/` itself carries
+`#![forbid(unsafe_code)]` since 2026-08-31 — if you are adding a syscall and
+reach for `unsafe`, read
+[`archive/SYSCALL_UNSAFE_CLEANUP.md`](archive/SYSCALL_UNSAFE_CLEANUP.md) §1
+first: the operation belongs behind a named function in the crate that owns what
+it pokes, not behind a local `#[allow]` (which `forbid` refuses anyway).
 
 **Still undocumented (deferred gap list):** audio (`src/audio.rs`) and the
 framebuffer device itself (`src/ramfb.rs` — distinct from the `fb.rs` syscall

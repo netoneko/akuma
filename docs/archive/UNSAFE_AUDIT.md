@@ -6,7 +6,27 @@ Userspace (`userspace/`) is out of scope.
 **Question:** where can `unsafe` be replaced with a safe alternative, what should be
 done first, and how much `unsafe` is there.
 
-Nothing in this document has been applied. It is a work list.
+Nothing in this document had been applied when it was written. It is a work
+list, and parts of it have since landed — each marked in place. **Do not read a
+finding here as describing current code without checking its status line.**
+
+Landed so far:
+
+- §P0 (the user-copy wrapper) — see §4.0 and §4.0a below.
+- §P1 (`#[repr(C)]` structs instead of hand-offset byte writes) — the
+  `getdents64` record builder, 2026-08-31, as `akuma_syscalls_linux::dirent`.
+- **`src/syscall/` reached zero `unsafe` and took `#![forbid(unsafe_code)]`**
+  on 2026-08-31 — 17 blocks to 0, the first enforced ban outside `crates/`.
+  Full record: [`SYSCALL_UNSAFE_CLEANUP.md`](SYSCALL_UNSAFE_CLEANUP.md). Note
+  what that does *not* mean: the operations moved into the crates that own what
+  they poke rather than disappearing, so §6's "irreducible core" is unchanged and
+  the tree-wide count fell by 11, not 17.
+
+The headline stats in §2 are from 2026-08-12 and are now badly stale (they read
+879 sites tree-wide; the 2026-08-31 count is 533). For current numbers use
+`python3 scripts/cloc_akuma.py src crates`, which
+[`crate-safety.md`](../reference/crate-safety.md) tracks — never the table
+below.
 
 ---
 
@@ -275,6 +295,16 @@ correctly where a range exclusion would not. Rationale and the rest:
 [`USER_COPY_FOLD.md`](USER_COPY_FOLD.md) §7.
 
 ### P1 — `#[repr(C)]` structs instead of hand-offset byte writes: 3 blocks, 281 unsafe ops
+
+> **PARTLY LANDED 2026-08-31.** The `getdents64` record builder is done, as
+> `akuma_syscalls_linux::dirent` (offsets + `reclen()` + `encode()`, host-tested).
+> It is **not** a `#[repr(C)]` struct, and the reason is worth keeping: the
+> natural header `{u64, i64, u16, u8}` measures 24 bytes because C pads a struct
+> to its own alignment, but `d_name` starts at **19**. A struct write would
+> clobber the first five bytes of every filename. Where a record's header is not
+> a whole number of its own alignment, this finding's advice is wrong — use named
+> offsets and an encoder. See
+> [`SYSCALL_UNSAFE_CLEANUP.md`](SYSCALL_UNSAFE_CLEANUP.md) §3.
 
 > **DONE 2026-08-14** — all three blocks, plus the reader half this section did
 > not count (`do_rt_sigreturn`'s ~40 hand-offset reads). Full record:

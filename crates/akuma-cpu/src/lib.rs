@@ -33,8 +33,12 @@
 //! - `msr elr_el1` / `msr spsr_el1` — the resolve-and-retry mechanism; writing
 //!   these redirects where the CPU returns to.
 //! - `msr vbar_el1` — installs the vector table.
-//! - `msr tpidr_el1` / `tpidrro_el0` / `tpidr_el0` — re-points every per-thread
-//!   static, or every TLS access userspace makes.
+//! - `msr tpidr_el1` / `tpidrro_el0` — re-points every per-thread static: the
+//!   kernel's own per-thread base, and the thread id `current_tid` indexes every
+//!   per-slot static with. (`tpidr_el0` — userspace's TLS base, which the kernel
+//!   never reads through — moved *into* the crate as
+//!   [`sysreg::set_tpidr_el0`]; see its doc for why the three registers are not
+//!   one rule.)
 //! - `mov sp, x` and `mov x30, x` — retarget every later stack access, and the
 //!   next `ret`. Reading both is in [`reg`]; writing neither is.
 //! - `dc zva` — unlike every other `dc`, it **writes** the block it names.
@@ -589,10 +593,54 @@ pub mod sysreg {
         dczid_el0, "dczid_el0");
     read_only!(/// `SCTLR_EL1` — system control.
         sctlr_el1, "sctlr_el1");
-    read_only!(/// `TPIDR_EL0` — the thread pointer EL0 runs under. Reading is
-        /// safe; **writing is not** — it re-points every TLS access userspace
-        /// makes, which is why `sys_set_tid_address`'s `msr` is not here.
+    read_only!(/// `TPIDR_EL0` — the thread pointer EL0 runs under. Both halves
+        /// of this one are here; see [`set_tpidr_el0`].
         tpidr_el0, "tpidr_el0");
+
+    /// Set `TPIDR_EL0`, the thread pointer **EL0** runs under, and `isb` so the
+    /// new base is in effect before the `eret` back to userspace.
+    ///
+    /// # Why this write is in the crate when the other `msr`s are not
+    ///
+    /// The admission test is "safe to execute", and this one is. `TPIDR_EL0` is
+    /// opaque userspace state to this kernel: it is read in exactly one place in
+    /// the tree (`src/exceptions.rs`, to save it into the trap frame) and is
+    /// never dereferenced or indexed with. A garbage value faults EL0's own TLS
+    /// accesses — in userspace, contained to the process that asked for it — and
+    /// cannot touch kernel memory, translation, or privilege.
+    ///
+    /// **This does not generalise to its neighbours, and the difference is the
+    /// point.** `TPIDRRO_EL0` holds the *thread id*:
+    /// `akuma_primitives::preempt::current_tid` indexes every per-slot static in
+    /// the kernel with it and halts the core if it is out of range. `TPIDR_EL1`
+    /// is the kernel's own per-thread base. Writes to either re-point kernel
+    /// state the kernel then dereferences, so both stay `unsafe` at their call
+    /// site alongside `ttbr0_el1`/`vbar_el1`/`elr_el1`.
+    ///
+    /// Added 2026-08-31. `INLINE_ASM_CLEANUP.md` §2 had all three registers on
+    /// one exclusion row reading "re-points every per-thread static, **or**
+    /// userspace's whole TLS"; the first half is the soundness argument and
+    /// belongs to the other two, the second half is a blast-radius argument and
+    /// was never a reason to make the caller write `unsafe`.
+    #[inline(always)]
+    pub fn set_tpidr_el0(base: u64) {
+        #[cfg(target_os = "none")]
+        {
+            // SAFETY: writes a register the kernel never reads through. The `isb`
+            // orders it ahead of the return to EL0; `nomem` is accurate because no
+            // memory is touched by either instruction.
+            unsafe {
+                core::arch::asm!(
+                    "msr tpidr_el0, {}",
+                    "isb",
+                    in(reg) base,
+                    options(nomem, nostack)
+                );
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        let _ = base;
+    }
     read_only!(/// `FPCR` — floating-point control.
         fpcr, "fpcr");
 
