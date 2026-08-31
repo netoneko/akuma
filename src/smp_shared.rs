@@ -173,9 +173,9 @@ pub fn set_mm_bkl_drop_enabled(on: bool) {
 /// Runtime toggle (default **on**) for `no-bkl-drivers` (Phase 6 of
 /// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md) — drop the BKL for the
 /// device-driver syscall paths (`sys_getrandom`, `sys_read`/`sys_pread64` on
-/// `/dev/urandom`, `sys_write` on `/dev/dsp`, and the `sys_fb_*` framebuffer
-/// syscalls), relying on each driver's own fine-grained Spinlock — `RNG_DEVICE`,
-/// `SOUND_DEVICE`, `FB_STATE` — for cross-core mutual exclusion instead.
+/// `/dev/urandom`, and `sys_write` on `/dev/dsp`), relying on each driver's own
+/// fine-grained Spinlock — `RNG_DEVICE`, `SOUND_DEVICE` — for cross-core mutual
+/// exclusion instead.
 /// `DriverBklGuard` reads this at construct/drop time (latched, same discipline
 /// as `VfsBklGuard` / `MmBklGuard`) so an `smp-shared` boot with the feature
 /// compiled in can still A/B against the BKL-held path without a rebuild.

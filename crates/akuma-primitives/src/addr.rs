@@ -89,8 +89,11 @@ pub const DEV_GIC_DIST_SIZE: usize = 0x1_0000;
 pub const DEV_GIC_CPU_VA: usize = 0x80_0001_0000;
 /// PL011 UART — the console.
 pub const DEV_UART_VA: usize = 0x80_0001_1000;
-/// QEMU fw_cfg. Absent on Firecracker; the slot is simply left unmapped there.
-pub const DEV_FW_CFG_VA: usize = 0x80_0001_2000;
+// 0x80_0001_2000 is a HOLE. It was `DEV_FW_CFG_VA` (QEMU fw_cfg) until the
+// framebuffer path was removed 2026-08-31 — fw_cfg's only consumer was ramfb
+// (`docs/archive/FRAMEBUFFER_REMOVED.md`). The window is deliberately not
+// re-packed: these are just addresses in a 2 MB span, and shuffling them to
+// close a gap would churn every device for nothing. A new device may take it.
 /// GICv3 redistributor, CPU0 RD_base frame. `GICR_WAKER` lives here.
 ///
 /// One page is enough: every redistributor register this kernel touches
@@ -163,7 +166,6 @@ pub const DEV_WINDOW_SPANS: &[(usize, usize)] = &[
     (DEV_GIC_DIST_VA, DEV_GIC_DIST_SIZE),
     (DEV_GIC_CPU_VA, 0x1000),
     (DEV_UART_VA, 0x1000),
-    (DEV_FW_CFG_VA, 0x1000),
     (DEV_GICR_RD_VA, 0x1000),
     (DEV_GICR_SGI_VA, 0x1000),
     (DEV_VIRTIO_VA, DEV_VIRTIO_SIZE),

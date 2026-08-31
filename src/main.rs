@@ -50,11 +50,6 @@ mod daif_tests;
 // mod embassy_virtio_driver;
 mod exceptions;
 mod file_page_cache;
-// fw_cfg exists to configure ramfb, so it follows the framebuffer gate.
-// `kernel_framebuffer` is `sc-framebuffer` AND a machine that actually has an
-// fw_cfg device — Firecracker has none (build.rs).
-#[cfg(kernel_framebuffer)]
-mod fw_cfg;
 mod fs;
 #[cfg(kernel_tests)]
 mod fs_tests;
@@ -76,8 +71,6 @@ mod pmm;
 mod process_tests;
 #[cfg(kernel_tests)]
 mod pthread_tests;
-#[cfg(kernel_framebuffer)]
-mod ramfb;
 #[cfg(feature = "rump")]
 mod rump_proxy;
 #[cfg(all(
@@ -1029,20 +1022,6 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         Err(_e) => console::print("[SND] virtio-sound not available\n"),
     }
 
-    // =========================================================================
-    // Framebuffer initialization (ramfb via fw_cfg)
-    // =========================================================================
-    #[cfg(kernel_framebuffer)]
-    match ramfb::init(320, 200) {
-        Ok(()) => {
-            console::print("[ramfb] Framebuffer ready\n");
-        }
-        Err(e) => {
-            console::print("[ramfb] Not available: ");
-            console::print(e);
-            console::print("\n");
-        }
-    }
 
     // Initialize kernel timer (CNTV alarm queue for async timeouts)
     akuma_exec::alarms::init();

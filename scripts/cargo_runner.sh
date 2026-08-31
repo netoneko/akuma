@@ -184,8 +184,6 @@ esac
 #   - The default kernel build uses the GICv3 driver, which is why -machine virt
 #     carries gic-version=3 below; HVF only supports GICv3 anyway. A kernel built
 #     with --features gic-v2 needs gic-version=2 and will NOT run under HVF.
-#   - ramfb is dropped under HVF: its dirty-page tracking can trip QEMU's HVF
-#     data-abort path. -display none is already set, so it is unnecessary.
 HVF="${HVF:-auto}"
 use_hvf=0
 case "$HVF" in
@@ -201,8 +199,7 @@ esac
 
 if [ "$use_hvf" = "1" ]; then
   ACCEL_ARGS=(-accel hvf -cpu host)
-  FB_ARGS=()
-  echo "[cargo_runner] accelerator: HVF (-accel hvf -cpu host; ramfb disabled). HVF=0 to force TCG." >&2
+  echo "[cargo_runner] accelerator: HVF (-accel hvf -cpu host). HVF=0 to force TCG." >&2
 
   # HVF + a boot-test build + under 2 GB = `Assertion failed: (isv)` and QEMU
   # exits 134 before the suite finishes. `src/tests.rs`'s user-copy trampoline
@@ -234,7 +231,6 @@ if [ "$use_hvf" = "1" ]; then
   fi
 else
   ACCEL_ARGS=(-accel tcg -cpu max)
-  FB_ARGS=(-device ramfb)
   echo "[cargo_runner] accelerator: TCG (software emulation)." >&2
 fi
 
@@ -314,7 +310,6 @@ QEMU_ARGS=(
   -device virtio-rng-device,bus=virtio-mmio-bus.2
   "${RUMP_NIC_ARGS[@]}"
   "${DISK2_ARGS[@]}"
-  "${FB_ARGS[@]}"
   "${SOUND_ARGS[@]}"
   "${DROPOFF_ARGS[@]}"
   "${ACTION_ARGS[@]}"

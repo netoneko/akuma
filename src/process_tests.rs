@@ -1008,13 +1008,8 @@ pub fn run_all_tests() {
     // real guarded path, plus the runtime kill switch.
     test_drivers_bkl_drop();
 
-    // ramfb's wire marshalling and `draw`'s bounds — the two things that stopped
-    // being spelled with raw pointers.
-    #[cfg(kernel_framebuffer)]
-    test_ramfb_wire_and_draw();
-
     // Device drivers must not be compiled for hardware this machine does not
-    // have — the invariant behind `kernel_framebuffer` / `kernel_audio`.
+    // have — the invariant behind `kernel_audio`.
     test_platform_device_gates();
     test_gicr_device_map();
 
@@ -5007,41 +5002,45 @@ fn test_mm_bkl_drop() {
     }
 }
 
-/// `sys_getrandom` and the `sys_fb_*` framebuffer syscalls — `DriverBklGuard`'s
-/// ledger balance, Phase 6 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
-/// (`src/syscall/{proc,fb}.rs`, guard in `src/syscall/fs.rs`).
+/// `sys_getrandom` — `DriverBklGuard`'s ledger balance, Phase 6 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md (guard in `src/syscall/fs.rs`).
 ///
-/// Drives the real syscall ENTRY points via `handle_syscall`, checking two things
-/// per case: the documented return value (or at least not a hard error code for
-/// the real paths), and that `bkl::in_dropped_window()` is false once the call
-/// returns — the guard's ledger must end balanced both on early-error paths that
-/// never open it AND on real paths that do.
+/// Drives the real syscall ENTRY point via `handle_syscall` and checks that
+/// `bkl::in_dropped_window()` is false once the call returns — the guard's ledger
+/// must end balanced.
 ///
-/// Does NOT drive the RNG read path with a real buffer (that needs a mapped user
-/// page — out of scope here, same constraint the mm test respects). Instead
-/// exercises the guard through `sys_fb_init`, which takes dimensions not pointers,
+/// **This test lost its teeth on 2026-08-31** and the replacement is not equal.
+/// It used to reach a *real* guarded path through `sys_fb_init`, which took
+/// dimensions rather than pointers and so could be called without a mapped user
+/// page. The framebuffer syscalls are gone
+/// (`docs/archive/FRAMEBUFFER_REMOVED.md`) and `sys_getrandom` fails
+/// `validate_user_ptr` *before* the guard is constructed, so what remains only
+/// covers early-error paths plus the kill switch. Restoring real-path coverage
+/// needs a driver syscall that is callable without a mapped user buffer; there
+/// is none today. Do not read a pass here as "the dropped window closes".
+///
 /// Every device driver compiled in must correspond to hardware this machine
 /// actually has.
 ///
-/// Two cfgs decide that (build.rs): `kernel_framebuffer` = `sc-framebuffer` AND a
-/// machine with an fw_cfg to configure ramfb through; `kernel_audio` = `sound`
-/// AND a machine that can carry a virtio-sound device. Firecracker satisfies
-/// neither — its device tree has no fw_cfg node and no sound device
-/// (`docs/reference/firecracker/fdt/`), and Firecracker upstream implements
-/// neither device.
+/// One cfg decides that (build.rs): `kernel_audio` = `sound` AND a machine that
+/// can carry a virtio-sound device. Firecracker satisfies neither — its device
+/// tree has no sound device (`docs/reference/firecracker/fdt/`), and Firecracker
+/// upstream does not implement one. (`kernel_framebuffer` was the second such
+/// cfg until the framebuffer was removed —
+/// `docs/archive/FRAMEBUFFER_REMOVED.md`.)
 ///
 /// This asserts the implication in the direction that can actually hurt: *if the
 /// driver is compiled in, the machine must have the device.* The converse is
-/// fine and normal — `extreme-size` drops both drivers on QEMU virt, which has
-/// both devices.
+/// fine and normal — `extreme-size` drops the driver on QEMU virt, which has the
+/// device.
 ///
 /// Why it is worth a boot test rather than trusting the cfgs: the two halves live
 /// in different files. The capability lives in `platform.rs` and the gate in
 /// `build.rs`, so adding a platform, or enabling a driver for one, can set one
 /// without the other — and the failure mode is a driver poking MMIO that is not
-/// mapped. That is exactly how `ramfb::init` took a data abort at
-/// `FAR=0x8000012008` on the first Firecracker boot
-/// (`docs/archive/AKUMA_FIRECRACKER_KVM.md`).
+/// mapped. That is exactly how the since-removed `ramfb::init` took a data abort
+/// at `FAR=0x8000012008` on the first Firecracker boot
+/// (`docs/archive/AKUMA_FIRECRACKER_KVM.md`) — the reason this test exists.
 /// The installed redistributor mapping must have room for every core the machine
 /// described — the §3.3 invariant, checked on the running machine.
 ///
@@ -5132,15 +5131,6 @@ fn test_platform_device_gates() {
 
     let mut fails = 0u32;
 
-    let fb_compiled = cfg!(kernel_framebuffer);
-    if fb_compiled && !machine::HAS_FRAMEBUFFER {
-        fails += 1;
-        crate::safe_print!(
-            128,
-            "[Test] platform-device-gates: framebuffer compiled in on a machine with none\n"
-        );
-    }
-
     let audio_compiled = cfg!(kernel_audio);
     if audio_compiled && !machine::HAS_VIRTIO_SOUND {
         fails += 1;
@@ -5150,144 +5140,16 @@ fn test_platform_device_gates() {
         );
     }
 
-    // HAS_FRAMEBUFFER is derived from FW_CFG_PA precisely so the two cannot
-    // disagree; check the derivation survived any edit to `platform.rs`.
-    if machine::HAS_FRAMEBUFFER != machine::FW_CFG_PA.is_some() {
-        fails += 1;
-        crate::safe_print!(
-            128,
-            "[Test] platform-device-gates: HAS_FRAMEBUFFER disagrees with FW_CFG_PA\n"
-        );
-    }
-
-    // A framebuffer driver with no fw_cfg mapping is the fault case above, so
-    // pin the mapping too: if fb is compiled, the device VA must be backed.
-    if fb_compiled && machine::FW_CFG_PA.is_none() {
-        fails += 1;
-        crate::safe_print!(
-            128,
-            "[Test] platform-device-gates: fb compiled but no fw_cfg PA to map\n"
-        );
-    }
-
     if fails == 0 {
         crate::safe_print!(
             160,
-            "[Test] platform-device-gates PASSED ({}: fb={} snd={})\n",
+            "[Test] platform-device-gates PASSED ({}: snd={})\n",
             machine::NAME,
-            if fb_compiled { "in" } else { "out" },
             if audio_compiled { "in" } else { "out" }
         );
     } else {
         crate::safe_print!(64, "[Test] platform-device-gates FAILED ({} cases)\n", fails);
         panic!("test_platform_device_gates: {fails} cases failed");
-    }
-}
-
-/// ramfb: the `etc/ramfb` wire layout and `draw`'s bounds.
-///
-/// Both used to be raw-pointer operations — the config was a
-/// `#[repr(C, packed)]` struct reinterpreted through `slice::from_raw_parts`,
-/// and `draw` reached the pixels through a `copy_nonoverlapping` onto an address
-/// held in a lock-free `AtomicUsize`. Neither is spelled that way any more, so
-/// pin what the rewrite must preserve: the exact 28 bytes QEMU parses, and the
-/// fact that `draw` stops at the *visible* framebuffer rather than at the end of
-/// the page-rounded allocation behind it.
-#[cfg(kernel_framebuffer)]
-fn test_ramfb_wire_and_draw() {
-    let mut fails = 0usize;
-
-    // ── Wire layout ───────────────────────────────────────────────────────
-    // addr(8) fourcc(4) flags(4) width(4) height(4) stride(4), all big-endian.
-    let cfg = crate::ramfb::cfg_bytes(0x0102_0304_0506_0708, 320, 200, 1280);
-    let want: [u8; 28] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // addr
-        b'4', b'2', b'R', b'X', // fourcc: XRGB8888, big-endian on the wire
-        0x00, 0x00, 0x00, 0x00, // flags
-        0x00, 0x00, 0x01, 0x40, // width  = 320
-        0x00, 0x00, 0x00, 0xC8, // height = 200
-        0x00, 0x00, 0x05, 0x00, // stride = 1280
-    ];
-    if cfg != want {
-        fails += 1;
-        crate::safe_print!(96, "[Test] ramfb: cfg wire layout FAILED\n");
-    }
-
-    // ── draw() bounds ─────────────────────────────────────────────────────
-    // main.rs initialises 320x200 at boot; if that did not happen (no ramfb on
-    // the QEMU command line) there is nothing to draw into and `draw` must say
-    // so rather than write somewhere.
-    match crate::ramfb::info() {
-        None => {
-            if crate::ramfb::draw(&[0xFFu8; 64]) != 0 {
-                fails += 1;
-                crate::safe_print!(96, "[Test] ramfb: draw with no framebuffer FAILED\n");
-            }
-        }
-        Some(fb) => {
-            // Page alignment is the entire reason `init` over-allocates a page
-            // and hand-rolls an offset; if that arithmetic is wrong this is the
-            // only thing that notices.
-            match crate::ramfb::pixels_base() {
-                Some(base) if base % 4096 == 0 => {}
-                Some(base) => {
-                    fails += 1;
-                    crate::safe_print!(
-                        96,
-                        "[Test] ramfb: base 0x{:x} not page-aligned FAILED\n",
-                        base
-                    );
-                }
-                None => {
-                    fails += 1;
-                    crate::safe_print!(96, "[Test] ramfb: info() but no base FAILED\n");
-                }
-            }
-
-            if fb.stride != fb.width * 4 {
-                fails += 1;
-                crate::safe_print!(96, "[Test] ramfb: stride {} != width*4 FAILED\n", fb.stride);
-            }
-            let visible = (fb.stride as usize) * (fb.height as usize);
-
-            // Empty source: nothing copied, no panic on the zero-length slice.
-            if crate::ramfb::draw(&[]) != 0 {
-                fails += 1;
-                crate::safe_print!(96, "[Test] ramfb: draw(empty) FAILED\n");
-            }
-
-            // Short source: copied whole.
-            let short = alloc::vec![0xA5u8; 4096];
-            if crate::ramfb::draw(&short) != short.len() {
-                fails += 1;
-                crate::safe_print!(96, "[Test] ramfb: draw(short) FAILED\n");
-            }
-
-            // Oversized source: truncated to the visible framebuffer, NOT to the
-            // block behind it. `init` over-allocates a page to page-align the
-            // framebuffer by hand, so the leaked block is `fb_size + 4096` and a
-            // run that handed out the whole of it would accept up to 4096 bytes
-            // more than the screen can show. This leg is why `init` narrows to
-            // exactly `fb_size` with the second `split_at_mut`.
-            let over = alloc::vec![0x5Au8; visible + 8192];
-            let n = crate::ramfb::draw(&over);
-            if n != visible {
-                fails += 1;
-                crate::safe_print!(
-                    96,
-                    "[Test] ramfb: draw(oversized) copied {} want {} FAILED\n",
-                    n,
-                    visible
-                );
-            }
-        }
-    }
-
-    if fails == 0 {
-        crate::safe_print!(96, "[Test] ramfb-wire-and-draw PASSED\n");
-    } else {
-        crate::safe_print!(64, "[Test] ramfb-wire-and-draw FAILED ({} cases)\n", fails);
-        panic!("test_ramfb_wire_and_draw: {fails} cases failed");
     }
 }
 
@@ -5318,52 +5180,13 @@ fn test_drivers_bkl_drop() {
     if r != EFAULT { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: getrandom(null) FAILED r={} (want EFAULT)\n", r); }
     balanced("getrandom(null ptr)", &mut fails);
 
-    // The framebuffer syscalls are the other driver-family vehicle, and they only
-    // exist where the machine has a framebuffer — `kernel_framebuffer` is off on
-    // Firecracker, which has no fw_cfg to configure ramfb through. The getrandom
-    // legs above carry this test on such a build; only the fb legs drop out.
-    #[cfg(kernel_framebuffer)]
-    {
-        // fb_init with zero dimensions: EINVAL before the guard.
-        let r = handle_syscall(nr::FB_INIT, &[0, 0, 0, 0, 0, 0]);
-        if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_init(0,0) FAILED r={} (want EINVAL)\n", r); }
-        balanced("fb_init(zero dims)", &mut fails);
-
-        // fb_info with null ptr: EINVAL before the guard.
-        let r = handle_syscall(nr::FB_INFO, &[0, 0, 0, 0, 0, 0]);
-        if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_info(null) FAILED r={} (want EINVAL)\n", r); }
-        balanced("fb_info(null)", &mut fails);
-
-        // fb_draw with null ptr / zero len: EINVAL before the guard.
-        let r = handle_syscall(nr::FB_DRAW, &[0, 0, 0, 0, 0, 0]);
-        if r != EINVAL { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: fb_draw(0,0) FAILED r={} (want EINVAL)\n", r); }
-        balanced("fb_draw(null)", &mut fails);
-
-        // ── Real guarded path ──────────────────────────────────────────────
-        // fb_init with valid dims: guard IS constructed. ramfb::init may succeed
-        // (0) or fail (EIO); either way the guard must be balanced.
-        let _ = handle_syscall(nr::FB_INIT, &[320, 240, 0, 0, 0, 0]);
-        balanced("fb_init(320x240)", &mut fails);
-
-        // Runtime kill switch: with the toggle off, the guard must never open the
-        // window at all — same kill-switch contract as the other phases.
-        #[cfg(kernel_smp_shared)]
-        {
-            use crate::smp_shared::{drivers_bkl_drop_enabled, set_drivers_bkl_drop_enabled};
-            let was = drivers_bkl_drop_enabled();
-            set_drivers_bkl_drop_enabled(false);
-            let _ = handle_syscall(nr::FB_INIT, &[320, 240, 0, 0, 0, 0]);
-            balanced("fb_init(toggle off)", &mut fails);
-            set_drivers_bkl_drop_enabled(was);
-        }
-    }
-
-    // Without the framebuffer there is no driver-family syscall this test can
-    // safely call that actually constructs the guard (getrandom's legs above all
-    // fail validation *before* it). So the kill switch is checked directly: the
-    // toggle must round-trip, which at least keeps the contract honest and the
-    // setter exercised on every platform.
-    #[cfg(all(kernel_smp_shared, not(kernel_framebuffer)))]
+    // There is no driver-family syscall this test can safely call that actually
+    // constructs the guard — getrandom's legs above all fail validation *before*
+    // it, and `sys_fb_init`, which used to be the one that did, is gone with the
+    // framebuffer (`docs/archive/FRAMEBUFFER_REMOVED.md`). So the kill switch is
+    // checked directly: the toggle must round-trip, which keeps the contract
+    // honest and the setter exercised on every platform.
+    #[cfg(kernel_smp_shared)]
     {
         use crate::smp_shared::{drivers_bkl_drop_enabled, set_drivers_bkl_drop_enabled};
         let was = drivers_bkl_drop_enabled();
@@ -5383,12 +5206,10 @@ fn test_drivers_bkl_drop() {
     unregister_thread_pid(tid);
 
     if fails == 0 {
-        let legs = if cfg!(kernel_framebuffer) {
-            "4 early-error + fb_init + kill switch"
-        } else {
-            "getrandom + kill switch; no framebuffer on this machine"
-        };
-        crate::safe_print!(160, "[Test] drivers-bkl-drop PASSED ({})\n", legs);
+        crate::safe_print!(
+            160,
+            "[Test] drivers-bkl-drop PASSED (getrandom early-error + kill switch)\n"
+        );
     } else {
         crate::safe_print!(64, "[Test] drivers-bkl-drop FAILED ({} cases)\n", fails);
         panic!("test_drivers_bkl_drop: {fails} cases failed");

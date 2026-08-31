@@ -42,9 +42,8 @@ pub struct MmioReg<T>(*mut T);
 impl<T: Copy> MmioReg<T> {
     /// Name the register at `addr`.
     ///
-    /// `const` so drivers with fixed register addresses (`fw_cfg`, the PL011
-    /// console) can build theirs in a `const` item and stay free of any
-    /// init-order dependency.
+    /// `const` so drivers with fixed register addresses (the PL011 console) can
+    /// build theirs in a `const` item and stay free of any init-order dependency.
     ///
     /// # Safety
     /// `addr` is a device register of width `T`, correctly aligned, and mapped
@@ -92,8 +91,9 @@ mod tests {
         assert_eq!(cell, 0x7472_6976, "the write must land at the named address");
     }
 
-    /// The width is part of the register's identity: `fw_cfg` alone needs u8, u16
-    /// and u64 registers, which is why the type is generic rather than u32-only.
+    /// The width is part of the register's identity — the now-removed `fw_cfg`
+    /// driver alone needed u8, u16 and u64 registers, which is why the type is
+    /// generic rather than u32-only.
     #[test]
     fn each_width_accesses_exactly_its_own_bytes() {
         let mut cell: u64 = 0;

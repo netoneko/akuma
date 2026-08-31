@@ -10,7 +10,6 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
     println!("cargo::rustc-check-cfg=cfg(kernel_console_lock)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_framebuffer)");
     println!("cargo::rustc-check-cfg=cfg(kernel_audio)");
 
     // Real (shared-kernel) SMP gate: ONE shared kernel — one set of statics, one
@@ -85,10 +84,10 @@ fn main() {
     // BKL-free device-driver syscalls (Phase 6 of
     // docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), mirroring `kernel_no_bkl_mm`.
     // `cfg(kernel_no_bkl_drivers)` makes the device-driver syscall paths
-    // (`sys_getrandom`, `sys_read`/`sys_pread64` on `/dev/urandom`, `sys_write` on
-    // `/dev/dsp`, and the `sys_fb_*` framebuffer syscalls) drop the BKL for their
-    // duration, relying on each driver's own fine-grained Spinlock — `RNG_DEVICE`,
-    // `SOUND_DEVICE`, `FB_STATE` — for cross-core mutual exclusion instead. Only
+    // (`sys_getrandom`, `sys_read`/`sys_pread64` on `/dev/urandom`, and
+    // `sys_write` on `/dev/dsp`) drop the BKL for their duration, relying on each
+    // driver's own fine-grained Spinlock — `RNG_DEVICE`, `SOUND_DEVICE` — for
+    // cross-core mutual exclusion instead. Only
     // meaningful under shared-kernel SMP. Emitted independently of `smp_shared` so
     // the guard body (gated on `all(kernel_smp_shared, kernel_no_bkl_drivers)`)
     // can compile-check in either combination. The block device (`BLOCK_DEVICE`)
@@ -175,14 +174,13 @@ fn main() {
     // Firecracker's device tree, dumped from a live microVM and checked in at
     // docs/reference/firecracker/fdt/, lists exactly: cpus, memory, chosen,
     // intc, timer, apb-pclk, psci, rtc@40001000, uart@40002000, three
-    // virtio_mmio nodes (net/block/rng), vmgenid and ptp. There is **no fw_cfg
-    // node and no sound device**, and Firecracker upstream implements neither.
+    // virtio_mmio nodes (net/block/rng), vmgenid and ptp. There is **no sound
+    // device**, and Firecracker upstream does not implement one.
     //
-    // So on `platform-firecracker` the framebuffer and virtio-sound drivers are
-    // not merely unused, they are undriveable — and one of them was actively
-    // dangerous: `ramfb::init` faulted on `DEV_FW_CFG_VA + 0x08` because nothing
-    // is mapped there (docs/archive/AKUMA_FIRECRACKER_KVM.md). That was patched
-    // with a runtime `FW_CFG_PA.is_some()` guard; this removes the code instead.
+    // So on `platform-firecracker` the virtio-sound driver is not merely unused,
+    // it is undriveable. (The framebuffer was the other such driver and was
+    // worse — `ramfb::init` faulted on the unmapped fw_cfg window; the whole
+    // path is gone as of 2026-08-31, docs/archive/FRAMEBUFFER_REMOVED.md.)
     //
     // Expressed as cfgs rather than repeating `all(feature = "...", not(feature =
     // "platform-firecracker"))` at a dozen sites, because that compound is
@@ -191,13 +189,10 @@ fn main() {
     // duplicated device tables.
     //
     // Cargo features are additive and cannot be subtracted by a platform, so
-    // `sound` and `sc-framebuffer` stay in the default set and these cfgs are
-    // what a Firecracker build actually keys off.
+    // `sound` stays in the default set and this cfg is what a Firecracker build
+    // actually keys off.
     let firecracker = std::env::var("CARGO_FEATURE_PLATFORM_FIRECRACKER").is_ok();
 
-    if std::env::var("CARGO_FEATURE_SC_FRAMEBUFFER").is_ok() && !firecracker {
-        println!("cargo:rustc-cfg=kernel_framebuffer");
-    }
     if std::env::var("CARGO_FEATURE_SOUND").is_ok() && !firecracker {
         println!("cargo:rustc-cfg=kernel_audio");
     }

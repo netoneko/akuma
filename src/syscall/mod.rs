@@ -73,8 +73,6 @@ pub mod eventfd;
 pub mod log;
 #[cfg(feature = "sc-sysv-ipc")]
 pub mod msgqueue;
-#[cfg(kernel_framebuffer)]
-mod fb;
 pub mod fs;
 pub mod flock;
 pub mod mem;
@@ -792,12 +790,6 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),
         nr::SET_TPIDR_EL0 => proc::sys_set_tpidr_el0(args[0]),
-        #[cfg(kernel_framebuffer)]
-        nr::FB_INIT => fb::sys_fb_init(args[0] as u32, args[1] as u32),
-        #[cfg(kernel_framebuffer)]
-        nr::FB_DRAW => fb::sys_fb_draw(args[0], args[1] as usize),
-        #[cfg(kernel_framebuffer)]
-        nr::FB_INFO => fb::sys_fb_info(args[0]),
         nr::GETPID => proc::sys_getpid(),
         nr::GETPPID => proc::sys_getppid(),
         nr::GETUID => 0,

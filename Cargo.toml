@@ -166,7 +166,7 @@ default = [
     "sound",
     "rump",
     "fs-cache",
-    "sc-aio", "sc-sysv-ipc", "sc-framebuffer", "sc-containers",
+    "sc-aio", "sc-sysv-ipc", "sc-containers",
     "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
     # Kernel half of the process-per-session sshd. Default since 2026-08-10 —
     # without it the stack RSTs past 8 simultaneous arrivals and sshd cannot
@@ -183,7 +183,7 @@ no-tests = ["akuma-net/small-sockets"]
 #
 # Selects the machine description in `src/platform.rs`: guest RAM at 2 GiB, the
 # PL011 at 0x4000_2000, virtio-mmio on a 0x1000 stride from 0x4000_3000 with
-# INTID base 32, no fw_cfg, and the 0x4000_0000 identity block mapped Device
+# INTID base 32, and the 0x4000_0000 identity block mapped Device
 # (it is Firecracker's MMIO window, not RAM). Also moves KERNEL_PHYS_BASE to
 # 0x8030_0000 — Firecracker loads at `get_kernel_start()` (0x8020_0000) plus the
 # Image header's text_offset (1 MiB).
@@ -316,13 +316,13 @@ no-bkl-process = ["akuma-exec/no-bkl-process"]
 no-bkl-mm = []
 
 # Run the device-driver syscalls (`getrandom`, `read`/`pread64` on `/dev/urandom`,
-# `write` on `/dev/dsp`, and the `fb_*` framebuffer syscalls) WITHOUT the Big Kernel
+# and `write` on `/dev/dsp`) WITHOUT the Big Kernel
 # Lock — Phase 6 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the fifth
 # subsystem carved out. Included in `smp-shared` since 2026-08-01 (same as
 # net/vfs/process/mm). Like the preceding phases, every piece of state these
 # syscalls touch already carries its own fine-grained Spinlock — `RNG_DEVICE`
-# (virtio-rng, polling), `SOUND_DEVICE` (virtio-sound, polling), and `FB_STATE`
-# (ramfb framebuffer) — so the BKL is redundant for them. The block device
+# (virtio-rng, polling) and `SOUND_DEVICE` (virtio-sound, polling) — so the BKL
+# is redundant for them. The block device
 # (`BLOCK_DEVICE`) and network device (`NETWORK`) are already BKL-free via
 # `no-bkl-vfs` / `no-bkl-network`; this phase covers the remaining drivers.
 # build.rs emits `cfg(kernel_no_bkl_drivers)` from CARGO_FEATURE_NO_BKL_DRIVERS.
@@ -330,8 +330,9 @@ no-bkl-mm = []
 # exists — their Spinlock acquisition is already unconditional — so this is a
 # bin-crate-only feature with nothing to forward into `akuma-exec`. A no-op
 # (byte-for-byte unchanged) on every build that doesn't set both features.
-# Note: virtio-gpu does not exist in this codebase; graphics output is via QEMU
-# ramfb (a fw_cfg-backed RAM framebuffer, not a virtio device).
+# Note: this kernel has no graphics output at all. virtio-gpu never existed here,
+# and the ramfb path was removed 2026-08-31
+# (docs/archive/FRAMEBUFFER_REMOVED.md).
 no-bkl-drivers = []
 
 # Run the timer IRQ (27) dispatch WITHOUT the Big Kernel Lock — Phase 7a of
@@ -590,7 +591,6 @@ fs-cache = ["akuma-ext2/fs-cache"]
 # Tier 1 — pure dead weight, no akuma-exec callbacks.
 sc-aio          = []
 sc-sysv-ipc     = []
-sc-framebuffer  = []
 sc-containers   = []
 sc-timerfd      = []
 # Tier 2 — each needs a no-op ExecRuntime callback stub when off (see main.rs).

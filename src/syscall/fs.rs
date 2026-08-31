@@ -66,11 +66,12 @@ pub(super) type VfsBklGuard = ToggledGuard<VfsBkl>;
 /// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), as a [`GuardToggle`] marker.
 ///
 /// Covers the device-driver syscall paths — `sys_getrandom`, the `DevUrandom` arm of
-/// `sys_read`/`sys_pread64`, the `DevDsp` arm of `sys_write`, and
-/// `sys_fb_init`/`sys_fb_draw`/`sys_fb_info`. Correctness rests on each driver's state
+/// `sys_read`/`sys_pread64`, and the `DevDsp` arm of `sys_write`. (The `sys_fb_*`
+/// framebuffer syscalls were the fourth until 2026-08-31 —
+/// `docs/archive/FRAMEBUFFER_REMOVED.md`.) Correctness rests on each driver's state
 /// already carrying its own fine-grained Spinlock — `RNG_DEVICE` (virtio-rng,
-/// `src/rng.rs`), `SOUND_DEVICE` (virtio-sound, `src/audio.rs`), and `FB_STATE`
-/// (ramfb, `src/ramfb.rs`) — so the BKL is redundant for them. The block device
+/// `src/rng.rs`) and `SOUND_DEVICE` (virtio-sound, `src/audio.rs`) — so the BKL
+/// is redundant for them. The block device
 /// (`BLOCK_DEVICE`) and network device (`NETWORK`) are already BKL-free via
 /// `no-bkl-vfs` / `no-bkl-network`; this window covers the remaining drivers.
 ///

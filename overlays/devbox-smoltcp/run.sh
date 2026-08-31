@@ -41,5 +41,5 @@ echo
 # and `rump-tests`, PLUS `smoltcp`. `--no-default-features` drops rump entirely; the
 # built-in in-kernel SSH is present because `userspace-sshd` is NOT selected. This
 # lands at ~2.2 MB, under the release profile's 3 MB size guard (no override needed).
-SMOLTCP_FEATURES="smoltcp,neko,sound,no-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
+SMOLTCP_FEATURES="smoltcp,neko,sound,no-tests,sc-aio,sc-sysv-ipc,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
 exec cargo run --release --no-default-features --features "$SMOLTCP_FEATURES"

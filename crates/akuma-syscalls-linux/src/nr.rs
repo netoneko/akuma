@@ -101,9 +101,16 @@ pub const KILL_BOX: u64 = 317;
 pub const REATTACH: u64 = 318;
 pub const UPTIME: u64 = 319;
 pub const SET_TPIDR_EL0: u64 = 320;
-pub const FB_INIT: u64 = 321;
-pub const FB_DRAW: u64 = 322;
-pub const FB_INFO: u64 = 323;
+// 321, 322, 323 are RESERVED, not free.
+//
+// They were `FB_INIT` / `FB_DRAW` / `FB_INFO`, the ramfb framebuffer syscalls,
+// removed 2026-08-31 with the whole framebuffer path
+// (`docs/archive/FRAMEBUFFER_REMOVED.md`). Do not reissue them for anything
+// else: a `libakuma` built before the removal still encodes 321-323 in its
+// `fb_init`/`fb_draw`/`fb_info` wrappers, and any binary on an existing disk
+// image carries those numbers baked in. Reusing them would give such a binary a
+// silent wrong syscall instead of `ENOSYS`. If a framebuffer comes back, it
+// should take these numbers again.
 /// Select a box's network stack.
 ///
 /// arg0 = box_id, arg1 = stack (0 = smoltcp, 1 = rump). herd calls this for a

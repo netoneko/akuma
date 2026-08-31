@@ -63,8 +63,6 @@ pub mod qemu_virt {
     pub const GICR_PA: usize = 0x080A_0000;
     /// PL011 UART — the console. Needed before the FDT is parsed.
     pub const UART_PA: usize = 0x0900_0000;
-    /// QEMU `fw_cfg`. Only `src/ramfb.rs` uses it.
-    pub const FW_CFG_PA: Option<usize> = Some(0x0902_0000);
     /// Base of the virtio-mmio slot array.
     pub const VIRTIO_PA: usize = 0x0A00_0000;
     /// Bytes between virtio-mmio slots. QEMU virt packs eight slots 0x200 apart,
@@ -82,13 +80,6 @@ pub mod qemu_virt {
     /// same range is the MMIO window and getting this wrong creates a
     /// mismatched-attribute alias over live device registers.
     pub const MMIO_WINDOW_IS_DEVICE: bool = false;
-
-    /// Can this machine present a framebuffer?
-    ///
-    /// Derived, not asserted: ramfb is configured *through* fw_cfg, so a machine
-    /// with no fw_cfg cannot have one. Keeping it a derivation means the two
-    /// facts cannot disagree.
-    pub const HAS_FRAMEBUFFER: bool = FW_CFG_PA.is_some();
 
     /// Can a virtio-sound device appear here?
     ///
@@ -131,8 +122,6 @@ pub mod firecracker {
     /// `layout::SERIAL_MEM_START` = `RTC_MEM_START + MMIO_LEN`
     /// = `0x4000_0000 + 0x1000 + 0x1000`. PL011-compatible.
     pub const UART_PA: usize = 0x4000_2000;
-    /// Firecracker has no `fw_cfg` device.
-    pub const FW_CFG_PA: Option<usize> = None;
     /// `layout::MEM_32BIT_DEVICES_START` = `SERIAL_MEM_START + MMIO_LEN`.
     pub const VIRTIO_PA: usize = 0x4000_3000;
     /// `device_manager::mmio::MMIO_LEN`. Each virtio device gets its own page,
@@ -150,16 +139,6 @@ pub mod firecracker {
     /// does, where it is RAM) would alias live device registers with mismatched
     /// memory attributes, which the ARM ARM leaves CONSTRAINED UNPREDICTABLE.
     pub const MMIO_WINDOW_IS_DEVICE: bool = true;
-
-    /// No framebuffer: ramfb is configured through fw_cfg and there is no fw_cfg
-    /// (see [`FW_CFG_PA`]). Derived so the two cannot disagree.
-    ///
-    /// This was not always harmless. `ramfb::init` used to touch
-    /// `DEV_FW_CFG_VA + 0x08` on a machine that maps nothing there, taking a data
-    /// abort with `FAR=0x8000012008` (docs/archive/AKUMA_FIRECRACKER_KVM.md). A
-    /// runtime guard fixed the fault; `kernel_framebuffer` (build.rs) now keeps
-    /// the driver out of the image altogether.
-    pub const HAS_FRAMEBUFFER: bool = FW_CFG_PA.is_some();
 
     /// No sound device. Firecracker implements virtio net, block, balloon, vsock
     /// and rng — there is no virtio-sound to attach, and the device tree a live
@@ -194,9 +173,6 @@ pub fn bootstrap_device_map() -> ([DevRegion; mmu::MAX_DEV_REGIONS], usize) {
     push(addr::DEV_GIC_DIST_VA, machine::GICD_PA, addr::DEV_GIC_DIST_SIZE);
     push(addr::DEV_GIC_CPU_VA, machine::GICC_PA, 0x1000);
     push(addr::DEV_UART_VA, machine::UART_PA, 0x1000);
-    if let Some(fw_cfg) = machine::FW_CFG_PA {
-        push(addr::DEV_FW_CFG_VA, fw_cfg, 0x1000);
-    }
     push(addr::DEV_GICR_RD_VA, machine::GICR_PA, 0x1000);
     push(addr::DEV_GICR_SGI_VA, machine::GICR_PA + GICR_SGI_OFFSET, 0x1000);
     push(addr::DEV_VIRTIO_VA, machine::VIRTIO_PA, virtio_window_bytes());
@@ -341,11 +317,6 @@ pub unsafe fn install_fdt_device_map(dtb_ptr: usize) -> FdtMapOutcome {
 
     let uart_pa = desc.uart.map_or(machine::UART_PA, |u| u.region.base as usize);
     push(addr::DEV_UART_VA, uart_pa, 0x1000);
-    if let Some(fw_cfg) = machine::FW_CFG_PA {
-        // Not described by either tree in a form this crate reads; the literal is
-        // the only source, and it is QEMU-only.
-        push(addr::DEV_FW_CFG_VA, fw_cfg, 0x1000);
-    }
 
     // Only CPU0's two frames are mapped through the L0[1] device window. That is
     // not an oversight: secondaries reach their own redistributor by physical
