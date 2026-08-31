@@ -14,8 +14,8 @@ use alloc::format;
 // comment and a number get to disagree. See
 // docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
 use akuma_primitives::errno::negated::{
-    EAFNOSUPPORT, EAGAIN, EBADF, EEXIST, EFAULT, EINTR, EINVAL, EISDIR, ENOENT, ENOSYS, EOPNOTSUPP,
-    EPERM, EPFNOSUPPORT, ESPIPE, ESRCH,
+    EAFNOSUPPORT, EAGAIN, EBADF, EEXIST, EFAULT, EINTR, EINVAL, EIO, EISDIR, ENOENT, ENOSYS,
+    EOPNOTSUPP, EPERM, EPFNOSUPPORT, ESPIPE, ESRCH,
 };
 
 /// Run process tests that require the network stack (call after network init)
@@ -5180,12 +5180,64 @@ fn test_drivers_bkl_drop() {
     if r != EFAULT { fails += 1; crate::safe_print!(96, "[Test] drivers-bkl-drop: getrandom(null) FAILED r={} (want EFAULT)\n", r); }
     balanced("getrandom(null ptr)", &mut fails);
 
-    // There is no driver-family syscall this test can safely call that actually
-    // constructs the guard — getrandom's legs above all fail validation *before*
-    // it, and `sys_fb_init`, which used to be the one that did, is gone with the
-    // framebuffer (`docs/archive/FRAMEBUFFER_REMOVED.md`). So the kill switch is
-    // checked directly: the toggle must round-trip, which keeps the contract
-    // honest and the setter exercised on every platform.
+    // ── Real guarded path ──────────────────────────────────────────────────
+    // getrandom with a buffer that PASSES validation, so `DriverBklGuard` is
+    // actually constructed and the chunked `fill_bytes` + `copy_to_user` loop
+    // runs inside the dropped window. This is the only leg that proves the
+    // window *closes*; the early-error legs above only prove it never opened.
+    //
+    // `sys_fb_init` used to be this leg — it took dimensions rather than
+    // pointers, so it needed no mapped user page — and it went with the
+    // framebuffer (`docs/archive/FRAMEBUFFER_REMOVED.md`). `BYPASS_VALIDATION`
+    // replaces it: `validate_user_range` short-circuits to `true` when it is set
+    // (`akuma-exec/src/process/user_access.rs:313`), which is how a boot test
+    // gets a kernel-stack pointer past the user-pointer check. The same lever
+    // carries `sync_tests.rs` and `pthread_tests.rs`, and `copy_to_user_with`'s
+    // SAFETY note names this case explicitly. Arguably better coverage than the
+    // fb leg ever was: getrandom is a syscall real userspace calls, and the whole
+    // driver body runs in the window rather than a bare `init`.
+    let mut real_path = "none";
+    {
+        use core::sync::atomic::Ordering;
+        let mut buf = [0u8; 64];
+        let ptr = (&raw mut buf).cast::<u8>() as u64;
+
+        crate::syscall::BYPASS_VALIDATION.store(true, Ordering::Release);
+        let r = handle_syscall(nr::GETRANDOM, &[ptr, 64, 0, 0, 0, 0]);
+        crate::syscall::BYPASS_VALIDATION.store(false, Ordering::Release);
+
+        // EIO is legitimate: a machine with no virtio-rng cannot fill. Anything
+        // else means the guarded body did not run the way this test assumes, and
+        // a `balanced` pass below would be vacuous.
+        if r == 64 {
+            real_path = "filled";
+            // Proves the body actually executed rather than short-circuiting to a
+            // success return. 64 zero bytes from a working RNG is not a thing.
+            if buf.iter().all(|&b| b == 0) {
+                fails += 1;
+                crate::safe_print!(
+                    96,
+                    "[Test] drivers-bkl-drop: getrandom(real) returned 64 but filled nothing\n"
+                );
+            }
+        } else if r == EIO {
+            // No virtio-rng on this machine. The guard still opened and closed —
+            // `fill_bytes` fails *inside* it — so `balanced` is still meaningful,
+            // but the fill assertion above did not run. The PASSED line says so.
+            real_path = "EIO";
+        } else {
+            fails += 1;
+            crate::safe_print!(
+                96,
+                "[Test] drivers-bkl-drop: getrandom(real) FAILED r={} (want 64 or EIO)\n",
+                r
+            );
+        }
+        balanced("getrandom(real guarded path)", &mut fails);
+    }
+
+    // The kill switch, checked directly: the toggle must round-trip, which keeps
+    // the contract honest and the setter exercised on every platform.
     #[cfg(kernel_smp_shared)]
     {
         use crate::smp_shared::{drivers_bkl_drop_enabled, set_drivers_bkl_drop_enabled};
@@ -5208,7 +5260,8 @@ fn test_drivers_bkl_drop() {
     if fails == 0 {
         crate::safe_print!(
             160,
-            "[Test] drivers-bkl-drop PASSED (getrandom early-error + kill switch)\n"
+            "[Test] drivers-bkl-drop PASSED (early-error + real path [{}] + kill switch)\n",
+            real_path
         );
     } else {
         crate::safe_print!(64, "[Test] drivers-bkl-drop FAILED ({} cases)\n", fails);
