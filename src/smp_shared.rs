@@ -131,7 +131,7 @@ pub fn wake_remote_idle() -> bool {
         return false; // no idle peer
     }
     let target = mask.trailing_zeros(); // lowest idle peer core
-    crate::gic::trigger_sgi_core(target, SCHED_SGI);
+    akuma_gic::trigger_sgi_core(target, akuma_gic::SGI_SCHEDULER);
     true
 }
 
@@ -144,7 +144,7 @@ pub fn wake_core(core_id: u8) {
     if core_id == self_aff0 || core_id == 0xFF {
         return; // self-SGI already fired by trigger_sgi; or no last-known core
     }
-    crate::gic::trigger_sgi_core(u32::from(core_id), SCHED_SGI);
+    akuma_gic::trigger_sgi_core(u32::from(core_id), akuma_gic::SGI_SCHEDULER);
 }
 
 unsafe extern "C" {
@@ -235,7 +235,7 @@ pub fn probe_dtb(fdt: Option<&akuma_fdt::Fdt<'_>>) {
 }
 
 /// M0 bringup: PSCI `CPU_ON` every secondary onto the shared boot tables, then wait
-/// (bounded) for each to report online. Called from `kernel_main` after `gic::init`.
+/// (bounded) for each to report online. Called from `kernel_main` after `akuma_gic::init`.
 pub fn bringup_secondaries() {
     if !PROBED.load(Ordering::Acquire) {
         crate::safe_print!(56, "[SMP-shared] not probed; staying single-core\n");
@@ -347,86 +347,27 @@ fn dsb_sy() {
     akuma_cpu::barrier::dsb_sy();
 }
 
-// --- Per-PE GICv3 receive path (M2c) --------------------------------------------
-// The boot L1[0] block identity-maps device space, so a secondary on the shared boot
-// tables reaches its own redistributor at its physical address directly. Constants
-// mirror `crate::smp` (kept private here so the multikernel path stays untouched).
-/// Base of the GICv3 redistributor region, as a **physical** address.
+/// Where this machine's redistributor frames are, for `akuma_gic::secondary_init`.
 ///
-/// Secondaries reach the redistributor through the low identity mapping
-/// (`boot.rs` L1[0] maps 0..1 GiB as a device block, and the GIC is below 1 GiB
-/// on both supported machines) rather than through the L0[1] device window,
-/// because this runs during bringup on the boot page table.
+/// The geometry is machine-specific — and on Firecracker it also depends on the
+/// configured vCPU count — so it is read from the **installed device map**
+/// (`crate::platform`), letting a redistributor discovered from the FDT win over
+/// the compile-time bootstrap literal. Getting this wrong points a core at
+/// another core's frames, which silently costs it its timer interrupt.
 ///
-/// The value is machine-specific, and on Firecracker it also depends on the
-/// configured vCPU count — see `crate::platform`. It is read from the installed
-/// device map so that a redistributor discovered from the FDT wins over the
-/// compile-time bootstrap literal; getting this wrong points a core at another
-/// core's frames, which silently costs it its timer interrupt.
-fn gicr_base() -> usize {
-    crate::platform::gicr_base_pa()
-}
-const GICR_STRIDE: usize = crate::platform::GICR_STRIDE;
-const GICR_SGI_OFFSET: usize = crate::platform::GICR_SGI_OFFSET;
-const GICR_WAKER: usize = 0x0014;
-const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
-const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
-const GICR_SGI_IGROUPR0: usize = 0x0080;
-const GICR_SGI_ISENABLER0: usize = 0x0100;
-const GICR_SGI_IPRIORITYR: usize = 0x0400;
-/// EL1 virtual-timer PPI (the shared 10 ms scheduler tick) and the scheduler SGI
-/// (INTID 0), which each core rings at itself from the shared timer handler.
-const TIMER_PPI: u32 = 27;
-const SCHED_SGI: u32 = 0;
-
-/// ISV-safe single-register MMIO (no writeback/pair form — those assert under QEMU HVF;
-/// same reasoning as `gic_v3::mmio_w32`).
-fn mmio_w32(addr: usize, val: u32) {
-    // SAFETY: `addr` is a device-mapped GIC redistributor register.
-    unsafe {
-        core::arch::asm!("str {v:w}, [{a}]", v = in(reg) val, a = in(reg) addr,
-            options(nostack, preserves_flags));
+/// The driver itself moved to `akuma-gic` on 2026-09-01. What was here — an
+/// `mmio_w32`/`mmio_r32` pair copied verbatim from `gic_v3.rs`, a second copy of
+/// the `GICR_WAKER_*` bits, and four raw `msr` instructions duplicating
+/// `gic_v3::init`'s CPU-interface sequence — was **three `unsafe` blocks that
+/// already existed elsewhere**, so consolidating removed them rather than
+/// relocating them (`docs/archive/AKUMA_GIC_CONSOLIDATION.md`).
+#[cfg(kernel_smp_shared)]
+fn redistributor_layout() -> akuma_gic::RedistributorLayout {
+    akuma_gic::RedistributorLayout {
+        base_pa: crate::platform::gicr_base_pa(),
+        stride: crate::platform::GICR_STRIDE,
+        sgi_offset: crate::platform::GICR_SGI_OFFSET,
     }
-}
-fn mmio_r32(addr: usize) -> u32 {
-    let val: u32;
-    // SAFETY: `addr` is a device-mapped GIC redistributor register.
-    unsafe {
-        core::arch::asm!("ldr {v:w}, [{a}]", v = out(reg) val, a = in(reg) addr,
-            options(nostack, preserves_flags, readonly));
-    }
-    val
-}
-
-/// Bring up THIS secondary's GICv3 receive path: enable the system-register CPU
-/// interface, wake its redistributor, and enable the scheduler SGI (INTID 0) + the
-/// virtual-timer PPI (27). The distributor's global config was done once by the BSP.
-fn secondary_gic_init(idx: usize) {
-    // SAFETY: GICv3 CPU-interface system registers; values per the architecture.
-    unsafe {
-        let sre: u64;
-        core::arch::asm!("mrs {0}, S3_0_C12_C12_5", out(reg) sre, options(nomem, nostack));
-        core::arch::asm!("msr S3_0_C12_C12_5, {0}", in(reg) sre | 1, options(nomem, nostack)); // ICC_SRE_EL1.SRE
-        akuma_cpu::barrier::isb();
-        core::arch::asm!("msr S3_0_C4_C6_0, {0}", in(reg) 0xFFu64, options(nomem, nostack)); // ICC_PMR_EL1
-        core::arch::asm!("msr S3_0_C12_C12_3, {0}", in(reg) 0u64, options(nomem, nostack)); // ICC_BPR1_EL1
-        core::arch::asm!("msr S3_0_C12_C12_7, {0}", in(reg) 1u64, options(nomem, nostack)); // ICC_IGRPEN1_EL1
-    }
-    akuma_cpu::barrier::isb();
-    let rd = gicr_base() + idx * GICR_STRIDE;
-    let sgi = rd + GICR_SGI_OFFSET;
-    let waker = rd + GICR_WAKER;
-    mmio_w32(waker, mmio_r32(waker) & !GICR_WAKER_PROCESSOR_SLEEP);
-    while mmio_r32(waker) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
-        core::hint::spin_loop();
-    }
-    mmio_w32(sgi + GICR_SGI_IGROUPR0, 0xFFFF_FFFF);
-    for i in 0..8 {
-        mmio_w32(sgi + GICR_SGI_IPRIORITYR + i * 4, 0xA0A0_A0A0);
-    }
-    mmio_w32(sgi + GICR_SGI_ISENABLER0, (1u32 << SCHED_SGI) | (1u32 << TIMER_PPI));
-    // Ensure redistributor writes complete before IRQs are unmasked.
-    akuma_cpu::barrier::dsb_ish();
 }
 
 /// Base VA of this core's 64 KiB (`1 << STACK_SHIFT`) boot/idle stack in
@@ -654,7 +595,7 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
     crate::safe_print!(64, "[SMP-shared] core {} online (idle tid {})\n", core, slot);
 
     // Bring up this PE's interrupt receive path, install shared vectors, arm the tick.
-    secondary_gic_init(core);
+    akuma_gic::secondary_init(core, redistributor_layout());
     set_shared_vbar();
     // Arm this core's periodic tick from the shared choice (BSP's probe /
     // override result, published via akuma-timer's registry).

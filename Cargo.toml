@@ -243,7 +243,7 @@ rump-tests = []
 # passing) and a same-binary `bkl-profile` A/B on the contention regimen
 # (`irq/sched` 24.7% → 10.2%, 6/6 digests exact both sides). Remove from this
 # list to A/B.
-smp-shared = ["akuma-exec/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
@@ -561,7 +561,6 @@ sound = ["virtio-drivers/alloc", "akuma-virtio/sound"]
 # Silicon, where only the GICv3 system-register CPU interface exists. Build the
 # kernel with `gic-version=3` in the QEMU command line when using the default
 # (GICv3) driver — see scripts/cargo_runner.sh.
-gic-v2 = []
 
 # Profile discriminator (NOT a syscall gate). build_extreme_size.sh enables it so
 # build.rs can pick a tighter IMAGE_SIZE / STACK_BOTTOM than the `size` profile.
@@ -676,6 +675,9 @@ akuma-exec = { path = "crates/akuma-exec" }
 # Reached directly, not through `akuma_exec::bkl`: `src/smp_shared.rs` re-exports
 # `akuma_bkl::policy` (the BKL-drop toggles), and routing a policy module through
 # the exec crate that does not read it would be indirection for its own sake.
+# The GICv3 driver, consolidated from `src/gic.rs` + `src/gic_v3.rs` + the
+# redistributor half of `src/smp_shared.rs` on 2026-09-01.
+akuma-gic = { path = "crates/akuma-gic" }
 akuma-bkl = { path = "crates/akuma-bkl" }
 akuma-fpcache = { path = "crates/akuma-fpcache" }
 akuma-kacho = { path = "crates/akuma-kacho" }

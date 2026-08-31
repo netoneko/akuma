@@ -2688,7 +2688,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     }
 
     // Acknowledge the IRQ once, up front (the GIC IAR read needs no BKL).
-    let irq_opt = crate::gic::acknowledge_irq();
+    let irq_opt = akuma_gic::acknowledge_irq();
     match irq_opt {
         Some(intid) => note_irq_intid(intid),
         // IAR said "spurious" (1023): the vector fired but the interrupt was
@@ -2709,10 +2709,10 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     #[cfg(kernel_smp_shared)]
     if interrupted_el0
         && crate::smp_shared::sched_bklfree_el0_enabled()
-        && matches!(irq_opt, Some(i) if i == crate::gic::SGI_SCHEDULER)
+        && matches!(irq_opt, Some(i) if i == akuma_gic::SGI_SCHEDULER)
     {
         let new_sp =
-            akuma_exec::threading::sgi_scheduler_handler_with_sp(crate::gic::SGI_SCHEDULER, current_sp);
+            akuma_exec::threading::sgi_scheduler_handler_with_sp(akuma_gic::SGI_SCHEDULER, current_sp);
         let final_sp = if new_sp != 0 { new_sp } else { current_sp };
         // SAFETY: `final_sp` is a live IRQ trap frame; SPSR sits at a fixed offset.
         let spsr = unsafe {
@@ -2736,10 +2736,10 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     #[cfg(all(kernel_smp_shared, kernel_no_bkl_irq))]
     if crate::smp_shared::irq_bkl_drop_enabled()
         && let Some(irq) = irq_opt
-        && irq != crate::gic::SGI_SCHEDULER
+        && irq != akuma_gic::SGI_SCHEDULER
     {
         crate::irq::dispatch_irq(irq);
-        crate::gic::end_of_interrupt(irq);
+        akuma_gic::end_of_interrupt(irq);
         return 0;
     }
 
@@ -2758,12 +2758,12 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     );
 
     let new_sp = if let Some(irq) = irq_opt {
-        if irq == crate::gic::SGI_SCHEDULER {
+        if irq == akuma_gic::SGI_SCHEDULER {
             akuma_exec::threading::sgi_scheduler_handler_with_sp(irq, current_sp)
         } else {
             // Normal device IRQ: dispatch then EOI.
             crate::irq::dispatch_irq(irq);
-            crate::gic::end_of_interrupt(irq);
+            akuma_gic::end_of_interrupt(irq);
             0
         }
     } else {

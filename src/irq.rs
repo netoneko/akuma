@@ -59,7 +59,7 @@ static IRQ_HANDLERS: Spinlock<IrqHandlers> = Spinlock::new(IrqHandlers {
 pub fn register_handler(irq: u32, handler: IrqHandler) {
     let idx = irq as usize;
     if idx >= MAX_IRQ {
-        // Out of range for the table. Match `gic::enable_irq`'s posture for an
+        // Out of range for the table. Match `akuma_gic::enable_irq`'s posture for an
         // invalid INTID (ignore) rather than enabling a line nothing can service.
         return;
     }
@@ -81,7 +81,7 @@ pub fn register_handler(irq: u32, handler: IrqHandler) {
     });
 
     // Outside the lock: this can deliver `irq` on this core immediately.
-    crate::gic::enable_irq(irq);
+    akuma_gic::enable_irq(irq);
 }
 
 /// Dispatch an IRQ to its registered handler

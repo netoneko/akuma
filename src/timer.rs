@@ -152,9 +152,9 @@ pub fn timer_irq_handler(_irq: u32) {
         }
     }
     #[cfg(kernel_smp_shared)]
-    crate::gic::trigger_sgi_self(crate::gic::SGI_SCHEDULER);
+    akuma_gic::trigger_sgi_self(akuma_gic::SGI_SCHEDULER);
     #[cfg(not(kernel_smp_shared))]
-    crate::gic::trigger_sgi(crate::gic::SGI_SCHEDULER);
+    akuma_gic::trigger_sgi(akuma_gic::SGI_SCHEDULER);
 }
 
 // ============================================================================

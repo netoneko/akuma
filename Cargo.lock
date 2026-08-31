@@ -15,6 +15,7 @@ dependencies = [
  "akuma-fdt",
  "akuma-firecracker",
  "akuma-fpcache",
+ "akuma-gic",
  "akuma-isolation",
  "akuma-kacho",
  "akuma-locks-rw",
@@ -135,6 +136,14 @@ dependencies = [
  "akuma-pmm",
  "akuma-primitives",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-gic"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-primitives",
 ]
 
 [[package]]

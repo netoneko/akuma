@@ -91,9 +91,6 @@ mod file_page_cache;
 mod fs;
 #[cfg(kernel_tests)]
 mod fs_tests;
-mod gic;
-#[cfg(not(feature = "gic-v2"))]
-mod gic_v3;
 mod irq;
 #[cfg(all(kernel_tests, feature = "smoltcp"))]
 mod network_tests;
@@ -469,15 +466,15 @@ pub(crate) fn build_exec_runtime(
         uptime_us: timer::uptime_us,
         disable_irqs: irq::disable_irqs,
         enable_irqs: irq::enable_irqs,
-        end_of_interrupt: gic::end_of_interrupt,
+        end_of_interrupt: akuma_gic::end_of_interrupt,
         // Real shared-kernel SMP: voluntary reschedules (yield_now / schedule_blocking)
         // must ring THIS core's scheduler SGI, not the hardcoded PE0 that `trigger_sgi`
         // targets — otherwise a secondary's yield/block pokes the BSP and never
         // reschedules itself. On the BSP (aff0 = 0) `trigger_sgi_self` is equivalent.
         #[cfg(kernel_smp_shared)]
-        trigger_sgi: gic::trigger_sgi_self,
+        trigger_sgi: akuma_gic::trigger_sgi_self,
         #[cfg(not(kernel_smp_shared))]
-        trigger_sgi: gic::trigger_sgi,
+        trigger_sgi: akuma_gic::trigger_sgi,
         // Cross-core wakeup (M4): nudge an idle peer to run a just-woken thread. No-op
         // off shared-SMP.
         #[cfg(kernel_smp_shared)]
@@ -617,7 +614,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // address can be a compile-time literal — Firecracker's GIC redistributor
     // base moves with vCPU count, so the rest has to be discovered. Install the
     // compile-time bootstrap map now and rewrite the boot table's device L3 from
-    // it, so the GIC and virtio pages exist before `gic::init()` runs.
+    // it, so the GIC and virtio pages exist before `akuma_gic::init()` runs.
     //
     // This is the bootstrap map, not the authority: `platform::machine`'s
     // redistributor address assumes one vCPU. The FDT-derived refinement runs
@@ -731,7 +728,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Keeping the literal at `SMP=2` points the boot core at CPU1's frames: it
     // clears the wrong `GICR_WAKER` and enables the virtual timer on the wrong
     // frame, losing its own scheduler tick with no build or boot error. So this
-    // has to run before `gic::init()`, and the DTB has to be mapped first — hence
+    // has to run before `akuma_gic::init()`, and the DTB has to be mapped first — hence
     // its position immediately after `ensure_boot_identity_covers`.
     //
     // A failure here is not fatal: the bootstrap map stays, which is correct on
@@ -986,7 +983,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print(" free\n");
 
     // Initialize GIC (Generic Interrupt Controller)
-    gic::init();
+    akuma_gic::init();
     console::print("GIC initialized\n");
 
     // Real (shared-kernel) SMP: wake secondary cores onto the SHARED boot page tables,
@@ -1097,7 +1094,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Now enable preemptive scheduling (timer interrupts)
     // =========================================================================
     console::print("Configuring scheduler SGI...\n");
-    gic::enable_irq(gic::SGI_SCHEDULER);
+    akuma_gic::enable_irq(akuma_gic::SGI_SCHEDULER);
 
     console::print("Registering timer IRQ...\n");
     // Single hardware timer: the virtual timer (CNTV) fires PPI 27. Its handler
@@ -1109,7 +1106,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // (timer::probe_host_tick) can fire one-shots into a harmless handler;
     // the real ISR is swapped in below before the periodic tick is armed.
     irq::register_handler(27, timer::probe_irq_nop);
-    gic::enable_irq(27); // Enable virtual timer interrupt
+    akuma_gic::enable_irq(27); // Enable virtual timer interrupt
 
     console::print("Enabling timer...\n");
     let tick_us = timer::probe_host_tick();
@@ -2173,7 +2170,7 @@ fn ring_netpoll_doorbell() {
         // anything the waiters record. A broadcast is imprecise and cheap; a
         // precise wake here is wrong more often than it is expensive.
         // See docs/archive/AKUMA_NET_ISSUES.md §11.
-        gic::broadcast_sgi(gic::SGI_SCHEDULER);
+        akuma_gic::broadcast_sgi(akuma_gic::SGI_SCHEDULER);
     }
 }
 

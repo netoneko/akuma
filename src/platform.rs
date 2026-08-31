@@ -263,7 +263,7 @@ pub enum FdtMapOutcome {
 /// # Ordering
 ///
 /// Call **after** `mmu::ensure_boot_identity_covers(dtb_ptr)` — the FDT can sit
-/// outside `boot.rs`'s static identity map — and **before** `gic::init()`, which
+/// outside `boot.rs`'s static identity map — and **before** `akuma_gic::init()`, which
 /// is the first thing to touch a GIC register. The caller must rebuild the boot
 /// device L3 afterwards; this function only installs the table.
 ///

@@ -1,0 +1,24 @@
+[package]
+name = "akuma-gic"
+version = "0.1.0"
+edition = "2024"
+description = "ARM GICv3 interrupt-controller driver (distributor, redistributor, ICC_* CPU interface)"
+
+[features]
+# Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared` feature.
+# Makes this crate's build.rs emit `cfg(kernel_smp_shared)`, which is what gates
+# the per-core SGI entry points (`trigger_sgi_core`, `broadcast_sgi`) and the
+# secondary bring-up path. Off, a single core self-targets via `trigger_sgi`.
+smp-shared = ["akuma-primitives/smp-shared"]
+
+[dependencies]
+# The device-window VAs the BSP reaches the GICD/GICR through
+# (`addr::DEV_GIC_DIST_VA`, `DEV_GICR_RD_VA`, `DEV_GICR_SGI_VA`).
+akuma-primitives = { path = "../akuma-primitives" }
+# `barrier::isb` / `barrier::dsb_ish`. The GIC's own `ICC_*` system-register
+# writes deliberately stay here rather than moving into `akuma-cpu` — see the
+# crate docs.
+akuma-cpu = { path = "../akuma-cpu" }
+
+[lints]
+workspace = true

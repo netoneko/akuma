@@ -8,7 +8,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{exec,ext2,firecracker,fpcache,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
+  `akuma-{bkl,exec,ext2,firecracker,fpcache,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
   `akuma-cpu` holds every AArch64 instruction that is **safe to execute** —
   barriers, cache/TLB maintenance, core parking, `DAIF`, the virtual-timer
@@ -171,6 +171,22 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   subsystems/syscalls/poll.md` § "The wait loop is one machine"). The crate also
   carries a differential test against the pre-extraction `wait_until`; keep that
   oracle in the shipped loop's shape rather than tidying it.
+  `akuma-bkl` is the BKL protocol and the spinlocks under it — and since
+  2026-09-01 also `akuma_bkl::policy`, the **decision** to take it or skip it:
+  the seven `no-bkl-*` phase toggles and the per-syscall opt-out bitmap, moved
+  out of `src/smp_shared.rs` (which went 1173 -> 808 lines,
+  `docs/archive/AKUMA_SMP_SHARED_SPLIT.md`). Each toggle is a relaxed atomic load
+  with a **paired setter that is not test-only** — every phase in
+  `BKL_FINE_GRAINED_LOCKING_PLAN.md` is validated by a same-binary A/B that flips
+  it at runtime, so deleting a setter because production never calls it deletes
+  the ability to measure the phase. Each is read ONCE at excursion entry and
+  **latched**; a guard that re-reads can close a window it never opened.
+  `process_bkl_drop_enabled` is the one toggle that did NOT move — its atomic is
+  in `akuma_exec::process::bkl_guard` and `akuma-exec` depends on this crate, so
+  moving it would invert that edge; `src/smp_shared.rs` forwards it. The opt-out
+  bitmap's tests own syscall numbers on neither the seed nor the deny list,
+  because it is a `static` and `cargo test` runs threads — **`300` looks free and
+  is seeded**; the free set is pinned in a comment beside them.
   `akuma-locks-rw` is the recoverable reader/writer lock for orphaned-lock
   recovery (2026-08-30, `docs/archive/AKUMA_EXT2_CLEANUP.md` §4): release **is**
   abandon — the sweep for a dead holder performs the same CAS-guarded operation
