@@ -1,0 +1,21 @@
+[package]
+name = "akuma-fpcache"
+version = "0.1.0"
+edition = "2024"
+description = "Shared physical pages for read-only file-backed mappings (the file-page cache)"
+
+[dependencies]
+# `PhysFrame`, and the `user_flags::is_shareable_mapping` predicate reached
+# through `akuma_exec::mmu`.
+akuma-exec = { path = "../akuma-exec" }
+# The CoW refcount this cache reuses for its own reference, plus `FreeSite`
+# attribution and the `free_count()` gate the elastic cap samples.
+akuma-pmm = { path = "../akuma-pmm" }
+# `irq::with_irqs_disabled`, `preempt::current_tid`, and `safe_print!`.
+akuma-primitives = { path = "../akuma-primitives" }
+# The observe/decide/hysteresis band on the elastic cap.
+akuma-kacho = { path = "../akuma-kacho" }
+spinning_top = "0.3"
+
+[lints]
+workspace = true

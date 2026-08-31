@@ -8,7 +8,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{exec,ext2,firecracker,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
+  `akuma-{exec,ext2,firecracker,fpcache,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
   `akuma-cpu` holds every AArch64 instruction that is **safe to execute** —
   barriers, cache/TLB maintenance, core parking, `DAIF`, the virtual-timer
@@ -31,8 +31,8 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `sysreg::set_tpidr_el0` (`docs/archive/SYSCALL_UNSAFE_CLEANUP.md` §6). To time a code path use
   `sysreg::cntvct_el0_ordered()` — a bare counter read is unordered against the
   work it measures and once made an 8 KB copy measure as 0 ns.
-  **22 of the 32 carry `#![forbid(unsafe_code)]`** — which crates, and why the
-  other ten cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
+  **23 of the 36 carry `#![forbid(unsafe_code)]`** — which crates, and why the
+  other 13 cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
   with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).
   **`src/syscall/` carries the ban too** (2026-08-31), as a module attribute in
   its `mod.rs` — the first one outside `crates/`, and the reason the crate tally
@@ -126,6 +126,19 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`.
   `akuma-kacho` is the shared observe/decide/hysteresis layer every self-tuning
   policy uses (timer-tick demotion, file-page cache cap, netpoll wake rate).
+  `akuma-fpcache` is that file-page cache: shared physical frames for read-only
+  file-backed mappings, keyed `(inode, mount id, file offset)` and reference-counted
+  through the **CoW refcount**, so teardown needed no new code (2026-09-01,
+  `docs/archive/AKUMA_FPCACHE_EXTRACTION.md`). It moved for the
+  `#![forbid(unsafe_code)]`-across-`src/` goal rather than for host tests — it
+  held no `unsafe` to localize; it was one of the eight `crate::` clusters
+  `src/exceptions.rs` must shed before **it** can leave, and the only one needing
+  no hook. The four `src/config.rs` tunables arrive at `init` as an
+  `FpcacheConfig`, which is the one real cost: the kill switch stopped being a
+  const-folded branch and became a relaxed atomic load (+304 B `.text`, +16 B
+  `.bss`, 0 B of `extreme-size` image). **`src/config.rs` stays the single source
+  of truth** — the `src/file_page_cache.rs` shim reads the consts and hands them
+  over, so do not add a second copy in the crate.
   The **networking family** is four crates since 2026-08-30
   (`docs/archive/AKUMA_NET_SPLIT.md`), split so that all but one of them can
   forbid `unsafe`. `akuma-net` is the smoltcp stack (`smoltcp_net/`, 14 modules)

@@ -13,6 +13,7 @@ dependencies = [
  "akuma-ext2",
  "akuma-fdt",
  "akuma-firecracker",
+ "akuma-fpcache",
  "akuma-isolation",
  "akuma-kacho",
  "akuma-locks-rw",
@@ -121,6 +122,17 @@ name = "akuma-firecracker"
 version = "0.1.0"
 dependencies = [
  "fdt",
+]
+
+[[package]]
+name = "akuma-fpcache"
+version = "0.1.0"
+dependencies = [
+ "akuma-exec",
+ "akuma-kacho",
+ "akuma-pmm",
+ "akuma-primitives",
+ "spinning_top",
 ]
 
 [[package]]

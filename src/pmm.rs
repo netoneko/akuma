@@ -27,10 +27,16 @@ pub use akuma_exec::{PhysFrame, FrameSource};
 
 pub use akuma_pmm::{
     PmmConfig, PmmHooks, register_config, register_hooks, FrameTrackingStats,
-    cow_ref_inc, cow_ref_dec, cow_ref_get,
+    cow_ref_dec, cow_ref_get,
 };
+/// `cow_ref_count` has never had a production caller here. `cow_ref_inc` lost
+/// its last one on 2026-09-01, when the file-page cache moved to
+/// `akuma-fpcache` and began calling `akuma_pmm` directly — what is left are the
+/// CoW refcount self-tests in `src/tests.rs` and `src/process_tests.rs`, which
+/// `extreme-size` compiles out (`no-tests`) while still building with
+/// `-D unused-imports`.
 #[allow(unused_imports)]
-pub use akuma_pmm::cow_ref_count;
+pub use akuma_pmm::{cow_ref_count, cow_ref_inc};
 
 // ============================================================================
 // Frame tracking — thin wrappers, PhysFrame/FrameSource <-> usize/akuma_pmm::FrameSource

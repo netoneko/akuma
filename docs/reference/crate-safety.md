@@ -1,7 +1,23 @@
 # Crate safety: which crates forbid `unsafe`
 
 **Grade: A** — regenerated 2026-09-01 with
-`python3 scripts/cloc_akuma.py src crates` after
+`python3 scripts/cloc_akuma.py src crates` after the file-page cache left `src/`
+as `akuma-fpcache`
+([`AKUMA_FPCACHE_EXTRACTION.md`](../archive/AKUMA_FPCACHE_EXTRACTION.md)):
+500 lines holding **zero** `unsafe`, so neither production
+count moved — `src/` stayed at **104** and `crates/` at **324**. **23 of 36
+crates** forbid: numerator and denominator both rose by one, which is the shape
+an extraction has when the thing extracted was already safe. What it bought is
+one fewer file in `src/` for the `#![forbid(unsafe_code)]` goal and one fewer
+`crate::` edge out of `src/exceptions.rs` — the file holding **77 of the 97**
+`unsafe` blocks left in `src/` production code, and therefore the whole of that
+goal. The one behavioural change is that `SHARED_FILE_PAGES_ENABLED` stopped
+being a const-folded gate and became a relaxed atomic load, because the tunables
+are `src/config.rs` `const`s and the crate sits below the module that owns them;
+A/B'd on `extreme-size` at **+304 bytes `.text`, +16 bytes `.bss`, and 0 bytes of
+image** (724,328 B on both arms).
+
+Earlier the same day, after
 [`AKUMA_FDT_EXTRACTION.md`](../archive/AKUMA_FDT_EXTRACTION.md): the six
 `unsafe` operations that turned a boot pointer into a device tree — spread over
 `src/main.rs`, `src/platform.rs` and `src/smp_shared.rs` — became one, in the new
