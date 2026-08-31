@@ -1,66 +1,29 @@
+//! Kernel console — formatting, cross-core serialisation, and line input.
+//!
+//! # This module forbids `unsafe`
+//!
+//! It held three `unsafe` blocks, one per PL011 register access, until
+//! 2026-08-31. [`akuma_primitives::mmio::MmioReg`] collapsed them to one, and
+//! that one moved to `crates/akuma-uart` — the device is a crate now, and what
+//! is left here is *policy*: IRQ masking, the opt-in cross-core `Spinlock` and
+//! its reentrancy guard, the `MULTICORE` runtime gate, and every formatting
+//! helper. See `docs/archive/AKUMA_UART_EXTRACTION.md`.
+//!
+//! `forbid`, not `deny`: `deny` can be switched back off by a module-local
+//! `#[allow(unsafe_code)]`. This is the file that has to keep working when the
+//! allocator is what broke, so a stray `unsafe` here is worth a compile error.
+//!
+//! The ban does not mean the console is proven sound — it means the one genuinely
+//! unsafe operation, vouching that `DEV_UART_VA` is a mapped PL011 window, is
+//! stated once in the crate that owns the device instead of at each access.
+#![forbid(unsafe_code)]
+
 use crate::alloc::string::ToString;
 use alloc::vec::Vec;
 #[cfg(kernel_console_lock)]
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 #[cfg(kernel_console_lock)]
 use spinning_top::Spinlock;
-
-// ============================================================================
-// UART Driver - Encapsulates all MMIO access
-// ============================================================================
-
-/// PL011 UART register offsets
-const DR_OFFSET: usize = 0x00; // Data register
-const FR_OFFSET: usize = 0x18; // Flag register
-
-/// Flag register bits
-const RXFE: u32 = 1 << 4; // Receive FIFO empty flag
-#[allow(dead_code)]
-const TXFF: u32 = 1 << 5; // Transmit FIFO full flag
-
-/// UART driver that encapsulates all MMIO access
-struct Uart {
-    base: usize,
-}
-
-impl Uart {
-    /// Create a new UART driver at the given base address
-    const fn new(base: usize) -> Self {
-        Self { base }
-    }
-
-    /// Write a byte to the UART data register
-    #[inline]
-    fn write(&self, byte: u8) {
-        // SAFETY: Writing to UART data register at known address
-        unsafe {
-            ((self.base + DR_OFFSET) as *mut u8).write_volatile(byte);
-        }
-    }
-
-    /// Read a byte from the UART data register
-    #[inline]
-    fn read(&self) -> u8 {
-        // SAFETY: Reading from UART data register at known address
-        unsafe { ((self.base + DR_OFFSET) as *mut u8).read_volatile() }
-    }
-
-    /// Read the UART flag register
-    #[inline]
-    fn flags(&self) -> u32 {
-        // SAFETY: Reading from UART flag register at known address
-        unsafe { ((self.base + FR_OFFSET) as *const u32).read_volatile() }
-    }
-
-    /// Check if there is data available to read
-    #[inline]
-    fn has_data(&self) -> bool {
-        (self.flags() & RXFE) == 0
-    }
-}
-
-/// Global UART instance at remapped VA (physical 0x0900_0000 via L0[1])
-static UART: Uart = Uart::new(akuma_exec::mmu::DEV_UART_VA);
 
 // ============================================================================
 // Cross-core serialization (opt-in via `CONSOLE_LOCK=1`)
@@ -147,21 +110,21 @@ fn emit(bytes: &[u8]) {
                 // `emit()` this core already owns. Write directly, do not
                 // re-acquire (Spinlock is not reentrant).
                 for &b in bytes {
-                    UART.write(b);
+                    akuma_uart::write_byte(b);
                 }
                 return;
             }
             let _g = CONSOLE_LOCK.lock();
             CONSOLE_OWNER.store(me, Ordering::Relaxed);
             for &b in bytes {
-                UART.write(b);
+                akuma_uart::write_byte(b);
             }
             CONSOLE_OWNER.store(0, Ordering::Relaxed);
             drop(_g);
             return;
         }
         for &b in bytes {
-            UART.write(b);
+            akuma_uart::write_byte(b);
         }
     });
 }
@@ -267,19 +230,19 @@ macro_rules! tprint {
 
 /// Check if a character is available for reading
 pub fn has_char() -> bool {
-    UART.has_data()
+    akuma_uart::has_data()
 }
 
 /// Read a character (non-blocking, only call if has_char() is true)
 pub fn getchar() -> u8 {
-    UART.read()
+    akuma_uart::read_byte()
 }
 
 /// Read a character (blocking)
 #[allow(dead_code)]
 fn getchar_blocking() -> u8 {
     while !has_char() {}
-    UART.read()
+    akuma_uart::read_byte()
 }
 
 #[allow(dead_code)]

@@ -1,0 +1,11 @@
+[package]
+name = "akuma-uart"
+version = "0.1.0"
+edition = "2024"
+description = "The PL011 console UART: two registers and the byte-level accessors over them. Quarantines the console's MMIO unsafe out of the bin crate."
+
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+
+[lints]
+workspace = true
