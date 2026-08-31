@@ -103,17 +103,37 @@ to close a gap would churn every device for nothing.
 standing in for the BKL — `RNG_DEVICE`, `SOUND_DEVICE`, and formerly ramfb's
 `FB_STATE`.
 
-`test_drivers_bkl_drop` **lost its only real guarded path.** Every `getrandom`
-leg fails `validate_user_ptr` *before* `DriverBklGuard` is constructed, so those
-legs only ever proved the guard is not opened on early-error paths.
-`sys_fb_init` was the one driver syscall that took dimensions rather than
-pointers, so it could be called from a boot test without a mapped user page —
-which made it the only leg that opened the window and proved it closed.
+`test_drivers_bkl_drop` briefly **lost its only real guarded path, and got it
+back the same day.** Recorded because the wrong diagnosis is instructive.
 
-What remains is early-error paths plus the kill switch. **Do not read a pass as
-"the dropped window closes."** Restoring that coverage needs a driver syscall
-callable without a mapped user buffer; there is none today. This is stated in the
-test's own doc comment so the next reader does not have to find this file.
+`sys_fb_init` was the one driver syscall taking dimensions rather than pointers,
+so a boot test could call it with no mapped user page — the only leg that opened
+the dropped window and proved it closed. Every `getrandom` leg fails
+`validate_user_ptr` *before* `DriverBklGuard` is constructed.
+
+The first conclusion was that restoring coverage needed a driver syscall callable
+without a mapped user buffer, and that none existed. **That was wrong.** It does
+not need a mapped page — it needs `BYPASS_VALIDATION`, which
+`validate_user_range` short-circuits on
+(`crates/akuma-exec/src/process/user_access.rs:313`), letting a kernel-stack
+pointer through the check. `sync_tests.rs` and `pthread_tests.rs` had been
+driving real syscalls that way the whole time, and `copy_to_user_with`'s SAFETY
+comment names the case explicitly — *"or explicitly bypassed by a boot test"*.
+The mistake was staring at the fb-shaped hole instead of at how the neighbouring
+test modules solve the same problem.
+
+The replacement leg calls `sys_getrandom` with a bypassed kernel-stack buffer, so
+the guard is constructed and the whole chunked `fill_bytes` + `copy_to_user` body
+runs inside the window. It is **better** coverage than the fb leg: `getrandom` is
+a syscall real userspace calls (`fb_init` had none), and the driver body executes
+in the window rather than a bare `init()`.
+
+Two guards against a vacuous pass, both worth keeping: the buffer must come back
+non-zero, and the PASSED line reports the branch — `[filled]` (fill assertion
+armed) vs `[EIO]` (no virtio-rng; the guard still opens and closes because
+`fill_bytes` fails inside it, but the assertion never fires). Without that
+report, silent degradation to `EIO` would be indistinguishable from real
+coverage — which is the same class of trap as the original loss.
 
 ## 4. Immediately before: the unsafe cleanup (same day)
 

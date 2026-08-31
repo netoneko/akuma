@@ -5009,15 +5009,24 @@ fn test_mm_bkl_drop() {
 /// `bkl::in_dropped_window()` is false once the call returns — the guard's ledger
 /// must end balanced.
 ///
-/// **This test lost its teeth on 2026-08-31** and the replacement is not equal.
-/// It used to reach a *real* guarded path through `sys_fb_init`, which took
-/// dimensions rather than pointers and so could be called without a mapped user
-/// page. The framebuffer syscalls are gone
-/// (`docs/archive/FRAMEBUFFER_REMOVED.md`) and `sys_getrandom` fails
-/// `validate_user_ptr` *before* the guard is constructed, so what remains only
-/// covers early-error paths plus the kill switch. Restoring real-path coverage
-/// needs a driver syscall that is callable without a mapped user buffer; there
-/// is none today. Do not read a pass here as "the dropped window closes".
+/// Three legs: an early-error path that must never open the window, a **real**
+/// guarded path that must open it and close it again, and the kill switch.
+///
+/// The real leg used to be `sys_fb_init`, which took dimensions rather than
+/// pointers and so needed no mapped user page. That went with the framebuffer
+/// (`docs/archive/FRAMEBUFFER_REMOVED.md`), and `sys_getrandom` — the only
+/// driver syscall left — fails `validate_user_ptr` before the guard is built.
+/// `BYPASS_VALIDATION` is the way back in: `validate_user_range` short-circuits
+/// to `true` while it is set, so a kernel-stack buffer passes the check and the
+/// whole chunked `fill_bytes` + `copy_to_user` body runs inside the window. Same
+/// lever `sync_tests.rs` and `pthread_tests.rs` use.
+///
+/// Two things keep a pass from going vacuous, and both matter: the buffer must
+/// come back non-zero (proving the body ran rather than short-circuiting to a
+/// success return), and the PASSED line reports which branch was taken. `EIO` is
+/// tolerated for a machine with no virtio-rng — the guard still opens and closes,
+/// since `fill_bytes` fails *inside* it — but on that path the fill assertion
+/// never fires, so `[EIO]` in the log means weaker coverage than `[filled]`.
 ///
 /// Every device driver compiled in must correspond to hardware this machine
 /// actually has.
