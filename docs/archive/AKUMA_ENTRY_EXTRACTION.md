@@ -194,6 +194,44 @@ kernel memory with an `LDP` (`0xa9401023`), which carries no syndrome, so HVF
 reports ISV=0 and asserts before the guest sees the fault. `cargo_runner.sh`
 prints the diagnosis itself. Re-run with `MEMORY=2048M`.
 
+## 11. Follow-on: the two hooks that were on the wrong side of their own rule
+
+`proposals/POST_REFACTORING_CLEANUP.md` item 1 asked whether each boot-registered
+hook's failure mode was deliberate or copy-paste. Audited, and the tree turned out
+to already have two coherent classes — with two exceptions, both in
+`akuma-kernel-glue`:
+
+| | absent means | accessor |
+|---|---|---|
+| `Registered<T>` (9 crates) | a boot-order **bug** | `require()`, panics naming the `init` you forgot |
+| `OnceCopy<T>` (6 statics) | a legitimate **state** | `get()`, every read degrades |
+
+The rule that separates them, now written down in `akuma-not-even-once`'s header:
+**if the same cfg that declares the static also guarantees the registration, it is
+a `Registered`** — there is no absent state to handle.
+
+Both exceptions were `OnceCopy` statics whose cfg is identical to `rust_start`'s
+registration, so neither had an absent state:
+
+- `BOOT_TEST_HOOKS` — a hand-rolled `.expect("boot test hooks not registered")`,
+  i.e. the right policy spelled the long way, with a diagnostic that named no
+  `init` call. Now `Registered::require()`.
+- `RUMP_TESTS_HOOK` — worse, and the reason this was worth doing: its call site
+  read `if !DISABLE_ALL_TESTS && let Some(f) = RUMP_TESTS_HOOK.get() { f() }`, so
+  a drifted cfg between the static and the registration would have skipped the
+  **entire rump regression suite** without printing a word. Now `require()`.
+
+Verified by boot rather than by inspection, since the second change converts a
+silent skip into a panic on a live path (`rump` is a default feature): `SMP=2`,
+165 `Result: PASS`, no panic, and `[PASS] test_rump_fd_ref_survives_fork` present
+— the suite runs.
+
+Item 1's third sub-item, a proposed `assert_all_hooks_registered()`, was
+**deliberately not built**. With the rule above it has nothing to check: every
+`Registered` already panics with a named diagnostic on first use, and every
+`OnceCopy` is *supposed* to be absent sometimes. A checker over the union would
+either duplicate `require()` or fire on the legitimately-absent half.
+
 ## Background
 
 - `docs/archive/AKUMA_SMP_SHARED_SPLIT.md` — `smp_shared` reaching zero `unsafe`

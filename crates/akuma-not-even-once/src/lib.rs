@@ -5,6 +5,33 @@
 //! callback table with a diagnostic, and [`TakeOnce`] for a large `static`
 //! buffer that exactly one owner needs `&'static mut` to.
 //!
+//! # Which of the two to reach for
+//!
+//! [`OnceCopy`] and [`Registered`] wrap the same cell and differ only in what
+//! happens when the value is absent. That choice is not a style preference — it
+//! is a statement about whether absence is *possible*, and the tree splits
+//! cleanly along it:
+//!
+//! | | absent means | accessor | examples |
+//! |---|---|---|---|
+//! | [`Registered`] | a boot-order **bug** | `require()` — panics naming the `init` you forgot | `ExecRuntime`, `PmmHooks`, `SchedHooks`, `VfsHooks`, the boot self-test suite |
+//! | [`OnceCopy`] | a legitimate **state** | `get()` — every read degrades (`is_some_and`, `map_or`, `if let`) | the console print hook, the clock hook, the optional rump/box syscall tables |
+//!
+//! The distinction earns its keep because both failure modes are silent in the
+//! wrong direction. A `Registered` that degraded would let a missing runtime
+//! surface a thousand instructions later as a wrong answer; an `OnceCopy` that
+//! panicked would take down early boot, where the console hook legitimately is
+//! not installed yet and printing must stay a no-op.
+//!
+//! So: **if the same cfg that declares the static also guarantees the
+//! registration, it is a [`Registered`]** — there is no absent state to handle,
+//! and spelling one anyway converts a boot-order bug into silence. Two hooks in
+//! `akuma-kernel-glue` were on the wrong side of that line until 2026-09-01: the
+//! boot self-test table (a hand-rolled `.expect()` on an `OnceCopy`, i.e. the
+//! right policy written the long way) and the rump regression suite, whose
+//! `if let Some(f) = HOOK.get()` call site meant a drifted cfg would skip the
+//! entire suite without a word.
+//!
 //! # Why this is its own crate
 //!
 //! Split out of `akuma-primitives` on 2026-08-30. It was that crate's last five

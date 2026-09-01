@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 773
-- **Docs contributing at least one fix:** 249
+- **Total distinct fixes counted:** 778
+- **Docs contributing at least one fix:** 252
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 132 | 17.1% | 20 |
-| Memory & Virtual Memory | 122 | 15.8% | 39 |
+| Syscall / ABI Compatibility Audits | 132 | 17.0% | 20 |
+| Memory & Virtual Memory | 122 | 15.7% | 39 |
 | Scheduler & Process Management | 79 | 10.2% | 22 |
-| SMP & Locking | 89 | 11.5% | 39 |
+| SMP & Locking | 91 | 11.7% | 40 |
 | Networking | 58 | 7.5% | 22 |
 | Userspace Apps & Libraries | 37 | 4.8% | 20 |
-| Rump Kernel & Syscall Proxy | 26 | 3.4% | 6 |
-| Toolchain & Self-Hosting | 43 | 5.6% | 7 |
-| SSH | 26 | 3.4% | 15 |
-| VFS & Filesystem | 33 | 4.3% | 18 |
+| Rump Kernel & Syscall Proxy | 26 | 3.3% | 6 |
+| Toolchain & Self-Hosting | 43 | 5.5% | 7 |
+| SSH | 26 | 3.3% | 15 |
+| VFS & Filesystem | 33 | 4.2% | 18 |
 | Boot & Drivers | 24 | 3.1% | 9 |
 | Signals & Exceptions | 15 | 1.9% | 7 |
-| Misc / Cross-cutting | 33 | 4.3% | 8 |
+| Misc / Cross-cutting | 36 | 4.6% | 10 |
 | Console & Terminal | 32 | 4.1% | 11 |
 | Containers | 24 | 3.1% | 6 |
-| **Total** | **773** | **100.0%** | **249** |
+| **Total** | **778** | **100.0%** | **252** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -512,7 +512,11 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/KTG_GRACE_EXPIRY_KILL_INTERRUPT.md
 - `exit_group` paid its full 2 s kill-grace per multithreaded process: a thread parked in an untimed `FUTEX_WAIT` (or any yarn-driven blocking wait) was woken by the deferred-kill request but re-parked, because neither `sys_futex`'s re-evaluation nor `should_interrupt_blocking_syscall` consulted `PENDING_KILL` — both read only signal paths — so the wake was consumed by the very loop it was meant to end and the only exit was grace expiry plus hard kill; fixed by adding the kill check first in both readers, returning `EINTR` that unwinds to the thread's self-termination boundary (boot test `test_pending_kill_interrupts_blocking_wait`, probe `userspace/forktest/c_stress/futexkill.c`)
 
-## SMP & Locking (89 fixes, 39 docs)
+## SMP & Locking (91 fixes, 40 docs)
+
+### docs/archive/SYSCALL_UNSAFE_CLEANUP.md
+(The `src/syscall/` `unsafe`-to-zero conversion is a refactor and is not counted; this is the defect it surfaced. The `with_own_process_exclusive` clause the doc leaves unproven is a documented obligation, not a fix.)
+- `io_setup` called `map_user_page` **without holding `as_lock`**, then walked `proc.address_space` directly — on `smp-shared` a concurrent unmap could free a page-table frame that walk was descending through. Converting the site to the safe wrapper forced the fix, because the wrapper's `&mut self` made the unlocked spelling inexpressible; the frame allocation stays outside the hold, since the PMM's reclaim path re-enters `as_lock`
 
 ### docs/archive/IRQ_HANDLER_TABLE_DEADLOCK.md
 - `register_handler` called `gic::enable_irq()` **while holding `IRQ_HANDLERS`**, the non-reentrant spinlock `dispatch_irq` takes from the interrupt vector, so a line delivering on that core before the guard dropped self-deadlocked it — with the BKL still held, surfacing as an `SMP>1` boot freeze with `[BKL] stuck: owner=1 waiter=2/3/4`. Fixed with a fixed `[Option<IrqHandler>; 256]` table (also removing up to 49 `Vec::push` heap allocations inside that lock), publishing under `with_irqs_disabled`, and moving `enable_irq` outside the lock
@@ -628,7 +632,8 @@ aren't recorded anywhere else.)
 - `LAZY_REGION_TABLE`'s `mmap`/`mprotect` mutators allocated on the heap while holding the lock; an OOM there abandoned the lock via `return_to_kernel`, and the exit path's `clear_lazy_regions` then re-acquired the same (now-wedged) lock forever — the `-j4` self-host freeze of 2026-08-02; fixed structurally by moving the per-pid map onto `Process::lazy_regions`, removing the second global-lock acquisition from the exit path entirely
 
 ### docs/archive/EPOLL_MULTI_POLLER_PIPE_FLAKE.md
-- `test_epoll_multi_poller_pipe`'s intermittent `woken=1 (expected 2)` (31% at SMP=2, distinct from the earlier always-`woken=0` bug in `EPOLL_PERFORMANCE.md`) was a test-harness defect, not a kernel bug: a 2ms "assume both threads are scheduled" delay with no handshake, plus a wake-budget that exactly equaled the poll-interval fallback (10ms vs. 10ms, a coin flip under scheduler jitter); both fixed in the test
+- `test_epoll_multi_poller_pipe`'s intermittent `woken=1 (expected 2)` (31% at SMP=2, distinct from the earlier always-`woken=0` bug in `EPOLL_PERFORMANCE.md`) was a test-harness defect, not a kernel bug: a 2ms "assume both threads are scheduled" delay with no handshake, plus a wake-budget that exactly equaled the poll-interval fallback (10ms vs. 10ms, a coin flip under scheduler jitter); both fixed in the test — **§9 (2026-09-01) establishes this was not the root cause**: it removed two real defects and lowered the rate without touching what actually failed, which is why §8's ten clean boots did not hold
+- The real cause, found when it came back: the test waited with a bare `yield_now()` spin in the handshake, the wake budget and both pollers' terminal parks. The boot suite runs with the BKL held, and `yield_now` returns without switching when nothing else on the core is READY — so the main thread re-entered the loop still holding the BKL, freezing every peer core out of the kernel. The poller co-located on core 0 always finished (hence `woken=1`, never `woken=0`) while the peer-core poller spun forever on the BKL acquire its `epoll_pwait` lap needed. Fixed in the test by using `blocking_relax()` at every wait, whose `idle_halt` drops the BKL around a WFI; still no kernel change
 
 ### docs/archive/MPROTECT_TLB_ASID_BUG.md
 - `flush_tlb_range` invalidated with `tlbi vale1is`, whose ASID comes from operand bits [63:48] — zero for every user VA, while user processes run under non-zero ASIDs — so `sys_mprotect`'s permission downgrades (musl's guard-page `PROT_NONE`, RELRO GOT `PROT_READ`) never reached the TLB and stayed silently writable; fixed by widening to `vaae1is` (all-ASID), required because `new_shared` puts one L0 table under several live ASIDs at once
@@ -1186,7 +1191,16 @@ aren't recorded anywhere else.)
 - Even with that mask, a signal-woken thread rejoined the back of the round-robin run queue, and signal delivery had unbounded priority over resuming the syscall it interrupted (each handler return re-delivered the next pending signal immediately), so under a 10ms-cadence signal sender the interrupted syscall was starved indefinitely rather than merely raced; fixed via `SIGNAL_WAKE_PREEMPT` (runs a signal-woken thread on the next switch) plus `SIGFRAME_ACTIVE` (bounds delivery to one handler per unit of userspace progress, consulted by `rt_sigreturn`)
 
 
-## Misc / Cross-cutting (33 fixes, 8 docs)
+## Misc / Cross-cutting (36 fixes, 10 docs)
+
+### docs/archive/AKUMA_ENTRY_EXTRACTION.md
+(The `akuma-entry` split itself is a refactor and is not counted; these are the two defects it surfaced. The `with_boot_identity_fdt` change — mapping and range-checking the DTB pointer instead of vouching for it by comment — is a hardening with no observed failure, and is not counted either.)
+- `scripts/cloc_akuma.py` marked a crate as carrying `#![forbid(unsafe_code)]` when **any** file in it did, so a module-level ban on one file reported the whole crate as enforced: `akuma-kernel-glue` showed `forbid` on the strength of `console.rs` while still holding boot assembly and three `unsafe` sites. Since the script regenerates `docs/reference/crate-safety.md`, the miscount landed in the docs as authoritative. Detection now requires the file to be a crate root, so a module-level ban understates the crate rather than overstating it
+- `RUMP_TESTS_HOOK`'s call site read `if !DISABLE_ALL_TESTS && let Some(f) = HOOK.get() { f() }`, but the hook's `OnceCopy` static and `rust_start`'s registration carry the identical cfg — so there was no absent state to handle, and any drift between the two would have skipped the **entire rump regression suite** silently. Converted to `Registered::require()`, which panics naming the missing `init`; `BOOT_TEST_HOOKS` had the same shape spelled as a hand-rolled `.expect()`
+
+### docs/archive/SRC_BOOT_ENTRY_UNSAFE_CLEANUP.md
+(The `src/` boot-entry `unsafe` reduction and the boot suite's hand-rolled-pinning cleanup are refactors and are not counted; this is the defect the new lexer tests found. The 70 remaining test `unsafe` sites are the suite's subject matter, not debt.)
+- `scripts/cloc_akuma.py`'s lexer counted `r#unsafe` — the raw-identifier escape, the one spelling of those six letters that is **not** the keyword — as an `unsafe` site: the scanner saw `r`, then a bare `#`, then `unsafe`. Nothing in the tree writes it today; fixed because the failure is silent and inflates a number the docs quote as authoritative
 
 ### docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md
 (The `akuma-exec` crate split itself is a refactor and is not counted; these are the defects it surfaced and fixed along the way. The `akuma-bkl` dead-`RawRwSpinlock` deletion is a removal with no bug attached; the `akuma-ext2` generation bug it points at was **open** when this was written and is now fixed and counted under VFS & Filesystem, in `AKUMA_EXT2_CLEANUP.md`'s own subsection.)
@@ -1351,6 +1365,8 @@ aren't recorded anywhere else.)
 ---
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
+
+Also scanned 2026-09-01 (the `oof` branch — the `src/` -> `crates/` extraction campaign, 40 commits — ahead of merging it). Fourteen crate-extraction records are pure refactors with no defect attached and are counted nowhere: AKUMA_ALLOC_EXTRACTION, AKUMA_CONFIG_EXTRACTION, AKUMA_EXCEPTIONS_EXTRACTION, AKUMA_FDT_EXTRACTION, AKUMA_FPCACHE_EXTRACTION, AKUMA_GIC_CONSOLIDATION (a three-file consolidation that deleted a dead GICv2 backend and two byte-identical MMIO copies — removals, not fixes), AKUMA_SMP_SHARED_SPLIT, AKUMA_SYSCALLS_GLUE_EXTRACTION, AKUMA_UART_EXTRACTION, AKUMA_VFS_GLUE_EXTRACTION, INLINE_ASM_CLEANUP (218 `asm!` sites to 35, mechanical), SRC_SYSCALL_EXTRACTION, and FRAMEBUFFER_REMOVED (a removal). The three docs on this branch that *did* surface defects have their own subsections above: AKUMA_ENTRY_EXTRACTION and SRC_BOOT_ENTRY_UNSAFE_CLEANUP (Misc / Cross-cutting) and SYSCALL_UNSAFE_CLEANUP (SMP & Locking). SELFHOST_KERNEL_HEAP_LEAK is **open** — the kernel heap climbs 13 MB to 760 MB across in-guest clean builds and OOM-kills `rustc`, A/B'd as pre-existing on both arms 2026-09-01, no fix — and is counted nowhere. Two already-listed docs were re-checked for content added on this branch: AKUMA_FIRECRACKER_KVM gained §5.5 (`--no-net` parks in an early non-returning branch of `run_async_main`, so every test section after network init silently does not run) which is a **documentation-only finding, explicitly not a regression and with no fix landed**, so it adds no bullet; DEVBOX_ISSUES gained Issue 27 (SIGILL spam on every `cargo` start) which is **Status: OPEN**. EPOLL_MULTI_POLLER_PIPE_FLAKE gained a real §9 fix and its subsection above was corrected — §6, previously recorded as the fix, is now known not to have been the root cause.
 
 Also scanned 2026-08-30 (the `akuma-exec` split branch, ahead of closing it): AKUMA_EXT2_CLEANUP was parked here as a plan with nothing implemented. **That is no longer true** — all five steps landed 2026-08-30/31 and it now has its own subsection under VFS & Filesystem with six bullets. AKUMA_EXEC_SPLIT_AGAIN's own crate-split content is a refactor and is not counted — only the four defects it surfaced along the way are, under Misc / Cross-cutting above.
 

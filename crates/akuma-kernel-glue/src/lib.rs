@@ -490,22 +490,29 @@ pub struct BootTestHooks {
     pub process_network_tests: fn(),
 }
 
+/// `Registered`, not a bare `OnceCopy`: this table MUST exist by the time
+/// `kernel_main` reaches the suite, so absence is a boot-order bug rather than
+/// a condition to handle. See `akuma_not_even_once`'s "Which of the two to
+/// reach for" — the accessor below was a hand-rolled `.expect()` on an
+/// `OnceCopy` until 2026-09-01, which is the same policy spelled the long way
+/// and the one hook in the tree that did not match its class.
 #[cfg(all(target_os = "none", kernel_tests))]
-static BOOT_TEST_HOOKS: akuma_primitives::OnceCopy<BootTestHooks> =
-    akuma_primitives::OnceCopy::new();
+static BOOT_TEST_HOOKS: akuma_primitives::Registered<BootTestHooks> =
+    akuma_primitives::Registered::new(
+        "akuma-kernel-glue: boot test hooks not registered — \
+         call akuma_kernel_glue::set_boot_test_hooks() from rust_start first",
+    );
 
-/// Install the boot self-test hooks. Idempotent by `OnceCopy`'s contract — a
+/// Install the boot self-test hooks. Idempotent by `Registered`'s contract — a
 /// second call is ignored.
 #[cfg(all(target_os = "none", kernel_tests))]
 pub fn set_boot_test_hooks(hooks: BootTestHooks) {
-    BOOT_TEST_HOOKS.set(hooks);
+    BOOT_TEST_HOOKS.register(hooks);
 }
 
 #[cfg(all(target_os = "none", kernel_tests))]
 fn boot_test_hooks() -> BootTestHooks {
-    BOOT_TEST_HOOKS
-        .get()
-        .expect("boot test hooks not registered before kernel_main")
+    BOOT_TEST_HOOKS.require()
 }
 
 /// The rump regression-guard suite (`src/rump_tests.rs`) is gated
@@ -518,7 +525,10 @@ fn boot_test_hooks() -> BootTestHooks {
     feature = "rump",
     any(not(feature = "no-tests"), feature = "rump-tests"),
 ))]
-static RUMP_TESTS_HOOK: akuma_primitives::OnceCopy<fn()> = akuma_primitives::OnceCopy::new();
+static RUMP_TESTS_HOOK: akuma_primitives::Registered<fn()> = akuma_primitives::Registered::new(
+    "akuma-kernel-glue: rump tests hook not registered — \
+     call akuma_kernel_glue::set_rump_tests_hook() from rust_start first",
+);
 
 #[cfg(all(
     target_os = "none",
@@ -527,7 +537,7 @@ static RUMP_TESTS_HOOK: akuma_primitives::OnceCopy<fn()> = akuma_primitives::Onc
     any(not(feature = "no-tests"), feature = "rump-tests"),
 ))]
 pub fn set_rump_tests_hook(f: fn()) {
-    RUMP_TESTS_HOOK.set(f);
+    RUMP_TESTS_HOOK.register(f);
 }
 
 /// Main kernel initialization - all safe code
@@ -1655,8 +1665,13 @@ fn run_async_main() -> ! {
         feature = "rump",
         any(not(feature = "no-tests"), feature = "rump-tests"),
     ))]
-    if !config::DISABLE_ALL_TESTS
-        && let Some(f) = RUMP_TESTS_HOOK.get() { f(); }
+    // `require`, not `get`: this static and `rust_start`'s registration carry the
+    // identical cfg, so an absent hook here means the two drifted apart — and the
+    // old `if let Some` spelling turned that into a regression suite silently not
+    // running, which is the failure this whole class of hook is meant to make loud.
+    if !config::DISABLE_ALL_TESTS {
+        (RUMP_TESTS_HOOK.require())();
+    }
 
     // devbox: make the rump stack the DEFAULT for box 0 (the root box) and bring
     // up its rump_server here, so every unboxed process is rump-networked with no
