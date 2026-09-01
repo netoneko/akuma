@@ -932,6 +932,98 @@ static DOUBLE_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub static DP_PREFAULT_FILL_SHORT: AtomicUsize = AtomicUsize::new(0);
 
 // ============================================================================
+// Leak-debugging: per-site demand-paging frame counters (temporary instrument)
+// ============================================================================
+// Each demand-paging map site bumps the matching counter once per page it maps,
+// and the page-free path bumps PAGES_FREED. Dumped in the crash handler and the
+// periodic [Mem] line so a memory spike can be attributed to a specific path.
+//
+// Moved here from `src/pmm.rs` on 2026-09-01, with the exception path's move to
+// `akuma-exceptions`: their remaining bumpers (`src/exceptions.rs` until then,
+// `src/syscall/mem.rs`) were exactly the "call sites outside pmm.rs" the old
+// comment kept them out for, and both now reach `akuma_pmm` directly. The
+// one-line dump (`dp_counters_line`) stayed in `src/pmm.rs` — it also reads
+// `akuma_ext2`'s inode-deferred-free counters, which sit ABOVE this crate.
+
+pub static DP_FILE_PAGES: AtomicUsize = AtomicUsize::new(0);
+pub static DP_ANON_PAGES: AtomicUsize = AtomicUsize::new(0);
+pub static DP_COW_PAGES: AtomicUsize = AtomicUsize::new(0);
+pub static DP_PROTNONE_PAGES: AtomicUsize = AtomicUsize::new(0);
+pub static EAGER_MMAP_PAGES: AtomicUsize = AtomicUsize::new(0);
+pub static USER_PAGES_FREED: AtomicUsize = AtomicUsize::new(0);
+
+/// Instruction-abort faults whose lazy region records **non-executable** flags, so the
+/// page maps non-exec and the fetch cannot succeed until the permission-fault arm
+/// upgrades it to `RX`.
+///
+/// Not a frame counter (unlike its neighbours) — it counts *faults*, once per fault
+/// rather than once per page, and it exists to answer a reachability question the tree
+/// had never measured: the merged demand-paging body skips I-cache maintenance for
+/// these pages, on the argument that the upgrade path does it instead
+/// (`docs/archive/COW_PILE_AUDIT.md` §12.1). A non-zero value means that argument is
+/// load-bearing in this workload; zero means the change is inert here.
+pub static DP_IA_NOEXEC_FAULTS: AtomicUsize = AtomicUsize::new(0);
+
+/// File-backed demand-page fills whose `read_at` **errored or came up short**.
+///
+/// Pass B fills into a frame from `alloc_pages_zeroed`, so an incomplete read leaves
+/// the tail (or the whole page) as zeros. Both fill sites used to discard the
+/// `Result<usize, _>` entirely, which made that indistinguishable from a file that
+/// genuinely contains zeros — and the shareable arm then published the frame to
+/// `file_page_cache` under `(inode, file_off)`, so one transient short read became a
+/// *persistent, cross-process* zero page that every later mapper got as a cache hit
+/// without touching the disk.
+///
+/// That is the mechanism behind `rustc` ICEing with
+/// `Expected header tag [79, 68, 72, 84] but found [0, 0, 0, 0]` ("ODHT", the crate
+/// metadata header) during the self-host build: one poisoned `.rlib` page, then every
+/// concurrent `rustc` reading the same page of the same file.
+///
+/// **Non-zero here is always a defect.** A short read at this layer is not a normal
+/// EOF condition — the range was already clamped to `filesz` by the caller.
+pub static DP_FILE_FILL_SHORT: AtomicUsize = AtomicUsize::new(0);
+
+/// `sys_munmap`'s whole-region arm found the region's **recorded** frame for a VA
+/// disagreeing with the frame actually in the live PTE.
+///
+/// The record goes stale whenever something replaces a mapping without rewriting the
+/// region's frame list: `complete_cow_break` installing a private copy,
+/// `MADV_DONTNEED`'s share-break, a CoW write fault. Freeing the recorded frame then
+/// releases a page this process no longer maps — while a peer may still hold it — and
+/// simultaneously leaks the frame that *was* mapped.
+///
+/// Every premature free in the 2026-08-15 hunt attributed to `site=munmap-region`
+/// (6/6). See `docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §6.
+pub static DP_MUNMAP_STALE_REGION_FRAME: AtomicUsize = AtomicUsize::new(0);
+
+/// Faults on a lazy region whose flags say `PROT_NONE` but whose source is a **file**.
+///
+/// The `PROT_NONE` arm of the translation-fault path auto-commits a reservation with a
+/// zeroed frame (Go's `sysReserve`/`sysMap` shape). That is right for an anonymous
+/// reservation and catastrophic for a file-backed one: the process gets zeros where the
+/// file's bytes belong, with no short read, no error, and no cache involvement — which
+/// is exactly the residue left after `DP_FILE_FILL_SHORT` and `DP_FILE_CACHE_MISMATCH`
+/// both came back clean across a reproducing build.
+pub static DP_PROTNONE_FILE_REGION: AtomicUsize = AtomicUsize::new(0);
+
+/// `file_page_cache` hits whose frame did **not** match the file on disk, counted only
+/// when the fpcache verify-hits debug gate is on. Non-zero proves the cache is serving
+/// wrong bytes and names the key; zero across a reproducing build clears the cache
+/// entirely and moves the search downstream.
+pub static DP_FILE_CACHE_MISMATCH: AtomicUsize = AtomicUsize::new(0);
+
+/// Pages withheld from `file_page_cache` because [`DP_FILE_FILL_SHORT`] fired for them.
+/// The gap between the two counters is the incomplete fills that were never eligible
+/// to be published anyway (not fully covered by file data, or a private mapping).
+pub static DP_FILE_FILL_UNPUBLISHED: AtomicUsize = AtomicUsize::new(0);
+
+/// Bump a demand-paging counter by `n`.
+#[inline]
+pub fn dp_count(counter: &AtomicUsize, n: usize) {
+    counter.fetch_add(n, Ordering::Relaxed);
+}
+
+// ============================================================================
 // UAF hunt: free ledger — a ring of recent frees, named by thread
 // ============================================================================
 

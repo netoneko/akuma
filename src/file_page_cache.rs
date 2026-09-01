@@ -10,10 +10,15 @@
 //! [`FpcacheConfig`](akuma_fpcache::FpcacheConfig). `config` therefore remains
 //! the single source of truth for the values.
 
-pub use akuma_fpcache::{
-    insert, invalidate_inode, is_shareable_mapping, len, lookup_and_ref, mark_icache_clean,
-    shrink, stats_line,
-};
+pub use akuma_fpcache::{invalidate_inode, len, shrink, stats_line};
+
+// The rest of the shim's re-exports: exceptions.rs — their production caller —
+// reached `akuma_fpcache` directly on 2026-09-01, and the only `src/` callers
+// left are the fpcache boot self-tests in `process_tests.rs`, which `no-tests`
+// builds (extreme-size, devbox) compile out while still denying unused
+// imports. Same shape as `pmm.rs`'s `cow_ref_count`/`cow_ref_inc` re-exports.
+#[allow(unused_imports)]
+pub use akuma_fpcache::{insert, is_shareable_mapping, lookup_and_ref, mark_icache_clean};
 
 /// Size the cache from total RAM. Called once from `fs::init`.
 ///

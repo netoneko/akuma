@@ -93,12 +93,20 @@ static CORE_IDLE_MASK: AtomicU32 = AtomicU32::new(0);
 // lives in `akuma_exec::process::bkl_guard`, and `akuma-exec` depends on
 // `akuma-bkl`, so moving it would invert that edge.
 pub use akuma_bkl::policy::{
-    drivers_bkl_drop_enabled, exec_bkl_drop_enabled, fault_bkl_drop_enabled,
-    irq_bkl_drop_enabled, mm_bkl_drop_enabled, sched_bklfree_el0_enabled,
-    set_drivers_bkl_drop_enabled, set_exec_bkl_drop_enabled,
-    set_fault_bkl_drop_enabled, set_irq_bkl_drop_enabled, set_mm_bkl_drop_enabled,
-    set_sched_bklfree_el0_enabled, set_syscall_bkl_optout, set_vfs_bkl_drop_enabled,
-    syscall_bkl_optout, vfs_bkl_drop_enabled,
+    drivers_bkl_drop_enabled, exec_bkl_drop_enabled, mm_bkl_drop_enabled,
+    vfs_bkl_drop_enabled,
+};
+// The A/B setters, and the three getters whose last production reader was the
+// exception path (which reads `akuma_bkl::policy::` directly since 2026-09-01),
+// are now touched only by the boot self-tests — `process_tests.rs`, which
+// `no-tests` builds (`devbox-smoltcp`, extreme-size) compile out while denying
+// unused imports. Same shape as `pmm.rs`'s tests-only re-exports.
+#[allow(unused_imports)]
+pub use akuma_bkl::policy::{
+    irq_bkl_drop_enabled, sched_bklfree_el0_enabled, set_drivers_bkl_drop_enabled,
+    set_exec_bkl_drop_enabled, set_fault_bkl_drop_enabled, set_irq_bkl_drop_enabled,
+    set_mm_bkl_drop_enabled, set_sched_bklfree_el0_enabled, set_syscall_bkl_optout,
+    set_vfs_bkl_drop_enabled, syscall_bkl_optout,
 };
 
 /// Runtime toggle (default **on**) for `no-bkl-process` (Phase 3 of

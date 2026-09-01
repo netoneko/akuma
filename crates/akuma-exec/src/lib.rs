@@ -164,4 +164,10 @@ pub fn init(rt: ExecRuntime, cfg: ExecConfig) {
         resolve_file_id: rt.resolve_file_id,
         exec_bkl_drop_enabled: rt.exec_bkl_drop_enabled,
     });
+    // `akuma-pmm`'s one upward bridge: the surviving-mapper walk for the
+    // premature-free / poison reports. Lives in `process::reclaim` beside its
+    // caller `drain_retired_under_pressure`; degrades to `None` when
+    // unregistered (host tests), which is why — unlike the ELF hooks above —
+    // ordering against `pmm::init` does not matter.
+    akuma_pmm::register_surviving_mapper_hook(process::reclaim::surviving_mapper);
 }

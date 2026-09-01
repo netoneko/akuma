@@ -10,6 +10,11 @@
 
 use core::arch::global_asm;
 
+// `safe_print!` resolves unqualified throughout this module — the same move
+// `akuma-exec` and `akuma-fpcache` make. (`tprint!` is `src/console.rs`'s and
+// does not travel; its timestamp prefix is the only difference.)
+use akuma_primitives::safe_print;
+
 // Exception vector table with EL0 support
 global_asm!(
     r#"
@@ -1012,7 +1017,7 @@ fn maybe_print_sigsegv_syscall_diag(elr: u64, far: u64, frame: &UserTrapFrame) {
     let hint = syscall_nr_pattern2_hint(nr);
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let tid = akuma_exec::threading::current_thread_id();
-    crate::tprint!(
+    safe_print!(
         384,
         "[sigsegv-syscall] pid={} tid={} FAR={:#x} ELR={:#x} x8={} ({}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x}\n",
         pid, tid, far, elr, nr, hint, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5,
@@ -1224,20 +1229,20 @@ fn demand_page_lazy_region(
         // the page maps non-exec (it always did — `map_flags` never consulted the
         // arm), so the fetch cannot succeed until the permission-fault arm upgrades
         // it to RX, which is where its I-cache maintenance now happens.
-        crate::pmm::dp_count(&crate::pmm::DP_IA_NOEXEC_FAULTS, 1);
+        akuma_pmm::dp_count(&akuma_pmm::DP_IA_NOEXEC_FAULTS, 1);
     }
     // Hoisted out of the per-page readahead loops below: `map_flags` is
     // loop-invariant, and the predicate now reads the registered `ExecConfig` (which
     // `config()` returns **by value** — the whole struct), so evaluating it per page
     // cost a ~45-field copy up to 512 times per fault. Once per fault instead.
-    let shareable_mapping = crate::file_page_cache::is_shareable_mapping(map_flags);
+    let shareable_mapping = akuma_fpcache::is_shareable_mapping(map_flags);
 
     if let akuma_exec::process::LazySource::File {
         ref path, inode, mount_id, file_offset, filesz, segment_va, ..
     } = *source
     {
         if crate::config::DEMAND_PAGE_LOG_ENABLED {
-            crate::tprint!(256, "[{}] file region: fault_va={:#x} seg_va={:#x} filesz={:#x} file_off={:#x}\n",
+            safe_print!(256, "[{}] file region: fault_va={:#x} seg_va={:#x} filesz={:#x} file_off={:#x}\n",
                 access.tag(), far_usize, segment_va, filesz, file_offset);
         }
         const READAHEAD_PAGES: usize = 256;
@@ -1253,7 +1258,7 @@ fn demand_page_lazy_region(
         // fault still holds a global reference for the frame; `adopt_user_frame`
         // consumes it on install, and Pass C frees it on a lost race. Pool frames
         // always own theirs; shared hits own the one `lookup_and_ref` took.
-        let mut shared: alloc::vec::Vec<(usize, crate::pmm::PhysFrame, bool, bool)> =
+        let mut shared: alloc::vec::Vec<(usize, akuma_exec::PhysFrame, bool, bool)> =
             alloc::vec::Vec::new();
         let mut needed = 0usize;
         {
@@ -1267,7 +1272,7 @@ fn demand_page_lazy_region(
                     let full = va >= segment_va && va + 0x1000 <= segment_va + filesz;
                     let hit = if full && shareable_mapping {
                         let file_off = file_offset + (va - segment_va);
-                        crate::file_page_cache::lookup_and_ref(mount_id, inode, file_off, is_exec)
+                        akuma_fpcache::lookup_and_ref(mount_id, inode, file_off, is_exec)
                     } else {
                         None
                     };
@@ -1298,16 +1303,16 @@ fn demand_page_lazy_region(
         // process. When the budget hits 0 (free <= reserve) nothing maps and we fall
         // through to the single-page fallback below (alloc_page_zeroed_user -> None ->
         // SIGSEGV).
-        let needed = needed.min(crate::pmm::user_readahead_budget(crate::pmm::free_count()));
+        let needed = needed.min(akuma_pmm::user_readahead_budget(akuma_pmm::free_count()));
 
         // Batch-allocate all needed frames in one lock acquisition
         let frame_pool = if needed > 0 {
-            crate::pmm::alloc_pages_zeroed(needed).unwrap_or_else(|| {
+            alloc_pages_zeroed(needed).unwrap_or_else(|| {
                 // Fallback: allocate what we can one at a time, still honouring the
                 // reserve so we can't starve the kernel.
                 let mut v = alloc::vec::Vec::new();
                 for _ in 0..needed {
-                    match crate::pmm::alloc_page_zeroed_user() {
+                    match alloc_page_zeroed_user() {
                         Some(f) => v.push(f),
                         None => break,
                     }
@@ -1325,7 +1330,7 @@ fn demand_page_lazy_region(
         // (M5b). Records (va, frame) to install next.
         // `(va, frame, owns_ref)` — see `shared` above. Pool frames always carry a
         // reference of their own; shared hits may not.
-        let mut filled: alloc::vec::Vec<(usize, crate::pmm::PhysFrame, bool)> =
+        let mut filled: alloc::vec::Vec<(usize, akuma_exec::PhysFrame, bool)> =
             alloc::vec::Vec::new();
         // M5b Stage 4a: DROP the BKL for the block-I/O fill so peer cores can enter
         // the kernel while this core waits on the disk (the measured ~10 ms hold).
@@ -1337,7 +1342,7 @@ fn demand_page_lazy_region(
         // loop's page-table reads walk (freed only at teardown, which can't run while
         // this thread faults).
         #[cfg(kernel_smp_shared)]
-        let fault_dropped_bkl = crate::smp_shared::fault_bkl_drop_enabled();
+        let fault_dropped_bkl = akuma_bkl::policy::fault_bkl_drop_enabled();
         #[cfg(kernel_smp_shared)]
         if fault_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
         let mut cur_va = page_va;
@@ -1362,16 +1367,16 @@ fn demand_page_lazy_region(
                     let file_off = file_offset + (cur_va - segment_va);
                     let mut disk = alloc::vec![0u8; 0x1000];
                     let got = if inode != 0 {
-                        crate::vfs::read_at_by_inode(path, inode, file_off, &mut disk)
+                        (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, &mut disk)
                     } else {
-                        crate::vfs::read_at(path, file_off, &mut disk)
+                        (akuma_exec::runtime::runtime().read_at)(path, file_off, &mut disk)
                     };
                     let kva = akuma_exec::mmu::phys_to_virt(pf.addr).cast::<u8>();
                     let cached = unsafe { core::slice::from_raw_parts(kva, 0x1000) };
                     if got == Ok(0x1000) && cached != disk.as_slice() {
                         let at = cached.iter().zip(disk.iter()).position(|(a, b)| a != b).unwrap_or(0);
-                        crate::pmm::dp_count(&crate::pmm::DP_FILE_CACHE_MISMATCH, 1);
-                        crate::tprint!(256,
+                        akuma_pmm::dp_count(&akuma_pmm::DP_FILE_CACHE_MISMATCH, 1);
+                        safe_print!(256,
                             "[FPC-BAD] pid={} inode={} file_off={:#x} va={:#x} first_diff={:#x} cached={:#x} disk={:#x} cached_zero={}\n",
                             pid, inode, file_off, cur_va, at, cached[at], disk[at],
                             u8::from(cached.iter().all(|b| *b == 0)));
@@ -1387,7 +1392,7 @@ fn demand_page_lazy_region(
                     let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
                     akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
                     let file_off = file_offset + (cur_va - segment_va);
-                    crate::file_page_cache::mark_icache_clean(mount_id, inode, file_off, pf);
+                    akuma_fpcache::mark_icache_clean(mount_id, inode, file_off, pf);
                 }
                 filled.push((cur_va, pf, owns_ref));
                 cur_va += 0x1000;
@@ -1415,9 +1420,9 @@ fn demand_page_lazy_region(
                         core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
                     };
                     let got = if inode != 0 {
-                        crate::vfs::read_at_by_inode(path, inode, file_off, page_buf)
+                        (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
                     } else {
-                        crate::vfs::read_at(path, file_off, page_buf)
+                        (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
                     };
                     // The range is already clamped to `filesz`, so anything less than
                     // `len` is a defect, not EOF. The frame came from
@@ -1426,8 +1431,8 @@ fn demand_page_lazy_region(
                     // here. See `pmm::DP_FILE_FILL_SHORT`.
                     fill_complete = got == Ok(len);
                     if !fill_complete {
-                        crate::pmm::dp_count(&crate::pmm::DP_FILE_FILL_SHORT, 1);
-                        crate::tprint!(288,
+                        akuma_pmm::dp_count(&akuma_pmm::DP_FILE_FILL_SHORT, 1);
+                        safe_print!(288,
                             "[FILL-SHORT] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} path={} — page left zero-filled\n",
                             pid, inode, file_off, len, got, cur_va, path);
                     }
@@ -1467,9 +1472,9 @@ fn demand_page_lazy_region(
             {
                 if fill_complete {
                     let file_off = file_offset + (cur_va - segment_va);
-                    crate::file_page_cache::insert(mount_id, inode, file_off, pf, is_exec);
+                    akuma_fpcache::insert(mount_id, inode, file_off, pf, is_exec);
                 } else {
-                    crate::pmm::dp_count(&crate::pmm::DP_FILE_FILL_UNPUBLISHED, 1);
+                    akuma_pmm::dp_count(&akuma_pmm::DP_FILE_FILL_UNPUBLISHED, 1);
                 }
             }
             filled.push((cur_va, pf, true));
@@ -1485,7 +1490,7 @@ fn demand_page_lazy_region(
         // mapped the VA) is collected and freed after the hold.
         let mut any_mapped = false;
         let mut pages_mapped = 0u64;
-        let mut race_free: alloc::vec::Vec<crate::pmm::PhysFrame> = alloc::vec::Vec::new();
+        let mut race_free: alloc::vec::Vec<akuma_exec::PhysFrame> = alloc::vec::Vec::new();
         if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
             #[cfg(kernel_smp_shared)]
             let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
@@ -1533,9 +1538,9 @@ fn demand_page_lazy_region(
         }
 
         // Free race-lost frames + unused pool frames (outside the hold).
-        for pf in race_free { crate::pmm::free_page_at(pf, akuma_pmm::FreeSite::FaultRaceLost); }
+        for pf in race_free { free_page_at(pf, akuma_pmm::FreeSite::FaultRaceLost); }
         while pool_idx < frame_pool.len() {
-            crate::pmm::free_page_at(frame_pool[pool_idx], akuma_pmm::FreeSite::FaultPoolSurplus);
+            free_page_at(frame_pool[pool_idx], akuma_pmm::FreeSite::FaultPoolSurplus);
             pool_idx += 1;
         }
 
@@ -1548,7 +1553,7 @@ fn demand_page_lazy_region(
         // synchronized. See COW_PILE_AUDIT.md F4.
 
         if any_mapped {
-            crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, pages_mapped as usize);
+            akuma_pmm::dp_count(&akuma_pmm::DP_FILE_PAGES, pages_mapped as usize);
             crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
             if crate::config::PROCESS_SYSCALL_STATS
                 && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
@@ -1562,10 +1567,10 @@ fn demand_page_lazy_region(
         }
         // Readahead pool was exhausted before reaching page_va.
         // Fall back to a single-page allocation for just the faulting page.
-        let (_, _, free) = crate::pmm::stats();
-        crate::tprint!(160, "[{}] pid={} va=0x{:x} readahead pool exhausted, {} free pages — retrying single page\n",
+        let (_, _, free) = akuma_pmm::stats();
+        safe_print!(160, "[{}] pid={} va=0x{:x} readahead pool exhausted, {} free pages — retrying single page\n",
             access.tag(), pid, far_usize, free);
-        if let Some(pf) = crate::pmm::alloc_page_zeroed_user() {
+        if let Some(pf) = alloc_page_zeroed_user() {
             // Re-read file data for this single page
             let pg_data_start = core::cmp::max(page_va, segment_va);
             let pg_data_end = core::cmp::min(page_va + 0x1000, segment_va + filesz);
@@ -1578,17 +1583,17 @@ fn demand_page_lazy_region(
                     core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
                 };
                 let got = if inode != 0 {
-                    crate::vfs::read_at_by_inode(path, inode, file_off, page_buf)
+                    (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
                 } else {
-                    crate::vfs::read_at(path, file_off, page_buf)
+                    (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
                 };
                 // This arm never publishes to `file_page_cache`, so a short read here
                 // poisons only the faulting process — but it is the same defect and
                 // shares the counter, so a build that trips one can be told from a
                 // build that trips the other by the `[FILL-SHORT]` tag alone.
                 if got != Ok(len) {
-                    crate::pmm::dp_count(&crate::pmm::DP_FILE_FILL_SHORT, 1);
-                    crate::tprint!(288,
+                    akuma_pmm::dp_count(&akuma_pmm::DP_FILE_FILL_SHORT, 1);
+                    safe_print!(288,
                         "[FILL-SHORT/single] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} path={}\n",
                         pid, inode, file_off, len, got, page_va, path);
                 }
@@ -1619,16 +1624,16 @@ fn demand_page_lazy_region(
                 }
             }
             if !installed_ok {
-                crate::pmm::free_page(pf);
+                free_page(pf);
             }
-            crate::pmm::dp_count(&crate::pmm::DP_FILE_PAGES, 1);
+            akuma_pmm::dp_count(&akuma_pmm::DP_FILE_PAGES, 1);
             crate::syscall::syscall_counters::inc_pagefault(1);
             return true;
         }
-        let (_, _, free2) = crate::pmm::stats();
-        crate::tprint!(160, "[{}] pid={} va=0x{:x} single-page fallback OOM, {} free pages\n",
+        let (_, _, free2) = akuma_pmm::stats();
+        safe_print!(160, "[{}] pid={} va=0x{:x} single-page fallback OOM, {} free pages\n",
             access.tag(), pid, far_usize, free2);
-    } else if let Some(page_frame) = crate::pmm::alloc_page_zeroed_user() {
+    } else if let Some(page_frame) = alloc_page_zeroed_user() {
         // Anonymous demand page: frame (zeroed) allocated OUTSIDE `as_lock`;
         // install + track under it.
         let mut installed_ok = false;
@@ -1647,7 +1652,7 @@ fn demand_page_lazy_region(
             }
         }
         if installed_ok {
-            crate::pmm::dp_count(&crate::pmm::DP_ANON_PAGES, 1);
+            akuma_pmm::dp_count(&akuma_pmm::DP_ANON_PAGES, 1);
             crate::syscall::syscall_counters::inc_pagefault(1);
             if crate::config::PROCESS_SYSCALL_STATS
                 && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
@@ -1655,13 +1660,13 @@ fn demand_page_lazy_region(
                 }
         } else {
             // Race (peer mapped it) or no owner: free our frame.
-            crate::pmm::free_page(page_frame);
+            free_page(page_frame);
         }
         // Page is mapped (by us or another CPU) - success
         return true;
     } else {
-        let (_, _, free) = crate::pmm::stats();
-        crate::tprint!(160, "[{}] pid={} va=0x{:x} anon alloc failed, {} free pages\n",
+        let (_, _, free) = akuma_pmm::stats();
+        safe_print!(160, "[{}] pid={} va=0x{:x} anon alloc failed, {} free pages\n",
             access.tag(), pid, far_usize, free);
     }
     false
@@ -1712,7 +1717,7 @@ pub enum CowRemap<'a> {
 /// It is a function so the requirement has one statement instead of three, and so the
 /// two `CowRemap` arms cannot drift on it silently.
 #[inline]
-fn copy_page_under_as_lock(old_pa: usize, new_frame: crate::pmm::PhysFrame) {
+fn copy_page_under_as_lock(old_pa: usize, new_frame: akuma_exec::PhysFrame) {
     // SAFETY: `old_pa` came from a valid user PTE and `new_frame` from the PMM, so
     // both are identity-mapped, page-aligned and 4 KiB wide; the regions cannot
     // overlap because `new_frame` was just allocated and is not mapped anywhere yet.
@@ -1756,9 +1761,9 @@ pub fn complete_cow_break(
     remap: CowRemap<'_>,
     page_va: usize,
     old_pa: usize,
-    new_frame: crate::pmm::PhysFrame,
+    new_frame: akuma_exec::PhysFrame,
 ) {
-    crate::pmm::track_frame(new_frame, akuma_exec::runtime::FrameSource::UserData);
+    akuma_pmm::track_frame(new_frame.addr, akuma_pmm::FrameSource::UserData);
 
     let released_last_va = match remap {
         CowRemap::TakingAsLock(owner) => {
@@ -1773,7 +1778,7 @@ pub fn complete_cow_break(
                 // `as_lock` across translate, refcount and copy alike).
                 let still_named =
                     aspace.translate(page_va).map(|pa| pa & !0xFFF) == Some(old_pa);
-                if !still_named || crate::pmm::cow_ref_get(old_pa) == 0 {
+                if !still_named || akuma_pmm::cow_ref_get(old_pa) == 0 {
                     return None;
                 }
                 // F1 (§8 row 6): the copy runs INSIDE the `as_lock` hold, so
@@ -1797,7 +1802,7 @@ pub fn complete_cow_break(
                 // frame. Callers proceed/retry: a completed sibling break means
                 // the retried access succeeds; a genuine unmap re-faults with a
                 // translation (not permission) code and takes its normal path.
-                crate::pmm::free_page(new_frame);
+                free_page(new_frame);
                 return;
             };
             released
@@ -1829,7 +1834,7 @@ pub fn complete_cow_break(
     // real lock would put a cross-core serialization point on the hottest path in
     // the kernel to re-solve a solved problem.
     if released_last_va {
-        crate::pmm::cow_ref_dec(old_pa);
+        akuma_pmm::cow_ref_dec(old_pa);
     }
 }
 
@@ -1846,10 +1851,10 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
         None => return true, // page not mapped — not a CoW page
     };
 
-    if crate::pmm::cow_ref_get(old_pa) == 0 { return true; } // not CoW, already writable
+    if akuma_pmm::cow_ref_get(old_pa) == 0 { return true; } // not CoW, already writable
 
     // CoW page: allocate a private copy and remap as RW.
-    let new_frame = match crate::pmm::alloc_page_zeroed() {
+    let new_frame = match alloc_page_zeroed() {
         Some(f) => f,
         None => return false, // OOM
     };
@@ -1863,7 +1868,7 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
         complete_cow_break(CowRemap::TakingAsLock(owner), page_va, old_pa, new_frame);
         true
     } else {
-        crate::pmm::free_page(new_frame); // no owner — free to avoid leak
+        free_page(new_frame); // no owner — free to avoid leak
         false
     }
 }
@@ -1891,7 +1896,7 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
             // `alloc_page_zeroed_user` calls `reclaim_clean_file_pages`, which takes
             // `as_lock` once per swept page — allocating under the hold would
             // self-deadlock on a non-reentrant `Spinlock`.
-            if let Some(page_frame) = crate::pmm::alloc_page_zeroed_user() {
+            if let Some(page_frame) = alloc_page_zeroed_user() {
                 // PTE install + frame bookkeeping under `as_lock` (Phase 7f
                 // pre-flight; same fold Phase 7e applied to the signal-path PTE
                 // sites). `as_owner` is the L0-owning thread-group leader, so this is
@@ -1923,10 +1928,10 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
                 // data frame goes back to the PMM iff nothing mapped it (lost CAS
                 // race) or there is no owner to track it against.
                 if !installed || owner.is_none() {
-                    crate::pmm::free_page(page_frame);
+                    free_page(page_frame);
                 }
                 if owner.is_none() {
-                    for tf in table_frames { crate::pmm::free_page(tf); }
+                    for tf in table_frames { free_page(tf); }
                 }
                 return true;
             }
@@ -1956,7 +1961,7 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
         return Some(SIGRETURN_TRAMPOLINE_ADDR);
     }
 
-    let frame = crate::pmm::alloc_page_zeroed()?;
+    let frame = alloc_page_zeroed()?;
     unsafe {
         let ptr = akuma_exec::mmu::phys_to_virt(frame.addr).cast::<u8>();
         core::ptr::copy_nonoverlapping(TRAMPOLINE.as_ptr(), ptr, TRAMPOLINE.len());
@@ -1970,14 +1975,14 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
         if installed {
             owner.address_space.track_user_frame(frame);
         } else {
-            crate::pmm::free_page(frame);
+            free_page(frame);
         }
         for tf in table_frames {
             owner.address_space.track_page_table_frame(tf);
         }
     } else {
-        crate::pmm::free_page(frame);
-        for tf in table_frames { crate::pmm::free_page(tf); }
+        free_page(frame);
+        for tf in table_frames { free_page(tf); }
         return None;
     }
 
@@ -2082,7 +2087,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     let restorer = if action.restorer != 0 {
         action.restorer
     } else if let Some(addr) = ensure_sigreturn_trampoline(pid) { addr } else {
-        crate::tprint!(64, "[signal] failed to map sigreturn trampoline for pid={}\n", pid);
+        safe_print!(64, "[signal] failed to map sigreturn trampoline for pid={}\n", pid);
         return false;
     };
     let frame_ref = unsafe { &*frame };
@@ -2103,13 +2108,13 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // fault/interrupt occurred — *not* the handler we will install at handler_addr.
     // Misreading this as “handler PC” suggests ELR corruption; it is not.
     if crate::config::SIGNAL_TRACE_ENABLED {
-        crate::tprint!(256,
+        safe_print!(256,
             "[signal] deliver sig={} slot={} handler={:#x} fault_pc={:#x} user_sp={:#x} alt_sp={:#x} alt_size={:#x} sa_flags={:#x}\n",
             signal, thread_slot, handler_addr, frame_ref.elr_el1, user_sp, alt_sp, alt_size, action.flags);
     }
 
     if crate::config::DEBUG_PATTERN2_TRAP_TRACE && syscall_stub_elr_in_diag_window(frame_ref.elr_el1) {
-        crate::tprint!(
+        safe_print!(
             192,
             "[pattern2-stub] deliver sig={} pid={} slot={} fault_pc={:#x} x8={:#x} ({}) sp={:#x}\n",
             signal,
@@ -2129,7 +2134,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // Re-pend the signal so it is retried at the next syscall boundary, by
     // which time mstart will have called sigaltstack.
     if (action.flags & SA_ONSTACK) != 0 && alt_sp == 0 {
-        crate::tprint!(128,
+        safe_print!(128,
             "[signal] sig {} needs sigaltstack but slot {} has none — re-pending\n",
             signal, thread_slot);
         akuma_exec::threading::pend_signal_for_thread(thread_slot, signal);
@@ -2146,7 +2151,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
                 // after sigreturn instead of silently dropping it.  Mirrors the
                 // existing re-pend path for when sigaltstack isn't configured yet
                 // (lines above).  The caller will NOT kill the process.
-                crate::tprint!(128,
+                safe_print!(128,
                     "[signal] sig {} re-entrant on sigaltstack (sp={:#x} in [{:#x},{:#x})) \
                      — re-pending\n",
                     signal, user_sp, alt_lo, alt_hi);
@@ -2155,7 +2160,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
                 // Fatal signal (e.g. re-entrant SIGSEGV) while inside a signal handler —
                 // genuine unrecoverable crash.  The data-abort caller falls through to
                 // return_to_kernel(-11).
-                crate::tprint!(128,
+                safe_print!(128,
                     "[signal] sig {} re-entrant FAULT at {:#x} (sp={:#x} on sigaltstack \
                      [{:#x},{:#x})) — killing process\n",
                     signal, fault_addr, user_sp, alt_lo, alt_hi);
@@ -2180,7 +2185,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     let new_sp = (stack_top - SIGFRAME_SIZE) & !0xF;
 
     if crate::config::SIGNAL_TRACE_ENABLED {
-        crate::tprint!(256,
+        safe_print!(256,
             "[signal] frame: stack_top={:#x} new_sp={:#x} on_altstack={}\n",
             stack_top, new_sp, stack_top != user_sp);
     }
@@ -2190,7 +2195,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     let first_page = new_sp & !0xFFF;
     let last_page = (new_sp + SIGFRAME_SIZE - 1) & !0xFFF;
     if !ensure_user_page_mapped(pid, first_page) {
-        crate::tprint!(128, "[signal] sig {} frame page {:#x} not mappable\n", signal, first_page);
+        safe_print!(128, "[signal] sig {} frame page {:#x} not mappable\n", signal, first_page);
         return false;
     }
     // Pre-resolve CoW: ensure the page is writable before the kernel writes the
@@ -2198,7 +2203,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // causes EC=0x25 (EL1 data abort) when write_bytes runs below.
     ensure_cow_page_writable(pid, first_page);
     if last_page != first_page && !ensure_user_page_mapped(pid, last_page) {
-        crate::tprint!(128, "[signal] sig {} frame page {:#x} not mappable\n", signal, last_page);
+        safe_print!(128, "[signal] sig {} frame page {:#x} not mappable\n", signal, last_page);
         return false;
     }
     if last_page != first_page { ensure_cow_page_writable(pid, last_page); }
@@ -2292,7 +2297,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
         // EL1-only mapping, which the old open-coded writes followed into kernel
         // memory (`USER_COPY_FOLD.md` §7). Declining delivery here means the caller
         // applies the default action instead.
-        crate::tprint!(128, "[signal] sig {} frame copy to {:#x} failed\n", signal, new_sp);
+        safe_print!(128, "[signal] sig {} frame copy to {:#x} failed\n", signal, new_sp);
         return false;
     }
 
@@ -2335,7 +2340,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     akuma_exec::threading::or_thread_signal_mask(action.mask & !((1u64 << 8) | (1u64 << 18)));
 
     if crate::config::SIGNAL_TRACE_ENABLED {
-        crate::tprint!(128, "[signal] Delivering sig {} to handler {:#x} (restorer={:#x})\n",
+        safe_print!(128, "[signal] Delivering sig {} to handler {:#x} (restorer={:#x})\n",
             signal, handler_addr, restorer);
     }
     true
@@ -2481,7 +2486,7 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
     // mode) or any other invalid mode bits are set, ERET would crash the
     // kernel.  Force clean EL0t instead.
     if restored_spsr & 0x1F != 0 {
-        crate::tprint!(128,
+        safe_print!(128,
             "[sigreturn] WARNING: corrupted SPSR={:#x} (mode bits={:#x}), forcing EL0t\n",
             restored_spsr, restored_spsr & 0x1F);
         // Clear only the M[4:0] mode bits; preserve NZCV, DAIF, and other flags
@@ -2492,7 +2497,7 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
     }
 
     if crate::config::SIGNAL_TRACE_ENABLED {
-        crate::tprint!(256,
+        safe_print!(256,
             "[sigreturn] restoring: sp={:#x} pc={:#x} pstate={:#x} sigframe_sp={:#x}\n",
             f.sp_el0, f.elr_el1, f.spsr_el1, sigframe_sp);
     }
@@ -2500,7 +2505,7 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
     if crate::config::DEBUG_PATTERN2_TRAP_TRACE && syscall_stub_elr_in_diag_window(f.elr_el1) {
         let rp = akuma_exec::process::read_current_pid().unwrap_or(0);
         let slot = akuma_exec::threading::current_thread_id();
-        crate::tprint!(
+        safe_print!(
             224,
             "[pattern2-sigreturn] pid={} slot={} restored_pc={:#x} x8={:#x} ({}) sigframe_sp={:#x}\n",
             rp,
@@ -2573,6 +2578,100 @@ pub fn init() {
     // Enable IRQs by clearing DAIF.I, now that VBAR_EL1 is installed and
     // synchronized above — the ordering that makes taking an interrupt safe.
     akuma_primitives::irq::unmask_irqs();
+}
+
+// ============================================================================
+// Kernel hooks
+// ============================================================================
+//
+// The callbacks the exception path needs from kernel-core state that cannot
+// move below it. Same shape as `akuma_elf::VfsHooks` (`Registered` +
+// `require()`): the values are plain `fn` items, registered once from
+// `src/main.rs` BEFORE `init()` unmasks IRQs — the ordering that makes the
+// `require()` panic below unreachable, because no exception can be taken
+// before the vector table is installed and DAIF.I cleared.
+
+/// The kernel-core callbacks the exception handlers call out to.
+#[derive(Clone, Copy)]
+pub struct ExceptionHooks {
+    /// `crate::irq::dispatch_irq` — the device-IRQ dispatcher. The IRQ vector
+    /// runs it for every INTID that is not the scheduler SGI; the dispatcher
+    /// and its handler table stay in `src/irq.rs`.
+    pub dispatch_irq: fn(u32),
+    /// `crate::smp_shared::record_el0_trap` — the per-core "this core serviced
+    /// a user trap" diagnostic counter (M3 cross-core-userspace proof). Only
+    /// exists under `kernel_smp_shared`, like the module that owns it.
+    #[cfg(kernel_smp_shared)]
+    pub record_el0_trap: fn(),
+    /// `akuma_exec::process::reclaim::report_poison_value` — quarantine-poison
+    /// decode for the wild-data-abort dump. Lives in akuma-exec's reclaim
+    /// module: it needs the poison codec from `akuma-pmm`, the live RAM window
+    /// from exec's `mmu`, and the process-table walk (`surviving_mapper`).
+    pub report_poison_value: fn(&str, u64),
+    /// `crate::pmm::dp_counters_line` — the demand-paging counter dump. Stays
+    /// in `src/pmm.rs` with the counters' formatter: it also reads
+    /// `akuma_ext2`'s deferred-free counters, which sit above the pmm crate.
+    pub dp_counters_line: fn(&mut dyn core::fmt::Write),
+}
+
+static HOOKS: akuma_primitives::Registered<ExceptionHooks> = akuma_primitives::Registered::new(
+    "exceptions: ExceptionHooks not registered — call exceptions::register_hooks() before exceptions::init()",
+);
+
+/// Register the kernel-core callbacks. Call once, before [`init`].
+pub fn register_hooks(h: ExceptionHooks) {
+    HOOKS.register(h);
+}
+
+/// The registered hooks. Panics if unregistered — see the section header.
+#[inline]
+fn hooks() -> ExceptionHooks {
+    HOOKS.require()
+}
+
+// ---- PMM shim ----------------------------------------------------------------
+// The `src/pmm.rs` wrappers this file used to call through, kept local once the
+// file stops reaching `crate::pmm`: each adds the current tid for free
+// attribution and/or converts `PhysFrame` <-> raw PA — neither of which needs
+// `src/`. Same move `akuma-fpcache` made with `free_frame`.
+
+/// Free a single physical page. If the frame is CoW-shared (refcount > 0), only
+/// decrements the refcount instead of actually freeing.
+#[inline]
+fn free_page(frame: akuma_exec::PhysFrame) {
+    akuma_pmm::free_page(frame.addr, akuma_primitives::preempt::current_tid() as u32);
+}
+
+/// As [`free_page`], but attributes the release to a specific code path so a
+/// premature-free / poison report can name it.
+#[inline]
+fn free_page_at(frame: akuma_exec::PhysFrame, site: akuma_pmm::FreeSite) {
+    akuma_pmm::free_page_at(frame.addr, akuma_primitives::preempt::current_tid() as u32, site);
+}
+
+/// Allocate a zeroed page.
+#[inline]
+fn alloc_page_zeroed() -> Option<akuma_exec::PhysFrame> {
+    akuma_pmm::alloc_page_zeroed().map(akuma_exec::PhysFrame::new)
+}
+
+/// Allocate a zeroed page for a **user** demand-paging fault — returns `None`
+/// once free PMM has fallen to `akuma_pmm::USER_PAGE_RESERVE`, which the caller
+/// treats as OOM and SIGSEGVs on.
+#[inline]
+fn alloc_page_zeroed_user() -> Option<akuma_exec::PhysFrame> {
+    akuma_pmm::alloc_page_zeroed_user().map(akuma_exec::PhysFrame::new)
+}
+
+/// Contiguous-free batch allocation of `count` zeroed pages.
+#[inline]
+fn alloc_pages_zeroed(count: usize) -> Option<alloc::vec::Vec<akuma_exec::PhysFrame>> {
+    Some(
+        akuma_pmm::alloc_pages_zeroed(count)?
+            .into_iter()
+            .map(akuma_exec::PhysFrame::new)
+            .collect(),
+    )
 }
 
 /// Default exception handler - logs unexpected exceptions
@@ -2684,7 +2783,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     // pure compute loops that only get timer-preempted, not just syscalls).
     #[cfg(kernel_smp_shared)]
     if interrupted_el0 {
-        crate::smp_shared::record_el0_trap();
+        (hooks().record_el0_trap)();
     }
 
     // Acknowledge the IRQ once, up front (the GIC IAR read needs no BKL).
@@ -2708,7 +2807,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     // enter_kernel — a normal reconcile would leak a ticket.
     #[cfg(kernel_smp_shared)]
     if interrupted_el0
-        && crate::smp_shared::sched_bklfree_el0_enabled()
+        && akuma_bkl::policy::sched_bklfree_el0_enabled()
         && matches!(irq_opt, Some(i) if i == akuma_gic::SGI_SCHEDULER)
     {
         let new_sp =
@@ -2734,11 +2833,11 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     // reconcile — the interrupted thread's BKL hold state (held or not, EL0 or EL1) is
     // left completely untouched by this excursion.
     #[cfg(all(kernel_smp_shared, kernel_no_bkl_irq))]
-    if crate::smp_shared::irq_bkl_drop_enabled()
+    if akuma_bkl::policy::irq_bkl_drop_enabled()
         && let Some(irq) = irq_opt
         && irq != akuma_gic::SGI_SCHEDULER
     {
-        crate::irq::dispatch_irq(irq);
+        (hooks().dispatch_irq)(irq);
         akuma_gic::end_of_interrupt(irq);
         return 0;
     }
@@ -2762,7 +2861,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
             akuma_exec::threading::sgi_scheduler_handler_with_sp(irq, current_sp)
         } else {
             // Normal device IRQ: dispatch then EOI.
-            crate::irq::dispatch_irq(irq);
+            (hooks().dispatch_irq)(irq);
             akuma_gic::end_of_interrupt(irq);
             0
         }
@@ -2854,7 +2953,7 @@ fn print_write_perm_fault_diag(far: u64, iss: u64, pid: u32, as_owner: u32) {
     let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
     let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
     let pa = akuma_exec::mmu::translate_user_va(l0_ptr, page_va).map(|p| p & !0xFFF);
-    let cow = pa.map_or(0, crate::pmm::cow_ref_get);
+    let cow = pa.map_or(0, akuma_pmm::cow_ref_get);
     // `.0` is the region's user flags; `is_none` on it is what gates the upgrade.
     let lazy_self = akuma_exec::process::lazy_region_lookup_for_page_fault(pid, far_usize).map(|t| t.0);
     let lazy_owner =
@@ -2869,7 +2968,7 @@ fn print_write_perm_fault_diag(far: u64, iss: u64, pid: u32, as_owner: u32) {
     let ap_rw = pte.is_some_and(|p| {
         p & akuma_exec::mmu::flags::AP_MASK == akuma_exec::mmu::flags::AP_RW_ALL
     });
-    let (_total, _alloc, free) = crate::pmm::stats();
+    let (_total, _alloc, free) = akuma_pmm::stats();
     crate::safe_print!(255,
         "[WPF] pid={} as_owner={} va={:#x} pa={:#x} mapped={} cow_ref={} lazy_self={:#x} \
          lazy_owner={:#x} eager={:#x} pte={:#x} ap_rw={} have_owner={} free={}\n",
@@ -3156,8 +3255,8 @@ fn print_page_forensics(tag: &str, pid: u32, va: usize) {
     // no record at all there IS no distance — printing one computed against a
     // default seq of 0 yields a large number that reads exactly like a real
     // (innocent) age, so report the absence instead.
-    let (tid_freed, free_age) = match crate::pmm::last_free_record(pa) {
-        Some((tid, seq)) => (i64::from(tid), i64::from(crate::pmm::free_ledger_seq().wrapping_sub(seq))),
+    let (tid_freed, free_age) = match akuma_pmm::last_free_record(pa) {
+        Some((tid, seq)) => (i64::from(tid), i64::from(akuma_pmm::free_ledger_seq().wrapping_sub(seq))),
         None => (-1, -1),
     };
     let tracked = akuma_exec::process::lookup_process_shared(pid)
@@ -3166,13 +3265,13 @@ fn print_page_forensics(tag: &str, pid: u32, va: usize) {
         "[{}] pid={} va={:#x} pa={:#x} FREE={} cow_ref={} tracked={} \
          last_free=(tid={} age={}) [-1 = never freed] head={:#x},{:#x},{:#x},{:#x}\n",
         tag, pid, page_va, pa,
-        crate::pmm::is_page_free(pa),
-        crate::pmm::cow_ref_get(pa),
+        akuma_pmm::is_page_free(pa),
+        akuma_pmm::cow_ref_get(pa),
         tracked, tid_freed, free_age,
         words[0], words[1], words[2], words[3]);
     // The reference history is what separates "this page's count was legitimately
     // 0" from "someone decremented it once too often".
-    crate::pmm::print_cow_history(pa);
+    akuma_pmm::print_cow_history(pa);
 
     // How many eager regions claim this VA? The fault handler answers from the
     // first `Vec` match, so two overlapping regions mean the record it consulted
@@ -3243,9 +3342,9 @@ fn try_resolve_el1_cow_fault() -> bool {
         None => return false,
     };
 
-    if crate::pmm::cow_ref_get(old_pa) == 0 { return false; }
+    if akuma_pmm::cow_ref_get(old_pa) == 0 { return false; }
 
-    let new_frame = match crate::pmm::alloc_page_zeroed() {
+    let new_frame = match alloc_page_zeroed() {
         Some(f) => f,
         None => return false, // OOM — fall through to kill-process path
     };
@@ -3286,7 +3385,7 @@ fn try_resolve_el1_cow_fault() -> bool {
         // No process owner found: cannot remap — free the new frame to avoid a leak.
         // Do NOT cow_ref_dec: the page is still mapped RO with the original refcount.
         // Returning false lets the EL1 handler kill the process via the normal path.
-        crate::pmm::free_page(new_frame);
+        free_page(new_frame);
         false
     }
 }
@@ -3555,12 +3654,12 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
 /// Uses static buffer to avoid heap allocations during crash
 fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
     use core::fmt::Write;
-    let mut w = crate::console::StackWriter::<256>::new();
+    let mut w = akuma_primitives::console::StackWriter::<256>::new();
     
     safe_print!(64, "\n=== Memory Stats at Crash ===\n");
     
     // Kernel heap stats
-    let heap_stats = crate::allocator::stats();
+    let heap_stats = akuma_alloc::stats();
     safe_print!(256, "  Heap: {}/{} bytes used ({} allocs, peak={})\n",
         heap_stats.allocated,
         heap_stats.heap_size,
@@ -3569,15 +3668,15 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
     );
 
     // PMM stats
-    let pmm_free = crate::pmm::free_count();
-    let pmm_total = crate::pmm::total_count();
+    let pmm_free = akuma_pmm::free_count();
+    let pmm_total = akuma_pmm::total_count();
     safe_print!(256, "  PMM: {}/{} pages free ({} KB / {} KB)\n",
         pmm_free, pmm_total,
         pmm_free * 4, pmm_total * 4
     );
 
     // Frame tracking stats if enabled
-    if let Some(frame_stats) = crate::pmm::tracking_stats() {
+    if let Some(frame_stats) = akuma_pmm::tracking_stats() {
         safe_print!(256, "  Frames: kernel={}, user_pt={}, user_data={}, elf={}\n",
             frame_stats.kernel_count,
             frame_stats.user_page_table_count,
@@ -3654,7 +3753,7 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
             );
         }
         let _ = write!(w, "    DP pages (global): ");
-        crate::pmm::dp_counters_line(&mut w);
+        (hooks().dp_counters_line)(&mut w);
         let _ = writeln!(w);
         w.flush();
 
@@ -3735,7 +3834,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     // kernel stack — reading x8 pre-acquire touches no shared state.
     #[cfg(kernel_smp_shared)]
     let bkl_optout = ((esr >> 26) & 0x3F) == esr::EC_SVC64
-        && crate::smp_shared::syscall_bkl_optout(unsafe { (*frame).x8 });
+        && akuma_bkl::policy::syscall_bkl_optout(unsafe { (*frame).x8 });
     #[cfg(not(kernel_smp_shared))]
     let bkl_optout = false;
     if !bkl_optout {
@@ -3773,7 +3872,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     // Record that this core serviced a user (EL0) trap — the M3 cross-core-userspace
     // proof (an EL0 trap only comes from userspace running on this core).
     #[cfg(kernel_smp_shared)]
-    crate::smp_shared::record_el0_trap();
+    (hooks().record_el0_trap)();
     let ret = rust_sync_el0_handler_inner(frame, esr, far);
     // Deferred thread-kill (real shared-kernel SMP): if a peer core's
     // kill_thread_group posted a kill request for this thread, terminate it
@@ -3973,7 +4072,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             let thread_slot = akuma_exec::threading::current_thread_id();
                             let (alt_sp, _, _) = akuma_exec::threading::get_sigaltstack(thread_slot);
                             if sig == 23 && alt_sp == 0 {
-                                crate::tprint!(96, "[SIGURG] re-pend tid={} (alt_sp=0, JIT retry)\n", thread_slot);
+                                safe_print!(96, "[SIGURG] re-pend tid={} (alt_sp=0, JIT retry)\n", thread_slot);
                                 akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
                             } else {
                                 unsafe { (*frame).x0 = frame_ref.x0; }
@@ -4053,7 +4152,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
                         let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
                         if akuma_exec::process::lazy_region_lookup_for_page_fault(pid, store_va as usize).is_some()
-                            && let Some(pf) = crate::pmm::alloc_page_zeroed() {
+                            && let Some(pf) = alloc_page_zeroed() {
                                 let (tfs, installed) = unsafe {
                                     akuma_exec::mmu::map_user_page(page_va, pf.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
                                 };
@@ -4062,15 +4161,15 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                         owner.address_space.track_user_frame(pf);
                                         for tf in tfs { owner.address_space.track_page_table_frame(tf); }
                                     } else {
-                                        crate::pmm::free_page(pf);
-                                        for tf in tfs { crate::pmm::free_page(tf); }
+                                        free_page(pf);
+                                        for tf in tfs { free_page(tf); }
                                     }
                                 } else {
-                                    crate::pmm::free_page(pf);
+                                    free_page(pf);
                                     if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                                         for tf in tfs { owner.address_space.track_page_table_frame(tf); }
                                     } else {
-                                        for tf in tfs { crate::pmm::free_page(tf); }
+                                        for tf in tfs { free_page(tf); }
                                     }
                                 }
                             }
@@ -4138,7 +4237,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         // For async signals like SIGURG, check if sigaltstack is ready
                         let (alt_sp, _, _) = akuma_exec::threading::get_sigaltstack(thread_slot);
                         if sig == 23 && alt_sp == 0 {
-                            crate::tprint!(96, "[SIGURG] re-pend tid={} (alt_sp=0, sigreturn)\n", thread_slot);
+                            safe_print!(96, "[SIGURG] re-pend tid={} (alt_sp=0, sigreturn)\n", thread_slot);
                             akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
                         } else {
                             unsafe { (*frame).x0 = saved_x0; }
@@ -4231,7 +4330,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 let (alt_sp, _, _) = akuma_exec::threading::get_sigaltstack(thread_slot);
                 if sig == 23 && alt_sp == 0 {
                     // Re-pend SIGURG for later - thread not ready yet
-                    crate::tprint!(96, "[SIGURG] re-pend tid={} (alt_sp=0, syscall return)\n", thread_slot);
+                    safe_print!(96, "[SIGURG] re-pend tid={} (alt_sp=0, syscall return)\n", thread_slot);
                     akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
                 } else {
                     // Store the syscall return value in x0 of the trap frame so that
@@ -4300,7 +4399,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // An unrecorded page still breaks CoW: see `write_allowed_by_record`.
                     if !write_allowed_by_record(pid, far_usize) {
                         // Fall through to SIGSEGV, which is what the protection asked for.
-                        crate::tprint!(160,
+                        safe_print!(160,
                             "[MPROTECT-DENY] pid={} va={:#x} write refused by recorded protection\n",
                             pid, page_va);
                     } else {
@@ -4314,7 +4413,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // Allocate the CoW destination BEFORE taking `as_lock` — alloc must
                     // stay outside the hold (the PMM OOM/reclaim path can re-enter
                     // `as_lock`). Freed below if the page didn't actually need CoW.
-                    if let Some(new_frame) = crate::pmm::alloc_page_zeroed() {
+                    if let Some(new_frame) = alloc_page_zeroed() {
                         let mut did_cow = false;
                         if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                             // PTE overwrite + 4 KiB copy under `as_lock` (shared-kernel
@@ -4327,7 +4426,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
                             if let Some(old_pa_with_offset) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va) {
                                 let old_pa = old_pa_with_offset & !(0xFFF);
-                                if crate::pmm::cow_ref_get(old_pa) > 0 {
+                                if akuma_pmm::cow_ref_get(old_pa) > 0 {
                                     // `_asg` above already holds `as_lock` for this whole
                                     // block, so the break must not take it again — and the
                                     // 4 KiB copy lands inside that hold, which is what keeps
@@ -4370,7 +4469,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             return unsafe { (*frame).x0 };
                         }
                         // Not a CoW page (or no owner): return the unused frame.
-                        crate::pmm::free_page(new_frame);
+                        free_page(new_frame);
                     }
                     } // end write_allowed_by_record
                     // OOM or not-CoW: fall through to the lazy permission upgrade / SIGSEGV.
@@ -4468,8 +4567,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     let protnone_file = akuma_exec::mmu::user_flags::is_none(flags)
                         && matches!(source, akuma_exec::process::LazySource::File { .. });
                     if protnone_file {
-                        crate::pmm::dp_count(&crate::pmm::DP_PROTNONE_FILE_REGION, 1);
-                        crate::tprint!(224,
+                        akuma_pmm::dp_count(&akuma_pmm::DP_PROTNONE_FILE_REGION, 1);
+                        safe_print!(224,
                             "[DA-NONE-FILE] pid={} as_owner={} va={:#x} flags={:#x} — PROT_NONE flags on a FILE-backed lazy region, demand-paging instead of zero-filling\n",
                             pid, as_owner, far_usize, flags);
                     }
@@ -4481,7 +4580,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         // it as RW rather than SIGSEGVing. Guard pages are NOT lazy-region
                         // entries so this path is only reached for genuine reservations.
                         let page_va = far_usize & !(0xFFF);
-                        if let Some(page_frame) = crate::pmm::alloc_page_zeroed() {
+                        if let Some(page_frame) = alloc_page_zeroed() {
                             // Frame allocated OUTSIDE `as_lock`; install + track under it.
                             let mut installed_ok = false;
                             if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
@@ -4499,21 +4598,21 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                 }
                             }
                             if installed_ok {
-                                crate::pmm::dp_count(&crate::pmm::DP_PROTNONE_PAGES, 1);
+                                akuma_pmm::dp_count(&akuma_pmm::DP_PROTNONE_PAGES, 1);
                                 crate::syscall::syscall_counters::inc_pagefault(1);
                             } else {
                                 // Race (another CPU mapped it) or no owner: free our page.
-                                crate::pmm::free_page(page_frame);
+                                free_page(page_frame);
                             }
                             return unsafe { (*frame).x0 };
                         }
                         // OOM: fall through to SIGSEGV
-                        crate::tprint!(128, "[DA-NONE] pid={} as_owner={} far=0x{:x} OOM\n",
+                        safe_print!(128, "[DA-NONE] pid={} as_owner={} far=0x{:x} OOM\n",
                             pid, as_owner, far_usize);
                     } else if far_in_kernel_identity_user_range(far) {
                         // Fault VA is in the kernel identity-map range — demand-paging here
                         // would corrupt kernel memory.  Fall through to SIGSEGV.
-                        crate::tprint!(128, "[DA-DP] pid={} fault in kernel VA range {:#x} -> SIGSEGV\n",
+                        safe_print!(128, "[DA-DP] pid={} fault in kernel VA range {:#x} -> SIGSEGV\n",
                             pid, far_usize);
                     } else if demand_page_lazy_region(
                         akuma_exec::mmu::FaultAccess::Data,
@@ -4541,7 +4640,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             r.iter().find_map(|reg| reg.frame_for(page_va))
                         });
                         if let Some(phys) = phys_opt {
-                            crate::tprint!(192, "[DP-eager] pid={} re-map va=0x{:x} frame=0x{:x}\n",
+                            safe_print!(192, "[DP-eager] pid={} re-map va=0x{:x} frame=0x{:x}\n",
                                 pid, page_va, phys.addr);
                             #[cfg(kernel_smp_shared)]
                             let _asg = akuma_exec::process::AsLockHold::new(&owner.as_lock);
@@ -4560,14 +4659,14 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // Dump mmap_regions for debugging: shows what the eager fallback searched
                     if let Some(dbg_proc) = akuma_exec::process::lookup_process_shared(as_owner) {
                         let n = dbg_proc.vm_with_regions(|r| r.len());
-                        crate::tprint!(128, "[DP] eager miss: pid={} va=0x{:x} checked {} mmap_regions\n",
+                        safe_print!(128, "[DP] eager miss: pid={} va=0x{:x} checked {} mmap_regions\n",
                             pid, far_usize, n);
                     } else {
-                        crate::tprint!(128, "[DP] eager miss: lookup_process({}) returned None!\n", pid);
+                        safe_print!(128, "[DP] eager miss: lookup_process({}) returned None!\n", pid);
                     }
                     let lazy_count = akuma_exec::process::lazy_region_count_for_pid(pid);
                     akuma_exec::process::lazy_region_debug(far_usize);
-                    crate::tprint!(128, "[DP] no lazy region for FAR={:#x} pid={} (pid has {} lazy regions)\n", far, pid, lazy_count);
+                    safe_print!(128, "[DP] no lazy region for FAR={:#x} pid={} (pid has {} lazy regions)\n", far, pid, lazy_count);
                     
                     // Log register state for debugging wild pointer accesses
                     let frame_ref = unsafe { &*frame };
@@ -4589,9 +4688,9 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             115 => "EINPROGRESS",
                             _ => "???",
                         };
-                        crate::tprint!(256, "[WILD-DA] *** FAR={:#x} is -{} ({}) - syscall error used as pointer! ***\n",
+                        safe_print!(256, "[WILD-DA] *** FAR={:#x} is -{} ({}) - syscall error used as pointer! ***\n",
                             far, errno, errno_name);
-                        crate::tprint!(128, "[WILD-DA] This means a syscall returned error -{} and userspace used it as a pointer\n", errno);
+                        safe_print!(128, "[WILD-DA] This means a syscall returned error -{} and userspace used it as a pointer\n", errno);
                         // §7k investigation (signal/register corruption, docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md):
                         // dump the user instruction at the FAULT and the source syscall site so a
                         // recurrence tells us whether the errno came from a REAL svc (genuine arg/
@@ -4619,15 +4718,15 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         }
                     }
                     
-                    crate::tprint!(384, "[WILD-DA] pid={} FAR={:#x} ELR={:#x} last_sc={}\n  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n  x4={:#x} x5={:#x} x6={:#x} x7={:#x}\n",
+                    safe_print!(384, "[WILD-DA] pid={} FAR={:#x} ELR={:#x} last_sc={}\n  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n  x4={:#x} x5={:#x} x6={:#x} x7={:#x}\n",
                         pid, far_usize, frame_ref.elr_el1, last_sc,
                         frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3,
                         frame_ref.x4, frame_ref.x5, frame_ref.x6, frame_ref.x7);
-                    crate::tprint!(128, "  x8={:#x} x9={:#x} x10={:#x} x11={:#x}\n",
+                    safe_print!(128, "  x8={:#x} x9={:#x} x10={:#x} x11={:#x}\n",
                         frame_ref.x8, frame_ref.x9, frame_ref.x10, frame_ref.x11);
-                    crate::tprint!(128, "  x12={:#x} x13={:#x} x14={:#x} x15={:#x}\n",
+                    safe_print!(128, "  x12={:#x} x13={:#x} x14={:#x} x15={:#x}\n",
                         frame_ref.x12, frame_ref.x13, frame_ref.x14, frame_ref.x15);
-                    crate::tprint!(128, "  x16={:#x} x17={:#x} x18={:#x} x28={:#x}\n",
+                    safe_print!(128, "  x16={:#x} x17={:#x} x18={:#x} x28={:#x}\n",
                         frame_ref.x16, frame_ref.x17, frame_ref.x18, frame_ref.x28);
 
                     // A null FAR means the *pointer* was corrupt, not the access —
@@ -4654,7 +4753,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                         ("x1", frame_ref.x1), ("x2", frame_ref.x2),
                                         ("x3", frame_ref.x3), ("x8", frame_ref.x8),
                                         ("x19", frame_ref.x19), ("x20", frame_ref.x20)] {
-                        crate::pmm::report_poison_value(name, val);
+                        (hooks().report_poison_value)(name, val);
                     }
 
                     for (name, val) in [("x0", frame_ref.x0), ("x1", frame_ref.x1),
@@ -4693,7 +4792,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 let far_usize = far as usize;
                 if (0x0001_e000_0000..0x0002_0000_0000).contains(&far_usize) {
                     // Fault in Go heap range - always log for debugging
-                    crate::tprint!(128, "[SIGSEGV-HEAP] pid={} far={:#x} elr={:#x} iss={:#x}\n",
+                    safe_print!(128, "[SIGSEGV-HEAP] pid={} far={:#x} elr={:#x} iss={:#x}\n",
                         pid, far, elr, iss);
                 }
             }
@@ -4726,7 +4825,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             }
 
             let frame_ref = unsafe { &*frame };
-            crate::tprint!(128, "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
+            safe_print!(128, "[Fault] Data abort from EL0 at FAR={:#x}, ELR={:#x}, ISS={:#x}\n",
                 far, elr, iss);
             crate::safe_print!(128, "[Fault]  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n",
                 frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3);
@@ -4823,8 +4922,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     let protnone_file = akuma_exec::mmu::user_flags::is_none(flags)
                         && matches!(source, akuma_exec::process::LazySource::File { .. });
                     if protnone_file {
-                        crate::pmm::dp_count(&crate::pmm::DP_PROTNONE_FILE_REGION, 1);
-                        crate::tprint!(224,
+                        akuma_pmm::dp_count(&akuma_pmm::DP_PROTNONE_FILE_REGION, 1);
+                        safe_print!(224,
                             "[DA-NONE-FILE] pid={} as_owner={} va={:#x} flags={:#x} — PROT_NONE flags on a FILE-backed lazy region, demand-paging instead of zero-filling\n",
                             pid, as_owner, far_usize, flags);
                     }
@@ -4833,7 +4932,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     } else if far_in_kernel_identity_user_range(far) {
                         // Fault VA is in the kernel identity-map range — demand-paging
                         // would corrupt kernel memory.  Fall through to SIGSEGV.
-                        crate::tprint!(128, "[IA-DP] pid={} fault in kernel VA range {:#x} -> SIGSEGV\n",
+                        safe_print!(128, "[IA-DP] pid={} fault in kernel VA range {:#x} -> SIGSEGV\n",
                             pid, far_usize);
                     } else if demand_page_lazy_region(
                         akuma_exec::mmu::FaultAccess::Instruction,
@@ -4843,13 +4942,13 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     }
                 } else {
                     akuma_exec::process::lazy_region_debug(far_usize);
-                    crate::tprint!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);
+                    safe_print!(128, "[DP] no lazy region for inst FAR={:#x} pid={}\n", far, pid);
                     
                     // Log register state for debugging wild pointer accesses
                     let frame_ref = unsafe { &*frame };
-                    crate::tprint!(256, "[WILD-IA] pid={} FAR={:#x} ELR={:#x} x0={:#x} x1={:#x} x2={:#x}\n",
+                    safe_print!(256, "[WILD-IA] pid={} FAR={:#x} ELR={:#x} x0={:#x} x1={:#x} x2={:#x}\n",
                         pid, far_usize, frame_ref.elr_el1, frame_ref.x0, frame_ref.x1, frame_ref.x2);
-                    crate::tprint!(128, "  x8={:#x} x9={:#x} x16={:#x} x17={:#x} x28={:#x}\n",
+                    safe_print!(128, "  x8={:#x} x9={:#x} x16={:#x} x17={:#x} x28={:#x}\n",
                         frame_ref.x8, frame_ref.x9, frame_ref.x16, frame_ref.x17, frame_ref.x28);
                 }
             }
@@ -4866,7 +4965,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             crate::safe_print!(128, "[IA] pid={} far={:#x} iss={:#x}\n", pid, far, iss);
             interp_relr_forensics(far_usize, pid);
             let frame_ref = unsafe { &*frame };
-            crate::tprint!(128, "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
+            safe_print!(128, "[Fault] Instruction abort from EL0 at FAR={:#x}, ISS={:#x}\n",
                 far, iss);
             crate::safe_print!(128, "[Fault]  x0={:#x} x1={:#x} x2={:#x} x3={:#x}\n",
                 frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3);

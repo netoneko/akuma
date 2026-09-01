@@ -18,18 +18,12 @@
 
 extern crate alloc;
 
-/// Brings `safe_print!` into textual scope for the whole crate, which is exactly
-/// what `#[macro_use] mod console;` did for it when this crate owned a copy of
-/// the macro. The definition now lives in `akuma_primitives::console` — one for
-/// the tree instead of three (see that module's header). 1,405 call sites in
-/// `src/` are unchanged.
-#[macro_use]
-extern crate akuma_primitives;
-
 /// …and this puts it in the crate root's *path* namespace, for the call sites
 /// that spell it `crate::safe_print!`. Both spellings are in use across `src/`
 /// and both worked before, because `#[macro_export]` on a crate-root
-/// `macro_rules!` provides each.
+/// `macro_rules!` provides each. The `#[macro_use] extern crate` half is gone
+/// (2026-09-01): `src/exceptions.rs` — its last textual user — imports the
+/// macro directly now, on its way to `akuma-exceptions`.
 pub use akuma_primitives::safe_print;
 
 mod akuma;
@@ -920,12 +914,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         evict_clean_file_pages: akuma_exec::process::reclaim_clean_file_pages,
         shrink_page_cache: file_page_cache::shrink,
     });
-    // The permanent bridge hook `akuma-pmm` needs (see the crate's module doc
-    // "Extraction status"): `surviving_mapper` walks the process table, which
-    // can never move into a crate below `akuma-exec`. The `cow_ref_get` bridge
-    // Step 2 needed here too is gone as of Step 3 — `COW_REFCOUNTS` is
-    // crate-native now.
-    akuma_pmm::register_surviving_mapper_hook(pmm::surviving_mapper);
+    // The permanent surviving-mapper bridge `akuma-pmm` needs moved to
+    // `akuma_exec::process::reclaim` on 2026-09-01 (the fn only ever needed the
+    // process table, which akuma-exec owns) and registers itself from
+    // `akuma_exec::init`. The `cow_ref_get` bridge Step 2 needed here too is
+    // gone as of Step 3 — `COW_REFCOUNTS` is crate-native now.
 
     // Initialize Physical Memory Manager
     // After this, the allocator can switch to page-based allocation
@@ -1010,6 +1003,24 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     //    docs/archive/SMP_SHARED.md M4 "open item".
     #[cfg(all(kernel_smp_shared, not(feature = "no-tests")))]
     smp_shared::bringup_secondaries();
+
+    // Exception-path hooks: the dispatcher + the EL0-trap diagnostic the IRQ
+    // and SVC entry points call out to. Registered BEFORE `exceptions::init()`
+    // — no exception can be handled before it installs VBAR and unmasks IRQs,
+    // which is what keeps the hooks' `require()` unreachable-empty.
+    #[cfg(kernel_smp_shared)]
+    exceptions::register_hooks(exceptions::ExceptionHooks {
+        dispatch_irq: irq::dispatch_irq,
+        record_el0_trap: smp_shared::record_el0_trap,
+        report_poison_value: akuma_exec::process::reclaim::report_poison_value,
+        dp_counters_line: pmm::dp_counters_line,
+    });
+    #[cfg(not(kernel_smp_shared))]
+    exceptions::register_hooks(exceptions::ExceptionHooks {
+        dispatch_irq: irq::dispatch_irq,
+        report_poison_value: akuma_exec::process::reclaim::report_poison_value,
+        dp_counters_line: pmm::dp_counters_line,
+    });
 
     // Set up exception vectors and enable IRQs
     exceptions::init();

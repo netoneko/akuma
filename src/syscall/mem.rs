@@ -648,7 +648,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 proc.pid, proc.tgid, mmap_addr, pages, declined, first_va, stale_pa, prot, flags);
         }
     });
-    crate::pmm::dp_count(&crate::pmm::EAGER_MMAP_PAGES, pages);
+    akuma_pmm::dp_count(&akuma_pmm::EAGER_MMAP_PAGES, pages);
 
     // Record writable MAP_SHARED file mappings so their pages get written back to
     // the file on munmap/msync/exit (Akuma has no shared page cache).
@@ -1380,7 +1380,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
                 if let (Some(rec), Some(live)) = (frames.get(i).copied(), dropped)
                     && rec.addr != live.addr
                 {
-                    let seen = crate::pmm::DP_MUNMAP_STALE_REGION_FRAME
+                    let seen = akuma_pmm::DP_MUNMAP_STALE_REGION_FRAME
                         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     // Rate-limited: this fires ~11k times per self-host build, and
                     // printing every one doubles build wall time — enough to move the

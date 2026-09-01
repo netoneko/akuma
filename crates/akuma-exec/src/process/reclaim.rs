@@ -236,6 +236,68 @@ pub fn drain_retired_under_pressure() -> usize {
     drain_retired()
 }
 
+// ============================================================================
+// PMM diagnostics that needed the process table — moved here 2026-09-01
+// ============================================================================
+//
+// `surviving_mapper` used to live in `src/pmm.rs` as the one bridge hook
+// `akuma-pmm` could never own ("walks the process table, which can never move
+// into a crate below `akuma-exec`"). It still can't move into `akuma-pmm` — but
+// it never needed `src/` either: `akuma-exec` is above `akuma-pmm`, owns the
+// process table, and already registers callbacks downward
+// (`drain_retired_under_pressure` above is another `PmmHooks` target). So the
+// fn moved here and `akuma_exec::init` registers it, which retires the
+// `src/main.rs` registration line. `report_poison_value` came along: its only
+// other needs are `akuma_pmm`'s poison codec and the RAM window from
+// `crate::mmu` — all inside this crate.
+
+/// **Permanent.** The first live address space (other than one this thread is
+/// tearing down) that still tracks `pa` as one of its user frames, as
+/// `(pid, tgid)`. `find_process` is lock-free (slot-state atomics + raw
+/// pointers under an IRQ guard); RETIRED slots are skipped, so a process being
+/// reaped cannot report itself.
+pub fn surviving_mapper(pa: usize) -> Option<(u32, u32)> {
+    table::find_process(|p| {
+        if p.address_space.tracks_user_frame(pa) {
+            Some((p.pid, p.tgid))
+        } else {
+            None
+        }
+    })
+}
+
+/// If `word` is a quarantine poison word, the frame it was written for.
+///
+/// This is what turns the null-`Rc` crash from "a qword read back as garbage"
+/// into "frame P, freed by thread T at free-seq S". Returns `None` when the
+/// quarantine is compiled off, since nothing writes poison then and any match
+/// would be a coincidence.
+fn poison_word_frame(word: u64) -> Option<usize> {
+    if !akuma_pmm::config().pmm_uaf_quarantine {
+        return None;
+    }
+    akuma_pmm::poison_decode(word, crate::mmu::ram_base(), crate::mmu::ram_end())
+}
+
+/// Report a value that decoded as quarantine poison, naming the frame it
+/// belonged to, who freed it and how its reference count got to zero. Called
+/// from the fault path with whatever registers the faulting instruction used.
+pub fn report_poison_value(tag: &str, word: u64) {
+    let Some(pa) = poison_word_frame(word) else { return };
+    let (tid_freed, seq_freed, site) = akuma_pmm::last_free_record_at(pa)
+        .unwrap_or((u32::MAX, 0, akuma_pmm::FreeSite::Unknown));
+    crate::safe_print!(255,
+        "[PMM-POISON] {}={:#x} is quarantine poison for pa={:#x} — the kernel FREED \
+         this frame while the process still had it. freed_by=(tid={} seq={} site={}) now_seq={} cow_ref={}\n",
+        tag, word, pa, tid_freed, seq_freed, site.name(),
+        akuma_pmm::free_ledger_seq(), akuma_pmm::cow_ref_get(pa));
+    if let Some((pid, tgid)) = surviving_mapper(pa) {
+        crate::safe_print!(128,
+            "  [PMM-POISON] pa={:#x} still tracked by pid={} tgid={}\n", pa, pid, tgid);
+    }
+    akuma_pmm::print_cow_history(pa);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
