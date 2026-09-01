@@ -19,7 +19,7 @@ pub(super) const EFD_CLOEXEC: u32 = 0x80000;
 
 pub fn eventfd_create(initval: u32, flags: u32) -> u32 {
     let id = NEXT_EVENTFD_ID.fetch_add(1, Ordering::SeqCst);
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         EVENTFDS.lock().insert(id, KernelEventFd {
             counter: u64::from(initval),
             flags,
@@ -31,7 +31,7 @@ pub fn eventfd_create(initval: u32, flags: u32) -> u32 {
 }
 
 pub(super) fn eventfd_read(id: u32) -> Result<u64, i32> {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut table = EVENTFDS.lock();
         if let Some(efd) = table.get_mut(&id) {
             if efd.counter == 0 {
@@ -60,12 +60,12 @@ pub(super) fn eventfd_read(id: u32) -> Result<u64, i32> {
 }
 
 pub fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut table = EVENTFDS.lock();
         if let Some(efd) = table.get_mut(&id) {
             efd.counter = efd.counter.saturating_add(val);
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                crate::tprint!(96, "[eventfd] write id={} val={} counter={}\n", id, val, efd.counter);
+                akuma_primitives::tprint!(96, "[eventfd] write id={} val={} counter={}\n", id, val, efd.counter);
             }
             
             // Wake all pollers
@@ -81,13 +81,13 @@ pub fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
 }
 
 pub(super) fn eventfd_can_read(id: u32) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         EVENTFDS.lock().get(&id).is_some_and(|efd| efd.counter > 0)
     })
 }
 
 pub(super) fn eventfd_is_nonblock(id: u32) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         EVENTFDS.lock().get(&id).is_some_and(|efd| efd.flags & EFD_NONBLOCK != 0)
     })
 }
@@ -95,12 +95,12 @@ pub(super) fn eventfd_is_nonblock(id: u32) -> bool {
 /// Increment the reference count for a shared eventfd (called on fork).
 /// Mirrors `pipe_clone_ref` in the pipe subsystem.
 pub fn eventfd_clone_ref(id: u32) {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut efds = EVENTFDS.lock();
         if let Some(efd) = efds.get_mut(&id) {
             efd.ref_count += 1;
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                crate::safe_print!(96, "[eventfd] clone_ref id={} ref_count={}\n", id, efd.ref_count);
+                akuma_primitives::safe_print!(96, "[eventfd] clone_ref id={} ref_count={}\n", id, efd.ref_count);
             }
         }
     });
@@ -109,12 +109,12 @@ pub fn eventfd_clone_ref(id: u32) {
 /// Decrement the reference count. Destroys the eventfd only when ref_count reaches 0.
 /// Previously this blindly removed the entry, breaking parent processes after fork+exec.
 pub fn eventfd_close(id: u32) {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut efds = EVENTFDS.lock();
         if let Some(efd) = efds.get_mut(&id) {
             efd.ref_count = efd.ref_count.saturating_sub(1);
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                crate::safe_print!(96, "[eventfd] close id={} ref_count={}\n", id, efd.ref_count);
+                akuma_primitives::safe_print!(96, "[eventfd] close id={} ref_count={}\n", id, efd.ref_count);
             }
             if efd.ref_count == 0 {
                 efds.remove(&id);
@@ -124,7 +124,7 @@ pub fn eventfd_close(id: u32) {
 }
 
 pub fn eventfd_add_poller(id: u32, tid: usize) {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         if let Some(efd) = EVENTFDS.lock().get_mut(&id) {
             efd.pollers.insert(tid, wake_handle_for_thread(tid));
         }
@@ -142,7 +142,7 @@ pub(super) fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
         proc.set_nonblock(fd);
     }
     if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-        crate::tprint!(96, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {} (id={})\n", initval, flags, fd, efd_id);
+        akuma_primitives::tprint!(96, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {} (id={})\n", initval, flags, fd, efd_id);
     }
     u64::from(fd)
 }

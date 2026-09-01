@@ -24,6 +24,7 @@
 extern crate alloc;
 
 pub mod ext2;
+pub mod fs;
 pub mod proc;
 
 use alloc::collections::BTreeMap;
@@ -1173,6 +1174,12 @@ pub struct VfsGlueHooks {
     pub probed_core_count: fn() -> usize,
     /// `crate::timer::utc_time_us` — wall clock, `None` before NTP/RTC sets it.
     pub utc_time_us: fn() -> Option<u64>,
+    /// `crate::file_page_cache::init` — the binary's shim, which supplies the
+    /// four `FpcacheConfig` fields from `src/config.rs`. Called with total RAM
+    /// in bytes from [`fs::init`]. **Not** `akuma_fpcache::init` directly: that
+    /// takes the config, and duplicating it here would give `src/config.rs` a
+    /// second copy.
+    pub fpcache_init: fn(usize),
 }
 
 static HOOKS: akuma_primitives::OnceCopy<VfsGlueHooks> = akuma_primitives::OnceCopy::new();
@@ -1201,6 +1208,12 @@ fn utc_time_us() -> Option<u64> {
     HOOKS.get().and_then(|h| (h.utc_time_us)())
 }
 
+fn fpcache_init(total_ram_bytes: usize) {
+    if let Some(h) = HOOKS.get() {
+        (h.fpcache_init)(total_ram_bytes);
+    }
+}
+
 /// Tunables. `src/config.rs` stays the single source of truth; `src/vfs.rs`
 /// reads the consts and calls [`init`].
 ///
@@ -1220,6 +1233,8 @@ pub struct VfsGlueConfig {
     pub max_threads: usize,
     /// Cap on a captured `/proc/<pid>/stdout`.
     pub proc_stdout_max_size: usize,
+    /// Verbose file-I/O tracing in the sync facade.
+    pub syscall_debug_io_enabled: bool,
 }
 
 static CFG: akuma_primitives::OnceCopy<VfsGlueConfig> = akuma_primitives::OnceCopy::new();
@@ -1268,6 +1283,10 @@ fn cfg_shared_file_pages_enabled() -> bool {
 
 fn cfg_syscall_debug_info_enabled() -> bool {
     CFG.get().is_some_and(|c| c.syscall_debug_info_enabled)
+}
+
+fn cfg_syscall_debug_io_enabled() -> bool {
+    CFG.get().is_some_and(|c| c.syscall_debug_io_enabled)
 }
 
 fn cfg_max_threads() -> usize {

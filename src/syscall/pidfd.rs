@@ -9,14 +9,14 @@ static NEXT_PIDFD_ID: AtomicU32 = AtomicU32::new(1);
 
 pub fn pidfd_create(target_pid: u32) -> u32 {
     let id = NEXT_PIDFD_ID.fetch_add(1, Ordering::SeqCst);
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         PIDFD_TABLE.lock().insert(id, KernelPidFd { target_pid });
     });
     id
 }
 
 pub(super) fn pidfd_get_pid(id: u32) -> Option<u32> {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         PIDFD_TABLE.lock().get(&id).map(|pf| pf.target_pid)
     })
 }
@@ -32,7 +32,7 @@ pub fn pidfd_can_read(id: u32) -> bool {
 }
 
 pub fn pidfd_close(id: u32) {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         PIDFD_TABLE.lock().remove(&id);
     });
 }
@@ -67,7 +67,7 @@ pub(super) fn sys_pidfd_open(pid: u32, flags: u32) -> u64 {
     }
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::tprint!(96, "[pidfd] open pid={} → fd={} (pidfd_id={})\n", pid, fd, pidfd_id);
+        akuma_primitives::tprint!(96, "[pidfd] open pid={} → fd={} (pidfd_id={})\n", pid, fd, pidfd_id);
     }
     u64::from(fd)
 }

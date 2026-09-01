@@ -58,7 +58,7 @@ static FLOCK_TABLE: Spinlock<BTreeMap<String, FlockEntry>> = Spinlock::new(BTree
 /// `write_count` leaks this codebase has hit before
 /// (`crates/akuma-exec/src/process/fd.rs`'s own `close_all` doc comment).
 pub fn flock_release(path: &str, holder: usize, fd: u32) {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut table = FLOCK_TABLE.lock();
         if let Some(entry) = table.get_mut(path) {
             entry.holders.retain(|&(h, f)| !(h == holder && f == fd));
@@ -93,7 +93,7 @@ pub(super) fn sys_flock(fd: u32, operation: u32) -> u64 {
         op @ (LOCK_SH | LOCK_EX) => {
             let want = if op == LOCK_SH { LockKind::Shared } else { LockKind::Exclusive };
             loop {
-                let acquired = crate::irq::with_irqs_disabled(|| {
+                let acquired = akuma_primitives::irq::with_irqs_disabled(|| {
                     let mut table = FLOCK_TABLE.lock();
                     match table.get_mut(&path) {
                         None => {
@@ -130,7 +130,7 @@ pub(super) fn sys_flock(fd: u32, operation: u32) -> u64 {
                 // loop uses (`signal.rs`) for the same reason (a wake here
                 // would need its own per-path waiter list for a syscall that,
                 // unlike pipes/sockets, is not on any hot path).
-                let now = crate::timer::uptime_us();
+                let now = akuma_primitives::clock::uptime_us();
                 akuma_exec::threading::schedule_blocking(now + 10_000);
             }
         }

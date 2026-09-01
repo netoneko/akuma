@@ -30,7 +30,7 @@ impl GuardToggle for MmBkl {
     fn enabled() -> bool {
         #[cfg(kernel_smp_shared)]
         {
-            crate::smp_shared::mm_bkl_drop_enabled()
+            akuma_bkl::policy::mm_bkl_drop_enabled()
         }
         #[cfg(not(kernel_smp_shared))]
         {
@@ -202,7 +202,7 @@ pub fn writeback_shared_pages(path: &str, file_offset: usize, len: usize, pas: &
         if !akuma_exec::mmu::copy_from_phys(pa, &mut page[..chunk]) {
             break; // `pa` is not PMM-managed RAM — a corrupt mapping record
         }
-        match crate::fs::write_at(path, off, &page[..chunk]) {
+        match akuma_vfs_glue::fs::write_at(path, off, &page[..chunk]) {
             Ok(n) => { written += n; off += n; }
             Err(_) => break,
         }
@@ -332,9 +332,9 @@ pub(super) fn sys_brk(new_brk: usize) -> u64 {
 /// `docs/archive/EXT2_WRITEBACK_DESIGN.md`). Resolved together, from one call, so
 /// the two can never describe different mounts.
 fn resolve_file_extent(path: &str, offset: usize, len: usize) -> (u32, u32, usize) {
-    match crate::vfs::file_size(path) {
+    match akuma_vfs_glue::file_size(path) {
         Ok(file_len) => {
-            let (mount_id, inode) = crate::vfs::resolve_file_id(path).unwrap_or((0, 0));
+            let (mount_id, inode) = akuma_vfs_glue::resolve_file_id(path).unwrap_or((0, 0));
             (
                 mount_id,
                 inode,
@@ -371,7 +371,7 @@ fn mmap_eager_to_lazy_fallback(
             let count = akuma_exec::process::push_lazy_region_with_source(
                 proc.tgid, mmap_addr, pages * 4096, page_flags, source);
             if crate::config::MEM_SYSCALL_TRACE_ENABLED {
-                crate::tprint!(128, "[mmap] eager OOM -> lazy-file fallback pid={} pages={} ({} regions)\n",
+                akuma_primitives::tprint!(128, "[mmap] eager OOM -> lazy-file fallback pid={} pages={} ({} regions)\n",
                 proc.pid, pages, count);
             }
             return mmap_addr as u64;
@@ -380,7 +380,7 @@ fn mmap_eager_to_lazy_fallback(
     }
     let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
     if crate::config::MEM_SYSCALL_TRACE_ENABLED {
-        crate::tprint!(128, "[mmap] eager OOM -> lazy fallback pid={} pages={} ({} regions)\n",
+        akuma_primitives::tprint!(128, "[mmap] eager OOM -> lazy fallback pid={} pages={} ({} regions)\n",
         proc.pid, pages, count);
     }
     mmap_addr as u64
@@ -435,7 +435,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         // kernel's physical-RAM identity map and causing silent memory corruption.
         if mmap_fixed_overlaps_kernel_va(addr, pages * 4096) {
             if crate::config::MEM_SYSCALL_TRACE_ENABLED {
-                crate::tprint!(128, "[mmap] REJECT MAP_FIXED kernel VA: pid={} addr=0x{:x} len=0x{:x}\n",
+                akuma_primitives::tprint!(128, "[mmap] REJECT MAP_FIXED kernel VA: pid={} addr=0x{:x} len=0x{:x}\n",
                 proc.pid, addr, pages * 4096);
             }
             return EINVAL;
@@ -454,7 +454,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         addr
     } else if let Some(a) = proc.vm_alloc_mmap(pages * 4096) { a } else {
         if crate::config::MEM_SYSCALL_TRACE_ENABLED {
-            crate::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
+            akuma_primitives::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
             proc.pid, pages * 4096,
             proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed),
             proc.memory.mmap_limit);
@@ -485,7 +485,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     if use_lazy {
         let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
         if crate::config::MEM_SYSCALL_TRACE_ENABLED {
-            crate::tprint!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
+            akuma_primitives::tprint!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
                 proc.pid, len, prot, flags, mmap_addr, count);
         }
         return mmap_addr as u64;
@@ -519,7 +519,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             let count = akuma_exec::process::push_lazy_region_with_source(
                 proc.tgid, mmap_addr, pages * 4096, page_flags, source);
             if crate::config::MEM_SYSCALL_TRACE_ENABLED {
-                crate::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (lazy-file, {} regions)\n",
+                akuma_primitives::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (lazy-file, {} regions)\n",
                     proc.pid, fd, &path, offset, len, mmap_addr, count);
             }
             return mmap_addr as u64;
@@ -527,16 +527,16 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 
     // Batch-allocate all pages in a single PMM lock acquisition, then map
     // them with no_flush and issue a single TLB flush after the loop.
-    let frame_batch = if let Some(b) = crate::pmm::alloc_pages_zeroed(pages) { b } else {
+    let frame_batch = if let Some(b) = akuma_exec::pmm::alloc_pages_zeroed(pages) { b } else {
         // The eager batch uses the *critical* allocator, which (unlike the
         // demand-paging fault path) does not evict. Under memory pressure that
         // makes a small eager mmap fail outright — userspace `new`/`malloc`
         // then gets ENOMEM and aborts with std::bad_alloc. So mirror the fault
         // path: evict clean file-backed pages (e.g. model weights mmap'd larger
         // than RAM) and retry once.
-        let reclaimed = akuma_exec::process::reclaim_clean_file_pages(pages + crate::pmm::USER_PAGE_RESERVE);
+        let reclaimed = akuma_exec::process::reclaim_clean_file_pages(pages + akuma_exec::pmm::USER_PAGE_RESERVE);
         if reclaimed > 0 {
-            if let Some(b) = crate::pmm::alloc_pages_zeroed(pages) {
+            if let Some(b) = akuma_exec::pmm::alloc_pages_zeroed(pages) {
                 b
             } else if is_shared_writable {
                 // A writable MAP_SHARED mapping must stay eager so its pages are
@@ -584,7 +584,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 // frame is freshly allocated and not yet in any page table, so
                 // nothing can observe the intermediate state.
                 let page_buf = &mut fill_buf[..chunk];
-                match crate::fs::read_at(&path, file_off, page_buf) {
+                match akuma_vfs_glue::fs::read_at(&path, file_off, page_buf) {
                     Ok(n) => {
                         if !akuma_exec::mmu::copy_to_phys(frame.addr, &fill_buf[..n]) {
                             break; // the PMM just handed us this frame; cannot happen
@@ -597,12 +597,12 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 }
             }
             if crate::config::SYSCALL_DEBUG_IO_ENABLED {
-                crate::safe_print!(256, "[mmap] pid={} fd={} file={} off={} len={} = 0x{:x} (read {} bytes)\n",
+                akuma_primitives::safe_print!(256, "[mmap] pid={} fd={} file={} off={} len={} = 0x{:x} (read {} bytes)\n",
                     proc.pid, fd, &path, offset, len, mmap_addr, bytes_read);
             }
         }
     } else if crate::config::MEM_SYSCALL_TRACE_ENABLED {
-        crate::tprint!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
+        akuma_primitives::tprint!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
             proc.pid, len, prot, flags, mmap_addr);
     }
 
@@ -642,7 +642,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
             let l0 = akuma_exec::mmu::phys_to_virt((ttbr0 & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
             let stale_pa = akuma_exec::mmu::translate_user_va(l0, first_va).unwrap_or(0) & !0xFFF;
-            crate::safe_print!(255,
+            akuma_primitives::safe_print!(255,
                 "[MMAP-STALE-PTE] pid={} tgid={} base={:#x} pages={} declined={} first_va={:#x} \
                  stale_pa={:#x} prot={:#x} flags={:#x}\n",
                 proc.pid, proc.tgid, mmap_addr, pages, declined, first_va, stale_pa, prot, flags);
@@ -659,7 +659,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 SharedFileMapping { path: f.path.clone(), file_offset: offset, len },
             );
             if crate::config::MEM_SYSCALL_TRACE_ENABLED {
-                crate::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (shared-writable, writeback on)\n",
+                akuma_primitives::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (shared-writable, writeback on)\n",
                     proc.pid, fd, &f.path, offset, len, mmap_addr);
             }
         }
@@ -728,10 +728,10 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         // hold — the PMM OOM/reclaim path can re-enter `as_lock`). Roll back on OOM.
         let mut new_frames = alloc::vec::Vec::with_capacity(new_pages);
         for _ in 0..new_pages {
-            if let Some(frame) = crate::pmm::alloc_page_zeroed() {
+            if let Some(frame) = akuma_exec::pmm::alloc_page_zeroed() {
                 new_frames.push(frame);
             } else {
-                for f in new_frames { crate::pmm::free_page_at(f, akuma_pmm::FreeSite::Mremap); }
+                for f in new_frames { akuma_exec::pmm::free_page_at(f, akuma_pmm::FreeSite::Mremap); }
                 return ENOMEM;
             }
         }
@@ -823,7 +823,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                     }
                 }
             });
-            for frame in to_free { crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::Mremap); }
+            for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::Mremap); }
             proc.vm_free_mmap(old_addr, freed_size);
             found_eager = true;
         }
@@ -847,7 +847,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                     }
                 }
             });
-            for frame in to_free { crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::Mremap); }
+            for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::Mremap); }
             proc.vm_free_mmap(old_addr, old_pages * 4096);
         }
 
@@ -870,7 +870,7 @@ pub fn dontneed_count_shared(
     let mut n = 0usize;
     for i in 0..pages {
         let pa = aspace.translate(aligned_addr + i * 4096).map(|pa| pa & !0xFFF);
-        let cow = pa.map_or(0, crate::pmm::cow_ref_get);
+        let cow = pa.map_or(0, akuma_exec::pmm::cow_ref_get);
         if dontneed_page_action(pa.is_some(), cow) == DontneedAction::BreakSharing {
             n += 1;
         }
@@ -901,14 +901,14 @@ pub fn dontneed_apply(
     aspace: &mut akuma_exec::mmu::UserAddressSpace,
     aligned_addr: usize,
     pages: usize,
-    spares: &[crate::pmm::PhysFrame],
-    to_free: &mut alloc::vec::Vec<crate::pmm::PhysFrame>,
+    spares: &[akuma_exec::pmm::PhysFrame],
+    to_free: &mut alloc::vec::Vec<akuma_exec::pmm::PhysFrame>,
 ) -> DontneedOutcome {
     let mut out = DontneedOutcome::default();
     for i in 0..pages {
         let va = aligned_addr + i * 4096;
         let pa = aspace.translate(va).map(|pa| pa & !0xFFF);
-        let cow = pa.map_or(0, crate::pmm::cow_ref_get);
+        let cow = pa.map_or(0, akuma_exec::pmm::cow_ref_get);
         match dontneed_page_action(pa.is_some(), cow) {
             DontneedAction::Nothing => {}
             DontneedAction::ZeroInPlace => {
@@ -1019,7 +1019,7 @@ fn madvise_dontneed_range(
     // re-entrancy hazard `CLAUDE.md` § "Kernel conventions" is about. Reserving
     // `pages` is the exact worst case, so no push inside can grow it.
     let mut file_vas: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(pages);
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let lr = proc.lazy_regions.lock();
         for i in 0..pages {
             let va = aligned_addr + i * 4096;
@@ -1032,7 +1032,7 @@ fn madvise_dontneed_range(
         }
     });
     if !file_vas.is_empty() {
-        let mut dropped: alloc::vec::Vec<crate::pmm::PhysFrame> =
+        let mut dropped: alloc::vec::Vec<akuma_exec::pmm::PhysFrame> =
             alloc::vec::Vec::with_capacity(file_vas.len());
         proc.with_address_space(|aspace| {
             for va in &file_vas {
@@ -1042,10 +1042,10 @@ fn madvise_dontneed_range(
             }
         });
         for frame in dropped {
-            crate::pmm::free_page(frame);
+            akuma_exec::pmm::free_page(frame);
         }
         DONTNEED_FILE_BACKED.fetch_add(file_vas.len(), Ordering::Relaxed);
-        crate::tprint!(192,
+        akuma_primitives::tprint!(192,
             "[DONTNEED-FILE] pid={} va={:#x} pages={} — dropped file-backed mapping instead of zeroing it\n",
             proc.pid, file_vas[0], file_vas.len());
     }
@@ -1061,14 +1061,14 @@ fn madvise_dontneed_range(
     // reclaim-aware per-page allocator will give and skip the remainder — the
     // advice is advisory, and not zeroing a page is a far better failure than
     // zeroing someone else's.
-    let mut spares: alloc::vec::Vec<crate::pmm::PhysFrame> = if shared_pages == 0 {
+    let mut spares: alloc::vec::Vec<akuma_exec::pmm::PhysFrame> = if shared_pages == 0 {
         alloc::vec::Vec::new()
-    } else if let Some(v) = crate::pmm::alloc_pages_zeroed(shared_pages) {
+    } else if let Some(v) = akuma_exec::pmm::alloc_pages_zeroed(shared_pages) {
         v
     } else {
         let mut v = alloc::vec::Vec::with_capacity(shared_pages);
         for _ in 0..shared_pages {
-            match crate::pmm::alloc_page_zeroed_user() {
+            match akuma_exec::pmm::alloc_page_zeroed_user() {
                 Some(f) => v.push(f),
                 None => break,
             }
@@ -1076,13 +1076,13 @@ fn madvise_dontneed_range(
         v
     };
     for frame in &spares {
-        crate::pmm::track_frame(*frame, akuma_exec::runtime::FrameSource::UserData);
+        akuma_exec::pmm::track_frame(*frame, akuma_exec::runtime::FrameSource::UserData);
     }
 
     // Old frames whose last VA in this address space went away, and any
     // replacement that could not be installed. Freed after the hold; the `Vec` is
     // pre-reserved so the pushes inside it never hit the allocator.
-    let mut to_free: alloc::vec::Vec<crate::pmm::PhysFrame> =
+    let mut to_free: alloc::vec::Vec<akuma_exec::pmm::PhysFrame> =
         alloc::vec::Vec::with_capacity(spares.len() * 2);
 
     // Pass 2 — apply. `translate` / `zero_mapped_page` / `unmap_and_free_page`
@@ -1093,10 +1093,10 @@ fn madvise_dontneed_range(
     });
 
     for frame in spares.drain(used..) {
-        crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::MadviseDontneed);
+        akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MadviseDontneed);
     }
     for frame in to_free {
-        crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::MadviseDontneed);
+        akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MadviseDontneed);
     }
     if broke > 0 {
         DONTNEED_SHARED_FRAME.fetch_add(broke, Ordering::Relaxed);
@@ -1160,7 +1160,7 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             }
 
             // Batch-allocate and map with deferred TLB flush.
-            let frames = match crate::pmm::alloc_pages_zeroed(prefault.len()) {
+            let frames = match akuma_exec::pmm::alloc_pages_zeroed(prefault.len()) {
                 Some(v) => v,
                 None => return 0, // advisory — ignore OOM
             };
@@ -1252,7 +1252,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
     if crate::config::MEM_SYSCALL_TRACE_ENABLED {
-        crate::tprint!(128, "[mprotect] pid={} owner={} addr=0x{:x} len=0x{:x} prot={:#x}\n",
+        akuma_primitives::tprint!(128, "[mprotect] pid={} owner={} addr=0x{:x} len=0x{:x} prot={:#x}\n",
             current_pid, owner_pid, addr, pages * 4096, prot);
     }
     if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
@@ -1295,7 +1295,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
         }
         0
     } else {
-        crate::tprint!(128, "[mprotect] EINVAL: owner={} not found\n", owner_pid);
+        akuma_primitives::tprint!(128, "[mprotect] EINVAL: owner={} not found\n", owner_pid);
         EINVAL
     }
 }
@@ -1340,7 +1340,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     let unmapped_any_eager = !detached.is_empty();
     for (base, n, frames) in detached {
         if crate::config::TRACE_MUNMAP {
-            crate::tprint!(128, "[munmap] pid={} addr=0x{:x} ({} pages, {} owned, base=0x{:x})\n",
+            akuma_primitives::tprint!(128, "[munmap] pid={} addr=0x{:x} ({} pages, {} owned, base=0x{:x})\n",
                 proc.pid, addr, n, frames.len(), base);
         }
         // Writable MAP_SHARED file mapping: flush its (still-resident) pages back
@@ -1351,7 +1351,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             let flush_len = m.len.min(n * 4096);
             let written = writeback_shared_pages(&m.path, m.file_offset, flush_len, &pas);
             if crate::config::TRACE_MUNMAP {
-                crate::tprint!(192, "[munmap] pid={} shared-writeback file={} off={} {} bytes\n",
+                akuma_primitives::tprint!(192, "[munmap] pid={} shared-writeback file={} off={} {} bytes\n",
                     proc.pid, &m.path, m.file_offset, written);
             }
         }
@@ -1386,7 +1386,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
                     // printing every one doubles build wall time — enough to move the
                     // very races being measured. `munmap_stale=` carries the volume.
                     if seen < 32 {
-                        crate::tprint!(192,
+                        akuma_primitives::tprint!(192,
                             "[MUNMAP-STALE] pid={} va={:#x} recorded={:#x} live={:#x} — freed the live frame\n",
                             proc.pid, va, rec.addr, live.addr);
                     }
@@ -1397,7 +1397,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             }
             akuma_exec::mmu::flush_tlb_range_all_asid(base, n);
         });
-        for frame in to_free { crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapRegion); }
+        for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapRegion); }
         proc.vm_free_mmap(base, n * 4096);
     }
 
@@ -1417,7 +1417,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
                 akuma_exec::mmu::flush_tlb_range_all_asid(freed_start, freed_pages);
             });
             let had_physical = !to_free.is_empty();
-            for frame in to_free { crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapPartial); }
+            for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapPartial); }
             // Only recycle the VA range when physical pages were actually freed.
             // Pure lazy (PROT_NONE, never demand-paged) regions must NOT be put
             // back in free_regions: alloc_mmap prefers free_regions over
@@ -1458,6 +1458,6 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             akuma_exec::mmu::flush_tlb_range_all_asid(addr, total_pages);
         }
     });
-    for frame in to_free { crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapSpan); }
+    for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapSpan); }
     0
 }

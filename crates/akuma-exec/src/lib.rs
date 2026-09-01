@@ -83,6 +83,7 @@
 
 extern crate alloc;
 
+pub mod pmm;
 pub mod runtime;
 /// Spinlocks and the recursive Big Kernel Lock — **moved to `akuma-bkl` on
 /// 2026-08-30** (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.4), together with

@@ -393,6 +393,7 @@ dependencies = [
  "akuma-ext2",
  "akuma-fpcache",
  "akuma-isolation",
+ "akuma-locks-rw",
  "akuma-net",
  "akuma-pmm",
  "akuma-primitives",

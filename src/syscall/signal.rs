@@ -170,7 +170,7 @@ pub(super) fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: usize) -> u64 {
         }
         // Sleep in short slices so a wake (pend_signal_for_thread wakes the waker)
         // or interrupt is observed promptly.
-        let now = crate::timer::uptime_us();
+        let now = akuma_primitives::clock::uptime_us();
         akuma_exec::threading::schedule_blocking(now + 10_000);
     }
 }
@@ -244,7 +244,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
     // spells as a `u64::MAX` deadline rather than a separate flag.
     let timeout_us = time::read_timeout_us(timeout_ptr)?.unwrap_or(u64::MAX);
 
-    let start_time = crate::timer::uptime_us();
+    let start_time = akuma_primitives::clock::uptime_us();
 
     loop {
         // Check for pending signals.  We pass ~wait_mask to take_pending_signal
@@ -260,7 +260,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
             return Ok(u64::from(sig));
         }
 
-        let now = crate::timer::uptime_us();
+        let now = akuma_primitives::clock::uptime_us();
         let elapsed = now.saturating_sub(start_time);
         if timeout_ptr != 0 && elapsed >= timeout_us {
             return Err(EAGAIN); // Timeout
@@ -288,7 +288,7 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
     if sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }
 
     if crate::config::TRACE_TKILL {
-        crate::safe_print!(128, "[signal] tkill(tid={}, sig={}) from slot={}\n",
+        akuma_primitives::safe_print!(128, "[signal] tkill(tid={}, sig={}) from slot={}\n",
             tid, sig, akuma_exec::threading::current_thread_id());
     }
 
@@ -319,7 +319,7 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
             akuma_exec::process::SignalHandler::Default => "DFL",
             akuma_exec::process::SignalHandler::UserFn(_) => "FN",
         };
-        crate::safe_print!(128, "[signal]   tkill disp={} mask={:#x} blocked={} fatal={}\n",
+        akuma_primitives::safe_print!(128, "[signal]   tkill disp={} mask={:#x} blocked={} fatal={}\n",
             kind, target_mask, (target_mask & (1u64 << (sig - 1))) != 0,
             signal_is_fatal_default(sig));
     }

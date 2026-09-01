@@ -113,7 +113,7 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
     let cloexec = sock_type & 0x80000 != 0;
     let nonblock = sock_type & 0x800 != 0;
     if domain != 2 || (base_type != 1 && base_type != 2) {
-        crate::safe_print!(96, "[syscall] socket(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
+        akuma_primitives::safe_print!(96, "[syscall] socket(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
         return EAFNOSUPPORT;
     }
     if let Some(idx) = socket::alloc_socket(base_type) {
@@ -126,7 +126,7 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
                 proc.set_nonblock(fd);
             }
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                crate::safe_print!(96, "[syscall] socket(type={}) = fd {}\n", if base_type == 2 { "UDP" } else { "TCP" }, fd);
+                akuma_primitives::safe_print!(96, "[syscall] socket(type={}) = fd {}\n", if base_type == 2 { "UDP" } else { "TCP" }, fd);
             }
             return u64::from(fd);
         }
@@ -156,7 +156,7 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
     // Only AF_UNIX (1); accept SOCK_STREAM (1) and SOCK_SEQPACKET (5).
     if domain != 1 || (base_type != 1 && base_type != 5) {
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-            crate::safe_print!(96, "[syscall] socketpair(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
+            akuma_primitives::safe_print!(96, "[syscall] socketpair(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
         }
         return EAFNOSUPPORT;
     }
@@ -217,7 +217,7 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
         return EFAULT;
     }
     if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-        crate::safe_print!(96, "[syscall] socketpair(AF_UNIX) = ({}, {})\n", fd0, fd1);
+        akuma_primitives::safe_print!(96, "[syscall] socketpair(AF_UNIX) = ({}, {})\n", fd0, fd1);
     }
     0
 }
@@ -238,7 +238,7 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
         return EFAULT;
     }
     let addr = sa.to_addr();
-    crate::safe_print!(96, "[syscall] bind(fd={}, port={}, ip={}.{}.{}.{})\n", fd, addr.port, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3]);
+    akuma_primitives::safe_print!(96, "[syscall] bind(fd={}, port={}, ip={}.{}.{}.{})\n", fd, addr.port, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3]);
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return EBADF,
@@ -246,7 +246,7 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     match socket::socket_bind(idx, addr) {
         Ok(()) => 0,
         Err(e) => {
-            crate::safe_print!(64, "[syscall] bind failed: {}\n", e);
+            akuma_primitives::safe_print!(64, "[syscall] bind failed: {}\n", e);
             neg_errno(e)
         }
     }
@@ -338,7 +338,7 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     }
     let addr = sa.to_addr();
     if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-        crate::safe_print!(96, "[syscall] connect(fd={}, ip={}.{}.{}.{}:{})\n", fd, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port);
+        akuma_primitives::safe_print!(96, "[syscall] connect(fd={}, ip={}.{}.{}.{}:{})\n", fd, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port);
     }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
@@ -348,19 +348,19 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     match socket::socket_connect(idx, addr, nonblock) {
         Ok(()) => {
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                crate::safe_print!(64, "[syscall] connect(fd={}) = OK\n", fd);
+                akuma_primitives::safe_print!(64, "[syscall] connect(fd={}) = OK\n", fd);
             }
             0
         }
         Err(e) if e == libc_errno::EINPROGRESS => {
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                crate::safe_print!(64, "[syscall] connect(fd={}) = EINPROGRESS\n", fd);
+                akuma_primitives::safe_print!(64, "[syscall] connect(fd={}) = EINPROGRESS\n", fd);
             }
             EINPROGRESS
         }
         Err(e) => {
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                crate::safe_print!(64, "[syscall] connect(fd={}) = err {}\n", fd, e);
+                akuma_primitives::safe_print!(64, "[syscall] connect(fd={}) = err {}\n", fd, e);
             }
             neg_errno(e)
         }
@@ -564,11 +564,11 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
             // sendto, i.e. per datagram on the UDP send path. Same class as the
             // ungated `epoll_ctl` trace in poll.rs (LONG_ROAD_TO_REDIS_PART_2.md §9).
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                crate::safe_print!(96, "[syscall] sendto(fd={}, len={}, dest={}.{}.{}.{}:{})\n", fd, len, a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.port);
+                akuma_primitives::safe_print!(96, "[syscall] sendto(fd={}, len={}, dest={}.{}.{}.{}:{})\n", fd, len, a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.port);
             }
             // Extra debug for DNS traffic
             if crate::config::SYSCALL_DEBUG_NET_ENABLED && a.port == 53 {
-                crate::tprint!(128, "[DNS] query sent: fd={} len={} to {}.{}.{}.{}:53\n", 
+                akuma_primitives::tprint!(128, "[DNS] query sent: fd={} len={} to {}.{}.{}.{}:53\n", 
                     fd, len, a.ip[0], a.ip[1], a.ip[2], a.ip[3]);
             }
             a
@@ -581,13 +581,13 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
         match socket::socket_send_udp(idx, buf, dest) {
             Ok(n) => {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED && dest.port == 53 {
-                    crate::tprint!(64, "[DNS] query sent OK: {} bytes\n", n);
+                    akuma_primitives::tprint!(64, "[DNS] query sent OK: {} bytes\n", n);
                 }
                 n as u64
             }
             Err(e) => {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED && dest.port == 53 {
-                    crate::tprint!(64, "[DNS] query send error: {}\n", e);
+                    akuma_primitives::tprint!(64, "[DNS] query send error: {}\n", e);
                 }
                 neg_errno(e)
             }
@@ -634,13 +634,13 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
 
     if socket::is_udp_socket(idx) {
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-            crate::tprint!(96, "[UDP] recvfrom: fd={} len={} nonblock={}\n", fd, len, nonblock);
+            akuma_primitives::tprint!(96, "[UDP] recvfrom: fd={} len={} nonblock={}\n", fd, len, nonblock);
         }
         match socket::socket_recv_udp(idx, &mut kernel_buf, nonblock) {
             Ok((n, from)) => {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                     let ip = from.ip;
-                    crate::tprint!(96, "[UDP] recvfrom OK: {} bytes from {}.{}.{}.{}:{}\n", 
+                    akuma_primitives::tprint!(96, "[UDP] recvfrom OK: {} bytes from {}.{}.{}.{}:{}\n", 
                         n, ip[0], ip[1], ip[2], ip[3], from.port);
                 }
                 if copy_to_user(buf_ptr, &kernel_buf[..n]).is_err() {
@@ -659,7 +659,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
             }
             Err(e) => {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED && e != libc_errno::EAGAIN {
-                    crate::tprint!(64, "[UDP] recvfrom error: {}\n", e);
+                    akuma_primitives::tprint!(64, "[UDP] recvfrom error: {}\n", e);
                 }
                 neg_errno(e)
             }
@@ -668,7 +668,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
         match socket::socket_recv(idx, &mut kernel_buf, nonblock) {
             Ok(n) => {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                    crate::tprint!(96, "[TCP] recvfrom fd={} got={}\n", fd, n);
+                    akuma_primitives::tprint!(96, "[TCP] recvfrom fd={} got={}\n", fd, n);
                 }
                 if copy_to_user(buf_ptr, &kernel_buf[..n]).is_err() {
                     return EFAULT;
@@ -681,7 +681,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
             }
             Err(e) => {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                    crate::tprint!(64, "[TCP] recvfrom fd={} err={}\n", fd, e);
+                    akuma_primitives::tprint!(64, "[TCP] recvfrom fd={} err={}\n", fd, e);
                 }
                 if e == libc_errno::EAGAIN {
                     super::poll::epoll_on_fd_drained(fd);
@@ -823,7 +823,7 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                 }
                 _ => {
                     if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                        crate::tprint!(128, "[setsockopt] SOL_SOCKET optname={} ignored\n", optname);
+                        akuma_primitives::tprint!(128, "[setsockopt] SOL_SOCKET optname={} ignored\n", optname);
                     }
                     0
                 }
@@ -844,7 +844,7 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                 }
                 _ => {
                     if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                        crate::tprint!(128, "[setsockopt] IPPROTO_TCP optname={} ignored\n", optname);
+                        akuma_primitives::tprint!(128, "[setsockopt] IPPROTO_TCP optname={} ignored\n", optname);
                     }
                     0
                 }
@@ -852,7 +852,7 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
         }
         _ => {
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                crate::tprint!(128, "[setsockopt] level={} optname={} ignored\n", level, optname);
+                akuma_primitives::tprint!(128, "[setsockopt] level={} optname={} ignored\n", level, optname);
             }
             0
         }
@@ -970,7 +970,7 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
     // investigation needs side by side.
     if crate::config::SYSCALL_DEBUG_NET_ENABLED && level == SOL_SOCKET && optname == SO_ERROR {
         let st = get_socket_from_fd(fd).map_or("no-fd", socket_tcp_state_str);
-        crate::tprint!(96, "[soerr] fd={} val={} state={}\n", fd, val, st);
+        akuma_primitives::tprint!(96, "[soerr] fd={} val={} state={}\n", fd, val, st);
     }
 
     if write_user_val(optval, &val).is_err() {
@@ -1251,8 +1251,8 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         let result = socket::socket_send(idx, &kernel_buf, fd_is_nonblock(fd));
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
             match &result {
-                Ok(n) => crate::tprint!(96, "[TCP] sendmsg fd={} len={} sent={}\n", fd, kernel_buf.len(), n),
-                Err(e) => crate::tprint!(64, "[TCP] sendmsg fd={} err={}\n", fd, e),
+                Ok(n) => akuma_primitives::tprint!(96, "[TCP] sendmsg fd={} len={} sent={}\n", fd, kernel_buf.len(), n),
+                Err(e) => akuma_primitives::tprint!(64, "[TCP] sendmsg fd={} err={}\n", fd, e),
             }
         }
         match result {
@@ -1381,13 +1381,13 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
 
     if socket::is_udp_socket(idx) {
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-            crate::tprint!(96, "[UDP] recvmsg: fd={} buflen={} nonblock={}\n", fd, kernel_buf.len(), nonblock);
+            akuma_primitives::tprint!(96, "[UDP] recvmsg: fd={} buflen={} nonblock={}\n", fd, kernel_buf.len(), nonblock);
         }
         match socket::socket_recv_udp(idx, &mut kernel_buf, nonblock) {
             Ok((n, from)) => {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
                     let ip = from.ip;
-                    crate::tprint!(96, "[UDP] recvmsg OK: {} bytes from {}.{}.{}.{}:{}\n",
+                    akuma_primitives::tprint!(96, "[UDP] recvmsg OK: {} bytes from {}.{}.{}.{}:{}\n",
                         n, ip[0], ip[1], ip[2], ip[3], from.port);
                 }
                 if copy_to_user(iov.iov_base, &kernel_buf[..n]).is_err() {
@@ -1407,7 +1407,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
             }
             Err(e) => {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED && e != libc_errno::EAGAIN {
-                    crate::tprint!(64, "[UDP] recvmsg error: {}\n", e);
+                    akuma_primitives::tprint!(64, "[UDP] recvmsg error: {}\n", e);
                 }
                 neg_errno(e)
             }
@@ -1416,7 +1416,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         match socket::socket_recv(idx, &mut kernel_buf, nonblock) {
             Ok(n) => {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                    crate::tprint!(96, "[TCP] recvmsg fd={} got={}\n", fd, n);
+                    akuma_primitives::tprint!(96, "[TCP] recvmsg fd={} got={}\n", fd, n);
                 }
                 if copy_to_user(iov.iov_base, &kernel_buf[..n]).is_err() {
                     return EFAULT;
@@ -1431,7 +1431,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
             }
             Err(e) => {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                    crate::tprint!(64, "[TCP] recvmsg fd={} err={}\n", fd, e);
+                    akuma_primitives::tprint!(64, "[TCP] recvmsg fd={} err={}\n", fd, e);
                 }
                 if e == libc_errno::EAGAIN {
                     super::poll::epoll_on_fd_drained(fd);
@@ -1507,7 +1507,7 @@ pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
         if crate::config::SYSCALL_DEBUG_EPOLL_EDGE {
             let (listening, pending, dead) =
                 akuma_net::socket::listener_backlog_census(idx).unwrap_or((0, 0, 0));
-            crate::tprint!(160, "[epoll-listener] idx={} ready={} backlog={}/{}/{}\n",
+            akuma_primitives::tprint!(160, "[epoll-listener] idx={} ready={} backlog={}/{}/{}\n",
                 idx, ready, listening, pending, dead);
         }
         return ready;
@@ -1555,7 +1555,7 @@ pub(super) fn socket_can_send_tcp(idx: usize) -> bool {
     }).unwrap_or(false)
 }
 
-/// smoltcp TCP state as a static string, for `tprint!` — no allocation, so it is
+/// smoltcp TCP state as a static string, for `akuma_primitives::tprint!` — no allocation, so it is
 /// safe on the console path (`docs/reference/subsystems/console.md`).
 #[cfg(feature = "smoltcp")]
 pub(super) fn socket_tcp_state_str(idx: usize) -> &'static str {
@@ -1669,13 +1669,13 @@ pub fn run_socket_timeout_tests() {
 
     let tid = akuma_exec::threading::current_thread_id();
     let pid = 8032u32;
-    register_process(pid, crate::process_tests::make_test_process(pid));
+    register_process(pid, akuma_exec::process::make_test_process(pid));
     register_thread_pid(tid, pid);
 
     let Some(idx) = socket::alloc_socket(socket::socket_const::SOCK_STREAM) else {
         unregister_thread_pid(tid);
         unregister_process(pid);
-        crate::safe_print!(128, "[Test] socket_timeout_option_roundtrip SKIPPED (no socket slots)\n");
+        akuma_primitives::safe_print!(128, "[Test] socket_timeout_option_roundtrip SKIPPED (no socket slots)\n");
         return;
     };
     let proc = akuma_exec::process::current_process_shared().unwrap();
@@ -1731,12 +1731,12 @@ pub fn run_socket_timeout_tests() {
     unregister_process(pid);
 
     if default_unset && roundtrip && zero_means_forever && send_independent {
-        crate::safe_print!(
+        akuma_primitives::safe_print!(
             160,
             "[Test] socket_timeout_option_roundtrip PASSED (SO_RCVTIMEO/SO_SNDTIMEO set+get, zero=forever, sides independent)\n"
         );
     } else {
-        crate::safe_print!(
+        akuma_primitives::safe_print!(
             192,
             "[Test] socket_timeout_option_roundtrip FAILED: default_unset={} roundtrip={} zero_forever={} send_independent={}\n",
             default_unset, roundtrip, zero_means_forever, send_independent
@@ -1785,7 +1785,7 @@ pub fn run_net_bounce_tests() {
     let capped = alloc_net_bounce(1 << 20).expect("capped bounce alloc must succeed at boot");
     assert_eq!(capped.len(), NET_BOUNCE_MAX, "oversized request is served at the cap");
 
-    crate::console::print("  [PASS] test_net_bounce_alloc_degradation\n");
+    akuma_primitives::console::print_str("  [PASS] test_net_bounce_alloc_degradation\n");
 }
 
 // ============================================================================

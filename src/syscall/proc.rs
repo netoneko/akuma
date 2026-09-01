@@ -1,4 +1,3 @@
-use crate::tprint;
 use super::*;
 
 // Maps child PID → the parent thread's generation-tagged WakeHandle for processes
@@ -34,7 +33,7 @@ pub fn notify_child_channel_exited_pub(pid: u32, code: i32) {
 /// Called from do_execve (on successful image replacement), sys_exit_group/sys_exit,
 /// and fault exit paths in exceptions.rs.
 pub fn vfork_complete(child_pid: u32) {
-    let parent = crate::irq::with_irqs_disabled(|| {
+    let parent = akuma_primitives::irq::with_irqs_disabled(|| {
         VFORK_WAITERS.lock().remove(&child_pid)
     });
     if let Some(handle) = parent {
@@ -45,18 +44,18 @@ pub fn vfork_complete(child_pid: u32) {
 /// Number of entries currently in VFORK_WAITERS.  Used only by kernel tests.
 #[cfg(kernel_tests)]
 pub fn vfork_waiters_len() -> usize {
-    crate::irq::with_irqs_disabled(|| VFORK_WAITERS.lock().len())
+    akuma_primitives::irq::with_irqs_disabled(|| VFORK_WAITERS.lock().len())
 }
 
 /// Kernel test helper: insert a fake pending vfork for `child_pid`, invoke
 /// `vfork_complete`, and return whether the entry was cleanly removed.
 #[cfg(kernel_tests)]
 pub fn test_vfork_complete_mechanism(child_pid: u32) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         VFORK_WAITERS.lock().insert(child_pid, akuma_exec::threading::current_wake_handle());
     });
     vfork_complete(child_pid);
-    let still_present = crate::irq::with_irqs_disabled(|| {
+    let still_present = akuma_primitives::irq::with_irqs_disabled(|| {
         VFORK_WAITERS.lock().contains_key(&child_pid)
     });
     !still_present
@@ -105,7 +104,7 @@ pub(super) fn sys_setpgid(pid: u32, pgid: u32) -> u64 {
         old
     }) {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[syscall] setpgid(pid={}, pgid={}): old={}, new={}\n", target_pid, pgid, old_pgid, target_pgid);
+            akuma_primitives::safe_print!(128, "[syscall] setpgid(pid={}, pgid={}): old={}, new={}\n", target_pid, pgid, old_pgid, target_pgid);
         }
         0
     } else {
@@ -130,12 +129,12 @@ pub(super) fn sys_getpgid(pid: u32) -> u64 {
 
     if let Some(proc) = akuma_exec::process::lookup_process_shared(target_pid) {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED && pid == 0 {
-            crate::safe_print!(128, "[syscall] getpgid(0) for PID {}: returning PGID {}\n", target_pid, proc.pgid);
+            akuma_primitives::safe_print!(128, "[syscall] getpgid(0) for PID {}: returning PGID {}\n", target_pid, proc.pgid);
         }
         u64::from(proc.pgid)
     } else {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[syscall] getpgid({}) not found: ESRCH\n", target_pid);
+            akuma_primitives::safe_print!(128, "[syscall] getpgid({}) not found: ESRCH\n", target_pid);
         }
         ESRCH
     }
@@ -253,14 +252,14 @@ pub(super) fn sys_set_robust_list(head: u64, len: usize) -> u64 {
 pub(super) fn sys_exit(code: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         if crate::config::FUTEX_DBG_ENABLED {
-            crate::tprint!(96, "[exit93] tid={} pid={} tgid={}\n",
+            akuma_primitives::tprint!(96, "[exit93] tid={} pid={} tgid={}\n",
                 akuma_exec::threading::current_thread_id(), proc.pid, proc.tgid);
         }
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-            let elapsed_us = crate::timer::uptime_us().saturating_sub(proc.start_time_us);
+            let elapsed_us = akuma_primitives::clock::uptime_us().saturating_sub(proc.start_time_us);
             let secs = elapsed_us / 1_000_000;
             let frac = (elapsed_us % 1_000_000) / 10_000;
-            crate::tprint!(128, "[exit] tid={} pid={} name={} code={} after {}.{:02}s\n",
+            akuma_primitives::tprint!(128, "[exit] tid={} pid={} name={} code={} after {}.{:02}s\n",
                 akuma_exec::threading::current_thread_id(), proc.pid, proc.name, code, secs, frac);
         }
         let pid = proc.pid;
@@ -297,9 +296,9 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         // through the normal EL0→EL1→EL0 trampoline).
         let tid_addr = proc.clear_child_tid;
         if tid_addr != 0 {
-            let mapped = crate::mmu::is_current_user_page_mapped(tid_addr as usize);
+            let mapped = akuma_exec::mmu::is_current_user_page_mapped(tid_addr as usize);
             if crate::config::FUTEX_DBG_ENABLED {
-                tprint!(160, "[cct-exit] pid={} tgid={} tid_addr={:#x} mapped={} (sys_exit)\n",
+                akuma_primitives::tprint!(160, "[cct-exit] pid={} tgid={} tid_addr={:#x} mapped={} (sys_exit)\n",
                     pid, proc.tgid, tid_addr, mapped);
             }
             if mapped {
@@ -366,14 +365,14 @@ pub fn sys_exit_group_pub(code: i32) -> ! {
 pub(super) fn sys_exit_group(code: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         if crate::config::FUTEX_DBG_ENABLED {
-            crate::tprint!(96, "[exit94] tid={} pid={} tgid={}\n",
+            akuma_primitives::tprint!(96, "[exit94] tid={} pid={} tgid={}\n",
                 akuma_exec::threading::current_thread_id(), proc.pid, proc.tgid);
         }
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-            let elapsed_us = crate::timer::uptime_us().saturating_sub(proc.start_time_us);
+            let elapsed_us = akuma_primitives::clock::uptime_us().saturating_sub(proc.start_time_us);
             let secs = elapsed_us / 1_000_000;
             let frac = (elapsed_us % 1_000_000) / 10_000;
-            crate::tprint!(128, "[exit_group] pid={} name={} code={} after {}.{:02}s\n",
+            akuma_primitives::tprint!(128, "[exit_group] pid={} name={} code={} after {}.{:02}s\n",
                 proc.pid, proc.name, code, secs, frac);
         }
         // Gated 2026-08-29. It was unconditional for the reason below, and that
@@ -388,7 +387,7 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         // investigation — see
         // docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §4.
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::tprint!(160, "[PROC-EXIT] pid={} tgid={} name={} code={}\n",
+            akuma_primitives::tprint!(160, "[PROC-EXIT] pid={} tgid={} name={} code={}\n",
                 proc.pid, proc.tgid, proc.name, code);
         }
         let pid = proc.pid;
@@ -484,7 +483,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED || crate::config::SYSCALL_DEBUG_NET_ENABLED {
         let tid = akuma_exec::threading::current_thread_id();
         let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-        crate::tprint!(128, "[clone] tid={} pid={} flags=0x{:x} stack=0x{:x}\n", tid, pid, flags, stack);
+        akuma_primitives::tprint!(128, "[clone] tid={} pid={} flags=0x{:x} stack=0x{:x}\n", tid, pid, flags, stack);
     }
 
     // Bits 32+ are unused by any valid clone flag.  Garbage values like
@@ -502,12 +501,12 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
             Ok(tid) => {
                 akuma_exec::threading::seed_thread_signal_mask(tid as usize, parent_mask);
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                    crate::tprint!(64, "[clone] new thread TID={}\n", tid);
+                    akuma_primitives::tprint!(64, "[clone] new thread TID={}\n", tid);
                 }
                 return u64::from(tid);
             }
             Err(e) => {
-                crate::safe_print!(128, "[syscall] clone_thread failed: {}\n", e);
+                akuma_primitives::safe_print!(128, "[syscall] clone_thread failed: {}\n", e);
                 return EAGAIN;
             }
         }
@@ -531,7 +530,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         let child_pid = akuma_exec::process::allocate_pid();
 
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[syscall] clone: forking PID {} -> {} (flags=0x{:x})\n", parent_proc.pid, child_pid, flags);
+            akuma_primitives::safe_print!(128, "[syscall] clone: forking PID {} -> {} (flags=0x{:x})\n", parent_proc.pid, child_pid, flags);
         }
 
         // CLONE_VFORK: register the parent TID in VFORK_WAITERS *before* fork_process
@@ -539,7 +538,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         // is a race window where the child can exec, call vfork_complete (which removes
         // the entry), and find nothing — leaving the parent blocked forever.
         if flags & CLONE_VFORK != 0 {
-            crate::irq::with_irqs_disabled(|| {
+            akuma_primitives::irq::with_irqs_disabled(|| {
                 VFORK_WAITERS.lock().insert(child_pid, akuma_exec::threading::current_wake_handle());
             });
         }
@@ -588,7 +587,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                             }
                             let fd_i32 = pidfd_fd as i32;
                             let _ = write_user_val(pidfd_out_ptr, &fd_i32);
-                            crate::tprint!(96, "[clone] CLONE_PIDFD: child={} pidfd={}\n", new_pid, pidfd_fd);
+                            akuma_primitives::tprint!(96, "[clone] CLONE_PIDFD: child={} pidfd={}\n", new_pid, pidfd_fd);
                         }
                     }
                 // CLONE_VFORK: block parent until child calls execve or exits.
@@ -603,7 +602,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                     // vfork_complete() removes the VFORK_WAITERS entry.
                     loop {
                         akuma_exec::threading::schedule_blocking(u64::MAX);
-                        let still_pending = crate::irq::with_irqs_disabled(|| {
+                        let still_pending = akuma_primitives::irq::with_irqs_disabled(|| {
                             VFORK_WAITERS.lock().contains_key(&new_pid)
                         });
                         if !still_pending { break; }
@@ -614,18 +613,18 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
             Err(e) => {
                 // Fork failed: clean up the VFORK_WAITERS entry we pre-inserted.
                 if flags & CLONE_VFORK != 0 {
-                    crate::irq::with_irqs_disabled(|| {
+                    akuma_primitives::irq::with_irqs_disabled(|| {
                         VFORK_WAITERS.lock().remove(&child_pid);
                     });
                 }
-                crate::safe_print!(128, "[syscall] clone: fork failed: {}\n", e);
+                akuma_primitives::safe_print!(128, "[syscall] clone: fork failed: {}\n", e);
                 return ENOMEM;
             }
         }
     }
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] clone: flags=0x{:x} not supported, returning ENOSYS\n", flags);
+        akuma_primitives::safe_print!(128, "[syscall] clone: flags=0x{:x} not supported, returning ENOSYS\n", flags);
     }
     ENOSYS
 }
@@ -653,7 +652,7 @@ pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
     };
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::tprint!(128, "[syscall] clone3(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
+        akuma_primitives::tprint!(128, "[syscall] clone3(flags=0x{:x}, stack=0x{:x})\n", flags, stack);
     }
 
     // Pass the pidfd pointer through so CLONE_PIDFD can write the fd number back
@@ -666,22 +665,22 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let path = match copy_from_user_str(path_ptr, 1024) {
         Ok(p) => p,
         Err(e) => {
-            crate::safe_print!(64, "[syscall] execve: path copy failed with {} pid={}\n", e as i64, pid);
+            akuma_primitives::safe_print!(64, "[syscall] execve: path copy failed with {} pid={}\n", e as i64, pid);
             return e;
         },
     };
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::tprint!(128, "[syscall] execve(path=\"{}\", argv_ptr=0x{:x}, envp_ptr=0x{:x}) PID {}\n", path, argv_ptr, envp_ptr, pid);
+        akuma_primitives::tprint!(128, "[syscall] execve(path=\"{}\", argv_ptr=0x{:x}, envp_ptr=0x{:x}) PID {}\n", path, argv_ptr, envp_ptr, pid);
     }
 
     let resolved_path = if path.starts_with('/') {
         path
     } else if let Some(proc) = akuma_exec::process::current_process_shared() {
-        crate::vfs::resolve_path(&proc.cwd, &path)
+        akuma_vfs_glue::resolve_path(&proc.cwd, &path)
     } else {
         path
     };
-    let resolved_path = crate::vfs::resolve_symlinks(&resolved_path);
+    let resolved_path = akuma_vfs_glue::resolve_symlinks(&resolved_path);
 
     let mut args = Vec::new();
     if argv_ptr != 0 {
@@ -698,7 +697,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             // after it, then exec'd a corrupt argv (e.g. rustc saw `--check-cfg`
             // with its giant value truncated away → "Argument to option missing").
             if let Ok(s) = copy_from_user_str(str_ptr, crate::config::MAX_ARG_STRLEN) { args.push(s) } else {
-                crate::safe_print!(96, "[syscall] execve: argv[{}] too long or unreadable (cap={}) — E2BIG\n",
+                akuma_primitives::safe_print!(96, "[syscall] execve: argv[{}] too long or unreadable (cap={}) — E2BIG\n",
                     i, crate::config::MAX_ARG_STRLEN);
                 return E2BIG;
             }
@@ -723,7 +722,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // "no `ld` line names the crate proves nothing". Widened so the `-o <output>`
     // argument survives for `cc`/`collect2`/`ld` invocations.
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::tprint!(2048, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
+        akuma_primitives::tprint!(2048, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
     }
 
     do_execve(resolved_path, args, env)
@@ -737,9 +736,9 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     #[cfg(kernel_profile_extreme)]
     let mut file_data: Option<alloc::vec::Vec<u8>> = {
         let mut head = alloc::vec![0u8; 256];
-        match crate::fs::read_at(&resolved_path, 0, &mut head) {
+        match akuma_vfs_glue::fs::read_at(&resolved_path, 0, &mut head) {
             Ok(n) => { head.truncate(n); Some(head) }
-            Err(crate::vfs::FsError::Internal) => None,
+            Err(akuma_vfs_glue::FsError::Internal) => None,
             Err(e) => {
                 // Gated 2026-08-30: this is the PATH search, not an error. A shell
                 // or cargo resolving `cc`/`rustc` probes every PATH entry in turn,
@@ -747,7 +746,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
                 // PATH length x exec count. A genuinely unreadable binary still
                 // surfaces as the execve's errno to the caller.
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                    crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+                    akuma_primitives::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
                 }
                 return super::fs::fs_error_to_errno(e);
             }
@@ -763,15 +762,15 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         // timer ticks (a bare leave/enter pair let the first tick re-hold the BKL for the
         // rest of the read); the syscall wrapper's leave_kernel still balances it.
         #[cfg(kernel_smp_shared)]
-        let exec_dropped_bkl = crate::smp_shared::exec_bkl_drop_enabled();
+        let exec_dropped_bkl = akuma_bkl::policy::exec_bkl_drop_enabled();
         #[cfg(kernel_smp_shared)]
         if exec_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
-        let read_result = crate::fs::read_file(&resolved_path);
+        let read_result = akuma_vfs_glue::fs::read_file(&resolved_path);
         #[cfg(kernel_smp_shared)]
         if exec_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
         match read_result {
             Ok(data) => Some(data),
-            Err(crate::vfs::FsError::Internal) => None,
+            Err(akuma_vfs_glue::FsError::Internal) => None,
             Err(e) => {
                 // Gated 2026-08-30: this is the PATH search, not an error. A shell
                 // or cargo resolving `cc`/`rustc` probes every PATH entry in turn,
@@ -779,7 +778,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
                 // PATH length x exec count. A genuinely unreadable binary still
                 // surfaces as the execve's errno to the caller.
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                    crate::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+                    akuma_primitives::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
                 }
                 return super::fs::fs_error_to_errno(e);
             }
@@ -803,10 +802,10 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     // Resolve the on-demand load's file size before entering the exclusive
     // window so the stat-failure early return stays outside it.
     let file_size = if file_data.is_none() {
-        match crate::vfs::file_size(&resolved_path) {
+        match akuma_vfs_glue::file_size(&resolved_path) {
             Ok(sz) => sz as usize,
             Err(e) => {
-                crate::safe_print!(128, "[syscall] execve: failed to stat {}\n", resolved_path);
+                akuma_primitives::safe_print!(128, "[syscall] execve: failed to stat {}\n", resolved_path);
                 return super::fs::fs_error_to_errno(e);
             }
         }
@@ -835,7 +834,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     };
 
     if let Err(e) = replace_result {
-        crate::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
+        akuma_primitives::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
         // `replace_image` returns a stringly-typed error from the ELF loader;
         // a "Failed to load ELF: ..." message means the binary is malformed
         // (missing PT_LOAD, bad magic, etc.) — Linux returns ENOEXEC for that.
@@ -881,7 +880,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     proc.name.clone_from(&resolved_path);
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
+        akuma_primitives::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
     }
 
     // This frame is abandoned by the eret below (enter_user_mode never
@@ -918,7 +917,7 @@ fn exec_shebang(script_path: String, file_data: Vec<u8>, original_args: Vec<Stri
     // argv-construction rule, both host-tested in akuma-exec's `shebang_tests`.
     let head = &file_data[..file_data.len().min(akuma_exec::process::SHEBANG_MAX)];
     let Some((interpreter, shebang_arg)) = akuma_exec::process::parse_shebang(head) else {
-        crate::safe_print!(128, "[syscall] execve: invalid shebang in {}\n", script_path);
+        akuma_primitives::safe_print!(128, "[syscall] execve: invalid shebang in {}\n", script_path);
         return ENOENT;
     };
 
@@ -934,13 +933,13 @@ fn exec_shebang(script_path: String, file_data: Vec<u8>, original_args: Vec<Stri
     let interp_arg = shebang_arg.map(String::from);
     drop(file_data); // last borrow (interpreter/shebang_arg) ended above
 
-    let interp_path = crate::vfs::resolve_symlinks(&interp_argv0);
+    let interp_path = akuma_vfs_glue::resolve_symlinks(&interp_argv0);
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
         if let Some(ref arg) = interp_arg {
-            crate::safe_print!(128, "[syscall] execve: shebang {} {} {}\n", interp_argv0, arg, script_path);
+            akuma_primitives::safe_print!(128, "[syscall] execve: shebang {} {} {}\n", interp_argv0, arg, script_path);
         } else {
-            crate::safe_print!(128, "[syscall] execve: shebang {} {}\n", interp_argv0, script_path);
+            akuma_primitives::safe_print!(128, "[syscall] execve: shebang {} {}\n", interp_argv0, script_path);
         }
     }
 
@@ -962,7 +961,7 @@ fn exec_shebang(script_path: String, file_data: Vec<u8>, original_args: Vec<Stri
 
 pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] wait4(pid={}, options=0x{:x})\n", pid, options);
+        akuma_primitives::safe_print!(128, "[syscall] wait4(pid={}, options=0x{:x})\n", pid, options);
     }
 
     const RUSAGE_SIZE: usize = 144;
@@ -994,7 +993,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                     let code = ch.exit_code();
                     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                         let st = encode_wait_status(code);
-                        crate::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", p, code, st);
+                        akuma_primitives::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", p, code, st);
                     }
                     if status_ptr != 0 {
                         let status = encode_wait_status(code);
@@ -1052,7 +1051,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
     } else if pid == -1 || pid == 0 {
         if !akuma_exec::process::has_children(current_pid) {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[syscall] wait4: no children for PID {}\n", current_pid);
+                akuma_primitives::safe_print!(128, "[syscall] wait4: no children for PID {}\n", current_pid);
             }
             return ECHILD;
         }
@@ -1062,7 +1061,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 let code = ch.exit_code();
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                     let st = encode_wait_status(code);
-                    crate::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
+                    akuma_primitives::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
                 }
                 if status_ptr != 0 {
                     let status = encode_wait_status(code);
@@ -1092,7 +1091,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 let code = ch.exit_code();
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
                     let st = encode_wait_status(code);
-                    crate::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
+                    akuma_primitives::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
                 }
                 if status_ptr != 0 {
                     let status = encode_wait_status(code);
@@ -1121,7 +1120,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
     }
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] wait4: no child found for PID {}\n", pid);
+        akuma_primitives::safe_print!(128, "[syscall] wait4: no child found for PID {}\n", pid);
     }
     ECHILD
 }
@@ -1135,7 +1134,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
     use akuma_syscalls_linux::signal::{SIGCHLD, SIGINFO_SIZE};
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] waitid(idtype={}, id={}, options=0x{:x})\n", idtype, id, options);
+        akuma_primitives::safe_print!(128, "[syscall] waitid(idtype={}, id={}, options=0x{:x})\n", idtype, id, options);
     }
 
     // Zero siginfo buffer before any early return so Go sees clean data.
@@ -1243,7 +1242,7 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
 
     if let Some((child_pid, code)) = result {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[syscall] waitid: PID {} exited with code {}\n", child_pid, code);
+            akuma_primitives::safe_print!(128, "[syscall] waitid: PID {} exited with code {}\n", child_pid, code);
         }
         if infop != 0 {
             // siginfo_t layout for SIGCHLD (AArch64 LP64 Linux):
@@ -1304,9 +1303,9 @@ pub(super) fn sys_sysinfo(info_ptr: usize) -> u64 {
     // the array did.
     if !validate_user_ptr(info_ptr as u64, core::mem::size_of::<Sysinfo>()) { return EFAULT; }
     let info = Sysinfo {
-        uptime: (crate::timer::uptime_us() / 1_000_000).cast_signed(),
-        totalram: crate::pmm::total_count() as u64 * 4096,
-        freeram: crate::pmm::free_count() as u64 * 4096,
+        uptime: (akuma_primitives::clock::uptime_us() / 1_000_000).cast_signed(),
+        totalram: akuma_exec::pmm::total_count() as u64 * 4096,
+        freeram: akuma_exec::pmm::free_count() as u64 * 4096,
         procs: 1,
         mem_unit: 1,
         ..Sysinfo::default()
@@ -1463,7 +1462,7 @@ pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
     while remaining > 0 {
         let chunk = remaining.min(256);
         let mut kernel_buf = alloc::vec![0u8; chunk];
-        if crate::rng::fill_bytes(&mut kernel_buf).is_ok() {
+        if akuma_virtio::rng::fill_bytes(&mut kernel_buf).is_ok() {
             if copy_to_user(current_ptr, &kernel_buf).is_err() {
                 return EFAULT;
             }
@@ -1581,7 +1580,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
             }
         }
         Err(e) => {
-            crate::safe_print!(128, "[sys_spawn] path={} failed: {}\n", path, e);
+            akuma_primitives::safe_print!(128, "[sys_spawn] path={} failed: {}\n", path, e);
         }
     }
     Err(ENOMEM)
@@ -1756,7 +1755,7 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
     }
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED || crate::config::SYSCALL_DEBUG_NET_ENABLED {
-        crate::tprint!(96, "[signal] kill(pid={}, sig={})\n", pid, sig);
+        akuma_primitives::tprint!(96, "[signal] kill(pid={}, sig={})\n", pid, sig);
     }
 
     // Per-pid delivery (thread-group interrupt+pend, SIGKILL hard-kill, and
@@ -1903,7 +1902,7 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
         }
         _ => {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::tprint!(128, "[prctl] unsupported option={} arg2={:#x} arg3={:#x} arg4={:#x} arg5={:#x}\n",
+                akuma_primitives::tprint!(128, "[prctl] unsupported option={} arg2={:#x} arg3={:#x} arg4={:#x} arg5={:#x}\n",
                 option, arg2, arg3, arg4, arg5);
             }
             0

@@ -7548,49 +7548,11 @@ fn register_thread_group_of_three() -> (u32, u32, u32) {
     (leader_pid, g1_pid, g2_pid)
 }
 
-/// Helper to create a minimal Process for testing logic without loading a real ELF.
-pub fn make_test_process(pid: u32) -> alloc::boxed::Box<akuma_exec::process::Process> {
-    use akuma_exec::process::{Process, ProcessMemory, SharedFdTable, SharedSignalTable, ProcessSyscallStats};
-    use akuma_exec::mmu::UserAddressSpace;
-    use spinning_top::Spinlock;
-    use alloc::sync::Arc;
-    use alloc::string::ToString;
-    use alloc::vec::Vec;
-
-    let addr_space = UserAddressSpace::new().unwrap();
-    let mem = ProcessMemory::new(0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000);
-    
-    alloc::boxed::Box::new(Process {
-        pid, pgid: pid, tgid: pid, name: "test".to_string(),
-        state: akuma_exec::process::ProcessState::Ready,
-        address_space: addr_space,
-        context: akuma_exec::process::UserContext::new(0, 0),
-        parent_pid: 0, brk: 0x1000_0000, initial_brk: 0x1000_0000,
-        entry_point: 0, memory: mem, process_info_phys: 0,
-        args: Vec::new(), cwd: "/".to_string(),
-        stdin: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
-        stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
-        exited: false, exit_code: 0,
-        dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
-        lazy_regions: Spinlock::new(process::LazyRegionMap::new()),
-        fds: Arc::new(SharedFdTable::new()),
-        fault_mutex: Spinlock::new(alloc::collections::BTreeMap::new()),
-        vm_lock: Spinlock::new(()),
-        as_lock: Spinlock::new(()),
-        thread_id: None, spawner_pid: None,
-        terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
-        box_id: 0, namespace: akuma_isolation::global_namespace(),
-        channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: 0,
-        robust_list_head: 0, robust_list_len: 0,
-        signal_actions: Arc::new(SharedSignalTable::new()),
-        signal_mask: 0,
-        sigaltstack_sp: 0, sigaltstack_flags: 2, sigaltstack_size: 0,
-        start_time_us: 0,
-        current_syscall: core::sync::atomic::AtomicU64::new(!0),
-        last_syscall: core::sync::atomic::AtomicU64::new(0),
-        syscall_stats: ProcessSyscallStats::new(),
-    })
-}
+/// Moved to `akuma_exec::process` on 2026-09-01 — it constructs a `Process` and
+/// held zero `crate::` references, and `src/syscall/`'s own test blocks needed
+/// it from across a crate boundary. Re-exported so the ~200 call sites below are
+/// unchanged. See `docs/archive/SRC_SYSCALL_EXTRACTION.md` Blocker 2.
+pub use akuma_exec::process::make_test_process;
 
 // ── advanced signal/diagnostic tests ─────────────────────────────────────
 

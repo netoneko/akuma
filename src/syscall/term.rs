@@ -44,7 +44,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const SIOCGIFHWADDR: u32 = super::net::SIOCGIFHWADDR;
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
+        akuma_primitives::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
     }
 
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
@@ -90,7 +90,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 }
 
                 Some(akuma_exec::process::FileDescriptor::File(ref f)) => {
-                    crate::fs::file_size(&f.path)
+                    akuma_vfs_glue::fs::file_size(&f.path)
                         .map_or(0, |sz| (sz as usize).saturating_sub(f.position) as i32)
                 }
                 Some(akuma_exec::process::FileDescriptor::ChildStdout(_)) => 0,
@@ -281,7 +281,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             ts.lflag = kernel_buf[3];
             
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[syscall] TCSETS: iflag=0x{:x} oflag=0x{:x} cflag=0x{:x} lflag=0x{:x}\n",
+                akuma_primitives::safe_print!(128, "[syscall] TCSETS: iflag=0x{:x} oflag=0x{:x} cflag=0x{:x} lflag=0x{:x}\n",
                     ts.iflag, ts.oflag, ts.cflag, ts.lflag);
             }
             
@@ -317,7 +317,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             let ts = term_state_lock.lock();
             let pgid = ts.foreground_pgid;
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[syscall] TIOCGPGRP: returning foreground_pgid {}\n", pgid);
+                akuma_primitives::safe_print!(128, "[syscall] TIOCGPGRP: returning foreground_pgid {}\n", pgid);
             }
             if write_user_val_with(arg, &pgid, Prefault::No).is_err() {
                 return EFAULT;
@@ -335,7 +335,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             }
             let mut ts = term_state_lock.lock();
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[syscall] TIOCSPGRP: setting foreground_pgid to {}\n", pgid);
+                akuma_primitives::safe_print!(128, "[syscall] TIOCSPGRP: setting foreground_pgid to {}\n", pgid);
             }
             ts.foreground_pgid = pgid;
             0
@@ -344,7 +344,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     };
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[syscall] ioctl result={}\n", result as i64);
+        akuma_primitives::safe_print!(128, "[syscall] ioctl result={}\n", result as i64);
     }
     result
 }
@@ -408,7 +408,7 @@ pub(super) fn sys_get_terminal_attributes(_fd: u64, attr_ptr: u64) -> u64 {
 
 pub(super) fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(64, "[syscall] sys_set_cursor_position({}, {})\n", col, row);
+        akuma_primitives::safe_print!(64, "[syscall] sys_set_cursor_position({}, {})\n", col, row);
     }
     let row_1 = row + 1;
     let col_1 = col + 1;
@@ -418,21 +418,21 @@ pub(super) fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
 
 pub(super) fn sys_hide_cursor() -> u64 {
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(64, "[syscall] sys_hide_cursor()\n");
+        akuma_primitives::safe_print!(64, "[syscall] sys_hide_cursor()\n");
     }
     write_to_process_channel(b"\x1b[?25l")
 }
 
 pub(super) fn sys_show_cursor() -> u64 {
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(64, "[syscall] sys_show_cursor()\n");
+        akuma_primitives::safe_print!(64, "[syscall] sys_show_cursor()\n");
     }
     write_to_process_channel(b"\x1b[?25h")
 }
 
 pub(super) fn sys_clear_screen() -> u64 {
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(64, "[syscall] sys_clear_screen()\n");
+        akuma_primitives::safe_print!(64, "[syscall] sys_clear_screen()\n");
     }
     write_to_process_channel(b"\x1b[2J")
 }
@@ -463,7 +463,7 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
         let deadline = if timeout_us == u64::MAX {
             u64::MAX
         } else {
-            crate::timer::uptime_us().saturating_add(timeout_us)
+            akuma_primitives::clock::uptime_us().saturating_add(timeout_us)
         };
 
         // Register the waker ONCE for the whole wait rather than once per iteration:
@@ -504,7 +504,7 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
                 return EINTR;
             }
 
-            if crate::timer::uptime_us() >= deadline {
+            if akuma_primitives::clock::uptime_us() >= deadline {
                 break 0;
             }
 
@@ -529,7 +529,7 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
 pub(super) fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
     let stat_size = core::mem::size_of::<ThreadCpuStat>();
     if !validate_user_ptr(ptr, max * stat_size) { return EFAULT; }
-    let count = max.min(crate::config::MAX_THREADS);
+    let count = max.min(akuma_exec::threading::types::MAX_THREADS);
     for i in 0..count {
         let mut stat = ThreadCpuStat {
             tid: i as u32,

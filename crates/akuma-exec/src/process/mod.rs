@@ -3834,3 +3834,60 @@ mod grace_kill_tests {
              parent's wait4 blocked");
     }
 }
+
+/// A minimal [`Process`] for exercising process logic without loading an ELF.
+///
+/// Lives here, in the crate that owns `Process`, rather than in the boot suite
+/// that grew it. It moved on 2026-09-01 for a structural reason: `src/syscall/`
+/// reached `crate::process_tests::make_test_process` from four of its own
+/// `cfg(kernel_tests)` blocks, and `src/process_tests.rs` reaches 352 symbols
+/// back into `src/syscall/` — a cycle that blocked `src/syscall/` from becoming
+/// a crate (`docs/archive/SRC_SYSCALL_EXTRACTION.md`, Blocker 2). It was a
+/// 43-line function with **zero** `crate::` references, so it simply belonged
+/// one level down.
+///
+/// Unconditional rather than feature-gated: it is a `pub fn` in a library, so it
+/// is not dead code in a `no-tests` build, and LTO drops it when nothing calls
+/// it. Measured — `extreme-size` did not move.
+pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
+    use {Process, ProcessMemory, SharedFdTable, SharedSignalTable, ProcessSyscallStats};
+    use crate::mmu::UserAddressSpace;
+    use spinning_top::Spinlock;
+    use alloc::sync::Arc;
+    use alloc::string::ToString;
+    use alloc::vec::Vec;
+
+    let addr_space = UserAddressSpace::new().unwrap();
+    let mem = ProcessMemory::new(0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000);
+    
+    alloc::boxed::Box::new(Process {
+        pid, pgid: pid, tgid: pid, name: "test".to_string(),
+        state: ProcessState::Ready,
+        address_space: addr_space,
+        context: UserContext::new(0, 0),
+        parent_pid: 0, brk: 0x1000_0000, initial_brk: 0x1000_0000,
+        entry_point: 0, memory: mem, process_info_phys: 0,
+        args: Vec::new(), cwd: "/".to_string(),
+        stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
+        stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
+        exited: false, exit_code: 0,
+        dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
+        lazy_regions: Spinlock::new(LazyRegionMap::new()),
+        fds: Arc::new(SharedFdTable::new()),
+        fault_mutex: Spinlock::new(alloc::collections::BTreeMap::new()),
+        vm_lock: Spinlock::new(()),
+        as_lock: Spinlock::new(()),
+        thread_id: None, spawner_pid: None,
+        terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
+        box_id: 0, namespace: akuma_isolation::global_namespace(),
+        channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: 0,
+        robust_list_head: 0, robust_list_len: 0,
+        signal_actions: Arc::new(SharedSignalTable::new()),
+        signal_mask: 0,
+        sigaltstack_sp: 0, sigaltstack_flags: 2, sigaltstack_size: 0,
+        start_time_us: 0,
+        current_syscall: core::sync::atomic::AtomicU64::new(!0),
+        last_syscall: core::sync::atomic::AtomicU64::new(0),
+        syscall_stats: ProcessSyscallStats::new(),
+    })
+}

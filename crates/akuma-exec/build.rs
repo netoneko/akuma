@@ -10,6 +10,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
     println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
     println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_process)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
 
     // BKL-free fork page-copy (Phase 3), forwarded from the bin's `no-bkl-process`
     // feature. Unlike `no-bkl-network`/`no-bkl-vfs` — whose guards live in the bin
@@ -37,5 +38,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EXTREME");
     if size_profile && std::env::var("CARGO_FEATURE_EXTREME").is_ok() {
         println!("cargo:rustc-cfg=kernel_profile_extreme");
+    }
+
+    // The bin crate's `no-tests` feature compiles the boot self-test surface out.
+    // Absence of the feature = `kernel_tests` ON, mirroring the bin's build.rs and
+    // `akuma-exceptions`. `pmm`'s forwarders need it: they are `cfg(kernel_tests)`
+    // and their callers are the boot suite up in the binary.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_TESTS");
+    if std::env::var("CARGO_FEATURE_NO_TESTS").is_err() {
+        println!("cargo:rustc-cfg=kernel_tests");
     }
 }

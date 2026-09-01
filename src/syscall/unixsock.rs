@@ -102,7 +102,7 @@ static ACCEPT_WAITERS: Spinlock<BTreeMap<u32, BTreeMap<usize, WakeHandle>>> =
 /// table holds `BTreeMap`s, which need the allocator — and this module can be
 /// reached before anything guarantees the heap is up on every path.
 fn with_table<R>(f: impl FnOnce(&mut UnixTable) -> R) -> R {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut guard = UNIX_TABLE.lock();
         let table = guard.get_or_insert_with(UnixTable::new);
         f(table)
@@ -240,7 +240,7 @@ pub fn unix_sock_close(sock: u32) {
     // Anything parked in accept() on this listener must be woken to discover
     // the listener is gone, or it sleeps forever on a queue nobody will fill.
     wake_accept_waiters(sock);
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         ACCEPT_WAITERS.lock().remove(&sock);
     });
 }
@@ -282,7 +282,7 @@ pub fn unix_channel_detach(pipe_id: u32) {
 /// which a `connect` lands with no waiter recorded, and the thread then sleeps
 /// through its own wake-up.
 fn accept_wait_slot(listener: u32, tid: usize) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut guard = UNIX_TABLE.lock();
         let table = guard.get_or_insert_with(UnixTable::new);
         match table.get(listener) {
@@ -302,7 +302,7 @@ fn accept_wait_slot(listener: u32, tid: usize) -> bool {
 
 /// Wake everything parked in `accept` on this listener.
 fn wake_accept_waiters(listener: u32) {
-    let handles: Vec<WakeHandle> = crate::irq::with_irqs_disabled(|| {
+    let handles: Vec<WakeHandle> = akuma_primitives::irq::with_irqs_disabled(|| {
         let mut map = ACCEPT_WAITERS.lock();
         map.get_mut(&listener)
             .map(|w| core::mem::take(w).into_values().collect())
@@ -350,7 +350,7 @@ pub fn sys_socket_unix(sock_type: i32, cloexec: bool, nonblock: bool) -> u64 {
         proc.set_nonblock(fd);
     }
     if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-        crate::safe_print!(96, "[unix] socket(type={}) = fd {}\n", ty.to_raw(), fd);
+        akuma_primitives::safe_print!(96, "[unix] socket(type={}) = fd {}\n", ty.to_raw(), fd);
     }
     u64::from(fd)
 }
@@ -412,9 +412,9 @@ pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
     }
     if crate::config::SYSCALL_DEBUG_NET_ENABLED {
         if let Some(path) = name.path_bytes() {
-            crate::safe_print!(160, "[unix] bind(fd={}) path len={}\n", fd, path.len());
+            akuma_primitives::safe_print!(160, "[unix] bind(fd={}) path len={}\n", fd, path.len());
         } else {
-            crate::safe_print!(96, "[unix] bind(fd={}) abstract\n", fd);
+            akuma_primitives::safe_print!(96, "[unix] bind(fd={}) abstract\n", fd);
         }
     }
     Ok(0)
@@ -435,9 +435,9 @@ pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
 /// not turn a working `bind` into a failure. What it does cost is the userspace
 /// conventions: `stat`, `unlink` and `ls` will not see the path.
 fn create_socket_node(path: &str) {
-    if let Err(e) = crate::vfs::create_socket_node(path) {
+    if let Err(e) = akuma_vfs_glue::create_socket_node(path) {
         let _ = e;
-        crate::safe_print!(
+        akuma_primitives::safe_print!(
             112,
             "[unix] bind: S_IFSOCK node create failed (name is still bound)\n"
         );
@@ -452,7 +452,7 @@ pub fn sys_listen(fd: u32, backlog: i32) -> u64 {
     match with_table(|t| t.listen(sock, backlog)) {
         Ok(()) => {
             if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                crate::safe_print!(96, "[unix] listen(fd={}, backlog={})\n", fd, backlog);
+                akuma_primitives::safe_print!(96, "[unix] listen(fd={}, backlog={})\n", fd, backlog);
             }
             0
         }
@@ -484,7 +484,7 @@ pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
         match outcome {
             Ok(ConnectOutcome::DgramPeerSet { .. }) => {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                    crate::safe_print!(96, "[unix] connect(fd={}) dgram peer set\n", fd);
+                    akuma_primitives::safe_print!(96, "[unix] connect(fd={}) dgram peer set\n", fd);
                 }
                 return Ok(0);
             }
@@ -520,7 +520,7 @@ pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
                 }
                 wake_accept_waiters(listener);
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                    crate::safe_print!(96, "[unix] connect(fd={}) queued\n", fd);
+                    akuma_primitives::safe_print!(96, "[unix] connect(fd={}) queued\n", fd);
                 }
                 return Ok(0);
             }
@@ -602,11 +602,11 @@ pub fn sys_accept(fd: u32, addr_ptr: u64, addrlen_ptr: u64, flags: u32) -> u64 {
             // The fd is already installed; tearing it down here would race a
             // concurrent dup. Report the fault and leave the connection —
             // Linux also keeps the accepted fd on an addr copy-out failure.
-            crate::safe_print!(96, "[unix] accept: addr copyout failed\n");
+            akuma_primitives::safe_print!(96, "[unix] accept: addr copyout failed\n");
         }
     }
     if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-        crate::safe_print!(96, "[unix] accept(fd={}) = fd {}\n", fd, new_fd);
+        akuma_primitives::safe_print!(96, "[unix] accept(fd={}) = fd {}\n", fd, new_fd);
     }
     u64::from(new_fd)
 }
@@ -738,7 +738,7 @@ pub fn listener_ready(fd: u32, tid: Option<usize>) -> Option<bool> {
         Some(s.accept_ready())
     })?;
     if !ready && let Some(tid) = tid {
-        crate::irq::with_irqs_disabled(|| {
+        akuma_primitives::irq::with_irqs_disabled(|| {
             ACCEPT_WAITERS
                 .lock()
                 .entry(sock)
@@ -811,7 +811,7 @@ pub fn unix_send(fd: u32, data: &[u8], dontwait: bool) -> u64 {
                     // only drained (never shrunk) by a concurrent reader. If it
                     // ever does, the channel's boundaries no longer match the
                     // pipe's bytes, so say so loudly rather than record a lie.
-                    crate::safe_print!(
+                    akuma_primitives::safe_print!(
                         128,
                         "[unix] FRAMING DESYNC tx={} want={} wrote={}\n",
                         tx,
@@ -907,7 +907,7 @@ fn deliver_datagram(queue: u32, data: &[u8], nonblock: bool) -> u64 {
                     }
                 };
                 if written != plan.bytes {
-                    crate::safe_print!(
+                    akuma_primitives::safe_print!(
                         128,
                         "[unix] DGRAM DESYNC queue={} want={} wrote={}\n",
                         queue,

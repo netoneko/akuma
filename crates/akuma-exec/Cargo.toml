@@ -7,6 +7,10 @@ edition = "2024"
 workspace = true
 
 [features]
+# Mirrors the bin's `no-tests`: absence of it means `kernel_tests` is ON. The
+# `pmm` module's boot-suite forwarders are gated on that cfg, and without this
+# they compile out of a crate the bin then cannot find them in.
+no-tests = []
 # Profile discriminator forwarded from the bin crate's `extreme` feature
 # (build_extreme_size.sh). Lets this crate's build.rs emit
 # `cfg(kernel_profile_extreme)` so threading can trim the warm-stack floor and

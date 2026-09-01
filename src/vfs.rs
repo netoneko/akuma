@@ -22,12 +22,14 @@ pub fn register() {
         syscall_debug_info_enabled: crate::config::SYSCALL_DEBUG_INFO_ENABLED,
         max_threads: crate::config::MAX_THREADS,
         proc_stdout_max_size: crate::config::PROC_STDOUT_MAX_SIZE,
+        syscall_debug_io_enabled: crate::config::SYSCALL_DEBUG_IO_ENABLED,
     });
     akuma_vfs_glue::set_hooks(akuma_vfs_glue::VfsGlueHooks {
         audio_is_available: crate::audio::is_available,
         fs_exists: crate::fs::exists,
         probed_core_count,
         utc_time_us: crate::timer::utc_time_us,
+        fpcache_init: crate::file_page_cache::init,
     });
 }
 

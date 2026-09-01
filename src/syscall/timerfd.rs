@@ -13,7 +13,7 @@ static TIMERFD_TABLE: Spinlock<BTreeMap<u32, TimerFdState>> = Spinlock::new(BTre
 static TIMERFD_NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
 pub fn timerfd_add_poller(id: u32, tid: usize) {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         if let Some(state) = TIMERFD_TABLE.lock().get_mut(&id) {
             state.pollers.insert(tid);
         }
@@ -43,7 +43,7 @@ fn us_to_timespec_safe(us: u64, ptr: usize) -> Result<(), u64> {
 }
 
 pub(super) fn timerfd_can_read(timer_id: u32) -> bool {
-    let now = crate::timer::uptime_us();
+    let now = akuma_primitives::clock::uptime_us();
     TIMERFD_TABLE.lock().get(&timer_id).is_some_and(|state| {
         if state.initial_us == 0 { return false; }
         let elapsed = now.saturating_sub(state.armed_at_us);
@@ -59,7 +59,7 @@ pub(super) fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::TimerFd(timer_id));
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-            crate::safe_print!(96, "[timerfd] create id={} fd={} clk={} fl={}\n", timer_id, fd, clockid, flags);
+            akuma_primitives::safe_print!(96, "[timerfd] create id={} fd={} clk={} fl={}\n", timer_id, fd, clockid, flags);
         }
         u64::from(fd)
     } else {
@@ -77,7 +77,7 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
 
     if old_value != 0 {
         if let Some(state) = table.get(&timer_id) {
-            let now = crate::timer::uptime_us();
+            let now = akuma_primitives::clock::uptime_us();
             let elapsed = now.saturating_sub(state.armed_at_us);
             let remaining = state.initial_us.saturating_sub(elapsed);
             // struct itimerspec { it_interval at 0, it_value at 16 }
@@ -97,7 +97,7 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
     let initial_us = timespec_to_us_safe(new_value + 16)?;   // it_value (initial expiration)
 
     const TFD_TIMER_ABSTIME: i32 = 1;
-    let now = crate::timer::uptime_us();
+    let now = akuma_primitives::clock::uptime_us();
     let effective_initial = if flags & TFD_TIMER_ABSTIME != 0 {
         initial_us.saturating_sub(now)
     } else {
@@ -105,7 +105,7 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
     };
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::safe_print!(128, "[timerfd] settime id={} initial={}us interval={}us\n",
+        akuma_primitives::safe_print!(128, "[timerfd] settime id={} initial={}us interval={}us\n",
         timer_id, effective_initial, interval_us);
     }
 
@@ -136,7 +136,7 @@ pub(super) fn sys_timerfd_gettime(fd_arg0: u64, out_ptr: u64) -> u64 {
         }
         let table = TIMERFD_TABLE.lock();
         if let Some(state) = table.get(&timer_id) {
-            let now = crate::timer::uptime_us();
+            let now = akuma_primitives::clock::uptime_us();
             let elapsed = now.saturating_sub(state.armed_at_us);
             let remaining = state.initial_us.saturating_sub(elapsed);
             if us_to_timespec_safe(state.interval_us, out).is_err() { return EFAULT; }
@@ -152,7 +152,7 @@ pub(super) fn sys_timerfd_gettime(fd_arg0: u64, out_ptr: u64) -> u64 {
 }
 
 pub(super) fn timerfd_read(timer_id: u32) -> u64 {
-    let now = crate::timer::uptime_us();
+    let now = akuma_primitives::clock::uptime_us();
     let mut table = TIMERFD_TABLE.lock();
     let state = match table.get_mut(&timer_id) {
         Some(s) => s,

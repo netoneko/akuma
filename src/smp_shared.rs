@@ -92,6 +92,12 @@ static CORE_IDLE_MASK: AtomicU32 = AtomicU32::new(0);
 // `process_bkl_drop_enabled` below is deliberately NOT among them: its atomic
 // lives in `akuma_exec::process::bkl_guard`, and `akuma-exec` depends on
 // `akuma-bkl`, so moving it would invert that edge.
+// `#[allow(unused_imports)]` since 2026-09-01: `src/syscall/` was the last
+// production reader and now calls `akuma_bkl::policy::` directly, so on some
+// feature sets nothing here consumes these at all. Kept because
+// `process_tests.rs` still spells them `smp_shared::*`, and because the forwarder
+// is the documented place to look for them.
+#[allow(unused_imports)]
 pub use akuma_bkl::policy::{
     drivers_bkl_drop_enabled, exec_bkl_drop_enabled, mm_bkl_drop_enabled,
     vfs_bkl_drop_enabled,

@@ -19,20 +19,20 @@ pub(super) fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> u64 {
     }
     match akuma_boot::decode(magic1, magic2, cmd) {
         Ok(Some(akuma_boot::Action::Restart)) => {
-            crate::safe_print!(48, "[reboot] PSCI SYSTEM_RESET requested\n");
+            akuma_primitives::safe_print!(48, "[reboot] PSCI SYSTEM_RESET requested\n");
             // Write-back caches make reboot(2) the clean-shutdown path: push
             // every dirty block out before the machine dies. Best-effort —
             // a failed sync must not strand a rebooting box, and the data is
             // e2fsck-recoverable — but say so on the console.
-            if crate::vfs::sync_all_filesystems().is_err() {
-                crate::safe_print!(48, "[reboot] fs sync failed; disk may need e2fsck\n");
+            if akuma_vfs_glue::sync_all_filesystems().is_err() {
+                akuma_primitives::safe_print!(48, "[reboot] fs sync failed; disk may need e2fsck\n");
             }
             akuma_boot::system_reset();
         }
         Ok(Some(akuma_boot::Action::PowerOff)) => {
-            crate::safe_print!(48, "[reboot] PSCI SYSTEM_OFF requested\n");
-            if crate::vfs::sync_all_filesystems().is_err() {
-                crate::safe_print!(48, "[reboot] fs sync failed; disk may need e2fsck\n");
+            akuma_primitives::safe_print!(48, "[reboot] PSCI SYSTEM_OFF requested\n");
+            if akuma_vfs_glue::sync_all_filesystems().is_err() {
+                akuma_primitives::safe_print!(48, "[reboot] fs sync failed; disk may need e2fsck\n");
             }
             akuma_boot::system_off();
         }

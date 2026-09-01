@@ -1,4 +1,3 @@
-use crate::tprint;
 use super::*;
 use akuma_net::socket::libc_errno;
 use alloc::collections::{BTreeMap as PollerMap, VecDeque};
@@ -62,12 +61,12 @@ static NEXT_PIPE_ID: AtomicU32 = AtomicU32::new(1);
 ///
 /// Printed next to `[THR-DUMP]` under the same `DEADLOCK_THREAD_DUMP_ENABLED` gate.
 pub fn pipe_dump() {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let pipes = PIPES.lock();
         if pipes.is_empty() {
             return;
         }
-        tprint!(48, "[PIPE-DUMP] {} live\n", pipes.len());
+        akuma_primitives::tprint!(48, "[PIPE-DUMP] {} live\n", pipes.len());
         for (id, p) in pipes.iter() {
             // Reader tids are printed so the parked `read()` in `[THR-DUMP]` can be
             // matched to the pipe it is parked on.
@@ -78,10 +77,10 @@ pub fn pipe_dump() {
                 waiters[n] = *t;
                 n += 1;
             }
-            tprint!(160, "  pipe={} bytes={} readers={} writers={} pollers={}\n",
+            akuma_primitives::tprint!(160, "  pipe={} bytes={} readers={} writers={} pollers={}\n",
                 id, p.buffer.len(), p.read_count, p.write_count, p.pollers.len());
             for w in waiters.iter().take(n) {
-                tprint!(48, "    poller tid={}\n", w);
+                akuma_primitives::tprint!(48, "    poller tid={}\n", w);
             }
         }
     });
@@ -89,7 +88,7 @@ pub fn pipe_dump() {
 
 pub fn pipe_create() -> u32 {
     let id = NEXT_PIPE_ID.fetch_add(1, Ordering::SeqCst);
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         PIPES.lock().insert(id, KernelPipe {
             buffer: VecDeque::new(),
             write_count: 1,
@@ -98,24 +97,24 @@ pub fn pipe_create() -> u32 {
         });
     });
     if crate::config::PIPE_TRACE_ENABLED {
-        crate::safe_print!(64, "[pipe] create id={}\n", id);
+        akuma_primitives::safe_print!(64, "[pipe] create id={}\n", id);
     }
     id
 }
 
 pub fn pipe_clone_ref(id: u32, is_write: bool) {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             if is_write {
                 pipe.write_count += 1;
                 if crate::config::PIPE_TRACE_ENABLED {
-                    crate::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+                    akuma_primitives::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
                 }
             } else {
                 pipe.read_count += 1;
                 if crate::config::PIPE_TRACE_ENABLED {
-                    crate::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+                    akuma_primitives::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
                 }
             }
         }
@@ -125,7 +124,7 @@ pub fn pipe_clone_ref(id: u32, is_write: bool) {
 /// Register the current thread as interested in polling this pipe.
 /// Called by epoll/poll check logic.
 pub fn pipe_add_poller(id: u32, tid: usize) {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.pollers.insert(tid, wake_handle_for_thread(tid));
@@ -142,7 +141,7 @@ pub fn pipe_add_poller(id: u32, tid: usize) {
 /// this number — see `run_pselect6_registers_waker_test`.
 #[cfg(kernel_tests)]
 pub fn pipe_poller_count(id: u32) -> usize {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).map_or(0, |p| p.pollers.len())
     })
 }
@@ -165,7 +164,7 @@ pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
     // means the pipe buffer is full (caller should yield/block and retry);
     // Err(true) = broken pipe, raise SIGPIPE (after unlocking!);
     // Err(false) = pipe gone, plain EPIPE.
-    let outcome = crate::irq::with_irqs_disabled(|| {
+    let outcome = akuma_primitives::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             if pipe.read_count == 0 {
@@ -186,7 +185,7 @@ pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
             Ok(n)
         } else {
             if crate::config::PIPE_TRACE_ENABLED {
-                crate::safe_print!(128, "[pipe] write WARN: pipe id={} not found (len={})\n", id, data.len());
+                akuma_primitives::safe_print!(128, "[pipe] write WARN: pipe id={} not found (len={})\n", id, data.len());
             }
             Err(false)
         }
@@ -244,7 +243,7 @@ pub fn pipe_write_all_blocking(id: u32, data: &[u8]) -> Result<(), i32> {
 }
 
 pub fn pipe_read(id: u32, buf: &mut [u8]) -> (usize, bool) {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             let n = buf.len().min(pipe.buffer.len());
@@ -275,14 +274,14 @@ pub fn pipe_close_write(id: u32) {
     // `PIPES` is held (IRQs masked) is the lock-ordering inversion that
     // wedged a core the last time an allocation ran inside this lock (see
     // `PIPE_CAPACITY`'s docs, failure 2).
-    let destroyed = crate::irq::with_irqs_disabled(|| {
+    let destroyed = akuma_primitives::irq::with_irqs_disabled(|| {
         let mut destroyed = false;
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.write_count = pipe.write_count.saturating_sub(1);
             // Always log close_write so we can trace use-after-close bugs.
             if crate::config::PIPE_TRACE_ENABLED {
-                crate::safe_print!(128, "[pipe] close_write id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+                akuma_primitives::safe_print!(128, "[pipe] close_write id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
             }
             
             // Notify waiters (EOF is an event)
@@ -294,13 +293,13 @@ pub fn pipe_close_write(id: u32) {
 
             if pipe.write_count == 0 && pipe.read_count == 0 {
                 if crate::config::PIPE_TRACE_ENABLED {
-                    crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
+                    akuma_primitives::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 }
                 pipes.remove(&id);
                 destroyed = true;
             }
         } else if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::tprint!(64, "[pipe] close_rw WARN: id={} not found\n", id);
+            akuma_primitives::tprint!(64, "[pipe] close_rw WARN: id={} not found\n", id);
         }
         destroyed
     });
@@ -320,14 +319,14 @@ pub fn pipe_close_read(id: u32) {
     // `PIPES` is held (IRQs masked) is the lock-ordering inversion that
     // wedged a core the last time an allocation ran inside this lock (see
     // `PIPE_CAPACITY`'s docs, failure 2).
-    let destroyed = crate::irq::with_irqs_disabled(|| {
+    let destroyed = akuma_primitives::irq::with_irqs_disabled(|| {
         let mut destroyed = false;
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.read_count = pipe.read_count.saturating_sub(1);
             // Always log close_read so we can trace use-after-close bugs.
             if crate::config::PIPE_TRACE_ENABLED {
-                crate::safe_print!(128, "[pipe] close_read id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
+                akuma_primitives::safe_print!(128, "[pipe] close_read id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
             }
 
             // Losing the last reader is an event for blocked *writers*, exactly as
@@ -351,13 +350,13 @@ pub fn pipe_close_read(id: u32) {
 
             if pipe.write_count == 0 && pipe.read_count == 0 {
                 if crate::config::PIPE_TRACE_ENABLED {
-                    crate::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
+                    akuma_primitives::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 }
                 pipes.remove(&id);
                 destroyed = true;
             }
         } else if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::tprint!(64, "[pipe] close_rw WARN: id={} not found\n", id);
+            akuma_primitives::tprint!(64, "[pipe] close_rw WARN: id={} not found\n", id);
         }
         destroyed
     });
@@ -381,7 +380,7 @@ pub fn pipe_close_read(id: u32) {
 /// A concurrent write between the first and second step would fire the wakeup
 /// with no reader registered, causing the blocking thread to sleep forever.
 pub fn pipe_check_set_reader(id: u32, tid: usize) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             if !pipe.buffer.is_empty() || pipe.write_count == 0 {
@@ -399,7 +398,7 @@ pub fn pipe_check_set_reader(id: u32, tid: usize) -> bool {
 /// For the new poller-based implementation, we return true if tid is in the set.
 #[cfg(kernel_tests)]
 pub fn pipe_is_poller_registered(id: u32, tid: usize) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).is_some_and(|p| p.pollers.contains_key(&tid))
     })
 }
@@ -410,7 +409,7 @@ pub fn pipe_is_poller_registered(id: u32, tid: usize) -> bool {
 /// should block (and the tid has been registered so it will be woken when the
 /// reader drains data).
 pub fn pipe_check_set_writer(id: u32, tid: usize) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
         if let Some(pipe) = pipes.get_mut(&id) {
             if pipe.read_count == 0 {
@@ -430,13 +429,13 @@ pub fn pipe_check_set_writer(id: u32, tid: usize) -> bool {
 /// Test helper: return how many pollers are registered on `id`.
 #[cfg(kernel_tests)]
 pub fn pipe_pollers_count(id: u32) -> usize {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).map_or(0, |p| p.pollers.len())
     })
 }
 
 pub fn pipe_can_read(id: u32) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).is_some_and(|p| !p.buffer.is_empty() || p.write_count == 0)
     })
 }
@@ -448,13 +447,13 @@ pub fn pipe_can_read(id: u32) -> bool {
 /// edge-triggered watcher has nothing else to key the EOF transition on.
 /// See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
 pub fn pipe_hup(id: u32) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).is_none_or(|p| p.write_count == 0)
     })
 }
 
 pub fn pipe_bytes_available(id: u32) -> usize {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).map_or(0, |p| p.buffer.len())
     })
 }
@@ -463,7 +462,7 @@ pub fn pipe_bytes_available(id: u32) -> usize {
 /// The capacity term is what stops poll/epoll from reporting POLLOUT on a full pipe and
 /// spinning a userspace event loop. `pub` to match `pipe_can_read` (asserted by tests).
 pub fn pipe_can_write(id: u32) -> bool {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).is_some_and(|p| p.read_count > 0 && p.buffer.len() < PIPE_CAPACITY)
     })
 }

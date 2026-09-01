@@ -658,7 +658,7 @@ mod enabled {
         let named: u64 = STAGE_TICKS.iter().map(|s| per(s.load(Ordering::Relaxed))).sum();
         let named_min: u64 = STAGE_MIN.iter().map(|s| one(s.load(Ordering::Relaxed))).sum();
 
-        crate::safe_print!(
+        akuma_primitives::safe_print!(
             192,
             "[READPROF] w={} n={} n_hs={} n_exc={} bytes={}/{}..{} freq={} cal={}ns/lap\n",
             w,
@@ -671,7 +671,7 @@ mod enabled {
             freq,
             per(cal),
         );
-        crate::safe_print!(
+        akuma_primitives::safe_print!(
             192,
             "[READPROF] w={} mean exc={}ns hs={}ns sr={}ns  wrap={}ns pro_epi={}ns resid={}ns\n",
             w,
@@ -685,7 +685,7 @@ mod enabled {
         {
             let ng = N_GAP.swap(0, Ordering::Relaxed).max(1);
             let gt = GAP_TICKS.swap(0, Ordering::Relaxed);
-            crate::safe_print!(
+            akuma_primitives::safe_print!(
                 192,
                 "[READPROF] w={} gap  mean={}ns min={}ns n={}  (EL0 side: asm epilogue + user + asm prologue)\n",
                 w,
@@ -694,7 +694,7 @@ mod enabled {
                 ng,
             );
             let g = |i: usize| GAP_HIST[i].swap(0, Ordering::Relaxed);
-            crate::safe_print!(
+            akuma_primitives::safe_print!(
                 192,
                 "[READPROF] w={} gap_us <1:{} 1-2:{} 2-4:{} 4-8:{} 8-16:{} 16+:{}\n",
                 w, g(0), g(1), g(2), g(3), g(4),
@@ -703,7 +703,7 @@ mod enabled {
         }
         {
             let nf = N_FLOOR.swap(0, Ordering::Relaxed);
-            crate::safe_print!(
+            akuma_primitives::safe_print!(
                 192,
                 "[READPROF] w={} floor nr={} n={} exc: min={}ns mean={}ns  hs: min={}ns mean={}ns\n",
                 w,
@@ -721,7 +721,7 @@ mod enabled {
         // reached), a larger one means interleaving.
         {
             let nl = N_FLOOR_LAPS_SEEN.swap(0, Ordering::Relaxed).max(1);
-            crate::safe_print!(
+            akuma_primitives::safe_print!(
                 160,
                 "[READPROF] w={} floorlaps n_lap={} cal={}ns (subtract per lap)\n",
                 w,
@@ -729,7 +729,7 @@ mod enabled {
                 per(CAL_TICKS.load(Ordering::Relaxed)),
             );
             for (i, name) in FLOOR_LAP_NAMES.iter().enumerate() {
-                crate::safe_print!(
+                akuma_primitives::safe_print!(
                     128,
                     "[READPROF] w={} flap {}: min={}ns mean={}ns\n",
                     w,
@@ -739,14 +739,14 @@ mod enabled {
                 );
             }
         }
-        crate::safe_print!(
+        akuma_primitives::safe_print!(
             192,
             "[READPROF] w={} commit mean={}ns min={}ns  (instrument overhead inside pro_epi)\n",
             w,
             ns(COMMIT_TICKS.swap(0, Ordering::Relaxed), freq) / n,
             one(COMMIT_MIN.swap(u64::MAX, Ordering::Relaxed)),
         );
-        crate::safe_print!(
+        akuma_primitives::safe_print!(
             192,
             "[READPROF] w={} min  exc={}ns hs={}ns sr={}ns  wrap={}ns pro_epi={}ns resid={}ns\n",
             w,
@@ -760,21 +760,21 @@ mod enabled {
         // The distribution behind `mean` and `min`. Printed in two halves for
         // the same fixed-buffer reason as the per-stage lines below.
         let h = |i: usize| EXC_HIST[i].swap(0, Ordering::Relaxed);
-        crate::safe_print!(
+        akuma_primitives::safe_print!(
             192,
             "[READPROF] w={} exc_us <1:{} 1-2:{} 2-4:{} 4-8:{} 8-16:{}\n",
             w, h(0), h(1), h(2), h(3), h(4),
         );
-        crate::safe_print!(
+        akuma_primitives::safe_print!(
             192,
             "[READPROF] w={} exc_us 16-32:{} 32-64:{} 64-128:{} 128-256:{} 256+:{}\n",
             w, h(5), h(6), h(7), h(8), h(9),
         );
-        // One line per stage rather than a single formatted row: `safe_print!`
+        // One line per stage rather than a single formatted row: `akuma_primitives::safe_print!`
         // takes a fixed stack buffer, and seven names plus seven numbers in one
         // call is exactly the kind of variable-width row that truncates.
         for (i, name) in STAGE_NAMES.iter().enumerate() {
-            crate::safe_print!(
+            akuma_primitives::safe_print!(
                 128,
                 "[READPROF] w={} {}: min={}ns mean={}ns\n",
                 w,

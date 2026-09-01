@@ -21,7 +21,7 @@ pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr
     // Normalize before deciding anything: `root` becomes the box's `SubdirFs`
     // jail, and an unresolved `..` would sail through the containment check
     // below and then resolve on disk to somewhere else entirely.
-    let root = crate::vfs::canonicalize_path(root);
+    let root = akuma_vfs_glue::canonicalize_path(root);
 
     // Registration is a privilege boundary — the caller is naming a filesystem
     // subtree that anything spawned into the box will see as `/`. Without this
@@ -33,7 +33,7 @@ pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr
         Ok(parent) => parent,
         Err(reason) => {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(192, "[register_box] denied box={} root={} caller_box={}: {}\n",
+                akuma_primitives::safe_print!(192, "[register_box] denied box={} root={} caller_box={}: {}\n",
                     id, root, caller_box, reason);
             }
             return EPERM;
@@ -49,7 +49,7 @@ pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr
         parent_box_id,
     });
 
-    crate::vfs::create_box_namespace(id, &root);
+    akuma_vfs_glue::create_box_namespace(id, &root);
 
     0
 }
@@ -67,7 +67,7 @@ pub(super) fn sys_kill_box(box_id: u64) -> u64 {
     if akuma_exec::process::kill_box(box_id).is_err() {
         return ESRCH;
     }
-    crate::vfs::remove_box_namespace(box_id);
+    akuma_vfs_glue::remove_box_namespace(box_id);
     0
 }
 
@@ -157,13 +157,13 @@ fn caller_may_mount() -> bool {
 /// everything into `EINVAL`, which made `mount` report nonsense for the two
 /// cases scripts actually branch on: table full (`ENOMEM`) and target already
 /// mounted (`EBUSY`) — `docs/archive/MOUNT_MISSING_SYSCALLS.md` §3.11.
-fn mount_errno(e: crate::vfs::FsError) -> u64 {
+fn mount_errno(e: akuma_vfs_glue::FsError) -> u64 {
     match e {
-        crate::vfs::FsError::NoSpace => ENOMEM,
-        crate::vfs::FsError::AlreadyExists => EBUSY,
-        crate::vfs::FsError::NotFound => ENOENT,
-        crate::vfs::FsError::NotADirectory => ENOTDIR,
-        crate::vfs::FsError::ReadOnly => EROFS,
+        akuma_vfs_glue::FsError::NoSpace => ENOMEM,
+        akuma_vfs_glue::FsError::AlreadyExists => EBUSY,
+        akuma_vfs_glue::FsError::NotFound => ENOENT,
+        akuma_vfs_glue::FsError::NotADirectory => ENOTDIR,
+        akuma_vfs_glue::FsError::ReadOnly => EROFS,
         _ => EINVAL,
     }
 }
@@ -177,7 +177,7 @@ pub(super) fn sys_mount(
 ) -> SysResult {
     if !caller_may_mount() {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[mount] denied: boxed processes may not mount\n");
+            akuma_primitives::safe_print!(128, "[mount] denied: boxed processes may not mount\n");
         }
         return Err(EPERM);
     }
@@ -194,13 +194,13 @@ pub(super) fn sys_mount(
     // un-normalized target ("/proc/", "/a/../proc") would register a mount point
     // no lookup can ever match — and would slip past the duplicate check that
     // keeps a box from shadowing its own root.
-    let target = crate::vfs::canonicalize_path(&target);
+    let target = akuma_vfs_glue::canonicalize_path(&target);
 
     // Only box 0 reaches here, so this is always the global mount table.
     if flags & akuma_vfs::MS_REMOUNT != 0 {
         // Remount only flips stored flags; `fs`/`source` args are advisory.
         // Linux requires the target to already be a mount point.
-        return match crate::vfs::remount(&target, flags) {
+        return match akuma_vfs_glue::remount(&target, flags) {
             Ok(()) => Ok(0),
             Err(e) => Err(mount_errno(e)),
         };
@@ -208,22 +208,22 @@ pub(super) fn sys_mount(
 
     // A mount needs a directory to land on (Linux: `ENOTDIR`). Boot mounts
     // bypass this arm entirely, so this never gates `/` or `/proc` at boot.
-    match crate::vfs::metadata(&target) {
+    match akuma_vfs_glue::metadata(&target) {
         Ok(m) if m.is_dir => {}
         Ok(_) => return Err(ENOTDIR),
         Err(e) => return Err(mount_errno(e)),
     }
 
-    let fs: alloc::sync::Arc<dyn crate::vfs::Filesystem> = match fstype.as_str() {
-        "proc" => alloc::sync::Arc::new(crate::vfs::proc::ProcFilesystem::new()),
+    let fs: alloc::sync::Arc<dyn akuma_vfs_glue::Filesystem> = match fstype.as_str() {
+        "proc" => alloc::sync::Arc::new(akuma_vfs_glue::proc::ProcFilesystem::new()),
         "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
         "ext2" => {
             // The source must name a registered block device (vdb, /dev/vdb, …).
             // The boot disk (vda) is deliberately mountable here too — it is
             // already mounted at `/`, so the duplicate check is the guard.
-            let Some(idx) = crate::block::device_index_by_name(&source) else {
+            let Some(idx) = akuma_virtio::block::device_index_by_name(&source) else {
                 if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                    crate::safe_print!(128, "[mount] no such device: {}\n", source);
+                    akuma_primitives::safe_print!(128, "[mount] no such device: {}\n", source);
                 }
                 return Err(ENODEV);
             };
@@ -231,14 +231,14 @@ pub(super) fn sys_mount(
             // cap belongs to the root filesystem, and the cache never shrinks
             // (`docs/archive/MOUNT_MISSING_SYSCALLS.md` §5 Tier B).
             const DATA_DISK_CACHE_BYTES: usize = 16 * 1024 * 1024;
-            match crate::vfs::ext2::mount_device(idx, Some(DATA_DISK_CACHE_BYTES)) {
+            match akuma_vfs_glue::ext2::mount_device(idx, Some(DATA_DISK_CACHE_BYTES)) {
                 Ok(fs) => fs,
                 Err(_) => return Err(ENODEV), // no ext2 magic on that device
             }
         }
         _ => {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[mount] unsupported fstype: {}\n", fstype);
+                akuma_primitives::safe_print!(128, "[mount] unsupported fstype: {}\n", fstype);
             }
             return Err(ENODEV);
         }
@@ -249,7 +249,7 @@ pub(super) fn sys_mount(
     } else {
         source.as_str()
     };
-    match crate::vfs::mount_with(&target, Some(recorded_source), flags, fs) {
+    match akuma_vfs_glue::mount_with(&target, Some(recorded_source), flags, fs) {
         Ok(()) => Ok(0),
         Err(e) => Err(mount_errno(e)),
     }
@@ -270,16 +270,16 @@ pub(super) fn sys_mount(
 pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> SysResult {
     if !caller_may_mount() {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(128, "[umount2] denied: boxed processes may not unmount\n");
+            akuma_primitives::safe_print!(128, "[umount2] denied: boxed processes may not unmount\n");
         }
         return Err(EPERM);
     }
     let target = copy_from_user_str(target_ptr, 256)?;
-    let target = crate::vfs::canonicalize_path(&target);
+    let target = akuma_vfs_glue::canonicalize_path(&target);
     if target == "/" {
         return Err(EBUSY);
     }
-    match crate::vfs::unmount(&target) {
+    match akuma_vfs_glue::unmount(&target) {
         Ok(()) => Ok(0),
         Err(e) => Err(mount_errno(e)),
     }
@@ -293,7 +293,7 @@ pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> SysResult {
 /// silently produced an empty layer would surface much later as a missing file
 /// inside the container, with nothing pointing back here.
 #[cfg(feature = "sc-containers")]
-fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn crate::vfs::Filesystem>, u64> {
+fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::Filesystem>, u64> {
     use akuma_isolation::overlay_fs::{OverlayFs, parse_options};
 
     if data_ptr == 0 {
@@ -303,30 +303,30 @@ fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn crate::vfs::Files
 
     let opts = parse_options(&data).map_err(|reason| {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(192, "[mount] overlay options rejected: {}\n", reason);
+            akuma_primitives::safe_print!(192, "[mount] overlay options rejected: {}\n", reason);
         }
         EINVAL
     })?;
 
-    let root_fs = crate::vfs::get_root_fs().ok_or(ENODEV)?;
+    let root_fs = akuma_vfs_glue::get_root_fs().ok_or(ENODEV)?;
 
     let mut dirs = alloc::vec::Vec::with_capacity(opts.lowerdirs.len() + 1);
-    dirs.push(crate::vfs::canonicalize_path(&opts.upperdir));
+    dirs.push(akuma_vfs_glue::canonicalize_path(&opts.upperdir));
     for lower in &opts.lowerdirs {
-        dirs.push(crate::vfs::canonicalize_path(lower));
+        dirs.push(akuma_vfs_glue::canonicalize_path(lower));
     }
 
     let mut layers = alloc::vec::Vec::with_capacity(dirs.len());
     for dir in &dirs {
-        if !crate::vfs::metadata(dir).is_ok_and(|m| m.is_dir) {
+        if !akuma_vfs_glue::metadata(dir).is_ok_and(|m| m.is_dir) {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(192, "[mount] overlay layer missing: {}\n", dir);
+                akuma_primitives::safe_print!(192, "[mount] overlay layer missing: {}\n", dir);
             }
             return Err(ENOENT);
         }
         layers.push(alloc::sync::Arc::new(
             akuma_isolation::subdir_fs::SubdirFs::new(root_fs.clone(), dir),
-        ) as alloc::sync::Arc<dyn crate::vfs::Filesystem>);
+        ) as alloc::sync::Arc<dyn akuma_vfs_glue::Filesystem>);
     }
 
     let upper = layers.remove(0);
@@ -354,11 +354,11 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
     }
 
     // Same reason as sys_mount: mount points are matched literally.
-    let target = crate::vfs::canonicalize_path(core::str::from_utf8(&target_buf).unwrap_or(""));
+    let target = akuma_vfs_glue::canonicalize_path(core::str::from_utf8(&target_buf).unwrap_or(""));
     let fstype = core::str::from_utf8(&fstype_buf).unwrap_or("");
 
-    let fs: alloc::sync::Arc<dyn crate::vfs::Filesystem> = match fstype {
-        "proc" => alloc::sync::Arc::new(crate::vfs::proc::ProcFilesystem::new()),
+    let fs: alloc::sync::Arc<dyn akuma_vfs_glue::Filesystem> = match fstype {
+        "proc" => alloc::sync::Arc::new(akuma_vfs_glue::proc::ProcFilesystem::new()),
         "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
         "overlay" => build_overlay(data_ptr)?,
         _ => return Err(ENODEV),
@@ -376,18 +376,18 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
         // enforces that the root is still the pristine jail.
         if akuma_exec::process::list_processes().iter().any(|p| p.box_id == box_id) {
             if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(160, "[mount] refusing to re-root live box {}\n", box_id);
+                akuma_primitives::safe_print!(160, "[mount] refusing to re-root live box {}\n", box_id);
             }
             return Err(EPERM);
         }
-        return match crate::vfs::replace_box_root(box_id, fs) {
+        return match akuma_vfs_glue::replace_box_root(box_id, fs) {
             Ok(()) => Ok(0),
-            Err(crate::vfs::FsError::PermissionDenied) => Err(EPERM),
+            Err(akuma_vfs_glue::FsError::PermissionDenied) => Err(EPERM),
             Err(_) => Err(EINVAL),
         };
     }
 
-    match crate::vfs::mount_in_namespace(box_id, &target, fs) {
+    match akuma_vfs_glue::mount_in_namespace(box_id, &target, fs) {
         Ok(()) => Ok(0),
         Err(_) => Err(EINVAL),
     }

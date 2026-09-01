@@ -24,6 +24,8 @@ akuma-timer = { path = "../akuma-timer" }
 # `/proc/net/tcp` lists the socket table. `default-features = false` matches the
 # binary: the rump-only devbox compiles smoltcp out and still needs this crate.
 akuma-net = { path = "../akuma-net", default-features = false }
+# `register_backstop` — the waiter-side recycler pass `fs::init` installs.
+akuma-locks-rw = { path = "../akuma-locks-rw" }
 spinning_top = "0.3"
 
 # `/proc/<pid>/syscalls` and `/proc/sysvipc/msg`. These two are why the layer

@@ -41,7 +41,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
     }
     if existing != 0 {
         let live =
-            crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&existing));
+            akuma_primitives::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&existing));
         if live {
             return EEXIST;
         }
@@ -62,7 +62,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
         None => return ENOMEM,
     };
 
-    let frame = match crate::pmm::alloc_page_zeroed() {
+    let frame = match akuma_exec::pmm::alloc_page_zeroed() {
         Some(f) => f,
         None => return ENOMEM,
     };
@@ -102,7 +102,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
     }
 
     // ── Register context and write VA to user ────────────────────────────────
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         AIO_CONTEXTS
             .lock()
             .insert(ring_va as u64, AioContext { _ring_va: ring_va });
@@ -110,7 +110,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
 
     let ring_va_u64 = ring_va as u64;
     if write_user_val(ctx_idp, &ring_va_u64).is_err() {
-        crate::irq::with_irqs_disabled(|| {
+        akuma_primitives::irq::with_irqs_disabled(|| {
             AIO_CONTEXTS.lock().remove(&ring_va_u64);
         });
         // Physical page is already tracked in address_space; it will be freed
@@ -119,7 +119,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
     }
 
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        crate::tprint!(64, "[io_setup] nr_events={} ring_va=0x{:x}\n", capped_nr, ring_va);
+        akuma_primitives::tprint!(64, "[io_setup] nr_events={} ring_va=0x{:x}\n", capped_nr, ring_va);
     }
     0
 }
@@ -137,11 +137,11 @@ pub(super) fn sys_io_submit(ctx: u64, _nr: i64, _iocbpp: u64) -> u64 {
     // mask IRQs and take a lock to decide a string nobody prints. See
     // docs/archive/CONSOLE_LOG_COST.md §9.
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
+        let exists = akuma_primitives::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
         if exists {
-            crate::tprint!(128, "[io_submit] ctx=0x{:x} nr={} → stub 0\n", ctx, _nr);
+            akuma_primitives::tprint!(128, "[io_submit] ctx=0x{:x} nr={} → stub 0\n", ctx, _nr);
         } else {
-            crate::tprint!(96, "[io_submit] ctx=0x{:x} not found → 0\n", ctx);
+            akuma_primitives::tprint!(96, "[io_submit] ctx=0x{:x} not found → 0\n", ctx);
         }
     }
     0
@@ -159,11 +159,11 @@ pub(super) fn sys_io_cancel(ctx: u64, _iocb: u64, _result: u64) -> u64 {
     // mask IRQs and take a lock to decide a string nobody prints. See
     // docs/archive/CONSOLE_LOG_COST.md §9.
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
+        let exists = akuma_primitives::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
         if exists {
-            crate::tprint!(128, "[io_cancel] ctx=0x{:x} → 0\n", ctx);
+            akuma_primitives::tprint!(128, "[io_cancel] ctx=0x{:x} → 0\n", ctx);
         } else {
-            crate::tprint!(128, "[io_cancel] ctx=0x{:x} not found → 0\n", ctx);
+            akuma_primitives::tprint!(128, "[io_cancel] ctx=0x{:x} not found → 0\n", ctx);
         }
     }
     0
@@ -183,9 +183,9 @@ pub(super) fn sys_io_getevents(ctx: u64, _min_nr: i64, _nr: i64, _events: u64, _
     // mask IRQs and take a lock to decide a string nobody prints. See
     // docs/archive/CONSOLE_LOG_COST.md §9.
     if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-        let exists = crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
+        let exists = akuma_primitives::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
         if !exists {
-            crate::tprint!(128, "[io_getevents] ctx=0x{:x} not found → 0\n", ctx);
+            akuma_primitives::tprint!(128, "[io_getevents] ctx=0x{:x} not found → 0\n", ctx);
         }
     }
     // Ring is always empty (head == tail), so 0 events are ready.
@@ -199,19 +199,19 @@ pub(super) fn sys_io_getevents(ctx: u64, _min_nr: i64, _nr: i64, _events: u64, _
 /// Same policy as `sys_io_submit`: return 0 for unknown ctx (idempotent).
 pub(super) fn sys_io_destroy(ctx: u64) -> u64 {
     let removed =
-        crate::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().remove(&ctx));
+        akuma_primitives::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().remove(&ctx));
     if let Some(_aio_ctx) = removed {
         // The physical page is tracked in proc.address_space and will be
         // freed when the process exits (or we could unmap it here, but
         // leaving it mapped until exit is safe since bun never reuses the
         // address and the page is read-only after io_destroy).
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::tprint!(64, "[io_destroy] ctx=0x{:x} destroyed\n", ctx);
+            akuma_primitives::tprint!(64, "[io_destroy] ctx=0x{:x} destroyed\n", ctx);
         }
         0
     } else {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::tprint!(96, "[io_destroy] ctx=0x{:x} not found → 0 (avoid EINVAL for Go)\n", ctx);
+            akuma_primitives::tprint!(96, "[io_destroy] ctx=0x{:x} not found → 0 (avoid EINVAL for Go)\n", ctx);
         }
         0
     }

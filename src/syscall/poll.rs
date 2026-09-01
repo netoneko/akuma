@@ -166,7 +166,7 @@ fn log_epoll_pwait_return(
         return;
     }
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let elapsed_us = crate::timer::uptime_us().saturating_sub(start_time);
+    let elapsed_us = akuma_primitives::clock::uptime_us().saturating_sub(start_time);
     let nready = ready_count;
     let every = crate::config::EPOLL_ZERO_SAMPLE_INTERVAL.max(1);
 
@@ -175,7 +175,7 @@ fn log_epoll_pwait_return(
         if !n.is_multiple_of(every) {
             return;
         }
-        crate::tprint!(
+        akuma_primitives::tprint!(
             224,
             "[epoll] pwait zero-sample#{} pid={} epfd={} nready=0 timeout=0ms (interval={} ~{} suppressed)\n",
             n / every,
@@ -187,7 +187,7 @@ fn log_epoll_pwait_return(
         return;
     }
 
-    crate::tprint!(
+    akuma_primitives::tprint!(
         224,
         "[epoll] pwait ret pid={} epfd={} timeout_ms={} nready={} iters={} dur_us={} interest_fds={} {}\n",
         pid,
@@ -207,7 +207,7 @@ fn log_epoll_pwait_return(
         let out_flag = if ev.events & ep::EPOLLOUT != 0 { "OUT" } else { "" };
         let hup_flag = if ev.events & ep::EPOLLHUP != 0 { "HUP" } else { "" };
         let err_flag = if ev.events & ep::EPOLLERR != 0 { "ERR" } else { "" };
-        crate::tprint!(
+        akuma_primitives::tprint!(
             128,
             "[epoll]    ev[{}] data=0x{:x} {}{}{}{}\n",
             i,
@@ -222,7 +222,7 @@ fn log_epoll_pwait_return(
 
 #[cfg(feature = "sc-epoll")]
 pub fn epoll_destroy(epoll_id: u32) {
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         EPOLL_TABLE.lock().remove(&epoll_id);
     });
 }
@@ -270,7 +270,7 @@ fn epoll_reset_edge(fd: u32, bits: u32) {
     // allocation and N spinlock round-trips on every `read()` of a pipe, i.e.
     // on sshd's session bridge, every byte a TUI writes, and every busybox
     // pipeline. See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
-    crate::irq::with_irqs_disabled(|| {
+    akuma_primitives::irq::with_irqs_disabled(|| {
         let mut table = EPOLL_TABLE.lock();
         for inst in table.values_mut() {
             inst.reset_edge(fd, bits);
@@ -320,7 +320,7 @@ pub fn epoll_on_fd_write_blocked(fd: u32) {
 pub fn sys_epoll_create1(flags: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
-        crate::irq::with_irqs_disabled(|| {
+        akuma_primitives::irq::with_irqs_disabled(|| {
             EPOLL_TABLE.lock().insert(epoll_id, InterestList::new());
         });
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::EpollFd(epoll_id));
@@ -328,7 +328,7 @@ pub fn sys_epoll_create1(flags: u32) -> u64 {
             proc.set_cloexec(fd);
         }
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-            crate::tprint!(96, "[epoll] create1() id={} fd={} cloexec={}\n", epoll_id, fd, flags & ep::EPOLL_CLOEXEC != 0);
+            akuma_primitives::tprint!(96, "[epoll] create1() id={} fd={} cloexec={}\n", epoll_id, fd, flags & ep::EPOLL_CLOEXEC != 0);
         }
         u64::from(fd)
     } else {
@@ -357,7 +357,7 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
     // barred outright (locking.md). The membership probe keeps EBADF ahead of EFAULT,
     // which is the precedence the un-hoisted code had.
     let event = if ctl.needs_event() {
-        if !crate::irq::with_irqs_disabled(|| EPOLL_TABLE.lock().contains_key(&epoll_id)) {
+        if !akuma_primitives::irq::with_irqs_disabled(|| EPOLL_TABLE.lock().contains_key(&epoll_id)) {
             return EBADF;
         }
         let mut ev = EpollEvent { events: 0, _pad: 0, data: 0 };
@@ -374,7 +374,7 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
     // to sit inside an IRQ-masked spinlock hold.
     let mut outcome = None;
 
-    let result = crate::irq::with_irqs_disabled(|| {
+    let result = akuma_primitives::irq::with_irqs_disabled(|| {
         let mut table = EPOLL_TABLE.lock();
         let Some(instance) = table.get_mut(&epoll_id) else { return EBADF };
         let o = instance.apply(ctl, fd, ev_events, ev_data);
@@ -394,7 +394,7 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
     if crate::config::SYSCALL_DEBUG_NET_ENABLED
         && let Some(kind) = outcome.and_then(akuma_syscalls_poll::CtlOutcome::trace_tag)
     {
-        crate::tprint!(96, "[epoll] ctl {} epfd={} fd={} events=0x{:x}\n", kind, epfd, fd, ev_events);
+        akuma_primitives::tprint!(96, "[epoll] ctl {} epfd={} fd={} events=0x{:x}\n", kind, epfd, fd, ev_events);
     }
     result
 }
@@ -422,7 +422,7 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
         // knowing about: it is indistinguishable, to the caller, from a socket
         // that died — see `docs/runbooks/cargo-cannot-reach-crates-io.md` § 3.4.
         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-            crate::tprint!(96, "[pollmiss] fd={} -> EPOLLHUP|EPOLLERR (no fd entry)\n", fd_num);
+            akuma_primitives::tprint!(96, "[pollmiss] fd={} -> EPOLLHUP|EPOLLERR (no fd entry)\n", fd_num);
         }
         return readiness(FdState::Missing, requested);
     };
@@ -445,7 +445,7 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                     Some(handle) => {
                         let can_recv = akuma_net::smoltcp_net::udp_can_recv(handle);
                         if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                            crate::tprint!(96, "[epoll] check UDP fd={} can_recv={}\n", fd_num, can_recv);
+                            akuma_primitives::tprint!(96, "[epoll] check UDP fd={} can_recv={}\n", fd_num, can_recv);
                         }
                         FdState::Udp {
                             can_recv,
@@ -458,7 +458,7 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                 }
             } else if super::net::socket_is_dead_tcp(idx) {
                 if crate::config::SYSCALL_DEBUG_NET_ENABLED {
-                    crate::tprint!(96, "[pollhup] fd={} idx={} state={} req=0x{:x}\n",
+                    akuma_primitives::tprint!(96, "[pollhup] fd={} idx={} state={} req=0x{:x}\n",
                         fd_num, idx, super::net::socket_tcp_state_str(idx), requested);
                 }
                 FdState::Tcp { dead: true, can_recv: false, can_send: false, peer_closed: false }
@@ -610,7 +610,7 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
     if crate::config::SYSCALL_DEBUG_EPOLL_EDGE
         && let Some((idx, can_recv)) = tcp_trace
     {
-        crate::tprint!(96, "[epoll-tcp] fd={} idx={} req=0x{:x} can_recv={} ready=0x{:x}\n",
+        akuma_primitives::tprint!(96, "[epoll-tcp] fd={} idx={} req=0x{:x} can_recv={} ready=0x{:x}\n",
             fd_num, idx, requested, can_recv, ready);
     }
 
@@ -636,7 +636,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
     } else {
         0
     };
-    let start_time = crate::timer::uptime_us();
+    let start_time = akuma_primitives::clock::uptime_us();
     let waker = akuma_exec::threading::current_thread_waker();
 
     let mut iterations = 0u64;
@@ -692,7 +692,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
         const STACK_SNAPSHOT_SIZE: usize = 128;
         let mut stack_snapshot = [0u32; STACK_SNAPSHOT_SIZE];
 
-        let snapshot = crate::irq::with_irqs_disabled(|| {
+        let snapshot = akuma_primitives::irq::with_irqs_disabled(|| {
             let table = EPOLL_TABLE.lock();
             let instance = table.get(&epoll_id)?;
 
@@ -721,7 +721,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             if ready_count >= maxevents { break; }
 
             // Re-acquire lock to get entry details (MUST NOT hold during readiness check)
-            let entry_info = crate::irq::with_irqs_disabled(|| {
+            let entry_info = akuma_primitives::irq::with_irqs_disabled(|| {
                 let table = EPOLL_TABLE.lock();
                 table.get(&epoll_id).and_then(|inst| inst.get(fd))
             });
@@ -743,7 +743,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             // HUP/ERR to force both handlers to run, and dereferenced a connection
             // object it had already torn down along with the fd. Prune instead.
             if akuma_exec::process::current_process_shared().is_none_or(|p| p.get_fd(fd).is_none()) {
-                crate::irq::with_irqs_disabled(|| {
+                akuma_primitives::irq::with_irqs_disabled(|| {
                     if let Some(inst) = EPOLL_TABLE.lock().get_mut(&epoll_id) {
                         inst.prune(fd);
                     }
@@ -760,7 +760,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
             let step = edge::scan(entry.events, revents, entry.last_ready);
 
             if let Some(record) = step.record {
-                crate::irq::with_irqs_disabled(|| {
+                akuma_primitives::irq::with_irqs_disabled(|| {
                     if let Some(inst) = EPOLL_TABLE.lock().get_mut(&epoll_id) {
                         inst.record_ready(fd, record);
                     }
@@ -770,7 +770,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
                 // other trace: the fd stays ready, the watcher stays parked,
                 // and nothing reports an error. See `SYSCALL_DEBUG_EPOLL_EDGE`.
                 if crate::config::SYSCALL_DEBUG_EPOLL_EDGE && revents != 0 {
-                    crate::tprint!(
+                    akuma_primitives::tprint!(
                         160,
                         "[epoll] ET epfd={} fd={} rev=0x{:x} last=0x{:x} new=0x{:x} {}\n",
                         epfd,
@@ -795,7 +795,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
 
         let ready = ready_count > 0;
         let obs = Observation {
-            now_us: crate::timer::uptime_us(),
+            now_us: akuma_primitives::clock::uptime_us(),
             poll_epoch: 0, // no epoch guard in this family — see WaitPolicy::epoll
             progress,
             condition_met: ready,
@@ -804,9 +804,9 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
 
         // Periodic log for long waits (every ~5 seconds = 500 iterations x 10ms)
         if crate::config::SYSCALL_DEBUG_NET_ENABLED && iterations.is_multiple_of(500) {
-            let elapsed = crate::timer::uptime_us() - start_time;
+            let elapsed = akuma_primitives::clock::uptime_us() - start_time;
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-            crate::tprint!(192, "[epoll] pwait still waiting: pid={} epfd={} {}us elapsed\n",
+            akuma_primitives::tprint!(192, "[epoll] pwait still waiting: pid={} epfd={} {}us elapsed\n",
                 pid, epfd, elapsed);
         }
 
@@ -905,7 +905,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
         None => (true, 0),
     };
 
-    let start_time = crate::timer::uptime_us();
+    let start_time = akuma_primitives::clock::uptime_us();
 
     // Register the calling thread as a waker on each polled fd, exactly as
     // `sys_epoll_pwait` and `sys_ppoll` do, so a peer write wakes us
@@ -967,7 +967,7 @@ pub(super) fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exc
 
         let ready = ready_count > 0;
         let obs = Observation {
-            now_us: crate::timer::uptime_us(),
+            now_us: akuma_primitives::clock::uptime_us(),
             poll_epoch: 0, // no epoch guard in this family — see WaitPolicy::epoll
             progress,
             condition_met: ready,
@@ -1069,7 +1069,7 @@ pub fn run_pselect6_exceptfds_test() {
 
     let tid = akuma_exec::threading::current_thread_id();
     let pid = 8041u32;
-    register_process(pid, crate::process_tests::make_test_process(pid));
+    register_process(pid, akuma_exec::process::make_test_process(pid));
     register_thread_pid(tid, pid);
 
     let proc = akuma_exec::process::current_process_shared().unwrap();
@@ -1123,9 +1123,9 @@ pub fn run_pselect6_exceptfds_test() {
 
     let pass = ready_ok && ready_except_cleared && timeout_ok && timeout_except_cleared;
     if pass {
-        crate::safe_print!(128, "  [PASS] pselect6_clears_exceptfds\n");
+        akuma_primitives::safe_print!(128, "  [PASS] pselect6_clears_exceptfds\n");
     } else {
-        crate::safe_print!(160,
+        akuma_primitives::safe_print!(160,
             "  [FAIL] pselect6_clears_exceptfds ready_ok={} ready_cleared={} timeout_ok={} timeout_cleared={}\n",
             ready_ok, ready_except_cleared, timeout_ok, timeout_except_cleared);
     }
@@ -1157,7 +1157,7 @@ pub fn run_pselect6_registers_waker_test() {
 
     let tid = akuma_exec::threading::current_thread_id();
     let pid = 8042u32;
-    register_process(pid, crate::process_tests::make_test_process(pid));
+    register_process(pid, akuma_exec::process::make_test_process(pid));
     register_thread_pid(tid, pid);
 
     let proc = akuma_exec::process::current_process_shared().unwrap();
@@ -1191,9 +1191,9 @@ pub fn run_pselect6_registers_waker_test() {
 
     let pass = rc == 0 && before == 0 && after >= 1;
     if pass {
-        crate::safe_print!(128, "  [PASS] pselect6_registers_waker\n");
+        akuma_primitives::safe_print!(128, "  [PASS] pselect6_registers_waker\n");
     } else {
-        crate::safe_print!(
+        akuma_primitives::safe_print!(
             160,
             "  [FAIL] pselect6_registers_waker rc={} pollers {} -> {} (want 0 -> >=1)\n",
             rc,
@@ -1227,7 +1227,7 @@ pub fn run_pselect6_eintr_test() {
 
     let tid = akuma_exec::threading::current_thread_id();
     let pid = 8043u32;
-    register_process(pid, crate::process_tests::make_test_process(pid));
+    register_process(pid, akuma_exec::process::make_test_process(pid));
     register_thread_pid(tid, pid);
 
     // `interrupt_thread` sets the flag on the channel registered for `tid`, and
@@ -1254,7 +1254,7 @@ pub fn run_pselect6_eintr_test() {
     let mut rset = [0u64; 16];
     rset[(rfd / 64) as usize] |= 1u64 << (rfd % 64);
     let mut ts = Timespec { tv_sec: 0, tv_nsec: 300_000_000 };
-    let started = crate::timer::uptime_us();
+    let started = akuma_primitives::clock::uptime_us();
     let rc = flat(sys_pselect6(
         (rfd + 1) as usize,
         &raw mut rset as u64,
@@ -1263,7 +1263,7 @@ pub fn run_pselect6_eintr_test() {
         &raw mut ts as u64,
         0,
     ));
-    let elapsed = crate::timer::uptime_us().saturating_sub(started);
+    let elapsed = akuma_primitives::clock::uptime_us().saturating_sub(started);
 
     if let Some(ch) = akuma_exec::process::current_channel() {
         ch.clear_interrupted();
@@ -1280,9 +1280,9 @@ pub fn run_pselect6_eintr_test() {
     // than after a full timeout that happened to be reported as an error.
     let pass = rc == EINTR && elapsed < 200_000;
     if pass {
-        crate::safe_print!(128, "  [PASS] pselect6_returns_eintr\n");
+        akuma_primitives::safe_print!(128, "  [PASS] pselect6_returns_eintr\n");
     } else {
-        crate::safe_print!(
+        akuma_primitives::safe_print!(
             160,
             "  [FAIL] pselect6_returns_eintr rc={} (want {}) elapsed={}us\n",
             rc,
@@ -1312,11 +1312,11 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
 
     if crate::config::SYSCALL_DEBUG_NET_ENABLED && nfds > 0 {
         let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-        crate::tprint!(128, "[ppoll] enter: pid={} nfds={} timeout_us={}\n", pid, nfds, 
+        akuma_primitives::tprint!(128, "[ppoll] enter: pid={} nfds={} timeout_us={}\n", pid, nfds, 
             if infinite { u64::MAX } else { timeout_us });
     }
 
-    let start_time = crate::timer::uptime_us();
+    let start_time = akuma_primitives::clock::uptime_us();
     let mut kernel_fds = alloc::vec![PollFd { fd: 0, events: 0, revents: 0 }; nfds];
     if nfds > 0 && copy_from_user(as_user_bytes_mut(&mut kernel_fds), fds_ptr).is_err() {
         return Err(EFAULT);
@@ -1390,7 +1390,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
 
         let ready = ready_count > 0;
         let obs = Observation {
-            now_us: crate::timer::uptime_us(),
+            now_us: akuma_primitives::clock::uptime_us(),
             poll_epoch: 0, // no epoch guard in this family — see WaitPolicy::epoll
             progress,
             condition_met: ready,

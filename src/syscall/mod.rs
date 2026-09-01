@@ -216,7 +216,7 @@ pub mod syscall_counters {
         let total = TOTAL_COUNT.load(Ordering::Relaxed);
         let other = OTHER_COUNT.load(Ordering::Relaxed);
         let last_nr = OTHER_LAST_NR.load(Ordering::Relaxed);
-        crate::safe_print!(512,
+        akuma_primitives::safe_print!(512,
             "[SC-STATS] total={} madvise={} mremap={} lseek={} rnd={} pid={} fcntl={} other={}(last_nr={})\n",
             total,
             MADVISE_COUNT.load(Ordering::Relaxed),
@@ -227,7 +227,7 @@ pub mod syscall_counters {
             FCNTL_COUNT.load(Ordering::Relaxed),
             other, last_nr,
         );
-        crate::safe_print!(512,
+        akuma_primitives::safe_print!(512,
             "[SC-STATS] futex={} sigmask={} sigact={} clk={} ioctl={} fstat={} yield={}\n",
             FUTEX_COUNT.load(Ordering::Relaxed),
             SIGPROCMASK_COUNT.load(Ordering::Relaxed),
@@ -237,7 +237,7 @@ pub mod syscall_counters {
             FSTAT_COUNT.load(Ordering::Relaxed),
             YIELD_COUNT.load(Ordering::Relaxed),
         );
-        crate::safe_print!(384,
+        akuma_primitives::safe_print!(384,
             "[SC-STATS] mmap={}({}pg) munmap={} brk={} read={} write={} open={} close={} mprot={} pgfault={}({}pg)\n",
             MMAP_COUNT.load(Ordering::Relaxed),
             MMAP_PAGES.load(Ordering::Relaxed),
@@ -450,7 +450,7 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
     
     if let Ok(s) = core::str::from_utf8(&bytes) { Ok(String::from(s)) } else {
         if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-            crate::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
+            akuma_primitives::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
         }
         Err(EINVAL)
     }
@@ -582,7 +582,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // silently added to or dropped from the list changes nothing observable
     // until someone turns the flag on to debug something else.
     if plan.debug_print {
-        crate::safe_print!(128, "[SC] nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x}\n", syscall_num, args[0], args[1], args[2]);
+        akuma_primitives::safe_print!(128, "[SC] nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x}\n", syscall_num, args[0], args[1], args[2]);
     }
 
     syscall_counters::inc_total();
@@ -625,7 +625,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // One clock read serves both hooks; `need_timing` is their union, decided
     // once in the prologue and read again in the epilogue rather than
     // recomputed there.
-    let t0 = if plan.need_timing { crate::timer::uptime_us() } else { 0 };
+    let t0 = if plan.need_timing { akuma_primitives::clock::uptime_us() } else { 0 };
     crate::syscall::utils::read_profile::floor_laps::lap(
         crate::syscall::utils::read_profile::F_LAP_HOOKS,
     );
@@ -848,7 +848,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MSYNC => mem::sys_msync(args[0] as usize, args[1] as usize, args[2] as u32),
         nr::PROCESS_VM_READV => {
             if crate::config::SYSCALL_ENOSYS_DIAG {
-                crate::tprint!(96, "[ENOSYS] nr=270 (process_vm_readv) pid={}\n",
+                akuma_primitives::tprint!(96, "[ENOSYS] nr=270 (process_vm_readv) pid={}\n",
                     akuma_exec::process::read_current_pid().unwrap_or(0));
             }
             ENOSYS
@@ -965,7 +965,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-epoll")]
         nr::EPOLL_PWAIT => {
             if crate::config::SYSCALL_DEBUG_NET_ENABLED && (args[4] != 0 || args[5] != 0) {
-                crate::safe_print!(128, "[epoll_pwait] sigmask=0x{:x} sigsetsize={}\n", args[4], args[5]);
+                akuma_primitives::safe_print!(128, "[epoll_pwait] sigmask=0x{:x} sigsetsize={}\n", args[4], args[5]);
             }
             poll::sys_epoll_pwait(args[0] as u32, args[1] as usize, args[2] as i32, args[3] as i32)
         }
@@ -979,7 +979,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             // `io_uring_enter` is a *loop* call in any runtime that gets as far
             // as trying it, so this one especially must not print per call.
             if crate::config::SYSCALL_ENOSYS_DIAG {
-                crate::tprint!(96, "[ENOSYS] nr={} (io_uring) pid={}\n", syscall_num,
+                akuma_primitives::tprint!(96, "[ENOSYS] nr={} (io_uring) pid={}\n", syscall_num,
                     akuma_exec::process::read_current_pid().unwrap_or(0));
             }
             ENOSYS
@@ -1006,7 +1006,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         nr::INOTIFY_INIT1 | nr::INOTIFY_ADD_WATCH | nr::INOTIFY_RM_WATCH => {
             if crate::config::SYSCALL_ENOSYS_DIAG {
-                crate::tprint!(128, "[ENOSYS] nr={} (inotify) pid={}\n", syscall_num,
+                akuma_primitives::tprint!(128, "[ENOSYS] nr={} (inotify) pid={}\n", syscall_num,
                     akuma_exec::process::read_current_pid().unwrap_or(0));
             }
             ENOSYS
@@ -1019,7 +1019,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MOUNT_IN_NS => flat(container::sys_mount_in_ns(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5])),
         _ => {
             if crate::config::SYSCALL_ENOSYS_DIAG {
-                crate::safe_print!(128,
+                akuma_primitives::safe_print!(128,
                     "[ENOSYS] nr={} pid={} args=[0x{:x}, 0x{:x}, 0x{:x}]\n",
                     syscall_num, akuma_exec::process::read_current_pid().unwrap_or(0),
                     args[0], args[1], args[2]);
@@ -1101,7 +1101,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     );
 
     if plan.need_timing {
-        let elapsed = crate::timer::uptime_us().saturating_sub(t0);
+        let elapsed = akuma_primitives::clock::uptime_us().saturating_sub(t0);
         // `epi_cur`, not `cur`: these dereference a `Process`, so they take the
         // validated identity. `owner_pid` stays the prologue's — it is a scalar
         // copy and the ring is keyed by it, so a process that retired mid-call
@@ -1131,7 +1131,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         if crate::config::SYSCALL_ERRNO_DIAG_EXTRA {
             let tid = akuma_exec::threading::current_thread_id();
             let elr = akuma_exec::threading::current_trap_frame_elr();
-            crate::safe_print!(192,
+            akuma_primitives::safe_print!(192,
                 "[{}] nr={} pid={} tid={} ELR={} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]\n",
                 err_name, syscall_num, owner_pid, tid,
                 ElrFmt(elr),
@@ -1157,12 +1157,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 } else {
                     "other"
                 };
-                crate::safe_print!(192,
+                akuma_primitives::safe_print!(192,
                     "  [mmap-einval] reason={} addr={:#x} len={:#x} prot={:#x} flags={:#x}({})\n",
                     reason, addr, len, prot, flags, MmapFlagsFmt(flags));
             }
         } else {
-            crate::safe_print!(128,
+            akuma_primitives::safe_print!(128,
                 "[{}] nr={} pid={} args=[{:#x}, {:#x}, {:#x}, {:#x}]\n",
                 err_name, syscall_num, owner_pid, args[0], args[1], args[2], args[3]);
         }

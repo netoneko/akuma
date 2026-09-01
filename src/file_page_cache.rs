@@ -12,7 +12,13 @@
 
 // `len` dropped from this re-export when `/proc/meminfo` moved to
 // `akuma-vfs-glue` and started calling `akuma_fpcache::len` directly.
-pub use akuma_fpcache::{invalidate_inode, shrink, stats_line};
+pub use akuma_fpcache::{shrink, stats_line};
+
+/// Boot-suite only since `src/fs.rs` moved into `akuma-vfs-glue` and started
+/// calling `akuma_fpcache::invalidate_inode` directly — an ungated re-export is
+/// an unused import on `no-tests` profiles, which build with `-D unused-imports`.
+#[cfg(kernel_tests)]
+pub use akuma_fpcache::invalidate_inode;
 
 // The rest of the shim's re-exports: exceptions.rs — their production caller —
 // reached `akuma_fpcache` directly on 2026-09-01, and the only `src/` callers

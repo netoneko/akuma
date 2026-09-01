@@ -187,7 +187,7 @@ default = [
     # gated and why that reason no longer applies.
     "sc-reboot",
 ]
-no-tests = ["akuma-net/small-sockets", "akuma-exceptions/no-tests"]
+no-tests = ["akuma-net/small-sockets", "akuma-exceptions/no-tests", "akuma-exec/no-tests"]
 
 # Target Firecracker's aarch64 microVM instead of QEMU `virt`.
 #
