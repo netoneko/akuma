@@ -9,6 +9,8 @@ akuma-config = { path = "../akuma-config" }
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-exec = { path = "../akuma-exec" }
 akuma-ext2 = { path = "../akuma-ext2" }
+akuma-fdt = { path = "../akuma-fdt" }
+akuma-firecracker = { path = "../akuma-firecracker" }
 akuma-fpcache = { path = "../akuma-fpcache" }
 akuma-gic = { path = "../akuma-gic" }
 akuma-net = { path = "../akuma-net", default-features = false }
@@ -16,6 +18,7 @@ akuma-pmm = { path = "../akuma-pmm" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-syscalls-time = { path = "../akuma-syscalls-time" }
 akuma-timer = { path = "../akuma-timer" }
+akuma-uart = { path = "../akuma-uart" }
 akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 log = { version = "0.4", default-features = false }
 spinning_top = "0.3"
@@ -33,6 +36,11 @@ no-tests = []
 # other toggles above, which only need to reach this crate's own build.rs.
 smp-shared = ["akuma-gic/smp-shared"]
 net-profile = ["akuma-net/net-profile"]
+# `platform.rs` selects the machine description at compile time. The cfg it
+# reads is `feature = "platform-firecracker"` on THIS package, so the toggle has
+# to exist here and be forwarded from every crate above (see
+# `akuma-kernel-glue/Cargo.toml`) — a missing forward silently picks QEMU virt.
+platform-firecracker = []
 bkl-profile = []
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
 net-noalloc = ["akuma-net/net-noalloc"]

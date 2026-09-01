@@ -9,14 +9,16 @@
 //! its reentrancy guard, the `MULTICORE` runtime gate, and every formatting
 //! helper. See `docs/archive/AKUMA_UART_EXTRACTION.md`.
 //!
-//! `forbid`, not `deny`: `deny` can be switched back off by a module-local
-//! `#[allow(unsafe_code)]`. This is the file that has to keep working when the
-//! allocator is what broke, so a stray `unsafe` here is worth a compile error.
+//! The ban is `akuma-kernel-core`'s crate-level one since this module moved
+//! there (2026-09-01) — it used to be a module-local `#![forbid(unsafe_code)]`,
+//! back when the surrounding crate could not carry one. That local attribute is
+//! why `scripts/cloc_akuma.py` reported `akuma-kernel-glue` as forbidding while
+//! it still held boot assembly: the script marks a crate when ANY file in it
+//! carries the attribute.
 //!
 //! The ban does not mean the console is proven sound — it means the one genuinely
 //! unsafe operation, vouching that `DEV_UART_VA` is a mapped PL011 window, is
 //! stated once in the crate that owns the device instead of at each access.
-#![forbid(unsafe_code)]
 
 use crate::alloc::string::ToString;
 use alloc::vec::Vec;

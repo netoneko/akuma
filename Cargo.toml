@@ -17,6 +17,7 @@ default-members = [
     "crates/akuma-ext2",
     "crates/akuma-isolation",
     "crates/akuma-kacho",
+    "crates/akuma-entry",
     "crates/akuma-kernel-core",
     "crates/akuma-kernel-glue",
     "crates/akuma-mmap",

@@ -6212,14 +6212,11 @@ fn test_cow_break_declines_stale_old_pa() {
 /// stack would overlap the kernel or the heap — so assert the relationships hold
 /// for the profile this kernel was actually built with.
 fn test_boot_stack_reservation_invariants() {
-    unsafe extern "C" {
-        static _kernel_phys_end: u8;
-        static STACK_BOTTOM: u8;
-        static STACK_TOP: u8;
-    }
-    let kernel_end = &raw const _kernel_phys_end as usize;
-    let stack_bottom = &raw const STACK_BOTTOM as usize;
-    let stack_top = &raw const STACK_TOP as usize;
+    // Declared once, in `akuma-entry` — this test used to carry a second,
+    // byte-identical `unsafe extern` block for the same three symbols.
+    let kernel_end = crate::linker_syms::kernel_phys_end();
+    let stack_bottom = crate::linker_syms::stack_bottom();
+    let stack_top = crate::linker_syms::stack_top();
 
     // 1. The reservation sits strictly above the kernel image (no overlap).
     let above_image = stack_bottom > kernel_end;

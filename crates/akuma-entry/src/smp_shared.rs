@@ -227,7 +227,7 @@ fn psci_is_hvc(fdt: &akuma_fdt::Fdt<'_>) -> bool {
 /// bytes, and one of the six `unsafe` operations `akuma-fdt` replaced with one.
 pub fn probe_dtb(fdt: Option<&akuma_fdt::Fdt<'_>>) {
     let Some(fdt) = fdt else {
-        crate::safe_print!(64, "[SMP-shared] no DTB; staying single-core\n");
+        akuma_kernel_core::safe_print!(64, "[SMP-shared] no DTB; staying single-core\n");
         return;
     };
     let mut count = 0usize;
@@ -246,22 +246,22 @@ pub fn probe_dtb(fdt: Option<&akuma_fdt::Fdt<'_>>) {
         akuma_psci::Conduit::Smc
     });
     PROBED.store(true, Ordering::Release);
-    crate::safe_print!(64, "[SMP-shared] probed {} core(s)\n", count.max(1));
+    akuma_kernel_core::safe_print!(64, "[SMP-shared] probed {} core(s)\n", count.max(1));
 }
 
 /// M0 bringup: PSCI `CPU_ON` every secondary onto the shared boot tables, then wait
 /// (bounded) for each to report online. Called from `kernel_main` after `akuma_gic::init`.
 pub fn bringup_secondaries() {
     if !PROBED.load(Ordering::Acquire) {
-        crate::safe_print!(56, "[SMP-shared] not probed; staying single-core\n");
+        akuma_kernel_core::safe_print!(56, "[SMP-shared] not probed; staying single-core\n");
         return;
     }
     let num_cores = NUM_CORES.load(Ordering::Relaxed);
     let bsp_idx = (read_mpidr() & 0xff) as usize;
-    crate::safe_print!(64, "[SMP-shared] {} core(s); BSP is core {}\n", num_cores, bsp_idx);
+    akuma_kernel_core::safe_print!(64, "[SMP-shared] {} core(s); BSP is core {}\n", num_cores, bsp_idx);
 
     if num_cores <= 1 {
-        crate::safe_print!(56, "[SMP-shared] single core; no secondaries\n");
+        akuma_kernel_core::safe_print!(56, "[SMP-shared] single core; no secondaries\n");
         return;
     }
 
@@ -272,7 +272,7 @@ pub fn bringup_secondaries() {
     // ("CPU_ON core 1 (mpi[dSrM=P0x1) -->s ok"). Past this point at least two
     // cores can reach `emit()`, which is exactly the condition the lock is for.
     // See `console::set_multicore`.
-    crate::console::set_multicore();
+    akuma_kernel_core::console::set_multicore();
 
     let entry_pa = secondary_entry_shared as *const () as u64;
     // Publish everything the secondaries read (this module's statics, their stacks)
@@ -289,9 +289,9 @@ pub fn bringup_secondaries() {
         let r = akuma_psci::call(akuma_psci::CPU_ON, target, entry_pa, idx as u64);
         if r == 0 {
             expected += 1;
-            crate::safe_print!(80, "[SMP-shared] CPU_ON core {} (mpidr=0x{:x}) -> ok\n", idx, target);
+            akuma_kernel_core::safe_print!(80, "[SMP-shared] CPU_ON core {} (mpidr=0x{:x}) -> ok\n", idx, target);
         } else {
-            crate::safe_print!(80, "[SMP-shared] CPU_ON core {} failed: {}\n", idx, r);
+            akuma_kernel_core::safe_print!(80, "[SMP-shared] CPU_ON core {} failed: {}\n", idx, r);
         }
     }
 
@@ -304,9 +304,9 @@ pub fn bringup_secondaries() {
     }
     let online = ONLINE_COUNT.load(Ordering::Acquire);
     if online == expected {
-        crate::safe_print!(72, "[SMP-shared] \u{2713} {} secondary core(s) online (shared kernel)\n", online);
+        akuma_kernel_core::safe_print!(72, "[SMP-shared] \u{2713} {} secondary core(s) online (shared kernel)\n", online);
     } else {
-        crate::safe_print!(80, "[SMP-shared] only {}/{} secondaries reported online\n", online, expected);
+        akuma_kernel_core::safe_print!(80, "[SMP-shared] only {}/{} secondaries reported online\n", online, expected);
     }
 }
 
@@ -347,9 +347,9 @@ fn dsb_sy() {
 #[cfg(kernel_smp_shared)]
 fn redistributor_layout() -> akuma_gic::RedistributorLayout {
     akuma_gic::RedistributorLayout {
-        base_pa: crate::platform::gicr_base_pa(),
-        stride: crate::platform::GICR_STRIDE,
-        sgi_offset: crate::platform::GICR_SGI_OFFSET,
+        base_pa: akuma_kernel_core::platform::gicr_base_pa(),
+        stride: akuma_kernel_core::platform::GICR_STRIDE,
+        sgi_offset: akuma_kernel_core::platform::GICR_SGI_OFFSET,
     }
 }
 
@@ -437,8 +437,8 @@ fn demo_exit() -> ! {
 pub fn stop_and_reclaim_demos() {
     DEMO_STOP.store(true, Ordering::Release);
     // Let workers wake from their short sleep, observe the flag, and self-terminate.
-    let start = crate::timer::uptime_us();
-    while crate::timer::uptime_us().saturating_sub(start) < 300_000 {
+    let start = akuma_kernel_core::timer::uptime_us();
+    while akuma_kernel_core::timer::uptime_us().saturating_sub(start) < 300_000 {
         akuma_exec::threading::yield_now();
         akuma_exec::threading::idle_halt();
     }
@@ -510,7 +510,7 @@ pub fn spawn_worker_demo() {
             spawned += 1;
         }
     }
-    crate::safe_print!(64, "[SMP-shared] spawned {} demo workers\n", spawned);
+    akuma_kernel_core::safe_print!(64, "[SMP-shared] spawned {} demo workers\n", spawned);
 }
 
 /// Self-test waiter that parks in a pure `blocking_relax()` loop — exactly what a thread
@@ -580,19 +580,19 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
 
     ONLINE_COUNT.fetch_add(1, Ordering::AcqRel);
     let Some(slot) = idle else {
-        crate::safe_print!(64, "[SMP-shared] core {} online but NO idle slot; parking\n", core);
+        akuma_kernel_core::safe_print!(64, "[SMP-shared] core {} online but NO idle slot; parking\n", core);
         loop {
             akuma_cpu::park::wfe();
         }
     };
-    crate::safe_print!(64, "[SMP-shared] core {} online (idle tid {})\n", core, slot);
+    akuma_kernel_core::safe_print!(64, "[SMP-shared] core {} online (idle tid {})\n", core, slot);
 
     // Bring up this PE's interrupt receive path, install shared vectors, arm the tick.
     akuma_gic::secondary_init(core, redistributor_layout());
     set_shared_vbar();
     // Arm this core's periodic tick from the shared choice (BSP's probe /
     // override result, published via akuma-timer's registry).
-    crate::timer::enable_timer_interrupts(crate::timer::current_tick_us());
+    akuma_kernel_core::timer::enable_timer_interrupts(akuma_kernel_core::timer::current_tick_us());
 
     // Unmask IRQs: from here the timer tick drives this core's scheduler.
     // The `isb` matters here specifically: this is the first time this core takes

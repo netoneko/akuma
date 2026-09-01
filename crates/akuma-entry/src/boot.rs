@@ -229,7 +229,7 @@ setup_boot_page_tables:
     // mismatched-attribute alias, which the ARM ARM leaves CONSTRAINED
     // UNPREDICTABLE: the CPU may speculatively read, cache and write back a UART
     // FIFO or a virtio doorbell. The choice comes from
-    // `crate::platform::machine::MMIO_WINDOW_IS_DEVICE`; the flag values stay
+    // `akuma_kernel_core::platform::machine::MMIO_WINDOW_IS_DEVICE`; the flag values stay
     // defined once, here in the assembler, rather than mirrored into Rust.
     ldr     x0, =0x40000000
 .if {mmio_window_is_device}
@@ -367,9 +367,9 @@ boot_page_tables:
     .space  4096 * 6
 "#,
     phys_base = const PHYS_BASE,
-    uart_pa = const crate::platform::machine::UART_PA,
+    uart_pa = const akuma_kernel_core::platform::machine::UART_PA,
     uart_slot = const UART_L3_SLOT,
-    mmio_window_is_device = const (crate::platform::machine::MMIO_WINDOW_IS_DEVICE as usize),
+    mmio_window_is_device = const (akuma_kernel_core::platform::machine::MMIO_WINDOW_IS_DEVICE as usize),
 );
 
 /// L3 slot the console UART occupies in the L0[1] device window.

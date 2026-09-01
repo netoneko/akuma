@@ -12,11 +12,13 @@ akuma-bkl = { path = "../akuma-bkl" }
 # `akuma_kernel_core::config` for actual use).
 akuma-config = { path = "../akuma-config" }
 akuma-cpu = { path = "../akuma-cpu" }
+# Boot assembly, the secondary trampoline and the linker symbols. Split out so
+# THIS crate can carry `#![forbid(unsafe_code)]`; see that crate's header.
+akuma-entry = { path = "../akuma-entry" }
 akuma-exceptions = { path = "../akuma-exceptions" }
 akuma-exec = { path = "../akuma-exec" }
 akuma-ext2 = { path = "../akuma-ext2" }
 akuma-fdt = { path = "../akuma-fdt" }
-akuma-firecracker = { path = "../akuma-firecracker" }
 akuma-gic = { path = "../akuma-gic" }
 akuma-kernel-core = { path = "../akuma-kernel-core" }
 akuma-net = { path = "../akuma-net", default-features = false }
@@ -28,7 +30,6 @@ akuma-psci = { path = "../akuma-psci" }
 akuma-rump = { path = "../akuma-rump", optional = true }
 akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false }
 akuma-timer = { path = "../akuma-timer" }
-akuma-uart = { path = "../akuma-uart" }
 akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 akuma-virtio = { path = "../akuma-virtio" }
 log = { version = "0.4", default-features = false }
@@ -38,8 +39,8 @@ spinning_top = "0.3"
 # Mirrors the root package's own toggles of the same name — see
 # `akuma-kernel-core/Cargo.toml` for why each needs its own copy here rather
 # than relying on root's build.rs (build scripts are per-package).
-extreme = []
-no-tests = ["akuma-kernel-core/no-tests"]
+extreme = ["akuma-entry/extreme"]
+no-tests = ["akuma-kernel-core/no-tests", "akuma-entry/no-tests"]
 smp-shared = [
     "akuma-exec/smp-shared",
     "akuma-vfs-glue/smp-shared",
@@ -49,6 +50,7 @@ smp-shared = [
     "akuma-primitives/smp-shared",
     "akuma-syscalls-glue/smp-shared",
     "akuma-kernel-core/smp-shared",
+    "akuma-entry/smp-shared",
     "no-bkl-network",
     "no-bkl-vfs",
     "no-bkl-process",
@@ -66,7 +68,7 @@ net-profile = ["akuma-net/net-profile", "akuma-kernel-core/net-profile"]
 bkl-profile = ["akuma-kernel-core/bkl-profile"]
 smoltcp = ["akuma-net/smoltcp", "akuma-syscalls-glue/smoltcp", "akuma-kernel-core/smoltcp"]
 sound = ["akuma-virtio/sound"]
-platform-firecracker = ["akuma-config/platform-firecracker", "akuma-virtio/platform-firecracker"]
+platform-firecracker = ["akuma-config/platform-firecracker", "akuma-entry/platform-firecracker", "akuma-kernel-core/platform-firecracker", "akuma-virtio/platform-firecracker"]
 rump = ["akuma-net/rump", "dep:akuma-rump", "akuma-syscalls-glue/rump"]
 rump-default = ["rump"]
 rump-tests = []

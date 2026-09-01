@@ -157,7 +157,7 @@ pub const GICR_SGI_OFFSET: usize = 0x1_0000;
 ///
 /// Installed before the FDT is parsed so that the console works and so a very
 /// early fault has a chance of printing. Replaced wholesale by
-/// [`crate::fdt_devices`]-derived regions as soon as the FDT is available.
+/// FDT-derived regions as soon as the FDT is available.
 #[must_use]
 pub fn bootstrap_device_map() -> ([DevRegion; mmu::MAX_DEV_REGIONS], usize) {
     let mut out = [DevRegion { va: 0, pa: 0, size: 0 }; mmu::MAX_DEV_REGIONS];

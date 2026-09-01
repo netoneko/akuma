@@ -77,6 +77,10 @@ mod async_tests;
 #[cfg(kernel_bkl_profile)]
 pub use akuma_kernel_core::bkl_profile;
 pub use akuma_kernel_glue::boot;
+/// `linker.ld`'s absolute image/boot-stack symbols, named once in `akuma-entry`.
+/// `process_tests.rs` is the only `src/` consumer.
+#[cfg(kernel_tests)]
+pub use akuma_kernel_glue::linker_syms;
 pub use akuma_kernel_core::config;
 pub use akuma_kernel_glue::console;
 #[cfg(kernel_tests)]

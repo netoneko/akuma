@@ -246,23 +246,30 @@ const BOOT_STATIC_MAP_END: usize = 0xC000_0000; // 3 GB
 /// That window closes at [`init`], so the obligation is discharged here by
 /// refusing to run once [`is_initialized`] is true rather than being pushed
 /// onto the caller as an `unsafe` contract.
+///
+/// # Returns
+/// Whether `addr` is readable through the boot identity map on return — `true`
+/// if it was already covered or this call mapped it, `false` if it is outside
+/// what the boot table can reach or the window has closed. [`with_boot_identity_fdt`]
+/// is what that answer exists for: a raw boot-time read needs a *checked* mapping,
+/// not a mapping attempt.
 #[cfg(target_os = "none")]
-pub fn ensure_boot_identity_covers(addr: usize) {
+pub fn ensure_boot_identity_covers(addr: usize) -> bool {
     if is_initialized() {
         debug_assert!(false, "ensure_boot_identity_covers after mmu::init");
-        return;
+        return false;
     }
     let idx = addr >> 30;
     if idx == 0 || idx > 511 {
-        return; // block 0 is the device block; anything past 511 is not addressable here
+        return false; // block 0 is the device block; anything past 511 is not addressable here
     }
     if addr < BOOT_STATIC_MAP_END {
-        return; // already covered by boot.rs's static blocks
+        return true; // already covered by boot.rs's static blocks
     }
 
     let l0_phys = (get_boot_ttbr0() & 0x0000_FFFF_FFFF_F000) as usize;
     if l0_phys == 0 {
-        return;
+        return false;
     }
     let l0 = phys_to_virt(l0_phys) as *const u64;
     let l0_0 = unsafe { core::ptr::read_volatile(l0) };
@@ -276,11 +283,50 @@ pub fn ensure_boot_identity_covers(addr: usize) {
     unsafe {
         let existing = core::ptr::read_volatile(l1.add(idx));
         if existing & flags::VALID != 0 {
-            return; // already mapped
+            return true; // already mapped
         }
         core::ptr::write_volatile(l1.add(idx), ((idx << 30) as u64) | block_flags);
     }
     boot_table_flush_sync();
+    true
+}
+
+/// Read the flattened device tree at `pa`, for the duration of one closure.
+///
+/// This is the only supported way to reach [`akuma_fdt::locate`] from the boot
+/// path, and it exists so that the "is this pointer mapped?" obligation is
+/// *discharged* rather than passed along. `locate` is `unsafe` because it
+/// speculatively reads eight bytes at an address nothing has validated; the
+/// caller in `kernel_main` could only ever vouch for that by comment. This crate
+/// owns the boot identity map, so [`ensure_boot_identity_covers`] maps the block
+/// and reports whether `addr` came out covered — an out-of-range pointer, or one
+/// arriving after [`init`] has closed the boot-table window, yields `None`
+/// instead of a translation fault before the console has said anything about
+/// memory.
+///
+/// # Why a closure
+/// The blob is **not** valid for the rest of boot: on large-RAM configs the heap
+/// is placed on top of it. `locate` hands back an unbounded lifetime, so nothing
+/// in the type system stops a `Dtb` from outliving its bytes — the closure is
+/// what bounds it, and every consumer (device map, `detect_memory`, the SMP
+/// probe) has to run inside. Returning the `Dtb` from this function instead
+/// would hand back exactly the dangling borrow it exists to prevent.
+///
+/// `pa` is resolved first ([`akuma_fdt::resolve`]), so a zero pointer — the
+/// "scan for QEMU virt's fixed location" case — is mapped and checked at the
+/// address that will actually be read.
+#[cfg(target_os = "none")]
+pub fn with_boot_identity_fdt<R>(pa: usize, f: impl FnOnce(Option<&akuma_fdt::Dtb<'_>>) -> R) -> R {
+    let base = akuma_fdt::resolve(pa);
+    if !ensure_boot_identity_covers(base) {
+        return f(None);
+    }
+    // SAFETY: `base` is confirmed mapped through the boot identity map directly
+    // above, and `locate` validates the FDT magic and declared size before
+    // trusting either. Boot phase: single-threaded, on the boot page table,
+    // before any user address space exists.
+    let dtb = unsafe { akuma_fdt::locate(base) };
+    f(dtb.as_ref())
 }
 
 /// Extend the boot TTBR0 identity map to cover ALL detected RAM.

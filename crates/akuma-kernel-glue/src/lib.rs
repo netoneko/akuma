@@ -1,9 +1,29 @@
 #![no_std]
-// This crate is the unsafe half of the bin crate — boot assembly, secondary-core
-// bring-up, the UART console, the platform/machine description, the rump
-// sysproxy client, and the kernel_main/async-main orchestration. It does NOT
-// carry `#![forbid(unsafe_code)]`: that's `akuma-kernel-core`, one layer down,
-// which this crate depends on and freely re-exports from.
+// This crate carries `#![forbid(unsafe_code)]` as of 2026-09-01.
+//
+// It was created as "the unsafe half of the bin crate" and held four things the
+// `unsafe_code` lint rejects. Each went to the crate that owns what it pokes,
+// which is the same move `src/syscall/` made:
+//
+//   * boot assembly + the secondary trampoline + the `#[unsafe(no_mangle)]`
+//     symbols assembly branches to  ->  `akuma-entry`
+//   * `linker.ld`'s absolute image/stack symbols  ->  `akuma-entry::linker_syms`,
+//     as safe accessors (reading a linker symbol's *address* never needed
+//     `unsafe`; only naming it did)
+//   * `akuma_fdt::locate`'s raw boot-time read  ->  `akuma_mmu::with_boot_identity_fdt`,
+//     which maps and then *checks* the block instead of vouching for it
+//
+// `console.rs` and `platform.rs` moved DOWN to `akuma-kernel-core` at the same
+// time. Neither held any `unsafe`; `console.rs` carried its own module-level
+// `#![forbid(unsafe_code)]`, which is why `scripts/cloc_akuma.py` used to report
+// this crate as forbidding while it still contained boot assembly (the script
+// marks a crate when ANY file in it carries the attribute).
+//
+// `forbid`, not `deny`: it cannot be switched back off by a local
+// `#[allow(unsafe_code)]`. If something here needs a genuinely unsafe operation,
+// put it behind a named function in the crate that owns the state it touches and
+// state the obligation there — do not reach for an allow.
+#![forbid(unsafe_code)]
 //! Extracted from `src/main.rs`, `src/boot.rs`, `src/console.rs`,
 //! `src/platform.rs`, `src/smp_shared.rs`, `src/rump_proxy.rs`,
 //! `src/syscall.rs` and `src/vfs.rs` on 2026-09-01 — the second half of the
@@ -83,15 +103,17 @@ pub use akuma_virtio::{audio, block, rng};
 // MMIO reads/writes are just pointer dereferences, portable to any target —
 // it is specifically the asm section directives here that are not.
 #[cfg(target_os = "none")]
-pub mod boot;
+pub use akuma_entry::boot;
 #[cfg(target_os = "none")]
-pub mod console;
+pub use akuma_entry::linker_syms;
 #[cfg(target_os = "none")]
-pub mod platform;
+pub use akuma_kernel_core::console;
+#[cfg(target_os = "none")]
+pub use akuma_kernel_core::platform;
 #[cfg(all(target_os = "none", feature = "rump"))]
 pub mod rump_proxy;
 #[cfg(all(target_os = "none", kernel_smp_shared))]
-pub mod smp_shared;
+pub use akuma_entry::smp_shared;
 #[cfg(target_os = "none")]
 pub mod syscall;
 #[cfg(target_os = "none")]
@@ -573,14 +595,9 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // DTB goes to ALIGN_UP(kernel_load + image_size, 2MB) = 0x40200000.
     const KERNEL_BASE: usize = config::KERNEL_PHYS_BASE;
 
-    unsafe extern "C" {
-        static _kernel_phys_end: u8;
-        static STACK_BOTTOM: u8;
-        static STACK_TOP: u8;
-    }
-    let kernel_end = &raw const _kernel_phys_end as usize;
-    let stack_bottom = &raw const STACK_BOTTOM as usize;
-    let boot_stack_top = &raw const STACK_TOP as usize;
+    let kernel_end = akuma_entry::linker_syms::kernel_phys_end();
+    let stack_bottom = akuma_entry::linker_syms::stack_bottom();
+    let boot_stack_top = akuma_entry::linker_syms::stack_top();
     let kernel_size = kernel_end - KERNEL_BASE;
 
     // Stack high-water probe: paint the boot stack's unused lower region so the
@@ -619,12 +636,6 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
         console::print(" KB margin)\n");
     }
 
-    // The FDT may live outside boot.rs's static [0, 3 GiB) identity map: Firecracker
-    // places it in the last 2 MiB of guest RAM, so a 4 GiB microVM has it at ~6 GiB.
-    // Map its block before reading it, or `detect_memory` faults before printing
-    // anything about memory. No-op on QEMU virt, where the DTB is low.
-    mmu::ensure_boot_identity_covers(dtb_ptr);
-
     // =========================================================================
     // Device map, take two: from the machine, not from a literal
     // =========================================================================
@@ -650,21 +661,20 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // large-RAM configs the heap can be placed on top of it. Scoping the borrow
     // is what makes the borrow checker enforce "read the DTB before heap init",
     // which was previously only a comment on `probe_dtb`.
-    let (ram_base, ram_size);
-    {
-        // SAFETY: `dtb_ptr` is zero (scan for QEMU virt's fixed location) or the
-        // bootloader's pointer, and either way is inside the boot identity map
-        // (extended above). Still single-threaded on the boot page table, before
-        // any user address space exists. `locate` reads 8 bytes and validates the
-        // magic and declared size before trusting either. The `'_` lifetime it
-        // hands back ends with this block, ahead of heap init.
-        let dtb = unsafe { akuma_fdt::locate(dtb_ptr) };
-        if let Some(d) = &dtb {
+    // `with_boot_identity_fdt` maps the DTB's block, confirms the mapping took,
+    // and only then reads — the FDT may live outside boot.rs's static [0, 3 GiB)
+    // identity map (Firecracker places it in the last 2 MiB of guest RAM, so a
+    // 4 GiB microVM has it at ~6 GiB), and an unchecked read faults before the
+    // console has said anything about memory. It is also what bounds the blob's
+    // lifetime to this closure: `akuma_fdt::locate` hands back an unbounded one,
+    // and the bytes stop being valid at heap init below.
+    let (ram_base, ram_size) = mmu::with_boot_identity_fdt(dtb_ptr, |dtb| {
+        if let Some(d) = dtb {
             safe_print!(64, "[DTB] found at 0x{:x} ({} bytes)\n", d.base(), d.len());
         } else {
             safe_print!(64, "[DTB] none at 0x{:x}\n", akuma_fdt::resolve(dtb_ptr));
         }
-        let fdt = dtb.as_ref().and_then(akuma_fdt::Dtb::parse);
+        let fdt = dtb.and_then(akuma_fdt::Dtb::parse);
 
         let outcome = platform::install_fdt_device_map(fdt.as_ref());
         match outcome {
@@ -681,14 +691,16 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
             }
         }
 
-        (ram_base, ram_size) = detect_memory(fdt.as_ref());
+        let ram = detect_memory(fdt.as_ref());
 
         // Real (shared-kernel) SMP: snapshot CPU/PSCI info from the DTB NOW, before the
         // heap allocator (which can be placed exactly at the DTB's address on
         // large-RAM configs) overwrites it. No-op without the `smp-shared` feature.
         #[cfg(kernel_smp_shared)]
         smp_shared::probe_dtb(fdt.as_ref());
-    }
+
+        ram
+    });
 
     // Memory layout. All the policy (boot-stack cover, code+stack floor, the
     // extreme reserve-RAM clamp) lives in `compute_memory_layout` + `config`, so

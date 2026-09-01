@@ -103,6 +103,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-entry"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-cpu",
+ "akuma-exceptions",
+ "akuma-exec",
+ "akuma-fdt",
+ "akuma-gic",
+ "akuma-kernel-core",
+ "akuma-primitives",
+ "akuma-psci",
+]
+
+[[package]]
 name = "akuma-exceptions"
 version = "0.1.0"
 dependencies = [
@@ -202,6 +217,8 @@ dependencies = [
  "akuma-cpu",
  "akuma-exec",
  "akuma-ext2",
+ "akuma-fdt",
+ "akuma-firecracker",
  "akuma-fpcache",
  "akuma-gic",
  "akuma-net",
@@ -209,6 +226,7 @@ dependencies = [
  "akuma-primitives",
  "akuma-syscalls-time",
  "akuma-timer",
+ "akuma-uart",
  "akuma-vfs-glue",
  "log",
  "smoltcp",
@@ -223,11 +241,11 @@ dependencies = [
  "akuma-bkl",
  "akuma-config",
  "akuma-cpu",
+ "akuma-entry",
  "akuma-exceptions",
  "akuma-exec",
  "akuma-ext2",
  "akuma-fdt",
- "akuma-firecracker",
  "akuma-gic",
  "akuma-kernel-core",
  "akuma-net",
@@ -237,7 +255,6 @@ dependencies = [
  "akuma-rump",
  "akuma-syscalls-glue",
  "akuma-timer",
- "akuma-uart",
  "akuma-vfs-glue",
  "akuma-virtio",
  "log",
@@ -271,6 +288,7 @@ version = "0.1.0"
 dependencies = [
  "akuma-bkl",
  "akuma-cpu",
+ "akuma-fdt",
  "akuma-mmap",
  "akuma-pmm",
  "akuma-primitives",

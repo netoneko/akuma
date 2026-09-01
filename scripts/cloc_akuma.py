@@ -266,7 +266,17 @@ class FileCount:
     #: whole test file. Split out because a kernel test that pokes a page table is
     #: not the same liability as one on a live syscall path.
     test_unsafe_sites: int = 0
-    #: This file carries a crate-level `#![forbid(unsafe_code)]`.
+    #: This file is a crate ROOT carrying `#![forbid(unsafe_code)]`, so the ban
+    #: covers the whole crate.
+    #:
+    #: The root check is the point. `#![forbid(..)]` is an inner attribute: on a
+    #: non-root file it bans `unsafe` for that module tree only, and the crate
+    #: around it can still be full of it. Counting those as enforced is what made
+    #: this table report `akuma-kernel-glue` as forbidding while it still held
+    #: boot assembly and three `unsafe` sites — `console.rs` carried a
+    #: module-level ban. A module-level ban is now simply not counted; the tree
+    #: has none left (2026-09-01), and if one comes back it understates the
+    #: crate rather than overstating it.
     forbids_unsafe: bool = False
     #: Production CODE lines lying inside an `unsafe { .. }` block, plus the
     #: declaration line of an `unsafe fn`/`impl`/`trait`. This is the "how much
@@ -630,7 +640,9 @@ def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> Fi
 
     fc = FileCount(path=relpath, lang=spec.name)
     fc.whole_file_test = is_test_path(relpath) or inner_test
-    fc.forbids_unsafe = FORBID_RE.search(text) is not None
+    fc.forbids_unsafe = FORBID_RE.search(text) is not None and os.path.basename(
+        relpath
+    ) in ("lib.rs", "main.rs")
     for ln in unsafe_lines:
         if fc.whole_file_test or ln in test:
             fc.test_unsafe_sites += 1
@@ -836,8 +848,8 @@ class Agg:
     test_unsafe_sites: int = 0
     unsafe_code: int = 0
     test_unsafe_code: int = 0
-    #: True once ANY file in this component carried `#![forbid(unsafe_code)]` —
-    #: in practice its `lib.rs`, since the attribute is crate-level.
+    #: True once this component's crate root carried `#![forbid(unsafe_code)]`.
+    #: See `FileCount.forbids_unsafe` for why only the root counts.
     forbids_unsafe: bool = False
 
     def add(self, fc: FileCount):
@@ -1054,7 +1066,6 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
         # counter is wrong (or an `#[unsafe(...)]` attribute was counted), not that
         # the ban was bypassed.
         print("  !! non-zero inside a `forbid(unsafe_code)` crate — check the counter")
-
     # Production vs test `unsafe`, per scope and for the tree. `src/` is the bulk
     # of the tree's test `unsafe` (the in-kernel boot suite forges trap frames and
     # builds page tables by hand, which is the job) and quoting a crates/-only

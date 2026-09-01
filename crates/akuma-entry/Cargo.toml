@@ -1,0 +1,31 @@
+[package]
+name = "akuma-entry"
+version = "0.1.0"
+edition = "2024"
+description = "The kernel's entry points: boot assembly, the secondary-core trampoline, and the linker symbols. The one crate that cannot forbid unsafe_code, so akuma-kernel-glue above it can."
+
+[dependencies]
+akuma-bkl = { path = "../akuma-bkl" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-exceptions = { path = "../akuma-exceptions" }
+akuma-exec = { path = "../akuma-exec" }
+akuma-fdt = { path = "../akuma-fdt" }
+akuma-gic = { path = "../akuma-gic" }
+# `console`, `platform` and `timer`. This edge is why `console.rs`/`platform.rs`
+# moved DOWN into that crate rather than staying beside the assembly: they hold
+# no `unsafe`, and keeping them here would have dragged them under this crate's
+# missing ban for no reason.
+akuma-kernel-core = { path = "../akuma-kernel-core" }
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-psci = { path = "../akuma-psci" }
+
+[features]
+# Mirrors the root package's toggles that this crate's own build.rs and modules
+# read. `smp-shared` gates the entire secondary-core half.
+extreme = []
+no-tests = []
+smp-shared = ["akuma-gic/smp-shared", "akuma-kernel-core/smp-shared", "akuma-exceptions/smp-shared"]
+platform-firecracker = ["akuma-kernel-core/platform-firecracker"]
+
+[lints]
+workspace = true
