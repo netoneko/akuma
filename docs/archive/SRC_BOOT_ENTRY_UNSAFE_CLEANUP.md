@@ -280,11 +280,22 @@ operations.
 - `cargo build --release`, `scripts/build_extreme_size.sh` (711 K, unchanged
   against the 4 MB floor), `cargo clippy --release` clean.
 - Host tests: 80 suites, all green.
-- Release boot under HVF: **119 `Result: PASS`, byte-identical to a stashed-HEAD
-  baseline run.** Both runs end in the known
-  `Assertion failed: (isv), function hvf_handle_exception` during the
-  `user copy: widened loop` self-test — the documented HVF ISV=0 writeback-form
-  bug ([`QEMU_HVF_ISV_BUG.md`](QEMU_HVF_ISV_BUG.md)), unrelated and pre-existing.
+- Release boot, **`MEMORY=2048M`**: **265 pass markers (165 `Result: PASS` + 100
+  `[PASS]`), zero failures**, both "ALL PASSED" banners, run to the end of the
+  suite and on into normal operation.
+
+  **Run the suite at 2048M or it does not finish, and the truncation is
+  silent.** At the default `MEMORY=256M` under HVF, QEMU aborts itself about
+  two-thirds of the way in — `Assertion failed: (isv), function
+  hvf_handle_exception, hvf.c:2437`, exit 134 — the documented HVF ISV=0
+  writeback-form bug ([`QEMU_HVF_ISV_BUG.md`](QEMU_HVF_ISV_BUG.md)), which
+  `scripts/cargo_runner.sh` warns about in the log. That truncated run reports a
+  perfectly stable **119 `Result: PASS`**, matching a stashed-HEAD baseline
+  exactly, which is what makes it dangerous: it reads as a green suite and is a
+  suite that stopped early. Every waker, `Pin` and FPCR test in `src/tests.rs`
+  lives *after* the cut, so a 119-vs-119 comparison proves nothing about them.
+  This was mis-measured that way once during this work; the number to quote is
+  the 2048M one.
 - The boot log confirms all four changed early-boot paths:
   `x0 at _boot entry: 0x48000000` (matches the DTB argument, so the `.data.boot`
   static survived the `.bss` clear), `[Platform] qemu-virt device map installed`

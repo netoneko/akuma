@@ -496,6 +496,21 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
                     i = k + len(terminator)
                     continue
 
+                # `r#ident` — a *raw identifier*, not a raw string. This is the
+                # escape hatch for naming something after a keyword, so
+                # `r#unsafe` is precisely the one spelling of those six letters
+                # that is NOT the keyword. Falling through to the identifier
+                # scanner below counted it as an unsafe site: the scanner saw
+                # `r`, then a bare `#`, then `unsafe`. Nothing in this tree
+                # writes it today; it is fixed because the failure is silent and
+                # in the direction that inflates the number.
+                if hashes and k < n and _is_ident_char(text[k]) and not text[k].isdigit():
+                    while k < n and _is_ident_char(text[k]):
+                        k += 1
+                    last_ident = ""  # a raw ident can never name an asm macro
+                    i = k
+                    continue
+
         if c in spec.strings:
             i += 1
             while i < n and text[i] != c:
@@ -1139,6 +1154,77 @@ UNSAFE_CASES = [
         0,
         0,
     ),
+    # ---- lexer traps -------------------------------------------------------
+    # Everything below is a construct that desynchronises a lexer written the
+    # obvious way, leaving it inside a "string" or "comment" for the rest of the
+    # file. The failure mode is silent and one-directional: the counter reports
+    # *fewer* sites than there are, which reads as progress. Every case here is
+    # something the tree actually contains.
+    (
+        # `'"'` is the classic. Treat `'` as "char literal, skip 3 chars" and you
+        # are fine; treat `"` as a string opener wherever you see it and the rest
+        # of the file is one string.
+        "a quote inside a char literal does not open a string",
+        "fn f() {\n    let q = '\"';\n    unsafe { a() };\n}\n",
+        1,
+        1,
+    ),
+    (
+        # And the reverse trap: a lifetime is an apostrophe with no closing one.
+        # A lexer that opens a char literal at `'a` swallows everything up to the
+        # next apostrophe, which may be many lines away.
+        "a lifetime is not an unterminated char literal",
+        "fn f<'a>(x: &'a u8) {\n    unsafe { a(x) };\n}\n",
+        1,
+        1,
+    ),
+    (
+        "an escaped quote does not end the string early",
+        'fn f() {\n    p("say \\"unsafe\\" loudly");\n}\n',
+        0,
+        0,
+    ),
+    ("the word in a byte string is not a site", 'fn f() {\n    p(b"unsafe");\n}\n', 0, 0),
+    (
+        "a hashed raw string is not a site",
+        'fn f() {\n    p(r##"unsafe { \"x\" }"##);\n}\n',
+        0,
+        0,
+    ),
+    (
+        "block comments nest, so the inner close does not reopen code",
+        "fn f() {\n    /* /* unsafe */ */\n    a();\n}\n",
+        0,
+        0,
+    ),
+    ("the word in an inner doc comment is not a site", "//! see `unsafe { }`\nfn f() {}\n", 0, 0),
+    (
+        "unsafe as part of a longer identifier is not the keyword",
+        "fn f() {\n    let my_unsafe = 1;\n    let unsafely = 2;\n    let r#unsafe = 3;\n}\n",
+        0,
+        0,
+    ),
+    # ---- cfg gating --------------------------------------------------------
+    (
+        "a compound test cfg still charges to test",
+        '#[cfg(all(test, feature = "x"))]\nfn f() {\n    unsafe { a() };\n}\n',
+        0,
+        0,
+    ),
+    (
+        "cfg(not(test)) is production, not test",
+        "#[cfg(not(test))]\nfn f() {\n    unsafe { a() };\n}\n",
+        1,
+        1,
+    ),
+    (
+        # A plain feature gate says nothing about tests; charging it to test
+        # would hide real shipped `unsafe` behind any optional feature.
+        "a non-test feature gate is production",
+        '#[cfg(feature = "smp-shared")]\nfn f() {\n    unsafe { a() };\n}\n',
+        1,
+        1,
+    ),
 ]
 
 
@@ -1196,6 +1282,102 @@ def self_test() -> int:
             print(f"  FAIL overlapping roots double-count: {len(plain)} files / "
                   f"{sum(f.code for f in plain)} code alone vs {len(overlapped)} / "
                   f"{sum(f.code for f in overlapped)} with an overlapping root")
+
+    # Every crate in `crates/` must appear in the report. This is the failure
+    # this script has actually had, twice: `akuma-gic` and `akuma-psci` "were
+    # missing entirely" from the per-crate unsafe table until someone noticed
+    # (docs/reference/crate-safety.md). A crate that is silently absent does not
+    # read as an error — it reads as a crate with nothing to report, and its
+    # `unsafe` simply stops being counted. New crates are added to this tree
+    # every few days, so nothing about "it worked last time" carries over.
+    if os.path.isdir("crates"):
+        on_disk = {
+            d for d in os.listdir("crates")
+            if os.path.isfile(os.path.join("crates", d, "Cargo.toml"))
+        }
+        files, _ = walk(["crates"], True)
+        reported = {component_of(f.path).split(os.sep, 1)[1] for f in files}
+        missing = sorted(on_disk - reported)
+        if missing:
+            failures += 1
+            print(f"  FAIL {len(missing)} crate(s) absent from the report: {missing}")
+        else:
+            print(f"  ok   every crate under crates/ is reported ({len(on_disk)})")
+
+    # `forbids_unsafe` and `unsafe_sites` must agree, in both directions. The
+    # attribute is what the compiler enforces; the site count is what this script
+    # measures. They are derived independently — one by regex over the file head,
+    # one by the lexer — so a disagreement means exactly one of them is wrong,
+    # and the report's headline ratio ("N of M crates forbid") is built on both.
+    if os.path.isdir("crates"):
+        files, _ = walk(["crates"], True)
+        by_crate: dict = {}
+        for f in files:
+            agg = by_crate.setdefault(component_of(f.path), [False, 0])
+            agg[0] = agg[0] or f.forbids_unsafe
+            agg[1] += f.unsafe_sites + f.test_unsafe_sites
+        contradictions = [c for c, (forbids, sites) in by_crate.items() if forbids and sites]
+        if contradictions:
+            failures += 1
+            print(f"  FAIL crate(s) claim #![forbid(unsafe_code)] yet report sites: "
+                  f"{sorted(contradictions)}")
+        else:
+            n = sum(1 for forbids, _ in by_crate.values() if forbids)
+            print(f"  ok   every forbidding crate reports zero unsafe sites ({n})")
+
+    # A file the walker calls a test file must charge nothing to production, and
+    # vice versa. The two buckets are filled at different places in the scanner
+    # (whole-file classification vs. per-item `#[cfg(test)]` gating), and a file
+    # leaking into both is how test `unsafe` gets counted as shipped `unsafe` —
+    # the number `src/` is judged on.
+    leaked = []
+    for root in ("src", "crates"):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, names in os.walk(root):
+            for nm in names:
+                if not nm.endswith(".rs"):
+                    continue
+                rel = os.path.join(dirpath, nm)
+                fc = count_file(rel, rel, spec, True)
+                if fc.whole_file_test and (fc.unsafe_sites or fc.code):
+                    leaked.append(rel)
+    if leaked:
+        failures += 1
+        print(f"  FAIL {len(leaked)} whole-file test(s) charged to production: {leaked[:3]}")
+    else:
+        print("  ok   whole-file tests charge nothing to production")
+
+    # Total occurrences of the substring are a hard upper bound on sites: the
+    # lexer only ever *removes* matches (comments, strings, attributes, longer
+    # identifiers), never invents one. This is the cheap direction-of-error check
+    # that would have caught the overlapping-roots doubling above while knowing
+    # nothing about roots.
+    #
+    # Occurrences, NOT lines containing one — that version of this check failed
+    # on `crates/akuma-alloc/src/lib.rs`, which opens two `GlobalAlloc` methods
+    # as `unsafe fn talc_alloc(..) -> *mut u8 { unsafe {`. Two keywords, one
+    # line, and the *check* was wrong rather than the script.
+    word = re.compile(r"unsafe")
+    exceeded = []
+    for root in ("src", "crates"):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, names in os.walk(root):
+            for nm in names:
+                if not nm.endswith(".rs"):
+                    continue
+                rel = os.path.join(dirpath, nm)
+                text = open(rel, encoding="utf-8", errors="replace").read()
+                fc = count_file(rel, rel, spec, True)
+                if fc.unsafe_sites + fc.test_unsafe_sites > len(word.findall(text)):
+                    exceeded.append(rel)
+    if exceeded:
+        failures += 1
+        print(f"  FAIL sites exceed the substring upper bound in {len(exceeded)} file(s): "
+              f"{exceeded[:3]}")
+    else:
+        print("  ok   site count stays under the naive substring upper bound")
 
     print()
     print("self-test: " + ("PASS" if failures == 0 else f"{failures} FAILURE(S)"))

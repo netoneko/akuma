@@ -2623,8 +2623,7 @@ pub fn test_waker_mechanism() -> bool {
         }
     }
     
-    let mut future = TestFuture { polled_once: false };
-    let mut future = unsafe { Pin::new_unchecked(&mut future) };
+    let mut future = core::pin::pin!(TestFuture { polled_once: false });
     
     // Create waker
     let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
@@ -2714,27 +2713,21 @@ impl core::future::Future for MultiPollFuture {
 /// continues despite wake() doing nothing.
 pub fn test_block_on_noop_waker() -> bool {
     use core::future::Future;
-    use core::pin::Pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use core::task::{Context, Poll, Waker};
 
     console::print("\n[TEST] Block-on with no-op waker\n");
 
-    // No-op waker (like we use in block_on)
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(core::ptr::null(), &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
+    // The no-op waker this test is named for is now `Waker::noop()` — the safe
+    // `const` stdlib item, rather than a local `RawWakerVTable` of four empty
+    // closures behind `Waker::from_raw`. Same waker, and a more faithful one:
+    // `block_on` in the SSH path uses the stdlib item too.
     
     // Simulate block_on with limited iterations
-    fn block_on_limited<F: Future>(mut future: F, max_iters: usize) -> Option<F::Output> {
-        let mut future = unsafe { Pin::new_unchecked(&mut future) };
-        
+    fn block_on_limited<F: Future>(future: F, max_iters: usize) -> Option<F::Output> {
+        let mut future = core::pin::pin!(future);
+
         for _ in 0..max_iters {
-            let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
-            let waker = unsafe { Waker::from_raw(raw_waker) };
-            let mut cx = Context::from_waker(&waker);
+            let mut cx = Context::from_waker(Waker::noop());
             
             match future.as_mut().poll(&mut cx) {
                 Poll::Ready(output) => return Some(output),
@@ -5786,7 +5779,7 @@ static NEON_TEST_ERRORS: AtomicU32 = AtomicU32::new(0);
 /// (RMode) are compared; the rest of FPCR is not under test.
 fn fpcr_rmode_thread(fpcr_val: u64, done: &'static AtomicBool) -> ! {
     let mut errors: u32 = 0;
-    unsafe { core::arch::asm!("msr fpcr, {}", in(reg) fpcr_val); }
+    akuma_cpu::sysreg::set_fpcr(fpcr_val);
 
     for _ in 0..30 {
         threading::yield_now();
@@ -9366,7 +9359,6 @@ pub fn test_thread_waker_roundtrip() -> bool {
 
 /// Test: block_on-style executor with real ThreadWaker completes a multi-poll future
 pub fn test_block_on_real_waker() -> bool {
-    use core::pin::Pin;
     use core::task::{Context, Poll};
 
     console::print("\n[TEST] Block-on with real ThreadWaker\n");
@@ -9375,8 +9367,7 @@ pub fn test_block_on_real_waker() -> bool {
     let waker = akuma_exec::threading::current_thread_waker();
     let mut cx = Context::from_waker(&waker);
 
-    let mut future = MultiPollFuture::new(5, true);
-    let mut future = unsafe { Pin::new_unchecked(&mut future) };
+    let mut future = core::pin::pin!(MultiPollFuture::new(5, true));
 
     let mut result = None;
     for _ in 0..20 {

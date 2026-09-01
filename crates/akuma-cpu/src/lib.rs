@@ -644,6 +644,36 @@ pub mod sysreg {
     read_only!(/// `FPCR` — floating-point control.
         fpcr, "fpcr");
 
+    /// Write `FPCR` — floating-point control (rounding mode, exception masks,
+    /// flush-to-zero).
+    ///
+    /// **Admitted for the same reason as [`set_tpidr_el0`], with more room to
+    /// spare.** The test is "safe to execute": `FPCR` selects how the FPU
+    /// *rounds*, nothing more. It re-points no state, indexes no per-slot
+    /// static, names no address, and changes no translation or privilege — a
+    /// garbage value can only make arithmetic wrong, which is not a
+    /// memory-safety property. Contrast the registers that stay `unsafe` at
+    /// their call site: `ttbr0_el1`, `vbar_el1`, `elr_el1`, `tpidr_el1` and
+    /// `tpidrro_el0` all re-point something the kernel then dereferences.
+    ///
+    /// Added 2026-09-01. The reader above already lived here, so a bare
+    /// `asm!("msr fpcr, …")` in the boot suite was the *only* `asm!` in
+    /// `src/tests.rs` and the asymmetry — read admitted, write open-coded — was
+    /// the accident. Writes to FPCR belong here.
+    #[inline(always)]
+    pub fn set_fpcr(val: u64) {
+        #[cfg(target_os = "none")]
+        {
+            // SAFETY: `msr fpcr` touches no memory and re-points no kernel
+            // state; `nomem`/`nostack` are accurate.
+            unsafe {
+                core::arch::asm!("msr fpcr, {}", in(reg) val, options(nomem, nostack));
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        let _ = val;
+    }
+
     /// `CNTVCT_EL0`, preceded by an `isb`.
     ///
     /// **Use this, not [`cntvct_el0`], to time anything.** A bare `mrs
