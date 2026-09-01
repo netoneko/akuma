@@ -10,7 +10,9 @@
 //! [`FpcacheConfig`](akuma_fpcache::FpcacheConfig). `config` therefore remains
 //! the single source of truth for the values.
 
-pub use akuma_fpcache::{invalidate_inode, len, shrink, stats_line};
+// `len` dropped from this re-export when `/proc/meminfo` moved to
+// `akuma-vfs-glue` and started calling `akuma_fpcache::len` directly.
+pub use akuma_fpcache::{invalidate_inode, shrink, stats_line};
 
 // The rest of the shim's re-exports: exceptions.rs — their production caller —
 // reached `akuma_fpcache` directly on 2026-09-01, and the only `src/` callers

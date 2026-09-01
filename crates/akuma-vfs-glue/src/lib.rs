@@ -1,7 +1,27 @@
-//! Virtual Filesystem (VFS) Layer
+//! The kernel-side VFS layer: the mount table, per-box namespaces, and `/proc`.
 //!
-//! Kernel-side VFS: owns the global mount table, provides process-aware path
-//! resolution, and re-exports types from the `akuma_vfs` crate.
+//! `akuma-vfs` owns the *vocabulary* — the `Filesystem` trait, `DirEntry`,
+//! `FsError`, path canonicalisation, the `MountTable` type. This crate owns the
+//! kernel's single **instance** of all that: the global mount table behind a
+//! spinlock, the per-box `Namespace` map that decides which mounts a container
+//! can see, the ext2-over-virtio adapter, and the synthetic `/proc`.
+//!
+//! # Why it is a crate, as of 2026-09-01
+//!
+//! It was `src/vfs/`, and it could not leave while `proc.rs` read
+//! `crate::syscall::log` and `crate::syscall::msgqueue` — because `src/syscall/`
+//! reads 37 symbols back out of here, and Cargo cannot express a cycle. Those
+//! two registries became `akuma-syscalls-log` and `akuma-syscalls-ipc` first;
+//! this crate followed. It is in turn what unblocks `src/syscall/` itself.
+//! `docs/archive/SRC_SYSCALL_EXTRACTION.md`.
+//!
+//! Everything it still needs from the binary is four function pointers
+//! ([`VfsGlueHooks`]) and four booleans ([`VfsGlueConfig`]).
+
+#![no_std]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
 
 pub mod ext2;
 pub mod proc;
@@ -12,7 +32,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
-// Re-export everything from the crate so existing `use crate::vfs::*` keeps working.
+// Re-export everything from the crate so existing `use crate::*` keeps working.
 pub use akuma_vfs::{
     DevNode, DevProbe, DirEntry, Filesystem, FsError, FsStats, Metadata, MountInfo, ResolvedMount,
     MS_RDONLY, ST_RDONLY,
@@ -157,7 +177,9 @@ pub fn init() {
     }
 }
 
-/// Sync every filesystem visible anywhere: the global mount table and every
+/// Sync every filesystem visible anywhere.
+///
+/// The global mount table and every
 /// box namespace (the same fs may appear in both; `sync` is idempotent, and a
 /// duplicate flush of an already-clean cache is free). Called from
 /// `sys_reboot` before PSCI reset/poweroff — with the ext2 write-back cache,
@@ -381,11 +403,11 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
 /// on kernels where nothing has been mmap'd yet; once populated, `resolve_inode`
 /// costs one walk, against a write that already does its own.
 fn invalidate_file_pages(path: &str) {
-    if !crate::config::SHARED_FILE_PAGES_ENABLED || crate::file_page_cache::len() == 0 {
+    if !crate::cfg_shared_file_pages_enabled() || akuma_fpcache::len() == 0 {
         return;
     }
     if let Ok(inode) = resolve_inode(path) {
-        crate::file_page_cache::invalidate_inode(inode);
+        akuma_fpcache::invalidate_inode(inode);
     }
 }
 
@@ -426,6 +448,7 @@ pub fn read_at_by_inode(path: &str, inode: u32, offset: usize, buf: &mut [u8]) -
 /// `None` when the path does not resolve, or when the filesystem has no inode
 /// addressing at all (procfs, memfs, synthetic nodes) — callers then fall back to
 /// working by path, exactly as before.
+#[must_use]
 pub fn resolve_file_id(path: &str) -> Option<(u32, u32)> {
     let resolved = resolve_mount(path)?;
     let inode = resolved.fs.resolve_inode(&resolved.rel).ok()?;
@@ -458,6 +481,7 @@ pub fn resolve_file_id(path: &str) -> Option<(u32, u32)> {
 /// Directories need no exclusion: `read_at_by_inode` refuses `S_IFDIR` exactly
 /// where the path-based `read_at` does, so a `read(2)` on a directory fd still
 /// gets `NotAFile` either way.
+#[must_use]
 pub fn open_file_ids(path: &str) -> Option<(u32, u32)> {
     if is_mtab(path) {
         return None;
@@ -582,6 +606,7 @@ pub fn remove_dir(path: &str) -> Result<(), FsError> {
 }
 
 /// Check if a path exists
+#[must_use]
 pub fn exists(path: &str) -> bool {
     if is_mtab(path) {
         return true;
@@ -791,6 +816,7 @@ pub fn remove_symlink(path: &str) -> bool {
 }
 
 /// Resolve a path, following symlinks (up to 8 levels to prevent loops)
+#[must_use]
 pub fn resolve_symlinks(path: &str) -> String {
     let mut resolved = canonicalize_path(path);
     for _ in 0..8 {
@@ -803,7 +829,7 @@ pub fn resolve_symlinks(path: &str) -> String {
                 resolved = resolve_path(parent, &t);
             }
         } else {
-            if resolved == "/bin/sh" && crate::fs::exists("/bin/dash") {
+            if resolved == "/bin/sh" && crate::fs_exists("/bin/dash") {
                 resolved = String::from("/bin/dash");
                 continue;
             }
@@ -889,12 +915,12 @@ const DEV_DIR_INO: u64 = u64::MAX - 2;
 fn dev_probe() -> DevProbe {
     let mut block_slots = 0u8;
     for idx in 0..akuma_vfs::dev::MAX_BLOCK_SLOTS {
-        if crate::block::device_name(idx).is_some() {
+        if akuma_virtio::block::device_name(idx).is_some() {
             block_slots |= 1 << idx;
         }
     }
     DevProbe {
-        audio: crate::audio::is_available(),
+        audio: crate::audio_is_available(),
         block_slots,
         // Boxes get no synthetic /dev — see `DevProbe::in_box` for why, and
         // for the two carve-outs (`null`/`zero` stat, and `/dev/net/tap0`,
@@ -913,6 +939,7 @@ fn dev_probe() -> DevProbe {
 /// Absolute paths — the shape every syscall-layer caller passes — resolve with
 /// no allocation. A relative one pays a single `String`, the same one
 /// `resolve_mount` allocates on the very next line.
+#[must_use]
 pub fn dev_node(path: &str) -> Option<DevNode> {
     if let Some(name) = path.strip_prefix("/dev/") {
         return dev_node_named(name);
@@ -930,11 +957,13 @@ pub fn dev_node(path: &str) -> Option<DevNode> {
 ///
 /// `name` is `/dev`-relative and must not contain a slash; a nested path such
 /// as `net/tap0` simply matches nothing.
+#[must_use]
 pub fn dev_node_named(name: &str) -> Option<DevNode> {
     akuma_vfs::dev::lookup(dev_probe(), name)
 }
 
 /// Whether `path` resolves to `/dev` itself.
+#[must_use]
 pub fn is_dev_dir(path: &str) -> bool {
     let trimmed = path.strip_suffix('/').unwrap_or(path);
     if trimmed == DEV_DIR {
@@ -947,7 +976,9 @@ pub fn is_dev_dir(path: &str) -> bool {
 }
 
 /// Whether `name` (a `/dev`-relative block device name, e.g. `"vda"`) is the
-/// source of any mount in the global table — the check that keeps a raw
+/// source of any mount in the global table.
+///
+/// This is the check that keeps a raw
 /// write-open off a device `Ext2Filesystem` is caching
 /// (`proposals/RAW_BLOCK_DEVICE_FD.md` §3). Root mounts with source
 /// `/dev/vda` (`src/fs.rs`), so this strips an optional `/dev/` prefix off
@@ -1111,4 +1142,138 @@ pub fn render_mounts(viewer_box_id: u64, target_pid: Option<u32>, buf: &mut [u8]
     }
 
     pos
+}
+
+// ===========================================================================
+// What this layer still needs from the binary
+// ===========================================================================
+
+/// The four things `/proc` reports that only the binary can answer.
+///
+/// Deliberately tiny, and it stayed tiny by checking each candidate first:
+/// `crate::block` turned out to be a re-export of `akuma_virtio::block`,
+/// `crate::pmm::stats` and the file-page-cache pair already live in
+/// `akuma-pmm`/`akuma-fpcache`, and `crate::timer::uptime_us` is
+/// `akuma_primitives::clock`. What is left is genuinely binary-local: an inline
+/// `mod audio` in `main.rs`, the VFS-glue-facing half of `src/fs.rs`, the SMP
+/// topology probe, and the wall clock (which needs the binary's boot uptime to
+/// turn monotonic microseconds into UTC).
+///
+/// Unregistered is quiet, not fatal — every getter below has a defined answer
+/// with no hooks installed, so host tests and early boot read a coherent
+/// (if empty) `/proc` rather than panicking. Same contract as
+/// `akuma_primitives::console::print_str`.
+#[derive(Clone, Copy)]
+pub struct VfsGlueHooks {
+    /// `crate::audio::is_available` — whether `/proc/audio` reports a device.
+    pub audio_is_available: fn() -> bool,
+    /// `crate::fs::exists` — path probe against the binary's own FS front door.
+    pub fs_exists: fn(&str) -> bool,
+    /// `crate::smp_shared::probed_core_count` — DTB-probed core count for `/proc/cores`.
+    pub probed_core_count: fn() -> usize,
+    /// `crate::timer::utc_time_us` — wall clock, `None` before NTP/RTC sets it.
+    pub utc_time_us: fn() -> Option<u64>,
+}
+
+static HOOKS: akuma_primitives::OnceCopy<VfsGlueHooks> = akuma_primitives::OnceCopy::new();
+
+/// Install the binary's callbacks. Idempotent, per `OnceCopy`.
+pub fn set_hooks(h: VfsGlueHooks) {
+    HOOKS.set(h);
+}
+
+fn audio_is_available() -> bool {
+    HOOKS.get().is_some_and(|h| (h.audio_is_available)())
+}
+
+fn fs_exists(path: &str) -> bool {
+    HOOKS.get().is_some_and(|h| (h.fs_exists)(path))
+}
+
+/// Gated exactly like its only caller, `proc::active_core_count`: without real
+/// SMP there is one core and nothing to ask the binary about.
+#[cfg(kernel_smp_shared)]
+fn probed_core_count() -> usize {
+    HOOKS.get().map_or(1, |h| (h.probed_core_count)())
+}
+
+fn utc_time_us() -> Option<u64> {
+    HOOKS.get().and_then(|h| (h.utc_time_us)())
+}
+
+/// Tunables. `src/config.rs` stays the single source of truth; `src/vfs.rs`
+/// reads the consts and calls [`init`].
+///
+/// Four of these are `bool`, which clippy dislikes on principle. They stay
+/// separate fields because each one mirrors a *named const in `src/config.rs`*
+/// one-for-one, and collapsing them into a bitflags type would put a second,
+/// differently-shaped copy of that list in the tree — exactly what keeping
+/// `src/config.rs` authoritative is meant to prevent.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug)]
+pub struct VfsGlueConfig {
+    pub proc_syscall_log_enabled: bool,
+    pub proc_sysvipc_enabled: bool,
+    pub shared_file_pages_enabled: bool,
+    pub syscall_debug_info_enabled: bool,
+    /// Thread-table size — `/proc` iterates slots up to this.
+    pub max_threads: usize,
+    /// Cap on a captured `/proc/<pid>/stdout`.
+    pub proc_stdout_max_size: usize,
+}
+
+static CFG: akuma_primitives::OnceCopy<VfsGlueConfig> = akuma_primitives::OnceCopy::new();
+
+/// Install the tunables. Idempotent.
+///
+/// Named `set_config`, not `init`: this crate already has an `init` that mounts
+/// the root filesystem, and two functions called `init` on one type is how a
+/// caller ends up doing only half of what it meant to.
+pub fn set_config(cfg: VfsGlueConfig) {
+    CFG.set(cfg);
+}
+
+/// `src/config.rs` forces this `false` on `kernel_profile_extreme`, and the
+/// duplicated `const false` here is deliberate: it is what lets the optimiser
+/// delete the `/proc/<pid>/syscalls` renderer from that image instead of merely
+/// never calling it. Handing the flag over as runtime config cost 4 KB of
+/// `extreme-size` `.text` until this arm existed. The *value* still comes from
+/// `src/config.rs` on every other profile — see this crate's build.rs.
+#[cfg(kernel_profile_extreme)]
+const fn cfg_proc_syscall_log_enabled() -> bool {
+    false
+}
+
+#[cfg(not(kernel_profile_extreme))]
+fn cfg_proc_syscall_log_enabled() -> bool {
+    CFG.get().is_some_and(|c| c.proc_syscall_log_enabled)
+}
+
+/// Same trade as [`cfg_proc_syscall_log_enabled`]: `extreme-size` gates out the
+/// `sc-sysv-ipc` family entirely, so the view has nothing to show and the
+/// renderer should not be in the image.
+#[cfg(kernel_profile_extreme)]
+const fn cfg_proc_sysvipc_enabled() -> bool {
+    false
+}
+
+#[cfg(not(kernel_profile_extreme))]
+fn cfg_proc_sysvipc_enabled() -> bool {
+    CFG.get().is_some_and(|c| c.proc_sysvipc_enabled)
+}
+
+fn cfg_shared_file_pages_enabled() -> bool {
+    CFG.get().is_some_and(|c| c.shared_file_pages_enabled)
+}
+
+fn cfg_syscall_debug_info_enabled() -> bool {
+    CFG.get().is_some_and(|c| c.syscall_debug_info_enabled)
+}
+
+fn cfg_max_threads() -> usize {
+    CFG.get().map_or(256, |c| c.max_threads)
+}
+
+fn cfg_proc_stdout_max_size() -> usize {
+    CFG.get().map_or(64 * 1024, |c| c.proc_stdout_max_size)
 }

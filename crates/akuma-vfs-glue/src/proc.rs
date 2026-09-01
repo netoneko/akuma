@@ -21,7 +21,6 @@ use alloc::format;
 use core::fmt::Write as _;
 
 use super::{DirEntry, Filesystem, FsError, FsStats, Metadata};
-use crate::config::{MAX_THREADS, PROC_STDOUT_MAX_SIZE};
 use akuma_exec::{process::{self, Pid, ProcessState}, threading};
 
 // ============================================================================
@@ -68,8 +67,10 @@ fn caller_box_id() -> u64 {
     akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id)
 }
 
-/// Render a `/proc/mounts` listing for the **read** paths. The mount
-/// spinlocks are held only inside `crate::vfs::render_mounts`, which writes
+/// Render a `/proc/mounts` listing for the **read** paths.
+///
+/// The mount
+/// spinlocks are held only inside `crate::render_mounts`, which writes
 /// into the stack buffer below allocation-free; the `.to_vec()` copy happens
 /// after the locks are gone and exists only because the `Filesystem` trait's
 /// `read_file` returns `Vec<u8>` — the same contract every procfs virtual
@@ -79,6 +80,7 @@ fn caller_box_id() -> u64 {
 /// `target_pid` selects whose mount set is listed; `None` (or an unknown
 /// pid) means the global table. Returns `None` when the viewer may not see
 /// the target (box rule) — callers turn that into `NotFound`.
+#[must_use]
 pub fn mounts_bytes(target_pid: Option<Pid>, viewer_box_id: u64) -> Option<Vec<u8>> {
     if let Some(pid) = target_pid {
         let proc = process::lookup_process_shared(pid)?;
@@ -87,7 +89,7 @@ pub fn mounts_bytes(target_pid: Option<Pid>, viewer_box_id: u64) -> Option<Vec<u
         }
     }
     let mut buf = [0u8; 2048];
-    let n = crate::vfs::render_mounts(viewer_box_id, target_pid, &mut buf);
+    let n = crate::render_mounts(viewer_box_id, target_pid, &mut buf);
     Some(buf[..n].to_vec())
 }
 
@@ -206,7 +208,7 @@ use akuma_exec::threading::types::MAX_CORES;
 /// allocating.
 #[cfg(kernel_smp_shared)]
 fn active_core_count() -> usize {
-    crate::smp_shared::probed_core_count().clamp(1, MAX_CORES)
+    crate::probed_core_count().clamp(1, MAX_CORES)
 }
 #[cfg(not(kernel_smp_shared))]
 fn active_core_count() -> usize {
@@ -230,7 +232,7 @@ fn cpu_time_snapshot() -> (u64, [u64; MAX_CORES], usize) {
     let cores = active_core_count();
     let mut per_core = [0u64; MAX_CORES];
     let mut total = 0u64;
-    for tid in 0..MAX_THREADS {
+    for tid in 0..crate::cfg_max_threads() {
         let us = threading::get_thread_cpu_time(tid);
         if us == 0 {
             continue;
@@ -253,7 +255,7 @@ fn cpu_time_snapshot() -> (u64, [u64; MAX_CORES], usize) {
 /// two reads (the only thing `top` actually needs from it).
 fn render_stat_system(buf: &mut [u8]) -> usize {
     use akuma_primitives::console::FmtBuf;
-    let uptime_us = crate::timer::uptime_us();
+    let uptime_us = akuma_primitives::clock::uptime_us();
     let (busy_total, busy_per_core, cores) = cpu_time_snapshot();
     let idle_total = (uptime_us.saturating_mul(cores as u64)).saturating_sub(busy_total) / JIFFY_US;
     let user_total = busy_total / JIFFY_US;
@@ -282,17 +284,17 @@ fn render_stat_system(buf: &mut [u8]) -> usize {
 /// `/proc/meminfo` — what busybox `free` reads (`MemTotal`/`MemFree`/
 /// `Buffers`/`Cached`/`SwapTotal`/`SwapFree`, matched by key prefix, not by
 /// column position). Real numbers off the PMM page allocator
-/// (`crate::pmm::stats`) and the file page cache (`crate::file_page_cache::len`,
+/// (`akuma_pmm::stats`) and the file page cache (`akuma_fpcache::len`,
 /// the reclaimable-on-demand cache `MemAvailable` accounts for). No swap
 /// exists on this kernel, so the `Swap*` fields are always 0 — a legitimate
 /// value, not a placeholder.
 fn render_meminfo(buf: &mut [u8]) -> usize {
     use akuma_primitives::console::FmtBuf;
-    let (total_pages, _allocated, free_pages) = crate::pmm::stats();
+    let (total_pages, _allocated, free_pages) = akuma_pmm::stats();
     let page_kb = (akuma_pmm::PAGE_SIZE / 1024) as u64;
     let total_kb = total_pages as u64 * page_kb;
     let free_kb = free_pages as u64 * page_kb;
-    let cached_kb = crate::file_page_cache::len() as u64 * page_kb;
+    let cached_kb = akuma_fpcache::len() as u64 * page_kb;
     let available_kb = free_kb + cached_kb;
 
     let mut pos = 0usize;
@@ -313,7 +315,7 @@ fn render_meminfo(buf: &mut [u8]) -> usize {
 /// Linux SMP semantics (summed across every core, so it can exceed wall time).
 fn render_uptime(buf: &mut [u8]) -> usize {
     use akuma_primitives::console::FmtBuf;
-    let uptime_us = crate::timer::uptime_us();
+    let uptime_us = akuma_primitives::clock::uptime_us();
     let (busy_total, _busy_per_core, cores) = cpu_time_snapshot();
     let idle_us = (uptime_us.saturating_mul(cores as u64)).saturating_sub(busy_total);
     let mut pos = 0usize;
@@ -350,6 +352,7 @@ pub struct ProcFilesystem;
 
 impl ProcFilesystem {
     /// Create a new procfs instance
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -401,6 +404,7 @@ impl ProcFilesystem {
 
     /// Returns a human-readable description string for an fd entry (used by readlinkat).
     /// These strings are NOT necessarily valid filesystem paths.
+    #[must_use]
     pub fn fd_description(fd_entry: &akuma_exec::process::FileDescriptor, fd: u32) -> String {
         use akuma_exec::process::FileDescriptor;
         match fd_entry {
@@ -424,7 +428,7 @@ impl ProcFilesystem {
             FileDescriptor::Stderr => String::from("/dev/stderr"),
             FileDescriptor::ChildStdout(child_pid) => format!("pipe:[child:{child_pid}]"),
             FileDescriptor::PidFd(id) => format!("anon_inode:[pidfd:{id}]"),
-            FileDescriptor::BlockDev { idx, .. } => match crate::block::device_name(*idx as usize) {
+            FileDescriptor::BlockDev { idx, .. } => match akuma_virtio::block::device_name(*idx as usize) {
                 Some(name) => format!("/dev/{name}"),
                 None => format!("blockdev:[{idx}]"),
             },
@@ -474,7 +478,7 @@ impl ProcFilesystem {
                 }
 
                 // Write with size limit (thread-safe via Spinlock)
-                target.stdout.lock().write_with_limit(data, PROC_STDOUT_MAX_SIZE);
+                target.stdout.lock().write_with_limit(data, crate::cfg_proc_stdout_max_size());
                 Ok(data.len())
             }
             _ => Err(FsError::NotFound),
@@ -489,8 +493,10 @@ impl Default for ProcFilesystem {
 }
 
 /// Returns the readlinkat description string for a procfs fd path like "/proc/<pid>/fd/<n>".
+///
 /// Unlike `read_symlink`, this returns descriptions for ALL fd types (pipes, sockets, etc.),
 /// not just File fds. Used by the readlinkat syscall to report virtual fd targets.
+#[must_use]
 pub fn proc_fd_description(path: &str) -> Option<String> {
     let path = path.trim_start_matches('/');
     // Strip leading "proc/" if present
@@ -576,7 +582,7 @@ impl Filesystem for ProcFilesystem {
 
             // Mount listing + supported filesystems. Rendered per-viewer: a
             // boxed process sees its own namespace's mounts with no source
-            // column (crate::vfs::render_mounts).
+            // column (crate::render_mounts).
             entries.push(DirEntry {
                 name: String::from("mounts"),
                 is_dir: false,
@@ -606,8 +612,8 @@ impl Filesystem for ProcFilesystem {
             // the unfiltered list here is what put every host pid into a
             // container's `ls /proc`, while `ps` looked correct because it stats
             // each entry and the foreign ones are refused.
-            if crate::config::PROC_SYSCALL_LOG_ENABLED {
-                let logged_pids = crate::syscall::log::list_pids_with_logs(current_box_id);
+            if crate::cfg_proc_syscall_log_enabled() {
+                let logged_pids = akuma_syscalls_log::list_pids_with_logs(current_box_id);
                 let live_pids: alloc::collections::BTreeSet<u32> = entries.iter()
                     .filter_map(|e| e.name.parse::<u32>().ok())
                     .collect();
@@ -624,7 +630,7 @@ impl Filesystem for ProcFilesystem {
             }
 
             // sysvipc directory
-            if crate::config::PROC_SYSVIPC_ENABLED {
+            if crate::cfg_proc_sysvipc_enabled() {
                 entries.push(DirEntry {
                     name: String::from("sysvipc"),
                     is_dir: true,
@@ -647,7 +653,7 @@ impl Filesystem for ProcFilesystem {
                 ]);
             }
 
-            if parts[0] == "sysvipc" && crate::config::PROC_SYSVIPC_ENABLED {
+            if parts[0] == "sysvipc" && crate::cfg_proc_sysvipc_enabled() {
                 return Ok(alloc::vec![
                     DirEntry { name: String::from("msg"), is_dir: false, is_symlink: false, size: 0 },
                 ]);
@@ -656,8 +662,8 @@ impl Filesystem for ProcFilesystem {
             // /<pid> - list "fd" directory and optionally "syscalls"
             let pid: Pid = parts[0].parse().map_err(|_| FsError::NotFound)?;
             // Process may have exited but still have a retained log
-            let pid_has_log = crate::config::PROC_SYSCALL_LOG_ENABLED
-                && crate::syscall::log::get_formatted(pid, current_box_id).is_some();
+            let pid_has_log = crate::cfg_proc_syscall_log_enabled()
+                && akuma_syscalls_log::get_formatted(pid, current_box_id).is_some();
             if !Self::process_visible(pid, current_box_id) && !pid_has_log {
                 return Err(FsError::NotFound);
             }
@@ -694,8 +700,8 @@ impl Filesystem for ProcFilesystem {
                     size: 0,
                 });
             }
-            if crate::config::PROC_SYSCALL_LOG_ENABLED
-                && crate::syscall::log::get_formatted(pid, current_box_id).is_some()
+            if crate::cfg_proc_syscall_log_enabled()
+                && akuma_syscalls_log::get_formatted(pid, current_box_id).is_some()
             {
                 pid_entries.push(DirEntry {
                     name: String::from("syscalls"),
@@ -806,11 +812,11 @@ impl Filesystem for ProcFilesystem {
         // Handle <pid>/syscalls. `get_formatted` applies the box rule itself —
         // this is the method a `read()` actually lands in, and it is the one that
         // used to have no isolation check at all.
-        if crate::config::PROC_SYSCALL_LOG_ENABLED {
+        if crate::cfg_proc_syscall_log_enabled() {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
             if parts.len() == 2 && parts[1] == "syscalls"
                 && let Ok(pid) = parts[0].parse::<Pid>() {
-                    let data = crate::syscall::log::get_formatted(pid, caller_box_id())
+                    let data = akuma_syscalls_log::get_formatted(pid, caller_box_id())
                         .ok_or(FsError::NotFound)?;
                     if offset >= data.len() {
                         return Ok(0);
@@ -928,8 +934,8 @@ impl Filesystem for ProcFilesystem {
             }
             
             let boxes = process::list_boxes();
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
-                crate::safe_print!(128, "[ProcFS] Reading boxes (count={})\n", boxes.len());
+            if crate::cfg_syscall_debug_info_enabled() {
+                akuma_primitives::safe_print!(128, "[ProcFS] Reading boxes (count={})\n", boxes.len());
             }
             let mut out = String::from("ID,NAME,ROOT,CREATOR,PRIMARY\n");
             for b in boxes {
@@ -998,7 +1004,7 @@ impl Filesystem for ProcFilesystem {
 
         // /proc/mounts — the viewer's own mount set (its namespace if boxed,
         // the global table on the host). A box sees which paths are mounted
-        // into it, never where they came from — crate::vfs::render_mounts
+        // into it, never where they came from — crate::render_mounts
         // enforces that and keeps the whole render allocation-free.
         if path == "mounts" {
             let pid = process::current_process_shared().map(|p| p.pid);
@@ -1040,8 +1046,8 @@ impl Filesystem for ProcFilesystem {
         }
 
         #[cfg(feature = "sc-sysv-ipc")]
-        if path == "sysvipc/msg" && crate::config::PROC_SYSVIPC_ENABLED {
-            let queues = crate::syscall::msgqueue::list_msg_queues();
+        if path == "sysvipc/msg" && crate::cfg_proc_sysvipc_enabled() {
+            let queues = akuma_syscalls_ipc::list_msg_queues();
             let mut out = String::from(
                 "       key      msqid perms      cbytes       qnum lspid lrpid   stime   rtime   ctime\n"
             );
@@ -1062,11 +1068,11 @@ impl Filesystem for ProcFilesystem {
         // process table, which cannot answer for a pid that has already exited —
         // and an exited pid is exactly what a retained log is for, so it fell open.
         // The log carries its own `box_id` now and decides for itself.
-        if crate::config::PROC_SYSCALL_LOG_ENABLED {
+        if crate::cfg_proc_syscall_log_enabled() {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
             if parts.len() == 2 && parts[1] == "syscalls"
                 && let Ok(pid) = parts[0].parse::<Pid>() {
-                    return crate::syscall::log::get_formatted(pid, current_box_id)
+                    return akuma_syscalls_log::get_formatted(pid, current_box_id)
                         .ok_or(FsError::NotFound);
                 }
         }
@@ -1193,7 +1199,7 @@ impl Filesystem for ProcFilesystem {
             return true;
         }
 
-        if crate::config::PROC_SYSVIPC_ENABLED && (path == "sysvipc" || path == "sysvipc/msg") {
+        if crate::cfg_proc_sysvipc_enabled() && (path == "sysvipc" || path == "sysvipc/msg") {
             return true;
         }
 
@@ -1210,8 +1216,8 @@ impl Filesystem for ProcFilesystem {
             let parts: Vec<&str> = path.split('/').collect();
             if parts.len() == 1 {
                 if Self::process_visible(pid, current_box_id) { return true; }
-                if crate::config::PROC_SYSCALL_LOG_ENABLED {
-                    return crate::syscall::log::get_formatted(pid, current_box_id).is_some();
+                if crate::cfg_proc_syscall_log_enabled() {
+                    return akuma_syscalls_log::get_formatted(pid, current_box_id).is_some();
                 }
                 return false;
             }
@@ -1221,8 +1227,8 @@ impl Filesystem for ProcFilesystem {
             if parts.len() == 2 && (parts[1] == "cmdline" || parts[1] == "status" || parts[1] == "stat") {
                 return Self::process_visible(pid, current_box_id);
             }
-            if parts.len() == 2 && parts[1] == "syscalls" && crate::config::PROC_SYSCALL_LOG_ENABLED {
-                return crate::syscall::log::get_formatted(pid, current_box_id).is_some();
+            if parts.len() == 2 && parts[1] == "syscalls" && crate::cfg_proc_syscall_log_enabled() {
+                return akuma_syscalls_log::get_formatted(pid, current_box_id).is_some();
             }
         }
 
@@ -1276,7 +1282,7 @@ impl Filesystem for ProcFilesystem {
             let size = if path == "mounts" {
                 let pid = process::current_process_shared().map(|p| p.pid);
                 let mut probe = [0u8; 2048];
-                crate::vfs::render_mounts(caller_box_id(), pid, &mut probe) as u64
+                crate::render_mounts(caller_box_id(), pid, &mut probe) as u64
             } else {
                 0
             };
@@ -1322,7 +1328,7 @@ impl Filesystem for ProcFilesystem {
                         return Err(FsError::NotFound);
                     }
                     let mut probe = [0u8; 2048];
-                    let size = crate::vfs::render_mounts(caller_box_id(), Some(pid), &mut probe) as u64;
+                    let size = crate::render_mounts(caller_box_id(), Some(pid), &mut probe) as u64;
                     return Ok(Metadata {
                         is_dir: false,
                         size,
@@ -1359,7 +1365,7 @@ impl Filesystem for ProcFilesystem {
             });
         }
 
-        if crate::config::PROC_SYSVIPC_ENABLED && path == "sysvipc" {
+        if crate::cfg_proc_sysvipc_enabled() && path == "sysvipc" {
             return Ok(Metadata {
                 is_dir: true,
                 size: 0,
@@ -1371,7 +1377,7 @@ impl Filesystem for ProcFilesystem {
             });
         }
 
-        if crate::config::PROC_SYSVIPC_ENABLED && path == "sysvipc/msg" {
+        if crate::cfg_proc_sysvipc_enabled() && path == "sysvipc/msg" {
             return Ok(Metadata {
                 is_dir: false,
                 size: 0,
@@ -1409,8 +1415,8 @@ impl Filesystem for ProcFilesystem {
         if let Ok(pid) = Self::parse_pid_path(path) {
             let parts: Vec<&str> = path.split('/').collect();
             // <pid>/syscalls
-            if parts.len() == 2 && parts[1] == "syscalls" && crate::config::PROC_SYSCALL_LOG_ENABLED {
-                if crate::syscall::log::get_formatted(pid, caller_box_id()).is_some() {
+            if parts.len() == 2 && parts[1] == "syscalls" && crate::cfg_proc_syscall_log_enabled() {
+                if akuma_syscalls_log::get_formatted(pid, caller_box_id()).is_some() {
                     return Ok(Metadata {
                         is_dir: false,
                         size: 0,
@@ -1450,8 +1456,8 @@ impl Filesystem for ProcFilesystem {
                 });
             }
             let pid_exists = Self::process_visible(pid, caller_box_id())
-                || (crate::config::PROC_SYSCALL_LOG_ENABLED
-                    && crate::syscall::log::get_formatted(pid, caller_box_id()).is_some());
+                || (crate::cfg_proc_syscall_log_enabled()
+                    && akuma_syscalls_log::get_formatted(pid, caller_box_id()).is_some());
             if !pid_exists {
                 return Err(FsError::NotFound);
             }

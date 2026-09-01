@@ -1,0 +1,14 @@
+[package]
+name = "akuma-syscalls-log"
+version = "0.1.0"
+edition = "2024"
+description = "Per-pid syscall trace rings, retained past exit and published through /proc"
+
+[dependencies]
+# `irq::with_irqs_disabled` around every touch of the ring, and `clock::uptime_us`
+# for the exit stamp the retention window is measured from.
+akuma-primitives = { path = "../akuma-primitives" }
+spinning_top = "0.3"
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "akuma-syscalls-ipc"
+version = "0.1.0"
+edition = "2024"
+description = "The System V message-queue syscall family (msgget/msgctl/msgsnd/msgrcv)"
+
+[dependencies]
+# `errno::negated::*` for the return codes, and `irq`/`clock` reached through it.
+akuma-primitives = { path = "../akuma-primitives" }
+# `user_access` for the msgp copies, and `threading` for the poller wake handles.
+akuma-exec = { path = "../akuma-exec" }
+spinning_top = "0.3"
+
+[lints]
+workspace = true

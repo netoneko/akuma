@@ -33,6 +33,9 @@ default-members = [
     "crates/akuma-scheduler",
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-linux",
+    "crates/akuma-vfs-glue",
+    "crates/akuma-syscalls-ipc",
+    "crates/akuma-syscalls-log",
     "crates/akuma-syscalls-mem",
     "crates/akuma-syscalls-poll",
     "crates/akuma-syscalls-sync",
@@ -246,7 +249,7 @@ rump-tests = []
 # passing) and a same-binary `bkl-profile` A/B on the contention regimen
 # (`irq/sched` 24.7% → 10.2%, 6/6 digests exact both sides). Remove from this
 # list to A/B.
-smp-shared = ["akuma-exec/smp-shared", "akuma-exceptions/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-exceptions/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
@@ -550,7 +553,7 @@ rump = ["akuma-net/rump", "dep:akuma-rump"]
 # (rump-only, deferred) no longer picks up `smp-shared` transitively — it never
 # asked for it, but if that build is ever meant to have real SMP it must now say
 # so explicitly.
-sc-reboot = ["dep:akuma-boot"]
+sc-reboot = ["dep:akuma-boot", "akuma-vfs-glue/sc-reboot"]
 # The native smoltcp TCP/IP stack (NIC0): the in-kernel socket syscalls, DNS/HTTP,
 # and the built-in SSH server are all built on it. In `default`; the devbox build
 # drops it (rump is the only stack) via --no-default-features, which compiles the
@@ -577,7 +580,7 @@ sound = ["virtio-drivers/alloc", "akuma-virtio/sound"]
 # Forwarded to akuma-exec and akuma-ext2 so their build.rs emits the same cfg
 # (warm-stack floor + kernel-stack right-sizing in akuma-exec; block-cache gate
 # in akuma-ext2).
-extreme = ["akuma-exec/extreme", "akuma-ext2/extreme", "akuma-primitives/extreme"]
+extreme = ["akuma-exec/extreme", "akuma-ext2/extreme", "akuma-primitives/extreme", "akuma-vfs-glue/extreme"]
 
 # Large RAM-sized ext2 block cache with clock eviction (crates/akuma-ext2). Keeps
 # the read-only toolchain resident across the many process spawns in a self-host
@@ -602,8 +605,8 @@ fs-cache = ["akuma-ext2/fs-cache"]
 # syscall; the minimal builds use --no-default-features and re-add what they want.
 # Tier 1 — pure dead weight, no akuma-exec callbacks.
 sc-aio          = []
-sc-sysv-ipc     = []
-sc-containers   = []
+sc-sysv-ipc     = ["dep:akuma-syscalls-ipc", "akuma-vfs-glue/sc-sysv-ipc"]
+sc-containers   = ["akuma-vfs-glue/sc-containers"]
 sc-timerfd      = []
 # Tier 2 — each needs a no-op ExecRuntime callback stub when off (see main.rs).
 sc-eventfd      = []
@@ -756,6 +759,22 @@ akuma-syscalls-linux = { path = "crates/akuma-syscalls-linux" }
 # that is a requirement, not a happy accident (docs/archive/
 # AKUMA_EXTRACT_SYSCALLS.md §7 — the dispatch is the hottest function here).
 akuma-syscalls = { path = "crates/akuma-syscalls" }
+
+# Per-pid syscall trace rings behind `/proc/<pid>/syscalls`. Split out of
+# `src/syscall/` so `src/vfs/proc.rs` can read them without `src/vfs/` depending
+# on `src/syscall/`, which reads 37 symbols back the other way — see
+# docs/archive/SRC_SYSCALL_EXTRACTION_SURVEY.md Blocker 1.
+akuma-syscalls-log = { path = "crates/akuma-syscalls-log" }
+
+# The kernel-side VFS layer (mount table, per-box namespaces, /proc). Was
+# `src/vfs/`; see docs/archive/SRC_SYSCALL_EXTRACTION_SURVEY.md.
+akuma-vfs-glue = { path = "crates/akuma-vfs-glue" }
+
+# The SysV message-queue family. Split out for the same cycle as -log: /proc
+# lists the queues. Optional and gated on `sc-sysv-ipc` exactly as the module it
+# replaced was, so `extreme-size` (--no-default-features) still compiles none of
+# it — the crate split must not quietly re-add ~440 lines to the 4 MB floor.
+akuma-syscalls-ipc = { path = "crates/akuma-syscalls-ipc", optional = true }
 # The futex family's pure logic: op decode, the (tgid, uaddr) waiter table, the
 # deadline algebra, the WAKE_OP opcode and the wait loop's outcome decision. A
 # family implementation on the akuma-syscalls-time model (AKUMA_EXTRACT_SYSCALLS.md

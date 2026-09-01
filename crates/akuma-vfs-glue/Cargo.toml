@@ -1,0 +1,50 @@
+[package]
+name = "akuma-vfs-glue"
+version = "0.1.0"
+edition = "2024"
+description = "The kernel-side VFS layer: mount table, per-box namespaces, and the /proc filesystem"
+
+[dependencies]
+# The filesystem traits, path helpers and `MountTable` this layer instantiates.
+akuma-vfs = { path = "../akuma-vfs" }
+# `Namespace` — the per-box mount view `with_fs` resolves through.
+akuma-isolation = { path = "../akuma-isolation" }
+# Process/thread state `/proc` reports on, and the ext2 backing store's inode pins.
+akuma-exec = { path = "../akuma-exec" }
+akuma-ext2 = { path = "../akuma-ext2" }
+# The virtio block devices ext2 mounts sit on (`crate::block` was already a
+# re-export of this).
+akuma-virtio = { path = "../akuma-virtio" }
+# `/proc/meminfo` and friends.
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-fpcache = { path = "../akuma-fpcache" }
+# Uptime for `/proc/uptime`; `safe_print!`/`tprint!`; `Spinlock`.
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-timer = { path = "../akuma-timer" }
+# `/proc/net/tcp` lists the socket table. `default-features = false` matches the
+# binary: the rump-only devbox compiles smoltcp out and still needs this crate.
+akuma-net = { path = "../akuma-net", default-features = false }
+spinning_top = "0.3"
+
+# `/proc/<pid>/syscalls` and `/proc/sysvipc/msg`. These two are why the layer
+# could not leave `src/` until 2026-09-01: they used to be `crate::syscall::…`,
+# and `src/syscall/` reads 37 symbols back out of here — a cycle Cargo cannot
+# express. See docs/archive/SRC_SYSCALL_EXTRACTION.md Blocker 1.
+akuma-syscalls-log = { path = "../akuma-syscalls-log" }
+akuma-syscalls-ipc = { path = "../akuma-syscalls-ipc", optional = true }
+
+[features]
+# All four are forwarded from the bin, which owns the real definitions. They gate
+# exactly what they gated when this code was `src/vfs/`: `extreme-size` builds
+# --no-default-features and must not gain a byte of container, reboot-sync or
+# SysV-IPC code from the crate split.
+sc-sysv-ipc = ["dep:akuma-syscalls-ipc"]
+sc-containers = []
+# Discriminates extreme-size from size in build.rs; forwarded from the bin.
+extreme = []
+sc-reboot = []
+# So build.rs can emit `kernel_smp_shared` — see its header for why that matters.
+smp-shared = []
+
+[lints]
+workspace = true

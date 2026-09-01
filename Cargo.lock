@@ -28,7 +28,9 @@ dependencies = [
  "akuma-psci",
  "akuma-rump",
  "akuma-syscalls",
+ "akuma-syscalls-ipc",
  "akuma-syscalls-linux",
+ "akuma-syscalls-log",
  "akuma-syscalls-mem",
  "akuma-syscalls-poll",
  "akuma-syscalls-sync",
@@ -37,6 +39,7 @@ dependencies = [
  "akuma-timer",
  "akuma-uart",
  "akuma-vfs",
+ "akuma-vfs-glue",
  "akuma-virtio",
  "embedded-io-async",
  "log",
@@ -297,8 +300,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-syscalls-ipc"
+version = "0.1.0"
+dependencies = [
+ "akuma-exec",
+ "akuma-primitives",
+ "spinning_top",
+]
+
+[[package]]
 name = "akuma-syscalls-linux"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-syscalls-log"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+ "spinning_top",
+]
 
 [[package]]
 name = "akuma-syscalls-mem"
@@ -362,6 +382,25 @@ dependencies = [
 name = "akuma-vfs"
 version = "0.1.0"
 dependencies = [
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-vfs-glue"
+version = "0.1.0"
+dependencies = [
+ "akuma-exec",
+ "akuma-ext2",
+ "akuma-fpcache",
+ "akuma-isolation",
+ "akuma-net",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-syscalls-ipc",
+ "akuma-syscalls-log",
+ "akuma-timer",
+ "akuma-vfs",
+ "akuma-virtio",
  "spinning_top",
 ]
 

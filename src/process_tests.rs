@@ -17162,7 +17162,7 @@ fn test_msgqueue_send_wakes_receiver() {
     let test_tid = find_free_thread_slots(1).first().copied();
     let tid = if let Some(t) = test_tid { t } else {
         console::print("[Test] msgqueue_send_wakes_receiver SKIPPED: no free thread slot\n");
-        sys_msgctl(msqid, IPC_RMID, 0);
+        let _ = sys_msgctl(msqid, IPC_RMID, 0);
         return;
     };
 
@@ -17175,7 +17175,7 @@ fn test_msgqueue_send_wakes_receiver() {
     let registered = msgqueue_is_recv_poller(0, msqid, tid);
 
     // Push a message — should wake the receiver
-    msgqueue_push_direct(0, msqid, 1, b"hello");
+    let _ = msgqueue_push_direct(0, msqid, 1, b"hello");
 
     // Check: thread should be READY, poller set should be empty
     let state = threading::get_thread_state(tid);
@@ -17187,7 +17187,7 @@ fn test_msgqueue_send_wakes_receiver() {
     threading::set_woken_state(tid, false);
 
     // Cleanup
-    sys_msgctl(msqid, IPC_RMID, 0);
+    let _ = sys_msgctl(msqid, IPC_RMID, 0);
 
     if registered && state == thread_state::READY && woken && pollers_after == 0 {
         console::print("[Test] msgqueue_send_wakes_receiver PASSED\n");
@@ -17211,13 +17211,13 @@ fn test_msgqueue_recv_wakes_sender() {
     let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as u32;
 
     // Put a message in the queue so we can pop it
-    msgqueue_push_direct(0, msqid, 1, b"data");
+    let _ = msgqueue_push_direct(0, msqid, 1, b"data");
 
     // A free slot stands in for a sender parked in msgsnd.
     let test_tid = find_free_thread_slots(1).first().copied();
     let tid = if let Some(t) = test_tid { t } else {
         console::print("[Test] msgqueue_recv_wakes_sender SKIPPED: no free thread slot\n");
-        sys_msgctl(msqid, IPC_RMID, 0);
+        let _ = sys_msgctl(msqid, IPC_RMID, 0);
         return;
     };
 
@@ -17236,7 +17236,7 @@ fn test_msgqueue_recv_wakes_sender() {
     // Restore
     threading::set_thread_state(tid, thread_state::FREE);
     threading::set_woken_state(tid, false);
-    sys_msgctl(msqid, IPC_RMID, 0);
+    let _ = sys_msgctl(msqid, IPC_RMID, 0);
 
     if msg.is_some() && state == thread_state::READY && woken && pollers_after == 0 {
         console::print("[Test] msgqueue_recv_wakes_sender PASSED\n");
@@ -17262,7 +17262,7 @@ fn test_msgqueue_rmid_wakes_pollers() {
     let tids = find_free_thread_slots(2);
     if tids.len() < 2 {
         console::print("[Test] msgqueue_rmid_wakes_pollers SKIPPED: need 2 free thread slots\n");
-        sys_msgctl(msqid, IPC_RMID, 0);
+        let _ = sys_msgctl(msqid, IPC_RMID, 0);
         return;
     }
 
@@ -17277,7 +17277,7 @@ fn test_msgqueue_rmid_wakes_pollers() {
     msgqueue_add_send_poller(0, msqid, tids[1]);
 
     // IPC_RMID should wake both
-    sys_msgctl(msqid, IPC_RMID, 0);
+    let _ = sys_msgctl(msqid, IPC_RMID, 0);
 
     let state0 = threading::get_thread_state(tids[0]);
     let state1 = threading::get_thread_state(tids[1]);
@@ -17316,7 +17316,7 @@ fn test_msgqueue_nowait_returns_immediately() {
     let msg_count = msgqueue_message_count(0, msqid);
 
     // Cleanup
-    sys_msgctl(msqid, IPC_RMID, 0);
+    let _ = sys_msgctl(msqid, IPC_RMID, 0);
 
     if recv_pollers == 0 && send_pollers == 0 && msg_count == 0 {
         console::print("[Test] msgqueue_nowait_returns_immediately PASSED\n");
@@ -17342,7 +17342,7 @@ fn test_msgqueue_waker_idempotent() {
     let test_tid = find_free_thread_slots(1).first().copied();
     let tid = if let Some(t) = test_tid { t } else {
         console::print("[Test] msgqueue_waker_idempotent SKIPPED: no free thread slot\n");
-        sys_msgctl(msqid, IPC_RMID, 0);
+        let _ = sys_msgctl(msqid, IPC_RMID, 0);
         return;
     };
 
@@ -17352,14 +17352,14 @@ fn test_msgqueue_waker_idempotent() {
     msgqueue_add_recv_poller(0, msqid, tid);
 
     // First push wakes the poller and clears the set
-    msgqueue_push_direct(0, msqid, 1, b"msg1");
+    let _ = msgqueue_push_direct(0, msqid, 1, b"msg1");
 
     let state_after_first = threading::get_thread_state(tid);
     let pollers_after_first = msgqueue_recv_pollers_count(0, msqid);
 
     // Second push — poller set is now empty, so no wake should happen
     // (thread is already READY, this should be harmless)
-    msgqueue_push_direct(0, msqid, 2, b"msg2");
+    let _ = msgqueue_push_direct(0, msqid, 2, b"msg2");
 
     let state_after_second = threading::get_thread_state(tid);
     let msg_count = msgqueue_message_count(0, msqid);
@@ -17367,7 +17367,7 @@ fn test_msgqueue_waker_idempotent() {
     // Restore
     threading::set_thread_state(tid, thread_state::FREE);
     threading::set_woken_state(tid, false);
-    sys_msgctl(msqid, IPC_RMID, 0);
+    let _ = sys_msgctl(msqid, IPC_RMID, 0);
 
     if state_after_first == thread_state::READY
         && pollers_after_first == 0

@@ -40,7 +40,7 @@ fn register_for_reap(fs: &Arc<Ext2Mount>) {
             return;
         }
     }
-    crate::safe_print!(
+    akuma_primitives::safe_print!(
         128,
         "[ext2] WARNING: more than {} ext2 mounts — orphaned-lock recovery is off for this one\n",
         MAX_EXT2_MOUNTS
@@ -68,8 +68,9 @@ pub fn reap_dead_thread(tid: usize) {
     }
 }
 
-/// Kernel block device adapter implementing `akuma_ext2::BlockDevice` over one
-/// registered virtio-blk device (see `crate::block`). `idx` 0 is the boot disk
+/// Kernel block device adapter implementing `akuma_ext2::BlockDevice`.
+///
+/// Wraps one registered virtio-blk device. `idx` 0 is the boot disk
 /// (`vda`); runtime `mount(2)` passes the index its `source` name resolved to.
 pub struct KernelBlockDevice {
     pub idx: usize,
@@ -77,11 +78,11 @@ pub struct KernelBlockDevice {
 
 impl BlockDevice for KernelBlockDevice {
     fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
-        crate::block::read_bytes_at(self.idx, offset, buf).map_err(|_| ())
+        akuma_virtio::block::read_bytes_at(self.idx, offset, buf).map_err(|_| ())
     }
 
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
-        crate::block::write_bytes_at(self.idx, offset, data).map_err(|_| ())
+        akuma_virtio::block::write_bytes_at(self.idx, offset, data).map_err(|_| ())
     }
 }
 
@@ -94,14 +95,14 @@ pub fn mount() -> Result<Arc<dyn Filesystem>, akuma_vfs::FsError> {
 ///
 /// Non-root instances pass `Some(cap)` so a second disk does not re-commit the
 /// whole global cache budget (the cache never shrinks — `src/fs.rs` sizing
-/// comments). Callers gate on `crate::block::device_name(idx)` first.
+/// comments). Callers gate on `akuma_virtio::block::device_name(idx)` first.
 pub fn mount_device(
     idx: usize,
     cache_cap: Option<usize>,
 ) -> Result<Arc<dyn Filesystem>, akuma_vfs::FsError> {
     let fs = Arc::new(Ext2Filesystem::new_with_cache_cap(
         KernelBlockDevice { idx },
-        || crate::timer::utc_time_us().unwrap_or(0),
+        || crate::utc_time_us().unwrap_or(0),
         cache_cap,
     )?);
     // After construction (which does device I/O) and before the filesystem is
