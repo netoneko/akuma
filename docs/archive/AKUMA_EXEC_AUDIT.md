@@ -8,8 +8,10 @@ that, by its owner's own description, "was never really audited" — the isolati
 half was cut out into `akuma-isolation` and some other pieces moved, but the
 remaining `unsafe` had never been enumerated as a set.
 
-**Result:** 123 `unsafe` sites classified into 8 kinds. Two kinds fixed
-(§4 −4 sites, §5a −1), now **118**. Three of the remaining five soundness sites
+**Result:** 123 `unsafe` sites classified into 8 kinds. Three kinds fixed
+(§4 −4 sites, §5a −1, §5c-bis −3), now **115**, and the six `&self` -> `&mut`
+casts are down to **2** — both in `address_space`, which §5-bis shows needs a
+different shape. Three of the remaining five soundness sites
 are sized and planned in §5/§6. Two incidental findings — a triplicated enum
 (§5b) and the fact that nobody has swept for either pattern tree-wide (§5c) —
 came out of the same reading.
@@ -370,6 +372,52 @@ Two sweeps are owed, and neither has been run:
 Both are mechanical to look for and neither is urgent — the system is stable and
 these are hygiene. But "we found two of these by accident in one crate" is not
 evidence that there are only two.
+
+## 5c-bis. Landed: `free_regions` and `mmap_regions` moved inside their locks (2026-09-01)
+
+The §5-bis design, applied. **5 -> 2 UB sites**, and the three that went are
+*gone*, not legalised — there is no `unsafe` in the replacement.
+
+| before | after |
+|---|---|
+| `pub vm_lock: Spinlock<()>` + `pub mmap_regions: Vec<MmapRegion>` | `pub mmap_regions: Spinlock<Vec<MmapRegion>>` |
+| `pub free_regions: Vec<(usize, usize)>` | `pub free_regions: Spinlock<Vec<(usize, usize)>>` |
+| `vm_with_regions`: `&mut *(addr_of!(self.mmap_regions) as *mut _)` | `let mut regions = self.mmap_regions.lock(); f(&mut regions)` |
+| `vm_alloc_mmap`/`vm_free_mmap`: cast to `&mut ProcessMemory` | `self.memory.alloc_mmap(size)` — the method takes `&self` and locks the free list itself |
+
+`ProcessMemory::alloc_mmap` and `free_mmap` changed receiver from `&mut self` to
+`&self`, which is what let the two `Process` wrappers drop their casts. That is
+sound because of the field audit in §5-bis: the five `usize` fields are immutable
+after `new()` and `next_mmap` is already atomic, so `&self` + a locked
+`free_regions` covers everything either method touches.
+
+### `vm_lock` is deleted
+
+It guarded nothing once both `Vec`s held their own locks — and `set_brk`, its
+last holder, had already stopped needing it in §5a. A `Spinlock<()>` beside the
+data it nominally protects is the anti-pattern that created all six casts, so
+leaving a vestigial one behind would have re-planted it. `set_brk` is now a bare
+relaxed atomic store with no lock and no IRQ masking.
+
+Doc references to `vm_lock` in `akuma-mmap`, `akuma-syscalls-mem`,
+`akuma-exec-core` and `children.rs` describe the *discipline* (short holds, no
+yield/alloc inside) which still stands; they name a field that no longer exists
+and are worth a pass.
+
+### One hold, not two, in `alloc_mmap`
+
+The free-list scan reads an index it then mutates, so the lock is taken once
+across the whole scan-and-splice rather than per-operation — releasing between
+them would let a peer invalidate `i`. It is dropped before the `next_mmap` CAS
+loop, which needs no lock.
+
+### What the readers cost
+
+Every previously lock-free `.mmap_regions` read now takes the lock — `len()`,
+`iter()`, `clone()` on the fork path, plus four boot-suite sites. That is the
+right trade here and not the one §5-bis warns about for `address_space`: these
+are fork/exec-path reads, not the per-fault `l0_phys()` reads, and they were
+racing the writers before.
 
 ## 6. Recommended order
 
