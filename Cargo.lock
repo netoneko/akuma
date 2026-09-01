@@ -157,7 +157,9 @@ dependencies = [
 name = "akuma-exec-core"
 version = "0.1.0"
 dependencies = [
+ "akuma-mmap",
  "akuma-primitives",
+ "akuma-syscalls-linux",
 ]
 
 [[package]]

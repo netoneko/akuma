@@ -10,6 +10,14 @@ description = "The unsafe-free half of akuma-exec: trap-frame/thread-slot types 
 # is NOT a plain value means the seam is drawn in the wrong place — the whole
 # point is that nothing here can touch a `Process`, a page table or a lock.
 akuma-primitives = { path = "../akuma-primitives" }
+# `MmapRegion`. NOT `akuma-mmu` — the distinction is the whole rule: `akuma-mmap`
+# is region *bookkeeping* with an empty dependency table of its own (it cannot
+# lock, allocate a frame or edit a page table), so it is a value vocabulary.
+# `akuma-mmu` is the page tables themselves, and a type that wants those does not
+# belong here — which is why `ProcessMemory` stayed behind in `akuma-exec`.
+akuma-mmap = { path = "../akuma-mmap" }
+# `open(2)` flag constants. The zero-dependency ABI crate; numbers, not behaviour.
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 
 [lints]
 workspace = true
