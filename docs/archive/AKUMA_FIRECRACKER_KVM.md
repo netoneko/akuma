@@ -685,6 +685,59 @@ other half of the ~96% CPU observation. Not investigated.
 - **Building Akuma inside the Firecracker guest** — the self-host target. Blocked
   on §5.1 only for convenience (SSH); the disk and userspace already work.
 
+### 5.5 `--no-net` silently skips everything after network init in `run_async_main` — including the rump test section
+
+**Found 2026-09-01**, while boot-verifying the `akuma-kernel-core`/
+`akuma-kernel-glue` `src/` extraction (`crates/akuma-kernel-glue/src/lib.rs`'s
+header). Not a regression from that extraction — `run_async_main` moved
+verbatim, control flow untouched — but previously undocumented, and easy to
+mistake for one if you diff a `--no-net` Firecracker boot log against a QEMU
+boot log (which gets a NIC by default) and see a whole test section missing.
+
+`run_async_main` attempts network init early; on failure it prints
+`[Net] Network init failed: ...` / `[Idle] Entering idle loop (no network)`
+and parks there — an early, non-returning branch. Everything textually after
+that call in the function, including `network_tests::run_tests()`,
+`process_tests::run_network_tests()`, and **`rump_tests::run_all_tests()`
+plus the `rump_sysproxy`/`rump_listen_accept` demos**, never runs. This is
+true even for the rump pieces that don't themselves touch the network — the
+sysproxy handshake is a kernel pipe to `/bin/rump_server`, not a socket — they
+just happen to sit after the network-init branch in source order.
+
+Confirmed via `overlays/devbox-firecracker/run.sh --no-net`: zero
+case-insensitive matches for `rump` anywhere in a 1540-line, 297-PASSED boot
+log. The same binary run with `--net` (real tap networking) is expected to
+reach the rump section the way a QEMU boot (SLIRP NIC by default) already
+does — QEMU with `RUMP_NIC=1` additionally exercises the tap-backed rump path
+(`/dev/net/tap0`, `[Test] rump_tap PASSED`) and the full sysproxy round trip
+(`rump_server` spawn, handshake, `rump_sys_socket`, `rump_listen_accept`),
+all PASSED, 0 FAILED, on 2026-09-01.
+
+**Confirmed 2026-09-01**: `overlays/devbox-firecracker/run.sh --net` (the
+default, single `eth0` interface — smoltcp, not rump's own NIC) is enough to
+clear the branch. `run_async_main` only needs network init to *succeed*, not
+specifically NIC1, so `[SmolNet] Initialized successfully` alone unblocks
+everything after it: `--- Rump Tests ---` runs and all six structural cases
+pass (`test_rump_fd_ref_survives_fork`,
+`test_run_async_main_skips_network_thread_id_under_rump_default`,
+`test_start_default_stack_registers_rump_server_tid`, the three
+`effective_poll_interval` cases) — 305 PASSED / 1 FAILED (the unrelated
+`thread_slot_reclaim_on_spawn` timing flake, §5.3-adjacent, not investigated
+here) in a `--net` boot.
+
+Two rump pieces still don't run under Firecracker, and by design rather than
+bug: `[Test] rump_tap SKIPPED (no NIC1; run QEMU with RUMP_NIC=1)` — rump's
+own tap-backed NIC1 is a *second*, separate virtio-net device in the QEMU
+runner (`RUMP_NIC=1` on `virtio-mmio-bus.4`), and
+`overlays/devbox-firecracker/run.sh` only configures the one `eth0`
+interface, with no equivalent second-NIC flag, so the tap-backed rump data
+path itself stays unexercised here. And the `rump_sysproxy`/
+`rump_listen_accept` boot demo (`run_rump()`) is gated on NIC1 being present
+too — "Boot demo — only when NIC1 is present (`RUMP_NIC=1`)" per its own doc
+comment — so it's silently absent for the same reason, not a second bug.
+Reaching either under Firecracker would need a second `network-interfaces`
+entry in the Firecracker JSON config, which nothing here currently scripts.
+
 ### 5.3 TODO: the vCPU sweep on Lima — 4, 6 and 10
 
 **Open, and deliberately Lima's job rather than metal's.** The FDT-derived device
