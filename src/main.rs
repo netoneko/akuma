@@ -24,7 +24,7 @@ extern crate alloc;
 /// `macro_rules!` provides each. The `#[macro_use] extern crate` half is gone
 /// (2026-09-01): `src/exceptions.rs` — its last textual user — imports the
 /// macro directly now, on its way to `akuma-exceptions`.
-pub use akuma_primitives::safe_print;
+pub use akuma_primitives::{safe_print, tprint};
 
 mod akuma;
 // The kernel heap moved to `crates/akuma-alloc` on 2026-08-31 to quarantine its

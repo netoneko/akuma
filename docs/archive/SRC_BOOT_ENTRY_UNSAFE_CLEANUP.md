@@ -9,8 +9,9 @@ the whole of what remained.
 |---|---:|---:|
 | `src/` production `unsafe` sites | 11 | **3** |
 | ...of which are real operations | 7 | **1** |
-| `crates/` production `unsafe` sites | 411 | 412 |
+| `crates/` production `unsafe` sites | 411 | 413 |
 | tree production `unsafe` sites | 422 | **415** |
+| `src/` **test** `unsafe` sites | 77 | **70** |
 | crates that forbid | 23 of 39 | 23 of 39 |
 
 Seven production sites are **gone**, not relocated, and no crate was added.
@@ -252,6 +253,88 @@ Semihosting **under `HVF=0` only**, selected by the harness rather than by the
 kernel. The kernel cannot distinguish the two accelerators without reading
 `MIDR_EL1` and guessing, and a guess that is wrong hangs the VM.
 
+## 6. The same defect, again, in the boot suite
+
+`src/`'s test files held **77** `unsafe` sites. Seven came out, and six of those
+seven were the *identical* mistake §4 found in `run_async_main` — hand-rolled
+pinning and hand-rolled no-op wakers:
+
+| site | was | now |
+|---|---|---|
+| `async_tests.rs` ×2 | `Pin::new_unchecked(Box::new(f))` + a 4-closure vtable | `Box::pin(f)`, `Waker::noop()` |
+| `tests.rs` ×3 | `Pin::new_unchecked(&mut f)` | `core::pin::pin!(f)` |
+| `tests.rs` ×1 | a no-op vtable, in a test *named* `test_block_on_noop_waker` | `Waker::noop()` |
+| `akuma-exec` `process/types.rs` ×1 | `noop_waker()` helper over `Waker::from_raw` | `Waker::noop().clone()` |
+
+The `block_on_noop_waker` one is worth singling out: the test exists to prove a
+`block_on` loop works with a no-op waker, and it was building its own instead of
+using the stdlib's. `Waker::noop()` is what the SSH `block_on` path actually uses,
+so the test got *more* faithful, not less.
+
+One `asm!` also left, and took an asymmetry with it:
+
+| site | was | now |
+|---|---|---|
+| `tests.rs` ×1 | `asm!("msr fpcr, {}", …)` | `akuma_cpu::sysreg::set_fpcr` |
+
+`akuma-cpu` already had the **reader** (`sysreg::fpcr()`, via `read_only!`), so a
+bare `msr fpcr` in the boot suite was the only `asm!` in `src/tests.rs` and the
+read-admitted / write-open-coded split was an accident rather than a decision.
+`set_fpcr` is admitted on `set_tpidr_el0`'s reasoning with room to spare: FPCR
+selects how the FPU *rounds*. It re-points nothing the kernel dereferences, names
+no address, and a garbage value can only make arithmetic wrong — which is not a
+memory-safety property. Contrast what stays `unsafe` at the call site
+(`ttbr0_el1`, `vbar_el1`, `elr_el1`, `tpidr_el1`, `tpidrro_el0`): every one of
+those re-points state the kernel then dereferences.
+
+### The other 70 are the tests' subject matter
+
+This is the part worth not re-litigating. The boot suite pokes page tables,
+physical frames, PTE permission bits, the user-copy fault paths, `dc zva`, MMIO,
+and self-modifying code. A test proving `copy_from_user_safe` returns `EFAULT`
+has to hand it an unmapped address; the icache tests write two instructions and
+`transmute` to a function pointer to run them; `dc zva` is on `akuma-cpu`'s
+deliberately-excluded list. **The `unsafe` is the experiment.**
+
+One left deliberately that *looks* removable: `test_waker_mechanism`'s counting
+`RawWakerVTable`. `alloc::task::Wake` would remove the `unsafe`, but that test's
+**subject** is the raw vtable — converting it would test a different mechanism.
+(Its `CLONE_COUNT` is dead instrumentation, incremented and never asserted; the
+`Wake` trait has no clone hook, which is part of why the swap is not equivalent.)
+
+### And why a `crates/akuma-tests` split does not follow
+
+The obvious next thought — move the unsafe tests to one crate and the rest to
+another — was surveyed and rejected. **Six of the nine test files already hold
+zero `unsafe`**, and they are 6% of the code:
+
+```
+process_tests.rs  20,394 lines   1,574 crate:: refs   23 unsafe
+tests.rs           9,509           848                41
+sync_tests.rs      2,525           127                 7
+async/daif/fs/network/pthread/rump_tests
+                   1,975           184                 0
+```
+
+So splitting on unsafe-ness puts 94% of the tests in the "unsafe" crate and
+achieves nothing. Making it meaningful means splitting *within* `tests.rs` and
+`process_tests.rs` — per-function triage of ~500 functions at one `unsafe` site
+per 230 lines — which cuts across the subsystem grouping the suite's `run_test!`
+ordering and its "Memory Tests: ALL PASSED" banners depend on, and separates a
+safe CoW-fork test from the unsafe PTE-poking test of the same mechanism.
+**Unsafe-ness is orthogonal to how these tests are organised, and it cuts that
+organisation badly.**
+
+The coupling makes it moot anyway: 2,606 `crate::` references, **187 distinct
+symbols across 15 clusters** (of which **33 are types**, which a hooks struct
+cannot carry), against the 8 clusters `ExceptionHooks` had to absorb. And it
+would buy nothing for the ban — `src/` can never `forbid` while `global_asm!` and
+`#[unsafe(no_mangle)]` are in `main.rs`/`boot.rs`/`smp_shared.rs`, tests or no
+tests. The prerequisite is `src/syscall/` leaving first
+([`SRC_SYSCALL_EXTRACTION_SURVEY.md`](SRC_SYSCALL_EXTRACTION_SURVEY.md)), and if
+the goal is only navigability, `src/tests/{memory,threading,futex,…}.rs` as
+plain modules gets that today for free.
+
 ## What is left in `src/`
 
 ```
@@ -305,6 +388,48 @@ operations.
   `HVF=0`**. Before this run, the same probe hung under `HVF=1` — that is the
   §5 fix, and it is the one behaviour change in this run that a user can see.
 
+## 7. The census tool grew tests, and one of them found a bug
+
+`scripts/cloc_akuma.py` is what regenerates
+[`crate-safety.md`](../reference/crate-safety.md), so a miscount lands in the
+docs as authoritative. Its `--self-test` gained **13 lexer cases and 4 structural
+invariants**.
+
+It was challenged as "wildly inaccurate" and is not: an independently written
+lexer agrees with it at exactly **423** sites across `crates/`, and its
+`test`/`production` split is right — the 11 test sites are all in inline
+`#[cfg(test)] mod` blocks (6 of them in `akuma-exec/threading`), because no
+`*_tests.rs` file under `crates/` contains any `unsafe` at all. The number *looks*
+wrong next to `grep -c unsafe` (593 lines) for two reasons worth knowing: ~170 of
+those lines are comments — this codebase writes *about* `unsafe` constantly — and
+10 are `#[unsafe(…)]` attributes, which the script excludes on purpose because
+they mark a declaration rather than an operation.
+
+**The new lexer cases found a real bug.** `r#unsafe` — the raw-identifier escape,
+the one spelling of those six letters that is *not* the keyword — was counted as
+a site: the scanner saw `r`, then a bare `#`, then `unsafe`. Fixed. Nothing in the
+tree writes it today; it is fixed because the failure is silent and inflates the
+number. The other cases pin the constructs that desynchronise a naive lexer and
+leave it "inside a string" for the rest of a file: `'"'` in a char literal,
+lifetimes (`&'a u8`) versus char literals, escaped quotes, byte strings, hashed
+raw strings, nested block comments, and `cfg(all(test, …))` / `cfg(not(test))`
+gating.
+
+The four invariants are each pinned to a failure this script has actually had:
+
+| invariant | the failure it pins |
+|---|---|
+| every crate under `crates/` appears in the report | `akuma-gic` and `akuma-psci` were once *missing entirely*; an absent crate reads as "nothing to report", not as an error, and new crates land here every few days |
+| `forbids_unsafe` and `unsafe_sites` agree both ways | the two are derived independently (regex over the file head vs. the lexer) and the headline "N of M crates forbid" rests on both |
+| whole-file tests charge nothing to production | test `unsafe` counted as shipped `unsafe` is the number `src/` is judged on |
+| sites ≤ substring occurrences | the cheap direction-of-error check; would have caught the overlapping-roots doubling without knowing anything about roots |
+
+That last one **failed on first write, and the check was wrong, not the script**:
+`akuma-alloc` opens two `GlobalAlloc` methods as
+`unsafe fn talc_alloc(..) -> *mut u8 { unsafe {` — two keywords, one line. The
+bound is occurrences, not lines containing one. Recorded in the comment so nobody
+re-derives it.
+
 ## Background
 
 - [`AKUMA_EXCEPTIONS_EXTRACTION.md`](AKUMA_EXCEPTIONS_EXTRACTION.md) — the run
@@ -315,5 +440,9 @@ operations.
   as runtime checks, first outing.
 - [`INLINE_ASM_CLEANUP.md`](INLINE_ASM_CLEANUP.md) — `akuma-cpu`, and what
   deliberately stays out of it.
+- [`SRC_SYSCALL_EXTRACTION_SURVEY.md`](SRC_SYSCALL_EXTRACTION_SURVEY.md) — where
+  `tprint!` went and why, and what still blocks `src/syscall/` from leaving.
 - [`../reference/crate-safety.md`](../reference/crate-safety.md) — the running
   census this run regenerated.
+- [`../reference/subsystems/console.md`](../reference/subsystems/console.md) —
+  the printing rules; `tprint!` now lives in `akuma-primitives`.

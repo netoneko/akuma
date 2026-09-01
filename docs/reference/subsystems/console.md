@@ -50,11 +50,27 @@ which writes the UART directly with IRQs disabled on the current core
 `print_hex`/`print_dec`/`print_u64` (`:107-165`) format directly into a
 fixed-size stack buffer, no `alloc`. `StackWriter<const N: usize>`
 (`:173-209`) implements `core::fmt::Write` over a stack buffer for panic-safe
-`write!()`-style formatting; `safe_print!`/`tprint!` (`:219-241`, exported
-macros) wrap it — `tprint!` additionally prepends a `[T<secs>.<cs>]` uptime
-timestamp read from `crate::timer::uptime_us()`. These exist specifically so
-kernel logging can't itself panic from an allocation failure while already
+`write!()`-style formatting; `safe_print!`/`tprint!` wrap it — `tprint!`
+additionally prepends a `[T<secs>.<cs>]` uptime stamp. These exist specifically
+so kernel logging can't itself panic from an allocation failure while already
 handling a fault.
+
+**Both macros live in `crates/akuma-primitives/src/console.rs`** as of
+2026-09-01; `src/console.rs` only re-exports `StackWriter`, and `src/main.rs`
+re-exports both macros at the binary's crate root so `crate::safe_print!` and
+`crate::tprint!` resolve unchanged. `tprint!` reads
+`akuma_primitives::clock::uptime_us()`, the hook `akuma_exec::runtime::register`
+installs from `ExecRuntime::uptime_us` — which the binary sets to
+`timer::uptime_us`, the same function the macro used to call directly. Before
+that registration it prints `[T0.00]` rather than failing, matching
+`print_str`'s "unregistered is quiet, not fatal" contract.
+
+`tprint!` stayed in `src/` for years on the stated grounds that "a leaf crate has
+no clock", which had been false since `akuma_primitives::clock` was split out.
+Moving it unpinned 112 call sites in `src/syscall/` from the binary crate — see
+[`../../archive/SRC_SYSCALL_EXTRACTION_SURVEY.md`](../../archive/SRC_SYSCALL_EXTRACTION_SURVEY.md)
+§4. **Check for an existing hook before adding one**: the first attempt at this
+added a second, redundant uptime hook to `console.rs`.
 
 ## Printing rules (required)
 
@@ -70,9 +86,12 @@ TALC lock and hung the handler mid-dump.
 Concretely:
 
 - **Do** use `crate::safe_print!(N, "fmt\n", args…)` — or `tprint!` when you
-  want the `[T<secs>.<cs>]` uptime stamp. Both exist in `src/` (`console.rs`)
-  and in `crates/akuma-exec` (`threading/mod.rs`, `#[macro_export]`ed, so
-  `crate::safe_print!` resolves from any module in that crate).
+  want the `[T<secs>.<cs>]` uptime stamp. Both are `#[macro_export]`ed from
+  `akuma-primitives`, so any crate can reach them as
+  `akuma_primitives::{safe_print,tprint}!`, and the binary re-exports both at its
+  crate root. Calling `tprint!` unqualified from a submodule of the binary needs
+  a `use crate::tprint;` — it is no longer textually in scope the way a local
+  `macro_rules!` was.
 - **Don't** hand-roll a `struct Buf([u8; N], usize)` + `impl core::fmt::Write`
   to do a single `write!` before flushing. That *is* the macro body, unrolled.
   The codebase had eight such reimplementations; the audit's remediation

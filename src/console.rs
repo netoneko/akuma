@@ -210,23 +210,14 @@ pub fn print_u64(n: u64) {
 /// `akuma-exec` copies did.
 pub use akuma_primitives::console::StackWriter;
 
-/// Like `safe_print!` but prepends a `[T<secs>.<cs>]` uptime timestamp.
-///
-/// Stays in this crate rather than moving to `akuma-primitives`: the timestamp
-/// comes from `crate::timer::uptime_us()`, and a leaf crate has no clock.
-#[macro_export]
-macro_rules! tprint {
-    ($size:expr, $($arg:tt)*) => {{
-        use core::fmt::Write;
-        let __us = $crate::timer::uptime_us();
-        let __s = __us / 1_000_000;
-        let __cs = (__us % 1_000_000) / 10_000;
-        let mut writer = $crate::console::StackWriter::<$size>::new();
-        let _ = write!(writer, "[T{}.{:02}] ", __s, __cs);
-        let _ = write!(writer, $($arg)*);
-        writer.flush();
-    }};
-}
+// `tprint!` moved to `akuma_primitives::console` on 2026-09-01, alongside
+// `safe_print!` and the `StackWriter` both use. It stayed here for one reason —
+// "the timestamp comes from `crate::timer::uptime_us()`, and a leaf crate has no
+// clock". That reason was already stale: `akuma_primitives::clock` has held the
+// uptime hook since it was split out, registered by `akuma_exec::runtime` from
+// `ExecRuntime::uptime_us` — which `src/main.rs` sets to `timer::uptime_us`, the
+// same function. The binary re-exports the macro at its crate root, so
+// `crate::tprint!` resolves unchanged.
 
 /// Check if a character is available for reading
 pub fn has_char() -> bool {

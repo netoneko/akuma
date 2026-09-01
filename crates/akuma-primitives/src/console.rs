@@ -191,6 +191,32 @@ macro_rules! safe_print {
     }};
 }
 
+/// Like [`safe_print!`], but prepends a `[T<secs>.<cs>]` uptime stamp.
+///
+/// The stamp is what makes a trace correlatable across cores — every futex, BKL
+/// and exec investigation in `docs/archive/` reads `[T…]` to order events that
+/// interleave on the console. `$size` budgets the *whole* line including the
+/// ~10-byte prefix.
+///
+/// Moved here from `src/console.rs` on 2026-09-01. It stayed up in the binary
+/// because "a leaf crate has no clock" — but this crate has had one since
+/// [`crate::clock`], registered from `akuma_exec::runtime::register` off
+/// `ExecRuntime::uptime_us` (which the binary sets to `timer::uptime_us`, the
+/// very function the old macro called). So the clock this prints is the same
+/// clock, reached through a hook that already existed rather than a second one.
+/// Prints `[T0.00]` before that registration, per [`crate::clock::uptime_us`].
+#[macro_export]
+macro_rules! tprint {
+    ($size:expr, $($arg:tt)*) => {{
+        use ::core::fmt::Write as _;
+        let __us = $crate::clock::uptime_us();
+        let mut writer = $crate::console::StackWriter::<$size>::new();
+        let _ = write!(writer, "[T{}.{:02}] ", __us / 1_000_000, (__us % 1_000_000) / 10_000);
+        let _ = write!(writer, $($arg)*);
+        writer.flush();
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FmtBuf, StackWriter};
