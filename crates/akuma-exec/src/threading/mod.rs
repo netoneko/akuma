@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 #[cfg(target_os = "none")]
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use akuma_primitives::OnceCopy;
 use spinning_top::Spinlock;
 
 use crate::runtime::{runtime, config, with_irqs_disabled, IrqGuard};
@@ -41,14 +42,31 @@ pub fn set_current_exception_stack(_stack_top: u64) {}
 // Lock-Free Thread State Management
 // ============================================================================
 
-/// Cleanup callback (e.g. for process unregistration)
-/// Stored as usize (function pointer cast) to allow atomic access
-static CLEANUP_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+/// Cleanup callback (e.g. for process unregistration).
+///
+/// `OnceCopy`, not `AtomicUsize`: this and the two hooks below were an
+/// `AtomicUsize` holding `cb as usize`, transmuted back to `fn(usize)` at each
+/// read, from 2026-03-19 — five months before `OnceCopy` existed. The type was
+/// never actually erased (the setter takes `fn(usize)` and the transmute
+/// produced `fn(usize)`), so the `usize` was only an internal representation,
+/// and `transmute` is strictly more dangerous than the API needs: it will
+/// convert any address to any signature, with a `!= 0` check as the only guard.
+/// `OnceCopy` is the tree's one mechanism for "registered at boot, read from
+/// anywhere" and costs the same relaxed load. See
+/// `docs/reference/subsystems/kernel-hooks.md`.
+///
+/// `OnceCopy` rather than `Registered` because absence is a legitimate state
+/// here — the recycler runs before the kernel registers anything — so the read
+/// sites degrade rather than panicking.
+static CLEANUP_CALLBACK: OnceCopy<fn(usize)> = OnceCopy::new();
 
 /// Set a callback to be invoked when a thread is cleaned up (recycled).
 /// The callback receives the thread ID (index) of the cleaned up thread.
+///
+/// Single-shot: a second call is ignored rather than replacing the first. Every
+/// in-tree registration happens exactly once, from `akuma_exec::process::init`.
 pub fn set_cleanup_callback(cb: fn(usize)) {
-    CLEANUP_CALLBACK.store(cb as usize, Ordering::SeqCst);
+    CLEANUP_CALLBACK.set(cb);
 }
 
 /// Kernel-registered purge for per-tid state this crate cannot reach.
@@ -59,12 +77,14 @@ pub fn set_cleanup_callback(cb: fn(usize)) {
 /// thread that died while parked is inherited by the slot's next occupant and silently
 /// absorbs that address's next wake. Those tables live in the kernel crate, so the kernel
 /// registers a hook here and the recycler calls it alongside `CLEANUP_CALLBACK`.
-static SLOT_PURGE_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+static SLOT_PURGE_CALLBACK: OnceCopy<fn(usize)> = OnceCopy::new();
 
 /// Register the per-tid purge invoked when a thread slot is recycled. Runs with no lock
 /// of this module held (same point as `CLEANUP_CALLBACK`), so the hook may take its own.
+///
+/// Single-shot; registered once from `akuma-kernel-glue` (`futex_purge_tid`).
 pub fn set_slot_purge_callback(cb: fn(usize)) {
-    SLOT_PURGE_CALLBACK.store(cb as usize, Ordering::SeqCst);
+    SLOT_PURGE_CALLBACK.set(cb);
 }
 
 /// Recover locks a thread died *holding* — the TERMINATED→FREE sweep.
@@ -80,12 +100,14 @@ pub fn set_slot_purge_callback(cb: fn(usize)) {
 /// TERMINATED→INITIALIZING CAS has excluded every spawn, and before the FREE store. That
 /// is the single call site below, and it is why this is a second hook rather than a
 /// second consumer of the first. See `docs/archive/AKUMA_EXT2_CLEANUP.md` §4.5/§4.6.
-static SLOT_REAP_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+static SLOT_REAP_CALLBACK: OnceCopy<fn(usize)> = OnceCopy::new();
 
 /// Register the dead-holder lock sweep. Same lock context as the callbacks above (none of
 /// this module's locks held), so the hook may take its own.
+///
+/// Single-shot; registered once from `akuma-vfs-glue` (`ext2::reap_dead_thread`).
 pub fn set_slot_reap_callback(cb: fn(usize)) {
-    SLOT_REAP_CALLBACK.store(cb as usize, Ordering::SeqCst);
+    SLOT_REAP_CALLBACK.set(cb);
 }
 
 /// Thread ID of the network polling loop (run_async_main).
@@ -1360,9 +1382,7 @@ pub fn mark_thread_terminated(idx: usize) {
         // a terminated thread — unlike its trap frame, kernel stack or sigaltstack, which
         // the terminal park may still touch and which therefore stay until the recycler.
         // Holds no lock of this module, so the hook may take its own.
-        let purge_addr = SLOT_PURGE_CALLBACK.load(Ordering::Relaxed);
-        if purge_addr != 0 {
-            let purge: fn(usize) = unsafe { core::mem::transmute(purge_addr) };
+        if let Some(purge) = SLOT_PURGE_CALLBACK.get() {
             purge(idx);
         }
     }
@@ -1987,9 +2007,7 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             }
 
             // Invoke cleanup callback (if any)
-            let cb_addr = CLEANUP_CALLBACK.load(Ordering::Relaxed);
-            if cb_addr != 0 {
-                let cb: fn(usize) = unsafe { core::mem::transmute(cb_addr) };
+            if let Some(cb) = CLEANUP_CALLBACK.get() {
                 cb(i);
             }
 
@@ -1997,9 +2015,7 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // slot can be re-claimed — otherwise the next occupant inherits them under the
             // same tid. Same lock context as the callback above (none of this module's
             // locks held), so the hook is free to take its own.
-            let purge_addr = SLOT_PURGE_CALLBACK.load(Ordering::Relaxed);
-            if purge_addr != 0 {
-                let purge: fn(usize) = unsafe { core::mem::transmute(purge_addr) };
+            if let Some(purge) = SLOT_PURGE_CALLBACK.get() {
                 purge(i);
             }
             
@@ -2020,9 +2036,7 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // Release anything this thread died holding. Last thing before the slot
             // becomes claimable, which is exactly the reap contract: the tid is dead,
             // and no new occupant can have taken it yet. See SLOT_REAP_CALLBACK.
-            let reap_addr = SLOT_REAP_CALLBACK.load(Ordering::Relaxed);
-            if reap_addr != 0 {
-                let reap: fn(usize) = unsafe { core::mem::transmute(reap_addr) };
+            if let Some(reap) = SLOT_REAP_CALLBACK.get() {
                 reap(i);
             }
 

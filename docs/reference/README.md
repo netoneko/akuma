@@ -23,6 +23,7 @@ churn. See [`../README.md`](../README.md).
 | VFS (ext2, procfs, pipes) | [`subsystems/vfs.md`](subsystems/vfs.md) | A |
 | Syscalls / Linux ABI | [`subsystems/syscalls.md`](subsystems/syscalls.md) (per-family docs in [`subsystems/syscalls/`](subsystems/syscalls/), grades vary) | A |
 | Containers / boxes / herd | [`subsystems/containers.md`](subsystems/containers.md) | B |
+| Boot-registered hooks (how crates call back up) | [`subsystems/kernel-hooks.md`](subsystems/kernel-hooks.md) | A |
 | Cargo features + env knobs | [`subsystems/config-flags.md`](subsystems/config-flags.md) | — |
 | IRQ dispatch | [`subsystems/irq.md`](subsystems/irq.md) | B |
 | Console / UART output | [`subsystems/console.md`](subsystems/console.md) | B |
