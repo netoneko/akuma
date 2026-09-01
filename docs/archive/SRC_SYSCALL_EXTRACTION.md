@@ -1,4 +1,4 @@
-# Moving `src/syscall/` out: a survey, not a move
+# Moving `src/syscall/` out
 
 **2026-09-01.** `src/syscall/` is 23 files, 16,661 lines, and already carries
 `#![forbid(unsafe_code)]` as a module attribute — the most crate-ready thing left
@@ -6,11 +6,28 @@ in `src/`. It is also what 542 of the boot suite's `crate::` references point at
 so it is the prerequisite for any test crate.
 
 The question asked was "can we just move it to `crates/akuma-syscalls-glue`? looks
-like a clean move." **It is not clean.** This is what is in the way, measured, so
-the next attempt starts from facts rather than from a look.
+like a clean move." **It is not**, and this doc is the survey that says why, plus
+the first three steps of the answer, which are done.
 
-Nothing here was moved. The tree is unchanged apart from one blocker that fell
-out cheaply on the way (`tprint!`, §4).
+## Status
+
+| step | what | state |
+|---|---|---|
+| 0 | `tprint!` → `akuma-primitives` (§4) | **done** |
+| 1a | `src/syscall/log.rs` → `akuma-syscalls-log` | **done** |
+| 1b | `src/syscall/msgqueue.rs` → `akuma-syscalls-ipc` | **done** |
+| 2 | `src/vfs/` → `akuma-vfs-glue` | **done** |
+| 3 | decide the `cfg(kernel_tests)` story (Blocker 2) | open |
+| 4 | `crate::config` → `SyscallConfig` (225 refs / 26 consts) | open |
+| 5 | `src/syscall/` → `akuma-syscalls-glue` | open |
+
+Steps 1a–2 are recorded in [§7](#7-what-was-actually-done). The cycle that made
+the move impossible is **broken**: `src/vfs/` no longer exists, and nothing
+outside `src/syscall/` points back into it.
+
+Census movement across the whole run: **23 of 39 crates forbid → 26 of 42**, and
+enforced-safe code under `crates/` went **25,658 / 49,706 (51.6%) → 28,135 /
+52,202 (53.9%)**.
 
 ## The good news first: the inbound seam already exists
 
@@ -27,10 +44,11 @@ let ret = (hooks.handle_syscall)(syscall_num, &args);
 So the SVC path does not care where `handle_syscall` lives. Everything below is
 about the **outbound** direction: what `src/syscall/` reaches back into.
 
-## Blocker 1 — a dependency cycle, `src/syscall/` ↔ `src/vfs/`
+## Blocker 1 — a dependency cycle, `src/syscall/` ↔ `src/vfs/` — **RESOLVED**
 
-This is the one that makes the move *impossible* rather than merely laborious.
-Cargo crates cannot be mutually dependent.
+This is the one that made the move *impossible* rather than merely laborious.
+Cargo crates cannot be mutually dependent. Cut on 2026-09-01; the survey below is
+what it looked like, and [§7](#7-what-was-actually-done) is what was done.
 
 ```
 src/syscall/  ──110 refs, 50 symbols──▶  src/vfs/
@@ -152,20 +170,136 @@ same clock.
 
 ## Suggested order, if this is picked up
 
-1. **`src/syscall/log.rs` + `src/syscall/msgqueue.rs` → a crate.** Breaks the
-   `/proc` cycle (Blocker 1's back-edge). 571 lines, small surface.
-2. **Decide the `cfg(kernel_tests)` story** (Blocker 2). Cheapest is to lift the
+1. ~~`src/syscall/log.rs` + `src/syscall/msgqueue.rs` → crates.~~ **Done**, §7.1–7.2.
+2. ~~`src/vfs/` → a crate.~~ **Done**, §7.3. This was billed as "the real
+   project" and came in at 20 distinct symbols because four of the six clusters
+   that looked binary-local were already re-exports of crates. **Price an
+   extraction by resolving each symbol, not by counting references** — the two
+   numbers were off by an order of magnitude here in the safe direction, and by
+   an order of magnitude in the *unsafe* direction for `crate::irq` (94 refs, one
+   function).
+3. **Decide the `cfg(kernel_tests)` story** (Blocker 2). Cheapest is to lift the
    30 gated blocks out of the 9 files into `src/`, so the crate ships production
-   code only.
-3. **`crate::config` → `SyscallConfig`.** 225 refs, 26 consts, known pattern.
-4. **Repoint `safe_print` / `irq::with_irqs_disabled`.** 259 refs, mechanical.
-5. **`src/vfs/` → a crate**, or at least the 50 symbols `src/syscall/` needs from
-   it. This is the large one and deserves its own survey.
-6. **Then** the move, plus a hooks struct for the ~50-symbol tail (`fs`, `pmm`,
-   `audio`, `block`, `smp_shared`, `rump_proxy`, …).
+   code only. This is now the first blocker, and it is a choice rather than a
+   measurement.
+4. **`crate::config` → `SyscallConfig`.** 225 refs, 26 consts, known pattern —
+   and watch the size floor per §7.4.
+5. **Repoint `safe_print` / `irq::with_irqs_disabled`.** 259 refs, mechanical.
+6. **Then** the move, plus a hooks struct for the tail (`fs`, `audio`,
+   `smp_shared`, `rump_proxy`, …). `crate::vfs` (110 refs, 50 symbols) is now
+   `akuma_vfs_glue::` and costs nothing.
 
-Steps 1–4 are worth doing on their own merits and leave the tree strictly tidier
-whether or not the move ever happens. Step 5 is the real project.
+## 7. What was actually done
+
+Three crates, in dependency order. Each was built, clippied, host-tested and
+booted at `SMP=4 MEMORY=2048M` before the next began.
+
+### 7.1 `akuma-syscalls-log` — 132 lines
+
+The per-pid syscall trace rings behind `/proc/<pid>/syscalls`. Moved for the
+cycle, not for tests: it has no `unsafe` and no pure logic worth a host test.
+
+Its outbound surface was six symbols, and **four of them were free because of
+§4** — `crate::tprint` had just become `akuma_primitives::tprint`, and
+`crate::irq::with_irqs_disabled` / `crate::timer::uptime_us` were already
+`akuma_primitives::irq` / `akuma_primitives::clock`. Only the three
+`crate::config` consts needed work, handed over as a `LogConfig` at `init`.
+
+`src/syscall/log.rs` survives as a shim that re-exports `record`/`mark_exited`/
+`get_formatted` and calls `init` — **because `src/config.rs` stays the single
+source of truth** and the crate cannot read it. `/proc` was repointed at
+`akuma_syscalls_log::` directly; routing it back through the shim is what the
+cycle *was*.
+
+### 7.2 `akuma-syscalls-ipc` — 439 lines
+
+The SysV message-queue family (`msgget`/`msgctl`/`msgsnd`/`msgrcv`). The fifth
+syscall family to leave `src/syscall/` after `-time`, `-sync`, `-poll` and
+`-mem`, and the first to leave for a structural reason rather than for host
+tests.
+
+**`use super::*` hid its real dependencies.** The file's only visible imports
+were `alloc` and three `akuma_exec::threading` items; everything else came
+through the glob. Commenting the glob out and reading the compiler's complaints
+enumerated it in one build: 7 errno constants, 5 `user_access` items, `Spinlock`,
+`AtomicU32`, `BTreeMap`, `Vec`. All crate-available —
+`akuma_primitives::errno::negated` and `akuma_exec::process::user_access` — plus
+a local re-derivation of `validate_user_ptr`, which is a four-line forwarder over
+`validate_user_range(.., Prefault::Yes)` in `src/syscall/mod.rs`. **If you are
+about to move a file that opens with `use super::*`, do this first**; the import
+list is not the dependency list.
+
+Unlike its four siblings this crate is *not* "the pure logic with the effects
+left behind" — it owns the queue table, does its own user copies, wakes its own
+pollers. The seam is a dependency edge, not a purity boundary, and the header
+says so rather than implying a cleanliness it does not have.
+
+The dependency is `optional = true` behind `sc-sysv-ipc`, exactly as the module
+it replaced was gated: **a crate split must not quietly re-add 440 lines to the
+`extreme-size` floor.**
+
+### 7.3 `akuma-vfs-glue` — 2,763 lines
+
+The mount table, per-box namespaces, the ext2-over-virtio adapter and `/proc`.
+`akuma-vfs` owns the *vocabulary* (`Filesystem`, `DirEntry`, `FsError`,
+`MountTable`); this crate owns the kernel's single **instance** of it.
+
+Its outbound surface priced out at 20 distinct symbols / 47 refs — an order of
+magnitude cheaper than `src/syscall/`'s 160 / 900+ — and **checking each one
+before writing a hook is what kept the hooks struct at four members**:
+
+| looked binary-local | actually |
+|---|---|
+| `crate::block` (4 symbols) | a re-export of `akuma_virtio::block` |
+| `crate::pmm::stats` | `akuma_pmm::stats` |
+| `crate::file_page_cache::{invalidate_inode,len}` | `akuma_fpcache::` |
+| `crate::timer::uptime_us` | `akuma_primitives::clock::uptime_us` |
+
+What was left is genuinely the binary's: an inline `mod audio` in `main.rs`,
+`fs::exists`, `smp_shared::probed_core_count`, and `timer::utc_time_us` (which
+needs the binary's boot uptime to turn monotonic microseconds into UTC). Four
+function pointers, on the `ExceptionHooks` model, unregistered-is-quiet.
+
+Three things went wrong and are worth repeating:
+
+- **A brace-form `use` slipped the symbol survey.** The regex counting
+  `crate::config::NAME` never matched `use crate::config::{MAX_THREADS,
+  PROC_STDOUT_MAX_SIZE}`. Two more consts, found by the compiler. Grep for
+  `use crate::x::{` separately.
+- **The crate needed a `build.rs`, and its absence would have been silent.**
+  `proc.rs`'s `active_core_count` is `#[cfg(kernel_smp_shared)]` with a `1`
+  fallback, and it sizes the per-core CPU-time accounting `/proc` reports.
+  Without the cfg forwarded, the crate compiles the fallback **even under real
+  SMP** — no build error, no runtime error, just `/proc` dividing by one core on
+  a four-core machine. `akuma-exec` shipped this exact bug for its
+  `kernel_profile_extreme` gates. Any crate carved out of `src/` inherits every
+  `kernel_*` cfg its code reads, and cfgs do not travel with the code.
+- **Four binary features gate the moved code** (`sc-containers` ×8, `sc-reboot`,
+  `sc-sysv-ipc`) and had to be declared on the crate and forwarded. The symptom
+  is `cannot find function … in module crate::vfs` against a `pub fn` that plainly
+  exists — a feature-gated item, not a visibility problem.
+
+### 7.4 What it cost
+
+**`extreme-size` grew exactly 4,096 bytes** — 728,568 → 732,664, measured with
+`cargo clean -p akuma` on both arms because an incremental rebuild reports no
+change at all and will happily tell you there is no regression. Exactly one page
+is an alignment boundary being crossed rather than 4 KB of new code, and against
+a 3,070 KB image with a 4 MB floor it is 0.13% of the headroom.
+
+Part of it was found and removed before measuring: `src/config.rs` forces
+`PROC_SYSCALL_LOG_ENABLED` and `PROC_SYSVIPC_ENABLED` to `false` on
+`kernel_profile_extreme`, and while they were `const` the `/proc` renderers
+behind them were **const-folded out of the image**. Handing them over as runtime
+config turned both into loads and retained both renderers. The crate's getters
+are now `#[cfg(kernel_profile_extreme)] const fn … { false }`, which is a
+deliberate duplication of a fact `src/config.rs` also states — the alternative is
+paying for a renderer the profile can never reach.
+
+**This is the general tax on config-by-handover** and the reason
+`akuma-fpcache`'s extraction documented its own +304 bytes. Every const that
+becomes runtime config stops const-folding whatever it gates. Check the size
+floor on any extraction that moves a `bool` out of `src/config.rs`.
 
 ## Deliberation: should `akuma-syscalls` and the glue crate later merge?
 

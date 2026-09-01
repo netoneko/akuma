@@ -331,7 +331,7 @@ cannot carry), against the 8 clusters `ExceptionHooks` had to absorb. And it
 would buy nothing for the ban — `src/` can never `forbid` while `global_asm!` and
 `#[unsafe(no_mangle)]` are in `main.rs`/`boot.rs`/`smp_shared.rs`, tests or no
 tests. The prerequisite is `src/syscall/` leaving first
-([`SRC_SYSCALL_EXTRACTION_SURVEY.md`](SRC_SYSCALL_EXTRACTION_SURVEY.md)), and if
+([`SRC_SYSCALL_EXTRACTION.md`](SRC_SYSCALL_EXTRACTION.md)), and if
 the goal is only navigability, `src/tests/{memory,threading,futex,…}.rs` as
 plain modules gets that today for free.
 
@@ -440,7 +440,7 @@ re-derives it.
   as runtime checks, first outing.
 - [`INLINE_ASM_CLEANUP.md`](INLINE_ASM_CLEANUP.md) — `akuma-cpu`, and what
   deliberately stays out of it.
-- [`SRC_SYSCALL_EXTRACTION_SURVEY.md`](SRC_SYSCALL_EXTRACTION_SURVEY.md) — where
+- [`SRC_SYSCALL_EXTRACTION.md`](SRC_SYSCALL_EXTRACTION.md) — where
   `tprint!` went and why, and what still blocks `src/syscall/` from leaving.
 - [`../reference/crate-safety.md`](../reference/crate-safety.md) — the running
   census this run regenerated.

@@ -68,7 +68,7 @@ that registration it prints `[T0.00]` rather than failing, matching
 `tprint!` stayed in `src/` for years on the stated grounds that "a leaf crate has
 no clock", which had been false since `akuma_primitives::clock` was split out.
 Moving it unpinned 112 call sites in `src/syscall/` from the binary crate — see
-[`../../archive/SRC_SYSCALL_EXTRACTION_SURVEY.md`](../../archive/SRC_SYSCALL_EXTRACTION_SURVEY.md)
+[`../../archive/SRC_SYSCALL_EXTRACTION.md`](../../archive/SRC_SYSCALL_EXTRACTION.md)
 §4. **Check for an existing hook before adding one**: the first attempt at this
 added a second, redundant uptime hook to `console.rs`.
 
