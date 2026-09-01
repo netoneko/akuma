@@ -593,11 +593,17 @@ and Verify block: [`selfhost-kernel-build.md`](selfhost-kernel-build.md)
 
 - **`cargo clean` before every trial** — a green incremental build proves
   nothing, and no script issues the clean for you.
-- **A/B it**: same number of trials on a worktree at the parent commit. As of
-  2026-08-15 the baseline is green (10/10 clean builds), so a single red trial
-  on your arm is already a real finding — but confirm the baseline on *your*
-  image before concluding, and check the tripwire greps (`[PMM-RESURRECT]`
-  etc.) even on green runs.
+- **A/B it**: same number of trials on a worktree at the parent commit. The
+  2026-08-15 baseline of 10/10 clean builds **no longer reproduces** — re-measured
+  2026-09-01, both arms score **8/10**, because the kernel heap leaks
+  monotonically across trials (13 → ~758 MB) until the OOM killer takes rustc at
+  trial 9 and the VM stops answering at trial 10. That is pre-existing and
+  A/B-confirmed, so **cap the campaign at ~8 trials per boot** and do not read a
+  trial-9 or trial-10 death as your change:
+  [`../archive/SELFHOST_KERNEL_HEAP_LEAK.md`](../archive/SELFHOST_KERNEL_HEAP_LEAK.md).
+  Within those 8 a single red trial on your arm is still a real finding — but
+  confirm the baseline on *your* image before concluding, and check the tripwire
+  greps (`[PMM-RESURRECT]` etc.) even on green runs.
 - **Do not retry past a failure** — capture both logs and match against that
   runbook's Common failures table.
 

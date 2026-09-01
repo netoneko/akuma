@@ -185,32 +185,30 @@ use core::panic::PanicInfo;
 /// Used by the timer watchdog to report which step is blocking.
 pub static GLOBAL_POLL_STEP: AtomicU64 = AtomicU64::new(0);
 
-/// Halt the CPU in a low-power wait loop. Safe wrapper around wfi.
-#[inline]
+/// Stop the machine.
+///
+/// **PSCI `SYSTEM_OFF`, and nothing else.** QEMU implements it under every
+/// accelerator, Firecracker implements it, and real hardware implements it —
+/// measured 2026-09-01 on `HVF=1` (the default on Apple silicon) and `HVF=0`,
+/// both clean exits. It is the only mechanism that stops the VM on the default
+/// accelerator.
+///
+/// This used to try ARM semihosting (`hlt #0xf000` with `SYS_EXIT_EXTENDED`)
+/// first, because it is the only mechanism that can hand an exit *code* back to
+/// the shell. **Do not put it back without reading
+/// `docs/archive/SRC_BOOT_ENTRY_UNSAFE_CLEANUP.md` §5**: under HVF the `hlt`
+/// does not fall through to the next instruction, it wedges the vCPU, so a
+/// panic on the default accelerator hung forever rather than stopping — and any
+/// PSCI fallback placed after it was unreachable. Nothing in `scripts/` reads
+/// QEMU's exit status anyway; harnesses detect a panic by grepping the log for
+/// `[PANIC]`, which is why the trade is worth taking.
+///
+/// The `wfi` loop is what makes the `-> !` true: `akuma_psci::call` returns if
+/// there is no conduit at all.
 fn halt() -> ! {
-    halt_with_code(1)
-}
-
-/// Exit QEMU with a specific exit code using ARM semihosting.
-/// Requires QEMU to be started with `-semihosting` flag.
-/// Falls back to wfi loop if semihosting is not available.
-#[inline]
-fn halt_with_code(code: u32) -> ! {
-    // Use ARM semihosting SYS_EXIT_EXTENDED (0x20) to exit QEMU with a code
-    // The parameter block contains [reason, exit_code]
-    // ADP_Stopped_ApplicationExit = 0x20026
-    let block: [u64; 2] = [0x20026, u64::from(code)];
-
-    unsafe {
-        core::arch::asm!(
-            "hlt #0xf000",
-            in("x0") 0x20u64,        // SYS_EXIT_EXTENDED
-            in("x1") block.as_ptr(),
-            options(nomem, nostack)
-        );
-    }
-
-    // If semihosting is not available, fall back to wfi loop
+    // Discarded deliberately: on success this does not return, so a status can
+    // only mean "no PSCI conduit" — which the `wfi` below already handles.
+    let _ = akuma_psci::call(akuma_psci::SYSTEM_OFF, 0, 0, 0);
     loop {
         akuma_cpu::park::wfi();
     }
@@ -233,12 +231,12 @@ fn panic(info: &PanicInfo) -> ! {
     halt()
 }
 
-// Import boot_x0_at_entry from assembly
-unsafe extern "C" {
-    static boot_x0_at_entry: u64;
-}
-
-/// Minimal unsafe entry point - immediately delegates to safe kernel_main
+/// The C ABI entry point the boot assembly `bl`s.
+///
+/// Immediately delegates to `kernel_main`. It holds no `unsafe` operations of
+/// its own any more; the `#[unsafe(no_mangle)]` attribute is the only thing here
+/// the `unsafe_code` lint objects to, and the boot assembly needs the symbol
+/// name.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
     // FIRST statement in the kernel's Rust entry, before any output at all: point
@@ -260,7 +258,7 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
     console::print("\n");
     
     // Also print what was stored at very first instruction
-    let x0_at_entry = unsafe { boot_x0_at_entry };
+    let x0_at_entry = boot::x0_at_entry();
     console::print("x0 at _boot entry: 0x");
     console::print_hex(x0_at_entry);
     console::print("\n");
@@ -636,10 +634,11 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     }
 
     platform::install_bootstrap_device_map();
-    // SAFETY: still on the boot page table built by `boot.rs`, single-threaded,
-    // before any user address space exists, and `boot_device_l3_phys()` is the L3
-    // that table installed under L0[1].
-    unsafe { mmu::rebuild_boot_device_table(boot::boot_device_l3_phys()) };
+    // Still on the boot page table built by `boot.rs`, single-threaded, before any
+    // user address space exists — which is what `rebuild_boot_device_table` now
+    // checks for itself. It also finds the device L3 by walking that table, so
+    // there is no L3 address to pass and no way to pass the wrong one.
+    mmu::rebuild_boot_device_table();
     console::print("[Platform] ");
     console::print(platform::machine::NAME);
     console::print(" device map installed\n");
@@ -711,8 +710,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // places it in the last 2 MiB of guest RAM, so a 4 GiB microVM has it at ~6 GiB.
     // Map its block before reading it, or `detect_memory` faults before printing
     // anything about memory. No-op on QEMU virt, where the DTB is low.
-    // SAFETY: still on the boot page table, single-threaded, no other address space.
-    unsafe { mmu::ensure_boot_identity_covers(dtb_ptr) };
+    mmu::ensure_boot_identity_covers(dtb_ptr);
 
     // =========================================================================
     // Device map, take two: from the machine, not from a literal
@@ -758,9 +756,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
         let outcome = platform::install_fdt_device_map(fdt.as_ref());
         match outcome {
             platform::FdtMapOutcome::Installed { gicr_pa, moved } => {
-                // SAFETY: as for the bootstrap rebuild above — boot page table,
-                // single-threaded, and this is the L3 that table installed.
-                unsafe { mmu::rebuild_boot_device_table(boot::boot_device_l3_phys()) };
+                mmu::rebuild_boot_device_table();
                 safe_print!(96, "[Platform] FDT device map: GICR=0x{:x}{}\n",
                     gicr_pa, if moved { " (moved from bootstrap literal)" } else { "" });
             }
@@ -1551,7 +1547,7 @@ fn netpoll_drain_step() {
 fn run_async_main() -> ! {
     use core::future::Future;
     use core::pin::pin;
-    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+    use core::task::{Context, Waker};
 
     // Register this thread as the network poller so the scheduler boost targets it.
     //
@@ -1802,14 +1798,11 @@ fn run_async_main() -> ! {
     // Pin memory monitor
     let mut mem_monitor_pinned = pin!(memory_monitor());
     
-    // Simple waker for executor
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(core::ptr::null(), &VTABLE),
-        |_| {}, |_| {}, |_| {},
-    );
-    let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
-    let waker = unsafe { Waker::from_raw(raw_waker) };
-    let mut cx = Context::from_waker(&waker);
+    // The executor below never parks on a waker — it polls, drains and loops —
+    // so the no-op waker is all it needs. `Waker::noop()` is the safe, `const`
+    // stdlib spelling of the hand-rolled `RawWakerVTable` of four empty closures
+    // this used to build behind `Waker::from_raw`.
+    let mut cx = Context::from_waker(Waker::noop());
 
     // Measurement builds only: start attributing cross-core BKL wait to the holder.
     #[cfg(kernel_bkl_profile)]

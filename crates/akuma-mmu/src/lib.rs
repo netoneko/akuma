@@ -240,11 +240,18 @@ const BOOT_STATIC_MAP_END: usize = 0xC000_0000; // 3 GB
 /// 512 GiB L1 as Normal memory would invite speculative access to addresses with
 /// no backing store.
 ///
-/// # Safety
-/// Must run on the boot page table, single-threaded, before any other address
-/// space exists.
+/// # Boot-phase only
+/// Editing the boot table is only sound while it is the *only* table: on the
+/// boot page table, single-threaded, before any other address space exists.
+/// That window closes at [`init`], so the obligation is discharged here by
+/// refusing to run once [`is_initialized`] is true rather than being pushed
+/// onto the caller as an `unsafe` contract.
 #[cfg(target_os = "none")]
-pub unsafe fn ensure_boot_identity_covers(addr: usize) {
+pub fn ensure_boot_identity_covers(addr: usize) {
+    if is_initialized() {
+        debug_assert!(false, "ensure_boot_identity_covers after mmu::init");
+        return;
+    }
     let idx = addr >> 30;
     if idx == 0 || idx > 511 {
         return; // block 0 is the device block; anything past 511 is not addressable here
@@ -523,15 +530,63 @@ unsafe fn write_device_l3(l3_ptr: *mut u64) {
 /// before any GIC or virtio MMIO access. Everything else in the boot table is
 /// left alone.
 ///
-/// # Safety
-/// `boot_dev_l3_phys` must be the physical address of the L3 table `boot.rs`
-/// installed under L0[1], and the caller must be running on the boot table (or
-/// on a table sharing that L3) with interrupts disabled.
-pub unsafe fn rebuild_boot_device_table(boot_dev_l3_phys: usize) {
+/// The L3 is **found, not supplied**: this walks the live boot TTBR0 for
+/// L0[1] -> L1[0] -> L2[0], which is exactly [`write_device_l3`]'s stated
+/// precondition, so there is no wrong table a caller can hand in. It used to
+/// take the address as an argument, derived independently in `src/boot.rs` from
+/// the `boot_page_tables` linker symbol ("the device L3 is page 5") — two
+/// descriptions of one table, and the `unsafe` on this function existed only to
+/// make the caller promise they still agreed.
+///
+/// # Boot-phase only
+/// Same window as [`ensure_boot_identity_covers`]: the boot table is only safe
+/// to edit in place while it is the only table and nothing else is running.
+/// Enforced here rather than asserted by the caller.
+pub fn rebuild_boot_device_table() {
+    if is_initialized() {
+        debug_assert!(false, "rebuild_boot_device_table after mmu::init");
+        return;
+    }
+    let Some(l3_phys) = boot_device_l3_phys() else {
+        return;
+    };
+    // SAFETY: `l3_phys` came out of the boot table's own L0[1]->L1[0]->L2[0]
+    // chain, so it is by construction the writable 512-entry L3 that chain
+    // resolves to, and `phys_to_virt` is the identity on it.
     unsafe {
-        write_device_l3(phys_to_virt(boot_dev_l3_phys) as *mut u64);
+        write_device_l3(phys_to_virt(l3_phys) as *mut u64);
     }
     boot_table_flush_sync();
+}
+
+/// Walk the boot TTBR0 for the device L3 under `L0[1] -> L1[0] -> L2[0]`.
+///
+/// `None` if any level of that chain is absent — which is the case on the host
+/// (`get_boot_ttbr0` is a `0` stub there) and would be the case if the boot
+/// assembly ever stopped installing the device window.
+fn boot_device_l3_phys() -> Option<usize> {
+    const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+    // SAFETY: each address is the physical base of a page-table level reached
+    // from the boot TTBR0, identity-mapped by the boot table, and read as a
+    // single aligned u64. Checked valid before descending.
+    unsafe fn descend(table_phys: usize, index: usize) -> Option<usize> {
+        if table_phys == 0 {
+            return None;
+        }
+        let entry = unsafe { core::ptr::read_volatile((phys_to_virt(table_phys) as *const u64).add(index)) };
+        if entry & (flags::VALID | flags::TABLE) != (flags::VALID | flags::TABLE) {
+            return None;
+        }
+        Some((entry & ADDR_MASK) as usize)
+    }
+
+    let l0_phys = (get_boot_ttbr0() & ADDR_MASK) as usize;
+    unsafe {
+        let l1 = descend(l0_phys, 1)?;
+        let l2 = descend(l1, 0)?;
+        descend(l2, 0)
+    }
 }
 
 /// Allocate the shared L1/L2/L3 device page tables that every user address

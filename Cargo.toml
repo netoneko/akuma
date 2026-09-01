@@ -9,6 +9,7 @@ default-members = [
     "crates/akuma-fdt",
     "crates/akuma-firecracker",
     "crates/akuma-fpcache",
+    "crates/akuma-gic",
     "crates/akuma-psci",
     "crates/akuma-cpu",
     "crates/akuma-elf",
@@ -699,6 +700,7 @@ akuma-exceptions = { path = "crates/akuma-exceptions" }
 # `akuma-boot` decodes `reboot(2)` under `#![forbid(unsafe_code)]`, and an `smc`
 # would have cost it that ban.
 akuma-psci = { path = "crates/akuma-psci" }
+
 akuma-gic = { path = "crates/akuma-gic" }
 akuma-bkl = { path = "crates/akuma-bkl" }
 akuma-fpcache = { path = "crates/akuma-fpcache" }

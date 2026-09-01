@@ -1,6 +1,112 @@
 # Crate safety: which crates forbid `unsafe`
 
 **Grade: A** — regenerated 2026-09-01 with
+`python3 scripts/cloc_akuma.py src crates` after the `src/` boot-entry cleanup
+([`SRC_BOOT_ENTRY_UNSAFE_CLEANUP.md`](../archive/SRC_BOOT_ENTRY_UNSAFE_CLEANUP.md)).
+`src/` production fell **11 -> 3** and `crates/` rose only **411 -> 412**, so the
+tree total fell **422 -> 415**: **seven production sites are genuinely gone**,
+not relocated, and no crate was added. **23 of 39 crates** forbid, unchanged.
+
+This is the run where the campaign's usual move — extract the obligation into a
+crate that owns it — was tried, measured, and **reverted in favour of deleting
+the operation**. An `akuma-qemu` crate briefly existed to hold the semihosting
+exit; the measurement that justified it also showed the mechanism does not work
+on the accelerator everybody runs, and PSCI already did the job from a crate the
+tree had. See ["The one that did not need a crate"](#no-crate) below.
+
+Six of the seven went away because an obligation was *discharged* rather than
+moved, and the pattern is worth copying:
+
+- **`mmu::rebuild_boot_device_table` was `unsafe` only to make the caller promise
+  two derivations still agreed.** It took the device L3's physical address; the
+  caller got it from `src/boot.rs`, which computed it from the `boot_page_tables`
+  linker symbol ("the device L3 is page 5"). Two descriptions of one table. It
+  now walks the boot TTBR0 for `L0[1] -> L1[0] -> L2[0]` — which *is* the callee's
+  stated precondition — so there is no wrong table a caller can pass, the
+  parameter is gone, and so is `boot::boot_device_l3_phys()` and the `unsafe
+  extern` block inside it. Two `unsafe` blocks in `main.rs`, one in `boot.rs`.
+- **`mmu::ensure_boot_identity_covers` / `rebuild_boot_device_table` are
+  boot-phase-only, and the boot phase is observable.** Their obligation ("boot
+  page table, single-threaded, before any other address space exists") is exactly
+  the window that closes at `mmu::init`, so both now check `is_initialized()`
+  themselves instead of asserting it in a `# Safety` block the caller re-copies
+  at each site. This is the third time in the campaign a `# Safety` clause turned
+  out to be a runtime-checkable predicate; see
+  [`SYSCALL_UNSAFE_CLEANUP.md`](../archive/SYSCALL_UNSAFE_CLEANUP.md).
+- **`boot_x0_at_entry` stopped being an extern static.** The boot assembly's
+  `str x0, [x1]` is a plain aligned 64-bit store, so the storage can be a Rust
+  `AtomicU64` that a relaxed load may read with no `unsafe` at all. It carries
+  `#[unsafe(link_section = ".data.boot")]` deliberately: the store happens at
+  `_boot + 4`, *before* the `.bss` clear at the top of `_boot_code`, so a `.bss`
+  home would be zeroed back out — verify with `nm` that the symbol reads `D`.
+- **`Waker::from_raw` became `Waker::noop()`.** The async main loop never parks
+  on a waker, so the hand-rolled `RawWakerVTable` of four empty closures was
+  reproducing a safe `const` stdlib item.
+
+`src/` production `unsafe` is now **3 sites in 2 files**: `src/main.rs` (2 — the
+`unsafe extern "C"` linker-symbol block and `akuma_fdt::locate`) and
+`src/smp_shared.rs` (1, the same kind of declaration block). **Exactly one of the
+three is a real operation**: `akuma_fdt::locate`, which dereferences a
+firmware-supplied pointer and is irreducible for the reason `akuma-fdt` exists.
+The `#![forbid(unsafe_code)]`-across-`src/` goal is now blocked only on the
+`global_asm!` and `#[unsafe(no_mangle)]` attributes the boot and secondary
+trampolines need — a lint question, not a soundness one.
+
+<a id="no-crate"></a>
+### The one that did not need a crate: the semihosting exit
+
+`src/main.rs`'s last `asm!` was `hlt #0xf000` with `SYS_EXIT_EXTENDED` — ARM
+semihosting, which ends the QEMU process **with an exit code**. That code is the
+only thing it can do that PSCI `SYSTEM_OFF` cannot, so it looked like a crate:
+27 lines, one instruction, on the `akuma-uart` model.
+
+Measuring it before writing the doc is what killed it. The matrix, 2026-09-01,
+with a temporary `halt()` probe at the top of `rust_start`:
+
+| mechanism | `HVF=1` (the default on Apple silicon) | `HVF=0` (TCG) | carries an exit code |
+|---|---|---|---|
+| semihosting `hlt #0xf000` | **wedges the vCPU** | exits 42 | yes |
+| PSCI `SYSTEM_OFF` | exits 0 | exits 0 | no |
+
+Three things fall out of that table, in order of how badly each was assumed
+wrong:
+
+1. **Under HVF the `hlt` does not fall through — it wedges.** The instruction
+   never retires, so the vCPU sits on it forever. The `wfi` loop written
+   underneath it as a "fallback if semihosting is unavailable" was never reached
+   on the default accelerator, and neither was anything else placed after it. A
+   panic on a stock `cargo run` hung the VM instead of stopping it.
+2. **Therefore ordering cannot rescue it.** The natural design — semihosting
+   first for the exit code, PSCI second for everything else — was built and
+   measured, and it hangs under HVF for exactly the reason above: step 2 is
+   unreachable. Reversing the order makes PSCI unconditional and semihosting
+   dead, because PSCI never fails where QEMU runs.
+3. **Nothing reads the exit code.** Every harness under `scripts/` that judges a
+   run detects a panic by grepping the log for `[PANIC]`; the `returncode == 0`
+   checks in `forktest_smp_matrix.py` and `quick_forktest.py` are on *guest*
+   binaries run over ssh, not on QEMU. `sched_audit_matrix.py` prints QEMU's rc
+   and does not branch on it.
+
+So the crate held a mechanism that works only on a non-default accelerator, buys
+a signal nothing consumes, and — by being first in the chain — actively
+prevented the mechanism that does work. `src/main.rs` now calls
+`akuma_psci::call(SYSTEM_OFF, …)` and parks, `halt_with_code` is gone (it could
+not honour a code any more, and a discarded parameter is a lie), and the crate
+was deleted.
+
+**The transferable lesson is about the extraction reflex, not about
+semihosting.** "Which crate should own this `unsafe`?" is the second question.
+The first is "does this operation still do anything?", and it is cheap to
+answer: one probe, two accelerators, ten minutes. Had the crate landed without
+it, the tree would carry a 39th crate whose sole function is to hang the default
+build.
+
+If exit-code fidelity is ever genuinely needed — a CI that wants a panic to be
+`$?` rather than a log grep — the answer is semihosting **under `HVF=0` only**,
+selected by the harness, not by the kernel. The kernel cannot tell the two
+accelerators apart without reading `MIDR_EL1` and guessing.
+
+The run before it, the same day, was
 `python3 scripts/cloc_akuma.py src crates` after the exception path left `src/`
 as `akuma-exceptions`
 ([`AKUMA_EXCEPTIONS_EXTRACTION.md`](../archive/AKUMA_EXCEPTIONS_EXTRACTION.md)).
@@ -199,13 +305,13 @@ to call — see [`AKUMA_EXTRACT_MMAP.md`](../archive/AKUMA_EXTRACT_MMAP.md) §3.
 ## How much of the tree is enforced-safe
 
 Also generated by `scripts/cloc_akuma.py src crates` (2026-09-01, after
-[`AKUMA_EXCEPTIONS_EXTRACTION.md`](../archive/AKUMA_EXCEPTIONS_EXTRACTION.md)):
+[`SRC_BOOT_ENTRY_UNSAFE_CLEANUP.md`](../archive/SRC_BOOT_ENTRY_UNSAFE_CLEANUP.md)):
 
 | | |
 |---|---|
 | enforced unsafe-free crates | **23 of 39** |
-| code in those crates | **25,658 of 49,676** lines under `crates/` (51.7%) |
-| `unsafe` sites across `crates/` | **422** (411 production), of which **0** are inside an enforced crate |
+| code in those crates | **25,658 of 49,706** lines under `crates/` (51.6%) |
+| `unsafe` sites across `crates/` | **423** (412 production), of which **0** are inside an enforced crate |
 
 Both percentages fell, and neither is a regression: 3,120 lines of exception
 handling and 80 `unsafe` sites arrived under `crates/` in one move, enlarging
@@ -442,19 +548,19 @@ crates and a long tail holding one obligation each.
 |---|---:|---|
 | `akuma-exec` | 123 | trap frames, the thread-identity map, context switch, `user_access` |
 | `akuma-exceptions` | 80 | the vector table, the EL0/EL1 trap handlers and the fault repair behind them. Irreducible in the strongest sense on this list: `forbid` rejects `global_asm!` and `#[unsafe(no_mangle)]` outright, and this crate is a vector table plus the five handlers it `bl`s. One stated contract at the top of `lib.rs` covers all 80, the shape `akuma-net-nic` and `akuma-gic` use |
-| `akuma-mmu` | 63 | page tables, `UserAddressSpace`, ASIDs, the per-core TTBR free gate |
+| `akuma-mmu` | 64 | page tables, `UserAddressSpace`, ASIDs, the per-core TTBR free gate. Gained one: `boot_device_l3_phys`, the boot-table walk that let `rebuild_boot_device_table` stop being `unsafe` for its callers |
 | `akuma-virtio` | 38 | MMIO and DMA by definition |
 | `akuma-cpu` | 32 | `asm!` is unconditionally unsafe; the crate exists so ~160 tree-wide sites don't each have to say so |
 | `akuma-net-nic` | 23 | DMA-visible frame arenas, virtio descriptor rings, the NIC MMIO doorbell, and smoltcp's `Device` impls |
 | `akuma-alloc` | 20 | the `GlobalAlloc` impl, raw span claiming into Talc, and the canary reads/writes either side of every user pointer. **Deliberately quarantined rather than reduced** — see below |
-| `src` (bin) | 11 | not a crate and never `forbid`-able as a whole: `src/main.rs`'s boot entry, DTB location and boot device-table rebuild (9), plus one `unsafe extern "C"` linker-symbol block each in `src/boot.rs` and `src/smp_shared.rs`. Was 91 before the exception path left. Its two enforced *subtrees* (`src/syscall/`, `src/console.rs`) read 0 |
+| `src` (bin) | 3 | not a crate and never `forbid`-able as a whole: `akuma_fdt::locate` plus one `unsafe extern "C"` linker-symbol block each in `src/main.rs` and `src/smp_shared.rs`. **Only the first is an operation.** Was 91 before the exception path left, 11 before the boot-entry cleanup. Its two enforced *subtrees* (`src/syscall/`, `src/console.rs`) read 0 |
 | `akuma-locks-rw-cell` | 8 | the `UnsafeCell<T>` derefs that turn an `akuma-locks-rw` ticket into `&T` / `&mut T`, plus the two `Send`/`Sync` impls that let the cell cross cores. Stable Rust cannot mint `&mut T` from `&self` without them, which is exactly why `akuma-locks-rw` carries no value and this crate exists. Irreducible *and* deliberately tiny: 206 lines, generic over `T`, so the obligation is discharged once for every consumer — the same bargain `lock_api` makes |
 | `akuma-gic` | 5 | the whole GICv3 driver — distributor, redistributor, the `ICC_*_EL1` CPU interface. Every address passed to `mmio_w32`/`mmio_r32` is a device-mapped GIC register; do not lower those to `write_volatile`, which may emit a writeback form and make QEMU's HVF backend assert |
 | `akuma-not-even-once` | 5 | `UnsafeCell` boot-registration cells; the safe alternative (`Spinlock<Option<T>>`) is a lock on the hottest indirection in the kernel |
 | `akuma-primitives` | 4 | IRQ masking, per-CPU registers, the console writer |
 | `akuma-fdt` | 3 | materialising the boot DTB: the eight-byte header probe and the `from_raw_parts` that follows it. **The whole crate exists to be these three**, so that `main.rs`, `platform.rs` and `smp_shared.rs` need none — see below |
 | `akuma-pmm` | 3 | the physical frame allocator's own bookkeeping — the invariant that justifies them is this crate's own bitmap state, so they cannot move |
-| `akuma-psci` | 2 | `smc_call` and `hvc_call`, one fixed instruction each with no branch inside the asm. **Deliberately not in `akuma-cpu`**: `smc` with `SYSTEM_OFF` halts the machine and with `CPU_ON` starts a core at an address you supply, so a safe wrapper there would let any safe code in the tree power the box off |
+| `akuma-psci` | 2 | `smc_call` and `hvc_call`, one fixed instruction each with no branch inside the asm. **Deliberately not in `akuma-cpu`**: `smc` with `SYSTEM_OFF` halts the machine and with `CPU_ON` starts a core at an address you supply, so putting it in the crate every module depends on would let any safe code in the tree power the box off. Note the distinction — the *crate's own* `call`/`hvc_call`/`smc_call` are safe `pub fn`s, because the obligation being discharged is the `asm!` keyword; what stays out of `akuma-cpu` is the instruction, not the safety. Since 2026-09-01 this is also the kernel's **only** way to stop a machine: `halt()` calls `SYSTEM_OFF` |
 | `akuma-timer` | 1 | CNTV/PL031 register access |
 | `akuma-uart` | 1 | the single statement that `DEV_UART_VA` is a mapped PL011 window. The crate exists to hold exactly this |
 

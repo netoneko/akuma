@@ -86,8 +86,8 @@ _boot:
 
 _boot_code:
     // Store x0 (DTB pointer from QEMU) before any modification
-    adrp    x1, boot_x0_at_entry
-    add     x1, x1, :lo12:boot_x0_at_entry
+    adrp    x1, BOOT_X0_AT_ENTRY
+    add     x1, x1, :lo12:BOOT_X0_AT_ENTRY
     str     x0, [x1]
     
     // Save DTB pointer
@@ -356,11 +356,6 @@ boot_ttbr0_addr:
 .global boot_ttbr1_addr
 boot_ttbr1_addr:
     .quad   0
-// Debug: store x0 at entry for verification
-.global boot_x0_at_entry
-boot_x0_at_entry:
-    .quad   0xDEADBEEF
-
 // Reserve space for boot page tables (6 pages = 24KB)
 // Pages 0-2: L0 TTBR0, L0 TTBR1, L1 (identity mapping)
 // Pages 3-5: L1, L2, L3 for device MMIO under L0[1]
@@ -385,15 +380,23 @@ boot_page_tables:
 const UART_L3_SLOT: usize =
     (akuma_primitives::addr::DEV_UART_VA - akuma_primitives::addr::DEV_WINDOW_VA) / 4096;
 
-/// Physical address of the L3 table the boot assembly installs under L0[1].
+/// `x0` as the firmware/QEMU left it at the very first instruction of `_boot`,
+/// before anything could modify it — the DTB pointer, on every platform that
+/// passes one.
 ///
-/// `boot_page_tables` reserves six pages; the device L3 is page 5. Rust needs
-/// this to rewrite the device map once the FDT has been read.
+/// The storage is a Rust static rather than a `.quad` in the assembly above so
+/// that reading it needs no `unsafe`: the boot code's `str x0, [x1]` is a plain
+/// aligned 64-bit store, which a relaxed atomic load is entitled to observe. It
+/// lives in `.data.boot` deliberately — the store happens at `_boot + 4`, long
+/// before the `.bss` clear at the top of `_boot_code`, so a `.bss` home would
+/// see the value zeroed back out.
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".data.boot")]
+pub static BOOT_X0_AT_ENTRY: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Read [`BOOT_X0_AT_ENTRY`]. Single writer, in assembly, before Rust runs.
 #[must_use]
-pub fn boot_device_l3_phys() -> usize {
-    unsafe extern "C" {
-        static boot_page_tables: u8;
-    }
-    // SAFETY: taking the address of a linker-provided symbol; no memory access.
-    (&raw const boot_page_tables) as usize + 5 * 4096
+pub fn x0_at_entry() -> u64 {
+    BOOT_X0_AT_ENTRY.load(core::sync::atomic::Ordering::Relaxed)
 }
