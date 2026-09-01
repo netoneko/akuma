@@ -85,6 +85,14 @@ pub struct UserTrapFrame {
     pub elr_el1: u64,
     pub spsr_el1: u64,
     pub tpidr_el0: u64,
+    /// 16-byte alignment pad for the frame the exception vector pushes. Named
+    /// with the leading underscore that the rest of the tree uses for layout
+    /// padding (`akuma-ext2`'s on-disk structs do the same), and `pub` because
+    /// it is written by name in struct literals outside this crate —
+    /// `akuma-exec`'s `sigframe.rs` and the boot suite both build frames.
+    /// Clippy reads `pub _name` as "public but unused"; here the underscore
+    /// means "do not read this", not "unused".
+    #[allow(clippy::pub_underscore_fields)]
     pub _padding: u64,
 }
 
@@ -117,6 +125,7 @@ pub struct Context {
 }
 
 impl Context {
+    #[must_use]
     pub const fn zero() -> Self {
         Self {
             magic: CONTEXT_MAGIC,
@@ -128,6 +137,7 @@ impl Context {
         }
     }
 
+    #[must_use]
     pub fn is_valid(&self) -> bool {
         self.magic == CONTEXT_MAGIC
     }
@@ -150,25 +160,30 @@ pub struct StackInfo {
 }
 
 impl StackInfo {
+    #[must_use]
     pub const fn empty() -> Self {
         Self { base: 0, size: 0, top: 0 }
     }
 
+    #[must_use]
     pub fn new(base: usize, size: usize) -> Self {
         Self { base, size, top: base + size }
     }
 
-    pub fn overlaps(&self, other: &StackInfo) -> bool {
+    #[must_use]
+    pub fn overlaps(&self, other: &Self) -> bool {
         if self.base == 0 || other.base == 0 {
             return false;
         }
         self.base < other.top && other.base < self.top
     }
 
+    #[must_use]
     pub fn contains(&self, addr: usize) -> bool {
         self.base != 0 && addr >= self.base && addr < self.top
     }
 
+    #[must_use]
     pub fn is_allocated(&self) -> bool {
         self.base != 0
     }
@@ -189,6 +204,7 @@ pub struct ThreadSlot {
 }
 
 impl ThreadSlot {
+    #[must_use]
     pub const fn empty() -> Self {
         Self {
             start_time_us: 0,
@@ -220,7 +236,10 @@ pub struct KernelThreadInfo {
 }
 
 /// Snapshot data copied from thread pool (to minimize IRQ-disabled time)
-pub(crate) struct ThreadPoolSnapshot {
+// `pub`, not `pub(crate)`: it was crate-private while this file lived inside
+// `akuma-exec`, and that spelling now means "private to `akuma-exec-core`" —
+// which hides it from its only consumer. Widened on the 2026-09-01 move.
+pub struct ThreadPoolSnapshot {
     pub states: [ThreadState; MAX_THREADS],
     pub sps: [u64; MAX_THREADS],
     pub stacks: [StackInfo; MAX_THREADS],
@@ -246,6 +265,7 @@ pub struct StackAllocationSummary {
 /// `thread_limit` is the number of thread slots that actually get a stack
 /// allocated (`reserved..thread_limit` user slots); it scales with RAM, see
 /// `compute_thread_limit` in src/main.rs. Clamped to `[reserved, MAX_THREADS]`.
+#[must_use]
 pub fn calculate_stack_requirements(
     reserved_threads: usize,
     kernel_stack_size: usize,
@@ -280,10 +300,12 @@ pub fn calculate_stack_requirements(
 }
 
 /// Verify that the thread-stack pool fits in the memory it is actually
-/// allocated from. Stacks come from **PMM** (`alloc_pages_contiguous_zeroed`),
-/// not the kernel heap, so `available_mem` should be the free PMM byte count at
-/// init time (callers historically passed the heap size — that was the bug that
-/// made small-RAM boots panic; see docs/LOW_MEMORY_ENVIRONMENT.md).
+/// allocated from.
+///
+/// Stacks come from **PMM** (`alloc_pages_contiguous_zeroed`), not the kernel
+/// heap, so `available_mem` should be the free PMM byte count at init time.
+/// Callers historically passed the heap size — that was the bug that made
+/// small-RAM boots panic; see `docs/LOW_MEMORY_ENVIRONMENT.md`.
 pub fn verify_stack_memory_params(
     available_mem: usize,
     reserved_threads: usize,

@@ -1,0 +1,15 @@
+[package]
+name = "akuma-exec-core"
+version = "0.1.0"
+edition = "2024"
+description = "The unsafe-free half of akuma-exec: trap-frame/thread-slot types and the pure stack-sizing policy. Depends only on akuma-primitives, so it can forbid unsafe_code."
+
+[dependencies]
+# `MAX_THREADS`/`MAX_CORES` and the per-slot preempt vocabulary. The only
+# dependency, and deliberately a leaf one: anything this crate reaches for that
+# is NOT a plain value means the seam is drawn in the wrong place — the whole
+# point is that nothing here can touch a `Process`, a page table or a lock.
+akuma-primitives = { path = "../akuma-primitives" }
+
+[lints]
+workspace = true

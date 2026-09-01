@@ -60,6 +60,9 @@ debug-info = ["akuma-mmu/debug-info"]
 # functions, so the trivially-dischargeable `unsafe` blocks live in one crate
 # instead of at every call site. Zero dependencies of its own.
 akuma-cpu = { path = "../akuma-cpu" }
+# The unsafe-free half: trap-frame/thread-slot types and stack-sizing policy.
+# Re-exported as `threading::types`, so this crate's call sites are unchanged.
+akuma-exec-core = { path = "../akuma-exec-core" }
 akuma-primitives = { path = "../akuma-primitives" }
 # The BKL protocol + spinlocks, extracted 2026-08-30
 # (docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md §3.4). This crate re-exports it as

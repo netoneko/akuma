@@ -4,7 +4,14 @@
 #![allow(dead_code)]
 
 pub mod sigframe;
-pub mod types;
+/// Trap-frame / thread-slot types and the pure stack-sizing policy.
+///
+/// Moved to `akuma-exec-core` on 2026-09-01 — it was already `alloc` +
+/// `akuma-primitives` only, with 199 lines of host tests, so it was on the wrong
+/// side of a `forbid` it could always have carried. Re-exported under the
+/// original path so `akuma_exec::threading::types::MAX_THREADS` &c. still
+/// resolve for `akuma-exceptions` and `akuma-vfs-glue`.
+pub use akuma_exec_core::thread as types;
 
 pub use types::*;
 

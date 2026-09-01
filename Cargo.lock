@@ -139,6 +139,7 @@ dependencies = [
  "akuma-bkl",
  "akuma-cpu",
  "akuma-elf",
+ "akuma-exec-core",
  "akuma-isolation",
  "akuma-mmap",
  "akuma-mmu",
@@ -150,6 +151,13 @@ dependencies = [
  "lock_api",
  "log",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-exec-core"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
 ]
 
 [[package]]
