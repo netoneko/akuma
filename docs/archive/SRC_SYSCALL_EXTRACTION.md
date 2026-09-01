@@ -6,8 +6,14 @@ in `src/`. It is also what 542 of the boot suite's `crate::` references point at
 so it is the prerequisite for any test crate.
 
 The question asked was "can we just move it to `crates/akuma-syscalls-glue`? looks
-like a clean move." **It is not**, and this doc is the survey that says why, plus
-the first three steps of the answer, which are done.
+like a clean move." **It was not** — and this doc is the survey that said why.
+All of it is done now; the move itself is written up separately in
+[`AKUMA_SYSCALLS_GLUE_EXTRACTION.md`](AKUMA_SYSCALLS_GLUE_EXTRACTION.md).
+
+The survey's value was in what it found *before* anyone started: a dependency
+cycle Cargo cannot express, a second cycle through the test module, and a config
+plan (a 26-field handover struct) that pricing showed would have been a mistake.
+Four things had to move first, **none of them syscall code**.
 
 ## Status
 
@@ -21,7 +27,7 @@ the first three steps of the answer, which are done.
 | 3b | `src/fs.rs` → `akuma-vfs-glue`, `src/pmm.rs` wrappers → `akuma-exec` | **done** |
 | 3c | 539 refs repointed to crate paths | **done** |
 | 4 | `crate::config` → [`akuma-config`](AKUMA_CONFIG_EXTRACTION.md) — a **crate of consts**, not a `SyscallConfig` | **done** |
-| 5 | `src/syscall/` → `akuma-syscalls-glue` | open |
+| 5 | `src/syscall/` → [`akuma-syscalls-glue`](AKUMA_SYSCALLS_GLUE_EXTRACTION.md) | **done** |
 
 Steps 1a–2 are recorded in [§7](#7-what-was-actually-done). The cycle that made
 the move impossible is **broken**: `src/vfs/` no longer exists, and nothing
