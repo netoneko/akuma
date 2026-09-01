@@ -24,9 +24,9 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     #[cfg(feature = "rump")]
     const TUNSETIFF: u32 = 0x4004_54ca;
     // OSS audio ioctls for /dev/dsp (mirror crate::audio constants).
-    const SNDCTL_DSP_SPEED: u32 = crate::audio::SNDCTL_DSP_SPEED;
-    const SNDCTL_DSP_SETFMT: u32 = crate::audio::SNDCTL_DSP_SETFMT;
-    const SNDCTL_DSP_CHANNELS: u32 = crate::audio::SNDCTL_DSP_CHANNELS;
+    const SNDCTL_DSP_SPEED: u32 = akuma_virtio::audio::SNDCTL_DSP_SPEED;
+    const SNDCTL_DSP_SETFMT: u32 = akuma_virtio::audio::SNDCTL_DSP_SETFMT;
+    const SNDCTL_DSP_CHANNELS: u32 = akuma_virtio::audio::SNDCTL_DSP_CHANNELS;
     // Read-only network ioctls (mirror super::net constants) — `ifconfig`.
     #[cfg(feature = "smoltcp")]
     const SIOCGIFCONF: u32 = super::net::SIOCGIFCONF;
@@ -43,7 +43,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     #[cfg(feature = "smoltcp")]
     const SIOCGIFHWADDR: u32 = super::net::SIOCGIFHWADDR;
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
     }
 
@@ -166,9 +166,9 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 return EFAULT;
             }
             let res = match cmd {
-                SNDCTL_DSP_SPEED => crate::audio::set_rate(val),
-                SNDCTL_DSP_SETFMT => crate::audio::set_format_oss(val),
-                SNDCTL_DSP_CHANNELS => crate::audio::set_channels(val),
+                SNDCTL_DSP_SPEED => akuma_virtio::audio::set_rate(val),
+                SNDCTL_DSP_SETFMT => akuma_virtio::audio::set_format_oss(val),
+                SNDCTL_DSP_CHANNELS => akuma_virtio::audio::set_channels(val),
                 _ => unreachable!(),
             };
             if res.is_err() {
@@ -280,7 +280,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             ts.cflag = kernel_buf[2];
             ts.lflag = kernel_buf[3];
             
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] TCSETS: iflag=0x{:x} oflag=0x{:x} cflag=0x{:x} lflag=0x{:x}\n",
                     ts.iflag, ts.oflag, ts.cflag, ts.lflag);
             }
@@ -316,7 +316,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             };
             let ts = term_state_lock.lock();
             let pgid = ts.foreground_pgid;
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] TIOCGPGRP: returning foreground_pgid {}\n", pgid);
             }
             if write_user_val_with(arg, &pgid, Prefault::No).is_err() {
@@ -334,7 +334,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 return EFAULT;
             }
             let mut ts = term_state_lock.lock();
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] TIOCSPGRP: setting foreground_pgid to {}\n", pgid);
             }
             ts.foreground_pgid = pgid;
@@ -343,7 +343,7 @@ pub(super) fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
         _ => ENOTTY,
     };
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(128, "[syscall] ioctl result={}\n", result as i64);
     }
     result
@@ -407,7 +407,7 @@ pub(super) fn sys_get_terminal_attributes(_fd: u64, attr_ptr: u64) -> u64 {
 }
 
 pub(super) fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(64, "[syscall] sys_set_cursor_position({}, {})\n", col, row);
     }
     let row_1 = row + 1;
@@ -417,21 +417,21 @@ pub(super) fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
 }
 
 pub(super) fn sys_hide_cursor() -> u64 {
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(64, "[syscall] sys_hide_cursor()\n");
     }
     write_to_process_channel(b"\x1b[?25l")
 }
 
 pub(super) fn sys_show_cursor() -> u64 {
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(64, "[syscall] sys_show_cursor()\n");
     }
     write_to_process_channel(b"\x1b[?25h")
 }
 
 pub(super) fn sys_clear_screen() -> u64 {
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(64, "[syscall] sys_clear_screen()\n");
     }
     write_to_process_channel(b"\x1b[2J")

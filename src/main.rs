@@ -1092,6 +1092,7 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // Config + the four `/proc` facts only the binary can answer. Must precede
     // the root mount below, which is `akuma_vfs_glue::init`.
     vfs::register();
+    syscall::register();
     // Identity-cache hit counting rides with the epilogue audit: both are
     // measurement, and the hit count is only meaningful next to the miss
     // breakdown. See `config::IDENTITY_AUDIT`.

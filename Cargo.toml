@@ -34,6 +34,7 @@ default-members = [
     "crates/akuma-scheduler",
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-linux",
+    "crates/akuma-syscalls-glue",
     "crates/akuma-vfs-glue",
     "crates/akuma-syscalls-ipc",
     "crates/akuma-syscalls-log",
@@ -191,7 +192,7 @@ default = [
     # gated and why that reason no longer applies.
     "sc-reboot",
 ]
-no-tests = ["akuma-net/small-sockets", "akuma-exceptions/no-tests", "akuma-exec/no-tests"]
+no-tests = ["akuma-net/small-sockets", "akuma-exceptions/no-tests", "akuma-exec/no-tests", "akuma-syscalls-glue/no-tests"]
 
 # Target Firecracker's aarch64 microVM instead of QEMU `virt`.
 #
@@ -253,7 +254,7 @@ rump-tests = []
 # passing) and a same-binary `bkl-profile` A/B on the contention regimen
 # (`irq/sched` 24.7% → 10.2%, 6/6 digests exact both sides). Remove from this
 # list to A/B.
-smp-shared = ["akuma-exec/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-exceptions/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-exceptions/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq", "akuma-syscalls-glue/smp-shared"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
@@ -265,7 +266,7 @@ smp-shared = ["akuma-exec/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-excep
 # (PreemptGuard additionally masks IRQs for those holds — see
 # crates/akuma-net/src/runtime.rs). A no-op (byte-for-byte unchanged) on every
 # build that doesn't set both features.
-no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network", "akuma-primitives/no-bkl-network"]
+no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network", "akuma-primitives/no-bkl-network", "akuma-syscalls-glue/no-bkl-network"]
 
 # Run the VFS syscalls WITHOUT the Big Kernel Lock — Phase 4 of
 # docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the second subsystem carved out
@@ -279,7 +280,7 @@ no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network", "akum
 # IRQs for the ext2/block-device holds — the same hardening that closed the
 # SMP=4 ABBA wedge in net's Phase 2. A no-op (byte-for-byte unchanged) on every
 # build that doesn't set both features.
-no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "akuma-net/no-bkl-vfs", "akuma-primitives/no-bkl-vfs"]
+no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "akuma-net/no-bkl-vfs", "akuma-primitives/no-bkl-vfs", "akuma-syscalls-glue/no-bkl-vfs"]
 
 # Run `fork_process`'s CoW share/demote pass WITHOUT the Big Kernel Lock — Phase 3 of
 # docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the third subsystem carved out (after
@@ -327,7 +328,7 @@ no-bkl-process = ["akuma-exec/no-bkl-process"]
 # reachable from a BKL-free window the way `PreemptGuard` is for net/vfs (see
 # BKL_VFS_CARVE_OUT.md §19.3) — so this is a bin-crate-only feature with nothing
 # to forward into `akuma-exec`.
-no-bkl-mm = []
+no-bkl-mm = ["akuma-syscalls-glue/no-bkl-mm"]
 
 # Run the device-driver syscalls (`getrandom`, `read`/`pread64` on `/dev/urandom`,
 # and `write` on `/dev/dsp`) WITHOUT the Big Kernel
@@ -347,7 +348,7 @@ no-bkl-mm = []
 # Note: this kernel has no graphics output at all. virtio-gpu never existed here,
 # and the ramfb path was removed 2026-08-31
 # (docs/archive/FRAMEBUFFER_REMOVED.md).
-no-bkl-drivers = []
+no-bkl-drivers = ["akuma-syscalls-glue/no-bkl-drivers"]
 
 # Run the timer IRQ (27) dispatch WITHOUT the Big Kernel Lock — Phase 7a of
 # docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7 (see
@@ -406,7 +407,7 @@ net-profile = ["akuma-net/net-profile"]
 # (the wrapper spans are handed up by one flag) — run it with `SMP=1`:
 #   cargo build --release --features read-profile
 # Read `cal=` before believing any stage: it is the cost of the measurement.
-read-profile = []
+read-profile = ["akuma-syscalls-glue/read-profile"]
 
 # Static RX/TX frame rings and a non-blocking transmit path in the virtio-net
 # device (`crates/akuma-net/src/virtio_rings.rs`). NOT in `default` — opt-in.
@@ -525,7 +526,7 @@ net-direct-waker = ["akuma-net/net-direct-waker"]
 # build with --no-default-features and omit it (it targets roomy VMs, not the
 # 4 MB floor). NIC1 itself only exists when the QEMU runner is started with
 # RUMP_NIC=1; without it, tap init no-ops and /dev/net/tap0 returns ENODEV.
-rump = ["akuma-net/rump", "dep:akuma-rump"]
+rump = ["akuma-net/rump", "dep:akuma-rump", "akuma-syscalls-glue/rump"]
 
 # Linux `reboot(2)` -> PSCI SYSTEM_RESET/SYSTEM_OFF (src/syscall/reboot.rs).
 # In `default` since 2026-08-25 (so plain `release` carries it too; nr 142 was
@@ -557,13 +558,13 @@ rump = ["akuma-net/rump", "dep:akuma-rump"]
 # (rump-only, deferred) no longer picks up `smp-shared` transitively — it never
 # asked for it, but if that build is ever meant to have real SMP it must now say
 # so explicitly.
-sc-reboot = ["dep:akuma-boot", "akuma-vfs-glue/sc-reboot"]
+sc-reboot = ["dep:akuma-boot", "akuma-vfs-glue/sc-reboot", "akuma-syscalls-glue/sc-reboot"]
 # The native smoltcp TCP/IP stack (NIC0): the in-kernel socket syscalls, DNS/HTTP,
 # and the built-in SSH server are all built on it. In `default`; the devbox build
 # drops it (rump is the only stack) via --no-default-features, which compiles the
 # whole smoltcp path — and the smoltcp-coupled built-in SSH — out. Enables the
 # matching akuma-net feature.
-smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
+smoltcp = ["dep:smoltcp", "akuma-net/smoltcp", "akuma-syscalls-glue/smoltcp"]
 
 # virtio-sound output driver (src/audio.rs + /dev/dsp). Enabled by default;
 # dropped by the size/extreme profiles' `--no-default-features` builds. Pulls in
@@ -584,7 +585,7 @@ sound = ["virtio-drivers/alloc", "akuma-virtio/sound"]
 # Forwarded to akuma-exec and akuma-ext2 so their build.rs emits the same cfg
 # (warm-stack floor + kernel-stack right-sizing in akuma-exec; block-cache gate
 # in akuma-ext2).
-extreme = ["akuma-exec/extreme", "akuma-ext2/extreme", "akuma-primitives/extreme", "akuma-vfs-glue/extreme", "akuma-config/extreme"]
+extreme = ["akuma-exec/extreme", "akuma-ext2/extreme", "akuma-primitives/extreme", "akuma-vfs-glue/extreme", "akuma-config/extreme", "akuma-syscalls-glue/extreme"]
 
 # Large RAM-sized ext2 block cache with clock eviction (crates/akuma-ext2). Keeps
 # the read-only toolchain resident across the many process spawns in a self-host
@@ -608,14 +609,14 @@ fs-cache = ["akuma-ext2/fs-cache"]
 # Per-family syscall gates. Default-on so `cargo build`/`run`/`test` keep every
 # syscall; the minimal builds use --no-default-features and re-add what they want.
 # Tier 1 — pure dead weight, no akuma-exec callbacks.
-sc-aio          = []
-sc-sysv-ipc     = ["dep:akuma-syscalls-ipc", "akuma-vfs-glue/sc-sysv-ipc"]
-sc-containers   = ["akuma-vfs-glue/sc-containers"]
-sc-timerfd      = []
+sc-aio          = ["akuma-syscalls-glue/sc-aio"]
+sc-sysv-ipc     = ["dep:akuma-syscalls-ipc", "akuma-vfs-glue/sc-sysv-ipc", "akuma-syscalls-glue/sc-sysv-ipc"]
+sc-containers   = ["akuma-vfs-glue/sc-containers", "akuma-syscalls-glue/sc-containers"]
+sc-timerfd      = ["akuma-syscalls-glue/sc-timerfd"]
 # Tier 2 — each needs a no-op ExecRuntime callback stub when off (see main.rs).
-sc-eventfd      = []
-sc-pidfd        = []
-sc-epoll        = []
+sc-eventfd      = ["akuma-syscalls-glue/sc-eventfd"]
+sc-pidfd        = ["akuma-syscalls-glue/sc-pidfd"]
+sc-epoll        = ["akuma-syscalls-glue/sc-epoll"]
 
 # ── devbox: rump as the DEFAULT network stack + no built-in SSH ──────────────
 # Register the NetBSD rump TCP/IP stack as the default stack for box 0 (the root
@@ -767,6 +768,10 @@ akuma-syscalls-linux = { path = "crates/akuma-syscalls-linux" }
 # that is a requirement, not a happy accident (docs/archive/
 # AKUMA_EXTRACT_SYSCALLS.md §7 — the dispatch is the hottest function here).
 akuma-syscalls = { path = "crates/akuma-syscalls" }
+
+# The syscall dispatcher and its families. Was `src/syscall/` — see
+# docs/archive/SRC_SYSCALL_EXTRACTION.md.
+akuma-syscalls-glue = { path = "crates/akuma-syscalls-glue", default-features = false }
 
 # Per-pid syscall trace rings behind `/proc/<pid>/syscalls`. Split out of
 # `src/syscall/` so `src/vfs/proc.rs` can read them without `src/vfs/` depending

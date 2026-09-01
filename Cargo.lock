@@ -29,6 +29,7 @@ dependencies = [
  "akuma-psci",
  "akuma-rump",
  "akuma-syscalls",
+ "akuma-syscalls-glue",
  "akuma-syscalls-ipc",
  "akuma-syscalls-linux",
  "akuma-syscalls-log",
@@ -306,6 +307,40 @@ name = "akuma-syscalls"
 version = "0.1.0"
 dependencies = [
  "akuma-syscalls-linux",
+]
+
+[[package]]
+name = "akuma-syscalls-glue"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-boot",
+ "akuma-config",
+ "akuma-cpu",
+ "akuma-exec",
+ "akuma-isolation",
+ "akuma-mmu",
+ "akuma-net",
+ "akuma-net-unix",
+ "akuma-net-yarn",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-syscalls",
+ "akuma-syscalls-ipc",
+ "akuma-syscalls-linux",
+ "akuma-syscalls-log",
+ "akuma-syscalls-mem",
+ "akuma-syscalls-poll",
+ "akuma-syscalls-sync",
+ "akuma-syscalls-time",
+ "akuma-terminal",
+ "akuma-timer",
+ "akuma-vfs",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "log",
+ "smoltcp",
+ "spinning_top",
 ]
 
 [[package]]

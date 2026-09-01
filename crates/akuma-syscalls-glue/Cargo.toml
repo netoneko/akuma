@@ -1,0 +1,69 @@
+[package]
+name = "akuma-syscalls-glue"
+version = "0.1.0"
+edition = "2024"
+description = "The Linux syscall dispatcher and its per-family implementations"
+
+[dependencies]
+akuma-bkl = { path = "../akuma-bkl" }
+akuma-config = { path = "../akuma-config" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-exec = { path = "../akuma-exec" }
+akuma-isolation = { path = "../akuma-isolation" }
+akuma-mmu = { path = "../akuma-mmu" }
+akuma-net = { path = "../akuma-net", default-features = false }
+akuma-net-unix = { path = "../akuma-net-unix" }
+akuma-net-yarn = { path = "../akuma-net-yarn" }
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-syscalls = { path = "../akuma-syscalls" }
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+akuma-syscalls-log = { path = "../akuma-syscalls-log" }
+akuma-syscalls-mem = { path = "../akuma-syscalls-mem" }
+akuma-syscalls-poll = { path = "../akuma-syscalls-poll" }
+akuma-syscalls-sync = { path = "../akuma-syscalls-sync" }
+akuma-syscalls-time = { path = "../akuma-syscalls-time" }
+akuma-terminal = { path = "../akuma-terminal" }
+akuma-timer = { path = "../akuma-timer" }
+akuma-vfs = { path = "../akuma-vfs" }
+akuma-vfs-glue = { path = "../akuma-vfs-glue" }
+akuma-virtio = { path = "../akuma-virtio" }
+# Optional, gated exactly as the modules they back were in `src/syscall/`.
+akuma-boot = { path = "../akuma-boot", optional = true }
+akuma-syscalls-ipc = { path = "../akuma-syscalls-ipc", optional = true }
+spinning_top = "0.3"
+smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
+log = { version = "0.4", default-features = false }
+
+[features]
+# `default` exists so a bare `cargo build -p akuma-syscalls-glue` (and the
+# pre-commit hook's per-crate clippy) compiles a configuration that a real kernel
+# actually produces. With no features at all, half the socket layer is
+# unreachable and `-D dead-code` fires on code no build ships without.
+#
+# **The bin must therefore use `default-features = false`** — same as it does for
+# `akuma-net` — or an `extreme-size` build would silently gain smoltcp.
+default = ["smoltcp"]
+
+# Every one is forwarded from the bin, which owns the real definitions.
+sc-reboot = ["dep:akuma-boot"]
+sc-sysv-ipc = ["dep:akuma-syscalls-ipc"]
+smp-shared = []
+no-bkl-network = []
+no-bkl-vfs = []
+no-bkl-mm = []
+no-bkl-drivers = []
+no-tests = []
+extreme = []
+smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
+sc-aio = []
+sc-containers = []
+sc-epoll = []
+sc-pidfd = []
+sc-timerfd = []
+sc-eventfd = []
+rump = []
+read-profile = []
+
+[lints]
+workspace = true

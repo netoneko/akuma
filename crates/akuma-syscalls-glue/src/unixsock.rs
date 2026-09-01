@@ -349,7 +349,7 @@ pub fn sys_socket_unix(sock_type: i32, cloexec: bool, nonblock: bool) -> u64 {
     if nonblock {
         proc.set_nonblock(fd);
     }
-    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
         akuma_primitives::safe_print!(96, "[unix] socket(type={}) = fd {}\n", ty.to_raw(), fd);
     }
     u64::from(fd)
@@ -410,7 +410,7 @@ pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
     {
         create_socket_node(p);
     }
-    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
         if let Some(path) = name.path_bytes() {
             akuma_primitives::safe_print!(160, "[unix] bind(fd={}) path len={}\n", fd, path.len());
         } else {
@@ -451,7 +451,7 @@ pub fn sys_listen(fd: u32, backlog: i32) -> u64 {
     };
     match with_table(|t| t.listen(sock, backlog)) {
         Ok(()) => {
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::safe_print!(96, "[unix] listen(fd={}, backlog={})\n", fd, backlog);
             }
             0
@@ -483,7 +483,7 @@ pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
         let outcome = with_table(|t| t.connect(sock, &name, creds));
         match outcome {
             Ok(ConnectOutcome::DgramPeerSet { .. }) => {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     akuma_primitives::safe_print!(96, "[unix] connect(fd={}) dgram peer set\n", fd);
                 }
                 return Ok(0);
@@ -519,7 +519,7 @@ pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
                     });
                 }
                 wake_accept_waiters(listener);
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     akuma_primitives::safe_print!(96, "[unix] connect(fd={}) queued\n", fd);
                 }
                 return Ok(0);
@@ -605,7 +605,7 @@ pub fn sys_accept(fd: u32, addr_ptr: u64, addrlen_ptr: u64, flags: u32) -> u64 {
             akuma_primitives::safe_print!(96, "[unix] accept: addr copyout failed\n");
         }
     }
-    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
         akuma_primitives::safe_print!(96, "[unix] accept(fd={}) = fd {}\n", fd, new_fd);
     }
     u64::from(new_fd)

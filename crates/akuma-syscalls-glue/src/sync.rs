@@ -113,7 +113,7 @@ static FUTEX_TID_KEY: [core::sync::atomic::AtomicU64;
 /// synchronisation point, and it must not add ordering to the futex fast path.
 #[inline]
 fn fe(tid: usize, ev: u64, uaddr: usize) {
-    if !crate::config::FUTEX_ORPHAN_DIAG || tid >= akuma_exec::threading::MAX_THREADS {
+    if !akuma_config::FUTEX_ORPHAN_DIAG || tid >= akuma_exec::threading::MAX_THREADS {
         return;
     }
     use core::sync::atomic::Ordering::Relaxed;
@@ -167,7 +167,7 @@ static WAKE_RING_TS: [core::sync::atomic::AtomicU64; WAKE_RING] = {
 };
 
 fn wake_ring_record(tgid: u32, uaddr: usize, woken: u64) {
-    if !crate::config::FUTEX_ORPHAN_DIAG {
+    if !akuma_config::FUTEX_ORPHAN_DIAG {
         return;
     }
     use core::sync::atomic::Ordering::Relaxed;
@@ -241,7 +241,7 @@ fn futex_key_tgid(is_private: bool, uaddr: usize) -> u32 {
     // handed to the policy — but only when it can change the answer, because it
     // is a map walk on the futex fast path.
     let shared = !is_private
-        && own_tgid.is_some_and(|t| t != 0 && crate::syscall::mem::is_shared_file_mapping(t, uaddr));
+        && own_tgid.is_some_and(|t| t != 0 && crate::mem::is_shared_file_mapping(t, uaddr));
     match akuma_syscalls_sync::namespace(is_private, own_tgid, shared) {
         Namespace::AddressSpace(tgid) => tgid,
         Namespace::Shared => 0,
@@ -282,6 +282,8 @@ fn report_degraded_futex_key() {
 static FUTEX_KEY_DEGRADED_TO_SHARED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Wake up to `max_wake` waiters whose bitset intersects `wake_mask`.
+///
 /// Pop up to `max_wake` waiters from the `(tgid, uaddr)` bucket whose stored bitset
 /// intersects `wake_mask` (`BITSET_MATCH_ANY` for plain `FUTEX_WAKE`/kernel-internal
 /// wakes; `val3` for `FUTEX_WAKE_BITSET`), fire their wakers, and return how many were
@@ -307,8 +309,10 @@ pub fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32, wake_mask: u32) -> 
 }
 
 /// Kernel-internal futex wake (clear_child_tid, robust futex).
-/// Wakes both tgid=0 (shared futex waiters) and tgid=tgid (FUTEX_PRIVATE waiters such
-/// as pthread_join), since we cannot know which variant the waiter used.
+///
+/// Wakes both tgid=0 (shared futex waiters) and tgid=tgid (FUTEX_PRIVATE
+/// waiters such as pthread_join), since we cannot know which variant the waiter
+/// used.
 pub fn futex_wake(tgid: u32, uaddr: usize, max_wake: i32) {
     let n0 = futex_do_wake(0, uaddr, max_wake as u32, BITSET_MATCH_ANY);
     let n1 = if tgid != 0 {
@@ -316,7 +320,7 @@ pub fn futex_wake(tgid: u32, uaddr: usize, max_wake: i32) {
     } else {
         0
     };
-    if crate::config::FUTEX_DBG_ENABLED {
+    if akuma_config::FUTEX_DBG_ENABLED {
         akuma_primitives::tprint!(128, "[clear_child_tid] tgid={} addr={:#x} woke shared={} private={}\n", tgid, uaddr, n0, n1);
     }
 }
@@ -455,7 +459,7 @@ pub fn futex_dump() {
                 let tid = handle.tid();
                 // Age comes from the per-tid event ring (last transition = its enqueue),
                 // so a long-queued waiter is visible without widening `Waiter` itself.
-                let age = if crate::config::FUTEX_ORPHAN_DIAG {
+                let age = if akuma_config::FUTEX_ORPHAN_DIAG {
                     now.saturating_sub(FUTEX_TID_TS[tid].load(core::sync::atomic::Ordering::Relaxed))
                 } else {
                     0
@@ -474,7 +478,7 @@ pub fn futex_dump() {
     // Only when something is actually wedged, and only a few times per boot: each
     // report is tens of lines of serial output, which is itself enough to perturb a
     // timing bug.
-    if crate::config::FUTEX_ORPHAN_DIAG
+    if akuma_config::FUTEX_ORPHAN_DIAG
         && !(stuck.is_empty() && orphans.is_empty())
         && WAKE_RING_DUMPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3
     {
@@ -503,7 +507,7 @@ static WAKE_RING_DUMPS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// in time. See [`futex_orphan_check`] for the legend.
 fn fmt_hist(tid: usize) -> [u8; 16] {
     let mut buf = [b'-'; 16];
-    if !crate::config::FUTEX_ORPHAN_DIAG || tid >= akuma_exec::threading::MAX_THREADS {
+    if !akuma_config::FUTEX_ORPHAN_DIAG || tid >= akuma_exec::threading::MAX_THREADS {
         return buf;
     }
     let hist = FUTEX_TID_HIST[tid].load(core::sync::atomic::Ordering::Relaxed);
@@ -522,7 +526,7 @@ fn fmt_hist(tid: usize) -> [u8; 16] {
 /// Returns each orphan's `(tgid, uaddr)` so the caller can pull the matching wakes.
 fn futex_orphan_check() -> Vec<(u32, usize)> {
     let mut found = Vec::new();
-    if !crate::config::FUTEX_ORPHAN_DIAG {
+    if !akuma_config::FUTEX_ORPHAN_DIAG {
         return found;
     }
     use akuma_exec::threading::{MAX_THREADS, thread_state};
@@ -607,10 +611,11 @@ pub mod test_hooks {
         });
     }
 
-    /// `None` when no queue exists for `key` (distinct from an empty one, which the
-    /// table never stores — every removal path drops an emptied queue). The returned
-    /// tids have their bitset stripped: the deterministic test checks FIFO ordering,
-    /// not bitset bookkeeping.
+/// `None` when no queue exists for `key` (distinct from an empty one, which the
+/// table never stores — every removal path drops an emptied queue).
+///
+/// The returned tids have their bitset stripped: the deterministic test checks
+/// FIFO ordering, not bitset bookkeeping.
     pub fn queue(key: (u32, usize)) -> Option<Vec<usize>> {
         akuma_primitives::irq::with_irqs_disabled(|| FUTEX_WAITERS.lock().queue(key))
     }
@@ -663,7 +668,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
             let tgid = futex_key_tgid(is_private, uaddr);
             let key = (tgid, uaddr);
 
-            if crate::config::FUTEX_DBG_ENABLED {
+            if akuma_config::FUTEX_DBG_ENABLED {
                 let ts = akuma_primitives::clock::uptime_us();
                 akuma_primitives::tprint!(128, "[futex-dbg] WAIT tid={} tgid={} addr={:#x} val={} ts={}us\n", tid, tgid, uaddr, val, ts);
             }
@@ -700,7 +705,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                     op,
                     ts.to_us(),
                     akuma_primitives::clock::uptime_us(),
-                    crate::timer::utc_time_us(),
+                    crate::hooks::utc_time_us(),
                 )
             } else {
                 akuma_syscalls_sync::NEVER
@@ -768,14 +773,14 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                         if cleanup.is_some() {
                             futex_remove_tid_anywhere(tgid, tid);
                         }
-                        if crate::config::FUTEX_DBG_ENABLED {
+                        if akuma_config::FUTEX_DBG_ENABLED {
                             akuma_primitives::tprint!(128, "[futex-dbg] WOKE tid={} addr={:#x} result=EINTR ts={}us\n", tid, uaddr, akuma_primitives::clock::uptime_us());
                         }
                         fe(tid, FE_RET, uaddr);
                         return EINTR;
                     }
                     Step::Woken => {
-                        if crate::config::FUTEX_DBG_ENABLED {
+                        if akuma_config::FUTEX_DBG_ENABLED {
                             akuma_primitives::tprint!(128, "[futex-dbg] WOKE tid={} addr={:#x} result=0 ts={}us\n", tid, uaddr, akuma_primitives::clock::uptime_us());
                         }
                         fe(tid, FE_RET, uaddr);
@@ -785,7 +790,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                         if cleanup.is_some() {
                             futex_remove_tid_anywhere(tgid, tid);
                         }
-                        if crate::config::FUTEX_DBG_ENABLED {
+                        if akuma_config::FUTEX_DBG_ENABLED {
                             akuma_primitives::tprint!(128, "[futex-dbg] WOKE tid={} addr={:#x} result=ETIMEDOUT{} ts={}us\n",
                                 tid, uaddr, if cleanup.is_some() { " (requeued)" } else { "" }, akuma_primitives::clock::uptime_us());
                         }
@@ -816,7 +821,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
         Action::Wake { mask } => {
             let tgid = futex_key_tgid(is_private, uaddr);
             let woken = futex_do_wake(tgid, uaddr, val, mask);
-            if crate::config::FUTEX_DBG_ENABLED {
+            if akuma_config::FUTEX_DBG_ENABLED {
                 // `tgid` is printed because it is the half of the key that can silently
                 // differ between waker and waiter: an exiting thread whose process entry
                 // is already RETIRED resolves `read_current_pid` differently from the
@@ -858,7 +863,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 wake_by_handle(h.0);
             }
 
-            if crate::config::FUTEX_DBG_ENABLED {
+            if akuma_config::FUTEX_DBG_ENABLED {
                 akuma_primitives::tprint!(128, "[futex-dbg] REQUEUE addr={:#x} addr2={:#x} woken={} requeued={} ts={}us\n", uaddr, uaddr2, woken, requeued, akuma_primitives::clock::uptime_us());
             }
             (woken + requeued) as u64
@@ -898,7 +903,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 0
             };
 
-            if crate::config::FUTEX_DBG_ENABLED {
+            if akuma_config::FUTEX_DBG_ENABLED {
                 akuma_primitives::tprint!(128, "[futex-dbg] WAKE_OP addr={:#x} addr2={:#x} old={} new={} woken={}+{} ts={}us\n",
                     uaddr, uaddr2, oldval, newval, woken1, woken2, akuma_primitives::clock::uptime_us());
             }

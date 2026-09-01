@@ -61,10 +61,11 @@ const BLOCKING_POLL_INTERVAL_US: u64 = 10_000;
 /// `docs/reference/subsystems/rump-stack.md` "Known limitations".
 const RUMP_BLOCKING_POLL_INTERVAL_US: u64 = 1_000;
 
-/// Per-iteration blocking-poll sleep ceiling. Rump fds get a shorter interval
-/// because they have no push readiness yet; everything else keeps the 10 ms
-/// default (the `KNOWN_ISSUES.md` #6/#7 fix that bounds per-iteration sleep
-/// when no waker fires).
+/// Per-iteration blocking-poll sleep ceiling.
+///
+/// Rump fds get a shorter interval because they have no push readiness yet;
+/// everything else keeps the 10 ms default (the `KNOWN_ISSUES.md` #6/#7 fix
+/// that bounds per-iteration sleep when no waker fires).
 pub fn effective_poll_interval_us(has_rump_fd: bool) -> u64 {
     if has_rump_fd {
         RUMP_BLOCKING_POLL_INTERVAL_US
@@ -143,7 +144,7 @@ fn fd_set_wants_rump_poll_interval(_readfds: &[u64], _writefds: &[u64], _nfds: u
 // `struct pollfd` and `struct epoll_event` moved to `akuma-syscalls-linux` on
 // 2026-08-27, with the "NOT packed on ARM64, unlike x86_64" note and a test
 // that proves the 16-byte stride. Re-exported so
-// `crate::syscall::poll::EpollEvent` (kernel tests) keeps its spelling — and no
+// `crate::poll::EpollEvent` (kernel tests) keeps its spelling — and no
 // longer behind `sc-epoll`, since `EpollEvent`'s *layout* does not depend on
 // whether this build dispatches `epoll_ctl`.
 pub use super::PollFd;
@@ -162,13 +163,13 @@ fn log_epoll_pwait_return(
     kernel_events: &[EpollEvent],
     note: &'static str,
 ) {
-    if !crate::config::SYSCALL_DEBUG_NET_ENABLED {
+    if !akuma_config::SYSCALL_DEBUG_NET_ENABLED {
         return;
     }
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let elapsed_us = akuma_primitives::clock::uptime_us().saturating_sub(start_time);
     let nready = ready_count;
-    let every = crate::config::EPOLL_ZERO_SAMPLE_INTERVAL.max(1);
+    let every = akuma_config::EPOLL_ZERO_SAMPLE_INTERVAL.max(1);
 
     if timeout == 0 && nready == 0 && iterations == 1 && note.is_empty() {
         let n = EPOLL_PWAIT_ZERO_ZERO_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -280,7 +281,9 @@ fn epoll_reset_edge(fd: u32, bits: u32) {
 
 /// Called when a socket read drained the receive buffer (an `EAGAIN`, or any
 /// successful read — BoringSSL/bun read one TLS record at a time and never
-/// drain to `EAGAIN`). Re-arms the `EPOLLIN` edge so the next arrival fires.
+/// drain to `EAGAIN`).
+///
+/// Re-arms the `EPOLLIN` edge so the next arrival fires.
 #[cfg(feature = "sc-epoll")]
 pub fn epoll_on_fd_drained(fd: u32) {
     epoll_reset_edge(fd, ep::EPOLLIN);
@@ -327,7 +330,7 @@ pub fn sys_epoll_create1(flags: u32) -> u64 {
         if flags & ep::EPOLL_CLOEXEC != 0 {
             proc.set_cloexec(fd);
         }
-        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
             akuma_primitives::tprint!(96, "[epoll] create1() id={} fd={} cloexec={}\n", epoll_id, fd, flags & ep::EPOLL_CLOEXEC != 0);
         }
         u64::from(fd)
@@ -336,10 +339,13 @@ pub fn sys_epoll_create1(flags: u32) -> u64 {
     }
 }
 
-/// Forktest Pattern 2: Go reports crashes at **`PC≈0x13060`** for both **`read`** and **`epoll_ctl`**
-/// (shared syscall trampoline). **`[sigsegv-syscall]`** serial (`src/exceptions.rs`) keys off **`x8`**.
-/// This path uses **`read_user_into`** (validate + prefault + copy) for the 16-byte
-/// AArch64 **`epoll_event`** — see **`docs/GO_FORKTEST_DEBUG.md`** if **`x8==EPOLL_CTL`** at SIGSEGV.
+/// Forktest Pattern 2: Go reports crashes at **`PC≈0x13060`** for both
+/// **`read`** and **`epoll_ctl`** (shared syscall trampoline).
+///
+/// **`[sigsegv-syscall]`** serial (`src/exceptions.rs`) keys off **`x8`**. This
+/// path uses **`read_user_into`** (validate + prefault + copy) for the 16-byte
+/// AArch64 **`epoll_event`** — see **`docs/GO_FORKTEST_DEBUG.md`** if
+/// **`x8==EPOLL_CTL`** at SIGSEGV.
 #[cfg(feature = "sc-epoll")]
 pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
     let epoll_id = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(epfd)) {
@@ -391,7 +397,7 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
     // removing it took the c=1 redis round trip from 303 us to the numbers in
     // `docs/archive/LONG_ROAD_TO_REDIS_PART_2.md` §9. Debug tracing must never
     // be on by default on a request path.
-    if crate::config::SYSCALL_DEBUG_NET_ENABLED
+    if akuma_config::SYSCALL_DEBUG_NET_ENABLED
         && let Some(kind) = outcome.and_then(akuma_syscalls_poll::CtlOutcome::trace_tag)
     {
         akuma_primitives::tprint!(96, "[epoll] ctl {} epfd={} fd={} events=0x{:x}\n", kind, epfd, fd, ev_events);
@@ -421,7 +427,7 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
         // A poll on an fd the calling process cannot see. Rare and always worth
         // knowing about: it is indistinguishable, to the caller, from a socket
         // that died — see `docs/runbooks/cargo-cannot-reach-crates-io.md` § 3.4.
-        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
             akuma_primitives::tprint!(96, "[pollmiss] fd={} -> EPOLLHUP|EPOLLERR (no fd entry)\n", fd_num);
         }
         return readiness(FdState::Missing, requested);
@@ -444,7 +450,7 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                 match super::net::socket_get_udp_handle(idx) {
                     Some(handle) => {
                         let can_recv = akuma_net::smoltcp_net::udp_can_recv(handle);
-                        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                        if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                             akuma_primitives::tprint!(96, "[epoll] check UDP fd={} can_recv={}\n", fd_num, can_recv);
                         }
                         FdState::Udp {
@@ -457,7 +463,7 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
                     None => FdState::Udp { can_recv: false, can_send: false },
                 }
             } else if super::net::socket_is_dead_tcp(idx) {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     akuma_primitives::tprint!(96, "[pollhup] fd={} idx={} state={} req=0x{:x}\n",
                         fd_num, idx, super::net::socket_tcp_state_str(idx), requested);
                 }
@@ -594,7 +600,7 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
         #[cfg(feature = "rump")]
         akuma_exec::process::FileDescriptor::RumpSocket { rump_fd, .. } => FdState::RumpSocket {
             readable: requested & ep::EPOLLIN != 0
-                && crate::rump_proxy::rump_socket_readable(rump_fd),
+                && crate::hooks::rump_socket_readable(rump_fd),
         },
         #[cfg(feature = "rump")]
         akuma_exec::process::FileDescriptor::Tap { .. } => FdState::Tap {
@@ -607,7 +613,7 @@ pub fn epoll_check_fd_readiness(fd_num: u32, requested: u32, waker: Option<&Wake
     let ready = readiness(state, requested);
 
     #[cfg(feature = "smoltcp")]
-    if crate::config::SYSCALL_DEBUG_EPOLL_EDGE
+    if akuma_config::SYSCALL_DEBUG_EPOLL_EDGE
         && let Some((idx, can_recv)) = tcp_trace
     {
         akuma_primitives::tprint!(96, "[epoll-tcp] fd={} idx={} req=0x{:x} can_recv={} ready=0x{:x}\n",
@@ -769,7 +775,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
                 // let this event through. A lost edge is invisible in every
                 // other trace: the fd stays ready, the watcher stays parked,
                 // and nothing reports an error. See `SYSCALL_DEBUG_EPOLL_EDGE`.
-                if crate::config::SYSCALL_DEBUG_EPOLL_EDGE && revents != 0 {
+                if akuma_config::SYSCALL_DEBUG_EPOLL_EDGE && revents != 0 {
                     akuma_primitives::tprint!(
                         160,
                         "[epoll] ET epfd={} fd={} rev=0x{:x} last=0x{:x} new=0x{:x} {}\n",
@@ -803,7 +809,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
         };
 
         // Periodic log for long waits (every ~5 seconds = 500 iterations x 10ms)
-        if crate::config::SYSCALL_DEBUG_NET_ENABLED && iterations.is_multiple_of(500) {
+        if akuma_config::SYSCALL_DEBUG_NET_ENABLED && iterations.is_multiple_of(500) {
             let elapsed = akuma_primitives::clock::uptime_us() - start_time;
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             akuma_primitives::tprint!(192, "[epoll] pwait still waiting: pid={} epfd={} {}us elapsed\n",
@@ -1310,7 +1316,7 @@ pub(super) fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u
         None => (true, 0),
     };
 
-    if crate::config::SYSCALL_DEBUG_NET_ENABLED && nfds > 0 {
+    if akuma_config::SYSCALL_DEBUG_NET_ENABLED && nfds > 0 {
         let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
         akuma_primitives::tprint!(128, "[ppoll] enter: pid={} nfds={} timeout_us={}\n", pid, nfds, 
             if infinite { u64::MAX } else { timeout_us });

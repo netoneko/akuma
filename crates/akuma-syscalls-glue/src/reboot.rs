@@ -1,6 +1,7 @@
-//! `reboot(2)` — `sc-reboot`. ABI decode lives in `akuma_boot` (host-testable);
-//! this just matches the decoded `Action` onto the PSCI call `smp_shared`
-//! already knows how to issue.
+//! `reboot(2)` — the `sc-reboot` syscall.
+//!
+//! ABI decode lives in `akuma_boot` (host-testable); this just matches the
+//! decoded `Action` onto the PSCI call `smp_shared` already knows how to issue.
 
 use super::*;
 

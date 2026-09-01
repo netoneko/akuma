@@ -32,7 +32,7 @@ pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr
     ) {
         Ok(parent) => parent,
         Err(reason) => {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(192, "[register_box] denied box={} root={} caller_box={}: {}\n",
                     id, root, caller_box, reason);
             }
@@ -176,7 +176,7 @@ pub(super) fn sys_mount(
     _data_ptr: u64,
 ) -> SysResult {
     if !caller_may_mount() {
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(128, "[mount] denied: boxed processes may not mount\n");
         }
         return Err(EPERM);
@@ -222,7 +222,7 @@ pub(super) fn sys_mount(
             // The boot disk (vda) is deliberately mountable here too — it is
             // already mounted at `/`, so the duplicate check is the guard.
             let Some(idx) = akuma_virtio::block::device_index_by_name(&source) else {
-                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                     akuma_primitives::safe_print!(128, "[mount] no such device: {}\n", source);
                 }
                 return Err(ENODEV);
@@ -237,7 +237,7 @@ pub(super) fn sys_mount(
             }
         }
         _ => {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(128, "[mount] unsupported fstype: {}\n", fstype);
             }
             return Err(ENODEV);
@@ -269,7 +269,7 @@ pub(super) fn sys_mount(
 ///   are composed from outside via `MOUNT_IN_NS` and torn down with the box.
 pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> SysResult {
     if !caller_may_mount() {
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(128, "[umount2] denied: boxed processes may not unmount\n");
         }
         return Err(EPERM);
@@ -302,7 +302,7 @@ fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::F
     let data = copy_from_user_str(data_ptr, 4096)?;
 
     let opts = parse_options(&data).map_err(|reason| {
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(192, "[mount] overlay options rejected: {}\n", reason);
         }
         EINVAL
@@ -319,7 +319,7 @@ fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::F
     let mut layers = alloc::vec::Vec::with_capacity(dirs.len());
     for dir in &dirs {
         if !akuma_vfs_glue::metadata(dir).is_ok_and(|m| m.is_dir) {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(192, "[mount] overlay layer missing: {}\n", dir);
             }
             return Err(ENOENT);
@@ -375,7 +375,7 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
         // whole class of live-swap games off the table. `replace_box_root` then
         // enforces that the root is still the pristine jail.
         if akuma_exec::process::list_processes().iter().any(|p| p.box_id == box_id) {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(160, "[mount] refusing to re-root live box {}\n", box_id);
             }
             return Err(EPERM);

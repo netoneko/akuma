@@ -49,9 +49,14 @@ pub const VERSION_TRIPLE: [u8; 3] = [0, 0, 8];
 
 /// The commit, as the numeric value of the abbreviated git SHA.
 ///
-/// `build.rs` embeds `AKUMA_GIT_SHA` from `git rev-parse --short HEAD` and
-/// re-runs when `HEAD` moves, so this cannot go stale behind a cache hit. A
-/// build outside a git checkout gets the literal `"unknown"`, which parses to
+/// **This crate's own `build.rs` embeds `AKUMA_GIT_SHA`**, and the binary's no
+/// longer does. `rustc-env` does not propagate across crates, so when this became
+/// a crate the const stopped compiling — and the fix is to move the derivation
+/// down here rather than have the binary compute a value and hand it back
+/// through a hook. Nothing else in the tree reads the variable, so there is still
+/// exactly one `git rev-parse` in the build.
+///
+/// A build outside a git checkout gets the literal `"unknown"`, which parses to
 /// `0` — the same answer as "no commit", which is what it means.
 pub const COMMIT: u32 = parse_hex_prefix(env!("AKUMA_GIT_SHA"));
 
@@ -69,9 +74,11 @@ pub const fn pack(major: u8, minor: u8, patch: u8, commit: u32) -> u64 {
     ((major as u64) << 48) | ((minor as u64) << 40) | ((patch as u64) << 32) | commit as u64
 }
 
-/// The inverse of [`pack`]. Used by the boot test, so it can assert against the
-/// layout rather than against a magic number that would have to be edited in
-/// step with it — a test you have to update to keep passing checks nothing.
+/// The inverse of [`pack`].
+///
+/// Used by the boot test, so it can assert against the layout rather than
+/// against a magic number that would have to be edited in step with it — a test
+/// you have to update to keep passing checks nothing.
 ///
 /// Also used by the round-trip assertion below, which is what keeps it from
 /// being dead code in a `no-tests` build. That is the better answer than a

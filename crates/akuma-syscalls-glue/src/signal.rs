@@ -218,6 +218,8 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
     0
 }
 
+/// `rt_sigtimedwait` — synchronously wait for queued signals.
+///
 /// rt_sigtimedwait - synchronously wait for queued signals
 /// set: signals to wait for
 /// info: pointer to siginfo_t structure (ignored for now)
@@ -287,7 +289,7 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
     if sig == 0 { return 0; }
     if sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }
 
-    if crate::config::TRACE_TKILL {
+    if akuma_config::TRACE_TKILL {
         akuma_primitives::safe_print!(128, "[signal] tkill(tid={}, sig={}) from slot={}\n",
             tid, sig, akuma_exec::threading::current_thread_id());
     }
@@ -313,7 +315,7 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
         return 0;
     }
 
-    if crate::config::TRACE_TKILL {
+    if akuma_config::TRACE_TKILL {
         let kind = match target_handler {
             akuma_exec::process::SignalHandler::Ignore => "IGN",
             akuma_exec::process::SignalHandler::Default => "DFL",

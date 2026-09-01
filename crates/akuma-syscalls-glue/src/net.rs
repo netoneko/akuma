@@ -125,7 +125,7 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
             if nonblock {
                 proc.set_nonblock(fd);
             }
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::safe_print!(96, "[syscall] socket(type={}) = fd {}\n", if base_type == 2 { "UDP" } else { "TCP" }, fd);
             }
             return u64::from(fd);
@@ -155,7 +155,7 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
     let nonblock = sock_type & 0x800 != 0;
     // Only AF_UNIX (1); accept SOCK_STREAM (1) and SOCK_SEQPACKET (5).
     if domain != 1 || (base_type != 1 && base_type != 5) {
-        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
             akuma_primitives::safe_print!(96, "[syscall] socketpair(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
         }
         return EAFNOSUPPORT;
@@ -216,7 +216,7 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
         super::unixsock::socketpair_rollback(sock0, sock1);
         return EFAULT;
     }
-    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
         akuma_primitives::safe_print!(96, "[syscall] socketpair(AF_UNIX) = ({}, {})\n", fd0, fd1);
     }
     0
@@ -337,7 +337,7 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
         return EFAULT;
     }
     let addr = sa.to_addr();
-    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
         akuma_primitives::safe_print!(96, "[syscall] connect(fd={}, ip={}.{}.{}.{}:{})\n", fd, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port);
     }
     let idx = match get_socket_from_fd(fd) {
@@ -347,19 +347,19 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     let nonblock = fd_is_nonblock(fd);
     match socket::socket_connect(idx, addr, nonblock) {
         Ok(()) => {
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::safe_print!(64, "[syscall] connect(fd={}) = OK\n", fd);
             }
             0
         }
         Err(e) if e == libc_errno::EINPROGRESS => {
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::safe_print!(64, "[syscall] connect(fd={}) = EINPROGRESS\n", fd);
             }
             EINPROGRESS
         }
         Err(e) => {
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::safe_print!(64, "[syscall] connect(fd={}) = err {}\n", fd, e);
             }
             neg_errno(e)
@@ -563,11 +563,11 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
             // Gated like the DNS trace directly below it — this fires on EVERY
             // sendto, i.e. per datagram on the UDP send path. Same class as the
             // ungated `epoll_ctl` trace in poll.rs (LONG_ROAD_TO_REDIS_PART_2.md §9).
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::safe_print!(96, "[syscall] sendto(fd={}, len={}, dest={}.{}.{}.{}:{})\n", fd, len, a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.port);
             }
             // Extra debug for DNS traffic
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED && a.port == 53 {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED && a.port == 53 {
                 akuma_primitives::tprint!(128, "[DNS] query sent: fd={} len={} to {}.{}.{}.{}:53\n", 
                     fd, len, a.ip[0], a.ip[1], a.ip[2], a.ip[3]);
             }
@@ -580,13 +580,13 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
         };
         match socket::socket_send_udp(idx, buf, dest) {
             Ok(n) => {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED && dest.port == 53 {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED && dest.port == 53 {
                     akuma_primitives::tprint!(64, "[DNS] query sent OK: {} bytes\n", n);
                 }
                 n as u64
             }
             Err(e) => {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED && dest.port == 53 {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED && dest.port == 53 {
                     akuma_primitives::tprint!(64, "[DNS] query send error: {}\n", e);
                 }
                 neg_errno(e)
@@ -633,12 +633,12 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
     let nonblock = fd_is_nonblock(fd);
 
     if socket::is_udp_socket(idx) {
-        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
             akuma_primitives::tprint!(96, "[UDP] recvfrom: fd={} len={} nonblock={}\n", fd, len, nonblock);
         }
         match socket::socket_recv_udp(idx, &mut kernel_buf, nonblock) {
             Ok((n, from)) => {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     let ip = from.ip;
                     akuma_primitives::tprint!(96, "[UDP] recvfrom OK: {} bytes from {}.{}.{}.{}:{}\n", 
                         n, ip[0], ip[1], ip[2], ip[3], from.port);
@@ -658,7 +658,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
                 n as u64
             }
             Err(e) => {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED && e != libc_errno::EAGAIN {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED && e != libc_errno::EAGAIN {
                     akuma_primitives::tprint!(64, "[UDP] recvfrom error: {}\n", e);
                 }
                 neg_errno(e)
@@ -667,7 +667,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
     } else {
         match socket::socket_recv(idx, &mut kernel_buf, nonblock) {
             Ok(n) => {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     akuma_primitives::tprint!(96, "[TCP] recvfrom fd={} got={}\n", fd, n);
                 }
                 if copy_to_user(buf_ptr, &kernel_buf[..n]).is_err() {
@@ -680,7 +680,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
                 n as u64
             }
             Err(e) => {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     akuma_primitives::tprint!(64, "[TCP] recvfrom fd={} err={}\n", fd, e);
                 }
                 if e == libc_errno::EAGAIN {
@@ -822,7 +822,7 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                     }
                 }
                 _ => {
-                    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                         akuma_primitives::tprint!(128, "[setsockopt] SOL_SOCKET optname={} ignored\n", optname);
                     }
                     0
@@ -843,7 +843,7 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
                     0
                 }
                 _ => {
-                    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                    if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                         akuma_primitives::tprint!(128, "[setsockopt] IPPROTO_TCP optname={} ignored\n", optname);
                     }
                     0
@@ -851,7 +851,7 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
             }
         }
         _ => {
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::tprint!(128, "[setsockopt] level={} optname={} ignored\n", level, optname);
             }
             0
@@ -968,7 +968,7 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
     // `SO_ERROR` is what a non-blocking connect's outcome is read through, so
     // its value and the socket state behind it are the two things any connect
     // investigation needs side by side.
-    if crate::config::SYSCALL_DEBUG_NET_ENABLED && level == SOL_SOCKET && optname == SO_ERROR {
+    if akuma_config::SYSCALL_DEBUG_NET_ENABLED && level == SOL_SOCKET && optname == SO_ERROR {
         let st = get_socket_from_fd(fd).map_or("no-fd", socket_tcp_state_str);
         akuma_primitives::tprint!(96, "[soerr] fd={} val={} state={}\n", fd, val, st);
     }
@@ -999,6 +999,10 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
 /// §3q).
 ///
 /// Returns `Err(errno)` on a bad pointer or an unsatisfiable allocation.
+// Every caller is `#[cfg(feature = "smoltcp")]`, so this carries the same gate.
+// It was ungated while this file lived in the binary and the workspace's
+// `dead_code = "deny"` did not catch it; as a crate it does.
+#[cfg(feature = "smoltcp")]
 fn gather_iovecs(iovs: &[super::fs::IoVec]) -> Result<alloc::vec::Vec<u8>, u64> {
     let total: usize = iovs.iter().map(|v| v.iov_len).sum();
     if total == 0 {
@@ -1143,6 +1147,10 @@ pub(super) fn unix_recvmsg_entry(fd: u32, msg_ptr: u64, flags: i32) -> u64 {
 /// separately. Ignoring it would make `sendmsg` work on connected sockets only,
 /// silently, and datagram libraries reach for `sendmsg` precisely when they have
 /// both a destination and multiple buffers.
+// Every caller is `#[cfg(feature = "smoltcp")]`, so this carries the same gate.
+// It was ungated while this file lived in the binary and the workspace's
+// `dead_code = "deny"` did not catch it; as a crate it does.
+#[cfg(feature = "smoltcp")]
 fn unix_sendmsg(fd: u32, msg: &MsgHdr, iovs: &[super::fs::IoVec], flags: i32) -> SysResult {
     let dest = super::unixsock::read_dest(msg.msg_name, msg.msg_namelen as usize)?;
     let buf = gather_iovecs(iovs)?;
@@ -1249,7 +1257,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         }
     } else {
         let result = socket::socket_send(idx, &kernel_buf, fd_is_nonblock(fd));
-        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
             match &result {
                 Ok(n) => akuma_primitives::tprint!(96, "[TCP] sendmsg fd={} len={} sent={}\n", fd, kernel_buf.len(), n),
                 Err(e) => akuma_primitives::tprint!(64, "[TCP] sendmsg fd={} err={}\n", fd, e),
@@ -1380,12 +1388,12 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     let nonblock = fd_is_nonblock(fd);
 
     if socket::is_udp_socket(idx) {
-        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
             akuma_primitives::tprint!(96, "[UDP] recvmsg: fd={} buflen={} nonblock={}\n", fd, kernel_buf.len(), nonblock);
         }
         match socket::socket_recv_udp(idx, &mut kernel_buf, nonblock) {
             Ok((n, from)) => {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     let ip = from.ip;
                     akuma_primitives::tprint!(96, "[UDP] recvmsg OK: {} bytes from {}.{}.{}.{}:{}\n",
                         n, ip[0], ip[1], ip[2], ip[3], from.port);
@@ -1406,7 +1414,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 n as u64
             }
             Err(e) => {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED && e != libc_errno::EAGAIN {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED && e != libc_errno::EAGAIN {
                     akuma_primitives::tprint!(64, "[UDP] recvmsg error: {}\n", e);
                 }
                 neg_errno(e)
@@ -1415,7 +1423,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     } else {
         match socket::socket_recv(idx, &mut kernel_buf, nonblock) {
             Ok(n) => {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     akuma_primitives::tprint!(96, "[TCP] recvmsg fd={} got={}\n", fd, n);
                 }
                 if copy_to_user(iov.iov_base, &kernel_buf[..n]).is_err() {
@@ -1430,7 +1438,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 n as u64
             }
             Err(e) => {
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     akuma_primitives::tprint!(64, "[TCP] recvmsg fd={} err={}\n", fd, e);
                 }
                 if e == libc_errno::EAGAIN {
@@ -1442,6 +1450,10 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     }
 }
 
+// Every caller is `#[cfg(feature = "smoltcp")]`, so this carries the same gate.
+// It was ungated while this file lived in the binary and the workspace's
+// `dead_code = "deny"` did not catch it; as a crate it does.
+#[cfg(feature = "smoltcp")]
 pub(super) fn get_socket_from_fd(fd: u32) -> Option<usize> {
     let proc = akuma_exec::process::current_process_shared()?;
     if let Some(akuma_exec::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd) { Some(idx) } else { None }
@@ -1504,7 +1516,7 @@ pub(super) fn socket_can_recv_tcp(idx: usize) -> bool {
     // calls `accept` until a poll tells it to. Called with no socket-table lock
     // held: `listener_ready` takes that lock itself.
     if let Some(ready) = akuma_net::socket::listener_ready(idx) {
-        if crate::config::SYSCALL_DEBUG_EPOLL_EDGE {
+        if akuma_config::SYSCALL_DEBUG_EPOLL_EDGE {
             let (listening, pending, dead) =
                 akuma_net::socket::listener_backlog_census(idx).unwrap_or((0, 0, 0));
             akuma_primitives::tprint!(160, "[epoll-listener] idx={} ready={} backlog={}/{}/{}\n",
@@ -1745,14 +1757,15 @@ pub fn run_socket_timeout_tests() {
     }
 }
 
-/// Boot self-test for the net bounce-buffer allocator. Verifies the
-/// degradation policy that keeps an oversized socket send/recv from aborting
-/// the whole kernel under PMM exhaustion (the EC=0x3c `brk #1` crash seen when
-/// llama-server streamed HTTP while an 84 MB model had drained a 64 MB VM —
-/// the 64 KiB bounce buffer needs 16 *contiguous* pages, which a fragmented
-/// pool can't grow into, so the infallible `vec![]` routed through
-/// `handle_alloc_error` → `brk #1`). The fix allocates *fallibly* and backs
-/// off to a single page, then to ENOMEM — never aborting.
+/// Boot self-test for the net bounce-buffer allocator.
+///
+/// Verifies the degradation policy that keeps an oversized socket send/recv
+/// from aborting the whole kernel under PMM exhaustion (the EC=0x3c `brk #1`
+/// crash seen when llama-server streamed HTTP while an 84 MB model had drained
+/// a 64 MB VM — the 64 KiB bounce buffer needs 16 *contiguous* pages, which a
+/// fragmented pool can't grow into, so the infallible `vec![]` routed through
+/// `handle_alloc_error` → `brk #1`). The fix allocates *fallibly* and backs off
+/// to a single page, then to ENOMEM — never aborting.
 #[cfg(kernel_tests)]
 pub fn run_net_bounce_tests() {
     // --- Pure size-plan boundaries (no RAM touched) ---

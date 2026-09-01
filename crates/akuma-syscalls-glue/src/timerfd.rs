@@ -58,7 +58,7 @@ pub(super) fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
     let timer_id = TIMERFD_NEXT_ID.fetch_add(1, Ordering::Relaxed);
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::TimerFd(timer_id));
-        if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
             akuma_primitives::safe_print!(96, "[timerfd] create id={} fd={} clk={} fl={}\n", timer_id, fd, clockid, flags);
         }
         u64::from(fd)
@@ -104,7 +104,7 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
         initial_us
     };
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(128, "[timerfd] settime id={} initial={}us interval={}us\n",
         timer_id, effective_initial, interval_us);
     }

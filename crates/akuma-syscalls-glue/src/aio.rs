@@ -118,7 +118,7 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
         return EFAULT;
     }
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::tprint!(64, "[io_setup] nr_events={} ring_va=0x{:x}\n", capped_nr, ring_va);
     }
     0
@@ -136,7 +136,7 @@ pub(super) fn sys_io_submit(ctx: u64, _nr: i64, _iocbpp: u64) -> u64 {
     // the flag off (every shipping profile) that made three stub syscalls each
     // mask IRQs and take a lock to decide a string nobody prints. See
     // docs/archive/CONSOLE_LOG_COST.md §9.
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         let exists = akuma_primitives::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
         if exists {
             akuma_primitives::tprint!(128, "[io_submit] ctx=0x{:x} nr={} → stub 0\n", ctx, _nr);
@@ -158,7 +158,7 @@ pub(super) fn sys_io_cancel(ctx: u64, _iocb: u64, _result: u64) -> u64 {
     // the flag off (every shipping profile) that made three stub syscalls each
     // mask IRQs and take a lock to decide a string nobody prints. See
     // docs/archive/CONSOLE_LOG_COST.md §9.
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         let exists = akuma_primitives::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
         if exists {
             akuma_primitives::tprint!(128, "[io_cancel] ctx=0x{:x} → 0\n", ctx);
@@ -182,7 +182,7 @@ pub(super) fn sys_io_getevents(ctx: u64, _min_nr: i64, _nr: i64, _events: u64, _
     // the flag off (every shipping profile) that made three stub syscalls each
     // mask IRQs and take a lock to decide a string nobody prints. See
     // docs/archive/CONSOLE_LOG_COST.md §9.
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         let exists = akuma_primitives::irq::with_irqs_disabled(|| AIO_CONTEXTS.lock().contains_key(&ctx));
         if !exists {
             akuma_primitives::tprint!(128, "[io_getevents] ctx=0x{:x} not found → 0\n", ctx);
@@ -205,12 +205,12 @@ pub(super) fn sys_io_destroy(ctx: u64) -> u64 {
         // freed when the process exits (or we could unmap it here, but
         // leaving it mapped until exit is safe since bun never reuses the
         // address and the page is read-only after io_destroy).
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::tprint!(64, "[io_destroy] ctx=0x{:x} destroyed\n", ctx);
         }
         0
     } else {
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::tprint!(96, "[io_destroy] ctx=0x{:x} not found → 0 (avoid EINVAL for Go)\n", ctx);
         }
         0

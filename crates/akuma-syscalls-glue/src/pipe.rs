@@ -14,9 +14,11 @@ struct KernelPipe {
     pollers: PollerMap<usize, WakeHandle>,
 }
 
-/// Maximum kernel pipe buffer capacity (bytes). Matches Linux's default pipe size
-/// (64 KiB). A write that would exceed it is truncated to the space available, and a
-/// write to an already-full pipe accepts nothing — see `pipe_write`'s contract.
+/// Maximum kernel pipe buffer capacity (bytes).
+///
+/// Matches Linux's default pipe size (64 KiB). A write that would exceed it is
+/// truncated to the space available, and a write to an already-full pipe
+/// accepts nothing — see `pipe_write`'s contract.
 ///
 /// Before this cap, `pipe.buffer` was an unbounded `VecDeque` that grew to whatever a
 /// writer pushed, which is a userspace-driven unbounded kernel allocation. Two distinct
@@ -96,7 +98,7 @@ pub fn pipe_create() -> u32 {
             pollers: PollerMap::new(),
         });
     });
-    if crate::config::PIPE_TRACE_ENABLED {
+    if akuma_config::PIPE_TRACE_ENABLED {
         akuma_primitives::safe_print!(64, "[pipe] create id={}\n", id);
     }
     id
@@ -108,12 +110,12 @@ pub fn pipe_clone_ref(id: u32, is_write: bool) {
         if let Some(pipe) = pipes.get_mut(&id) {
             if is_write {
                 pipe.write_count += 1;
-                if crate::config::PIPE_TRACE_ENABLED {
+                if akuma_config::PIPE_TRACE_ENABLED {
                     akuma_primitives::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
                 }
             } else {
                 pipe.read_count += 1;
-                if crate::config::PIPE_TRACE_ENABLED {
+                if akuma_config::PIPE_TRACE_ENABLED {
                     akuma_primitives::safe_print!(128, "[pipe] clone_ref id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
                 }
             }
@@ -146,9 +148,11 @@ pub fn pipe_poller_count(id: u32) -> usize {
     })
 }
 
-/// Write data to a pipe. Returns Ok(n) for the number of bytes accepted, or Err(EPIPE)
-/// if the pipe has been destroyed (no readers left or pipe removed). On Linux, writing
-/// to a broken pipe delivers SIGPIPE and returns EPIPE; callers must replicate this.
+/// Write data to a pipe.
+///
+/// Returns Ok(n) for the number of bytes accepted, or Err(EPIPE) if the pipe
+/// has been destroyed (no readers left or pipe removed). On Linux, writing to a
+/// broken pipe delivers SIGPIPE and returns EPIPE; callers must replicate this.
 ///
 /// # Short writes
 /// Since `PIPE_CAPACITY` landed this is a **partial** write: `n` may be less than
@@ -184,7 +188,7 @@ pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
 
             Ok(n)
         } else {
-            if crate::config::PIPE_TRACE_ENABLED {
+            if akuma_config::PIPE_TRACE_ENABLED {
                 akuma_primitives::safe_print!(128, "[pipe] write WARN: pipe id={} not found (len={})\n", id, data.len());
             }
             Err(false)
@@ -280,7 +284,7 @@ pub fn pipe_close_write(id: u32) {
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.write_count = pipe.write_count.saturating_sub(1);
             // Always log close_write so we can trace use-after-close bugs.
-            if crate::config::PIPE_TRACE_ENABLED {
+            if akuma_config::PIPE_TRACE_ENABLED {
                 akuma_primitives::safe_print!(128, "[pipe] close_write id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
             }
             
@@ -292,13 +296,13 @@ pub fn pipe_close_write(id: u32) {
             }
 
             if pipe.write_count == 0 && pipe.read_count == 0 {
-                if crate::config::PIPE_TRACE_ENABLED {
+                if akuma_config::PIPE_TRACE_ENABLED {
                     akuma_primitives::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 }
                 pipes.remove(&id);
                 destroyed = true;
             }
-        } else if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        } else if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::tprint!(64, "[pipe] close_rw WARN: id={} not found\n", id);
         }
         destroyed
@@ -325,7 +329,7 @@ pub fn pipe_close_read(id: u32) {
         if let Some(pipe) = pipes.get_mut(&id) {
             pipe.read_count = pipe.read_count.saturating_sub(1);
             // Always log close_read so we can trace use-after-close bugs.
-            if crate::config::PIPE_TRACE_ENABLED {
+            if akuma_config::PIPE_TRACE_ENABLED {
                 akuma_primitives::safe_print!(128, "[pipe] close_read id={} write_count={} read_count={}\n", id, pipe.write_count, pipe.read_count);
             }
 
@@ -349,13 +353,13 @@ pub fn pipe_close_read(id: u32) {
             }
 
             if pipe.write_count == 0 && pipe.read_count == 0 {
-                if crate::config::PIPE_TRACE_ENABLED {
+                if akuma_config::PIPE_TRACE_ENABLED {
                     akuma_primitives::safe_print!(64, "[pipe] DESTROY id={} (both counts 0)\n", id);
                 }
                 pipes.remove(&id);
                 destroyed = true;
             }
-        } else if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        } else if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::tprint!(64, "[pipe] close_rw WARN: id={} not found\n", id);
         }
         destroyed
@@ -371,9 +375,11 @@ pub fn pipe_close_read(id: u32) {
 }
 
 /// Atomically check if there is data (or EOF) available on the pipe, and if
-/// not, register `tid` as the blocking reader. Returns `true` if the caller
-/// should NOT block (data available, EOF, or pipe gone), `false` if it should
-/// block (and the tid has been registered so it will be woken on next write).
+/// not, register `tid` as the blocking reader.
+///
+/// Returns `true` if the caller should NOT block (data available, EOF, or pipe
+/// gone), `false` if it should block (and the tid has been registered so it
+/// will be woken on next write).
 ///
 /// This eliminates the TOCTOU window in the old two-step:
 ///   pipe_read() → (empty, no-eof) → pipe_set_reader_thread() → schedule_blocking()
@@ -404,10 +410,11 @@ pub fn pipe_is_poller_registered(id: u32, tid: usize) -> bool {
 }
 
 /// Atomically check if there is space available to write to the pipe, and if
-/// not, register `tid` as a blocking writer. Returns `true` if the caller
-/// should NOT block (space available, no readers, or pipe gone), `false` if it
-/// should block (and the tid has been registered so it will be woken when the
-/// reader drains data).
+/// not, register `tid` as a blocking writer.
+///
+/// Returns `true` if the caller should NOT block (space available, no readers,
+/// or pipe gone), `false` if it should block (and the tid has been registered
+/// so it will be woken when the reader drains data).
 pub fn pipe_check_set_writer(id: u32, tid: usize) -> bool {
     akuma_primitives::irq::with_irqs_disabled(|| {
         let mut pipes = PIPES.lock();
@@ -441,11 +448,12 @@ pub fn pipe_can_read(id: u32) -> bool {
 }
 
 /// True once every write end is gone (or the pipe is already destroyed): the
-/// read end can never produce anything but EOF again. This is `POLLHUP` on a
-/// pipe read end, and it is the bit that distinguishes "drained, writer still
-/// alive" from "at EOF" — `pipe_can_read` folds both into one `POLLIN`, so an
-/// edge-triggered watcher has nothing else to key the EOF transition on.
-/// See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
+/// read end can never produce anything but EOF again.
+///
+/// This is `POLLHUP` on a pipe read end, and it is the bit that distinguishes
+/// "drained, writer still alive" from "at EOF" — `pipe_can_read` folds both
+/// into one `POLLIN`, so an edge-triggered watcher has nothing else to key the
+/// EOF transition on. See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
 pub fn pipe_hup(id: u32) -> bool {
     akuma_primitives::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).is_none_or(|p| p.write_count == 0)
@@ -458,9 +466,12 @@ pub fn pipe_bytes_available(id: u32) -> usize {
     })
 }
 
-/// Whether a write would make progress: a live reader AND room under `PIPE_CAPACITY`.
-/// The capacity term is what stops poll/epoll from reporting POLLOUT on a full pipe and
-/// spinning a userspace event loop. `pub` to match `pipe_can_read` (asserted by tests).
+/// Whether a write would make progress: a live reader AND room under
+/// `PIPE_CAPACITY`.
+///
+/// The capacity term is what stops poll/epoll from reporting POLLOUT on a full
+/// pipe and spinning a userspace event loop. `pub` to match `pipe_can_read`
+/// (asserted by tests).
 pub fn pipe_can_write(id: u32) -> bool {
     akuma_primitives::irq::with_irqs_disabled(|| {
         PIPES.lock().get(&id).is_some_and(|p| p.read_count > 0 && p.buffer.len() < PIPE_CAPACITY)

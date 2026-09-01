@@ -62,7 +62,7 @@ pub(super) type MmBklGuard = ToggledGuard<MmBkl>;
 // `sys_mmap` and the diagnostic helpers below; moved on from there to
 // `akuma-syscalls-linux` on 2026-08-27, which is where the "values match Linux
 // AArch64" claim is now actually checked. Re-exported so
-// `crate::syscall::mem::MAP_FIXED` (kernel tests) keeps its spelling.
+// `crate::mem::MAP_FIXED` (kernel tests) keeps its spelling.
 
 pub use akuma_syscalls_linux::flags::map::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE,
@@ -83,33 +83,44 @@ pub use akuma_syscalls_linux::flags::map::{
 // `dontneed_share_break` climbing on a fork-heavy workload is the corruption that
 // is no longer happening.
 
-/// `MADV_DONTNEED` calls whose start address was not page-aligned. Linux rejects
-/// these with `EINVAL`; rounding the start DOWN pulls the caller's live head page
-/// into the zeroed range. Still unfixed — deliberately a separate cycle
-/// (`CARGO_HEAP_NULL_RC.md` § "The fix", follow-on 1); it has never read non-zero.
+/// `MADV_DONTNEED` calls whose start address was not page-aligned.
+///
+/// Linux rejects these with `EINVAL`; rounding the start DOWN pulls the
+/// caller's live head page into the zeroed range. Still unfixed — deliberately
+/// a separate cycle (`CARGO_HEAP_NULL_RC.md` § "The fix", follow-on 1); it has
+/// never read non-zero.
 pub static DONTNEED_UNALIGNED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// Pages whose frame was shared with another address space (`cow_ref >= 2` — a
+/// Pages that took the share-breaking path instead of being zeroed in place.
+    ///
+    /// Their frame was shared with another address space (`cow_ref >= 2` — a
 /// post-fork CoW page or a `file_page_cache` page) and which therefore took the
-/// share-breaking path instead of being zeroed in place. Before 2026-08-14 every
-/// one of these wiped a frame some other address space still maps.
+/// share-breaking path instead of being zeroed in place.
+///
+/// Before 2026-08-14 every one of these wiped a frame some other address space
+/// still maps.
 pub static DONTNEED_SHARED_FRAME: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// Shared pages left **untouched** because no replacement frame was available:
+/// Shared pages left **untouched** for want of a replacement frame.
+    ///
+    /// Either
 /// the PMM had none (`MADV_DONTNEED` is advisory, so failing to zero beats
 /// wiping a peer), or a fork landed between this handler's classify and apply
-/// passes and made a page shared that was private a moment earlier. Expected 0;
-/// a climbing value means memory pressure is reaching this path.
+/// passes and made a page shared that was private a moment earlier.
+///
+/// Expected 0; a climbing value means memory pressure is reaching this path.
 pub static DONTNEED_SHARE_BREAK_SKIPPED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// `MADV_DONTNEED` pages that were **file-backed**, and so had their mapping dropped
-/// (Linux's behaviour) instead of being zeroed in place or replaced with a private
-/// zero frame. Before this, both of the other actions made an mmap'd file read back as
-/// zeros permanently — see `MADV_DONTNEED_SHARED_FRAME.md` "Still open" item 2, and
-/// `FPCACHE_ZERO_PAGE_POISONING.md` for the hunt that ended here.
+/// `MADV_DONTNEED` pages that were **file-backed**, and so had their mapping
+/// dropped (Linux's behaviour) instead of being zeroed in place or replaced
+/// with a private zero frame.
+///
+/// Before this, both of the other actions made an mmap'd file read back as
+/// zeros permanently — see `MADV_DONTNEED_SHARED_FRAME.md` "Still open" item 2,
+/// and `FPCACHE_ZERO_PAGE_POISONING.md` for the hunt that ended here.
 pub static DONTNEED_FILE_BACKED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
@@ -370,7 +381,7 @@ fn mmap_eager_to_lazy_fallback(
             );
             let count = akuma_exec::process::push_lazy_region_with_source(
                 proc.tgid, mmap_addr, pages * 4096, page_flags, source);
-            if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+            if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
                 akuma_primitives::tprint!(128, "[mmap] eager OOM -> lazy-file fallback pid={} pages={} ({} regions)\n",
                 proc.pid, pages, count);
             }
@@ -379,7 +390,7 @@ fn mmap_eager_to_lazy_fallback(
         return ENOMEM;
     }
     let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
-    if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+    if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
         akuma_primitives::tprint!(128, "[mmap] eager OOM -> lazy fallback pid={} pages={} ({} regions)\n",
         proc.pid, pages, count);
     }
@@ -407,7 +418,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // threshold, `MAP_POPULATE`'s precedence and the `MAP_SHARED` matrix. Everything
     // below acts on it.
     let plan = akuma_syscalls_mem::mmap::plan(
-        prot, flags, fd, pages, crate::config::MMAP_EAGER_MAX_PAGES,
+        prot, flags, fd, pages, akuma_config::MMAP_EAGER_MAX_PAGES,
     );
     let is_fixed = flags & MAP_FIXED != 0;
     let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
@@ -434,7 +445,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         // guard a process can map user pages at e.g. 0x8000_0000, overlapping the
         // kernel's physical-RAM identity map and causing silent memory corruption.
         if mmap_fixed_overlaps_kernel_va(addr, pages * 4096) {
-            if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+            if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
                 akuma_primitives::tprint!(128, "[mmap] REJECT MAP_FIXED kernel VA: pid={} addr=0x{:x} len=0x{:x}\n",
                 proc.pid, addr, pages * 4096);
             }
@@ -453,7 +464,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         }
         addr
     } else if let Some(a) = proc.vm_alloc_mmap(pages * 4096) { a } else {
-        if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+        if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
             akuma_primitives::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
             proc.pid, pages * 4096,
             proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed),
@@ -484,7 +495,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 
     if use_lazy {
         let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
-        if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+        if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
             akuma_primitives::tprint!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
                 proc.pid, len, prot, flags, mmap_addr, count);
         }
@@ -498,7 +509,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // LazySource::File, same mechanism as demand-paged ELFs.
     // Writable MAP_SHARED is forced eager (see below) so its pages are all
     // resident for writeback; everything else may demand-page lazily.
-    if crate::config::MMAP_FILE_BACKED_LAZY && plan.file_lazy_eligible
+    if akuma_config::MMAP_FILE_BACKED_LAZY && plan.file_lazy_eligible
         && let Some(akuma_exec::process::FileDescriptor::File(ref f)) = proc.get_fd(fd as u32) {
             let path = f.path.clone();
             // Path→inode resolution reads ext2 metadata (real I/O on a cold cache) —
@@ -518,7 +529,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             );
             let count = akuma_exec::process::push_lazy_region_with_source(
                 proc.tgid, mmap_addr, pages * 4096, page_flags, source);
-            if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+            if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
                 akuma_primitives::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (lazy-file, {} regions)\n",
                     proc.pid, fd, &path, offset, len, mmap_addr, count);
             }
@@ -596,12 +607,12 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                     Err(_) => break,
                 }
             }
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(256, "[mmap] pid={} fd={} file={} off={} len={} = 0x{:x} (read {} bytes)\n",
                     proc.pid, fd, &path, offset, len, mmap_addr, bytes_read);
             }
         }
-    } else if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+    } else if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
         akuma_primitives::tprint!(128, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (eager)\n",
             proc.pid, len, prot, flags, mmap_addr);
     }
@@ -658,7 +669,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 (proc.tgid, mmap_addr),
                 SharedFileMapping { path: f.path.clone(), file_offset: offset, len },
             );
-            if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+            if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
                 akuma_primitives::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (shared-writable, writeback on)\n",
                     proc.pid, fd, &f.path, offset, len, mmap_addr);
             }
@@ -1251,7 +1262,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     let adding_exec = prot & 0x4 != 0;
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
-    if crate::config::MEM_SYSCALL_TRACE_ENABLED {
+    if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
         akuma_primitives::tprint!(128, "[mprotect] pid={} owner={} addr=0x{:x} len=0x{:x} prot={:#x}\n",
             current_pid, owner_pid, addr, pages * 4096, prot);
     }
@@ -1339,7 +1350,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     });
     let unmapped_any_eager = !detached.is_empty();
     for (base, n, frames) in detached {
-        if crate::config::TRACE_MUNMAP {
+        if akuma_config::TRACE_MUNMAP {
             akuma_primitives::tprint!(128, "[munmap] pid={} addr=0x{:x} ({} pages, {} owned, base=0x{:x})\n",
                 proc.pid, addr, n, frames.len(), base);
         }
@@ -1350,7 +1361,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             let pas: Vec<usize> = frames.iter().map(|f| f.addr).collect();
             let flush_len = m.len.min(n * 4096);
             let written = writeback_shared_pages(&m.path, m.file_offset, flush_len, &pas);
-            if crate::config::TRACE_MUNMAP {
+            if akuma_config::TRACE_MUNMAP {
                 akuma_primitives::tprint!(192, "[munmap] pid={} shared-writeback file={} off={} {} bytes\n",
                     proc.pid, &m.path, m.file_offset, written);
             }

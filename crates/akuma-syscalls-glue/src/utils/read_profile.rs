@@ -170,10 +170,12 @@ mod disabled {
         pub fn lap(_stage: usize) {}
     }
 
-    /// The EL0 handler's outer span as plain functions over a raw start tick —
-    /// the exception path's `ExceptionHooks` cannot name `Span`, so the two
-    /// halves travel separately and reassemble here. Both compile to nothing
-    /// without the feature. (Shared doc with the enabled arm below.)
+/// The EL0 handler's outer span as plain functions over a raw start tick — the
+/// exception path's `ExceptionHooks` cannot name `Span`, so the two halves
+/// travel separately and reassemble here.
+///
+/// Both compile to nothing without the feature. (Shared doc with the enabled
+/// arm below.)
     #[inline(always)]
     #[must_use]
     pub fn exception_span_start() -> u64 {
@@ -185,9 +187,10 @@ mod disabled {
 }
 
 /// Floor-arm lap indices: the suspects inside `handle_syscall`'s prologue and
-/// epilogue, timed only on the `getpid` floor arm (`FLOOR_NR`). Public so
-/// `handle_syscall` can name its lap boundaries; the statics stay private to
-/// the enabled module.
+/// epilogue, timed only on the `getpid` floor arm (`FLOOR_NR`).
+///
+/// Public so `handle_syscall` can name its lap boundaries; the statics stay
+/// private to the enabled module.
 pub const F_LAP_IDENT: usize = 0;
 pub const F_LAP_INTRPT: usize = 1;
 pub const F_LAP_HOOKS: usize = 2;

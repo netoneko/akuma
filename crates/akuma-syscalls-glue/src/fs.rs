@@ -243,7 +243,7 @@ pub(super) fn resolve_path_at(dirfd: i32, raw_path: &str) -> Result<String, u64>
 // offset assertions that used to sit right here — they are the same
 // assertions, checked by `cargo test` on the host instead of only by whatever
 // build happened to compile this file. Re-exported so
-// `crate::syscall::fs::Stat` (boot tests) and `super::fs::IoVec` (net.rs)
+// `crate::fs::Stat` (boot tests) and `super::fs::IoVec` (net.rs)
 // keep their spelling.
 pub use super::{IoVec, Stat, Statx, StatxTimestamp, makedev};
 
@@ -251,10 +251,10 @@ pub use super::{IoVec, Stat, Statx, StatxTimestamp, makedev};
 pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // Per-stage fixed-cost attribution (`read-profile`; ZST otherwise). Created
     // before the first line of real work and committed only on the `File` arm —
-    // see `crate::syscall::utils::read_profile`.
-    let mut rec = crate::syscall::utils::read_profile::Rec::new();
+    // see `crate::utils::read_profile`.
+    let mut rec = crate::utils::read_profile::Rec::new();
     if !validate_user_ptr(buf_ptr, count) {
-        if crate::config::SYSCALL_DEBUG_PIPE_READ {
+        if akuma_config::SYSCALL_DEBUG_PIPE_READ {
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             akuma_primitives::tprint!(
                 192,
@@ -267,7 +267,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         return EFAULT;
     }
-    rec.lap(crate::syscall::utils::read_profile::S_VALIDATE);
+    rec.lap(crate::utils::read_profile::S_VALIDATE);
     // Deliberately scoped: `current_process_shared()` hands out `&'static Process`, but
     // that lifetime is not one the process table can honour across a blocking park. The
     // RETIRED + `PROCESS_RECLAIM_COOLDOWN_US` scheme bounds a *lookup-then-use* span of
@@ -287,9 +287,9 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         };
         (proc.pid, fd)
     };
-    rec.lap(crate::syscall::utils::read_profile::S_FD);
+    rec.lap(crate::utils::read_profile::S_FD);
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
         akuma_primitives::safe_print!(128, "[syscall] read(stdin, count={})\n", count);
     }
 
@@ -308,7 +308,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     && copy_to_user(buf_ptr, &temp[..n]).is_err() {
                         return EFAULT;
                     }
-                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                     akuma_primitives::safe_print!(128, "[syscall] read(stdin) fallback returned {}\n", n);
                 }
                 return n as u64;
@@ -353,7 +353,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                             if copy_to_user(buf_ptr, &kernel_buf[..to_read]).is_err() {
                                 return EFAULT;
                             }
-                            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                                 akuma_primitives::safe_print!(128, "[syscall] read(stdin) returned {} bytes from canon_ready\n", to_read);
                             }
                             return to_read as u64;
@@ -398,14 +398,14 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                                     if copy_to_user(buf_ptr, &kernel_buf[..to_read]).is_err() {
                                         return EFAULT;
                                     }
-                                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                                         akuma_primitives::safe_print!(128, "[syscall] read(stdin) returned {} bytes (canonical)\n", to_read);
                                     }
                                     return to_read as u64;
                                 }
                                 continue;
                             } else if let Some(echo_buf) = ts.echo_noncanon(&kernel_buf[..n]) {
-                                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                                     akuma_primitives::safe_print!(128, "[syscall] read: echoing {} bytes\n", echo_buf.len());
                                 }
                                 ch.write(&echo_buf);
@@ -416,7 +416,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     if copy_to_user(buf_ptr, &kernel_buf[..n]).is_err() {
                         return EFAULT;
                     }
-                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                         let mut snippet = [0u8; 32];
                         let sn_len = n.min(32);
                         snippet[..sn_len].copy_from_slice(&kernel_buf[..sn_len]);
@@ -447,7 +447,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                             }
                         }
                     }
-                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                         akuma_primitives::safe_print!(128, "[syscall] read(stdin) returned 0 (EOF)\n");
                     }
                     return 0;
@@ -471,7 +471,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
 
                 let term_state_lock = if let Some(state) = akuma_exec::process::current_terminal_state() { state } else {
-                    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                         akuma_primitives::safe_print!(128, "[syscall] read(stdin) no terminal state, EOF\n");
                     }
                     return 0;
@@ -509,27 +509,27 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             // THIS arm on purpose: the Stdin arm parks in `schedule_blocking` while taking
             // non-IRQ-masked terminal-state locks, which this carve-out has not audited.
             let _vfs_bkl = VfsBklGuard::new();
-            rec.lap(crate::syscall::utils::read_profile::S_BKL);
+            rec.lap(crate::utils::read_profile::S_BKL);
             let limit = 64 * 1024;
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
-            rec.lap(crate::syscall::utils::read_profile::S_ALLOC);
+            rec.lap(crate::utils::read_profile::S_ALLOC);
 
             let read_result = akuma_vfs_glue::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), f.position, &mut temp);
-            rec.lap(crate::syscall::utils::read_profile::S_FS);
+            rec.lap(crate::utils::read_profile::S_FS);
             match read_result {
                 Ok(n) => {
                     if n > 0 {
                         if copy_to_user(buf_ptr, &temp[..n]).is_err() {
                             return EFAULT;
                         }
-                        rec.lap(crate::syscall::utils::read_profile::S_COPY);
+                        rec.lap(crate::utils::read_profile::S_COPY);
                         if let Some(proc) = akuma_exec::process::current_process_shared() {
                             proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
                         }
-                        rec.lap(crate::syscall::utils::read_profile::S_POS);
+                        rec.lap(crate::utils::read_profile::S_POS);
                     }
-                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                    if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                         akuma_primitives::safe_print!(256, "[syscall] read(fd={}, file={}, pos={}, req={}) = {}\n", fd_num, &f.path, f.position, to_read, n);
                     }
                     rec.commit(to_read);
@@ -579,7 +579,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             } else {
                 socket::socket_recv(idx, &mut temp, nonblock)
             };
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 match &result {
                     Ok(n) => akuma_primitives::tprint!(128, "[sock] read fd={} req={} got={}\n", fd_num, count, n),
                     Err(e) if *e == akuma_net::socket::libc_errno::EAGAIN => {
@@ -645,10 +645,10 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         // **`[sigsegv-syscall] x8=63`** (`read`) — **`GO_FORKTEST_DEBUG.md`** Pattern 2.
         akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
             let mut temp = alloc::vec![0u8; count];
-            if crate::config::SYSCALL_DEBUG_PIPE_READ {
+            if akuma_config::SYSCALL_DEBUG_PIPE_READ {
                 use core::sync::atomic::{AtomicU64, Ordering};
                 static PIPE_READ_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
-                let sample = crate::config::SYSCALL_DEBUG_PIPE_READ_SAMPLE.max(1);
+                let sample = akuma_config::SYSCALL_DEBUG_PIPE_READ_SAMPLE.max(1);
                 let seq = PIPE_READ_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
                 if seq.is_multiple_of(sample) {
                     let tid = akuma_exec::threading::current_thread_id();
@@ -675,7 +675,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 let (n, eof) = super::pipe::pipe_read(pipe_id, &mut temp);
                 if n > 0 {
                     if copy_to_user(buf_ptr, &temp[..n]).is_err() {
-                        if crate::config::SYSCALL_DEBUG_PIPE_READ {
+                        if akuma_config::SYSCALL_DEBUG_PIPE_READ {
                             akuma_primitives::tprint!(
                                 224,
                                 "[pipe-read] EFAULT copy_to_user pid={} fd={} pipe={} buf={:#x} copy_len={}\n",
@@ -857,7 +857,7 @@ pub(super) fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) 
                         && copy_to_user(buf_ptr, &temp[..n]).is_err() {
                             return EFAULT;
                         }
-                    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                    if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                         akuma_primitives::safe_print!(256, "[syscall] pread64(fd={}, file={}, off={}, req={}) = {}\n", fd_num, &f.path, offset, to_read, n);
                     }
                     n as u64
@@ -979,7 +979,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         let written = match fd {
             akuma_exec::process::FileDescriptor::Stdout | akuma_exec::process::FileDescriptor::Stderr
             | akuma_exec::process::FileDescriptor::DevTty => {
-                if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                     if total_written == 0 {
                       akuma_primitives::safe_print!(96, "[OUT] pid={} fd={} len={}\n", pid, fd_num, count);
                     } else {
@@ -1037,7 +1037,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                 }
                 
-                if crate::config::STDOUT_TO_KERNEL_LOG_COPY_ENABLED {
+                if akuma_config::STDOUT_TO_KERNEL_LOG_COPY_ENABLED {
                     // Re-resolved: the backpressure loop just above can have parked.
                     if let Some(proc) = akuma_exec::process::current_process_shared() {
                         proc.write_stdout(buf_slice);
@@ -1137,7 +1137,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     socket::socket_send(idx, buf_slice, nonblock)
                 };
                 
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED && total_written == 0 {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED && total_written == 0 {
                     match &result {
                         Ok(n) => akuma_primitives::tprint!(96, "[TCP] write fd={} len={} sent={}\n", fd_num, count, n),
                         Err(e) => akuma_primitives::tprint!(96, "[TCP] write fd={} len={} err={}\n", fd_num, count, i64::from(*e)),
@@ -1187,7 +1187,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                         }
                         Ok(n) => break n as u64,
                         Err(e) => {
-                            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+                            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                                 akuma_primitives::safe_print!(128, "[syscall] write: PipeWrite fd={} pipe_id={} EPIPE ({} bytes)\n", fd_num, pipe_id, buf_slice.len());
                             }
                             if total_written > 0 { return total_written as u64; }
@@ -1230,7 +1230,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 val_bytes.copy_from_slice(&buf_slice[..8]);
                 let val = u64::from_ne_bytes(val_bytes);
                 if val == u64::MAX { return EINVAL; }
-                if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     akuma_primitives::tprint!(96, "[eventfd] write via fd={} id={} val={}\n", fd_num, efd_id, val);
                 }
                 match super::eventfd::eventfd_write(efd_id, val) {
@@ -1254,7 +1254,7 @@ pub(super) fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 // Blocking PCM playback. The audio driver re-chunks into bounded
                 // periods internally; consumes the whole slice or errors.
                 let _drv_bkl = DriverBklGuard::new();
-                if let Ok(n) = crate::audio::play(buf_slice) { n as u64 } else {
+                if let Ok(n) = akuma_virtio::audio::play(buf_slice) { n as u64 } else {
                     if total_written > 0 { return total_written as u64; }
                     return EIO;
                 }
@@ -1304,7 +1304,7 @@ pub(super) fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
         total_read += n;
         if (n as usize) < iov.iov_len { break; }
     }
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
         akuma_primitives::safe_print!(128, "[syscall] readv(fd={}, cnt={}) = {}\n", fd_num, iov_cnt, total_read);
     }
     total_read
@@ -1378,7 +1378,7 @@ pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
             break;
         }
     }
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
         akuma_primitives::safe_print!(128, "[syscall] writev(fd={}, cnt={}) = {}\n", fd_num, iov_cnt, total_written);
     }
     total_written
@@ -1575,7 +1575,7 @@ pub(super) fn sys_dup(oldfd: u32) -> u64 {
     akuma_exec::process::clone_fd_refs(&entry);
     let newfd = proc.alloc_fd(entry);
     proc.clear_cloexec(newfd);
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(128, "[syscall] dup(oldfd={}) = {}\n", oldfd, newfd);
     }
     u64::from(newfd)
@@ -1589,7 +1589,7 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
         None => return EBADF,
     };
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         let pid = proc.pid;
         akuma_primitives::safe_print!(128, "[syscall] dup3(oldfd={}, newfd={}, flags=0x{:x}) PID {}\n", oldfd, newfd, flags, pid);
     }
@@ -1649,7 +1649,7 @@ pub(super) fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
 pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> SysResult {
     let raw_path = copy_from_user_str(path_ptr, 1024)?;
 
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
         akuma_primitives::tprint!(128, "[syscall] openat(dirfd={}, path={:?}, flags=0x{:x}, mode=0x{:x})\n", dirfd, raw_path, flags, mode);
     }
 
@@ -1666,7 +1666,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
     if flags & akuma_exec::process::open_flags::O_TMPFILE
         == akuma_exec::process::open_flags::O_TMPFILE
     {
-        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
             akuma_primitives::safe_print!(128, "[syscall] openat({:?}): O_TMPFILE unsupported -> EINVAL\n", raw_path);
         }
         return Err(EINVAL);
@@ -1679,7 +1679,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
     let path = match resolve_path_at(dirfd, &raw_path) {
         Ok(p) => p,
         Err(e) => {
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED && e == EBADF {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED && e == EBADF {
                 akuma_primitives::safe_print!(128, "[syscall] openat: bad dirfd={}\n", dirfd);
             }
             return Err(e);
@@ -1707,7 +1707,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
             }
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(256, "[syscall] openat(/dev/null) = fd {} flags=0x{:x}\n", fd, flags);
             }
             return Ok(u64::from(fd));
@@ -1721,7 +1721,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
             }
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
             }
             return Ok(u64::from(fd));
@@ -1735,7 +1735,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
             }
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(256, "[syscall] openat(/dev/zero) = fd {} flags=0x{:x}\n", fd, flags);
             }
             return Ok(u64::from(fd));
@@ -1765,7 +1765,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
         if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
             proc.set_cloexec(fd);
         }
-        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
             akuma_primitives::safe_print!(256, "[syscall] openat(/dev/tty) = fd {} flags=0x{:x}\n", fd, flags);
         }
         return Ok(u64::from(fd));
@@ -1774,13 +1774,13 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
     // /dev/dsp — virtio-sound output. Only opens when a sound device was found at
     // boot (audio::is_available()); otherwise falls through to the normal path
     // (→ ENOENT), so the node simply doesn't exist when the feature is off.
-    if (path == "/dev/dsp" || path == "/dev/audio") && crate::audio::is_available() {
+    if (path == "/dev/dsp" || path == "/dev/audio") && akuma_virtio::audio::is_available() {
         if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevDsp);
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
             }
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
             }
             return Ok(u64::from(fd));
@@ -1804,7 +1804,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
             }
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(256, "[syscall] openat(/dev/net/tap0) = fd {} flags=0x{:x}\n", fd, flags);
             }
             return Ok(u64::from(fd));
@@ -1828,7 +1828,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
         // so the failure lands at the syscall the caller can actually see
         // (§3's "Refuse write-open of a mounted device" option).
         if wants_write && akuma_vfs_glue::device_is_mounted(node.name) {
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] openat({}) EBUSY (mounted, write requested)\n", &path);
             }
             return Err(EBUSY);
@@ -1842,7 +1842,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
             if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
                 proc.set_cloexec(fd);
             }
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
             }
             return Ok(u64::from(fd));
@@ -1857,7 +1857,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
     // fd whose first `read()` fails against ext2 — a failure at the wrong
     // syscall. `ENODEV` matches `/dev/net/tap0` above.
     if akuma_vfs_glue::dev_node(&path).is_some() {
-        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
             akuma_primitives::safe_print!(256, "[syscall] openat({}) ENODEV (no fd behavior)\n", &path);
         }
         return Err(ENODEV);
@@ -1883,7 +1883,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
     if !akuma_vfs_glue::fs::exists(&path) {
         let is_creat = flags & akuma_exec::process::open_flags::O_CREAT != 0;
         if !is_creat {
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(256, "[syscall] openat({}) ENOENT flags=0x{:x}\n", &path, flags);
             }
             return Err(ENOENT);
@@ -1897,7 +1897,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
                 format!("/{parent_raw}")
             };
             if parent_path != "/" && !akuma_vfs_glue::fs::exists(&parent_path) {
-                if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                     akuma_primitives::safe_print!(256, "[syscall] openat({}) parent {} not found flags=0x{:x}\n", &path, &parent_path, flags);
                 }
                 return Err(ENOENT);
@@ -1920,7 +1920,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
                 != 0
             && akuma_vfs_glue::metadata(&path).is_ok_and(|m| m.is_dir)
         {
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] openat({:?}): write open of directory -> EISDIR\n", path);
             }
             return Err(EISDIR);
@@ -1941,7 +1941,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
             // or, after inode reuse, a different file's bytes → decode
             // garbage. Gated like the other syscall traces — flip
             // SYSCALL_DEBUG_IO_ENABLED to hunt the actor again.
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED
                 && let Ok(sz) = akuma_vfs_glue::file_size(&path)
                 && sz > 0
             {
@@ -1965,7 +1965,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
         if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
             proc.set_cloexec(fd);
         }
-        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
             akuma_primitives::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
         }
         Ok(u64::from(fd))
@@ -2021,7 +2021,7 @@ pub fn sys_close(fd: u32) -> u64 {
                     super::pidfd::pidfd_close(pidfd_id);
                 }
                 akuma_exec::process::FileDescriptor::DevDsp => {
-                    crate::audio::stop();
+                    akuma_virtio::audio::stop();
                 }
                 akuma_exec::process::FileDescriptor::File(f) => {
                     let holder = alloc::sync::Arc::as_ptr(&proc.fds) as usize;
@@ -2164,7 +2164,7 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
             let _vfs_bkl = VfsBklGuard::new();
             if let Ok(meta) = akuma_vfs_glue::metadata_open_file(&f.path, f.mount_id(), f.inode()) {
                 stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: if meta.is_dir { 2 } else { 1 }, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
-                if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+                if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                     akuma_primitives::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
                 }
                 0
@@ -2286,7 +2286,7 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
         let final_path = if follow { akuma_vfs_glue::resolve_symlinks(&resolved_path) } else { resolved_path };
 
         if let Ok(meta) = akuma_vfs_glue::metadata(&final_path) {
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] newfstatat({}) mode=0o{:o} size={}\n", final_path, meta.mode, meta.size);
             }
             stat = Stat { 
@@ -2319,7 +2319,7 @@ pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, _flags: u
             return 0;
         }
         
-        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
             akuma_primitives::safe_print!(128, "[syscall] newfstatat: ENOENT {}\n", final_path);
         }
         ENOENT
@@ -2404,7 +2404,7 @@ pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
             // artifact while dependents map it — see sys_openat's
             // [O_TRUNC-ZAP]. Never fired on this workload (the actor is
             // open(O_TRUNC)+unlink, not ftruncate).
-            if crate::config::SYSCALL_DEBUG_IO_ENABLED
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED
                 && length == 0
                 && f.path.contains("target")
             {
@@ -2586,7 +2586,7 @@ pub(super) fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u3
     // clock has never been set (no RTC and no SNTP yet), in which case there is no
     // meaningful "now" to store — the stamps are left alone rather than set to 0,
     // which would date every touched file to 1970.
-    let now_secs = crate::timer::utc_time_us().map(|us| us / 1_000_000);
+    let now_secs = crate::hooks::utc_time_us().map(|us| us / 1_000_000);
 
     // A NULL `times` means "both to now". Otherwise it is two `struct timespec`,
     // and a malformed one is EINVAL *before* any lookup — Linux validates the
@@ -2675,7 +2675,7 @@ pub(super) fn sys_faccessat2(dirfd: i32, path_ptr: u64, _mode: u32, _flags: u32)
     if akuma_vfs_glue::fs::exists(&final_path) || akuma_vfs_glue::is_symlink(&resolved_path) {
         Ok(0)
     } else {
-        if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
             akuma_primitives::safe_print!(128, "[syscall] faccessat: ENOENT {}\n", final_path);
         }
         Err(ENOENT)
@@ -2767,7 +2767,7 @@ pub(super) fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
         F_GETLK | F_SETLK | F_SETLKW => 0,
         F_SETOWN | F_GETOWN => 0,
         _ => {
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(192, "[fcntl] UNSUPPORTED: pid={} fd={} cmd={} arg={:#x}\n",
                 proc.pid, fd, cmd, arg);
             }
@@ -2796,7 +2796,7 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, _mode: u32) -> SysResult {
         None => akuma_vfs_glue::canonicalize_path(&raw_path),
     };
 
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
         akuma_primitives::safe_print!(256, "[syscall] mkdirat({}) dirfd={}\n", &path, dirfd);
     }
 
@@ -2829,7 +2829,7 @@ pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> SysResult {
         None => akuma_vfs_glue::canonicalize_path(&path),
     };
 
-    if crate::config::SYSCALL_DEBUG_IO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
         akuma_primitives::safe_print!(256, "[syscall] unlinkat({}) flags=0x{:x}\n", &resolved, flags);
         // Diagnostic (2026-08-15 hunt §14): unlink frees the inode for reuse
         // while other processes may still hold lazy regions naming it — their
@@ -2870,7 +2870,7 @@ pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpa
 
     let oldpath = resolve_path_at(olddirfd, &raw_old)?;
     let newpath = resolve_path_at(newdirfd, &raw_new)?;
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(256, "[syscall] renameat: {} -> {}\n", oldpath, newpath);
     }
     match akuma_vfs_glue::fs::rename(&oldpath, &newpath) {
@@ -2905,7 +2905,7 @@ pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newp
         return Err(super::EEXIST);
     }
 
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(256, "[syscall] renameat2: {} -> {} flags=0x{:x}\n", oldpath, newpath, flags);
     }
     match akuma_vfs_glue::fs::rename(&oldpath, &newpath) {
@@ -2918,7 +2918,7 @@ pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -
     let target = copy_from_user_str(target_ptr, 1024)?;
     let raw_link = copy_from_user_str(linkpath_ptr, 1024)?;
     let link_path = resolve_path_at(newdirfd, &raw_link)?;
-    if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(256, "[syscall] symlinkat: {} -> {}\n", link_path, target);
     }
     match akuma_vfs_glue::create_symlink(&link_path, &target) {
@@ -3085,7 +3085,7 @@ pub(super) fn sys_fchdir(fd: u32) -> u64 {
             // and must not allocate (dropping the old cwd is fine).
             let new_cwd = path.clone();
             akuma_exec::process::with_current_process(|p| p.cwd = new_cwd);
-            if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] fchdir(fd={}) -> \"{}\"\n", fd, path);
             }
             return 0;

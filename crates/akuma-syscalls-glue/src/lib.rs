@@ -1,7 +1,24 @@
-//! System Call Handlers
+//! The Linux syscall dispatcher and its per-family implementations.
 //!
-//! Implements the syscall interface for user programs.
-//! Uses Linux-compatible ABI: syscall number in x8, arguments in x0-x5.
+//! Syscall number in `x8`, arguments in `x0`-`x5`. `akuma-exceptions` reaches
+//! `handle_syscall` through `ExceptionHooks`, so the SVC path does not name this
+//! crate at all.
+//!
+//! # Why it is a crate, as of 2026-09-01
+//!
+//! It was `src/syscall/` — 23 files, ~17k lines, the largest thing left in the
+//! binary and the one 542 of the boot suite's `crate::` references pointed at.
+//! Four things had to move first, none of them syscall code:
+//!
+//! | blocker | resolution |
+//! |---|---|
+//! | `src/vfs/` cycle (110 refs out, 10 back) | `akuma-vfs-glue`, after `-log`/`-ipc` cut the back-edge |
+//! | `crate::config` (217 refs) | `akuma-config`, a crate of `const`s — **not** a handover struct |
+//! | `crate::process_tests::make_test_process` | moved to `akuma-exec::process` |
+//! | `crate::fs`, `crate::pmm` wrappers | `akuma-vfs-glue::fs`, `akuma-exec::pmm` |
+//!
+//! What was left needed **seven** function pointers ([`SyscallHooks`]).
+//! `docs/archive/SRC_SYSCALL_EXTRACTION.md`.
 //!
 //! # This module forbids `unsafe`
 //!
@@ -37,7 +54,31 @@
 //! second caller of it is a change to that argument.
 //!
 //! Full record: `docs/archive/SYSCALL_UNSAFE_CLEANUP.md`.
+#![no_std]
 #![forbid(unsafe_code)]
+// ---- lints ----------------------------------------------------------------
+// The first three were already allowed by `src/main.rs` on this exact code; they
+// move with it. Nothing is being newly suppressed:
+#![allow(clippy::cast_ptr_alignment)]
+#![allow(clippy::cast_possible_wrap)] // a syscall return *is* a reinterpreted u64
+#![allow(clippy::inline_always)] // used for hot syscall paths
+//
+// The next two only fire because this is a library now, not a module tree in a
+// binary, and neither is describing a defect here:
+//
+// `redundant_pub_crate` wants `pub` where a `pub(crate)` item sits in a private
+// module. Every module below except the handful re-exported for the boot suite
+// *is* private, and `pub(crate)` states the real visibility — widening it to
+// `pub` to satisfy the lint would make the crate's surface a lie.
+#![allow(clippy::redundant_pub_crate)]
+// `must_use_candidate` wants `#[must_use]` on ~40 syscall implementations. The
+// dispatcher is their only caller and consumes every return, so there is no
+// dropped-value bug class here to catch. Where one genuinely existed — tests
+// discarding an errno from `sys_msgctl` — the attribute was added deliberately,
+// in `akuma-syscalls-ipc`.
+#![allow(clippy::must_use_candidate)]
+
+extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -95,14 +136,17 @@ pub use fs::run_writev_short_write_tests;
 pub mod pipe;
 pub mod poll;
 pub mod proc;
-/// AF_UNIX sockets. The decisions live in `akuma_net_unix` (host-tested); this
-/// module is the kernel half — the one table, the user-pointer copies, and the
-/// pipes that carry the bytes. See docs/archive/UNIX_SOCKET_IMPROVEMENTS.md.
+/// AF_UNIX sockets — the kernel half.
+///
+/// The decisions live in `akuma_net_unix` (host-tested); this module holds the
+/// one table, the user-pointer copies, and the pipes that carry the bytes. See
+/// docs/archive/UNIX_SOCKET_IMPROVEMENTS.md.
 pub mod unixsock;
 pub mod signal;
 mod sync;
-/// `akuma_get_version` — the build identity packed into the return register,
-/// and the floor control for the syscall boundary. See the module docs.
+/// `akuma_get_version` — the build identity, packed into the return register.
+///
+/// Also the floor control for the syscall boundary. See the module docs.
 pub mod version;
 mod term;
 /// Itimers, clock_gettime/settime/getres, nanosleep, adjtimex — moved to the
@@ -258,7 +302,7 @@ pub mod syscall_counters {
 ///
 /// Re-export: the flag moved to `akuma_exec::process::user_access` with the check it
 /// disables, so the copy helpers can honour it. The ~50 boot-test call sites keep
-/// spelling it `crate::syscall::BYPASS_VALIDATION`.
+/// spelling it `crate::BYPASS_VALIDATION`.
 pub use akuma_exec::process::user_access::BYPASS_VALIDATION;
 
 /// Syscall numbers (Linux-compatible subset).
@@ -284,6 +328,11 @@ pub struct ThreadCpuStat {
     pub state: u8,
     /// Last core the thread ran on (MPIDR aff0). 0xFF = never scheduled.
     pub last_core: u8,
+    /// Wire padding. `pub` because the struct is, `_`-prefixed because nothing
+    /// reads it — it exists so the `repr(C)` layout matches what userspace
+    /// expects. Clippy's `pub_underscore_fields` wants one or the other; the ABI
+    /// wants both.
+    #[allow(clippy::pub_underscore_fields)]
     pub _reserved: [u8; 6],
     pub name: [u8; 16],
 }
@@ -449,7 +498,7 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
     }
     
     if let Ok(s) = core::str::from_utf8(&bytes) { Ok(String::from(s)) } else {
-        if crate::config::SYSCALL_DEBUG_INFO_ENABLED {
+        if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
         }
         Err(EINVAL)
@@ -468,11 +517,11 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
 /// existing const — see `akuma_syscalls::IdentitySource` and the note on
 /// `EPILOGUE_IDENTITY` below.
 const EXCURSION_HOOKS: akuma_syscalls::HookConfig = akuma_syscalls::HookConfig {
-    process_stats: crate::config::PROCESS_SYSCALL_STATS,
-    proc_log: crate::config::PROC_SYSCALL_LOG_ENABLED,
-    debug_io: crate::config::SYSCALL_DEBUG_IO_ENABLED,
-    errno_diag: crate::config::SYSCALL_ERRNO_DIAG_ENABLED,
-    identity_audit: crate::config::IDENTITY_AUDIT,
+    process_stats: akuma_config::PROCESS_SYSCALL_STATS,
+    proc_log: akuma_config::PROC_SYSCALL_LOG_ENABLED,
+    debug_io: akuma_config::SYSCALL_DEBUG_IO_ENABLED,
+    errno_diag: akuma_config::SYSCALL_ERRNO_DIAG_ENABLED,
+    identity_audit: akuma_config::IDENTITY_AUDIT,
     identity: EPILOGUE_IDENTITY,
 };
 
@@ -498,7 +547,7 @@ pub const EPILOGUE_IDENTITY: akuma_syscalls::IdentitySource =
 pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // Outer span for `read-profile` (ZST otherwise): started before the pid
     // lookup and counter bumps below, so `hs - sr` names this prologue/epilogue.
-    let rp_span = crate::syscall::utils::read_profile::Span::new();
+    let rp_span = crate::utils::read_profile::Span::new();
     // The generic shape of this excursion: which counter bucket, whether the
     // signal-state clear applies, whether each hook runs, and where the
     // epilogue gets its identity. Decisions only — every effect below is still
@@ -507,7 +556,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     let excursion = akuma_syscalls::Excursion::new(syscall_num, EXCURSION_HOOKS);
     let plan = excursion.prologue();
     CURRENT_SYSCALL_NR.store(syscall_num, Ordering::Relaxed);
-    crate::syscall::utils::read_profile::floor_laps::start(syscall_num);
+    crate::utils::read_profile::floor_laps::start(syscall_num);
 
     akuma_exec::threading::set_thread_current_syscall(syscall_num);
     // A fresh excursion starts with no delivered-signal record, so one delivery
@@ -554,8 +603,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         proc.last_syscall.store(syscall_num, Ordering::Relaxed);
         proc.current_syscall.store(syscall_num, Ordering::Relaxed);
     }
-    crate::syscall::utils::read_profile::floor_laps::lap(
-        crate::syscall::utils::read_profile::F_LAP_IDENT,
+    crate::utils::read_profile::floor_laps::lap(
+        crate::utils::read_profile::F_LAP_IDENT,
     );
 
     if akuma_exec::process::is_current_interrupted() {
@@ -571,8 +620,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         });
         return EINTR;
     }
-    crate::syscall::utils::read_profile::floor_laps::lap(
-        crate::syscall::utils::read_profile::F_LAP_INTRPT,
+    crate::utils::read_profile::floor_laps::lap(
+        crate::utils::read_profile::F_LAP_INTRPT,
     );
 
 
@@ -626,8 +675,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // once in the prologue and read again in the epilogue rather than
     // recomputed there.
     let t0 = if plan.need_timing { akuma_primitives::clock::uptime_us() } else { 0 };
-    crate::syscall::utils::read_profile::floor_laps::lap(
-        crate::syscall::utils::read_profile::F_LAP_HOOKS,
+    crate::utils::read_profile::floor_laps::lap(
+        crate::utils::read_profile::F_LAP_HOOKS,
     );
 
     // For a `stack=rump` box, the proxy intercepts socket-family syscalls (and
@@ -637,7 +686,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // non-rump boxes — a single relaxed atomic load). It also emits the
     // `[RUMP-SP]` trace.
     #[cfg(feature = "rump")]
-    let rump_result = crate::rump_proxy::intercept_box_syscall(syscall_num, args);
+    let rump_result = crate::hooks::intercept_box_syscall(syscall_num, args);
     #[cfg(not(feature = "rump"))]
     let rump_result: Option<u64> = None;
 
@@ -847,7 +896,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRUSAGE => time::sys_getrusage(args[0] as i32, args[1] as usize),
         nr::MSYNC => mem::sys_msync(args[0] as usize, args[1] as usize, args[2] as u32),
         nr::PROCESS_VM_READV => {
-            if crate::config::SYSCALL_ENOSYS_DIAG {
+            if akuma_config::SYSCALL_ENOSYS_DIAG {
                 akuma_primitives::tprint!(96, "[ENOSYS] nr=270 (process_vm_readv) pid={}\n",
                     akuma_exec::process::read_current_pid().unwrap_or(0));
             }
@@ -915,7 +964,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 // cargo's `num_cpus` always saw one CPU and `cargo build`
                 // defaulted to `-j1` even on an SMP=2+ kernel.
                 #[cfg(kernel_smp_shared)]
-                let nr_cpus: usize = crate::smp_shared::probed_core_count();
+                let nr_cpus: usize = crate::hooks::probed_core_count();
                 #[cfg(not(kernel_smp_shared))]
                 let nr_cpus: usize = 1;
                 let mask: u64 = if nr_cpus >= CPU_SET_BITS_PER_WORD {
@@ -964,7 +1013,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::EPOLL_CTL => poll::sys_epoll_ctl(args[0] as u32, args[1] as i32, args[2] as u32, args[3] as usize),
         #[cfg(feature = "sc-epoll")]
         nr::EPOLL_PWAIT => {
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED && (args[4] != 0 || args[5] != 0) {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED && (args[4] != 0 || args[5] != 0) {
                 akuma_primitives::safe_print!(128, "[epoll_pwait] sigmask=0x{:x} sigsetsize={}\n", args[4], args[5]);
             }
             poll::sys_epoll_pwait(args[0] as u32, args[1] as usize, args[2] as i32, args[3] as i32)
@@ -978,7 +1027,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
             // `io_uring_enter` is a *loop* call in any runtime that gets as far
             // as trying it, so this one especially must not print per call.
-            if crate::config::SYSCALL_ENOSYS_DIAG {
+            if akuma_config::SYSCALL_ENOSYS_DIAG {
                 akuma_primitives::tprint!(96, "[ENOSYS] nr={} (io_uring) pid={}\n", syscall_num,
                     akuma_exec::process::read_current_pid().unwrap_or(0));
             }
@@ -1005,7 +1054,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             EOPNOTSUPP
         }
         nr::INOTIFY_INIT1 | nr::INOTIFY_ADD_WATCH | nr::INOTIFY_RM_WATCH => {
-            if crate::config::SYSCALL_ENOSYS_DIAG {
+            if akuma_config::SYSCALL_ENOSYS_DIAG {
                 akuma_primitives::tprint!(128, "[ENOSYS] nr={} (inotify) pid={}\n", syscall_num,
                     akuma_exec::process::read_current_pid().unwrap_or(0));
             }
@@ -1018,7 +1067,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-containers")]
         nr::MOUNT_IN_NS => flat(container::sys_mount_in_ns(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5])),
         _ => {
-            if crate::config::SYSCALL_ENOSYS_DIAG {
+            if akuma_config::SYSCALL_ENOSYS_DIAG {
                 akuma_primitives::safe_print!(128,
                     "[ENOSYS] nr={} pid={} args=[0x{:x}, 0x{:x}, 0x{:x}]\n",
                     syscall_num, akuma_exec::process::read_current_pid().unwrap_or(0),
@@ -1028,8 +1077,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         },
     };
-    crate::syscall::utils::read_profile::floor_laps::lap(
-        crate::syscall::utils::read_profile::F_LAP_DISP,
+    crate::utils::read_profile::floor_laps::lap(
+        crate::utils::read_profile::F_LAP_DISP,
     );
 
     // The errno set the diagnostic below covers. It was `result == EFAULT` alone
@@ -1096,8 +1145,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     if epi.clear_current_syscall && let Some((_, proc)) = epi_cur {
         proc.current_syscall.store(!0u64, Ordering::Relaxed);
     }
-    crate::syscall::utils::read_profile::floor_laps::lap(
-        crate::syscall::utils::read_profile::F_LAP_EPI1,
+    crate::utils::read_profile::floor_laps::lap(
+        crate::utils::read_profile::F_LAP_EPI1,
     );
 
     if plan.need_timing {
@@ -1114,8 +1163,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             log::record(owner_pid, box_id, syscall_num, t0, elapsed, result);
         }
     }
-    crate::syscall::utils::read_profile::floor_laps::lap(
-        crate::syscall::utils::read_profile::F_LAP_EPI2,
+    crate::utils::read_profile::floor_laps::lap(
+        crate::utils::read_profile::F_LAP_EPI2,
     );
 
     // Log when a syscall returns a dangerous negative error code.  Go's runtime may
@@ -1128,7 +1177,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         let owner_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
         let err_name = if result == EFAULT { "EFAULT" } else if result == ENOSYS { "ENOSYS" } else { "EINVAL" };
 
-        if crate::config::SYSCALL_ERRNO_DIAG_EXTRA {
+        if akuma_config::SYSCALL_ERRNO_DIAG_EXTRA {
             let tid = akuma_exec::threading::current_thread_id();
             let elr = akuma_exec::threading::current_trap_frame_elr();
             akuma_primitives::safe_print!(192,
@@ -1179,7 +1228,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
 // takes `AIO_CONTEXTS.lock()`. Both derive from the `syscall-debug-info` feature,
 // so this can only fire if someone hand-edits one of them — which is the point.
 const _: () = assert!(
-    crate::config::SYSCALL_DEBUG_INFO_ENABLED == akuma_syscalls::DEBUG_INFO,
+    akuma_config::SYSCALL_DEBUG_INFO_ENABLED == akuma_syscalls::DEBUG_INFO,
     "config::SYSCALL_DEBUG_INFO_ENABLED disagrees with akuma-syscalls' debug-info \
      feature; FastPath::Leaf membership would be wrong for the AIO stubs"
 );
@@ -1221,5 +1270,83 @@ impl core::fmt::Display for MmapFlagsFmt {
         }
         if first { f.write_str("0")?; }
         Ok(())
+    }
+}
+
+// ===========================================================================
+// What this crate still needs from the binary
+// ===========================================================================
+
+/// The seven things the syscall layer cannot reach from a crate.
+///
+/// Deliberately small, and it stayed small because each candidate was *resolved*
+/// before a hook was written for it — `crate::audio` turned out to be a
+/// re-export of `akuma_virtio::audio`, `crate::fs` and `crate::pmm` moved into
+/// the crates that own what they wrap, and `crate::config` became a crate of
+/// `const`s. What is left is genuinely binary-local: the rump sysproxy (whose
+/// state lives in `src/rump_proxy.rs`), the wall clock (which needs the binary's
+/// boot uptime to turn monotonic microseconds into UTC), and the DTB-probed core
+/// count.
+///
+/// Unregistered is quiet, not fatal: every accessor below has a defined answer
+/// with no hooks installed, so host tests and early boot get coherent behaviour
+/// rather than a panic. Same contract as `akuma_primitives::console::print_str`.
+#[derive(Clone, Copy)]
+pub struct SyscallHooks {
+    /// `rump_proxy::box_is_rump` — is this box served by a rump kernel?
+    pub box_is_rump: fn(u64) -> bool,
+    /// `rump_proxy::mark_box_rump`
+    pub mark_box_rump: fn(u64),
+    /// `rump_proxy::attach_server` — bind a box to its rump server process.
+    pub attach_server: fn(u64, akuma_exec::process::Pid),
+    /// `rump_proxy::intercept_box_syscall` — forward a call to the rump server.
+    pub intercept_box_syscall: fn(u64, &[u64; 6]) -> Option<u64>,
+    /// `rump_proxy::rump_socket_readable`
+    pub rump_socket_readable: fn(i32) -> bool,
+    /// `timer::utc_time_us` — wall clock, `None` before NTP/RTC sets it.
+    pub utc_time_us: fn() -> Option<u64>,
+    /// `smp_shared::probed_core_count` — DTB-probed core count.
+    pub probed_core_count: fn() -> usize,
+}
+
+static HOOKS: akuma_primitives::OnceCopy<SyscallHooks> = akuma_primitives::OnceCopy::new();
+
+/// Install the binary's callbacks. Idempotent, per `OnceCopy`.
+pub fn set_hooks(h: SyscallHooks) {
+    HOOKS.set(h);
+}
+
+/// Which of these has a caller depends on the feature set — the rump five need
+/// `rump`, `probed_core_count` needs `smp-shared` — so the parity surface is
+/// deliberately wider than any single configuration uses. Same argument the
+/// virtio-audio stub carried: the syscall layer compiles unchanged either way.
+#[allow(dead_code)]
+pub(crate) mod hooks {
+    use super::HOOKS;
+
+    pub fn box_is_rump(box_id: u64) -> bool {
+        HOOKS.get().is_some_and(|h| (h.box_is_rump)(box_id))
+    }
+    pub fn mark_box_rump(box_id: u64) {
+        if let Some(h) = HOOKS.get() {
+            (h.mark_box_rump)(box_id);
+        }
+    }
+    pub fn attach_server(box_id: u64, server_pid: akuma_exec::process::Pid) {
+        if let Some(h) = HOOKS.get() {
+            (h.attach_server)(box_id, server_pid);
+        }
+    }
+    pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
+        HOOKS.get().and_then(|h| (h.intercept_box_syscall)(syscall_num, args))
+    }
+    pub fn rump_socket_readable(rump_fd: i32) -> bool {
+        HOOKS.get().is_some_and(|h| (h.rump_socket_readable)(rump_fd))
+    }
+    pub fn utc_time_us() -> Option<u64> {
+        HOOKS.get().and_then(|h| (h.utc_time_us)())
+    }
+    pub fn probed_core_count() -> usize {
+        HOOKS.get().map_or(1, |h| (h.probed_core_count)())
     }
 }

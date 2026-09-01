@@ -64,7 +64,7 @@ pub fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
         let mut table = EVENTFDS.lock();
         if let Some(efd) = table.get_mut(&id) {
             efd.counter = efd.counter.saturating_add(val);
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::tprint!(96, "[eventfd] write id={} val={} counter={}\n", id, val, efd.counter);
             }
             
@@ -99,7 +99,7 @@ pub fn eventfd_clone_ref(id: u32) {
         let mut efds = EVENTFDS.lock();
         if let Some(efd) = efds.get_mut(&id) {
             efd.ref_count += 1;
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::safe_print!(96, "[eventfd] clone_ref id={} ref_count={}\n", id, efd.ref_count);
             }
         }
@@ -113,7 +113,7 @@ pub fn eventfd_close(id: u32) {
         let mut efds = EVENTFDS.lock();
         if let Some(efd) = efds.get_mut(&id) {
             efd.ref_count = efd.ref_count.saturating_sub(1);
-            if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::safe_print!(96, "[eventfd] close id={} ref_count={}\n", id, efd.ref_count);
             }
             if efd.ref_count == 0 {
@@ -141,7 +141,7 @@ pub(super) fn sys_eventfd2(initval: u32, flags: u32) -> u64 {
     if flags & EFD_NONBLOCK != 0 {
         proc.set_nonblock(fd);
     }
-    if crate::config::SYSCALL_DEBUG_NET_ENABLED {
+    if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
         akuma_primitives::tprint!(96, "[syscall] eventfd2(initval={}, flags=0x{:x}) = fd {} (id={})\n", initval, flags, fd, efd_id);
     }
     u64::from(fd)
