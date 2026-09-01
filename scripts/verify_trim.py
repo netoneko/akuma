@@ -159,7 +159,9 @@ def digests_agree(out):
 #                     writes, and a guard page's blast radius. Self-calibrating:
 #                     it counts its own divergences FROM LINUX and prints the
 #                     total, so the marker is the count, not a PASS.
-#   `eager_mprotect_probe` — **KNOWN FAIL, see KNOWN_FAIL_EXERCISES below.**
+#   `eager_mprotect_probe` — mprotect downgrade vs. the `[EAGER-UPGRADE]`
+#                     fault-handler repair. Was a KNOWN FAIL from 2026-08-15;
+#                     passes since 2026-09-01 (see KNOWN_FAIL_EXERCISES below).
 #   `pthread_kill_eintr`   — a signal interrupting a blocked `read()`: EINTR
 #                     without SA_RESTART, transparent restart with it. Prints a
 #                     PHASE2 INFO line about deferred handler delivery that is a
@@ -202,14 +204,33 @@ EXERCISES = [
 # real regression elsewhere still reads as `UNEXPECTED`, and so a run where one
 # starts passing says so loudly instead of looking identical to every other run.
 #
-# `eager_mprotect_probe`: both phases report "write succeeded, no SIGSEGV —
-# mprotect was defeated" (measured 2026-08-15 on 24f7e1c1). The probe exists
-# precisely to catch the `[EAGER-UPGRADE]` fault-handler repair firing on a
-# region `mprotect` had downgraded, which is what it is now reporting — see its
-# header comment and J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §3,
-# §6a. It is deterministic and takes 4 s, which is exactly why it is worth
-# carrying: the day it flips to `ok` is a result.
-KNOWN_FAIL_EXERCISES = {"eager_mprotect"}
+# **Empty since 2026-09-01.** `eager_mprotect` was the only entry, and it flipped
+# to passing — which the old comment here called out in advance as "a result",
+# so this is that result being collected rather than the list being tidied.
+#
+# It failed from 2026-08-15 (24f7e1c1) with both phases reporting "write
+# succeeded, no SIGSEGV — mprotect was defeated": the `[EAGER-UPGRADE]`
+# fault-handler repair was firing on a region `mprotect` had downgraded
+# (J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §3, §6a). It now
+# refuses the write, which is what `akuma-mmap`'s `prot_recorded` +
+# `mprotect_eager_regions_in_range` were built to do
+# (GRANT_RECORDS_VS_DENY_RECORDS.md).
+#
+# Verified as a real pass, not a silent one, before removing it — the boot log
+# carries the positive evidence at both SMP levels:
+#
+#     [MPROTECT-DENY] pid=531 va=0x10422000 write refused by recorded protection
+#     [WPF] ... ap_rw=false ...
+#     [Fault] Process 531 (/bin/eager_mprotect_probe) SIGSEGV after 0.00s
+#
+# i.e. the write faulted and the process died, which is the probe's success
+# condition. Both phases (pids 530 and 531) did so, on both arms of an A/B —
+# so this is a landed fix, not a change under test.
+#
+# If an entry is ever added back, it must carry the same three things this one
+# did: what fails, the measurement that established it, and what its flipping
+# would mean.
+KNOWN_FAIL_EXERCISES: set[str] = set()
 
 # Known-flaky, threshold-driven: fails on an unmodified tree, and passes on one
 # too. Compared separately so the failure SET stays meaningful.

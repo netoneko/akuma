@@ -355,7 +355,7 @@ Memory / fork / CoW binaries already on `disk.img` — all self-reporting:
 | `neonfault <path>` | `neonfault: done, 0/N crossing loads wrong` — likewise |
 | `mmap_file <path>` | `mmap_file: touched all pages` |
 | `allocstress` | `allocstress: reached 2,000,000 allocations without failure!` |
-| `eager_mprotect_probe` | `RESULT: PASS` — but it reports **`RESULT: FAIL` on an unmodified tree today** (both phases, "write succeeded, no SIGSEGV — mprotect was defeated", measured 2026-08-15 on `24f7e1c1` at SMP=1 and SMP=4). `verify_trim.py` carries it in `KNOWN_FAIL_EXERCISES` so it reads `KNOWN-FAIL (expected)` instead of masquerading as a regression. See `../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §3, §6a |
+| `eager_mprotect_probe` | `RESULT: PASS`. **It was a known failure from 2026-08-15 (`24f7e1c1`) and passes as of 2026-09-01** — both phases now refuse the write (`[MPROTECT-DENY] … write refused by recorded protection`, `ap_rw=false`, probe SIGSEGVs), which is what `akuma-mmap`'s `prot_recorded` + `mprotect_eager_regions_in_range` were built to do (`../archive/GRANT_RECORDS_VS_DENY_RECORDS.md`). `KNOWN_FAIL_EXERCISES` is empty again; a `FAIL` here is now a real regression, not the expected state. Background on the original defect: `../archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §3, §6a |
 
 ### Probes built since this runbook was last revised (added 2026-08-28)
 

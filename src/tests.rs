@@ -3508,7 +3508,7 @@ fn make_test_process(
         state: akuma_exec::process::ProcessState::Ready,
         address_space: addr_space,
         context: akuma_exec::process::UserContext::new(0, 0),
-        parent_pid: ppid, brk: 0x1000_0000, initial_brk: 0x1000_0000,
+        parent_pid: ppid, brk: core::sync::atomic::AtomicUsize::new(0x1000_0000), initial_brk: 0x1000_0000,
         entry_point: 0, memory: mem, process_info_phys: info_phys,
         args: Vec::new(), cwd: String::from("/"),
         stdin: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),

@@ -587,7 +587,18 @@ pub struct Process {
     pub address_space: UserAddressSpace,
     pub context: UserContext,
     pub parent_pid: Pid,
-    pub brk: usize,
+    /// The program break.
+    ///
+    /// `AtomicUsize`, not `usize`: [`Process::set_brk`] takes `&self`, and the
+    /// store used to go through `&mut *(addr_of!(self.brk) as *mut usize)`. The
+    /// `vm_lock` that guards it gives real mutual exclusion, but a `&mut`
+    /// derived from `&self` to a field that is not in a cell is UB under the
+    /// aliasing model no matter how well locked it is — a lock provides
+    /// exclusion, not provenance. An atomic says exactly what the old doc
+    /// comment already claimed ("concurrent readers race the store"), and says
+    /// it in a way the compiler agrees with. See
+    /// `docs/archive/AKUMA_EXEC_AUDIT.md` §5.
+    pub brk: AtomicUsize,
     pub initial_brk: usize,
     pub entry_point: usize,
     pub memory: ProcessMemory,
@@ -804,7 +815,7 @@ impl Process {
             parent_pid: parent.pid,
             name: parent.name.clone(),
             entry_point: parent.entry_point,
-            brk: parent.brk,
+            brk: AtomicUsize::new(parent.brk.load(Ordering::Relaxed)),
             initial_brk: parent.initial_brk,
             memory: parent.memory.clone(),
             args: parent.args.clone(),
@@ -1134,7 +1145,7 @@ impl Process {
 
     /// Get current program break
     pub fn get_brk(&self) -> usize {
-        self.brk
+        self.brk.load(Ordering::Relaxed)
     }
 
     /// Set program break, returns new value.
@@ -1149,10 +1160,10 @@ impl Process {
     /// as they did against the old `&mut self` write.
     pub fn set_brk(&self, new_brk: usize) -> usize {
         if new_brk < self.initial_brk {
-            return self.brk;
+            return self.brk.load(Ordering::Relaxed);
         }
         let aligned = (new_brk + 0xFFF) & !0xFFF;
-        let old_top = (self.brk + 0xFFF) & !0xFFF;
+        let old_top = (self.brk.load(Ordering::Relaxed) + 0xFFF) & !0xFFF;
         if aligned > old_top {
             let mut page = old_top;
             while page < aligned {
@@ -1171,10 +1182,12 @@ impl Process {
             }
         }
         with_irqs_disabled(|| {
+            // The lock is kept: it no longer protects the store itself (an atomic
+            // needs no lock) but still orders it against the other `vm_*`
+            // bookkeeping under the same lock. Dropping it would be a separate
+            // change to the locking discipline, not part of making this sound.
             let _g = self.vm_lock.lock();
-            // SAFETY: `vm_lock` serializes this store against other `vm_*` bookkeeping;
-            // see the doc comment above.
-            unsafe { *(core::ptr::addr_of!(self.brk) as *mut usize) = new_brk; }
+            self.brk.store(new_brk, Ordering::Relaxed);
         });
         new_brk
     }
@@ -2572,7 +2585,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     if lifecycle_trace_on() {
         crate::safe_print!(128, "[FORK-DBG] parent_pid={} child_pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
-            parent_pid, child_pid, parent.brk, parent.memory.code_end,
+            parent_pid, child_pid, parent.brk.load(Ordering::Relaxed), parent.memory.code_end,
             parent.mmap_regions.len(),
             parent.lazy_regions.lock().len());
     }
@@ -2828,8 +2841,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 &mut new_proc.address_space, &mut chunk_scratch, "stack")?;
 
             // Share code+brk.
-            if parent.brk > code_start {
-                let brk_len = parent.brk - code_start;
+            if parent.brk.load(Ordering::Relaxed) > code_start {
+                let brk_len = parent.brk.load(Ordering::Relaxed) - code_start;
                 total_shared += cow_share_and_demote_range(parent_l0, as_lock, code_start, brk_len,
                     &mut new_proc.address_space, &mut chunk_scratch, "brk")?;
             }
@@ -2931,11 +2944,11 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         lifecycle_trace("[FORK-DBG] step4: stack done\n");
 
         let code_start = fork_code_start(parent.memory.code_end);
-        if parent.brk > code_start {
-            let brk_len = parent.brk - code_start;
+        if parent.brk.load(Ordering::Relaxed) > code_start {
+            let brk_len = parent.brk.load(Ordering::Relaxed) - code_start;
             if lifecycle_trace_on() {
                 crate::safe_print!(96, "[FORK-DBG] step4: brk copy 0x{:x}..0x{:x} ({} pages)\n",
-                    code_start, parent.brk, brk_len / mmu::PAGE_SIZE);
+                    code_start, parent.brk.load(Ordering::Relaxed), brk_len / mmu::PAGE_SIZE);
             }
             copy_range_phys(
                 parent_l0,
@@ -3865,7 +3878,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         state: ProcessState::Ready,
         address_space: addr_space,
         context: UserContext::new(0, 0),
-        parent_pid: 0, brk: 0x1000_0000, initial_brk: 0x1000_0000,
+        parent_pid: 0, brk: AtomicUsize::new(0x1000_0000), initial_brk: 0x1000_0000,
         entry_point: 0, memory: mem, process_info_phys: 0,
         args: Vec::new(), cwd: "/".to_string(),
         stdin: Arc::new(Spinlock::new(StdioBuffer::new())),

@@ -1415,8 +1415,10 @@ impl PipeIo for KernelPipeIo {
     }
 }
 
-/// Make the NetBSD rump stack the DEFAULT network stack for box 0 — the root box
-/// every process starts in (the `rump-default` / `devbox` feature). Unlike the
+/// Make the NetBSD rump stack the DEFAULT network stack for box 0.
+///
+/// Box 0 is the root box every process starts in (the `rump-default` /
+/// `devbox` feature). Unlike the
 /// boxed `stack=rump` service (a herd-owned `rump_server` in a fresh box that
 /// processes must `join_box` into), this marks **box 0** rump and brings up its
 /// `rump_server` from the kernel at boot, so every ordinary unboxed process

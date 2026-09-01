@@ -20,28 +20,22 @@ use akuma_primitives::Registered;
 pub use akuma_mmap::PhysFrame;
 
 /// Allocation source for debug frame tracking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameSource {
-    Kernel,
-    UserPageTable,
-    UserData,
-    ElfLoader,
-    Unknown,
-}
+///
+/// Re-exported from `akuma-pmm`, which owns the tracker this feeds. It was a
+/// third byte-identical copy of that enum until 2026-09-01, with a five-arm
+/// `match` converting to the real one at every boundary — in this file, in
+/// `akuma-mmu`, and in `pmm.rs` next door. The stated reason ("the crate sits
+/// below `akuma-exec` and cannot name this one") was backwards: `akuma-pmm`
+/// cannot name *ours*, but we have always depended on it and could always name
+/// *theirs*. Nothing was gained by the copies except three places to add a
+/// variant.
+pub use akuma_pmm::FrameSource;
 
-/// Direct call into `akuma_pmm::track_frame`, converting [`FrameSource`] at the
-/// boundary — this crate's enum and the crate's `akuma_pmm::FrameSource` are
-/// separate types (the crate sits below `akuma-exec` and cannot name this one).
-/// Mirrors `src/pmm.rs`'s identical wrapper for `src/`'s own call sites.
+/// Direct call into `akuma_pmm::track_frame`, unwrapping [`PhysFrame`] to the
+/// raw `usize` that crate's API takes. No longer converts the source: it is the
+/// same type now (see [`FrameSource`]).
 pub fn track_frame(frame: PhysFrame, source: FrameSource) {
-    let src = match source {
-        FrameSource::Kernel => akuma_pmm::FrameSource::Kernel,
-        FrameSource::UserPageTable => akuma_pmm::FrameSource::UserPageTable,
-        FrameSource::UserData => akuma_pmm::FrameSource::UserData,
-        FrameSource::ElfLoader => akuma_pmm::FrameSource::ElfLoader,
-        FrameSource::Unknown => akuma_pmm::FrameSource::Unknown,
-    };
-    akuma_pmm::track_frame(frame.addr, src);
+    akuma_pmm::track_frame(frame.addr, source);
 }
 
 /// Kernel-provided callbacks for the exec crate.

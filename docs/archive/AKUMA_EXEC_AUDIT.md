@@ -8,10 +8,11 @@ that, by its owner's own description, "was never really audited" — the isolati
 half was cut out into `akuma-isolation` and some other pieces moved, but the
 remaining `unsafe` had never been enumerated as a set.
 
-**Result:** 123 `unsafe` sites classified into 8 kinds. One kind fixed in this
-pass (−4 sites, now 119). One kind is a genuine soundness defect by Rust's
-aliasing model, with low practical risk, and is *not* fixed here — it is sized
-and planned in §5.
+**Result:** 123 `unsafe` sites classified into 8 kinds. Two kinds fixed
+(§4 −4 sites, §5a −1), now **118**. Three of the remaining five soundness sites
+are sized and planned in §5/§6. Two incidental findings — a triplicated enum
+(§5b) and the fact that nobody has swept for either pattern tree-wide (§5c) —
+came out of the same reading.
 
 ## 1. Why this crate is not another `akuma-entry`
 
@@ -196,6 +197,92 @@ merely locked. The cost is that the fields are `pub`:
 that removes the site rather than legalising it. `address_space` at 202
 references is a mechanical but wide change and should be its own commit, most
 likely behind a private field plus an accessor rather than a bare type swap.
+
+## 5a. Landed: `Process::brk` -> `AtomicUsize` (2026-09-01)
+
+The first of the six, and the only one that could be *removed* rather than
+legalised — the other five guard aggregates (`ProcessMemory`, `UserAddressSpace`,
+`Vec<MmapRegion>`) that have no atomic equivalent.
+
+`set_brk(&self)` wrote through `&mut *(addr_of!(self.brk) as *mut usize)` under
+`vm_lock`. The lock was real and is kept; what it could not provide was
+provenance. The give-away was already in the function's own doc comment:
+
+> *"Concurrent **readers** of `brk` race the store exactly as they did against
+> the old `&mut self` write."*
+
+That is a description of an atomic, written out longhand. `AtomicUsize` with
+`Ordering::Relaxed` expresses precisely the semantics that were already
+intended, and the compiler agrees with it. The `vm_lock` acquire stays: it no
+longer protects this store (an atomic needs none) but still orders it against
+the other `vm_*` bookkeeping under the same lock, and removing it would be a
+change to the locking discipline rather than to soundness.
+
+Cost: 12 sites in `akuma-exec`, plus two readers in `akuma-exceptions` and one
+boot-suite constructor. **6 -> 5 UB sites.**
+
+The disambiguation is the trap: there are **three** `brk` fields — `Process::brk`
+(`process/mod.rs:590`), `ProcessMemory::brk` (`process/types.rs:590`, the same
+line number by coincidence) and `LoadedElf::brk` — so `.brk` is not sed-able.
+
+## 5b. Landed: `FrameSource` was defined three times (2026-09-01)
+
+Found while answering "why does `pmm.rs` exist". The same five-variant enum was
+declared in **three** crates —
+
+| | |
+|---|---|
+| `akuma-pmm/src/lib.rs:343` | the real one; owns the tracker |
+| `akuma-exec/src/runtime.rs:24` | byte-identical copy |
+| `akuma-mmu/src/lib.rs:110` | byte-identical copy |
+
+— with **three** byte-identical five-arm converters between them
+(`runtime.rs`, `akuma-mmu`, and `akuma-exec/src/pmm.rs`), each translating a
+copy back into the original before every `akuma_pmm::track_frame` call.
+
+Both copies justified themselves in comments, and both justifications were
+backwards:
+
+- `runtime.rs`: *"this crate's enum and `akuma_pmm::FrameSource` are separate
+  types (the crate sits below `akuma-exec` and cannot name this one)."* True and
+  irrelevant — `akuma-pmm` cannot name *ours*, but `akuma-exec` has always
+  depended on `akuma-pmm` (`Cargo.toml:82`) and could always have named *theirs*.
+- `akuma-mmu`: *"the `akuma-exec` enum, mirrored here so this crate can attribute
+  frames without depending on the execution crate."* It was mirroring a copy;
+  the original sits **below** both, in a crate `akuma-mmu` already depends on.
+
+Now one definition and zero converters; the two copies are `pub use
+akuma_pmm::FrameSource`. Nothing was gained by the duplication except three
+places to forget a variant.
+
+`akuma-exec/src/pmm.rs` also carried its module-doc block **twice** (two `//!`
+headers with different bodies), and asserted that `akuma-pmm` "works in raw
+`usize` physical addresses **on purpose** (see its module doc)" — that doc argues
+leaf-ness, never usize-ness. Both corrected; the second matters because it is
+exactly what a future "should `akuma-pmm` speak `PhysFrame`?" decision turns on.
+
+## 5c. Deferred: sweep for both patterns tree-wide
+
+**Neither of the above was looked for — both were tripped over.** That is the
+finding. `akuma-exec` was audited because it was the biggest crate; the
+`&self` -> `&mut` cast and the duplicated-enum-plus-converter both turned up
+inside it, and nothing has checked whether they exist elsewhere.
+
+Two sweeps are owed, and neither has been run:
+
+1. **`&self` -> `&mut` casts.** Grep shape: `addr_of!(self.` and
+   `as *mut` on a place derived from `&self`. In `akuma-exec` every instance
+   carried a SAFETY comment arguing *mutual exclusion*, which is the right
+   argument for the wrong question — so the comment is not a filter. The check
+   that matters is whether the field sits in an `UnsafeCell`.
+2. **Duplicated types with hand-written converters.** Grep shape: the same
+   variant list declared in more than one crate, plus a `match` whose arms are
+   `X::A => Y::A`. An identity `match` between two enums is the tell, and it is
+   cheap to search for.
+
+Both are mechanical to look for and neither is urgent — the system is stable and
+these are hygiene. But "we found two of these by accident in one crate" is not
+evidence that there are only two.
 
 ## 6. Recommended order
 

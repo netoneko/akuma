@@ -102,29 +102,18 @@ pub mod types;
 /// `crate::safe_print!(…)` call sites resolve unchanged.
 pub use akuma_primitives::safe_print;
 
-/// Allocation source for debug frame tracking — the `akuma-exec` enum, mirrored
-/// here so this crate can attribute page-table and user-data frames without
-/// depending on the execution crate. Converted at the `akuma-pmm` boundary
-/// exactly as `akuma_exec::runtime::track_frame` does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameSource {
-    Kernel,
-    UserPageTable,
-    UserData,
-    ElfLoader,
-    Unknown,
-}
+/// Allocation source for debug frame tracking.
+///
+/// Re-exported from `akuma-pmm`, which owns the tracker. This was a mirrored
+/// copy of that enum "so this crate can attribute frames without depending on
+/// the execution crate" — but the type it was mirroring was `akuma-exec`'s own
+/// copy, and the one that matters lives *below* both of us in `akuma-pmm`,
+/// which this crate already depends on. Unified 2026-09-01.
+pub use akuma_pmm::FrameSource;
 
 /// Attribute a frame to a source in the PMM's tracker.
 pub fn track_frame(frame: PhysFrame, source: FrameSource) {
-    let src = match source {
-        FrameSource::Kernel => akuma_pmm::FrameSource::Kernel,
-        FrameSource::UserPageTable => akuma_pmm::FrameSource::UserPageTable,
-        FrameSource::UserData => akuma_pmm::FrameSource::UserData,
-        FrameSource::ElfLoader => akuma_pmm::FrameSource::ElfLoader,
-        FrameSource::Unknown => akuma_pmm::FrameSource::Unknown,
-    };
-    akuma_pmm::track_frame(frame.addr, src);
+    akuma_pmm::track_frame(frame.addr, source);
 }
 
 /// The scheduler questions this crate cannot answer for itself.

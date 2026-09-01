@@ -160,7 +160,7 @@ impl Process {
         self.address_space = loaded.address_space;
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: AS swapped\n");
         self.entry_point = loaded.entry_point;
-        self.brk = loaded.brk;
+        self.brk.store(loaded.brk, Ordering::Relaxed);
         self.initial_brk = loaded.brk;
         self.memory = ProcessMemory::new(loaded.brk, loaded.stack_bottom, loaded.stack_top, loaded.mmap_floor);
         self.mmap_regions.clear();
@@ -301,7 +301,7 @@ impl Process {
             address_space: loaded.address_space,
             context: UserContext::new(loaded.entry_point, loaded.sp),
             parent_pid: 0,
-            brk: loaded.brk,
+            brk: core::sync::atomic::AtomicUsize::new(loaded.brk),
             initial_brk: loaded.brk,
             entry_point: loaded.entry_point,
             memory,

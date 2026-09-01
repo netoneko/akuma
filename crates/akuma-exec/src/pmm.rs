@@ -5,13 +5,14 @@
 //! `src/syscall/` calls eight of these wrappers and could not leave the binary
 //! while they were in it (`docs/archive/SRC_SYSCALL_EXTRACTION.md`).
 //!
-//! `akuma-pmm` works in raw `usize` physical addresses on purpose (see its
-//! module doc); this is the one place that translates. The `dp_counters_line`
+//! `akuma-pmm` works in raw `usize` physical addresses; this is the one place
+//! that translates. (This used to say "on purpose (see its module doc)" — that
+//! doc argues *leaf-ness*, "no dependency on `akuma-exec`", and never states a
+//! usize rationale. Corrected 2026-09-01; the distinction matters, because it is
+//! what a future "should `akuma-pmm` speak `PhysFrame`?" question turns on.) The `dp_counters_line`
 //! dump stayed in `src/pmm.rs`: it also reads `akuma_ext2`'s deferred-free
 //! counters, which sit *above* this crate, and `akuma-exceptions` takes it
 //! through a hook.
-
-//! `PhysFrame`/`FrameSource` conversions over `akuma-pmm`'s raw-`usize` API.
 //!
 //! The bitmap allocator, frame tracker, UAF quarantine, free/CoW event ledgers
 //! (Step 2), the CoW refcount table itself (Step 3), and the reclaim escalation
@@ -53,18 +54,13 @@ pub use akuma_pmm::cow_ref_dec;
 pub use akuma_pmm::{cow_ref_count, cow_ref_inc};
 
 // ============================================================================
-// Frame tracking — thin wrappers, PhysFrame/FrameSource <-> usize/akuma_pmm::FrameSource
+// Frame tracking — thin wrapper, PhysFrame -> usize
 // ============================================================================
 
+/// The third of three byte-identical `FrameSource` converters until 2026-09-01.
+/// `FrameSource` is `akuma-pmm`'s type now, so only `PhysFrame` is unwrapped.
 pub fn track_frame(frame: PhysFrame, source: FrameSource) {
-    let src = match source {
-        FrameSource::Kernel => akuma_pmm::FrameSource::Kernel,
-        FrameSource::UserPageTable => akuma_pmm::FrameSource::UserPageTable,
-        FrameSource::UserData => akuma_pmm::FrameSource::UserData,
-        FrameSource::ElfLoader => akuma_pmm::FrameSource::ElfLoader,
-        FrameSource::Unknown => akuma_pmm::FrameSource::Unknown,
-    };
-    akuma_pmm::track_frame(frame.addr, src);
+    akuma_pmm::track_frame(frame.addr, source);
 }
 
 // `tracking_stats` moved out on 2026-09-01: exceptions.rs — its only caller —

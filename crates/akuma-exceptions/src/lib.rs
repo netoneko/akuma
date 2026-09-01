@@ -3980,7 +3980,10 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
         } else {
             0 // SP outside expected range (might be corrupted)
         };
-        let heap_used = proc.brk.saturating_sub(proc.initial_brk);
+        let heap_used = proc
+            .brk
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(proc.initial_brk);
         let mmap_used = mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(0x1000_0000);
 
         // Print in smaller chunks to fit in static buffer
@@ -3995,7 +3998,7 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
         safe_print!(256, "    SP_EL0={user_sp:#x}, used={stack_used} bytes ({stack_pct}%)\n");
 
         safe_print!(256, "    Heap: brk={:#x} (initial={:#x}), grown={} bytes\n",
-            proc.brk, proc.initial_brk, heap_used
+            proc.brk.load(core::sync::atomic::Ordering::Relaxed), proc.initial_brk, heap_used
         );
 
         safe_print!(256, "    Mmap: next={:#x}, limit={:#x}, used={} bytes\n",
