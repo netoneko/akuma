@@ -357,7 +357,7 @@ pub fn secondary_stack_base(core: usize) -> usize {
 /// point of shared-kernel SMP — so it now calls the one implementation instead
 /// of carrying a second copy that could drift from it.
 fn set_shared_vbar() {
-    crate::exceptions::install_vbar();
+    akuma_exceptions::install_vbar();
 }
 
 /// Per-core counter of scheduler ticks each core has serviced a worker on — the M2c

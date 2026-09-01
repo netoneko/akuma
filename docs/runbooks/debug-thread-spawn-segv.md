@@ -47,7 +47,7 @@ Read the message as **"a process whose address space is shared"**, which is a
 strictly larger set. The line is emitted from a single predicate:
 
 ```rust
-// src/exceptions.rs
+// crates/akuma-exceptions/src/lib.rs
 let is_clone_thread = proc.address_space.is_shared();
 ```
 
@@ -210,7 +210,7 @@ they land *after* the faults, not before.
 
 **SA_RESTART cannot re-run `clone`.** A silently replayed `svc` would clone twice
 against one packet — candidate 1 below, delivered. But the rewind at
-`src/exceptions.rs` (`(*frame).elr_el1 -= 4`) is gated on the syscall having
+`akuma-exceptions` (`(*frame).elr_el1 -= 4`) is gated on the syscall having
 returned `-EINTR` or `-ERESTARTSYS`; `clone` returns a positive tid or `EAGAIN`,
 neither of which arms it.
 
@@ -385,7 +385,7 @@ foreign heap word (`"cseinfo."`).
 nothing: `clone_thread` hands the child `shared_ttbr0` — the parent's ttbr0
 *including the parent's ASID* — while `new_shared` gives the child's `Process` a
 fresh ASID over the same L0, so the ASIDs differ by design on every cloned
-thread. The diagnostic in `src/exceptions.rs` now separates the two and only
+thread. The diagnostic in `akuma-exceptions` now separates the two and only
 flags **`L0 BASE DIFFERS`**; a bare ASID difference prints
 `(asid differs only — normal for a cloned thread)`. An earlier revision flagged
 both, which would have made every cloned-thread fault look like a smoking gun.
@@ -641,7 +641,7 @@ New constraints from the 2026-08-06 `-j4` run (instrumented kernel, N ran 2→6)
 ### What the instrumented runs settled (2026-08-06, later session)
 
 A kernel-side `[RELR]` forensics block now ships in the instruction-abort
-handler (`src/exceptions.rs`, `interp_relr_forensics`). It fires **only** on a
+handler (`akuma-exceptions`, `interp_relr_forensics`). It fires **only** on a
 `FAR` of the shape `N × INTERP_BASE + off` with `N ≥ 2` and `off < 0x100000`,
 then scans the interpreter's own 1 MB VA window in the *live* tables for words
 equal to `FAR` and prints each hit's **VA, PA and value**, plus
@@ -976,7 +976,7 @@ address of that pair**. `clone_thread` snapshots the two words there, in the
 parent's address space, into per-slot statics (`record_clone_snapshot`,
 `crates/akuma-exec/src/process/mod.rs`). The fatal EL0 data-abort dump re-reads
 them in the child's context and prints the comparison
-(`print_spawn_fault_diag`, `src/exceptions.rs`):
+(`print_spawn_fault_diag`, `akuma-exceptions`):
 
 ```
 [Fault]  tid=26 ttbr0_live=0x1a000067f00000 ttbr0_proc=0x1a000067f00000

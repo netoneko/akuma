@@ -178,7 +178,7 @@ the same instructions with no call overhead.
 > behaviour change on a hot path that needs its own measurement — see the module
 > header in `irq.rs` for the cost on each side. Do not "tidy" it in passing.
 
-The one DAIF write not routed here is in `src/exceptions.rs`'s vector-install asm
+The one DAIF write not routed here is in `akuma-exceptions`'s vector-install asm
 block, where the surrounding `msr vbar_el1` / `isb` sequence has to stay one unit.
 
 ### Preemption

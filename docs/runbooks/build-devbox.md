@@ -97,7 +97,7 @@ Env knobs (all optional):
 > Apple Silicon's HVF lacks; the probe expects `SIGILL` to detect the missing
 > feature, but the kernel's `EC=0x0` handler hard-killed the process instead
 > of delivering it. Fixed by delivering `SIGILL` via `try_deliver_signal` in
-> `src/exceptions.rs`. Re-verified 2026-08-11 on devbox-smoltcp: `cargo new`,
+> `akuma-exceptions`. Re-verified 2026-08-11 on devbox-smoltcp: `cargo new`,
 > `cargo build`, and running the resulting binary all completed cleanly. Full
 > writeup: [`../archive/NIGHTLY_CARGO_HVF_SIGILL.md`](../archive/NIGHTLY_CARGO_HVF_SIGILL.md);
 > also covered in [`selfhost-kernel-build.md`](selfhost-kernel-build.md) §6.
@@ -219,4 +219,4 @@ curl https://ifconfig.me               # HTTPS over rump (verifies CA bundle)
   cause + fix, 2026-08-06) — both toolchains ship together now, see the
   toolchain note above.
 - `selfhost-kernel-build.md` §6 — the fix in kernel-source terms
-  (`src/exceptions.rs`, `try_deliver_signal`).
+  (`akuma-exceptions`, `try_deliver_signal`).

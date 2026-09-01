@@ -80,7 +80,9 @@ mod daif_tests;
 // mod embassy_net_driver;
 // mod embassy_time_driver; // replaced by akuma_exec::alarms
 // mod embassy_virtio_driver;
-mod exceptions;
+// The exception path moved to `akuma-exceptions` (2026-09-01). The alias keeps
+// every `exceptions::` call site in this file spelled as it was.
+use akuma_exceptions as exceptions;
 mod file_page_cache;
 mod fs;
 #[cfg(kernel_tests)]
@@ -1008,18 +1010,54 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     // and SVC entry points call out to. Registered BEFORE `exceptions::init()`
     // — no exception can be handled before it installs VBAR and unmasks IRQs,
     // which is what keeps the hooks' `require()` unreachable-empty.
+    exceptions::register_config(exceptions::ExceptionsConfig {
+        verify_svc_at_entry: config::VERIFY_SVC_AT_ENTRY,
+        process_syscall_stats: config::PROCESS_SYSCALL_STATS,
+        demand_page_log_enabled: config::DEMAND_PAGE_LOG_ENABLED,
+        fpcache_verify_hits: config::FPCACHE_VERIFY_HITS,
+        signal_trace_enabled: config::SIGNAL_TRACE_ENABLED,
+        trace_tkill: config::TRACE_TKILL,
+        debug_sigsegv_syscall_stub: config::DEBUG_SIGSEGV_SYSCALL_STUB,
+        debug_sigsegv_syscall_stub_elir_min: config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MIN,
+        debug_sigsegv_syscall_stub_elir_max: config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MAX,
+        debug_pattern2_trap_trace: config::DEBUG_PATTERN2_TRAP_TRACE,
+    });
     #[cfg(kernel_smp_shared)]
     exceptions::register_hooks(exceptions::ExceptionHooks {
         dispatch_irq: irq::dispatch_irq,
         record_el0_trap: smp_shared::record_el0_trap,
         report_poison_value: akuma_exec::process::reclaim::report_poison_value,
         dp_counters_line: pmm::dp_counters_line,
+        handle_syscall: syscall::handle_syscall,
+        current_syscall_nr: syscall::current_syscall_nr,
+        inc_pagefault: syscall::syscall_counters::inc_pagefault,
+        inc_qemu_dc_zva_ec15: syscall::syscall_counters::inc_qemu_dc_zva_ec15,
+        inc_qemu_stp_xzr_ec15: syscall::syscall_counters::inc_qemu_stp_xzr_ec15,
+        sys_exit_group: syscall::proc::sys_exit_group_pub,
+        notify_child_channel_exited: syscall::proc::notify_child_channel_exited_pub,
+        vfork_complete: syscall::proc::vfork_complete,
+        signal_is_fatal_default: syscall::signal::signal_is_fatal_default,
+        syscall_log_formatted: syscall::log::get_formatted,
+        read_profile_span_new: syscall::utils::read_profile::exception_span_start,
+        read_profile_span_end: syscall::utils::read_profile::exception_span_end,
     });
     #[cfg(not(kernel_smp_shared))]
     exceptions::register_hooks(exceptions::ExceptionHooks {
         dispatch_irq: irq::dispatch_irq,
         report_poison_value: akuma_exec::process::reclaim::report_poison_value,
         dp_counters_line: pmm::dp_counters_line,
+        handle_syscall: syscall::handle_syscall,
+        current_syscall_nr: syscall::current_syscall_nr,
+        inc_pagefault: syscall::syscall_counters::inc_pagefault,
+        inc_qemu_dc_zva_ec15: syscall::syscall_counters::inc_qemu_dc_zva_ec15,
+        inc_qemu_stp_xzr_ec15: syscall::syscall_counters::inc_qemu_stp_xzr_ec15,
+        sys_exit_group: syscall::proc::sys_exit_group_pub,
+        notify_child_channel_exited: syscall::proc::notify_child_channel_exited_pub,
+        vfork_complete: syscall::proc::vfork_complete,
+        signal_is_fatal_default: syscall::signal::signal_is_fatal_default,
+        syscall_log_formatted: syscall::log::get_formatted,
+        read_profile_span_new: syscall::utils::read_profile::exception_span_start,
+        read_profile_span_end: syscall::utils::read_profile::exception_span_end,
     });
 
     // Set up exception vectors and enable IRQs

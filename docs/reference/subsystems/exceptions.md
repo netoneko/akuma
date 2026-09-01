@@ -2,7 +2,14 @@
 
 The AArch64 exception vector table, GPR/FPSIMD save-restore, and ESR_EL1
 dispatch every syscall, page fault, IRQ, and signal delivery flows through.
-Source: `src/exceptions.rs` (3,503 lines). For what each destination does
+Source: `crates/akuma-exceptions/src/lib.rs` (3,120 code lines) — it was
+`src/exceptions.rs` until 2026-09-01
+([`AKUMA_EXCEPTIONS_EXTRACTION.md`](../../archive/AKUMA_EXCEPTIONS_EXTRACTION.md)),
+and the move took `src/` production `unsafe` from 91 sites to 11. The crate
+reaches kernel-core state (the syscall dispatcher, the IRQ dispatcher, the
+`src/config.rs` tunables) only through the `ExceptionHooks`/`ExceptionsConfig`
+registrations `src/main.rs` installs at boot; it names no `crate::` path.
+For what each destination does
 once routed here, see [`syscalls.md`](syscalls.md) "Dispatch" (SVC →
 `handle_syscall`), [`memory.md`](memory.md) "CoW fork" (data-abort → CoW
 resolution), [`syscalls/signal.md`](syscalls/signal.md) (signal delivery

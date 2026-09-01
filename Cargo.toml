@@ -4,6 +4,7 @@ default-members = [
     ".",
     "crates/akuma-alloc",
     "crates/akuma-exec",
+    "crates/akuma-exceptions",
     "crates/akuma-uart",
     "crates/akuma-fdt",
     "crates/akuma-firecracker",
@@ -182,7 +183,7 @@ default = [
     # gated and why that reason no longer applies.
     "sc-reboot",
 ]
-no-tests = ["akuma-net/small-sockets"]
+no-tests = ["akuma-net/small-sockets", "akuma-exceptions/no-tests"]
 
 # Target Firecracker's aarch64 microVM instead of QEMU `virt`.
 #
@@ -244,7 +245,7 @@ rump-tests = []
 # passing) and a same-binary `bkl-profile` A/B on the contention regimen
 # (`irq/sched` 24.7% → 10.2%, 6/6 digests exact both sides). Remove from this
 # list to A/B.
-smp-shared = ["akuma-exec/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-exceptions/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
@@ -359,7 +360,7 @@ no-bkl-drivers = []
 # 0 stuck/RECOVERED/PANIC/WILD/SPURIOUS both sides) — see
 # docs/archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md §5. Remove from the `smp-shared`
 # list to A/B against the BKL-held path.
-no-bkl-irq = []
+no-bkl-irq = ["akuma-exceptions/no-bkl-irq"]
 
 # BKL-hold attribution (measurement builds only — never ship it). Enables the
 # per-tag BKL profiler in `akuma_exec::sync` for the whole boot and makes the
@@ -673,6 +674,16 @@ akuma-net-yarn = { path = "crates/akuma-net-yarn" }
 # virtio Hal + MMIO probe + the block/rng/audio drivers.
 akuma-virtio = { path = "crates/akuma-virtio" }
 akuma-exec = { path = "crates/akuma-exec" }
+# The exception path: vector table, EL0/EL1 trap handlers, EL0 syscall entry,
+# CoW breaks, demand paging, signal delivery. Extracted from
+# `src/exceptions.rs` 2026-09-01 — `docs/archive/AKUMA_EXCEPTIONS_EXTRACTION.md`.
+# It cannot take `#![forbid(unsafe_code)]` (a vector table is hand-written asm
+# by definition); its stated safety contract lives at the top of its lib.rs,
+# in the shape `akuma-net-nic`'s DMA contract and `akuma-gic`'s MMIO contract
+# use. Reaches kernel-core state (the syscall dispatcher, the IRQ dispatcher,
+# the EL0-trap diagnostic, config tunables) exclusively through the
+# `ExceptionHooks`/`ExceptionsConfig` registrations in `src/main.rs`.
+akuma-exceptions = { path = "crates/akuma-exceptions" }
 # The Chief: observe/decide/hysteresis primitives shared by every self-tuning
 # policy in the tree (timer-tick demotion, file-page cache cap, netpoll wake
 # rate). Takes reports, issues verdicts, never touches hardware.

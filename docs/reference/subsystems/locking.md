@@ -455,7 +455,7 @@ serialized against concurrent readers the way `write_file`/`create_dir` are.
 Not currently exposed to a BKL-free window — audit this before converting
 `truncate`/`ftruncate`.
 
-### The per-syscall BKL opt-out list — Phase 7f (`src/smp_shared.rs` + `src/exceptions.rs`)
+### The per-syscall BKL opt-out list — Phase 7f (`src/smp_shared.rs` + `akuma-exceptions`)
 
 Since 2026-08-01, `rust_sync_el0_handler` acquires the BKL **unless the trapped
 syscall's number is on the opt-out list** (`SYSCALL_BKL_OPTOUT`, a 512-bit atomic

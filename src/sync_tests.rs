@@ -887,7 +887,7 @@ fn test_futex_wait_eintr_signal_preserved() {
 fn test_rt_sigreturn_restores_registers() {
     set_bypass(true);
 
-    use crate::exceptions::{
+    use akuma_exceptions::{
         TEST_SIGFRAME_MCONTEXT, TEST_SIGFRAME_SIZE, TEST_SIGFRAME_UCONTEXT,
         TEST_SIGFRAME_FPSIMD,
     };

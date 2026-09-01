@@ -48,7 +48,7 @@ pass explicit `--dir` arguments.
 | 50 | Exhaustive; the tail is small clones where a helper costs more than it saves |
 
 **Use 50 for the fault, CoW and page-table paths regardless.** A 13-line clone in
-`src/exceptions.rs` is worth more attention than a 60-line one in a test file:
+`akuma-exceptions` is worth more attention than a 60-line one in a test file:
 the 2026-08-12 CoW refcount underflow lived in three mutually-cloned break sites
 that only appear at `--minimum-tokens 50`, and had to be fixed three times
 (`../archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.6). Small clones in

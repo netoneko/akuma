@@ -3662,6 +3662,23 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     0  // No switch needed
 }
 
+/// Host stub for [`sgi_scheduler_handler_with_sp`], which is bare-metal only:
+/// its switch arm writes `ttbr0_el1`, an `msr` deliberately kept out of
+/// `akuma-cpu` (installing an address space is not "safe to execute"). The
+/// pairing exists so `akuma-exceptions` — whose IRQ handler is the sole caller —
+/// stays in `default-members` and compiles under `cargo test --target $HOST`
+/// alongside every other crate, rather than buying host coverage of the
+/// exception path with a workspace exclusion.
+///
+/// It panics rather than returning `0`: `0` is the handler's "no context switch
+/// needed" answer, so a stub returning it would let a host caller read a silent
+/// no-op as a real scheduling decision. Nothing on the host has an IRQ vector to
+/// call this from, and if that ever changes the panic says so.
+#[cfg(not(target_os = "none"))]
+pub fn sgi_scheduler_handler_with_sp(_irq: u32, _current_sp: u64) -> u64 {
+    unimplemented!("sgi_scheduler_handler_with_sp: bare metal only (writes ttbr0_el1)")
+}
+
 /// Called from the IRQ vector asm immediately after `mov sp, x0`: this core is
 /// now off the outgoing thread's kernel stack, so peers may pick that thread up
 /// (or recycle its slot). Clears the off-CPU gate `commit_switch` latched.

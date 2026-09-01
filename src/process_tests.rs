@@ -238,7 +238,7 @@ fn test_el1_sync_exception_preserves_gprs() {
     // log here is expected rather than a symptom.
     crate::safe_print!(160,
         "  [test] el1_sync_exception_preserves_gprs: the EL1 abort dump below is deliberate\n");
-    let (mask, aborts) = crate::exceptions::el1_sync_gpr_clobber_mask();
+    let (mask, aborts) = akuma_exceptions::el1_sync_gpr_clobber_mask();
     if aborts == 0 {
         // The probe's store did not fault, so nothing was tested. Report that as a
         // failure rather than a pass: a vacuous assertion here would hide exactly
@@ -1126,7 +1126,7 @@ fn test_thread_last_core_tracked() {
 
 /// See the call site: asserts the [SPURIOUS-SVC] counter stayed 0 across the suite.
 fn test_no_spurious_svc_traps() {
-    let n = crate::exceptions::spurious_svc_count();
+    let n = akuma_exceptions::spurious_svc_count();
     if n == 0 {
         console::print("[Test] no_spurious_svc_traps PASSED (0 phantom SVCs)\n");
     } else {
@@ -5697,7 +5697,7 @@ fn test_syscall_bkl_optout() {
 /// `return_to_kernel` ledger reset. Runs LAST, like `test_no_spurious_svc_traps`.
 #[cfg(kernel_smp_shared)]
 fn test_no_stale_window_heals() {
-    let n = crate::exceptions::stale_window_heal_count();
+    let n = akuma_exceptions::stale_window_heal_count();
     if n == 0 {
         console::print("[Test] no_stale_window_heals PASSED (0 heals)\n");
     } else {
@@ -6156,8 +6156,8 @@ fn test_cow_break_declines_stale_old_pa() {
         // 1. STALE old_pa: the PTE names A but the caller (as a raced EL1 site
         //    would) passes B. The break must decline: PTE untouched, refcounts
         //    untouched, C returned to the PMM inside the call.
-        crate::exceptions::complete_cow_break(
-            crate::exceptions::CowRemap::TakingAsLock(owner), va, frame_b.addr, frame_c);
+        akuma_exceptions::complete_cow_break(
+            akuma_exceptions::CowRemap::TakingAsLock(owner), va, frame_b.addr, frame_c);
         let pte = owner.with_address_space(|a| a.translate(va).map(|p| p & !0xFFF));
         if pte != Some(frame_a.addr) {
             return (false, "declined break rewrote the PTE");
@@ -6173,8 +6173,8 @@ fn test_cow_break_declines_stale_old_pa() {
         let Some(frame_d) = crate::pmm::alloc_page_zeroed() else {
             return (false, "OOM frame D");
         };
-        crate::exceptions::complete_cow_break(
-            crate::exceptions::CowRemap::TakingAsLock(owner), va, frame_a.addr, frame_d);
+        akuma_exceptions::complete_cow_break(
+            akuma_exceptions::CowRemap::TakingAsLock(owner), va, frame_a.addr, frame_d);
         let pte = owner.with_address_space(|a| a.translate(va).map(|p| p & !0xFFF));
         if pte != Some(frame_d.addr) {
             return (false, "genuine break did not remap to the private copy");
@@ -6800,7 +6800,7 @@ fn test_stale_write_fault_absorbed() {
     // This thread's own slot: it is not faulting concurrently, so no peer can
     // perturb the run counter mid-test.
     let tid = akuma_exec::threading::current_thread_id();
-    let absorbed = |va| crate::exceptions::stale_write_fault_absorbed_in(l0, va, tid);
+    let absorbed = |va| akuma_exceptions::stale_write_fault_absorbed_in(l0, va, tid);
 
     // A read-only page is a genuine permission fault: the handler must decline and
     // let SIGSEGV (or a real repair) happen. Also resets the run counter for the
@@ -6823,9 +6823,9 @@ fn test_stale_write_fault_absorbed() {
     assert!(absorbed(WRITABLE_VA), "the second retry is still within budget");
 
     // Budget spent on an unchanged (VA, PTE): stop absorbing rather than loop.
-    let repeats_before = crate::exceptions::STALE_TLB_REPEATS.load(Ordering::Relaxed);
+    let repeats_before = akuma_exceptions::STALE_TLB_REPEATS.load(Ordering::Relaxed);
     assert!(!absorbed(WRITABLE_VA), "an unchanged PTE must exhaust the retry budget");
-    assert!(crate::exceptions::STALE_TLB_REPEATS.load(Ordering::Relaxed) == repeats_before + 1,
+    assert!(akuma_exceptions::STALE_TLB_REPEATS.load(Ordering::Relaxed) == repeats_before + 1,
         "exhausting the budget must be counted");
 
     // A changed PTE means real work happened in between — the same shape a CoW
@@ -9155,7 +9155,7 @@ fn test_signal_mask_nodefer_flag_skips() {
 /// The `uc_sigmask` field lives at ucontext+40 → frame offset 168 (128+40).
 #[allow(clippy::useless_let_if_seq)]
 fn test_sigframe_layout_constants() {
-    use crate::exceptions::{
+    use akuma_exceptions::{
         TEST_SIGFRAME_FPSIMD, TEST_SIGFRAME_MCONTEXT, TEST_SIGFRAME_SIZE,
         TEST_SIGFRAME_UC_SIGMASK, TEST_SIGFRAME_UCONTEXT,
     };
@@ -9722,7 +9722,7 @@ fn test_demand_paging_merged_body_policy() {
 /// classified correctly, or the guard would either miss the phantom (crash
 /// recurs) or eat a real syscall (hang).
 fn test_is_aarch64_svc_recogniser() {
-    use crate::exceptions::is_aarch64_svc;
+    use akuma_exceptions::is_aarch64_svc;
     // Real SVCs (any immediate) — must be recognised.
     let svcs = [
         0xD400_0001u32, // svc #0   (the canonical Linux syscall encoding)
@@ -9822,7 +9822,7 @@ fn test_kernel_stack_sizes_sane() {
 /// Policy helper for EL0 IA replay: kernel identity RAM faults should not be treated as “stale TB”.
 #[allow(clippy::useless_let_if_seq)]
 fn test_far_kernel_identity_range_policy() {
-    use crate::exceptions::far_in_kernel_identity_user_range;
+    use akuma_exceptions::far_in_kernel_identity_user_range;
     let mut ok = if !far_in_kernel_identity_user_range(0x6006_c15c) {
         crate::safe_print!(64, "[Test] far_kernel_identity_range: 0x6006c15c expected in range\n");
         false
@@ -9899,7 +9899,7 @@ fn test_dc_zva_emulation() {
 /// Verify that `decode_stp_xzr_xzr` correctly recognises and decodes all signed-offset
 /// variants of `stp xzr, xzr, [Xn, #N]`, including negative offsets and different Rn.
 fn test_stp_xzr_misroute_decode() {
-    use crate::exceptions::decode_stp_xzr_xzr;
+    use akuma_exceptions::decode_stp_xzr_xzr;
 
     struct Case {
         instr: u32,
@@ -9952,7 +9952,7 @@ fn test_stp_xzr_misroute_decode() {
 /// Verify that the STP emulation path writes exactly 16 zero bytes to the target address.
 /// Runs entirely in EL1 on a kernel heap buffer — no user address space needed.
 fn test_stp_xzr_emulation() {
-    use crate::exceptions::decode_stp_xzr_xzr;
+    use akuma_exceptions::decode_stp_xzr_xzr;
 
     // `stp xzr, xzr, [x0, #0x10]` — offset=16, Rn=0
     let instr: u32 = 0xa9017c1f;
@@ -10031,7 +10031,7 @@ fn test_stp_xzr_ec15_handler_fires() {
 
 /// `SA_SIGINFO` passes `&siginfo` and `&ucontext` — x1/x2 offsets from frame base.
 fn test_sa_siginfo_frame_offsets_for_x1_x2() {
-    use crate::exceptions::TEST_SIGFRAME_UCONTEXT;
+    use akuma_exceptions::TEST_SIGFRAME_UCONTEXT;
     const SIGINFO_OFF: usize = 0;
     let sp = 0xc400_bba0usize;
     let x1 = sp + SIGINFO_OFF;
@@ -13723,7 +13723,7 @@ fn test_sigchld_not_fatal_by_default() {
 /// hanging `wait` even after the signal is delivered correctly. This unit-tests
 /// the predicate directly (a full ELR-rewind assertion needs a live trap frame).
 fn test_rt_sigsuspend_not_restartable() {
-    use crate::exceptions::syscall_is_non_restartable;
+    use akuma_exceptions::syscall_is_non_restartable;
     let sigsuspend_ok = syscall_is_non_restartable(133);
     let poll_ok = syscall_is_non_restartable(73) && syscall_is_non_restartable(72)
         && syscall_is_non_restartable(22) && syscall_is_non_restartable(4);

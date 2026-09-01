@@ -91,7 +91,7 @@ GICv3 mnemonic support.
 `src/irq.rs` is the handler-registration layer above the GIC:
 `register_handler(irq, f)` records `f` in a `Vec<Option<IrqHandler>>` and
 calls `gic::enable_irq(irq)` (`irq.rs:84-96`). The unified IRQ entry
-(`rust_irq_handler_with_sp`, `src/exceptions.rs:1455-1470`) does:
+(`rust_irq_handler_with_sp`, `crates/akuma-exceptions/src/lib.rs`) does:
 
 ```
 irq = gic::acknowledge_irq()

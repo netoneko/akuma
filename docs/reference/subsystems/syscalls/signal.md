@@ -2,7 +2,7 @@
 
 rt_sigaction / rt_sigprocmask / sigaltstack / rt_sigsuspend / rt_sigtimedwait /
 kill / tkill / tgkill / rt_sigreturn. Source: `src/syscall/signal.rs`; frame
-build/unwind lives in `src/exceptions.rs` (`try_deliver_signal`,
+build/unwind lives in `crates/akuma-exceptions/src/lib.rs` (`try_deliver_signal`,
 `do_rt_sigreturn`). For `kill`'s process/tgid-wide routing see
 [`proc.md`](proc.md) "kill / tkill"; for the blocking primitives behind
 `rt_sigsuspend`/`rt_sigtimedwait` see [`../scheduler.md`](../scheduler.md)

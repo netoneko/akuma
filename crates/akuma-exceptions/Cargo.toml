@@ -1,0 +1,62 @@
+[package]
+name = "akuma-exceptions"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[features]
+# Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared`
+# feature. This crate's build.rs emits `cfg(kernel_smp_shared)` from it, which
+# gates the BKL excursion wrapper, the IRQ reconciliation, the EL0-trap
+# diagnostic hook and the dropped-window tripwires — the same cfg names the
+# bin crate uses so the gates are uniform. With it off the exception handlers
+# compile the `not()` arms (no BKL, no reconciliation), which is what the
+# single-core profiles (extreme-size, devbox) build.
+smp-shared = []
+
+# BKL-free timer-IRQ dispatch (Phase 7a), forwarded from the bin crate's
+# `no-bkl-irq`. Gates the fast path in `rust_irq_handler_with_sp` that
+# dispatches a non-scheduler IRQ without ever taking the BKL. Only meaningful
+# together with `smp-shared`; the guard body is additionally gated on that, so
+# it compiles to nothing in either single-cfg combination.
+no-bkl-irq = []
+
+# Compile the boot self-test surface out (`kernel_tests` cfg NOT emitted):
+# `el1_sync_gpr_clobber_mask`'s GPR-transparency probe, the `TEST_SIGFRAME_*`
+# layout consts and the boot suite's entry points. extreme-size and the devbox
+# build set this; the default `cargo build`/`test` do not.
+no-tests = []
+
+[dependencies]
+# The safe-to-execute AArch64 instructions: barrier/cache reads and the
+# read-only system registers the handlers sample (`esr_el1`, `far_el1`,
+# `ttbr0_el1`, `cntvct_el0`, ...). Writing TTBR0/ELR/VBAR deliberately does NOT
+# live there — installing a vector table or redirecting ELR is a change of
+# control flow, so those `msr`s stay `unsafe` at their (few) call sites here.
+akuma-cpu = { path = "../akuma-cpu" }
+# `safe_print!`/`StackWriter` (heap-free console), `Registered` (the hook
+# tables), `preempt::current_tid` and the IRQ guard.
+akuma-primitives = { path = "../akuma-primitives" }
+# The process table, threading slots, `UserTrapFrame`, the sigframe layout,
+# user access (copy_to/from_user), the BKL protocol and `akuma-mmu` — the
+# state every fault arm reads or repairs. The one upward dependency the
+# handlers cannot lose.
+akuma-exec = { path = "../akuma-exec" }
+# The BKL drop/skip policy decisions (`fault_bkl_drop_enabled`, the per-syscall
+# opt-out bitmap, ...). Read directly, not through `akuma_exec::bkl`.
+akuma-bkl = { path = "../akuma-bkl" }
+# The physical frame allocator: alloc/free/CoW refcounts, the free ledger and
+# the demand-paging attribution counters.
+akuma-pmm = { path = "../akuma-pmm" }
+# The shared file-page cache the demand-paging fill consults and publishes to.
+akuma-fpcache = { path = "../akuma-fpcache" }
+# The GICv3 driver: IRQ acknowledge/EOI and `SGI_SCHEDULER` in the IRQ handler.
+akuma-gic = { path = "../akuma-gic" }
+# The Linux/aarch64 syscall number table, for the SIGSEGV-vs-stub diagnostics
+# (`nr::READ`, `nr::EPOLL_CTL`, ...). Zero-dependency ABI crate.
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+# The kernel heap, for the crash-time memory-stats dump
+# (`log_memory_stats_on_crash`). Leaf crate.
+akuma-alloc = { path = "../akuma-alloc" }

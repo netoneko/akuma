@@ -10,6 +10,7 @@ dependencies = [
  "akuma-bkl",
  "akuma-boot",
  "akuma-cpu",
+ "akuma-exceptions",
  "akuma-exec",
  "akuma-ext2",
  "akuma-fdt",
@@ -85,6 +86,21 @@ dependencies = [
  "akuma-primitives",
  "elf",
  "log",
+]
+
+[[package]]
+name = "akuma-exceptions"
+version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-bkl",
+ "akuma-cpu",
+ "akuma-exec",
+ "akuma-fpcache",
+ "akuma-gic",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-syscalls-linux",
 ]
 
 [[package]]

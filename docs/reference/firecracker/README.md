@@ -257,7 +257,7 @@ Consequences to respect:
 
 `akuma_exec::mmu::is_kernel_text` is the single place that answers "is this
 address kernel code", backed by a window installed from `main.rs`. Five sites in
-`src/exceptions.rs` and one in `akuma-exec`'s scheduler previously used
+`akuma-exceptions` and one in `akuma-exec`'s scheduler previously used
 `KERNEL_PHYS_BASE..0x6000_0000`, which **inverts into an empty range** when the
 kernel loads above `0x6000_0000` — producing `[IRQ POISON]` on every timer tick
 and `[SGI-S POISON]` on every context switch.

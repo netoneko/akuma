@@ -145,6 +145,10 @@ mod disabled {
         }
         #[inline(always)]
         pub fn end_handle_syscall(self, _nr: u64) {}
+        /// Kept for shape parity with the enabled arm; the exception path now
+        /// closes its span through [`exception_span_end`] (a no-op here), so
+        /// nothing calls this directly.
+        #[allow(dead_code)]
         #[inline(always)]
         pub fn end_exception(self) {}
     }
@@ -165,6 +169,19 @@ mod disabled {
         #[inline(always)]
         pub fn lap(_stage: usize) {}
     }
+
+    /// The EL0 handler's outer span as plain functions over a raw start tick —
+    /// the exception path's `ExceptionHooks` cannot name `Span`, so the two
+    /// halves travel separately and reassemble here. Both compile to nothing
+    /// without the feature. (Shared doc with the enabled arm below.)
+    #[inline(always)]
+    #[must_use]
+    pub fn exception_span_start() -> u64 {
+        0
+    }
+
+    #[inline(always)]
+    pub fn exception_span_end(_start: u64) {}
 }
 
 /// Floor-arm lap indices: the suspects inside `handle_syscall`'s prologue and
@@ -567,6 +584,23 @@ mod enabled {
         fn default() -> Self {
             Self::new()
         }
+    }
+
+    /// The EL0 handler's outer span as plain functions over a raw start tick —
+    /// the exception path's `ExceptionHooks` cannot name `Span`, so the two
+    /// halves travel separately and reassemble here. The enabled pair costs
+    /// exactly what `Span::new`/`end_exception` always cost: one `now()` and
+    /// the `end_exception` body on the same `start` value. (Shared doc with
+    /// the no-op pair in the `disabled` arm above.)
+    #[inline]
+    #[must_use]
+    pub fn exception_span_start() -> u64 {
+        now()
+    }
+
+    #[inline]
+    pub fn exception_span_end(start: u64) {
+        Span { start }.end_exception()
     }
 
     /// Which log2-microsecond bucket a tick delta falls in. Uses the counter

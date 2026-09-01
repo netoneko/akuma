@@ -18,7 +18,7 @@ For memory syscalls see [`memory.md`](memory.md); for network syscalls see
 ## Dispatch
 
 Linux-compatible ABI: syscall number in **x8**, args in **x0–x5**, return in
-x0. Entry: EL0 sync exception → `src/exceptions.rs` → `handle_syscall`
+x0. Entry: EL0 sync exception → `crates/akuma-exceptions/src/lib.rs` → `handle_syscall`
 (`src/syscall/mod.rs:582`).
 
 `handle_syscall` flow:
@@ -31,9 +31,12 @@ x0. Entry: EL0 sync exception → `src/exceptions.rs` → `handle_syscall`
 
 `src/syscall/mod.rs` carries `#![forbid(unsafe_code)]` (2026-08-31), which
 applies to every submodule in the table below. It is the first enforced ban
-outside `crates/` — a bin crate cannot take one whole (`src/exceptions.rs` alone
-has 87 sites, and trap-frame work is the job there), but this is the subtree that
-runs with **userspace-controlled arguments on every call**.
+outside `crates/` — a bin crate cannot take one whole (trap-frame and
+page-table work is the job in `src/main.rs`'s boot entry), but this is the
+subtree that runs with **userspace-controlled arguments on every call**. The
+exception path that used to hold 87 of the bin crate's sites left for
+`akuma-exceptions` on 2026-09-01, taking `src/` production `unsafe` to 11
+sites in 3 files — the claim about bin crates is unchanged, its scale is not.
 
 **If you are adding a syscall and need a raw pointer, a page-table edit, or a
 system-register write, do not reach for `#[allow(unsafe_code)]` — `forbid`

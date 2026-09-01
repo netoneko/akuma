@@ -6,7 +6,8 @@ a hang with no output (see [`debug-boot-hang.md`](debug-boot-hang.md)) or an
 OOM/allocation panic (see [`debug-memory-oom.md`](debug-memory-oom.md), which
 owns the memory-corruption signatures that overlap with this doc).
 
-> **Stability of this area: C (active risk).** `src/exceptions.rs` was
+> **Stability of this area: C (active risk).** The exception path (now
+> `akuma-exceptions`, `src/exceptions.rs` until 2026-09-01) was
 > touched every month from January through July 2026, including the June 2026
 > memory+signal crisis. The recurring lesson across nearly every post-mortem
 > below: **an EL1 handler must never `eret` back to the ELR it just killed a
@@ -21,7 +22,7 @@ This runbook is action-first — symptom to cause to fix — not architecture.
 ## How to read an EL1 crash dump
 
 A kernel-mode fault prints this exact format (`rust_sync_el1_handler`,
-`src/exceptions.rs:1673`):
+`crates/akuma-exceptions/src/lib.rs`):
 
 ```
 [Exception] Sync from EL1: EC=0x25, ISS=0x61

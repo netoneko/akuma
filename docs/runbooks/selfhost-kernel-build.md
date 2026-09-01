@@ -748,7 +748,7 @@ HVF `-cpu host`); TCG `-cpu max` implements them, so no trap occurs there and
 `HVF=0` avoided the crash. Full investigation + evidence + rule-outs:
 [`../archive/NIGHTLY_CARGO_HVF_SIGILL.md`](../archive/NIGHTLY_CARGO_HVF_SIGILL.md).
 
-The fix is one arm of the sync-exception handler in `src/exceptions.rs`: deliver
+The fix is one arm of the sync-exception handler in `akuma-exceptions`: deliver
 `SIGILL` (signal 4) via the existing `try_deliver_signal` path before killing —
 mirroring what the kernel already did for `SIGSEGV` and the spurious-SVC `SIGILL`
 case. Verified end to end: `cargo --version` runs under HVF (RC=0), a

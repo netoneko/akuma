@@ -8224,7 +8224,7 @@ fn test_mmap_fixed_kernel_va_guard() -> bool {
 /// passes at any `MEMORY` size.
 fn test_lazy_fault_kernel_va_guard() -> bool {
     console::print("\n[TEST] lazy fault: far_in_kernel_identity_user_range covers RAM identity map\n");
-    use crate::exceptions::far_in_kernel_identity_user_range;
+    use akuma_exceptions::far_in_kernel_identity_user_range;
     use akuma_exec::process::types::ProcessMemory;
     let kva_start = ProcessMemory::KERNEL_VA_START as u64;
     let kva_end   = akuma_exec::mmu::kernel_va_end() as u64; // dynamic: tracks detected RAM
@@ -8489,7 +8489,7 @@ fn test_mmap_lazy_munmap_no_recycle() -> bool {
 /// uc_sigmask at ucontext+40.
 /// mcontext at ucontext+176 (after 120-byte _pad + 8-byte _pad2 for alignment).
 fn test_signal_frame_uc_stack_offsets() -> bool {
-    use crate::exceptions::{
+    use akuma_exceptions::{
         TEST_SIGFRAME_UCONTEXT, TEST_SIGFRAME_MCONTEXT,
         TEST_SIGFRAME_UC_SIGMASK, TEST_SIGFRAME_SIZE,
     };

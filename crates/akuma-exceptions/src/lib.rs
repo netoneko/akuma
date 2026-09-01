@@ -1,21 +1,111 @@
-// ARM64 Exception handling
-//!
-//! Exception vectors for AArch64 with proper EL0 (user mode) support.
+//! ARM64 exception handling — the vector table, the EL0/EL1 trap handlers, the
+//! EL0 syscall entry, and the fault-repair machinery behind them (CoW breaks,
+//! demand paging, signal delivery).
 //!
 //! When a user process makes a syscall (SVC instruction):
 //! 1. CPU automatically switches to EL1 and SP_EL1
-//! 2. sync_el0_handler saves all user registers
-//! 3. Rust syscall handler processes the request
-//! 4. Handler returns, registers restored, ERET to EL0
+//! 2. `sync_el0_handler` saves all user registers
+//! 3. the Rust syscall handler processes the request
+//! 4. the handler returns, registers are restored, ERET to EL0
+//!
+//! # Safety contract
+//!
+//! This crate is the `src/` kernel's irreducible `unsafe`, moved out of the
+//! tree wholesale on 2026-09-01 (`docs/archive/AKUMA_EXCEPTIONS_EXTRACTION.md`).
+//! It does **not** carry `#![forbid(unsafe_code)]` and must not pretend to:
+//! a file with a vector table and register-restore trampolines cannot. What it
+//! does instead is state the obligations, here, once:
+//!
+//! - **Trap frames.** The `*mut UserTrapFrame` handed to a handler is valid for
+//!   that handler's duration and points at the exception stack the vector table
+//!   pushed. Every `(*frame).x0`-style raw deref in this file is discharged by
+//!   that sentence plus the frame layouts documented at each vector entry.
+//! - **The vector table + `global_asm!`.** The two asm blobs (the vector table
+//!   and the `kernel_tests` GPR-transparency probe) are hand-written AArch64;
+//!   their register-save discipline is proven by `el1_sync_gpr_clobber_mask`,
+//!   which fails the boot suite the moment the EL1 vector clobbers a GPR.
+//! - **`#[unsafe(no_mangle)]` handlers.** `rust_default_exception_handler`,
+//!   `rust_irq_handler_with_sp`, `el1_fault_recovery_pad`,
+//!   `rust_sync_el1_handler` and `rust_sync_el0_handler` are the symbols the
+//!   vector table `bl`s. They are `extern "C"` (AAPCS64 preserves x19–x28) and
+//!   must stay leaf-reachable from the table.
+//! - **`install_vbar` / `set_current_exception_stack` / ELR redirections.**
+//!   The few `msr`/`mrs`-writes that change control flow (`vbar_el1`,
+//!   `tpidr_el1`, `elr_el1`) are `unsafe` at their call site because a wrong
+//!   value is a broken kernel, not a Rust error. `akuma-cpu` deliberately does
+//!   not own them: installing a vector table is not "safe to execute".
+//! - **Raw physical-window reads.** Page-table walks and frame peeks
+//!   (`phys_to_virt(...).read_volatile()`) appear only in diagnostic/repair
+//!   paths where the PA came from a live PTE read in the same handler.
+//!
+//! Everything else the handlers need — PMM, page-table edits, the process
+//! table, block I/O, signal plumbing, the syscall dispatcher — arrives through
+//! safe calls into `akuma-exec`/`akuma-pmm`/`akuma-fpcache` or through the
+//! [`ExceptionHooks`] registration, never open-coded.
+//!
+//! # Host builds
+//!
+//! Every item that executes an EL1 instruction or lives in a `global_asm!` blob
+//! is gated on `target_os = "none"`, so the crate stays in the workspace's
+//! `default-members` and clippy/`cargo test --target $HOST` cover its ~5400
+//! lines like every other crate's. The gated set is small and closed: the vector
+//! table and the `kernel_tests` GPR-transparency probe (the two asm blobs and
+//! their `extern` declarations), and the three control-flow register writes
+//! ([`install_vbar`], [`set_current_exception_stack`], and the two
+//! `msr elr_el1` redirections in `rust_sync_el1_handler`).
+//!
+//! **The gate is `target_os`, not `target_arch`** — the same trap `akuma-cpu`'s
+//! note of this name records, and the reason this section exists. The
+//! development host *is* `aarch64-apple-darwin`, so `msr vbar_el1`,
+//! `msr tpidr_el1` and `msr elr_el1` all assemble under `cargo test`; they are
+//! EL1 instructions, so the first host test to reach one dies with `SIGILL`
+//! rather than a compile error. Only the vector table's
+//! `.section .text.exceptions` fails loudly on its own (Mach-O rejects the
+//! directive), which is what surfaced the rest.
+//!
+//! Nothing here has host *tests* — a trap handler needs a trap. What the host
+//! build buys is that the type checking and lint pass cannot silently stop
+//! applying to the exception path.
 
+#![no_std]
+
+// Kernel-specific lints, mirroring the bin crate's allow list (this code was
+// lint-clean inside the bin under the same allowances; the casts are MMIO/PTE
+// arithmetic, the `inline(always)` are hot trap paths, and the struct_excessive_bools
+// is the ExceptionsConfig gate table, one bool per named `src/config.rs` const).
+#![allow(clippy::cast_ptr_alignment)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::inline_always)]
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::doc_markdown)]
+// The handler docs open with the multi-paragraph incident narratives this tree
+// keeps in place (a doc-comment style the fault paths depend on); the
+// must_use candidates are pure predicates whose callers ignore the result by
+// design (counters, state queries inside handlers).
+#![allow(clippy::too_long_first_doc_paragraph)]
+#![allow(clippy::must_use_candidate)]
+
+extern crate alloc;
+
+// Only the two `global_asm!` blobs use it, and both are bare-metal gated: the
+// vector table's `.section .text.exceptions` does not assemble for a Mach-O
+// host, and the GPR-transparency probe deliberately takes an EL1 data abort.
+#[cfg(target_os = "none")]
 use core::arch::global_asm;
 
-// `safe_print!` resolves unqualified throughout this module — the same move
-// `akuma-exec` and `akuma-fpcache` make. (`tprint!` is `src/console.rs`'s and
-// does not travel; its timestamp prefix is the only difference.)
-use akuma_primitives::safe_print;
+// `safe_print!` resolves unqualified throughout this crate — the same move
+// `akuma-exec` and `akuma-fpcache` make, and what let the moved call sites
+// keep both of their original spellings (`safe_print!` unqualified and
+// `crate::safe_print!`, both resolving here at the crate root). `tprint!` is
+// `src/console.rs`'s and did not travel; the timestamp prefix it added is the
+// only thing those call sites lost.
+pub use akuma_primitives::safe_print;
 
 // Exception vector table with EL0 support
+#[cfg(target_os = "none")]
 global_asm!(
     r#"
 .section .text.exceptions
@@ -634,6 +724,7 @@ irq_handler:
 "#
 );
 
+#[cfg(target_os = "none")]
 unsafe extern "C" {
     static exception_vector_table: u8;
 }
@@ -670,9 +761,17 @@ unsafe extern "C" {
 /// Called during context switch to update TPIDR_EL1
 #[inline]
 pub fn set_current_exception_stack(stack_top: u64) {
+    // Bare metal only: `msr tpidr_el1` is an EL1 instruction. It *assembles* on
+    // the aarch64 development host, so an ungated body would build under
+    // `cargo test` and die with `SIGILL` the first time a host test reached it —
+    // the trap `akuma-cpu`'s "Host builds" note records. See this crate's own
+    // note of the same name.
+    #[cfg(target_os = "none")]
     unsafe {
         core::arch::asm!("msr tpidr_el1, {}", in(reg) stack_top);
     }
+    #[cfg(not(target_os = "none"))]
+    let _ = stack_top;
 }
 
 /// Get the current exception stack pointer from TPIDR_EL1
@@ -911,7 +1010,7 @@ pub fn decode_stp_xzr_xzr(instr: u32) -> Option<(usize, i64)> {
 
 /// Human-readable syscall hint for forktest Pattern 2 serial (`GO_FORKTEST_DEBUG.md`).
 fn syscall_nr_pattern2_hint(nr: u64) -> &'static str {
-    use crate::syscall::nr;
+    use akuma_syscalls_linux::nr;
     match nr {
         x if x == nr::READ => "read",
         x if x == nr::EPOLL_CTL => "epoll_ctl",
@@ -929,8 +1028,8 @@ fn syscall_nr_pattern2_hint(nr: u64) -> &'static str {
 
 #[inline]
 fn syscall_stub_elr_in_diag_window(elr: u64) -> bool {
-    let min = crate::config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MIN;
-    let max = crate::config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MAX;
+    let min = debug_sigsegv_syscall_stub_elir_min();
+    let max = debug_sigsegv_syscall_stub_elir_max();
     elr >= min && elr <= max
 }
 
@@ -1007,7 +1106,7 @@ fn interp_relr_forensics(far: usize, pid: u32) {
 
 /// Log syscall number (**`x8`**), **FAR**, **pid/tid** when SIGSEGV hits the configured syscall-stub VA window.
 fn maybe_print_sigsegv_syscall_diag(elr: u64, far: u64, frame: &UserTrapFrame) {
-    if !crate::config::DEBUG_SIGSEGV_SYSCALL_STUB {
+    if !debug_sigsegv_syscall_stub() {
         return;
     }
     if !syscall_stub_elr_in_diag_window(elr) {
@@ -1241,7 +1340,7 @@ fn demand_page_lazy_region(
         ref path, inode, mount_id, file_offset, filesz, segment_va, ..
     } = *source
     {
-        if crate::config::DEMAND_PAGE_LOG_ENABLED {
+        if demand_page_log_enabled() {
             safe_print!(256, "[{}] file region: fault_va={:#x} seg_va={:#x} filesz={:#x} file_off={:#x}\n",
                 access.tag(), far_usize, segment_va, filesz, file_offset);
         }
@@ -1363,7 +1462,7 @@ fn demand_page_lazy_region(
                 // the direct test for "the cache is serving bytes that are not the
                 // file's" — the alternative is inferring it from a userspace symptom
                 // three layers up. See `pmm::DP_FILE_CACHE_MISMATCH`.
-                if crate::config::FPCACHE_VERIFY_HITS {
+                if fpcache_verify_hits() {
                     let file_off = file_offset + (cur_va - segment_va);
                     let mut disk = alloc::vec![0u8; 0x1000];
                     let got = if inode != 0 {
@@ -1554,8 +1653,8 @@ fn demand_page_lazy_region(
 
         if any_mapped {
             akuma_pmm::dp_count(&akuma_pmm::DP_FILE_PAGES, pages_mapped as usize);
-            crate::syscall::syscall_counters::inc_pagefault(pages_mapped);
-            if crate::config::PROCESS_SYSCALL_STATS
+            (hooks().inc_pagefault)(pages_mapped);
+            if process_syscall_stats()
                 && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                     owner.syscall_stats.inc_pagefault(pages_mapped);
                 }
@@ -1627,7 +1726,7 @@ fn demand_page_lazy_region(
                 free_page(pf);
             }
             akuma_pmm::dp_count(&akuma_pmm::DP_FILE_PAGES, 1);
-            crate::syscall::syscall_counters::inc_pagefault(1);
+            (hooks().inc_pagefault)(1);
             return true;
         }
         let (_, _, free2) = akuma_pmm::stats();
@@ -1653,8 +1752,8 @@ fn demand_page_lazy_region(
         }
         if installed_ok {
             akuma_pmm::dp_count(&akuma_pmm::DP_ANON_PAGES, 1);
-            crate::syscall::syscall_counters::inc_pagefault(1);
-            if crate::config::PROCESS_SYSCALL_STATS
+            (hooks().inc_pagefault)(1);
+            if process_syscall_stats()
                 && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                     owner.syscall_stats.inc_pagefault(1);
                 }
@@ -2107,13 +2206,13 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // `fault_pc` is the saved ELR at exception entry — i.e. the user PC where the
     // fault/interrupt occurred — *not* the handler we will install at handler_addr.
     // Misreading this as “handler PC” suggests ELR corruption; it is not.
-    if crate::config::SIGNAL_TRACE_ENABLED {
+    if signal_trace_enabled() {
         safe_print!(256,
             "[signal] deliver sig={} slot={} handler={:#x} fault_pc={:#x} user_sp={:#x} alt_sp={:#x} alt_size={:#x} sa_flags={:#x}\n",
             signal, thread_slot, handler_addr, frame_ref.elr_el1, user_sp, alt_sp, alt_size, action.flags);
     }
 
-    if crate::config::DEBUG_PATTERN2_TRAP_TRACE && syscall_stub_elr_in_diag_window(frame_ref.elr_el1) {
+    if debug_pattern2_trap_trace() && syscall_stub_elr_in_diag_window(frame_ref.elr_el1) {
         safe_print!(
             192,
             "[pattern2-stub] deliver sig={} pid={} slot={} fault_pc={:#x} x8={:#x} ({}) sp={:#x}\n",
@@ -2184,7 +2283,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
 
     let new_sp = (stack_top - SIGFRAME_SIZE) & !0xF;
 
-    if crate::config::SIGNAL_TRACE_ENABLED {
+    if signal_trace_enabled() {
         safe_print!(256,
             "[signal] frame: stack_top={:#x} new_sp={:#x} on_altstack={}\n",
             stack_top, new_sp, stack_top != user_sp);
@@ -2339,7 +2438,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
     // blocked while this handler runs.  SIGKILL (bit 8) and SIGSTOP (bit 18) are immune.
     akuma_exec::threading::or_thread_signal_mask(action.mask & !((1u64 << 8) | (1u64 << 18)));
 
-    if crate::config::SIGNAL_TRACE_ENABLED {
+    if signal_trace_enabled() {
         safe_print!(128, "[signal] Delivering sig {} to handler {:#x} (restorer={:#x})\n",
             signal, handler_addr, restorer);
     }
@@ -2372,7 +2471,7 @@ fn try_deliver_signal(frame: *mut UserTrapFrame, signal: u32, fault_addr: u64, i
 ///
 /// Diverges when the signal is fatal; returns normally otherwise.
 fn apply_default_signal_action(signal: u32) {
-    if crate::config::TRACE_TKILL {
+    if trace_tkill() {
         crate::safe_print!(96, "[signal] default-action check sig={} slot={}\n",
             signal, akuma_exec::threading::current_thread_id());
     }
@@ -2390,14 +2489,14 @@ fn apply_default_signal_action(signal: u32) {
     if !matches!(handler, akuma_exec::process::SignalHandler::Default) {
         return;
     }
-    if !crate::syscall::signal::signal_is_fatal_default(signal) {
+    if !(hooks().signal_is_fatal_default)(signal) {
         return;
     }
 
     crate::safe_print!(128,
         "[signal] Process {} ({}) terminated by signal {} (default action)\n",
         proc.pid, proc.name, signal);
-    crate::syscall::proc::sys_exit_group_pub(-(signal as i32)) // never returns
+    (hooks().sys_exit_group)(-(signal as i32)) // never returns
 }
 
 /// Terminal path for a fatal EL0 fault whose signal reached its *default* action
@@ -2440,7 +2539,7 @@ fn apply_default_signal_action(signal: u32) {
 /// common case — a multi-threaded process crashing on its **main** thread, which
 /// owns a non-shared address space — was precisely the one that leaked.
 fn fatal_signal_group_exit(code: i32) -> ! {
-    crate::syscall::proc::sys_exit_group_pub(code)
+    (hooks().sys_exit_group)(code)
 }
 
 /// Restore saved context from a signal frame on the user stack (rt_sigreturn).
@@ -2496,13 +2595,13 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
         f.spsr_el1 = restored_spsr;
     }
 
-    if crate::config::SIGNAL_TRACE_ENABLED {
+    if signal_trace_enabled() {
         safe_print!(256,
             "[sigreturn] restoring: sp={:#x} pc={:#x} pstate={:#x} sigframe_sp={:#x}\n",
             f.sp_el0, f.elr_el1, f.spsr_el1, sigframe_sp);
     }
 
-    if crate::config::DEBUG_PATTERN2_TRAP_TRACE && syscall_stub_elr_in_diag_window(f.elr_el1) {
+    if debug_pattern2_trap_trace() && syscall_stub_elr_in_diag_window(f.elr_el1) {
         let rp = akuma_exec::process::read_current_pid().unwrap_or(0);
         let slot = akuma_exec::threading::current_thread_id();
         safe_print!(
@@ -2552,10 +2651,15 @@ fn do_rt_sigreturn(frame: *mut UserTrapFrame) -> Option<u64> {
 /// table is a change of control flow, so the obligation is real and stays here,
 /// discharged once.
 pub fn install_vbar() {
+    // Bare metal only, for two independent reasons: the vector table itself is a
+    // `global_asm!` blob that only assembles for the kernel target, and
+    // `msr vbar_el1` is an EL1 instruction. See this crate's "Host builds" note.
+    //
     // SAFETY: installs the address of this kernel's own vector table, a linker
     // symbol in `.text`. `&raw const` resolves the symbol without reading
     // through it; the `isb` makes the new base effective before the next
     // exception can be taken.
+    #[cfg(target_os = "none")]
     unsafe {
         let vbar = &raw const exception_vector_table as u64;
 
@@ -2594,11 +2698,11 @@ pub fn init() {
 /// The kernel-core callbacks the exception handlers call out to.
 #[derive(Clone, Copy)]
 pub struct ExceptionHooks {
-    /// `crate::irq::dispatch_irq` — the device-IRQ dispatcher. The IRQ vector
+    /// `src/irq.rs` `dispatch_irq` — the device-IRQ dispatcher. The IRQ vector
     /// runs it for every INTID that is not the scheduler SGI; the dispatcher
     /// and its handler table stay in `src/irq.rs`.
     pub dispatch_irq: fn(u32),
-    /// `crate::smp_shared::record_el0_trap` — the per-core "this core serviced
+    /// `src/smp_shared.rs` `record_el0_trap` — the per-core "this core serviced
     /// a user trap" diagnostic counter (M3 cross-core-userspace proof). Only
     /// exists under `kernel_smp_shared`, like the module that owns it.
     #[cfg(kernel_smp_shared)]
@@ -2608,10 +2712,45 @@ pub struct ExceptionHooks {
     /// module: it needs the poison codec from `akuma-pmm`, the live RAM window
     /// from exec's `mmu`, and the process-table walk (`surviving_mapper`).
     pub report_poison_value: fn(&str, u64),
-    /// `crate::pmm::dp_counters_line` — the demand-paging counter dump. Stays
+    /// `src/pmm.rs` `dp_counters_line` — the demand-paging counter dump. Stays
     /// in `src/pmm.rs` with the counters' formatter: it also reads
     /// `akuma_ext2`'s deferred-free counters, which sit above the pmm crate.
     pub dp_counters_line: fn(&mut dyn core::fmt::Write),
+    // ---- the syscall family (`src/syscall`) --------------------------------
+    // The SVC dispatch is the one genuine hook cluster on this path: the
+    // dispatcher, its counters and its exit/notify plumbing are kernel-core
+    // state the exception handlers call into. Hot path — see the section
+    // comment at `rust_sync_el0_handler` for how the table is read once per
+    // handler, not per call.
+    /// `src/syscall/mod.rs` `handle_syscall` — the SVC dispatcher.
+    pub handle_syscall: fn(u64, &[u64; 6]) -> u64,
+    /// `src/syscall/mod.rs` `current_syscall_nr` — last number this thread
+    /// dispatched, for the WILD-DA "errno used as pointer" forensics.
+    pub current_syscall_nr: fn() -> u64,
+    /// `src/syscall/mod.rs` `syscall_counters::inc_pagefault` — the global PF tally.
+    pub inc_pagefault: fn(u64),
+    /// `src/syscall/mod.rs` `syscall_counters::inc_qemu_dc_zva_ec15`.
+    pub inc_qemu_dc_zva_ec15: fn(),
+    /// `src/syscall/mod.rs` `syscall_counters::inc_qemu_stp_xzr_ec15`.
+    pub inc_qemu_stp_xzr_ec15: fn(),
+    /// `src/syscall/proc.rs` `sys_exit_group_pub` — the fatal-signal terminal
+    /// path (whole thread group, the ordering that fixed the orphaned-CLONE_VM
+    /// leak). Never returns.
+    pub sys_exit_group: fn(i32) -> !,
+    /// `src/syscall/proc.rs` `notify_child_channel_exited_pub`.
+    pub notify_child_channel_exited: fn(u32, i32),
+    /// `src/syscall/proc.rs` `vfork_complete`.
+    pub vfork_complete: fn(u32),
+    /// `src/syscall/signal.rs` `signal_is_fatal_default`.
+    pub signal_is_fatal_default: fn(u32) -> bool,
+    /// `src/syscall/log.rs` `get_formatted` — the per-process syscall ring
+    /// buffer, dumped on the WILD-DA crash path.
+    pub syscall_log_formatted: fn(u32, u64) -> Option<alloc::vec::Vec<u8>>,
+    /// `read_profile::exception_span_start` — opens the EL0 handler's outer
+    /// `[READPROF]` span (ZST no-ops without the `read-profile` feature).
+    pub read_profile_span_new: fn() -> u64,
+    /// `read_profile::exception_span_end` — closes the span opened above.
+    pub read_profile_span_end: fn(u64),
 }
 
 static HOOKS: akuma_primitives::Registered<ExceptionHooks> = akuma_primitives::Registered::new(
@@ -2627,6 +2766,123 @@ pub fn register_hooks(h: ExceptionHooks) {
 #[inline]
 fn hooks() -> ExceptionHooks {
     HOOKS.require()
+}
+
+// ============================================================================
+// Kernel config
+// ============================================================================
+//
+// The `src/config.rs` tunables the exception path reads, handed over at
+/// [`register_config`] — same shape and same rationale as
+/// `akuma_fpcache::FpcacheConfig`: the consts are `src/`-owned and this code
+/// sits below the module that owns them, so they arrive as values. `src/
+/// config.rs` stays the single source of truth; `src/main.rs` reads it and
+/// hands the values over next to `register_hooks`.
+///
+/// The cost of the move is that these gates are no longer const-folded: each
+/// accessor below is a relaxed atomic load where a compile-time constant used
+/// to be. Most gate anomaly-only diagnostics, but `verify_svc_at_entry` and
+/// `process_syscall_stats` sit on every SVC / fault — measured against the
+/// pre-extraction binary (`docs/archive/AKUMA_EXCEPTIONS_EXTRACTION.md`).
+#[derive(Clone, Copy)]
+pub struct ExceptionsConfig {
+    /// `config::VERIFY_SVC_AT_ENTRY` — stale-I-cache spurious-SVC guard.
+    pub verify_svc_at_entry: bool,
+    /// `config::PROCESS_SYSCALL_STATS` — per-process pagefault stat bumps.
+    pub process_syscall_stats: bool,
+    /// `config::DEMAND_PAGE_LOG_ENABLED` — `[DA-DP]` success-path trace.
+    pub demand_page_log_enabled: bool,
+    /// `config::FPCACHE_VERIFY_HITS` — re-read-from-disk cache verification.
+    pub fpcache_verify_hits: bool,
+    /// `config::SIGNAL_TRACE_ENABLED` — `[signal]` delivery trace.
+    pub signal_trace_enabled: bool,
+    /// `config::TRACE_TKILL` — `[signal] tkill` trace.
+    pub trace_tkill: bool,
+    /// `config::DEBUG_SIGSEGV_SYSCALL_STUB` — `[sigsegv-syscall]` forensics.
+    pub debug_sigsegv_syscall_stub: bool,
+    /// `config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MIN`.
+    pub debug_sigsegv_syscall_stub_elir_min: u64,
+    /// `config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MAX`.
+    pub debug_sigsegv_syscall_stub_elir_max: u64,
+    /// `config::DEBUG_PATTERN2_TRAP_TRACE` — `[pattern2-*]` trace.
+    pub debug_pattern2_trap_trace: bool,
+}
+
+static CFG_VERIFY_SVC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CFG_PROC_STATS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CFG_DP_LOG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CFG_FPC_VERIFY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CFG_SIGNAL_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CFG_TRACE_TKILL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CFG_SIGSEGV_STUB: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CFG_SIGSEGV_STUB_ELIR_MIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CFG_SIGSEGV_STUB_ELIR_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CFG_PATTERN2_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Publish the config tunables. Call once, before any EL0 code can run — in
+/// practice from `src/main.rs` right next to [`register_hooks`].
+pub fn register_config(cfg: ExceptionsConfig) {
+    use core::sync::atomic::Ordering::Relaxed;
+    CFG_VERIFY_SVC.store(cfg.verify_svc_at_entry, Relaxed);
+    CFG_PROC_STATS.store(cfg.process_syscall_stats, Relaxed);
+    CFG_DP_LOG.store(cfg.demand_page_log_enabled, Relaxed);
+    CFG_FPC_VERIFY.store(cfg.fpcache_verify_hits, Relaxed);
+    CFG_SIGNAL_TRACE.store(cfg.signal_trace_enabled, Relaxed);
+    CFG_TRACE_TKILL.store(cfg.trace_tkill, Relaxed);
+    CFG_SIGSEGV_STUB.store(cfg.debug_sigsegv_syscall_stub, Relaxed);
+    CFG_SIGSEGV_STUB_ELIR_MIN.store(cfg.debug_sigsegv_syscall_stub_elir_min, Relaxed);
+    CFG_SIGSEGV_STUB_ELIR_MAX.store(cfg.debug_sigsegv_syscall_stub_elir_max, Relaxed);
+    CFG_PATTERN2_TRACE.store(cfg.debug_pattern2_trap_trace, Relaxed);
+}
+
+#[inline]
+fn verify_svc_at_entry() -> bool {
+    CFG_VERIFY_SVC.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn process_syscall_stats() -> bool {
+    CFG_PROC_STATS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn demand_page_log_enabled() -> bool {
+    CFG_DP_LOG.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn fpcache_verify_hits() -> bool {
+    CFG_FPC_VERIFY.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn signal_trace_enabled() -> bool {
+    CFG_SIGNAL_TRACE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn trace_tkill() -> bool {
+    CFG_TRACE_TKILL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn debug_sigsegv_syscall_stub() -> bool {
+    CFG_SIGSEGV_STUB.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn debug_sigsegv_syscall_stub_elir_min() -> u64 {
+    CFG_SIGSEGV_STUB_ELIR_MIN.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn debug_sigsegv_syscall_stub_elir_max() -> u64 {
+    CFG_SIGSEGV_STUB_ELIR_MAX.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn debug_pattern2_trap_trace() -> bool {
+    CFG_PATTERN2_TRACE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 // ---- PMM shim ----------------------------------------------------------------
@@ -3541,7 +3797,13 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
             let fault_handler = akuma_exec::threading::get_user_copy_fault_handler();
             if fault_handler != 0 {
                 // Redirect ELR to the recovery handler
-                // This allows copy_from_user/copy_to_user to return EFAULT safely
+                // This allows copy_from_user/copy_to_user to return EFAULT safely.
+                // Bare metal only: `msr elr_el1` is an EL1 instruction, and off
+                // the kernel target there is no exception to return from. See the
+                // crate's "Host builds" note.
+                // SAFETY: `fault_handler` is the trampoline the in-progress user
+                // copy registered on this thread, in kernel text.
+                #[cfg(target_os = "none")]
                 unsafe {
                     core::arch::asm!("msr elr_el1, {}", in(reg) fault_handler);
                 }
@@ -3566,8 +3828,8 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
                     p.state = akuma_exec::process::ProcessState::Zombie(-14);
                 });
                 akuma_exec::process::kill_thread_group(pid, l0_phys, -14);
-                crate::syscall::proc::notify_child_channel_exited_pub(pid, -14);
-                crate::syscall::proc::vfork_complete(pid);
+                (hooks().notify_child_channel_exited)(pid, -14);
+                (hooks().vfork_complete)(pid);
             }
             // Redirect ELR to the recovery landing pad so that ERET does NOT
             // return into the middle of the faulting instruction sequence.
@@ -3577,6 +3839,10 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
             // FAR=0x1 as the cascade drifts through garbage code).
             // The landing pad yields in a loop; the scheduler stops dispatching
             // this thread once cleanup_terminated() recycles the slot.
+            // Bare metal only, as above.
+            // SAFETY: `el1_fault_recovery_pad` is this crate's own landing pad,
+            // in kernel text and mapped in every address space.
+            #[cfg(target_os = "none")]
             unsafe {
                 let pad = el1_fault_recovery_pad as *const () as usize as u64;
                 core::arch::asm!("msr elr_el1, {}", in(reg) pad);
@@ -3816,7 +4082,11 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     // Outermost span for `read-profile` (ZST otherwise): started before the BKL
     // acquire and the entry tripwires, so `exc - hs` names everything this
     // wrapper does around the dispatch. See `crate::syscall::utils::read_profile`.
-    let rp_span = crate::syscall::utils::read_profile::Span::new();
+    // Bind the hook table once for this excursion: every read below is one
+    // require() copy of the struct instead of two, and this is the hottest
+    // function in the kernel.
+    let hooks = hooks();
+    let rp_span = (hooks.read_profile_span_new)();
     note_exception_entry();
     note_exc_class(0);
     SYNC_EC_EL0[((esr >> 26) & 0x3F) as usize]
@@ -3872,7 +4142,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     // Record that this core serviced a user (EL0) trap — the M3 cross-core-userspace
     // proof (an EL0 trap only comes from userspace running on this core).
     #[cfg(kernel_smp_shared)]
-    (hooks().record_el0_trap)();
+    (hooks.record_el0_trap)();
     let ret = rust_sync_el0_handler_inner(frame, esr, far);
     // Deferred thread-kill (real shared-kernel SMP): if a peer core's
     // kill_thread_group posted a kill request for this thread, terminate it
@@ -3919,7 +4189,7 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     }
     // Last thing before the asm epilogue erets: this closes the window and, when
     // it is full, prints it — outside the VFS BKL and outside every span above.
-    rp_span.end_exception();
+    (hooks.read_profile_span_end)(rp_span);
     ret
 }
 
@@ -3971,7 +4241,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             // DC-ZVA/STP-XZR misroute emulations further down get a chance to
             // claim it first.
             let mut spurious_svc_give_up = false;
-            if crate::config::VERIFY_SVC_AT_ENTRY {
+            if verify_svc_at_entry() {
                 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
                 static LAST_SPURIOUS_ELR: AtomicU64 = AtomicU64::new(0);
                 static SPURIOUS_REPLAYS: AtomicU32 = AtomicU32::new(0);
@@ -4117,7 +4387,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             unsafe { core::ptr::read_volatile((frame as *const u64).add(xt)) }
                         } else { 0 };
                         emulate_dc_zva(dc_addr);
-                        crate::syscall::syscall_counters::inc_qemu_dc_zva_ec15();
+                        (hooks().inc_qemu_dc_zva_ec15)();
                         unsafe { (*frame).elr_el1 = elr.wrapping_add(4); }
                         return unsafe { (*frame).x0 };
                     }
@@ -4174,7 +4444,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                                 }
                             }
                         emulate_stp_xzr_xzr(store_va);
-                        crate::syscall::syscall_counters::inc_qemu_stp_xzr_ec15();
+                        (hooks().inc_qemu_stp_xzr_ec15)();
                         unsafe { (*frame).elr_el1 = elr.wrapping_add(4); }
                         return unsafe { (*frame).x0 };
                     }
@@ -4264,7 +4534,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             ];
 
             // Handle syscall
-            let ret = crate::syscall::handle_syscall(syscall_num, &args);
+            let hooks = hooks();
+            let ret = (hooks.handle_syscall)(syscall_num, &args);
 
             // SYNC TLS: If the syscall modified TPIDR_EL0 (e.g. SET_TPIDR_EL0),
             // update the trap frame so the change persists after register restoration.
@@ -4312,7 +4583,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             // sees it at the next syscall boundary (async delivery via pending queue).
             let sig_mask = akuma_exec::threading::thread_signal_mask();
 
-            if crate::config::TRACE_TKILL {
+            if trace_tkill() {
                 let slot = akuma_exec::threading::current_thread_id();
                 let pend = akuma_exec::threading::pending_signals_raw(slot);
                 if pend != 0 {
@@ -4599,7 +4870,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                             }
                             if installed_ok {
                                 akuma_pmm::dp_count(&akuma_pmm::DP_PROTNONE_PAGES, 1);
-                                crate::syscall::syscall_counters::inc_pagefault(1);
+                                (hooks().inc_pagefault)(1);
                             } else {
                                 // Race (another CPU mapped it) or no owner: free our page.
                                 free_page(page_frame);
@@ -4670,7 +4941,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     
                     // Log register state for debugging wild pointer accesses
                     let frame_ref = unsafe { &*frame };
-                    let last_sc = crate::syscall::current_syscall_nr();
+                    let last_sc = (hooks().current_syscall_nr)();
                     
                     // Check if FAR looks like a negative errno (syscall error used as pointer)
                     // Errno values are small negatives: -1 (EPERM) to -133 (EHWPOISON)
@@ -4770,7 +5041,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     // the syscall log is stored under that owner PID, not the thread's own PID.
                     // Box 0: this is the kernel's own crash dump to the console, not a
                     // procfs read on behalf of a container, so it sees every log.
-                    match crate::syscall::log::get_formatted(pid, 0) {
+                    match (hooks().syscall_log_formatted)(pid, 0) {
                         Some(log_bytes) => {
                             crate::safe_print!(64, "[WILD-DA] syscall log (pid={}):\n", pid);
                             if let Ok(s) = core::str::from_utf8(&log_bytes) {
@@ -5123,12 +5394,12 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
 // abort has no business in a build that will never assert on it.
 // ---------------------------------------------------------------------------
 
-#[cfg(kernel_tests)]
+#[cfg(all(kernel_tests, target_os = "none"))]
 unsafe extern "C" {
     fn __el1_gpr_transparency_probe(out: *mut u64, base: u64) -> u64;
 }
 
-#[cfg(kernel_tests)]
+#[cfg(all(kernel_tests, target_os = "none"))]
 global_asm!(
     r#"
 .text
@@ -5210,7 +5481,7 @@ __el1_gpr_transparency_landing:
 /// (`docs/archive/SMP_ADOPTED_IDLE_STACK_CLOBBER.md` is the local precedent), so
 /// the caller must require that the count moved.
 #[must_use]
-#[cfg(kernel_tests)]
+#[cfg(all(kernel_tests, target_os = "none"))]
 pub fn el1_sync_gpr_clobber_mask() -> (u32, u64) {
     const BASE: u64 = 0x5A5A_0000;
     const EC_DATA_ABORT_EL1: usize = 0x25;
@@ -5239,7 +5510,7 @@ pub fn el1_sync_gpr_clobber_mask() -> (u32, u64) {
     (mask, after.wrapping_sub(before))
 }
 
-#[cfg(kernel_tests)]
+#[cfg(all(kernel_tests, target_os = "none"))]
 unsafe extern "C" {
     fn __el1_gpr_transparency_landing();
 }

@@ -16,7 +16,7 @@ match the Linux AArch64 userspace ABI. For the userspace libc layer, see
 
 Linux AArch64 ABI. Syscall number in **x8**, args in **x0–x5**, return in x0.
 
-- Entry: EL0 sync exception → `src/exceptions.rs` → `handle_syscall`
+- Entry: EL0 sync exception → `crates/akuma-exceptions/src/lib.rs` → `handle_syscall`
   (`src/syscall/mod.rs:582`).
 - **Rump interception first:** `rump_proxy::intercept_box_syscall`
   (`mod.rs:650`) forwards socket-family syscalls for rump boxes (AF_UNIX

@@ -41,7 +41,7 @@ host-tested instead of boot-tested. Three homes, and the split is the point:
 |---|---|---|
 | mapping-kind plan (lazy/eager, file-backed, shared-writable, `shared_anon`), `MAP_FIXED` validation, `munmap` sizing, mremap's move-vs-expand, madvise's advice decode, `MADV_DONTNEED`'s range + per-page rule, membarrier decode | [`crates/akuma-syscalls-mem`](../../../../crates/akuma-syscalls-mem) | pure over the argument bits; **never sees a region**, which is what keeps it a leaf beside `-sync` and `-poll` |
 | `MmapRegion`, `PhysFrame`, CoW-fork inheritance, `munmap`'s clip-and-split, the PTE permission vocabulary (`user_flags`, `is_write`) | [`crates/akuma-mmap`](../../../../crates/akuma-mmap) | region *algebra*; zero dependencies, so it cannot lock, allocate or name a `Process` |
-| every probe, lock, frame, page-table edit, TLB flush, user-memory access; `Process::vm_lock` / `vm_with_regions`; `dontneed_count_shared` / `dontneed_apply`; the fault path | `src/syscall/mem.rs`, `src/exceptions.rs` | effects, and arguments about locking and hardware |
+| every probe, lock, frame, page-table edit, TLB flush, user-memory access; `Process::vm_lock` / `vm_with_regions`; `dontneed_count_shared` / `dontneed_apply`; the fault path | `src/syscall/mem.rs`, `crates/akuma-exceptions/src/lib.rs` | effects, and arguments about locking and hardware |
 
 If a change to `akuma-syscalls-mem` finds itself wanting `MmapRegion`, the seam is
 drawn in the wrong place — move the seam, do not add the dependency.

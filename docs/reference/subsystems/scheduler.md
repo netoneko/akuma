@@ -117,7 +117,7 @@ core may pick it), and a peer that restored a not-yet-saved SP would run a corru
 Only *half* of that switch is BKL-free, though — "the scheduler SGI runs BKL-free" is
 overstated as a blanket claim. Since M5c step-2, a scheduler SGI that preempted **EL0**
 runs the whole switch without ever taking the BKL, gated on `interrupted_el0 &&
-sched_bklfree_el0_enabled() && irq == SGI_SCHEDULER` (`src/exceptions.rs:2622-2642`). An
+sched_bklfree_el0_enabled() && irq == SGI_SCHEDULER` (`crates/akuma-exceptions/src/lib.rs`, `rust_irq_handler_with_sp`). An
 SGI that instead preempted **EL1** falls through to `bkl::enter_kernel()`
 (`exceptions.rs:2665`) and runs `sgi_scheduler_handler_with_sp` **BKL-held**
 (`exceptions.rs:2680`), exactly like any other device IRQ. So the BKL-free path is the
