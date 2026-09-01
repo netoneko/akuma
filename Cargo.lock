@@ -21,6 +21,7 @@ dependencies = [
  "akuma-isolation",
  "akuma-kacho",
  "akuma-kernel-core",
+ "akuma-kernel-glue",
  "akuma-locks-rw",
  "akuma-net",
  "akuma-net-unix",
@@ -211,6 +212,35 @@ dependencies = [
  "akuma-vfs-glue",
  "log",
  "smoltcp",
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-kernel-glue"
+version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-bkl",
+ "akuma-config",
+ "akuma-cpu",
+ "akuma-exceptions",
+ "akuma-exec",
+ "akuma-ext2",
+ "akuma-fdt",
+ "akuma-firecracker",
+ "akuma-gic",
+ "akuma-kernel-core",
+ "akuma-net",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-psci",
+ "akuma-rump",
+ "akuma-syscalls-glue",
+ "akuma-timer",
+ "akuma-uart",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "log",
  "spinning_top",
 ]
 

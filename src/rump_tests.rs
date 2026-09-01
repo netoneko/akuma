@@ -18,11 +18,12 @@ use crate::console;
 /// "rump-default"))]` gate we'd silently regress the devbox "starve under
 /// CPU-bound load" fix (`overlays/devbox/README.md:297-307`).
 fn test_run_async_main_skips_network_thread_id_under_rump_default() {
-    const MAIN_SRC: &str = include_str!("main.rs");
+    // run_async_main moved to `akuma-kernel-glue` with kernel_main 2026-09-01.
+    const MAIN_SRC: &str = include_str!("../crates/akuma-kernel-glue/src/lib.rs");
 
     let fn_start = MAIN_SRC
         .find("fn run_async_main(")
-        .expect("main.rs must define run_async_main");
+        .expect("akuma-kernel-glue must define run_async_main");
     let fn_body_end = MAIN_SRC[fn_start..]
         .find("\nfn ")
         .map_or(MAIN_SRC.len(), |off| fn_start + off);
@@ -65,7 +66,8 @@ fn test_run_async_main_skips_network_thread_id_under_rump_default() {
 /// per-call work). The registration happens right after spawn, using the TID
 /// returned by `spawn_process_with_channel`, before `attach_server` is called.
 fn test_start_default_stack_registers_rump_server_tid() {
-    const PROXY_SRC: &str = include_str!("rump_proxy.rs");
+    // rump_proxy.rs moved to `akuma-kernel-glue` 2026-09-01.
+    const PROXY_SRC: &str = include_str!("../crates/akuma-kernel-glue/src/rump_proxy.rs");
 
     let fn_start = PROXY_SRC
         .find("pub fn start_default_stack")

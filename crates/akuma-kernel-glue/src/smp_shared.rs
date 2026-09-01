@@ -115,8 +115,10 @@ pub use akuma_bkl::policy::{
     set_vfs_bkl_drop_enabled, syscall_bkl_optout,
 };
 
-/// Runtime toggle (default **on**) for `no-bkl-process` (Phase 3 of
-/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md) — drop the BKL for `fork_process`'s
+/// Runtime toggle (default **on**) for `no-bkl-process`.
+///
+/// Phase 3 of
+/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md — drop the BKL for `fork_process`'s
 /// CoW share/demote pass, relying on the address space's own `as_lock` (the same lock
 /// the CoW fault handler takes BKL-free) held in bounded chunks around every
 /// parent-page-table access, plus the existing `COW_REFCOUNTS` / PMM / allocator
@@ -127,11 +129,14 @@ pub use akuma_bkl::policy::{
 /// — the guard is constructed inside `fork_process`, which cannot name bin-crate items.
 /// These are thin re-exports so every BKL toggle stays reachable from one module.
 #[inline]
+#[must_use]
 pub fn process_bkl_drop_enabled() -> bool {
     akuma_exec::process::process_bkl_drop_enabled()
 }
 
-/// Enable/disable the fork page-copy BKL-drop at runtime. Used by the boot self-test
+/// Enable/disable the fork page-copy BKL-drop at runtime.
+///
+/// Used by the boot self-test
 /// `test_fork_bkl_drop` for its A/B phase; also the kill switch and the handle for an
 /// interactive same-binary A/B under `bkl-profile`.
 pub fn set_process_bkl_drop_enabled(on: bool) {
@@ -153,7 +158,9 @@ fn set_core_idle(core: usize, idle: bool) {
 }
 
 /// Ring one idle peer core's scheduler SGI so it wakes from WFI, reschedules, and can
-/// pick up a just-woken READY thread now rather than on its next timer tick. Best-effort
+/// pick up a just-woken READY thread now rather than on its next timer tick.
+///
+/// Best-effort
 /// (a race that finds no idle core just falls back to the timer). Reached via the
 /// `wake_remote_idle` runtime hook — the scheduler's displacement bypass calls it to
 /// route READY work to idle capacity instead of preempting a RUNNING thread.
@@ -170,7 +177,9 @@ pub fn wake_remote_idle() -> bool {
 }
 
 /// Send a scheduler SGI to a specific core so its scheduler picks up a just-woken
-/// READY thread without waiting for the ~10 ms timer tick. Called from
+/// READY thread without waiting for the ~10 ms timer tick.
+///
+/// Called from
 /// `ThreadWaker::wake` via the `wake_core` runtime hook. Best-effort: a race that
 /// finds the core already processing an SGI just falls back to the timer tick.
 pub fn wake_core(core_id: u8) {
@@ -302,6 +311,7 @@ pub fn bringup_secondaries() {
 }
 
 /// Number of secondaries that reached the M0 online barrier (excludes the BSP).
+///
 /// Consumed by the boot self-test in `process_tests.rs` (compiled out under `no-tests`,
 /// e.g. the devbox-smoltcp runtime image — hence `allow(dead_code)`).
 #[allow(dead_code)]
@@ -351,6 +361,7 @@ fn redistributor_layout() -> akuma_gic::RedistributorLayout {
 /// resolves the symbol without reading through it), so the whole operation is
 /// expressible without `asm!` — and the array type carries the bound the asm
 /// version could only state in a comment.
+#[must_use]
 pub fn secondary_stack_base(core: usize) -> usize {
     (&raw const secondary_boot_stacks_shared) as usize + (core << STACK_SHIFT)
 }
@@ -374,7 +385,9 @@ static CORES_SEEN: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CO
 /// USERSPACE runs across cores. Bumped from the EL0 trap entry (`rust_sync_el0_handler`).
 static CORES_SEEN_USER: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
 
-/// Record that this core just took an EL0 trap (a user syscall or fault). Called from
+/// Record that this core just took an EL0 trap (a user syscall or fault).
+///
+/// Called from
 /// the syscall entry; an EL0 trap only originates from userspace, so a nonzero count on
 /// core N means a user process executed on core N.
 #[inline]
@@ -417,7 +430,9 @@ fn demo_exit() -> ! {
 }
 
 /// Signal all demo workers/probes to stop, wait for them to self-terminate, reclaim
-/// their slots, then reset the flag for the next test. Keeps the scarce system-thread
+/// their slots, then reset the flag for the next test.
+///
+/// Keeps the scarce system-thread
 /// slots (RESERVED_THREADS) from leaking across the M2c/M3/M4 self-tests.
 pub fn stop_and_reclaim_demos() {
     DEMO_STOP.store(true, Ordering::Release);
@@ -473,7 +488,9 @@ fn smp_worker() -> ! {
     demo_exit()
 }
 
-/// Spawn the M2c demo workers from the BSP (after secondaries are up). Each is an
+/// Spawn the M2c demo workers from the BSP (after secondaries are up).
+///
+/// Each is an
 /// ordinary shared-pool kernel thread; the per-core schedulers distribute them, so over
 /// time both the BSP and the secondaries run them. Call once.
 pub fn spawn_worker_demo() {
@@ -509,7 +526,9 @@ fn blocking_relax_waiter() -> ! {
     demo_exit()
 }
 
-/// Spawn one [`blocking_relax_waiter`] per core (BSP self-test). They occupy every core so
+/// Spawn one [`blocking_relax_waiter`] per core (BSP self-test).
+///
+/// They occupy every core so
 /// the test can prove the BSP still makes BKL-requiring forward progress while they are all
 /// parked in a blocking wait. Best-effort (slot-limited); stop via [`stop_and_reclaim_demos`].
 pub fn spawn_blocking_relax_waiters() {
@@ -537,6 +556,7 @@ pub fn worker_ticks(core: usize) -> u64 {
 }
 
 /// Secondary-core Rust entry (M2c). Runs on the SHARED boot page tables + PMM/heap.
+///
 /// Adopts its boot context as this core's idle thread, brings up its GIC receive path,
 /// installs the shared vectors, arms the shared 10 ms virtual-timer tick, enables IRQs,
 /// and enters the idle loop — from which the timer preempts it onto any runnable thread

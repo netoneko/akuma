@@ -73,7 +73,9 @@ static RUMP_BOXES: Spinlock<BTreeSet<u64>> = Spinlock::new(BTreeSet::new());
 /// load when no `stack=rump` box exists (the common case / pre-rumpnet boot).
 static RUMP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Mark `box_id` as using the rump network stack. Idempotent; never un-marks (a
+/// Mark `box_id` as using the rump network stack.
+///
+/// Idempotent; never un-marks (a
 /// later smoltcp-default spawn into the same box must not clear it). herd calls
 /// `SET_BOX_STACK` for the box BEFORE it spawns the box's `rump_server`, so that
 /// when that spawn lands the kernel knows to wire it a sysproxy channel (see
@@ -216,7 +218,9 @@ fn ensure_box_proxy(box_id: u64) -> Option<Arc<BoxProxy>> {
     }
 }
 
-/// Wire a freshly-spawned `rump_server` into the per-box proxy. Called from the
+/// Wire a freshly-spawned `rump_server` into the per-box proxy.
+///
+/// Called from the
 /// spawn path when herd spawns the box's `rump_server` (`--fd 3 --net`): creates
 /// the kernel pipe pair, installs it on the server's fd 3 BEFORE the server runs,
 /// then handshakes IN A KTHREAD (the handshake blocks ~5s through rump_init +
@@ -321,7 +325,9 @@ const NB_MSG_PEEK: u64 = 0x2;
 const NB_MSG_DONTWAIT: u64 = 0x80;
 
 /// Intercept a `stack=rump` box's socket-family syscall and forward it to the
-/// box's `rump_server`. Returns `Some(result)` to short-circuit normal smoltcp
+/// box's `rump_server`.
+///
+/// Returns `Some(result)` to short-circuit normal smoltcp
 /// dispatch, or `None` to fall through (non-rump box, non-socket syscall, or a
 /// non-rump fd for read/write/close). Also emits the `[RUMP-SP]` trace.
 pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
@@ -1330,13 +1336,16 @@ fn proxy_recvmsg(args: &[u64; 6], proc: &Process, box_id: u64) -> u64 {
     }
 }
 
-/// Is the calling box's rump socket `rump_fd` readable right now? Forwards a
+/// Is the calling box's rump socket `rump_fd` readable right now?
+///
+/// Forwards a
 /// non-blocking `recvfrom(rump_fd, _, 1, MSG_PEEK|MSG_DONTWAIT)` to the rump
 /// server (NetBSD flag values). `n > 0` ⇒ data waiting (POLLIN). This is how
 /// `poll`/`select`/`epoll` get real readiness for a `RumpSocket` fd, so a client
 /// like sic can multiplex stdin + the IRC socket instead of blocking in recv.
 /// NOTE: each call is one sysproxy round-trip, so polling a rump fd is not cheap
 /// (the proxy latency applies).
+#[must_use]
 pub fn rump_socket_readable(rump_fd: i32) -> bool {
     let pid = process::read_current_pid().unwrap_or(0);
     let Some(proc) = process::lookup_process_shared(pid) else {
@@ -1470,7 +1479,9 @@ pub fn start_default_stack() {
     // completes.)
 }
 
-/// Boot demo — only when NIC1 is present (`RUMP_NIC=1`). Spawns `/bin/rump_server`,
+/// Boot demo — only when NIC1 is present (`RUMP_NIC=1`).
+///
+/// Spawns `/bin/rump_server`,
 /// hands it one end of a kernel pipe pair as fd 3, and drives a `rump_sys_socket`
 /// over the other end. Prints `[Test] rump_sysproxy PASSED/FAILED`. Suppressed
 /// when `rump-default` owns box 0's stack (that path spawns the real, persistent

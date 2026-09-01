@@ -220,11 +220,13 @@ pub use akuma_primitives::console::StackWriter;
 // `crate::tprint!` resolves unchanged.
 
 /// Check if a character is available for reading
+#[must_use]
 pub fn has_char() -> bool {
     akuma_uart::has_data()
 }
 
 /// Read a character (non-blocking, only call if has_char() is true)
+#[must_use]
 pub fn getchar() -> u8 {
     akuma_uart::read_byte()
 }

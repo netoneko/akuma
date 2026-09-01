@@ -1,0 +1,78 @@
+[package]
+name = "akuma-kernel-glue"
+version = "0.1.0"
+edition = "2024"
+description = "The unsafe half of the bin crate: boot assembly, secondary-core bring-up, the UART console, the platform/machine description, the rump sysproxy client, and the kernel_main/async-main orchestration that ties every other crate together. Depends on akuma-kernel-core; src/ keeps only the crate-root-mandatory items (global allocator, alloc-error handler, panic handler, the _start entry stub) plus the boot self-test suite."
+
+[dependencies]
+akuma-alloc = { path = "../akuma-alloc" }
+akuma-bkl = { path = "../akuma-bkl" }
+# Not used directly by any module here, only needed for the
+# `platform-firecracker` feature forward below (re-exported through
+# `akuma_kernel_core::config` for actual use).
+akuma-config = { path = "../akuma-config" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-exceptions = { path = "../akuma-exceptions" }
+akuma-exec = { path = "../akuma-exec" }
+akuma-ext2 = { path = "../akuma-ext2" }
+akuma-fdt = { path = "../akuma-fdt" }
+akuma-firecracker = { path = "../akuma-firecracker" }
+akuma-gic = { path = "../akuma-gic" }
+akuma-kernel-core = { path = "../akuma-kernel-core" }
+akuma-net = { path = "../akuma-net", default-features = false }
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-psci = { path = "../akuma-psci" }
+# Kernel-side sysproxy client (rumpsp wire + Linux<->NetBSD translation). Only
+# the `rump` feature needs it, mirroring the root package.
+akuma-rump = { path = "../akuma-rump", optional = true }
+akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false }
+akuma-timer = { path = "../akuma-timer" }
+akuma-uart = { path = "../akuma-uart" }
+akuma-vfs-glue = { path = "../akuma-vfs-glue" }
+akuma-virtio = { path = "../akuma-virtio" }
+log = { version = "0.4", default-features = false }
+spinning_top = "0.3"
+
+[features]
+# Mirrors the root package's own toggles of the same name — see
+# `akuma-kernel-core/Cargo.toml` for why each needs its own copy here rather
+# than relying on root's build.rs (build scripts are per-package).
+extreme = []
+no-tests = ["akuma-kernel-core/no-tests"]
+smp-shared = [
+    "akuma-exec/smp-shared",
+    "akuma-vfs-glue/smp-shared",
+    "akuma-exceptions/smp-shared",
+    "akuma-gic/smp-shared",
+    "akuma-net/smp-shared",
+    "akuma-primitives/smp-shared",
+    "akuma-syscalls-glue/smp-shared",
+    "akuma-kernel-core/smp-shared",
+    "no-bkl-network",
+    "no-bkl-vfs",
+    "no-bkl-process",
+    "no-bkl-mm",
+    "no-bkl-drivers",
+    "no-bkl-irq",
+]
+no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network", "akuma-primitives/no-bkl-network", "akuma-syscalls-glue/no-bkl-network"]
+no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-net/no-bkl-vfs", "akuma-primitives/no-bkl-vfs", "akuma-syscalls-glue/no-bkl-vfs"]
+no-bkl-process = ["akuma-exec/no-bkl-process"]
+no-bkl-mm = ["akuma-syscalls-glue/no-bkl-mm"]
+no-bkl-drivers = ["akuma-syscalls-glue/no-bkl-drivers"]
+no-bkl-irq = ["akuma-exceptions/no-bkl-irq"]
+net-profile = ["akuma-net/net-profile", "akuma-kernel-core/net-profile"]
+bkl-profile = ["akuma-kernel-core/bkl-profile"]
+smoltcp = ["akuma-net/smoltcp", "akuma-syscalls-glue/smoltcp", "akuma-kernel-core/smoltcp"]
+sound = ["akuma-virtio/sound"]
+platform-firecracker = ["akuma-config/platform-firecracker", "akuma-virtio/platform-firecracker"]
+rump = ["akuma-net/rump", "dep:akuma-rump", "akuma-syscalls-glue/rump"]
+rump-default = ["rump"]
+rump-tests = []
+sc-eventfd = ["akuma-syscalls-glue/sc-eventfd"]
+sc-pidfd = ["akuma-syscalls-glue/sc-pidfd"]
+sc-epoll = ["akuma-syscalls-glue/sc-epoll"]
+
+[lints]
+workspace = true
