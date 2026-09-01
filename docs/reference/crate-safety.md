@@ -1,6 +1,42 @@
 # Crate safety: which crates forbid `unsafe`
 
 **Grade: A** — regenerated 2026-09-01 with
+`python3 scripts/cloc_akuma.py src crates` after the PSCI conduit left `src/` as
+`akuma-psci` ([`AKUMA_SMP_SHARED_SPLIT.md`](../archive/AKUMA_SMP_SHARED_SPLIT.md)
+step 3). `src/` production fell **92 -> 91** while `crates/` rose **329 -> 331**:
+splitting `psci_call(use_hvc, …)` into `smc_call`/`hvc_call` turns one `unsafe`
+block into two, which is expected — each is now a single fixed instruction with
+no branch inside the asm, and the win is that `src/` is one closer to zero, not
+arithmetic. **23 of 38 crates** forbid. `akuma-boot` **kept** its ban and gained
+`system_reset`/`system_off`: the conduit is a sibling crate precisely so the
+`smc`/`hvc` did not cost it (the `akuma-net` / `akuma-net-nic` split, same
+reason).
+
+**`src/smp_shared.rs` now holds zero `unsafe` operations** — 8 in August, via
+`akuma-fdt` (→4), the GIC consolidation (→1) and this (→0). It still **cannot**
+carry `#![forbid(unsafe_code)]`: the lint also rejects `unsafe extern` blocks,
+`global_asm!` and `#[unsafe(no_mangle)]`, and it needs all three for the
+secondary trampoline. That distinction matters for the endgame — `src/exceptions.rs`
+has two `global_asm!` blocks and five `#[unsafe(no_mangle)]` handlers, so cleaning
+its blocks in place would still not let `src/` forbid. It has to move to a crate.
+
+The run before it, the same day, was
+`python3 scripts/cloc_akuma.py src crates` after the GIC consolidation
+([`AKUMA_GIC_CONSOLIDATION.md`](../archive/AKUMA_GIC_CONSOLIDATION.md)): the
+GICv3 driver, previously run from `src/gic.rs`, `src/gic_v3.rs` and the
+redistributor half of `src/smp_shared.rs`, became `akuma-gic`. `src/` production
+fell **104 -> 92** while `crates/` rose only **324 -> 329**: twelve blocks left,
+five arrived, and the missing seven are genuinely gone — four were a GICv2
+backend no profile enabled and HVF could not run, three were a byte-identical
+second copy of `mmio_w32`/`mmio_r32` and the `GICR_WAKER_*` bits that the crate
+already had. **23 of 37 crates** forbid; `akuma-gic` is one that cannot, by
+construction, and its five blocks sit behind a single stated MMIO contract in the
+shape `akuma-net-nic` uses for DMA. `src/smp_shared.rs` went **4 `unsafe` blocks
+to 1** — the PSCI SMC/HVC conduit call, and nothing else. The largest remaining
+holder is unchanged and is now essentially the whole problem:
+`src/exceptions.rs` at **77 of the 92**.
+
+The run before it, the same day, was
 `python3 scripts/cloc_akuma.py src crates` after the file-page cache left `src/`
 as `akuma-fpcache`
 ([`AKUMA_FPCACHE_EXTRACTION.md`](../archive/AKUMA_FPCACHE_EXTRACTION.md)):

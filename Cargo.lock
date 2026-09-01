@@ -24,6 +24,7 @@ dependencies = [
  "akuma-net-yarn",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-psci",
  "akuma-rump",
  "akuma-syscalls",
  "akuma-syscalls-linux",
@@ -66,6 +67,9 @@ dependencies = [
 [[package]]
 name = "akuma-boot"
 version = "0.1.0"
+dependencies = [
+ "akuma-psci",
+]
 
 [[package]]
 name = "akuma-cpu"
@@ -252,6 +256,10 @@ dependencies = [
  "akuma-cpu",
  "akuma-not-even-once",
 ]
+
+[[package]]
+name = "akuma-psci"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-rump"

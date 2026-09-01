@@ -1,10 +1,15 @@
 # Splitting `src/smp_shared.rs`
 
-**2026-09-01, commit `b9a876fb`.** The BKL policy toggles moved to
-`akuma_bkl::policy`. `src/smp_shared.rs` went **1173 → 808 lines**.
+**2026-09-01.** Three steps, in order:
 
-This is step one of a split, not the whole thing, so the second half of this doc
-is an inventory of what is left and what it is waiting on.
+| Step | Moved to | `unsafe` blocks in `smp_shared.rs` |
+|---|---|---|
+| BKL policy toggles (`b9a876fb`) | `akuma_bkl::policy` | 4 → 4 |
+| GIC redistributor half | `akuma-gic` | 4 → 1 |
+| PSCI SMC/HVC conduit | `akuma-psci` | 1 → **0** |
+
+`src/smp_shared.rs` went **1173 → ~740 lines** and holds **no `unsafe`
+operations** at all. The second half of this doc is an inventory of what is left.
 
 ## Why `smp_shared.rs` is being split at all
 
@@ -154,3 +159,85 @@ static counter array would be the first thing in it that is not one.
 - [`../reference/crate-safety.md`](../reference/crate-safety.md) — unchanged by
   this move (23 of 36 crates; `src/` 104, `crates/` 324), because the moved code
   held no `unsafe`.
+
+---
+
+# Step 3: the PSCI conduit → `akuma-psci`
+
+The last `unsafe` block in the file. `psci_call(use_hvc, func, a1, a2, a3)` was
+one `unsafe {}` containing an `if use_hvc { hvc #0 } else { smc #0 }`.
+
+## Why not `akuma-cpu`
+
+The obvious-looking home is wrong, for the third time in this sequence — the
+same objection that kept `record_el0_trap` and the GIC's `ICC_*` writes out.
+`akuma-cpu` is *AArch64 instructions that are safe to execute*, exposed as safe
+functions. `smc #0` with `SYSTEM_OFF` halts the machine, with `SYSTEM_RESET`
+reboots it, and with `CPU_ON` starts another core at an address you supply. A
+safe wrapper in a crate everything depends on would let any safe code in the tree
+power the box off — the exact invariant `akuma-cpu` exists to hold.
+
+## Why not `akuma-boot` either, despite appearances
+
+`akuma-boot` was the natural home — it already owned `PSCI_SYSTEM_OFF` /
+`PSCI_SYSTEM_RESET`, and `CLAUDE.md` recorded the split as a wart ("the PSCI SMC
+call itself stays in `src/smp_shared.rs`"). It could decode a reboot but not
+perform one.
+
+But `akuma-boot` carries `#![forbid(unsafe_code)]`. Absorbing an `smc` would have
+cost it that ban. So the conduit is a **sibling**: `akuma-psci` holds the two asm
+blocks, `akuma-boot` depends on it and keeps its ban. Same split as `akuma-net` /
+`akuma-net-nic`, for the same reason.
+
+The reboot half did land in `akuma-boot`: `system_reset()` and `system_off()`
+moved there from `smp_shared.rs`, so the crate now decodes *and* performs.
+
+## The count went UP, and that is expected
+
+Splitting `psci_call` into `smc_call` / `hvc_call` turns **one** `unsafe {}` into
+**two** — each function is now a single fixed instruction with no runtime branch
+inside the asm. `crates/` went 329 → 331 while `src/` went 92 → 91. The win is
+that `src/` is one block closer to zero and each block is simpler; it is not an
+arithmetic win, and nobody should expect one.
+
+## Fallout: `sc-reboot` no longer depends on `smp-shared`
+
+The feature list said `sc-reboot = ["dep:akuma-boot", "smp-shared"]`, and the
+manifest comment explained why: `reboot.rs` called `crate::smp_shared` for the
+PSCI plumbing, and that module only exists under `#[cfg(kernel_smp_shared)]`. It
+was a **build fix, never a capability choice** — `smp_shared` owned the conduit
+only because it needed `CPU_ON` for bring-up.
+
+With the syscall now calling `akuma_boot::system_reset`, the dependency is gone.
+**Note this changes `devbox`** (rump-only, deferred), which listed `sc-reboot`
+and therefore picked up `smp-shared` transitively. It never asked for it; if that
+build is ever meant to have real SMP it must now say so explicitly.
+`scripts/build_devbox.sh` was rebuilt to confirm it still compiles.
+
+## Zero `unsafe` blocks is not the same as being able to `forbid`
+
+`#![forbid(unsafe_code)]` was tried on the module and **rejected** — the lint
+also refuses `unsafe extern` blocks, `core::arch::global_asm!` and
+`#[unsafe(no_mangle)]`, and this module needs all three for the secondary
+trampoline PSCI `CPU_ON` jumps to.
+
+This is worth internalising before the endgame: **any file with a vector table or
+a trampoline is in the same position**, however few `unsafe` operations it has.
+`src/exceptions.rs` owns two `global_asm!` blocks and five `#[unsafe(no_mangle)]`
+handlers, so cleaning its 76 blocks in place would still not let `src/` forbid.
+It has to *move to a crate*. That was always the plan; this is the proof.
+
+## Verification
+
+- Host tests 1102 passed / 0 failed (the crate adds one, deliberately a single
+  test — `IS_HVC` is a `static` and two tests would race, the same trap as
+  `akuma_bkl::policy`'s bitmap).
+- `extreme-size` builds; `scripts/build_devbox.sh` builds (the feature change).
+- **SMP=4 boot**: `CPU_ON core 1/2/3 -> ok`, 3/3 secondaries online, workers and
+  userspace on 4 cores, migration across 4 distinct cores, **0 FAILED**. PSCI
+  `CPU_ON` *is* secondary bring-up, so this is the whole test.
+
+`#[must_use]` on the call functions is deliberate: silently dropping a PSCI
+return is how a failed `CPU_ON` goes unnoticed. The two sites that legitimately
+discard it (`system_reset`/`system_off`, which do not return on success) say so
+with `let _ =` and a comment.

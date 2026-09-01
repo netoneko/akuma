@@ -1,0 +1,10 @@
+[package]
+name = "akuma-psci"
+version = "0.1.0"
+edition = "2024"
+description = "The PSCI conduit: SMC/HVC calls for CPU_ON, SYSTEM_RESET and SYSTEM_OFF"
+
+[dependencies]
+
+[lints]
+workspace = true

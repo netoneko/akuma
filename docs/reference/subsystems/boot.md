@@ -39,9 +39,11 @@ For debugging, see [`../../runbooks/debug-boot-hang.md`](../../runbooks/debug-bo
 - **Default:** runner auto-selects HVF on Darwin/arm64; `HVF=0` forces TCG.
   HVF ~70× (prompt) / ~100× (gen) faster for LLM; non-deterministic. Use TCG
   for deterministic crash repro.
-- **GIC:** runner passes `-machine virt,gic-version=3` for both. `src/gic_v3.rs`
-  is default (system-register CPU interface `ICC_*`, redistributor). GICv2 MMIO
-  driver behind `gic-v2` feature (TCG only). Akuma uses SGI 0 + PPI 27/30 only.
+- **GIC:** runner passes `-machine virt,gic-version=3` for both. `crates/akuma-gic`
+  is the only driver (system-register CPU interface `ICC_*`, redistributor); the
+  GICv2 MMIO backend and its `gic-v2` feature were deleted 2026-09-01 — it could
+  not run under HVF and nothing enabled it (`archive/AKUMA_GIC_CONSOLIDATION.md`).
+  Akuma uses SGI 0 + PPI 27/30 only.
 - **HVF-specific fixes (all landed):** GICv3 driver; unified **virtual** timer
   `CNTV_*` (physical CNTP trapped under HVF); IC IVAU via kernel alias not
   unmapped user VA; inline-asm MMIO helpers forcing base-register addressing

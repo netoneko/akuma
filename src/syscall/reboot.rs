@@ -27,14 +27,14 @@ pub(super) fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> u64 {
             if crate::vfs::sync_all_filesystems().is_err() {
                 crate::safe_print!(48, "[reboot] fs sync failed; disk may need e2fsck\n");
             }
-            crate::smp_shared::system_reset();
+            akuma_boot::system_reset();
         }
         Ok(Some(akuma_boot::Action::PowerOff)) => {
             crate::safe_print!(48, "[reboot] PSCI SYSTEM_OFF requested\n");
             if crate::vfs::sync_all_filesystems().is_err() {
                 crate::safe_print!(48, "[reboot] fs sync failed; disk may need e2fsck\n");
             }
-            crate::smp_shared::system_off();
+            akuma_boot::system_off();
         }
         Ok(Some(akuma_boot::Action::Noop)) => 0,
         Ok(None) | Err(akuma_boot::BadMagic) => EINVAL,

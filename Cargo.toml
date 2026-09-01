@@ -8,6 +8,7 @@ default-members = [
     "crates/akuma-fdt",
     "crates/akuma-firecracker",
     "crates/akuma-fpcache",
+    "crates/akuma-psci",
     "crates/akuma-cpu",
     "crates/akuma-elf",
     "crates/akuma-ext2",
@@ -533,15 +534,21 @@ rump = ["akuma-net/rump", "dep:akuma-rump"]
 # (scripts/cargo_runner.sh's KERNEL_DROPOFF), then reboot(2) straight into the
 # new build instead of a host-side extract + relaunch cycle.
 #
-# Depends on `smp-shared`: `src/syscall/reboot.rs` calls `crate::smp_shared`
-# unconditionally for the PSCI SMC/HVC plumbing, and that module only exists
-# under `smp-shared` (`#[cfg(kernel_smp_shared)]`, src/main.rs). Without this,
-# any `--no-default-features` build that lists `sc-reboot` but not
-# `smp-shared` fails with "cannot find `smp_shared` in `crate`" — confirmed
-# pre-existing on `scripts/build_devbox.sh` (rump-only `devbox`, deferred)
-# independent of the `default` change above; fixed here rather than left as a
-# trap for the next feature set that lists `sc-reboot`.
-sc-reboot = ["dep:akuma-boot", "smp-shared"]
+# No longer depends on `smp-shared`, as of 2026-09-01. It used to: `reboot.rs`
+# called `crate::smp_shared::system_reset` for the PSCI SMC/HVC plumbing, and
+# that module only exists under `smp-shared` (`#[cfg(kernel_smp_shared)]`,
+# src/main.rs), so any `--no-default-features` build listing `sc-reboot` without
+# it failed with "cannot find `smp_shared` in `crate`". The coupling was a build
+# fix, never a capability choice — `smp_shared` owned the conduit only because
+# it needed `CPU_ON` for secondary bring-up.
+#
+# `system_reset`/`system_off` now live in `akuma-boot`, over the `akuma-psci`
+# conduit, so the syscall no longer names `smp_shared` at all
+# (`docs/archive/AKUMA_SMP_SHARED_SPLIT.md`). NOTE this means `devbox`
+# (rump-only, deferred) no longer picks up `smp-shared` transitively — it never
+# asked for it, but if that build is ever meant to have real SMP it must now say
+# so explicitly.
+sc-reboot = ["dep:akuma-boot"]
 # The native smoltcp TCP/IP stack (NIC0): the in-kernel socket syscalls, DNS/HTTP,
 # and the built-in SSH server are all built on it. In `default`; the devbox build
 # drops it (rump is the only stack) via --no-default-features, which compiles the
@@ -677,6 +684,10 @@ akuma-exec = { path = "crates/akuma-exec" }
 # the exec crate that does not read it would be indirection for its own sake.
 # The GICv3 driver, consolidated from `src/gic.rs` + `src/gic_v3.rs` + the
 # redistributor half of `src/smp_shared.rs` on 2026-09-01.
+# The PSCI conduit (smc/hvc). A sibling of `akuma-boot` rather than part of it:
+# `akuma-boot` decodes `reboot(2)` under `#![forbid(unsafe_code)]`, and an `smc`
+# would have cost it that ban.
+akuma-psci = { path = "crates/akuma-psci" }
 akuma-gic = { path = "crates/akuma-gic" }
 akuma-bkl = { path = "crates/akuma-bkl" }
 akuma-fpcache = { path = "crates/akuma-fpcache" }

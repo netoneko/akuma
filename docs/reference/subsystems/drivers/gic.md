@@ -1,6 +1,9 @@
 # GIC (interrupt controller)
 
-Source: `src/gic.rs` (backend selector), `src/gic_v3.rs` (default backend).
+Source: `crates/akuma-gic` (the whole driver, since 2026-09-01 —
+[`archive/AKUMA_GIC_CONSOLIDATION.md`](../../../archive/AKUMA_GIC_CONSOLIDATION.md)).
+It was `src/gic.rs` + `src/gic_v3.rs` + the redistributor half of
+`src/smp_shared.rs` until then.
 
 > **Stability: B (watch).** The GICv3 backend and the HVF boot-blocker it
 > fixed have been dormant since 2026-06-09; the `smp` feature's cross-core
@@ -10,31 +13,38 @@ Source: `src/gic.rs` (backend selector), `src/gic_v3.rs` (default backend).
 > or pair/SIMD store sets the data-abort's ISV bit to 0, and QEMU's HVF
 > backend `assert(isv)`s on any data abort it can't decode.
 
-## Backend selection
+## There is one backend
 
-`src/gic.rs` is a thin dispatcher over two mutually exclusive backends,
-selected at compile time:
+GICv3, always. The CPU interface is EL1 system registers (`ICC_*_EL1`) and
+SGI/PPI config lives in the per-PE redistributor. QEMU is always started with
+`-machine virt,gic-version=3`, under both accelerators.
 
-| Backend | Selected by | CPU interface | Works under |
-|---|---|---|---|
-| GICv3 (default) | `not(feature = "gic-v2")` | EL1 system registers (`ICC_*_EL1`) | HVF and TCG (`gic.rs:1-13`) |
-| GICv2 | `feature = "gic-v2"` | MMIO frame at `DEV_GIC_CPU_VA` (phys `0x0801_0000`) | TCG only |
+A legacy GICv2 MMIO backend existed behind `feature = "gic-v2"` until
+2026-09-01. It was deleted: no build script, profile or acceptance playbook ever
+enabled it, and it could not run under HVF at all — QEMU presents GICv3 there
+with no `0x0801_0000` CPU-interface frame, so the driver's first distributor
+write faulted with `ISV=0` and HVF asserted (see `archive/QEMU_HVF_ISV_BUG.md`
+root cause 1). Recover it from `git show <commit>~1:src/gic.rs` if a TCG-only
+reference is ever wanted; nothing in the tree dispatches on a backend any more.
 
-`gic.rs`'s public API (`init`, `enable_irq`, `acknowledge_irq`,
-`end_of_interrupt`, `trigger_sgi`, `set_priority`, `gic.rs:194-250`) just
-`#[cfg]`-branches to either the local GICv2 `Gic` struct or `crate::gic_v3::*`.
-Callers never care which backend is active. QEMU is always started with
-`-machine virt,gic-version=3` (both accelerators); the `gic-v2` feature exists
-for reference/fallback under TCG only, per `config-flags.md`.
+## Who calls what
 
-**Why GICv3 is default:** under `-accel hvf` on Apple Silicon, QEMU presents
-GICv3 and there is no `0x0801_0000` GICv2 CPU-interface MMIO frame at all — the
-legacy driver's first distributor write past the v2/v3-divergent region faults
-with ISV=0 and HVF asserts. See `archive/QEMU_HVF_ISV_BUG.md` root cause 1.
+| Path | Entry points |
+|---|---|
+| BSP bring-up | `init` (distributor + this PE's redistributor + CPU interface) |
+| Secondary bring-up | `secondary_init(idx, RedistributorLayout)` — takes the redistributor geometry as an argument, read from `src/platform.rs`'s installed device map, so an FDT-discovered redistributor beats any compile-time literal |
+| IRQ dispatch | `acknowledge_irq`, `end_of_interrupt` |
+| Registration | `enable_irq`, `set_priority` |
+| Scheduling | `SGI_SCHEDULER`, `trigger_sgi` (single-core self-target), `trigger_sgi_self` / `trigger_sgi_core` / `broadcast_sgi` (`kernel_smp_shared` only) |
+
+`init` reaches the hardware through the `addr::DEV_GIC*` device-window VAs;
+`secondary_init` uses PAs, because it runs on the boot page table where only the
+low 1 GiB identity block exists. Both are correct; they are different mappings
+of the same registers.
 
 ## GICv3 init sequence
 
-`gic_v3::init()` (`src/gic_v3.rs:144-182`), in order:
+`akuma_gic::init()`, in order:
 
 1. Set `ICC_SRE_EL1.SRE=1` — switch the CPU interface from (nonexistent)
    MMIO to system registers.

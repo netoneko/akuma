@@ -2,7 +2,12 @@
 name = "akuma-boot"
 version = "0.1.0"
 edition = "2024"
-description = "Boot/reboot logic. Currently just reboot(2) ABI decode for the devbox-only PSCI SYSTEM_RESET/SYSTEM_OFF syscall; a natural home for src/boot.rs's logic later."
+description = "Boot/reboot logic: reboot(2) ABI decode plus the PSCI SYSTEM_RESET/SYSTEM_OFF actions; a natural home for src/boot.rs's logic later."
+
+[dependencies]
+# The conduit that actually issues the call. A separate crate so this one keeps
+# `#![forbid(unsafe_code)]` — the `smc`/`hvc` asm lives there, not here.
+akuma-psci = { path = "../akuma-psci" }
 
 [lints]
 workspace = true

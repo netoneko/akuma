@@ -1,3 +1,25 @@
+//! # Zero `unsafe` blocks — but it cannot carry `forbid`
+//!
+//! This module reached **0 `unsafe {}` blocks** on 2026-09-01. It held 8 in
+//! August: `akuma-fdt` took it to 4 (`archive/AKUMA_FDT_EXTRACTION.md`), the GIC
+//! consolidation took 3 more (`archive/AKUMA_GIC_CONSOLIDATION.md`), and the
+//! last — the PSCI SMC/HVC conduit — became `akuma-psci`.
+//!
+//! It still cannot take `#![forbid(unsafe_code)]` the way `src/syscall/` does,
+//! and that is worth knowing before anyone tries: the lint also rejects
+//! `unsafe extern` blocks, `core::arch::global_asm!` and
+//! `#[unsafe(no_mangle)]`, and this module needs all three for the secondary
+//! trampoline that PSCI `CPU_ON` jumps to. **Zero `unsafe` operations is not the
+//! same as being able to forbid** — the remaining constructs are asm and
+//! linkage, not operations. Any file with a vector table or a trampoline is in
+//! the same position, which is why `src/exceptions.rs` has to *move to a crate*
+//! rather than be cleaned in place.
+//!
+//! Keep it at zero anyway: if this module needs a privileged operation, put it
+//! behind a named function in the crate that owns the hardware it pokes —
+//! `akuma-gic` for the interrupt controller, `akuma-psci` for the conduit,
+//! `akuma-cpu` for instructions that are safe to execute.
+
 //! Real (shared-kernel) SMP — classic symmetric multiprocessing.
 //!
 //! This is the INVERSE of the multikernel in [`crate::smp`]. There, every core runs
@@ -42,14 +64,12 @@ const MAX_CORES: usize = 8;
 const STACK_SHIFT: usize = 16;
 
 // PSCI (matches crate::smp — QEMU `virt` exposes PSCI over the DTB-declared conduit).
-const PSCI_CPU_ON: u64 = 0xC400_0003;
 // SYSTEM_OFF/SYSTEM_RESET function IDs live in akuma_boot alongside the rest of
 // the reboot ABI (`sc-reboot` only) — nothing hardware-specific about a constant.
 
 // --- DTB-probed topology, stashed before the heap can overwrite the DTB ------------
 static PROBED: AtomicBool = AtomicBool::new(false);
 static NUM_CORES: AtomicUsize = AtomicUsize::new(1);
-static USE_HVC: AtomicBool = AtomicBool::new(true);
 static PROBED_MPIDRS: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
 
 /// Count of secondaries that have reached their online barrier. Genuinely shared
@@ -164,38 +184,6 @@ fn read_mpidr() -> u64 {
     akuma_cpu::sysreg::mpidr_el1()
 }
 
-/// Issue a PSCI call over the platform conduit (`hvc`/`smc`). Returns x0 (0 = SUCCESS).
-fn psci_call(use_hvc: bool, func: u64, a1: u64, a2: u64, a3: u64) -> i64 {
-    let ret: i64;
-    // SAFETY: a standard SMCCC call; we clobber the caller-saved GPR range (x1–x17).
-    unsafe {
-        if use_hvc {
-            core::arch::asm!(
-                "hvc #0",
-                inout("x0") func => ret,
-                in("x1") a1, in("x2") a2, in("x3") a3,
-                lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _,
-                lateout("x8") _, lateout("x9") _, lateout("x10") _, lateout("x11") _,
-                lateout("x12") _, lateout("x13") _, lateout("x14") _, lateout("x15") _,
-                lateout("x16") _, lateout("x17") _,
-                options(nostack),
-            );
-        } else {
-            core::arch::asm!(
-                "smc #0",
-                inout("x0") func => ret,
-                in("x1") a1, in("x2") a2, in("x3") a3,
-                lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _,
-                lateout("x8") _, lateout("x9") _, lateout("x10") _, lateout("x11") _,
-                lateout("x12") _, lateout("x13") _, lateout("x14") _, lateout("x15") _,
-                lateout("x16") _, lateout("x17") _,
-                options(nostack),
-            );
-        }
-    }
-    ret
-}
-
 /// `true` if the PSCI conduit is `hvc` (QEMU `virt`); default to it when absent.
 fn psci_is_hvc(fdt: &akuma_fdt::Fdt<'_>) -> bool {
     fdt.find_node("/psci")
@@ -229,7 +217,11 @@ pub fn probe_dtb(fdt: Option<&akuma_fdt::Fdt<'_>>) {
         }
     }
     NUM_CORES.store(count.max(1), Ordering::Relaxed);
-    USE_HVC.store(psci_is_hvc(fdt), Ordering::Relaxed);
+    akuma_psci::set_conduit(if psci_is_hvc(fdt) {
+        akuma_psci::Conduit::Hvc
+    } else {
+        akuma_psci::Conduit::Smc
+    });
     PROBED.store(true, Ordering::Release);
     crate::safe_print!(64, "[SMP-shared] probed {} core(s)\n", count.max(1));
 }
@@ -242,7 +234,6 @@ pub fn bringup_secondaries() {
         return;
     }
     let num_cores = NUM_CORES.load(Ordering::Relaxed);
-    let use_hvc = USE_HVC.load(Ordering::Relaxed);
     let bsp_idx = (read_mpidr() & 0xff) as usize;
     crate::safe_print!(64, "[SMP-shared] {} core(s); BSP is core {}\n", num_cores, bsp_idx);
 
@@ -272,7 +263,7 @@ pub fn bringup_secondaries() {
         }
         let target = slot.load(Ordering::Relaxed);
         // `context_id` (a3) is unused in M0; pass the core index for future use / debug.
-        let r = psci_call(use_hvc, PSCI_CPU_ON, target, entry_pa, idx as u64);
+        let r = akuma_psci::call(akuma_psci::CPU_ON, target, entry_pa, idx as u64);
         if r == 0 {
             expected += 1;
             crate::safe_print!(80, "[SMP-shared] CPU_ON core {} (mpidr=0x{:x}) -> ok\n", idx, target);
@@ -302,38 +293,6 @@ pub fn bringup_secondaries() {
 #[allow(dead_code)]
 pub fn online_secondary_count() -> usize {
     ONLINE_COUNT.load(Ordering::Acquire)
-}
-
-/// Whole-machine PSCI `SYSTEM_RESET`. Called from `src/syscall/reboot.rs`.
-///
-/// Unlike a self-hosted kexec (considered and rejected — see
-/// `docs/runbooks/selfhost-kernel-build.md` background) this needs no in-kernel
-/// SMP park/quiesce dance: QEMU/firmware tears every core and device back down
-/// to the same clean reset state `boot.rs` already assumes, so a plain PSCI
-/// reset gets that for free. `-kernel` bytes are cached by QEMU at process
-/// startup and are not re-read on an in-process reset, so this only picks up a
-/// freshly built kernel when combined with `-action reboot=shutdown` and a
-/// host-side relaunch — see `scripts/cargo_runner.sh`'s `KERNEL_DROPOFF`.
-#[cfg(feature = "sc-reboot")]
-pub fn system_reset() -> ! {
-    let use_hvc = USE_HVC.load(Ordering::Relaxed);
-    psci_call(use_hvc, akuma_boot::PSCI_SYSTEM_RESET, 0, 0, 0);
-    // SYSTEM_RESET does not return on success; reaching here means the call
-    // itself failed (e.g. no PSCI conduit). Nothing sensible to do but spin —
-    // the syscall dispatcher isn't set up to receive a return from this path.
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
-/// Whole-machine PSCI `SYSTEM_OFF`. See `system_reset` for the shared reasoning.
-#[cfg(feature = "sc-reboot")]
-pub fn system_off() -> ! {
-    let use_hvc = USE_HVC.load(Ordering::Relaxed);
-    psci_call(use_hvc, akuma_boot::PSCI_SYSTEM_OFF, 0, 0, 0);
-    loop {
-        core::hint::spin_loop();
-    }
 }
 
 /// Number of cores the DTB reported (including the BSP). See `online_secondary_count`.

@@ -8,7 +8,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{bkl,exec,ext2,firecracker,fpcache,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,rump,terminal,timer,vfs,virtio}`
+  `akuma-{bkl,exec,ext2,firecracker,fpcache,gic,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,psci,rump,terminal,timer,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
   `akuma-cpu` holds every AArch64 instruction that is **safe to execute** —
   barriers, cache/TLB maintenance, core parking, `DAIF`, the virtual-timer
@@ -31,8 +31,8 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `sysreg::set_tpidr_el0` (`docs/archive/SYSCALL_UNSAFE_CLEANUP.md` §6). To time a code path use
   `sysreg::cntvct_el0_ordered()` — a bare counter read is unordered against the
   work it measures and once made an 8 KB copy measure as 0 ns.
-  **23 of the 36 carry `#![forbid(unsafe_code)]`** — which crates, and why the
-  other 13 cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
+  **23 of the 38 carry `#![forbid(unsafe_code)]`** — which crates, and why the
+  other 15 cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
   with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).
   **`src/syscall/` carries the ban too** (2026-08-31), as a module attribute in
   its `mod.rs` — the first one outside `crates/`, and the reason the crate tally
@@ -171,6 +171,23 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   subsystems/syscalls/poll.md` § "The wait loop is one machine"). The crate also
   carries a differential test against the pre-extraction `wait_until`; keep that
   oracle in the shipped loop's shape rather than tidying it.
+  `akuma-gic` is the **whole** GICv3 driver (2026-09-01,
+  `docs/archive/AKUMA_GIC_CONSOLIDATION.md`) — distributor, per-PE
+  redistributor, the `ICC_*_EL1` CPU interface, and secondary bring-up. It
+  replaced three files that all drove the same controller: `src/gic.rs`,
+  `src/gic_v3.rs` and the redistributor half of `src/smp_shared.rs`, which
+  carried a **byte-identical** second copy of `mmio_w32`/`mmio_r32` and the
+  `GICR_WAKER_*` bits. 12 `unsafe` blocks left `src/`; only 5 arrived — 4 were a
+  dead GICv2 backend (`feature = "gic-v2"`, never enabled by any profile and
+  unable to run under HVF at all) and 3 were the duplicates. It **cannot**
+  forbid `unsafe` and never will: it is MMIO and system registers end to end,
+  behind one stated contract — every address passed to `mmio_w32`/`mmio_r32` is a
+  device-mapped GIC register, in the L0[1] device window or the low 1 GiB
+  identity block. **Do not lower those to `write_volatile`**: the optimizer may
+  emit a writeback form, which sets `ESR.ISV=0` and makes QEMU's HVF backend
+  assert. The `ICC_*` writes deliberately did **not** go to `akuma-cpu` — that
+  crate is instructions that are *safe to execute*, and enabling a CPU interface
+  is not one.
   `akuma-bkl` is the BKL protocol and the spinlocks under it — and since
   2026-09-01 also `akuma_bkl::policy`, the **decision** to take it or skip it:
   the seven `no-bkl-*` phase toggles and the per-syscall opt-out bitmap, moved
@@ -221,11 +238,27 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   never tries to cross-compile it for the kernel's own target.
   `akuma-boot` holds the Linux `reboot(2)` ABI decode for the `sc-reboot`
   syscall (`src/syscall/reboot.rs`) — in `default` since 2026-08-25 (only
-  `extreme-size`, which builds `--no-default-features`, excludes it) — the
-  PSCI SMC call itself stays in `src/smp_shared.rs`, which already owns
-  SMC/HVC conduit selection for `CPU_ON`; `sc-reboot` depends on
-  `smp-shared` for exactly that reason. Named `-boot`, not `-reboot`: a
+  `extreme-size`, which builds `--no-default-features`, excludes it) — **and
+  since 2026-09-01 `system_reset`/`system_off` themselves**, so it decodes *and*
+  performs. It keeps `#![forbid(unsafe_code)]` because the `smc`/`hvc` lives in
+  the sibling `akuma-psci`, not here — absorbing it would have cost the ban, the
+  same reason `akuma-net` and `akuma-net-nic` are two crates. `sc-reboot` no
+  longer depends on `smp-shared`; that was a build fix for `reboot.rs` naming
+  `crate::smp_shared`, never a capability choice, and dropping it means `devbox`
+  no longer picks up `smp-shared` transitively. Named `-boot`, not `-reboot`: a
   natural future home for `src/boot.rs`'s logic too.
+  `akuma-psci` is the conduit — `smc_call`/`hvc_call`, the `Conduit` the DTB's
+  `/psci` `method` selects (default `Hvc`; both supported machines use it), and
+  the `CPU_ON`/`SYSTEM_OFF`/`SYSTEM_RESET` ids. It was `src/smp_shared.rs`'s
+  **last** `unsafe` block, which is now at zero
+  (`docs/archive/AKUMA_SMP_SHARED_SPLIT.md`). Splitting the old
+  `psci_call(use_hvc, …)` in two took 1 `unsafe` block to 2 — expected, and the
+  point is that each is one fixed instruction with no branch inside the asm.
+  **Not in `akuma-cpu`, and this is the third time that answer came up**: `smc`
+  with `SYSTEM_OFF` halts the machine and with `CPU_ON` starts a core at an
+  address you supply, so a safe wrapper there would let any safe code in the tree
+  power the box off. The call functions are `#[must_use]` — dropping a PSCI
+  return is how a failed `CPU_ON` goes unnoticed.
 - `userspace/` — ELF binaries (musl libc); current member list + one-liners: `docs/reference/userspace-layout.md`
 - `docs/` — Documentation (see below)
 - `scripts/` — Build and debug helpers

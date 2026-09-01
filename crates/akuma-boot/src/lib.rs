@@ -8,10 +8,14 @@
 #![forbid(unsafe_code)]
 //! Linux `reboot(2)` ABI decode — pure, host-testable.
 //!
-//! The actual PSCI SMC call stays in `src/smp_shared.rs`, which already owns
-//! SMC/HVC conduit selection for `CPU_ON` bring-up; this crate only decides
-//! *what* the syscall means, so the hardware call site (`system_reset`/
-//! `system_off`) has nothing left to get wrong but "issue the call".
+//! Since 2026-09-01 this crate also *performs* the reboot: [`system_reset`] and
+//! [`system_off`] live here, issuing the call through `akuma-psci`. They were in
+//! `src/smp_shared.rs`, which owned the conduit because it needed `CPU_ON` for
+//! bring-up — so a crate that could decode a reboot had to reach back into the
+//! bin crate to do one, and `sc-reboot` had to depend on `smp-shared` to get it.
+//! The conduit is now `akuma-psci`, a sibling rather than part of this crate,
+//! precisely so the `unsafe` `smc`/`hvc` does not cost this crate its
+//! `#![forbid(unsafe_code)]` (`docs/archive/AKUMA_SMP_SHARED_SPLIT.md`).
 //!
 //! Devbox-only (`sc-reboot` feature, wired into `devbox`/`devbox-smoltcp`):
 //! rebuild the kernel in-guest, `dd` it over the file backing both `-kernel`
@@ -114,5 +118,41 @@ mod tests {
     #[test]
     fn unrecognized_cmd_with_good_magic_is_none() {
         assert_eq!(decode(MAGIC1, MAGIC2, 0xdead_beef), Ok(None));
+    }
+}
+
+/// Whole-machine PSCI `SYSTEM_RESET`.
+///
+/// Akuma has no in-kernel park/quiesce dance before this, and needs none: QEMU
+/// and firmware tear every core and device back down to the same clean reset
+/// state `boot.rs` already assumes, so a plain PSCI reset gets that for free.
+///
+/// `-kernel` bytes are cached by QEMU at process startup and are **not** re-read
+/// on an in-process reset, so this only picks up a freshly built kernel when
+/// combined with `-action reboot=shutdown` and a host-side relaunch — see
+/// `scripts/cargo_runner.sh`'s `KERNEL_DROPOFF` and
+/// `docs/runbooks/selfhost-kernel-build.md`.
+///
+/// Callers should sync filesystems first; this does not return.
+pub fn system_reset() -> ! {
+    // Discarded deliberately: on success this does not return at all, so a
+    // returned status can only mean the call failed — which the loop below
+    // already handles. There is no caller left to report it to.
+    let _ = akuma_psci::call(akuma_psci::SYSTEM_RESET, 0, 0, 0);
+    // `SYSTEM_RESET` does not return on success, so reaching here means the call
+    // itself failed — typically no PSCI conduit. There is nothing sensible left
+    // to do: the syscall dispatcher is not set up to receive a return from this
+    // path, and the caller has already synced and announced the reboot.
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Whole-machine PSCI `SYSTEM_OFF`. See [`system_reset`] for the shared
+/// reasoning; likewise does not return.
+pub fn system_off() -> ! {
+    let _ = akuma_psci::call(akuma_psci::SYSTEM_OFF, 0, 0, 0);
+    loop {
+        core::hint::spin_loop();
     }
 }
