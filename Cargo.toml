@@ -205,7 +205,7 @@ no-tests = ["akuma-net/small-sockets", "akuma-exceptions/no-tests", "akuma-exec/
 # The device *physical* addresses this sets are a bootstrap map only; the real
 # ones come from the FDT at runtime, because Firecracker's GIC redistributor base
 # depends on vCPU count. See proposals/FIRECRACKER_PORT.md.
-platform-firecracker = ["akuma-config/platform-firecracker"]
+platform-firecracker = ["akuma-config/platform-firecracker", "akuma-virtio/platform-firecracker"]
 
 # Support for a server handling many simultaneous connections: a deeper
 # per-listener backlog and a larger socket budget (see

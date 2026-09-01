@@ -193,6 +193,16 @@ fn main() {
     // actually keys off.
     let firecracker = std::env::var("CARGO_FEATURE_PLATFORM_FIRECRACKER").is_ok();
 
+    // `kernel_audio` no longer *selects* an implementation — since 2026-09-01
+    // `akuma-virtio` owns that, via its own `platform-firecracker` feature which
+    // swaps its real `imp` for its stub. This cfg has two narrower jobs left:
+    // whether `kernel_main` probes at all (the real driver walks eight virtio
+    // slots to report "not available", which is noise on a machine that has
+    // none), and what `test_platform_device_gates` asserts.
+    //
+    // **It must stay equal to `akuma-virtio`'s gate** — both are
+    // `sound && !platform-firecracker`. If they diverge, the boot test above
+    // asserts against an implementation that is not the one compiled in.
     if std::env::var("CARGO_FEATURE_SOUND").is_ok() && !firecracker {
         println!("cargo:rustc-cfg=kernel_audio");
     }

@@ -29,3 +29,13 @@ akuma-primitives = { path = "../akuma-primitives" }
 # feature, which gates that crate's `sound` module. Forwarded from the kernel's
 # own `sound` feature.
 sound = ["virtio-drivers/alloc"]
+
+# The machine has no virtio-sound device, so `sound` must be *subtracted* even
+# though it is in the kernel's default feature set.
+#
+# Cargo features are additive and a platform cannot turn one off, which is why
+# `src/main.rs` used to shadow this crate's real `audio` with a third copy of the
+# stub, selected by a `kernel_audio` cfg its build.rs computed as
+# `sound && !platform-firecracker`. Taking the platform as a feature here puts
+# that subtraction next to the driver it subtracts, and the copy is gone.
+platform-firecracker = []

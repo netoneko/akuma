@@ -127,53 +127,21 @@ mod timer;
 // Phase 3). Re-bound here so existing `crate::block::…` paths still resolve.
 pub(crate) use akuma_virtio::{block, rng};
 
-/// virtio-sound, on machines that have one.
+/// virtio-sound. Real driver or inert stub — `akuma-virtio` decides.
 ///
-/// Firecracker does not: its device tree carries three virtio devices (net,
-/// block, rng) and no sound device, and Firecracker upstream implements none. So
-/// `kernel_audio` is off there and [`audio`] below is a stub instead — see the
-/// `kernel_audio` note in build.rs.
-#[cfg(kernel_audio)]
+/// A plain re-export since 2026-09-01. There used to be two arms here selected by
+/// a `kernel_audio` cfg, the second a **third copy** of a stub `akuma-virtio`
+/// already had: `sound` is in the default feature set, Cargo features cannot be
+/// subtracted by a platform, and Firecracker has no sound device. That
+/// subtraction now lives in `akuma-virtio` as its own `platform-firecracker`
+/// feature, next to the driver it subtracts.
+///
+/// `kernel_audio` still exists and is still worth having, with two narrower jobs:
+/// whether `kernel_main` probes at all, and what
+/// `process_tests::test_platform_device_gates` asserts. It must stay equal to
+/// `akuma-virtio`'s gate — see build.rs.
 pub(crate) use akuma_virtio::audio;
 
-/// Stub `audio` for machines with no sound device.
-///
-/// Mirrors `akuma_virtio::audio`'s own feature-off stub (its `imp` module) so the
-/// syscall layer compiles unchanged: `/dev/dsp` never opens because
-/// `is_available()` is false, which is the same gate `syscall/fs.rs` already
-/// applies. The OSS ABI constants are re-exported rather than restated — they are
-/// compile-time numbers, and duplicating them is how the two copies drift.
-#[cfg(not(kernel_audio))]
-pub(crate) mod audio {
-    // Which of these has a caller depends on the feature set — `AFMT_S16_LE` is
-    // used only by the boot suite, which `no-tests` builds drop — so the parity
-    // surface is deliberately wider than any single configuration needs. That is
-    // the point of a stub: the syscall layer compiles unchanged either way.
-    #[allow(unused_imports)]
-    pub use akuma_virtio::audio::{
-        AFMT_S16_LE, AudioError, SNDCTL_DSP_CHANNELS, SNDCTL_DSP_SETFMT, SNDCTL_DSP_SPEED,
-    };
-
-    // Deliberately no `init`: `kernel_audio` is off, so nothing probes for a
-    // sound device and a stub `init` would be dead code. If the boot probe is
-    // ever re-enabled here, the resulting compile error is the point.
-    pub fn is_available() -> bool {
-        false
-    }
-    pub fn set_format_oss(_fmt: i32) -> Result<(), AudioError> {
-        Err(AudioError::NotInitialized)
-    }
-    pub fn set_channels(_channels: i32) -> Result<(), AudioError> {
-        Err(AudioError::NotInitialized)
-    }
-    pub fn set_rate(_rate_hz: i32) -> Result<(), AudioError> {
-        Err(AudioError::NotInitialized)
-    }
-    pub fn play(_frames: &[u8]) -> Result<usize, AudioError> {
-        Err(AudioError::NotInitialized)
-    }
-    pub fn stop() {}
-}
 mod vfs;
 
 use core::sync::atomic::AtomicU64;

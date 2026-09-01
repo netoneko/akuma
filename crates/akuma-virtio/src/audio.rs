@@ -24,7 +24,7 @@
 #[derive(Debug, Clone, Copy)]
 // With the `sound` feature off, the stub API only ever yields `NotInitialized`;
 // the other variants describe real-driver failures and would be dead code.
-#[cfg_attr(not(feature = "sound"), allow(dead_code))]
+#[cfg_attr(any(not(feature = "sound"), feature = "platform-firecracker"), allow(dead_code))]
 pub enum AudioError {
     /// Device not found on the bus
     NotFound,
@@ -56,17 +56,17 @@ pub const SNDCTL_DSP_CHANNELS: u32 = 0xC0045006;
 
 /// OSS format: signed 16-bit little-endian PCM.
 // Consumed only by the real driver (sound on); part of the documented ABI.
-#[cfg_attr(not(feature = "sound"), allow(dead_code))]
+#[cfg_attr(any(not(feature = "sound"), feature = "platform-firecracker"), allow(dead_code))]
 pub const AFMT_S16_LE: i32 = 0x00000010;
 /// OSS format: unsigned 8-bit PCM.
-#[cfg_attr(not(feature = "sound"), allow(dead_code))]
+#[cfg_attr(any(not(feature = "sound"), feature = "platform-firecracker"), allow(dead_code))]
 pub const AFMT_U8: i32 = 0x00000008;
 
 // ============================================================================
 // Feature ON: real driver
 // ============================================================================
 
-#[cfg(feature = "sound")]
+#[cfg(all(feature = "sound", not(feature = "platform-firecracker")))]
 mod imp {
     use super::{AudioError, AFMT_S16_LE, AFMT_U8};
     use core::cell::UnsafeCell;
@@ -298,7 +298,7 @@ mod imp {
 // Feature OFF: stubs so the syscall layer still compiles
 // ============================================================================
 
-#[cfg(not(feature = "sound"))]
+#[cfg(any(not(feature = "sound"), feature = "platform-firecracker"))]
 mod imp {
     use super::AudioError;
 
