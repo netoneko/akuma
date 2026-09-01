@@ -24,6 +24,31 @@ receive buffer was too small to open Firecracker's delivery gate (§4), and with
 `RX_BUFFER_LEN = 65568` the DHCP handshake completes, which it cannot do without
 inbound frames. `--vcpus 1` is still the only tested topology here.
 
+## Known unstable here: `thread_slot_reclaim_on_spawn`
+
+**2026-09-01, under Lima nested virt on Apple silicon:** the boot suite reports
+`PASSED=305 FAILED=1`, and the one failure is always
+
+```
+[Test] thread_slot_reclaim_on_spawn FAILED: hot_reclaim=85 (want 0,
+       in_cooldown_window=true) respawn_ok=true gated_from_other_thread=0 (want 0)
+```
+
+Treat it as **unstable on Firecracker, not as a regression.** Evidence:
+
+- A/B'd the same day against a stashed-clean tree: **both arms report exactly
+  `PASSED=305 FAILED=1`**, same test, on the same host.
+- The same build passes the full suite on QEMU at `SMP=4 MEMORY=2048M`:
+  265 pass, 0 fail.
+- The assertion is a *timing* property — `in_cooldown_window=true` says the
+  reclaim happened inside a window the test expects to suppress it — and this
+  host is a Firecracker microVM inside a Lima VM inside macOS. The AWS
+  `m6g.metal` run above (real hardware, 1 vCPU) reported `292/0/0`.
+
+So the useful signal from a Firecracker run here is **`FAILED` going above 1, or
+this line changing to a different test**, not `FAILED=0`. Anything that touches
+thread-slot reclaim or the scheduler cooldown should be checked on metal.
+
 - Procedure: `docs/runbooks/run-on-firecracker.md`
 - Platform invariants and constants: `docs/reference/firecracker/`
 - How it got here, and the five bugs it exposed:

@@ -99,6 +99,20 @@ move needs a decision first:
 
 Neither is hard. Both have to be *chosen*, and neither is a file move.
 
+**Measured 2026-09-01, and it is the cheap option that wins.**
+`make_test_process` is 42 lines with **zero `crate::` references** — it
+constructs an `akuma_exec::process::Process` out of nothing but `akuma_exec`,
+`akuma_isolation`, `akuma_terminal`, `alloc`, `spinning_top` and `core`. So it
+can move down beside the types it builds and the back-edge disappears, without
+touching the 30 gated blocks at all.
+
+Note also which direction is *not* a problem. The test files call **578
+`crate::syscall::` references across 63 distinct symbols** (`process_tests.rs`
+alone 352, `sync_tests.rs` 118, `tests.rs` 72). That is binary → crate, the
+direction Cargo is happy with, and a `src/syscall.rs` shim re-exporting the crate
+keeps every one of those call sites spelled exactly as it is today — the same
+trick §7.1 and §7.2 used. **The 578 are not work; the 4 are.**
+
 ## Blocker 3 — 19 outbound clusters, 160 distinct symbols
 
 The raw reference count is misleading in both directions, so here it is split by
@@ -238,46 +252,19 @@ The dependency is `optional = true` behind `sc-sysv-ipc`, exactly as the module
 it replaced was gated: **a crate split must not quietly re-add 440 lines to the
 `extreme-size` floor.**
 
-### 7.3 `akuma-vfs-glue` — 2,763 lines
+### 7.3 `akuma-vfs-glue` — 2,935 lines
 
 The mount table, per-box namespaces, the ext2-over-virtio adapter and `/proc`.
-`akuma-vfs` owns the *vocabulary* (`Filesystem`, `DirEntry`, `FsError`,
-`MountTable`); this crate owns the kernel's single **instance** of it.
+Four function pointers and six consts are all it still needs from the binary.
 
-Its outbound surface priced out at 20 distinct symbols / 47 refs — an order of
-magnitude cheaper than `src/syscall/`'s 160 / 900+ — and **checking each one
-before writing a hook is what kept the hooks struct at four members**:
-
-| looked binary-local | actually |
-|---|---|
-| `crate::block` (4 symbols) | a re-export of `akuma_virtio::block` |
-| `crate::pmm::stats` | `akuma_pmm::stats` |
-| `crate::file_page_cache::{invalidate_inode,len}` | `akuma_fpcache::` |
-| `crate::timer::uptime_us` | `akuma_primitives::clock::uptime_us` |
-
-What was left is genuinely the binary's: an inline `mod audio` in `main.rs`,
-`fs::exists`, `smp_shared::probed_core_count`, and `timer::utc_time_us` (which
-needs the binary's boot uptime to turn monotonic microseconds into UTC). Four
-function pointers, on the `ExceptionHooks` model, unregistered-is-quiet.
-
-Three things went wrong and are worth repeating:
-
-- **A brace-form `use` slipped the symbol survey.** The regex counting
-  `crate::config::NAME` never matched `use crate::config::{MAX_THREADS,
-  PROC_STDOUT_MAX_SIZE}`. Two more consts, found by the compiler. Grep for
-  `use crate::x::{` separately.
-- **The crate needed a `build.rs`, and its absence would have been silent.**
-  `proc.rs`'s `active_core_count` is `#[cfg(kernel_smp_shared)]` with a `1`
-  fallback, and it sizes the per-core CPU-time accounting `/proc` reports.
-  Without the cfg forwarded, the crate compiles the fallback **even under real
-  SMP** — no build error, no runtime error, just `/proc` dividing by one core on
-  a four-core machine. `akuma-exec` shipped this exact bug for its
-  `kernel_profile_extreme` gates. Any crate carved out of `src/` inherits every
-  `kernel_*` cfg its code reads, and cfgs do not travel with the code.
-- **Four binary features gate the moved code** (`sc-containers` ×8, `sc-reboot`,
-  `sc-sysv-ipc`) and had to be declared on the crate and forwarded. The symptom
-  is `cannot find function … in module crate::vfs` against a `pub fn` that plainly
-  exists — a feature-gated item, not a visibility problem.
+**Written up on its own:
+[`AKUMA_VFS_GLUE_EXTRACTION.md`](AKUMA_VFS_GLUE_EXTRACTION.md)** — why
+`akuma-vfs` was not enough (30 of the 37 functions `src/syscall/` calls are
+defined in the layer, none are re-exports), how the hooks struct stayed at four
+members, and the three things that went wrong: a `build.rs` whose absence would
+have silently mis-sized `/proc`'s per-core accounting under SMP, four binary
+features that read as missing functions, and config-by-handover costing a page
+of `extreme-size` by killing const-folding.
 
 ### 7.4 What it cost
 
