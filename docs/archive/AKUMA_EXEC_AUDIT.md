@@ -198,6 +198,93 @@ that removes the site rather than legalising it. `address_space` at 202
 references is a mechanical but wide change and should be its own commit, most
 likely behind a private field plus an accessor rather than a bare type swap.
 
+## 5-bis. Correction: these can be made **safe**, not merely sound (2026-09-01)
+
+§5 and §6 below said the fix "legalises the `unsafe` rather than removing it",
+and proposed `UnsafeCell` plus accessors. **That was wrong**, and it was wrong by
+anchoring on the first mechanism that came to mind instead of auditing the
+fields. Corrected here; §6's order is updated to match.
+
+### The anti-pattern is a lock that guards nothing
+
+```rust
+pub vm_lock: Spinlock<()>,          // a lock guarding nothing
+pub mmap_regions: Vec<MmapRegion>,  // ...and the data it "guards", beside it
+```
+
+There is no way to obtain `&mut` from a `Spinlock<()>`, so the code reaches
+around it with `&mut *(addr_of!(self.field) as *mut T)`. Putting the data
+**inside** the lock — `Spinlock<Vec<MmapRegion>>` — hands out `&mut` safely and
+makes the lock/data pairing compiler-checked instead of comment-checked. Zero
+`unsafe`, not sound-but-unsafe.
+
+`Process` already does this correctly **one field over**:
+`lazy_regions: Spinlock<LazyRegionMap>`. The idiom was in the same struct the
+whole time.
+
+### What the audit of the fields actually found
+
+`ProcessMemory` has seven fields, and only **one** of them is a mutable
+aggregate:
+
+| field | mutated after `new()`? |
+|---|---|
+| `code_end`, `brk`, `stack_bottom`, `stack_top`, `mmap_limit` | **no** — set at construction, never assigned again |
+| `next_mmap` | yes, and it is **already an `AtomicUsize`** (CAS'd for `CLONE_VM` siblings) |
+| `free_regions: Vec<(usize, usize)>` | **yes — the only one** |
+
+So the whole of `vm_alloc_mmap`/`vm_free_mmap`'s `unsafe` exists to reach one
+`Vec`. `free_regions: Spinlock<Vec<(usize, usize)>>` removes it outright and lets
+both methods keep their `&self`.
+
+### Splitting `vm_lock` is safe, and here is the evidence
+
+`vm_lock` nominally guards `mmap_regions` *and* `ProcessMemory::free_regions`.
+There are exactly **four** `vm_lock.lock()` sites in the tree:
+
+| site | touches |
+|---|---|
+| `mod.rs:904` `vm_with_regions` | `mmap_regions` only |
+| `mod.rs:934` `vm_alloc_mmap` | `free_regions` only |
+| `mod.rs:949` `vm_free_mmap` | `free_regions` only |
+| `mod.rs:1189` `set_brk` | nothing, since §5a — the store is atomic |
+
+**No site holds it across both fields.** Two callers that want an allocate-then-
+record sequence already take and drop the lock twice, so a competing thread can
+already interleave between them; per-field locks remove no exclusion that exists
+today.
+
+### `address_space` needs a different shape, and it is not "just wrap it"
+
+Naively wrapping `UserAddressSpace` in a `Spinlock` makes every reader acquire
+it, and most readers are deliberately lock-free scalar getters on the fault path:
+
+| accessor | n | kind |
+|---|---:|---|
+| `l0_phys()` (`self.l0_frame.addr`) | 42 | scalar |
+| `track_user_frame` | 24 | mutation |
+| `map_page` | 14 | mutation |
+| `track_page_table_frame` | 12 | mutation |
+| `ttbr` | 11 | scalar |
+| `is_shared()` | 6 | scalar |
+
+~59 of them are scalars. And `as_lock` already has documented deadlock
+discipline — `mod.rs:193` describes chunking holds to avoid "this core holding
+`as_lock` while a nested IRQ hard-spins for the BKL, against a peer holding the
+BKL and waiting on `as_lock` in `munmap`". Making every reader acquire it widens
+that surface considerably.
+
+The shape that works is a **split**, not a wrapper: the scalars
+(`l0_phys`, `asid`, `is_shared`, `ttbr`) become atomics on `Process`, read
+lock-free as they are today; the mutating operations move inside
+`Spinlock<UserAddressSpace>`, reached through `with_address_space`, which is
+already exactly that accessor — so those call sites do not change shape at all.
+
+**That is a change to the locking model, not a wrapper swap**, and it needs its
+own plan: `l0_phys` changing under a lock-free reader is precisely the
+page-table-UAF class (`PAGE_TABLE_UAF_TTBR_GATE_FIX`). Do `memory`/
+`mmap_regions` first as a proof of the pattern.
+
 ## 5a. Landed: `Process::brk` -> `AtomicUsize` (2026-09-01)
 
 The first of the six, and the only one that could be *removed* rather than

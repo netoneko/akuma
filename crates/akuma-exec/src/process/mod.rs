@@ -591,7 +591,7 @@ pub struct Process {
     ///
     /// `AtomicUsize`, not `usize`: [`Process::set_brk`] takes `&self`, and the
     /// store used to go through `&mut *(addr_of!(self.brk) as *mut usize)`. The
-    /// `vm_lock` that guards it gives real mutual exclusion, but a `&mut`
+    /// `vm_lock` that guarded it gave real mutual exclusion, but a `&mut`
     /// derived from `&self` to a field that is not in a cell is UB under the
     /// aliasing model no matter how well locked it is — a lock provides
     /// exclusion, not provenance. An atomic says exactly what the old doc
@@ -610,7 +610,13 @@ pub struct Process {
     pub exited: bool,
     pub exit_code: i32,
     pub dynamic_page_tables: Vec<PhysFrame>,
-    pub mmap_regions: Vec<MmapRegion>,
+    /// mmap region bookkeeping.
+    ///
+    /// Inside the lock, not beside a `Spinlock<()>` — see
+    /// `docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis. `vm_with_regions` used to reach
+    /// around the old `vm_lock` with `&mut *(addr_of!(..) as *mut Vec<_>)`
+    /// because there is no way to get `&mut` out of a lock that guards nothing.
+    pub mmap_regions: Spinlock<Vec<MmapRegion>>,
     /// Per-process demand-paged lazy regions, keyed by `start_va`. Owned here
     /// (not in a global table) so a `BTreeMap::insert` that OOMs under the lock
     /// cannot self-deadlock on teardown — the field drops inside `Process::drop`
@@ -658,13 +664,12 @@ pub struct Process {
     /// — no allocation, file I/O, mapping, or frame-free is performed while it is
     /// held (those happen on the returned frames after the lock is released), so it
     /// can never be held across a yield.
-    pub vm_lock: Spinlock<()>,
     /// Serializes hardware page-table mutation for this address space across cores
     /// under shared-kernel SMP (real M5b). The BKL-free user page-fault path takes
     /// this (instead of the BKL) for its short PTE-install window; every AS-mutating
     /// syscall (`mmap`/`munmap`/`mprotect`/`brk`/teardown/CoW-mark) takes it in
     /// addition to the BKL it already holds, so a concurrent fault on the same
-    /// address space excludes correctly. Unlike [`Process::vm_lock`] (which guards
+    /// address space excludes correctly. Unlike the former `vm_lock` (which guarded
     /// only the `mmap_regions` `Vec` for pure Vec ops), this covers the raw
     /// page-table writes in `mmu::map_user_page*` / `AddressSpace::{un,}map_page`.
     /// Held only for short windows with preemption disabled — NEVER across alloc,
@@ -690,7 +695,7 @@ pub struct Process {
 /// own `pid`. Everything else was either byte-identical inheritance from the
 /// parent or a fresh per-child constant, and now lives in one place:
 /// [`Process::inherit_from`]. (`docs/archive/COW_PILE_AUDIT.md` §2 counted nine
-/// divergences; the other three — `fault_mutex`, `as_lock`, `vm_lock` — are
+/// divergences; the other two — `fault_mutex`, `as_lock` — are
 /// `fresh` at all three sites and so are not divergences at all. See
 /// `inherit_from` for why fresh-per-child is deliberate even on a shared
 /// address space.)
@@ -846,7 +851,7 @@ impl Process {
             // `fork` replaces this with `inherit_mmap_regions_for_cow_child`;
             // `vfork`/`clone_thread` leave it empty and see the parent's mappings
             // through the shared L0.
-            mmap_regions: Vec::new(),
+            mmap_regions: Spinlock::new(Vec::new()),
             // Per-process, dropped in `Process::drop`. `fork` propagates the
             // parent thread-group leader's descriptors into it before
             // registration; `clone_thread` calls `clone_lazy_regions` after.
@@ -873,11 +878,10 @@ impl Process {
             // "three fresh locks on a shared address space" row — which flags this
             // as suspect precisely because the reason lives at one call site.
             //
-            // `vm_lock` guards `mmap_regions`/`ProcessMemory::free_regions`, both
+            // `mmap_regions`/`ProcessMemory::free_regions` each hold their own lock, both
             // of which ARE per-`Process` (see the empty `mmap_regions` above), so a
             // fresh lock is simply correct there.
             fault_mutex: Spinlock::new(BTreeMap::new()),
-            vm_lock: Spinlock::new(()),
             as_lock: Spinlock::new(()),
 
             start_time_us: (runtime().uptime_us)(),
@@ -889,7 +893,7 @@ impl Process {
     }
 
     /// Run `f` with exclusive access to [`Process::mmap_regions`], serialized by
-    /// [`Process::vm_lock`] with IRQs disabled. This is the ONLY sanctioned way to
+    /// [`Process::mmap_regions`]'s own lock with IRQs disabled. This is the ONLY sanctioned way to
     /// touch `mmap_regions` — it prevents the data race where CLONE_VM threads
     /// concurrently push/remove/iter the shared `Vec` and corrupt it (kernel hang
     /// under llama's graph-buffer mmap burst).
@@ -897,60 +901,50 @@ impl Process {
     /// `f` MUST perform only pure `Vec` operations (push/remove/iter/clone) and
     /// MUST NOT allocate frames, map pages, free frames, read files, or yield —
     /// return any frames to unmap/free and do that work AFTER this returns, with
-    /// the lock released. Holding `vm_lock` across a yield/alloc would risk a
+    /// the lock released. Holding it across a yield/alloc would risk a
     /// single-core deadlock.
     pub fn vm_with_regions<R>(&self, f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> R {
         with_irqs_disabled(|| {
-            let _g = self.vm_lock.lock();
-            // SAFETY: `vm_lock` (held here) serializes every `vm_with_regions`
-            // caller across the thread group, so this is the unique live
-            // reference to `mmap_regions` for the closure's duration. Interior
-            // mutability via raw pointer is required because the field is a plain
-            // `Vec` and callers hold only `&Process` (the address-space owner is
-            // already aliased `&mut` across CLONE_VM threads by `lookup_process`).
-            let regions = unsafe {
-                &mut *(core::ptr::addr_of!(self.mmap_regions)
-                    as *mut Vec<MmapRegion>)
-            };
-            f(regions)
+            // The lock now holds the data, so the `&mut` comes from the guard
+            // instead of a cast. IRQs stay masked around the hold for the same
+            // reason as before: an IRQ handler that took this lock would
+            // self-deadlock on a single core.
+            let mut regions = self.mmap_regions.lock();
+            f(&mut regions)
         })
     }
 
-    /// Allocate `size` bytes of mmap VA space, serialized by the SAME
-    /// [`Process::vm_lock`] that guards [`Process::mmap_regions`]. `ProcessMemory::
-    /// alloc_mmap`'s free-list fast path (`free_regions`) was, before this, a plain
-    /// unguarded `Vec` — exclusivity relied entirely on the BKL, which is not just a
-    /// gap for any future BKL-free mm-syscall carve-out but a live bug today: an IRQ
-    /// preemption of a CLONE_VM sibling thread mid-`alloc_mmap` (the exact race class
-    /// `vm_lock` itself was introduced to close for `mmap_regions`, see that field's
-    /// doc comment) can interleave a second thread's `alloc_mmap`/`free_mmap` call on
-    /// the same `free_regions` `Vec`. Reusing `vm_lock` costs nothing new: `alloc_mmap`
-    /// is already a pure bump-pointer/free-list operation with no allocation, I/O, or
-    /// yield, matching `vm_lock`'s existing discipline exactly. `next_mmap`'s own CAS
-    /// (see [`ProcessMemory::alloc_mmap`]) still stands for callers that can't take
-    /// this lock, but every syscall-level caller should go through this method now.
+    /// Allocate `size` bytes of mmap VA space, serialized by
+    /// [`ProcessMemory::free_regions`]'s own lock.
+    ///
+    /// That free list was, before the lock existed, a plain unguarded `Vec` —
+    /// exclusivity relied entirely on the BKL, which is both a gap for any future
+    /// BKL-free mm-syscall carve-out and a live bug: an IRQ preemption of a
+    /// CLONE_VM sibling thread mid-`alloc_mmap` can interleave a second thread's
+    /// `alloc_mmap`/`free_mmap` on the same `Vec`.
+    ///
+    /// It was closed by a `Spinlock<()>` named `vm_lock` sitting *beside* the data
+    /// — which gave real exclusion but no way to obtain `&mut`, so this method
+    /// reached around it with a cast from `&self`. The `Vec` is inside its own
+    /// lock as of 2026-09-01 and the cast is gone
+    /// (`docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis). The hold stays short for the
+    /// same reason as before: `alloc_mmap` is a pure bump-pointer/free-list
+    /// operation with no allocation, I/O or yield inside it.
+    ///
+    /// `next_mmap`'s own CAS (see [`ProcessMemory::alloc_mmap`]) still stands for
+    /// callers that can't take this lock, but every syscall-level caller should
+    /// go through this method.
     pub fn vm_alloc_mmap(&self, size: usize) -> Option<usize> {
-        with_irqs_disabled(|| {
-            let _g = self.vm_lock.lock();
-            // SAFETY: `vm_lock` (held here) serializes every `vm_alloc_mmap`/
-            // `vm_free_mmap` caller across the thread group, so this is the unique
-            // live reference to `memory` for the closure's duration — same
-            // reasoning as `vm_with_regions`'s `mmap_regions` access.
-            let memory = unsafe { &mut *(core::ptr::addr_of!(self.memory) as *mut ProcessMemory) };
-            memory.alloc_mmap(size)
-        })
+        // `alloc_mmap` takes `&self` now and locks `free_regions` itself; the five
+        // other `ProcessMemory` fields it reads are immutable after `new()`.
+        with_irqs_disabled(|| self.memory.alloc_mmap(size))
     }
 
     /// Return `[start, start+size)` to the mmap free-list. Counterpart to
-    /// [`Process::vm_alloc_mmap`] — see that method's doc for why this needs
-    /// `vm_lock` at all.
+    /// [`Process::vm_alloc_mmap`] — see that method's doc for why this is locked
+    /// at all.
     pub fn vm_free_mmap(&self, start: usize, size: usize) {
-        with_irqs_disabled(|| {
-            let _g = self.vm_lock.lock();
-            // SAFETY: see `vm_alloc_mmap`.
-            let memory = unsafe { &mut *(core::ptr::addr_of!(self.memory) as *mut ProcessMemory) };
-            memory.free_mmap(start, size);
-        })
+        with_irqs_disabled(|| self.memory.free_mmap(start, size));
     }
 
     /// Run `f` holding this address space's page-table lock ([`Process::as_lock`])
@@ -1181,14 +1175,12 @@ impl Process {
                 page += 0x1000;
             }
         }
-        with_irqs_disabled(|| {
-            // The lock is kept: it no longer protects the store itself (an atomic
-            // needs no lock) but still orders it against the other `vm_*`
-            // bookkeeping under the same lock. Dropping it would be a separate
-            // change to the locking discipline, not part of making this sound.
-            let _g = self.vm_lock.lock();
-            self.brk.store(new_brk, Ordering::Relaxed);
-        });
+        // No lock and no IRQ masking: `brk` is an atomic, and since
+        // `mmap_regions`/`free_regions` moved inside their own locks there is no
+        // longer any other `vm_*` bookkeeping to order against. `vm_lock` — a
+        // `Spinlock<()>` guarding nothing, which is what forced the old cast —
+        // is gone. See `docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis.
+        self.brk.store(new_brk, Ordering::Relaxed);
         new_brk
     }
 
@@ -2586,7 +2578,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     if lifecycle_trace_on() {
         crate::safe_print!(128, "[FORK-DBG] parent_pid={} child_pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
             parent_pid, child_pid, parent.brk.load(Ordering::Relaxed), parent.memory.code_end,
-            parent.mmap_regions.len(),
+            parent.mmap_regions.lock().len(),
             parent.lazy_regions.lock().len());
     }
 
@@ -2779,7 +2771,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let mut needed: usize = 0;
             table::for_each_process(|p| {
                 if p.tgid == parent_tgid && p.pid != parent_pid {
-                    needed += p.mmap_regions.iter().filter(|r| r.pages > 0).count();
+                    needed += p.mmap_regions.lock().iter().filter(|r| r.pages > 0).count();
                 }
             });
 
@@ -2787,7 +2779,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let mut overflow = false;
             table::for_each_process(|p| {
                 if p.tgid == parent_tgid && p.pid != parent_pid {
-                    for region in &p.mmap_regions {
+                    for region in p.mmap_regions.lock().iter() {
                         if region.pages > 0 {
                             if ranges.len() < ranges.capacity() {
                                 ranges.push((region.start_va, region.len_bytes()));
@@ -2864,7 +2856,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md: a grandchild of the
             // process that ran `mmap` (`( cmd; cmd ) &` — shell forks a subshell,
             // subshell forks to exec) faulted on musl's first malloc arena.
-            for region in &parent.mmap_regions {
+            for region in parent.mmap_regions.lock().iter() {
                 if region.pages == 0 {
                     continue;
                 }
@@ -2908,7 +2900,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         // not owned.  On write fault, new frames are allocated and tracked in
         // user_frames.  We keep each region's VA *and page count* so munmap can
         // size it and so this child's own forks can share it (see `MmapRegion`).
-        new_proc.mmap_regions = inherit_mmap_regions_for_cow_child(&parent.mmap_regions);
+        *new_proc.mmap_regions.lock() = inherit_mmap_regions_for_cow_child(&parent.mmap_regions.lock());
         // NOTE: `new_proc.lazy_regions` is deliberately NOT cleared here — the
         // parent's descriptors were propagated into it above, and wiping them
         // reinstates the first-touch SIGSEGV of
@@ -2977,7 +2969,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         lifecycle_trace("[FORK-DBG] step4: interp done\n");
 
         const MAX_FORK_MMAP_PAGES: usize = 2048;
-        let mmap_snapshot: Vec<MmapRegion> = parent.mmap_regions.clone();
+        let mmap_snapshot: Vec<MmapRegion> = parent.mmap_regions.lock().clone();
         // RAII so a `?` early-return (OOM mid-copy) can't strand the flag set for the
         // rest of the boot, as the bare store/store pair did.
         let _forking = ForkInProgressGuard::new();
@@ -3058,7 +3050,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             }
         }
 
-        new_proc.mmap_regions = child_mmap_regions;
+        *new_proc.mmap_regions.lock() = child_mmap_regions;
         // `new_proc.lazy_regions` starts empty and is filled by the propagation
         // just below; clearing it here would undo that (see the CoW arm's note).
         new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -3884,11 +3876,10 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
         exited: false, exit_code: 0,
-        dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
+        dynamic_page_tables: Vec::new(), mmap_regions: Spinlock::new(Vec::new()),
         lazy_regions: Spinlock::new(LazyRegionMap::new()),
         fds: Arc::new(SharedFdTable::new()),
         fault_mutex: Spinlock::new(alloc::collections::BTreeMap::new()),
-        vm_lock: Spinlock::new(()),
         as_lock: Spinlock::new(()),
         thread_id: None, spawner_pid: None,
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),

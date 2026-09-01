@@ -2903,7 +2903,7 @@ fn test_high_volume_small_allocs_no_leak() -> bool {
 fn test_alloc_mmap_non_overlapping() -> bool {
     console::print("\n[TEST] alloc_mmap: non-overlapping addresses\n");
 
-    let mut mem = akuma_exec::process::ProcessMemory::new(
+    let mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
 
@@ -2940,7 +2940,7 @@ fn test_alloc_mmap_non_overlapping() -> bool {
 fn test_alloc_mmap_free_region_recycling() -> bool {
     console::print("\n[TEST] alloc_mmap: free region recycling\n");
 
-    let mut mem = akuma_exec::process::ProcessMemory::new(
+    let mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
 
@@ -2948,7 +2948,7 @@ fn test_alloc_mmap_free_region_recycling() -> bool {
     let _a2 = mem.alloc_mmap(0x4000).unwrap();
     let bump_after = mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
 
-    mem.free_regions.push((a1, 0x4000));
+    mem.free_regions.lock().push((a1, 0x4000));
 
     // Should reuse the freed region, not bump
     let a3 = mem.alloc_mmap(0x2000).unwrap();
@@ -3443,7 +3443,7 @@ fn test_map_user_page_roundtrip() -> bool {
 fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
     console::print("\n[TEST] munmap: sub-range of eager alloc is no-op\n");
 
-    let mut mem = akuma_exec::process::ProcessMemory::new(
+    let mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
 
@@ -3514,11 +3514,10 @@ fn make_test_process(
         stdin: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         exited: false, exit_code: 0,
-        dynamic_page_tables: Vec::new(), mmap_regions: Vec::new(),
+        dynamic_page_tables: Vec::new(), mmap_regions: spinning_top::Spinlock::new(Vec::new()),
         lazy_regions: Spinlock::new(akuma_exec::process::LazyRegionMap::new()),
         fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new()),
         fault_mutex: Spinlock::new(BTreeMap::new()),
-        vm_lock: Spinlock::new(()),
         as_lock: Spinlock::new(()),
         thread_id: None, spawner_pid: None,
         terminal_state: alloc::sync::Arc::new(Spinlock::new(
@@ -3542,7 +3541,7 @@ fn make_test_process(
 fn test_mmap_does_not_overlap_identity_map() -> bool {
     console::print("\n[TEST] MMU: mmap allocator avoids kernel identity map\n");
 
-    let mut mem = akuma_exec::process::ProcessMemory::new(
+    let mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000, 0xD000_0000, 0xD010_0000, 0x0,
     );
 
@@ -3887,11 +3886,11 @@ fn test_clone_vm_mmap_regions_on_owner() -> bool {
     let child_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new_shared(l0) { a } else { console::print("  OOM (child AS)\n"); return false; };
     let info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
-    let mut parent_proc = make_test_process(parent_pid, 0, parent_as, info.addr);
+    let parent_proc = make_test_process(parent_pid, 0, parent_as, info.addr);
 
     // Simulate an eager mmap on the parent
     let test_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
-    parent_proc.mmap_regions.push(akuma_exec::process::MmapRegion::owned(0x6809_d000, vec![test_frame]));
+    parent_proc.mmap_regions.lock().push(akuma_exec::process::MmapRegion::owned(0x6809_d000, vec![test_frame]));
 
     let child_proc = make_test_process(child_pid, parent_pid, child_as, info.addr);
 
@@ -3899,9 +3898,9 @@ fn test_clone_vm_mmap_regions_on_owner() -> bool {
     akuma_exec::process::register_process(child_pid, child_proc);
 
     let parent_regions = akuma_exec::process::lookup_process_shared(parent_pid)
-        .map_or(0, |p| p.mmap_regions.len());
+        .map_or(0, |p| p.mmap_regions.lock().len());
     let child_regions = akuma_exec::process::lookup_process_shared(child_pid)
-        .map_or(0, |p| p.mmap_regions.len());
+        .map_or(0, |p| p.mmap_regions.lock().len());
 
     // Cleanup. Free the manually-injected mmap frames while the process is still
     // ACTIVE (and thus visible to lookup_process) — unregister_process now retires
@@ -3943,7 +3942,7 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
     let worker_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new_shared(l0) { a } else { console::print("  OOM\n"); return false; };
     let info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
-    let mut owner_proc = make_test_process(owner_pid, 0, owner_as, info.addr);
+    let owner_proc = make_test_process(owner_pid, 0, owner_as, info.addr);
     let worker_proc = make_test_process(worker_pid, owner_pid, worker_as, info.addr);
 
     // 127-page eager mmap tracked on the owner
@@ -3957,7 +3956,7 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
             return false;
         }
     }
-    owner_proc.mmap_regions.push(akuma_exec::process::MmapRegion::owned(region_base, frames));
+    owner_proc.mmap_regions.lock().push(akuma_exec::process::MmapRegion::owned(region_base, frames));
 
     akuma_exec::process::register_process(owner_pid, owner_proc);
     akuma_exec::process::register_process(worker_pid, worker_proc);
@@ -3968,7 +3967,7 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
 
     // Search via owner PID (correct path after fix)
     let found_via_owner = akuma_exec::process::lookup_process_shared(owner_pid).and_then(|p| {
-        for reg in &p.mmap_regions {
+        for reg in p.mmap_regions.lock().iter() {
             if reg.contains(page_va) {
                 return Some((reg.start_va, reg.pages));
             }
@@ -3978,7 +3977,7 @@ fn test_clone_vm_eager_fallback_finds_region() -> bool {
 
     // Search via worker PID (broken path before fix)
     let found_via_worker = akuma_exec::process::lookup_process_shared(worker_pid).and_then(|p| {
-        for reg in &p.mmap_regions {
+        for reg in p.mmap_regions.lock().iter() {
             if reg.contains(page_va) {
                 return Some((reg.start_va, reg.pages));
             }
@@ -5387,7 +5386,7 @@ fn test_arena_trim_crash_pattern() -> bool {
 
     // ProcessMemory with enough VA space: next_mmap at 0x8000_0000,
     // stack/limit at 0x10_0000_0000 (64 GB ceiling).
-    let mut mem = akuma_exec::process::ProcessMemory::new(
+    let mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000,       // code_end
         0x10_0000_0000,    // stack_bottom (64 GB)
         0x10_0001_0000,    // stack_top
@@ -5408,7 +5407,7 @@ fn test_arena_trim_crash_pattern() -> bool {
     // Step 2: munmap entire 8GB — removes lazy region, recycles VA
     let results = akuma_exec::process::munmap_lazy_regions_in_range(test_pid, base, LARGE_SIZE);
     let fully_removed = results.len() == 1;
-    mem.free_regions.push((base, LARGE_SIZE));
+    mem.free_regions.lock().push((base, LARGE_SIZE));
 
     // Verify midpoint is now uncovered
     let mid_gone = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, mid).is_none();
@@ -5444,7 +5443,7 @@ fn test_arena_trim_crash_pattern() -> bool {
     ).is_none();
 
     // Verify the remainder is in free_regions (available for future allocs)
-    let remainder_in_free = mem.free_regions.iter().any(|&(start, size)| {
+    let remainder_in_free = mem.free_regions.lock().iter().any(|&(start, size)| {
         start == base + SMALL_SIZE && size == LARGE_SIZE - SMALL_SIZE
     });
 
@@ -5487,7 +5486,7 @@ fn test_multi_arena_trim_crash() -> bool {
     let test_pid = akuma_exec::process::allocate_pid();
     let _proc = LazyTestProcess::new(test_pid);
 
-    let mut mem = akuma_exec::process::ProcessMemory::new(
+    let mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000,
         0x10_0000_0000,
         0x10_0001_0000,
@@ -5537,7 +5536,7 @@ fn test_multi_arena_trim_crash() -> bool {
     let removed = akuma_exec::process::munmap_lazy_regions_in_range(
         test_pid, arena_base, LARGE_SIZE,
     );
-    mem.free_regions.push((arena_base, LARGE_SIZE));
+    mem.free_regions.lock().push((arena_base, LARGE_SIZE));
     let arena_removed = removed.len() == 1;
     let back_to_17 = akuma_exec::process::lazy_region_count_for_pid(test_pid) == 17;
 
@@ -6135,7 +6134,7 @@ fn test_large_mmap_limit() -> bool {
     let stack_bottom = stack_top - USER_STACK_SIZE;
     let mmap_floor = brk + MIN_MMAP_SPACE;
     
-    let mut mem = akuma_exec::process::ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
+    let mem = akuma_exec::process::ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
     
     crate::safe_print!(128, "  Created ProcessMemory: next_mmap={:#x}, mmap_limit={:#x}\n",
         mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit);
@@ -6458,7 +6457,7 @@ fn test_alloc_mmap_skips_kernel_va_hole() -> bool {
     let stack_bot  = stack_top - 2 * 1024 * 1024;
     let mmap_floor = 0x3010_0000;
 
-    let mut mem = akuma_exec::process::ProcessMemory::new(brk, stack_bot, stack_top, mmap_floor);
+    let mem = akuma_exec::process::ProcessMemory::new(brk, stack_bot, stack_top, mmap_floor);
 
     // Manually bump next_mmap to just before kernel hole
     mem.next_mmap.store(KERNEL_VA_START - 4096, core::sync::atomic::Ordering::Relaxed); // one page before hole
@@ -6559,7 +6558,7 @@ fn test_mmap_space_covers_jsc_gigacage() -> bool {
     let stack_top   = core::cmp::min(aligned, MAX_STACK_TOP);
     let stack_bot   = stack_top - STACK_SIZE;
 
-    let mut mem = akuma_exec::process::ProcessMemory::new(brk, stack_bot, stack_top, mmap_floor);
+    let mem = akuma_exec::process::ProcessMemory::new(brk, stack_bot, stack_top, mmap_floor);
 
     const ARENA_1GB: usize = 1024 * 1024 * 1024;
     let addr_1g = mem.alloc_mmap(ARENA_1GB);
@@ -6734,7 +6733,7 @@ fn test_go_binary_va_exhaustion_scenario() -> bool {
     let stack_top_large = core::cmp::min(aligned, MAX_STACK_TOP);
     let stack_bot_large = stack_top_large - STACK_SIZE;
 
-    let mut mem_large = akuma_exec::process::types::ProcessMemory::new(
+    let mem_large = akuma_exec::process::types::ProcessMemory::new(
         brk_go, stack_bot_large, stack_top_large, 0,
     );
 
@@ -7727,7 +7726,7 @@ fn test_mmap_allocator_skips_full_kernel_range() -> bool {
     console::print("\n[TEST] mmap allocator skips full kernel VA range\n");
     let mut pass = true;
 
-    let mut mem = akuma_exec::process::types::ProcessMemory::new(
+    let mem = akuma_exec::process::types::ProcessMemory::new(
         0x3000_0000, // code_end: just below kernel range
         0x1_0000_0000, // stack_bottom
         0x1_0020_0000, // stack_top
@@ -7929,14 +7928,14 @@ fn test_sysinfo_reports_actual_ram() -> bool {
 fn test_alloc_mmap_free_region_skips_kernel_hole() -> bool {
     console::print("\n[TEST] alloc_mmap free_region skips kernel VA hole\n");
 
-    let mut mem = akuma_exec::process::ProcessMemory::new(
+    let mem = akuma_exec::process::ProcessMemory::new(
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
 
-    mem.free_regions.push((0x5000_0000, 0x2000_0000));
+    mem.free_regions.lock().push((0x5000_0000, 0x2000_0000));
 
     let result = mem.alloc_mmap(0x1000);
-    let hole_consumed = mem.free_regions.iter()
+    let hole_consumed = mem.free_regions.lock().iter()
         .all(|&(s, _)| !(0x4000_0000..0x8000_0000).contains(&s));
 
     if let Some(addr) = result
@@ -7945,7 +7944,7 @@ fn test_alloc_mmap_free_region_skips_kernel_hole() -> bool {
             return false;
         }
 
-    let region_preserved = mem.free_regions.iter()
+    let region_preserved = mem.free_regions.lock().iter()
         .any(|&(s, sz)| s == 0x5000_0000 && sz == 0x2000_0000);
 
     if !region_preserved && !hole_consumed {
@@ -8438,7 +8437,7 @@ fn test_mmap_lazy_munmap_no_recycle() -> bool {
     console::print("\n[TEST] mmap lazy munmap does not recycle VA (Go heap prober fix)\n");
 
     // Stack-top chosen to give plenty of mmap space without needing huge VA.
-    let mut mem = akuma_exec::process::ProcessMemory::new(
+    let mem = akuma_exec::process::ProcessMemory::new(
         0x10000, 0x3000_0000, 0x3010_0000, 0,
     );
 

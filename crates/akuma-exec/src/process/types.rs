@@ -15,6 +15,7 @@
 //! is exactly where it already is.
 
 use alloc::vec::Vec;
+use spinning_top::Spinlock;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub use akuma_exec_core::process::*;
@@ -31,7 +32,16 @@ pub struct ProcessMemory {
     /// advance it using CAS without disabling IRQs.
     pub next_mmap: AtomicUsize,
     pub mmap_limit: usize,
-    pub free_regions: Vec<(usize, usize)>,
+    /// Freed mmap VA ranges, available for reuse.
+    ///
+    /// The **only** field here that is mutated after `new()` — the five `usize`
+    /// fields above are set at construction and never assigned again, and
+    /// `next_mmap` is already atomic. It is therefore the only thing the old
+    /// `Process::vm_lock` was really guarding, and the only reason
+    /// `vm_alloc_mmap`/`vm_free_mmap` needed `&mut *(addr_of!(..) as *mut _)`
+    /// from a `&self` method. Holding the data *inside* the lock makes those
+    /// safe (`docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis).
+    pub free_regions: Spinlock<Vec<(usize, usize)>>,
 }
 
 impl Clone for ProcessMemory {
@@ -43,7 +53,7 @@ impl Clone for ProcessMemory {
             stack_top: self.stack_top,
             next_mmap: AtomicUsize::new(self.next_mmap.load(Ordering::Relaxed)),
             mmap_limit: self.mmap_limit,
-            free_regions: self.free_regions.clone(),
+            free_regions: Spinlock::new(self.free_regions.lock().clone()),
         }
     }
 }
@@ -61,7 +71,7 @@ impl ProcessMemory {
             stack_top,
             next_mmap: AtomicUsize::new(mmap_start),
             mmap_limit,
-            free_regions: Vec::new(),
+            free_regions: Spinlock::new(Vec::new()),
         }
     }
 
@@ -78,23 +88,29 @@ impl ProcessMemory {
     /// `kernel_va_end()` for why this must track RAM size.
     pub const KERNEL_VA_END: usize   = 0xC000_0000;
 
-    pub fn alloc_mmap(&mut self, size: usize) -> Option<usize> {
+    pub fn alloc_mmap(&self, size: usize) -> Option<usize> {
         // Dynamic top of the kernel identity-map hole (scales with RAM size).
         let kva_end = crate::mmu::kernel_va_end();
-        for i in 0..self.free_regions.len() {
-            let (start, f_size) = self.free_regions[i];
+        // One hold for the whole first-fit scan-and-splice: the scan reads indices
+        // it then mutates, so releasing between them would let a peer invalidate
+        // `i`. Dropped before the CAS loop below, which touches only `next_mmap`.
+        {
+            let mut free = self.free_regions.lock();
+            for i in 0..free.len() {
+                let (start, f_size) = free[i];
 
-            // Skip regions that overlap the kernel RAM identity map.
-            if start < kva_end && start + f_size > Self::KERNEL_VA_START {
-                continue;
-            }
-
-            if f_size >= size {
-                self.free_regions.remove(i);
-                if f_size > size {
-                    self.free_regions.push((start + size, f_size - size));
+                // Skip regions that overlap the kernel RAM identity map.
+                if start < kva_end && start + f_size > Self::KERNEL_VA_START {
+                    continue;
                 }
-                return Some(start);
+
+                if f_size >= size {
+                    free.remove(i);
+                    if f_size > size {
+                        free.push((start + size, f_size - size));
+                    }
+                    return Some(start);
+                }
             }
         }
 
@@ -132,8 +148,8 @@ impl ProcessMemory {
         }
     }
 
-    pub fn free_mmap(&mut self, start: usize, size: usize) {
-        self.free_regions.push((start, size));
+    pub fn free_mmap(&self, start: usize, size: usize) {
+        self.free_regions.lock().push((start, size));
     }
 }
 

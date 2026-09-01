@@ -163,7 +163,7 @@ impl Process {
         self.brk.store(loaded.brk, Ordering::Relaxed);
         self.initial_brk = loaded.brk;
         self.memory = ProcessMemory::new(loaded.brk, loaded.stack_bottom, loaded.stack_top, loaded.mmap_floor);
-        self.mmap_regions.clear();
+        self.mmap_regions.lock().clear();
         self.lazy_regions.lock().clear();
         self.dynamic_page_tables.clear();
         self.args = args.to_vec();
@@ -313,7 +313,7 @@ impl Process {
             exited: false,
             exit_code: 0,
             dynamic_page_tables: Vec::new(),
-            mmap_regions: Vec::new(),
+            mmap_regions: spinning_top::Spinlock::new(Vec::new()),
             lazy_regions: Spinlock::new(lazy_regions),
             fds: Arc::new(SharedFdTable::with_stdio()),
             thread_id: None,
@@ -333,7 +333,6 @@ impl Process {
             signal_actions: Arc::new(SharedSignalTable::new()),
             signal_mask: 0,
             fault_mutex: Spinlock::new(BTreeMap::new()),
-            vm_lock: Spinlock::new(()),
             as_lock: Spinlock::new(()),
             sigaltstack_sp: 0,
             sigaltstack_flags: 2, // SS_DISABLE
