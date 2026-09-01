@@ -40,20 +40,32 @@ pub fn enable_timer_interrupts(interval_us: u64) {
     akuma_timer::arm_periodic_tick();
 }
 
-/// The scheduler tick the host probe chose (or the compiled default / debug
-/// override). The ISR and secondary cores read this every re-arm, so a
-/// governor demotion takes effect on the next tick without a broadcast.
+/// The scheduler tick the host probe chose (or the compiled default / debug override).
+///
+/// The ISR and secondary cores read this every re-arm, so a governor demotion
+/// takes effect on the next tick without a broadcast.
+#[must_use]
 pub fn current_tick_us() -> u64 {
     akuma_timer::tick_us(crate::config::TIMER_INTERVAL_US)
 }
 
 /// BSP idle/netpoll loop iterations — the runtime governor's spin sensor.
+///
 /// Healthy: ~1 iteration per timer tick (the loop halts in WFI between ticks).
 /// Host that stopped honouring WFI: hundreds of thousands per window
 /// (measured ~1.8M/s at a 1 ms tick on the regression host). Incremented from
 /// the async-main loop (`main.rs`), read/swapped by the governor block in the
 /// ISR below.
 pub static NETPOLL_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Which step of the async-main boot sequence is in flight.
+///
+/// Written only by `main.rs` (`crate::timer::GLOBAL_POLL_STEP` there via a
+/// re-export) and read here by the preemption watchdog to name where a stuck
+/// thread is stuck. Moved from `main.rs` with the watchdog itself rather than
+/// left behind, since this is its only reader.
+pub static GLOBAL_POLL_STEP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Governor observation cadence: every this-many ticks, feed the idle-loop
 /// iteration count to `akuma_timer::policy::governor_observe` and demote the
@@ -99,7 +111,7 @@ pub fn timer_irq_handler(_irq: u32) {
             if now.saturating_sub(last) > 1_000_000 {
                 LAST_WARN_US.store(now, core::sync::atomic::Ordering::Relaxed);
                 // Get poll step to help diagnose where we're stuck
-                let step = crate::GLOBAL_POLL_STEP.load(core::sync::atomic::Ordering::Relaxed);
+                let step = GLOBAL_POLL_STEP.load(core::sync::atomic::Ordering::Relaxed);
                 // Use stack-only print to avoid heap allocation in IRQ context
                 let tid = akuma_exec::threading::current_thread_id();
                 crate::safe_print!(96, "[WATCHDOG] Preemption disabled for {}ms at step {} tid={}\n",
@@ -167,11 +179,12 @@ pub fn timer_irq_handler(_irq: u32) {
 static PROBING_CORE: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
-/// NOP IRQ handler installed while the probe measures WFI: the exception
-/// dispatcher acks/EOIs around us, but the handler itself must disarm the
-/// timer — a one-shot that has fired keeps its level asserted (CVAL <=
-/// counter, enabled), and an unmasked level re-forwards forever after EOI.
-/// The next probe sample re-arms.
+/// NOP IRQ handler installed while the probe measures WFI.
+///
+/// The exception dispatcher acks/EOIs around us, but the handler itself must
+/// disarm the timer — a one-shot that has fired keeps its level asserted
+/// (CVAL <= counter, enabled), and an unmasked level re-forwards forever
+/// after EOI. The next probe sample re-arms.
 ///
 /// **Only the probing core may disarm.** IRQ 27 is a per-CPU PPI, but
 /// `irq::register_handler` writes ONE shared dispatch table (`src/irq.rs:42`),
@@ -214,6 +227,7 @@ pub fn probe_irq_nop(_irq: u32) {
 ///
 /// Skipped (returns the compiled default) on `kernel_profile_extreme`: a 4 MB
 /// single-core box keeps its historical 10 ms and needs no probing.
+#[must_use]
 pub fn probe_host_tick() -> u64 {
     #[cfg(kernel_profile_extreme)]
     {
@@ -242,6 +256,7 @@ pub fn probe_host_tick() -> u64 {
 
 // Read Unix timestamp from PL031 RTC (seconds since Unix epoch)
 // Returns None if RTC is not initialized
+#[must_use]
 pub fn read_rtc_timestamp() -> Option<u32> {
     #[cfg(target_os = "none")]
     {
@@ -255,6 +270,7 @@ pub fn read_rtc_timestamp() -> Option<u32> {
 
 // Initialize UTC time from PL031 RTC
 // Returns true if successful, false if RTC not available
+#[must_use]
 pub fn init_utc_from_rtc() -> bool {
     if let Some(timestamp) = read_rtc_timestamp() {
         // Convert seconds to microseconds
@@ -268,6 +284,7 @@ pub fn init_utc_from_rtc() -> bool {
 
 // Get current UTC time in microseconds since Unix epoch
 // Returns None if UTC time has not been set
+#[must_use]
 pub fn utc_time_us() -> Option<u64> {
     akuma_timer::utc_time_us(uptime_us())
 }
@@ -275,6 +292,7 @@ pub fn utc_time_us() -> Option<u64> {
 // Get current UTC time in seconds since Unix epoch
 // Returns None if UTC time has not been set
 // Used by TLS certificate verification
+#[must_use]
 pub fn utc_seconds() -> Option<u64> {
     utc_time_us().map(|us| us / 1_000_000)
 }
@@ -293,6 +311,7 @@ pub struct DateTime {
 
 impl DateTime {
     // Convert microseconds since Unix epoch to DateTime
+    #[must_use]
     pub fn from_unix_us(us: u64) -> Self {
         let secs = us / 1_000_000;
         let micros = (us % 1_000_000) as u32;
@@ -345,6 +364,7 @@ impl DateTime {
         }
     }
 
+    #[must_use]
     pub fn to_iso8601(&self) -> String {
         format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
@@ -366,6 +386,7 @@ fn is_leap_year(year: u32) -> bool {
 
 // Get current UTC time as ISO 8601
 // Returns "NOT_SET" if UTC time hasn't been configured
+#[must_use]
 pub fn utc_iso8601() -> String {
     match utc_time_us() {
         Some(us) => DateTime::from_unix_us(us).to_iso8601(),

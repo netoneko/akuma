@@ -26,7 +26,7 @@ extern crate alloc;
 /// macro directly now, on its way to `akuma-exceptions`.
 pub use akuma_primitives::{safe_print, tprint};
 
-mod akuma;
+pub use akuma_kernel_core::akuma;
 // The kernel heap moved to `crates/akuma-alloc` on 2026-08-31 to quarantine its
 // 18 `unsafe` sites out of the bin crate (that crate's header explains why it
 // cannot and should not `forbid`). Aliased rather than renamed at ~40 call sites,
@@ -69,10 +69,18 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
 // mod async_net;
 #[cfg(kernel_tests)]
 mod async_tests;
+// The unsafe-free half of the bin crate moved to `akuma-kernel-core`
+// (2026-09-01) so it could carry `#![forbid(unsafe_code)]`; these re-exports
+// keep every `crate::x::y` call site in this file — and in the test modules
+// below, which are staying in `src/` — spelled as it was. `boot`, `console`,
+// `platform`, `smp_shared`, `syscall`, `vfs` and `rump_proxy` stay as real
+// `mod` declarations here: each calls into one of the other five, which carry
+// real `unsafe` and so cannot live in the forbid crate (see
+// `akuma_kernel_core`'s crate doc for which three and why).
 #[cfg(kernel_bkl_profile)]
-mod bkl_profile;
+pub use akuma_kernel_core::bkl_profile;
 mod boot;
-mod config;
+pub use akuma_kernel_core::config;
 #[macro_use]
 mod console;
 #[cfg(kernel_tests)]
@@ -83,21 +91,21 @@ mod daif_tests;
 // The exception path moved to `akuma-exceptions` (2026-09-01). The alias keeps
 // every `exceptions::` call site in this file spelled as it was.
 use akuma_exceptions as exceptions;
-mod file_page_cache;
-mod fs;
+pub use akuma_kernel_core::file_page_cache;
+pub use akuma_kernel_core::fs;
 #[cfg(kernel_tests)]
 mod fs_tests;
-mod irq;
+pub use akuma_kernel_core::irq;
 #[cfg(all(kernel_tests, feature = "smoltcp"))]
 mod network_tests;
 // Device-level NIC counters' console half (`net-profile`). Measurement builds
 // only; see the module docs and `crates/akuma-net/src/nicstat.rs`.
 #[cfg(feature = "net-profile")]
-mod nic_profile;
-mod klog;
-mod ntp_boot;
+pub use akuma_kernel_core::nic_profile;
+pub use akuma_kernel_core::klog;
+pub use akuma_kernel_core::ntp_boot;
 mod platform;
-mod pmm;
+pub use akuma_kernel_core::pmm;
 #[cfg(kernel_tests)]
 mod process_tests;
 #[cfg(kernel_tests)]
@@ -120,7 +128,7 @@ mod sync_tests;
 mod syscall;
 #[cfg(kernel_tests)]
 mod tests;
-mod timer;
+pub use akuma_kernel_core::timer;
 
 // The virtio drivers moved to `akuma-virtio` together with the `Hal` and the
 // MMIO probe loop they shared (docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md
@@ -144,14 +152,14 @@ pub(crate) use akuma_virtio::audio;
 
 mod vfs;
 
-use core::sync::atomic::AtomicU64;
-
 use akuma_exec::{mmu, process, threading};
 use core::panic::PanicInfo;
 
-/// Global poll step counter for debugging hangs.
-/// Used by the timer watchdog to report which step is blocking.
-pub static GLOBAL_POLL_STEP: AtomicU64 = AtomicU64::new(0);
+/// Global poll step counter for debugging hangs, used by the timer watchdog to
+/// report which step is blocking. Moved to `akuma_kernel_core::timer` with the
+/// watchdog itself (2026-09-01); re-exported so the bare name still resolves
+/// at every existing call site in this file.
+pub use akuma_kernel_core::timer::GLOBAL_POLL_STEP;
 
 /// Stop the machine.
 ///

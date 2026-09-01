@@ -20,6 +20,7 @@ dependencies = [
  "akuma-gic",
  "akuma-isolation",
  "akuma-kacho",
+ "akuma-kernel-core",
  "akuma-locks-rw",
  "akuma-net",
  "akuma-net-unix",
@@ -191,6 +192,27 @@ dependencies = [
 [[package]]
 name = "akuma-kacho"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-kernel-core"
+version = "0.1.0"
+dependencies = [
+ "akuma-config",
+ "akuma-cpu",
+ "akuma-exec",
+ "akuma-ext2",
+ "akuma-fpcache",
+ "akuma-gic",
+ "akuma-net",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-syscalls-time",
+ "akuma-timer",
+ "akuma-vfs-glue",
+ "log",
+ "smoltcp",
+ "spinning_top",
+]
 
 [[package]]
 name = "akuma-locks-rw"

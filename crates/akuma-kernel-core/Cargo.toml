@@ -1,0 +1,41 @@
+[package]
+name = "akuma-kernel-core"
+version = "0.1.0"
+edition = "2024"
+description = "Unsafe-free half of the bin crate: config/timer/irq/pmm/vfs-fs shims, klog, boot-time SNTP, and the profiling dumps. The unsafe half (main.rs, smp_shared.rs, console.rs, boot.rs, platform.rs) stays in src/ for now."
+
+[dependencies]
+akuma-config = { path = "../akuma-config" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-exec = { path = "../akuma-exec" }
+akuma-ext2 = { path = "../akuma-ext2" }
+akuma-fpcache = { path = "../akuma-fpcache" }
+akuma-gic = { path = "../akuma-gic" }
+akuma-net = { path = "../akuma-net", default-features = false }
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-syscalls-time = { path = "../akuma-syscalls-time" }
+akuma-timer = { path = "../akuma-timer" }
+akuma-vfs-glue = { path = "../akuma-vfs-glue" }
+log = { version = "0.4", default-features = false }
+spinning_top = "0.3"
+smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
+
+[features]
+# Mirrors the root package's own toggles of the same name — each needs to
+# reach this crate's build.rs so `kernel_tests`/`kernel_profile_extreme`/
+# `kernel_smp_shared` come out the same here as in the bin crate. See
+# `build.rs`.
+extreme = []
+no-tests = []
+# `trigger_sgi_self` (timer.rs) is itself `#[cfg(kernel_smp_shared)]` inside
+# akuma-gic, gated on akuma-gic's OWN feature — forward this one, unlike the
+# other toggles above, which only need to reach this crate's own build.rs.
+smp-shared = ["akuma-gic/smp-shared"]
+net-profile = ["akuma-net/net-profile"]
+bkl-profile = []
+smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
+net-noalloc = ["akuma-net/net-noalloc"]
+
+[lints]
+workspace = true

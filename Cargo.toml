@@ -17,6 +17,7 @@ default-members = [
     "crates/akuma-ext2",
     "crates/akuma-isolation",
     "crates/akuma-kacho",
+    "crates/akuma-kernel-core",
     "crates/akuma-mmap",
     "crates/akuma-mmu",
     "crates/akuma-not-even-once",
@@ -192,7 +193,7 @@ default = [
     # gated and why that reason no longer applies.
     "sc-reboot",
 ]
-no-tests = ["akuma-net/small-sockets", "akuma-exceptions/no-tests", "akuma-exec/no-tests", "akuma-syscalls-glue/no-tests"]
+no-tests = ["akuma-net/small-sockets", "akuma-exceptions/no-tests", "akuma-exec/no-tests", "akuma-syscalls-glue/no-tests", "akuma-kernel-core/no-tests"]
 
 # Target Firecracker's aarch64 microVM instead of QEMU `virt`.
 #
@@ -254,7 +255,7 @@ rump-tests = []
 # passing) and a same-binary `bkl-profile` A/B on the contention regimen
 # (`irq/sched` 24.7% → 10.2%, 6/6 digests exact both sides). Remove from this
 # list to A/B.
-smp-shared = ["akuma-exec/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-exceptions/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq", "akuma-syscalls-glue/smp-shared"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-exceptions/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq", "akuma-syscalls-glue/smp-shared", "akuma-kernel-core/smp-shared"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
 # first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
@@ -381,7 +382,7 @@ no-bkl-irq = ["akuma-exceptions/no-bkl-irq"]
 # kernel entry, so it perturbs timing-sensitive tests — keep it out of
 # `smp-shared` and enable it explicitly:
 #   cargo build --release --features devbox-smoltcp,no-tests,bkl-profile
-bkl-profile = []
+bkl-profile = ["akuma-kernel-core/bkl-profile"]
 
 # Device-level NIC instrumentation (measurement builds only — never ship it).
 # Forwards `akuma-net/net-profile`, which counts per-packet RX/TX/poll timing
@@ -394,7 +395,7 @@ bkl-profile = []
 # run made with it on. Enable explicitly:
 #   cargo build --release --features devbox-smoltcp,no-tests,net-profile
 # Parsed by scripts/benchmarks/bench_nic_rtt.py.
-net-profile = ["akuma-net/net-profile"]
+net-profile = ["akuma-net/net-profile", "akuma-kernel-core/net-profile"]
 
 # Per-stage `read(2)` fixed-cost attribution (measurement builds only — never
 # ship it). Makes `sys_read`'s `File` arm, `handle_syscall` and the EL0 handler
@@ -453,7 +454,7 @@ read-profile = ["akuma-syscalls-glue/read-profile"]
 # during init.
 #
 # Measurements: docs/archive/AKUMA_NET_ISSUES.md §7.
-net-noalloc = ["akuma-net/net-noalloc"]
+net-noalloc = ["akuma-net/net-noalloc", "akuma-kernel-core/net-noalloc"]
 
 # Park blocking socket waiters (`wait_until` in akuma-net) the way every other
 # blocking path in the kernel does: register a waker on the socket, then
@@ -564,7 +565,7 @@ sc-reboot = ["dep:akuma-boot", "akuma-vfs-glue/sc-reboot", "akuma-syscalls-glue/
 # drops it (rump is the only stack) via --no-default-features, which compiles the
 # whole smoltcp path — and the smoltcp-coupled built-in SSH — out. Enables the
 # matching akuma-net feature.
-smoltcp = ["dep:smoltcp", "akuma-net/smoltcp", "akuma-syscalls-glue/smoltcp"]
+smoltcp = ["dep:smoltcp", "akuma-net/smoltcp", "akuma-syscalls-glue/smoltcp", "akuma-kernel-core/smoltcp"]
 
 # virtio-sound output driver (src/audio.rs + /dev/dsp). Enabled by default;
 # dropped by the size/extreme profiles' `--no-default-features` builds. Pulls in
@@ -585,7 +586,7 @@ sound = ["virtio-drivers/alloc", "akuma-virtio/sound"]
 # Forwarded to akuma-exec and akuma-ext2 so their build.rs emits the same cfg
 # (warm-stack floor + kernel-stack right-sizing in akuma-exec; block-cache gate
 # in akuma-ext2).
-extreme = ["akuma-exec/extreme", "akuma-ext2/extreme", "akuma-primitives/extreme", "akuma-vfs-glue/extreme", "akuma-config/extreme", "akuma-syscalls-glue/extreme"]
+extreme = ["akuma-exec/extreme", "akuma-ext2/extreme", "akuma-primitives/extreme", "akuma-vfs-glue/extreme", "akuma-config/extreme", "akuma-syscalls-glue/extreme", "akuma-kernel-core/extreme"]
 
 # Large RAM-sized ext2 block cache with clock eviction (crates/akuma-ext2). Keeps
 # the read-only toolchain resident across the many process spawns in a self-host
@@ -717,6 +718,12 @@ akuma-gic = { path = "crates/akuma-gic" }
 akuma-bkl = { path = "crates/akuma-bkl" }
 akuma-fpcache = { path = "crates/akuma-fpcache" }
 akuma-kacho = { path = "crates/akuma-kacho" }
+# The unsafe-free half of this bin crate: config/timer/irq/pmm/fs shims, klog,
+# boot-time SNTP, the bkl-profile/net-profile dumps. Extracted 2026-09-01 so it
+# could carry `#![forbid(unsafe_code)]` — see its lib.rs header for the three
+# modules deliberately left behind (they call into `smp_shared`/`console`,
+# which stay in `src/` until their own extraction).
+akuma-kernel-core = { path = "crates/akuma-kernel-core" }
 # Physical memory manager: bitmap allocator, frame tracking, UAF quarantine,
 # free/CoW event ledgers. `src/pmm.rs` is now a thin shim over this crate.
 akuma-alloc = { path = "crates/akuma-alloc" }

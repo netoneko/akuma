@@ -10,10 +10,12 @@
 
 pub use akuma_exec::pmm::*;
 
-/// One-line dump of the demand-paging frame attribution counters, written into
-/// the caller's buffer. Takes a `&mut dyn Write` (instead of returning a
-/// `String`) so it stays heap-free — this is reached from the sync-EL1 crash
-/// handler, which must not touch the allocator (see ALLOC_PRINT_AUDIT.md §6.3).
+/// One-line dump of the demand-paging frame attribution counters.
+///
+/// Written into the caller's buffer. Takes a `&mut dyn Write` (instead of
+/// returning a `String`) so it stays heap-free — this is reached from the
+/// sync-EL1 crash handler, which must not touch the allocator (see
+/// ALLOC_PRINT_AUDIT.md §6.3).
 pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
     use core::sync::atomic::Ordering;
     let _ = write!(
