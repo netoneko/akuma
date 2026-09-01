@@ -5,6 +5,8 @@ edition = "2024"
 description = "The kernel-side VFS layer: mount table, per-box namespaces, and the /proc filesystem"
 
 [dependencies]
+# The tunables, as consts to fold against rather than a struct handed over.
+akuma-config = { path = "../akuma-config" }
 # The filesystem traits, path helpers and `MountTable` this layer instantiates.
 akuma-vfs = { path = "../akuma-vfs" }
 # `Namespace` — the per-box mount view `with_fs` resolves through.

@@ -5,25 +5,20 @@
 //! `src/syscall/` ↔ `src/vfs/` cycle that kept it here
 //! (`docs/archive/SRC_SYSCALL_EXTRACTION.md`).
 //!
-//! Two things keep this file alive, and both are the binary's job:
-//! **`src/config.rs` stays the single source of truth** for the tunables, and
-//! the four `/proc` facts only the binary can answer are registered here. The
-//! rest is a re-export, so no call site in `src/syscall/` changed.
+//! One thing keeps this file alive: the four `/proc` facts only the binary can
+//! answer are registered here. The rest is a re-export, so no call site in
+//! `src/syscall/` changed. (The config half went to `akuma-config`.)
 
 pub use akuma_vfs_glue::*;
 
-/// Hand the binary's config and callbacks to the crate. Called once from
+/// Install the four `/proc` facts only the binary can answer. Called once from
 /// `kernel_main`, before the root filesystem is mounted.
+///
+/// The config half of this went away when `akuma-config` landed — the crate reads
+/// the tunables as `const`s now. What is left is genuinely un-const-able: an
+/// inline `mod audio` in `main.rs`, `fs::exists`, the SMP topology probe, and the
+/// wall clock.
 pub fn register() {
-    akuma_vfs_glue::set_config(akuma_vfs_glue::VfsGlueConfig {
-        proc_syscall_log_enabled: crate::config::PROC_SYSCALL_LOG_ENABLED,
-        proc_sysvipc_enabled: crate::config::PROC_SYSVIPC_ENABLED,
-        shared_file_pages_enabled: crate::config::SHARED_FILE_PAGES_ENABLED,
-        syscall_debug_info_enabled: crate::config::SYSCALL_DEBUG_INFO_ENABLED,
-        max_threads: crate::config::MAX_THREADS,
-        proc_stdout_max_size: crate::config::PROC_STDOUT_MAX_SIZE,
-        syscall_debug_io_enabled: crate::config::SYSCALL_DEBUG_IO_ENABLED,
-    });
     akuma_vfs_glue::set_hooks(akuma_vfs_glue::VfsGlueHooks {
         audio_is_available: crate::audio::is_available,
         fs_exists: crate::fs::exists,

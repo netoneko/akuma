@@ -76,40 +76,25 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
-/// The `src/config.rs` tunables this cache reads, handed over at [`init`].
-///
-/// They arrive as values rather than being read from a config crate because
-/// `SHARED_FILE_PAGES_ENABLED` and friends are `src/`-owned `const`s, and this
-/// crate sits below the module that owns them. The cost of the move is that the
-/// gate is no longer const-folded: [`enabled`] is now a relaxed atomic load on
-/// the fault path instead of a compile-time `false` that deleted the branch.
-/// That is the one behavioural difference in this extraction — A/B it before
-/// trusting the fault-path numbers.
-#[derive(Clone, Copy)]
-pub struct FpcacheConfig {
-    /// `config::SHARED_FILE_PAGES_ENABLED` — the kill switch.
-    pub enabled: bool,
-    /// `config::FPCACHE_BASE_RAM_DIVISOR` — base cap is RAM/this/4096.
-    pub base_ram_divisor: usize,
-    /// `config::FPCACHE_INFLATE_PCT` — elastic growth above the base cap.
-    pub inflate_pct: usize,
-    /// `config::FPCACHE_INFLATE_HEADROOM_MULT` — free RAM multiple required
-    /// before the inflation is granted.
-    pub inflate_headroom_mult: usize,
-}
 
 /// The kill switch, published by [`init`]. False until then, which is also what
 /// keeps the cache inert on a build that never calls it.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// [`FpcacheConfig::inflate_pct`], published by [`init`].
-static INFLATE_PCT: AtomicUsize = AtomicUsize::new(0);
+/// Elastic growth above the base cap, and the free-RAM multiple required to
+/// take it. `const`s from `akuma_config` since 2026-09-01 — they were atomics
+/// published by [`init`], which is the pattern that crate exists to retire.
+const fn inflate_pct() -> usize {
+    akuma_config::FPCACHE_INFLATE_PCT
+}
 
-/// [`FpcacheConfig::inflate_headroom_mult`], published by [`init`].
-static INFLATE_HEADROOM_MULT: AtomicUsize = AtomicUsize::new(0);
+const fn inflate_headroom_mult() -> usize {
+    akuma_config::FPCACHE_INFLATE_HEADROOM_MULT
+}
 
-/// Is the cache switched on? Replaces the `const` gate every entry point used
-/// to read directly — see [`FpcacheConfig`] for what that costs.
+/// Is the cache switched on **and** initialised? Not a `const`: the kill switch
+/// is one, but the caps [`init`] computes from detected RAM are not, and every
+/// reader here needs both.
 #[inline]
 fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
@@ -202,17 +187,17 @@ pub static INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
 /// still mapped costs nothing beyond the map node, since that frame was going to
 /// exist anyway. Only entries with zero mappers hold memory that would otherwise
 /// be free, which is why the cap can be generous relative to the ext2 block cache.
-pub fn init(total_ram_bytes: usize, cfg: FpcacheConfig) {
-    if !cfg.enabled {
+pub fn init(total_ram_bytes: usize) {
+    if !akuma_config::SHARED_FILE_PAGES_ENABLED {
         return;
     }
-    INFLATE_PCT.store(cfg.inflate_pct, Ordering::Relaxed);
-    INFLATE_HEADROOM_MULT.store(cfg.inflate_headroom_mult, Ordering::Relaxed);
-    // Armed last of the three: every `enabled()` reader goes on to load the
-    // two tunables above, so arming the gate first would expose a window
-    // where the cache is live with a 0% inflation.
+    // `ENABLED` is still an atomic, and still armed here rather than being a
+    // `const`: it means "the kill switch is on **and** the caps below are set",
+    // and every `enabled()` reader goes on to use them. The two tunables it used
+    // to be ordered against are `const`s now, so the window the old comment
+    // guarded no longer exists — but the caps are still runtime state.
     ENABLED.store(true, Ordering::Relaxed);
-    let divisor = cfg.base_ram_divisor.max(1);
+    let divisor = akuma_config::FPCACHE_BASE_RAM_DIVISOR.max(1);
     let base = (total_ram_bytes / divisor) / 4096;
     BASE_CAP_PAGES.store(base, Ordering::Relaxed);
     CAP_PAGES.store(base, Ordering::Relaxed);
@@ -220,7 +205,7 @@ pub fn init(total_ram_bytes: usize, cfg: FpcacheConfig) {
         160,
         "[fpcache] shared file-page cache enabled, base cap={} pages (+{}% elastic)\n",
         base,
-        INFLATE_PCT.load(Ordering::Relaxed)
+        inflate_pct()
     );
     // Boot is the cheapest moment there will ever be to grant the inflation, so
     // take the first reading now instead of waiting for 512 misses to accumulate.
@@ -234,7 +219,7 @@ pub fn init(total_ram_bytes: usize, cfg: FpcacheConfig) {
 fn inflation_pages() -> usize {
     BASE_CAP_PAGES
         .load(Ordering::Relaxed)
-        .saturating_mul(INFLATE_PCT.load(Ordering::Relaxed))
+        .saturating_mul(inflate_pct())
         / 100
 }
 
@@ -280,7 +265,7 @@ pub fn reassess_cap() {
     let want_inflated = akuma_kacho::hysteresis(
         inflated,
         free as u64,
-        extra.saturating_mul(INFLATE_HEADROOM_MULT.load(Ordering::Relaxed).max(1)) as u64,
+        extra.saturating_mul(inflate_headroom_mult().max(1)) as u64,
         extra as u64,
     );
     if want_inflated != inflated {

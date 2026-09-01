@@ -5,6 +5,8 @@ edition = "2024"
 description = "Shared physical pages for read-only file-backed mappings (the file-page cache)"
 
 [dependencies]
+# The tunables, as consts to fold against rather than a struct handed over.
+akuma-config = { path = "../akuma-config" }
 # `PhysFrame`, and the `user_flags::is_shareable_mapping` predicate reached
 # through `akuma_exec::mmu`.
 akuma-exec = { path = "../akuma-exec" }

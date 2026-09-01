@@ -17,17 +17,31 @@ the first three steps of the answer, which are done.
 | 1a | `src/syscall/log.rs` → `akuma-syscalls-log` | **done** |
 | 1b | `src/syscall/msgqueue.rs` → `akuma-syscalls-ipc` | **done** |
 | 2 | `src/vfs/` → `akuma-vfs-glue` | **done** |
-| 3 | decide the `cfg(kernel_tests)` story (Blocker 2) | open |
-| 4 | `crate::config` → `SyscallConfig` (225 refs / 26 consts) | open |
+| 3 | `make_test_process` → `akuma-exec` (Blocker 2) | **done** |
+| 3b | `src/fs.rs` → `akuma-vfs-glue`, `src/pmm.rs` wrappers → `akuma-exec` | **done** |
+| 3c | 539 refs repointed to crate paths | **done** |
+| 4 | `crate::config` → [`akuma-config`](AKUMA_CONFIG_EXTRACTION.md) — a **crate of consts**, not a `SyscallConfig` | **done** |
 | 5 | `src/syscall/` → `akuma-syscalls-glue` | open |
 
 Steps 1a–2 are recorded in [§7](#7-what-was-actually-done). The cycle that made
 the move impossible is **broken**: `src/vfs/` no longer exists, and nothing
 outside `src/syscall/` points back into it.
 
-Census movement across the whole run: **23 of 39 crates forbid → 26 of 42**, and
-enforced-safe code under `crates/` went **25,658 / 49,706 (51.6%) → 28,135 /
-52,202 (53.9%)**.
+Census movement across the whole run: **23 of 39 crates forbid → 27 of 43**, and
+enforced-safe code under `crates/` went **25,658 / 49,706 (51.6%) → 28,445 /
+52,664 (54.0%)**. `src/syscall/`'s outbound went from **19 clusters / ~900 refs
+to 5 clusters / 48** — only `crate::audio` (10), `crate::rump_proxy` (5),
+`crate::timer::utc_time_us`, `crate::smp_shared::probed_core_count` and the two
+profile counters remain, all of them genuinely binary-local and hooks-shaped.
+
+**Step 4 did not go the way the survey predicted, and that is the interesting
+part.** The plan was a 26-field `SyscallConfig` handed over at init, following
+`akuma-fpcache`. Pricing it first showed that would have been a mistake —
+thirteen of the flags are unconditionally `false` and gate trace blocks on the
+syscall path, and runtime config stops const-folding whatever it gates. So the
+tunables became a *crate of consts* instead, which also retired the four handover
+structs that already existed. See
+[`AKUMA_CONFIG_EXTRACTION.md`](AKUMA_CONFIG_EXTRACTION.md).
 
 ## The good news first: the inbound seam already exists
 

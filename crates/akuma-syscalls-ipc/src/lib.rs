@@ -27,7 +27,7 @@ extern crate alloc;
 
 use alloc::collections::{BTreeMap, BTreeMap as PollerMap, VecDeque};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use spinning_top::Spinlock;
 
 use akuma_exec::process::user_access::{
@@ -38,19 +38,10 @@ use akuma_primitives::clock::uptime_us;
 use akuma_primitives::errno::negated::{E2BIG, EAGAIN, EEXIST, EFAULT, EINVAL, ENOENT, ENOMSG};
 use akuma_primitives::irq::with_irqs_disabled;
 
-/// Whether to print the per-call `[msg*]` traces.
-///
-/// `src/config.rs` stays the single source of truth; `src/syscall/msgqueue.rs`
-/// is a shim that reads `SYSCALL_DEBUG_INFO_ENABLED` and calls [`init`].
-static DEBUG_INFO: AtomicBool = AtomicBool::new(false);
-
-/// Install the trace toggle. Called once from `kernel_main`.
-pub fn init(debug_info: bool) {
-    DEBUG_INFO.store(debug_info, Ordering::Relaxed);
-}
-
-fn debug_info() -> bool {
-    DEBUG_INFO.load(Ordering::Relaxed)
+/// Whether to print the per-call `[msg*]` traces — a `const` from
+/// `akuma_config`, so the traces fold out entirely when it is false.
+const fn debug_info() -> bool {
+    akuma_config::SYSCALL_DEBUG_INFO_ENABLED
 }
 
 /// Validate a user pointer range, faulting lazy pages in.

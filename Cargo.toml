@@ -11,6 +11,7 @@ default-members = [
     "crates/akuma-fpcache",
     "crates/akuma-gic",
     "crates/akuma-psci",
+    "crates/akuma-config",
     "crates/akuma-cpu",
     "crates/akuma-elf",
     "crates/akuma-ext2",
@@ -165,6 +166,9 @@ syscall-debug-info = [
     "akuma-syscalls/debug-info",
     "akuma-syscalls-time/debug-info",
     "akuma-exec/debug-info",
+    # SYSCALL_DEBUG_INFO_ENABLED is `cfg!(feature = "syscall-debug-info")`, so the
+    # crate needs the feature or the const reads false regardless of this one.
+    "akuma-config/syscall-debug-info",
 ]
 
 default = [
@@ -201,7 +205,7 @@ no-tests = ["akuma-net/small-sockets", "akuma-exceptions/no-tests", "akuma-exec/
 # The device *physical* addresses this sets are a bootstrap map only; the real
 # ones come from the FDT at runtime, because Firecracker's GIC redistributor base
 # depends on vCPU count. See proposals/FIRECRACKER_PORT.md.
-platform-firecracker = []
+platform-firecracker = ["akuma-config/platform-firecracker"]
 
 # Support for a server handling many simultaneous connections: a deeper
 # per-listener backlog and a larger socket budget (see
@@ -580,7 +584,7 @@ sound = ["virtio-drivers/alloc", "akuma-virtio/sound"]
 # Forwarded to akuma-exec and akuma-ext2 so their build.rs emits the same cfg
 # (warm-stack floor + kernel-stack right-sizing in akuma-exec; block-cache gate
 # in akuma-ext2).
-extreme = ["akuma-exec/extreme", "akuma-ext2/extreme", "akuma-primitives/extreme", "akuma-vfs-glue/extreme"]
+extreme = ["akuma-exec/extreme", "akuma-ext2/extreme", "akuma-primitives/extreme", "akuma-vfs-glue/extreme", "akuma-config/extreme"]
 
 # Large RAM-sized ext2 block cache with clock eviction (crates/akuma-ext2). Keeps
 # the read-only toolchain resident across the many process spawns in a self-host
@@ -628,7 +632,7 @@ rump-default = ["rump"]
 # keeps its built-in SSH). The devbox needs this: with rump the default stack,
 # the built-in server (which is smoltcp-only) would be the one thing still on
 # the native stack.
-userspace-sshd = []
+userspace-sshd = ["akuma-config/userspace-sshd"]
 
 # The devbox meta-feature: rump is the default stack and there is no built-in
 # SSH. Selected with `--features devbox` (+ the `devbox` profile). Built with
@@ -659,6 +663,10 @@ workspace = true
 # parking, DAIF, read-only system registers) behind safe `#[inline(always)]`
 # functions, so the trivially-dischargeable `unsafe` blocks live in one crate
 # instead of at every call site. Zero dependencies of its own.
+# The kernel's compile-time tunables. A crate rather than `src/config.rs` so
+# crates fold against the consts instead of being handed them at runtime — see
+# its header for why that mattered and why it is not in `akuma-primitives`.
+akuma-config = { path = "crates/akuma-config" }
 akuma-cpu = { path = "crates/akuma-cpu" }
 akuma-terminal = { path = "crates/akuma-terminal" }
 akuma-vfs = { path = "crates/akuma-vfs" }

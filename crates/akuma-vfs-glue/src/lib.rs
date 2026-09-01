@@ -1217,82 +1217,38 @@ fn fpcache_init(total_ram_bytes: usize) {
 /// Tunables. `src/config.rs` stays the single source of truth; `src/vfs.rs`
 /// reads the consts and calls [`init`].
 ///
-/// Four of these are `bool`, which clippy dislikes on principle. They stay
-/// separate fields because each one mirrors a *named const in `src/config.rs`*
-/// one-for-one, and collapsing them into a bitflags type would put a second,
-/// differently-shaped copy of that list in the tree — exactly what keeping
-/// `src/config.rs` authoritative is meant to prevent.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Clone, Copy, Debug)]
-pub struct VfsGlueConfig {
-    pub proc_syscall_log_enabled: bool,
-    pub proc_sysvipc_enabled: bool,
-    pub shared_file_pages_enabled: bool,
-    pub syscall_debug_info_enabled: bool,
-    /// Thread-table size — `/proc` iterates slots up to this.
-    pub max_threads: usize,
-    /// Cap on a captured `/proc/<pid>/stdout`.
-    pub proc_stdout_max_size: usize,
-    /// Verbose file-I/O tracing in the sync facade.
-    pub syscall_debug_io_enabled: bool,
-}
-
-static CFG: akuma_primitives::OnceCopy<VfsGlueConfig> = akuma_primitives::OnceCopy::new();
-
-/// Install the tunables. Idempotent.
+/// The tunables, read as `const`s from `akuma_config` rather than handed over.
 ///
-/// Named `set_config`, not `init`: this crate already has an `init` that mounts
-/// the root filesystem, and two functions called `init` on one type is how a
-/// caller ends up doing only half of what it meant to.
-pub fn set_config(cfg: VfsGlueConfig) {
-    CFG.set(cfg);
-}
-
-/// `src/config.rs` forces this `false` on `kernel_profile_extreme`, and the
-/// duplicated `const false` here is deliberate: it is what lets the optimiser
-/// delete the `/proc/<pid>/syscalls` renderer from that image instead of merely
-/// never calling it. Handing the flag over as runtime config cost 4 KB of
-/// `extreme-size` `.text` until this arm existed. The *value* still comes from
-/// `src/config.rs` on every other profile — see this crate's build.rs.
-#[cfg(kernel_profile_extreme)]
+/// This crate briefly carried a `VfsGlueConfig` struct and `src/vfs.rs` populated
+/// it at boot. That is the pattern `akuma-config` exists to retire: a `const`
+/// that becomes runtime config stops const-folding whatever it gates, and the
+/// two `/proc` flags below cost a page of `extreme-size` while they were loads.
+/// They fold again now, with no `#[cfg]` duplication needed here at all.
 const fn cfg_proc_syscall_log_enabled() -> bool {
-    false
+    akuma_config::PROC_SYSCALL_LOG_ENABLED
 }
 
-#[cfg(not(kernel_profile_extreme))]
-fn cfg_proc_syscall_log_enabled() -> bool {
-    CFG.get().is_some_and(|c| c.proc_syscall_log_enabled)
-}
-
-/// Same trade as [`cfg_proc_syscall_log_enabled`]: `extreme-size` gates out the
-/// `sc-sysv-ipc` family entirely, so the view has nothing to show and the
-/// renderer should not be in the image.
-#[cfg(kernel_profile_extreme)]
 const fn cfg_proc_sysvipc_enabled() -> bool {
-    false
+    akuma_config::PROC_SYSVIPC_ENABLED
 }
 
-#[cfg(not(kernel_profile_extreme))]
-fn cfg_proc_sysvipc_enabled() -> bool {
-    CFG.get().is_some_and(|c| c.proc_sysvipc_enabled)
+const fn cfg_shared_file_pages_enabled() -> bool {
+    akuma_config::SHARED_FILE_PAGES_ENABLED
 }
 
-fn cfg_shared_file_pages_enabled() -> bool {
-    CFG.get().is_some_and(|c| c.shared_file_pages_enabled)
+const fn cfg_syscall_debug_info_enabled() -> bool {
+    akuma_config::SYSCALL_DEBUG_INFO_ENABLED
 }
 
-fn cfg_syscall_debug_info_enabled() -> bool {
-    CFG.get().is_some_and(|c| c.syscall_debug_info_enabled)
+const fn cfg_syscall_debug_io_enabled() -> bool {
+    akuma_config::SYSCALL_DEBUG_IO_ENABLED
 }
 
-fn cfg_syscall_debug_io_enabled() -> bool {
-    CFG.get().is_some_and(|c| c.syscall_debug_io_enabled)
+const fn cfg_max_threads() -> usize {
+    akuma_config::MAX_THREADS
 }
 
-fn cfg_max_threads() -> usize {
-    CFG.get().map_or(256, |c| c.max_threads)
+const fn cfg_proc_stdout_max_size() -> usize {
+    akuma_config::PROC_STDOUT_MAX_SIZE
 }
 
-fn cfg_proc_stdout_max_size() -> usize {
-    CFG.get().map_or(64 * 1024, |c| c.proc_stdout_max_size)
-}

@@ -5,6 +5,8 @@ edition = "2024"
 description = "Per-pid syscall trace rings, retained past exit and published through /proc"
 
 [dependencies]
+# The tunables, as consts to fold against rather than a struct handed over.
+akuma-config = { path = "../akuma-config" }
 # `irq::with_irqs_disabled` around every touch of the ring, and `clock::uptime_us`
 # for the exit stamp the retention window is measured from.
 akuma-primitives = { path = "../akuma-primitives" }

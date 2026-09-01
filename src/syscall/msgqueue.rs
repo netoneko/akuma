@@ -2,9 +2,8 @@
 //!
 //! The family moved to a crate on 2026-09-01 to break the `src/syscall/` ↔
 //! `src/vfs/` dependency cycle (`docs/archive/SRC_SYSCALL_EXTRACTION.md`
-//! Blocker 1) — `/proc` lists the queues. This file stays so **`src/config.rs`
-//! remains the single source of truth** for the trace toggle, which the crate
-//! cannot read; everything else is a re-export and no call site changed.
+//! Blocker 1) — `/proc` lists the queues. It is now a pure re-export: the `init`
+//! that handed the trace toggle over went away with `akuma-config`.
 
 // The four dispatch arms — always reachable. `/proc` reads
 // `akuma_syscalls_ipc::list_msg_queues` directly; routing that back through here
@@ -24,7 +23,3 @@ pub use akuma_syscalls_ipc::{
     msgqueue_recv_pollers_count, msgqueue_send_pollers_count,
 };
 
-/// Hand `src/config.rs`'s trace toggle to the crate. Called once from `kernel_main`.
-pub fn init() {
-    akuma_syscalls_ipc::init(crate::config::SYSCALL_DEBUG_INFO_ENABLED);
-}

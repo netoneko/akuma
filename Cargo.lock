@@ -9,6 +9,7 @@ dependencies = [
  "akuma-alloc",
  "akuma-bkl",
  "akuma-boot",
+ "akuma-config",
  "akuma-cpu",
  "akuma-exceptions",
  "akuma-exec",
@@ -73,6 +74,13 @@ name = "akuma-boot"
 version = "0.1.0"
 dependencies = [
  "akuma-psci",
+]
+
+[[package]]
+name = "akuma-config"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
 ]
 
 [[package]]
@@ -154,6 +162,7 @@ dependencies = [
 name = "akuma-fpcache"
 version = "0.1.0"
 dependencies = [
+ "akuma-config",
  "akuma-exec",
  "akuma-kacho",
  "akuma-pmm",
@@ -303,6 +312,7 @@ dependencies = [
 name = "akuma-syscalls-ipc"
 version = "0.1.0"
 dependencies = [
+ "akuma-config",
  "akuma-exec",
  "akuma-primitives",
  "spinning_top",
@@ -316,6 +326,7 @@ version = "0.1.0"
 name = "akuma-syscalls-log"
 version = "0.1.0"
 dependencies = [
+ "akuma-config",
  "akuma-primitives",
  "spinning_top",
 ]
@@ -389,6 +400,7 @@ dependencies = [
 name = "akuma-vfs-glue"
 version = "0.1.0"
 dependencies = [
+ "akuma-config",
  "akuma-exec",
  "akuma-ext2",
  "akuma-fpcache",

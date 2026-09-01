@@ -1,0 +1,21 @@
+[package]
+name = "akuma-config"
+version = "0.1.0"
+edition = "2024"
+description = "The kernel's compile-time tunables, as consts every crate can fold against"
+
+[dependencies]
+# Only for the `MAX_THREADS` re-export, which is defined in `preempt` because the
+# per-slot statics are indexed by it. Nothing else here has a dependency at all.
+akuma-primitives = { path = "../akuma-primitives" }
+
+[features]
+# All forwarded from the bin, which owns the real definitions. They must arrive,
+# or a gated const silently compiles its other arm — see build.rs.
+extreme = []
+platform-firecracker = []
+syscall-debug-info = []
+userspace-sshd = []
+
+[lints]
+workspace = true

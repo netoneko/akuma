@@ -41,43 +41,20 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 use akuma_primitives::clock::uptime_us;
 use akuma_primitives::irq::with_irqs_disabled;
 
-/// Tunables, handed over once at boot.
-///
-/// `src/config.rs` stays the single source of truth — `src/syscall/log.rs` is a
-/// shim that reads the consts and calls [`init`]. Do **not** add a second copy
-/// here. The cost of the indirection is that two const-folded comparisons became
-/// relaxed atomic loads; both sit behind the `epi.log` epilogue gate and a
-/// spinlock acquisition, so it is noise.
-#[derive(Clone, Copy, Debug)]
-pub struct LogConfig {
-    /// Ring depth per pid. Older entries are dropped first.
-    pub max_entries: usize,
-    /// How long a log survives its process, in milliseconds.
-    pub retain_ms: u64,
-}
-
-static MAX_ENTRIES: AtomicUsize = AtomicUsize::new(64);
-static RETAIN_MS: AtomicU64 = AtomicU64::new(10_000);
-
-/// Install the tunables. Idempotent; safe to skip entirely in host tests, where
-/// the defaults above match `src/config.rs`.
-pub fn init(cfg: LogConfig) {
-    MAX_ENTRIES.store(cfg.max_entries, Ordering::Relaxed);
-    RETAIN_MS.store(cfg.retain_ms, Ordering::Relaxed);
-}
-
+/// Ring depth per pid, from `akuma_config`. Read as a `const`, not handed over:
+/// see that crate's header for why the four `…Config` structs this file used to
+/// carry were a mistake.
 fn max_entries() -> usize {
-    MAX_ENTRIES.load(Ordering::Relaxed)
+    akuma_config::PROC_SYSCALL_LOG_MAX_ENTRIES
 }
 
 fn retain_us() -> u64 {
-    RETAIN_MS.load(Ordering::Relaxed) * 1_000
+    akuma_config::PROC_SYSCALL_LOG_RETAIN_MS * 1_000
 }
 
 struct SyscallEntry {

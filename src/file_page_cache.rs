@@ -33,13 +33,5 @@ pub use akuma_fpcache::{insert, is_shareable_mapping, lookup_and_ref, mark_icach
 /// Reads the `config` tunables and publishes them to the crate; see
 /// [`akuma_fpcache::init`] for what the sizing means.
 pub fn init(total_ram_bytes: usize) {
-    akuma_fpcache::init(
-        total_ram_bytes,
-        akuma_fpcache::FpcacheConfig {
-            enabled: crate::config::SHARED_FILE_PAGES_ENABLED,
-            base_ram_divisor: crate::config::FPCACHE_BASE_RAM_DIVISOR,
-            inflate_pct: crate::config::FPCACHE_INFLATE_PCT,
-            inflate_headroom_mult: crate::config::FPCACHE_INFLATE_HEADROOM_MULT,
-        },
-    );
+    akuma_fpcache::init(total_ram_bytes);
 }

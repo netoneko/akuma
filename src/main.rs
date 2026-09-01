@@ -1121,13 +1121,6 @@ fn kernel_main(dtb_ptr: usize) -> ! {
     console::print("Initializing threading...\n");
     threading::init();
     process::init(); // Initialize process subsystem (registers cleanup callback)
-    // Hand `src/config.rs`'s retention tunables to `akuma-syscalls-log`. The
-    // crate defaults match the consts, so a missed call degrades to "the same
-    // numbers" rather than to zero-length logs — but call it anyway, or the
-    // consts stop being the single source of truth the moment someone edits one.
-    syscall::log::init();
-    #[cfg(feature = "sc-sysv-ipc")]
-    syscall::msgqueue::init();
     // Config + the four `/proc` facts only the binary can answer. Must precede
     // the root mount below, which is `akuma_vfs_glue::init`.
     vfs::register();
