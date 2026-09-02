@@ -12,7 +12,13 @@
 /// cycle. Prefaulting a lazy file page needs to know which process owns the
 /// address space and what the region is backed by; page-table mechanics do not.
 /// Moving the file moved the cycle, rather than papering it over with a callback.
-pub mod user_access;
+/// The EL0 memory boundary moved to its own crate on 2026-09-02
+/// (`AKUMA_EXEC_AUDIT.md` §6 item A) — all ~15 of its user-copy `unsafe` sites
+/// with it. Re-exported here so every `akuma_exec::process::user_access::…` call
+/// site (syscalls-glue, exceptions, the boot suite) resolves unchanged. The
+/// demand-paging half stayed: [`lazy_prefault`].
+pub use akuma_user_access as user_access;
+pub mod lazy_prefault;
 pub mod address_space;
 pub mod types;
 pub mod table;

@@ -84,6 +84,11 @@ akuma-pmm = { path = "../akuma-pmm" }
 # algebra, and the PTE permission vocabulary. Sits BELOW this crate so a future
 # `akuma-syscalls-mem` can name `MmapRegion` without depending on all of exec.
 akuma-mmap = { path = "../akuma-mmap" }
+# The EL0 copy boundary (asm loop + fault trampoline + copy_from/to_user). Held
+# every user-copy `unsafe` this crate used to carry; re-exported below as
+# `process::user_access`. `process::lazy_prefault` registers its demand-paging
+# half back into it at `init`.
+akuma-user-access = { path = "../akuma-user-access" }
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 spinning_top = "0.3"
 lock_api = "0.4"

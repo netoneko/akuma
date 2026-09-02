@@ -547,20 +547,6 @@ pub fn note_current_expected_l0(ttbr0: u64) {
     note_thread_expected_l0(get_current_thread_register(), ttbr0);
 }
 
-/// Per-thread user-copy fault handler address (set around copy_from/to_user).
-///
-/// Lock-free, for the same reason as `CURRENT_TRAP_FRAME`: it is read by the DATA
-/// ABORT exception handler (`get_user_copy_fault_handler`) to recover a faulting
-/// user copy. Taking `POOL.lock()` there self-deadlocks the single CPU if the
-/// fault occurred while `POOL` was already held (a nested fault) — observed as a
-/// hang spinning on the pool spinlock in the copy-fault path under a multithreaded
-/// process (curl's resolver + main thread). A per-thread atomic is safe: a thread
-/// only reads/writes its OWN slot, and its own fault can't race its own set.
-static USER_COPY_FAULT_HANDLER: [AtomicU64; MAX_THREADS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_THREADS]
-};
-
 /// Atomic wake times for WAITING threads - scheduler checks these
 /// Value is 0 for threads that are not waiting, otherwise it's the wake deadline in microseconds
 static WAKE_TIMES: [AtomicU64; MAX_THREADS] = {
@@ -1233,7 +1219,7 @@ fn scrub_thread_slot(i: usize) {
     // syscall frame that no longer exists — a fault before the new occupant installs
     // its own would jump there.
     CURRENT_TRAP_FRAME[i].store(0, Ordering::Release);
-    USER_COPY_FAULT_HANDLER[i].store(0, Ordering::Release);
+    akuma_primitives::preempt::clear_user_copy_fault_handler(i);
 
     // TTBR0 tripwire baseline: unknown until the new occupant's context is written
     // (a stale expected-L0 would flag the new occupant's first switch as a mismatch).
@@ -4212,26 +4198,12 @@ pub fn mark_current_terminated() {
     }
 }
 
-/// Get the current thread's user copy fault handler address.
-///
-/// Lock-free (see `USER_COPY_FAULT_HANDLER`): called from the data-abort handler,
-/// where taking `POOL.lock()` could self-deadlock a nested fault.
-pub fn get_user_copy_fault_handler() -> u64 {
-    let tid = get_current_thread_register();
-    if tid < MAX_THREADS {
-        USER_COPY_FAULT_HANDLER[tid].load(Ordering::Acquire)
-    } else {
-        0
-    }
-}
-
-/// Set the current thread's user copy fault handler address. Lock-free.
-pub fn set_user_copy_fault_handler(handler: u64) {
-    let tid = get_current_thread_register();
-    if tid < MAX_THREADS {
-        USER_COPY_FAULT_HANDLER[tid].store(handler, Ordering::Release);
-    }
-}
+/// The per-thread user-copy fault handler moved to `akuma_primitives::preempt`
+/// (both its setter, `akuma-user-access`, and its reader, `akuma-exceptions`,
+/// need it without depending on this crate). Re-exported so
+/// `akuma_exec::threading::{get,set}_user_copy_fault_handler` call sites resolve
+/// unchanged.
+pub use akuma_primitives::preempt::{get_user_copy_fault_handler, set_user_copy_fault_handler};
 
 /// Get current thread ID from TPIDR_EL0 register
 /// This is more reliable than a global atomic as it's per-CPU

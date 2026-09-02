@@ -39,6 +39,7 @@ default-members = [
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-linux",
     "crates/akuma-syscalls-glue",
+    "crates/akuma-user-access",
     "crates/akuma-vfs-glue",
     "crates/akuma-syscalls-ipc",
     "crates/akuma-syscalls-log",

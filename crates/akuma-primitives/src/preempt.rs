@@ -126,6 +126,54 @@ static PREEMPTION_DISABLED_AT: [AtomicU64; MAX_THREADS] = {
 /// Last time the watchdog ran, for detecting host sleep/wake time jumps.
 static LAST_WATCHDOG_CHECK_US: AtomicU64 = AtomicU64::new(0);
 
+/// Per-thread user-copy fault handler address, set around `copy_from/to_user`
+/// (`akuma-user-access`) and read by the EL1 DATA ABORT handler
+/// (`akuma-exceptions`) to recover a faulting user copy instead of panicking.
+///
+/// Lives here — the leaf crate, next to `PREEMPTION_DISABLED` — rather than in
+/// `akuma-exec::threading` because both the setter (`akuma-user-access`) and the
+/// reader (`akuma-exceptions`) would otherwise need `akuma-exec`, and
+/// `akuma-exec` re-exports `akuma-user-access` (a cycle). It is a plain
+/// `[AtomicU64; MAX_THREADS]` indexed by [`current_tid`], the exact shape of the
+/// preempt slots beside it.
+///
+/// Lock-free by necessity: read from the data-abort handler, where taking
+/// `POOL.lock()` self-deadlocks a nested fault (observed as a spin in the
+/// copy-fault path under curl's resolver + main thread). A thread only touches
+/// its OWN slot, and its own fault cannot race its own set.
+static USER_COPY_FAULT_HANDLER: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// The current thread's user-copy fault handler address, or 0 if none is armed.
+#[must_use]
+pub fn get_user_copy_fault_handler() -> u64 {
+    let tid = current_tid();
+    if tid < MAX_THREADS {
+        USER_COPY_FAULT_HANDLER[tid].load(Ordering::Acquire)
+    } else {
+        0
+    }
+}
+
+/// Arm (or, with `0`, disarm) the current thread's user-copy fault handler.
+pub fn set_user_copy_fault_handler(handler: u64) {
+    let tid = current_tid();
+    if tid < MAX_THREADS {
+        USER_COPY_FAULT_HANDLER[tid].store(handler, Ordering::Release);
+    }
+}
+
+/// Disarm slot `i`'s handler on thread-slot teardown. A stale address is a fixup
+/// into a syscall frame that no longer exists — a fault before the new occupant
+/// arms its own would jump there.
+pub fn clear_user_copy_fault_handler(i: usize) {
+    if i < MAX_THREADS {
+        USER_COPY_FAULT_HANDLER[i].store(0, Ordering::Release);
+    }
+}
+
 /// The `file:line` that first disabled preemption for `tid` (the 0→1
 /// transition), if it is still disabled.
 #[must_use]

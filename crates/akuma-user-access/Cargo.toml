@@ -1,0 +1,22 @@
+[package]
+name = "akuma-user-access"
+version = "0.1.0"
+edition = "2024"
+description = "The EL0 memory boundary: the user-pointer range check, the copy asm (__arch_copy_user_memory) and its fault-recovery trampoline, and the copy_from/to_user helpers built on them. Where all of akuma-exec's user-copy unsafe lives."
+
+[lints]
+workspace = true
+
+# `akuma-exec` re-exports this as `akuma_exec::process::user_access`, so this
+# crate must sit BELOW it and cannot name `Process`. It reaches:
+#   - `akuma-primitives` for `EFAULT`, `current_tid`, `MAX_THREADS` and the
+#     per-thread user-copy fault-handler slot (moved there so the setter here and
+#     the reader in `akuma-exceptions` need neither `akuma-exec`).
+#   - `akuma-mmu` for the "is this range mapped and EL0-accessible" walk that
+#     `validate_user_range` does. No cycle: `akuma-mmu` does not depend on this.
+# The demand-paging half (`prefault_user_range`) needs `Process`, the address
+# space lock and lazy regions, so its body stays in `akuma-exec` and is reached
+# through `set_prefault_hook`.
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-mmu = { path = "../akuma-mmu" }

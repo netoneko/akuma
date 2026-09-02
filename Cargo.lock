@@ -147,6 +147,7 @@ dependencies = [
  "akuma-primitives",
  "akuma-syscalls-linux",
  "akuma-terminal",
+ "akuma-user-access",
  "embedded-io-async",
  "lock_api",
  "log",
@@ -501,6 +502,14 @@ dependencies = [
 name = "akuma-uart"
 version = "0.1.0"
 dependencies = [
+ "akuma-primitives",
+]
+
+[[package]]
+name = "akuma-user-access"
+version = "0.1.0"
+dependencies = [
+ "akuma-mmu",
  "akuma-primitives",
 ]
 

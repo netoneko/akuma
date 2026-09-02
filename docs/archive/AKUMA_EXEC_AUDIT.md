@@ -497,11 +497,38 @@ deadlock above. Those sites take `lock()` and go through the guard.
    scalars became an atomic mirror on `Process` and the rest moved inside
    `Spinlock<UserAddressSpace>`; again zero `unsafe`, not `UnsafeCell`.
    **All six `&self -> &mut` casts are now gone.**
-5. RawWaker → `alloc::task::Wake`, opportunistically. Still open.
-6. Only then consider whether the crate wants splitting for `forbid` — even with
-   2-4 done the crate is at ~109 `unsafe` sites (the process table, thread
-   contexts and EL0 boundary — §2's first five kinds), still far from zero, so
-   the split in §1 remains a separate design decision rather than a consequence.
+5. RawWaker → `alloc::task::Wake`, opportunistically. Still open — and weaker
+   than it looks: `Wake` needs `Arc<Self>`, so it trades 6 trivially-correct
+   `unsafe` lines for a heap allocation on every `current_thread_waker()`. The
+   thread waker packs its handle into the data pointer precisely to avoid that.
+
+6. Splitting the crate for `forbid`. This is not one step but four, and the
+   first is nearly free:
+
+   - **A. Extract `process/user_access.rs` → `akuma-user-access`.** ~~open~~
+     **done 2026-09-02** ([`AKUMA_EXEC_USER_ACCESS_EXTRACTION.md`](AKUMA_EXEC_USER_ACCESS_EXTRACTION.md)):
+     the EL0 copy boundary — asm loop, fault trampoline, `copy_from/to_user` —
+     is its own crate, one stated contract, cannot forbid. `akuma-exec` **126 →
+     112** `unsafe` blocks. The demand-paging half (`prefault_user_range`) needs
+     a `Process` so it stayed as `process::lazy_prefault`, reached through a
+     `set_prefault_hook` registration. Prereq done on the way: the per-thread
+     user-copy-fault-handler slot moved to `akuma_primitives::preempt` (both the
+     setter and `akuma-exceptions`' reader now need neither `akuma-exec`).
+   - **B. Push `process/mod.rs`'s 29 down.** EL0 trampolines → `akuma-entry`;
+     robust-futex user walk + CLONE `set_tid` writes → `akuma-user-access`;
+     fork phys-page copy → an `akuma-mmu::copy_phys_page`; raw `Process*` derefs
+     → `table` accessors. The `src/syscall/` 17→0 playbook. Open.
+   - **C. Extract `threading/mod.rs` → `akuma-threading` (~53, ~2,600 lines).**
+     It doesn't name the `Process` type; its up-calls become hooks. This is the
+     "cut the core in half" §1 warns against — the real design decision. Open.
+   - **D. `process/table.rs` (19)** — the `*mut Process` slot store. Either it
+     stays `unsafe` (a small crate that can't forbid, like `akuma-gic`) or it
+     genericizes into an `akuma-slot-table` primitive, the move
+     `akuma-locks-rw-cell` made. Open.
+
+   After A–C, `akuma-exec` proper (fork/exec/signal/channel/fd/lifecycle/reclaim)
+   is `unsafe`-free and takes `#![forbid(unsafe_code)]`. Do **not** do C on the
+   strength of a line count; A stands on its own regardless.
 
 ## Background
 

@@ -1,46 +1,60 @@
-//! User memory access: the range check, the prefault, and the copy — one helper.
+//! The EL0 memory boundary: the user-pointer range check, the copy asm, and the
+//! `copy_from/to_user` helpers built on them.
+//!
+//! # The one obligation
+//!
+//! Everything `unsafe` here — the `global_asm!` copy loop, its `extern` decls,
+//! and the raw slice reconstructions in the helpers — serves one contract:
+//!
+//! > **An unmapped or non-EL0-accessible user address cannot panic the kernel.**
+//! > A `ldrb`/`stp` in [`copy_from_user_safe`]'s loop that faults lands in
+//! > `__arch_copy_user_fault` (armed as this thread's handler in
+//! > `akuma_primitives::preempt`), which returns `EFAULT`. The asm is **leaf and
+//! > stackless** so that recovery `ret`s back to the Rust caller — the three
+//! > invariants are stated on `__arch_copy_user_memory` itself.
+//!
+//! Extracted from `akuma-exec/src/process/user_access.rs` on 2026-09-02
+//! (`AKUMA_EXEC_AUDIT.md` §6 item A) so `akuma-exec` proper sheds ~15 `unsafe`
+//! sites. It is re-exported as `akuma_exec::process::user_access`, so every
+//! `akuma_exec::process::user_access::…` call site resolves unchanged.
 //!
 //! # The two halves, and why they used to be two
 //!
-//! Until 2026-08-14 this module held only the *copy*
-//! ([`copy_from_user_safe`]/[`copy_to_user_safe`]): an assembly byte loop plus a
-//! recovery trampoline registered as the thread's user-copy fault handler. If a
-//! `ldrb`/`strb` in that loop touches an unmapped page, the EL1 abort handler
-//! (`src/exceptions.rs`, `EC=0x25` with `ELR` in kernel code) rewrites `ELR_EL1`
-//! to the trampoline, which returns `EFAULT`. That is all "safe" ever meant here:
-//! **an unmapped user address cannot panic the kernel.** The copy checked nothing.
-//!
-//! The *check* lived in the bin crate as `syscall::validate_user_ptr`, and it was
-//! opt-in: 126 call sites against 167 copies. Two consequences, both real:
-//!
-//! 1. The recovery net only catches **unmapped** addresses. A *mapped kernel* VA
-//!    passed as a destination is written by the byte loop with no fault, no
-//!    `EFAULT` and no diagnostic. `validate_user_ptr` deliberately does not
-//!    exclude the kernel identity-mapped range (see [`user_range_ok`]), so the
-//!    range check was the only thing standing there — and it could be skipped.
-//! 2. The raw `(dst, src, len)` signature put the *kernel*-side length invariant
-//!    on the caller. The trampoline protects the user pointer; nothing protects
-//!    the kernel buffer, so a `len` larger than the kernel array is an ordinary
-//!    mapped over-read or over-write — no fault, no diagnostic.
-//!
-//! So the two are folded: [`copy_to_user`], [`copy_from_user`],
-//! [`write_user_val`] and [`read_user_into`] validate, prefault and copy, take
-//! slices (so `len` cannot disagree with the buffer) and are **safe `fn`s**.
-//! `docs/archive/UNSAFE_AUDIT.md` §4 P0, and
-//! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` Phase 5.
+//! Until 2026-08-14 this held only the *copy*
+//! ([`copy_from_user_safe`]/[`copy_to_user_safe`]): the asm loop plus the
+//! recovery trampoline. The copy checked nothing. The *check* lived in the bin
+//! crate as `syscall::validate_user_ptr` and was opt-in — 126 call sites against
+//! 167 copies — so a mapped **kernel** VA passed as a destination was written
+//! with no fault and no diagnostic, and a `len` larger than the kernel buffer
+//! was an ordinary mapped over-read/write. So the two are folded:
+//! [`copy_to_user`], [`copy_from_user`], [`write_user_val`] and
+//! [`read_user_into`] validate, prefault and copy, take slices (so `len` cannot
+//! disagree with the buffer) and are **safe `fn`s**.
+//! `docs/archive/UNSAFE_AUDIT.md` §4 P0.
 //!
 //! # Prefaulting is a parameter, not a default
 //!
 //! Validation's second job is to make the range *present*, by demand-paging lazy
-//! pages ([`prefault_user_range`]) so the copy cannot fault at all. That
-//! allocates frames, takes the address space's `as_lock` and reads files — so it
-//! must not run from a context that already holds a lock the reclaim path takes,
-//! or from the abort path itself. Syscall arms want [`Prefault::Yes`]; fault-time
-//! and non-user-memory callers pass [`Prefault::No`] and say why.
+//! pages ([`prefault_user_range`]) so the copy cannot fault at all. That needs a
+//! `Process`, the address-space lock and lazy regions, so its body lives in
+//! `akuma-exec` and is reached through [`set_prefault_hook`]. Syscall arms want
+//! [`Prefault::Yes`]; fault-time and non-user-memory callers pass
+//! [`Prefault::No`] and say why.
+
+#![no_std]
+// Inherited from `akuma-exec`, where this code lived until 2026-09-02 — the same
+// allows its `lib.rs` carries for the copy helpers.
+#![allow(
+    clippy::missing_safety_doc,
+    clippy::ref_as_ptr,
+    clippy::borrow_as_ptr,
+    clippy::ptr_as_ptr,
+    clippy::too_long_first_doc_paragraph,
+)]
 
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, Ordering};
-use crate::threading::set_user_copy_fault_handler;
+use akuma_primitives::preempt::set_user_copy_fault_handler;
 
 unsafe extern "C" {
     fn __arch_copy_user_memory(dst: *mut u8, src: *const u8, len: usize) -> u64;
@@ -316,7 +330,7 @@ pub fn validate_user_range(ptr: u64, len: usize, prefault: Prefault) -> bool {
     if !user_range_ok(ptr, len) {
         return false;
     }
-    if crate::mmu::is_current_user_range_mapped(ptr as usize, len) {
+    if akuma_mmu::is_current_user_range_mapped(ptr as usize, len) {
         return true;
     }
     match prefault {
@@ -329,162 +343,43 @@ pub fn validate_user_range(ptr: u64, len: usize, prefault: Prefault) -> bool {
         // allocation and possibly file I/O.
         Prefault::Yes => {
             prefault_user_range(ptr as usize, len)
-                && crate::mmu::is_current_user_range_mapped(ptr as usize, len)
+                && akuma_mmu::is_current_user_range_mapped(ptr as usize, len)
         }
         Prefault::No => false,
     }
 }
 
-/// Demand-page any lazy user pages covering `[start, start+len)` so a kernel-side
-/// access can touch them.
+/// A `fn(start, len) -> bool` that demand-pages any lazy user pages covering
+/// `[start, start+len)` so a kernel-side access can touch them.
 ///
-/// **Phase 7f pre-flight**: this runs inside BKL-free syscall windows (every
-/// whole-fn net/vfs guard reaches it through [`validate_user_range`], and the
-/// opt-out list made `getrandom`'s prologue join that class), so the BKL no longer
-/// serializes its PTE installs against a peer core. Each page's PTE install +
-/// frame bookkeeping therefore runs under the address space's `as_lock`, the same
-/// fix Phase 7e applied to the three signal-path PTE sites. Frame allocation and
-/// the file fill stay OUTSIDE that hold: the hold masks IRQs and `as_lock` is a
-/// non-reentrant `Spinlock`, so block I/O must never run under it, and the PMM's
-/// pressure path (`reclaim_clean_file_pages`) re-enters `as_lock` per page.
+/// The body needs a `Process`, the address-space lock and the lazy-region table,
+/// none of which this crate can name, so `akuma-exec` registers its
+/// implementation (`process::lazy_prefault::prefault_user_range`) here at
+/// `akuma_exec::init` time. Until then, and in host tests, it is unregistered
+/// and [`prefault_user_range`] returns `false` — fail-closed: a caller that
+/// needs a lazy page faulted in gets `EFAULT` rather than a copy into a page
+/// that is not there.
+type PrefaultFn = fn(usize, usize) -> bool;
+
+static PREFAULT_HOOK: akuma_primitives::OnceCopy<PrefaultFn> = akuma_primitives::OnceCopy::new();
+
+/// Register the demand-paging implementation. Called once from `akuma_exec::init`.
+pub fn set_prefault_hook(f: PrefaultFn) {
+    PREFAULT_HOOK.set(f);
+}
+
+/// Demand-page any lazy user pages covering `[start, start+len)` so a kernel-side
+/// access can touch them. Forwards to the hook `akuma-exec` registered via
+/// [`set_prefault_hook`]; returns `false` if none is registered (fail-closed).
+///
+/// **Phase 7f pre-flight**: reached through [`validate_user_range`] from BKL-free
+/// syscall windows. The implementation installs each page's PTE + frame
+/// bookkeeping under the address space's lock, with frame allocation and the file
+/// fill kept OUTSIDE that hold (the hold masks IRQs and the lock is a
+/// non-reentrant `Spinlock`; the PMM pressure path re-enters it per page).
 #[must_use]
 pub fn prefault_user_range(start: usize, len: usize) -> bool {
-    let page_start = start & !0xFFF;
-    let page_end = (start + len + 0xFFF) & !0xFFF;
-    // The `as_lock` guarding THIS address space's page tables lives on the
-    // thread-group leader that owns the L0 root — a CLONE_VM sibling gets a fresh
-    // `as_lock` from `fork_process`, so holding the current thread's would exclude
-    // nothing (`process/bkl_guard.rs`'s rule 1). Resolved once for the whole range;
-    // it cannot change under us, this is our own address space.
-    let as_lock_owner = crate::process::address_space_owner_pid_for_fault()
-        .and_then(crate::process::lookup_process_shared);
-    let mut va = page_start;
-    while va < page_end {
-        if !crate::mmu::is_current_user_page_mapped(va) {
-            let Some((flags, source, _region_start, _region_size)) =
-                crate::process::lazy_region_lookup(va)
-            else {
-                return false;
-            };
-            let map_flags = match &source {
-                crate::process::LazySource::File { .. } => {
-                    if flags == 0 { crate::mmu::user_flags::RW_NO_EXEC } else { flags }
-                }
-                _ => crate::mmu::user_flags::RW_NO_EXEC,
-            };
-            let Some(page_addr) = akuma_pmm::alloc_page_zeroed() else {
-                return false;
-            };
-            let page_frame = crate::PhysFrame::new(page_addr);
-            if let crate::process::LazySource::File {
-                ref path, inode, file_offset, filesz, segment_va, ..
-            } = source
-            {
-                let pg_data_start = core::cmp::max(va, segment_va);
-                let pg_data_end = core::cmp::min(va + 0x1000, segment_va + filesz);
-                if pg_data_start < pg_data_end {
-                    let dst_off = pg_data_start - va;
-                    let file_off = file_offset + (pg_data_start - segment_va);
-                    let read_len = pg_data_end - pg_data_start;
-                    let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
-                    // SAFETY: `page_ptr` is the kernel mapping of a page just
-                    // allocated here and not yet published to any page table, so
-                    // this is the only reference to it; `dst_off + read_len` is
-                    // bounded by the 4 KiB page by the two clamps above.
-                    let page_buf = unsafe {
-                        core::slice::from_raw_parts_mut(
-                            page_ptr.cast::<u8>().add(dst_off),
-                            read_len,
-                        )
-                    };
-                    let rt = crate::runtime::runtime();
-                    let got = if inode == 0 {
-                        (rt.read_at)(path, file_off, page_buf)
-                    } else {
-                        (rt.read_at_by_inode)(path, inode, file_off, page_buf)
-                    };
-                    // The range is already clamped to `filesz`, so anything less
-                    // than `read_len` is a defect, not EOF — same contract as
-                    // the demand-fault fill's `[FILL-SHORT]` in
-                    // `src/exceptions.rs`. But this site is the one that
-                    // instrument could never see: the page installed below is
-                    // PRESENT, so no later fault re-fills it, and the zero tail
-                    // of `alloc_page_zeroed`'s frame reads back as file data.
-                    // The result used to be dropped (`let _ =`), which made the
-                    // defect silent; count and name it instead.
-                    if got != Ok(read_len) {
-                        akuma_pmm::DP_PREFAULT_FILL_SHORT.fetch_add(1, Ordering::Relaxed);
-                        crate::safe_print!(224,
-                            "[FILL-SHORT/prefault] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} — page installed zero-filled\n",
-                            crate::process::read_current_pid().unwrap_or(0), inode, file_off, read_len, got, va);
-                    }
-                }
-            }
-            // Everything above (alloc + file fill) ran with no `as_lock` held.
-            // The PTE install and the frame bookkeeping must be atomic against
-            // a peer core's page-table edit on this same page — in particular
-            // against `reclaim_clean_file_pages`, whose `try_evict_ro_page`
-            // clears a live RO PTE and only returns the frame if it is already
-            // tracked. Installing outside the hold lets it observe the
-            // mapped-but-untracked instant: it clears our PTE, declines to free
-            // (untracked), and we then track a frame that is no longer mapped —
-            // a re-fault leak. One hold per page, never spanning the loop.
-            let owner_pid = crate::process::read_current_pid().unwrap_or(0);
-            let owner = crate::process::lookup_process_shared(owner_pid);
-            // SAFETY (map_user_page): installing a mapping for our own address
-            // space at a VA this loop has just confirmed unmapped, with a frame
-            // nothing else references yet.
-            //
-            // `as_lock_owner` (the L0-owning thread-group leader) supplies the
-            // lock; the frames are tracked against `owner` (this thread's
-            // Process). They are the same Process for every normal thread — only
-            // a vfork-child prefault sees them differ, and then the two locks are
-            // genuinely distinct so the nested hold below cannot self-deadlock.
-            let (table_frames, installed) = if let (Some(leader), Some(owner)) = (as_lock_owner, owner)
-                && core::ptr::eq(leader, owner)
-            {
-                let mut g = leader.address_space.lock();
-                let (tf, inst) = unsafe { crate::mmu::map_user_page(va, page_frame.addr, map_flags) };
-                if inst {
-                    g.track_user_frame(page_frame);
-                }
-                for t in &tf {
-                    g.track_page_table_frame(*t);
-                }
-                (tf, inst)
-            } else {
-                let _leader_g = as_lock_owner.map(|l| l.address_space.lock());
-                let (tf, inst) = unsafe { crate::mmu::map_user_page(va, page_frame.addr, map_flags) };
-                if let Some(owner) = owner {
-                    let mut g = owner.address_space.lock();
-                    if inst {
-                        g.track_user_frame(page_frame);
-                    }
-                    for t in &tf {
-                        g.track_page_table_frame(*t);
-                    }
-                }
-                (tf, inst)
-            };
-            // Frees run after the hold is released. Ownership rule, matching
-            // `exceptions.rs`'s `ensure_user_page_mapped` sibling: the data
-            // frame goes back to the PMM iff the PTE CAS race was lost (nothing
-            // mapped it) or there is no owner to track it. A previous version
-            // freed it iff `installed && owner.is_none()`, which leaked the
-            // frame on every lost CAS race with a live owner.
-            let tid = akuma_primitives::preempt::current_tid() as u32;
-            if !installed || owner.is_none() {
-                akuma_pmm::free_page(page_frame.addr, tid);
-            }
-            if owner.is_none() {
-                for tf in table_frames {
-                    akuma_pmm::free_page(tf.addr, tid);
-                }
-            }
-        }
-        va += 4096;
-    }
-    true
+    PREFAULT_HOOK.get().is_some_and(|f| f(start, len))
 }
 
 // ============================================================================

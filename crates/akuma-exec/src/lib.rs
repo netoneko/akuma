@@ -171,4 +171,8 @@ pub fn init(rt: ExecRuntime, cfg: ExecConfig) {
     // unregistered (host tests), which is why — unlike the ELF hooks above —
     // ordering against `pmm::init` does not matter.
     akuma_pmm::register_surviving_mapper_hook(process::reclaim::surviving_mapper);
+    // `akuma-user-access`'s one upward bridge: the demand-paging body that
+    // `validate_user_range(_, Prefault::Yes)` needs. Unregistered it fails
+    // closed (EFAULT), so ordering against other init does not matter.
+    akuma_user_access::set_prefault_hook(process::lazy_prefault::prefault_user_range);
 }
