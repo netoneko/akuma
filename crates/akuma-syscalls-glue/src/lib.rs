@@ -614,9 +614,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         // this cold arm runs held, exactly like every non-opted-out path; no-op there.
         let _held = akuma_exec::bkl::DroppedWindowPause::new();
         akuma_exec::process::with_current_process(|p| {
-            p.exited = true;
-            p.exit_code = 130;
-            p.state = akuma_exec::process::ProcessState::Zombie(130);
+            p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
+            p.exit_code.store(130, core::sync::atomic::Ordering::Relaxed);
+            p.state.store(akuma_exec::process::ProcessState::Zombie(130));
         });
         return EINTR;
     }

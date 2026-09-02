@@ -123,7 +123,7 @@ const CAP_FULL_MASK: &str = "000001ffffffffff";
 fn proc_status_text(p: &process::Process) -> String {
     let name = p.name.as_str();
     let name_field = if name.len() > 15 { &name[..15] } else { name };
-    let state = match p.state {
+    let state = match p.state.load() {
         ProcessState::Zombie(_) => "Z (zombie)",
         ProcessState::Ready | ProcessState::Running => "R (running)",
         ProcessState::Blocked => "S (sleeping)",
@@ -140,7 +140,7 @@ fn proc_status_text(p: &process::Process) -> String {
         name_field, state, p.pid, p.pid, p.parent_pid,
         CAP_FULL_MASK, CAP_FULL_MASK, CAP_FULL_MASK,
     );
-    if let ProcessState::Zombie(code) = p.state {
+    if let ProcessState::Zombie(code) = p.state.load() {
         use core::fmt::Write as _;
         let _ = writeln!(out, "ExitCode:\t{code}");
     }
@@ -162,7 +162,7 @@ fn render_pid_stat(p: &process::Process, buf: &mut [u8]) -> usize {
     // Linux's `comm` is the executable's basename, truncated to 15 bytes.
     let base = name.rsplit('/').next().unwrap_or(name);
     let comm = if base.len() > 15 { &base[..15] } else { base };
-    let state = match p.state {
+    let state = match p.state.load() {
         ProcessState::Zombie(_) => 'Z',
         ProcessState::Blocked => 'S',
         ProcessState::Ready | ProcessState::Running => 'R',

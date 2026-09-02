@@ -265,9 +265,9 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         let pid = proc.pid;
         let proc_tid = proc.thread_id;
         akuma_exec::process::with_current_process(|p| {
-            p.exited = true;
-            p.exit_code = code;
-            p.state = akuma_exec::process::ProcessState::Zombie(code);
+            p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
+            p.exit_code.store(code, core::sync::atomic::Ordering::Relaxed);
+            p.state.store(akuma_exec::process::ProcessState::Zombie(code));
         });
         if akuma_config::PROC_SYSCALL_LOG_ENABLED {
             crate::log::mark_exited(pid);
@@ -395,9 +395,9 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         let proc_tid = proc.thread_id;
         let l0_phys = proc.address_space.l0_phys();
         akuma_exec::process::with_current_process(|p| {
-            p.exited = true;
-            p.exit_code = code;
-            p.state = akuma_exec::process::ProcessState::Zombie(code);
+            p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
+            p.exit_code.store(code, core::sync::atomic::Ordering::Relaxed);
+            p.state.store(akuma_exec::process::ProcessState::Zombie(code));
         });
         if akuma_config::PROC_SYSCALL_LOG_ENABLED {
             crate::log::mark_exited(pid);

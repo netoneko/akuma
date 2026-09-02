@@ -1495,7 +1495,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
         last_syscall: u64,
     }
     let infos = crate::process::table::collect_process_info(|p| {
-        let st = match p.state {
+        let st = match p.state.load() {
             ProcessState::Ready => 0u8,
             ProcessState::Running => 1,
             ProcessState::Blocked => 2,

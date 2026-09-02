@@ -7859,7 +7859,7 @@ fn test_exit_group_does_not_unregister_while_siblings_running() {
     // Verify sibling still exists in table but is marked Zombie
     let (exists, is_zombie) = crate::irq::with_irqs_disabled(|| {
         if let Some(proc) = akuma_exec::process::lookup_process_shared(sib_pid) {
-            (true, matches!(proc.state, ProcessState::Zombie(_)))
+            (true, matches!(proc.state.load(), ProcessState::Zombie(_)))
         } else {
             (false, false)
         }
@@ -14734,9 +14734,9 @@ fn test_entry_point_trampoline_no_zombie_match() {
 
     // Simulate a zombie left by kill_thread_group (thread_id cleared).
     let mut zombie_proc = make_test_process(zombie_pid);
-    zombie_proc.exited = true;
-    zombie_proc.exit_code = 137;
-    zombie_proc.state = ProcessState::Zombie(137);
+    zombie_proc.exited.store(true, core::sync::atomic::Ordering::Relaxed);
+    zombie_proc.exit_code.store(137, core::sync::atomic::Ordering::Relaxed);
+    zombie_proc.state.store(ProcessState::Zombie(137));
     zombie_proc.thread_id = None; // cleared by fix
     register_process(zombie_pid, zombie_proc);
 
@@ -14858,15 +14858,15 @@ fn test_zombie_process_unregistered_after_return_to_kernel() {
     // exit_group: the caller marks itself exited+Zombie (as sys_exit_group does)
     // BEFORE tearing down the group, then kills the siblings.
     akuma_exec::process::table::with_process(caller_pid, |caller| {
-        caller.exited = true;
-        caller.exit_code = 0;
-        caller.state = ProcessState::Zombie(0);
+        caller.exited.store(true, core::sync::atomic::Ordering::Relaxed);
+        caller.exit_code.store(0, core::sync::atomic::Ordering::Relaxed);
+        caller.state.store(ProcessState::Zombie(0));
     });
     kill_thread_group(caller_pid, l0_phys, 0);
 
     // The caller remains a registered zombie; the sibling is auto-reaped.
     let still_registered = lookup_process_shared(caller_pid).is_some();
-    let is_exited = lookup_process_shared(caller_pid).is_some_and(|p| p.exited);
+    let is_exited = lookup_process_shared(caller_pid).is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
     let sibling_gone = lookup_process_shared(sibling_pid).is_none();
 
     // return_to_kernel then unregisters the zombie caller.
@@ -16166,15 +16166,15 @@ fn test_exit_terminates_calling_thread() {
     register_process(pid, make_test_process(pid));
 
     // Before kill: not exited
-    let before = lookup_process_shared(pid).is_none_or(|p| p.exited);
+    let before = lookup_process_shared(pid).is_none_or(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
 
     // Kill it
     let _ = akuma_exec::process::kill_process(pid);
 
     // After kill: exited=true, state=Zombie
-    let after_exited = lookup_process_shared(pid).is_some_and(|p| p.exited);
+    let after_exited = lookup_process_shared(pid).is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
     let after_zombie = lookup_process_shared(pid).is_some_and(|p|
-        matches!(p.state, akuma_exec::process::ProcessState::Zombie(_))
+        matches!(p.state.load(), akuma_exec::process::ProcessState::Zombie(_))
     );
 
     let _ = unregister_process(pid);
@@ -16325,7 +16325,7 @@ fn test_kill_child_processes_thread_group_matches_fork_parent() {
     register_process(compile_pid, compile);
 
     kill_child_processes(main_pid);
-    let missed_by_main = lookup_process_shared(compile_pid).is_some_and(|p| !p.exited);
+    let missed_by_main = lookup_process_shared(compile_pid).is_some_and(|p| !p.exited.load(core::sync::atomic::Ordering::Relaxed));
 
     kill_child_processes_for_thread_group(l0);
     let compile_gone = lookup_process_shared(compile_pid).is_none();
@@ -17696,8 +17696,8 @@ fn test_sigterm_vs_sigkill_behavior() {
     let _ = akuma_exec::process::kill_process_with_signal(pid_term, 15);
     let _ = akuma_exec::process::kill_process_with_signal(pid_kill, 9);
 
-    let term_code = lookup_process_shared(pid_term).map_or(0, |p| p.exit_code);
-    let kill_code = lookup_process_shared(pid_kill).map_or(0, |p| p.exit_code);
+    let term_code = lookup_process_shared(pid_term).map_or(0, |p| p.exit_code.load(core::sync::atomic::Ordering::Relaxed));
+    let kill_code = lookup_process_shared(pid_kill).map_or(0, |p| p.exit_code.load(core::sync::atomic::Ordering::Relaxed));
 
     let _ = unregister_process(pid_term);
     let _ = unregister_process(pid_kill);
@@ -17800,7 +17800,7 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
     let leader_name_ok = lookup_process_shared(leader_pid)
         .is_some_and(|p| p.name == "leader_test");
     let leader_not_exited = lookup_process_shared(leader_pid)
-        .is_some_and(|p| !p.exited);
+        .is_some_and(|p| !p.exited.load(core::sync::atomic::Ordering::Relaxed));
     let goroutine_gone = lookup_process_shared(goroutine_pid).is_none();
 
     // Cleanup — unregister anything still in the table
@@ -17912,11 +17912,11 @@ fn test_crash_goroutine_exit_kills_group() {
     let parent_name = lookup_process_shared(parent_pid)
         .is_some_and(|p| p.name == "parent_survives");
     let parent_not_exited = lookup_process_shared(parent_pid)
-        .is_some_and(|p| !p.exited);
+        .is_some_and(|p| !p.exited.load(core::sync::atomic::Ordering::Relaxed));
 
     // Child should be zombie
     let child_zombie = lookup_process_shared(child_pid)
-        .is_some_and(|p| p.exited);
+        .is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
 
     // Cleanup
     let _ = unregister_process(child_pid);
@@ -17965,7 +17965,7 @@ fn test_leader_exit_never_kills_group() {
     // Unrelated process must be unaffected
     let other_alive = lookup_process_shared(other_pid).is_some();
     let other_not_exited = lookup_process_shared(other_pid)
-        .is_some_and(|p| !p.exited);
+        .is_some_and(|p| !p.exited.load(core::sync::atomic::Ordering::Relaxed));
 
     // Cleanup — unregister everything that might still be in the table
     let _ = unregister_process(leader_pid);
@@ -18524,12 +18524,12 @@ fn test_lookup_process_shim_returns_valid_ref() {
     use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
 
     let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    let mut proc = make_test_process(pid);
-    proc.exit_code = 42;
+    let proc = make_test_process(pid);
+    proc.exit_code.store(42, core::sync::atomic::Ordering::Relaxed);
     register_process(pid, proc);
 
     let ref_ok = if let Some(p) = lookup_process_shared(pid) {
-        p.exit_code == 42
+        p.exit_code.load(core::sync::atomic::Ordering::Relaxed) == 42
     } else {
         false
     };
@@ -18674,7 +18674,7 @@ fn test_kill_process_notifies_child_channel() {
     // Zombie should still be in the table (wait4 needs to find it)
     let zombie_exists = akuma_exec::process::lookup_process_shared(child_pid).is_some();
     let is_zombie = akuma_exec::process::lookup_process_shared(child_pid)
-        .is_some_and(|p| p.exited);
+        .is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
 
     // Clean up
     let _ = akuma_exec::process::unregister_process(child_pid);
@@ -18707,7 +18707,7 @@ fn test_sigkill_goroutine_does_not_kill_leader() {
 
     // Leader is zombie (killed by kill_process_with_signal)
     let leader_zombie = lookup_process_shared(leader_pid)
-        .is_some_and(|p| p.exited);
+        .is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
 
     // list_processes must not crash (no dangling pointers)
     let _procs = list_processes();
@@ -18742,9 +18742,9 @@ fn test_zombie_stays_for_wait4_reap() {
 
     // Zombie must be in the table
     let in_table = lookup_process_shared(pid).is_some();
-    let is_exited = lookup_process_shared(pid).is_some_and(|p| p.exited);
-    let is_zombie_state = lookup_process_shared(pid).is_some_and(|p| matches!(p.state, akuma_exec::process::ProcessState::Zombie(_)));
-    let exit_code = lookup_process_shared(pid).map_or(0, |p| p.exit_code);
+    let is_exited = lookup_process_shared(pid).is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
+    let is_zombie_state = lookup_process_shared(pid).is_some_and(|p| matches!(p.state.load(), akuma_exec::process::ProcessState::Zombie(_)));
+    let exit_code = lookup_process_shared(pid).map_or(0, |p| p.exit_code.load(core::sync::atomic::Ordering::Relaxed));
     let tid_cleared = lookup_process_shared(pid).is_some_and(|p| p.thread_id.is_none());
 
     // Simulate wait4 reaping
@@ -18774,10 +18774,10 @@ fn test_orphan_children_become_zombies() {
     let _ = akuma_exec::process::kill_process(parent_pid);
 
     // Parent should be zombie
-    let parent_zombie = lookup_process_shared(parent_pid).is_some_and(|p| p.exited);
+    let parent_zombie = lookup_process_shared(parent_pid).is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
 
     // Child should also be zombie (kill_process cascades)
-    let child_zombie = lookup_process_shared(child_pid).is_some_and(|p| p.exited);
+    let child_zombie = lookup_process_shared(child_pid).is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
 
     // Both still in table (no reaper)
     let parent_in_table = lookup_process_shared(parent_pid).is_some();

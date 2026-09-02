@@ -3505,7 +3505,7 @@ fn make_test_process(
     );
     alloc::boxed::Box::new(akuma_exec::process::Process {
         pid, pgid: pid, tgid: pid, name: String::from("test"),
-        state: akuma_exec::process::ProcessState::Ready,
+        state: akuma_exec::process::AtomicProcessState::new(akuma_exec::process::ProcessState::Ready),
         address_space: akuma_exec::process::ProcAddressSpace::new(addr_space),
         context: akuma_exec::process::UserContext::new(0, 0),
         parent_pid: ppid, brk: core::sync::atomic::AtomicUsize::new(0x1000_0000), initial_brk: 0x1000_0000,
@@ -3513,7 +3513,7 @@ fn make_test_process(
         args: Vec::new(), cwd: String::from("/"),
         stdin: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
-        exited: false, exit_code: 0,
+        exited: core::sync::atomic::AtomicBool::new(false), exit_code: core::sync::atomic::AtomicI32::new(0),
         dynamic_page_tables: Vec::new(), mmap_regions: spinning_top::Spinlock::new(Vec::new()),
         lazy_regions: Spinlock::new(akuma_exec::process::LazyRegionMap::new()),
         fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new()),
@@ -5043,9 +5043,9 @@ fn test_kill_process_cascades_to_children() -> bool {
     let kill_ok = akuma_exec::process::kill_process(parent_pid).is_ok();
     // After kill, processes should be zombies (still in table, but exited=true)
     let parent_zombie = akuma_exec::process::lookup_process_shared(parent_pid)
-        .is_some_and(|p| p.exited);
+        .is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
     let child_zombie = akuma_exec::process::lookup_process_shared(child_pid)
-        .is_some_and(|p| p.exited);
+        .is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
 
     // Clean up zombies (simulates what wait4/on_thread_cleanup would do)
     let _ = akuma_exec::process::unregister_process(parent_pid);

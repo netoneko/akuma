@@ -3,7 +3,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::format;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use akuma_terminal as terminal;
 use spinning_top::Spinlock;
@@ -14,7 +14,7 @@ use crate::runtime::{runtime, config, track_frame, FrameSource, PhysFrame};
 use crate::process::types::{ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo, Pid};
 use crate::process::lifecycle::LifecycleGuard;
 use super::{
-    LazyRegionMap, NEXT_PID, Process, ProcessState, ProcessSyscallStats, SharedFdTable,
+    AtomicProcessState, LazyRegionMap, NEXT_PID, Process, ProcessState, ProcessSyscallStats, SharedFdTable,
     SharedSignalTable, StdioBuffer, UserContext,
 };
 
@@ -301,7 +301,7 @@ impl Process {
             pgid: pid,
             tgid: pid, // group leader = self
             name: String::from(name),
-            state: ProcessState::Ready,
+            state: AtomicProcessState::new(ProcessState::Ready),
             address_space: crate::process::ProcAddressSpace::new(loaded.address_space),
             context: UserContext::new(loaded.entry_point, loaded.sp),
             parent_pid: 0,
@@ -314,8 +314,8 @@ impl Process {
             cwd: String::from("/"),
             stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
             stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
-            exited: false,
-            exit_code: 0,
+            exited: AtomicBool::new(false),
+            exit_code: AtomicI32::new(0),
             dynamic_page_tables: Vec::new(),
             mmap_regions: spinning_top::Spinlock::new(Vec::new()),
             lazy_regions: Spinlock::new(lazy_regions),

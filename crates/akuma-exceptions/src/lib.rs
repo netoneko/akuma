@@ -3820,9 +3820,9 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
                 let l0_phys = proc.address_space.l0_phys();
                 let pid = proc.pid;
                 akuma_exec::process::with_current_process(|p| {
-                    p.exited = true;
-                    p.exit_code = -14; // EFAULT
-                    p.state = akuma_exec::process::ProcessState::Zombie(-14);
+                    p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
+                    p.exit_code.store(-14, core::sync::atomic::Ordering::Relaxed); // EFAULT
+                    p.state.store(akuma_exec::process::ProcessState::Zombie(-14));
                 });
                 akuma_exec::process::kill_thread_group(pid, l0_phys, -14);
                 (hooks().notify_child_channel_exited)(pid, -14);
@@ -4546,9 +4546,9 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             
             // Check if process exited - if so, return to kernel
             if let Some(proc) = akuma_exec::process::current_process_shared() {
-                if proc.exited {
-                    let exit_code = proc.exit_code;
-                    
+                if proc.exited.load(core::sync::atomic::Ordering::Relaxed) {
+                    let exit_code = proc.exit_code.load(core::sync::atomic::Ordering::Relaxed);
+
                     // Validate exit code - detect corruption (pointer-like values)
                     let exit_code_u32 = exit_code as u32;
                     if (0x40000000..0x50000000).contains(&exit_code_u32) {
@@ -4556,8 +4556,8 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                         crate::safe_print!(128, "  PID={}, exit_code={} (0x{:x}) looks like kernel address\n",
                             proc.pid, exit_code, exit_code_u32);
                         crate::safe_print!(96, "  proc ptr=0x{:x}, &exit_code=0x{:x}\n",
-                            core::ptr::from_ref(proc) as usize, 
-                            &raw const proc.exit_code as usize);
+                            core::ptr::from_ref(proc) as usize,
+                            proc.exit_code.as_ptr() as usize);
                         // Also check if the syscall frame x0 matches
                         let frame_x0 = unsafe { (*frame).x0 };
                         crate::safe_print!(64, "  frame.x0=0x{:x} (syscall arg)\n", frame_x0);

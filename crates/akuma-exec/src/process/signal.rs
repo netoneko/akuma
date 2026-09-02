@@ -117,9 +117,9 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // or by return_to_kernel if the thread reaches it.
     // (Bug #24 + #31: eager unregister caused ECHILD in wait4)
     table::with_process(pid, |p| {
-        p.exited = true;
-        p.exit_code = -9;
-        p.state = ProcessState::Zombie(-9);
+        p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
+        p.exit_code.store(-9, core::sync::atomic::Ordering::Relaxed);
+        p.state.store(ProcessState::Zombie(-9));
         p.thread_id = None; // prevent entry_point_trampoline from matching this zombie
     });
 
@@ -172,9 +172,9 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
 
     let exit_code = -(sig as i32);
     table::with_process(pid, |p| {
-        p.exited = true;
-        p.exit_code = exit_code;
-        p.state = ProcessState::Zombie(exit_code);
+        p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
+        p.exit_code.store(exit_code, core::sync::atomic::Ordering::Relaxed);
+        p.state.store(ProcessState::Zombie(exit_code));
         p.thread_id = None;
     });
 

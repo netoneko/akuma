@@ -55,7 +55,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 /// Rate-limit counter for the `[KTG-MISMATCH]` tripwire in [`kill_thread_group`].
 static KTG_MISMATCHES: AtomicUsize = AtomicUsize::new(0);
@@ -588,7 +588,14 @@ pub struct Process {
     /// exit_group() kills all threads with matching tgid.
     pub tgid: Pid,
     pub name: String,
-    pub state: ProcessState,
+    /// `AtomicProcessState`, not a plain `ProcessState`: [`Process::run`] and
+    /// [`Process::prepare_for_execution`] set it on a `&self`-only
+    /// process-lifecycle path (first entry to EL0), and signal / exception
+    /// teardown sets it from a peer core. Written under the BKL / a local IRQ
+    /// mask, never atomically, before this change; `Relaxed` is the honest
+    /// equivalent, the same call [`Process::brk`] made (`AKUMA_EXEC_AUDIT.md`
+    /// §5a). Read `.load()`, write `.store()`.
+    pub state: AtomicProcessState,
     /// This process's user address space, merged with the lock that serializes
     /// hardware page-table mutation on it (was a separate `as_lock:
     /// Spinlock<()>`). The lock-free scalar getters (`l0_phys`, `asid`,
@@ -619,8 +626,12 @@ pub struct Process {
     pub cwd: String,
     pub stdin: Arc<Spinlock<StdioBuffer>>,
     pub stdout: Arc<Spinlock<StdioBuffer>>,
-    pub exited: bool,
-    pub exit_code: i32,
+    /// `AtomicBool` / `AtomicI32`, same reasoning as [`Process::state`]:
+    /// [`Process::reset_io`] clears them on the `&self`-only first-run path, and
+    /// exit teardown (`sys_exit`, signal, exception) sets them from a peer core.
+    /// `Relaxed`. Read `.load()`, write `.store()`.
+    pub exited: AtomicBool,
+    pub exit_code: AtomicI32,
     pub dynamic_page_tables: Vec<PhysFrame>,
     /// mmap region bookkeeping.
     ///
@@ -808,12 +819,12 @@ impl Process {
             sigaltstack_size: parent.sigaltstack_size,
 
             // ── fresh for every child, regardless of primitive ──
-            state: ProcessState::Ready,
+            state: AtomicProcessState::new(ProcessState::Ready),
             // Overwritten by `spawn_child_thread_and_publish`, which the
             // `entry_point_trampoline` reads out of the registered `Process`.
             context: UserContext::default(),
-            exited: false,
-            exit_code: 0,
+            exited: AtomicBool::new(false),
+            exit_code: AtomicI32::new(0),
             dynamic_page_tables: Vec::new(),
             // `fork` replaces this with `inherit_mmap_regions_for_cow_child`;
             // `vfork`/`clone_thread` leave it empty and see the parent's mappings
@@ -978,7 +989,14 @@ impl Process {
     ///
     /// Called only from [`entry_point_trampoline`], for a thread's *first* entry to
     /// EL0.
-    pub fn run(&mut self) -> ! {
+    ///
+    /// `&self`: the only field it mutates is [`Process::state`] (now an atomic),
+    /// so the trampoline can reach it through a shared `&'static Process` from
+    /// `table::active_process_ref` rather than a raw `&mut *proc_ptr`. Address
+    /// space activation and `enter_user_mode_checked` are already `&self` / free
+    /// functions. This is the first-run half of Phase 7f
+    /// (`docs/archive/BKL_PHASE7_AUDIT.md` §5).
+    pub fn run(&self) -> ! {
         // Last gate before installing an address space and eret'ing into it: this
         // thread slot must actually belong to this process. `THREAD_PID_MAP` naming a
         // *different* pid is proof it does not — running anyway would activate a
@@ -996,7 +1014,7 @@ impl Process {
             loop { crate::threading::yield_now(); }
         }
 
-        self.state = ProcessState::Running;
+        self.state.store(ProcessState::Running);
 
         // Activate the user address space
         self.address_space.activate();
@@ -1012,8 +1030,8 @@ impl Process {
     ///
     /// Sets up process state and writes process info to the info page.
     /// Does NOT register in process table or enter userspace.
-    pub(crate) fn prepare_for_execution(&mut self) {
-        self.state = ProcessState::Running;
+    pub(crate) fn prepare_for_execution(&self) {
+        self.state.store(ProcessState::Running);
 
         // Reset per-process I/O state
         self.reset_io();
@@ -1103,12 +1121,13 @@ impl Process {
         new_brk
     }
 
-    /// Reset I/O state for execution
-    pub fn reset_io(&mut self) {
+    /// Reset I/O state for execution. `&self`: `stdin`/`stdout` are `Arc<Spinlock>`
+    /// and `exited`/`exit_code` are atomics.
+    pub fn reset_io(&self) {
         self.stdin.lock().pos = 0;
         self.stdout.lock().clear();
-        self.exited = false;
-        self.exit_code = 0;
+        self.exited.store(false, Ordering::Relaxed);
+        self.exit_code.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1550,7 +1569,7 @@ pub fn dump_orphan_processes() {
     // nested taker of both goes table -> map, and this keeps it that way.
     let mut candidates: Vec<(Pid, Pid, Option<usize>, bool)> = Vec::new();
     table::for_each_process(|p| {
-        candidates.push((p.pid, p.tgid, p.thread_id, p.exited));
+        candidates.push((p.pid, p.tgid, p.thread_id, p.exited.load(Ordering::Relaxed)));
     });
     for (pid, tgid, thread_id, exited) in candidates {
         if exited || table::thread_for_pid(pid).is_some() {
@@ -1575,7 +1594,7 @@ fn kill_children_whose_parent_in(parents: &BTreeSet<Pid>) {
     table::for_each_process(|p| {
         if parents.contains(&p.parent_pid) {
             children.push((p.pid, p.parent_pid, p.thread_id, p.address_space.l0_phys(),
-                p.exited, p.name.clone()));
+                p.exited.load(Ordering::Relaxed), p.name.clone()));
         }
     });
 
@@ -1628,9 +1647,9 @@ fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
             cleanup_process_fds(proc);
         }
         table::with_process(*pid, |p| {
-            p.exited = true;
-            p.exit_code = 137;
-            p.state = ProcessState::Zombie(137);
+            p.exited.store(true, Ordering::Relaxed);
+            p.exit_code.store(137, Ordering::Relaxed);
+            p.state.store(ProcessState::Zombie(137));
             p.thread_id = None;
         });
         // Same Arc as register_child_channel / notify_child_channel_exited /
@@ -2163,7 +2182,7 @@ pub extern "C" fn return_to_kernel_from_fault(exit_code: i32) -> ! {
 fn cleanup_process_fds(proc: &Process) {
     let mut live_sharers = 0usize;
     table::for_each_process(|p| {
-        if !p.exited && Arc::ptr_eq(&p.fds, &proc.fds) {
+        if !p.exited.load(Ordering::Relaxed) && Arc::ptr_eq(&p.fds, &proc.fds) {
             live_sharers += 1;
         }
     });
@@ -3384,18 +3403,21 @@ pub extern "C" fn entry_point_trampoline() -> ! {
     if lifecycle_trace_on() {
         crate::safe_print!(64, "[FORK-DBG] trampoline ENTRY tid={}\n", tid);
     }
-    let proc_ptr: *mut Process = resolve_thread_process(tid)
-        .and_then(table::get_process_ptr)
-        .unwrap_or(core::ptr::null_mut());
+    // `active_process_ref` → a safe `&'static Process`. Same lifetime basis as
+    // `lookup_process_shared` (akuma-slot-table's deferred-reclaim contract):
+    // this is the trampoline's own just-spawned process, which cannot be freed
+    // before its first run.
+    let proc = resolve_thread_process(tid).and_then(table::active_process_ref);
 
-    if proc_ptr.is_null() || crate::threading::is_thread_terminated(tid) {
-        if proc_ptr.is_null() {
+    if proc.is_none() || crate::threading::is_thread_terminated(tid) {
+        if proc.is_none() {
             log::debug!("[process] FATAL: No process found for thread {}", tid);
         }
         crate::threading::mark_current_terminated();
         loop { crate::threading::yield_now(); }
     }
-    
+    let proc = proc.unwrap();
+
     // SIGURG guard: Clear any pending SIGURG if sigaltstack isn't configured.
     // Go's runtime sends SIGURG to newly created M-threads for goroutine preemption,
     // but the thread hasn't finished mstart1 initialization yet (sigaltstack not set).
@@ -3416,14 +3438,11 @@ pub extern "C" fn entry_point_trampoline() -> ! {
         }
     }
     
-    unsafe {
-        let proc = &*proc_ptr;
-        if proc.exited {
-            crate::threading::mark_current_terminated();
-            loop { crate::threading::yield_now(); }
-        }
-        (*proc_ptr).run();
+    if proc.exited.load(Ordering::Relaxed) {
+        crate::threading::mark_current_terminated();
+        loop { crate::threading::yield_now(); }
     }
+    proc.run()
 }
 
 
@@ -3645,7 +3664,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
     
     alloc::boxed::Box::new(Process {
         pid, pgid: pid, tgid: pid, name: "test".to_string(),
-        state: ProcessState::Ready,
+        state: AtomicProcessState::new(ProcessState::Ready),
         address_space: ProcAddressSpace::new(addr_space),
         context: UserContext::new(0, 0),
         parent_pid: 0, brk: AtomicUsize::new(0x1000_0000), initial_brk: 0x1000_0000,
@@ -3653,7 +3672,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         args: Vec::new(), cwd: "/".to_string(),
         stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
-        exited: false, exit_code: 0,
+        exited: AtomicBool::new(false), exit_code: AtomicI32::new(0),
         dynamic_page_tables: Vec::new(), mmap_regions: Spinlock::new(Vec::new()),
         lazy_regions: Spinlock::new(LazyRegionMap::new()),
         fds: Arc::new(SharedFdTable::new()),

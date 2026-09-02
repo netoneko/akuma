@@ -587,27 +587,27 @@ pub fn spawn_process_with_channel_ext(
 
 /// Execute a process that is already registered in the PROCESS_TABLE
 pub(crate) fn run_registered_process(pid: Pid) -> ! {
-    // SAFETY: called only from the process's own just-spawned thread (or the
-    // spawner handing off to it) on a BKL-held path, before first entry to
-    // user mode — no other reference to this Process is live. First-run
-    // lifecycle window, same class as execve's `replace_image` (Phase 7f).
-    unsafe {
-        let _ = crate::process::table::with_process_exclusive::<(), _>(pid, |proc| {
-            // Prepare the process (set state, write process info page)
-            proc.prepare_for_execution();
+    // `prepare_for_execution`, `address_space.activate()` and
+    // `enter_user_mode_checked` are all `&self` — `Process::state` and the I/O
+    // reset flags became atomics (`AKUMA_EXEC_AUDIT.md` §6.E group 2a) — so this
+    // first-run window reaches its process through a safe shared borrow instead
+    // of `with_process_exclusive`.
+    let Some(proc) = lookup_process_shared(pid) else {
+        // Reached only if the process vanished between spawn and first run.
+        panic!("Process not found in run_registered_process");
+    };
 
-            // Activate the user address space (sets TTBR0)
-            proc.address_space.activate();
+    // Prepare the process (set state, write process info page)
+    proc.prepare_for_execution();
 
-            // Now safe to enable IRQs - TTBR0 is set to user tables
-            (runtime().enable_irqs)();
+    // Activate the user address space (sets TTBR0)
+    proc.address_space.activate();
 
-            // Enter user mode via ERET - this never returns
-            enter_user_mode_checked(&proc.context);
-        });
-    }
-    // Reached only if the process vanished between spawn and first run.
-    panic!("Process not found in run_registered_process");
+    // Now safe to enable IRQs - TTBR0 is set to user tables
+    (runtime().enable_irqs)();
+
+    // Enter user mode via ERET - this never returns
+    enter_user_mode_checked(&proc.context)
 }
 
 #[cfg(test)]

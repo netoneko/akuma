@@ -40,15 +40,27 @@ groups, and the crate cannot `forbid` until all three clear** (group 1 landed
    `lookup_process_shared` deref is gone (safe `table::active_process_ref` →
    `SlotTable::active_ref`). Both survive only because Group 2 (below) has not
    removed `with_process_exclusive`'s callers yet.
-2. **The execve / first-run *exclusive* window (3)** —
-   `with_own_process_exclusive`, `run_registered_process`,
-   `entry_point_trampoline` all need a non-IRQ-masked `&mut Process` across
-   `replace_image` (block I/O, allocations) or `Process::run` (`eret`, never
-   returns). This is **Phase 7f** (`BKL_PHASE7_AUDIT.md` §5) — converting the
-   destructive lifecycle window to a real lock — and is a project in its own
-   right, not a wrapper. `with_process_exclusive` is `unsafe fn` precisely so
-   these three acknowledge the obligation; a generic `akuma-slot-table` can move
-   the deref but not remove the `unsafe`.
+2. **The execve / first-run *exclusive* window (3)** — Phase 7f
+   (`BKL_PHASE7_AUDIT.md` §5), converting the destructive lifecycle window to
+   real interior mutability. Two shapes:
+   - **2a — first-run (`run_registered_process`, `entry_point_trampoline`).**
+     **Done 2026-09-02.** The only `&mut` need was `Process::run` /
+     `prepare_for_execution` setting `self.state` (+ `reset_io` clearing
+     `exited`/`exit_code`). Those three fields became atomics —
+     `state: AtomicProcessState` (an `AtomicU64` packing `Zombie(i32)`, in
+     `akuma-exec-core`), `exited: AtomicBool`, `exit_code: AtomicI32` — the same
+     call `brk` made in §5a, ~50 mechanical call-site edits across 5 crates.
+     `run`/`prepare_for_execution`/`reset_io` now take `&self`; both sites reach
+     their process through `table::active_process_ref` (safe). **7 → 5** sites.
+   - **2b — the execve destructive window (`with_own_process_exclusive` →
+     `replace_image`).** Open. `Spinlock<ProcessImage>` sub-struct over
+     `replace_image`'s bare-field mutation set (`entry_point`, `initial_brk`,
+     `memory`, `dynamic_page_tables`, `args`, `context`, `process_info_phys`,
+     `clear_child_tid`, `sigaltstack_*`, `name`); `replace_image` takes `&self`;
+     every peer reader of those fields takes the same lock. Follows the
+     `ProcAddressSpace` precedent — **not** a coarse `PROCESS_TABLE_LOCK`
+     (§9.2 rejected that). Removes `with_process_exclusive` + its 1 forwarding
+     block in `table.rs` + `with_own_process_exclusive`.
 3. **Two decoupled-pointer sites (2)** — `fork`'s `demote_range_to_ro` (its
    `parent_l0` and the serializing `parent_as` lock are *deliberately
    independent* parameters — the self-test passes a lock stand-in whose own L0

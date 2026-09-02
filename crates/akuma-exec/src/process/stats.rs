@@ -123,7 +123,7 @@ pub fn dump_running_process_stats() {
     if !process_syscall_stats_enabled() { return; }
     let mut pids: Vec<(Pid, String, u64)> = Vec::new();
     table::for_each_process(|p| {
-        if !p.exited && p.start_time_us > 0 {
+        if !p.exited.load(core::sync::atomic::Ordering::Relaxed) && p.start_time_us > 0 {
             pids.push((p.pid, p.name.clone(), p.start_time_us));
         }
     });

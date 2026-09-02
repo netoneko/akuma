@@ -450,6 +450,83 @@ pub enum ProcessState {
     Zombie(i32),
 }
 
+impl ProcessState {
+    /// Pack into a `u64` for [`AtomicProcessState`]: tag in the low byte, the
+    /// `Zombie` exit code (as `u32`) in bits [8:40).
+    #[must_use]
+    pub const fn to_bits(self) -> u64 {
+        match self {
+            Self::Ready => 0,
+            Self::Running => 1,
+            Self::Blocked => 2,
+            Self::Zombie(code) => 3 | ((code.cast_unsigned() as u64) << 8),
+        }
+    }
+
+    /// Inverse of [`to_bits`](Self::to_bits). An unrecognised tag decodes to
+    /// `Ready` — unreachable for a value this module produced, and a safer
+    /// default than a panic on the atomic read path.
+    #[must_use]
+    pub const fn from_bits(bits: u64) -> Self {
+        match bits & 0xff {
+            1 => Self::Running,
+            2 => Self::Blocked,
+            3 => Self::Zombie(((bits >> 8) as u32).cast_signed()),
+            _ => Self::Ready,
+        }
+    }
+}
+
+/// A [`ProcessState`] behind a relaxed `AtomicU64`, so `Process::state` can be
+/// read and written through `&self`.
+///
+/// Was a plain `ProcessState` field mutated through `&mut Process` — which the
+/// process-lifecycle windows (`Process::run`, `prepare_for_execution`) needed a
+/// non-IRQ-masked exclusive borrow for, one of the last things blocking
+/// `akuma-exec` from `#![forbid(unsafe_code)]`. The old field was written under
+/// the BKL / a local IRQ mask, never atomically; `Ordering::Relaxed` is the
+/// honest equivalent, the same call `Process::brk` made
+/// (`docs/archive/AKUMA_EXEC_AUDIT.md` §5a).
+#[derive(Debug)]
+pub struct AtomicProcessState(core::sync::atomic::AtomicU64);
+
+impl AtomicProcessState {
+    #[must_use]
+    pub const fn new(s: ProcessState) -> Self {
+        Self(core::sync::atomic::AtomicU64::new(s.to_bits()))
+    }
+
+    #[must_use]
+    pub fn load(&self) -> ProcessState {
+        ProcessState::from_bits(self.0.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn store(&self, s: ProcessState) {
+        self.0.store(s.to_bits(), core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod process_state_bits_tests {
+    use super::ProcessState;
+
+    #[test]
+    fn roundtrips_every_variant() {
+        for s in [
+            ProcessState::Ready,
+            ProcessState::Running,
+            ProcessState::Blocked,
+            ProcessState::Zombie(0),
+            ProcessState::Zombie(137),
+            ProcessState::Zombie(-9),
+            ProcessState::Zombie(i32::MIN),
+            ProcessState::Zombie(i32::MAX),
+        ] {
+            assert_eq!(ProcessState::from_bits(s.to_bits()), s);
+        }
+    }
+}
+
 /// User context saved during kernel entry
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

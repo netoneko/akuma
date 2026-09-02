@@ -347,7 +347,7 @@ pub fn count_process_states() -> (usize, usize, usize) {
     let mut blocked = 0usize;
     PROCESS_TABLE.for_each_active(|_, p| {
         total += 1;
-        match p.state {
+        match p.state.load() {
             crate::process::types::ProcessState::Ready
             | crate::process::types::ProcessState::Running => running += 1,
             crate::process::types::ProcessState::Blocked => blocked += 1,
