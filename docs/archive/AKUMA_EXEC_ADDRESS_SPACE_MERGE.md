@@ -237,27 +237,63 @@ in the common case, two distinct guards (leader's then owner's) in the rare one.
 
 ## 8. Verification
 
-Full A/B against `a6c7aef0` per `docs/runbooks/verify-trim-fat-change.md`.
+Run at `26b57133` against the parent `a6c7aef0`, per
+`docs/runbooks/verify-trim-fat-change.md`. All `MEMORY=2048`.
 
-**Tier 1** (`verify_trim.py --tier 1`): all four clippy configs clean
-(`release`, `extreme-size`, `devbox-smoltcp`, `devbox-rump`), 1102 host tests, 0
-failed. akuma-exec / akuma-mmu / akuma-mmap host suites: 116 / 57 / 11.
+### `verify_trim.py` full A/B (tiers 1–3)
 
-**Tier 2** (boot + 17 exercises, `MEMORY=2048`):
+The two summaries are **identical except one line**:
 
-| | SMP=1 | SMP=4 |
-|---|---|---|
-| booted | yes | yes |
-| exercises | 17/17 `ok` | 17/17 `ok` |
-| `fail_set` | empty | empty |
-| `passed_marker` | 310 | 318 |
-| `pass_marker` | 100 | 100 |
+```
+33c33
+< smp4.bkl_stuck: 102        (base a6c7aef0)
+> smp4.bkl_stuck: 101        (mine)
+```
 
-`bkl_stuck` (0 / 87) and `host_timejumps` (1 / 0) are informational.
-`stack_overflow: 1` on both — the `stackstress` exercise's deliberate canary
-smash, symmetric across configs, exercise still `ok`.
+`bkl_stuck` is load-driven and explicitly not compared by count. Everything else
+matched byte-for-byte on both arms:
 
-<!-- FILL: full A/B diff, mem_suite, forktest_smp_matrix, tier 4 redis, firecracker -->
+| | value (both arms) |
+|---|---|
+| `clippy.{release,extreme-size,devbox-smoltcp,devbox-rump}` | clean |
+| `host.tests` / `host.failed` | 1102 / 0 |
+| `smp{1,4}.booted` | True / True |
+| `smp{1,4}.ex.*` (17 exercises each) | all `ok` |
+| `smp{1,4}.fail_set` | empty / empty |
+| `smp{1,4}.passed_marker` | 310 / 318 |
+| `smp{1,4}.pass_marker` | 100 / 100 |
+| `smp{1,4}.host_timejumps` | 0 / 0 (host quiet — readings trustworthy) |
+| `smp{1,4}.stack_overflow` | 1 / 1 (the `stackstress` deliberate canary smash) |
+
+### `mem_suite.py --port 2222 --no-build` (live VM)
+
+`PASS (10/10 probes, 3 DIVERGE)` — `mmap_stress`, `mmapsum`, `mmap_file`,
+`mprotectlb`, `mremapmove`, `madvshared`, `shmanon`, `cowstale`,
+`eager_mprotect_probe` all `ok`; `smapsdirty` `ok, 3 DIVERGE` (the documented
+green state).
+
+### `forktest_smp_matrix.py` (SMP 2 & 4)
+
+`# ALL TESTS PASSED` — **14/14**. Every run reported
+`[BKL] RECOVERED: 0`, `[WATCHDOG]: 0`, `[PANIC]: 0`, `WILD-DA: 0`,
+`[SGI-S POISON]: 0`.
+
+### `verify_trim.py --tier 4` (redis `--test-memory` on devbox-smoltcp)
+
+`redis.stage: ok`, `redis.vm_sigsegv: 0`, `redis.timejumps: 0`. The memtest
+walked anonymous demand-paging / `USER_PAGE_RESERVE` / reclaim escalation and
+verified the bytes — no `MEMORY ERROR DETECTED`, no OOM kill.
+
+### `overlays/devbox-firecracker/{build,run}.sh` (KVM, `FC_MEM=2048`)
+
+`lines=1613 PASSED=304 FAILED=1 POISON=0`, `[PASS]` count 100, no `[FAIL]`
+marker, no `PANIC` / `[BKL] stuck` / `WILD`. The single failure is
+`thread_slot_reclaim_on_spawn` (`hot_reclaim=108, want 0, in_cooldown_window=true`)
+— the documented pre-existing timing sensitivity that fails on unmodified HEAD
+too (`PAGE_TABLE_UAF_BKL_STORM.md` §7.3 note). `PASSED=304` vs the ~305 baseline
+is a ±1 `passed_marker` move (a test reporting `INCONCLUSIVE`/`SKIPPED` instead
+of `PASSED`), within documented noise; the signal — `FAILED=1` and it is that
+one test, `POISON=0` — is clean.
 
 ## Background
 
