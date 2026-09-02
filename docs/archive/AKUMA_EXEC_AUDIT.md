@@ -30,11 +30,16 @@ fallback, new `with_phys_bytes_mut` for the prefault file-fill, the safe
 `map_user_page_tracked` for the prefault common path, and new
 `write_current_user_val` (+ `is_current_user_range_writable`) for the two CLONE
 `set_tid` EL1 stores. **37 → 25 `unsafe` sites.** What remains is **three
-groups, and the crate cannot `forbid` until all three clear**:
+groups, and the crate cannot `forbid` until all three clear** (group 1 landed
+2026-09-02 — `akuma-slot-table` extracted, **25 → 7** sites):
 
-1. **`table.rs` (18 + the `with_process_exclusive` `unsafe fn`)** — §6.D, the
-   generic `akuma-slot-table` primitive. Not started. Eliminates the whole file
-   plus `children.rs`'s `lookup_process_shared` deref (~20 sites).
+1. ~~**`table.rs` (18 + the `with_process_exclusive` `unsafe fn`)**~~ — §6.D,
+   the generic `akuma-slot-table` primitive. **Done 2026-09-02.** `table.rs`
+   holds one `unsafe` block now (`with_process_exclusive`'s body, forwarding to
+   `SlotTable::active_exclusive`) and the `unsafe fn` signature; `children.rs`'s
+   `lookup_process_shared` deref is gone (safe `table::active_process_ref` →
+   `SlotTable::active_ref`). Both survive only because Group 2 (below) has not
+   removed `with_process_exclusive`'s callers yet.
 2. **The execve / first-run *exclusive* window (3)** —
    `with_own_process_exclusive`, `run_registered_process`,
    `entry_point_trampoline` all need a non-IRQ-masked `&mut Process` across
@@ -591,10 +596,30 @@ deadlock above. Those sites take `lock()` and go through the guard.
      slot had already gone to `akuma_primitives::preempt` in step A.
      `akuma-exec` re-exports `pub use akuma_threading as threading`, so all 33
      downstream `akuma_exec::threading::…` consumers resolve unchanged.
-   - **D. `process/table.rs` (19)** — the `*mut Process` slot store. Either it
-     stays `unsafe` (a small crate that can't forbid, like `akuma-gic`) or it
-     genericizes into an `akuma-slot-table` primitive, the move
-     `akuma-locks-rw-cell` made. Open.
+   - **D. `process/table.rs` (19)** — the `*mut Process` slot store.
+     **Done 2026-09-02.** Genericized into `akuma-slot-table`: a
+     `SlotTable<T, N>` owning the FREE/ACTIVE/RETIRED state array, the
+     `[AtomicPtr<T>; N]`, the per-slot reuse generation, the retire timestamp,
+     and every deref — the move `akuma-locks-rw-cell`/`akuma-gic` made, never
+     naming `Process`. `table.rs` keeps all domain logic (the identity cache,
+     `THREAD_PID_MAP`, the reclaim hooks, `mark_thread_terminated`) and calls
+     the generic crate for each deref. The orderings and the RETIRED-window
+     generation bump are preserved verbatim. **`akuma-exec` 25 → 7** `unsafe`
+     sites; `akuma-slot-table` carries 11 behind one stated contract.
+
+     On the way, the identity cache lost its `own_ptr`/`tgid_ptr`
+     `AtomicPtr<Process>` fields: `identity_get` now derives the pointer with
+     `SlotTable::ref_if_current(slot, stamped_generation)`, which within one
+     generation is immutable and equal to what the cached pointer held (the
+     comment at the old deref site already argued this). The `*_slot` stores
+     became the `Release` publication point that `*_ptr` used to be.
+     `collect_process_info`'s two `MaybeUninit` array sites went too —
+     `[T::default(); N]` with the existing `T: Copy` bound. Gates: full boot
+     self-test suite green (`identity_lazy_restamp`, `identity_recycled_slot_rejected`,
+     `epilogue_identity_revalidated`, `fork-bkl-drop`,
+     `pmm_conserved_across_spawn_exit_reap`, `retired_reclaim_*`, `slot_recycling`);
+     `akuma-slot-table` host tests (racing claimers/reclaimers, generation
+     tracking, cooldown).
 
    **Correction (§6.E, 2026-09-02):** A–D do **not** leave the crate
    `unsafe`-free. The execve / first-run exclusive window (`with_process_exclusive`

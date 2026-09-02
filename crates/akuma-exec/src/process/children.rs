@@ -529,9 +529,9 @@ pub fn read_current_pid() -> Option<Pid> {
 /// leader (`as_owner`), which cannot be freed while the faulting thread runs, so the
 /// reference is sound there. Foreign-PID lookups must stay on the BKL slow path.
 pub fn lookup_process_shared(pid: Pid) -> Option<&'static Process> {
-    let ptr = crate::process::table::get_process_ptr(pid)?;
+    let proc = crate::process::table::active_process_ref(pid)?;
     crate::process::diag::borrow_inc(pid);
-    Some(unsafe { &*ptr })
+    Some(proc)
 }
 
 /// Outcome of [`fault_slot_acquire`] — how the per-page demand-paging slot was won.

@@ -1,8 +1,10 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use spinning_top::Spinlock;
+
+use akuma_slot_table::{SlotMiss, SlotTable};
 
 use crate::process::Process;
 use crate::process::types::Pid;
@@ -14,59 +16,22 @@ pub const MAX_PROCESSES: usize = 256;
 /// Next available PID (monotonically increasing, never recycled)
 pub static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
-/// Slot states for the lock-free process table.
-pub mod slot_state {
-    pub const FREE: u8 = 0;
-    pub const ACTIVE: u8 = 1;
-    /// Reaped (`unregister_process`'d) but not yet freed. Invisible to
-    /// `get_process_ptr`/`for_each_process`/`register_process`'s free-slot scan —
-    /// exactly like ACTIVE is invisible to allocation and FREE is invisible to
-    /// lookup. The `Process` and its address space stay live in memory until
-    /// `reclaim_retired_processes` frees them; see that function's docs for why.
-    pub const RETIRED: u8 = 2;
-}
-
-/// Per-slot state: FREE, ACTIVE, or RETIRED.
-static SLOT_STATES: [AtomicU8; MAX_PROCESSES] = {
-    const INIT: AtomicU8 = AtomicU8::new(slot_state::FREE);
-    [INIT; MAX_PROCESSES]
-};
-
-/// Per-slot process pointer. Non-null when ACTIVE or RETIRED, null when FREE.
-/// Points to a heap-allocated Process (from Box::into_raw).
-static PROCESS_SLOTS: [AtomicPtr<Process>; MAX_PROCESSES] = {
-    const INIT: AtomicPtr<Process> = AtomicPtr::new(core::ptr::null_mut());
-    [INIT; MAX_PROCESSES]
-};
-
-/// Per-slot retirement timestamp (uptime_us), valid while the slot is RETIRED.
-/// Read by `reclaim_retired_processes` to enforce the cooldown; see its docs.
-static RETIRE_TIME: [AtomicU64; MAX_PROCESSES] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_PROCESSES]
-};
-
-/// Per-slot reuse generation — the thing that makes `SLOT_STATES[i] == ACTIVE`
-/// mean "still the occupant you cached" rather than merely "somebody is here".
+/// The lock-free slot store: per-slot FREE/ACTIVE/RETIRED state, the `*mut
+/// Process` pointer, a reuse generation, and a retire timestamp — and every
+/// dereference of those pointers. See `akuma-slot-table`'s crate docs for the
+/// one stated contract (deferred reclamation + cooldown) that all the
+/// borrow-returning accessors below rest on.
 ///
-/// The slot lifecycle is ACTIVE → RETIRED → (reclaim frees the `Process`) → FREE
-/// → claimed again → ACTIVE. Validating on state alone cannot see the round
-/// trip: a recycled slot reads ACTIVE while a cached pointer into it dangles, so
-/// the check passes and the deref is a use-after-free
-/// (`docs/archive/IDENTITY_CACHE_SMP_REVIEW.md` Finding B).
-///
-/// **Pointer equality is not a substitute.** `Process` is a fixed-size
-/// allocation, so the allocator can hand the same address to the new occupant —
-/// that comparison passes while returning the wrong identity.
-///
-/// Bumped in exactly one place, `reclaim_retired_processes_internal`, between
-/// the pointer swap and the `FREE` store. The slot is RETIRED across the bump
-/// and every reader already falls back on a non-ACTIVE state, so no reader can
-/// observe ACTIVE paired with a stale stamp.
-static SLOT_GEN: [AtomicU32; MAX_PROCESSES] = {
-    const INIT: AtomicU32 = AtomicU32::new(0);
-    [INIT; MAX_PROCESSES]
-};
+/// The slot lifecycle is ACTIVE → RETIRED → (`reclaim_retired` frees the
+/// `Process`) → FREE → claimed again → ACTIVE. The reuse generation is what
+/// makes `is_active(i)` mean "still the occupant you cached" rather than merely
+/// "somebody is here": a recycled slot reads ACTIVE while a cached pointer
+/// dangles (`docs/archive/IDENTITY_CACHE_SMP_REVIEW.md` Finding B), and pointer
+/// equality is no substitute because `Process` is a fixed-size allocation the
+/// allocator can hand straight back. `reclaim_retired` bumps the generation
+/// between the pointer swap and the `FREE` store, while the slot is RETIRED, so
+/// no reader can observe ACTIVE paired with a stale stamp.
+static PROCESS_TABLE: SlotTable<Process, MAX_PROCESSES> = SlotTable::new();
 
 /// Register a process in the table (takes ownership via Box).
 ///
@@ -74,10 +39,10 @@ static SLOT_GEN: [AtomicU32; MAX_PROCESSES] = {
 /// The Process is kept alive until `unregister_process` + `reclaim_retired_processes`
 /// reclaim it.
 pub fn register_process(_pid: Pid, proc: Box<Process>) {
-    let ptr = Box::into_raw(proc);
-    if try_claim_free_slot(ptr) {
-        return;
-    }
+    let proc = match PROCESS_TABLE.try_claim(proc) {
+        Ok(_slot) => return,
+        Err(proc) => proc,
+    };
     // Miss: deliberately NOT calling `reclaim_retired_processes` here, even though
     // the table may simply be full of cooled-down zombies awaiting periodic
     // reclamation rather than genuinely out of slots (the same shape
@@ -97,7 +62,7 @@ pub fn register_process(_pid: Pid, proc: Box<Process>) {
     // original 100 ms `netpoll_maint` one. Requesting a drain is lock-free, so it IS
     // safe from here — collecting is not.
     crate::process::reclaim::request_retired_reclaim();
-    unsafe { drop(Box::from_raw(ptr)); }
+    drop(proc);
     // OPEN (docs/reference/subsystems/memory.md → "OPEN: a full process table still
     // panics the kernel"): this should return an error so fork/clone/spawn surface
     // -EAGAIN — "collector starved, retry" — instead of halting the box, since every
@@ -110,22 +75,6 @@ pub fn register_process(_pid: Pid, proc: Box<Process>) {
         MAX_PROCESSES,
         retired_process_count()
     );
-}
-
-/// Try to claim one FREE slot and install `ptr` into it. Returns whether it succeeded.
-fn try_claim_free_slot(ptr: *mut Process) -> bool {
-    for i in 0..MAX_PROCESSES {
-        if SLOT_STATES[i].compare_exchange(
-            slot_state::FREE,
-            slot_state::ACTIVE,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-        ).is_ok() {
-            PROCESS_SLOTS[i].store(ptr, Ordering::Release);
-            return true;
-        }
-    }
-    false
 }
 
 /// Retire a process from the table: makes it invisible to `get_process_ptr`,
@@ -147,78 +96,59 @@ fn try_claim_free_slot(ptr: *mut Process) -> bool {
 /// window could still be open. See docs/archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md
 /// (Phase 7e, "Free" half) and docs/archive/BKL_PHASE7_AUDIT.md §2.1/§2.1.1.
 pub fn unregister_process(pid: Pid) -> bool {
-    for i in 0..MAX_PROCESSES {
-        if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-            continue;
-        }
-        let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-        if ptr.is_null() {
-            continue;
-        }
-        if unsafe { (*ptr).pid } != pid {
-            continue;
-        }
-        // Claim the ACTIVE -> RETIRED transition exclusively. Losing this CAS means
-        // another thread already retired (or is retiring) this exact slot; the
-        // scalar `pid` match above can't tell those apart from us, the CAS can.
-        if SLOT_STATES[i].compare_exchange(
-            slot_state::ACTIVE,
-            slot_state::RETIRED,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ).is_err() {
-            continue;
-        }
-        RETIRE_TIME[i].store((runtime().uptime_us)(), Ordering::Release);
-        // Stamp how much memory this slot is parking and flag that a collector is
-        // wanted. Scalar, taken here while the `Process` is provably alive — a reader
-        // on the pressure path must never dereference a RETIRED `Process` to size it,
-        // since that races the very drop it is trying to schedule. See
-        // `process::reclaim`.
-        crate::process::reclaim::note_retired(
-            i,
-            unsafe { (*ptr).address_space.resident_pages() } as u32,
-        );
-        // Mark the process's thread as TERMINATED before unregistering.
-        // This prevents orphaned threads that stay READY forever after
-        // their process is reaped. Without this, kthreads shows "user-process"
-        // threads with no corresponding process, and switching to them hangs.
-        //
-        // IMPORTANT: Only mark terminated if this is NOT the current thread.
-        // Tests call unregister_process from the same thread to clean up,
-        // and marking ourselves terminated would cause Thread 0's cleanup
-        // to zero our context while we're still running.
-        //
-        // IMPORTANT: `thread_id` is only a *recorded* slot number, and thread slots
-        // are recycled (`cleanup_terminated_internal`, ~10 ms cooldown). A process
-        // whose thread already self-terminated can have that slot handed to a brand
-        // new, unrelated process before this runs — `kill_thread_group` PHASE 2 is
-        // the path that gets there late, because PHASE 1 only *requests* deferred
-        // kills and then grace-waits up to 2 s for siblings to reach their EL1→EL0
-        // boundary. Terminating a recycled slot kills an innocent thread and leaves
-        // ITS process alive with no thread at all: unschedulable, unable to exit,
-        // never reaped, and its parent's `wait4` blocked forever. That is the silent
-        // `rustc big.rs` hang (a linker `gcc` lost its only thread mid-link).
-        //
-        // So consult THREAD_PID_MAP, which records the slot's *current* owner. Only
-        // an entry naming a different pid proves the slot was stolen; a missing entry
-        // means nobody has claimed it, and terminating it is still the right thing
-        // (that is the orphaned-READY-thread case the paragraph above describes).
-        if let Some(tid) = unsafe { (*ptr).thread_id } {
-            let current_tid = crate::threading::current_thread_id();
-            let slot_owner = with_irqs_disabled(|| THREAD_PID_MAP.lock().get(&tid).copied());
-            let recycled = matches!(slot_owner, Some(owner) if owner != pid);
-            if recycled {
-                crate::safe_print!(112, "[unregister] pid={} stale tid={} now owned by pid={}\n",
-                    pid, tid, slot_owner.unwrap_or(0));
+    // `SlotTable::retire` does the ACTIVE→RETIRED CAS (losing it — a racing
+    // retire of this exact slot — skips to the next match) and stamps the
+    // retire time *after* the CAS wins. The closure runs with the slot RETIRED
+    // and the `Process` provably still live.
+    PROCESS_TABLE.retire(
+        || (runtime().uptime_us)(),
+        |p| p.pid == pid,
+        |i, p| {
+            // Stamp how much memory this slot is parking and flag that a collector is
+            // wanted. Scalar, taken here while the `Process` is provably alive — a reader
+            // on the pressure path must never dereference a RETIRED `Process` to size it,
+            // since that races the very drop it is trying to schedule. See
+            // `process::reclaim`.
+            crate::process::reclaim::note_retired(i, p.address_space.resident_pages() as u32);
+            // Mark the process's thread as TERMINATED before unregistering.
+            // This prevents orphaned threads that stay READY forever after
+            // their process is reaped. Without this, kthreads shows "user-process"
+            // threads with no corresponding process, and switching to them hangs.
+            //
+            // IMPORTANT: Only mark terminated if this is NOT the current thread.
+            // Tests call unregister_process from the same thread to clean up,
+            // and marking ourselves terminated would cause Thread 0's cleanup
+            // to zero our context while we're still running.
+            //
+            // IMPORTANT: `thread_id` is only a *recorded* slot number, and thread slots
+            // are recycled (`cleanup_terminated_internal`, ~10 ms cooldown). A process
+            // whose thread already self-terminated can have that slot handed to a brand
+            // new, unrelated process before this runs — `kill_thread_group` PHASE 2 is
+            // the path that gets there late, because PHASE 1 only *requests* deferred
+            // kills and then grace-waits up to 2 s for siblings to reach their EL1→EL0
+            // boundary. Terminating a recycled slot kills an innocent thread and leaves
+            // ITS process alive with no thread at all: unschedulable, unable to exit,
+            // never reaped, and its parent's `wait4` blocked forever. That is the silent
+            // `rustc big.rs` hang (a linker `gcc` lost its only thread mid-link).
+            //
+            // So consult THREAD_PID_MAP, which records the slot's *current* owner. Only
+            // an entry naming a different pid proves the slot was stolen; a missing entry
+            // means nobody has claimed it, and terminating it is still the right thing
+            // (that is the orphaned-READY-thread case the paragraph above describes).
+            if let Some(tid) = p.thread_id {
+                let current_tid = crate::threading::current_thread_id();
+                let slot_owner = with_irqs_disabled(|| THREAD_PID_MAP.lock().get(&tid).copied());
+                let recycled = matches!(slot_owner, Some(owner) if owner != pid);
+                if recycled {
+                    crate::safe_print!(112, "[unregister] pid={} stale tid={} now owned by pid={}\n",
+                        pid, tid, slot_owner.unwrap_or(0));
+                }
+                if tid != current_tid && !recycled {
+                    crate::threading::mark_thread_terminated(tid);
+                }
             }
-            if tid != current_tid && !recycled {
-                crate::threading::mark_thread_terminated(tid);
-            }
-        }
-        return true;
-    }
-    false
+        },
+    )
 }
 
 /// Free the memory of every RETIRED slot whose cooldown
@@ -250,54 +180,27 @@ pub fn reclaim_retired_processes_force() -> usize {
 }
 
 fn reclaim_retired_processes_internal(ignore_cooldown: bool) -> usize {
-    let now = (runtime().uptime_us)();
-    let cooldown_us = config().process_reclaim_cooldown_us;
-    let mut count = 0;
-    for i in 0..MAX_PROCESSES {
-        if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::RETIRED {
-            continue;
-        }
-        if !ignore_cooldown {
-            let retire_time = RETIRE_TIME[i].load(Ordering::Acquire);
-            if retire_time > 0 && now.saturating_sub(retire_time) < cooldown_us {
-                continue;
-            }
-        }
-        // Extract the pointer BEFORE releasing the slot for reuse: the state stays
-        // RETIRED throughout this swap, so `register_process` (which only claims
-        // FREE slots) can never observe a half-freed slot or race the pointer we're
-        // about to free. Two reclaimers racing the same slot (`reclaim_retired_processes`
-        // has no single-collector gate): exactly one gets the real pointer via this
-        // atomic swap, the other gets null and skips — mirrors how the old synchronous
-        // `unregister_process` handled a racing second call on the same slot.
-        let old = PROCESS_SLOTS[i].swap(core::ptr::null_mut(), Ordering::AcqRel);
-        if old.is_null() {
-            continue;
-        }
-        // Retire the generation BEFORE the slot becomes claimable. Ordering is
-        // the whole safety argument: the state is RETIRED across this bump, and
-        // every reader rejects a non-ACTIVE state, so nobody can read ACTIVE
-        // together with the pre-bump generation. Release-paired with the
-        // Acquire load in `identity_get`.
-        SLOT_GEN[i].fetch_add(1, Ordering::AcqRel);
-        SLOT_STATES[i].store(slot_state::FREE, Ordering::Release);
-        RETIRE_TIME[i].store(0, Ordering::Relaxed);
-        crate::process::reclaim::clear_retired_slot(i);
-        unsafe { drop(Box::from_raw(old)); }
-        count += 1;
-    }
-    count
+    // `SlotTable::reclaim_retired` does, per eligible RETIRED slot: swap the
+    // pointer to null (so `register_process` can never race a half-freed slot),
+    // bump the generation while the slot is still RETIRED (the ordering that is
+    // the whole safety argument — every reader rejects a non-ACTIVE state before
+    // reading the generation, so none can pair ACTIVE with the pre-bump stamp;
+    // Release-paired with the Acquire in `identity_get` via `ref_if_current`),
+    // store FREE, clear the retire stamp, run `on_free`, then drop the `Box`.
+    // Two racers on one slot: one wins the swap and frees, the other skips.
+    PROCESS_TABLE.reclaim_retired(
+        (runtime().uptime_us)(),
+        config().process_reclaim_cooldown_us,
+        ignore_cooldown,
+        |i| {
+            crate::process::reclaim::clear_retired_slot(i);
+        },
+    )
 }
 
 /// Number of RETIRED slots awaiting `reclaim_retired_processes`. Diagnostics/tests only.
 pub fn retired_process_count() -> usize {
-    let mut count = 0;
-    for i in 0..MAX_PROCESSES {
-        if SLOT_STATES[i].load(Ordering::Relaxed) == slot_state::RETIRED {
-            count += 1;
-        }
-    }
-    count
+    PROCESS_TABLE.retired_count()
 }
 
 /// Access a process by PID within a callback. **This is the safe API.**
@@ -315,10 +218,7 @@ pub fn retired_process_count() -> usize {
 /// ```
 #[inline]
 pub fn with_process<T, F: FnOnce(&mut Process) -> T>(pid: Pid, f: F) -> Option<T> {
-    with_irqs_disabled(|| {
-        let ptr = get_process_ptr_inner(pid)?;
-        Some(f(unsafe { &mut *ptr }))
-    })
+    PROCESS_TABLE.with_active_mut(|p| p.pid == pid, f)
 }
 
 /// Run `f` with exclusive `&mut Process` access and NO lock or IRQ mask — the
@@ -344,8 +244,10 @@ pub fn with_process<T, F: FnOnce(&mut Process) -> T>(pid: Pid, f: F) -> Option<T
 /// - no other reference (shared or `&mut`) to this `Process` may be live on
 ///   this thread across the call.
 pub unsafe fn with_process_exclusive<T, F: FnOnce(&mut Process) -> T>(pid: Pid, f: F) -> Option<T> {
-    let ptr = get_process_ptr(pid)?;
-    Some(f(unsafe { &mut *ptr }))
+    // SAFETY: the obligation is this function's own `# Safety` clause, forwarded
+    // verbatim to the caller — `active_exclusive` runs `f` on an unmasked
+    // `&mut Process` and vouches for nothing.
+    unsafe { PROCESS_TABLE.active_exclusive(|p| p.pid == pid, f) }
 }
 
 /// Look up a process by PID. Returns a raw pointer.
@@ -357,21 +259,15 @@ pub unsafe fn with_process_exclusive<T, F: FnOnce(&mut Process) -> T>(pid: Pid, 
 /// the `&'static mut`-returning wrappers over this pointer were deleted in
 /// Phase 7e's "Access" half.
 pub fn get_process_ptr(pid: Pid) -> Option<*mut Process> {
-    with_irqs_disabled(|| get_process_ptr_inner(pid))
+    with_irqs_disabled(|| PROCESS_TABLE.active_ptr_locked(|p| p.pid == pid))
 }
 
-/// Inner scan (no IRQ guard — caller must ensure IRQs disabled).
-fn get_process_ptr_inner(pid: Pid) -> Option<*mut Process> {
-    for i in 0..MAX_PROCESSES {
-        if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-            continue;
-        }
-        let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-        if !ptr.is_null() && unsafe { (*ptr).pid } == pid {
-            return Some(ptr);
-        }
-    }
-    None
+/// Shared `&'static Process` for `pid`, resolved under an IRQ mask. The safe
+/// form of `get_process_ptr` for readers — `lookup_process_shared` is the one
+/// caller. The borrow's validity past the mask rests on `akuma-slot-table`'s
+/// deferred-reclamation contract, the same as the raw pointer's did.
+pub fn active_process_ref(pid: Pid) -> Option<&'static Process> {
+    PROCESS_TABLE.active_ref(|p| p.pid == pid)
 }
 
 /// Iterate all active processes, calling `f` for each.
@@ -380,17 +276,7 @@ fn get_process_ptr_inner(pid: Pid) -> Option<*mut Process> {
 /// For iteration that needs allocation, use `collect_pids` + per-PID lookup.
 #[inline]
 pub fn for_each_process<F: FnMut(&Process)>(mut f: F) {
-    with_irqs_disabled(|| {
-        for i in 0..MAX_PROCESSES {
-            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-                continue;
-            }
-            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-            if !ptr.is_null() {
-                f(unsafe { &*ptr });
-            }
-        }
-    });
+    PROCESS_TABLE.for_each_active(|_, p| f(p));
 }
 
 /// Iterate all active processes, calling `f` for each. Returns early if `f` returns Some.
@@ -398,20 +284,7 @@ pub fn for_each_process<F: FnMut(&Process)>(mut f: F) {
 /// Runs entirely with IRQs disabled — the callback MUST NOT allocate.
 #[inline]
 pub fn find_process<T, F: FnMut(&Process) -> Option<T>>(mut f: F) -> Option<T> {
-    with_irqs_disabled(|| {
-        for i in 0..MAX_PROCESSES {
-            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-                continue;
-            }
-            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-            if !ptr.is_null() {
-                if let Some(result) = f(unsafe { &*ptr }) {
-                    return Some(result);
-                }
-            }
-        }
-        None
-    })
+    PROCESS_TABLE.find_active(|_, p| f(p))
 }
 
 /// Collect PIDs matching a predicate.
@@ -423,19 +296,10 @@ pub fn collect_pids<F: FnMut(&Process) -> bool>(mut pred: F) -> Vec<Pid> {
     // Phase 1: scan into fixed-size stack buffer (no heap allocation)
     let mut buf = [0u32; MAX_PROCESSES];
     let mut count = 0usize;
-    with_irqs_disabled(|| {
-        for i in 0..MAX_PROCESSES {
-            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-                continue;
-            }
-            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-            if !ptr.is_null() {
-                let p = unsafe { &*ptr };
-                if pred(p) && count < MAX_PROCESSES {
-                    buf[count] = p.pid;
-                    count += 1;
-                }
-            }
+    PROCESS_TABLE.for_each_active(|_, p| {
+        if pred(p) && count < MAX_PROCESSES {
+            buf[count] = p.pid;
+            count += 1;
         }
     });
     // Phase 2: copy to Vec with IRQs enabled (safe to allocate)
@@ -450,42 +314,22 @@ pub fn collect_process_info<T: Copy + Default, F>(mut f: F) -> Vec<T>
 where
     F: FnMut(&Process) -> Option<T>,
 {
-    let mut buf: [core::mem::MaybeUninit<T>; MAX_PROCESSES] = unsafe {
-        core::mem::MaybeUninit::uninit().assume_init()
-    };
+    let mut buf = [T::default(); MAX_PROCESSES];
     let mut count = 0usize;
-    with_irqs_disabled(|| {
-        for i in 0..MAX_PROCESSES {
-            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-                continue;
-            }
-            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-            if !ptr.is_null() {
-                if let Some(val) = f(unsafe { &*ptr }) {
-                    if count < MAX_PROCESSES {
-                        buf[count] = core::mem::MaybeUninit::new(val);
-                        count += 1;
-                    }
-                }
+    PROCESS_TABLE.for_each_active(|_, p| {
+        if let Some(val) = f(p) {
+            if count < MAX_PROCESSES {
+                buf[count] = val;
+                count += 1;
             }
         }
     });
-    let mut result = Vec::with_capacity(count);
-    for item in &buf[..count] {
-        result.push(unsafe { item.assume_init() });
-    }
-    result
+    buf[..count].to_vec()
 }
 
 /// Number of active processes.
 pub fn process_count() -> usize {
-    let mut count = 0;
-    for i in 0..MAX_PROCESSES {
-        if SLOT_STATES[i].load(Ordering::Relaxed) == slot_state::ACTIVE {
-            count += 1;
-        }
-    }
-    count
+    PROCESS_TABLE.active_count()
 }
 
 /// `(total, running_or_ready, blocked)` — a scalar tally over every active
@@ -495,28 +339,19 @@ pub fn process_count() -> usize {
 /// refresh; `collect_process_info`/`list_processes` would answer the same
 /// question but always allocate (a `Vec`, plus a `String` clone per process),
 /// which is unnecessary for a plain count. Same locking shape as
-/// `collect_process_info`: `PROCESS_SLOTS` pointers are only valid to
-/// dereference with IRQs disabled.
+/// `collect_process_info`: the slot pointers are only valid to dereference
+/// with IRQs disabled, which `for_each_active` handles.
 pub fn count_process_states() -> (usize, usize, usize) {
     let mut total = 0usize;
     let mut running = 0usize;
     let mut blocked = 0usize;
-    with_irqs_disabled(|| {
-        for i in 0..MAX_PROCESSES {
-            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-                continue;
-            }
-            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-            if ptr.is_null() {
-                continue;
-            }
-            total += 1;
-            match unsafe { &*ptr }.state {
-                crate::process::types::ProcessState::Ready
-                | crate::process::types::ProcessState::Running => running += 1,
-                crate::process::types::ProcessState::Blocked => blocked += 1,
-                crate::process::types::ProcessState::Zombie(_) => {}
-            }
+    PROCESS_TABLE.for_each_active(|_, p| {
+        total += 1;
+        match p.state {
+            crate::process::types::ProcessState::Ready
+            | crate::process::types::ProcessState::Running => running += 1,
+            crate::process::types::ProcessState::Blocked => blocked += 1,
+            crate::process::types::ProcessState::Zombie(_) => {}
         }
     });
     (total, running, blocked)
@@ -553,9 +388,9 @@ pub static THREAD_PID_MAP: Spinlock<BTreeMap<usize, Pid>> =
 // section that writes `THREAD_PID_MAP` (`thread_pid_map_insert` /
 // `thread_pid_map_remove`), so map and cache can never disagree for longer
 // than one critical section. Every fast-path read re-validates the slot state
-// against `SLOT_STATES`, so a process that retired (ACTIVE→RETIRED) while a
-// straggler thread still runs falls back to the slow path — exactly what an
-// uncached lookup would do — instead of touching the entry.
+// and generation through `SlotTable::ref_if_current`, so a process that retired
+// (ACTIVE→RETIRED) while a straggler thread still runs falls back to the slow
+// path — exactly what an uncached lookup would do — instead of touching the entry.
 //
 // The pointer stays valid across RETIRED (deferred reclamation keeps the
 // `Process` alive) and is cleared when the map entry is removed, which is the
@@ -565,15 +400,19 @@ pub static THREAD_PID_MAP: Spinlock<BTreeMap<usize, Pid>> =
 /// cache lines, touched by exactly one thread each.
 pub struct ThreadIdentity {
     own_pid: AtomicU32,
-    /// Slot of the OWN process, or `INVALID_SLOT` when empty/unresolved.
+    /// Slot of the OWN process, or `INVALID_SLOT` when empty/unresolved. Written
+    /// with `Release` and read with `Acquire` — it is the **publication point**
+    /// for the half, replacing the old `own_ptr` `Release` store (the pointer is
+    /// no longer cached: `identity_get` derives it via `SlotTable::ref_if_current`
+    /// from `slot` + `own_gen`, which within one generation is immutable and
+    /// equal to what `own_ptr` used to hold).
     own_slot: AtomicU16,
-    own_ptr: AtomicPtr<Process>,
     tgid: AtomicU32,
     tgid_slot: AtomicU16,
-    tgid_ptr: AtomicPtr<Process>,
-    /// `SLOT_GEN` at the moment each half was stamped. A slot that has been
-    /// recycled since reads ACTIVE with a different generation, which is the
-    /// only thing that distinguishes "still ours" from "freed and re-issued".
+    /// `SlotTable` generation at the moment each half was stamped. A slot that
+    /// has been recycled since reads ACTIVE with a different generation, which
+    /// is the only thing that distinguishes "still ours" from "freed and
+    /// re-issued".
     own_gen: AtomicU32,
     tgid_gen: AtomicU32,
     /// Failed lazy re-stamps for this entry, bounded by [`MAX_REPAIR_ATTEMPTS`].
@@ -609,10 +448,8 @@ impl ThreadIdentity {
         Self {
             own_pid: AtomicU32::new(0),
             own_slot: AtomicU16::new(INVALID_SLOT),
-            own_ptr: AtomicPtr::new(core::ptr::null_mut()),
             tgid: AtomicU32::new(0),
             tgid_slot: AtomicU16::new(INVALID_SLOT),
-            tgid_ptr: AtomicPtr::new(core::ptr::null_mut()),
             own_gen: AtomicU32::new(0),
             tgid_gen: AtomicU32::new(0),
             repair_attempts: AtomicU8::new(0),
@@ -708,7 +545,7 @@ pub static IDENTITY_STATS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Resolve `pid` in the table and store both identity halves for `tid`.
-/// Caller must hold IRQs masked (scans the slots like `get_process_ptr_inner`).
+/// Caller must hold IRQs masked (scans the slots via `find_active_locked`).
 /// An unresolvable pid (insert raced ahead of `register_process`) stores the
 /// invalid marker: fast paths miss, slow paths answer, nothing is wrong.
 fn identity_store_locked(tid: usize, pid: Pid) {
@@ -716,60 +553,42 @@ fn identity_store_locked(tid: usize, pid: Pid) {
         return;
     }
     let e = &THREAD_IDENTITY[tid];
+    // First pass: the own-pid slot. A non-`CLONE_THREAD` process is its own tgid
+    // leader, so this pass fills the tgid half too.
+    let mut own_slot = INVALID_SLOT;
     let mut tgid = pid;
     let mut tgid_slot = INVALID_SLOT;
-    let mut tgid_ptr: *mut Process = core::ptr::null_mut();
-    let mut own_slot = INVALID_SLOT;
-    let mut own_ptr: *mut Process = core::ptr::null_mut();
-    for i in 0..MAX_PROCESSES {
-        if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-            continue;
-        }
-        let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-        if ptr.is_null() {
-            continue;
-        }
-        let p = unsafe { &*ptr };
+    PROCESS_TABLE.find_active_locked::<()>(|i, p| {
         if p.pid == pid {
             own_slot = i as u16;
-            own_ptr = ptr;
             tgid = p.tgid;
             tgid_slot = i as u16;
-            tgid_ptr = ptr;
-            break;
+            Some(())
+        } else {
+            None
         }
-    }
+    });
     // A CLONE_THREAD child's own pid differs from its tgid: resolve the leader
     // in a second pass (the first pass stopped at the own hit).
     if tgid != pid {
-        tgid_slot = INVALID_SLOT;
-        tgid_ptr = core::ptr::null_mut();
-        for i in 0..MAX_PROCESSES {
-            if SLOT_STATES[i].load(Ordering::Relaxed) != slot_state::ACTIVE {
-                continue;
-            }
-            let ptr = PROCESS_SLOTS[i].load(Ordering::Acquire);
-            if !ptr.is_null() && unsafe { (*ptr).pid } == tgid {
-                tgid_slot = i as u16;
-                tgid_ptr = ptr;
-                break;
-            }
-        }
+        tgid_slot = PROCESS_TABLE
+            .find_active_locked(|i, p| (p.pid == tgid).then_some(i as u16))
+            .unwrap_or(INVALID_SLOT);
     }
-    // Stamp the generation BEFORE publishing the pointer, so a reader that sees
-    // the new pointer (Acquire on `*_ptr`) cannot still see the old stamp.
+    // Stamp the generation BEFORE publishing the slot (the `Release` store on
+    // `*_slot` below is the publication point — it replaces the old `*_ptr`
+    // `Release`), so a reader that sees the new slot with `Acquire` cannot still
+    // see the old generation stamp.
     if own_slot != INVALID_SLOT {
-        e.own_gen.store(SLOT_GEN[own_slot as usize].load(Ordering::Acquire), Ordering::Relaxed);
+        e.own_gen.store(PROCESS_TABLE.generation(own_slot as usize), Ordering::Relaxed);
     }
     if tgid_slot != INVALID_SLOT {
-        e.tgid_gen.store(SLOT_GEN[tgid_slot as usize].load(Ordering::Acquire), Ordering::Relaxed);
+        e.tgid_gen.store(PROCESS_TABLE.generation(tgid_slot as usize), Ordering::Relaxed);
     }
     e.own_pid.store(pid, Ordering::Relaxed);
-    e.own_slot.store(own_slot, Ordering::Relaxed);
-    e.own_ptr.store(own_ptr, Ordering::Release);
     e.tgid.store(tgid, Ordering::Relaxed);
-    e.tgid_slot.store(tgid_slot, Ordering::Relaxed);
-    e.tgid_ptr.store(tgid_ptr, Ordering::Release);
+    e.own_slot.store(own_slot, Ordering::Release);
+    e.tgid_slot.store(tgid_slot, Ordering::Release);
     // Fresh budget only when BOTH halves resolved. The bound in `identity_get`
     // is unreachable otherwise, and it has now been got wrong twice in the same
     // way, so the reasoning is worth spelling out:
@@ -803,10 +622,8 @@ fn identity_clear_locked(tid: usize) {
         return;
     }
     let e = &THREAD_IDENTITY[tid];
-    e.own_slot.store(INVALID_SLOT, Ordering::Relaxed);
-    e.own_ptr.store(core::ptr::null_mut(), Ordering::Release);
-    e.tgid_slot.store(INVALID_SLOT, Ordering::Relaxed);
-    e.tgid_ptr.store(core::ptr::null_mut(), Ordering::Release);
+    e.own_slot.store(INVALID_SLOT, Ordering::Release);
+    e.tgid_slot.store(INVALID_SLOT, Ordering::Release);
     // The pids go too, and that is load-bearing rather than tidiness: this is
     // the DELIBERATE invalidation (`thread_pid_map_remove`), and `identity_get`
     // decides whether a miss may be lazily re-stamped by asking whether a pid is
@@ -843,7 +660,7 @@ pub fn thread_pid_map_remove(tid: usize) -> Option<Pid> {
 }
 
 /// Read one half of the current thread's cached identity, re-validating the
-/// slot state the same way `get_process_ptr_inner` does (state first, then
+/// slot through `SlotTable::ref_if_current` (state first, then generation, then
 /// pointer). `own=false` selects the tgid-leader half.
 fn identity_get(own: bool) -> Option<(Pid, &'static Process)> {
     let tid = crate::threading::current_thread_id();
@@ -898,35 +715,35 @@ fn identity_get(own: bool) -> Option<(Pid, &'static Process)> {
         IDENTITY_REPAIRS.fetch_add(1, Ordering::Relaxed);
     }
     let slot = slot as usize;
-    if slot >= MAX_PROCESSES || SLOT_STATES[slot].load(Ordering::Relaxed) != slot_state::ACTIVE {
-        IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-        IDENTITY_FB_INACTIVE.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
     // Finding B: ACTIVE alone cannot tell "still ours" from "freed and
     // re-issued" — the slot may have gone ACTIVE → RETIRED → freed → FREE →
-    // claimed since we cached it, and the pointer below would then be a
-    // use-after-free. The state is read FIRST (above) and the generation
-    // SECOND: reclaim bumps the generation while the slot is RETIRED, so
-    // observing ACTIVE here means some occupant is installed, and a matching
-    // generation means it is still the one we stamped. `PROCESS_SLOTS[i]` is
-    // written once per generation (`try_claim_free_slot`, after the CAS) and
-    // nulled once (reclaim's swap), so within a generation the slot's pointer is
-    // immutable and a matching stamp already proves the cached pid is right —
-    // which is why no pid re-check is needed and the `Process` cache line is
-    // never touched.
+    // claimed since we cached it. `SlotTable::ref_if_current` reads state FIRST,
+    // generation SECOND (reclaim bumps it while the slot is RETIRED, so ACTIVE
+    // paired with a matching stamp means the occupant we stamped is still
+    // installed), pointer THIRD. Within one generation the slot's pointer is
+    // immutable — written once by `try_claim` after the CAS, nulled once by
+    // reclaim's swap — so a matching stamp already proves the cached pid is
+    // right, which is why no pid re-check is needed and the `Process` cache
+    // line is never touched on a hit.
     let stamped_gen = if own { e.own_gen.load(Ordering::Relaxed) } else { e.tgid_gen.load(Ordering::Relaxed) };
-    if SLOT_GEN[slot].load(Ordering::Acquire) != stamped_gen {
-        IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-        IDENTITY_FB_STALE_GEN.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let ptr = if own { e.own_ptr.load(Ordering::Acquire) } else { e.tgid_ptr.load(Ordering::Acquire) };
-    if ptr.is_null() {
-        IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-        IDENTITY_FB_NULL.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
+    let proc = match PROCESS_TABLE.ref_if_current(slot, stamped_gen) {
+        Ok(p) => p,
+        Err(SlotMiss::Inactive) => {
+            IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            IDENTITY_FB_INACTIVE.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Err(SlotMiss::StaleGen) => {
+            IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            IDENTITY_FB_STALE_GEN.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Err(SlotMiss::Null) => {
+            IDENTITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            IDENTITY_FB_NULL.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
     // Gated: the miss paths above are meant to be rare, but a hit counter sits
     // on the hottest path in the kernel, so it must not cost anything in a
     // shipping build. One relaxed load of a hot static when disabled.
@@ -934,7 +751,7 @@ fn identity_get(own: bool) -> Option<(Pid, &'static Process)> {
         IDENTITY_HITS.fetch_add(1, Ordering::Relaxed);
     }
     let pid = if own { e.own_pid.load(Ordering::Relaxed) } else { e.tgid.load(Ordering::Relaxed) };
-    Some((pid, unsafe { &*ptr }))
+    Some((pid, proc))
 }
 
 /// Test hooks for the lazy re-stamp (`process_tests::test_identity_lazy_restamp`).
@@ -955,11 +772,9 @@ pub mod test_hooks {
         }
         let e = &THREAD_IDENTITY[tid];
         e.own_pid.store(pid, Ordering::Relaxed);
-        e.own_slot.store(INVALID_SLOT, Ordering::Relaxed);
-        e.own_ptr.store(core::ptr::null_mut(), Ordering::Release);
+        e.own_slot.store(INVALID_SLOT, Ordering::Release);
         e.tgid.store(pid, Ordering::Relaxed);
-        e.tgid_slot.store(INVALID_SLOT, Ordering::Relaxed);
-        e.tgid_ptr.store(core::ptr::null_mut(), Ordering::Release);
+        e.tgid_slot.store(INVALID_SLOT, Ordering::Release);
         e.repair_attempts.store(0, Ordering::Relaxed);
     }
 
@@ -997,7 +812,7 @@ pub mod test_hooks {
         let live = if slot == INVALID_SLOT || slot as usize >= MAX_PROCESSES {
             0
         } else {
-            SLOT_GEN[slot as usize].load(Ordering::Acquire)
+            PROCESS_TABLE.generation(slot as usize)
         };
         (slot, e.own_gen.load(Ordering::Relaxed), live)
     }

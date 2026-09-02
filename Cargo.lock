@@ -157,6 +157,7 @@ dependencies = [
  "akuma-mmu",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-slot-table",
  "akuma-syscalls-linux",
  "akuma-terminal",
  "akuma-threading",
@@ -394,6 +395,13 @@ version = "0.1.0"
 dependencies = [
  "akuma-kacho",
  "libm",
+]
+
+[[package]]
+name = "akuma-slot-table"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
 ]
 
 [[package]]

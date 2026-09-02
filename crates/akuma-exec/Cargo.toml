@@ -85,6 +85,11 @@ akuma-pmm = { path = "../akuma-pmm" }
 # `akuma-syscalls-mem` can name `MmapRegion` without depending on all of exec.
 akuma-mmap = { path = "../akuma-mmap" }
 akuma-threading = { path = "../akuma-threading" }
+# The lock-free per-slot `*mut Process` store under the process table: the
+# FREE/ACTIVE/RETIRED state array, the reuse generation, the retire timestamp,
+# and every deref. Extracted so `process/table.rs` holds no `unsafe`. Generic —
+# it never names `Process`.
+akuma-slot-table = { path = "../akuma-slot-table" }
 # The EL0 entry `eret`: `enter_user_mode` (register-load + `eret` asm) and its
 # SPSR gate `enter_user_mode_checked`. Re-exported as
 # `akuma_exec::process::{enter_user_mode, enter_user_mode_checked}` so this

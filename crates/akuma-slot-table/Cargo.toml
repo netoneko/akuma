@@ -1,0 +1,14 @@
+[package]
+name = "akuma-slot-table"
+version = "0.1.0"
+edition = "2024"
+description = "The lock-free per-slot pointer store under the process table: a fixed [AtomicPtr<T>; N] with FREE/ACTIVE/RETIRED state, a per-slot reuse generation, and a retire timestamp — and every deref of those pointers, behind one stated contract"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `with_irqs_disabled` — the one genuine safe abstraction the ref-returning
+# accessors need: an IRQ mask on one core plus deferred reclamation is what keeps
+# a slot pointer valid for the length of a scan.
+akuma-primitives = { path = "../akuma-primitives" }
