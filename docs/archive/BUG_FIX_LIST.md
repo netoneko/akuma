@@ -9,18 +9,18 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 778
-- **Docs contributing at least one fix:** 252
+- **Total distinct fixes counted:** 785
+- **Docs contributing at least one fix:** 254
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 132 | 17.0% | 20 |
-| Memory & Virtual Memory | 122 | 15.7% | 39 |
-| Scheduler & Process Management | 79 | 10.2% | 22 |
-| SMP & Locking | 91 | 11.7% | 40 |
-| Networking | 58 | 7.5% | 22 |
-| Userspace Apps & Libraries | 37 | 4.8% | 20 |
+| Syscall / ABI Compatibility Audits | 132 | 16.8% | 20 |
+| Memory & Virtual Memory | 122 | 15.5% | 39 |
+| Scheduler & Process Management | 79 | 10.1% | 22 |
+| SMP & Locking | 98 | 12.5% | 42 |
+| Networking | 58 | 7.4% | 22 |
+| Userspace Apps & Libraries | 37 | 4.7% | 20 |
 | Rump Kernel & Syscall Proxy | 26 | 3.3% | 6 |
 | Toolchain & Self-Hosting | 43 | 5.5% | 7 |
 | SSH | 26 | 3.3% | 15 |
@@ -30,7 +30,7 @@ from several subsystems under one write-up.
 | Misc / Cross-cutting | 36 | 4.6% | 10 |
 | Console & Terminal | 32 | 4.1% | 11 |
 | Containers | 24 | 3.1% | 6 |
-| **Total** | **778** | **100.0%** | **252** |
+| **Total** | **785** | **100.0%** | **254** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -512,7 +512,20 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/KTG_GRACE_EXPIRY_KILL_INTERRUPT.md
 - `exit_group` paid its full 2 s kill-grace per multithreaded process: a thread parked in an untimed `FUTEX_WAIT` (or any yarn-driven blocking wait) was woken by the deferred-kill request but re-parked, because neither `sys_futex`'s re-evaluation nor `should_interrupt_blocking_syscall` consulted `PENDING_KILL` — both read only signal paths — so the wake was consumed by the very loop it was meant to end and the only exit was grace expiry plus hard kill; fixed by adding the kill check first in both readers, returning `EINTR` that unwinds to the thread's self-termination boundary (boot test `test_pending_kill_interrupts_blocking_wait`, probe `userspace/forktest/c_stress/futexkill.c`)
 
-## SMP & Locking (91 fixes, 40 docs)
+## SMP & Locking (98 fixes, 42 docs)
+
+### docs/archive/AKUMA_EXEC_AUDIT.md
+(The `akuma-exec` -> `#![forbid(unsafe_code)]` campaign is a refactor and is not counted — see `AKUMA_EXEC_FORBID_UNSAFE.md`; these are the soundness defects it surfaced and fixed. §5b's triplicated `FrameSource` enum + converters is a duplication cleanup with no bug and is not counted; §6.E group 3 turned out to be non-problems and is not counted.)
+- §4: three kernel-registered hooks in `threading/mod.rs` were stored as `AtomicUsize` holding `cb as usize` and `transmute`d back to `fn(usize)` at each read — `transmute` converts any address to any signature with `!= 0` as the sole guard; replaced with `OnceCopy<fn(usize)>`
+- §5a: `Process::brk` was a plain `usize` mutated through `&self` via `&mut *(addr_of!(self.brk) as *mut usize)` — a `&mut` derived from `&self` to a non-`UnsafeCell` field is aliasing UB no matter how well `vm_lock` serialized the writers; now `AtomicUsize`
+- §5c-bis: `Process::mmap_regions` and `ProcessMemory::free_regions` were `Vec`s beside a `Spinlock<()>` (`vm_lock`) that could not hand out `&mut`, so `&self` methods reached them with `&mut *(addr_of!(..) as *mut Vec<_>)`; the `Vec`s moved inside their own `Spinlock`s and `vm_lock` was deleted
+- §6.E group 2a: `Process::{state, exited, exit_code}` were plain fields written from a peer core (signal / exception teardown) under nothing but the BKL and read on the syscall + first-run paths — a torn read of the `Zombie(i32)` enum is UB-adjacent; now atomics (`state` an `AtomicU64` packing the tag + payload), and `Process::run` / `prepare_for_execution` take `&self`
+- §6.E group 2b: `Process::{entry_point, initial_brk, process_info_phys, clear_child_tid, sigaltstack_*}` and all five `ProcessMemory` scalars were plain fields re-set wholesale by `execve` while peer readers (`for_each_process`, the fault path) could observe the half-swapped struct; now atomics plus a `ProcessMemory::reset(&self)`, and `name`/`args`/`context` moved behind one `Spinlock<ProcessImage>`, so `replace_image` takes `&self`
+
+### docs/archive/AKUMA_EXEC_ADDRESS_SPACE_MERGE.md
+(The `address_space` + `as_lock` merge is a refactor; these are the two `&self -> &mut` casts it removed and the deadlock it exposed.)
+- `AKUMA_EXEC_AUDIT.md` §5's last two casts: `Process::with_address_space` bridged `address_space: UserAddressSpace` and a `Spinlock<()>` beside it with `&mut *(addr_of!(self.address_space) as *mut UserAddressSpace)`; the two became one `ProcAddressSpace` field (`Spinlock<UserAddressSpace>` + a lock-free atomic mirror of the four fault-path scalars), no cast and no `UnsafeCell`
+- `CowRemap::CallerHoldsAsLock`'s arm called `owner.address_space.{track_user_frame,remove_user_frame}` as lockless field pokes; once those moved behind `as_lock` — which the EL0 permission-fault CoW break already holds across the whole break — they would self-deadlock the non-reentrant `Spinlock`; the arm now carries the caller's own `&mut UserAddressSpace` guard and calls the trackers on that
 
 ### docs/archive/SYSCALL_UNSAFE_CLEANUP.md
 (The `src/syscall/` `unsafe`-to-zero conversion is a refactor and is not counted; this is the defect it surfaced. The `with_own_process_exclusive` clause the doc leaves unproven is a documented obligation, not a fix.)
@@ -1365,6 +1378,8 @@ aren't recorded anywhere else.)
 ---
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
+
+Also scanned 2026-09-02 (the `oof-part-2` branch — `akuma-exec` -> `#![forbid(unsafe_code)]`, ahead of merging it). AKUMA_EXEC_FORBID_UNSAFE is the campaign's completion write-up — narrative pointing at fixes counted elsewhere, no bullet of its own. AKUMA_EXEC_USER_ACCESS_EXTRACTION and AKUMA_SLOT_TABLE_EXTRACTION are pure crate-extraction records ("a file move plus a fail-closed hook: behaviour-preserving" / a generic `SlotTable<T, N>` primitive with the identity cache's representation collapsed but semantics preserved) — no defect attached, counted nowhere. AKUMA_KERNEL_HOOKS is an inventory of the tree's 21 boot-registered hook cells; its one landed change — the `RUMP_TESTS_HOOK`/`BOOT_TEST_HOOKS` conversions to `Registered::require()` — is already counted under AKUMA_ENTRY_EXTRACTION (the extraction that prompted the audit), and its `transmute`-hooks finding is "recorded, not done in this pass". The two docs on this branch that *did* surface defects have their own subsections under SMP & Locking above: AKUMA_EXEC_AUDIT (five soundness fixes — a `transmute` round-trip, four `&self -> &mut` / plain-field-written-cross-core sites made atomic or moved inside their lock) and AKUMA_EXEC_ADDRESS_SPACE_MERGE (the last two casts, plus a `CowRemap` self-deadlock the merge exposed). ASID_EXHAUSTION_TIGHT_THREAD_LOOP is **Status: OPEN** — `pthread_create` fails at ~251 serial iterations because ASIDs leak from address spaces whose `Drop` never ran, against `MAX_ASID = 256` — counted nowhere. SELFHOST_KERNEL_HEAP_LEAK stays **open** (the runbook's Tier 5 cap at ~8 trials/boot is the operational takeaway).
 
 Also scanned 2026-09-01 (the `oof` branch — the `src/` -> `crates/` extraction campaign, 40 commits — ahead of merging it). Fourteen crate-extraction records are pure refactors with no defect attached and are counted nowhere: AKUMA_ALLOC_EXTRACTION, AKUMA_CONFIG_EXTRACTION, AKUMA_EXCEPTIONS_EXTRACTION, AKUMA_FDT_EXTRACTION, AKUMA_FPCACHE_EXTRACTION, AKUMA_GIC_CONSOLIDATION (a three-file consolidation that deleted a dead GICv2 backend and two byte-identical MMIO copies — removals, not fixes), AKUMA_SMP_SHARED_SPLIT, AKUMA_SYSCALLS_GLUE_EXTRACTION, AKUMA_UART_EXTRACTION, AKUMA_VFS_GLUE_EXTRACTION, INLINE_ASM_CLEANUP (218 `asm!` sites to 35, mechanical), SRC_SYSCALL_EXTRACTION, and FRAMEBUFFER_REMOVED (a removal). The three docs on this branch that *did* surface defects have their own subsections above: AKUMA_ENTRY_EXTRACTION and SRC_BOOT_ENTRY_UNSAFE_CLEANUP (Misc / Cross-cutting) and SYSCALL_UNSAFE_CLEANUP (SMP & Locking). SELFHOST_KERNEL_HEAP_LEAK is **open** — the kernel heap climbs 13 MB to 760 MB across in-guest clean builds and OOM-kills `rustc`, A/B'd as pre-existing on both arms 2026-09-01, no fix — and is counted nowhere. Two already-listed docs were re-checked for content added on this branch: AKUMA_FIRECRACKER_KVM gained §5.5 (`--no-net` parks in an early non-returning branch of `run_async_main`, so every test section after network init silently does not run) which is a **documentation-only finding, explicitly not a regression and with no fix landed**, so it adds no bullet; DEVBOX_ISSUES gained Issue 27 (SIGILL spam on every `cargo` start) which is **Status: OPEN**. EPOLL_MULTI_POLLER_PIPE_FLAKE gained a real §9 fix and its subsection above was corrected — §6, previously recorded as the fix, is now known not to have been the root cause.
 
