@@ -1,16 +1,125 @@
-// Preemptive threading with fixed-size thread pool
-// Supports per-thread stack sizes and stack overflow detection
+//! Preemptive threading: the fixed-size thread pool, the lock-free per-thread
+//! state arrays, the context switch, park/wake, per-thread stacks and overflow
+//! detection, and the `thread_start` / SGI-scheduler trampolines.
+//!
+//! # What this crate is for
+//!
+//! It is where **all** of `akuma-exec`'s scheduler `unsafe` lives — extracted
+//! 2026-09-02 (`AKUMA_EXEC_AUDIT.md` §6 step C). `akuma-exec` proper (fork,
+//! exec, signals, channels, fds, lifecycle, reclaim) no longer carries the
+//! `THREAD_CONTEXTS` raw derefs, the `msr tpidr_el1`, the context-switch asm or
+//! the trampolines. Making "is Akuma's scheduler sound?" a ~5,200-line question
+//! instead of part of a 9,000-line one is the point — same trade as
+//! `akuma-net-nic` and `akuma-user-access`.
+//!
+//! It **cannot** `#![forbid(unsafe_code)]`: it is per-slot `static` arrays,
+//! `global_asm!`, and raw context-frame reads end to end.
+//!
+//! # It sits BELOW `akuma-exec`
+//!
+//! It does not name the `Process` type. `UserContext` / `UserTrapFrame` /
+//! `MAX_THREADS` are in `akuma-exec-core` (the forbid-clean leaf). The seven
+//! things it asks of the process layer — trace gate, tid→pid lookups, the
+//! reclaim drain flag, the interrupt check, and two diagnostics — are
+//! [`ProcessHooks`], registered by `akuma_exec::init`. The platform callbacks it
+//! needs (uptime, SGI, wake-core, EOI, print) are [`ThreadRuntime`]; the tuning
+//! knobs are [`ThreadConfig`]. `akuma-exec` re-exports this crate as
+//! `akuma_exec::threading`, so every `akuma_exec::threading::…` call site
+//! resolves unchanged.
 
+#![cfg_attr(not(test), no_std)]
 #![allow(dead_code)]
+// The lint allow-list this code was written against — ported verbatim from
+// `akuma-exec/src/lib.rs`, where it lived until 2026-09-02.
+#![allow(
+    clippy::future_not_send,
+    clippy::must_use_candidate,
+    clippy::missing_const_for_fn,
+    clippy::uninlined_format_args,
+    clippy::cast_ptr_alignment,
+    clippy::items_after_statements,
+    clippy::significant_drop_in_scrutinee,
+    clippy::too_many_lines,
+    clippy::use_self,
+    clippy::struct_field_names,
+    clippy::struct_excessive_bools,
+    clippy::similar_names,
+    clippy::unreadable_literal,
+    clippy::unnecessary_cast,
+    clippy::redundant_else,
+    clippy::semicolon_if_nothing_returned,
+    clippy::single_match_else,
+    clippy::declare_interior_mutable_const,
+    clippy::borrow_as_ptr,
+    clippy::ptr_as_ptr,
+    clippy::unused_self,
+    clippy::vec_init_then_push,
+    clippy::pub_underscore_fields,
+    clippy::doc_markdown,
+    clippy::too_long_first_doc_paragraph,
+    clippy::needless_pass_by_value,
+    clippy::if_not_else,
+    clippy::manual_div_ceil,
+    clippy::option_if_let_else,
+    clippy::match_wildcard_for_single_variants,
+    clippy::cast_possible_wrap,
+    clippy::redundant_closure_for_method_calls,
+    clippy::iter_without_into_iter,
+    clippy::collapsible_if,
+    clippy::significant_drop_tightening,
+    clippy::ref_as_ptr,
+    clippy::needless_range_loop,
+    clippy::new_without_default,
+    clippy::match_same_arms,
+    clippy::redundant_closure,
+    clippy::manual_is_variant_and,
+    clippy::missing_safety_doc,
+    clippy::let_and_return,
+    clippy::manual_range_contains,
+    clippy::empty_line_after_doc_comments,
+    clippy::inline_always,
+    clippy::bool_to_int_with_if,
+    clippy::manual_saturating_arithmetic,
+    clippy::cast_lossless,
+    clippy::option_map_or_none,
+    clippy::redundant_field_names,
+    clippy::let_underscore_untyped,
+    unused_unsafe,
+    unused_mut,
+    clippy::implicit_saturating_sub,
+    clippy::manual_let_else,
+    clippy::verbose_bit_mask,
+    clippy::ptr_cast_constness,
+    clippy::derive_partial_eq_without_eq,
+    clippy::or_fun_call,
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::identity_op,
+    clippy::while_let_loop,
+    clippy::collapsible_else_if,
+    clippy::needless_continue,
+    clippy::inherent_to_string,
+    clippy::manual_find,
+    clippy::manual_is_multiple_of,
+    clippy::eq_op,
+    clippy::doc_overindented_list_items,
+    clippy::map_unwrap_or,
+    clippy::used_underscore_binding,
+    clippy::branches_sharing_code,
+    clippy::doc_comment_double_space_linebreaks,
+    clippy::no_effect_underscore_binding,
+    clippy::unwrap_or_default,
+    clippy::should_implement_trait,
+)]
+
+extern crate alloc;
 
 pub mod sigframe;
-/// Trap-frame / thread-slot types and the pure stack-sizing policy.
-///
-/// Moved to `akuma-exec-core` on 2026-09-01 — it was already `alloc` +
-/// `akuma-primitives` only, with 199 lines of host tests, so it was on the wrong
-/// side of a `forbid` it could always have carried. Re-exported under the
-/// original path so `akuma_exec::threading::types::MAX_THREADS` &c. still
-/// resolve for `akuma-exceptions` and `akuma-vfs-glue`.
+#[cfg(test)]
+mod test_support;
+/// Trap-frame / thread-slot types and the pure stack-sizing policy — in
+/// `akuma-exec-core` since 2026-09-01. Re-exported under the original path so
+/// `akuma_exec::threading::types::MAX_THREADS` &c. resolve for `akuma-exceptions`
+/// and `akuma-vfs-glue`.
 pub use akuma_exec_core::thread as types;
 
 pub use types::*;
@@ -21,13 +130,98 @@ use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use akuma_primitives::OnceCopy;
+use akuma_primitives::once::Registered;
+use akuma_primitives::irq::{with_irqs_disabled, IrqGuard};
+use akuma_primitives::safe_print;
 use spinning_top::Spinlock;
 
-use crate::runtime::{runtime, config, with_irqs_disabled, IrqGuard};
-// This module's ~39 `safe_print!` calls used to resolve to a `macro_rules!`
-// defined a few lines below them. The macro now lives in `akuma-primitives`
-// (one copy for the tree instead of three), so it needs importing.
-use crate::safe_print;
+// `akuma-exec` compatibility aliases: these paths resolved to `crate::…` while
+// this module lived inside that crate.
+use akuma_mmu as mmu;
+use akuma_bkl::bkl;
+// Only the `kernel_smp_shared` thread-tag call sites use this.
+#[cfg(kernel_smp_shared)]
+use akuma_bkl::sync;
+use akuma_exec_core::process::UserContext;
+use akuma_mmap::PhysFrame;
+
+// ── platform + config + process hooks (were `crate::runtime` / `crate::process`) ──
+
+/// The platform callbacks the scheduler needs — the subset of `akuma-exec`'s
+/// `ExecRuntime` this crate ever touched. Registered by [`register`].
+#[derive(Clone, Copy)]
+pub struct ThreadRuntime {
+    pub uptime_us: fn() -> u64,
+    pub trigger_sgi: fn(u32),
+    pub wake_core: fn(u8),
+    pub wake_remote_idle: fn() -> bool,
+    pub end_of_interrupt: fn(u32),
+    pub print_str: fn(&str),
+}
+
+/// The tuning knobs — the subset of `ExecConfig` this crate reads.
+#[derive(Clone, Copy)]
+pub struct ThreadConfig {
+    pub reserved_threads: usize,
+    pub kernel_stack_size: usize,
+    pub system_thread_stack_size: usize,
+    pub user_thread_stack_size: usize,
+    pub boot_stack_base: usize,
+    pub boot_stack_top: usize,
+    pub enable_stack_canaries: bool,
+    pub stack_canary: u64,
+    pub canary_words: usize,
+    pub network_thread_ratio: u32,
+    pub prioritize_never_scheduled: bool,
+    pub deferred_thread_cleanup: bool,
+    pub thread_cleanup_cooldown_us: u64,
+    pub syscall_debug_info_enabled: bool,
+    pub enable_sgi_debug_prints: bool,
+}
+
+/// The seven things the scheduler asks of the process layer above it.
+#[derive(Clone, Copy)]
+pub struct ProcessHooks {
+    pub clear_draining: fn(usize),
+    pub lifecycle_trace_on: fn() -> bool,
+    pub pid_for_thread: fn(usize) -> Option<u32>,
+    pub find_pid_by_thread: fn(usize) -> Option<u32>,
+    pub is_current_interrupted: fn() -> bool,
+    /// `(current_syscall, tgid, l0_phys)` for the `[THR-DUMP]` correlation line.
+    pub proc_dump_info: fn(u32) -> Option<(u64, u32, usize)>,
+    pub dump_orphan_processes: fn(),
+}
+
+static THREAD_RT: Registered<ThreadRuntime> =
+    Registered::new("akuma-threading: ThreadRuntime not registered — call akuma_exec::init()");
+static THREAD_CFG: Registered<ThreadConfig> =
+    Registered::new("akuma-threading: ThreadConfig not registered — call akuma_exec::init()");
+static PROCESS_HOOKS: Registered<ProcessHooks> =
+    Registered::new("akuma-threading: ProcessHooks not registered — call akuma_exec::init()");
+
+/// Register the platform runtime + tuning config. Called once from `akuma_exec::init`.
+pub fn register(rt: ThreadRuntime, cfg: ThreadConfig) {
+    THREAD_RT.register(rt);
+    THREAD_CFG.register(cfg);
+}
+
+/// Register the process-layer callbacks. Called once from `akuma_exec::init`.
+pub fn register_process_hooks(h: ProcessHooks) {
+    PROCESS_HOOKS.register(h);
+}
+
+#[inline]
+fn runtime() -> ThreadRuntime {
+    THREAD_RT.require()
+}
+#[inline]
+fn config() -> ThreadConfig {
+    THREAD_CFG.require()
+}
+#[inline]
+fn process() -> ProcessHooks {
+    PROCESS_HOOKS.require()
+}
 
 /// Set the current exception stack pointer (TPIDR_EL1).
 #[cfg(target_os = "none")]
@@ -42,7 +236,7 @@ pub fn set_current_exception_stack(_stack_top: u64) {}
 
 // `StackWriter` and this crate's `safe_print!` copy both moved to
 // `akuma-primitives::console` — one writer and one macro for the whole tree
-// instead of five and three. `crate::safe_print!` still resolves: `lib.rs`
+// instead of five and three. `safe_print!` still resolves: `lib.rs`
 // re-exports the macro. See that module's header for the census.
 
 // ============================================================================
@@ -1036,7 +1230,7 @@ pub fn take_restore_sigmask() -> Option<u64> {
 
 /// Record the payload for a SIGCHLD about to be pended on `slot`: the exiting
 /// child's pid and its raw exit code (negative ⇒ killed by signal `-code`).
-/// Called by [`crate::process::raise_sigchld_for_parent`] immediately before
+/// Called by `akuma_exec::process::raise_sigchld_for_parent` immediately before
 /// `pend_signal_for_thread`, so delivery reads a consistent `(pid, code)`.
 pub fn set_last_sigchld(slot: usize, child_pid: u32, exit_code: i32) {
     if slot < MAX_THREADS {
@@ -1142,9 +1336,9 @@ fn set_current_thread_register(tid: usize) {
     // `schedule_indices`, per-core idle adoption, boot) — so re-pointing the per-core
     // sampling cache here is what makes BKL attribution follow the thread across
     // preemption and cross-core migration instead of being smeared into `irq/sched`.
-    // See `crate::sync::ThreadTagTable`.
+    // See `sync::ThreadTagTable`.
     #[cfg(kernel_smp_shared)]
-    crate::sync::load_thread_tag_to_core(crate::bkl::current_core_id(), tid);
+    sync::load_thread_tag_to_core(bkl::current_core_id(), tid);
 }
 
 #[cfg(not(target_os = "none"))]
@@ -1242,12 +1436,12 @@ fn scrub_thread_slot(i: usize) {
 
     // Reclaim re-entrancy guard. A thread killed inside `drain_retired` leaves this set,
     // and the next occupant then takes the "already draining" early return forever.
-    crate::process::reclaim::clear_draining(i);
+    (process().clear_draining)(i);
 
     // Profiler attribution: without this the new thread lends the previous occupant's
     // tag to any peer sampling this slot before its first kernel entry.
     #[cfg(kernel_smp_shared)]
-    crate::sync::reset_thread_tag(i);
+    sync::reset_thread_tag(i);
 }
 
 /// Atomically claim a free slot in the given range
@@ -1325,14 +1519,14 @@ pub fn mark_thread_terminated(idx: usize) {
         // trace was both a flood during the interesting window and exhausted by
         // the time anything went wrong. `lifecycle_trace_on()` first, so the
         // atomic RMW below is skipped too when tracing is off.
-        if crate::process::lifecycle_trace_on()
+        if (process().lifecycle_trace_on)()
             && TERM_TRACES.fetch_add(1, Ordering::Relaxed) < 4096
         {
             let loc = core::panic::Location::caller();
             let killer = get_current_thread_register();
             safe_print!(224,
                 "[TERM] tid={} pid={:?} by_tid={} state={} pending_kill={} at={}:{}\n",
-                idx, crate::process::table::pid_for_thread(idx), killer,
+                idx, (process().pid_for_thread)(idx), killer,
                 THREAD_STATES[idx].load(Ordering::SeqCst),
                 PENDING_KILL[idx].load(Ordering::Acquire),
                 loc.file(), loc.line());
@@ -1352,12 +1546,12 @@ pub fn mark_thread_terminated(idx: usize) {
         let killer = get_current_thread_register();
         if killer != idx
             && CROSS_KILLS.fetch_add(1, Ordering::Relaxed) < 32
-            && let Some(victim_pid) = crate::process::find_pid_by_thread(idx)
+            && let Some(victim_pid) = (process().find_pid_by_thread)(idx)
         {
             safe_print!(160,
                 "[kill] tid={} (pid={}) terminated by tid={} (pid={}) victim_state={}\n",
                 idx, victim_pid, killer,
-                crate::process::find_pid_by_thread(killer).unwrap_or(0),
+                (process().find_pid_by_thread)(killer).unwrap_or(0),
                 THREAD_STATES[idx].load(Ordering::SeqCst));
         }
         // Record termination time for cooldown tracking
@@ -1584,7 +1778,7 @@ impl ThreadPool {
 
                 let stack = &self.stacks[i];
                 let stack_top = ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64;
-                let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
+                let boot_ttbr0 = mmu::get_boot_ttbr0();
 
                 let sp = setup_fake_irq_frame(
                     stack_top,
@@ -2018,7 +2212,7 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // occupant of this slot would inherit the depth and run its EL1 excursions
             // BKL-free until the EL0-entry tripwire healed it. Must happen before the
             // slot goes FREE, i.e. before any spawn can claim it.
-            let _stale_depth = crate::bkl::clear_dropped_windows_for_dead_thread(i);
+            let _stale_depth = bkl::clear_dropped_windows_for_dead_thread(i);
 
             // Final scrub before the slot becomes claimable. The individual clears above
             // stay because some are order-sensitive (CURRENT_TRAP_FRAME must precede the
@@ -2043,7 +2237,7 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // `syscall_debug_info_enabled` already covers: its own doc records
             // the `[FORK-DBG]`/`[TRAMP]` traces costing ~20 serial lines per
             // `fork()` for the same reason. A recycle is a lifecycle event.
-            if crate::process::lifecycle_trace_on() {
+            if (process().lifecycle_trace_on)() {
                 safe_print!(128, "[Cleanup] Thread {} recycled after {}us cooldown\n", i, cooldown);
             }
             
@@ -2122,7 +2316,7 @@ pub fn adopt_current_as_core_idle(
     unsafe {
         let ctx = &mut *get_context_mut(slot);
         ctx.magic = CONTEXT_MAGIC;
-        ctx.ttbr0 = crate::mmu::get_boot_ttbr0();
+        ctx.ttbr0 = mmu::get_boot_ttbr0();
         ctx.is_user_process = 0;
     }
     // This core is now the idle thread. Latch its ON_CPU gate: it starts life
@@ -2427,7 +2621,7 @@ impl ThreadPool {
     pub fn init(&mut self) {
         // Get the STORED boot TTBR0 value - all kernel threads will use this
         // CRITICAL: Must use stored value, not current TTBR0 which could be a user process's!
-        let boot_ttbr0: u64 = crate::mmu::get_boot_ttbr0();
+        let boot_ttbr0: u64 = mmu::get_boot_ttbr0();
 
         // Slot 0 is the idle/boot thread (uses boot stack, never terminated)
         THREAD_STATES[IDLE_THREAD_IDX].store(thread_state::RUNNING, Ordering::SeqCst);
@@ -2470,9 +2664,9 @@ impl ThreadPool {
         // the boot stack was already in use before we could reserve space.
         // Allocate from PMM to avoid using kernel heap for stacks.
         let exc_pages = (EXCEPTION_STACK_SIZE + 4095) / 4096;
-        let exc_frame = akuma_pmm::alloc_pages_contiguous_zeroed(exc_pages).map(crate::PhysFrame::new)
+        let exc_frame = akuma_pmm::alloc_pages_contiguous_zeroed(exc_pages).map(PhysFrame::new)
             .expect("Failed to allocate boot exception stack from PMM");
-        let boot_exception_stack_ptr = crate::mmu::phys_to_virt(exc_frame.addr);
+        let boot_exception_stack_ptr = mmu::phys_to_virt(exc_frame.addr);
         let boot_exception_stack_top = unsafe {
             (boot_exception_stack_ptr as *const u8).add(EXCEPTION_STACK_SIZE) as u64
         };
@@ -2577,11 +2771,11 @@ impl ThreadPool {
         let alloc_size = pages * page_size;
 
         // Allocate contiguous physical pages from PMM (bypasses kernel heap)
-        let frame = match akuma_pmm::alloc_pages_contiguous_zeroed(pages).map(crate::PhysFrame::new) {
+        let frame = match akuma_pmm::alloc_pages_contiguous_zeroed(pages).map(PhysFrame::new) {
             Some(f) => f,
             None => return false,
         };
-        let stack_ptr = crate::mmu::phys_to_virt(frame.addr) as usize;
+        let stack_ptr = mmu::phys_to_virt(frame.addr) as usize;
         let stack_info = StackInfo::new(stack_ptr, alloc_size);
 
         // Initialize canary at bottom of stack
@@ -2650,7 +2844,7 @@ impl ThreadPool {
             }
             let page_size = 4096;
             let pages = (stack.size + page_size - 1) / page_size;
-            let phys_addr = crate::mmu::virt_to_phys(stack.base);
+            let phys_addr = mmu::virt_to_phys(stack.base);
             akuma_pmm::free_pages_contiguous(phys_addr, pages);
             self.stacks[slot_idx] = StackInfo::empty();
         }
@@ -2975,7 +3169,7 @@ impl ThreadPool {
         // before the READY publication below for any SeqCst reader (pickers).
         ON_CPU[current_idx].store(1, Ordering::SeqCst);
         ON_CPU[next_idx].store(1, Ordering::SeqCst);
-        let core = crate::bkl::current_core_id() as usize;
+        let core = bkl::current_core_id() as usize;
         if core < MAX_CORES {
             PER_CORE_OFFCPU[core].store(current_idx, Ordering::SeqCst);
         }
@@ -3013,7 +3207,7 @@ impl ThreadPool {
         // Record the core the incoming thread is now running on. commit_switch always
         // runs on the core that will run next_idx (single runqueue, each core schedules
         // itself), so current_core_id() is authoritative.
-        LAST_CORE[next_idx].store(crate::bkl::current_core_id() as u8, Ordering::Relaxed);
+        LAST_CORE[next_idx].store(bkl::current_core_id() as u8, Ordering::Relaxed);
 
         // Update timing (still in slot, but we own it)
         self.slots[next_idx].start_time_us = now;
@@ -3118,7 +3312,7 @@ static SGI_DEBUG_ONCE: AtomicBool = AtomicBool::new(false);
 /// non-SMP and host builds.
 #[inline]
 fn voluntary_schedule_flag() -> &'static AtomicBool {
-    &VOLUNTARY_SCHEDULE[crate::bkl::current_core_id() as usize % MAX_CORES]
+    &VOLUNTARY_SCHEDULE[bkl::current_core_id() as usize % MAX_CORES]
 }
 
 /// Enable SGI debug for next yield (one-shot)
@@ -3143,7 +3337,7 @@ pub fn init() {
     // PMM via alloc_pages_contiguous_zeroed, NOT the kernel heap). The pool size
     // tracks thread_limit(), which is scaled to RAM before this runs.
     let (_total, _alloc, free_pages) = akuma_pmm::stats();
-    let free_bytes = free_pages.saturating_mul(crate::mmu::PAGE_SIZE);
+    let free_bytes = free_pages.saturating_mul(mmu::PAGE_SIZE);
     if let Err(msg) = verify_stack_memory(free_bytes) {
         panic!("Stack allocation failed: {}", msg);
     }
@@ -3298,7 +3492,7 @@ pub fn idle_halt() {
     // halted, or peer cores can't enter the kernel. Drop it before WFI; the IRQ that
     // wakes us re-takes it via the IRQ-path reconcile as it returns into this thread.
     // No-op unless `cfg(kernel_smp_shared)`.
-    crate::bkl::leave_kernel();
+    bkl::leave_kernel();
     // SAFETY: WFI halts the PE until a pending IRQ. IRQs are enabled on entry, so
     // the interrupt (timer tick / device) is taken and serviced before WFI returns.
     akuma_cpu::park::wfi();
@@ -3309,8 +3503,8 @@ pub fn idle_halt() {
     // exactly the conversion the dropped-window ledger exists to prevent. The
     // bookkeeping below is safe BKL-free — it touches only POOL under its own IRQ-masked
     // lock. No-op unless smp-shared.
-    if !crate::bkl::in_dropped_window() {
-        crate::bkl::enter_kernel();
+    if !bkl::in_dropped_window() {
+        bkl::enter_kernel();
         // Profiler only: name this hold. An idle thread never passes a syscall/fault
         // tagging site, so without this its BKL time (this bookkeeping plus the
         // `yield_now()` that follows in the idle loop) is attributed "unknown". Gated on
@@ -3318,7 +3512,7 @@ pub fn idle_halt() {
         // must keep their own excursion's tag.
         #[cfg(kernel_smp_shared)]
         if is_idle {
-            crate::sync::set_holder_tag(crate::bkl::current_core_id(), crate::sync::HOLD_TAG_IDLE);
+            sync::set_holder_tag(bkl::current_core_id(), sync::HOLD_TAG_IDLE);
         }
     }
     let halted = (runtime().uptime_us)().saturating_sub(entered);
@@ -3460,7 +3654,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     };
     if debug { (runtime().print_str)("[SGI-DBG] got POOL\n"); }
     // Which core is scheduling — selects this core's idle fallback. 0 on single-core.
-    let core_id = crate::bkl::current_core_id() as usize;
+    let core_id = bkl::current_core_id() as usize;
     let switch_info = pool.schedule_indices(voluntary, core_id, interrupted_el0).map(|(old_idx, new_idx)| {
         let new_tpidr = pool.slots[new_idx].exception_stack_top;
         (old_idx, new_idx, new_tpidr)
@@ -3531,8 +3725,8 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             //     restore's own frame stay in RAM;
             //   * 16-byte aligned, or the first `stp` raises an SP-alignment fault with
             //     exactly the same unrecoverable shape as an unmapped SP.
-            let ram_base = crate::mmu::ram_base() as u64;
-            let ram_end = crate::mmu::ram_end() as u64;
+            let ram_base = mmu::ram_base() as u64;
+            let ram_end = mmu::ram_end() as u64;
             // The restored IRQ frame is 256 bytes (see `setup_fake_irq_frame`); require
             // it whole rather than just the two tripwire words.
             const RESTORE_FRAME_BYTES: u64 = 256;
@@ -3575,7 +3769,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             // fetch aborts, and the vector entry's own fetch aborts recursively
             // (PC pinned at vector+0x200, ESR=0x86000004). Print the culprit pair
             // BEFORE the install so the wedge is attributable from the log.
-            if crate::mmu::l0_recently_freed(new_ttbr0 & TTBR0_L0_MASK) {
+            if mmu::l0_recently_freed(new_ttbr0 & TTBR0_L0_MASK) {
                 safe_print!(160,
                     "[SGI-S FREED-L0] new_ttbr0={:#x} old_tid={} new_tid={} new_state={}\n",
                     new_ttbr0, old_idx, new_idx,
@@ -3602,7 +3796,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
                 // page-table-UAF free gate, see mmu::any_core_on_l0): PREV covers the
                 // outgoing table across the msr window, ACTIVE covers the incoming one
                 // from before the hardware can walk it.
-                let pub_core = crate::mmu::publish_l0_begin(new_ttbr0);
+                let pub_core = mmu::publish_l0_begin(new_ttbr0);
                 core::arch::asm!(
                     "dsb ish",
                     "msr ttbr0_el1, {ttbr0}",
@@ -3612,7 +3806,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
                     "isb",
                     ttbr0 = in(reg) new_ttbr0,
                 );
-                crate::mmu::publish_l0_end(pub_core);
+                mmu::publish_l0_end(pub_core);
             }
             
             if config().enable_sgi_debug_prints {
@@ -3627,7 +3821,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             {
                 let elr = ((new_sp + 240) as *const u64).read_volatile();
                 let spsr = ((new_sp + 248) as *const u64).read_volatile();
-                let kernel_text = crate::mmu::is_kernel_text(elr as usize);
+                let kernel_text = mmu::is_kernel_text(elr as usize);
                 // EL0-target frames must not eret into kernel text (NOT merely
                 // ≥0x4000_0000 — user mmap VAs legitimately reach 0x1_xxxx_xxxx+);
                 // EL1-target frames must eret INTO kernel text (ELR=0x8 shape).
@@ -3692,7 +3886,7 @@ pub fn sgi_scheduler_handler_with_sp(_irq: u32, _current_sp: u64) -> u64 {
 /// Runs with IRQs masked on the incoming thread's stack; takes no locks.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_switch_finished() {
-    let core = crate::bkl::current_core_id() as usize;
+    let core = bkl::current_core_id() as usize;
     if core < MAX_CORES {
         let tid = PER_CORE_OFFCPU[core].swap(usize::MAX, Ordering::SeqCst);
         if tid < MAX_THREADS {
@@ -3754,7 +3948,7 @@ pub fn on_cpu_count() -> usize {
 }
 
 /// Update a thread's context for a new execution (e.g., after execve or fork)
-pub fn update_thread_context(thread_id: usize, user_context: &crate::process::UserContext) {
+pub fn update_thread_context(thread_id: usize, user_context: &UserContext) {
     // Tripwire for the SMP=4 mixed-EL corruption: a "user" context whose PC is a
     // kernel address is poison at CREATION time (the capture read a clobbered
     // frame/slot) — catch it here with the culprit tid before it is published.
@@ -4099,7 +4293,7 @@ pub fn schedule_blocking(wake_time_us: u64) {
             break;
         }
 
-        if crate::process::is_current_interrupted() {
+        if (process().is_current_interrupted)() {
             WAKE_TIMES[tid].store(0, Ordering::SeqCst);
             // Same TERMINATED guard as above — the old unconditional RUNNING
             // store here could resurrect a thread killed while it waited.
@@ -4360,7 +4554,7 @@ where
         };
         
         // Get STORED boot TTBR0 (not current, which could be user process's!)
-        let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
+        let boot_ttbr0 = mmu::get_boot_ttbr0();
 
         // Set up fake IRQ frame for stack-based context switching
         let sp = setup_fake_irq_frame(
@@ -4550,7 +4744,7 @@ where
         };
         
         // Get STORED boot TTBR0 (not current, which could be user process's!)
-        let boot_ttbr0 = crate::mmu::get_boot_ttbr0();
+        let boot_ttbr0 = mmu::get_boot_ttbr0();
 
         // x21 = IRQ enable flag: 0 = enable, non-zero = keep disabled
         let x21 = if start_irqs_disabled { 1u64 } else { 0u64 };
@@ -4725,14 +4919,13 @@ pub fn dump_thread_resume_points() {
             _ => '?',
         };
         // Correlate to a pid + its current syscall (which subsystem it's in).
-        let (pid, sc, tg, l0) = match crate::process::find_pid_by_thread(tid) {
-            Some(p) => {
-                match crate::process::lookup_process_shared(p) {
-                    Some(pr) => (p as i64, pr.current_syscall.load(Ordering::Relaxed),
-                                 pr.tgid as i64, pr.address_space.l0_phys() as u64),
-                    None => (p as i64, !0, -1, 0),
+        let (pid, sc, tg, l0) = match (process().find_pid_by_thread)(tid) {
+            Some(p) => match (process().proc_dump_info)(p) {
+                Some((syscall, tgid, l0_phys)) => {
+                    (p as i64, syscall, tgid as i64, l0_phys as u64)
                 }
-            }
+                None => (p as i64, !0, -1, 0),
+            },
             None => (-1, !0, -1, 0),
         };
         let _ = (tg, l0);
@@ -4765,7 +4958,7 @@ pub fn dump_thread_resume_points() {
     }
     // The inverse view: processes with no thread at all. A hang shows up here and
     // nowhere else — such a process is absent from the loop above by definition.
-    crate::process::dump_orphan_processes();
+    (process().dump_orphan_processes)();
 }
 
 /// Debug: saved kernel resume point of a context-switched-out thread, as
@@ -4836,7 +5029,7 @@ pub fn no_trap_frame_child_count() -> u64 {
 /// instruction-abort class, `N` climbing by one per event for the whole boot
 /// (`docs/runbooks/debug-thread-spawn-segv.md`, class 2). Returning `None` fails
 /// the syscall instead, which is loud, local, and recoverable.
-pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserContext> {
+pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
     if thread_id >= MAX_THREADS {
         return None;
     }
@@ -4847,13 +5040,13 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<crate::process::UserCo
         if frame_ptr != 0 {
             let frame = unsafe { &*(frame_ptr as *const UserTrapFrame) };
             let ctx = unsafe { &*get_context(thread_id) };
-            let ttbr0 = if ctx.ttbr0 != 0 { ctx.ttbr0 } else { crate::mmu::get_boot_ttbr0() };
+            let ttbr0 = if ctx.ttbr0 != 0 { ctx.ttbr0 } else { mmu::get_boot_ttbr0() };
 
             if config().syscall_debug_info_enabled {
                 safe_print!(128, "[threading] get_saved_user_context: captured from trap frame for thread {} (PC={:#x}, SP={:#x})\n",
                     thread_id, frame.elr_el1, frame.sp_el0);
             }
-            return Some(crate::process::UserContext {
+            return Some(UserContext {
                 x0: frame.x0, x1: frame.x1, x2: frame.x2, x3: frame.x3,
                 x4: frame.x4, x5: frame.x5, x6: frame.x6, x7: frame.x7,
                 x8: frame.x8, x9: frame.x9, x10: frame.x10, x11: frame.x11,

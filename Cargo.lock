@@ -147,6 +147,7 @@ dependencies = [
  "akuma-primitives",
  "akuma-syscalls-linux",
  "akuma-terminal",
+ "akuma-threading",
  "akuma-user-access",
  "embedded-io-async",
  "lock_api",
@@ -486,6 +487,20 @@ dependencies = [
 name = "akuma-terminal"
 version = "0.1.0"
 dependencies = [
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-threading"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-cpu",
+ "akuma-exec-core",
+ "akuma-mmap",
+ "akuma-mmu",
+ "akuma-pmm",
+ "akuma-primitives",
  "spinning_top",
 ]
 

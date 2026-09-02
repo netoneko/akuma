@@ -114,7 +114,13 @@ pub use akuma_mmu as mmu;
 /// name so `process::image`'s three call sites and
 /// `akuma_exec::elf_loader::INTERP_BASE` in `src/exceptions.rs` are unchanged.
 pub use akuma_elf as elf_loader;
-pub mod threading;
+/// The preemptive scheduler — **moved to `akuma-threading` on 2026-09-02**
+/// (`docs/archive/AKUMA_EXEC_AUDIT.md` §6 step C): the thread pool, the
+/// per-thread state arrays, the context switch and the trampolines, ~53 `unsafe`
+/// sites. Re-exported under the old name so every `akuma_exec::threading::…`
+/// call site (33 files) resolves unchanged; `init` registers its three hook
+/// structs (`ThreadRuntime`, `ThreadConfig`, `ProcessHooks`).
+pub use akuma_threading as threading;
 pub mod alarms;
 pub mod process;
 /// The box (container) registry — **moved to `akuma-isolation` on 2026-08-30**
@@ -175,4 +181,43 @@ pub fn init(rt: ExecRuntime, cfg: ExecConfig) {
     // `validate_user_range(_, Prefault::Yes)` needs. Unregistered it fails
     // closed (EFAULT), so ordering against other init does not matter.
     akuma_user_access::set_prefault_hook(process::lazy_prefault::prefault_user_range);
+    // `akuma-threading`'s upward surface: the platform callbacks it uses (a
+    // subset of `rt`), its tuning knobs (a subset of `cfg`), and the seven
+    // things it asks of this crate's process layer.
+    threading::register(
+        threading::ThreadRuntime {
+            uptime_us: rt.uptime_us,
+            trigger_sgi: rt.trigger_sgi,
+            wake_core: rt.wake_core,
+            wake_remote_idle: rt.wake_remote_idle,
+            end_of_interrupt: rt.end_of_interrupt,
+            print_str: rt.print_str,
+        },
+        threading::ThreadConfig {
+            reserved_threads: cfg.reserved_threads,
+            kernel_stack_size: cfg.kernel_stack_size,
+            system_thread_stack_size: cfg.system_thread_stack_size,
+            user_thread_stack_size: cfg.user_thread_stack_size,
+            boot_stack_base: cfg.boot_stack_base,
+            boot_stack_top: cfg.boot_stack_top,
+            enable_stack_canaries: cfg.enable_stack_canaries,
+            stack_canary: cfg.stack_canary,
+            canary_words: cfg.canary_words,
+            network_thread_ratio: cfg.network_thread_ratio,
+            prioritize_never_scheduled: cfg.prioritize_never_scheduled,
+            deferred_thread_cleanup: cfg.deferred_thread_cleanup,
+            thread_cleanup_cooldown_us: cfg.thread_cleanup_cooldown_us,
+            syscall_debug_info_enabled: cfg.syscall_debug_info_enabled,
+            enable_sgi_debug_prints: cfg.enable_sgi_debug_prints,
+        },
+    );
+    threading::register_process_hooks(threading::ProcessHooks {
+        clear_draining: process::reclaim::clear_draining,
+        lifecycle_trace_on: process::lifecycle_trace_on,
+        pid_for_thread: process::table::pid_for_thread,
+        find_pid_by_thread: process::find_pid_by_thread,
+        is_current_interrupted: process::is_current_interrupted,
+        proc_dump_info: process::proc_dump_info_for_thread_dump,
+        dump_orphan_processes: process::dump_orphan_processes,
+    });
 }

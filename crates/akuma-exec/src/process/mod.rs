@@ -1269,71 +1269,6 @@ pub unsafe fn enter_user_mode(_ctx: &UserContext) -> ! {
     panic!("not on bare metal")
 }
 
-/// Execute a boxed process - enters user mode and never returns
-///
-/// This function takes ownership of the Box<Process>, registers it in the
-/// PROCESS_TABLE (which takes ownership), then enters userspace via ERET.
-///
-/// MEMORY MANAGEMENT:
-/// Previously, Process lived on the thread closure's stack, but execute() never
-/// returns (it ERETs to userspace). When the process exits, return_to_kernel()
-/// is called from the exception handler context, so the closure never completes
-/// and Process::drop() was never called, leaking all physical pages.
-///
-/// Now, the Process is heap-allocated via Box and owned by PROCESS_TABLE.
-/// When return_to_kernel() calls unregister_process(), the process is retired
-/// (see that function's doc comment) and later dropped by
-/// `reclaim_retired_processes` after a cooldown, calling Process::drop() ->
-/// UserAddressSpace::drop() which frees all physical pages (code, data, stack,
-/// heap, page tables).
-#[allow(dead_code)]
-fn execute_boxed(mut process: Box<Process>) -> ! {
-    // Prepare the process (set state, write process info page)
-    process.prepare_for_execution();
-    
-    // Get PID and context pointer before registering (which moves the Box)
-    let pid = process.pid;
-    
-    // Get raw pointer to access process after registration
-    // SAFETY: The Box is moved to PROCESS_TABLE which keeps it alive.
-    // The pointer remains valid until unregister_process() is called,
-    // which only happens in return_to_kernel() after we've left userspace.
-    let proc_ptr = &mut *process as *mut Process;
-    
-    // Register the process in the table - this transfers ownership of the Box
-    // to PROCESS_TABLE. The process memory will be freed when unregister_process
-    // returns the Box and it goes out of scope.
-    register_process(pid, process);
-    
-    // Get reference back through the raw pointer
-    // SAFETY: process is now owned by PROCESS_TABLE and won't move or be freed
-    // until unregister_process is called (which happens after we exit userspace)
-    let proc_ref = unsafe { &mut *proc_ptr };
-    
-    // Activate the user address space (sets TTBR0)
-    proc_ref.address_space.activate();
-
-    // Now safe to enable IRQs - TTBR0 is set to user tables
-    (runtime().enable_irqs)();
-
-    // Enter user mode via ERET - this never returns
-    // When user calls exit(), the exception handler calls return_to_kernel()
-    // which unregisters the process (dropping the Box and freeing memory)
-    unsafe {
-        enter_user_mode(&proc_ref.context);
-    }
-}
-
-/// Check if process has exited and return to kernel if so
-/// Called from exception handler after each syscall
-#[unsafe(no_mangle)]
-pub extern "C" fn check_process_exit() -> bool {
-    // Use per-process exit flag instead of global
-    match current_process_shared() {
-        Some(proc) => proc.exited,
-        None => false,
-    }
-}
 
 /// Return to kernel after process exit
 /// 
@@ -1694,6 +1629,21 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
 /// never `p.thread_id`: a dead process keeps its recorded slot number, so the
 /// recorded field would report a thread that belongs to somebody else now.
 /// Printed next to `[THR-DUMP]`; silent when the system is healthy.
+/// `(current_syscall, tgid, l0_phys)` for a pid — the process-side data
+/// `akuma-threading`'s `[THR-DUMP]` line correlates a stuck tid against. A hook
+/// (`threading::ProcessHooks::proc_dump_info`) rather than a direct call because
+/// `akuma-threading` sits below this crate and cannot name `Process`.
+#[must_use]
+pub fn proc_dump_info_for_thread_dump(pid: Pid) -> Option<(u64, u32, usize)> {
+    lookup_process_shared(pid).map(|p| {
+        (
+            p.current_syscall.load(core::sync::atomic::Ordering::Relaxed),
+            p.tgid,
+            p.address_space.l0_phys(),
+        )
+    })
+}
+
 pub fn dump_orphan_processes() {
     // Snapshot under the table lock, then resolve the map outside it: every other
     // nested taker of both goes table -> map, and this keeps it that way.

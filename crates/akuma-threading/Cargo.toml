@@ -1,0 +1,26 @@
+[package]
+name = "akuma-threading"
+version = "0.1.0"
+edition = "2024"
+description = "The preemptive scheduler: fixed-size thread pool, lock-free per-thread state arrays, context switch, park/wake, per-thread stacks + overflow detection, and the thread_start / SGI trampolines. All of akuma-exec's scheduler unsafe, behind one crate boundary."
+
+[lints]
+workspace = true
+
+# Sits BELOW `akuma-exec` (re-exported as `akuma_exec::threading`). It does not
+# name `Process`: the trap-frame/slot types + `UserContext` are in
+# `akuma-exec-core`, and the seven process-layer callbacks are `ProcessHooks`,
+# registered from `akuma_exec::init`. No dependency reaches back to `akuma-exec`.
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-exec-core = { path = "../akuma-exec-core" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-mmu = { path = "../akuma-mmu" }
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-bkl = { path = "../akuma-bkl" }
+akuma-mmap = { path = "../akuma-mmap" }
+spinning_top = "0.3"
+
+[features]
+smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared"]
+extreme = ["akuma-primitives/extreme"]

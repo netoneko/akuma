@@ -8,13 +8,19 @@ that, by its owner's own description, "was never really audited" — the isolati
 half was cut out into `akuma-isolation` and some other pieces moved, but the
 remaining `unsafe` had never been enumerated as a set.
 
-**Result:** 123 `unsafe` sites classified into 8 kinds. Three kinds fixed
-(§4 −4 sites, §5a −1, §5c-bis −3, §5c-ter −2), now **113**, and **all six
-`&self` -> `&mut` casts are gone** — the last two, in `with_address_space`,
-closed 2026-09-02 by merging `address_space` + `as_lock` into `ProcAddressSpace`
-(§5c-ter). None of the six was legalised with `UnsafeCell`; every one either
-became an atomic or moved inside the lock that already guarded it. Two
-incidental findings — a triplicated enum (§5b) and the fact that nobody has
+**Result:** 123 `unsafe` sites classified into 8 kinds. **All six `&self` ->
+`&mut` casts are gone** (§4/§5a/§5c-bis/§5c-ter) — none legalised with
+`UnsafeCell`; each became an atomic or moved inside the lock that already
+guarded it.
+
+**Then §6 was worked in earnest (2026-09-02):** `akuma-user-access` extracted
+(§6.A), `process/mod.rs` pushed down 29 → 12 (§6.B), and **`akuma-threading`
+extracted** (§6.C) — the scheduler, its 57 `unsafe` blocks, into a crate that
+can't forbid so `akuma-exec` can head toward one. The crate went from ~126
+`unsafe` blocks to **37**; §6.D (`table.rs`) and the EL0-entry cluster are what
+stand between it and `#![forbid(unsafe_code)]`.
+
+Two incidental findings — a triplicated enum (§5b) and the fact that nobody has
 swept for either pattern tree-wide (§5c) — came out of the same reading.
 
 ## 1. Why this crate is not another `akuma-entry`
@@ -514,22 +520,45 @@ deadlock above. Those sites take `lock()` and go through the guard.
      `set_prefault_hook` registration. Prereq done on the way: the per-thread
      user-copy-fault-handler slot moved to `akuma_primitives::preempt` (both the
      setter and `akuma-exceptions`' reader now need neither `akuma-exec`).
-   - **B. Push `process/mod.rs`'s 29 down.** First pass **done 2026-09-02**,
-     **29 → 15**: fork's 4 phys-page copies → `akuma_mmu::copy_phys_page`;
-     the two `ProcessInfo` frame writes (here + `image.rs`) → `akuma_mmu::write_phys`
+   - **B. Push `process/mod.rs`'s 29 down.** **Done 2026-09-02, 29 → 12:**
+     fork's 4 phys-page copies → `akuma_mmu::copy_phys_page`; the two
+     `ProcessInfo` frame writes (here + `image.rs`) → `akuma_mmu::write_phys`
      (`ProcessInfo` gained `#[derive(Copy)]`); the robust-futex list walk + the
      `clear_child_tid` exit write (~9 raw `core::ptr::read/write` on user VAs) →
      `akuma_user_access::{read_user_into_with, write_user_val_with}` with
      `Prefault::No`; the `(*ptr).tgid` deref in `kill_thread_group` →
-     `table::with_process`. The 15 that remain: the EL0-entry cluster
-     (`enter_user_mode` ×2 + the two trampolines + `Process::run` — ~11, the
-     "→ `akuma-entry`" sub-project), `demote_range_to_ro`'s raw `*mut u64` L0,
-     `table::with_process_exclusive`, and the two CLONE `set_tid` writes that are
-     **deliberately** a plain EL1 store (`copy_to_user_safe` was tried and broke
-     the Go runtime — the comment at the site).
-   - **C. Extract `threading/mod.rs` → `akuma-threading` (~53, ~2,600 lines).**
-     It doesn't name the `Process` type; its up-calls become hooks. This is the
-     "cut the core in half" §1 warns against — the real design decision. Open.
+     `table::with_process`; and `execute_boxed` + `check_process_exit` — both
+     dead since an older launch design, **zero references tree-wide** — deleted
+     (−3).
+
+     The 12 that remain are irreducible here: the EL0-entry surface
+     (`enter_user_mode` ×2 + its `asm!`, `entry_point_trampoline`,
+     `enter_user_mode_checked`, `Process::run` — ~8) does **not** move to
+     `akuma-entry` — that crate depends on `akuma-exec` (a cycle) and its stated
+     contract is "nothing here dereferences a caller-supplied pointer", which
+     `enter_user_mode(&UserContext)` and the trampoline's `&mut *proc_ptr` both
+     do. It is `Process`'s own subject matter. Plus `demote_range_to_ro`'s raw
+     `*mut u64` L0, `table::with_process_exclusive`, and the two CLONE `set_tid`
+     writes that are **deliberately** a plain EL1 store (`copy_to_user_safe` was
+     tried and broke the Go runtime — the comment at the site).
+   - **C. Extract `threading/mod.rs` + `sigframe.rs` → `akuma-threading`.**
+     **Done 2026-09-02.** ~5,800 lines (5,200 prod + 6 test modules), **57
+     `unsafe` blocks** — the thread pool, the lock-free per-slot state arrays,
+     the context switch, park/wake, per-thread stacks + overflow detection, the
+     `thread_start`/SGI trampolines. `akuma-exec` **94 → 37** `unsafe` blocks.
+
+     It does not name `Process`; `UserContext`/`UserTrapFrame`/`MAX_THREADS` were
+     already in `akuma-exec-core`. Its upward surface is three registered hook
+     structs built in `akuma_exec::init`: `ThreadRuntime` (6 platform fns — a
+     subset of `ExecRuntime`), `ThreadConfig` (15 tuning knobs — a subset of
+     `ExecConfig`), `ProcessHooks` (7 fns: the trace gate, two tid→pid lookups,
+     the reclaim drain flag, the interrupt check, and two diagnostics —
+     `dump_orphan_processes` + a `proc_dump_info` tuple for `[THR-DUMP]`). Deps:
+     `akuma-{primitives,exec-core,cpu,mmu,pmm,bkl,mmap}` — **none reach back to
+     `akuma-exec`**. Prereq on the way: the per-thread user-copy-fault-handler
+     slot had already gone to `akuma_primitives::preempt` in step A.
+     `akuma-exec` re-exports `pub use akuma_threading as threading`, so all 33
+     downstream `akuma_exec::threading::…` consumers resolve unchanged.
    - **D. `process/table.rs` (19)** — the `*mut Process` slot store. Either it
      stays `unsafe` (a small crate that can't forbid, like `akuma-gic`) or it
      genericizes into an `akuma-slot-table` primitive, the move
