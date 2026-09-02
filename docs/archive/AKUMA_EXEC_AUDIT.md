@@ -29,9 +29,18 @@ became safe `akuma-mmu` helpers — `write_phys` for `prepare_for_execution`'s
 fallback, new `with_phys_bytes_mut` for the prefault file-fill, the safe
 `map_user_page_tracked` for the prefault common path, and new
 `write_current_user_val` (+ `is_current_user_range_writable`) for the two CLONE
-`set_tid` EL1 stores. **37 → 25 `unsafe` sites.** What remains is **three
-groups, and the crate cannot `forbid` until all three clear** (group 1 landed
-2026-09-02 — `akuma-slot-table` extracted, **25 → 7** sites):
+`set_tid` EL1 stores. **37 → 25 `unsafe` sites.** What remained was three groups,
+**all cleared 2026-09-02**, and:
+
+> **`crates/akuma-exec` carries `#![forbid(unsafe_code)]` as of 2026-09-02.**
+> **0 `unsafe` sites, 100.0% safe** — the largest crate in the tree
+> (`docs/reference/crate-safety.md`). Every genuine operation moved to a crate
+> that owns what it pokes: `akuma-slot-table` (the `*mut Process` store),
+> `akuma-threading` (the scheduler), `akuma-el0-entry` (the `eret`),
+> `akuma-user-access` (the EL0 copy), `akuma-mmu` (page-table walks —
+> `demote_range_to_ro` and `map_user_page` both gained a `&self`-safe form).
+
+The three groups (group 1: **25 → 7**; group 2a+2b: **7 → 2**; group 3: **2 → 0**):
 
 1. ~~**`table.rs` (18 + the `with_process_exclusive` `unsafe fn`)**~~ — §6.D,
    the generic `akuma-slot-table` primitive. **Done 2026-09-02.** `table.rs`
@@ -97,13 +106,33 @@ groups, and the crate cannot `forbid` until all three clear** (group 1 landed
      `execve_preserves_cwd`, `failed_exec_preserves_cloexec_fds`, the exec-reset
      `clear_child_tid` test — all PASS); `/proc/self/status` name rendering over
      SSH; SMP=4 forktest.
-3. **Two decoupled-pointer sites (2)** — `fork`'s `demote_range_to_ro` (its
-   `parent_l0` and the serializing `parent_as` lock are *deliberately
-   independent* parameters — the self-test passes a lock stand-in whose own L0
-   is empty, so this cannot become a `&mut UserAddressSpace` method without a
-   phys-validated L0 wrapper), and the vfork-child-prefault `map_user_page` edge
-   (edit under the leader's `as_lock`, record frames in the child's distinct
-   address space — `map_user_page_tracked` cannot express "lock A, record in B").
+3. **Two decoupled-pointer sites (2) — Done 2026-09-02. `akuma-exec` 2 → 0.**
+   - **`fork`'s `demote_range_to_ro`.** The claim that `parent_l0` and
+     `parent_as` are "deliberately independent" was true only of the *test*,
+     which decoupled them (real `parent_as` for the L0, an empty
+     `ProcAddressSpace` standin for the lock) precisely because there were two
+     params. In production, inside `fork`, the live TTBR0 **is** the leader's
+     address space — the two were always the same L0. `cow_share_and_demote_range`
+     / `share_rw_range` dropped the `parent_l0: *const u64` param and derive it
+     from `parent_as.l0_phys()`; the demote is now `asg.demote_range_to_ro(va,
+     pages)` on the `AddressSpaceGuard` (a new `&mut self` method on
+     `UserAddressSpace` that walks `self.l0_frame` — its own L0 root — so
+     `akuma-mmu` absorbs the one `unsafe` block, +1 there). The two self-tests
+     wrap the mapped AS in one `ProcAddressSpace` and pass that; the standin is
+     gone.
+   - **The vfork-child-prefault `map_user_page` edge.** "Lock A, record in B"
+     was a false problem: A (the leader's `as_lock`) and B (the vfork child's
+     distinct `UserAddressSpace`) share the **same L0**, and the faulted page
+     lives in that L0 — it is the leader's to free, not the child's. The
+     special-case arm is deleted; `prefault_user_range` now always does
+     `leader.address_space.lock().map_user_page_tracked(va, frame, flags)`,
+     which re-checks `installed_l0 == self.l0_phys()` and tracks against the
+     leader. Fail-closed (`return false`) when the address-space owner does not
+     resolve — unreachable on the syscall prefault path. Deleted the raw
+     `map_user_page` call and its whole free-on-lost-CAS cleanup block.
+   Gates: boot self-tests (`fork-bkl-drop`, `fork_cow_share_incs_once_per_frame`,
+   `cow_ref_ledger`, `pmm_conserved_across_spawn_exit_reap` — all PASS, 0-page
+   drift), SMP=4 forktest, self-host kernel build.
 
 Two incidental findings — a triplicated enum (§5b) and the fact that nobody has
 swept for either pattern tree-wide (§5c) — came out of the same reading.

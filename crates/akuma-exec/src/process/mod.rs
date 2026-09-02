@@ -288,7 +288,6 @@ impl Drop for ForkInProgressGuard {
 /// No TLB maintenance is needed here: the parent's PTEs are untouched, and the
 /// child's address space has never been on a CPU.
 pub fn share_rw_range(
-    parent_l0: *const u64,
     parent_as: &ProcAddressSpace,
     va_start: usize,
     len: usize,
@@ -296,6 +295,9 @@ pub fn share_rw_range(
     scratch: &mut alloc::vec::Vec<(usize, usize, u64)>,
 ) -> Result<usize, &'static str> {
     let pages = fork_page_count_for_len(len).ok_or("shared-anon share page count overflow")?;
+    // The L0 to read comes from `parent_as` itself, not a separate raw pointer:
+    // inside fork the live TTBR0 *is* the leader's address space (§6.E group 3).
+    let parent_l0 = mmu::phys_to_virt(parent_as.l0_phys()) as *const u64;
     let mut count = 0usize;
     let mut done = 0usize;
     while done < pages {
@@ -329,7 +331,6 @@ pub fn share_rw_range(
 }
 
 pub fn cow_share_and_demote_range(
-    parent_l0: *const u64,
     parent_as: &ProcAddressSpace,
     va_start: usize,
     len: usize,
@@ -338,6 +339,12 @@ pub fn cow_share_and_demote_range(
     label: &str,
 ) -> Result<usize, &'static str> {
     let pages = fork_page_count_for_len(len).ok_or("CoW share page count overflow")?;
+    // The L0 to walk is `parent_as`'s own — it used to arrive as a separate raw
+    // `*const u64` snapshot of the live TTBR0, but inside fork the live TTBR0
+    // *is* the leader's address space, so the two were always the same L0. One
+    // source removes the `unsafe { demote_range_to_ro(raw_ptr) }` and the
+    // mismatch it invited (`AKUMA_EXEC_AUDIT.md` §6.E group 3).
+    let parent_l0 = mmu::phys_to_virt(parent_as.l0_phys()) as *const u64;
     let mut count = 0usize;
     let mut done = 0usize;
     while done < pages {
@@ -349,7 +356,7 @@ pub fn cow_share_and_demote_range(
 
         // ── Phase A: parent page table, under the AS lock, IRQs masked ──
         {
-            let _asg = parent_as.lock();
+            let mut asg = parent_as.lock();
             mmu::collect_mapped_pages_with_flags_into(parent_l0, chunk_va, chunk, scratch);
             // ONE reference per address space, not per VA.
             //
@@ -384,14 +391,11 @@ pub fn cow_share_and_demote_range(
                 // Inserts with count=2 on first share.
                 akuma_pmm::cow_ref_inc(pa);
             }
-            // SAFETY: `parent_l0` is the live L0 root of the tables this pass
-            // edits — it and `parent_as` (the serializing `as_lock`, held by
-            // `_asg`) are deliberately independent parameters, so this cannot
-            // become a `&mut UserAddressSpace` method (the self-test passes a
-            // lock stand-in whose own L0 is empty).
-            unsafe {
-                mmu::demote_range_to_ro(parent_l0.cast_mut(), chunk_va, chunk);
-            }
+            // `asg` derefs to `&mut UserAddressSpace` — the same address space
+            // `parent_l0` names — so the demote is a safe method call on it
+            // rather than `unsafe { demote_range_to_ro(raw_ptr) }`. Still under
+            // the `as_lock` hold (`asg`), still before the TLB flush below.
+            asg.demote_range_to_ro(chunk_va, chunk);
             // Invalidate before releasing the lock so a sibling thread on a peer core
             // can't keep writing through a stale RW TLB entry for a page the child now
             // references. (The old code demoted every range and then flushed once at
@@ -2665,19 +2669,19 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let _bkl = ProcessBklGuard::new();
 
             // Share stack
-            total_shared += cow_share_and_demote_range(parent_l0, parent_as, stack_start, stack_size,
+            total_shared += cow_share_and_demote_range(parent_as, stack_start, stack_size,
                 new_proc.address_space.get_mut(), &mut chunk_scratch, "stack")?;
 
             // Share code+brk.
             if parent.brk.load(Ordering::Relaxed) > code_start {
                 let brk_len = parent.brk.load(Ordering::Relaxed) - code_start;
-                total_shared += cow_share_and_demote_range(parent_l0, parent_as, code_start, brk_len,
+                total_shared += cow_share_and_demote_range(parent_as, code_start, brk_len,
                     new_proc.address_space.get_mut(), &mut chunk_scratch, "brk")?;
             }
 
             // Share interpreter region
             if mmu::translate_user_va(parent_l0, interp_base).is_some() {
-                total_shared += cow_share_and_demote_range(parent_l0, parent_as, interp_base, interp_scan_size,
+                total_shared += cow_share_and_demote_range(parent_as, interp_base, interp_scan_size,
                     new_proc.address_space.get_mut(), &mut chunk_scratch, "interp")?;
             }
 
@@ -2700,22 +2704,22 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 // it would give parent and child separate pages on the first write,
                 // silently ignoring the flag — see `share_rw_range`.
                 total_shared += if region.shared_anon {
-                    share_rw_range(parent_l0, parent_as, region.start_va,
+                    share_rw_range(parent_as, region.start_va,
                         region.len_bytes(), new_proc.address_space.get_mut(), &mut chunk_scratch)?
                 } else {
-                    cow_share_and_demote_range(parent_l0, parent_as, region.start_va,
+                    cow_share_and_demote_range(parent_as, region.start_va,
                         region.len_bytes(), new_proc.address_space.get_mut(), &mut chunk_scratch,
                         "mmap")?
                 };
             }
 
             for (va_start, len) in &sibling_ranges {
-                total_shared += cow_share_and_demote_range(parent_l0, parent_as, *va_start, *len,
+                total_shared += cow_share_and_demote_range(parent_as, *va_start, *len,
                     new_proc.address_space.get_mut(), &mut chunk_scratch, "sibling-mmap")?;
             }
 
             for region in &parent_lazy_regions {
-                total_shared += cow_share_and_demote_range(parent_l0, parent_as, region.start_va, region.size,
+                total_shared += cow_share_and_demote_range(parent_as, region.start_va, region.size,
                     new_proc.address_space.get_mut(), &mut chunk_scratch, "lazy")?;
             }
 

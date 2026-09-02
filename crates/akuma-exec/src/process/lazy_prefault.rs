@@ -101,67 +101,24 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
             // mapped-but-untracked instant: it clears our PTE, declines to free
             // (untracked), and we then track a frame that is no longer mapped —
             // a re-fault leak. One hold per page, never spanning the loop.
-            let owner_pid = crate::process::read_current_pid().unwrap_or(0);
-            let owner = crate::process::lookup_process_shared(owner_pid);
-            // `as_lock_owner` (the L0-owning thread-group leader) supplies the
-            // lock; the frames are tracked against `owner` (this thread's
-            // Process). They are the same Process for every normal thread — only
-            // a vfork-child prefault sees them differ, and then the two locks are
-            // genuinely distinct so the nested hold below cannot self-deadlock.
-            let (table_frames, installed): (Option<crate::mmu::TableFrames>, bool) =
-                if let (Some(leader), Some(o)) = (as_lock_owner, owner)
-                    && core::ptr::eq(leader, o)
-                {
-                    // Common path. `leader`'s address space is the installed one
-                    // (`as_lock_owner` is resolved from the live TTBR0), and
-                    // `&mut UserAddressSpace` proves the `as_lock` hold, so
-                    // `map_user_page_tracked` discharges `map_user_page`'s whole
-                    // contract in `akuma-mmu`. It tracks `page_frame` and any new
-                    // table frames itself — on a lost CAS race the frame stays
-                    // tracked and is freed at teardown rather than here.
-                    (None, leader.address_space.lock().map_user_page_tracked(va, page_frame, map_flags))
-                } else {
-                    // vfork-child prefault edge: the PTE edit is serialized by
-                    // the *leader's* `as_lock` but the frames are recorded in
-                    // `owner`'s distinct address space. `map_user_page_tracked`
-                    // cannot express "lock A, record in B", so this rare arm
-                    // stays on the raw call.
-                    let _leader_g = as_lock_owner.map(|l| l.address_space.lock());
-                    // SAFETY (map_user_page): installing a mapping for the
-                    // installed address space at a VA this loop has just
-                    // confirmed unmapped, with a freshly-allocated frame nothing
-                    // else references; the leader's `as_lock` is held above and
-                    // the return value is fully consumed below.
-                    let (tf, inst) = unsafe { crate::mmu::map_user_page(va, page_frame.addr, map_flags) };
-                    if let Some(owner) = owner {
-                        let mut g = owner.address_space.lock();
-                        if inst {
-                            g.track_user_frame(page_frame);
-                        }
-                        for t in &tf {
-                            g.track_page_table_frame(*t);
-                        }
-                    }
-                    (Some(tf), inst)
-                };
-            // Frees run after the hold is released. Only the raw arm needs them:
-            // the common path tracked everything against the address space, so a
-            // lost CAS race there leaves a tracked-but-unmapped frame that
-            // teardown reclaims. For the raw arm, the ownership rule matches
-            // `exceptions.rs`'s `ensure_user_page_mapped` sibling — the data
-            // frame goes back to the PMM iff the CAS race was lost or there is no
-            // owner to track it.
-            let tid = akuma_primitives::preempt::current_tid() as u32;
-            if let Some(table_frames) = table_frames {
-                if !installed || owner.is_none() {
-                    akuma_pmm::free_page(page_frame.addr, tid);
-                }
-                if owner.is_none() {
-                    for tf in table_frames {
-                        akuma_pmm::free_page(tf.addr, tid);
-                    }
-                }
-            }
+            //
+            // The installed L0 is the thread-group leader's — every `CLONE_VM`
+            // sibling *and* a vfork child share it — so the lock and the frame
+            // tracking both go there: the page lives in the leader's L0 and is
+            // the leader's to free. That collapses what used to be a common
+            // path plus a raw `unsafe { map_user_page }` "lock A, record in B"
+            // arm for the vfork edge (`AKUMA_EXEC_AUDIT.md` §6.E group 3).
+            // `map_user_page_tracked` re-checks `installed_l0 == self.l0_phys()`
+            // and, on a lost CAS race, leaves the frame tracked to be freed at
+            // teardown rather than here.
+            let Some(leader) = as_lock_owner else {
+                // No resolvable address-space owner (a dying process) — fail
+                // closed, the caller gets EFAULT rather than a page in a table
+                // we could not lock. Unreachable on the syscall prefault path.
+                akuma_pmm::free_page(page_frame.addr, akuma_primitives::preempt::current_tid() as u32);
+                return false;
+            };
+            let _installed = leader.address_space.lock().map_user_page_tracked(va, page_frame, map_flags);
         }
         va += 4096;
     }

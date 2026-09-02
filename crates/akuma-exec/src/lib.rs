@@ -1,4 +1,11 @@
 #![cfg_attr(not(test), no_std)]
+// The whole point of the extraction campaign (`docs/archive/AKUMA_EXEC_AUDIT.md`
+// §6): every genuine `unsafe` operation this crate used to carry moved into a
+// crate that owns what it pokes — `akuma-slot-table` (the `*mut Process` store),
+// `akuma-threading` (the scheduler), `akuma-el0-entry` (the `eret`),
+// `akuma-user-access` (the EL0 copy), `akuma-mmu` (page-table walks). What is
+// left is pure logic over locks and atomics.
+#![forbid(unsafe_code)]
 // `never_type` became stable in 1.100.0-nightly; the attribute is now a warning.
 #![feature(allocator_api)]
 #![allow(

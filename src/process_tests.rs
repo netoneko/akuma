@@ -4758,17 +4758,19 @@ fn test_fork_bkl_drop() {
             continue;
         };
 
-        let parent_l0 = mmu::phys_to_virt(parent_as.l0_phys()) as *const u64;
-        // Stand-in for the thread-group leader's `Process::as_lock`; uncontended here,
-        // but it exercises the same acquire/release (and IRQ mask) the real path takes.
-        let as_lock_standin = akuma_exec::process::ProcAddressSpace::new(mmu::UserAddressSpace::new().expect("standin AS"));
+        // Wrap the mapped parent AS in a `ProcAddressSpace` — it is now both the
+        // L0 the pass walks and the `as_lock` it serializes on (the two were
+        // separate params until §6.E group 3 collapsed them; the standin that
+        // used to exercise the lock is redundant now that there is one source).
+        let parent_pas = akuma_exec::process::ProcAddressSpace::new(parent_as);
+        let parent_l0 = mmu::phys_to_virt(parent_pas.l0_phys()) as *const u64;
         let mut scratch: alloc::vec::Vec<(usize, usize, u64)> =
             alloc::vec::Vec::with_capacity(FORK_AS_CHUNK_PAGES);
 
         // Record the parent's PAs BEFORE the share, so we can prove the child got the
         // same physical frames (CoW share, not a copy) and the parent kept them.
         let before = mmu::collect_mapped_pages_with_flags(parent_l0, VA_BASE, PAGES);
-        let shared = cow_share_and_demote_range(parent_l0, &as_lock_standin,
+        let shared = cow_share_and_demote_range(&parent_pas,
             VA_BASE,
             PAGES * mmu::PAGE_SIZE,
             &mut child_as,
@@ -4847,7 +4849,7 @@ fn test_fork_bkl_drop() {
         // (1→0, freed exactly once). A leak or double-free here would show up in
         // `test_pmm_conserved_across_spawn_exit_reap`.
         drop(child_as);
-        drop(parent_as);
+        drop(parent_pas);
     }
 
     // ── Phase 4: early-error path stays balanced ────────────────────────────
@@ -6653,10 +6655,9 @@ fn test_fork_cow_share_incs_once_per_frame() {
     parent.track_user_frame(frame);
 
     let before = crate::pmm::cow_ref_get(frame.addr);
-    let as_lock_standin = akuma_exec::process::ProcAddressSpace::new(crate::mmu::UserAddressSpace::new().expect("standin AS"));
+    let parent_pas = akuma_exec::process::ProcAddressSpace::new(parent);
     let mut scratch = alloc::vec::Vec::new();
-    let parent_l0 = akuma_exec::mmu::phys_to_virt(parent.l0_phys()) as *const u64;
-    let shared = cow_share_and_demote_range(parent_l0, &as_lock_standin, VA_A, 2 * crate::mmu::PAGE_SIZE, &mut child, &mut scratch, "test");
+    let shared = cow_share_and_demote_range(&parent_pas, VA_A, 2 * crate::mmu::PAGE_SIZE, &mut child, &mut scratch, "test");
     let after = crate::pmm::cow_ref_get(frame.addr);
 
     // Both VAs must be shared into the child, but the frame is one holder-pair:
@@ -6667,7 +6668,7 @@ fn test_fork_cow_share_incs_once_per_frame() {
     // frame is genuinely free. A count that came back as 3 would strand it here —
     // which is exactly the leak this guards.
     drop(child);
-    drop(parent);
+    drop(parent_pas);
     let residual = crate::pmm::cow_ref_get(frame.addr);
     while crate::pmm::cow_ref_get(frame.addr) > 0 {
         if crate::pmm::cow_ref_dec(frame.addr) { break; }

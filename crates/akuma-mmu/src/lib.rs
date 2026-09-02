@@ -1608,6 +1608,25 @@ impl UserAddressSpace {
         self.map_page(va, frame.addr, user_flags)
     }
 
+    /// Demote every RW L3 PTE in `[va_start, va_start + pages*PAGE_SIZE)` of
+    /// **this** address space to read-only; returns the count demoted. The
+    /// CoW-fork share pass
+    /// (`akuma_exec::process::cow_share_and_demote_range`) calls this per chunk
+    /// under the per-AS `as_lock`, then issues the range TLB flush.
+    ///
+    /// The `&self`-safe form of the free [`demote_range_to_ro`] `unsafe fn`:
+    /// that one takes a raw `*mut u64` L0 the caller vouches for, this one walks
+    /// `self.l0_frame` — this address space's own L0 root, allocated in `new`
+    /// and never reassigned, so the walk always has a real tree to follow
+    /// (`AKUMA_EXEC_AUDIT.md` §6.E group 3).
+    pub fn demote_range_to_ro(&mut self, va_start: usize, pages: usize) -> usize {
+        // SAFETY: `self.l0_frame.addr` is this AS's L0 root; `&mut self` is the
+        // exclusivity the PTE writes need.
+        unsafe {
+            demote_range_to_ro(phys_to_virt(self.l0_frame.addr) as *mut u64, va_start, pages)
+        }
+    }
+
     pub fn is_range_mapped(&self, va_start: usize, len: usize) -> bool {
         if len == 0 { return true; }
         let start_page = va_start & !(PAGE_SIZE - 1);
