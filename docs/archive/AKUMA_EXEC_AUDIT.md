@@ -53,14 +53,50 @@ groups, and the crate cannot `forbid` until all three clear** (group 1 landed
      `run`/`prepare_for_execution`/`reset_io` now take `&self`; both sites reach
      their process through `table::active_process_ref` (safe). **7 → 5** sites.
    - **2b — the execve destructive window (`with_own_process_exclusive` →
-     `replace_image`).** Open. `Spinlock<ProcessImage>` sub-struct over
-     `replace_image`'s bare-field mutation set (`entry_point`, `initial_brk`,
-     `memory`, `dynamic_page_tables`, `args`, `context`, `process_info_phys`,
-     `clear_child_tid`, `sigaltstack_*`, `name`); `replace_image` takes `&self`;
-     every peer reader of those fields takes the same lock. Follows the
-     `ProcAddressSpace` precedent — **not** a coarse `PROCESS_TABLE_LOCK`
-     (§9.2 rejected that). Removes `with_process_exclusive` + its 1 forwarding
-     block in `table.rs` + `with_own_process_exclusive`.
+     `replace_image`).** **Done 2026-09-02. `akuma-exec` 5 → 2 sites** — only
+     Group 3 remains. `replace_image` / `replace_image_from_path` take `&self`;
+     the `do_execve` closure
+     (`akuma-syscalls-glue/src/proc.rs`) resolves its process through
+     `lookup_process_shared` and `with_own_process_exclusive` /
+     `with_process_exclusive` / `table::get_process_ptr` all go away. Following
+     the `ProcAddressSpace` precedent (scalars → lock-free atomic, aggregates →
+     one lock) rather than the single coarse `Spinlock<ProcessImage>` the plan
+     sketched — `§9.2` rejected a coarse `PROCESS_TABLE_LOCK` and the same
+     reasoning applies field-by-field here:
+       - **scalars → atomics** (the §5a call): `Process::{entry_point,
+         initial_brk, process_info_phys}` → `AtomicUsize`; `clear_child_tid` →
+         `AtomicU64`; `sigaltstack_{sp,size}` → `AtomicU64`, `sigaltstack_flags`
+         → `AtomicI32`. Signal delivery reads `sigaltstack_*` and must stay
+         lock-free.
+       - **`ProcessMemory` scalars → atomics** (`code_end`, `brk`,
+         `stack_bottom`, `stack_top`, `mmap_limit` → `AtomicUsize`, joining
+         `next_mmap`), plus a `reset(&self, …)` so `replace_image` never
+         replaces the struct. Contradicts §5-bis's "never assigned again" —
+         which was true field-by-field but not across the wholesale
+         `self.memory = ProcessMemory::new(…)` execve does.
+       - **aggregates → `Spinlock<ProcessImage>`**: `{ name: String, args:
+         Vec<String>, context: UserContext }` — the three `execve` swaps
+         wholesale. `context` readers (3 of them) copy the `UserContext` out
+         under the lock (`Copy`) so the guard never crosses
+         `enter_user_mode_checked`'s `!`. `name`'s hot-path readers become
+         `proc.image.lock().name` (guard temp lives to statement end); the cold
+         `/proc/<pid>/*` renderers take a clone via new `Process::image_name()`
+         / `image_args()`. `dynamic_page_tables` turned out to be **dead** —
+         nothing pushes to it — so `replace_image`'s `.clear()` just went away
+         and the field stayed a bare `Vec` (drained on `Drop`, which keeps
+         `&mut self`).
+     Removed: `with_process_exclusive` (+ its `table.rs` forwarding block),
+     `table::get_process_ptr` (callerless), `SlotTable::active_exclusive`
+     (callerless — `akuma-slot-table` 11 → 9 sites). `with_own_process_exclusive`
+     kept but now **safe** (`&Process` via `lookup_process_shared`, BKL check
+     retained as the peer-exclusion guard until Phase 7f lands). `entry_point`
+     and the `Process` `sigaltstack_*` copies have no non-test reader — atomic
+     only because `replace_image` writes them.
+     Gates: boot self-tests (`signal_reset_on_exec`, `execve_no_heap_leak`,
+     `replace_image_preserves_pid`, `execve_kills_thread_group_siblings`,
+     `execve_preserves_cwd`, `failed_exec_preserves_cloexec_fds`, the exec-reset
+     `clear_child_tid` test — all PASS); `/proc/self/status` name rendering over
+     SSH; SMP=4 forktest.
 3. **Two decoupled-pointer sites (2)** — `fork`'s `demote_range_to_ro` (its
    `parent_l0` and the serializing `parent_as` lock are *deliberately
    independent* parameters — the self-test passes a lock stand-in whose own L0

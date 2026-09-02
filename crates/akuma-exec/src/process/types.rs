@@ -20,39 +20,41 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub use akuma_exec_core::process::*;
 
-/// Memory regions for a process
+/// Memory regions for a process.
+///
+/// Every field is interior-mutable: `free_regions`/`next_mmap` because
+/// `CLONE_VM` siblings race `alloc_mmap` on the shared `Process`
+/// (`docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis), and the other five scalars
+/// because `execve` re-sets them — via [`ProcessMemory::reset`] on `&self`, so
+/// `replace_image` never needs `&mut Process`. §5-bis said those five were
+/// "set at construction and never assigned again"; that was true field by
+/// field but not across the wholesale `self.memory = ProcessMemory::new(…)`
+/// that `replace_image` used to do (§6.E group 2b).
 #[derive(Debug)]
 pub struct ProcessMemory {
-    pub code_end: usize,
-    pub brk: usize,
-    pub stack_bottom: usize,
-    pub stack_top: usize,
-    /// Next available mmap VA. AtomicUsize so CLONE_VM goroutine threads
+    pub code_end: AtomicUsize,
+    pub brk: AtomicUsize,
+    pub stack_bottom: AtomicUsize,
+    pub stack_top: AtomicUsize,
+    /// Next available mmap VA. `AtomicUsize` so CLONE_VM goroutine threads
     /// (which share the parent Process via lookup_process) can race-free
     /// advance it using CAS without disabling IRQs.
     pub next_mmap: AtomicUsize,
-    pub mmap_limit: usize,
-    /// Freed mmap VA ranges, available for reuse.
-    ///
-    /// The **only** field here that is mutated after `new()` — the five `usize`
-    /// fields above are set at construction and never assigned again, and
-    /// `next_mmap` is already atomic. It is therefore the only thing the old
-    /// `Process::vm_lock` was really guarding, and the only reason
-    /// `vm_alloc_mmap`/`vm_free_mmap` needed `&mut *(addr_of!(..) as *mut _)`
-    /// from a `&self` method. Holding the data *inside* the lock makes those
-    /// safe (`docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis).
+    pub mmap_limit: AtomicUsize,
+    /// Freed mmap VA ranges, available for reuse. Inside the lock, not beside a
+    /// `Spinlock<()>` — see `docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis.
     pub free_regions: Spinlock<Vec<(usize, usize)>>,
 }
 
 impl Clone for ProcessMemory {
     fn clone(&self) -> Self {
         Self {
-            code_end: self.code_end,
-            brk: self.brk,
-            stack_bottom: self.stack_bottom,
-            stack_top: self.stack_top,
+            code_end: AtomicUsize::new(self.code_end.load(Ordering::Relaxed)),
+            brk: AtomicUsize::new(self.brk.load(Ordering::Relaxed)),
+            stack_bottom: AtomicUsize::new(self.stack_bottom.load(Ordering::Relaxed)),
+            stack_top: AtomicUsize::new(self.stack_top.load(Ordering::Relaxed)),
             next_mmap: AtomicUsize::new(self.next_mmap.load(Ordering::Relaxed)),
-            mmap_limit: self.mmap_limit,
+            mmap_limit: AtomicUsize::new(self.mmap_limit.load(Ordering::Relaxed)),
             free_regions: Spinlock::new(self.free_regions.lock().clone()),
         }
     }
@@ -65,19 +67,34 @@ impl ProcessMemory {
         let mmap_limit = stack_bottom.saturating_sub(0x10_0000);
 
         Self {
-            code_end,
-            brk: code_end,
-            stack_bottom,
-            stack_top,
+            code_end: AtomicUsize::new(code_end),
+            brk: AtomicUsize::new(code_end),
+            stack_bottom: AtomicUsize::new(stack_bottom),
+            stack_top: AtomicUsize::new(stack_top),
             next_mmap: AtomicUsize::new(mmap_start),
-            mmap_limit,
+            mmap_limit: AtomicUsize::new(mmap_limit),
             free_regions: Spinlock::new(Vec::new()),
         }
     }
 
+    /// Re-point every field for a new image, through `&self`. The `execve`
+    /// equivalent of `*self = ProcessMemory::new(…)`, minus the `&mut`.
+    pub fn reset(&self, code_end: usize, stack_bottom: usize, stack_top: usize, mmap_floor: usize) {
+        let base = (code_end + 0x1000_0000) & !0xFFFF;
+        let mmap_start = core::cmp::max(base, mmap_floor);
+        let mmap_limit = stack_bottom.saturating_sub(0x10_0000);
+        self.code_end.store(code_end, Ordering::Relaxed);
+        self.brk.store(code_end, Ordering::Relaxed);
+        self.stack_bottom.store(stack_bottom, Ordering::Relaxed);
+        self.stack_top.store(stack_top, Ordering::Relaxed);
+        self.next_mmap.store(mmap_start, Ordering::Relaxed);
+        self.mmap_limit.store(mmap_limit, Ordering::Relaxed);
+        self.free_regions.lock().clear();
+    }
+
     pub fn overlaps_stack(&self, addr: usize, size: usize) -> bool {
         let end = addr.saturating_add(size);
-        addr < self.stack_top && end > self.stack_bottom
+        addr < self.stack_top.load(Ordering::Relaxed) && end > self.stack_bottom.load(Ordering::Relaxed)
     }
 
     pub const KERNEL_VA_START: usize = 0x4000_0000;
@@ -133,7 +150,7 @@ impl ProcessMemory {
             if self.overlaps_stack(candidate, size) {
                 return None;
             }
-            if candidate + size > self.mmap_limit {
+            if candidate + size > self.mmap_limit.load(Ordering::Relaxed) {
                 return None;
             }
 
@@ -160,10 +177,22 @@ mod tests {
     #[test]
     fn process_memory_new() {
         let mem = ProcessMemory::new(0x10000, 0x7FFF_0000, 0x8000_0000, 0);
-        assert_eq!(mem.code_end, 0x10000);
-        assert_eq!(mem.brk, 0x10000);
-        assert_eq!(mem.stack_bottom, 0x7FFF_0000);
-        assert_eq!(mem.stack_top, 0x8000_0000);
+        assert_eq!(mem.code_end.load(Ordering::Relaxed), 0x10000);
+        assert_eq!(mem.brk.load(Ordering::Relaxed), 0x10000);
+        assert_eq!(mem.stack_bottom.load(Ordering::Relaxed), 0x7FFF_0000);
+        assert_eq!(mem.stack_top.load(Ordering::Relaxed), 0x8000_0000);
+    }
+
+    #[test]
+    fn process_memory_reset_repoints_every_field() {
+        let mem = ProcessMemory::new(0x10000, 0x7FFF_0000, 0x8000_0000, 0);
+        mem.free_mmap(0x2000_0000, 0x1000);
+        mem.reset(0x20000, 0x6FFF_0000, 0x7000_0000, 0);
+        assert_eq!(mem.code_end.load(Ordering::Relaxed), 0x20000);
+        assert_eq!(mem.brk.load(Ordering::Relaxed), 0x20000);
+        assert_eq!(mem.stack_bottom.load(Ordering::Relaxed), 0x6FFF_0000);
+        assert_eq!(mem.stack_top.load(Ordering::Relaxed), 0x7000_0000);
+        assert!(mem.free_regions.lock().is_empty(), "reset clears the free list");
     }
 
     #[test]

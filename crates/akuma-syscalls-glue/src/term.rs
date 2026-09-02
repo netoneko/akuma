@@ -543,7 +543,8 @@ pub(super) fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
             stat.pid = pid;
             if let Some(proc) = akuma_exec::process::lookup_process_shared(pid) {
                 stat.box_id = proc.box_id;
-                let name_bytes = proc.name.as_bytes();
+                let name_owned = proc.image_name();
+                let name_bytes = name_owned.as_bytes();
                 let to_copy = name_bytes.len().min(stat.name.len());
                 stat.name[..to_copy].copy_from_slice(&name_bytes[..to_copy]);
                 if to_copy < stat.name.len() {

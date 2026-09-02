@@ -780,7 +780,7 @@ pub fn alloc_mmap(size: usize) -> usize {
         Some(addr) => addr,
         None => {
             log::debug!("[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}",
-                proc.pid, size, proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed), proc.memory.mmap_limit);
+                proc.pid, size, proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed), proc.memory.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
             0
         }
     }
@@ -1472,7 +1472,7 @@ pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
 /// Get stack bounds for current process
 pub fn get_stack_bounds() -> (usize, usize) {
     match current_process_shared() {
-        Some(p) => (p.memory.stack_bottom, p.memory.stack_top),
+        Some(p) => (p.memory.stack_bottom.load(core::sync::atomic::Ordering::Relaxed), p.memory.stack_top.load(core::sync::atomic::Ordering::Relaxed)),
         None => (0, 0),
     }
 }
@@ -1520,8 +1520,9 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
             0 => "ready", 1 => "running", 2 => "blocked", _ => "zombie",
         };
         let (name, args) = if let Some(proc) = lookup_process_shared(info.pid) {
-            if proc.name.len() <= 4096 && proc.args.len() <= 256 {
-                (proc.name.clone(), proc.args.clone())
+            let img = proc.image.lock();
+            if img.name.len() <= 4096 && img.args.len() <= 256 {
+                (img.name.clone(), img.args.clone())
             } else {
                 (alloc::string::String::from("?"), Vec::new())
             }

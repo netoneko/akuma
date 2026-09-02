@@ -468,7 +468,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             akuma_primitives::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
             proc.pid, pages * 4096,
             proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed),
-            proc.memory.mmap_limit);
+            proc.memory.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
         }
         return ENOMEM;
     };

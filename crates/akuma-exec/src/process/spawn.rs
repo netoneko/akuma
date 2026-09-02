@@ -457,7 +457,7 @@ pub fn spawn_process_with_channel_ext(
     process.terminal_state.lock().foreground_pgid = process.pid;
 
     // Save arguments in process struct for ProcessInfo page
-    process.args = if let Some(arg_slice) = args {
+    process.image.get_mut().args = if let Some(arg_slice) = args {
         arg_slice.iter().map(|s| String::from(*s)).collect()
     } else {
         Vec::new()
@@ -607,7 +607,8 @@ pub(crate) fn run_registered_process(pid: Pid) -> ! {
     (runtime().enable_irqs)();
 
     // Enter user mode via ERET - this never returns
-    enter_user_mode_checked(&proc.context)
+    let ctx = proc.image.lock().context;
+    enter_user_mode_checked(&ctx)
 }
 
 #[cfg(test)]

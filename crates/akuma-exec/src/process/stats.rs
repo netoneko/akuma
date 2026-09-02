@@ -124,7 +124,7 @@ pub fn dump_running_process_stats() {
     let mut pids: Vec<(Pid, String, u64)> = Vec::new();
     table::for_each_process(|p| {
         if !p.exited.load(core::sync::atomic::Ordering::Relaxed) && p.start_time_us > 0 {
-            pids.push((p.pid, p.name.clone(), p.start_time_us));
+            pids.push((p.pid, p.image.lock().name.clone(), p.start_time_us));
         }
     });
     let now = (runtime().uptime_us)();

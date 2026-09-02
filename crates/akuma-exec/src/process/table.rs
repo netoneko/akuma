@@ -221,51 +221,13 @@ pub fn with_process<T, F: FnOnce(&mut Process) -> T>(pid: Pid, f: F) -> Option<T
     PROCESS_TABLE.with_active_mut(|p| p.pid == pid, f)
 }
 
-/// Run `f` with exclusive `&mut Process` access and NO lock or IRQ mask — the
-/// accessor for the process-LIFECYCLE paths (`execve`'s `replace_image*`,
-/// self-teardown) that mutate the whole `Process` (address-space swap, context
-/// rewrite) and allocate/do block I/O while doing it, which rules out
-/// [`with_process`]'s IRQ-masked closure.
+/// Shared `&'static Process` for `pid`, resolved under an IRQ mask.
+/// `lookup_process_shared` is the one caller. The borrow's validity past the
+/// mask rests on `akuma-slot-table`'s deferred-reclamation contract.
 ///
-/// This is the explicit, enumerated residue of the Phase 7e "Access" migration
-/// (docs/archive/BKL_PHASE7_AUDIT.md §5): the execve/clone-class destructive
-/// windows stay `&mut`-exclusive and belong to Phase 7f. Do not add call sites
-/// casually — everything else goes through `lookup_process_shared`/
-/// [`with_process`].
-///
-/// # Safety
-/// The caller must guarantee exclusivity STRUCTURALLY, not via this call:
-///
-/// - `pid` must be the calling thread's own process (which cannot be freed or
-///   concurrently image-replaced by its own syscall path), or a process no
-///   other core can reach (not yet published / already isolated);
-/// - the call must be on a BKL-held path, which is what excludes every peer
-///   core's accessor for the closure's duration — this function adds nothing;
-/// - no other reference (shared or `&mut`) to this `Process` may be live on
-///   this thread across the call.
-pub unsafe fn with_process_exclusive<T, F: FnOnce(&mut Process) -> T>(pid: Pid, f: F) -> Option<T> {
-    // SAFETY: the obligation is this function's own `# Safety` clause, forwarded
-    // verbatim to the caller — `active_exclusive` runs `f` on an unmasked
-    // `&mut Process` and vouches for nothing.
-    unsafe { PROCESS_TABLE.active_exclusive(|p| p.pid == pid, f) }
-}
-
-/// Look up a process by PID. Returns a raw pointer.
-///
-/// # Safety
-/// The pointer is valid only while IRQs are disabled or no other thread
-/// can call `unregister_process` + `reclaim_retired_processes`. Prefer
-/// `with_process()` for safe access, or `lookup_process_shared` for reads —
-/// the `&'static mut`-returning wrappers over this pointer were deleted in
-/// Phase 7e's "Access" half.
-pub fn get_process_ptr(pid: Pid) -> Option<*mut Process> {
-    with_irqs_disabled(|| PROCESS_TABLE.active_ptr_locked(|p| p.pid == pid))
-}
-
-/// Shared `&'static Process` for `pid`, resolved under an IRQ mask. The safe
-/// form of `get_process_ptr` for readers — `lookup_process_shared` is the one
-/// caller. The borrow's validity past the mask rests on `akuma-slot-table`'s
-/// deferred-reclamation contract, the same as the raw pointer's did.
+/// Replaced `get_process_ptr` (raw `*mut Process`) and the `unsafe fn
+/// with_process_exclusive` — the execve/first-run destructive windows those
+/// existed for now take `&Process` (`AKUMA_EXEC_AUDIT.md` §6.E group 2).
 pub fn active_process_ref(pid: Pid) -> Option<&'static Process> {
     PROCESS_TABLE.active_ref(|p| p.pid == pid)
 }

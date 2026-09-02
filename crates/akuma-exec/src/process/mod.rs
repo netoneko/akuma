@@ -577,6 +577,25 @@ pub fn close_process_stdin(pid: Pid) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The parts of a [`Process`] that `execve` replaces wholesale — held behind
+/// one [`Spinlock`] ([`Process::image`]) so a peer core sees the whole old
+/// image or the whole new one, never a half-swapped mix.
+///
+/// This is Phase 7f's answer to the destructive-window `unsafe`
+/// (`AKUMA_EXEC_AUDIT.md` §6.E group 2b): `replace_image` locks this once and
+/// mutates through `&self` instead of needing a `&mut Process` that
+/// `table::with_process_exclusive` had to synthesise from a raw pointer.
+pub struct ProcessImage {
+    /// `argv[0]`-ish display name. Read as a `Display` arg by `for_each_process`
+    /// diagnostics and `/proc/<pid>/{comm,stat,status}`.
+    pub name: String,
+    /// The argument vector, for `/proc/<pid>/cmdline`.
+    pub args: Vec<String>,
+    /// The register state the *first* entry to EL0 `eret`s into. `Copy`, so
+    /// readers take it out by value and drop the guard before the `eret`.
+    pub context: UserContext,
+}
+
 /// A user process
 pub struct Process {
     pub pid: Pid,
@@ -587,7 +606,6 @@ pub struct Process {
     /// kill() delivers signals to all threads with matching tgid.
     /// exit_group() kills all threads with matching tgid.
     pub tgid: Pid,
-    pub name: String,
     /// `AtomicProcessState`, not a plain `ProcessState`: [`Process::run`] and
     /// [`Process::prepare_for_execution`] set it on a `&self`-only
     /// process-lifecycle path (first entry to EL0), and signal / exception
@@ -604,7 +622,6 @@ pub struct Process {
     /// `AsLockHold`). See [`ProcAddressSpace`] and
     /// `docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis.
     pub address_space: ProcAddressSpace,
-    pub context: UserContext,
     pub parent_pid: Pid,
     /// The program break.
     ///
@@ -618,11 +635,22 @@ pub struct Process {
     /// it in a way the compiler agrees with. See
     /// `docs/archive/AKUMA_EXEC_AUDIT.md` §5.
     pub brk: AtomicUsize,
-    pub initial_brk: usize,
-    pub entry_point: usize,
+    /// `AtomicUsize` (§5a / §6.E group 2b): `execve`'s `replace_image` re-sets
+    /// these on `&self`, and peers read them (`initial_brk` on the heap-stats
+    /// path). `entry_point` has no live reader today but `replace_image` writes
+    /// it, so it is atomic for the same reason.
+    pub initial_brk: AtomicUsize,
+    pub entry_point: AtomicUsize,
     pub memory: ProcessMemory,
-    pub process_info_phys: usize,
-    pub args: Vec<String>,
+    pub process_info_phys: AtomicUsize,
+    /// `name` / `args` / `context` — the parts `execve`'s `replace_image` swaps
+    /// wholesale — behind ONE lock, so a peer reader (`for_each_process` sweep
+    /// formatting `name`, `/proc/<pid>/cmdline` reading `args`) sees the old
+    /// image or the new one, never a mix. `context` is the first-run `eret`
+    /// target; readers copy it out (`UserContext: Copy`) so the guard never
+    /// crosses `enter_user_mode_checked`'s `!`. See `AKUMA_EXEC_AUDIT.md`
+    /// §6.E group 2b.
+    pub image: Spinlock<ProcessImage>,
     pub cwd: String,
     pub stdin: Arc<Spinlock<StdioBuffer>>,
     pub stdout: Arc<Spinlock<StdioBuffer>>,
@@ -632,6 +660,10 @@ pub struct Process {
     /// `Relaxed`. Read `.load()`, write `.store()`.
     pub exited: AtomicBool,
     pub exit_code: AtomicI32,
+    /// Always empty in this tree — nothing pushes to it. `Process::drop` still
+    /// drains it defensively. If a future change starts populating it,
+    /// `replace_image` must reset it (it takes `&self` now, so it would need a
+    /// lock or to move into [`Process::image`]).
     pub dynamic_page_tables: Vec<PhysFrame>,
     /// mmap region bookkeeping.
     ///
@@ -664,7 +696,9 @@ pub struct Process {
     /// cleared on the grabber's exit, so a stale pid here is self-correcting the
     /// next time anyone asks. See `reattach_process_ext`.
     pub grabbed_by: Option<Pid>,
-    pub clear_child_tid: u64,
+    /// `AtomicU64` (§5a): written by `set_tid_address` and by `execve`'s reset,
+    /// read at exit for the `CLONE_CHILD_CLEARTID` futex wake.
+    pub clear_child_tid: AtomicU64,
     pub robust_list_head: u64,
     pub robust_list_len: usize,
     pub signal_actions: Arc<SharedSignalTable>,
@@ -675,9 +709,13 @@ pub struct Process {
     /// RAII release guard never ran) and reclaim the slot instead of spinning
     /// forever. See [`fault_slot_acquire`]/[`fault_slot_release`].
     pub fault_mutex: Spinlock<BTreeMap<usize, usize>>,
-    pub sigaltstack_sp: u64,
-    pub sigaltstack_flags: i32,
-    pub sigaltstack_size: u64,
+    /// `execve` disables the alt stack (it pointed into the old image). Atomics
+    /// (§5a) so that reset needs no `&mut Process`. The per-*thread* alt stack
+    /// the signal path actually consults lives in `akuma-threading`; these
+    /// `Process` copies have no non-test reader today.
+    pub sigaltstack_sp: AtomicU64,
+    pub sigaltstack_flags: AtomicI32,
+    pub sigaltstack_size: AtomicU64,
     pub start_time_us: u64,
     pub current_syscall: AtomicU64,
     pub last_syscall: AtomicU64,
@@ -788,20 +826,18 @@ impl Process {
             pid: o.pid,
             tgid: o.tgid,
             address_space: ProcAddressSpace::new(o.address_space),
-            process_info_phys: o.process_info_phys,
+            process_info_phys: AtomicUsize::new(o.process_info_phys),
             fds: o.fds,
             signal_actions: o.signal_actions,
-            clear_child_tid: o.clear_child_tid,
+            clear_child_tid: AtomicU64::new(o.clear_child_tid),
 
             // ── inherited verbatim from the parent ──
             pgid: parent.pgid,
             parent_pid: parent.pid,
-            name: parent.name.clone(),
-            entry_point: parent.entry_point,
+            entry_point: AtomicUsize::new(parent.entry_point.load(Ordering::Relaxed)),
             brk: AtomicUsize::new(parent.brk.load(Ordering::Relaxed)),
-            initial_brk: parent.initial_brk,
+            initial_brk: AtomicUsize::new(parent.initial_brk.load(Ordering::Relaxed)),
             memory: parent.memory.clone(),
-            args: parent.args.clone(),
             cwd: parent.cwd.clone(),
             stdin: parent.stdin.clone(),   // shared
             stdout: parent.stdout.clone(), // shared
@@ -814,15 +850,23 @@ impl Process {
             // in `spawn_child_thread_and_publish`, to avoid contaminating this one.
             channel: parent.channel.clone(),
             signal_mask: parent.signal_mask,
-            sigaltstack_sp: parent.sigaltstack_sp,
-            sigaltstack_flags: parent.sigaltstack_flags,
-            sigaltstack_size: parent.sigaltstack_size,
+            sigaltstack_sp: AtomicU64::new(parent.sigaltstack_sp.load(Ordering::Relaxed)),
+            sigaltstack_flags: AtomicI32::new(parent.sigaltstack_flags.load(Ordering::Relaxed)),
+            sigaltstack_size: AtomicU64::new(parent.sigaltstack_size.load(Ordering::Relaxed)),
 
             // ── fresh for every child, regardless of primitive ──
             state: AtomicProcessState::new(ProcessState::Ready),
-            // Overwritten by `spawn_child_thread_and_publish`, which the
-            // `entry_point_trampoline` reads out of the registered `Process`.
-            context: UserContext::default(),
+            // `name`/`args` inherited from the parent; `context` is overwritten
+            // by `spawn_child_thread_and_publish`, which `entry_point_trampoline`
+            // reads back out of the registered `Process`.
+            image: Spinlock::new({
+                let pimg = parent.image.lock();
+                ProcessImage {
+                    name: pimg.name.clone(),
+                    args: pimg.args.clone(),
+                    context: UserContext::default(),
+                }
+            }),
             exited: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
             dynamic_page_tables: Vec::new(),
@@ -973,7 +1017,7 @@ impl Process {
     ///
     /// Arguments will be passed to the process via the ProcessInfo page.
     pub fn set_args(&mut self, args: &[&str]) {
-        self.args = args.iter().map(|s| String::from(*s)).collect();
+        self.image.lock().args = args.iter().map(|s| String::from(*s)).collect();
     }
     
     /// Set current working directory for this process
@@ -1022,8 +1066,10 @@ impl Process {
         // Jump to user mode. The checked entry validates `spsr` targets EL0 —
         // every context this kernel builds sets `spsr = 0`, so it is one compare
         // on a once-per-launch path, and it removes this crate's last `eret`
-        // `unsafe`.
-        enter_user_mode_checked(&self.context)
+        // `unsafe`. `context` is `Copy` — take it out and drop the `image` guard
+        // before the `eret` that never returns.
+        let ctx = self.image.lock().context;
+        enter_user_mode_checked(&ctx)
     }
 
     /// Prepare process for execution (internal helper)
@@ -1040,7 +1086,7 @@ impl Process {
         // space). `write_phys` range-checks the frame against PMM RAM — same
         // helper `fork_process` uses for the identical write at its own site.
         let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
-        let wrote = crate::mmu::write_phys(self.process_info_phys, &info);
+        let wrote = crate::mmu::write_phys(self.process_info_phys.load(Ordering::Relaxed), &info);
         debug_assert!(wrote, "process_info_phys outside PMM RAM");
     }
 
@@ -1090,7 +1136,7 @@ impl Process {
     /// lock's discipline). Concurrent *readers* of `brk` race the store exactly
     /// as they did against the old `&mut self` write.
     pub fn set_brk(&self, new_brk: usize) -> usize {
-        if new_brk < self.initial_brk {
+        if new_brk < self.initial_brk.load(core::sync::atomic::Ordering::Relaxed) {
             return self.brk.load(Ordering::Relaxed);
         }
         let aligned = (new_brk + 0xFFF) & !0xFFF;
@@ -1121,6 +1167,18 @@ impl Process {
         new_brk
     }
 
+    /// A clone of the process name. `name` is behind [`Process::image`]
+    /// (`execve` renames), so cold readers that would otherwise juggle the
+    /// guard — `/proc/<pid>/{comm,stat,status}`, diagnostics — take a copy.
+    pub fn image_name(&self) -> String {
+        self.image.lock().name.clone()
+    }
+
+    /// A clone of the argument vector. See [`Process::image_name`].
+    pub fn image_args(&self) -> Vec<String> {
+        self.image.lock().args.clone()
+    }
+
     /// Reset I/O state for execution. `&self`: `stdin`/`stdout` are `Arc<Spinlock>`
     /// and `exited`/`exit_code` are atomics.
     pub fn reset_io(&self) {
@@ -1141,30 +1199,20 @@ impl Drop for Process {
     }
 }
 
-/// Run `f` with exclusive `&mut Process` access to **the calling thread's own
-/// process** — the safe form of [`table::with_process_exclusive`].
+/// Run `f` with a shared `&Process` for **the calling thread's own process** —
+/// the `execve` destructive window.
 ///
-/// That function's `# Safety` section has three clauses. Two of them are
-/// mechanical and are discharged here instead of being restated at a call site
-/// that can get them wrong:
+/// Since `AKUMA_EXEC_AUDIT.md` §6.E group 2b this is **safe**: `replace_image`
+/// and everything else the window does take `&self` (the mutated fields are
+/// atomics, interior-locked, or behind [`Process::image`]), so no `&mut Process`
+/// — and no raw pointer to synthesise one from — is needed.
 ///
-/// - **"`pid` must be the calling thread's own process"** — resolved here from
-///   [`read_current_pid`], so there is no pid argument to pass incorrectly.
-/// - **"the call must be on a BKL-held path"** — checked against
-///   [`akuma_bkl::bkl::held_by_current`]. A caller without the BKL gets `None`
-///   rather than a `&mut` no peer core is excluded from.
-///
-/// # What is NOT proven
-///
-/// The third clause — *no other reference to this `Process` may be live on this
-/// thread across the call* — is a discipline, not a type-level proof. Nothing
-/// stops a caller nesting this inside another window. It rests on the call sites
-/// staying enumerated (currently one: `sys_execve`'s destructive window), which
-/// is the same basis on which [`Process::with_address_space`] is already a safe
-/// function in this crate. Treat a new call site as a change to that argument,
-/// not as ordinary use — and read `docs/archive/BKL_PHASE7_AUDIT.md` §5 first:
-/// Phase 7f owns converting this window properly.
-pub fn with_own_process_exclusive<T, F: FnOnce(&mut Process) -> T>(f: F) -> Option<T> {
+/// The BKL check stays: until Phase 7f finishes, the BKL is still what keeps a
+/// peer core out of EL1 while the image is half-swapped. A caller without it is
+/// refused rather than allowed to race a peer's `for_each_process` sweep against
+/// the `replace_image` in progress. `pid` is resolved here from
+/// [`read_current_pid`] so there is no argument to get wrong.
+pub fn with_own_process_exclusive<T, F: FnOnce(&Process) -> T>(f: F) -> Option<T> {
     let pid = read_current_pid()?;
     if !akuma_bkl::bkl::held_by_current() {
         crate::safe_print!(
@@ -1174,11 +1222,7 @@ pub fn with_own_process_exclusive<T, F: FnOnce(&mut Process) -> T>(f: F) -> Opti
         );
         return None;
     }
-    // SAFETY: `pid` is this thread's own process, resolved above rather than
-    // supplied; the BKL is held, which is what excludes every peer core's
-    // accessor for the closure's duration. The no-nesting clause is the caller
-    // discipline documented above.
-    unsafe { table::with_process_exclusive(pid, f) }
+    Some(f(children::lookup_process_shared(pid)?))
 }
 
 /// The EL0 entry `eret` — `enter_user_mode` (the register-load + `eret` asm)
@@ -1594,7 +1638,7 @@ fn kill_children_whose_parent_in(parents: &BTreeSet<Pid>) {
     table::for_each_process(|p| {
         if parents.contains(&p.parent_pid) {
             children.push((p.pid, p.parent_pid, p.thread_id, p.address_space.l0_phys(),
-                p.exited.load(Ordering::Relaxed), p.name.clone()));
+                p.exited.load(Ordering::Relaxed), p.image.lock().name.clone()));
         }
     });
 
@@ -1809,7 +1853,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // forever — one killed thread wedges the whole process, with the futex table
     // showing a perfectly ordinary, correctly-queued waiter.
     if let Some(proc) = lookup_process_shared(pid.unwrap_or(0)) {
-        let tid_addr = proc.clear_child_tid;
+        let tid_addr = proc.clear_child_tid.load(core::sync::atomic::Ordering::Relaxed);
         if tid_addr != 0 {
             // `Prefault::No` EL1 write — an unmapped page is a no-op (Err), not a
             // kernel fault. A lazily-mapped-but-never-faulted `clear_child_tid`
@@ -1939,7 +1983,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         }
 
         let (start_us, proc_name) = lookup_process_shared(pid)
-            .map(|p| (p.start_time_us, p.name.clone()))
+            .map(|p| (p.start_time_us, p.image.lock().name.clone()))
             .unwrap_or((0, alloc::string::String::from("?")));
         let elapsed_us = (runtime().uptime_us)().saturating_sub(start_us);
         let secs = elapsed_us / 1_000_000;
@@ -2281,7 +2325,7 @@ fn spawn_child_thread_and_publish(
 
     // `entry_point_trampoline` erets to `proc.context`, so this must land before
     // the thread exists.
-    new_proc.context = *child_ctx;
+    new_proc.image.get_mut().context = *child_ctx;
 
     lifecycle_trace("[FORK-DBG] child-publish: spawning child thread\n");
     // Allocate the thread slot but keep it INITIALIZING until everything below is
@@ -2369,7 +2413,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
     if lifecycle_trace_on() {
         crate::safe_print!(128, "[FORK-DBG] parent_pid={} child_pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
-            parent_pid, child_pid, parent.brk.load(Ordering::Relaxed), parent.memory.code_end,
+            parent_pid, child_pid, parent.brk.load(Ordering::Relaxed), parent.memory.code_end.load(Ordering::Relaxed),
             parent.mmap_regions.lock().len(),
             parent.lazy_regions.lock().len());
     }
@@ -2406,7 +2450,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     })?;
 
     // 4. Perform memory copy
-    let stack_top = parent.memory.stack_top;
+    let stack_top = parent.memory.stack_top.load(Ordering::Relaxed);
     let stack_size = config().user_stack_size; 
     let stack_start = stack_top - stack_size;
     
@@ -2523,7 +2567,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 
         // Lowest VA to scan for code/data pages — see `fork_code_start`, which
         // carries the three layouts and the Go-AArch64 regression it exists for.
-        let code_start = fork_code_start(parent.memory.code_end);
+        let code_start = fork_code_start(parent.memory.code_end.load(Ordering::Relaxed));
         let interp_base = 0x3000_0000usize;
         let interp_scan_size = 2 * 1024 * 1024;
 
@@ -2727,7 +2771,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         )?;
         lifecycle_trace("[FORK-DBG] step4: stack done\n");
 
-        let code_start = fork_code_start(parent.memory.code_end);
+        let code_start = fork_code_start(parent.memory.code_end.load(Ordering::Relaxed));
         if parent.brk.load(Ordering::Relaxed) > code_start {
             let brk_len = parent.brk.load(Ordering::Relaxed) - code_start;
             if lifecycle_trace_on() {
@@ -2914,7 +2958,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     lifecycle_trace("[FORK-DBG] step5a: re-mapping PROCESS_INFO_ADDR\n");
     let map_result = new_proc.address_space.get_mut().map_page(
         PROCESS_INFO_ADDR,
-        new_proc.process_info_phys,
+        new_proc.process_info_phys.load(core::sync::atomic::Ordering::Relaxed),
         mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
     );
     if map_result.is_err() {
@@ -2923,7 +2967,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     lifecycle_trace("[FORK-DBG] step5b: writing ProcessInfo\n");
     {
         let info = ProcessInfo::new(child_pid, parent_pid, new_proc.box_id);
-        let wrote = mmu::write_phys(new_proc.process_info_phys, &info);
+        let wrote = mmu::write_phys(new_proc.process_info_phys.load(core::sync::atomic::Ordering::Relaxed), &info);
         debug_assert!(wrote, "fork: ProcessInfo frame not in PMM RAM");
     }
 
@@ -3018,7 +3062,7 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
         address_space: new_address_space,
         // Shares the parent's ProcessInfo page; identity comes from
         // THREAD_PID_MAP.  exec installs a fresh page.
-        process_info_phys: parent.process_info_phys,
+        process_info_phys: parent.process_info_phys.load(core::sync::atomic::Ordering::Relaxed),
         fds: Arc::new(parent.fds.clone_deep_for_fork()),
         // Inherited, like fork's — see `SharedSignalTable::clone_for_fork`.
         signal_actions: Arc::new(parent.signal_actions.clone_for_fork()),
@@ -3236,7 +3280,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
         pid: child_pid,
         tgid: parent_tgid, // same thread group as parent
         address_space: shared_as,
-        process_info_phys: parent.process_info_phys,
+        process_info_phys: parent.process_info_phys.load(core::sync::atomic::Ordering::Relaxed),
         fds: parent.fds.clone(), // Arc::clone — shared fd table (CLONE_FILES)
         signal_actions: parent.signal_actions.clone(), // Shared table (Arc clone)
         // Only a CLONE_CHILD_CLEARTID caller gets the zero-and-wake at exit.
@@ -3663,13 +3707,17 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
     let mem = ProcessMemory::new(0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000);
     
     alloc::boxed::Box::new(Process {
-        pid, pgid: pid, tgid: pid, name: "test".to_string(),
+        pid, pgid: pid, tgid: pid,
         state: AtomicProcessState::new(ProcessState::Ready),
         address_space: ProcAddressSpace::new(addr_space),
-        context: UserContext::new(0, 0),
-        parent_pid: 0, brk: AtomicUsize::new(0x1000_0000), initial_brk: 0x1000_0000,
-        entry_point: 0, memory: mem, process_info_phys: 0,
-        args: Vec::new(), cwd: "/".to_string(),
+        image: Spinlock::new(ProcessImage {
+            name: "test".to_string(),
+            args: Vec::new(),
+            context: UserContext::new(0, 0),
+        }),
+        parent_pid: 0, brk: AtomicUsize::new(0x1000_0000), initial_brk: AtomicUsize::new(0x1000_0000),
+        entry_point: AtomicUsize::new(0), memory: mem, process_info_phys: AtomicUsize::new(0),
+        cwd: "/".to_string(),
         stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
         exited: AtomicBool::new(false), exit_code: AtomicI32::new(0),
@@ -3680,11 +3728,11 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         thread_id: None, spawner_pid: None,
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
-        channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: 0,
+        channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: AtomicU64::new(0),
         robust_list_head: 0, robust_list_len: 0,
         signal_actions: Arc::new(SharedSignalTable::new()),
         signal_mask: 0,
-        sigaltstack_sp: 0, sigaltstack_flags: 2, sigaltstack_size: 0,
+        sigaltstack_sp: AtomicU64::new(0), sigaltstack_flags: AtomicI32::new(2), sigaltstack_size: AtomicU64::new(0),
         start_time_us: 0,
         current_syscall: core::sync::atomic::AtomicU64::new(!0),
         last_syscall: core::sync::atomic::AtomicU64::new(0),

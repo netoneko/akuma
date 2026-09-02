@@ -1865,7 +1865,7 @@ pub(super) fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Sy
 
     let path = if path == "/proc/self/exe" {
         if let Some(proc) = akuma_exec::process::current_process_shared() {
-            proc.name.clone()
+            proc.image_name()
         } else {
             return Err(ENOENT);
         }
@@ -2948,7 +2948,7 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
     if path == "/proc/self/exe" {
         if !validate_user_ptr(buf_ptr, bufsize) { return Err(EFAULT); }
         let exe = if let Some(proc) = akuma_exec::process::current_process_shared() {
-            proc.name.clone()
+            proc.image_name()
         } else {
             String::from("/bin/unknown")
         };

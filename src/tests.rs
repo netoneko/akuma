@@ -2912,7 +2912,7 @@ fn test_alloc_mmap_non_overlapping() -> bool {
     for &sz in &sizes {
         if let Some(a) = mem.alloc_mmap(sz) { addrs.push((a, sz)) } else {
             crate::safe_print!(192, "  alloc_mmap returned None for size {:#x} (next={:#x} limit={:#x})\n",
-                sz, mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit);
+                sz, mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
             return false;
         }
     }
@@ -3504,13 +3504,13 @@ fn make_test_process(
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
     alloc::boxed::Box::new(akuma_exec::process::Process {
-        pid, pgid: pid, tgid: pid, name: String::from("test"),
+        pid, pgid: pid, tgid: pid,
         state: akuma_exec::process::AtomicProcessState::new(akuma_exec::process::ProcessState::Ready),
         address_space: akuma_exec::process::ProcAddressSpace::new(addr_space),
-        context: akuma_exec::process::UserContext::new(0, 0),
-        parent_pid: ppid, brk: core::sync::atomic::AtomicUsize::new(0x1000_0000), initial_brk: 0x1000_0000,
-        entry_point: 0, memory: mem, process_info_phys: info_phys,
-        args: Vec::new(), cwd: String::from("/"),
+        image: spinning_top::Spinlock::new(akuma_exec::process::ProcessImage { name: String::from("test"), args: Vec::new(), context: akuma_exec::process::UserContext::new(0, 0) }),
+        parent_pid: ppid, brk: core::sync::atomic::AtomicUsize::new(0x1000_0000), initial_brk: core::sync::atomic::AtomicUsize::new(0x1000_0000),
+        entry_point: core::sync::atomic::AtomicUsize::new(0), memory: mem, process_info_phys: core::sync::atomic::AtomicUsize::new(info_phys),
+        cwd: String::from("/"),
         stdin: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         exited: core::sync::atomic::AtomicBool::new(false), exit_code: core::sync::atomic::AtomicI32::new(0),
@@ -3523,11 +3523,11 @@ fn make_test_process(
             akuma_terminal::TerminalState::default(),
         )),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
-        channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: 0,
+        channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: core::sync::atomic::AtomicU64::new(0),
         robust_list_head: 0, robust_list_len: 0,
         signal_actions: alloc::sync::Arc::new(akuma_exec::process::SharedSignalTable::new()),
         signal_mask: 0,
-        sigaltstack_sp: 0, sigaltstack_flags: 2, sigaltstack_size: 0,
+        sigaltstack_sp: core::sync::atomic::AtomicU64::new(0), sigaltstack_flags: core::sync::atomic::AtomicI32::new(2), sigaltstack_size: core::sync::atomic::AtomicU64::new(0),
         start_time_us: 0,
         current_syscall: core::sync::atomic::AtomicU64::new(!0),
         last_syscall: core::sync::atomic::AtomicU64::new(0),
@@ -4529,20 +4529,20 @@ fn test_execve_clears_child_tid() -> bool {
     let info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
     // Create Process with clear_child_tid set (simulating set_tid_address)
-    let mut proc = make_test_process(pid, 0, addr_space, info.addr);
-    proc.clear_child_tid = 0x300c_2e80;
+    let proc = make_test_process(pid, 0, addr_space, info.addr);
+    proc.clear_child_tid.store(0x300c_2e80, core::sync::atomic::Ordering::Relaxed);
 
-    let before = proc.clear_child_tid;
+    let before = proc.clear_child_tid.load(core::sync::atomic::Ordering::Relaxed);
     assert!(before == 0x300c_2e80, "clear_child_tid should be set");
 
     // Simulate what replace_image now does: reset clear_child_tid to 0
-    proc.clear_child_tid = 0;
+    proc.clear_child_tid.store(0, core::sync::atomic::Ordering::Relaxed);
 
     // Verify the fix: clear_child_tid must be 0 after exec (replace_image)
-    let pass = proc.clear_child_tid == 0;
+    let pass = proc.clear_child_tid.load(core::sync::atomic::Ordering::Relaxed) == 0;
     if !pass {
         crate::safe_print!(128, "  clear_child_tid before=0x{:x} after=0x{:x} (expected 0)\n",
-            before, proc.clear_child_tid);
+            before, proc.clear_child_tid.load(core::sync::atomic::Ordering::Relaxed));
     }
 
     // Cleanup
@@ -6136,7 +6136,7 @@ fn test_large_mmap_limit() -> bool {
     let mem = akuma_exec::process::ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
     
     crate::safe_print!(128, "  Created ProcessMemory: next_mmap={:#x}, mmap_limit={:#x}\n",
-        mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit);
+        mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
     
     // Bun allocates a 1GB arena + 64GB Gigacage (not 128GB contiguous)
     let arena_size = 1024 * 1024 * 1024;
@@ -6153,7 +6153,7 @@ fn test_large_mmap_limit() -> bool {
         }
         (a1, a2) => {
             crate::safe_print!(128, "  FAILED: arena={:?} gigacage={:?} (limit={:#x})\n",
-                a1, a2, mem.mmap_limit);
+                a1, a2, mem.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
             console::print("  Result: FAIL\n");
             false
         }
@@ -6575,7 +6575,7 @@ fn test_mmap_space_covers_jsc_gigacage() -> bool {
         crate::safe_print!(128, "  64 GB gigacage at {:#x}–{:#x} OK\n", a, a + GIGACAGE_64GB);
     } else {
         crate::safe_print!(128, "  FAIL: 64 GB alloc failed (mmap_limit={:#x})\n",
-            mem.mmap_limit);
+            mem.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
     }
 
     let pass = pass_1g && pass_64g;
@@ -6713,7 +6713,7 @@ fn test_go_binary_va_exhaustion_scenario() -> bool {
     let mem_1g = akuma_exec::process::types::ProcessMemory::new(
         brk_go, stack_bot_1g, stack_top_1g, 0,
     );
-    let budget_1g         = mem_1g.mmap_limit;
+    let budget_1g         = mem_1g.mmap_limit.load(core::sync::atomic::Ordering::Relaxed);
     let probes_before_1g  = budget_1g / PROBE_SIZE;
     let would_exhaust_1g  = probes_before_1g < NUM_PROBES;
     crate::safe_print!(128,
@@ -6745,7 +6745,7 @@ fn test_go_binary_va_exhaustion_scenario() -> bool {
         }
     }
 
-    let budget_large = mem_large.mmap_limit;
+    let budget_large = mem_large.mmap_limit.load(core::sync::atomic::Ordering::Relaxed);
     let probes_large = budget_large / PROBE_SIZE;
     crate::safe_print!(128,
         "  Large: mmap_limit={:#x}, budget_probes={}, all_ok={}\n",

@@ -94,13 +94,14 @@ pub fn mounts_bytes(target_pid: Option<Pid>, viewer_box_id: u64) -> Option<Vec<u
 }
 
 fn proc_cmdline_bytes(p: &process::Process) -> Vec<u8> {
-    if p.args.is_empty() {
-        let mut v: Vec<u8> = p.name.as_bytes().to_vec();
+    let args = p.image_args();
+    if args.is_empty() {
+        let mut v: Vec<u8> = p.image_name().into_bytes();
         v.push(0);
         return v;
     }
     let mut out = Vec::new();
-    for a in &p.args {
+    for a in &args {
         out.extend_from_slice(a.as_bytes());
         out.push(0);
     }
@@ -121,7 +122,8 @@ fn proc_cmdline_bytes(p: &process::Process) -> Vec<u8> {
 const CAP_FULL_MASK: &str = "000001ffffffffff";
 
 fn proc_status_text(p: &process::Process) -> String {
-    let name = p.name.as_str();
+    let name_owned = p.image_name();
+    let name = name_owned.as_str();
     let name_field = if name.len() > 15 { &name[..15] } else { name };
     let state = match p.state.load() {
         ProcessState::Zombie(_) => "Z (zombie)",
@@ -158,7 +160,8 @@ fn proc_status_text(p: &process::Process) -> String {
 /// stats are a separate, larger feature.
 fn render_pid_stat(p: &process::Process, buf: &mut [u8]) -> usize {
     use akuma_primitives::console::FmtBuf;
-    let name = p.name.as_str();
+    let name_owned = p.image_name();
+    let name = name_owned.as_str();
     // Linux's `comm` is the executable's basename, truncated to 15 bytes.
     let base = name.rsplit('/').next().unwrap_or(name);
     let comm = if base.len() > 15 { &base[..15] } else { base };

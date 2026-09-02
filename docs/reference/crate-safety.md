@@ -1,19 +1,28 @@
 # Crate safety: which crates forbid `unsafe`
 
 **Grade: A** — regenerated 2026-09-02 with
+`python3 scripts/cloc_akuma.py src crates` after Phase 7f groups 2a+2b
+([`AKUMA_EXEC_AUDIT.md`](../archive/AKUMA_EXEC_AUDIT.md) §6.E): the
+`execve`/first-run destructive window stopped needing a `&mut Process`
+synthesised from a raw pointer. `Process::{state,exited,exit_code,entry_point,
+initial_brk,process_info_phys,clear_child_tid,sigaltstack_*}` and the five
+`ProcessMemory` scalars became atomics (the §5a call); `name`/`args`/`context`
+moved behind one `Spinlock<ProcessImage>`; `replace_image` and `Process::run`
+take `&self`. `table::{get_process_ptr,with_process_exclusive}` and
+`SlotTable::active_exclusive` are gone. **`akuma-exec` 7 → 2** `unsafe` sites —
+only Group 3 (`demote_range_to_ro`'s raw L0, the vfork-prefault `map_user_page`
+edge) left; `akuma-slot-table` **11 → 9**. **31 of 52 crates** forbid.
+
+The run before it, earlier the same day,
 `python3 scripts/cloc_akuma.py src crates` after `akuma-slot-table` was carved
-out of `akuma_exec::process::table`
-([`AKUMA_EXEC_AUDIT.md`](../archive/AKUMA_EXEC_AUDIT.md) §6.D). The lock-free
-`*mut Process` slot store — the FREE/ACTIVE/RETIRED state array, the reuse
-generation, the retire timestamp, and every deref — became a generic
-`SlotTable<T, N>` primitive that never names `Process`, the move
-`akuma-locks-rw-cell`/`akuma-gic` made. `akuma-exec` **25 → 7** `unsafe` sites
-(the identity cache's `own_ptr`/`tgid_ptr` fields went too — `identity_get`
-derives the pointer from `SlotTable::ref_if_current(slot, generation)`); the new
-`akuma-slot-table` carries **11**, behind one stated contract. **31 of 52
-crates** forbid. `akuma-exec`'s remaining 7 are the three groups §6.E
-enumerates: the execve/first-run exclusive `&mut Process` window (Phase 7f),
-`demote_range_to_ro`'s raw L0, and the vfork-prefault `map_user_page` edge.
+out of `akuma_exec::process::table` (§6.D). The lock-free `*mut Process` slot
+store — the FREE/ACTIVE/RETIRED state array, the reuse generation, the retire
+timestamp, and every deref — became a generic `SlotTable<T, N>` primitive that
+never names `Process`, the move `akuma-locks-rw-cell`/`akuma-gic` made.
+`akuma-exec` **25 → 7** `unsafe` sites (the identity cache's
+`own_ptr`/`tgid_ptr` fields went too — `identity_get` derives the pointer from
+`SlotTable::ref_if_current(slot, generation)`); the new `akuma-slot-table`
+carried **11**, behind one stated contract.
 
 The run before it, 2026-09-01, was
 `python3 scripts/cloc_akuma.py src crates` after the `src/` boot-entry cleanup
@@ -608,8 +617,8 @@ crates and a long tail holding one obligation each.
 
 | crate | sites | why it is irreducible |
 |---|---:|---|
-| `akuma-exec` | 7 | the execve/first-run exclusive `&mut Process` window (`with_process_exclusive` + its 3 callers — Phase 7f, not a layering problem), `demote_range_to_ro`'s raw `*mut u64` L0, and the vfork-prefault `map_user_page` edge. Was 123 before `user_access`/`threading`/`el0-entry`/`slot-table` left; [`AKUMA_EXEC_AUDIT.md`](../archive/AKUMA_EXEC_AUDIT.md) §6.E |
-| `akuma-slot-table` | 11 | the lock-free per-slot `*mut Process` store under the process table — FREE/ACTIVE/RETIRED state, the reuse generation, the retire timestamp, and every deref of those pointers. Generic `SlotTable<T, N>`, never names `Process`. One stated contract at the top of `lib.rs`: a slot's `Box<T>` is dropped only by `reclaim_retired` after a cooldown that outlasts any held stale pointer, and within a generation the pointer is immutable. The shape `akuma-locks-rw-cell`/`akuma-gic` use |
+| `akuma-exec` | 2 | `demote_range_to_ro`'s raw `*mut u64` L0 and the vfork-prefault `map_user_page` edge — the two "lock A, record in B" decoupled-pointer sites (§6.E group 3). Was 123 before `user_access`/`threading`/`el0-entry`/`slot-table` left and Phase 7f groups 2a+2b landed; [`AKUMA_EXEC_AUDIT.md`](../archive/AKUMA_EXEC_AUDIT.md) §6.E |
+| `akuma-slot-table` | 9 | the lock-free per-slot `*mut Process` store under the process table — FREE/ACTIVE/RETIRED state, the reuse generation, the retire timestamp, and every deref of those pointers. Generic `SlotTable<T, N>`, never names `Process`. One stated contract at the top of `lib.rs`: a slot's `Box<T>` is dropped only by `reclaim_retired` after a cooldown that outlasts any held stale pointer, and within a generation the pointer is immutable. The shape `akuma-locks-rw-cell`/`akuma-gic` use |
 | `akuma-exceptions` | 80 | the vector table, the EL0/EL1 trap handlers and the fault repair behind them. Irreducible in the strongest sense on this list: `forbid` rejects `global_asm!` and `#[unsafe(no_mangle)]` outright, and this crate is a vector table plus the five handlers it `bl`s. One stated contract at the top of `lib.rs` covers all 80, the shape `akuma-net-nic` and `akuma-gic` use |
 | `akuma-mmu` | 64 | page tables, `UserAddressSpace`, ASIDs, the per-core TTBR free gate. Gained one: `boot_device_l3_phys`, the boot-table walk that let `rebuild_boot_device_table` stop being `unsafe` for its callers |
 | `akuma-virtio` | 38 | MMIO and DMA by definition |

@@ -2492,7 +2492,7 @@ fn apply_default_signal_action(signal: u32) {
 
     crate::safe_print!(128,
         "[signal] Process {} ({}) terminated by signal {} (default action)\n",
-        proc.pid, proc.name, signal);
+        proc.pid, proc.image.lock().name, signal);
     (hooks().sys_exit_group)(-(signal as i32)) // never returns
 }
 
@@ -3816,7 +3816,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
             }
             safe_print!(256, "  EC=0x25 in kernel code — killing current process (EFAULT)\n");
             if let Some(proc) = akuma_exec::process::current_process_shared() {
-                safe_print!(256, "  Killing PID {} ({})\n", proc.pid, proc.name);
+                safe_print!(256, "  Killing PID {} ({})\n", proc.pid, proc.image.lock().name);
                 let l0_phys = proc.address_space.l0_phys();
                 let pid = proc.pid;
                 akuma_exec::process::with_current_process(|p| {
@@ -3971,23 +3971,26 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
     // User process info (if any)
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let mem = &proc.memory;
-        let stack_size = mem.stack_top - mem.stack_bottom;
-        let stack_used = if user_sp >= mem.stack_bottom as u64 && user_sp < mem.stack_top as u64 {
-            mem.stack_top - user_sp as usize
+        let stack_bottom = mem.stack_bottom.load(core::sync::atomic::Ordering::Relaxed);
+        let stack_top = mem.stack_top.load(core::sync::atomic::Ordering::Relaxed);
+        let mmap_limit = mem.mmap_limit.load(core::sync::atomic::Ordering::Relaxed);
+        let stack_size = stack_top - stack_bottom;
+        let stack_used = if user_sp >= stack_bottom as u64 && user_sp < stack_top as u64 {
+            stack_top - user_sp as usize
         } else {
             0 // SP outside expected range (might be corrupted)
         };
         let heap_used = proc
             .brk
             .load(core::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(proc.initial_brk);
+            .saturating_sub(proc.initial_brk.load(core::sync::atomic::Ordering::Relaxed));
         let mmap_used = mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(0x1000_0000);
 
         // Print in smaller chunks to fit in static buffer
-        safe_print!(256, "  Process PID={} '{}'\n", proc.pid, proc.name);
+        safe_print!(256, "  Process PID={} '{}'\n", proc.pid, proc.image.lock().name);
 
         safe_print!(256, "    Stack: {:#x}-{:#x} ({} KB)\n",
-            mem.stack_bottom, mem.stack_top, stack_size / 1024
+            stack_bottom, stack_top, stack_size / 1024
         );
 
         // Calculate percentage without floating point (integer percentage)
@@ -3995,11 +3998,11 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
         safe_print!(256, "    SP_EL0={user_sp:#x}, used={stack_used} bytes ({stack_pct}%)\n");
 
         safe_print!(256, "    Heap: brk={:#x} (initial={:#x}), grown={} bytes\n",
-            proc.brk.load(core::sync::atomic::Ordering::Relaxed), proc.initial_brk, heap_used
+            proc.brk.load(core::sync::atomic::Ordering::Relaxed), proc.initial_brk.load(core::sync::atomic::Ordering::Relaxed), heap_used
         );
 
         safe_print!(256, "    Mmap: next={:#x}, limit={:#x}, used={} bytes\n",
-            mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit, mmap_used
+            mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mmap_limit, mmap_used
         );
 
         // Leak attribution: how many frames this process tracks vs the VA it
@@ -4023,9 +4026,9 @@ fn log_memory_stats_on_crash(tid: usize, kernel_sp: u64, user_sp: u64) {
         let _ = writeln!(w);
         w.flush();
 
-        if user_sp < mem.stack_bottom as u64 {
+        if user_sp < stack_bottom as u64 {
             safe_print!(128, "    WARNING: User SP below stack bottom - STACK OVERFLOW!\n");
-        } else if user_sp >= mem.stack_top as u64 {
+        } else if user_sp >= stack_top as u64 {
             safe_print!(128, "    WARNING: User SP above stack top - SP corrupted!\n");
         }
     } else {
@@ -4476,7 +4479,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 if let Some(proc) = akuma_exec::process::current_process_shared() {
                     crate::safe_print!(128,
                         "[SPURIOUS-SVC] Process {} ({}) killed (SIGILL, phantom SVC)\n",
-                        proc.pid, proc.name);
+                        proc.pid, proc.image.lock().name);
                 }
                 fatal_signal_group_exit(-4) // never returns
             }
@@ -4568,7 +4571,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                     let secs = elapsed_us / 1_000_000;
                     let frac = (elapsed_us % 1_000_000) / 10_000;
                     crate::safe_print!(128, "[exception] Process {} ({}) exited (code {}) [{}.{:02}s]\n",
-                        proc.pid, proc.name, exit_code, secs, frac);
+                        proc.pid, proc.image.lock().name, exit_code, secs, frac);
                     akuma_exec::process::return_to_kernel(exit_code);
                 }
             } else {
@@ -5105,7 +5108,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 let secs = elapsed_us / 1_000_000;
                 let frac = (elapsed_us % 1_000_000) / 10_000;
                 crate::safe_print!(128, "[Fault] Process {} ({}) SIGSEGV after {}.{:02}s\n",
-                    proc.pid, proc.name, secs, frac);
+                    proc.pid, proc.image.lock().name, secs, frac);
             }
             fatal_signal_group_exit(-11) // SIGSEGV - never returns
         }
@@ -5242,7 +5245,7 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
                 let secs = elapsed_us / 1_000_000;
                 let frac = (elapsed_us % 1_000_000) / 10_000;
                 crate::safe_print!(128, "[Fault] Process {} ({}) SIGSEGV after {}.{:02}s\n",
-                    proc.pid, proc.name, secs, frac);
+                    proc.pid, proc.image.lock().name, secs, frac);
             }
             fatal_signal_group_exit(-11) // never returns
         }

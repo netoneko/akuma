@@ -7842,7 +7842,7 @@ fn test_exit_group_does_not_unregister_while_siblings_running() {
 
     // Create a fake "sibling" process (pid 1001) sharing the same l0_phys
     let sib_pid = 1001;
-    let mut sib_proc = make_test_process(sib_pid);
+    let sib_proc = make_test_process(sib_pid);
     
     // Force share address space (simulating CLONE_VM)
     let shared_as = if let Some(as_space) = crate::mmu::UserAddressSpace::new_shared(l0_phys) { as_space } else {
@@ -8089,7 +8089,7 @@ fn test_echo2() {
             Ok(proc) => {
                 crate::safe_print!(96, 
                     "[Test] Process created: PID={}, entry={:#x}\n",
-                    proc.pid, proc.context.pc
+                    proc.pid, proc.image.lock().context.pc
                 );
                 console::print("[Test] echo2 test PASSED (process creation succeeded)\n");
 
@@ -8413,7 +8413,7 @@ fn test_signal_reset_on_exec() {
         return;
     };
 
-    let mut proc = match process::Process::from_elf(
+    let proc = match process::Process::from_elf(
         "elftest", &[String::from("elftest")], &[], &elf_data, None,
     ) {
         Ok(p) => p,
@@ -8433,9 +8433,9 @@ fn test_signal_reset_on_exec() {
             restorer: 0,
         };
     }
-    proc.sigaltstack_sp    = 0xc400_4000;
-    proc.sigaltstack_size  = 0x8000;
-    proc.sigaltstack_flags = 0; // SS_ONSTACK active
+    proc.sigaltstack_sp.store(0xc400_4000, core::sync::atomic::Ordering::Relaxed);
+    proc.sigaltstack_size.store(0x8000, core::sync::atomic::Ordering::Relaxed);
+    proc.sigaltstack_flags.store(0, core::sync::atomic::Ordering::Relaxed); // SS_ONSTACK active
 
     // Replace the image — same binary, new address space.
     if let Err(e) = proc.replace_image(&elf_data, &[String::from("elftest")], &[]) {
@@ -8449,9 +8449,9 @@ fn test_signal_reset_on_exec() {
         matches!(actions[10].handler, SignalHandler::Default)
     };
     // The alternate signal stack must be disabled (SS_DISABLE = 2).
-    let altstack_disabled = proc.sigaltstack_sp == 0
-        && proc.sigaltstack_size == 0
-        && proc.sigaltstack_flags == 2;
+    let altstack_disabled = proc.sigaltstack_sp.load(core::sync::atomic::Ordering::Relaxed) == 0
+        && proc.sigaltstack_size.load(core::sync::atomic::Ordering::Relaxed) == 0
+        && proc.sigaltstack_flags.load(core::sync::atomic::Ordering::Relaxed) == 2;
 
     if handler_reset && altstack_disabled {
         console::print("[Test] signal_reset_on_exec PASSED\n");
@@ -8460,7 +8460,7 @@ fn test_signal_reset_on_exec() {
             64,
             "[Test] signal_reset_on_exec FAILED: handler_reset={} altstack_disabled={} (sp=0x{:x} flags={})\n",
             handler_reset, altstack_disabled,
-            proc.sigaltstack_sp, proc.sigaltstack_flags,
+            proc.sigaltstack_sp.load(core::sync::atomic::Ordering::Relaxed), proc.sigaltstack_flags.load(core::sync::atomic::Ordering::Relaxed),
         );
     }
 }
@@ -8476,7 +8476,7 @@ fn test_signal_ignore_preserved_on_exec() {
         return;
     };
 
-    let mut proc = match process::Process::from_elf(
+    let proc = match process::Process::from_elf(
         "elftest", &[String::from("elftest")], &[], &elf_data, None,
     ) {
         Ok(p) => p,
@@ -13715,7 +13715,7 @@ fn test_kill_thread_group_preserves_lazy_regions() {
     register_process(owner_pid, owner_proc);
 
     // Create sibling sharing the same l0_phys (simulates CLONE_VM).
-    let mut sib_proc = make_test_process(sibling_pid);
+    let sib_proc = make_test_process(sibling_pid);
     let shared_as = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
     sib_proc.address_space.replace(shared_as);
     register_process(sibling_pid, sib_proc);
@@ -16316,7 +16316,7 @@ fn test_kill_child_processes_thread_group_matches_fork_parent() {
     let l0 = main_proc.address_space.l0_phys();
     register_process(main_pid, main_proc);
 
-    let mut worker = make_test_process(worker_pid);
+    let worker = make_test_process(worker_pid);
     worker.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap());
     register_process(worker_pid, worker);
 
@@ -16580,13 +16580,13 @@ fn test_sigaltstack_set_and_query() {
     // sigaltstack(ss, old_ss) — NR 132
     // We test the process field directly since we can't pass user pointers.
     akuma_exec::process::table::with_process(pid, |p| {
-        p.sigaltstack_sp = 0x200004000;
-        p.sigaltstack_flags = 0;
-        p.sigaltstack_size = 0x8000;
+        p.sigaltstack_sp.store(0x200004000, core::sync::atomic::Ordering::Relaxed);
+        p.sigaltstack_flags.store(0, core::sync::atomic::Ordering::Relaxed);
+        p.sigaltstack_size.store(0x8000, core::sync::atomic::Ordering::Relaxed);
     });
 
     let (sp, flags, size) = if let Some(p) = akuma_exec::process::lookup_process_shared(pid) {
-        (p.sigaltstack_sp, p.sigaltstack_flags, p.sigaltstack_size)
+        (p.sigaltstack_sp.load(core::sync::atomic::Ordering::Relaxed), p.sigaltstack_flags.load(core::sync::atomic::Ordering::Relaxed), p.sigaltstack_size.load(core::sync::atomic::Ordering::Relaxed))
     } else {
         (0, 0, 0)
     };
@@ -17774,7 +17774,7 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
     // Leader owns its address space (is_shared == false).
     let mut leader = make_test_process(leader_pid);
     leader.tgid = leader_pid;
-    leader.name = alloc::string::String::from("leader_test");
+    leader.image.get_mut().name = alloc::string::String::from("leader_test");
     let leader_l0 = leader.address_space.l0_phys();
     register_process(leader_pid, leader);
 
@@ -17798,7 +17798,7 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
     // Leader must still be alive and intact.
     let leader_alive = lookup_process_shared(leader_pid).is_some();
     let leader_name_ok = lookup_process_shared(leader_pid)
-        .is_some_and(|p| p.name == "leader_test");
+        .is_some_and(|p| p.image.lock().name == "leader_test");
     let leader_not_exited = lookup_process_shared(leader_pid)
         .is_some_and(|p| !p.exited.load(core::sync::atomic::Ordering::Relaxed));
     let goroutine_gone = lookup_process_shared(goroutine_pid).is_none();
@@ -17897,7 +17897,7 @@ fn test_crash_goroutine_exit_kills_group() {
     let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
     let mut parent = make_test_process(parent_pid);
-    parent.name = alloc::string::String::from("parent_survives");
+    parent.image.get_mut().name = alloc::string::String::from("parent_survives");
     register_process(parent_pid, parent);
 
     let mut child = make_test_process(child_pid);
@@ -17910,7 +17910,7 @@ fn test_crash_goroutine_exit_kills_group() {
     // Parent must be completely unaffected
     let parent_alive = lookup_process_shared(parent_pid).is_some();
     let parent_name = lookup_process_shared(parent_pid)
-        .is_some_and(|p| p.name == "parent_survives");
+        .is_some_and(|p| p.image.lock().name == "parent_survives");
     let parent_not_exited = lookup_process_shared(parent_pid)
         .is_some_and(|p| !p.exited.load(core::sync::atomic::Ordering::Relaxed));
 
@@ -18446,7 +18446,7 @@ fn test_list_processes_does_not_hold_lock_during_clone() {
 
     let test_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let mut proc = make_test_process(test_pid);
-    proc.name = alloc::string::String::from("list_test");
+    proc.image.get_mut().name = alloc::string::String::from("list_test");
     register_process(test_pid, proc);
 
     let procs = list_processes();
@@ -18477,8 +18477,8 @@ fn test_rwspinlock_table_concurrent_reads() {
     register_process(pid2, make_test_process(pid2));
 
     // Lock-free lookups — both should succeed simultaneously
-    let has1 = akuma_exec::process::table::get_process_ptr(pid1).is_some();
-    let has2 = akuma_exec::process::table::get_process_ptr(pid2).is_some();
+    let has1 = akuma_exec::process::table::active_process_ref(pid1).is_some();
+    let has2 = akuma_exec::process::table::active_process_ref(pid2).is_some();
 
     let _ = unregister_process(pid1);
     let _ = unregister_process(pid2);
@@ -18497,11 +18497,11 @@ fn test_process_table_register_get_unregister() {
 
     let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let mut proc = make_test_process(pid);
-    proc.name = alloc::string::String::from("lockfree_test");
+    proc.image.get_mut().name = alloc::string::String::from("lockfree_test");
     register_process(pid, proc);
 
     // lookup_process returns &mut Process via raw pointer (lock-free)
-    let name_ok = lookup_process_shared(pid).is_some_and(|p| p.name == "lockfree_test");
+    let name_ok = lookup_process_shared(pid).is_some_and(|p| p.image.lock().name == "lockfree_test");
 
     // Unregister retires the process (see its doc comment for why it no longer
     // returns/drops the Box synchronously).
@@ -19157,7 +19157,7 @@ fn test_execve_kills_thread_group_siblings() {
         return;
     };
 
-    let mut leader = match process::Process::from_elf(
+    let leader = match process::Process::from_elf(
         "elftest", &[String::from("leader")], &[], &elf_data, None,
     ) {
         Ok(p) => p,

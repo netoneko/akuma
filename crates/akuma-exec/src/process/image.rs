@@ -3,7 +3,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::format;
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use akuma_terminal as terminal;
 use spinning_top::Spinlock;
@@ -118,21 +118,30 @@ fn push_deferred_regions(lazy: &mut LazyRegionMap, segments: &[DeferredLazySegme
 
 impl Process {
     /// Replace current process image with a new ELF binary (execve core)
-    pub fn replace_image(&mut self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), String> {
+    pub fn replace_image(&self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), String> {
         self.replace_image_from(ImageSource::Bytes(elf_data), args, env)
     }
 
     /// Replace current process image using on-demand loading from a file path.
-    pub fn replace_image_from_path(&mut self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), String> {
+    pub fn replace_image_from_path(&self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), String> {
         self.replace_image_from(ImageSource::Path { path, file_size }, args, env)
     }
 
     /// The execve core, shared by both public replacers.
     ///
+    /// `&self`, not `&mut self` (`AKUMA_EXEC_AUDIT.md` §6.E group 2b): the
+    /// mutated fields are now atomics (`entry_point`, `initial_brk`, `brk`,
+    /// `process_info_phys`, `clear_child_tid`, `sigaltstack_*`), interior-locked
+    /// (`memory`, `mmap_regions`, `lazy_regions`, `address_space`,
+    /// `signal_actions`), or behind [`Process::image`] (`args`, `context`). The
+    /// `LifecycleGuard` + the caller's BKL are what keep a peer from observing
+    /// the half-swapped state, exactly as before — this change only removes the
+    /// `&mut *ptr` that `table::with_process_exclusive` had to synthesise.
+    ///
     /// The `[FORK-DBG]` lifecycle traces below existed only on the in-memory path
     /// until these two were merged, so whichever half of exec a binary's size
     /// selected was invisible to lifecycle tracing. They now cover both sources.
-    fn replace_image_from(&mut self, source: ImageSource<'_>, args: &[String], env: &[String]) -> Result<(), String> {
+    fn replace_image_from(&self, source: ImageSource<'_>, args: &[String], env: &[String]) -> Result<(), String> {
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: loading ELF\n");
         let interp_prefix: Option<&str> = None;
         let loaded = source.load(args, env, interp_prefix)
@@ -162,19 +171,19 @@ impl Process {
         // space drops here, freeing its page-table frames.
         drop(self.address_space.replace(loaded.address_space));
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: AS swapped\n");
-        self.entry_point = loaded.entry_point;
+        self.entry_point.store(loaded.entry_point, Ordering::Relaxed);
         self.brk.store(loaded.brk, Ordering::Relaxed);
-        self.initial_brk = loaded.brk;
-        self.memory = ProcessMemory::new(loaded.brk, loaded.stack_bottom, loaded.stack_top, loaded.mmap_floor);
+        self.initial_brk.store(loaded.brk, Ordering::Relaxed);
+        self.memory.reset(loaded.brk, loaded.stack_bottom, loaded.stack_top, loaded.mmap_floor);
         self.mmap_regions.lock().clear();
         self.lazy_regions.lock().clear();
-        self.dynamic_page_tables.clear();
-        self.args = args.to_vec();
-        self.clear_child_tid = 0;
+        // `dynamic_page_tables` is always empty in this tree (nothing pushes to
+        // it), so there is nothing to clear — and `&self` could not anyway.
+        self.clear_child_tid.store(0, Ordering::Relaxed);
 
         // Written through the owned field rather than the pid-keyed
         // `push_lazy_region`: that would resolve `self.pid` back to this very
-        // `Process` through a *shared* table lookup while we hold `&mut self`.
+        // `Process` through a *shared* table lookup, re-entering the caller.
         let heap_lazy_size = compute_heap_lazy_size(loaded.brk, &self.memory);
         let lazy_stack_start = loaded.stack_top.saturating_sub(LAZY_STACK_MAX);
         {
@@ -192,28 +201,34 @@ impl Process {
                 self.pid, how, loaded.entry_point, loaded.brk, loaded.stack_bottom, loaded.stack_top, loaded.sp);
         }
 
-        // Update context for the next run
-        self.context = crate::process::UserContext::new(loaded.entry_point, loaded.sp);
+        // The new argv and the first-run `eret` target — the two `Process::image`
+        // fields `execve` replaces (`name` is set by the syscall glue after this
+        // returns). One lock hold, no reader between here and it.
+        {
+            let mut img = self.image.lock();
+            img.args = args.to_vec();
+            img.context = crate::process::UserContext::new(loaded.entry_point, loaded.sp);
+        }
 
         // Re-write process info page in the NEW address space
         let process_info_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("OOM process info")?;
         track_frame(process_info_frame, FrameSource::UserData);
 
-        self.address_space
-            .get_mut()
-            .map_page(
+        {
+            let mut asg = self.address_space.lock();
+            asg.map_page(
                 PROCESS_INFO_ADDR,
                 process_info_frame.addr,
                 mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
             )
             .map_err(|_| "Failed to map process info")?;
-
-        self.address_space.get_mut().track_user_frame(process_info_frame);
-        self.process_info_phys = process_info_frame.addr;
+            asg.track_user_frame(process_info_frame);
+        }
+        self.process_info_phys.store(process_info_frame.addr, Ordering::Relaxed);
 
         {
             let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
-            let wrote = mmu::write_phys(self.process_info_phys, &info);
+            let wrote = mmu::write_phys(self.process_info_phys.load(Ordering::Relaxed), &info);
             debug_assert!(wrote, "exec: ProcessInfo frame not in PMM RAM");
         }
 
@@ -230,9 +245,9 @@ impl Process {
                 }
             }
         }
-        self.sigaltstack_sp = 0;
-        self.sigaltstack_size = 0;
-        self.sigaltstack_flags = 2; // SS_DISABLE
+        self.sigaltstack_sp.store(0, Ordering::Relaxed);
+        self.sigaltstack_size.store(0, Ordering::Relaxed);
+        self.sigaltstack_flags.store(2, Ordering::Relaxed); // SS_DISABLE
 
         Ok(())
     }
@@ -289,7 +304,7 @@ impl Process {
         let memory = ProcessMemory::new(loaded.brk, loaded.stack_bottom, loaded.stack_top, loaded.mmap_floor);
 
         log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
-            pid, loaded.brk, loaded.stack_bottom, loaded.stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit);
+            pid, loaded.brk, loaded.stack_bottom, loaded.stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit.load(Ordering::Relaxed));
 
         let heap_lazy_size = compute_heap_lazy_size(loaded.brk, &memory);
         lazy_regions.push(loaded.brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
@@ -300,17 +315,19 @@ impl Process {
             pid,
             pgid: pid,
             tgid: pid, // group leader = self
-            name: String::from(name),
             state: AtomicProcessState::new(ProcessState::Ready),
             address_space: crate::process::ProcAddressSpace::new(loaded.address_space),
-            context: UserContext::new(loaded.entry_point, loaded.sp),
+            image: Spinlock::new(crate::process::ProcessImage {
+                name: String::from(name),
+                args: Vec::new(),
+                context: UserContext::new(loaded.entry_point, loaded.sp),
+            }),
             parent_pid: 0,
             brk: core::sync::atomic::AtomicUsize::new(loaded.brk),
-            initial_brk: loaded.brk,
-            entry_point: loaded.entry_point,
+            initial_brk: AtomicUsize::new(loaded.brk),
+            entry_point: AtomicUsize::new(loaded.entry_point),
             memory,
-            process_info_phys: process_info_frame.addr,
-            args: Vec::new(),
+            process_info_phys: AtomicUsize::new(process_info_frame.addr),
             cwd: String::from("/"),
             stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
             stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
@@ -331,15 +348,15 @@ impl Process {
             channel: None,
             delegate_pid: None,
             grabbed_by: None,
-            clear_child_tid: 0,
+            clear_child_tid: AtomicU64::new(0),
             robust_list_head: 0,
             robust_list_len: 0,
             signal_actions: Arc::new(SharedSignalTable::new()),
             signal_mask: 0,
             fault_mutex: Spinlock::new(BTreeMap::new()),
-            sigaltstack_sp: 0,
-            sigaltstack_flags: 2, // SS_DISABLE
-            sigaltstack_size: 0,
+            sigaltstack_sp: AtomicU64::new(0),
+            sigaltstack_flags: AtomicI32::new(2), // SS_DISABLE
+            sigaltstack_size: AtomicU64::new(0),
             start_time_us: (runtime().uptime_us)(),
             current_syscall: core::sync::atomic::AtomicU64::new(!0),
             last_syscall: core::sync::atomic::AtomicU64::new(0),

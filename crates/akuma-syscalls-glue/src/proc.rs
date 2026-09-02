@@ -233,7 +233,7 @@ pub(super) fn sys_uname(buf: u64) -> u64 {
 /// `clone_thread`'s CLONE_PARENT_SETTID write and `gettid()`.
 pub(super) fn sys_set_tid_address(tidptr: u64) -> u64 {
     akuma_exec::process::with_current_process(|p| {
-        p.clear_child_tid = tidptr;
+        p.clear_child_tid.store(tidptr, core::sync::atomic::Ordering::Relaxed);
     });
     akuma_exec::threading::current_thread_id() as u64
 }
@@ -260,7 +260,7 @@ pub(super) fn sys_exit(code: i32) -> u64 {
             let secs = elapsed_us / 1_000_000;
             let frac = (elapsed_us % 1_000_000) / 10_000;
             akuma_primitives::tprint!(128, "[exit] tid={} pid={} name={} code={} after {}.{:02}s\n",
-                akuma_exec::threading::current_thread_id(), proc.pid, proc.name, code, secs, frac);
+                akuma_exec::threading::current_thread_id(), proc.pid, proc.image.lock().name, code, secs, frac);
         }
         let pid = proc.pid;
         let proc_tid = proc.thread_id;
@@ -294,7 +294,7 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         // space is still active, because return_to_kernel is never reached from
         // the sys_exit path (the thread loops in yield_now instead of returning
         // through the normal EL0→EL1→EL0 trampoline).
-        let tid_addr = proc.clear_child_tid;
+        let tid_addr = proc.clear_child_tid.load(core::sync::atomic::Ordering::Relaxed);
         if tid_addr != 0 {
             let mapped = akuma_exec::mmu::is_current_user_page_mapped(tid_addr as usize);
             if akuma_config::FUTEX_DBG_ENABLED {
@@ -373,7 +373,7 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
             let secs = elapsed_us / 1_000_000;
             let frac = (elapsed_us % 1_000_000) / 10_000;
             akuma_primitives::tprint!(128, "[exit_group] pid={} name={} code={} after {}.{:02}s\n",
-                proc.pid, proc.name, code, secs, frac);
+                proc.pid, proc.image.lock().name, code, secs, frac);
         }
         // Gated 2026-08-29. It was unconditional for the reason below, and that
         // reason has aged out: the J4 investigation is archived, while the line
@@ -388,7 +388,7 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         // docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §4.
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::tprint!(160, "[PROC-EXIT] pid={} tgid={} name={} code={}\n",
-                proc.pid, proc.tgid, proc.name, code);
+                proc.pid, proc.tgid, proc.image.lock().name, code);
         }
         let pid = proc.pid;
         let tgid = proc.tgid;
@@ -877,7 +877,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         }
     }
 
-    proc.name.clone_from(&resolved_path);
+    proc.image.lock().name.clone_from(&resolved_path);
 
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
@@ -900,7 +900,8 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
 
     // Never returns. The `_checked` form refuses a context whose SPSR does not
     // target EL0, which is what let the raw one be `unsafe`.
-    akuma_exec::process::enter_user_mode_checked(&proc.context);
+    let ctx = proc.image.lock().context;
+    akuma_exec::process::enter_user_mode_checked(&ctx);
         })
     };
     // `None` means the process vanished between `current_pid` and the lookup;
@@ -1820,7 +1821,7 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
                     // Build the String outside the IRQ-masked closure; only the
                     // move (and the old name's drop) happens inside.
                     let new_name = alloc::string::String::from(name);
-                    akuma_exec::process::with_current_process(|p| p.name = new_name);
+                    akuma_exec::process::with_current_process(|p| p.image.lock().name = new_name);
                 }
             }
             0
@@ -1829,10 +1830,12 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
             // Get process name
             if arg2 != 0 && validate_user_ptr(arg2, 16)
                 && let Some(proc) = akuma_exec::process::current_process_shared() {
-                    let name = proc.name.as_bytes();
+                    let img = proc.image.lock();
+                    let name = img.name.as_bytes();
                     let len = name.len().min(15);
                     let mut kernel_buf = [0u8; 16];
                     kernel_buf[..len].copy_from_slice(&name[..len]);
+                    drop(img);
                     if copy_to_user(arg2, &kernel_buf).is_err() {
                         return EFAULT;
                     }

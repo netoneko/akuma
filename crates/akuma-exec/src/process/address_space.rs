@@ -221,12 +221,23 @@ impl ProcAddressSpace {
 
     /// Swap in a freshly loaded address space (the `execve` core) and refresh
     /// the scalar mirror in the same step, returning the old one for the caller
-    /// to drop. `&mut self`: `replace_image` holds `&mut Process` under the
-    /// `LifecycleGuard`, with thread-group siblings already killed.
-    pub fn replace(&mut self, uas: UserAddressSpace) -> UserAddressSpace {
+    /// to drop.
+    ///
+    /// `&self` since `AKUMA_EXEC_AUDIT.md` §6.E group 2b — `replace_image` no
+    /// longer holds `&mut Process`. The swap is done under `inner`'s lock (with
+    /// IRQs masked on `kernel_smp_shared`); a lock-free `l0_phys()` reader can
+    /// briefly see the new inner paired with the old `ttbr0` mirror between the
+    /// two stores, but that window existed for `&mut self` too (the mirror and
+    /// the inner were never updated atomically) and `execve` runs BKL-held with
+    /// siblings already killed, so no such reader is live.
+    pub fn replace(&self, uas: UserAddressSpace) -> UserAddressSpace {
         let ttbr0 = uas.ttbr0();
         let shared = uas.is_shared();
-        let old = core::mem::replace(self.inner.get_mut(), uas);
+        let old = {
+            #[cfg(kernel_smp_shared)]
+            let _irq = crate::runtime::IrqGuard::new();
+            core::mem::replace(&mut *self.inner.lock(), uas)
+        };
         self.ttbr0.store(ttbr0, Ordering::Relaxed);
         self.shared.store(shared, Ordering::Relaxed);
         old

@@ -26,9 +26,8 @@
 //! Every method that hands out a borrow derived from a slot pointer —
 //! [`SlotTable::active_ref`], [`SlotTable::with_active_mut`],
 //! [`SlotTable::for_each_active`], [`SlotTable::find_active`],
-//! [`SlotTable::ref_if_current`], the `*_locked` variants, and the `unsafe`
-//! [`SlotTable::active_exclusive`] — relies on the consumer's **deferred
-//! reclamation discipline**:
+//! [`SlotTable::ref_if_current`] and the `*_locked` variants — relies on the
+//! consumer's **deferred reclamation discipline**:
 //!
 //! > A slot's `Box<T>` is dropped **only** by [`SlotTable::reclaim_retired`],
 //! > and only after a cooldown long enough that no core can still hold a
@@ -292,27 +291,6 @@ impl<T, const N: usize> SlotTable<T, N> {
     /// first `Some`.
     pub fn find_active<R>(&self, f: impl FnMut(usize, &T) -> Option<R>) -> Option<R> {
         with_irqs_disabled(|| self.find_active_locked(f))
-    }
-
-    /// Run `f` with `&mut T` for the first `ACTIVE` slot satisfying `pred`,
-    /// **without** an IRQ mask.
-    ///
-    /// # Safety
-    /// The caller must guarantee exclusivity **structurally**, not via this
-    /// call: the slot's occupant must be one no other core can free or mutate
-    /// for the closure's duration (the caller's own process on a BKL-held path,
-    /// or a not-yet-published / already-isolated one), and no other reference to
-    /// it may be live on this thread across the call. This exists for the
-    /// process-lifecycle windows (`execve`'s image replacement, first run) that
-    /// allocate and do block I/O inside `f` and so cannot hold a mask.
-    pub unsafe fn active_exclusive<R>(
-        &self,
-        pred: impl Fn(&T) -> bool,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Option<R> {
-        let ptr = self.active_ptr_locked(pred)?;
-        // SAFETY: the caller's structural exclusivity argument (see the doc).
-        Some(f(unsafe { &mut *ptr }))
     }
 
     // ── retire / reclaim ───────────────────────────────────────────────────
