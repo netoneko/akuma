@@ -71,6 +71,7 @@ pub const PROCESS_INFO_ADDR: usize = 0x1000;
 /// `box_id` are meaningful — argv and cwd are not communicated through this
 /// page (argv comes from the entry stack, cwd from the `GETCWD` syscall).
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub ppid: u32,

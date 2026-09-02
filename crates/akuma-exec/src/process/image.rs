@@ -211,10 +211,10 @@ impl Process {
         self.address_space.get_mut().track_user_frame(process_info_frame);
         self.process_info_phys = process_info_frame.addr;
 
-        unsafe {
-            let info_ptr = mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
+        {
             let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
-            core::ptr::write(info_ptr, info);
+            let wrote = mmu::write_phys(self.process_info_phys, &info);
+            debug_assert!(wrote, "exec: ProcessInfo frame not in PMM RAM");
         }
 
         // Reset I/O state (but keep FDs and Channel!)

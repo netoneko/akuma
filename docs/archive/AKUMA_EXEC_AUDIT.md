@@ -514,10 +514,19 @@ deadlock above. Those sites take `lock()` and go through the guard.
      `set_prefault_hook` registration. Prereq done on the way: the per-thread
      user-copy-fault-handler slot moved to `akuma_primitives::preempt` (both the
      setter and `akuma-exceptions`' reader now need neither `akuma-exec`).
-   - **B. Push `process/mod.rs`'s 29 down.** EL0 trampolines → `akuma-entry`;
-     robust-futex user walk + CLONE `set_tid` writes → `akuma-user-access`;
-     fork phys-page copy → an `akuma-mmu::copy_phys_page`; raw `Process*` derefs
-     → `table` accessors. The `src/syscall/` 17→0 playbook. Open.
+   - **B. Push `process/mod.rs`'s 29 down.** First pass **done 2026-09-02**,
+     **29 → 15**: fork's 4 phys-page copies → `akuma_mmu::copy_phys_page`;
+     the two `ProcessInfo` frame writes (here + `image.rs`) → `akuma_mmu::write_phys`
+     (`ProcessInfo` gained `#[derive(Copy)]`); the robust-futex list walk + the
+     `clear_child_tid` exit write (~9 raw `core::ptr::read/write` on user VAs) →
+     `akuma_user_access::{read_user_into_with, write_user_val_with}` with
+     `Prefault::No`; the `(*ptr).tgid` deref in `kill_thread_group` →
+     `table::with_process`. The 15 that remain: the EL0-entry cluster
+     (`enter_user_mode` ×2 + the two trampolines + `Process::run` — ~11, the
+     "→ `akuma-entry`" sub-project), `demote_range_to_ro`'s raw `*mut u64` L0,
+     `table::with_process_exclusive`, and the two CLONE `set_tid` writes that are
+     **deliberately** a plain EL1 store (`copy_to_user_safe` was tried and broke
+     the Go runtime — the comment at the site).
    - **C. Extract `threading/mod.rs` → `akuma-threading` (~53, ~2,600 lines).**
      It doesn't name the `Process` type; its up-calls become hooks. This is the
      "cut the core in half" §1 warns against — the real design decision. Open.

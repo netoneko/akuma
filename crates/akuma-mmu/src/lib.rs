@@ -1197,6 +1197,56 @@ pub fn copy_to_phys(pa: usize, src: &[u8]) -> bool {
     true
 }
 
+/// Copy one `PAGE_SIZE` frame from `src_pa` to `dst_pa`.
+///
+/// The fork path's page-by-page copy: parent frame -> freshly allocated child
+/// frame. Both must be distinct PMM-managed frames — `false` if either is
+/// out of range or they are the same frame (an overlapping `copy_nonoverlapping`
+/// is UB, and a self-copy is always a caller bug here).
+///
+/// Replaces the `phys_to_virt` + `copy_nonoverlapping` idiom that stood at four
+/// `unsafe` sites in `akuma-exec/src/process/mod.rs`.
+#[must_use]
+pub fn copy_phys_page(dst_pa: usize, src_pa: usize) -> bool {
+    let dst = dst_pa & !(PAGE_SIZE - 1);
+    let src = src_pa & !(PAGE_SIZE - 1);
+    if dst == src
+        || !akuma_pmm::contains(dst, PAGE_SIZE)
+        || !akuma_pmm::contains(src, PAGE_SIZE)
+    {
+        return false;
+    }
+    // SAFETY: both ranges are page-aligned, `PAGE_SIZE` long, inside PMM RAM
+    // (identity-mapped and readable/writable) and — checked above — disjoint.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            phys_to_virt(src).cast_const(),
+            phys_to_virt(dst),
+            PAGE_SIZE,
+        );
+    }
+    true
+}
+
+/// Write a plain `#[repr(C)]` value into the physical frame at `pa`.
+///
+/// For a struct the kernel drops into a frame it owns and has not mapped yet —
+/// `ProcessInfo` at fork/exec. `T` must be `Copy` plain-old-data; `false` if
+/// `size_of::<T>()` bytes from `pa` leave PMM RAM.
+#[must_use]
+pub fn write_phys<T: Copy>(pa: usize, val: &T) -> bool {
+    if !akuma_pmm::contains(pa, core::mem::size_of::<T>()) {
+        return false;
+    }
+    // SAFETY: `pa` holds `size_of::<T>()` bytes of PMM RAM (identity-mapped,
+    // writable); `val` is a live `&T`. Alignment: `phys_to_virt(pa)` of a frame
+    // base is page-aligned, and every call site passes a frame base.
+    unsafe {
+        core::ptr::write(phys_to_virt(pa).cast::<T>(), *val);
+    }
+    true
+}
+
 pub struct UserAddressSpace {
     l0_frame: PhysFrame,
     page_table_frames: Spinlock<Vec<PhysFrame>>,

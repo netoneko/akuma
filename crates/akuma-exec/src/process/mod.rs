@@ -1397,9 +1397,7 @@ pub fn grace_kill_should_terminate(sib_pid: Pid, tid: usize) -> bool {
 
 pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     // Find tgid for the calling process
-    let tgid = table::get_process_ptr(my_pid)
-        .map(|ptr| unsafe { (*ptr).tgid })
-        .unwrap_or(my_pid);
+    let tgid = table::with_process(my_pid, |p| p.tgid).unwrap_or(my_pid);
 
     let mut siblings: Vec<(Pid, Option<usize>)> = Vec::new();
     table::for_each_process(|p| {
@@ -1939,9 +1937,12 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     if let Some(proc) = lookup_process_shared(pid.unwrap_or(0)) {
         let tid_addr = proc.clear_child_tid;
         if tid_addr != 0 {
-            if crate::mmu::is_current_user_page_mapped(tid_addr as usize) {
-                unsafe { core::ptr::write(tid_addr as *mut u32, 0); }
-            }
+            // `Prefault::No` EL1 write — an unmapped page is a no-op (Err), not a
+            // kernel fault. A lazily-mapped-but-never-faulted `clear_child_tid`
+            // word is exactly that case.
+            let _ = akuma_user_access::write_user_val_with(
+                tid_addr, &0u32, akuma_user_access::Prefault::No,
+            );
             // Wake pthread_join waiters regardless of whether the page was
             // mappable: futex_wake reads the kernel waiter table, not user
             // memory, and a joiner must be woken even if we couldn't zero the
@@ -1954,51 +1955,53 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
         if let Some(proc) = lookup_process_shared(pid.unwrap_or(0)) {
             // Robust futex list cleanup: walk the list and mark owned futexes
             // with FUTEX_OWNER_DIED so waiters don't deadlock.
+            //
+            // Every user-memory access below goes through `akuma-user-access`'s
+            // `Prefault::No` helpers: EL1 reads/writes of a user VA that turn an
+            // unmapped page into `Err` (via the copy fault trampoline) instead of
+            // faulting the kernel. `Prefault::No` because we hold no lock the
+            // reclaim path takes but must not demand-page a dying thread's list.
             let robust_head = proc.robust_list_head;
             if robust_head != 0 {
+                use akuma_user_access::{read_user_into_with, write_user_val_with, Prefault};
+                /// `Ok(v)` or `None` if the read faulted.
+                fn ru<T: Copy + Default>(addr: u64) -> Option<T> {
+                    let mut v = T::default();
+                    read_user_into_with(&mut v, addr, Prefault::No).ok().map(|()| v)
+                }
                 const FUTEX_OWNER_DIED: u32 = 0x40000000;
                 const ROBUST_LIST_LIMIT: usize = 2048;
                 let my_tid = proc.pid;
                 let my_tgid = proc.tgid;
                 // robust_list_head layout: { next: *mut robust_list, futex_offset: long, list_op_pending: *mut robust_list }
-                if crate::mmu::is_current_user_page_mapped(robust_head as usize) {
-                    let futex_offset = unsafe {
-                        core::ptr::read((robust_head as usize + 8) as *const i64)
-                    };
-                    let pending_ptr = unsafe {
-                        core::ptr::read((robust_head as usize + 16) as *const u64)
-                    };
-
+                let mark_owner_died = |futex_addr: usize| {
+                    if let Some(word) = ru::<u32>(futex_addr as u64)
+                        && (word & 0x3FFFFFFF) == my_tid
+                        && write_user_val_with(futex_addr as u64, &(word | FUTEX_OWNER_DIED), Prefault::No).is_ok()
+                    {
+                        (runtime().futex_wake)(my_tgid, futex_addr, 1);
+                    }
+                };
+                if let (Some(futex_offset), Some(pending_ptr), Some(first)) = (
+                    ru::<i64>(robust_head + 8),
+                    ru::<u64>(robust_head + 16),
+                    ru::<u64>(robust_head),
+                ) {
                     // Walk the linked list
-                    let mut entry = unsafe { core::ptr::read(robust_head as *const u64) };
+                    let mut entry = first;
                     let mut count = 0usize;
                     while entry != robust_head && entry != 0 && count < ROBUST_LIST_LIMIT {
-                        if crate::mmu::is_current_user_page_mapped(entry as usize) {
-                            let futex_addr = (entry as i64 + futex_offset) as usize;
-                            if crate::mmu::is_current_user_page_mapped(futex_addr) {
-                                let word = unsafe { core::ptr::read(futex_addr as *const u32) };
-                                if (word & 0x3FFFFFFF) == my_tid {
-                                    unsafe { core::ptr::write(futex_addr as *mut u32, word | FUTEX_OWNER_DIED); }
-                                    (runtime().futex_wake)(my_tgid, futex_addr, 1);
-                                }
-                            }
-                            entry = unsafe { core::ptr::read(entry as *const u64) };
-                        } else {
-                            break;
-                        }
+                        let futex_addr = (entry as i64 + futex_offset) as usize;
+                        mark_owner_died(futex_addr);
+                        // The `next` pointer; a faulted read ends the walk.
+                        let Some(next) = ru::<u64>(entry) else { break };
+                        entry = next;
                         count += 1;
                     }
 
                     // Handle pending operation
-                    if pending_ptr != 0 && crate::mmu::is_current_user_page_mapped(pending_ptr as usize) {
-                        let futex_addr = (pending_ptr as i64 + futex_offset) as usize;
-                        if crate::mmu::is_current_user_page_mapped(futex_addr) {
-                            let word = unsafe { core::ptr::read(futex_addr as *const u32) };
-                            if (word & 0x3FFFFFFF) == my_tid {
-                                unsafe { core::ptr::write(futex_addr as *mut u32, word | FUTEX_OWNER_DIED); }
-                                (runtime().futex_wake)(my_tgid, futex_addr, 1);
-                            }
-                        }
+                    if pending_ptr != 0 {
+                        mark_owner_died((pending_ptr as i64 + futex_offset) as usize);
                     }
                 }
             }
@@ -2608,10 +2611,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             }
             if let Some(src_phys) = mmu::translate_user_va(parent_l0, va) {
                 let frame = dest_as.alloc_and_map(va, mmu::user_flags::RW)?;
-                unsafe {
-                    let src_ptr = mmu::phys_to_virt(src_phys & !0xFFF) as *const u8;
-                    let dest_ptr = mmu::phys_to_virt(frame.addr);
-                    core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, mmu::PAGE_SIZE);
+                if !mmu::copy_phys_page(frame.addr, src_phys) {
+                    return Err("Fork copy: source or destination frame not in PMM RAM");
                 }
                 copied += 1;
             }
@@ -2925,10 +2926,9 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 match akuma_pmm::alloc_page_zeroed().map(PhysFrame::new) {
                     Some(frame) => {
                         track_frame(frame, FrameSource::UserData);
-                        unsafe {
-                            let src = mmu::phys_to_virt(pf.addr) as *const u8;
-                            let dst = mmu::phys_to_virt(frame.addr);
-                            core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
+                        if !mmu::copy_phys_page(frame.addr, pf.addr) {
+                            ok = false;
+                            break;
                         }
                         if new_proc.address_space.get_mut().map_page(page_va, frame.addr, mmu::user_flags::RW).is_err() {
                             ok = false;
@@ -3005,11 +3005,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                         break 'lazy_copy;
                     }
                     if let Ok(frame) = new_proc.address_space.get_mut().alloc_and_map(page_va, mmu::user_flags::RW) {
-                        unsafe {
-                            let src = mmu::phys_to_virt(src_phys & !0xFFF) as *const u8;
-                            let dst = mmu::phys_to_virt(frame.addr);
-                            core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
-                        }
+                        let copied_ok = mmu::copy_phys_page(frame.addr, src_phys);
+                        debug_assert!(copied_ok, "fork lazy-page copy: frame not in PMM RAM");
                         lazy_pages_copied += 1;
                     }
                 }
@@ -3050,10 +3047,10 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         lifecycle_trace("[FORK-DBG] step5a: map_page FAILED\n");
     }
     lifecycle_trace("[FORK-DBG] step5b: writing ProcessInfo\n");
-    unsafe {
-        let info_ptr = mmu::phys_to_virt(new_proc.process_info_phys) as *mut ProcessInfo;
+    {
         let info = ProcessInfo::new(child_pid, parent_pid, new_proc.box_id);
-        core::ptr::write(info_ptr, info);
+        let wrote = mmu::write_phys(new_proc.process_info_phys, &info);
+        debug_assert!(wrote, "fork: ProcessInfo frame not in PMM RAM");
     }
 
     lifecycle_trace("[FORK-DBG] step5: done, entering step6\n");
