@@ -9,12 +9,13 @@ half was cut out into `akuma-isolation` and some other pieces moved, but the
 remaining `unsafe` had never been enumerated as a set.
 
 **Result:** 123 `unsafe` sites classified into 8 kinds. Three kinds fixed
-(§4 −4 sites, §5a −1, §5c-bis −3), now **115**, and the six `&self` -> `&mut`
-casts are down to **2** — both in `address_space`, which §5-bis shows needs a
-different shape. Three of the remaining five soundness sites
-are sized and planned in §5/§6. Two incidental findings — a triplicated enum
-(§5b) and the fact that nobody has swept for either pattern tree-wide (§5c) —
-came out of the same reading.
+(§4 −4 sites, §5a −1, §5c-bis −3, §5c-ter −2), now **113**, and **all six
+`&self` -> `&mut` casts are gone** — the last two, in `with_address_space`,
+closed 2026-09-02 by merging `address_space` + `as_lock` into `ProcAddressSpace`
+(§5c-ter). None of the six was legalised with `UnsafeCell`; every one either
+became an atomic or moved inside the lock that already guarded it. Two
+incidental findings — a triplicated enum (§5b) and the fact that nobody has
+swept for either pattern tree-wide (§5c) — came out of the same reading.
 
 ## 1. Why this crate is not another `akuma-entry`
 
@@ -419,16 +420,88 @@ right trade here and not the one §5-bis warns about for `address_space`: these
 are fork/exec-path reads, not the per-fault `l0_phys()` reads, and they were
 racing the writers before.
 
+## 5c-ter. Landed: `address_space` + `as_lock` merged into `ProcAddressSpace` (2026-09-02)
+
+Full writeup: [`AKUMA_EXEC_ADDRESS_SPACE_MERGE.md`](AKUMA_EXEC_ADDRESS_SPACE_MERGE.md).
+
+The §5-bis "split, don't wrap" design for the last two casts, applied. **2 -> 0
+UB sites** — the crate's `&self -> &mut` cast count is now **zero**, and the two
+that went are *gone*, not legalised.
+
+`Process` carried the address space as two fields — `address_space:
+UserAddressSpace` and `as_lock: Spinlock<()>` — and `with_address_space` bridged
+them with `&mut *(addr_of!(self.address_space) as *mut UserAddressSpace)`. They
+are now one field:
+
+```rust
+pub struct ProcAddressSpace {
+    inner: Spinlock<UserAddressSpace>,   // was `as_lock` + the data it guarded
+    ttbr0: AtomicU64,                    // lock-free mirror: (asid << 48) | l0_phys
+    shared: AtomicBool,
+}
+```
+
+### The field audit that made the wrapper unnecessary to fear
+
+§5-bis worried that `Spinlock<UserAddressSpace>` would put a lock acquire on
+~59 fault-path scalar reads. It doesn't, because **`UserAddressSpace`'s
+`l0_frame`/`asid`/`shared` are immutable after `new()`/`new_shared()`** (grep:
+no `self.l0_frame =` anywhere) and `page_table_frames`/`user_frames` are already
+`Spinlock`-wrapped. So the four scalar getters (`l0_phys` 42, `ttbr0` 11,
+`is_shared` 7, `asid` 3) read an atomic mirror on `Process`; **every other
+`UserAddressSpace` operation already ran under `as_lock`** (the fault path in
+`src/exceptions.rs` takes it before every `track_*`) or held an exclusive
+`&mut Process` (fork child, ELF loader). The mirror is refreshed only by
+`execve` — `ProcAddressSpace::replace` swaps the inner value and stores the new
+`ttbr0`/`shared` in one step.
+
+### `with_address_space` is now zero `unsafe`
+
+```rust
+pub fn with_address_space<R>(&self, f: impl FnOnce(&mut UserAddressSpace) -> R) -> R {
+    let mut g = self.address_space.lock();   // as_lock, IRQs masked on smp-shared
+    f(&mut g)
+}
+```
+
+Both cfg arms collapse into this one — the `not(kernel_smp_shared)` arm's "single
+core / BKL-serialized" cast is gone; on that config the spinlock is simply always
+uncontended (the BKL serialises every caller first).
+
+### `AsLockHold` deleted; `CowRemap::CallerHoldsAsLock` fixed
+
+`AsLockHold::new(&owner.as_lock)` at ~10 `src/exceptions.rs` sites became
+`owner.address_space.lock()`, using the returned guard for the `track_*`
+sequence that used to reach the field separately. `CowRemap::CallerHoldsAsLock`
+carried `&'a Process` and its arm called `owner.address_space.track_user_frame`
+— which, once `track_*` is behind the lock, would have **self-deadlocked**
+against the caller's own hold. It now carries `&'a mut UserAddressSpace` (the
+caller's guard) directly.
+
+### The `&self` frame-tracking passthroughs are deliberately absent
+
+`ProcAddressSpace` has one-shot passthroughs for the read-only `&self` methods
+(`translate`, `resident_pages`, `user_frame_count`, …) but **not** for
+`track_user_frame`/`track_page_table_frame`/`adopt_user_frame`/`remove_user_frame`
+— those are called from fault/CoW paths that already hold `lock()` across a
+`map_user_page` + track sequence, and a self-locking passthrough there is the
+deadlock above. Those sites take `lock()` and go through the guard.
+
 ## 6. Recommended order
 
 1. ~~The three callbacks~~ — done, §4.
-2. `brk` → `AtomicUsize`. Small, removes one site outright, no API churn beyond 32 refs.
-3. `memory` and `mmap_regions` → `UnsafeCell` (25 and 17 refs). Contained.
-4. `address_space` → `UnsafeCell` behind an accessor. Wide; own commit.
-5. RawWaker → `alloc::task::Wake`, opportunistically.
-6. Only then consider whether the crate wants splitting for `forbid` — with 2-5
-   done it would be at ~109 sites, still far from zero, so the split in §1
-   remains a separate design decision rather than a consequence.
+2. ~~`brk` → `AtomicUsize`~~ — done, §5a.
+3. ~~`memory` and `mmap_regions` → inside their locks~~ — done, §5c-bis (not
+   `UnsafeCell`: the data moved *inside* `Spinlock`, zero `unsafe`).
+4. ~~`address_space` + `as_lock` → `ProcAddressSpace`~~ — done, §5c-ter. The
+   scalars became an atomic mirror on `Process` and the rest moved inside
+   `Spinlock<UserAddressSpace>`; again zero `unsafe`, not `UnsafeCell`.
+   **All six `&self -> &mut` casts are now gone.**
+5. RawWaker → `alloc::task::Wake`, opportunistically. Still open.
+6. Only then consider whether the crate wants splitting for `forbid` — even with
+   2-4 done the crate is at ~109 `unsafe` sites (the process table, thread
+   contexts and EL0 boundary — §2's first five kinds), still far from zero, so
+   the split in §1 remains a separate design decision rather than a consequence.
 
 ## Background
 

@@ -431,25 +431,40 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
             // a re-fault leak. One hold per page, never spanning the loop.
             let owner_pid = crate::process::read_current_pid().unwrap_or(0);
             let owner = crate::process::lookup_process_shared(owner_pid);
-            let install = || {
-                // SAFETY: installing a mapping for our own address space at a VA
-                // this loop has just confirmed unmapped, with a frame nothing else
-                // references yet.
-                let (table_frames, installed) =
-                    unsafe { crate::mmu::map_user_page(va, page_frame.addr, map_flags) };
+            // SAFETY (map_user_page): installing a mapping for our own address
+            // space at a VA this loop has just confirmed unmapped, with a frame
+            // nothing else references yet.
+            //
+            // `as_lock_owner` (the L0-owning thread-group leader) supplies the
+            // lock; the frames are tracked against `owner` (this thread's
+            // Process). They are the same Process for every normal thread — only
+            // a vfork-child prefault sees them differ, and then the two locks are
+            // genuinely distinct so the nested hold below cannot self-deadlock.
+            let (table_frames, installed) = if let (Some(leader), Some(owner)) = (as_lock_owner, owner)
+                && core::ptr::eq(leader, owner)
+            {
+                let mut g = leader.address_space.lock();
+                let (tf, inst) = unsafe { crate::mmu::map_user_page(va, page_frame.addr, map_flags) };
+                if inst {
+                    g.track_user_frame(page_frame);
+                }
+                for t in &tf {
+                    g.track_page_table_frame(*t);
+                }
+                (tf, inst)
+            } else {
+                let _leader_g = as_lock_owner.map(|l| l.address_space.lock());
+                let (tf, inst) = unsafe { crate::mmu::map_user_page(va, page_frame.addr, map_flags) };
                 if let Some(owner) = owner {
-                    if installed {
-                        owner.address_space.track_user_frame(page_frame);
+                    let mut g = owner.address_space.lock();
+                    if inst {
+                        g.track_user_frame(page_frame);
                     }
-                    for tf in &table_frames {
-                        owner.address_space.track_page_table_frame(*tf);
+                    for t in &tf {
+                        g.track_page_table_frame(*t);
                     }
                 }
-                (table_frames, installed)
-            };
-            let (table_frames, installed) = match as_lock_owner {
-                Some(leader) => leader.with_as_locked(install),
-                None => install(),
+                (tf, inst)
             };
             // Frees run after the hold is released. Ownership rule, matching
             // `exceptions.rs`'s `ensure_user_page_mapped` sibling: the data

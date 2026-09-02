@@ -157,7 +157,10 @@ impl Process {
             loaded.address_space.l0_phys(), loaded.address_space.asid(), crate::bkl::current_core_id()));
         mmu::UserAddressSpace::deactivate();
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: swapping AS\n");
-        self.address_space = loaded.address_space;
+        // `replace` swaps the inner address space and refreshes the lock-free
+        // scalar mirror (`ttbr0`/`shared`) in one step; the returned old address
+        // space drops here, freeing its page-table frames.
+        drop(self.address_space.replace(loaded.address_space));
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: AS swapped\n");
         self.entry_point = loaded.entry_point;
         self.brk.store(loaded.brk, Ordering::Relaxed);
@@ -197,6 +200,7 @@ impl Process {
         track_frame(process_info_frame, FrameSource::UserData);
 
         self.address_space
+            .get_mut()
             .map_page(
                 PROCESS_INFO_ADDR,
                 process_info_frame.addr,
@@ -204,7 +208,7 @@ impl Process {
             )
             .map_err(|_| "Failed to map process info")?;
 
-        self.address_space.track_user_frame(process_info_frame);
+        self.address_space.get_mut().track_user_frame(process_info_frame);
         self.process_info_phys = process_info_frame.addr;
 
         unsafe {
@@ -298,7 +302,7 @@ impl Process {
             tgid: pid, // group leader = self
             name: String::from(name),
             state: ProcessState::Ready,
-            address_space: loaded.address_space,
+            address_space: crate::process::ProcAddressSpace::new(loaded.address_space),
             context: UserContext::new(loaded.entry_point, loaded.sp),
             parent_pid: 0,
             brk: core::sync::atomic::AtomicUsize::new(loaded.brk),
@@ -333,7 +337,6 @@ impl Process {
             signal_actions: Arc::new(SharedSignalTable::new()),
             signal_mask: 0,
             fault_mutex: Spinlock::new(BTreeMap::new()),
-            as_lock: Spinlock::new(()),
             sigaltstack_sp: 0,
             sigaltstack_flags: 2, // SS_DISABLE
             sigaltstack_size: 0,

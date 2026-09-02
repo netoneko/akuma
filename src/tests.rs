@@ -3506,7 +3506,7 @@ fn make_test_process(
     alloc::boxed::Box::new(akuma_exec::process::Process {
         pid, pgid: pid, tgid: pid, name: String::from("test"),
         state: akuma_exec::process::ProcessState::Ready,
-        address_space: addr_space,
+        address_space: akuma_exec::process::ProcAddressSpace::new(addr_space),
         context: akuma_exec::process::UserContext::new(0, 0),
         parent_pid: ppid, brk: core::sync::atomic::AtomicUsize::new(0x1000_0000), initial_brk: 0x1000_0000,
         entry_point: 0, memory: mem, process_info_phys: info_phys,
@@ -3518,7 +3518,6 @@ fn make_test_process(
         lazy_regions: Spinlock::new(akuma_exec::process::LazyRegionMap::new()),
         fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new()),
         fault_mutex: Spinlock::new(BTreeMap::new()),
-        as_lock: Spinlock::new(()),
         thread_id: None, spawner_pid: None,
         terminal_state: alloc::sync::Arc::new(Spinlock::new(
             akuma_terminal::TerminalState::default(),
@@ -7122,11 +7121,9 @@ fn test_kernel_va_rejected_as_user_pointer() -> bool {
     proc.address_space.activate();
 
     let (frames, _) = unsafe { map_user_page(user_va, user_page.addr, user_flags::RW) };
-    proc.address_space.track_user_frame(user_page);
-    for f in frames { proc.address_space.track_page_table_frame(f); }
+    { let asg = proc.address_space.lock(); asg.track_user_frame(user_page); for f in frames { asg.track_page_table_frame(f); } }
     let (frames, _) = unsafe { map_user_page(none_va, none_page.addr, user_flags::NONE) };
-    proc.address_space.track_user_frame(none_page);
-    for f in frames { proc.address_space.track_page_table_frame(f); }
+    { let asg = proc.address_space.lock(); asg.track_user_frame(none_page); for f in frames { asg.track_page_table_frame(f); } }
 
     // 1. The kernel VA really is mapped in this user address space...
     let kernel_present = is_current_user_page_mapped(kernel_va);

@@ -525,7 +525,8 @@ pub fn read_current_pid() -> Option<Pid> {
 /// mutation the fault path needs is a `&self` method (`track_user_frame`,
 /// `track_page_table_frame`, `vm_with_regions`, `with_as_locked`) or a free function
 /// (`mmu::map_user_page*`); the actual cross-core mutual exclusion on the raw
-/// page-table writes comes from [`Process::as_lock`], not from `&mut` exclusivity.
+/// page-table writes comes from [`Process::address_space`]'s lock, not from
+/// `&mut` exclusivity.
 ///
 /// # Safety warning
 /// Same lifetime caveat as [`lookup_process`]: valid only while the process stays
@@ -1105,7 +1106,7 @@ pub fn reclaim_clean_file_pages(want: usize) -> usize {
             // mmap-family syscall) on the same page, exactly like the fault handler's
             // own per-page `as_lock` holds. One hold per page (not one hold spanning
             // the whole up-to-262144-page scan): this loop is a bounded but
-            // potentially long sweep, and `as_lock_hold` masks IRQs for its duration —
+            // potentially long sweep, and the AS-lock hold masks IRQs for its duration —
             // holding it across the entire sweep would starve this core's timer for
             // however long the scan runs, exactly the "mask per attempt, never across
             // an unbounded wait" rule (docs/reference/subsystems/locking.md).

@@ -13,6 +13,7 @@
 /// address space and what the region is backed by; page-table mechanics do not.
 /// Moving the file moved the cycle, rather than papering it over with a callback.
 pub mod user_access;
+pub mod address_space;
 pub mod types;
 pub mod table;
 pub mod channel;
@@ -29,6 +30,7 @@ pub mod bkl_guard;
 pub mod reclaim;
 
 pub use lifecycle::LifecycleGuard;
+pub use address_space::{AddressSpaceGuard, ProcAddressSpace};
 pub use bkl_guard::{process_bkl_drop_enabled, set_process_bkl_drop_enabled, ProcessBklGuard};
 
 pub use types::*;
@@ -232,7 +234,7 @@ impl Drop for ForkInProgressGuard {
 /// track the frame in the child's address space, and drop the parent's PTE to RO so the
 /// parent's own later writes fault too. Returns the number of pages shared.
 ///
-/// The work is split across a chunked [`Process::as_lock`] hold (see
+/// The work is split across a chunked [`Process::address_space`] lock hold (see
 /// [`FORK_AS_CHUNK_PAGES`]) into two phases, and the split is what makes
 /// [`fork_process`]'s `no-bkl-process` window sound:
 ///
@@ -281,7 +283,7 @@ impl Drop for ForkInProgressGuard {
 /// child's address space has never been on a CPU.
 pub fn share_rw_range(
     parent_l0: *const u64,
-    as_lock: &Spinlock<()>,
+    parent_as: &ProcAddressSpace,
     va_start: usize,
     len: usize,
     child_as: &mut mmu::UserAddressSpace,
@@ -297,10 +299,7 @@ pub fn share_rw_range(
             .and_then(|off| va_start.checked_add(off))
             .ok_or("shared-anon share VA overflow")?;
         {
-            #[cfg(kernel_smp_shared)]
-            let _asg = AsLockHold::new(as_lock);
-            #[cfg(not(kernel_smp_shared))]
-            let _ = as_lock;
+            let _asg = parent_as.lock();
             mmu::collect_mapped_pages_with_flags_into(parent_l0, chunk_va, chunk, scratch);
             for (idx, &(_, pa, _)) in scratch.iter().enumerate() {
                 let seen_in_earlier_chunk = child_as.tracks_user_frame(pa);
@@ -325,7 +324,7 @@ pub fn share_rw_range(
 
 pub fn cow_share_and_demote_range(
     parent_l0: *const u64,
-    as_lock: &Spinlock<()>,
+    parent_as: &ProcAddressSpace,
     va_start: usize,
     len: usize,
     child_as: &mut mmu::UserAddressSpace,
@@ -342,12 +341,9 @@ pub fn cow_share_and_demote_range(
             .and_then(|off| va_start.checked_add(off))
             .ok_or("CoW share VA overflow")?;
 
-        // ── Phase A: parent page table, under `as_lock`, IRQs masked ──
+        // ── Phase A: parent page table, under the AS lock, IRQs masked ──
         {
-            #[cfg(kernel_smp_shared)]
-            let _asg = AsLockHold::new(as_lock);
-            #[cfg(not(kernel_smp_shared))]
-            let _ = as_lock;
+            let _asg = parent_as.lock();
             mmu::collect_mapped_pages_with_flags_into(parent_l0, chunk_va, chunk, scratch);
             // ONE reference per address space, not per VA.
             //
@@ -584,7 +580,14 @@ pub struct Process {
     pub tgid: Pid,
     pub name: String,
     pub state: ProcessState,
-    pub address_space: UserAddressSpace,
+    /// This process's user address space, merged with the lock that serializes
+    /// hardware page-table mutation on it (was a separate `as_lock:
+    /// Spinlock<()>`). The lock-free scalar getters (`l0_phys`, `asid`,
+    /// `ttbr0`, `is_shared`) read an atomic mirror; every other operation goes
+    /// through `address_space.lock()` (was [`Process::with_address_space`] /
+    /// `AsLockHold`). See [`ProcAddressSpace`] and
+    /// `docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis.
+    pub address_space: ProcAddressSpace,
     pub context: UserContext,
     pub parent_pid: Pid,
     /// The program break.
@@ -652,32 +655,6 @@ pub struct Process {
     /// RAII release guard never ran) and reclaim the slot instead of spinning
     /// forever. See [`fault_slot_acquire`]/[`fault_slot_release`].
     pub fault_mutex: Spinlock<BTreeMap<usize, usize>>,
-    /// Serializes all access to [`Process::mmap_regions`] AND `Process::memory`'s
-    /// mmap free-list (`ProcessMemory::free_regions`, via [`Process::vm_alloc_mmap`]/
-    /// [`Process::vm_free_mmap`]) across the thread group. CLONE_VM threads share one
-    /// address-space-owner Process, so concurrent `sys_mmap`/`munmap`/`mremap`
-    /// (push/remove) and the page-fault eager fallback (iter) would otherwise race on
-    /// the plain `Vec`s — a half-completed reallocation read by another thread
-    /// corrupts it and hangs the kernel (observed under llama's burst of
-    /// graph-buffer mmaps). All access goes through the `vm_*` helper methods, which
-    /// hold this lock with IRQs disabled for a *pure Vec/bookkeeping operation only*
-    /// — no allocation, file I/O, mapping, or frame-free is performed while it is
-    /// held (those happen on the returned frames after the lock is released), so it
-    /// can never be held across a yield.
-    /// Serializes hardware page-table mutation for this address space across cores
-    /// under shared-kernel SMP (real M5b). The BKL-free user page-fault path takes
-    /// this (instead of the BKL) for its short PTE-install window; every AS-mutating
-    /// syscall (`mmap`/`munmap`/`mprotect`/`brk`/teardown/CoW-mark) takes it in
-    /// addition to the BKL it already holds, so a concurrent fault on the same
-    /// address space excludes correctly. Unlike the former `vm_lock` (which guarded
-    /// only the `mmap_regions` `Vec` for pure Vec ops), this covers the raw
-    /// page-table writes in `mmu::map_user_page*` / `AddressSpace::{un,}map_page`.
-    /// Held only for short windows with preemption disabled — NEVER across alloc,
-    /// block I/O, or a context switch (see [`Process::with_as_locked`] and
-    /// docs/archive/SMP_SHARED_M5_FAULT_LOCK_PLAN.md). CLONE_VM members share the
-    /// leader's, keyed by `tgid`, exactly like [`Process::fault_mutex`]. Lock order:
-    /// `BKL > as_lock > {PMM, page_table_frames, user_frames, fault_mutex, ...}`.
-    pub as_lock: Spinlock<()>,
     pub sigaltstack_sp: u64,
     pub sigaltstack_flags: i32,
     pub sigaltstack_size: u64,
@@ -695,10 +672,10 @@ pub struct Process {
 /// own `pid`. Everything else was either byte-identical inheritance from the
 /// parent or a fresh per-child constant, and now lives in one place:
 /// [`Process::inherit_from`]. (`docs/archive/COW_PILE_AUDIT.md` §2 counted nine
-/// divergences; the other two — `fault_mutex`, `as_lock` — are
-/// `fresh` at all three sites and so are not divergences at all. See
-/// `inherit_from` for why fresh-per-child is deliberate even on a shared
-/// address space.)
+/// divergences; the other two — `fault_mutex`, and the lock inside
+/// `address_space` (`ProcAddressSpace`) — are `fresh` at all three sites and so
+/// are not divergences at all. See `inherit_from` for why fresh-per-child is
+/// deliberate even on a shared address space.)
 ///
 /// Every field here is **mandatory**. There is deliberately no `Default`, no
 /// builder and no `..parent` rest-pattern: a seventh divergence discovered later
@@ -771,25 +748,6 @@ pub fn kill_box(box_id: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// RAII hold of an address space's `as_lock` with IRQs disabled — see
-/// [`Process::as_lock_hold`]. Field drop order (declaration order) releases the lock
-/// before restoring DAIF. smp-shared only.
-#[cfg(kernel_smp_shared)]
-pub struct AsLockHold<'a> {
-    _g: spinning_top::guard::SpinlockGuard<'a, ()>,
-    _irq: crate::runtime::IrqGuard,
-}
-
-#[cfg(kernel_smp_shared)]
-impl<'a> AsLockHold<'a> {
-    #[inline]
-    pub fn new(as_lock: &'a Spinlock<()>) -> Self {
-        let _irq = crate::runtime::IrqGuard::new();
-        let _g = as_lock.lock();
-        AsLockHold { _g, _irq }
-    }
-}
-
 impl Process {
     /// Build a clone-family child from `parent`, with the six values the three
     /// primitives disagree about supplied explicitly in `o`.
@@ -809,7 +767,7 @@ impl Process {
             // ── the six that differ per primitive, plus the child's pid ──
             pid: o.pid,
             tgid: o.tgid,
-            address_space: o.address_space,
+            address_space: ProcAddressSpace::new(o.address_space),
             process_info_phys: o.process_info_phys,
             fds: o.fds,
             signal_actions: o.signal_actions,
@@ -862,19 +820,21 @@ impl Process {
             robust_list_head: 0,
             robust_list_len: 0,
 
-            // The three locks are fresh for EVERY child, including the two
-            // primitives whose child SHARES its parent's address space. That is
-            // deliberate and load-bearing, not an oversight:
+            // The per-address-space locks are fresh for EVERY child, including the
+            // two primitives whose child SHARES its parent's address space (the
+            // `address_space` lock is inside `ProcAddressSpace::new`, applied to
+            // `o.address_space` above). That is deliberate and load-bearing, not an
+            // oversight:
             //
-            // `as_lock`/`fault_mutex` belong to the thread-group LEADER, and every
-            // fault-path caller resolves the owning `Process` through
-            // `address_space_owner_pid_for_fault()` rather than through `self` —
-            // so a `CLONE_VM` member's own copy is never the lock anyone waits on.
-            // Handing the child the parent's `Spinlock` instead would not help
-            // (the fault path still would not reach it through the child) and
+            // the `address_space` lock / `fault_mutex` belong to the thread-group
+            // LEADER, and every fault-path caller resolves the owning `Process`
+            // through `address_space_owner_pid_for_fault()` rather than through
+            // `self` — so a `CLONE_VM` member's own copy is never the lock anyone
+            // waits on. Handing the child the parent's `Spinlock` instead would not
+            // help (the fault path still would not reach it through the child) and
             // would need `Process` to hold them behind an `Arc`, which is a
-            // different change. See `Process::as_lock`'s field doc,
-            // `fork_process`'s `as_lock` resolution, and COW_PILE_AUDIT.md §2's
+            // different change. See `Process::address_space`'s field doc,
+            // `fork_process`'s `parent_as` resolution, and COW_PILE_AUDIT.md §2's
             // "three fresh locks on a shared address space" row — which flags this
             // as suspect precisely because the reason lives at one call site.
             //
@@ -882,7 +842,6 @@ impl Process {
             // of which ARE per-`Process` (see the empty `mmap_regions` above), so a
             // fresh lock is simply correct there.
             fault_mutex: Spinlock::new(BTreeMap::new()),
-            as_lock: Spinlock::new(()),
 
             start_time_us: (runtime().uptime_us)(),
             current_syscall: AtomicU64::new(!0),
@@ -947,97 +906,47 @@ impl Process {
         with_irqs_disabled(|| self.memory.free_mmap(start, size));
     }
 
-    /// Run `f` holding this address space's page-table lock ([`Process::as_lock`])
-    /// with preemption disabled — the shared-kernel-SMP (M5b) primitive that lets a
-    /// user page fault mutate page tables **without** the Big Kernel Lock while still
+    /// Run `f` holding this address space's page-table lock with preemption
+    /// disabled — the shared-kernel-SMP (M5b) primitive that lets a user page
+    /// fault mutate page tables **without** the Big Kernel Lock while still
     /// excluding concurrent AS-mutating syscalls and sibling faults on the same
     /// address space.
     ///
     /// `f` MUST be short and self-contained: PTE writes + frame tracking only. It MUST
     /// NOT allocate frames, do block I/O, or yield while held — do that work before/
     /// after (on private frames), exactly like [`Process::vm_with_regions`]. IRQs are
-    /// disabled for the whole hold, so (a) `as_lock` is never carried across a context
+    /// disabled for the whole hold, so (a) the lock is never carried across a context
     /// switch (the "spinlock across switch" deadlock class), and (b) a nested timer IRQ
-    /// can't acquire the BKL behind our back and leak it (an `as_lock`→BKL inversion) —
-    /// the fault fast path holds `as_lock` *instead of* the BKL. See
+    /// can't acquire the BKL behind our back and leak it (a lock→BKL inversion) —
+    /// the fault fast path holds this lock *instead of* the BKL. See
     /// docs/archive/SMP_SHARED_M5_FAULT_LOCK_PLAN.md.
     ///
-    /// On builds without `kernel_smp_shared` this compiles to just `f()` — no lock, no
-    /// IRQ change — so single-core/size/extreme builds are unaffected.
+    /// On builds without `kernel_smp_shared` this is a bare (uncontended) spinlock
+    /// hold with no IRQ change — see [`ProcAddressSpace::lock`].
     #[inline]
     pub fn with_as_locked<R>(&self, f: impl FnOnce() -> R) -> R {
-        #[cfg(kernel_smp_shared)]
-        {
-            // Locals drop in reverse declaration order: `_g` (release lock) before
-            // `_irq` (restore DAIF) — release the lock before re-enabling IRQs.
-            let _irq = crate::runtime::IrqGuard::new();
-            let _g = self.as_lock.lock();
-            f()
-        }
-        #[cfg(not(kernel_smp_shared))]
-        {
-            f()
-        }
+        let _g = self.address_space.lock();
+        f()
     }
 
-    /// Run `f` with `&mut UserAddressSpace` under this address space's
-    /// [`Process::as_lock`] with IRQs disabled (on `smp-shared`; a plain call
-    /// elsewhere, exactly like [`Process::with_as_locked`]) — the accessor that
-    /// lets the shared-reference (`&Process`) syscall paths call the `&mut self`
-    /// page-table mutators (`unmap_page*`, `update_page_flags*`,
-    /// `unmap_and_free_page*`, `map_and_track`, …) without materializing a
-    /// `&mut Process`.
+    /// Run `f` with `&mut UserAddressSpace` under this address space's lock (with
+    /// IRQs masked on `smp-shared`) — the accessor that lets the shared-reference
+    /// (`&Process`) syscall paths call the `&mut self` page-table mutators
+    /// (`unmap_page*`, `update_page_flags*`, `unmap_and_free_page*`,
+    /// `map_and_track`, …) without materializing a `&mut Process`.
     ///
-    /// Interior mutability follows [`Process::vm_with_regions`]'s discipline:
-    /// `as_lock` (held here, IRQs masked) is what serializes every page-table
-    /// mutator on this address space across cores, so the raw-pointer `&mut` is
-    /// the unique live reference for the closure's duration. On builds without
-    /// `kernel_smp_shared` there is no lock — exclusion is the pre-existing
-    /// single-core/BKL invariant, byte-for-byte the shape the old
-    /// `&'static mut Process` call sites relied on.
+    /// Since 2026-09-02 this is `self.address_space.lock()` and hands `f` a
+    /// `&mut UserAddressSpace` straight from the guard — no `&self -> &mut` cast
+    /// (`docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis). The lock **is** what
+    /// serializes every page-table mutator on this address space across cores.
     ///
-    /// Same rules as [`Process::with_as_locked`]/[`AsLockHold`]: keep the closure
-    /// short — PTE edits, frame bookkeeping, TLB flushes. It MUST NOT allocate
-    /// page frames (the PMM OOM/reclaim path re-enters `as_lock`), do block I/O,
-    /// or yield. Allocate frames before, free them after.
+    /// Keep the closure short — PTE edits, frame bookkeeping, TLB flushes. It
+    /// MUST NOT allocate page frames (the PMM OOM/reclaim path re-enters this
+    /// lock), do block I/O, or yield. Allocate frames before, free them after.
     #[inline]
     pub fn with_address_space<R>(&self, f: impl FnOnce(&mut UserAddressSpace) -> R) -> R {
-        #[cfg(kernel_smp_shared)]
-        {
-            // Locals drop in reverse declaration order: `_g` (release lock) before
-            // `_irq` (restore DAIF) — release the lock before re-enabling IRQs.
-            let _irq = crate::runtime::IrqGuard::new();
-            let _g = self.as_lock.lock();
-            // SAFETY: `as_lock` is held with IRQs masked; see the doc comment.
-            let aspace = unsafe {
-                &mut *(core::ptr::addr_of!(self.address_space) as *mut UserAddressSpace)
-            };
-            f(aspace)
-        }
-        #[cfg(not(kernel_smp_shared))]
-        {
-            // SAFETY: single-core / BKL-serialized, the invariant every previous
-            // `&'static mut Process` caller of these mutators already relied on.
-            let aspace = unsafe {
-                &mut *(core::ptr::addr_of!(self.address_space) as *mut UserAddressSpace)
-            };
-            f(aspace)
-        }
-    }
-
-    /// RAII hold of this address space's [`Process::as_lock`] with IRQs disabled — the
-    /// counterpart to [`Process::with_as_locked`] for the `&mut Process` syscall paths
-    /// (`mmap`/`munmap`/`mprotect`/`brk`/teardown) where a closure would conflict with
-    /// the disjoint `&mut self.address_space` edits it guards.
-    ///
-    /// Construct as `AsLockHold::new(&proc.as_lock)` so only the `as_lock` *field* is
-    /// borrowed, leaving `proc.address_space` free to mutate (disjoint-field borrow).
-    /// Same discipline as [`Process::with_as_locked`]: short window, no alloc/IO/yield.
-    /// smp-shared only; call sites gate the `let _g = …` line on `cfg(kernel_smp_shared)`.
-    #[cfg(kernel_smp_shared)]
-    #[must_use]
-    pub fn as_lock_hold(as_lock: &Spinlock<()>) -> AsLockHold<'_> {
-        AsLockHold::new(as_lock)
+        let mut g = self.address_space.lock();
+        f(&mut g)
     }
 
     /// Set command line arguments for this process
@@ -2627,26 +2536,28 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         mmu::phys_to_virt(l0_addr) as *const u64
     };
 
-    // The `as_lock` that serializes THIS address space's page tables — the very lock
-    // the CoW fault handler takes (`AsLockHold::new(&owner.as_lock)` in
-    // src/exceptions.rs). The `no-bkl-process` carve-out holds it in bounded chunks
-    // around every parent-PTE access below, which is what lets the BKL be dropped for
-    // the copy.
+    // The address space (and its lock) that serializes THIS address space's page
+    // tables — the very lock the CoW fault handler takes
+    // (`owner.address_space.lock()` in src/exceptions.rs). The `no-bkl-process`
+    // carve-out holds it in bounded chunks around every parent-PTE access below,
+    // which is what lets the BKL be dropped for the copy.
     //
-    // It is the thread-group LEADER's lock, not necessarily this thread's:
-    // `CLONE_THREAD` siblings each get a fresh `Spinlock` in their own `Process` (see
-    // the struct literal above) while SHARING one address space, and the fault handler
-    // resolves its owner from the live TTBR0 via `address_space_owner_pid_for_fault`.
-    // A worker-thread fork (pid != tgid) that took `parent.as_lock` would hold a lock
-    // no fault handler ever waits on, and the window would exclude nothing. Inside
-    // fork the live TTBR0 *is* the parent's address space, so this resolves to exactly
-    // the pid the fault handler would pick.
-    let as_lock: &Spinlock<()> = {
+    // It is the thread-group LEADER's, not necessarily this thread's:
+    // `CLONE_THREAD` siblings each get their own `ProcAddressSpace` (see the
+    // struct literal above) — a shared L0 view under a fresh lock — and the fault
+    // handler resolves its owner from the live TTBR0 via
+    // `address_space_owner_pid_for_fault`. A worker-thread fork (pid != tgid) that
+    // took `parent.address_space` would hold a lock no fault handler ever waits
+    // on, and the window would exclude nothing. Inside fork the live TTBR0 *is*
+    // the parent's address space, so this resolves to exactly the pid the fault
+    // handler would pick.
+    let parent_as: &ProcAddressSpace = {
         let owner_pid = address_space_owner_pid_for_fault().unwrap_or(parent_pid);
         if owner_pid == parent_pid {
-            &parent.as_lock
+            &parent.address_space
         } else {
-            lookup_process_shared(owner_pid).map_or(&parent.as_lock, |p| &p.as_lock)
+            lookup_process_shared(owner_pid)
+                .map_or(&parent.address_space, |p| &p.address_space)
         }
     };
 
@@ -2829,20 +2740,20 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             let _bkl = ProcessBklGuard::new();
 
             // Share stack
-            total_shared += cow_share_and_demote_range(parent_l0, as_lock, stack_start, stack_size,
-                &mut new_proc.address_space, &mut chunk_scratch, "stack")?;
+            total_shared += cow_share_and_demote_range(parent_l0, parent_as, stack_start, stack_size,
+                new_proc.address_space.get_mut(), &mut chunk_scratch, "stack")?;
 
             // Share code+brk.
             if parent.brk.load(Ordering::Relaxed) > code_start {
                 let brk_len = parent.brk.load(Ordering::Relaxed) - code_start;
-                total_shared += cow_share_and_demote_range(parent_l0, as_lock, code_start, brk_len,
-                    &mut new_proc.address_space, &mut chunk_scratch, "brk")?;
+                total_shared += cow_share_and_demote_range(parent_l0, parent_as, code_start, brk_len,
+                    new_proc.address_space.get_mut(), &mut chunk_scratch, "brk")?;
             }
 
             // Share interpreter region
             if mmu::translate_user_va(parent_l0, interp_base).is_some() {
-                total_shared += cow_share_and_demote_range(parent_l0, as_lock, interp_base, interp_scan_size,
-                    &mut new_proc.address_space, &mut chunk_scratch, "interp")?;
+                total_shared += cow_share_and_demote_range(parent_l0, parent_as, interp_base, interp_scan_size,
+                    new_proc.address_space.get_mut(), &mut chunk_scratch, "interp")?;
             }
 
             // Share mmap regions.
@@ -2864,23 +2775,23 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 // it would give parent and child separate pages on the first write,
                 // silently ignoring the flag — see `share_rw_range`.
                 total_shared += if region.shared_anon {
-                    share_rw_range(parent_l0, as_lock, region.start_va,
-                        region.len_bytes(), &mut new_proc.address_space, &mut chunk_scratch)?
+                    share_rw_range(parent_l0, parent_as, region.start_va,
+                        region.len_bytes(), new_proc.address_space.get_mut(), &mut chunk_scratch)?
                 } else {
-                    cow_share_and_demote_range(parent_l0, as_lock, region.start_va,
-                        region.len_bytes(), &mut new_proc.address_space, &mut chunk_scratch,
+                    cow_share_and_demote_range(parent_l0, parent_as, region.start_va,
+                        region.len_bytes(), new_proc.address_space.get_mut(), &mut chunk_scratch,
                         "mmap")?
                 };
             }
 
             for (va_start, len) in &sibling_ranges {
-                total_shared += cow_share_and_demote_range(parent_l0, as_lock, *va_start, *len,
-                    &mut new_proc.address_space, &mut chunk_scratch, "sibling-mmap")?;
+                total_shared += cow_share_and_demote_range(parent_l0, parent_as, *va_start, *len,
+                    new_proc.address_space.get_mut(), &mut chunk_scratch, "sibling-mmap")?;
             }
 
             for region in &parent_lazy_regions {
-                total_shared += cow_share_and_demote_range(parent_l0, as_lock, region.start_va, region.size,
-                    &mut new_proc.address_space, &mut chunk_scratch, "lazy")?;
+                total_shared += cow_share_and_demote_range(parent_l0, parent_as, region.start_va, region.size,
+                    new_proc.address_space.get_mut(), &mut chunk_scratch, "lazy")?;
             }
 
             // Belt-and-braces global invalidate on top of the per-chunk range flushes.
@@ -2929,7 +2840,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             parent_l0,
             stack_start,
             stack_size,
-            &mut new_proc.address_space,
+            new_proc.address_space.get_mut(),
             None,
             "stack",
         )?;
@@ -2946,7 +2857,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 parent_l0,
                 code_start,
                 brk_len,
-                &mut new_proc.address_space,
+                new_proc.address_space.get_mut(),
                 Some(MAX_FORK_BRK_COPY_PAGES),
                 "brk",
             )?;
@@ -2961,7 +2872,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                 parent_l0,
                 interp_base,
                 interp_scan_size,
-                &mut new_proc.address_space,
+                new_proc.address_space.get_mut(),
                 None,
                 "interp",
             )?;
@@ -3013,11 +2924,11 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                             let dst = mmu::phys_to_virt(frame.addr);
                             core::ptr::copy_nonoverlapping(src, dst, mmu::PAGE_SIZE);
                         }
-                        if new_proc.address_space.map_page(page_va, frame.addr, mmu::user_flags::RW).is_err() {
+                        if new_proc.address_space.get_mut().map_page(page_va, frame.addr, mmu::user_flags::RW).is_err() {
                             ok = false;
                             break;
                         }
-                        new_proc.address_space.track_user_frame(frame);
+                        new_proc.address_space.get_mut().track_user_frame(frame);
                         child_frames.push(frame);
                     }
                     None => {
@@ -3087,7 +2998,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
                     if lazy_pages_copied >= MAX_FORK_LAZY_PAGES {
                         break 'lazy_copy;
                     }
-                    if let Ok(frame) = new_proc.address_space.alloc_and_map(page_va, mmu::user_flags::RW) {
+                    if let Ok(frame) = new_proc.address_space.get_mut().alloc_and_map(page_va, mmu::user_flags::RW) {
                         unsafe {
                             let src = mmu::phys_to_virt(src_phys & !0xFFF) as *const u8;
                             let dst = mmu::phys_to_virt(frame.addr);
@@ -3124,7 +3035,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     // This broke vfork_complete (wrong child PID → parent never unblocked)
     // and the CoW fault handler (resolved pages in the wrong address space).
     lifecycle_trace("[FORK-DBG] step5a: re-mapping PROCESS_INFO_ADDR\n");
-    let map_result = new_proc.address_space.map_page(
+    let map_result = new_proc.address_space.get_mut().map_page(
         PROCESS_INFO_ADDR,
         new_proc.process_info_phys,
         mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
@@ -3868,7 +3779,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
     alloc::boxed::Box::new(Process {
         pid, pgid: pid, tgid: pid, name: "test".to_string(),
         state: ProcessState::Ready,
-        address_space: addr_space,
+        address_space: ProcAddressSpace::new(addr_space),
         context: UserContext::new(0, 0),
         parent_pid: 0, brk: AtomicUsize::new(0x1000_0000), initial_brk: 0x1000_0000,
         entry_point: 0, memory: mem, process_info_phys: 0,
@@ -3880,7 +3791,6 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         lazy_regions: Spinlock::new(LazyRegionMap::new()),
         fds: Arc::new(SharedFdTable::new()),
         fault_mutex: Spinlock::new(alloc::collections::BTreeMap::new()),
-        as_lock: Spinlock::new(()),
         thread_id: None, spawner_pid: None,
         terminal_state: Arc::new(Spinlock::new(akuma_terminal::TerminalState::default())),
         box_id: 0, namespace: akuma_isolation::global_namespace(),

@@ -13,9 +13,9 @@ use akuma_exec::process::MmapRegion;
 /// `FRAME_TRACKER` (never held across a yield), and `SHARED_FILE_MAPPINGS` — so
 /// the BKL is redundant for them. Two gaps this phase's audit found (a plain
 /// unguarded `ProcessMemory::free_regions`, and `sys_mmap`'s OOM/reclaim sweep
-/// mutating page tables with no `as_lock` hold) were closed as a prerequisite;
-/// see `Process::vm_alloc_mmap`/`vm_free_mmap` and
-/// `reclaim_clean_file_pages`'s per-page `as_lock_hold`.
+/// mutating page tables with no address-space-lock hold) were closed as a
+/// prerequisite; see `Process::vm_alloc_mmap`/`vm_free_mmap` and
+/// `reclaim_clean_file_pages`'s per-page `proc.address_space.lock()`.
 ///
 /// Unlike the VFS/net carve-outs, none of `as_lock`/`vm_lock`/`lazy_regions`/
 /// PMM need to know a BKL-free window is calling them — their IRQ-masking is

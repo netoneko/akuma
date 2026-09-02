@@ -4660,7 +4660,6 @@ fn test_fork_bkl_drop() {
     use crate::smp_shared::{process_bkl_drop_enabled, set_process_bkl_drop_enabled};
     #[cfg(not(kernel_smp_shared))]
     use akuma_exec::process::{process_bkl_drop_enabled, set_process_bkl_drop_enabled};
-    use spinning_top::Spinlock;
 
     /// Enough to cross a chunk boundary twice and leave a partial trailing chunk, so an
     /// off-by-one in the `while done < pages` loop (dropped tail, re-shared chunk, or a
@@ -4762,16 +4761,14 @@ fn test_fork_bkl_drop() {
         let parent_l0 = mmu::phys_to_virt(parent_as.l0_phys()) as *const u64;
         // Stand-in for the thread-group leader's `Process::as_lock`; uncontended here,
         // but it exercises the same acquire/release (and IRQ mask) the real path takes.
-        let as_lock: Spinlock<()> = Spinlock::new(());
+        let as_lock_standin = akuma_exec::process::ProcAddressSpace::new(mmu::UserAddressSpace::new().expect("standin AS"));
         let mut scratch: alloc::vec::Vec<(usize, usize, u64)> =
             alloc::vec::Vec::with_capacity(FORK_AS_CHUNK_PAGES);
 
         // Record the parent's PAs BEFORE the share, so we can prove the child got the
         // same physical frames (CoW share, not a copy) and the parent kept them.
         let before = mmu::collect_mapped_pages_with_flags(parent_l0, VA_BASE, PAGES);
-        let shared = cow_share_and_demote_range(
-            parent_l0,
-            &as_lock,
+        let shared = cow_share_and_demote_range(parent_l0, &as_lock_standin,
             VA_BASE,
             PAGES * mmu::PAGE_SIZE,
             &mut child_as,
@@ -5770,7 +5767,7 @@ fn test_ensure_user_pages_mapped_as_lock() {
             free_before, free_after);
     }
     if let Some(p) = lookup_process_shared(pid)
-        && p.as_lock.try_lock().is_none()
+        && !p.address_space.is_unlocked()
     {
         fails += 1;
         crate::safe_print!(96,
@@ -5835,11 +5832,11 @@ fn test_munmap_spans_multiple_eager_regions() {
                     for i in 0..PAGES_PER {
                         let va = BASE + (r * PAGES_PER + i) * 0x1000;
                         let Some(frame) = crate::pmm::alloc_page_zeroed() else { break };
-                        if p.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+                        if p.address_space.get_mut().map_page(va, frame.addr, user_flags::RW).is_err() {
                             crate::pmm::free_page(frame);
                             break;
                         }
-                        p.address_space.track_user_frame(frame);
+                        p.address_space.get_mut().track_user_frame(frame);
                         frames.push(frame);
                     }
                     p.vm_with_regions(|list| list.push(MmapRegion::owned_with_flags(
@@ -5861,13 +5858,13 @@ fn test_munmap_spans_multiple_eager_regions() {
                         let va = base + i * 0x1000;
                         match frames.get(i) {
                             Some(&f) => {
-                                p.address_space.unmap_page(va);
-                                if p.address_space.remove_user_frame(f) {
+                                p.address_space.get_mut().unmap_page(va);
+                                if p.address_space.get_mut().remove_user_frame(f) {
                                     crate::pmm::free_page(f);
                                 }
                             }
                             None => {
-                                if let Some(f) = p.address_space.unmap_and_free_page(va) {
+                                if let Some(f) = p.address_space.get_mut().unmap_and_free_page(va) {
                                     crate::pmm::free_page(f);
                                 }
                             }
@@ -5888,7 +5885,7 @@ fn test_munmap_spans_multiple_eager_regions() {
                 });
                 for (base, n) in leftovers {
                     for i in 0..n {
-                        if let Some(f) = p.address_space.unmap_and_free_page(base + i * 0x1000) {
+                        if let Some(f) = p.address_space.get_mut().unmap_and_free_page(base + i * 0x1000) {
                             crate::pmm::free_page(f);
                         }
                     }
@@ -5923,11 +5920,11 @@ fn test_munmap_teardown_conserves_pmm() {
             for i in 0..N {
                 let va = BENCH_VA_BASE + i * 0x1000;
                 let Some(frame) = crate::pmm::alloc_page_zeroed() else { break; };
-                if p.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+                if p.address_space.get_mut().map_page(va, frame.addr, user_flags::RW).is_err() {
                     crate::pmm::free_page(frame);
                     break;
                 }
-                p.address_space.track_user_frame(frame);
+                p.address_space.get_mut().track_user_frame(frame);
                 mapped += 1;
             }
             // Tear down through the deferred-flush munmap primitive (ba60d72):
@@ -5935,7 +5932,7 @@ fn test_munmap_teardown_conserves_pmm() {
             // frame for the caller to free exactly once.
             for i in 0..mapped {
                 let va = BENCH_VA_BASE + i * 0x1000;
-                if let Some(frame) = p.address_space.unmap_and_free_page(va) {
+                if let Some(frame) = p.address_space.get_mut().unmap_and_free_page(va) {
                     crate::pmm::free_page(frame);
                 }
             }
@@ -6630,7 +6627,6 @@ fn test_cow_break_dec_only_on_last_va() {
 /// `FORK_AS_CHUNK_PAGES` chunk, and again in a later chunk once the child tracks it.
 fn test_fork_cow_share_incs_once_per_frame() {
     use akuma_exec::process::cow_share_and_demote_range;
-    use spinning_top::Spinlock;
 
     let Some(frame) = crate::pmm::alloc_page() else {
         console::print("[Test] fork_cow_share_incs_once_per_frame SKIPPED (no free frame)\n");
@@ -6657,11 +6653,10 @@ fn test_fork_cow_share_incs_once_per_frame() {
     parent.track_user_frame(frame);
 
     let before = crate::pmm::cow_ref_get(frame.addr);
-    let as_lock: Spinlock<()> = Spinlock::new(());
+    let as_lock_standin = akuma_exec::process::ProcAddressSpace::new(crate::mmu::UserAddressSpace::new().expect("standin AS"));
     let mut scratch = alloc::vec::Vec::new();
     let parent_l0 = akuma_exec::mmu::phys_to_virt(parent.l0_phys()) as *const u64;
-    let shared = cow_share_and_demote_range(
-        parent_l0, &as_lock, VA_A, 2 * crate::mmu::PAGE_SIZE, &mut child, &mut scratch, "test");
+    let shared = cow_share_and_demote_range(parent_l0, &as_lock_standin, VA_A, 2 * crate::mmu::PAGE_SIZE, &mut child, &mut scratch, "test");
     let after = crate::pmm::cow_ref_get(frame.addr);
 
     // Both VAs must be shared into the child, but the frame is one holder-pair:
@@ -6788,9 +6783,9 @@ fn test_stale_write_fault_absorbed() {
         console::print("[Test] stale_write_fault_absorbed SKIPPED (no memory)\n");
         return;
     };
-    assert!(p.address_space.map_page(WRITABLE_VA, rw_frame.addr, user_flags::RW).is_ok(),
+    assert!(p.address_space.get_mut().map_page(WRITABLE_VA, rw_frame.addr, user_flags::RW).is_ok(),
         "scratch RW mapping failed");
-    assert!(p.address_space.map_page(READONLY_VA, ro_frame.addr, user_flags::RO).is_ok(),
+    assert!(p.address_space.get_mut().map_page(READONLY_VA, ro_frame.addr, user_flags::RO).is_ok(),
         "scratch RO mapping failed");
     let l0 = mmu::phys_to_virt(p.address_space.l0_phys()) as *const u64;
 
@@ -6811,7 +6806,7 @@ fn test_stale_write_fault_absorbed() {
     // read-only PTE followed by an absorb on the same VA once the repair lands.
     // The new PTE is a fresh budget key, so this second call must absorb even
     // back-to-back with the decline above.
-    p.address_space.update_page_flags(READONLY_VA, user_flags::RW_NO_EXEC);
+    p.address_space.get_mut().update_page_flags(READONLY_VA, user_flags::RW_NO_EXEC);
     assert!(absorbed(READONLY_VA),
         "a peer repair landing after the entry decline must be absorbed (the cowstale residual)");
 
@@ -6827,11 +6822,11 @@ fn test_stale_write_fault_absorbed() {
 
     // A changed PTE means real work happened in between — the same shape a CoW
     // break produces — so the budget starts over instead of staying spent.
-    p.address_space.update_page_flags(WRITABLE_VA, user_flags::RW_NO_EXEC);
+    p.address_space.get_mut().update_page_flags(WRITABLE_VA, user_flags::RW_NO_EXEC);
     assert!(absorbed(WRITABLE_VA), "a changed PTE must get a fresh retry budget");
 
-    if let Some(f) = p.address_space.unmap_and_free_page(WRITABLE_VA) { crate::pmm::free_page(f); }
-    if let Some(f) = p.address_space.unmap_and_free_page(READONLY_VA) { crate::pmm::free_page(f); }
+    if let Some(f) = p.address_space.get_mut().unmap_and_free_page(WRITABLE_VA) { crate::pmm::free_page(f); }
+    if let Some(f) = p.address_space.get_mut().unmap_and_free_page(READONLY_VA) { crate::pmm::free_page(f); }
     console::print("[Test] stale_write_fault_absorbed PASSED\n");
 }
 
@@ -7113,10 +7108,10 @@ fn test_aliased_pa_not_double_freed() {
             // mapping — the count>1 state the refcount design admits. va1/va2
             // share the same L1/L2/L3 tables, so the second map allocates no
             // new page-table frames (keeps the accounting balanced).
-            let _ = p.address_space.map_page(va1, frame.addr, user_flags::RW);
-            p.address_space.track_user_frame(frame);
-            let _ = p.address_space.map_page(va2, frame.addr, user_flags::RW);
-            p.address_space.track_user_frame(frame);
+            let _ = p.address_space.get_mut().map_page(va1, frame.addr, user_flags::RW);
+            p.address_space.get_mut().track_user_frame(frame);
+            let _ = p.address_space.get_mut().map_page(va2, frame.addr, user_flags::RW);
+            p.address_space.get_mut().track_user_frame(frame);
             // `p` drops here: Drop frees user_frames[frame] == 2 times. The
             // second free hits an already-free page; pmm::free_page must refuse
             // the re-mark (counting it) instead of corrupting the free list.
@@ -7162,14 +7157,14 @@ fn test_unmap_and_free_respects_refcount() {
             let va1 = BENCH_VA_BASE;
             let va2 = BENCH_VA_BASE + 0x1000;
             // Same PA mapped (and tracked) at two VAs → user_frames count == 2.
-            let _ = p.address_space.map_page(va1, frame.addr, user_flags::RW);
-            p.address_space.track_user_frame(frame);
-            let _ = p.address_space.map_page(va2, frame.addr, user_flags::RW);
-            p.address_space.track_user_frame(frame);
+            let _ = p.address_space.get_mut().map_page(va1, frame.addr, user_flags::RW);
+            p.address_space.get_mut().track_user_frame(frame);
+            let _ = p.address_space.get_mut().map_page(va2, frame.addr, user_flags::RW);
+            p.address_space.get_mut().track_user_frame(frame);
             // First unmap: still referenced at va2 → must NOT yield a frame.
-            let first = p.address_space.unmap_and_free_page(va1);
+            let first = p.address_space.get_mut().unmap_and_free_page(va1);
             // Second unmap: last reference → yields the frame to free exactly once.
-            let second = p.address_space.unmap_and_free_page(va2);
+            let second = p.address_space.get_mut().unmap_and_free_page(va2);
             if let Some(f) = second { crate::pmm::free_page(f); }
             // `p` drops with empty user_frames — nothing left to free.
             (first.is_some(), second.is_some())
@@ -7220,11 +7215,11 @@ fn bench_munmap_teardown() {
         for i in 0..want {
             let va = BENCH_VA_BASE + i * 4096;
             let Some(frame) = crate::pmm::alloc_page_zeroed() else { break; };
-            if p.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+            if p.address_space.get_mut().map_page(va, frame.addr, user_flags::RW).is_err() {
                 crate::pmm::free_page(frame);
                 break;
             }
-            p.address_space.track_user_frame(frame);
+            p.address_space.get_mut().track_user_frame(frame);
             mapped += 1;
         }
         if mapped == 0 {
@@ -7237,7 +7232,7 @@ fn bench_munmap_teardown() {
         let start = crate::timer::uptime_us();
         for i in 0..mapped {
             let va = BENCH_VA_BASE + i * 4096;
-            if let Some(frame) = p.address_space.unmap_and_free_page_no_flush(va) {
+            if let Some(frame) = p.address_space.get_mut().unmap_and_free_page_no_flush(va) {
                 crate::pmm::free_page(frame);
             }
         }
@@ -7273,11 +7268,11 @@ fn bench_fork_cow_share() {
     for i in 0..want {
         let va = BENCH_VA_BASE + i * 4096;
         let Some(frame) = crate::pmm::alloc_page_zeroed() else { break; };
-        if parent.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+        if parent.address_space.get_mut().map_page(va, frame.addr, user_flags::RW).is_err() {
             crate::pmm::free_page(frame);
             break;
         }
-        parent.address_space.track_user_frame(frame);
+        parent.address_space.get_mut().track_user_frame(frame);
         mapped += 1;
     }
     if mapped == 0 {
@@ -7357,11 +7352,11 @@ fn bench_mmap_populate() {
         if let Some(frames) = crate::pmm::alloc_pages_zeroed(want) {
             for (i, frame) in frames.into_iter().enumerate() {
                 let va = BENCH_VA_BASE + i * 4096;
-                if p.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+                if p.address_space.get_mut().map_page(va, frame.addr, user_flags::RW).is_err() {
                     crate::pmm::free_page(frame);
                     break;
                 }
-                p.address_space.track_user_frame(frame);
+                p.address_space.get_mut().track_user_frame(frame);
                 mapped += 1;
             }
             mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, mapped);
@@ -7378,7 +7373,7 @@ fn bench_mmap_populate() {
         // Tear the eager mapping down before the lazy measurement.
         for i in 0..mapped {
             let va = BENCH_VA_BASE + i * 4096;
-            if let Some(frame) = p.address_space.unmap_and_free_page_no_flush(va) {
+            if let Some(frame) = p.address_space.get_mut().unmap_and_free_page_no_flush(va) {
                 crate::pmm::free_page(frame);
             }
         }
@@ -7401,11 +7396,11 @@ fn bench_mmap_populate() {
         for i in 0..mapped {
             let va = BENCH_VA_BASE + i * 4096;
             let Some(frame) = crate::pmm::alloc_page_zeroed() else { break; };
-            if p.address_space.map_page(va, frame.addr, user_flags::RW).is_err() {
+            if p.address_space.get_mut().map_page(va, frame.addr, user_flags::RW).is_err() {
                 crate::pmm::free_page(frame);
                 break;
             }
-            p.address_space.track_user_frame(frame);
+            p.address_space.get_mut().track_user_frame(frame);
             mmu::flush_tlb_range_all_asid(va, 1);
             faulted += 1;
         }
@@ -7417,7 +7412,7 @@ fn bench_mmap_populate() {
         // Tear down; `p` drops here freeing its page-table frames.
         for i in 0..faulted {
             let va = BENCH_VA_BASE + i * 4096;
-            if let Some(frame) = p.address_space.unmap_and_free_page_no_flush(va) {
+            if let Some(frame) = p.address_space.get_mut().unmap_and_free_page_no_flush(va) {
                 crate::pmm::free_page(frame);
             }
         }
@@ -7855,7 +7850,7 @@ fn test_exit_group_does_not_unregister_while_siblings_running() {
         unregister_process(main_pid);
         return;
     };
-    sib_proc.address_space = shared_as;
+    sib_proc.address_space.replace(shared_as);
     register_process(sib_pid, sib_proc);
 
     // Call kill_thread_group (as if main_pid called exit_group)
@@ -7906,7 +7901,7 @@ fn test_rt_sigaction_after_exit_group_not_enosys() {
         unregister_process(main_pid);
         return;
     };
-    sib_proc.address_space = shared_as;
+    sib_proc.address_space.replace(shared_as);
     
     // Assign a fake thread ID to the sibling so we can impersonate it
     let sib_tid = 9999;
@@ -9163,7 +9158,7 @@ fn test_update_page_flags_rw_to_rx_clears_uxn() {
     use akuma_exec::mmu::flags;
     let mut p = make_test_process(99901);
     let va = 0x200_0000;
-    if p.address_space.alloc_and_map(va, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+    if p.address_space.get_mut().alloc_and_map(va, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
         crate::safe_print!(64, "[Test] update_page_flags_rw_rx SKIPPED or FAILED: alloc_and_map\n");
         return;
     }
@@ -9178,7 +9173,7 @@ fn test_update_page_flags_rw_to_rx_clears_uxn() {
     // The edit is infallible; the read-back below is what actually proves it
     // landed. (This used to test `.is_err()` on a Result that was structurally
     // always `Ok` — a branch that could never be taken.)
-    p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
+    p.address_space.get_mut().update_page_flags(va, akuma_exec::mmu::user_flags::RX);
     let Some(e2) = p.address_space.read_l3_page_entry(va) else {
         crate::safe_print!(64, "[Test] update_page_flags_rw_rx FAILED: read pte after RX\n");
         return;
@@ -9191,7 +9186,7 @@ fn test_update_page_flags_rw_to_rx_clears_uxn() {
         );
         return;
     }
-    p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
+    p.address_space.get_mut().update_page_flags(va, akuma_exec::mmu::user_flags::RX);
     let Some(e3) = p.address_space.read_l3_page_entry(va) else {
         crate::safe_print!(64, "[Test] update_page_flags_idempotent_rx FAILED: read\n");
         return;
@@ -9247,8 +9242,8 @@ fn test_kernel_identity_va_walk_stops_at_block() {
     let victim = (mmu::phys_to_virt(va & !0x1F_FFFF) as usize + (((va >> 12) & 0x1FF) * 8)) as *mut u64;
     let before = unsafe { core::ptr::read_volatile(victim) };
 
-    p.address_space.update_page_flags(va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
-    p.address_space.unmap_page_no_flush(va);
+    p.address_space.get_mut().update_page_flags(va, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+    p.address_space.get_mut().unmap_page_no_flush(va);
 
     let after = unsafe { core::ptr::read_volatile(victim) };
     if before != after {
@@ -9264,7 +9259,7 @@ fn test_kernel_identity_va_walk_stops_at_block() {
 fn test_icache_invalidate_page_va_smoke() {
     let mut p = make_test_process(99902);
     let va = 0x201_0000;
-    if p.address_space.alloc_and_map(va, akuma_exec::mmu::user_flags::RX).is_err() {
+    if p.address_space.get_mut().alloc_and_map(va, akuma_exec::mmu::user_flags::RX).is_err() {
         crate::safe_print!(64, "[Test] icache_invalidate_smoke SKIPPED or FAILED: alloc_and_map\n");
         return;
     }
@@ -12106,7 +12101,7 @@ fn park_retired_process_with_pages(pages: usize) -> Option<(u32, usize)> {
     for _ in 0..pages {
         match pmm::alloc_page_zeroed() {
             Some(f) => {
-                proc.address_space.track_user_frame(f);
+                proc.address_space.lock().track_user_frame(f);
                 parked += 1;
             }
             None => break,
@@ -13722,7 +13717,7 @@ fn test_kill_thread_group_preserves_lazy_regions() {
     // Create sibling sharing the same l0_phys (simulates CLONE_VM).
     let mut sib_proc = make_test_process(sibling_pid);
     let shared_as = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
-    sib_proc.address_space = shared_as;
+    sib_proc.address_space.replace(shared_as);
     register_process(sibling_pid, sib_proc);
 
     // Push a lazy region under the owner PID (as sys_mmap would).
@@ -13772,7 +13767,7 @@ fn test_lazy_region_lookup_for_page_fault_clone() {
     let mut sib_proc = make_test_process(sibling_pid);
     sib_proc.tgid = owner_pid;
     let l0 = lookup_process_shared(owner_pid).expect("owner").address_space.l0_phys();
-    sib_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    sib_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap());
     register_process(sibling_pid, sib_proc);
 
     push_lazy_region(owner_pid, va, size, user_flags::RW);
@@ -13815,7 +13810,7 @@ fn test_lazy_region_lookup_resolves_tgid_for_demand_paging() {
     let mut worker_proc = make_test_process(worker);
     worker_proc.tgid = leader;
     let l0 = lookup_process_shared(leader).expect("leader").address_space.l0_phys();
-    worker_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    worker_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap());
     register_process(worker, worker_proc);
 
     push_lazy_region(leader, va, size, user_flags::RW);
@@ -13999,7 +13994,7 @@ fn test_kill_thread_group_marks_siblings_zombie() {
     // Create sibling with same tgid (same thread group)
     let mut sib_proc = make_test_process(sibling_pid);
     sib_proc.tgid = leader_pid;  // Same thread group as leader
-    sib_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    sib_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sibling_pid, sib_proc);
 
     // Leader calls kill_thread_group - should unregister sibling
@@ -14070,7 +14065,7 @@ fn test_kill_thread_group_reaps_futex_blocked_sibling() {
     let mut sib = make_test_process(sib_pid);
     sib.tgid = leader_pid;
     if let Some(shared) = crate::mmu::UserAddressSpace::new_shared(l0) {
-        sib.address_space = shared;
+        sib.address_space.replace(shared);
     }
     sib.thread_id = Some(sib_tid);
     register_process(sib_pid, sib);
@@ -14176,7 +14171,7 @@ fn test_fatal_fault_group_exit_precedes_parent_notify() {
     let mut sib = make_test_process(sib_pid);
     sib.tgid = leader_pid;
     if let Some(shared) = crate::mmu::UserAddressSpace::new_shared(l0) {
-        sib.address_space = shared;
+        sib.address_space.replace(shared);
     }
     sib.thread_id = Some(sib_tid);
     register_process(sib_pid, sib);
@@ -14309,19 +14304,19 @@ fn test_kill_thread_group_terminates_before_cleanup() {
     let mut sib1 = make_test_process(sib1_pid);
     sib1.tgid = owner_pid;
     sib1.thread_id = Some(sib1_tid);
-    sib1.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    sib1.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib1_pid, sib1);
 
     let mut sib2 = make_test_process(sib2_pid);
     sib2.tgid = owner_pid;
     sib2.thread_id = Some(sib2_tid);
-    sib2.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    sib2.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib2_pid, sib2);
 
     let mut sib3 = make_test_process(sib3_pid);
     sib3.tgid = owner_pid;
     sib3.thread_id = Some(sib3_tid);
-    sib3.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    sib3.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib3_pid, sib3);
 
     // Before kill: threads should be FREE (test slots, never spawned).
@@ -14536,7 +14531,7 @@ fn test_kill_thread_group_no_channel_lock_contention() {
     let mut sib_proc = make_test_process(sib_pid);
     sib_proc.tgid = owner_pid;
     sib_proc.thread_id = Some(sib_tid);
-    sib_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    sib_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib_pid, sib_proc);
 
     let sib_channel = Arc::new(ProcessChannel::new());
@@ -14602,13 +14597,13 @@ fn test_exit_group_kills_siblings_before_close_all() {
     let mut sib1_proc = make_test_process(sib1_pid);
     sib1_proc.tgid = leader_pid;
     sib1_proc.thread_id = Some(sib1_tid);
-    sib1_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    sib1_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib1_pid, sib1_proc);
 
     let mut sib2_proc = make_test_process(sib2_pid);
     sib2_proc.tgid = leader_pid;
     sib2_proc.thread_id = Some(sib2_tid);
-    sib2_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    sib2_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib2_pid, sib2_proc);
 
     // Simulate exit_group ordering: kill_thread_group runs FIRST
@@ -14690,7 +14685,7 @@ fn test_kill_thread_group_clears_thread_id() {
     let mut sib_proc = make_test_process(sibling_pid);
     sib_proc.tgid = leader_pid;  // Same thread group
     sib_proc.thread_id = Some(sibling_tid);
-    sib_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    sib_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sibling_pid, sib_proc);
 
     // Leader calls kill_thread_group
@@ -14857,7 +14852,7 @@ fn test_zombie_process_unregistered_after_return_to_kernel() {
 
     let mut sib_proc = make_test_process(sibling_pid);
     sib_proc.tgid = caller_pid; // same thread group as the caller
-    sib_proc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
+    sib_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sibling_pid, sib_proc);
 
     // exit_group: the caller marks itself exited+Zombie (as sys_exit_group does)
@@ -16322,7 +16317,7 @@ fn test_kill_child_processes_thread_group_matches_fork_parent() {
     register_process(main_pid, main_proc);
 
     let mut worker = make_test_process(worker_pid);
-    worker.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    worker.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap());
     register_process(worker_pid, worker);
 
     let mut compile = make_test_process(compile_pid);
@@ -16960,7 +16955,7 @@ fn test_kill_thread_group_sets_child_channel_exited() {
     sib_proc.tgid = leader_pid;  // Same thread group
     sib_proc.thread_id = Some(sibling_tid);
     let shared_as = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
-    sib_proc.address_space = shared_as;
+    sib_proc.address_space.replace(shared_as);
     register_process(sibling_pid, sib_proc);
 
     // Register PROCESS_CHANNEL for sibling (this is what kill_thread_group removes)
@@ -17028,7 +17023,7 @@ fn test_epoll_pidfd_with_kill_thread_group() {
     sib_proc.tgid = leader_pid;  // Same thread group
     sib_proc.thread_id = Some(101);
     let shared_as = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
-    sib_proc.address_space = shared_as;
+    sib_proc.address_space.replace(shared_as);
 
     // Register child channel for sibling (for pidfd to detect exit)
     let sib_ch = Arc::new(ProcessChannel::new());
@@ -17787,7 +17782,7 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
     let mut goroutine = make_test_process(goroutine_pid);
     goroutine.tgid = leader_pid; // same thread group
     goroutine.parent_pid = leader_pid;
-    goroutine.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(leader_l0).unwrap();
+    goroutine.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(leader_l0).unwrap());
     register_process(goroutine_pid, goroutine);
 
     // Replicate return_to_kernel's gate for the goroutine's normal exit: only an
@@ -17865,7 +17860,7 @@ fn test_kill_thread_group_preserves_exit_code() {
     let mut g = make_test_process(goroutine_pid);
     g.tgid = leader_pid;
     g.thread_id = Some(goroutine_tid);
-    g.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    g.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap());
     register_process(goroutine_pid, g);
 
     // Goroutine calls exit_group(0): the leader is torn down as a "sibling".
@@ -19121,7 +19116,7 @@ fn test_kill_thread_group_two_phase() {
     sibling.thread_id = Some(sibling_tid);
     // Share address space
     let shared_as = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
-    sibling.address_space = shared_as;
+    sibling.address_space.replace(shared_as);
     register_process(sibling_pid, sibling);
     
     // Kill thread group
@@ -19179,12 +19174,12 @@ fn test_execve_kills_thread_group_siblings() {
     let mut sibling = make_test_process(sibling_pid);
     sibling.tgid = leader_pid;
     sibling.thread_id = Some(sibling_tid);
-    sibling.address_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new_shared(leader.address_space.l0_phys()) {
+    sibling.address_space.replace(if let Some(a) = akuma_exec::mmu::UserAddressSpace::new_shared(leader.address_space.l0_phys()) {
         a
     } else {
         crate::safe_print!(64, "[Test] execve_kills_thread_group_siblings: new_shared failed\n");
         return;
-    };
+    });
     register_process(sibling_pid, sibling);
 
     // Re-exec the leader into the same test binary — this must kill the sibling.
@@ -19333,7 +19328,7 @@ fn test_alloc_mmap_resolves_tgid() {
     let mut wproc = make_test_process(worker);
     wproc.tgid = leader;
     let l0 = lookup_process_shared(leader).expect("leader").address_space.l0_phys();
-    wproc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    wproc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap());
     register_process(worker, wproc);
 
     let leader_next_before = lookup_process_shared(leader).unwrap().memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
@@ -19381,7 +19376,7 @@ fn test_lazy_region_lookup_resolves_tgid() {
     let mut wproc = make_test_process(worker);
     wproc.tgid = leader;
     let l0 = lookup_process_shared(leader).expect("leader").address_space.l0_phys();
-    wproc.address_space = akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap();
+    wproc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap());
     register_process(worker, wproc);
 
     // Switch to worker context using thread PID map

@@ -11,9 +11,9 @@
 //! (`demote_range_to_ro`) and no lock covered those PTE edits. That is true of the
 //! code as it was written, but it is not a property of the operation: the fault
 //! handler already edits the very same PTEs *without* the BKL, serialized by the
-//! address space's own [`Process::as_lock`] (`exceptions.rs`, the
-//! `AsLockHold::new(&owner.as_lock)` sites). `as_lock` is the inner lock the VFS
-//! playbook asks for — fork simply wasn't taking it.
+//! address space's own lock ([`Process::address_space`], `exceptions.rs`'s
+//! `owner.address_space.lock()` sites). That lock — historically "`as_lock`" —
+//! is the inner lock the VFS playbook asks for; fork simply wasn't taking it.
 //!
 //! So the carve-out is: take `as_lock` over every parent-page-table access, drop
 //! the BKL for the surrounding copy, and leave steps 5–8 (ProcessInfo,
@@ -22,19 +22,20 @@
 //!
 //! ## Three constraints that shaped the implementation
 //!
-//! 1. **It must be the thread-group LEADER's `as_lock`, not the forking thread's.**
-//!    `CLONE_THREAD` siblings each get their own `Process` with their own
-//!    `Spinlock` (`fork_process`'s struct literal constructs a fresh `as_lock`) but
-//!    *share* one address space. The fault handler resolves its owner with
+//! 1. **It must be the thread-group LEADER's address-space lock, not the forking
+//!    thread's.** `CLONE_THREAD` siblings each get their own `Process` with their
+//!    own `ProcAddressSpace` (a shared-L0 view under a fresh lock) but *share*
+//!    one address space. The fault handler resolves its owner with
 //!    [`crate::process::address_space_owner_pid_for_fault`] — TTBR0 → the
 //!    non-shared process that owns that L0 — so fork must resolve the same way, or
 //!    a worker-thread fork would take a lock nothing else in the system holds.
 //!
-//! 2. **The hold must be chunked, never spanning the whole copy.** [`AsLockHold`]
-//!    masks IRQs for its duration, and it has to: without the mask, a timer IRQ
-//!    inside the BKL-free window does `enter_kernel()` and hard-spins for the BKL
-//!    while this core holds `as_lock`, against a peer that holds the BKL and wants
-//!    `as_lock` in `munmap`/`mprotect` — the AB-BA wedge the network Phase 2
+//! 2. **The hold must be chunked, never spanning the whole copy.**
+//!    [`ProcAddressSpace::lock`] masks IRQs for its duration, and it has to:
+//!    without the mask, a timer IRQ inside the BKL-free window does
+//!    `enter_kernel()` and hard-spins for the BKL while this core holds the AS
+//!    lock, against a peer that holds the BKL and wants the AS lock in
+//!    `munmap`/`mprotect` — the AB-BA wedge the network Phase 2
 //!    `PreemptGuard` fix exists to prevent. Masking IRQs across a milliseconds-long
 //!    page copy is equally unacceptable (it starves this core's tick, and the
 //!    playbook's "mask per attempt, never across an unbounded wait" rule says so).
@@ -50,8 +51,8 @@
 //!    lock. This is why the carve-out *merges* the demote pass into the share pass
 //!    rather than leaving it as the separate second walk it used to be.
 //!
-//! [`AsLockHold`]: crate::process::AsLockHold
-//! [`Process::as_lock`]: crate::process::Process::as_lock
+//! [`ProcAddressSpace::lock`]: crate::process::ProcAddressSpace::lock
+//! [`Process::address_space`]: crate::process::Process::address_space
 //! [`FORK_AS_CHUNK_PAGES`]: crate::process::FORK_AS_CHUNK_PAGES
 
 use akuma_primitives::{GuardToggle, ToggledGuard};
