@@ -1,0 +1,23 @@
+[package]
+name = "akuma-el0-entry"
+version = "0.1.0"
+edition = "2024"
+description = "The EL0 entry `eret`: `enter_user_mode` (the register-load + `eret` asm) and the `enter_user_mode_checked` SPSR gate. All of akuma-exec's process-launch/execve `eret` unsafe, behind one crate boundary."
+
+[lints]
+workspace = true
+
+# Sits BELOW `akuma-exec` (re-exported as `akuma_exec::process::{enter_user_mode,
+# enter_user_mode_checked}`). It does not name `Process`: `enter_user_mode` takes
+# `&UserContext`, which lives in `akuma-exec-core`. No dependency reaches back to
+# `akuma-exec`.
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-exec-core = { path = "../akuma-exec-core" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-bkl = { path = "../akuma-bkl" }
+akuma-threading = { path = "../akuma-threading" }
+
+[features]
+smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-threading/smp-shared"]
+extreme = ["akuma-primitives/extreme", "akuma-threading/extreme"]

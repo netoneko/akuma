@@ -55,23 +55,26 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
                     let dst_off = pg_data_start - va;
                     let file_off = file_offset + (pg_data_start - segment_va);
                     let read_len = pg_data_end - pg_data_start;
-                    let page_ptr = crate::mmu::phys_to_virt(page_frame.addr);
-                    // SAFETY: `page_ptr` is the kernel mapping of a page just
-                    // allocated here and not yet published to any page table, so
-                    // this is the only reference to it; `dst_off + read_len` is
-                    // bounded by the 4 KiB page by the two clamps above.
-                    let page_buf = unsafe {
-                        core::slice::from_raw_parts_mut(
-                            page_ptr.cast::<u8>().add(dst_off),
-                            read_len,
-                        )
-                    };
                     let rt = crate::runtime::runtime();
-                    let got = if inode == 0 {
-                        (rt.read_at)(path, file_off, page_buf)
-                    } else {
-                        (rt.read_at_by_inode)(path, inode, file_off, page_buf)
-                    };
+                    // `with_phys_bytes_mut` hands `f` a `&mut [u8]` view of the
+                    // freshly-allocated, not-yet-mapped frame: the only reference
+                    // for its duration, and `dst_off + read_len` is bounded by
+                    // the 4 KiB page by the two clamps above. `None` (frame out
+                    // of range — impossible for an `alloc_page_zeroed` result)
+                    // reads back as a short fill and takes the branch below.
+                    let got = crate::mmu::with_phys_bytes_mut(
+                        page_frame.addr,
+                        dst_off,
+                        read_len,
+                        |page_buf| {
+                            if inode == 0 {
+                                (rt.read_at)(path, file_off, page_buf)
+                            } else {
+                                (rt.read_at_by_inode)(path, inode, file_off, page_buf)
+                            }
+                        },
+                    )
+                    .unwrap_or(Err(0));
                     // The range is already clamped to `filesz`, so anything less
                     // than `read_len` is a defect, not EOF — same contract as
                     // the demand-fault fill's `[FILL-SHORT]` in
@@ -100,54 +103,63 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
             // a re-fault leak. One hold per page, never spanning the loop.
             let owner_pid = crate::process::read_current_pid().unwrap_or(0);
             let owner = crate::process::lookup_process_shared(owner_pid);
-            // SAFETY (map_user_page): installing a mapping for our own address
-            // space at a VA this loop has just confirmed unmapped, with a frame
-            // nothing else references yet.
-            //
             // `as_lock_owner` (the L0-owning thread-group leader) supplies the
             // lock; the frames are tracked against `owner` (this thread's
             // Process). They are the same Process for every normal thread — only
             // a vfork-child prefault sees them differ, and then the two locks are
             // genuinely distinct so the nested hold below cannot self-deadlock.
-            let (table_frames, installed) = if let (Some(leader), Some(owner)) = (as_lock_owner, owner)
-                && core::ptr::eq(leader, owner)
-            {
-                let mut g = leader.address_space.lock();
-                let (tf, inst) = unsafe { crate::mmu::map_user_page(va, page_frame.addr, map_flags) };
-                if inst {
-                    g.track_user_frame(page_frame);
-                }
-                for t in &tf {
-                    g.track_page_table_frame(*t);
-                }
-                (tf, inst)
-            } else {
-                let _leader_g = as_lock_owner.map(|l| l.address_space.lock());
-                let (tf, inst) = unsafe { crate::mmu::map_user_page(va, page_frame.addr, map_flags) };
-                if let Some(owner) = owner {
-                    let mut g = owner.address_space.lock();
-                    if inst {
-                        g.track_user_frame(page_frame);
+            let (table_frames, installed): (Option<crate::mmu::TableFrames>, bool) =
+                if let (Some(leader), Some(o)) = (as_lock_owner, owner)
+                    && core::ptr::eq(leader, o)
+                {
+                    // Common path. `leader`'s address space is the installed one
+                    // (`as_lock_owner` is resolved from the live TTBR0), and
+                    // `&mut UserAddressSpace` proves the `as_lock` hold, so
+                    // `map_user_page_tracked` discharges `map_user_page`'s whole
+                    // contract in `akuma-mmu`. It tracks `page_frame` and any new
+                    // table frames itself — on a lost CAS race the frame stays
+                    // tracked and is freed at teardown rather than here.
+                    (None, leader.address_space.lock().map_user_page_tracked(va, page_frame, map_flags))
+                } else {
+                    // vfork-child prefault edge: the PTE edit is serialized by
+                    // the *leader's* `as_lock` but the frames are recorded in
+                    // `owner`'s distinct address space. `map_user_page_tracked`
+                    // cannot express "lock A, record in B", so this rare arm
+                    // stays on the raw call.
+                    let _leader_g = as_lock_owner.map(|l| l.address_space.lock());
+                    // SAFETY (map_user_page): installing a mapping for the
+                    // installed address space at a VA this loop has just
+                    // confirmed unmapped, with a freshly-allocated frame nothing
+                    // else references; the leader's `as_lock` is held above and
+                    // the return value is fully consumed below.
+                    let (tf, inst) = unsafe { crate::mmu::map_user_page(va, page_frame.addr, map_flags) };
+                    if let Some(owner) = owner {
+                        let mut g = owner.address_space.lock();
+                        if inst {
+                            g.track_user_frame(page_frame);
+                        }
+                        for t in &tf {
+                            g.track_page_table_frame(*t);
+                        }
                     }
-                    for t in &tf {
-                        g.track_page_table_frame(*t);
-                    }
-                }
-                (tf, inst)
-            };
-            // Frees run after the hold is released. Ownership rule, matching
-            // `exceptions.rs`'s `ensure_user_page_mapped` sibling: the data
-            // frame goes back to the PMM iff the PTE CAS race was lost (nothing
-            // mapped it) or there is no owner to track it. A previous version
-            // freed it iff `installed && owner.is_none()`, which leaked the
-            // frame on every lost CAS race with a live owner.
+                    (Some(tf), inst)
+                };
+            // Frees run after the hold is released. Only the raw arm needs them:
+            // the common path tracked everything against the address space, so a
+            // lost CAS race there leaves a tracked-but-unmapped frame that
+            // teardown reclaims. For the raw arm, the ownership rule matches
+            // `exceptions.rs`'s `ensure_user_page_mapped` sibling — the data
+            // frame goes back to the PMM iff the CAS race was lost or there is no
+            // owner to track it.
             let tid = akuma_primitives::preempt::current_tid() as u32;
-            if !installed || owner.is_none() {
-                akuma_pmm::free_page(page_frame.addr, tid);
-            }
-            if owner.is_none() {
-                for tf in table_frames {
-                    akuma_pmm::free_page(tf.addr, tid);
+            if let Some(table_frames) = table_frames {
+                if !installed || owner.is_none() {
+                    akuma_pmm::free_page(page_frame.addr, tid);
+                }
+                if owner.is_none() {
+                    for tf in table_frames {
+                        akuma_pmm::free_page(tf.addr, tid);
+                    }
                 }
             }
         }

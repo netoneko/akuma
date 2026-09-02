@@ -384,8 +384,11 @@ pub fn cow_share_and_demote_range(
                 // Inserts with count=2 on first share.
                 akuma_pmm::cow_ref_inc(pa);
             }
-            // SAFETY: `parent_l0` is the live L0 root of the address space this
-            // `as_lock` guards (see the preconditions above).
+            // SAFETY: `parent_l0` is the live L0 root of the tables this pass
+            // edits — it and `parent_as` (the serializing `as_lock`, held by
+            // `_asg`) are deliberately independent parameters, so this cannot
+            // become a `&mut UserAddressSpace` method (the self-test passes a
+            // lock stand-in whose own L0 is empty).
             unsafe {
                 mmu::demote_range_to_ro(parent_l0.cast_mut(), chunk_va, chunk);
             }
@@ -998,10 +1001,11 @@ impl Process {
         // Activate the user address space
         self.address_space.activate();
 
-        // Jump to user mode
-        unsafe {
-            enter_user_mode(&self.context);
-        }
+        // Jump to user mode. The checked entry validates `spsr` targets EL0 —
+        // every context this kernel builds sets `spsr = 0`, so it is one compare
+        // on a once-per-launch path, and it removes this crate's last `eret`
+        // `unsafe`.
+        enter_user_mode_checked(&self.context)
     }
 
     /// Prepare process for execution (internal helper)
@@ -1014,12 +1018,12 @@ impl Process {
         // Reset per-process I/O state
         self.reset_io();
 
-        // Write process info to the physical page (before activating address space)
-        unsafe {
-            let info_ptr = crate::mmu::phys_to_virt(self.process_info_phys) as *mut ProcessInfo;
-            let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
-            core::ptr::write(info_ptr, info);
-        }
+        // Write process info to the physical page (before activating address
+        // space). `write_phys` range-checks the frame against PMM RAM — same
+        // helper `fork_process` uses for the identical write at its own site.
+        let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
+        let wrote = crate::mmu::write_phys(self.process_info_phys, &info);
+        debug_assert!(wrote, "process_info_phys outside PMM RAM");
     }
 
     // ========== Per-Process I/O Methods (thread-safe with size limits) ==========
@@ -1158,116 +1162,13 @@ pub fn with_own_process_exclusive<T, F: FnOnce(&mut Process) -> T>(f: F) -> Opti
     unsafe { table::with_process_exclusive(pid, f) }
 }
 
-/// [`enter_user_mode`], with the one check that makes it safe to call.
-///
-/// `eret` returns to whatever exception level `SPSR_EL1.M[3:0]` names, so a
-/// context claiming `EL1h` turns this call into "jump to an arbitrary address
-/// **with kernel privilege**" — that, not the program counter, is what made the
-/// raw form `unsafe`. A context that targets EL0 can only misbehave in
-/// userspace, where a bad PC or SP faults the process and nothing else.
-///
-/// Every context this kernel builds sets `spsr = 0` (EL0t), so the check costs
-/// one compare on a path taken once per exec.
-///
-/// A context that fails it does not return either: by the time execve reaches
-/// here the old image is already gone, so there is nothing to fall back to. It
-/// halts the core with the offending value named, the same choice
-/// `akuma_primitives::preempt::current_tid` makes for a corrupt `TPIDRRO_EL0`.
-#[cfg(target_os = "none")]
-pub fn enter_user_mode_checked(ctx: &UserContext) -> ! {
-    const SPSR_M_MASK: u64 = 0b1111;
-    const SPSR_M_EL0T: u64 = 0b0000;
-    if ctx.spsr & SPSR_M_MASK != SPSR_M_EL0T {
-        crate::safe_print!(
-            192,
-            "[FATAL] enter_user_mode_checked: spsr={:#x} does not target EL0 (M={:#x})\n\
-             Refusing to eret — this would return with kernel privilege.\n",
-            ctx.spsr,
-            ctx.spsr & SPSR_M_MASK
-        );
-        loop {
-            akuma_cpu::park::wfi();
-        }
-    }
-    // SAFETY: the context targets EL0, checked above. An EL0 context cannot
-    // return into the kernel; a bad PC/SP inside it faults the process.
-    unsafe { enter_user_mode(ctx) }
-}
-
-#[cfg(not(target_os = "none"))]
-pub fn enter_user_mode_checked(_ctx: &UserContext) -> ! {
-    panic!("enter_user_mode_checked on a host build")
-}
-
-/// Enter user mode with the given context
-///
-/// This sets up the CPU state and performs an ERET to EL0.
-/// Does not return.
-#[cfg(target_os = "none")]
-#[inline(never)]
-#[allow(dead_code)]
-pub unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
-    // Tripwire for the SMP=4 mixed-EL corruption: refuse silence if this EL0 entry
-    // would land in kernel text (poison minted upstream — see update_thread_context).
-    if ctx.pc >= 0x4000_0000 {
-        crate::safe_print!(128, "[EUM POISON] enter_user_mode pc={:#x} spsr={:#x} tid={}\n",
-            ctx.pc, ctx.spsr, crate::threading::current_thread_id());
-    }
-    // This `eret` drops to EL0 without returning through the syscall wrapper (initial
-    // process launch / execve), so the SVC epilogue's `clear_current_trap_frame` never
-    // runs for the trap that got us here. On the execve path that leaves the slot
-    // pointing at the abandoned execve trap frame while userspace runs — stale for
-    // every reader until the next SVC republishes. No live frame exists at an ERET to
-    // user, so clear it unconditionally.
-    crate::threading::clear_current_trap_frame();
-    // Real shared-kernel SMP: this `eret` drops to EL0 without returning through the
-    // syscall wrapper (initial process launch / execve), so release the BKL here —
-    // otherwise it would stay held while running userspace. No-op unless
-    // `cfg(kernel_smp_shared)`.
-    crate::bkl::leave_kernel();
-    // SAFETY: This inline asm sets up CPU state and ERETs to user mode.
-    // x30 is pinned as the context pointer and loaded last to avoid corruption.
-    unsafe {
-        core::arch::asm!(
-            // Set system registers from named operands (consumed before GP loads)
-            "msr sp_el0, {sp_user}",
-            "msr elr_el1, {pc}",
-            "msr spsr_el1, {spsr}",
-            "msr tpidr_el0, {tls}",
-            // Load x0-x29 from context struct (x30 = ctx pointer, stable throughout)
-            "ldp x0, x1, [x30]",
-            "ldp x2, x3, [x30, #16]",
-            "ldp x4, x5, [x30, #32]",
-            "ldp x6, x7, [x30, #48]",
-            "ldp x8, x9, [x30, #64]",
-            "ldp x10, x11, [x30, #80]",
-            "ldp x12, x13, [x30, #96]",
-            "ldp x14, x15, [x30, #112]",
-            "ldp x16, x17, [x30, #128]",
-            "ldp x18, x19, [x30, #144]",
-            "ldp x20, x21, [x30, #160]",
-            "ldp x22, x23, [x30, #176]",
-            "ldp x24, x25, [x30, #192]",
-            "ldp x26, x27, [x30, #208]",
-            "ldp x28, x29, [x30, #224]",
-            // Load x30 last (overwrites ctx pointer, no longer needed)
-            "ldr x30, [x30, #240]",
-            "eret",
-            in("x30") ctx as *const UserContext,
-            sp_user = in(reg) ctx.sp,
-            pc = in(reg) ctx.pc,
-            spsr = in(reg) ctx.spsr,
-            tls = in(reg) ctx.tpidr,
-            options(noreturn)
-        )
-    }
-}
-
-#[cfg(not(target_os = "none"))]
-#[allow(dead_code)]
-pub unsafe fn enter_user_mode(_ctx: &UserContext) -> ! {
-    panic!("not on bare metal")
-}
+/// The EL0 entry `eret` — `enter_user_mode` (the register-load + `eret` asm)
+/// and its SPSR gate `enter_user_mode_checked` — **moved to `akuma-el0-entry`
+/// on 2026-09-02** (`AKUMA_EXEC_AUDIT.md` §6). Re-exported under the original
+/// paths so this crate's call sites (`Process::run`,
+/// `spawn::run_registered_process`, `entry_point_trampoline`) and
+/// `akuma-syscalls-glue`'s one `enter_user_mode_checked` call resolve unchanged.
+pub use akuma_el0_entry::{enter_user_mode, enter_user_mode_checked};
 
 
 /// Return to kernel after process exit
@@ -1805,7 +1706,11 @@ pub fn kill_child_processes_for_thread_group(l0_phys: usize) {
 }
 
 /// Exit code is communicated via ProcessChannel for async callers.
-#[unsafe(no_mangle)]
+///
+/// `#[unsafe(no_mangle)]` was dropped 2026-09-02: nothing references the C
+/// symbol — every caller is a Rust `akuma_exec::process::return_to_kernel(..)`
+/// call, and the sibling `return_to_kernel_from_fault` has always been mangled.
+/// `forbid(unsafe_code)` rejects the attribute form outright.
 pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
     // A BKL-opted-out syscall (Phase 7f per-syscall opt-out list) runs its whole EL0
     // excursion inside an open dropped-BKL window, and this function never returns to
@@ -3395,18 +3300,27 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
             // stuck pending signal) while the aborting thread saw nothing and fell
             // through to musl's `a_crash()`. Repro: userspace/forktest/c_stress/abortsig.c.
             //
-            // Plain EL1 store is safe here: the bits-32+ guard in sys_clone_pidfd
-            // prevents garbage flags from entering clone_thread, so the caller is
-            // always a legitimate CLONE_THREAD|CLONE_VM request with writable pages.
-            // copy_to_user_safe was tried here but its byte-by-byte strb through
-            // the fault-handler mechanism silently returned EFAULT on some pages,
-            // leaving mp.procid=0 and crashing the Go runtime.
+            // `write_current_user_val` is a single aligned EL1 `str` behind an
+            // AP-writable page check — deliberately NOT the fault-handler
+            // `copy_to_user_safe`, whose byte-by-byte `strb` loop silently
+            // returned EFAULT on some pages here, leaving `mp.procid=0` and
+            // crashing the Go runtime. The bits-32+ guard in `sys_clone_pidfd`
+            // already guarantees this is a legitimate CLONE_THREAD|CLONE_VM
+            // request with writable pages; the check only downgrades a would-be
+            // EL1 fault to a skipped write.
             let child_tid = tid as u32;
-            if parent_tid_ptr != 0 && flags & CLONE_PARENT_SETTID != 0 {
-                unsafe { core::ptr::write(parent_tid_ptr as *mut u32, child_tid); }
+            let mut set_tid = |ptr: u64, which: &str| {
+                if ptr != 0 && !crate::mmu::write_current_user_val(ptr as usize, &child_tid) {
+                    crate::safe_print!(128,
+                        "[clone_thread] {} set_tid write to {:#x} skipped — page not writable\n",
+                        which, ptr);
+                }
+            };
+            if flags & CLONE_PARENT_SETTID != 0 {
+                set_tid(parent_tid_ptr, "CLONE_PARENT_SETTID");
             }
-            if child_tid_ptr != 0 && flags & CLONE_CHILD_SETTID != 0 {
-                unsafe { core::ptr::write(child_tid_ptr as *mut u32, child_tid); }
+            if flags & CLONE_CHILD_SETTID != 0 {
+                set_tid(child_tid_ptr, "CLONE_CHILD_SETTID");
             }
         },
     )?;

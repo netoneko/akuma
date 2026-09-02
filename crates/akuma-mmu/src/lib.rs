@@ -1247,6 +1247,33 @@ pub fn write_phys<T: Copy>(pa: usize, val: &T) -> bool {
     true
 }
 
+/// Run `f` with a `&mut [u8]` view of `[offset, offset + len)` inside the
+/// physical frame at `pa`, reached through its kernel identity mapping.
+///
+/// For a freshly-allocated frame the kernel is filling before it maps it —
+/// demand-paging's per-page file read (`process::lazy_prefault`). `None` if `pa`
+/// is not a page-aligned PMM frame or the window leaves it.
+///
+/// Replaces a `phys_to_virt` + `slice::from_raw_parts_mut` at the one prefault
+/// site; the frame is unpublished, so `f` is the only accessor for its duration.
+#[must_use]
+pub fn with_phys_bytes_mut<R>(
+    pa: usize,
+    offset: usize,
+    len: usize,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> Option<R> {
+    let end = offset.checked_add(len)?;
+    if end > PAGE_SIZE || (pa & (PAGE_SIZE - 1)) != 0 || !akuma_pmm::contains(pa, PAGE_SIZE) {
+        return None;
+    }
+    // SAFETY: `pa` is a page-aligned PMM frame (identity-mapped, writable); the
+    // window is inside that page; the frame is not published to any page table,
+    // so `f` holds the only reference for its duration.
+    let buf = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(pa).add(offset), len) };
+    Some(f(buf))
+}
+
 pub struct UserAddressSpace {
     l0_frame: PhysFrame,
     page_table_frames: Spinlock<Vec<PhysFrame>>,
@@ -2705,6 +2732,27 @@ pub fn is_current_user_range_mapped(va_start: usize, len: usize) -> bool {
     true
 }
 
+/// Read a `Copy` POD value of type `T` from `va` in the **current** address
+/// space, at EL1. `None` if `[va, va + size_of::<T>())` is not currently mapped
+/// EL0-accessible.
+///
+/// This is the `read_current_pid` fallback's read of `ProcessInfo` at its fixed
+/// user VA. It deliberately does **not** route through `akuma-user-access`:
+/// `validate_user_range` there resolves the faulting address space's owner
+/// through the process layer, and that path calls back into this exact
+/// function — an infinite recursion. The AP-gated presence check above is the
+/// whole precondition the read needs.
+#[must_use]
+pub fn read_current_user_val<T: Copy>(va: usize) -> Option<T> {
+    if !is_current_user_range_mapped(va, core::mem::size_of::<T>()) {
+        return None;
+    }
+    // SAFETY: `[va, va + size_of::<T>())` is mapped and EL0-accessible in the
+    // live TTBR0 (checked directly above), so this EL1 read cannot fault.
+    // `read_unaligned` drops the alignment obligation; `T: Copy` is POD.
+    Some(unsafe { core::ptr::read_unaligned(va as *const T) })
+}
+
 /// Is anything mapped at `va` in the current address space? **Presence** — see
 /// [`is_page_mapped_ptr`] for why this one is not the AP-gated question.
 pub fn is_current_user_page_mapped(va: usize) -> bool {
@@ -2764,6 +2812,14 @@ impl UserLeaf {
     #[must_use]
     pub fn user_accessible(self) -> bool {
         self.entry & flags::AP_RW_ALL != 0
+    }
+
+    /// Whether **EL0** (and therefore an EL1 store) may *write* this mapping —
+    /// AP[7:6] == `0b01` (`AP_RW_ALL`) exactly. A read-only user page fails this
+    /// where it passes [`user_accessible`](Self::user_accessible).
+    #[must_use]
+    pub fn user_writable(self) -> bool {
+        self.entry & (flags::AP_RO_ALL | flags::AP_RW_ALL) == flags::AP_RW_ALL
     }
 }
 
@@ -3032,6 +3088,48 @@ fn is_page_mapped_ptr(l0_ptr: *const u64, va: usize) -> bool {
 /// encoding and [`is_current_user_range_mapped`] for the hole this closes.
 fn is_page_user_accessible_ptr(l0_ptr: *const u64, va: usize) -> bool {
     resolve_user_leaf(l0_ptr, va).is_some_and(UserLeaf::user_accessible)
+}
+
+fn is_page_user_writable_ptr(l0_ptr: *const u64, va: usize) -> bool {
+    resolve_user_leaf(l0_ptr, va).is_some_and(UserLeaf::user_writable)
+}
+
+/// Every page in `[va_start, va_start + len)` is mapped **writable from EL0** in
+/// the current address space. The write-side counterpart of
+/// [`is_current_user_range_mapped`] — a `PROT_READ` page fails this.
+#[must_use]
+pub fn is_current_user_range_writable(va_start: usize, len: usize) -> bool {
+    let ttbr0 = get_current_ttbr0();
+    if ttbr0 == 0 { return false; }
+    let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let start_page = va_start & !(PAGE_SIZE - 1);
+    let end_page = (va_start + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let num_pages = (end_page - start_page) / PAGE_SIZE;
+    let l0_ptr = phys_to_virt(l0_addr) as *const u64;
+    (0..num_pages).all(|i| is_page_user_writable_ptr(l0_ptr, start_page + i * PAGE_SIZE))
+}
+
+/// Write a `Copy` POD value to `va` in the **current** address space with a
+/// single aligned EL1 store. `false` (no write performed) if
+/// `[va, va + size_of::<T>())` is not mapped writable from EL0.
+///
+/// The write counterpart of [`read_current_user_val`], and deliberately **not**
+/// `akuma_user_access::copy_to_user`: that path is a byte-by-byte `strb` loop
+/// through the fault trampoline, which has been observed to return a spurious
+/// `EFAULT` mid-page for the musl / Go `set_tid` stores in
+/// `process::clone_thread`. Those callers have already validated the clone
+/// flags that guarantee a writable page and need one `str`, not a loop.
+#[must_use]
+pub fn write_current_user_val<T: Copy>(va: usize, val: &T) -> bool {
+    if !is_current_user_range_writable(va, core::mem::size_of::<T>()) {
+        return false;
+    }
+    // SAFETY: `[va, va + size_of::<T>())` is mapped writable and EL0-accessible
+    // in the live TTBR0 (checked directly above), so this EL1 store cannot
+    // fault. `read_unaligned`/`write_unaligned` drop the alignment obligation;
+    // `T: Copy` is POD.
+    unsafe { core::ptr::write_unaligned(va as *mut T, *val) }
+    true
 }
 
 #[cfg(test)]

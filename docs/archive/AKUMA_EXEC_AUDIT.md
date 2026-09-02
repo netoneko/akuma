@@ -20,6 +20,38 @@ can't forbid so `akuma-exec` can head toward one. The crate went from ~126
 `unsafe` blocks to **37**; §6.D (`table.rs`) and the EL0-entry cluster are what
 stand between it and `#![forbid(unsafe_code)]`.
 
+**§6.E landed (2026-09-02), and the "unsafe-free after A–C" claim below was
+wrong.** `akuma-el0-entry` extracted (`enter_user_mode` + its `asm!` + the
+`enter_user_mode_checked` SPSR gate); `#[unsafe(no_mangle)]` dropped from
+`return_to_kernel` (nothing links the C symbol); and five raw-pointer sites
+became safe `akuma-mmu` helpers — `write_phys` for `prepare_for_execution`'s
+`ProcessInfo` write, new `read_current_user_val` for `read_current_pid`'s
+fallback, new `with_phys_bytes_mut` for the prefault file-fill, the safe
+`map_user_page_tracked` for the prefault common path, and new
+`write_current_user_val` (+ `is_current_user_range_writable`) for the two CLONE
+`set_tid` EL1 stores. **37 → 25 `unsafe` sites.** What remains is **three
+groups, and the crate cannot `forbid` until all three clear**:
+
+1. **`table.rs` (18 + the `with_process_exclusive` `unsafe fn`)** — §6.D, the
+   generic `akuma-slot-table` primitive. Not started. Eliminates the whole file
+   plus `children.rs`'s `lookup_process_shared` deref (~20 sites).
+2. **The execve / first-run *exclusive* window (3)** —
+   `with_own_process_exclusive`, `run_registered_process`,
+   `entry_point_trampoline` all need a non-IRQ-masked `&mut Process` across
+   `replace_image` (block I/O, allocations) or `Process::run` (`eret`, never
+   returns). This is **Phase 7f** (`BKL_PHASE7_AUDIT.md` §5) — converting the
+   destructive lifecycle window to a real lock — and is a project in its own
+   right, not a wrapper. `with_process_exclusive` is `unsafe fn` precisely so
+   these three acknowledge the obligation; a generic `akuma-slot-table` can move
+   the deref but not remove the `unsafe`.
+3. **Two decoupled-pointer sites (2)** — `fork`'s `demote_range_to_ro` (its
+   `parent_l0` and the serializing `parent_as` lock are *deliberately
+   independent* parameters — the self-test passes a lock stand-in whose own L0
+   is empty, so this cannot become a `&mut UserAddressSpace` method without a
+   phys-validated L0 wrapper), and the vfork-child-prefault `map_user_page` edge
+   (edit under the leader's `as_lock`, record frames in the child's distinct
+   address space — `map_user_page_tracked` cannot express "lock A, record in B").
+
 Two incidental findings — a triplicated enum (§5b) and the fact that nobody has
 swept for either pattern tree-wide (§5c) — came out of the same reading.
 
@@ -564,9 +596,13 @@ deadlock above. Those sites take `lock()` and go through the guard.
      genericizes into an `akuma-slot-table` primitive, the move
      `akuma-locks-rw-cell` made. Open.
 
-   After A–C, `akuma-exec` proper (fork/exec/signal/channel/fd/lifecycle/reclaim)
-   is `unsafe`-free and takes `#![forbid(unsafe_code)]`. Do **not** do C on the
-   strength of a line count; A stands on its own regardless.
+   **Correction (§6.E, 2026-09-02):** A–D do **not** leave the crate
+   `unsafe`-free. The execve / first-run exclusive window (`with_process_exclusive`
+   and its three callers) survives every extraction — it is a Phase 7f problem,
+   not a layering one — and two decoupled-pointer sites (`demote_range_to_ro`,
+   the vfork prefault edge) need their own phys-validated wrappers. `forbid`
+   needs D **and** those. Do **not** do C on the strength of a line count; A
+   stands on its own regardless.
 
 ## Background
 

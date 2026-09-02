@@ -12,7 +12,7 @@ use crate::process::table::{register_process};
 use crate::process::children::{lookup_process_shared, current_terminal_state};
 use crate::process::lifecycle::LifecycleGuard;
 
-use super::{Process, enter_user_mode, read_current_pid, get_box_name};
+use super::{Process, enter_user_mode_checked, read_current_pid, get_box_name};
 
 /// Longest `#!` line honoured, matching Linux's `BINPRM_BUF_SIZE`.
 ///
@@ -603,7 +603,7 @@ pub(crate) fn run_registered_process(pid: Pid) -> ! {
             (runtime().enable_irqs)();
 
             // Enter user mode via ERET - this never returns
-            enter_user_mode(&proc.context);
+            enter_user_mode_checked(&proc.context);
         });
     }
     // Reached only if the process vanished between spawn and first run.

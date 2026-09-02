@@ -15,13 +15,13 @@ no-tests = []
 # (build_extreme_size.sh). Lets this crate's build.rs emit
 # `cfg(kernel_profile_extreme)` so threading can trim the warm-stack floor and
 # right-size kernel stacks for the extreme low-memory target. NOT a syscall gate.
-extreme = ["akuma-primitives/extreme", "akuma-elf/extreme", "akuma-threading/extreme"]
+extreme = ["akuma-primitives/extreme", "akuma-elf/extreme", "akuma-threading/extreme", "akuma-el0-entry/extreme"]
 
 # Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared` feature.
 # Lets this crate's build.rs emit `cfg(kernel_smp_shared)` so the Big Kernel Lock
 # (`bkl`) is active; with it off, `bkl` compiles to zero-overhead no-ops and the
 # default/other builds are unaffected. See docs/reference/subsystems/smp-shared.md.
-smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared", "akuma-elf/smp-shared", "akuma-threading/smp-shared"]
+smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared", "akuma-elf/smp-shared", "akuma-threading/smp-shared", "akuma-el0-entry/smp-shared"]
 
 # Disable BKL usage for network operations (Phase 2 testing).
 # When enabled, network syscalls skip BKL acquisition and use the new
@@ -85,6 +85,11 @@ akuma-pmm = { path = "../akuma-pmm" }
 # `akuma-syscalls-mem` can name `MmapRegion` without depending on all of exec.
 akuma-mmap = { path = "../akuma-mmap" }
 akuma-threading = { path = "../akuma-threading" }
+# The EL0 entry `eret`: `enter_user_mode` (register-load + `eret` asm) and its
+# SPSR gate `enter_user_mode_checked`. Re-exported as
+# `akuma_exec::process::{enter_user_mode, enter_user_mode_checked}` so this
+# crate's call sites and `akuma-syscalls-glue`'s one are unchanged.
+akuma-el0-entry = { path = "../akuma-el0-entry" }
 # The EL0 copy boundary (asm loop + fault trampoline + copy_from/to_user). Held
 # every user-copy `unsafe` this crate used to carry; re-exported below as
 # `process::user_access`. `process::lazy_prefault` registers its demand-paging

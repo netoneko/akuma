@@ -494,17 +494,12 @@ pub fn read_current_pid() -> Option<Pid> {
     // the raw `mmu` call. The page is mapped `user_flags::RO` (`AP_RO_ALL`, EL0
     // bit set) at every site that maps it — `image.rs` on exec, `mod.rs` on fork
     // and on the post-CoW re-map — so it passes.
-    if !crate::mmu::is_current_user_range_mapped(
-        PROCESS_INFO_ADDR,
-        core::mem::size_of::<ProcessInfo>(),
-    ) {
-        return None;
-    }
-
-    // Read from the fixed address in the current address space
-    // SAFETY: checked directly above — PROCESS_INFO_ADDR is mapped and EL0-accessible
-    // in the live TTBR0, so this read cannot fault.
-    let pid = unsafe { (*(PROCESS_INFO_ADDR as *const ProcessInfo)).pid };
+    // Read from the fixed address in the current address space. `read_current_user_val`
+    // does the AP-gated presence check and the EL1 read behind `akuma-mmu`'s
+    // page-table contract — it deliberately does not route through
+    // `akuma-user-access`, whose `validate_user_range` would recurse back through
+    // `address_space_owner_pid_for_fault` into this function.
+    let pid = crate::mmu::read_current_user_val::<ProcessInfo>(PROCESS_INFO_ADDR)?.pid;
     if pid == 0 { None } else { Some(pid) }
 }
 

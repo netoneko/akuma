@@ -91,6 +91,17 @@ name = "akuma-cpu"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-el0-entry"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-cpu",
+ "akuma-exec-core",
+ "akuma-primitives",
+ "akuma-threading",
+]
+
+[[package]]
 name = "akuma-elf"
 version = "0.1.0"
 dependencies = [
@@ -138,6 +149,7 @@ version = "0.1.0"
 dependencies = [
  "akuma-bkl",
  "akuma-cpu",
+ "akuma-el0-entry",
  "akuma-elf",
  "akuma-exec-core",
  "akuma-isolation",
