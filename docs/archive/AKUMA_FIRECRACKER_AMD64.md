@@ -269,6 +269,73 @@ and the instruction cache snoops stores, so no maintenance is required. The one
 thing to watch there is `line_size`, which returns a hardcoded 64 rather than
 reading `CPUID`.
 
+## 3.6 It boots under Firecracker, on real hardware
+
+**2026-09-03, Firecracker v1.16.1, AMD Ryzen 7 8845HS (Zen 4), Pop!_OS 22.04,
+kernel 6.17.9, native KVM.** Not emulation — the same ELF QEMU boots locally, run
+by Firecracker on a real x86 machine. `amd64/run-firecracker.sh` does it in one
+command (`FC_HOST=user@host`).
+
+```
+  hvm_start_info @ 0x0000000000006000
+  version=1 modules=0 rsdp=0x0000000000000000 cmdline=0x0000000000020000
+  memmap: 4 entries
+    0x0000000000000000 + 0x000000000009fc00  RAM
+    0x000000000009fc00 + 0x0000000000040400  reserved
+    0x00000000eec00000 + 0x0000000010000000  reserved
+    0x0000000000100000 + 0x000000001ff00000  RAM
+  usable RAM: 511 MiB
+  pmm:  126385 free frames (493 MiB)
+  test: heap vec[4096] sum=22898104320
+  test: pmm alloc 8 frames, free 126385 -> 126377 -> 126385   [OK]
+  test: paging map/write/verify/unmap @0x0000000040000000   [OK]
+  test: W^X encoding   [OK]
+```
+
+Four things only the real machine could establish.
+
+**The PVH gamble paid off exactly as designed.** `hvm_start_info` is at
+**`0x6000`** here against QEMU's **`0x1580`** — different address, identical code
+path, no `#[cfg]` anywhere. That is the whole reason §2 chose PVH over the 64-bit
+LinuxBoot protocol, and printing the pointer (§2.2) is what makes it checkable at
+a glance. `cmdline=0x20000` is Firecracker's `CMDLINE_START`, matching its source.
+
+**`rsdp_paddr` is 0 on Firecracker too — correcting §4.** The earlier note said
+PVH hands over the ACPI root pointer so the "scan the BIOS area for `RSD PTR `"
+step never has to exist, and flagged that QEMU reported 0 and Firecracker needed
+checking. Now checked: **Firecracker v1.16.1 also reports 0.** The field is in the
+ABI and neither VMM populates it, so when ACPI is eventually needed the RSDP will
+have to be found some other way. Do not build on that field.
+
+**Picking the RAM region by containment, not by size or order, was load-bearing.**
+Firecracker reports **4** entries where QEMU reports 7, and — the part that
+matters — it lists the main RAM region **last**, after a reserved region at
+`0xeec00000`. Any implementation that took the first RAM entry would have chosen
+the 640 KiB block at 0, and one that scanned in order and stopped early would
+differ between the two VMMs. §3.5.2's "right by construction" was not a
+hypothetical.
+
+**`drives` and `network-interfaces` are mandatory in the single-JSON config.**
+Even when empty. Firecracker rejects the file outright:
+
+```
+RunWithoutApiError error: Failed to build MicroVM from Json:
+  Invalid JSON: missing field `drives` at line 10 column 1
+```
+
+They are not defaulted, and this differs from the API path. The machine has no
+disk and no NIC, so both stay `[]`.
+
+### 3.6.1 `EFER.NXE` — found before it could bite
+
+Stage B's first blocker was in `boot.s`, not in the page-table code: it set
+`EFER.LME` and not `EFER.NXE`. Without NXE, **bit 63 of a PTE is a reserved bit,
+not the no-execute flag** — setting it does not mark a page non-executable, it
+makes every access to that page fault with the reserved-bit error. A kernel that
+omits it and then tries to enforce W^X gets the exact opposite of what it asked
+for. It is now set in the same `wrmsr` as LME, so no page-table code can run
+before it is in force.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at
@@ -277,13 +344,15 @@ reading `CPUID`.
   outright, so nothing so far has needed it. It becomes necessary for IOAPIC (device
   interrupts), MADT (SMP) and MCFG (PCI) — not before. Even a preemption timer does
   not need it, since the LAPIC base comes from MSR `IA32_APIC_BASE`. When it is
-  needed, `hvm_start_info.rsdp_paddr` removes the "scan the BIOS area for `RSD PTR `"
-  step — though note QEMU reported `rsdp=0x0` here, so that field needs checking
-  against Firecracker specifically before anything relies on it.
-- **No page-table management beyond the boot identity map.** This is where proposal
-  item 1 becomes a genuine blocker: x86 PTEs encode write at bit 1, user at bit 2 and
-  NX at bit 63, with nothing resembling the AArch64 `AP` field, so `MmapRegion.flags`
-  being a raw AArch64 `u64` cannot cross. Item 1 *is* the x86 MMU prerequisite.
+  needed, it will have to be found the hard way: `hvm_start_info.rsdp_paddr` exists
+  in the ABI but **both** QEMU and Firecracker v1.16.1 report it as 0 (measured,
+  §3.6). Do not build on that field.
+- **Page tables exist but are not shared with `akuma-mmap`.** `amd64/src/paging.rs`
+  can map, unmap and translate, with a local `Prot` struct deliberately shaped the way
+  proposal item 1 wants. It is local because `MmapRegion.flags` is still a raw AArch64
+  `u64` and the two encodings share no field — see that module's table. Item 1 remains
+  the prerequisite for *sharing* the region bookkeeping; it was not needed to get
+  paging working.
 - **No IDT.** Nothing faults, demand-pages or reaches userspace until exception entry
   exists — new arch code, and not one of the six items.
 - **No VGA console.** Considered and dropped: the target is Firecracker, whose console

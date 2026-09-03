@@ -107,10 +107,20 @@ _start:
     movl $__pml4, %eax
     movl %eax, %cr3
 
-    /* EFER.LME (MSR 0xC0000080 bit 8): long mode enabled, not yet active. */
+    /* EFER (MSR 0xC0000080): LME bit 8, NXE bit 11.
+     *
+     * LME enables long mode — not yet active; LME + CR0.PG is what activates it.
+     *
+     * **NXE is not optional and is easy to miss.** Without it, bit 63 of a page
+     * table entry is a *reserved* bit rather than the no-execute flag: setting
+     * it does not mark a page non-executable, it makes every access to that page
+     * fault with the reserved-bit error. So a kernel that omits NXE and then
+     * tries to enforce W^X gets the opposite of what it asked for, and gets it as
+     * a fault rather than a silent downgrade. Set here, in the same `wrmsr` as
+     * LME, so no page-table code can run before it is in force. */
     movl $0xC0000080, %ecx
     rdmsr
-    orl  $(1 << 8), %eax
+    orl  $((1 << 8) | (1 << 11)), %eax
     wrmsr
 
     /* CR0.PG | CR0.PE — paging on. LME + PG is what makes long mode active;

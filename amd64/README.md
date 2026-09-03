@@ -1,8 +1,10 @@
 # Akuma/amd64
 
 x86_64 bring-up target. Boots to long mode, brings up the kernel heap and the
-physical frame allocator, and stops there — no userspace, no interrupts, no
-scheduler, no MMU management beyond the identity map `boot.s` builds.
+physical frame allocator, and can map/unmap 4 KiB pages — then stops. No
+userspace, no interrupts, no scheduler, no IDT.
+
+Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1**.
 
 **Status: C** (active risk, expect surprises). This is a spike, not a port.
 
@@ -23,6 +25,8 @@ Akuma/amd64 — long mode reached
   pmm:  126354 free frames (493 MiB)
   test: heap vec[4096] sum=22898104320
   test: pmm alloc 8 frames, free 126354 -> 126346 -> 126354   [OK]
+  test: paging map/write/verify/unmap @0x0000000040000000   [OK]
+  test: W^X encoding   [OK]
 
 Akuma/amd64 — memory subsystem up
 ```
@@ -64,28 +68,48 @@ exposes, and it is `serial.rs`'s only target. There is no VGA path.
 
 ## Running under Firecracker
 
+**Verified 2026-09-03** on Firecracker v1.16.1, AMD Ryzen 7 8845HS (Zen 4),
+Pop!_OS 22.04, native KVM.
+
+```bash
+FC_HOST=user@host amd64/run-firecracker.sh
+# MEMORY=1024 VCPUS=1 FC_KEY=~/.ssh/id_ed25519 TIMEOUT=20 also honoured
+```
+
 Not reproducible on an Apple Silicon host: Firecracker needs KVM, and the guest
-ISA here is not the host's. It needs an x86_64 Linux box with `/dev/kvm`
-(`c5.metal`, `m5.metal`, or any bare-metal/nested-virt x86 host).
+ISA is not the host's. It needs an x86_64 Linux box with `/dev/kvm`. The setup on
+that box is one static binary and no `sudo` — no Lima, no KVM configuration:
+
+```bash
+VER=$(curl -sI https://github.com/firecracker-microvm/firecracker/releases/latest \
+      | grep -i '^location:' | sed 's|.*/tag/||' | tr -d '\r\n')
+curl -L -o /tmp/fc.tgz \
+  "https://github.com/firecracker-microvm/firecracker/releases/download/${VER}/firecracker-${VER}-x86_64.tgz"
+tar -xzf /tmp/fc.tgz -C /tmp && mkdir -p ~/bin
+install -m755 "/tmp/release-${VER}-x86_64/firecracker-${VER}-x86_64" ~/bin/firecracker
+```
 
 The kernel is a plain ELF64 — `linux-loader` requires ELFCLASS64, so unlike the
 aarch64 target there is **no objcopy step and no flat binary**. Point
-`boot_source.kernel_image_path` straight at
-`target/x86_64-unknown-none/release/akuma-amd64`.
+`boot_source.kernel_image_path` straight at the linked artifact.
 
 ```json
 {
-  "boot-source": {
-    "kernel_image_path": "akuma-amd64",
-    "boot_args": ""
-  },
+  "boot-source": { "kernel_image_path": "akuma-amd64", "boot_args": "" },
+  "drives": [],
+  "network-interfaces": [],
   "machine-config": { "vcpu_count": 1, "mem_size_mib": 512 }
 }
 ```
 
-No `drives` and no `network-interfaces`: nothing in this kernel reads a disk or a
-NIC yet. Console output arrives on Firecracker's serial, which it writes to its
-own stdout.
+**`drives` and `network-interfaces` are mandatory here even though they are
+empty.** The single-JSON path does not default them — omit either and Firecracker
+exits with `missing field 'drives'`. The API path has different rules. Nothing in
+this kernel reads a disk or a NIC yet, so both stay `[]`.
+
+Console output arrives on Firecracker's serial, which it writes to its own
+stdout. The kernel halts rather than exiting, so Firecracker never returns on its
+own — run it under `timeout`.
 
 ## What is deliberately missing
 

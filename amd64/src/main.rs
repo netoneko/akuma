@@ -45,6 +45,8 @@ mod hvm;
 #[cfg(target_arch = "x86_64")]
 mod mem;
 #[cfg(target_arch = "x86_64")]
+mod paging;
+#[cfg(target_arch = "x86_64")]
 mod serial;
 
 #[cfg(target_arch = "x86_64")]
@@ -134,6 +136,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 
     if mem::init(&info) {
         mem::smoke_test();
+        paging::smoke_test();
         serial::puts("\nAkuma/amd64 — memory subsystem up\n");
     } else {
         serial::puts("\nAkuma/amd64 — memory bring-up FAILED\n");
