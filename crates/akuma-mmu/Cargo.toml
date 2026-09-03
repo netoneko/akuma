@@ -20,6 +20,12 @@ workspace = true
 # `docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.5.
 debug-info = []
 
+# Temporary address-space lifecycle accounting used to root-cause the self-host
+# kernel heap leak, and the regression gate for it. OFF by default: the counters
+# sit on the page-fault `user_frames` path.
+# See docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md.
+leak-instr = []
+
 # Real (shared-kernel) SMP, forwarded from the bin crate. Only reaches
 # `akuma-bkl`, whose `current_core_id` this crate uses for the TTBR free gate.
 smp-shared = ["akuma-bkl/smp-shared", "akuma-primitives/smp-shared"]

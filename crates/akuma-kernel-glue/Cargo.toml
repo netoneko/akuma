@@ -36,6 +36,7 @@ log = { version = "0.4", default-features = false }
 spinning_top = "0.3"
 
 [features]
+leak-instr = ["akuma-alloc/leak-instr", "akuma-exec/leak-instr"]
 # Mirrors the root package's own toggles of the same name — see
 # `akuma-kernel-core/Cargo.toml` for why each needs its own copy here rather
 # than relying on root's build.rs (build scripts are per-package).

@@ -983,141 +983,223 @@ pub fn l0_recently_freed(l0_base: u64) -> bool {
             .any(|s| s.load(Ordering::SeqCst) == l0_base)
 }
 
-/// ── Temporary address-space lifecycle accounting (heap-leak hunt) ──
-///
-/// `user_frames` (`BTreeMap<usize, u32>`) is where the self-host heap leak
-/// lives — its 144-byte leaf and 240-byte internal nodes are the leaked class
-/// (`docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md`). These say whether the maps
-/// are stranded because address spaces are not dropped, or because entries are
-/// never removed from maps that are.
-static AS_NEW: AtomicUsize = AtomicUsize::new(0);
-static AS_NEW_SHARED: AtomicUsize = AtomicUsize::new(0);
-static AS_DROP: AtomicUsize = AtomicUsize::new(0);
-static AS_DROP_SHARED: AtomicUsize = AtomicUsize::new(0);
-/// Entries currently held by a `user_frames` map that still exists: +1 per new
-/// key, -1 per key removed, -len when a map is freed or dropped.
-static UF_LIVE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
-/// Components of that residual, so a short term names the escape route.
-static UF_INSERTS: AtomicUsize = AtomicUsize::new(0);
-static UF_REMOVE_ONE: AtomicUsize = AtomicUsize::new(0);
-static UF_FREED_NOW: AtomicUsize = AtomicUsize::new(0);
-static UF_DROP_REMAINDER: AtomicUsize = AtomicUsize::new(0);
-static UF_SILENT: AtomicUsize = AtomicUsize::new(0);
-/// Drop-completion bracket. This kernel does not unwind — a killed or abandoned
-/// teardown thread skips destructors — so a `Drop` that is entered and never
-/// left leaks the `user_frames` map it is holding in a local, with every other
-/// counter reading clean. Enter is `AS_DROP + AS_DROP_SHARED`.
-static AS_DROP_EXIT: AtomicUsize = AtomicUsize::new(0);
-/// The same bracket around the inner window: `free_as_frames_now` subtracts the
-/// map's length on entry and then frees pages one at a time.
-static FREE_NOW_ENTER: AtomicUsize = AtomicUsize::new(0);
-static FREE_NOW_EXIT: AtomicUsize = AtomicUsize::new(0);
+/// Temporary address-space lifecycle accounting, behind `leak-instr` (off by
+/// default). Root-caused the self-host heap leak; kept because
+/// `free_now_enter == free_now_exit` and `[ASSTUCK] in_flight=0` are the
+/// regression gate for it (`docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md`).
+#[cfg(feature = "leak-instr")]
+#[allow(clippy::pub_underscore_fields, clippy::redundant_pub_crate)]
+mod instr {
+    use super::*;
 
-/// In-flight `Drop` ledger: who entered and has not left.
-///
-/// The bracket counters say *how many* teardowns went missing; this says
-/// *which*. A slot is claimed on `Drop` entry and released on exit, so anything
-/// still occupied at dump time is a teardown that was abandoned mid-flight,
-/// named by the address space it was tearing down and the thread doing it.
-/// Fixed-size and lock-free — this runs on the teardown path.
-const DROP_SLOTS: usize = 512;
-/// Occupancy + owner: 0 = free, otherwise `tid + 1`.
-static DROP_TID: [AtomicUsize; DROP_SLOTS] = [const { AtomicUsize::new(0) }; DROP_SLOTS];
-static DROP_L0: [AtomicUsize; DROP_SLOTS] = [const { AtomicUsize::new(0) }; DROP_SLOTS];
-static DROP_ASID: [AtomicUsize; DROP_SLOTS] = [const { AtomicUsize::new(0) }; DROP_SLOTS];
-static DROP_UF_LEN: [AtomicUsize; DROP_SLOTS] = [const { AtomicUsize::new(0) }; DROP_SLOTS];
-/// What the slot is bracketing: 0 = `UserAddressSpace::drop`, 1 =
-/// `free_as_frames_now` reached from a drop, 2 = reached from a pending drain.
-static DROP_KIND: [AtomicUsize; DROP_SLOTS] = [const { AtomicUsize::new(0) }; DROP_SLOTS];
-/// Drops that found every slot occupied — i.e. already-stuck entries crowding
-/// the ledger out. Non-zero means the ledger is saturated, not that nothing leaked.
-static DROP_LEDGER_OVERFLOW: AtomicUsize = AtomicUsize::new(0);
+    /// ── Temporary address-space lifecycle accounting (heap-leak hunt) ──
+    ///
+    /// `user_frames` (`BTreeMap<usize, u32>`) is where the self-host heap leak
+    /// lives — its 144-byte leaf and 240-byte internal nodes are the leaked class
+    /// (`docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md`). These say whether the maps
+    /// are stranded because address spaces are not dropped, or because entries are
+    /// never removed from maps that are.
+    pub(super) static AS_NEW: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static AS_NEW_SHARED: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static AS_DROP: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static AS_DROP_SHARED: AtomicUsize = AtomicUsize::new(0);
+    /// Entries currently held by a `user_frames` map that still exists: +1 per new
+    /// key, -1 per key removed, -len when a map is freed or dropped.
+    pub(super) static UF_LIVE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    /// Components of that residual, so a short term names the escape route.
+    pub(super) static UF_INSERTS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static UF_REMOVE_ONE: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static UF_FREED_NOW: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static UF_DROP_REMAINDER: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static UF_SILENT: AtomicUsize = AtomicUsize::new(0);
+    /// Drop-completion bracket. This kernel does not unwind — a killed or abandoned
+    /// teardown thread skips destructors — so a `Drop` that is entered and never
+    /// left leaks the `user_frames` map it is holding in a local, with every other
+    /// counter reading clean. Enter is `AS_DROP + AS_DROP_SHARED`.
+    pub(super) static AS_DROP_EXIT: AtomicUsize = AtomicUsize::new(0);
+    /// The same bracket around the inner window: `free_as_frames_now` subtracts the
+    /// map's length on entry and then frees pages one at a time.
+    pub(super) static FREE_NOW_ENTER: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static FREE_NOW_EXIT: AtomicUsize = AtomicUsize::new(0);
 
-/// Claim a ledger slot for this teardown. `None` when the ledger is full.
-fn drop_ledger_enter(l0: usize, asid: u16, uf_len: usize, kind: usize) -> Option<usize> {
-    let tid = akuma_primitives::preempt::current_tid() + 1;
-    for i in 0..DROP_SLOTS {
-        if DROP_TID[i]
-            .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            DROP_L0[i].store(l0, Ordering::Relaxed);
-            DROP_ASID[i].store(asid as usize, Ordering::Relaxed);
-            DROP_UF_LEN[i].store(uf_len, Ordering::Relaxed);
-            DROP_KIND[i].store(kind, Ordering::Relaxed);
-            return Some(i);
+    /// In-flight `Drop` ledger: who entered and has not left.
+    ///
+    /// The bracket counters say *how many* teardowns went missing; this says
+    /// *which*. A slot is claimed on `Drop` entry and released on exit, so anything
+    /// still occupied at dump time is a teardown that was abandoned mid-flight,
+    /// named by the address space it was tearing down and the thread doing it.
+    /// Fixed-size and lock-free — this runs on the teardown path.
+    pub(super) const DROP_SLOTS: usize = 512;
+    /// Occupancy + owner: 0 = free, otherwise `tid + 1`.
+    pub(super) static DROP_TID: [AtomicUsize; DROP_SLOTS] = [const { AtomicUsize::new(0) }; DROP_SLOTS];
+    pub(super) static DROP_L0: [AtomicUsize; DROP_SLOTS] = [const { AtomicUsize::new(0) }; DROP_SLOTS];
+    pub(super) static DROP_ASID: [AtomicUsize; DROP_SLOTS] = [const { AtomicUsize::new(0) }; DROP_SLOTS];
+    pub(super) static DROP_UF_LEN: [AtomicUsize; DROP_SLOTS] = [const { AtomicUsize::new(0) }; DROP_SLOTS];
+    /// What the slot is bracketing: 0 = `UserAddressSpace::drop`, 1 =
+    /// `free_as_frames_now` reached from a drop, 2 = reached from a pending drain.
+    pub(super) static DROP_KIND: [AtomicUsize; DROP_SLOTS] = [const { AtomicUsize::new(0) }; DROP_SLOTS];
+    /// Drops that found every slot occupied — i.e. already-stuck entries crowding
+    /// the ledger out. Non-zero means the ledger is saturated, not that nothing leaked.
+    pub(super) static DROP_LEDGER_OVERFLOW: AtomicUsize = AtomicUsize::new(0);
+
+    /// Claim a ledger slot for this teardown. `None` when the ledger is full.
+    pub(super) fn drop_ledger_enter(l0: usize, asid: u16, uf_len: usize, kind: usize) -> Option<usize> {
+        let tid = akuma_primitives::preempt::current_tid() + 1;
+        for i in 0..DROP_SLOTS {
+            if DROP_TID[i]
+                .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                DROP_L0[i].store(l0, Ordering::Relaxed);
+                DROP_ASID[i].store(asid as usize, Ordering::Relaxed);
+                DROP_UF_LEN[i].store(uf_len, Ordering::Relaxed);
+                DROP_KIND[i].store(kind, Ordering::Relaxed);
+                return Some(i);
+            }
+        }
+        DROP_LEDGER_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    pub(super) fn drop_ledger_exit(slot: Option<usize>) {
+        if let Some(i) = slot {
+            DROP_TID[i].store(0, Ordering::Relaxed);
         }
     }
-    DROP_LEDGER_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-    None
-}
 
-fn drop_ledger_exit(slot: Option<usize>) {
-    if let Some(i) = slot {
-        DROP_TID[i].store(0, Ordering::Relaxed);
+    /// Print every teardown still in flight, and the total `user_frames` entries
+    /// they are holding. At idle that total should be 0.
+    pub fn dump_stuck_drops() {
+        let mut stuck = 0usize;
+        let mut held = 0usize;
+        for i in 0..DROP_SLOTS {
+            let tid = DROP_TID[i].load(Ordering::Relaxed);
+            if tid == 0 {
+                continue;
+            }
+            stuck += 1;
+            let uf = DROP_UF_LEN[i].load(Ordering::Relaxed);
+            held += uf;
+            let kind = match DROP_KIND[i].load(Ordering::Relaxed) {
+                0 => "as_drop",
+                1 => "free_now/from_drop",
+                _ => "free_now/from_drain",
+            };
+            if stuck <= 12 {
+                akuma_primitives::safe_print!(160,
+                    "[ASSTUCK] slot={} kind={} tid={} l0=0x{:x} asid=0x{:x} uf_entries={}\n",
+                    i, kind, tid - 1, DROP_L0[i].load(Ordering::Relaxed),
+                    DROP_ASID[i].load(Ordering::Relaxed), uf);
+            }
+        }
+        akuma_primitives::safe_print!(128,
+            "[ASSTUCK] in_flight={} holding_uf_entries={} ledger_overflow={}\n",
+            stuck, held, DROP_LEDGER_OVERFLOW.load(Ordering::Relaxed));
+    }
+
+    /// (drop exits, free_as_frames_now entries, free_as_frames_now exits).
+    pub fn as_drop_bracket_stats() -> (usize, usize, usize) {
+        (
+            AS_DROP_EXIT.load(Ordering::Relaxed),
+            FREE_NOW_ENTER.load(Ordering::Relaxed),
+            FREE_NOW_EXIT.load(Ordering::Relaxed),
+        )
+    }
+
+    /// (inserts, removals, freed at teardown, dropped with the struct, silently dropped).
+    pub fn uf_flow_stats() -> (usize, usize, usize, usize, usize) {
+        (
+            UF_INSERTS.load(Ordering::Relaxed),
+            UF_REMOVE_ONE.load(Ordering::Relaxed),
+            UF_FREED_NOW.load(Ordering::Relaxed),
+            UF_DROP_REMAINDER.load(Ordering::Relaxed),
+            UF_SILENT.load(Ordering::Relaxed),
+        )
+    }
+
+    /// (new, new_shared, dropped, dropped_shared, live user_frames entries).
+    pub fn as_lifecycle_stats() -> (usize, usize, usize, usize, usize) {
+        (
+            AS_NEW.load(Ordering::Relaxed),
+            AS_NEW_SHARED.load(Ordering::Relaxed),
+            AS_DROP.load(Ordering::Relaxed),
+            AS_DROP_SHARED.load(Ordering::Relaxed),
+            UF_LIVE_ENTRIES.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Ledger handle: a slot index while instrumented.
+    pub(super) type Ledger = Option<usize>;
+
+    pub(super) fn as_new() { AS_NEW.fetch_add(1, Ordering::Relaxed); }
+    pub(super) fn as_new_shared() { AS_NEW_SHARED.fetch_add(1, Ordering::Relaxed); }
+    pub(super) fn as_drop_enter(shared: bool, l0: usize, asid: u16, uf_len: usize) -> Ledger {
+        if shared { AS_DROP_SHARED.fetch_add(1, Ordering::Relaxed); }
+        else { AS_DROP.fetch_add(1, Ordering::Relaxed); }
+        drop_ledger_enter(l0, asid, uf_len, 0)
+    }
+    pub(super) fn as_drop_exit(l: Ledger) {
+        AS_DROP_EXIT.fetch_add(1, Ordering::Relaxed);
+        drop_ledger_exit(l);
+    }
+    pub(super) fn free_now_enter(l0: usize, uf_len: usize, kind: usize) -> Ledger {
+        FREE_NOW_ENTER.fetch_add(1, Ordering::Relaxed);
+        UF_LIVE_ENTRIES.fetch_sub(uf_len, Ordering::Relaxed);
+        UF_FREED_NOW.fetch_add(uf_len, Ordering::Relaxed);
+        drop_ledger_enter(l0, 0, uf_len, kind)
+    }
+    pub(super) fn free_now_exit(l: Ledger) {
+        FREE_NOW_EXIT.fetch_add(1, Ordering::Relaxed);
+        drop_ledger_exit(l);
+    }
+    pub(super) fn uf_insert() {
+        UF_LIVE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        UF_INSERTS.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(super) fn uf_removed() {
+        UF_LIVE_ENTRIES.fetch_sub(1, Ordering::Relaxed);
+        UF_REMOVE_ONE.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(super) fn uf_drop_remainder(n: usize) {
+        if n > 0 {
+            UF_LIVE_ENTRIES.fetch_sub(n, Ordering::Relaxed);
+            UF_DROP_REMAINDER.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+    pub(super) fn uf_silent(n: usize) {
+        UF_LIVE_ENTRIES.fetch_sub(n, Ordering::Relaxed);
+        UF_SILENT.fetch_add(n, Ordering::Relaxed);
     }
 }
 
-/// Print every teardown still in flight, and the total `user_frames` entries
-/// they are holding. At idle that total should be 0.
-pub fn dump_stuck_drops() {
-    let mut stuck = 0usize;
-    let mut held = 0usize;
-    for i in 0..DROP_SLOTS {
-        let tid = DROP_TID[i].load(Ordering::Relaxed);
-        if tid == 0 {
-            continue;
-        }
-        stuck += 1;
-        let uf = DROP_UF_LEN[i].load(Ordering::Relaxed);
-        held += uf;
-        let kind = match DROP_KIND[i].load(Ordering::Relaxed) {
-            0 => "as_drop",
-            1 => "free_now/from_drop",
-            _ => "free_now/from_drain",
-        };
-        if stuck <= 12 {
-            akuma_primitives::safe_print!(160,
-                "[ASSTUCK] slot={} kind={} tid={} l0=0x{:x} asid=0x{:x} uf_entries={}\n",
-                i, kind, tid - 1, DROP_L0[i].load(Ordering::Relaxed),
-                DROP_ASID[i].load(Ordering::Relaxed), uf);
-        }
-    }
-    akuma_primitives::safe_print!(128,
-        "[ASSTUCK] in_flight={} holding_uf_entries={} ledger_overflow={}\n",
-        stuck, held, DROP_LEDGER_OVERFLOW.load(Ordering::Relaxed));
+/// `leak-instr` off: every hook compiles to nothing.
+#[cfg(not(feature = "leak-instr"))]
+#[allow(clippy::let_unit_value)]
+mod instr {
+    pub(super) type Ledger = ();
+    #[inline(always)] pub(super) fn as_new() {}
+    #[inline(always)] pub(super) fn as_new_shared() {}
+    #[inline(always)] pub(super) fn as_drop_enter(_s: bool, _l0: usize, _a: u16, _n: usize) -> Ledger {}
+    #[inline(always)] pub(super) fn as_drop_exit(_l: Ledger) {}
+    #[inline(always)] pub(super) fn free_now_enter(_l0: usize, _n: usize, _k: usize) -> Ledger {}
+    #[inline(always)] pub(super) fn free_now_exit(_l: Ledger) {}
+    #[inline(always)] pub(super) fn uf_insert() {}
+    #[inline(always)] pub(super) fn uf_removed() {}
+    #[inline(always)] pub(super) fn uf_drop_remainder(_n: usize) {}
+    #[inline(always)] pub(super) fn uf_silent(_n: usize) {}
 }
 
-/// (drop exits, free_as_frames_now entries, free_as_frames_now exits).
-pub fn as_drop_bracket_stats() -> (usize, usize, usize) {
-    (
-        AS_DROP_EXIT.load(Ordering::Relaxed),
-        FREE_NOW_ENTER.load(Ordering::Relaxed),
-        FREE_NOW_EXIT.load(Ordering::Relaxed),
-    )
-}
-
-/// (inserts, removals, freed at teardown, dropped with the struct, silently dropped).
-pub fn uf_flow_stats() -> (usize, usize, usize, usize, usize) {
-    (
-        UF_INSERTS.load(Ordering::Relaxed),
-        UF_REMOVE_ONE.load(Ordering::Relaxed),
-        UF_FREED_NOW.load(Ordering::Relaxed),
-        UF_DROP_REMAINDER.load(Ordering::Relaxed),
-        UF_SILENT.load(Ordering::Relaxed),
-    )
-}
-
-/// (new, new_shared, dropped, dropped_shared, live user_frames entries).
-pub fn as_lifecycle_stats() -> (usize, usize, usize, usize, usize) {
-    (
-        AS_NEW.load(Ordering::Relaxed),
-        AS_NEW_SHARED.load(Ordering::Relaxed),
-        AS_DROP.load(Ordering::Relaxed),
-        AS_DROP_SHARED.load(Ordering::Relaxed),
-        UF_LIVE_ENTRIES.load(Ordering::Relaxed),
-    )
-}
+/// Instrumentation accessors. Zeros / no-ops unless `leak-instr` is enabled.
+#[cfg(not(feature = "leak-instr"))]
+pub fn as_lifecycle_stats() -> (usize, usize, usize, usize, usize) { (0, 0, 0, 0, 0) }
+#[cfg(not(feature = "leak-instr"))]
+pub fn uf_flow_stats() -> (usize, usize, usize, usize, usize) { (0, 0, 0, 0, 0) }
+#[cfg(not(feature = "leak-instr"))]
+pub fn as_drop_bracket_stats() -> (usize, usize, usize) { (0, 0, 0) }
+#[cfg(not(feature = "leak-instr"))]
+pub fn dump_stuck_drops() {}
+#[cfg(feature = "leak-instr")]
+pub use instr::{as_drop_bracket_stats, as_lifecycle_stats, dump_stuck_drops, uf_flow_stats};
 
 /// Frames of a torn-down address space whose free was deferred because some
 /// core's TTBR0 was still resident on the L0 (see module comment above).
@@ -1198,10 +1280,8 @@ fn free_or_defer_as_frames(
 
 /// Unconditional frame release — only reachable through the liveness gate.
 fn free_as_frames_now(l0_frame: PhysFrame, user_frames: &BTreeMap<usize, u32>, pt_frames: &[PhysFrame], kind: usize) {
-    FREE_NOW_ENTER.fetch_add(1, Ordering::Relaxed);
-    let _ledger = drop_ledger_enter(l0_frame.addr, 0, user_frames.len(), kind);
-    UF_LIVE_ENTRIES.fetch_sub(user_frames.len(), Ordering::Relaxed);
-    UF_FREED_NOW.fetch_add(user_frames.len(), Ordering::Relaxed);
+    #[allow(clippy::let_unit_value)]
+    let _ledger = instr::free_now_enter(l0_frame.addr, user_frames.len(), kind);
     note_freed_l0(l0_frame.addr as u64 & L0_BASE_MASK);
     let tid = akuma_primitives::preempt::current_tid() as u32;
     {
@@ -1217,8 +1297,7 @@ fn free_as_frames_now(l0_frame: PhysFrame, user_frames: &BTreeMap<usize, u32>, p
         for frame in pt_frames { akuma_pmm::free_page_at(frame.addr, tid, akuma_pmm::FreeSite::AsTeardown); }
     }
     akuma_pmm::free_page_at(l0_frame.addr, tid, akuma_pmm::FreeSite::AsTeardown);
-    FREE_NOW_EXIT.fetch_add(1, Ordering::Relaxed);
-    drop_ledger_exit(_ledger);
+    instr::free_now_exit(_ledger);
 }
 
 /// Re-check parked address-space frames and free the ones whose L0 no core
@@ -1302,8 +1381,7 @@ struct SharedL0Entry {
 impl Drop for SharedL0Entry {
     fn drop(&mut self) {
         if let Some(uf) = &self.deferred_user_frames {
-            UF_LIVE_ENTRIES.fetch_sub(uf.len(), Ordering::Relaxed);
-            UF_SILENT.fetch_add(uf.len(), Ordering::Relaxed);
+            instr::uf_silent(uf.len());
         }
     }
 }
@@ -1506,7 +1584,7 @@ impl UserAddressSpace {
             shared: false,
         };
         addr_space.add_kernel_mappings().ok()?;
-        AS_NEW.fetch_add(1, Ordering::Relaxed);
+        instr::as_new();
         Some(addr_space)
     }
 
@@ -1536,7 +1614,7 @@ impl UserAddressSpace {
                     deferred_l0: None,
                 });
         });
-        AS_NEW_SHARED.fetch_add(1, Ordering::Relaxed);
+        instr::as_new_shared();
         Some(Self {
             l0_frame: PhysFrame { addr: parent_l0_phys },
             page_table_frames: Spinlock::new(Vec::new()),
@@ -1801,7 +1879,7 @@ impl UserAddressSpace {
         {
             let _irq = IrqGuard::new();
             *self.user_frames.lock().entry(frame.addr)
-                .or_insert_with(|| { UF_LIVE_ENTRIES.fetch_add(1, Ordering::Relaxed); UF_INSERTS.fetch_add(1, Ordering::Relaxed); 0 }) += 1;
+                .or_insert_with(|| { instr::uf_insert(); 0 }) += 1;
         }
         self.map_page(va, frame.addr, user_flags)
     }
@@ -1865,7 +1943,7 @@ impl UserAddressSpace {
     pub fn track_user_frame(&self, frame: PhysFrame) {
         let _irq = IrqGuard::new();
         *self.user_frames.lock().entry(frame.addr)
-            .or_insert_with(|| { UF_LIVE_ENTRIES.fetch_add(1, Ordering::Relaxed); UF_INSERTS.fetch_add(1, Ordering::Relaxed); 0 }) += 1;
+            .or_insert_with(|| { instr::uf_insert(); 0 }) += 1;
     }
 
     /// Adopt `frame` as a mapping of this address space, maintaining **both** the
@@ -1894,7 +1972,7 @@ impl UserAddressSpace {
         let _irq = IrqGuard::new();
         let mut uf = self.user_frames.lock();
         let first_va_here = !uf.contains_key(&frame.addr);
-        if first_va_here { UF_LIVE_ENTRIES.fetch_add(1, Ordering::Relaxed); UF_INSERTS.fetch_add(1, Ordering::Relaxed); }
+        if first_va_here { instr::uf_insert(); }
         *uf.entry(frame.addr).or_insert(0) += 1;
         match (caller_holds_ref, first_va_here) {
             // Caller's reference becomes this address space's one reference.
@@ -2088,8 +2166,7 @@ impl UserAddressSpace {
             *count -= 1;
             if *count == 0 {
                 frames.remove(&frame.addr);
-                UF_LIVE_ENTRIES.fetch_sub(1, Ordering::Relaxed);
-                UF_REMOVE_ONE.fetch_add(1, Ordering::Relaxed);
+                instr::uf_removed();
                 return true; // last reference dropped — caller owns the free
             }
             return false; // still mapped at another VA — must not free yet
@@ -2356,13 +2433,12 @@ impl UserAddressSpace {
 
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
-        if self.shared { AS_DROP_SHARED.fetch_add(1, Ordering::Relaxed); }
-        else { AS_DROP.fetch_add(1, Ordering::Relaxed); }
-        let _ledger = drop_ledger_enter(
+        #[allow(clippy::let_unit_value)]
+        let _ledger = instr::as_drop_enter(
+            self.shared,
             self.l0_frame.addr,
             self.asid,
             { let _irq = IrqGuard::new(); self.user_frames.lock().len() },
-            0,
         );
         // Opportunistic retry of earlier TTBR-deferred frees: address spaces die
         // constantly under load, so this keeps the parked list near-empty without
@@ -2398,7 +2474,7 @@ impl Drop for UserAddressSpace {
                 });
                 // Temporary: no entry to park in, so the map died inside the
                 // closure above. Stop counting its entries as live.
-                if !stored { UF_LIVE_ENTRIES.fetch_sub(n_uf, Ordering::Relaxed); UF_SILENT.fetch_add(n_uf, Ordering::Relaxed); }
+                if !stored { instr::uf_silent(n_uf); }
             } else {
                 // No shared views (or all already dropped) — release now, THROUGH
                 // the per-core TTBR liveness gate: a peer core whose TTBR0_EL1 is
@@ -2448,7 +2524,7 @@ impl Drop for UserAddressSpace {
         // with the struct here; stop counting its entries as live. Temporary.
         {
             let n = { let _irq = IrqGuard::new(); self.user_frames.lock().len() };
-            if n > 0 { UF_LIVE_ENTRIES.fetch_sub(n, Ordering::Relaxed); UF_DROP_REMAINDER.fetch_add(n, Ordering::Relaxed); }
+            instr::uf_drop_remainder(n);
         }
         // ORDER IS LOAD-BEARING: flush BEFORE returning the ASID to the allocator.
         //
@@ -2467,8 +2543,7 @@ impl Drop for UserAddressSpace {
         // covered too.
         flush_tlb_asid(self.asid);
         with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
-        AS_DROP_EXIT.fetch_add(1, Ordering::Relaxed);
-        drop_ledger_exit(_ledger);
+        instr::as_drop_exit(_ledger);
     }
 }
 

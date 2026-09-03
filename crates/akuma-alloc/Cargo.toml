@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "The kernel heap: Talc plus the on-demand PMM growth/backoff/reclaim policy around it. Quarantines the allocator's unsafe away from the bin crate."
 
+[features]
+# Temporary leak-attribution instrumentation: live-bytes histogram by size class,
+# exact-size and per-syscall/per-pid tables, and the frame-pointer call-chain
+# attribution. OFF by default — `livehist_add`/`pc_track_alloc` sit on every
+# allocation, and the chain capture walks x29 (which also wants
+# `-C force-frame-pointers=yes`). See docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md.
+leak-instr = []
+
 [dependencies]
 talc = "4"
 spinning_top = "0.3"

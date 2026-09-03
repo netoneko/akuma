@@ -1847,45 +1847,47 @@ fn run_async_main() -> ! {
                     crate::pmm::free_count(), crate::pmm::total_count(),
                     crate::allocator::stats().heap_size / 1024 / 1024);
             }
-            // Live-bytes histogram by size class, same 30s cadence — leak
-            // attribution for the self-host heap hunt (temporary).
-            akuma_alloc::dump_live_histogram();
-            akuma_alloc::dump_pc_attribution();
-            // Parked deferred-free state: a compile that leaks 144-B objects
-            // parks its user_frames BTreeMap nodes here if a shared view
-            // strands (one node per resident user page). Temporary.
-            let (l0e, l0u, l0pt) = akuma_exec::mmu::shared_l0_stats();
-            akuma_primitives::safe_print!(128,
-                "[L0PARK] entries={} deferred_user_pages={} deferred_pt_frames={}\n",
-                l0e, l0u, l0pt);
-            // The OTHER park list: address spaces whose frames could not be freed
-            // at drop because a core's TTBR0 — or a thread's SAVED ctx.ttbr0 —
-            // still named the dying L0. Each entry holds a whole `user_frames`
-            // BTreeMap. Nothing has ever printed this one. Temporary.
-            let (an, ans, ad, ads, ufl) = akuma_exec::mmu::as_lifecycle_stats();
-            akuma_primitives::safe_print!(160,
-                "[ASLIFE] new={} new_shared={} drop={} drop_shared={} live_uf_entries={}\n",
-                an, ans, ad, ads, ufl);
-            // Which live address space is holding the stranded `user_frames`
-            // entries. Temporary, with the counters below.
-            akuma_exec::process::table::for_each_process(|p| {
-                let n = p.address_space.resident_pages();
-                if n > 5000 {
-                    akuma_primitives::safe_print!(96, "[UFBIG] pid={} uf_entries={}\n", p.pid, n);
-                }
-            });
-            akuma_exec::mmu::dump_stuck_drops();
-            let (dex, fne, fnx) = akuma_exec::mmu::as_drop_bracket_stats();
-            akuma_primitives::safe_print!(160,
-                "[ASDROP] drop_exit={} free_now_enter={} free_now_exit={}\n", dex, fne, fnx);
-            let (ins, rem, fnow, drem, sil) = akuma_exec::mmu::uf_flow_stats();
-            akuma_primitives::safe_print!(192,
-                "[UFFLOW] inserts={} removed={} freed_at_teardown={} dropped_with_struct={} silent={}\n",
-                ins, rem, fnow, drem, sil);
-            let (pe, puf, ppt) = akuma_exec::mmu::pending_ttbr_free_stats();
-            akuma_primitives::safe_print!(128,
-                "[ASPARK] pending={} parked_user_frames={} parked_pt_frames={}\n",
-                pe, puf, ppt);
+            #[cfg(feature = "leak-instr")]
+            {
+                // Live-bytes histogram by size class, same 30s cadence — leak
+                // attribution for the self-host heap hunt (temporary).
+                akuma_alloc::dump_live_histogram();
+                akuma_alloc::dump_pc_attribution();
+                // Parked deferred-free state: a compile that leaks 144-B objects
+                // parks its user_frames BTreeMap nodes here if a shared view
+                // strands (one node per resident user page). Temporary.
+                let (l0e, l0u, l0pt) = akuma_exec::mmu::shared_l0_stats();
+                akuma_primitives::safe_print!(128,
+                    "[L0PARK] entries={} deferred_user_pages={} deferred_pt_frames={}\n",
+                    l0e, l0u, l0pt);
+                // The OTHER park list: address spaces whose frames could not be freed
+                // at drop because a core's TTBR0 — or a thread's SAVED ctx.ttbr0 —
+                // still named the dying L0. Each entry holds a whole `user_frames`
+                // BTreeMap. Nothing has ever printed this one. Temporary.
+                let (an, ans, ad, ads, ufl) = akuma_exec::mmu::as_lifecycle_stats();
+                akuma_primitives::safe_print!(160,
+                    "[ASLIFE] new={} new_shared={} drop={} drop_shared={} live_uf_entries={}\n",
+                    an, ans, ad, ads, ufl);
+                // Which live address space is holding the stranded `user_frames`
+                // entries. Temporary, with the counters below.
+                akuma_exec::process::table::for_each_process(|p| {
+                    let n = p.address_space.resident_pages();
+                    if n > 5000 {
+                        akuma_primitives::safe_print!(96, "[UFBIG] pid={} uf_entries={}\n", p.pid, n);
+                    }
+                });
+                akuma_exec::mmu::dump_stuck_drops();
+                let (dex, fne, fnx) = akuma_exec::mmu::as_drop_bracket_stats();
+                akuma_primitives::safe_print!(160,
+                    "[ASDROP] drop_exit={} free_now_enter={} free_now_exit={}\n", dex, fne, fnx);
+                let (ins, rem, fnow, drem, sil) = akuma_exec::mmu::uf_flow_stats();
+                akuma_primitives::safe_print!(192,
+                    "[UFFLOW] inserts={} removed={} freed_at_teardown={} dropped_with_struct={} silent={}\n",
+                    ins, rem, fnow, drem, sil);
+                let (pe, puf, ppt) = akuma_exec::mmu::pending_ttbr_free_stats();
+                akuma_primitives::safe_print!(128,
+                    "[ASPARK] pending={} parked_user_frames={} parked_pt_frames={}\n",
+                    pe, puf, ppt);            }
             // Shared read-only file pages, same cadence. `hits` is the number of
             // private frame allocations + `read_at` sweeps this cache avoided, which
             // is the direct measure of the `-j4` amplification it exists to remove.

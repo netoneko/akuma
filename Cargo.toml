@@ -171,6 +171,12 @@ debug = true
 # `flat_when_untraced`), and `FastPath` membership must be constant within a
 # build. `config::SYSCALL_DEBUG_INFO_ENABLED` is derived from this feature, and
 # `src/syscall/mod.rs` const-asserts the two agree.
+# Temporary leak-attribution instrumentation across the allocator and the MMU.
+# OFF by default; build with `--features leak-instr` (and
+# `-C force-frame-pointers=yes` for the call-chain attribution) when chasing a
+# heap leak. docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md.
+leak-instr = ["akuma-kernel-glue/leak-instr"]
+
 syscall-debug-info = [
     "akuma-syscalls/debug-info",
     "akuma-syscalls-time/debug-info",

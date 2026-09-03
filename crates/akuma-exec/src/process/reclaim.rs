@@ -168,6 +168,25 @@ pub fn drain_retired() -> usize {
     if !pressure_reclaim_enabled() {
         return 0;
     }
+    // A TERMINATED thread can be reaped at any yield and will never resume, and
+    // this kernel does not unwind — so a sweep started here is abandoned where it
+    // stands, taking whatever it had already taken ownership of with it. Freeing
+    // one `Process` runs `UserAddressSpace::drop`, a multi-thousand-page loop; the
+    // measured residual after the pending-TTBR drain was gated the same way was
+    // ~1 abandoned drop per build, each stranding its `user_frames` map
+    // (`docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md`).
+    //
+    // Terminal sites keep *requesting* — `unregister_process` already called
+    // `request_retired_reclaim()`, and the flag stands until a collector runs. The
+    // OOM-kill-storm regime this site was added for
+    // (`docs/archive/OOM_KILL_DEFERRED_RECLAIM_GAP.md` §5 candidate 1) is still
+    // covered, and better: `drain_retired_under_pressure` runs on the *allocating*
+    // thread, which is non-terminal by construction, so the collector fires
+    // exactly when memory is short. An abandoned sweep returned nothing anyway.
+    if crate::threading::current_thread_is_terminated() {
+        request_retired_reclaim();
+        return 0;
+    }
     let tid = crate::threading::current_thread_id();
     let guarded = tid < MAX_THREADS;
     if guarded && DRAINING[tid].swap(true, Ordering::AcqRel) {

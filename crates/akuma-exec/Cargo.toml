@@ -7,6 +7,7 @@ edition = "2024"
 workspace = true
 
 [features]
+leak-instr = ["akuma-mmu/leak-instr"]
 # Mirrors the bin's `no-tests`: absence of it means `kernel_tests` is ON. The
 # `pmm` module's boot-suite forwarders are gated on that cfg, and without this
 # they compile out of a crate the bin then cannot find them in.
