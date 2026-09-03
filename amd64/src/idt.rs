@@ -229,11 +229,16 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: u64) {
 
 /// The LAPIC timer vector.
 ///
-/// Does no work beyond counting and acknowledging: a handler runs with `IF`
-/// clear (these are interrupt gates, not trap gates) and on the interrupted
-/// stack, so anything substantial belongs in code the tick *wakes*, not here.
+/// Counts, acknowledges, and may **switch tasks** — the switch happens here, on
+/// the interrupted task's own trap stack, which is what makes preemption
+/// preemption. Everything it does is bounded and allocation-free; a handler runs
+/// with `IF` clear (these are interrupt gates, not trap gates), so it cannot
+/// nest.
 extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
     crate::lapic::on_tick();
+    // Preemption. EOI has already been sent, so the LAPIC can deliver the next
+    // tick to whichever task runs after this returns.
+    crate::sched::preempt_if_needed();
 }
 
 /// Address of [`timer_interrupt`], for [`set_handler`].

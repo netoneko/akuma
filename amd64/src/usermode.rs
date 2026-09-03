@@ -358,7 +358,14 @@ pub fn init_syscall() {
 ///   jmp $                               ; a guard, not a fallthrough
 ///   <message bytes>
 /// ```
-fn build_user_program(out: &mut [u8], base_va: u64, msg: &[u8], rounds: u32, status: u32) -> usize {
+fn build_user_program(
+    out: &mut [u8],
+    base_va: u64,
+    msg: &[u8],
+    rounds: u32,
+    delay: u32,
+    status: u32,
+) -> usize {
     let mut n = 0;
     let mut emit = |bytes: &[u8], n: &mut usize| {
         out[*n..*n + bytes.len()].copy_from_slice(bytes);
@@ -386,8 +393,24 @@ fn build_user_program(out: &mut [u8], base_va: u64, msg: &[u8], rounds: u32, sta
     emit(&mov_imm(RDX, msg.len() as u32), &mut n);
     emit(&[0x0F, 0x05], &mut n); // syscall
 
-    emit(&mov_imm(RAX, Syscall::SchedYield.to_x86_64() as u32), &mut n);
-    emit(&[0x0F, 0x05], &mut n); // syscall
+    if delay == 0 {
+        // Cooperative: hand the CPU over explicitly.
+        emit(&mov_imm(RAX, Syscall::SchedYield.to_x86_64() as u32), &mut n);
+        emit(&[0x0F, 0x05], &mut n); // syscall
+    } else {
+        // Preemptive: burn time in ring 3 and never yield, so the only way this
+        // process can stop running is the timer taking it off the CPU.
+        //   mov r13, delay
+        // spin:
+        //   dec r13
+        //   jnz spin
+        let d = delay.to_le_bytes();
+        emit(&[0x49, 0xC7, 0xC5, d[0], d[1], d[2], d[3]], &mut n);
+        let spin = n;
+        emit(&[0x49, 0xFF, 0xCD], &mut n); // dec r13
+        let back = (n + 2) - spin;
+        emit(&[0x75, (back as u8).wrapping_neg()], &mut n);
+    }
 
     emit(&[0x49, 0xFF, 0xCC], &mut n); // dec r12
     // jnz rel8, back to loop_start. The displacement is measured from the *end*
@@ -419,9 +442,13 @@ pub struct Process {
 }
 
 impl Process {
-    /// Build a process that prints `msg` `rounds` times, yielding between each,
-    /// then exits with `status`.
-    fn new(msg: &[u8], rounds: u32, status: u32) -> Option<Self> {
+    /// Build a process that prints `msg` `rounds` times then exits with
+    /// `status`.
+    ///
+    /// `delay == 0` yields between rounds (cooperative); anything else spins
+    /// that many iterations in ring 3 and never yields, so only preemption can
+    /// take it off the CPU.
+    fn new(msg: &[u8], rounds: u32, delay: u32, status: u32) -> Option<Self> {
         let space = paging::AddressSpace::new()?;
         let (Some(code), Some(stack)) = (akuma_pmm::alloc_page(), akuma_pmm::alloc_page()) else {
             space.free();
@@ -435,7 +462,7 @@ impl Process {
             core::ptr::write_bytes(code as *mut u8, 0, 4096);
             core::ptr::write_bytes(stack as *mut u8, 0, 4096);
             let page = core::slice::from_raw_parts_mut(code as *mut u8, 4096);
-            build_user_program(page, USER_CODE_VA as u64, msg, rounds, status);
+            build_user_program(page, USER_CODE_VA as u64, msg, rounds, delay, status);
         }
 
         if !space.map(USER_CODE_VA, code as u64, Prot::USER_RX, MemAttr::WriteBack)
@@ -460,7 +487,7 @@ impl Process {
 ///
 /// `extern "C" fn() -> !` takes no arguments, so a task entry cannot be handed
 /// its process. A slot per process is the smallest thing that works on one core.
-static mut PROCS: [Option<Process>; 2] = [None, None];
+static mut PROCS: [Option<Process>; 4] = [None, None, None, None];
 
 /// Enter ring 3 for process `idx`, then mark the task finished.
 ///
@@ -490,6 +517,12 @@ extern "C" fn proc0_entry() -> ! {
 extern "C" fn proc1_entry() -> ! {
     run_process(1);
 }
+extern "C" fn proc2_entry() -> ! {
+    run_process(2);
+}
+extern "C" fn proc3_entry() -> ! {
+    run_process(3);
+}
 
 /// Run two isolated processes concurrently and prove they interleave.
 pub fn smoke_test(t: &mut Suite) {
@@ -500,8 +533,8 @@ pub fn smoke_test(t: &mut Suite) {
     let free_before = akuma_pmm::free_count();
 
     let (Some(a), Some(b)) = (
-        Process::new(MSG_A, ROUNDS, 0x0A),
-        Process::new(MSG_B, ROUNDS, 0x0B),
+        Process::new(MSG_A, ROUNDS, 0, 0x0A),
+        Process::new(MSG_B, ROUNDS, 0, 0x0B),
     ) else {
         t.check("ring3: processes built", false);
         return;
@@ -570,6 +603,85 @@ pub fn smoke_test(t: &mut Suite) {
     }
     t.check_eq(
         "ring3: address-space teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+}
+
+/// Two processes that never yield, interleaved by the timer alone.
+///
+/// The distinction from [`smoke_test`] is the whole point: those processes call
+/// `sched_yield`, so interleaving proves only that the scheduler works. These
+/// spin in ring 3 with no syscall between writes, so the *only* way control can
+/// leave one is the timer interrupt taking it — which is preemption.
+pub fn preempt_test(t: &mut Suite) {
+    const ROUNDS: u32 = 3;
+    // Long enough to span at least one tick on both machines. Emulation and real
+    // silicon differ by ~17x here (§3.9), so this is sized for the slower-to-tick
+    // of the two — the Ryzen, at roughly 2.1M spins per tick.
+    const DELAY: u32 = 8_000_000;
+
+    let base = WRITE_SEQ_LEN.load(Ordering::Relaxed);
+    let free_before = akuma_pmm::free_count();
+
+    let (Some(c), Some(d)) = (
+        Process::new(b"    [ring3 C] spinning, never yields\n", ROUNDS, DELAY, 0x0C),
+        Process::new(b"    [ring3 D] spinning, never yields\n", ROUNDS, DELAY, 0x0D),
+    ) else {
+        t.check("preempt: processes built", false);
+        return;
+    };
+    let (root_c, root_d) = (c.space.root(), d.space.root());
+
+    // SAFETY: single core; written before the tasks that read them exist.
+    unsafe {
+        let procs = &raw mut PROCS;
+        (*procs)[2] = Some(c);
+        (*procs)[3] = Some(d);
+    }
+
+    let spawned = crate::sched::spawn_in_space(proc2_entry, root_c).is_some()
+        && crate::sched::spawn_in_space(proc3_entry, root_d).is_some();
+    if !t.check("preempt: processes spawned", spawned) {
+        return;
+    }
+
+    serial::puts("  -- userspace output follows (no yields) --\n");
+    crate::lapic::start_timer();
+    let mut spins = 0u64;
+    while !crate::sched::all_user_tasks_finished() && spins < 100_000 {
+        spins += 1;
+        crate::sched::yield_now();
+    }
+    crate::lapic::stop_timer();
+
+    let len = WRITE_SEQ_LEN.load(Ordering::Relaxed).min(WRITE_SEQ.len() as u64);
+    let switches = (base + 1..len)
+        .filter(|&i| {
+            let i = i as usize;
+            WRITE_SEQ[i].load(Ordering::Relaxed) != WRITE_SEQ[i - 1].load(Ordering::Relaxed)
+        })
+        .count();
+
+    t.check_eq("preempt: writes served", len - base, u64::from(ROUNDS) * 2);
+    // Only >= 1 is asserted. How *often* the timer lands inside a spin depends on
+    // the tick period against the delay loop, which differs by an order of
+    // magnitude between QEMU and real silicon; requiring an exact count would be
+    // asserting on the host's speed rather than on preemption.
+    t.check("preempt: timer interleaved two non-yielding processes", switches >= 1);
+    t.note("preempt: task switches observed between writes", switches as u64);
+
+    // SAFETY: both tasks have finished; nothing else touches these slots.
+    unsafe {
+        let procs = &raw mut PROCS;
+        for slot in 2..4 {
+            if let Some(p) = (*procs)[slot].take() {
+                p.free();
+            }
+        }
+    }
+    t.check_eq(
+        "preempt: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
         free_before as u64,
     );

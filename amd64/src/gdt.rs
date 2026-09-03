@@ -121,6 +121,25 @@ struct Gdtr {
     base: u64,
 }
 
+/// Point the TSS at the stack a ring-3 trap should switch to.
+///
+/// Must be called on every context switch once preemption exists. `rsp0` is
+/// where the CPU pushes the interrupt frame when an interrupt arrives **in ring
+/// 3**, and a preempted task is suspended *on that frame* — so two tasks sharing
+/// one `rsp0` would have the second's interrupt overwrite the first's saved
+/// state, and the first would resume into a frame describing the second.
+///
+/// Sharing was safe until Stage J only because nothing switched tasks from
+/// inside an interrupt handler.
+pub fn set_kernel_stack(rsp0: u64) {
+    // SAFETY: single core; the TSS is reached only through a raw pointer, and
+    // the CPU reads `rsp0` on the next ring-3 trap rather than concurrently.
+    unsafe {
+        let tss = &raw mut TSS;
+        (*tss).rsp0 = rsp0;
+    }
+}
+
 /// Build the GDT and TSS, load both.
 pub fn init() {
     // SAFETY: single core, interrupts masked, written once before `lgdt`. The

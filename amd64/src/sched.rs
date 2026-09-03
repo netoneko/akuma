@@ -168,6 +168,9 @@ struct Task {
     /// Where the syscall path saves this task's stacks. Per-task since Stage I;
     /// see `usermode::UserCtx`.
     uctx: UserCtx,
+    /// Stack the CPU switches to when this task traps from ring 3. Per-task
+    /// since Stage J; see `gdt::set_kernel_stack`.
+    trap_stack_top: u64,
 }
 
 impl Task {
@@ -177,6 +180,7 @@ impl Task {
             state: State::Unused,
             space_root: 0,
             uctx: UserCtx::new(),
+            trap_stack_top: 0,
         }
     }
 }
@@ -210,6 +214,33 @@ fn tasks() -> *mut [Task; MAX_TASKS] {
 fn current() -> usize {
     // SAFETY: single core; `CURRENT` is only written by `yield_now` and `init`.
     unsafe { *(&raw const CURRENT).cast::<usize>() }
+}
+
+/// Called from the timer interrupt: switch tasks if the tick asked for it.
+///
+/// Runs **inside an interrupt handler**, which is what makes this preemption
+/// rather than the cooperative yield of Stage I. The suspended task is left
+/// sitting on its own trap stack with its interrupt frame intact; when it is
+/// scheduled again it returns from here, the handler returns, and `iretq`
+/// resumes whatever it was doing — in ring 3 or ring 0.
+///
+/// Safe only because every task has its **own** trap stack
+/// (`gdt::set_kernel_stack`) and because interrupts are masked for the duration
+/// (the IDT uses interrupt gates, not trap gates), so this cannot nest.
+pub fn preempt_if_needed() {
+    if need_resched() {
+        PREEMPTIONS.fetch_add(1, Ordering::Relaxed);
+        yield_now();
+    }
+}
+
+/// Switches performed from the timer interrupt rather than from a `yield_now`.
+static PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times the timer has taken a task off the CPU.
+#[must_use]
+pub fn preemptions() -> u64 {
+    PREEMPTIONS.load(Ordering::Relaxed)
 }
 
 /// Have all tasks except the boot task finished?
@@ -280,12 +311,19 @@ pub fn spawn(entry: extern "C" fn() -> !) -> Option<usize> {
     let stack = vec![0u8; STACK_SIZE].leak();
     let stack_top = stack.as_ptr() as usize + STACK_SIZE;
 
+    // A second stack, for traps taken while this task is in ring 3. Separate
+    // from the task's own kernel stack because a preempted task is suspended on
+    // the interrupt frame, and the two must not overlap.
+    let trap = vec![0u8; STACK_SIZE].leak();
+    let trap_top = (trap.as_ptr() as usize + STACK_SIZE) & !0xf;
+
     // SAFETY: raw-pointer access to the table; single core.
     unsafe {
         let t = tasks();
         for slot in 1..MAX_TASKS {
             if (*t)[slot].state == State::Unused {
                 (*t)[slot].ctx = Context::for_task(stack_top, entry);
+                (*t)[slot].trap_stack_top = trap_top as u64;
                 (*t)[slot].state = State::Runnable;
                 return Some(slot);
             }
@@ -352,6 +390,9 @@ pub fn yield_now() {
             paging::activate(want);
         }
 
+        // Where a ring-3 trap by the incoming task will land.
+        crate::gdt::set_kernel_stack((*t)[next].trap_stack_top);
+
         let old = &raw mut (*t)[cur].ctx;
         let new = &raw const (*t)[next].ctx;
         switch_context(old, new);
@@ -369,14 +410,6 @@ const WORKERS: usize = 3;
 static mut COUNTERS: [u64; WORKERS] = [0; WORKERS];
 /// Per-worker checksums, accumulated in a *local* across yields.
 static mut CHECKSUMS: [u64; WORKERS] = [0; WORKERS];
-/// Set if any worker ever observed a timer-driven reschedule request.
-static SAW_TICK_REQUEST: AtomicBool = AtomicBool::new(false);
-
-/// How long a worker will wait for a tick before giving up on one.
-///
-/// Bounded so a dead timer makes the test *fail* rather than hang the boot —
-/// the same rule as `lapic::smoke_test`.
-const TICK_WAIT_BUDGET: u64 = 200_000_000;
 
 /// Body shared by the three workers.
 ///
@@ -386,11 +419,13 @@ const TICK_WAIT_BUDGET: u64 = 200_000_000;
 /// distinguishes a real context switch from a function call that happens to
 /// return.
 ///
-/// Each round waits for the timer to ask for a reschedule before yielding, so
-/// the round-robin is genuinely **paced by the tick** rather than by how fast
-/// the workers happen to run. The first version yielded immediately and the
-/// whole test finished inside a single timer period, observing zero ticks — the
-/// scheduler passed and the tick check correctly failed.
+/// Each round yields explicitly. An earlier version *waited* for the timer to
+/// request a reschedule before yielding, which stopped working the moment
+/// preemption existed: `preempt_if_needed` consumes `NEED_RESCHED` inside the
+/// interrupt handler, so a worker polling for it in ring 0 could never observe
+/// it and spun out its whole budget. That the tick drives scheduling is now
+/// measured by [`preemptions`] instead, which counts the thing directly rather
+/// than inferring it from a flag two parties race for.
 fn worker_body(id: usize) -> ! {
     let mut acc: u64 = 0;
     for round in 0..ROUNDS {
@@ -401,14 +436,6 @@ fn worker_body(id: usize) -> ! {
             (*(&raw mut COUNTERS).cast::<[u64; WORKERS]>())[id] += 1;
         }
 
-        let mut spins = 0u64;
-        while !need_resched() && spins < TICK_WAIT_BUDGET {
-            spins += 1;
-            core::hint::spin_loop();
-        }
-        if need_resched() {
-            SAW_TICK_REQUEST.store(true, Ordering::Relaxed);
-        }
         yield_now();
     }
     // SAFETY: as above.
@@ -491,8 +518,6 @@ pub fn smoke_test(t: &mut Suite) {
     }
     t.note("sched: switches", switches);
     t.note("sched: ticks", lapic::ticks());
-    t.check(
-        "sched: reschedule was tick-driven",
-        SAW_TICK_REQUEST.load(Ordering::Relaxed),
-    );
+    t.check("sched: timer preempted at least once", preemptions() > 0);
+    t.note("sched: preemptions", preemptions());
 }

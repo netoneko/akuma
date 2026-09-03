@@ -177,6 +177,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     gdt::init();
     usermode::init_syscall();
     usermode::smoke_test(&mut t);
+    usermode::preempt_test(&mut t);
 
     // The verdict is `#[must_use]`, and this is why: before the harness existed
     // a `[FAIL]` printed and the boot went on to announce success.
