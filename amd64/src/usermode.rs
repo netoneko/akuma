@@ -152,6 +152,32 @@ syscall_entry:
     push rcx                        /* user rip    */
     push r11                        /* user rflags */
     push rax                        /* nr — kept only to balance the frame */
+
+    /* The Linux x86_64 syscall ABI clobbers exactly three registers — rax
+     * (the result), rcx and r11 (which the `syscall` instruction itself takes).
+     * EVERYTHING ELSE IS PRESERVED, argument registers included, and a compiler
+     * targeting that ABI relies on it: it will happily leave a live value in r8
+     * across a syscall and never reload it.
+     *
+     * That is not hypothetical. It is what this stage's ELF program did — see
+     * `docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.18.1. The hand-assembled
+     * programs before it kept their state in r12/r13, which are callee-saved and
+     * therefore preserved by `syscall_handler` for free, so the kernel got away
+     * with clobbering the argument registers for five stages.
+     *
+     * rbx, rbp and r12-r15 need nothing here: `syscall_handler` is
+     * `extern "C"`, so the compiler preserves them, and a context switch taken
+     * inside it saves them too.
+     *
+     * Six pushes is 48 bytes, a multiple of 16, so the alignment the `sub rsp, 8`
+     * below establishes is unchanged by adding them. */
+    push rdi
+    push rsi
+    push rdx
+    push r8
+    push r9
+    push r10
+
     sub rsp, 8                      /* System V wants rsp 16-aligned at `call` */
 
     /* Linux arg registers into System V positions:
@@ -167,6 +193,12 @@ syscall_entry:
     call syscall_handler            /* result in rax */
 
     add rsp, 8
+    pop r10                         /* restore what the ABI promises userspace */
+    pop r9
+    pop r8
+    pop rdx
+    pop rsi
+    pop rdi
     pop rcx                         /* discard the saved nr; rcx is scratch
                                        until the user rip is popped below */
 
@@ -847,7 +879,11 @@ pub fn elf_test(t: &mut Suite) {
     const ARGV_OK: u64 = 1 << 4;
     /// `AT_PAGESZ` is present in the auxiliary vector and is 4096.
     const AUXV_OK: u64 = 1 << 5;
-    const ALL_OK: u64 = DATA_OK | BSS_OK | WRITABLE_OK | ARGC_OK | ARGV_OK | AUXV_OK;
+    /// A syscall preserved every register the Linux x86_64 ABI promises. This
+    /// bit is the one that failed on its first run — see `syscall_entry`.
+    const REGS_OK: u64 = 1 << 6;
+    const ALL_OK: u64 =
+        DATA_OK | BSS_OK | WRITABLE_OK | ARGC_OK | ARGV_OK | AUXV_OK | REGS_OK;
 
     let free_before = akuma_pmm::free_count();
 
@@ -955,6 +991,7 @@ pub fn elf_test(t: &mut Suite) {
         t.check("elf:   argc is on the stack", status & ARGC_OK != 0);
         t.check("elf:   argv[0] points at its string", status & ARGV_OK != 0);
         t.check("elf:   auxv carries AT_PAGESZ", status & AUXV_OK != 0);
+        t.check("elf:   a syscall preserved the ABI's registers", status & REGS_OK != 0);
     }
 
     // SAFETY: the task has finished; nothing else touches this slot.

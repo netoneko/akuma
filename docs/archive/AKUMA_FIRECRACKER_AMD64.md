@@ -1008,6 +1008,197 @@ paging) are in PML4 slot 0 of the *kernel's* space. That is not a conflict —
 each process has its own slot 0 — but it does mean the kernel is still willing to
 map low addresses for itself. A stricter split would refuse.
 
+## 3.18 Stage L: an ELF loader, and the first real kernel bug
+
+The kernel no longer runs programs it wrote itself. `amd64/src/loader.rs` parses
+an ELF64 image, places its `PT_LOAD` segments into a process address space, lays
+out a System V initial stack, and jumps to `e_entry`.
+
+The blocker was Stage K, not the loader. Until the kernel left the lower half
+there was nowhere to *put* a program linked where a static Linux binary is
+linked, and a loader that can only place an image at an address chosen to dodge
+the kernel is a loader for one program. `USER_CODE_VA` is `0x40_0000` because
+that is where the program says it goes.
+
+```
+  elf: rejects a non-ELF image   [OK]
+  elf: rejects ET_DYN   [OK]
+  elf: rejects a non-x86-64 machine   [OK]
+  elf: rejects ELF32   [OK]
+  elf: rejects a truncated image   [OK]
+  elf: rejected loads leak nothing   [OK]
+  elf: image loaded   [OK]
+  elf: every PT_LOAD was placed   [OK]
+  ...
+  -- userspace output follows (from an ELF image) --
+    [elf] loaded from a real ELF image
+  elf: program ran and reported every check   [OK]
+  elf: teardown leaks nothing   [OK]
+```
+
+### 3.18.1 The bug it found
+
+The guest program exited with `0x401000` — the address of its own `.rodata` —
+where a six-bit mask was expected, because `syscall_entry` clobbered six
+registers the Linux x86_64 syscall ABI preserves, and rustc had left the live
+value in one of them.
+
+It has its own document: **`docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md`**.
+
+The part that belongs here is *why five stages missed it*. Every program before
+this one was emitted by `usermode::build_user_program`, and its live state across
+a syscall sat in `r12`/`r13` — callee-saved, therefore preserved by an
+`extern "C"` handler for free. The kernel's test programs used exactly the
+registers the kernel's bug did not touch, because the same author chose both.
+
+That is the actual argument for building against a real toolchain, and it is
+worth separating from the usual one. The point is not that a compiled program is
+larger or more complex than a hand-assembled one. It is that **its choices are
+uncorrelated with the kernel's**. Every stage before this validated the kernel
+against its own assumptions.
+
+### 3.18.2 Where the image comes from
+
+`userspace/amd64/hello/hello.rs`, compiled by `amd64/build.rs` with the same
+`rustc` that is building the kernel, `--target x86_64-unknown-none`, and
+embedded with `include_bytes!`.
+
+`rustc` directly rather than a nested `cargo build`: a build script that invokes
+cargo shares the parent's target directory and package lock, which deadlocks, and
+working around it means a separate target dir and a second copy of every
+dependency. This program has no dependencies — one file against `core` — so the
+thing cargo adds is exactly the thing that breaks.
+
+`include_bytes!` rather than a file because this target has no disk driver, so
+there is nowhere to put a binary it could open by path. That is the honest
+constraint and it is temporary; nothing about the loader assumes it.
+
+Two flag differences from the kernel's own build are load-bearing:
+
+* `-C code-model=small`. The kernel's `code-model=kernel` comes from a
+  `.cargo/config.toml` target entry, which does **not** reach a hand-rolled
+  `rustc` invocation — and would be wrong here anyway, since this image is at
+  `0x40_0000` and not in the top -2 GiB.
+* `-C link-arg=--no-pie` as well as `relocation-model=static`. The model decides
+  what relocations are emitted; the link flag decides what kind of object comes
+  out. Without it the result is `ET_DYN`, which the loader refuses.
+
+### 3.18.3 The link script is part of the design
+
+`userspace/amd64/user.ld` puts `. = ALIGN(0x1000)` between every output section.
+Without it lld packs `.text`, `.rodata` and `.data` into one page, and a single
+page then has to carry the union of three permission sets — an executable,
+writable page.
+
+The loader refuses that mapping outright, which makes the alignment load-bearing
+rather than cosmetic: a link that stops satisfying W^X fails the boot instead of
+silently handing ring 3 a writable code page. `Prot` has never offered a
+`USER_RWX` constructor; this is where that convention became enforcement.
+
+Two things about the resulting image were not what the script implies, and both
+are why the self-test derives its expectations from the file rather than from a
+literal:
+
+* lld emits **four** `PT_LOAD`s from three named sections, because `-z relro`
+  splits `.data` from `.bss`. `count_pt_load` reads the phdr table at its
+  architectural offsets and compares — a number derived independently of the
+  parser under test.
+* `.data` and `.bss` share the page at `0x402000`, so the "two segments in one
+  page" path in `map_range` runs on every boot. Both are `PF_W`, so the union is
+  a no-op and no remap happens — but the code is exercised rather than dead.
+
+### 3.18.4 What the exit status is for
+
+`hello.rs` checks seven properties of the load and reports them as bits of its
+exit status rather than printing a verdict. A program that printed would have
+"passed" by running at all; the status is compared against a value computed in
+`usermode::elf_test`, so a wrong load fails the boot.
+
+| bit | claim | what it would catch |
+|---|---|---|
+| 0 | `.data` holds its linked contents | segment mapped but file bytes not copied |
+| 1 | `.bss` is zero across 32 KiB | `p_memsz > p_filesz` tail not zero-filled, or only the first page |
+| 2 | `.data` is writable | `PF_W` never reached the PTE |
+| 3 | `argc` is on the stack | no initial frame built |
+| 4 | `argv[0]` points at its string | pointer written, string not |
+| 5 | auxv carries `AT_PAGESZ` | vector absent or unterminated |
+| 6 | a syscall preserved the ABI's registers | §3.18.1 |
+
+Bit 1 is 32 KiB rather than one word on purpose: a zero-fill that clears the
+segment's first page and stops would pass a smaller check.
+
+`elf_test` names each bit individually when the mask comes back short, because
+`got 0x2F want 0x7F` makes the reader decode a bitmask to learn that `argv[0]`
+was wrong.
+
+### 3.18.5 Rejection is tested before acceptance
+
+Five malformed images — non-ELF magic, `ET_DYN`, `EM_AARCH64`, ELFCLASS32, and a
+truncated file — must all be refused, and the free-frame count must be unchanged
+afterwards. Each is a *mutation of the real image* rather than a hand-written
+header, so a change to how `hello` is linked cannot leave these testing a shape
+the loader no longer sees.
+
+They check that a rejection happened, not which message came back. The messages
+are diagnostics; pinning them would make rewording one a test failure.
+
+`loader::load` frees nothing on the failure path — it records frames as it
+allocates them and leaves them to the caller. A half-loaded image whose frames
+the loader had reclaimed would leave the space's page tables pointing at memory
+the PMM has since handed to someone else, which is the `AddressSpace::free`
+split (tables are its own, leaves are the caller's) followed through.
+
+### 3.18.6 Why not `akuma-elf`
+
+The tree has an ELF loader and it is arch-neutral in everything that matters
+here: `source.rs` parses through the vetted `elf` 0.7 crate and names no
+architecture. It is unusable from this target for one structural reason —
+`load.rs`, `interp.rs` and `stack.rs` are all written against
+`akuma_mmu::UserAddressSpace`, and `akuma-mmu` is AArch64 page-table code. That
+dependency is real rather than incidental, and the crate's own manifest says why:
+a loader that cannot name an address space cannot place a segment.
+
+So the extraction that would let the two share is a **parse/place split** — the
+`ElfSource` + `parse_headers` half is neutral and currently `pub(super)`; the
+mapping half is not. That is the shape a future crate should take, and it was not
+this stage's work.
+
+What this stage deliberately did *not* do is re-implement the parsing.
+`loader.rs` calls the same `elf` 0.7 crate through the same
+`parse_ident`/`parse_tail`/`SegmentTable` path, so the tree has one ELF parser
+and two consumers — not two parsers, which is the defect
+`TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §3 spent a verification campaign over
+2,387 binaries removing.
+
+### 3.18.7 `MAX_TASKS` was sized against the tests that existed
+
+`spawn` returned `None` and only the ELF test failed. Slots are never recycled —
+a finished task keeps its two 32 KiB stacks — so the table has to hold every task
+the *whole boot* creates, not every task alive at once. Three scheduler workers,
+two cooperative processes, two preempted ones and one ELF process is eight, plus
+the boot task: nine, against a `MAX_TASKS` of 8.
+
+Raised to 12. The right fix is recycling, and it is deliberately not this: a slot
+cannot be reused until its stacks can be, and reclaiming those needs the
+scheduler to know no frame is still on them.
+
+### 3.18.8 What the loader does not do
+
+No demand paging — every page of every segment is allocated and copied up front.
+The `#PF` handler can already service a not-present fault, so the machinery
+exists; wiring segments to it needs a per-space region table, which is the next
+thing rather than part of this one.
+
+No `PT_INTERP`, no relocations, no `PT_GNU_RELRO` enforcement, and no `AT_PHDR` —
+a program that walks its own program headers gets nothing useful from this auxv.
+No `PROT_NONE` guard page below the stack, and no stack growth.
+
+W^X is enforced at *map* time and never observed being enforced by the hardware:
+a ring-3 write to a code page would be a `#PF`, and this kernel's `#PF` handler
+is fatal for anything outside its armed demand-paging window. Proving the
+refusal is a separate stage that needs faults to be deliverable to a process
+rather than to the console.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at

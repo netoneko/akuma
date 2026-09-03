@@ -24,10 +24,13 @@
 //! | 3 | `argc` is what the kernel put on the stack |
 //! | 4 | `argv[0]` points at a readable string with the expected bytes |
 //! | 5 | the auxiliary vector carries `AT_PAGESZ` = 4096 |
+//! | 6 | a syscall preserved every register the Linux ABI says it must |
 //!
 //! Bits 3-5 test the *initial stack*, which is the half of "loading a program"
 //! that has nothing to do with parsing the file and everything to do with the
 //! System V ABI the program was compiled against.
+//!
+//! Bit 6 is the one that found a bug. See [`regs_preserved`].
 
 #![no_std]
 #![no_main]
@@ -38,6 +41,7 @@
 /// kernel side dispatches through that crate — which is where the identity
 /// actually has to be shared.
 const SYS_WRITE: u64 = 1;
+const SYS_GETPID: u64 = 39;
 const SYS_EXIT_GROUP: u64 = 231;
 
 /// `AT_PAGESZ`, the one auxv entry this program looks for.
@@ -80,6 +84,50 @@ unsafe fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         );
     }
     ret
+}
+
+/// Does a syscall come back with every register the ABI promises intact?
+///
+/// The Linux x86_64 syscall ABI clobbers three registers and no more: `rax`
+/// holds the result, and the `syscall` instruction itself takes `rcx` and
+/// `r11`. Argument registers are preserved, which is why a compiler will leave a
+/// live value in `r8` across a syscall and never reload it.
+///
+/// This is written as an explicit probe rather than left to that compiler
+/// behaviour on purpose. The bug it caught was found the accidental way — rustc
+/// happened to park this program's running `status` in `r8`, the kernel happened
+/// to clobber it, and the symptom was an exit status of `0x401000` — and an
+/// accident is not a regression test. Which register a compiler picks is its
+/// business and can change with any release; this asks the question directly.
+///
+/// `getpid` because it is the cheapest syscall that touches nothing: no memory,
+/// no console, no scheduler.
+///
+/// # Safety
+/// Executes a syscall. `getpid` has no side effect.
+unsafe fn regs_preserved() -> bool {
+    let (rdi, rsi, rdx, r8, r9, r10): (u64, u64, u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_GETPID => _,
+            inlateout("rdi") 0x1111_1111_1111_1111_u64 => rdi,
+            inlateout("rsi") 0x2222_2222_2222_2222_u64 => rsi,
+            inlateout("rdx") 0x3333_3333_3333_3333_u64 => rdx,
+            inlateout("r8")  0x8888_8888_8888_8888_u64 => r8,
+            inlateout("r9")  0x9999_9999_9999_9999_u64 => r9,
+            inlateout("r10") 0xAAAA_AAAA_AAAA_AAAA_u64 => r10,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    rdi == 0x1111_1111_1111_1111
+        && rsi == 0x2222_2222_2222_2222
+        && rdx == 0x3333_3333_3333_3333
+        && r8 == 0x8888_8888_8888_8888
+        && r9 == 0x9999_9999_9999_9999
+        && r10 == 0xAAAA_AAAA_AAAA_AAAA
 }
 
 core::arch::global_asm!(
@@ -184,6 +232,11 @@ unsafe extern "C" fn rust_start(sp: *const u64) -> ! {
     };
     if pagesz == 4096 {
         status |= 1 << 5;
+    }
+
+    // SAFETY: `getpid` has no side effect; see the function's own note.
+    if unsafe { regs_preserved() } {
+        status |= 1 << 6;
     }
 
     // SAFETY: fd 1 is the kernel's serial console, and MSG is in this image.
