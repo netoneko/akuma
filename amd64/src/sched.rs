@@ -33,8 +33,9 @@
 //! being part of the interface at all, and the crate that owns fork and exec
 //! stops needing to know what a callee-saved register is.
 
+use akuma_selftest::Suite;
+
 use crate::lapic;
-use crate::serial;
 use alloc::vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -363,17 +364,14 @@ fn expected_checksum(id: u64) -> u64 {
 }
 
 /// Spawn three tasks, run them to completion, verify.
-pub fn smoke_test() {
-    serial::puts("  test: scheduler ");
-
+pub fn smoke_test(t: &mut Suite) {
     init();
     let spawned = [worker0 as extern "C" fn() -> !, worker1, worker2]
         .into_iter()
         .filter(|&f| spawn(f).is_some())
         .count();
 
-    if spawned != WORKERS {
-        serial::puts("[FAIL] could not spawn\n");
+    if !t.check_eq("sched: tasks spawned", spawned as u64, WORKERS as u64) {
         return;
     }
 
@@ -384,15 +382,14 @@ pub fn smoke_test() {
         core::arch::asm!("sti", options(nomem, nostack));
     }
 
-    let mut guard = 0u64;
+    let mut switches = 0u64;
     loop {
         // SAFETY: raw-pointer read of the table; single core.
-        let done =
-            unsafe { (1..=WORKERS).all(|s| (*tasks())[s].state == State::Finished) };
-        if done || guard > 10_000 {
+        let done = unsafe { (1..=WORKERS).all(|s| (*tasks())[s].state == State::Finished) };
+        if done || switches > 10_000 {
             break;
         }
-        guard += 1;
+        switches += 1;
         yield_now();
     }
 
@@ -409,35 +406,19 @@ pub fn smoke_test() {
         )
     };
 
-    let counts_ok = counters.iter().all(|&c| c == ROUNDS);
-    let sums_ok = (0..WORKERS).all(|i| checksums[i] == expected_checksum(i as u64));
-
-    serial::put_dec(WORKERS as u64);
-    serial::puts(" tasks x ");
-    serial::put_dec(ROUNDS);
-    serial::puts(" rounds, ");
-    serial::put_dec(guard);
-    serial::puts(" switches, ticks=");
-    serial::put_dec(lapic::ticks());
-
-    if counts_ok && sums_ok {
-        serial::puts("   [OK]\n");
-    } else {
-        serial::puts("   [FAIL] counters=");
-        for c in counters {
-            serial::put_dec(c);
-            serial::puts(" ");
-        }
-        serial::puts("\n");
-        return;
+    t.check(
+        "sched: every worker ran every round",
+        counters.iter().all(|&c| c == ROUNDS),
+    );
+    // The property that distinguishes a real context switch from a call that
+    // returns: the accumulator is a local, read and written across a yield.
+    for (i, &sum) in checksums.iter().enumerate() {
+        t.check_eq("sched: locals survive the switch", sum, expected_checksum(i as u64));
     }
-
-    // Reported separately: this is about the *timer*, not about switching, and
-    // conflating them would let a passing scheduler hide a dead tick.
-    serial::puts("  test: tick-driven resched ");
-    serial::puts(if SAW_TICK_REQUEST.load(Ordering::Relaxed) {
-        "observed   [OK]\n"
-    } else {
-        "never observed   [FAIL]\n"
-    });
+    t.note("sched: switches", switches);
+    t.note("sched: ticks", lapic::ticks());
+    t.check(
+        "sched: reschedule was tick-driven",
+        SAW_TICK_REQUEST.load(Ordering::Relaxed),
+    );
 }

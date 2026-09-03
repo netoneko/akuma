@@ -1,0 +1,12 @@
+[package]
+name = "akuma-selftest"
+version = "0.1.0"
+edition = "2024"
+description = "Boot self-test harness: pass/fail tally and got-vs-want reporting, shared between the aarch64 boot suite and the amd64 target"
+
+[lints]
+workspace = true
+
+[dependencies]
+# None, deliberately. A test harness that can fail to link, allocate, or reach a
+# console is worse than no harness — see the crate header.

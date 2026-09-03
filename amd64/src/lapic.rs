@@ -29,6 +29,8 @@
 use crate::idt;
 use crate::paging::{self, MemAttr, Prot};
 use crate::port::outb;
+use akuma_selftest::Suite;
+
 use crate::serial;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -204,15 +206,10 @@ pub fn stop_timer() {
 /// Enable interrupts and confirm ticks actually arrive.
 ///
 /// Bounded by a spin budget rather than trusting the timer: if interrupts never
-/// arrive this must report a failure, not hang the boot. `hlt` inside the loop
-/// so the wait is not a busy spin — and because a `hlt` that never wakes is
-/// itself the bug being tested for, the budget is counted in iterations of a
-/// *pause* loop rather than in `hlt`s.
-pub fn smoke_test() {
+/// arrive this must report a failure, not hang the boot.
+pub fn smoke_test(t: &mut Suite) {
     const WANT: u64 = 5;
     const BUDGET: u64 = 500_000_000;
-
-    serial::puts("  test: timer interrupts ");
 
     // SAFETY: the IDT is loaded, the timer vector has a handler, the legacy PICs
     // are masked, and the LAPIC is configured. This is the first `sti` in the
@@ -233,10 +230,10 @@ pub fn smoke_test() {
     }
     stop_timer();
 
-    let seen = ticks();
-    serial::put_dec(seen);
-    serial::puts(" ticks in ");
-    serial::put_dec(spins);
-    serial::puts(" spins");
-    serial::puts(if seen >= WANT { "   [OK]\n" } else { "   [FAIL]\n" });
+    t.check("lapic: timer interrupts arrive", ticks() >= WANT);
+    // A measurement, not an assertion: the count differs by an order of
+    // magnitude between emulation and real silicon (QEMU ~6e4, Zen 4 ~1e7 for
+    // the same five ticks), which is itself evidence the ticks come from a
+    // clock rather than from anything correlated with instruction count.
+    t.note("lapic: spins waiting for 5 ticks", spins);
 }

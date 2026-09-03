@@ -40,7 +40,7 @@
 //! page fault with no IDT installed — a triple-fault and a guest that vanishes
 //! with no output.
 
-use crate::serial;
+use akuma_selftest::Suite;
 
 /// Present.
 const P: u64 = 1 << 0;
@@ -338,34 +338,29 @@ pub fn translate_in(root: u64, va: usize) -> Option<u64> {
 /// Chosen VA is 1 GiB — the first address `boot.s` does *not* map, so the whole
 /// path (allocate PDPT entry, PD, PT, leaf) is exercised and a false pass from
 /// accidentally hitting the identity map is impossible.
-pub fn smoke_test() {
+pub fn smoke_test(t: &mut Suite) {
     const TEST_VA: usize = 1 << 30;
     const PATTERN: u64 = 0x0bad_c0de_dead_beef;
 
-    serial::puts("  test: paging ");
-
-    if translate(TEST_VA).is_some() {
-        serial::puts("[FAIL] 0x40000000 already mapped\n");
+    if !t.check("paging: test VA starts unmapped", translate(TEST_VA).is_none()) {
         return;
     }
-
     let Some(frame) = akuma_pmm::alloc_page() else {
-        serial::puts("[FAIL] no frame\n");
+        t.check("paging: frame available", false);
         return;
     };
 
-    if !map_page(TEST_VA, frame as u64, Prot::KERNEL_RW, MemAttr::WriteBack) {
-        serial::puts("[FAIL] map_page\n");
+    if !t.check(
+        "paging: map_page",
+        map_page(TEST_VA, frame as u64, Prot::KERNEL_RW, MemAttr::WriteBack),
+    ) {
         return;
     }
-
-    match translate(TEST_VA) {
-        Some(pa) if pa == frame as u64 => {}
-        _ => {
-            serial::puts("[FAIL] translate mismatch\n");
-            return;
-        }
-    }
+    t.check_eq(
+        "paging: translate matches",
+        translate(TEST_VA).unwrap_or(0),
+        frame as u64,
+    );
 
     // SAFETY: the mapping was just installed and verified by a table walk.
     let readback = unsafe {
@@ -373,76 +368,51 @@ pub fn smoke_test() {
         p.write_volatile(PATTERN);
         p.read_volatile()
     };
-    if readback != PATTERN {
-        serial::puts("[FAIL] readback\n");
-        return;
-    }
+    t.check_eq("paging: readback through mapping", readback, PATTERN);
 
     // The write must be visible at the *physical* address too — that is what
     // proves the mapping points where the walk said, rather than at some other
     // page that happens to be readable.
     // SAFETY: PMM frames are inside the identity map.
     let via_phys = unsafe { (frame as *const u64).read_volatile() };
-    if via_phys != PATTERN {
-        serial::puts("[FAIL] physical alias mismatch\n");
-        return;
-    }
+    t.check_eq("paging: visible via physical alias", via_phys, PATTERN);
 
-    if unmap_page(TEST_VA) != Some(frame as u64) {
-        serial::puts("[FAIL] unmap\n");
-        return;
-    }
-    if translate(TEST_VA).is_some() {
-        serial::puts("[FAIL] still mapped after unmap\n");
-        return;
-    }
+    t.check_eq(
+        "paging: unmap returns the frame",
+        unmap_page(TEST_VA).unwrap_or(0),
+        frame as u64,
+    );
+    t.check("paging: unmapped after unmap", translate(TEST_VA).is_none());
 
     akuma_pmm::free_page(frame, 0);
-
-    serial::puts("map/write/verify/unmap @0x");
-    serial::put_hex(TEST_VA as u64);
-    serial::puts("   [OK]\n");
-
-    nx_encoding_check();
+    nx_encoding_check(t);
 }
 
 /// Check that the encoder cannot express write+execute, and that NX is set.
 ///
 /// A pure check on [`encode`], not on the hardware: the hardware half needs a
-/// `#PF` handler to observe, and there is no IDT yet. What it does prove is the
-/// property item 1 exists to guarantee — that "read-only" and "executable" are
-/// distinct values, which on the AArch64 side they currently are not
+/// `#PF` handler to observe. What it does prove is the property proposal item 1
+/// exists to guarantee — that "read-only" and "executable" are distinct values,
+/// which on the AArch64 side they currently are not
 /// (`user_flags::RO == user_flags::EXEC`).
-fn nx_encoding_check() {
+fn nx_encoding_check(t: &mut Suite) {
     let rw = encode(Prot::KERNEL_RW, MemAttr::WriteBack);
     let rx = encode(Prot::KERNEL_RX, MemAttr::WriteBack);
     let ro = encode(Prot::KERNEL_RO, MemAttr::WriteBack);
-
-    // User mappings must additionally carry US, and kernel mappings must not:
-    // a kernel page that leaks US is reachable from ring 3.
     let urw = encode(Prot::USER_RW, MemAttr::WriteBack);
     let urx = encode(Prot::USER_RX, MemAttr::WriteBack);
+    let dev = encode(Prot::KERNEL_RW, MemAttr::Device);
 
-    let ok = rw & NX != 0        // data is never executable
-        && rw & RW != 0
-        && rx & NX == 0          // code is executable
-        && rx & RW == 0          // ...and never writable
-        && ro & NX != 0
-        && ro & RW == 0
-        && ro != rx              // the defect item 1.1 describes, absent here
-        && urw & US != 0         // user mappings are user-accessible
-        && urx & US != 0
-        && urw & NX != 0         // ...and user data is still never executable
-        && urx & RW == 0         // ...and user code is still never writable
-        && rw & US == 0          // kernel mappings are NOT reachable from ring 3
-        && rx & US == 0
-        && ro & US == 0
-        // Device mappings are uncacheable; normal memory is not.
-        && encode(Prot::KERNEL_RW, MemAttr::Device) & (PCD | PWT) == PCD | PWT
-        && rw & (PCD | PWT) == 0;
-
-    serial::puts("  test: W^X encoding ");
-    serial::puts(if ok { "  [OK]\n" } else { "  [FAIL]\n" });
+    t.check("W^X: kernel data is non-executable", rw & NX != 0 && rw & RW != 0);
+    t.check("W^X: kernel code is exec and not writable", rx & NX == 0 && rx & RW == 0);
+    t.check("W^X: read-only is neither", ro & NX != 0 && ro & RW == 0);
+    // The defect proposal item 1.1 describes, absent here by construction.
+    t.check("W^X: read-only and executable differ", ro != rx);
+    t.check("W^X: user mappings carry US", urw & US != 0 && urx & US != 0);
+    t.check("W^X: user data non-exec, user code non-writable", urw & NX != 0 && urx & RW == 0);
+    t.check("W^X: kernel mappings are not user-reachable", (rw | rx | ro) & US == 0);
+    t.check("attr: device is uncacheable, normal is not",
+            dev & (PCD | PWT) == PCD | PWT && rw & (PCD | PWT) == 0);
 }
 
 /// One address space: a PML4 of its own, sharing the kernel's mappings.

@@ -147,32 +147,43 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     serial::put_dec(usable / 1024 / 1024);
     serial::puts(" MiB\n");
 
-    if mem::init(&info) {
-        mem::smoke_test();
-        paging::smoke_test();
-        // Only after the PMM and paging are up: the #PF handler allocates a
-        // frame and maps it, so installing the IDT earlier would give us a
-        // handler that cannot service the fault it exists to service.
-        idt::init();
-        idt::smoke_test();
-        if lapic::init() {
-            lapic::smoke_test();
-            // Restart the timer the smoke test stopped: the scheduler wants a
-            // live tick to drive NEED_RESCHED.
-            lapic::start_timer();
-            sched::smoke_test();
-            lapic::stop_timer();
-        }
-        // Ring 3 last. It replaces the GDT `boot.s` installed, and the TSS it
-        // adds is what makes a trap taken *from* ring 3 survivable — so it must
-        // come after everything that could still fault in ring 0.
-        gdt::init();
-        usermode::init_syscall();
-        usermode::smoke_test();
-
-        serial::puts("\nAkuma/amd64 — memory subsystem up\n");
-    } else {
+    if !mem::init(&info) {
         serial::puts("\nAkuma/amd64 — memory bring-up FAILED\n");
+        halt();
+    }
+
+    let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
+
+    mem::smoke_test(&mut t);
+    paging::smoke_test(&mut t);
+    // Only after the PMM and paging are up: the #PF handler allocates a frame
+    // and maps it, so installing the IDT earlier would give us a handler that
+    // cannot service the fault it exists to service.
+    idt::init();
+    idt::smoke_test(&mut t);
+
+    if t.check("lapic: initialised", lapic::init()) {
+        lapic::smoke_test(&mut t);
+        // Restart the timer the smoke test stopped: the scheduler wants a live
+        // tick to drive NEED_RESCHED.
+        lapic::start_timer();
+        sched::smoke_test(&mut t);
+        lapic::stop_timer();
+    }
+
+    // Ring 3 last. It replaces the GDT `boot.s` installed, and the TSS it adds
+    // is what makes a trap taken *from* ring 3 survivable — so it must come
+    // after everything that could still fault in ring 0.
+    gdt::init();
+    usermode::init_syscall();
+    usermode::smoke_test(&mut t);
+
+    // The verdict is `#[must_use]`, and this is why: before the harness existed
+    // a `[FAIL]` printed and the boot went on to announce success.
+    if t.report() {
+        serial::puts("Akuma/amd64 — all self-tests passed\n");
+    } else {
+        serial::puts("Akuma/amd64 — SELF-TESTS FAILED\n");
     }
 
     halt();

@@ -20,31 +20,17 @@ MEMORY=1024 amd64/run.sh
 ```
 Akuma/amd64 — long mode reached
   hvm_start_info @ 0x0000000000001580
-  version=1 modules=0 rsdp=0x0000000000000000 cmdline=0x0000000000000560
-  memmap: 7 entries
-    0x0000000000000000 + 0x000000000009fc00  RAM
-    ...
-  usable RAM: 511 MiB
-  heap: 0x000000000024e000 + 16 MiB ... ok
-  pmm:  126354 free frames (493 MiB)
-  test: heap vec[4096] sum=22898104320
-  test: pmm alloc 8 frames, free 126354 -> 126346 -> 126354   [OK]
-  test: paging map/write/verify/unmap @0x0000000040000000   [OK]
-  test: W^X encoding   [OK]
-  test: demand paging 4 faults serviced, frames 126380 -> 126378   [OK]
-  lapic: base=0x00000000fee00000 id=0 timer vector=32 periodic
-  test: timer interrupts 5 ticks in 62080 spins   [OK]
-  test: scheduler 3 tasks x 4 rounds, 5 switches, ticks=17   [OK]
-  test: tick-driven resched observed   [OK]
-  test: ring 3 — userspace output follows
-    [ring3] hello from userspace via write(2)
-  test: processes — userspace output follows
+  memmap: 7 entries ... usable RAM: 511 MiB
+  heap: 0x24f000 + 16 MiB ... ok
+  pmm:  126353 free frames (493 MiB)
+  ...
+  -- userspace output follows --
     [ring3 A] first process, own address space
     [ring3 B] second process, same VA, different frame
-  test: processes 0x1264000 vs 0x126a000 at the same VA, exits 0x0a/0x0b   [OK]
-  test: address-space teardown frames 126366 -> 126366   [OK]
+  ring3: same VA, different frames   [OK]
 
-Akuma/amd64 — memory subsystem up
+Akuma/amd64 self-test: 39 passed, 0 failed
+Akuma/amd64 — all self-tests passed
 ```
 
 The heap and frame allocator are **unmodified `akuma-alloc` and `akuma-pmm`** —

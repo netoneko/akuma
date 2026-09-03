@@ -30,6 +30,8 @@
 //! LAPIC setup, and that is a later stage.
 
 use crate::paging::{self, MemAttr, Prot};
+use akuma_selftest::Suite;
+
 use crate::serial;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -311,20 +313,18 @@ fn disarm_lazy() {
 
 /// Take a fault on purpose and service it.
 ///
-/// Chosen VA is 2 GiB — outside the 1 GiB `boot.s` identity-maps and clear of
-/// the 1 GiB address `paging::smoke_test` uses, so nothing here can pass by
-/// accidentally hitting an existing mapping.
+/// Chosen VA is 2 GiB — outside the identity map *and* clear of the 1 GiB
+/// address `paging::smoke_test` uses, so nothing here can pass by accidentally
+/// hitting an existing mapping.
 ///
 /// Touching four pages proves the handler is re-entrant across faults rather
 /// than working once, and reading the values back afterwards proves the mappings
 /// survived — a handler that mapped the page and then lost it would still let
 /// the faulting store retire.
-pub fn smoke_test() {
+pub fn smoke_test(t: &mut Suite) {
     const LAZY_BASE_VA: u64 = 2 << 30;
     const PAGES: u64 = 4;
     const LEN: u64 = PAGES * 4096;
-
-    serial::puts("  test: demand paging ");
 
     let free_before = akuma_pmm::free_count();
     arm_lazy(LAZY_BASE_VA, LEN);
@@ -336,32 +336,49 @@ pub fn smoke_test() {
         unsafe { va.write_volatile(0xfeed_0000 + i) };
     }
 
-    let mut ok = DEMAND_FAULTS.load(Ordering::Relaxed) == PAGES as usize;
+    t.check_eq(
+        "demand paging: faults serviced",
+        DEMAND_FAULTS.load(Ordering::Relaxed) as u64,
+        PAGES,
+    );
 
+    let mut readback_ok = true;
     for i in 0..PAGES {
         let va = (LAZY_BASE_VA + i * 4096) as *const u64;
         // SAFETY: mapped by the faults above.
         if unsafe { va.read_volatile() } != 0xfeed_0000 + i {
-            ok = false;
+            readback_ok = false;
         }
     }
+    t.check("demand paging: mappings survive the fault", readback_ok);
 
     disarm_lazy();
 
     // Release what the handler allocated, so the frame count returns to where it
     // started — a leak here would be invisible without this check.
+    let mut unmapped = 0;
     for i in 0..PAGES {
         if let Some(pa) = paging::unmap_page((LAZY_BASE_VA + i * 4096) as usize) {
             akuma_pmm::free_page(pa as usize, 0);
-        } else {
-            ok = false;
+            unmapped += 1;
         }
     }
+    t.check_eq("demand paging: pages unmapped", unmapped, PAGES);
 
-    serial::put_dec(DEMAND_FAULTS.load(Ordering::Relaxed) as u64);
-    serial::puts(" faults serviced, frames ");
-    serial::put_dec(free_before as u64);
-    serial::puts(" -> ");
-    serial::put_dec(akuma_pmm::free_count() as u64);
-    serial::puts(if ok { "   [OK]\n" } else { "   [FAIL]\n" });
+    // Exactly two frames stay out: the page directory and the page table that
+    // had to be allocated to describe the 2 GiB region. `unmap_page` clears the
+    // leaf and deliberately does not reclaim the tables above it — doing so
+    // safely needs a per-table live-entry count, since another mapping may still
+    // sit in the same table.
+    //
+    // This is pinned rather than tolerated. The previous version of this test
+    // *printed* `126348 -> 126346` and scored itself `[OK]` anyway, because the
+    // frame count was in the output and not in the condition. If table reclaim
+    // is ever implemented, this number becomes 0 and the test says so.
+    const RETAINED_TABLES: u64 = 2;
+    t.check_eq(
+        "demand paging: only the two intermediate tables retained",
+        (free_before - akuma_pmm::free_count()) as u64,
+        RETAINED_TABLES,
+    );
 }

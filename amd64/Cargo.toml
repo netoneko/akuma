@@ -20,6 +20,9 @@ akuma-pmm = { path = "../crates/akuma-pmm" }
 # port is why it exists: `akuma-syscalls-linux::nr` is asm-generic (aarch64)
 # numbering, and x86_64 Linux numbers everything differently.
 akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
+# Shared boot self-test harness. Gives the tally the amd64 target lacked: a
+# [FAIL] used to print and the boot then finished announcing success.
+akuma-selftest = { path = "../crates/akuma-selftest" }
 
 [[bin]]
 name = "akuma-amd64"

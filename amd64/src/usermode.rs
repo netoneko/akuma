@@ -27,6 +27,8 @@
 
 use akuma_syscalls_abi::Syscall;
 
+use akuma_selftest::Suite;
+
 use crate::gdt;
 use crate::paging::{self, MemAttr, Prot};
 use crate::serial;
@@ -406,8 +408,8 @@ impl Process {
 }
 
 /// Run two processes in separate address spaces and prove they are isolated.
-pub fn smoke_test() {
-    serial::puts("  test: processes — userspace output follows\n");
+pub fn smoke_test(t: &mut Suite) {
+    serial::puts("  -- userspace output follows --\n");
 
     let free_before = akuma_pmm::free_count();
 
@@ -415,7 +417,7 @@ pub fn smoke_test() {
         Process::new(b"    [ring3 A] first process, own address space\n", 0x0A),
         Process::new(b"    [ring3 B] second process, same VA, different frame\n", 0x0B),
     ) else {
-        serial::puts("  [FAIL] could not build processes\n");
+        t.check("ring3: processes built", false);
         return;
     };
 
@@ -429,32 +431,26 @@ pub fn smoke_test() {
     let status_a = a.run();
     let status_b = b.run();
 
-    let calls = CALLS.load(Ordering::Relaxed);
-    let isolated = pa_a.is_some() && pa_b.is_some() && pa_a != pa_b && pa_k.is_none();
-    let ran = status_a == 0x0A && status_b == 0x0B && calls == 4;
-
-    serial::puts("  test: processes 0x");
-    serial::put_hex(pa_a.unwrap_or(0));
-    serial::puts(" vs 0x");
-    serial::put_hex(pa_b.unwrap_or(0));
-    serial::puts(" at the same VA, exits 0x");
-    serial::put_hex(status_a);
-    serial::puts("/0x");
-    serial::put_hex(status_b);
-    serial::puts(if isolated && ran { "   [OK]\n" } else { "   [FAIL]\n" });
+    t.check("ring3: both spaces map the test VA", pa_a.is_some() && pa_b.is_some());
+    t.check("ring3: same VA, different frames", pa_a != pa_b);
+    t.check("ring3: kernel space does not map it", pa_k.is_none());
+    t.check_eq("ring3: process A exit status", status_a, 0x0A);
+    t.check_eq("ring3: process B exit status", status_b, 0x0B);
+    t.check_eq("ring3: syscalls served", CALLS.load(Ordering::Relaxed), 4);
+    t.check_eq(
+        "ring3: bytes written by userspace",
+        WRITTEN.load(Ordering::Relaxed),
+        (b"    [ring3 A] first process, own address space\n".len()
+            + b"    [ring3 B] second process, same VA, different frame\n".len()) as u64,
+    );
 
     a.free();
     b.free();
 
     // Address spaces are page tables; leaking them leaks frames silently.
-    let free_after = akuma_pmm::free_count();
-    serial::puts("  test: address-space teardown frames ");
-    serial::put_dec(free_before as u64);
-    serial::puts(" -> ");
-    serial::put_dec(free_after as u64);
-    serial::puts(if free_before == free_after {
-        "   [OK]\n"
-    } else {
-        "   [FAIL]\n"
-    });
+    t.check_eq(
+        "ring3: address-space teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
 }

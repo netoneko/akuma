@@ -24,6 +24,8 @@
 //!   \____________________ PMM `kernel_end` reservation ____________________/
 //! ```
 
+use akuma_selftest::Suite;
+
 use crate::hvm::StartInfo;
 use crate::serial;
 
@@ -155,51 +157,43 @@ pub fn init(info: &StartInfo) -> bool {
 ///
 /// A boot that prints "ok" and never allocates has demonstrated that `init`
 /// returned, nothing more. This allocates from the heap, allocates and frees
-/// frames, and checks the free count moves in the right direction — the smallest
-/// thing that fails loudly if the wiring is wrong.
-pub fn smoke_test() {
-    serial::puts("  test: heap ");
-    {
+/// frames, and checks the free count moves in the right direction.
+pub fn smoke_test(t: &mut Suite) {
+    // Sum of i^2 for i < 4096 = 4095*4096*8191/6. Checked against a value
+    // computed here rather than a literal, so the test cannot be "fixed" by
+    // pasting in whatever the kernel printed.
+    const N: u64 = 4096;
+    let want: u64 = (N - 1) * N * (2 * N - 1) / 6;
+
+    let got = {
         let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-        for i in 0..4096u64 {
+        for i in 0..N {
             v.push(i * i);
         }
         // Read it back so the writes cannot be optimised away.
-        let sum: u64 = v.iter().sum();
-        serial::puts("vec[4096] sum=");
-        serial::put_dec(sum);
-    }
+        v.iter().sum()
+    };
+    t.check_eq("heap: vec[4096] checksum", got, want);
 
     let before = akuma_pmm::free_count();
     let mut frames = [0usize; 8];
-    let mut got = 0;
+    let mut got_frames = 0;
     for slot in &mut frames {
         match akuma_pmm::alloc_page() {
             Some(pa) => {
                 *slot = pa;
-                got += 1;
+                got_frames += 1;
             }
             None => break,
         }
     }
     let during = akuma_pmm::free_count();
-    for &pa in &frames[..got] {
+    for &pa in &frames[..got_frames] {
         akuma_pmm::free_page(pa, 0);
     }
     let after = akuma_pmm::free_count();
 
-    serial::puts("\n  test: pmm alloc ");
-    serial::put_dec(got as u64);
-    serial::puts(" frames, free ");
-    serial::put_dec(before as u64);
-    serial::puts(" -> ");
-    serial::put_dec(during as u64);
-    serial::puts(" -> ");
-    serial::put_dec(after as u64);
-
-    if got == frames.len() && during == before - got && after == before {
-        serial::puts("   [OK]\n");
-    } else {
-        serial::puts("   [FAIL]\n");
-    }
+    t.check_eq("pmm: frames allocated", got_frames as u64, frames.len() as u64);
+    t.check_eq("pmm: free count drops", during as u64, (before - frames.len()) as u64);
+    t.check_eq("pmm: free count restored", after as u64, before as u64);
 }

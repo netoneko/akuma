@@ -37,6 +37,7 @@ default-members = [
     "crates/akuma-primitives",
     "crates/akuma-rump",
     "crates/akuma-scheduler",
+    "crates/akuma-selftest",
     "crates/akuma-slot-table",
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-abi",

@@ -741,6 +741,69 @@ The flag's lifetime is exactly one excursion, so it is now cleared at the top of
 `enter_user_mode` rather than at the exit. Checking the *exit status* rather than
 "did it return" is what surfaced it.
 
+## 3.14 A shared self-test harness, and the leak it found immediately
+
+```
+Akuma/amd64 self-test: 39 passed, 0 failed
+Akuma/amd64 — all self-tests passed
+```
+
+`crates/akuma-selftest` — no dependencies, no allocation, `forbid(unsafe_code)`,
+output through a caller-supplied `fn(&str)` so it knows nothing about PL011 vs
+16550 vs a host `print!`.
+
+It exists because both sides of this tree had grown the same shape. `src/tests.rs`
+and `src/process_tests.rs` are 36k lines of `fn test_*() -> bool` with ad-hoc
+printing at each site, and `amd64/` had reached seven smoke tests each
+hand-rolling `if ok { "[OK]" } else { "[FAIL]" }`. **Neither had a tally**, so a
+failing check printed `[FAIL]` and the boot carried on and announced success.
+`Suite::report` is `#[must_use]` for exactly that reason.
+
+### 3.14.1 It found a leak on its first run
+
+Converting `idt::smoke_test` turned a passing test into a failing one:
+
+```
+demand paging: no frame leak   [FAIL] got 0x1ed80 want 0x1ed82
+```
+
+The previous version printed `frames 126348 -> 126346` and scored itself `[OK]`.
+The two-frame shortfall was **in the output and not in the condition** — the
+`ok` flag covered faults, readback and unmap, and the frame count was decoration.
+
+The frames are real and the behaviour is correct: they are the page directory and
+page table allocated to describe the 2 GiB test region. `unmap_page` clears the
+leaf and deliberately does not reclaim the tables above it, because doing so
+safely needs a per-table live-entry count — another mapping may still sit in the
+same table. So the test now pins the number at exactly 2, with the reasoning; if
+table reclaim is ever implemented it becomes 0 and the test says so.
+
+### 3.14.2 `check_eq` rather than `check`
+
+A bool can only report that something was wrong. The Stage H bug (§3.13.3) was
+diagnosed by its *value*: an exit status of `0x37` is 55, the length of the
+message the process had just written, which named the cause immediately. So
+`check_eq` prints both sides on failure and is the primary API, not a
+convenience.
+
+### 3.14.3 The harness's own bug, caught on the host
+
+`NUM_BUF` was sized 18 — `0x` plus 16 hex digits. Decimal needs **20**:
+`u64::MAX` is 18446744073709551615. `dec` panicked with "index out of bounds: the
+len is 18 but the index is 18".
+
+In a kernel that is a panic raised *by the diagnostic path*, which is the one
+place a panic is least useful — the harness would have taken down the boot it was
+reporting on. It was caught by a host unit test on the edge values, in a crate
+that needs no VM to test. That is the argument for the extraction in miniature.
+
+### 3.14.4 Not adopted in `src/` yet
+
+`src/` keeps its existing style. Converting 36k lines of boot tests is a separate
+change with its own risk, and the harness is useful to the amd64 target on its
+own. The crate is deliberately arch-neutral and dependency-free so that
+conversion can happen incrementally, a suite at a time, whenever it is worth it.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at
