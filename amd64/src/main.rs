@@ -54,6 +54,8 @@ mod paging;
 #[cfg(target_arch = "x86_64")]
 mod port;
 #[cfg(target_arch = "x86_64")]
+mod sched;
+#[cfg(target_arch = "x86_64")]
 mod serial;
 
 #[cfg(target_arch = "x86_64")]
@@ -151,6 +153,11 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         idt::smoke_test();
         if lapic::init() {
             lapic::smoke_test();
+            // Restart the timer the smoke test stopped: the scheduler wants a
+            // live tick to drive NEED_RESCHED.
+            lapic::start_timer();
+            sched::smoke_test();
+            lapic::stop_timer();
         }
         serial::puts("\nAkuma/amd64 — memory subsystem up\n");
     } else {

@@ -118,6 +118,7 @@ pub fn ticks() -> u64 {
 /// Called from the timer vector.
 pub fn on_tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    crate::sched::set_need_resched();
     eoi();
 }
 
@@ -167,14 +168,7 @@ pub fn init() -> bool {
 
     idt::set_handler(TIMER_VECTOR, idt::timer_interrupt_entry());
 
-    write(REG_TIMER_DIV, TIMER_DIV_16);
-    write(REG_LVT_TIMER, u32::from(TIMER_VECTOR) | LVT_TIMER_PERIODIC);
-    // Initial count is deliberately uncalibrated. The LAPIC counts at the core
-    // crystal frequency, which needs CPUID leaf 0x15 or calibration against
-    // another clock to convert into wall time — and nothing here needs wall time
-    // yet. This value just has to produce ticks at a rate a spin loop can
-    // observe without waiting all day.
-    write(REG_TIMER_INIT, 1_000_000);
+    start_timer();
 
     serial::puts("  lapic: base=0x");
     serial::put_hex(base);
@@ -184,6 +178,20 @@ pub fn init() -> bool {
     serial::put_dec(u64::from(TIMER_VECTOR));
     serial::puts(" periodic\n");
     true
+}
+
+/// Arm the periodic timer.
+///
+/// The initial count is deliberately **uncalibrated**. The LAPIC counts at the
+/// core crystal frequency, which needs CPUID leaf `0x15` or calibration against
+/// another clock to convert into wall time — and nothing here needs wall time
+/// yet. This value only has to tick fast enough for a bounded spin loop to
+/// observe without waiting all day — it was 1_000_000 until the scheduler test
+/// needed several ticks inside one short workload and saw none.
+pub fn start_timer() {
+    write(REG_TIMER_DIV, TIMER_DIV_16);
+    write(REG_LVT_TIMER, u32::from(TIMER_VECTOR) | LVT_TIMER_PERIODIC);
+    write(REG_TIMER_INIT, 100_000);
 }
 
 /// Stop the timer. Used after the smoke test so later output is not interleaved
