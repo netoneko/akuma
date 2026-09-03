@@ -228,6 +228,155 @@ fn print_delta(label: &str, before: u64, after: u64) -> bool {
     delta >= REGRESSION_PCT
 }
 
+/// Fraction of deleted bytes that must come back before the filesystem is
+/// considered to be reclaiming. Well below 100 % on purpose: directory blocks,
+/// group metadata and the probe's own dirs move a little in both directions.
+const RECLAIM_OK_PCT: i64 = 80;
+
+/// Unpinned control phase: bytes to create and delete with nothing mapping them.
+const RECLAIM_BYTES: usize = 32 * 1024 * 1024;
+const RECLAIM_FILE_SIZE: usize = 256 * 1024;
+
+/// Pinned phase. **Deliberately more than `inode_pin`'s 1024 slots**: the leak
+/// needs the pin table to overflow, after which `is_pinned` answers `true` for
+/// every inode and every unlink defers.
+const PINNED_FILES: usize = 1200;
+const PINNED_FILE_SIZE: usize = 64 * 1024;
+
+/// `(consumed_bytes, returned_bytes)` for a create-then-delete cycle, or `None`
+/// if `statfs` is unavailable.
+fn space_delta(before: u64, mid: u64, after: u64, bsize: u64) -> (u64, u64) {
+    (
+        before.saturating_sub(mid) * bsize,
+        after.saturating_sub(mid) * bsize,
+    )
+}
+
+fn report(label: &str, consumed: u64, returned: u64) -> Option<i64> {
+    print("ext2probe: reclaim[");
+    print(label);
+    print("]: consumed=");
+    print_dec((consumed / 1024) as usize);
+    print("KB returned=");
+    print_dec((returned / 1024) as usize);
+    println("KB");
+    if consumed == 0 {
+        print("ext2probe: reclaim[");
+        print(label);
+        println("]: INCONCLUSIVE (create consumed no measurable space)");
+        return None;
+    }
+    let pct = (returned as i64).saturating_mul(100) / consumed as i64;
+    print("ext2probe: reclaim[");
+    print(label);
+    print("]: ");
+    print_dec(pct.max(0) as usize);
+    println("% of deleted bytes returned");
+    Some(pct)
+}
+
+/// Control: create and delete files that **nothing maps**. `release_last_link`
+/// takes its immediate-free path here, so this must reclaim ~everything. If even
+/// this leaks, the defect is not the pin/deferral interaction.
+fn reclaim_unpinned(ops: &dyn FsOps, dir: &str) -> Option<i64> {
+    let n = RECLAIM_BYTES / RECLAIM_FILE_SIZE;
+    let (bsize, _, before) = libakuma::statfs_free("/")?;
+    ops.mkdir(dir);
+    workload::create_files(ops, dir, n, RECLAIM_FILE_SIZE);
+    let (_, _, mid) = libakuma::statfs_free("/")?;
+    workload::delete_files(ops, dir, n);
+    rmdir(dir);
+    let (_, _, after) = libakuma::statfs_free("/")?;
+    let (c, r) = space_delta(before, mid, after, bsize);
+    report("unpinned", c, r)
+}
+
+/// **The model of the leak.** Unlink every file *while a mapping still holds its
+/// inode*, then drop the mappings and ask whether the blocks came back.
+///
+/// Sequence, and every step matters:
+///   1. create `PINNED_FILES` files (> the 1024-slot pin table on purpose),
+///   2. `mmap` each one file-backed and close the fd — the mapping keeps the
+///      `InodePin`, so the inode is pinned with no fd open,
+///   3. `unlink` all of them: `is_pinned` is true, so each free is *deferred*
+///      onto the 256-slot list, which overflows at 256 and — before the fix —
+///      silently leaked the rest because `release_last_link` discarded
+///      `DeferredFrees::push`'s `false`,
+///   4. `munmap` everything, dropping the pins,
+///   5. the next filesystem operation should drain the deferral list and return
+///      the blocks.
+///
+/// A healthy filesystem returns ~all of it. Leaking returns ~0. Measured on the
+/// pre-fix kernel: 49.4 MB deleted, **0 bytes back**.
+fn reclaim_pinned(ops: &dyn FsOps, dir: &str) -> Option<i64> {
+    use libakuma::{close, mmap_file, munmap, open, open_flags::{O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY}};
+    const PROT_READ: u32 = 0x1;
+    const MAP_PRIVATE: u32 = 0x02;
+
+    let (bsize, _, before) = libakuma::statfs_free("/")?;
+    ops.mkdir(dir);
+
+    // 1. create
+    let buf = alloc::vec![b'p'; PINNED_FILE_SIZE];
+    for i in 0..PINNED_FILES {
+        let path = alloc::format!("{}/p{}", dir, i);
+        let fd = open(&path, O_CREAT | O_WRONLY | O_TRUNC);
+        if fd < 0 {
+            break;
+        }
+        let _ = write(fd, &buf);
+        close(fd);
+    }
+    let (_, _, mid) = libakuma::statfs_free("/")?;
+
+    // 2. map each, then close the fd — the mapping holds the pin
+    let mut maps = alloc::vec::Vec::with_capacity(PINNED_FILES);
+    let mut pinned = 0usize;
+    for i in 0..PINNED_FILES {
+        let path = alloc::format!("{}/p{}", dir, i);
+        let fd = open(&path, O_RDONLY);
+        if fd < 0 {
+            continue;
+        }
+        let addr = mmap_file(0, PINNED_FILE_SIZE, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if addr != usize::MAX && addr != 0 {
+            maps.push(addr);
+            pinned += 1;
+        }
+    }
+    print("ext2probe: reclaim[pinned]: mapped ");
+    print_dec(pinned);
+    print(" of ");
+    print_dec(PINNED_FILES);
+    println(" files (pin table has 1024 slots)");
+
+    // 3. unlink while mapped -> every free is deferred
+    for i in 0..PINNED_FILES {
+        let path = alloc::format!("{}/p{}", dir, i);
+        libakuma::unlink(&path);
+    }
+
+    // 4. drop the pins
+    for addr in &maps {
+        munmap(*addr, PINNED_FILE_SIZE);
+    }
+
+    // 5. give the drain something to run on, then measure
+    let drain = alloc::format!("{}/drain", dir);
+    let fd = open(&drain, O_CREAT | O_WRONLY | O_TRUNC);
+    if fd >= 0 {
+        let _ = write(fd, b"x");
+        close(fd);
+    }
+    libakuma::unlink(&drain);
+    rmdir(dir);
+
+    let (_, _, after) = libakuma::statfs_free("/")?;
+    let (c, r) = space_delta(before, mid, after, bsize);
+    report("pinned", c, r)
+}
+
 #[no_mangle]
 pub extern "C" fn main() {
     let stress_files: usize = libakuma::arg(1)
@@ -273,12 +422,36 @@ pub extern "C" fn main() {
     regressed |= print_delta("seq_read ", r1, r2);
     regressed |= print_delta("list_dir ", l1, l2);
 
+    // Space reclamation — a different failure from the timing one above, and the
+    // one that actually kills long campaigns. Run AFTER the stress pass, because
+    // the pin-table overflow that triggers the leak needs a workload to provoke
+    // it; on a freshly booted guest the tables are empty and unlink works.
+    println("");
+    println("ext2probe: --- space reclamation ---");
+    let unpinned = reclaim_unpinned(&ops, "/probe/reclaim");
+    let pinned = reclaim_pinned(&ops, "/probe/pinned");
+
     rmdir("/probe");
 
     if regressed {
         println("ext2probe: REGRESSION (>=20% slower on at least one op after the mass delete)");
     } else {
         println("ext2probe: NO REGRESSION");
+    }
+    // Two verdicts, because they fail for different reasons. `unpinned` failing
+    // means the ordinary free path is broken; `pinned` failing is the
+    // pin/deferral leak specifically.
+    match (unpinned, pinned) {
+        (Some(u), Some(p)) if u >= RECLAIM_OK_PCT && p >= RECLAIM_OK_PCT => {
+            println("ext2probe: SPACE OK")
+        }
+        (Some(u), Some(_)) if u >= RECLAIM_OK_PCT => println(
+            "ext2probe: SPACE LEAK (unlink of a MAPPED file did not return its blocks — pin/deferral leak)",
+        ),
+        (Some(_), _) => println(
+            "ext2probe: SPACE LEAK (even unmapped unlink did not return its blocks)",
+        ),
+        _ => println("ext2probe: SPACE INCONCLUSIVE"),
     }
     exit(0);
 }

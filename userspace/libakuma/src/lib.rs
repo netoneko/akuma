@@ -73,6 +73,7 @@ pub mod syscall {
     pub const MMAP: u64 = 222;
     pub const GETDENTS64: u64 = 61;
     pub const MKDIRAT: u64 = 34;
+    pub const STATFS: u64 = 43;
     pub const UNLINKAT: u64 = 35;
     pub const SYMLINKAT: u64 = 36;
     pub const RENAMEAT: u64 = 38;
@@ -568,6 +569,32 @@ pub fn mmap(addr: usize, len: usize, prot: u32, flags: u32) -> usize {
         0,
     );
     result as usize
+}
+
+/// Map a **file** into memory.
+///
+/// [`mmap`] hardcodes `fd = 0, offset = 0`, so it can only make anonymous
+/// mappings. This variant passes both through, which is what a probe needs to
+/// hold an inode open: a file-backed mapping takes an `InodePin`, and that pin
+/// is what makes an `unlink` of the file *deferred* rather than immediate — the
+/// precondition for the ext2 unlink leak
+/// (`docs/archive/EXT2_UNLINK_INODE_BLOCK_LEAK.md`).
+///
+/// The fd may be closed immediately after this returns; the mapping, and
+/// therefore the pin, outlives it.
+///
+/// Returns the mapped address, or `usize::MAX` on failure.
+#[inline(always)]
+pub fn mmap_file(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usize) -> usize {
+    syscall(
+        syscall::MMAP,
+        addr as u64,
+        len as u64,
+        prot as u64,
+        flags as u64,
+        fd as u64,
+        offset as u64,
+    ) as usize
 }
 
 /// Unmap memory pages
@@ -1134,6 +1161,34 @@ pub fn mkdir(path: &str) -> i32 {
 }
 
 /// Delete a file
+/// Filesystem free space, as `(block_size, total_blocks, free_blocks)`.
+///
+/// Exists for `ext2probe`'s space-reclamation phase: the ext2 unlink leak
+/// (`docs/archive/EXT2_UNLINK_INODE_BLOCK_LEAK.md`) is only observable as "bytes
+/// deleted but never returned", so a probe for it has to read the filesystem's
+/// own free count rather than trust `du`.
+///
+/// Reads only the first three `i64`s it needs out of the 120-byte
+/// `struct statfs` (`akuma_syscalls_linux::stat::Statfs`): `f_bsize` at +8,
+/// `f_blocks` at +16, `f_bfree` at +24. Returns `None` on error.
+#[must_use]
+pub fn statfs_free(path: &str) -> Option<(u64, u64, u64)> {
+    let path_c = alloc::format!("{}\0", path);
+    // 120-byte buffer, 8-byte aligned so the i64 reads are aligned.
+    let mut buf = [0u64; 15];
+    let r = syscall(
+        syscall::STATFS,
+        path_c.as_ptr() as u64,
+        buf.as_mut_ptr() as u64,
+        0, 0, 0, 0,
+    ) as i64;
+    if r < 0 {
+        return None;
+    }
+    // buf[1] = f_bsize, buf[2] = f_blocks, buf[3] = f_bfree
+    Some((buf[1], buf[2], buf[3]))
+}
+
 pub fn unlink(path: &str) -> i32 {
     let path_c = alloc::format!("{}\0", path);
     syscall(

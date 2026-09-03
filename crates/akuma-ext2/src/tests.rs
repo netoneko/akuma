@@ -66,6 +66,15 @@ fn mount_populated() -> Ext2Filesystem<MemBlockDevice> {
     Ext2Filesystem::new(load_fixture("populated.ext2"), || 0).unwrap()
 }
 
+/// 4 MB / 2048-inode image. `test.ext2` has only **256 inodes**, which is
+/// exactly the deferral bound this fixture exists to exceed — a test of "more
+/// concurrent pinned unlinks than the list holds" cannot be written against a
+/// filesystem that cannot hold that many files. Built with
+/// `mke2fs -t ext2 -b 1024 -N 2048 -I 128 -O ^resize_inode,^dir_index`.
+fn mount_many_inodes() -> Ext2Filesystem<MemBlockDevice> {
+    Ext2Filesystem::new(load_fixture("manyinodes.ext2"), || 0).unwrap()
+}
+
 // ── BlockDevice unit tests ──────────────────────────────────────────
 
 #[test]
@@ -916,6 +925,78 @@ fn repeated_pin_unlink_cycles_do_not_exhaust_the_deferral_list() {
         0,
         "no inode should ever have been leaked at this scale",
     );
+}
+
+/// **Regression test for the ~148 MB/build on-disk leak.** Hold more inodes
+/// pinned-and-unlinked *simultaneously* than the deferral list used to hold.
+///
+/// This is the shape `ext2probe`'s pinned phase measured on a live guest: 1200
+/// files unlinked while a mapping held each one returned only 21 % of their
+/// blocks, with `defer_leak` landing on exactly `1200 - 256` = **944**. The
+/// cause was two defects at one line — `DEFERRED_FREE_SLOTS` was 256, and
+/// `release_last_link` called `DeferredFrees::push` as a bare statement, so the
+/// `false` meaning "no room, you must handle this" was discarded and the caller
+/// zeroed `hard_links` anyway. See `EXT2_UNLINK_INODE_BLOCK_LEAK.md`.
+///
+/// 300 is chosen to sit **above the old 256 bound and far below the new one**,
+/// so this test fails on the pre-fix code and passes after. All 300 pins are
+/// held live across every unlink on purpose: releasing them one at a time would
+/// let the list drain and never reach the cliff.
+#[test]
+fn pinned_unlinks_beyond_the_old_bound_leak_nothing() {
+    let _serial = pin_test_serial();
+    // NOT `mount_empty()`: `test.ext2` holds 256 inodes, the very bound under
+    // test, so it runs out of inodes before it can overflow the list.
+    let fs = mount_many_inodes();
+    let leaked_before = crate::DEFERRED_FREE_LEAKED.load(core::sync::atomic::Ordering::Relaxed);
+
+    const N: usize = 300;
+    let mut pins = alloc::vec::Vec::with_capacity(N);
+    let mut inodes = alloc::vec::Vec::with_capacity(N);
+    for i in 0..N {
+        let name = alloc::format!("/pinned{i}");
+        fs.write_file(&name, b"payload-that-owns-a-block").unwrap();
+        let inode = fs.resolve_inode(&name).unwrap();
+        inodes.push(inode);
+        // Pin BEFORE unlinking, and keep it: this is what forces the deferral.
+        pins.push(akuma_primitives::InodePin::new(inode));
+    }
+    for i in 0..N {
+        fs.remove_file(&alloc::format!("/pinned{i}")).unwrap();
+    }
+
+    // Every one of them must be queued, not abandoned.
+    assert_eq!(
+        fs.deferred_free_len(),
+        N,
+        "all {N} pinned unlinks must be queued; a smaller number means the list \
+         overflowed and the surplus was leaked",
+    );
+    assert_eq!(
+        crate::DEFERRED_FREE_LEAKED.load(core::sync::atomic::Ordering::Relaxed),
+        leaked_before,
+        "no inode may be leaked at {N} concurrent pinned unlinks",
+    );
+
+    // Drop the pins and give the drain something to run on.
+    drop(pins);
+    fs.write_file("/drain", b"x").unwrap();
+
+    assert_eq!(fs.deferred_free_len(), 0, "the list must fully drain once unpinned");
+
+    // Deliberately NOT a read-back of each freed inode. Freed inode *numbers*
+    // are immediately reusable, and the `/drain` write above takes one — the
+    // first attempt at this assertion failed on "inode 12 should have been
+    // freed" because `/drain` had been allocated into inode 12 and legitimately
+    // read back its 1 byte. The allocator racing the assertion says nothing
+    // about the leak.
+    //
+    // What the leak actually is, and therefore what this test asserts, is above:
+    // every pinned unlink was QUEUED (`deferred_free_len() == N`, which was
+    // `256` before the fix), nothing was counted as leaked, and the queue
+    // emptied once the pins dropped. Reuse of those inode numbers is itself
+    // evidence the frees landed.
+    let _ = inodes;
 }
 
 /// The read lever itself, measured deterministically instead of timed.

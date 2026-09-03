@@ -1847,6 +1847,45 @@ fn run_async_main() -> ! {
                     crate::pmm::free_count(), crate::pmm::total_count(),
                     crate::allocator::stats().heap_size / 1024 / 1024);
             }
+            // Inode-lifecycle tripwires, on the periodic cadence.
+            //
+            // These four were previously reachable ONLY from `dp_counters_line`,
+            // which only the sync-EL1 **crash handler** calls
+            // (`akuma-exceptions` :4025). So the two that matter were invisible
+            // on every boot that did not crash — which is
+            // `EXT2_UNLINK_INODE_BLOCK_LEAK.md` §4's answer to "why did this go
+            // unnoticed", and §6.4's "do this one regardless of which fix is
+            // chosen". Four relaxed atomic loads per 30 s.
+            //
+            // `pin=` rises and falls with the build (inodes a live mapping holds
+            // open). The other three are the alarms:
+            //   `pin_ovf=` non-zero  -> the pin table ran out and `is_pinned`
+            //                           now answers TRUE FOR EVERY INODE, so
+            //                           every unlink defers. One leaked pin
+            //                           holder poisons this permanently.
+            //   `defer=`             -> unlinked-but-still-mapped inodes waiting
+            //                           to be freed; must drain toward 0.
+            //   `defer_leak=` non-0  -> inodes (and every block they own)
+            //                           abandoned because the 256-slot deferral
+            //                           list was full. **Must stay 0.** This is
+            //                           the ~148 MB/build on-disk leak.
+            // Ungated: these are "must stay 0" tripwires, and gating them behind
+            // a feature is what hid them for the whole of the last campaign.
+            {
+                let ovf = akuma_primitives::inode_pin::OVERFLOW.load(Ordering::Relaxed);
+                let leak = akuma_ext2::DEFERRED_FREE_LEAKED.load(Ordering::Relaxed);
+                crate::safe_print!(192,
+                    "[INODE] pin={} pin_ovf={} defer={} defer_leak={}{}\n",
+                    akuma_primitives::inode_pin::pinned_inodes(),
+                    ovf,
+                    akuma_ext2::deferred_free_pending(),
+                    leak,
+                    if leak > 0 {
+                        "  *** LEAKING INODES+BLOCKS ON UNLINK ***"
+                    } else if ovf > 0 {
+                        "  *** PIN TABLE OVERFLOWED: every unlink now defers ***"
+                    } else { "" });
+            }
             // Memory-pressure budget, same cadence and deliberately next to
             // `[FSCACHE]` so occupancy and pressure are read together.
             //

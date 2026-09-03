@@ -561,7 +561,21 @@ pub static E2_READ_AT_EOF: AtomicUsize = AtomicUsize::new(0);
 /// A fixed array of atomics rather than a `Vec` because it is manipulated under
 /// the state write lock on paths that must not allocate, and because a bounded
 /// structure cannot itself become the reason a free is lost.
-const DEFERRED_FREE_SLOTS: usize = 256;
+/// Slots for inodes awaiting a deferred free.
+///
+/// **256 until 2026-09-03, and that bound was the whole of the ~148 MB/build
+/// on-disk leak.** `ext2probe`'s pinned phase unlinks 1200 files while a mapping
+/// holds each one: 256 fitted the list and were freed correctly, and
+/// `defer_leak` came out at **exactly 944** — `1200 - 256` — with 62.7 MB of
+/// blocks abandoned (`EXT2_UNLINK_INODE_BLOCK_LEAK.md` §2.3).
+///
+/// Sized against *peak concurrent* deferrals rather than the cumulative total,
+/// because the list drains as soon as pins drop (`defer=0` after every probe
+/// run). 4096 entries is 16 KB of `.bss` and covers the probe's 1200 with room;
+/// `release_last_link` additionally forces a drain and retries before it will
+/// leak, so the bound has to be exceeded by inodes that are *all still pinned*
+/// at one instant for anything to be lost.
+const DEFERRED_FREE_SLOTS: usize = 4096;
 
 /// The per-filesystem list of inodes whose last name was removed while a mapping
 /// still held them pinned. The dirent is gone, but the inode keeps its size and
@@ -583,8 +597,19 @@ impl DeferredFrees {
         Self { slots: [const { AtomicU32::new(0) }; DEFERRED_FREE_SLOTS] }
     }
 
-    /// Record `inode` for a later free. Returns `false` if there was no room, in
-    /// which case the caller must leak it rather than free it.
+    /// Record `inode` for a later free. `false` means there was no room.
+    ///
+    /// `#[must_use]`, and that attribute is the fix for a real defect: the sole
+    /// caller invoked this as a bare statement, so `false` — "I could not record
+    /// this, you must handle it" — was silently discarded and the caller went on
+    /// to zero `hard_links` and write the inode back, leaving it allocated with
+    /// no name and no queued free. That is the on-disk leak.
+    ///
+    /// Deliberately does **not** touch [`DEFERRED_FREE_LEAKED`]: it does not
+    /// know whether the caller will retry, and counting here double-counted a
+    /// single inode across a drain-and-retry. The caller increments it at the
+    /// point it actually gives up.
+    #[must_use]
     fn push(&self, inode: u32) -> bool {
         for slot in &self.slots {
             if slot.load(Ordering::Relaxed) != 0 {
@@ -595,7 +620,6 @@ impl DeferredFrees {
                 return true;
             }
         }
-        DEFERRED_FREE_LEAKED.fetch_add(1, Ordering::Relaxed);
         false
     }
 }
@@ -2293,12 +2317,27 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         inode: &mut Inode,
     ) -> Result<(), FsError> {
         if akuma_primitives::inode_pin::is_pinned(inode_num) {
-            // If the deferral list is full the inode is *leaked*, not freed: it
-            // stays allocated with no name and no queued free, and only `e2fsck`
-            // reclaims it. `DeferredFrees::push` counts that case. Leaking blocks
-            // is recoverable; handing a reader another file's bytes is not, so
-            // the overflow falls this way deliberately.
-            self.deferred.push(inode_num);
+            // A live mapping still names this inode, so it cannot be freed now —
+            // queue it. `push`'s result is load-bearing and was previously
+            // discarded, which is what leaked ~148 MB per self-host build.
+            if !self.deferred.push(inode_num) {
+                // The list is full. Before giving up, free whatever in it is no
+                // longer pinned — entries become drainable the moment their last
+                // mapping goes, and nothing else on this path forces that sweep.
+                // This turns "the list is full" into the much rarer "the list is
+                // full of inodes that are ALL still pinned".
+                self.drain_deferred_frees(state);
+                if !self.deferred.push(inode_num) {
+                    // Genuinely out of room. Leak it: the blocks stay allocated
+                    // with no name, and only `e2fsck` reclaims them. Leaking is
+                    // recoverable, handing a reader another file's bytes is not,
+                    // so the overflow still falls this way deliberately — but it
+                    // is now counted here (once) and printed every 30 s on the
+                    // `[INODE]` line, so raising `DEFERRED_FREE_SLOTS` is a
+                    // decision someone can actually see the need for.
+                    DEFERRED_FREE_LEAKED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             inode.hard_links = 0;
             return self.write_inode(state, inode_num, inode);
         }

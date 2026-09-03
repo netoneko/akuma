@@ -1,5 +1,13 @@
 # Deleting files frees no space: ext2 leaks inodes and blocks on unlink
 
+**Status: FIXED 2026-09-03** — `DEFERRED_FREE_SLOTS` 256 -> 4096, `#[must_use]`
+on `DeferredFrees::push`, and a forced drain-and-retry before `release_last_link`
+will give up. Verified on a live guest by `ext2probe`'s new pinned phase:
+`defer_leak` **944 -> 0**, reclamation of unlinked-while-mapped blocks
+**21 % -> 85 %** (the remaining 15 % is the lazy drain, not loss — see §2.3), and
+a host regression test that fails at the old bound. The §3.1 amplifier is
+**deliberately still there**; §6 says why.
+
 **Date:** 2026-09-03
 **Status:** **OPEN** — root-caused and measured, not fixed.
 **Reproduce:** on any devbox with a build tree, `cargo clean` (or `rm -rf` a large
@@ -142,6 +150,39 @@ resolves to the *proc* mount and reports `Available=0`, which reads as a full di
 on an image with a gigabyte free — it aborted a measurement run once before being
 noticed.
 
+### 2.3 `ext2probe` pinned phase — the defect isolated, before and after
+
+`userspace/ext2probe` gained a two-phase space-reclamation section that models
+this defect directly (`reclaim_unpinned` / `reclaim_pinned`). The pinned phase is
+the one that matters: create 1200 files, `mmap` each **file-backed** and close the
+fd so the *mapping* holds the `InodePin`, `unlink` all 1200 while mapped so every
+free is deferred, `munmap`, then ask `statfs` how much came back.
+
+| | pre-fix | post-fix |
+|---|---|---|
+| `reclaim[unpinned]` (control) | 100 % | 100 % |
+| `reclaim[pinned]` | **21 %** (17 424 / 81 616 KB) | **85 %** (69 580 / 81 616 KB) |
+| `[INODE] defer_leak=` | **944** | **0** |
+| verdict | `SPACE LEAK` | `SPACE OK` |
+
+Two numbers make the mechanism unambiguous:
+
+- **Pre-fix `17 424 KB` returned = 272 files' worth of 64 KB, against a 256-slot
+  list.** 256 entries fitted and were freed correctly; `defer_leak` came out at
+  exactly **944 = 1200 - 256**. The bound *was* the leak.
+- **Post-fix the missing 15 % is accounted for, not lost.** `defer=177` at the
+  sample, and `81 616 - 69 580 = 12 036 KB` ~ `177 x 64 KB`. Those blocks are
+  queued and will be freed by the next drain. This is why `RECLAIM_OK_PCT` in the
+  probe is 80 and not 100: a correct lazy drain legitimately leaves a tail.
+
+The control phase reading 100 % in both columns is what localises the defect —
+the ordinary immediate-free path was never broken.
+
+**Note on `pin_ovf`.** It reads 0 in both runs, but it is a *live gauge*, not a
+cumulative counter: `release` decrements it when it finds no entry, so it
+self-clears once pins drop and cannot tell you whether it overflowed mid-run.
+Do not read `pin_ovf=0` after the fact as "the table never overflowed".
+
 ## 3. Root cause
 
 `crates/akuma-ext2/src/ext2.rs`. Unlinking an inode that a live mapping still
@@ -217,7 +258,53 @@ A related trap: `du` and `df` disagree, because the leaked blocks belong to no
 file. `du -sx /` will report far less than `df` says is used, and that gap **is**
 the leak — it is a cheap in-guest test that needs no reboot.
 
-## 6. Fix options
+## 6. Fix options — and what was actually done (2026-09-03)
+
+**Applied: 1 (bounded form), 2 (as a retry), and 4. Option 3 deliberately not.**
+
+1. **Bound raised, not made growable.** `DEFERRED_FREE_SLOTS` 256 -> 4096
+   (16 KB of `.bss`). Sized against *peak concurrent* deferrals rather than the
+   cumulative total, because the list drains as soon as pins drop — `defer`
+   returns to 0 after every probe run. A growable `Vec` was rejected: the
+   deferral list is touched from `&mut Ext2State` paths, and an unbounded list
+   would trade a recoverable **disk** leak for an unbounded **kernel-heap** one
+   the moment anything did latch `is_pinned` on (§3.1).
+2. **Applied as a drain-and-retry rather than an immediate free.** On a full list
+   `release_last_link` now forces `drain_deferred_frees` and retries the push.
+   The doc's original phrasing — "fall back to an immediate free when the inode
+   is not actually pinned" — is **not** safe as written: under §3.1 you cannot
+   distinguish "no pin recorded" from "pin lost to overflow", so freeing on that
+   basis risks handing a live mapping another file's blocks. The retry gets the
+   same benefit (entries become drainable the instant their last mapping goes)
+   with none of that risk. Plus `#[must_use]` on `push`, because the whole defect
+   was its `bool` being discarded at the one call site.
+3. **The amplifier is still there, on purpose.** `is_pinned` still answers `true`
+   for every inode while `OVERFLOW > 0`, and that can still latch permanently:
+   `release` only decrements when it finds no entry, and a *leaked pin holder*
+   never calls `release` at all. It was left alone because the measurement said
+   it was not load-bearing for this leak — `pin_ovf=0` and `defer=0`, i.e. the
+   drain worked — and rewriting overflow semantics in a lock-free table on a
+   hunch is how a recoverable disk leak becomes a corrupted mapping. It is now
+   *visible* on `[INODE]`, which is the precondition for fixing it if it fires.
+   If you do fix it, confine the overflow to the hash region that overflowed
+   (`slot_of(inode)`'s neighbourhood) rather than poisoning every inode; that
+   keeps the conservative direction and cuts the blast radius from 1/1 to ~1/64.
+4. **Done: the tripwire is visible.** `[INODE] pin= pin_ovf= defer= defer_leak=`
+   now prints on the same 30 s cadence as `[FSCACHE]`
+   (`akuma-kernel-glue`), with a `*** LEAKING INODES+BLOCKS ON UNLINK ***`
+   suffix when `defer_leak > 0`. Previously these four were reachable only from
+   `dp_counters_line`, which only the sync-EL1 **crash handler** calls — which is
+   §4's entire answer to "why did nobody see this".
+
+Regression coverage: `pinned_unlinks_beyond_the_old_bound_leak_nothing`
+(`crates/akuma-ext2/src/tests.rs`) holds 300 pins live — above the old bound,
+below the new — and asserts all 300 are queued, none counted leaked, and the
+queue empties. It **fails at the old bound** (`left: 256, right: 300`), verified.
+It needs the new `manyinodes.ext2` fixture because `test.ext2` has only 256
+inodes — exactly the bound under test, so it runs out of inodes before it can
+overflow the list.
+
+### 6.1 The original option list, for reference
 
 1. **Raise the bound / make the list growable.** The cheapest change, and the one
    the counter's doc already asks for. A `Vec` on the kernel heap removes the
