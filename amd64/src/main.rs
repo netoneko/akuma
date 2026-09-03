@@ -42,6 +42,8 @@ compile_error!(
 );
 
 #[cfg(target_arch = "x86_64")]
+mod acpi;
+#[cfg(target_arch = "x86_64")]
 mod blk;
 #[cfg(target_arch = "x86_64")]
 mod cmdline;
@@ -210,6 +212,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // and a driver that goes quiet.
     akuma_primitives::console::set_print_hook(serial::puts);
 
+    // What the machine says about itself, printed rather than acted on. This is
+    // the amd64 equivalent of dumping an FDT, and there is no FDT: the pieces
+    // are the E820 map above, the command line above, and — if the machine has
+    // any — the ACPI tables found by scanning for them, because `rsdp_paddr`
+    // reads 0 on both VMMs.
+    describe_machine();
+
     // Block devices, after the heap (the virtio HAL allocates DMA buffers from
     // it) and after the IDT (a bad transport address should fault reportably).
     let have_disk = blk::init(&mmio_devices);
@@ -254,6 +263,50 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     }
 
     halt();
+}
+
+/// Print the machine's ACPI inventory, or say there is none.
+///
+/// A dump, not a configuration step: nothing in this kernel consumes ACPI yet.
+/// It exists because the answer decides whether device interrupts are reachable
+/// at all on this machine — the IOAPIC's address lives in the MADT — and that is
+/// worth knowing before a stage is planned around it rather than during one.
+#[cfg(target_arch = "x86_64")]
+fn describe_machine() {
+    let Some(rsdp) = acpi::find_rsdp() else {
+        serial::puts("  acpi: none found (no RSDP in the EBDA or the BIOS window)\n");
+        return;
+    };
+    serial::puts("  acpi: RSDP at 0x");
+    serial::put_hex(rsdp.addr);
+    serial::puts(" rev=");
+    serial::put_dec(u64::from(rsdp.revision));
+    serial::puts(" oem=");
+    // The OEM id is six bytes of ASCII with no NUL; print it as such.
+    for b in rsdp.oem {
+        let c = if b.is_ascii_graphic() || b == b' ' { b } else { b'?' };
+        serial::putb(c);
+    }
+    serial::puts(" rsdt=0x");
+    serial::put_hex(u64::from(rsdp.rsdt));
+    serial::puts(" xsdt=0x");
+    serial::put_hex(rsdp.xsdt);
+    serial::puts("\n  acpi: tables:");
+    acpi::for_each_table(&rsdp, |t| {
+        serial::puts(" ");
+        for b in t.signature {
+            let c = if b.is_ascii_graphic() { b } else { b'?' };
+            serial::putb(c);
+        }
+        // Address and length, not just the signature: a dump that names tables
+        // without saying where they are cannot be checked against a guest's
+        // `/sys/firmware/acpi/tables/`, which is the cross-check this exists for.
+        serial::puts("@0x");
+        serial::put_hex(t.addr);
+        serial::puts("+");
+        serial::put_dec(u64::from(t.length));
+    });
+    serial::puts("\n");
 }
 
 /// Park the core forever with interrupts masked.

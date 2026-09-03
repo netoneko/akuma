@@ -49,6 +49,20 @@ fi
 # locally at all. Here it can.
 MACHINE="-M microvm"
 
+# Modern virtio, not legacy.
+#
+# QEMU's virtio-mmio transports default to `force-legacy=true` — version 1, the
+# pre-1.0 layout. Firecracker implements **only** the modern interface, so a
+# local run without this exercises a transport the target machine does not have:
+# different register layout, different feature negotiation, different queue
+# setup. `virtio-drivers` handles both, which is exactly why the divergence is
+# easy to miss — the driver works and the code path is wrong.
+#
+# `blk::smoke_test` asserts version 2 for this reason, and it caught the default
+# on its first run. `scripts/cargo_runner.sh` passes the same `-global` on
+# aarch64 (`docs/archive/` on the rng v2-only work).
+LEGACY_OFF="-global virtio-mmio.force-legacy=false"
+
 # The drive, and the command line that announces it.
 #
 # QEMU does not synthesise `virtio_mmio.device=` the way Firecracker does — for a
@@ -76,9 +90,10 @@ if [ "$DISK" != "none" ]; then
     APPEND="-append virtio_mmio.device=512@0xfeb00000:5"
 fi
 
-# shellcheck disable=SC2086  # DRIVE/APPEND/MACHINE are deliberately word-split
+# shellcheck disable=SC2086  # these are deliberately word-split
 exec qemu-system-x86_64 \
     $MACHINE \
+    $LEGACY_OFF \
     -kernel "$KERNEL" \
     -m "$MEMORY" \
     $DRIVE \

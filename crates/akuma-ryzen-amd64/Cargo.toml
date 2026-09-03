@@ -1,0 +1,19 @@
+[package]
+name = "akuma-ryzen-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The amd64 machine description: PVH hvm_start_info, the virtio-MMIO command line, and ACPI — parsed at run time, host-tested"
+
+[lints]
+workspace = true
+
+# No dependencies, deliberately.
+#
+# `akuma-firecracker` — the aarch64 sibling this mirrors — needs the `fdt` crate
+# because a device tree is a real format with strings, offsets and a token
+# stream. This machine hands over three much simpler things: a fixed-layout
+# struct, a whitespace-separated string, and a set of length-prefixed tables with
+# checksums. All three are read here directly, which keeps the crate buildable
+# for a bare-metal target before the heap exists and testable on the host with
+# nothing to vendor.
+[dependencies]
