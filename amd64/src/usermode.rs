@@ -30,6 +30,7 @@ use akuma_syscalls_abi::Syscall;
 use akuma_selftest::Suite;
 
 use crate::gdt;
+use crate::loader::{self, FrameSet};
 use crate::paging::{self, MemAttr, Prot};
 use crate::phys::phys_ptr;
 use crate::serial;
@@ -52,6 +53,28 @@ const EFER_SCE: u64 = 1 << 0;
 /// the constraint the higher-half move removed.
 const USER_CODE_VA: usize = 0x40_0000;
 const USER_STACK_VA: usize = 0x41_0000;
+
+/// Top of the stack given to an ELF-loaded process.
+///
+/// Near the ceiling of the lower half rather than just above the image, which is
+/// where the hand-assembled program's stack goes: an ELF decides its own extent,
+/// and `0x41_0000` is inside `hello`'s. Linux puts the stack at the top of the
+/// user address space for the same reason — it is the one place a program's
+/// segments cannot already be.
+const ELF_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
+/// Pages of stack. Two, because the initial frame is under 200 bytes and
+/// `hello` does not recurse; a real program needs a guard page and a growth
+/// policy, and this kernel has neither.
+const ELF_STACK_PAGES: usize = 2;
+
+/// The guest program, linked at [`USER_CODE_VA`] and embedded in the kernel
+/// image.
+///
+/// `include_bytes!` because this target has no disk driver, so there is nowhere
+/// to put a file it could open by path. The path comes from `amd64/build.rs`,
+/// which compiles `userspace/amd64/hello/hello.rs` with the same `rustc` that is
+/// building this kernel.
+const HELLO_ELF: &[u8] = include_bytes!(env!("USER_HELLO_ELF"));
 
 /// Where a task's kernel stack and saved user stack live.
 ///
@@ -440,11 +463,21 @@ fn build_user_program(
     n
 }
 
-/// A process: its own address space plus the frames backing it.
+/// A process: its own address space, the frames backing it, and where to start.
+///
+/// `entry` and `stack_top` are fields rather than the two module constants they
+/// used to be. That was fine while every process was the same hand-assembled
+/// blob at the same address; an ELF decides its own entry point, and its stack
+/// has to go somewhere the image does not already occupy.
 pub struct Process {
     space: paging::AddressSpace,
-    code: usize,
-    stack: usize,
+    /// Every leaf frame this process owns. `AddressSpace::free` releases page
+    /// tables, not the pages they point at — this is the other half.
+    frames: FrameSet,
+    /// Where ring 3 starts executing.
+    entry: u64,
+    /// Initial `rsp`.
+    stack: u64,
 }
 
 impl Process {
@@ -454,16 +487,32 @@ impl Process {
     /// `delay == 0` yields between rounds (cooperative); anything else spins
     /// that many iterations in ring 3 and never yields, so only preemption can
     /// take it off the CPU.
+    ///
+    /// The program is assembled byte by byte by [`build_user_program`] rather
+    /// than loaded from an image. That is deliberate even now that
+    /// [`Self::from_elf`] exists: these two tests are about the scheduler and
+    /// the timer, and a blob with no file format between it and the page table
+    /// cannot fail for a loader's reasons.
     fn new(msg: &[u8], rounds: u32, delay: u32, status: u32) -> Option<Self> {
         let space = paging::AddressSpace::new()?;
+        let mut frames = FrameSet::new();
+
         let (Some(code), Some(stack)) = (akuma_pmm::alloc_page(), akuma_pmm::alloc_page()) else {
             space.free();
             return None;
         };
+        // Recorded before anything can fail: a frame the set does not know
+        // about is a frame that leaks.
+        if !frames.push(code) || !frames.push(stack) {
+            akuma_pmm::free_page(code, 0);
+            akuma_pmm::free_page(stack, 0);
+            space.free();
+            return None;
+        }
 
-        // SAFETY: PMM frames are inside the identity map, so the physical
-        // address is a valid pointer for staging the program *before* the
-        // address space that will hold it is ever activated.
+        // SAFETY: PMM frames are reachable through the physmap, so the program
+        // can be staged *before* the address space that will hold it is ever
+        // activated.
         unsafe {
             core::ptr::write_bytes(phys_ptr::<u8>(code as u64), 0, 4096);
             core::ptr::write_bytes(phys_ptr::<u8>(stack as u64), 0, 4096);
@@ -474,44 +523,85 @@ impl Process {
         if !space.map(USER_CODE_VA, code as u64, Prot::USER_RX, MemAttr::WriteBack)
             || !space.map(USER_STACK_VA, stack as u64, Prot::USER_RW, MemAttr::WriteBack)
         {
-            akuma_pmm::free_page(code, 0);
-            akuma_pmm::free_page(stack, 0);
+            frames.free_all();
             space.free();
             return None;
         }
-        Some(Self { space, code, stack })
+        Some(Self {
+            space,
+            frames,
+            entry: USER_CODE_VA as u64,
+            stack: (USER_STACK_VA + 4096 - 16) as u64,
+        })
     }
 
-    fn free(self) {
-        akuma_pmm::free_page(self.code, 0);
-        akuma_pmm::free_page(self.stack, 0);
+    /// Build a process from a linked ELF image.
+    ///
+    /// The failure path frees the frames the loader recorded before it gave up —
+    /// which is why [`loader::load`] records them as it goes and frees nothing
+    /// itself. A half-loaded image whose frames the loader had reclaimed would
+    /// leave this space's page tables pointing at memory the PMM has since
+    /// handed to someone else.
+    fn from_elf(image: &[u8]) -> Result<Self, &'static str> {
+        let space = paging::AddressSpace::new().ok_or("no frame for a PML4")?;
+        let mut frames = FrameSet::new();
+
+        let built = loader::load(image, &space, &mut frames).and_then(|img| {
+            loader::build_stack(
+                &space,
+                &mut frames,
+                ELF_STACK_TOP,
+                ELF_STACK_PAGES,
+                b"hello",
+                img.entry,
+            )
+            .map(|rsp| (img.entry, rsp))
+        });
+
+        match built {
+            Ok((entry, stack)) => Ok(Self { space, frames, entry, stack }),
+            Err(e) => {
+                frames.free_all();
+                space.free();
+                Err(e)
+            }
+        }
+    }
+
+    fn free(mut self) {
+        self.frames.free_all();
         self.space.free();
     }
 }
 
-/// The two processes the test runs, reachable from their task entry points.
+/// The processes the tests run, reachable from their task entry points.
 ///
 /// `extern "C" fn() -> !` takes no arguments, so a task entry cannot be handed
 /// its process. A slot per process is the smallest thing that works on one core.
-static mut PROCS: [Option<Process>; 4] = [None, None, None, None];
+static mut PROCS: [Option<Process>; 5] = [None, None, None, None, None];
 
 /// Enter ring 3 for process `idx`, then mark the task finished.
 ///
 /// The scheduler has already installed this task's address space by the time
 /// this runs — `spawn_in_space` recorded the root, and `yield_now` writes `CR3`
 /// before switching stacks.
+///
+/// The entry point and stack come from the slot rather than from module
+/// constants. They were constants while every process was the same blob at the
+/// same address; an ELF's entry is `e_entry` and its stack is wherever the
+/// loader could put one.
 fn run_process(idx: usize) -> ! {
     // SAFETY: single core; each slot is written once before its task is spawned
     // and read only by that task.
-    let space_ok = unsafe {
+    let start = unsafe {
         let procs = &raw const PROCS;
-        (*procs)[idx].is_some()
+        (*procs)[idx].as_ref().map(|p| (p.entry, p.stack))
     };
-    if space_ok {
-        let user_rsp = (USER_STACK_VA + 4096 - 16) as u64;
-        // SAFETY: both pages are mapped user-accessible in the address space the
-        // scheduler installed for this task, and the program ends in exit_group.
-        let status = unsafe { enter_user_mode(USER_CODE_VA as u64, user_rsp) };
+    if let Some((entry, stack)) = start {
+        // SAFETY: both are addresses the loader (or `Process::new`) mapped
+        // user-accessible in the address space the scheduler installed for this
+        // task, and every program this kernel runs ends in exit_group.
+        let status = unsafe { enter_user_mode(entry, stack) };
         EXIT_STATUS.store(status, Ordering::Relaxed);
     }
     crate::sched::finish();
@@ -528,6 +618,9 @@ extern "C" fn proc2_entry() -> ! {
 }
 extern "C" fn proc3_entry() -> ! {
     run_process(3);
+}
+extern "C" fn proc4_entry() -> ! {
+    run_process(4);
 }
 
 /// Run two isolated processes concurrently and prove they interleave.

@@ -308,28 +308,75 @@ pub fn translate(va: usize) -> Option<u64> {
     translate_in(read_cr3(), va)
 }
 
-/// Resolve `va` in the address space rooted at `root`.
-pub fn translate_in(root: u64, va: usize) -> Option<u64> {
+/// What a page-table walk found.
+enum Walk {
+    /// Nothing maps `va`.
+    Missing,
+    /// A 2 MiB page at PD level; the entry, and the size of the page it maps.
+    Large(u64, u64),
+    /// A 4 KiB leaf entry.
+    Leaf(u64),
+}
+
+/// Walk `root` down to whatever maps `va`.
+///
+/// One walker, so that "what does this resolve to" and "what permissions does
+/// it carry" can never disagree — they are two readings of the same entry.
+fn walk_in(root: u64, va: usize) -> Walk {
     let mut table = root;
     for level in (2..=4).rev() {
-        // SAFETY: `table` is a live table frame inside the identity map.
+        // SAFETY: `table` is a live table frame reached through the physmap.
         let entry = unsafe { table_mut(table).add(index(va, level)).read_volatile() };
         if entry & P == 0 {
-            return None;
+            return Walk::Missing;
         }
         if entry & PS != 0 {
-            // A 2 MiB page at PD level: offset within it.
-            let size = 1 << 21;
-            return Some((entry & ADDR_MASK) + (va as u64 & (size - 1)));
+            // Only PD level (2) can carry PS here; a PDPT 1 GiB page is never
+            // created by this kernel, so the size is fixed.
+            return Walk::Large(entry, 1 << 21);
         }
         table = entry & ADDR_MASK;
     }
-    // SAFETY: `table` is the PT frame.
+    // SAFETY: `table` is the PT frame; the index is masked to 0..512.
     let entry = unsafe { table_mut(table).add(index(va, 1)).read_volatile() };
     if entry & P == 0 {
-        return None;
+        Walk::Missing
+    } else {
+        Walk::Leaf(entry)
     }
-    Some((entry & ADDR_MASK) + (va as u64 & (PAGE_SIZE as u64 - 1)))
+}
+
+/// Resolve `va` in the address space rooted at `root`.
+pub fn translate_in(root: u64, va: usize) -> Option<u64> {
+    match walk_in(root, va) {
+        Walk::Missing => None,
+        Walk::Large(entry, size) => Some((entry & ADDR_MASK) + (va as u64 & (size - 1))),
+        Walk::Leaf(entry) => Some((entry & ADDR_MASK) + (va as u64 & (PAGE_SIZE as u64 - 1))),
+    }
+}
+
+/// The permissions `va` is mapped with in the address space rooted at `root`.
+///
+/// The inverse of [`encode`], and the reason it exists is the ELF loader: two
+/// `PT_LOAD` segments can land in one page, and deciding what that page's
+/// permissions must become needs to *read* what they currently are. Reading the
+/// hardware's own entry rather than a shadow record is the same discipline
+/// [`translate_in`] follows — and it is what lets a self-test assert that a code
+/// page really is non-writable rather than that the loader believes it is.
+///
+/// [`MemAttr`] is deliberately not returned: nothing needs it yet, and a decoder
+/// that guesses would have to invent an answer for `PCD` without `PWT`.
+#[must_use]
+pub fn prot_in(root: u64, va: usize) -> Option<Prot> {
+    let entry = match walk_in(root, va) {
+        Walk::Missing => return None,
+        Walk::Large(entry, _) | Walk::Leaf(entry) => entry,
+    };
+    Some(Prot {
+        write: entry & RW != 0,
+        exec: entry & NX == 0,
+        user: entry & US != 0,
+    })
 }
 
 /// Map a frame outside the identity map, write through it, read it back, unmap.
@@ -438,27 +485,24 @@ pub fn drop_identity_map() {
 ///
 /// # What is shared and what is not
 ///
-/// The kernel runs identity-mapped in the first 1 GiB — image, stacks, heap, PMM
-/// pool and page tables all live there — so every address space must contain it
-/// or the first instruction after `mov cr3` faults. Rather than copy those
-/// mappings, a new space **shares the entry**: its PDPT slot 0 points at the very
-/// same page directory the kernel boot map uses, so there is one kernel mapping
-/// and no possibility of the copies drifting.
+/// The kernel lives entirely in the upper half — its image, the physmap that
+/// covers every physical page it touches, and the device window — so every
+/// address space must contain those or the first instruction after `mov cr3`
+/// faults, and the timer handler could not write EOI while a process runs.
+/// Rather than copy them, a new space **shares the entries**: its three
+/// [`SHARED_PML4_SLOTS`] point at the very same tables the kernel's own PML4
+/// does, so there is one kernel mapping and no possibility of copies drifting.
 ///
-/// The LAPIC window (`0xFEE0_0000`, PDPT slot 3) is shared for the same reason —
-/// the timer handler writes EOI, and it can fire while a process is running.
-///
-/// Everything else is private. `USER_CODE_VA` and `USER_STACK_VA` sit at
-/// `0x5000_0000`, which is PDPT slot 1, so two spaces can map different frames at
-/// the same virtual address and neither can see the other's.
+/// The whole lower half — all 256 remaining PML4 slots — is private. Two spaces
+/// can map different frames at the same virtual address and neither can see the
+/// other's, which is what [`crate::usermode::smoke_test`] checks before it runs
+/// anything.
 ///
 /// # What this is not
 ///
-/// There is no higher-half split. The kernel is identity-mapped low rather than
-/// at `0xFFFF_8000_0000_0000`, which is what the aarch64 side does with
-/// TTBR1/TTBR0. That is the right end state and it is a bigger change than this;
-/// sharing a PDPT entry buys real isolation between *user* mappings today
-/// without moving the kernel.
+/// There is no per-space kernel *stack* separation, no ASID/PCID tagging (every
+/// `mov cr3` flushes the whole non-global TLB), and no reference counting: an
+/// address space is freed by [`Self::free`] at a point the caller picks.
 pub struct AddressSpace {
     root: u64,
 }
@@ -512,6 +556,12 @@ impl AddressSpace {
     #[must_use]
     pub fn translate(&self, va: usize) -> Option<u64> {
         translate_in(self.root, va)
+    }
+
+    /// The permissions `va` carries in this space, or `None` if unmapped.
+    #[must_use]
+    pub fn prot(&self, va: usize) -> Option<Prot> {
+        prot_in(self.root, va)
     }
 
     /// Release this space's own tables.
