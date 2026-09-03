@@ -5124,6 +5124,51 @@ fn rust_sync_el0_handler_inner(frame: *mut UserTrapFrame, esr: u64, far: u64) ->
             let is_permission_fault = fault_type == 0x0C;
             let far_usize = far as usize;
 
+            // EL0 fetched an instruction from the kernel's own identity range.
+            //
+            // No user mapping is ever placed there (`ProcessMemory` refuses
+            // allocations overlapping it), so a userspace PC in that range did not
+            // come from a jump userspace could compute: it came from an `eret` that
+            // used a KERNEL ELR_EL1. The reproducible way to mint one is an
+            // exception landing between an EL0-return sequence's `msr elr_el1` and
+            // its `eret`, which replaces the user PC with the kernel PC it
+            // interrupted — see the DAIF mask at the top of `akuma-el0-entry`'s
+            // `asm!` block, and `docs/archive/ERET_ELR_CLOBBER_ENTER_USER_MODE.md`.
+            //
+            // Printed BEFORE the delivery attempt below, and unconditionally,
+            // because that attempt is where this class went dark: a process with a
+            // SIGSEGV handler registered (every Rust binary — std installs one for
+            // stack-overflow reporting) has the signal delivered with no kernel
+            // output at all, so the defect presented as an unexplained `rustc`
+            // SIGSEGV for three sessions of the self-host campaign.
+            //
+            // `eum=` is the discriminator, and it is the reason this print resolves
+            // the address instead of only reporting it. On an instruction abort FAR
+            // *is* the faulting PC, so `far == elr` holds for a wild branch into the
+            // range too and separates nothing. What does separate them is WHERE in
+            // kernel text the PC landed: a clobbered `ELR_EL1` holds the kernel PC an
+            // exception interrupted, so it points into the EL0-return sequence
+            // itself, within a few instructions of `enter_user_mode`'s `msr elr_el1`.
+            // `eum=+0x1c8` says "this is the eret window"; `eum=out` says a genuine
+            // wild branch, which is a different bug.
+            if far_in_kernel_identity_user_range(far) {
+                let elr_now = unsafe { (*frame).elr_el1 };
+                let eum = akuma_exec::process::enter_user_mode
+                    as unsafe fn(&akuma_exec::process::UserContext) -> ! as usize;
+                // 0x400 covers the whole function (~0x220 bytes measured) with room
+                // for codegen drift; a hit outside it is reported rather than hidden.
+                let off = far_usize.wrapping_sub(eum);
+                if off < 0x400 {
+                    safe_print!(240,
+                        "[ERET-CLOBBER] pid={} as_owner={} EL0 fetch at kernel VA far={:#x} elr={:#x} iss={:#x} eum=+{:#x} — eret used a kernel ELR_EL1 from inside the EL0-return sequence\n",
+                        pid, as_owner, far_usize, elr_now, iss, off);
+                } else {
+                    safe_print!(240,
+                        "[ERET-CLOBBER] pid={} as_owner={} EL0 fetch at kernel VA far={:#x} elr={:#x} iss={:#x} eum=out (enter_user_mode={:#x}) — EL0 PC in kernel text, NOT the eret window\n",
+                        pid, as_owner, far_usize, elr_now, iss, eum);
+                }
+            }
+
             // Lazy region permission upgrade: an instruction fetch hit a page this
             // address space has mapped non-executable. Upgrade it to `RX` and run the
             // I-cache maintenance for the frame, which the demand-paging body

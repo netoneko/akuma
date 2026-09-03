@@ -112,6 +112,40 @@ pub unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
     // x30 is pinned as the context pointer and loaded last to avoid corruption.
     unsafe {
         core::arch::asm!(
+            // Mask IRQs for the whole exception-return sequence.
+            //
+            // THIS MUST BE THE FIRST INSTRUCTION, and it must stay ahead of the
+            // `msr elr_el1` below. `eret` reads ELR_EL1 and SPSR_EL1 *live*, and
+            // an exception taken between writing them and the `eret` OVERWRITES
+            // ELR_EL1 with the kernel PC it interrupted — the user PC is simply
+            // gone, and nothing downstream can tell. `leave_kernel()` above ends
+            // by restoring the caller's DAIF, and every caller (initial launch,
+            // execve) reaches here with IRQs enabled, so before this line the
+            // window was open on a live timer tick:
+            //
+            //   msr elr_el1, x20   <- user PC
+            //   <IRQ>              ELR_EL1 := &"msr spsr_el1" ; SPSR_EL1 := EL1h
+            //   msr spsr_el1, x9   <- user SPSR (EL0t) written OVER the IRQ's
+            //   ...                   so SPSR is now user but ELR is kernel
+            //   eret               -> EL0 at a kernel text address
+            //
+            // which lands as an EL0 instruction abort, permission fault, with
+            // `FAR == ELR ==` the address of the `msr spsr_el1` in this very
+            // block — the unexplained intermittent `rustc` SIGSEGV of the
+            // self-host campaign (docs/archive/ERET_ELR_CLOBBER_ENTER_USER_MODE.md).
+            // An IRQ in the wider window (after `msr spsr_el1`, before `eret`)
+            // erets to that kernel PC with SPSR still EL1h and DAIF.I masked,
+            // which is an uninterruptible EL1 loop in the register-restore tail:
+            // a silent hang rather than a signal.
+            //
+            // `#2` (I) matches the SVC epilogue's `msr daifset, #2` in
+            // `akuma-exceptions`, the sibling EL0 return that always had it; FIQ
+            // and SError are routed to `default_exception_handler` and unused.
+            // `eret` restores PSTATE from SPSR_EL1, and every context this kernel
+            // builds sets `spsr = 0`, so userspace resumes with IRQs unmasked —
+            // the mask does not leak past the `eret`.
+            "msr daifset, #2",
+            "isb",
             // Set system registers from named operands (consumed before GP loads)
             "msr sp_el0, {sp_user}",
             "msr elr_el1, {pc}",

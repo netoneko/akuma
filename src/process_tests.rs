@@ -324,6 +324,10 @@ pub fn run_all_tests() {
     #[cfg(kernel_smp_shared)]
     test_smp_shared_dropped_window_survives_irq();
 
+    // The EL0-return `eret` must hold IRQs masked from the `ELR_EL1` write through
+    // the `eret`. Not SMP-gated: the timer tick that wins the race exists at SMP=1.
+    test_el0_eret_masks_irqs();
+
     // BKL-hold ATTRIBUTION must follow the thread, not the core: a thread preempted
     // mid-excursion must still be attributed to that excursion when it resumes, and the
     // transient IRQ stamp must never overwrite the interrupted thread's own tag.
@@ -1991,6 +1995,122 @@ fn test_smp_shared_dropped_window_survives_irq() {
             outer_close_reacquired,
             preserved
         );
+    }
+}
+
+/// The EL0-return `eret` must run with IRQs MASKED from the write of `ELR_EL1`
+/// through the `eret` itself.
+///
+/// `eret` reads `ELR_EL1`/`SPSR_EL1` live, and an exception taken inside that
+/// window replaces the user PC in `ELR_EL1` with the kernel PC it interrupted.
+/// The `eret` then drops to EL0 at a kernel text address, which arrives as an
+/// EL0 instruction abort with `FAR == ELR` and a permission fault — a SIGSEGV
+/// with no memory corruption anywhere near it. `enter_user_mode` (initial launch
+/// and `execve`) is reached from ordinary kernel code with IRQs *enabled*, unlike
+/// the SVC epilogue which inherits the trap's mask, and it shipped without the
+/// mask: `docs/archive/ERET_ELR_CLOBBER_ENTER_USER_MODE.md`.
+///
+/// The race itself is two instructions wide and cannot be provoked on demand, so
+/// this asserts the *invariant* instead, by reading the emitted instruction
+/// stream: walk `enter_user_mode` to its first `msr ELR_EL1, xN`, tracking
+/// `PSTATE.I` across every DAIF write, and require I to be masked there and to
+/// stay masked through the `eret`. That is the property the fix establishes, it
+/// holds however the compiler schedules the block, and it fails loudly if a later
+/// edit reorders the mask or reinstates a DAIF restore ahead of the return.
+///
+/// Anchor-not-found degrades to INCONCLUSIVE rather than FAILED: a codegen change
+/// that moves the `asm!` block out of this symbol makes the check inapplicable,
+/// not violated.
+fn test_el0_eret_masks_irqs() {
+    // MSR encodings, all fixed-form (ARM ARM C6.2.x):
+    //   msr ELR_EL1, xN   1101_0101_0001_1000_0100_0000_001t_tttt
+    //   msr DAIFSet, #imm 1101_0101_0000_0011_0100_iiii_1101_1111
+    //   msr DAIFClr, #imm 1101_0101_0000_0011_0100_iiii_1111_1111
+    //   msr DAIF, xN      1101_0101_0001_1011_0100_0010_001t_tttt
+    //   eret              1101_0110_1001_1111_0000_0011_1110_0000
+    const MSR_ELR_EL1: u32 = 0xd518_4020;
+    // DAIF is S3_3_C4_C2_**1** — op2=1, so the base is `…4220`, not `…4200`
+    // (`…4200` with op2=0 is NZCV). Getting this wrong makes the whole test
+    // vacuous rather than red: the `msr DAIF, x21` restore goes undetected, I
+    // reads as still-masked at the `msr ELR_EL1`, and the pre-fix kernel PASSES.
+    // Verified by booting the mask-removed build and requiring FAILED.
+    const MSR_DAIF_REG: u32 = 0xd51b_4220;
+    const RT_MASK: u32 = 0xFFFF_FFE0;
+    const MSR_DAIFSET: u32 = 0xd503_40df;
+    const MSR_DAIFCLR: u32 = 0xd503_40ff;
+    const IMM_MASK: u32 = 0xFFFF_F0FF;
+    const ERET: u32 = 0xd69f_03e0;
+    const DAIF_I: u32 = 0b0010;
+    // 1 KB of instructions: the whole function is ~0x220 bytes.
+    const MAX_WORDS: usize = 256;
+
+    let f: unsafe fn(&akuma_exec::process::UserContext) -> ! =
+        akuma_exec::process::enter_user_mode;
+    let base = f as usize as *const u32;
+
+    // Decode one word into its effect on PSTATE.I, if any.
+    // `Some(true)` = masks I, `Some(false)` = unmasks (or restores, which can),
+    // `None` = leaves I alone.
+    fn i_effect(w: u32) -> Option<bool> {
+        if (w & IMM_MASK) == MSR_DAIFSET && ((w >> 8) & 0xF) & DAIF_I != 0 {
+            Some(true)
+        } else if (w & IMM_MASK) == MSR_DAIFCLR && ((w >> 8) & 0xF) & DAIF_I != 0 {
+            Some(false)
+        } else if (w & RT_MASK) == MSR_DAIF_REG {
+            // A register restore writes all of DAIF from a runtime value, so it
+            // can unmask. `leave_kernel()` ends with exactly this, which is why
+            // the mask has to come after it rather than before.
+            Some(false)
+        } else if (w & 0xFC00_0000) == 0x9400_0000 || (w & 0xFFFF_FC1F) == 0xD63F_0000 {
+            // `bl` / `blr`: the callee's DAIF writes are invisible to a linear
+            // scan, so treat a call as having possibly unmasked. Conservative on
+            // purpose — today `leave_kernel()`'s restore is inlined and visible,
+            // and if a later edit turns it into a real call the alternative is a
+            // silently vacuous test. The mask must therefore be the last
+            // DAIF-relevant thing before `msr ELR_EL1`, calls included.
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    let mut masked = false;
+    let mut elr_at: Option<usize> = None;
+    let mut masked_at_elr = false;
+    for i in 0..MAX_WORDS {
+        // SAFETY: kernel text, identity-mapped and readable at EL1; `base` is a
+        // live function symbol and the walk stops at the first `eret`, well
+        // inside the 1 KB bound.
+        let w = unsafe { core::ptr::read_volatile(base.add(i)) };
+        if let Some(m) = i_effect(w) {
+            masked = m;
+        }
+        if elr_at.is_none() && (w & RT_MASK) == MSR_ELR_EL1 {
+            elr_at = Some(i);
+            masked_at_elr = masked;
+        }
+        if w == ERET {
+            break;
+        }
+    }
+
+    match elr_at {
+        None => crate::safe_print!(
+            176,
+            "[Test] el0_eret_masks_irqs INCONCLUSIVE: no `msr ELR_EL1` in the first {} words of enter_user_mode\n",
+            MAX_WORDS
+        ),
+        Some(_) if masked_at_elr && masked => crate::safe_print!(
+            160,
+            "[Test] el0_eret_masks_irqs PASSED (IRQs masked from ELR_EL1 write through eret)\n"
+        ),
+        Some(at) => crate::safe_print!(
+            240,
+            "[Test] el0_eret_masks_irqs FAILED: msr ELR_EL1 at word {} with I masked={}, still masked at eret={} — an IRQ here replaces the user PC with a kernel PC\n",
+            at,
+            masked_at_elr,
+            masked
+        ),
     }
 }
 
