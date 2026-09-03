@@ -804,6 +804,71 @@ change with its own risk, and the harness is useful to the amd64 target on its
 own. The crate is deliberately arch-neutral and dependency-free so that
 conversion can happen incrementally, a suite at a time, whenever it is worth it.
 
+## 3.15 Stage I: multitasking
+
+```
+  -- userspace output follows --
+    [ring3 A] round
+    [ring3 B] round
+    [ring3 A] round
+    [ring3 B] round
+    [ring3 A] round
+    [ring3 B] round
+  ring3: processes interleaved   [OK]
+```
+
+Two user processes, each in its own address space, taking turns. The scheduler
+now installs a task's page-table root in `CR3` on every switch, so a context
+switch changes *which memory exists*, not just which stack is live.
+
+Cooperative, via a `sched_yield` syscall: the user program loops
+`write` / `sched_yield`, and the switch happens on the kernel side of that
+syscall. The tick still only sets a flag.
+
+### 3.15.1 Counts cannot prove multitasking
+
+Three writes from A followed by three from B satisfies every count-based check
+and means the scheduler never switched. So the kernel records **which task**
+performed each `write` and the test asserts on the *transitions*: 6 writes must
+produce 5 changes of task. A run that batched would report 1.
+
+### 3.15.2 Three globals had to become per-task, and only one was obvious
+
+`syscall_entry` kept the saved user stack, the kernel stack to run on, and the
+leave-ring-3 flag in three globals. Multitasking makes all three wrong, for three
+different reasons:
+
+- **Saved user stack** — a syscall by A would overwrite B's saved `rsp`.
+- **Kernel stack** — this is the subtle one. Two processes sharing one syscall
+  stack is harmless *until a context switch happens inside a syscall*, which is
+  exactly what `sched_yield` does: the switch pushes A's callee-saved registers
+  onto that stack and B then resumes and pops its own frame from the same place.
+- **Leave flag** — A's `exit_group` would make B return early from whatever
+  syscall it was in. This is the same bug as §3.13.3 in a new disguise: there it
+  was one process leaking into the next excursion, here it is one process leaking
+  into another *task*.
+
+All three now live in a `UserCtx` the scheduler repoints on switch. Its field
+offsets are load-bearing — `syscall_entry` indexes it as `[rax+0]`, `[rax+8]`,
+`[rax+16]` — which is stated on the struct, since reordering the fields would
+silently change what that assembly reads.
+
+### 3.15.3 What stayed global on purpose
+
+The TSS `rsp0` trap stack is still one shared region. That is safe *only* because
+nothing switches tasks from inside an interrupt handler — the timer handler
+counts, sets a flag and returns. The moment preemption switches from the handler,
+`rsp0` has to become per-task too, and that is the next real constraint on
+preemption rather than an oversight.
+
+### 3.15.4 Task slots are not recycled
+
+`spawn` looks for `State::Unused` and a finished task stays `Finished`, so its
+stack is never handed to someone else. `MAX_TASKS` therefore bounds the tasks a
+boot may *ever* create, not the tasks alive at once — it went 4 → 8 when the two
+processes had nowhere to go alongside the three scheduler workers. Reuse needs
+the stack freed first, which needs to know nothing still points into it.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at

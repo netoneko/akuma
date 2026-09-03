@@ -47,17 +47,51 @@ const EFER_SCE: u64 = 1 << 0;
 const USER_CODE_VA: usize = 0x5000_0000;
 const USER_STACK_VA: usize = 0x5001_0000;
 
-/// Set by the handler when the excursion into ring 3 should end. Read by
-/// `syscall_entry`, which is why it is `no_mangle` rather than a normal static.
+/// Where a task's kernel stack and saved user stack live.
+///
+/// One per task. `syscall_entry` reaches the running task's through
+/// [`CURRENT_UCTX`]; the scheduler repoints that on every switch. They were two
+/// globals until multitasking made that wrong — a syscall taken by one process
+/// would have written another's saved stack pointer.
+/// Field offsets are load-bearing: `syscall_entry` indexes this by hand as
+/// `[rax + 0]`, `[rax + 8]` and `[rax + 16]`. Reordering the fields silently
+/// changes what that assembly reads.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UserCtx {
+    /// Kernel stack to resume on: set by `enter_user_mode`, used by the syscall
+    /// path and by the exit path. Offset 0.
+    pub kernel_rsp: u64,
+    /// The task's user stack, saved on syscall entry. Offset 8.
+    pub user_rsp: u64,
+    /// Non-zero when this task should leave ring 3. Offset 16.
+    pub leave: u64,
+}
+
+impl UserCtx {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { kernel_rsp: 0, user_rsp: 0, leave: 0 }
+    }
+}
+
+/// The running task's [`UserCtx`]. Repointed by the scheduler on every switch.
 #[unsafe(no_mangle)]
-static mut LEAVE_RING3: u64 = 0;
+pub static mut CURRENT_UCTX: *mut UserCtx = core::ptr::null_mut();
 
 /// How many syscalls arrived.
 static CALLS: AtomicU64 = AtomicU64::new(0);
 /// Bytes accepted by `write`, across all processes.
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
-/// Status userspace exited with.
+/// Status the last process exited with.
 static EXIT_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Which task performed each `write`, in order. Proving that two processes ran
+/// concurrently needs the *interleaving*, not just the totals: three writes from
+/// A followed by three from B would satisfy every count-based check and would
+/// mean the scheduler never switched.
+static WRITE_SEQ: [AtomicU64; 16] = [const { AtomicU64::new(u64::MAX) }; 16];
+static WRITE_SEQ_LEN: AtomicU64 = AtomicU64::new(0);
 
 /// Largest `write` this kernel will accept. A bound rather than trust: `len`
 /// comes from ring 3, and an unbounded length would walk off the mapped page
@@ -72,51 +106,65 @@ core::arch::global_asm!(
 
 .global syscall_entry
 syscall_entry:
-    /* Entered from ring 3. rcx = user rip, r11 = user rflags, rsp = USER's
-     * stack. Interrupts are already off (IA32_FMASK clears IF), so this window
-     * cannot be interrupted while rsp still points at user memory. */
-    mov [rip + user_rsp_slot], rsp
-    lea rsp, [rip + syscall_stack_top]
+    /* Entered from ring 3. rcx = user rip, r11 = user rflags, rsp = the USER's
+     * stack. Interrupts are off (IA32_FMASK clears IF), so this window cannot
+     * be interrupted while rsp still points at user memory.
+     *
+     * Every saved slot is per-task, reached through CURRENT_UCTX. With more
+     * than one process, globals would be wrong twice over: a syscall by task A
+     * would overwrite task B's saved user stack, and a context switch *inside*
+     * a syscall would corrupt whichever kernel stack the two shared. */
+    mov [rip + SYSCALL_SCRATCH], rax
+    mov rax, [rip + CURRENT_UCTX]
+    mov [rax + 8], rsp              /* uctx.user_rsp   = user rsp   */
+    mov rsp, [rax + 0]              /* kernel stack    = uctx.kernel_rsp */
+    mov rax, [rip + SYSCALL_SCRATCH]
 
-    push rcx                      /* user rip   */
-    push r11                      /* user rflags */
-    push rax                      /* syscall nr — kept only to balance the frame */
-    sub rsp, 8                    /* System V wants rsp 16-aligned at `call`;
-                                     three pushes leave it 8 off. */
+    push rcx                        /* user rip    */
+    push r11                        /* user rflags */
+    push rax                        /* nr — kept only to balance the frame */
+    sub rsp, 8                      /* System V wants rsp 16-aligned at `call` */
 
-    /* Shift the Linux argument registers into System V positions:
+    /* Linux arg registers into System V positions:
      *   Linux:    nr=rax  a1=rdi  a2=rsi  a3=rdx
      *   System V: 1 =rdi  2 =rsi  3 =rdx  4 =rcx
-     * so (nr, a1, a2, a3) -> (rdi, rsi, rdx, rcx).
-     *
      * Assigned right-to-left, or each move clobbers the next one's source.
-     * `rcx` is free to use as the fourth argument even though `syscall` put the
-     * user return address there — it was pushed above and is restored below. */
+     * `rcx` is free even though `syscall` put the user return address there —
+     * it was pushed above and is restored below. */
     mov rcx, rdx
     mov rdx, rsi
     mov rsi, rdi
     mov rdi, rax
-    call syscall_handler          /* result in rax */
+    call syscall_handler            /* result in rax */
 
     add rsp, 8
-    pop rcx                       /* discard the saved nr */
+    pop rcx                         /* discard the saved nr; rcx is scratch
+                                       until the user rip is popped below */
 
-    /* Whether to go back to ring 3 is the handler's decision, not a property of
+    /* Whether to return to ring 3 is the handler's decision, not a property of
      * the syscall number: `exit` and `exit_group` are different numbers, and on
-     * a second architecture they would be different again. The handler sets the
-     * flag; this only reads it. */
-    cmp qword ptr [rip + LEAVE_RING3], 0
+     * another architecture different again. Per-task, because a process that
+     * exits must not make the *next* process return early from its own
+     * syscall. */
+    mov rcx, [rip + CURRENT_UCTX]
+    cmp qword ptr [rcx + 16], 0     /* uctx.leave */
     jne .Lexit_to_kernel
 
-    pop r11
-    pop rcx
-    mov rsp, [rip + user_rsp_slot]
+    pop r11                         /* user rflags */
+    pop rcx                         /* user rip    */
+    /* rax holds the result and must survive the stack switch; rcx and r11 are
+     * now live for sysretq, so the scratch slot is the only place left. */
+    mov [rip + SYSCALL_SCRATCH], rax
+    mov rax, [rip + CURRENT_UCTX]
+    mov rsp, [rax + 8]              /* back to this task's user stack */
+    mov rax, [rip + SYSCALL_SCRATCH]
     sysretq
 
 .Lexit_to_kernel:
-    /* Syscall 0: do not go back to ring 3. Restore what enter_user_mode saved
-     * and return from it. rax still holds the handler's result. */
-    mov rsp, [rip + kernel_return_rsp]
+    /* Leave ring 3 for good. Restore what enter_user_mode saved and return from
+     * it; rax still holds the handler's result. rcx already points at the
+     * uctx. */
+    mov rsp, [rcx + 0]
     pop r15
     pop r14
     pop r13
@@ -127,37 +175,33 @@ syscall_entry:
 
 .global enter_user_mode
 enter_user_mode:
-    /* rdi = user rip, rsi = user rsp. Returns when userspace exits.
-     *
-     * Clear LEAVE_RING3 first. Its lifetime is exactly one excursion, and it is
-     * set by the handler on the way out — so a *second* entry with the flag
-     * still set returns immediately after the first syscall, whatever that
-     * syscall was. That is not hypothetical: it made a second process report its
-     * write() length (55) as its exit status instead of 0x0B, with both
-     * processes otherwise behaving correctly. */
-    mov qword ptr [rip + LEAVE_RING3], 0
-
+    /* rdi = user rip, rsi = user rsp. Returns when userspace exits. */
     push rbp
     push rbx
     push r12
     push r13
     push r14
     push r15
-    mov [rip + kernel_return_rsp], rsp
 
-    mov rcx, rdi                  /* sysret takes rip from rcx    */
-    mov r11, 0x202                /* ...and rflags from r11: IF set, bit 1 reserved-1 */
-    mov rsp, rsi                  /* user stack */
+    mov rax, [rip + CURRENT_UCTX]
+    /* Publish this task's kernel stack: both the syscall path and the exit path
+     * resume on it. */
+    mov [rax + 0], rsp
+    /* Clear the leave flag. Its lifetime is exactly one excursion, and it is set
+     * on the way out — so a second entry with it still set returns immediately
+     * after the first syscall, whatever that syscall was. That is not
+     * hypothetical: it made a second process report its write() length (55) as
+     * its exit status instead of 0x0B. */
+    mov qword ptr [rax + 16], 0
+
+    mov rcx, rdi                    /* sysret takes rip from rcx */
+    mov r11, 0x202                  /* ...and rflags from r11: IF set, bit 1 reserved-1 */
+    mov rsp, rsi                    /* user stack */
     sysretq
 
     .section .bss
     .align 16
-syscall_stack:
-    .skip 16384
-syscall_stack_top:
-user_rsp_slot:
-    .skip 8
-kernel_return_rsp:
+SYSCALL_SCRATCH:
     .skip 8
 "#
 );
@@ -221,18 +265,26 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         Syscall::Write => sys_write(a1, a2, a3),
         Syscall::Exit | Syscall::ExitGroup => {
             EXIT_STATUS.store(a1, Ordering::Relaxed);
-            // SAFETY: single core, interrupts off inside a syscall; read only by
-            // `syscall_entry` on the way out. Bound to a local first — writing
-            // `*(&raw mut X)` inline trips `clippy::deref_addrof`, whose
-            // suggested fix reintroduces the `static_mut_refs` violation.
+            // SAFETY: single core, interrupts off inside a syscall. The
+            // running task's context is what `syscall_entry` will read on the
+            // way out, and only this task can be inside a syscall.
             unsafe {
-                let flag = &raw mut LEAVE_RING3;
-                *flag = 1;
+                let cur = &raw const CURRENT_UCTX;
+                let uctx = *cur;
+                if !uctx.is_null() {
+                    (*uctx).leave = 1;
+                }
             }
             a1
         }
         Syscall::Getpid => 1,
-        Syscall::SchedYield => 0,
+        Syscall::SchedYield => {
+            // The switch happens on *this task's* kernel stack, which is the
+            // whole reason UserCtx is per-task: two processes sharing one
+            // syscall stack would clobber each other's saved frame here.
+            crate::sched::yield_now();
+            0
+        }
         Syscall::Close => EBADF,
         Syscall::Brk => EINVAL,
         _ => ENOSYS,
@@ -264,6 +316,10 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         let byte = unsafe { (buf as *const u8).add(i as usize).read_volatile() };
         serial::putb(byte);
     }
+    let n = WRITE_SEQ_LEN.fetch_add(1, Ordering::Relaxed) as usize;
+    if let Some(slot) = WRITE_SEQ.get(n) {
+        slot.store(crate::sched::current_task() as u64, Ordering::Relaxed);
+    }
     WRITTEN.fetch_add(len, Ordering::Relaxed);
     len
 }
@@ -287,31 +343,29 @@ pub fn init_syscall() {
 
 /// Emit the user program into `out`, returning its total length.
 ///
-/// Built rather than written as a byte literal so the message offset is
-/// *computed*. A hand-assembled blob with a hardcoded operand is exactly the
-/// kind of thing that stays correct until someone edits the message by one
-/// character.
+/// Built rather than written as a byte literal so the message address and the
+/// loop displacement are *computed*. A hand-assembled blob with hardcoded
+/// operands stays correct until someone edits the message by one character.
 ///
 /// ```text
-///   mov rax, <write>        ; number from Syscall::Write.to_x86_64()
-///   mov rdi, 1              ; fd = stdout
-///   movabs rsi, <msg va>    ; patched once the layout is known
-///   mov rdx, <len>
-///   syscall
-///   mov rax, <exit_group>
-///   mov rdi, <status>
-///   syscall
-///   jmp $                   ; a guard, not a fallthrough
+///   mov r12, <rounds>
+/// loop:
+///   mov rax, <write>; mov rdi, 1; movabs rsi, <msg>; mov rdx, <len>; syscall
+///   mov rax, <sched_yield>; syscall     ; hand the CPU to the other process
+///   dec r12
+///   jnz loop
+///   mov rax, <exit_group>; mov rdi, <status>; syscall
+///   jmp $                               ; a guard, not a fallthrough
 ///   <message bytes>
 /// ```
-fn build_user_program(out: &mut [u8], base_va: u64, msg: &[u8], status: u32) -> usize {
+fn build_user_program(out: &mut [u8], base_va: u64, msg: &[u8], rounds: u32, status: u32) -> usize {
     let mut n = 0;
     let mut emit = |bytes: &[u8], n: &mut usize| {
         out[*n..*n + bytes.len()].copy_from_slice(bytes);
         *n += bytes.len();
     };
 
-    // mov r64, imm32 (sign-extended). Opcode byte differs per destination.
+    // mov r64, imm32 (sign-extended). The ModRM byte selects the destination.
     let mov_imm = |modrm: u8, v: u32| {
         let b = v.to_le_bytes();
         [0x48, 0xC7, modrm, b[0], b[1], b[2], b[3]]
@@ -320,15 +374,29 @@ fn build_user_program(out: &mut [u8], base_va: u64, msg: &[u8], status: u32) -> 
     const RDI: u8 = 0xC7;
     const RDX: u8 = 0xC2;
 
+    // mov r12, imm32 needs REX.WB (0x49) since r12 is an extended register.
+    let r = rounds.to_le_bytes();
+    emit(&[0x49, 0xC7, 0xC4, r[0], r[1], r[2], r[3]], &mut n);
+
+    let loop_start = n;
     emit(&mov_imm(RAX, Syscall::Write.to_x86_64() as u32), &mut n);
     emit(&mov_imm(RDI, 1), &mut n);
-
-    // movabs rsi, imm64 — the message address, patched below.
     let movabs_at = n;
-    emit(&[0x48, 0xBE, 0, 0, 0, 0, 0, 0, 0, 0], &mut n);
-
+    emit(&[0x48, 0xBE, 0, 0, 0, 0, 0, 0, 0, 0], &mut n); // movabs rsi, msg
     emit(&mov_imm(RDX, msg.len() as u32), &mut n);
     emit(&[0x0F, 0x05], &mut n); // syscall
+
+    emit(&mov_imm(RAX, Syscall::SchedYield.to_x86_64() as u32), &mut n);
+    emit(&[0x0F, 0x05], &mut n); // syscall
+
+    emit(&[0x49, 0xFF, 0xCC], &mut n); // dec r12
+    // jnz rel8, back to loop_start. The displacement is measured from the *end*
+    // of the jump, hence the +2 for the instruction's own bytes. Computed as a
+    // positive distance and negated, so no signed cast is needed and the range
+    // check is on a value that cannot already have wrapped.
+    let back = (n + 2) - loop_start;
+    debug_assert!(back <= 127, "loop body outgrew a rel8 jump");
+    emit(&[0x75, (back as u8).wrapping_neg()], &mut n);
 
     emit(&mov_imm(RAX, Syscall::ExitGroup.to_x86_64() as u32), &mut n);
     emit(&mov_imm(RDI, status), &mut n);
@@ -344,15 +412,16 @@ fn build_user_program(out: &mut [u8], base_va: u64, msg: &[u8], status: u32) -> 
 }
 
 /// A process: its own address space plus the frames backing it.
-struct Process {
+pub struct Process {
     space: paging::AddressSpace,
     code: usize,
     stack: usize,
 }
 
 impl Process {
-    /// Build a process that prints `msg` and exits with `status`.
-    fn new(msg: &[u8], status: u32) -> Option<Self> {
+    /// Build a process that prints `msg` `rounds` times, yielding between each,
+    /// then exits with `status`.
+    fn new(msg: &[u8], rounds: u32, status: u32) -> Option<Self> {
         let space = paging::AddressSpace::new()?;
         let (Some(code), Some(stack)) = (akuma_pmm::alloc_page(), akuma_pmm::alloc_page()) else {
             space.free();
@@ -366,7 +435,7 @@ impl Process {
             core::ptr::write_bytes(code as *mut u8, 0, 4096);
             core::ptr::write_bytes(stack as *mut u8, 0, 4096);
             let page = core::slice::from_raw_parts_mut(code as *mut u8, 4096);
-            build_user_program(page, USER_CODE_VA as u64, msg, status);
+            build_user_program(page, USER_CODE_VA as u64, msg, rounds, status);
         }
 
         if !space.map(USER_CODE_VA, code as u64, Prot::USER_RX, MemAttr::WriteBack)
@@ -380,26 +449,6 @@ impl Process {
         Some(Self { space, code, stack })
     }
 
-    /// Switch to this process's address space, run it, and switch back.
-    fn run(&self) -> u64 {
-        let kernel_root = paging::active_root();
-        // SAFETY: the space shares the kernel's PDPT slot 0 (identity-mapped
-        // first 1 GiB: image, stacks, heap, PMM pool) and slot 3 (the LAPIC), so
-        // every page this kernel executes from or touches while the process runs
-        // is mapped in it. That is exactly the obligation `activate` states.
-        unsafe { paging::activate(self.space.root()) };
-
-        let user_rsp = (USER_STACK_VA + 4096 - 16) as u64;
-        // SAFETY: both pages are mapped with user permissions in the now-active
-        // address space, and the program ends in exit_group, which returns here.
-        let status = unsafe { enter_user_mode(USER_CODE_VA as u64, user_rsp) };
-
-        // SAFETY: returning to the address space we came from, which is still
-        // intact — nothing freed it while the process ran.
-        unsafe { paging::activate(kernel_root) };
-        status
-    }
-
     fn free(self) {
         akuma_pmm::free_page(self.code, 0);
         akuma_pmm::free_page(self.stack, 0);
@@ -407,47 +456,118 @@ impl Process {
     }
 }
 
-/// Run two processes in separate address spaces and prove they are isolated.
+/// The two processes the test runs, reachable from their task entry points.
+///
+/// `extern "C" fn() -> !` takes no arguments, so a task entry cannot be handed
+/// its process. A slot per process is the smallest thing that works on one core.
+static mut PROCS: [Option<Process>; 2] = [None, None];
+
+/// Enter ring 3 for process `idx`, then mark the task finished.
+///
+/// The scheduler has already installed this task's address space by the time
+/// this runs — `spawn_in_space` recorded the root, and `yield_now` writes `CR3`
+/// before switching stacks.
+fn run_process(idx: usize) -> ! {
+    // SAFETY: single core; each slot is written once before its task is spawned
+    // and read only by that task.
+    let space_ok = unsafe {
+        let procs = &raw const PROCS;
+        (*procs)[idx].is_some()
+    };
+    if space_ok {
+        let user_rsp = (USER_STACK_VA + 4096 - 16) as u64;
+        // SAFETY: both pages are mapped user-accessible in the address space the
+        // scheduler installed for this task, and the program ends in exit_group.
+        let status = unsafe { enter_user_mode(USER_CODE_VA as u64, user_rsp) };
+        EXIT_STATUS.store(status, Ordering::Relaxed);
+    }
+    crate::sched::finish();
+}
+
+extern "C" fn proc0_entry() -> ! {
+    run_process(0);
+}
+extern "C" fn proc1_entry() -> ! {
+    run_process(1);
+}
+
+/// Run two isolated processes concurrently and prove they interleave.
 pub fn smoke_test(t: &mut Suite) {
-    serial::puts("  -- userspace output follows --\n");
+    const ROUNDS: u32 = 3;
+    const MSG_A: &[u8] = b"    [ring3 A] round\n";
+    const MSG_B: &[u8] = b"    [ring3 B] round\n";
 
     let free_before = akuma_pmm::free_count();
 
     let (Some(a), Some(b)) = (
-        Process::new(b"    [ring3 A] first process, own address space\n", 0x0A),
-        Process::new(b"    [ring3 B] second process, same VA, different frame\n", 0x0B),
+        Process::new(MSG_A, ROUNDS, 0x0A),
+        Process::new(MSG_B, ROUNDS, 0x0B),
     ) else {
         t.check("ring3: processes built", false);
         return;
     };
 
-    // The whole point, checked before either runs: the same virtual address
-    // resolves to different physical frames, and to nothing at all in the
-    // kernel's own space.
+    // The isolation property, checked before either runs: the same virtual
+    // address resolves to different frames, and to nothing in the kernel's space.
     let pa_a = a.space.translate(USER_CODE_VA);
     let pa_b = b.space.translate(USER_CODE_VA);
     let pa_k = paging::translate(USER_CODE_VA);
+    let (root_a, root_b) = (a.space.root(), b.space.root());
 
-    let status_a = a.run();
-    let status_b = b.run();
+    // SAFETY: single core; written before the tasks that read them exist.
+    unsafe {
+        let procs = &raw mut PROCS;
+        (*procs)[0] = Some(a);
+        (*procs)[1] = Some(b);
+    }
+
+    let spawned = crate::sched::spawn_in_space(proc0_entry, root_a).is_some()
+        && crate::sched::spawn_in_space(proc1_entry, root_b).is_some();
+    if !t.check("ring3: processes spawned", spawned) {
+        return;
+    }
+
+    serial::puts("  -- userspace output follows --\n");
+    // Drive the round-robin from the boot task until both processes finish.
+    let mut spins = 0u64;
+    while !crate::sched::all_user_tasks_finished() && spins < 10_000 {
+        spins += 1;
+        crate::sched::yield_now();
+    }
 
     t.check("ring3: both spaces map the test VA", pa_a.is_some() && pa_b.is_some());
     t.check("ring3: same VA, different frames", pa_a != pa_b);
     t.check("ring3: kernel space does not map it", pa_k.is_none());
-    t.check_eq("ring3: process A exit status", status_a, 0x0A);
-    t.check_eq("ring3: process B exit status", status_b, 0x0B);
-    t.check_eq("ring3: syscalls served", CALLS.load(Ordering::Relaxed), 4);
     t.check_eq(
-        "ring3: bytes written by userspace",
-        WRITTEN.load(Ordering::Relaxed),
-        (b"    [ring3 A] first process, own address space\n".len()
-            + b"    [ring3 B] second process, same VA, different frame\n".len()) as u64,
+        "ring3: writes served",
+        WRITE_SEQ_LEN.load(Ordering::Relaxed),
+        u64::from(ROUNDS) * 2,
     );
 
-    a.free();
-    b.free();
+    // The multitasking claim. Counts alone cannot distinguish "A ran three
+    // times then B ran three times" from real interleaving, so this looks for a
+    // change of task between consecutive writes.
+    let len = WRITE_SEQ_LEN.load(Ordering::Relaxed).min(WRITE_SEQ.len() as u64) as usize;
+    let switches = (1..len)
+        .filter(|&i| {
+            WRITE_SEQ[i].load(Ordering::Relaxed) != WRITE_SEQ[i - 1].load(Ordering::Relaxed)
+        })
+        .count();
+    t.check_eq(
+        "ring3: processes interleaved",
+        switches as u64,
+        u64::from(ROUNDS) * 2 - 1,
+    );
 
-    // Address spaces are page tables; leaking them leaks frames silently.
+    // SAFETY: both tasks have finished; nothing else touches these slots.
+    unsafe {
+        let procs = &raw mut PROCS;
+        for slot in 0..2 {
+            if let Some(p) = (*procs)[slot].take() {
+                p.free();
+            }
+        }
+    }
     t.check_eq(
         "ring3: address-space teardown leaks nothing",
         akuma_pmm::free_count() as u64,

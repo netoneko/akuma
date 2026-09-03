@@ -36,15 +36,22 @@
 use akuma_selftest::Suite;
 
 use crate::lapic;
+use crate::paging;
+use crate::usermode::{CURRENT_UCTX, UserCtx};
 use alloc::vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Per-task kernel stack. Generous: these are `Vec` allocations from a 16 MiB
 /// heap, and a stack overflow here has no guard page to catch it.
 const STACK_SIZE: usize = 32 * 1024;
 
 /// Maximum tasks, including the boot task in slot 0.
-const MAX_TASKS: usize = 4;
+///
+/// Slots are never recycled — `spawn` looks for `State::Unused`, and a finished
+/// task stays `Finished` so its stack is not handed to someone else. The table
+/// therefore has to hold every task the boot ever creates: three scheduler
+/// workers plus two user processes, with room to spare.
+const MAX_TASKS: usize = 8;
 
 core::arch::global_asm!(
     r#"
@@ -155,6 +162,12 @@ enum State {
 struct Task {
     ctx: Context,
     state: State,
+    /// Page-table root to install when this task runs. `0` means "the kernel's",
+    /// which is what every kernel task uses.
+    space_root: u64,
+    /// Where the syscall path saves this task's stacks. Per-task since Stage I;
+    /// see `usermode::UserCtx`.
+    uctx: UserCtx,
 }
 
 impl Task {
@@ -162,9 +175,18 @@ impl Task {
         Self {
             ctx: Context::empty(),
             state: State::Unused,
+            space_root: 0,
+            uctx: UserCtx::new(),
         }
     }
 }
+
+/// The kernel's own page-table root, captured at [`init`].
+///
+/// A task with `space_root == 0` runs in this. Recorded rather than re-read from
+/// `CR3` at switch time, because by then `CR3` holds whatever the *outgoing*
+/// task was using.
+static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 
 /// The task table. Slot 0 is the boot thread.
 ///
@@ -190,6 +212,19 @@ fn current() -> usize {
     unsafe { *(&raw const CURRENT).cast::<usize>() }
 }
 
+/// Have all tasks except the boot task finished?
+#[must_use]
+pub fn all_user_tasks_finished() -> bool {
+    // SAFETY: raw-pointer read of the table; single core.
+    unsafe { (1..MAX_TASKS).all(|s| (*tasks())[s].state != State::Runnable) }
+}
+
+/// The running task's slot.
+#[must_use]
+pub fn current_task() -> usize {
+    current()
+}
+
 fn set_current(v: usize) {
     // SAFETY: as `current`.
     unsafe { *(&raw mut CURRENT).cast::<usize>() = v };
@@ -210,11 +245,32 @@ pub fn need_resched() -> bool {
 
 /// Register the currently-executing thread as task 0.
 pub fn init() {
+    KERNEL_ROOT.store(paging::active_root(), Ordering::Relaxed);
     // SAFETY: raw-pointer access to the table; single core, before any switch.
     unsafe {
         (*tasks())[0].state = State::Runnable;
+        // The boot task needs a live user context too: it is what the very first
+        // `enter_user_mode` publishes its kernel stack into.
+        let cur = &raw mut CURRENT_UCTX;
+        *cur = &raw mut (*tasks())[0].uctx;
     }
     set_current(0);
+}
+
+/// Create a task that runs in a page table of its own.
+///
+/// `space_root` is installed in `CR3` whenever this task is scheduled. The
+/// address space must share the kernel's mappings — see
+/// `paging::AddressSpace` — or the switch faults on the instruction after
+/// `mov cr3`.
+pub fn spawn_in_space(entry: extern "C" fn() -> !, space_root: u64) -> Option<usize> {
+    let slot = spawn(entry)?;
+    // SAFETY: raw-pointer access to the table; single core, and `slot` was just
+    // returned by `spawn`.
+    unsafe {
+        (*tasks())[slot].space_root = space_root;
+    }
+    Some(slot)
 }
 
 /// Create a task. Returns its slot, or `None` if the table is full.
@@ -278,6 +334,24 @@ pub fn yield_now() {
         }
 
         set_current(next);
+
+        // Repoint the per-task syscall context *before* the switch: the
+        // incoming task may resume inside its own syscall and immediately read
+        // it on the way back to ring 3.
+        let cur_uctx = &raw mut CURRENT_UCTX;
+        *cur_uctx = &raw mut (*t)[next].uctx;
+
+        // Install the incoming task's address space. Every space shares the
+        // kernel's mappings, so the instructions between here and the switch —
+        // and the switch itself — remain mapped throughout.
+        let want = match (*t)[next].space_root {
+            0 => KERNEL_ROOT.load(Ordering::Relaxed),
+            root => root,
+        };
+        if want != paging::active_root() {
+            paging::activate(want);
+        }
+
         let old = &raw mut (*t)[cur].ctx;
         let new = &raw const (*t)[next].ctx;
         switch_context(old, new);

@@ -5,8 +5,9 @@ physical frame allocator, maps/unmaps 4 KiB pages, services page faults with
 **demand paging**, takes **LAPIC timer interrupts**, and round-robin schedules
 tasks across separate stacks, and enters **ring 3** with a working
 `syscall`/`sysret` path, where userspace calls **real Linux x86_64 syscalls**
-(`write`, `exit_group`) from **isolated per-process address spaces**. No loader,
-no preemption, no device interrupts, no higher-half kernel.
+(`write`, `exit_group`, `sched_yield`) from **isolated per-process address
+spaces**, and **multitasks** between them. No loader, no preemption, no device
+interrupts, no higher-half kernel.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1**.
 
