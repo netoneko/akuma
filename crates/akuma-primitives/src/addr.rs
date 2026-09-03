@@ -96,11 +96,14 @@ pub const DEVMAP_OFFSET: usize = 0;
 #[inline(always)]
 #[must_use]
 pub fn virt_to_phys(vaddr: usize) -> usize {
-    assert!(
-        vaddr >= PHYSMAP_OFFSET,
-        "virt_to_phys on an address outside the kernel RAM window"
-    );
-    vaddr - PHYSMAP_OFFSET
+    // `checked_sub().expect()` rather than `assert!(vaddr >= PHYSMAP_OFFSET)`:
+    // on AArch64 the offset is 0, and clippy correctly points out that a
+    // `>= 0` comparison on a `usize` is always true. Written this way the check
+    // says the same thing on both architectures, folds to nothing where the
+    // offset is zero, and does not need a `cfg` to silence a lint.
+    vaddr
+        .checked_sub(PHYSMAP_OFFSET)
+        .expect("virt_to_phys on an address outside the kernel RAM window")
 }
 
 /// Physical address → kernel-mapped pointer, **for RAM**.

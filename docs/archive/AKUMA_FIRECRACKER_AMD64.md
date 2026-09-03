@@ -1214,6 +1214,192 @@ is fatal for anything outside its armed demand-paging window. Proving the
 refusal is a separate stage that needs faults to be deliverable to a process
 rather than to the console.
 
+## 3.19 Stage M: a block device, and the machine description behind it
+
+The kernel reads a disk. `amd64/src/blk.rs` maps a virtio-MMIO transport,
+`akuma-virtio` drives it, and the self-test reads two known sectors 1 MiB apart
+and checks every byte of both.
+
+The driver is **unmodified**. `akuma-virtio` and `virtio-drivers` were used as
+they stand; what this target had to supply was the three machine facts they
+cannot discover — where the transport is, how the slots are spaced, and how to
+translate an address. That is the claim in
+`docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` paying off in the direction the
+document predicted, and it is worth being precise about the size of the payoff:
+five crates (`akuma-virtio`, `akuma-ext2`, `akuma-vfs`, `akuma-fdt`,
+`akuma-primitives`) already built for `x86_64-unknown-none` before this stage
+started. The filesystem half of "fs/vfs" is largely free. The device half is the
+work.
+
+### 3.19.1 Discovery: the command line is the device tree
+
+x86_64 Firecracker passes **no FDT**, runs with `pci=off`, and there is no bus to
+enumerate. It announces each virtio device by appending a token to the kernel
+command line, which arrives through `hvm_start_info.cmdline_paddr`:
+
+```text
+  Firecracker v1.16.1:  pci=off virtio_mmio.device=4K@0xc0001000:5
+  QEMU microvm:         virtio_mmio.device=512@0xfeb00000:5   (we pass it)
+```
+
+Both measured. The first by attaching a drive and printing the command line —
+and note that attaching the drive is what *makes the token appear*: with
+`"drives": []` the command line is empty, which is why every boot before this
+stage had nothing to discover.
+
+QEMU does not synthesise the token (for a Linux guest the operator writes it),
+so `amd64/run.sh` writes it, with a base measured from `info mtree`. The guest
+parses the identical string either way: one discovery path, two machines.
+
+### 3.19.2 `-M microvm`, or the stand-in stops standing in
+
+The local run moved from QEMU's default `pc` machine to `microvm`. This is not a
+tidiness change. `pc` and `q35` put virtio on **PCI**; Firecracker has no PCI at
+all. A local run against `pc` would exercise a device model the target machine
+does not have, and the whole justification for QEMU being a useful stand-in —
+"what boots here boots there" — would be gone. `microvm` is x86-only and is
+Firecracker's analogue: PVH entry, virtio-MMIO, no PCI.
+
+Two QEMU behaviours had to be corrected, and both were caught by assertions
+rather than by reading documentation:
+
+* **Devices land at the top of the transport array.** `info qtree` shows a lone
+  virtio-blk on bus 23 of 24, at `0xfeb02e00` — not at the base. The aarch64
+  `-M virt` machine does the same thing at bus 31, which is why
+  `scripts/cargo_runner.sh` has pinned every device to a numbered bus for years.
+  Same fix: `bus=virtio-mmio-bus.0`. Firecracker needs no equivalent — it packs
+  devices densely from its own base and announces each one, so slot order and
+  announcement order agree.
+* **QEMU defaults virtio-MMIO to *legacy*.** `blk::smoke_test` asserts the
+  transport reports version 2 and got 1. `virtio-drivers` handles both, which is
+  exactly why this is easy to miss: the driver worked, and the code path was one
+  Firecracker never uses. `-global virtio-mmio.force-legacy=false` fixes it, the
+  same flag `cargo_runner.sh` passes on aarch64.
+
+### 3.19.3 Three seams in shared crates, each named by a document first
+
+**1. `virt_to_phys` stopped being the identity.** `akuma-primitives::addr`'s own
+header said: *"If the kernel ever gains a non-identity kernel map, this is one of
+the places that has to change, and it cannot become a runtime hook without
+re-paying the cost Phase 3 measured away. The honest options at that point are a
+compile-time offset constant or a per-region translation the caller passes in."*
+The amd64 kernel has had a physmap since Stage K. It took the first option: a
+`cfg`'d `PHYSMAP_OFFSET`, still `#[inline(always)]`, zero on AArch64 so every
+function folds to what it was.
+
+The gate is the **conjunction**, `all(target_os = "none", target_arch = ...)`.
+`target_arch = "x86_64"` alone would fire under `cargo test` on an x86_64 host
+and silently offset every translation in a host test — the same mistake §0 was
+written about, one gate away in either direction.
+
+**2. MMIO translation split from RAM translation.** `phys_to_virt` answers "where
+is this page of memory"; `mmio_phys_to_virt` answers "where is this device
+register". On AArch64 both are the identity and the distinction is invisible,
+which is why there was one function. On amd64 they are different windows with
+different cacheability, and conflating them hands a driver a cached alias of a
+register file — or, with today's 1 GiB physmap, an assertion failure.
+
+**3. The virtio window base became a runtime value**, joining the stride and
+count that already were. On AArch64 it is a fixed slot in the L0[1] device map;
+here the VMM chooses it. `virtio_slot_va` pays one more relaxed load, on a path
+that runs once per probe and never per packet.
+
+### 3.19.4 A latent bug that went live
+
+`akuma_primitives::preempt::current_tid` was gated `#[cfg(target_os = "none")]`.
+`REDUCING_PLATFORM_DEPENDENCY.md` §0 named it as a latent instance of the same
+mistake when the equivalent was fixed in `akuma-cpu`; it went live the moment
+this target linked a driver that takes a `PreemptGuard`.
+
+`x86_64-unknown-none` is also `target_os = "none"`, so that gate selected the
+AArch64 body on x86 — where `tpidrro_el0()` is the `akuma-cpu` **stub**, which
+returns 0 and reads no register. The answer was right *by accident*: a bring-up
+kernel with one thread wants 0. That is the worst version of wrong, because it
+works until the day the target has threads. Now gated on the conjunction, with
+an explicit non-AArch64 arm that says zero and says why.
+
+### 3.19.5 `akuma-ryzen-amd64`: the machine description, host-tested
+
+Three modules written for this stage — the PVH handoff parser, the command-line
+parser and the ACPI scanner — moved out of `amd64/src/` into a crate, on the
+`akuma-firecracker` model: `no_std`, allocation-free, **no dependencies**, and
+`#![forbid(unsafe_code)]`.
+
+The last one deserves a note. This crate parses hostile, attacker-adjacent input
+— every byte comes from the VMM — and it does so with zero `unsafe`, because the
+one dangerous operation (dereferencing a VMM-supplied physical address) is on the
+far side of a `PhysMem` trait the *caller* implements. The kernel's impl is three
+lines with one bounds check; the tests' impl is a list of byte spans. That split
+is what makes the parser host-testable and memory-safe at once.
+
+`akuma-firecracker` takes a `&[u8]` because a device tree is one blob. This
+machine's description is scattered — the handoff block at one address, its memory
+map at another, the command line at a third, the ACPI tables wherever the VMM put
+them — so a slice cannot express it and copying it all into one would need an
+allocator that does not exist at that point in boot.
+
+Fifteen host tests replaced twenty-two boot checks, and cover more: the ACPI
+paths and the hostile inputs were never reachable from a boot self-test at all.
+
+### 3.19.6 The finding: no ACPI address may be a constant
+
+`hvm_start_info.rsdp_paddr` is **0 on both machines**, so the root pointer is
+found the BIOS-era way, by scanning the EBDA and `0xE0000..0xFFFFF`. That much
+§3.6 already predicted. What the reference dumps added is why it *matters*.
+
+`amd64/dump-machine.sh` boots Linux under Firecracker at 1/2/4/8 vCPUs and reads
+its boot log — Linux prints every table it finds, with address and length, long
+before it needs a root filesystem, so **no rootfs is involved**. The result:
+
+```text
+  vCPUs      1          2          4          8
+  RSDP     0xE0000    0xE0000    0xE0000    0xE0000     <- the only fixed one
+  XSDT     0xA00A7    0xA00C3    0xA00FB    0xA016B
+  FACP     0x9FF17    0x9FF2B    0x9FF53    0x9FFA3
+  APIC     0xA002B    0xA003F    0xA0067    0xA00B7
+  MADT len   0x40       0x48       0x58       0x78
+```
+
+**Every table address moves with the vCPU count.** The MADT grows by one 8-byte
+Local APIC entry per CPU and everything packed around it slides. This is the
+amd64 twin of `GICD_IROUTER_ALIASING.md`: a kernel that pinned any of these to a
+literal would read the right table at one vCPU count and a neighbour's bytes at
+another, with no error, because the signature check would be the only thing
+between it and garbage.
+
+The two machines also disagree in a way that justifies having both: QEMU
+`microvm` has **two** IOAPICs (`0xfec00000` GSI 0, `0xfec10000` GSI 24) where
+Firecracker has one. Code written against Firecracker alone would reasonably
+assume one.
+
+Full comparison: `docs/reference/firecracker-amd64/README.md`.
+
+### 3.19.7 Polled, not interrupt-driven
+
+`virtio-drivers`' blocking `read_blocks` spins on the used ring. That is a
+stopping point rather than an oversight: the device's interrupt needs an IOAPIC,
+and while the MADT now *reports* one, routing a GSI to a vector and taking the
+interrupt is its own stage. The IRQ number is parsed and kept
+(`MmioDevice::irq`) so that stage does not have to re-derive it.
+
+### 3.19.8 A doc error the arithmetic exposed
+
+`amd64/src/phys.rs`, `lapic.rs` and §3.17.1 all said the LAPIC at `0xFEE0_0000`
+was "inside the first GiB" and therefore already had a cached alias in the
+physmap. `0xFEE0_0000` is **3.98 GiB** and `PHYSMAP_LIMIT` is 1 GiB. The alias
+never existed; `phys_to_virt` would have asserted on it.
+
+It survived because nothing depended on it — the code maps `DEVMAP_BASE + pa`
+directly and never asks the physmap for a device address. Corrected in all three
+places rather than deleted, because it would mislead in a specific direction: a
+reader could "simplify" by dropping the device window believing the physmap
+covers MMIO. The real reasons are reach (the physmap stops at 1 GiB) and
+cacheability (MMIO must not be writeback), and the second is what `MemAttr`
+exists for.
+
+QEMU `microvm` puts virtio-MMIO at `0xFEB0_0000`, in the same sub-4 GiB MMIO
+hole, which is what made the arithmetic worth checking.
+
 ## 4. What is deliberately missing
 
 Corrected 2026-09-04. This list was written at Stage B and went stale as the
@@ -1222,6 +1408,11 @@ it), no IDT (Stage C), and that the target had never run under Firecracker
 (§3.6, on real hardware). A stale "missing" is worse than an edited record, so
 what follows is the state as of Stage L rather than the original text.
 
+- **ACPI is found and read, but only the MADT.** Since Stage M the RSDP is
+  located by scanning (`rsdp_paddr` is 0 on both machines) and the MADT parsed
+  for the local APIC address, the I/O APICs and the enabled CPU list. The FADT,
+  DSDT and MCFG are seen and skipped; there is no AML interpreter and no plan
+  for one. The original note, kept because its reasoning still holds:
 - **No ACPI, and it is further away than expected.** PVH supplies the memory map
   outright, so nothing so far has needed it. It becomes necessary for IOAPIC (device
   interrupts), MADT (SMP) and MCFG (PCI) — not before. Even the preemption timer does
@@ -1229,10 +1420,15 @@ what follows is the state as of Stage L rather than the original text.
   needed, it will have to be found the hard way: `hvm_start_info.rsdp_paddr` exists
   in the ABI but **both** QEMU and Firecracker v1.16.1 report it as 0 (measured,
   §3.6). Do not build on that field.
-- **No devices at all.** No disk, no NIC, no virtio. The console is the 16550 at
-  I/O port `0x3F8` and nothing else, which is why the ELF loader's image is
-  `include_bytes!`d into the kernel rather than opened by path (§3.18.2). A VGA
-  text path was considered and dropped: it would be dead code on Firecracker.
+- **No NIC, and no device interrupts.** There is a disk since Stage M
+  (virtio-blk, §3.19), driven by polling. The console is still the 16550 at I/O
+  port `0x3F8`; a VGA text path was considered and dropped as dead code on
+  Firecracker. The ELF loader's image is still `include_bytes!`d rather than
+  opened by path, because there is a block device but no filesystem on top of it
+  yet.
+- **No IOAPIC.** Its address is now read from the MADT (§3.19.6) and nothing
+  uses it. Routing a GSI to a vector and taking a device interrupt is the next
+  stage, and is what would let the block driver stop polling.
 - **No demand paging for user segments.** The `#PF` handler services a
   not-present fault inside one armed region (Stage C); an ELF's segments are
   allocated and copied eagerly. Wiring the two together needs a per-space region

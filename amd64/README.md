@@ -10,17 +10,27 @@ address spaces**, and **preemptively multitasks** between them. The kernel runs
 in the **upper half**, so user programs are mapped at `0x40_0000` where a static
 Linux binary is linked — and since Stage L an **ELF loader** puts one there: a
 program `rustc` compiled and linked, whose `PT_LOAD` segments the kernel parses
-and places, with a System V initial stack (argc/argv/envp/auxv). No devices
-beyond the serial console.
+and places, with a System V initial stack (argc/argv/envp/auxv). Since Stage M
+it also drives a **virtio-blk disk** and reads its own machine description —
+the PVH memory map, the virtio-MMIO command line, and ACPI's MADT. No
+filesystem on top of the disk yet, and no device interrupts.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1**.
 
 **Status: C** (active risk, expect surprises). This is a spike, not a port.
 
 ```bash
-amd64/run.sh                     # build + boot under QEMU
+amd64/run.sh                     # build + boot under QEMU microvm, with a probe disk
 MEMORY=1024 amd64/run.sh
+DISK=my.img amd64/run.sh         # attach an existing raw image
+DISK=none amd64/run.sh           # no drive at all
 ```
+
+`-M microvm`, not QEMU's default `pc`, and that is load-bearing: `pc` and `q35`
+put virtio on **PCI**, and Firecracker has no PCI bus. A local run against them
+would exercise a device model the target machine does not have, and the reason
+QEMU is a useful stand-in — the same entry path, the same device model — would
+be gone.
 
 ```
 Akuma/amd64 — long mode reached
@@ -130,6 +140,30 @@ banner. The guest never runs and there is no error. It only reproduces on a real
 terminal — over a pipe (`ssh` with no `-t`) there is no controlling TTY and plain
 `timeout` works fine.
 
+## The machine description
+
+There is **no device tree**. `crates/akuma-ryzen-amd64` parses the three things
+this machine does provide, and is host-tested against bytes measured from both
+VMMs:
+
+| | where | what it carries |
+|---|---|---|
+| PVH `hvm_start_info` | address in `%ebx` at entry | E820 memory map, command-line pointer |
+| the kernel command line | a string that block points at | every virtio-MMIO transport: base, size, IRQ |
+| ACPI | found by **scanning** the BIOS window | local APIC, I/O APICs, CPU list (the MADT) |
+
+`hvm_start_info.rsdp_paddr` exists in the ABI and is **0 on both machines**, so
+the ACPI root pointer is found the BIOS-era way. And no table address may be a
+constant — every one of them moves with the vCPU count. The measured evidence,
+at 1/2/4/8 vCPUs, is `docs/reference/firecracker-amd64/`; regenerate it with:
+
+```bash
+FC_HOST=user@host amd64/dump-machine.sh
+```
+
+That boots **Linux** under Firecracker and reads its boot log, which lists every
+ACPI table long before a root filesystem is needed — so no rootfs is involved.
+
 ## Guest programs
 
 The programs the loader runs live in `userspace/amd64/`, one directory each,
@@ -143,9 +177,14 @@ program that printed its verdict would have "passed" by running at all.
 
 ## What is deliberately missing
 
-- **No devices.** No disk, no NIC, no virtio, no IOAPIC — the 16550 at I/O port
-  `0x3F8` is the whole device model. A VGA text path was considered and dropped:
-  it is dead code on Firecracker.
+- **No filesystem.** There is a disk (virtio-blk) and nothing on top of it.
+  `akuma-ext2` and `akuma-vfs` already build for `x86_64-unknown-none`, so this
+  is the next stage rather than a hard problem.
+- **No NIC, and no device interrupts.** The block driver polls the used ring.
+  The IOAPIC's address is read from the MADT and nothing uses it; routing a GSI
+  to a vector is what would let the driver stop polling.
+- **No VGA.** Considered and dropped: dead code on Firecracker, whose console is
+  the 16550 at I/O port `0x3F8`.
 - **No demand paging for user segments.** The `#PF` handler services a
   not-present fault inside one armed region; an ELF's segments are allocated and
   copied eagerly. Wiring the two together needs a per-space region table.
