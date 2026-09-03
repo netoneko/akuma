@@ -8,7 +8,7 @@
 //! # Relationship to `akuma-mmap` and proposal item 1
 //!
 //! [`Prot`] below is deliberately the shape
-//! `proposals/REDUCING_PLATFORM_DEPENDENCY.md` §1 proposes for `akuma-mmap`: a
+//! `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §1 proposes for `akuma-mmap`: a
 //! small `Copy` struct of `{read, write, exec, user}` with named constructors,
 //! **not** a `u64` of architectural bits. It is defined here rather than reused
 //! from `akuma-mmap` because `MmapRegion.flags` is still a raw AArch64 `u64`

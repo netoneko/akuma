@@ -90,7 +90,7 @@
 //! passed**. Fixing the gate alone took that to 34 passing, with the remaining
 //! 18 blocked by genuinely AArch64-specific code elsewhere. Measured
 //! 2026-09-03; regenerate with the loop in
-//! `proposals/REDUCING_PLATFORM_DEPENDENCY.md` §0.1.
+//! `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §0.1.
 //!
 //! The lesson generalises to every other bare-metal gate in the tree —
 //! `akuma_primitives::preempt::current_tid` among them — and those are still
@@ -108,7 +108,7 @@
 //! `RFLAGS.IF` where the *set* bit means "enabled" — opposite polarity in a
 //! `u64` that callers compare against AArch64 bit positions. `tlb`, `vtimer` and
 //! `sysreg` leak their encodings the same way. Those want the neutral vocabulary
-//! `proposals/REDUCING_PLATFORM_DEPENDENCY.md` §3 describes, not an x86 arm
+//! `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §3 describes, not an x86 arm
 //! bolted under an AArch64 mnemonic.
 
 #![cfg_attr(not(test), no_std)]

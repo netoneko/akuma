@@ -2,7 +2,7 @@
 //!
 //! Both `akuma-alloc` and `akuma-pmm` are architecture-neutral and built for
 //! `x86_64-unknown-none` before this target existed. This module is the test of
-//! that: if the claim in `proposals/REDUCING_PLATFORM_DEPENDENCY.md` is right,
+//! that: if the claim in `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` is right,
 //! wiring them up needs no new arch code at all — only a memory map, which PVH
 //! hands over (`crate::hvm`).
 //!

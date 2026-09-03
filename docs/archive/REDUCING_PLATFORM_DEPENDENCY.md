@@ -1,14 +1,32 @@
 # Reducing platform dependency
 
-**Date:** 2026-09-03
-**Status:** §0 applied 2026-09-03 (the arch gate, found while bringing up `amd64/`).
-§5 started 2026-09-04 (`akuma-syscalls-abi`). Items 1-4 and 6 not applied — though
-the amd64 port has now produced independent evidence *for* items 1, 3 and 4; see
-`docs/archive/AKUMA_FIRECRACKER_AMD64.md`. Every number below is measured — `scripts/cloc_akuma.py`
-for line counts, greps reproduced inline for call-site counts. No estimate is inferred
-from `wc -l`; see §8 for why that distinction matters here.
-**Related:** `proposals/FIRECRACKER_PORT.md` (a second *machine*, same architecture),
-`docs/reference/crate-safety.md`, `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`,
+**Date:** 2026-09-03. **Moved** from `proposals/` to `docs/archive/` on 2026-09-04:
+two of its six items have landed and the rest have been argued against real evidence
+rather than a hypothetical port, so this is now a record of findings with open items
+in it, not a proposal awaiting a decision. It keeps its original structure — the
+reasoning for an item that has *not* been done is the part worth preserving.
+
+## Status of each item
+
+| | Item | State |
+|---|---|---|
+| §0 | The arch gate (`target_os` alone stopped discriminating) | **APPLIED 2026-09-03.** 13 → 36 crates build for `x86_64-unknown-none` |
+| §1 | PTE permissions are AArch64 bits inside a crate that forbids knowing that | **OPEN.** Evidence *for* it since: `amd64/src/paging.rs` has the `Prot`/`MemAttr` vocabulary §1.2 asks for, written from scratch because `MmapRegion.flags` cannot cross (`AKUMA_FIRECRACKER_AMD64.md` §3.5, §3.9.1). Two encodings now exist and neither can be handed to the other |
+| §2 | Device discovery arrives as a DTB, threaded through the MMU | **OPEN.** x86_64 Firecracker passes no DTB at all — the memory map comes from `hvm_start_info`, which is what `amd64/src/hvm.rs` parses. The second consumer §2 predicted exists now |
+| §3 | TLB invalidation cannot express *who* | **OPEN.** Sharpened: `invlpg` is **core-local** where `tlbi ...is` broadcasts to the inner-shareable domain, so an x86 multi-core kernel must IPI. There is no way to say that difference in today's vocabulary (`AKUMA_FIRECRACKER_AMD64.md` §3.10.3) |
+| §4 | `Context` is built by register name outside the crates that own registers | **OPEN.** `amd64/src/sched.rs` built a second `Context` by hand for the same reason |
+| §5 | Syscall numbers are constants, not a table | **APPLIED 2026-09-04.** `crates/akuma-syscalls-abi`, and the amd64 syscall handler dispatches through it |
+| §6 | Write down the per-CPU-identity rule | **OPEN.** One paragraph, no code change |
+
+Every number below is measured — `scripts/cloc_akuma.py` for line counts, greps
+reproduced inline for call-site counts. No estimate is inferred from `wc -l`; see §8
+for why that distinction matters here. The crate counts in §0.1 were 34 when written
+and are 36 now; regenerate rather than trusting either (§8.1).
+
+**Related:** `docs/archive/AKUMA_FIRECRACKER_AMD64.md` (the port that produced the
+evidence, one section per stage), `proposals/FIRECRACKER_PORT.md` (a second *machine*,
+same architecture), `docs/reference/crate-safety.md`,
+`docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`,
 `docs/archive/INLINE_ASM_CLEANUP.md`.
 
 ## The claim
@@ -63,6 +81,8 @@ while touching it will be to "unify" something that is deliberately split.
 ---
 
 ## 0. The arch gate — found by building, fixed 2026-09-03
+
+**APPLIED.**
 
 Full record: `docs/archive/AKUMA_FIRECRACKER_AMD64.md`.
 
@@ -145,6 +165,8 @@ this whole document is about, one level down.
 ---
 
 ## 1. The PTE permission vocabulary is AArch64 bits, in the crate that forbids knowing that
+
+**OPEN.** Independent evidence arrived after this was written — see the status table.
 
 **Highest leverage. The only item here that is a live imprecision rather than debt.**
 
@@ -270,6 +292,8 @@ line in the archive doc when it lands.
 
 ## 2. Device discovery arrives as a DTB and is threaded through the MMU
 
+**OPEN.** The second, non-DTB machine this predicted now exists (`amd64/src/hvm.rs`).
+
 `akuma-mmu` depends on `akuma-fdt` and hands a device tree to its callers:
 
 ```rust
@@ -327,6 +351,8 @@ missing-population bug names the `init` that was skipped instead of faulting.
 ---
 
 ## 3. TLB invalidation cannot express *who*
+
+**OPEN**, and sharper than when written: see the status table.
 
 ```rust
 pub fn flush_tlb_all()
@@ -394,6 +420,8 @@ implicitly re-run during each of the four investigations above.
 
 ## 4. `Context` is built by register name outside the crates that own registers
 
+**OPEN.** A second hand-built `Context` now exists in `amd64/src/sched.rs`.
+
 ```rust
 // crates/akuma-exec-core/src/thread.rs
 pub struct Context {
@@ -449,6 +477,8 @@ switch asm indexes it by offset.
 
 ## 5. Syscall numbers are constants, not a table
 
+**APPLIED 2026-09-04** — `crates/akuma-syscalls-abi`.
+
 `crates/akuma-syscalls-linux/src/nr.rs` is 273 lines of `pub const NAME: u64 = n;` in
 the Linux `asm-generic` numbering, and dispatch in `akuma-syscalls-glue` matches on
 those constants directly (192 `nr::` references).
@@ -489,6 +519,8 @@ this adds a way to dispatch by name, it does not migrate anything.
 ---
 
 ## 6. Write down the per-CPU-identity rule before something depends on it being free
+
+**OPEN.** Still one paragraph and no code change.
 
 `akuma-primitives::preempt::current_tid()` reads `TPIDRRO_EL0`;
 `akuma-primitives::cpu::current_core_id()` is the same shape. Both are callable at

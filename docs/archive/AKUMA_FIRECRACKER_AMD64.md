@@ -11,7 +11,7 @@ Akuma/amd64 — long mode reached
 The interesting result is not the boot. It is what the boot **found**: one `cfg`
 gate in `akuma-cpu` was silently emitting AArch64 instructions into x86 codegen,
 and it was taking three quarters of the tree down with it. That gate was listed in
-`proposals/REDUCING_PLATFORM_DEPENDENCY.md` under *"what is already right, and must
+`docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` under *"what is already right, and must
 not be regressed."*
 
 ## The result
@@ -1276,7 +1276,7 @@ reference in `boot.s` with `R_X86_64_32 cannot be used against local symbol`.
 
 **Background:** the one kernel defect this port has found so far has its own
 document: `docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md`.
-`proposals/REDUCING_PLATFORM_DEPENDENCY.md` §0 carries the corrected
+`docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §0 carries the corrected
 claim and the reproduction commands; `amd64/README.md` is the current-state doc for
 this target. The aarch64 Firecracker port — a different machine with a different
 device model — is `docs/archive/AKUMA_FIRECRACKER_KVM.md` and

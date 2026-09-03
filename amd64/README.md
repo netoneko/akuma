@@ -155,7 +155,7 @@ program that printed its verdict would have "passed" by running at all.
   `docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md` §8.
 - **No SMP**, no `CR4.SMAP`/`SMEP`, no TSS/IST, no ACPI.
 - **Little use of the kernel crates.** 36 of 54 build for `x86_64-unknown-none`
-  (§0 of `proposals/REDUCING_PLATFORM_DEPENDENCY.md`), but they take the *host
+  (§0 of `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md`), but they take the *host
   stub* out of `akuma-cpu`: a no-op `dsb_ish`, a `wfi` that does not park.
   Calling them from here would be wrong in ways QEMU will not show you. Read
   §0.3 before wiring the first one up. `akuma-elf` in particular is unusable —
@@ -170,4 +170,4 @@ building for `x86_64-unknown-none`), and the two verification methods that turne
 out not to work. The one kernel defect the port has found —
 `syscall_entry` clobbering six registers the Linux ABI preserves — is
 `docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md`.
-`proposals/REDUCING_PLATFORM_DEPENDENCY.md` §0 carries the corrected claim.
+`docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §0 carries the corrected claim.

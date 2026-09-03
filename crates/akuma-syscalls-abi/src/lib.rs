@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 //! Which syscall a number means, **on which architecture**.
 //!
-//! Proposal item 5 (`proposals/REDUCING_PLATFORM_DEPENDENCY.md` §5), started
+//! Proposal item 5 (`docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §5), started
 //! 2026-09-04 because the amd64 port made it stop being cosmetic.
 //!
 //! # Why this is a separate crate

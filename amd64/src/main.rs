@@ -8,7 +8,7 @@
 //! stop assuming AArch64.
 //!
 //! What this file is really measuring is the claim in
-//! `proposals/REDUCING_PLATFORM_DEPENDENCY.md`: that 81.7% of the tree's
+//! `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md`: that 81.7% of the tree's
 //! production code is already architecture-neutral. Every crate that boots
 //! usefully from here is evidence for it; every crate that cannot is a seam
 //! the proposal has to name.
