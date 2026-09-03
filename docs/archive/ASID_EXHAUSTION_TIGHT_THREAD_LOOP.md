@@ -214,6 +214,62 @@ analysis, because it does not make anything reclaim sooner — it just makes the
 big enough that the deferred path has time to work. That is the change to make
 first.
 
+## 6.3 2026-09-03 — §4 upgraded from inference to direct proof
+
+The self-host heap-leak hunt
+([`SELFHOST_KERNEL_HEAP_LEAK.md`](SELFHOST_KERNEL_HEAP_LEAK.md)) instrumented
+`UserAddressSpace::drop` with an enter/exit counter pair and a per-address-space
+in-flight ledger. That measurement settles a question this doc could only argue
+indirectly.
+
+**Every `UserAddressSpace::drop` runs to completion.** Over one clean in-guest
+build: `drop_exit = 1537 = drop(424) + drop_shared(1113)`, and the in-flight
+ledger reports `in_flight=0` for the `as_drop` bracket at every sample. The
+`AS_DROP_EXIT` counter is incremented *after*
+`ASID_ALLOCATOR.lock().free(self.asid)`, which is the last statement in `Drop`,
+so a balanced bracket means **every ASID taken was returned**.
+
+Consequences:
+
+- §4's "it is a rate problem, not a leak" is now proved rather than inferred
+  from a healing-under-pause experiment. Both lines of evidence agree.
+- §3's warning text — *"suspect leaked ASIDs from address spaces whose Drop
+  never ran"* — names a suspect that measurably does not occur. Apply the
+  correction §4 already recommends: exhaustion means "leaked **or** allocated
+  faster than the deferred path returns them", and only the second is reachable
+  here.
+- **Do not reuse the ASID canary as evidence about anything other than ASIDs.**
+  The heap-leak hunt initially argued "`[asid] EXHAUSTED` = 0, therefore `Drop`
+  runs, therefore the maps it frees are freed". The first two steps were right
+  and the third was wrong: the leaked maps were freed by `free_as_frames_now`
+  reached from `drain_pending_ttbr_frees` — a *different* caller, outside
+  `Drop`, which is the one that gets abandoned. A canary proves something about
+  its own resource and nothing about what runs beside it.
+
+### What this does to the §6 lever table
+
+**"Return the ASID before the rest of the drop" is now quantified.** The same
+measurement shows where `Drop` spends its time: the abandoned drains were each
+holding `user_frames` maps of **11 872 to 42 193 entries**, and
+`free_as_frames_now` returns those pages to the PMM one at a time. That whole
+loop sits *before* `flush_tlb_asid` + the ASID free, so an ASID is held for the
+duration of a multi-thousand-page teardown on top of the 10 ms reclaim cooldown.
+The lever is therefore worth more than the table assumed.
+
+It is **not** obviously safe, and the audit the table asks for is still owed.
+The ordering comment in `Drop` is explicit that the flush must precede the free
+because a peer core can `alloc()` the ASID and install it while stale
+translations live. Moving flush-and-free earlier does not by itself discharge
+that: `free_or_defer_as_frames` parks frames precisely because a core may still
+have TTBR0 on the dying L0, and such a core can populate fresh TLB entries by
+walking the still-live tables *after* the flush. Note the existing asymmetry
+this exposes — when the frames are parked, the ASID is returned anyway. Whether
+that is safe is the audit, and it belongs with §6.2's enumeration rather than
+ahead of it.
+
+§6.1 (16-bit ASIDs) and §6.2 (the precondition for reclaiming sooner) are
+untouched by this measurement. §6.1 remains the change to make first.
+
 ## 7. What to check when this recurs
 
 1. `grep -a "clone_thread failed"` — the reason string is ungated and names the
@@ -234,3 +290,8 @@ first.
   made `[asid] EXHAUSTED` and `clone_thread failed` visible at all.
 - `docs/reference/subsystems/memory.md` — the reclaim path the ASID drop rides on.
 - `docs/reference/subsystems/thread-lifecycle.md` — slot states and the cooldown.
+- [`SELFHOST_KERNEL_HEAP_LEAK.md`](SELFHOST_KERNEL_HEAP_LEAK.md) — the drop
+  enter/exit bracket that proves §4, and the abandoned `drain_pending_ttbr_frees`
+  that leaks the frames `Drop` handed it. The two issues share a code path and
+  are still distinct: `Drop` always completes (so ASIDs return), while the drain
+  it feeds does not (so the frames do not).

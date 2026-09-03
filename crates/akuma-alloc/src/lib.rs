@@ -64,7 +64,7 @@ extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, AtomicBool, Ordering};
 use spinning_top::Spinlock;
 use talc::{Span, Talc};
 
@@ -572,6 +572,345 @@ static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PEAK_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
+/// Live bytes and live object count per log2 size class (leak attribution).
+/// `LIVE_COUNT[class]` tells multiplicity: bytes/class_size = how many objects
+/// of that size survive, which is what distinguishes per-unit leaks from
+/// per-page drips. Temporary instrumentation for the self-host heap hunt.
+static LIVE_BYTES: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
+static LIVE_COUNT: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
+
+/// Exact-size live counts for class 2^8 (sizes 240 and 256 exactly), further
+/// attributed by current syscall number (index 0 = no-syscall context).
+/// Registered from kernel-glue at init. Temporary instrumentation.
+static LIVE_BY_NR: [[AtomicU32; 512]; 2] = [const { [const { AtomicU32::new(0) }; 512] }; 2];
+
+/// Cumulative allocation counts by syscall nr, per leak size. Add-side only:
+/// no underflow, and races merely misattribute a few counts — the dominant nr
+/// for each size still identifies the syscall family that allocates the
+/// leaking objects. Temporary instrumentation.
+#[allow(dead_code)]
+static ALLOCS_BY_NR: [[AtomicU64; 512]; 4] =
+    [const { [const { AtomicU64::new(0) }; 512] }; 4]; // superseded by ALLOCS_BY_PID; kept for the [ALLOCNR] dump shape
+
+/// Cumulative allocation counts and live counts, by CURRENT PID, for the leak
+/// sizes. Live counts wrap (u32) when a free lands under a different pid than
+/// the alloc — a large-wrapped value at a dead pid means "allocated by that
+/// pid, freed by someone else" — exactly the teardown-path fingerprint this
+/// hunt wants. Temporary instrumentation.
+static ALLOCS_BY_PID: [[AtomicU64; 512]; 4] =
+    [const { [const { AtomicU64::new(0) }; 512] }; 4];
+static LIVE_BY_PID: [[AtomicU32; 512]; 4] =
+    [const { [const { AtomicU32::new(0) }; 512] }; 4];
+
+/// The four observed leak sizes.
+const NR_SIZES: [usize; 4] = [144, 224, 240, 256];
+
+/// Exact-size live counts for class 2^8 (sizes 129..=256), where the build-
+/// churn leak lives. Index `size - 128`. Temporary instrumentation.
+static LIVE_COUNT_8: [AtomicU32; 128] = [const { AtomicU32::new(0) }; 128];
+static SYSCALL_NR_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+// ── Temporary leak attribution: live objects by allocating call chain ──────
+//
+// The self-host heap leak is ~261 000 live 144-byte objects per clean build
+// (`docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md`). Size alone names the *type*
+// (a `BTreeMap<usize, u32>` leaf node) but not the *owner*, and cumulative
+// alloc counts cannot separate the leaking site from the churning one — 86% of
+// 144-byte allocations are freed normally. So this tracks LIVE count per call
+// chain: capture the frame-pointer chain at allocation, intern it, and remember
+// which slot each live pointer belongs to so the free can decrement the right
+// one.
+//
+// Requires `-C force-frame-pointers=yes` (aarch64-unknown-none omits x29 chains
+// otherwise). Delete this whole block, its call sites and that flag once the
+// leak is named.
+const PCTRACK_SIZE: usize = 144;
+const PC_DEPTH: usize = 6;
+const PC_SLOTS: usize = 512;
+/// Interned chain key (FNV of the chain); 0 = free slot.
+static PC_KEY: [AtomicU64; PC_SLOTS] = [const { AtomicU64::new(0) }; PC_SLOTS];
+static PC_CHAIN: [[AtomicUsize; PC_DEPTH]; PC_SLOTS] =
+    [const { [const { AtomicUsize::new(0) }; PC_DEPTH] }; PC_SLOTS];
+static PC_ALLOCS: [AtomicU64; PC_SLOTS] = [const { AtomicU64::new(0) }; PC_SLOTS];
+/// Live count, wrapping: a free whose alloc slot was evicted by an address
+/// collision decrements a neighbour. Noise, not corruption — the ranking holds.
+static PC_LIVE: [AtomicU64; PC_SLOTS] = [const { AtomicU64::new(0) }; PC_SLOTS];
+
+/// Direct-mapped pointer -> slot+1, so a free can find its allocation's chain
+/// without a header (changing the layout would have to stay symmetric across
+/// alloc/dealloc/realloc; this does not touch the layout at all). 4 M entries
+/// -> ~13% occupancy at the observed live count; collisions misattribute a few
+/// percent of frees.
+const PTR_SLOT_BITS: usize = 21;
+static PTR_SLOT: [AtomicU16; 1 << PTR_SLOT_BITS] =
+    [const { AtomicU16::new(0) }; 1 << PTR_SLOT_BITS];
+
+#[inline]
+fn ptr_slot_index(ptr: usize) -> usize {
+    (ptr >> 4) & ((1 << PTR_SLOT_BITS) - 1)
+}
+
+/// Walk the x29 frame chain, newest first. Every step is validated against the
+/// previous frame — stacks grow down, so a caller's frame is always at a higher
+/// address, and a real frame is within a page or so of its callee's. A chain
+/// that fails either check stops the walk rather than dereferencing a guess.
+#[cfg(target_os = "none")]
+#[inline(never)]
+fn capture_chain() -> [usize; PC_DEPTH] {
+    let mut out = [0usize; PC_DEPTH];
+    let mut fp: usize;
+    // SAFETY: reads a register. `x29` is the frame pointer under
+    // `-C force-frame-pointers=yes`; without it the validation below rejects
+    // whatever it holds and the walk yields zeros.
+    unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+    for slot in &mut out {
+        if fp == 0 || fp & 0xf != 0 || fp < 0x4000_0000 {
+            break;
+        }
+        // SAFETY: `fp` passed the alignment/range check and, after the first
+        // iteration, the monotonic-and-nearby check below, so it points into
+        // the current (mapped) kernel stack.
+        let (next, ra) = unsafe { (*(fp as *const usize), *((fp + 8) as *const usize)) };
+        *slot = ra;
+        if next <= fp || next - fp > 0x1_0000 {
+            break;
+        }
+        fp = next;
+    }
+    out
+}
+
+#[cfg(not(target_os = "none"))]
+fn capture_chain() -> [usize; PC_DEPTH] { [0; PC_DEPTH] }
+
+/// Intern `chain`, returning its slot. `None` when the table is full.
+fn intern_chain(chain: &[usize; PC_DEPTH]) -> Option<usize> {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &pc in chain {
+        h ^= pc as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if h == 0 {
+        h = 1;
+    }
+    let start = (h as usize) % PC_SLOTS;
+    for probe in 0..32 {
+        let i = (start + probe) % PC_SLOTS;
+        let cur = PC_KEY[i].load(Ordering::Relaxed);
+        if cur == h {
+            return Some(i);
+        }
+        if cur == 0
+            && PC_KEY[i]
+                .compare_exchange(0, h, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            for (d, pc) in chain.iter().enumerate() {
+                PC_CHAIN[i][d].store(*pc, Ordering::Relaxed);
+            }
+            return Some(i);
+        }
+    }
+    None
+}
+
+#[inline]
+fn pc_track_alloc(ptr: usize, size: usize) {
+    if size != PCTRACK_SIZE {
+        return;
+    }
+    let chain = capture_chain();
+    if let Some(slot) = intern_chain(&chain) {
+        PC_ALLOCS[slot].fetch_add(1, Ordering::Relaxed);
+        PC_LIVE[slot].fetch_add(1, Ordering::Relaxed);
+        PTR_SLOT[ptr_slot_index(ptr)].store(slot as u16 + 1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn pc_track_free(ptr: usize, size: usize) {
+    if size != PCTRACK_SIZE {
+        return;
+    }
+    let i = ptr_slot_index(ptr);
+    let s = PTR_SLOT[i].swap(0, Ordering::Relaxed);
+    if s != 0 {
+        PC_LIVE[s as usize - 1].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Print the call chains holding the most live `PCTRACK_SIZE` objects.
+/// Symbolize the addresses against the kernel ELF, e.g.
+/// `llvm-symbolizer --obj=target/aarch64-unknown-none/release/akuma <pc>`.
+pub fn dump_pc_attribution() {
+    for i in 0..PC_SLOTS {
+        let live = PC_LIVE[i].load(Ordering::Relaxed).cast_signed();
+        if live < 500 {
+            continue;
+        }
+        let allocs = PC_ALLOCS[i].load(Ordering::Relaxed);
+        safe_print!(96, "[PCLIVE] slot={} live={} allocs={}\n", i, live, allocs);
+        for (d, cell) in PC_CHAIN[i].iter().enumerate() {
+            let pc = cell.load(Ordering::Relaxed);
+            if pc != 0 {
+                safe_print!(64, "[PCLIVE]   #{} 0x{:x}\n", d, pc);
+            }
+        }
+    }
+}
+
+
+/// Register the `current_syscall_nr` hook so leak attribution can name the
+/// syscall family a surviving allocation came from. Called once at kernel init.
+pub fn register_syscall_nr_hook(f: fn() -> u64) {
+    SYSCALL_NR_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Register the `current_pid` hook for leak attribution.
+///
+/// Lets the histogram name the process whose syscall path allocated (and later
+/// freed) surviving objects. Called once at kernel init; the hook returns 0
+/// when no process context exists.
+pub fn register_current_pid_hook(f: fn() -> u64) {
+    CURRENT_PID_HOOK.store(f as usize, Ordering::Release);
+}
+
+static CURRENT_PID_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn hook_current_pid() -> u64 {
+    let f = CURRENT_PID_HOOK.load(Ordering::Acquire);
+    if f == 0 {
+        0
+    } else {
+        (unsafe { core::mem::transmute::<usize, fn() -> u64>(f) })()
+    }
+}
+
+#[inline]
+fn live_nr_slot(size: usize) -> Option<usize> {
+    match size {
+        240 => Some(0),
+        256 => Some(1),
+        _ => None,
+    }
+}
+
+#[inline]
+fn alloc_nr_slot(size: usize) -> Option<usize> {
+    NR_SIZES.iter().position(|&s| s == size)
+}
+
+#[inline]
+fn size_class(size: usize) -> usize {
+    if size == 0 {
+        0
+    } else {
+        (size.next_power_of_two().trailing_zeros() as usize).min(31)
+    }
+}
+
+#[inline]
+fn livehist_add(size: usize) {
+    let sc = size_class(size);
+    LIVE_BYTES[sc].fetch_add(size, Ordering::Relaxed);
+    LIVE_COUNT[sc].fetch_add(1, Ordering::Relaxed);
+    if let Some(table) = live_nr_slot(size) {
+        let nr = hook_syscall_nr() as usize;
+        if nr < 512 {
+            LIVE_BY_NR[table][nr].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if let Some(table) = alloc_nr_slot(size) {
+        let pid = hook_current_pid() as usize;
+        if pid < 512 {
+            ALLOCS_BY_PID[table][pid].fetch_add(1, Ordering::Relaxed);
+            LIVE_BY_PID[table][pid].fetch_add(1, Ordering::Relaxed);
+        }
+        let nr = hook_syscall_nr() as usize;
+        if nr < 512 {
+            ALLOCS_BY_NR[table][nr].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if sc == 8 && size > 128 && size < 256 {
+        LIVE_COUNT_8[size - 128].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn livehist_sub(size: usize) {
+    let sc = size_class(size);
+    LIVE_BYTES[sc].fetch_sub(size, Ordering::Relaxed);
+    LIVE_COUNT[sc].fetch_sub(1, Ordering::Relaxed);
+    if let Some(table) = live_nr_slot(size) {
+        let nr = hook_syscall_nr() as usize;
+        if nr < 512 {
+            LIVE_BY_NR[table][nr].fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    if let Some(table) = alloc_nr_slot(size) {
+        let pid = hook_current_pid() as usize;
+        if pid < 512 {
+            LIVE_BY_PID[table][pid].fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    if sc == 8 && size > 128 && size < 256 {
+        LIVE_COUNT_8[size - 128].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn hook_syscall_nr() -> u64 {
+    let f = SYSCALL_NR_HOOK.load(Ordering::Acquire);
+    if f == 0 {
+        0
+    } else {
+        (unsafe { core::mem::transmute::<usize, fn() -> u64>(f) })()
+    }
+}
+
+/// Print one line per nonzero size class. Alloc-free (safe_print), safe from
+/// any context. Sum of LIVE_BYTES tracks ALLOCATED_BYTES within class-granularity.
+pub fn dump_live_histogram() {
+    for i in 0..32 {
+        let b = LIVE_BYTES[i].load(Ordering::Relaxed);
+        let c = LIVE_COUNT[i].load(Ordering::Relaxed);
+        if b > 0 {
+            safe_print!(128, "[LIVEHIST] 2^{}: {} objs, {}KB live\n", i, c, b / 1024);
+        }
+    }
+    for (i, c) in LIVE_COUNT_8.iter().enumerate() {
+        let c = c.load(Ordering::Relaxed);
+        if c > 0 {
+            safe_print!(96, "[LIVE8] size={}: {} objs\n", 128 + i, c);
+        }
+    }
+    for (t, size) in [(0usize, 240usize), (1, 256)] {
+        for (nr, c) in LIVE_BY_NR[t].iter().enumerate() {
+            let c = c.load(Ordering::Relaxed);
+            if c > 0 {
+                safe_print!(96, "[LIVENR] size={} nr={}: {} objs live\n", size, nr, c);
+            }
+        }
+    }
+    for (t, size) in NR_SIZES.iter().enumerate() {
+        for (nr, c) in ALLOCS_BY_NR[t].iter().enumerate() {
+            let c = c.load(Ordering::Relaxed);
+            if c > 30 {
+                safe_print!(96, "[NRALLOC] size={} nr={}: {} allocs\n", size, nr, c);
+            }
+        }
+        for (pid, c) in ALLOCS_BY_PID[t].iter().enumerate() {
+            let c = c.load(Ordering::Relaxed);
+            if c > 20 {
+                let live = LIVE_BY_PID[t][pid].load(Ordering::Relaxed);
+                safe_print!(128, "[PIDNR] size={} pid={}: {} allocs, {} live (wrap=dead-pid-freed)\n",
+                    size, pid, c, live.cast_signed());
+            }
+        }
+    }
+}
+
 /// Memory statistics
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryStats {
@@ -753,6 +1092,8 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
         let new_allocated =
             ALLOCATED_BYTES.fetch_add(user_size, Ordering::Relaxed) + user_size;
         ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+        livehist_add(user_size);
+        pc_track_alloc(user_ptr as usize, user_size);
         let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
         while new_allocated > peak {
             match PEAK_ALLOCATED.compare_exchange_weak(
@@ -838,9 +1179,14 @@ unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
             (ptr, layout)
         };
 
+        // Before the free: once the span is back in Talc another core can hand
+        // the same address out and claim its `PTR_SLOT` entry, which this would
+        // then clear.
+        pc_track_free(ptr as usize, user_size);
         TALC.lock()
             .free(core::ptr::NonNull::new_unchecked(actual_ptr), actual_layout);
         ALLOCATED_BYTES.fetch_sub(user_size, Ordering::Relaxed);
+        livehist_sub(user_size);
     });
 }}
 
@@ -889,6 +1235,7 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
                 TALC.lock()
                     .free(core::ptr::NonNull::new_unchecked(actual_ptr), actual_layout);
                 ALLOCATED_BYTES.fetch_sub(old_user_size, Ordering::Relaxed);
+                livehist_sub(old_user_size);
                 return ptr::null_mut();
             }
 
@@ -935,6 +1282,7 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
             // Update allocation stats for new allocation
             let new_allocated = ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed) + new_size;
             ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+            livehist_add(new_size);
             let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
             while new_allocated > peak {
                 match PEAK_ALLOCATED.compare_exchange_weak(
@@ -983,6 +1331,7 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
                 TALC.lock()
                     .free(core::ptr::NonNull::new_unchecked(old_actual_ptr), old_actual_layout);
                 ALLOCATED_BYTES.fetch_sub(old_user_size, Ordering::Relaxed);
+                livehist_sub(old_user_size);
             }
 
             // Heap growth monitor for realloc (net growth = new_size - old_user_size)

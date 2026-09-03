@@ -540,6 +540,28 @@ pub fn set_rump_tests_hook(f: fn()) {
     RUMP_TESTS_HOOK.register(f);
 }
 
+#[cfg(target_os = "none")]
+/// Alloc-hook form of the current THREAD id: lock-free (a TPIDRRO_EL0 read).
+/// Deliberately NOT `read_current_pid` — that path can take `THREAD_PID_MAP`'s
+/// spinlock, and the allocator calls this from inside `talc_alloc`'s
+/// IRQ-masked section, so any thread that allocates while holding that lock
+/// deadlocks the box (observed as a `[BKL] stuck` boot storm). Temporary
+/// instrumentation for the live-histogram leak hunt.
+fn current_pid_for_alloc_hook() -> u64 {
+    akuma_exec::threading::current_thread_id() as u64
+}
+
+#[cfg(target_os = "none")]
+/// Alloc-hook form of the CURRENT THREAD's syscall number — the per-slot
+/// stamp (`THREAD_CURRENT_SYSCALL`), not the racy global the sshd loop pins
+/// at `nanosleep`. Kernel-context allocations (no syscall) land in bucket 511
+/// so they stay visible. Lock-free; temporary instrumentation.
+fn thread_nr_for_alloc_hook() -> u64 {
+    let tid = akuma_exec::threading::current_thread_id();
+    let nr = akuma_exec::threading::thread_current_syscall(tid);
+    if nr == u64::MAX { 511 } else { nr }
+}
+
 /// Main kernel initialization - all safe code
 #[cfg(target_os = "none")]
 pub fn kernel_main(dtb_ptr: usize) -> ! {
@@ -861,6 +883,11 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Signal that PMM is ready - allocator will switch to page mode
     allocator::mark_pmm_ready();
+    // Leak-attribution hooks: the live-histogram names the syscall family and
+    // the current process for surviving allocations. Both are racy under SMP
+    // (family-level attribution is enough).
+    allocator::register_syscall_nr_hook(thread_nr_for_alloc_hook);
+    allocator::register_current_pid_hook(current_pid_for_alloc_hook);
     console::print("PMM initialized, allocator switched to page mode\n");
 
     // Reclaim the pre-kernel region.  KERNEL_PHYS_OFFSET (1 MB) bytes before the
@@ -1820,6 +1847,45 @@ fn run_async_main() -> ! {
                     crate::pmm::free_count(), crate::pmm::total_count(),
                     crate::allocator::stats().heap_size / 1024 / 1024);
             }
+            // Live-bytes histogram by size class, same 30s cadence — leak
+            // attribution for the self-host heap hunt (temporary).
+            akuma_alloc::dump_live_histogram();
+            akuma_alloc::dump_pc_attribution();
+            // Parked deferred-free state: a compile that leaks 144-B objects
+            // parks its user_frames BTreeMap nodes here if a shared view
+            // strands (one node per resident user page). Temporary.
+            let (l0e, l0u, l0pt) = akuma_exec::mmu::shared_l0_stats();
+            akuma_primitives::safe_print!(128,
+                "[L0PARK] entries={} deferred_user_pages={} deferred_pt_frames={}\n",
+                l0e, l0u, l0pt);
+            // The OTHER park list: address spaces whose frames could not be freed
+            // at drop because a core's TTBR0 — or a thread's SAVED ctx.ttbr0 —
+            // still named the dying L0. Each entry holds a whole `user_frames`
+            // BTreeMap. Nothing has ever printed this one. Temporary.
+            let (an, ans, ad, ads, ufl) = akuma_exec::mmu::as_lifecycle_stats();
+            akuma_primitives::safe_print!(160,
+                "[ASLIFE] new={} new_shared={} drop={} drop_shared={} live_uf_entries={}\n",
+                an, ans, ad, ads, ufl);
+            // Which live address space is holding the stranded `user_frames`
+            // entries. Temporary, with the counters below.
+            akuma_exec::process::table::for_each_process(|p| {
+                let n = p.address_space.resident_pages();
+                if n > 5000 {
+                    akuma_primitives::safe_print!(96, "[UFBIG] pid={} uf_entries={}\n", p.pid, n);
+                }
+            });
+            akuma_exec::mmu::dump_stuck_drops();
+            let (dex, fne, fnx) = akuma_exec::mmu::as_drop_bracket_stats();
+            akuma_primitives::safe_print!(160,
+                "[ASDROP] drop_exit={} free_now_enter={} free_now_exit={}\n", dex, fne, fnx);
+            let (ins, rem, fnow, drem, sil) = akuma_exec::mmu::uf_flow_stats();
+            akuma_primitives::safe_print!(192,
+                "[UFFLOW] inserts={} removed={} freed_at_teardown={} dropped_with_struct={} silent={}\n",
+                ins, rem, fnow, drem, sil);
+            let (pe, puf, ppt) = akuma_exec::mmu::pending_ttbr_free_stats();
+            akuma_primitives::safe_print!(128,
+                "[ASPARK] pending={} parked_user_frames={} parked_pt_frames={}\n",
+                pe, puf, ppt);
             // Shared read-only file pages, same cadence. `hits` is the number of
             // private frame allocations + `read_at` sweeps this cache avoided, which
             // is the direct measure of the `-j4` amplification it exists to remove.
