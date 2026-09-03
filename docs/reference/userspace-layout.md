@@ -1,6 +1,6 @@
 # Userspace Layout
 
-**Grade: B** (verify behaviour) — accurate as of 2026-08-10; drifts whenever a
+**Grade: B** (verify behaviour) — accurate as of 2026-09-04; drifts whenever a
 member is added/removed from `userspace/` without this doc being updated.
 
 Current-state index of `userspace/` top-level members (musl libc ELF binaries
@@ -39,6 +39,20 @@ pages — not every member has one).
 | `futexprobe` | C-only. `futex_op_cost` — per-op cost of `futex(2)`, six arms that all return **without parking** (so it measures decode + waiter-table work, not the scheduler). Built for both kernels from one source, like `ext2probe/c/read_syscall_cost.c`. Before/after gate for `src/syscall/sync.rs` and `crates/akuma-syscalls-sync` changes; driver `scripts/benchmarks/futex_op_ab.py`, arm runner `scripts/benchmarks/futex_ab_run.sh` |
 | `epollprobe` | C-only. `epoll_op_cost` — per-op cost of the epoll/poll/select family, seven arms that all return **without parking** (so it measures the readiness map, the interest-list walk, the edge decision and the fd-set marshalling, not the scheduler). Built for both kernels from one source, and it emits `futex_op_cost`'s line format on purpose so the arm-agnostic driver `scripts/benchmarks/futex_op_ab.py` runs it unchanged (`--exe`). Before/after gate for `src/syscall/poll.rs` and `crates/akuma-syscalls-poll` changes; arm runner `scripts/benchmarks/epoll_ab_run.sh`. The *correctness* half is `epollops` in `userspace/forktest/c_stress/`, run by `scripts/epoll_suite.py` |
 | `memprobe` | C-only. `mem_op_cost` — per-op cost of the memory family, nine arms that all return **without faulting** (an arm that demand-pages measures the fault path and the PMM, whose variance swamps a decode change). Emits `futex_op_cost`'s line format so the arm-agnostic driver `scripts/benchmarks/futex_op_ab.py` runs it unchanged (`--exe`). Takes a third argument, `hostile` (default 1): `0` skips the two arms that a **pre-2026-08-29 kernel cannot survive** — `mmap(len=-1)` and `madvise(len=-1)` were unbounded kernel loops, so a baseline A/B arm must be able to opt out. Before/after gate for `src/syscall/mem.rs`, `crates/akuma-syscalls-mem` and `crates/akuma-mmap`; arm runner `scripts/benchmarks/mem_ab_run.sh`. Ships a second binary, `mem_fault_cost`, whose arms all **do** fault or allocate — `plan()`'s lazy-vs-eager outcomes, demand paging (translation faults), `brk` growth, and CoW (permission faults) — each reported as a **bracket** (two page counts subtracted, so mmap/munmap/fork/exit cancel). The two are split on purpose: the PMM's variance would swamp a decode measurement. `build.sh --push-lima fc` puts the **same static binary** on an aarch64 Linux VM, which is how the Akuma-vs-Linux column in `syscalls/mem.md` is produced — identical code, only the kernel differs (report ratios, not ns: the two run under different hypervisors). The *correctness* half is the ten probes in `userspace/forktest/c_stress/`, run by `scripts/mem_suite.py` |
+
+### `userspace/amd64/` — a different world
+
+Not in the table above and not a workspace member. `userspace/amd64/<name>/<name>.rs`
+holds single-file guest programs for the **amd64** bring-up target: `#![no_std]`,
+raw Linux x86_64 syscalls, no `libakuma`, no musl, no `Cargo.toml`. Each is
+compiled straight by `rustc --target x86_64-unknown-none` from `amd64/build.rs`,
+linked with `userspace/amd64/user.ld` at `0x40_0000`, and embedded in the amd64
+kernel image with `include_bytes!` — that target has no disk driver, so there is
+nowhere to put a file it could open by path.
+
+`hello` is the ELF loader's probe. See
+[`../../userspace/amd64/README.md`](../../userspace/amd64/README.md) for how to
+add one, and `docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.18 for why it exists.
 
 Removed members (documented in `docs/archive/`, kept for historical
 reference): `quickjs`, `needle-server`, `crush`, `stdcheck`, `top`, `stp_test`,

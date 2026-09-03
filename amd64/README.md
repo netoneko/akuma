@@ -5,10 +5,13 @@ physical frame allocator, maps/unmaps 4 KiB pages, services page faults with
 **demand paging**, takes **LAPIC timer interrupts**, and round-robin schedules
 tasks across separate stacks, and enters **ring 3** with a working
 `syscall`/`sysret` path, where userspace calls **real Linux x86_64 syscalls**
-(`write`, `exit_group`, `sched_yield`) from **isolated per-process address
-spaces**, and **preemptively multitasks** between them. The kernel runs in the
-**upper half**, so user programs are mapped at `0x40_0000` where a static Linux
-binary is linked. No loader, no device interrupts.
+(`write`, `getpid`, `exit_group`, `sched_yield`) from **isolated per-process
+address spaces**, and **preemptively multitasks** between them. The kernel runs
+in the **upper half**, so user programs are mapped at `0x40_0000` where a static
+Linux binary is linked — and since Stage L an **ELF loader** puts one there: a
+program `rustc` compiled and linked, whose `PT_LOAD` segments the kernel parses
+and places, with a System V initial stack (argc/argv/envp/auxv). No devices
+beyond the serial console.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1**.
 
@@ -27,11 +30,15 @@ Akuma/amd64 — long mode reached
   pmm:  126353 free frames (493 MiB)
   ...
   -- userspace output follows --
-    [ring3 A] first process, own address space
-    [ring3 B] second process, same VA, different frame
+    [ring3 A] round
+    [ring3 B] round
   ring3: same VA, different frames   [OK]
+  ...
+  -- userspace output follows (from an ELF image) --
+    [elf] loaded from a real ELF image
+  elf: program ran and reported every check   [OK]
 
-Akuma/amd64 self-test: 39 passed, 0 failed
+Akuma/amd64 self-test: 59 passed, 0 failed
 Akuma/amd64 — all self-tests passed
 ```
 
@@ -123,23 +130,44 @@ banner. The guest never runs and there is no error. It only reproduces on a real
 terminal — over a pipe (`ssh` with no `-t`) there is no controlling TTY and plain
 `timeout` works fine.
 
+## Guest programs
+
+The programs the loader runs live in `userspace/amd64/`, one directory each,
+compiled straight by `rustc` from `amd64/build.rs` and embedded with
+`include_bytes!` — there is no disk driver, so there is nowhere to put a file the
+kernel could open by path. See `userspace/amd64/README.md` for how to add one.
+
+A guest program reports what it checked through its **exit status**, which the
+kernel's self-test compares against a value computed in `src/usermode.rs`. A
+program that printed its verdict would have "passed" by running at all.
+
 ## What is deliberately missing
 
-- **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from
-  physical at `0xFFFF000040000000`; this target runs on the identity map. That is
-  the next structural thing to mirror, and it is absent rather than half-done.
-- **No `hvm_start_info` parsing.** The pointer is printed, not read. Its memory
-  map is where the amd64 equivalent of `PlatformInfo`
-  (`proposals/REDUCING_PLATFORM_DEPENDENCY.md` §2) comes from — x86_64 Firecracker
-  passes no DTB, so `akuma-fdt` has nothing to say here.
-- **No use of the kernel crates.** 34 of 52 build for `x86_64-unknown-none`
-  (§0 of that proposal), but they take the *host stub* out of `akuma-cpu`: a no-op
-  `dsb_ish`, a `wfi` that does not park. Calling them from here would be wrong in
-  ways QEMU will not show you. Read §0.3 before wiring the first one up.
+- **No devices.** No disk, no NIC, no virtio, no IOAPIC — the 16550 at I/O port
+  `0x3F8` is the whole device model. A VGA text path was considered and dropped:
+  it is dead code on Firecracker.
+- **No demand paging for user segments.** The `#PF` handler services a
+  not-present fault inside one armed region; an ELF's segments are allocated and
+  copied eagerly. Wiring the two together needs a per-space region table.
+- **No FP/SIMD save on the syscall path.** No `xsave`, no lazy FPU. Nothing in
+  the current handler touches a vector register, which is a property of today's
+  code rather than a guarantee — see
+  `docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md` §8.
+- **No SMP**, no `CR4.SMAP`/`SMEP`, no TSS/IST, no ACPI.
+- **Little use of the kernel crates.** 36 of 54 build for `x86_64-unknown-none`
+  (§0 of `proposals/REDUCING_PLATFORM_DEPENDENCY.md`), but they take the *host
+  stub* out of `akuma-cpu`: a no-op `dsb_ish`, a `wfi` that does not park.
+  Calling them from here would be wrong in ways QEMU will not show you. Read
+  §0.3 before wiring the first one up. `akuma-elf` in particular is unusable —
+  its mapping half is written against the AArch64 `akuma-mmu`, which is why
+  `src/loader.rs` exists.
 
 ---
 
 **Background:** `docs/archive/AKUMA_FIRECRACKER_AMD64.md` records how this target
-came up, the `akuma-cpu` arch-gate bug it uncovered (13 → 34 crates building for
-`x86_64-unknown-none`), and the two verification methods that turned out not to
-work. `proposals/REDUCING_PLATFORM_DEPENDENCY.md` §0 carries the corrected claim.
+came up stage by stage, the `akuma-cpu` arch-gate bug it uncovered (13 → 36 crates
+building for `x86_64-unknown-none`), and the two verification methods that turned
+out not to work. The one kernel defect the port has found —
+`syscall_entry` clobbering six registers the Linux ABI preserves — is
+`docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md`.
+`proposals/REDUCING_PLATFORM_DEPENDENCY.md` §0 carries the corrected claim.

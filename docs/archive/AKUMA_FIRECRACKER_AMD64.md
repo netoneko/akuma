@@ -1201,28 +1201,47 @@ rather than to the console.
 
 ## 4. What is deliberately missing
 
-- **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at
-  `0xFFFF000040000000`; amd64 runs on the identity map. Absent rather than half-done.
+Corrected 2026-09-04. This list was written at Stage B and went stale as the
+stages landed — it still claimed there was no upper-half mapping (Stage K did
+it), no IDT (Stage C), and that the target had never run under Firecracker
+(§3.6, on real hardware). A stale "missing" is worse than an edited record, so
+what follows is the state as of Stage L rather than the original text.
+
 - **No ACPI, and it is further away than expected.** PVH supplies the memory map
   outright, so nothing so far has needed it. It becomes necessary for IOAPIC (device
-  interrupts), MADT (SMP) and MCFG (PCI) — not before. Even a preemption timer does
+  interrupts), MADT (SMP) and MCFG (PCI) — not before. Even the preemption timer does
   not need it, since the LAPIC base comes from MSR `IA32_APIC_BASE`. When it is
   needed, it will have to be found the hard way: `hvm_start_info.rsdp_paddr` exists
   in the ABI but **both** QEMU and Firecracker v1.16.1 report it as 0 (measured,
   §3.6). Do not build on that field.
+- **No devices at all.** No disk, no NIC, no virtio. The console is the 16550 at
+  I/O port `0x3F8` and nothing else, which is why the ELF loader's image is
+  `include_bytes!`d into the kernel rather than opened by path (§3.18.2). A VGA
+  text path was considered and dropped: it would be dead code on Firecracker.
+- **No demand paging for user segments.** The `#PF` handler services a
+  not-present fault inside one armed region (Stage C); an ELF's segments are
+  allocated and copied eagerly. Wiring the two together needs a per-space region
+  table (§3.18.8).
+- **No FP/SIMD state save on the syscall path.** `syscall_handler` touches no
+  vector register today, which is a property of the current handler rather than
+  a guarantee — the AArch64 side saves `q0`-`q31` for exactly this reason. Same
+  class as the bug in `AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md` §8, still open.
+- **No TSS and no IST.** A double fault runs on the faulting stack, which is
+  fine while nothing can overflow it and wrong the moment a guard page exists.
+  When one appears, vector 8 needs an IST entry *before* it.
 - **Page tables exist but are not shared with `akuma-mmap`.** `amd64/src/paging.rs`
-  can map, unmap and translate, with a local `Prot` struct deliberately shaped the way
-  proposal item 1 wants. It is local because `MmapRegion.flags` is still a raw AArch64
-  `u64` and the two encodings share no field — see that module's table. Item 1 remains
-  the prerequisite for *sharing* the region bookkeeping; it was not needed to get
-  paging working.
-- **No IDT.** Nothing faults, demand-pages or reaches userspace until exception entry
-  exists — new arch code, and not one of the six items.
-- **No VGA console.** Considered and dropped: the target is Firecracker, whose console
-  is the 16550 at I/O port `0x3F8`, and a VGA text path would be dead code on it.
-- **Not run under Firecracker yet.** Firecracker needs KVM on an x86_64 host; the dev
-  machine is Apple Silicon, so QEMU is the only local stand-in. The entry path is
-  shared, the device model is not.
+  can map, unmap, translate and now report a page's permissions, with a local `Prot`
+  struct deliberately shaped the way proposal item 1 wants. It is local because
+  `MmapRegion.flags` is still a raw AArch64 `u64` and the two encodings share no
+  field — see that module's table. Item 1 remains the prerequisite for *sharing* the
+  region bookkeeping.
+- **`akuma-elf` is not shared either**, for a different and more specific reason:
+  its mapping half is written against `akuma_mmu::UserAddressSpace`. The
+  extraction that would fix that is a parse/place split (§3.18.6).
+- **No SMP.** One vCPU. `invlpg` is core-local and there is no IPI shootdown, so
+  the TLB maintenance is complete only because there is one TLB (proposal item 3).
+- **No `CR4.SMAP`/`SMEP`.** `sys_write` dereferences a user pointer directly from
+  ring 0; with SMAP on that needs `stac`/`clac`. A real gap, not a hypothetical.
 
 ## 5. Files
 
@@ -1230,11 +1249,22 @@ rather than to the console.
 |---|---|
 | `amd64/src/boot.s` | PVH note, 32-bit trampoline, long-mode entry |
 | `amd64/src/serial.rs` | polled 16550 on port 0x3F8 |
-| `amd64/src/main.rs` | `kmain`, panic handler, x86_64-only guard |
+| `amd64/src/main.rs` | `kmain`, panic handler, x86_64-only guard, the self-test order |
+| `amd64/src/hvm.rs` | `hvm_start_info` and its memory map |
+| `amd64/src/mem.rs` | heap then PMM, and why that order |
+| `amd64/src/phys.rs` | the physmap / device / kernel windows |
+| `amd64/src/paging.rs` | 4-level tables, `Prot`/`MemAttr`, `AddressSpace` |
+| `amd64/src/gdt.rs`, `amd64/src/idt.rs` | descriptor tables, exceptions, demand paging |
+| `amd64/src/lapic.rs`, `amd64/src/port.rs` | timer, I/O ports |
+| `amd64/src/sched.rs` | context switch, round-robin, preemption |
+| `amd64/src/usermode.rs` | ring 3, `syscall`/`sysret`, `Process`, the ring-3 tests |
+| `amd64/src/loader.rs` | the ELF loader and the initial user stack (Stage L) |
+| `userspace/amd64/user.ld` | guest link script: `ET_EXEC` at 0x40_0000, page-aligned segments |
+| `userspace/amd64/hello/hello.rs` | the loader's probe; reports through its exit status |
 | `amd64/linker.ld` | load at 2 MiB, explicit `PHDRS` incl. `PT_NOTE` |
-| `amd64/build.rs` | passes the linker script as `rustc-link-arg-bins` |
-| `amd64/run.sh`, `amd64/README.md` | |
-| `.cargo/config.toml` | `[target.x86_64-unknown-none]` → `relocation-model=static` |
+| `amd64/build.rs` | the kernel link script, and building the guest programs |
+| `amd64/run.sh`, `amd64/run-firecracker.sh`, `amd64/README.md` | |
+| `.cargo/config.toml` | `[target.x86_64-unknown-none]` → `relocation-model=static`, `code-model=kernel` |
 | `crates/akuma-cpu/src/lib.rs` | the gate, and a rewritten header |
 
 `relocation-model=static` is a property of the *target*, not the package: a bare-metal
@@ -1244,7 +1274,9 @@ reference in `boot.s` with `R_X86_64_32 cannot be used against local symbol`.
 
 ---
 
-**Background:** `proposals/REDUCING_PLATFORM_DEPENDENCY.md` §0 carries the corrected
+**Background:** the one kernel defect this port has found so far has its own
+document: `docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md`.
+`proposals/REDUCING_PLATFORM_DEPENDENCY.md` §0 carries the corrected
 claim and the reproduction commands; `amd64/README.md` is the current-state doc for
 this target. The aarch64 Firecracker port — a different machine with a different
 device model — is `docs/archive/AKUMA_FIRECRACKER_KVM.md` and
