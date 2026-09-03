@@ -1,6 +1,13 @@
 # Repeated in-guest clean builds leak kernel heap to the OOM wall
 
-**Status: ROOT-CAUSED 2026-09-03 (second session), not yet fixed.**
+**Status: ROOT-CAUSED and FIXED 2026-09-03.** The fix is the `drain_retired`
+terminal gate plus `CACHE_CHUNK_BYTES` 1 MB -> 64 KB; abandoned drains went
+**77 -> 0**, orphaned `user_frames` entries **1 466 360 -> 0**, and `stuck=(0,0)`
+after the reclaim gate. **Independently re-confirmed the same day** by two
+8-build campaigns that were measuring something else entirely — see
+"2026-09-03 (third session) — independent confirmation" at the end. Read on for
+the root cause; the theory list T1-T5 is kept because the reasoning that killed
+each one is still the map of this subsystem.
 `drain_pending_ttbr_frees` (`crates/akuma-mmu/src/lib.rs`) `swap_remove`s
 `PendingAsFree` entries out of the global `PENDING_TTBR_FREES` list into a local
 `Vec` and only *then* frees them in a loop. It runs on the deferred-reclaim
@@ -569,3 +576,49 @@ brackets work without them.
 `e2fsck -fy devbox.img` between runs
 (`/opt/homebrew/opt/e2fsprogs/sbin/e2fsck`) — a hard-killed guest really does
 damage the image.
+
+## 2026-09-03 (third session) — independent confirmation
+
+The fix was verified by the session that made it. It was then **re-confirmed
+accidentally**, which is the stronger evidence: two 8-build in-guest campaigns run
+to investigate an unrelated `rustc` SIGSEGV (`ERET_ELR_CLOBBER_ENTER_USER_MODE.md`)
+logged `heap_mb` throughout and it never moved.
+
+`heap_mb` from `[FSCACHE]`, every sample across 8 consecutive `cargo clean` +
+full-kernel builds in one boot:
+
+| arm | samples | heap_mb |
+|---|---|---|
+| `MEMORY=2048` | 9 | `287 290 290 290 290 288 294 289 290` |
+| `MEMORY=4096` | 53 | `441` then `444` for every remaining sample |
+
+Spread at 2 GB is **7 MB across 8 builds, with no trend**. The pre-fix symptom was
+`13 MB -> 760 MB` over a comparable campaign, ending at the OOM wall with rustc
+exiting 137. `[PMM-BUDGET] heap=` agrees independently: 73 699 - 75 273 pages
+(288-294 MB), flat.
+
+The 4 GB arm's higher-but-equally-flat 444 MB is not a partial leak — it is the
+ext2 block cache's cap, which is `min(RAM/8, FSCACHE_CEILING_MB)` = 384 MB at
+4 GB versus 256 MB at 2 GB. Heap total tracks the cache, exactly as it should.
+
+### "Fixed" means the heap no longer GROWS — not that it has room
+
+Worth stating, because reading this doc's status line alone would mislead. At 2 GB
+the flat heap sits at ~290 MB **of which the unreclaimable ext2 block cache is
+256 MB — 90 %** — and the same campaign recorded six kernel-heap OOMs on
+allocations of 0.8-2 MB at 97-98 % heap used:
+
+```
+[ALLOC FAIL] requested=819200  heap_used=283/287MB (98%)
+[OOM] allocation of 2102032 bytes failed (heap 281MB / 289MB used) — killing process
+```
+
+Those are **not** this leak returning. They are a heap that is flat but almost
+entirely block cache, and the cache cannot shrink: `ClockBlockCache` only ever
+`push`es its `chunks: Vec<Vec<u8>>`, eviction recycles a slot **in place**, and no
+`PmmHooks` reclaim path even names it. Chase those to
+`EXT2_UNLINK_INODE_BLOCK_LEAK.md`'s sibling issue and `FSCACHE_CEILING_MB`, not
+back to `drain_pending_ttbr_frees`.
+
+The regression gate stated above still stands: `free_now_enter == free_now_exit`
+and `[ASSTUCK] in_flight=0`.

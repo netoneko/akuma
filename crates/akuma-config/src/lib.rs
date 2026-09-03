@@ -563,7 +563,7 @@ pub const SHARED_FILE_PAGES_ENABLED: bool = true;
 /// **128 MB and 256 MB are within noise of each other** (10.72 vs 10.79
 /// s/compile) despite 4.5x the misses — so on a memory-constrained box the cache
 /// is cheap to shrink. Set to `0` to disable the cache entirely.
-pub const FSCACHE_CEILING_MB: usize = 384;
+pub const FSCACHE_CEILING_MB: usize = 1024;
 
 pub const FPCACHE_BASE_RAM_DIVISOR: usize = 8;
 

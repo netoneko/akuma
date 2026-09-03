@@ -1876,10 +1876,11 @@ fn run_async_main() -> ! {
                     / 4096;
                 let (fsc_used, _fsc_cap) = akuma_ext2::cache_occupancy();
                 crate::safe_print!(224,
-                    "[PMM-BUDGET] free={} low_water={} user_oom={} | fpcache={}pg fscache={}pg stackpg={} heap={}pg\n",
+                    "[PMM-BUDGET] free={} low_water={} user_oom={} mmap_enomem={} | fpcache={}pg fscache={}pg stackpg={} heap={}pg\n",
                     crate::pmm::free_count(),
                     if low == usize::MAX { 0 } else { low },
                     user_oom,
+                    akuma_pmm::user_enomem_count(),
                     crate::file_page_cache::len(),
                     fsc_used,
                     stackpg,
@@ -2423,5 +2424,131 @@ async fn memory_monitor() -> ! {
 
         // Report every 10 seconds (or period from config)
         Timer::after(Duration::from_secs(config::MEM_MONITOR_PERIOD_SECONDS)).await;
+    }
+}
+
+// ============================================================================
+// Source-shape invariants (host tests)
+// ============================================================================
+
+/// Two invariants that are **compile-time** properties of this crate's own
+/// source, so nothing at runtime can observe them: under `rump-default` the call
+/// T1 guards is *compiled out*, and T2's effect is only visible as a throughput
+/// difference under load. They are asserted by reading the source text.
+///
+/// They used to live in `src/rump_tests.rs` as boot-suite tests, which embedded
+/// `include_str!` of this file (126 KB) plus `rump_proxy.rs` (78 KB) into the
+/// **kernel image** — ~200 KB of `.rodata` in every build that compiled the boot
+/// suite. Moved here 2026-09-03: `#[cfg(test)]` means the embedding now happens
+/// only in the host test binary, and `cargo test --target $(host)` runs them.
+///
+/// The move also fixed a coverage hole. The old module was gated
+/// `any(not(feature = "no-tests"), feature = "rump-tests")`, so the **devbox
+/// builds — the only ones that actually run `rump-default` — never executed
+/// these checks at all.** They ran solely in an image that does not use the
+/// feature they guard. Here they run on every `cargo test`, for every profile.
+///
+/// `include_str!` rather than `std::fs`: this crate is `#![no_std]`, and a path
+/// relative to this file cannot go stale the way a `CARGO_MANIFEST_DIR` join can.
+#[cfg(test)]
+mod source_shape {
+    /// T1: under `rump-default`, `run_async_main` must NOT register itself as
+    /// the network thread — `start_default_stack` owns that slot (T2 registers
+    /// rump_server's TID). If anyone removes the
+    /// `#[cfg(not(feature = "rump-default"))]` gate we would silently regress
+    /// the devbox "starve under CPU-bound load" fix
+    /// (`overlays/devbox/README.md:297-307`).
+    #[test]
+    fn run_async_main_skips_network_thread_id_under_rump_default() {
+        const MAIN_SRC: &str = include_str!("lib.rs");
+
+        let fn_start = MAIN_SRC
+            .find("fn run_async_main(")
+            .expect("akuma-kernel-glue must define run_async_main");
+        let fn_body_end = MAIN_SRC[fn_start..]
+            .find("\nfn ")
+            .map_or(MAIN_SRC.len(), |off| fn_start + off);
+        let body = &MAIN_SRC[fn_start..fn_body_end];
+
+        let call_idx = body
+            .find("set_network_thread_id(")
+            .expect("run_async_main must register the network thread (gated)");
+
+        // Walk backwards from the call over non-comment, non-blank lines until the
+        // nearest attribute. Trim the partial last line (the `    threading::`
+        // prefix on the call's own line) so scanning starts one line above it.
+        let before = body[..call_idx].rsplit_once('\n').map_or("", |(rest, _)| rest);
+        let mut found_cfg = false;
+        for raw_line in before.lines().rev() {
+            let line = raw_line.trim_start();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if line.starts_with("#[cfg(") {
+                found_cfg = line.contains("not(feature = \"rump-default\")");
+            }
+            break;
+        }
+        assert!(
+            found_cfg,
+            "run_async_main's set_network_thread_id call must be gated by \
+             #[cfg(not(feature = \"rump-default\"))] so start_default_stack owns \
+             the boost slot under devbox"
+        );
+    }
+
+    /// T2: under `rump-default`, `start_default_stack` must register
+    /// rump_server's main thread (the fiber-scheduler OS thread) as the network
+    /// thread — NOT the proxy handshake kthread, which parks after
+    /// `Client::connect` and does zero per-call work.
+    #[test]
+    fn start_default_stack_registers_rump_server_tid() {
+        const PROXY_SRC: &str = include_str!("rump_proxy.rs");
+
+        let fn_start = PROXY_SRC
+            .find("pub fn start_default_stack")
+            .expect("rump_proxy.rs must define start_default_stack");
+        let fn_body_end = PROXY_SRC[fn_start..]
+            .find("\npub fn ")
+            .or_else(|| PROXY_SRC[fn_start..].find("\nfn "))
+            .map_or(PROXY_SRC.len(), |off| fn_start + off);
+        let body = &PROXY_SRC[fn_start..fn_body_end];
+
+        // The spawn must capture the TID (not discard it as `_tid`).
+        assert!(
+            !body.contains("Ok((_tid,") || body.contains("Ok((tid,"),
+            "start_default_stack must capture rump_server's TID from \
+             spawn_process_with_channel, not discard it as _tid"
+        );
+
+        // The registration must use the captured server TID, not
+        // `current_thread_id` (which would be the kthread).
+        assert!(
+            body.contains("set_network_thread_id(server_tid)"),
+            "start_default_stack must call set_network_thread_id(server_tid) — \
+             registering rump_server's main thread as the network thread, not the \
+             calling kthread. The proxy kthread parks after handshake and does no \
+             per-call work."
+        );
+
+        // The kthread body in attach_server must NOT contain its own registration.
+        let attach_start = PROXY_SRC
+            .find("pub fn attach_server")
+            .expect("rump_proxy.rs must define attach_server");
+        let attach_body = &PROXY_SRC[attach_start..];
+        let spawn_idx = attach_body
+            .find("threading::spawn_fn")
+            .expect("attach_server must spawn the handshake kthread");
+        let kthread_body = &attach_body[spawn_idx..];
+        let kthread_end = kthread_body
+            .find("\n    });\n")
+            .map_or(attach_body.len(), |off| spawn_idx + off);
+        let kthread_section = &attach_body[spawn_idx..kthread_end];
+        assert!(
+            !kthread_section.contains("set_network_thread_id(current_thread_id())"),
+            "attach_server's kthread must NOT register itself as the network \
+             thread — it parks after the handshake. The registration belongs in \
+             start_default_stack."
+        );
     }
 }

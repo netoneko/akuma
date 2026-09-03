@@ -2329,6 +2329,42 @@ const USER_RECLAIM_BATCH: usize = 512;
 static PMM_LOW_WATER: AtomicUsize = AtomicUsize::new(usize::MAX);
 static USER_ALLOC_OOM: AtomicUsize = AtomicUsize::new(0);
 
+/// Count of `ENOMEM`s handed back to USERSPACE from a memory syscall because a
+/// frame allocation failed.
+///
+/// A different path from [`USER_ALLOC_OOM`], and the distinction is the whole
+/// point: that one counts *page faults* the kernel could not serve, this one
+/// counts `mmap`/`mremap` **syscalls** that returned an error to the program. A
+/// build can have `user_oom=0` — no fault ever failed — while `mmap` is handing
+/// `MAP_FAILED` to a linker that does not check it, which then dereferences NULL
+/// or calls through a NULL pointer. That is the shape of the unexplained `ld`
+/// crashes in the 2026-09-03 2 GB run (`FAR=0x0`, and `ELR=0x0`), and before this
+/// counter existed the ENOMEM returns at those sites printed nothing at all.
+static USER_ENOMEM: AtomicUsize = AtomicUsize::new(0);
+
+/// Record an `ENOMEM` returned to userspace from a memory syscall under genuine
+/// allocation pressure. Call it only where a frame/page allocation failed — not
+/// from argument validation, which returns `ENOMEM` by Linux convention without
+/// any memory being short.
+#[inline]
+pub fn note_user_enomem(_site: &str, _len: usize) {
+    #[cfg(feature = "pmm-instr")]
+    {
+        let n = USER_ENOMEM.fetch_add(1, Ordering::Relaxed);
+        if n < 8 {
+            akuma_primitives::safe_print!(192,
+                "[USER-ENOMEM] #{} site={} len={} free={} — returning ENOMEM to userspace\n",
+                n + 1, _site, _len, free_count());
+        }
+    }
+}
+
+/// See [`USER_ENOMEM`]. Always `0` without `feature = "pmm-instr"`.
+#[must_use]
+pub fn user_enomem_count() -> usize {
+    USER_ENOMEM.load(Ordering::Relaxed)
+}
+
 /// `(low_water_pages, user_fault_oom_count)`. See [`PMM_LOW_WATER`].
 ///
 /// Without `feature = "pmm-instr"` nothing writes either counter, so this reports

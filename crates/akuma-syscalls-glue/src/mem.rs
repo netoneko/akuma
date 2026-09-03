@@ -387,6 +387,7 @@ fn mmap_eager_to_lazy_fallback(
             }
             return mmap_addr as u64;
         }
+        akuma_pmm::note_user_enomem("mmap/eager-file", len);
         return ENOMEM;
     }
     let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
@@ -553,6 +554,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 // A writable MAP_SHARED mapping must stay eager so its pages are
                 // tracked for writeback; the lazy fallback can't do that, so fail
                 // rather than silently drop writes.
+                akuma_pmm::note_user_enomem("mmap/shared-writable", len);
                 return ENOMEM;
             } else {
                 // Still short of a contiguous eager batch: fall back to a lazy
@@ -562,6 +564,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 return mmap_eager_to_lazy_fallback(proc, is_file_backed, fd, offset, len, mmap_addr, pages, page_flags);
             }
         } else if is_shared_writable {
+            akuma_pmm::note_user_enomem("mmap/shared-writable", len);
             return ENOMEM;
         } else {
             return mmap_eager_to_lazy_fallback(proc, is_file_backed, fd, offset, len, mmap_addr, pages, page_flags);
@@ -743,6 +746,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                 new_frames.push(frame);
             } else {
                 for f in new_frames { akuma_exec::pmm::free_page_at(f, akuma_pmm::FreeSite::Mremap); }
+                akuma_pmm::note_user_enomem("mremap/frames", new_pages * 4096);
                 return ENOMEM;
             }
         }
