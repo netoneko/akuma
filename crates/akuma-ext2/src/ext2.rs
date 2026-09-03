@@ -300,6 +300,15 @@ pub fn cache_occupancy() -> (usize, usize) {
 /// so this is the largest single allocation the cache ever asks for, regardless
 /// of `capacity_blocks`.
 ///
+/// **Sized 64 KB, not 1 MB (2026-09-03).** A kernel-heap span must be
+/// *physically* contiguous (the heap lives in the `phys_to_virt` linear map), so
+/// a 1 MB chunk demanded a 256-page run from a PMM that a running build has
+/// checkerboarded. Measured at `MEMORY=2048`: `[OOM] allocation of 1048576 bytes
+/// failed` with **893 MB still free** — `handle_oom`'s "true fragmentation OOM"
+/// path, which kills a process. 64 KB needs a 16-page run instead, and costs
+/// only a longer `chunks` vector (16x more entries, 8 bytes each). The cap and
+/// the total footprint are unchanged.
+///
 /// A single contiguous `Vec<u8>` was the original design and it does not scale:
 /// `Vec` growth doubles, so a 512 MB cap meant a `realloc(256 MB -> 512 MB)` with
 /// both buffers live (~768 MB transient) and a 512 MB contiguous demand on the
@@ -308,7 +317,7 @@ pub fn cache_occupancy() -> (usize, usize) {
 /// (~900 MB, never returned), after which sshd accepted connections but reset at
 /// key exchange. Chunking bounds the allocation and never copies existing slots.
 #[cfg(any(ext2_fs_cache, test))]
-const CACHE_CHUNK_BYTES: usize = 1 << 20; // 1 MB
+const CACHE_CHUNK_BYTES: usize = 1 << 16; // 64 KB
 
 /// Clock (second-chance) block cache. Slots are allocated lazily (one backing
 /// chunk at a time) up to `capacity_blocks`; thereafter the clock hand sweeps,
