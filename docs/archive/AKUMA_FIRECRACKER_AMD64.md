@@ -200,15 +200,92 @@ the identical point, immediately after `OK: fully unmapped source returns EFAULT
 `scripts/cargo_runner.sh:226` already documents the assert and offers `HVF=0`, which
 is what produced the 306-PASSED run above. Any future A/B on this tree needs `HVF=0`.
 
+## 3.5 Stage A: the memory subsystem runs on amd64
+
+Added the same day. The heap and the physical frame allocator now come up on
+x86_64 using **unmodified** `akuma-alloc` and `akuma-pmm`:
+
+```
+  ram:  0x0000000000100000 .. 0x000000001ffe0000
+  kernel ends 0x000000000024d0b9
+  heap: 0x000000000024e000 + 16 MiB ... ok
+  pmm:  init(base=0x0000000000100000, size=510 MiB, reserved_to=0x000000000124e000)
+  pmm:  126354 free frames (493 MiB)
+  test: heap vec[4096] sum=22898104320
+  test: pmm alloc 8 frames, free 126354 -> 126346 -> 126354   [OK]
+```
+
+This needed **none of the proposal's six items**. It needed a memory map, which
+PVH supplies, and two crates that were already neutral. That is the thesis of
+`REDUCING_PLATFORM_DEPENDENCY.md` demonstrated rather than argued.
+
+The smoke test is deliberately not a "did init return" check. `22898104320` is
+Σi² for i < 4096 = 4095·4096·8191/6 — an exact match proves the heap stores and
+reads back 32 KiB rather than merely handing out a pointer, and the free count
+moving 126354 → 126346 → 126354 proves frames are actually reserved and returned.
+
+### 3.5.1 The ordering is backwards from intuition
+
+**The heap must be up before the PMM.** `akuma_pmm`'s `init` allocates its own
+free-page bitmap with `alloc::vec![0u64; n]`, so a PMM initialised first faults
+inside the allocator. A frame allocator feels like the more primitive thing and
+here it is not.
+
+That forces the layout: the heap is carved statically (16 MiB) out of the region
+above the kernel image, and the PMM is then told its reservation runs to
+`heap_end`, not `kernel_end`. Passing `kernel_end` would hand out frames the
+allocator is already using — and it would not fault immediately, which is the
+worst kind of wrong.
+
+### 3.5.2 Two choices that are load-bearing
+
+**The RAM region is picked by containment, not by size.** `pick_region` selects
+the region that *contains the kernel image*. Largest-usable would have given the
+same answer here and is right almost always; containment is right by
+construction.
+
+**Everything is clamped to 1 GiB**, because that is exactly what `boot.s`
+identity-maps. The VMM will happily report more RAM than the kernel can address,
+and handing those frames to the PMM would produce a page fault with no IDT
+installed — i.e. a triple-fault and a guest that vanishes silently.
+
+### 3.5.3 `akuma-cpu` gained honest x86 arms
+
+`barrier` and `park` are no longer stubs; both carry a mapping table in their
+module docs. Two entries are lossy and documented as such:
+
+- **`isb` → `lfence` is an approximation.** `lfence` is a dispatch barrier, not
+  an architecturally serialising instruction (only `cpuid`, `iret` and CR writes
+  are). It is redundant rather than insufficient in practice, because the x86
+  operations one would put an `isb` after (`mov %cr3`, `wrmsr`) serialise
+  themselves. Chosen over `cpuid`, which clobbers four registers.
+- **`wfe` → `pause` and `sev` → `nop` are only correct as a pair.** x86 has
+  neither, so `wfe` becomes a spin hint that does not sleep, and `sev` therefore
+  has nothing to wake. Changing one without the other breaks it.
+
+`cache` keeps the shared no-op arm, and its module note now records that on x86
+this is **correct rather than a stub**: x86 caches are coherent by architecture
+and the instruction cache snoops stores, so no maintenance is required. The one
+thing to watch there is `line_size`, which returns a hardcoded 64 rather than
+reading `CPUID`.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at
   `0xFFFF000040000000`; amd64 runs on the identity map. Absent rather than half-done.
-- **No `hvm_start_info` parsing.** The pointer is printed, not read. Its memory map is
-  where the amd64 equivalent of the proposal's §2 `PlatformInfo` comes from — x86_64
-  Firecracker passes **no DTB**, so `akuma-fdt` and `akuma-firecracker` (both
-  DTB-driven, both aarch64) have nothing to say on this machine.
-- **No use of the 34 crates that now compile.** See §1.3 before wiring the first one up.
+- **No ACPI, and it is further away than expected.** PVH supplies the memory map
+  outright, so nothing so far has needed it. It becomes necessary for IOAPIC (device
+  interrupts), MADT (SMP) and MCFG (PCI) — not before. Even a preemption timer does
+  not need it, since the LAPIC base comes from MSR `IA32_APIC_BASE`. When it is
+  needed, `hvm_start_info.rsdp_paddr` removes the "scan the BIOS area for `RSD PTR `"
+  step — though note QEMU reported `rsdp=0x0` here, so that field needs checking
+  against Firecracker specifically before anything relies on it.
+- **No page-table management beyond the boot identity map.** This is where proposal
+  item 1 becomes a genuine blocker: x86 PTEs encode write at bit 1, user at bit 2 and
+  NX at bit 63, with nothing resembling the AArch64 `AP` field, so `MmapRegion.flags`
+  being a raw AArch64 `u64` cannot cross. Item 1 *is* the x86 MMU prerequisite.
+- **No IDT.** Nothing faults, demand-pages or reaches userspace until exception entry
+  exists — new arch code, and not one of the six items.
 - **No VGA console.** Considered and dropped: the target is Firecracker, whose console
   is the 16550 at I/O port `0x3F8`, and a VGA text path would be dead code on it.
 - **Not run under Firecracker yet.** Firecracker needs KVM on an x86_64 host; the dev

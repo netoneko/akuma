@@ -66,6 +66,10 @@ dependencies = [
 [[package]]
 name = "akuma-amd64"
 version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-pmm",
+]
 
 [[package]]
 name = "akuma-bkl"

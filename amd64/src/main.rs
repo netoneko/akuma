@@ -15,6 +15,9 @@
 
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
+
+extern crate alloc;
 
 /// This package is x86_64-only, and says so in one line rather than in five.
 ///
@@ -38,10 +41,36 @@ compile_error!(
 );
 
 #[cfg(target_arch = "x86_64")]
+mod hvm;
+#[cfg(target_arch = "x86_64")]
+mod mem;
+#[cfg(target_arch = "x86_64")]
 mod serial;
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(include_str!("boot.s"), options(att_syntax));
+
+/// The kernel heap.
+///
+/// `#[global_allocator]` is a binary-level declaration, so it lives here rather
+/// than in `akuma-alloc` — exactly as `src/main.rs` does it for the aarch64
+/// kernel. The crate exports the implementation; a binary installs it.
+#[cfg(target_arch = "x86_64")]
+#[global_allocator]
+static ALLOCATOR: akuma_alloc::KernelAllocator = akuma_alloc::KernelAllocator;
+
+/// Out of memory.
+///
+/// The aarch64 kernel kills the faulting process here. This target has no
+/// processes, so there is nothing to kill and panicking is the honest response.
+#[cfg(target_arch = "x86_64")]
+#[alloc_error_handler]
+fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
+    serial::puts("\n[OOM] allocation of ");
+    serial::put_dec(layout.size() as u64);
+    serial::puts(" bytes failed\n");
+    halt();
+}
 
 /// Long-mode entry, called from `boot.s` with the `hvm_start_info` pointer.
 ///
@@ -58,6 +87,57 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     serial::puts("  hvm_start_info @ 0x");
     serial::put_hex(hvm_start_info);
     serial::puts("\n");
+
+    // SAFETY: this is the value the PVH entry ABI delivered in %ebx; every read
+    // inside is bounds-checked against the identity map.
+    let Some(info) = (unsafe { hvm::StartInfo::read(hvm_start_info) }) else {
+        serial::puts("  [FATAL] bad or missing hvm_start_info magic\n");
+        halt();
+    };
+
+    serial::puts("  version=");
+    serial::put_dec(u64::from(info.version));
+    serial::puts(" modules=");
+    serial::put_dec(u64::from(info.nr_modules));
+    serial::puts(" rsdp=0x");
+    serial::put_hex(info.rsdp_paddr);
+    serial::puts(" cmdline=0x");
+    serial::put_hex(info.cmdline_paddr);
+    serial::puts("\n");
+
+    serial::puts("  memmap: ");
+    serial::put_dec(u64::from(info.memmap_entries));
+    serial::puts(" entries\n");
+
+    let mut usable = 0u64;
+    for i in 0..info.memmap_entries {
+        // SAFETY: index is bounds-checked and every field read is range-checked.
+        let Some(r) = (unsafe { info.memmap_entry(i) }) else {
+            serial::puts("    [unreadable entry]\n");
+            continue;
+        };
+        serial::puts("    0x");
+        serial::put_hex(r.addr);
+        serial::puts(" + 0x");
+        serial::put_hex(r.size);
+        serial::puts("  ");
+        serial::puts(r.kind_str());
+        serial::puts("\n");
+        if r.is_ram() {
+            usable += r.size;
+        }
+    }
+
+    serial::puts("  usable RAM: ");
+    serial::put_dec(usable / 1024 / 1024);
+    serial::puts(" MiB\n");
+
+    if mem::init(&info) {
+        mem::smoke_test();
+        serial::puts("\nAkuma/amd64 — memory subsystem up\n");
+    } else {
+        serial::puts("\nAkuma/amd64 — memory bring-up FAILED\n");
+    }
 
     halt();
 }

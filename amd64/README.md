@@ -1,8 +1,8 @@
 # Akuma/amd64
 
-x86_64 bring-up target. Boots to long mode with a working console and stops there
-— no userspace, no interrupts, no scheduler, no MMU management beyond the identity
-map `boot.s` builds.
+x86_64 bring-up target. Boots to long mode, brings up the kernel heap and the
+physical frame allocator, and stops there — no userspace, no interrupts, no
+scheduler, no MMU management beyond the identity map `boot.s` builds.
 
 **Status: C** (active risk, expect surprises). This is a spike, not a port.
 
@@ -14,7 +14,23 @@ MEMORY=1024 amd64/run.sh
 ```
 Akuma/amd64 — long mode reached
   hvm_start_info @ 0x0000000000001580
+  version=1 modules=0 rsdp=0x0000000000000000 cmdline=0x0000000000000560
+  memmap: 7 entries
+    0x0000000000000000 + 0x000000000009fc00  RAM
+    ...
+  usable RAM: 511 MiB
+  heap: 0x000000000024e000 + 16 MiB ... ok
+  pmm:  126354 free frames (493 MiB)
+  test: heap vec[4096] sum=22898104320
+  test: pmm alloc 8 frames, free 126354 -> 126346 -> 126354   [OK]
+
+Akuma/amd64 — memory subsystem up
 ```
+
+The heap and frame allocator are **unmodified `akuma-alloc` and `akuma-pmm`** —
+the same crates the aarch64 kernel uses, with no arch code added. Note the
+ordering in `mem.rs`: the heap must come up *before* the PMM, because the PMM
+allocates its own bitmap with `alloc::vec!`.
 
 ## Boot protocol: PVH
 
@@ -84,3 +100,10 @@ own stdout.
   (§0 of that proposal), but they take the *host stub* out of `akuma-cpu`: a no-op
   `dsb_ish`, a `wfi` that does not park. Calling them from here would be wrong in
   ways QEMU will not show you. Read §0.3 before wiring the first one up.
+
+---
+
+**Background:** `docs/archive/AKUMA_FIRECRACKER_AMD64.md` records how this target
+came up, the `akuma-cpu` arch-gate bug it uncovered (13 → 34 crates building for
+`x86_64-unknown-none`), and the two verification methods that turned out not to
+work. `proposals/REDUCING_PLATFORM_DEPENDENCY.md` §0 carries the corrected claim.

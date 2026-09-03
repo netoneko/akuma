@@ -118,6 +118,32 @@
 ///
 /// Ordering instructions. They constrain when *this* core's accesses become
 /// visible; they never dereference anything.
+///
+/// # x86_64 mapping, and where it is lossy
+///
+/// | | AArch64 | x86_64 | exact? |
+/// |---|---|---|---|
+/// | [`dsb_ish`] | `dsb ish` | `mfence` | yes, and stronger than needed |
+/// | [`dsb_ishst`] | `dsb ishst` | `sfence` | yes |
+/// | [`dsb_sy`] | `dsb sy` | `mfence` | yes |
+/// | [`isb`] | `isb` | `lfence` | **no — see below** |
+///
+/// The data barriers are the easy half. x86-TSO reorders only store→load, so
+/// `mfence` is at least as strong as `dsb ish` in every case the kernel uses it,
+/// and the shareability domain has no x86 counterpart because x86 cache
+/// coherence is not optional.
+///
+/// **`isb` → `lfence` is an approximation and the one to distrust.** `isb`
+/// flushes the pipeline and guarantees that context-changing operations before
+/// it are visible to every instruction after it. `lfence` is a dispatch barrier,
+/// not an architecturally serialising instruction — only `cpuid`, `iret` and
+/// writes to control registers are. In practice the gap rarely bites, because
+/// the x86 operations this kernel would put an `isb` after (`mov %cr3`,
+/// `wrmsr`) are *themselves* serialising, so the barrier is redundant rather
+/// than insufficient. It is chosen over `cpuid` because `cpuid` clobbers four
+/// registers on what is meant to be a single-instruction wrapper. **If a
+/// self-modifying-code or CR-write path ever depends on this, promote it to
+/// `cpuid` at that call site rather than widening this one.**
 pub mod barrier {
     /// `dsb ish` — full data synchronisation barrier, inner-shareable.
     #[inline(always)]
@@ -126,6 +152,11 @@ pub mod barrier {
         // SAFETY: a barrier orders accesses; it touches no memory itself.
         unsafe {
             core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: a fence orders accesses; it touches no memory itself.
+        unsafe {
+            core::arch::asm!("mfence", options(nostack, preserves_flags));
         };
     }
 
@@ -137,6 +168,11 @@ pub mod barrier {
         unsafe {
             core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
         };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: as the full fence, store-ordering only.
+        unsafe {
+            core::arch::asm!("sfence", options(nostack, preserves_flags));
+        };
     }
 
     /// `dsb sy` — full system data synchronisation barrier.
@@ -146,6 +182,11 @@ pub mod barrier {
         // SAFETY: as `dsb_ish`.
         unsafe {
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: as the inner-shareable fence; x86 fences have no shareability domain.
+        unsafe {
+            core::arch::asm!("mfence", options(nostack, preserves_flags));
         };
     }
 
@@ -160,6 +201,11 @@ pub mod barrier {
         unsafe {
             core::arch::asm!("isb", options(nostack, preserves_flags));
         };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: a speculation/dispatch barrier; it touches no memory.
+        unsafe {
+            core::arch::asm!("lfence", options(nostack, preserves_flags));
+        };
     }
 }
 
@@ -169,6 +215,26 @@ pub mod barrier {
 /// a `dc`/`ic` on an unmapped or garbage address faults or is ignored per the
 /// architecture, it does not read or write through the pointer. That is what
 /// makes an arbitrary `usize` a safe argument.
+///
+/// # x86_64: the no-op is the *correct* implementation, not a stub
+///
+/// This module is the one place where x86_64 falling through to the shared
+/// non-AArch64 arm is right on the merits rather than merely tolerated, and it
+/// is worth stating so nobody "fixes" it later.
+///
+/// x86 caches are coherent by architecture. Data caches are kept coherent by the
+/// hardware, and the instruction cache snoops stores, so making written bytes
+/// fetchable requires no explicit maintenance — only a serialising instruction
+/// on the fetching core, which is [`super::barrier::isb`]'s job and not this
+/// module's. `clflush`/`clwb` exist but are for persistent memory and
+/// non-coherent DMA, neither of which is what these five functions are called
+/// for. So `dc_cvau`, `dc_cvac`, `ic_ivau` and `ic_iallu` doing nothing on x86 is
+/// the architecture, not a gap.
+///
+/// [`line_size`] is the exception worth watching: it returns the shared fallback
+/// of 64, which is correct on every x86-64 part shipped so far but is a constant
+/// rather than a `CPUID` leaf 1 read. If a caller ever uses it for anything more
+/// load-bearing than loop striding, read `CPUID` properly.
 pub mod cache {
     /// `dc cvau` — clean one data cache line to the point of unification.
     #[inline(always)]
@@ -324,6 +390,26 @@ pub mod tlb {
 }
 
 /// Core parking and event signalling.
+///
+/// # x86_64 mapping, and a pair that must move together
+///
+/// | | AArch64 | x86_64 |
+/// |---|---|---|
+/// | [`wfi`] | `wfi` | `hlt` |
+/// | [`wfe`] | `wfe` | `pause` |
+/// | [`sev`] | `sev` | `nop` |
+/// | [`nop`] | `nop` | `pause` |
+///
+/// `wfi`/`hlt` is exact: both stop the core until an interrupt.
+///
+/// **`wfe`/`sev` is not, and the two entries are only correct together.** On
+/// AArch64 `wfe` sleeps until some core executes `sev`; x86 has neither, so
+/// `wfe` becomes `pause` — a spin hint that does not sleep — and `sev` therefore
+/// becomes `nop`, because with nothing asleep there is nothing to wake. The pair
+/// is *semantically* a busy-wait where AArch64 gets a real sleep: correct, and
+/// more power-hungry. Changing one without the other breaks it. If `wfe` is ever
+/// given a real x86 sleep (`monitor`/`mwait`), `sev` must become the
+/// corresponding write to the monitored line in the same change.
 pub mod park {
     /// `wfi` — wait for interrupt. Returns when one is taken (or spuriously).
     #[inline(always)]
@@ -333,6 +419,11 @@ pub mod park {
         // *wise* to park here is a scheduling question, not a safety one.
         unsafe {
             core::arch::asm!("wfi", options(nostack, preserves_flags));
+        };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: halts until an interrupt. Whether it is *wise* to park here is a scheduling question, not a safety one.
+        unsafe {
+            core::arch::asm!("hlt", options(nostack, preserves_flags));
         };
     }
 
@@ -344,6 +435,11 @@ pub mod park {
         unsafe {
             core::arch::asm!("wfe", options(nostack, preserves_flags));
         };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: a spin-loop hint; it is architecturally a nop.
+        unsafe {
+            core::arch::asm!("pause", options(nostack, preserves_flags));
+        };
     }
 
     /// `sev` — signal event to all cores.
@@ -354,6 +450,11 @@ pub mod park {
         unsafe {
             core::arch::asm!("sev", options(nostack, preserves_flags));
         };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: a nop. x86 has no event-signal instruction; see the note on `sev`.
+        unsafe {
+            core::arch::asm!("nop", options(nostack, preserves_flags));
+        };
     }
 
     /// `nop` — one architecturally-defined no-op, for spin backoff.
@@ -363,6 +464,11 @@ pub mod park {
         // SAFETY: it is a nop.
         unsafe {
             core::arch::asm!("nop", options(nomem, nostack, preserves_flags));
+        };
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: a spin-loop hint, architecturally a nop.
+        unsafe {
+            core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
         };
     }
 }
