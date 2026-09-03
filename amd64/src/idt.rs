@@ -147,6 +147,20 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
     serial::put_hex(frame.rflags);
     serial::puts("\n  cr2=0x");
     serial::put_hex(read_cr2());
+
+    // Dump the words at the faulting rsp. For a fault *on* an `iretq` this is
+    // the return frame the CPU was rejecting — rip, cs, rflags, rsp, ss — which
+    // is the only way to see which selector it actually objected to rather than
+    // inferring it from the error code.
+    if frame.rsp != 0 && frame.rsp < (1 << 30) {
+        serial::puts("\n  [rsp]=");
+        for i in 0..5 {
+            // SAFETY: bounds-checked against the identity map above.
+            let w = unsafe { (frame.rsp as *const u64).add(i).read_volatile() };
+            serial::puts(" 0x");
+            serial::put_hex(w);
+        }
+    }
     serial::puts("\n");
     crate::halt();
 }

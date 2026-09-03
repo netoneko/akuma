@@ -523,6 +523,83 @@ register is. Item 4's `spsr` hazard (any of 19 call sites could write `EL1h` and
 turn `enter_user_mode` into a privileged jump) simply cannot be expressed against
 a type with no public fields.
 
+## 3.11 Stage F: ring 3, and the bug only real hardware could find
+
+```
+  test: ring 3 entered, 2 syscalls, arg=0x0000000000001234 status=0x0000000000002468   [OK]
+```
+
+`amd64/src/gdt.rs` (GDT + TSS) and `amd64/src/usermode.rs` (`syscall`/`sysret`).
+The kernel drops to ring 3, userspace makes a syscall, the kernel doubles the
+argument, userspace gets the result back and passes it out as an exit status:
+`0x2468 = 0x1234 * 2` proves the value made the whole round trip rather than the
+call merely returning.
+
+This is the first use of `Prot::USER_RX` and `Prot::USER_RW`, which had existed
+since Stage B, been unit-checked, and never actually been mapped.
+
+### 3.11.1 The bug: `#GP` on AMD, clean on QEMU
+
+The ring-3 test passed under QEMU and faulted immediately on the Ryzen:
+
+```
+[EXCEPTION] #GP general protection err=0x0000000000000018
+  rip=0x00000000002030e2  cs=0x08  rflags=0x10006
+```
+
+`rip` disassembled to the `iretq` in `idt::timer_interrupt` — so an interrupt had
+been delivered *in ring 3* and the fault was on the way back out. The error code
+named GDT entry 3 (user data), which was not enough to say why: the descriptor
+looked correct.
+
+Dumping the five words at the faulting `rsp` — for a fault *on* an `iretq` that
+is exactly the frame being rejected — settled it in one run:
+
+```
+  [rsp]= rip=0x50000000  cs=0x23  rflags=0x202  rsp=0x50010ff0  ss=0x18
+```
+
+`CS = 0x23` carries RPL 3; **`SS = 0x18` carries RPL 0**. `iretq` requires
+`SS.RPL == CS.RPL`, hence `#GP(0x18)`.
+
+The cause is in `IA32_STAR`. `sysret` does not take selectors, it *computes*
+them: `CS = STAR[63:48] + 16`, `SS = STAR[63:48] + 8`. The base was `0x10`, so SS
+came out as `0x18` with RPL 0. The fix is the standard one — put the RPL in the
+base, `STAR[63:48] = 0x10 | 3` — after which `CS = 0x23` and `SS = 0x1b`.
+
+**Emulation hid it.** QEMU forces RPL 3 onto both computed selectors, so a base
+of `0x10` works there and faults on real AMD hardware at the first interrupt
+taken in ring 3. Nothing about the local run was wrong; the local machine simply
+could not express the failure. This is the clearest argument in this document for
+the Firecracker host existing at all — three stages of QEMU-green work, and the
+first thing ring 3 did on real silicon was expose a selector bug.
+
+Fixing it also validated more than the syscall path: the interrupt that triggered
+the fault was a *real* LAPIC tick delivered in ring 3, so the TSS `rsp0` stack
+switch and the interrupt-return path are exercised too, not just `syscall`.
+
+### 3.11.2 The frame dump stays
+
+`idt::fatal` now dumps the words at the faulting `rsp`. It is only meaningful for
+a fault on an `iretq`, and for that case it is the difference between "the error
+code says GDT[3]" and "the frame says `ss=0x18`". Cheap, bounds-checked against
+the identity map, and it earned its place on its first run.
+
+### 3.11.3 Two constraints the GDT layout carries silently
+
+`sysret` computing selectors rather than taking them means user **data** must sit
+immediately *below* user code (`0x18` then `0x20`), which is the reverse of the
+intuitive order. `syscall` is the mirror — `CS = STAR[47:32]`, `SS = that + 8` —
+forcing kernel code and data adjacent at `0x08`/`0x10`.
+
+Neither constraint is checked at load time, by anything. A wrong order links
+fine, boots fine, and faults on the first transition. Both are now written down
+in `gdt.rs`'s header, which is the only enforcement available.
+
+The kernel entries are byte-identical to the ones `boot.s` installed, deliberately:
+`CS` stays valid across the `lgdt`, so no far return is needed and the only
+reload is `ltr`.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at

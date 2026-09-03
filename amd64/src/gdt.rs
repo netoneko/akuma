@@ -16,10 +16,11 @@
 //! ```
 //!
 //! `sysret` does not take selectors; it *computes* them from `IA32_STAR[63:48]`,
-//! loading `CS = base + 16` and `SS = base + 8`. With base `0x10` that yields
-//! `CS = 0x20` and `SS = 0x18`, which is why user **data** must sit immediately
-//! below user **code** rather than the intuitive other way round. Swap those two
-//! rows and `sysret` lands in ring 3 with a data selector in `CS`.
+//! loading `CS = base + 16` and `SS = base + 8`. With base `0x13` (`0x10 | 3`)
+//! that yields `CS = 0x23` and `SS = 0x1b`, which is why user **data** must sit
+//! immediately below user **code** rather than the intuitive other way round.
+//! Swap those two rows and `sysret` lands in ring 3 with a data selector in
+//! `CS`. See [`SYSRET_BASE`] for why the RPL belongs in the base.
 //!
 //! `syscall` is the mirror image: it loads `CS = IA32_STAR[47:32]` and
 //! `SS = that + 8`, so kernel code at `0x08` and kernel data at `0x10` are also
@@ -91,8 +92,20 @@ pub const KERNEL_CODE: u16 = 0x08;
 /// — moving kernel data off `0x10` silently breaks `syscall`.
 #[allow(dead_code)]
 pub const KERNEL_DATA: u16 = 0x10;
-/// `IA32_STAR[63:48]`. `sysret` derives user CS/SS from it; see the module note.
-pub const SYSRET_BASE: u16 = 0x10;
+/// `IA32_STAR[63:48]`. `sysret` derives user CS/SS from it: `CS = base + 16`,
+/// `SS = base + 8`.
+///
+/// **The `| 3` is the RPL and it is load-bearing.** With a bare `0x10` the
+/// computed selectors are `CS = 0x20` and `SS = 0x18` — correct indices, but
+/// `SS` carries RPL 0 while `CS` carries RPL 0 too, and the CPU forces only
+/// `CS.RPL` to 3. `iretq` back to ring 3 then rejects the frame with
+/// `#GP(0x18)`, because it requires `SS.RPL == CS.RPL`.
+///
+/// Emulation hides this: QEMU forces RPL 3 onto both selectors, so `0x10` works
+/// there and faults on real AMD hardware at the first interrupt taken in ring 3.
+/// Measured 2026-09-04 on a Ryzen 7 8845HS under Firecracker; the IRET frame
+/// read `cs=0x23 ss=0x18`, which is what named the bug.
+pub const SYSRET_BASE: u16 = 0x10 | 3;
 const TSS_SELECTOR: u16 = 0x28;
 
 /// Descriptors, matching `boot.s` for the two kernel entries.
