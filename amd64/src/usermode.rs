@@ -25,6 +25,8 @@
 //! function. It is the same trick as `sched.rs`'s context switch, with ring 3 in
 //! the middle.
 
+use akuma_syscalls_linux::syscall::Syscall;
+
 use crate::gdt;
 use crate::paging::{self, MemAttr, Prot};
 use crate::serial;
@@ -43,14 +45,22 @@ const EFER_SCE: u64 = 1 << 0;
 const USER_CODE_VA: usize = 0x5000_0000;
 const USER_STACK_VA: usize = 0x5001_0000;
 
-/// Syscall numbers the test blob uses.
-const SYS_EXIT: u64 = 0;
-const SYS_WRITE_DEC: u64 = 1;
+/// Set by the handler when the excursion into ring 3 should end. Read by
+/// `syscall_entry`, which is why it is `no_mangle` rather than a normal static.
+#[unsafe(no_mangle)]
+static mut LEAVE_RING3: u64 = 0;
 
-/// Last value userspace passed to `SYS_WRITE_DEC`, for the test to check.
-static LAST_ARG: AtomicU64 = AtomicU64::new(0);
 /// How many syscalls arrived.
 static CALLS: AtomicU64 = AtomicU64::new(0);
+/// Bytes accepted by `write`.
+static WRITTEN: AtomicU64 = AtomicU64::new(0);
+/// Status userspace exited with.
+static EXIT_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Largest `write` this kernel will accept. A bound rather than trust: `len`
+/// comes from ring 3, and an unbounded length would walk off the mapped page
+/// into whatever follows.
+const MAX_WRITE: u64 = 4096;
 
 core::arch::global_asm!(
     r#"
@@ -68,7 +78,7 @@ syscall_entry:
 
     push rcx                      /* user rip   */
     push r11                      /* user rflags */
-    push rax                      /* syscall nr, for the exit check below */
+    push rax                      /* syscall nr — kept only to balance the frame */
     sub rsp, 8                    /* System V wants rsp 16-aligned at `call`;
                                      three pushes leave it 8 off. */
 
@@ -81,9 +91,14 @@ syscall_entry:
     call syscall_handler          /* result in rax */
 
     add rsp, 8
-    pop rcx                       /* the saved nr */
-    test rcx, rcx
-    jz .Lexit_to_kernel
+    pop rcx                       /* discard the saved nr */
+
+    /* Whether to go back to ring 3 is the handler's decision, not a property of
+     * the syscall number: `exit` and `exit_group` are different numbers, and on
+     * a second architecture they would be different again. The handler sets the
+     * flag; this only reads it. */
+    cmp qword ptr [rip + LEAVE_RING3], 0
+    jne .Lexit_to_kernel
 
     pop r11
     pop rcx
@@ -167,19 +182,84 @@ fn rdmsr(msr: u32) -> u64 {
 ///
 /// Runs on the dedicated syscall stack with interrupts off. Returns the value
 /// userspace sees in `rax`.
+///
+/// Dispatches on [`Syscall`] rather than on a raw number. That is proposal item
+/// 5's point made load-bearing: the same `write` is 1 here and 64 on aarch64, so
+/// a handler written against numbers cannot be shared and a handler written
+/// against names can.
 #[unsafe(no_mangle)]
-extern "C" fn syscall_handler(nr: u64, a1: u64, _a2: u64) -> u64 {
+extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64) -> u64 {
     CALLS.fetch_add(1, Ordering::Relaxed);
-    match nr {
-        SYS_WRITE_DEC => {
-            LAST_ARG.store(a1, Ordering::Relaxed);
-            // Doubling makes the return path observable: userspace can check it
-            // got a value back rather than merely that the call returned.
-            a1 * 2
+
+    // Errno values are returned as negatives, the Linux convention.
+    const ENOSYS: u64 = (-38i64) as u64;
+    const EBADF: u64 = (-9i64) as u64;
+    const EINVAL: u64 = (-22i64) as u64;
+
+    let Some(call) = Syscall::from_x86_64(nr) else {
+        return ENOSYS;
+    };
+
+    match call {
+        Syscall::Write => sys_write(a1, a2, /* len */ arg3()),
+        Syscall::Exit | Syscall::ExitGroup => {
+            EXIT_STATUS.store(a1, Ordering::Relaxed);
+            // SAFETY: single core, interrupts off inside a syscall; read only by
+            // `syscall_entry` on the way out.
+            unsafe { *(&raw mut LEAVE_RING3) = 1 };
+            a1
         }
-        SYS_EXIT => a1,
-        _ => u64::MAX,
+        Syscall::Getpid => 1,
+        Syscall::SchedYield => 0,
+        Syscall::Close => EBADF,
+        Syscall::Brk => EINVAL,
+        _ => ENOSYS,
     }
+}
+
+/// The third syscall argument, which the entry stub does not forward.
+///
+/// `syscall_entry` shifts `nr, a1, a2` into the first three System V registers,
+/// so `rdx` — Linux's third argument — is consumed before the handler sees it.
+/// Rather than widen the stub, the value is read back from where it still lives.
+#[inline(always)]
+fn arg3() -> u64 {
+    let v: u64;
+    // SAFETY: reads a register into a local. `r10` is Linux's *fourth* argument
+    // register and untouched by the stub, so this is only correct because the
+    // stub saves rdx there; see the stub.
+    unsafe {
+        core::arch::asm!("mov {}, r10", out(reg) v, options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// `write(fd, buf, len)` — fd 1 and 2 go to the serial console.
+///
+/// Reading `buf` from ring 0 works because `CR4.SMAP` is not enabled; with SMAP
+/// on this would need `stac`/`clac` around the access. That is a real gap and
+/// not a hypothetical — see the module note.
+fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
+    const EBADF: u64 = (-9i64) as u64;
+    const EFAULT: u64 = (-14i64) as u64;
+
+    if fd != 1 && fd != 2 {
+        return EBADF;
+    }
+    if len > MAX_WRITE {
+        return EFAULT;
+    }
+    for i in 0..len {
+        // SAFETY: `buf` is a user pointer and this is the one place the kernel
+        // dereferences one. It is bounded by MAX_WRITE above, and a fault here
+        // would land in the #PF handler rather than silently corrupting — which
+        // is the honest limit of what this can promise without a
+        // copy_from_user that validates the range against the page tables.
+        let byte = unsafe { (buf as *const u8).add(i as usize).read_volatile() };
+        serial::putb(byte);
+    }
+    WRITTEN.fetch_add(len, Ordering::Relaxed);
+    len
 }
 
 /// Enable `syscall`/`sysret`.
