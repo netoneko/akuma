@@ -177,6 +177,14 @@ debug = true
 # heap leak. docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md.
 leak-instr = ["akuma-kernel-glue/leak-instr"]
 
+# PMM pressure instrumentation: the `[PMM-BUDGET]` budget line (per-consumer
+# page counts beside the PMM free count) and `[PMM-USER-OOM]`, which is the
+# discriminator between "a user fault could not be served" and a corruption
+# SIGSEGV. OFF by default; build with `--features pmm-instr` while a memory
+# question is open. See docs/archive/ERET_ELR_CLOBBER_ENTER_USER_MODE.md and
+# the 2026-09-03 2 GB self-host measurement.
+pmm-instr = ["akuma-kernel-glue/pmm-instr"]
+
 syscall-debug-info = [
     "akuma-syscalls/debug-info",
     "akuma-syscalls-time/debug-info",

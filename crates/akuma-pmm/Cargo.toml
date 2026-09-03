@@ -14,3 +14,11 @@ akuma-primitives = { path = "../akuma-primitives" }
 # entirely; what `unsafe` is left is raw-frame access, not instructions.
 akuma-cpu = { path = "../akuma-cpu" }
 spinning_top = "0.3"
+
+[features]
+# PMM pressure instrumentation: the low-water sample on the user-fault path and
+# the `[PMM-USER-OOM]` print. OFF by default — the low-water update is a relaxed
+# load plus a compare on EVERY user demand-paging fault (29 M in one self-host
+# build), which is cheap but not free, and the diagnostics only earn their cost
+# while a memory question is open. Enable with `--features pmm-instr`.
+pmm-instr = []

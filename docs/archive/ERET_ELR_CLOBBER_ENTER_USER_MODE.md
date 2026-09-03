@@ -296,27 +296,35 @@ resolved-address print:
 | age of process | `after 0.00s` — dies at its first instruction | `after 0.15s` / `4.54s` — dies mid-run |
 | cause | kernel clobbered `ELR_EL1` | userspace branched through a garbage pointer |
 
-And the remaining class is **file content**, not CPU state. Iteration 6 named it
-outright:
+**Correction — iteration 6 was memory exhaustion, not file corruption.** The first
+reading of this record blamed `cc: fatal error: cannot execute '.../collect2':
+posix_spawn: Exec format error` on bad file content. The console says otherwise,
+two lines earlier:
 
 ```
-cc: fatal error: cannot execute '/usr/libexec/gcc/.../collect2': posix_spawn: Exec format error
-[E2-EOF] inode=6513 off=0x2400 size_now=0x2210 — caller believed the file extended past off
-[E2-EOF] inode=6574 off=0x3400 size_now=0x3218 — caller believed the file extended past off
+[PSTATS] PID 4443 (.../collect2) 0.00s: 18 syscalls  pmm=333free/524288tot
+[syscall] execve: replace_image failed for .../collect2: Failed to load ELF: Mapping…
 ```
 
-An on-disk binary that is no longer executable, and the ext2 layer itself
-reporting that a file is **shorter than the caller believed**. Together with
-`ld terminated with signal 11` (iteration 5) and rustc branching to unmapped user
-VAs (iteration 3), that is one story: wrong/short file content reaching
-userspace — the ext2 + page-cache/mmap family, not a register-state defect.
-`PMM-UAF=0`, `PMM-RESURRECT=0`, `PANIC=0` throughout.
+**`pmm=333free/524288tot`** — 333 free physical pages, 1.3 MB of a 2 GB box. The
+ELF load could not map the image, `execve` returned the failure, and gcc reported
+it as `Exec format error`. The binary on disk was fine. Anything that presents as
+`Exec format error`, a failed `execve`, or an `[OOM]` on this box should be checked
+against `pmm=…free` in the nearest `[PSTATS]` line **before** being called
+corruption.
 
-One further data point for the still-open 2 GB fragmentation question: it recurred
-once in this run, *with* `CACHE_CHUNK_BYTES` at 64 KB —
-`[OOM] allocation of 2370248 bytes failed (heap 279MB / 289MB used) — killing
-process`, on a 2.37 MB contiguous request against a heap that peaked at 292 MB. So
-the 64 KB chunk did not eliminate it.
+The `[OOM]` in the same window has the same cause rather than being a heap-cap or
+fragmentation problem: `[ALLOC FAIL] requested=2370248 heap_total=289MB
+heap_used=279MB (96%)` failed because the heap grows *from PMM*, and PMM had 333
+pages. It is not independent evidence about `CACHE_CHUNK_BYTES`.
+
+What remains genuinely unexplained is narrower: the wild **indirect branch**
+(iteration 3's `[WILD-IA] FAR=0x6024704` with `[DP] no lazy region for inst`, and
+iteration 5's `ld terminated with signal 11`). Those may themselves be OOM in
+disguise — the three `OOM: fall through to SIGSEGV` paths deliver a signal and
+print nothing — which is exactly why those three sites deserve the print. Four
+`[E2-EOF]` lines are a separate, small signal. `PMM-UAF=0`,
+`PMM-RESURRECT=0`, `PANIC=0` throughout.
 
 The remaining class is the already-open garbage-function-pointer family
 (`CARGO_HEAP_NULL_RC.md`, `TRAMPOLINE_STALE_PROCESS_RELR.md`, and `SELFHOST_ZERO_PAGE_HUNT.md`). One **new** datum for that hunt, from the `SPSR` this run

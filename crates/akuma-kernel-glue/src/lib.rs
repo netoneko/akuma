@@ -1847,6 +1847,44 @@ fn run_async_main() -> ! {
                     crate::pmm::free_count(), crate::pmm::total_count(),
                     crate::allocator::stats().heap_size / 1024 / 1024);
             }
+            // Memory-pressure budget, same cadence and deliberately next to
+            // `[FSCACHE]` so occupancy and pressure are read together.
+            //
+            // Gated on `pmm-instr` (off by default) together with the counters it
+            // reads: with the feature off `pressure_stats()` reports
+            // `(usize::MAX, 0)` and the line would print zeros, which is worse
+            // than printing nothing.
+            //
+            // The question this answers: when PMM bottoms out, WHO is holding the
+            // pages? The 2026-09-03 2 GB run had `pmm_free=333` (1.3 MB of 2 GB)
+            // while `[FPCACHE] entries=78643/78643` and `[FSCACHE]
+            // slots=65536/65536` — both caches pinned at 100 % of cap straight
+            // through exhaustion. Printing the three consumers on one line makes
+            // that readable without cross-referencing three separate lines and a
+            // `[PSTATS]` for the free count.
+            //
+            // `stackpg` is the kernel thread-stack pool, which on every profile but
+            // `extreme` is eagerly allocated for ALL slots at boot and never
+            // reclaimed — so unlike the two caches it is a floor, not a cache.
+            #[cfg(feature = "pmm-instr")]
+            {
+                let (low, user_oom) = akuma_pmm::pressure_stats();
+                let limit = akuma_exec::threading::thread_limit();
+                let reserved = config::RESERVED_THREADS;
+                let stackpg = (reserved.saturating_sub(1) * config::SYSTEM_THREAD_STACK_SIZE
+                    + limit.saturating_sub(reserved) * config::USER_THREAD_STACK_SIZE)
+                    / 4096;
+                let (fsc_used, _fsc_cap) = akuma_ext2::cache_occupancy();
+                crate::safe_print!(224,
+                    "[PMM-BUDGET] free={} low_water={} user_oom={} | fpcache={}pg fscache={}pg stackpg={} heap={}pg\n",
+                    crate::pmm::free_count(),
+                    if low == usize::MAX { 0 } else { low },
+                    user_oom,
+                    crate::file_page_cache::len(),
+                    fsc_used,
+                    stackpg,
+                    crate::allocator::stats().heap_size / 4096);
+            }
             #[cfg(feature = "leak-instr")]
             {
                 // Live-bytes histogram by size class, same 30s cadence — leak

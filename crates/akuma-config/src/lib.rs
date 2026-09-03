@@ -546,6 +546,25 @@ pub const SHARED_FILE_PAGES_ENABLED: bool = true;
 /// is still mapped costs nothing beyond the map node, since that frame was
 /// going to exist anyway — so this can be generous relative to the ext2 block
 /// cache. Lower it to starve the cache for an A/B.
+/// Ceiling (MiB) on the ext2 block cache, capping the `RAM/8` term that
+/// `akuma-vfs-glue`'s `fs::init` sizes it from.
+///
+/// Unlike the file-*page* cache below, this one is a **pure additional
+/// consumer**: it holds copies of disk blocks in the kernel heap, and — as
+/// `fs::init`'s own comment records — *it never shrinks*, so whatever it fills is
+/// committed for the boot's lifetime. At `MEMORY=2048` the `RAM/8` term (256 MB)
+/// binds, and 256 MB of a 289 MB heap is the block cache; that is what an
+/// `[ALLOC FAIL]` on that box is competing with.
+///
+/// Was a hardcoded `384 * 1024 * 1024` in `fs::init` until 2026-09-03; it is a
+/// const here so the low-RAM arm is a one-line change and the A/B is repeatable.
+/// The 2026-08-05 measurement behind 384 (8 sequential in-VM `rustc -O` compiles
+/// at `MEMORY=4096`) found the response is a step rather than a slope, and that
+/// **128 MB and 256 MB are within noise of each other** (10.72 vs 10.79
+/// s/compile) despite 4.5x the misses — so on a memory-constrained box the cache
+/// is cheap to shrink. Set to `0` to disable the cache entirely.
+pub const FSCACHE_CEILING_MB: usize = 384;
+
 pub const FPCACHE_BASE_RAM_DIVISOR: usize = 8;
 
 /// Extra cache allowed on top of the base cap, as a **percentage of the base

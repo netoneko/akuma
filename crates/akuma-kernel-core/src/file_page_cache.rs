@@ -10,9 +10,17 @@
 //! [`FpcacheConfig`](akuma_fpcache::FpcacheConfig). `config` therefore remains
 //! the single source of truth for the values.
 
-// `len` dropped from this re-export when `/proc/meminfo` moved to
-// `akuma-vfs-glue` and started calling `akuma_fpcache::len` directly.
+// `len` was dropped from this re-export when `/proc/meminfo` moved to
+// `akuma-vfs-glue` and started calling `akuma_fpcache::len` directly. It is back
+// for the `[PMM-BUDGET]` line in `akuma-kernel-glue`, which does NOT depend on
+// `akuma-fpcache` and should not gain the edge for one diagnostic — it already
+// reaches the cache through this shim for `shrink`/`stats_line`. Ungated like its
+// two neighbours, and the caller is ungated too, so it cannot read as unused.
 pub use akuma_fpcache::{shrink, stats_line};
+/// Only the `pmm-instr` `[PMM-BUDGET]` line needs this; ungated it is an
+/// unused re-export on profiles built with `-D unused-imports`.
+#[cfg(feature = "pmm-instr")]
+pub use akuma_fpcache::len;
 
 /// Boot-suite only since `src/fs.rs` moved into `akuma-vfs-glue` and started
 /// calling `akuma_fpcache::invalidate_inode` directly — an ungated re-export is

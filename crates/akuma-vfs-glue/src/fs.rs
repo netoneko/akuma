@@ -119,9 +119,12 @@ pub fn init() -> Result<(), FsError> {
     // See docs/archive/BKL_RUSTC_SCALING_BASELINE.md.
     {
         const PAGE: usize = 4096;
-        const CACHE_CEILING: usize = 384 * 1024 * 1024;
+        // The ceiling is `akuma_config::FSCACHE_CEILING_MB` since 2026-09-03 (was a
+        // hardcoded 384 MB here). The measurement table above is the reason it is
+        // 384 by default and the reason it is safe to lower on a small box.
+        let ceiling = akuma_config::FSCACHE_CEILING_MB * 1024 * 1024;
         let ram_bytes = akuma_pmm::total_count().saturating_mul(PAGE);
-        let cap = core::cmp::min(ram_bytes / 8, CACHE_CEILING);
+        let cap = core::cmp::min(ram_bytes / 8, ceiling);
         akuma_ext2::set_cache_cap_bytes(cap);
         // Sized from the same RAM figure, but a *different* kind of consumer: this
         // one dedupes frames that would otherwise exist per-process anyway.

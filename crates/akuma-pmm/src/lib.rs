@@ -2317,15 +2317,73 @@ const USER_RECLAIM_BATCH: usize = 512;
 /// to report that. Progress is judged by re-reading `free_count()` on the next
 /// loop iteration, via `next_reclaim_step`'s own re-check — see that function's
 /// doc in `akuma_exec::memmath` for why the order matters.
+/// Fewest free pages ever seen at a user demand-paging fault, and how many of
+/// those faults ended in OOM.
+///
+/// Every user-fault OOM in the kernel funnels through `alloc_page_zeroed_user`
+/// returning `None`, and each of the three call sites then SIGSEGVs the process
+/// **without printing anything** — which is why an OOM-induced SIGSEGV has been
+/// indistinguishable from a corruption-induced one in every campaign log. Counting
+/// it here rather than at the three sites means a new fault path is covered for
+/// free. `usize::MAX` = no user fault has been served yet.
+static PMM_LOW_WATER: AtomicUsize = AtomicUsize::new(usize::MAX);
+static USER_ALLOC_OOM: AtomicUsize = AtomicUsize::new(0);
+
+/// `(low_water_pages, user_fault_oom_count)`. See [`PMM_LOW_WATER`].
+///
+/// Without `feature = "pmm-instr"` nothing writes either counter, so this reports
+/// `(usize::MAX, 0)`. The two statics stay compiled on purpose: this keeps one
+/// signature, so no caller needs a `cfg` of its own.
+#[must_use]
+pub fn pressure_stats() -> (usize, usize) {
+    (
+        PMM_LOW_WATER.load(Ordering::Relaxed),
+        USER_ALLOC_OOM.load(Ordering::Relaxed),
+    )
+}
+
 pub fn alloc_page_zeroed_user() -> Option<usize> {
     use reclaim_escalation::{ReclaimStep, next_reclaim_step};
+
+    // Low-water sample. Taken here because this function already reads
+    // `free_count()` for the escalation decision below, so the only added cost on
+    // the fault path is a relaxed load plus a compare that almost always fails.
+    // Gated all the same: this runs on every user demand-paging fault.
+    #[cfg(feature = "pmm-instr")]
+    {
+        let free = free_count();
+        let mut low = PMM_LOW_WATER.load(Ordering::Relaxed);
+        while free < low {
+            match PMM_LOW_WATER.compare_exchange_weak(
+                low, free, Ordering::Relaxed, Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => low = seen,
+            }
+        }
+    }
 
     let mut done = None;
     loop {
         let step = next_reclaim_step(free_count(), done);
         match step {
             ReclaimStep::Allocate => return alloc_page_zeroed(),
-            ReclaimStep::GiveUp => return None,
+            ReclaimStep::GiveUp => {
+                // The caller will SIGSEGV the faulting process. Print the first
+                // few so a log can say "this SIGSEGV was OOM", then fall back to
+                // the counter — an OOM storm must not turn the console into the
+                // bottleneck.
+                #[cfg(feature = "pmm-instr")]
+                {
+                    let n = USER_ALLOC_OOM.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        akuma_primitives::safe_print!(176,
+                            "[PMM-USER-OOM] #{} free={} reserve={} — user fault cannot be served, caller will SIGSEGV\n",
+                            n + 1, free_count(), USER_PAGE_RESERVE);
+                    }
+                }
+                return None;
+            }
             ReclaimStep::ReclaimHeap => {
                 (hooks().heap_reclaim)();
             }
