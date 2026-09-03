@@ -49,9 +49,19 @@ const STACK_SIZE: usize = 32 * 1024;
 ///
 /// Slots are never recycled — `spawn` looks for `State::Unused`, and a finished
 /// task stays `Finished` so its stack is not handed to someone else. The table
-/// therefore has to hold every task the boot ever creates: three scheduler
-/// workers plus two user processes, with room to spare.
-const MAX_TASKS: usize = 8;
+/// therefore has to hold every task the *whole boot* ever creates, not every
+/// task alive at once: three scheduler workers, two cooperative processes, two
+/// preempted ones, and one loaded from an ELF image. Eight of those plus the
+/// boot task is exactly nine, which is why this stopped being 8 when the ELF
+/// stage landed — the symptom was `spawn` returning `None` after every earlier
+/// test had passed.
+///
+/// The right fix is recycling, and it is deliberately not this: a slot cannot
+/// be reused until its two 32 KiB stacks can be, and reclaiming those needs the
+/// scheduler to know a task's stack is no longer in use by any frame — which is
+/// a different stage. Growing the table is honest about being a bound on the
+/// boot's total task count.
+const MAX_TASKS: usize = 12;
 
 core::arch::global_asm!(
     r#"

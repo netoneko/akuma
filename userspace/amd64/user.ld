@@ -1,5 +1,5 @@
 /* Link script for the guest programs the amd64 kernel loads
- * (`userspace/amd64/*/`, built by `amd64/build.rs`).
+ * (the per-program directories under `userspace/amd64`, built by `amd64/build.rs`).
  *
  * 0x40_0000 is where a static Linux x86_64 binary is linked, and since Stage K
  * the kernel is in the upper half — so the program is mapped where it expects

@@ -71,6 +71,7 @@ dependencies = [
  "akuma-pmm",
  "akuma-selftest",
  "akuma-syscalls-abi",
+ "elf",
 ]
 
 [[package]]

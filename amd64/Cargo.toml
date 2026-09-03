@@ -23,6 +23,11 @@ akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
 # Shared boot self-test harness. Gives the tally the amd64 target lacked: a
 # [FAIL] used to print and the boot then finished announcing success.
 akuma-selftest = { path = "../crates/akuma-selftest" }
+# ELF parsing for the loader (`src/loader.rs`). The same vetted crate
+# `akuma-elf` parses through, at the same version, so the tree still has one ELF
+# parser — the aarch64 loader itself is unusable here because it is written
+# against `akuma-mmu`. See that module's header.
+elf = { version = "0.7", default-features = false }
 
 [[bin]]
 name = "akuma-amd64"

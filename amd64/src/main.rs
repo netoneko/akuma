@@ -52,6 +52,8 @@ mod idt;
 #[cfg(target_arch = "x86_64")]
 mod lapic;
 #[cfg(target_arch = "x86_64")]
+mod loader;
+#[cfg(target_arch = "x86_64")]
 mod mem;
 #[cfg(target_arch = "x86_64")]
 mod paging;
@@ -202,6 +204,12 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     usermode::init_syscall();
     usermode::smoke_test(&mut t);
     usermode::preempt_test(&mut t);
+    // Last, because it is the only test whose program the kernel did not
+    // assemble: everything before it has to work for a loader failure to be
+    // readable as a loader failure.
+    lapic::start_timer();
+    usermode::elf_test(&mut t);
+    lapic::stop_timer();
 
     // The verdict is `#[must_use]`, and this is why: before the harness existed
     // a `[FAIL]` printed and the boot went on to announce success.

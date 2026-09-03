@@ -542,7 +542,9 @@ impl Process {
     /// itself. A half-loaded image whose frames the loader had reclaimed would
     /// leave this space's page tables pointing at memory the PMM has since
     /// handed to someone else.
-    fn from_elf(image: &[u8]) -> Result<Self, &'static str> {
+    /// Returns the process and what the loader found, so a caller can check the
+    /// placement as well as the outcome.
+    fn from_elf(image: &[u8]) -> Result<(Self, loader::LoadedImage), &'static str> {
         let space = paging::AddressSpace::new().ok_or("no frame for a PML4")?;
         let mut frames = FrameSet::new();
 
@@ -555,11 +557,14 @@ impl Process {
                 b"hello",
                 img.entry,
             )
-            .map(|rsp| (img.entry, rsp))
+            .map(|rsp| (img, rsp))
         });
 
         match built {
-            Ok((entry, stack)) => Ok(Self { space, frames, entry, stack }),
+            Ok((img, stack)) => {
+                let entry = img.entry;
+                Ok((Self { space, frames, entry, stack }, img))
+            }
             Err(e) => {
                 frames.free_all();
                 space.free();
@@ -781,6 +786,248 @@ pub fn preempt_test(t: &mut Suite) {
     }
     t.check_eq(
         "preempt: teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+}
+
+/// Count `PT_LOAD` program headers in an ELF64 image.
+///
+/// Reads the four fields it needs at their architectural offsets rather than
+/// going through the `elf` crate, which is the point: the loader's segment
+/// count is checked against a number derived independently of the code that
+/// produced it. A parser bug that dropped a segment would otherwise agree with
+/// itself.
+fn count_pt_load(image: &[u8]) -> u64 {
+    const PT_LOAD: u32 = 1;
+    let u16_at = |off: usize| u16::from_le_bytes([image[off], image[off + 1]]) as usize;
+    let phoff = u64::from_le_bytes([
+        image[32], image[33], image[34], image[35],
+        image[36], image[37], image[38], image[39],
+    ]) as usize;
+    let phentsize = u16_at(54);
+    let phnum = u16_at(56);
+
+    (0..phnum)
+        .filter(|i| {
+            let at = phoff + i * phentsize;
+            image
+                .get(at..at + 4)
+                .is_some_and(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == PT_LOAD)
+        })
+        .count() as u64
+}
+
+/// Load a linked ELF image and run it.
+///
+/// The distinction from the two tests above is the same one Stage F drew
+/// against Stage E: those run a program *this file assembled*, so they can only
+/// ever exercise code the kernel already knew how to emit. This one runs an
+/// image `rustc` produced and the kernel had to parse — headers it did not
+/// write, segment placement it did not choose, and an entry point it read out
+/// of the file.
+///
+/// # What the exit status carries
+///
+/// `hello.rs` checks six properties of the load and reports them as bits, and
+/// the expectation here is spelled out as named constants rather than as `0x3F`
+/// so that a partial failure names itself. Reporting through the status rather
+/// than through `write` is what makes a bad load fail the boot: a program that
+/// printed its verdict would still have "passed" by running at all.
+pub fn elf_test(t: &mut Suite) {
+    /// `.data` arrived with its linked contents.
+    const DATA_OK: u64 = 1 << 0;
+    /// `.bss` is zero across all 32 KiB of it.
+    const BSS_OK: u64 = 1 << 1;
+    /// The `PF_W` segment really is writable.
+    const WRITABLE_OK: u64 = 1 << 2;
+    /// `argc` is what the stack builder wrote.
+    const ARGC_OK: u64 = 1 << 3;
+    /// `argv[0]` points at the expected NUL-terminated string.
+    const ARGV_OK: u64 = 1 << 4;
+    /// `AT_PAGESZ` is present in the auxiliary vector and is 4096.
+    const AUXV_OK: u64 = 1 << 5;
+    const ALL_OK: u64 = DATA_OK | BSS_OK | WRITABLE_OK | ARGC_OK | ARGV_OK | AUXV_OK;
+
+    let free_before = akuma_pmm::free_count();
+
+    // Rejection first, and before anything is allocated: a loader is judged as
+    // much by what it refuses as by what it loads, and these cost nothing to
+    // check because each fails before a frame is touched.
+    reject_test(t);
+
+    let (proc, img) = match Process::from_elf(HELLO_ELF) {
+        Ok(p) => p,
+        Err(e) => {
+            t.check("elf: image loaded", false);
+            serial::puts("  elf: load failed: ");
+            serial::puts(e);
+            serial::puts("\n");
+            return;
+        }
+    };
+    t.check("elf: image loaded", true);
+
+    // Every PT_LOAD in the file was placed. Counted out of the image rather
+    // than written as a literal: how many segments lld emits is its decision,
+    // not ours — `user.ld` names three output sections and the current link
+    // produces four LOADs, because `-z relro` splits .data from .bss. A literal
+    // here would turn any future linker flag into a test failure, while this
+    // catches the thing that matters: a loader that skipped one would produce a
+    // program that runs right up until it touches the segment that is missing.
+    t.check_eq(
+        "elf: every PT_LOAD was placed",
+        img.segments as u64,
+        count_pt_load(HELLO_ELF),
+    );
+    t.check(
+        "elf: image ends above its entry point",
+        img.end_va > img.entry && img.end_va % 4096 == 0,
+    );
+    // .bss is 32 KiB, so the writable segment alone is 9 pages; with .text,
+    // .rodata and two stack pages the total cannot be a single-page accident.
+    t.check(
+        "elf: frames owned covers image and stack",
+        proc.frames.len() >= 12 && proc.frames.len() <= loader::MAX_PROC_FRAMES,
+    );
+
+    // The entry point is what the file said, not what the kernel assumed. Read
+    // straight out of the image's `e_entry` field so a loader that ignored it
+    // and jumped at the first segment would fail here rather than by crashing.
+    let want_entry = u64::from_le_bytes([
+        HELLO_ELF[24], HELLO_ELF[25], HELLO_ELF[26], HELLO_ELF[27],
+        HELLO_ELF[28], HELLO_ELF[29], HELLO_ELF[30], HELLO_ELF[31],
+    ]);
+    t.check_eq("elf: entry point is e_entry", proc.entry, want_entry);
+
+    // Permissions read back out of the page tables — what the hardware will do,
+    // not what the loader believes it did. The entry page must be executable and
+    // not writable; the stack must be the reverse. Both are W^X, from opposite
+    // ends.
+    let entry_prot = proc.space.prot(proc.entry as usize & !0xfff);
+    t.check(
+        "elf: entry page is user-executable and not writable",
+        entry_prot == Some(Prot::USER_RX),
+    );
+    let stack_prot = proc.space.prot((proc.stack as usize) & !0xfff);
+    t.check(
+        "elf: stack page is user-writable and not executable",
+        stack_prot == Some(Prot::USER_RW),
+    );
+
+    // The stack is a separate mapping from the image, not an extension of it.
+    t.check(
+        "elf: stack is above the image and mapped",
+        proc.stack < ELF_STACK_TOP && proc.stack >= ELF_STACK_TOP - (ELF_STACK_PAGES as u64 * 4096),
+    );
+
+    let root = proc.space.root();
+    // SAFETY: single core; the slot is written before the task that reads it
+    // exists.
+    unsafe {
+        let procs = &raw mut PROCS;
+        (*procs)[4] = Some(proc);
+    }
+
+    if !t.check(
+        "elf: process spawned",
+        crate::sched::spawn_in_space(proc4_entry, root).is_some(),
+    ) {
+        return;
+    }
+
+    EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
+    serial::puts("  -- userspace output follows (from an ELF image) --\n");
+    let mut spins = 0u64;
+    while !crate::sched::all_user_tasks_finished() && spins < 10_000 {
+        spins += 1;
+        crate::sched::yield_now();
+    }
+
+    let status = EXIT_STATUS.load(Ordering::Relaxed);
+    t.check_eq("elf: program ran and reported every check", status, ALL_OK);
+    if status != ALL_OK && status != u64::MAX {
+        // Name the failures individually. A bare "got 0x2F, want 0x3F" makes the
+        // reader decode a bitmask to learn that argv[0] was wrong.
+        t.check("elf:   .data holds its linked contents", status & DATA_OK != 0);
+        t.check("elf:   .bss is zero-filled", status & BSS_OK != 0);
+        t.check("elf:   the PF_W segment is writable", status & WRITABLE_OK != 0);
+        t.check("elf:   argc is on the stack", status & ARGC_OK != 0);
+        t.check("elf:   argv[0] points at its string", status & ARGV_OK != 0);
+        t.check("elf:   auxv carries AT_PAGESZ", status & AUXV_OK != 0);
+    }
+
+    // SAFETY: the task has finished; nothing else touches this slot.
+    unsafe {
+        let procs = &raw mut PROCS;
+        if let Some(p) = (*procs)[4].take() {
+            p.free();
+        }
+    }
+    t.check_eq(
+        "elf: teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+}
+
+/// Images the loader must refuse, and the reason each one exists.
+///
+/// Every case is a mutation of the *real* image rather than a hand-written
+/// header, so a change to how `hello` is linked cannot leave these testing a
+/// shape the loader no longer sees. They check that a rejection happens, not
+/// which message comes back — the messages are diagnostics and pinning them
+/// would make rewording one a test failure.
+fn reject_test(t: &mut Suite) {
+    let free_before = akuma_pmm::free_count();
+
+    // A buffer big enough for the header mutations. Only the first 64 bytes are
+    // ever changed, and every case below is rejected during header validation,
+    // so the truncated image is never actually placed.
+    let mut buf = [0u8; 256];
+    buf.copy_from_slice(&HELLO_ELF[..256]);
+
+    let cases: [(&str, usize, &[u8]); 4] = [
+        // e_ident[EI_MAG0..4]: not an ELF at all.
+        ("elf: rejects a non-ELF image", 0, &[0x7f, b'E', b'L', b'G']),
+        // e_type at offset 16: ET_DYN (3). A PIE needs relocation this kernel
+        // cannot do, and loading one places it at its link-time zero.
+        ("elf: rejects ET_DYN", 16, &[3, 0]),
+        // e_machine at offset 18: EM_AARCH64 (183). The other architecture in
+        // this tree, which is the mistake actually available to make.
+        ("elf: rejects a non-x86-64 machine", 18, &[183, 0]),
+        // e_ident[EI_CLASS] at offset 4: ELFCLASS32.
+        ("elf: rejects ELF32", 4, &[1]),
+    ];
+
+    for (name, at, bytes) in cases {
+        let mut img = buf;
+        img[at..at + bytes.len()].copy_from_slice(bytes);
+        let Some(space) = paging::AddressSpace::new() else {
+            t.check(name, false);
+            continue;
+        };
+        let mut frames = FrameSet::new();
+        let refused = loader::load(&img, &space, &mut frames).is_err();
+        frames.free_all();
+        space.free();
+        t.check(name, refused);
+    }
+
+    // A truncated image: the header claims segments the file does not contain.
+    t.check("elf: rejects a truncated image", {
+        let Some(space) = paging::AddressSpace::new() else {
+            return;
+        };
+        let mut frames = FrameSet::new();
+        let refused = loader::load(&HELLO_ELF[..48], &space, &mut frames).is_err();
+        frames.free_all();
+        space.free();
+        refused
+    });
+
+    t.check_eq(
+        "elf: rejected loads leak nothing",
         akuma_pmm::free_count() as u64,
         free_before as u64,
     );

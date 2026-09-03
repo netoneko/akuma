@@ -126,8 +126,8 @@ impl FrameSet {
 
     /// Return every frame to the PMM and forget them.
     pub fn free_all(&mut self) {
-        for i in 0..self.len {
-            akuma_pmm::free_page(self.frames[i], 0);
+        for &pa in self.frames.iter().take(self.len) {
+            akuma_pmm::free_page(pa, 0);
         }
         self.len = 0;
     }
@@ -221,30 +221,31 @@ fn map_range(
 ) -> Result<(), &'static str> {
     let mut va = start;
     while va < end {
-        match space.prot(va as usize) {
-            Some(existing) => {
-                let want = widen(existing, prot);
-                if want.write && want.exec {
-                    return Err("segments share a page and would make it writable+executable");
-                }
-                if want != existing {
-                    let pa = space.translate(va as usize).ok_or("mapped page has no frame")?;
-                    if !space.map(va as usize, pa, want, MemAttr::WriteBack) {
-                        return Err("could not widen a shared page's permissions");
-                    }
+        if let Some(existing) = space.prot(va as usize) {
+            // A page a previous segment already placed. Only reachable from an
+            // unaligned link; see `widen`.
+            let want = widen(existing, prot);
+            if want.write && want.exec {
+                return Err("segments share a page and would make it writable+executable");
+            }
+            if want != existing {
+                let pa = space.translate(va as usize).ok_or("mapped page has no frame")?;
+                if !space.map(va as usize, pa, want, MemAttr::WriteBack) {
+                    return Err("could not widen a shared page's permissions");
                 }
             }
-            None => {
-                let pa = akuma_pmm::alloc_page().ok_or("out of frames loading a segment")? as u64;
-                // SAFETY: a fresh PMM frame, reached through the physmap.
-                unsafe { core::ptr::write_bytes(phys_ptr::<u8>(pa), 0, PAGE_SIZE) };
-                if !frames.push(pa as usize) {
-                    akuma_pmm::free_page(pa as usize, 0);
-                    return Err("image needs more frames than a process may own");
-                }
-                if !space.map(va as usize, pa, prot, MemAttr::WriteBack) {
-                    return Err("could not map a segment page");
-                }
+        } else {
+            let pa = akuma_pmm::alloc_page().ok_or("out of frames loading a segment")? as u64;
+            // SAFETY: a fresh PMM frame, reached through the physmap.
+            unsafe { core::ptr::write_bytes(phys_ptr::<u8>(pa), 0, PAGE_SIZE) };
+            // Recorded before it is mapped: a frame the set does not know about
+            // is a frame that leaks, and `map` can fail.
+            if !frames.push(pa as usize) {
+                akuma_pmm::free_page(pa as usize, 0);
+                return Err("image needs more frames than a process may own");
+            }
+            if !space.map(va as usize, pa, prot, MemAttr::WriteBack) {
+                return Err("could not map a segment page");
             }
         }
         va += PAGE_SIZE as u64;
@@ -382,7 +383,7 @@ pub fn build_stack(
     argv0: &[u8],
     entry: u64,
 ) -> Result<u64, &'static str> {
-    if top % PAGE_SIZE as u64 != 0 || pages == 0 {
+    if !top.is_multiple_of(PAGE_SIZE as u64) || pages == 0 {
         return Err("stack top must be page aligned and at least one page");
     }
     let bytes = (pages as u64) * PAGE_SIZE as u64;
