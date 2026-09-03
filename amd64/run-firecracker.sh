@@ -53,20 +53,36 @@ cat > run.sh <<'EORUN'
 #!/bin/sh
 # Boot Akuma/amd64 under Firecracker. Staged by amd64/run-firecracker.sh.
 #
-# The kernel halts rather than exiting, so Firecracker never returns on its own —
-# hence the timeout. TIMEOUT=0 runs without one (Ctrl-C to stop).
+# Output goes to the terminal AND to ./boot.log (truncated each run).
+#
+# The kernel halts with `cli; hlt` rather than exiting, so Firecracker never
+# returns on its own — hence the timeout. TIMEOUT=0 runs without one (Ctrl-C).
+#
+# `timeout --foreground` is load-bearing, not tidiness. Plain `timeout` puts the
+# child in its OWN PROCESS GROUP, which stops it being the foreground group of
+# the controlling terminal. Firecracker attaches guest serial input to stdin, so
+# reading the TTY from a background process group raises SIGTTIN and the process
+# stops dead right after printing its banner — the guest never runs and there is
+# no error. The symptom is a single "Running Firecracker" line and nothing else,
+# and it only reproduces on a real terminal: over a pipe (ssh with no -t) there
+# is no controlling TTY and plain `timeout` works fine, which is a good way to
+# lose an hour. `--foreground` leaves the child in the shell's process group.
 set -e
 cd "\$(dirname "\$0")"
 
 FC=\$(command -v firecracker || echo "\$HOME/bin/firecracker")
 [ -x "\$FC" ] || { echo "firecracker not found (looked in PATH and ~/bin)" >&2; exit 1; }
 
+LOG=boot.log
 TIMEOUT="\${TIMEOUT:-20}"
+
 if [ "\$TIMEOUT" = "0" ]; then
-    exec "\$FC" --no-api --config-file akuma-vm.json
+    "\$FC" --no-api --config-file akuma-vm.json 2>&1 | tee "\$LOG"
 else
-    timeout "\$TIMEOUT" "\$FC" --no-api --config-file akuma-vm.json || true
+    timeout --foreground "\$TIMEOUT" \
+        "\$FC" --no-api --config-file akuma-vm.json 2>&1 | tee "\$LOG" || true
 fi
+echo "--- log written to \$(pwd)/\$LOG ---"
 EORUN
 chmod +x run.sh
 

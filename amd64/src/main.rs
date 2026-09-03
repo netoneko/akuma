@@ -16,6 +16,7 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
@@ -42,6 +43,8 @@ compile_error!(
 
 #[cfg(target_arch = "x86_64")]
 mod hvm;
+#[cfg(target_arch = "x86_64")]
+mod idt;
 #[cfg(target_arch = "x86_64")]
 mod mem;
 #[cfg(target_arch = "x86_64")]
@@ -137,6 +140,11 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     if mem::init(&info) {
         mem::smoke_test();
         paging::smoke_test();
+        // Only after the PMM and paging are up: the #PF handler allocates a
+        // frame and maps it, so installing the IDT earlier would give us a
+        // handler that cannot service the fault it exists to service.
+        idt::init();
+        idt::smoke_test();
         serial::puts("\nAkuma/amd64 — memory subsystem up\n");
     } else {
         serial::puts("\nAkuma/amd64 — memory bring-up FAILED\n");
@@ -150,7 +158,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 /// `hlt` in a loop rather than a bare spin: it is the x86 counterpart of the
 /// `wfi` that `akuma_cpu::park_core` emits on AArch64, and burning a host core
 /// at 100% is how a QEMU run gets mistaken for a hang.
-fn halt() -> ! {
+pub fn halt() -> ! {
     loop {
         #[cfg(target_arch = "x86_64")]
         // SAFETY: `cli` and `hlt` are unconditionally safe to execute at ring 0

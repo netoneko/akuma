@@ -336,6 +336,66 @@ omits it and then tries to enforce W^X gets the exact opposite of what it asked
 for. It is now set in the same `wrmsr` as LME, so no page-table code can run
 before it is in force.
 
+## 3.7 Stage C: an IDT, and demand paging
+
+```
+  test: demand paging 4 faults serviced, frames 126380 -> 126378   [OK]
+```
+
+`amd64/src/idt.rs`. Before it, *every* fault was fatal and invisible: with no IDT
+loaded a page fault escalates to a double fault and then a triple fault, and the
+VMM resets the guest with nothing on the serial line. Every bug in the earlier
+stages had that same symptom — silence — which is why those modules bounds-check
+so aggressively. This replaces that discipline with a diagnostic.
+
+The test arms a lazily-backed range at 2 GiB (outside the identity map *and*
+clear of the 1 GiB address `paging::smoke_test` uses, so it cannot pass by
+accidentally hitting an existing mapping), stores to four pages, and lets `#PF`
+service each one: allocate a frame, zero it, map it, `iretq` re-executes the
+faulting store. It then reads all four back — a handler that mapped a page and
+then lost it would still let the store retire — and unmaps them, checking the
+frame count returns to where it started so a leak cannot hide.
+
+**No hand-written entry stubs.** rustc's `x86-interrupt` calling convention
+synthesises the uniform frame and the `iretq`, so the handlers are ordinary
+`fn`s. That is a compiler feature, not a dependency.
+
+**A protection fault inside the lazy range is deliberately still fatal.** Only
+error-code bit 0 clear (*not present*) is demand paging; bit 0 set means a write
+to something deliberately read-only, and servicing that would silently defeat the
+protection. This is the same grant-vs-deny distinction as
+`docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`.
+
+**No TSS and no IST**, so a double fault runs on the faulting stack. Fine while
+nothing can overflow it, wrong the moment a guard page exists — a stack-overflow
+double fault would fault again pushing its own frame and triple-fault. When a
+guard page appears, vector 8 needs an IST entry *before* it.
+
+## 3.8 `timeout` silently breaks Firecracker on a terminal
+
+Worth its own section because the symptom is indistinguishable from a kernel that
+does not boot, and it only reproduces interactively.
+
+```
+$ ./run.sh
+2026-09-03T23:31:55 [anonymous-instance:main] Running Firecracker v1.16.1
+$                          # ...and nothing else, ever
+```
+
+`timeout` runs its child in **its own process group**, so the child is no longer
+the foreground process group of the controlling terminal. Firecracker attaches
+guest serial input to stdin; reading the TTY from a background process group
+raises `SIGTTIN`, which stops the process immediately after it prints its banner.
+The guest never runs, and there is no error message.
+
+It does not reproduce over a pipe — `ssh` with no `-t` has no controlling TTY, so
+plain `timeout` is fine there. Every automated run in this document went through
+a pipe, which is why the bug survived until someone ran it by hand.
+
+The fix is `timeout --foreground`, which leaves the child in the shell's process
+group. `amd64/run-firecracker.sh` stages a `run.sh` that uses it and tees to
+`boot.log`.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at

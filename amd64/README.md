@@ -1,8 +1,8 @@
 # Akuma/amd64
 
 x86_64 bring-up target. Boots to long mode, brings up the kernel heap and the
-physical frame allocator, and can map/unmap 4 KiB pages — then stops. No
-userspace, no interrupts, no scheduler, no IDT.
+physical frame allocator, maps/unmaps 4 KiB pages, and services page faults with
+**demand paging**. No userspace, no hardware interrupts, no scheduler.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1**.
 
@@ -27,6 +27,7 @@ Akuma/amd64 — long mode reached
   test: pmm alloc 8 frames, free 126354 -> 126346 -> 126354   [OK]
   test: paging map/write/verify/unmap @0x0000000040000000   [OK]
   test: W^X encoding   [OK]
+  test: demand paging 4 faults serviced, frames 126380 -> 126378   [OK]
 
 Akuma/amd64 — memory subsystem up
 ```
@@ -108,8 +109,16 @@ exits with `missing field 'drives'`. The API path has different rules. Nothing i
 this kernel reads a disk or a NIC yet, so both stay `[]`.
 
 Console output arrives on Firecracker's serial, which it writes to its own
-stdout. The kernel halts rather than exiting, so Firecracker never returns on its
-own — run it under `timeout`.
+stdout; the staged `run.sh` tees it to `~/akuma/boot.log`. The kernel halts rather
+than exiting, so Firecracker never returns on its own — run it under `timeout`.
+
+**Use `timeout --foreground`, not plain `timeout`.** Plain `timeout` puts the
+child in its own process group, so it is no longer the terminal's foreground
+group; Firecracker attaches guest serial input to stdin, and reading the TTY from
+a background process group raises `SIGTTIN` and stops the process right after its
+banner. The guest never runs and there is no error. It only reproduces on a real
+terminal — over a pipe (`ssh` with no `-t`) there is no controlling TTY and plain
+`timeout` works fine.
 
 ## What is deliberately missing
 
