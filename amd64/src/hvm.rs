@@ -34,19 +34,17 @@
 //!
 //! # Reading physical addresses
 //!
-//! Everything here dereferences a *physical* address as if it were virtual,
-//! which is only sound because `boot.s` identity-maps the first 1 GiB. Every
-//! read is bounds-checked against that window rather than trusted, because these
-//! values come from outside the kernel: a pointer past the identity map is a
-//! page fault with no IDT installed, i.e. an immediate triple-fault and a guest
-//! that vanishes with no output. Refusing to read is recoverable; faulting is
-//! not.
+//! Every address in this block is physical, and the kernel reaches physical
+//! memory through the physmap (`crate::phys`). Each read is bounds-checked
+//! against that window rather than trusted, because these values come from
+//! outside the kernel: a pointer past the physmap is a page fault with no IDT
+//! installed, i.e. an immediate triple-fault and a guest that vanishes with no
+//! output. Refusing to read is recoverable; faulting is not.
 
 /// `"xEn3"` little-endian. A block that does not start with this is not one.
 const HVM_MAGIC: u32 = 0x336e_c578;
 
-/// The identity map `boot.s` builds. Nothing outside it is readable yet.
-const IDENTITY_MAP_LIMIT: u64 = 1 << 30;
+use crate::phys::{PHYSMAP_LIMIT, phys_ptr};
 
 const MEMMAP_ENTRY_SIZE: u64 = 24;
 
@@ -83,7 +81,7 @@ impl MemRegion {
     }
 }
 
-/// Read `len` bytes at a physical address, if it is inside the identity map.
+/// Read `len` bytes at a physical address, if it is inside the physmap.
 ///
 /// # Safety
 /// The caller must not assume the value is meaningful — only that reading it did
@@ -91,14 +89,14 @@ impl MemRegion {
 /// comes from the VMM, not from this kernel.
 unsafe fn read_phys<const N: usize>(pa: u64) -> Option<[u8; N]> {
     let n = N as u64;
-    if pa.checked_add(n)? > IDENTITY_MAP_LIMIT {
+    if pa.checked_add(n)? > PHYSMAP_LIMIT {
         return None;
     }
     let mut buf = [0u8; N];
     for (i, slot) in buf.iter_mut().enumerate() {
-        // SAFETY: `pa + N` was just proved to be inside the identity map that
-        // boot.s established, so this address is mapped and readable.
-        *slot = unsafe { core::ptr::read_volatile((pa + i as u64) as *const u8) };
+        // SAFETY: `pa + N` was just proved to be inside the physmap, so the
+        // translated address is mapped and readable.
+        *slot = unsafe { phys_ptr::<u8>(pa + i as u64).read_volatile() };
     }
     Some(buf)
 }

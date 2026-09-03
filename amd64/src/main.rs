@@ -56,6 +56,8 @@ mod mem;
 #[cfg(target_arch = "x86_64")]
 mod paging;
 #[cfg(target_arch = "x86_64")]
+mod phys;
+#[cfg(target_arch = "x86_64")]
 mod port;
 #[cfg(target_arch = "x86_64")]
 mod sched;
@@ -143,6 +145,18 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         }
     }
 
+    // Before anything that can fault. `idt::init` needs nothing but its own
+    // static table, so installing it here — rather than after the memory
+    // subsystem, where it used to go — means a fault during memory bring-up
+    // prints a diagnosis instead of triple-faulting into silence. That is not
+    // hypothetical: it cost a debugging round during the higher-half move.
+    idt::init();
+
+    // The trampoline's identity map has done its job: the kernel is executing
+    // from its high linked address and its stack is in the physmap. Dropping it
+    // now hands the entire lower half to userspace.
+    paging::drop_identity_map();
+
     serial::puts("  usable RAM: ");
     serial::put_dec(usable / 1024 / 1024);
     serial::puts(" MiB\n");
@@ -156,10 +170,9 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 
     mem::smoke_test(&mut t);
     paging::smoke_test(&mut t);
-    // Only after the PMM and paging are up: the #PF handler allocates a frame
-    // and maps it, so installing the IDT earlier would give us a handler that
-    // cannot service the fault it exists to service.
-    idt::init();
+    // The IDT is already loaded (before mem::init, so faults there are
+    // visible). Demand paging is what needs the PMM, and that is only exercised
+    // here.
     idt::smoke_test(&mut t);
 
     if t.check("lapic: initialised", lapic::init()) {

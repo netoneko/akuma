@@ -29,4 +29,11 @@ rustflags = ["-C", "link-arg=-Tlinker.ld"]
 # probes that measure how much of the tree is arch-neutral — those build rlibs,
 # and a stray link script in their flag set is noise at best.
 [target.x86_64-unknown-none]
-rustflags = ["-C", "relocation-model=static"]
+#
+# `code-model=kernel` because the kernel is linked into the top -2 GiB
+# (0xFFFFFFFF80000000, see amd64/linker.ld). The default `small` model emits
+# R_X86_64_32S relocations, which cannot express a 2^47 displacement — the link
+# fails with "relocation R_X86_64_32S out of range" pointing at ordinary statics.
+# `kernel` is the model built for exactly this address range; `large` would also
+# work and costs a 64-bit absolute for every reference.
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=kernel"]

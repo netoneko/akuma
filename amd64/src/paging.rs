@@ -42,6 +42,8 @@
 
 use akuma_selftest::Suite;
 
+use crate::phys::{PHYSMAP_LIMIT, phys_ptr};
+
 /// Present.
 const P: u64 = 1 << 0;
 /// Writable.
@@ -64,9 +66,6 @@ const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const PAGE_SIZE: usize = 4096;
 /// Entries per table: 4 KiB / 8 bytes. Also the index mask below.
 const ENTRIES: usize = 512;
-
-/// `boot.s` identity-maps exactly this much, which bounds what is dereferenceable.
-const IDENTITY_MAP_LIMIT: u64 = 1 << 30;
 
 /// Permissions, as permissions — not as an encoding.
 ///
@@ -138,8 +137,8 @@ const fn encode(prot: Prot, attr: MemAttr) -> u64 {
 /// `pa` must be a page-aligned frame that is either a live page table or a
 /// freshly-zeroed frame the caller is about to make one.
 unsafe fn table_mut(pa: u64) -> *mut u64 {
-    debug_assert!(pa < IDENTITY_MAP_LIMIT, "page table outside the identity map");
-    pa as *mut u64
+    debug_assert!(pa < PHYSMAP_LIMIT, "page table outside the physmap");
+    phys_ptr::<u64>(pa)
 }
 
 /// The active top-level table, from `CR3`.
@@ -227,7 +226,7 @@ unsafe fn next_table(entry_ptr: *mut u64, user: bool) -> Option<u64> {
     // SAFETY: a fresh PMM frame inside the identity map; zeroing it is what
     // makes it a valid empty table.
     unsafe {
-        core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
+        core::ptr::write_bytes(phys_ptr::<u8>(frame), 0, PAGE_SIZE);
         // Intermediate entries are permissive; the leaf decides. NX is left
         // clear here for the same reason.
         entry_ptr.write_volatile(frame | P | RW | if user { US } else { 0 });
@@ -374,7 +373,7 @@ pub fn smoke_test(t: &mut Suite) {
     // proves the mapping points where the walk said, rather than at some other
     // page that happens to be readable.
     // SAFETY: PMM frames are inside the identity map.
-    let via_phys = unsafe { (frame as *const u64).read_volatile() };
+    let via_phys = unsafe { phys_ptr::<u64>(frame as u64).read_volatile() };
     t.check_eq("paging: visible via physical alias", via_phys, PATTERN);
 
     t.check_eq(
@@ -415,6 +414,26 @@ fn nx_encoding_check(t: &mut Suite) {
             dev & (PCD | PWT) == PCD | PWT && rw & (PCD | PWT) == 0);
 }
 
+/// Unmap the lower half of the kernel's own address space.
+///
+/// `boot.s` builds an identity map so the 32-bit trampoline has somewhere to
+/// stand. Once the kernel is executing from its high linked address and reaching
+/// physical memory through the physmap, that mapping is not merely unnecessary —
+/// it *occupies the lower half*, which belongs to userspace. Dropping it is what
+/// lets a process be mapped wherever it is linked.
+///
+/// Only PML4 slot 0 is cleared: it is the only lower-half slot `boot.s` filled.
+pub fn drop_identity_map() {
+    // SAFETY: the caller must already be running from the kernel window with a
+    // physmap stack — which `boot.s`'s `high_entry` arranges before it calls
+    // `kmain`. Reloading CR3 flushes the now-stale identity translations.
+    unsafe {
+        let root = read_cr3();
+        table_mut(root).write_volatile(0);
+        activate(root);
+    }
+}
+
 /// One address space: a PML4 of its own, sharing the kernel's mappings.
 ///
 /// # What is shared and what is not
@@ -442,46 +461,40 @@ fn nx_encoding_check(t: &mut Suite) {
 /// without moving the kernel.
 pub struct AddressSpace {
     root: u64,
-    pdpt: u64,
 }
 
-/// PDPT slots that every address space shares with the kernel.
-const SHARED_PDPT_SLOTS: [usize; 2] = [
-    0, // the identity-mapped first 1 GiB: kernel image, heap, PMM pool
-    3, // 0xC000_0000..0x1_0000_0000, which contains the LAPIC at 0xFEE0_0000
+/// PML4 slots every address space shares with the kernel.
+///
+/// Slots 0..255 are userspace and stay private; these three are the kernel's
+/// whole world. Sharing at PML4 level rather than PDPT level is what Stage K
+/// bought: the lower half is now entirely the process's, so a user program can
+/// be mapped wherever it is linked instead of having to dodge the kernel.
+const SHARED_PML4_SLOTS: [usize; 3] = [
+    256, // physmap    — every physical page the kernel touches
+    257, // device map — MMIO, uncached
+    511, // the kernel image itself
 ];
 
 impl AddressSpace {
     /// Build a new address space sharing the kernel's mappings.
     pub fn new() -> Option<Self> {
         let root = akuma_pmm::alloc_page()? as u64;
-        let Some(pdpt) = akuma_pmm::alloc_page().map(|p| p as u64) else {
-            akuma_pmm::free_page(root as usize, 0);
-            return None;
-        };
 
-        // SAFETY: two fresh PMM frames inside the identity map. Zeroing is what
-        // makes them valid empty tables; the entries written after are the only
-        // non-zero ones.
+        // SAFETY: a fresh PMM frame, reached through the physmap. Zeroing is
+        // what makes it a valid empty table; the shared entries written below
+        // are the only non-zero ones, so the whole lower half starts unmapped.
         unsafe {
-            core::ptr::write_bytes(root as *mut u8, 0, PAGE_SIZE);
-            core::ptr::write_bytes(pdpt as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(phys_ptr::<u8>(root), 0, PAGE_SIZE);
 
-            // Share, do not copy: read the kernel's PDPT and alias its entries.
-            let kernel_pdpt = {
-                let kroot = read_cr3();
-                let e = table_mut(kroot).read_volatile();
-                e & ADDR_MASK
-            };
-            for slot in SHARED_PDPT_SLOTS {
-                let e = table_mut(kernel_pdpt).add(slot).read_volatile();
-                table_mut(pdpt).add(slot).write_volatile(e);
+            // Share, do not copy: alias the kernel's own top-level entries, so
+            // there is one kernel mapping and the copies cannot drift.
+            let kroot = read_cr3();
+            for slot in SHARED_PML4_SLOTS {
+                let e = table_mut(kroot).add(slot).read_volatile();
+                table_mut(root).add(slot).write_volatile(e);
             }
-
-            // PML4[0] -> our PDPT. User-accessible, because the leaf decides.
-            table_mut(root).write_volatile(pdpt | P | RW | US);
         }
-        Some(Self { root, pdpt })
+        Some(Self { root })
     }
 
     /// The value to load into `CR3`.
@@ -512,28 +525,36 @@ impl AddressSpace {
     /// Leaf frames are the caller's — this frees page *tables*, not the pages
     /// they point at.
     pub fn free(self) {
-        // SAFETY: the tables were allocated by `new` and are inside the identity
-        // map; the shared slots are skipped so the kernel's own tables survive.
+        // SAFETY: every table was allocated by this space's own `map` calls and
+        // is reached through the physmap. The shared PML4 slots are skipped, so
+        // the kernel's own tables survive; only the lower half is walked.
         unsafe {
-            for slot in 0..ENTRIES {
-                if SHARED_PDPT_SLOTS.contains(&slot) {
+            for l4 in 0..ENTRIES {
+                if SHARED_PML4_SLOTS.contains(&l4) {
                     continue;
                 }
-                let pd_entry = table_mut(self.pdpt).add(slot).read_volatile();
-                if pd_entry & P == 0 {
+                let e4 = table_mut(self.root).add(l4).read_volatile();
+                if e4 & P == 0 {
                     continue;
                 }
-                let pd = pd_entry & ADDR_MASK;
-                for i in 0..ENTRIES {
-                    let pt_entry = table_mut(pd).add(i).read_volatile();
-                    if pt_entry & P != 0 && pt_entry & PS == 0 {
-                        akuma_pmm::free_page((pt_entry & ADDR_MASK) as usize, 0);
+                let pdpt = e4 & ADDR_MASK;
+                for l3 in 0..ENTRIES {
+                    let e3 = table_mut(pdpt).add(l3).read_volatile();
+                    if e3 & P == 0 || e3 & PS != 0 {
+                        continue;
                     }
+                    let pd = e3 & ADDR_MASK;
+                    for l2 in 0..ENTRIES {
+                        let e2 = table_mut(pd).add(l2).read_volatile();
+                        if e2 & P != 0 && e2 & PS == 0 {
+                            akuma_pmm::free_page((e2 & ADDR_MASK) as usize, 0);
+                        }
+                    }
+                    akuma_pmm::free_page(pd as usize, 0);
                 }
-                akuma_pmm::free_page(pd as usize, 0);
+                akuma_pmm::free_page(pdpt as usize, 0);
             }
         }
-        akuma_pmm::free_page(self.pdpt as usize, 0);
         akuma_pmm::free_page(self.root as usize, 0);
     }
 }

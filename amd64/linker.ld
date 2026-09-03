@@ -1,32 +1,39 @@
-/* amd64 kernel layout.
+/* amd64 kernel layout: low trampoline, high kernel.
  *
- * Load address 0x200000 (2 MiB). Two constraints pin it:
- *   - it must clear the region both loaders use for boot structures. Firecracker
- *     places hvm_start_info at 0x6000 and the command line at 0x20000, and the
- *     legacy sub-1 MiB area holds the BIOS data area and device memory.
- *   - boot.s identity-maps the first 1 GiB with 2 MiB pages, so the image has
- *     to land inside that window.
+ * The kernel is linked to run at `KERNEL_VMA + physical`, in the upper half,
+ * and *loaded* at its physical address. Two regions therefore have different
+ * rules:
  *
- * PHDRS is explicit rather than left to lld. The PVH note is only found by a
- * loader that can see it through a PT_NOTE program header; a note that exists
- * as a section but is covered by no phdr is invisible, and the failure is
- * silent — Firecracker falls back to BootProtocol::LinuxBoot and enters in long
- * mode at e_entry, i.e. straight into 32-bit trampoline code, and QEMU falls
- * back to a different path entirely. Naming the phdrs here means the note's
- * visibility is stated, not inherited.
+ *   .boot / .bootbss  — VMA == LMA, low.  The PVH entry runs here in 32-bit
+ *                       protected mode with paging off, so every address it
+ *                       touches must be physical. That includes the boot page
+ *                       tables and the boot stack, which is why they are here
+ *                       and not in the ordinary .bss.
+ *   everything else   — VMA high, LMA low, via AT().
  *
- * No KERNEL_VIRT_BASE equivalent yet: this target runs on the identity map that
- * boot.s builds. The aarch64 linker.ld's upper-half split is the next thing to
- * mirror here, and it is deliberately absent rather than half-done.
+ * `KERNEL_VMA` is the top -2 GiB, which is what `-C code-model=kernel` assumes.
+ * The physmap — through which the kernel reaches an arbitrary physical page —
+ * is a second window at PML4 slot 256; the two are separate because a
+ * kernel-code-model image cannot be linked into slot 256's range.
+ *
+ * Load address 0x200000 (2 MiB) still clears the region both loaders use for
+ * boot structures — Firecracker puts hvm_start_info at 0x6000 and the command
+ * line at 0x20000.
  */
 ENTRY(_start)
 
+/* Top -2 GiB: the range `-C code-model=kernel` is built for. The physmap is a
+ * *separate* window (PML4 slot 256, 0xFFFF800000000000) since a kernel-model
+ * image cannot be linked there. */
+KERNEL_VMA = 0xFFFFFFFF80000000;
+
 PHDRS
 {
-    note PT_NOTE   FLAGS(4);            /* R   — the PVH note */
-    text PT_LOAD    FLAGS(5);           /* R+X */
-    rodata PT_LOAD  FLAGS(4);           /* R   */
-    data PT_LOAD    FLAGS(6);           /* R+W — .data and .bss */
+    note    PT_NOTE FLAGS(4);           /* R   — the PVH note */
+    boot    PT_LOAD  FLAGS(5);          /* R+X — the low trampoline */
+    text    PT_LOAD  FLAGS(5);          /* R+X */
+    rodata  PT_LOAD  FLAGS(4);          /* R   */
+    data    PT_LOAD  FLAGS(6);          /* R+W — .data and .bss */
 }
 
 SECTIONS
@@ -41,26 +48,50 @@ SECTIONS
     .note.Xen : { KEEP(*(.note.Xen)) } :note
 
     . = ALIGN(0x1000);
-    .boot : { KEEP(*(.text.boot)) } :text
-    .text : { *(.text .text.*) } :text
+    .boot : {
+        KEEP(*(.text.boot))
+        /* The GDT the trampoline loads: physical, for the same reason the code
+         * around it is. */
+        KEEP(*(.rodata.boot))
+    } :boot
 
+    /* Boot-time BSS, addressed physically by the trampoline.
+     * Page tables first and contiguous: boot.s zeroes all three with one
+     * `rep stosl` from __pml4, which is only correct while they abut. */
     . = ALIGN(0x1000);
-    .rodata : { *(.rodata .rodata.*) } :rodata
-
-    . = ALIGN(0x1000);
-    .data : { *(.data .data.*) } :data
-
-    .bss (NOLOAD) : {
-        __bss_start = .;
-        /* Page tables first and contiguous: boot.s zeroes all three with one
-         * `rep stosl` from __pml4, which is only correct while they abut. */
+    .bootbss (NOLOAD) : {
         *(.bss.pagetables)
+        *(.bss.bootstack)
+    } :boot
+
+    . = ALIGN(0x1000);
+    _kernel_phys_body = .;
+
+    /* From here on: high VMA, low LMA. */
+    . += KERNEL_VMA;
+
+    .text ALIGN(0x1000) : AT(ADDR(.text) - KERNEL_VMA) {
+        *(.text .text.*)
+    } :text
+
+    .rodata ALIGN(0x1000) : AT(ADDR(.rodata) - KERNEL_VMA) {
+        *(.rodata .rodata.*)
+    } :rodata
+
+    .data ALIGN(0x1000) : AT(ADDR(.data) - KERNEL_VMA) {
+        *(.data .data.*)
+    } :data
+
+    .bss ALIGN(0x1000) (NOLOAD) : AT(ADDR(.bss) - KERNEL_VMA) {
+        __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
         __bss_end = .;
     } :data
 
-    _kernel_end = .;
+    /* Physical end of the image, for the PMM reservation. `.` is a high VMA
+     * here, so the offset has to come back off. */
+    _kernel_end = . - KERNEL_VMA;
 
     /DISCARD/ : {
         *(.eh_frame)

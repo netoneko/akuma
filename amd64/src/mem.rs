@@ -27,6 +27,7 @@
 use akuma_selftest::Suite;
 
 use crate::hvm::StartInfo;
+use crate::phys::{PHYSMAP_LIMIT, phys_to_virt};
 use crate::serial;
 
 /// Bytes of RAM handed to the heap, taken off the top of the PMM's range.
@@ -36,11 +37,6 @@ use crate::serial;
 /// needs (one bit per 4 KiB frame: 512 MiB of RAM costs 16 KiB of bitmap) while
 /// staying negligible against any plausible guest.
 const HEAP_SIZE: usize = 16 * 1024 * 1024;
-
-/// `boot.s` identity-maps exactly the first 1 GiB. Nothing above it is
-/// addressable yet, so RAM beyond this is not ours to hand out however much of
-/// it the VMM reports.
-const IDENTITY_MAP_LIMIT: u64 = 1 << 30;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -71,7 +67,7 @@ fn pick_region(info: &StartInfo, kernel_end: usize) -> Option<(u64, u64)> {
         let end = r.addr.checked_add(r.size)?;
         if r.addr <= kernel_end as u64 && (kernel_end as u64) < end {
             // Clamp to what boot.s actually mapped.
-            return Some((r.addr, end.min(IDENTITY_MAP_LIMIT)));
+            return Some((r.addr, end.min(PHYSMAP_LIMIT)));
         }
     }
     None
@@ -106,7 +102,25 @@ pub fn init(info: &StartInfo) -> bool {
     serial::put_dec((HEAP_SIZE / 1024 / 1024) as u64);
     serial::puts(" MiB ... ");
 
-    if let Err(e) = akuma_alloc::init(heap_start, HEAP_SIZE) {
+    // Prove the physmap actually reaches the heap before handing it to an
+    // allocator that will write metadata into it. A fault here is diagnosable;
+    // one inside talc is not.
+    {
+        let probe = phys_to_virt(heap_start as u64) as *mut u64;
+        // SAFETY: inside the physmap, which boot.s mapped.
+        unsafe {
+            probe.write_volatile(0x5a5a_5a5a_5a5a_5a5a);
+            if probe.read_volatile() != 0x5a5a_5a5a_5a5a_5a5a {
+                serial::puts("PHYSMAP READBACK FAILED\n");
+                return false;
+            }
+        }
+        serial::puts("physmap ok, ");
+    }
+
+    // The allocator hands out pointers, so it must be given the *virtual*
+    // address of the heap. Everything else here is physical.
+    if let Err(e) = akuma_alloc::init(phys_to_virt(heap_start as u64) as usize, HEAP_SIZE) {
         serial::puts("FAILED: ");
         serial::puts(e);
         serial::puts("\n");

@@ -30,6 +30,7 @@
 //! LAPIC setup, and that is a later stage.
 
 use crate::paging::{self, MemAttr, Prot};
+use crate::phys::phys_ptr;
 use akuma_selftest::Suite;
 
 use crate::serial;
@@ -154,10 +155,10 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
     // the return frame the CPU was rejecting — rip, cs, rflags, rsp, ss — which
     // is the only way to see which selector it actually objected to rather than
     // inferring it from the error code.
-    if frame.rsp != 0 && frame.rsp < (1 << 30) {
+    if frame.rsp != 0 && frame.rsp >= crate::phys::KERNEL_VMA {
         serial::puts("\n  [rsp]=");
         for i in 0..5 {
-            // SAFETY: bounds-checked against the identity map above.
+            // SAFETY: checked to be a kernel-window address above.
             let w = unsafe { (frame.rsp as *const u64).add(i).read_volatile() };
             serial::puts(" 0x");
             serial::put_hex(w);
@@ -214,8 +215,8 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: u64) {
         if let Some(frame_pa) = akuma_pmm::alloc_page() {
             // Zero before mapping: a recycled frame otherwise leaks whatever the
             // previous owner left in it to whoever faults next.
-            // SAFETY: PMM frames are inside the identity map boot.s built.
-            unsafe { core::ptr::write_bytes(frame_pa as *mut u8, 0, 4096) };
+            // SAFETY: a PMM frame, reached through the physmap.
+            unsafe { core::ptr::write_bytes(phys_ptr::<u8>(frame_pa as u64), 0, 4096) };
             if paging::map_page(page as usize, frame_pa as u64, Prot::KERNEL_RW, MemAttr::WriteBack) {
                 DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
                 return;

@@ -31,6 +31,7 @@ use akuma_selftest::Suite;
 
 use crate::gdt;
 use crate::paging::{self, MemAttr, Prot};
+use crate::phys::phys_ptr;
 use crate::serial;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -42,10 +43,15 @@ const IA32_FMASK: u32 = 0xC000_0084;
 /// `EFER.SCE` — without it, `syscall` raises `#UD`.
 const EFER_SCE: u64 = 1 << 0;
 
-/// Where the test's user code and stack live. Above everything else the port
-/// maps, so a mistake cannot silently land on an existing mapping.
-const USER_CODE_VA: usize = 0x5000_0000;
-const USER_STACK_VA: usize = 0x5001_0000;
+/// Where the test's user code and stack live.
+///
+/// `0x40_0000` is where a static Linux x86_64 binary is linked by default, and
+/// since Stage K the kernel no longer occupies the lower half, so a program can
+/// simply be mapped where it expects to be. Before that this had to be
+/// `0x5000_0000` — chosen to dodge the kernel's identity map — which is exactly
+/// the constraint the higher-half move removed.
+const USER_CODE_VA: usize = 0x40_0000;
+const USER_STACK_VA: usize = 0x41_0000;
 
 /// Where a task's kernel stack and saved user stack live.
 ///
@@ -459,9 +465,9 @@ impl Process {
         // address is a valid pointer for staging the program *before* the
         // address space that will hold it is ever activated.
         unsafe {
-            core::ptr::write_bytes(code as *mut u8, 0, 4096);
-            core::ptr::write_bytes(stack as *mut u8, 0, 4096);
-            let page = core::slice::from_raw_parts_mut(code as *mut u8, 4096);
+            core::ptr::write_bytes(phys_ptr::<u8>(code as u64), 0, 4096);
+            core::ptr::write_bytes(phys_ptr::<u8>(stack as u64), 0, 4096);
+            let page = core::slice::from_raw_parts_mut(phys_ptr::<u8>(code as u64), 4096);
             build_user_program(page, USER_CODE_VA as u64, msg, rounds, delay, status);
         }
 

@@ -28,6 +28,7 @@
 
 use crate::idt;
 use crate::paging::{self, MemAttr, Prot};
+use crate::phys::DEVMAP_BASE;
 use crate::port::outb;
 use akuma_selftest::Suite;
 
@@ -65,7 +66,7 @@ const TIMER_DIV_16: u32 = 0b0011;
 /// Ticks observed. Written only by the handler, read by everyone else.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// The mapped LAPIC base, or 0 before [`init`].
+/// The LAPIC's *virtual* base in the device window, or 0 before [`init`].
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
 fn rdmsr(msr: u32) -> u64 {
@@ -156,13 +157,20 @@ pub fn init() -> bool {
     // field as found.
     unsafe { wrmsr(IA32_APIC_BASE, base_msr | APIC_GLOBAL_ENABLE) };
 
-    // Identity-map the register page as device memory. Above the 1 GiB
-    // identity map, so this is a real mapping, and it is what MemAttr exists for.
-    if !paging::map_page(base as usize, base, Prot::KERNEL_RW, MemAttr::Device) {
+    // Map the register page into the *device* window, uncached.
+    //
+    // Not the physmap: that covers the first GiB with 2 MiB writeback pages, and
+    // 0xFEE0_0000 falls inside it — so the LAPIC already has a cached alias
+    // there. Splitting that 2 MiB page to change one 4 KiB entry's cacheability
+    // would work; a second window is simpler and states the intent. Two mappings
+    // of one physical page with different cacheability is the whole reason
+    // `MemAttr` exists.
+    let va = DEVMAP_BASE + base;
+    if !paging::map_page(va as usize, base, Prot::KERNEL_RW, MemAttr::Device) {
         serial::puts("  [FATAL] could not map the LAPIC page\n");
         return false;
     }
-    LAPIC_BASE.store(base, Ordering::Relaxed);
+    LAPIC_BASE.store(va, Ordering::Relaxed);
 
     // Software-enable, and park spurious deliveries on a vector of their own so
     // they are distinguishable from a real one.

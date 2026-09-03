@@ -869,6 +869,60 @@ boot may *ever* create, not the tasks alive at once — it went 4 → 8 when the
 processes had nowhere to go alongside the three scheduler workers. Reuse needs
 the stack freed first, which needs to know nothing still points into it.
 
+## 3.16 Stage J: preemption
+
+```
+  -- userspace output follows (no yields) --
+    [ring3 C] spinning, never yields
+    [ring3 D] spinning, never yields
+    [ring3 C] spinning, never yields
+    ...
+  preempt: timer interleaved two non-yielding processes   [OK]
+  preempt: task switches observed between writes 5      # QEMU
+  preempt: task switches observed between writes 4      # Firecracker, Zen 4
+```
+
+The two processes in this test contain **no `sched_yield`**. They write, then
+spin 8 million iterations in ring 3. The only thing that can take them off the
+CPU is the timer interrupt — which is the difference between Stage I's
+cooperative scheduling and preemption, and why it needed its own test rather
+than a stronger assertion on the existing one.
+
+The switch happens inside `timer_interrupt`, on the interrupted task's own trap
+stack. When that task is scheduled again it returns from `preempt_if_needed`, the
+handler returns, and `iretq` resumes it — in ring 3 or ring 0, wherever it was.
+
+### 3.16.1 The blocker named in §3.15.3, cleared
+
+Per-task TSS `rsp0`. `rsp0` is where the CPU pushes the interrupt frame for a
+ring-3 trap, and **a preempted task is suspended sitting on that frame** — so two
+tasks sharing one `rsp0` would have the second's interrupt overwrite the first's
+saved state, and the first would resume into a frame describing the second.
+Every task now gets its own trap stack, installed by `gdt::set_kernel_stack` on
+each switch.
+
+### 3.16.2 Preemption broke the test that motivated it
+
+The Stage E scheduler test hung. Its workers waited for `need_resched()` before
+yielding — and `preempt_if_needed` now **consumes that flag inside the interrupt
+handler**, so a worker polling for it in ring 0 could never observe it and spun
+out its whole 200-million-iteration budget.
+
+The check was measuring the wrong thing to begin with: it inferred "the tick
+drives scheduling" from a flag that two parties race for. It now calls
+`sched::preemptions()`, which counts switches made from the interrupt handler —
+the thing itself rather than a proxy for it.
+
+### 3.16.3 Why the assertion is `>= 1`
+
+How often the timer lands inside a spin depends on the tick period against the
+delay loop, and those differ by roughly 17x between QEMU and real silicon
+(§3.9). QEMU produced 5 switches, the Ryzen 4. Asserting an exact count would be
+asserting on the host's speed; the count is reported as a `note` instead.
+
+The delay is sized for the slower-to-tick of the two — the Ryzen, at roughly 2.1M
+spins per tick.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at

@@ -71,18 +71,39 @@ _start:
      * entry a silent triple-fault instead of a visible bug. */
     movl $__pml4, %edi
     xorl %eax, %eax
-    movl $(3 * 4096 / 4), %ecx
+    movl $(5 * 4096 / 4), %ecx
     rep stosl
 
-    /* PML4[0] -> PDPT, present + writable */
-    movl $__pdpt, %eax
+    /* PML4[0] -> the low PDPT: the identity map the trampoline runs on, and
+     * which stays live until the kernel has switched to high addresses. */
+    movl $__pdpt_low, %eax
     orl  $0x03, %eax
     movl %eax, __pml4
 
-    /* PDPT[0] -> PD, present + writable */
+    /* PML4[256] -> the high PDPT: the physmap window at 0xFFFF_8000_0000_0000,
+     * where the kernel image is linked and through which the kernel reaches any
+     * physical page. Slot 256 is the first of the upper half; entry size is 8,
+     * so the byte offset is 256*8 = 2048. */
+    movl $__pdpt_high, %eax
+    orl  $0x03, %eax
+    movl %eax, __pml4 + 2048
+
+    /* PML4[511] -> the kernel PDPT: the top -2 GiB, where the image is linked.
+     * Slot 511 is at byte offset 511*8 = 4088. */
+    movl $__pdpt_kern, %eax
+    orl  $0x03, %eax
+    movl %eax, __pml4 + 4088
+
+    /* All three PDPTs point at the SAME page directory. The identity map and the
+     * physmap describe identical memory, so sharing the PD costs one frame less
+     * and makes it impossible for the two views to disagree. */
     movl $__pd, %eax
     orl  $0x03, %eax
-    movl %eax, __pdpt
+    movl %eax, __pdpt_low
+    movl %eax, __pdpt_high
+    /* 0xFFFFFFFF80000000 falls in PDPT slot 510 (byte offset 510*8 = 4080), so
+     * that is where the kernel image's first GiB is described. */
+    movl %eax, __pdpt_kern + 4080
 
     /* PD[i] = (i * 2 MiB) | present | writable | PS  -> identity-map 1 GiB.
      * 2 MiB pages rather than a single 1 GiB PDPT entry on purpose: 1 GiB
@@ -149,6 +170,22 @@ long_mode_start:
     movq $__boot_stack_top, %rsp
     xorq %rbp, %rbp
 
+    /* Still executing from the low identity map. Jump to the kernel's linked
+     * (high) address: an absolute indirect jump, because a direct `jmp` encodes
+     * a 32-bit displacement and the target is 2^47 away. */
+    movabsq $high_entry, %rax
+    jmpq *%rax
+
+    .section .text
+high_entry:
+    /* Now running from the top -2 GiB. Rebase the stack into the physmap: it
+     * aliases the identity map, so this points at the very bytes the trampoline
+     * was already using — no copy, no discontinuity. The stack cannot stay at
+     * its identity address, because that mapping is what gets dropped to hand
+     * the lower half to userspace. */
+    movabsq $0xFFFF800000000000, %rax
+    addq %rax, %rsp
+
     /* System V: first argument in %rdi. %esi still holds the hvm_start_info
      * pointer; the 32-bit move zero-extends, which is what we want — the PVH
      * ABI defines it as a 32-bit physical address. */
@@ -162,7 +199,11 @@ long_mode_start:
     jmp 2b
 
 /* ---- descriptors -------------------------------------------------------- */
-.section .rodata
+/* In the low boot region, not the kernel's .rodata: `lgdt` runs in the 32-bit
+ * trampoline with paging off, so the descriptor table must be reachable at its
+ * physical address. Left in .rodata it linked to a high VMA and the relocation
+ * would not fit — "R_X86_64_32 out of range ... references section '.rodata'". */
+.section .rodata.boot, "a"
 .align 16
 __gdt64:
     .quad 0                          /* null descriptor */
@@ -181,11 +222,15 @@ __gdt64_ptr:
 /* ---- boot page tables and stack ----------------------------------------- */
 .section .bss.pagetables, "aw", @nobits
 .align 4096
-__pml4: .skip 4096
-__pdpt: .skip 4096
-__pd:   .skip 4096
+__pml4:      .skip 4096
+__pdpt_low:  .skip 4096
+__pd:        .skip 4096
+__pdpt_high: .skip 4096
+__pdpt_kern: .skip 4096
 
-.section .bss, "aw", @nobits
+/* The boot stack is addressed physically by the 32-bit trampoline, so it lives
+ * in .bootbss beside the page tables rather than in the high .bss. */
+.section .bss.bootstack, "aw", @nobits
 .align 16
 __boot_stack:
     .skip 64 * 1024
