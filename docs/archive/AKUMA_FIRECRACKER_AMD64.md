@@ -923,6 +923,91 @@ asserting on the host's speed; the count is reported as a `note` instead.
 The delay is sized for the slower-to-tick of the two — the Ryzen, at roughly 2.1M
 spins per tick.
 
+## 3.17 Stage K: the higher-half kernel
+
+The kernel no longer lives in the lower half. The address space is now:
+
+```text
+  0x0000_0000_0000_0000 .. 0x0000_7FFF_FFFF_FFFF   userspace   (PML4 0..255)
+  0xFFFF_8000_0000_0000 + pa                       physmap     (PML4 256)
+  0xFFFF_8080_0000_0000 + pa                       device MMIO (PML4 257)
+  0xFFFF_FFFF_8000_0000 + pa                       kernel image(PML4 511)
+```
+
+The payoff is immediate and concrete: `USER_CODE_VA` moved from `0x5000_0000` —
+a value picked to *dodge* the kernel's identity map — to **`0x40_0000`**, which
+is where a static Linux x86_64 binary is linked. An ELF loader stops being
+artificial the moment a program can be mapped where it expects to be.
+
+An address space now shares three PML4 slots with the kernel instead of two PDPT
+slots, so the entire lower half is the process's.
+
+### 3.17.1 Two windows onto the same memory, on purpose
+
+The physmap maps RAM with 2 MiB writeback pages. The LAPIC at `0xFEE0_0000` is
+inside the first GiB, so it already *has* a cached alias there. Rather than split
+that 2 MiB page, device registers get a second window mapped 4 KiB at a time with
+`MemAttr::Device`. Two mappings of one physical page with different cacheability
+is exactly what that type was added for in §3.9.1.
+
+### 3.17.2 Three failures, each a different layer
+
+The move took three debugging rounds, and none of them was a paging bug.
+
+**1. Code model.** The link failed with `relocation R_X86_64_32S out of range`
+pointing at ordinary statics. The default `small` code model cannot express a
+2^47 displacement. `-C code-model=kernel` is built for the top -2 GiB, which is
+why the kernel image is linked at `0xFFFF_FFFF_8000_0000` and the physmap is a
+*separate* window — a kernel-model image cannot be linked into slot 256's range.
+
+**2. The GDT was in the lower half.** After dropping the identity map, the kernel
+triple-faulted inside the heap allocator. QEMU's `-d int` gave the shape:
+
+```
+check_exception old: 0xffffffff new 0xe    # a page fault
+check_exception old: 0xe        new 0xe    # ...whose delivery also faulted
+check_exception old: 0x8        new 0xe    # #DF, delivery faulted again
+Triple fault
+```
+
+`CR2` pointed at `0x2010d8` — the GDT `boot.s` builds in the low boot region,
+because the 32-bit trampoline must reach it with paging off. **The CPU reads the
+GDT on every exception delivery**, loading CS from the IDT entry's selector, so
+unmapping it makes every fault a triple fault. `gdt::init` rebuilds the table in
+the kernel's high `.bss`; it now runs *before* `drop_identity_map` rather than
+just before ring 3.
+
+**3. An unplaced output section.** With the GDT fixed, the fault became
+reportable, and said:
+
+```
+[EXCEPTION] #PF  rip=0xffffffff8021876d  cr2=0x0000000000217010
+callq *0x7fffe89d(%rip)   # 0x217010 <__boot_stack_top>
+```
+
+An indirect call through a GOT slot — a `memset` inside the allocator. The
+linker script never named `.got`, so lld placed it wherever it liked: **on top of
+`__boot_stack_top`** in the low boot region. `relocation-model=static` removes
+most GOT use but not all of it, so the section exists even though it is nearly
+empty. Naming `.got`/`.plt` explicitly puts them in the high image.
+
+The general lesson is the third one: a section a linker script does not mention
+is still emitted, and where it lands is not the script author's decision.
+
+### 3.17.3 The IDT moved earlier, and stayed there
+
+Failure 2 was invisible because the IDT was installed *after* the memory
+subsystem — so a fault during memory bring-up had no handler. `idt::init` needs
+nothing but its own static table, so it now runs before `mem::init`. Failure 3
+was diagnosed in a single run because of that change.
+
+### 3.17.4 What still uses the lower half
+
+The kernel's own test VAs (1 GiB for `paging::smoke_test`, 2 GiB for demand
+paging) are in PML4 slot 0 of the *kernel's* space. That is not a conflict —
+each process has its own slot 0 — but it does mean the kernel is still willing to
+map low addresses for itself. A stricter split would refuse.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at

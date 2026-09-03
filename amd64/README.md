@@ -6,8 +6,9 @@ physical frame allocator, maps/unmaps 4 KiB pages, services page faults with
 tasks across separate stacks, and enters **ring 3** with a working
 `syscall`/`sysret` path, where userspace calls **real Linux x86_64 syscalls**
 (`write`, `exit_group`, `sched_yield`) from **isolated per-process address
-spaces**, and **preemptively multitasks** between them. No loader, no device
-interrupts, no higher-half kernel.
+spaces**, and **preemptively multitasks** between them. The kernel runs in the
+**upper half**, so user programs are mapped at `0x40_0000` where a static Linux
+binary is linked. No loader, no device interrupts.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1**.
 
