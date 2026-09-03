@@ -151,6 +151,53 @@ impl StartInfo {
         }
     }
 
+    /// Copy the boot command line into `buf`, returning it as a `str`.
+    ///
+    /// The command line is where a PVH machine describes devices it has no other
+    /// way to announce. Firecracker and QEMU `microvm` both present virtio as
+    /// **MMIO** — there is no PCI bus to enumerate and, on this machine, no DTB
+    /// to read — so the transport's address, size and interrupt arrive as
+    /// `virtio_mmio.device=4K@0xd0000000:5` tokens here and nowhere else.
+    ///
+    /// That makes this the amd64 analogue of the FDT `/soc/virtio_mmio@...`
+    /// nodes `akuma-fdt` walks, and the second consumer of the seam
+    /// `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §2 named.
+    ///
+    /// Bounded and copied rather than borrowed: the bytes live in VMM-written
+    /// physical memory that nothing stops from being reused, and a `&str`
+    /// pointing into the physmap would be a borrow of memory this kernel does
+    /// not own. Truncation is silent by design — a caller wanting to know should
+    /// compare the returned length against its buffer.
+    ///
+    /// Returns `None` if there is no command line, if it is not readable, or if
+    /// it is not UTF-8. Invalid UTF-8 is a refusal rather than a lossy decode:
+    /// every consumer here is matching ASCII tokens, and a replacement character
+    /// in the middle of an address is worse than no address.
+    ///
+    /// # Safety
+    /// Reads the string this block points at; see the module note on physical
+    /// reads.
+    pub unsafe fn read_cmdline<'a>(&self, buf: &'a mut [u8]) -> Option<&'a str> {
+        if self.cmdline_paddr == 0 || buf.is_empty() {
+            return None;
+        }
+        let mut len = 0;
+        while len < buf.len() {
+            let pa = self.cmdline_paddr.checked_add(len as u64)?;
+            // SAFETY: bounds-checked against the physmap inside.
+            let byte = unsafe { read_phys::<1>(pa)? }[0];
+            if byte == 0 {
+                break;
+            }
+            buf[len] = byte;
+            len += 1;
+        }
+        if len == 0 {
+            return None;
+        }
+        core::str::from_utf8(&buf[..len]).ok()
+    }
+
     /// One memory-map entry, or `None` if out of range or unreadable.
     ///
     /// # Safety

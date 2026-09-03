@@ -14,12 +14,28 @@
 //!
 //! # Why devices need a second window
 //!
-//! The physmap maps RAM with 2 MiB pages, writeback-cached — which is right for
-//! RAM and wrong for MMIO. The LAPIC sits at `0xFEE0_0000`, inside the first
-//! GiB, so it is *already* covered by the physmap at a cached address. Rather
-//! than split that 2 MiB page, device registers get their own window mapped 4 KiB
-//! at a time with [`crate::paging::MemAttr::Device`]. Two windows onto the same
-//! physical address, with different cacheability, is the point.
+//! **Corrected 2026-09-04.** This note used to say the LAPIC at `0xFEE0_0000`
+//! was "inside the first GiB", already covered by the physmap at a cached
+//! address, and that the device window existed to avoid splitting a 2 MiB page.
+//! That arithmetic is wrong twice over: `0xFEE0_0000` is **3.98 GiB**, and
+//! [`PHYSMAP_LIMIT`] is 1 GiB — so the physmap does not reach the LAPIC at all,
+//! and no cached alias of it has ever existed. QEMU `microvm` puts virtio-MMIO
+//! at `0xFEB0_0000`, in the same hole, for the same reason: this is the standard
+//! x86 MMIO region just below 4 GiB, which is deliberately *not* RAM.
+//!
+//! The real reasons for a second window are both still good, and neither is the
+//! one that was written down:
+//!
+//! 1. **Reach.** The physmap covers only what `boot.s` maps — one page directory,
+//!    512 x 2 MiB, the first GiB. Device MMIO is above it, so it needs a mapping
+//!    the physmap does not provide.
+//! 2. **Cacheability.** RAM is writeback; MMIO must be uncached, or the CPU can
+//!    satisfy a register read from cache and never issue the access. That is what
+//!    [`crate::paging::MemAttr`] is for, and it is the half that would still
+//!    matter if the physmap were ever grown past 4 GiB — at which point the
+//!    "two windows onto one physical page" story becomes true rather than
+//!    aspirational, and the physmap would have to skip the MMIO hole or leave a
+//!    cached alias of every device register in place.
 
 /// Base of the physmap window (PML4 slot 256).
 pub const PHYSMAP_BASE: u64 = 0xFFFF_8000_0000_0000;

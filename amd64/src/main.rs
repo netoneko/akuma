@@ -124,6 +124,20 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     serial::put_hex(info.cmdline_paddr);
     serial::puts("\n");
 
+    // The command line, which on a PVH machine is where virtio-MMIO devices are
+    // announced — there is no PCI bus and no DTB. 512 bytes is a bound rather
+    // than a guess: Firecracker's own limit is 4096, but everything this kernel
+    // reads from it sits at the front, and a fixed stack buffer keeps the read
+    // allocation-free on a path that runs before the heap is proven.
+    let mut cmdline_buf = [0u8; 512];
+    // SAFETY: `cmdline_paddr` came from the handoff block; every byte read is
+    // bounds-checked against the physmap.
+    if let Some(cmdline) = unsafe { info.read_cmdline(&mut cmdline_buf) } {
+        serial::puts("  cmdline: \"");
+        serial::puts(cmdline);
+        serial::puts("\"\n");
+    }
+
     serial::puts("  memmap: ");
     serial::put_dec(u64::from(info.memmap_entries));
     serial::puts(" entries\n");

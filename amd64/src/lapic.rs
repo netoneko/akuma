@@ -159,12 +159,15 @@ pub fn init() -> bool {
 
     // Map the register page into the *device* window, uncached.
     //
-    // Not the physmap: that covers the first GiB with 2 MiB writeback pages, and
-    // 0xFEE0_0000 falls inside it — so the LAPIC already has a cached alias
-    // there. Splitting that 2 MiB page to change one 4 KiB entry's cacheability
-    // would work; a second window is simpler and states the intent. Two mappings
-    // of one physical page with different cacheability is the whole reason
-    // `MemAttr` exists.
+    // Not the physmap, and not because of cacheability alone: 0xFEE0_0000 is at
+    // 3.98 GiB and the physmap stops at 1 GiB (`PHYSMAP_LIMIT`), so it does not
+    // reach the LAPIC at all — `phys_to_virt` would assert rather than return a
+    // cached alias. This comment claimed the opposite until 2026-09-04; see
+    // `crate::phys`.
+    //
+    // `MemAttr::Device` is still load-bearing on its own terms: a writeback
+    // mapping of a register page lets the CPU satisfy a read from cache and
+    // never issue the access.
     let va = DEVMAP_BASE + base;
     if !paging::map_page(va as usize, base, Prot::KERNEL_RW, MemAttr::Device) {
         serial::puts("  [FATAL] could not map the LAPIC page\n");

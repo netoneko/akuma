@@ -942,13 +942,28 @@ artificial the moment a program can be mapped where it expects to be.
 An address space now shares three PML4 slots with the kernel instead of two PDPT
 slots, so the entire lower half is the process's.
 
-### 3.17.1 Two windows onto the same memory, on purpose
+### 3.17.1 A second window for devices
 
-The physmap maps RAM with 2 MiB writeback pages. The LAPIC at `0xFEE0_0000` is
-inside the first GiB, so it already *has* a cached alias there. Rather than split
-that 2 MiB page, device registers get a second window mapped 4 KiB at a time with
-`MemAttr::Device`. Two mappings of one physical page with different cacheability
-is exactly what that type was added for in §3.9.1.
+**Corrected 2026-09-04.** This section originally said the LAPIC at
+`0xFEE0_0000` was inside the first GiB and therefore already had a cached alias
+in the physmap, and that the device window existed to avoid splitting a 2 MiB
+page. `0xFEE0_0000` is **3.98 GiB** and `PHYSMAP_LIMIT` is 1 GiB, so that alias
+never existed — `phys_to_virt` would assert on it. The error survived because
+nothing depended on the claim: the code maps `DEVMAP_BASE + pa` directly and
+never asks the physmap for a device address.
+
+It is worth correcting rather than deleting because it would mislead in a
+specific way — a reader could "simplify" by dropping the device window on the
+belief that the physmap already covers MMIO, and the failure would be a panic in
+`phys_to_virt` at best and an uncached-vs-writeback bug at worst.
+
+The two real reasons: the physmap covers only the first GiB (one page directory,
+512 x 2 MiB, all `boot.s` builds), and MMIO must be uncached or the CPU can
+satisfy a register read from cache without issuing the access. The second is what
+`MemAttr` was added for in §3.9.1 and is unaffected.
+
+The MMIO hole just below 4 GiB is where x86 puts devices generally, not just the
+LAPIC: QEMU `microvm` lands virtio-MMIO at `0xFEB0_0000`, measured (§3.19).
 
 ### 3.17.2 Three failures, each a different layer
 

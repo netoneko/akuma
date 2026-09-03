@@ -24,6 +24,15 @@ FC_DIR="${FC_DIR:-akuma}"        # relative to the remote $HOME
 MEMORY="${MEMORY:-512}"
 VCPUS="${VCPUS:-1}"
 TIMEOUT="${TIMEOUT:-20}"
+# DISK=<local path> attaches it as the guest's first virtio-blk drive.
+#
+# Firecracker has no PCI bus and passes no device tree, so a drive is announced
+# to the guest exactly one way: Firecracker appends a
+# `virtio_mmio.device=<size>@<base>:<irq>` token to the kernel command line,
+# which arrives through `hvm_start_info.cmdline_paddr`. Attaching a drive is
+# therefore also what makes that token appear — with `"drives": []` the command
+# line is empty and there is nothing to discover.
+DISK="${DISK:-}"
 KERNEL=target/x86_64-unknown-none/release/akuma-amd64
 
 SSH="ssh -o StrictHostKeyChecking=no -i $FC_KEY"
@@ -32,6 +41,14 @@ cargo build -p akuma-amd64 --target x86_64-unknown-none --release
 
 $SSH "$FC_HOST" "mkdir -p ~/$FC_DIR"
 scp -q -o StrictHostKeyChecking=no -i "$FC_KEY" "$KERNEL" "$FC_HOST:$FC_DIR/akuma-amd64"
+
+# The drives array, built here so the JSON below stays a fixed template.
+DRIVES_JSON="[]"
+if [ -n "$DISK" ]; then
+    [ -f "$DISK" ] || { echo "DISK=$DISK does not exist" >&2; exit 1; }
+    scp -q -o StrictHostKeyChecking=no -i "$FC_KEY" "$DISK" "$FC_HOST:$FC_DIR/disk.img"
+    DRIVES_JSON='[{"drive_id":"rootfs","path_on_host":"DISK_PATH","is_root_device":false,"is_read_only":false}]'
+fi
 
 # Stage the config and a standalone launcher, then run it. The launcher is
 # written here rather than kept only on the host so the two cannot drift.
@@ -48,12 +65,13 @@ cd ~/$FC_DIR
 cat > akuma-vm.json <<'EOJSON'
 {
   "boot-source": { "kernel_image_path": "KERNEL_PATH", "boot_args": "" },
-  "drives": [],
+  "drives": $DRIVES_JSON,
   "network-interfaces": [],
   "machine-config": { "vcpu_count": $VCPUS, "mem_size_mib": $MEMORY }
 }
 EOJSON
 sed -i "s|KERNEL_PATH|\$HOME/$FC_DIR/akuma-amd64|" akuma-vm.json
+sed -i "s|DISK_PATH|\$HOME/$FC_DIR/disk.img|" akuma-vm.json
 
 cat > run.sh <<'EORUN'
 #!/bin/sh
