@@ -36,6 +36,7 @@ default-members = [
     "crates/akuma-locks-rw-cell",
     "crates/akuma-primitives",
     "crates/akuma-rump",
+    "crates/akuma-ryzen-amd64",
     "crates/akuma-scheduler",
     "crates/akuma-selftest",
     "crates/akuma-slot-table",

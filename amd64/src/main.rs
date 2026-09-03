@@ -42,21 +42,17 @@ compile_error!(
 );
 
 #[cfg(target_arch = "x86_64")]
-mod acpi;
-#[cfg(target_arch = "x86_64")]
 mod blk;
-#[cfg(target_arch = "x86_64")]
-mod cmdline;
 #[cfg(target_arch = "x86_64")]
 mod gdt;
 #[cfg(target_arch = "x86_64")]
 mod usermode;
 #[cfg(target_arch = "x86_64")]
-mod hvm;
-#[cfg(target_arch = "x86_64")]
 mod idt;
 #[cfg(target_arch = "x86_64")]
 mod lapic;
+#[cfg(target_arch = "x86_64")]
+mod machine;
 #[cfg(target_arch = "x86_64")]
 mod loader;
 #[cfg(target_arch = "x86_64")]
@@ -113,62 +109,6 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     serial::put_hex(hvm_start_info);
     serial::puts("\n");
 
-    // SAFETY: this is the value the PVH entry ABI delivered in %ebx; every read
-    // inside is bounds-checked against the identity map.
-    let Some(info) = (unsafe { hvm::StartInfo::read(hvm_start_info) }) else {
-        serial::puts("  [FATAL] bad or missing hvm_start_info magic\n");
-        halt();
-    };
-
-    serial::puts("  version=");
-    serial::put_dec(u64::from(info.version));
-    serial::puts(" modules=");
-    serial::put_dec(u64::from(info.nr_modules));
-    serial::puts(" rsdp=0x");
-    serial::put_hex(info.rsdp_paddr);
-    serial::puts(" cmdline=0x");
-    serial::put_hex(info.cmdline_paddr);
-    serial::puts("\n");
-
-    // The command line, which on a PVH machine is where virtio-MMIO devices are
-    // announced — there is no PCI bus and no DTB. 512 bytes is a bound rather
-    // than a guess: Firecracker's own limit is 4096, but everything this kernel
-    // reads from it sits at the front, and a fixed stack buffer keeps the read
-    // allocation-free on a path that runs before the heap is proven.
-    let mut cmdline_buf = [0u8; 512];
-    // SAFETY: `cmdline_paddr` came from the handoff block; every byte read is
-    // bounds-checked against the physmap.
-    let cmdline = unsafe { info.read_cmdline(&mut cmdline_buf) };
-    if let Some(cmdline) = cmdline {
-        serial::puts("  cmdline: \"");
-        serial::puts(cmdline);
-        serial::puts("\"\n");
-    }
-    let mmio_devices = cmdline.map_or_else(cmdline::MmioDevices::new, cmdline::parse_virtio_mmio);
-
-    serial::puts("  memmap: ");
-    serial::put_dec(u64::from(info.memmap_entries));
-    serial::puts(" entries\n");
-
-    let mut usable = 0u64;
-    for i in 0..info.memmap_entries {
-        // SAFETY: index is bounds-checked and every field read is range-checked.
-        let Some(r) = (unsafe { info.memmap_entry(i) }) else {
-            serial::puts("    [unreadable entry]\n");
-            continue;
-        };
-        serial::puts("    0x");
-        serial::put_hex(r.addr);
-        serial::puts(" + 0x");
-        serial::put_hex(r.size);
-        serial::puts("  ");
-        serial::puts(r.kind_str());
-        serial::puts("\n");
-        if r.is_ram() {
-            usable += r.size;
-        }
-    }
-
     // Descriptor tables first, and the ORDER HERE IS LOAD-BEARING.
     //
     // `boot.s` builds its GDT in the low boot region, because the 32-bit
@@ -196,11 +136,14 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // userspace.
     paging::drop_identity_map();
 
-    serial::puts("  usable RAM: ");
-    serial::put_dec(usable / 1024 / 1024);
-    serial::puts(" MiB\n");
+    // Read the machine's description of itself. After `drop_identity_map`
+    // because every read goes through the physmap, and after `idt::init` because
+    // a VMM-supplied pointer that escapes the bounds check should fault
+    // reportably rather than triple-fault.
+    let machine = machine::describe(hvm_start_info);
+    machine::report(&machine);
 
-    if !mem::init(&info) {
+    if !mem::init(&machine) {
         serial::puts("\nAkuma/amd64 — memory bring-up FAILED\n");
         halt();
     }
@@ -212,21 +155,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // and a driver that goes quiet.
     akuma_primitives::console::set_print_hook(serial::puts);
 
-    // What the machine says about itself, printed rather than acted on. This is
-    // the amd64 equivalent of dumping an FDT, and there is no FDT: the pieces
-    // are the E820 map above, the command line above, and — if the machine has
-    // any — the ACPI tables found by scanning for them, because `rsdp_paddr`
-    // reads 0 on both VMMs.
-    describe_machine();
-
     // Block devices, after the heap (the virtio HAL allocates DMA buffers from
     // it) and after the IDT (a bad transport address should fault reportably).
-    let have_disk = blk::init(&mmio_devices);
+    let have_disk = blk::init(&machine.virtio);
 
     let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
 
     mem::smoke_test(&mut t);
-    cmdline::smoke_test(&mut t);
     paging::smoke_test(&mut t);
     // The IDT is already loaded (before mem::init, so faults there are
     // visible). Demand paging is what needs the PMM, and that is only exercised
@@ -263,50 +198,6 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     }
 
     halt();
-}
-
-/// Print the machine's ACPI inventory, or say there is none.
-///
-/// A dump, not a configuration step: nothing in this kernel consumes ACPI yet.
-/// It exists because the answer decides whether device interrupts are reachable
-/// at all on this machine — the IOAPIC's address lives in the MADT — and that is
-/// worth knowing before a stage is planned around it rather than during one.
-#[cfg(target_arch = "x86_64")]
-fn describe_machine() {
-    let Some(rsdp) = acpi::find_rsdp() else {
-        serial::puts("  acpi: none found (no RSDP in the EBDA or the BIOS window)\n");
-        return;
-    };
-    serial::puts("  acpi: RSDP at 0x");
-    serial::put_hex(rsdp.addr);
-    serial::puts(" rev=");
-    serial::put_dec(u64::from(rsdp.revision));
-    serial::puts(" oem=");
-    // The OEM id is six bytes of ASCII with no NUL; print it as such.
-    for b in rsdp.oem {
-        let c = if b.is_ascii_graphic() || b == b' ' { b } else { b'?' };
-        serial::putb(c);
-    }
-    serial::puts(" rsdt=0x");
-    serial::put_hex(u64::from(rsdp.rsdt));
-    serial::puts(" xsdt=0x");
-    serial::put_hex(rsdp.xsdt);
-    serial::puts("\n  acpi: tables:");
-    acpi::for_each_table(&rsdp, |t| {
-        serial::puts(" ");
-        for b in t.signature {
-            let c = if b.is_ascii_graphic() { b } else { b'?' };
-            serial::putb(c);
-        }
-        // Address and length, not just the signature: a dump that names tables
-        // without saying where they are cannot be checked against a guest's
-        // `/sys/firmware/acpi/tables/`, which is the cross-check this exists for.
-        serial::puts("@0x");
-        serial::put_hex(t.addr);
-        serial::puts("+");
-        serial::put_dec(u64::from(t.length));
-    });
-    serial::puts("\n");
 }
 
 /// Park the core forever with interrupts masked.

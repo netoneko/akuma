@@ -26,7 +26,7 @@
 
 use akuma_selftest::Suite;
 
-use crate::hvm::StartInfo;
+use akuma_ryzen_amd64::MachineDescription;
 use crate::phys::{PHYSMAP_LIMIT, phys_to_virt};
 use crate::serial;
 
@@ -49,35 +49,24 @@ const fn align_up(v: usize, to: usize) -> usize {
     v.div_ceil(to) * to
 }
 
-/// Pick the RAM region the kernel was loaded into.
-///
-/// Chosen by *containment*, not by size. The largest usable region is very
-/// nearly always the right one, but "the region holding the kernel" is the one
-/// that is right by construction — picking any other would hand the PMM frames
-/// while the kernel image sits somewhere it has never heard of.
-fn pick_region(info: &StartInfo, kernel_end: usize) -> Option<(u64, u64)> {
-    for i in 0..info.memmap_entries {
-        // SAFETY: index and fields are bounds-checked inside.
-        let Some(r) = (unsafe { info.memmap_entry(i) }) else {
-            continue;
-        };
-        if !r.is_ram() {
-            continue;
-        }
-        let end = r.addr.checked_add(r.size)?;
-        if r.addr <= kernel_end as u64 && (kernel_end as u64) < end {
-            // Clamp to what boot.s actually mapped.
-            return Some((r.addr, end.min(PHYSMAP_LIMIT)));
-        }
-    }
-    None
-}
-
 /// Bring up heap then PMM. Returns false if the machine described no usable RAM.
-pub fn init(info: &StartInfo) -> bool {
+///
+/// The region is chosen by **containment** — `region_containing`, in
+/// `akuma-ryzen-amd64` and host-tested there. The largest usable region is very
+/// nearly always the right one, but "the region holding the kernel" is right by
+/// construction: picking any other would hand the PMM frames while the kernel
+/// image sits somewhere it has never heard of.
+pub fn init(machine: &MachineDescription) -> bool {
     let kernel_end = core::ptr::addr_of!(_kernel_end) as usize;
 
-    let Some((ram_base, ram_end)) = pick_region(info, kernel_end) else {
+    // Clamped to what `boot.s` actually mapped: the physmap covers the first
+    // GiB, and a PMM told about memory past it would hand out frames the kernel
+    // cannot reach.
+    let region = machine
+        .region_containing(kernel_end as u64)
+        .map(|r| (r.addr, r.end().min(PHYSMAP_LIMIT)));
+
+    let Some((ram_base, ram_end)) = region else {
         serial::puts("  [FATAL] no RAM region contains the kernel image\n");
         return false;
     };

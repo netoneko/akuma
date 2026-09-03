@@ -42,7 +42,7 @@
 
 use akuma_selftest::Suite;
 
-use crate::cmdline::MmioDevices;
+use akuma_ryzen_amd64::MmioDevices;
 use crate::paging::{self, MemAttr, Prot};
 use crate::phys::DEVMAP_BASE;
 use crate::serial;
@@ -90,24 +90,19 @@ pub fn init(devices: &MmioDevices) -> bool {
         }
     }
 
-    // The drivers address slots as `base + i * stride`, so a machine whose
-    // devices are not evenly spaced cannot be described that way. Both machines
-    // *are* — Firecracker 0x1000 apart, microvm 0x200 — but that is measured,
-    // not guaranteed, so it is checked. Falling back to one slot loses the extra
-    // devices and keeps the first; believing a stride that does not hold would
-    // point slot 1 at nothing and hand `VirtIOBlk::new` a page of zeroes.
-    let stride = first.len;
-    let contiguous = devs
-        .iter()
-        .enumerate()
-        .all(|(i, d)| d.base == first.base + (i as u64) * stride && d.len == stride);
-    let slots = if contiguous { devs.len() } else { 1 };
-    if !contiguous {
+    // Slot geometry: `base + i * stride`. The evenly-spaced check lives in
+    // `akuma-ryzen-amd64`, where it is host-tested — believing a stride that does
+    // not hold would point slot 1 at nothing and hand `VirtIOBlk::new` a page of
+    // zeroes.
+    let Some((base, stride, slots)) = devices.geometry() else {
+        return false;
+    };
+    if slots < devs.len() {
         serial::puts("  [blk] transports are not evenly spaced; using the first only\n");
     }
 
     akuma_primitives::addr::set_virtio_window(
-        (DEVMAP_BASE + first.base) as usize,
+        (DEVMAP_BASE + base) as usize,
         stride as usize,
         slots,
     );
@@ -115,7 +110,7 @@ pub fn init(devices: &MmioDevices) -> bool {
     serial::puts("  blk:  ");
     serial::put_dec(slots as u64);
     serial::puts(" virtio slot(s) at pa 0x");
-    serial::put_hex(first.base);
+    serial::put_hex(base);
     serial::puts(" stride 0x");
     serial::put_hex(stride);
     serial::puts(" irq ");

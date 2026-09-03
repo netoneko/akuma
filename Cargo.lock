@@ -70,6 +70,7 @@ dependencies = [
  "akuma-alloc",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-ryzen-amd64",
  "akuma-selftest",
  "akuma-syscalls-abi",
  "akuma-virtio",
@@ -400,6 +401,10 @@ version = "0.1.0"
 
 [[package]]
 name = "akuma-rump"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-ryzen-amd64"
 version = "0.1.0"
 
 [[package]]
