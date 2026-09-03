@@ -69,6 +69,7 @@ version = "0.1.0"
 dependencies = [
  "akuma-alloc",
  "akuma-pmm",
+ "akuma-syscalls-abi",
 ]
 
 [[package]]
@@ -414,6 +415,13 @@ dependencies = [
 
 [[package]]
 name = "akuma-syscalls"
+version = "0.1.0"
+dependencies = [
+ "akuma-syscalls-linux",
+]
+
+[[package]]
+name = "akuma-syscalls-abi"
 version = "0.1.0"
 dependencies = [
  "akuma-syscalls-linux",

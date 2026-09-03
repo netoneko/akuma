@@ -4,7 +4,9 @@ x86_64 bring-up target. Boots to long mode, brings up the kernel heap and the
 physical frame allocator, maps/unmaps 4 KiB pages, services page faults with
 **demand paging**, takes **LAPIC timer interrupts**, and round-robin schedules
 tasks across separate stacks, and enters **ring 3** with a working
-`syscall`/`sysret` path. No loader, no preemption, no device interrupts.
+`syscall`/`sysret` path, where userspace calls **real Linux x86_64 syscalls**
+(`write`, `exit_group`). No loader, no preemption, no device interrupts, no
+per-process address space.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1**.
 
@@ -34,7 +36,9 @@ Akuma/amd64 — long mode reached
   test: timer interrupts 5 ticks in 62080 spins   [OK]
   test: scheduler 3 tasks x 4 rounds, 5 switches, ticks=17   [OK]
   test: tick-driven resched observed   [OK]
-  test: ring 3 entered, 2 syscalls, arg=0x1234 status=0x2468   [OK]
+  test: ring 3 — userspace output follows
+    [ring3] hello from userspace via write(2)
+  test: ring 3 97-byte program, 2 syscalls, wrote 46 bytes, exit_group(0)   [OK]
 
 Akuma/amd64 — memory subsystem up
 ```

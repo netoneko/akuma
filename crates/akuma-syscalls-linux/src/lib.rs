@@ -77,7 +77,6 @@ pub mod flags;
 pub mod io;
 pub mod net;
 pub mod nr;
-pub mod syscall;
 pub mod proc;
 pub mod signal;
 pub mod stat;

@@ -1,0 +1,13 @@
+[package]
+name = "akuma-syscalls-abi"
+version = "0.1.0"
+edition = "2024"
+description = "Which syscall a number means, on which architecture: the neutral Syscall name plus the per-arch Linux number tables"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The asm-generic (aarch64) table. This crate deliberately does NOT copy those
+# numbers — it reads them, so the two can never drift.
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }

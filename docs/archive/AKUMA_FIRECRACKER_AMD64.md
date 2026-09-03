@@ -600,6 +600,86 @@ The kernel entries are byte-identical to the ones `boot.s` installed, deliberate
 `CS` stays valid across the `lgdt`, so no far return is needed and the only
 reload is `ltr`.
 
+## 3.12 Stage G: the Linux ABI, and proposal item 5 becomes load-bearing
+
+```
+  test: ring 3 — userspace output follows
+    [ring3] hello from userspace via write(2)
+  test: ring 3 97-byte program, 2 syscalls, wrote 46 bytes, exit_group(0)   [OK]
+```
+
+That middle line is written by **ring-3 code calling `write(2)`** — a real Linux
+syscall with the real x86_64 number — and printed by the kernel's serial driver.
+The program then calls `exit_group(0)` and the excursion returns.
+
+### 3.12.1 Why item 5 stopped being cosmetic
+
+The proposal filed item 5 as "real, small, least present-day payoff — defer this
+one". The amd64 port changes that, because `akuma-syscalls-linux::nr` is
+`asm-generic` numbering, which is aarch64's, and x86_64 Linux numbers everything
+differently:
+
+| | aarch64 (`asm-generic`) | x86_64 |
+|---|---:|---:|
+| `read` | 63 | **0** |
+| `write` | 64 | **1** |
+| `exit` | 93 | **60** |
+| `exit_group` | 94 | **231** |
+| `mmap` | 222 | **9** |
+| `openat` | 56 | **257** |
+
+The dangerous row is `read`. Number `0` is `read` on x86_64 and **`io_setup`**
+under `asm-generic`, so a dispatcher fed the wrong table does not fail to find a
+handler — it finds the *wrong* one. `akuma-syscalls-linux`'s own header names
+that class as worse than a crash: "a wrong field offset or flag bit does not
+crash, it corrupts". A wrong syscall number is the same shape.
+
+### 3.12.2 `akuma-syscalls-abi`, and why it is not in `akuma-syscalls-linux`
+
+The first attempt put the `Syscall` enum and the x86_64 table inside
+`akuma-syscalls-linux`. That was wrong, and the crate's own description says why:
+it is *"The Linux/aarch64 syscall ABI"*. A second architecture's numbering inside
+it makes the name quietly false, and leaves a reader no way to tell which table a
+bare `nr::WRITE` means.
+
+`akuma-syscalls-abi` is the arch-plural concept one level up. It **reads**
+`akuma-syscalls-linux::nr` for the asm-generic numbers rather than copying them,
+so the two can never drift, and owns the x86_64 table that has no home below.
+`akuma-syscalls-linux` is untouched, so none of the 192 `nr::` call sites in
+`akuma-syscalls-glue` moved and the aarch64 kernel took no risk.
+
+Three host tests, all of which run without a VM:
+
+- **`round_trip_on_both_architectures`** — every variant has a number on both and
+  decodes back. `to_x86_64`/`to_aarch64` return `u64`, not `Option<u64>`, so
+  adding a variant without adding both numbers fails to *compile*.
+- **`tables_disagree_where_linux_does`** — modelled on `akuma-firecracker`'s
+  `no_address_is_hardcoded`, and for the same reason: the bug being guarded
+  against is a second table copied from the first, which looks right until it is
+  used. If this ever passes trivially, that bug is already in the tree.
+- **`zero_means_different_things`** — pins the `read`/`io_setup` collision above.
+
+### 3.12.3 The test program's numbers come from the table under test
+
+`build_user_program` emits `Syscall::Write.to_x86_64()` rather than a literal `1`,
+so the program and the kernel that decodes it cannot disagree. The program is
+built rather than written as a byte literal, because the message address is an
+operand: a hand-assembled blob with a hardcoded offset stays correct until
+somebody edits the string by one character.
+
+### 3.12.4 Known gaps in the syscall path
+
+- **`sys_write` dereferences a user pointer directly.** That works only because
+  `CR4.SMAP` is not enabled; with SMAP on it needs `stac`/`clac`. There is no
+  `copy_from_user` validating the range against the page tables — the length is
+  bounded and a bad pointer lands in the `#PF` handler, which is the honest limit
+  of what it can promise.
+- **The entry stub forwards four arguments**, not six. Linux passes `a4`-`a6` in
+  `r10`, `r8`, `r9`; nothing needs them yet.
+- **One address space.** `enter_user_mode` does not switch `CR3`, so ring 3 runs
+  in the kernel's tables with the kernel pages simply not marked user-accessible.
+  That is sound but it is not isolation, and it is what a real process needs next.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at

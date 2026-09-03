@@ -39,6 +39,7 @@ default-members = [
     "crates/akuma-scheduler",
     "crates/akuma-slot-table",
     "crates/akuma-syscalls",
+    "crates/akuma-syscalls-abi",
     "crates/akuma-syscalls-linux",
     "crates/akuma-syscalls-glue",
     "crates/akuma-threading",

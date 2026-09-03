@@ -1,16 +1,32 @@
-//! Which syscall a number means, on which architecture.
+#![no_std]
+// Nothing here touches memory: two number tables and the mapping between them.
+#![forbid(unsafe_code)]
+//! Which syscall a number means, **on which architecture**.
 //!
 //! Proposal item 5 (`proposals/REDUCING_PLATFORM_DEPENDENCY.md` §5), started
 //! 2026-09-04 because the amd64 port made it stop being cosmetic.
 //!
+//! # Why this is a separate crate
+//!
+//! `akuma-syscalls-linux` describes itself as *"The Linux/aarch64 syscall
+//! ABI"*, and that precision is the point of it — its numbers, wire structs and
+//! flag tables are all one architecture's. Adding a second architecture's
+//! numbering **inside** it would quietly make the crate's own name wrong, and
+//! the next reader would have no way to tell which table a bare `nr::WRITE`
+//! meant.
+//!
+//! So the arch-plural concept lives here instead, one level up: this crate
+//! *reads* `akuma-syscalls-linux::nr` for the asm-generic numbers rather than
+//! copying them, so the two can never drift, and owns the x86_64 table that has
+//! no home down there.
+//!
 //! # The problem, concretely
 //!
-//! [`crate::nr`]'s header says *"a syscall number is a fact about Linux, not
-//! about which features this build compiles in"*, and that was the right call.
-//! But it is a fact about Linux **on a particular architecture**, and the module
-//! name does not say which. It is `asm-generic`, which is what aarch64 uses.
-//! x86_64 predates `asm-generic` and has its own table, so the same name means a
-//! different number on each:
+//! `nr`'s header says *"a syscall number is a fact about Linux, not about which
+//! features this build compiles in"*, and that was right. But it is a fact about
+//! Linux **on a particular architecture**, and the module name does not say
+//! which. It is `asm-generic`, which is what aarch64 uses. x86_64 predates
+//! `asm-generic` and has its own table:
 //!
 //! | | aarch64 (`asm-generic`) | x86_64 |
 //! |---|---:|---:|
@@ -22,9 +38,9 @@
 //! | `openat` | 56 | **257** |
 //!
 //! Note `read`: `0` on x86_64 is `io_setup` under `asm-generic`. A dispatcher
-//! that used the wrong table would not fail to find a handler — it would find
-//! the **wrong** handler, which is the failure mode this crate's header calls
-//! out as worse than a crash.
+//! using the wrong table would not fail to find a handler — it would find the
+//! **wrong** handler, which `akuma-syscalls-linux`'s own header calls out as the
+//! failure mode worse than a crash.
 //!
 //! # Shape
 //!
@@ -39,9 +55,9 @@
 //! Deliberately a **subset**: the syscalls the amd64 port can plausibly reach
 //! plus the ones any static binary issues on startup. It is not a mirror of
 //! `nr`, and it should not become one speculatively — an entry here is a claim
-//! that both tables were checked, and [`tables_disagree_where_linux_does`] is
-//! what makes that claim testable. Add an entry when a caller needs it, with
-//! both numbers, and the round-trip tests will hold you to it.
+//! that both tables were checked, and `tables_disagree_where_linux_does` is what
+//! makes that claim testable. Add an entry when a caller needs it, with both
+//! numbers, and the round-trip tests will hold you to it.
 
 /// A syscall, named rather than numbered.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -71,7 +87,7 @@ pub enum Syscall {
 /// x86_64 Linux numbers.
 ///
 /// From `arch/x86/entry/syscalls/syscall_64.tbl`. Kept in its own module rather
-/// than merged into [`crate::nr`] so that neither table can be reached by
+/// than merged into `akuma_syscalls_linux::nr` so that neither table can be reached by
 /// accident: a caller has to name the architecture it means.
 pub mod x86_64 {
     pub const READ: u64 = 0;
@@ -127,7 +143,7 @@ impl Syscall {
     /// Decode an aarch64 (`asm-generic`) Linux syscall number.
     #[must_use]
     pub const fn from_aarch64(nr: u64) -> Option<Self> {
-        use crate::nr as n;
+        use akuma_syscalls_linux::nr as n;
         Some(match nr {
             n::READ => Self::Read,
             n::WRITE => Self::Write,
@@ -188,7 +204,7 @@ impl Syscall {
     /// [`Syscall::to_x86_64`].
     #[must_use]
     pub const fn to_aarch64(self) -> u64 {
-        use crate::nr as n;
+        use akuma_syscalls_linux::nr as n;
         match self {
             Self::Read => n::READ,
             Self::Write => n::WRITE,
@@ -292,7 +308,7 @@ mod tests {
     #[test]
     fn zero_means_different_things() {
         assert_eq!(Syscall::from_x86_64(0), Some(Syscall::Read));
-        assert_eq!(crate::nr::IO_SETUP, 0);
+        assert_eq!(akuma_syscalls_linux::nr::IO_SETUP, 0);
         assert_ne!(Syscall::from_aarch64(0), Some(Syscall::Read));
     }
 

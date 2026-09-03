@@ -25,7 +25,7 @@
 //! function. It is the same trick as `sched.rs`'s context switch, with ring 3 in
 //! the middle.
 
-use akuma_syscalls_linux::syscall::Syscall;
+use akuma_syscalls_abi::Syscall;
 
 use crate::gdt;
 use crate::paging::{self, MemAttr, Prot};
@@ -82,9 +82,15 @@ syscall_entry:
     sub rsp, 8                    /* System V wants rsp 16-aligned at `call`;
                                      three pushes leave it 8 off. */
 
-    /* Shift the Linux-style argument registers into System V positions:
-     * nr(rax), a1(rdi), a2(rsi) -> rdi, rsi, rdx. Order matters — rdx first,
-     * or rsi is clobbered before it is read. */
+    /* Shift the Linux argument registers into System V positions:
+     *   Linux:    nr=rax  a1=rdi  a2=rsi  a3=rdx
+     *   System V: 1 =rdi  2 =rsi  3 =rdx  4 =rcx
+     * so (nr, a1, a2, a3) -> (rdi, rsi, rdx, rcx).
+     *
+     * Assigned right-to-left, or each move clobbers the next one's source.
+     * `rcx` is free to use as the fourth argument even though `syscall` put the
+     * user return address there — it was pushed above and is restored below. */
+    mov rcx, rdx
     mov rdx, rsi
     mov rsi, rdi
     mov rdi, rax
@@ -188,7 +194,7 @@ fn rdmsr(msr: u32) -> u64 {
 /// a handler written against numbers cannot be shared and a handler written
 /// against names can.
 #[unsafe(no_mangle)]
-extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64) -> u64 {
+extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     CALLS.fetch_add(1, Ordering::Relaxed);
 
     // Errno values are returned as negatives, the Linux convention.
@@ -201,12 +207,17 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64) -> u64 {
     };
 
     match call {
-        Syscall::Write => sys_write(a1, a2, /* len */ arg3()),
+        Syscall::Write => sys_write(a1, a2, a3),
         Syscall::Exit | Syscall::ExitGroup => {
             EXIT_STATUS.store(a1, Ordering::Relaxed);
             // SAFETY: single core, interrupts off inside a syscall; read only by
-            // `syscall_entry` on the way out.
-            unsafe { *(&raw mut LEAVE_RING3) = 1 };
+            // `syscall_entry` on the way out. Bound to a local first — writing
+            // `*(&raw mut X)` inline trips `clippy::deref_addrof`, whose
+            // suggested fix reintroduces the `static_mut_refs` violation.
+            unsafe {
+                let flag = &raw mut LEAVE_RING3;
+                *flag = 1;
+            }
             a1
         }
         Syscall::Getpid => 1,
@@ -217,22 +228,6 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64) -> u64 {
     }
 }
 
-/// The third syscall argument, which the entry stub does not forward.
-///
-/// `syscall_entry` shifts `nr, a1, a2` into the first three System V registers,
-/// so `rdx` — Linux's third argument — is consumed before the handler sees it.
-/// Rather than widen the stub, the value is read back from where it still lives.
-#[inline(always)]
-fn arg3() -> u64 {
-    let v: u64;
-    // SAFETY: reads a register into a local. `r10` is Linux's *fourth* argument
-    // register and untouched by the stub, so this is only correct because the
-    // stub saves rdx there; see the stub.
-    unsafe {
-        core::arch::asm!("mov {}, r10", out(reg) v, options(nomem, nostack, preserves_flags));
-    }
-    v
-}
 
 /// `write(fd, buf, len)` — fd 1 and 2 go to the serial console.
 ///
@@ -279,54 +274,90 @@ pub fn init_syscall() {
     }
 }
 
-/// The user program, as machine code.
+/// The message userspace prints.
+const USER_MSG: &[u8] = b"    [ring3] hello from userspace via write(2)\n";
+
+/// Emit the user program into `out`, returning its total length.
 ///
-/// Assembled by hand because there is no user toolchain in this build and no
-/// loader yet: `akuma-elf` exists but wants a filesystem, and the point here is
-/// the *transition*, not the loader.
+/// Built rather than written as a byte literal so the message offset is
+/// *computed*. A hand-assembled blob with a hardcoded operand is exactly the
+/// kind of thing that stays correct until someone edits the message by one
+/// character.
 ///
 /// ```text
-///   mov rax, 1        ; SYS_WRITE_DEC
-///   mov rdi, 0x1234   ; argument
-///   syscall           ; -> rax = 0x2468
-///   mov rdi, rax      ; hand the result back as exit status
-///   mov rax, 0        ; SYS_EXIT
-///   syscall           ; does not return
-///   jmp $             ; unreachable; a guard, not a fallthrough
+///   mov rax, <write>        ; number from Syscall::Write.to_x86_64()
+///   mov rdi, 1              ; fd = stdout
+///   movabs rsi, <msg va>    ; patched once the layout is known
+///   mov rdx, <len>
+///   syscall
+///   mov rax, <exit_group>
+///   mov rdi, 0              ; status
+///   syscall
+///   jmp $                   ; a guard, not a fallthrough
+///   <message bytes>
 /// ```
-const USER_BLOB: &[u8] = &[
-    0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
-    0x48, 0xC7, 0xC7, 0x34, 0x12, 0x00, 0x00, // mov rdi, 0x1234
-    0x0F, 0x05, // syscall
-    0x48, 0x89, 0xC7, // mov rdi, rax
-    0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0
-    0x0F, 0x05, // syscall
-    0xEB, 0xFE, // jmp $
-];
+fn build_user_program(out: &mut [u8], base_va: u64) -> usize {
+    let mut n = 0;
+    let mut emit = |bytes: &[u8], n: &mut usize| {
+        out[*n..*n + bytes.len()].copy_from_slice(bytes);
+        *n += bytes.len();
+    };
+
+    // mov rax, imm32 (sign-extended to 64)
+    let mov_rax = |v: u32| {
+        let b = v.to_le_bytes();
+        [0x48, 0xC7, 0xC0, b[0], b[1], b[2], b[3]]
+    };
+    let mov_rdi = |v: u32| {
+        let b = v.to_le_bytes();
+        [0x48, 0xC7, 0xC7, b[0], b[1], b[2], b[3]]
+    };
+    let mov_rdx = |v: u32| {
+        let b = v.to_le_bytes();
+        [0x48, 0xC7, 0xC2, b[0], b[1], b[2], b[3]]
+    };
+
+    emit(&mov_rax(Syscall::Write.to_x86_64() as u32), &mut n);
+    emit(&mov_rdi(1), &mut n);
+
+    // movabs rsi, imm64 — the message address, patched below.
+    let movabs_at = n;
+    emit(&[0x48, 0xBE, 0, 0, 0, 0, 0, 0, 0, 0], &mut n);
+
+    emit(&mov_rdx(USER_MSG.len() as u32), &mut n);
+    emit(&[0x0F, 0x05], &mut n); // syscall
+
+    emit(&mov_rax(Syscall::ExitGroup.to_x86_64() as u32), &mut n);
+    emit(&mov_rdi(0), &mut n);
+    emit(&[0x0F, 0x05], &mut n); // syscall
+    emit(&[0xEB, 0xFE], &mut n); // jmp $
+
+    let msg_off = n;
+    emit(USER_MSG, &mut n);
+
+    let msg_va = base_va + msg_off as u64;
+    out[movabs_at + 2..movabs_at + 10].copy_from_slice(&msg_va.to_le_bytes());
+    n
+}
 
 /// Map a user code page and a user stack page, drop to ring 3, come back.
 pub fn smoke_test() {
-    const ARG: u64 = 0x1234;
-
-    serial::puts("  test: ring 3 ");
+    serial::puts("  test: ring 3 — userspace output follows\n");
 
     let (Some(code_frame), Some(stack_frame)) = (akuma_pmm::alloc_page(), akuma_pmm::alloc_page())
     else {
-        serial::puts("[FAIL] no frames\n");
+        serial::puts("  [FAIL] no frames\n");
         return;
     };
 
     // SAFETY: PMM frames are inside the identity map, so the physical address is
-    // a valid pointer for staging the blob before it is mapped into user space.
-    unsafe {
+    // a valid pointer for staging the program before it is mapped into ring 3.
+    let prog_len = unsafe {
         core::ptr::write_bytes(code_frame as *mut u8, 0, 4096);
         core::ptr::write_bytes(stack_frame as *mut u8, 0, 4096);
-        core::ptr::copy_nonoverlapping(
-            USER_BLOB.as_ptr(),
-            code_frame as *mut u8,
-            USER_BLOB.len(),
-        );
-    }
+        let page = core::slice::from_raw_parts_mut(code_frame as *mut u8, 4096);
+        build_user_program(page, USER_CODE_VA as u64)
+    };
 
     // USER_RX for the code: readable and executable by ring 3, and *not*
     // writable — the encoder has no writable-and-executable constructor.
@@ -341,7 +372,7 @@ pub fn smoke_test() {
         Prot::USER_RW,
         MemAttr::WriteBack,
     ) {
-        serial::puts("[FAIL] could not map user pages\n");
+        serial::puts("  [FAIL] could not map user pages\n");
         return;
     }
 
@@ -349,19 +380,23 @@ pub fn smoke_test() {
     let user_rsp = (USER_STACK_VA + 4096 - 16) as u64;
 
     // SAFETY: both pages were just mapped with user permissions in the live
-    // address space, and the blob ends in syscall 0, which returns here.
+    // address space, and the program ends in exit_group, which returns here.
     let status = unsafe { enter_user_mode(USER_CODE_VA as u64, user_rsp) };
 
     let calls = CALLS.load(Ordering::Relaxed);
-    let arg = LAST_ARG.load(Ordering::Relaxed);
-    let ok = calls == 2 && arg == ARG && status == ARG * 2;
+    let written = WRITTEN.load(Ordering::Relaxed);
+    let exit = EXIT_STATUS.load(Ordering::Relaxed);
+    let ok = calls == 2 && written == USER_MSG.len() as u64 && exit == 0 && status == 0;
 
-    serial::puts("entered, ");
+    serial::puts("  test: ring 3 ");
+    serial::put_dec(prog_len as u64);
+    serial::puts("-byte program, ");
     serial::put_dec(calls);
-    serial::puts(" syscalls, arg=0x");
-    serial::put_hex(arg);
-    serial::puts(" status=0x");
-    serial::put_hex(status);
+    serial::puts(" syscalls, wrote ");
+    serial::put_dec(written);
+    serial::puts(" bytes, exit_group(");
+    serial::put_dec(exit);
+    serial::puts(")");
     serial::puts(if ok { "   [OK]\n" } else { "   [FAIL]\n" });
 
     paging::unmap_page(USER_CODE_VA);

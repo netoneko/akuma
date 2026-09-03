@@ -16,10 +16,10 @@ workspace = true
 # `docs/archive/AKUMA_FIRECRACKER_AMD64.md` §1.3 for what that costs.
 akuma-alloc = { path = "../crates/akuma-alloc" }
 akuma-pmm = { path = "../crates/akuma-pmm" }
-# The Linux ABI. Its `syscall::Syscall` enum is proposal item 5's shape, and the
-# amd64 port is why it exists: `nr` is asm-generic (aarch64) numbering, and
-# x86_64 Linux numbers everything differently.
-akuma-syscalls-linux = { path = "../crates/akuma-syscalls-linux" }
+# Syscall identity across architectures. Proposal item 5's shape, and the amd64
+# port is why it exists: `akuma-syscalls-linux::nr` is asm-generic (aarch64)
+# numbering, and x86_64 Linux numbers everything differently.
+akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
 
 [[bin]]
 name = "akuma-amd64"
