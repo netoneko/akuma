@@ -455,6 +455,74 @@ boot.
 Port I/O moved out of `serial.rs` into `amd64/src/port.rs` when this became its
 second consumer.
 
+## 3.10 Stage E: context switching and a scheduler
+
+```
+  test: scheduler 3 tasks x 4 rounds, 5 switches, ticks=17   [OK]
+  test: tick-driven resched observed   [OK]
+```
+
+`amd64/src/sched.rs`. Three tasks on separate stacks, round-robin, paced by the
+LAPIC tick.
+
+**It is a real context switch and it is not preemption.** A task that never calls
+`yield_now` runs forever; the tick sets a flag the yield consumes. True
+preemption means switching *inside* the interrupt handler so `iretq` returns onto
+a different task's stack, which needs each task's interrupt frame on its own
+stack and a TSS once ring 3 exists. The module says so in its header rather than
+letting "scheduler" imply more than was built.
+
+The test proves the switch is real rather than a function call that returns: each
+worker accumulates a checksum in a **local**, read and written across a yield, so
+a switch that failed to preserve the task's stack or callee-saved registers
+produces the wrong value. The expected checksums are computed independently.
+
+### 3.10.1 The test caught its own shortcut
+
+First run: `test: scheduler ... ticks=5 [OK]` and
+`test: tick-driven resched never observed [FAIL]`.
+
+Nothing was broken. The workers yielded immediately, so the whole test finished
+inside a single timer period and observed zero ticks — `ticks=5` was left over
+from the LAPIC test. The scheduler was correct and the *pacing claim* was not.
+Fixed by making each round wait for a tick (bounded, so a dead timer fails rather
+than hangs) and shortening the timer period from 1,000,000 to 100,000.
+
+This is the argument for reporting the two properties separately. A single
+combined "scheduler works" line would have passed, and the fact that the tick
+drove nothing would have gone unnoticed.
+
+### 3.10.2 `global_asm!` inherits the previous file's section
+
+Adding `switch_context` broke the link with an error that names the wrong file:
+
+```
+error: BSS section '.bss' cannot have non-zero bytes
+```
+
+Module-level `global_asm!` blocks from every module are concatenated into one
+object file, and **the assembler carries its current section across that
+boundary**. `boot.s` ends with `.section .bss` (the boot stack), so the new
+block's instructions were emitted into `.bss` — which is `NOLOAD`. The fix is one
+`.section .text` directive; the rule is that every asm block in this crate opens
+by naming its section.
+
+### 3.10.3 What this says about proposal item 4
+
+Item 4 wants `akuma-exec-core`'s `Context` — a `repr(C)` struct of twenty public
+mutable AArch64 register fields — replaced by constructors and accessors. The
+x86 `Context` here is that argument taken to its conclusion: it holds **one**
+field, `rsp`, and is built only by `Context::for_task`. Everything else lives on
+the task's own stack, pushed by the switch routine.
+
+That is not an x86 trick — the same structure works on AArch64. It is the
+strongest available evidence for item 4's instinct: once a context can only be
+built by a constructor, the register set stops being part of the interface, and
+the crate that owns fork and exec no longer needs to know what a callee-saved
+register is. Item 4's `spsr` hazard (any of 19 call sites could write `EL1h` and
+turn `enter_user_mode` into a privileged jump) simply cannot be expressed against
+a type with no public fields.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at

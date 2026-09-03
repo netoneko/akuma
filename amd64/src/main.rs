@@ -42,6 +42,10 @@ compile_error!(
 );
 
 #[cfg(target_arch = "x86_64")]
+mod gdt;
+#[cfg(target_arch = "x86_64")]
+mod usermode;
+#[cfg(target_arch = "x86_64")]
 mod hvm;
 #[cfg(target_arch = "x86_64")]
 mod idt;
@@ -159,6 +163,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
             sched::smoke_test();
             lapic::stop_timer();
         }
+        // Ring 3 last. It replaces the GDT `boot.s` installed, and the TSS it
+        // adds is what makes a trap taken *from* ring 3 survivable — so it must
+        // come after everything that could still fault in ring 0.
+        gdt::init();
+        usermode::init_syscall();
+        usermode::smoke_test();
+
         serial::puts("\nAkuma/amd64 — memory subsystem up\n");
     } else {
         serial::puts("\nAkuma/amd64 — memory bring-up FAILED\n");
