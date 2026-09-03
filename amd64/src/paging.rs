@@ -143,6 +143,28 @@ unsafe fn table_mut(pa: u64) -> *mut u64 {
 }
 
 /// The active top-level table, from `CR3`.
+#[must_use]
+pub fn active_root() -> u64 {
+    read_cr3()
+}
+
+/// Switch the active address space.
+///
+/// # Safety
+/// `root` must be a PML4 that maps every page this kernel is currently
+/// executing from and every page it will touch before switching back — the
+/// kernel image, its stacks, the heap, the PMM pool and the LAPIC window. An
+/// address space missing any of those faults on the instruction after `mov cr3`,
+/// with no way to report it.
+pub unsafe fn activate(root: u64) {
+    // SAFETY: caller's obligation, stated above. Writing CR3 also flushes the
+    // non-global TLB, which is what makes the switch take effect.
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+    }
+}
+
+/// The active top-level table, from `CR3`.
 fn read_cr3() -> u64 {
     let v: u64;
     // SAFETY: reading CR3 copies a register into a local; it dereferences
@@ -213,13 +235,22 @@ unsafe fn next_table(entry_ptr: *mut u64, user: bool) -> Option<u64> {
     Some(frame)
 }
 
-/// Map `va` to `pa` with `prot` and `attr`. Returns false if a table could not
-/// be allocated or if the range is backed by a 2 MiB page.
+/// Map `va` to `pa` in the **active** address space.
 pub fn map_page(va: usize, pa: u64, prot: Prot, attr: MemAttr) -> bool {
+    map_page_in(read_cr3(), va, pa, prot, attr)
+}
+
+/// Map `va` to `pa` in the address space rooted at `root`.
+///
+/// Taking the root as a parameter rather than always reading `CR3` is what lets
+/// a process's tables be built *before* they are activated — the alternative is
+/// switching to a half-built address space, which cannot be done safely from
+/// code that is itself running out of memory those tables describe.
+pub fn map_page_in(root: u64, va: usize, pa: u64, prot: Prot, attr: MemAttr) -> bool {
     assert_eq!(va % PAGE_SIZE, 0, "va must be page aligned");
     assert_eq!(pa % PAGE_SIZE as u64, 0, "pa must be page aligned");
 
-    let mut table = read_cr3();
+    let mut table = root;
     for level in (2..=4).rev() {
         // SAFETY: `table` is a live table frame inside the identity map.
         let entry_ptr = unsafe { table_mut(table).add(index(va, level)) };
@@ -240,9 +271,14 @@ pub fn map_page(va: usize, pa: u64, prot: Prot, attr: MemAttr) -> bool {
     true
 }
 
-/// Remove the mapping for `va`, if any. Returns the physical address it held.
+/// Remove the mapping for `va` in the active address space.
 pub fn unmap_page(va: usize) -> Option<u64> {
-    let mut table = read_cr3();
+    unmap_page_in(read_cr3(), va)
+}
+
+/// Remove the mapping for `va` in the address space rooted at `root`.
+pub fn unmap_page_in(root: u64, va: usize) -> Option<u64> {
+    let mut table = root;
     for level in (2..=4).rev() {
         // SAFETY: `table` is a live table frame inside the identity map.
         let entry = unsafe { table_mut(table).add(index(va, level)).read_volatile() };
@@ -264,13 +300,18 @@ pub fn unmap_page(va: usize) -> Option<u64> {
     Some(entry & ADDR_MASK)
 }
 
-/// Resolve `va` to a physical address by walking the live tables.
+/// Resolve `va` in the active address space.
 ///
 /// Walks rather than trusting a shadow structure, so it reports what the
 /// *hardware* would do — which is the only useful answer when checking whether a
 /// mapping took effect.
 pub fn translate(va: usize) -> Option<u64> {
-    let mut table = read_cr3();
+    translate_in(read_cr3(), va)
+}
+
+/// Resolve `va` in the address space rooted at `root`.
+pub fn translate_in(root: u64, va: usize) -> Option<u64> {
+    let mut table = root;
     for level in (2..=4).rev() {
         // SAFETY: `table` is a live table frame inside the identity map.
         let entry = unsafe { table_mut(table).add(index(va, level)).read_volatile() };
@@ -402,4 +443,127 @@ fn nx_encoding_check() {
 
     serial::puts("  test: W^X encoding ");
     serial::puts(if ok { "  [OK]\n" } else { "  [FAIL]\n" });
+}
+
+/// One address space: a PML4 of its own, sharing the kernel's mappings.
+///
+/// # What is shared and what is not
+///
+/// The kernel runs identity-mapped in the first 1 GiB — image, stacks, heap, PMM
+/// pool and page tables all live there — so every address space must contain it
+/// or the first instruction after `mov cr3` faults. Rather than copy those
+/// mappings, a new space **shares the entry**: its PDPT slot 0 points at the very
+/// same page directory the kernel boot map uses, so there is one kernel mapping
+/// and no possibility of the copies drifting.
+///
+/// The LAPIC window (`0xFEE0_0000`, PDPT slot 3) is shared for the same reason —
+/// the timer handler writes EOI, and it can fire while a process is running.
+///
+/// Everything else is private. `USER_CODE_VA` and `USER_STACK_VA` sit at
+/// `0x5000_0000`, which is PDPT slot 1, so two spaces can map different frames at
+/// the same virtual address and neither can see the other's.
+///
+/// # What this is not
+///
+/// There is no higher-half split. The kernel is identity-mapped low rather than
+/// at `0xFFFF_8000_0000_0000`, which is what the aarch64 side does with
+/// TTBR1/TTBR0. That is the right end state and it is a bigger change than this;
+/// sharing a PDPT entry buys real isolation between *user* mappings today
+/// without moving the kernel.
+pub struct AddressSpace {
+    root: u64,
+    pdpt: u64,
+}
+
+/// PDPT slots that every address space shares with the kernel.
+const SHARED_PDPT_SLOTS: [usize; 2] = [
+    0, // the identity-mapped first 1 GiB: kernel image, heap, PMM pool
+    3, // 0xC000_0000..0x1_0000_0000, which contains the LAPIC at 0xFEE0_0000
+];
+
+impl AddressSpace {
+    /// Build a new address space sharing the kernel's mappings.
+    pub fn new() -> Option<Self> {
+        let root = akuma_pmm::alloc_page()? as u64;
+        let Some(pdpt) = akuma_pmm::alloc_page().map(|p| p as u64) else {
+            akuma_pmm::free_page(root as usize, 0);
+            return None;
+        };
+
+        // SAFETY: two fresh PMM frames inside the identity map. Zeroing is what
+        // makes them valid empty tables; the entries written after are the only
+        // non-zero ones.
+        unsafe {
+            core::ptr::write_bytes(root as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(pdpt as *mut u8, 0, PAGE_SIZE);
+
+            // Share, do not copy: read the kernel's PDPT and alias its entries.
+            let kernel_pdpt = {
+                let kroot = read_cr3();
+                let e = table_mut(kroot).read_volatile();
+                e & ADDR_MASK
+            };
+            for slot in SHARED_PDPT_SLOTS {
+                let e = table_mut(kernel_pdpt).add(slot).read_volatile();
+                table_mut(pdpt).add(slot).write_volatile(e);
+            }
+
+            // PML4[0] -> our PDPT. User-accessible, because the leaf decides.
+            table_mut(root).write_volatile(pdpt | P | RW | US);
+        }
+        Some(Self { root, pdpt })
+    }
+
+    /// The value to load into `CR3`.
+    #[must_use]
+    pub const fn root(&self) -> u64 {
+        self.root
+    }
+
+    /// Map a page in this space.
+    pub fn map(&self, va: usize, pa: u64, prot: Prot, attr: MemAttr) -> bool {
+        map_page_in(self.root, va, pa, prot, attr)
+    }
+
+    /// Resolve a virtual address in this space, without activating it.
+    #[must_use]
+    pub fn translate(&self, va: usize) -> Option<u64> {
+        translate_in(self.root, va)
+    }
+
+    /// Release this space's own tables.
+    ///
+    /// Frees the PML4, the PDPT, and every table below a **non-shared** PDPT
+    /// slot. Deliberately not a `Drop` impl: freeing an address space that is
+    /// still in `CR3` unmaps the code doing the freeing, and a destructor that
+    /// can be triggered by falling out of scope makes that too easy. It has to
+    /// be asked for.
+    ///
+    /// Leaf frames are the caller's — this frees page *tables*, not the pages
+    /// they point at.
+    pub fn free(self) {
+        // SAFETY: the tables were allocated by `new` and are inside the identity
+        // map; the shared slots are skipped so the kernel's own tables survive.
+        unsafe {
+            for slot in 0..ENTRIES {
+                if SHARED_PDPT_SLOTS.contains(&slot) {
+                    continue;
+                }
+                let pd_entry = table_mut(self.pdpt).add(slot).read_volatile();
+                if pd_entry & P == 0 {
+                    continue;
+                }
+                let pd = pd_entry & ADDR_MASK;
+                for i in 0..ENTRIES {
+                    let pt_entry = table_mut(pd).add(i).read_volatile();
+                    if pt_entry & P != 0 && pt_entry & PS == 0 {
+                        akuma_pmm::free_page((pt_entry & ADDR_MASK) as usize, 0);
+                    }
+                }
+                akuma_pmm::free_page(pd as usize, 0);
+            }
+        }
+        akuma_pmm::free_page(self.pdpt as usize, 0);
+        akuma_pmm::free_page(self.root as usize, 0);
+    }
 }

@@ -52,7 +52,7 @@ static mut LEAVE_RING3: u64 = 0;
 
 /// How many syscalls arrived.
 static CALLS: AtomicU64 = AtomicU64::new(0);
-/// Bytes accepted by `write`.
+/// Bytes accepted by `write`, across all processes.
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Status userspace exited with.
 static EXIT_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -125,7 +125,16 @@ syscall_entry:
 
 .global enter_user_mode
 enter_user_mode:
-    /* rdi = user rip, rsi = user rsp. Returns when userspace calls syscall 0. */
+    /* rdi = user rip, rsi = user rsp. Returns when userspace exits.
+     *
+     * Clear LEAVE_RING3 first. Its lifetime is exactly one excursion, and it is
+     * set by the handler on the way out — so a *second* entry with the flag
+     * still set returns immediately after the first syscall, whatever that
+     * syscall was. That is not hypothetical: it made a second process report its
+     * write() length (55) as its exit status instead of 0x0B, with both
+     * processes otherwise behaving correctly. */
+    mov qword ptr [rip + LEAVE_RING3], 0
+
     push rbp
     push rbx
     push r12
@@ -274,9 +283,6 @@ pub fn init_syscall() {
     }
 }
 
-/// The message userspace prints.
-const USER_MSG: &[u8] = b"    [ring3] hello from userspace via write(2)\n";
-
 /// Emit the user program into `out`, returning its total length.
 ///
 /// Built rather than written as a byte literal so the message offset is
@@ -291,116 +297,164 @@ const USER_MSG: &[u8] = b"    [ring3] hello from userspace via write(2)\n";
 ///   mov rdx, <len>
 ///   syscall
 ///   mov rax, <exit_group>
-///   mov rdi, 0              ; status
+///   mov rdi, <status>
 ///   syscall
 ///   jmp $                   ; a guard, not a fallthrough
 ///   <message bytes>
 /// ```
-fn build_user_program(out: &mut [u8], base_va: u64) -> usize {
+fn build_user_program(out: &mut [u8], base_va: u64, msg: &[u8], status: u32) -> usize {
     let mut n = 0;
     let mut emit = |bytes: &[u8], n: &mut usize| {
         out[*n..*n + bytes.len()].copy_from_slice(bytes);
         *n += bytes.len();
     };
 
-    // mov rax, imm32 (sign-extended to 64)
-    let mov_rax = |v: u32| {
+    // mov r64, imm32 (sign-extended). Opcode byte differs per destination.
+    let mov_imm = |modrm: u8, v: u32| {
         let b = v.to_le_bytes();
-        [0x48, 0xC7, 0xC0, b[0], b[1], b[2], b[3]]
+        [0x48, 0xC7, modrm, b[0], b[1], b[2], b[3]]
     };
-    let mov_rdi = |v: u32| {
-        let b = v.to_le_bytes();
-        [0x48, 0xC7, 0xC7, b[0], b[1], b[2], b[3]]
-    };
-    let mov_rdx = |v: u32| {
-        let b = v.to_le_bytes();
-        [0x48, 0xC7, 0xC2, b[0], b[1], b[2], b[3]]
-    };
+    const RAX: u8 = 0xC0;
+    const RDI: u8 = 0xC7;
+    const RDX: u8 = 0xC2;
 
-    emit(&mov_rax(Syscall::Write.to_x86_64() as u32), &mut n);
-    emit(&mov_rdi(1), &mut n);
+    emit(&mov_imm(RAX, Syscall::Write.to_x86_64() as u32), &mut n);
+    emit(&mov_imm(RDI, 1), &mut n);
 
     // movabs rsi, imm64 — the message address, patched below.
     let movabs_at = n;
     emit(&[0x48, 0xBE, 0, 0, 0, 0, 0, 0, 0, 0], &mut n);
 
-    emit(&mov_rdx(USER_MSG.len() as u32), &mut n);
+    emit(&mov_imm(RDX, msg.len() as u32), &mut n);
     emit(&[0x0F, 0x05], &mut n); // syscall
 
-    emit(&mov_rax(Syscall::ExitGroup.to_x86_64() as u32), &mut n);
-    emit(&mov_rdi(0), &mut n);
+    emit(&mov_imm(RAX, Syscall::ExitGroup.to_x86_64() as u32), &mut n);
+    emit(&mov_imm(RDI, status), &mut n);
     emit(&[0x0F, 0x05], &mut n); // syscall
     emit(&[0xEB, 0xFE], &mut n); // jmp $
 
     let msg_off = n;
-    emit(USER_MSG, &mut n);
+    emit(msg, &mut n);
 
     let msg_va = base_va + msg_off as u64;
     out[movabs_at + 2..movabs_at + 10].copy_from_slice(&msg_va.to_le_bytes());
     n
 }
 
-/// Map a user code page and a user stack page, drop to ring 3, come back.
-pub fn smoke_test() {
-    serial::puts("  test: ring 3 — userspace output follows\n");
+/// A process: its own address space plus the frames backing it.
+struct Process {
+    space: paging::AddressSpace,
+    code: usize,
+    stack: usize,
+}
 
-    let (Some(code_frame), Some(stack_frame)) = (akuma_pmm::alloc_page(), akuma_pmm::alloc_page())
-    else {
-        serial::puts("  [FAIL] no frames\n");
-        return;
-    };
+impl Process {
+    /// Build a process that prints `msg` and exits with `status`.
+    fn new(msg: &[u8], status: u32) -> Option<Self> {
+        let space = paging::AddressSpace::new()?;
+        let (Some(code), Some(stack)) = (akuma_pmm::alloc_page(), akuma_pmm::alloc_page()) else {
+            space.free();
+            return None;
+        };
 
-    // SAFETY: PMM frames are inside the identity map, so the physical address is
-    // a valid pointer for staging the program before it is mapped into ring 3.
-    let prog_len = unsafe {
-        core::ptr::write_bytes(code_frame as *mut u8, 0, 4096);
-        core::ptr::write_bytes(stack_frame as *mut u8, 0, 4096);
-        let page = core::slice::from_raw_parts_mut(code_frame as *mut u8, 4096);
-        build_user_program(page, USER_CODE_VA as u64)
-    };
+        // SAFETY: PMM frames are inside the identity map, so the physical
+        // address is a valid pointer for staging the program *before* the
+        // address space that will hold it is ever activated.
+        unsafe {
+            core::ptr::write_bytes(code as *mut u8, 0, 4096);
+            core::ptr::write_bytes(stack as *mut u8, 0, 4096);
+            let page = core::slice::from_raw_parts_mut(code as *mut u8, 4096);
+            build_user_program(page, USER_CODE_VA as u64, msg, status);
+        }
 
-    // USER_RX for the code: readable and executable by ring 3, and *not*
-    // writable — the encoder has no writable-and-executable constructor.
-    if !paging::map_page(
-        USER_CODE_VA,
-        code_frame as u64,
-        Prot::USER_RX,
-        MemAttr::WriteBack,
-    ) || !paging::map_page(
-        USER_STACK_VA,
-        stack_frame as u64,
-        Prot::USER_RW,
-        MemAttr::WriteBack,
-    ) {
-        serial::puts("  [FAIL] could not map user pages\n");
-        return;
+        if !space.map(USER_CODE_VA, code as u64, Prot::USER_RX, MemAttr::WriteBack)
+            || !space.map(USER_STACK_VA, stack as u64, Prot::USER_RW, MemAttr::WriteBack)
+        {
+            akuma_pmm::free_page(code, 0);
+            akuma_pmm::free_page(stack, 0);
+            space.free();
+            return None;
+        }
+        Some(Self { space, code, stack })
     }
 
-    // Stack grows down; start at the top of the page, 16-aligned.
-    let user_rsp = (USER_STACK_VA + 4096 - 16) as u64;
+    /// Switch to this process's address space, run it, and switch back.
+    fn run(&self) -> u64 {
+        let kernel_root = paging::active_root();
+        // SAFETY: the space shares the kernel's PDPT slot 0 (identity-mapped
+        // first 1 GiB: image, stacks, heap, PMM pool) and slot 3 (the LAPIC), so
+        // every page this kernel executes from or touches while the process runs
+        // is mapped in it. That is exactly the obligation `activate` states.
+        unsafe { paging::activate(self.space.root()) };
 
-    // SAFETY: both pages were just mapped with user permissions in the live
-    // address space, and the program ends in exit_group, which returns here.
-    let status = unsafe { enter_user_mode(USER_CODE_VA as u64, user_rsp) };
+        let user_rsp = (USER_STACK_VA + 4096 - 16) as u64;
+        // SAFETY: both pages are mapped with user permissions in the now-active
+        // address space, and the program ends in exit_group, which returns here.
+        let status = unsafe { enter_user_mode(USER_CODE_VA as u64, user_rsp) };
+
+        // SAFETY: returning to the address space we came from, which is still
+        // intact — nothing freed it while the process ran.
+        unsafe { paging::activate(kernel_root) };
+        status
+    }
+
+    fn free(self) {
+        akuma_pmm::free_page(self.code, 0);
+        akuma_pmm::free_page(self.stack, 0);
+        self.space.free();
+    }
+}
+
+/// Run two processes in separate address spaces and prove they are isolated.
+pub fn smoke_test() {
+    serial::puts("  test: processes — userspace output follows\n");
+
+    let free_before = akuma_pmm::free_count();
+
+    let (Some(a), Some(b)) = (
+        Process::new(b"    [ring3 A] first process, own address space\n", 0x0A),
+        Process::new(b"    [ring3 B] second process, same VA, different frame\n", 0x0B),
+    ) else {
+        serial::puts("  [FAIL] could not build processes\n");
+        return;
+    };
+
+    // The whole point, checked before either runs: the same virtual address
+    // resolves to different physical frames, and to nothing at all in the
+    // kernel's own space.
+    let pa_a = a.space.translate(USER_CODE_VA);
+    let pa_b = b.space.translate(USER_CODE_VA);
+    let pa_k = paging::translate(USER_CODE_VA);
+
+    let status_a = a.run();
+    let status_b = b.run();
 
     let calls = CALLS.load(Ordering::Relaxed);
-    let written = WRITTEN.load(Ordering::Relaxed);
-    let exit = EXIT_STATUS.load(Ordering::Relaxed);
-    let ok = calls == 2 && written == USER_MSG.len() as u64 && exit == 0 && status == 0;
+    let isolated = pa_a.is_some() && pa_b.is_some() && pa_a != pa_b && pa_k.is_none();
+    let ran = status_a == 0x0A && status_b == 0x0B && calls == 4;
 
-    serial::puts("  test: ring 3 ");
-    serial::put_dec(prog_len as u64);
-    serial::puts("-byte program, ");
-    serial::put_dec(calls);
-    serial::puts(" syscalls, wrote ");
-    serial::put_dec(written);
-    serial::puts(" bytes, exit_group(");
-    serial::put_dec(exit);
-    serial::puts(")");
-    serial::puts(if ok { "   [OK]\n" } else { "   [FAIL]\n" });
+    serial::puts("  test: processes 0x");
+    serial::put_hex(pa_a.unwrap_or(0));
+    serial::puts(" vs 0x");
+    serial::put_hex(pa_b.unwrap_or(0));
+    serial::puts(" at the same VA, exits 0x");
+    serial::put_hex(status_a);
+    serial::puts("/0x");
+    serial::put_hex(status_b);
+    serial::puts(if isolated && ran { "   [OK]\n" } else { "   [FAIL]\n" });
 
-    paging::unmap_page(USER_CODE_VA);
-    paging::unmap_page(USER_STACK_VA);
-    akuma_pmm::free_page(code_frame, 0);
-    akuma_pmm::free_page(stack_frame, 0);
+    a.free();
+    b.free();
+
+    // Address spaces are page tables; leaking them leaks frames silently.
+    let free_after = akuma_pmm::free_count();
+    serial::puts("  test: address-space teardown frames ");
+    serial::put_dec(free_before as u64);
+    serial::puts(" -> ");
+    serial::put_dec(free_after as u64);
+    serial::puts(if free_before == free_after {
+        "   [OK]\n"
+    } else {
+        "   [FAIL]\n"
+    });
 }

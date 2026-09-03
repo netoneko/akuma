@@ -5,8 +5,8 @@ physical frame allocator, maps/unmaps 4 KiB pages, services page faults with
 **demand paging**, takes **LAPIC timer interrupts**, and round-robin schedules
 tasks across separate stacks, and enters **ring 3** with a working
 `syscall`/`sysret` path, where userspace calls **real Linux x86_64 syscalls**
-(`write`, `exit_group`). No loader, no preemption, no device interrupts, no
-per-process address space.
+(`write`, `exit_group`) from **isolated per-process address spaces**. No loader,
+no preemption, no device interrupts, no higher-half kernel.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1**.
 
@@ -38,7 +38,11 @@ Akuma/amd64 — long mode reached
   test: tick-driven resched observed   [OK]
   test: ring 3 — userspace output follows
     [ring3] hello from userspace via write(2)
-  test: ring 3 97-byte program, 2 syscalls, wrote 46 bytes, exit_group(0)   [OK]
+  test: processes — userspace output follows
+    [ring3 A] first process, own address space
+    [ring3 B] second process, same VA, different frame
+  test: processes 0x1264000 vs 0x126a000 at the same VA, exits 0x0a/0x0b   [OK]
+  test: address-space teardown frames 126366 -> 126366   [OK]
 
 Akuma/amd64 — memory subsystem up
 ```

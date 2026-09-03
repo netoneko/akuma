@@ -680,6 +680,67 @@ somebody edits the string by one character.
   in the kernel's tables with the kernel pages simply not marked user-accessible.
   That is sound but it is not isolation, and it is what a real process needs next.
 
+## 3.13 Stage H: per-process address spaces
+
+```
+    [ring3 A] first process, own address space
+    [ring3 B] second process, same VA, different frame
+  test: processes 0x1264000 vs 0x126a000 at the same VA, exits 0x0a/0x0b   [OK]
+  test: address-space teardown frames 126366 -> 126366   [OK]
+```
+
+Two processes, each with its own PML4, both mapping `USER_CODE_VA` — and
+resolving it to **different physical frames**. The kernel's own address space
+maps that VA to nothing at all. That is isolation rather than merely "ring 3
+cannot write kernel pages".
+
+### 3.13.1 Sharing the kernel by aliasing an entry, not copying it
+
+The kernel runs identity-mapped in the first 1 GiB — image, stacks, heap, PMM
+pool and every page table live there — so an address space missing it faults on
+the instruction *after* `mov cr3`, with no way to report it. A new space
+therefore has to contain the kernel.
+
+It shares rather than copies: the new PDPT's slot 0 points at the very same page
+directory the boot map uses. One kernel mapping exists, so the copies cannot
+drift. Slot 3 (`0xC000_0000`..`0x1_0000_0000`, containing the LAPIC at
+`0xFEE0_0000`) is shared for the same reason — the timer can fire while a process
+runs, and the handler writes EOI.
+
+Everything else is private. `USER_CODE_VA` is `0x5000_0000`, which is PDPT slot 1,
+so the two spaces differ exactly where they should.
+
+`paging::activate` is `unsafe` and its doc states the whole obligation: the root
+must map every page the kernel is executing from and will touch before switching
+back. That is the one contract this stage rests on.
+
+### 3.13.2 `free` is not `Drop`
+
+Freeing an address space that is still in `CR3` unmaps the code doing the
+freeing. A destructor that fires on falling out of scope makes that far too easy,
+so teardown must be asked for by name. It frees the PML4, the PDPT and every
+table under a *non-shared* slot — skipping the shared ones, or the first process
+to exit would free the kernel's own page directory.
+
+The frame-count check exists because that class of bug is silent: page tables are
+frames, and leaking them looks exactly like working correctly.
+
+### 3.13.3 The bug the test caught
+
+First run: isolation passed, both processes printed correctly, teardown was
+clean — and process B exited with **`0x37`** where `0x0b` was expected. `0x37` is
+55, which is the length of B's message.
+
+`LEAVE_RING3`, the flag the handler sets to end an excursion, was never cleared.
+A's `exit_group` left it set, so B returned to the kernel immediately after its
+*first* syscall — `write` — and `enter_user_mode` reported that syscall's return
+value as the exit status. Both processes still ran and still printed, which is
+why nothing else noticed.
+
+The flag's lifetime is exactly one excursion, so it is now cleared at the top of
+`enter_user_mode` rather than at the exit. Checking the *exit status* rather than
+"did it return" is what surfaced it.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at
