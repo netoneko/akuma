@@ -48,10 +48,14 @@
 //!   identity. Two mounts sharing a number therefore alias — which can only
 //!   *add* pins, never drop one, so it costs a deferred free and never a freed
 //!   mapping.
-//! - If the table has no room, the pin is not recorded and [`OVERFLOW`] counts
-//!   it. While that count is non-zero [`is_pinned`] answers `true` for
-//!   everything, because an unrecorded pin is indistinguishable from any other
-//!   inode. It self-clears: an unpin that finds no entry decrements it again.
+//! - If the table has no room, the pin is not recorded and the overflow counter
+//!   for that inode's **region** counts it (see [`REGIONS`]). While that
+//!   region's count is non-zero [`is_pinned`] answers `true` for every inode in
+//!   it, because an unrecorded pin is indistinguishable from any other inode
+//!   hashing there. It self-clears: an unpin that finds no entry decrements it
+//!   again. Accounting per region rather than globally is deliberate — one lost
+//!   pin used to make *every* inode read pinned, which stalls a deferred-free
+//!   drain into an unbounded queue.
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -77,7 +81,50 @@ static TABLE: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 
 /// Live pins that did not fit in [`TABLE`]. Non-zero makes [`is_pinned`] answer
 /// `true` for every inode — see the module header.
-pub static OVERFLOW: AtomicUsize = AtomicUsize::new(0);
+static OVERFLOW: [AtomicUsize; REGIONS] = [const { AtomicUsize::new(0) }; REGIONS];
+
+/// Regions the table is divided into for overflow accounting. An unrecorded pin
+/// makes only its **own** region answer conservatively, instead of the whole
+/// table.
+///
+/// Why this exists: a single global flag meant one lost pin made
+/// [`is_pinned`] answer `true` for *every* inode, which stops
+/// `akuma_ext2`'s `drain_deferred_frees` from freeing anything at all — so its
+/// deferral queue climbs instead of draining and eventually leaks. Measured over
+/// four in-guest builds: `pin_ovf` hovering at 3-27 (never 0) took `defer` from
+/// 0 to 2252 monotonically, 55 % of its bound
+/// (`EXT2_UNLINK_INODE_BLOCK_LEAK.md` §2.4). `pin_ovf` does not need to be
+/// large to block the drain completely — only non-zero.
+///
+/// 64 regions of 16 slots cuts the blast radius of one lost pin from 1/1 to
+/// ~1/64, so the drain keeps making progress on the other 63 regions.
+const REGIONS: usize = 64;
+const SLOTS_PER_REGION: usize = SLOTS / REGIONS;
+
+/// The overflow region an inode is accounted to: the region of its **home**
+/// slot.
+///
+/// Home, not wherever the probe ended up — and that is what makes it sound. A
+/// probe chain can spill past a region boundary, but `acquire`, `release` and
+/// `is_pinned` all derive the region from the same `slot_of(inode)`, so each
+/// inode's conservative answer is governed by its own home region and by nothing
+/// else. An inode whose pin was lost therefore still reads pinned; an inode in
+/// another region is unaffected.
+const fn region_of(inode: u32) -> usize {
+    slot_of(inode) / SLOTS_PER_REGION
+}
+
+/// Total unrecorded pins across every region — diagnostics only
+/// (`[INODE] pin_ovf=`). Non-zero means at least one region is answering
+/// conservatively.
+#[must_use]
+pub fn overflow_count() -> usize {
+    let mut n = 0;
+    for r in &OVERFLOW {
+        n += r.load(Ordering::Acquire);
+    }
+    n
+}
 
 const fn pack(inode: u32, count: u32) -> u64 {
     ((inode as u64) << 32) | count as u64
@@ -182,7 +229,37 @@ fn acquire(inode: u32) {
                 tomb = Some((pos, cur));
             }
         }
-        OVERFLOW.fetch_add(1, Ordering::AcqRel);
+        // The chain ran to PROBE_LIMIT without an empty slot. Before declaring
+        // overflow, claim a TOMBSTONE if the walk passed one.
+        //
+        // This is the fix for the pin table overflowing on a table that is ~0.5 %
+        // *live*. `release` leaves `(inode, 0)` behind rather than clearing the
+        // slot — necessary, because zeroing a slot mid-chain would truncate the
+        // probe chain of any key that hashed earlier and probed past it. Those
+        // tombstones are what `tomb` exists to recycle, but it was only consulted
+        // inside the `cur == 0` branch above: a window of 32 slots that are all
+        // live-or-tombstone never reaches `cur == 0`, so it fell through to here
+        // and reported overflow **while holding a reusable slot it had just
+        // walked past**.
+        //
+        // A build maps and unmaps thousands of files through a 1024-slot table,
+        // so it saturates with tombstones within one build and then overflowed on
+        // essentially every `acquire`. That kept `pin_ovf` permanently non-zero
+        // with `pin` reading 5-93, which stalls `akuma_ext2`'s deferred-free
+        // drain and takes its queue to the bound
+        // (`EXT2_UNLINK_INODE_BLOCK_LEAK.md` §2.5).
+        if let Some((target, expect)) = tomb {
+            if TABLE[target]
+                .compare_exchange(expect, pack(inode, 1), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+            // Lost the tombstone to a concurrent insert. Re-probe: the chain may
+            // now hold our key, and there may be another tombstone further on.
+            continue 'restart;
+        }
+        OVERFLOW[region_of(inode)].fetch_add(1, Ordering::AcqRel);
         return;
     }
 }
@@ -208,6 +285,12 @@ fn release(inode: u32) {
                     .compare_exchange(cur, pack(ino, cnt - 1), Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
+                    if cnt == 1 {
+                        // This slot just became a tombstone. Compact it away if we
+                        // can, because unbounded tombstone growth is what breaks
+                        // this table — see `compact_tail`.
+                        compact_tail(pos);
+                    }
                     return;
                 }
                 continue 'restart;
@@ -215,9 +298,10 @@ fn release(inode: u32) {
         }
         // No entry: the matching `acquire` overflowed. Cancel it out so the
         // table's conservative mode ends when the lost pins are gone.
-        let mut cur = OVERFLOW.load(Ordering::Acquire);
+        let slot = &OVERFLOW[region_of(inode)];
+        let mut cur = slot.load(Ordering::Acquire);
         while cur > 0 {
-            match OVERFLOW.compare_exchange_weak(
+            match slot.compare_exchange_weak(
                 cur,
                 cur - 1,
                 Ordering::AcqRel,
@@ -231,6 +315,65 @@ fn release(inode: u32) {
     }
 }
 
+/// Clear the tombstone at `pos`, and any run of tombstones behind it, **iff
+/// doing so cannot truncate a probe chain.**
+///
+/// # Why this is necessary
+///
+/// `release` leaves `(inode, 0)` rather than `0`, because zeroing a slot
+/// mid-chain would truncate the probe chain of every key that hashed earlier and
+/// probed past it. Left to accumulate, those tombstones break the table in *two*
+/// separate places, and the second one is subtle:
+///
+/// - `acquire` walks `PROBE_LIMIT` slots without finding an empty one and reports
+///   overflow (fixed separately by recycling the tombstone it passed), and
+/// - **`is_pinned` never sees `cur == 0`, so it falls through its probe loop to
+///   its conservative `true`.** That makes it answer "pinned" for *every* inode
+///   with zero live pins and no overflow, which stops `akuma_ext2`'s
+///   `drain_deferred_frees` from freeing anything at all. Measured: 4567 drain
+///   calls, **0 inodes freed**, `slots=1015/1024` occupied against `pin=0` live
+///   (`EXT2_UNLINK_INODE_BLOCK_LEAK.md` §2.6).
+///
+/// # Why it is sound
+///
+/// A slot is cleared only when the **next** slot is already empty. Linear-probe
+/// chains are contiguous and terminate at the first empty slot, so if `pos + 1`
+/// is empty then no key whose home is at or before `pos` can live beyond `pos` —
+/// there is no chain passing *through* `pos` to truncate.
+///
+/// The race is closed by using `compare_exchange` rather than `store`: for a key
+/// with home at or before `pos` to land at `pos + 1`, `acquire` would have to walk
+/// past this tombstone, and it cannot — it records the first tombstone it passes
+/// and claims it once it reaches the empty slot, so it takes `pos` itself. Our CAS
+/// then fails and we leave the slot alone, which is correct.
+fn compact_tail(pos: usize) {
+    let mut at = pos;
+    for _ in 0..PROBE_LIMIT {
+        // Only safe while the following slot is empty.
+        if TABLE[(at + 1) & MASK].load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let cur = TABLE[at].load(Ordering::Acquire);
+        if cur == 0 {
+            return;
+        }
+        let (_, cnt) = unpack(cur);
+        if cnt != 0 {
+            // A live entry, not a tombstone. Stop: it must stay.
+            return;
+        }
+        if TABLE[at]
+            .compare_exchange(cur, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Someone claimed or revived it; nothing to compact here.
+            return;
+        }
+        // Clearing `at` may have exposed a tombstone behind it. Walk back.
+        at = at.wrapping_sub(1) & MASK;
+    }
+}
+
 /// Does a live mapping name `inode`?
 ///
 /// The filesystem asks this before freeing an inode, so **`true` must be
@@ -241,7 +384,10 @@ pub fn is_pinned(inode: u32) -> bool {
     if inode == 0 {
         return false;
     }
-    if OVERFLOW.load(Ordering::Acquire) > 0 {
+    // Only THIS inode's region, not the whole table: a pin lost in some other
+    // region says nothing about this inode, and answering `true` for everything
+    // is what stalls `drain_deferred_frees` into an unbounded queue.
+    if OVERFLOW[region_of(inode)].load(Ordering::Acquire) > 0 {
         return true;
     }
     let home = slot_of(inode);
@@ -261,8 +407,26 @@ pub fn is_pinned(inode: u32) -> bool {
     true
 }
 
+/// Slots holding anything at all — live pins **and tombstones** — out of
+/// [`SLOTS`].
+///
+/// The companion [`pinned_inodes`] counts only `cnt > 0`, which makes tombstones
+/// invisible, and that is exactly how a table saturated with dead entries hid
+/// behind a `pin=5` reading while `acquire` spuriously reported overflow on
+/// every insert (`EXT2_UNLINK_INODE_BLOCK_LEAK.md` §2.5). A rising figure here
+/// with a low `pinned_inodes` is the tombstone-congestion signature; if it sits
+/// near [`SLOTS`], probe chains are long and inserts are recycling tombstones
+/// rather than finding empty slots.
+#[must_use]
+pub fn slots_occupied() -> usize {
+    TABLE
+        .iter()
+        .filter(|s| s.load(Ordering::Relaxed) != 0)
+        .count()
+}
+
 /// Live pin count for `inode` — diagnostics and tests only. Does **not** consult
-/// [`OVERFLOW`], so it reports what the table actually holds.
+/// the overflow counters, so it reports what the table actually holds.
 #[must_use]
 pub fn pin_count(inode: u32) -> u32 {
     if inode == 0 {
@@ -374,7 +538,7 @@ mod tests {
             let p = InodePin::new(ino);
             drop(p);
         }
-        assert_eq!(OVERFLOW.load(Ordering::Acquire), 0, "no overflow from reuse");
+        assert_eq!(overflow_count(), 0, "no overflow from reuse");
         assert!(!is_pinned(ino));
     }
 
@@ -414,6 +578,132 @@ mod tests {
         assert!(!is_pinned(b));
     }
 
+    /// **The bug that stopped the ext2 deferred-free drain.** After heavy
+    /// pin/unpin churn the table must not report a never-pinned inode as pinned,
+    /// and must not stay occupied.
+    ///
+    /// `is_pinned` terminates its probe on `cur == 0`; a tombstone is non-zero,
+    /// so a window saturated with tombstones made it fall through to its
+    /// conservative `true` — for **every** inode, with zero live pins and no
+    /// overflow. `drain_deferred_frees` re-asks `is_pinned` per entry, so it froze
+    /// completely: measured 4567 drain calls and **0** inodes freed, with
+    /// `slots=1015/1024` occupied against `pin=0`
+    /// (`EXT2_UNLINK_INODE_BLOCK_LEAK.md` §2.6).
+    #[test]
+    fn churn_does_not_leave_the_table_answering_pinned_for_everything() {
+        let _g = serial();
+        let home_seed = 90_001;
+        let home = slot_of(home_seed);
+        let mut colliders = Vec::new();
+        let mut cand = home_seed;
+        while colliders.len() < PROBE_LIMIT + 8 {
+            if slot_of(cand) == home {
+                colliders.push(cand);
+            }
+            cand += 1;
+            assert!(cand < home_seed + 100_000_000, "not enough colliders");
+        }
+
+        // Saturate the window, then release everything: pure churn, nothing live.
+        let fill: Vec<InodePin> = colliders.iter().map(|i| InodePin::new(*i)).collect();
+        drop(fill);
+
+        // An inode on that chain that was NEVER pinned must read unpinned. This is
+        // the question `drain_deferred_frees` asks about every queued entry.
+        let never = {
+            let mut c = cand;
+            loop {
+                if slot_of(c) == home && !colliders.contains(&c) {
+                    break c;
+                }
+                c += 1;
+                assert!(c < cand + 100_000_000, "no further collider");
+            }
+        };
+        assert_eq!(pin_count(never), 0, "fixture: it must never have been pinned");
+        assert_eq!(overflow_count(), 0, "fixture: no overflow should be involved");
+        assert!(
+            !is_pinned(never),
+            "a table churned to saturation must not answer `pinned` for an inode \
+             that was never pinned — this is what froze the ext2 drain at 0 frees",
+        );
+
+        // And the tombstones must actually be gone, not merely tolerated: an
+        // unbounded occupancy is what produces the saturation in the first place.
+        assert!(
+            slots_occupied() < PROBE_LIMIT,
+            "released pins must be compacted away; {} slots still occupied",
+            slots_occupied(),
+        );
+    }
+
+    /// A chain saturated with **tombstones** — dead entries, no live pins — must
+    /// not report overflow. Recycling them is what tombstones are for.
+    ///
+    /// This is the defect that kept `pin_ovf` permanently non-zero on a table
+    /// only ~0.5 % live: `acquire` recorded the first tombstone it passed but
+    /// only *used* it inside its `cur == 0` branch, so a 32-slot window with no
+    /// empty slot fell through to the overflow counter while holding a reusable
+    /// slot. A build cycles thousands of inodes through 1024 slots, saturating
+    /// them with tombstones within one build, after which nearly every `acquire`
+    /// overflowed — which stalls `akuma_ext2`'s deferred-free drain and drives
+    /// its queue to the bound (`EXT2_UNLINK_INODE_BLOCK_LEAK.md` §2.5).
+    #[test]
+    fn a_chain_of_tombstones_is_recycled_not_overflowed() {
+        let _g = serial();
+        // Colliders: enough to fill a probe window and then some.
+        let home_seed = 70_001;
+        let home = slot_of(home_seed);
+        let mut colliders = Vec::new();
+        let mut cand = home_seed;
+        while colliders.len() < PROBE_LIMIT + 4 {
+            if slot_of(cand) == home {
+                colliders.push(cand);
+            }
+            cand += 1;
+            assert!(cand < home_seed + 100_000_000, "not enough colliders");
+        }
+
+        // Fill the chain, then release everything: every slot in the window is
+        // now `(inode, 0)` — a tombstone — and nothing is live.
+        //
+        // The pins must be held **simultaneously** and dropped together. A
+        // first attempt at this fixture did `drop(InodePin::new(i))` per inode,
+        // which acquires and releases one at a time — so each insert recycled
+        // the *previous* tombstone, only one slot was ever occupied, and the
+        // test passed with the fix removed. Verified by re-running it against
+        // the unfixed `acquire`.
+        let fill: Vec<InodePin> = colliders.iter().map(|i| InodePin::new(*i)).collect();
+        drop(fill);
+        assert_eq!(
+            pin_count(colliders[0]), 0,
+            "the fixture must leave no live pins",
+        );
+
+        let before = overflow_count();
+        // A fresh inode on that same chain must find a home in a recycled
+        // tombstone rather than reporting overflow.
+        let newcomer = colliders[colliders.len() - 1] + 0; // same chain by construction
+        let fresh = {
+            let mut c = newcomer + 1;
+            loop {
+                if slot_of(c) == home && !colliders.contains(&c) {
+                    break c;
+                }
+                c += 1;
+                assert!(c < newcomer + 100_000_000, "no further collider");
+            }
+        };
+        let pin = InodePin::new(fresh);
+        assert_eq!(
+            overflow_count(), before,
+            "a chain of tombstones must be recycled, not reported as overflow",
+        );
+        assert_eq!(pin_count(fresh), 1, "the new pin must be recorded");
+        assert!(is_pinned(fresh));
+        drop(pin);
+    }
+
     #[test]
     fn overflow_is_conservative_and_self_clearing() {
         let _g = serial();
@@ -430,18 +720,40 @@ mod tests {
             cand += 1;
             assert!(cand < home_seed + 100_000_000, "not enough colliders");
         }
-        let before = OVERFLOW.load(Ordering::Acquire);
+        let before = overflow_count();
         let pins: Vec<InodePin> = colliders.iter().map(|i| InodePin::new(*i)).collect();
         assert!(
-            OVERFLOW.load(Ordering::Acquire) > before,
+            overflow_count() > before,
             "a full chain must record overflow"
         );
-        // While pins are lost, every inode reads as pinned — including one that
-        // was never pinned at all.
-        assert!(is_pinned(999_999), "overflow must answer conservatively");
+        // Conservative WITHIN the overflowed region: an inode hashing there reads
+        // pinned even though nothing recorded a pin for it. This is the property
+        // that keeps a lost pin from ever permitting a free.
+        let victim = (home_seed..home_seed + 10_000_000)
+            .find(|i| region_of(*i) == region_of(home_seed) && !colliders.contains(i))
+            .expect("an unpinned inode in the overflowed region");
+        assert!(
+            is_pinned(victim),
+            "an inode in the overflowed region must answer conservatively",
+        );
+
+        // ...but CONFINED to it: an inode in another region is unaffected. This
+        // is the whole point of per-region accounting — with one global flag this
+        // read was `true`, which stalls a deferred-free drain into an unbounded
+        // queue (`EXT2_UNLINK_INODE_BLOCK_LEAK.md` §2.4).
+        let elsewhere = (1u32..10_000_000)
+            .find(|i| region_of(*i) != region_of(home_seed) && pin_count(*i) == 0)
+            .expect("an inode in a different region");
+        assert!(
+            !is_pinned(elsewhere),
+            "overflow in one region must NOT make inode {elsewhere} (region {}) read pinned; \
+             a global flag here is what blocked the ext2 deferred-free drain",
+            region_of(elsewhere),
+        );
+
         drop(pins);
         assert_eq!(
-            OVERFLOW.load(Ordering::Acquire),
+            overflow_count(),
             before,
             "overflow must unwind as the lost pins are released"
         );

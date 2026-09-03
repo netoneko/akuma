@@ -8,6 +8,11 @@ description = "Ext2 filesystem implementation for no_std kernels"
 workspace = true
 
 [features]
+# Deferred-free drain instrumentation (`DEFERRED_DRAIN_*`). OFF by default:
+# `DEFERRED_DRAIN_SKIPPED` increments once per skipped entry per drain pass, and
+# a drain sweeps up to `DEFERRED_FREE_SLOTS` entries and runs tens of thousands
+# of times per build, so it is the one counter here with a real hot-path cost.
+pmm-instr = []
 extreme = []
 # Large, RAM-sized, clock-eviction block cache (replaces the tiny 64-slot ring).
 # Keeps the read-only toolchain (.so + rlibs) resident across the hundreds of

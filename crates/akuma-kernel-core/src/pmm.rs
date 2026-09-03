@@ -42,7 +42,7 @@ pub fn dp_counters_line(w: &mut dyn core::fmt::Write) {
         // should drain to 0; `defer_leak=` is inodes leaked because the deferral
         // list was full and **must stay 0** — non-zero means raise the bound.
         akuma_primitives::inode_pin::pinned_inodes(),
-        akuma_primitives::inode_pin::OVERFLOW.load(Ordering::Relaxed),
+        akuma_primitives::inode_pin::overflow_count(),
         akuma_ext2::deferred_free_pending(),
         akuma_ext2::DEFERRED_FREE_LEAKED.load(Ordering::Relaxed),
     );

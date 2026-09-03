@@ -635,6 +635,28 @@ pub static DEFERRED_FREE_PENDING: AtomicUsize = AtomicUsize::new(0);
 /// Leaked blocks are recoverable (`e2fsck` reconnects them to `lost+found`);
 /// bytes handed to the wrong reader are not, which is why this is the direction
 /// the overflow falls. Non-zero here means the bound needs raising.
+/// Times [`Ext2Filesystem::drain_deferred_frees`] has been entered, and inodes it
+/// has actually freed.
+///
+/// These exist because the queue was observed climbing to 3022 entries across six
+/// builds while at most 99 inodes were pinned and `pin_ovf` was 0 — a state that
+/// the drain's own logic says is impossible, since one call sweeps every slot and
+/// frees each unpinned entry, and `allocate_inode` calls it thousands of times
+/// per build. The counters separate the three explanations that the queue length
+/// alone cannot: **never ran** (`calls` flat), **ran and skipped** (`calls` rises,
+/// `freed` flat — so `is_pinned` is answering `true`, e.g. for a reused inode
+/// number), or **ran and was out-run** (both rise, queue still grows).
+/// `EXT2_UNLINK_INODE_BLOCK_LEAK.md` §2.6.
+///
+/// Written only under `feature = "pmm-instr"`; without it they stay 0. The
+/// statics remain compiled so `[INODE]`'s formatting needs no `cfg` of its own.
+pub static DEFERRED_DRAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
+pub static DEFERRED_DRAIN_FREED: AtomicUsize = AtomicUsize::new(0);
+/// Entries a drain pass skipped because [`is_pinned`] said the inode was still
+/// mapped. A large value against a small `[INODE] pin=` is the "reused inode
+/// number" signature.
+pub static DEFERRED_DRAIN_SKIPPED: AtomicUsize = AtomicUsize::new(0);
+
 pub static DEFERRED_FREE_LEAKED: AtomicUsize = AtomicUsize::new(0);
 
 /// Inodes currently awaiting their deferred free, for the `[Mem]`/PSTATS dump.
@@ -2253,9 +2275,16 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// freeing it would reintroduce exactly the defect the deferral exists to
     /// prevent.
     fn drain_deferred_frees(&self, state: &mut Ext2State) {
+        #[cfg(feature = "pmm-instr")]
+        DEFERRED_DRAIN_CALLS.fetch_add(1, Ordering::Relaxed);
         for slot in &self.deferred.slots {
             let inode_num = slot.load(Ordering::Acquire);
-            if inode_num == 0 || akuma_primitives::inode_pin::is_pinned(inode_num) {
+            if inode_num == 0 {
+                continue;
+            }
+            if akuma_primitives::inode_pin::is_pinned(inode_num) {
+                #[cfg(feature = "pmm-instr")]
+                DEFERRED_DRAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             // Claim it before doing any work, so a concurrent drain cannot free
@@ -2267,6 +2296,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 continue;
             }
             DEFERRED_FREE_PENDING.fetch_sub(1, Ordering::Relaxed);
+            #[cfg(feature = "pmm-instr")]
+            DEFERRED_DRAIN_FREED.fetch_add(1, Ordering::Relaxed);
             // Best-effort from here: a failure leaves the inode allocated but
             // unreferenced, which `e2fsck` reconnects. Re-queueing it on error
             // could spin on a permanently failing inode.

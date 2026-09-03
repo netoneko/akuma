@@ -18,7 +18,8 @@ extern crate alloc;
 mod ext2;
 
 pub use ext2::{
-    DEFERRED_FREE_LEAKED, DEFERRED_FREE_PENDING, Ext2Filesystem, cache_occupancy, cache_stats, deferred_free_pending,
+    DEFERRED_DRAIN_CALLS, DEFERRED_DRAIN_FREED, DEFERRED_DRAIN_SKIPPED, DEFERRED_FREE_LEAKED,
+    DEFERRED_FREE_PENDING, Ext2Filesystem, cache_occupancy, cache_stats, deferred_free_pending,
     init_inode_freed_hook, set_cache_cap_bytes,
 };
 

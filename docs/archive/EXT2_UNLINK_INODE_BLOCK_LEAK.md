@@ -1,17 +1,34 @@
 # Deleting files frees no space: ext2 leaks inodes and blocks on unlink
 
-**Status: FIXED 2026-09-03** — `DEFERRED_FREE_SLOTS` 256 -> 4096, `#[must_use]`
-on `DeferredFrees::push`, and a forced drain-and-retry before `release_last_link`
-will give up. Verified on a live guest by `ext2probe`'s new pinned phase:
-`defer_leak` **944 -> 0**, reclamation of unlinked-while-mapped blocks
-**21 % -> 85 %** (the remaining 15 % is the lazy drain, not loss — see §2.3), and
-a host regression test that fails at the old bound. The §3.1 amplifier is
-**deliberately still there**; §6 says why.
+**Status: FIXED 2026-09-03.** Per-build disk growth on two consecutive clean
+in-guest builds is **0 MB**, down from a flat +141 MB. The root cause was **not**
+the deferral list at all — it was **tombstone saturation in the inode pin table**
+making `is_pinned` answer `true` for every inode, which froze the deferred-free
+drain at *zero frees in 4567 calls*. Four changes went in; only the last one was
+the cure. §2.5 and §2.6 are the chain, §6 is what each change did and did not do.
+
+The four changes, in the order they landed:
+
+1. `#[must_use]` on `DeferredFrees::push` — its `bool` was discarded at its only
+   call site, so `release_last_link` zeroed `hard_links` and wrote the inode back
+   even when the free had not been queued.
+2. `DEFERRED_FREE_SLOTS` 256 -> 4096, plus a forced drain-and-retry before giving
+   up.
+3. Per-region overflow accounting in the pin table, replacing one global flag.
+4. **Tombstone handling in the pin table — the cure.** `acquire` now recycles a
+   tombstone it walked past instead of reporting overflow, and `release` compacts
+   a tombstone away when the following slot is empty (`compact_tail`).
 
 **Date:** 2026-09-03
-**Status:** **OPEN** — root-caused and measured, not fixed.
-**Reproduce:** on any devbox with a build tree, `cargo clean` (or `rm -rf` a large
-directory) and watch `df`. The space does not come back.
+**Status:** **FIXED** — 0 MB growth across three consecutive clean builds
+(`dused` 3885 / 3885 / 3885 MB), `defer=0`, `pin_ovf=0`, `defer_leak=0`,
+`slots` tracking live pins.
+**Reproduce (pre-fix):** on any devbox with a build tree, `cargo clean` (or
+`rm -rf` a large directory) and watch `df`. The space does not come back.
+**Regression check:** `ext2probe`'s pinned phase (`SPACE OK` / `SPACE LEAK`), the
+`[INODE]` line (`defer`, `pin_ovf`, `defer_leak` and `slots` must all stay low),
+and three host tests in `akuma-primitives`/`akuma-ext2`, each verified to fail
+when its fix is reverted.
 
 ---
 
@@ -182,6 +199,132 @@ the ordinary immediate-free path was never broken.
 cumulative counter: `release` decrements it when it finds no entry, so it
 self-clears once pins drop and cannot tell you whether it overflowed mid-run.
 Do not read `pin_ovf=0` after the fact as "the table never overflowed".
+
+### 2.4 The campaign that refuted "fixed" — `defer` climbs, it does not drain
+
+Four in-guest builds at `MEMORY=2048` on the fixed kernel, reading the newly
+visible `[INODE]` line (§6.4) for the first time during a *real* build rather
+than a probe:
+
+```
+[INODE] pin=25 pin_ovf=0  defer=0    defer_leak=0
+[INODE] pin=0  pin_ovf=0  defer=216  defer_leak=0
+[INODE] pin=78 pin_ovf=27 defer=875  defer_leak=0
+[INODE] pin=13 pin_ovf=8  defer=1365 defer_leak=0
+[INODE] pin=14 pin_ovf=3  defer=2252 defer_leak=0
+```
+
+| | reading |
+|---|---|
+| `defer_leak=0` throughout | the applied fix does what it claims — nothing is abandoned |
+| per-build disk delta | **+148 MB -> +54, +25, -13** — and one *negative*, so the drain does sometimes run |
+| `defer` | **0 -> 216 -> 875 -> 1365 -> 2252**, monotonic, ~550/build |
+| `pin_ovf` | **27 -> 8 -> 3** — decaying as releases balance it, but never reaching 0 |
+
+**`defer` should oscillate — fill, drain, refill. It only climbs.** At 2252 of
+4096 after four builds it is 55 % of the way to the new bound, so the bound is
+reached around build 7-8 and `defer_leak` starts climbing again. The applied fix
+is therefore worth ~7 builds of headroom.
+
+The cause is exactly the §3.1 latch, now with numbers: while `pin_ovf > 0`,
+`is_pinned` answers `true` for **every** inode, so `drain_deferred_frees` can free
+nothing and the queue only grows. `pin_ovf` hovering at 3-27 rather than 0 is
+enough to block the drain completely — it does not need to be large, only
+non-zero.
+
+**Why the earlier "not load-bearing" call was wrong.** §6.3 originally deferred
+the amplifier because `ext2probe` measured `pin_ovf=0` and `defer=0`. That was a
+true measurement of the wrong workload: the probe maps 1200 files and releases
+them in one batch, so its overflow self-clears before the sample. A `-j4` build
+holds a churning set of mappings continuously and keeps `pin_ovf` off zero. **A
+probe that does not reproduce the pin pressure cannot license a decision about
+the pin table.**
+
+### 2.5 First wrong turn: the bound, the amplifier, and `acquire`'s tombstones
+
+Three changes landed before the real cause was found. Each fixed a genuine defect
+and none fixed the leak, which is worth recording because the *reasoning* that
+justified them looked sound at the time:
+
+| change | what it fixed | effect on the leak |
+|---|---|---|
+| `DEFERRED_FREE_SLOTS` 256 -> 4096 + `#[must_use]` on `push` | `push`'s `false` was discarded at its only call site — a real leak of the surplus | +141 -> +54 MB. Bought ~1 build of headroom |
+| per-region overflow accounting (was one global flag) | one lost pin no longer poisons every inode | +54 -> +40 MB. The stall was not coming from `OVERFLOW` |
+| tombstone reuse in `acquire` | it walked past reusable tombstones and reported overflow anyway, on a table 0.5 % live. `pin_ovf` 21 -> **0** | +40 -> +38 MB. Insertion was never what froze the drain |
+
+The lesson in the middle row: `ext2probe` measured `pin_ovf=0` and licensed
+deferring the amplifier work. That was a true measurement of the **wrong
+workload** — the probe maps 1200 files and drops them in one batch, so its
+overflow self-clears before the sample, while a `-j4` build holds a churning
+mapping set continuously. **A probe that does not reproduce the pin pressure
+cannot license a decision about the pin table.**
+
+### 2.6 The actual root cause: `is_pinned` falls through to `true`
+
+Two counters found it in one sample. `slots_occupied()` was added because
+`pinned_inodes()` counts only `cnt > 0`, so tombstones are invisible — a table
+99 % occupied reported `pin=0`. `drain(calls= freed= skipped=)` was added to
+separate "never ran" from "ran and skipped" from "out-run":
+
+```
+[INODE] pin=0/1015slots pin_ovf=0 defer=4 defer_leak=0 drain(calls=4567 freed=0 skipped=1121)
+```
+
+**4567 drain calls, 0 inodes freed, 1015 of 1024 slots occupied, 0 live pins.**
+The only path that produces that is the tail of `is_pinned`:
+
+```rust
+for i in 0..PROBE_LIMIT {
+    if cur == 0 { return false; }      // never reached: a tombstone is non-zero
+    if ino == inode { return cnt > 0; }
+}
+true    // "the table is congested and absence cannot be proven. Say pinned."
+```
+
+`release` leaves `(inode, 0)` rather than `0` — necessary, since zeroing a slot
+mid-chain truncates the probe chain of any key that hashed earlier and probed past
+it. But nothing ever removed them, so a build churning thousands of inodes through
+1024 slots saturated every probe window. `is_pinned` then never sees `cur == 0`,
+never matches the key, and returns its conservative `true` **for every inode** —
+with zero live pins and no overflow. `drain_deferred_frees` re-asks it per entry,
+so it froze completely.
+
+The full chain, evidenced at every link:
+
+**build churns inodes through 1024 slots -> tombstones saturate -> `is_pinned`
+hits its `PROBE_LIMIT` fallback and says `true` for everything -> the drain frees
+nothing -> the queue climbs to its bound -> `defer_leak` starts -> blocks
+abandoned on disk.**
+
+The measured 252 MiB of orphaned blocks matched the queue to within two inodes
+(`'deleted inode has zero dtime'` = 3024 vs `defer=3022`) and matched the whole
+campaign's 251 MB of growth. So there was never a second leak, and never a
+non-idempotent workload — both were live hypotheses until this closed them.
+
+### 2.6a The fix: compaction on release
+
+`compact_tail` (`akuma-primitives/src/inode_pin.rs`) clears a tombstone **iff the
+next slot is already empty**, then walks backwards over any run behind it. Sound
+because linear-probe chains are contiguous and terminate at the first empty slot:
+if `pos + 1` is empty, no key whose home is at or before `pos` can live beyond it,
+so there is no chain passing through `pos` to truncate. It uses
+`compare_exchange`, not `store`, which closes the race — for a key with home at or
+before `pos` to land at `pos + 1`, `acquire` would have to walk *past* the
+tombstone, and it cannot: it claims the first tombstone it passes once it reaches
+the empty slot, so it takes `pos` itself and our CAS fails.
+
+Result, over consecutive clean builds:
+
+| | before | after |
+|---|---|---|
+| `slots` occupied | 941 -> 1015 / 1024 | **0, 57, 61** (tracks live pins) |
+| `defer` | 0 -> 3022, monotonic | **0** throughout |
+| `drain(freed=)` | 0 in 4567 calls | 0 — *and correct*: `defer=0`, so nothing is ever queued |
+| `dused` between clean builds | +141 MB | **0 MB** |
+
+`freed=0` is now the right answer rather than the symptom: with `is_pinned`
+answering truthfully, `release_last_link` takes its **immediate-free** path and
+unlinks never enter the queue at all.
 
 ## 3. Root cause
 

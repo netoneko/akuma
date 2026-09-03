@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 785
-- **Docs contributing at least one fix:** 254
+- **Total distinct fixes counted:** 791
+- **Docs contributing at least one fix:** 257
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 132 | 16.8% | 20 |
-| Memory & Virtual Memory | 122 | 15.5% | 39 |
-| Scheduler & Process Management | 79 | 10.1% | 22 |
-| SMP & Locking | 98 | 12.5% | 42 |
-| Networking | 58 | 7.4% | 22 |
+| Syscall / ABI Compatibility Audits | 132 | 16.7% | 20 |
+| Memory & Virtual Memory | 123 | 15.5% | 40 |
+| Scheduler & Process Management | 79 | 10.0% | 22 |
+| SMP & Locking | 98 | 12.4% | 42 |
+| Networking | 58 | 7.3% | 22 |
 | Userspace Apps & Libraries | 37 | 4.7% | 20 |
 | Rump Kernel & Syscall Proxy | 26 | 3.3% | 6 |
-| Toolchain & Self-Hosting | 43 | 5.5% | 7 |
+| Toolchain & Self-Hosting | 43 | 5.4% | 7 |
 | SSH | 26 | 3.3% | 15 |
-| VFS & Filesystem | 33 | 4.2% | 18 |
-| Boot & Drivers | 24 | 3.1% | 9 |
-| Signals & Exceptions | 15 | 1.9% | 7 |
+| VFS & Filesystem | 37 | 4.7% | 19 |
+| Boot & Drivers | 24 | 3.0% | 9 |
+| Signals & Exceptions | 16 | 2.0% | 8 |
 | Misc / Cross-cutting | 36 | 4.6% | 10 |
-| Console & Terminal | 32 | 4.1% | 11 |
-| Containers | 24 | 3.1% | 6 |
-| **Total** | **785** | **100.0%** | **254** |
+| Console & Terminal | 32 | 4.0% | 11 |
+| Containers | 24 | 3.0% | 6 |
+| **Total** | **791** | **100.0%** | **257** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -182,7 +182,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - Converting `sys_sysinfo`'s hand-written `[u8; 112]` byte-offset writes into a `repr(C)` `Sysinfo` struct left its tail padding uninitialized (`#[derive(Default)]` does not zero padding), so the first version handed userspace 4 bytes of live kernel stack on every `sysinfo(2)` call — an info leak invisible to every gate tier because nothing reads those bytes; fixed with a named `_f: [u8; 4]` field plus `defaulted_sysinfo_has_no_uninitialised_bytes`, asserting all 112 bytes are zero
 - The syscall epilogue re-used the prologue's process identity across the whole dispatch (Finding A of `IDENTITY_CACHE_SMP_REVIEW.md`, left open there), reachable when `kill_thread_group` retires a `CLONE_THREAD` sibling still inside a blocking syscall and a reclaim drain runs before the epilogue writes — a witness found at depth 2 by exhaustively enumerating `claim`/`retire`/`reclaim` interleavings rather than by a soak; fixed by having the epilogue re-resolve the identity cache after dispatch (`IdentitySource::Reresolve`) and skip its `Process` writes on a miss
 
-## Memory & Virtual Memory (122 fixes, 39 docs)
+## Memory & Virtual Memory (123 fixes, 40 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -385,6 +385,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/BUSYBOX_HASH_MISCOMPUTE.md
 - `sync_el1_handler` (`src/exceptions.rs`) saved only x0-x3/x29/x30, but the EL1 paths that *resolve* a fault (`try_resolve_el1_cow_fault`, `try_resolve_el1_user_copy_lazy_fault`) `eret` back to re-execute the faulting instruction, so a page fault mid-copy replayed the widened multi-register `stp` store with x4-x18 holding leftover handler state instead of the copy's own live data — busybox `md5sum`/`sha*sum` returned a wrong, non-deterministic digest for an unmodified file roughly 40-50% of the time, for any file over one page; fixed by making the vector transparent to x4-x18, guarded by `test_el1_sync_exception_preserves_gprs`
 
+
+### docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md
+- `drain_pending_ttbr_frees` `swap_remove`d `PendingAsFree` entries into a local `Vec` and only then freed them, on a deferred-reclaim path documented as running on an already-terminated thread that can be permanently preempted mid-sweep — so the carried entries were orphaned: gone from the global list, still holding whole `UserAddressSpace::user_frames` maps, unreachable. The kernel heap climbed 13 MB -> 760 MB across repeated in-guest clean builds and OOM-killed `rustc`. Fixed by a terminal gate on `drain_retired` plus `CACHE_CHUNK_BYTES` 1 MB -> 64 KB: abandoned drains 77 -> 0, orphaned entries 1 466 360 -> 0, and `heap_mb` flat within 7 MB across eight consecutive builds
 
 ## Scheduler & Process Management (79 fixes, 22 docs)
 
@@ -1053,7 +1056,7 @@ aren't recorded anywhere else.)
 
 ---
 
-## VFS & Filesystem (33 fixes, 18 docs)
+## VFS & Filesystem (37 fixes, 19 docs)
 
 ### docs/archive/AKUMA_EXT2_CLEANUP.md
 - §2.3: `read_inode` heap over-read (UB) — a rev-1 superblock's `inode_size` was taken off disk with no minimum check, so an image with `inode_size < 128` blitted a whole `Inode` out of a smaller allocation
@@ -1126,6 +1129,12 @@ aren't recorded anywhere else.)
 - `utimensat` (`nr::UTIMENSAT`) was a bare `=> 0` stub that always reported success, so busybox `touch`'s ENOENT-then-create idiom never fired and `touch newfile` exited 0 while creating nothing — a stub whose success return actively suppressed the file creation; fixed with a real handler (`fs::sys_utimensat`) returning `ENOENT`/`EBADF`/`EFAULT`/`EINVAL` from the real dirfd/path/times validation, matching Linux's argument-before-path-lookup ordering
 - `akuma_vfs::Filesystem` had no operation to set an inode's timestamps at all, so `touch -d`/`touch -t` silently changed nothing and a plain re-`touch` of an existing file never refreshed its mtime (`make` would never see a target as newer); fixed via `Filesystem::set_times(path, atime, mtime)` (each an `Option`, `None` meaning `UTIME_OMIT`) implemented in ext2 (mirroring `chmod`, deliberately not bumping mtime for an atime-only call) and the mtime half in memfs
 
+### docs/archive/EXT2_UNLINK_INODE_BLOCK_LEAK.md
+- `release_last_link` called `DeferredFrees::push` as a bare statement, discarding the `false` that means "no room, you must handle this", then zeroed `hard_links` and wrote the inode back anyway — leaving it allocated with no name and no queued free. `#[must_use]` on `push`, plus a forced drain-and-retry and `DEFERRED_FREE_SLOTS` 256 -> 4096, so the surplus is no longer abandoned
+- `is_pinned` fell out of its `PROBE_LIMIT` loop to its conservative `true` on a table saturated with **tombstones** — `release` leaves `(inode, 0)` and nothing removed it — so it answered "pinned" for *every* inode with zero live pins and no overflow, freezing `drain_deferred_frees` at **0 frees in 4567 calls** and driving its queue to the bound. Fixed by `compact_tail`: clear a tombstone when the next slot is already empty (sound because linear-probe chains are contiguous and end at the first empty slot), CAS not store to close the insert race. Per-build disk growth +141 MB -> **0 MB** over six consecutive clean builds
+- `acquire` recorded the first tombstone it walked past but only consulted it inside its `cur == 0` branch, so a 32-slot window with no empty slot reported overflow while holding a reusable slot — on a table 0.5 % live. `pin_ovf` 21 -> 0
+- One lost pin set a single global overflow flag, which made `is_pinned` conservative for every inode at once; overflow is now accounted per hash region, so a lost pin confines its blast radius to ~1/64 of the table instead of stalling every deferred free
+
 ## Boot & Drivers (24 fixes, 9 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
@@ -1172,7 +1181,7 @@ aren't recorded anywhere else.)
 - The `devbox-smoltcp` boot's `sshd.conf` carried `start_delay_ms = 10000`, tuning inherited from the rump profile's DHCP-handshake wait, but under smoltcp the network stack is already up synchronously before `herd` even starts, so the delay was pure dead time on every boot; set to `0` in `overlays/devbox/rootfs/etc/herd/enabled/sshd.conf` (the rump case still needs the 10s value, kept in `bootstrap/etc/herd/core2/sshd-rump.conf`)
 
 
-## Signals & Exceptions (15 fixes, 7 docs)
+## Signals & Exceptions (16 fixes, 8 docs)
 
 ### docs/archive/CTRL_C_SIGINT_DELIVERY.md
 - Ctrl-C never interrupted a foreground child over `ssh -tt` (repro: `tail -f`): **no line discipline in the tree generated `SIGINT` at all**. Fixed in the kernel as a process-group broadcast; the first attempt — patching sshd to target `foreground_pgid` as a single pid — was wrong and is recorded as such
@@ -1203,6 +1212,9 @@ aren't recorded anywhere else.)
 - `PENDING_SIGNALS` is cleared at the moment of delivery and was the only bit `current_thread_has_pending_interrupt` read, so `rt_sigreturn`'s immediate re-delivery of the next queued signal always cleared it before a blocked syscall's wait loop was scheduled to notice — under a signal source fast enough to keep the deliver→handler→`rt_sigreturn`→deliver chain saturated, `pthread_kill` could never interrupt the blocking syscall it targeted; fixed (necessary but, on its own, not sufficient) via a separate per-thread `DELIVERED_SIGNALS` mask, set once at the `try_deliver_signal` chokepoint and consulted alongside the pending bit
 - Even with that mask, a signal-woken thread rejoined the back of the round-robin run queue, and signal delivery had unbounded priority over resuming the syscall it interrupted (each handler return re-delivered the next pending signal immediately), so under a 10ms-cadence signal sender the interrupted syscall was starved indefinitely rather than merely raced; fixed via `SIGNAL_WAKE_PREEMPT` (runs a signal-woken thread on the next switch) plus `SIGFRAME_ACTIVE` (bounds delivery to one handler per unit of userspace progress, consulted by `rt_sigreturn`)
 
+
+### docs/archive/ERET_ELR_CLOBBER_ENTER_USER_MODE.md
+- `enter_user_mode`'s `asm!` ran the whole EL0-return sequence with IRQs enabled — `leave_kernel()` restores the caller's DAIF immediately above it — so an IRQ between `msr elr_el1` and the `eret` replaced the user PC in `ELR_EL1` with the kernel PC it interrupted, and the later `msr spsr_el1` then repaired SPSR but not ELR; the `eret` dropped to EL0 at a kernel text address, presenting as an intermittent `rustc` SIGSEGV with `FAR == ELR` and every corruption tripwire clean. Fixed with `msr daifset, #2` as the block's first instruction (the sibling SVC epilogue always had it); the wider window instead `eret`s to **EL1** with DAIF masked, an uninterruptible loop in the register-restore tail
 
 ## Misc / Cross-cutting (36 fixes, 10 docs)
 
@@ -1379,9 +1391,9 @@ aren't recorded anywhere else.)
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
 
-Also scanned 2026-09-02 (the `oof-part-2` branch — `akuma-exec` -> `#![forbid(unsafe_code)]`, ahead of merging it). AKUMA_EXEC_FORBID_UNSAFE is the campaign's completion write-up — narrative pointing at fixes counted elsewhere, no bullet of its own. AKUMA_EXEC_USER_ACCESS_EXTRACTION and AKUMA_SLOT_TABLE_EXTRACTION are pure crate-extraction records ("a file move plus a fail-closed hook: behaviour-preserving" / a generic `SlotTable<T, N>` primitive with the identity cache's representation collapsed but semantics preserved) — no defect attached, counted nowhere. AKUMA_KERNEL_HOOKS is an inventory of the tree's 21 boot-registered hook cells; its one landed change — the `RUMP_TESTS_HOOK`/`BOOT_TEST_HOOKS` conversions to `Registered::require()` — is already counted under AKUMA_ENTRY_EXTRACTION (the extraction that prompted the audit), and its `transmute`-hooks finding is "recorded, not done in this pass". The two docs on this branch that *did* surface defects have their own subsections under SMP & Locking above: AKUMA_EXEC_AUDIT (five soundness fixes — a `transmute` round-trip, four `&self -> &mut` / plain-field-written-cross-core sites made atomic or moved inside their lock) and AKUMA_EXEC_ADDRESS_SPACE_MERGE (the last two casts, plus a `CowRemap` self-deadlock the merge exposed). ASID_EXHAUSTION_TIGHT_THREAD_LOOP is **Status: OPEN** — `pthread_create` fails at ~251 serial iterations because ASIDs leak from address spaces whose `Drop` never ran, against `MAX_ASID = 256` — counted nowhere. SELFHOST_KERNEL_HEAP_LEAK stays **open** (the runbook's Tier 5 cap at ~8 trials/boot is the operational takeaway).
+Also scanned 2026-09-02 (the `oof-part-2` branch — `akuma-exec` -> `#![forbid(unsafe_code)]`, ahead of merging it). AKUMA_EXEC_FORBID_UNSAFE is the campaign's completion write-up — narrative pointing at fixes counted elsewhere, no bullet of its own. AKUMA_EXEC_USER_ACCESS_EXTRACTION and AKUMA_SLOT_TABLE_EXTRACTION are pure crate-extraction records ("a file move plus a fail-closed hook: behaviour-preserving" / a generic `SlotTable<T, N>` primitive with the identity cache's representation collapsed but semantics preserved) — no defect attached, counted nowhere. AKUMA_KERNEL_HOOKS is an inventory of the tree's 21 boot-registered hook cells; its one landed change — the `RUMP_TESTS_HOOK`/`BOOT_TEST_HOOKS` conversions to `Registered::require()` — is already counted under AKUMA_ENTRY_EXTRACTION (the extraction that prompted the audit), and its `transmute`-hooks finding is "recorded, not done in this pass". The two docs on this branch that *did* surface defects have their own subsections under SMP & Locking above: AKUMA_EXEC_AUDIT (five soundness fixes — a `transmute` round-trip, four `&self -> &mut` / plain-field-written-cross-core sites made atomic or moved inside their lock) and AKUMA_EXEC_ADDRESS_SPACE_MERGE (the last two casts, plus a `CowRemap` self-deadlock the merge exposed). ASID_EXHAUSTION_TIGHT_THREAD_LOOP is **Status: OPEN** — `pthread_create` fails at ~251 serial iterations because ASIDs leak from address spaces whose `Drop` never ran, against `MAX_ASID = 256` — counted nowhere. SELFHOST_KERNEL_HEAP_LEAK was **since fixed on 2026-09-03** and now has its own subsection under Memory & Virtual Memory above.
 
-Also scanned 2026-09-01 (the `oof` branch — the `src/` -> `crates/` extraction campaign, 40 commits — ahead of merging it). Fourteen crate-extraction records are pure refactors with no defect attached and are counted nowhere: AKUMA_ALLOC_EXTRACTION, AKUMA_CONFIG_EXTRACTION, AKUMA_EXCEPTIONS_EXTRACTION, AKUMA_FDT_EXTRACTION, AKUMA_FPCACHE_EXTRACTION, AKUMA_GIC_CONSOLIDATION (a three-file consolidation that deleted a dead GICv2 backend and two byte-identical MMIO copies — removals, not fixes), AKUMA_SMP_SHARED_SPLIT, AKUMA_SYSCALLS_GLUE_EXTRACTION, AKUMA_UART_EXTRACTION, AKUMA_VFS_GLUE_EXTRACTION, INLINE_ASM_CLEANUP (218 `asm!` sites to 35, mechanical), SRC_SYSCALL_EXTRACTION, and FRAMEBUFFER_REMOVED (a removal). The three docs on this branch that *did* surface defects have their own subsections above: AKUMA_ENTRY_EXTRACTION and SRC_BOOT_ENTRY_UNSAFE_CLEANUP (Misc / Cross-cutting) and SYSCALL_UNSAFE_CLEANUP (SMP & Locking). SELFHOST_KERNEL_HEAP_LEAK is **open** — the kernel heap climbs 13 MB to 760 MB across in-guest clean builds and OOM-kills `rustc`, A/B'd as pre-existing on both arms 2026-09-01, no fix — and is counted nowhere. Two already-listed docs were re-checked for content added on this branch: AKUMA_FIRECRACKER_KVM gained §5.5 (`--no-net` parks in an early non-returning branch of `run_async_main`, so every test section after network init silently does not run) which is a **documentation-only finding, explicitly not a regression and with no fix landed**, so it adds no bullet; DEVBOX_ISSUES gained Issue 27 (SIGILL spam on every `cargo` start) which is **Status: OPEN**. EPOLL_MULTI_POLLER_PIPE_FLAKE gained a real §9 fix and its subsection above was corrected — §6, previously recorded as the fix, is now known not to have been the root cause.
+Also scanned 2026-09-01 (the `oof` branch — the `src/` -> `crates/` extraction campaign, 40 commits — ahead of merging it). Fourteen crate-extraction records are pure refactors with no defect attached and are counted nowhere: AKUMA_ALLOC_EXTRACTION, AKUMA_CONFIG_EXTRACTION, AKUMA_EXCEPTIONS_EXTRACTION, AKUMA_FDT_EXTRACTION, AKUMA_FPCACHE_EXTRACTION, AKUMA_GIC_CONSOLIDATION (a three-file consolidation that deleted a dead GICv2 backend and two byte-identical MMIO copies — removals, not fixes), AKUMA_SMP_SHARED_SPLIT, AKUMA_SYSCALLS_GLUE_EXTRACTION, AKUMA_UART_EXTRACTION, AKUMA_VFS_GLUE_EXTRACTION, INLINE_ASM_CLEANUP (218 `asm!` sites to 35, mechanical), SRC_SYSCALL_EXTRACTION, and FRAMEBUFFER_REMOVED (a removal). The three docs on this branch that *did* surface defects have their own subsections above: AKUMA_ENTRY_EXTRACTION and SRC_BOOT_ENTRY_UNSAFE_CLEANUP (Misc / Cross-cutting) and SYSCALL_UNSAFE_CLEANUP (SMP & Locking). SELFHOST_KERNEL_HEAP_LEAK was open at the time — the kernel heap climbs 13 MB to 760 MB across in-guest clean builds and OOM-kills `rustc`, A/B'd as pre-existing on both arms 2026-09-01 — and was **since fixed on 2026-09-03**; it now has its own subsection under Memory & Virtual Memory above. Two already-listed docs were re-checked for content added on this branch: AKUMA_FIRECRACKER_KVM gained §5.5 (`--no-net` parks in an early non-returning branch of `run_async_main`, so every test section after network init silently does not run) which is a **documentation-only finding, explicitly not a regression and with no fix landed**, so it adds no bullet; DEVBOX_ISSUES gained Issue 27 (SIGILL spam on every `cargo` start) which is **Status: OPEN**. EPOLL_MULTI_POLLER_PIPE_FLAKE gained a real §9 fix and its subsection above was corrected — §6, previously recorded as the fix, is now known not to have been the root cause.
 
 Also scanned 2026-08-30 (the `akuma-exec` split branch, ahead of closing it): AKUMA_EXT2_CLEANUP was parked here as a plan with nothing implemented. **That is no longer true** — all five steps landed 2026-08-30/31 and it now has its own subsection under VFS & Filesystem with six bullets. AKUMA_EXEC_SPLIT_AGAIN's own crate-split content is a refactor and is not counted — only the four defects it surfaced along the way are, under Misc / Cross-cutting above.
 

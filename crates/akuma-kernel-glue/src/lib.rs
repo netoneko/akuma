@@ -1869,17 +1869,25 @@ fn run_async_main() -> ! {
             //                           abandoned because the 256-slot deferral
             //                           list was full. **Must stay 0.** This is
             //                           the ~148 MB/build on-disk leak.
-            // Ungated: these are "must stay 0" tripwires, and gating them behind
-            // a feature is what hid them for the whole of the last campaign.
+            // Gated on `pmm-instr` like the rest of the memory diagnostics. The
+            // underlying counters stay cheap and always-compiled, and the crash
+            // handler's `dp_counters_line` still reports `pin_ovf`/`defer_leak`
+            // unconditionally — so a post-mortem keeps them, and only the 30 s
+            // console line costs anything.
+            #[cfg(feature = "pmm-instr")]
             {
-                let ovf = akuma_primitives::inode_pin::OVERFLOW.load(Ordering::Relaxed);
+                let ovf = akuma_primitives::inode_pin::overflow_count();
                 let leak = akuma_ext2::DEFERRED_FREE_LEAKED.load(Ordering::Relaxed);
                 crate::safe_print!(192,
-                    "[INODE] pin={} pin_ovf={} defer={} defer_leak={}{}\n",
+                    "[INODE] pin={}/{}slots pin_ovf={} defer={} defer_leak={} drain(calls={} freed={} skipped={}){}\n",
                     akuma_primitives::inode_pin::pinned_inodes(),
+                    akuma_primitives::inode_pin::slots_occupied(),
                     ovf,
                     akuma_ext2::deferred_free_pending(),
                     leak,
+                    akuma_ext2::DEFERRED_DRAIN_CALLS.load(Ordering::Relaxed),
+                    akuma_ext2::DEFERRED_DRAIN_FREED.load(Ordering::Relaxed),
+                    akuma_ext2::DEFERRED_DRAIN_SKIPPED.load(Ordering::Relaxed),
                     if leak > 0 {
                         "  *** LEAKING INODES+BLOCKS ON UNLINK ***"
                     } else if ovf > 0 {
