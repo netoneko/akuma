@@ -68,16 +68,48 @@
 //!
 //! # Host builds
 //!
-//! Off `target_os = "none"` every function is a no-op (or returns 0), so host
-//! unit tests in consuming crates link and run.
+//! Off `all(target_os = "none", target_arch = "aarch64")` every function is a
+//! no-op (or returns 0), so host unit tests in consuming crates link and run.
 //!
-//! **The gate is `target_os`, not `target_arch`.** This was written as
-//! `cfg(target_arch = "aarch64")` first, which is a trap on this project: the
-//! development host *is* `aarch64-apple-darwin`, so the gate was true under
-//! `cargo test` and the wrappers really executed — `tlbi`, `dc cvau` and
-//! `mrs esr_el1` are EL1 instructions, and the first host test died with
-//! `SIGILL`. Every other bare-metal gate in the tree keys on `target_os = "none"`
-//! for exactly this reason (`akuma_primitives::preempt::current_tid` among them).
+//! **The gate is the conjunction, and both halves were learned the hard way.**
+//!
+//! *Not `target_arch` alone.* This was written as `cfg(target_arch = "aarch64")`
+//! first, which is a trap on this project: the development host *is*
+//! `aarch64-apple-darwin`, so the gate was true under `cargo test` and the
+//! wrappers really executed — `tlbi`, `dc cvau` and `mrs esr_el1` are EL1
+//! instructions, and the first host test died with `SIGILL`.
+//!
+//! *Not `target_os` alone.* That was the gate here until 2026-09-03, and it was
+//! correct for exactly as long as this tree had one bare-metal target.
+//! `x86_64-unknown-none` is also `target_os = "none"`, so the moment an amd64
+//! target existed (`amd64/`) every one of these functions tried to emit AArch64
+//! instructions into x86 codegen. The symptom was not subtle — `invalid
+//! instruction mnemonic 'mrs'` — but the blast radius was: because
+//! `akuma-primitives` calls into this crate and nearly everything calls into
+//! `akuma-primitives`, **39 of 52 crates failed to build for x86_64 and 13
+//! passed**. Fixing the gate alone took that to 34 passing, with the remaining
+//! 18 blocked by genuinely AArch64-specific code elsewhere. Measured
+//! 2026-09-03; regenerate with the loop in
+//! `proposals/REDUCING_PLATFORM_DEPENDENCY.md` §0.1.
+//!
+//! The lesson generalises to every other bare-metal gate in the tree —
+//! `akuma_primitives::preempt::current_tid` among them — and those are still
+//! `target_os`-only. They are latent duplicates of this bug: harmless while
+//! nothing on x86 calls them, wrong the moment something does.
+//!
+//! # What x86_64 gets today
+//!
+//! The host stub, and that is a **placeholder, not a port.** A no-op `dsb_ish`
+//! and a `park::wfi` that does not park are wrong on real x86 hardware; they are
+//! survivable only because the amd64 target does not yet call this crate. The
+//! functions that could take an honest x86 body (`barrier`, `park`, `cache`) are
+//! a small job. The ones that cannot are the interesting half: `daif::read`
+//! returns a raw `DAIF` whose bit 7 means "masked", while the x86 equivalent is
+//! `RFLAGS.IF` where the *set* bit means "enabled" — opposite polarity in a
+//! `u64` that callers compare against AArch64 bit positions. `tlb`, `vtimer` and
+//! `sysreg` leak their encodings the same way. Those want the neutral vocabulary
+//! `proposals/REDUCING_PLATFORM_DEPENDENCY.md` §3 describes, not an x86 arm
+//! bolted under an AArch64 mnemonic.
 
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::inline_always, clippy::must_use_candidate)]
@@ -90,7 +122,7 @@ pub mod barrier {
     /// `dsb ish` — full data synchronisation barrier, inner-shareable.
     #[inline(always)]
     pub fn dsb_ish() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: a barrier orders accesses; it touches no memory itself.
         unsafe {
             core::arch::asm!("dsb ish", options(nostack, preserves_flags));
@@ -100,7 +132,7 @@ pub mod barrier {
     /// `dsb ishst` — store-only data synchronisation barrier, inner-shareable.
     #[inline(always)]
     pub fn dsb_ishst() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `dsb_ish`.
         unsafe {
             core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
@@ -110,7 +142,7 @@ pub mod barrier {
     /// `dsb sy` — full system data synchronisation barrier.
     #[inline(always)]
     pub fn dsb_sy() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `dsb_ish`.
         unsafe {
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
@@ -121,7 +153,7 @@ pub mod barrier {
     /// context-changing operations before it are seen by instructions after it.
     #[inline(always)]
     pub fn isb() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: flushing the pipeline cannot violate memory safety. Note this
         // makes a *prior* unsafe change (a TTBR write) take effect — the
         // obligation belongs to that write, which is not in this crate.
@@ -141,43 +173,43 @@ pub mod cache {
     /// `dc cvau` — clean one data cache line to the point of unification.
     #[inline(always)]
     pub fn dc_cvau(va: usize) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: cache maintenance by VA does not access the line's contents.
         unsafe {
             core::arch::asm!("dc cvau, {}", in(reg) va, options(nostack, preserves_flags));
         };
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = va;
     }
 
     /// `dc cvac` — clean one data cache line to the point of coherency.
     #[inline(always)]
     pub fn dc_cvac(va: usize) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `dc_cvau`.
         unsafe {
             core::arch::asm!("dc cvac, {}", in(reg) va, options(nostack, preserves_flags));
         };
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = va;
     }
 
     /// `ic ivau` — invalidate one instruction cache line by VA.
     #[inline(always)]
     pub fn ic_ivau(va: usize) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `dc_cvau`.
         unsafe {
             core::arch::asm!("ic ivau, {}", in(reg) va, options(nostack, preserves_flags));
         };
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = va;
     }
 
     /// `ic iallu` — invalidate the entire instruction cache to PoU.
     #[inline(always)]
     pub fn ic_iallu() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: discarding cached instructions is always safe; the next fetch
         // re-reads memory.
         unsafe {
@@ -188,7 +220,7 @@ pub mod cache {
     /// Cache line size in bytes, from `CTR_EL0`.
     #[inline(always)]
     pub fn line_size() -> usize {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let ctr: u64;
             // SAFETY: `CTR_EL0` is a read-only ID register.
@@ -198,7 +230,7 @@ pub mod cache {
             // DminLine (bits 19:16) is log2 of words; a word is 4 bytes.
             4 << ((ctr >> 16) & 0xf)
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         64
     }
 }
@@ -212,7 +244,7 @@ pub mod tlb {
     /// `tlbi vmalle1` — invalidate all stage-1 entries for EL1.
     #[inline(always)]
     pub fn vmalle1() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: invalidation forces a re-walk; it cannot grant access.
         unsafe {
             core::arch::asm!("tlbi vmalle1", options(nostack, preserves_flags));
@@ -222,7 +254,7 @@ pub mod tlb {
     /// `tlbi vmalle1is` — the same, broadcast to the inner-shareable domain.
     #[inline(always)]
     pub fn vmalle1is() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `vmalle1`.
         unsafe {
             core::arch::asm!("tlbi vmalle1is", options(nostack, preserves_flags));
@@ -234,31 +266,31 @@ pub mod tlb {
     /// Takes the architectural operand (VA >> 12), not a byte address.
     #[inline(always)]
     pub fn vaae1(va_page: u64) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `vmalle1`.
         unsafe {
             core::arch::asm!("tlbi vaae1, {}", in(reg) va_page, options(nostack, preserves_flags));
         };
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = va_page;
     }
 
     /// `tlbi vaae1is` — the same, broadcast to the inner-shareable domain.
     #[inline(always)]
     pub fn vaae1is(va_page: u64) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `vmalle1`.
         unsafe {
             core::arch::asm!("tlbi vaae1is, {}", in(reg) va_page, options(nostack, preserves_flags));
         };
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = va_page;
     }
 
     /// `tlbi aside1is` — invalidate every entry for one ASID, inner-shareable.
     #[inline(always)]
     pub fn aside1is(asid: u16) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `vmalle1`.
         unsafe {
             core::arch::asm!(
@@ -267,7 +299,7 @@ pub mod tlb {
                 options(nostack, preserves_flags)
             );
         };
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = asid;
     }
 
@@ -277,7 +309,7 @@ pub mod tlb {
     /// because no peer core is running the address space being invalidated.
     #[inline(always)]
     pub fn aside1(asid: u16) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `vmalle1`.
         unsafe {
             core::arch::asm!(
@@ -286,7 +318,7 @@ pub mod tlb {
                 options(nostack, preserves_flags)
             );
         };
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = asid;
     }
 }
@@ -296,7 +328,7 @@ pub mod park {
     /// `wfi` — wait for interrupt. Returns when one is taken (or spuriously).
     #[inline(always)]
     pub fn wfi() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: a hint that stops fetching until an interrupt. Whether it is
         // *wise* to park here is a scheduling question, not a safety one.
         unsafe {
@@ -307,7 +339,7 @@ pub mod park {
     /// `wfe` — wait for event.
     #[inline(always)]
     pub fn wfe() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `wfi`.
         unsafe {
             core::arch::asm!("wfe", options(nostack, preserves_flags));
@@ -317,7 +349,7 @@ pub mod park {
     /// `sev` — signal event to all cores.
     #[inline(always)]
     pub fn sev() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: sets a per-core event flag; touches no memory.
         unsafe {
             core::arch::asm!("sev", options(nostack, preserves_flags));
@@ -327,7 +359,7 @@ pub mod park {
     /// `nop` — one architecturally-defined no-op, for spin backoff.
     #[inline(always)]
     pub fn nop() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: it is a nop.
         unsafe {
             core::arch::asm!("nop", options(nomem, nostack, preserves_flags));
@@ -349,7 +381,7 @@ pub mod reg {
     /// The current stack pointer (`SP_EL1` at EL1).
     #[inline(always)]
     pub fn sp() -> usize {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let v: usize;
             // SAFETY: copies SP into a local; no access is made through it.
@@ -358,14 +390,14 @@ pub mod reg {
             };
             v
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         0
     }
 
     /// The link register, `x30` — the caller's return address.
     #[inline(always)]
     pub fn lr() -> u64 {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let v: u64;
             // SAFETY: as `sp`.
@@ -374,7 +406,7 @@ pub mod reg {
             };
             v
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         0
     }
 }
@@ -401,7 +433,7 @@ pub mod daif {
     /// Read `DAIF`. Bit 7 (`I`) set means IRQs are masked.
     #[inline(always)]
     pub fn read() -> u64 {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let v: u64;
             // SAFETY: reading the mask has no memory effect and changes nothing.
@@ -410,27 +442,27 @@ pub mod daif {
             };
             v
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         0
     }
 
     /// Write `DAIF` wholesale — restoring a value from [`read`].
     #[inline(always)]
     pub fn restore(daif: u64) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: see the module header — the obligation this could break is a
         // lock-discipline one that `unsafe` cannot express.
         unsafe {
             core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack));
         };
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = daif;
     }
 
     /// `msr daifset, #2` — mask IRQs.
     #[inline(always)]
     pub fn mask_irq() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `restore`. Masking is the conservative direction besides.
         unsafe {
             core::arch::asm!("msr daifset, #2", options(nomem, nostack));
@@ -440,7 +472,7 @@ pub mod daif {
     /// `msr daifclr, #2` — unmask IRQs.
     #[inline(always)]
     pub fn unmask_irq() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `restore`.
         unsafe {
             core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
@@ -453,7 +485,7 @@ pub mod daif {
     /// which an already-fetched instruction can still take the interrupt.
     #[inline(always)]
     pub fn mask_irq_sync() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `restore`.
         unsafe {
             core::arch::asm!("msr daifset, #2", "isb", options(nomem, nostack));
@@ -463,7 +495,7 @@ pub mod daif {
     /// Unmask IRQs and `isb`. Fused for the same reason as [`mask_irq_sync`].
     #[inline(always)]
     pub fn unmask_irq_sync() {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `restore`.
         unsafe {
             core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack));
@@ -508,24 +540,24 @@ pub mod vtimer {
     /// **No `nomem`**, deliberately — see the module note below.
     #[inline(always)]
     pub fn set_cval(deadline: u64) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: writes a comparator; it dereferences nothing.
         unsafe {
             core::arch::asm!("msr cntv_cval_el0, {}", in(reg) deadline, options(nostack));
         };
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = deadline;
     }
 
     /// `msr cntv_ctl_el0` — bit 0 enables, bit 1 **masks**. `1` is armed.
     #[inline(always)]
     pub fn set_ctl(ctl: u64) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         // SAFETY: as `set_cval`.
         unsafe {
             core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) ctl, options(nostack));
         };
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = ctl;
     }
 }
@@ -542,7 +574,7 @@ pub mod sysreg {
             $(#[$m])*
             #[inline(always)]
             pub fn $name() -> u64 {
-                #[cfg(target_os = "none")]
+                #[cfg(all(target_os = "none", target_arch = "aarch64"))]
                 {
                     let v: u64;
                     // SAFETY: a read of a read-only system register: no memory
@@ -556,7 +588,7 @@ pub mod sysreg {
                     };
                     v
                 }
-                #[cfg(not(target_os = "none"))]
+                #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
                 0
             }
         };
@@ -624,7 +656,7 @@ pub mod sysreg {
     /// was never a reason to make the caller write `unsafe`.
     #[inline(always)]
     pub fn set_tpidr_el0(base: u64) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             // SAFETY: writes a register the kernel never reads through. The `isb`
             // orders it ahead of the return to EL0; `nomem` is accurate because no
@@ -638,7 +670,7 @@ pub mod sysreg {
                 );
             }
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = base;
     }
     read_only!(/// `FPCR` — floating-point control.
@@ -662,7 +694,7 @@ pub mod sysreg {
     /// the accident. Writes to FPCR belong here.
     #[inline(always)]
     pub fn set_fpcr(val: u64) {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             // SAFETY: `msr fpcr` touches no memory and re-points no kernel
             // state; `nomem`/`nostack` are accurate.
@@ -670,7 +702,7 @@ pub mod sysreg {
                 core::arch::asm!("msr fpcr, {}", in(reg) val, options(nomem, nostack));
             }
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = val;
     }
 
@@ -687,7 +719,7 @@ pub mod sysreg {
     /// available for callers that only want a coarse timestamp.
     #[inline(always)]
     pub fn cntvct_el0_ordered() -> u64 {
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let v: u64;
             // SAFETY: a barrier and a read of a counter register.
@@ -696,7 +728,7 @@ pub mod sysreg {
             };
             v
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         0
     }
 }

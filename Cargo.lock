@@ -64,6 +64,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-amd64"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-bkl"
 version = "0.1.0"
 dependencies = [
