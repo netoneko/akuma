@@ -25,7 +25,7 @@
 //! in this tree. A build-time constant cannot express that address. The
 //! constants below are therefore a *bootstrap* map (correct for the common
 //! single-vCPU case, enough to print and to survive until the FDT is read), not
-//! the authority. See `proposals/FIRECRACKER_PORT.md` §2.1 and §5.
+//! the authority. See `docs/archive/FIRECRACKER_PORT.md` §2.1 and §5.
 //!
 //! # Adding a third machine
 //!

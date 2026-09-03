@@ -11,7 +11,7 @@ attributes ~69% to the network thread, and that figure needs reading carefully.
 
 Current-state facts only. History and the debugging narrative are in
 `docs/archive/AKUMA_FIRECRACKER_KVM.md`; the design argument is in
-`proposals/FIRECRACKER_PORT.md`; the procedure is
+`docs/archive/FIRECRACKER_PORT.md`; the procedure is
 `docs/runbooks/run-on-firecracker.md`.
 
 Constants below were read from **Firecracker v1.16.1** and verified identical on

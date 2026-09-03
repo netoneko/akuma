@@ -27,7 +27,7 @@ instance; this runbook is the local path.
 those do and how to debug when they fail; prefer the scripts for routine use.
 
 Platform invariants and constants: `docs/reference/firecracker/`.
-Design background: `proposals/FIRECRACKER_PORT.md`.
+Design background: `docs/archive/FIRECRACKER_PORT.md`.
 
 ---
 
@@ -47,7 +47,7 @@ swift /tmp/nv.swift
 ```
 
 Expect `nested: true`. On an M1/M2, or macOS < 15, it prints `false` and there is
-no local path — go to the AWS metal route in `proposals/FIRECRACKER_PORT.md` §7.
+no local path — go to the AWS metal route in `docs/archive/FIRECRACKER_PORT.md` §7.
 
 ## 2. A Linux guest with `/dev/kvm` *(partially verified)*
 
@@ -201,7 +201,7 @@ firecracker --api-sock /tmp/fc.sock --config-file /tmp/akuma.json'
 **Start with `vcpu_count: 1`** — but 2 works. Firecracker places the GIC
 redistributors at `0x3FFF_0000 - vcpu_count * 0x2_0000`, so CPU0's frames move
 with the count, and the compile-time bootstrap map is right for one vCPU only.
-The FDT-derived refinement (`proposals/FIRECRACKER_PORT.md` §5) **is now
+The FDT-derived refinement (`docs/archive/FIRECRACKER_PORT.md` §5) **is now
 implemented** — `crates/akuma-firecracker` parsed by
 `platform::install_fdt_device_map` — and 2 vCPUs was verified on metal on
 2026-08-21 (302/0/0, secondary online, SSH in).
@@ -310,7 +310,7 @@ meaningful.
 
 ## Background
 
-- `proposals/FIRECRACKER_PORT.md` — verified constants, the vCPU-dependent GIC
+- `docs/archive/FIRECRACKER_PORT.md` — verified constants, the vCPU-dependent GIC
   redistributor, and why the device map has to be FDT-derived.
 - `docs/archive/GICD_IROUTER_ALIASING.md` — the distributor-span bug found while
   scoping this; fixed at the VA-layout level in `akuma_primitives::addr`.

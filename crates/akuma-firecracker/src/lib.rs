@@ -20,7 +20,7 @@
 //! constant can express that address. The device map has to be read from the
 //! machine, which is what this crate does.
 //!
-//! Background: `proposals/FIRECRACKER_PORT.md` §2.1 and §5.
+//! Background: `docs/archive/FIRECRACKER_PORT.md` §2.1 and §5.
 //!
 //! # Design
 //!

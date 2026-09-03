@@ -1,9 +1,37 @@
 # Firecracker port: verified constants and work plan
 
-**Date:** 2026-08-21
+**Date:** 2026-08-21. **Moved** from `proposals/` to `docs/archive/` on
+2026-09-04: the port it plans was carried out, so this is the design record
+behind shipped code rather than a proposal. The plan below is left as written —
+it is what was executed against, and its §5 reasoning (structural, not tactical)
+is the part still worth reading. What changed is recorded per-phase below and,
+in detail, in the two outcome documents.
+
 **Supersedes the open questions in:** `docs/archive/PORTING_POSSIBILITIES.md`
-**Status:** nothing applied. Constants below were read from Firecracker `main` and
-`rust-vmm/linux-loader` `main` via the GitHub contents API, not inferred.
+
+## Status: applied
+
+| Phase (§6) | Outcome |
+|---|---|
+| **1** — structural refactor, QEMU only: device map from the FDT, literals gone | **DONE.** `crates/akuma-firecracker` is that device map, built with no allocation because it runs before the heap. `crates/akuma-kernel-core/src/platform.rs` holds what remains |
+| **§4.5** — the `GICD_IROUTER` aliasing bug | **FIXED.** `docs/archive/GICD_IROUTER_ALIASING.md`. GICD was mapped as one page, so `IROUTER` writes landed on the redistributor; device VAs are spans now |
+| **2** — validate the memory map under QEMU with Firecracker's addresses | **NOT POSSIBLE**, corrected in place 2026-08-21 — `-M virt` bakes its map into the machine model. Collapsed into a static `nm` check |
+| **3** — real Firecracker | **DONE 2026-08-21.** Boots under KVM on a Lima nested-virt guest: ext2 root mounted, boot suite **290 PASSED / 0 FAILED / 0 POISON**, userspace processes, `sshd` under herd. Nine bugs on the way, eight of them the same mistake — trusting a value only QEMU happened to provide. `docs/archive/AKUMA_FIRECRACKER_KVM.md` |
+| **4** — AWS metal | **DONE.** `m6g.metal`, verified end to end: DHCP completes, the guest takes `10.0.2.15/24`, and an operator SSH session reaches `userspace/sshd`. Infrastructure lives in the sibling `akuma-terraform` repo; `docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md` |
+| **§1.2** — local `/dev/kvm` on an Apple Silicon Mac | **DONE**, via a Lima VM with nested virtualization. `CPU: All CPU(s) started at EL2` is the line that confirms it engaged |
+
+**Still open**, both from `AKUMA_FIRECRACKER_KVM.md` §5: a nondeterministic
+`akuma_net::init` hang (§5.2) and a spinning DHCP settle loop (§5.3). Neither was
+investigated on metal.
+
+**Reproduce any of this:** `docs/runbooks/run-on-firecracker.md`.
+**Not to be confused with** `docs/archive/AKUMA_FIRECRACKER_AMD64.md` — that is a
+second *architecture* (x86_64, PVH boot, a different device model), where this is
+a second *machine* on the architecture the tree already ran.
+
+The constants below were read from Firecracker `main` and `rust-vmm/linux-loader`
+`main` via the GitHub contents API, not inferred; the measured FDTs that replaced
+them at run time are in `docs/reference/firecracker/fdt/`.
 
 `PORTING_POSSIBILITIES.md` was an options survey with five open questions and a
 memory map quoted from a partial excerpt. This document closes four of the five
@@ -494,6 +522,10 @@ Stated so the estimate is not inflated. Verified, not assumed:
 
 ## 6. Sequencing
 
+**All four phases are resolved — see the status table at the top.** Left as
+written because the reasoning about *why* Phase 1 could be done without a
+hypervisor, and why Phase 2 could not be done at all, is the transferable part.
+
 Revised from `PORTING_POSSIBILITIES.md` §4.4, with the QEMU-only phase carrying
 more weight now that the structural approach is chosen.
 
@@ -531,6 +563,12 @@ static check (above), so the first real Firecracker signal now comes from Phase 
 ---
 
 ## 7. AWS metal: what to have ready
+
+**Done** — and the instance is now managed from the sibling `akuma-terraform`
+repo rather than by hand (`docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md`). One
+operational note that outlived the plan: `.metal` is not a preference, it is the
+only EC2 family that exposes `/dev/kvm`, and it bills by the hour — stop it
+between sessions.
 
 Since the instance is approved, the prep worth doing now is the part that makes
 the metal hours short.

@@ -8,7 +8,7 @@ under KVM in VHE mode, the FDT dumped at 1/2/4/8 vCPUs
 (`docs/reference/firecracker/fdt/`) — and, as of the second session on
 2026-08-21, **Akuma itself boots on it and answers SSH**, at 1 and 2 vCPUs
 (§10).
-**Design it serves:** `proposals/FIRECRACKER_PORT.md` §7 (AWS metal) and §5
+**Design it serves:** `docs/archive/FIRECRACKER_PORT.md` §7 (AWS metal) and §5
 (FDT-derived device map)
 **Prior art:** `docs/archive/AKUMA_FIRECRACKER_KVM.md` (the local Lima boot),
 `overlays/devbox-firecracker/`
@@ -682,7 +682,7 @@ aws ec2 stop-instances --region ap-northeast-1 \
 
 ## Background
 
-- `proposals/FIRECRACKER_PORT.md` — verified constants, the vCPU-dependent GIC
+- `docs/archive/FIRECRACKER_PORT.md` — verified constants, the vCPU-dependent GIC
   redistributor, and why the device map must be FDT-derived
 - `docs/archive/AKUMA_FIRECRACKER_KVM.md` — the first Firecracker boot and the
   five reset-value assumptions it exposed

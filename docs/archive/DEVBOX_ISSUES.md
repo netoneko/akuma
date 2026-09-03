@@ -1857,7 +1857,7 @@ all.
    emits no such node, which is the same fact `FW_CFG_PA = None` states by hand.
    Reporting it from `crates/akuma-firecracker` makes `AVAILABLE` a consequence
    of the machine description rather than a literal kept in sync with one, which
-   is the argument `proposals/FIRECRACKER_PORT.md` §5 makes for the GIC.
+   is the argument `docs/archive/FIRECRACKER_PORT.md` §5 makes for the GIC.
 2. **Host-test the directory walk.** `find_file` reads a big-endian count and
    walks 64-byte entries — offset arithmetic over device-supplied data, the shape
    that most deserves a test. Taking a byte slice instead of reading registers

@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-21
 **Found:** while checking whether a 4 KiB GICD mapping suffices for the
-Firecracker port (`proposals/FIRECRACKER_PORT.md` §4.5).
+Firecracker port (`docs/archive/FIRECRACKER_PORT.md` §4.5).
 **Status:** OPEN. Not fixed. Benign today by coincidence; the coincidence is not
 load-bearing on purpose, and it changes shape on a second platform.
 **Severity:** latent. No known misbehaviour on QEMU virt today. Do not close this
@@ -139,7 +139,7 @@ reserving 16 L3 slots for GICD, which collides with the current one-device-per-
 4 KiB VA assignment in `addr.rs` and therefore moves every `DEV_*_VA` constant.
 
 **It changes shape under Firecracker.** The port moves the redistributors *below*
-the distributor in physical space (`proposals/FIRECRACKER_PORT.md` §2.1) and the
+the distributor in physical space (`docs/archive/FIRECRACKER_PORT.md` §2.1) and the
 virtio SPI base from 48 to 32. The VAs do not change, so the aliasing target does
 not change either — but the coincidence in §3 now rests on KVM's vGICv3 IROUTER
 reset value rather than QEMU's, and on INTIDs 32..39 landing on
@@ -156,7 +156,7 @@ Not applied. The shape:
 2. Re-lay out the `DEV_*_VA` block in `crates/akuma-primitives/src/addr.rs:71-84`
    so no device sits inside GICD's span. This is a breaking change to published
    constants, so it is worth doing in the same pass as any other device-map work
-   rather than twice — see `proposals/FIRECRACKER_PORT.md` §5.
+   rather than twice — see `docs/archive/FIRECRACKER_PORT.md` §5.
 3. Consider whether the redistributor frames want their real 64 KiB spans too,
    for the same reason.
 
@@ -184,7 +184,7 @@ The second check is cheap enough to add now and would have failed the day
 
 ## Background
 
-- `proposals/FIRECRACKER_PORT.md` §4.5 — where this was found, and why the port
+- `docs/archive/FIRECRACKER_PORT.md` §4.5 — where this was found, and why the port
   wants the same VA-block rework.
 - `docs/archive/AKUMA_NET_ISSUES.md` §3.1 — the investigation that added the
   four-step SPI sequence (group/priority/route before enable), i.e. the change

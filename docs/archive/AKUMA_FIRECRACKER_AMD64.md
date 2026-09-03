@@ -1280,5 +1280,5 @@ document: `docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md`.
 claim and the reproduction commands; `amd64/README.md` is the current-state doc for
 this target. The aarch64 Firecracker port — a different machine with a different
 device model — is `docs/archive/AKUMA_FIRECRACKER_KVM.md` and
-`proposals/FIRECRACKER_PORT.md`. The instruction-chokepoint work this gate belongs to
+`docs/archive/FIRECRACKER_PORT.md`. The instruction-chokepoint work this gate belongs to
 is `docs/archive/INLINE_ASM_CLEANUP.md`.

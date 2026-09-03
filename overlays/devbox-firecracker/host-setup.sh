@@ -29,7 +29,7 @@ NV="$(swift "$NV_SWIFT" 2>/dev/null | tail -1 || echo unknown)"
 rm -f "$NV_SWIFT"
 case "$NV" in
   yes)    say "nested virtualization: supported" ;;
-  no)     die "this Mac reports nested virtualization unsupported (needs Apple silicon M3+). Use AWS .metal — proposals/FIRECRACKER_PORT.md §7" ;;
+  no)     die "this Mac reports nested virtualization unsupported (needs Apple silicon M3+). Use AWS .metal — docs/archive/FIRECRACKER_PORT.md §7" ;;
   no-os)  die "needs macOS 15 or newer" ;;
   *)      say "WARNING: could not determine nested-virt support; continuing" ;;
 esac

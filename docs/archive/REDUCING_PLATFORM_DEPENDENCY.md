@@ -24,7 +24,7 @@ for why that distinction matters here. The crate counts in §0.1 were 34 when wr
 and are 36 now; regenerate rather than trusting either (§8.1).
 
 **Related:** `docs/archive/AKUMA_FIRECRACKER_AMD64.md` (the port that produced the
-evidence, one section per stage), `proposals/FIRECRACKER_PORT.md` (a second *machine*,
+evidence, one section per stage), `docs/archive/FIRECRACKER_PORT.md` (a second *machine*,
 same architecture), `docs/reference/crate-safety.md`,
 `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`,
 `docs/archive/INLINE_ASM_CLEANUP.md`.
@@ -306,7 +306,7 @@ their consumers in device-tree shape, through the crate that manages page tables
 ### 2.1 Why it is a defect today
 
 We already run two machines with different discovery quirks — QEMU virt and
-Firecracker — and `proposals/FIRECRACKER_PORT.md` documents the memory-map and
+Firecracker — and `docs/archive/FIRECRACKER_PORT.md` documents the memory-map and
 constant differences between them as a table of corrections rather than as data the
 kernel reads. The `akuma-firecracker` crate (221 production lines) exists partly to
 hold what amounts to platform facts. Those facts have no single home.

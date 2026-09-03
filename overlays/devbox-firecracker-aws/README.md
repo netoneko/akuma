@@ -150,7 +150,7 @@ whiteouts, so layer order alone reproduces it exactly.
   `0x3fff0000 - vcpu_count * 0x20000` — now confirmed by measurement at 1/2/4/8
   vCPUs (`docs/reference/firecracker/fdt/`) — and Akuma's device map is a
   compile-time table pinned to one vCPU. The FDT-derived replacement is
-  `proposals/FIRECRACKER_PORT.md` §5.
+  `docs/archive/FIRECRACKER_PORT.md` §5.
 - **One drive.** A second small ext2 image, for carrying a kernel Akuma built
   in-VM back out to the host, is designed and deferred:
   `crates/akuma-virtio/src/block.rs` keeps a single global `BLOCK_DEVICE` and

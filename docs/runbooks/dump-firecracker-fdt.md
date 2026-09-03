@@ -114,7 +114,7 @@ In order. Nothing past the first failure is meaningful.
 - `docs/reference/firecracker/fdt/` — the artifacts this produced, and what they
   confirm
 - `docs/reference/firecracker/memory-map.md` — the map they were checked against
-- `proposals/FIRECRACKER_PORT.md` §2.1, §5 — why the vCPU axis decides the
+- `docs/archive/FIRECRACKER_PORT.md` §2.1, §5 — why the vCPU axis decides the
   refactor
 - `docs/archive/AKUMA_FIRECRACKER_TERRAFORM.md` — the host this runs on
 - `docs/runbooks/run-on-firecracker.md` — the local Lima path

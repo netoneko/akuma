@@ -185,7 +185,7 @@ fn main() {
     // Expressed as cfgs rather than repeating `all(feature = "...", not(feature =
     // "platform-firecracker"))` at a dozen sites, because that compound is
     // exactly the kind of mirror invariant that rots when one site is missed —
-    // the same argument proposals/FIRECRACKER_PORT.md §5.2 makes about the
+    // the same argument docs/archive/FIRECRACKER_PORT.md §5.2 makes about the
     // duplicated device tables.
     //
     // Cargo features are additive and cannot be subtracted by a platform, so

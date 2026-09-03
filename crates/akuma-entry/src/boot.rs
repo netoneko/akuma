@@ -272,7 +272,7 @@ setup_boot_page_tables:
     // and long before any FDT can be parsed, so every address it uses has to be
     // a compile-time literal — and compile-time literals cannot describe
     // Firecracker's GIC, whose redistributor base moves with the configured vCPU
-    // count (proposals/FIRECRACKER_PORT.md §2.1).
+    // count (docs/archive/FIRECRACKER_PORT.md §2.1).
     //
     // So the boot table maps exactly enough to make `safe_print!` work, and Rust
     // installs the real device map from the FDT via

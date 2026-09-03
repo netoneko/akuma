@@ -16,7 +16,7 @@ its ext2 root (both `disk.img` and the 6 GB devbox image), runs the boot suite a
 Nine bugs fixed getting there. **Eight of the nine were the same mistake** —
 trusting a value that only QEMU happened to provide (§3).
 **Reproduce:** `docs/runbooks/run-on-firecracker.md`
-**Design:** `proposals/FIRECRACKER_PORT.md`
+**Design:** `docs/archive/FIRECRACKER_PORT.md`
 
 ---
 
@@ -58,7 +58,7 @@ Memory Tests: ALL PASSED
 Memory Tests: ALL PASSED
 ```
 
-Three predictions from `proposals/FIRECRACKER_PORT.md` confirmed empirically:
+Three predictions from `docs/archive/FIRECRACKER_PORT.md` confirmed empirically:
 
 - The FDT lands at the **top of DRAM**: `x0 = 0x9fe00000`, which is exactly
   `0xA000_0000 - 0x20_0000` (`FDT_MAX_SIZE`) for a 512 MiB guest. §4.4 predicted
@@ -811,7 +811,7 @@ configuration, which is precisely the shape of the four bugs above.
 
 ## Background
 
-- `proposals/FIRECRACKER_PORT.md` — verified constants and the port design.
+- `docs/archive/FIRECRACKER_PORT.md` — verified constants and the port design.
 - `docs/archive/GICD_IROUTER_ALIASING.md` — §3.1 in full.
 - `docs/runbooks/run-on-firecracker.md` — how to reproduce all of this.
 - `docs/archive/PORTING_POSSIBILITIES.md` — the original options survey.

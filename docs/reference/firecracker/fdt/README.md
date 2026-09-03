@@ -28,7 +28,7 @@ virtio-rng (`"entropy": {}`).
 ## What they confirm
 
 **The GIC redistributor base moves with the vCPU count**, exactly as
-`proposals/FIRECRACKER_PORT.md` §2.1 predicted from
+`docs/archive/FIRECRACKER_PORT.md` §2.1 predicted from
 `gic/gicv3/mod.rs`'s `get_redists_addr()`:
 
 | vCPUs | `intc` `reg` (GICD, then GICR) | predicted GICR base |

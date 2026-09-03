@@ -476,7 +476,7 @@ pub const MAX_DEV_REGIONS: usize = 16;
 /// time. `pa` is the *machine's*, and is therefore a runtime value — QEMU virt
 /// and Firecracker disagree on every one of them, and Firecracker's GIC
 /// redistributor base additionally depends on the configured vCPU count
-/// (`proposals/FIRECRACKER_PORT.md` §2.1), which no build-time constant can
+/// (`docs/archive/FIRECRACKER_PORT.md` §2.1), which no build-time constant can
 /// express. That asymmetry — fixed VAs, discovered PAs — is the whole shape of
 /// the device-map abstraction.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
