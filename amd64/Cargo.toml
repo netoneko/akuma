@@ -28,6 +28,14 @@ akuma-selftest = { path = "../crates/akuma-selftest" }
 # parser — the aarch64 loader itself is unusable here because it is written
 # against `akuma-mmu`. See that module's header.
 elf = { version = "0.7", default-features = false }
+# The virtio-blk driver, used unmodified. What this target supplies is the three
+# machine facts it cannot discover — where the transport is, how the slots are
+# spaced, and how to translate an address — via `akuma-primitives::addr`.
+akuma-virtio = { path = "../crates/akuma-virtio" }
+# `set_virtio_window`, `set_print_hook`, and the phys<->virt translation the
+# virtio HAL uses. Reached transitively already; named here because this crate
+# now calls it directly.
+akuma-primitives = { path = "../crates/akuma-primitives" }
 
 [[bin]]
 name = "akuma-amd64"

@@ -38,7 +38,7 @@
 
 use core::ptr::NonNull;
 
-use akuma_primitives::addr::{phys_to_virt, virt_to_phys};
+use akuma_primitives::addr::{mmio_phys_to_virt, virt_to_phys};
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 
 /// DMA allocation and address translation for every virtio device in the tree.
@@ -80,9 +80,17 @@ unsafe impl Hal for VirtioHal {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
+        // `mmio_phys_to_virt`, not `phys_to_virt`. They are the same function on
+        // AArch64 — both the identity — and different windows on amd64, where RAM
+        // is writeback-cached in the physmap and device registers are uncached in
+        // a window of their own. Reaching a register file through the RAM
+        // translation there would either fault (it is outside the physmap's 1 GiB)
+        // or, if the physmap were ever grown, hand this driver a *cached* alias of
+        // a device.
+        //
         // SAFETY: caller contract — `paddr` is a mapped MMIO region, so its
-        // linear-map VA is non-null.
-        unsafe { NonNull::new_unchecked(phys_to_virt(paddr as usize)) }
+        // device-window VA is non-null.
+        unsafe { NonNull::new_unchecked(mmio_phys_to_virt(paddr as usize)) }
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> PhysAddr {

@@ -42,6 +42,10 @@ compile_error!(
 );
 
 #[cfg(target_arch = "x86_64")]
+mod blk;
+#[cfg(target_arch = "x86_64")]
+mod cmdline;
+#[cfg(target_arch = "x86_64")]
 mod gdt;
 #[cfg(target_arch = "x86_64")]
 mod usermode;
@@ -132,11 +136,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     let mut cmdline_buf = [0u8; 512];
     // SAFETY: `cmdline_paddr` came from the handoff block; every byte read is
     // bounds-checked against the physmap.
-    if let Some(cmdline) = unsafe { info.read_cmdline(&mut cmdline_buf) } {
+    let cmdline = unsafe { info.read_cmdline(&mut cmdline_buf) };
+    if let Some(cmdline) = cmdline {
         serial::puts("  cmdline: \"");
         serial::puts(cmdline);
         serial::puts("\"\n");
     }
+    let mmio_devices = cmdline.map_or_else(cmdline::MmioDevices::new, cmdline::parse_virtio_mmio);
 
     serial::puts("  memmap: ");
     serial::put_dec(u64::from(info.memmap_entries));
@@ -197,9 +203,21 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         halt();
     }
 
+    // Give the shared crates a console. `safe_print!` discards output until a
+    // hook is registered, so without this every diagnostic `akuma-virtio` emits
+    // — including the one naming why a device failed to initialise — is silently
+    // dropped. One line, and it is the difference between a driver that reports
+    // and a driver that goes quiet.
+    akuma_primitives::console::set_print_hook(serial::puts);
+
+    // Block devices, after the heap (the virtio HAL allocates DMA buffers from
+    // it) and after the IDT (a bad transport address should fault reportably).
+    let have_disk = blk::init(&mmio_devices);
+
     let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
 
     mem::smoke_test(&mut t);
+    cmdline::smoke_test(&mut t);
     paging::smoke_test(&mut t);
     // The IDT is already loaded (before mem::init, so faults there are
     // visible). Demand paging is what needs the PMM, and that is only exercised
@@ -214,6 +232,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         sched::smoke_test(&mut t);
         lapic::stop_timer();
     }
+
+    blk::smoke_test(&mut t, have_disk);
 
     usermode::init_syscall();
     usermode::smoke_test(&mut t);

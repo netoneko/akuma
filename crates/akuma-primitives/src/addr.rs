@@ -27,27 +27,102 @@
 //! re-paying the cost Phase 3 measured away. The honest options at that point are
 //! a compile-time offset constant or a per-region translation the caller passes
 //! in — not a registered function pointer.
+//!
+//! # That happened, 2026-09-04
+//!
+//! The amd64 kernel runs in the upper half: RAM is reached through a physmap at
+//! `0xFFFF_8000_0000_0000 + pa`, not the identity. So this module took the first
+//! of the two options its own paragraph above prescribed — **a compile-time
+//! offset constant**, `cfg`'d per architecture, still `#[inline(always)]`, still
+//! not a hook. On AArch64 the offset is zero and every function below compiles to
+//! exactly what it did before.
+//!
+//! Two things fell out of doing it, and both are the point rather than incidental:
+//!
+//! * **The gate is the conjunction**, `all(target_os = "none", target_arch = ...)`.
+//!   `target_arch = "x86_64"` alone would fire under `cargo test` on an x86_64
+//!   host and silently offset every translation in a host test. That is exactly
+//!   the bug `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §0 was written about;
+//!   it is one gate away in either direction.
+//! * **MMIO is a different question from RAM.** [`phys_to_virt`] answers "where is
+//!   this *page of memory*"; [`mmio_phys_to_virt`] answers "where is this *device
+//!   register*". On AArch64 both are the identity and the distinction is
+//!   invisible, which is why there was only one function. On amd64 they are
+//!   different windows with different cacheability — RAM is writeback in the
+//!   physmap, MMIO is uncached in a device window — and conflating them hands a
+//!   driver a cached alias of a register file.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+/// Offset between a kernel RAM pointer and the physical address behind it.
+///
+/// Zero on AArch64: the kernel map is the identity there, and every function
+/// below folds to a no-op exactly as it did before this constant existed.
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+pub const PHYSMAP_OFFSET: usize = 0;
+
+/// Base of the amd64 kernel's physmap window (PML4 slot 256).
+///
+/// Duplicated in `amd64/src/phys.rs` as `PHYSMAP_BASE` — which re-exports this
+/// rather than restating it, so there is one value. It cannot live only there:
+/// `akuma-primitives` is a leaf crate and cannot depend on a binary.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub const PHYSMAP_OFFSET: usize = 0xFFFF_8000_0000_0000;
+
+/// Base of the amd64 kernel's device (MMIO) window, PML4 slot 257.
+///
+/// A second window rather than a range inside the physmap, because device
+/// registers must be mapped uncached and RAM must not be. See `amd64/src/phys.rs`.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub const DEVMAP_OFFSET: usize = 0xFFFF_8080_0000_0000;
+
+/// MMIO offset on every other target: the identity, as for RAM.
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+pub const DEVMAP_OFFSET: usize = 0;
+
 /// Kernel virtual address → physical address.
 ///
-/// The kernel map is the identity, so this is a no-op that exists to name the
-/// conversion at call sites and to give the assumption a single home. See the
-/// module header before changing it.
+/// A subtraction rather than a no-op since 2026-09-04; see the module header. On
+/// AArch64 [`PHYSMAP_OFFSET`] is zero and this is the identity it always was.
+///
+/// # Panics
+/// If `vaddr` is not in the kernel's RAM window. This is a DMA path and the
+/// header warns against cost, so it is worth saying what the cost is: one
+/// compare and a not-taken branch, against a device round trip. What it buys is
+/// that handing a driver an address from the *wrong window* — a `&'static [u8]`
+/// in the kernel image, say, whose window has a different offset — fails loudly
+/// instead of programming a plausible-looking wrong physical address into a
+/// descriptor and letting the device DMA over unrelated memory.
 #[inline(always)]
 #[must_use]
 pub fn virt_to_phys(vaddr: usize) -> usize {
-    vaddr
+    assert!(
+        vaddr >= PHYSMAP_OFFSET,
+        "virt_to_phys on an address outside the kernel RAM window"
+    );
+    vaddr - PHYSMAP_OFFSET
 }
 
-/// Physical address → kernel-mapped pointer.
+/// Physical address → kernel-mapped pointer, **for RAM**.
 ///
-/// The kernel map is the identity. See the module header before changing it.
+/// For device registers use [`mmio_phys_to_virt`]: on amd64 they are different
+/// windows with different cacheability, and on AArch64 both are the identity.
 #[inline(always)]
 #[must_use]
 pub fn phys_to_virt(paddr: usize) -> *mut u8 {
-    paddr as *mut u8
+    (paddr + PHYSMAP_OFFSET) as *mut u8
+}
+
+/// Physical address → kernel-mapped pointer, **for MMIO**.
+///
+/// Separate from [`phys_to_virt`] because the two are separate questions the
+/// moment the kernel stops being identity-mapped: RAM is writeback-cached in the
+/// physmap, device registers are uncached in a window of their own. On AArch64
+/// both offsets are zero, so this is the identity and costs nothing.
+#[inline(always)]
+#[must_use]
+pub fn mmio_phys_to_virt(paddr: usize) -> *mut u8 {
+    (paddr + DEVMAP_OFFSET) as *mut u8
 }
 
 // =============================================================================
@@ -124,6 +199,20 @@ pub const DEV_VIRTIO_SIZE: usize = 8 * 0x1000;
 static VIRTIO_STRIDE: AtomicUsize = AtomicUsize::new(0x200);
 static VIRTIO_SLOTS: AtomicUsize = AtomicUsize::new(8);
 
+/// Where the slot array starts, as a kernel VA.
+///
+/// Runtime for the same reason the stride is, one architecture later: on AArch64
+/// the window is a fixed slot in the kernel's L0[1] device map ([`DEV_VIRTIO_VA`],
+/// the default here, so nothing about that kernel changes). On amd64 there is no
+/// fixed device map — the machine announces virtio-MMIO on the boot command line
+/// (`virtio_mmio.device=4K@0xc0001000:5` under Firecracker,
+/// `512@0xfeb00000` under QEMU `microvm`, both measured) and the kernel maps it
+/// where it lands. A const cannot express an address the VMM chooses.
+///
+/// This costs `virtio_slot_va` a second relaxed load, on a path that runs once
+/// per probe and never per packet.
+static VIRTIO_BASE_VA: AtomicUsize = AtomicUsize::new(DEV_VIRTIO_VA);
+
 /// Bytes between consecutive virtio-mmio slots.
 #[inline]
 #[must_use]
@@ -138,21 +227,42 @@ pub fn virtio_slots() -> usize {
     VIRTIO_SLOTS.load(Ordering::Relaxed)
 }
 
+/// Kernel VA the virtio-mmio slot array starts at.
+#[inline]
+#[must_use]
+pub fn virtio_base_va() -> usize {
+    VIRTIO_BASE_VA.load(Ordering::Relaxed)
+}
+
 /// Kernel VA of virtio-mmio slot `i`.
 #[inline]
 #[must_use]
 pub fn virtio_slot_va(i: usize) -> usize {
-    DEV_VIRTIO_VA + i * virtio_stride()
+    virtio_base_va() + i * virtio_stride()
 }
 
 /// Install the machine's virtio-mmio geometry. Call during early boot, before
 /// any driver probes. `slots * stride` must fit in [`DEV_VIRTIO_SIZE`].
+///
+/// Leaves the window base at [`DEV_VIRTIO_VA`]; a machine that places the array
+/// somewhere else calls [`set_virtio_window`] instead.
 pub fn set_virtio_geometry(stride: usize, slots: usize) {
+    set_virtio_window(DEV_VIRTIO_VA, stride, slots);
+}
+
+/// Install the machine's virtio-mmio window: where the slot array is, how far
+/// apart the slots are, and how many there are.
+///
+/// Call during early boot, before any driver probes. `slots * stride` must fit in
+/// [`DEV_VIRTIO_SIZE`], which is what the caller reserved VA for.
+pub fn set_virtio_window(base_va: usize, stride: usize, slots: usize) {
     debug_assert!(stride > 0 && slots > 0, "degenerate virtio geometry");
+    debug_assert!(base_va != 0, "virtio window at VA 0");
     debug_assert!(
         slots.saturating_mul(stride) <= DEV_VIRTIO_SIZE,
         "virtio slot array does not fit its VA reservation"
     );
+    VIRTIO_BASE_VA.store(base_va, Ordering::Relaxed);
     VIRTIO_STRIDE.store(stride, Ordering::Relaxed);
     VIRTIO_SLOTS.store(slots, Ordering::Relaxed);
 }

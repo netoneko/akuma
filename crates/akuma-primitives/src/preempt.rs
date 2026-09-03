@@ -73,7 +73,19 @@ pub const MAX_EXPECTED_CHECK_GAP_US: u64 = 100_000;
 /// Halts the core if the register is out of range: every per-slot static in the
 /// kernel is indexed by this, so a corrupt value is not something to continue
 /// past — it would index arbitrary memory. Returns 0 on host builds.
-#[cfg(target_os = "none")]
+///
+/// # The gate is the conjunction, and that is not cosmetic
+///
+/// This read `#[cfg(target_os = "none")]` until 2026-09-04 — named as a latent
+/// bug in `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §0 when the same
+/// mistake was fixed in `akuma-cpu`, and live from the moment the amd64 target
+/// linked a driver that takes a `PreemptGuard`. `x86_64-unknown-none` is also
+/// `target_os = "none"`, so that gate selected the AArch64 body on x86, where
+/// `tpidrro_el0()` is the `akuma-cpu` **stub**: it returns 0 and reads no
+/// register. The result was right by accident — a bring-up kernel with one
+/// thread wants 0 — which is the worst version of wrong, because it works until
+/// the day that target has threads.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline]
 #[must_use]
 pub fn current_tid() -> usize {
@@ -93,7 +105,14 @@ pub fn current_tid() -> usize {
     tid
 }
 
-#[cfg(not(target_os = "none"))]
+/// Current thread id on every target without a per-CPU register this crate
+/// knows how to read: host builds, and bare-metal targets other than AArch64.
+///
+/// Zero, stated rather than inherited. The amd64 kernel has one kernel thread
+/// per core and no `TPIDRRO_EL0` equivalent wired up; when it grows per-thread
+/// kernel state it needs a real answer here (x86's is `GS`-relative, via
+/// `IA32_KERNEL_GS_BASE` and `swapgs`), and this arm is where that goes.
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 #[inline]
 #[must_use]
 pub fn current_tid() -> usize {

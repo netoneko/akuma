@@ -69,8 +69,10 @@ version = "0.1.0"
 dependencies = [
  "akuma-alloc",
  "akuma-pmm",
+ "akuma-primitives",
  "akuma-selftest",
  "akuma-syscalls-abi",
+ "akuma-virtio",
  "elf",
 ]
 
