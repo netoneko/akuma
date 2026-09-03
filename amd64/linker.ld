@@ -78,6 +78,28 @@ SECTIONS
         *(.rodata .rodata.*)
     } :rodata
 
+    /* Indirection tables. Placing these EXPLICITLY is not tidiness.
+     *
+     * An output section this script does not name is still emitted — lld puts it
+     * wherever it sees fit, and here it chose the low boot region, landing `.got`
+     * directly on top of `__boot_stack_top`. The kernel then ran fine until the
+     * identity map was dropped, at which point the first `call *GOT(%rip)` — a
+     * `memset` inside the heap allocator — jumped through an unmapped address:
+     *
+     *   [EXCEPTION] #PF  rip=...8021876d  cr2=0x217010
+     *   callq *0x7fffe89d(%rip)   # 0x217010 <__boot_stack_top>
+     *
+     * `relocation-model=static` removes most GOT use but not all of it, so the
+     * section exists even though it is nearly empty. Naming it here puts it in
+     * the high image with everything else. */
+    .got ALIGN(0x1000) : AT(ADDR(.got) - KERNEL_VMA) {
+        *(.got) *(.got.plt) *(.igot) *(.igot.plt)
+    } :rodata
+
+    .plt ALIGN(0x1000) : AT(ADDR(.plt) - KERNEL_VMA) {
+        *(.plt) *(.plt.*) *(.iplt)
+    } :rodata
+
     .data ALIGN(0x1000) : AT(ADDR(.data) - KERNEL_VMA) {
         *(.data .data.*)
     } :data

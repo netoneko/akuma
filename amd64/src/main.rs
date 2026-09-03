@@ -145,16 +145,31 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         }
     }
 
-    // Before anything that can fault. `idt::init` needs nothing but its own
-    // static table, so installing it here — rather than after the memory
-    // subsystem, where it used to go — means a fault during memory bring-up
-    // prints a diagnosis instead of triple-faulting into silence. That is not
-    // hypothetical: it cost a debugging round during the higher-half move.
+    // Descriptor tables first, and the ORDER HERE IS LOAD-BEARING.
+    //
+    // `boot.s` builds its GDT in the low boot region, because the 32-bit
+    // trampoline has to reach it with paging off. The CPU reads the GDT on every
+    // exception delivery — it loads CS from the IDT entry's selector — so once
+    // the identity map is dropped, that GDT is unmapped and *any* fault becomes
+    // a triple fault. The first #PF cannot be delivered, which raises #DF, whose
+    // delivery faults for the same reason.
+    //
+    // `gdt::init` rebuilds the table in the kernel's own high .bss, so GDTR
+    // points somewhere that survives. It must therefore run before
+    // `drop_identity_map`, not after — which is where it used to be, and the
+    // symptom was a triple fault inside the heap allocator with CR2 pointing at
+    // 0x2010d8: the GDT itself.
+    gdt::init();
+
+    // `idt::init` needs nothing but its own static table, so it goes here rather
+    // than after the memory subsystem: a fault during memory bring-up then
+    // prints a diagnosis instead of vanishing.
     idt::init();
 
     // The trampoline's identity map has done its job: the kernel is executing
-    // from its high linked address and its stack is in the physmap. Dropping it
-    // now hands the entire lower half to userspace.
+    // from its high linked address, its stack is in the physmap, and both
+    // descriptor tables are now high. Dropping it hands the lower half to
+    // userspace.
     paging::drop_identity_map();
 
     serial::puts("  usable RAM: ");
@@ -184,10 +199,6 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         lapic::stop_timer();
     }
 
-    // Ring 3 last. It replaces the GDT `boot.s` installed, and the TSS it adds
-    // is what makes a trap taken *from* ring 3 survivable — so it must come
-    // after everything that could still fault in ring 0.
-    gdt::init();
     usermode::init_syscall();
     usermode::smoke_test(&mut t);
     usermode::preempt_test(&mut t);
