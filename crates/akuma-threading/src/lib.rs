@@ -1865,6 +1865,18 @@ pub fn get_thread_state(idx: usize) -> u8 {
 /// Returns true if the thread is dead (TERMINATED or FREE state).
 /// Used for orphaned lock detection - a thread holding a lock is considered
 /// dead if it's terminated or if its slot has been reclaimed.
+/// Is the thread we are running on already TERMINATED?
+///
+/// True at the terminal teardown sites (`return_to_kernel`,
+/// `return_to_kernel_from_fault`, `exit_group`'s pre-park drain), which all call
+/// `mark_current_terminated()` before they drain. Such a thread can be reaped at
+/// any yield and will never resume, so it must not *perform* deferred reclamation
+/// — only request it. See `akuma_mmu::drain_pending_ttbr_frees` and
+/// `docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md`.
+pub fn current_thread_is_terminated() -> bool {
+    is_thread_terminated(current_thread_id())
+}
+
 pub fn is_thread_terminated(thread_id: usize) -> bool {
     let state = get_thread_state(thread_id);
     state == thread_state::TERMINATED || state == thread_state::FREE

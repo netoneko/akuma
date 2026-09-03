@@ -167,6 +167,7 @@ pub fn init(rt: ExecRuntime, cfg: ExecConfig) {
     akuma_mmu::register_sched_hooks(akuma_mmu::SchedHooks {
         any_saved_ctx_on_l0: threading::any_saved_ctx_on_l0,
         note_current_expected_l0: threading::note_current_expected_l0,
+        current_thread_is_terminated: threading::current_thread_is_terminated,
     });
     // `akuma-elf`'s four VFS callbacks, forwarded from the same `ExecRuntime`
     // fields the loader used to read directly. These `require()` at use — a stub

@@ -135,6 +135,12 @@ pub struct SchedHooks {
     /// Record the TTBR0 the current thread is expected to run under, so a
     /// mismatch at switch-in is detectable.
     pub note_current_expected_l0: fn(u64),
+    /// Is the calling thread already TERMINATED? Such a thread can be reaped at
+    /// any yield and never resume, so it must not *run* the pending-frame drain
+    /// — the drain would be abandoned mid-loop, orphaning the frames and the
+    /// `user_frames` map it had taken ownership of
+    /// (`docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md`).
+    pub current_thread_is_terminated: fn() -> bool,
 }
 
 static SCHED: akuma_primitives::Registered<SchedHooks> = akuma_primitives::Registered::new(
@@ -154,6 +160,14 @@ pub fn register_sched_hooks(h: SchedHooks) {
 #[inline]
 fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
     SCHED.get().and_then(|h| (h.any_saved_ctx_on_l0)(l0_base))
+}
+
+/// Is the calling thread terminal? `false` before registration — during early
+/// boot nothing has terminated, and the gate is a refusal to do work, so the
+/// permissive default is also the safe one.
+#[inline]
+fn thread_is_terminal() -> bool {
+    SCHED.get().is_some_and(|h| (h.current_thread_is_terminated)())
 }
 
 /// Record the current thread's expected TTBR0. No-op before registration.
@@ -1215,34 +1229,58 @@ pub fn drain_pending_ttbr_frees() -> usize {
     if PENDING_TTBR_FREE_COUNT.load(Ordering::Acquire) == 0 {
         return 0;
     }
-    let ready: Vec<PendingAsFree> = with_irqs_disabled(|| {
+    // A TERMINATED thread can be reaped at any yield and will never resume, so a
+    // multi-thousand-page free started here is abandoned mid-loop — and the entry
+    // it owns has already left the list, so nothing can ever find it again. That
+    // is the self-host heap leak: 82 abandoned drains per clean build holding
+    // 1.47 M `user_frames` entries (`docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md`).
+    //
+    // The split this restores is `process::reclaim`'s own: terminal sites
+    // *request* reclamation, they do not *perform* it. Four non-terminal
+    // collectors remain — both idle loops, `netpoll_maint`, and the allocator's
+    // pressure path (which runs on the allocating thread, non-terminal by
+    // construction) — plus every address-space drop that is not itself on a
+    // terminal thread.
+    if thread_is_terminal() {
+        return 0;
+    }
+    let mut n = 0;
+    // ONE entry per iteration, claimed under the lock and freed outside it.
+    // Draining the whole ready set into a local `Vec` first meant an abandoned
+    // sweep lost every entry it was carrying, not just the one in flight.
+    while let Some(e) = take_one_ready_ttbr_free() {
+        as_trace(format_args!("[AS-FREE] l0=0x{:x} asid=0x{:x} path=drained core={}\n",
+            e.l0_frame.addr, e.asid, akuma_bkl::bkl::current_core_id()));
+        free_as_frames_now(e.l0_frame, &e.user_frames, &e.pt_frames, 2);
+        n += 1;
+    }
+    n
+}
+
+/// Remove and return one parked address space whose L0 no core's TTBR0 and no
+/// thread's saved context still names, or `None` when none is ready.
+///
+/// Both gates are the same pair `free_or_defer_as_frames` applies, and both must
+/// stay: releasing on the core check alone re-opens the F8 window this list exists
+/// to close.
+fn take_one_ready_ttbr_free() -> Option<PendingAsFree> {
+    with_irqs_disabled(|| {
         let mut pending = PENDING_TTBR_FREES.lock();
-        let mut ready = Vec::new();
         let mut i = 0;
         while i < pending.len() {
-            // Same two gates as `free_or_defer_as_frames`: no core's live TTBR0
-            // on the L0, and no thread's saved context either — releasing on the
-            // core check alone would re-open the F8 window this list exists to
-            // close for entries parked by the saved-context gate.
             let l0 = pending[i].l0_frame.addr;
             if any_core_on_l0(l0).is_none()
                 && crate::any_saved_ctx_on_l0(l0 as u64 & L0_BASE_MASK).is_none()
             {
-                ready.push(pending.swap_remove(i));
-            } else {
-                i += 1;
+                let e = pending.swap_remove(i);
+                PENDING_TTBR_FREE_COUNT.store(pending.len(), Ordering::Release);
+                return Some(e);
             }
+            i += 1;
         }
         PENDING_TTBR_FREE_COUNT.store(pending.len(), Ordering::Release);
-        ready
-    });
-    let n = ready.len();
-    for e in ready {
-        as_trace(format_args!("[AS-FREE] l0=0x{:x} asid=0x{:x} path=drained core={}\n",
-            e.l0_frame.addr, e.asid, akuma_bkl::bkl::current_core_id()));
-        free_as_frames_now(e.l0_frame, &e.user_frames, &e.pt_frames, 2);
-    }
-    n
+        None
+    })
 }
 
 /// Tracks shared L0 page table reference counts and deferred frame lists.

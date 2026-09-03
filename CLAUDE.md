@@ -438,3 +438,20 @@ Pre-commit hook runs clippy + tests automatically.
 Never use the `fork` subagent type (or any multi-agent fan-out) in this repo — do the
 work directly instead. Forking copies the whole conversation context into a background
 agent, which costs far more tokens than doing it inline.
+
+**The user drives all commits. Never `git commit`, `git push`, `git reset`, `git rebase`
+or otherwise rewrite history** — in this repo or any submodule. Run clippy and the host
+tests, fix what they find, and leave the work uncommitted.
+
+**Commit vocabulary describes the user's actions, not a request for yours.** When the
+user says "committed", "checkpoint", "committed checkpoint", "pushed", "landed",
+"stashed" or similar, they are *reporting what they just did* so you know the state of
+the tree — not asking you to do it. Treat such a line as context, not an instruction.
+The same goes for a bare noun phrase on its own line in a longer message; it is a status
+note.
+
+If you genuinely believe a commit is warranted, say so and stop. Only an unambiguous
+imperative addressed to you — "commit this", "please commit", "make a commit" — is a
+request. Anything less means leave the tree alone: a commit the user did not ask for
+hides the diff they were about to review (`git status` and `git diff` go quiet), and
+undoing it means rewriting history, which is also off-limits.
