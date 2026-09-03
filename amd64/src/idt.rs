@@ -29,7 +29,7 @@
 //! masked; `IF` has been 0 since `boot.s`, so nothing can arrive. A timer means
 //! LAPIC setup, and that is a later stage.
 
-use crate::paging::{self, Prot};
+use crate::paging::{self, MemAttr, Prot};
 use crate::serial;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -200,7 +200,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: u64) {
             // previous owner left in it to whoever faults next.
             // SAFETY: PMM frames are inside the identity map boot.s built.
             unsafe { core::ptr::write_bytes(frame_pa as *mut u8, 0, 4096) };
-            if paging::map_page(page as usize, frame_pa as u64, Prot::KERNEL_RW) {
+            if paging::map_page(page as usize, frame_pa as u64, Prot::KERNEL_RW, MemAttr::WriteBack) {
                 DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -209,6 +209,47 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: u64) {
     }
 
     fatal("#PF page fault", &frame, Some(code));
+}
+
+/// The LAPIC timer vector.
+///
+/// Does no work beyond counting and acknowledging: a handler runs with `IF`
+/// clear (these are interrupt gates, not trap gates) and on the interrupted
+/// stack, so anything substantial belongs in code the tick *wakes*, not here.
+extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
+    crate::lapic::on_tick();
+}
+
+/// Address of [`timer_interrupt`], for [`set_handler`].
+///
+/// A function rather than a `pub` handler because the handler's ABI is an
+/// implementation detail of this module — the caller wants "the timer entry
+/// point", not a typed `extern "x86-interrupt" fn` it would then have to spell.
+#[allow(function_casts_as_integer)]
+#[must_use]
+pub fn timer_interrupt_entry() -> usize {
+    timer_interrupt as usize
+}
+
+/// Install a handler for one vector, after [`init`].
+///
+/// The IDT is read by the CPU on every interrupt, so this edits a live table.
+/// Safe only because it is called with interrupts masked and before the vector
+/// it installs can be raised — the LAPIC timer is configured *after* its handler
+/// is in place.
+pub fn set_handler(vector: u8, handler: usize) {
+    // SAFETY: reached only through a raw pointer, never a reference; single
+    // core, interrupts masked.
+    //
+    // Bound to a local first rather than written `(*(&raw mut IDT))[..]`, which
+    // trips `clippy::deref_addrof`. Clippy's suggested fix there — index `IDT`
+    // directly — would reintroduce the `static_mut_refs` violation this pointer
+    // exists to avoid, so the lint is right about the shape and wrong about the
+    // remedy.
+    unsafe {
+        let idt = &raw mut IDT;
+        (*idt)[vector as usize].set(handler);
+    }
 }
 
 /// Build the IDT and load it.

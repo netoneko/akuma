@@ -50,6 +50,10 @@ const RW: u64 = 1 << 1;
 const US: u64 = 1 << 2;
 /// Page size — at PD level this means a 2 MiB page rather than a PT pointer.
 const PS: u64 = 1 << 7;
+/// Page-level write-through.
+const PWT: u64 = 1 << 3;
+/// Page-level cache disable.
+const PCD: u64 = 1 << 4;
 /// No-execute. **Requires `EFER.NXE`**, which `boot.s` sets alongside `LME`;
 /// without it this is a reserved bit and setting it faults.
 const NX: u64 = 1 << 63;
@@ -91,13 +95,26 @@ impl Prot {
     pub const USER_RX: Self = Self { write: false, exec: true, user: true };
 }
 
-/// Encode a [`Prot`] into x86_64 PTE permission bits.
+/// How a mapping is cached.
 ///
-/// The x86 half of what item 1 calls `encode(prot, attr)`. Memory attributes
-/// (PAT/PCD/PWT) are not modelled yet — everything here is writeback normal
-/// memory — so the `MemAttr` half of that signature is deliberately absent
-/// rather than stubbed with a value that would look meaningful.
-const fn encode(prot: Prot) -> u64 {
+/// The other half of item 1's `encode(prot, attr)`, and it arrived the moment
+/// something needed it rather than being invented up front: the LAPIC is MMIO,
+/// and mapping a device register writeback-cached means the CPU can satisfy a
+/// read from cache and never issue the access at all. On AArch64 this is an
+/// `AttrIndx` into `MAIR_EL1`; here it is two PTE bits. No consumer should care
+/// which — that difference is precisely what the neutral vocabulary hides.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MemAttr {
+    /// Normal RAM: writeback cached.
+    WriteBack,
+    /// Device MMIO: uncacheable, and never speculatively read.
+    Device,
+}
+
+/// Encode a [`Prot`] and [`MemAttr`] into x86_64 PTE bits.
+///
+/// The x86 backend of what item 1 calls `encode(prot, attr)`.
+const fn encode(prot: Prot, attr: MemAttr) -> u64 {
     let mut bits = P;
     if prot.write {
         bits |= RW;
@@ -107,6 +124,10 @@ const fn encode(prot: Prot) -> u64 {
     }
     if !prot.exec {
         bits |= NX;
+    }
+    match attr {
+        MemAttr::WriteBack => {}
+        MemAttr::Device => bits |= PCD | PWT,
     }
     bits
 }
@@ -192,9 +213,9 @@ unsafe fn next_table(entry_ptr: *mut u64, user: bool) -> Option<u64> {
     Some(frame)
 }
 
-/// Map `va` to `pa` with `prot`. Returns false if a table could not be
-/// allocated or if the range is backed by a 2 MiB page.
-pub fn map_page(va: usize, pa: u64, prot: Prot) -> bool {
+/// Map `va` to `pa` with `prot` and `attr`. Returns false if a table could not
+/// be allocated or if the range is backed by a 2 MiB page.
+pub fn map_page(va: usize, pa: u64, prot: Prot, attr: MemAttr) -> bool {
     assert_eq!(va % PAGE_SIZE, 0, "va must be page aligned");
     assert_eq!(pa % PAGE_SIZE as u64, 0, "pa must be page aligned");
 
@@ -213,7 +234,7 @@ pub fn map_page(va: usize, pa: u64, prot: Prot) -> bool {
     unsafe {
         table_mut(table)
             .add(index(va, 1))
-            .write_volatile(pa | encode(prot));
+            .write_volatile(pa | encode(prot, attr));
     }
     invlpg(va);
     true
@@ -292,7 +313,7 @@ pub fn smoke_test() {
         return;
     };
 
-    if !map_page(TEST_VA, frame as u64, Prot::KERNEL_RW) {
+    if !map_page(TEST_VA, frame as u64, Prot::KERNEL_RW, MemAttr::WriteBack) {
         serial::puts("[FAIL] map_page\n");
         return;
     }
@@ -352,14 +373,14 @@ pub fn smoke_test() {
 /// distinct values, which on the AArch64 side they currently are not
 /// (`user_flags::RO == user_flags::EXEC`).
 fn nx_encoding_check() {
-    let rw = encode(Prot::KERNEL_RW);
-    let rx = encode(Prot::KERNEL_RX);
-    let ro = encode(Prot::KERNEL_RO);
+    let rw = encode(Prot::KERNEL_RW, MemAttr::WriteBack);
+    let rx = encode(Prot::KERNEL_RX, MemAttr::WriteBack);
+    let ro = encode(Prot::KERNEL_RO, MemAttr::WriteBack);
 
     // User mappings must additionally carry US, and kernel mappings must not:
     // a kernel page that leaks US is reachable from ring 3.
-    let urw = encode(Prot::USER_RW);
-    let urx = encode(Prot::USER_RX);
+    let urw = encode(Prot::USER_RW, MemAttr::WriteBack);
+    let urx = encode(Prot::USER_RX, MemAttr::WriteBack);
 
     let ok = rw & NX != 0        // data is never executable
         && rw & RW != 0
@@ -374,7 +395,10 @@ fn nx_encoding_check() {
         && urx & RW == 0         // ...and user code is still never writable
         && rw & US == 0          // kernel mappings are NOT reachable from ring 3
         && rx & US == 0
-        && ro & US == 0;
+        && ro & US == 0
+        // Device mappings are uncacheable; normal memory is not.
+        && encode(Prot::KERNEL_RW, MemAttr::Device) & (PCD | PWT) == PCD | PWT
+        && rw & (PCD | PWT) == 0;
 
     serial::puts("  test: W^X encoding ");
     serial::puts(if ok { "  [OK]\n" } else { "  [FAIL]\n" });

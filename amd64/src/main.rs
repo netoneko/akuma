@@ -46,9 +46,13 @@ mod hvm;
 #[cfg(target_arch = "x86_64")]
 mod idt;
 #[cfg(target_arch = "x86_64")]
+mod lapic;
+#[cfg(target_arch = "x86_64")]
 mod mem;
 #[cfg(target_arch = "x86_64")]
 mod paging;
+#[cfg(target_arch = "x86_64")]
+mod port;
 #[cfg(target_arch = "x86_64")]
 mod serial;
 
@@ -145,6 +149,9 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         // handler that cannot service the fault it exists to service.
         idt::init();
         idt::smoke_test();
+        if lapic::init() {
+            lapic::smoke_test();
+        }
         serial::puts("\nAkuma/amd64 — memory subsystem up\n");
     } else {
         serial::puts("\nAkuma/amd64 — memory bring-up FAILED\n");

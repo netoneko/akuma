@@ -26,34 +26,7 @@ const LINE_STATUS: u16 = 5;
 /// Line status bit 5: transmit holding register empty.
 const LSR_THR_EMPTY: u8 = 1 << 5;
 
-/// Write a byte to an I/O port.
-///
-/// # Safety
-/// The caller must know what device answers at `port`. Every call in this
-/// module targets the COM1 register block, which is architecturally fixed.
-#[inline]
-unsafe fn outb(port: u16, val: u8) {
-    // SAFETY: caller's obligation, discharged above.
-    unsafe {
-        core::arch::asm!("out dx, al", in("dx") port, in("al") val,
-                         options(nomem, nostack, preserves_flags));
-    }
-}
-
-/// Read a byte from an I/O port.
-///
-/// # Safety
-/// As [`outb`].
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    // SAFETY: caller's obligation, discharged at each call site.
-    unsafe {
-        core::arch::asm!("in al, dx", out("al") val, in("dx") port,
-                         options(nomem, nostack, preserves_flags));
-    }
-    val
-}
+use crate::port::{inb, outb};
 
 /// Configure COM1 for 115200 8N1 with FIFOs on.
 ///

@@ -396,6 +396,65 @@ The fix is `timeout --foreground`, which leaves the child in the shell's process
 group. `amd64/run-firecracker.sh` stages a `run.sh` that uses it and tees to
 `boot.log`.
 
+## 3.9 Stage D: hardware interrupts, and `MemAttr` earns its place
+
+```
+  lapic: base=0x00000000fee00000 id=0 timer vector=32 periodic
+  test: timer interrupts 5 ticks in 612346 spins   [OK]     # QEMU
+  test: timer interrupts 5 ticks in 10691123 spins   [OK]   # Firecracker, Zen 4
+```
+
+`amd64/src/lapic.rs`. Everything before this ran with `IF` clear from `boot.s`
+onward: the kernel could fault, but nothing could *interrupt* it. A timer tick is
+the prerequisite for preemption and therefore for a scheduler.
+
+The spin counts are worth keeping. The same five ticks cost **612 K** spins under
+QEMU and **10.7 M** on the Zen 4 — a real CPU spins ~17x further between ticks
+than an emulated one. That ratio is itself the evidence that the ticks come from
+a clock rather than from anything correlated with instruction count.
+
+**Still no ACPI.** The LAPIC does not need discovering: its base is in
+`IA32_APIC_BASE` (MSR `0x1B`), one `rdmsr` away. That is why a preemption timer
+sits *before* ACPI in the plan rather than after it — the IOAPIC is what genuinely
+needs the MADT.
+
+### 3.9.1 The first real consumer of `MemAttr`
+
+The LAPIC lives at `0xFEE0_0000`, above the 1 GiB `boot.s` identity-maps, so it
+must be mapped explicitly — **and uncacheable**. A writeback-cached device mapping
+lets the CPU satisfy a read from cache and never issue the access at all, which
+makes a polled register appear frozen.
+
+`paging::encode` was written in §3.5 with a deliberate hole: it took a `Prot` and
+no attribute, with a comment saying the `MemAttr` half of item 1's
+`encode(prot, attr)` was "deliberately absent rather than stubbed with a value
+that would look meaningful". It is now present, because something needed it —
+`MemAttr::{WriteBack, Device}`, two PTE bits (`PCD | PWT`) here and an `AttrIndx`
+into `MAIR_EL1` on AArch64. No consumer cares which, which is the entire point of
+the neutral vocabulary item 1 proposes.
+
+That is the second time this port has produced evidence *for* item 1 rather than
+consuming it: §3.5 showed the permission half cannot cross, and this shows the
+attribute half is real rather than speculative.
+
+### 3.9.2 Mask the legacy PICs before the first `sti`
+
+The 8259s power up with lines unmasked and vectors overlapping the CPU exception
+range, so enabling interrupts without masking them invites a spurious IRQ that
+decodes as a `#GP` with a garbage error code. Four `outb`s, not optional. Nothing
+here uses them — the serial console is polled — so they are masked rather than
+remapped.
+
+The timer's initial count is deliberately **uncalibrated**: the LAPIC counts at
+the core crystal frequency, which needs CPUID leaf `0x15` or calibration against
+another clock to convert to wall time, and nothing needs wall time yet. It only
+has to tick fast enough for a bounded spin loop to observe. That loop is bounded
+precisely so a timer that never fires reports a failure instead of hanging the
+boot.
+
+Port I/O moved out of `serial.rs` into `amd64/src/port.rs` when this became its
+second consumer.
+
 ## 4. What is deliberately missing
 
 - **No upper-half mapping.** The aarch64 `linker.ld` splits kernel VA from physical at

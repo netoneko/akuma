@@ -1,8 +1,9 @@
 # Akuma/amd64
 
 x86_64 bring-up target. Boots to long mode, brings up the kernel heap and the
-physical frame allocator, maps/unmaps 4 KiB pages, and services page faults with
-**demand paging**. No userspace, no hardware interrupts, no scheduler.
+physical frame allocator, maps/unmaps 4 KiB pages, services page faults with
+**demand paging**, and takes **LAPIC timer interrupts**. No userspace, no
+scheduler, no device interrupts.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1**.
 
@@ -28,6 +29,8 @@ Akuma/amd64 — long mode reached
   test: paging map/write/verify/unmap @0x0000000040000000   [OK]
   test: W^X encoding   [OK]
   test: demand paging 4 faults serviced, frames 126380 -> 126378   [OK]
+  lapic: base=0x00000000fee00000 id=0 timer vector=32 periodic
+  test: timer interrupts 5 ticks in 612346 spins   [OK]
 
 Akuma/amd64 — memory subsystem up
 ```
