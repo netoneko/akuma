@@ -170,6 +170,30 @@ long_mode_start:
     movq $__boot_stack_top, %rsp
     xorq %rbp, %rbp
 
+    /* Make SSE legal for ring 3.
+     *
+     * The kernel is built for `x86_64-unknown-none`, which is soft-float, so
+     * nothing in it emits an xmm instruction. A ring-3 binary the tree did not
+     * compile (busybox, any normal musl program) emits `movups`/xmm in its
+     * startup and #UDs unless CR4.OSFXSR is set: SSE is architecturally present
+     * on every x86_64 part but the OS has to acknowledge it.
+     *
+     *   CR0.EM (bit 2) = 0  — do NOT trap x87/SSE as "no coprocessor"
+     *   CR0.MP (bit 1) = 1  — `wait`/`fwait` honour TS
+     *   CR4.OSFXSR      (bit  9) = 1  — enable SSE + `fxsave`/`fxrstor` layout
+     *   CR4.OSXMMEXCPT  (bit 10) = 1  — deliver #XM instead of #UD on an SSE fault
+     *
+     * There is no `fxsave`/`fxrstor` on the context switch yet (README: "No
+     * FP/SIMD state save"), so this only makes the instructions legal — a
+     * second SSE-using task would clobber the first's xmm registers. */
+    movq %cr0, %rax
+    andq $-5, %rax
+    orq  $2, %rax
+    movq %rax, %cr0
+    movq %cr4, %rax
+    orq  $((1 << 9) | (1 << 10)), %rax
+    movq %rax, %cr4
+
     /* Still executing from the low identity map. Jump to the kernel's linked
      * (high) address: an absolute indirect jump, because a direct `jmp` encodes
      * a 32-bit displacement and the target is 2^47 away. */

@@ -88,12 +88,13 @@ const AT_ENTRY: u64 = 9;
 /// A fixed array rather than a `Vec`: this is teardown bookkeeping on a path
 /// that runs under memory pressure, and the kernel's own rule is that the best
 /// code allocates nothing. It has to cover image + stack for the largest
-/// program the loader runs: `sshd` is ~31 pages of segments plus the 128-page
-/// stack (`ELF_STACK_PAGES`), so 192 leaves headroom. A real program will need
-/// a region list rather than a bigger array, and that arrives with demand
-/// paging. `mmap`/heap frames are not tracked here — they are leaked on
-/// teardown, deliberately (`mm.rs`).
-pub const MAX_PROC_FRAMES: usize = 192;
+/// program the loader runs: static musl **busybox** is ~275 pages of segments
+/// plus the 128-page stack (`ELF_STACK_PAGES`), so 512 leaves headroom. This
+/// `[usize; 512]` per `Process` (16 slots = 64 KiB of `.bss`) is exactly the
+/// dead weight a region list would replace, and is on the deferred-audit list
+/// (`AKUMA_FIRECRACKER_AMD64.md` §3.24.5). `mmap`/heap frames are not tracked
+/// here — they are leaked on teardown, deliberately (`mm.rs`).
+pub const MAX_PROC_FRAMES: usize = 512;
 
 /// Every physical frame a process owns, so teardown can give them all back.
 ///

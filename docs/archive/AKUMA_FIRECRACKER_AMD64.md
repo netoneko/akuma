@@ -1970,6 +1970,78 @@ is the `static` array + spinlock around the leaf. See
   routed per task and the numbered fds each side holds do not collide in
   practice.
 
+### 3.24.5 Deferred: the allocation audit
+
+**`amd64/src/` has not been through the "analyze every path for allocations"
+pass the kernel convention requires** (`CLAUDE.md` § "Kernel conventions"). Stage
+O/P/R were written for reach first. The known offenders, to be settled when this
+code is extracted into crates:
+
+* `sys_spawn` / `user_cstr` / `user_argv` — a `Vec` per argv string and one for
+  the pointer array, on the spawn path. Should be fixed stack buffers
+  (`build_stack` already bounds argv at `MAX_ARGV`).
+* `fd::read_pipe` / `write_pipe` / `sock::recv` / `sock::send` — an
+  `alloc::vec![0u8; len]` bounce buffer per call, `len` up to 64 KiB from ring
+  3. Should be a fixed staging buffer or a chunked copy.
+* `fd::sys_openat` caches the **whole file** in a `Vec<u8>` per open (Stage O's
+  stated divergence, `docs/archive/AMD64_CRATE_REUSE_AUDIT.md`).
+* `fd::copy_in` / `copy_out` build a `Vec` where a slice copy would do.
+* `main.rs` / `run_init` split `initargs=` into a `Vec<&str>`.
+
+None of these is on the allocator-failure-reporting path, and the target has
+493 MiB free, so nothing here is urgent — but it is a debt, recorded so the
+crate extraction has a checklist rather than a rediscovery.
+
+## 3.25 Stage S: a binary the tree did not compile — static musl busybox
+
+```text
+$ busybox uname -a
+Akuma akuma 0.1.0-amd64 Akuma/amd64 (x86_64 bring-up) x86_64 GNU/Linux
+```
+
+Every program before this — `hello`, `paws`, `httpd`, `sshd` — was built by
+this repo for `x86_64-unknown-none`, which is **soft-float** and links against a
+`libakuma` whose syscall numbers the kernel chose. busybox is a stock
+`1.35.0-x86_64-linux-musl` static `ET_EXEC` off `busybox.net`, compiled by a
+normal toolchain. Running it is the real test of the ELF loader and the Linux
+syscall surface, and `strace` (a new `strace` command-line flag prints every
+syscall the init program makes) walked it there in four steps:
+
+1. **`arch_prctl(ARCH_SET_FS)` — syscall 158, x86-only, no aarch64 number.**
+   musl's `__init_tp` issues it first and `hlt`s if it fails. It writes
+   `IA32_FS_BASE` directly — the x86 analogue of `set_tpidr_el0`. There is no
+   per-task save/restore: the kernel never touches FS/GS base, so the value just
+   persists, which is correct while one program at a time uses TLS and a debt
+   when two do (§3.24.5-style, noted at the call site).
+
+2. **SSE, in `boot.s`.** busybox's startup does `movups (%rdx), %xmm0` and
+   `#UD`'d: SSE is architecturally present on every x86_64 part but the OS must
+   set `CR4.OSFXSR` / `CR4.OSXMMEXCPT` and clear `CR0.EM` first. The kernel is
+   soft-float so nothing in it needed this — a ring-3 binary compiled normally
+   does. Still no `fxsave`/`fxrstor` on the context switch (the README's
+   standing gap), so this only makes the instructions legal.
+
+3. **`uname(2)`** — the same `.rodata` `utsname` the aarch64 kernel serves
+   (`akuma_syscalls_glue::proc::sys_uname`), `machine` = `x86_64`.
+
+4. **`writev(2)`** — busybox prints through `writev`, not `write`. Plus the
+   handful that are one-liners on a kernel with no users and no signals:
+   `getuid`/`getgid`/`geteuid`/`getegid` → 0, `set{uid,gid}` → 0,
+   `rt_sigprocmask`/`rt_sigaction` → 0, `set_robust_list`/`prlimit64` → 0,
+   `readlink`/`readlinkat` → `EINVAL`. These are handled by raw x86_64 number in
+   `syscall_dispatch` rather than routed through the cross-arch `Syscall` enum —
+   they do not earn a variant, and where the aarch64 kernel does more (real
+   credentials, real signal masking) that is stated at the site.
+
+`busybox_test` spawns `busybox uname -m` and checks the output is `x86_64`.
+
+### 3.25.1 What still does not run
+
+`busybox sh` running anything but a builtin needs `fork`+`execve` (or `vfork`)
+and `wait4`, and a pipeline needs `pipe2` — none of which this target has.
+`arch_prctl`'s missing per-task FS-base save/restore becomes real the moment a
+second musl process (the shell *and* a forked applet) is runnable at once.
+
 ## 4. What is deliberately missing
 
 Corrected 2026-09-04. This list was written at Stage B and went stale as the

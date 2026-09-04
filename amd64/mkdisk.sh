@@ -108,6 +108,23 @@ done
 [ -n "$FDPROBE" ] && "$DEBUGFS" -w -R "write $FDPROBE bin/fdprobe" "$IMG" >/dev/null 2>&1
 [ -n "$PAWS" ] && "$DEBUGFS" -w -R "write $PAWS bin/paws" "$IMG" >/dev/null 2>&1
 [ -n "$HTTPD" ] && "$DEBUGFS" -w -R "write $HTTPD bin/httpd" "$IMG" >/dev/null 2>&1
+
+# busybox: a real static musl x86_64 binary (ET_EXEC, non-PIE), fetched once and
+# cached. It is the test that the ELF loader and the Linux syscall surface hold
+# up under a program the tree did not compile. `/bin/sh` and a handful of applet
+# names are hard-linked to it so a multicall dispatch on `argv[0]` works.
+BB_VER=1.35.0
+BB="target/x86_64-unknown-none/release/busybox-x86_64"
+if [ ! -f "$BB" ]; then
+    mkdir -p "$(dirname "$BB")"
+    curl -sSL -o "$BB" "https://www.busybox.net/downloads/binaries/${BB_VER}-x86_64-linux-musl/busybox" || rm -f "$BB"
+fi
+if [ -f "$BB" ]; then
+    "$DEBUGFS" -w -R "write $BB bin/busybox" "$IMG" >/dev/null 2>&1
+    for applet in sh uname ls cat echo pwd env cut head tail wc; do
+        "$DEBUGFS" -w -R "ln /bin/busybox /bin/$applet" "$IMG" >/dev/null 2>&1
+    done
+fi
 if [ -n "$SSHD" ]; then
     "$DEBUGFS" -w -R "write $SSHD bin/sshd" "$IMG" >/dev/null 2>&1
     "$DEBUGFS" -w -R "mkdir /etc" "$IMG" >/dev/null 2>&1

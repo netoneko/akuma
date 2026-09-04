@@ -129,6 +129,12 @@ pub static mut CURRENT_UCTX: *mut UserCtx = core::ptr::null_mut();
 
 /// How many syscalls arrived.
 static CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Print every syscall number and its result. Off during the self-tests, turned
+/// on by `run_init` when `strace` is on the command line — a bring-up aid for
+/// running a program the tree did not compile (busybox).
+pub static SYSCALL_TRACE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 /// Bytes accepted by `write`, across all processes.
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Status the last process exited with.
@@ -349,7 +355,18 @@ fn rdmsr(msr: u32) -> u64 {
 #[unsafe(no_mangle)]
 extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     CALLS.fetch_add(1, Ordering::Relaxed);
+    let r = syscall_dispatch(nr, a1, a2, a3, a4, a5);
+    if SYSCALL_TRACE.load(Ordering::Relaxed) {
+        serial::puts("[sc] nr=");
+        serial::put_dec(nr);
+        serial::puts(" -> 0x");
+        serial::put_hex(r);
+        serial::puts("\n");
+    }
+    r
+}
 
+fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     use crate::fd::errno;
 
     // Akuma's own syscalls, before the Linux table.
@@ -376,6 +393,66 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
         };
     }
 
+    // Linux syscalls handled by raw x86_64 number rather than through the
+    // cross-architecture `Syscall` enum — either because they are x86-only
+    // (`arch_prctl`) or because their behaviour on a kernel with no users and no
+    // signals is a one-liner that does not earn an enum variant and four match
+    // arms. Where the AArch64 kernel does more (real signal masking, real
+    // credentials), that is noted at the site.
+    match nr {
+        // x86_64 158: the TLS-base primitive. No aarch64 number.
+        158 => return sys_arch_prctl(a1, a2),
+        // uname(2). Same static-.rodata answer the aarch64 kernel gives, machine
+        // string aside — see `akuma_syscalls_glue::proc::sys_uname`.
+        63 => return sys_uname(a1),
+        // Credentials. One user, uid 0 — the same answer `src/syscall` gives.
+        102 | 104 | 107 | 108 => return 0, // get{uid,gid,euid,egid}
+        105 | 106 => return 0,             // set{uid,gid}: already root, accept
+        // Signals: this kernel has none, so "the mask is empty and stays empty"
+        // is the correct result, not a stub. `rt_sigprocmask` writes the old
+        // (empty) set back if asked.
+        13 => return 0, // rt_sigaction
+        14 => {
+            if a3 != 0 {
+                let n = (a4 as usize).min(8);
+                // SAFETY: a user pointer to a sigset_t, bounded by sigsetsize.
+                unsafe { core::ptr::write_bytes(a3 as *mut u8, 0, n) };
+            }
+            return 0;
+        }
+        // Best-effort robustness/rlimit hooks musl pokes on startup.
+        273 => return 0,          // set_robust_list
+        302 => return 0,          // prlimit64
+        // Nothing here is a symlink.
+        89 | 267 => return errno::EINVAL, // readlink / readlinkat
+        // Process-group / session ids. One process, so it is its own group and
+        // session leader; `setpgid`/`setsid` accept and report id 1.
+        110 => return 1,                  // getppid
+        111 | 121 | 124 => return 1,      // getpgrp / getpgid / getsid
+        109 | 112 => return 0,            // setpgid / setsid
+        // `getcwd(buf, size)` — this target has no per-process cwd; it is always
+        // root. Linux returns the length *including* the NUL.
+        79 => {
+            if a1 == 0 || a2 < 2 {
+                return errno::EINVAL;
+            }
+            // SAFETY: a user buffer of at least `a2` bytes, `a2 >= 2` checked.
+            unsafe {
+                (a1 as *mut u8).write_volatile(b'/');
+                (a1 as *mut u8).add(1).write_volatile(0);
+            }
+            return 2;
+        }
+        // `mprotect` — W^X is enforced at map time and there is no region table
+        // to re-permission against, so this accepts and does nothing. A caller
+        // asking for *more* access than it has still sees the original (never
+        // less permissive) mapping; one asking for less is not honoured. Real
+        // `mprotect` for spawned processes needs the per-space region table the
+        // loader also wants (§3.18.8 / §3.24.5).
+        10 => return 0,
+        _ => {}
+    }
+
     let Some(call) = Syscall::from_x86_64(nr) else {
         return errno::ENOSYS;
     };
@@ -383,6 +460,11 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
     match call {
         Syscall::Write => sys_write(a1, a2, a3),
         Syscall::Read => crate::fd::sys_read(a1, a2, a3),
+        // busybox prints through `writev`, not `write`. Walk the iovec array and
+        // forward each segment; a short write on any segment stops the walk, as
+        // `writev(2)` specifies.
+        Syscall::Writev => sys_writev(a1, a2, a3),
+        Syscall::Readv => sys_readv(a1, a2, a3),
         Syscall::Openat => crate::fd::sys_openat(a1, a2, a3, a4),
         Syscall::Close => crate::fd::sys_close(a1),
         Syscall::Lseek => crate::fd::sys_lseek(a1, a2, a3),
@@ -441,12 +523,164 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
     }
 }
 
+/// `writev(fd, iov, iovcnt)` — `struct iovec` is `{ base: *const u8, len: usize }`,
+/// 16 bytes. Forwards each segment through `sys_write`; a short or failing
+/// segment ends the walk and the total so far (or the error, if nothing was
+/// written) is returned, per POSIX.
+fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
+    use crate::fd::errno;
+    let cnt = (cnt as usize).min(1024);
+    let mut total: u64 = 0;
+    for i in 0..cnt {
+        let e = iov + (i as u64) * 16;
+        // SAFETY: user pointers to an iovec array; bad ones fault reportably.
+        let (base, len) = unsafe {
+            (
+                (e as *const u64).read_volatile(),
+                (e as *const u64).add(1).read_volatile(),
+            )
+        };
+        if len == 0 {
+            continue;
+        }
+        let n = sys_write(fd, base, len);
+        if errno::is_err(n) {
+            // An errno (top of the u64 range). Return it only if nothing has
+            // gone out yet; otherwise report the partial success.
+            return if total == 0 { n } else { total };
+        }
+        total += n;
+        if n < len {
+            break;
+        }
+    }
+    total
+}
+
+/// `readv(fd, iov, iovcnt)` — the mirror of [`sys_writev`].
+fn sys_readv(fd: u64, iov: u64, cnt: u64) -> u64 {
+    use crate::fd::errno;
+    let cnt = (cnt as usize).min(1024);
+    let mut total: u64 = 0;
+    for i in 0..cnt {
+        let e = iov + (i as u64) * 16;
+        // SAFETY: as `sys_writev`.
+        let (base, len) = unsafe {
+            (
+                (e as *const u64).read_volatile(),
+                (e as *const u64).add(1).read_volatile(),
+            )
+        };
+        if len == 0 {
+            continue;
+        }
+        let n = crate::fd::sys_read(fd, base, len);
+        if errno::is_err(n) {
+            return if total == 0 { n } else { total };
+        }
+        total += n;
+        if n < len {
+            break;
+        }
+    }
+    total
+}
+
 /// `getrandom(buf, buflen, flags)` — bytes from `RDRAND` (or the loud
 /// non-cryptographic fallback on a CPU without it; see `net::rng_fill`).
 ///
 /// `flags` is ignored: `GRND_NONBLOCK` never applies because `RDRAND` does not
 /// block, and `GRND_RANDOM` vs the urandom pool is a distinction this source
 /// does not have. Bounded per call — `sshd` asks for 32 at a time.
+/// `struct utsname`: six 65-byte NUL-padded fields, 390 bytes. The ABI's shape,
+/// not this kernel's — Linux copies the same 390 bytes out of `init_uts_ns`.
+const UTS_FIELD: usize = 65;
+const UTS_LEN: usize = UTS_FIELD * 6;
+
+const fn uts_set(mut b: [u8; UTS_LEN], field: usize, v: &[u8]) -> [u8; UTS_LEN] {
+    let start = field * UTS_FIELD;
+    let max = UTS_FIELD - 1;
+    let n = if v.len() < max { v.len() } else { max };
+    let mut i = 0;
+    while i < n {
+        b[start + i] = v[i];
+        i += 1;
+    }
+    b
+}
+
+/// The answer `uname(2)` gives, assembled once in `.rodata`. `machine` is
+/// `x86_64` here where the AArch64 kernel says `aarch64` — the one field that
+/// actually differs between the two.
+static UTSNAME: [u8; UTS_LEN] = {
+    let b = [0u8; UTS_LEN];
+    let b = uts_set(b, 0, b"Akuma"); // sysname
+    let b = uts_set(b, 1, b"akuma"); // nodename
+    let b = uts_set(b, 2, b"0.1.0-amd64"); // release
+    let b = uts_set(b, 3, b"Akuma/amd64 (x86_64 bring-up)"); // version
+    let b = uts_set(b, 4, b"x86_64"); // machine
+    uts_set(b, 5, b"(none)") // domainname
+};
+
+fn sys_uname(buf: u64) -> u64 {
+    if buf == 0 {
+        return crate::fd::errno::EFAULT;
+    }
+    // SAFETY: a user pointer to a `struct utsname`; `CR4.SMAP` is off and a bad
+    // pointer faults reportably.
+    unsafe {
+        core::ptr::copy_nonoverlapping(UTSNAME.as_ptr(), buf as *mut u8, UTS_LEN);
+    }
+    0
+}
+
+/// `arch_prctl(code, addr)` — x86_64 syscall 158, the TLS-base primitive.
+///
+/// musl's `__init_tp` calls `arch_prctl(ARCH_SET_FS, tp)` as its very first
+/// syscall and `hlt`s (crashes) if it fails, so this is the wall for running
+/// any musl binary. It writes `IA32_FS_BASE` (or `GS_BASE`) directly — the x86
+/// analogue of AArch64's `set_tpidr_el0`.
+///
+/// **Single-TLS-user assumption:** the kernel itself never touches FS/GS base
+/// and there is no per-task save/restore, so this value simply persists across
+/// preemption. Correct while one program at a time uses TLS (the shell); two
+/// concurrent musl processes would clobber each other and need the base saved
+/// in `UserCtx` and reloaded on switch. Deferred — noted in
+/// `AKUMA_FIRECRACKER_AMD64.md`.
+fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
+    const ARCH_SET_GS: u64 = 0x1001;
+    const ARCH_SET_FS: u64 = 0x1002;
+    const ARCH_GET_FS: u64 = 0x1003;
+    const ARCH_GET_GS: u64 = 0x1004;
+    const IA32_FS_BASE: u32 = 0xC000_0100;
+    const IA32_GS_BASE: u32 = 0xC000_0101;
+    match code {
+        ARCH_SET_FS => {
+            // SAFETY: sets the current CPU's FS base to a userspace-supplied
+            // linear address. A bad value can only fault EL0's own `%fs:`
+            // accesses, exactly as on Linux.
+            unsafe { wrmsr(IA32_FS_BASE, addr) };
+            0
+        }
+        ARCH_SET_GS => {
+            // SAFETY: as above for GS. Nothing in this kernel uses GS base.
+            unsafe { wrmsr(IA32_GS_BASE, addr) };
+            0
+        }
+        ARCH_GET_FS => {
+            // SAFETY: a user pointer to a u64, per the ABI.
+            unsafe { (addr as *mut u64).write_volatile(rdmsr(IA32_FS_BASE)) };
+            0
+        }
+        ARCH_GET_GS => {
+            // SAFETY: as above.
+            unsafe { (addr as *mut u64).write_volatile(rdmsr(IA32_GS_BASE)) };
+            0
+        }
+        _ => crate::fd::errno::EINVAL,
+    }
+}
+
 fn sys_getrandom(buf: u64, len: u64) -> u64 {
     use crate::fd::errno;
     if buf == 0 {
@@ -1224,6 +1458,73 @@ pub fn spawn_test(t: &mut Suite) {
     );
 }
 
+/// Stage S: a real static musl **busybox** — a program the tree did not compile
+/// — runs an applet and its output comes back.
+///
+/// `busybox uname -m` exercises the whole "run a foreign binary" surface: the
+/// ELF loader on a ~1 MB image, `arch_prctl` for the TLS base, SSE made legal in
+/// `boot.s` (busybox's startup `movups` #UD'd without it), `uname(2)`, and
+/// `writev` (busybox prints through it, not `write`). Skipped when busybox is
+/// not on the disk.
+pub fn busybox_test(t: &mut Suite) {
+    const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
+
+    if crate::fs::read_file("/bin/busybox").is_none() {
+        t.note("busybox: not on the disk; skipped", 0);
+        return;
+    }
+
+    let free_before = akuma_pmm::free_count();
+    let path = b"/bin/busybox\0";
+    let (a0, a1a, a2a) = (b"busybox\0", b"uname\0", b"-m\0");
+    let argv: [u64; 4] = [
+        a0.as_ptr() as u64,
+        a1a.as_ptr() as u64,
+        a2a.as_ptr() as u64,
+        0,
+    ];
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    if !t.check("busybox: spawned", r < ERRNO_FLOOR) {
+        return;
+    }
+    let pid = (r & 0xFFFF_FFFF) as u32;
+    let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
+    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut status = u64::MAX;
+    let mut buf = [0u8; 64];
+    let mut spins = 0u64;
+    loop {
+        spins += 1;
+        if spins > 2_000_000 {
+            break;
+        }
+        let n = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        if n != 0 && n < ERRNO_FLOOR {
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        let mut st: i32 = -1;
+        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+            status = ((st >> 8) & 0xff) as u64;
+            break;
+        }
+        crate::sched::yield_now();
+    }
+    crate::fd::sys_close(stdout_fd);
+
+    t.check_eq("busybox: exited 0", status, 0);
+    t.check(
+        "busybox: `uname -m` printed x86_64",
+        out.windows(6).any(|w| w == b"x86_64"),
+    );
+    t.check_eq(
+        "busybox: teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+}
+
 /// Run two isolated processes concurrently and prove they interleave.
 pub fn smoke_test(t: &mut Suite) {
     const ROUNDS: u32 = 3;
@@ -1759,14 +2060,22 @@ pub fn fdprobe_test(t: &mut Suite) {
 /// is a server that never reads the console. Both are the same binaries the
 /// aarch64 devbox runs, compiled for `x86_64-unknown-none` against a ported
 /// `libakuma`.
-pub fn run_init(path: &str) -> bool {
+pub fn run_init(path: &str, args: &[&str]) -> bool {
     let Some(image) = crate::fs::read_file(path) else {
         serial::puts("  [init] not on the disk: ");
         serial::puts(path);
         serial::puts("\n");
         return false;
     };
-    let (proc, _img) = match Process::from_elf(&image) {
+    // argv[0] is the path; `args` (from `initargs=`) follow. A multicall binary
+    // like busybox dispatches on `argv[1]` when `argv[0]`'s basename is
+    // `busybox`, so `initargs=uname,-a` runs its `uname` applet.
+    let mut argv_owned: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::with_capacity(1 + args.len());
+    argv_owned.push(path.as_bytes());
+    for a in args {
+        argv_owned.push(a.as_bytes());
+    }
+    let (proc, _img) = match Process::from_elf_argv(&image, &argv_owned) {
         Ok(p) => p,
         Err(e) => {
             serial::puts("  [init] failed to load: ");

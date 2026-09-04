@@ -89,6 +89,14 @@ pub mod errno {
     pub const ESRCH: u64 = (-3i64) as u64;
     pub const EAGAIN: u64 = (-11i64) as u64;
     pub const ENOMEM: u64 = (-12i64) as u64;
+
+    /// Does a syscall return value carry an errno? Linux errnos are `1..=4095`,
+    /// returned as `(-errno) as u64` — the very top of the range. Anything below
+    /// is a real result.
+    #[must_use]
+    pub const fn is_err(r: u64) -> bool {
+        r > u64::MAX - 4096
+    }
 }
 
 /// Descriptors 0, 1 and 2 are the console and are never in the table.

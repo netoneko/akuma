@@ -217,6 +217,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     usermode::elf_test(&mut t);
     usermode::fdprobe_test(&mut t);
     usermode::spawn_test(&mut t);
+    usermode::busybox_test(&mut t);
     lapic::stop_timer();
 
     // Last: it spawns the netpoll daemon and leaves it running (which is the
@@ -239,7 +240,21 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // an hour debugging the wrong layer.
     if passed && have_fs {
         let mut init_buf = [0u8; 128];
-        if let Some(path) = machine::init_path(hvm_start_info, &mut init_buf) {
+        let mut args_buf = [0u8; 256];
+        // Copy the path out first: `init_path` and `init_args` both borrow a
+        // fresh parse of the command line, so they cannot both be live.
+        let mut path_store = [0u8; 128];
+        let path_len = machine::init_path(hvm_start_info, &mut init_buf)
+            .map(|p| {
+                let n = p.len().min(path_store.len());
+                path_store[..n].copy_from_slice(&p.as_bytes()[..n]);
+                n
+            });
+        if let Some(path_len) = path_len {
+            let path = core::str::from_utf8(&path_store[..path_len]).unwrap_or("");
+            let args_str = machine::init_args(hvm_start_info, &mut args_buf).unwrap_or("");
+            let args: alloc::vec::Vec<&str> =
+                args_str.split(',').filter(|s| !s.is_empty()).collect();
             // Leave the timer running for the init program: it drives preemption
             // (so a busy server cannot starve the netpoll daemon) and advances
             // the clock `akuma-net`'s wait deadlines are measured against. The
@@ -247,7 +262,10 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
             if have_net {
                 lapic::start_timer();
             }
-            usermode::run_init(path);
+            if machine::flag(hvm_start_info, "strace") {
+                usermode::SYSCALL_TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+            usermode::run_init(path, &args);
         }
     }
 
