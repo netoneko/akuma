@@ -57,6 +57,28 @@ pub fn describe(start_info_pa: u64) -> MachineDescription {
     d
 }
 
+/// The value of an `init=` token on the boot command line, copied into `buf`.
+///
+/// Which program gets the console after the self-tests. `paws` is a shell and
+/// wants a terminal; `httpd` is a server and wants none, so the choice cannot be
+/// baked in — and the command line is where a machine already tells this kernel
+/// things (`docs/reference/firecracker-amd64/README.md`).
+///
+/// Returns `None` when there is no such token, which means "no init": the boot
+/// halts after its verdict, as it did before there was anything to run.
+pub fn init_path<'a>(start_info_pa: u64, buf: &'a mut [u8]) -> Option<&'a str> {
+    let mut scratch = [0u8; 512];
+    let si = akuma_ryzen_amd64::StartInfo::parse(&Physmap, start_info_pa)?;
+    let cmdline = si.cmdline(&Physmap, &mut scratch)?;
+    let value = cmdline
+        .split_ascii_whitespace()
+        .find_map(|t| t.strip_prefix("init="))?;
+    // Copied out because `scratch` dies with this frame.
+    let n = value.len().min(buf.len());
+    buf[..n].copy_from_slice(&value.as_bytes()[..n]);
+    core::str::from_utf8(&buf[..n]).ok()
+}
+
 /// Print what the machine said. A dump, not a configuration step.
 ///
 /// This is the amd64 equivalent of dumping an FDT, and it is worth printing

@@ -230,7 +230,10 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // one, because a shell on a kernel whose own tests failed is a way to spend
     // an hour debugging the wrong layer.
     if passed && have_fs {
-        usermode::run_shell();
+        let mut init_buf = [0u8; 128];
+        if let Some(path) = machine::init_path(hvm_start_info, &mut init_buf) {
+            usermode::run_init(path);
+        }
     }
 
     halt();

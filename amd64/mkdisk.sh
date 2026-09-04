@@ -54,9 +54,14 @@ FDPROBE=$(find target/x86_64-unknown-none/release/build -name fdprobe.elf 2>/dev
 # against the ported `libakuma`. Best-effort — a tree where paws does not build
 # still gets a bootable image with the probes on it.
 PAWS=""
-if (cd userspace && cargo build -q -p paws --target x86_64-unknown-none --release 2>/dev/null); then
-    PAWS=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name paws -type f | head -1)
-fi
+HTTPD=""
+for prog in paws httpd; do
+    if (cd userspace && cargo build -q -p "$prog" --target x86_64-unknown-none --release 2>/dev/null); then
+        found=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name "$prog" -type f | head -1)
+        [ "$prog" = paws ] && PAWS="$found"
+        [ "$prog" = httpd ] && HTTPD="$found"
+    fi
+done
 
 mkdir -p "$(dirname "$IMG")"
 rm -f "$IMG"
@@ -83,6 +88,10 @@ done
 "$DEBUGFS" -w -R "write $HELLO bin/hello" "$IMG" >/dev/null 2>&1
 [ -n "$FDPROBE" ] && "$DEBUGFS" -w -R "write $FDPROBE bin/fdprobe" "$IMG" >/dev/null 2>&1
 [ -n "$PAWS" ] && "$DEBUGFS" -w -R "write $PAWS bin/paws" "$IMG" >/dev/null 2>&1
+[ -n "$HTTPD" ] && "$DEBUGFS" -w -R "write $HTTPD bin/httpd" "$IMG" >/dev/null 2>&1
+# Something for httpd to serve.
+printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></html>\n' > "$TMP/index.html"
+"$DEBUGFS" -w -R "write $TMP/index.html index.html" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $TMP/probe.txt probe.txt" "$IMG" >/dev/null 2>&1
 
 echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")"

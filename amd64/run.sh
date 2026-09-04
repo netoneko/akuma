@@ -107,7 +107,9 @@ if [ "$DISK" != "none" ]; then
     # A NIC on the next transport. QEMU's user-mode stack needs no tap and no
     # root: it NATs, and answers DHCP itself, so a local run exercises the same
     # discovery and the same driver the Firecracker host does with dnsmasq.
-    NIC="-netdev user,id=n0 -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1"
+    # `hostfwd` puts the guest's port 8080 on the host's, so `httpd` can be
+    # reached with an ordinary `curl http://localhost:8080/`.
+    NIC="-netdev user,id=n0,hostfwd=tcp::${HTTP_PORT:-8080}-:8080 -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1"
     # Two tokens now, one per device, dense at the 0x200 stride. This is the
     # multi-slot geometry `MmioDevices::geometry` computes — until now only one
     # device was ever announced, so the stride was never exercised on this
@@ -116,7 +118,9 @@ if [ "$DISK" != "none" ]; then
     # and the surrounding variables are deliberately word-split — so this one is
     # kept separate and quoted at the call, or QEMU reads the second token as
     # another device and fails with "drive with bus=0, unit=0 exists".
-    CMDLINE="virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6"
+    # `init=` picks the program that gets the console after the self-tests.
+    # Default `/bin/paws`; `INIT=/bin/httpd amd64/run.sh` for the server.
+    CMDLINE="virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6 init=${INIT:-/bin/paws}"
 fi
 
 # shellcheck disable=SC2086  # these are deliberately word-split
