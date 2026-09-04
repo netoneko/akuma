@@ -1,6 +1,6 @@
 [package]
 name = "akuma-amd64"
-version = "0.1.0"
+version = "0.0.7"
 edition = "2024"
 description = "amd64 (x86_64) boot target: PVH -> long mode -> the arch-neutral crates"
 

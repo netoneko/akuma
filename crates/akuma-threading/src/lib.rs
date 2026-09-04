@@ -126,7 +126,7 @@ pub use types::*;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use akuma_primitives::OnceCopy;
@@ -224,13 +224,13 @@ fn process() -> ProcessHooks {
 }
 
 /// Set the current exception stack pointer (TPIDR_EL1).
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline]
 pub fn set_current_exception_stack(stack_top: u64) {
     unsafe { core::arch::asm!("msr tpidr_el1, {}", in(reg) stack_top); }
 }
 
-#[cfg(not(target_os = "none"))]
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 #[inline]
 pub fn set_current_exception_stack(_stack_top: u64) {}
 
@@ -1324,7 +1324,7 @@ pub fn set_itimer(tid: usize, deadline: u64, interval: u64) {
 /// need to modify its own thread ID directly.
 
 /// Set the current thread ID in TPIDRRO_EL0
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline]
 fn set_current_thread_register(tid: usize) {
     unsafe {
@@ -1341,7 +1341,7 @@ fn set_current_thread_register(tid: usize) {
     sync::load_thread_tag_to_core(bkl::current_core_id(), tid);
 }
 
-#[cfg(not(target_os = "none"))]
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 #[inline]
 fn set_current_thread_register(_tid: usize) {}
 
@@ -2347,7 +2347,7 @@ pub fn adopt_current_as_core_idle(
 // ============================================================================
 
 // Assembly context switch implementation
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 global_asm!(
     r#"
 .section .text
@@ -2402,16 +2402,16 @@ thread_exit_asm:
 "#
 );
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 unsafe extern "C" {
     fn thread_start() -> !;
     fn thread_start_closure() -> !;
 }
 
-#[cfg(not(target_os = "none"))]
-unsafe extern "C" fn thread_start() -> ! { panic!("not on bare metal") }
-#[cfg(not(target_os = "none"))]
-unsafe extern "C" fn thread_start_closure() -> ! { panic!("not on bare metal") }
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+unsafe extern "C" fn thread_start() -> ! { panic!("not on bare metal aarch64") }
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+unsafe extern "C" fn thread_start_closure() -> ! { panic!("not on bare metal aarch64") }
 
 
 /// Set up a fake IRQ frame on a new thread's stack
@@ -3618,7 +3618,7 @@ pub fn blocking_relax_net() {
 /// Takes current SP from assembly, returns new SP if switch needed (or 0).
 /// The assembly does the actual SP switch AFTER this function returns.
 /// This avoids the problem of switching SP in the middle of Rust code.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     (runtime().end_of_interrupt)(irq);
 
@@ -3875,21 +3875,35 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     0  // No switch needed
 }
 
-/// Host stub for [`sgi_scheduler_handler_with_sp`], which is bare-metal only:
-/// its switch arm writes `ttbr0_el1`, an `msr` deliberately kept out of
-/// `akuma-cpu` (installing an address space is not "safe to execute"). The
-/// pairing exists so `akuma-exceptions` — whose IRQ handler is the sole caller —
-/// stays in `default-members` and compiles under `cargo test --target $HOST`
-/// alongside every other crate, rather than buying host coverage of the
-/// exception path with a workspace exclusion.
+/// Stub for [`sgi_scheduler_handler_with_sp`] off `all(target_os = "none",
+/// target_arch = "aarch64")` — both the host-test build (no `target_os =
+/// "none"` at all) and, since 2026-09-05, a genuine `x86_64-unknown-none`
+/// build. The real handler's switch arm writes `ttbr0_el1`, an `msr`
+/// deliberately kept out of `akuma-cpu` (installing an address space is not
+/// "safe to execute"), so it cannot have a portable body the way most of this
+/// crate's atomic/bookkeeping functions do.
+///
+/// **This is a real, open gap on x86_64, not a formality.** Unlike
+/// `akuma-mmu`'s target-arch gate fix
+/// (`docs/archive/AKUMA_MMU_TARGET_ARCH_GATE_FIX.md`), which had `amd64/src/
+/// paging.rs` as an already-working port target, there is no x86 equivalent
+/// of this SGI-interrupt-driven, fake-IRQ-frame context switch to port —
+/// `amd64/src/sched.rs`'s cooperative-only switch is a materially simpler
+/// mechanism. Writing a real x86_64 arm here is its own piece of safety-
+/// critical design work; see `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md`.
 ///
 /// It panics rather than returning `0`: `0` is the handler's "no context switch
-/// needed" answer, so a stub returning it would let a host caller read a silent
-/// no-op as a real scheduling decision. Nothing on the host has an IRQ vector to
-/// call this from, and if that ever changes the panic says so.
-#[cfg(not(target_os = "none"))]
+/// needed" answer, so a stub returning it would let a caller read a silent
+/// no-op as a real scheduling decision. Nothing calls this on the host or on
+/// `x86_64` today (`akuma-exceptions`'s IRQ handler is the sole caller, and
+/// nothing wires that handler up outside the aarch64 kernel), and if that
+/// ever changes the panic says so instead of silently never switching.
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 pub fn sgi_scheduler_handler_with_sp(_irq: u32, _current_sp: u64) -> u64 {
-    unimplemented!("sgi_scheduler_handler_with_sp: bare metal only (writes ttbr0_el1)")
+    unimplemented!(
+        "sgi_scheduler_handler_with_sp: aarch64 bare metal only (writes ttbr0_el1) — \
+         see proposals/AKUMA_THREADING_ARCH_PORTABILITY.md for the x86_64 gap"
+    )
 }
 
 /// Called from the IRQ vector asm immediately after `mov sp, x0`: this core is
