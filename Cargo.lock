@@ -82,6 +82,7 @@ dependencies = [
  "akuma-syscalls-mem",
  "akuma-syscalls-poll",
  "akuma-terminal",
+ "akuma-user-access",
  "akuma-vfs",
  "akuma-virtio",
  "elf",

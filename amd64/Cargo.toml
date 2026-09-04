@@ -82,6 +82,12 @@ akuma-pipe = { path = "../crates/akuma-pipe" }
 # `sys_select` (`fd.rs`): `apk` waits for socket writability through `select`
 # and wedged its TLS fetch while the syscall was `ENOSYS`.
 akuma-syscalls-poll = { path = "../crates/akuma-syscalls-poll" }
+# The user-copy primitive: `copy_from_user_safe` and its x86_64 `rep movsb`
+# loop, plus `user_copy_fixup`, which `idt.rs`'s page-fault path consults to
+# turn a fault inside that loop into a returned EFAULT instead of a halt. The
+# first arch-neutral crate on this target whose *mechanism* had to be built
+# here rather than ported (`docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md`).
+akuma-user-access = { path = "../crates/akuma-user-access" }
 
 [[bin]]
 name = "akuma-amd64"

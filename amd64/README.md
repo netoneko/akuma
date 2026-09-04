@@ -316,8 +316,7 @@ and each entry has one of three reasons:
 |---|---|
 | `akuma-mmu`, `akuma-elf` | **Blocked.** `akuma-mmu` is AArch64 page-table format; `akuma-elf`'s mapping half is written against it. The fix is a parse/place split for the loader, and proposal item 1 for the tables. `amd64/src/loader.rs` grew its own independent static-PIE (`ET_DYN`) support 2026-09-04 for `apk` rather than waiting on that split — real duplication, tracked as such, not evidence the split stopped mattering |
 | `akuma-mmap` | **Blocked on item 1.** `MmapRegion.flags` is a raw AArch64 PTE `u64`; the two encodings share no field. This costs `munmap`'s clip-and-split, lazy regions, and a region list to replace `loader::MAX_PROC_FRAMES` |
-| `akuma-user-access` | **Cannot build.** Its copy loop is AArch64 `global_asm!` (`cbz`). `fd.rs` has its own bounded copy helpers, which is duplication with a real reason |
-| `akuma-syscalls-glue` (incl. its `pipe`) | **Cannot build** (`cbz` through `akuma-user-access`). `amd64/src/{fd,usermode}.rs` hold the file/spawn/pipe syscall bodies; the pure pipe buffer was extracted to `akuma-pipe` rather than re-derived |
+| `akuma-syscalls-glue` (incl. its `pipe`) | **Not reached yet** (it needs `akuma-exec`). `amd64/src/{fd,usermode}.rs` hold the file/spawn/pipe syscall bodies; the pure pipe buffer was extracted to `akuma-pipe` rather than re-derived. Until 2026-09-05 it could not build at all, through `akuma-user-access`'s AArch64 asm |
 | `akuma-uart`, `akuma-gic`, `akuma-psci`, `akuma-exceptions`, `akuma-el0-entry`, `akuma-entry`, `akuma-timer`, `akuma-fdt`, `akuma-firecracker` | **Different hardware.** PL011 vs a 16550 on I/O ports, GICv3 vs LAPIC, PSCI vs nothing, an FDT vs a PVH block. Genuinely arch- or machine-specific |
 | `akuma-exec`, `akuma-exec-core`, `akuma-threading`, `akuma-slot-table`, `akuma-syscalls`, `akuma-kernel-core`, `akuma-kernel-glue`, `akuma-vfs-glue`, `akuma-bkl` | **Not reached yet.** The process/exec/SMP layer. `akuma-exec-core` supplied `FileDescriptor`/`KernelFile`; its `Process` and the fork/exec of `akuma-exec` are what Stage T (§3.26) needs |
 | `akuma-rump`, `akuma-fpcache`, `akuma-kacho`, `akuma-isolation`, `akuma-syscalls-{poll,sync,time,ipc,log}`, `akuma-boot`, `akuma-config` | **Not needed yet.** All build for `x86_64-unknown-none`; none has a consumer on this target |
@@ -450,7 +449,13 @@ program that printed its verdict would have "passed" by running at all.
   the current handler touches a vector register, which is a property of today's
   code rather than a guarantee — see
   `docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md` §8.
-- **No SMP**, no `CR4.SMAP`/`SMEP`, no TSS/IST, no ACPI.
+- **No SMP**, no `CR4.SMAP`/`SMEP`, no IST, no ACPI.
+- **User pointers are still dereferenced raw** in `usermode.rs`/`fd.rs`. The
+  fault-safe primitive now exists on this target — `akuma-user-access`'s
+  `copy_from_user_safe` returns `EFAULT` from a `#PF` inside its `rep movsb`
+  via the hand-assembled vector-14 entry in `idt.rs`
+  (`docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md`) — but the syscall bodies
+  have not been converted to it yet.
 - **Little use of the kernel crates.** 36 of 54 build for `x86_64-unknown-none`
   (§0 of `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md`), but they take the *host
   stub* out of `akuma-cpu`: a no-op `dsb_ish`, a `wfi` that does not park.

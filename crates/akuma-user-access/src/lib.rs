@@ -7,11 +7,22 @@
 //! and the raw slice reconstructions in the helpers — serves one contract:
 //!
 //! > **An unmapped or non-EL0-accessible user address cannot panic the kernel.**
-//! > A `ldrb`/`stp` in [`copy_from_user_safe`]'s loop that faults lands in
-//! > `__arch_copy_user_fault` (armed as this thread's handler in
-//! > `akuma_primitives::preempt`), which returns `EFAULT`. The asm is **leaf and
+//! > A load or store in [`copy_from_user_safe`]'s loop that faults lands in
+//! > `__arch_copy_user_fault`, which returns `EFAULT`. The asm is **leaf and
 //! > stackless** so that recovery `ret`s back to the Rust caller — the three
 //! > invariants are stated on `__arch_copy_user_memory` itself.
+//!
+//! How the fault *reaches* the trampoline is per-architecture, and the two
+//! mechanisms differ on purpose:
+//!
+//! * **AArch64** arms the trampoline address as this thread's handler in
+//!   `akuma_primitives::preempt` around each copy; `akuma-exceptions`'s EL1 sync
+//!   handler reads it and rewrites `ELR_EL1`.
+//! * **x86_64** arms nothing. `current_tid()` is a constant 0 there, so a
+//!   per-thread slot would be one kernel-wide word. `amd64/src/idt.rs`'s
+//!   page-fault path asks [`user_copy_fixup`] whether the faulting `rip` is
+//!   inside the copy loop and rewrites the saved `rip` only then — a one-entry
+//!   exception table (`docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md`).
 //!
 //! Extracted from `akuma-exec/src/process/user_access.rs` on 2026-09-02
 //! (`AKUMA_EXEC_AUDIT.md` §6 item A) so `akuma-exec` proper sheds ~15 `unsafe`
@@ -52,17 +63,26 @@
     clippy::too_long_first_doc_paragraph,
 )]
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_arch = "aarch64")]
 use akuma_primitives::preempt::set_user_copy_fault_handler;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 unsafe extern "C" {
     fn __arch_copy_user_memory(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn __arch_copy_user_memory_bytes(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn __arch_copy_user_fault();
+}
+
+// The x86_64 copy loop's instruction range, `[start, end)`, as two zero-sized
+// labels the asm block below defines. `user_copy_fixup` compares a faulting
+// `rip` against them; nothing reads through these.
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    static __arch_copy_user_region_start: u8;
+    static __arch_copy_user_region_end: u8;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -177,6 +197,122 @@ __arch_copy_user_fault:
     ret
     "#
 );
+
+// x86_64: the same contract, a different recovery mechanism.
+//
+// rdi = dst, rsi = src, rdx = len (System V). Returns 0 on success, EFAULT on
+// a fault.
+//
+// There is NO armed per-thread handler here, unlike AArch64. `current_tid()` is
+// a constant 0 on this target (`akuma_primitives::preempt`), so the per-thread
+// slot would be one kernel-wide word — and a task preempted mid-copy would leave
+// it armed for whatever faults next. Instead the page-fault handler
+// (`amd64/src/idt.rs`) asks [`user_copy_fixup`] whether the faulting `rip` lies
+// in `[__arch_copy_user_region_start, __arch_copy_user_region_end)`, and only
+// then rewrites the saved `rip` to `__arch_copy_user_fault`. That is Linux's
+// exception-table shape: the *instruction* decides, not a flag, so there is
+// nothing to arm, nothing to disarm, and no window in which a fault elsewhere
+// can be mistaken for a user-copy fault.
+//
+// THE INVARIANTS carry over with x86 names:
+//
+//   1. LEAF AND STACKLESS. `iretq` restores the rsp the fault saw, and the fixup
+//      then `ret`s through it, so rsp at every faulting instruction must equal
+//      rsp at entry — the return address on top. No push, no call, no sub rsp.
+//   2. CALLER-SAVED REGISTERS ONLY (rax, rcx, rsi, rdi, rdx). The fixup restores
+//      nothing; System V says the caller has already given these up.
+//   3. THE EXCEPTION MUST NOT EAT THEM EITHER. A store here can fault on a lazy
+//      destination page, be serviced, and `iretq` back to RE-EXECUTE it — so
+//      `page_fault_entry` in `idt.rs` saves and restores every caller-saved
+//      register around its call into Rust, and Rust preserves the rest.
+//      `__arch_copy_user_memory` is `rep movsb`, whose whole state is
+//      rcx/rsi/rdi: the CPU updates them as it goes, so a restart after a
+//      serviced fault resumes at the right byte, and a fixup after an
+//      unserviceable one has copied a prefix. Same partial-write contract as the
+//      AArch64 loop: a bare EFAULT, not bytes-not-copied.
+//   4. DF MUST BE CLEAR, and `cld` makes it so rather than trusting the ABI.
+//
+// Known gap, stated rather than hidden: a NON-CANONICAL address (bit 47 not
+// sign-extended into 48..63) raises #GP, not #PF, and #GP is fatal on this
+// target. `USER_VA_LIMIT` is the 48-bit AArch64 bound, so `validate_user_range`
+// admits 0x0000_8000_0000_0000..=0x0000_FFFF_FFFF_FFFF, which x86_64 cannot
+// address at all. Until that limit is per-arch, a caller must not reach this
+// loop with such a pointer.
+//
+// `rep movsb` rather than a hand-tiered loop: with ERMS (every Zen and every
+// Intel core since Ivy Bridge) it is the fastest copy the ISA has for lengths
+// this crate sees, and it is one restartable instruction, which is what makes
+// the fixup argument above short. `docs/archive/USER_COPY_BYTE_LOOP.md`
+// measured the AArch64 tiering; nothing here has been measured yet, and that is
+// the order of work — correct first, then `scripts/benchmarks/` decides.
+#[cfg(target_arch = "x86_64")]
+global_asm!(
+    r#"
+    /* Naming the section is mandatory — see amd64/src/sched.rs for why a
+     * missing `.section` puts code in .bss and fails the link. */
+    .section .text
+.global __arch_copy_user_memory
+.global __arch_copy_user_memory_bytes
+.global __arch_copy_user_fault
+.global __arch_copy_user_region_start
+.global __arch_copy_user_region_end
+
+__arch_copy_user_region_start:
+
+__arch_copy_user_memory:
+    mov     rcx, rdx
+    cld
+    rep movsb
+    xor     eax, eax
+    ret
+
+/* Byte-at-a-time oracle for `copy_loop_differential_sweep` — the loop above is
+ * only trustworthy against an implementation too simple to be wrong. Same
+ * invariants: leaf, stackless, caller-saved registers only, inside the fixup
+ * range. Not reachable from any copy path. */
+__arch_copy_user_memory_bytes:
+    test    rdx, rdx
+    jz      2f
+1:  mov     al, byte ptr [rsi]
+    mov     byte ptr [rdi], al
+    inc     rsi
+    inc     rdi
+    dec     rdx
+    jnz     1b
+2:  xor     eax, eax
+    ret
+
+__arch_copy_user_region_end:
+
+/* Fixup target: the page-fault handler rewrites the saved rip to here when the
+ * fault's rip was inside the range above. rsp is untouched by everything in
+ * that range, so this `ret` lands in the Rust caller with EFAULT (14) in rax. */
+__arch_copy_user_fault:
+    mov     eax, 14
+    ret
+    "#
+);
+
+/// x86_64: the address a page fault at `rip` should resume at, if `rip` is
+/// inside the user-copy loop — the one place a kernel-mode `#PF` is not fatal.
+///
+/// The exception-table check, as one comparison. `amd64/src/idt.rs`'s page-fault
+/// path calls this after demand paging has declined the fault and before it
+/// declares the fault fatal. `None` for every other `rip`, including the fixup
+/// trampoline itself, which cannot fault.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn user_copy_fixup(rip: u64) -> Option<u64> {
+    // Taking the address of a linker symbol needs no `unsafe`; nothing is read
+    // through it. Both are labels in `.text` defined by the asm block above.
+    let start = core::ptr::addr_of!(__arch_copy_user_region_start) as u64;
+    let end = core::ptr::addr_of!(__arch_copy_user_region_end) as u64;
+    if rip >= start && rip < end {
+        Some(__arch_copy_user_fault as *const () as usize as u64)
+    } else {
+        None
+    }
+}
 
 /// `EFAULT`, as the byte loop's trampoline returns it and as the syscall ABI wants
 /// it (`x0 = -errno` happens at the syscall boundary, not here).
@@ -567,25 +703,47 @@ pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> R
     }
 }
 
-/// x86_64 stub — no fault-recovery copy mechanism exists yet on this target.
+/// x86_64: the same primitive, recovered through the page-fault handler's
+/// exception-table check instead of an armed per-thread trampoline.
 ///
-/// An isolated experiment (2026-09-05) toward building one — rewriting the
-/// faulting `rip` from an `extern "x86-interrupt" fn(&mut InterruptStackFrame,
-/// u64)` page-fault handler — redirected control to a **garbage mid-instruction
-/// address** instead of the intended recovery target, raising `#UD` rather
-/// than either working or failing safely. That rules out the naive approach;
-/// it does not yet answer what does. See
-/// `proposals/AKUMA_USER_ACCESS_ARCH_PORTABILITY.md`.
+/// Nothing is armed and nothing is disarmed around the copy. `amd64/src/idt.rs`
+/// decides recovery from the faulting `rip` alone ([`user_copy_fixup`]), so a
+/// fault outside `__arch_copy_user_memory` is exactly as fatal as it was before
+/// this existed, and a task preempted mid-copy leaves no state for the next
+/// task to trip over. The compiler fences keep the copy from being moved across
+/// anything the caller sequences around it, matching the AArch64 arm.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Result<(), u64> {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+    // SAFETY: a fault inside `__arch_copy_user_memory` is redirected by the
+    // page-fault handler to `__arch_copy_user_fault`, which returns EFAULT
+    // instead of halting; the caller owns the kernel-side length invariant (the
+    // safe wrappers take slices so it cannot disagree).
+    let res = unsafe { __arch_copy_user_memory(dst, src, len) };
+
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(res)
+    }
+}
+
+/// Every other target: no fault-recovery copy mechanism exists.
 ///
 /// `unimplemented!()`, not a silent `Err(EFAULT)`: a caller reading a fake
 /// EFAULT as "the address was bad" instead of "this isn't built yet" would
 /// mask every future call site that assumes user-copy already works on this
 /// target — the exact failure shape `sgi_scheduler_handler_with_sp`'s own
-/// x86_64 stub (`akuma-threading`) already avoids for the same reason.
-#[cfg(not(target_arch = "aarch64"))]
+/// non-AArch64 stub (`akuma-threading`) already avoids for the same reason.
+/// x86_64 had this stub until 2026-09-05; `docs/archive/AKUMA_USER_ACCESS_GATE_FIX.md`
+/// records the experiment that preceded the real arm above.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub unsafe fn copy_from_user_safe(_dst: *mut u8, _src: *const u8, _len: usize) -> Result<(), u64> {
     unimplemented!(
-        "copy_from_user_safe: no x86_64 fault-recovery copy exists yet — \
+        "copy_from_user_safe: no fault-recovery copy exists for this target — \
          see proposals/AKUMA_USER_ACCESS_ARCH_PORTABILITY.md"
     )
 }
@@ -623,7 +781,7 @@ pub unsafe fn copy_to_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Res
 ///
 /// Returns `(cases_checked, mismatches, first_bad_key)`, where the key packs
 /// `src_align << 32 | dst_align << 16 | len` for the first disagreement.
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(all(target_os = "none", any(target_arch = "aarch64", target_arch = "x86_64")))]
 #[must_use]
 pub fn copy_loop_differential_sweep() -> (u32, u32, u64) {
     const BUF: usize = 8192;

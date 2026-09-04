@@ -193,6 +193,10 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // visible). Demand paging is what needs the PMM, and that is only exercised
     // here.
     idt::smoke_test(&mut t);
+    // The user-copy fault recovery, after demand paging is known-good: it is
+    // the one path on which a kernel-mode #PF is not fatal, and the test takes
+    // three of them on purpose.
+    idt::user_copy_smoke_test(&mut t);
 
     if t.check("lapic: initialised", lapic::init()) {
         lapic::smoke_test(&mut t);

@@ -124,6 +124,12 @@ the next names in the dependency chain, now measured rather than assumed.
 
 ## Next
 
+**Done 2026-09-05** — the hand-written vector-14 stub described above was
+built and boot-verified the same day: `docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md`.
+The `unimplemented!()` stub described above is history; x86_64 has a real
+`copy_from_user_safe`, and the experiment's negative result stands as the
+reason the stub was written by hand.
+
 `proposals/AKUMA_USER_ACCESS_ARCH_PORTABILITY.md` records the naked-stub
 approach as the real next step. `akuma-el0-entry` is a newly-found,
 unscoped blocker — nobody has looked at it yet.

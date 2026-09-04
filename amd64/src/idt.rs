@@ -7,23 +7,36 @@
 //! earlier modules bounds-check so aggressively. This is what replaces that
 //! discipline with a diagnostic.
 //!
-//! # Why there is no hand-written assembly here
+//! # Why there is almost no hand-written assembly here
 //!
 //! Exception entry normally needs stubs: the CPU pushes an error code for some
 //! vectors and not others, so a uniform frame has to be synthesised by hand, and
 //! returning needs `iretq` rather than `ret`. rustc's `x86-interrupt` calling
-//! convention does all of that, so the handlers below are ordinary `fn`s. That is
-//! a compiler feature, not a dependency — this crate still has none beyond
-//! `akuma-alloc` and `akuma-pmm`.
+//! convention does all of that, so every handler below but one is an ordinary
+//! `fn`. That is a compiler feature, not a dependency — this crate still has none
+//! beyond `akuma-alloc` and `akuma-pmm`.
+//!
+//! **Vector 14 is the exception (2026-09-05).** The page-fault handler is the
+//! one handler that must sometimes *rewrite the return address* — to recover a
+//! faulting user copy (`akuma-user-access`) instead of halting. `x86-interrupt`
+//! hands the frame over by value and gives no supported way to edit it; the
+//! obvious workaround, taking `&mut InterruptStackFrame`, resumed at an address
+//! 5 bytes inside an unrelated instruction and raised `#UD`
+//! (`docs/archive/AKUMA_USER_ACCESS_GATE_FIX.md`). So `#PF` enters through
+//! [`page_fault_entry`], a `global_asm!` stub that owns the frame layout and the
+//! `iretq`, and calls a plain `extern "C"` Rust function with a pointer to it.
+//! Nothing about that stub depends on an unstable ABI's internals. The other
+//! vectors stay `x86-interrupt`: they never return anywhere but where they came
+//! from, or never return at all.
 //!
 //! # What is deliberately missing
 //!
-//! **No TSS and no IST.** A double fault therefore runs on the faulting stack,
-//! which is fine while nothing can overflow it and wrong the moment a guard page
-//! exists: a stack-overflow double fault would fault again pushing its own frame
-//! and triple-fault. The kernel is single-stack and single-core here, so the
-//! machinery is not yet earned; when a guard page appears, vector 8 needs an IST
-//! entry *before* it.
+//! **No IST.** (`gdt.rs` has grown a TSS since this was written — ring 3 needs
+//! `rsp0` — but its IST slots are unused.) A double fault therefore runs on the
+//! faulting stack, which is fine while nothing can overflow it and wrong the
+//! moment a guard page exists: a stack-overflow double fault would fault again
+//! pushing its own frame and triple-fault. When a guard page appears, vector 8
+//! needs an IST entry *before* it.
 //!
 //! **No hardware interrupts.** Vectors 32+ are unmapped and the PIC is not even
 //! masked; `IF` has been 0 since `boot.s`, so nothing can arrive. A timer means
@@ -116,6 +129,9 @@ static mut IDT: [Entry; IDT_LEN] = [Entry::empty(); IDT_LEN];
 /// Page faults serviced by demand paging, for the smoke test.
 static DEMAND_FAULTS: AtomicUsize = AtomicUsize::new(0);
 
+/// Page faults redirected to the user-copy fixup, for the smoke test.
+static COPY_FIXUPS: AtomicUsize = AtomicUsize::new(0);
+
 /// Base of the lazily-backed test region, or 0 if none is armed.
 static LAZY_BASE: AtomicU64 = AtomicU64::new(0);
 /// Length in bytes of the lazily-backed region.
@@ -190,19 +206,109 @@ extern "x86-interrupt" fn unhandled(frame: InterruptStackFrame) {
     fatal("unhandled vector", &frame, None);
 }
 
-/// `#PF` — the only handler that can *return*.
+/// What [`page_fault_entry`] hands to [`page_fault_dispatch`]: the error code
+/// the CPU pushes for vector 14, then the ordinary return frame.
 ///
-/// Page-fault error code bits: 0 present, 1 write, 2 user, 3 reserved-bit,
-/// 4 instruction fetch.
+/// Layout is fixed by the hardware and by the stub's `lea rdi, [rsp + 80]`,
+/// which points at the error code after the stub's ten pushes. Reordering these
+/// fields changes what that assembly reads.
+#[repr(C)]
+pub struct PageFaultFrame {
+    /// Bits: 0 present, 1 write, 2 user, 3 reserved-bit, 4 instruction fetch.
+    pub error_code: u64,
+    pub frame: InterruptStackFrame,
+}
+
+core::arch::global_asm!(
+    r#"
+    /* Naming the section is mandatory — see sched.rs for why a missing
+     * `.section` puts code in .bss and fails the link. */
+    .section .text
+.global page_fault_entry
+page_fault_entry:
+    /* On entry the CPU has pushed, on a 16-byte-aligned rsp (long mode aligns
+     * before pushing, whether or not the privilege level changed):
+     *
+     *   [rsp +  0]  error code
+     *   [rsp +  8]  rip
+     *   [rsp + 16]  cs
+     *   [rsp + 24]  rflags
+     *   [rsp + 32]  rsp
+     *   [rsp + 40]  ss
+     *
+     * Save every caller-saved register: `page_fault_dispatch` is `extern "C"`,
+     * so it preserves rbx/rbp/r12-r15 itself, but it is free to destroy these
+     * nine and the interrupted code — which may be `rep movsb` in the middle of
+     * a user copy, about to be re-executed after demand paging — is not
+     * expecting a call. rbp is pushed too, as the tenth: ten pushes is 80
+     * bytes, which keeps rsp 16-aligned at the `call`, as System V requires,
+     * and gives a debugger a frame chain for free. */
+    push rbp
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    lea rdi, [rsp + 80]             /* &PageFaultFrame: the error code slot */
+    call page_fault_dispatch
+
+    /* The dispatcher returned, so this fault was serviced or fixed up — it may
+     * have rewritten the saved rip. Restore exactly what was saved; a demand-
+     * paged store re-executes with the registers it faulted with. */
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    pop rbp
+
+    add rsp, 8                      /* drop the error code; iretq does not */
+    iretq
+"#
+);
+
+unsafe extern "C" {
+    /// The vector-14 entry point, installed in the IDT by [`init`].
+    fn page_fault_entry();
+}
+
+/// `#PF` — the only handler that can *return*, and the only one that can return
+/// *somewhere else*.
 ///
-/// A fault inside the armed lazy region with bit 0 clear (the page is not
-/// present) is demand paging: allocate a frame, map it, and return. `iretq`
-/// re-executes the faulting instruction, which then succeeds. Anything else is
-/// a real fault and is fatal — in particular a *protection* fault (bit 0 set)
-/// inside the region is not "not mapped yet", it is a write to something
-/// deliberately read-only, and servicing it would silently defeat the
-/// protection.
-extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: u64) {
+/// Called by [`page_fault_entry`] with the hardware frame; whatever this leaves
+/// in `frame.rip` is where `iretq` resumes. Three outcomes, in this order:
+///
+/// 1. **Demand paging.** A fault inside the armed lazy region with bit 0 clear
+///    (the page is not present): allocate a frame, map it, and return with the
+///    frame untouched, so the faulting instruction re-executes and succeeds.
+///    Anything else in the region is a real fault — in particular a *protection*
+///    fault (bit 0 set) is a write to something deliberately read-only, and
+///    servicing it would silently defeat the protection.
+/// 2. **User-copy fixup.** The faulting `rip` is inside `akuma-user-access`'s
+///    copy loop (`user_copy_fixup`): rewrite `rip` to its `EFAULT` trampoline
+///    and return. That is the whole fault-recovery mechanism, and it is checked
+///    *after* demand paging on purpose — a copy into a lazy page must be
+///    serviced, not failed.
+/// 3. **Fatal.** Everything else, as before.
+///
+/// `#[unsafe(no_mangle)]` and `extern "C"` because the stub `call`s it by name.
+/// A plain function, not `x86-interrupt`: the stub already did the entry work,
+/// and this must be free to edit the frame — see the module header.
+#[unsafe(no_mangle)]
+extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
+    // SAFETY: the stub passes a pointer into the current stack, to the frame
+    // the CPU just pushed; it is live and exclusively ours until `iretq`.
+    let pf = unsafe { &mut *frame };
+    let code = pf.error_code;
     let addr = read_cr2();
     let base = LAZY_BASE.load(Ordering::Relaxed);
     let len = LAZY_LEN.load(Ordering::Relaxed);
@@ -225,7 +331,13 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: u64) {
         }
     }
 
-    fatal("#PF page fault", &frame, Some(code));
+    if let Some(fixup) = akuma_user_access::user_copy_fixup(pf.frame.rip) {
+        COPY_FIXUPS.fetch_add(1, Ordering::Relaxed);
+        pf.frame.rip = fixup;
+        return;
+    }
+
+    fatal("#PF page fault", &pf.frame, Some(code));
 }
 
 /// The LAPIC timer vector.
@@ -279,10 +391,11 @@ pub fn set_handler(vector: u8, handler: usize) {
 /// `function_casts_as_integer` is allowed here deliberately. The lint exists to
 /// catch a function *item* being used where its return value was meant, which is
 /// almost always a bug — but putting a handler's address into a gate descriptor
-/// is the one thing an IDT is. The five handlers have five different signatures
-/// (`x86-interrupt`, with and without an error code, one diverging), so spelling
-/// each cast through its exact fn-pointer type would add five lines of ceremony
-/// that say nothing the descriptor does not already say.
+/// is the one thing an IDT is. The handlers have five different signatures
+/// (`x86-interrupt`, with and without an error code, one diverging, and the
+/// bare `extern "C"` asm entry for `#PF`), so spelling each cast through its
+/// exact fn-pointer type would add lines of ceremony that say nothing the
+/// descriptor does not already say.
 #[allow(function_casts_as_integer)]
 pub fn init() {
     // SAFETY: single core, interrupts masked, and the table is reached only
@@ -296,7 +409,8 @@ pub fn init() {
         (*idt)[6].set(invalid_opcode as usize);
         (*idt)[8].set(double_fault as usize);
         (*idt)[13].set(general_protection as usize);
-        (*idt)[14].set(page_fault as usize);
+        // The one hand-assembled entry; see the module header.
+        (*idt)[14].set(page_fault_entry as usize);
 
         let idtr = Idtr {
             limit: (core::mem::size_of::<[Entry; IDT_LEN]>() - 1) as u16,
@@ -384,6 +498,154 @@ pub fn smoke_test(t: &mut Suite) {
     const RETAINED_TABLES: u64 = 2;
     t.check_eq(
         "demand paging: only the two intermediate tables retained",
+        (free_before - akuma_pmm::free_count()) as u64,
+        RETAINED_TABLES,
+    );
+}
+
+/// Exercise the user-copy fault recovery for real: take a page fault inside
+/// `__arch_copy_user_memory` on purpose and check the kernel gets `EFAULT` back
+/// instead of halting.
+///
+/// A build that links is no evidence here. The failed first attempt at this
+/// mechanism compiled, linked, and resumed at a garbage address
+/// (`docs/archive/AKUMA_USER_ACCESS_GATE_FIX.md`); only a caught fault proves
+/// the stub's frame offsets, the `rip` rewrite and the trampoline's `ret` all
+/// agree. Runs after [`smoke_test`] so demand paging is already known-good.
+///
+/// Five things, each of which fails independently:
+///
+/// 1. A copy between two kernel buffers is byte-exact and returns `Ok` — the
+///    plain path, with no fault taken.
+/// 2. A copy whose *source* is an unmapped lower-half address returns
+///    `Err(EFAULT)` — a load fault, fixed up.
+/// 3. A copy whose *destination* is unmapped returns `Err(EFAULT)` — a store
+///    fault, the other operand.
+/// 4. A copy that starts on a mapped page and runs off its end fails with
+///    `EFAULT` **after** copying the mapped prefix — proof the fault was taken
+///    mid-`rep movsb` and the CPU's own progress in rcx/rsi/rdi was honoured,
+///    not that the copy was refused up front.
+/// 5. A copy out of the armed lazy region succeeds and reads zeroes — the
+///    ordering in [`page_fault_dispatch`]: demand paging wins over fixup when
+///    both apply. Fixup first would have failed this copy.
+///
+/// Plus the differential sweep from the crate itself, which pins `rep movsb`
+/// against a byte loop over every alignment and tier-boundary length.
+pub fn user_copy_smoke_test(t: &mut Suite) {
+    use akuma_user_access::copy_from_user_safe;
+    const EFAULT: u64 = 14;
+    /// Lower half, well clear of anything a user program or test maps.
+    const UNMAPPED_VA: u64 = 0x10_0000_0000;
+    /// One page mapped on purpose, with the next page left unmapped.
+    const EDGE_VA: u64 = 0x11_0000_0000;
+    /// A lazy region for case 5, distinct from `smoke_test`'s 2 GiB.
+    const LAZY_VA: u64 = 3 << 30;
+
+    let free_before = akuma_pmm::free_count();
+    let fixups_before = COPY_FIXUPS.load(Ordering::Relaxed);
+
+    let mut src = [0u8; 256];
+    for (i, b) in src.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+    }
+    let mut dst = [0xA5u8; 256];
+
+    // 1. valid copy
+    // SAFETY: both are live kernel stack buffers of the stated length.
+    let r = unsafe { copy_from_user_safe(dst.as_mut_ptr(), src.as_ptr(), src.len()) };
+    t.check("user copy: kernel-to-kernel copy returns Ok", r.is_ok());
+    t.check("user copy: kernel-to-kernel copy is byte-exact", dst == src);
+
+    // 2. unmapped source
+    dst.fill(0xA5);
+    // SAFETY: the source is unmapped ON PURPOSE — the #PF handler must redirect
+    // the copy loop to its trampoline. That redirection is what is under test.
+    let r = unsafe { copy_from_user_safe(dst.as_mut_ptr(), UNMAPPED_VA as *const u8, 64) };
+    t.check_eq("user copy: unmapped source returns EFAULT", r.err().unwrap_or(0), EFAULT);
+    t.check("user copy: unmapped source wrote nothing", dst.iter().all(|&b| b == 0xA5));
+
+    // 3. unmapped destination
+    // SAFETY: as above, with the store faulting instead of the load.
+    let r = unsafe { copy_from_user_safe(UNMAPPED_VA as *mut u8, src.as_ptr(), 64) };
+    t.check_eq("user copy: unmapped destination returns EFAULT", r.err().unwrap_or(0), EFAULT);
+
+    // The kernel is still running — that is the point — and a copy after a
+    // recovered fault behaves like one before it.
+    dst.fill(0xA5);
+    // SAFETY: as case 1.
+    let r = unsafe { copy_from_user_safe(dst.as_mut_ptr(), src.as_ptr(), src.len()) };
+    t.check("user copy: copy after a recovered fault still works", r.is_ok() && dst == src);
+
+    // 4. fault mid-copy: one mapped page, then the edge
+    let mut edge_ok = false;
+    if let Some(pa) = akuma_pmm::alloc_page() {
+        // SAFETY: a fresh PMM frame, reached through the physmap.
+        unsafe {
+            let p = phys_ptr::<u8>(pa as u64);
+            for i in 0..4096 {
+                p.add(i).write_volatile((i as u8) ^ 0x5C);
+            }
+        }
+        if paging::map_page(EDGE_VA as usize, pa as u64, Prot::KERNEL_RW, MemAttr::WriteBack) {
+            static mut BIG: [u8; 8192] = [0; 8192];
+            // SAFETY: single-threaded boot test; private to this fn.
+            let big = unsafe { &mut *core::ptr::addr_of_mut!(BIG) };
+            big.fill(0xEE);
+            // SAFETY: the first 4096 bytes are mapped, the next 4096 are not; the
+            // fault is intended and recovered.
+            let r = unsafe { copy_from_user_safe(big.as_mut_ptr(), EDGE_VA as *const u8, 8192) };
+            let prefix_ok = big[..4096].iter().enumerate().all(|(i, &b)| b == (i as u8) ^ 0x5C);
+            let tail_untouched = big[4096..].iter().all(|&b| b == 0xEE);
+            edge_ok = r == Err(EFAULT) && prefix_ok && tail_untouched;
+            if let Some(pa) = paging::unmap_page(EDGE_VA as usize) {
+                akuma_pmm::free_page(pa as usize, 0);
+            }
+        } else {
+            akuma_pmm::free_page(pa, 0);
+        }
+    }
+    t.check("user copy: fault off the end of a mapped page copies the prefix, then EFAULT", edge_ok);
+
+    // 5. demand paging beats fixup
+    arm_lazy(LAZY_VA, 4096);
+    dst.fill(0xA5);
+    let demand_before = DEMAND_FAULTS.load(Ordering::Relaxed);
+    // SAFETY: the source is unmapped but inside the armed lazy region; the #PF
+    // handler maps a zeroed page and re-executes the copy.
+    let r = unsafe { copy_from_user_safe(dst.as_mut_ptr(), LAZY_VA as *const u8, dst.len()) };
+    disarm_lazy();
+    t.check(
+        "user copy: a lazy-region fault inside the loop is demand-paged, not fixed up",
+        r.is_ok()
+            && dst.iter().all(|&b| b == 0)
+            && DEMAND_FAULTS.load(Ordering::Relaxed) == demand_before + 1,
+    );
+    if let Some(pa) = paging::unmap_page(LAZY_VA as usize) {
+        akuma_pmm::free_page(pa as usize, 0);
+    }
+
+    // Exactly three fixups: cases 2, 3 and 4. Case 5 must not have counted.
+    t.check_eq(
+        "user copy: exactly three faults were fixed up",
+        (COPY_FIXUPS.load(Ordering::Relaxed) - fixups_before) as u64,
+        3,
+    );
+
+    // The differential sweep, on kernel memory: `rep movsb` vs. the byte loop.
+    let (checked, bad, first_bad) = akuma_user_access::copy_loop_differential_sweep();
+    t.check("user copy: differential sweep ran", checked > 100_000);
+    if !t.check_eq("user copy: rep movsb agrees with the byte loop", u64::from(bad), 0) {
+        serial::puts("  first mismatch (src_align<<32|dst_align<<16|len)=0x");
+        serial::put_hex(first_bad);
+        serial::puts("\n");
+    }
+
+    // Two intermediate tables each for EDGE_VA and LAZY_VA (`unmap_page` keeps
+    // them, as `smoke_test` explains), so four frames stay out. Pinned, like
+    // there, so a leak in the fixup path shows up as a number and not a note.
+    const RETAINED_TABLES: u64 = 4;
+    t.check_eq(
+        "user copy: only the intermediate tables retained",
         (free_before - akuma_pmm::free_count()) as u64,
         RETAINED_TABLES,
     );
