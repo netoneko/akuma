@@ -25,6 +25,8 @@ const LINE_STATUS: u16 = 5;
 
 /// Line status bit 5: transmit holding register empty.
 const LSR_THR_EMPTY: u8 = 1 << 5;
+/// Data Ready — a byte is waiting in the receive buffer.
+const LSR_DATA_READY: u8 = 1 << 0;
 
 use crate::port::{inb, outb};
 
@@ -64,6 +66,27 @@ pub fn putb(byte: u8) {
 }
 
 /// Emit a string, translating `\n` to CRLF.
+/// Take a byte from the receive buffer, or `None` if none is waiting.
+///
+/// Polled, like the transmit side: this target takes no device interrupts, so
+/// there is no IRQ to arrive and no buffer for one to fill. A caller that wants
+/// to block spins on this — which is honest here, because there is nothing else
+/// for the CPU to do while a shell waits for a key.
+///
+/// Non-blocking rather than blocking as the primitive, so a `read` with no data
+/// can return `EAGAIN` and a scheduler can be added later without changing the
+/// device layer.
+#[must_use]
+pub fn getb() -> Option<u8> {
+    // SAFETY: two reads of the 16550's own port range, which `init` configured.
+    unsafe {
+        if inb(COM1 + LINE_STATUS) & LSR_DATA_READY == 0 {
+            return None;
+        }
+        Some(inb(COM1 + DATA))
+    }
+}
+
 pub fn puts(s: &str) {
     for &b in s.as_bytes() {
         if b == b'\n' {

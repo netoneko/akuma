@@ -48,6 +48,17 @@ akuma-ext2 = { path = "../crates/akuma-ext2" }
 # there is no mount table yet.
 akuma-vfs = { path = "../crates/akuma-vfs" }
 spinning_top = "0.3"
+# `mmap`'s mapping-kind decode and `MAP_FIXED` validation — a pure function of
+# the argument bits, host-tested, with seven pinned divergences from Linux. Used
+# rather than re-derived so this target cannot drift from the AArch64 kernel on
+# exactly the arguments where Linux compatibility is subtle.
+akuma-syscalls-mem = { path = "../crates/akuma-syscalls-mem" }
+# The shared flag tables the decode is written against.
+akuma-syscalls-linux = { path = "../crates/akuma-syscalls-linux" }
+# The console line discipline: canonical mode, echo, backspace, Ctrl+D, and
+# `map_cr_to_nl`. Hand-rolling a console reader hits the CR-vs-NL bug on the
+# first Enter keypress; this crate is the tree's answer and is dependency-free.
+akuma-terminal = { path = "../crates/akuma-terminal" }
 
 [[bin]]
 name = "akuma-amd64"

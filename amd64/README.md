@@ -12,19 +12,26 @@ Linux binary is linked — and since Stage L an **ELF loader** puts one there: a
 program `rustc` compiled and linked, whose `PT_LOAD` segments the kernel parses
 and places, with a System V initial stack (argc/argv/envp/auxv). Since Stage M
 it also drives a **virtio-blk disk** and reads its own machine description —
-the PVH memory map, the virtio-MMIO command line, and ACPI's MADT. No
-filesystem on top of the disk yet, and no device interrupts.
+the PVH memory map, the virtio-MMIO command line, and ACPI's MADT — and since
+Stage N it mounts **ext2** on that disk and runs a program it opened by path.
+Reads only, no file syscalls for ring 3 yet, and no device interrupts.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1**.
 
 **Status: C** (active risk, expect surprises). This is a spike, not a port.
 
 ```bash
-amd64/run.sh                     # build + boot under QEMU microvm, with a probe disk
+amd64/run.sh                     # build + boot under QEMU microvm, with an ext2 root
 MEMORY=1024 amd64/run.sh
-DISK=my.img amd64/run.sh         # attach an existing raw image
+DISK=my.img amd64/run.sh         # attach an existing image
 DISK=none amd64/run.sh           # no drive at all
+amd64/mkdisk.sh out.img 8        # build the ext2 root image on its own
 ```
+
+The root image is **rebuilt on every run**, on purpose: it carries the guest ELF
+that was just compiled, and a stale image would silently run the previous
+build's program while every check still passed. `mkdisk.sh` uses `mkfs.ext2` and
+`debugfs` — no Docker, no mount, no root, so it works unprivileged on macOS.
 
 `-M microvm`, not QEMU's default `pc`, and that is load-bearing: `pc` and `q35`
 put virtio on **PCI**, while Firecracker's default transport is MMIO. A local run
@@ -171,6 +178,19 @@ FC_HOST=user@host amd64/dump-machine.sh
 That boots **Linux** under Firecracker and reads its boot log, which lists every
 ACPI table long before a root filesystem is needed — so no rootfs is involved.
 
+## Storage
+
+`akuma-ext2` is mounted on the virtio-blk device, **unmodified**. Its entire
+interface to a disk is a two-method `BlockDevice` trait, which is exactly what
+`akuma-virtio` exposes, so `src/fs.rs`'s adaptation is a struct and two
+forwarding calls.
+
+There is no mount table — one filesystem, reached through `fs::with_root`.
+`akuma-vfs`'s `Filesystem` trait is used; its `MountTable` arrives when there is
+a second thing to mount. Reads only: the driver and the filesystem can both
+write, but a self-test that mutated the image would make it stateful across
+boots.
+
 ## Guest programs
 
 The programs the loader runs live in `userspace/amd64/`, one directory each,
@@ -184,12 +204,18 @@ program that printed its verdict would have "passed" by running at all.
 
 ## What is deliberately missing
 
-- **No filesystem.** There is a disk (virtio-blk) and nothing on top of it.
-  `akuma-ext2` and `akuma-vfs` already build for `x86_64-unknown-none`, so this
-  is the next stage rather than a hard problem.
+- **No file syscalls.** The kernel reads files; ring 3 cannot. There is no
+  descriptor table and no `open`/`read`/`close`. That, plus a read path on the
+  16550 and a minimal `execve`, is what a serial-console shell needs — and it
+  needs neither `fork` nor sockets, which is why it is a much shorter road than
+  sshd.
+- **No writes**, and no mount table.
 - **No NIC, and no device interrupts.** The block driver polls the used ring.
   The IOAPIC's address is read from the MADT and nothing uses it; routing a GSI
-  to a vector is what would let the driver stop polling.
+  to a vector is what would let the driver stop polling. The *host* side of
+  networking is ready — `amd64/net-setup.sh` builds a tap, DHCP and NAT through
+  Docker with no sudo, proved with a Linux guest taking a lease — and all four
+  `akuma-net*` crates build for `x86_64-unknown-none`.
 - **No VGA.** Considered and dropped: dead code on Firecracker, whose console is
   the 16550 at I/O port `0x3F8`.
 - **No demand paging for user segments.** The `#PF` handler services a

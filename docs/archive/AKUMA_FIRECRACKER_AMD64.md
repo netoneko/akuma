@@ -1408,6 +1408,110 @@ exists for.
 QEMU `microvm` puts virtio-MMIO at `0xFEB0_0000`, in the same sub-4 GiB MMIO
 hole, which is what made the arithmetic worth checking.
 
+## 3.20 Stage N: a filesystem, and a program opened by path
+
+The kernel mounts ext2 on the virtio-blk device from Stage M and runs a program
+it read out of it: `/bin/hello`, found by name, on a filesystem it mounted, on a
+disk it discovered from the command line.
+
+```
+  fs:   ext2 mounted on vda
+  fs: / contains bin/   [OK]
+  fs: probe.txt ends with its last line   [OK]
+  fs: read_at lands at the right offset   [OK]
+  elf: on-disk and embedded images are identical   [OK]
+  elf:  loading /bin/hello from ext2
+    [elf] loaded from a real ELF image
+  elf: program ran and reported every check   [OK]
+```
+
+85 passed, 0 failed, under QEMU `microvm` and under Firecracker on the Ryzen.
+
+### 3.20.1 The adaptation layer is eleven lines
+
+`akuma-ext2` was used unmodified — it already built for `x86_64-unknown-none`,
+already forbids `unsafe`, and its entire interface to a disk is two methods:
+
+```rust
+pub trait BlockDevice: Send + Sync {
+    fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()>;
+    fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()>;
+}
+```
+
+which is exactly the shape `akuma_virtio::block` exposes, so the shim in
+`amd64/src/fs.rs` is a struct and two forwarding calls. That brevity is the
+finding rather than an accident: the seam was drawn in the right place years
+before this target existed, and neither crate had to learn anything about the
+other.
+
+Stage M made the same point about the driver. Two stages in a row where the
+answer was "wire it up" is what the platform-dependency work was *for*.
+
+### 3.20.2 There is no mount table, on purpose
+
+`akuma-vfs`'s `Filesystem` trait is used; its `MountTable` is not. One
+filesystem, reached through `fs::with_root`. A mount table generalises path
+resolution across several filesystems, and there is one — it arrives when there
+is a second thing to mount, which is the point at which it stops being ceremony.
+
+The clock is `|| 0`, which `Ext2Filesystem::new` documents as the answer for a
+machine that does not know the time. This one does not: it has a LAPIC timer but
+no RTC and no SNTP client. Every file it wrote would be stamped 1970, which is
+one of the reasons nothing writes yet — the other being that a self-test which
+mutated the image would make the image stateful across boots, so the next run
+would start from whatever the last one left.
+
+### 3.20.3 The disk image, and why the low-level test changed
+
+`amd64/mkdisk.sh` replaces `mkdisk.py`. It builds a real ext2 image with
+`mkfs.ext2` and puts files in it with `debugfs -w -R write` — **no Docker, no
+mount, no root**, which is what makes it work unprivileged on macOS.
+`scripts/populate_disk.sh` uses Docker for the aarch64 image because that one
+holds a whole distro; this holds two files.
+
+1 KiB blocks rather than the 4 KiB the aarch64 image uses, deliberately: it puts
+the indirect-block paths within reach of a small image.
+
+That change broke three checks in `blk::smoke_test`, which had been reading two
+known sectors from the raw probe disk. They were replaced rather than deleted,
+and with something better: the test now reads the **ext2 superblock** and checks
+its magic, and that `s_blocks_count << (10 + s_log_block_size)` describes a
+filesystem that fits the device the driver reported. That is a structure the next
+layer up is about to parse rather than a pattern invented for the test, so a
+failure here and a failure in `fs::mount_root` have the same cause — which makes
+this the useful *first* failure rather than a second opinion.
+
+The "does the offset reach the device" check survived in a better form too: byte
+0 is the boot block, which `mkfs.ext2` leaves zeroed, so it cannot equal the
+superblock at 1024. A driver that ignored the requested offset would pass every
+other check and fail that one.
+
+### 3.20.4 The embedded image became a fallback, and is checked against the disk
+
+`elf_test` now reads `/bin/hello` from the filesystem. The `include_bytes!` copy
+stays as the fallback for a machine with no disk — `DISK=none`, and every stage
+before Stage M — so the loader is still exercised on a machine with no storage.
+
+The two come from **different build steps**: `amd64/build.rs` compiles the
+program into `OUT_DIR`, and `amd64/mkdisk.sh` copies that same file into the
+image. They are supposed to be byte-identical, and the test asserts it. Without
+that assertion a stale image would silently run the *previous* build's program
+and every check would still pass — the failure mode where a test measures
+something real and the wrong copy of it.
+
+`run.sh` and `run-firecracker.sh` therefore rebuild the image on every run rather
+than reusing one.
+
+### 3.20.5 What this does not get us
+
+Reads only, one filesystem, and no `open`/`read`/`close` **syscalls** — the
+kernel can read a file, ring 3 still cannot. That is the next thing, and it is
+what stands between here and a shell: `paws` on the serial console needs a file
+descriptor table, a read path on the 16550, and enough of `execve` to start one
+process. Not `fork`, and not sockets — which is why a UART shell is a much
+shorter road than sshd (§4).
+
 ## 4. What is deliberately missing
 
 Corrected 2026-09-04. This list was written at Stage B and went stale as the
@@ -1428,8 +1532,18 @@ what follows is the state as of Stage L rather than the original text.
   needed, it will have to be found the hard way: `hvm_start_info.rsdp_paddr` exists
   in the ABI but **both** QEMU and Firecracker v1.16.1 report it as 0 (measured,
   §3.6). Do not build on that field.
+- **No file syscalls.** The kernel reads files (ext2 since Stage N, §3.20);
+  ring 3 cannot. There is no descriptor table and no `open`/`read`/`close`. That,
+  plus a read path on the 16550 and a minimal `execve`, is what a serial-console
+  shell needs — and it needs neither `fork` nor sockets, which is why it is a much
+  shorter road than sshd.
+- **No writes.** The block driver and `akuma-ext2` can both write; nothing does.
+  A self-test that mutated the image would make it stateful across boots.
 - **No NIC, and no device interrupts.** There is a disk since Stage M
-  (virtio-blk, §3.19), driven by polling. The console is still the 16550 at I/O
+  (virtio-blk, §3.19), driven by polling. The host side of networking is ready
+  (`amd64/net-setup.sh`, proved with a Linux guest taking a DHCP lease) and all
+  four `akuma-net*` crates build for `x86_64-unknown-none`; what is missing is
+  kernel-side wiring. The console is still the 16550 at I/O
   port `0x3F8`; a VGA text path was considered and dropped as dead code on
   Firecracker. The ELF loader's image is still `include_bytes!`d rather than
   opened by path, because there is a block device but no filesystem on top of it

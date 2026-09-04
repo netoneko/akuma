@@ -133,7 +133,12 @@ static WRITE_SEQ_LEN: AtomicU64 = AtomicU64::new(0);
 /// Largest `write` this kernel will accept. A bound rather than trust: `len`
 /// comes from ring 3, and an unbounded length would walk off the mapped page
 /// into whatever follows.
-const MAX_WRITE: u64 = 4096;
+///
+/// Raised from 4096 in Stage O to match `fd::MAX_IO`: a shell streaming a file
+/// to the console writes in whatever chunks its buffer holds, and a limit lower
+/// than the read limit turns a legitimate write into `EFAULT` halfway through
+/// an output line.
+const MAX_WRITE: u64 = 64 * 1024;
 
 core::arch::global_asm!(
     r#"
@@ -189,11 +194,24 @@ syscall_entry:
     sub rsp, 8                      /* System V wants rsp 16-aligned at `call` */
 
     /* Linux arg registers into System V positions:
-     *   Linux:    nr=rax  a1=rdi  a2=rsi  a3=rdx
-     *   System V: 1 =rdi  2 =rsi  3 =rdx  4 =rcx
-     * Assigned right-to-left, or each move clobbers the next one's source.
-     * `rcx` is free even though `syscall` put the user return address there —
-     * it was pushed above and is restored below. */
+     *   Linux:    nr=rax  a1=rdi  a2=rsi  a3=rdx  a4=r10  a5=r8   a6=r9
+     *   System V: 1 =rdi  2 =rsi  3 =rdx  4 =rcx  5 =r8   6 =r9
+     *
+     * Six of the seven are passed on; a6 is dropped because no syscall this
+     * kernel implements takes one (mmap's sixth is its offset, and only
+     * file-backed mappings use it — this target has none).
+     *
+     * The order is load-bearing: every move must read its source before some
+     * later move overwrites it. `r9 <- r8` precedes `r8 <- r10` for that reason,
+     * and the rdx/rsi/rdi chain is assigned right-to-left for the same one.
+     *
+     * `rcx` is free even though `syscall` put the user return address there — it
+     * was pushed above and is restored below. `r10` is free for the mirror
+     * reason: it is caller-saved, was pushed above, and the ABI's a4 lives there
+     * precisely because System V's 4th argument register is `rcx`, which
+     * `syscall` destroys. */
+    mov r9, r8
+    mov r8, r10
     mov rcx, rdx
     mov rdx, rsi
     mov rsi, rdi
@@ -318,20 +336,28 @@ fn rdmsr(msr: u32) -> u64 {
 /// a handler written against numbers cannot be shared and a handler written
 /// against names can.
 #[unsafe(no_mangle)]
-extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     CALLS.fetch_add(1, Ordering::Relaxed);
 
-    // Errno values are returned as negatives, the Linux convention.
-    const ENOSYS: u64 = (-38i64) as u64;
-    const EBADF: u64 = (-9i64) as u64;
-    const EINVAL: u64 = (-22i64) as u64;
+    use crate::fd::errno;
 
     let Some(call) = Syscall::from_x86_64(nr) else {
-        return ENOSYS;
+        return errno::ENOSYS;
     };
 
     match call {
         Syscall::Write => sys_write(a1, a2, a3),
+        Syscall::Read => crate::fd::sys_read(a1, a2, a3),
+        Syscall::Openat => crate::fd::sys_openat(a1, a2, a3, a4),
+        Syscall::Close => crate::fd::sys_close(a1),
+        Syscall::Lseek => crate::fd::sys_lseek(a1, a2, a3),
+        Syscall::Fstat => crate::fd::sys_fstat(a1, a2),
+        Syscall::Ioctl => crate::fd::sys_ioctl(a1, a2, a3),
+        // `a5` is mmap's fd and is deliberately unused: only anonymous mappings
+        // are supported, so a file-backed request must fail rather than quietly
+        // return zeroed memory that the caller believes holds a file.
+        Syscall::Mmap => crate::mm::sys_mmap(a1, a2, a3, a4, a5),
+        Syscall::Munmap => crate::mm::sys_munmap(a1, a2),
         Syscall::Exit | Syscall::ExitGroup => {
             EXIT_STATUS.store(a1, Ordering::Relaxed);
             // SAFETY: single core, interrupts off inside a syscall. The
@@ -354,14 +380,17 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             crate::sched::yield_now();
             0
         }
-        Syscall::Close => EBADF,
-        Syscall::Brk => EINVAL,
-        _ => ENOSYS,
+        _ => errno::ENOSYS,
     }
 }
 
 
 /// `write(fd, buf, len)` — fd 1 and 2 go to the serial console.
+///
+/// Kept here rather than moved into `fd` with its siblings because of the
+/// `WRITE_SEQ` bookkeeping below: the multitasking and preemption tests prove
+/// interleaving by recording *which task* performed each write, and that
+/// instrumentation belongs next to the tests that read it.
 ///
 /// Reading `buf` from ring 0 works because `CR4.SMAP` is not enabled; with SMAP
 /// on this would need `stac`/`clac` around the access. That is a real gap and

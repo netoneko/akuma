@@ -44,6 +44,8 @@ compile_error!(
 #[cfg(target_arch = "x86_64")]
 mod blk;
 #[cfg(target_arch = "x86_64")]
+mod fd;
+#[cfg(target_arch = "x86_64")]
 mod fs;
 #[cfg(target_arch = "x86_64")]
 mod gdt;
@@ -59,6 +61,8 @@ mod machine;
 mod loader;
 #[cfg(target_arch = "x86_64")]
 mod mem;
+#[cfg(target_arch = "x86_64")]
+mod mm;
 #[cfg(target_arch = "x86_64")]
 mod paging;
 #[cfg(target_arch = "x86_64")]
@@ -185,7 +189,10 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 
     blk::smoke_test(&mut t, have_disk);
     fs::smoke_test(&mut t, have_fs);
+    fd::smoke_test(&mut t, have_fs);
+    mm::smoke_test(&mut t);
 
+    fd::init_console();
     usermode::init_syscall();
     usermode::smoke_test(&mut t);
     usermode::preempt_test(&mut t);
