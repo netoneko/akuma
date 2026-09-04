@@ -35,9 +35,13 @@
 //!
 //! # What it refuses
 //!
-//! * Anything but `ET_EXEC` + `EM_X86_64` + ELF64 little-endian. `ET_DYN` needs
-//!   relocation and an interpreter; neither exists here, and loading one would
-//!   place a PIE at its link-time zero and jump into it.
+//! * Anything but `ET_EXEC`/`ET_DYN` + `EM_X86_64` + ELF64 little-endian.
+//! * A `PT_INTERP` segment — a *dynamically*-linked binary (one that names
+//!   `/lib/ld-musl-x86_64.so.1` and expects the kernel or a separate loader
+//!   run to satisfy symbol imports against it) still has no home here. What
+//!   `ET_DYN` alone buys (since 2026-09-04, for `apk`) is **static-PIE**: a
+//!   fully self-contained image that only needs a base address and its own
+//!   `_start` to bring itself up — see "Static-PIE" below.
 //! * A segment outside the lower half. The upper half is the kernel's, and a
 //!   `p_vaddr` there would ask `map_page_in` to overwrite a shared PML4 entry.
 //! * A page that would end up **writable and executable**. `Prot` offers no
@@ -48,16 +52,39 @@
 //!   refusal never fires on our own image — a link that stops satisfying it
 //!   fails the boot instead of silently handing ring 3 a writable code page.
 //!
+//! # Static-PIE (`ET_DYN`, no `PT_INTERP`)
+//!
+//! Alpine's `apk-tools-static` — the reason this exists — is compiled
+//! `-static-pie`: `ET_DYN`, no `PT_INTERP`, and its relocations are `DT_RELR`
+//! (a compact bitmap format, not a classic `SHT_RELA` array — confirmed by
+//! reading its own `.dynamic` section, `RELASZ` is 0 and `RELR`/`RELRSZ` carry
+//! everything). This loader does **not** process them. It does not need to:
+//! musl's own startup (`_dlstart_c`) walks its *own* program headers — found
+//! through `AT_PHDR` in the auxv this file now supplies — computes its load
+//! bias from where the kernel actually put them versus where they claim to be
+//! linked at (0, for a PIE), and self-relocates before calling `main`. The
+//! kernel's entire job is: pick a base (`PIE_BASE`), map every `PT_LOAD` at
+//! `base + p_vaddr` instead of `p_vaddr`, and report `AT_PHDR`/`AT_PHNUM`/
+//! `AT_PHENT` truthfully. Everything past that is the binary's own problem,
+//! by design — the same division of labor `userspace/apk-tools/docs/
+//! PIE_LOADER.md` documents for the AArch64 kernel, which this mirrors.
+//!
+//! One consequence worth stating: the data segment RELR relocations land in
+//! must be **writable** at load time for `_dlstart_c` to write into it, and
+//! this loader never re-protects it read-only afterward (`PT_GNU_RELRO` is
+//! parsed nowhere here) — a real security regression from what a hardened
+//! loader would do, accepted for the same reason the rest of this file's
+//! "what it does not do yet" list is accepted.
+//!
 //! # What it does not do yet
 //!
 //! No demand paging: every page of every `PT_LOAD` is allocated and copied up
 //! front. The `#PF` handler can already service a not-present fault
 //! (`idt.rs`), so the machinery exists; wiring segments to it needs a per-space
-//! region table, which is the next thing rather than part of this one. No
-//! `PT_INTERP`, no relocations, no `PT_GNU_RELRO`, and no `AT_PHDR` — a program
-//! that walks its own program headers gets nothing useful from this auxv.
+//! region table, which is the next thing rather than part of this one. No real
+//! dynamic linker (`PT_INTERP` is refused outright), and no `PT_GNU_RELRO`.
 
-use elf::abi::{EM_X86_64, ET_EXEC, PF_W, PF_X, PT_LOAD};
+use elf::abi::{EM_X86_64, ET_DYN, ET_EXEC, PF_W, PF_X, PT_INTERP, PT_LOAD};
 use elf::endian::LittleEndian;
 use elf::file::{Class, FileHeader};
 use elf::segment::SegmentTable;
@@ -74,12 +101,28 @@ const ELF64_EHDR_SIZE: usize = 64;
 /// First address that is not userspace: PML4 slot 256 and up is the kernel's.
 const USER_VA_LIMIT: u64 = 0x0000_8000_0000_0000;
 
+/// Where a static-PIE (`ET_DYN`) image's segments are placed. `p_vaddr`
+/// values in a PIE start near 0 (it is linked as if loaded at address 0), so
+/// this is added to every one of them — the same constant, and the same
+/// reasoning, as `akuma-elf`'s `PIE_BASE` for the AArch64 kernel: well above
+/// where an `ET_EXEC` image links (`0x40_0000`) and, on this target, well
+/// below `mm::MMAP_BASE` (`0x1_0000_0000`) — the AArch64 loader's own
+/// `PIE_BASE`-collides-with-its-mmap-region bug
+/// (`userspace/apk-tools/docs/PIE_LOADER.md` "Change 2") cannot recur here
+/// for the boring reason that the two were never close: an anonymous mmap
+/// from musl's TLS setup (`__copy_tls`) lands 3.75 GiB away from this base,
+/// not on top of it.
+const PIE_BASE: u64 = 0x1000_0000;
+
 /// Auxiliary-vector keys this kernel supplies.
 ///
-/// Two of the ~20 Linux defines, spelled here rather than pulled from
-/// `akuma_elf::types::auxv`, which is private to that crate. When the
-/// parse/place split in the module header happens, these move with it.
+/// Spelled here rather than pulled from `akuma_elf::types::auxv`, which is
+/// private to that crate. When the parse/place split in the module header
+/// happens, these move with it.
 const AT_NULL: u64 = 0;
+const AT_PHDR: u64 = 3;
+const AT_PHENT: u64 = 4;
+const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
 const AT_ENTRY: u64 = 9;
 
@@ -165,7 +208,8 @@ impl FrameSet {
 
 /// What a successful load produced.
 pub struct LoadedImage {
-    /// `e_entry` — where `enter_user_mode` jumps.
+    /// `base + e_entry` — where `enter_user_mode` jumps. Equal to `e_entry`
+    /// for an `ET_EXEC` image (`base` is 0 there).
     pub entry: u64,
     /// Page-aligned end of the highest `PT_LOAD`. Where a `brk` heap would
     /// start; recorded now because it is free to compute here and impossible to
@@ -173,6 +217,24 @@ pub struct LoadedImage {
     pub end_va: u64,
     /// How many `PT_LOAD` segments were placed.
     pub segments: usize,
+    /// Where the program header table ended up in the mapped image, for
+    /// `AT_PHDR` — found by locating the `PT_LOAD` segment whose file range
+    /// covers `e_phoff` and translating through *that* segment's own
+    /// `p_vaddr`/`p_offset`, **not** `base + e_phoff` (only correct when the
+    /// covering segment links `p_vaddr == p_offset`, which a traditional
+    /// `ET_EXEC` linked at a high base does not — see `load`'s own comment
+    /// at the computation for the crash that shortcut produced). No
+    /// `PT_PHDR` segment search: nothing here needs one to exist, and
+    /// `apk.static` (this feature's reason to exist) does not carry one.
+    /// `0` if no `PT_LOAD` segment covers `e_phoff` — the hand-linked
+    /// `userspace/amd64/hello`/`fdprobe` probes don't bother, and neither
+    /// reads its own auxv, so this is a fallback rather than a load failure.
+    pub phdr_addr: u64,
+    /// `e_phnum`, for `AT_PHNUM`.
+    pub phnum: u16,
+    /// `e_phentsize`, for `AT_PHENT` — always 56 on ELF64 (checked at parse
+    /// time), but passed through rather than hard-coded a second place.
+    pub phent: u16,
 }
 
 /// Round `v` up to the next multiple of `to`.
@@ -308,9 +370,15 @@ pub fn load(
     if ehdr.e_machine != EM_X86_64 {
         return Err("not an x86-64 image");
     }
-    if ehdr.e_type != ET_EXEC {
-        return Err("not ET_EXEC — this kernel cannot relocate a PIE");
-    }
+    let is_pie = match ehdr.e_type {
+        ET_EXEC => false,
+        ET_DYN => true,
+        _ => return Err("not ET_EXEC or ET_DYN"),
+    };
+    // `p_vaddr` values in a PIE start near 0 (linked as if loaded at 0); an
+    // `ET_EXEC` image links at its real address, so `base` is 0 there and
+    // every `base + p_vaddr` below is unchanged from before this existed.
+    let base = if is_pie { PIE_BASE } else { 0 };
     // PN_XNUM keeps the real count in shdr[0].sh_info. Nothing here comes near
     // 65535 segments, so reject it rather than mis-read the table as that many.
     if ehdr.e_phnum == elf::abi::PN_XNUM {
@@ -329,6 +397,14 @@ pub fn load(
     let phdrs = image.get(phoff..phend).ok_or("program header table past end of image")?;
     let segments = SegmentTable::new(ehdr.endianness, ehdr.class, phdrs);
 
+    // A dynamically-linked binary (one that names a real interpreter) is
+    // still refused outright — see the module header's "What it refuses".
+    // Checked before placing anything, so a rejected image leaves no frames
+    // behind to unwind.
+    if segments.iter().any(|ph| ph.p_type == PT_INTERP) {
+        return Err("PT_INTERP present — this kernel has no dynamic linker, only static-PIE");
+    }
+
     let mut placed = 0usize;
     let mut end_va = 0u64;
 
@@ -343,7 +419,10 @@ pub fn load(
             return Err("segment p_filesz exceeds p_memsz");
         }
 
-        let seg_end = ph.p_vaddr.checked_add(ph.p_memsz).ok_or("segment wraps the address space")?;
+        let seg_end = base
+            .checked_add(ph.p_vaddr)
+            .and_then(|v| v.checked_add(ph.p_memsz))
+            .ok_or("segment wraps the address space")?;
         if seg_end > USER_VA_LIMIT {
             return Err("segment is not in the lower half");
         }
@@ -353,7 +432,8 @@ pub fn load(
             return Err("segment is both writable and executable");
         }
 
-        let start = ph.p_vaddr & !(PAGE_SIZE as u64 - 1);
+        let vaddr = base + ph.p_vaddr;
+        let start = vaddr & !(PAGE_SIZE as u64 - 1);
         let end = align_up(seg_end, PAGE_SIZE as u64);
         map_range(space, frames, start, end, prot)?;
 
@@ -362,7 +442,7 @@ pub fn load(
             let len = usize::try_from(ph.p_filesz).map_err(|_| "segment file size overflow")?;
             let file_end = off.checked_add(len).ok_or("segment file range overflow")?;
             let bytes = image.get(off..file_end).ok_or("segment data past end of image")?;
-            if !write_user(space, ph.p_vaddr, bytes) {
+            if !write_user(space, vaddr, bytes) {
                 return Err("segment page vanished between mapping and copying");
             }
         }
@@ -374,14 +454,48 @@ pub fn load(
     if placed == 0 {
         return Err("image has no PT_LOAD segments");
     }
-    if ehdr.e_entry == 0 || ehdr.e_entry >= USER_VA_LIMIT {
+    let entry = base.checked_add(ehdr.e_entry).ok_or("entry point overflows the address space")?;
+    if entry == 0 || entry >= USER_VA_LIMIT {
         return Err("entry point is not a user address");
     }
-    if space.prot(ehdr.e_entry as usize & !(PAGE_SIZE - 1)).is_none_or(|p| !p.exec) {
+    if space.prot(entry as usize & !(PAGE_SIZE - 1)).is_none_or(|p| !p.exec) {
         return Err("entry point is not in an executable segment");
     }
 
-    Ok(LoadedImage { entry: ehdr.e_entry, end_va, segments: placed })
+    // `AT_PHDR`: the runtime address file offset `e_phoff` maps to — **not**
+    // simply `base + e_phoff`. That shortcut is only correct when the
+    // covering segment's `p_vaddr` equals its `p_offset`, true for a PIE
+    // linked near 0 (`apk.static`'s segment 0 is `p_vaddr=0, p_offset=0`) but
+    // false for a traditional `ET_EXEC` image linked at a high base — busybox
+    // links at `0x40_0000` with `p_offset=0` for the same segment, so
+    // `base + e_phoff` (`0x40`, `e_phoff`'s literal value — the ELF header is
+    // exactly 64 bytes) is not even a mapped address, and busybox faulted on
+    // it at `cr2=0x40` the first time this shipped with the shortcut. Found
+    // instead by locating the `PT_LOAD` segment whose *file* range covers
+    // `e_phoff` and translating through *that* segment's own
+    // `p_vaddr`/`p_offset` pair, which is correct for both shapes.
+    //
+    // Falls back to 0 rather than failing the whole load when no segment
+    // covers it — `userspace/amd64/hello`/`fdprobe`'s hand-rolled
+    // `user.ld` does not bother mapping the file's first few bytes into any
+    // `PT_LOAD` (nothing in either program reads its own program headers),
+    // and refusing to load them over an auxv entry neither one looks at
+    // would be exactly backwards. A real static-PIE binary's own toolchain
+    // always covers this in practice — `apk.static` does — so this fallback
+    // is never expected to be what a genuine `ET_DYN` load hits.
+    let phdr_addr = segments
+        .iter()
+        .filter(|ph| ph.p_type == PT_LOAD)
+        .find_map(|ph| {
+            let seg_off_end = ph.p_offset.checked_add(ph.p_filesz)?;
+            if ehdr.e_phoff < ph.p_offset || ehdr.e_phoff >= seg_off_end {
+                return None;
+            }
+            base.checked_add(ph.p_vaddr)?.checked_add(ehdr.e_phoff - ph.p_offset)
+        })
+        .unwrap_or(0);
+
+    Ok(LoadedImage { entry, end_va, segments: placed, phdr_addr, phnum: ehdr.e_phnum, phent: ehdr.e_phentsize })
 }
 
 /// Map a stack below `top` and lay out the System V initial frame on it.
@@ -416,10 +530,18 @@ pub const MAX_ARGV: usize = 16;
 /// allocation (same reasoning as [`MAX_ARGV`]).
 pub const MAX_ENVP: usize = 32;
 
-/// Words in the fixed word block: argc, argv ptrs + NULL, envp ptrs + NULL, and
-/// three auxv pairs (`AT_PAGESZ`, `AT_ENTRY`, `AT_NULL`).
-const STACK_WORDS_MAX: usize = 1 + (MAX_ARGV + 1) + (MAX_ENVP + 1) + 6;
+/// Words in the fixed word block: argc, argv ptrs + NULL, envp ptrs + NULL,
+/// and five auxv pairs (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`,
+/// `AT_ENTRY`, `AT_NULL` — six, not five; the name undercounts by one on
+/// purpose-adjacent history, see the `aux` word count below which is the
+/// number that actually matters).
+const STACK_WORDS_MAX: usize = 1 + (MAX_ARGV + 1) + (MAX_ENVP + 1) + 12;
 
+/// As [`load`]'s return value: `AT_PHDR`/`AT_PHNUM`/`AT_PHENT` are what let a
+/// static-PIE binary (`apk`) find its own program headers and self-relocate
+/// — see the module header's "Static-PIE" section. An `ET_EXEC` image (every
+/// other program on this target) ignores them; they cost three more auxv
+/// words and nothing else.
 pub fn build_stack(
     space: &AddressSpace,
     frames: &mut FrameSet,
@@ -427,7 +549,7 @@ pub fn build_stack(
     pages: usize,
     argv: &[&[u8]],
     envp: &[&[u8]],
-    entry: u64,
+    img: &LoadedImage,
 ) -> Result<u64, &'static str> {
     if !top.is_multiple_of(PAGE_SIZE as u64) || pages == 0 {
         return Err("stack top must be page aligned and at least one page");
@@ -460,8 +582,9 @@ pub fn build_stack(
     let strings_base = cursor & !0xf;
 
     // argc, one pointer per argv entry, argv NULL, one per envp entry, envp
-    // NULL, three auxv pairs.
-    let words = 1 + argv.len() + 1 + envp.len() + 1 + 6;
+    // NULL, six auxv pairs (AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_ENTRY,
+    // AT_NULL).
+    let words = 1 + argv.len() + 1 + envp.len() + 1 + 12;
     let rsp = (strings_base - (words as u64) * 8) & !0xf;
     if rsp < base {
         return Err("initial stack frame does not fit");
@@ -482,12 +605,18 @@ pub fn build_stack(
     }
     put(2 + argv.len() + envp.len(), 0); // envp terminator
     let aux = 3 + argv.len() + envp.len();
-    put(aux, AT_PAGESZ);
-    put(aux + 1, PAGE_SIZE as u64);
-    put(aux + 2, AT_ENTRY);
-    put(aux + 3, entry);
-    put(aux + 4, AT_NULL);
-    put(aux + 5, 0);
+    put(aux, AT_PHDR);
+    put(aux + 1, img.phdr_addr);
+    put(aux + 2, AT_PHENT);
+    put(aux + 3, u64::from(img.phent));
+    put(aux + 4, AT_PHNUM);
+    put(aux + 5, u64::from(img.phnum));
+    put(aux + 6, AT_PAGESZ);
+    put(aux + 7, PAGE_SIZE as u64);
+    put(aux + 8, AT_ENTRY);
+    put(aux + 9, img.entry);
+    put(aux + 10, AT_NULL);
+    put(aux + 11, 0);
 
     for (&va, a) in arg_va.iter().zip(argv).chain(env_va.iter().zip(envp)) {
         if !write_user(space, va, a) || !write_user(space, va + a.len() as u64, &[0]) {

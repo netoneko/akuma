@@ -2532,6 +2532,158 @@ the AArch64 acceptance tests compile, not a rewritten equivalent. The
 faster, independent check that tcc itself still works if the musl staging
 above is ever the thing that breaks.
 
+## 3.29 Stage W: `apk` (2026-09-04, same day)
+
+"Let's get apk working now" — asked right after §3.28 landed. `apk` is
+Alpine's real package manager, `apk-tools-static`, the identical pre-built
+`-static-pie` binary `userspace/apk-tools` already stages for the AArch64
+image (`userspace/apk-tools/docs/PIE_LOADER.md` documents that kernel's own
+version of everything below). Getting it running here needed one real kernel
+feature (static-PIE loading, §3.29.1) and turned up three more real bugs
+(§3.29.2–§3.29.4) that a static-PIE loader alone would not have surfaced —
+`apk` is the first program on this target complex enough to exercise `flock`,
+`sendmsg`/`recvmsg`, and a `read(2)` past 64 KiB at all.
+
+### 3.29.1 Static-PIE (`ET_DYN`) loading
+
+`amd64/src/loader.rs` refused anything but `ET_EXEC` outright — "`ET_DYN`
+needs relocation and an interpreter; neither exists here." Half of that
+sentence was never true: `apk.static` is `ET_DYN` **with no `PT_INTERP`** —
+static-PIE, not dynamically linked — and its relocations are `DT_RELR` (a
+compact bitmap, confirmed by reading its own `.dynamic`: `RELASZ` is 0,
+`RELR`/`RELRSZ` carry 25529 entries), which musl's own startup
+(`_dlstart_c`) applies to itself before calling `main` — the kernel processes
+none of it, exactly as `userspace/apk-tools/docs/PIE_LOADER.md` documents for
+the AArch64 kernel ("Kernel-side relocations are skipped for PIE binaries").
+So the fix was smaller than "add a relocator": accept `ET_DYN`, refuse
+`PT_INTERP` explicitly (real dynamic linking is still out of scope), pick a
+base (`PIE_BASE = 0x1000_0000`, the same constant `akuma-elf` uses), and add
+that base to every `p_vaddr`/`e_entry` — unchanged from before for `ET_EXEC`,
+where `base` is 0.
+
+The one thing musl's self-relocation needs from the kernel is **`AT_PHDR`**
+— it walks its own program headers (found there) to compute its load bias
+and locate `.dynamic`. This kernel had never supplied `AT_PHDR`/`AT_PHNUM`/
+`AT_PHENT` at all (the module header used to say so explicitly: "no
+`AT_PHDR`"), so `build_stack` grew three more auxv pairs.
+
+**The first attempt crashed busybox**, deterministically, at `cr2=0x40`:
+`AT_PHDR` was computed as `base + e_phoff`, correct for a PIE linked near 0
+(`apk.static`'s segment 0 is `p_vaddr=0, p_offset=0`) but wrong for a
+traditional `ET_EXEC` linked at a high base — busybox links at `0x40_0000`
+with `p_offset=0` for the same segment, so `base + e_phoff` (`0x40`, the
+literal `e_phoff` value — the ELF header is exactly 64 bytes) is not a mapped
+address at all. Fixed by finding the actual `PT_LOAD` segment whose *file*
+range covers `e_phoff` and translating through *that* segment's own
+`p_vaddr`/`p_offset`, which is correct regardless of where the image links.
+That in turn broke the hand-linked `userspace/amd64/hello`/`fdprobe` probes
+(`elf: image loaded [FAIL]`) — their minimal `user.ld` never bothers mapping
+the file's first few bytes into any `PT_LOAD` at all, so the search finds
+nothing; made non-fatal (`AT_PHDR` falls back to `0`) rather than refusing
+the load, since neither probe ever reads its own auxv.
+
+One self-test's premise went stale in the process: `elf: rejects ET_DYN`
+mutates `HELLO_ELF`'s `e_type` to `ET_DYN` and checks the load is refused —
+still true, but no longer *because* it is `ET_DYN` (that is now accepted);
+the case is truncated to 256 bytes for the test's own reasons, and a real
+static-PIE load of those bytes hits "segment data past end of image" instead.
+Comment corrected in place; a dedicated "refuses `PT_INTERP`" case, needing a
+hand-built image rather than a `HELLO_ELF` mutation, is real coverage not yet
+written.
+
+Verified: `apk --version` → `apk-tools 3.0.8-r0, compiled for x86_64.` — the
+static-PIE binary loads, self-relocates, and runs.
+
+### 3.29.2 `flock`: `ENOSYS` was fatal to `apk`, not ignorable
+
+`apk update` immediately printed `ERROR: Unable to lock database: Function
+not implemented` and exited (status 99) before touching the network. Root
+cause: `flock` (x86_64 73) was not in the dispatch table at all — `apk`
+`flock()`s `/lib/apk/db/lock` before doing anything else, treats a failure as
+fatal, and `Syscall::from_x86_64` mapping nothing to `Flock` (the enum has no
+such variant) meant it fell through to `ENOSYS`. Fixed the same way
+`mprotect` already is: accept and do nothing. One user, one process at a time
+on this target — nothing exists for an advisory lock to protect against.
+
+### 3.29.3 `sendmsg`/`recvmsg`: the DNS reply that arrived but could never be read
+
+With `flock` fixed, `apk -X <url> update` (bypassing the repositories *file*,
+see §3.29.4) hung forever rather than erroring. `STRACE=1` showed a tight
+loop: `clock_gettime` (`ENOSYS`) → `poll` returning `1` (ready!) →
+`recvmsg` returning `ENOSYS`, repeating. musl's resolver on this apk build
+uses `sendmsg`/`recvmsg` (x86_64 46/47) for its DNS queries, not
+`sendto`/`recvfrom` (44/45, already fixed in §3.28's DNS work) — a different
+pair of syscall numbers this target had never wired at all. The `poll` return
+of `1` is the tell: the UDP reply had genuinely arrived (this target's real
+DNS-over-UDP path, §3.28, working exactly as intended) but nothing could read
+it, because the syscall the caller used to read it did not exist.
+
+Fixed by adding `sock::sys_sendmsg`/`sys_recvmsg`, decoding the x86_64
+`struct msghdr` (`msg_name`/`msg_iov`/`msg_iovlen`, up to 8 scatter/gather
+entries — `msg_control` read as present, never interpreted) and routing
+through the same `akuma_net::socket::socket_send_udp`/`socket_recv_udp`/
+`socket_send`/`socket_recv` §3.28 already wired for the plain-pointer forms.
+
+### 3.29.4 `read(2)` past 64 KiB was `EINVAL`, not a short read
+
+Even with §3.29.2/3.29.3 fixed, plain `apk update` (using `/etc/apk/
+repositories`, not `-X`) still reported `OK: 0 distinct packages available`
+— **zero** network syscalls in a full trace, meaning it never got past
+reading its own config. `--repositories-file /etc/apk/repositories`
+(explicit, rather than the silently-tolerant default path) surfaced the real
+error: `failed to read repositories: /etc/apk/repositories: Invalid
+argument`. A temporary debug print at the point `sys_read` returns `EINVAL`
+caught it directly: `len=0x10001` and `len=0x20000` — 64 KiB+1 and 128 KiB,
+requested against a 119-byte file. `apk`'s I/O layer (`apk_istream`) reads
+local files through a fixed, generously-sized buffer regardless of the
+file's real size, exactly as `fread`/`read` are meant to be used — POSIX
+`read(2)` returning fewer bytes than asked (a **short read**) is not an
+error, it is the normal way a caller finds out how much was actually there.
+
+`sys_read`'s `if len > MAX_IO { return EINVAL }` refused the whole call
+instead. The fix is a clamp, not a rejection: `let len = len.min(MAX_IO);`,
+after which the existing file-read path (`total.saturating_sub(pos).min(len)`)
+was *already* correct — it already does a proper short read once it is
+allowed to run at all. This was never apk-specific: any well-behaved program
+handing `read(2)` an oversized buffer for a small file — completely ordinary
+usage — hit the same wall. The self-test that used to assert "an oversized
+read is `EINVAL`" now asserts the opposite (a clamped read returns exactly
+what the file has, `6623` bytes of `/probe.txt`) and moved off the shared
+64-byte test buffer onto its own 8 KiB one — the old assertion, run against
+the new clamped behavior with the same tiny buffer, would have been a real
+stack overflow inside the self-test itself (a clamped read legitimately
+returning more than 64 bytes into a 64-byte destination), not a passing
+check.
+
+With all three fixed, `apk update` (plain, no flags) correctly opens
+`/etc/apk/repositories`, attempts **both** configured repositories, resolves
+DNS, connects, and completes a TLS handshake for each:
+
+```
+$ apk update
+7[fetch https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APK...]
+WARNING: ... TLS: server certificate not trusted
+7[fetch https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/x86_64/APK...]
+WARNING: ... TLS: server certificate not trusted
+2 unavailable, 0 stale; 0 distinct packages available
+```
+
+### 3.29.5 What's left: no wall clock
+
+The remaining, unfixed blocker is structural, not a bug: this target has no
+RTC and no SNTP client (`fs::no_clock` already says as much for inode
+timestamps, and `amd64_shim::time()` — §3.27.2 — returns a hard-coded `0`).
+Confirmed directly: a tcc-compiled C program calling `time(NULL)` printed
+`time() = 0`. Every real CA certificate's "not valid before" date is
+decades after 1970-01-01, so TLS validation correctly (from its own
+perspective) rejects all of them as not-yet-valid — `--allow-untrusted` does
+**not** help, because that flag bypasses `apk`'s own package-signature
+check, not the TLS library's certificate-chain validation underneath it,
+which is a separate, earlier gate. A real wall clock — an SNTP client at
+boot, mirroring what `akuma-syscalls-time` already does for the AArch64
+kernel — is what `apk update`/`apk add` against the real Alpine CDN needs
+next, and is a stage of its own, not attempted here.
+
 ## 4. What is deliberately missing
 
 Corrected 2026-09-04. This list was written at Stage B and went stale as the

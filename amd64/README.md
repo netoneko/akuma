@@ -57,10 +57,29 @@ headers, the same package `apk add musl-dev` installs on the AArch64 image —
 so the AArch64 acceptance tests' own command now runs unmodified:
 `tcc -static -B /usr/lib/tcc -o /tmp/hello_c /tmp/hello.c` compiles the
 AArch64 suite's own `hello.c` (`#include <stdio.h>` + `printf`), and running
-the result prints `Hello, Akuma!` and exits 0 — verified over SSH. No device
-interrupts, and no pipelines (`a | b`) over the interactive SSH
-shell — `sys_pipe2` (step 4) is still `ENOSYS`, seen directly as `can't create pipe: Bad
-file descriptor` from `wget ... | head`.
+the result prints `Hello, Akuma!` and exits 0 — verified over SSH.
+
+Still the same day: the loader gained **static-PIE (`ET_DYN`) support**, so
+Alpine's real **`apk`** (`apk-tools-static`, `-static-pie`) runs — `apk
+--version`, and `apk update` against the real Alpine CDN gets through DNS, TCP
+and a full TLS handshake before stopping at certificate validation (this
+target has no wall clock at all — `time()` reads `0` — so every real
+certificate looks not-yet-valid; not fixed here). Getting that far needed
+three more real bugs found and fixed, not just apk-specific workarounds:
+`flock` (`ENOSYS` made `apk` treat its own database lock as fatal),
+`sendmsg`/`recvmsg` (musl's resolver uses them, not `sendto`/`recvfrom` —
+without them a UDP reply that had genuinely arrived, `poll` correctly
+reporting it, was still unreadable), and `read(2)` refusing any request over
+64 KiB outright instead of clamping it like real Linux does — which broke
+apk's own 128 KiB-buffer read of a 119-byte config file before it ever
+touched the network. Full account, including exactly why `AT_PHDR` computed
+as `base + e_phoff` crashed busybox before it was fixed:
+`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.29.
+
+No device interrupts, and no pipelines (`a | b`) over the interactive SSH
+shell — `sys_pipe2`/`dup2` (step 4) are still `ENOSYS`, seen directly as
+`can't create pipe: Bad file descriptor` from `wget ... | head` and as shell
+output redirection (`>`) failing the same way.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1** —
 `curl http://10.0.2.15:8080/` and `ssh root@10.0.2.15 'echo hi'` both from the
@@ -270,7 +289,7 @@ and each entry has one of three reasons:
 
 | crate | why amd64 does not use it |
 |---|---|
-| `akuma-mmu`, `akuma-elf` | **Blocked.** `akuma-mmu` is AArch64 page-table format; `akuma-elf`'s mapping half is written against it. The fix is a parse/place split for the loader, and proposal item 1 for the tables |
+| `akuma-mmu`, `akuma-elf` | **Blocked.** `akuma-mmu` is AArch64 page-table format; `akuma-elf`'s mapping half is written against it. The fix is a parse/place split for the loader, and proposal item 1 for the tables. `amd64/src/loader.rs` grew its own independent static-PIE (`ET_DYN`) support 2026-09-04 for `apk` rather than waiting on that split — real duplication, tracked as such, not evidence the split stopped mattering |
 | `akuma-mmap` | **Blocked on item 1.** `MmapRegion.flags` is a raw AArch64 PTE `u64`; the two encodings share no field. This costs `munmap`'s clip-and-split, lazy regions, and a region list to replace `loader::MAX_PROC_FRAMES` |
 | `akuma-user-access` | **Cannot build.** Its copy loop is AArch64 `global_asm!` (`cbz`). `fd.rs` has its own bounded copy helpers, which is duplication with a real reason |
 | `akuma-syscalls-glue` (incl. its `pipe`) | **Cannot build** (`cbz` through `akuma-user-access`). `amd64/src/{fd,usermode}.rs` hold the file/spawn/pipe syscall bodies; the pure pipe buffer was extracted to `akuma-pipe` rather than re-derived |

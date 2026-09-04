@@ -259,6 +259,136 @@ pub fn sys_recvfrom(fd: u64, buf: u64, len: u64, src_addr: u64) -> u64 {
     recv(idx, buf, len, fd::is_nonblocking(fd))
 }
 
+/// Byte offsets into the x86_64 `struct msghdr` — 56 bytes, `{ void
+/// *msg_name; socklen_t msg_namelen; struct iovec *msg_iov; size_t
+/// msg_iovlen; void *msg_control; size_t msg_controllen; int msg_flags; }`.
+/// `msg_namelen` (a 4-byte `socklen_t` at offset 8) leaves 4 bytes of padding
+/// before the next pointer-sized field, which is why `IOV` is 16, not 12.
+mod msghdr_off {
+    pub const NAME: u64 = 0;
+    pub const IOV: u64 = 16;
+    pub const IOVLEN: u64 = 24;
+}
+
+/// One `struct iovec`: `{ void *iov_base; size_t iov_len; }`, 16 bytes.
+const IOVEC_SIZE: u64 = 16;
+
+/// Scatter/gather entries [`sys_sendmsg`]/[`sys_recvmsg`] will walk. A bound
+/// rather than trust, like every other length this kernel takes from ring 3 —
+/// musl's DNS resolver (the reason these two exist) uses exactly one.
+const MAX_MSG_IOV: u64 = 8;
+
+/// Read one `u64` field out of user memory at `base + off`.
+fn read_u64(base: u64, off: u64) -> u64 {
+    // SAFETY: same user-pointer contract as every other raw access in this
+    // module; the field offsets above are the caller's guarantee of
+    // alignment and existence.
+    unsafe { ((base + off) as *const u64).read_volatile() }
+}
+
+/// `sendmsg(fd, msghdr*, flags)` / `recvmsg(fd, msghdr*, flags)` — x86_64
+/// 46/47. musl's DNS resolver on Alpine's musl build uses these, not
+/// `sendto`/`recvfrom`: `apk`'s own name resolution (before it can even reach
+/// `dl-cdn.alpinelinux.org`) hung in a `poll`+`recvmsg` loop forever —
+/// `poll(2)` correctly reported the UDP socket readable (a real DNS reply had
+/// arrived; see `sys_sendto`'s fix), but `recvmsg` did not exist at all on
+/// this target, so the data sitting in the socket was never reachable and the
+/// loop spun retrying the same read forever.
+///
+/// Only what a UDP query round-trip needs: `msg_name`/`msg_namelen` (the
+/// `sendto`/`recvfrom` address argument's equivalent) and the scatter/gather
+/// buffer, built by concatenating up to `MAX_MSG_IOV` `iovec` entries into one
+/// contiguous copy — `msg_control`/`msg_controllen` (ancillary data:
+/// `SCM_RIGHTS` fd-passing and the like) are read as present and never
+/// interpreted, and `msg_flags` on the way back is always `0`, matching what
+/// no caller on this target needs yet.
+pub fn sys_sendmsg(fd: u64, msg: u64, _flags: u64) -> u64 {
+    let Some(idx) = fd::socket_index(fd) else {
+        return errno::ENOTSOCK;
+    };
+    let name = read_u64(msg, msghdr_off::NAME);
+    let iov = read_u64(msg, msghdr_off::IOV);
+    let iovlen = read_u64(msg, msghdr_off::IOVLEN).min(MAX_MSG_IOV);
+
+    let mut data = alloc::vec::Vec::new();
+    for i in 0..iovlen {
+        let entry = iov + i * IOVEC_SIZE;
+        let base = read_u64(entry, 0);
+        let len = read_u64(entry, 8);
+        data.extend_from_slice(&fd::copy_in(base, len));
+    }
+
+    if name != 0 && akuma_net::socket::is_udp_socket(idx) {
+        let Some(dest) = sockaddr_in_from_user(name, core::mem::size_of::<SockAddrIn>() as u64) else {
+            return errno::EINVAL;
+        };
+        return match akuma_net::socket::socket_send_udp(idx, &data, dest) {
+            Ok(n) => n as u64,
+            Err(e) => net_err(e),
+        };
+    }
+    match akuma_net::socket::socket_send(idx, &data, fd::is_nonblocking(fd)) {
+        Ok(n) => n as u64,
+        Err(e) => net_err(e),
+    }
+}
+
+/// See [`sys_sendmsg`]. Scatters the received bytes across `msg_iov` in
+/// order, filling each entry before moving to the next — the shape a caller
+/// asking for more `iovlen` entries than one datagram needs is written to
+/// expect. Writes the sender's address back through `msg_name` (fixed 16
+/// bytes, the `sockaddr_in` size — same "no real `addrlen`" note as
+/// `sys_recvfrom`, except here `msg_namelen` *is* available, so it is set to
+/// match rather than left for the caller to guess).
+pub fn sys_recvmsg(fd: u64, msg: u64, _flags: u64) -> u64 {
+    let Some(idx) = fd::socket_index(fd) else {
+        return errno::ENOTSOCK;
+    };
+    let name = read_u64(msg, msghdr_off::NAME);
+    let iov = read_u64(msg, msghdr_off::IOV);
+    let iovlen = read_u64(msg, msghdr_off::IOVLEN).min(MAX_MSG_IOV);
+    let total_cap: u64 = (0..iovlen).map(|i| read_u64(iov + i * IOVEC_SIZE, 8)).sum();
+
+    let is_udp = akuma_net::socket::is_udp_socket(idx);
+    let mut data = alloc::vec![0u8; total_cap as usize];
+    let n = if is_udp {
+        match akuma_net::socket::socket_recv_udp(idx, &mut data, fd::is_nonblocking(fd)) {
+            Ok((n, from)) => {
+                if name != 0 {
+                    sockaddr_in_to_user(name, from);
+                    // SAFETY: `name` points at a real `sockaddr_in`-sized
+                    // buffer, per this syscall's own contract; `msg_namelen`
+                    // sits 8 bytes into `msghdr`, a plain `socklen_t` (u32).
+                    unsafe {
+                        ((msg + 8) as *mut u32).write_volatile(core::mem::size_of::<SockAddrIn>() as u32);
+                    }
+                }
+                n
+            }
+            Err(e) => return net_err(e),
+        }
+    } else {
+        match akuma_net::socket::socket_recv(idx, &mut data, fd::is_nonblocking(fd)) {
+            Ok(n) => n,
+            Err(e) => return net_err(e),
+        }
+    };
+
+    let mut written = 0usize;
+    for i in 0..iovlen {
+        if written >= n {
+            break;
+        }
+        let entry = iov + i * IOVEC_SIZE;
+        let base = read_u64(entry, 0);
+        let cap = read_u64(entry, 8) as usize;
+        let chunk = (n - written).min(cap);
+        fd::copy_out(base, &data[written..written + chunk]);
+        written += chunk;
+    }
+    written as u64
+}
+
 /// `setsockopt` — accepted and mostly ignored.
 ///
 /// Returning success for an option this kernel does not implement is the

@@ -502,9 +502,20 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    if len > MAX_IO {
-        return errno::EINVAL;
-    }
+    // Clamped, not refused. `read(2)` on real Linux accepts an oversized
+    // count and just does a short read (or reads up to its own internal cap,
+    // ~2 GiB) — it is not an error for the caller to ask for more than is
+    // available or than this kernel wants to service in one call. Rejecting
+    // the whole call with `EINVAL` used to be this function's answer, and it
+    // broke `apk`: its I/O layer reads local files through a fixed
+    // (128 KiB-class) buffer regardless of the file's real size — completely
+    // ordinary POSIX usage — so a 119-byte `/etc/apk/repositories` came back
+    // "Invalid argument" before `apk update` ever got as far as opening a
+    // socket. The file-read path below already clamps to what is actually
+    // available (`total.saturating_sub(pos).min(len)`); this clamp is what
+    // lets a request past `MAX_IO` reach that logic instead of being refused
+    // outright.
+    let len = len.min(MAX_IO);
 
     if fd == 0 {
         // A spawned child's stdin is a pipe, not the console — `sshd` feeds it.
@@ -1437,9 +1448,21 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         sys_close(fd);
     }
 
-    // An oversized read must be refused rather than trusted.
+    // A request past `MAX_IO` is clamped, not refused — real `read(2)`
+    // semantics (see `sys_read`'s own comment): the byte count actually
+    // returned is bounded by what the file has, not by what was asked for.
+    // Uses its own appropriately-sized buffer rather than the 64-byte `buf`
+    // above — a clamped read here legitimately delivers more than 64 bytes
+    // (`/probe.txt` is 6623), and writing that many into a 64-byte
+    // destination would be a real overflow. That is the caller's mistake to
+    // avoid, not this kernel's to prevent: `len` is the caller's own
+    // assertion about its buffer's size, exactly as on real Linux.
     let fd = sys_openat(0, path.as_ptr() as u64, 0, 0);
-    t.check_eq("fd: an oversized read is EINVAL",
-               sys_read(fd, buf.as_mut_ptr() as u64, MAX_IO + 1), errno::EINVAL);
+    let mut big = alloc::vec![0u8; 8192];
+    t.check_eq(
+        "fd: a request past MAX_IO is clamped to what the file has",
+        sys_read(fd, big.as_mut_ptr() as u64, MAX_IO + 1),
+        6623,
+    );
     sys_close(fd);
 }

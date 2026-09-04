@@ -633,6 +633,22 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         // `mprotect` for spawned processes needs the per-space region table the
         // loader also wants (§3.18.8 / §3.24.5).
         10 => return 0,
+        // `flock(fd, op)` — x86_64 73. One user, one process at a time on
+        // this target (no fork-based package-manager concurrency exists to
+        // race against), so there is nothing an advisory lock could actually
+        // protect — accept and do nothing, the same stance `mprotect` above
+        // takes. Without this, `apk`'s database lock (`flock` on
+        // `/lib/apk/db/lock`) came back `ENOSYS` and it treated that as fatal:
+        // `apk update` printed "Unable to lock database: Function not
+        // implemented" and exited before ever reaching the network.
+        73 => return 0,
+        // `sendmsg`/`recvmsg` — x86_64 46/47. musl's DNS resolver on this
+        // build uses these, not `sendto`/`recvfrom`; without them `poll`
+        // correctly reported a UDP reply readable and `recvmsg` came back
+        // `ENOSYS`, so `apk`'s own name resolution spun forever. See
+        // `sock::sys_sendmsg`/`sock::sys_recvmsg`.
+        46 => return crate::sock::sys_sendmsg(a1, a2, a3),
+        47 => return crate::sock::sys_recvmsg(a1, a2, a3),
         _ => {}
     }
 
@@ -1186,7 +1202,7 @@ impl Process {
                 ELF_STACK_PAGES,
                 argv,
                 envp,
-                img.entry,
+                &img,
             )
             .map(|rsp| (img, rsp))
         });
@@ -2639,8 +2655,20 @@ fn reject_test(t: &mut Suite) {
     let cases: [(&str, usize, &[u8]); 4] = [
         // e_ident[EI_MAG0..4]: not an ELF at all.
         ("elf: rejects a non-ELF image", 0, &[0x7f, b'E', b'L', b'G']),
-        // e_type at offset 16: ET_DYN (3). A PIE needs relocation this kernel
-        // cannot do, and loading one places it at its link-time zero.
+        // e_type at offset 16: ET_DYN (3). Static-PIE (`ET_DYN`, no
+        // `PT_INTERP`) is accepted since 2026-09-04 — see the module header's
+        // "Static-PIE" section — so this case is no longer refused *for being
+        // ET_DYN*; it is refused because `HELLO_ELF[..256]` truncates its
+        // first `PT_LOAD` segment's file data (`p_offset=0x1000`,
+        // `p_filesz=500`, past this test's 256-byte buffer), which the
+        // relocated-at-`PIE_BASE` load path reaches and rejects on exactly
+        // the same "segment data past end of image" check an `ET_EXEC` load
+        // of the same truncated bytes would hit. Kept under this name because
+        // the outcome this suite actually checks (refused) is unchanged, and
+        // per this function's own doc it checks that, not why — a dedicated
+        // "refuses `PT_INTERP`" case would need a hand-built image rather
+        // than a `HELLO_ELF` mutation, which is real, not-yet-written
+        // coverage rather than something this case still stands in for.
         ("elf: rejects ET_DYN", 16, &[3, 0]),
         // e_machine at offset 18: EM_AARCH64 (183). The other architecture in
         // this tree, which is the mistake actually available to make.

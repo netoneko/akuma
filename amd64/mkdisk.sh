@@ -217,6 +217,84 @@ EOF
     "$DEBUGFS" -w -R "write $TMP/hello.c tmp/hello.c" "$IMG" >/dev/null 2>&1
 fi
 
+# apk (2026-09-04): Alpine's real `apk-tools-static` binary, the same
+# pre-built artifact `userspace/apk-tools` stages for the AArch64 image —
+# fetched here directly rather than through that crate, because its own
+# `build.rs` is pinned to the aarch64 download URLs and bootstrap paths.
+# `apk.static` is `-static-pie` (`ET_DYN`, no `PT_INTERP`) — loadable only
+# since `amd64/src/loader.rs` grew static-PIE support the same day; see that
+# file's module header for why the kernel does *not* process its `DT_RELR`
+# relocations itself (musl's own startup code does, once it can find its
+# program headers via `AT_PHDR`).
+APK_VENDOR="target/x86_64-unknown-none/release/apk-vendor"
+mkdir -p "$APK_VENDOR"
+APK_STATIC_APK="$APK_VENDOR/apk-tools-static.apk"
+ALPINE_KEYS_APK="$APK_VENDOR/alpine-keys.apk"
+CACERT="$APK_VENDOR/cacert.pem"
+[ -f "$APK_STATIC_APK" ] || curl -sSLf -o "$APK_STATIC_APK" \
+    "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/apk-tools-static-3.0.8-r0.apk" \
+    || rm -f "$APK_STATIC_APK"
+[ -f "$ALPINE_KEYS_APK" ] || curl -sSLf -o "$ALPINE_KEYS_APK" \
+    "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/alpine-keys-2.6-r0.apk" \
+    || rm -f "$ALPINE_KEYS_APK"
+# Mozilla's CA bundle — Alpine's CDN has been HTTPS-only since early 2026
+# (plain HTTP returns 403), so `apk update`/`apk add` cannot work without one.
+[ -f "$CACERT" ] || curl -sSLf -o "$CACERT" "https://curl.se/ca/cacert.pem" || rm -f "$CACERT"
+
+if [ -f "$APK_STATIC_APK" ]; then
+    APK_STAGE=$(mktemp -d)
+    tar xzf "$APK_STATIC_APK" -C "$APK_STAGE" sbin/apk.static
+    "$DEBUGFS" -w -R "write $APK_STAGE/sbin/apk.static bin/apk" "$IMG" >/dev/null 2>&1
+
+    # `/etc` itself isn't created until the SSHD/DNS blocks further down —
+    # this block runs first, so it has to make its own parent directory
+    # rather than assume one of theirs already ran. Idempotent like every
+    # other `mkdir` in this script (`/etc` itself is mkdir'd twice more,
+    # later, on purpose — see those blocks). `/etc/apk` is needed
+    # unconditionally below (repositories/arch/world), not only when the
+    # signing keys downloaded, so it is made here rather than nested inside
+    # that `if`.
+    "$DEBUGFS" -w -R "mkdir /etc" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /etc/apk" "$IMG" >/dev/null 2>&1
+
+    if [ -f "$ALPINE_KEYS_APK" ]; then
+        tar xzf "$ALPINE_KEYS_APK" -C "$APK_STAGE" etc/apk/keys
+        "$DEBUGFS" -w -R "mkdir /etc/apk/keys" "$IMG" >/dev/null 2>&1
+        for key in "$APK_STAGE"/etc/apk/keys/*; do
+            [ -f "$key" ] && "$DEBUGFS" -w -R "write $key etc/apk/keys/$(basename "$key")" "$IMG" >/dev/null 2>&1
+        done
+    fi
+    rm -rf "$APK_STAGE"
+
+    printf 'https://dl-cdn.alpinelinux.org/alpine/latest-stable/main\nhttps://dl-cdn.alpinelinux.org/alpine/latest-stable/community\n' \
+        > "$TMP/apk-repositories"
+    "$DEBUGFS" -w -R "write $TMP/apk-repositories etc/apk/repositories" "$IMG" >/dev/null 2>&1
+    printf 'x86_64\n' > "$TMP/apk-arch"
+    "$DEBUGFS" -w -R "write $TMP/apk-arch etc/apk/arch" "$IMG" >/dev/null 2>&1
+    printf '' > "$TMP/apk-world"
+    "$DEBUGFS" -w -R "write $TMP/apk-world etc/apk/world" "$IMG" >/dev/null 2>&1
+
+    if [ -f "$CACERT" ]; then
+        "$DEBUGFS" -w -R "mkdir /etc/ssl" "$IMG" >/dev/null 2>&1
+        "$DEBUGFS" -w -R "mkdir /etc/ssl/certs" "$IMG" >/dev/null 2>&1
+        "$DEBUGFS" -w -R "write $CACERT etc/ssl/certs/ca-certificates.crt" "$IMG" >/dev/null 2>&1
+        "$DEBUGFS" -w -R "write $CACERT etc/ssl/cert.pem" "$IMG" >/dev/null 2>&1
+    fi
+
+    # Seed the package database so `apk add` works without `--initdb`, and the
+    # empty cache dir `apk` expects to find (both match
+    # `userspace/apk-tools/build.rs`'s bootstrap layout for the AArch64 image).
+    "$DEBUGFS" -w -R "mkdir /lib" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /lib/apk" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /lib/apk/db" "$IMG" >/dev/null 2>&1
+    printf '' > "$TMP/apk-empty"
+    "$DEBUGFS" -w -R "write $TMP/apk-empty lib/apk/db/installed" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "write $TMP/apk-empty lib/apk/db/triggers" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /var" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /var/cache" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /var/cache/apk" "$IMG" >/dev/null 2>&1
+fi
+
 # busybox: a real static musl x86_64 binary (ET_EXEC, non-PIE), fetched once and
 # cached. It is the test that the ELF loader and the Linux syscall surface hold
 # up under a program the tree did not compile. `/bin/sh` and a handful of applet
