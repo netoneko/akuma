@@ -121,7 +121,7 @@ if [ ! -f "$BB" ]; then
 fi
 if [ -f "$BB" ]; then
     "$DEBUGFS" -w -R "write $BB bin/busybox" "$IMG" >/dev/null 2>&1
-    for applet in sh uname ls cat echo pwd env cut head tail wc; do
+    for applet in sh uname ls cat echo pwd env cut head tail wc find wget; do
         "$DEBUGFS" -w -R "ln /bin/busybox /bin/$applet" "$IMG" >/dev/null 2>&1
     done
 fi
@@ -138,6 +138,17 @@ if [ -n "$SSHD" ]; then
     printf 'shell = %s\n' "${SSHD_SHELL:-/bin/paws}" > "$TMP/sshd.conf"
     "$DEBUGFS" -w -R "write $TMP/sshd.conf etc/sshd/sshd.conf" "$IMG" >/dev/null 2>&1
 fi
+# DNS. QEMU's usermode `-netdev user` and Firecracker's `net-setup.sh` tap both
+# answer DNS themselves at `10.0.2.3` (usermode net's fixed proxy address; see
+# `net-setup.sh`'s dnsmasq for the Firecracker side, same address by
+# convention) — but nothing points a guest resolver at it without this file.
+# musl's resolver reads `/etc/resolv.conf` and, finding none, falls back to
+# `127.0.0.1`, so `wget http://a-hostname/` failed with "bad address" even
+# though outbound TCP itself worked (`amd64/README.md`'s curl/wget check).
+"$DEBUGFS" -w -R "mkdir /etc" "$IMG" >/dev/null 2>&1
+printf 'nameserver 10.0.2.3\n' > "$TMP/resolv.conf"
+"$DEBUGFS" -w -R "write $TMP/resolv.conf etc/resolv.conf" "$IMG" >/dev/null 2>&1
+
 # Something for httpd to serve. httpd's document root is `/public`, and `GET /`
 # maps to `/public/index.html` — put it where httpd looks, not at the root.
 printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></html>\n' > "$TMP/index.html"

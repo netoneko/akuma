@@ -2233,6 +2233,34 @@ PMM still caps at `PHYSMAP_LIMIT` (1 GiB) — a bigger guest buys user pages for
 5. **`getdents64` (217)** — `ls`. `akuma-vfs`'s `read_dir` is already used by
    `src/fs.rs`; still `ENOSYS`, so `ls` reports "can't open".
 
+   **Done 2026-09-04.** `fd::sys_getdents64` reuses `KernelFile::dir_cache` and
+   `akuma_syscalls_linux::dirent::{reclen, encode}` — the same cache-on-first-call
+   shape and the same wire encoder the AArch64 kernel's `sys_getdents64`
+   (`crates/akuma-syscalls-glue/src/fs.rs`) uses, not a re-derived record layout.
+   `sys_openat` had to grow a directory case first: it called `fs::read_file`
+   unconditionally, which fails a directory as `NotAFile`, so `openat` on `/bin`
+   returned `ENOENT` before this — `fs::metadata` is checked first now, and a
+   directory open stores an empty `data` `Vec` with a new `Entry::is_dir` flag
+   that also fixes `read`(→`EISDIR`) and `fstat`(→ real `S_IFDIR`) on a directory
+   fd; the latter matters because musl's `fdopendir` fstats the fd and refuses
+   `ENOTDIR` unless `S_ISDIR` holds, so a wrong mode there would have failed
+   `ls`/`find` even with `getdents64` itself correct. `ext2::read_dir` drops the
+   synthetic `.`/`..` records before this ever sees them, matching the AArch64
+   side. Boot-verified on QEMU `microvm`: `ssh`, `ls -la /`, `find / -maxdepth 2`
+   all return real listings; 166 self-tests still pass.
+
+   Also found while checking outbound HTTP (`wget`, this target's curl —
+   busybox's static build carries no `curl` applet): the guest could reach a
+   server by raw IP (a real HTTP response came back, including a redirect the
+   server issued to a hostname) but not by name — no `/etc/resolv.conf` existed
+   on the image at all. `mkdisk.sh` now writes one (`nameserver 10.0.2.3`, the
+   fixed address both QEMU usermode net and Firecracker's `net-setup.sh`
+   dnsmasq answer on), but hostname lookups still fail after ~10s
+   (`wget: bad address`) — `akuma-net`'s UDP socket path exists
+   (`socket_send_udp`/`socket_recv_udp`) but a DNS query over it has never
+   been exercised end to end on this target and the gap is unexplored past
+   confirming resolv.conf alone does not fix it.
+
 Reference the AArch64 impls for semantics, not reuse (they are behind
 `akuma-exec`/`akuma-bkl`, which do not build for `x86_64-unknown-none`):
 `crates/akuma-exec/src/process/` (fork), `crates/akuma-syscalls-glue/src/`,
@@ -2278,6 +2306,8 @@ what follows is the state as of Stage L rather than the original text.
   stdio to `akuma-pipe` pipes and runs it as a scheduler task; `waitpid` reaps
   it. What is missing on top is `fork`/`execve`/`wait4` — see Stage T (§3.26).
   `getcwd` returns `/` (no per-process cwd); `getdents64` is still absent (`ls`).
+  Corrected 2026-09-04: `getdents64` shipped that day, §3.26.5 step 5 — `ls`
+  and `find` both work now.
 - **No writes.** The block driver and `akuma-ext2` can both write; nothing does.
   A self-test that mutated the image would make it stateful across boots.
 - **Networking works** since Stage Q (§3.23): the netpoll daemon drives

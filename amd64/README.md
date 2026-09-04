@@ -25,8 +25,21 @@ via `arch_prctl` (TLS base), SSE enabled in `boot.s`, `uname` and `writev`
 `stat`/`lstat`/`newfstatat`, **`execve`**, **`fork`** (eager full-copy, no CoW)
 + `wait4`, per-task `%fs` base, `open`, `access`, terminal `ioctl` and `poll` —
 so an **interactive `busybox sh` over SSH runs external commands**
-(`uname -a`, `echo`, …). `ls` still needs `getdents64`; no writes, no device
-interrupts.
+(`uname -a`, `echo`, …), and Stage T's step 5 (2026-09-04) wired `getdents64`,
+so **`ls` and `find` both work** — reusing the same `akuma_syscalls_linux::dirent`
+wire encoder and the `KernelFile::dir_cache` snapshot-on-first-call the AArch64
+kernel's `sys_getdents64` uses, not a hand-rolled record layout. `mkdisk.sh` now
+writes `/etc/resolv.conf` (`nameserver 10.0.2.3`, the fixed address both QEMU
+usermode net and Firecracker's `net-setup.sh` dnsmasq answer DNS on) so a guest
+resolver has somewhere to look — but hostname lookups still fail (`wget: bad
+address`, ~10s to report it, so it is trying and timing out rather than
+bailing immediately). A raw-IP request gets a real HTTP response (proven
+against `info.cern.ch`'s IP, which even 30x-redirected to a hostname the guest
+then failed to resolve), so outbound TCP/HTTP itself works end to end and the
+gap is specifically DNS-over-UDP — unexplored past this point. No writes, no
+device interrupts, and no pipelines (`a | b`) over the interactive SSH shell —
+`sys_pipe2` (step 4) is still `ENOSYS`, seen directly as `can't create pipe: Bad
+file descriptor` from `wget ... | head`.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1** —
 `curl http://10.0.2.15:8080/` and `ssh root@10.0.2.15 'echo hi'` both from the
@@ -324,7 +337,8 @@ program that printed its verdict would have "passed" by running at all.
   costs one frame per page and can hit `ENOMEM` near `MAX_PROC_FRAMES`), and
   `pipe2`/`dup2` for **pipelines** (`a | b`). `sshd`'s `fork-sessions` mode is
   still out (it needs `fork` before auth, a different shape). Rest of **Stage
-  T**: `pipe2`, `getdents64` (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.26).
+  T**: `pipe2` (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.26 — `getdents64`,
+  step 5, shipped 2026-09-04).
 - **No pty line discipline for a spawned shell.** `SPAWN_FLAG_PTY` is accepted
   and ignored; an interactive `sshd` shell gets raw bytes over its stdin pipe
   and does its own editing.

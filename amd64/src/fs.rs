@@ -32,7 +32,7 @@
 
 use akuma_ext2::{BlockDevice, Ext2Filesystem};
 use akuma_selftest::Suite;
-use akuma_vfs::{Filesystem, Metadata};
+use akuma_vfs::{DirEntry, Filesystem, Metadata};
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
@@ -117,6 +117,20 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
 #[must_use]
 pub fn metadata(path: &str) -> Option<Metadata> {
     with_root(|fs| fs.metadata(path).ok())?
+}
+
+/// List a directory's entries — the backing for `getdents64` (`ls`, `find`).
+///
+/// `akuma-ext2`'s `read_dir` already drops the synthetic `.`/`..` records (it
+/// filters them out of the raw directory block before returning), so this
+/// target's `getdents64` never has to invent them — the same shape the
+/// AArch64 kernel's `list_dir` hands its own `sys_getdents64`.
+///
+/// `None` covers both "no filesystem mounted" and "not a directory" — the
+/// caller (`fd::sys_getdents64`) only has one error to report either way.
+#[must_use]
+pub fn read_dir(path: &str) -> Option<Vec<DirEntry>> {
+    with_root(|fs| fs.read_dir(path).ok())?
 }
 
 /// Mount, then prove the filesystem can be read.

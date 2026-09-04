@@ -653,6 +653,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         Syscall::Lseek => crate::fd::sys_lseek(a1, a2, a3),
         Syscall::Fstat => crate::fd::sys_fstat(a1, a2),
         Syscall::Ioctl => crate::fd::sys_ioctl(a1, a2, a3),
+        // `getdents64(fd, dirp, count)` — x86_64 217. `ls`/`find`.
+        Syscall::Getdents64 => crate::fd::sys_getdents64(a1, a2, a3),
         // `a5` is mmap's fd and is deliberately unused: only anonymous mappings
         // are supported, so a file-backed request must fail rather than quietly
         // return zeroed memory that the caller believes holds a file.

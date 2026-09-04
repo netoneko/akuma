@@ -89,6 +89,8 @@ pub mod errno {
     pub const ESRCH: u64 = (-3i64) as u64;
     pub const EAGAIN: u64 = (-11i64) as u64;
     pub const ENOMEM: u64 = (-12i64) as u64;
+    pub const ENOTDIR: u64 = (-20i64) as u64;
+    pub const EISDIR: u64 = (-21i64) as u64;
 
     /// Does a syscall return value carry an errno? Linux errnos are `1..=4095`,
     /// returned as `(-errno) as u64` — the very top of the range. Anything below
@@ -115,13 +117,20 @@ pub const MAX_OPEN: usize = 16;
 /// nothing else.
 struct Entry {
     desc: FileDescriptor,
-    /// The file's contents, cached at `open`. See the module header.
+    /// The file's contents, cached at `open`. See the module header. Empty and
+    /// unused for a directory descriptor (`is_dir`) — `getdents64` reads
+    /// `desc`'s `KernelFile::dir_cache` instead, not this.
     data: Vec<u8>,
     /// `O_NONBLOCK`, set through `fcntl(F_SETFL)`. Only sockets consult it —
     /// `sshd`'s cooperative loop makes its listener and every accepted stream
     /// non-blocking so a session idling on its socket suspends instead of
     /// stalling its peers.
     nonblocking: bool,
+    /// Was this fd opened on a directory? Set once at `open`, from
+    /// `fs::metadata` — never a socket or pipe, so those constructors always
+    /// pass `false`. Only `getdents64` may read a directory descriptor;
+    /// `read`/`write` on one report `EISDIR`/`EBADF` per POSIX.
+    is_dir: bool,
 }
 
 /// Allocate a descriptor for an already-created socket.
@@ -138,6 +147,7 @@ pub fn alloc_socket_fd(idx: usize) -> Option<u64> {
                 desc: FileDescriptor::Socket(idx),
                 data: Vec::new(),
                 nonblocking: false,
+                is_dir: false,
             });
             return Some((i + FIRST_FILE_FD) as u64);
         }
@@ -168,7 +178,7 @@ pub fn alloc_pipe_fd(pipe_id: usize, is_write: bool) -> Option<u64> {
     let mut table = TABLE.lock();
     for (i, slot) in table.iter_mut().enumerate() {
         if slot.is_none() {
-            *slot = Some(Entry { desc, data: Vec::new(), nonblocking: false });
+            *slot = Some(Entry { desc, data: Vec::new(), nonblocking: false, is_dir: false });
             return Some((i + FIRST_FILE_FD) as u64);
         }
     }
@@ -378,8 +388,19 @@ pub fn sys_openat(_dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
         p.push_str(&path);
         p
     };
-    let Some(data) = fs::read_file(&normalised) else {
-        return errno::ENOENT;
+    // A directory has no bytes to cache as file contents — `read_file` would
+    // fail it as `NotAFile`. Check `metadata` first (one inode read, next to
+    // `read_file`'s whole-file copy) so a directory opens successfully instead
+    // of falling through to "not found"; `getdents64` lists it straight off
+    // the disk on first use.
+    let is_dir = fs::metadata(&normalised).is_some_and(|m| m.is_dir);
+    let data = if is_dir {
+        Vec::new()
+    } else {
+        match fs::read_file(&normalised) {
+            Some(d) => d,
+            None => return errno::ENOENT,
+        }
     };
 
     let mut table = TABLE.lock();
@@ -388,7 +409,7 @@ pub fn sys_openat(_dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
             // `KernelFile::new` leaves the inode 0 — "read by path", which is
             // what this target does.
             let desc = FileDescriptor::File(KernelFile::new(normalised, flags_ as u32));
-            *slot = Some(Entry { desc, data, nonblocking: false });
+            *slot = Some(Entry { desc, data, nonblocking: false, is_dir });
             return (i + FIRST_FILE_FD) as u64;
         }
     }
@@ -475,6 +496,9 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     let Some(Some(entry)) = table.get_mut(idx as usize) else {
         return errno::EBADF;
     };
+    if entry.is_dir {
+        return errno::EISDIR;
+    }
     let total = entry.data.len();
     let Some(file) = entry.file() else {
         return errno::EBADF;
@@ -622,6 +646,121 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     file.position as u64
 }
 
+/// `getdents64(fd, dirp, count)` — x86_64 217. `ls` and `find` both need this;
+/// until now `openat` on a directory returned `ENOENT` (`read_file` fails it as
+/// `NotAFile`) and this syscall did not exist at all.
+///
+/// Reuses `KernelFile::dir_cache` — the same field and the same reason the
+/// AArch64 kernel has one: a directory that changes between two calls must not
+/// shift the caller's cursor mid-walk, so the listing is snapshotted on first
+/// use and `position` (otherwise a byte offset into cached file contents, see
+/// [`sys_read`]) is reused as an entry index for a directory descriptor.
+///
+/// The wire record — offsets, the 8-byte `d_reclen` rounding, the NUL and the
+/// pad — is `akuma_syscalls_linux::dirent`, not hand-rolled: that module's own
+/// header explains why `size_of::<Header>()` is the wrong offset to reach for.
+/// `d_ino`/`d_off` are both 1, matching the AArch64 kernel — this target
+/// reports no real inode number through `getdents64` either, and nothing seeks
+/// a directory by `d_off`.
+///
+/// Three separate `TABLE` locks rather than one held across the call: the
+/// cache-miss path calls `fs::read_dir`, which takes the *other* lock
+/// (`fs::ROOT`), and nothing else in this module nests the two — see
+/// [`sys_openat`], which reads the file before ever touching `TABLE`.
+pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
+        return errno::ENOTDIR;
+    };
+
+    let (path, cached) = {
+        let mut table = TABLE.lock();
+        let Some(Some(entry)) = table.get_mut(idx as usize) else {
+            return errno::EBADF;
+        };
+        if !entry.is_dir {
+            return errno::ENOTDIR;
+        }
+        let Some(file) = entry.file() else {
+            return errno::EBADF;
+        };
+        (file.path.clone(), file.dir_cache.clone())
+    };
+
+    let entries = if let Some(c) = cached {
+        c
+    } else {
+        let Some(dir_entries) = fs::read_dir(&path) else {
+            return errno::ENOENT;
+        };
+        let cache: Vec<akuma_exec_core::process::DirCacheEntry> = dir_entries
+            .iter()
+            .map(|e| akuma_exec_core::process::DirCacheEntry {
+                name: e.name.clone(),
+                d_type: if e.is_dir {
+                    4 // DT_DIR
+                } else if e.is_symlink {
+                    10 // DT_LNK
+                } else {
+                    8 // DT_REG
+                },
+            })
+            .collect();
+        let mut table = TABLE.lock();
+        if let Some(Some(entry)) = table.get_mut(idx as usize)
+            && let Some(file) = entry.file()
+        {
+            file.dir_cache = Some(cache.clone());
+        }
+        cache
+    };
+
+    let mut table = TABLE.lock();
+    let Some(Some(entry)) = table.get_mut(idx as usize) else {
+        return errno::EBADF;
+    };
+    let Some(file) = entry.file() else {
+        return errno::EBADF;
+    };
+    let position = file.position;
+    if position >= entries.len() {
+        return 0;
+    }
+
+    let count = (count as usize).min(MAX_IO as usize);
+    let mut kernel_buf = alloc::vec![0u8; count];
+    let mut written = 0usize;
+    let mut consumed = 0usize;
+    for e in entries.iter().skip(position) {
+        let reclen = akuma_syscalls_linux::dirent::reclen(e.name.len());
+        if written + reclen > count {
+            break;
+        }
+        let ok = akuma_syscalls_linux::dirent::encode(
+            &mut kernel_buf[written..written + reclen],
+            1,
+            1,
+            e.d_type,
+            e.name.as_bytes(),
+        );
+        debug_assert!(ok, "dirent::reclen and dirent::encode disagree on the record size");
+        if !ok {
+            break;
+        }
+        written += reclen;
+        consumed += 1;
+    }
+    file.position += consumed;
+    drop(table);
+
+    if written > 0 {
+        copy_to_user(dirp, &kernel_buf[..written]);
+    }
+    written as u64
+}
+
 /// The x86_64 `struct stat` — 144 bytes. **Not** the aarch64 layout: x86_64
 /// puts `st_nlink` at 16 (8 bytes) and `st_mode` at 24, where `asm-generic`
 /// has `st_mode` at 16 and `st_nlink` at 20. This is why `akuma-syscalls-linux`'s
@@ -634,6 +773,8 @@ const STAT_SIZE: usize = 144;
 const S_IFREG_0644: u32 = 0o100_644;
 /// `S_IFCHR | 0620`, for the console descriptors.
 const S_IFCHR_0620: u32 = 0o020_620;
+/// `S_IFDIR | 0755`, for a directory descriptor.
+const S_IFDIR_0755: u32 = 0o040_755;
 
 /// Serialise a `struct stat` at the x86_64 field offsets. The fields this target
 /// can answer are filled; the rest stay zero rather than invented — a caller
@@ -674,19 +815,26 @@ fn encode_stat(
 ///
 /// The size comes from the cached contents (see the module header); the mode is
 /// a fixed `S_IFREG | 0644` because a `KernelFile` on this target carries no
-/// inode to read a real one from. A console descriptor reports `S_IFCHR`.
+/// inode to read a real one from. A console descriptor reports `S_IFCHR`, a
+/// directory descriptor `S_IFDIR` — musl's `fdopendir` fstats the fd and
+/// refuses it with `ENOTDIR` unless `S_ISDIR` holds, so `ls`/`find` need this
+/// to be right, not just `openat` succeeding.
 pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
-    let (mode, size) = if fd < FIRST_FILE_FD as u64 {
-        (S_IFCHR_0620, 0u64)
+    let (mode, size, nlink) = if fd < FIRST_FILE_FD as u64 {
+        (S_IFCHR_0620, 0u64, 1u64)
     } else {
         let idx = fd - FIRST_FILE_FD as u64;
         let table = TABLE.lock();
         let Some(Some(entry)) = table.get(idx as usize) else {
             return errno::EBADF;
         };
-        (S_IFREG_0644, entry.data.len() as u64)
+        if entry.is_dir {
+            (S_IFDIR_0755, 0u64, 2u64)
+        } else {
+            (S_IFREG_0644, entry.data.len() as u64, 1u64)
+        }
     };
-    let st = encode_stat(mode, size, 0, 1, None, None, None);
+    let st = encode_stat(mode, size, 0, nlink, None, None, None);
     copy_to_user(statbuf, &st);
     0
 }
