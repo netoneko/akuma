@@ -1633,7 +1633,7 @@ pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(us
 }
 
 /// Check if a socket index refers to a UDP socket
-#[must_use] 
+#[must_use]
 #[cfg(feature = "smoltcp")]
 pub fn is_udp_socket(idx: usize) -> bool {
     with_table(|table| {
@@ -1643,6 +1643,24 @@ pub fn is_udp_socket(idx: usize) -> bool {
             false
         }
     })
+}
+
+/// Does a UDP socket have a datagram queued to read?
+///
+/// A thin, `idx`-addressed wrapper around [`smoltcp_handle_for`] +
+/// [`smoltcp_net::udp_can_recv`], for a caller that has no smoltcp handle of
+/// its own and no epoll/readiness-map machinery to route through — the amd64
+/// target's `poll(2)`, whose own doc used to say "nothing on this target
+/// polls a socket". That stopped being true the day a UDP client showed up:
+/// musl's stub DNS resolver `sendto`s a query and then `poll`s the same socket
+/// waiting for the reply, so a `poll` that always reports a socket "not ready"
+/// makes every hostname lookup read as a timeout no matter how fast the
+/// network answers.
+#[must_use]
+#[cfg(feature = "smoltcp")]
+pub fn socket_udp_recv_ready(idx: usize) -> bool {
+    smoltcp_net::poll();
+    matches!(smoltcp_handle_for(idx), Some((handle, true)) if smoltcp_net::udp_can_recv(handle))
 }
 
 /// Get the default peer for a connected UDP socket

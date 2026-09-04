@@ -665,8 +665,15 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         Syscall::Listen => crate::sock::sys_listen(a1, a2),
         Syscall::Accept => crate::sock::sys_accept(a1, a2, a3),
         Syscall::Connect => crate::sock::sys_connect(a1, a2, a3),
-        Syscall::Sendto => crate::sock::sys_sendto(a1, a2, a3),
-        Syscall::Recvfrom => crate::sock::sys_recvfrom(a1, a2, a3),
+        // `a5` is the destination/source `struct sockaddr *` — Linux's 5th
+        // argument, which the entry asm's shuffle keeps (only the 6th,
+        // `addrlen`, is dropped; see `syscall_entry`'s comment on why that was
+        // safe until now). Needed for UDP: unlike a connected TCP socket, a
+        // UDP `sendto` has no peer to fall back on, and musl's DNS resolver
+        // never `connect()`s its query socket — it addresses every nameserver
+        // by hand on each `sendto`. See `sock::sys_sendto`.
+        Syscall::Sendto => crate::sock::sys_sendto(a1, a2, a3, a5),
+        Syscall::Recvfrom => crate::sock::sys_recvfrom(a1, a2, a3, a5),
         Syscall::Setsockopt => crate::sock::sys_setsockopt(a1, a2, a3, a4, a5),
         Syscall::Exit | Syscall::ExitGroup => {
             EXIT_STATUS.store(a1, Ordering::Relaxed);

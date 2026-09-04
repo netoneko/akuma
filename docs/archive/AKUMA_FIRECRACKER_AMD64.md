@@ -2249,17 +2249,52 @@ PMM still caps at `PHYSMAP_LIMIT` (1 GiB) — a bigger guest buys user pages for
    side. Boot-verified on QEMU `microvm`: `ssh`, `ls -la /`, `find / -maxdepth 2`
    all return real listings; 166 self-tests still pass.
 
-   Also found while checking outbound HTTP (`wget`, this target's curl —
-   busybox's static build carries no `curl` applet): the guest could reach a
-   server by raw IP (a real HTTP response came back, including a redirect the
-   server issued to a hostname) but not by name — no `/etc/resolv.conf` existed
-   on the image at all. `mkdisk.sh` now writes one (`nameserver 10.0.2.3`, the
+   Also found, and fixed, while checking outbound HTTP (`wget`, this target's
+   curl — busybox's static build carries no `curl` applet): the guest could
+   reach a server by raw IP (a real HTTP response came back, including a
+   redirect the server issued to a hostname) but not by name. Two real bugs,
+   both in the UDP path DNS is the first thing on this target to exercise:
+
+   1. `sys_sendto`/`sys_recvfrom` were **three-argument functions** —
+      `(fd, buf, len)` — silently dropping Linux's `flags`/`dest_addr`/`addrlen`.
+      That is invisible on the TCP sockets `httpd`/`sshd` use (a connected
+      socket ignores the address anyway, which is exactly what the code's own
+      comment claimed the whole function did), but a UDP socket has no peer
+      unless `connect()`ed, and musl's stub resolver never connects its query
+      socket — it addresses each nameserver by hand on every `sendto`. With no
+      destination, `socket_send`'s attempt on an unconnected `Datagram` had
+      nowhere to go. Fix: `sys_sendto` decodes `dest_addr` (Linux's 5th
+      argument — the entry asm keeps it; only the 6th, `addrlen`, is dropped)
+      and, for a UDP socket, calls `akuma_net::socket::socket_send_udp` instead
+      of the generic path; `sys_recvfrom` symmetrically calls
+      `socket_recv_udp` and writes the sender's address back.
+   2. Even after (1), `sys_poll` hard-coded **every** socket fd as "not
+      ready" (its own doc said so — "nothing on this target polls one", true
+      until a UDP client showed up). musl's resolver `sendto`s a query then
+      `poll`s the same socket waiting for the reply; a `poll` that always
+      reports "not ready" makes a reply that already arrived read as a
+      timeout. Fix: a new `akuma_net::socket::socket_udp_recv_ready(idx)` (a
+      thin `smoltcp_net::udp_can_recv` wrapper, `#[cfg(feature = "smoltcp")]`
+      like its neighbours) that `fd::poll_ready` calls for a UDP fd; TCP fds
+      are unchanged (still "not ready" — nothing polls one yet, so there was
+      nothing to have gotten wrong there).
+
+   `mkdisk.sh` also now writes `/etc/resolv.conf` (`nameserver 10.0.2.3`, the
    fixed address both QEMU usermode net and Firecracker's `net-setup.sh`
-   dnsmasq answer on), but hostname lookups still fail after ~10s
-   (`wget: bad address`) — `akuma-net`'s UDP socket path exists
-   (`socket_send_udp`/`socket_recv_udp`) but a DNS query over it has never
-   been exercised end to end on this target and the gap is unexplored past
-   confirming resolv.conf alone does not fix it.
+   dnsmasq answer on) — needed regardless of (1)/(2), since a guest resolver
+   has nowhere to ask without it.
+
+   Verified with `STRACE=1` on QEMU `microvm`: `socket`→`bind`→two `sendto`s
+   (A+AAAA query, 29 bytes each)→`poll` returns 1 (was always 0)→two
+   `recvfrom`s (29 bytes each)→`close`, then a real answer. End to end:
+   `wget -O - http://info.cern.ch/` from inside the guest, over SSH, returns
+   the actual 646-byte page. `example.com` still fails (`wget: bad address`)
+   but for an unrelated, environment-specific reason — this build machine's own
+   DNS resolver returns `NXDOMAIN` for `example.com` (confirmed with a plain
+   host-side `nslookup`, nothing guest-specific), and the guest's own trace
+   shows it correctly receiving that same NXDOMAIN and reporting it — the fix
+   is doing the right thing with a real negative answer. 166 self-tests still
+   pass; `akuma-net`'s host suite (37 tests) is unaffected.
 
 Reference the AArch64 impls for semantics, not reuse (they are behind
 `akuma-exec`/`akuma-bkl`, which do not build for `x86_64-unknown-none`):

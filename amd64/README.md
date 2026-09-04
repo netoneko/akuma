@@ -28,16 +28,23 @@ so an **interactive `busybox sh` over SSH runs external commands**
 (`uname -a`, `echo`, …), and Stage T's step 5 (2026-09-04) wired `getdents64`,
 so **`ls` and `find` both work** — reusing the same `akuma_syscalls_linux::dirent`
 wire encoder and the `KernelFile::dir_cache` snapshot-on-first-call the AArch64
-kernel's `sys_getdents64` uses, not a hand-rolled record layout. `mkdisk.sh` now
-writes `/etc/resolv.conf` (`nameserver 10.0.2.3`, the fixed address both QEMU
-usermode net and Firecracker's `net-setup.sh` dnsmasq answer DNS on) so a guest
-resolver has somewhere to look — but hostname lookups still fail (`wget: bad
-address`, ~10s to report it, so it is trying and timing out rather than
-bailing immediately). A raw-IP request gets a real HTTP response (proven
-against `info.cern.ch`'s IP, which even 30x-redirected to a hostname the guest
-then failed to resolve), so outbound TCP/HTTP itself works end to end and the
-gap is specifically DNS-over-UDP — unexplored past this point. No writes, no
-device interrupts, and no pipelines (`a | b`) over the interactive SSH shell —
+kernel's `sys_getdents64` uses, not a hand-rolled record layout. Checking
+outbound `wget` (this target's curl — busybox's static build carries no `curl`
+applet) surfaced a real UDP bug, also fixed 2026-09-04: `sys_sendto`/
+`sys_recvfrom` never took a destination/source address (three-argument
+functions where Linux's are six), so a UDP socket with no `connect()`ed peer —
+exactly musl's stub DNS resolver's shape, which addresses every nameserver by
+hand on each `sendto` — had nowhere to send a query; and `sys_poll` hard-coded
+every socket fd as "not ready", so even a query that *did* land got a reply
+`poll` could never see. Both are now real (`akuma_net::socket::socket_send_udp`/
+`socket_recv_udp`/`socket_udp_recv_ready`, used unmodified — the "wiring, not
+implementation" pattern this whole target follows). `mkdisk.sh` also writes
+`/etc/resolv.conf` (`nameserver 10.0.2.3`, the fixed address both QEMU usermode
+net and Firecracker's `net-setup.sh` dnsmasq answer DNS on), which a guest
+resolver needs to have anywhere to ask. Net result: `wget http://info.cern.ch/`
+from inside the guest does a real DNS lookup, TCP connect and HTTP GET and
+returns the page — verified over SSH on QEMU `microvm`. No writes, no device
+interrupts, and no pipelines (`a | b`) over the interactive SSH shell —
 `sys_pipe2` (step 4) is still `ENOSYS`, seen directly as `can't create pipe: Bad
 file descriptor` from `wget ... | head`.
 

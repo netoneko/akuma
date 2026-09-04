@@ -904,9 +904,11 @@ pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
 ///
 /// Readiness is real for the fds a shell actually polls — a stdin/stdout pipe
 /// (checked non-destructively) and the console — and optimistic (always ready)
-/// for a regular file, which POSIX allows. A socket fd reports **not** ready:
-/// nothing on this target polls one, and a false `POLLIN` would send the caller
-/// into a blocking `recv`. `POLLNVAL` is not distinguished from "not ready".
+/// for a regular file, which POSIX allows. A UDP socket fd is real too (see
+/// [`poll_ready`]) — musl's stub DNS resolver polls one waiting for a reply. A
+/// TCP socket fd still reports **not** ready: nothing on this target polls a
+/// stream socket yet, and a false `POLLIN` would send the caller into a
+/// blocking `recv`. `POLLNVAL` is not distinguished from "not ready".
 ///
 /// Timeout: `< 0` waits indefinitely (yield-and-retry, so `sshd` and the
 /// netpoll daemon keep running); `0` is one non-blocking pass; `> 0` is
@@ -991,8 +993,18 @@ fn poll_ready(fd: u64) -> (bool, bool) {
     if let Some(p) = pipe_write_id(fd) {
         return (false, crate::pipe::writable(p));
     }
-    if socket_index(fd).is_some() {
-        // Not polled by anything on this target; see `sys_poll`'s note.
+    if let Some(idx) = socket_index(fd) {
+        // UDP: real readiness, via `akuma_net::socket::socket_udp_recv_ready`
+        // — needed since musl's stub DNS resolver `sendto`s a query then
+        // `poll`s the same socket for the reply, and a socket that always
+        // "isn't ready" makes every reply look like a timeout no matter how
+        // fast smoltcp actually receives it (`sys_sendto`'s doc has the rest
+        // of that bug). TCP is left at `sys_poll`'s original "not ready":
+        // nothing on this target polls a stream socket yet, so there is
+        // nothing to have gotten wrong there.
+        if akuma_net::socket::is_udp_socket(idx) {
+            return (akuma_net::socket::socket_udp_recv_ready(idx), false);
+        }
         return (false, false);
     }
     // A regular file: always ready, per POSIX.

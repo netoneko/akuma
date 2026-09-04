@@ -195,20 +195,68 @@ pub fn recv(idx: usize, buf: u64, len: u64, nonblock: bool) -> u64 {
     }
 }
 
-/// `sendto` / `recvfrom`, TCP-only: the address arguments are ignored, which is
-/// what Linux does for a connected socket.
-pub fn sys_sendto(fd: u64, buf: u64, len: u64) -> u64 {
-    match fd::socket_index(fd) {
-        Some(idx) => send(idx, buf, len, fd::is_nonblocking(fd)),
-        None => errno::ENOTSOCK,
+/// `sendto(fd, buf, len, flags, dest_addr, addrlen)`.
+///
+/// TCP: `dest_addr` is ignored, matching what Linux does on a connected
+/// socket — `send`/`sys_write` reach the same [`send`] this falls through to.
+///
+/// UDP is where this used to be wrong. A UDP socket has no peer to fall back
+/// on unless it was `connect()`ed, and musl's stub DNS resolver never does
+/// that — `__res_msend` opens one `SOCK_DGRAM` socket and addresses each
+/// nameserver by hand on every `sendto`. Until now `dest_addr` was dropped at
+/// the syscall boundary entirely (this function took three arguments), so
+/// every UDP `sendto` on an unconnected socket had nowhere to go — the
+/// `EIO`/timeout a DNS query saw was this, not a smoltcp or wiring problem one
+/// layer down. `akuma_net::socket::socket_send_udp` (used unmodified, same as
+/// the AArch64 kernel) is what actually addresses a datagram.
+///
+/// `addrlen` (Linux's 6th argument) is not available — `syscall_entry`'s
+/// register shuffle keeps only five — so the decode assumes a `sockaddr_in`'s
+/// fixed 16 bytes, which is safe because [`sys_socket`] refuses every family
+/// but `AF_INET`.
+pub fn sys_sendto(fd: u64, buf: u64, len: u64, dest_addr: u64) -> u64 {
+    use core::mem::size_of;
+
+    let Some(idx) = fd::socket_index(fd) else {
+        return errno::ENOTSOCK;
+    };
+    if dest_addr != 0 && akuma_net::socket::is_udp_socket(idx) {
+        let Some(dest) = sockaddr_in_from_user(dest_addr, size_of::<SockAddrIn>() as u64) else {
+            return errno::EINVAL;
+        };
+        let data = fd::copy_in(buf, len);
+        return match akuma_net::socket::socket_send_udp(idx, &data, dest) {
+            Ok(n) => n as u64,
+            Err(e) => net_err(e),
+        };
     }
+    send(idx, buf, len, fd::is_nonblocking(fd))
 }
 
-pub fn sys_recvfrom(fd: u64, buf: u64, len: u64) -> u64 {
-    match fd::socket_index(fd) {
-        Some(idx) => recv(idx, buf, len, fd::is_nonblocking(fd)),
-        None => errno::ENOTSOCK,
+/// `recvfrom(fd, buf, len, flags, src_addr, addrlen)`.
+///
+/// TCP: `src_addr` is left untouched, as for [`sys_sendto`]. UDP: the sender's
+/// address is written back through `akuma_net::socket::socket_recv_udp`'s
+/// returned peer — a DNS response arriving from the wrong source would
+/// otherwise be indistinguishable from a real answer, though this target's
+/// resolver support does not check it yet either. Same `addrlen`-is-unavailable
+/// note as `sys_sendto`: a non-null `src_addr` is always written the full 16
+/// bytes of a `sockaddr_in`.
+pub fn sys_recvfrom(fd: u64, buf: u64, len: u64, src_addr: u64) -> u64 {
+    let Some(idx) = fd::socket_index(fd) else {
+        return errno::ENOTSOCK;
+    };
+    if akuma_net::socket::is_udp_socket(idx) {
+        let mut data = alloc::vec![0u8; len as usize];
+        return match akuma_net::socket::socket_recv_udp(idx, &mut data, fd::is_nonblocking(fd)) {
+            Ok((n, from)) => {
+                sockaddr_in_to_user(src_addr, from);
+                fd::copy_out(buf, &data[..n]) as u64
+            }
+            Err(e) => net_err(e),
+        };
     }
+    recv(idx, buf, len, fd::is_nonblocking(fd))
 }
 
 /// `setsockopt` — accepted and mostly ignored.
