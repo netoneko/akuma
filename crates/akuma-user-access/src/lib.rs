@@ -52,16 +52,20 @@
     clippy::too_long_first_doc_paragraph,
 )]
 
+#[cfg(target_arch = "aarch64")]
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_arch = "aarch64")]
 use akuma_primitives::preempt::set_user_copy_fault_handler;
 
+#[cfg(target_arch = "aarch64")]
 unsafe extern "C" {
     fn __arch_copy_user_memory(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn __arch_copy_user_memory_bytes(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn __arch_copy_user_fault();
 }
 
+#[cfg(target_arch = "aarch64")]
 global_asm!(
     r#"
 .text
@@ -541,6 +545,7 @@ pub fn read_user_into_with<T: Copy>(
 /// **Raw primitive — prefer [`copy_from_user`].** This checks nothing: it is the
 /// copy loop plus the fault trampoline. Every remaining caller is either the safe
 /// wrapper above or a path that documents why it validates differently.
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Result<(), u64> {
     set_user_copy_fault_handler(__arch_copy_user_fault as *const () as usize as u64);
 
@@ -560,6 +565,29 @@ pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> R
     } else {
         Err(res)
     }
+}
+
+/// x86_64 stub — no fault-recovery copy mechanism exists yet on this target.
+///
+/// An isolated experiment (2026-09-05) toward building one — rewriting the
+/// faulting `rip` from an `extern "x86-interrupt" fn(&mut InterruptStackFrame,
+/// u64)` page-fault handler — redirected control to a **garbage mid-instruction
+/// address** instead of the intended recovery target, raising `#UD` rather
+/// than either working or failing safely. That rules out the naive approach;
+/// it does not yet answer what does. See
+/// `proposals/AKUMA_USER_ACCESS_ARCH_PORTABILITY.md`.
+///
+/// `unimplemented!()`, not a silent `Err(EFAULT)`: a caller reading a fake
+/// EFAULT as "the address was bad" instead of "this isn't built yet" would
+/// mask every future call site that assumes user-copy already works on this
+/// target — the exact failure shape `sgi_scheduler_handler_with_sp`'s own
+/// x86_64 stub (`akuma-threading`) already avoids for the same reason.
+#[cfg(not(target_arch = "aarch64"))]
+pub unsafe fn copy_from_user_safe(_dst: *mut u8, _src: *const u8, _len: usize) -> Result<(), u64> {
+    unimplemented!(
+        "copy_from_user_safe: no x86_64 fault-recovery copy exists yet — \
+         see proposals/AKUMA_USER_ACCESS_ARCH_PORTABILITY.md"
+    )
 }
 
 /// Copy to user memory from kernel memory safely.
@@ -595,7 +623,7 @@ pub unsafe fn copy_to_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Res
 ///
 /// Returns `(cases_checked, mismatches, first_bad_key)`, where the key packs
 /// `src_align << 32 | dst_align << 16 | len` for the first disagreement.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[must_use]
 pub fn copy_loop_differential_sweep() -> (u32, u32, u64) {
     const BUF: usize = 8192;
