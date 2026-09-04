@@ -217,7 +217,7 @@ pub fn init(ram_base: usize, ram_size: usize) {
     RAM_BASE.store(ram_base, Ordering::Release);
     RAM_SIZE.store(ram_size, Ordering::Release);
     MMU_INITIALIZED.store(true, Ordering::Release);
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     extend_boot_ram_identity_map(ram_base, ram_size);
 }
 
@@ -256,7 +256,7 @@ const BOOT_STATIC_MAP_END: usize = 0xC000_0000; // 3 GB
 /// what the boot table can reach or the window has closed. [`with_boot_identity_fdt`]
 /// is what that answer exists for: a raw boot-time read needs a *checked* mapping,
 /// not a mapping attempt.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn ensure_boot_identity_covers(addr: usize) -> bool {
     if is_initialized() {
         debug_assert!(false, "ensure_boot_identity_covers after mmu::init");
@@ -318,7 +318,7 @@ pub fn ensure_boot_identity_covers(addr: usize) -> bool {
 /// `pa` is resolved first ([`akuma_fdt::resolve`]), so a zero pointer — the
 /// "scan for QEMU virt's fixed location" case — is mapped and checked at the
 /// address that will actually be read.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn with_boot_identity_fdt<R>(pa: usize, f: impl FnOnce(Option<&akuma_fdt::Dtb<'_>>) -> R) -> R {
     let base = akuma_fdt::resolve(pa);
     if !ensure_boot_identity_covers(base) {
@@ -344,7 +344,7 @@ pub fn with_boot_identity_fdt<R>(pa: usize, f: impl FnOnce(Option<&akuma_fdt::Dt
 /// (EL1-only, matching boot.rs's L1[1]/L1[2]) so kernel-context access to any
 /// valid frame works regardless of which TTBR0 is active. Per-AS user mappings
 /// already cover full RAM via `add_kernel_mappings`; this fixes the *boot* table.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 fn extend_boot_ram_identity_map(ram_base: usize, ram_size: usize) {
     let _ = ram_base;
     let ram_end = ram_base.saturating_add(ram_size);
@@ -726,7 +726,7 @@ pub fn sync_icache_range(kva: usize, len: usize) {
 // variants broadcast the invalidation across the inner-shareable domain (all cores on
 // QEMU `virt`). Other builds keep the cheaper core-local form. The context-switch flush
 // (threading) stays local — it only needs to clear the switching core's own TLB.
-#[cfg(all(target_os = "none", kernel_smp_shared))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
 pub fn flush_tlb_all() {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::vmalle1is();
@@ -734,7 +734,7 @@ pub fn flush_tlb_all() {
     akuma_cpu::barrier::isb();
 }
 
-#[cfg(all(target_os = "none", not(kernel_smp_shared)))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
 pub fn flush_tlb_all() {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::vmalle1();
@@ -742,10 +742,10 @@ pub fn flush_tlb_all() {
     akuma_cpu::barrier::isb();
 }
 
-#[cfg(not(target_os = "none"))]
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 pub fn flush_tlb_all() {}
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn get_boot_ttbr0() -> u64 {
     unsafe {
         let addr: u64;
@@ -760,11 +760,11 @@ pub fn get_boot_ttbr0() -> u64 {
     }
 }
 
-#[cfg(not(target_os = "none"))]
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 pub fn get_boot_ttbr0() -> u64 { 0 }
 
 // Inner-shareable under shared SMP (see `flush_tlb_all`).
-#[cfg(all(target_os = "none", kernel_smp_shared))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
 pub fn flush_tlb_asid(asid: u16) {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::aside1is(asid);
@@ -772,7 +772,7 @@ pub fn flush_tlb_asid(asid: u16) {
     akuma_cpu::barrier::isb();
 }
 
-#[cfg(all(target_os = "none", not(kernel_smp_shared)))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
 pub fn flush_tlb_asid(asid: u16) {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::aside1(asid);
@@ -780,11 +780,11 @@ pub fn flush_tlb_asid(asid: u16) {
     akuma_cpu::barrier::isb();
 }
 
-#[cfg(not(target_os = "none"))]
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 pub fn flush_tlb_asid(_asid: u16) {}
 
 // Inner-shareable under shared SMP (see `flush_tlb_all`).
-#[cfg(all(target_os = "none", kernel_smp_shared))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
 pub fn flush_tlb_page(va: usize) {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::vaae1is((va >> 12) as u64);
@@ -792,7 +792,7 @@ pub fn flush_tlb_page(va: usize) {
     akuma_cpu::barrier::isb();
 }
 
-#[cfg(all(target_os = "none", not(kernel_smp_shared)))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
 pub fn flush_tlb_page(va: usize) {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::vaae1((va >> 12) as u64);
@@ -800,7 +800,7 @@ pub fn flush_tlb_page(va: usize) {
     akuma_cpu::barrier::isb();
 }
 
-#[cfg(not(target_os = "none"))]
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 pub fn flush_tlb_page(_va: usize) {}
 
 // ============================================================================
@@ -2405,7 +2405,7 @@ impl UserAddressSpace {
         // other value and false-positive.
         let _irq = IrqGuard::new();
         flush_tlb_all();
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
             let _core = publish_l0_begin(_ttbr0);
             core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _ttbr0);
@@ -2420,7 +2420,7 @@ impl UserAddressSpace {
         // Same IRQ guard as activate() — install + note must not be split.
         let _irq = IrqGuard::new();
         flush_tlb_all();
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
             let _core = publish_l0_begin(_boot_ttbr0);
             core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _boot_ttbr0);
@@ -3008,12 +3008,12 @@ pub fn protect_kernel_code() {
     boot_table_flush_sync();
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn get_current_ttbr0() -> usize {
     akuma_cpu::sysreg::ttbr0_el1() as usize
 }
 
-#[cfg(not(target_os = "none"))]
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 pub fn get_current_ttbr0() -> usize { 0 }
 
 /// Is every page of `[va_start, va_start+len)` mapped **as user memory** in the
