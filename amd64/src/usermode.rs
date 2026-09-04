@@ -652,7 +652,7 @@ impl Process {
 ///
 /// `extern "C" fn() -> !` takes no arguments, so a task entry cannot be handed
 /// its process. A slot per process is the smallest thing that works on one core.
-static mut PROCS: [Option<Process>; 5] = [None, None, None, None, None];
+static mut PROCS: [Option<Process>; 6] = [None, None, None, None, None, None];
 
 /// Enter ring 3 for process `idx`, then mark the task finished.
 ///
@@ -695,6 +695,9 @@ extern "C" fn proc3_entry() -> ! {
 }
 extern "C" fn proc4_entry() -> ! {
     run_process(4);
+}
+extern "C" fn proc5_entry() -> ! {
+    run_process(5);
 }
 
 /// Run two isolated processes concurrently and prove they interleave.
@@ -1126,6 +1129,96 @@ fn reject_test(t: &mut Suite) {
 
     t.check_eq(
         "elf: rejected loads leak nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+}
+
+/// Run the file/memory syscall probe in ring 3.
+///
+/// `fd::smoke_test` and `mm::smoke_test` call the same functions from ring 0,
+/// where a user pointer is just a pointer. This runs them across the privilege
+/// boundary through the `syscall` instruction with the real x86_64 numbers,
+/// which is the only place a wrong argument register shows up — `r10` versus
+/// `rcx` for the fourth argument in particular, which the `syscall` instruction
+/// forces and which no ring-0 test can catch.
+pub fn fdprobe_test(t: &mut Suite) {
+    /// Every bit the probe sets when the whole surface works. See its header for
+    /// what each one claims.
+    const ALL_OK: u64 = 0xFFF;
+
+    let Some(image) = crate::fs::read_file("/bin/fdprobe") else {
+        t.note("fdprobe: not on the disk; skipped", 0);
+        return;
+    };
+
+    let free_before = akuma_pmm::free_count();
+    let (proc, _img) = match Process::from_elf(&image) {
+        Ok(p) => p,
+        Err(e) => {
+            t.check("fdprobe: image loaded", false);
+            serial::puts("  fdprobe: load failed: ");
+            serial::puts(e);
+            serial::puts("\n");
+            return;
+        }
+    };
+    let root = proc.space.root();
+    // SAFETY: single core; the slot is written before the task that reads it
+    // exists.
+    unsafe {
+        let procs = &raw mut PROCS;
+        (*procs)[5] = Some(proc);
+    }
+    if !t.check(
+        "fdprobe: spawned",
+        crate::sched::spawn_in_space(proc5_entry, root).is_some(),
+    ) {
+        return;
+    }
+
+    EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
+    let mut spins = 0u64;
+    while !crate::sched::all_user_tasks_finished() && spins < 10_000 {
+        spins += 1;
+        crate::sched::yield_now();
+    }
+
+    let status = EXIT_STATUS.load(Ordering::Relaxed);
+    t.check_eq("fdprobe: every syscall claim held", status, ALL_OK);
+    if status != ALL_OK && status != u64::MAX {
+        // Name the failures individually rather than making the reader decode a
+        // 12-bit mask.
+        let claims: [(&str, u64); 12] = [
+            ("fdprobe:   openat returns a descriptor", 1 << 0),
+            ("fdprobe:   read returns the file's bytes", 1 << 1),
+            ("fdprobe:   lseek(SEEK_SET) rewinds", 1 << 2),
+            ("fdprobe:   lseek(SEEK_END) reports the size", 1 << 3),
+            ("fdprobe:   reading at EOF returns 0", 1 << 4),
+            ("fdprobe:   fstat reports the size", 1 << 5),
+            ("fdprobe:   close invalidates the descriptor", 1 << 6),
+            ("fdprobe:   a missing path is ENOENT", 1 << 7),
+            ("fdprobe:   mmap returns zeroed memory", 1 << 8),
+            ("fdprobe:   that memory holds a write", 1 << 9),
+            ("fdprobe:   munmap succeeds", 1 << 10),
+            ("fdprobe:   a file-backed mmap is refused", 1 << 11),
+        ];
+        for (label, bit) in claims {
+            t.check(label, status & bit != 0);
+        }
+    }
+
+    // SAFETY: the task has finished; nothing else touches this slot.
+    unsafe {
+        let procs = &raw mut PROCS;
+        if let Some(p) = (*procs)[5].take() {
+            p.free();
+        }
+    }
+    // The probe mmaps and munmaps, so its frames must come back too — a leak
+    // here is `mm::sys_munmap` failing to free rather than the loader.
+    t.check_eq(
+        "fdprobe: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
         free_before as u64,
     );

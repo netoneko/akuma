@@ -43,6 +43,7 @@ DEBUGFS=$(find_tool debugfs) || {
 # The guest ELF, wherever cargo put it. Built by amd64/build.rs into OUT_DIR, so
 # the path carries a hash and has to be searched for rather than spelled.
 HELLO=$(find target/x86_64-unknown-none/release/build -name hello.elf 2>/dev/null | head -1)
+FDPROBE=$(find target/x86_64-unknown-none/release/build -name fdprobe.elf 2>/dev/null | head -1)
 [ -n "$HELLO" ] || {
     echo "hello.elf not found — run 'cargo build -p akuma-amd64 --target x86_64-unknown-none --release' first" >&2
     exit 1
@@ -71,6 +72,7 @@ done
 
 "$DEBUGFS" -w -R "mkdir /bin" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $HELLO bin/hello" "$IMG" >/dev/null 2>&1
+[ -n "$FDPROBE" ] && "$DEBUGFS" -w -R "write $FDPROBE bin/fdprobe" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $TMP/probe.txt probe.txt" "$IMG" >/dev/null 2>&1
 
 echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello ($(wc -c < "$HELLO" | tr -d ' ') bytes), /probe.txt ($(wc -c < "$TMP/probe.txt" | tr -d ' ') bytes)"

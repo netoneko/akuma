@@ -201,6 +201,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // readable as a loader failure.
     lapic::start_timer();
     usermode::elf_test(&mut t);
+    usermode::fdprobe_test(&mut t);
     lapic::stop_timer();
 
     // The verdict is `#[must_use]`, and this is why: before the harness existed

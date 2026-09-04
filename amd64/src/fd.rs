@@ -5,20 +5,31 @@
 //! that closes that gap, and it is the last thing between the target and an
 //! interactive shell.
 //!
-//! # A whole-file read, not a handle
+//! # The descriptor type is `akuma-exec-core`'s, not a local one
 //!
-//! `open` reads the entire file into the heap and the descriptor holds the bytes
-//! plus a cursor. `read` and `lseek` work on that buffer; nothing goes back to
-//! the disk after the open.
+//! [`FileDescriptor`] and [`KernelFile`] come from `akuma-exec-core` — the
+//! unsafe-free core of the kernel's execution crate, which builds for
+//! `x86_64-unknown-none` behind only `akuma-primitives`, `akuma-mmap` and
+//! `akuma-syscalls-linux`. This module first defined its own `OpenFile`, which
+//! was the wrong instinct twice: it duplicated a type the tree already has, and
+//! the tree's version is *better* — it carries a `dir_cache` for `getdents64`,
+//! and it addresses a file by `(mount_id, inode)` so a `read` never re-resolves
+//! a path that could now mean a different file.
 //!
-//! That is a real limitation and worth stating rather than discovering: a file
-//! costs its own size in kernel heap for as long as it is open, so this cannot
-//! open a large file, and two descriptors on one file do not share anything. It
-//! is also exactly what `akuma_vfs::Filesystem::read_file` offers, and what a
-//! shell reading configuration and listing directories needs. A streaming
-//! handle means an inode cache and a per-descriptor block cursor, which is the
-//! layer `akuma-ext2` already has internally and does not expose — going after
-//! it here would be building a second one.
+//! `KernelFile::new(path, flags)` leaves the inode 0, which its own doc defines
+//! as "no inode: read by path". That is exactly this target's situation — there
+//! is one filesystem and no mount table — so the shared type is used in the mode
+//! it already has for the case, rather than being extended for it.
+//!
+//! # Contents are cached, and that is the local part
+//!
+//! `open` reads the whole file through `fs::read_file` and holds the bytes
+//! alongside the descriptor; `read` and `lseek` work on that buffer. The
+//! AArch64 kernel reads by inode on every call instead, backed by `akuma-ext2`'s
+//! own block cache. Doing that here needs the `VfsHooks` plumbing that lives in
+//! `akuma-exec`, which does not build for this target — so this is a stated
+//! divergence, not an oversight, and the cost is that a file occupies its own
+//! size in kernel heap while open.
 //!
 //! # The table is global
 //!
@@ -31,6 +42,7 @@
 //! operations do not care where the array lives. Stated here so that move is a
 //! relocation rather than a rewrite.
 
+use akuma_exec_core::process::{FileDescriptor, KernelFile};
 use akuma_selftest::Suite;
 use akuma_terminal::TerminalState;
 use alloc::vec::Vec;
@@ -83,13 +95,32 @@ pub const FIRST_FILE_FD: usize = 3;
 /// a leak shows up as `EMFILE` quickly rather than as steady heap growth.
 pub const MAX_OPEN: usize = 16;
 
-/// One open file: its bytes, and where the cursor is.
-struct OpenFile {
+/// One entry: the tree's descriptor, plus this target's cached contents.
+///
+/// The cursor lives in the `KernelFile`'s own `position`, not beside it — so a
+/// future move to reading by inode changes where the *bytes* come from and
+/// nothing else.
+struct Entry {
+    desc: FileDescriptor,
+    /// The file's contents, cached at `open`. See the module header.
     data: Vec<u8>,
-    pos: usize,
 }
 
-static TABLE: Spinlock<[Option<OpenFile>; MAX_OPEN]> =
+impl Entry {
+    /// The `KernelFile` inside, which every operation here needs.
+    ///
+    /// Only `FileDescriptor::File` is ever stored in this table — the console
+    /// descriptors are 0/1/2 and never enter it — so a different variant is a
+    /// bug in this module rather than a case to handle.
+    fn file(&mut self) -> Option<&mut KernelFile> {
+        match &mut self.desc {
+            FileDescriptor::File(f) => Some(f),
+            _ => None,
+        }
+    }
+}
+
+static TABLE: Spinlock<[Option<Entry>; MAX_OPEN]> =
     Spinlock::new([const { None }; MAX_OPEN]);
 
 /// Largest single `read`/`write` this kernel will accept.
@@ -136,7 +167,7 @@ fn path_from_user(ptr: u64) -> Option<alloc::string::String> {
 /// working directory to resolve against yet — so a relative path is treated as
 /// root-relative rather than rejected, which is what a shell listing `bin`
 /// expects to work.
-pub fn sys_openat(_dirfd: u64, path: u64, _flags: u64, _mode: u64) -> u64 {
+pub fn sys_openat(_dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     let Some(path) = path_from_user(path) else {
         return errno::EFAULT;
     };
@@ -154,7 +185,10 @@ pub fn sys_openat(_dirfd: u64, path: u64, _flags: u64, _mode: u64) -> u64 {
     let mut table = TABLE.lock();
     for (i, slot) in table.iter_mut().enumerate() {
         if slot.is_none() {
-            *slot = Some(OpenFile { data, pos: 0 });
+            // `KernelFile::new` leaves the inode 0 — "read by path", which is
+            // what this target does.
+            let desc = FileDescriptor::File(KernelFile::new(normalised, flags_ as u32));
+            *slot = Some(Entry { desc, data });
             return (i + FIRST_FILE_FD) as u64;
         }
     }
@@ -203,18 +237,21 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
 
     let idx = fd - FIRST_FILE_FD as u64;
     let mut table = TABLE.lock();
-    let Some(Some(file)) = table.get_mut(idx as usize) else {
+    let Some(Some(entry)) = table.get_mut(idx as usize) else {
         return errno::EBADF;
     };
-    let remaining = file.data.len().saturating_sub(file.pos);
-    let n = remaining.min(len as usize);
+    let total = entry.data.len();
+    let Some(file) = entry.file() else {
+        return errno::EBADF;
+    };
+    let pos = file.position;
+    let n = total.saturating_sub(pos).min(len as usize);
     if n == 0 {
         return 0;
     }
-    let chunk = &file.data[file.pos..file.pos + n];
-    let written = copy_to_user(buf, chunk);
-    file.pos += written;
-    written as u64
+    file.position = pos + n;
+    let chunk = &entry.data[pos..pos + n];
+    copy_to_user(buf, chunk) as u64
 }
 
 /// Read from the console, through the line discipline.
@@ -279,16 +316,20 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     }
     let idx = fd - FIRST_FILE_FD as u64;
     let mut table = TABLE.lock();
-    let Some(Some(file)) = table.get_mut(idx as usize) else {
+    let Some(Some(entry)) = table.get_mut(idx as usize) else {
+        return errno::EBADF;
+    };
+    let total = entry.data.len();
+    let Some(file) = entry.file() else {
         return errno::EBADF;
     };
     // `offset` is signed on the wire; a negative seek from SEEK_CUR/SEEK_END is
     // legal and must not be read as an enormous unsigned value.
-    let delta = offset as i64;
+    let delta = offset.cast_signed();
     let base = match whence {
         SEEK_SET => 0i64,
-        SEEK_CUR => file.pos as i64,
-        SEEK_END => file.data.len() as i64,
+        SEEK_CUR => i64::try_from(file.position).unwrap_or(i64::MAX),
+        SEEK_END => i64::try_from(total).unwrap_or(i64::MAX),
         _ => return errno::EINVAL,
     };
     let Some(target) = base.checked_add(delta) else {
@@ -298,8 +339,8 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         return errno::EINVAL;
     }
     // Seeking past the end is legal; reading there returns 0.
-    file.pos = target as usize;
-    file.pos as u64
+    file.position = target as usize;
+    file.position as u64
 }
 
 /// `fstat(fd, statbuf)` — enough of `struct stat` for a caller to learn a size.
@@ -322,10 +363,10 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     } else {
         let idx = fd - FIRST_FILE_FD as u64;
         let table = TABLE.lock();
-        let Some(Some(file)) = table.get(idx as usize) else {
+        let Some(Some(entry)) = table.get(idx as usize) else {
             return errno::EBADF;
         };
-        (REG_MODE, file.data.len() as u64)
+        (REG_MODE, entry.data.len() as u64)
     };
     st[ST_MODE..ST_MODE + 4].copy_from_slice(&mode.to_le_bytes());
     st[ST_SIZE..ST_SIZE + 8].copy_from_slice(&size.to_le_bytes());

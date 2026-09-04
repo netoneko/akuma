@@ -58,14 +58,6 @@ const PAGE_SIZE: u64 = 4096;
 /// here — the same constants the AArch64 kernel dispatches on.
 use akuma_syscalls_linux::flags::prot::{PROT_EXEC, PROT_WRITE};
 
-/// How many pages this target maps eagerly before `plan` calls a mapping lazy.
-///
-/// `usize::MAX`, because there is no lazy path: without a region table the `#PF`
-/// handler cannot know which faults to service, so every mapping must be
-/// populated at `mmap` time. Passing the real `MMAP_EAGER_MAX_PAGES` would make
-/// `plan` return `use_lazy` for a large request and this module would then have
-/// to refuse it — saying "never lazy" up front is the honest spelling.
-
 /// Where anonymous mappings start.
 ///
 /// Well above where a static binary is linked (`0x40_0000`) and well below the
@@ -81,7 +73,13 @@ static NEXT_VA: AtomicU64 = AtomicU64::new(MMAP_BASE);
 /// empty and the kernel is unrecoverable.
 const MAX_MAPPING: u64 = 64 * 1024 * 1024;
 
-/// See the note on the `prot` import: never lazy, because there is no lazy path.
+/// How many pages this target maps eagerly before `plan` calls a mapping lazy.
+///
+/// `usize::MAX`, because there is no lazy path: without a region table the `#PF`
+/// handler cannot know which faults to service, so every mapping must be
+/// populated at `mmap` time. Passing the real `MMAP_EAGER_MAX_PAGES` would make
+/// `plan` return `use_lazy` for a large request and this module would then have
+/// to refuse it — saying "never lazy" up front is the honest spelling.
 const EAGER_MAX_PAGES: usize = usize::MAX;
 
 /// `mmap(addr, len, prot, flags, fd)`.
@@ -193,7 +191,7 @@ pub fn smoke_test(t: &mut Suite) {
     );
     t.check_eq(
         "mmap: MAP_FIXED is refused",
-        sys_mmap(0x5000_0000, 4096, 3, ANON | MAP_FIXED as u64, NO_FD),
+        sys_mmap(0x5000_0000, 4096, 3, ANON | u64::from(MAP_FIXED), NO_FD),
         errno::ENOSYS,
     );
     t.check_eq(

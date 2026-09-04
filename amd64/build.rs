@@ -8,6 +8,7 @@ fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     kernel_link_args(&dir);
     build_user_program(&dir, "hello");
+    build_user_program(&dir, "fdprobe");
 }
 
 /// Pass the amd64 linker script to the bin only.

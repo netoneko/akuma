@@ -191,6 +191,53 @@ a second thing to mount. Reads only: the driver and the filesystem can both
 write, but a self-test that mutated the image would make it stateful across
 boots.
 
+## Before writing anything here, check `crates/`
+
+This target exists to *use* the tree's crates, not to re-derive them, and the
+failure mode is quiet: hand-rolled code that works is indistinguishable from
+code that had to be written. It has already happened twice — an `mmap` argument
+decode that duplicated `akuma-syscalls-mem`, and a console reader that would have
+re-invented `akuma-terminal`'s canonical mode (and hit the CR-vs-NL bug on the
+first Enter keypress). Both were caught in review rather than by a test.
+
+**Two commands, before adding a module:**
+
+```bash
+cargo build -p <crate> --target x86_64-unknown-none --release   # does it build?
+cargo tree -p akuma --target aarch64-unknown-none -e normal     # what does the real kernel use?
+```
+
+**Building is necessary, not sufficient.** `akuma-mmu` compiles for
+`x86_64-unknown-none` — it is bit arithmetic, and nothing in it is an invalid
+x86 instruction — but its own header says *"AArch64, 4 KB granule, 4-level page
+tables"*, and it manipulates AArch64 descriptors throughout. A crate that builds
+can still be wrong; read what it says it is.
+
+The kernel pulls in 38 crates this target does not. That list is the roadmap,
+and each entry has one of three reasons:
+
+| crate | why amd64 does not use it |
+|---|---|
+| `akuma-mmu`, `akuma-elf` | **Blocked.** `akuma-mmu` is AArch64 page-table format; `akuma-elf`'s mapping half is written against it. The fix is a parse/place split for the loader, and proposal item 1 for the tables |
+| `akuma-mmap` | **Blocked on item 1.** `MmapRegion.flags` is a raw AArch64 PTE `u64`; the two encodings share no field. This costs `munmap`'s clip-and-split and lazy regions |
+| `akuma-user-access` | **Cannot build.** Its copy loop is AArch64 `global_asm!` (`cbz`). `fd.rs` has its own bounded copy helpers, which is duplication with a real reason |
+| `akuma-uart`, `akuma-gic`, `akuma-psci`, `akuma-exceptions`, `akuma-el0-entry`, `akuma-entry`, `akuma-timer`, `akuma-fdt`, `akuma-firecracker` | **Different hardware.** PL011 vs a 16550 on I/O ports, GICv3 vs LAPIC, PSCI vs nothing, an FDT vs a PVH block. Genuinely arch- or machine-specific |
+| `akuma-exec`, `akuma-exec-core`, `akuma-threading`, `akuma-slot-table`, `akuma-syscalls`, `akuma-syscalls-glue`, `akuma-kernel-core`, `akuma-kernel-glue`, `akuma-vfs-glue`, `akuma-bkl` | **Not reached yet.** These are the process/exec/SMP layer. `akuma-exec-core` ("the unsafe-free core of `akuma-exec`") is the next one to reach for — it is what `execve` and a real process table would come from |
+| `akuma-net*`, `akuma-rump`, `akuma-fpcache`, `akuma-kacho`, `akuma-isolation`, `akuma-syscalls-{poll,sync,time,ipc,log}`, `akuma-boot`, `akuma-config` | **Not needed yet.** All build for `x86_64-unknown-none`; none has a consumer on this target. The four `akuma-net*` crates are the shortest of these to reach, since the host side and device discovery are already done |
+
+What amd64 *does* use, and what each replaced:
+
+| | crate | note |
+|---|---|---|
+| heap, frames | `akuma-alloc`, `akuma-pmm` | unmodified, no arch code added |
+| disk | `akuma-virtio` | unmodified; the machine facts come from `akuma-primitives::addr` |
+| filesystem | `akuma-ext2`, `akuma-vfs` | unmodified; the shim is a struct and two calls |
+| machine description | `akuma-ryzen-amd64` | written for this target, host-tested against both VMMs |
+| `mmap` decode | `akuma-syscalls-mem` | after a correction — it was hand-rolled first |
+| console line discipline | `akuma-terminal` | canonical mode, echo, `map_cr_to_nl` |
+| syscall identity | `akuma-syscalls-abi`, `akuma-syscalls-linux` | `write` is 1 here and 64 on aarch64 |
+| self-tests | `akuma-selftest` | the pass/fail tally |
+
 ## Guest programs
 
 The programs the loader runs live in `userspace/amd64/`, one directory each,

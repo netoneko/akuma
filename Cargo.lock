@@ -68,6 +68,7 @@ name = "akuma-amd64"
 version = "0.1.0"
 dependencies = [
  "akuma-alloc",
+ "akuma-exec-core",
  "akuma-ext2",
  "akuma-pmm",
  "akuma-primitives",
