@@ -70,10 +70,18 @@ const ELF_STACK_PAGES: usize = 2;
 /// The guest program, linked at [`USER_CODE_VA`] and embedded in the kernel
 /// image.
 ///
-/// `include_bytes!` because this target has no disk driver, so there is nowhere
-/// to put a file it could open by path. The path comes from `amd64/build.rs`,
-/// which compiles `userspace/amd64/hello/hello.rs` with the same `rustc` that is
-/// building this kernel.
+/// **The fallback since Stage N, not the primary.** `elf_test` reads
+/// `/bin/hello` off the ext2 root when there is one, which is the interesting
+/// case: an image the kernel opened by path, from a filesystem it mounted, on a
+/// disk it discovered. This copy is what runs when there is no disk — `DISK=none`,
+/// and every stage before Stage M — so the loader is still exercised on a
+/// machine with no storage.
+///
+/// The two are byte-identical: `amd64/build.rs` compiles the program into
+/// `OUT_DIR` and `amd64/mkdisk.sh` copies that same file into the image. That is
+/// what makes the fallback honest rather than a second, drifting program — and
+/// `elf_test` checks it, because "identical" is an assumption about two build
+/// steps agreeing.
 const HELLO_ELF: &[u8] = include_bytes!(env!("USER_HELLO_ELF"));
 
 /// Where a task's kernel stack and saved user stack live.
@@ -892,7 +900,31 @@ pub fn elf_test(t: &mut Suite) {
     // check because each fails before a frame is touched.
     reject_test(t);
 
-    let (proc, img) = match Process::from_elf(HELLO_ELF) {
+    // From the filesystem when there is one. This is the whole point of the
+    // stage: the bytes came off a disk the kernel discovered, through a
+    // filesystem it mounted, found by path — rather than out of its own `.rodata`.
+    let from_disk = crate::fs::read_file("/bin/hello");
+    let image: &[u8] = if let Some(bytes) = from_disk.as_deref() {
+        {
+            // The embedded copy and the on-disk copy come from two different
+            // build steps (`build.rs` into OUT_DIR, `mkdisk.sh` into the image).
+            // They are supposed to be the same file; asserting it is what turns
+            // that into a checked fact rather than a convention, and a mismatch
+            // would mean the image is stale — which would otherwise show up as
+            // the previous run's program silently running again.
+            t.check_eq("elf: on-disk and embedded images agree in size",
+                       bytes.len() as u64, HELLO_ELF.len() as u64);
+            t.check("elf: on-disk and embedded images are identical", bytes == HELLO_ELF);
+            serial::puts("  elf:  loading /bin/hello from ext2\n");
+            bytes
+        }
+    } else {
+        serial::puts("  elf:  no filesystem; loading the embedded image\n");
+        HELLO_ELF
+    };
+    t.check("elf: image came from the filesystem", from_disk.is_some());
+
+    let (proc, img) = match Process::from_elf(image) {
         Ok(p) => p,
         Err(e) => {
             t.check("elf: image loaded", false);
@@ -914,7 +946,7 @@ pub fn elf_test(t: &mut Suite) {
     t.check_eq(
         "elf: every PT_LOAD was placed",
         img.segments as u64,
-        count_pt_load(HELLO_ELF),
+        count_pt_load(image),
     );
     t.check(
         "elf: image ends above its entry point",
@@ -931,8 +963,8 @@ pub fn elf_test(t: &mut Suite) {
     // straight out of the image's `e_entry` field so a loader that ignored it
     // and jumped at the first segment would fail here rather than by crashing.
     let want_entry = u64::from_le_bytes([
-        HELLO_ELF[24], HELLO_ELF[25], HELLO_ELF[26], HELLO_ELF[27],
-        HELLO_ELF[28], HELLO_ELF[29], HELLO_ELF[30], HELLO_ELF[31],
+        image[24], image[25], image[26], image[27],
+        image[28], image[29], image[30], image[31],
     ]);
     t.check_eq("elf: entry point is e_entry", proc.entry, want_entry);
 

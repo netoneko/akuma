@@ -68,13 +68,16 @@ name = "akuma-amd64"
 version = "0.1.0"
 dependencies = [
  "akuma-alloc",
+ "akuma-ext2",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-ryzen-amd64",
  "akuma-selftest",
  "akuma-syscalls-abi",
+ "akuma-vfs",
  "akuma-virtio",
  "elf",
+ "spinning_top",
 ]
 
 [[package]]

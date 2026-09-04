@@ -166,41 +166,55 @@ pub fn smoke_test(t: &mut Suite, expect_disk: bool) {
     t.check("blk: capacity is non-zero", sectors.unwrap_or(0) > 0);
     t.note("blk: capacity in sectors", sectors.unwrap_or(0));
 
-    // The disk `amd64/mkdisk.py` wrote. Reading it back is what proves the whole
-    // path — descriptor ring, DMA translation, the device's own view of memory —
-    // rather than just that a driver object was constructed.
+    // Read the **ext2 superblock**, which is a structure the next layer up is
+    // about to parse rather than a pattern invented for this test.
+    //
+    // Until Stage N this read two known sectors from a raw disk built by
+    // `mkdisk.py`. That disk existed to prove the DMA path before there was a
+    // filesystem; the filesystem proves it better, and checking a real on-disk
+    // structure means this test fails for the same reason `fs::mount_root`
+    // would — which is what makes it a useful *first* failure rather than a
+    // second opinion.
     //
     // The buffer is on the kernel stack, which `boot.s` rebased into the physmap
     // (`high_entry`), so `virt_to_phys` can translate it. A buffer anywhere else
     // in the upper half would trip that function's window assertion, which is
     // the diagnostic that assertion exists for.
-    let mut buf = [0u8; 512];
+    const SB_OFFSET: u64 = 1024;
+    let mut sb = [0u8; 512];
     if !t.check(
-        "blk: read sector 0",
-        akuma_virtio::block::read_bytes(0, &mut buf).is_ok(),
+        "blk: read the ext2 superblock",
+        akuma_virtio::block::read_bytes(SB_OFFSET, &mut sb).is_ok(),
     ) {
         return;
     }
 
-    const SIG: &[u8] = b"AKUMA/amd64 blk probe";
-    t.check("blk: sector 0 carries the probe signature", buf.starts_with(SIG));
-    // Every byte after the signature is `(i * 7 + 3) & 0xff`, so a read that
-    // returned the right first bytes and then garbage — a short DMA, a
-    // descriptor length bug — fails here rather than passing.
-    let patterned = (SIG.len()..512).all(|i| buf[i] == ((i * 7 + 3) & 0xff) as u8);
-    t.check("blk: sector 0 pattern is intact to the end", patterned);
+    // s_magic, at superblock offset 56.
+    let magic = u16::from_le_bytes([sb[56], sb[57]]);
+    t.check_eq("blk: superblock magic is 0xEF53", u64::from(magic), 0xEF53);
 
-    // A sector 1 MiB in, to prove the offset reaches the device rather than
-    // being ignored: a driver that returned sector 0 for every request would
-    // pass every check above.
-    let mut far = [0u8; 512];
+    // s_blocks_count (offset 4) and s_log_block_size (offset 24) must describe
+    // a filesystem that fits the device the driver reported. A read that
+    // returned the right magic from the wrong offset would not survive this.
+    let blocks = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]);
+    let log_bs = u32::from_le_bytes([sb[24], sb[25], sb[26], sb[27]]);
+    let bytes = u64::from(blocks) << (10 + log_bs);
+    t.check(
+        "blk: the superblock describes a filesystem that fits the device",
+        bytes > 0 && bytes <= sectors.unwrap_or(0) * 512,
+    );
+    t.note("blk: filesystem size in KiB", bytes / 1024);
+
+    // The offset must actually reach the device: byte 0 is the boot block,
+    // which `mkfs.ext2` leaves zeroed, so it cannot equal the superblock. A
+    // driver that ignored the requested offset and returned block 0 for every
+    // request would pass every check above and fail this one.
+    let mut boot = [0u8; 512];
     if t.check(
-        "blk: read sector 2048 (1 MiB in)",
-        akuma_virtio::block::read_bytes(2048 * 512, &mut far).is_ok(),
+        "blk: read the boot block at offset 0",
+        akuma_virtio::block::read_bytes(0, &mut boot).is_ok(),
     ) {
-        t.check(
-            "blk: the far sector is a different sector",
-            far.starts_with(b"AKUMA/amd64 far sector") && far[..32] != buf[..32],
-        );
+        t.check("blk: offset 0 and offset 1024 differ", boot != sb);
+        t.check("blk: the boot block is zeroed", boot.iter().all(|&b| b == 0));
     }
 }

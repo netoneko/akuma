@@ -79,8 +79,10 @@ DRIVE=""
 APPEND=""
 if [ "$DISK" != "none" ]; then
     if [ -z "$DISK" ]; then
-        DISK=target/x86_64-unknown-none/release/amd64-probe.img
-        python3 "$HERE/mkdisk.py" "$DISK" 4 >/dev/null
+        # Rebuilt every run, on purpose: it contains the guest ELF that was just
+        # compiled, and a stale image would silently run the previous one.
+        DISK=target/x86_64-unknown-none/release/amd64-root.img
+        sh "$HERE/mkdisk.sh" "$DISK" 8 >/dev/null
     fi
     # `bus=virtio-mmio-bus.0` is load-bearing. QEMU fills transports from the
     # TOP down — measured with `info qtree`, a lone virtio-blk lands on bus 23 of

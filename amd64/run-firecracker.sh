@@ -36,6 +36,8 @@ TIMEOUT="${TIMEOUT:-20}"
 # "By default" is the operative phrase. v1.16.1 has `--enable-pci`, and it builds
 # a real PCIe segment — measured, see `docs/reference/firecracker-amd64/README.md`.
 # MMIO is a choice here, not a constraint the VMM imposes.
+# Defaults to the ext2 root image, rebuilt from the just-compiled guest ELF.
+# `DISK=none` boots with no drive, which is the pre-Stage-M shape and still valid.
 DISK="${DISK:-}"
 KERNEL=target/x86_64-unknown-none/release/akuma-amd64
 
@@ -48,6 +50,11 @@ scp -q -o StrictHostKeyChecking=no -i "$FC_KEY" "$KERNEL" "$FC_HOST:$FC_DIR/akum
 
 # The drives array, built here so the JSON below stays a fixed template.
 DRIVES_JSON="[]"
+if [ -z "$DISK" ]; then
+    DISK=target/x86_64-unknown-none/release/amd64-root.img
+    sh "$HERE/mkdisk.sh" "$DISK" 8 >/dev/null
+fi
+[ "$DISK" = "none" ] && DISK=""
 if [ -n "$DISK" ]; then
     [ -f "$DISK" ] || { echo "DISK=$DISK does not exist" >&2; exit 1; }
     scp -q -o StrictHostKeyChecking=no -i "$FC_KEY" "$DISK" "$FC_HOST:$FC_DIR/disk.img"

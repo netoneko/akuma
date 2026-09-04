@@ -44,6 +44,8 @@ compile_error!(
 #[cfg(target_arch = "x86_64")]
 mod blk;
 #[cfg(target_arch = "x86_64")]
+mod fs;
+#[cfg(target_arch = "x86_64")]
 mod gdt;
 #[cfg(target_arch = "x86_64")]
 mod usermode;
@@ -158,6 +160,10 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // Block devices, after the heap (the virtio HAL allocates DMA buffers from
     // it) and after the IDT (a bad transport address should fault reportably).
     let have_disk = blk::init(&machine.virtio);
+    // The filesystem, on top of that disk. Both are best-effort: a machine with
+    // no drive still boots, which is what `DISK=none` and every stage before
+    // Stage M did.
+    let have_fs = have_disk && fs::mount_root();
 
     let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
 
@@ -178,6 +184,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     }
 
     blk::smoke_test(&mut t, have_disk);
+    fs::smoke_test(&mut t, have_fs);
 
     usermode::init_syscall();
     usermode::smoke_test(&mut t);
