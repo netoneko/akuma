@@ -21,7 +21,7 @@ cd "$HERE/.."
 FC_HOST="${FC_HOST:?set FC_HOST=user@host}"
 FC_KEY="${FC_KEY:-$HOME/.ssh/id_ed25519}"
 FC_DIR="${FC_DIR:-akuma}"        # relative to the remote $HOME
-MEMORY="${MEMORY:-512}"
+MEMORY="${MEMORY:-2048}"
 VCPUS="${VCPUS:-1}"
 TIMEOUT="${TIMEOUT:-20}"
 # FC_NET=1 attaches a virtio-net device on the host tap `FC_TAP` (default tap0).

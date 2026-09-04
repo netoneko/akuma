@@ -33,10 +33,16 @@ use crate::serial;
 /// Bytes of RAM handed to the heap, taken off the top of the PMM's range.
 ///
 /// Statically sized because the PMM cannot supply it — see the ordering note
-/// above. 16 MiB is chosen to be comfortably more than the PMM's own bitmap
-/// needs (one bit per 4 KiB frame: 512 MiB of RAM costs 16 KiB of bitmap) while
-/// staying negligible against any plausible guest.
-const HEAP_SIZE: usize = 16 * 1024 * 1024;
+/// above. The PMM's own bitmap (one bit per 4 KiB frame: 512 MiB of RAM costs
+/// 16 KiB) is a rounding error here; what actually spends the heap is the
+/// scheduler's per-task kernel stacks (two 32 KiB `Vec`s each, `MAX_TASKS`
+/// never-recycled slots), a `MAX_PROC_FRAMES`-word `FrameSet` per live process,
+/// and the whole-file `Vec` `sys_openat` caches (busybox is ~1.1 MiB). 64 MiB
+/// leaves headroom for all of that with a shell forking freely. The PMM is
+/// separately capped at `PHYSMAP_LIMIT` (1 GiB — `boot.s` maps only the first
+/// GiB) whatever `mem_size_mib` the guest is given, so a bigger config buys
+/// user pages, not heap.
+const HEAP_SIZE: usize = 64 * 1024 * 1024;
 
 const PAGE_SIZE: usize = 4096;
 

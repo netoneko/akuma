@@ -58,17 +58,20 @@ const STACK_SIZE: usize = 32 * 1024;
 ///
 /// Stage Q added the netpoll daemon (one slot, whole run); Stage R added
 /// `sys_spawn`, and each `sshd` session that runs a command takes another slot.
+/// Stage T added `fork` — an interactive shell takes a **fresh** slot for every
+/// external command it runs, on top of the one for the shell itself.
 /// `sys_waitpid` recycles the child's `PROCS` slot and its frames, but **not**
-/// its scheduler task slot — so this is now the cap on how many commands one
-/// `sshd` boot can serve (~13 after the self-tests). Recycling task slots is
-/// the fix and is deliberately still not here.
+/// its scheduler task slot — so this is the cap on how many commands one `sshd`
+/// boot can serve.
 ///
 /// The right fix is recycling, and it is deliberately not this: a slot cannot
 /// be reused until its two 32 KiB stacks can be, and reclaiming those needs the
 /// scheduler to know a task's stack is no longer in use by any frame — which is
 /// a different stage. Growing the table is honest about being a bound on the
-/// boot's total task count.
-const MAX_TASKS: usize = 24;
+/// boot's total task count; 96 slots × (2 × 32 KiB stacks, leaked lazily on
+/// first use) is ~6 MiB against the 64 MiB heap, and buys an interactive shell
+/// dozens of commands before the ceiling bites.
+const MAX_TASKS: usize = 96;
 
 core::arch::global_asm!(
     r#"

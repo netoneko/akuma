@@ -63,9 +63,10 @@ needs yet.
 ```
 Akuma/amd64 — long mode reached
   hvm_start_info @ 0x0000000000001580
-  memmap: 7 entries ... usable RAM: 511 MiB
-  heap: 0x24f000 + 16 MiB ... ok
-  pmm:  126353 free frames (493 MiB)
+  memmap: 7 entries ... usable RAM: 2047 MiB
+  heap: 0x2f6000 + 64 MiB ... ok
+  pmm:  init(... size=1023 MiB)   # capped at PHYSMAP_LIMIT — boot.s maps 1 GiB
+  pmm:  245002 free frames (957 MiB)
   ...
   -- userspace output follows --
     [ring3 A] round
@@ -328,14 +329,13 @@ program that printed its verdict would have "passed" by running at all.
   and ignored; an interactive `sshd` shell gets raw bytes over its stdin pipe
   and does its own editing.
 - **Scheduler task slots do not recycle.** `waitpid` frees a reaped child's
-  process slot, frames and pipes, but not its `sched` task slot (`MAX_TASKS` =
-  24, and a `Finished` slot is never reused). The boot self-tests spend most of
-  them, so an `sshd` boot serves only a handful of commands before `spawn` /
-  `fork` returns `ENOMEM` and the shell reports *"can't fork"* / *"failed to
-  spawn"*. Each `execve` reuses the spawning task's slot, but each **`fork`**
-  takes a fresh one, so an interactive session that runs a few external
-  commands exhausts the budget quickly. Task-slot recycling is the fix and is a
-  stage of its own.
+  process slot, frames and pipes, but not its `sched` task slot — a `Finished`
+  slot stays `Finished` and its two 32 KiB stacks are never reclaimed. Each
+  `execve` reuses the spawning task's slot, but each **`fork`** takes a fresh
+  one. `MAX_TASKS` was raised to 96 (~6 MiB of lazily-leaked stacks against the
+  64 MiB heap) so an interactive shell serves dozens of external commands before
+  the ceiling bites with *"can't fork"* / *"failed to spawn"*. Actually
+  recycling the slots is the real fix and is a stage of its own.
 - **No writes to the filesystem**, and no mount table. `sshd` cannot persist its
   host key (it regenerates each boot, which it tolerates).
 - **No device interrupts.** The block driver polls the used ring; the NIC would

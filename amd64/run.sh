@@ -17,7 +17,7 @@ set -e
 HERE=$(dirname "$0")
 cd "$HERE/.."
 
-MEMORY="${MEMORY:-512}"
+MEMORY="${MEMORY:-2048}"
 KERNEL=target/x86_64-unknown-none/release/akuma-amd64
 # DISK=<path> attaches an existing image; otherwise a probe disk is generated.
 # DISK=none boots with no drive, which is the pre-Stage-M shape and still valid.

@@ -2214,6 +2214,16 @@ teardown leaves those pipes for the parent. Gate: `usermode::fork_test` runs
 `sh -c "uname; echo DONE"` (the `;` forces the fork), checks both the forked
 child's output and the parent's later builtin come back, and that nothing leaks.
 
+Three sizing knobs moved so an interactive shell can fork freely: the kernel
+heap 16 → **64 MiB** (task stacks and per-process `FrameSet`s spend it),
+`MAX_TASKS` 24 → **96** (a `Finished` slot never recycles, and every forked
+command takes one), and `MAX_PROC_FRAMES` 512 → **2048** with its buffer moved
+to the heap — an inline `[usize; 2048]` had made `Process` 16 KiB and every
+by-value move of one overflowed a 32 KiB task stack into a `#PF` that looked
+like anything but. The run-script default `mem_size_mib` is now 2048, though the
+PMM still caps at `PHYSMAP_LIMIT` (1 GiB) — a bigger guest buys user pages for
+`fork` copies, not heap.
+
 ### 3.26.5 Still ahead
 
 4. **`pipe2` (293), `dup2`/`dup3` (33/292).** `akuma-pipe` + `alloc_pipe_fd`
