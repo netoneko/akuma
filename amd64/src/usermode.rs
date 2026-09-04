@@ -341,6 +341,24 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
 
     use crate::fd::errno;
 
+    // Akuma's own syscalls, before the Linux table.
+    //
+    // They live at `0x1000 +` their AArch64 number (see `libakuma`'s
+    // `AKUMA_PRIVATE_BASE`), far above any allocated Linux number. Checking this
+    // range first is what keeps a shell's keystroke poll from dispatching into
+    // whatever Linux happens to have at 313 — `finit_module`, as it turns out.
+    const AKUMA_PRIVATE_BASE: u64 = 0x1000;
+    if nr >= AKUMA_PRIVATE_BASE {
+        return match nr - AKUMA_PRIVATE_BASE {
+            313 => crate::fd::sys_poll_input_event(a1, a2, a3),
+            // 302 `kill`, 303 `waitpid`, 301 `spawn` and the box family are not
+            // implemented here: this target has one process at a time and no
+            // `fork`. Returning ENOSYS is what makes `paws` report a command it
+            // cannot run rather than hanging on a child that never starts.
+            _ => errno::ENOSYS,
+        };
+    }
+
     let Some(call) = Syscall::from_x86_64(nr) else {
         return errno::ENOSYS;
     };

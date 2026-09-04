@@ -254,6 +254,37 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     copy_to_user(buf, chunk) as u64
 }
 
+/// Akuma's own `poll_input_event(buf, len, timeout_us)` — a **raw** keystroke.
+///
+/// Not the same path as `read(0)`, and the difference is the point.
+/// `read(0)` goes through `akuma-terminal`'s canonical mode: the kernel buffers
+/// a line, handles backspace, echoes, and returns when Enter is pressed. This
+/// returns single bytes as they arrive, unechoed, because its caller wants to do
+/// its own line editing — `paws`'s `read_line` handles backspace, Ctrl+D and
+/// echo itself, which is exactly what a shell with history and completion has to
+/// do.
+///
+/// Both are legitimate and the terminal crate has `enter_raw_mode` for precisely
+/// this split. Serving `poll_input_event` from the canonical path would make a
+/// shell wait for a whole line before it could echo the first character.
+///
+/// Blocks until a byte arrives. `timeout_us` is accepted and ignored: honouring
+/// it needs a clock read in the wait loop, and every caller today passes
+/// `u64::MAX` (wait forever). Ignoring a finite timeout would be wrong, so it is
+/// recorded here rather than silently treated as infinite — the first caller
+/// that passes one is the one that has to implement it.
+pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    loop {
+        if let Some(b) = serial::getb() {
+            return copy_to_user(buf, &[b]) as u64;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Read from the console, through the line discipline.
 ///
 /// Polls the UART, feeds each byte to `process_canon_input`, writes back

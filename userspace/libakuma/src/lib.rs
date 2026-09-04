@@ -108,7 +108,27 @@ pub mod syscall {
     /// `Syscall::from_x86_64` returns `None` for it today, and it stays outside
     /// any plausible future allocation.
     #[cfg(target_arch = "x86_64")]
+    #[allow(dead_code)] // Every call now has a number; kept for the next one that does not.
     pub const UNSUPPORTED: u64 = u64::MAX;
+
+    /// Where Akuma's **own** syscalls live on x86_64.
+    ///
+    /// `spawn`, `poll_input_event`, the terminal controls and the box family are
+    /// Akuma's, not Linux's. On AArch64 they sit at 300+, in a range the
+    /// asm-generic table leaves free. **That range is not free on x86_64** —
+    /// 300 is `getcpu`, 313 is `finit_module` — so reusing those numbers here
+    /// would dispatch a shell's keystroke poll into the module loader.
+    ///
+    /// `0x1000` is far above any allocated Linux number (the highest is in the
+    /// 460s) and leaves the AArch64 offsets visible: `POLL_INPUT_EVENT` is
+    /// `0x1000 + 313` here and `313` there, so the two tables can be read
+    /// against each other.
+    ///
+    /// This is what `crates/akuma-syscalls-abi` should own once it grows the
+    /// Akuma-private family; until then the constant lives with the numbers it
+    /// offsets.
+    #[cfg(target_arch = "x86_64")]
+    pub const AKUMA_PRIVATE_BASE: u64 = 0x1000;
 
     #[cfg(target_arch = "aarch64")]
     pub use aarch64_nr::*;
@@ -188,7 +208,7 @@ pub mod syscall {
     /// The x86_64 numbering.
     #[cfg(target_arch = "x86_64")]
     mod x86_64_nr {
-        use super::UNSUPPORTED;
+        use super::AKUMA_PRIVATE_BASE;
         pub const EXIT: u64 = 60;
         pub const READ: u64 = 0;
         pub const WRITE: u64 = 1;
@@ -217,12 +237,12 @@ pub mod syscall {
         pub const SYMLINKAT: u64 = 266;
         pub const RENAMEAT: u64 = 264;
         pub const GETRANDOM: u64 = 318;
-        pub const RESOLVE_HOST: u64 = UNSUPPORTED;
-        pub const SPAWN: u64 = UNSUPPORTED;
-        pub const KILL: u64 = UNSUPPORTED;
-        pub const WAITPID: u64 = UNSUPPORTED;
-        pub const TIME: u64 = UNSUPPORTED;
-        pub const CLOSE_CHILD_STDIN: u64 = UNSUPPORTED;
+        pub const RESOLVE_HOST: u64 = AKUMA_PRIVATE_BASE + 300;
+        pub const SPAWN: u64 = AKUMA_PRIVATE_BASE + 301;
+        pub const KILL: u64 = AKUMA_PRIVATE_BASE + 302;
+        pub const WAITPID: u64 = AKUMA_PRIVATE_BASE + 303;
+        pub const TIME: u64 = AKUMA_PRIVATE_BASE + 305;
+        pub const CLOSE_CHILD_STDIN: u64 = AKUMA_PRIVATE_BASE + 326;
         pub const CHDIR: u64 = 80;
         pub const GETCWD: u64 = 79;
         pub const FCNTL: u64 = 72;
@@ -231,26 +251,26 @@ pub mod syscall {
         pub const NEWFSTATAT: u64 = 262;
         pub const CLOCK_GETTIME: u64 = 228;
         pub const FACCESSAT2: u64 = 439;
-        pub const SET_TERMINAL_ATTRIBUTES: u64 = UNSUPPORTED;
-        pub const GET_TERMINAL_ATTRIBUTES: u64 = UNSUPPORTED;
-        pub const SET_CURSOR_POSITION: u64 = UNSUPPORTED;
-        pub const HIDE_CURSOR: u64 = UNSUPPORTED;
-        pub const SHOW_CURSOR: u64 = UNSUPPORTED;
-        pub const CLEAR_SCREEN: u64 = UNSUPPORTED;
-        pub const POLL_INPUT_EVENT: u64 = UNSUPPORTED;
-        pub const GET_CPU_STATS: u64 = UNSUPPORTED;
-        pub const SPAWN_EXT: u64 = UNSUPPORTED;
-        pub const REGISTER_BOX: u64 = UNSUPPORTED;
-        pub const KILL_BOX: u64 = UNSUPPORTED;
-        pub const REATTACH: u64 = UNSUPPORTED;
-        pub const UPTIME: u64 = UNSUPPORTED;
+        pub const SET_TERMINAL_ATTRIBUTES: u64 = AKUMA_PRIVATE_BASE + 307;
+        pub const GET_TERMINAL_ATTRIBUTES: u64 = AKUMA_PRIVATE_BASE + 308;
+        pub const SET_CURSOR_POSITION: u64 = AKUMA_PRIVATE_BASE + 309;
+        pub const HIDE_CURSOR: u64 = AKUMA_PRIVATE_BASE + 310;
+        pub const SHOW_CURSOR: u64 = AKUMA_PRIVATE_BASE + 311;
+        pub const CLEAR_SCREEN: u64 = AKUMA_PRIVATE_BASE + 312;
+        pub const POLL_INPUT_EVENT: u64 = AKUMA_PRIVATE_BASE + 313;
+        pub const GET_CPU_STATS: u64 = AKUMA_PRIVATE_BASE + 314;
+        pub const SPAWN_EXT: u64 = AKUMA_PRIVATE_BASE + 315;
+        pub const REGISTER_BOX: u64 = AKUMA_PRIVATE_BASE + 316;
+        pub const KILL_BOX: u64 = AKUMA_PRIVATE_BASE + 317;
+        pub const REATTACH: u64 = AKUMA_PRIVATE_BASE + 318;
+        pub const UPTIME: u64 = AKUMA_PRIVATE_BASE + 319;
         pub const SET_TID_ADDRESS: u64 = 218;
         pub const EXIT_GROUP: u64 = 231;
-        pub const SET_TPIDR_EL0: u64 = UNSUPPORTED;
+        pub const SET_TPIDR_EL0: u64 = AKUMA_PRIVATE_BASE + 320;
         pub const GETEUID: u64 = 107;
         pub const MOUNT: u64 = 165;
         pub const UMOUNT2: u64 = 166;
-        pub const MOUNT_IN_NS: u64 = UNSUPPORTED;
+        pub const MOUNT_IN_NS: u64 = AKUMA_PRIVATE_BASE + 325;
         pub const FCHMODAT: u64 = 268;
         pub const CLONE: u64 = 56;
         pub const WAIT4: u64 = 61;
