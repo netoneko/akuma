@@ -1741,6 +1741,7 @@ fn note_user_thread_highwater() {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 impl ThreadPool {
     /// Internal helper to spawn a user closure without marking it READY
     pub fn spawn_user_closure_initializing(
@@ -1808,6 +1809,19 @@ impl ThreadPool {
             }
         }
         Err("No free user thread slots")
+    }
+}
+
+/// x86_64 stub — `pthread_create`-style spawning is out of scope for this
+/// pass's cooperative-only switch (see [`spawn_fn`]'s x86_64 arm instead).
+#[cfg(target_arch = "x86_64")]
+impl ThreadPool {
+    pub fn spawn_user_closure_initializing(
+        &mut self,
+        _trampoline_fn: fn(*mut ()) -> !,
+        _closure_ptr: *mut (),
+    ) -> Result<usize, &'static str> {
+        Err("spawn_user_closure_initializing: not implemented on x86_64 (see proposals/AKUMA_THREADING_ARCH_PORTABILITY.md)")
     }
 }
 
@@ -2290,7 +2304,7 @@ pub use akuma_primitives::preempt::{
 /// the scheduler switches back to this idle); `stack_base`/`stack_size` describe the
 /// boot stack so `validate_current_sp` recognizes it. Must be called with IRQs masked
 /// and before this core enables interrupts.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn adopt_current_as_core_idle(
     core_id: usize,
     exc_stack_top: u64,
@@ -2340,6 +2354,18 @@ pub fn adopt_current_as_core_idle(
     THREAD_STATES[slot].store(thread_state::RUNNING, Ordering::SeqCst);
     register_core_idle(core_id, slot);
     Some(slot)
+}
+
+/// x86_64 stub — real shared-kernel SMP is out of scope for this pass (see
+/// `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md`); nothing calls this here.
+#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+pub fn adopt_current_as_core_idle(
+    _core_id: usize,
+    _exc_stack_top: u64,
+    _stack_base: usize,
+    _stack_size: usize,
+) -> Option<usize> {
+    None
 }
 
 // ============================================================================
@@ -2413,6 +2439,187 @@ unsafe extern "C" fn thread_start() -> ! { panic!("not on bare metal aarch64") }
 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 unsafe extern "C" fn thread_start_closure() -> ! { panic!("not on bare metal aarch64") }
 
+// ============================================================================
+// x86_64 context switch — cooperative only, ported from `amd64/src/sched.rs`
+// ============================================================================
+//
+// See `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md` for why this is a
+// materially simpler mechanism than the AArch64 SGI/fake-IRQ-frame switch
+// above, not a smaller version of it: a plain function-call-style switch,
+// with the callee-saved register file living on each thread's own stack
+// rather than in `Context`. `amd64/src/sched.rs`'s own `switch_context` is
+// proven — its `smoke_test` runs real cooperative+preemptive round-robin
+// scheduling today — so this is a port of that asm, not new design.
+//
+// Deliberately NOT wired into the AArch64-shaped machinery this file already
+// has for spawning (`setup_fake_irq_frame`, `init_thread_slot_context`,
+// `sgi_scheduler_handler_with_sp`): those build the fake-IRQ-return frame the
+// AArch64 exception path expects, which has no x86_64 analogue. This is a
+// second, independent switch path, reachable only through the x86_64 arms of
+// [`spawn_fn`]/[`yield_now`] added alongside it.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    r#"
+    .section .text
+.global akuma_threading_x86_switch_context
+akuma_threading_x86_switch_context:
+    /* System V: rdi = &mut old.rsp is NOT how this is called — see the Rust
+     * wrapper below, which passes raw `*mut Context`/`*const Context` whose
+     * first field is `magic`, not `rsp`. The offset is computed there so this
+     * asm never has to know the struct layout beyond "rsp is a u64 field",
+     * matching `amd64::sched::switch_context`'s own contract one level up. */
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [rdi], rsp
+    mov rsp, [rsi]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+.global akuma_threading_x86_thread_entry_trampoline
+akuma_threading_x86_thread_entry_trampoline:
+    /* Reached via the `ret` above the first time a freshly spawned thread is
+     * switched in — see `x86_build_closure_context`, which pre-loads r12 =
+     * closure_ptr and rbx = the boxed-closure trampoline fn pointer at
+     * exactly the stack slots this switch's `pop`s read them from. `jmp`,
+     * not `call`: the trampoline is `fn(*mut ()) -> !` and never returns, so
+     * there is no return address to arrange. */
+    mov rdi, r12
+    jmp rbx
+"#
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn akuma_threading_x86_switch_context(old_rsp: *mut u64, new_rsp: *const u64);
+    fn akuma_threading_x86_thread_entry_trampoline() -> !;
+}
+
+/// Save the current thread's register state onto its own stack, switch to
+/// `new`'s stack, and resume it — either at the point it last called this
+/// same function, or (for a never-yet-run thread) at
+/// [`akuma_threading_x86_thread_entry_trampoline`], per
+/// [`x86_build_closure_context`].
+///
+/// # Safety
+/// `old`/`new` must point at live [`Context`]s for threads that are not
+/// concurrently being switched by anything else — the same obligation
+/// `get_context`/`get_context_mut` already document.
+#[cfg(target_arch = "x86_64")]
+unsafe fn x86_switch_context(old: *mut Context, new: *const Context) { unsafe {
+    // `rsp` is `Context`'s only field on this target (see its doc comment in
+    // `akuma-exec-core`), so `&raw mut (*old).rsp` and a plain `u64` pointer
+    // are the same address — spelled this way so the asm above only has to
+    // know "a `u64` slot", not the whole struct.
+    akuma_threading_x86_switch_context(&raw mut (*old).rsp, &raw const (*new).rsp);
+}}
+
+/// Build the [`Context`] for a thread that has never run, so the first
+/// [`x86_switch_context`] into it starts `trampoline(closure_ptr)`.
+///
+/// Ported from `amd64::sched::Context::for_task`, generalised to pass one
+/// argument through — that file's tasks are all `extern "C" fn() -> !` with
+/// no per-task data (the three `smoke_test` workers are distinct top-level
+/// `fn`s), where `akuma-threading`'s `spawn_fn` needs to launch an arbitrary
+/// boxed `FnOnce() -> !`. `akuma_threading_x86_thread_entry_trampoline`
+/// unpacks the one argument `switch_context`'s plain `ret` cannot pass on its
+/// own: `closure_ptr` rides in r12, `trampoline` in rbx, both preserved
+/// exactly like the six real callee-saved registers because from the asm's
+/// point of view they are indistinguishable from them.
+///
+/// See `Context::for_task`'s own doc comment for why `entry_slot` sits 16
+/// bytes below `stack_top` rather than at it: System V's `rsp + 8 ≡ 0 (mod
+/// 16)` entry invariant, satisfied here because the callee this jumps to
+/// (the trampoline) is reached by `jmp`, not `call` — no return address is
+/// pushed, so the alignment `switch_context`'s `ret` leaves behind is already
+/// exactly what a normal call would have produced.
+#[cfg(target_arch = "x86_64")]
+fn x86_build_closure_context(stack_top: usize, trampoline: fn(*mut ()) -> !, closure_ptr: *mut ()) -> Context {
+    let entry_slot = (stack_top - 16) & !0xf;
+    // SAFETY: `entry_slot` and the six words below it are inside the stack
+    // the caller just allocated for this thread and nothing else has touched
+    // yet — the same obligation `amd64::sched::Context::for_task` documents.
+    unsafe {
+        let p = entry_slot as *mut u64;
+        p.write(akuma_threading_x86_thread_entry_trampoline as *const () as u64);
+        p.sub(1).write(0); // rbp
+        p.sub(2).write(trampoline as *const () as u64); // rbx
+        p.sub(3).write(closure_ptr as u64); // r12
+        p.sub(4).write(0); // r13
+        p.sub(5).write(0); // r14
+        p.sub(6).write(0); // r15
+    }
+    let mut ctx = Context::zero();
+    ctx.rsp = (entry_slot - 48) as u64;
+    ctx
+}
+
+/// Simple round-robin pick of the next `READY`/`RUNNING` slot after
+/// `from`, wrapping. Deliberately not [`ThreadPool::schedule_indices`] —
+/// that method's SMP/priority/network-thread-boost logic is real scheduling
+/// policy for the AArch64 multi-core scheduler this pass does not attempt to
+/// match; this mirrors `amd64::sched::yield_now`'s own plain scan instead,
+/// which is exactly what a single-core, cooperative-only switch needs.
+#[cfg(target_arch = "x86_64")]
+fn x86_pick_next(from: usize) -> Option<usize> {
+    for step in 1..=MAX_THREADS {
+        let candidate = (from + step) % MAX_THREADS;
+        let state = THREAD_STATES[candidate].load(Ordering::Acquire);
+        if state == thread_state::READY || state == thread_state::RUNNING {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The running thread's slot, for the x86_64 switch path only.
+///
+/// Deliberately not [`current_thread_id`]/`akuma_primitives::preempt::current_tid`:
+/// that reads `TPIDRRO_EL0`, a register `akuma-cpu` correctly stubs to always
+/// answer `0` off `aarch64` (`docs/archive/AKUMA_MMU_TARGET_ARCH_GATE_FIX.md`'s
+/// sibling fix, `preempt.rs`) — every thread would misread as "thread 0" if
+/// this path used it. x86_64 has no per-thread register free for the same
+/// trick without also claiming `IA32_FS_BASE`/`GS_BASE` (which
+/// `amd64/src/usermode.rs` already needs for userspace TLS), so this is a
+/// plain static, matching `amd64::sched`'s own `CURRENT` — correct only for
+/// the single-core, no-SMP scope this pass covers.
+#[cfg(target_arch = "x86_64")]
+static X86_CURRENT_THREAD: AtomicUsize = AtomicUsize::new(IDLE_THREAD_IDX);
+
+/// The x86_64 cooperative switch: called from [`yield_now`]'s x86_64 arm.
+///
+/// No-op if nothing else is `READY`/`RUNNING` — a lone thread calling this in
+/// a loop must make progress rather than deadlock against itself, same as
+/// `amd64::sched::yield_now`.
+#[cfg(target_arch = "x86_64")]
+fn x86_yield_now() {
+    let cur = X86_CURRENT_THREAD.load(Ordering::Acquire);
+    let Some(next) = x86_pick_next(cur) else { return };
+    if next == cur {
+        return;
+    }
+    if THREAD_STATES[cur].load(Ordering::Acquire) == thread_state::RUNNING {
+        THREAD_STATES[cur].store(thread_state::READY, Ordering::Release);
+    }
+    THREAD_STATES[next].store(thread_state::RUNNING, Ordering::Release);
+    X86_CURRENT_THREAD.store(next, Ordering::Release);
+    // SAFETY: `cur`/`next` are both valid slot indices (`x86_pick_next` only
+    // returns in-range candidates), neither is concurrently switched from
+    // anywhere else on this single-core, cooperative-only path, and `next`'s
+    // context was built either by `x86_build_closure_context` or by a
+    // previous call to this same function.
+    unsafe {
+        x86_switch_context(get_context_mut(cur), get_context(next));
+    }
+}
 
 /// Set up a fake IRQ frame on a new thread's stack
 /// 
@@ -2644,6 +2851,7 @@ impl ThreadPool {
         register_core_idle(0, IDLE_THREAD_IDX);
         
         // Initialize boot thread context in THREAD_CONTEXTS (not in slot)
+        #[cfg(target_arch = "aarch64")]
         unsafe {
             let boot_ctx = &mut *get_context_mut(IDLE_THREAD_IDX);
             boot_ctx.magic = CONTEXT_MAGIC;
@@ -2654,6 +2862,17 @@ impl ThreadPool {
             boot_ctx.user_entry = 0;
             boot_ctx.user_sp = 0;
             boot_ctx.is_user_process = 0;
+        }
+        // x86_64: `Context` is just `{ magic, rsp }`, and `rsp` for the
+        // already-running boot thread is meaningless until the first switch
+        // *away* from it saves it (same as `amd64::sched::Context::empty`'s
+        // own doc comment) — nothing to write here but the magic.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let _ = boot_ttbr0;
+            unsafe {
+                (*get_context_mut(IDLE_THREAD_IDX)).magic = CONTEXT_MAGIC;
+            }
         }
 
         // Boot stack info — bounds come from the kernel via ExecConfig because they
@@ -3429,8 +3648,17 @@ pub fn yield_now() {
             }
         }
     }
-    voluntary_schedule_flag().store(true, Ordering::Release);
-    (runtime().trigger_sgi)(0);
+    // x86_64: no SGI/interrupt-based switch exists yet (see the "x86_64
+    // context switch" section above), so this calls the cooperative switch
+    // directly and synchronously rather than through an interrupt — the
+    // same shape `amd64::sched::yield_now` already uses.
+    #[cfg(target_arch = "x86_64")]
+    x86_yield_now();
+    #[cfg(target_arch = "aarch64")]
+    {
+        voluntary_schedule_flag().store(true, Ordering::Release);
+        (runtime().trigger_sgi)(0);
+    }
 }
 
 /// Halt the calling (idle) thread until the next interrupt, AND keep CPU-time
@@ -3937,6 +4165,7 @@ pub extern "C" fn rust_switch_finished() {
 /// blockers costs only a short deferral, while trusting the state machine costs
 /// the machine if any revival route exists that the model missed.
 /// Bounded loop, no heap, no locks.
+#[cfg(target_arch = "aarch64")]
 pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
     if l0_base == 0 {
         return None;
@@ -3948,15 +4177,33 @@ pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
     })
 }
 
+/// x86_64 stub — TTBR0/L0 tracking is an AArch64 MMU concept with no x86_64
+/// analogue built yet (`akuma-mmu`'s x86_64 arm has no ASID/PCID support
+/// either, see `docs/archive/AKUMA_MMU_X86_ADDRESS_SPACE.md`). Answering
+/// "never referenced" is conservative in the caller's favor (it never blocks
+/// an L0 free on x86_64's account) and correct today: nothing on this target
+/// saves a `ttbr0`-shaped value anywhere.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn any_saved_ctx_on_l0(_l0_base: u64) -> Option<(usize, u8)> {
+    None
+}
+
 /// Test hook: swap a slot's saved-context TTBR0, returning the previous value
 /// (boot-suite self-tests only — they can't get a real thread parked with a
 /// chosen stale TTBR0 in its saved context).
 #[doc(hidden)]
+#[cfg(target_arch = "aarch64")]
 pub fn test_swap_saved_ctx_ttbr0(slot: usize, ttbr0: u64) -> u64 {
     unsafe {
         let ctx = &mut *get_context_mut(slot % MAX_THREADS);
         core::mem::replace(&mut ctx.ttbr0, ttbr0)
     }
+}
+
+#[doc(hidden)]
+#[cfg(not(target_arch = "aarch64"))]
+pub fn test_swap_saved_ctx_ttbr0(_slot: usize, _ttbr0: u64) -> u64 {
+    0
 }
 
 /// Test/diagnostic accessor: whether `tid`'s [`ON_CPU`] gate is set.
@@ -3973,7 +4220,17 @@ pub fn on_cpu_count() -> usize {
         .count()
 }
 
+/// x86_64 stub — process-thread context rewrite (execve/fork) needs the
+/// AArch64 fake-IRQ-frame trap layout `update_thread_context` writes into,
+/// which has no x86_64 counterpart in this pass's cooperative-only switch.
+/// See `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md`.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn update_thread_context(_thread_id: usize, _user_context: &UserContext) {
+    unimplemented!("update_thread_context: not implemented on x86_64")
+}
+
 /// Update a thread's context for a new execution (e.g., after execve or fork)
+#[cfg(target_arch = "aarch64")]
 pub fn update_thread_context(thread_id: usize, user_context: &UserContext) {
     // Tripwire for the SMP=4 mixed-EL corruption: a "user" context whose PC is a
     // kernel address is poison at CREATION time (the capture read a clobbered
@@ -4568,8 +4825,31 @@ where
     let closure_ptr = Box::into_raw(boxed) as *mut ();
     let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
 
-    // Step 3: Set up fake IRQ frame and context
+    // Step 3, x86_64: same shape as `spawn_fn`'s x86_64 arm — no fake IRQ
+    // frame, see the "x86_64 context switch" section above.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let stack_top = {
+            let pool = POOL.lock();
+            pool.stacks[slot_idx].top as u64
+        };
+        with_irqs_disabled(|| {
+            // SAFETY: this slot was just claimed and is not yet READY.
+            unsafe {
+                *get_context_mut(slot_idx) =
+                    x86_build_closure_context(stack_top as usize, trampoline, closure_ptr);
+            }
+            {
+                let mut pool = POOL.lock();
+                pool.slots[slot_idx].start_time_us = 0;
+            }
+            THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
+        });
+    }
+
+    // Step 3, aarch64: set up fake IRQ frame and context.
     // This enables stack-based context switching
+    #[cfg(target_arch = "aarch64")]
     with_irqs_disabled(|| {
         // Get stack info from POOL (brief lock)
         let stack_top = {
@@ -4578,7 +4858,7 @@ where
             // Initial stack top is BELOW the exception area
             ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64
         };
-        
+
         // Get STORED boot TTBR0 (not current, which could be user process's!)
         let boot_ttbr0 = mmu::get_boot_ttbr0();
 
@@ -4590,7 +4870,7 @@ where
             closure_ptr as u64,                        // x20 - closure data
             0,                                         // x21 - enable IRQs
         );
-        
+
         // Debug output
         safe_print!(128, "[spawn_system_fn SIMPLE] tid={} stack_top={:#x} irq_sp={:#x}\n",
             slot_idx, stack_top, sp);
@@ -4614,11 +4894,11 @@ where
             let mut pool = POOL.lock();
             pool.slots[slot_idx].start_time_us = 0;
         }
-        
+
         // NOW set atomic state to READY - context is fully set up, scheduler can run it
         THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
     });
-    
+
     Ok(slot_idx)
 }
 
@@ -4689,7 +4969,11 @@ where
 ///
 /// Split out of `spawn_user_thread_fn_internal` only so the reset is reachable
 /// from a host test; `#[inline]` keeps the spawn path's codegen as it was.
+///
+/// AArch64-only: both real callers are already gated the same way
+/// (`spawn_user_thread_fn_internal`'s aarch64 arm; the host test above).
 #[inline]
+#[cfg(target_arch = "aarch64")]
 fn init_thread_slot_context(
     slot_idx: usize,
     sp: u64,
@@ -4758,8 +5042,36 @@ where
     let closure_ptr = Box::into_raw(boxed) as *mut ();
     let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
 
-    // Step 3: Set up fake IRQ frame and minimal context
+    // Step 3, x86_64: no fake IRQ frame — see the "x86_64 context switch"
+    // section above. `start_irqs_disabled` (the process-thread race guard
+    // documented on `spawn_user_thread_fn_for_process`) has no analogue in
+    // this pass's cooperative-only x86_64 path and is ignored; nothing on
+    // this target calls that variant yet.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = start_irqs_disabled;
+        let stack_top = {
+            let pool = POOL.lock();
+            pool.stacks[slot_idx].top as u64
+        };
+        with_irqs_disabled(|| {
+            // SAFETY: this slot was just claimed and is not yet READY, so no
+            // switch can be reading its context concurrently.
+            unsafe {
+                *get_context_mut(slot_idx) =
+                    x86_build_closure_context(stack_top as usize, trampoline, closure_ptr);
+            }
+            {
+                let mut pool = POOL.lock();
+                pool.slots[slot_idx].start_time_us = 0;
+            }
+            THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
+        });
+    }
+
+    // Step 3, aarch64: set up fake IRQ frame and minimal context.
     // This enables stack-based context switching
+    #[cfg(target_arch = "aarch64")]
     with_irqs_disabled(|| {
         // Get stack info from POOL (brief lock)
         let stack_top = {
@@ -4768,7 +5080,7 @@ where
             // Initial stack top is BELOW the exception area
             ((stack.top - EXCEPTION_STACK_SIZE) & !0xF) as u64
         };
-        
+
         // Get STORED boot TTBR0 (not current, which could be user process's!)
         let boot_ttbr0 = mmu::get_boot_ttbr0();
 
@@ -4921,6 +5233,12 @@ pub fn current_trap_frame_elr() -> Option<u64> {
 /// docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §7.14 for
 /// why `Context.elr` itself is dead after thread creation). Prints 0 if the
 /// thread has never been switched out via the IRQ path yet (`Context.sp == 0`).
+#[cfg(target_arch = "x86_64")]
+pub fn dump_thread_resume_points() {
+    safe_print!(16, "[THR-DUMP] not implemented on x86_64\n");
+}
+
+#[cfg(target_arch = "aarch64")]
 pub fn dump_thread_resume_points() {
     safe_print!(16, "[THR-DUMP]\n");
     for tid in 0..MAX_THREADS {
@@ -5005,6 +5323,7 @@ pub fn dump_thread_resume_points() {
 /// resume point. Returns `live_elr == 0` if the thread has never been switched
 /// out via the IRQ path yet (`Context.sp == 0`). Returns `None` for out-of-range
 /// ids.
+#[cfg(target_arch = "aarch64")]
 pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
     if thread_id >= MAX_THREADS {
         return None;
@@ -5021,6 +5340,13 @@ pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
         };
         Some((ctx.x30, live_elr, ctx.sp))
     })
+}
+
+/// x86_64 stub — this diagnostic reads the AArch64 fake-IRQ-frame layout
+/// that has no counterpart in this pass's cooperative-only switch.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn get_saved_kernel_resume(_thread_id: usize) -> Option<(u64, u64, u64)> {
+    None
 }
 
 /// Count of `get_saved_user_context` calls that found no live EL0 trap frame.
@@ -5055,6 +5381,7 @@ pub fn no_trap_frame_child_count() -> u64 {
 /// instruction-abort class, `N` climbing by one per event for the whole boot
 /// (`docs/runbooks/debug-thread-spawn-segv.md`, class 2). Returning `None` fails
 /// the syscall instead, which is loud, local, and recoverable.
+#[cfg(target_arch = "aarch64")]
 pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
     if thread_id >= MAX_THREADS {
         return None;
@@ -5107,6 +5434,16 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
              stale user_entry={:#x} user_sp={:#x} is_user={} count={}\n",
             thread_id, current_thread_id(), stale_entry, stale_sp, is_user, n + 1);
     }
+    None
+}
+
+/// x86_64 stub — no fork/vfork/clone-of-a-user-process path exists yet on
+/// this target (see `update_thread_context`'s x86_64 stub), so there is
+/// never a valid child context to build. `None` is exactly what the AArch64
+/// side also returns whenever it lacks a live trap frame — the same
+/// "refuse the syscall" outcome, just always rather than conditionally.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn get_saved_user_context(_thread_id: usize) -> Option<UserContext> {
     None
 }
 
@@ -5274,8 +5611,13 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
                 thread_state::WAITING => ThreadState::Ready, // Show waiting threads
                 _ => ThreadState::Free,
             };
-            // Read SP from THREAD_CONTEXTS (not from slot)
-            sps[i] = unsafe { (*get_context(i)).sp };
+            // Read SP from THREAD_CONTEXTS (not from slot). `Context`'s
+            // stack-pointer field is named `sp` on AArch64 and `rsp` on
+            // x86_64 — see `akuma-exec-core::thread::Context`'s two arms.
+            #[cfg(target_arch = "aarch64")]
+            { sps[i] = unsafe { (*get_context(i)).sp }; }
+            #[cfg(target_arch = "x86_64")]
+            { sps[i] = unsafe { (*get_context(i)).rsp }; }
         }
 
         ThreadPoolSnapshot {
@@ -5768,6 +6110,7 @@ mod state_transition_guard_tests {
     /// - a *recycled* slot must refuse, since the triple would then be a dead
     ///   process's.
     #[test]
+    #[cfg(target_arch = "aarch64")]
     fn a_thread_with_no_trap_frame_never_yields_a_child_context() {
         crate::test_support::ensure_test_runtime();
         let tid = 40;

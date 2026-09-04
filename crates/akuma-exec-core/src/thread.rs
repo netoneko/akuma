@@ -96,7 +96,20 @@ pub struct UserTrapFrame {
     pub _padding: u64,
 }
 
-/// CPU context saved during context switch
+/// CPU context saved during context switch.
+///
+/// AArch64's shape: the whole callee-saved register file, the exception
+/// return state (`elr`/`spsr`/`daif`), the address-space root (`ttbr0`), and
+/// the published user-mode entry triple — because AArch64's switch mechanism
+/// (`akuma-threading`'s `sgi_scheduler_handler_with_sp`) restores a thread via
+/// a *fake IRQ return frame*, so this struct's field order and `#[repr(C)]`
+/// layout are load-bearing for that asm, not just documentation.
+///
+/// The `x86_64` arm below is a completely different, much smaller type with
+/// the same name — see its own doc comment for why a struct this shape is
+/// not portable, and `docs/archive/AKUMA_THREADING_GATE_FIX.md` /
+/// `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md` for the full story.
+#[cfg(target_arch = "aarch64")]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Context {
@@ -124,6 +137,7 @@ pub struct Context {
     pub is_user_process: u64,
 }
 
+#[cfg(target_arch = "aarch64")]
 impl Context {
     #[must_use]
     pub const fn zero() -> Self {
@@ -135,6 +149,43 @@ impl Context {
             ttbr0: 0,
             user_entry: 0, user_sp: 0, user_tls: 0, is_user_process: 0,
         }
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.magic == CONTEXT_MAGIC
+    }
+}
+
+/// x86_64's `Context`: one saved stack pointer, nothing else.
+///
+/// Ported from `amd64/src/sched.rs`'s own `Context` (proven — that file's
+/// `smoke_test` runs real cooperative+preemptive round-robin scheduling
+/// today). Everything the AArch64 struct carries as named fields — the
+/// callee-saved registers, the return address — lives on the task's own
+/// stack instead, pushed and popped by `akuma-threading`'s x86_64
+/// `switch_context` asm. That is not a smaller version of the AArch64
+/// mechanism; it is a materially simpler one (a plain function-call-style
+/// switch, no fake-IRQ-frame trick), which is why this pass only builds
+/// cooperative switching, not AArch64's SGI/preemption-integrated mechanism —
+/// see `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md`.
+///
+/// `magic`/`is_valid` are kept for interface parity with the AArch64 struct
+/// (nothing in this crate currently branches on them, but keeping the shape
+/// identical means callers that do check it don't need a second `cfg`).
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Context {
+    pub magic: u64,
+    pub rsp: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Context {
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self { magic: CONTEXT_MAGIC, rsp: 0 }
     }
 
     #[must_use]
@@ -373,6 +424,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "aarch64")]
     fn context_zero_all_registers_zero() {
         let ctx = Context::zero();
         assert_eq!(ctx.x19, 0);
@@ -387,6 +439,13 @@ mod tests {
         assert_eq!(ctx.user_sp, 0);
         assert_eq!(ctx.user_tls, 0);
         assert_eq!(ctx.is_user_process, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn context_zero_all_registers_zero() {
+        let ctx = Context::zero();
+        assert_eq!(ctx.rsp, 0);
     }
 
     #[test]
