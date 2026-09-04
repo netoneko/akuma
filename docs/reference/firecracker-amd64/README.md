@@ -110,7 +110,44 @@ as informative as one it accepts, so failures are captured rather than aborting.
 | `rng` / `balloon` / `pmem` / `hotplug` | boot | one token each, at `0xc0001000:5` |
 | `pci`, `block-pci`, `rng-pci` | boot | a PCIe segment; see below |
 | `vsock` | boots | (first run failed on a stale socket file, not a limit) |
-| `net` | needs a host `tap` device, which needs root |
+| `net` | boots | one token, exactly like a disk |
+| `net-dhcp` | boots | **gets a DHCP lease**: `10.0.2.15`, gateway `10.0.2.2` |
+
+## Networking, and the host side of it
+
+`amd64/net-setup.sh` gives the host a tap, DHCP and NAT **through Docker, with no
+sudo** — `--network host` puts the container in the host's network namespace, so
+an interface it creates belongs to the host and outlives the container, and
+`--cap-add=NET_ADMIN` grants exactly what `ip tuntap` and `iptables` need.
+
+Two things that cost a run each and are easy to miss:
+
+* **`--device /dev/net/tun` is required.** `--network host` shares the network
+  namespace, not `/dev`. Without it `ip tuntap add` fails with "open: No such
+  file or directory", which reads like the tap is missing and is actually the
+  control device being absent inside the container.
+* **`ip tuntap ... user <uid>`, numerically.** The container has no account for
+  the host's user, so a name fails with `invalid user "..."`.
+
+The addresses are deliberately identical to
+`overlays/devbox-firecracker/guest-setup.sh` — gateway `10.0.2.2`, guest
+`10.0.2.15` — which are QEMU's SLIRP addresses, so a guest cannot tell the three
+hosts apart.
+
+Proved with a Linux guest and in-kernel DHCP (`ip=dhcp`), so no root filesystem
+is involved:
+
+```text
+Sending DHCP requests ., OK
+IP-Config: Got DHCP answer from 10.0.2.2, my address is 10.0.2.15
+     device=eth0, hwaddr=02:fc:00:00:00:01, ipaddr=10.0.2.15, gw=10.0.2.2
+```
+
+**The NIC arrives the same way a disk does** — one `virtio_mmio.device=` token,
+dense in the same slot array, parsed by the same code. Nothing about device
+discovery has to change for networking; what is missing is kernel-side wiring of
+`akuma-net`, which already builds for `x86_64-unknown-none` (as do `akuma-net-nic`,
+`akuma-net-yarn` and `akuma-net-unix`).
 
 **Devices are dense and ordered.** Every virtio device gets a token, allocated
 from `0xc0001000` with a `0x1000` stride and an IRQ from 5 upward, in attachment

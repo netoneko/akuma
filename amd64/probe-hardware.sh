@@ -39,7 +39,8 @@ cd ~/$FC_DIR
 [ -f pmem.img ] || dd if=/dev/zero of=pmem.img bs=1M count=16 status=none
 
 emit() {
-    # \$1 = case name, \$2 = extra JSON members, \$3 = extra firecracker flags
+    # \$1 = case name, \$2 = extra JSON members, \$3 = firecracker flags,
+    # \$4 = extra kernel command-line words
     #
     # \`drives\` and \`network-interfaces\` are MANDATORY in the single-JSON path
     # even when empty (the API path defaults them; this one does not), so they
@@ -53,7 +54,7 @@ emit() {
 {
   "boot-source": {
     "kernel_image_path": "\$HOME/$FC_DIR/vmlinux",
-    "boot_args": "console=ttyS0 reboot=k panic=1"
+    "boot_args": "console=ttyS0 reboot=k panic=1 \$4"
   },
   "drives": \$_drives,
   "network-interfaces": \$_nics,
@@ -78,8 +79,13 @@ for c in $CASES; do
       block)      DRIVES="\$ONE_DISK" emit \$c "" "" ;;
       block-pci)  DRIVES="\$ONE_DISK" emit \$c "" "--enable-pci" ;;
       two-block)  DRIVES="\$TWO_DISK" emit \$c "" "" ;;
-      net)        NICS='[{"iface_id":"eth0","host_dev_name":"tap0"}]' emit \$c "" "" ;;
-      net-pci)    NICS='[{"iface_id":"eth0","host_dev_name":"tap0"}]' emit \$c "" "--enable-pci" ;;
+      # The MAC must match \`amd64/net-setup.sh\`'s \`--dhcp-host\`, or the pinned
+      # lease never matches and the guest lands somewhere unpredictable.
+      net)        NICS='[{"iface_id":"eth0","host_dev_name":"tap0","guest_mac":"02:FC:00:00:00:01"}]' emit \$c "" "" ;;
+      net-pci)    NICS='[{"iface_id":"eth0","host_dev_name":"tap0","guest_mac":"02:FC:00:00:00:01"}]' emit \$c "" "--enable-pci" ;;
+      # In-kernel DHCP (\`ip=dhcp\`, CONFIG_IP_PNP_DHCP) so the whole path — NIC,
+      # tap, dnsmasq, lease — is proved without a root filesystem.
+      net-dhcp)   NICS='[{"iface_id":"eth0","host_dev_name":"tap0","guest_mac":"02:FC:00:00:00:01"}]' emit \$c "" "" "ip=dhcp" ;;
       rng)        emit \$c ',"entropy":{}' "" ;;
       rng-pci)    emit \$c ',"entropy":{}' "--enable-pci" ;;
       # The socket file is removed first: Firecracker binds it and does not
