@@ -14,6 +14,7 @@ pub mod net;
 use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
     r#"
     .section .text._start
@@ -26,6 +27,33 @@ core::arch::global_asm!(
         // If main returns, exit with 0
         mov x0, 0
         bl exit
+    "#
+);
+
+// The same entry, for x86_64.
+//
+// Two differences beyond the mnemonics, and both bite if missed:
+//
+// * `rsp` must be 16-aligned before a `call`. AArch64's `bl` has no such rule
+//   and the aarch64 arm above needs no `and`. At process entry `rsp` points at
+//   `argc` and is already aligned, so the alignment has to happen *after* the
+//   pointer is captured, not before.
+// * `call` pushes a return address, so `libakuma_init` cannot be branched to and
+//   fallen through from — which the aarch64 arm gets away with because `bl`
+//   writes `x30` rather than memory.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    r#"
+    .section .text._start
+    .global _start
+    _start:
+        mov rdi, rsp
+        and rsp, -16
+        call libakuma_init
+        call main
+        xor edi, edi
+        call exit
+    1:  jmp 1b
     "#
 );
 
@@ -49,77 +77,184 @@ extern "C" {
 }
 
 /// Syscall numbers
+/// Syscall numbers, per architecture.
+///
+/// # Why there are two tables and not one
+///
+/// A syscall number is a fact about Linux **on a particular architecture**:
+/// `write` is 64 under the asm-generic numbering AArch64 uses and 1 on x86_64,
+/// and `0` is `io_setup` on one and `read` on the other — so a wrong table finds
+/// the *wrong handler* rather than no handler.
+///
+/// `crates/akuma-syscalls-abi` is the tree's answer to that for the **kernel**
+/// side, and it would be the right home for these too. It is not used here yet
+/// for a measured reason: it carries 19 syscalls and this module needs 65, and
+/// 21 of the missing ones are Akuma's own (`SPAWN`, `REGISTER_BOX`,
+/// `CLEAR_SCREEN`, `SET_TPIDR_EL0`) with no Linux number on any architecture.
+/// Growing that crate to cover them is worth doing and is not a prerequisite for
+/// a working port — see `docs/archive/AKUMA_FIRECRACKER_AMD64.md`.
+///
+/// # `UNSUPPORTED`
+///
+/// The Akuma-specific calls have no x86_64 number, so the x86_64 table gives
+/// them a sentinel the kernel cannot dispatch. A program that calls one on this
+/// architecture gets `-ENOSYS` at run time rather than silently invoking
+/// whatever real syscall happened to share a number — which is what picking an
+/// arbitrary free number would risk the first time Linux allocated it.
 pub mod syscall {
-    pub const EXIT: u64 = 93;
-    pub const READ: u64 = 63;
-    pub const WRITE: u64 = 64;
-    pub const WRITEV: u64 = 66;
-    pub const IOCTL: u64 = 29;
-    pub const BRK: u64 = 214;
-    pub const OPENAT: u64 = 56;
-    pub const CLOSE: u64 = 57;
-    pub const LSEEK: u64 = 62;
-    pub const FSTAT: u64 = 80;
-    pub const NANOSLEEP: u64 = 101;
-    pub const SOCKET: u64 = 198;
-    pub const BIND: u64 = 200;
-    pub const LISTEN: u64 = 201;
-    pub const ACCEPT: u64 = 202;
-    pub const CONNECT: u64 = 203;
-    pub const SENDTO: u64 = 206;
-    pub const RECVFROM: u64 = 207;
-    pub const SHUTDOWN: u64 = 210;
-    pub const MUNMAP: u64 = 215;
-    pub const MMAP: u64 = 222;
-    pub const GETDENTS64: u64 = 61;
-    pub const MKDIRAT: u64 = 34;
-    pub const STATFS: u64 = 43;
-    pub const UNLINKAT: u64 = 35;
-    pub const SYMLINKAT: u64 = 36;
-    pub const RENAMEAT: u64 = 38;
-    pub const GETRANDOM: u64 = 278;
-    // Custom syscalls
-    pub const RESOLVE_HOST: u64 = 300;
-    pub const SPAWN: u64 = 301;
-    pub const KILL: u64 = 302;
-    pub const WAITPID: u64 = 303;
-    pub const TIME: u64 = 305;
-    pub const CLOSE_CHILD_STDIN: u64 = 326;
-    pub const CHDIR: u64 = 49;
-    pub const GETCWD: u64 = 17;
-    pub const FCNTL: u64 = 25;
-    pub const PIPE2: u64 = 59;
-    pub const FACCESSAT: u64 = 48;
-    pub const NEWFSTATAT: u64 = 79;
-    pub const CLOCK_GETTIME: u64 = 113;
-    pub const FACCESSAT2: u64 = 439;
-    // New Terminal Control Syscalls
-    pub const SET_TERMINAL_ATTRIBUTES: u64 = 307;
-    pub const GET_TERMINAL_ATTRIBUTES: u64 = 308;
-    pub const SET_CURSOR_POSITION: u64 = 309;
-    pub const HIDE_CURSOR: u64 = 310;
-    pub const SHOW_CURSOR: u64 = 311;
-    pub const CLEAR_SCREEN: u64 = 312;
-    pub const POLL_INPUT_EVENT: u64 = 313;
-    pub const GET_CPU_STATS: u64 = 314;
-    pub const SPAWN_EXT: u64 = 315;
-    pub const REGISTER_BOX: u64 = 316;
-    pub const KILL_BOX: u64 = 317;
-    pub const REATTACH: u64 = 318;
-    pub const UPTIME: u64 = 319;
-    pub const SET_TID_ADDRESS: u64 = 96;
-    pub const EXIT_GROUP: u64 = 94;
-    pub const SET_TPIDR_EL0: u64 = 320;
-    // 321-323 were the framebuffer syscalls (FB_INIT/FB_DRAW/FB_INFO), removed
-    // 2026-08-31 with the whole ramfb path (docs/archive/FRAMEBUFFER_REMOVED.md).
-    // The numbers stay RESERVED kernel-side; do not reuse them here either.
-    pub const GETEUID: u64 = 175;
-    pub const MOUNT: u64 = 40;
-    pub const UMOUNT2: u64 = 39;
-    pub const MOUNT_IN_NS: u64 = 325;
-    pub const FCHMODAT: u64 = 53;
-    pub const CLONE: u64 = 220;
-    pub const WAIT4: u64 = 260;
+    /// No number on this architecture. Dispatches to nothing; returns `-ENOSYS`.
+    ///
+    /// Deliberately enormous rather than merely unassigned: the kernel's
+    /// `Syscall::from_x86_64` returns `None` for it today, and it stays outside
+    /// any plausible future allocation.
+    #[cfg(target_arch = "x86_64")]
+    pub const UNSUPPORTED: u64 = u64::MAX;
+
+    #[cfg(target_arch = "aarch64")]
+    pub use aarch64_nr::*;
+    #[cfg(target_arch = "x86_64")]
+    pub use x86_64_nr::*;
+
+    /// The asm-generic numbering, unchanged since before the port.
+    #[cfg(target_arch = "aarch64")]
+    mod aarch64_nr {
+        pub const EXIT: u64 = 93;
+        pub const READ: u64 = 63;
+        pub const WRITE: u64 = 64;
+        pub const WRITEV: u64 = 66;
+        pub const IOCTL: u64 = 29;
+        pub const BRK: u64 = 214;
+        pub const OPENAT: u64 = 56;
+        pub const CLOSE: u64 = 57;
+        pub const LSEEK: u64 = 62;
+        pub const FSTAT: u64 = 80;
+        pub const NANOSLEEP: u64 = 101;
+        pub const SOCKET: u64 = 198;
+        pub const BIND: u64 = 200;
+        pub const LISTEN: u64 = 201;
+        pub const ACCEPT: u64 = 202;
+        pub const CONNECT: u64 = 203;
+        pub const SENDTO: u64 = 206;
+        pub const RECVFROM: u64 = 207;
+        pub const SHUTDOWN: u64 = 210;
+        pub const MUNMAP: u64 = 215;
+        pub const MMAP: u64 = 222;
+        pub const GETDENTS64: u64 = 61;
+        pub const MKDIRAT: u64 = 34;
+        pub const STATFS: u64 = 43;
+        pub const UNLINKAT: u64 = 35;
+        pub const SYMLINKAT: u64 = 36;
+        pub const RENAMEAT: u64 = 38;
+        pub const GETRANDOM: u64 = 278;
+        pub const RESOLVE_HOST: u64 = 300;
+        pub const SPAWN: u64 = 301;
+        pub const KILL: u64 = 302;
+        pub const WAITPID: u64 = 303;
+        pub const TIME: u64 = 305;
+        pub const CLOSE_CHILD_STDIN: u64 = 326;
+        pub const CHDIR: u64 = 49;
+        pub const GETCWD: u64 = 17;
+        pub const FCNTL: u64 = 25;
+        pub const PIPE2: u64 = 59;
+        pub const FACCESSAT: u64 = 48;
+        pub const NEWFSTATAT: u64 = 79;
+        pub const CLOCK_GETTIME: u64 = 113;
+        pub const FACCESSAT2: u64 = 439;
+        pub const SET_TERMINAL_ATTRIBUTES: u64 = 307;
+        pub const GET_TERMINAL_ATTRIBUTES: u64 = 308;
+        pub const SET_CURSOR_POSITION: u64 = 309;
+        pub const HIDE_CURSOR: u64 = 310;
+        pub const SHOW_CURSOR: u64 = 311;
+        pub const CLEAR_SCREEN: u64 = 312;
+        pub const POLL_INPUT_EVENT: u64 = 313;
+        pub const GET_CPU_STATS: u64 = 314;
+        pub const SPAWN_EXT: u64 = 315;
+        pub const REGISTER_BOX: u64 = 316;
+        pub const KILL_BOX: u64 = 317;
+        pub const REATTACH: u64 = 318;
+        pub const UPTIME: u64 = 319;
+        pub const SET_TID_ADDRESS: u64 = 96;
+        pub const EXIT_GROUP: u64 = 94;
+        pub const SET_TPIDR_EL0: u64 = 320;
+        pub const GETEUID: u64 = 175;
+        pub const MOUNT: u64 = 40;
+        pub const UMOUNT2: u64 = 39;
+        pub const MOUNT_IN_NS: u64 = 325;
+        pub const FCHMODAT: u64 = 53;
+        pub const CLONE: u64 = 220;
+        pub const WAIT4: u64 = 260;
+    }
+
+    /// The x86_64 numbering.
+    #[cfg(target_arch = "x86_64")]
+    mod x86_64_nr {
+        use super::UNSUPPORTED;
+        pub const EXIT: u64 = 60;
+        pub const READ: u64 = 0;
+        pub const WRITE: u64 = 1;
+        pub const WRITEV: u64 = 20;
+        pub const IOCTL: u64 = 16;
+        pub const BRK: u64 = 12;
+        pub const OPENAT: u64 = 257;
+        pub const CLOSE: u64 = 3;
+        pub const LSEEK: u64 = 8;
+        pub const FSTAT: u64 = 5;
+        pub const NANOSLEEP: u64 = 35;
+        pub const SOCKET: u64 = 41;
+        pub const BIND: u64 = 49;
+        pub const LISTEN: u64 = 50;
+        pub const ACCEPT: u64 = 43;
+        pub const CONNECT: u64 = 42;
+        pub const SENDTO: u64 = 44;
+        pub const RECVFROM: u64 = 45;
+        pub const SHUTDOWN: u64 = 48;
+        pub const MUNMAP: u64 = 11;
+        pub const MMAP: u64 = 9;
+        pub const GETDENTS64: u64 = 217;
+        pub const MKDIRAT: u64 = 258;
+        pub const STATFS: u64 = 137;
+        pub const UNLINKAT: u64 = 263;
+        pub const SYMLINKAT: u64 = 266;
+        pub const RENAMEAT: u64 = 264;
+        pub const GETRANDOM: u64 = 318;
+        pub const RESOLVE_HOST: u64 = UNSUPPORTED;
+        pub const SPAWN: u64 = UNSUPPORTED;
+        pub const KILL: u64 = UNSUPPORTED;
+        pub const WAITPID: u64 = UNSUPPORTED;
+        pub const TIME: u64 = UNSUPPORTED;
+        pub const CLOSE_CHILD_STDIN: u64 = UNSUPPORTED;
+        pub const CHDIR: u64 = 80;
+        pub const GETCWD: u64 = 79;
+        pub const FCNTL: u64 = 72;
+        pub const PIPE2: u64 = 293;
+        pub const FACCESSAT: u64 = 269;
+        pub const NEWFSTATAT: u64 = 262;
+        pub const CLOCK_GETTIME: u64 = 228;
+        pub const FACCESSAT2: u64 = 439;
+        pub const SET_TERMINAL_ATTRIBUTES: u64 = UNSUPPORTED;
+        pub const GET_TERMINAL_ATTRIBUTES: u64 = UNSUPPORTED;
+        pub const SET_CURSOR_POSITION: u64 = UNSUPPORTED;
+        pub const HIDE_CURSOR: u64 = UNSUPPORTED;
+        pub const SHOW_CURSOR: u64 = UNSUPPORTED;
+        pub const CLEAR_SCREEN: u64 = UNSUPPORTED;
+        pub const POLL_INPUT_EVENT: u64 = UNSUPPORTED;
+        pub const GET_CPU_STATS: u64 = UNSUPPORTED;
+        pub const SPAWN_EXT: u64 = UNSUPPORTED;
+        pub const REGISTER_BOX: u64 = UNSUPPORTED;
+        pub const KILL_BOX: u64 = UNSUPPORTED;
+        pub const REATTACH: u64 = UNSUPPORTED;
+        pub const UPTIME: u64 = UNSUPPORTED;
+        pub const SET_TID_ADDRESS: u64 = 218;
+        pub const EXIT_GROUP: u64 = 231;
+        pub const SET_TPIDR_EL0: u64 = UNSUPPORTED;
+        pub const GETEUID: u64 = 107;
+        pub const MOUNT: u64 = 165;
+        pub const UMOUNT2: u64 = 166;
+        pub const MOUNT_IN_NS: u64 = UNSUPPORTED;
+        pub const FCHMODAT: u64 = 268;
+        pub const CLONE: u64 = 56;
+        pub const WAIT4: u64 = 61;
+    }
 }
 
 /// Thread CPU statistics for top command
@@ -235,17 +370,10 @@ pub fn getcwd() -> &'static str {
     static CWD_LOCK: Spinlock<[u8; 256]> = Spinlock::new([0u8; 256]);
     let mut guard = CWD_LOCK.lock();
     let buf_ptr = guard.as_mut_ptr();
-    let result: i64;
-    unsafe {
-        asm!(
-            "svc #0",
-            in("x8") syscall::GETCWD,
-            in("x0") buf_ptr,
-            in("x1") 256usize,
-            lateout("x0") result,
-            options(nostack)
-        );
-    }
+    // Through `syscall` rather than its own `asm!`: this had no reason to be a
+    // fourth copy of the instruction, and being one is what would have made it a
+    // fourth place to port.
+    let result = syscall(syscall::GETCWD, buf_ptr as u64, 256, 0, 0, 0, 0) as i64;
     if result <= 0 {
         return "/";
     }
@@ -263,16 +391,7 @@ pub fn getcwd() -> &'static str {
 /// Returns 0 on success, negative errno on failure.
 pub fn chdir(path: &str) -> i32 {
     let path_c = alloc::format!("{}\0", path);
-    let result: i64;
-    unsafe {
-        asm!(
-            "svc #0",
-            in("x8") syscall::CHDIR,
-            in("x0") path_c.as_ptr(),
-            lateout("x0") result,
-            options(nostack)
-        );
-    }
+    let result = syscall(syscall::CHDIR, path_c.as_ptr() as u64, 0, 0, 0, 0, 0) as i64;
     result as i32
 }
 
@@ -466,6 +585,7 @@ pub fn env_all() -> EnvVars {
 /// - x8: syscall number
 /// - x0-x5: arguments
 /// - x0: return value
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub fn syscall(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     let ret: u64;
@@ -485,13 +605,51 @@ pub fn syscall(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
     ret
 }
 
+/// The same call, for x86_64.
+///
+/// `r10` carries the fourth argument, **not `rcx`**: the `syscall` instruction
+/// puts the return address in `rcx`, which is precisely why the Linux syscall
+/// ABI diverges from System V at that position. A port that used `rcx` here
+/// would work for every syscall taking three arguments or fewer and then read
+/// garbage on `openat` — the classic version of this bug.
+///
+/// `rcx` and `r11` are declared `lateout` for the same reason: the instruction
+/// destroys both, and omitting them lets the compiler keep a live value in
+/// either across the call.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn syscall(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") num => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            in("r8") a4,
+            in("r9") a5,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
+    ret
+}
+
 /// Exit the program with the given status code
 #[no_mangle]
 pub extern "C" fn exit(code: i32) -> ! {
     syscall(syscall::EXIT, code as u64, 0, 0, 0, 0, 0);
-    // Should not reach here, but just in case
+    // Should not reach here, but just in case.
+    //
+    // `spin_loop`, not `wfi`: this is *userspace*, and `wfi` is a privileged
+    // hint even on AArch64 — it happened to be tolerated rather than being
+    // right. The portable intrinsic emits `yield` on AArch64 and `pause` on
+    // x86_64, which is what this loop actually wants.
     loop {
-        unsafe { asm!("wfi") };
+        core::hint::spin_loop();
     }
 }
 
@@ -608,7 +766,7 @@ pub fn munmap(addr: usize, len: usize) -> isize {
 ///
 /// CRITICAL: We use mov+svc to avoid inout on x0, which ensures the compiler
 /// knows x0 is clobbered and will save/restore any important values.
-#[cfg(not(feature = "chunked-allocator"))]
+#[cfg(all(not(feature = "chunked-allocator"), target_arch = "aarch64"))]
 #[inline(never)] // Prevent inlining to ensure proper call/return semantics
 fn munmap_void(addr: usize, len: usize) {
     unsafe {
@@ -633,6 +791,19 @@ fn munmap_void(addr: usize, len: usize) {
             options(nostack)
         );
     }
+}
+
+/// The x86_64 counterpart, which needs none of the ceremony above.
+///
+/// The aarch64 version exists to force `x0` to be treated as clobbered — its
+/// comment explains that `inout` on `x0` was not enough. On x86_64 the result
+/// register is `rax` and `syscall`'s clobbers (`rcx`, `r11`) are already
+/// declared in [`syscall`], so the ordinary path is correct and a second
+/// hand-rolled form would only be a second thing to get wrong.
+#[cfg(all(not(feature = "chunked-allocator"), target_arch = "x86_64"))]
+#[inline(never)]
+fn munmap_void(addr: usize, len: usize) {
+    let _ = syscall(syscall::MUNMAP, addr as u64, len as u64, 0, 0, 0, 0);
 }
 
 /// Sleep for the specified number of seconds

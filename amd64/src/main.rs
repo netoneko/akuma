@@ -206,10 +206,19 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 
     // The verdict is `#[must_use]`, and this is why: before the harness existed
     // a `[FAIL]` printed and the boot went on to announce success.
-    if t.report() {
+    let passed = t.report();
+    if passed {
         serial::puts("Akuma/amd64 — all self-tests passed\n");
     } else {
         serial::puts("Akuma/amd64 — SELF-TESTS FAILED\n");
+    }
+
+    // Hand the console to a shell, if one is on the disk. After the verdict, so
+    // an interactive session never hides a failing boot — and only on a passing
+    // one, because a shell on a kernel whose own tests failed is a way to spend
+    // an hour debugging the wrong layer.
+    if passed && have_fs {
+        usermode::run_shell();
     }
 
     halt();

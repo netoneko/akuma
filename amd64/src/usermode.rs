@@ -652,7 +652,7 @@ impl Process {
 ///
 /// `extern "C" fn() -> !` takes no arguments, so a task entry cannot be handed
 /// its process. A slot per process is the smallest thing that works on one core.
-static mut PROCS: [Option<Process>; 6] = [None, None, None, None, None, None];
+static mut PROCS: [Option<Process>; 7] = [None, None, None, None, None, None, None];
 
 /// Enter ring 3 for process `idx`, then mark the task finished.
 ///
@@ -698,6 +698,9 @@ extern "C" fn proc4_entry() -> ! {
 }
 extern "C" fn proc5_entry() -> ! {
     run_process(5);
+}
+extern "C" fn proc6_entry() -> ! {
+    run_process(6);
 }
 
 /// Run two isolated processes concurrently and prove they interleave.
@@ -1222,4 +1225,50 @@ pub fn fdprobe_test(t: &mut Suite) {
         akuma_pmm::free_count() as u64,
         free_before as u64,
     );
+}
+
+/// Load `/bin/paws` and give it the console.
+///
+/// Not a self-test — it never returns while the shell is running, and it blocks
+/// on the UART waiting for a keystroke. It is the last thing the boot does, and
+/// only when the binary is on the disk, so a machine without it still reaches
+/// the "all self-tests passed" line and halts as before.
+///
+/// This is the same `paws` the aarch64 devbox runs, compiled for
+/// `x86_64-unknown-none` against a ported `libakuma`. Its stdin is the 16550
+/// through `akuma-terminal`'s canonical mode, which is what makes a line of
+/// typing arrive as a line.
+pub fn run_shell() -> bool {
+    let Some(image) = crate::fs::read_file("/bin/paws") else {
+        return false;
+    };
+    let (proc, _img) = match Process::from_elf(&image) {
+        Ok(p) => p,
+        Err(e) => {
+            serial::puts("  [shell] /bin/paws failed to load: ");
+            serial::puts(e);
+            serial::puts("\n");
+            return false;
+        }
+    };
+    let root = proc.space.root();
+    // SAFETY: single core; the slot is written before the task that reads it
+    // exists.
+    unsafe {
+        let procs = &raw mut PROCS;
+        (*procs)[6] = Some(proc);
+    }
+    if crate::sched::spawn_in_space(proc6_entry, root).is_none() {
+        serial::puts("  [shell] no task slot for the shell\n");
+        return false;
+    }
+    serial::puts("\n-- /bin/paws on the console; type `exit` or Ctrl+D to stop --\n");
+    // Drive the round-robin from the boot task. Unbounded on purpose: a shell
+    // runs until it exits, and the spin cap the self-tests use would kill it
+    // mid-session.
+    while !crate::sched::all_user_tasks_finished() {
+        crate::sched::yield_now();
+    }
+    serial::puts("\n-- shell exited --\n");
+    true
 }

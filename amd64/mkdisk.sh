@@ -49,6 +49,15 @@ FDPROBE=$(find target/x86_64-unknown-none/release/build -name fdprobe.elf 2>/dev
     exit 1
 }
 
+# paws, the shell. Built here rather than by `userspace/build.sh`, which targets
+# aarch64-musl: this is the same source compiled for `x86_64-unknown-none`
+# against the ported `libakuma`. Best-effort — a tree where paws does not build
+# still gets a bootable image with the probes on it.
+PAWS=""
+if (cd userspace && cargo build -q -p paws --target x86_64-unknown-none --release 2>/dev/null); then
+    PAWS=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name paws -type f | head -1)
+fi
+
 mkdir -p "$(dirname "$IMG")"
 rm -f "$IMG"
 
@@ -73,6 +82,7 @@ done
 "$DEBUGFS" -w -R "mkdir /bin" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $HELLO bin/hello" "$IMG" >/dev/null 2>&1
 [ -n "$FDPROBE" ] && "$DEBUGFS" -w -R "write $FDPROBE bin/fdprobe" "$IMG" >/dev/null 2>&1
+[ -n "$PAWS" ] && "$DEBUGFS" -w -R "write $PAWS bin/paws" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $TMP/probe.txt probe.txt" "$IMG" >/dev/null 2>&1
 
-echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello ($(wc -c < "$HELLO" | tr -d ' ') bytes), /probe.txt ($(wc -c < "$TMP/probe.txt" | tr -d ' ') bytes)"
+echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")"
