@@ -330,11 +330,12 @@ program that printed its verdict would have "passed" by running at all.
 - **Scheduler task slots do not recycle.** `waitpid` frees a reaped child's
   process slot, frames and pipes, but not its `sched` task slot (`MAX_TASKS` =
   24, and a `Finished` slot is never reused). The boot self-tests spend most of
-  them, so with `SSHD_SHELL=/bin/sh` a single `sshd` boot serves ~9
-  `ssh … '<cmd>'` exec sessions before `spawn` returns `ENOMEM` and sshd reports
-  *"failed to spawn"*. Task-slot recycling is the fix and is a stage of its own.
-  `execve` reuses the spawning task's slot rather than taking a new one, so it
-  does not make this worse per session.
+  them, so an `sshd` boot serves only a handful of commands before `spawn` /
+  `fork` returns `ENOMEM` and the shell reports *"can't fork"* / *"failed to
+  spawn"*. Each `execve` reuses the spawning task's slot, but each **`fork`**
+  takes a fresh one, so an interactive session that runs a few external
+  commands exhausts the budget quickly. Task-slot recycling is the fix and is a
+  stage of its own.
 - **No writes to the filesystem**, and no mount table. `sshd` cannot persist its
   host key (it regenerates each boot, which it tolerates).
 - **No device interrupts.** The block driver polls the used ring; the NIC would

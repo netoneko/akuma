@@ -83,33 +83,59 @@ const AT_NULL: u64 = 0;
 const AT_PAGESZ: u64 = 6;
 const AT_ENTRY: u64 = 9;
 
-/// How many frames one process may own — image, stack and all.
+/// How many frames one process may own.
 ///
 /// A fixed array rather than a `Vec`: this is teardown bookkeeping on a path
 /// that runs under memory pressure, and the kernel's own rule is that the best
-/// code allocates nothing. It has to cover image + stack for the largest
-/// program the loader runs: static musl **busybox** is ~275 pages of segments
-/// plus the 128-page stack (`ELF_STACK_PAGES`), so 512 leaves headroom. This
-/// `[usize; 512]` per `Process` (16 slots = 64 KiB of `.bss`) is exactly the
-/// dead weight a region list would replace, and is on the deferred-audit list
-/// (`AKUMA_FIRECRACKER_AMD64.md` §3.24.5). `mmap`/heap frames are not tracked
-/// here — they are leaked on teardown, deliberately (`mm.rs`).
-pub const MAX_PROC_FRAMES: usize = 512;
+/// code allocates nothing.
+///
+/// For a loader-built process this only has to cover **image + stack** — static
+/// musl busybox is ~275 pages of segments plus the 128-page stack — and its
+/// `mmap`/heap frames are tracked separately (`mm::release_anon_frames`).
+///
+/// But a **`fork`** child's `FrameSet` holds a copy of *every* mapped user page
+/// — image, stack, heap and all (`Process::fork_from`) — because there is no
+/// CoW and teardown must find them. A long-lived interactive shell can map well
+/// past 512 pages, and hitting the cap makes `fork` return `ENOMEM` (the user
+/// sees `sh: can't fork: Out of memory` on a box with 500 MiB free). 2048
+/// covers busybox plus a generous heap; the buffer is heap-allocated (see
+/// [`FrameSet`]), so raising this only costs 8 bytes/entry per live process. A
+/// CoW `fork` plus the region list this array stands in for removes the cap
+/// entirely (§3.26.5).
+pub const MAX_PROC_FRAMES: usize = 2048;
 
 /// Every physical frame a process owns, so teardown can give them all back.
 ///
 /// `AddressSpace::free` releases page *tables*, not the pages they point at —
 /// deliberately, since the tables are its own and the leaves are the caller's.
 /// This is that caller's half of the bargain.
+///
+/// The `MAX_PROC_FRAMES`-word buffer lives on the **heap** (a boxed slice), not
+/// inline: at `[usize; 2048]` an inline array made `Process` 16 KiB, and every
+/// by-value move of one — `Process::new` returning two into a tuple,
+/// `fork_from` returning `Option<Process>` on a 32 KiB task stack — overflowed
+/// the stack into a `#PF` that looked like anything but. One 16 KiB heap block
+/// per live process is the fix; teardown reads it and never allocates.
 pub struct FrameSet {
-    frames: [usize; MAX_PROC_FRAMES],
+    frames: alloc::boxed::Box<[usize]>,
     len: usize,
+}
+
+impl Default for FrameSet {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FrameSet {
     #[must_use]
-    pub const fn new() -> Self {
-        Self { frames: [0; MAX_PROC_FRAMES], len: 0 }
+    pub fn new() -> Self {
+        // A repeat `vec!` allocates and fills on the heap directly — no
+        // MAX_PROC_FRAMES-word stack temporary on the way to the box.
+        Self {
+            frames: alloc::vec![0usize; MAX_PROC_FRAMES].into_boxed_slice(),
+            len: 0,
+        }
     }
 
     /// Record a frame. Returns false when full, which the caller must treat as

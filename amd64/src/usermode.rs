@@ -1189,9 +1189,14 @@ impl Process {
     }
 
     fn free(mut self) {
-        // Anonymous `mmap` frames first — they are not in `self.frames` (no
-        // region table yet) and the walk needs the page tables still standing.
-        crate::mm::release_anon_frames(&self.space);
+        // A `fork` child's `FrameSet` already holds *every* mapped page,
+        // anonymous ones included (`fork_from` copied them). A loader-built
+        // process's does not — its `mmap`/heap frames are untracked, so walk
+        // the mmap window and free them before the tables go. Running that walk
+        // for a `fork` child would double-free.
+        if !self.forked {
+            crate::mm::release_anon_frames(&self.space);
+        }
         self.frames.free_all();
         self.space.free();
     }
