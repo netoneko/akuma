@@ -78,6 +78,8 @@ pub fn init_console() {
 /// Linux errno values, negated as the kernel ABI returns them.
 pub mod errno {
     pub const EBADF: u64 = (-9i64) as u64;
+    pub const ENOTSOCK: u64 = (-88i64) as u64;
+    pub const EAFNOSUPPORT: u64 = (-97i64) as u64;
     pub const ENOENT: u64 = (-2i64) as u64;
     pub const EFAULT: u64 = (-14i64) as u64;
     pub const EINVAL: u64 = (-22i64) as u64;
@@ -104,6 +106,50 @@ struct Entry {
     desc: FileDescriptor,
     /// The file's contents, cached at `open`. See the module header.
     data: Vec<u8>,
+}
+
+/// Allocate a descriptor for an already-created socket.
+///
+/// Sockets live in the same table as files, as `FileDescriptor::Socket(idx)` —
+/// the same variant the AArch64 kernel uses, carrying the same index into the
+/// same `akuma_net::socket` table. Sharing the table is what makes `read` and
+/// `write` work on a socket without the caller knowing.
+pub fn alloc_socket_fd(idx: usize) -> Option<u64> {
+    let mut table = TABLE.lock();
+    for (i, slot) in table.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(Entry { desc: FileDescriptor::Socket(idx), data: Vec::new() });
+            return Some((i + FIRST_FILE_FD) as u64);
+        }
+    }
+    None
+}
+
+/// The socket index behind `fd`, or `None` if it is not a socket.
+#[must_use]
+pub fn socket_index(fd: u64) -> Option<usize> {
+    let idx = fd.checked_sub(FIRST_FILE_FD as u64)?;
+    let table = TABLE.lock();
+    match table.get(idx as usize)? {
+        Some(Entry { desc: FileDescriptor::Socket(s), .. }) => Some(*s),
+        _ => None,
+    }
+}
+
+/// Copy `len` bytes in from a user pointer. Public for `sock`.
+#[must_use]
+pub fn copy_in(ptr: u64, len: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        // SAFETY: the same user-pointer contract as every other access here.
+        out.push(unsafe { (ptr as *const u8).add(i as usize).read_volatile() });
+    }
+    out
+}
+
+/// Copy out to a user pointer. Public for `sock`.
+pub fn copy_out(ptr: u64, src: &[u8]) -> usize {
+    copy_to_user(ptr, src)
 }
 
 impl Entry {
@@ -204,14 +250,20 @@ pub fn sys_close(fd: u64) -> u64 {
     let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
         return errno::EBADF;
     };
-    let mut table = TABLE.lock();
-    match table.get_mut(idx as usize) {
-        Some(slot) if slot.is_some() => {
-            *slot = None;
-            0
+    // Take the entry out under the lock, then release the socket outside it:
+    // `remove_socket` reaches into the network stack, and holding the
+    // descriptor table across that is how a lock inversion starts.
+    let taken = {
+        let mut table = TABLE.lock();
+        match table.get_mut(idx as usize) {
+            Some(slot) if slot.is_some() => slot.take(),
+            _ => return errno::EBADF,
         }
-        _ => errno::EBADF,
+    };
+    if let Some(Entry { desc: FileDescriptor::Socket(s), .. }) = taken {
+        crate::sock::close(s);
     }
+    0
 }
 
 /// `read(fd, buf, len)`.
@@ -233,6 +285,13 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     }
     if fd == 1 || fd == 2 {
         return errno::EBADF;
+    }
+
+    // A socket descriptor routes to the network stack. The lock is dropped
+    // first: `socket_recv` blocks, and holding the descriptor table across a
+    // blocking wait would stop every other task from opening a file.
+    if let Some(sock) = socket_index(fd) {
+        return crate::sock::recv(sock, buf, len);
     }
 
     let idx = fd - FIRST_FILE_FD as u64;

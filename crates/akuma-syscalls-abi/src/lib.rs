@@ -78,6 +78,18 @@ pub enum Syscall {
     Exit,
     ExitGroup,
     SchedYield,
+    Socket,
+    Bind,
+    Listen,
+    Accept,
+    Connect,
+    Sendto,
+    Recvfrom,
+    Setsockopt,
+    Getsockopt,
+    Shutdown,
+    Getdents64,
+    Getcwd,
     Getpid,
     Nanosleep,
     ClockGettime,
@@ -90,6 +102,18 @@ pub enum Syscall {
 /// than merged into `akuma_syscalls_linux::nr` so that neither table can be reached by
 /// accident: a caller has to name the architecture it means.
 pub mod x86_64 {
+    pub const SOCKET: u64 = 41;
+    pub const BIND: u64 = 49;
+    pub const LISTEN: u64 = 50;
+    pub const ACCEPT: u64 = 43;
+    pub const CONNECT: u64 = 42;
+    pub const SENDTO: u64 = 44;
+    pub const RECVFROM: u64 = 45;
+    pub const SETSOCKOPT: u64 = 54;
+    pub const GETSOCKOPT: u64 = 55;
+    pub const SHUTDOWN: u64 = 48;
+    pub const GETDENTS64: u64 = 217;
+    pub const GETCWD: u64 = 79;
     pub const READ: u64 = 0;
     pub const WRITE: u64 = 1;
     pub const CLOSE: u64 = 3;
@@ -129,6 +153,18 @@ impl Syscall {
             n::READV => Self::Readv,
             n::WRITEV => Self::Writev,
             n::SCHED_YIELD => Self::SchedYield,
+            n::SOCKET => Self::Socket,
+            n::BIND => Self::Bind,
+            n::LISTEN => Self::Listen,
+            n::ACCEPT => Self::Accept,
+            n::CONNECT => Self::Connect,
+            n::SENDTO => Self::Sendto,
+            n::RECVFROM => Self::Recvfrom,
+            n::SETSOCKOPT => Self::Setsockopt,
+            n::GETSOCKOPT => Self::Getsockopt,
+            n::SHUTDOWN => Self::Shutdown,
+            n::GETDENTS64 => Self::Getdents64,
+            n::GETCWD => Self::Getcwd,
             n::NANOSLEEP => Self::Nanosleep,
             n::GETPID => Self::Getpid,
             n::EXIT => Self::Exit,
@@ -178,6 +214,18 @@ impl Syscall {
     pub const fn to_x86_64(self) -> u64 {
         use x86_64 as n;
         match self {
+            Self::Socket => n::SOCKET,
+            Self::Bind => n::BIND,
+            Self::Listen => n::LISTEN,
+            Self::Accept => n::ACCEPT,
+            Self::Connect => n::CONNECT,
+            Self::Sendto => n::SENDTO,
+            Self::Recvfrom => n::RECVFROM,
+            Self::Setsockopt => n::SETSOCKOPT,
+            Self::Getsockopt => n::GETSOCKOPT,
+            Self::Shutdown => n::SHUTDOWN,
+            Self::Getdents64 => n::GETDENTS64,
+            Self::Getcwd => n::GETCWD,
             Self::Read => n::READ,
             Self::Write => n::WRITE,
             Self::Close => n::CLOSE,
@@ -206,6 +254,18 @@ impl Syscall {
     pub const fn to_aarch64(self) -> u64 {
         use akuma_syscalls_linux::nr as n;
         match self {
+            Self::Socket => n::SOCKET,
+            Self::Bind => n::BIND,
+            Self::Listen => n::LISTEN,
+            Self::Accept => n::ACCEPT,
+            Self::Connect => n::CONNECT,
+            Self::Sendto => n::SENDTO,
+            Self::Recvfrom => n::RECVFROM,
+            Self::Setsockopt => n::SETSOCKOPT,
+            Self::Getsockopt => n::GETSOCKOPT,
+            Self::Shutdown => n::SHUTDOWN,
+            Self::Getdents64 => n::GETDENTS64,
+            Self::Getcwd => n::GETCWD,
             Self::Read => n::READ,
             Self::Write => n::WRITE,
             Self::Close => n::CLOSE,

@@ -63,6 +63,9 @@ akuma-terminal = { path = "../crates/akuma-terminal" }
 # core of `akuma-exec`, behind only `akuma-primitives`/`akuma-mmap`/
 # `akuma-syscalls-linux`, all of which build for this target.
 akuma-exec-core = { path = "../crates/akuma-exec-core" }
+# The networking stack: smoltcp, the AF_INET socket table and DNS. Used
+# unmodified; `src/net.rs` supplies the twelve `NetRuntime` hooks.
+akuma-net = { path = "../crates/akuma-net" }
 
 [[bin]]
 name = "akuma-amd64"

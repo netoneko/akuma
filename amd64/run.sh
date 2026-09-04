@@ -55,6 +55,14 @@ fi
 # locally at all. Here it can.
 MACHINE="-M microvm"
 
+# A CPU model with RDRAND. The default `microvm` model does not expose it, and
+# the kernel's network stack wants hardware entropy for TCP sequence numbers —
+# and `sshd` will want it for key exchange. The kernel checks CPUID and falls
+# back to a non-cryptographic PRNG rather than faulting, but the fallback is not
+# something a local run should silently be testing against: both Ryzen and
+# Graviton have RDRAND, so the stand-in should too.
+CPU="-cpu max"
+
 # Modern virtio, not legacy.
 #
 # QEMU's virtio-mmio transports default to `force-legacy=true` — version 1, the
@@ -76,7 +84,8 @@ LEGACY_OFF="-global virtio-mmio.force-legacy=false"
 # measured above. The guest parses the identical token either way, which is the
 # point: one discovery path, two machines.
 DRIVE=""
-APPEND=""
+NIC=""
+CMDLINE=""
 if [ "$DISK" != "none" ]; then
     if [ -z "$DISK" ]; then
         # Rebuilt every run, on purpose: it contains the guest ELF that was just
@@ -95,17 +104,31 @@ if [ "$DISK" != "none" ]; then
     # Firecracker needs no equivalent: it packs devices densely from its own base
     # and announces each one, so slot order and announcement order agree.
     DRIVE="-drive id=d0,file=$DISK,format=raw,if=none -device virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0"
-    APPEND="-append virtio_mmio.device=512@0xfeb00000:5"
+    # A NIC on the next transport. QEMU's user-mode stack needs no tap and no
+    # root: it NATs, and answers DHCP itself, so a local run exercises the same
+    # discovery and the same driver the Firecracker host does with dnsmasq.
+    NIC="-netdev user,id=n0 -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1"
+    # Two tokens now, one per device, dense at the 0x200 stride. This is the
+    # multi-slot geometry `MmioDevices::geometry` computes — until now only one
+    # device was ever announced, so the stride was never exercised on this
+    # machine.
+    # One shell word, however many tokens. `-append` takes a single argument,
+    # and the surrounding variables are deliberately word-split — so this one is
+    # kept separate and quoted at the call, or QEMU reads the second token as
+    # another device and fails with "drive with bus=0, unit=0 exists".
+    CMDLINE="virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6"
 fi
 
 # shellcheck disable=SC2086  # these are deliberately word-split
 exec qemu-system-x86_64 \
     $MACHINE \
+    $CPU \
     $LEGACY_OFF \
     -kernel "$KERNEL" \
     -m "$MEMORY" \
     $DRIVE \
-    $APPEND \
+    $NIC \
+    ${CMDLINE:+-append "$CMDLINE"} \
     -serial mon:stdio \
     -display none \
     -no-reboot \

@@ -70,6 +70,7 @@ dependencies = [
  "akuma-alloc",
  "akuma-exec-core",
  "akuma-ext2",
+ "akuma-net",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-ryzen-amd64",

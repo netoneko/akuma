@@ -64,6 +64,8 @@ mod mem;
 #[cfg(target_arch = "x86_64")]
 mod mm;
 #[cfg(target_arch = "x86_64")]
+mod net;
+#[cfg(target_arch = "x86_64")]
 mod paging;
 #[cfg(target_arch = "x86_64")]
 mod phys;
@@ -73,6 +75,8 @@ mod port;
 mod sched;
 #[cfg(target_arch = "x86_64")]
 mod serial;
+#[cfg(target_arch = "x86_64")]
+mod sock;
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(include_str!("boot.s"), options(att_syntax));
@@ -169,6 +173,12 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // Stage M did.
     let have_fs = have_disk && fs::mount_root();
 
+    // Networking, after the heap (the stack allocates) and after the virtio
+    // window is set (the NIC is another slot in the same array the disk came
+    // from). DHCP on: both machines run a server — QEMU's user-mode stack, and
+    // dnsmasq on the Firecracker host (`amd64/net-setup.sh`).
+    let have_net = net::init(true);
+
     let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
 
     mem::smoke_test(&mut t);
@@ -191,6 +201,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     fs::smoke_test(&mut t, have_fs);
     fd::smoke_test(&mut t, have_fs);
     mm::smoke_test(&mut t);
+    net::smoke_test(&mut t, have_net);
+    sock::smoke_test(&mut t, have_net);
 
     fd::init_console();
     usermode::init_syscall();

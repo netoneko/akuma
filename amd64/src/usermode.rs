@@ -376,6 +376,14 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
         // return zeroed memory that the caller believes holds a file.
         Syscall::Mmap => crate::mm::sys_mmap(a1, a2, a3, a4, a5),
         Syscall::Munmap => crate::mm::sys_munmap(a1, a2),
+        Syscall::Socket => crate::sock::sys_socket(a1, a2, a3),
+        Syscall::Bind => crate::sock::sys_bind(a1, a2, a3),
+        Syscall::Listen => crate::sock::sys_listen(a1, a2),
+        Syscall::Accept => crate::sock::sys_accept(a1, a2, a3),
+        Syscall::Connect => crate::sock::sys_connect(a1, a2, a3),
+        Syscall::Sendto => crate::sock::sys_sendto(a1, a2, a3),
+        Syscall::Recvfrom => crate::sock::sys_recvfrom(a1, a2, a3),
+        Syscall::Setsockopt => crate::sock::sys_setsockopt(a1, a2, a3, a4, a5),
         Syscall::Exit | Syscall::ExitGroup => {
             EXIT_STATUS.store(a1, Ordering::Relaxed);
             // SAFETY: single core, interrupts off inside a syscall. The
@@ -417,6 +425,11 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     const EBADF: u64 = (-9i64) as u64;
     const EFAULT: u64 = (-14i64) as u64;
 
+    // A socket descriptor routes to the network stack, so a program written
+    // against `write(2)` works on a connection without knowing it has one.
+    if let Some(sock) = crate::fd::socket_index(fd) {
+        return crate::sock::send(sock, buf, len);
+    }
     if fd != 1 && fd != 2 {
         return EBADF;
     }

@@ -1512,6 +1512,164 @@ descriptor table, a read path on the 16550, and enough of `execve` to start one
 process. Not `fork`, and not sockets — which is why a UART shell is a much
 shorter road than sshd (§4).
 
+## 3.21 Stage O: file syscalls, and a shell on the serial line
+
+`paws` runs on the amd64 kernel, over the 16550, with line editing and command
+dispatch:
+
+```text
+-- /bin/paws on the console; type `exit` or Ctrl+D to stop --
+paws v0.3.0 - OS Shell & Core Utilities
+paws / # pwd
+/
+paws / # ls
+ls: cannot access .
+paws / # help
+Embedded utilities:
+  ls, cat, cp, mv, rm, mkdir, rmdir, touch, echo
+  pwd, cd, uname, uptime, sleep, clear, whoami
+paws / # exit
+-- shell exited --
+```
+
+It is the same `paws` the aarch64 devbox runs — one source, compiled for
+`x86_64-unknown-none` against a ported `libakuma`. `ls` fails because
+`getdents64` is not implemented yet; it fails *cleanly* rather than hanging,
+which is the difference between a missing syscall and a broken one.
+
+112 self-tests pass, 0 fail, under QEMU `microvm` and under Firecracker on the
+Ryzen.
+
+### 3.21.1 The kernel surface
+
+| syscall | note |
+|---|---|
+| `openat` | resolves through ext2, caches the file's bytes, allocates a descriptor |
+| `read` | fd 0 is the console (canonical); a file descriptor reads from the cache |
+| `close`, `lseek`, `fstat` | `lseek` handles all three whences and a negative delta |
+| `ioctl` | always `ENOTTY`, deliberately — see §3.21.4 |
+| `mmap`, `munmap` | anonymous only, eager, W^X enforced |
+| `poll_input_event` | Akuma's own: a **raw**, unechoed keystroke |
+
+The descriptor type is `akuma_exec_core::process::{FileDescriptor, KernelFile}`
+and the `mmap` argument decode is `akuma_syscalls_mem::mmap::plan`. Both were
+hand-rolled first and replaced; that, and a third case, is
+`docs/archive/AMD64_CRATE_REUSE_AUDIT.md`.
+
+The syscall entry path had to grow from three arguments to six.
+`openat` takes four and `mmap` takes six, and the register shuffle is
+order-sensitive: `r9 <- r8` must precede `r8 <- r10`, or the fifth argument
+overwrites the source of the fourth.
+
+### 3.21.2 A probe before the port
+
+`userspace/amd64/fdprobe/fdprobe.rs` exercises the whole surface **from ring 3**
+and reports twelve claims as bits of its exit status. It exists because
+`fd::smoke_test` and `mm::smoke_test` call the same functions from ring 0, where
+a user pointer is just a pointer and the argument registers are whatever Rust
+chose. Only a real `syscall` instruction exercises the ABI.
+
+It caught nothing, which is the correct outcome for a probe written before the
+thing it probes is trusted — and it is now the regression test for the argument
+shuffle above.
+
+### 3.21.3 Porting `libakuma`: four sites, and two of them should not have existed
+
+The arch surface was smaller than expected: **4 `svc` sites and one `_start`**.
+
+Two of the four were hand-rolled `asm!` blocks — `getcwd` and `chdir` each
+open-coded the instruction rather than calling the crate's own `syscall()`. They
+had no reason to be separate, and being separate is exactly what would have made
+them two more places to port. Routing them through `syscall()` turned four
+porting sites into two before any x86 was written.
+
+`munmap_void` is the one that genuinely needed a second arm, and its comment says
+why: on AArch64 it uses `mov`+`svc` because `inout("x0")` was not enough to make
+the compiler treat `x0` as clobbered. On x86_64 the result register is `rax` and
+`syscall`'s clobbers are already declared, so the ordinary path is correct and a
+second hand-rolled form would only be a second thing to get wrong.
+
+**A real bug fell out.** `exit()`'s unreachable fallback loop executed **`wfi`**
+— a privileged instruction, in userspace. It was tolerated on AArch64 rather than
+correct. It is `core::hint::spin_loop()` now, which emits `yield` there and
+`pause` on x86_64.
+
+`_start` needs two things the AArch64 version does not: `rsp` must be 16-aligned
+before a `call`, and the alignment has to happen *after* `rsp` is captured,
+because that value is the argv block.
+
+**aarch64 builds with zero errors after all of it.**
+
+### 3.21.4 Akuma's private syscall numbers collide on x86_64
+
+This is the finding worth carrying forward.
+
+Akuma's own syscalls — `spawn`, `poll_input_event`, the terminal controls, the
+box family — sit at **300+** on AArch64, in a range the asm-generic table leaves
+free. **That range is not free on x86_64.** 300 is `getcpu`; 313 is
+`finit_module`. Reusing the numbers would have dispatched a shell's keystroke
+poll into the module loader.
+
+They live at `0x1000 + n` on x86_64 now — above any allocated Linux number (the
+highest is in the 460s), with the AArch64 offset still legible so the two tables
+can be read against each other. `libakuma`'s `AKUMA_PRIVATE_BASE` documents it;
+the kernel checks that range *before* the Linux table for the same reason.
+
+The first attempt gave them a sentinel instead, and the symptom is worth
+recording because it looked like a broken console: `poll_input_event` returned
+`-ENOSYS`, `paws`'s `read_line` saw `n <= 0`, broke with an empty line, and
+reprinted the prompt — forever. A tight loop of prompts reads like a terminal
+bug and was a missing number.
+
+### 3.21.5 Two console paths, and both are right
+
+`read(0)` goes through `akuma-terminal`'s **canonical** mode: the kernel buffers
+a line, handles backspace, echoes, and returns on Enter. `poll_input_event`
+returns **raw**, unechoed single bytes.
+
+That is not a compromise. `paws` does its own line editing — backspace, Ctrl+D,
+echo — which is what any shell with history or completion must do, and serving it
+from the canonical path would make it wait for a whole line before echoing the
+first character. `akuma-terminal` has `enter_raw_mode` for precisely this split.
+
+`ioctl` returns `ENOTTY` rather than `ENOSYS`, also deliberately: a libc asking
+"is this a terminal?" reads `ENOTTY` as a clear no and carries on unbuffered,
+where `ENOSYS` reads as a broken kernel and some runtimes abort on it.
+
+### 3.21.6 A whole-file read, not a handle
+
+`open` reads the entire file into the heap; `read` and `lseek` work on that
+buffer. A file therefore costs its own size in kernel heap while open, and two
+descriptors on one file share nothing.
+
+This is a stated divergence from the AArch64 kernel, which reads by inode on
+every call through `akuma-ext2`'s own block cache. Doing that here needs the
+`VfsHooks` plumbing that lives in `akuma-exec`, which does not build for this
+target. The `KernelFile` in the descriptor is the same type either way, so
+closing the gap changes where the bytes come from and nothing else.
+
+### 3.21.7 The FIFO gotcha, for anyone scripting this
+
+Piping input to the shell has to be **delayed until the shell exists**:
+
+```bash
+( sleep 100; printf 'pwd\nls\nexit\n' ) | amd64/run.sh
+```
+
+The 16550's receive FIFO is 16 bytes, nothing drains it during the boot
+self-tests, and under TCG those take about ninety seconds. Input written at
+launch is silently dropped, and the symptom is a shell that starts and then
+appears to ignore everything. Not a kernel bug, but it costs a run to work out.
+
+### 3.21.8 What a shell still cannot do
+
+`getdents64` and `getcwd` are not implemented, so `ls` fails and the prompt's
+path is the shell's own idea of it. `spawn`/`waitpid` return `ENOSYS`, so `paws`
+runs its builtins and refuses external programs — this target has one process at
+a time and no `fork`. Nothing writes: the block driver and `akuma-ext2` can both
+write, but a self-test that mutated the image would make it stateful across
+boots.
+
 ## 4. What is deliberately missing
 
 Corrected 2026-09-04. This list was written at Stage B and went stale as the
@@ -1532,11 +1690,10 @@ what follows is the state as of Stage L rather than the original text.
   needed, it will have to be found the hard way: `hvm_start_info.rsdp_paddr` exists
   in the ABI but **both** QEMU and Firecracker v1.16.1 report it as 0 (measured,
   §3.6). Do not build on that field.
-- **No file syscalls.** The kernel reads files (ext2 since Stage N, §3.20);
-  ring 3 cannot. There is no descriptor table and no `open`/`read`/`close`. That,
-  plus a read path on the 16550 and a minimal `execve`, is what a serial-console
-  shell needs — and it needs neither `fork` nor sockets, which is why it is a much
-  shorter road than sshd.
+- **No `getdents64`, no `getcwd`, no `spawn`.** Ring 3 has `open`/`read`/
+  `close`/`lseek`/`fstat`/`mmap` since Stage O and a shell runs on them, but it
+  cannot list a directory or start a program. `spawn` needs a process table this
+  target does not have.
 - **No writes.** The block driver and `akuma-ext2` can both write; nothing does.
   A self-test that mutated the image would make it stateful across boots.
 - **No NIC, and no device interrupts.** There is a disk since Stage M
