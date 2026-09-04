@@ -96,11 +96,70 @@ point — a parser validated against one machine is a description of that machin
 The two-IOAPIC difference is the kind of thing that makes a second machine worth
 having: code written against Firecracker alone would reasonably assume one.
 
+## What this VMM can be asked for
+
+Measured by `amd64/probe-hardware.sh`, which boots Linux under a matrix of
+configurations and reads the guest's own inventory. A config the VMM rejects is
+as informative as one it accepts, so failures are captured rather than aborting.
+
+| case | result | what the guest sees |
+|---|---|---|
+| `baseline` | boots | no virtio at all; the command line has no device token |
+| `block` | boots | `virtio_mmio.device=4K@0xc0001000:5` -> `vda` |
+| `two-block` | boots | **two** tokens: `4K@0xc0001000:5` and `4K@0xc0002000:6` |
+| `rng` / `balloon` / `pmem` / `hotplug` | boot | one token each, at `0xc0001000:5` |
+| `pci`, `block-pci`, `rng-pci` | boot | a PCIe segment; see below |
+| `vsock` | boots | (first run failed on a stale socket file, not a limit) |
+| `net` | needs a host `tap` device, which needs root |
+
+**Devices are dense and ordered.** Every virtio device gets a token, allocated
+from `0xc0001000` with a `0x1000` stride and an IRQ from 5 upward, in attachment
+order. That is what `MmioDevices::geometry()` in `crates/akuma-ryzen-amd64`
+computes, and `two-block` is the case that proves the stride rather than assuming
+it from a single device.
+
+## Firecracker **does** have PCI
+
+Worth stating plainly because the opposite was written down in this tree and
+propagated as a premise. `firecracker --enable-pci` ("Enables PCIe support")
+exists in v1.16.1 and builds a real segment:
+
+```text
+pci: adding PCI segment: id=0x0,
+     PCI MMIO config address: 0xeec00000,          <- ECAM
+     mem32 area: [0xc0001000-0xeebfffff],
+     mem64 area: [0x4000000000-0x7fffffffff],
+     IO area:    [0xcf8-0xcff]
+```
+
+Note `0xeec00000`: the same span the E820 map reports as *reserved* in every
+capture. The MCFG table is published whether or not PCI is enabled.
+
+With `--enable-pci` the command line loses **both** `pci=off` and every
+`virtio_mmio.device=` token — the devices move to PCI and are found by
+enumeration instead of announcement.
+
+**Why the confusion is easy.** Firecracker's own published CI `vmlinux` is built
+**without `CONFIG_PCI`**: in the `block-pci` capture the guest prints zero PCI
+enumeration lines and never finds the disk. The VMM offered the bus; that guest
+could not see it. Anyone testing with the standard artifacts would conclude PCI
+does not work.
+
+Akuma drives MMIO **by choice**: the driver already exists and works on both
+architectures, and PCI would mean config-space enumeration and BAR programming
+for no capability this target needs yet. If that changes, QEMU's ordinary
+`pc`/`q35` machine becomes the right local stand-in and `-M microvm` can go.
+
 ## Files
 
 | | |
 |---|---|
+| `probe-*.log` | one Linux boot per configuration in the matrix above |
+
+| | |
+|---|---|
 | `linux-boot-{1,2,4,8}-vcpu.log` | Linux 6.1.128 boot log under Firecracker at that vCPU count |
+| `README.md` | this file |
 
 **Background:** [`../../archive/AKUMA_FIRECRACKER_AMD64.md`](../../archive/AKUMA_FIRECRACKER_AMD64.md)
 is the port, one section per stage; `crates/akuma-ryzen-amd64` is the parser and

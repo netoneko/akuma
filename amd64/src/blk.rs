@@ -31,10 +31,9 @@
 //!
 //! `virtio-drivers`' blocking `read_blocks` spins on the used ring. That is a
 //! deliberate stopping point rather than an oversight: taking the device's
-//! interrupt needs an **IOAPIC**, finding the IOAPIC needs ACPI's MADT, and
-//! `hvm_start_info.rsdp_paddr` is 0 on both machines (measured), so ACPI would
-//! have to start with a scan of the BIOS area. None of that is needed to read a
-//! sector, and a stage that bundled it would be two stages wearing a coat.
+//! interrupt needs an **IOAPIC**. Its address is now read from the MADT
+//! (`akuma-ryzen-amd64`), but routing a GSI to a vector and taking the interrupt
+//! is its own stage, and none of it is needed to read a sector.
 //!
 //! The interrupt number is parsed and recorded (`cmdline::MmioDevice::irq`)
 //! rather than discarded, so the stage that does want it does not have to

@@ -26,12 +26,16 @@ VCPUS="${VCPUS:-1}"
 TIMEOUT="${TIMEOUT:-20}"
 # DISK=<local path> attaches it as the guest's first virtio-blk drive.
 #
-# Firecracker has no PCI bus and passes no device tree, so a drive is announced
-# to the guest exactly one way: Firecracker appends a
+# Firecracker passes no device tree, and **by default** presents virtio over
+# MMIO with PCI switched off — it appends `pci=off` and a
 # `virtio_mmio.device=<size>@<base>:<irq>` token to the kernel command line,
 # which arrives through `hvm_start_info.cmdline_paddr`. Attaching a drive is
-# therefore also what makes that token appear — with `"drives": []` the command
+# therefore also what makes that token appear: with `"drives": []` the command
 # line is empty and there is nothing to discover.
+#
+# "By default" is the operative phrase. v1.16.1 has `--enable-pci`, and it builds
+# a real PCIe segment — measured, see `docs/reference/firecracker-amd64/README.md`.
+# MMIO is a choice here, not a constraint the VMM imposes.
 DISK="${DISK:-}"
 KERNEL=target/x86_64-unknown-none/release/akuma-amd64
 

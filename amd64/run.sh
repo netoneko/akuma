@@ -11,7 +11,7 @@
 # is correct, and HVF cannot help because the guest ISA is not the host's.
 #
 # Since Stage M this uses `-M microvm` rather than the default `pc`, so the local
-# device model matches Firecracker's: virtio over MMIO, no PCI. See below.
+# device model matches Firecracker's *default*: virtio over MMIO. See below.
 set -e
 
 HERE=$(dirname "$0")
@@ -37,12 +37,18 @@ fi
 # `-M microvm`, not the default `pc`, and this is the whole reason the local run
 # still means anything.
 #
-# Firecracker has no PCI bus: it presents virtio over MMIO and announces each
-# device on the kernel command line. QEMU's `pc`/`q35` machines put virtio on
-# PCI, so a local run against them would exercise a device model the target
-# machine does not have — the stand-in would stop standing in. `microvm` is
-# x86-only and is Firecracker's analogue: PVH entry, virtio-MMIO, no PCI.
+# Firecracker runs virtio over MMIO **by default**, announcing each device on the
+# kernel command line. QEMU's `pc`/`q35` machines put virtio on PCI, so a local
+# run against them would exercise a different transport than the one this kernel
+# drives — the stand-in would stop standing in. `microvm` is x86-only and is the
+# analogue of Firecracker's default: PVH entry, virtio-MMIO.
 # Measured layout (`info mtree`): eight transports at 0xfeb00000, 0x200 apart.
+#
+# Not because PCI is unavailable — Firecracker v1.16.1 has `--enable-pci` and
+# builds a real segment (ECAM 0xeec00000, measured). MMIO is what this kernel
+# drives today, on both architectures, with a driver that already works. If that
+# ever changes, `pc`/`q35` becomes the right local machine and this comment is
+# the note saying so.
 #
 # `-M virt`'s equivalent does not exist on the aarch64 side, which is why
 # `docs/archive/FIRECRACKER_PORT.md` §6 could not validate that memory map

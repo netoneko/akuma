@@ -9,11 +9,16 @@
 //! and printing `hvm_start_info.cmdline_paddr` on the Ryzen host, the second from
 //! `info mtree`.
 //!
-//! This is the whole of device discovery on this machine for anything on a
-//! virtio transport. Firecracker runs with `pci=off` and there is no bus to
-//! enumerate; there is no device tree; and while ACPI *is* present (see
-//! [`super::acpi`]) it describes the interrupt controllers and not the virtio
-//! transports. The string is the only place the transport's address appears.
+//! This is the whole of device discovery on this machine **as configured**.
+//! Firecracker's default is `pci=off` with each device announced here; there is
+//! no device tree; and while ACPI *is* present (see [`super::acpi`]) it
+//! describes the interrupt controllers, not the virtio transports. So the string
+//! is the only place a transport's address appears.
+//!
+//! It is a default, not a law. `--enable-pci` makes Firecracker build a real
+//! PCIe segment and the devices move there — at which point these tokens stop
+//! appearing and enumeration replaces them. Measured, with the segment layout,
+//! in `docs/reference/firecracker-amd64/README.md`.
 //!
 //! # This parses attacker-adjacent input
 //!

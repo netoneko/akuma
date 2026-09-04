@@ -27,10 +27,17 @@ DISK=none amd64/run.sh           # no drive at all
 ```
 
 `-M microvm`, not QEMU's default `pc`, and that is load-bearing: `pc` and `q35`
-put virtio on **PCI**, and Firecracker has no PCI bus. A local run against them
-would exercise a device model the target machine does not have, and the reason
-QEMU is a useful stand-in — the same entry path, the same device model — would
-be gone.
+put virtio on **PCI**, while Firecracker's default transport is MMIO. A local run
+against them would exercise a different transport than the one this kernel
+drives, and the reason QEMU is a useful stand-in — the same entry path, the same
+device model — would be gone.
+
+This is a **choice, not a constraint**. Firecracker v1.16.1 takes `--enable-pci`
+and builds a real PCIe segment (ECAM at `0xeec00000`, measured — see
+`docs/reference/firecracker-amd64/README.md`). MMIO is what this kernel already
+drives on both architectures, with a driver that needed no changes; PCI would
+mean config-space enumeration and BAR programming for no capability this target
+needs yet.
 
 ```
 Akuma/amd64 — long mode reached

@@ -1254,11 +1254,19 @@ parses the identical string either way: one discovery path, two machines.
 ### 3.19.2 `-M microvm`, or the stand-in stops standing in
 
 The local run moved from QEMU's default `pc` machine to `microvm`. This is not a
-tidiness change. `pc` and `q35` put virtio on **PCI**; Firecracker has no PCI at
-all. A local run against `pc` would exercise a device model the target machine
-does not have, and the whole justification for QEMU being a useful stand-in —
-"what boots here boots there" — would be gone. `microvm` is x86-only and is
-Firecracker's analogue: PVH entry, virtio-MMIO, no PCI.
+tidiness change. `pc` and `q35` put virtio on **PCI**; Firecracker's default
+transport is MMIO. A local run against `pc` would exercise a different transport
+than the one this kernel drives, and the whole justification for QEMU being a
+useful stand-in — "what boots here boots there" — would be gone. `microvm` is
+x86-only and is the analogue of Firecracker's default: PVH entry, virtio-MMIO.
+
+**Corrected 2026-09-04.** This section first said "Firecracker has no PCI at
+all", and §3.19.1 said there was "no bus to enumerate". That is wrong, and it is
+worth recording *how* it got written: it was inherited from earlier notes,
+propagated without being checked, and then used as a premise. Firecracker
+v1.16.1 has `--enable-pci` and builds a real PCIe segment — measured in §3.19.9.
+The right statement is that MMIO is the **default**, and that this kernel drives
+MMIO **by choice**.
 
 Two QEMU behaviours had to be corrected, and both were caught by assertions
 rather than by reading documentation:
