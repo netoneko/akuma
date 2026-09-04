@@ -76,6 +76,7 @@ dependencies = [
  "akuma-primitives",
  "akuma-ryzen-amd64",
  "akuma-selftest",
+ "akuma-sntp",
  "akuma-syscalls-abi",
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
@@ -440,6 +441,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-sntp"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-syscalls"
 version = "0.1.0"
 dependencies = [
@@ -540,6 +545,7 @@ version = "0.1.0"
 dependencies = [
  "akuma-exec",
  "akuma-primitives",
+ "akuma-sntp",
  "akuma-syscalls-linux",
  "akuma-timer",
  "log",

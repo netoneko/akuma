@@ -76,6 +76,7 @@ mod nr {
     pub const MKDIR: u64 = 83;
     pub const UNLINK: u64 = 87;
     pub const GETCWD: u64 = 79;
+    pub const TIME: u64 = 201;
     pub const EXIT_GROUP: u64 = 231;
 }
 
@@ -565,10 +566,16 @@ pub fn munmap(addr: usize, len: usize) -> isize {
 // Misc
 // ============================================================================
 
-/// This target has no RTC and no SNTP client (`amd64/src/fs.rs`'s
-/// `no_clock` makes the same call for inode timestamps) — `0` is the honest
-/// answer, not a guess dressed up as one.
+/// A real `time(2)` since `amd64/src/clock.rs` (2026-09-05, boot-time SNTP)
+/// — `0` before that module's `sync_via_sntp` has run or if it failed
+/// (no route, DNS blocked, …), matching `time(2)`'s own "seconds since the
+/// epoch" contract rather than inventing a value. `amd64/src/fs.rs`'s
+/// `no_clock` (inode timestamps) is a different, still-open gap — this only
+/// answers the *wall-clock* question, not "does every file have a real
+/// mtime".
 #[must_use]
 pub fn time() -> u64 {
-    0
+    // SAFETY: `NULL` for `tloc` is a documented, valid `time(2)` call — the
+    // seconds count comes back in `rax` either way.
+    unsafe { syscall6(nr::TIME, 0, 0, 0, 0, 0, 0) }
 }

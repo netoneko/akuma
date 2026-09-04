@@ -44,6 +44,10 @@ compile_error!(
 #[cfg(target_arch = "x86_64")]
 mod blk;
 #[cfg(target_arch = "x86_64")]
+mod clock;
+#[cfg(target_arch = "x86_64")]
+mod dns;
+#[cfg(target_arch = "x86_64")]
 mod fd;
 #[cfg(target_arch = "x86_64")]
 mod fs;
@@ -222,10 +226,29 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     usermode::fork_test(&mut t);
     lapic::stop_timer();
 
-    // Last: it spawns the netpoll daemon and leaves it running (which is the
-    // point — `run_init` needs it), so it must come after the leak and
-    // preemption checks above.
-    net::netpoll_selftest(&mut t, have_net);
+    // The netpoll drain half, then (in the gap before the daemon task
+    // exists) the wall clock, then the spawn half — see `net::
+    // netpoll_selftest`'s doc for exactly why the clock sync has to run
+    // between these two rather than after both, and `clock.rs`'s own header
+    // for why this is best-effort (no `t.check`) rather than something to
+    // fail the boot over. The daemon is left running once spawned (that is
+    // the point; `run_init` needs it), so all of this must come after the
+    // leak and preemption checks above.
+    if net::netpoll_drain_selftest(&mut t, have_net) {
+        if have_net {
+            // `start_timer`/`stop_timer`, same idiom as every other phase
+            // above that needs real elapsed time: `net::uptime_us` reads
+            // `lapic::ticks()`, which does not advance while the timer is
+            // stopped (true here since line 227), and `akuma_sntp::boot::
+            // bootstrap_over_udp`'s own timeout depends on it moving —
+            // without a live tick, an unanswered request would spin forever
+            // instead of giving up.
+            lapic::start_timer();
+            clock::sync_via_sntp();
+            lapic::stop_timer();
+        }
+        net::netpoll_spawn_selftest(&mut t);
+    }
 
     // The verdict is `#[must_use]`, and this is why: before the harness existed
     // a `[FAIL]` printed and the boot went on to announce success.

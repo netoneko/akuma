@@ -66,6 +66,11 @@ akuma-exec-core = { path = "../crates/akuma-exec-core" }
 # The networking stack: smoltcp, the AF_INET socket table and DNS. Used
 # unmodified; `src/net.rs` supplies the twelve `NetRuntime` hooks.
 akuma-net = { path = "../crates/akuma-net" }
+# The SNTP wire protocol + boot-time retry loop (`src/clock.rs`, 2026-09-05) —
+# pure, host-tested, `#![no_std]`, zero dependencies. Extracted out of
+# `akuma-syscalls-time` specifically so this target could reach it without also
+# needing that crate's `akuma-exec` dependency, which does not build here.
+akuma-sntp = { path = "../crates/akuma-sntp" }
 # The pure byte-FIFO half of a pipe (buffer, 64 KiB cap, closable write end, the
 # empty-vs-EOF rule), host-tested. `sys_spawn` wires a child's stdio to these;
 # `src/pipe.rs` is the `static` array + lock around it. The tree's full kernel

@@ -63,18 +63,31 @@ Still the same day: the loader gained **static-PIE (`ET_DYN`) support**, so
 Alpine's real **`apk`** (`apk-tools-static`, `-static-pie`) runs — `apk
 --version`, and `apk update` against the real Alpine CDN gets through DNS, TCP
 and a full TLS handshake before stopping at certificate validation (this
-target has no wall clock at all — `time()` reads `0` — so every real
-certificate looks not-yet-valid; not fixed here). Getting that far needed
-three more real bugs found and fixed, not just apk-specific workarounds:
-`flock` (`ENOSYS` made `apk` treat its own database lock as fatal),
-`sendmsg`/`recvmsg` (musl's resolver uses them, not `sendto`/`recvfrom` —
-without them a UDP reply that had genuinely arrived, `poll` correctly
-reporting it, was still unreadable), and `read(2)` refusing any request over
-64 KiB outright instead of clamping it like real Linux does — which broke
-apk's own 128 KiB-buffer read of a 119-byte config file before it ever
-touched the network. Full account, including exactly why `AT_PHDR` computed
-as `base + e_phoff` crashed busybox before it was fixed:
-`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.29.
+target had no wall clock at all — `time()` read `0` — so every real
+certificate looked not-yet-valid). Getting that far needed three more real
+bugs found and fixed, not just apk-specific workarounds: `flock` (`ENOSYS`
+made `apk` treat its own database lock as fatal), `sendmsg`/`recvmsg` (musl's
+resolver uses them, not `sendto`/`recvfrom` — without them a UDP reply that
+had genuinely arrived, `poll` correctly reporting it, was still unreadable),
+and `read(2)` refusing any request over 64 KiB outright instead of clamping
+it like real Linux does — which broke apk's own 128 KiB-buffer read of a
+119-byte config file before it ever touched the network. Full account,
+including exactly why `AT_PHDR` computed as `base + e_phoff` crashed busybox
+before it was fixed: `docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.29.
+
+The clock followed the next day: a **boot-time SNTP client** (`amd64/src/
+clock.rs`, `amd64/src/dns.rs`) — `clock_gettime`/`gettimeofday`/`time` now
+answer with real Unix time, and `apk update`'s TLS handshake against the real
+Alpine CDN no longer fails with "server certificate not trusted" — verified
+over SSH, the warning is simply gone. Not a real clock (it syncs once and
+never re-syncs — accurate to the year, not claiming more), and getting it
+working found two more real bugs on the way: interrupts were globally
+disabled at exactly the point in boot this needs them (fixed with an explicit
+`sti`), and a kernel-side UDP call run concurrently with the netpoll daemon
+deadlocks on a lock the daemon's own poll step also takes — the first time
+anything had tried that combination. Full account, including the still-open
+follow-on hang once `apk update` gets *past* the handshake into the real
+index download: `docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.30.
 
 No device interrupts, and no pipelines (`a | b`) over the interactive SSH
 shell — `sys_pipe2`/`dup2` (step 4) are still `ENOSYS`, seen directly as

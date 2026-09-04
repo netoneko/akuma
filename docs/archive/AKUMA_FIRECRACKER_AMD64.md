@@ -2684,6 +2684,166 @@ boot, mirroring what `akuma-syscalls-time` already does for the AArch64
 kernel — is what `apk update`/`apk add` against the real Alpine CDN needs
 next, and is a stage of its own, not attempted here.
 
+## 3.30 Stage X: a real wall clock (2026-09-05)
+
+Closes §3.29.5. `clock_gettime`/`gettimeofday`/`time` now answer with real
+Unix time once an SNTP fetch at boot succeeds — `apk update`'s TLS handshake
+against the real Alpine CDN no longer fails with "server certificate not
+trusted"; verified over SSH, the warning is simply gone (see §3.30.5). Getting
+there needed a shared-crate extraction and found two more real bugs, neither
+of them the clock itself.
+
+### 3.30.1 `akuma-sntp`: pulling the protocol out from under `akuma-exec`
+
+`akuma-syscalls-time` already carried a complete, host-tested SNTP client
+(`sntp.rs`: RFC 4330 packet build/parse and the offset math; `boot.rs`: the
+send/poll/receive/timeout retry loop, effects-based like `akuma-net-yarn`'s
+`wait_until`) — built 2026-08-25 in anticipation of exactly this, per that
+crate's own header, but never wired up: `grep`ing the whole tree for
+`bootstrap_over_udp` or `BootstrapEffects` found zero call sites, on either
+architecture. amd64 could not simply add that crate as a dependency to reach
+it: `akuma-syscalls-time`'s `lib.rs` unconditionally imports
+`akuma_exec::process::user_access`/`threading`, and `akuma-exec` does not
+build for `x86_64-unknown-none` at all (§0 of `docs/archive/
+REDUCING_PLATFORM_DEPENDENCY.md`). But `sntp.rs`/`boot.rs` themselves import
+nothing but `core` — confirmed by reading both files, not assumed — so this
+was a **move**, not a rewrite: both files relocated verbatim into a new
+`crates/akuma-sntp` (`#![no_std]`, `#![forbid(unsafe_code)]`, empty
+`[dependencies]`), and `akuma-syscalls-time` re-exports them
+(`pub use akuma_sntp::{boot, sntp};`) so its own public API — and every
+future AArch64 caller that finally wires `bootstrap_over_udp` up for real —
+is unchanged. All 12 of the extracted tests still pass, unmodified.
+
+### 3.30.2 The kernel-side effects: `clock.rs`, and what it deliberately is not
+
+`amd64/src/clock.rs` supplies `akuma_sntp::boot::BootstrapEffects` from
+`akuma_net::socket::{socket_send_udp, socket_recv_udp}` (a raw UDP socket
+allocated and freed around one fetch, not routed through the fd table at
+all) and the uptime source `net.rs` already had —
+`crate::net::uptime_us` (the same "coarse but honest" `lapic::ticks() *
+10_000` clock `net.rs`'s own header already used for network timeouts, now
+`pub` rather than private so `clock.rs` can share it: one uptime source for
+the whole target, not two that could quietly disagree).
+
+The clock this keeps is deliberately not a real clock: it syncs **once**,
+anchors `unix_epoch_us` to that one `net::uptime_us` reading, and every later
+`now_us()` is just `anchor + elapsed`. No periodic re-sync, no drift slewing,
+no `adjtimex`. That is a scope cut stated in the module's own header, not an
+oversight: the actual requirement — TLS certificate date validation — needs
+the answer right to within the *year*, arguably the *day*, never the
+millisecond, and a real clock (what `akuma-syscalls-time` already implements
+properly, for a platform with a calibrated hardware timer) is a different,
+bigger piece of work this is not trying to be. The kernel command line-seed
+alternative `docs/archive/MISSING_NTP_SYSCALLS.md` names for the AArch64 side
+(`akuma.epoch=<unix seconds>`, the host stamping the guest's boot args at
+launch) was considered and not chosen as the primary mechanism, for the
+reason given in `clock.rs`'s own header: it only works when whoever launches
+the VM remembers to pass it.
+
+`net.rs`'s `utc_seconds` `NetRuntime` hook — previously a permanent `None`,
+its own doc claiming "the stack uses this for certificate validity" — is now
+wired to `clock::utc_seconds()`. Checked before wiring it: nothing inside
+`akuma-net` actually reads that hook (zero call sites), so this changes no
+behavior today. It makes the hook's own stated purpose true for whenever
+something does read it, which is why it was worth the one-line change anyway.
+
+### 3.30.3 Bug found #1: interrupts were off, so the clock this all depends on never moved
+
+The very first boot attempt hung at 100% CPU with no output past "netpoll
+daemon scheduled." Bisected with temporary debug prints (`lapic::ticks()`
+before/after a busy-spin and a `yield_now` loop): the tick count never
+changed either way. A direct `pushfq`/`pop` read of `RFLAGS` confirmed
+`IF=0` — maskable interrupts were **globally disabled** at exactly the point
+`clock.rs` runs, despite `lapic::start_timer()` having just re-armed the
+LAPIC's own count (that function only touches LVT/init-count registers, never
+`RFLAGS`, and never claimed to). `lapic::smoke_test` does an explicit `sti`
+early in boot and nothing had done a matching `cli` on purpose — something in
+the long stretch of ring-3/syscall-heavy self-tests between that `sti` and
+here (`elf`/`fdprobe`/`spawn`/`busybox`/`execve`/`fork` — all real
+enter-ring-3, take-a-syscall, return-to-ring-0 traffic) leaves it cleared,
+and *what*, specifically, is a real, separate bug not tracked down here — it
+is dated and left as an open question rather than guessed at.
+
+Fixed locally rather than chased to its root: `clock.rs` now does its own
+`sti` before relying on any tick-based timeout, on the principle that
+depending on ambient global interrupt state some unrelated earlier code
+happened to leave behind was the actual mistake, independent of whatever
+clears it. Confirmed working: the same busy-spin diagnostic, re-run after the
+`sti`, showed `lapic::ticks()` advancing normally.
+
+### 3.30.4 Bug found #2: a kernel-side UDP call and the netpoll daemon, run concurrently, deadlock
+
+Fixing IF=0 traded one hang for a subtler one: the very next boot still hung
+at exactly the same spot, with `sti` confirmed in effect. Bisected with more
+debug prints, this time inside the DNS resolution call itself
+(`akuma_net::dns::resolve_host_blocking`, driving smoltcp's own dedicated
+`dns::Socket`): it never returned, past even its own internal 10-second
+timeout, though the same hostname (`pool.ntp.org`) resolves in under 3
+seconds through this target's *other*, already-proven DNS path — musl's own
+`sendmsg`/`recvmsg`-based stub resolver in userspace (§3.29.3) — which ruled
+out the network or the DNS server as the cause.
+
+The distinguishing fact, checked directly: **nothing on amd64 had ever called
+`smoltcp_net::dns_query` (or any kernel-side `akuma_net::socket` function)
+while the netpoll daemon task was alive before this.** Every earlier
+kernel-side caller — `sock::smoke_test` included — runs during the
+self-test sequence, entirely before `spawn_netpoll()` is ever reached. Once
+the daemon exists and is cooperatively/preemptively scheduled (which `sti`,
+fixed in §3.30.3, is exactly what makes possible), a second concurrent caller
+touching the same `akuma_net` internals is new territory — and on a single
+core, a spinlock held across a preemption point deadlocks the instant the
+preempted holder is the daemon and the new waiter is anyone else.
+
+Sidestepped two ways rather than fixed at the lock (finding *which* lock,
+and whether the real fix is BKL-shaped IRQ discipline or a smaller local
+change, is future work, not attempted here):
+
+- **`amd64/src/dns.rs`** (new): a minimal, hand-rolled single-question
+  A-record DNS client over raw UDP — the exact same
+  `socket_send_udp`/`socket_recv_udp` primitives `clock.rs`'s own SNTP fetch
+  already uses and already trusts — replacing the call into smoltcp's
+  separate DNS-socket machinery entirely. Standard header/question encoding,
+  a compression-pointer-aware answer walk, `RCODE`/`ID` validation against
+  spoofed or stale replies, all pure functions apart from the one
+  send/poll/receive loop.
+- **`net::netpoll_selftest` split in two** — `netpoll_drain_selftest` (the
+  drain-to-quiescence half, which is where DHCP actually finishes — confirmed
+  by console log ordering) and `netpoll_spawn_selftest` (spawns the daemon and
+  checks it gets scheduled). `main.rs` now calls the drain half, then
+  `clock::sync_via_sntp` in the gap, then the spawn half — so the *only*
+  kernel-side caller of these socket primitives while `clock.rs` runs is
+  `clock.rs` itself; the daemon that would race it does not exist yet.
+
+Both bugs are dated together because the second only became reachable once
+the first was fixed — `sti` is what let the scheduler preempt into the daemon
+at all.
+
+### 3.30.5 What's verified, and what's still open
+
+Verified over SSH on QEMU `microvm`, from a clean `amd64/run.sh` (no manual
+disk edits): `clock: synced via SNTP (pool.ntp.org)` prints every boot, 173
+self-tests still pass, and:
+
+```
+$ apk update
+[fetch https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APK...]
+```
+
+— with **no** `WARNING: ... TLS: server certificate not trusted` following
+it, where before §3.30 that warning appeared within under a second, every
+time. That is the actual thing this stage set out to fix, and it is fixed.
+
+**Not fixed, and found while verifying this**: `apk update` run to
+completion (fetching the full package index, not just starting the TLS
+fetch) still hangs — a different, later hang than either bug above, on the
+bulk-download phase rather than the handshake. `STRACE=1` shows the process
+never exits (`wait4`/the private `waitpid` syscall keeps reporting "still
+running") once the index transfer itself is underway. Given §3.30.4's
+finding, a live-daemon-concurrency deadlock in the same family — now hit by
+apk's own real userspace socket calls sustained over a real transfer, rather
+than by kernel-side code — is the leading suspect, but this was not
+diagnosed further. A stage of its own.
+
 ## 4. What is deliberately missing
 
 Corrected 2026-09-04. This list was written at Stage B and went stale as the

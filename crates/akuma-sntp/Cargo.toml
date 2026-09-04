@@ -1,0 +1,10 @@
+[package]
+name = "akuma-sntp"
+version = "0.1.0"
+edition = "2024"
+description = "Pure SNTP (RFC 4330) client protocol and boot-time bootstrap loop, effects-based so it host-tests without a kernel"
+
+[lints]
+workspace = true
+
+[dependencies]

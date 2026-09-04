@@ -649,6 +649,49 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         // `sock::sys_sendmsg`/`sock::sys_recvmsg`.
         46 => return crate::sock::sys_sendmsg(a1, a2, a3),
         47 => return crate::sock::sys_recvmsg(a1, a2, a3),
+        // `clock_gettime(clockid, *timespec)` — x86_64 228. `CLOCK_REALTIME`
+        // (0) reads `clock::now_us()` — `0` until `clock::sync_via_sntp`
+        // succeeds, exactly the "every real TLS certificate looks not-yet-
+        // valid" bug this syscall existing at all closes
+        // (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.29.5/§3.30).
+        // `CLOCK_MONOTONIC` (1) and anything else read `net::uptime_us`
+        // instead: always available with no SNTP dependency, which is all a
+        // monotonic clock ever promised (an arbitrary epoch, not the Unix
+        // one) — busybox `sh`'s own `poll` timeout math and similar callers
+        // that just want *a* moving clock get one either way.
+        228 => {
+            const CLOCK_REALTIME: u64 = 0;
+            let us = if a1 == CLOCK_REALTIME { crate::clock::now_us() } else { crate::net::uptime_us() };
+            // SAFETY: a user `struct timespec { i64 tv_sec, i64 tv_nsec }`.
+            unsafe {
+                (a2 as *mut i64).write_volatile((us / 1_000_000).cast_signed());
+                (a2 as *mut i64).add(1).write_volatile(((us % 1_000_000) * 1000).cast_signed());
+            }
+            return 0;
+        }
+        // `gettimeofday(*timeval, *timezone)` — x86_64 96. `timezone` (a2)
+        // is always NULL from every real caller and is not consulted.
+        96 => {
+            if a1 != 0 {
+                let us = crate::clock::now_us();
+                // SAFETY: a user `struct timeval { i64 tv_sec, i64 tv_usec }`.
+                unsafe {
+                    (a1 as *mut i64).write_volatile((us / 1_000_000).cast_signed());
+                    (a1 as *mut i64).add(1).write_volatile((us % 1_000_000).cast_signed());
+                }
+            }
+            return 0;
+        }
+        // `time(*time_t)` — x86_64 201. Writes through `tloc` when non-null,
+        // in addition to the return value, matching `time(2)`'s own contract.
+        201 => {
+            let secs = (crate::clock::now_us() / 1_000_000).cast_signed();
+            if a1 != 0 {
+                // SAFETY: a user `time_t` (i64).
+                unsafe { (a1 as *mut i64).write_volatile(secs) };
+            }
+            return secs as u64;
+        }
         _ => {}
     }
 

@@ -34,8 +34,10 @@
 
 #![no_std]
 
-pub mod boot;
-pub mod sntp;
+// Moved to `akuma-sntp` 2026-09-05 (that crate's own doc has why); re-exported
+// under the same names so every existing `akuma_syscalls_time::{boot, sntp}`
+// call site is unaffected.
+pub use akuma_sntp::{boot, sntp};
 
 use akuma_exec::process::user_access::{copy_to_user, read_user_into, write_user_val};
 use akuma_exec::threading::MAX_THREADS;

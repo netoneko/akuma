@@ -4,12 +4,19 @@
 //!
 //! Same shape as `akuma-net-yarn`'s `wait_until` state machine
 //! (`WaitPolicy` takes only effects; the caller wires the real socket/timer
-//! calls). The real caller is `src/ntp_boot.rs` in the bin crate, which wires
-//! `akuma_net::smoltcp_net::{udp_socket_send, udp_socket_recv, poll}` and
-//! `akuma_timer::uptime_us` into [`BootstrapEffects`].
+//! calls). **`amd64/src/clock.rs`** is the one real caller today, wiring
+//! `akuma_net::socket::{socket_send_udp, socket_recv_udp}` and its own
+//! iteration-counted `uptime_us` stand-in (see that module's doc — this
+//! target has no calibrated timer to feed the real thing) into
+//! [`BootstrapEffects`]. The main aarch64 kernel's own wiring — `akuma_net::
+//! smoltcp_net::{udp_socket_send, udp_socket_recv, poll}` and the real,
+//! hardware-calibrated `akuma_timer::uptime_us` — is still the open gap
+//! `docs/archive/MISSING_NTP_SYSCALLS.md` describes: this module (and
+//! `sntp`) were extracted from `src/syscall/time.rs` in anticipation of that
+//! wiring, but nothing in `src/` calls `bootstrap_over_udp` yet.
 //!
 //! This crate deliberately has no `akuma-net` dependency: the socket/DNS
-//! calls only exist behind the bin crate's `smoltcp` feature, and keeping
+//! calls only exist behind a caller's own network-stack feature, and keeping
 //! this crate free of that means the whole SNTP protocol + retry logic gets
 //! host tests independent of any network-stack feature flag.
 

@@ -40,16 +40,23 @@ use crate::serial;
 /// Microseconds per LAPIC tick. Set by `lapic::start_timer`.
 const US_PER_TICK: u64 = 10_000;
 
-fn uptime_us() -> u64 {
+/// `clock.rs`'s SNTP bootstrap (2026-09-05) uses this same coarse-but-honest
+/// tick clock for its own round-trip timing — one uptime source for the
+/// whole target, not two that could disagree. `pub` rather than `pub(crate)`
+/// because `mod net;` is itself private, which already bounds this to the
+/// crate (clippy's `redundant_pub_crate`).
+pub fn uptime_us() -> u64 {
     crate::lapic::ticks() * US_PER_TICK
 }
 
-/// No wall clock: this machine has no RTC and no SNTP client, so it does not
-/// know what time it is. `None` rather than a plausible-looking zero — the
-/// stack uses this for certificate validity, where a wrong answer is worse than
-/// no answer.
+/// Wall clock, via `clock.rs`'s SNTP bootstrap (2026-09-05) — `None` until it
+/// succeeds (or hasn't run yet), matching this function's original contract:
+/// a wrong answer is worse than no answer, so an unsynced clock stays `None`
+/// rather than a plausible-looking zero. Nothing in `akuma-net` reads this
+/// hook yet (checked: zero call sites), so wiring it doesn't change network
+/// behavior today — it makes the *hook* honest for whenever something does.
 fn utc_seconds() -> Option<u64> {
-    None
+    crate::clock::utc_seconds()
 }
 
 /// Spin until `deadline_us`, yielding so anything else runnable makes progress.
@@ -331,29 +338,55 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
 
 /// Stage Q: the netpoll daemon, the loop that was missing.
 ///
-/// Two things are checked. First, that the drain **terminates** — the bug this
-/// stage replaced was a settle loop keyed on a clock that had not started yet,
-/// which spun `poll()` until QEMU's TX ring collapsed. With nothing generating
-/// traffic, 64 back-to-back drains must end on a zero-progress lap. Second, that
-/// the spawned daemon is actually **scheduled**: its lap counter must climb
-/// while the boot task does nothing but `yield_now`.
+/// Split in two 2026-09-05 (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.30)
+/// — one call used to do both; `main.rs` now calls
+/// [`netpoll_drain_selftest`] then [`netpoll_spawn_selftest`] itself, with
+/// `clock.rs`'s SNTP fetch run in the gap between them: after DHCP (this
+/// drain is where it actually finishes) but **before** the netpoll daemon
+/// task exists. Calling any kernel-side `akuma_net::socket` function while
+/// that daemon is alive and cooperatively scheduled is new territory: every
+/// earlier kernel-side caller (`sock::smoke_test` included) ran with it not
+/// yet spawned, and the first thing that *did* run concurrently with it —
+/// `clock.rs`'s own DNS query — deadlocked on a spinlock the daemon's own
+/// poll step also takes, on this single core, the instant `sti` let the
+/// scheduler preempt into the daemon mid-critical-section. Not fixed at the
+/// lock; avoided by not creating the second concurrent locker until this
+/// window is closed.
 ///
-/// Runs last in the self-test sequence on purpose — it leaves the daemon
-/// running (that is the point; `run_init` needs it), so it must not perturb the
-/// leak and preemption checks that come before it.
-pub fn netpoll_selftest(t: &mut Suite, up: bool) {
-    use core::sync::atomic::Ordering;
-
+/// Two things are checked, one per half. First
+/// ([`netpoll_drain_selftest`]), that the drain **terminates** — the bug this
+/// stage replaced was a settle loop keyed on a clock that had not started
+/// yet, which spun `poll()` until QEMU's TX ring collapsed. With nothing
+/// generating traffic, 64 back-to-back drains must end on a zero-progress
+/// lap. Second ([`netpoll_spawn_selftest`]), that the spawned daemon is
+/// actually **scheduled**: its lap counter must climb while the boot task
+/// does nothing but `yield_now`.
+///
+/// [`netpoll_spawn_selftest`] leaves the daemon running (that is the point;
+/// `run_init` needs it), so both run last in the self-test sequence, after
+/// the leak and preemption checks.
+///
+/// The drain half. `false` (and a `t.note`, not a `t.check` — "no stack" is
+/// not a failure) means the caller should not go on to
+/// [`netpoll_spawn_selftest`].
+pub fn netpoll_drain_selftest(t: &mut Suite, up: bool) -> bool {
     if !up {
         t.note("net: netpoll skipped (no stack)", 0);
-        return;
+        return false;
     }
-
     let mut last = u32::MAX;
     for _ in 0..64 {
         last = drain_step();
     }
     t.check_eq("net: the netpoll drain reaches quiescence", u64::from(last), 0);
+    true
+}
+
+/// The spawn half — see [`netpoll_drain_selftest`]'s doc. Only call this once
+/// the drain half has run (`netpoll_drain_selftest` returned `true`) — it
+/// does not check `up` itself.
+pub fn netpoll_spawn_selftest(t: &mut Suite) {
+    use core::sync::atomic::Ordering;
 
     let before = NETPOLL_LAPS.load(Ordering::Relaxed);
     if t.check("net: netpoll daemon spawned", spawn_netpoll()) {
