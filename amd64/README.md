@@ -16,10 +16,12 @@ the PVH memory map, the virtio-MMIO command line, and ACPI's MADT — and since
 Stage N it mounts **ext2** on that disk and runs a program it opened by path;
 Stage O gave ring 3 `open`/`read`/`close`/`lseek`/`fstat`/`mmap` and a serial
 shell (`paws`); Stage Q added a **netpoll daemon** so DHCP completes and `httpd`
-serves a request over virtio-net; and Stage R added `getrandom`, `fcntl` and
+serves a request over virtio-net; Stage R added `getrandom`, `fcntl` and
 **`sys_spawn`**, so **`sshd` serves an authenticated session** — key exchange,
-ed25519 pubkey auth, and a shell started over stdin/stdout pipes. No `fork`, no
-writes, no device interrupts.
+ed25519 pubkey auth, and a shell started over stdin/stdout pipes; and Stage S
+runs a **stock static musl `busybox`** — a binary the tree did not compile —
+via `arch_prctl` (TLS base), SSE enabled in `boot.s`, `uname` and `writev`
+(`busybox uname -a` prints `x86_64`). No `fork`, no writes, no device interrupts.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1** —
 `curl http://10.0.2.15:8080/` and `ssh root@10.0.2.15 'echo hi'` both from the

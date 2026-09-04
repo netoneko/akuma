@@ -132,9 +132,10 @@ if [ -n "$SSHD" ]; then
     if [ -f "$SSH_TEST_KEY.pub" ]; then
         "$DEBUGFS" -w -R "write $SSH_TEST_KEY.pub etc/sshd/authorized_keys" "$IMG" >/dev/null 2>&1
     fi
-    # The shell sshd starts in a session. `/bin/sh` is busybox on a devbox
-    # image; here the shell that builds for this target is `paws`.
-    printf 'shell = /bin/paws\n' > "$TMP/sshd.conf"
+    # The shell sshd starts in a session. `paws` is the shell that builds for
+    # this target and is the default; `SSHD_SHELL=/bin/sh` points it at busybox
+    # instead (exec-mode commands only — an interactive busybox needs `fork`).
+    printf 'shell = %s\n' "${SSHD_SHELL:-/bin/paws}" > "$TMP/sshd.conf"
     "$DEBUGFS" -w -R "write $TMP/sshd.conf etc/sshd/sshd.conf" "$IMG" >/dev/null 2>&1
 fi
 # Something for httpd to serve. httpd's document root is `/public`, and `GET /`
