@@ -32,7 +32,7 @@
 
 use akuma_ext2::{BlockDevice, Ext2Filesystem};
 use akuma_selftest::Suite;
-use akuma_vfs::Filesystem;
+use akuma_vfs::{Filesystem, Metadata};
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
@@ -105,6 +105,18 @@ pub fn with_root<R>(f: impl FnOnce(&Ext2Filesystem<VirtioBlk>) -> R) -> Option<R
 #[must_use]
 pub fn read_file(path: &str) -> Option<Vec<u8>> {
     with_root(|fs| fs.read_file(path).ok())?
+}
+
+/// Inode metadata for a path — the backing for the path-based `stat` syscalls.
+///
+/// `akuma-ext2`'s `type_perms` maps straight onto a Linux `st_mode`, so the
+/// caller gets the real file type and permission bits, not a fixed guess. The
+/// path walk does not follow symlinks (see [`sys_newfstatat`]'s note).
+///
+/// [`sys_newfstatat`]: crate::fd::sys_newfstatat
+#[must_use]
+pub fn metadata(path: &str) -> Option<Metadata> {
+    with_root(|fs| fs.metadata(path).ok())?
 }
 
 /// Mount, then prove the filesystem can be read.

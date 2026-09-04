@@ -336,6 +336,36 @@ pub fn spawn_in_space(entry: extern "C" fn() -> !, space_root: u64) -> Option<us
     Some(slot)
 }
 
+/// Repoint the **running** task's address space, and install it in `CR3` now.
+///
+/// `execve` (Stage T) rebuilds a spawned child's process in a fresh address
+/// space without a `fork`; the task keeps running but must switch page tables.
+/// The switch is done here rather than left to the next `yield_now` because the
+/// caller (`usermode::run_process`) re-enters ring 3 at a VA that only the new
+/// space maps — a stale `CR3` would `#PF` on the first user instruction.
+///
+/// Safe to switch mid-flight: every space shares the kernel's upper-half
+/// mappings, so the kernel stack this runs on stays mapped across `mov cr3`.
+pub fn set_current_space_root(space_root: u64) {
+    // SAFETY: raw-pointer access to the table; single core.
+    unsafe {
+        (*tasks())[current()].space_root = space_root;
+    }
+    let want = if space_root == 0 {
+        KERNEL_ROOT.load(Ordering::Relaxed)
+    } else {
+        space_root
+    };
+    if want != paging::active_root() {
+        // SAFETY: `want` is either a live `AddressSpace` root (from `execve`'s
+        // freshly-loaded image) or the kernel's own; both share the upper-half
+        // mappings, so the kernel stack and code stay mapped across the write.
+        unsafe {
+            paging::activate(want);
+        }
+    }
+}
+
 /// Create a daemon task: one that runs for the life of the kernel and is not
 /// counted by [`all_user_tasks_finished`]. The netpoll loop is the only caller.
 pub fn spawn_daemon(entry: extern "C" fn() -> !) -> Option<usize> {

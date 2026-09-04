@@ -384,12 +384,23 @@ pub fn load(
 /// heap allocation on the spawn path.
 pub const MAX_ARGV: usize = 16;
 
+/// The most envp entries the initial stack builder will place. `execve` from a
+/// shell hands the child its whole environment; 32 covers a login shell's
+/// `PATH`/`HOME`/`TERM`/… with headroom, and bounds the copy without a heap
+/// allocation (same reasoning as [`MAX_ARGV`]).
+pub const MAX_ENVP: usize = 32;
+
+/// Words in the fixed word block: argc, argv ptrs + NULL, envp ptrs + NULL, and
+/// three auxv pairs (`AT_PAGESZ`, `AT_ENTRY`, `AT_NULL`).
+const STACK_WORDS_MAX: usize = 1 + (MAX_ARGV + 1) + (MAX_ENVP + 1) + 6;
+
 pub fn build_stack(
     space: &AddressSpace,
     frames: &mut FrameSet,
     top: u64,
     pages: usize,
     argv: &[&[u8]],
+    envp: &[&[u8]],
     entry: u64,
 ) -> Result<u64, &'static str> {
     if !top.is_multiple_of(PAGE_SIZE as u64) || pages == 0 {
@@ -398,41 +409,53 @@ pub fn build_stack(
     if argv.is_empty() || argv.len() > MAX_ARGV {
         return Err("argv must hold 1..=MAX_ARGV entries");
     }
+    if envp.len() > MAX_ENVP {
+        return Err("envp exceeds MAX_ENVP entries");
+    }
     let bytes = (pages as u64) * PAGE_SIZE as u64;
     let base = top.checked_sub(bytes).ok_or("stack underflows the address space")?;
     map_range(space, frames, base, top, Prot::USER_RW)?;
 
-    // The argv strings sit at the very top, NUL-terminated, packed downward.
-    // `str_va[i]` is where argv[i]'s bytes land.
-    let mut str_va = [0u64; MAX_ARGV];
+    // The argv then envp strings sit at the very top, NUL-terminated, packed
+    // downward. `arg_va[i]` / `env_va[i]` is where each string's bytes land.
+    let mut arg_va = [0u64; MAX_ARGV];
+    let mut env_va = [0u64; MAX_ENVP];
     let mut cursor = top;
-    for (slot, a) in str_va.iter_mut().zip(argv) {
+    for (slot, a) in arg_va.iter_mut().zip(argv) {
         cursor -= a.len() as u64 + 1;
+        *slot = cursor;
+    }
+    for (slot, e) in env_va.iter_mut().zip(envp) {
+        cursor -= e.len() as u64 + 1;
         *slot = cursor;
     }
     // Round the whole string blob down to 16 so the word block below starts
     // aligned without a second adjustment.
     let strings_base = cursor & !0xf;
 
-    // argc, one pointer per argv entry, argv NULL, envp NULL, three auxv pairs.
-    let words = 1 + argv.len() + 1 + 1 + 6;
+    // argc, one pointer per argv entry, argv NULL, one per envp entry, envp
+    // NULL, three auxv pairs.
+    let words = 1 + argv.len() + 1 + envp.len() + 1 + 6;
     let rsp = (strings_base - (words as u64) * 8) & !0xf;
     if rsp < base {
         return Err("initial stack frame does not fit");
     }
 
     // Assemble the word block on the kernel stack, then copy it in one shot.
-    let mut buf = [0u8; (1 + MAX_ARGV + 1 + 1 + 6) * 8];
+    let mut buf = [0u8; STACK_WORDS_MAX * 8];
     let mut put = |slot: usize, v: u64| {
         buf[slot * 8..slot * 8 + 8].copy_from_slice(&v.to_le_bytes());
     };
     put(0, argv.len() as u64);
-    for (i, &va) in str_va.iter().take(argv.len()).enumerate() {
+    for (i, &va) in arg_va.iter().take(argv.len()).enumerate() {
         put(1 + i, va);
     }
     put(1 + argv.len(), 0); // argv terminator
-    put(2 + argv.len(), 0); // envp terminator
-    let aux = 3 + argv.len();
+    for (i, &va) in env_va.iter().take(envp.len()).enumerate() {
+        put(2 + argv.len() + i, va);
+    }
+    put(2 + argv.len() + envp.len(), 0); // envp terminator
+    let aux = 3 + argv.len() + envp.len();
     put(aux, AT_PAGESZ);
     put(aux + 1, PAGE_SIZE as u64);
     put(aux + 2, AT_ENTRY);
@@ -440,9 +463,9 @@ pub fn build_stack(
     put(aux + 4, AT_NULL);
     put(aux + 5, 0);
 
-    for (&va, a) in str_va.iter().zip(argv) {
+    for (&va, a) in arg_va.iter().zip(argv).chain(env_va.iter().zip(envp)) {
         if !write_user(space, va, a) || !write_user(space, va + a.len() as u64, &[0]) {
-            return Err("could not write argv");
+            return Err("could not write argv/envp");
         }
     }
     if !write_user(space, rsp, &buf[..words * 8]) {

@@ -402,6 +402,22 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
     match nr {
         // x86_64 158: the TLS-base primitive. No aarch64 number.
         158 => return sys_arch_prctl(a1, a2),
+        // Path-based `struct stat`. `stat` (4) and `lstat` (6) are x86-only —
+        // `asm-generic` dropped them, so aarch64 has no number and they cannot
+        // go through the `Syscall` enum; `newfstatat` (262) exists on both but
+        // is grouped here with its siblings. `stat` follows a final symlink,
+        // `lstat` does not (`AT_SYMLINK_NOFOLLOW` == 0x100) — on this target
+        // that changes nothing (see `fd::sys_newfstatat`). `AT_FDCWD` is -100.
+        // busybox `sh` stats every PATH entry before it will run an applet —
+        // without this it saw `ENOSYS` and reported "Function not implemented"
+        // for a working builtin.
+        4 => return crate::fd::sys_newfstatat((-100i64) as u64, a1, a2, 0),
+        6 => return crate::fd::sys_newfstatat((-100i64) as u64, a1, a2, 0x100),
+        262 => return crate::fd::sys_newfstatat(a1, a2, a3, a4),
+        // `execve(path, argv, envp)` — x86_64 59. No `fork` on this target, so
+        // this is the `sh -c "<cmd>"` shape: the current (spawned) task replaces
+        // its own image in place. See `sys_execve`.
+        59 => return sys_execve(a1, a2, a3),
         // uname(2). Same static-.rodata answer the aarch64 kernel gives, machine
         // string aside — see `akuma_syscalls_glue::proc::sys_uname`.
         63 => return sys_uname(a1),
@@ -944,6 +960,17 @@ impl Process {
         image: &[u8],
         argv: &[&[u8]],
     ) -> Result<(Self, loader::LoadedImage), &'static str> {
+        Self::from_elf_argv_envp(image, argv, &[])
+    }
+
+    /// As [`Self::from_elf_argv`], plus the environment. `execve` (Stage T)
+    /// hands the new image the caller's whole `envp`; `spawn` passes none, and a
+    /// program with an empty environment falls back to its own default `PATH`.
+    fn from_elf_argv_envp(
+        image: &[u8],
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+    ) -> Result<(Self, loader::LoadedImage), &'static str> {
         let space = paging::AddressSpace::new().ok_or("no frame for a PML4")?;
         let mut frames = FrameSet::new();
 
@@ -954,6 +981,7 @@ impl Process {
                 ELF_STACK_TOP,
                 ELF_STACK_PAGES,
                 argv,
+                envp,
                 img.entry,
             )
             .map(|rsp| (img, rsp))
@@ -973,6 +1001,9 @@ impl Process {
     }
 
     fn free(mut self) {
+        // Anonymous `mmap` frames first — they are not in `self.frames` (no
+        // region table yet) and the walk needs the page tables still standing.
+        crate::mm::release_anon_frames(&self.space);
         self.frames.free_all();
         self.space.free();
     }
@@ -992,6 +1023,22 @@ static mut PROCS: [Option<Process>; 16] = [const { None }; 16];
 /// First `PROCS` slot `sys_spawn` may use; everything below is the self-tests
 /// and `run_init`.
 pub const SPAWN_SLOT_BASE: usize = 7;
+
+/// A fully-built replacement image parked by [`sys_execve`], keyed by `PROCS`
+/// slot. `run_process` picks it up after `enter_user_mode` returns and does the
+/// address-space swap on the kernel stack — outside the syscall asm, where a
+/// `mov cr3` and a frame free belong.
+static mut PENDING_EXEC: [Option<Process>; 16] = [const { None }; 16];
+
+/// Take the replacement image for `idx`, if `execve` parked one.
+fn take_pending_exec(idx: usize) -> Option<Process> {
+    // SAFETY: raw-pointer access; single core, and only this task's own
+    // `run_process` reads its slot.
+    unsafe {
+        let pending = &raw mut PENDING_EXEC;
+        (*pending)[idx].take()
+    }
+}
 
 /// Enter ring 3 for process `idx`, then mark the task finished.
 ///
@@ -1024,7 +1071,31 @@ fn run_process(idx: usize) -> ! {
         // SAFETY: both are addresses the loader (or `Process::new`) mapped
         // user-accessible in the address space the scheduler installed for this
         // task, and every program this kernel runs ends in exit_group.
-        let status = unsafe { enter_user_mode(entry, stack) };
+        //
+        // The loop is `execve`: when the last syscall parked a replacement
+        // image, swap it into this slot, switch `CR3`, free the old image, and
+        // re-enter ring 3 at the new entry — the same task, a new program.
+        let (mut entry, mut stack) = (entry, stack);
+        let status = loop {
+            let status = unsafe { enter_user_mode(entry, stack) };
+            let Some(next) = take_pending_exec(idx) else {
+                break status;
+            };
+            let new_root = next.space.root();
+            (entry, stack) = (next.entry, next.stack);
+            // SAFETY: raw-pointer access; single core. Replace before the CR3
+            // switch so the slot always names the live image.
+            let old = unsafe {
+                let procs = &raw mut PROCS;
+                (*procs)[idx].replace(next)
+            };
+            crate::sched::set_current_space_root(new_root);
+            // The old page tables and frames are unreferenced now that CR3
+            // points at the new space — safe to hand back to the PMM.
+            if let Some(old) = old {
+                old.free();
+            }
+        };
         EXIT_STATUS.store(status, Ordering::Relaxed);
         if idx >= SPAWN_SLOT_BASE {
             spawn_record_exit(idx, status as i32);
@@ -1143,6 +1214,103 @@ fn user_argv(ptr: u64) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
         }
     }
     argv
+}
+
+/// Parse a NULL-terminated array of C-string pointers, bounded at `max` entries.
+fn user_strv(ptr: u64, max: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+    let mut out = alloc::vec::Vec::new();
+    if ptr == 0 {
+        return out;
+    }
+    for i in 0..max {
+        // SAFETY: as `user_cstr`; the array is the caller's and NULL-terminated.
+        let p = unsafe { (ptr as *const u64).add(i).read_volatile() };
+        if p == 0 {
+            break;
+        }
+        match user_cstr(p, 512) {
+            Some(s) => out.push(s),
+            None => break,
+        }
+    }
+    out
+}
+
+/// `execve(path, argv, envp)` — x86_64 syscall 59.
+///
+/// This target has no `fork`, so `execve` is only ever the tail of a spawned
+/// task: `sshd`/`run_init` start a shell with `sys_spawn`, and the shell running
+/// `sh -c "<cmd>"` `execve`s the command directly (ash does not fork for the
+/// single-command `-c` form — verified with `strace`). The running task keeps
+/// its `PROCS` slot, its pipes and its pid; only the image behind it changes.
+///
+/// The build happens here, on the syscall stack; the *swap* (replace the slot,
+/// `mov cr3`, free the old image) happens in [`run_process`] after this returns
+/// through the `leave` path, because a page-table switch and a frame free do not
+/// belong inside the syscall asm. On success this does not really "return" — it
+/// sets `leave` and the next thing the task does is re-enter ring 3 at the new
+/// entry. On failure it returns a negative errno and the caller runs on.
+fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    use crate::fd::errno;
+
+    let slot = current_proc_slot();
+    if slot == usize::MAX || slot >= 16 {
+        // Not a slotted user task — nothing to replace.
+        return errno::ENOSYS;
+    }
+
+    let Some(path_bytes) = user_cstr(path_ptr, 256) else {
+        return errno::EFAULT;
+    };
+    let Ok(path) = core::str::from_utf8(&path_bytes) else {
+        return errno::EINVAL;
+    };
+    let Some(image) = crate::fs::read_file(path) else {
+        return errno::ENOENT;
+    };
+
+    let argv_owned = {
+        let mut v = user_strv(argv_ptr, loader::MAX_ARGV);
+        if v.is_empty() {
+            v.push(path_bytes.clone());
+        }
+        v
+    };
+    let envp_owned = user_strv(envp_ptr, loader::MAX_ENVP);
+    let argv_refs: alloc::vec::Vec<&[u8]> =
+        argv_owned.iter().map(alloc::vec::Vec::as_slice).collect();
+    let envp_refs: alloc::vec::Vec<&[u8]> =
+        envp_owned.iter().map(alloc::vec::Vec::as_slice).collect();
+
+    let (proc, _img) = match Process::from_elf_argv_envp(&image, &argv_refs, &envp_refs) {
+        Ok(p) => p,
+        Err(e) => {
+            serial::puts("  [execve] load failed: ");
+            serial::puts(e);
+            serial::puts("\n");
+            // The image was rejected; the caller's own image is untouched, so
+            // this is a real errno return, not a leave.
+            return errno::ENOMEM;
+        }
+    };
+
+    // Park the built image and ask the entry path to leave ring 3. `run_process`
+    // does the swap.
+    // SAFETY: raw-pointer access; single core, slot is this task's own.
+    unsafe {
+        let pending = &raw mut PENDING_EXEC;
+        (*pending)[slot] = Some(proc);
+    }
+    // SAFETY: single core, interrupts off inside a syscall; `CURRENT_UCTX` is
+    // this task's slot. Same `leave` mechanism `exit` uses.
+    unsafe {
+        let cur = &raw const CURRENT_UCTX;
+        let uctx = *cur;
+        if !uctx.is_null() {
+            (*uctx).leave = 1;
+        }
+    }
+    0
 }
 
 /// `spawn(path, argv, envp, stdin, stdin_len, flags)` — Akuma's own syscall 301.
@@ -1520,6 +1688,71 @@ pub fn busybox_test(t: &mut Suite) {
     );
     t.check_eq(
         "busybox: teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+}
+
+/// Stage T: `execve` with no `fork`.
+///
+/// `busybox sh -c "uname"` is spawned; ash resolves `uname` on `PATH`,
+/// `stat`s `/bin/uname` (the path-`stat` half of this stage) and `execve`s it
+/// **in place** — no fork. The spawned task keeps its slot, pid and stdout
+/// pipe, so `uname`'s output ("Akuma") comes back the same way the shell's would
+/// and `waitpid` reaps one child, not two.
+pub fn execve_test(t: &mut Suite) {
+    const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
+
+    if crate::fs::read_file("/bin/busybox").is_none() || crate::fs::read_file("/bin/sh").is_none() {
+        t.note("execve: busybox /bin/sh not on the disk; skipped", 0);
+        return;
+    }
+
+    let free_before = akuma_pmm::free_count();
+    let path = b"/bin/sh\0";
+    // The exact shape `sshd`'s exec sessions use: `sh -c "<cmd with args>"`.
+    // ash runs a single simple command (even with arguments) by `execve` in
+    // place, no fork — a `;`/`|` sequence is what forces the fork it does not
+    // have yet.
+    let (a0, a1a, a2a) = (b"sh\0", b"-c\0", b"uname -a\0");
+    let argv: [u64; 4] = [a0.as_ptr() as u64, a1a.as_ptr() as u64, a2a.as_ptr() as u64, 0];
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    if !t.check("execve: sh spawned", r < ERRNO_FLOOR) {
+        return;
+    }
+    let pid = (r & 0xFFFF_FFFF) as u32;
+    let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
+    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut status = u64::MAX;
+    let mut buf = [0u8; 64];
+    let mut spins = 0u64;
+    loop {
+        spins += 1;
+        if spins > 3_000_000 {
+            break;
+        }
+        let n = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        if n != 0 && n < ERRNO_FLOOR {
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        let mut st: i32 = -1;
+        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+            status = ((st >> 8) & 0xff) as u64;
+            break;
+        }
+        crate::sched::yield_now();
+    }
+    crate::fd::sys_close(stdout_fd);
+
+    t.check_eq("execve: `sh -c \"uname -a\"` exited 0", status, 0);
+    t.check(
+        "execve: the exec'd program's output came back",
+        out.windows(5).any(|w| w == b"Akuma") && out.windows(6).any(|w| w == b"x86_64"),
+    );
+    t.check_eq(
+        "execve: teardown leaks nothing (one child reaped, not two)",
         akuma_pmm::free_count() as u64,
         free_before as u64,
     );

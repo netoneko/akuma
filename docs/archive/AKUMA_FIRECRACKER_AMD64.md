@@ -2043,28 +2043,97 @@ it: `sh -c "uname -a"` `stat`s every PATH entry, every `stat` returns `ENOSYS`,
 and it reports `uname: Function not implemented` for an applet that works
 standalone.
 
-## 3.26 Stage T (planned): `busybox sh` runs commands
+## 3.26 Stage T: `busybox sh -c "<cmd>"` runs a command
 
-The ordered list, from the Stage-S `strace`:
+The ordered list, from the Stage-S `strace`. Steps 1 and 2's `execve` are done
+(2026-09-04); the rest is still ahead.
 
-1. **Path `stat` — `stat`/`lstat` (4/6), `newfstatat` (262).** Self-contained,
-   and probably most of what a no-`fork` `sh -c "<applet>"` needs. `sys_fstat`
-   (5) already works for open fds; `akuma-ext2` hands `src/fs.rs` the inode
-   metadata for the path-based version. **First.**
-2. **`fork`/`vfork` (57/58) + `execve` (59) + `wait4` (61).** External commands
-   and pipelines. No CoW fork here — `vfork`+`execve` (share the address space
-   until `exec`, the `posix_spawn` shape busybox uses) is the shorter road.
-   Route Linux `wait4` (61) into the existing Akuma-private `waitpid` (303)
-   spawn table in `usermode.rs`.
-3. **`pipe2` (293), `dup2`/`dup3` (33/292).** `akuma-pipe` + `alloc_pipe_fd` are
-   the pieces; wire `sys_pipe2`.
-4. **`getdents64` (217)** — `ls`. `akuma-vfs`'s `read_dir` is already used by
+### 3.26.1 Step 1 — path `stat` (done)
+
+`stat`/`lstat` (x86_64 4/6) and `newfstatat` (262). `stat` and `lstat` do not
+exist under `asm-generic` — aarch64 dropped them — so they cannot go through the
+`Syscall` enum and are handled by raw number in `syscall_dispatch`, alongside
+`uname`/`getcwd`; all three land in `fd::sys_newfstatat`. `stat` decodes to
+`newfstatat(AT_FDCWD, path, buf, 0)`, `lstat` to the same with
+`AT_SYMLINK_NOFOLLOW`, and `AT_EMPTY_PATH` falls through to `fstat`.
+
+The mode/size/inode/timestamps come straight from `akuma-ext2`'s inode metadata
+via a new `fs::metadata` — `type_perms` already *is* a Linux `st_mode`, so
+`S_ISDIR` / `S_ISREG` / the executable bit a shell checks come through
+unmodified. The x86_64 `struct stat` is serialised at its own field offsets
+(`st_nlink` at 16, `st_mode` at 24) — **not** `akuma-syscalls-linux`'s `Stat`,
+whose layout is `asm-generic`'s (`st_mode` at 16). That struct is the reason
+proposal item 5 is not cosmetic.
+
+Symlinks: this target's ext2 path walk does not follow them and `mkdisk.sh`
+builds the applet farm with **hard links** (`debugfs ln`), not symlinks, so
+`AT_SYMLINK_NOFOLLOW` changes nothing. Following belongs in `fs.rs` (where
+`openat` would need it too) if a symlink farm ever appears.
+
+With this, `busybox sh -c "uname"` stops printing *"uname: Function not
+implemented"*: it `stat`s every `PATH` entry (`ENOENT` for the misses, success +
+a real `st_mode` for `/bin/uname`) instead of getting `ENOSYS`, then proceeds to
+run the command.
+
+### 3.26.2 Step 2 — `execve`, no `fork` (done)
+
+`execve` (59) with **no** `fork`/`vfork`. ash does not fork for the
+single-command `sh -c "<cmd>"` form (confirmed by `strace` — `execve` follows
+the `stat`s with no `clone` between), so this one syscall is the whole path from
+"shell resolves the command" to "the command runs and its output comes back".
+
+The running task keeps its `PROCS` slot, its pid and its stdout pipe; only the
+image behind it changes. `sys_execve` builds the replacement `Process` (fresh
+address space, ELF loaded, initial stack with the real argv **and envp**) on the
+syscall stack, parks it in `PENDING_EXEC[slot]`, and sets the same `leave` flag
+`exit` uses. `run_process` — now a loop — picks it up after `enter_user_mode`
+returns: swap the slot, `sched::set_current_space_root` (which does the `mov
+cr3` immediately, because the re-entry VA is only mapped in the new space), free
+the old image, re-enter ring 3 at the new entry. The page-table switch and the
+frame free are deliberately in `run_process` on the kernel stack, not in the
+syscall asm.
+
+`build_stack` grew an `envp` parameter (bounded `MAX_ENVP = 32`) — `execve`
+hands the child the caller's whole environment; `spawn` still passes none and a
+program with an empty environment falls back to its own default `PATH`
+(`/bin` is on busybox's, so the applet farm resolves).
+
+**What went wrong: `execve` exposed a latent frame leak.** The first
+`execve_test` run failed its teardown check by exactly 5 frames. `sys_mmap` maps
+frames straight into the page tables and records them **nowhere** — not in the
+process `FrameSet` (there is no region table; the standing `akuma-mmap` debt) —
+so `Process::free` only ever reclaimed the loader's image and stack, and every
+spawned program that called `mmap` leaked its heap on exit. It was invisible
+because the only torn-down processes so far were the non-allocating probes
+(`hello`, `fdprobe`, `busybox uname` — none `mmap`s); a shell `mmap`s, and
+`execve` tears one down mid-life. Fixed by `mm::release_anon_frames`, which
+walks the one VA window `sys_mmap` populates (`[MMAP_BASE, NEXT_VA)`) and frees
+every still-mapped frame — called from `Process::free` before the `FrameSet` and
+the tables go. This also closes the leak on the ordinary spawn→`waitpid` path.
+
+Gate: `usermode::execve_test` spawns `/bin/sh -c "uname"`, checks the exec'd
+program's output (`Akuma`) comes back on the shell's stdout pipe, the child
+exits 0, and teardown frees exactly what it allocated — one child reaped, not
+two.
+
+### 3.26.3 Still ahead
+
+3. **`fork`/`vfork` (57/58) + `wait4` (61).** Interactive `busybox sh` and
+   pipelines (`a | b`) — ash *does* fork for those. No CoW here; `vfork`+`execve`
+   (share the address space until `exec`) is the shorter road. Route Linux
+   `wait4` (61) into the Akuma-private `waitpid` (303) spawn table — but note
+   `sys_waitpid` is non-blocking (returns 0 while the child runs) and a forked
+   shell expects `wait4(pid, &st, 0, 0)` to block, so the routing needs a wait
+   loop, not a passthrough.
+4. **`pipe2` (293), `dup2`/`dup3` (33/292).** `akuma-pipe` + `alloc_pipe_fd`
+   are the pieces; wire `sys_pipe2`.
+5. **`getdents64` (217)** — `ls`. `akuma-vfs`'s `read_dir` is already used by
    `src/fs.rs`.
-5. **`arch_prctl` per-task `FS_BASE` save/restore in `sched.rs`** — load-bearing
+6. **`arch_prctl` per-task `FS_BASE` save/restore in `sched.rs`** — load-bearing
    once the shell and a forked child are both runnable. A `UserCtx` field
-   (offset ≥ 32, past what `syscall_entry` indexes), `wrmsr` on switch, mirroring
-   how AArch64 restores `TPIDR_EL0`.
-6. **`ioctl(TCGETS/TIOCGWINSZ)`** — a plausible `termios`/`winsize` so busybox
+   (offset ≥ 32, past what `syscall_entry` indexes), `wrmsr` on switch,
+   mirroring how AArch64 restores `TPIDR_EL0`.
+7. **`ioctl(TCGETS/TIOCGWINSZ)`** — a plausible `termios`/`winsize` so busybox
    runs interactive rather than falling back.
 
 Reference the AArch64 impls for semantics, not reuse (they are behind
@@ -2072,15 +2141,17 @@ Reference the AArch64 impls for semantics, not reuse (they are behind
 `crates/akuma-exec/src/process/` (fork), `crates/akuma-syscalls-glue/src/`,
 `src/syscall/`.
 
-Alongside it: `overlays/devbox-amd64/` grows a real rootfs — the busybox symlink
-farm, `/etc/passwd`, `/etc/profile`, static `/dev` nodes — so the shell has a
-PATH and an environment.
+Alongside it: `overlays/devbox-amd64/` grows a real rootfs — the busybox applet
+farm (**hard links**, not symlinks — the ext2 path walk does not follow
+symlinks), `/etc/passwd`, `/etc/profile`, static `/dev` nodes — so the shell has
+a PATH and an environment.
 
 **Two debts not to grow:** `amd64/src/` has never had the allocation audit
-(§3.24.5 — fixed buffers, not `Vec`, on every new syscall path); and
-`loader::MAX_PROC_FRAMES` is a `[usize; 512]`-per-`Process` fixed array a region
-list should replace (which also unblocks real `mprotect` and demand paging for
-spawned processes).
+(§3.24.5 — fixed buffers, not `Vec`, on every new syscall path — `sys_execve`
+adds more `Vec`-per-argv on the spawn path); and `loader::MAX_PROC_FRAMES` is a
+`[usize; 512]`-per-`Process` fixed array a region list should replace (which
+also unblocks real `mprotect`, demand paging, and would have made
+`mm::release_anon_frames` unnecessary).
 
 ## 4. What is deliberately missing
 

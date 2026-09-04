@@ -167,6 +167,33 @@ pub fn sys_munmap(addr: u64, len: u64) -> u64 {
     0
 }
 
+/// Free every anonymous-mapping frame `space` still holds — process teardown.
+///
+/// `sys_mmap` does not record its frames in the process `FrameSet`: there is no
+/// per-address-space region table (the standing `akuma-mmap` debt,
+/// `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §1), so `Process::free` cannot
+/// reclaim them the way it reclaims the loader's image and stack. This walks the
+/// one VA window `sys_mmap` ever populates — `[MMAP_BASE, NEXT_VA)` — and hands
+/// each still-mapped frame back to the PMM. Pages already gone (a prior
+/// `munmap`, or another process's slice of the shared bump range) are skipped.
+///
+/// Bounded by the VA the bump allocator has handed out, which stays in the low
+/// MiB for this target's workloads. Until this existed, every spawned program
+/// that called `mmap` leaked its heap on exit — invisible while the only
+/// torn-down processes were the non-allocating probes, and exposed the moment
+/// `execve` tore down a shell (Stage T).
+pub fn release_anon_frames(space: &paging::AddressSpace) {
+    let end = NEXT_VA.load(Ordering::Relaxed);
+    let root = space.root();
+    let mut va = MMAP_BASE;
+    while va < end {
+        if let Some(frame) = paging::unmap_page_in(root, va as usize) {
+            akuma_pmm::free_page(frame as usize, 0);
+        }
+        va += PAGE_SIZE;
+    }
+}
+
 /// Check the refusals, which are the part a guest program cannot easily reach.
 ///
 /// The success path is exercised for real by every allocating program; what is

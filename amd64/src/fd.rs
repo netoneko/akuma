@@ -622,33 +622,128 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     file.position as u64
 }
 
-/// `fstat(fd, statbuf)` — enough of `struct stat` for a caller to learn a size.
-///
-/// The x86_64 layout: `st_size` is at offset 48 and `st_mode` at 24. The rest is
-/// zeroed rather than invented; a caller that reads `st_dev` gets 0, which is
-/// wrong but is not a plausible-looking lie.
-pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
-    const STAT_SIZE: usize = 144;
+/// The x86_64 `struct stat` — 144 bytes. **Not** the aarch64 layout: x86_64
+/// puts `st_nlink` at 16 (8 bytes) and `st_mode` at 24, where `asm-generic`
+/// has `st_mode` at 16 and `st_nlink` at 20. This is why `akuma-syscalls-linux`'s
+/// `Stat` cannot be reused here — its field offsets are the other architecture's
+/// (proposal item 5 territory).
+const STAT_SIZE: usize = 144;
+
+/// `S_IFREG | 0644` — a plain file whose real mode the target does not track for
+/// an already-open fd (`KernelFile` here carries no inode).
+const S_IFREG_0644: u32 = 0o100_644;
+/// `S_IFCHR | 0620`, for the console descriptors.
+const S_IFCHR_0620: u32 = 0o020_620;
+
+/// Serialise a `struct stat` at the x86_64 field offsets. The fields this target
+/// can answer are filled; the rest stay zero rather than invented — a caller
+/// that reads `st_dev` gets 0, which is wrong but is not a plausible-looking lie.
+fn encode_stat(
+    mode: u32,
+    size: u64,
+    ino: u64,
+    nlink: u64,
+    atime: Option<u64>,
+    mtime: Option<u64>,
+    ctime: Option<u64>,
+) -> [u8; STAT_SIZE] {
+    const ST_INO: usize = 8;
+    const ST_NLINK: usize = 16;
     const ST_MODE: usize = 24;
     const ST_SIZE: usize = 48;
-    /// `S_IFREG | 0644`.
-    const REG_MODE: u32 = 0o100_644;
-    /// `S_IFCHR | 0620`, for the console.
-    const CHR_MODE: u32 = 0o020_620;
+    const ST_BLKSIZE: usize = 56;
+    const ST_BLOCKS: usize = 64;
+    const ST_ATIME: usize = 72;
+    const ST_MTIME: usize = 88;
+    const ST_CTIME: usize = 104;
 
     let mut st = [0u8; STAT_SIZE];
+    st[ST_INO..ST_INO + 8].copy_from_slice(&ino.to_le_bytes());
+    st[ST_NLINK..ST_NLINK + 8].copy_from_slice(&nlink.to_le_bytes());
+    st[ST_MODE..ST_MODE + 4].copy_from_slice(&mode.to_le_bytes());
+    st[ST_SIZE..ST_SIZE + 8].copy_from_slice(&size.to_le_bytes());
+    st[ST_BLKSIZE..ST_BLKSIZE + 8].copy_from_slice(&4096u64.to_le_bytes());
+    st[ST_BLOCKS..ST_BLOCKS + 8].copy_from_slice(&size.div_ceil(512).to_le_bytes());
+    st[ST_ATIME..ST_ATIME + 8].copy_from_slice(&atime.unwrap_or(0).to_le_bytes());
+    st[ST_MTIME..ST_MTIME + 8].copy_from_slice(&mtime.unwrap_or(0).to_le_bytes());
+    st[ST_CTIME..ST_CTIME + 8].copy_from_slice(&ctime.unwrap_or(0).to_le_bytes());
+    st
+}
+
+/// `fstat(fd, statbuf)` — `struct stat` for an already-open descriptor.
+///
+/// The size comes from the cached contents (see the module header); the mode is
+/// a fixed `S_IFREG | 0644` because a `KernelFile` on this target carries no
+/// inode to read a real one from. A console descriptor reports `S_IFCHR`.
+pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     let (mode, size) = if fd < FIRST_FILE_FD as u64 {
-        (CHR_MODE, 0u64)
+        (S_IFCHR_0620, 0u64)
     } else {
         let idx = fd - FIRST_FILE_FD as u64;
         let table = TABLE.lock();
         let Some(Some(entry)) = table.get(idx as usize) else {
             return errno::EBADF;
         };
-        (REG_MODE, entry.data.len() as u64)
+        (S_IFREG_0644, entry.data.len() as u64)
     };
-    st[ST_MODE..ST_MODE + 4].copy_from_slice(&mode.to_le_bytes());
-    st[ST_SIZE..ST_SIZE + 8].copy_from_slice(&size.to_le_bytes());
+    let st = encode_stat(mode, size, 0, 1, None, None, None);
+    copy_to_user(statbuf, &st);
+    0
+}
+
+/// `newfstatat(dirfd, path, statbuf, flags)` — and, by the two thin shims in
+/// `syscall_dispatch`, the x86-only `stat(2)` and `lstat(2)`.
+///
+/// `dirfd` is honoured only for `AT_EMPTY_PATH` (stat the fd itself, the
+/// `fstat` form busybox uses to size a file it just opened); every other path
+/// is resolved from the root, exactly as [`sys_openat`] does it, because this
+/// target has no per-process working directory.
+///
+/// The mode, size, inode and timestamps come straight from `akuma-ext2`'s inode
+/// metadata — the `type_perms` field already *is* a Linux `st_mode` (type bits
+/// plus permissions), so `S_ISDIR` / `S_ISREG` / the executable bit a shell
+/// checks before running a PATH entry all come through unmodified.
+///
+/// Symlinks: this target's ext2 path walk does not follow them and the rootfs
+/// is built with hard links rather than symlinks, so `AT_SYMLINK_NOFOLLOW` is
+/// accepted and makes no difference — `metadata` reports the link's own inode
+/// either way. When a symlink farm appears, following belongs in `fs.rs` where
+/// `openat` would need it too, not here.
+pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
+    /// `fstatat`'s "operate on `dirfd` itself when the path is empty" bit.
+    const AT_EMPTY_PATH: u64 = 0x1000;
+
+    let Some(path) = path_from_user(path) else {
+        return errno::EFAULT;
+    };
+
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH != 0 {
+            return sys_fstat(dirfd, statbuf);
+        }
+        return errno::ENOENT;
+    }
+
+    let normalised = if path.starts_with('/') {
+        path
+    } else {
+        let mut p = alloc::string::String::from("/");
+        p.push_str(&path);
+        p
+    };
+
+    let Some(meta) = fs::metadata(&normalised) else {
+        return errno::ENOENT;
+    };
+    let st = encode_stat(
+        meta.mode,
+        meta.size,
+        meta.inode,
+        if meta.is_dir { 2 } else { 1 },
+        meta.accessed,
+        meta.modified,
+        meta.created,
+    );
     copy_to_user(statbuf, &st);
     0
 }
@@ -698,10 +793,67 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     t.check_eq("fd: SEEK_END reports the file size", end, 6623);
     t.check_eq("fd: reading at EOF returns 0", sys_read(fd, buf.as_mut_ptr() as u64, 16), 0);
 
-    let mut st = [0u8; 144];
+    let mut st = [0u8; STAT_SIZE];
     t.check_eq("fd: fstat succeeds", sys_fstat(fd, st.as_mut_ptr() as u64), 0);
     t.check_eq(
         "fd: fstat reports the size",
+        u64::from_le_bytes(st[48..56].try_into().unwrap_or([0; 8])),
+        6623,
+    );
+
+    // Path-based stat: `newfstatat(AT_FDCWD, "/probe.txt", &st, 0)`, the form
+    // `stat(2)` decodes to. Size, regular-file type bit and link count must all
+    // come back — busybox `sh` reads exactly these off a PATH entry.
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    st = [0u8; STAT_SIZE];
+    let probe = b"/probe.txt\0";
+    t.check_eq(
+        "fd: newfstatat /probe.txt succeeds",
+        sys_newfstatat(AT_FDCWD, probe.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+        0,
+    );
+    t.check_eq(
+        "fd: newfstatat reports the size",
+        u64::from_le_bytes(st[48..56].try_into().unwrap_or([0; 8])),
+        6623,
+    );
+    let mode = u32::from_le_bytes(st[24..28].try_into().unwrap_or([0; 4]));
+    t.check("fd: newfstatat reports S_IFREG", mode & 0o170_000 == 0o100_000);
+    t.check_eq(
+        "fd: newfstatat reports st_nlink",
+        u64::from_le_bytes(st[16..24].try_into().unwrap_or([0; 8])),
+        1,
+    );
+
+    // A directory: the type bit must switch to S_IFDIR and nlink to 2.
+    st = [0u8; STAT_SIZE];
+    let bindir = b"/bin\0";
+    t.check_eq(
+        "fd: newfstatat /bin succeeds",
+        sys_newfstatat(AT_FDCWD, bindir.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+        0,
+    );
+    let dmode = u32::from_le_bytes(st[24..28].try_into().unwrap_or([0; 4]));
+    t.check("fd: newfstatat reports S_IFDIR for /bin", dmode & 0o170_000 == 0o040_000);
+
+    // A missing path is ENOENT, not ENOSYS — the whole point of the stage.
+    let gone = b"/no/such/path\0";
+    t.check_eq(
+        "fd: newfstatat on a missing path is ENOENT",
+        sys_newfstatat(AT_FDCWD, gone.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+        errno::ENOENT,
+    );
+
+    // `AT_EMPTY_PATH` on an open fd falls through to `fstat`.
+    st = [0u8; STAT_SIZE];
+    let empty = b"\0";
+    t.check_eq(
+        "fd: newfstatat AT_EMPTY_PATH stats the fd",
+        sys_newfstatat(fd, empty.as_ptr() as u64, st.as_mut_ptr() as u64, 0x1000),
+        0,
+    );
+    t.check_eq(
+        "fd: newfstatat AT_EMPTY_PATH reports the fd's size",
         u64::from_le_bytes(st[48..56].try_into().unwrap_or([0; 8])),
         6623,
     );

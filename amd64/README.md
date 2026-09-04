@@ -21,7 +21,10 @@ serves a request over virtio-net; Stage R added `getrandom`, `fcntl` and
 ed25519 pubkey auth, and a shell started over stdin/stdout pipes; and Stage S
 runs a **stock static musl `busybox`** — a binary the tree did not compile —
 via `arch_prctl` (TLS base), SSE enabled in `boot.s`, `uname` and `writev`
-(`busybox uname -a` prints `x86_64`). No `fork`, no writes, no device interrupts.
+(`busybox uname -a` prints `x86_64`); and Stage T (in progress) added path
+`stat`/`lstat`/`newfstatat` and **`execve`** (no `fork`), so
+**`busybox sh -c "uname"` resolves the command on `PATH` and runs it**. No
+`fork` yet, no writes, no device interrupts.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1** —
 `curl http://10.0.2.15:8080/` and `ssh root@10.0.2.15 'echo hi'` both from the
@@ -74,7 +77,7 @@ Akuma/amd64 — long mode reached
   [SmolNet] DHCP configured ... IP: 10.0.2.15/24
   net: the netpoll daemon is being scheduled   [OK]
 
-Akuma/amd64 self-test: 137 passed, 0 failed
+Akuma/amd64 self-test: 150 passed, 0 failed
 Akuma/amd64 — all self-tests passed
 ```
 
@@ -312,18 +315,24 @@ program that printed its verdict would have "passed" by running at all.
 ## What is deliberately missing
 
 - **No `fork`.** `sys_spawn` (Stage R) loads an ELF, wires its stdio to pipes
-  and runs it — enough for `sshd` to start a session shell, for `paws -c` to run
-  a command, and for `busybox` to run an applet — but there is no
-  `fork`/`execve`/`wait4`, so `busybox sh` cannot execute a command (it starts
-  up and stops there) and `sshd`'s `fork-sessions` mode is out. That plus path
-  `stat` and `pipe2` is **Stage T** (`docs/archive/AKUMA_FIRECRACKER_AMD64.md`
-  §3.26).
+  and runs it; `execve` (Stage T, syscall 59) replaces a spawned task's image in
+  place, no `fork` — enough for `busybox sh -c "<cmd>"` to resolve a command on
+  `PATH` (path `stat`, also Stage T) and run it. But there is still no
+  `fork`/`vfork`/`wait4`, so an **interactive** `busybox sh` and shell pipelines
+  (`a | b`) do not work, and `sshd`'s `fork-sessions` mode is out. That plus
+  `pipe2`, `getdents64` and per-task `FS_BASE` is the rest of **Stage T**
+  (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.26).
 - **No pty line discipline for a spawned shell.** `SPAWN_FLAG_PTY` is accepted
   and ignored; an interactive `sshd` shell gets raw bytes over its stdin pipe
   and does its own editing.
 - **Scheduler task slots do not recycle.** `waitpid` frees a reaped child's
-  process slot, frames and pipes, but not its `sched` task slot — so one `sshd`
-  boot serves ~13 commands before `spawn` returns `ENOMEM`.
+  process slot, frames and pipes, but not its `sched` task slot (`MAX_TASKS` =
+  24, and a `Finished` slot is never reused). The boot self-tests spend most of
+  them, so with `SSHD_SHELL=/bin/sh` a single `sshd` boot serves ~9
+  `ssh … '<cmd>'` exec sessions before `spawn` returns `ENOMEM` and sshd reports
+  *"failed to spawn"*. Task-slot recycling is the fix and is a stage of its own.
+  `execve` reuses the spawning task's slot rather than taking a new one, so it
+  does not make this worse per session.
 - **No writes to the filesystem**, and no mount table. `sshd` cannot persist its
   host key (it regenerates each boot, which it tolerates).
 - **No device interrupts.** The block driver polls the used ring; the NIC would
