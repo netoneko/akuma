@@ -221,6 +221,7 @@ pub fn init(enable_dhcp: bool) -> bool {
     match akuma_net::init(rt, enable_dhcp) {
         Ok(()) => {
             serial::puts("  net:  stack up\n");
+            settle();
             true
         }
         Err(e) => {
@@ -230,6 +231,37 @@ pub fn init(enable_dhcp: bool) -> bool {
             false
         }
     }
+}
+
+/// Drive the stack until DHCP has had its chance.
+///
+/// **Nothing else polls.** The AArch64 kernel runs a netpoll thread; here the
+/// only thing that calls `smoltcp_net::poll()` is `akuma-net`'s own blocking
+/// wait, from inside a socket operation. That is enough once a program is
+/// running, and it is nothing at all in the window between `init` and the first
+/// `accept` — which is exactly the window DHCP lives in. Without this, the lease
+/// never completes and the log says "DHCP deconfigured - reverting to static
+/// fallback" for a machine whose server was answering all along.
+///
+/// Bounded, because a machine with no DHCP server is a legitimate machine: the
+/// static fallback (10.0.2.15/24) is what QEMU's user-mode stack and the
+/// Firecracker host both hand out anyway, so failing to get a lease costs
+/// nothing here and must not cost the boot.
+fn settle() {
+    // Two seconds of ticks. Enough for a DISCOVER/OFFER/REQUEST/ACK round trip
+    // on both machines; short enough that a machine with no server is not
+    // noticeably slower to boot.
+    let deadline = uptime_us() + 2_000_000;
+    let mut polls: u64 = 0;
+    while uptime_us() < deadline {
+        if akuma_net::smoltcp_net::poll() {
+            polls += 1;
+        }
+        crate::sched::yield_now();
+    }
+    serial::puts("  net:  settled after ");
+    serial::put_dec(polls);
+    serial::puts(" productive polls\n");
 }
 
 /// Check the pieces that do not need a NIC, plus the NIC if there is one.
@@ -257,7 +289,5 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
     crate::sched::yield_now();
     t.check("net: the uptime clock is readable", uptime_us() >= t0);
 
-    if !t.check("net: stack initialised", up) {
-        return;
-    }
+    t.check("net: stack initialised", up);
 }

@@ -1,8 +1,8 @@
-# Three things the amd64 port hand-rolled that the tree already had
+# Four things the amd64 port hand-rolled that the tree already had
 
 **Date:** 2026-09-04, during Stage O of the amd64 port.
-**Scope:** process, not a defect. Nothing shipped broken; all three were caught
-in review, and the code that replaced them is better than what it replaced.
+**Scope:** process, not a defect. Nothing shipped broken, and in every case the
+code that replaced the duplicate is better than what it replaced.
 
 This is written down because the failure mode is **quiet**. Hand-rolled code that
 works is indistinguishable, at a glance, from code that had to be written. A
@@ -10,8 +10,9 @@ duplicate that compiles, passes its tests and boots leaves no symptom — it jus
 means the tree now has two implementations of something, and the second one does
 not get the first one's bug fixes.
 
-All three were found the same way: the author of the crates read the diff and
-asked "don't we already have that?"
+The first three were found the same way: the author of the crates read the diff
+and asked "don't we already have that?" The fourth was found by looking first,
+which is the outcome this document is for.
 
 ## 1. The `mmap` argument decode
 
@@ -76,6 +77,27 @@ flags)` leaves the inode 0, which its own doc defines as *"no inode: read by
 path"*.
 
 **Now:** imported; `OpenFile` deleted.
+
+## 3b. `sockaddr_in` parsing (the fourth, caught without prompting)
+
+**Written:** a decode of `struct sockaddr_in` — the `AF_INET` family check, the
+**big-endian** port, the octet order — plus local `AF_INET`/`SOCK_STREAM`
+constants, in `amd64/src/sock.rs`.
+
+**Existed:** `akuma_net::socket::SockAddrIn` with `to_addr()` and `from_addr()`,
+in the crate that owns sockets, alongside
+`socket_const::{AF_INET, SOCK_STREAM, SOCK_DGRAM}`.
+
+**Cost:** that decode is exactly where the classic byte-order bug lives — a port
+read host-endian lands on 8080 instead of 80 (`0x1F90` vs `0x901F`). The
+existing implementation has been right about it for as long as the AArch64
+kernel has served connections.
+
+**Now:** imported. Only the privilege-boundary copy stayed local, for the same
+reason as §2 in the table below.
+
+This one was found by looking rather than by review, which is the point of
+writing the first three down.
 
 ## 4. What is genuinely local, and why
 

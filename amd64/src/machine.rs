@@ -66,7 +66,7 @@ pub fn describe(start_info_pa: u64) -> MachineDescription {
 ///
 /// Returns `None` when there is no such token, which means "no init": the boot
 /// halts after its verdict, as it did before there was anything to run.
-pub fn init_path<'a>(start_info_pa: u64, buf: &'a mut [u8]) -> Option<&'a str> {
+pub fn init_path(start_info_pa: u64, buf: &mut [u8]) -> Option<&str> {
     let mut scratch = [0u8; 512];
     let si = akuma_ryzen_amd64::StartInfo::parse(&Physmap, start_info_pa)?;
     let cmdline = si.cmdline(&Physmap, &mut scratch)?;

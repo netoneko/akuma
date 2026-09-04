@@ -238,6 +238,29 @@ What amd64 *does* use, and what each replaced:
 | syscall identity | `akuma-syscalls-abi`, `akuma-syscalls-linux` | `write` is 1 here and 64 on aarch64 |
 | self-tests | `akuma-selftest` | the pass/fail tally |
 
+## Networking
+
+`akuma-net` and `akuma-net-nic` run unmodified; `src/net.rs` supplies the twelve
+`NetRuntime` hooks and `src/sock.rs` wires the socket syscalls. The NIC is found
+by the same command-line discovery the disk uses — another slot in the same
+array.
+
+```bash
+amd64/run.sh                       # NIC on virtio-mmio-bus.1, port 8080 forwarded
+INIT=/bin/httpd amd64/run.sh       # run the server instead of the shell
+curl http://localhost:8080/
+```
+
+`init=` on the kernel command line picks what gets the console after the
+self-tests. `paws` wants a terminal, `httpd` wants none, so the choice cannot be
+baked in.
+
+**It does not serve a request yet** — see the netpoll note below.
+
+`RDRAND` is CPUID-checked, with a non-cryptographic fallback that warns loudly:
+QEMU's default `microvm` CPU does not expose it, and the first boot with
+networking took a `#UD` because of that. `run.sh` passes `-cpu max`.
+
 ## Guest programs
 
 The programs the loader runs live in `userspace/amd64/`, one directory each,
@@ -257,12 +280,15 @@ program that printed its verdict would have "passed" by running at all.
   needs neither `fork` nor sockets, which is why it is a much shorter road than
   sshd.
 - **No writes**, and no mount table.
-- **No NIC, and no device interrupts.** The block driver polls the used ring.
-  The IOAPIC's address is read from the MADT and nothing uses it; routing a GSI
-  to a vector is what would let the driver stop polling. The *host* side of
-  networking is ready — `amd64/net-setup.sh` builds a tap, DHCP and NAT through
-  Docker with no sudo, proved with a Linux guest taking a lease — and all four
-  `akuma-net*` crates build for `x86_64-unknown-none`.
+- **No netpoll task.** The networking stack is up, the NIC probes and sockets
+  bind and listen — but the only thing that calls `smoltcp_net::poll()` is
+  `akuma-net`'s own blocking wait, so nothing polls between socket calls. DHCP
+  never completes and a connection is accepted by QEMU and never answered. The
+  AArch64 kernel's equivalent is `run_async_main`/`netpoll_drain_step` in
+  `akuma-kernel-glue`. **This is the next thing to build.**
+- **No device interrupts.** The block driver polls the used ring; the NIC would
+  too. On the AArch64 side the NIC IRQ exists only to end the netpoll loop's
+  `wfi` early, so it is an optimisation on top of that loop, not a prerequisite.
 - **No VGA.** Considered and dropped: dead code on Firecracker, whose console is
   the 16550 at I/O port `0x3F8`.
 - **No demand paging for user segments.** The `#PF` handler services a

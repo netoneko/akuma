@@ -1670,6 +1670,124 @@ a time and no `fork`. Nothing writes: the block driver and `akuma-ext2` can both
 write, but a self-test that mutated the image would make it stateful across
 boots.
 
+## 3.22 Stage P: the networking stack, and the loop that is missing
+
+`akuma-net` (smoltcp, the AF_INET socket table, DNS) and `akuma-net-nic` run on
+the amd64 kernel, both **unmodified**. The socket syscalls are wired.
+`userspace/httpd`, compiled for `x86_64-unknown-none`, binds and listens.
+
+```text
+  virtio-mmio: 0x00000000feb00000 + 0x200 irq 5
+  virtio-mmio: 0x00000000feb00200 + 0x200 irq 6
+[SmolNet] Found virtio-net at slot 1
+[SmolNet] MAC: 52:54:00:12:34:56
+  net:  stack up
+  sock: bind to port 2222   [OK]
+  sock: listen   [OK]
+-- running /bin/httpd --
+httpd: Starting HTTP server on port 8080
+httpd: Listening for connections...
+```
+
+124 self-tests pass, 0 fail. **A request is not served yet** — §3.22.5.
+
+### 3.22.1 Multi-slot virtio geometry, exercised for the first time
+
+Until this stage exactly one device was ever announced, so
+`MmioDevices::geometry`'s stride computation had never run on hardware with more
+than one entry. Two tokens on the command line, two transports at the measured
+0x200 stride, disk at slot 0 and NIC at slot 1 — and `akuma-virtio`'s probe found
+the NIC where the geometry said it would be.
+
+### 3.22.2 The twelve `NetRuntime` hooks, and what they collapse to
+
+`NetRuntime` is the stack's entire upward surface. The AArch64 kernel fills it
+with real scheduler primitives: a park that marks a thread WAITING so a socket
+wake can target it, an interrupt check that honours `tkill`, a netpoll doorbell
+rung by the NIC's IRQ handler. On a target with one core, no device interrupts
+and a cooperative round-robin, most of them collapse — `park_until` becomes a
+yield loop, `current_waker` a no-op waker, `wake_netpoll` a no-op.
+
+They are written out one at a time with a reason each rather than defaulted,
+because every one of them becomes wrong the moment this target grows a second
+core or an IOAPIC.
+
+### 3.22.3 `RDRAND` is not universal, and the fallback must say so
+
+The first boot with networking took a **`#UD` invalid opcode** immediately after
+"net: stack up". The cause was `rdrand`: QEMU's default `microvm` CPU model does
+not expose it, and executing it there faults.
+
+It is CPUID-checked now (leaf 1, `ECX` bit 30), with a SplitMix64 fallback seeded
+from the TSC. The fallback is **documented as non-cryptographic and warns on the
+console**, because the next consumer is `sshd`'s key exchange and a silent weak
+RNG there is the worst possible failure. `-cpu max` was added to `run.sh` so the
+local stand-in matches both real machines, which do have `RDRAND`.
+
+Also worth recording: the `cpuid` wrapper saves and restores `rbx` by hand rather
+than naming it as a clobber. LLVM reserves `rbx`, and naming it is a compile
+error rather than a runtime surprise.
+
+### 3.22.4 The fourth crate-reuse catch, self-inflicted
+
+`sockaddr_in` parsing — the family check, the big-endian port, the octet order —
+was hand-rolled here before checking. `akuma_net::socket::SockAddrIn` already
+exists with `to_addr()`/`from_addr()`, in the crate that owns sockets, along with
+`socket_const::{AF_INET, SOCK_STREAM, SOCK_DGRAM}`.
+
+That decode is precisely where the 0x1F90-vs-0x901F byte-order bug lives, and
+the existing one has been right for as long as the AArch64 kernel has served
+connections. Replaced; only the privilege-boundary copy stayed local, because
+`akuma-user-access` is AArch64 asm. Full list:
+`docs/archive/AMD64_CRATE_REUSE_AUDIT.md`.
+
+`crates/akuma-syscalls-abi` was **extended** rather than worked around: twelve
+new variants (the ten socket calls, plus `Getdents64` and `Getcwd`). All ten
+numbers already existed on the AArch64 side, so it was adding names to both
+tables, and the crate's round-trip tests would have caught a mismatch.
+
+### 3.22.5 The open blocker: nothing runs a netpoll loop
+
+DHCP never completes. The log says:
+
+```text
+[SmolNet] DHCP deconfigured - reverting to static fallback
+```
+
+and `curl http://localhost:8080/` connects (QEMU's `hostfwd` accepts) and then
+times out with zero bytes.
+
+The cause is structural, not a bug in any of the above. **The only thing on this
+target that calls `smoltcp_net::poll()` is `akuma-net`'s own blocking wait**,
+from inside a socket operation. That is enough once a program is blocked in
+`accept`, and it is nothing at all in the window between `akuma_net::init` and
+the first socket call — which is exactly the window DHCP lives in.
+
+The AArch64 kernel does not have this problem because it runs a dedicated netpoll
+task: `run_async_main` in `akuma-kernel-glue`, whose `netpoll_drain_step` drains
+up to 64 productive polls per lap and then ends the lap in `wfi`. Its comment is
+explicit that the NIC IRQ exists only to *end that wait early* — "no virtio-net
+slot recorded; RX stays tick-driven" — so the loop, not the interrupt, is the
+load-bearing part.
+
+A two-second settle loop after `init` was tried and is not enough on its own: it
+lets DHCP attempt a round trip, but a server still needs the stack polled
+continuously while it runs, and nothing polls between one blocking call and the
+next.
+
+**The fix is a netpoll task**, spawned like any other scheduler task, running the
+`netpoll_drain_step` shape. That is the next thing to build, and it is what
+stands between "httpd listens" and "httpd serves".
+
+### 3.22.6 What sshd needs beyond that
+
+`sshd` and `akuma-ssh-crypto` **already build for `x86_64-unknown-none`**, and
+sshd's default mode is single-process cooperative (`fork-sessions` is opt-in), so
+no `fork` is required. After the netpoll task, what remains is a host key and
+`authorized_keys` on the image, `getrandom`, and — the real wall — `spawn`, which
+sshd needs to start a shell in an authenticated session. That is the same
+`akuma-exec-core` gap that stops `paws` running external commands.
+
 ## 4. What is deliberately missing
 
 Corrected 2026-09-04. This list was written at Stage B and went stale as the
@@ -1696,11 +1814,14 @@ what follows is the state as of Stage L rather than the original text.
   target does not have.
 - **No writes.** The block driver and `akuma-ext2` can both write; nothing does.
   A self-test that mutated the image would make it stateful across boots.
-- **No NIC, and no device interrupts.** There is a disk since Stage M
-  (virtio-blk, §3.19), driven by polling. The host side of networking is ready
-  (`amd64/net-setup.sh`, proved with a Linux guest taking a DHCP lease) and all
-  four `akuma-net*` crates build for `x86_64-unknown-none`; what is missing is
-  kernel-side wiring. The console is still the 16550 at I/O
+- **No netpoll task**, which is why networking is up but not working (§3.22.5).
+  The stack initialises, the NIC probes, sockets bind and listen — and nothing
+  polls between socket calls, so DHCP never completes and a connection is
+  accepted by QEMU and never answered. This is the next thing to build.
+- **No device interrupts.** The block driver polls the used ring; the NIC would
+  too. The IOAPIC's address is read from the MADT and nothing uses it. On the
+  AArch64 side the NIC IRQ exists only to end the netpoll loop's `wfi` early, so
+  it is an optimisation on top of the loop rather than a prerequisite for it. The console is still the 16550 at I/O
   port `0x3F8`; a VGA text path was considered and dropped as dead code on
   Firecracker. The ELF loader's image is still `include_bytes!`d rather than
   opened by path, because there is a block device but no filesystem on top of it
