@@ -1783,10 +1783,110 @@ stands between "httpd listens" and "httpd serves".
 
 `sshd` and `akuma-ssh-crypto` **already build for `x86_64-unknown-none`**, and
 sshd's default mode is single-process cooperative (`fork-sessions` is opt-in), so
-no `fork` is required. After the netpoll task, what remains is a host key and
+no `fork` is required. After the netpoll task, what remains is
 `authorized_keys` on the image, `getrandom`, and — the real wall — `spawn`, which
 sshd needs to start a shell in an authenticated session. That is the same
-`akuma-exec-core` gap that stops `paws` running external commands.
+`akuma-exec-core` gap that stops `paws` running external commands. (sshd
+generates its own host key on first run, so that is not a prerequisite.)
+
+## 3.23 Stage Q: the netpoll task, and the DMA window it exposed
+
+The blocker in §3.22.5 is cleared. `httpd` serves a request end to end — a real
+HTTP round trip over virtio-net — and DHCP completes (`IP: 10.0.2.15/24`), on
+**both** QEMU `microvm` and Firecracker on the Ryzen. **127 self-tests** on
+QEMU, all green.
+
+Two defects, and the second is the interesting one.
+
+### 3.23.1 `net::settle()` was keyed on a clock that had not started
+
+The Stage P checkpoint shipped a `settle()` loop that drained
+`smoltcp_net::poll()` for "two seconds" after `akuma_net::init` — measured as
+`uptime_us() < deadline`, where `uptime_us()` is `lapic::ticks() * 10_000`. But
+`net::init` runs at `main.rs:180` and `lapic::init()` — which installs the timer
+handler and starts the tick — is thirty lines later. `ticks()` was **0 for the
+whole of `settle()`**, so `deadline` was `0 + 2_000_000` and the loop never
+exited. The boot spun `poll()` forever, smoltcp kept re-sending DHCP DISCOVER,
+and QEMU's TX ring collapsed:
+
+```text
+qemu-system-x86_64: virtio: bogus descriptor or out of resources
+qemu-system-x86_64: Slirp: Failed to send packet, ret: -1
+```
+
+The self-tests never ran. The "124 green" claim in the checkpoint predated
+`settle()` being added — it was never true with that code in the tree.
+
+`settle()` is gone. Its replacement is the real thing §3.22.5 asked for.
+
+### 3.23.2 The netpoll daemon
+
+A scheduler task — `sched::spawn_daemon(netpoll_daemon)` — running
+
+```rust
+loop { drain_step(); yield_now(); }
+```
+
+where `drain_step` is the amd64 analogue of `netpoll_drain_step` in
+`akuma-kernel-glue`: `while smoltcp_net::poll() { … }` with the same 64-lap
+safety cap. There is no `wfi` and no NIC IRQ to end one early — the AArch64
+kernel's interrupt only *shortens* the wait, so the loop is the load-bearing
+part and this target has exactly the loop. The daemon is co-operatively
+scheduled alongside the `init=` program and the LAPIC timer preempts a
+compute-bound task onto it (`main.rs` now leaves the timer running for
+`run_init`, where the self-tests stop it between stages).
+
+`sched::Task` gained a `daemon` bool: `all_user_tasks_finished()` skips daemon
+slots, so `run_init`'s drive loop still ends when the *shell* exits rather than
+spinning against a task that is Runnable on purpose. `MAX_TASKS` 12 → 16 for the
+daemon plus headroom for sshd session tasks.
+
+### 3.23.3 The DMA bug the working loop exposed: `.bss` is a second RAM window
+
+With the loop running, QEMU **still** logged `virtio: bogus descriptor`. The
+cause was structural and had been latent since networking landed:
+`akuma-net-nic`'s RX/TX frame arenas are `.bss` **statics**, and on amd64 `.bss`
+is linked in the kernel image window (`0xFFFF_FFFF_8000_0000 + phys`), a
+*different alias of RAM* from the physmap (`0xFFFF_8000_0000_0000 + phys`) that
+`akuma_primitives::addr::virt_to_phys` knew about.
+
+`VirtioHal::share()` calls `virt_to_phys` on the buffer it is about to hand the
+device. For `RX_ARENA` at VA `0xffffffff80292248` (measured with `rust-nm`):
+
+```
+0xffffffff80292248 - PHYSMAP_OFFSET(0xFFFF_8000_0000_0000) = 0x7FFF_8029_2248  (~550 GiB)
+```
+
+QEMU got a descriptor pointing at 550 GiB of a 511 MiB guest and rejected it.
+This did **not** fault the kernel — the subtraction does not underflow, it just
+produces a plausible wrong number — which is why the module doc's "fails loudly"
+claim was only ever true for addresses *below* the physmap base.
+
+`virtio-blk` was unaffected because everything it DMAs is heap-allocated
+(`VirtioHal::dma_alloc` → the physmap window) or an ext2 buffer (also heap).
+Only `akuma-net-nic`, with its BSS-resident arenas, hit it.
+
+**Fix:** `virt_to_phys` on amd64 now checks the kernel image window first
+(`KERNEL_IMAGE_OFFSET`, mirroring `amd64/src/phys.rs::KERNEL_VMA`) and subtracts
+whichever base the pointer is in — the same two-alias `__pa()` a real
+higher-half kernel carries. AArch64 is untouched: both offsets are zero there
+and the function still folds to the identity.
+
+### 3.23.4 `net: stack initialised` was an unconditional assertion
+
+A machine with no virtio-net device is legitimate — `DISK=none` under QEMU, and
+Firecracker without `FC_NET=1`. `net::smoke_test` asserted the stack was up
+regardless, so the no-NIC Firecracker boot reported `1 FAILED`. It is a skip
+now, exactly as `sock::smoke_test` already treated the same condition.
+
+### 3.23.5 Firecracker networking is wired now
+
+`amd64/run-firecracker.sh` grew `FC_NET=1` (attach a virtio-net device on the
+host `FC_TAP`, default `tap0`) and honours `INIT=`. Run `amd64/net-setup.sh`
+first for the tap + dnsmasq + NAT. Firecracker auto-appends the
+`virtio_mmio.device=` token for the NIC just as it does for the drive, so the
+probe finds it at slot 1 with no kernel change. Verified: `curl
+http://10.0.2.15:8080/` from the FC host reaches `httpd` on the guest.
 
 ## 4. What is deliberately missing
 
@@ -1814,10 +1914,11 @@ what follows is the state as of Stage L rather than the original text.
   target does not have.
 - **No writes.** The block driver and `akuma-ext2` can both write; nothing does.
   A self-test that mutated the image would make it stateful across boots.
-- **No netpoll task**, which is why networking is up but not working (§3.22.5).
-  The stack initialises, the NIC probes, sockets bind and listen — and nothing
-  polls between socket calls, so DHCP never completes and a connection is
-  accepted by QEMU and never answered. This is the next thing to build.
+- **Networking works** since Stage Q (§3.23): the netpoll daemon drives
+  `smoltcp_net::poll()`, DHCP completes, and `httpd` serves a request over
+  virtio-net on both QEMU and Firecracker. What is still missing on top of it is
+  `spawn` (so `sshd` can start a shell) — the same gap as `paws` running
+  external commands.
 - **No device interrupts.** The block driver polls the used ring; the NIC would
   too. The IOAPIC's address is read from the MADT and nothing uses it. On the
   AArch64 side the NIC IRQ exists only to end the netpoll loop's `wfi` early, so

@@ -24,6 +24,16 @@ FC_DIR="${FC_DIR:-akuma}"        # relative to the remote $HOME
 MEMORY="${MEMORY:-512}"
 VCPUS="${VCPUS:-1}"
 TIMEOUT="${TIMEOUT:-20}"
+# FC_NET=1 attaches a virtio-net device on the host tap `FC_TAP` (default tap0).
+# Run `amd64/net-setup.sh` first — it creates the tap, a dnsmasq DHCP server and
+# NAT, all on the same 10.0.2.0/24 SLIRP addresses QEMU uses. The guest MAC has
+# to match net-setup.sh's `--dhcp-host` or the pinned lease never applies.
+FC_NET="${FC_NET:-}"
+FC_TAP="${FC_TAP:-tap0}"
+FC_GUEST_MAC="${FC_GUEST_MAC:-02:FC:00:00:00:01}"
+# INIT= picks the program the kernel runs after the self-tests (init= on the
+# kernel command line). Default paws; `INIT=/bin/httpd` for the server.
+INIT="${INIT:-/bin/paws}"
 # DISK=<local path> attaches it as the guest's first virtio-blk drive.
 #
 # Firecracker passes no device tree, and **by default** presents virtio over
@@ -61,6 +71,20 @@ if [ -n "$DISK" ]; then
     DRIVES_JSON='[{"drive_id":"rootfs","path_on_host":"DISK_PATH","is_root_device":false,"is_read_only":false}]'
 fi
 
+# The network-interfaces array. Firecracker auto-appends a
+# `virtio_mmio.device=<size>@<base>:<irq>` token to the kernel command line for
+# every configured MMIO device, drive and NIC alike, in creation order — so the
+# drive lands on slot 0 and the NIC on slot 1, which is what the probe expects.
+NET_JSON="[]"
+if [ -n "$FC_NET" ]; then
+    NET_JSON="[{\"iface_id\":\"eth0\",\"host_dev_name\":\"$FC_TAP\",\"guest_mac\":\"$FC_GUEST_MAC\"}]"
+fi
+
+# `init=` goes in boot_args; Firecracker appends its device tokens after it.
+# Passed unconditionally, as `run.sh` does, so the two stands-in agree on which
+# program gets the console.
+BOOT_ARGS="init=$INIT"
+
 # Stage the config and a standalone launcher, then run it. The launcher is
 # written here rather than kept only on the host so the two cannot drift.
 # Backticks below are escaped, every one of them. The outer heredoc is
@@ -75,14 +99,15 @@ cd ~/$FC_DIR
 
 cat > akuma-vm.json <<'EOJSON'
 {
-  "boot-source": { "kernel_image_path": "KERNEL_PATH", "boot_args": "" },
+  "boot-source": { "kernel_image_path": "KERNEL_PATH", "boot_args": "BOOT_ARGS_VAL" },
   "drives": $DRIVES_JSON,
-  "network-interfaces": [],
+  "network-interfaces": $NET_JSON,
   "machine-config": { "vcpu_count": $VCPUS, "mem_size_mib": $MEMORY }
 }
 EOJSON
 sed -i "s|KERNEL_PATH|\$HOME/$FC_DIR/akuma-amd64|" akuma-vm.json
 sed -i "s|DISK_PATH|\$HOME/$FC_DIR/disk.img|" akuma-vm.json
+sed -i "s|BOOT_ARGS_VAL|$BOOT_ARGS|" akuma-vm.json
 
 cat > run.sh <<'EORUN'
 #!/bin/sh

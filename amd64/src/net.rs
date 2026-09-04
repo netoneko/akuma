@@ -315,7 +315,15 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
     crate::sched::yield_now();
     t.check("net: the uptime clock is readable", uptime_us() >= t0);
 
-    t.check("net: stack initialised", up);
+    // A machine with no virtio-net device is legitimate — `DISK=none` under
+    // QEMU, and Firecracker without `FC_NET=1` — so "no stack" is a skip, not a
+    // failure, exactly as `sock::smoke_test` treats it. The RNG and clock checks
+    // above still run because neither needs a NIC.
+    if up {
+        t.check("net: stack initialised", true);
+    } else {
+        t.note("net: no virtio-net device; stack skipped", 0);
+    }
 }
 
 /// Stage Q: the netpoll daemon, the loop that was missing.

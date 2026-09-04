@@ -13,10 +13,14 @@ program `rustc` compiled and linked, whose `PT_LOAD` segments the kernel parses
 and places, with a System V initial stack (argc/argv/envp/auxv). Since Stage M
 it also drives a **virtio-blk disk** and reads its own machine description —
 the PVH memory map, the virtio-MMIO command line, and ACPI's MADT — and since
-Stage N it mounts **ext2** on that disk and runs a program it opened by path.
-Reads only, no file syscalls for ring 3 yet, and no device interrupts.
+Stage N it mounts **ext2** on that disk and runs a program it opened by path;
+Stage O gave ring 3 `open`/`read`/`close`/`lseek`/`fstat`/`mmap` and a serial
+shell (`paws`); and since Stage Q a **netpoll daemon** drives the networking
+stack, so DHCP completes and `httpd` serves a request over virtio-net. No
+device interrupts, no writes, no `spawn`.
 
-Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1**.
+Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1** —
+including networking, `curl http://10.0.2.15:8080/` from the Firecracker host.
 
 **Status: C** (active risk, expect surprises). This is a spike, not a port.
 
@@ -61,8 +65,11 @@ Akuma/amd64 — long mode reached
   -- userspace output follows (from an ELF image) --
     [elf] loaded from a real ELF image
   elf: program ran and reported every check   [OK]
+  ...
+  [SmolNet] DHCP configured ... IP: 10.0.2.15/24
+  net: the netpoll daemon is being scheduled   [OK]
 
-Akuma/amd64 self-test: 59 passed, 0 failed
+Akuma/amd64 self-test: 127 passed, 0 failed
 Akuma/amd64 — all self-tests passed
 ```
 
@@ -255,7 +262,28 @@ curl http://localhost:8080/
 self-tests. `paws` wants a terminal, `httpd` wants none, so the choice cannot be
 baked in.
 
-**It does not serve a request yet** — see the netpoll note below.
+Since Stage Q (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.23) a **netpoll
+daemon** — a `sched::spawn_daemon` task running the `netpoll_drain_step` shape —
+drives `smoltcp_net::poll()` between socket calls, so DHCP completes
+(`IP: 10.0.2.15/24`) and `httpd` serves a request end to end. Verified on QEMU
+`microvm` and on Firecracker (Ryzen, `FC_NET=1`):
+
+```bash
+INIT=/bin/httpd amd64/run.sh                  # QEMU
+curl http://localhost:8080/
+
+FC_HOST=... amd64/net-setup.sh                 # once: tap + dnsmasq + NAT
+FC_HOST=... FC_NET=1 INIT=/bin/httpd amd64/run-firecracker.sh
+curl http://10.0.2.15:8080/                    # from the FC host
+```
+
+The daemon replaced a `settle()` loop that spun on a clock (`lapic::ticks()`)
+that had not started when `net::init` ran — it hung the boot before the
+self-tests. Fixing that also surfaced a latent DMA bug: `akuma-net-nic`'s frame
+arenas are `.bss` statics, whose address is in the kernel-image window, and
+`virt_to_phys` only knew the physmap window — so every TX descriptor pointed at
+~550 GiB and the device rejected it as bogus. `virt_to_phys` now translates both
+windows.
 
 `RDRAND` is CPUID-checked, with a non-cryptographic fallback that warns loudly:
 QEMU's default `microvm` CPU does not expose it, and the first boot with
@@ -280,12 +308,10 @@ program that printed its verdict would have "passed" by running at all.
   needs neither `fork` nor sockets, which is why it is a much shorter road than
   sshd.
 - **No writes**, and no mount table.
-- **No netpoll task.** The networking stack is up, the NIC probes and sockets
-  bind and listen — but the only thing that calls `smoltcp_net::poll()` is
-  `akuma-net`'s own blocking wait, so nothing polls between socket calls. DHCP
-  never completes and a connection is accepted by QEMU and never answered. The
-  AArch64 kernel's equivalent is `run_async_main`/`netpoll_drain_step` in
-  `akuma-kernel-glue`. **This is the next thing to build.**
+- **No `spawn`.** Ring 3 cannot start a program. `httpd` serves because it never
+  needs to; `sshd` cannot open a shell in a session, and `paws` cannot run an
+  external command. This is the same `akuma-exec-core` gap, and the next thing to
+  build.
 - **No device interrupts.** The block driver polls the used ring; the NIC would
   too. On the AArch64 side the NIC IRQ exists only to end the netpoll loop's
   `wfi` early, so it is an optimisation on top of that loop, not a prerequisite.

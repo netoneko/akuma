@@ -89,9 +89,11 @@ done
 [ -n "$FDPROBE" ] && "$DEBUGFS" -w -R "write $FDPROBE bin/fdprobe" "$IMG" >/dev/null 2>&1
 [ -n "$PAWS" ] && "$DEBUGFS" -w -R "write $PAWS bin/paws" "$IMG" >/dev/null 2>&1
 [ -n "$HTTPD" ] && "$DEBUGFS" -w -R "write $HTTPD bin/httpd" "$IMG" >/dev/null 2>&1
-# Something for httpd to serve.
+# Something for httpd to serve. httpd's document root is `/public`, and `GET /`
+# maps to `/public/index.html` — put it where httpd looks, not at the root.
 printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></html>\n' > "$TMP/index.html"
-"$DEBUGFS" -w -R "write $TMP/index.html index.html" "$IMG" >/dev/null 2>&1
+"$DEBUGFS" -w -R "mkdir /public" "$IMG" >/dev/null 2>&1
+"$DEBUGFS" -w -R "write $TMP/index.html public/index.html" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $TMP/probe.txt probe.txt" "$IMG" >/dev/null 2>&1
 
 echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")"
