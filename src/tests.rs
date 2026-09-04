@@ -4052,7 +4052,7 @@ fn clear_pte(l0_phys: usize, va: usize) {
         if l2e & 1 == 0 { return; }
         let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
         l3_ptr.add((va >> 12) & 0x1FF).write_volatile(0);
-        akuma_exec::mmu::flush_tlb_page(va);
+        let _ = akuma_exec::mmu::flush_tlb_page(va, akuma_exec::mmu::TlbTarget::AllCores);
     }
 }
 
@@ -4674,7 +4674,7 @@ fn clear_boot_ttbr0_pte(va: usize, depth: PtClear) {
             l2_ptr.add((va >> 21) & 0x1FF).write_volatile(0);
             l1_ptr.add((va >> 30) & 0x1FF).write_volatile(0);
         }
-        akuma_exec::mmu::flush_tlb_page(va);
+        let _ = akuma_exec::mmu::flush_tlb_page(va, akuma_exec::mmu::TlbTarget::AllCores);
     }
 }
 

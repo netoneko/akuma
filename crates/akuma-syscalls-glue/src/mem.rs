@@ -649,7 +649,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             }
         }
         // Single TLB flush for the entire mmap range (still under the hold).
-        akuma_exec::mmu::flush_tlb_range(mmap_addr, pages);
+        let _ = akuma_exec::mmu::flush_tlb_range(mmap_addr, pages, akuma_exec::mmu::TlbTarget::AllCores);
         if declined > 0 {
             // Resolve the surviving (stale) PA for the first refusal — the walk is
             // only paid on the broken path.
@@ -1190,7 +1190,8 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
                     let _ = aspace.map_user_page_tracked_no_flush(page_va, frame, flags);
                 }
                 // Flush the entire requested range (covers all newly mapped pages).
-                akuma_exec::mmu::flush_tlb_range(aligned_addr, (end - aligned_addr) / 4096);
+                let _ = akuma_exec::mmu::flush_tlb_range(
+                    aligned_addr, (end - aligned_addr) / 4096, akuma_exec::mmu::TlbTarget::AllCores);
             });
             0
         }
@@ -1291,7 +1292,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
                 }
             }
             if any_updated {
-                akuma_exec::mmu::flush_tlb_range(addr, pages);
+                let _ = akuma_exec::mmu::flush_tlb_range(addr, pages, akuma_exec::mmu::TlbTarget::AllCores);
             }
         });
         if adding_exec {
@@ -1410,7 +1411,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
                     to_free.push(frame);
                 }
             }
-            akuma_exec::mmu::flush_tlb_range_all_asid(base, n);
+            let _ = akuma_exec::mmu::flush_tlb_range_all_asid(base, n, akuma_exec::mmu::TlbTarget::AllCores);
         });
         for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapRegion); }
         proc.vm_free_mmap(base, n * 4096);
@@ -1429,7 +1430,8 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
                         to_free.push(frame);
                     }
                 }
-                akuma_exec::mmu::flush_tlb_range_all_asid(freed_start, freed_pages);
+                let _ = akuma_exec::mmu::flush_tlb_range_all_asid(
+                    freed_start, freed_pages, akuma_exec::mmu::TlbTarget::AllCores);
             });
             let had_physical = !to_free.is_empty();
             for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapPartial); }
@@ -1470,7 +1472,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         // never mapped, but flushing the whole span once is correct and cheaper
         // than tracking which pages we actually cleared.
         if total_pages > 0 {
-            akuma_exec::mmu::flush_tlb_range_all_asid(addr, total_pages);
+            let _ = akuma_exec::mmu::flush_tlb_range_all_asid(addr, total_pages, akuma_exec::mmu::TlbTarget::AllCores);
         }
     });
     for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapSpan); }

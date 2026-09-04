@@ -1626,7 +1626,8 @@ fn demand_page_lazy_region(
             }
             // Flush the whole mapped run in one shot (fewer barriers).
             if any_mapped {
-                akuma_exec::mmu::flush_tlb_range(page_va, pages_mapped as usize);
+                let _ = akuma_exec::mmu::flush_tlb_range(
+                    page_va, pages_mapped as usize, akuma_exec::mmu::TlbTarget::AllCores);
             }
         } else {
             // No owner (degenerate): nothing to install; free what we filled.
@@ -1886,7 +1887,7 @@ pub fn complete_cow_break(
                 let _ = aspace.map_page(
                     page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
                 );
-                akuma_exec::mmu::flush_tlb_page(page_va);
+                let _ = akuma_exec::mmu::flush_tlb_page(page_va, akuma_exec::mmu::TlbTarget::AllCores);
                 aspace.track_user_frame(new_frame);
                 // CoW: the old page is freed via the global CoW refcount, never here.
                 Some(aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa)))
@@ -3391,7 +3392,7 @@ fn stale_write_fault_absorbed(page_va: usize) -> bool {
     // The peer that repaired the page broadcasts its own invalidation, so this is
     // belt-and-braces — but the fault is already paid for, and a second `tlbi` is
     // far cheaper than a wrongly-fatal signal if any repair path ever forgets one.
-    akuma_exec::mmu::flush_tlb_page(page_va);
+    let _ = akuma_exec::mmu::flush_tlb_page(page_va, akuma_exec::mmu::TlbTarget::AllCores);
     true
 }
 
@@ -3686,7 +3687,7 @@ fn try_resolve_el1_user_copy_lazy_fault() -> bool {
     }
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     if ensure_user_page_mapped(pid, page_va) {
-        akuma_exec::mmu::flush_tlb_page(page_va);
+        let _ = akuma_exec::mmu::flush_tlb_page(page_va, akuma_exec::mmu::TlbTarget::AllCores);
         true // ERET retries the faulting byte; the copy continues across the boundary
     } else {
         false

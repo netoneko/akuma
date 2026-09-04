@@ -404,7 +404,7 @@ pub fn cow_share_and_demote_range(
             // chunk.) `chunk` <= FORK_AS_CHUNK_PAGES keeps this a targeted
             // `tlbi vaae1is` sweep, under `flush_tlb_range_all_asid`'s full-flush
             // threshold.
-            mmu::flush_tlb_range_all_asid(chunk_va, chunk);
+            let _ = mmu::flush_tlb_range_all_asid(chunk_va, chunk, mmu::TlbTarget::AllCores);
         }
 
         // ── Phase B: child page table, unlocked, BKL-free ──
@@ -2732,7 +2732,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
             // and the child later ret's to a garbage/zero LR → SIGSEGV. (Intermittent
             // because the next context switch's activate()/deactivate() flush_tlb_all
             // closes the window; only writes before the parent is preempted corrupt.)
-            mmu::flush_tlb_all();
+            let _ = mmu::flush_tlb_all(mmu::TlbTarget::AllCores);
         }
         // ── BKL re-acquired from here ──
 

@@ -720,6 +720,75 @@ pub fn sync_icache_range(kva: usize, len: usize) {
     akuma_cpu::barrier::isb();
 }
 
+/// Which cores a TLB invalidation must reach.
+///
+/// Every `flush_tlb_*` call in this tree today invalidates a *user address
+/// space's* translation, and a shared-kernel process can run on any core, so
+/// every current call site needs [`AllCores`](TlbTarget::AllCores). The
+/// variant exists anyway — see
+/// `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §3 — because the previous
+/// API could not *say* which cores an invalidation covered, and four of this
+/// project's most expensive investigations
+/// (`fork_cow_tlb_asid_flush`, `page_table_uaf_ttbr_gate_fix`,
+/// `oncpu_gate_scheduler_race`, `cowstale_stale_write_fault_fixed`) turned on
+/// exactly that question. `ThisCore` is for a translation provably private to
+/// the calling core (e.g. a scratch mapping nothing else could have cached);
+/// picking it for anything else under `kernel_smp_shared` reintroduces the
+/// stale-peer-translation bug those investigations closed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TlbTarget {
+    /// Only the calling core may have cached this translation.
+    ThisCore,
+    /// Any core running this kernel image may have cached this translation
+    /// (the address space is, or could become, live on more than one core).
+    AllCores,
+}
+
+/// A pending TLB-invalidation completion.
+///
+/// `#[must_use]` so a `flush_tlb_*` call cannot be issued and silently
+/// forgotten about — the instruction that invalidates a translation and the
+/// barrier that makes the invalidation *visible* are two different steps, and
+/// dropping this token is what performs the second one. On AArch64 that is
+/// the `dsb ish` + `isb` pair this crate always emitted right after the
+/// `tlbi`; moving it into `Drop` costs nothing (the token is a drop-in
+/// replacement for a call that used to be inline in the same statement) and
+/// gives a future non-broadcast target — an IPI-based shootdown, should one
+/// ever be built — one place to wait for acknowledgement instead of a second
+/// vocabulary bolted on beside this one. See `akuma-psci`'s call functions for
+/// the same reasoning applied to a different silently-droppable return.
+#[must_use = "a TLB invalidation is not complete until this token is dropped"]
+pub struct TlbFlush(bool);
+
+impl TlbFlush {
+    /// A real invalidation was issued; drop this at the point completion is needed.
+    #[inline(always)]
+    fn pending() -> Self {
+        Self(true)
+    }
+
+    /// Nothing was invalidated (e.g. a zero-length range) — `Drop` is a no-op.
+    /// Exists so the early-return shapes below can still hand back a token
+    /// without buying a barrier pair they don't need.
+    #[inline(always)]
+    fn done() -> Self {
+        Self(false)
+    }
+}
+
+impl Drop for TlbFlush {
+    #[inline(always)]
+    fn drop(&mut self) {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        if self.0 {
+            akuma_cpu::barrier::dsb_ish();
+            akuma_cpu::barrier::isb();
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        let _ = self.0;
+    }
+}
+
 // Real shared-kernel SMP: TLB maintenance that affects a shared/user address space must
 // reach EVERY core (a page-table edit on one core while another runs that space in EL0
 // would otherwise leave the peer with stale entries). The inner-shareable `...is`
@@ -727,23 +796,24 @@ pub fn sync_icache_range(kva: usize, len: usize) {
 // QEMU `virt`). Other builds keep the cheaper core-local form. The context-switch flush
 // (threading) stays local — it only needs to clear the switching core's own TLB.
 #[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
-pub fn flush_tlb_all() {
+pub fn flush_tlb_all(target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
-    akuma_cpu::tlb::vmalle1is();
-    akuma_cpu::barrier::dsb_ish();
-    akuma_cpu::barrier::isb();
+    match target {
+        TlbTarget::AllCores => akuma_cpu::tlb::vmalle1is(),
+        TlbTarget::ThisCore => akuma_cpu::tlb::vmalle1(),
+    }
+    TlbFlush::pending()
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
-pub fn flush_tlb_all() {
+pub fn flush_tlb_all(_target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::vmalle1();
-    akuma_cpu::barrier::dsb_ish();
-    akuma_cpu::barrier::isb();
+    TlbFlush::pending()
 }
 
 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-pub fn flush_tlb_all() {}
+pub fn flush_tlb_all(_target: TlbTarget) -> TlbFlush { TlbFlush::done() }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn get_boot_ttbr0() -> u64 {
@@ -765,43 +835,45 @@ pub fn get_boot_ttbr0() -> u64 { 0 }
 
 // Inner-shareable under shared SMP (see `flush_tlb_all`).
 #[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
-pub fn flush_tlb_asid(asid: u16) {
+pub fn flush_tlb_asid(asid: u16, target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
-    akuma_cpu::tlb::aside1is(asid);
-    akuma_cpu::barrier::dsb_ish();
-    akuma_cpu::barrier::isb();
+    match target {
+        TlbTarget::AllCores => akuma_cpu::tlb::aside1is(asid),
+        TlbTarget::ThisCore => akuma_cpu::tlb::aside1(asid),
+    }
+    TlbFlush::pending()
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
-pub fn flush_tlb_asid(asid: u16) {
+pub fn flush_tlb_asid(asid: u16, _target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::aside1(asid);
-    akuma_cpu::barrier::dsb_ish();
-    akuma_cpu::barrier::isb();
+    TlbFlush::pending()
 }
 
 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-pub fn flush_tlb_asid(_asid: u16) {}
+pub fn flush_tlb_asid(_asid: u16, _target: TlbTarget) -> TlbFlush { TlbFlush::done() }
 
 // Inner-shareable under shared SMP (see `flush_tlb_all`).
 #[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
-pub fn flush_tlb_page(va: usize) {
+pub fn flush_tlb_page(va: usize, target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
-    akuma_cpu::tlb::vaae1is((va >> 12) as u64);
-    akuma_cpu::barrier::dsb_ish();
-    akuma_cpu::barrier::isb();
+    match target {
+        TlbTarget::AllCores => akuma_cpu::tlb::vaae1is((va >> 12) as u64),
+        TlbTarget::ThisCore => akuma_cpu::tlb::vaae1((va >> 12) as u64),
+    }
+    TlbFlush::pending()
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
-pub fn flush_tlb_page(va: usize) {
+pub fn flush_tlb_page(va: usize, _target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::vaae1((va >> 12) as u64);
-    akuma_cpu::barrier::dsb_ish();
-    akuma_cpu::barrier::isb();
+    TlbFlush::pending()
 }
 
 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-pub fn flush_tlb_page(_va: usize) {}
+pub fn flush_tlb_page(_va: usize, _target: TlbTarget) -> TlbFlush { TlbFlush::done() }
 
 // ============================================================================
 // User Address Space Management
@@ -2210,7 +2282,7 @@ impl UserAddressSpace {
     /// (`docs/archive/ERROR_HANDLING_AUDIT.md` §4.2).
     pub fn unmap_page(&mut self, va: usize) {
         self.unmap_page_no_flush(va);
-        flush_tlb_page(va);
+        let _ = flush_tlb_page(va, TlbTarget::AllCores);
     }
 
     /// Clear the L3 PTE for `va` **without** flushing the TLB.  The caller must
@@ -2229,7 +2301,7 @@ impl UserAddressSpace {
     /// The caller is responsible for freeing the returned frame via PMM.
     pub fn unmap_and_free_page(&mut self, va: usize) -> Option<PhysFrame> {
         let frame = self.unmap_and_free_page_no_flush(va);
-        flush_tlb_page(va);
+        let _ = flush_tlb_page(va, TlbTarget::AllCores);
         frame
     }
 
@@ -2287,7 +2359,7 @@ impl UserAddressSpace {
             pte.write_volatile(0);
             (l3_entry & 0x0000_FFFF_FFFF_F000) as usize
         };
-        flush_tlb_page(va);
+        let _ = flush_tlb_page(va, TlbTarget::AllCores);
         let frame = PhysFrame::new(pa);
         if self.remove_user_frame(frame) {
             Some(frame)
@@ -2349,7 +2421,7 @@ impl UserAddressSpace {
             pte.write_volatile(entry);
         }
         if flush {
-            flush_tlb_page(va);
+            let _ = flush_tlb_page(va, TlbTarget::AllCores);
         }
     }
 
@@ -2404,14 +2476,14 @@ impl UserAddressSpace {
         // a preemption between them would save/check live tables against the
         // other value and false-positive.
         let _irq = IrqGuard::new();
-        flush_tlb_all();
+        let _ = flush_tlb_all(TlbTarget::AllCores);
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
             let _core = publish_l0_begin(_ttbr0);
             core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _ttbr0);
             publish_l0_end(_core);
         }
-        flush_tlb_all();
+        let _ = flush_tlb_all(TlbTarget::AllCores);
         crate::note_current_expected_l0(_ttbr0);
     }
 
@@ -2419,14 +2491,14 @@ impl UserAddressSpace {
         let _boot_ttbr0 = get_boot_ttbr0();
         // Same IRQ guard as activate() — install + note must not be split.
         let _irq = IrqGuard::new();
-        flush_tlb_all();
+        let _ = flush_tlb_all(TlbTarget::AllCores);
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
             let _core = publish_l0_begin(_boot_ttbr0);
             core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _boot_ttbr0);
             publish_l0_end(_core);
         }
-        flush_tlb_all();
+        let _ = flush_tlb_all(TlbTarget::AllCores);
         crate::note_current_expected_l0(_boot_ttbr0);
     }
 }
@@ -2541,7 +2613,7 @@ impl Drop for UserAddressSpace {
         // Flushing first closes it: by the time the ASID is allocatable again, no
         // translation for it remains. `tlbi aside1is` is inner-shareable, so peers are
         // covered too.
-        flush_tlb_asid(self.asid);
+        let _ = flush_tlb_asid(self.asid, TlbTarget::AllCores);
         with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
         instr::as_drop_exit(_ledger);
     }
@@ -2716,7 +2788,7 @@ pub fn update_current_user_page_flags(va: usize, new_flags: u64) {
         if old_entry & flags::VALID == 0 { return; }
         pte.write_volatile((old_entry & !PERM_MASK) | new_flags);
     }
-    flush_tlb_page(va);
+    let _ = flush_tlb_page(va, TlbTarget::AllCores);
 }
 
 /// Resolve `va`'s **L3 entry slot** in the current address space, creating nothing.
@@ -2800,7 +2872,7 @@ pub fn remap_current_user_page(va: usize, pa: usize, user_flags_val: u64) -> boo
         let entry = (pa as u64) | flags::VALID | flags::TABLE | flags::AF | flags::NG | attr_index(MAIR_NORMAL_WB) | flags::SH_INNER | user_flags_val;
         pte.write_volatile(entry);
     }
-    flush_tlb_page(va);
+    let _ = flush_tlb_page(va, TlbTarget::AllCores);
     true
 }
 
@@ -2846,8 +2918,8 @@ pub unsafe fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) 
 /// invalidate every ASID aliasing those tables, which is what `vaae1is`
 /// ("VA, All-ASID, EL1") does. Same instruction as `flush_tlb_page`.
 #[inline]
-pub fn flush_tlb_range(start_va: usize, pages: usize) {
-    flush_tlb_range_all_asid(start_va, pages);
+pub fn flush_tlb_range(start_va: usize, pages: usize, target: TlbTarget) -> TlbFlush {
+    flush_tlb_range_all_asid(start_va, pages, target)
 }
 
 /// Flush TLB entries for a contiguous VA range across **all** ASIDs, with a
@@ -2860,7 +2932,7 @@ pub fn flush_tlb_range(start_va: usize, pages: usize) {
 /// calls to avoid O(pages) barrier sequences during a large `munmap`/teardown.
 /// See docs/COW_OPTIMIZATIONS.md (cheap-win E).
 #[inline]
-pub fn flush_tlb_range_all_asid(start_va: usize, pages: usize) {
+pub fn flush_tlb_range_all_asid(start_va: usize, pages: usize, target: TlbTarget) -> TlbFlush {
     // Above this many pages, one full-TLB flush (a single `tlbi vmalle1`) is
     // cheaper than issuing `tlbi` per page — the same trade-off Linux makes via
     // `tlb_single_page_flush_ceiling`.  A full flush is a correct (more
@@ -2868,26 +2940,27 @@ pub fn flush_tlb_range_all_asid(start_va: usize, pages: usize) {
     // TLB entries refill, which is worth it for a large `munmap`.
     const FULL_FLUSH_THRESHOLD: usize = 512;
     if pages == 0 {
-        return;
+        return TlbFlush::done();
     }
     if pages > FULL_FLUSH_THRESHOLD {
-        flush_tlb_all();
-        return;
+        return flush_tlb_all(target);
     }
     akuma_cpu::barrier::dsb_ishst();
     let mut va = start_va;
+    // Inner-shareable under shared SMP: a range unmapped on one core must
+    // invalidate peers running the same address space in EL0 (see
+    // `flush_tlb_all`). Other builds, and a `ThisCore` target, keep the
+    // cheaper core-local form.
+    let broadcast = cfg!(kernel_smp_shared) && target == TlbTarget::AllCores;
     for _ in 0..pages {
-        // Inner-shareable under shared SMP: a range unmapped on one core must
-        // invalidate peers running the same address space in EL0 (see
-        // `flush_tlb_all`). Other builds keep the cheaper core-local form.
-        #[cfg(kernel_smp_shared)]
-        akuma_cpu::tlb::vaae1is((va >> 12) as u64);
-        #[cfg(not(kernel_smp_shared))]
-        akuma_cpu::tlb::vaae1((va >> 12) as u64);
+        if broadcast {
+            akuma_cpu::tlb::vaae1is((va >> 12) as u64);
+        } else {
+            akuma_cpu::tlb::vaae1((va >> 12) as u64);
+        }
         va += 0x1000;
     }
-    akuma_cpu::barrier::dsb_ish();
-    akuma_cpu::barrier::isb();
+    TlbFlush::pending()
 }
 
 /// Atomically get or create a page table at `table_ptr[idx]`.

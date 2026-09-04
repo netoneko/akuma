@@ -7357,7 +7357,7 @@ fn bench_munmap_teardown() {
                 crate::pmm::free_page(frame);
             }
         }
-        akuma_exec::mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, mapped);
+        let _ = akuma_exec::mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, mapped, akuma_exec::mmu::TlbTarget::AllCores);
         let elapsed = crate::timer::uptime_us() - start;
         let per_page_ns = (elapsed.saturating_mul(1000)) / mapped as u64;
         crate::safe_print!(160,
@@ -7418,7 +7418,7 @@ fn bench_fork_cow_share() {
         child.track_user_frame(crate::pmm::PhysFrame::new(pa));
     }
     unsafe { mmu::demote_range_to_ro(parent_l0.cast_mut(), BENCH_VA_BASE, mapped); }
-    mmu::flush_tlb_asid(0);
+    let _ = mmu::flush_tlb_asid(0, mmu::TlbTarget::AllCores);
     let elapsed = crate::timer::uptime_us() - start;
     let per_page_ns = (elapsed.saturating_mul(1000)) / shared.max(1) as u64;
     crate::safe_print!(160,
@@ -7480,7 +7480,7 @@ fn bench_mmap_populate() {
                 p.address_space.get_mut().track_user_frame(frame);
                 mapped += 1;
             }
-            mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, mapped);
+            let _ = mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, mapped, mmu::TlbTarget::AllCores);
         }
         let eager_us = crate::timer::uptime_us() - start;
         if mapped == 0 {
@@ -7498,7 +7498,7 @@ fn bench_mmap_populate() {
                 crate::pmm::free_page(frame);
             }
         }
-        mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, mapped);
+        let _ = mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, mapped, mmu::TlbTarget::AllCores);
 
         // ── Lazy register: the ONLY mmap-time cost a lazy mapping pays. ─────
         let start = crate::timer::uptime_us();
@@ -7522,7 +7522,7 @@ fn bench_mmap_populate() {
                 break;
             }
             p.address_space.get_mut().track_user_frame(frame);
-            mmu::flush_tlb_range_all_asid(va, 1);
+            let _ = mmu::flush_tlb_range_all_asid(va, 1, mmu::TlbTarget::AllCores);
             faulted += 1;
         }
         let lazy_us = crate::timer::uptime_us() - start;
@@ -7537,7 +7537,7 @@ fn bench_mmap_populate() {
                 crate::pmm::free_page(frame);
             }
         }
-        mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, faulted);
+        let _ = mmu::flush_tlb_range_all_asid(BENCH_VA_BASE, faulted, mmu::TlbTarget::AllCores);
     }
 }
 
