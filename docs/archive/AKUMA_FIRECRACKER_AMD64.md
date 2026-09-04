@@ -2475,6 +2475,63 @@ where an ELF came from.
 A real `printf`-using `hello.c` — i.e. a musl static libc for amd64 — is the
 next real gap this surfaced, not a stage of its own yet.
 
+## 3.28 Stage V: a real musl static libc (2026-09-04, same day)
+
+Closed §3.27's own last-named gap within hours: `printf` now works, and the
+AArch64 acceptance tests' own `hello.c` compiles, links and runs unmodified.
+
+The fix was smaller than it sounds, because the hard part was already sitting
+unused on disk. `userspace/tcc/build.rs` downloads an Alpine `musl-dev` apk
+for x86_64 to get **headers** to cross-compile tcc against (§3.27.2) and only
+ever extracted `usr/include` from it into a build-time-only staging
+directory. The same apk — the identical file `apk-tools`/`populate_disk.sh`
+would fetch on the AArch64 side via `apk add musl-dev` — also carries
+`usr/lib/libc.a` (~9.4 MiB), the crt objects (`crt1.o`/`crti.o`/`crtn.o`, plus
+`Scrt1.o`/`rcrt1.o` for PIE forms this target does not use), and the full
+`usr/include` public header tree (216 files, one level of subdirectories:
+`bits/`, `sys/`, `netinet/`, …). `amd64/mkdisk.sh` now unpacks the **same
+cached apk** a second time — `userspace/tcc/vendor/musl-dev-x86_64.apk`,
+guaranteed present by the time `mkdisk.sh` gets here because it builds tcc
+first — and stages `usr/lib`'s `.a`/`.o` files plus a hand-rolled recursive
+copy of `usr/include` (`debugfs` has no "write a directory tree", so this is
+one `mkdir`/`write` `debugfs` invocation per subdirectory/file, mirroring
+`build.rs`'s own `copy_dir_recursive` by hand). `libc.so` is skipped —
+nothing on this target links dynamically.
+
+**`SIZE_MIB`'s default grew 8 → 32.** `libc.a` alone is bigger than the whole
+previous disk image; 32 MiB leaves comfortable headroom for it plus the
+headers plus everything already staged. `amd64/run.sh`'s own hardcoded
+`mkdisk.sh` invocation (previously the literal `8` mkdisk.sh's default now
+matches) had to move too, or the two would have silently disagreed the next
+time either one alone got edited.
+
+No kernel or tcc-port code changed for this stage — every byte written was
+already vetted, tested, upstream musl, reached through a path
+(`akuma-ext2::write_file`, unmodified) this target had already proven in
+§3.27.1. This is purely "more files on the disk image," which is the reason
+it landed same-day as the gap that named it.
+
+**Verified over SSH on QEMU `microvm`, the exact command
+`acceptance/07_tcc_static_prerequisites.md` uses on AArch64:**
+
+```
+$ tcc -static -B /usr/lib/tcc -o /tmp/hello_c /tmp/hello.c
+$ echo $?
+0
+$ ls -l /tmp/hello_c
+-rw-r--r-- 1 0 0 30047 ... /tmp/hello_c      # a real ELF64 LE x86-64 exec
+$ /tmp/hello_c
+Hello, Akuma!
+$ echo $?
+0
+```
+
+`/tmp/hello.c` staged is `bootstrap/tmp/hello.c` byte-for-byte — the same file
+the AArch64 acceptance tests compile, not a rewritten equivalent. The
+`-nostdlib` libc-free `probe_tcc.c` from §3.27.2 stays staged too, as a
+faster, independent check that tcc itself still works if the musl staging
+above is ever the thing that breaks.
+
 ## 4. What is deliberately missing
 
 Corrected 2026-09-04. This list was written at Stage B and went stale as the

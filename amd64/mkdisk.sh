@@ -22,7 +22,12 @@ HERE=$(dirname "$0")
 cd "$HERE/.."
 
 IMG="${1:-target/x86_64-unknown-none/release/amd64-root.img}"
-SIZE_MIB="${2:-8}"
+# 8 MiB was enough before a real static libc existed on this image; musl's
+# `libc.a` alone (staged 2026-09-04 so tcc can link a real `printf` — see the
+# musl staging block below) is ~9.4 MiB by itself, over the old default before
+# adding a single byte of anything else. 32 MiB leaves headroom for that,
+# `/usr/include`'s ~200 files, and everything already here.
+SIZE_MIB="${2:-32}"
 
 # e2fsprogs is keg-only under Homebrew, so its tools are not on PATH by default.
 find_tool() {
@@ -123,15 +128,7 @@ done
 [ -n "$PAWS" ] && "$DEBUGFS" -w -R "write $PAWS bin/paws" "$IMG" >/dev/null 2>&1
 [ -n "$HTTPD" ] && "$DEBUGFS" -w -R "write $HTTPD bin/httpd" "$IMG" >/dev/null 2>&1
 
-# tcc + its runtime archive. No musl static libc is staged on this image at
-# all yet (there is no `apk` here the way `populate_disk.sh` has for the
-# AArch64 image) — see `userspace/tcc/build.rs`'s comment on that gap — so
-# `/probe_tcc.c` is deliberately libc-free (`-nostdlib`, its own `_start`,
-# raw-syscall `_exit`) rather than the real `#include <stdio.h>` + `printf`
-# hello.c the AArch64 acceptance tests use: that one needs a working link
-# against `printf`/`__libc_start_main`, which fails *before* tcc ever reaches
-# the point of writing an output file, so it would prove nothing about
-# whether the write path (2026-09-04, `fd::sys_write_file`) actually works.
+# tcc + its runtime archive.
 if [ -n "$TCC" ]; then
     "$DEBUGFS" -w -R "write $TCC bin/tcc" "$IMG" >/dev/null 2>&1
     if [ -n "$TCC_LIBTCC1" ]; then
@@ -148,6 +145,51 @@ if [ -n "$TCC" ]; then
         rm -rf "$LIBTCC1_STAGE"
     fi
     "$DEBUGFS" -w -R "mkdir /tmp" "$IMG" >/dev/null 2>&1
+
+    # A real musl static libc (2026-09-04), so tcc can link a real `printf`
+    # instead of only the libc-free `-nostdlib` shape below. `userspace/tcc/
+    # build.rs` already downloads+caches an Alpine musl-dev apk for x86_64 to
+    # get *headers* to build tcc itself against; that same apk also carries
+    # the static archive and crt objects (`usr/lib/libc.a`, `crt1.o`,
+    # `crti.o`, `crtn.o`, …) and the full musl public header tree
+    # (`usr/include/stdio.h` and friends) — apk-tools' `musl-dev` package is
+    # the same package `populate_disk.sh --with-musl-dev` installs on the
+    # AArch64 image via `apk add`, just reached here by unpacking the same
+    # apk instead of running a package manager this target does not have.
+    # `libc.a` alone is ~9.4 MiB, which is why `SIZE_MIB`'s default grew.
+    MUSL_APK="userspace/tcc/vendor/musl-dev-x86_64.apk"
+    if [ -f "$MUSL_APK" ]; then
+        MUSL_STAGE=$(mktemp -d)
+        tar xzf "$MUSL_APK" -C "$MUSL_STAGE" usr/lib usr/include
+        "$DEBUGFS" -w -R "mkdir /usr/include" "$IMG" >/dev/null 2>&1
+        # Static archives + crt objects only — `-static` never touches
+        # `libc.so`, and nothing on this target links dynamically at all yet.
+        for f in "$MUSL_STAGE"/usr/lib/*.a "$MUSL_STAGE"/usr/lib/*.o; do
+            [ -f "$f" ] && "$DEBUGFS" -w -R "write $f usr/lib/$(basename "$f")" "$IMG" >/dev/null 2>&1
+        done
+        # `debugfs` has no recursive "write a directory tree" — one `mkdir`
+        # per subdirectory (musl's public headers are one level deep: bits/,
+        # sys/, netinet/, …), then every file, mirroring by hand what
+        # `copy_dir_recursive` in `userspace/tcc/build.rs` does for tcc's own
+        # (much smaller) internal header set.
+        for d in $(find "$MUSL_STAGE/usr/include" -mindepth 1 -type d); do
+            rel=${d#"$MUSL_STAGE/usr/include/"}
+            "$DEBUGFS" -w -R "mkdir /usr/include/$rel" "$IMG" >/dev/null 2>&1
+        done
+        for f in $(find "$MUSL_STAGE/usr/include" -type f); do
+            rel=${f#"$MUSL_STAGE/usr/include/"}
+            "$DEBUGFS" -w -R "write $f usr/include/$rel" "$IMG" >/dev/null 2>&1
+        done
+        rm -rf "$MUSL_STAGE"
+    fi
+
+    # Two proof programs. `probe_tcc.c` is deliberately libc-free
+    # (`-nostdlib`, its own `_start`, a raw-`syscall` `_exit`) — a fast,
+    # independent check that tcc itself still compiles+links+writes even if
+    # something above went wrong with the musl staging. `hello.c` is the
+    # AArch64 acceptance tests' own file, byte-for-byte
+    # (`bootstrap/tmp/hello.c`) — the real `#include <stdio.h>` + `printf`
+    # test the musl staging above exists for.
     cat > "$TMP/probe_tcc.c" <<'EOF'
 /* Deliberately libc-free — see mkdisk.sh's comment on why. */
 static void _exit_now(int code) {
@@ -164,6 +206,15 @@ void _start(void) {
 }
 EOF
     "$DEBUGFS" -w -R "write $TMP/probe_tcc.c tmp/probe_tcc.c" "$IMG" >/dev/null 2>&1
+    cat > "$TMP/hello.c" <<'EOF'
+#include <stdio.h>
+
+int main() {
+  printf("Hello, Akuma!\n");
+  return 0;
+}
+EOF
+    "$DEBUGFS" -w -R "write $TMP/hello.c tmp/hello.c" "$IMG" >/dev/null 2>&1
 fi
 
 # busybox: a real static musl x86_64 binary (ET_EXEC, non-PIE), fetched once and

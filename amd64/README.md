@@ -50,12 +50,15 @@ persists it once, at `close(2)` — enough for a real **tcc** (ported to
 `x86_64-unknown-none` the same day: `TCC_TARGET_X86_64`, an x86_64
 `setjmp`/`longjmp`, its own `amd64_shim` standing in for `libakuma`) to
 compile a C source file and write out a genuine ELF64 executable, which the
-loader then **runs** — `tcc -static -nostdlib -B /usr/lib/tcc -o out src.c`
-followed by `./out` returning the exit code the source asked for, verified
-over SSH. No `printf`/libc yet (no musl static libs are staged on this image;
-see `userspace/tcc/build.rs`'s comment), so today's proof program is
-libc-free, not the `#include <stdio.h>` hello.c the AArch64 acceptance tests
-use. No device interrupts, and no pipelines (`a | b`) over the interactive SSH
+loader then **runs** it. A real **musl static libc** followed the same day —
+`mkdisk.sh` unpacks the `libc.a`/crt objects/public headers already sitting
+inside the Alpine `musl-dev` apk it was already fetching for tcc's own build
+headers, the same package `apk add musl-dev` installs on the AArch64 image —
+so the AArch64 acceptance tests' own command now runs unmodified:
+`tcc -static -B /usr/lib/tcc -o /tmp/hello_c /tmp/hello.c` compiles the
+AArch64 suite's own `hello.c` (`#include <stdio.h>` + `printf`), and running
+the result prints `Hello, Akuma!` and exits 0 — verified over SSH. No device
+interrupts, and no pipelines (`a | b`) over the interactive SSH
 shell — `sys_pipe2` (step 4) is still `ENOSYS`, seen directly as `can't create pipe: Bad
 file descriptor` from `wget ... | head`.
 
@@ -70,7 +73,7 @@ amd64/run.sh                     # build + boot under QEMU microvm, with an ext2
 MEMORY=1024 amd64/run.sh
 DISK=my.img amd64/run.sh         # attach an existing image
 DISK=none amd64/run.sh           # no drive at all
-amd64/mkdisk.sh out.img 8        # build the ext2 root image on its own
+amd64/mkdisk.sh out.img 32       # build the ext2 root image on its own
 ```
 
 The root image is **rebuilt on every run**, on purpose: it carries the guest ELF

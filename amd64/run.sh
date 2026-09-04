@@ -91,7 +91,10 @@ if [ "$DISK" != "none" ]; then
         # Rebuilt every run, on purpose: it contains the guest ELF that was just
         # compiled, and a stale image would silently run the previous one.
         DISK=target/x86_64-unknown-none/release/amd64-root.img
-        sh "$HERE/mkdisk.sh" "$DISK" 8 >/dev/null
+        # 32, not the old 8: matches `mkdisk.sh`'s own default, sized for a
+        # real musl `libc.a` (~9.4 MiB alone) since 2026-09-04 — see that
+        # script's comment on `SIZE_MIB`.
+        sh "$HERE/mkdisk.sh" "$DISK" 32 >/dev/null
     fi
     # `bus=virtio-mmio-bus.0` is load-bearing. QEMU fills transports from the
     # TOP down — measured with `info qtree`, a lone virtio-blk lands on bus 23 of
