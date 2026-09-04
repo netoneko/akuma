@@ -125,10 +125,19 @@ if [ "$DISK" != "none" ]; then
     # kept separate and quoted at the call, or QEMU reads the second token as
     # another device and fails with "drive with bus=0, unit=0 exists".
     # `init=` picks the program that gets the console after the self-tests.
-    # Default `/bin/paws`; `INIT=/bin/httpd` for the server. `INITARGS=a,b,c`
-    # passes comma-separated argv to it (a space cannot be inside one cmdline
-    # token) — `INIT=/bin/busybox INITARGS=uname,-a` runs the busybox applet.
-    CMDLINE="virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6 init=${INIT:-/bin/paws}"
+    # Default `/bin/busybox` running its `sh` applet (an interactive shell,
+    # the same role `paws` used to have); `INIT=/bin/httpd` for the server;
+    # `INIT=/bin/paws` for the tree's own shell. `INITARGS=a,b,c` passes
+    # comma-separated argv to it (a space cannot be inside one cmdline token)
+    # — `INITARGS=uname,-a` runs a one-shot busybox applet instead of `sh`.
+    INIT="${INIT:-/bin/busybox}"
+    # Default INITARGS to `sh` only when INIT is also defaulting to busybox —
+    # `INIT=/bin/paws`/`/bin/httpd` need no args, and an explicit `INITARGS`
+    # always wins.
+    if [ -z "$INITARGS" ] && [ "$INIT" = "/bin/busybox" ]; then
+        INITARGS="sh"
+    fi
+    CMDLINE="virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6 init=$INIT"
     [ -n "$INITARGS" ] && CMDLINE="$CMDLINE initargs=$INITARGS"
     # STRACE=1 prints every syscall the init program makes — a bring-up aid.
     [ -n "$STRACE" ] && CMDLINE="$CMDLINE strace"

@@ -812,7 +812,23 @@ pub fn flush_tlb_all(_target: TlbTarget) -> TlbFlush {
     TlbFlush::pending()
 }
 
-#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+// x86_64 has no broadcast invalidation instruction (`REDUCING_PLATFORM_DEPENDENCY.md`
+// §3), so there is no `kernel_smp_shared` split to make here — a full `CR3` reload
+// is the only "flush everywhere this core knows about" this target has, and it is
+// what `invlpg`-per-page would degrade to past a threshold anyway (see
+// `flush_tlb_range_all_asid`'s `FULL_FLUSH_THRESHOLD`).
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn flush_tlb_all(_target: TlbTarget) -> TlbFlush {
+    // SAFETY: reloading the CR3 already active changes no mapping — it only
+    // forces every non-global TLB entry to be re-walked.
+    unsafe { x86_write_cr3(x86_read_cr3()) };
+    TlbFlush::pending()
+}
+
+#[cfg(not(any(
+    all(target_os = "none", target_arch = "aarch64"),
+    all(target_os = "none", target_arch = "x86_64"),
+)))]
 pub fn flush_tlb_all(_target: TlbTarget) -> TlbFlush { TlbFlush::done() }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -851,7 +867,19 @@ pub fn flush_tlb_asid(asid: u16, _target: TlbTarget) -> TlbFlush {
     TlbFlush::pending()
 }
 
-#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+// No PCID support on this target (out of scope, see
+// `proposals/AKUMA_MMU_ARCH_PORTABILITY.md` Phase 4), so an ASID-scoped flush
+// has no cheaper x86_64 form than a full flush — a correct, more aggressive
+// superset, same trade-off `flush_tlb_all`'s own x86_64 arm makes.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn flush_tlb_asid(_asid: u16, target: TlbTarget) -> TlbFlush {
+    flush_tlb_all(target)
+}
+
+#[cfg(not(any(
+    all(target_os = "none", target_arch = "aarch64"),
+    all(target_os = "none", target_arch = "x86_64"),
+)))]
 pub fn flush_tlb_asid(_asid: u16, _target: TlbTarget) -> TlbFlush { TlbFlush::done() }
 
 // Inner-shareable under shared SMP (see `flush_tlb_all`).
@@ -872,7 +900,16 @@ pub fn flush_tlb_page(va: usize, _target: TlbTarget) -> TlbFlush {
     TlbFlush::pending()
 }
 
-#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn flush_tlb_page(va: usize, _target: TlbTarget) -> TlbFlush {
+    akuma_cpu::tlb::invlpg(va);
+    TlbFlush::pending()
+}
+
+#[cfg(not(any(
+    all(target_os = "none", target_arch = "aarch64"),
+    all(target_os = "none", target_arch = "x86_64"),
+)))]
 pub fn flush_tlb_page(_va: usize, _target: TlbTarget) -> TlbFlush { TlbFlush::done() }
 
 // ============================================================================
@@ -1616,6 +1653,7 @@ pub fn with_phys_bytes_mut<R>(
     Some(f(buf))
 }
 
+#[cfg(target_arch = "aarch64")]
 pub struct UserAddressSpace {
     l0_frame: PhysFrame,
     page_table_frames: Spinlock<Vec<PhysFrame>>,
@@ -1629,6 +1667,7 @@ pub struct UserAddressSpace {
     shared: bool,
 }
 
+#[cfg(target_arch = "aarch64")]
 impl UserAddressSpace {
     pub fn new() -> Option<Self> {
         let l0_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new)?;
@@ -2503,6 +2542,7 @@ impl UserAddressSpace {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
         #[allow(clippy::let_unit_value)]
@@ -2619,6 +2659,349 @@ impl Drop for UserAddressSpace {
     }
 }
 
+// ============================================================================
+// x86_64 UserAddressSpace — Phase 4 of proposals/AKUMA_MMU_ARCH_PORTABILITY.md
+// ============================================================================
+//
+// A minimal x86_64 body, ported directly from `amd64/src/paging.rs` (which
+// already built this exact vocabulary and encoding — see that file's own
+// header) rather than redesigned. Deliberately NOT the aarch64 struct's peer
+// in features: no ASID/PCID, no CoW sharing, no refcounted frames, no lazy
+// regions, no multi-core epoch tracking. `UserAddressSpace` on this target
+// is a different, much smaller type that happens to share a name — any
+// caller reaching for a method only the aarch64 side has gets a compile
+// error here, which is the honest boundary of what this port proves.
+
+/// x86_64 page permissions, as permissions rather than as an encoding.
+///
+/// The x86 half of the vocabulary `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md`
+/// §1 proposes — `amd64/src/paging.rs::Prot` already built exactly this shape;
+/// see its header for why keeping this a struct (rather than a `u64`) is the
+/// point: `write`/`exec`/`user` cannot collide the way `akuma-mmap::user_flags`'
+/// `RO`/`EXEC` constants alias on the AArch64 side.
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Prot {
+    pub write: bool,
+    pub exec: bool,
+    pub user: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Prot {
+    /// User read/write, no execute. The default for data.
+    pub const USER_RW: Self = Self { write: true, exec: false, user: true };
+    /// User read + execute, not writable.
+    pub const USER_RX: Self = Self { write: false, exec: true, user: true };
+}
+
+/// How an x86_64 mapping is cached — the other half of `encode(prot, attr)`.
+/// See `amd64/src/paging.rs::MemAttr`'s header for why no consumer should
+/// care whether this becomes an `AttrIndx` (AArch64) or two PTE bits (x86).
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MemAttr {
+    /// Normal RAM: writeback cached. The only attribute any user page in
+    /// this crate's scope needs.
+    WriteBack,
+    /// Device MMIO: uncacheable, never speculatively read. Unused by
+    /// `UserAddressSpace` today (no `map_device_page` on this target yet);
+    /// present because `encode` is `pub(crate)` and a future device-mapping
+    /// method should not have to reinvent this half.
+    #[allow(dead_code)]
+    Device,
+}
+
+#[cfg(target_arch = "x86_64")]
+const X86_P: u64 = 1 << 0;
+#[cfg(target_arch = "x86_64")]
+const X86_RW: u64 = 1 << 1;
+#[cfg(target_arch = "x86_64")]
+const X86_US: u64 = 1 << 2;
+#[cfg(target_arch = "x86_64")]
+const X86_PWT: u64 = 1 << 3;
+#[cfg(target_arch = "x86_64")]
+const X86_PCD: u64 = 1 << 4;
+#[cfg(target_arch = "x86_64")]
+const X86_PS: u64 = 1 << 7;
+/// No-execute. Requires `EFER.NXE`, which `amd64/src/boot.s` sets alongside
+/// `LME` — without it this is a reserved bit and setting it faults. Any
+/// x86_64 kernel that links this crate without doing the same will fault the
+/// first time a non-executable page is touched, not the first time one is
+/// mapped; there is nothing this crate can check for that at map time.
+#[cfg(target_arch = "x86_64")]
+const X86_NX: u64 = 1 << 63;
+#[cfg(target_arch = "x86_64")]
+const X86_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+#[cfg(target_arch = "x86_64")]
+const X86_ENTRIES: usize = 512;
+
+/// Encode a [`Prot`] and [`MemAttr`] into x86_64 PTE bits. The x86 backend of
+/// `encode(prot, attr)` — this crate stays the only one naming `P`/`RW`/`US`/
+/// `NX`/`PCD`/`PWT`, same discipline as the AArch64 `flags` module.
+#[cfg(target_arch = "x86_64")]
+const fn x86_encode(prot: Prot, attr: MemAttr) -> u64 {
+    let mut bits = X86_P;
+    if prot.write {
+        bits |= X86_RW;
+    }
+    if prot.user {
+        bits |= X86_US;
+    }
+    if !prot.exec {
+        bits |= X86_NX;
+    }
+    match attr {
+        MemAttr::WriteBack => {}
+        MemAttr::Device => bits |= X86_PCD | X86_PWT,
+    }
+    bits
+}
+
+/// Index into the level-`n` table for `va`. Level 4 = PML4 … level 1 = PT.
+#[cfg(target_arch = "x86_64")]
+const fn x86_index(va: usize, level: u32) -> usize {
+    (va >> (12 + 9 * (level - 1))) & (X86_ENTRIES - 1)
+}
+
+/// # Safety
+/// `pa` must be a page-aligned frame that is either a live page table or a
+/// freshly-zeroed frame the caller is about to make one.
+#[cfg(target_arch = "x86_64")]
+unsafe fn x86_table_mut(pa: u64) -> *mut u64 {
+    phys_to_virt(pa as usize).cast::<u64>()
+}
+
+/// Fetch the next table down, allocating and zeroing it if absent.
+///
+/// Returns `None` if a frame could not be allocated, or if the entry is a
+/// huge page rather than a table pointer — splitting is not implemented.
+#[cfg(target_arch = "x86_64")]
+unsafe fn x86_next_table(entry_ptr: *mut u64, user: bool) -> Option<u64> { unsafe {
+    let entry = entry_ptr.read_volatile();
+    if entry & X86_P != 0 {
+        if entry & X86_PS != 0 {
+            return None;
+        }
+        // Widen permissions on the way down: a parent that is not
+        // user-accessible or not writable masks every child on x86, so an
+        // intermediate entry has to be at least as permissive as any leaf
+        // beneath it. Enforcement lives entirely in the leaf.
+        let want = X86_P | X86_RW | if user { X86_US } else { 0 };
+        if entry & want != want {
+            entry_ptr.write_volatile((entry | want) & !X86_NX);
+        }
+        return Some(entry & X86_ADDR_MASK);
+    }
+    let frame = akuma_pmm::alloc_page()? as u64;
+    core::ptr::write_bytes(x86_table_mut(frame).cast::<u8>(), 0, PAGE_SIZE);
+    entry_ptr.write_volatile(frame | X86_P | X86_RW | if user { X86_US } else { 0 });
+    Some(frame)
+}}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_map_page_in(root: u64, va: usize, pa: usize, prot: Prot, attr: MemAttr) -> bool {
+    assert_eq!(va % PAGE_SIZE, 0, "va must be page aligned");
+    assert_eq!(pa % PAGE_SIZE, 0, "pa must be page aligned");
+    let mut table = root;
+    for level in (2..=4).rev() {
+        // SAFETY: `table` is a live table frame reached through the physmap.
+        let entry_ptr = unsafe { x86_table_mut(table).add(x86_index(va, level)) };
+        match unsafe { x86_next_table(entry_ptr, prot.user) } {
+            Some(next) => table = next,
+            None => return false,
+        }
+    }
+    // SAFETY: `table` is the PT frame; the index is masked to 0..512.
+    unsafe {
+        x86_table_mut(table)
+            .add(x86_index(va, 1))
+            .write_volatile(pa as u64 | x86_encode(prot, attr));
+    }
+    akuma_cpu::tlb::invlpg(va);
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_unmap_page_in(root: u64, va: usize) -> Option<usize> {
+    let mut table = root;
+    for level in (2..=4).rev() {
+        // SAFETY: `table` is a live table frame reached through the physmap.
+        let entry = unsafe { x86_table_mut(table).add(x86_index(va, level)).read_volatile() };
+        if entry & X86_P == 0 || entry & X86_PS != 0 {
+            return None;
+        }
+        table = entry & X86_ADDR_MASK;
+    }
+    // SAFETY: `table` is the PT frame.
+    let leaf = unsafe { x86_table_mut(table).add(x86_index(va, 1)) };
+    let entry = unsafe { leaf.read_volatile() };
+    if entry & X86_P == 0 {
+        return None;
+    }
+    unsafe { leaf.write_volatile(0) };
+    akuma_cpu::tlb::invlpg(va);
+    Some((entry & X86_ADDR_MASK) as usize)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_translate_in(root: u64, va: usize) -> Option<usize> {
+    let mut table = root;
+    for level in (2..=4).rev() {
+        // SAFETY: `table` is a live table frame reached through the physmap.
+        let entry = unsafe { x86_table_mut(table).add(x86_index(va, level)).read_volatile() };
+        if entry & X86_P == 0 {
+            return None;
+        }
+        if entry & X86_PS != 0 {
+            // Only PD level (2) can carry PS here; a PDPT 1 GiB page is never
+            // created by this code, so the size is fixed.
+            let size = 1u64 << 21;
+            return Some(((entry & X86_ADDR_MASK) + (va as u64 & (size - 1))) as usize);
+        }
+        table = entry & X86_ADDR_MASK;
+    }
+    // SAFETY: `table` is the PT frame; the index is masked to 0..512.
+    let entry = unsafe { x86_table_mut(table).add(x86_index(va, 1)).read_volatile() };
+    if entry & X86_P == 0 {
+        return None;
+    }
+    Some(((entry & X86_ADDR_MASK) + (va as u64 & (PAGE_SIZE as u64 - 1))) as usize)
+}
+
+/// The active PML4, from `CR3`.
+#[cfg(target_arch = "x86_64")]
+fn x86_read_cr3() -> u64 {
+    let v: u64;
+    // SAFETY: reading CR3 copies a register into a local; it dereferences
+    // nothing and has no side effect.
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) v, options(nomem, nostack, preserves_flags));
+    }
+    v & X86_ADDR_MASK
+}
+
+/// Install `root` as the active PML4.
+///
+/// Stays directly in this crate rather than `akuma-cpu`, for the same reason
+/// the AArch64 `activate()`/`deactivate()`'s `msr ttbr0_el1` does: a safe
+/// wrapper in a zero-dependency crate would let any safe code repoint what
+/// the MMU dereferences.
+///
+/// # Safety
+/// `root` must be a PML4 that maps every page the kernel is currently
+/// executing from and every page it will touch before switching back — the
+/// kernel image, its stacks, the heap, the PMM pool. A root missing any of
+/// those faults on the instruction after `mov cr3`, with no way to report it.
+#[cfg(target_arch = "x86_64")]
+unsafe fn x86_write_cr3(root: u64) { unsafe {
+    core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+}}
+
+/// The kernel's own boot PML4, captured the first time a `UserAddressSpace`
+/// is created (at that point nothing but the boot root has ever been active).
+/// `deactivate()`'s x86_64 analogue of [`get_boot_ttbr0`] — that one reads a
+/// value `boot.s` records to a fixed symbol at assembly-time boot; this target
+/// has no such symbol yet, so the first live `CR3` read stands in for it. Only
+/// correct for a single boot address space at a time, which matches this
+/// pass's scope (see `proposals/AKUMA_MMU_ARCH_PORTABILITY.md` Phase 4's
+/// explicit non-goals).
+#[cfg(target_arch = "x86_64")]
+static X86_BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_arch = "x86_64")]
+pub struct UserAddressSpace {
+    root: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl UserAddressSpace {
+    /// PML4 slots shared with the kernel: the physmap, the device window, and
+    /// the kernel image itself. Matches `amd64::paging::AddressSpace`'s
+    /// `SHARED_PML4_SLOTS` exactly — sharing at PML4 level rather than
+    /// copying is what lets there be one kernel mapping that cannot drift.
+    /// This type has exactly one real caller (`amd64/`'s own kernel layout),
+    /// and hardcoding its convention here is what "a port, not a redesign"
+    /// means in practice; a second x86_64 target with a different layout
+    /// would need this list supplied rather than assumed.
+    const SHARED_PML4_SLOTS: [usize; 3] = [256, 257, 511];
+
+    pub fn new() -> Option<Self> {
+        let root = akuma_pmm::alloc_page()?;
+        let kroot = x86_read_cr3();
+        let _ = X86_BOOT_ROOT.compare_exchange(
+            0, kroot, Ordering::AcqRel, Ordering::Acquire,
+        );
+        // SAFETY: `root` is a fresh PMM frame reached through the physmap.
+        // Zeroing it is what makes it a valid empty table; the shared entries
+        // written below (aliased, not copied, from the live kernel root) are
+        // the only non-zero ones, so the whole lower half starts unmapped.
+        unsafe {
+            core::ptr::write_bytes(phys_to_virt(root), 0, PAGE_SIZE);
+            let kroot_ptr = x86_table_mut(kroot);
+            let root_ptr = x86_table_mut(root as u64);
+            for slot in Self::SHARED_PML4_SLOTS {
+                let e = kroot_ptr.add(slot).read_volatile();
+                root_ptr.add(slot).write_volatile(e);
+            }
+        }
+        Some(Self { root })
+    }
+
+    pub fn map_page(&mut self, va: usize, pa: usize, prot: Prot) -> Result<(), &'static str> {
+        if x86_map_page_in(self.root as u64, va, pa, prot, MemAttr::WriteBack) {
+            Ok(())
+        } else {
+            Err("x86_64 UserAddressSpace::map_page: page-table frame allocation failed")
+        }
+    }
+
+    pub fn unmap_page(&mut self, va: usize) {
+        x86_unmap_page_in(self.root as u64, va);
+    }
+
+    pub fn translate(&self, va: usize) -> Option<usize> {
+        x86_translate_in(self.root as u64, va)
+    }
+
+    /// Switch the active address space to this one.
+    ///
+    /// # Safety obligation carried by construction
+    /// `activate`/`deactivate` on the AArch64 side take no unsafe block at
+    /// their call site because `UserAddressSpace::new`'s shared-mapping
+    /// discipline discharges it; the same is true here — `new()` aliases the
+    /// kernel's own PML4 slots, so `self.root` maps everything the kernel
+    /// needs before the next line executes.
+    pub fn activate(&self) {
+        unsafe { x86_write_cr3(self.root as u64) };
+    }
+
+    /// Switch back to the kernel's own boot address space.
+    ///
+    /// No-op if nothing has captured a boot root yet (no `UserAddressSpace`
+    /// has ever been created) — matches the aarch64 side's `get_boot_ttbr0`
+    /// returning `0` before boot identity mapping runs, which its own
+    /// `deactivate()` installs unconditionally; this one skips the write
+    /// instead, since writing `0` to `CR3` on x86_64 is not "boot identity
+    /// map", it is "no page tables at all".
+    pub fn deactivate() {
+        let root = X86_BOOT_ROOT.load(Ordering::Acquire);
+        if root != 0 {
+            // SAFETY: `root` is the PML4 that was active before any
+            // `UserAddressSpace` on this target ever existed — necessarily
+            // one that already maps the whole running kernel.
+            unsafe { x86_write_cr3(root) };
+        }
+    }
+}
+
+// Deliberately no `Drop` impl, matching `amd64::paging::AddressSpace`'s own
+// choice and its stated reason: freeing an address space that is still
+// installed in `CR3` unmaps the code doing the freeing. Dropping a
+// `UserAddressSpace` on this target leaks its page-table frames rather than
+// risk that — asking for the free explicitly is `amd64::paging::AddressSpace
+// ::free`'s job, not replicated here since nothing in this pass's scope
+// tears one down.
 
 /// Populate an L3 page table from a 2MB block descriptor, preserving the
 /// block's identity mapping as 512 individual 4KB page entries.

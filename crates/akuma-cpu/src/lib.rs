@@ -387,6 +387,27 @@ pub mod tlb {
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = asid;
     }
+
+    /// `invlpg` — invalidate the TLB entry for one page, this core only.
+    ///
+    /// The x86 counterpart of `vaae1`/`vaae1is` above, and the concrete gap
+    /// `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §3 named: x86 has no
+    /// broadcast invalidation instruction at all. A multi-core x86 kernel needs
+    /// an IPI-based shootdown to reach peer cores — deliberately not built here
+    /// (`akuma_mmu::TlbTarget` is the vocabulary that would carry that decision
+    /// when it exists; see `docs/archive/AKUMA_MMU_TLB_TARGET_VOCABULARY.md`).
+    /// This wrapper is therefore core-local only, exactly like `aside1`.
+    #[inline(always)]
+    pub fn invlpg(va: usize) {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: invalidation forces a re-walk; it cannot grant access, and it
+        // does not dereference `va` itself.
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
+        };
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        let _ = va;
+    }
 }
 
 /// Core parking and event signalling.

@@ -70,6 +70,7 @@ dependencies = [
  "akuma-alloc",
  "akuma-exec-core",
  "akuma-ext2",
+ "akuma-mmu",
  "akuma-net",
  "akuma-pipe",
  "akuma-pmm",
