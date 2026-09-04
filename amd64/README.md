@@ -74,7 +74,7 @@ Akuma/amd64 — long mode reached
   [SmolNet] DHCP configured ... IP: 10.0.2.15/24
   net: the netpoll daemon is being scheduled   [OK]
 
-Akuma/amd64 self-test: 127 passed, 0 failed
+Akuma/amd64 self-test: 137 passed, 0 failed
 Akuma/amd64 — all self-tests passed
 ```
 
@@ -225,17 +225,18 @@ x86 instruction — but its own header says *"AArch64, 4 KB granule, 4-level pag
 tables"*, and it manipulates AArch64 descriptors throughout. A crate that builds
 can still be wrong; read what it says it is.
 
-The kernel pulls in 38 crates this target does not. That list is the roadmap,
+The kernel pulls in ~36 crates this target does not. That list is the roadmap,
 and each entry has one of three reasons:
 
 | crate | why amd64 does not use it |
 |---|---|
 | `akuma-mmu`, `akuma-elf` | **Blocked.** `akuma-mmu` is AArch64 page-table format; `akuma-elf`'s mapping half is written against it. The fix is a parse/place split for the loader, and proposal item 1 for the tables |
-| `akuma-mmap` | **Blocked on item 1.** `MmapRegion.flags` is a raw AArch64 PTE `u64`; the two encodings share no field. This costs `munmap`'s clip-and-split and lazy regions |
+| `akuma-mmap` | **Blocked on item 1.** `MmapRegion.flags` is a raw AArch64 PTE `u64`; the two encodings share no field. This costs `munmap`'s clip-and-split, lazy regions, and a region list to replace `loader::MAX_PROC_FRAMES` |
 | `akuma-user-access` | **Cannot build.** Its copy loop is AArch64 `global_asm!` (`cbz`). `fd.rs` has its own bounded copy helpers, which is duplication with a real reason |
+| `akuma-syscalls-glue` (incl. its `pipe`) | **Cannot build** (`cbz` through `akuma-user-access`). `amd64/src/{fd,usermode}.rs` hold the file/spawn/pipe syscall bodies; the pure pipe buffer was extracted to `akuma-pipe` rather than re-derived |
 | `akuma-uart`, `akuma-gic`, `akuma-psci`, `akuma-exceptions`, `akuma-el0-entry`, `akuma-entry`, `akuma-timer`, `akuma-fdt`, `akuma-firecracker` | **Different hardware.** PL011 vs a 16550 on I/O ports, GICv3 vs LAPIC, PSCI vs nothing, an FDT vs a PVH block. Genuinely arch- or machine-specific |
-| `akuma-exec`, `akuma-exec-core`, `akuma-threading`, `akuma-slot-table`, `akuma-syscalls`, `akuma-syscalls-glue`, `akuma-kernel-core`, `akuma-kernel-glue`, `akuma-vfs-glue`, `akuma-bkl` | **Not reached yet.** These are the process/exec/SMP layer. `akuma-exec-core` ("the unsafe-free core of `akuma-exec`") is the next one to reach for — it is what `execve` and a real process table would come from |
-| `akuma-net*`, `akuma-rump`, `akuma-fpcache`, `akuma-kacho`, `akuma-isolation`, `akuma-syscalls-{poll,sync,time,ipc,log}`, `akuma-boot`, `akuma-config` | **Not needed yet.** All build for `x86_64-unknown-none`; none has a consumer on this target. The four `akuma-net*` crates are the shortest of these to reach, since the host side and device discovery are already done |
+| `akuma-exec`, `akuma-exec-core`, `akuma-threading`, `akuma-slot-table`, `akuma-syscalls`, `akuma-kernel-core`, `akuma-kernel-glue`, `akuma-vfs-glue`, `akuma-bkl` | **Not reached yet.** The process/exec/SMP layer. `akuma-exec-core` supplied `FileDescriptor`/`KernelFile`; its `Process` and the fork/exec of `akuma-exec` are what Stage T (§3.26) needs |
+| `akuma-rump`, `akuma-fpcache`, `akuma-kacho`, `akuma-isolation`, `akuma-syscalls-{poll,sync,time,ipc,log}`, `akuma-boot`, `akuma-config` | **Not needed yet.** All build for `x86_64-unknown-none`; none has a consumer on this target |
 
 What amd64 *does* use, and what each replaced:
 
@@ -244,7 +245,10 @@ What amd64 *does* use, and what each replaced:
 | heap, frames | `akuma-alloc`, `akuma-pmm` | unmodified, no arch code added |
 | disk | `akuma-virtio` | unmodified; the machine facts come from `akuma-primitives::addr` |
 | filesystem | `akuma-ext2`, `akuma-vfs` | unmodified; the shim is a struct and two calls |
+| networking | `akuma-net`, `akuma-net-nic` | unmodified; `src/net.rs` supplies the `NetRuntime` hooks (Stage P/Q) |
 | machine description | `akuma-ryzen-amd64` | written for this target, host-tested against both VMMs |
+| descriptor type | `akuma-exec-core` | `FileDescriptor`/`KernelFile`; only the fd *table* is local |
+| pipe buffer | `akuma-pipe` | new leaf, `#![forbid(unsafe_code)]`, host-tested (Stage R) |
 | `mmap` decode | `akuma-syscalls-mem` | after a correction — it was hand-rolled first |
 | console line discipline | `akuma-terminal` | canonical mode, echo, `map_cr_to_nl` |
 | syscall identity | `akuma-syscalls-abi`, `akuma-syscalls-linux` | `write` is 1 here and 64 on aarch64 |
@@ -308,10 +312,12 @@ program that printed its verdict would have "passed" by running at all.
 ## What is deliberately missing
 
 - **No `fork`.** `sys_spawn` (Stage R) loads an ELF, wires its stdio to pipes
-  and runs it — enough for `sshd` to start a session shell and for `paws -c` to
-  run a command — but there is no `fork`/`exec` pair, so a shell pipeline inside
-  a spawned shell cannot fork its own children, and `sshd`'s `fork-sessions`
-  mode is out (the cooperative single-process build is what runs).
+  and runs it — enough for `sshd` to start a session shell, for `paws -c` to run
+  a command, and for `busybox` to run an applet — but there is no
+  `fork`/`execve`/`wait4`, so `busybox sh` cannot execute a command (it starts
+  up and stops there) and `sshd`'s `fork-sessions` mode is out. That plus path
+  `stat` and `pipe2` is **Stage T** (`docs/archive/AKUMA_FIRECRACKER_AMD64.md`
+  §3.26).
 - **No pty line discipline for a spawned shell.** `SPAWN_FLAG_PTY` is accepted
   and ignored; an interactive `sshd` shell gets raw bytes over its stdin pipe
   and does its own editing.

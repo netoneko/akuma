@@ -2037,10 +2037,50 @@ syscall the init program makes) walked it there in four steps:
 
 ### 3.25.1 What still does not run
 
-`busybox sh` running anything but a builtin needs `fork`+`execve` (or `vfork`)
-and `wait4`, and a pipeline needs `pipe2` — none of which this target has.
-`arch_prctl`'s missing per-task FS-base save/restore becomes real the moment a
-second musl process (the shell *and* a forked applet) is runnable at once.
+`busybox sh` completes its startup — TLS, signal setup, `getcwd`, the lot — and
+then cannot execute a command. `strace` (the `strace` command-line flag) shows
+it: `sh -c "uname -a"` `stat`s every PATH entry, every `stat` returns `ENOSYS`,
+and it reports `uname: Function not implemented` for an applet that works
+standalone.
+
+## 3.26 Stage T (planned): `busybox sh` runs commands
+
+The ordered list, from the Stage-S `strace`:
+
+1. **Path `stat` — `stat`/`lstat` (4/6), `newfstatat` (262).** Self-contained,
+   and probably most of what a no-`fork` `sh -c "<applet>"` needs. `sys_fstat`
+   (5) already works for open fds; `akuma-ext2` hands `src/fs.rs` the inode
+   metadata for the path-based version. **First.**
+2. **`fork`/`vfork` (57/58) + `execve` (59) + `wait4` (61).** External commands
+   and pipelines. No CoW fork here — `vfork`+`execve` (share the address space
+   until `exec`, the `posix_spawn` shape busybox uses) is the shorter road.
+   Route Linux `wait4` (61) into the existing Akuma-private `waitpid` (303)
+   spawn table in `usermode.rs`.
+3. **`pipe2` (293), `dup2`/`dup3` (33/292).** `akuma-pipe` + `alloc_pipe_fd` are
+   the pieces; wire `sys_pipe2`.
+4. **`getdents64` (217)** — `ls`. `akuma-vfs`'s `read_dir` is already used by
+   `src/fs.rs`.
+5. **`arch_prctl` per-task `FS_BASE` save/restore in `sched.rs`** — load-bearing
+   once the shell and a forked child are both runnable. A `UserCtx` field
+   (offset ≥ 32, past what `syscall_entry` indexes), `wrmsr` on switch, mirroring
+   how AArch64 restores `TPIDR_EL0`.
+6. **`ioctl(TCGETS/TIOCGWINSZ)`** — a plausible `termios`/`winsize` so busybox
+   runs interactive rather than falling back.
+
+Reference the AArch64 impls for semantics, not reuse (they are behind
+`akuma-exec`/`akuma-bkl`, which do not build for `x86_64-unknown-none`):
+`crates/akuma-exec/src/process/` (fork), `crates/akuma-syscalls-glue/src/`,
+`src/syscall/`.
+
+Alongside it: `overlays/devbox-amd64/` grows a real rootfs — the busybox symlink
+farm, `/etc/passwd`, `/etc/profile`, static `/dev` nodes — so the shell has a
+PATH and an environment.
+
+**Two debts not to grow:** `amd64/src/` has never had the allocation audit
+(§3.24.5 — fixed buffers, not `Vec`, on every new syscall path); and
+`loader::MAX_PROC_FRAMES` is a `[usize; 512]`-per-`Process` fixed array a region
+list should replace (which also unblocks real `mprotect` and demand paging for
+spawned processes).
 
 ## 4. What is deliberately missing
 
@@ -2062,17 +2102,15 @@ what follows is the state as of Stage L rather than the original text.
   needed, it will have to be found the hard way: `hvm_start_info.rsdp_paddr` exists
   in the ABI but **both** QEMU and Firecracker v1.16.1 report it as 0 (measured,
   §3.6). Do not build on that field.
-- **No `getdents64`, no `getcwd`, no `spawn`.** Ring 3 has `open`/`read`/
-  `close`/`lseek`/`fstat`/`mmap` since Stage O and a shell runs on them, but it
-  cannot list a directory or start a program. `spawn` needs a process table this
-  target does not have.
+- **`spawn` works** since Stage R (§3.24): `sys_spawn` loads an ELF, wires its
+  stdio to `akuma-pipe` pipes and runs it as a scheduler task; `waitpid` reaps
+  it. What is missing on top is `fork`/`execve`/`wait4` — see Stage T (§3.26).
+  `getcwd` returns `/` (no per-process cwd); `getdents64` is still absent (`ls`).
 - **No writes.** The block driver and `akuma-ext2` can both write; nothing does.
   A self-test that mutated the image would make it stateful across boots.
 - **Networking works** since Stage Q (§3.23): the netpoll daemon drives
-  `smoltcp_net::poll()`, DHCP completes, and `httpd` serves a request over
-  virtio-net on both QEMU and Firecracker. What is still missing on top of it is
-  `spawn` (so `sshd` can start a shell) — the same gap as `paws` running
-  external commands.
+  `smoltcp_net::poll()`, DHCP completes, `httpd` serves a request and `sshd`
+  serves an authenticated session over virtio-net on both QEMU and Firecracker.
 - **No device interrupts.** The block driver polls the used ring; the NIC would
   too. The IOAPIC's address is read from the MADT and nothing uses it. On the
   AArch64 side the NIC IRQ exists only to end the netpoll loop's `wfi` early, so
@@ -2088,10 +2126,12 @@ what follows is the state as of Stage L rather than the original text.
   not-present fault inside one armed region (Stage C); an ELF's segments are
   allocated and copied eagerly. Wiring the two together needs a per-space region
   table (§3.18.8).
-- **No FP/SIMD state save on the syscall path.** `syscall_handler` touches no
-  vector register today, which is a property of the current handler rather than
-  a guarantee — the AArch64 side saves `q0`-`q31` for exactly this reason. Same
-  class as the bug in `AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md` §8, still open.
+- **No FP/SIMD state save on the context switch.** SSE is *enabled* since
+  Stage S (`boot.s` sets `CR4.OSFXSR` so a normally-compiled ring-3 binary can
+  use `movups`/xmm), but there is no `fxsave`/`fxrstor` on the switch — one
+  SSE-using task at a time. The kernel is soft-float so `syscall_handler` itself
+  touches no vector register. Same class as `AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md`
+  §8, still open.
 - **No TSS and no IST.** A double fault runs on the faulting stack, which is
   fine while nothing can overflow it and wrong the moment a guard page exists.
   When one appears, vector 8 needs an IST entry *before* it.
@@ -2123,13 +2163,19 @@ what follows is the state as of Stage L rather than the original text.
 | `amd64/src/gdt.rs`, `amd64/src/idt.rs` | descriptor tables, exceptions, demand paging |
 | `amd64/src/lapic.rs`, `amd64/src/port.rs` | timer, I/O ports |
 | `amd64/src/sched.rs` | context switch, round-robin, preemption |
-| `amd64/src/usermode.rs` | ring 3, `syscall`/`sysret`, `Process`, the ring-3 tests |
-| `amd64/src/loader.rs` | the ELF loader and the initial user stack (Stage L) |
+| `amd64/src/usermode.rs` | ring 3, `syscall`/`sysret`, `Process`, `syscall_dispatch`, `sys_spawn`/`waitpid`, `arch_prctl`/`uname`, the ring-3 tests |
+| `amd64/src/loader.rs` | the ELF loader, `build_stack` (real argv), `MAX_PROC_FRAMES` (Stage L) |
+| `amd64/src/fd.rs` | the global fd table, file syscall bodies, `fcntl`, pipe-backed fds, `/proc/<pid>/fd/0` |
+| `amd64/src/pipe.rs` | the `static` pipe pool + spinlock over `akuma-pipe` (Stage R) |
+| `amd64/src/net.rs`, `amd64/src/sock.rs` | `NetRuntime` hooks, netpoll daemon, AF_INET socket syscalls (Stage P/Q) |
+| `crates/akuma-pipe/` | the pure byte-FIFO half of a pipe, `#![forbid(unsafe_code)]`, host-tested |
 | `userspace/amd64/user.ld` | guest link script: `ET_EXEC` at 0x40_0000, page-aligned segments |
 | `userspace/amd64/hello/hello.rs` | the loader's probe; reports through its exit status |
 | `amd64/linker.ld` | load at 2 MiB, explicit `PHDRS` incl. `PT_NOTE` |
 | `amd64/build.rs` | the kernel link script, and building the guest programs |
-| `amd64/run.sh`, `amd64/run-firecracker.sh`, `amd64/README.md` | |
+| `amd64/mkdisk.sh` | the ext2 image: `paws`/`httpd`/`sshd` (`x86_64-unknown-none`), busybox, keys |
+| `amd64/run.sh`, `amd64/run-firecracker.sh`, `amd64/net-setup.sh` | QEMU / Firecracker / tap+DHCP+NAT |
+| `overlays/devbox-amd64/` | the amd64 target's "devbox" home (thin wrapper today) |
 | `.cargo/config.toml` | `[target.x86_64-unknown-none]` → `relocation-model=static`, `code-model=kernel` |
 | `crates/akuma-cpu/src/lib.rs` | the gate, and a rewritten header |
 
