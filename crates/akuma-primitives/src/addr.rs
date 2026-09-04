@@ -76,6 +76,19 @@ pub const PHYSMAP_OFFSET: usize = 0xFFFF_8000_0000_0000;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub const DEVMAP_OFFSET: usize = 0xFFFF_8080_0000_0000;
 
+/// Base the amd64 kernel image is linked at (PML4 slot 511).
+///
+/// The `-2 GiB` range `-C code-model=kernel` assumes:
+/// `.text`/`.rodata`/`.data`/`.bss` all live here, linked high and loaded low
+/// via `AT(ADDR(sec) - KERNEL_VMA)` in `amd64/linker.ld` — so the physical
+/// address of a kernel object is its virtual address minus this. It is a
+/// **second alias of RAM**, distinct from the physmap: a `static` DMA buffer
+/// (`akuma-net-nic`'s frame arenas) has an address in this window, not the
+/// physmap, and [`virt_to_phys`] has to know both. Mirrors
+/// `amd64/src/phys.rs::KERNEL_VMA`.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub const KERNEL_IMAGE_OFFSET: usize = 0xFFFF_FFFF_8000_0000;
+
 /// MMIO offset on every other target: the identity, as for RAM.
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub const DEVMAP_OFFSET: usize = 0;
@@ -85,17 +98,29 @@ pub const DEVMAP_OFFSET: usize = 0;
 /// A subtraction rather than a no-op since 2026-09-04; see the module header. On
 /// AArch64 [`PHYSMAP_OFFSET`] is zero and this is the identity it always was.
 ///
+/// On amd64 there are **two** aliases of RAM and a DMA buffer can be in either:
+/// the physmap ([`PHYSMAP_OFFSET`], where the heap and page frames live) and the
+/// kernel image window ([`KERNEL_IMAGE_OFFSET`], where `.data`/`.bss` statics
+/// live — `akuma-net-nic`'s frame arenas among them). The image window is the
+/// higher base, so it is checked first. Getting this wrong is not loud: a
+/// `.bss` buffer translated through the physmap offset yields a plausible,
+/// non-zero, ~550 GiB physical address that the device rejects as a bogus
+/// descriptor rather than a fault the kernel sees.
+///
 /// # Panics
-/// If `vaddr` is not in the kernel's RAM window. This is a DMA path and the
-/// header warns against cost, so it is worth saying what the cost is: one
-/// compare and a not-taken branch, against a device round trip. What it buys is
-/// that handing a driver an address from the *wrong window* — a `&'static [u8]`
-/// in the kernel image, say, whose window has a different offset — fails loudly
-/// instead of programming a plausible-looking wrong physical address into a
-/// descriptor and letting the device DMA over unrelated memory.
+/// If `vaddr` is below the physmap base — i.e. not in any kernel RAM window.
+/// This is a DMA path and the header warns against cost, so it is worth saying
+/// what the cost is: one or two compares and a not-taken branch, against a
+/// device round trip.
 #[inline(always)]
 #[must_use]
 pub fn virt_to_phys(vaddr: usize) -> usize {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        if vaddr >= KERNEL_IMAGE_OFFSET {
+            return vaddr - KERNEL_IMAGE_OFFSET;
+        }
+    }
     // `checked_sub().expect()` rather than `assert!(vaddr >= PHYSMAP_OFFSET)`:
     // on AArch64 the offset is 0, and clippy correctly points out that a
     // `>= 0` comparison on a `usize` is always true. Written this way the check

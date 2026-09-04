@@ -216,6 +216,11 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     usermode::fdprobe_test(&mut t);
     lapic::stop_timer();
 
+    // Last: it spawns the netpoll daemon and leaves it running (which is the
+    // point — `run_init` needs it), so it must come after the leak and
+    // preemption checks above.
+    net::netpoll_selftest(&mut t, have_net);
+
     // The verdict is `#[must_use]`, and this is why: before the harness existed
     // a `[FAIL]` printed and the boot went on to announce success.
     let passed = t.report();
@@ -232,6 +237,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     if passed && have_fs {
         let mut init_buf = [0u8; 128];
         if let Some(path) = machine::init_path(hvm_start_info, &mut init_buf) {
+            // Leave the timer running for the init program: it drives preemption
+            // (so a busy server cannot starve the netpoll daemon) and advances
+            // the clock `akuma-net`'s wait deadlines are measured against. The
+            // self-tests stop it between stages; a shell or server wants it on.
+            if have_net {
+                lapic::start_timer();
+            }
             usermode::run_init(path);
         }
     }

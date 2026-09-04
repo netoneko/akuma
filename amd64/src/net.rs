@@ -58,7 +58,13 @@ fn utc_seconds() -> Option<u64> {
 /// directly. There is no such state here, so a parked waiter polls — which is
 /// the same trade the block driver makes, and for the same reason.
 fn park_until(deadline_us: u64) {
-    while uptime_us() < deadline_us {
+    // Cap the spin so a stalled clock (the LAPIC timer masked, e.g. between two
+    // self-test stages) degrades to "return and let the caller re-check" rather
+    // than "hang": `wait_until` re-evaluates its condition and re-drains the
+    // stack immediately after this returns, so an early return is always safe.
+    let mut guard = 0u32;
+    while uptime_us() < deadline_us && guard < 100_000 {
+        guard += 1;
         crate::sched::yield_now();
     }
 }
@@ -221,7 +227,6 @@ pub fn init(enable_dhcp: bool) -> bool {
     match akuma_net::init(rt, enable_dhcp) {
         Ok(()) => {
             serial::puts("  net:  stack up\n");
-            settle();
             true
         }
         Err(e) => {
@@ -233,35 +238,56 @@ pub fn init(enable_dhcp: bool) -> bool {
     }
 }
 
-/// Drive the stack until DHCP has had its chance.
+/// Laps the netpoll daemon has completed. Read by the self-test to prove the
+/// spawned task is actually being scheduled.
+static NETPOLL_LAPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// One netpoll lap: drain `smoltcp_net::poll()` until it stops making progress
+/// or the safety cap is hit. Returns the productive-poll count.
 ///
-/// **Nothing else polls.** The AArch64 kernel runs a netpoll thread; here the
-/// only thing that calls `smoltcp_net::poll()` is `akuma-net`'s own blocking
-/// wait, from inside a socket operation. That is enough once a program is
-/// running, and it is nothing at all in the window between `init` and the first
-/// `accept` — which is exactly the window DHCP lives in. Without this, the lease
-/// never completes and the log says "DHCP deconfigured - reverting to static
-/// fallback" for a machine whose server was answering all along.
-///
-/// Bounded, because a machine with no DHCP server is a legitimate machine: the
-/// static fallback (10.0.2.15/24) is what QEMU's user-mode stack and the
-/// Firecracker host both hand out anyway, so failing to get a lease costs
-/// nothing here and must not cost the boot.
-fn settle() {
-    // Two seconds of ticks. Enough for a DISCOVER/OFFER/REQUEST/ACK round trip
-    // on both machines; short enough that a machine with no server is not
-    // noticeably slower to boot.
-    let deadline = uptime_us() + 2_000_000;
-    let mut polls: u64 = 0;
-    while uptime_us() < deadline {
-        if akuma_net::smoltcp_net::poll() {
-            polls += 1;
+/// This is the amd64 analogue of `netpoll_drain_step` in `akuma-kernel-glue`.
+/// Each `poll()` moves at most one RX frame (one virtio buffer), so a burst
+/// needs the loop; the cap keeps one busy interface from starving the
+/// round-robin. There is no `wfi` here and no NIC IRQ to end one early — on the
+/// AArch64 side the interrupt only *shortens* the wait, so the loop is the
+/// load-bearing part and this target has exactly the loop.
+fn drain_step() -> u32 {
+    let mut polls = 0u32;
+    while akuma_net::smoltcp_net::poll() {
+        polls += 1;
+        if polls >= 64 {
+            break;
         }
+    }
+    polls
+}
+
+/// The netpoll daemon: the thing that calls `smoltcp_net::poll()` between socket
+/// calls, so DHCP completes and a listening server is actually serviced.
+///
+/// Spawned once (via [`spawn_netpoll`]) and never returns. It is a
+/// [`crate::sched::spawn_daemon`] task, so the round-robin schedules it
+/// alongside whatever `init=` program is running and the timer preempts a
+/// compute-bound task onto it; `all_user_tasks_finished` ignores it so a shell
+/// exiting still ends the boot.
+extern "C" fn netpoll_daemon() -> ! {
+    loop {
+        drain_step();
+        NETPOLL_LAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         crate::sched::yield_now();
     }
-    serial::puts("  net:  settled after ");
-    serial::put_dec(polls);
-    serial::puts(" productive polls\n");
+}
+
+/// Spawn the netpoll daemon. Returns false only if the task table is full, which
+/// is a bug (the table is sized for it) rather than a condition to handle.
+pub fn spawn_netpoll() -> bool {
+    let ok = crate::sched::spawn_daemon(netpoll_daemon).is_some();
+    if ok {
+        serial::puts("  net:  netpoll daemon spawned\n");
+    } else {
+        serial::puts("  net:  [WARN] no task slot for the netpoll daemon\n");
+    }
+    ok
 }
 
 /// Check the pieces that do not need a NIC, plus the NIC if there is one.
@@ -290,4 +316,41 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
     t.check("net: the uptime clock is readable", uptime_us() >= t0);
 
     t.check("net: stack initialised", up);
+}
+
+/// Stage Q: the netpoll daemon, the loop that was missing.
+///
+/// Two things are checked. First, that the drain **terminates** — the bug this
+/// stage replaced was a settle loop keyed on a clock that had not started yet,
+/// which spun `poll()` until QEMU's TX ring collapsed. With nothing generating
+/// traffic, 64 back-to-back drains must end on a zero-progress lap. Second, that
+/// the spawned daemon is actually **scheduled**: its lap counter must climb
+/// while the boot task does nothing but `yield_now`.
+///
+/// Runs last in the self-test sequence on purpose — it leaves the daemon
+/// running (that is the point; `run_init` needs it), so it must not perturb the
+/// leak and preemption checks that come before it.
+pub fn netpoll_selftest(t: &mut Suite, up: bool) {
+    use core::sync::atomic::Ordering;
+
+    if !up {
+        t.note("net: netpoll skipped (no stack)", 0);
+        return;
+    }
+
+    let mut last = u32::MAX;
+    for _ in 0..64 {
+        last = drain_step();
+    }
+    t.check_eq("net: the netpoll drain reaches quiescence", u64::from(last), 0);
+
+    let before = NETPOLL_LAPS.load(Ordering::Relaxed);
+    if t.check("net: netpoll daemon spawned", spawn_netpoll()) {
+        for _ in 0..4_000 {
+            crate::sched::yield_now();
+        }
+        let laps = NETPOLL_LAPS.load(Ordering::Relaxed) - before;
+        t.check("net: the netpoll daemon is being scheduled", laps > 100);
+        t.note("net: netpoll laps per 4000 boot-task yields", laps);
+    }
 }

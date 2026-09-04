@@ -46,13 +46,11 @@ pub fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> u64 {
     let Some(idx) = akuma_net::socket::alloc_socket(kind) else {
         return errno::EMFILE;
     };
-    match fd::alloc_socket_fd(idx) {
-        Some(fd) => fd,
-        None => {
-            akuma_net::socket::remove_socket(idx);
-            errno::EMFILE
-        }
-    }
+    let Some(fd) = fd::alloc_socket_fd(idx) else {
+        akuma_net::socket::remove_socket(idx);
+        return errno::EMFILE;
+    };
+    fd
 }
 
 /// Read a `struct sockaddr_in` from user memory.

@@ -56,12 +56,17 @@ const STACK_SIZE: usize = 32 * 1024;
 /// stage landed — the symptom was `spawn` returning `None` after every earlier
 /// test had passed.
 ///
+/// Stage Q added the netpoll daemon (one slot, spawned for the whole run) and
+/// leaves headroom for the tasks an authenticated `sshd` session forks off, so
+/// this grew again — same symptom if it is too small, same fix deferred for the
+/// same reason.
+///
 /// The right fix is recycling, and it is deliberately not this: a slot cannot
 /// be reused until its two 32 KiB stacks can be, and reclaiming those needs the
 /// scheduler to know a task's stack is no longer in use by any frame — which is
 /// a different stage. Growing the table is honest about being a bound on the
 /// boot's total task count.
-const MAX_TASKS: usize = 12;
+const MAX_TASKS: usize = 16;
 
 core::arch::global_asm!(
     r#"
@@ -172,6 +177,11 @@ enum State {
 struct Task {
     ctx: Context,
     state: State,
+    /// A daemon runs for the life of the kernel and never finishes — the netpoll
+    /// loop is the only one so far. [`all_user_tasks_finished`] ignores these
+    /// slots, so `run_init`'s drive loop still ends when the *shell* exits rather
+    /// than spinning against a task that is Runnable on purpose.
+    daemon: bool,
     /// Page-table root to install when this task runs. `0` means "the kernel's",
     /// which is what every kernel task uses.
     space_root: u64,
@@ -188,6 +198,7 @@ impl Task {
         Self {
             ctx: Context::empty(),
             state: State::Unused,
+            daemon: false,
             space_root: 0,
             uctx: UserCtx::new(),
             trap_stack_top: 0,
@@ -253,11 +264,20 @@ pub fn preemptions() -> u64 {
     PREEMPTIONS.load(Ordering::Relaxed)
 }
 
-/// Have all tasks except the boot task finished?
+/// Have all tasks except the boot task and any daemons finished?
+///
+/// Daemon slots (the netpoll loop) are Runnable for the whole run by design, so
+/// they are skipped — otherwise `run_init`'s drive loop would never see the
+/// shell exit.
 #[must_use]
 pub fn all_user_tasks_finished() -> bool {
     // SAFETY: raw-pointer read of the table; single core.
-    unsafe { (1..MAX_TASKS).all(|s| (*tasks())[s].state != State::Runnable) }
+    unsafe {
+        (1..MAX_TASKS).all(|s| {
+            let t = &(*tasks())[s];
+            t.daemon || t.state != State::Runnable
+        })
+    }
 }
 
 /// The running task's slot.
@@ -310,6 +330,18 @@ pub fn spawn_in_space(entry: extern "C" fn() -> !, space_root: u64) -> Option<us
     // returned by `spawn`.
     unsafe {
         (*tasks())[slot].space_root = space_root;
+    }
+    Some(slot)
+}
+
+/// Create a daemon task: one that runs for the life of the kernel and is not
+/// counted by [`all_user_tasks_finished`]. The netpoll loop is the only caller.
+pub fn spawn_daemon(entry: extern "C" fn() -> !) -> Option<usize> {
+    let slot = spawn(entry)?;
+    // SAFETY: raw-pointer access to the table; single core, and `slot` was just
+    // returned by `spawn`.
+    unsafe {
+        (*tasks())[slot].daemon = true;
     }
     Some(slot)
 }
