@@ -409,10 +409,16 @@ pub fn sys_close(fd: u64) -> u64 {
     match taken {
         Some(Entry { desc: FileDescriptor::Socket(s), .. }) => crate::sock::close(s),
         // Closing the write end (the `/proc/<pid>/fd/0` handle) signals EOF to
-        // the child. Closing a read end just drops the fd — the pipe is freed
-        // when the child is reaped in `waitpid`.
+        // the child but does not free the pipe — the child may still be draining
+        // buffered input.
         Some(Entry { desc: FileDescriptor::PipeWrite(p), .. }) => {
             crate::pipe::close_write(p as usize);
+        }
+        // Closing the read end (`sshd`'s stdout reader) is the last reference to
+        // a spawned child's stdout pipe — `waitpid` deliberately left it alive
+        // for this final drain. Free the slot now.
+        Some(Entry { desc: FileDescriptor::PipeRead(p), .. }) => {
+            crate::pipe::free(p as usize);
         }
         _ => {}
     }

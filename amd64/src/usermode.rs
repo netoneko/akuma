@@ -1122,7 +1122,7 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     };
     // SAFETY: as above; `slot_off` is in bounds and occupied.
     let s = unsafe { (*spawn_table())[slot_off].as_ref().unwrap() };
-    let (exit, stdout_pipe, stdin_pipe) = (s.exit, s.stdout_pipe, s.stdin_pipe);
+    let (exit, stdin_pipe) = (s.exit, s.stdin_pipe);
 
     let Some(code) = exit else {
         return 0; // still running
@@ -1134,9 +1134,11 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         unsafe { (status_ptr as *mut i32).write_volatile(raw) };
     }
 
-    // Reap: free both pipes, the SPAWN entry, and the child's PROCS slot (its
-    // frames), so a long-lived `sshd` does not run out of any of them.
-    pipe::free(stdout_pipe);
+    // Reap the SPAWN entry, the child's PROCS slot (its frames) and the **stdin**
+    // pipe — the child has exited, so nobody reads it any more. The **stdout**
+    // pipe stays alive until the parent closes its read fd (`sys_close` frees
+    // it): `sshd`'s bridge does its final `read` *after* `waitpid` returns, to
+    // drain the last bytes the child wrote before it exited.
     pipe::free(stdin_pipe);
     // SAFETY: raw-pointer access; single core. The child task is Finished — it
     // called `sched::finish()` in `run_process` after recording its exit.
@@ -1148,6 +1150,78 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         }
     }
     u64::from(pid)
+}
+
+/// Stage R: `sys_spawn` runs a child, its stdout comes back through a pipe, and
+/// `waitpid` reports its exit status.
+///
+/// Spawns `/bin/hello` — the same image `elf_test` runs, but this time its
+/// stdout is a pipe rather than the console and its exit status arrives through
+/// `waitpid` rather than the `EXIT_STATUS` global. The self-test calls
+/// `sys_spawn` with kernel pointers, which is fine: `user_cstr` just does
+/// volatile reads and the kernel may read its own memory.
+pub fn spawn_test(t: &mut Suite) {
+    /// Every check `hello.rs` reports, all passing (bits 0..=6).
+    const HELLO_ALL_OK: u64 = 0x7F;
+
+    let free_before = akuma_pmm::free_count();
+
+    // A syscall's "negative" return is an errno in `-1..=-4095`, i.e. a u64 at
+    // the very top of the range; anything below that is a real value.
+    const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
+
+    let path = b"/bin/hello\0";
+    let arg0 = b"hello\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    if !t.check("spawn: sys_spawn returned a handle", r < ERRNO_FLOOR) {
+        return;
+    }
+    let pid = (r & 0xFFFF_FFFF) as u32;
+    let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
+    t.check("spawn: pid is a real child pid", pid >= 2);
+
+    // Non-blocking reads so the driver keeps polling `waitpid` too.
+    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut status = u64::MAX;
+    let mut buf = [0u8; 64];
+    let mut spins = 0u64;
+    loop {
+        spins += 1;
+        if spins > 500_000 {
+            break;
+        }
+        let n = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        if n != 0 && n < ERRNO_FLOOR {
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        let mut st: i32 = -1;
+        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+            status = ((st >> 8) & 0xff) as u64;
+            break;
+        }
+        crate::sched::yield_now();
+    }
+
+    t.check(
+        "spawn: the child's stdout came back through the pipe",
+        out.windows(5).any(|w| w == b"[elf]"),
+    );
+    t.check_eq("spawn: waitpid reported the child's exit status", status, HELLO_ALL_OK);
+    // A drained, EOF pipe read returns 0.
+    t.check_eq(
+        "spawn: reading the child's stdout past EOF returns 0",
+        crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        0,
+    );
+    crate::fd::sys_close(stdout_fd);
+    t.check_eq(
+        "spawn: teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
 }
 
 /// Run two isolated processes concurrently and prove they interleave.

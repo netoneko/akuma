@@ -15,12 +15,15 @@ it also drives a **virtio-blk disk** and reads its own machine description —
 the PVH memory map, the virtio-MMIO command line, and ACPI's MADT — and since
 Stage N it mounts **ext2** on that disk and runs a program it opened by path;
 Stage O gave ring 3 `open`/`read`/`close`/`lseek`/`fstat`/`mmap` and a serial
-shell (`paws`); and since Stage Q a **netpoll daemon** drives the networking
-stack, so DHCP completes and `httpd` serves a request over virtio-net. No
-device interrupts, no writes, no `spawn`.
+shell (`paws`); Stage Q added a **netpoll daemon** so DHCP completes and `httpd`
+serves a request over virtio-net; and Stage R added `getrandom`, `fcntl` and
+**`sys_spawn`**, so **`sshd` serves an authenticated session** — key exchange,
+ed25519 pubkey auth, and a shell started over stdin/stdout pipes. No `fork`, no
+writes, no device interrupts.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1** —
-including networking, `curl http://10.0.2.15:8080/` from the Firecracker host.
+`curl http://10.0.2.15:8080/` and `ssh root@10.0.2.15 'echo hi'` both from the
+Firecracker host.
 
 **Status: C** (active risk, expect surprises). This is a spike, not a port.
 

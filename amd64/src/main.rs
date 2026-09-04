@@ -216,6 +216,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     lapic::start_timer();
     usermode::elf_test(&mut t);
     usermode::fdprobe_test(&mut t);
+    usermode::spawn_test(&mut t);
     lapic::stop_timer();
 
     // Last: it spawns the netpoll daemon and leaves it running (which is the

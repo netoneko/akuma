@@ -101,13 +101,14 @@ writing the first three down.
 
 ## 4. What is genuinely local, and why
 
-Three duplications survive, each with a checked reason:
+Four duplications survive, each with a checked reason:
 
 | local | the crate | why it cannot be used |
 |---|---|---|
 | the file syscall *bodies* (`sys_read`, `sys_openat`, `sys_lseek`) | `akuma-syscalls-glue` | **Does not build.** `error: invalid instruction mnemonic 'cbz'` — AArch64 asm reaching it through `akuma-user-access`. Its dependency list is 25 crates deep including `akuma-exec`, `akuma-mmu` and `akuma-bkl` |
 | `copy_from_user` / `copy_to_user` | `akuma-user-access` | **Does not build.** Its copy loop is AArch64 `global_asm!` |
 | the fd *array* | `akuma-exec`'s `Process` | Does not build here. The descriptor *type* is shared; only the table is local |
+| the pipe *table* (`static [Pipe; N]` + spinlock + `PipeId`) in `amd64/src/pipe.rs` | `akuma-syscalls-glue::pipe` | Same wall as the file-syscall bodies. The **buffer half** was extracted this time rather than re-derived — `crates/akuma-pipe`, `#![forbid(unsafe_code)]`, host-tested — so what stays local is only the `static` and the lock, the same split as `akuma-fpcache` / `file_page_cache.rs` |
 
 The raw-vs-canonical console split is not duplication either: `read(0)` goes
 through `akuma-terminal`'s canonical mode, and Akuma's own `poll_input_event`
