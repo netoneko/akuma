@@ -1663,6 +1663,47 @@ pub fn socket_udp_recv_ready(idx: usize) -> bool {
     matches!(smoltcp_handle_for(idx), Some((handle, true)) if smoltcp_net::udp_can_recv(handle))
 }
 
+/// `(recv_ready, send_ready)` for a stream socket, right now — the readiness
+/// probe behind `poll(2)`/`select(2)` on targets whose fd tables ask this
+/// crate directly.
+///
+/// One drain first, exactly like [`socket_udp_recv_ready`], so a packet that
+/// is on the wire is visible to the probe. The recv half is the same predicate
+/// a non-blocking `recv` applies (`tcp_recv_ready`, EOF included); the send
+/// half is `can_send`, the same condition `socket_send`'s wait parks on.
+/// `was_connected` is recomputed here exactly as [`socket_recv`] does it, so a
+/// socket whose handshake was only ever observed by a poller still reports a
+/// later EOF as readable rather than as silence.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn socket_tcp_ready(idx: usize) -> (bool, bool) {
+    smoltcp_net::poll();
+    let Some((handle, false)) = smoltcp_handle_for(idx) else {
+        return (false, false);
+    };
+    let was_connected = with_table(|table| {
+        let sock = table.get_mut(idx)?.as_mut()?;
+        if !sock.was_connected
+            && with_network(|net| {
+                tcp_reached_established(net.sockets.get::<tcp::Socket>(handle).state())
+            })
+            .unwrap_or(false)
+        {
+            sock.was_connected = true;
+        }
+        Some(sock.was_connected)
+    })
+    .unwrap_or(false);
+    with_network(|net| {
+        let socket = net.sockets.get::<tcp::Socket>(handle);
+        (
+            tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected),
+            socket.can_send(),
+        )
+    })
+    .unwrap_or((false, false))
+}
+
 /// Get the default peer for a connected UDP socket
 #[must_use] 
 #[cfg(feature = "smoltcp")]

@@ -2844,6 +2844,168 @@ apk's own real userspace socket calls sustained over a real transfer, rather
 than by kernel-side code — is the leading suspect, but this was not
 diagnosed further. A stage of its own.
 
+## 3.31 Stage Y: apk's HTTPS fetch, end to end (2026-09-04)
+
+Closes §3.30.5's open hang — and, on the way in, a boot crash that had been
+hiding behind it. Four real bugs, none of them in the TLS layer the
+certificate-date work pointed at. The diagnostics that found them, in the
+order that mattered: a **syscall-entry trace** (`[sc>]` lines, below) — a
+syscall that blocks forever has no result line, so a result-only tracer
+reports a hang as "no syscalls at all"; and a **wire capture** of the whole
+fetch (`-object filter-dump,id=f0,netdev=n0,file=…`), which is what proved
+the network stack innocent: the server's full handshake flight (5929 bytes)
+arrived, was buffered, and was ACKed — while apk sat silent.
+
+### 3.31.1 Bug found #1: a preemption window in `spawn_in_space` — sshd died on its first instruction
+
+**Symptom.** Intermittent, roughly every other boot, and total when it hit:
+after `all self-tests passed`, one line —
+
+```
+[EXCEPTION] #PF page fault err=0x0000000000000014
+  rip=0x00000000002045d0 rsp=0x00007fffffffef70
+  cs=0x0000000000000023 rflags=0x0000000000010202
+  cr2=0x00000000002045d0
+```
+
+— then nothing. No sshd, no console. (`err=0x14`: user-mode *instruction
+fetch*, not-present; `cs=0x23`: ring 3.)
+
+**The address is the whole story.** `0x2045d0` is `/bin/sshd`'s ELF entry
+point — the kernel jumped into ring 3 at exactly the right address and the
+fetch faulted anyway. `loader::load` re-verifies the entry page is mapped and
+executable after mapping everything (`loader.rs`), so the PTE existed in the
+loaded `AddressSpace` at check time. A load failure would have printed
+`[init] failed to load: …` and continued; this was load *success* followed by
+an unmapped fetch.
+
+**Cause.** `sched::spawn()` marked the new slot `Runnable` and returned;
+`spawn_in_space` wrote `space_root` *after* that. Those are a handful of
+instructions apart, and the LAPIC tick can land between them:
+`preempt_if_needed` → `yield_now` → the round-robin picker takes the fresh
+slot (it is already `Runnable`) → `space_root` is still 0 → the kernel's CR3
+is installed → `run_process` finds `PROCS[6]` populated (`run_init` stores it
+*before* spawning) → `enter_user_mode` sysrets into ring 3 with kernel page
+tables → first fetch faults exactly as observed. Which boot crashes is timer
+phase — the self-test sequence's DHCP/SNTP wall time decides where the tick
+lands — which is why this hid until now.
+
+**Fix.** Publication ordering, in `sched.rs`: `spawn_unpublished` fills every
+field the scheduler reads — `ctx`, `trap_stack_top`, `space_root`, `daemon` —
+and `state = Runnable` is the **last** store. `spawn_in_space`/`spawn_daemon`
+go through it; `spawn` (kernel-space tasks) keeps its old meaning. The fork
+path had the same race one step later — `seed_forked_task` wrote the child's
+TLS base and register snapshot after publication — so it now uses
+`spawn_in_space_unpublished` → `seed_forked_task` → `publish_task`: the child
+is invisible to the picker until the seed is in place. (`spawn_daemon`'s flag
+matters too: published before the flag write, a never-exiting daemon would be
+counted by `all_user_tasks_finished` and wedge the boot drive loop the other
+way.)
+
+**Verified.** Four consecutive boots of the fixed kernel: sshd serving in
+~5 s each, zero faults. The pre-fix fault log is the §3.30.5-era boot
+reproduced above; the race window analysis matches every register.
+
+### 3.31.2 The tracer that made the hang visible
+
+A blocking syscall never prints its result, so the old `[sc] nr=%d -> %r`
+tracer showed the hang as ~1.5 M lines of sshd's idle loop and nothing from
+apk. `syscall_handler` now also prints an **entry** line (`[sc>] nr=%d
+a1=%#x`) when `strace` is on the command line; the last entry line without a
+matching result *is* the stuck syscall. This one print turned "apk hangs
+somewhere in a 60 MB trace" into "`read(fd=12)` entered, never returned" —
+fd 12 being the TLS socket.
+
+### 3.31.3 Bug found #2: `select(2)` did not exist — and `poll_ready` made that fatal twice
+
+**Symptom.** apk: DNS ✓ (musl's `sendmsg`/`recvmsg` stub resolver, §3.29),
+connect ✓, ClientHello written ✓, ServerHello read ✓ — then blocks forever
+in `read(fd=12)` with the wire completely quiet in both directions (the
+filter-dump: all data ACKed, nothing retransmitting, no window probes; apk
+never sends the HTTP GET).
+
+**Cause, in two layers.**
+
+1. `select` (x86_64 23) fell through to `ENOSYS`. This is the x86 twin of
+   `APK_MISSING_SYSCALLS.md`'s pselect6 item: apk waits for socket readiness
+   through the select/pselect family, and with the syscall failing it took a
+   wrong branch and read a socket nobody had sent anything to.
+2. The `select` that arrived first **blocked forever itself**: the fd.rs
+   `poll_ready` probe hard-coded every TCP socket as `(false, false)` —
+   "not ready", with a comment saying nothing polled a stream socket yet.
+   `sys_select` loops on that probe, so apk's post-connect writability wait
+   went from ENOSYS to a permanent yield-spin.
+
+**Fix.** `sys_select` (`fd.rs`) marshals through `akuma-syscalls-poll`'s
+`fdset` module — the same host-tested bit arithmetic (the count-in-both-
+directions rule, the received-sets-are-overwritten rule from the libcurl
+`CURL_CSELECT_ERR` incident) the AArch64 poll family uses. That crate is the
+first consumer on this target from the README's "not needed yet, but builds"
+list; the wiring is the dependency plus one dispatch arm, not a
+re-derivation. The readiness probe is `akuma_net::socket::socket_tcp_ready`
+(new, in `akuma-net`): `(tcp_recv_ready(…), can_send)` — the identical
+predicate a non-blocking `recv` applies and the identical condition
+`socket_send` parks on — with `socket_udp_recv_ready` still serving the UDP
+side. `poll_ready`'s TCP arm now returns it.
+
+### 3.31.4 Bug found #3: a whole-file `write(2)` refused over 64 KiB — apk's `Invalid argument`
+
+With the hang gone, both fetches completed and apk died differently:
+`updating and opening …/APKINDEX.tar.gz: Invalid argument`, twice, `APK_RC=2`.
+The entry tracer put it in three lines:
+
+```
+[sc>] nr=0 a1=0xc      read(fd=12)  -> 0xde        (222 bytes of TLS body)
+[sc>] nr=1 a1=0xb      write(fd=11) -> -EINVAL
+```
+
+`fd::sys_write_file` rejected any `write(2)` longer than `MAX_IO` (64 KiB)
+with `EINVAL` — a length *refusal* where real Linux has none (any length is
+accepted; short writes are the contract). apk buffers a whole downloaded
+APKINDEX — hundreds of KB — and writes it to its cache file in one call.
+Fixed by chunking: the write copies in `MAX_IO`-sized pieces, each piece
+extending the descriptor's buffer and advancing the cursor under its own
+`TABLE` lock. (Found and fixed 2026-09-04; verification is the first item
+still open below.)
+
+### 3.31.5 What's verified, and what's still open
+
+Verified over SSH on QEMU `microvm`, `SSHD_SHELL=/bin/sh` disk, private
+ports (2222/8080 stay free for the aarch64 devbox):
+
+- Boot crash gone: 4/4 boots reach sshd (§3.31.1).
+- The §3.30.5 hang is gone: apk reaches the end of both index fetches and
+  exits on its own (§3.31.3/§3.31.4).
+- Self-tests: 173/173 on the fixed kernel.
+
+Still open, in the order they block:
+
+1. **§3.31.4's chunked write is not yet boot-verified** — the fix is in,
+   `apk add`-style persistence is the test.
+2. **`socketpair` (53) is ENOSYS** — busybox `wget https://…` bridges its
+   `ssl_client` helper over a socketpair, so the independent HTTPS check
+   (and only that) waits on it. `akuma_exec_core`'s
+   `FileDescriptor::UnixSocket { rx, tx, sock: 0 }` over two `crate::pipe`
+   allocations is the shape; the fd table's read/write/close dispatch needs
+   the three arms.
+3. **`brk` (12), `getsockname` (51) are ENOSYS** — musl tolerates both
+   (mmap-based fallback; apk calls getsockname once and moves on), noted so
+   they are not rediscovered as bugs later.
+4. **Daemon-vs-syscall `NETWORK` concurrency (§3.30.4's family) remains
+   untested territory** — every fetch so far has been single-connection and
+   short. `PreemptGuard` is a no-op on this target (no `kernel_smp_shared`),
+   so `NETWORK` holds are not preemption-safe by construction the way they
+   are on the AArch64 side; if a second concurrent fetch wedges, that is the
+   first place to look. (The §3.30.5 deadlock suspicion for *this* hang was
+   wrong: the cause was §3.31.3's missing syscall + never-ready probe.)
+5. **A "DNS works" control that is not apk**: `example.com` returns NXDomain
+   through QEMU slirp on the local network — the *host* resolver answers the
+   same, so this is the network, not the guest stack (verified by resolving
+   the same name from the host and by the pcap: the guest's query leaves
+   faithfully and the answer comes back faithfully). `dl-cdn.alpinelinux.org`
+   resolves and serves on the same path.
+
+
 ## 4. What is deliberately missing
 
 Corrected 2026-09-04. This list was written at Stage B and went stale as the

@@ -76,6 +76,12 @@ akuma-sntp = { path = "../crates/akuma-sntp" }
 # `src/pipe.rs` is the `static` array + lock around it. The tree's full kernel
 # pipe is `akuma-syscalls-glue`, which does not build for this target.
 akuma-pipe = { path = "../crates/akuma-pipe" }
+# The `select(2)`/`pselect6` fd-set marshalling and the readiness vocabulary
+# (`akuma_syscalls_poll::fdset`), host-tested — the same module the AArch64
+# kernel marshals its poll family through. First consumer on this target was
+# `sys_select` (`fd.rs`): `apk` waits for socket writability through `select`
+# and wedged its TLS fetch while the syscall was `ENOSYS`.
+akuma-syscalls-poll = { path = "../crates/akuma-syscalls-poll" }
 
 [[bin]]
 name = "akuma-amd64"

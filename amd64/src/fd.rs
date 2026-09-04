@@ -91,6 +91,9 @@ pub mod errno {
     pub const ENOMEM: u64 = (-12i64) as u64;
     pub const ENOTDIR: u64 = (-20i64) as u64;
     pub const EISDIR: u64 = (-21i64) as u64;
+    pub const EEXIST: u64 = (-17i64) as u64;
+    pub const ENOTEMPTY: u64 = (-39i64) as u64;
+    pub const EIO: u64 = (-5i64) as u64;
 
     /// Does a syscall return value carry an errno? Linux errnos are `1..=4095`,
     /// returned as `(-errno) as u64` — the very top of the range. Anything below
@@ -115,6 +118,7 @@ pub const MAX_OPEN: usize = 16;
 /// The cursor lives in the `KernelFile`'s own `position`, not beside it — so a
 /// future move to reading by inode changes where the *bytes* come from and
 /// nothing else.
+#[derive(Clone)]
 struct Entry {
     desc: FileDescriptor,
     /// The file's contents, cached at `open`. See the module header. Empty and
@@ -331,6 +335,27 @@ fn copy_to_user(ptr: u64, src: &[u8]) -> usize {
     src.len()
 }
 
+/// Dump a user C string to the serial trace (bounded, stops at NUL). Bring-up
+/// aid for the path-taking syscall entry lines; a bad pointer traces as an
+/// empty string rather than faulting the tracer. The `user VA` range check is
+/// the cheap half of a fault handler — enough for a tracer, not for real
+/// `copy_from_user` semantics (see the `akuma-user-access` row in the target
+/// README for why that seam does not exist here yet).
+pub fn trace_user_cstr(ptr: u64) {
+    // Above the user half is a kernel address (or garbage) — not a path.
+    if ptr == 0 || ptr >= 0x0000_8000_0000_0000 {
+        return;
+    }
+    for i in 0..256u64 {
+        // SAFETY: bounded read of user memory, per this module's contract.
+        let b = unsafe { (ptr as *const u8).add(i as usize).read_volatile() };
+        if b == 0 || !b.is_ascii() {
+            return;
+        }
+        serial::putb(b);
+    }
+}
+
 /// Read a NUL-terminated path from user memory.
 ///
 /// Bounded at 256 bytes, which is `PATH_MAX` for every path this kernel can
@@ -353,14 +378,59 @@ fn path_from_user(ptr: u64) -> Option<alloc::string::String> {
     None
 }
 
+/// Resolve an `*at()`-syscall path against its `dirfd`.
+///
+/// Absolute paths ignore `dirfd`, per POSIX. A relative path resolves against
+/// the directory the `dirfd` names — when it names one: a directory descriptor
+/// in the table (how `apk` opens each key: `openat(keys_dirfd, name)` after
+/// listing the very same directory, whose ignoring cost an afternoon). A
+/// directory fd is reached only as a *path* here — this target's descriptors
+/// cache no directory handle, so the join is string-level, which is exact for
+/// the paths `mkdisk`-built images actually hold. `AT_FDCWD` (`-100`) keeps
+/// the pre-`dirfd` behaviour, root-relative: this target has no per-process
+/// working directory yet. Everything else that is not a directory descriptor
+/// is `ENOTDIR`, per POSIX, rather than a silently different file.
+fn resolve_at(dirfd: u64, path: alloc::string::String) -> Result<alloc::string::String, u64> {
+    if path.starts_with('/') {
+        return Ok(path);
+    }
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    if dirfd == AT_FDCWD {
+        let mut p = alloc::string::String::from("/");
+        p.push_str(&path);
+        return Ok(p);
+    }
+    let Some(idx) = dirfd.checked_sub(FIRST_FILE_FD as u64) else {
+        return Err(errno::ENOTDIR);
+    };
+    let table = TABLE.lock();
+    let Some(Some(entry)) = table.get(idx as usize) else {
+        return Err(errno::ENOTDIR);
+    };
+    if !entry.is_dir {
+        return Err(errno::ENOTDIR);
+    }
+    let Some(FileDescriptor::File(f)) = Some(&entry.desc) else {
+        return Err(errno::ENOTDIR);
+    };
+    let mut joined = f.path.clone();
+    if !joined.ends_with('/') {
+        joined.push('/');
+    }
+    joined.push_str(&path);
+    Ok(joined)
+}
+
 /// `openat(dirfd, path, flags, mode)`.
 ///
-/// `dirfd` is ignored and every path is resolved from the root. That is correct
-/// for absolute paths and wrong for relative ones, which this kernel has no
-/// working directory to resolve against yet — so a relative path is treated as
-/// root-relative rather than rejected, which is what a shell listing `bin`
-/// expects to work.
-pub fn sys_openat(_dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
+/// Absolute paths and `AT_FDCWD` resolve from the root; a relative path
+/// resolves against the directory `dirfd` names ([`resolve_at`]). That last
+/// case is not a nicety: `apk` loads every signing key with
+/// `openat(keys_dirfd, name)` after listing that directory, and while `dirfd`
+/// was ignored each such open landed on a root-relative name that does not
+/// exist — zero keys loaded, and every fetched index reported `UNTRUSTED
+/// signature` no matter how correct the fetch and the keys were.
+pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     let Some(path) = path_from_user(path) else {
         return errno::EFAULT;
     };
@@ -381,13 +451,26 @@ pub fn sys_openat(_dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
         return errno::ENOENT;
     }
 
-    let normalised = if path.starts_with('/') {
-        path
-    } else {
-        let mut p = alloc::string::String::from("/");
-        p.push_str(&path);
-        p
+    let Ok(normalised) = resolve_at(dirfd, path) else {
+        return errno::ENOTDIR;
     };
+    // `O_TMPFILE` (x86_64 encoding, `0o20200000`) is answered with `EINVAL`,
+    // as Linux kernels without tmpfile support do. This used to be *missing*,
+    // which repeated the aarch64 `APK_OTMPFILE_DIR_FD.md` bug bit for bit:
+    // apk-tools 3 opens its atomic-write temp file with
+    // `openat(dfd, ".", O_RDWR|O_TMPFILE|O_CLOEXEC)`, the open succeeded as a
+    // writable descriptor on the *directory*, apk wrote the whole downloaded
+    // index into it (the kernel buffered the bytes, `close` skipped the
+    // `is_dir` persistence), and the reopen-for-verify then had nothing to
+    // verify — surfacing as `UNTRUSTED signature` over a fetch that was fine.
+    // Portable callers (apk-tools 3's `__apk_ostream_to_file`) treat any
+    // failure here as "no tmpfiles" and fall back to `.tmp.<pid>` +
+    // `renameat`, which works.
+    const O_TMPFILE_X86: u64 = 0o20200000;
+    if flags_ & O_TMPFILE_X86 == O_TMPFILE_X86 {
+        return errno::EINVAL;
+    }
+
     // `O_CREAT`: a new (or truncated) file, written back at `close(2)` — see
     // [`sys_close`] and this module's header. Skips `read_file` entirely
     // rather than reading-then-discarding an existing file's bytes: this
@@ -406,8 +489,15 @@ pub fn sys_openat(_dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     // fail it as `NotAFile`. Check `metadata` first (one inode read, next to
     // `read_file`'s whole-file copy) so a directory opens successfully instead
     // of falling through to "not found"; `getdents64` lists it straight off
-    // the disk on first use.
+    // the disk on first use. Write-mode opens of a directory are refused at
+    // `open(2)` time (Linux `may_open`'s answer) rather than handed out as a
+    // descriptor whose every meaningful write is a lie — the second half of
+    // the `O_TMPFILE` lesson above, and the same guard the aarch64 kernel
+    // shipped for it.
     let is_dir = !creating && fs::metadata(&normalised).is_some_and(|m| m.is_dir);
+    if is_dir && flags_ & u64::from(open_flags::O_ACCMODE) != 0 {
+        return errno::EISDIR;
+    }
     let data = if creating || is_dir {
         Vec::new()
     } else {
@@ -440,6 +530,249 @@ pub fn sys_openat(_dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
 pub mod open_flags {
     pub const O_ACCMODE: u32 = 0o3;
     pub const O_CREAT: u32 = 0o100;
+}
+
+/// `mkdirat(dirfd, path, mode)` — x86_64 258. `mode` is not tracked (one
+/// user, like `access`). First consumer: `apk`'s cache-directory setup.
+pub fn sys_mkdirat(dirfd: u64, path: u64, _mode: u64) -> u64 {
+    let Some(raw) = path_from_user(path) else {
+        return errno::EFAULT;
+    };
+    let Ok(path) = resolve_at(dirfd, raw) else {
+        return errno::ENOTDIR;
+    };
+    match fs::create_dir(&path) {
+        Ok(()) => 0,
+        Err(akuma_vfs::FsError::AlreadyExists) => errno::EEXIST,
+        Err(akuma_vfs::FsError::NotFound) => errno::ENOENT,
+        Err(_) => errno::EIO,
+    }
+}
+
+/// `unlinkat(dirfd, path, flags)` — x86_64 263. `AT_REMOVEDIR` (`0x200`)
+/// selects `rmdir`. First consumer: `apk`'s stale-cache cleanup.
+pub fn sys_unlinkat(dirfd: u64, path: u64, flags: u64) -> u64 {
+    const AT_REMOVEDIR: u64 = 0x200;
+    let Some(raw) = path_from_user(path) else {
+        return errno::EFAULT;
+    };
+    let Ok(path) = resolve_at(dirfd, raw) else {
+        return errno::ENOTDIR;
+    };
+    match fs::remove(&path, flags & AT_REMOVEDIR != 0) {
+        Ok(()) => 0,
+        Err(akuma_vfs::FsError::NotFound) => errno::ENOENT,
+        Err(akuma_vfs::FsError::DirectoryNotEmpty) => errno::ENOTEMPTY,
+        Err(_) => errno::EIO,
+    }
+}
+
+/// `renameat(olddirfd, oldpath, newdirfd, newpath)` — x86_64 264. Both
+/// `dirfd`s are ignored (root-relative), as everywhere on this target. First
+/// consumer: `apk`'s atomic `.tmp.<pid>` + rename cache write — the fallback
+/// its `__apk_ostream_to_file` uses when `O_TMPFILE` is refused (which it now
+/// is, above).
+pub fn sys_renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: u64) -> u64 {
+    let Some(old_raw) = path_from_user(oldpath) else {
+        return errno::EFAULT;
+    };
+    let Some(new_raw) = path_from_user(newpath) else {
+        return errno::EFAULT;
+    };
+    let Ok(old) = resolve_at(olddirfd, old_raw) else {
+        return errno::ENOTDIR;
+    };
+    let Ok(new) = resolve_at(newdirfd, new_raw) else {
+        return errno::ENOTDIR;
+    };
+    match fs::rename(&old, &new) {
+        Ok(()) => 0,
+        Err(e) => {
+            // Diagnostic for the apk cache-rename ENOENT (2026-09-04): the
+            // persist reported success yet the rename could not find the file.
+            serial::puts("[renameat] failed: old=\"");
+            serial::puts(&old);
+            serial::puts("\" new=\"");
+            serial::puts(&new);
+            serial::puts("\" base10=\"");
+            serial::puts(&fd_path_debug(10));
+            serial::puts("\" base7=\"");
+            serial::puts(&fd_path_debug(7));
+            serial::puts("\" err=");
+            serial::puts(fs_err_str(e));
+            serial::puts("\n");
+            errno::ENOENT
+        }
+    }
+}
+
+/// Static name for a VFS error, for console reporting (no allocation).
+#[must_use]
+fn fd_path_debug(fd: u64) -> alloc::string::String {
+    let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
+        return alloc::format!("<console {fd}>");
+    };
+    let table = TABLE.lock();
+    match table.get(idx as usize) {
+        Some(Some(Entry { desc: FileDescriptor::File(f), .. })) => f.path.clone(),
+        Some(Some(_)) => alloc::format!("<non-file {fd}>"),
+        _ => alloc::format!("<free {fd}>"),
+    }
+}
+
+/// Static name for a VFS error, for console reporting (no allocation).
+fn fs_err_str(e: akuma_vfs::FsError) -> &'static str {
+    use akuma_vfs::FsError as E;
+    match e {
+        E::NotFound => "not found",
+        E::PermissionDenied => "permission denied",
+        E::AlreadyExists => "already exists",
+        E::NotADirectory => "not a directory",
+        E::NotAFile => "not a file",
+        E::DirectoryNotEmpty => "directory not empty",
+        E::NoSpace => "no space",
+        E::InvalidPath => "invalid path",
+        E::Corrupt => "corrupt",
+        _ => "filesystem error",
+    }
+}
+
+/// `symlinkat(target, newdirfd, link_path)` — x86_64 266. Note the argument
+/// order: the TARGET comes first, per POSIX. First consumer: `apk add` —
+/// versioned-library symlinks (`libc.musl-x86_64.so.1`) are package contents,
+/// and each failure was a counted install error.
+pub fn sys_symlinkat(target: u64, newdirfd: u64, link_path: u64) -> u64 {
+    let Some(target) = path_from_user(target) else {
+        return errno::EFAULT;
+    };
+    let Some(link) = path_from_user(link_path) else {
+        return errno::EFAULT;
+    };
+    let Ok(link) = resolve_at(newdirfd, link) else {
+        return errno::ENOTDIR;
+    };
+    match fs::create_symlink(&link, &target) {
+        Ok(()) => 0,
+        Err(akuma_vfs::FsError::AlreadyExists) => errno::EEXIST,
+        Err(akuma_vfs::FsError::NotFound) => errno::ENOENT,
+        Err(_) => errno::EIO,
+    }
+}
+
+/// `readlinkat(dirfd, path, buf, bufsiz)` — x86_64 267. Replaces the old
+/// "return EINVAL" answer, which was honest while no symlink could exist and
+/// became a lie the moment [`sys_symlinkat`] landed.
+pub fn sys_readlinkat(dirfd: u64, path: u64, buf: u64, bufsiz: u64) -> u64 {
+    let Some(raw) = path_from_user(path) else {
+        return errno::EFAULT;
+    };
+    let Ok(path) = resolve_at(dirfd, raw) else {
+        return errno::ENOTDIR;
+    };
+    match fs::read_symlink(&path) {
+        Ok(target) => {
+            let bytes = target.as_bytes();
+            let n = (bytes.len() as u64).min(bufsiz);
+            copy_to_user(buf, &bytes[..n as usize]);
+            n
+        }
+        Err(_) => errno::ENOENT,
+    }
+}
+
+/// `utimensat(dirfd, path, times, flags)` — x86_64 280. `times` is two
+/// `struct timespec` (atime, mtime); the `UTIME_NOW`/`UTIME_OMIT` sentinel
+/// nanosecond values map to "the wall clock" / "leave alone". A NULL `times`
+/// sets both to now. First consumer: `apk`'s post-extract mtime preservation.
+pub fn sys_utimensat(dirfd: u64, path: u64, times: u64, _flags: u64) -> u64 {
+    const UTIME_NOW: i64 = 0x3fff_ffff;
+    const UTIME_OMIT: i64 = 0x3fff_fffe;
+
+    let Some(raw) = path_from_user(path) else {
+        return errno::EFAULT;
+    };
+    let Ok(path) = resolve_at(dirfd, raw) else {
+        return errno::ENOTDIR;
+    };
+
+    // Wall-clock seconds for UTIME_NOW; None until a boot without SNTP sync
+    // would make "now" a lie, which `clock::utc_seconds()`'s own contract
+    // already refuses to do.
+    let now = crate::clock::utc_seconds();
+    let decode = |spec: (i64, i64)| -> Option<Option<u64>> {
+        match spec.1 {
+            UTIME_OMIT => Some(None),
+            UTIME_NOW => Some(Some(now.unwrap_or(0))),
+            n if n < 0 => None,
+            secs => Some(Some(secs.max(0) as u64)),
+        }
+    };
+    let (atime, mtime) = if times == 0 {
+        let n = Some(Some(now.unwrap_or(0)));
+        (n.clone(), n)
+    } else {
+        // SAFETY: user array of two `struct timespec` { i64, i64 }: atime at
+        // +0, mtime at +16.
+        let read_ts = |off: u64| -> (i64, i64) {
+            // SAFETY: user `struct timespec` fields, per this syscall's ABI.
+            unsafe {
+                (
+                    ((times + off) as *const i64).read_volatile(),
+                    ((times + off + 8) as *const i64).read_volatile(),
+                )
+            }
+        };
+        let Some(atime) = decode(read_ts(0)) else {
+            return errno::EINVAL;
+        };
+        let Some(mtime) = decode(read_ts(16)) else {
+            return errno::EINVAL;
+        };
+        (atime, mtime)
+    };
+
+    match fs::set_times(&path, atime, mtime) {
+        Ok(()) => 0,
+        Err(akuma_vfs::FsError::NotFound) => errno::ENOENT,
+        Err(akuma_vfs::FsError::NotSupported) => errno::ENOSYS,
+        Err(_) => errno::EIO,
+    }
+}
+
+/// `dup(fd)` — x86_64 32. A new descriptor for an already-open one.
+///
+/// The first consumer is `apk`'s signature-verification I/O setup — it dups a
+/// just-reopened index fd, then closes the original, exactly as the aarch64
+/// bring-up found (`APK_MISSING_SYSCALLS.md` "dup (23)": without the syscall
+/// apk gave up and reported `UNTRUSTED signature` over a fetch that was in
+/// fact fine). Same bug, different syscall number.
+///
+/// **Divergence, pinned:** the copy is a *value* copy. The two descriptors
+/// share nothing — an independent cursor, an independent cached-contents
+/// buffer — and `close` on either releases the underlying socket or pipe
+/// outright, where Linux refcounts. That is wrong for shared-offset semantics
+/// and for closing one of two dups of a socket, and right for the hold-a-
+/// reference-across-a-close shape apk actually uses. Revisit when a caller
+/// needs the real thing.
+pub fn sys_dup(fd: u64) -> u64 {
+    let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
+        return errno::EBADF;
+    };
+    let cloned = {
+        let table = TABLE.lock();
+        match table.get(idx as usize) {
+            Some(Some(entry)) => entry.clone(),
+            _ => return errno::EBADF,
+        }
+    };
+    let mut table = TABLE.lock();
+    for (i, slot) in table.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(cloned);
+            return (i + FIRST_FILE_FD) as u64;
+        }
+    }
+    errno::EMFILE
 }
 
 /// `close(fd)`. Closing a console descriptor succeeds and does nothing — a
@@ -485,7 +818,20 @@ pub fn sys_close(fd: u64) -> u64 {
         Some(Entry { desc: FileDescriptor::File(file), data, is_dir: false, .. })
             if file.flags & open_flags::O_ACCMODE != 0 =>
         {
-            let _ = fs::write_file(&file.path, &data);
+            // A failed persist is REPORTED, not discarded: this is the whole
+            // file's worth of data, there is no second chance, and a silent
+            // loss here once surfaced as apk's rename finding no tmp file —
+            // an `ENOENT` pointing three layers away from the real failure.
+            // (`close(2)` still returns 0 — Linux's errno slots are taken and
+            // the data is already unreachable — so the console line is the
+            // caller's only signal.)
+            if let Err(e) = fs::write_file(&file.path, &data) {
+                serial::puts("[close] persist failed for \"");
+                serial::puts(&file.path);
+                serial::puts("\": ");
+                serial::puts(fs_err_str(e));
+                serial::puts("\n");
+            }
         }
         _ => {}
     }
@@ -575,40 +921,51 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    if len > MAX_IO {
-        return errno::EINVAL;
-    }
-    // Copied in before the lock: `copy_in` allocates, and there is no reason
-    // to hold `TABLE` across that.
-    let incoming = copy_in(buf, len);
+    // Copied in per-`MAX_IO` chunk inside the loop: `copy_in` allocates, and
+    // refusing the whole call when `len` exceeds one chunk (the old
+    // `EINVAL`) was wrong twice over — real Linux accepts any `write(2)`
+    // length (short writes are the contract), and `apk` exercises that
+    // directly: it buffers a whole downloaded APKINDEX (hundreds of KB) and
+    // writes it to its cache file in one call. The EINVAL it got back was
+    // reported as `updating and opening ...: Invalid argument` and killed
+    // every fetch, 2026-09-04.
 
     let idx = fd - FIRST_FILE_FD as u64;
-    let mut table = TABLE.lock();
-    let Some(Some(entry)) = table.get_mut(idx as usize) else {
-        return errno::EBADF;
-    };
-    if entry.is_dir {
-        return errno::EISDIR;
+    let mut written: usize = 0;
+    while written < len as usize {
+        let chunk_len = ((len as usize) - written).min(MAX_IO as usize);
+        // Copied in before the lock: there is no reason to hold `TABLE`
+        // across a user copy.
+        let incoming = copy_in(buf + written as u64, chunk_len as u64);
+        let mut table = TABLE.lock();
+        let Some(Some(entry)) = table.get_mut(idx as usize) else {
+            return errno::EBADF;
+        };
+        if entry.is_dir {
+            return errno::EISDIR;
+        }
+        // The position read and the write-permission check both come from
+        // `entry.desc`, borrowed immutably first so the mutable borrow of
+        // `entry.data` just below is not fighting a live borrow of a sibling
+        // field through the same `&mut Entry` — `entry.file()` would hold that
+        // borrow for the rest of the function if used here instead.
+        let pos = match &entry.desc {
+            FileDescriptor::File(f) if f.flags & open_flags::O_ACCMODE != 0 => f.position,
+            FileDescriptor::File(_) => return errno::EBADF, // opened read-only
+            _ => return errno::EBADF,
+        };
+        let end = pos + incoming.len();
+        if entry.data.len() < end {
+            entry.data.resize(end, 0);
+        }
+        entry.data[pos..end].copy_from_slice(&incoming);
+        if let FileDescriptor::File(f) = &mut entry.desc {
+            f.position = end;
+        }
+        drop(table);
+        written += incoming.len();
     }
-    // The position read and the write-permission check both come from
-    // `entry.desc`, borrowed immutably first so the mutable borrow of
-    // `entry.data` just below is not fighting a live borrow of a sibling
-    // field through the same `&mut Entry` — `entry.file()` would hold that
-    // borrow for the rest of the function if used here instead.
-    let pos = match &entry.desc {
-        FileDescriptor::File(f) if f.flags & open_flags::O_ACCMODE != 0 => f.position,
-        FileDescriptor::File(_) => return errno::EBADF, // opened read-only
-        _ => return errno::EBADF,
-    };
-    let end = pos + incoming.len();
-    if entry.data.len() < end {
-        entry.data.resize(end, 0);
-    }
-    entry.data[pos..end].copy_from_slice(&incoming);
-    if let FileDescriptor::File(f) = &mut entry.desc {
-        f.position = end;
-    }
-    incoming.len() as u64
+    len
 }
 
 /// Akuma's own `poll_input_event(buf, len, timeout_us)` — a **raw** keystroke.
@@ -1071,9 +1428,126 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> u64 {
     }
 }
 
+/// `select(nfds, readfds, writefds, exceptfds, timeout)` — x86_64 23.
+///
+/// The bit arithmetic, the return-value rule (a fd ready in both directions
+/// counts **twice**) and the fd-set shape are `akuma-syscalls-poll`'s — the
+/// same host-tested module the AArch64 kernel's `pselect6` marshals through.
+/// Hand-rolling them here was the tree's known failure mode and bought nothing:
+/// this module first shipped `poll` without `select`, and `apk` — which waits
+/// for post-connect socket writability through exactly this syscall (the
+/// AArch64 side's own `APK_MISSING_SYSCALLS.md` records the pselect6 twin of
+/// this bug) — spun `select -> ENOSYS` and wedged its TLS fetch mid-handshake.
+///
+/// The probes are this target's [`poll_ready`], the same readiness source
+/// `sys_poll` uses. `exceptfds` is received, and **overwritten to all-zero on
+/// the way out** — this kernel never reports exception conditions, and a set
+/// the kernel received but did not write comes back exactly as the caller
+/// passed it (the libcurl `CURL_CSELECT_ERR` bug in
+/// `docs/runbooks/cargo-cannot-reach-crates-io.md`).
+///
+/// Timeout is `struct timeval { i64 tv_sec, i64 tv_usec }` (16 bytes); NULL
+/// blocks until something is ready. Linux's "returns the remaining time in
+/// the struct" behaviour is a divergence this target pins: the struct is left
+/// untouched, which nothing in this tree relies on.
+pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64) -> u64 {
+    use akuma_syscalls_poll::fdset::{bytes, interests, nfds_ok, Interest, MAX_WORDS};
+
+    const EPOLLIN: u32 = 0x001;
+    const EPOLLOUT: u32 = 0x004;
+
+    let nfds = nfds as usize;
+    if !nfds_ok(nfds) {
+        return errno::EINVAL;
+    }
+    let nb = bytes(nfds);
+
+    // Zeroed MAX_WORDS buffers, filled only up to `nb`: `is_set` reads past
+    // `nb` as clear, so the tail needs no copy.
+    let mut in_read = [0u64; MAX_WORDS];
+    let mut in_write = [0u64; MAX_WORDS];
+    // `exceptfds` is part of the ABI even though no probe here can raise it:
+    // received (so a bad pointer faults loudly at the boundary, not later),
+    // then replaced with zeroes on the way back.
+    let mut in_except = [0u64; MAX_WORDS];
+    for (dst, src) in [
+        (&mut in_read, readfds),
+        (&mut in_write, writefds),
+        (&mut in_except, exceptfds),
+    ] {
+        if src != 0 {
+            let v = copy_in(src, nb as u64);
+            for (dst_w, chunk) in dst[..nb / 8].iter_mut().zip(v.as_chunks::<8>().0) {
+                *dst_w = u64::from_le_bytes(*chunk);
+            }
+        }
+    }
+    let mut out_read = [0u64; MAX_WORDS];
+    let mut out_write = [0u64; MAX_WORDS];
+
+    // The timeout, decoded once. `None` = block forever.
+    let deadline_budget: Option<u64> = if timeout == 0 {
+        Some(1)
+    } else {
+        // SAFETY: user `struct timeval`, per this syscall's ABI.
+        let (sec, usec) = unsafe {
+            ((timeout as *const i64).read_volatile(), ((timeout + 8) as *const i64).read_volatile())
+        };
+        if sec < 0 || !(0..1_000_000).contains(&usec) {
+            return errno::EINVAL;
+        }
+        let ms = (sec as u64).saturating_mul(1000).saturating_add(usec as u64 / 1000);
+        Some(ms.saturating_mul(200).clamp(1, 2_000_000))
+    };
+
+    let mut budget = deadline_budget.unwrap_or(u64::MAX);
+    loop {
+        let mut ready = 0u64;
+        for i in interests(&in_read, &in_write, nfds) {
+            let Interest { fd, in_read: r, in_write: w } = i;
+            let (pr, pw) = poll_ready(fd as u64);
+            let mut revents = 0u32;
+            if r && pr {
+                revents |= EPOLLIN;
+            }
+            if w && pw {
+                revents |= EPOLLOUT;
+            }
+            ready += i.record(revents, &mut out_read, &mut out_write);
+        }
+        if ready != 0 {
+            for (src, ptr) in [
+                (&out_read, readfds),
+                (&out_write, writefds),
+                // `in_except` is zeroed, so `is_set` over it is always false —
+                // written back all-zero, which is the overwrite rule.
+                (&in_except, exceptfds),
+            ] {
+                if ptr != 0 {
+                    let flat: Vec<u8> = src.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    copy_to_user(ptr, &flat[..nb]);
+                }
+            }
+            return ready;
+        }
+        if budget == 1 {
+            break;
+        }
+        budget -= 1;
+        crate::sched::yield_now();
+    }
+    // Timed out: the sets come back zeroed, matching the ready path's shape.
+    for ptr in [readfds, writefds, exceptfds] {
+        if ptr != 0 {
+            let zero = [0u8; 128];
+            copy_to_user(ptr, &zero[..nb]);
+        }
+    }
+    0
+}
+
 /// `(readable, writable)` for one fd, for [`sys_poll`]. Non-destructive.
-fn poll_ready(fd: u64) -> (bool, bool) {
-    if fd == 0 {
+fn poll_ready(fd: u64) -> (bool, bool) {    if fd == 0 {
         return match crate::usermode::current_stdin_pipe() {
             Some(p) => (crate::pipe::readable(p), false),
             None => (serial::has_byte(), false),
@@ -1097,13 +1571,14 @@ fn poll_ready(fd: u64) -> (bool, bool) {
         // `poll`s the same socket for the reply, and a socket that always
         // "isn't ready" makes every reply look like a timeout no matter how
         // fast smoltcp actually receives it (`sys_sendto`'s doc has the rest
-        // of that bug). TCP is left at `sys_poll`'s original "not ready":
-        // nothing on this target polls a stream socket yet, so there is
-        // nothing to have gotten wrong there.
+        // of that bug). TCP: real readiness both ways via `socket_tcp_ready`
+        // — since `select(2)` arrived, `apk` polls a stream socket for
+        // post-connect writability, and the old hard-coded `(false, false)`
+        // turned every such wait into a permanent one (`sys_select`'s doc).
         if akuma_net::socket::is_udp_socket(idx) {
             return (akuma_net::socket::socket_udp_recv_ready(idx), false);
         }
-        return (false, false);
+        return akuma_net::socket::socket_tcp_ready(idx);
     }
     // A regular file: always ready, per POSIX.
     let in_table = {

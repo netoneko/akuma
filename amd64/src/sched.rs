@@ -329,14 +329,39 @@ pub fn init() {
 /// address space must share the kernel's mappings — see
 /// `paging::AddressSpace` — or the switch faults on the instruction after
 /// `mov cr3`.
+///
+/// The slot is published [`State::Runnable`] only after `space_root` is in
+/// place: this used to be `spawn()` followed by a separate write, and a LAPIC
+/// tick landing between the two scheduled the task with `space_root` still 0 —
+/// kernel CR3 — so `run_init`'s sysret into ring 3 fetched sshd's entry point
+/// unmapped (`#PF`, `cr2 == rip == 0x2045d0`, `err=0x14`). Measured 2026-09-04,
+/// intermittent by timer phase: one boot served ssh, the next died on the first
+/// user instruction.
 pub fn spawn_in_space(entry: extern "C" fn() -> !, space_root: u64) -> Option<usize> {
-    let slot = spawn(entry)?;
-    // SAFETY: raw-pointer access to the table; single core, and `slot` was just
-    // returned by `spawn`.
+    spawn_ready(entry, space_root, false)
+}
+
+/// Like [`spawn_in_space`], but the slot is left unpublished ([`State::Unused`])
+/// so the caller can finish initialising it — [`seed_forked_task`]'s register
+/// and TLS snapshot — before anything can schedule it. Finish with
+/// [`publish_task`].
+///
+/// While unpublished the slot is invisible to the picker but still looks free to
+/// [`spawn`]'s scan, so the caller must not let a nested [`spawn`] run between
+/// the two calls. The only caller is `sys_fork`'s body, which seeds and
+/// publishes with nothing in between.
+pub fn spawn_in_space_unpublished(entry: extern "C" fn() -> !, space_root: u64) -> Option<usize> {
+    spawn_unpublished(entry, space_root, false)
+}
+
+/// Make an [`spawn_in_space_unpublished`] slot schedulable.
+pub fn publish_task(task_slot: usize) {
+    // SAFETY: raw-pointer access to the table; single core.
     unsafe {
-        (*tasks())[slot].space_root = space_root;
+        if let Some(task) = (*tasks()).get_mut(task_slot) {
+            task.state = State::Runnable;
+        }
     }
-    Some(slot)
 }
 
 /// Repoint the **running** task's address space, and install it in `CR3` now.
@@ -386,19 +411,37 @@ pub fn seed_forked_task(task_slot: usize, fs_base: u64, saved_regs: &[u64; 12]) 
 
 /// Create a daemon task: one that runs for the life of the kernel and is not
 /// counted by [`all_user_tasks_finished`]. The netpoll loop is the only caller.
+///
+/// The `daemon` flag is written before publication, not after: the flag's whole
+/// job is to keep this task out of [`all_user_tasks_finished`]'s tally, and a
+/// tick landing between `spawn()` and the flag write would publish a not-yet-
+/// daemon task — the boot drive loop would then wait for a `Finished` that a
+/// never-exiting daemon never reaches.
 pub fn spawn_daemon(entry: extern "C" fn() -> !) -> Option<usize> {
-    let slot = spawn(entry)?;
-    // SAFETY: raw-pointer access to the table; single core, and `slot` was just
-    // returned by `spawn`.
-    unsafe {
-        (*tasks())[slot].daemon = true;
-    }
+    spawn_ready(entry, 0, true)
+}
+
+/// [`spawn`] with the space root and daemon flag set before the slot becomes
+/// schedulable. Every field the scheduler or the picker reads is in place
+/// before `state = Runnable` publishes the slot — that ordering is the whole
+/// point; see [`spawn_in_space`].
+fn spawn_ready(entry: extern "C" fn() -> !, space_root: u64, daemon: bool) -> Option<usize> {
+    let slot = spawn_unpublished(entry, space_root, daemon)?;
+    publish_task(slot);
     Some(slot)
 }
 
-/// Create a task. Returns its slot, or `None` if the table is full.
+/// Create a task in the kernel's own address space (`space_root` 0).
 pub fn spawn(entry: extern "C" fn() -> !) -> Option<usize> {
-    // Leaked deliberately: a task's stack must outlive the frame that made it,
+    spawn_ready(entry, 0, false)
+}
+
+/// Allocate and initialise a task slot without making it schedulable.
+fn spawn_unpublished(
+    entry: extern "C" fn() -> !,
+    space_root: u64,
+    daemon: bool,
+) -> Option<usize> {    // Leaked deliberately: a task's stack must outlive the frame that made it,
     // and nothing here ever reaps a task.
     let stack = vec![0u8; STACK_SIZE].leak();
     let stack_top = stack.as_ptr() as usize + STACK_SIZE;
@@ -416,6 +459,11 @@ pub fn spawn(entry: extern "C" fn() -> !) -> Option<usize> {
             if (*t)[slot].state == State::Unused {
                 (*t)[slot].ctx = Context::for_task(stack_top, entry);
                 (*t)[slot].trap_stack_top = trap_top as u64;
+                (*t)[slot].space_root = space_root;
+                (*t)[slot].daemon = daemon;
+                // The publication: the picker and `all_user_tasks_finished`
+                // read `state`, and everything they read *beside* it must
+                // already be in place when they can first observe Runnable.
                 (*t)[slot].state = State::Runnable;
                 return Some(slot);
             }

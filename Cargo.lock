@@ -80,6 +80,7 @@ dependencies = [
  "akuma-syscalls-abi",
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
+ "akuma-syscalls-poll",
  "akuma-terminal",
  "akuma-vfs",
  "akuma-virtio",

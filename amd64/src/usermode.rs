@@ -462,8 +462,48 @@ pub fn set_fs_base(base: u64) {
 #[unsafe(no_mangle)]
 extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     CALLS.fetch_add(1, Ordering::Relaxed);
+    let trace = SYSCALL_TRACE.load(Ordering::Relaxed);
+    // Entry line: a syscall that blocks forever has no result line, so the
+    // entry line is what names it (a bring-up aid — without it a hang inside
+    // `read` is invisible and reads as "no syscalls at all"). Path-taking
+    // syscalls also get their path, bounded by the same decode the syscall
+    // itself uses.
+    if trace {
+        serial::puts("[sc>] nr=");
+        serial::put_dec(nr);
+        serial::puts(" a1=0x");
+        serial::put_hex(a1);
+        match nr {
+            // x86_64 `open(path, flags, mode)` — the path is the FIRST arg.
+            2 => {
+                serial::puts(" \"");
+                crate::fd::trace_user_cstr(a1);
+                serial::puts("\"");
+            }
+            257 | 258 | 263 | 269 => {
+                serial::puts(" at=");
+                serial::put_dec(a1);
+                serial::puts(" \"");
+                crate::fd::trace_user_cstr(a2);
+                serial::puts("\"");
+            }
+            264 => {
+                serial::puts(" at=");
+                serial::put_dec(a1);
+                serial::puts(" \"");
+                crate::fd::trace_user_cstr(a2);
+                serial::puts("\" -> at=");
+                serial::put_dec(a3);
+                serial::puts(" \"");
+                crate::fd::trace_user_cstr(a4);
+                serial::puts("\"");
+            }
+            _ => {}
+        }
+        serial::puts("\n");
+    }
     let r = syscall_dispatch(nr, a1, a2, a3, a4, a5);
-    if SYSCALL_TRACE.load(Ordering::Relaxed) {
+    if trace {
         serial::puts("[sc] nr=");
         serial::put_dec(nr);
         serial::puts(" -> 0x");
@@ -537,6 +577,22 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         // polls its stdin on every keystroke; `ENOSYS` here was a forever-loop
         // of "sh: poll: Function not implemented".
         7 => return crate::fd::sys_poll(a1, a2, a3),
+        // `select(nfds, readfds, writefds, exceptfds, timeout)` — x86_64 23.
+        // `apk` waits for post-connect socket writability through this syscall;
+        // `ENOSYS` here wedged its TLS fetch mid-handshake (see `fd::sys_select`).
+        23 => return crate::fd::sys_select(a1, a2, a3, a4, a5),
+        // `dup(fd)` — x86_64 32. `apk` dups a reopened index fd during
+        // signature-verification I/O setup; `ENOSYS` here made it report
+        // `UNTRUSTED signature` over a fetch that was fine (see
+        // `fd::sys_dup`; the aarch64 twin is `APK_MISSING_SYSCALLS.md`).
+        32 => return crate::fd::sys_dup(a1),
+        // `mkdirat` (258) / `unlinkat` (263) / `renameat` (264) — `apk`'s
+        // cache write is a named `.tmp.<pid>` file plus a rename; without
+        // these the cache write fails and the index fetch is unusable (the
+        // aarch64 table in `APK_MISSING_SYSCALLS.md` lists all three).
+        258 => return crate::fd::sys_mkdirat(a1, a2, a3),
+        263 => return crate::fd::sys_unlinkat(a1, a2, a3),
+        264 => return crate::fd::sys_renameat(a1, a2, a3, a4),
         // `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271. Same
         // core; a NULL timespec means wait forever, otherwise fold sec+nsec to
         // milliseconds (this target has no finer clock to honour anyway).
@@ -606,8 +662,18 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         // Best-effort robustness/rlimit hooks musl pokes on startup.
         273 => return 0,          // set_robust_list
         302 => return 0,          // prlimit64
-        // Nothing here is a symlink.
-        89 | 267 => return errno::EINVAL, // readlink / readlinkat
+        // `readlink` (89) / `readlinkat` (267). Was a flat EINVAL while no
+        // symlink could exist; `symlinkat` (below) made package symlinks real.
+        89 => return crate::fd::sys_readlinkat((-100i64) as u64, a1, a2, a3),
+        267 => return crate::fd::sys_readlinkat(a1, a2, a3, a4),
+        // `symlinkat(target, newdirfd, link_path)` — x86_64 266. Package
+        // contents are full of `.so.1` versioned-library symlinks; ENOSYS
+        // here turned each into a counted `apk add` error.
+        266 => return crate::fd::sys_symlinkat(a1, a2, a3),
+        // `utimensat` (280) / `futimens` (88) — timestamp preservation for
+        // `apk add`'s post-extract pass. NULL times = both set to now.
+        280 => return crate::fd::sys_utimensat(a1, a2, a3, a4),
+        88 => return crate::fd::sys_utimensat((-100i64) as u64, a1, a2, 0),
         // Process-group / session ids. One process, so it is its own group and
         // session leader; `setpgid`/`setsid` accept and report id 1.
         110 => return 1,                  // getppid
@@ -1739,11 +1805,15 @@ fn sys_fork() -> u64 {
         take_proc_slot(slot);
         return errno::ENOMEM;
     };
-    let Some(task_slot) = crate::sched::spawn_in_space(entry_fn, child_root) else {
+    let Some(task_slot) = crate::sched::spawn_in_space_unpublished(entry_fn, child_root) else {
         take_proc_slot(slot);
         return errno::ENOMEM;
     };
     crate::sched::seed_forked_task(task_slot, parent_fs_base, &parent_regs);
+    // Published last: the child's register/TLS snapshot must be in place before
+    // anything can schedule it — same ordering rule as `spawn_in_space`'s space
+    // root (a tick between spawn and seed used to run the child on garbage).
+    crate::sched::publish_task(task_slot);
 
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32;
     // SAFETY: raw-pointer write; single core.

@@ -36,7 +36,7 @@
 
 use akuma_ext2::{BlockDevice, Ext2Filesystem};
 use akuma_selftest::Suite;
-use akuma_vfs::{DirEntry, Filesystem, Metadata};
+use akuma_vfs::{DirEntry, Filesystem, FsError, Metadata};
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
@@ -121,9 +121,53 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
 /// `false` covers "no filesystem mounted" and every `akuma-ext2` failure
 /// (most commonly: the parent directory does not exist — `write_file` does
 /// not create one, matching `open(2)`'s own contract).
-#[must_use]
-pub fn write_file(path: &str, data: &[u8]) -> bool {
-    with_root(|fs| fs.write_file(path, data).is_ok()).unwrap_or(false)
+pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
+    with_root(|fs| fs.write_file(path, data)).unwrap_or(Err(FsError::NoFilesystem))
+}
+
+/// Create a directory. `mkdirat(2)`'s body — the parent must already exist,
+/// matching `akuma-ext2`'s (and `mkdir(2)`'s) own contract. First consumer:
+/// `apk`'s cache-directory setup.
+pub fn create_dir(path: &str) -> Result<(), FsError> {
+    with_root(|fs| fs.create_dir(path)).unwrap_or(Err(FsError::NoFilesystem))
+}
+
+/// Remove a file (or, with `rmdir`, an empty directory). `unlinkat(2)`'s body.
+pub fn remove(path: &str, rmdir: bool) -> Result<(), FsError> {
+    with_root(|fs| {
+        if rmdir {
+            fs.remove_dir(path)
+        } else {
+            fs.remove_file(path)
+        }
+    })
+    .unwrap_or(Err(FsError::NoFilesystem))
+}
+
+/// Rename (move) a path. `renameat(2)`'s body — the target is replaced if it
+/// exists, which is the atomic-tmpfile-swap shape `apk` names this syscall
+/// for. First consumer: `apk`'s `.tmp.<pid>` + rename cache write.
+pub fn rename(old_path: &str, new_path: &str) -> Result<(), FsError> {
+    with_root(|fs| fs.rename(old_path, new_path)).unwrap_or(Err(FsError::NoFilesystem))
+}
+
+/// Create a symlink. `symlinkat(2)`'s body. First consumer: `apk add` —
+/// package contents carry symlinks (`.so.1` versioned-library names), and
+/// every one of them failed with ENOSYS until this existed.
+pub fn create_symlink(link_path: &str, target: &str) -> Result<(), FsError> {
+    with_root(|fs| fs.create_symlink(link_path, target)).unwrap_or(Err(FsError::NoFilesystem))
+}
+
+/// Read a symlink's target. `readlink(2)`'s body.
+pub fn read_symlink(path: &str) -> Result<String, FsError> {
+    with_root(|fs| fs.read_symlink(path)).unwrap_or(Err(FsError::NoFilesystem))
+}
+
+/// Set file timestamps. `utimensat(2)`'s body; `None` leaves a stamp alone
+/// (`UTIME_OMIT`), matching the VFS trait's contract. First consumer: `apk`'s
+/// "preserve owner mtime" pass over extracted files.
+pub fn set_times(path: &str, atime_secs: Option<u64>, mtime_secs: Option<u64>) -> Result<(), FsError> {
+    with_root(|fs| fs.set_times(path, atime_secs, mtime_secs)).unwrap_or(Err(FsError::NoFilesystem))
 }
 
 /// Inode metadata for a path — the backing for the path-based `stat` syscalls.

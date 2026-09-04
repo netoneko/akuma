@@ -104,10 +104,12 @@ fi
 mkdir -p "$(dirname "$IMG")"
 rm -f "$IMG"
 
-# 1 KiB blocks, not the 4 KiB the aarch64 image uses. Deliberate: it makes the
-# indirect-block paths reachable in a small image, and the ext2 driver's block
-# size handling is a thing worth exercising rather than pinning to one value.
-"$MKFS" -q -F -b 1024 -L AKUMA-AMD64 "$IMG" "${SIZE_MIB}m"
+# 4 KiB blocks — the same setup as the devbox image (`scripts/create_disk.sh`),
+# not the 1 KiB this script used until 2026-09-04. The small-block choice was a
+# deliberate indirect-block exercise, and `akuma-ext2`'s host tests cover those
+# paths regardless; on real hardware/VMs the added divergence from the image
+# the aarch64 kernel actually runs cost more than the coverage taught.
+"$MKFS" -q -F -b 4096 -L AKUMA-AMD64 "$IMG" "${SIZE_MIB}m"
 
 # A known text file, so a read can be checked against content rather than
 # against "no error". The bytes are position-dependent for the same reason the
@@ -264,6 +266,16 @@ if [ -f "$APK_STATIC_APK" ]; then
             [ -f "$key" ] && "$DEBUGFS" -w -R "write $key etc/apk/keys/$(basename "$key")" "$IMG" >/dev/null 2>&1
         done
     fi
+
+    # The two keys `overlays/devbox/rootfs/etc/apk/keys/` carries — same
+    # files, byte for byte. `alpine-keys-2.6` (above) predates them, and
+    # `616ae350` is the 4096-bit RSA key that signs *current* `latest-stable`
+    # APKINDEX; without it apk 3.0.8 reports every fetched index as
+    # `UNTRUSTED signature` even though the fetch itself was fine
+    # (`docs/archive/APK_MISSING_SYSCALLS.md` "The key files", 2026-09-04).
+    for key in overlays/devbox/rootfs/etc/apk/keys/*.pub; do
+        [ -f "$key" ] && "$DEBUGFS" -w -R "write $key etc/apk/keys/$(basename "$key")" "$IMG" >/dev/null 2>&1
+    done
     rm -rf "$APK_STAGE"
 
     printf 'https://dl-cdn.alpinelinux.org/alpine/latest-stable/main\nhttps://dl-cdn.alpinelinux.org/alpine/latest-stable/community\n' \

@@ -178,6 +178,28 @@ fn write_and_read_back() {
     assert_eq!(data, b"test data");
 }
 
+/// A whole-index-sized write, read back byte for byte — the size class of an
+/// Alpine APKINDEX (~130 KB), which is what apk writes into its cache before
+/// re-opening it for signature verification. 1 KiB-block fixtures reach the
+/// indirect-block chains at 12 KB, double-indirect at ~4 MB is not reached
+/// here but every single- and first-level-indirect block below 128 KB is.
+/// A silent mid-file corruption here surfaces downstream as apk reporting
+/// `UNTRUSTED signature` over a fetch that was delivered intact (amd64,
+/// 2026-09-04).
+#[test]
+fn write_read_round_trip_index_sized() {
+    let fs = mount_empty();
+    // Deterministic pseudo-random fill: every byte position differs, so a
+    // wrong block mapping cannot pass by repeating a pattern.
+    let data: alloc::vec::Vec<u8> = (0..131_072u32)
+        .map(|i| ((i ^ 0xA5A5_A5A5).wrapping_mul(26_544_357) >> 11) as u8)
+        .collect();
+    fs.write_file("/big.bin", &data).unwrap();
+    let back = fs.read_file("/big.bin").unwrap();
+    assert_eq!(back.len(), data.len(), "length must survive the round trip");
+    assert_eq!(back, data, "every byte must survive the round trip");
+}
+
 #[test]
 fn write_at_offset() {
     let fs = mount_empty();
@@ -2299,4 +2321,52 @@ fn mount_rejects_block_size_log_over_the_spec_range() {
 #[test]
 fn mount_rejects_first_data_block_past_total_blocks() {
     assert_mount_rejected(fixture_with_sb_field(20, &u32::MAX.to_le_bytes()));
+}
+
+/// `apk`'s cache write, end to end at the fs layer: create-or-replace a file
+/// **nested three levels deep**, then rename it within the same directory —
+/// the atomic `.tmp.<pid>` + rename shape. Found 2026-09-04: the write
+/// half succeeded to root-level paths but `rename` returned NotFound for a
+/// nested old path, and `sys_close`'s discarded `write_file` result hid the
+/// other half.
+#[test]
+fn apk_cache_write_and_rename_nested() {
+    let fs = mount_empty();
+    // `mkdisk.sh` pre-creates these on the amd64 image; the ext2 write path
+    // does not create parents, matching `open(2)`.
+    fs.create_dir("/var").unwrap();
+    fs.create_dir("/var/cache").unwrap();
+    fs.create_dir("/var/cache/apk").unwrap();
+    let body: alloc::vec::Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    fs.write_file("/var/cache/apk/APKINDEX.cf3ffe0d.tar.gz.tmp.1", &body)
+        .unwrap();
+    fs.rename(
+        "/var/cache/apk/APKINDEX.cf3ffe0d.tar.gz.tmp.1",
+        "/var/cache/apk/APKINDEX.cf3ffe0d.tar.gz",
+    )
+    .unwrap();
+    assert!(fs.read_file("/var/cache/apk/APKINDEX.cf3ffe0d.tar.gz.tmp.1").is_err());
+    let back = fs.read_file("/var/cache/apk/APKINDEX.cf3ffe0d.tar.gz").unwrap();
+    assert_eq!(back, body);
+}
+
+/// The REAL amd64 guest image (mkfs.ext2 -b 1024 + debugfs), tmp-file write
+/// then rename, exactly as apk's cache update does. Requires the image at
+/// /tmp/amd64-root-for-test.img (copied there by the debugging session);
+/// skipped silently when it is absent so CI does not depend on it.
+#[test]
+fn guest_image_cache_write_and_rename() {
+    extern crate std;
+    let path = "/tmp/amd64-root-for-test.img";
+    let Ok(bytes) = std::fs::read(path) else { return };
+    let dev = MemBlockDevice::from_bytes(&bytes);
+    let fs = Ext2Filesystem::new(dev, || 0).unwrap();
+    let body: alloc::vec::Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    fs.write_file("/var/cache/apk/APKINDEX.cf3ffe0d.tar.gz.tmp.1", &body).unwrap();
+    fs.rename(
+        "/var/cache/apk/APKINDEX.cf3ffe0d.tar.gz.tmp.1",
+        "/var/cache/apk/APKINDEX.cf3ffe0d.tar.gz",
+    ).unwrap();
+    let back = fs.read_file("/var/cache/apk/APKINDEX.cf3ffe0d.tar.gz").unwrap();
+    assert_eq!(back, body);
 }

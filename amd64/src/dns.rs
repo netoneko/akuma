@@ -36,6 +36,12 @@ const DNS_SERVER: SocketAddrV4 = SocketAddrV4::new([10, 0, 2, 3], 53);
 /// rather than trust, like every other length this kernel takes off the wire.
 const MAX_PACKET: usize = 256;
 
+/// How often an unanswered query is re-sent within the caller's timeout.
+/// One send-and-pray lost the boot's only DNS resolution roughly every other
+/// boot (first packet after DHCP, gateway ARP entry not yet resolved) — see
+/// [`resolve_a`].
+const RETRANSMIT_US: u64 = 1_500_000;
+
 /// Encode `hostname` into DNS label form (`length, bytes, length, bytes, …,
 /// 0`) at `buf[pos..]`. Returns the new `pos`, or `None` if it does not fit
 /// or a label is too long (63 bytes — DNS's own limit).
@@ -105,8 +111,7 @@ fn skip_name(resp: &[u8], mut pos: usize) -> Option<usize> {
 
 /// Parse a response, validating it answers `id`, and return the first A
 /// record's address.
-fn parse_response(resp: &[u8], id: u16) -> Option<[u8; 4]> {
-    if resp.len() < 12 {
+fn parse_response(resp: &[u8], id: u16) -> Option<[u8; 4]> {    if resp.len() < 12 {
         return None;
     }
     if u16::from_be_bytes(resp[0..2].try_into().ok()?) != id {
@@ -147,6 +152,14 @@ fn parse_response(resp: &[u8], id: u16) -> Option<[u8; 4]> {
 /// Resolve `hostname` to an IPv4 address, blocking (via `poll`+non-blocking
 /// receive, like every other wait loop on this target) for up to
 /// `timeout_us` of [`crate::net::uptime_us`].
+///
+/// The query is **retransmitted** every [`RETRANSMIT_US`] until the timeout:
+/// this used to be a single send, and a single lost datagram was a failed
+/// resolution — which for [`crate::clock::sync_via_sntp`] meant "no wall
+/// clock this boot", which meant every TLS certificate in sight failed date
+/// validation. The likeliest loss is the very first packet after boot, while
+/// the gateway's ARP entry is still being resolved; a 1.5 s retransmit rides
+/// through that and through ordinary datagram loss alike.
 pub fn resolve_a(hostname: &str, timeout_us: u64) -> Option<[u8; 4]> {
     let mut query_buf = [0u8; MAX_PACKET];
     // The uptime reading doubles as the query ID's low bits — good enough
@@ -156,18 +169,24 @@ pub fn resolve_a(hostname: &str, timeout_us: u64) -> Option<[u8; 4]> {
     let len = build_query(id, hostname, &mut query_buf)?;
 
     let idx = akuma_net::socket::alloc_socket(SOCK_DGRAM)?;
-    let sent = akuma_net::socket::socket_send_udp(idx, &query_buf[..len], DNS_SERVER).is_ok();
+    let send_query = || akuma_net::socket::socket_send_udp(idx, &query_buf[..len], DNS_SERVER).is_ok();
 
-    let result = if sent {
+    let result = if send_query() {
         let start = crate::net::uptime_us();
+        let mut last_send = start;
         let mut resp_buf = [0u8; MAX_PACKET];
         loop {
             akuma_net::smoltcp_net::poll();
             if let Ok((n, _from)) = akuma_net::socket::socket_recv_udp(idx, &mut resp_buf, true) {
                 break parse_response(&resp_buf[..n], id);
             }
-            if crate::net::uptime_us().saturating_sub(start) > timeout_us {
+            let now = crate::net::uptime_us();
+            if now.saturating_sub(start) > timeout_us {
                 break None;
+            }
+            if now.saturating_sub(last_send) > RETRANSMIT_US {
+                let _ = send_query();
+                last_send = now;
             }
             crate::sched::yield_now();
         }
