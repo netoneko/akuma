@@ -2317,6 +2317,164 @@ shell prints `can't fork`. A CoW fork (the region list plus a write-fault
 handler) removes both the copy and the ceiling pressure, and would also have
 made `mm::release_anon_frames` unnecessary.
 
+## 3.27 Stage U: real writes, and tcc (2026-09-04)
+
+Two pieces, in the order they had to land: `open(2)` with `O_CREAT`/write
+support (§3.27.1), because tcc's `-o file` link stage cannot produce anything
+without somewhere to put it; then tcc itself, ported to
+`x86_64-unknown-none` (§3.27.2).
+
+### 3.27.1 Writes
+
+`fd::sys_openat` unconditionally called `fs::read_file`, which fails a
+nonexistent path as `ENOENT` — so `O_CREAT` did nothing; there was no way to
+create a file at all. Now: if `O_CREAT` is set, `sys_openat` skips the read
+and starts the descriptor's buffer empty (this target always effectively
+truncates on create — there is no in-place-update-and-keep-old-bytes path,
+and the one real caller, tcc, always asks for `O_WRONLY|O_CREAT|O_TRUNC`
+together). A new `Entry::is_dir`-shaped flag records whether the fd is
+writable (from the stored `KernelFile::flags`); `fd::sys_write_file` (reached
+from `usermode.rs`'s `sys_write` for any fd `>= FIRST_FILE_FD`, which
+previously fell through to `EBADF`) writes into the descriptor's own
+`Vec<u8>` at its cursor, growing it as needed. Nothing touches the disk until
+`close(2)` — the one point `fs::write_file` (new: a thin wrapper around
+`akuma-ext2`'s existing, **unmodified** `Filesystem::write_file`, which
+create-or-truncates in one call) is called, matching that call's own
+whole-file-replace shape rather than fighting it with partial-write
+bookkeeping this target has no reason to build yet.
+
+`akuma-ext2`'s `write_file` requires the parent directory to exist (it does
+not create one, matching `open(2)`) — `mkdisk.sh` now creates `/tmp`, which
+did not exist before, for exactly this reason.
+
+`mkir`/`unlink`/`rename` (x86_64 83/87/82) are **not** wired — `sys_openat`'s
+`O_CREAT` path is all that landed. That is enough for tcc: `tcc_write_elf_file`
+(`tinycc/tccelf.c`) does call `unlink(filename)` before its `open`, but never
+checks the result, and `O_TRUNC` makes it redundant for a plain file anyway.
+
+Boot-verified with a new `fd::smoke_test` round trip (create, write, close,
+reopen, read back, verify content, plus "a write to a read-only fd is
+`EBADF`") — 166 → 173 self-tests, all passing on QEMU `microvm`.
+
+### 3.27.2 tcc, ported to x86_64
+
+`userspace/tcc` is written against `aarch64-unknown-linux-musl` end to end —
+`libakuma` (its syscall/allocator/panic-handler layer) does not build for a
+bare-metal `x86_64-unknown-none` target at all, and `build.rs` hardcoded
+`TCC_TARGET_ARM64` and an AArch64 `setjmp.S` unconditionally. The vendored
+tinycc itself needed none of that: `x86_64-gen.c`/`x86_64-link.c` are
+upstream's own x86_64 backend, tinycc's *best*-supported target — the whole
+job was the port's own glue, not the compiler.
+
+**`build.rs`** now branches on the target triple: `TCC_TARGET_X86_64` instead
+of `_ARM64`; an x86_64 musl-dev apk for headers (`1.2.6-r2` — while fixing
+this, the previously-pinned aarch64 revision `1.2.5-r23` turned out to have
+already rotated off Alpine's `latest-stable` mirror, 404ing a fresh build
+that had no warm cache; both are now `1.2.6-r2`, and the download helper
+now passes `curl -f` so a future rotation fails loudly at the `curl` step
+instead of silently caching an HTML error page as if it were the apk); and no
+second runtime-helper object for x86_64 — upstream's own `lib/Makefile` builds
+x86_64's `libtcc1.a` from `libtcc1.o` alone (`X86_64_O = libtcc1.o
+$(COMMON_O)`), where arm64 additionally needs `lib-arm64.o` for varargs/cache
+helpers x86_64's calling convention has no use for. Output tar renamed
+per-arch (`dist/libtcc1-x86_64.tar`, `dist/libtcc1.tar` unchanged) so an
+x86_64 build run can never clobber the file `userspace/build.sh`'s aarch64
+pipeline reads by that exact literal name.
+
+**`src/setjmp_x86_64.S`** (new; the old `setjmp.S` renamed
+`setjmp_aarch64.S`): System V callee-saved integer registers (`rbx rbp r12-15
+rsp`) plus the return address, into the front of musl's arch-neutral
+`jmp_buf` — same convention as the AArch64 sibling. One real trap: clang's
+integrated assembler defaults `.S` files to AT&T syntax, and this is written
+Intel-style to read like the AArch64 file's `ldp`/`stp` lines — needs
+`.intel_syntax noprefix` at the top or every `mov [rdi+0], rbx` is "unknown
+mnemonic without a size suffix". Deliberately does **not** save xmm6-15 (the
+AArch64 sibling saves d8-d15): tcc's own C sources never keep a float alive
+across a call that can longjmp, and this target's kernel already carries no
+FP/SIMD save of its own on a context switch, so saving vector state here
+would promise a guarantee nothing else on this target keeps.
+
+**`src/amd64_shim.rs`** (new) is `libakuma`'s stand-in — not a rewrite of
+`main.rs`'s ~700 lines of `libakuma::X(...)` call sites, all of which are
+architecture-agnostic plumbing. `main.rs` gets one addition: `#[cfg(target_arch
+= "x86_64")] use amd64_shim as libakuma;`, so every existing call site resolves
+through this module instead with no other change. It supplies:
+
+- The process entry point (`_start` → `rust_start`, System V argv into an
+  `INITIAL_SP` static `args()` reads) — `libakuma`'s own `_start` does this on
+  aarch64, and nothing else provides it here.
+- `#[global_allocator]`/`#[panic_handler]`/`#[alloc_error_handler]` — also
+  normally `libakuma`'s job. The allocator is one eager 16 MiB anonymous
+  `mmap` (this target's `mmap` is fully eager — real frames at `mmap()` time,
+  not on first fault, capped at 64 MiB/call in `amd64/src/mm.rs`), bump-
+  allocated, `dealloc` a deliberate no-op: for a single `tcc -o file src.c`
+  invocation that runs once and exits, "never reclaim" and "reclaim only
+  within this process's lifetime" are the same thing.
+- File I/O (`open`/`close`/`read_fd`/`write_fd`/`lseek`/`fstat`), `mmap`/
+  `munmap`, `println`/`eprintln`, `getcwd` (`"/"`, matching the kernel's own
+  answer), `time` (`0`, matching `fs::no_clock` — this target has no RTC), and
+  stub `unlink`/`rename`/`mkdir` (real syscalls issued; the kernel does not
+  answer them yet, §3.27.1).
+- **`Stat`, at the x86_64 offsets** — not `libakuma::Stat`, whose layout is
+  `asm-generic`/aarch64's. `st_nlink` is 4 bytes at offset 16 there; 8 bytes at
+  offset 16 here. Mirrors `amd64/src/fd.rs`'s `encode_stat` field-for-field,
+  with a `const _: () = assert!(size_of::<Stat>() == 144)`.
+
+**Two link-time gaps only a real link run surfaced**, both C symbols
+`tinycc/tcc.c` calls directly rather than anything routed through
+`main.rs`'s Rust:
+
+- `exit` — needed `#[no_mangle]` (everything else in the shim is only ever
+  called from Rust through the `libakuma` alias, so this is the one function
+  in the file that needs the unmangled C name).
+- `execvp` — `tinycc/tcctools.c`'s cross-tool-invocation mode
+  (`tcc_tool_cross`) references it even for a plain `-o file` compile; dead
+  code for that path, but the *reference* still has to resolve. Stubbed to
+  always fail (matching `execvp(3)`'s "returns only on error" contract) —
+  there is no `fork`/exec surface exposed to tcc's C code to honour a real
+  call, and if this path is ever hit for real, wiring `sys_spawn` under it is
+  the right fix, not a quieter failure.
+
+**`amd64/mkdisk.sh`** builds tcc the same way it already builds
+`paws`/`httpd`/`sshd` — `cargo build --manifest-path tcc/Cargo.toml --target
+x86_64-unknown-none --release` (`--manifest-path`, not `-p tcc`: that crate is
+not a workspace member) — and stages the binary plus `libtcc1-x86_64.tar`'s
+contents (`libtcc1.a` + tcc's ten internal headers) under `/usr/lib/tcc`.
+
+**No musl static libc is staged on amd64 at all** — unlike the AArch64 image,
+which gets one from `apk add musl-dev` via `populate_disk.sh`, this target has
+no package manager and no libc archive anywhere on its disk. So the proof
+program is not the AArch64 acceptance tests' real `hello.c`
+(`#include <stdio.h>` + `printf`) — that needs a successful link against
+`printf`/`__libc_start_main`, which fails *before* tcc ever reaches the point
+of writing an output file, proving nothing about the write path. `mkdisk.sh`
+instead stages a deliberately libc-free `/tmp/probe_tcc.c`: its own `_start`,
+a raw-`syscall` `_exit`, compiled `-static -nostdlib` so tcc has nothing
+external left to resolve.
+
+**Verified end to end over SSH on QEMU `microvm`:**
+
+```
+$ tcc -static -nostdlib -B /usr/lib/tcc -o /tmp/probe_out /tmp/probe_tcc.c
+$ echo $?
+0
+$ ls -l /tmp/probe_out
+-rw-r--r-- 1 0 0 887 ... /tmp/probe_out          # a real ELF64 LE x86-64 exec
+$ /tmp/probe_out
+$ echo $?
+42                                                 # exactly what probe_tcc.c asked for
+```
+
+That last step — the tcc-compiled, tcc-written binary actually **running**
+correctly through this target's own ELF loader — was not attempted as part of
+this stage's scope (§3.27's aim was tcc-compiles-and-writes; whether the
+result runs was left as an open question). It turned out to already work,
+because the loader and `execve` path Stage T built had no reason to care
+where an ELF came from.
+
+A real `printf`-using `hello.c` — i.e. a musl static libc for amd64 — is the
+next real gap this surfaced, not a stage of its own yet.
+
 ## 4. What is deliberately missing
 
 Corrected 2026-09-04. This list was written at Stage B and went stale as the
@@ -2345,6 +2503,11 @@ what follows is the state as of Stage L rather than the original text.
   and `find` both work now.
 - **No writes.** The block driver and `akuma-ext2` can both write; nothing does.
   A self-test that mutated the image would make it stateful across boots.
+  Corrected 2026-09-04: writes shipped that day, §3.27.1 — whole-file,
+  `close(2)`-flushed, no `unlink`/`rename`/`mkdir` on the kernel side yet. The
+  worry about a mutating self-test making the image stateful does not apply
+  to `fd::smoke_test`'s write round trip: `run.sh` already rebuilds the image
+  on every run regardless.
 - **Networking works** since Stage Q (§3.23): the netpoll daemon drives
   `smoltcp_net::poll()`, DHCP completes, `httpd` serves a request and `sshd`
   serves an authenticated session over virtio-net on both QEMU and Firecracker.

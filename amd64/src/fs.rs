@@ -25,10 +25,14 @@
 //! second filesystem to mount, which is the point at which a mount table stops
 //! being ceremony.
 //!
-//! No writes are exercised. `Filesystem::write_file` exists and the block driver
-//! can write, but a self-test that mutates the image would make the image
-//! stateful across boots — the next run would start from whatever the last one
-//! left. The read path is what the ELF loader needs.
+//! Writes are exercised now (2026-09-04, [`write_file`]) — `fd::sys_write` on a
+//! file opened `O_CREAT`/`O_WRONLY` buffers into the descriptor's own `Vec<u8>`
+//! and this is called once, at `close(2)`, to persist it. `fd::smoke_test`
+//! writes and reads one back as part of the boot self-tests: the old worry
+//! about a mutating self-test making the image stateful across boots does not
+//! apply here, because `run.sh` already rebuilds the image on every run (see
+//! this file's own module header, further up) — nothing depends on this image
+//! surviving to the next boot unchanged.
 
 use akuma_ext2::{BlockDevice, Ext2Filesystem};
 use akuma_selftest::Suite;
@@ -105,6 +109,21 @@ pub fn with_root<R>(f: impl FnOnce(&Ext2Filesystem<VirtioBlk>) -> R) -> Option<R
 #[must_use]
 pub fn read_file(path: &str) -> Option<Vec<u8>> {
     with_root(|fs| fs.read_file(path).ok())?
+}
+
+/// Write a whole file to the root filesystem, creating it if it does not
+/// exist. The first real write path on this target — `akuma-ext2`'s
+/// `write_file` (create-or-truncate-and-replace) was always here, unmodified
+/// and untouched since Stage N; nothing on amd64 called it before `fd`'s
+/// close-time flush (see that module's header for why the write is buffered
+/// in memory and only lands here once).
+///
+/// `false` covers "no filesystem mounted" and every `akuma-ext2` failure
+/// (most commonly: the parent directory does not exist — `write_file` does
+/// not create one, matching `open(2)`'s own contract).
+#[must_use]
+pub fn write_file(path: &str, data: &[u8]) -> bool {
+    with_root(|fs| fs.write_file(path, data).is_ok()).unwrap_or(false)
 }
 
 /// Inode metadata for a path — the backing for the path-based `stat` syscalls.

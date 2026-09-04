@@ -8,6 +8,17 @@ use alloc::alloc::Layout;
 use core::ffi::{c_char, c_void, c_int};
 use core::ptr;
 
+// `amd64_shim` is x86_64's stand-in for `libakuma`, which does not build for
+// this target — see that module's header. Aliasing its name to `libakuma`
+// here, rather than editing every one of the ~700 lines below that call
+// `libakuma::X`, is the whole point: everything past this point is
+// arch-agnostic plumbing that would rather not know which syscall ABI is
+// underneath it.
+#[cfg(target_arch = "x86_64")]
+mod amd64_shim;
+#[cfg(target_arch = "x86_64")]
+use amd64_shim as libakuma;
+
 use libakuma::{
     close as akuma_close, exit as akuma_exit,
     open as akuma_open, open_flags,

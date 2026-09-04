@@ -43,9 +43,20 @@ implementation" pattern this whole target follows). `mkdisk.sh` also writes
 net and Firecracker's `net-setup.sh` dnsmasq answer DNS on), which a guest
 resolver needs to have anywhere to ask. Net result: `wget http://info.cern.ch/`
 from inside the guest does a real DNS lookup, TCP connect and HTTP GET and
-returns the page — verified over SSH on QEMU `microvm`. No writes, no device
-interrupts, and no pipelines (`a | b`) over the interactive SSH shell —
-`sys_pipe2` (step 4) is still `ENOSYS`, seen directly as `can't create pipe: Bad
+returns the page — verified over SSH on QEMU `microvm`. And since 2026-09-04
+**writes exist**: `fd::sys_write_file` buffers into the descriptor's own
+`Vec<u8>`, `fs::write_file` (`akuma-ext2`'s existing, unmodified write path)
+persists it once, at `close(2)` — enough for a real **tcc** (ported to
+`x86_64-unknown-none` the same day: `TCC_TARGET_X86_64`, an x86_64
+`setjmp`/`longjmp`, its own `amd64_shim` standing in for `libakuma`) to
+compile a C source file and write out a genuine ELF64 executable, which the
+loader then **runs** — `tcc -static -nostdlib -B /usr/lib/tcc -o out src.c`
+followed by `./out` returning the exit code the source asked for, verified
+over SSH. No `printf`/libc yet (no musl static libs are staged on this image;
+see `userspace/tcc/build.rs`'s comment), so today's proof program is
+libc-free, not the `#include <stdio.h>` hello.c the AArch64 acceptance tests
+use. No device interrupts, and no pipelines (`a | b`) over the interactive SSH
+shell — `sys_pipe2` (step 4) is still `ENOSYS`, seen directly as `can't create pipe: Bad
 file descriptor` from `wget ... | head`.
 
 Verified on QEMU (PVH) **and on real hardware under Firecracker v1.16.1** —
@@ -326,10 +337,22 @@ networking took a `#UD` because of that. `run.sh` passes `-cpu max`.
 
 ## Guest programs
 
-The programs the loader runs live in `userspace/amd64/`, one directory each,
-compiled straight by `rustc` from `amd64/build.rs` and embedded with
-`include_bytes!` — there is no disk driver, so there is nowhere to put a file the
-kernel could open by path. See `userspace/amd64/README.md` for how to add one.
+Two different ways a program gets onto this target, for two different reasons:
+
+- **`userspace/amd64/`** — one directory each, compiled straight by `rustc`
+  from `amd64/build.rs` and embedded with `include_bytes!`. This predates
+  Stage N (ext2), and stayed the shape for the ELF loader's own self-tests
+  (`hello`, `fdprobe`): a loader test should not depend on the filesystem it
+  is not testing. See `userspace/amd64/README.md` for how to add one.
+- **Real disk-resident programs** — `paws`, `httpd`, `sshd`, and (since
+  2026-09-04) **`tcc`** — are ordinary `cargo build -p <name> --target
+  x86_64-unknown-none --release` crates under `userspace/`, staged onto the
+  ext2 image by `amd64/mkdisk.sh` and opened by path like any other file.
+  `tcc` is not a workspace member (`userspace/tcc/Cargo.toml` is its own
+  `[workspace]` root — see `userspace/Cargo.toml`'s comment on the
+  submodule-backed crates), so `mkdisk.sh` reaches it with `--manifest-path`
+  rather than `-p tcc`; everything else about how it lands on the image is
+  the same as `paws`/`httpd`/`sshd`.
 
 A guest program reports what it checked through its **exit status**, which the
 kernel's self-test compares against a value computed in `src/usermode.rs`. A
@@ -357,8 +380,17 @@ program that printed its verdict would have "passed" by running at all.
   64 MiB heap) so an interactive shell serves dozens of external commands before
   the ceiling bites with *"can't fork"* / *"failed to spawn"*. Actually
   recycling the slots is the real fix and is a stage of its own.
-- **No writes to the filesystem**, and no mount table. `sshd` cannot persist its
-  host key (it regenerates each boot, which it tolerates).
+- **Writes exist (2026-09-04) but are whole-file, and there is still no mount
+  table.** `open(O_CREAT|O_WRONLY)` buffers into the fd's own buffer;
+  `close(2)` is the one point that buffer reaches `akuma-ext2`'s `write_file`,
+  which replaces a file's entire contents in one call — there is no
+  incremental/partial write to the disk, and no `unlink`/`rename`/`mkdir`
+  syscall on the kernel side yet (`fd.rs`'s module header has the design, and
+  `userspace/tcc/src/amd64_shim.rs`'s header has why tcc does not need those
+  three anyway). `sshd` still does not use this — it still regenerates its
+  host key every boot, which it tolerates — nothing has wired persistence
+  *into* an existing program yet; tcc's own `-o` output is the first thing
+  that writes.
 - **No device interrupts.** The block driver polls the used ring; the NIC would
   too. On the AArch64 side the NIC IRQ exists only to end the netpoll loop's
   `wfi` early, so it is an optimisation on top of that loop, not a prerequisite.

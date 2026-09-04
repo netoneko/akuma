@@ -919,6 +919,13 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     if let Some(p) = crate::fd::pipe_write_id(fd) {
         return crate::fd::write_pipe(p, buf, len as usize, crate::fd::is_nonblocking(fd));
     }
+    // A real file descriptor, opened `O_WRONLY`/`O_RDWR` — tcc's `-o` output,
+    // the first real writer on this target (2026-09-04). Above `fd::FIRST_FILE_FD`
+    // and not a socket or pipe (both already routed above), so this is the last
+    // fd class before the two console descriptors.
+    if fd >= crate::fd::FIRST_FILE_FD as u64 {
+        return crate::fd::sys_write_file(fd, buf, len);
+    }
     if fd != 1 && fd != 2 {
         return EBADF;
     }

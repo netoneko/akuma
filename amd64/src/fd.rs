@@ -388,13 +388,27 @@ pub fn sys_openat(_dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
         p.push_str(&path);
         p
     };
+    // `O_CREAT`: a new (or truncated) file, written back at `close(2)` — see
+    // [`sys_close`] and this module's header. Skips `read_file` entirely
+    // rather than reading-then-discarding an existing file's bytes: this
+    // target always truncates on `O_CREAT` (there is no in-place update path,
+    // and tcc — the first real writer here — always asks for
+    // `O_WRONLY|O_CREAT|O_TRUNC` together), so starting from an empty buffer
+    // is correct for the one case this target's callers actually use.
+    // Existing-directory check first: `O_CREAT` on a path that is already a
+    // directory must fail, not silently start writing a same-named file.
+    let creating = flags_ & u64::from(open_flags::O_CREAT) != 0;
+    if creating && fs::metadata(&normalised).is_some_and(|m| m.is_dir) {
+        return errno::EISDIR;
+    }
+
     // A directory has no bytes to cache as file contents — `read_file` would
     // fail it as `NotAFile`. Check `metadata` first (one inode read, next to
     // `read_file`'s whole-file copy) so a directory opens successfully instead
     // of falling through to "not found"; `getdents64` lists it straight off
     // the disk on first use.
-    let is_dir = fs::metadata(&normalised).is_some_and(|m| m.is_dir);
-    let data = if is_dir {
+    let is_dir = !creating && fs::metadata(&normalised).is_some_and(|m| m.is_dir);
+    let data = if creating || is_dir {
         Vec::new()
     } else {
         match fs::read_file(&normalised) {
@@ -414,6 +428,18 @@ pub fn sys_openat(_dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
         }
     }
     errno::EMFILE
+}
+
+/// `O_CREAT`, `O_WRONLY`, `O_RDWR`, `O_TRUNC` — the bits [`sys_openat`] and
+/// [`sys_write_file`] decode from the raw `flags` word. Spelled out locally
+/// rather than pulled from `akuma_syscalls_linux` because those are the
+/// AArch64/`asm-generic` values; on x86_64 they happen to share the same
+/// numeric encoding (`open(2)`'s flag bits are one of the few things the two
+/// architectures never diverged on), but naming that coincidence explicitly
+/// here is cheaper than a reader having to go check.
+pub mod open_flags {
+    pub const O_ACCMODE: u32 = 0o3;
+    pub const O_CREAT: u32 = 0o100;
 }
 
 /// `close(fd)`. Closing a console descriptor succeeds and does nothing — a
@@ -448,6 +474,18 @@ pub fn sys_close(fd: u64) -> u64 {
         // for this final drain. Free the slot now.
         Some(Entry { desc: FileDescriptor::PipeRead(p), .. }) => {
             crate::pipe::free(p as usize);
+        }
+        // A file opened for writing: this is the one and only point its
+        // buffered `data` reaches the disk (see the module header and
+        // `sys_write_file`) — `akuma-ext2`'s `write_file` replaces the whole
+        // file in one call, so there is nothing to flush incrementally.
+        // Read-only opens skip this: writing back an unmodified `read_file`
+        // copy on every `close` would be a silent no-op turned into needless
+        // disk I/O.
+        Some(Entry { desc: FileDescriptor::File(file), data, is_dir: false, .. })
+            if file.flags & open_flags::O_ACCMODE != 0 =>
+        {
+            let _ = fs::write_file(&file.path, &data);
         }
         _ => {}
     }
@@ -511,6 +549,55 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     file.position = pos + n;
     let chunk = &entry.data[pos..pos + n];
     copy_to_user(buf, chunk) as u64
+}
+
+/// `write(fd, buf, len)` on a real file descriptor — everything `sys_write` in
+/// `usermode.rs` does not itself handle (console, pipe, socket).
+///
+/// Writes into the descriptor's own `data` buffer at its cursor, growing it as
+/// needed; nothing reaches the disk here. `akuma-ext2`'s `write_file` replaces
+/// a file's entire contents in one call, so writing back after every `write(2)`
+/// would mean re-writing everything already written on each subsequent call —
+/// quadratic, and pointless before the program is done. `sys_close` is the one
+/// place this buffer is ever persisted; see the module header.
+pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    if len > MAX_IO {
+        return errno::EINVAL;
+    }
+    // Copied in before the lock: `copy_in` allocates, and there is no reason
+    // to hold `TABLE` across that.
+    let incoming = copy_in(buf, len);
+
+    let idx = fd - FIRST_FILE_FD as u64;
+    let mut table = TABLE.lock();
+    let Some(Some(entry)) = table.get_mut(idx as usize) else {
+        return errno::EBADF;
+    };
+    if entry.is_dir {
+        return errno::EISDIR;
+    }
+    // The position read and the write-permission check both come from
+    // `entry.desc`, borrowed immutably first so the mutable borrow of
+    // `entry.data` just below is not fighting a live borrow of a sibling
+    // field through the same `&mut Entry` — `entry.file()` would hold that
+    // borrow for the rest of the function if used here instead.
+    let pos = match &entry.desc {
+        FileDescriptor::File(f) if f.flags & open_flags::O_ACCMODE != 0 => f.position,
+        FileDescriptor::File(_) => return errno::EBADF, // opened read-only
+        _ => return errno::EBADF,
+    };
+    let end = pos + incoming.len();
+    if entry.data.len() < end {
+        entry.data.resize(end, 0);
+    }
+    entry.data[pos..end].copy_from_slice(&incoming);
+    if let FileDescriptor::File(f) = &mut entry.desc {
+        f.position = end;
+    }
+    incoming.len() as u64
 }
 
 /// Akuma's own `poll_input_event(buf, len, timeout_us)` — a **raw** keystroke.
@@ -1290,6 +1377,44 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     t.check_eq("fd: opening a missing file is ENOENT",
                sys_openat(0, missing.as_ptr() as u64, 0, 0), errno::ENOENT);
     t.check_eq("fd: a null path is EFAULT", sys_openat(0, 0, 0, 0), errno::EFAULT);
+
+    // Write round-trip (2026-09-04): create a file, write to it, close (the
+    // one point this target ever persists a write — see `fs`'s module
+    // header), reopen read-only, and read the same bytes back.
+    // `/write_probe.txt` is a name `mkdisk.sh` never creates, so this cannot
+    // collide with a real fixture on the image.
+    const O_WRONLY: u64 = 0o1;
+    const O_CREAT: u64 = 0o100;
+    const O_TRUNC: u64 = 0o1000;
+    let wpath = b"/write_probe.txt\0";
+    let wfd = sys_openat(0, wpath.as_ptr() as u64, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+    if t.check("fd: O_CREAT open succeeds", wfd >= FIRST_FILE_FD as u64) {
+        let msg = b"hello from amd64 write()\n";
+        t.check_eq(
+            "fd: write returns the byte count",
+            sys_write_file(wfd, msg.as_ptr() as u64, msg.len() as u64),
+            msg.len() as u64,
+        );
+        t.check_eq("fd: close after write persists it", sys_close(wfd), 0);
+
+        let rfd = sys_openat(0, wpath.as_ptr() as u64, 0, 0);
+        if t.check("fd: reopen the written file", rfd >= FIRST_FILE_FD as u64) {
+            let mut rbuf = [0u8; 64];
+            let n = sys_read(rfd, rbuf.as_mut_ptr() as u64, rbuf.len() as u64);
+            t.check_eq("fd: read back the written length", n, msg.len() as u64);
+            t.check("fd: read back the written bytes", &rbuf[..msg.len()] == msg);
+            sys_close(rfd);
+        }
+    }
+
+    // A write to a read-only fd is refused, not silently accepted.
+    let rofd = sys_openat(0, path.as_ptr() as u64, 0, 0);
+    t.check_eq(
+        "fd: writing a read-only fd is EBADF",
+        sys_write_file(rofd, path.as_ptr() as u64, 4),
+        errno::EBADF,
+    );
+    sys_close(rofd);
 
     // Fill the table, then check the next open is refused rather than
     // overwriting a live descriptor.

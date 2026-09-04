@@ -64,6 +64,20 @@ for prog in paws httpd; do
     fi
 done
 
+# tcc, ported to this target 2026-09-04. `userspace/tcc` is not a workspace
+# member (its own `Cargo.toml` declares `[workspace]` with no members, so it
+# is its own root — see `userspace/Cargo.toml`'s comment on the
+# submodule-backed crates), hence `--manifest-path` rather than `-p tcc`.
+# `TCC_LIBTCC1` is the runtime archive + tcc's own internal headers
+# (`libtcc1-x86_64.tar` — named apart from aarch64's `libtcc1.tar` so one
+# arch's build can never clobber the other's, see `userspace/tcc/build.rs`).
+TCC=""
+TCC_LIBTCC1=""
+if (cd userspace && cargo build -q --manifest-path tcc/Cargo.toml --target x86_64-unknown-none --release 2>/dev/null); then
+    TCC=$(find userspace/tcc/target/x86_64-unknown-none/release -maxdepth 1 -name tcc -type f | head -1)
+    [ -f userspace/tcc/dist/libtcc1-x86_64.tar ] && TCC_LIBTCC1="userspace/tcc/dist/libtcc1-x86_64.tar"
+fi
+
 # sshd, WITHOUT `fork-sessions` (a default feature): this target has no `fork`,
 # so the cooperative single-process executor is the only one that runs. `akuma`
 # is kept — it is what pulls in `libakuma` and its `net-async` — but the default
@@ -108,6 +122,49 @@ done
 [ -n "$FDPROBE" ] && "$DEBUGFS" -w -R "write $FDPROBE bin/fdprobe" "$IMG" >/dev/null 2>&1
 [ -n "$PAWS" ] && "$DEBUGFS" -w -R "write $PAWS bin/paws" "$IMG" >/dev/null 2>&1
 [ -n "$HTTPD" ] && "$DEBUGFS" -w -R "write $HTTPD bin/httpd" "$IMG" >/dev/null 2>&1
+
+# tcc + its runtime archive. No musl static libc is staged on this image at
+# all yet (there is no `apk` here the way `populate_disk.sh` has for the
+# AArch64 image) — see `userspace/tcc/build.rs`'s comment on that gap — so
+# `/probe_tcc.c` is deliberately libc-free (`-nostdlib`, its own `_start`,
+# raw-syscall `_exit`) rather than the real `#include <stdio.h>` + `printf`
+# hello.c the AArch64 acceptance tests use: that one needs a working link
+# against `printf`/`__libc_start_main`, which fails *before* tcc ever reaches
+# the point of writing an output file, so it would prove nothing about
+# whether the write path (2026-09-04, `fd::sys_write_file`) actually works.
+if [ -n "$TCC" ]; then
+    "$DEBUGFS" -w -R "write $TCC bin/tcc" "$IMG" >/dev/null 2>&1
+    if [ -n "$TCC_LIBTCC1" ]; then
+        LIBTCC1_STAGE=$(mktemp -d)
+        tar xf "$TCC_LIBTCC1" -C "$LIBTCC1_STAGE"
+        "$DEBUGFS" -w -R "mkdir /usr" "$IMG" >/dev/null 2>&1
+        "$DEBUGFS" -w -R "mkdir /usr/lib" "$IMG" >/dev/null 2>&1
+        "$DEBUGFS" -w -R "mkdir /usr/lib/tcc" "$IMG" >/dev/null 2>&1
+        "$DEBUGFS" -w -R "mkdir /usr/lib/tcc/include" "$IMG" >/dev/null 2>&1
+        "$DEBUGFS" -w -R "write $LIBTCC1_STAGE/usr/lib/tcc/libtcc1.a usr/lib/tcc/libtcc1.a" "$IMG" >/dev/null 2>&1
+        for hdr in "$LIBTCC1_STAGE"/usr/lib/tcc/include/*; do
+            [ -f "$hdr" ] && "$DEBUGFS" -w -R "write $hdr usr/lib/tcc/include/$(basename "$hdr")" "$IMG" >/dev/null 2>&1
+        done
+        rm -rf "$LIBTCC1_STAGE"
+    fi
+    "$DEBUGFS" -w -R "mkdir /tmp" "$IMG" >/dev/null 2>&1
+    cat > "$TMP/probe_tcc.c" <<'EOF'
+/* Deliberately libc-free — see mkdisk.sh's comment on why. */
+static void _exit_now(int code) {
+    __asm__ volatile (
+        "syscall"
+        :
+        : "a"(231), "D"(code)
+        : "rcx", "r11", "memory"
+    );
+}
+
+void _start(void) {
+    _exit_now(42);
+}
+EOF
+    "$DEBUGFS" -w -R "write $TMP/probe_tcc.c tmp/probe_tcc.c" "$IMG" >/dev/null 2>&1
+fi
 
 # busybox: a real static musl x86_64 binary (ET_EXEC, non-PIE), fetched once and
 # cached. It is the test that the ELF loader and the Linux syscall surface hold
@@ -155,5 +212,13 @@ printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></h
 "$DEBUGFS" -w -R "mkdir /public" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $TMP/index.html public/index.html" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $TMP/probe.txt probe.txt" "$IMG" >/dev/null 2>&1
+
+# `/tmp`: real writes landed 2026-09-04 (`fd::sys_write_file`/`fs::write_file`),
+# and `akuma-ext2`'s `write_file` requires the parent directory to already
+# exist — it does not create one, matching `open(2)`. tcc's own acceptance
+# tests on the AArch64 side (`acceptance/05_meow_tcc_extreme_4mb.md`) write
+# their output to `/tmp`, so this target's tcc port follows the same path
+# rather than inventing a different convention.
+"$DEBUGFS" -w -R "mkdir /tmp" "$IMG" >/dev/null 2>&1
 
 echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")"
