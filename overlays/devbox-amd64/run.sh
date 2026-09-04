@@ -22,6 +22,15 @@ cd "$REPO_ROOT"
 
 export INIT="${INIT:-/bin/sshd}"
 export SSH_PORT="${SSH_PORT:-2223}"
+# busybox (`sh`), not `paws`, as sshd's session shell — `paws` invoking
+# `/bin/busybox` as a child can hang (seen directly, not yet root-caused: a
+# `paws /` console session's `/bin/busybox uname -a` produced no output and no
+# prompt back), and busybox is the shell every other target's devbox overlay
+# already gives an interactive session. `amd64/mkdisk.sh`'s own comment on
+# `SSHD_SHELL` still applies: exec-mode commands work regardless; `fork`
+# (Stage T) is what makes an *interactive* busybox session — cd, pipelines,
+# job control — behave like a real shell rather than one command at a time.
+export SSHD_SHELL="${SSHD_SHELL:-/bin/sh}"
 
 echo "Booting amd64 devbox: INIT=$INIT  (ssh on host :$SSH_PORT once sshd listens)"
 echo "  ssh -i target/x86_64-unknown-none/release/amd64-ssh-test-key \\"

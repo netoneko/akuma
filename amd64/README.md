@@ -89,6 +89,18 @@ anything had tried that combination. Full account, including the still-open
 follow-on hang once `apk update` gets *past* the handshake into the real
 index download: `docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.30.
 
+Two days later, `apk add` actually installs something: the still-open index
+hang (`select`, `poll_ready` hard-coding every TCP socket "not ready") and a
+64 KiB `write(2)` refusal apk's own APKINDEX write hit are both fixed
+(§3.31), and — after raising `mkdisk.sh`'s disk from 32 to 128 MiB (32 MiB
+ran to `ENOSPC` partway through a real install) and closing a leak where
+nothing freed a task's fds when it exited (§3.32) — `apk add curl` (14
+packages) and `apk add busybox-static` both install cleanly over SSH, and
+the freshly-committed `/bin/busybox.static` runs and prints correctly:
+`apk` itself works end to end. `curl` the *binary* does not run once
+installed — it is dynamically linked, and this target has no `PT_INTERP`
+support at all, a separate and much larger gap than anything `apk` does.
+
 No device interrupts, and no pipelines (`a | b`) over the interactive SSH
 shell — `sys_pipe2`/`dup2` (step 4) are still `ENOSYS`, seen directly as
 `can't create pipe: Bad file descriptor` from `wget ... | head` and as shell

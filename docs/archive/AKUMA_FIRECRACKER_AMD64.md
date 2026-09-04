@@ -3005,6 +3005,97 @@ Still open, in the order they block:
    faithfully and the answer comes back faithfully). `dl-cdn.alpinelinux.org`
    resolves and serves on the same path.
 
+## 3.32 Stage Z: `apk add` actually installs something (2026-09-04)
+
+Closes §3.31.5 item 1. The tree did not build at the start of this stage —
+two type errors in the previous session's uncommitted work (`fs::read_symlink`
+missing its `String` import; `sys_utimensat`'s `times == 0` branch building an
+`Option<Option<u64>>` where the decoded-timespec branch built an `Option<u64>`,
+so the two arms of the `if` disagreed) — fixed first, mechanically, before any
+of what follows could even be tried.
+
+With a clean build, `apk add --allow-untrusted curl` (14 packages) got
+through every fetch and every §3.31.4 chunked write, then failed piecemeal —
+`WARNING: … failed to preserve …: owner` on almost every file (expected;
+`chown`/`fchown` are not wired — noted, not fixed here) and, on the packages
+after `libcrypto3`, `ERROR: …: failed to commit …: No such file or
+directory`. The `ERROR` text names the wrong layer, exactly as `sys_close`'s
+own comment predicts it will: `[close] persist failed for
+"/usr/lib/.apk.<hash>": no space` on the serial console (invisible over SSH —
+this is a `serial::puts`, not anything `apk`'s own stdout carries) is the real
+failure, a boot log grep away once the report's phrasing stopped being
+trusted at face value. `amd64/mkdisk.sh`'s 32 MiB default was sized for the
+base image (musl's `libc.a`, `/usr/include`) in 2026-09-04's earlier stage
+and never re-sized for actually installing something through `apk` — a
+`curl` install alone is 11.7 MiB, and the disk was already most of the way
+full before it started. Fixed by raising the default to 128 MiB
+(`mkdisk.sh`, `run.sh`'s matching call) — real headroom for a dependency
+chain, not just the base image.
+
+Rebuilding the (now-bigger) disk and re-running found a second, independent
+bug: a *second* `apk add` in the same boot — a fresh SSH session, a fresh
+`apk` process — failed almost immediately with `ERROR: System state may be
+inconsistent: failed to write database: No file descriptors available`,
+before doing any real work. `amd64/src/fd.rs`'s descriptor table
+(`MAX_OPEN = 16`) is one flat array shared by **every** task on this target,
+by design (see the module header) — but nothing ever swept a task's entries
+out of it when the task exited. Real Linux closes every fd a process still
+holds at `exit`/`exit_group`; every self-test here got away without that
+because each one opens a handful of fds and closes them itself. `apk`
+doesn't (real Linux relies on the kernel to reclaim what a process leaves
+open at exit, which is completely ordinary — the same class of "correct
+POSIX usage this target hadn't been asked to survive yet" as the `read(2)`
+clamp in §3.29.4), so its own directory-fd cache and download sockets across
+one multi-package install left the shared table full, and the *next*
+process inherited an already-exhausted table with zero fds free before it
+opened anything of its own.
+
+Fixed with an `owner: usize` field on `fd::Entry` (`current_proc_slot()`,
+already used to route fd 0/1/2 to the right task, tags who opened each one)
+and `fd::close_owned_by(proc_slot)` — collected under `TABLE`'s lock, then
+closed through the existing `sys_close` one at a time outside it, same
+lock-then-release-outside-it shape `sys_close` itself already uses for
+sockets. Called once, from `usermode::run_process`, right after a task's
+last `enter_user_mode` returns and before `spawn_record_exit` — so a
+parent's `waitpid` never observes a reaped child while its fds are still
+charged against the shared table. An `execve` chain does not trigger it
+mid-chain (the loop only leaves `run_process` once there is no pending
+exec), matching real close-on-exit semantics rather than closing everything
+between one program and the next in the same process.
+
+**Verified**, on a clean 128 MiB disk, five separate SSH sessions in the same
+boot: `apk update`, `apk add curl` (14 pkgs), `apk add busybox-static`
+(+1), `apk add nano` (+3), `apk update` again — every one exits 0, no
+`EMFILE`, no `No file descriptors available`. The `WARNING: … owner`
+lines remain (41 of them across the `curl` install, one or two per file) —
+apk-tools counts each toward its exit-status tally, which is why `apk add
+curl` reports `exited with status 14` for a run with zero real errors; not a
+bug, just a summary number worth not mistaking for one. And a runnable
+proof, not just an errorless log: `busybox-static`'s freshly-committed
+`/bin/busybox.static`, installed by this exact code path, executes and
+prints `uname -a` correctly — the chunked write from §3.31.4 and the ext2
+write path underneath it produce byte-correct files, not just error-free
+ones. `curl` itself does **not** run — `command not found`, and the real
+reason is explicit in `loader.rs`: `PT_INTERP present — this kernel has no
+dynamic linker, only static-PIE`. Alpine's `curl` package is dynamically
+linked against `libcurl.so.4`/`libssl.so.3`/etc., and this target has no
+`PT_INTERP` support at all (§ "Static-PIE (`ET_DYN`, no `PT_INTERP`)" in that
+file's own header) — a real, large, pre-existing, and entirely separate gap
+from anything `apk` itself does, not attempted here.
+
+Still open, in the order they'd block next:
+
+1. **`chown`/`fchown` are ENOSYS** — every `WARNING: … failed to preserve …:
+   owner` traces back to this; cosmetic today (`apk` treats it as
+   non-fatal and installs anyway) but worth real syscalls before it hides a
+   permissions bug that matters.
+2. **A real ELF dynamic linker (`PT_INTERP`)** — the only way an unmodified
+   dynamically-linked Alpine package (most of them; `curl` is the example
+   found here) will ever run on this target. A stage of its own, and a much
+   bigger one than anything above it.
+3. §3.31.5's items 2-5 (`socketpair`, `brk`/`getsockname`, `NETWORK`
+   concurrency under real preemption, the `example.com` DNS control) are
+   unchanged by this stage.
 
 ## 4. What is deliberately missing
 
