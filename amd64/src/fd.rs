@@ -748,13 +748,216 @@ pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
     0
 }
 
-/// `ioctl` — always `ENOTTY`.
+/// `poll(fds, nfds, timeout_ms)` — x86_64 syscall 7.
 ///
-/// Deliberately not `ENOSYS`. A libc asking "is this a terminal?" treats
-/// `ENOTTY` as a clear no and carries on unbuffered; `ENOSYS` reads as "this
-/// kernel is broken" and some runtimes abort on it.
-pub fn sys_ioctl(_fd: u64, _req: u64, _arg: u64) -> u64 {
-    errno::ENOTTY
+/// Enough of `poll` for an interactive `busybox sh`: its line editor calls
+/// `poll(&stdin, 1, -1)` on every keystroke, and an `ENOSYS` there sent it into
+/// a tight retry loop printing `sh: poll: Function not implemented` forever.
+///
+/// Readiness is real for the fds a shell actually polls — a stdin/stdout pipe
+/// (checked non-destructively) and the console — and optimistic (always ready)
+/// for a regular file, which POSIX allows. A socket fd reports **not** ready:
+/// nothing on this target polls one, and a false `POLLIN` would send the caller
+/// into a blocking `recv`. `POLLNVAL` is not distinguished from "not ready".
+///
+/// Timeout: `< 0` waits indefinitely (yield-and-retry, so `sshd` and the
+/// netpoll daemon keep running); `0` is one non-blocking pass; `> 0` is
+/// approximated by a bounded yield budget — this target has no calibrated
+/// clock, and the finite-timeout polls a shell makes are short escape-sequence
+/// disambiguations that tolerate the imprecision.
+pub fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> u64 {
+    const POLLIN: u16 = 0x001;
+    const POLLOUT: u16 = 0x004;
+    const MAX_NFDS: u64 = 64;
+
+    if nfds == 0 {
+        // A bare `poll(NULL, 0, ms)` is a sleep; with no clock, yield once.
+        crate::sched::yield_now();
+        return 0;
+    }
+    if fds == 0 || nfds > MAX_NFDS {
+        return errno::EINVAL;
+    }
+    let n = nfds as usize;
+    let timeout = timeout_ms as i32;
+
+    // Budget for a finite timeout: bounded so a stuck poll cannot wedge the
+    // task. Infinite (`< 0`) loops until something is ready.
+    let mut budget: u64 = match timeout {
+        0 => 1,
+        t if t < 0 => u64::MAX,
+        t => (t as u64).saturating_mul(200).min(2_000_000),
+    };
+
+    loop {
+        let mut ready = 0u64;
+        for i in 0..n {
+            let base = fds + (i as u64) * 8;
+            // SAFETY: user array of `struct pollfd` (8 bytes), bounded by nfds.
+            let fd = unsafe { (base as *const i32).read_volatile() };
+            let events = unsafe { ((base + 4) as *const u16).read_volatile() };
+            let mut revents = 0u16;
+            if fd >= 0 {
+                let (r, w) = poll_ready(fd as u64);
+                if r && events & POLLIN != 0 {
+                    revents |= POLLIN;
+                }
+                if w && events & POLLOUT != 0 {
+                    revents |= POLLOUT;
+                }
+            }
+            // SAFETY: the `revents` half of the same `struct pollfd`.
+            unsafe { ((base + 6) as *mut u16).write_volatile(revents) };
+            if revents != 0 {
+                ready += 1;
+            }
+        }
+        if ready != 0 {
+            return ready;
+        }
+        budget -= 1;
+        if budget == 0 {
+            return 0;
+        }
+        crate::sched::yield_now();
+    }
+}
+
+/// `(readable, writable)` for one fd, for [`sys_poll`]. Non-destructive.
+fn poll_ready(fd: u64) -> (bool, bool) {
+    if fd == 0 {
+        return match crate::usermode::current_stdin_pipe() {
+            Some(p) => (crate::pipe::readable(p), false),
+            None => (serial::has_byte(), false),
+        };
+    }
+    if fd == 1 || fd == 2 {
+        return match crate::usermode::current_stdout_pipe() {
+            Some(p) => (false, crate::pipe::writable(p)),
+            None => (false, true),
+        };
+    }
+    if let Some(p) = pipe_read_id(fd) {
+        return (crate::pipe::readable(p), false);
+    }
+    if let Some(p) = pipe_write_id(fd) {
+        return (false, crate::pipe::writable(p));
+    }
+    if socket_index(fd).is_some() {
+        // Not polled by anything on this target; see `sys_poll`'s note.
+        return (false, false);
+    }
+    // A regular file: always ready, per POSIX.
+    let in_table = {
+        let idx = fd.wrapping_sub(FIRST_FILE_FD as u64) as usize;
+        matches!(TABLE.lock().get(idx), Some(Some(_)))
+    };
+    (in_table, in_table)
+}
+
+/// `access(path)` / `faccessat(.., path, ..)` — does the path resolve?
+///
+/// `F_OK`/`R_OK`/`X_OK` all collapse to "it exists": one user, and no per-file
+/// permission enforcement anywhere else on this target, so answering anything
+/// finer would be inventing a result. `0` if it resolves, `-ENOENT` if not.
+pub fn sys_access(path: u64) -> u64 {
+    let Some(path) = path_from_user(path) else {
+        return errno::EFAULT;
+    };
+    let normalised = if path.starts_with('/') {
+        path
+    } else {
+        let mut p = alloc::string::String::from("/");
+        p.push_str(&path);
+        p
+    };
+    if fs::metadata(&normalised).is_some() {
+        0
+    } else {
+        errno::ENOENT
+    }
+}
+
+/// `ioctl(fd, request, arg)` — the terminal subset, plus `ENOTTY` for the rest.
+///
+/// An interactive `busybox sh` probes its stdin with `TCGETS` on startup and, if
+/// that fails, decides stdin is **not** a terminal: it prints no prompt, does no
+/// line editing, and reads to EOF — which over an SSH channel looks exactly like
+/// a hang. So fd 0/1/2 answer `TCGETS`/`TIOCGWINSZ` with a plausible cooked-mode
+/// `termios` and an 80x24 `winsize`, and accept the setters as no-ops. There is
+/// still no real line discipline on the pipe (`SPAWN_FLAG_PTY` is ignored), so
+/// the shell does its own editing on raw bytes — this only stops it giving up.
+///
+/// Everything else, and any request on a non-console fd, stays `ENOTTY` rather
+/// than `ENOSYS`: a libc asking "is this a tty?" treats `ENOTTY` as a clean no,
+/// where `ENOSYS` reads as a broken kernel and some runtimes abort on it.
+pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
+    // x86_64 ioctl request numbers (arch-generic for these).
+    const TCGETS: u64 = 0x5401;
+    const TCSETS: u64 = 0x5402;
+    const TCSETSW: u64 = 0x5403;
+    const TCSETSF: u64 = 0x5404;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
+    const TIOCGPGRP: u64 = 0x540F;
+    const TIOCSPGRP: u64 = 0x5410;
+    const TIOCSCTTY: u64 = 0x540E;
+
+    let is_console = fd < FIRST_FILE_FD as u64;
+    if !is_console {
+        return errno::ENOTTY;
+    }
+
+    match req {
+        TCGETS => {
+            if arg == 0 {
+                return errno::EFAULT;
+            }
+            // Kernel `struct termios`: c_iflag/oflag/cflag/lflag (u32 each),
+            // c_line (u8), c_cc[19]. 36 bytes; a couple extra do no harm.
+            let mut t = [0u8; 44];
+            let put = |t: &mut [u8], off: usize, v: u32| {
+                t[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            };
+            put(&mut t, 0, 0x0000_0500); // c_iflag = ICRNL | IXON
+            put(&mut t, 4, 0x0000_0005); // c_oflag = OPOST | ONLCR
+            put(&mut t, 8, 0x0000_00BF); // c_cflag = B38400 | CS8 | CREAD
+            put(&mut t, 12, 0x0000_8A3B); // c_lflag = ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN
+            // c_cc, the control characters that matter: VERASE, VKILL, VEOF,
+            // VINTR, VQUIT, VSUSP, VMIN, VTIME.
+            t[17] = 0x03; // VINTR  = ^C
+            t[18] = 0x1C; // VQUIT  = ^\
+            t[19] = 0x7F; // VERASE = DEL
+            t[20] = 0x15; // VKILL  = ^U
+            t[21] = 0x04; // VEOF   = ^D
+            t[22] = 0x00; // VTIME
+            t[23] = 0x01; // VMIN   = 1
+            t[27] = 0x1A; // VSUSP  = ^Z
+            copy_to_user(arg, &t);
+            0
+        }
+        TIOCGWINSZ => {
+            if arg == 0 {
+                return errno::EFAULT;
+            }
+            // struct winsize { u16 ws_row, ws_col, ws_xpixel, ws_ypixel }.
+            let mut w = [0u8; 8];
+            w[0..2].copy_from_slice(&24u16.to_le_bytes()); // ws_row
+            w[2..4].copy_from_slice(&80u16.to_le_bytes()); // ws_col
+            copy_to_user(arg, &w);
+            0
+        }
+        // The setters and job-control queries: accept, and answer with the one
+        // process group this target has.
+        TCSETS | TCSETSW | TCSETSF | TIOCSWINSZ | TIOCSPGRP | TIOCSCTTY => 0,
+        TIOCGPGRP => {
+            if arg != 0 {
+                copy_to_user(arg, &1i32.to_le_bytes());
+            }
+            0
+        }
+        _ => errno::ENOTTY,
+    }
 }
 
 /// Exercise the descriptor path from the kernel side.
@@ -856,6 +1059,66 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         "fd: newfstatat AT_EMPTY_PATH reports the fd's size",
         u64::from_le_bytes(st[48..56].try_into().unwrap_or([0; 8])),
         6623,
+    );
+
+    // `access`: a resolvable path is 0, a missing one ENOENT.
+    let probe_c = b"/probe.txt\0";
+    t.check_eq("fd: access(/probe.txt) is 0", sys_access(probe_c.as_ptr() as u64), 0);
+    t.check_eq(
+        "fd: access on a missing path is ENOENT",
+        sys_access(gone.as_ptr() as u64),
+        errno::ENOENT,
+    );
+
+    // `ioctl(TCGETS)` on the console answers rather than failing — this is what
+    // stops an interactive busybox deciding stdin is not a terminal.
+    let mut term = [0u8; 44];
+    t.check_eq(
+        "fd: ioctl(0, TCGETS) succeeds",
+        sys_ioctl(0, 0x5401, term.as_mut_ptr() as u64),
+        0,
+    );
+    t.check(
+        "fd: TCGETS reports a cooked-mode c_lflag (ICANON|ECHO)",
+        u32::from_le_bytes(term[12..16].try_into().unwrap_or([0; 4])) & 0x0A == 0x0A,
+    );
+    let mut ws = [0u8; 8];
+    t.check_eq(
+        "fd: ioctl(0, TIOCGWINSZ) succeeds",
+        sys_ioctl(0, 0x5413, ws.as_mut_ptr() as u64),
+        0,
+    );
+    t.check_eq(
+        "fd: TIOCGWINSZ reports 80 columns",
+        u64::from(u16::from_le_bytes(ws[2..4].try_into().unwrap_or([0; 2]))),
+        80,
+    );
+    t.check_eq(
+        "fd: ioctl(TCGETS) on a file is ENOTTY",
+        sys_ioctl(FIRST_FILE_FD as u64, 0x5401, term.as_mut_ptr() as u64),
+        errno::ENOTTY,
+    );
+
+    // `poll`: a regular file is always ready; a zero-length set with a timeout
+    // is a sleep that returns 0; an oversized set is EINVAL.
+    let mut pfd = [0u8; 8];
+    pfd[0..4].copy_from_slice(&(fd as i32).to_le_bytes());
+    pfd[4..6].copy_from_slice(&0x001u16.to_le_bytes()); // POLLIN
+    t.check_eq(
+        "fd: poll reports a regular file ready",
+        sys_poll(pfd.as_mut_ptr() as u64, 1, 0),
+        1,
+    );
+    t.check_eq(
+        "fd: poll(revents) has POLLIN set",
+        u64::from(u16::from_le_bytes(pfd[6..8].try_into().unwrap_or([0; 2]))) & 0x001,
+        0x001,
+    );
+    t.check_eq("fd: poll(NULL, 0, 0) returns 0", sys_poll(0, 0, 0), 0);
+    t.check_eq(
+        "fd: poll with too many fds is EINVAL",
+        sys_poll(pfd.as_mut_ptr() as u64, 999, 0),
+        errno::EINVAL,
     );
 
     t.check_eq("fd: close", sys_close(fd), 0);

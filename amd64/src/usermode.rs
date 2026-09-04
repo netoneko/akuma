@@ -414,6 +414,39 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         4 => return crate::fd::sys_newfstatat((-100i64) as u64, a1, a2, 0),
         6 => return crate::fd::sys_newfstatat((-100i64) as u64, a1, a2, 0x100),
         262 => return crate::fd::sys_newfstatat(a1, a2, a3, a4),
+        // `open(path, flags, mode)` — x86_64 2. x86_64 musl issues this directly
+        // (it only falls back to `openat` on architectures without `open`, like
+        // aarch64), so `busybox cat` hit `ENOSYS` here until now. `openat`
+        // ignores the dirfd for absolute paths and treats a relative one as
+        // root-relative, which is what `AT_FDCWD` means on a target with no cwd.
+        2 => return crate::fd::sys_openat((-100i64) as u64, a1, a2, a3),
+        // `access`/`faccessat(dirfd, path, mode[, flags])` — existence only.
+        // This target has one user (root) and no per-file exec tracking worth
+        // trusting, so "the path resolves" is the honest answer; a real
+        // permission check would be a guess.
+        21 => return crate::fd::sys_access(a1),
+        269 => return crate::fd::sys_access(a2),
+        // `poll(fds, nfds, timeout_ms)` — x86_64 7. An interactive `busybox sh`
+        // polls its stdin on every keystroke; `ENOSYS` here was a forever-loop
+        // of "sh: poll: Function not implemented".
+        7 => return crate::fd::sys_poll(a1, a2, a3),
+        // `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271. Same
+        // core; a NULL timespec means wait forever, otherwise fold sec+nsec to
+        // milliseconds (this target has no finer clock to honour anyway).
+        271 => {
+            let timeout_ms = if a3 == 0 {
+                (-1i64) as u64
+            } else {
+                // SAFETY: user `struct timespec` { i64 tv_sec, i64 tv_nsec }.
+                let (sec, nsec) = unsafe {
+                    ((a3 as *const i64).read_volatile(), (a3 as *const i64).add(1).read_volatile())
+                };
+                (sec.max(0) as u64)
+                    .saturating_mul(1000)
+                    .saturating_add((nsec.max(0) as u64) / 1_000_000)
+            };
+            return crate::fd::sys_poll(a1, a2, timeout_ms);
+        }
         // `execve(path, argv, envp)` — x86_64 59. No `fork` on this target, so
         // this is the `sh -c "<cmd>"` shape: the current (spawned) task replaces
         // its own image in place. See `sys_execve`.

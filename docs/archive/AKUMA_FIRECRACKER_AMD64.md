@@ -2045,8 +2045,11 @@ standalone.
 
 ## 3.26 Stage T: `busybox sh -c "<cmd>"` runs a command
 
-The ordered list, from the Stage-S `strace`. Steps 1 and 2's `execve` are done
-(2026-09-04); the rest is still ahead.
+The ordered list, from the Stage-S `strace`. Step 1 (path `stat`) and step 2's
+`execve` are done (2026-09-04), plus `open`/`access`/`ioctl`/`poll` that a real
+shell needed behind them — enough that `ssh host '<cmd>'` runs a single command
+and an interactive `busybox sh` shows a prompt and runs its builtins. `fork` and
+the rest are still ahead.
 
 ### 3.26.1 Step 1 — path `stat` (done)
 
@@ -2111,30 +2114,66 @@ walks the one VA window `sys_mmap` populates (`[MMAP_BASE, NEXT_VA)`) and frees
 every still-mapped frame — called from `Process::free` before the `FrameSet` and
 the tables go. This also closes the leak on the ordinary spawn→`waitpid` path.
 
-Gate: `usermode::execve_test` spawns `/bin/sh -c "uname"`, checks the exec'd
-program's output (`Akuma`) comes back on the shell's stdout pipe, the child
-exits 0, and teardown frees exactly what it allocated — one child reaped, not
-two.
+Gate: `usermode::execve_test` spawns `/bin/sh -c "uname -a"` (the exact shape
+`sshd`'s exec sessions use), checks the exec'd program's output (`Akuma` +
+`x86_64`) comes back on the shell's stdout pipe, the child exits 0, and teardown
+frees exactly what it allocated — one child reaped, not two.
 
-### 3.26.3 Still ahead
+Verified on QEMU and on Firecracker (Ryzen): `ssh root@10.0.2.15 'uname -a'`
+returns the banner and exit 0. A `;`/`|` sequence still fails with `sh: can't
+fork` — that is step 3.
 
-3. **`fork`/`vfork` (57/58) + `wait4` (61).** Interactive `busybox sh` and
-   pipelines (`a | b`) — ash *does* fork for those. No CoW here; `vfork`+`execve`
-   (share the address space until `exec`) is the shorter road. Route Linux
-   `wait4` (61) into the Akuma-private `waitpid` (303) spawn table — but note
-   `sys_waitpid` is non-blocking (returns 0 while the child runs) and a forked
-   shell expects `wait4(pid, &st, 0, 0)` to block, so the routing needs a wait
-   loop, not a passthrough.
+### 3.26.3 What running a real shell dragged in behind `execve`
+
+Four more syscalls, each `ENOSYS` until a `busybox` applet or the interactive
+shell tripped over it:
+
+- **`open` (2).** x86_64 musl issues `open` **directly** — it only falls back to
+  `openat` on architectures that lack `open` (aarch64, riscv) — so `busybox cat
+  /probe.txt` hit `ENOSYS` where `sh`'s own `openat`-based path resolution had
+  worked. Routed to `sys_openat(AT_FDCWD, …)`.
+- **`access` / `faccessat` (21 / 269).** Existence only: one user (root), no
+  per-file permission enforcement anywhere else on this target, so `F_OK`/`R_OK`/
+  `X_OK` all collapse to "the path resolves". Anything finer would be a guess.
+- **`ioctl` — the terminal subset (`fd.rs`).** An interactive `busybox sh`
+  probes stdin with `TCGETS`; the old blanket `ENOTTY` made it decide stdin is
+  not a terminal — no prompt, no editing, read to EOF, which over an SSH channel
+  is indistinguishable from a hang. Now fd 0/1/2 answer `TCGETS` with a
+  cooked-mode `termios` and `TIOCGWINSZ` with 80x24, and the setters
+  (`TCSETS*`, `TIOCSWINSZ`, `TIOCSPGRP`, `TIOCSCTTY`) are accepted no-ops.
+  There is still no real line discipline on the pipe — the shell edits raw
+  bytes itself — this only stops it giving up.
+- **`poll` / `ppoll` (7 / 271).** ash's line editor calls `poll(&stdin, 1, -1)`
+  on **every keystroke**; `ENOSYS` there was a tight loop printing `sh: poll:
+  Function not implemented` without end. `sys_poll` checks real readiness for
+  the fds a shell polls (stdin/stdout pipe, non-destructively, and the console),
+  is optimistic for a regular file (POSIX allows), and reports a socket **not**
+  ready (nothing polls one here, and a false `POLLIN` would wedge the caller in
+  `recv`). A negative timeout yields-and-retries so `sshd` and the netpoll
+  daemon keep running; a finite one is a bounded yield budget, since this target
+  has no calibrated clock.
+
+With these, an interactive `busybox sh` over SSH shows its prompt, edits a line,
+and runs its builtins (`pwd`, `cd`, `echo`, `exit`). External commands still
+need `fork`.
+
+### 3.26.4 Still ahead
+
+3. **`fork`/`vfork` (57/58) + `wait4` (61).** Interactive `busybox sh` forks for
+   **every** external command, and pipelines (`a | b`) and command sequences
+   (`a; b`) fork too. No CoW here; `vfork`+`execve` (share the address space
+   until `exec`) is the shorter road. Route Linux `wait4` (61) into the
+   Akuma-private `waitpid` (303) spawn table — but `sys_waitpid` is non-blocking
+   (returns 0 while the child runs) and a forked shell expects `wait4(pid, &st,
+   0, 0)` to block, so the routing needs a wait loop, not a passthrough.
 4. **`pipe2` (293), `dup2`/`dup3` (33/292).** `akuma-pipe` + `alloc_pipe_fd`
    are the pieces; wire `sys_pipe2`.
 5. **`getdents64` (217)** — `ls`. `akuma-vfs`'s `read_dir` is already used by
-   `src/fs.rs`.
+   `src/fs.rs`; still `ENOSYS`, so `ls` reports "can't open".
 6. **`arch_prctl` per-task `FS_BASE` save/restore in `sched.rs`** — load-bearing
    once the shell and a forked child are both runnable. A `UserCtx` field
    (offset ≥ 32, past what `syscall_entry` indexes), `wrmsr` on switch,
    mirroring how AArch64 restores `TPIDR_EL0`.
-7. **`ioctl(TCGETS/TIOCGWINSZ)`** — a plausible `termios`/`winsize` so busybox
-   runs interactive rather than falling back.
 
 Reference the AArch64 impls for semantics, not reuse (they are behind
 `akuma-exec`/`akuma-bkl`, which do not build for `x86_64-unknown-none`):

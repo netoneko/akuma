@@ -88,6 +88,19 @@ pub fn read(id: PipeId, out: &mut [u8]) -> Option<usize> {
     }
 }
 
+/// Would a [`read`] return something other than `None` right now — data waiting
+/// or EOF to report? Non-destructive; for `poll(2)`.
+#[must_use]
+pub fn readable(id: PipeId) -> bool {
+    PIPES.lock().get(id).is_some_and(|s| s.pipe.is_readable())
+}
+
+/// Is there room for a [`write`] right now? Non-destructive; for `poll(2)`.
+#[must_use]
+pub fn writable(id: PipeId) -> bool {
+    PIPES.lock().get(id).is_some_and(|s| s.pipe.room() > 0)
+}
+
 /// Mark the producer's end closed. A reader that has drained the buffer then
 /// sees EOF rather than blocking forever.
 pub fn close_write(id: PipeId) {

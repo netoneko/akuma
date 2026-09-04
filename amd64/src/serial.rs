@@ -87,6 +87,15 @@ pub fn getb() -> Option<u8> {
     }
 }
 
+/// Is a byte waiting on the receive side? Non-destructive — for `poll(2)` on a
+/// console fd, where consuming the byte would lose it before the following
+/// `read`.
+#[must_use]
+pub fn has_byte() -> bool {
+    // SAFETY: one read of the 16550's line-status port, configured by `init`.
+    unsafe { inb(COM1 + LINE_STATUS) & LSR_DATA_READY != 0 }
+}
+
 pub fn puts(s: &str) {
     for &b in s.as_bytes() {
         if b == b'\n' {
