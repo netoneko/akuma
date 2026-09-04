@@ -1888,6 +1888,88 @@ first for the tap + dnsmasq + NAT. Firecracker auto-appends the
 probe finds it at slot 1 with no kernel change. Verified: `curl
 http://10.0.2.15:8080/` from the FC host reaches `httpd` on the guest.
 
+## 3.24 Stage R: `sshd` serves a session — `getrandom`, `fcntl`, and `spawn`
+
+`ssh root@<guest> 'echo hi'` returns `hi` and exit status 0, on **QEMU and
+Firecracker**. The full path works: SSH-2 key exchange, ed25519 pubkey auth
+against `/etc/sshd/authorized_keys`, then the shell (`paws`) started by
+`sys_spawn`, its stdout bridged back over the channel, its exit status reaped by
+`waitpid`.
+
+The handshake itself needed nothing new — `akuma-ssh-crypto` and `sshd` already
+build for `x86_64-unknown-none`, and the socket syscalls were done in Stage P.
+Three things stood between "listens" and "serves".
+
+### 3.24.1 `getrandom` and `fcntl`
+
+`sshd` generates its host key on first boot (`getrandom`), and its cooperative
+serve loop makes the listener and every accepted socket non-blocking
+(`fcntl(F_SETFL, O_NONBLOCK)`) so one session idling on its socket suspends
+instead of stalling its peers. Both were `ENOSYS`.
+
+`getrandom` routes to `net::rng_fill` — the `RDRAND` path, or the loud
+non-cryptographic fallback on a CPU without it (QEMU's default `microvm`).
+`fcntl` stores an `O_NONBLOCK` bit per descriptor that `sock`'s
+`accept`/`recv`/`send` now consult; `F_SETFD`/`FD_CLOEXEC` is accepted and
+ignored (no `exec`). `akuma-syscalls-abi` gained `Fcntl` (25 / 72) and
+`Getrandom` (278 / 318) — both numbers, round-trip tested, as the crate
+requires.
+
+`sshd` is a default-`fork-sessions` build; that feature needs `fork`, which this
+target does not have, so `amd64/mkdisk.sh` builds it
+`--no-default-features --features akuma` — the cooperative single-process
+executor, which is the `extreme-size` path and needs no `fork`.
+
+### 3.24.2 The stack was two pages
+
+`sshd`'s key exchange (`curve25519`, `ed25519`, AES) `#PF`'d within a few calls
+of `main` on the loader's 2-page (8 KiB) user stack — `cr2 == rsp`, a textbook
+overflow. The stack is eagerly allocated with no guard page and no growth
+policy, so it has to be sized for the *largest* program the loader runs:
+`ELF_STACK_PAGES` is 128 (512 KiB) now, and `MAX_PROC_FRAMES` 192 to cover
+image + that stack. A small program pays 512 KiB of zeroed frames it never
+touches — the price of not having demand paging for the stack.
+
+### 3.24.3 `sys_spawn`, the wall
+
+The Akuma-private `spawn` (301), `waitpid` (303) and `close_child_stdin` (326).
+`spawn` loads an ELF (the loader existed), builds its initial stack with the
+real argv (`sh -c "<cmd>"` — `build_stack` took only `argv0` before), gives the
+child a **stdin pipe and a stdout pipe**, runs it as a scheduler task in its own
+address space, and returns `pid | (stdout_fd << 32)` — the ABI `libakuma`
+already speaks. `sshd`'s `bridge_process` reads that `stdout_fd`, opens
+`/proc/<pid>/fd/0` for the child's stdin (the one procfs path this target
+answers), and polls `waitpid` each tick.
+
+fd 0/1/2 are routed per task: `UserCtx` gained a `proc_slot` field (offset 24,
+past everything `syscall_entry` indexes), and `sys_read(0)` / `sys_write(1)`
+check whether the running task is a spawned child with pipes before falling back
+to the console.
+
+The pipe buffer is a new leaf crate, **`akuma-pipe`** — a bounded `VecDeque<u8>`
+with a closable write end and the empty-vs-EOF rule, `#![forbid(unsafe_code)]`,
+host-tested. `akuma_syscalls_glue::pipe` is the real one and has the same shape
+plus a waker map, but does not build here (behind `akuma-exec`); `amd64/src/pipe.rs`
+is the `static` array + spinlock around the leaf. See
+`docs/archive/AMD64_CRATE_REUSE_AUDIT.md`.
+
+### 3.24.4 What this does not get
+
+* **No pty line discipline.** `SPAWN_FLAG_PTY` is accepted and ignored — an
+  interactive shell gets raw bytes over the pipe and does its own editing
+  (`paws` already does; this is `spawn_pty` behaving like `spawn`).
+* **No `fork`.** So `sshd`'s `fork-sessions` mode is out, and a shell pipeline
+  (`a | b`) inside the spawned shell cannot fork its own children — the child
+  ELF runs, and a nested `spawn` from it works, but `fork`+`exec` does not.
+* **Scheduler task slots do not recycle.** `waitpid` frees the child's `PROCS`
+  slot, its frames and both pipes, but not its `sched` task slot — so one
+  `sshd` boot serves ~13 commands before `spawn` returns `ENOMEM`. Task-slot
+  recycling is the fix and is a stage of its own.
+* **The global fd table** is still one table, not one per process (Stage O's
+  note). A spawned child and `sshd` share it; it works because fd 0/1/2 are
+  routed per task and the numbered fds each side holds do not collide in
+  practice.
+
 ## 4. What is deliberately missing
 
 Corrected 2026-09-04. This list was written at Stage B and went stale as the

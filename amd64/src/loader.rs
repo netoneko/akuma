@@ -378,54 +378,73 @@ pub fn load(
 /// kernel that maps a stack and sets `rsp` without building it has produced a
 /// program that runs and reads garbage — which is why `hello.rs` checks three of
 /// these fields and reports them in its exit status.
+/// The most argv entries the initial stack builder will place. A shell invoked
+/// as `sh -c "<cmd>"` needs three; a generous bound catches a runaway without a
+/// heap allocation on the spawn path.
+pub const MAX_ARGV: usize = 16;
+
 pub fn build_stack(
     space: &AddressSpace,
     frames: &mut FrameSet,
     top: u64,
     pages: usize,
-    argv0: &[u8],
+    argv: &[&[u8]],
     entry: u64,
 ) -> Result<u64, &'static str> {
     if !top.is_multiple_of(PAGE_SIZE as u64) || pages == 0 {
         return Err("stack top must be page aligned and at least one page");
     }
+    if argv.is_empty() || argv.len() > MAX_ARGV {
+        return Err("argv must hold 1..=MAX_ARGV entries");
+    }
     let bytes = (pages as u64) * PAGE_SIZE as u64;
     let base = top.checked_sub(bytes).ok_or("stack underflows the address space")?;
     map_range(space, frames, base, top, Prot::USER_RW)?;
 
-    // The argv[0] string sits at the very top, with its NUL. Rounded to 16 so
-    // the word block below it starts aligned without a second adjustment.
-    let str_len = align_up(argv0.len() as u64 + 1, 16);
-    let str_va = top - str_len;
+    // The argv strings sit at the very top, NUL-terminated, packed downward.
+    // `str_va[i]` is where argv[i]'s bytes land.
+    let mut str_va = [0u64; MAX_ARGV];
+    let mut cursor = top;
+    for (slot, a) in str_va.iter_mut().zip(argv) {
+        cursor -= a.len() as u64 + 1;
+        *slot = cursor;
+    }
+    // Round the whole string blob down to 16 so the word block below starts
+    // aligned without a second adjustment.
+    let strings_base = cursor & !0xf;
 
-    // argc, argv[0], argv NULL, envp NULL, three auxv pairs.
-    const WORDS: usize = 10;
-    let rsp = (str_va - (WORDS * 8) as u64) & !0xf;
+    // argc, one pointer per argv entry, argv NULL, envp NULL, three auxv pairs.
+    let words = 1 + argv.len() + 1 + 1 + 6;
+    let rsp = (strings_base - (words as u64) * 8) & !0xf;
     if rsp < base {
         return Err("initial stack frame does not fit");
     }
 
-    let mut buf = [0u8; WORDS * 8];
-    let words: [u64; WORDS] = [
-        1,          // argc
-        str_va,     // argv[0]
-        0,          // argv terminator
-        0,          // envp terminator
-        AT_PAGESZ,
-        PAGE_SIZE as u64,
-        AT_ENTRY,
-        entry,
-        AT_NULL,
-        0,
-    ];
-    for (i, w) in words.iter().enumerate() {
-        buf[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    // Assemble the word block on the kernel stack, then copy it in one shot.
+    let mut buf = [0u8; (1 + MAX_ARGV + 1 + 1 + 6) * 8];
+    let mut put = |slot: usize, v: u64| {
+        buf[slot * 8..slot * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    };
+    put(0, argv.len() as u64);
+    for (i, &va) in str_va.iter().take(argv.len()).enumerate() {
+        put(1 + i, va);
     }
+    put(1 + argv.len(), 0); // argv terminator
+    put(2 + argv.len(), 0); // envp terminator
+    let aux = 3 + argv.len();
+    put(aux, AT_PAGESZ);
+    put(aux + 1, PAGE_SIZE as u64);
+    put(aux + 2, AT_ENTRY);
+    put(aux + 3, entry);
+    put(aux + 4, AT_NULL);
+    put(aux + 5, 0);
 
-    if !write_user(space, str_va, argv0) || !write_user(space, str_va + argv0.len() as u64, &[0]) {
-        return Err("could not write argv[0]");
+    for (&va, a) in str_va.iter().zip(argv) {
+        if !write_user(space, va, a) || !write_user(space, va + a.len() as u64, &[0]) {
+            return Err("could not write argv");
+        }
     }
-    if !write_user(space, rsp, &buf) {
+    if !write_user(space, rsp, &buf[..words * 8]) {
         return Err("could not write the initial stack frame");
     }
     Ok(rsp)

@@ -71,6 +71,7 @@ dependencies = [
  "akuma-exec-core",
  "akuma-ext2",
  "akuma-net",
+ "akuma-pipe",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-ryzen-amd64",
@@ -384,6 +385,10 @@ version = "0.1.0"
 
 [[package]]
 name = "akuma-not-even-once"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-pipe"
 version = "0.1.0"
 
 [[package]]

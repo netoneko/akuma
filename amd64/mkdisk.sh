@@ -56,14 +56,22 @@ FDPROBE=$(find target/x86_64-unknown-none/release/build -name fdprobe.elf 2>/dev
 PAWS=""
 HTTPD=""
 SSHD=""
-for prog in paws httpd sshd; do
+for prog in paws httpd; do
     if (cd userspace && cargo build -q -p "$prog" --target x86_64-unknown-none --release 2>/dev/null); then
         found=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name "$prog" -type f | head -1)
         [ "$prog" = paws ] && PAWS="$found"
         [ "$prog" = httpd ] && HTTPD="$found"
-        [ "$prog" = sshd ] && SSHD="$found"
     fi
 done
+
+# sshd, WITHOUT `fork-sessions` (a default feature): this target has no `fork`,
+# so the cooperative single-process executor is the only one that runs. `akuma`
+# is kept — it is what pulls in `libakuma` and its `net-async` — but the default
+# set that also brings `fork-sessions` is dropped.
+if (cd userspace && cargo build -q -p sshd --no-default-features --features akuma \
+        --target x86_64-unknown-none --release 2>/dev/null); then
+    SSHD=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name sshd -type f | head -1)
+fi
 
 # A test keypair for `sshd`'s pubkey auth. Generated once into `target/` (which
 # is git-ignored) and reused, so `ssh -i` has a stable key. sshd generates its
@@ -107,6 +115,10 @@ if [ -n "$SSHD" ]; then
     if [ -f "$SSH_TEST_KEY.pub" ]; then
         "$DEBUGFS" -w -R "write $SSH_TEST_KEY.pub etc/sshd/authorized_keys" "$IMG" >/dev/null 2>&1
     fi
+    # The shell sshd starts in a session. `/bin/sh` is busybox on a devbox
+    # image; here the shell that builds for this target is `paws`.
+    printf 'shell = /bin/paws\n' > "$TMP/sshd.conf"
+    "$DEBUGFS" -w -R "write $TMP/sshd.conf etc/sshd/sshd.conf" "$IMG" >/dev/null 2>&1
 fi
 # Something for httpd to serve. httpd's document root is `/public`, and `GET /`
 # maps to `/public/index.html` — put it where httpd looks, not at the root.

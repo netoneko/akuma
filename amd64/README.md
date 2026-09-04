@@ -302,16 +302,19 @@ program that printed its verdict would have "passed" by running at all.
 
 ## What is deliberately missing
 
-- **No file syscalls.** The kernel reads files; ring 3 cannot. There is no
-  descriptor table and no `open`/`read`/`close`. That, plus a read path on the
-  16550 and a minimal `execve`, is what a serial-console shell needs — and it
-  needs neither `fork` nor sockets, which is why it is a much shorter road than
-  sshd.
-- **No writes**, and no mount table.
-- **No `spawn`.** Ring 3 cannot start a program. `httpd` serves because it never
-  needs to; `sshd` cannot open a shell in a session, and `paws` cannot run an
-  external command. This is the same `akuma-exec-core` gap, and the next thing to
-  build.
+- **No `fork`.** `sys_spawn` (Stage R) loads an ELF, wires its stdio to pipes
+  and runs it — enough for `sshd` to start a session shell and for `paws -c` to
+  run a command — but there is no `fork`/`exec` pair, so a shell pipeline inside
+  a spawned shell cannot fork its own children, and `sshd`'s `fork-sessions`
+  mode is out (the cooperative single-process build is what runs).
+- **No pty line discipline for a spawned shell.** `SPAWN_FLAG_PTY` is accepted
+  and ignored; an interactive `sshd` shell gets raw bytes over its stdin pipe
+  and does its own editing.
+- **Scheduler task slots do not recycle.** `waitpid` frees a reaped child's
+  process slot, frames and pipes, but not its `sched` task slot — so one `sshd`
+  boot serves ~13 commands before `spawn` returns `ENOMEM`.
+- **No writes to the filesystem**, and no mount table. `sshd` cannot persist its
+  host key (it regenerates each boot, which it tolerates).
 - **No device interrupts.** The block driver polls the used ring; the NIC would
   too. On the AArch64 side the NIC IRQ exists only to end the netpoll loop's
   `wfi` early, so it is an optimisation on top of that loop, not a prerequisite.

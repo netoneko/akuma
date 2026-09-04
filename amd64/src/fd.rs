@@ -86,6 +86,9 @@ pub mod errno {
     pub const EMFILE: u64 = (-24i64) as u64;
     pub const ENOTTY: u64 = (-25i64) as u64;
     pub const ENOSYS: u64 = (-38i64) as u64;
+    pub const ESRCH: u64 = (-3i64) as u64;
+    pub const EAGAIN: u64 = (-11i64) as u64;
+    pub const ENOMEM: u64 = (-12i64) as u64;
 }
 
 /// Descriptors 0, 1 and 2 are the console and are never in the table.
@@ -142,6 +145,76 @@ pub fn socket_index(fd: u64) -> Option<usize> {
     match table.get(idx as usize)? {
         Some(Entry { desc: FileDescriptor::Socket(s), .. }) => Some(*s),
         _ => None,
+    }
+}
+
+/// Give `pipe_id` a descriptor: `PipeRead` for a reader end, `PipeWrite` for a
+/// writer end. Used by `sys_spawn` (the parent's stdout reader) and
+/// `sys_openat`'s `/proc/<pid>/fd/0` (the parent's stdin writer).
+pub fn alloc_pipe_fd(pipe_id: usize, is_write: bool) -> Option<u64> {
+    let desc = if is_write {
+        FileDescriptor::PipeWrite(pipe_id as u32)
+    } else {
+        FileDescriptor::PipeRead(pipe_id as u32)
+    };
+    let mut table = TABLE.lock();
+    for (i, slot) in table.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(Entry { desc, data: Vec::new(), nonblocking: false });
+            return Some((i + FIRST_FILE_FD) as u64);
+        }
+    }
+    None
+}
+
+/// The pipe id behind `fd` if it is a `PipeRead` descriptor.
+#[must_use]
+pub fn pipe_read_id(fd: u64) -> Option<usize> {
+    let idx = fd.checked_sub(FIRST_FILE_FD as u64)?;
+    match TABLE.lock().get(idx as usize)? {
+        Some(Entry { desc: FileDescriptor::PipeRead(p), .. }) => Some(*p as usize),
+        _ => None,
+    }
+}
+
+/// The pipe id behind `fd` if it is a `PipeWrite` descriptor.
+#[must_use]
+pub fn pipe_write_id(fd: u64) -> Option<usize> {
+    let idx = fd.checked_sub(FIRST_FILE_FD as u64)?;
+    match TABLE.lock().get(idx as usize)? {
+        Some(Entry { desc: FileDescriptor::PipeWrite(p), .. }) => Some(*p as usize),
+        _ => None,
+    }
+}
+
+/// Read from a pipe, honouring `nonblock`. A blocking read yields until data or
+/// EOF — which is safe on this target only because a pipe reader is never also
+/// the pipe's writer (spawn wires them to different tasks).
+pub fn read_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
+    let mut tmp = alloc::vec![0u8; len.min(MAX_IO as usize)];
+    loop {
+        match crate::pipe::read(pipe_id, &mut tmp) {
+            Some(0) => return 0, // EOF
+            Some(n) => return copy_to_user(buf, &tmp[..n]) as u64,
+            None if nonblock => return errno::EAGAIN,
+            None => crate::sched::yield_now(),
+        }
+    }
+}
+
+/// Write to a pipe, honouring `nonblock`. A short write is returned as-is;
+/// `sshd`'s bridge carries the residue.
+pub fn write_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
+    let data = copy_in(buf, len as u64);
+    loop {
+        let n = crate::pipe::write(pipe_id, &data);
+        if n > 0 || data.is_empty() {
+            return n as u64;
+        }
+        if nonblock {
+            return errno::EAGAIN;
+        }
+        crate::sched::yield_now();
     }
 }
 
@@ -273,6 +346,23 @@ pub fn sys_openat(_dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     let Some(path) = path_from_user(path) else {
         return errno::EFAULT;
     };
+
+    // `/proc/<pid>/fd/0` — `sshd`'s bridge opens this to feed a spawned shell's
+    // stdin. It is the only procfs path this target answers; everything else
+    // under /proc is ENOENT.
+    if let Some(rest) = path.strip_prefix("/proc/") {
+        if let Some(pid_str) = rest.strip_suffix("/fd/0") {
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                return errno::ENOENT;
+            };
+            let Some(pipe_id) = crate::usermode::stdin_pipe_for_pid(pid) else {
+                return errno::ENOENT;
+            };
+            return alloc_pipe_fd(pipe_id, true).unwrap_or(errno::EMFILE);
+        }
+        return errno::ENOENT;
+    }
+
     let normalised = if path.starts_with('/') {
         path
     } else {
@@ -316,8 +406,15 @@ pub fn sys_close(fd: u64) -> u64 {
             _ => return errno::EBADF,
         }
     };
-    if let Some(Entry { desc: FileDescriptor::Socket(s), .. }) = taken {
-        crate::sock::close(s);
+    match taken {
+        Some(Entry { desc: FileDescriptor::Socket(s), .. }) => crate::sock::close(s),
+        // Closing the write end (the `/proc/<pid>/fd/0` handle) signals EOF to
+        // the child. Closing a read end just drops the fd — the pipe is freed
+        // when the child is reaped in `waitpid`.
+        Some(Entry { desc: FileDescriptor::PipeWrite(p), .. }) => {
+            crate::pipe::close_write(p as usize);
+        }
+        _ => {}
     }
     0
 }
@@ -337,6 +434,10 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     }
 
     if fd == 0 {
+        // A spawned child's stdin is a pipe, not the console — `sshd` feeds it.
+        if let Some(pid) = crate::usermode::current_stdin_pipe() {
+            return read_pipe(pid, buf, len as usize, false);
+        }
         return read_console(buf, len as usize) as u64;
     }
     if fd == 1 || fd == 2 {
@@ -348,6 +449,11 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     // blocking wait would stop every other task from opening a file.
     if let Some(sock) = socket_index(fd) {
         return crate::sock::recv(sock, buf, len, is_nonblocking(fd));
+    }
+
+    // A pipe descriptor — the parent's read end of a spawned child's stdout.
+    if let Some(pid) = pipe_read_id(fd) {
+        return read_pipe(pid, buf, len as usize, is_nonblocking(fd));
     }
 
     let idx = fd - FIRST_FILE_FD as u64;
@@ -391,6 +497,19 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
 pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
     if len == 0 {
         return 0;
+    }
+    // A spawned child (an interactive `sshd` shell) reads its keystrokes from
+    // its stdin pipe, which `sshd` feeds from the SSH channel — not the UART.
+    // Yield while waiting so `sshd` and the netpoll daemon keep running.
+    if let Some(pipe_id) = crate::usermode::current_stdin_pipe() {
+        let mut one = [0u8; 1];
+        loop {
+            match crate::pipe::read(pipe_id, &mut one) {
+                Some(0) => return 0, // EOF — the client closed the channel
+                Some(_) => return copy_to_user(buf, &one) as u64,
+                None => crate::sched::yield_now(),
+            }
+        }
     }
     loop {
         if let Some(b) = serial::getb() {

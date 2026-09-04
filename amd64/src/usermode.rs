@@ -108,12 +108,18 @@ pub struct UserCtx {
     pub user_rsp: u64,
     /// Non-zero when this task should leave ring 3. Offset 16.
     pub leave: u64,
+    /// The `PROCS` slot this task is running, or `usize::MAX` for a task that is
+    /// not an ELF process (the boot task). Offset 24 — past everything the
+    /// assembly indexes, so it is free to be an ordinary field. `sys_read` /
+    /// `sys_write` use it to route fd 0/1/2 to a spawned child's pipes instead
+    /// of the console.
+    pub proc_slot: usize,
 }
 
 impl UserCtx {
     #[must_use]
     pub const fn new() -> Self {
-        Self { kernel_rsp: 0, user_rsp: 0, leave: 0 }
+        Self { kernel_rsp: 0, user_rsp: 0, leave: 0, proc_slot: usize::MAX }
     }
 }
 
@@ -355,11 +361,17 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
     const AKUMA_PRIVATE_BASE: u64 = 0x1000;
     if nr >= AKUMA_PRIVATE_BASE {
         return match nr - AKUMA_PRIVATE_BASE {
+            // `spawn(path, argv, envp, stdin, stdin_len[, flags])` — the sixth
+            // argument (the PTY flag) is dropped by `syscall_entry` and this
+            // target ignores it anyway (a pipe has no line discipline).
+            301 => sys_spawn(a1, a2, a3, a4, a5),
             313 => crate::fd::sys_poll_input_event(a1, a2, a3),
-            // 302 `kill`, 303 `waitpid`, 301 `spawn` and the box family are not
-            // implemented here: this target has one process at a time and no
-            // `fork`. Returning ENOSYS is what makes `paws` report a command it
-            // cannot run rather than hanging on a child that never starts.
+            303 => sys_waitpid(a1, a2, a3),
+            326 => sys_close_child_stdin(a1),
+            // `kill` is accepted as a no-op success: `sshd` sends SIGHUP/SIGTERM
+            // to a session's shell on teardown, and there is nothing here to
+            // deliver a signal to, but failing the call makes it log an error.
+            302 => 0,
             _ => errno::ENOSYS,
         };
     }
@@ -465,8 +477,16 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     if let Some(sock) = crate::fd::socket_index(fd) {
         return crate::sock::send(sock, buf, len, crate::fd::is_nonblocking(fd));
     }
+    // An explicit pipe write end (a parent feeding a child's stdin).
+    if let Some(p) = crate::fd::pipe_write_id(fd) {
+        return crate::fd::write_pipe(p, buf, len as usize, crate::fd::is_nonblocking(fd));
+    }
     if fd != 1 && fd != 2 {
         return EBADF;
+    }
+    // A spawned child's stdout/stderr is a pipe `sshd` drains, not the console.
+    if let Some(p) = current_stdout_pipe() {
+        return crate::fd::write_pipe(p, buf, len as usize, false);
     }
     if len > MAX_WRITE {
         return EFAULT;
@@ -680,6 +700,16 @@ impl Process {
     /// Returns the process and what the loader found, so a caller can check the
     /// placement as well as the outcome.
     fn from_elf(image: &[u8]) -> Result<(Self, loader::LoadedImage), &'static str> {
+        Self::from_elf_argv(image, &[b"hello"])
+    }
+
+    /// As [`Self::from_elf`], with the argv the program sees on its initial
+    /// stack. `sys_spawn` passes the real one (`sh -c "<cmd>"`); the tests pass
+    /// a single element because `hello.rs` only checks `argv[0]`.
+    fn from_elf_argv(
+        image: &[u8],
+        argv: &[&[u8]],
+    ) -> Result<(Self, loader::LoadedImage), &'static str> {
         let space = paging::AddressSpace::new().ok_or("no frame for a PML4")?;
         let mut frames = FrameSet::new();
 
@@ -689,7 +719,7 @@ impl Process {
                 &mut frames,
                 ELF_STACK_TOP,
                 ELF_STACK_PAGES,
-                b"hello",
+                argv,
                 img.entry,
             )
             .map(|rsp| (img, rsp))
@@ -718,7 +748,16 @@ impl Process {
 ///
 /// `extern "C" fn() -> !` takes no arguments, so a task entry cannot be handed
 /// its process. A slot per process is the smallest thing that works on one core.
-static mut PROCS: [Option<Process>; 7] = [None, None, None, None, None, None, None];
+///
+/// Slots 0..=6 are the self-tests and `run_init`; slots [`SPAWN_SLOT_BASE`]..
+/// are for `sys_spawn`'d children (an `sshd` session's shell). 16 total leaves
+/// nine concurrent spawns, which is past what the cooperative `sshd` build
+/// serves.
+static mut PROCS: [Option<Process>; 16] = [const { None }; 16];
+
+/// First `PROCS` slot `sys_spawn` may use; everything below is the self-tests
+/// and `run_init`.
+pub const SPAWN_SLOT_BASE: usize = 7;
 
 /// Enter ring 3 for process `idx`, then mark the task finished.
 ///
@@ -738,35 +777,377 @@ fn run_process(idx: usize) -> ! {
         (*procs)[idx].as_ref().map(|p| (p.entry, p.stack))
     };
     if let Some((entry, stack)) = start {
+        // Tell the syscall path which process this is, so fd 0/1/2 route to
+        // this task's pipes (if it is a spawned child) rather than the console.
+        // SAFETY: single core; `CURRENT_UCTX` points at this task's own slot.
+        unsafe {
+            let cur = &raw const CURRENT_UCTX;
+            let uctx = *cur;
+            if !uctx.is_null() {
+                (*uctx).proc_slot = idx;
+            }
+        }
         // SAFETY: both are addresses the loader (or `Process::new`) mapped
         // user-accessible in the address space the scheduler installed for this
         // task, and every program this kernel runs ends in exit_group.
         let status = unsafe { enter_user_mode(entry, stack) };
         EXIT_STATUS.store(status, Ordering::Relaxed);
+        if idx >= SPAWN_SLOT_BASE {
+            spawn_record_exit(idx, status as i32);
+        }
     }
     crate::sched::finish();
 }
 
-extern "C" fn proc0_entry() -> ! {
-    run_process(0);
+macro_rules! proc_entries {
+    ($($name:ident => $idx:literal),* $(,)?) => {
+        $(extern "C" fn $name() -> ! { run_process($idx); })*
+    };
 }
-extern "C" fn proc1_entry() -> ! {
-    run_process(1);
+proc_entries! {
+    proc0_entry => 0, proc1_entry => 1, proc2_entry => 2, proc3_entry => 3,
+    proc4_entry => 4, proc5_entry => 5, proc6_entry => 6, proc7_entry => 7,
+    proc8_entry => 8, proc9_entry => 9, proc10_entry => 10, proc11_entry => 11,
+    proc12_entry => 12, proc13_entry => 13, proc14_entry => 14, proc15_entry => 15,
 }
-extern "C" fn proc2_entry() -> ! {
-    run_process(2);
+
+/// The task entry function for `PROCS` slot `idx`. `sys_spawn` needs to hand
+/// `sched::spawn_in_space` a plain `fn` pointer and the slot is baked into each.
+pub fn proc_entry_for(idx: usize) -> Option<extern "C" fn() -> !> {
+    Some(match idx {
+        7 => proc7_entry,
+        8 => proc8_entry,
+        9 => proc9_entry,
+        10 => proc10_entry,
+        11 => proc11_entry,
+        12 => proc12_entry,
+        13 => proc13_entry,
+        14 => proc14_entry,
+        15 => proc15_entry,
+        _ => return None,
+    })
 }
-extern "C" fn proc3_entry() -> ! {
-    run_process(3);
+
+// ===========================================================================
+// Stage R: sys_spawn, a process table with pids, and waitpid
+// ===========================================================================
+//
+// `sshd` authenticates a session and then calls `spawn`/`spawn_pty` to start a
+// shell, bridging the child's stdout back to the SSH channel and the client's
+// keystrokes forward to its stdin. This is the amd64 half of that: load an ELF
+// (the loader already exists), give the child a stdout pipe and a stdin pipe,
+// run it as a scheduler task, and hand `sshd` back a pid plus a descriptor that
+// reads the stdout pipe. `waitpid` reports the exit status; `/proc/<pid>/fd/0`
+// (in `fd::sys_openat`) resolves to the stdin pipe's write end, which is how
+// `sshd`'s `bridge_process` feeds the shell.
+//
+// No `fork`, no per-process fd table, no real process hierarchy — one spawn per
+// `SPAWN` slot, and fd 0/1/2 are routed per task through `UserCtx::proc_slot`.
+
+use crate::pipe::{self, PipeId};
+
+/// One spawned child. Indexed by `proc_slot - SPAWN_SLOT_BASE`.
+struct Spawn {
+    pid: u32,
+    /// The child writes fd 1/2 here; the parent's `stdout_fd` reads it.
+    stdout_pipe: PipeId,
+    /// The child reads fd 0 here; `/proc/<pid>/fd/0` writes it.
+    stdin_pipe: PipeId,
+    /// `Some` once the child has left ring 3. `waitpid` consumes it and frees
+    /// the slot and both pipes.
+    exit: Option<i32>,
 }
-extern "C" fn proc4_entry() -> ! {
-    run_process(4);
+
+const SPAWN_SLOTS: usize = 16 - SPAWN_SLOT_BASE;
+
+/// The spawn table. `static mut` reached through raw pointers on one core, same
+/// discipline as `PROCS`: the only writers run inside a syscall (non-preemptible
+/// on this target) and none of them yield while touching it.
+static mut SPAWN: [Option<Spawn>; SPAWN_SLOTS] = [const { None }; SPAWN_SLOTS];
+
+/// Next pid to hand out. `sshd` itself is pid 1 (`Getpid` returns 1), so
+/// children start at 2.
+static NEXT_PID: AtomicU64 = AtomicU64::new(2);
+
+fn spawn_table() -> *mut [Option<Spawn>; SPAWN_SLOTS] {
+    &raw mut SPAWN
 }
-extern "C" fn proc5_entry() -> ! {
-    run_process(5);
+
+/// Read a NUL-terminated string from user memory, bounded.
+fn user_cstr(ptr: u64, max: usize) -> Option<alloc::vec::Vec<u8>> {
+    if ptr == 0 {
+        return None;
+    }
+    let mut out = alloc::vec::Vec::new();
+    for i in 0..max {
+        // SAFETY: the same user-pointer contract as every other access on this
+        // target — `CR4.SMAP` is off, and a bad pointer faults reportably.
+        let b = unsafe { (ptr as *const u8).add(i).read_volatile() };
+        if b == 0 {
+            return Some(out);
+        }
+        out.push(b);
+    }
+    None
 }
-extern "C" fn proc6_entry() -> ! {
-    run_process(6);
+
+/// Parse a NULL-terminated array of C-string pointers into owned bytes.
+fn user_argv(ptr: u64) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+    let mut argv = alloc::vec::Vec::new();
+    if ptr == 0 {
+        return argv;
+    }
+    for i in 0..loader::MAX_ARGV {
+        // SAFETY: as `user_cstr`; the array is the caller's and NULL-terminated.
+        let p = unsafe { (ptr as *const u64).add(i).read_volatile() };
+        if p == 0 {
+            break;
+        }
+        match user_cstr(p, 512) {
+            Some(s) => argv.push(s),
+            None => break,
+        }
+    }
+    argv
+}
+
+/// `spawn(path, argv, envp, stdin, stdin_len, flags)` — Akuma's own syscall 301.
+///
+/// Returns `pid | (stdout_fd << 32)` on success, or a negative errno. `flags`
+/// bit 0 (`SPAWN_FLAG_PTY`) is accepted and currently ignored: this target has
+/// no pty line discipline for a pipe, so an interactive shell gets raw bytes
+/// and does its own editing (`paws` already does).
+pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin_len: u64) -> u64 {
+    use crate::fd::errno;
+
+    let Some(path_bytes) = user_cstr(path_ptr, 256) else {
+        return errno::EFAULT;
+    };
+    let Ok(path) = core::str::from_utf8(&path_bytes) else {
+        return errno::EINVAL;
+    };
+
+    let Some(image) = crate::fs::read_file(path) else {
+        return errno::ENOENT;
+    };
+
+    // argv[0] defaults to the path if the caller passed none.
+    let argv_owned = {
+        let mut v = user_argv(argv_ptr);
+        if v.is_empty() {
+            v.push(path_bytes.clone());
+        }
+        v
+    };
+    let argv_refs: alloc::vec::Vec<&[u8]> =
+        argv_owned.iter().map(alloc::vec::Vec::as_slice).collect();
+
+    // A free PROCS slot in the spawn range.
+    let slot = {
+        // SAFETY: raw-pointer read; single core.
+        let procs = unsafe {
+            let p = &raw const PROCS;
+            &*p
+        };
+        (SPAWN_SLOT_BASE..16).find(|&s| procs[s].is_none())
+    };
+    let Some(slot) = slot else {
+        return errno::ENOMEM;
+    };
+
+    let (proc, _img) = match Process::from_elf_argv(&image, &argv_refs) {
+        Ok(p) => p,
+        Err(e) => {
+            serial::puts("  [spawn] load failed: ");
+            serial::puts(e);
+            serial::puts("\n");
+            return errno::ENOMEM;
+        }
+    };
+
+    let (Some(stdout_pipe), Some(stdin_pipe)) = (pipe::alloc(), pipe::alloc()) else {
+        proc.free();
+        return errno::ENOMEM;
+    };
+
+    // Seed the child's stdin, if the caller supplied any (`spawn_with_stdin`).
+    if stdin_ptr != 0 && stdin_len != 0 {
+        let seed = crate::fd::copy_in(stdin_ptr, stdin_len.min(64 * 1024));
+        pipe::write(stdin_pipe, &seed);
+    }
+
+    let root = proc.space.root();
+    // SAFETY: raw-pointer write; single core, slot was just found free.
+    unsafe {
+        let procs = &raw mut PROCS;
+        (*procs)[slot] = Some(proc);
+    }
+
+    let Some(entry) = proc_entry_for(slot) else {
+        cleanup_spawn_slot(slot, stdout_pipe, stdin_pipe);
+        return errno::ENOMEM;
+    };
+    if crate::sched::spawn_in_space(entry, root).is_none() {
+        cleanup_spawn_slot(slot, stdout_pipe, stdin_pipe);
+        return errno::ENOMEM;
+    }
+
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32;
+    // SAFETY: raw-pointer write; single core.
+    unsafe {
+        (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
+            pid,
+            stdout_pipe,
+            stdin_pipe,
+            exit: None,
+        });
+    }
+
+    let stdout_fd = crate::fd::alloc_pipe_fd(stdout_pipe, false);
+    let Some(stdout_fd) = stdout_fd else {
+        // The child is already running; it will just write into a pipe nobody
+        // reads. Report the failure — `sshd` drops the session.
+        return errno::EMFILE;
+    };
+
+    u64::from(pid) | (stdout_fd << 32)
+}
+
+fn cleanup_spawn_slot(slot: usize, stdout_pipe: PipeId, stdin_pipe: PipeId) {
+    pipe::free(stdout_pipe);
+    pipe::free(stdin_pipe);
+    // SAFETY: raw-pointer access; single core. The task was never spawned (or
+    // failed to), so nothing else touches this slot.
+    unsafe {
+        let procs = &raw mut PROCS;
+        if let Some(p) = (*procs)[slot].take() {
+            p.free();
+        }
+    }
+}
+
+/// Called from `run_process` when a spawned child leaves ring 3.
+pub fn spawn_record_exit(proc_slot: usize, status: i32) {
+    // SAFETY: raw-pointer access; single core.
+    unsafe {
+        if let Some(Some(s)) = (*spawn_table()).get_mut(proc_slot - SPAWN_SLOT_BASE) {
+            s.exit = Some(status);
+            pipe::close_write(s.stdout_pipe);
+        }
+    }
+}
+
+/// The stdin/stdout pipe a task running `PROCS` slot `proc_slot` reads/writes as
+/// fd 0 / fd 1. `None` for a task that is not a spawned child (fd 0/1/2 are the
+/// console).
+fn spawn_stdio(proc_slot: usize) -> Option<(PipeId, PipeId)> {
+    if proc_slot < SPAWN_SLOT_BASE {
+        return None;
+    }
+    // SAFETY: raw-pointer read; single core.
+    unsafe {
+        (*spawn_table())
+            .get(proc_slot - SPAWN_SLOT_BASE)?
+            .as_ref()
+            .map(|s| (s.stdin_pipe, s.stdout_pipe))
+    }
+}
+
+/// fd 0 for the current task: its stdin pipe, if it is a spawned child.
+pub fn current_stdin_pipe() -> Option<PipeId> {
+    spawn_stdio(current_proc_slot()).map(|(stdin, _)| stdin)
+}
+
+/// fd 1/2 for the current task: its stdout pipe, if it is a spawned child.
+pub fn current_stdout_pipe() -> Option<PipeId> {
+    spawn_stdio(current_proc_slot()).map(|(_, stdout)| stdout)
+}
+
+fn current_proc_slot() -> usize {
+    // SAFETY: single core; `CURRENT_UCTX` points at the running task's slot.
+    unsafe {
+        let cur = &raw const CURRENT_UCTX;
+        let uctx = *cur;
+        if uctx.is_null() {
+            usize::MAX
+        } else {
+            (*uctx).proc_slot
+        }
+    }
+}
+
+/// The stdin pipe write end for pid `pid`, for `fd::sys_openat`'s
+/// `/proc/<pid>/fd/0` handling.
+pub fn stdin_pipe_for_pid(pid: u32) -> Option<PipeId> {
+    // SAFETY: raw-pointer read; single core.
+    unsafe {
+        (*spawn_table())
+            .iter()
+            .flatten()
+            .find(|s| s.pid == pid)
+            .map(|s| s.stdin_pipe)
+    }
+}
+
+/// `close_child_stdin(pid)` — Akuma's syscall 326. `sshd` calls it when the
+/// client sends EOF on the channel, so the shell sees end-of-input.
+pub fn sys_close_child_stdin(pid: u64) -> u64 {
+    match stdin_pipe_for_pid(pid as u32) {
+        Some(p) => {
+            pipe::close_write(p);
+            0
+        }
+        None => crate::fd::errno::ESRCH,
+    }
+}
+
+/// `waitpid(pid, status_ptr, options)` — Akuma's syscall 303.
+///
+/// Non-blocking regardless of `options`: `sshd`'s bridge polls it every tick and
+/// must keep draining the child's stdout while it waits. Returns `pid` and
+/// writes the wait status (`exit_code << 8`) once the child has exited, `0`
+/// while it is still running, `-ESRCH` for an unknown pid.
+pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
+    use crate::fd::errno;
+    let pid = pid as u32;
+
+    // SAFETY: raw-pointer access; single core.
+    let slot_off = unsafe {
+        (*spawn_table())
+            .iter()
+            .position(|e| e.as_ref().is_some_and(|s| s.pid == pid))
+    };
+    let Some(slot_off) = slot_off else {
+        return errno::ESRCH;
+    };
+    // SAFETY: as above; `slot_off` is in bounds and occupied.
+    let s = unsafe { (*spawn_table())[slot_off].as_ref().unwrap() };
+    let (exit, stdout_pipe, stdin_pipe) = (s.exit, s.stdout_pipe, s.stdin_pipe);
+
+    let Some(code) = exit else {
+        return 0; // still running
+    };
+
+    if status_ptr != 0 {
+        let raw = ((u64::from((code as u32) & 0xff)) << 8) as i32;
+        // SAFETY: a user pointer to an int, per the wait(2) ABI.
+        unsafe { (status_ptr as *mut i32).write_volatile(raw) };
+    }
+
+    // Reap: free both pipes, the SPAWN entry, and the child's PROCS slot (its
+    // frames), so a long-lived `sshd` does not run out of any of them.
+    pipe::free(stdout_pipe);
+    pipe::free(stdin_pipe);
+    // SAFETY: raw-pointer access; single core. The child task is Finished — it
+    // called `sched::finish()` in `run_process` after recording its exit.
+    unsafe {
+        (*spawn_table())[slot_off] = None;
+        let procs = &raw mut PROCS;
+        if let Some(p) = (*procs)[SPAWN_SLOT_BASE + slot_off].take() {
+            p.free();
+        }
+    }
+    u64::from(pid)
 }
 
 /// Run two isolated processes concurrently and prove they interleave.

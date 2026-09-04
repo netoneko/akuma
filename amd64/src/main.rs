@@ -70,6 +70,8 @@ mod paging;
 #[cfg(target_arch = "x86_64")]
 mod phys;
 #[cfg(target_arch = "x86_64")]
+mod pipe;
+#[cfg(target_arch = "x86_64")]
 mod port;
 #[cfg(target_arch = "x86_64")]
 mod sched;

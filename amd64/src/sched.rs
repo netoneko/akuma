@@ -56,17 +56,19 @@ const STACK_SIZE: usize = 32 * 1024;
 /// stage landed — the symptom was `spawn` returning `None` after every earlier
 /// test had passed.
 ///
-/// Stage Q added the netpoll daemon (one slot, spawned for the whole run) and
-/// leaves headroom for the tasks an authenticated `sshd` session forks off, so
-/// this grew again — same symptom if it is too small, same fix deferred for the
-/// same reason.
+/// Stage Q added the netpoll daemon (one slot, whole run); Stage R added
+/// `sys_spawn`, and each `sshd` session that runs a command takes another slot.
+/// `sys_waitpid` recycles the child's `PROCS` slot and its frames, but **not**
+/// its scheduler task slot — so this is now the cap on how many commands one
+/// `sshd` boot can serve (~13 after the self-tests). Recycling task slots is
+/// the fix and is deliberately still not here.
 ///
 /// The right fix is recycling, and it is deliberately not this: a slot cannot
 /// be reused until its two 32 KiB stacks can be, and reclaiming those needs the
 /// scheduler to know a task's stack is no longer in use by any frame — which is
 /// a different stage. Growing the table is honest about being a bound on the
 /// boot's total task count.
-const MAX_TASKS: usize = 16;
+const MAX_TASKS: usize = 24;
 
 core::arch::global_asm!(
     r#"

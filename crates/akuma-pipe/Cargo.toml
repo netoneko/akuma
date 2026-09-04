@@ -1,0 +1,10 @@
+[package]
+name = "akuma-pipe"
+version = "0.1.0"
+edition = "2024"
+description = "The pure byte-FIFO half of a kernel pipe: buffer, cap, closable write end, EOF rule."
+
+[lints]
+workspace = true
+
+[dependencies]
