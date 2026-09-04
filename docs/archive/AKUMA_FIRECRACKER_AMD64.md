@@ -2045,11 +2045,23 @@ standalone.
 
 ## 3.26 Stage T: `busybox sh -c "<cmd>"` runs a command
 
-The ordered list, from the Stage-S `strace`. Step 1 (path `stat`) and step 2's
-`execve` are done (2026-09-04), plus `open`/`access`/`ioctl`/`poll` that a real
-shell needed behind them — enough that `ssh host '<cmd>'` runs a single command
-and an interactive `busybox sh` shows a prompt and runs its builtins. `fork` and
-the rest are still ahead.
+The ordered list, from the Stage-S `strace`. Steps 1–3 are done (2026-09-04):
+path `stat`, `execve`, and **`fork`** (+ `wait4`, per-task `%fs`, and
+`open`/`access`/`ioctl`/`poll` a real shell needed along the way).
+
+**As of 2026-09-04, an interactive `busybox sh` over SSH on the Ryzen /
+Firecracker box runs external commands:**
+
+```
+$ ssh root@10.0.2.15
+/ # uname -a
+Akuma akuma 0.1.0-amd64 Akuma/amd64 (x86_64 bring-up) x86_64 GNU/Linux
+/ # echo hi-from-shell
+hi-from-shell
+```
+
+`ls` still fails (`getdents64`, step 5). 166 self-tests green on QEMU and
+Firecracker.
 
 ### 3.26.1 Step 1 — path `stat` (done)
 
@@ -2154,26 +2166,62 @@ shell tripped over it:
   has no calibrated clock.
 
 With these, an interactive `busybox sh` over SSH shows its prompt, edits a line,
-and runs its builtins (`pwd`, `cd`, `echo`, `exit`). External commands still
-need `fork`.
+and runs its builtins (`pwd`, `cd`, `echo`, `exit`).
 
-### 3.26.4 Still ahead
+### 3.26.4 Step 3 — `fork` + `wait4` + per-task `%fs` (done)
 
-3. **`fork`/`vfork` (57/58) + `wait4` (61).** Interactive `busybox sh` forks for
-   **every** external command, and pipelines (`a | b`) and command sequences
-   (`a; b`) fork too. No CoW here; `vfork`+`execve` (share the address space
-   until `exec`) is the shorter road. Route Linux `wait4` (61) into the
-   Akuma-private `waitpid` (303) spawn table — but `sys_waitpid` is non-blocking
-   (returns 0 while the child runs) and a forked shell expects `wait4(pid, &st,
-   0, 0)` to block, so the routing needs a wait loop, not a passthrough.
+`fork` (57), `vfork` (58) and `clone(SIGCHLD, 0)` (56) all land in `sys_fork`,
+which does a **real eager copy** of the parent's address space — every user leaf
+walked (`paging::for_each_user_leaf`), a fresh frame allocated and the page
+copied, mapped at the same VA with the same permissions. **No CoW** (no per-page
+refcount, no write-fault handler wired to one): the copy is thrown away
+microseconds later by the child's `execve`, which is wasteful and correct. The
+first plan — `vfork` semantics, child shares the parent's address space, parent
+suspended until `execve` — died on two rocks, each worth recording:
+
+1. **The child needs the parent's whole register set, not just `rip`/`rsp`.**
+   The C compiler keeps live values in `r12`–`r15`/`rbx` across the `syscall`
+   (the Linux ABI preserves them), and `busybox`'s post-`fork` code read
+   `[r13 + 0x21]` with `r13 == 0` — a `#PF` at `cr2 = 0x21`. Fixed by
+   `syscall_entry` snapshotting all twelve preserved registers into
+   `UserCtx::saved_regs` on every syscall, and `enter_user_mode_forked`
+   restoring them for the child.
+2. **The shared user stack cannot survive the child's function calls.** After
+   `fork()` returns, `busybox` calls `execvp()` — a real call that pushes into
+   and scribbles the parent's stack frames (`_Fork`'s, `fork`'s). The parent
+   then `ret`s through a clobbered return address into `.rodata` — a `#UD`.
+   Real `vfork` forbids exactly this; `busybox` uses `fork`, not `vfork`, and
+   assumes an independent stack. Only a real address-space copy gives it one.
+
+Alongside `fork`:
+
+- **per-task `%fs` base.** `IA32_FS_BASE` is one CPU-global register and
+  `arch_prctl(ARCH_SET_FS)` its only writer, so a forked child that `execve`s
+  (and re-`arch_prctl`s) leaves the **parent** running on the child's TLS base —
+  another tiny-offset `#PF`. `arch_prctl` now records the base in
+  `UserCtx::fs_base`, the scheduler `wrmsr`s it on switch, and a `fork` child
+  inherits the parent's. This is the amd64 mirror of AArch64 restoring
+  `TPIDR_EL0`, and it stopped being optional the moment two user tasks were
+  runnable at once.
+- **`wait4` (61)** routes into the Akuma-private `waitpid` (303) spawn table but
+  **blocks** (yield loop) unless `WNOHANG`, and accepts `pid == -1` / `0` as
+  "any child" — a forked shell calls `wait4(pid, &st, 0, 0)` and expects to
+  sleep. `sys_waitpid` alone just returns 0 while the child runs.
+
+The child is a normal `Spawn` with `borrowed_io` — it shares the parent shell's
+stdout pipe (so a forked `uname`'s output reaches the SSH channel) and its
+teardown leaves those pipes for the parent. Gate: `usermode::fork_test` runs
+`sh -c "uname; echo DONE"` (the `;` forces the fork), checks both the forked
+child's output and the parent's later builtin come back, and that nothing leaks.
+
+### 3.26.5 Still ahead
+
 4. **`pipe2` (293), `dup2`/`dup3` (33/292).** `akuma-pipe` + `alloc_pipe_fd`
-   are the pieces; wire `sys_pipe2`.
+   are the pieces; wire `sys_pipe2`. Needed for pipelines (`a | b`) — and a
+   two-child pipeline also needs both `fork` copies live at once, near the
+   `MAX_PROC_FRAMES` ceiling.
 5. **`getdents64` (217)** — `ls`. `akuma-vfs`'s `read_dir` is already used by
    `src/fs.rs`; still `ENOSYS`, so `ls` reports "can't open".
-6. **`arch_prctl` per-task `FS_BASE` save/restore in `sched.rs`** — load-bearing
-   once the shell and a forked child are both runnable. A `UserCtx` field
-   (offset ≥ 32, past what `syscall_entry` indexes), `wrmsr` on switch,
-   mirroring how AArch64 restores `TPIDR_EL0`.
 
 Reference the AArch64 impls for semantics, not reuse (they are behind
 `akuma-exec`/`akuma-bkl`, which do not build for `x86_64-unknown-none`):
@@ -2187,10 +2235,14 @@ a PATH and an environment.
 
 **Two debts not to grow:** `amd64/src/` has never had the allocation audit
 (§3.24.5 — fixed buffers, not `Vec`, on every new syscall path — `sys_execve`
-adds more `Vec`-per-argv on the spawn path); and `loader::MAX_PROC_FRAMES` is a
-`[usize; 512]`-per-`Process` fixed array a region list should replace (which
-also unblocks real `mprotect`, demand paging, and would have made
-`mm::release_anon_frames` unnecessary).
+and `sys_fork` add more `Vec`-per-argv / per-syscall work on the spawn path);
+and `loader::MAX_PROC_FRAMES` is a `[usize; 512]`-per-`Process` fixed array a
+region list should replace. `fork` made the second one **load-bearing** rather
+than merely wasteful — an eager copy needs one frame per mapped user page, so a
+program near the ceiling (busybox is ~400) makes `fork` return `ENOMEM` and the
+shell prints `can't fork`. A CoW fork (the region list plus a write-fault
+handler) removes both the copy and the ceiling pressure, and would also have
+made `mm::release_anon_frames` unnecessary.
 
 ## 4. What is deliberately missing
 

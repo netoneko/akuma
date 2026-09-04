@@ -96,8 +96,8 @@ const HELLO_ELF: &[u8] = include_bytes!(env!("USER_HELLO_ELF"));
 /// globals until multitasking made that wrong — a syscall taken by one process
 /// would have written another's saved stack pointer.
 /// Field offsets are load-bearing: `syscall_entry` indexes this by hand as
-/// `[rax + 0]`, `[rax + 8]` and `[rax + 16]`. Reordering the fields silently
-/// changes what that assembly reads.
+/// `[rax + 0]`, `[rax + 8]`, `[rax + 16]` and `[rax + 32]`. Reordering the
+/// fields silently changes what that assembly reads.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct UserCtx {
@@ -114,12 +114,37 @@ pub struct UserCtx {
     /// `sys_write` use it to route fd 0/1/2 to a spawned child's pipes instead
     /// of the console.
     pub proc_slot: usize,
+    /// The user instruction pointer captured on syscall entry — the address the
+    /// `syscall` will return to. Offset 32. `syscall_entry` writes it (as
+    /// `[rax + 32]`) so `sys_fork` can hand a child task the exact point the
+    /// parent will resume from, which is what makes `vfork` "return twice".
+    pub user_rip: u64,
+    /// This task's `%fs` base (musl's TLS pointer). Offset 40 — not indexed by
+    /// assembly. `arch_prctl(ARCH_SET_FS)` records it here and the scheduler
+    /// `wrmsr`s it back on switch, because `IA32_FS_BASE` is one CPU-global
+    /// register and two user tasks (a shell and the child it forked) each need
+    /// their own. `0` means "never set" — the scheduler leaves the MSR alone.
+    pub fs_base: u64,
+    /// The user register set captured on every syscall entry, in the order
+    /// `syscall_entry` writes it (offset 48):
+    /// `[rdi, rsi, rdx, r10, r8, r9, rbx, rbp, r12, r13, r14, r15]`.
+    /// `sys_fork` copies this into the child so it resumes as a true
+    /// full-register copy of the parent — see `enter_user_mode_forked`.
+    pub saved_regs: [u64; 12],
 }
 
 impl UserCtx {
     #[must_use]
     pub const fn new() -> Self {
-        Self { kernel_rsp: 0, user_rsp: 0, leave: 0, proc_slot: usize::MAX }
+        Self {
+            kernel_rsp: 0,
+            user_rsp: 0,
+            leave: 0,
+            proc_slot: usize::MAX,
+            user_rip: 0,
+            fs_base: 0,
+            saved_regs: [0; 12],
+        }
     }
 }
 
@@ -176,6 +201,25 @@ syscall_entry:
     mov [rip + SYSCALL_SCRATCH], rax
     mov rax, [rip + CURRENT_UCTX]
     mov [rax + 8], rsp              /* uctx.user_rsp   = user rsp   */
+    mov [rax + 32], rcx             /* uctx.user_rip   = return addr (for vfork) */
+    /* Full user register snapshot into uctx.saved_regs[12] (offset 48). Every
+     * register the Linux syscall ABI preserves across `syscall` is still the
+     * caller's here — `vfork` hands this exact set to the child so it resumes
+     * as a true copy of the parent's context, not with garbage in r12-r15/rbx
+     * that a C compiler assumed survived the call. rax (the nr) and rcx/r11
+     * (clobbered by `syscall` itself) are not in the set. */
+    mov [rax + 48], rdi
+    mov [rax + 56], rsi
+    mov [rax + 64], rdx
+    mov [rax + 72], r10
+    mov [rax + 80], r8
+    mov [rax + 88], r9
+    mov [rax + 96], rbx
+    mov [rax + 104], rbp
+    mov [rax + 112], r12
+    mov [rax + 120], r13
+    mov [rax + 128], r14
+    mov [rax + 136], r15
     mov rsp, [rax + 0]              /* kernel stack    = uctx.kernel_rsp */
     mov rax, [rip + SYSCALL_SCRATCH]
 
@@ -279,7 +323,10 @@ syscall_entry:
 
 .global enter_user_mode
 enter_user_mode:
-    /* rdi = user rip, rsi = user rsp. Returns when userspace exits. */
+    /* rdi = user rip, rsi = user rsp, rdx = rax to enter ring 3 with. Returns
+     * when userspace exits. The rdx value is 0 for a fresh program (_start
+     * ignores rax) and 0 for a `vfork` child too — that 0 is what the child
+     * sees as `vfork`'s return value. */
     push rbp
     push rbx
     push r12
@@ -301,6 +348,47 @@ enter_user_mode:
     mov rcx, rdi                    /* sysret takes rip from rcx */
     mov r11, 0x202                  /* ...and rflags from r11: IF set, bit 1 reserved-1 */
     mov rsp, rsi                    /* user stack */
+    mov rax, rdx                    /* ring-3 entry rax (vfork child return value) */
+    sysretq
+
+.global enter_user_mode_forked
+enter_user_mode_forked:
+    /* rdi = user rip, rsi = user rsp. Enter ring 3 as a `vfork` child: a
+     * full-register copy of the parent's context at its `syscall` (read from
+     * this task's own uctx.saved_regs, which `sys_fork` filled from the
+     * parent), with rax = 0 (the child's `vfork` return value). Returns to the
+     * caller when the child leaves ring 3, exactly like `enter_user_mode`. */
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rax, [rip + CURRENT_UCTX]  /* rax = this task's uctx, kept until the end */
+    mov [rax + 0], rsp             /* publish this task's kernel stack */
+    mov qword ptr [rax + 16], 0    /* clear the leave flag */
+
+    mov rcx, rdi                   /* sysret rip */
+    mov r11, 0x202                 /* sysret rflags */
+
+    /* Restore the parent's register set from uctx.saved_regs (offset 48):
+     * [rdi, rsi, rdx, r10, r8, r9, rbx, rbp, r12, r13, r14, r15]. rsi (the
+     * user stack) and rax (the uctx pointer) are consumed last. */
+    mov rbp, [rax + 104]
+    mov r12, [rax + 112]
+    mov r13, [rax + 120]
+    mov r14, [rax + 128]
+    mov r15, [rax + 136]
+    mov r8,  [rax + 80]
+    mov r9,  [rax + 88]
+    mov r10, [rax + 72]
+    mov rdi, [rax + 48]
+    mov rbx, [rax + 96]
+    mov rdx, [rax + 64]
+    mov rsp, rsi                   /* user stack (before rsi is reloaded) */
+    mov rsi, [rax + 56]
+    xor eax, eax                   /* child sees vfork() == 0 */
     sysretq
 
     .section .bss
@@ -311,13 +399,23 @@ SYSCALL_SCRATCH:
 );
 
 unsafe extern "C" {
-    /// Drop to ring 3 at `rip` with stack `rsp`; returns when userspace calls
-    /// syscall 0.
+    /// Drop to ring 3 at `rip` with stack `rsp` and `rax = entry_rax`; returns
+    /// when userspace calls syscall 0. `entry_rax` is 0 for a fresh program and
+    /// 0 for a `vfork` child (the value it sees returned from `vfork`).
     ///
     /// # Safety
     /// `rip` must point at a page mapped user-executable and `rsp` at a page
     /// mapped user-writable, both in the address space that is live.
-    fn enter_user_mode(rip: u64, rsp: u64) -> u64;
+    fn enter_user_mode(rip: u64, rsp: u64, entry_rax: u64) -> u64;
+    /// Enter ring 3 as a `vfork` child — a full-register copy of the parent at
+    /// its `syscall`, `rax = 0`. Reads the register set from the running task's
+    /// `UserCtx::saved_regs`, which [`sys_fork`] populated. Returns when the
+    /// child leaves ring 3.
+    ///
+    /// # Safety
+    /// As [`enter_user_mode`], and the running task's `saved_regs` must hold the
+    /// parent's snapshot.
+    fn enter_user_mode_forked(rip: u64, rsp: u64) -> u64;
     fn syscall_entry();
 }
 
@@ -341,6 +439,15 @@ fn rdmsr(msr: u32) -> u64 {
                          options(nomem, nostack, preserves_flags));
     }
     (u64::from(hi) << 32) | u64::from(lo)
+}
+
+/// Load `%fs` base (`IA32_FS_BASE`) — the scheduler calls this to restore an
+/// incoming task's TLS pointer (`UserCtx::fs_base`). See `sys_arch_prctl`.
+pub fn set_fs_base(base: u64) {
+    const IA32_FS_BASE: u32 = 0xC000_0100;
+    // SAFETY: a linear address for `%fs:` accesses; a bad one only faults the
+    // task's own TLS reads, exactly as on Linux.
+    unsafe { wrmsr(IA32_FS_BASE, base) };
 }
 
 /// The kernel side of a `syscall`.
@@ -447,10 +554,37 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             };
             return crate::fd::sys_poll(a1, a2, timeout_ms);
         }
-        // `execve(path, argv, envp)` — x86_64 59. No `fork` on this target, so
-        // this is the `sh -c "<cmd>"` shape: the current (spawned) task replaces
-        // its own image in place. See `sys_execve`.
+        // `execve(path, argv, envp)` — x86_64 59: the current (spawned or
+        // forked) task replaces its own image in place. See `sys_execve`.
         59 => return sys_execve(a1, a2, a3),
+        // `fork` (57) / `vfork` (58) — a real eager-copy fork; see `sys_fork`
+        // (`vfork` gets the same, its "don't touch the parent" contract is moot
+        // once the address space is copied). `clone` (56) is a fork only when
+        // `CLONE_VM` is clear; with it set it means threads, not done here.
+        57 | 58 => return sys_fork(),
+        56 => {
+            const CLONE_VM: u64 = 0x0000_0100;
+            if a1 & CLONE_VM != 0 {
+                return errno::ENOSYS;
+            }
+            return sys_fork();
+        }
+        // `wait4(pid, wstatus, options, rusage)` — x86_64 61. Route into the
+        // Akuma-private `waitpid` table, but **block** (unless `WNOHANG`): a
+        // forked shell calls `wait4(pid, &st, 0, 0)` expecting to sleep until
+        // the child is done, where `sys_waitpid` alone just returns 0.
+        61 => {
+            const WNOHANG: u64 = 0x0000_0001;
+            loop {
+                // 0 = a matching child exists but has not exited; anything else
+                // is a reaped pid or `-ESRCH`.
+                let r = sys_waitpid(a1, a2, a3);
+                if r != 0 || a3 & WNOHANG != 0 {
+                    return r;
+                }
+                crate::sched::yield_now();
+            }
+        }
         // uname(2). Same static-.rodata answer the aarch64 kernel gives, machine
         // string aside — see `akuma_syscalls_glue::proc::sys_uname`.
         63 => return sys_uname(a1),
@@ -707,8 +841,20 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
         ARCH_SET_FS => {
             // SAFETY: sets the current CPU's FS base to a userspace-supplied
             // linear address. A bad value can only fault EL0's own `%fs:`
-            // accesses, exactly as on Linux.
-            unsafe { wrmsr(IA32_FS_BASE, addr) };
+            // accesses, exactly as on Linux. Also record it in this task's
+            // `UserCtx` so the scheduler can restore it on the way back in — the
+            // MSR is CPU-global, and without the per-task copy a forked child
+            // that `execve`s (and re-`arch_prctl`s) leaves the parent running on
+            // the child's TLS base. That crash (`cr2` a tiny offset off a
+            // garbage pointer) is what made this field load-bearing.
+            unsafe {
+                wrmsr(IA32_FS_BASE, addr);
+                let cur = &raw const CURRENT_UCTX;
+                let uctx = *cur;
+                if !uctx.is_null() {
+                    (*uctx).fs_base = addr;
+                }
+            }
             0
         }
         ARCH_SET_GS => {
@@ -916,6 +1062,14 @@ pub struct Process {
     entry: u64,
     /// Initial `rsp`.
     stack: u64,
+    /// Resume this process's **first** ring-3 entry with the parent's full
+    /// register set (`enter_user_mode_forked`) rather than a fresh `_start`.
+    ///
+    /// `true` for a `fork` child: it is a register- and memory-complete copy of
+    /// the parent and must continue from the parent's post-`fork` instruction.
+    /// `execve` replaces it with a plain `Process`, so only that first entry
+    /// takes the forked path.
+    forked: bool,
 }
 
 impl Process {
@@ -970,6 +1124,7 @@ impl Process {
             frames,
             entry: USER_CODE_VA as u64,
             stack: (USER_STACK_VA + 4096 - 16) as u64,
+            forked: false,
         })
     }
 
@@ -1023,7 +1178,7 @@ impl Process {
         match built {
             Ok((img, stack)) => {
                 let entry = img.entry;
-                Ok((Self { space, frames, entry, stack }, img))
+                Ok((Self { space, frames, entry, stack, forked: false }, img))
             }
             Err(e) => {
                 frames.free_all();
@@ -1039,6 +1194,49 @@ impl Process {
         crate::mm::release_anon_frames(&self.space);
         self.frames.free_all();
         self.space.free();
+    }
+
+    /// A `fork` child: a full eager copy of `parent`'s address space (every user
+    /// page in fresh frames — no CoW on this target), resuming at `entry`/`stack`
+    /// (the parent's post-`fork` RIP/RSP) as a register-complete copy.
+    ///
+    /// `None` if a frame runs out mid-copy or the child would need more frames
+    /// than `MAX_PROC_FRAMES` — the shell then sees `fork` fail with `ENOMEM`,
+    /// which is a survivable "can't fork" rather than a corrupt child.
+    fn fork_from(parent: &Self, entry: u64, stack: u64) -> Option<Self> {
+        let space = paging::AddressSpace::new()?;
+        let mut frames = FrameSet::new();
+        let mut ok = true;
+
+        paging::for_each_user_leaf(parent.space.root(), |va, pa, prot| {
+            if !ok {
+                return;
+            }
+            let Some(frame) = akuma_pmm::alloc_page() else {
+                ok = false;
+                return;
+            };
+            // SAFETY: both frames are live and reached through the physmap;
+            // exactly one page is copied.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_ptr::<u8>(pa),
+                    phys_ptr::<u8>(frame as u64),
+                    4096,
+                );
+            }
+            if !frames.push(frame) || !space.map(va, frame as u64, prot, MemAttr::WriteBack) {
+                akuma_pmm::free_page(frame, 0);
+                ok = false;
+            }
+        });
+
+        if !ok {
+            frames.free_all();
+            space.free();
+            return None;
+        }
+        Some(Self { space, frames, entry, stack, forked: true })
     }
 }
 
@@ -1088,9 +1286,16 @@ fn run_process(idx: usize) -> ! {
     // and read only by that task.
     let start = unsafe {
         let procs = &raw const PROCS;
-        (*procs)[idx].as_ref().map(|p| (p.entry, p.stack))
+        (*procs)[idx]
+            .as_ref()
+            .map(|p| (p.entry, p.stack, p.forked))
     };
-    if let Some((entry, stack)) = start {
+    if let Some((entry, stack, forked)) = start {
+        // A `fork` child's first entry re-enters ring 3 at the parent's
+        // post-`fork` instruction with the parent's full register set; the
+        // `execve` it usually does next swaps in a plain image, and every later
+        // loop iteration uses the ordinary entry path.
+        let mut forked_child = forked;
         // Tell the syscall path which process this is, so fd 0/1/2 route to
         // this task's pipes (if it is a spawned child) rather than the console.
         // SAFETY: single core; `CURRENT_UCTX` points at this task's own slot.
@@ -1110,7 +1315,12 @@ fn run_process(idx: usize) -> ! {
         // re-enter ring 3 at the new entry — the same task, a new program.
         let (mut entry, mut stack) = (entry, stack);
         let status = loop {
-            let status = unsafe { enter_user_mode(entry, stack) };
+            let status = if forked_child {
+                forked_child = false;
+                unsafe { enter_user_mode_forked(entry, stack) }
+            } else {
+                unsafe { enter_user_mode(entry, stack, 0) }
+            };
             let Some(next) = take_pending_exec(idx) else {
                 break status;
             };
@@ -1123,8 +1333,8 @@ fn run_process(idx: usize) -> ! {
                 (*procs)[idx].replace(next)
             };
             crate::sched::set_current_space_root(new_root);
-            // The old page tables and frames are unreferenced now that CR3
-            // points at the new space — safe to hand back to the PMM.
+            // The old image (the `fork` copy, or a previous `execve`'s) is
+            // unreferenced now that CR3 points at the new space — hand it back.
             if let Some(old) = old {
                 old.free();
             }
@@ -1194,6 +1404,14 @@ struct Spawn {
     /// `Some` once the child has left ring 3. `waitpid` consumes it and frees
     /// the slot and both pipes.
     exit: Option<i32>,
+    /// The pipes above belong to another `Spawn` (the `fork` parent's): this
+    /// child shares its stdio and must not close or free them on teardown.
+    borrowed_io: bool,
+    /// fd 0/1/2 for this child are the **console**, not the pipes above — a
+    /// `fork` child of a shell that itself runs on the console (`INIT=/bin/sh`
+    /// on the serial line, no `sshd` in front). The `stdin_pipe`/`stdout_pipe`
+    /// fields are unused then.
+    console_io: bool,
 }
 
 const SPAWN_SLOTS: usize = 16 - SPAWN_SLOT_BASE;
@@ -1346,6 +1564,135 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     0
 }
 
+/// `fork` (57) / `vfork` (58) / plain `clone(SIGCHLD, 0)` (56).
+///
+/// A real fork: the child gets an **eager full copy** of the parent's address
+/// space (every user page in fresh frames — there is no CoW on this target),
+/// resumes at the parent's post-`fork` instruction as a register- and TLS-
+/// complete copy, and runs as its own scheduler task. The parent is **not**
+/// suspended — it gets the child pid back immediately and both run; a shell
+/// blocks on the child itself, in `wait4`.
+///
+/// This is what an interactive `busybox sh` needs for every external command
+/// (`fork(); if (child) execvp(...)`) and it is `uname -a` at a shell prompt
+/// that it unblocks. The copy is thrown away microseconds later by the child's
+/// `execve`, which is wasteful but correct — CoW is the optimisation, not the
+/// semantics.
+///
+/// The rough edges are `MAX_PROC_FRAMES`: a `fork` needs one frame per mapped
+/// user page, so a large program near that ceiling (busybox is ~400 pages) can
+/// make `fork` fail with `ENOMEM` — the shell reports `can't fork` and carries
+/// on. A two-child pipeline needs both copies live at once.
+///
+/// Returns the child pid in the parent; the child never returns from here.
+fn sys_fork() -> u64 {
+    use crate::fd::errno;
+
+    let parent_slot = current_proc_slot();
+    if parent_slot == usize::MAX || parent_slot >= 16 {
+        return errno::ENOSYS;
+    }
+
+    // The point the child resumes from — the parent's own user RIP/RSP as
+    // captured on the way into this syscall — plus its TLS base and register
+    // snapshot.
+    // SAFETY: raw-pointer read; single core. `CURRENT_UCTX` is this task's.
+    let (user_rip, user_rsp, parent_fs_base, parent_regs) = unsafe {
+        let cur = &raw const CURRENT_UCTX;
+        let uctx = *cur;
+        if uctx.is_null() {
+            (0, 0, 0, [0u64; 12])
+        } else {
+            (
+                (*uctx).user_rip,
+                (*uctx).user_rsp,
+                (*uctx).fs_base,
+                (*uctx).saved_regs,
+            )
+        }
+    };
+    if user_rip == 0 || user_rsp == 0 {
+        return errno::ENOSYS;
+    }
+
+    // A free child slot (`PROCS` and `SPAWN` share the index).
+    // SAFETY: raw-pointer read; single core.
+    let slot = unsafe {
+        let procs = &raw const PROCS;
+        let spawn = spawn_table();
+        (SPAWN_SLOT_BASE..16)
+            .find(|&s| (*procs)[s].is_none() && (*spawn)[s - SPAWN_SLOT_BASE].is_none())
+    };
+    let Some(slot) = slot else {
+        return errno::ENOMEM;
+    };
+
+    // The child's fd 0/1/2 route wherever the parent's do.
+    let (stdin_pipe, stdout_pipe, console_io) = match spawn_stdio(parent_slot) {
+        Some((si, so)) => (si, so, false),
+        None => (0, 0, true),
+    };
+
+    // Copy the parent's whole address space.
+    let child = {
+        // SAFETY: raw-pointer read; single core. The parent slot is occupied
+        // (this task is running it).
+        let maybe = unsafe {
+            let procs = &raw const PROCS;
+            (*procs)[parent_slot]
+                .as_ref()
+                .and_then(|parent| Process::fork_from(parent, user_rip, user_rsp))
+        };
+        match maybe {
+            Some(c) => c,
+            None => return errno::ENOMEM,
+        }
+    };
+    let child_root = child.space.root();
+    // SAFETY: raw-pointer write; single core, slot just found free.
+    unsafe {
+        let procs = &raw mut PROCS;
+        (*procs)[slot] = Some(child);
+    }
+
+    let Some(entry_fn) = proc_entry_for(slot) else {
+        take_proc_slot(slot);
+        return errno::ENOMEM;
+    };
+    let Some(task_slot) = crate::sched::spawn_in_space(entry_fn, child_root) else {
+        take_proc_slot(slot);
+        return errno::ENOMEM;
+    };
+    crate::sched::seed_forked_task(task_slot, parent_fs_base, &parent_regs);
+
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32;
+    // SAFETY: raw-pointer write; single core.
+    unsafe {
+        (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
+            pid,
+            stdout_pipe,
+            stdin_pipe,
+            exit: None,
+            borrowed_io: true,
+            console_io,
+        });
+    }
+
+    u64::from(pid)
+}
+
+/// Drop a `PROCS` slot on a `fork`/`spawn` bail-out. The child task was never
+/// scheduled, so nothing else touches it.
+fn take_proc_slot(slot: usize) {
+    // SAFETY: raw-pointer access; single core.
+    unsafe {
+        let procs = &raw mut PROCS;
+        if let Some(p) = (*procs)[slot].take() {
+            p.free();
+        }
+    }
+}
+
 /// `spawn(path, argv, envp, stdin, stdin_len, flags)` — Akuma's own syscall 301.
 ///
 /// Returns `pid | (stdout_fd << 32)` on success, or a negative errno. `flags`
@@ -1435,6 +1782,8 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
             stdout_pipe,
             stdin_pipe,
             exit: None,
+            borrowed_io: false,
+            console_io: false,
         });
     }
 
@@ -1467,24 +1816,32 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
     unsafe {
         if let Some(Some(s)) = (*spawn_table()).get_mut(proc_slot - SPAWN_SLOT_BASE) {
             s.exit = Some(status);
-            pipe::close_write(s.stdout_pipe);
+            // A `fork` child that shares its parent's stdio must not close the
+            // parent's stdout — the parent (and every later command it runs)
+            // still writes there.
+            if !s.borrowed_io {
+                pipe::close_write(s.stdout_pipe);
+            }
         }
     }
 }
 
 /// The stdin/stdout pipe a task running `PROCS` slot `proc_slot` reads/writes as
-/// fd 0 / fd 1. `None` for a task that is not a spawned child (fd 0/1/2 are the
-/// console).
+/// fd 0 / fd 1. `None` for a task that is not a spawned child, or a `vfork`
+/// child of a console shell — in both cases fd 0/1/2 are the console.
 fn spawn_stdio(proc_slot: usize) -> Option<(PipeId, PipeId)> {
     if proc_slot < SPAWN_SLOT_BASE {
         return None;
     }
     // SAFETY: raw-pointer read; single core.
     unsafe {
-        (*spawn_table())
+        let s = (*spawn_table())
             .get(proc_slot - SPAWN_SLOT_BASE)?
-            .as_ref()
-            .map(|s| (s.stdin_pipe, s.stdout_pipe))
+            .as_ref()?;
+        if s.console_io {
+            return None;
+        }
+        Some((s.stdin_pipe, s.stdout_pipe))
     }
 }
 
@@ -1544,23 +1901,34 @@ pub fn sys_close_child_stdin(pid: u64) -> u64 {
 /// while it is still running, `-ESRCH` for an unknown pid.
 pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     use crate::fd::errno;
-    let pid = pid as u32;
+    let want = pid as u32;
+    // `wait4(-1)` / `waitpid(0)` — any child. `-1` arrives as `u32::MAX`.
+    let any = want == u32::MAX || want == 0;
 
-    // SAFETY: raw-pointer access; single core.
-    let slot_off = unsafe {
-        (*spawn_table())
-            .iter()
-            .position(|e| e.as_ref().is_some_and(|s| s.pid == pid))
-    };
-    let Some(slot_off) = slot_off else {
+    // SAFETY: raw-pointer read; single core.
+    let table = unsafe { &*spawn_table() };
+
+    // Does any matching child exist at all? (For the `-ESRCH` vs `0` decision.)
+    let exists = table
+        .iter()
+        .any(|e| e.as_ref().is_some_and(|s| any || s.pid == want));
+    if !exists {
         return errno::ESRCH;
-    };
-    // SAFETY: as above; `slot_off` is in bounds and occupied.
-    let s = unsafe { (*spawn_table())[slot_off].as_ref().unwrap() };
-    let (exit, stdin_pipe) = (s.exit, s.stdin_pipe);
+    }
 
-    let Some(code) = exit else {
-        return 0; // still running
+    // A matching child that has exited — reap the first one found.
+    let exited = table.iter().position(|e| {
+        e.as_ref()
+            .is_some_and(|s| (any || s.pid == want) && s.exit.is_some())
+    });
+    let Some(slot_off) = exited else {
+        return 0; // matching child(ren) exist, none has exited yet
+    };
+
+    // SAFETY: `slot_off` is in bounds and occupied with `exit == Some`.
+    let (code, stdin_pipe, child_pid, borrowed_io) = unsafe {
+        let s = (*spawn_table())[slot_off].as_ref().unwrap();
+        (s.exit.unwrap(), s.stdin_pipe, s.pid, s.borrowed_io)
     };
 
     if status_ptr != 0 {
@@ -1569,14 +1937,15 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         unsafe { (status_ptr as *mut i32).write_volatile(raw) };
     }
 
-    // Reap the SPAWN entry, the child's PROCS slot (its frames) and the **stdin**
-    // pipe — the child has exited, so nobody reads it any more. The **stdout**
-    // pipe stays alive until the parent closes its read fd (`sys_close` frees
-    // it): `sshd`'s bridge does its final `read` *after* `waitpid` returns, to
-    // drain the last bytes the child wrote before it exited.
-    pipe::free(stdin_pipe);
+    // A `vfork` child borrows the parent's stdio — leave those pipes alone.
+    // Otherwise free the **stdin** pipe (nobody reads it now); the **stdout**
+    // pipe outlives this call so `sshd`'s bridge can drain the last bytes.
+    if !borrowed_io {
+        pipe::free(stdin_pipe);
+    }
     // SAFETY: raw-pointer access; single core. The child task is Finished — it
-    // called `sched::finish()` in `run_process` after recording its exit.
+    // called `sched::finish()` in `run_process` after recording its exit. A
+    // `vfork` child's `Process` is borrowed, so `free` is a no-op for it.
     unsafe {
         (*spawn_table())[slot_off] = None;
         let procs = &raw mut PROCS;
@@ -1584,7 +1953,7 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
             p.free();
         }
     }
-    u64::from(pid)
+    u64::from(child_pid)
 }
 
 /// Stage R: `sys_spawn` runs a child, its stdout comes back through a pipe, and
@@ -1786,6 +2155,73 @@ pub fn execve_test(t: &mut Suite) {
     );
     t.check_eq(
         "execve: teardown leaks nothing (one child reaped, not two)",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+}
+
+/// Stage T: `fork` (with `vfork` semantics) + `execve` + `wait4`.
+///
+/// `busybox sh -c "uname; echo DONE"` — the `;` makes ash a command list, and
+/// it **forks** to run `uname` (an external command, not the last in the list)
+/// before running the `echo` builtin. So this exercises the whole path: the
+/// shell forks, the child `execve`s `/bin/uname` in the shared address space,
+/// the parent blocks in `wait4` until the child is done, then finishes the
+/// list. Output must carry both `Akuma` (from the forked `uname`) and `DONE`
+/// (from the parent shell), and nothing may leak.
+pub fn fork_test(t: &mut Suite) {
+    const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
+
+    if crate::fs::read_file("/bin/busybox").is_none() || crate::fs::read_file("/bin/sh").is_none() {
+        t.note("fork: busybox /bin/sh not on the disk; skipped", 0);
+        return;
+    }
+
+    let free_before = akuma_pmm::free_count();
+    let path = b"/bin/sh\0";
+    let (a0, a1a, a2a) = (b"sh\0", b"-c\0", b"uname; echo DONE\0");
+    let argv: [u64; 4] = [a0.as_ptr() as u64, a1a.as_ptr() as u64, a2a.as_ptr() as u64, 0];
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    if !t.check("fork: sh spawned", r < ERRNO_FLOOR) {
+        return;
+    }
+    let pid = (r & 0xFFFF_FFFF) as u32;
+    let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
+    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut status = u64::MAX;
+    let mut buf = [0u8; 64];
+    let mut spins = 0u64;
+    loop {
+        spins += 1;
+        if spins > 4_000_000 {
+            break;
+        }
+        let n = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        if n != 0 && n < ERRNO_FLOOR {
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        let mut st: i32 = -1;
+        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+            status = ((st >> 8) & 0xff) as u64;
+            break;
+        }
+        crate::sched::yield_now();
+    }
+    crate::fd::sys_close(stdout_fd);
+
+    t.check_eq("fork: `sh -c \"uname; echo DONE\"` exited 0", status, 0);
+    t.check(
+        "fork: the forked child's output came back",
+        out.windows(5).any(|w| w == b"Akuma"),
+    );
+    t.check(
+        "fork: the parent shell finished the command list",
+        out.windows(4).any(|w| w == b"DONE"),
+    );
+    t.check_eq(
+        "fork: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
         free_before as u64,
     );

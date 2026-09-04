@@ -366,6 +366,21 @@ pub fn set_current_space_root(space_root: u64) {
     }
 }
 
+/// Seed a not-yet-running `vfork` child task with the parent's TLS base and its
+/// full register snapshot, so it resumes as a true copy of the parent's context
+/// (see `usermode::enter_user_mode_forked`). The child inherits `%fs` because
+/// musl's post-fork fixups are `%fs`-relative, and the register set because a C
+/// compiler assumes r12-r15/rbx survive the `syscall`.
+pub fn seed_forked_task(task_slot: usize, fs_base: u64, saved_regs: &[u64; 12]) {
+    // SAFETY: raw-pointer access; single core, and the task is not yet scheduled.
+    unsafe {
+        if let Some(task) = (*tasks()).get_mut(task_slot) {
+            task.uctx.fs_base = fs_base;
+            task.uctx.saved_regs = *saved_regs;
+        }
+    }
+}
+
 /// Create a daemon task: one that runs for the life of the kernel and is not
 /// counted by [`all_user_tasks_finished`]. The netpoll loop is the only caller.
 pub fn spawn_daemon(entry: extern "C" fn() -> !) -> Option<usize> {
@@ -466,6 +481,17 @@ pub fn yield_now() {
 
         // Where a ring-3 trap by the incoming task will land.
         crate::gdt::set_kernel_stack((*t)[next].trap_stack_top);
+
+        // Restore the incoming task's `%fs` base. `IA32_FS_BASE` is one
+        // CPU-global register and `arch_prctl` is the only writer, so a task
+        // that set it keeps its value only as long as nothing else runs. A
+        // shell and the child it forked each have their own TLS — without this,
+        // the child's `execve` (which re-`arch_prctl`s) leaves the parent on
+        // the child's base. `0` means "never set"; leave the MSR alone then.
+        let fs = (*t)[next].uctx.fs_base;
+        if fs != 0 {
+            crate::usermode::set_fs_base(fs);
+        }
 
         let old = &raw mut (*t)[cur].ctx;
         let new = &raw const (*t)[next].ctx;

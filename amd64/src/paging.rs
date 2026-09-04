@@ -379,6 +379,56 @@ pub fn prot_in(root: u64, va: usize) -> Option<Prot> {
     })
 }
 
+/// Visit every present 4 KiB **user** leaf in the lower half of `root`, with its
+/// virtual address, physical frame and permissions.
+///
+/// The walk `AddressSpace::free` does, one level deeper — down to the leaves
+/// rather than stopping at the page tables. `fork` uses it to copy a parent's
+/// whole address space: there is no CoW here (no per-page refcount, no
+/// write-fault handler wired to one), so a `fork` is an eager frame-by-frame
+/// copy. Expensive when the child immediately `execve`s, correct always.
+pub fn for_each_user_leaf(root: u64, mut f: impl FnMut(usize, u64, Prot)) {
+    // SAFETY: every table is reached through the physmap; only the private lower
+    // half is walked, so the kernel's shared tables are never touched.
+    unsafe {
+        for l4 in 0..256 {
+            let e4 = table_mut(root).add(l4).read_volatile();
+            if e4 & P == 0 || e4 & PS != 0 {
+                continue;
+            }
+            let pdpt = e4 & ADDR_MASK;
+            for l3 in 0..ENTRIES {
+                let e3 = table_mut(pdpt).add(l3).read_volatile();
+                if e3 & P == 0 || e3 & PS != 0 {
+                    continue;
+                }
+                let pd = e3 & ADDR_MASK;
+                for l2 in 0..ENTRIES {
+                    let e2 = table_mut(pd).add(l2).read_volatile();
+                    if e2 & P == 0 || e2 & PS != 0 {
+                        continue;
+                    }
+                    let pt = e2 & ADDR_MASK;
+                    for l1 in 0..ENTRIES {
+                        let e1 = table_mut(pt).add(l1).read_volatile();
+                        if e1 & P == 0 {
+                            continue;
+                        }
+                        // Lower half: bit 47 is 0, so no sign extension needed.
+                        let va = (l4 << 39) | (l3 << 30) | (l2 << 21) | (l1 << 12);
+                        let prot = Prot {
+                            write: e1 & RW != 0,
+                            exec: e1 & NX == 0,
+                            user: e1 & US != 0,
+                        };
+                        f(va, e1 & ADDR_MASK, prot);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Map a frame outside the identity map, write through it, read it back, unmap.
 ///
 /// Chosen VA is 1 GiB — the first address `boot.s` does *not* map, so the whole
