@@ -135,6 +135,18 @@ struct Entry {
     /// pass `false`. Only `getdents64` may read a directory descriptor;
     /// `read`/`write` on one report `EISDIR`/`EBADF` per POSIX.
     is_dir: bool,
+    /// The `PROCS` slot that held `current_proc_slot()` when this fd was
+    /// opened. The table is one flat array shared by every task on this
+    /// target (see the module header), so nothing closed a task's fds when it
+    /// exited — a real apk install opens more concurrent fds than a shell
+    /// ever did (its own directory-fd cache across a multi-package tar
+    /// extraction) and reliably ran the table to `EMFILE` by the middle of
+    /// installing 14 packages; the *next* `apk` invocation, in a fresh
+    /// process, then started from an already-full table because the first
+    /// process's fds were never reclaimed. [`close_owned_by`] is the fix:
+    /// called once at process exit, it does exactly what [`sys_close`] would
+    /// have done for each fd this task never closed itself.
+    owner: usize,
 }
 
 /// Allocate a descriptor for an already-created socket.
@@ -152,6 +164,7 @@ pub fn alloc_socket_fd(idx: usize) -> Option<u64> {
                 data: Vec::new(),
                 nonblocking: false,
                 is_dir: false,
+                owner: crate::usermode::current_proc_slot(),
             });
             return Some((i + FIRST_FILE_FD) as u64);
         }
@@ -182,7 +195,13 @@ pub fn alloc_pipe_fd(pipe_id: usize, is_write: bool) -> Option<u64> {
     let mut table = TABLE.lock();
     for (i, slot) in table.iter_mut().enumerate() {
         if slot.is_none() {
-            *slot = Some(Entry { desc, data: Vec::new(), nonblocking: false, is_dir: false });
+            *slot = Some(Entry {
+                desc,
+                data: Vec::new(),
+                nonblocking: false,
+                is_dir: false,
+                owner: crate::usermode::current_proc_slot(),
+            });
             return Some((i + FIRST_FILE_FD) as u64);
         }
     }
@@ -513,7 +532,13 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
             // `KernelFile::new` leaves the inode 0 — "read by path", which is
             // what this target does.
             let desc = FileDescriptor::File(KernelFile::new(normalised, flags_ as u32));
-            *slot = Some(Entry { desc, data, nonblocking: false, is_dir });
+            *slot = Some(Entry {
+                desc,
+                data,
+                nonblocking: false,
+                is_dir,
+                owner: crate::usermode::current_proc_slot(),
+            });
             return (i + FIRST_FILE_FD) as u64;
         }
     }
@@ -708,8 +733,8 @@ pub fn sys_utimensat(dirfd: u64, path: u64, times: u64, _flags: u64) -> u64 {
         }
     };
     let (atime, mtime) = if times == 0 {
-        let n = Some(Some(now.unwrap_or(0)));
-        (n.clone(), n)
+        let n = Some(now.unwrap_or(0));
+        (n, n)
     } else {
         // SAFETY: user array of two `struct timespec` { i64, i64 }: atime at
         // +0, mtime at +16.
@@ -836,6 +861,37 @@ pub fn sys_close(fd: u64) -> u64 {
         _ => {}
     }
     0
+}
+
+/// Close every fd `proc_slot` still holds. Real Linux does this implicitly at
+/// `exit`/`exit_group`; this target's fd table is one array shared by every
+/// task (see the module header), and nothing swept it on task exit until now
+/// — a leak that stayed invisible through every earlier self-test (each opens
+/// a handful of fds and closes them itself) and only showed up 2026-09-04
+/// running `apk` twice in a row: the second invocation started from a table
+/// the first had already filled and failed at the database write with
+/// `EMFILE` before doing any real work. Called once, from `run_process`,
+/// right after a task's last `enter_user_mode` returns.
+///
+/// Collects the fds under the lock, then closes each through [`sys_close`]
+/// afterward — closing a socket calls into `akuma_net`, and nothing here
+/// should hold `TABLE`'s lock across that (the same reason [`sys_close`]
+/// itself takes the entry out before matching on it).
+pub fn close_owned_by(proc_slot: usize) {
+    let fds: Vec<u64> = {
+        let table = TABLE.lock();
+        table
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| match slot {
+                Some(e) if e.owner == proc_slot => Some((i + FIRST_FILE_FD) as u64),
+                _ => None,
+            })
+            .collect()
+    };
+    for fd in fds {
+        sys_close(fd);
+    }
 }
 
 /// `read(fd, buf, len)`.

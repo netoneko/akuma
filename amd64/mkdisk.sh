@@ -25,9 +25,19 @@ IMG="${1:-target/x86_64-unknown-none/release/amd64-root.img}"
 # 8 MiB was enough before a real static libc existed on this image; musl's
 # `libc.a` alone (staged 2026-09-04 so tcc can link a real `printf` — see the
 # musl staging block below) is ~9.4 MiB by itself, over the old default before
-# adding a single byte of anything else. 32 MiB leaves headroom for that,
-# `/usr/include`'s ~200 files, and everything already here.
-SIZE_MIB="${2:-32}"
+# adding a single byte of anything else. 32 MiB covered that, `/usr/include`'s
+# ~200 files, and everything already here — but not a real `apk add`: a single
+# `curl` install (14 packages: ca-certificates, musl, brotli-libs, c-ares,
+# libcrypto3, libunistring, libidn2, nghttp2-libs, libpsl, libssl3, zlib,
+# zstd-libs, libcurl, curl) ran the disk to `ENOSPC` partway through,
+# discovered 2026-09-04 via `[close] persist failed for "...": no space` on
+# the serial console — the real error, three layers back from what `apk`
+# itself reported (`failed to commit …: No such file or directory`, its
+# rename() finding no tmp file because the write that should have created it
+# had already failed silently at `close(2)`; see that function's own comment
+# in `amd64/src/fd.rs`). 128 MiB leaves real headroom for a handful of
+# dependency chains like that one, not just the base image.
+SIZE_MIB="${2:-128}"
 
 # e2fsprogs is keg-only under Homebrew, so its tools are not on PATH by default.
 find_tool() {

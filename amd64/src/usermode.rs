@@ -1486,6 +1486,12 @@ fn run_process(idx: usize) -> ! {
             }
         };
         EXIT_STATUS.store(status, Ordering::Relaxed);
+        // Real Linux closes every fd a process still holds at exit; this
+        // target's fd table did not until now (see `close_owned_by`'s own
+        // header). Before `spawn_record_exit` so a parent's `waitpid` never
+        // observes the child as reaped while its fds are still charged
+        // against the shared table.
+        crate::fd::close_owned_by(idx);
         if idx >= SPAWN_SLOT_BASE {
             spawn_record_exit(idx, status as i32);
         }
@@ -2005,7 +2011,7 @@ pub fn current_stdout_pipe() -> Option<PipeId> {
     spawn_stdio(current_proc_slot()).map(|(_, stdout)| stdout)
 }
 
-fn current_proc_slot() -> usize {
+pub fn current_proc_slot() -> usize {
     // SAFETY: single core; `CURRENT_UCTX` points at the running task's slot.
     unsafe {
         let cur = &raw const CURRENT_UCTX;

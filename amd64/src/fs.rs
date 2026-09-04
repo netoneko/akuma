@@ -37,6 +37,7 @@
 use akuma_ext2::{BlockDevice, Ext2Filesystem};
 use akuma_selftest::Suite;
 use akuma_vfs::{DirEntry, Filesystem, FsError, Metadata};
+use alloc::string::String;
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
