@@ -166,7 +166,10 @@ fn weak_fill(buf: &mut [u8]) {
 /// fails transiently. Retrying ten times is Intel's own recommendation; giving
 /// up after that fills nothing and lets the caller fail, rather than handing a
 /// key-exchange path a buffer of zeros that looks like randomness.
-fn rng_fill(buf: &mut [u8]) {
+///
+/// `pub` since Stage R: ring 3's `getrandom(2)` routes here, which is what
+/// `sshd`'s key exchange rests on.
+pub fn rng_fill(buf: &mut [u8]) {
     if !has_rdrand() {
         weak_fill(buf);
         return;

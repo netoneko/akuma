@@ -108,8 +108,10 @@ if [ "$DISK" != "none" ]; then
     # root: it NATs, and answers DHCP itself, so a local run exercises the same
     # discovery and the same driver the Firecracker host does with dnsmasq.
     # `hostfwd` puts the guest's port 8080 on the host's, so `httpd` can be
-    # reached with an ordinary `curl http://localhost:8080/`.
-    NIC="-netdev user,id=n0,hostfwd=tcp::${HTTP_PORT:-8080}-:8080 -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1"
+    # reached with `curl http://localhost:8080/`, and the guest's 2222 (sshd's
+    # default) on `SSH_PORT` — default 2222, override it when an aarch64 devbox
+    # (which also maps 2222) is already running: `SSH_PORT=2223 INIT=/bin/sshd`.
+    NIC="-netdev user,id=n0,hostfwd=tcp::${HTTP_PORT:-8080}-:8080,hostfwd=tcp::${SSH_PORT:-2222}-:2222 -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1"
     # Two tokens now, one per device, dense at the 0x200 stride. This is the
     # multi-slot geometry `MmioDevices::geometry` computes — until now only one
     # device was ever announced, so the stride was never exercised on this

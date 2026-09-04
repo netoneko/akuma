@@ -87,10 +87,13 @@ const AT_ENTRY: u64 = 9;
 ///
 /// A fixed array rather than a `Vec`: this is teardown bookkeeping on a path
 /// that runs under memory pressure, and the kernel's own rule is that the best
-/// code allocates nothing. 64 frames is 256 KiB, which is two orders of
-/// magnitude more than the guest program needs; a real program will need a
-/// region list rather than a bigger array, and that arrives with demand paging.
-pub const MAX_PROC_FRAMES: usize = 64;
+/// code allocates nothing. It has to cover image + stack for the largest
+/// program the loader runs: `sshd` is ~31 pages of segments plus the 128-page
+/// stack (`ELF_STACK_PAGES`), so 192 leaves headroom. A real program will need
+/// a region list rather than a bigger array, and that arrives with demand
+/// paging. `mmap`/heap frames are not tracked here — they are leaked on
+/// teardown, deliberately (`mm.rs`).
+pub const MAX_PROC_FRAMES: usize = 192;
 
 /// Every physical frame a process owns, so teardown can give them all back.
 ///

@@ -143,7 +143,7 @@ pub fn sys_accept(fd: u64, addr: u64, addrlen: u64) -> u64 {
     let Some(idx) = fd::socket_index(fd) else {
         return errno::ENOTSOCK;
     };
-    match akuma_net::socket::socket_accept(idx, false) {
+    match akuma_net::socket::socket_accept(idx, fd::is_nonblocking(fd)) {
         Ok((new_idx, peer)) => {
             let Some(new_fd) = fd::alloc_socket_fd(new_idx) else {
                 // No descriptor for the accepted connection. Closing it is the
@@ -171,25 +171,25 @@ pub fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
     let Some(sa) = sockaddr_in_from_user(addr, addrlen) else {
         return errno::EINVAL;
     };
-    match akuma_net::socket::socket_connect(idx, sa, false) {
+    match akuma_net::socket::socket_connect(idx, sa, fd::is_nonblocking(fd)) {
         Ok(()) => 0,
         Err(e) => net_err(e),
     }
 }
 
 /// Send on a socket descriptor. Reached from `write` as well as `sendto`.
-pub fn send(idx: usize, buf: u64, len: u64) -> u64 {
+pub fn send(idx: usize, buf: u64, len: u64, nonblock: bool) -> u64 {
     let data = fd::copy_in(buf, len);
-    match akuma_net::socket::socket_send(idx, &data, false) {
+    match akuma_net::socket::socket_send(idx, &data, nonblock) {
         Ok(n) => n as u64,
         Err(e) => net_err(e),
     }
 }
 
 /// Receive on a socket descriptor. Reached from `read` as well as `recvfrom`.
-pub fn recv(idx: usize, buf: u64, len: u64) -> u64 {
+pub fn recv(idx: usize, buf: u64, len: u64, nonblock: bool) -> u64 {
     let mut data = alloc::vec![0u8; len as usize];
-    match akuma_net::socket::socket_recv(idx, &mut data, false) {
+    match akuma_net::socket::socket_recv(idx, &mut data, nonblock) {
         Ok(n) => fd::copy_out(buf, &data[..n]) as u64,
         Err(e) => net_err(e),
     }
@@ -199,14 +199,14 @@ pub fn recv(idx: usize, buf: u64, len: u64) -> u64 {
 /// what Linux does for a connected socket.
 pub fn sys_sendto(fd: u64, buf: u64, len: u64) -> u64 {
     match fd::socket_index(fd) {
-        Some(idx) => send(idx, buf, len),
+        Some(idx) => send(idx, buf, len, fd::is_nonblocking(fd)),
         None => errno::ENOTSOCK,
     }
 }
 
 pub fn sys_recvfrom(fd: u64, buf: u64, len: u64) -> u64 {
     match fd::socket_index(fd) {
-        Some(idx) => recv(idx, buf, len),
+        Some(idx) => recv(idx, buf, len, fd::is_nonblocking(fd)),
         None => errno::ENOTSOCK,
     }
 }

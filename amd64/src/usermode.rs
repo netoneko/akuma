@@ -62,10 +62,15 @@ const USER_STACK_VA: usize = 0x41_0000;
 /// user address space for the same reason — it is the one place a program's
 /// segments cannot already be.
 const ELF_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
-/// Pages of stack. Two, because the initial frame is under 200 bytes and
-/// `hello` does not recurse; a real program needs a guard page and a growth
-/// policy, and this kernel has neither.
-const ELF_STACK_PAGES: usize = 2;
+/// Pages of stack. The initial frame is under 200 bytes, but the stack is
+/// eagerly allocated and there is no growth policy or guard page — so it has to
+/// be sized for the *largest* program the loader runs, not the smallest.
+/// `sshd`'s key exchange (curve25519, ed25519, AES) drives the deepest stack
+/// here and #PF'd on two pages within a few calls of `main`; 128 pages
+/// (512 KiB) clears it with room to spare. A small program pays 512 KiB of
+/// eagerly-zeroed frames it never touches — the cost of not having demand
+/// paging for the stack yet.
+const ELF_STACK_PAGES: usize = 128;
 
 /// The guest program, linked at [`USER_CODE_VA`] and embedded in the kernel
 /// image.
@@ -399,6 +404,20 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
             a1
         }
         Syscall::Getpid => 1,
+        Syscall::Fcntl => crate::fd::sys_fcntl(a1, a2, a3),
+        Syscall::Getrandom => sys_getrandom(a1, a2),
+        // No high-resolution sleep: this target has a coarse, uncalibrated
+        // clock and a cooperative scheduler. Yield instead — `sshd`'s serve
+        // loop only calls this to avoid a busy-spin when it did no work, and a
+        // yield is exactly that with the preemption timer running.
+        Syscall::Nanosleep => {
+            crate::sched::yield_now();
+            0
+        }
+        // The child-tid futex address a threaded libc registers on startup.
+        // Single-address-space, no `CLONE_THREAD` here, so it is recorded
+        // nowhere and the return value (the caller's tid) is ignored.
+        Syscall::SetTidAddress => 1,
         Syscall::SchedYield => {
             // The switch happens on *this task's* kernel stack, which is the
             // whole reason UserCtx is per-task: two processes sharing one
@@ -410,6 +429,22 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
     }
 }
 
+/// `getrandom(buf, buflen, flags)` — bytes from `RDRAND` (or the loud
+/// non-cryptographic fallback on a CPU without it; see `net::rng_fill`).
+///
+/// `flags` is ignored: `GRND_NONBLOCK` never applies because `RDRAND` does not
+/// block, and `GRND_RANDOM` vs the urandom pool is a distinction this source
+/// does not have. Bounded per call — `sshd` asks for 32 at a time.
+fn sys_getrandom(buf: u64, len: u64) -> u64 {
+    use crate::fd::errno;
+    if buf == 0 {
+        return errno::EFAULT;
+    }
+    let n = (len as usize).min(256);
+    let mut tmp = [0u8; 256];
+    crate::net::rng_fill(&mut tmp[..n]);
+    crate::fd::copy_out(buf, &tmp[..n]) as u64
+}
 
 /// `write(fd, buf, len)` — fd 1 and 2 go to the serial console.
 ///
@@ -428,7 +463,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     // A socket descriptor routes to the network stack, so a program written
     // against `write(2)` works on a connection without knowing it has one.
     if let Some(sock) = crate::fd::socket_index(fd) {
-        return crate::sock::send(sock, buf, len);
+        return crate::sock::send(sock, buf, len, crate::fd::is_nonblocking(fd));
     }
     if fd != 1 && fd != 2 {
         return EBADF;

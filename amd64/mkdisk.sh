@@ -55,13 +55,24 @@ FDPROBE=$(find target/x86_64-unknown-none/release/build -name fdprobe.elf 2>/dev
 # still gets a bootable image with the probes on it.
 PAWS=""
 HTTPD=""
-for prog in paws httpd; do
+SSHD=""
+for prog in paws httpd sshd; do
     if (cd userspace && cargo build -q -p "$prog" --target x86_64-unknown-none --release 2>/dev/null); then
         found=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name "$prog" -type f | head -1)
         [ "$prog" = paws ] && PAWS="$found"
         [ "$prog" = httpd ] && HTTPD="$found"
+        [ "$prog" = sshd ] && SSHD="$found"
     fi
 done
+
+# A test keypair for `sshd`'s pubkey auth. Generated once into `target/` (which
+# is git-ignored) and reused, so `ssh -i` has a stable key. sshd generates its
+# own *host* key on first run and tolerates not being able to persist it, so
+# only the client key needs to survive across boots.
+SSH_TEST_KEY="target/x86_64-unknown-none/release/amd64-ssh-test-key"
+if [ -n "$SSHD" ] && [ ! -f "$SSH_TEST_KEY" ]; then
+    ssh-keygen -q -t ed25519 -N '' -C 'akuma-amd64-test' -f "$SSH_TEST_KEY" </dev/null || true
+fi
 
 mkdir -p "$(dirname "$IMG")"
 rm -f "$IMG"
@@ -89,6 +100,14 @@ done
 [ -n "$FDPROBE" ] && "$DEBUGFS" -w -R "write $FDPROBE bin/fdprobe" "$IMG" >/dev/null 2>&1
 [ -n "$PAWS" ] && "$DEBUGFS" -w -R "write $PAWS bin/paws" "$IMG" >/dev/null 2>&1
 [ -n "$HTTPD" ] && "$DEBUGFS" -w -R "write $HTTPD bin/httpd" "$IMG" >/dev/null 2>&1
+if [ -n "$SSHD" ]; then
+    "$DEBUGFS" -w -R "write $SSHD bin/sshd" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /etc" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /etc/sshd" "$IMG" >/dev/null 2>&1
+    if [ -f "$SSH_TEST_KEY.pub" ]; then
+        "$DEBUGFS" -w -R "write $SSH_TEST_KEY.pub etc/sshd/authorized_keys" "$IMG" >/dev/null 2>&1
+    fi
+fi
 # Something for httpd to serve. httpd's document root is `/public`, and `GET /`
 # maps to `/public/index.html` — put it where httpd looks, not at the root.
 printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></html>\n' > "$TMP/index.html"

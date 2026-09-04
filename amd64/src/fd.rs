@@ -106,6 +106,11 @@ struct Entry {
     desc: FileDescriptor,
     /// The file's contents, cached at `open`. See the module header.
     data: Vec<u8>,
+    /// `O_NONBLOCK`, set through `fcntl(F_SETFL)`. Only sockets consult it —
+    /// `sshd`'s cooperative loop makes its listener and every accepted stream
+    /// non-blocking so a session idling on its socket suspends instead of
+    /// stalling its peers.
+    nonblocking: bool,
 }
 
 /// Allocate a descriptor for an already-created socket.
@@ -118,7 +123,11 @@ pub fn alloc_socket_fd(idx: usize) -> Option<u64> {
     let mut table = TABLE.lock();
     for (i, slot) in table.iter_mut().enumerate() {
         if slot.is_none() {
-            *slot = Some(Entry { desc: FileDescriptor::Socket(idx), data: Vec::new() });
+            *slot = Some(Entry {
+                desc: FileDescriptor::Socket(idx),
+                data: Vec::new(),
+                nonblocking: false,
+            });
             return Some((i + FIRST_FILE_FD) as u64);
         }
     }
@@ -133,6 +142,53 @@ pub fn socket_index(fd: u64) -> Option<usize> {
     match table.get(idx as usize)? {
         Some(Entry { desc: FileDescriptor::Socket(s), .. }) => Some(*s),
         _ => None,
+    }
+}
+
+/// Is `fd` marked `O_NONBLOCK`? `false` for anything not in the table.
+#[must_use]
+pub fn is_nonblocking(fd: u64) -> bool {
+    let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
+        return false;
+    };
+    let table = TABLE.lock();
+    matches!(table.get(idx as usize), Some(Some(e)) if e.nonblocking)
+}
+
+/// `fcntl(fd, cmd, arg)`. Only the two flag commands are implemented, and
+/// `F_SETFL` only inspects the `O_NONBLOCK` bit — `sshd` is the sole caller and
+/// that is all it sets. `F_GETFL` reports the same bit back and nothing else.
+pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+    const F_GETFL: u64 = 3;
+    const F_SETFL: u64 = 4;
+    const F_SETFD: u64 = 2;
+    const F_GETFD: u64 = 1;
+    const O_NONBLOCK: u64 = 0x800;
+
+    let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
+        return errno::EBADF;
+    };
+    let mut table = TABLE.lock();
+    let Some(Some(entry)) = table.get_mut(idx as usize) else {
+        return errno::EBADF;
+    };
+    match cmd {
+        F_SETFL => {
+            entry.nonblocking = arg & O_NONBLOCK != 0;
+            0
+        }
+        F_GETFL => {
+            if entry.nonblocking {
+                O_NONBLOCK
+            } else {
+                0
+            }
+        }
+        // FD_CLOEXEC is meaningless without exec; accept and ignore so a caller
+        // that sets it on every fd does not fail.
+        F_SETFD => 0,
+        F_GETFD => 0,
+        _ => errno::EINVAL,
     }
 }
 
@@ -234,7 +290,7 @@ pub fn sys_openat(_dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
             // `KernelFile::new` leaves the inode 0 — "read by path", which is
             // what this target does.
             let desc = FileDescriptor::File(KernelFile::new(normalised, flags_ as u32));
-            *slot = Some(Entry { desc, data });
+            *slot = Some(Entry { desc, data, nonblocking: false });
             return (i + FIRST_FILE_FD) as u64;
         }
     }
@@ -291,7 +347,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     // first: `socket_recv` blocks, and holding the descriptor table across a
     // blocking wait would stop every other task from opening a file.
     if let Some(sock) = socket_index(fd) {
-        return crate::sock::recv(sock, buf, len);
+        return crate::sock::recv(sock, buf, len, is_nonblocking(fd));
     }
 
     let idx = fd - FIRST_FILE_FD as u64;

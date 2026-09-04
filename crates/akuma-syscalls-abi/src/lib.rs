@@ -94,6 +94,8 @@ pub enum Syscall {
     Nanosleep,
     ClockGettime,
     SetTidAddress,
+    Getrandom,
+    Fcntl,
 }
 
 /// x86_64 Linux numbers.
@@ -133,6 +135,8 @@ pub mod x86_64 {
     pub const CLOCK_GETTIME: u64 = 228;
     pub const EXIT_GROUP: u64 = 231;
     pub const OPENAT: u64 = 257;
+    pub const FCNTL: u64 = 72;
+    pub const GETRANDOM: u64 = 318;
 }
 
 impl Syscall {
@@ -172,6 +176,8 @@ impl Syscall {
             n::CLOCK_GETTIME => Self::ClockGettime,
             n::EXIT_GROUP => Self::ExitGroup,
             n::OPENAT => Self::Openat,
+            n::FCNTL => Self::Fcntl,
+            n::GETRANDOM => Self::Getrandom,
             _ => return None,
         })
     }
@@ -200,6 +206,8 @@ impl Syscall {
             n::CLOCK_GETTIME => Self::ClockGettime,
             n::EXIT_GROUP => Self::ExitGroup,
             n::OPENAT => Self::Openat,
+            n::FCNTL => Self::Fcntl,
+            n::GETRANDOM => Self::Getrandom,
             _ => return None,
         })
     }
@@ -245,6 +253,8 @@ impl Syscall {
             Self::ClockGettime => n::CLOCK_GETTIME,
             Self::ExitGroup => n::EXIT_GROUP,
             Self::Openat => n::OPENAT,
+            Self::Fcntl => n::FCNTL,
+            Self::Getrandom => n::GETRANDOM,
         }
     }
 
@@ -285,6 +295,8 @@ impl Syscall {
             Self::ClockGettime => n::CLOCK_GETTIME,
             Self::ExitGroup => n::EXIT_GROUP,
             Self::Openat => n::OPENAT,
+            Self::Fcntl => n::FCNTL,
+            Self::Getrandom => n::GETRANDOM,
         }
     }
 }
@@ -319,6 +331,8 @@ mod tests {
         Syscall::Nanosleep,
         Syscall::ClockGettime,
         Syscall::SetTidAddress,
+        Syscall::Getrandom,
+        Syscall::Fcntl,
     ];
 
     #[test]
