@@ -133,6 +133,19 @@ it reads identically on a dead NIC and a busy one.
 | `nslookup`: *Bad file descriptor* | `write()` on a connected UDP socket. DNS itself works (`wget http://…` resolves) |
 | pings to `192.168.1.220` time out | `.220` is only the **pre-DHCP fallback**; a lease overrides it. The probe line says the real address |
 
+## The spare disk (persistence, in progress)
+
+`/dev/sda` on the **Ubuntu** side is a spare 1 TB drive being prepared for
+Akuma: wiped, **MBR** table, `sda1` 64 GiB ext2 `akuma-root` (staged with the
+RAM-disk image's contents), `sda2` ~867 GiB ext2 `akuma-data`. It is a Seagate
+ST1000LM035 **inside a USB-to-SATA enclosure** — Akuma cannot reach it over USB,
+so the plan is to move the bare drive to a free SATA port (`ata3`–`ata6` on the
+`00:1f.2` AHCI controller) and write `akuma-ahci`. See
+`proposals/NEXT_AGENT_AMD64_AHCI_PERSISTENCE.md`.
+
+USB disk I/O on this box is slow enough that `mkfs`/`e2fsck`/`blkid` over an ssh
+round-trip time out — run them `setsid nohup … &` and poll a log file.
+
 ## Background
 
 `docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md` — the whole bring-up, including
