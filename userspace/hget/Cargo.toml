@@ -1,0 +1,20 @@
+[package]
+name = "hget"
+version = "0.1.0"
+edition = "2021"
+
+# The in-tree answer to "fetch a URL over TLS".
+#
+# There is no static x86_64 `curl` in this tree — `bootstrap/bin/curl` is
+# aarch64 — and the two obvious ways to get one are both worse than this:
+# downloading a prebuilt static binary from a third party, or running Alpine's
+# `curl` package, which is dynamically linked and cannot load on a kernel with
+# no `PT_INTERP` support. `libakuma-tls` is already here, already used by `box`
+# and `meow`, and already builds for `x86_64-unknown-none`.
+[[bin]]
+name = "hget"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma" }
+libakuma-tls = { path = "../libakuma-tls" }

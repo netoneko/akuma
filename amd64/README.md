@@ -574,10 +574,32 @@ The session shell is **busybox `sh`** (`SSHD_SHELL=/bin/paws` for the small
 built-in one), with ~70 applets linked — `reboot`/`halt`/`poweroff` among them,
 which is how a keyboard-less box gets shut down cleanly.
 
+**The wall clock is not free.** Neither entry path has a battery-backed RTC
+this kernel reads, so time comes from SNTP after DHCP — and if that fails,
+`date` reports 1970 and **every TLS certificate looks not-yet-valid**, which
+`apk` reports as `server certificate not trusted`. That error sends people to
+the CA bundle; check `date` first. `date -s "YYYY-MM-DD HH:MM:SS"` sets it by
+hand (`clock_settime`/`settimeofday`/`adjtimex` are wired).
+
 **Pipelines and redirects do not work in that shell**: `cmd | cmd` returns
 `can't create pipe: Bad file descriptor`, and `pipe2` alone would not fix it —
 fds 0/1/2 are handled by number *below* `fd.rs`'s table (`FIRST_FILE_FD = 3`),
 so `dup2` onto them has nowhere to land. Plain commands are fine.
+
+### `hget` — HTTPS without curl
+
+`/bin/hget <url>` fetches a URL and writes the body to stdout, doing TLS
+in-process through `libakuma-tls` (the same crate `box pull` and `meow` use).
+
+It exists because every obvious way to get `curl` here is blocked:
+`bootstrap/bin/curl` is **aarch64**; Alpine's `curl` package is dynamically
+linked and this kernel has no `PT_INTERP` support; and busybox
+`wget https://...` shells out to a separate `ssl_client` over a `socketpair`,
+which is neither implemented nor on the image. `libakuma-tls` already builds
+for `x86_64-unknown-none`, so the shortest path to HTTPS is thirty lines rather
+than a foreign binary.
+
+Plain `busybox wget http://...` works fine — it is only TLS that needs this.
 
 ### `akuma-cli`
 

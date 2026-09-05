@@ -110,9 +110,21 @@ pub const FIRST_FILE_FD: usize = 3;
 /// How many files may be open at once.
 ///
 /// A fixed array so the table allocates nothing; the *contents* are heap, but
-/// the bookkeeping is not. 16 is more than a shell opens and small enough that
-/// a leak shows up as `EMFILE` quickly rather than as steady heap growth.
-pub const MAX_OPEN: usize = 16;
+/// the bookkeeping is not.
+///
+/// It was 16, on the reasoning that this is "more than a shell opens" and that
+/// a small table makes a leak show up as `EMFILE` quickly rather than as steady
+/// heap growth. Both halves are still true and the number was still wrong: a
+/// shell is not the only thing that runs here. `apk update` opens the package
+/// database, a repository index and a TLS connection per repository and gave up
+/// before reaching the network at all —
+///
+///     ERROR: Unable to open root: No file descriptors available
+///
+/// — which reads like a permissions or path problem and is neither. 64 leaves
+/// room for a package manager with a handful of repositories and is still small
+/// enough that a descriptor leak announces itself in seconds.
+pub const MAX_OPEN: usize = 64;
 
 /// One entry: the tree's descriptor, plus this target's cached contents.
 ///

@@ -1216,3 +1216,118 @@ mis-programmed ring base or a buffer overrun is the obvious suspect and
 `0x3201C040` looks far more like a DMA address than a count. **Not yet
 investigated.** If `rx` starts moving after the `ISR` fix and these two still
 climb into the hundreds of millions, that is the next thread to pull.
+
+
+---
+
+# Update — 2026-09-06, ssh works, and the clock was the whole story
+
+**Akuma answers SSH on bare metal.**
+
+```
+$ ssh -i target/x86_64-unknown-none/release/amd64-ssh-test-key -p 2222 root@192.168.1.123 "uname -a"
+Akuma akuma 0.1.0-amd64 Akuma/amd64 (x86_64 bring-up) x86_64 GNU/Linux
+```
+
+DHCP leased `192.168.1.123` — **not** the built-in `192.168.1.220`, which is
+only the pre-DHCP fallback and is overridden the moment a lease arrives. Pings
+to `.220` therefore kept timing out long after the machine was reachable, which
+is worth knowing before spending an evening on it.
+
+## What actually revived the receiver
+
+The stall dump said everything was correct: `rdsar` matched the ring base, all
+sixteen descriptors were `OWN`-ed by the chip with `EOR` on the last one alone,
+`CR_RE` set, `ISR` clear, and **`MPC` at zero** — not even dropping frames for
+want of a descriptor. The chip was not overrun and not confused about its ring;
+it was not being handed frames.
+
+`MISC_RXDV_GATED` was **clear**, so the PHY-gate theory was wrong too — the
+third wrong answer in a row, after `RDU` and a mis-translated address. What
+worked was the rest of `kick_receiver`: drop `CR_RE`, re-state `RDSAR` and
+`RCR`, bring `RE` back, reset the driver's cursor. `rx` moved off 16
+immediately and DHCP completed seconds later.
+
+That is a **workaround, not a diagnosis.** Why the chip and the driver
+desynchronise is still unknown, and so is why completions landed 182 KiB
+*below* the ring — walking forward off the end does not reach there. The
+recovery is uncapped now (it is what keeps the machine on the network) but only
+the first five stalls print, and the running total shows in the probe as
+`kicks=`. A `kicks=` that keeps climbing means the box is reachable *despite* a
+bug.
+
+Three wrong guesses in a row all came from reasoning about the code. What
+settled it was reading the chip's own registers and then changing one thing and
+watching.
+
+## The clock, again — and what it was really breaking
+
+`date` said `Thu Jan  1 00:00:00 UTC 1970` on the metal even after
+`sync_via_sntp` was wired into the multiboot2 path. The consequence was not
+cosmetic:
+
+```
+ERROR: Unable to open root: No file descriptors available     <- after the clock was set
+WARNING: ... TLS: server certificate not trusted              <- before
+```
+
+**At the epoch every TLS certificate on earth is not-yet-valid**, and `apk`
+reports that as `server certificate not trusted` — which sends you to inspect
+the CA bundle. The bundle was correct and present the whole time (188 900
+bytes, 121 certificates). Setting the clock made that error disappear.
+
+The kernel's own SNTP still does not land on this machine (why is open). What
+does work is userspace: `clock_settime` (227), `settimeofday` (164) and a
+minimal `adjtimex` (159) are wired now, and
+
+```
+/ # date -s "2026-09-06 00:30:00"
+Sun Sep  6 00:30:00 UTC 2026
+```
+
+`busybox ntpd -q -n -d -p <ip>` gets as far as a real reply —
+`offset:+1788638218` seconds, exactly 1970→2026 — and then **hangs after
+computing it**, without stepping the clock. Since `date -s` proves
+`settimeofday` works, the hang is elsewhere; `poll()` with a large timeout is
+the first place to look, because ntpd's main loop lives in one and only ever
+sent a single query.
+
+## Other things this run established
+
+- **`MAX_OPEN` was 16** and `apk update` exhausted it before reaching the
+  network (`Unable to open root: No file descriptors available`). Now 64.
+- **`/proc` now exists as an empty directory.** Nothing reads it, but busybox
+  `reboot` *opens* it to find init and refuses without it — on a machine whose
+  only other reboot is the power button. `reboot -f` skips the check and works,
+  which is what makes the edit/reboot/test loop autonomous from a laptop.
+  `ps`, `top` and `free` are still broken and need a real procfs.
+- **Pipes and redirects still do not work** — `cmd | cmd` gives `can't create
+  pipe: Bad file descriptor`, and `pipe2` alone would not fix it: fds 0/1/2 are
+  handled by number *below* `fd.rs`'s table (`FIRST_FILE_FD = 3`), so `dup2`
+  onto them has nowhere to land. That table needs real entries for 0/1/2.
+- **`nslookup` fails** (`write to '10.0.2.3': Bad file descriptor`) while
+  `wget http://example.com` resolves and fetches fine — so DNS works and it is
+  `nslookup`'s particular socket usage (`write()` on a connected UDP socket)
+  that is unimplemented.
+- **`hget`** (`userspace/hget`) is the answer to HTTPS rather than a staged
+  `curl`: `bootstrap/bin/curl` is aarch64, Alpine's `curl` is dynamically
+  linked and this kernel has no `PT_INTERP` support, and busybox `wget https`
+  needs a `socketpair` plus an `ssl_client` binary. `libakuma-tls` does TLS
+  in-process, is already used by `box pull` and `meow`, and builds for
+  `x86_64-unknown-none` unchanged — thirty lines instead of a foreign binary.
+
+## The loop that made this fast
+
+The box reboots itself now. `ssh akuma "reboot -f"` resets it into Ubuntu (the
+GRUB one-shot having been consumed), Ubuntu builds and stages and arms, and
+`reboot` there brings Akuma back — no hands, no photographs. `~/.ssh/config`
+carries an `akuma` alias with `StrictHostKeyChecking no` and
+`UserKnownHostsFile /dev/null`, which is not laziness: **sshd generates a new
+host key every boot and nothing persists it**, so the fingerprint changes by
+construction and a `known_hosts` entry would be wrong rather than reassuring.
+
+One trap that entry creates: plain `ssh root@192.168.1.123` now reaches **Akuma
+on 2222**, not Ubuntu on 22. Anything targeting the Ubuntu side has to pass
+`-F /dev/null`, or it silently talks to the wrong operating system — which is
+how a build once ran `cd /root/akuma` inside a kernel that has no such
+directory.

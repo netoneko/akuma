@@ -29,6 +29,7 @@ members = [
     "sshd",
     "wavplay",
     "scratch",
+    "hget",
 ]
 
 # selfhost_repro is intentionally NOT a member: it is a throwaway crate built
