@@ -404,6 +404,38 @@ A guest program reports what it checked through its **exit status**, which the
 kernel's self-test compares against a value computed in `src/usermode.rs`. A
 program that printed its verdict would have "passed" by running at all.
 
+## SMP
+
+Since Stage U (2026-09-05) the kernel runs on every core the MADT lists:
+
+```bash
+SMP=4 amd64/run.sh                         # or SMP=4 overlays/devbox-amd64/run.sh
+```
+
+**One shared kernel, one lock.** Every core holds the Big Kernel Lock while it
+executes kernel code and releases it on the way back to ring 3 and in the idle
+loop's `hlt`; user code runs in parallel, kernel code one core at a time. That
+is the aarch64 kernel's `smp-shared` design at its first step, and it is what
+lets every `static mut` table here stay unlocked. Per-core state is reached
+through `%gs` (`smp::PerCpu`; `swapgs` on the syscall and interrupt entries),
+each core has its own GDT/TSS, syscall MSRs and LAPIC timer, and a context
+switch carries the lock's depth and the task's SSE registers with the task.
+Secondaries are started INIT/STARTUP through a real-mode trampoline copied to
+`0x8000` (`boot.s`, `ap_trampoline_start`), one at a time.
+
+The self-test proves three things at `SMP=4`: every listed core comes online
+and takes its own ticks, four kernel workers run on all four cores with four
+in flight at once (they drop the BKL around a spin), and two ring-3 processes
+are served from two cores. The ELF/spawn/busybox/execve/fork tests then run
+with every core picking up processes — the stress that found the three SMP
+bugs in `docs/archive/AMD64_SMP_BRINGUP.md` §3.
+
+What is missing: TLB shootdown (complete today only because a process is one
+task and every switch to a process root writes `CR3`), a wake IPI (an idle
+core learns of work at its next tick), kernel-mode preemption (deliberately —
+the tick preempts ring 3 and the idle loop, kernel tasks yield), and any run
+on real hardware. `SMP=1` is the single-core boot every earlier stage ran.
+
 ## What is deliberately missing
 
 - **`fork` is an eager full copy, no CoW.** `sys_fork` (Stage T; `fork`/`vfork`/
@@ -445,11 +477,13 @@ program that printed its verdict would have "passed" by running at all.
 - **No demand paging for user segments.** The `#PF` handler services a
   not-present fault inside one armed region; an ELF's segments are allocated and
   copied eagerly. Wiring the two together needs a per-space region table.
-- **No FP/SIMD save on the syscall path.** No `xsave`, no lazy FPU. Nothing in
-  the current handler touches a vector register, which is a property of today's
-  code rather than a guarantee — see
+- **FP/SIMD state is saved on the context switch, not the syscall path.**
+  `fxsave`/`fxrstor` of a 512-byte per-task area around `switch_context`
+  (Stage U); no `xsave`, no AVX state, no lazy FPU. The syscall path itself
+  still saves nothing, which is fine while the kernel is soft-float — a
+  property of today's code rather than a guarantee, see
   `docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md` §8.
-- **No SMP**, no IST, no ACPI.
+- **SMP is BKL-first** (Stage U, 2026-09-05 — see "SMP" below). No IST.
 - **User pointers are fault-safe and SMAP-enforced since 2026-09-05.** Every
   user access in `usermode.rs`/`fd.rs`/`sock.rs` goes through `src/uaccess.rs`
   → `akuma-user-access`'s `copy_from_user_safe`, bracketed in `stac`/`clac`;

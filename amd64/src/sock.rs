@@ -150,9 +150,14 @@ pub fn sys_accept(fd: u64, addr: u64, addrlen: u64) -> u64 {
                 return errno::EMFILE;
             };
             let written = sockaddr_in_to_user(addr, peer);
+            // Through `uaccess`, like every other user write: this was a raw
+            // `write_volatile` the 2026-09-05 SMAP sweep missed, and the first
+            // `accept` with a non-null `addrlen` after `CR4.SMAP` went on —
+            // sshd's, under `SMP=4` — faulted in ring 0 on the client's stack
+            // (`#PF err=3, cr2=0x7fffffffdba8`) and took the BKL down with it.
+            // A bad pointer loses the length, not the connection.
             if addrlen != 0 {
-                // SAFETY: a user pointer to a socklen_t, as the ABI defines it.
-                unsafe { (addrlen as *mut u32).write_volatile(written as u32) };
+                let _ = crate::uaccess::write_val::<u32>(addrlen, written as u32);
             }
             new_fd
         }
@@ -363,12 +368,13 @@ pub fn sys_recvmsg(fd: u64, msg: u64, _flags: u64) -> u64 {
             Ok((n, from)) => {
                 if name != 0 {
                     sockaddr_in_to_user(name, from);
-                    // SAFETY: `name` points at a real `sockaddr_in`-sized
-                    // buffer, per this syscall's own contract; `msg_namelen`
-                    // sits 8 bytes into `msghdr`, a plain `socklen_t` (u32).
-                    unsafe {
-                        ((msg + 8) as *mut u32).write_volatile(core::mem::size_of::<SockAddrIn>() as u32);
-                    }
+                    // `msg_namelen` sits 8 bytes into `msghdr`, a plain
+                    // `socklen_t` (u32). Through `uaccess` — the other raw user
+                    // write the SMAP sweep missed; see `sys_accept`.
+                    let _ = crate::uaccess::write_val::<u32>(
+                        msg + 8,
+                        core::mem::size_of::<SockAddrIn>() as u32,
+                    );
                 }
                 n
             }

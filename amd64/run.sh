@@ -18,6 +18,10 @@ HERE=$(dirname "$0")
 cd "$HERE/.."
 
 MEMORY="${MEMORY:-2048}"
+# Cores. The kernel starts every LAPIC the MADT lists (amd64/src/smp.rs), so
+# this is the whole SMP switch; `SMP=1` is the single-core boot every stage
+# before Stage U ran.
+SMP="${SMP:-1}"
 KERNEL=target/x86_64-unknown-none/release/akuma-amd64
 # DISK=<path> attaches an existing image; otherwise a probe disk is generated.
 # DISK=none boots with no drive, which is the pre-Stage-M shape and still valid.
@@ -150,6 +154,7 @@ exec qemu-system-x86_64 \
     $LEGACY_OFF \
     -kernel "$KERNEL" \
     -m "$MEMORY" \
+    -smp "$SMP" \
     $DRIVE \
     $NIC \
     ${CMDLINE:+-append "$CMDLINE"} \

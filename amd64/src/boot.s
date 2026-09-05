@@ -409,6 +409,113 @@ __gdt64_ptr:
                                       * same descriptor valid once in 64-bit
                                       * mode. */
 
+/* ---- AP trampoline ------------------------------------------------------ */
+/* What a secondary core executes from the moment it leaves reset. A STARTUP
+ * IPI names a 4 KiB page below 1 MiB and the core begins there in 16-bit real
+ * mode with CS:IP = (page << 8):0000, so this block lives in the kernel's
+ * .rodata (a high address, like everything else) and `smp::start_secondaries`
+ * COPIES it to physical AP_BASE before the IPI. Every address in it is
+ * therefore spelled as `AP_BASE + (label - ap_trampoline_start)` — a constant
+ * the assembler folds — and never as a bare label, which would name the
+ * .rodata copy that the core cannot see.
+ *
+ * It is the 32-bit trampoline above, replayed for a core that arrives in an
+ * older mode still, and with two differences: the page tables already exist
+ * (the BSP built them and left the root in the mailbox), and the far jumps go
+ * through a GDT of their own whose 0x08 and 0x10 are byte-identical to the
+ * kernel's, so the CS/SS the core arrives in long mode with stay valid when
+ * `gdt::init_cpu` loads the real table. 0x18 is the one extra entry: a 32-bit
+ * code segment for the real->protected jump, which cannot go through an L=1
+ * descriptor.
+ *
+ * The mailbox is the top 256 bytes of the page. The BSP fills it, sends the
+ * IPI, waits for the core to report in, then reuses it for the next one. */
+.set AP_BASE,     0x8000
+.set AP_MB_CR3,   AP_BASE + 0xF00
+.set AP_MB_STACK, AP_BASE + 0xF08
+.set AP_MB_ENTRY, AP_BASE + 0xF10
+.set AP_MB_INDEX, AP_BASE + 0xF18
+
+.section .rodata
+.align 16
+.globl ap_trampoline_start
+ap_trampoline_start:
+.code16
+    cli
+    cld
+    xorw %ax, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+    /* `lgdtl`: the 32-bit form, so the descriptor's base is read as a full
+     * 32-bit linear address rather than 24 bits. */
+    lgdtl AP_BASE + (ap_gdt_ptr - ap_trampoline_start)
+    movl %cr0, %eax
+    orl  $1, %eax
+    movl %eax, %cr0
+    ljmpl $0x18, $(AP_BASE + (ap32 - ap_trampoline_start))
+
+.code32
+ap32:
+    movw $0x10, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+    movw %ax, %fs
+    movw %ax, %gs
+
+    /* CR4.PAE, the root from the mailbox, EFER.LME|NXE, CR0.PG — the same
+     * sequence as `common32`, for the same reasons; see there. */
+    movl %cr4, %eax
+    orl  $(1 << 5), %eax
+    movl %eax, %cr4
+
+    movl AP_MB_CR3, %eax
+    movl %eax, %cr3
+
+    movl $0xC0000080, %ecx
+    rdmsr
+    orl  $((1 << 8) | (1 << 11)), %eax
+    wrmsr
+
+    movl %cr0, %eax
+    orl  $((1 << 31) | (1 << 0)), %eax
+    movl %eax, %cr0
+
+    ljmpl $0x08, $(AP_BASE + (ap64 - ap_trampoline_start))
+
+.code64
+ap64:
+    movw $0x10, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+    movw %ax, %fs
+    movw %ax, %gs
+
+    /* The stack the BSP allocated (a high address, mapped because the root is
+     * the kernel's own PML4 plus an identity slot), this core's index as the
+     * first argument, and the high entry point. `jmp`, not `call`: the entry
+     * never returns, and the BSP already lowered the stack by one word so the
+     * callee sees the alignment `call` would have given it. */
+    movq AP_MB_STACK, %rsp
+    movq AP_MB_INDEX, %rdi
+    movq AP_MB_ENTRY, %rax
+    jmpq *%rax
+
+.align 16
+ap_gdt:
+    .quad 0
+    .quad 0x00AF9A000000FFFF         /* 0x08: code, ring 0, L=1 — as the kernel's */
+    .quad 0x00CF92000000FFFF         /* 0x10: data, ring 0        — as the kernel's */
+    .quad 0x00CF9A000000FFFF         /* 0x18: code, ring 0, D=1 (32-bit), boot only */
+ap_gdt_end:
+ap_gdt_ptr:
+    .word ap_gdt_end - ap_gdt - 1
+    .long AP_BASE + (ap_gdt - ap_trampoline_start)
+.globl ap_trampoline_end
+ap_trampoline_end:
+
 /* ---- boot page tables and stack ----------------------------------------- */
 .section .bss.pagetables, "aw", @nobits
 .align 4096

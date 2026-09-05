@@ -25,6 +25,18 @@
 //! enabling interrupts without masking them invites a spurious IRQ that decodes
 //! as, say, a `#GP` with a garbage error code. Masking is four `outb`s and it is
 //! not optional.
+//!
+//! # One page, one register block per core
+//!
+//! Every core's LAPIC answers at the same physical address — `0xFEE0_0000` is
+//! not one device, it is each core's own, reached through one mapping. So the
+//! page is mapped once ([`init`], on the BSP) and every core then talks to its
+//! own APIC through the same virtual address: [`init_ap`] enables and starts the
+//! timer on the core it runs on, [`eoi`] acknowledges on the core that took the
+//! interrupt, and the ICR writes in [`send_init`]/[`send_startup`] go out from
+//! whichever core issues them. `TICKS` counts the BSP's ticks only, because it is
+//! the clock (`net::uptime_us`); with N cores counting into one word, time would
+//! run N times fast.
 
 use crate::idt;
 use crate::paging::{self, MemAttr, Prot};
@@ -46,9 +58,26 @@ const REG_ID: usize = 0x020;
 const REG_EOI: usize = 0x0B0;
 /// Spurious Interrupt Vector Register. Bit 8 is the software enable.
 const REG_SVR: usize = 0x0F0;
+/// Interrupt Command Register, low half: delivery mode, destination shorthand,
+/// vector, and the delivery-status bit (12) that says a previous IPI is still
+/// being sent.
+const REG_ICR_LOW: usize = 0x300;
+/// ICR high half: the destination APIC id in bits 31:24.
+const REG_ICR_HIGH: usize = 0x310;
 const REG_LVT_TIMER: usize = 0x320;
 const REG_TIMER_INIT: usize = 0x380;
+/// Current count — the timer counting down from `REG_TIMER_INIT`.
+const REG_TIMER_CUR: usize = 0x390;
 const REG_TIMER_DIV: usize = 0x3E0;
+
+/// ICR delivery status: set while the LAPIC is still sending the last IPI.
+const ICR_SEND_PENDING: u32 = 1 << 12;
+/// ICR delivery mode INIT (bits 10:8 = 101), level-triggered, asserted.
+const ICR_INIT_ASSERT: u32 = 0x0000_C500;
+/// The matching de-assert: level bit clear, trigger mode level.
+const ICR_INIT_DEASSERT: u32 = 0x0000_8500;
+/// ICR delivery mode STARTUP (bits 10:8 = 110); the vector goes in bits 7:0.
+const ICR_STARTUP: u32 = 0x0000_4600;
 
 /// Vector for the LAPIC timer. Must be >= 32; 0..31 are CPU exceptions.
 pub const TIMER_VECTOR: u8 = 32;
@@ -118,11 +147,66 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
-/// Called from the timer vector.
+/// Called from the timer vector, on whichever core's timer fired.
+///
+/// The BSP's ticks are the kernel's clock; every core's are counted per core
+/// (`smp::ticks_on`) and every core's request a reschedule of *that core*.
 pub fn on_tick() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    crate::smp::this_cpu_tick();
+    if crate::smp::cpu_index() == 0 {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
     crate::sched::set_need_resched();
     eoi();
+}
+
+/// This core's APIC id, from its own ID register.
+#[must_use]
+pub fn apic_id() -> u32 {
+    read(REG_ID) >> 24
+}
+
+/// Spin until the last IPI has left this core's LAPIC.
+fn icr_wait_idle() {
+    while read(REG_ICR_LOW) & ICR_SEND_PENDING != 0 {
+        core::hint::spin_loop();
+    }
+}
+
+fn send_ipi(dest_apic_id: u32, low: u32) {
+    icr_wait_idle();
+    write(REG_ICR_HIGH, dest_apic_id << 24);
+    write(REG_ICR_LOW, low);
+    icr_wait_idle();
+}
+
+/// Send INIT to one core: reset it to the wait-for-STARTUP state. Assert then
+/// de-assert, as the multiprocessor specification's sequence has it; a VMM
+/// accepts either alone, and real parts have wanted both.
+pub fn send_init(dest_apic_id: u32) {
+    send_ipi(dest_apic_id, ICR_INIT_ASSERT);
+    send_ipi(dest_apic_id, ICR_INIT_DEASSERT);
+}
+
+/// Send STARTUP to one core: begin executing in real mode at `vector << 12`.
+pub fn send_startup(dest_apic_id: u32, vector: u8) {
+    send_ipi(dest_apic_id, ICR_STARTUP | u32::from(vector));
+}
+
+/// Block for `counts` ticks of this core's APIC timer, delivering nothing.
+///
+/// Borrows the timer: one-shot, LVT masked, spin on the current count. The
+/// caller's timer configuration is not preserved — [`start_timer`] re-arms it —
+/// so this is for phases where the timer is stopped anyway (AP bring-up). The
+/// unit is the same uncalibrated one `start_timer` uses; see there.
+pub fn delay_counts(counts: u32) {
+    write(REG_TIMER_DIV, TIMER_DIV_16);
+    write(REG_LVT_TIMER, LVT_MASKED);
+    write(REG_TIMER_INIT, counts);
+    while read(REG_TIMER_CUR) != 0 {
+        core::hint::spin_loop();
+    }
+    write(REG_TIMER_INIT, 0);
 }
 
 /// Mask both legacy 8259 PICs.
@@ -180,6 +264,7 @@ pub fn init() -> bool {
     write(REG_SVR, (1 << 8) | u32::from(SPURIOUS_VECTOR));
 
     idt::set_handler(TIMER_VECTOR, idt::timer_interrupt_entry());
+    crate::smp::set_bsp_lapic_id(read(REG_ID) >> 24);
 
     start_timer();
 
@@ -191,6 +276,19 @@ pub fn init() -> bool {
     serial::put_dec(u64::from(TIMER_VECTOR));
     serial::puts(" periodic\n");
     true
+}
+
+/// Bring up the LAPIC of a secondary core: enable it and start its timer.
+///
+/// The page is already mapped (a shared kernel mapping) and the timer vector
+/// already has its handler; what is per core is the enable bit in this core's
+/// `IA32_APIC_BASE`, its spurious vector, and its own timer.
+pub fn init_ap() {
+    let base_msr = rdmsr(IA32_APIC_BASE);
+    // SAFETY: as in `init` — one bit, the address left as found.
+    unsafe { wrmsr(IA32_APIC_BASE, base_msr | APIC_GLOBAL_ENABLE) };
+    write(REG_SVR, (1 << 8) | u32::from(SPURIOUS_VECTOR));
+    start_timer();
 }
 
 /// Arm the periodic timer.

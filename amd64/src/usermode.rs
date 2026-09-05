@@ -91,10 +91,12 @@ const HELLO_ELF: &[u8] = include_bytes!(env!("USER_HELLO_ELF"));
 
 /// Where a task's kernel stack and saved user stack live.
 ///
-/// One per task. `syscall_entry` reaches the running task's through
-/// [`CURRENT_UCTX`]; the scheduler repoints that on every switch. They were two
-/// globals until multitasking made that wrong — a syscall taken by one process
-/// would have written another's saved stack pointer.
+/// One per task. `syscall_entry` reaches the running task's through the
+/// per-CPU block (`gs:[8]`, `smp::current_uctx`); the scheduler repoints that
+/// on every switch. They were two globals until multitasking made that wrong —
+/// a syscall taken by one process would have written another's saved stack
+/// pointer — and the pointer to them was one global until SMP made *that*
+/// wrong the same way.
 /// Field offsets are load-bearing: `syscall_entry` indexes this by hand as
 /// `[rax + 0]`, `[rax + 8]`, `[rax + 16]` and `[rax + 32]`. Reordering the
 /// fields silently changes what that assembly reads.
@@ -131,6 +133,13 @@ pub struct UserCtx {
     /// `sys_fork` copies this into the child so it resumes as a true
     /// full-register copy of the parent — see `enter_user_mode_forked`.
     pub saved_regs: [u64; 12],
+    /// This task's user `%gs` base. Offset 144 — not indexed by assembly.
+    /// `arch_prctl(ARCH_SET_GS)` records it; the scheduler writes it to
+    /// `IA32_KERNEL_GS_BASE` on every switch, which is the register `swapgs`
+    /// turns into the program's `GS_BASE` on the way back to ring 3. The kernel
+    /// keeps its own per-CPU block in the other half of that pair (`smp.rs`),
+    /// so the program's value can never be written to `IA32_GS_BASE` directly.
+    pub gs_base: u64,
 }
 
 impl UserCtx {
@@ -144,13 +153,10 @@ impl UserCtx {
             user_rip: 0,
             fs_base: 0,
             saved_regs: [0; 12],
+            gs_base: 0,
         }
     }
 }
-
-/// The running task's [`UserCtx`]. Repointed by the scheduler on every switch.
-#[unsafe(no_mangle)]
-pub static mut CURRENT_UCTX: *mut UserCtx = core::ptr::null_mut();
 
 /// How many syscalls arrived.
 static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -169,8 +175,13 @@ static EXIT_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// concurrently needs the *interleaving*, not just the totals: three writes from
 /// A followed by three from B would satisfy every count-based check and would
 /// mean the scheduler never switched.
-static WRITE_SEQ: [AtomicU64; 16] = [const { AtomicU64::new(u64::MAX) }; 16];
+static WRITE_SEQ: [AtomicU64; 32] = [const { AtomicU64::new(u64::MAX) }; 32];
 static WRITE_SEQ_LEN: AtomicU64 = AtomicU64::new(0);
+/// Which *core* served each `write`, alongside [`WRITE_SEQ`]. Two processes
+/// whose writes arrive from two cores ran on two cores — the ring-3 half of
+/// the SMP self-test, and the only witness of user-mode parallelism the kernel
+/// can take without instrumenting the programs.
+static WRITE_CPU: [AtomicU64; 32] = [const { AtomicU64::new(u64::MAX) }; 32];
 
 /// Largest `write` this kernel will accept. A bound rather than trust: `len`
 /// comes from ring 3, and an unbounded length would walk off the mapped page
@@ -194,12 +205,20 @@ syscall_entry:
      * stack. Interrupts are off (IA32_FMASK clears IF), so this window cannot
      * be interrupted while rsp still points at user memory.
      *
-     * Every saved slot is per-task, reached through CURRENT_UCTX. With more
-     * than one process, globals would be wrong twice over: a syscall by task A
-     * would overwrite task B's saved user stack, and a context switch *inside*
-     * a syscall would corrupt whichever kernel stack the two shared. */
-    mov [rip + SYSCALL_SCRATCH], rax
-    mov rax, [rip + CURRENT_UCTX]
+     * `swapgs` first: %gs now holds this core's per-CPU block (`smp.rs`), and
+     * the program's GS base is parked in IA32_KERNEL_GS_BASE until the matching
+     * `swapgs` before `sysretq`. Everything this stub needs before it has a
+     * stack — the running task's UserCtx, one word of scratch — is reached
+     * through gs:[..], which is why two cores can be in here at once.
+     *
+     * Every saved slot is per-task, reached through the UserCtx pointer at
+     * gs:[8]. With more than one process, globals would be wrong twice over: a
+     * syscall by task A would overwrite task B's saved user stack, and a
+     * context switch *inside* a syscall would corrupt whichever kernel stack
+     * the two shared. */
+    swapgs
+    mov gs:[16], rax                /* percpu.scratch  = nr, while rax is a pointer */
+    mov rax, gs:[8]                 /* percpu.current_uctx */
     mov [rax + 8], rsp              /* uctx.user_rsp   = user rsp   */
     mov [rax + 32], rcx             /* uctx.user_rip   = return addr (for vfork) */
     /* Full user register snapshot into uctx.saved_regs[12] (offset 48). Every
@@ -221,7 +240,7 @@ syscall_entry:
     mov [rax + 128], r14
     mov [rax + 136], r15
     mov rsp, [rax + 0]              /* kernel stack    = uctx.kernel_rsp */
-    mov rax, [rip + SYSCALL_SCRATCH]
+    mov rax, gs:[16]
 
     push rcx                        /* user rip    */
     push r11                        /* user rflags */
@@ -294,7 +313,7 @@ syscall_entry:
      * another architecture different again. Per-task, because a process that
      * exits must not make the *next* process return early from its own
      * syscall. */
-    mov rcx, [rip + CURRENT_UCTX]
+    mov rcx, gs:[8]
     cmp qword ptr [rcx + 16], 0     /* uctx.leave */
     jne .Lexit_to_kernel
 
@@ -302,16 +321,20 @@ syscall_entry:
     pop rcx                         /* user rip    */
     /* rax holds the result and must survive the stack switch; rcx and r11 are
      * now live for sysretq, so the scratch slot is the only place left. */
-    mov [rip + SYSCALL_SCRATCH], rax
-    mov rax, [rip + CURRENT_UCTX]
+    mov gs:[16], rax
+    mov rax, gs:[8]
     mov rsp, [rax + 8]              /* back to this task's user stack */
-    mov rax, [rip + SYSCALL_SCRATCH]
+    mov rax, gs:[16]
+    /* The program's %gs back, the kernel's parked. The BKL was released in
+     * `syscall_handler` already; nothing between there and here touches
+     * shared state. */
+    swapgs
     sysretq
 
 .Lexit_to_kernel:
     /* Leave ring 3 for good. Restore what enter_user_mode saved and return from
      * it; rax still holds the handler's result. rcx already points at the
-     * uctx. */
+     * uctx. Still in ring 0, so %gs stays the kernel's: no swapgs. */
     mov rsp, [rcx + 0]
     pop r15
     pop r14
@@ -334,7 +357,7 @@ enter_user_mode:
     push r14
     push r15
 
-    mov rax, [rip + CURRENT_UCTX]
+    mov rax, gs:[8]                 /* percpu.current_uctx */
     /* Publish this task's kernel stack: both the syscall path and the exit path
      * resume on it. */
     mov [rax + 0], rsp
@@ -349,6 +372,7 @@ enter_user_mode:
     mov r11, 0x202                  /* ...and rflags from r11: IF set, bit 1 reserved-1 */
     mov rsp, rsi                    /* user stack */
     mov rax, rdx                    /* ring-3 entry rax (vfork child return value) */
+    swapgs                          /* the program's %gs; the kernel's is parked */
     sysretq
 
 .global enter_user_mode_forked
@@ -365,7 +389,7 @@ enter_user_mode_forked:
     push r14
     push r15
 
-    mov rax, [rip + CURRENT_UCTX]  /* rax = this task's uctx, kept until the end */
+    mov rax, gs:[8]                /* rax = this task's uctx, kept until the end */
     mov [rax + 0], rsp             /* publish this task's kernel stack */
     mov qword ptr [rax + 16], 0    /* clear the leave flag */
 
@@ -389,12 +413,8 @@ enter_user_mode_forked:
     mov rsp, rsi                   /* user stack (before rsi is reloaded) */
     mov rsi, [rax + 56]
     xor eax, eax                   /* child sees vfork() == 0 */
+    swapgs
     sysretq
-
-    .section .bss
-    .align 16
-SYSCALL_SCRATCH:
-    .skip 8
 "#
 );
 
@@ -450,6 +470,70 @@ pub fn set_fs_base(base: u64) {
     unsafe { wrmsr(IA32_FS_BASE, base) };
 }
 
+/// Set the *program's* `%gs` base — `IA32_KERNEL_GS_BASE`, which is where it
+/// lives while the kernel runs and what `swapgs` installs on the way back to
+/// ring 3. Never `IA32_GS_BASE`: in ring 0 that is the per-CPU block.
+pub fn set_user_gs_base(base: u64) {
+    // SAFETY: the parked half of the `%gs` pair; a bad value only faults the
+    // program's own `%gs:` accesses.
+    unsafe { wrmsr(crate::smp::IA32_KERNEL_GS_BASE, base) };
+}
+
+/// Leave ring 3 from an exception handler as if the program had called
+/// `exit_group(status)`.
+///
+/// The syscall path's `.Lexit_to_kernel`, done by hand: back onto the task's
+/// kernel stack at the point `enter_user_mode` saved its callee-saved registers,
+/// pop them, and return into `run_process` with `status` in `rax`. The trap
+/// stack the exception arrived on is simply abandoned — nothing on it is
+/// needed again. Takes the BKL first, because the code it returns into is
+/// kernel code and expects to hold it; the exception stub already `swapgs`'d,
+/// so the per-CPU block is in place.
+pub fn kill_current_from_fault(status: u64) -> ! {
+    crate::smp::bkl_enter();
+    EXIT_STATUS.store(status, Ordering::Relaxed);
+    let uctx = crate::smp::current_uctx();
+    assert!(!uctx.is_null(), "ring-3 fault with no current UserCtx");
+    // SAFETY: `uctx.kernel_rsp` is the stack `enter_user_mode` published for
+    // this task, with the six callee-saved registers and its return address on
+    // top; this is exactly the sequence `.Lexit_to_kernel` runs.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, [{uctx}]",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop rbx",
+            "pop rbp",
+            "ret",
+            uctx = in(reg) uctx,
+            in("rax") status,
+            options(noreturn)
+        );
+    }
+}
+
+/// Drop to ring 3 for `entry`/`stack`, holding the BKL on the way in and out.
+///
+/// Ring 3 does not hold the lock: it is released here, just before the
+/// `sysret`, and the task returns holding it again — `syscall_handler` took it
+/// for the syscall that decided to leave ring 3 and deliberately did not let go.
+/// Nothing between the release and the `sysretq` touches shared state; the
+/// assembly reads only this task's `UserCtx` and this core's per-CPU block.
+fn enter_user(entry: u64, stack: u64, forked: bool) -> u64 {
+    crate::smp::bkl_leave();
+    // SAFETY: the caller's obligation, stated on `enter_user_mode` — the
+    // addresses come from the loader for the space the scheduler installed.
+    unsafe {
+        if forked {
+            enter_user_mode_forked(entry, stack)
+        } else {
+            enter_user_mode(entry, stack, 0)
+        }
+    }
+}
+
 /// The kernel side of a `syscall`.
 ///
 /// Runs on the dedicated syscall stack with interrupts off. Returns the value
@@ -461,6 +545,11 @@ pub fn set_fs_base(base: u64) {
 /// against names can.
 #[unsafe(no_mangle)]
 extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    // Ring 3 does not hold the Big Kernel Lock; kernel code does. Taken here,
+    // released at the bottom unless this syscall is the one that leaves ring 3
+    // for good — that path returns into kernel code (`run_process`) which
+    // expects to hold it.
+    crate::smp::bkl_enter();
     CALLS.fetch_add(1, Ordering::Relaxed);
     let trace = SYSCALL_TRACE.load(Ordering::Relaxed);
     // Entry line: a syscall that blocks forever has no result line, so the
@@ -469,7 +558,11 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
     // syscalls also get their path, bounded by the same decode the syscall
     // itself uses.
     if trace {
-        serial::puts("[sc>] nr=");
+        serial::puts("[sc>] cpu=");
+        serial::put_dec(crate::smp::cpu_index() as u64);
+        serial::puts(" task=");
+        serial::put_dec(crate::sched::current_task() as u64);
+        serial::puts(" nr=");
         serial::put_dec(nr);
         serial::puts(" a1=0x");
         serial::put_hex(a1);
@@ -504,11 +597,21 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
     }
     let r = syscall_dispatch(nr, a1, a2, a3, a4, a5);
     if trace {
-        serial::puts("[sc] nr=");
+        serial::puts("[sc] cpu=");
+        serial::put_dec(crate::smp::cpu_index() as u64);
+        serial::puts(" task=");
+        serial::put_dec(crate::sched::current_task() as u64);
+        serial::puts(" nr=");
         serial::put_dec(nr);
         serial::puts(" -> 0x");
         serial::put_hex(r);
         serial::puts("\n");
+    }
+    let uctx = crate::smp::current_uctx();
+    // SAFETY: this task's own `UserCtx`, which only this task writes.
+    let leaving = unsafe { !uctx.is_null() && (*uctx).leave != 0 };
+    if !leaving {
+        crate::smp::bkl_leave();
     }
     r
 }
@@ -809,8 +912,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             // running task's context is what `syscall_entry` will read on the
             // way out, and only this task can be inside a syscall.
             unsafe {
-                let cur = &raw const CURRENT_UCTX;
-                let uctx = *cur;
+                let uctx = crate::smp::current_uctx();
                 if !uctx.is_null() {
                     (*uctx).leave = 1;
                 }
@@ -964,7 +1066,6 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
     const ARCH_GET_FS: u64 = 0x1003;
     const ARCH_GET_GS: u64 = 0x1004;
     const IA32_FS_BASE: u32 = 0xC000_0100;
-    const IA32_GS_BASE: u32 = 0xC000_0101;
     match code {
         ARCH_SET_FS => {
             // SAFETY: sets the current CPU's FS base to a userspace-supplied
@@ -977,8 +1078,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             // garbage pointer) is what made this field load-bearing.
             unsafe {
                 wrmsr(IA32_FS_BASE, addr);
-                let cur = &raw const CURRENT_UCTX;
-                let uctx = *cur;
+                let uctx = crate::smp::current_uctx();
                 if !uctx.is_null() {
                     (*uctx).fs_base = addr;
                 }
@@ -986,8 +1086,19 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             0
         }
         ARCH_SET_GS => {
-            // SAFETY: as above for GS. Nothing in this kernel uses GS base.
-            unsafe { wrmsr(IA32_GS_BASE, addr) };
+            // The program's GS lives in IA32_KERNEL_GS_BASE while the kernel
+            // runs — IA32_GS_BASE is this core's per-CPU block right now, and
+            // writing the program's value there would point every `gs:[..]` in
+            // the kernel at user memory. Recorded per task for the same reason
+            // as FS.
+            set_user_gs_base(addr);
+            // SAFETY: this task's own `UserCtx`.
+            unsafe {
+                let uctx = crate::smp::current_uctx();
+                if !uctx.is_null() {
+                    (*uctx).gs_base = addr;
+                }
+            }
             0
         }
         ARCH_GET_FS => {
@@ -997,7 +1108,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             0
         }
         ARCH_GET_GS => {
-            if !crate::uaccess::write_val::<u64>(addr, rdmsr(IA32_GS_BASE)) {
+            if !crate::uaccess::write_val::<u64>(addr, rdmsr(crate::smp::IA32_KERNEL_GS_BASE)) {
                 return crate::fd::errno::EFAULT;
             }
             0
@@ -1075,6 +1186,9 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     let n = WRITE_SEQ_LEN.fetch_add(1, Ordering::Relaxed) as usize;
     if let Some(slot) = WRITE_SEQ.get(n) {
         slot.store(crate::sched::current_task() as u64, Ordering::Relaxed);
+    }
+    if let Some(slot) = WRITE_CPU.get(n) {
+        slot.store(crate::smp::cpu_index() as u64, Ordering::Relaxed);
     }
     WRITTEN.fetch_add(len, Ordering::Relaxed);
     len
@@ -1450,10 +1564,9 @@ fn run_process(idx: usize) -> ! {
         let mut forked_child = forked;
         // Tell the syscall path which process this is, so fd 0/1/2 route to
         // this task's pipes (if it is a spawned child) rather than the console.
-        // SAFETY: single core; `CURRENT_UCTX` points at this task's own slot.
+        // SAFETY: under the BKL; the per-CPU `UserCtx` pointer is this task's own slot.
         unsafe {
-            let cur = &raw const CURRENT_UCTX;
-            let uctx = *cur;
+            let uctx = crate::smp::current_uctx();
             if !uctx.is_null() {
                 (*uctx).proc_slot = idx;
             }
@@ -1467,11 +1580,10 @@ fn run_process(idx: usize) -> ! {
         // re-enter ring 3 at the new entry — the same task, a new program.
         let (mut entry, mut stack) = (entry, stack);
         let status = loop {
-            let status = if forked_child {
+            let status = {
+                let forked = forked_child;
                 forked_child = false;
-                unsafe { enter_user_mode_forked(entry, stack) }
-            } else {
-                unsafe { enter_user_mode(entry, stack, 0) }
+                enter_user(entry, stack, forked)
             };
             let Some(next) = take_pending_exec(idx) else {
                 break status;
@@ -1697,11 +1809,10 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         let pending = &raw mut PENDING_EXEC;
         (*pending)[slot] = Some(proc);
     }
-    // SAFETY: single core, interrupts off inside a syscall; `CURRENT_UCTX` is
+    // SAFETY: under the BKL, interrupts off inside a syscall; the per-CPU `UserCtx` is
     // this task's slot. Same `leave` mechanism `exit` uses.
     unsafe {
-        let cur = &raw const CURRENT_UCTX;
-        let uctx = *cur;
+        let uctx = crate::smp::current_uctx();
         if !uctx.is_null() {
             (*uctx).leave = 1;
         }
@@ -1741,17 +1852,17 @@ fn sys_fork() -> u64 {
     // The point the child resumes from — the parent's own user RIP/RSP as
     // captured on the way into this syscall — plus its TLS base and register
     // snapshot.
-    // SAFETY: raw-pointer read; single core. `CURRENT_UCTX` is this task's.
-    let (user_rip, user_rsp, parent_fs_base, parent_regs) = unsafe {
-        let cur = &raw const CURRENT_UCTX;
-        let uctx = *cur;
+    // SAFETY: raw-pointer read under the BKL; the per-CPU `UserCtx` is this task's.
+    let (user_rip, user_rsp, parent_fs_base, parent_gs_base, parent_regs) = unsafe {
+        let uctx = crate::smp::current_uctx();
         if uctx.is_null() {
-            (0, 0, 0, [0u64; 12])
+            (0, 0, 0, 0, [0u64; 12])
         } else {
             (
                 (*uctx).user_rip,
                 (*uctx).user_rsp,
                 (*uctx).fs_base,
+                (*uctx).gs_base,
                 (*uctx).saved_regs,
             )
         }
@@ -1808,7 +1919,7 @@ fn sys_fork() -> u64 {
         take_proc_slot(slot);
         return errno::ENOMEM;
     };
-    crate::sched::seed_forked_task(task_slot, parent_fs_base, &parent_regs);
+    crate::sched::seed_forked_task(task_slot, parent_fs_base, parent_gs_base, &parent_regs);
     // Published last: the child's register/TLS snapshot must be in place before
     // anything can schedule it — same ordering rule as `spawn_in_space`'s space
     // root (a tick between spawn and seed used to run the child on garbage).
@@ -2008,10 +2119,9 @@ pub fn current_stdout_pipe() -> Option<PipeId> {
 }
 
 pub fn current_proc_slot() -> usize {
-    // SAFETY: single core; `CURRENT_UCTX` points at the running task's slot.
+    // SAFETY: under the BKL; the per-CPU `UserCtx` pointer is the running task's slot.
     unsafe {
-        let cur = &raw const CURRENT_UCTX;
-        let uctx = *cur;
+        let uctx = crate::smp::current_uctx();
         if uctx.is_null() {
             usize::MAX
         } else {
@@ -2538,6 +2648,86 @@ pub fn preempt_test(t: &mut Suite) {
     }
     t.check_eq(
         "preempt: teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+}
+
+/// Two spinning processes with every core running: do they end up on different
+/// cores?
+///
+/// The ring-3 half of `smp::smoke_test`. Its kernel workers proved two *kernel*
+/// tasks can execute at once by dropping the BKL around a spin; this proves the
+/// thing the BKL design is for — that user code needs no such favour. The same
+/// two non-yielding programs as [`preempt_test`], with each `write` tagged by
+/// the core that served it ([`WRITE_CPU`]): with a second core idling next to a
+/// BSP that is busy driving the test, the idle core's tick picks one of them
+/// up, and the writes arrive from two cores. Skipped, and said so, on one core.
+pub fn smp_parallel_test(t: &mut Suite) {
+    const ROUNDS: u32 = 3;
+    const DELAY: u32 = 8_000_000;
+
+    if crate::smp::online_cpus() < 2 {
+        t.note("smp: one core online, ring-3 parallelism check skipped", 1);
+        return;
+    }
+
+    let base = WRITE_SEQ_LEN.load(Ordering::Relaxed);
+    let free_before = akuma_pmm::free_count();
+
+    let (Some(c), Some(d)) = (
+        Process::new(b"    [ring3 E] spinning on some core\n", ROUNDS, DELAY, 0x0E),
+        Process::new(b"    [ring3 F] spinning on some core\n", ROUNDS, DELAY, 0x0F),
+    ) else {
+        t.check("smp ring3: processes built", false);
+        return;
+    };
+    let (root_c, root_d) = (c.space.root(), d.space.root());
+
+    // SAFETY: under the BKL; written before the tasks that read them exist.
+    // Slots 2 and 3 are free again: `preempt_test` took its processes back.
+    unsafe {
+        let procs = &raw mut PROCS;
+        (*procs)[2] = Some(c);
+        (*procs)[3] = Some(d);
+    }
+
+    let spawned = crate::sched::spawn_in_space(proc2_entry, root_c).is_some()
+        && crate::sched::spawn_in_space(proc3_entry, root_d).is_some();
+    if !t.check("smp ring3: processes spawned", spawned) {
+        return;
+    }
+
+    serial::puts("  -- userspace output follows (two cores) --\n");
+    crate::lapic::start_timer();
+    let mut spins = 0u64;
+    while !crate::sched::all_user_tasks_finished() && spins < 100_000_000 {
+        spins += 1;
+        crate::sched::yield_now();
+    }
+    crate::lapic::stop_timer();
+
+    let len = WRITE_SEQ_LEN.load(Ordering::Relaxed).min(WRITE_SEQ.len() as u64);
+    let cpus = (base..len).fold(0u64, |acc, i| {
+        let c = WRITE_CPU[i as usize].load(Ordering::Relaxed);
+        if c < 64 { acc | (1 << c) } else { acc }
+    });
+
+    t.check_eq("smp ring3: writes served", len - base, u64::from(ROUNDS) * 2);
+    t.note("smp ring3: cpu mask the writes came from", cpus);
+    t.check("smp ring3: two processes ran on two cores", cpus.count_ones() >= 2);
+
+    // SAFETY: both tasks have finished; nothing else touches these slots.
+    unsafe {
+        let procs = &raw mut PROCS;
+        for slot in 2..4 {
+            if let Some(p) = (*procs)[slot].take() {
+                p.free();
+            }
+        }
+    }
+    t.check_eq(
+        "smp ring3: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
         free_before as u64,
     );
