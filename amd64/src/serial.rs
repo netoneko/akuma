@@ -23,6 +23,10 @@ const LINE_CTRL: u16 = 3;
 const MODEM_CTRL: u16 = 4;
 const LINE_STATUS: u16 = 5;
 
+/// Scratch register: a byte the chip stores and hands back, and does nothing
+/// else with. The probe register, for exactly that reason.
+const SCRATCH: u16 = 7;
+
 /// Line status bit 5: transmit holding register empty.
 const LSR_THR_EMPTY: u8 = 1 << 5;
 /// Data Ready — a byte is waiting in the receive buffer.
@@ -42,6 +46,19 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// lock held by a core that died mid-line must not silence the report.
 static LOCK: AtomicBool = AtomicBool::new(false);
 const LOCK_BUDGET: u32 = 1 << 22;
+
+/// Did a 16550 answer the probe in [`init`]?
+///
+/// **An absent x86 I/O port reads `0xFF`.** On a machine with no UART — the
+/// bare-metal HP box, whose console is a framebuffer — polling `LSR` for
+/// data-ready therefore says "a byte is waiting", forever, and the byte is
+/// `0xFF`: a phantom keyboard typing an endless stream of one character. The
+/// first `sh` on that machine filled its screen with replacement glyphs from a
+/// stdin that never stopped (`docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md`,
+/// "not a kernel bug at all"). Every read path checks this and reports "no
+/// data" when nothing is there; the write path still mirrors to the
+/// framebuffer and skips the port.
+static PRESENT: AtomicBool = AtomicBool::new(false);
 
 struct Guard;
 
@@ -73,6 +90,24 @@ impl Drop for Guard {
 /// emulation — which is exactly the class of bug that only shows up on
 /// hardware, so it is set correctly here rather than left at the default.
 pub fn init() {
+    // Probe first: write two patterns to the scratch register and read them
+    // back. A real chip returns what it was given; an empty bus returns 0xFF
+    // for both — and a value of 0xFF from a real chip for the *first* pattern
+    // would be caught by the second. Only a chip that answers gets configured
+    // or read from.
+    // SAFETY: the scratch register is a plain storage byte with no side effect
+    // on a 16550, and an absent port ignores writes.
+    let present = unsafe {
+        outb(COM1 + SCRATCH, 0x5A);
+        let a = inb(COM1 + SCRATCH);
+        outb(COM1 + SCRATCH, 0xA5);
+        let b = inb(COM1 + SCRATCH);
+        a == 0x5A && b == 0xA5
+    };
+    PRESENT.store(present, Ordering::Release);
+    if !present {
+        return;
+    }
     // SAFETY: COM1's register block is fixed by the PC architecture.
     unsafe {
         outb(COM1 + INT_ENABLE, 0x00); // no interrupts; this driver polls
@@ -108,6 +143,9 @@ fn putb_raw(byte: u8) {
     // on.
     crate::multiboot2::mirror_byte(byte);
 
+    if !PRESENT.load(Ordering::Relaxed) {
+        return;
+    }
     // SAFETY: COM1's register block is fixed by the PC architecture.
     unsafe {
         while inb(COM1 + LINE_STATUS) & LSR_THR_EMPTY == 0 {
@@ -115,6 +153,12 @@ fn putb_raw(byte: u8) {
         }
         outb(COM1 + DATA, byte);
     }
+}
+
+/// Did [`init`] find a UART? `false` means every read reports no data.
+#[must_use]
+pub fn present() -> bool {
+    PRESENT.load(Ordering::Relaxed)
 }
 
 /// Emit a string, translating `\n` to CRLF.
@@ -130,6 +174,9 @@ fn putb_raw(byte: u8) {
 /// device layer.
 #[must_use]
 pub fn getb() -> Option<u8> {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return None; // no chip: no data, not an endless 0xFF
+    }
     // SAFETY: two reads of the 16550's own port range, which `init` configured.
     unsafe {
         if inb(COM1 + LINE_STATUS) & LSR_DATA_READY == 0 {
@@ -144,6 +191,9 @@ pub fn getb() -> Option<u8> {
 /// `read`.
 #[must_use]
 pub fn has_byte() -> bool {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return false;
+    }
     // SAFETY: one read of the 16550's line-status port, configured by `init`.
     unsafe { inb(COM1 + LINE_STATUS) & LSR_DATA_READY != 0 }
 }

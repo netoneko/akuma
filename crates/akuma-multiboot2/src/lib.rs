@@ -359,7 +359,22 @@ impl<'a> BootInfo<'a> {
     /// Whether an ACPI RSDP was passed.
     #[must_use]
     pub fn has_acpi(&self) -> bool {
-        self.tag(tag::ACPI_NEW).is_some() || self.tag(tag::ACPI_OLD).is_some()
+        self.rsdp().is_some()
+    }
+
+    /// The ACPI RSDP the loader passed, as the bytes of the structure itself
+    /// — a **copy** GRUB made, not the firmware's original, so its own address
+    /// means nothing but the table pointers inside it are the real ones.
+    ///
+    /// The 2.0 tag (36 bytes, with the XSDT pointer) is preferred over the 1.0
+    /// one (20 bytes, RSDT only) when both are present, which GRUB on UEFI does
+    /// produce. This is how a UEFI machine's tables are found at all: there is
+    /// no RSDP in the BIOS window there to scan for.
+    #[must_use]
+    pub fn rsdp(&self) -> Option<&'a [u8]> {
+        self.tag(tag::ACPI_NEW)
+            .or_else(|| self.tag(tag::ACPI_OLD))
+            .map(|t| t.body)
     }
 
     /// Where the image was loaded, if the loader said.

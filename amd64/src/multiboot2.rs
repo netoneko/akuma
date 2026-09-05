@@ -198,6 +198,12 @@ pub fn mirror_byte(byte: u8) {
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     ega_text(0, "Akuma/amd64: multiboot2 entry reached");
+    // Probe for a UART and configure it if one answers. This path never called
+    // `serial::init` — the reference machine has no serial port — and got away
+    // with it because an absent port ignores writes. Since the probe gates every
+    // port access (see `serial::PRESENT`), skipping it would mean no serial
+    // output at all on a machine that does have one.
+    serial::init();
 
     // SAFETY: GRUB guarantees %ebx points at an information block whose first
     // u32 is its own total size, and boot.s has mapped all of low physical
@@ -248,6 +254,8 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // appears without knowing a framebuffer exists.
     serial::puts("\nAkuma/amd64 - bare metal, booted by ");
     serial::puts(info.loader_name());
+    serial::puts("\n  uart: ");
+    serial::puts(if serial::present() { "present" } else { "absent (reads report no data)" });
     serial::puts("\n  fb:   ");
     serial::put_dec(u64::from(fb.width));
     serial::puts("x");
@@ -260,9 +268,13 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     serial::put_hex(fb.addr);
     serial::puts("\n");
 
-    // Descriptor tables, SMAP, then drop the identity map. Same order and the
-    // same reasons as `kmain`; see the comments there.
+    // Descriptor tables, the BSP's per-CPU block, SMAP, then drop the identity
+    // map. Same order and the same reasons as `kmain`; see the comments there.
+    // `smp::init_bsp` is not optional on this path either: the scheduler and
+    // the syscall stubs reach their per-core state through `%gs`, and without
+    // the block installed the first `yield_now` reads address 0.
     crate::gdt::init();
+    crate::smp::init_bsp();
     crate::idt::init();
     let smap = crate::uaccess::init_smap();
     crate::paging::drop_identity_map();
@@ -337,6 +349,29 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     crate::usermode::init_syscall();
     crate::usermode::smoke_test(&mut t);
     crate::usermode::preempt_test(&mut t);
+
+    // The other cores, exactly where `kmain` starts them. What is different on
+    // a firmware boot is what might be sitting on the trampoline page: the
+    // information block this function is still reading, or the root filesystem
+    // GRUB left in RAM. Either one there means single core rather than a copy
+    // over it.
+    let keep_out = [
+        (info_phys, info_phys + bytes.len() as u64),
+        info.first_module().map_or((0, 0), |m| (u64::from(m.start), u64::from(m.end))),
+    ];
+    let expected_aps = machine
+        .madt
+        .as_ref()
+        .map_or(0, |m| m.cpus().len().saturating_sub(1).min(crate::smp::MAX_CPUS - 1));
+    let started = if crate::smp::trampoline_page_available(&machine, &keep_out) {
+        crate::smp::start_secondaries(machine.madt.as_ref())
+    } else {
+        serial::puts("  smp:  trampoline page is not free RAM — single core\n");
+        0
+    };
+    crate::smp::smoke_test(&mut t, expected_aps, started);
+    crate::usermode::smp_parallel_test(&mut t);
+
     crate::lapic::start_timer();
     crate::usermode::elf_test(&mut t);
     crate::usermode::fdprobe_test(&mut t);
@@ -354,14 +389,27 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // is a way to spend an hour debugging the wrong layer.
     if passed && have_fs {
         let path = init_path(info.cmdline());
+        // `initargs=a,b,c`, comma-separated as on the PVH path: `init=/bin/busybox
+        // initargs=uname,-a` runs one applet and exits, which on a machine with
+        // no input device is the whole shape of "run something and see".
+        let args: alloc::vec::Vec<&str> = info
+            .cmdline()
+            .split_ascii_whitespace()
+            .find_map(|t| t.strip_prefix("initargs="))
+            .map(|v| v.split(',').filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
         serial::puts("\n-- running ");
         serial::puts(path);
+        for a in &args {
+            serial::puts(" ");
+            serial::puts(a);
+        }
         serial::puts(" --\n");
         // NOTE: stdout reaches the screen through the mirror, but STDIN IS NOT
         // CONNECTED. This board's keyboard is USB and there is no HID stack, so
         // an interactive shell will print its prompt and then block on a read
         // that nothing can satisfy. That is expected, and it is the next gap.
-        crate::usermode::run_init(path, &[]);
+        crate::usermode::run_init(path, &args);
     }
 
     cycle_forever()
@@ -398,7 +446,20 @@ fn machine_from(info: &BootInfo<'_>) -> MachineDescription {
     for (i, (base, len)) in usable[..n].iter().enumerate() {
         regions[i] = MemRegion { addr: *base, size: *len, kind: 1 };
     }
-    MachineDescription::from_memory_map(&regions[..n], None, None)
+
+    // ACPI, through the loader's copy of the RSDP. On a UEFI machine there is
+    // no RSDP in the BIOS window to scan for — the `describe` path's
+    // `find_rsdp` would come up empty — but the copy's XSDT pointer is the
+    // firmware's real one, and the tables live below 4 GiB where the physmap
+    // reaches. The MADT is what tells `smp` how many cores this box has.
+    let rsdp = info
+        .rsdp()
+        .and_then(akuma_ryzen_amd64::acpi::rsdp_from_bytes);
+    let madt = rsdp.as_ref().and_then(|r| {
+        akuma_ryzen_amd64::acpi::find_table(&crate::machine::Physmap, r, b"APIC")
+            .and_then(|t| akuma_ryzen_amd64::acpi::parse_madt(&crate::machine::Physmap, &t))
+    });
+    MachineDescription::from_memory_map(&regions[..n], rsdp, madt)
 }
 
 /// Cycle a band of colour along the bottom, for ever.
@@ -409,6 +470,9 @@ fn machine_from(info: &BootInfo<'_>) -> MachineDescription {
 /// which is the single fact hardest to establish on a machine with no serial
 /// port, no network and no disk output.
 fn cycle_forever() -> ! {
+    // The BSP is done with kernel code; the secondaries are not (their idle
+    // loops keep taking ticks). See `smp::bkl_abandon`.
+    crate::smp::bkl_abandon();
     let palette = [
         Rgb::new(0xE0, 0x50, 0x50),
         Rgb::new(0xE0, 0xC0, 0x40),

@@ -658,6 +658,13 @@ reading a stdin that never stops producing bytes: **an absent x86 I/O port reads
 is to probe for the UART at init (the scratch-register test) and report no data
 when it is absent.
 
+**Fixed 2026-09-05:** `serial::init` writes two patterns to the 16550's scratch
+register and reads them back; a bus with no chip returns `0xFF` for both, and
+from then on `getb`/`has_byte` report no data and `putb` skips the port (the
+framebuffer mirror is unaffected). The multiboot2 entry now calls `init` —
+it never had, which was harmless only while writes to an absent port were the
+only thing at stake. Both paths print `uart: present` or `uart: absent`.
+
 The real gap remains input. This board's keyboard is USB, there is no HID stack,
 and the machine has no serial port — so an interactive shell on the framebuffer
 cannot be driven at all. **Networking is the path to a usable shell here**, not a

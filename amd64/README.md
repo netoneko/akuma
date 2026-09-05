@@ -430,11 +430,17 @@ are served from two cores. The ELF/spawn/busybox/execve/fork tests then run
 with every core picking up processes — the stress that found the three SMP
 bugs in `docs/archive/AMD64_SMP_BRINGUP.md` §3.
 
+Both boot paths start the secondaries: PVH from the MADT the VMM's ACPI
+tables describe, multiboot2 from the RSDP copy in GRUB's ACPI tag (there is no
+RSDP to scan for on UEFI). Verified on the HP box's real cores under KVM —
+Firecracker with 4 vCPUs and the OVMF+GRUB rig with `-smp 4` — as well as
+under TCG; see `docs/archive/AMD64_SMP_BRINGUP.md` §4.
+
 What is missing: TLB shootdown (complete today only because a process is one
 task and every switch to a process root writes `CR3`), a wake IPI (an idle
 core learns of work at its next tick), kernel-mode preemption (deliberately —
-the tick preempts ring 3 and the idle loop, kernel tasks yield), and any run
-on real hardware. `SMP=1` is the single-core boot every earlier stage ran.
+the tick preempts ring 3 and the idle loop, kernel tasks yield), and a cold
+bare-metal boot. `SMP=1` is the single-core boot every earlier stage ran.
 
 ## What is deliberately missing
 

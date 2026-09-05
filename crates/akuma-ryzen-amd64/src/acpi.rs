@@ -128,6 +128,39 @@ fn rsdp_at<M: PhysMem + ?Sized>(m: &M, pa: u64) -> Option<Rsdp> {
     Some(Rsdp { addr: pa, revision, rsdt, xsdt, oem })
 }
 
+/// Parse an RSDP from its own bytes — a copy a boot loader handed over
+/// (multiboot2's ACPI tags) rather than one found in memory.
+///
+/// Same checks as [`rsdp_at`]: signature, the 1.0 checksum over 20 bytes, and
+/// for revision 2+ the extended checksum before the XSDT pointer is believed.
+/// `addr` is 0: a copy has no address worth reporting. The pointers inside it
+/// are the firmware's and are read through [`PhysMem`] as usual.
+#[must_use]
+pub fn rsdp_from_bytes(bytes: &[u8]) -> Option<Rsdp> {
+    if bytes.len() < 20 || bytes[..8] != RSDP_SIG {
+        return None;
+    }
+    let sum = |b: &[u8]| b.iter().fold(0u8, |a, &x| a.wrapping_add(x));
+    if sum(&bytes[..20]) != 0 {
+        return None;
+    }
+    let revision = bytes[15];
+    let rsdt = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let mut oem = [0u8; 6];
+    oem.copy_from_slice(&bytes[9..15]);
+    let xsdt = if revision >= 2 && bytes.len() >= 36 {
+        let length = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]) as usize;
+        if (33..=bytes.len()).contains(&length) && sum(&bytes[..length]) == 0 {
+            u64::from_le_bytes(bytes[24..32].try_into().ok()?)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    Some(Rsdp { addr: 0, revision, rsdt, xsdt, oem })
+}
+
 /// Scan the two architectural windows for an RSDP.
 ///
 /// Returns `None` on a machine with no ACPI, which is a legitimate

@@ -130,6 +130,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 
     serial::puts("\n");
     serial::puts("Akuma/amd64 — long mode reached\n");
+    serial::puts("  uart: ");
+    serial::puts(if serial::present() { "present\n" } else { "absent (reads report no data)\n" });
     serial::puts("  hvm_start_info @ 0x");
     serial::put_hex(hvm_start_info);
     serial::puts("\n");
@@ -261,7 +263,21 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         .madt
         .as_ref()
         .map_or(0, |m| m.cpus().len().saturating_sub(1).min(smp::MAX_CPUS - 1));
-    let started = smp::start_secondaries(machine.madt.as_ref());
+    // The VMM's boot structures all sit below the trampoline page on both
+    // machines (`smp::AP_TRAMPOLINE_PA`); this is the check that says so rather
+    // than the comment that assumes it.
+    let si = &machine.start_info;
+    let keep_out = [
+        (si.addr, si.addr + 4096),
+        (si.cmdline_paddr, si.cmdline_paddr + 4096),
+        (si.memmap_paddr, si.memmap_paddr + 4096),
+    ];
+    let started = if smp::trampoline_page_available(&machine, &keep_out) {
+        smp::start_secondaries(machine.madt.as_ref())
+    } else {
+        serial::puts("  smp:  trampoline page is not free RAM — single core\n");
+        0
+    };
     smp::smoke_test(&mut t, expected_aps, started);
     usermode::smp_parallel_test(&mut t);
     // Last, because it is the only test whose program the kernel did not
@@ -365,6 +381,15 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 /// `wfi` that `akuma_cpu::park_core` emits on AArch64, and burning a host core
 /// at 100% is how a QEMU run gets mistaken for a hang.
 pub fn halt() -> ! {
+    // A core that stops must not take the Big Kernel Lock with it: the others
+    // keep running (a fault on one core is reported, not spread), and after a
+    // failed verdict they idle quietly instead of spinning in their tick
+    // handlers. Before `smp::init_bsp` the lock is free and this is a no-op —
+    // but it reads `gs:`, so it is gated on the block being installed.
+    #[cfg(target_arch = "x86_64")]
+    if smp::percpu_installed() {
+        smp::bkl_abandon();
+    }
     loop {
         #[cfg(target_arch = "x86_64")]
         // SAFETY: `cli` and `hlt` are unconditionally safe to execute at ring 0

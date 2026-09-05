@@ -223,6 +223,34 @@ fn the_rsdp_is_found_by_scanning_the_bios_window() {
 }
 
 #[test]
+fn a_loader_supplied_rsdp_copy_parses_and_leads_to_the_madt() {
+    // GRUB on UEFI hands the kernel a COPY of the RSDP in a multiboot2 tag;
+    // the tables it points at are the firmware's, wherever those are.
+    let m = firecracker(4);
+    let bytes = rsdp_bytes(b"FIRECK", 0xA00A7); // the fixture's XSDT
+    let rsdp = acpi::rsdp_from_bytes(&bytes).expect("a valid RSDP copy");
+    assert_eq!(rsdp.addr, 0, "a copy has no address");
+    assert_eq!(rsdp.revision, 2);
+    assert_eq!(rsdp.xsdt, 0xA00A7);
+    assert_eq!(&rsdp.oem, b"FIRECK");
+
+    let madt = acpi::find_table(&m, &rsdp, b"APIC")
+        .and_then(|t| acpi::parse_madt(&m, &t))
+        .expect("the MADT through the copied pointer");
+    assert_eq!(madt.cpus().len(), 4);
+
+    // Corruption is refused, not passed through.
+    let mut bad = bytes.clone();
+    bad[9] ^= 1;
+    assert!(acpi::rsdp_from_bytes(&bad).is_none(), "1.0 checksum");
+    let mut bad_ext = bytes.clone();
+    bad_ext[30] ^= 1;
+    let r = acpi::rsdp_from_bytes(&bad_ext).expect("the 1.0 half still stands");
+    assert_eq!(r.xsdt, 0, "a failed extended checksum drops the XSDT pointer");
+    assert!(acpi::rsdp_from_bytes(&bytes[..12]).is_none(), "too short");
+}
+
+#[test]
 fn the_ioapic_address_comes_from_the_madt() {
     let m = firecracker(1);
     let mut buf = [0u8; 256];

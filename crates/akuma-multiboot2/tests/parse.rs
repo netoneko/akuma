@@ -141,6 +141,36 @@ fn strings_and_counts_are_read() {
     assert!(info.has_acpi());
 }
 
+/// The RSDP tag's body is the RSDP structure itself, and the 2.0 tag wins when
+/// both are present — a UEFI GRUB passes both, and only the 2.0 one names the
+/// XSDT, which is where a 64-bit machine's tables actually are.
+#[test]
+fn the_new_rsdp_tag_is_preferred_and_handed_over_whole() {
+    let mut old = vec![0u8; 20];
+    old[..8].copy_from_slice(b"RSD PTR ");
+    let mut new = vec![0u8; 36];
+    new[..8].copy_from_slice(b"RSD PTR ");
+    new[15] = 2;
+    new[24..32].copy_from_slice(&0x7fff_ffafu64.to_le_bytes());
+
+    let info_bytes = Builder::new()
+        .tag(tag::ACPI_OLD, &old)
+        .tag(tag::ACPI_NEW, &new)
+        .build();
+    let info = BootInfo::new(&info_bytes).unwrap();
+    let rsdp = info.rsdp().expect("an RSDP tag");
+    assert_eq!(rsdp.len(), 36, "the 2.0 structure, not the 1.0 one");
+    assert_eq!(&rsdp[..8], b"RSD PTR ");
+    assert_eq!(u64::from_le_bytes(rsdp[24..32].try_into().unwrap()), 0x7fff_ffaf);
+
+    let only_old = Builder::new().tag(tag::ACPI_OLD, &old).build();
+    let info = BootInfo::new(&only_old).unwrap();
+    assert_eq!(info.rsdp().map(<[u8]>::len), Some(20));
+
+    let none = Builder::new().tag(tag::CMDLINE, b"x\0").build();
+    assert!(BootInfo::new(&none).unwrap().rsdp().is_none());
+}
+
 /// Tags are 8-byte aligned but their sizes are not rounded up. A walker that
 /// steps by `size` desynchronises here and then reads payload bytes as tag
 /// headers — which is how a parser ends up "finding" tags that do not exist.

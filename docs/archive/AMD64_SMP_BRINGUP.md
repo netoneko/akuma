@@ -1,9 +1,13 @@
 # amd64 SMP: bringing the secondary cores up under one lock
 
-**Done** 2026-09-05, in the `amd64-smp` worktree. **Scope:** `amd64/` only; no
-crate under `crates/` changed. **Status:** every self-test passes at `SMP=1`
-(198), `SMP=2` and `SMP=4` (207 — nine new SMP checks) under QEMU `microvm`
-on an Apple Silicon host (TCG). Not yet run on real hardware.
+**Done** 2026-09-05, in the `amd64-smp` worktree, merged to `main` the same
+day. **Scope:** `amd64/`, plus two small additions in `akuma-multiboot2` and
+`akuma-ryzen-amd64` so the GRUB path can find its MADT (§3.7). **Status:**
+every self-test passes at `SMP=1` (198), `SMP=2` and `SMP=4` (207 — nine new
+SMP checks) under QEMU `microvm` on an Apple Silicon host (TCG); **and on the
+HP box's real Intel cores under KVM** — Firecracker with 4 vCPUs (195/195, the
+PVH path) and the OVMF+GRUB rig with `-smp 4` (162/162, the multiboot2 path),
+§4. A cold bare-metal boot of the same binary is staged and awaiting a reboot.
 
 The aarch64 kernel went shared-kernel SMP with a Big Kernel Lock first and
 fine-grained locks later (`docs/reference/subsystems/smp-shared.md`,
@@ -155,7 +159,29 @@ SMP the fault was worse than a halt: core 3 held the BKL when it died, and the
 other three printed `[BKL] stuck … owner 3` and spun forever. Both writes go
 through `uaccess::write_val` now.
 
-### 3.6 What was changed on purpose, not to fix a bug
+### 3.6 The GRUB path had no MADT, and the BSP kept the lock when it stopped
+
+`kmain_mb2` built its `MachineDescription` from the memory map alone —
+`from_memory_map(regions, None, None)` — so on the one machine that is
+actually a 4-core box it would have said "no MADT — single core" and meant it.
+On UEFI there is no RSDP in the BIOS window to scan for; the loader's copy in
+the multiboot2 ACPI tag is the only way in. `akuma_multiboot2::BootInfo::rsdp`
+hands the tag body over (the 2.0 tag preferred), `akuma_ryzen_amd64::acpi::
+rsdp_from_bytes` parses it with the same checksums `rsdp_at` applies, and the
+XSDT pointer inside leads to the firmware's real tables — below 4 GiB, inside
+the physmap. Both have host tests. `kmain_mb2` also gained the trampoline-page
+check both paths now do (`smp::trampoline_page_available`): the page at
+`0x8000` must be RAM in the loader's map and clear of the information block
+and the ramdisk module, or the boot stays single-core and says so.
+
+The first rig run then ended with three `[BKL] stuck … owner 0` lines after
+the verdict: the BSP had parked (`halt`, `cycle_forever`) still holding the
+lock at depth 1, and every AP's next tick handler spun on it forever. Correct
+diagnostic, wrong terminal state — `smp::bkl_abandon` now releases the lock
+in both, gated on the per-CPU block being installed since `halt` can run
+before it is.
+
+### 3.7 What was changed on purpose, not to fix a bug
 
 - **No kernel-mode preemption.** The tick preempts ring 3 and the idle loop.
   A kernel task (boot task, netpoll daemon) consumes `need_resched` at its next
@@ -200,6 +226,21 @@ old single-core behaviour plus the new bookkeeping (198 checks, all pass);
 `SMP=2` passes the same 207. Each STARTUP took on the first try; bring-up is
 ~10 000 spins per core. Three `SMP=4` boots in a row were clean.
 
+**Real hardware, under KVM** (`root@192.168.1.123`, the HP 500-502nj —
+`AKUMA_AMD64_ON_HP_500_502NJ.md`; Intel, 4 cores):
+
+| path | how | result |
+|---|---|---|
+| PVH | `FC_HOST=… VCPUS=4 amd64/run-firecracker.sh` (Firecracker v1.16.1) | 4 CPUs from the MADT, all online first try; workers in flight 4; ring-3 on two cores; **195 passed, 0 failed** (no NIC attached, so the net checks skip) |
+| multiboot2 | the box's OVMF+GRUB rig (`grub-mkrescue`, `qemu -enable-kvm -smp 4`), serial to a file | `uart: present`; 4 CPUs from the loader's RSDP copy; same witnesses; **162 passed, 0 failed**; `/bin/sh` starts |
+
+Ticks per core over the SMP phase are ~20–40 there against ~600 under TCG: the
+real APIC clock is what `AP_INIT_DELAY` was sized against, and bring-up took
+~200 spins per core instead of ~10 000. The first rig run failed one check,
+`elf: on-disk and embedded images are identical`, because the ISO's `root.img`
+predated the kernel copied in — a stale rig, not the kernel; rebuilt from the
+same tree it passes.
+
 Live: `SMP=4 INIT=/bin/sshd amd64/run.sh`, then six `ssh` sessions in a row
 (`uname -a`, `uname; echo DONE`, `cat /etc/resolv.conf`, three `echo`s) all
 returned their output with exit 0 and no `[Fault]`, `[EXCEPTION]` or
@@ -218,10 +259,11 @@ found.
 - **The BKL is held across every kernel path**, including a whole-file ext2
   read through polled virtio. A peer's syscall waits for it. Fine-grained
   locking is the aarch64 tree's plan, not this stage's.
-- **Real hardware.** The trampoline, INIT/STARTUP timing (`AP_INIT_DELAY` is
-  an uncalibrated LAPIC count, ~16 ms on QEMU) and the per-core `CR4`/MSR
-  setup have run only under TCG. `FC_HOST=… amd64/run-firecracker.sh` with a
-  `vcpu_count > 1` is the next thing to do.
+- **A cold bare-metal boot.** Everything above ran on the box's real cores
+  but under KVM, which virtualises the INIT/STARTUP sequence. The binary that
+  passed the rig is staged at `/boot/akuma/akuma-amd64` (with the 128 MiB
+  `root.img` beside it, old files kept as `*.bak-<date>`) and
+  `grub-reboot` is armed for the Akuma entry; the reboot itself is the user's.
 - **`MAX_CPUS = 16`.** The MADT parser reports up to 32; the per-CPU table
   stops at 16 and starts the first 15 APs with a warning.
 
@@ -237,4 +279,7 @@ found.
 | `amd64/src/gdt.rs` | GDT/TSS per core, `init_cpu` |
 | `amd64/src/lapic.rs` | `init_ap`, `apic_id`, ICR IPIs, `delay_counts`, per-core ticks |
 | `amd64/src/sock.rs` | `accept`'s `addrlen` and `recvmsg`'s `msg_namelen` through `uaccess` (§3.5) |
+| `amd64/src/multiboot2.rs` | RSDP → MADT from the loader's tag, the SMP block after `preempt_test`, `initargs=`, `serial::init` (§3.6) |
+| `crates/akuma-multiboot2` | `BootInfo::rsdp` |
+| `crates/akuma-ryzen-amd64` | `acpi::rsdp_from_bytes` |
 | `amd64/run.sh` | `SMP=N` |

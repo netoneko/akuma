@@ -67,6 +67,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use akuma_ryzen_amd64::acpi::Madt;
+use akuma_ryzen_amd64::MachineDescription;
 use akuma_selftest::Suite;
 
 use crate::phys::phys_ptr;
@@ -188,6 +189,23 @@ fn install_percpu(idx: usize) {
         wrmsr(IA32_GS_BASE, addr);
         wrmsr(IA32_KERNEL_GS_BASE, 0);
     }
+}
+
+/// Has this core's `%gs` been pointed at a [`PerCpu`] yet?
+///
+/// Reads `IA32_GS_BASE` rather than `gs:[0]`: before `install_percpu` the base
+/// is 0, and a `gs:`-relative load through it would be the very fault this
+/// exists to avoid. For the one caller (`halt`) that can run at any point in
+/// the boot, including before the block exists.
+#[must_use]
+pub fn percpu_installed() -> bool {
+    let (lo, hi): (u32, u32);
+    // SAFETY: reading an architectural MSR has no side effect.
+    unsafe {
+        core::arch::asm!("rdmsr", in("ecx") IA32_GS_BASE, out("eax") lo, out("edx") hi,
+                         options(nomem, nostack, preserves_flags));
+    }
+    (u64::from(hi) << 32) | u64::from(lo) != 0
 }
 
 /// This core's block, through `gs:[0]`.
@@ -386,6 +404,23 @@ pub fn set_bkl_depth(d: u32) {
     this_cpu().bkl_depth.store(d, Ordering::Relaxed);
 }
 
+/// Give the lock up for good, if this core holds it — for a core that is about
+/// to stop executing kernel code forever (`halt`, the bare-metal colour cycle).
+///
+/// Without this a BSP that finishes its boot holding the lock — a failed
+/// self-test verdict ends in `halt()`, which is `cli; hlt` at depth 1 — leaves
+/// every AP spinning in its tick handler for a lock that will never be
+/// released, printing `[BKL] stuck … owner 0` once each (measured 2026-09-05 in
+/// the OVMF rig). Nothing was wrong; the diagnostic was right. A core that
+/// stops should let go. Safe to call from a core that never held it.
+pub fn bkl_abandon() {
+    let cpu = this_cpu();
+    if BKL.owner.load(Ordering::Relaxed) == cpu.index.load(Ordering::Relaxed) {
+        cpu.bkl_depth.store(0, Ordering::Relaxed);
+        bkl_release();
+    }
+}
+
 /// Let the other cores in: drop the lock completely, spin briefly, take it
 /// back at the same depth.
 ///
@@ -482,6 +517,29 @@ const AP_ONLINE_BUDGET: u64 = 200_000_000;
 unsafe extern "C" {
     static ap_trampoline_start: u8;
     static ap_trampoline_end: u8;
+}
+
+/// Is the trampoline page ordinary RAM, and clear of everything the boot
+/// loader placed?
+///
+/// [`AP_TRAMPOLINE_PA`] is a claim about two VMMs' layouts. A firmware boot is
+/// a different machine: UEFI's map fragments low memory, and GRUB puts its
+/// information block wherever it likes. Copying the trampoline over either
+/// would corrupt something the kernel is still reading — so the caller names
+/// what it placed (`keep_out`, as `[start, end)` byte ranges) and this refuses
+/// unless the page is inside a RAM region and outside all of them. A refusal
+/// means "stay single-core", which is a configuration, not a failure.
+#[must_use]
+pub fn trampoline_page_available(machine: &MachineDescription, keep_out: &[(u64, u64)]) -> bool {
+    let (page_start, page_end) = (AP_TRAMPOLINE_PA, AP_TRAMPOLINE_PA + 4096);
+    let in_ram = machine
+        .regions()
+        .iter()
+        .any(|r| r.kind == 1 && r.addr <= page_start && r.addr + r.size >= page_end);
+    let clear = keep_out
+        .iter()
+        .all(|&(s, e)| e <= page_start || s >= page_end);
+    in_ram && clear
 }
 
 /// Present + writable, for the intermediate entries of the AP boot tables.
