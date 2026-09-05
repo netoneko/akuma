@@ -6,10 +6,10 @@ use smoltcp::time::Instant;
 // The single-buffer receive path and its counters exist only without
 // `net-noalloc`; with it, `virtio_rings` owns the buffers and the accounting.
 #[cfg(not(feature = "net-noalloc"))]
-use crate::counters::{RX_BEGIN_FAILURES, RX_BUFFERS_POSTED, RX_FRAMES_RECEIVED};
+use crate::counters::C;
 #[cfg(not(feature = "net-noalloc"))]
 use crate::frames::{FrameArena, FrameLease};
-use crate::counters::{TX_DROP_COUNT, TX_FRAMES_SENT};
+
 use crate::nic::Nic;
 use crate::nicstat;
 
@@ -182,14 +182,14 @@ impl VirtioSmoltcpDevice {
                 // deferred `DhcpReport` emission in `poll()`. A print here spins on
                 // `CONSOLE_LOCK`, and on a single-vCPU guest a holder that has been
                 // preempted can never run to release it. Counters
-                // (`RX_BUFFERS_POSTED` below) are safe; console I/O is not.
+                // (`C.rx_buffers_posted` below) are safe; console I/O is not.
                 let Some(posted) = self.inner.post_rx(&RX_ARENA, RX_SLOT) else {
-                    RX_BEGIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    C.rx_begin_failures.fetch_add(1, Ordering::Relaxed);
                     return None;
                 };
                 nicstat::record_rx_begin(t);
                 self.rx_posted = Some(posted);
-                RX_BUFFERS_POSTED.fetch_add(1, Ordering::Relaxed);
+                C.rx_buffers_posted.fetch_add(1, Ordering::Relaxed);
             }
             // Phase 2: has the device filled it?
             if self.inner.poll_receive().is_some() {
@@ -204,7 +204,7 @@ impl VirtioSmoltcpDevice {
                 // that runs off the end of it.
                 let (hdr_len, pkt_len) = self.inner.complete_rx(token, lease)?;
                 nicstat::record_rx_packet(t, pkt_len);
-                RX_FRAMES_RECEIVED.fetch_add(1, Ordering::Relaxed);
+                C.rx_frames_received.fetch_add(1, Ordering::Relaxed);
                 // Re-lease the slot for the RxToken's life. The device released
                 // it at `complete_rx`; this hands it to smoltcp instead, and the
                 // release at the top of the next call is what ends it.
@@ -260,9 +260,9 @@ impl VirtioSmoltcpDevice {
                 let ok = self.tx.submit(&mut self.inner, frame, end);
                 nicstat::record_tx(t, end - hdr, ok);
                 if ok {
-                    TX_FRAMES_SENT.fetch_add(1, Ordering::Relaxed);
+                    C.tx_frames_sent.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                    C.tx_drop_count.fetch_add(1, Ordering::Relaxed);
                 }
                 return res;
             }
@@ -287,7 +287,7 @@ impl VirtioSmoltcpDevice {
             if divert(&discard[..end]) {
                 return res;
             }
-            TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            C.tx_drop_count.fetch_add(1, Ordering::Relaxed);
             res
         }
         #[cfg(not(feature = "net-noalloc"))]
@@ -301,9 +301,9 @@ impl VirtioSmoltcpDevice {
             let ok = self.inner.send_blocking(&self.tx_buffer[..end]);
             nicstat::record_tx(t, end, ok);
             if ok {
-                TX_FRAMES_SENT.fetch_add(1, Ordering::Relaxed);
+                C.tx_frames_sent.fetch_add(1, Ordering::Relaxed);
             } else {
-                TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                C.tx_drop_count.fetch_add(1, Ordering::Relaxed);
             }
             res
         }

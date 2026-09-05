@@ -37,7 +37,7 @@ use akuma_primitives::addr::virt_to_phys;
 use akuma_primitives::mmio::MmioReg;
 use smoltcp::phy::DeviceCapabilities;
 
-use crate::counters::{RX_FRAMES_RECEIVED, RX_ISR_SEEN, RX_RING_DRY, TX_DROP_COUNT, TX_FRAMES_SENT};
+use crate::counters::C;
 
 /// Descriptors per ring. A power of two, small — this is a bring-up NIC on a
 /// polled single-core kernel, not a throughput target.
@@ -233,6 +233,18 @@ impl Rings for Rtl8169Rings {
 }
 
 /// The Realtek NIC behind [`ExternalDevice::Rtl8169`](crate::ExternalDevice).
+/// Consecutive fruitless receive laps before the stall dump fires. The poll
+/// loop runs into the hundreds of thousands per second, so this is a second or
+/// two of genuine silence — long enough not to fire on an idle link between
+/// broadcasts, short enough to catch the failure while it is fresh.
+const STALL_LAPS: u32 = 2_000_000;
+
+/// How many times the receiver is restarted before giving up and staying quiet.
+/// A chip that comes back on the first kick answers the question; one that
+/// needs five has answered a different one, and either way the log stays
+/// readable.
+const MAX_KICKS: u32 = 5;
+
 /// How many receive laps between PHY samples. See [`Rtl8169Device::take_rx_frame`].
 const LINK_SAMPLE_LAPS: u32 = 1024;
 
@@ -240,6 +252,13 @@ pub struct Rtl8169Device {
     nic: Nic<Rtl8169Regs, Rtl8169Rings>,
     /// Lap counter for the periodic PHY sample.
     link_poll: u32,
+    /// Consecutive laps that produced no frame.
+    idle_laps: u32,
+    /// How many stalls have been seen. The full ring dump prints on the first
+    /// one only — once is a diagnosis, sixteen lines every two seconds is a
+    /// screen nobody can read — and the recovery attempt is capped at
+    /// [`MAX_KICKS`] so a chip that will not restart cannot bury the log.
+    stalls: u32,
     /// The copy-out receive path's target, handed up to smoltcp as an
     /// `RxToken`. smoltcp may build a reply through a `TxToken` **while that
     /// token is live**, so the transmit path stages in `tx_scratch` instead.
@@ -270,12 +289,92 @@ impl Rtl8169Device {
             akuma_net_rtl8169::Speed::Unknown => 0,
         };
         crate::counters::set_link_state(l.up, mbit, l.full_duplex);
-        Ok(Self { nic, link_poll: 0, rx_scratch: [0; BUF_LEN], tx_scratch: [0; BUF_LEN] })
+        Ok(Self {
+            nic,
+            link_poll: 0,
+            idle_laps: 0,
+            stalls: 0,
+            rx_scratch: [0; BUF_LEN],
+            tx_scratch: [0; BUF_LEN],
+        })
     }
 
     #[must_use]
     pub fn mac_address(&self) -> [u8; 6] {
         self.nic.mac().0
+    }
+
+    /// Where this driver's DMA memory actually is: `(name, virtual, physical)`
+    /// for each of the four `.bss` arrays the chip is told about.
+    ///
+    /// Printed at bring-up because a wrong `virt_to_phys` here is invisible
+    /// until it is catastrophic: the chip writes descriptors and frames at an
+    /// address the driver never reads, so the ring looks permanently
+    /// chip-owned, receive stops dead, and whatever *does* live at that
+    /// physical address is quietly overwritten. Four numbers on the console
+    /// settle in one boot what is otherwise inferred from wreckage.
+    #[must_use]
+    pub fn dma_layout() -> [(&'static str, usize, u64); 4] {
+        [
+            ("rx_desc", &raw const RX_DESCS as usize, virt_to_phys(&raw const RX_DESCS as usize) as u64),
+            ("tx_desc", &raw const TX_DESCS as usize, virt_to_phys(&raw const TX_DESCS as usize) as u64),
+            ("rx_bufs", &raw const RX_BUFS as usize, virt_to_phys(&raw const RX_BUFS as usize) as u64),
+            ("tx_bufs", &raw const TX_BUFS as usize, virt_to_phys(&raw const TX_BUFS as usize) as u64),
+        ]
+    }
+
+    /// Print what the chip says about itself, plus the whole receive ring.
+    ///
+    /// The one number that matters is `rdsar` against the `rx_desc pa=` printed
+    /// at bring-up: equal means the chip is looking where we put the ring and
+    /// the fault is in the descriptors; different means it is not, and the
+    /// completions landing in unrelated kernel memory are simply it writing
+    /// where it thinks the ring is.
+    fn on_stall(&mut self) {
+        let s = self.nic.snapshot();
+        // The full picture once; after that the kick line alone, which is the
+        // part that changes.
+        if self.stalls > 1 {
+            let (before, after) = self.nic.kick_receiver();
+            crate::safe_print!(
+                120,
+                "[rtl] stall #{}: kick misc 0x{:08x} -> 0x{:08x} mpc={} cr=0x{:02x}\n",
+                self.stalls, before, after, s.mpc, s.cr
+            );
+            return;
+        }
+        crate::safe_print!(96, "[rtl] STALL #1 after {} idle laps\n", STALL_LAPS);
+        crate::safe_print!(
+            128,
+            "[rtl] cr=0x{:02x} isr=0x{:04x} imr=0x{:04x} rcr=0x{:08x} mpc={} misc=0x{:08x} rxdv_gated={} cursor={}/{}\n",
+            s.cr, s.isr, s.imr, s.rcr, s.mpc, s.misc,
+            u8::from(s.misc & akuma_net_rtl8169::regs::MISC_RXDV_GATED != 0),
+            s.cursor, s.ring_len
+        );
+        crate::safe_print!(
+            120,
+            "[rtl] rdsar=0x{:016x} tnpds=0x{:016x} (expect rx_desc pa from bring-up)\n",
+            s.rdsar, s.tnpds
+        );
+        for i in 0..s.ring_len.min(RING_LEN) {
+            let d = self.nic.rx_desc_at(i);
+            crate::safe_print!(
+                104,
+                "[rtl]  rx[{}] cmdstat=0x{:08x} buf=0x{:08x}{:08x}\n",
+                i, d.cmdstat, d.buf_hi, d.buf_lo
+            );
+        }
+
+        // Then try to restart it, and say whether the gate was actually set.
+        // A recovery that works tells us what was wrong; one that does not
+        // rules the gate out, which is worth almost as much.
+        let (before, after) = self.nic.kick_receiver();
+        crate::safe_print!(
+            120,
+            "[rtl] kick: misc 0x{:08x} -> 0x{:08x} (gate was {})\n",
+            before, after,
+            if before & akuma_net_rtl8169::regs::MISC_RXDV_GATED != 0 { "SET" } else { "clear" }
+        );
     }
 
     #[allow(clippy::unused_self)] // symmetry with the other `ExternalDevice` arms
@@ -307,9 +406,9 @@ impl Rtl8169Device {
         // boundary.
         let isr = self.nic.take_interrupts();
         if isr != 0 {
-            RX_ISR_SEEN.fetch_or(u32::from(isr), Ordering::Relaxed);
+            C.rx_isr_seen.fetch_or(u32::from(isr), Ordering::Relaxed);
             if isr & akuma_net_rtl8169::regs::INT_RDU != 0 {
-                RX_RING_DRY.fetch_add(1, Ordering::Relaxed);
+                C.rx_ring_dry.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -334,13 +433,25 @@ impl Rtl8169Device {
             crate::counters::set_link_state(l.up, mbit, l.full_duplex);
         }
 
-        let n = self.nic.receive(&mut self.rx_scratch)?;
+        // Stall watch. Receive dying at a ring boundary with no error bit set
+        // has now cost three rounds of theorising; this dumps what the chip
+        // says about itself the moment it stops, once, and then never again.
+        let Some(n) = self.nic.receive(&mut self.rx_scratch) else {
+            self.idle_laps = self.idle_laps.saturating_add(1);
+            if self.idle_laps >= STALL_LAPS && self.stalls < MAX_KICKS {
+                self.stalls += 1;
+                self.idle_laps = 0;
+                self.on_stall();
+            }
+            return None;
+        };
+        self.idle_laps = 0;
         // Only reached when a frame really came off the ring, so this counts
         // wire arrivals. The virtio path bumps the same counter in `device.rs`;
         // until 2026-09-05 this one bumped nothing, so `rx_counters()` read a
         // flat zero on the only target that has this chip — the exact number
         // the bring-up needed.
-        RX_FRAMES_RECEIVED.fetch_add(1, Ordering::Relaxed);
+        C.rx_frames_received.fetch_add(1, Ordering::Relaxed);
         // The pointer's provenance is `rx_scratch` (a field), not `self`
         // broadly — the borrow checker cannot see that through
         // `from_raw_parts`, which is why the virtio path hands back a raw
@@ -360,9 +471,9 @@ impl Rtl8169Device {
             return res;
         }
         if self.nic.transmit(&self.tx_scratch[..end]).is_err() {
-            TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            C.tx_drop_count.fetch_add(1, Ordering::Relaxed);
         } else {
-            TX_FRAMES_SENT.fetch_add(1, Ordering::Relaxed);
+            C.tx_frames_sent.fetch_add(1, Ordering::Relaxed);
         }
         res
     }

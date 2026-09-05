@@ -340,6 +340,7 @@ pub unsafe fn init_rtl8169(bar: *mut u8, static_v4: StaticIpv4) -> bool {
             return init_loopback_only();
         }
     };
+    RTL8169_UP.store(true, core::sync::atomic::Ordering::Relaxed);
     report_init(akuma_net::init_with_external(net_runtime(), true, device, Some(static_v4)))
 }
 
@@ -475,10 +476,43 @@ const PROBE_LAPS: u64 = 2_000_000;
 /// [`enable_probe`] from the `netprobe` command-line flag.
 static PROBE_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Whether the Realtek came up, so [`enable_probe`] knows there is a DMA layout
+/// worth dumping.
+static RTL8169_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Turn the probe on. Not a separate task **on purpose** — see
 /// [`netpoll_daemon`].
+///
+/// This is also where the NIC's DMA layout is printed, and the placement is the
+/// point: it used to print during bring-up, which is **forty lines above where
+/// the boot log ends**. On a machine whose console is a television being
+/// photographed, anything printed before the self-tests has scrolled off by the
+/// time there is something to photograph. `enable_probe` runs immediately
+/// before `run_init`, so these four lines land at the bottom, next to the probe
+/// output they explain.
 pub fn enable_probe() {
     PROBE_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+    if RTL8169_UP.load(core::sync::atomic::Ordering::Relaxed) {
+        // Where the chip has been told to write, against where we read. A wrong
+        // translation here is invisible until it is catastrophic: the chip
+        // writes descriptors and frames at an address the driver never looks
+        // at, so the ring reads as permanently chip-owned, receive stops dead,
+        // and whatever does live at that physical address is overwritten.
+        for (name, va, pa) in akuma_net::smoltcp_net::Rtl8169Device::dma_layout() {
+            serial::puts("  nic:  ");
+            serial::puts(name);
+            serial::puts(" va=0x");
+            serial::put_hex(va as u64);
+            serial::puts(" pa=0x");
+            serial::put_hex(pa);
+            serial::puts("\n");
+        }
+        // The block that keeps getting overwritten, so the two can be compared
+        // by eye without anyone having to look up a symbol.
+        serial::puts("  nic:  counters va=0x");
+        serial::put_hex(akuma_net::smoltcp_net::counter_block_addr() as u64);
+        serial::puts("\n");
+    }
     serial::puts("  net:  probe enabled (netprobe)\n");
 }
 
@@ -529,6 +563,18 @@ pub fn print_probe_line(now_us: u64, laps: u64) {
         "pending"
     });
     serial::puts("\n");
+
+    let (canary_lo, canary_hi) = akuma_net::smoltcp_net::canaries_intact();
+    if !canary_lo || !canary_hi {
+        // Loud, and on its own line above the numbers it invalidates: once
+        // something else has written into the counter block, every figure on
+        // the next line is a reading of whatever that was.
+        serial::puts("[probe] !! COUNTER MEMORY OVERWRITTEN: canary lo=");
+        serial::puts(if canary_lo { "ok" } else { "CLOBBERED" });
+        serial::puts(" hi=");
+        serial::puts(if canary_hi { "ok" } else { "CLOBBERED" });
+        serial::puts("\n");
+    }
 
     let (posted, begin_fail, received) = akuma_net::smoltcp_net::rx_counters();
     let (isr, dry) = akuma_net::smoltcp_net::isr_history();

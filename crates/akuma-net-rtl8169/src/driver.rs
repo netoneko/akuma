@@ -139,14 +139,7 @@ impl<R: Regs, M: Rings> Nic<R, M> {
 
         self.regs
             .w32(regs::TCR, regs::TCR_IFG_STANDARD | regs::TCR_MXDMA_UNLIMITED);
-        self.regs.w32(
-            regs::RCR,
-            regs::RCR_APM
-                | regs::RCR_AB
-                | regs::RCR_AM
-                | regs::RCR_MXDMA_UNLIMITED
-                | regs::RCR_RXFTH_DEFAULT,
-        );
+        self.regs.w32(regs::RCR, RCR_VALUE);
 
         // Accept every multicast group that gets past `RCR_AM`. Filtering
         // belongs above this layer, and an all-zero hash silently drops
@@ -293,6 +286,82 @@ impl<R: Regs, M: Rings> Nic<R, M> {
         isr
     }
 
+    /// Try to restart a receiver that has gone quiet with nothing to say.
+    ///
+    /// Called when receive has stopped while every visible condition is
+    /// correct: ring base right, all descriptors owned by the chip with
+    /// end-of-ring where it belongs, `CR_RE` set, `ISR` clear, and — the
+    /// telling one — `MPC` at zero, meaning the chip is not even discarding
+    /// frames for want of a descriptor. It is not overrun and it is not
+    /// confused about the ring; it is not being handed frames at all.
+    ///
+    /// The one gate between the PHY and the MAC that can do that silently is
+    /// [`regs::MISC_RXDV_GATED`], which `init` already clears once. Some
+    /// RTL8168 parts re-assert it later, and nothing reports that they have.
+    ///
+    /// This clears it again, re-writes the ring base and the accept
+    /// configuration, and bounces `CR_RE`. Returns `MISC` before and after, so
+    /// a caller can say whether the gate was actually the thing found set —
+    /// which is the difference between a fix and a coincidence.
+    pub fn kick_receiver(&mut self) -> (u32, u32) {
+        let before = self.regs.r32(regs::MISC);
+        if before & regs::MISC_RXDV_GATED != 0 {
+            self.regs.w32(regs::MISC, before & !regs::MISC_RXDV_GATED);
+        }
+
+        // Drop RE while the ring base is re-stated: the chip latches RDSAR when
+        // the receiver starts, and writing it under a running receiver is what
+        // the datasheet tells you not to do.
+        let cr = self.regs.r8(regs::CR);
+        self.regs.w8(regs::CR, cr & !regs::CR_RE);
+        write64(&mut self.regs, regs::RDSAR, self.mem.rx_ring_phys());
+        self.regs.w32(regs::RCR, RCR_VALUE);
+        self.regs.w8(regs::CR, cr | regs::CR_RE);
+
+        // The driver's own cursor goes back to the start with it: after a
+        // restart the chip fills from the ring base, and a cursor left mid-ring
+        // would look past the entries it is about to write.
+        self.rx = RxRing::new(self.mem.rx_ring_len());
+
+        (before, self.regs.r32(regs::MISC))
+    }
+
+    /// Everything the chip will tell us about its own receive state.
+    ///
+    /// Built because the alternative was inference. On the HP box the receiver
+    /// took exactly `RING_LEN` frames into the ring it was given — correctly,
+    /// at the addresses it was told — and then began writing completions into
+    /// kernel memory 182 KiB *below* the ring, with no error bit set anywhere.
+    /// Two rounds of reasoning about descriptor handling produced two wrong
+    /// answers (`RDU`, then a mis-translated address), because the one thing
+    /// nobody had done was ask the chip where it thought its ring was.
+    ///
+    /// `mpc` is the quiet one: the missed-packet counter increments for every
+    /// frame dropped because no descriptor was available, and it is the
+    /// difference between "the wire went silent" and "we stopped keeping up".
+    #[must_use]
+    pub fn snapshot(&mut self) -> Snapshot {
+        Snapshot {
+            cr: self.regs.r8(regs::CR),
+            isr: self.regs.r16(regs::ISR),
+            imr: self.regs.r16(regs::IMR),
+            rcr: self.regs.r32(regs::RCR),
+            tcr: self.regs.r32(regs::TCR),
+            mpc: self.regs.r32(regs::MPC),
+            misc: self.regs.r32(regs::MISC),
+            rdsar: read64(&mut self.regs, regs::RDSAR),
+            tnpds: read64(&mut self.regs, regs::TNPDS),
+            cursor: self.rx.cursor(),
+            ring_len: self.rx.len(),
+        }
+    }
+
+    /// Receive descriptor `i`, for a caller dumping the ring.
+    #[must_use]
+    pub fn rx_desc_at(&self, i: usize) -> Desc {
+        self.mem.rx_desc(i)
+    }
+
     /// Current link state, from one byte read.
     pub fn link(&mut self) -> LinkState {
         LinkState::from_phystatus(self.regs.r8(regs::PHYSTATUS))
@@ -343,6 +412,47 @@ impl<R: Regs, M: Rings> Nic<R, M> {
 fn write64<R: Regs>(regs: &mut R, off: u16, val: u64) {
     regs.w32(off, val as u32);
     regs.w32(off + 4, (val >> 32) as u32);
+}
+
+/// The receive configuration, in one place so `init` and [`Nic::kick_receiver`]
+/// cannot drift apart.
+const RCR_VALUE: u32 = regs::RCR_APM
+    | regs::RCR_AB
+    | regs::RCR_AM
+    | regs::RCR_MXDMA_UNLIMITED
+    | regs::RCR_RXFTH_DEFAULT;
+
+fn read64<R: Regs>(regs: &mut R, off: u16) -> u64 {
+    u64::from(regs.r32(off)) | (u64::from(regs.r32(off + 4)) << 32)
+}
+
+/// What the chip says about itself. See [`Nic::snapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Command register: `CR_RE`/`CR_TE` say whether receive and transmit are
+    /// even enabled. A cleared `RE` is a receiver that has been switched off.
+    pub cr: u8,
+    /// Interrupt status, as latched right now.
+    pub isr: u16,
+    /// Interrupt mask.
+    pub imr: u16,
+    /// Receive configuration: the accept bits and the DMA burst size.
+    pub rcr: u32,
+    /// Transmit configuration.
+    pub tcr: u32,
+    /// Missed packets — frames dropped for want of a descriptor.
+    pub mpc: u32,
+    /// The MISC register, for [`regs::MISC_RXDV_GATED`].
+    pub misc: u32,
+    /// **Where the chip believes its receive ring is.** The number this whole
+    /// structure exists for.
+    pub rdsar: u64,
+    /// Where it believes the normal-priority transmit ring is.
+    pub tnpds: u64,
+    /// The driver's own cursor into the ring.
+    pub cursor: usize,
+    /// Entries in the ring.
+    pub ring_len: usize,
 }
 
 /// Validate one ring's base address and length.

@@ -9,64 +9,77 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) static RX_BUFFERS_POSTED: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static RX_BEGIN_FAILURES: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static RX_FRAMES_RECEIVED: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static TX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-/// Frames handed to the device and accepted by it.
+/// Every device tally, in **one `#[repr(C)] struct`** with a known value at
+/// each end.
 ///
-/// The counterpart `TX_DROP_COUNT` never had: a drop count alone cannot tell
-/// "nothing was sent" from "nothing was asked to be sent", and on a bring-up
-/// where the question is whether a NIC moves anything at all, that is the
-/// whole question.
-pub(crate) static TX_FRAMES_SENT: AtomicUsize = AtomicUsize::new(0);
-
-/// Every `ISR` bit this driver has ever observed, OR-ed together.
+/// The layout is the point. These were eight separate `static`s, and Rust makes
+/// no promise about where the linker puts those relative to one another — so a
+/// canary declared "before" and "after" them in source order might sit anywhere,
+/// and a canary that is not adjacent proves nothing. Measured on the HP box:
+/// `rx`, `drop`, `rxfail` and the ISR accumulator were each overwritten with
+/// what look like physical addresses while both canaries read intact, which is
+/// either "the write was surgical" or "the canaries were somewhere else
+/// entirely", and there was no way to tell which.
 ///
-/// `ISR` latches **regardless of `IMR`** — the mask gates interrupt *delivery*,
-/// not the status bits — so on a purely polled path the bits accumulate and
-/// nothing clears them unless the driver reads the register back. Accumulated
-/// rather than sampled because the interesting bits are transient: by the time
-/// a human is reading a status line, the event is long past.
-pub(crate) static RX_ISR_SEEN: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+/// `#[repr(C)]` fixes the order and the padding, so `lo` and `hi` genuinely
+/// bracket the block. Now an intact pair means the write landed *inside* the
+/// counters and nowhere else — which for a DMA scribble would be a remarkable
+/// coincidence, and for a wild pointer is a real clue.
+#[repr(C)]
+pub(crate) struct CounterBlock {
+    pub(crate) canary_lo: AtomicUsize,
+    pub(crate) rx_buffers_posted: AtomicUsize,
+    pub(crate) rx_begin_failures: AtomicUsize,
+    pub(crate) rx_frames_received: AtomicUsize,
+    pub(crate) tx_drop_count: AtomicUsize,
+    pub(crate) tx_frames_sent: AtomicUsize,
+    pub(crate) rx_ring_dry: AtomicUsize,
+    pub(crate) rx_isr_seen: core::sync::atomic::AtomicU32,
+    /// The link, as the driver last read it from the PHY, packed so a reader
+    /// needs no lock: bit 0 up, bits 1..3 speed (1/2/3 = 10/100/1000), bit 3
+    /// full duplex, bit 7 always set so "sampled and down" is distinguishable
+    /// from "never sampled".
+    pub(crate) link_state: core::sync::atomic::AtomicU8,
+    pub(crate) canary_hi: AtomicUsize,
+}
 
-/// How many times the receive ring has been found dry (`ISR.RDU`).
-pub(crate) static RX_RING_DRY: AtomicUsize = AtomicUsize::new(0);
+/// The value both canaries must always hold. Not zero and not a small integer:
+/// a pattern that cannot be mistaken for a plausible count or a null write.
+pub(crate) const CANARY_VALUE: usize = 0x5EED_1234_5EED_1234;
 
-/// The link, as the driver last read it from the PHY, packed so a reader needs
-/// no lock: `0` = never sampled, otherwise bit 0 = up, bits 1..3 = speed
-/// (1/2/3 = 10/100/1000, 0 = unknown), bit 3 = full duplex, bit 7 always set so
-/// "sampled and down" is distinguishable from "never sampled".
-pub(crate) static LINK_STATE: core::sync::atomic::AtomicU8 =
-    core::sync::atomic::AtomicU8::new(0);
+pub(crate) static C: CounterBlock = CounterBlock {
+    canary_lo: AtomicUsize::new(CANARY_VALUE),
+    rx_buffers_posted: AtomicUsize::new(0),
+    rx_begin_failures: AtomicUsize::new(0),
+    rx_frames_received: AtomicUsize::new(0),
+    tx_drop_count: AtomicUsize::new(0),
+    tx_frames_sent: AtomicUsize::new(0),
+    rx_ring_dry: AtomicUsize::new(0),
+    rx_isr_seen: core::sync::atomic::AtomicU32::new(0),
+    link_state: core::sync::atomic::AtomicU8::new(0),
+    canary_hi: AtomicUsize::new(CANARY_VALUE),
+};
 
-/// `(buffers_posted, begin_failures, frames_received)` since boot.
+/// `(low canary intact, high canary intact)` — see [`CounterBlock`].
 #[must_use]
-pub fn rx_counters() -> (usize, usize, usize) {
+pub fn canaries_intact() -> (bool, bool) {
     (
-        RX_BUFFERS_POSTED.load(Ordering::Relaxed),
-        RX_BEGIN_FAILURES.load(Ordering::Relaxed),
-        RX_FRAMES_RECEIVED.load(Ordering::Relaxed),
+        C.canary_lo.load(Ordering::Relaxed) == CANARY_VALUE,
+        C.canary_hi.load(Ordering::Relaxed) == CANARY_VALUE,
     )
 }
 
-/// Frames the device refused, or that could not get a ring slot.
+/// Where the counter block lives, so a boot can print it next to the DMA
+/// addresses and the two can be compared by eye.
 #[must_use]
-pub fn tx_drop_count() -> usize {
-    TX_DROP_COUNT.load(Ordering::Relaxed)
-}
-
-/// Frames the device accepted for transmission since boot.
-#[must_use]
-pub fn tx_frames_sent() -> usize {
-    TX_FRAMES_SENT.load(Ordering::Relaxed)
+pub fn counter_block_addr() -> usize {
+    (&raw const C) as usize
 }
 
 /// `(every ISR bit seen so far, times the receive ring ran dry)`.
 #[must_use]
 pub fn isr_history() -> (u32, usize) {
-    (RX_ISR_SEEN.load(Ordering::Relaxed), RX_RING_DRY.load(Ordering::Relaxed))
+    (C.rx_isr_seen.load(Ordering::Relaxed), C.rx_ring_dry.load(Ordering::Relaxed))
 }
 
 /// The last sampled link state: `None` until a driver has read the PHY at all,
@@ -74,7 +87,7 @@ pub fn isr_history() -> (u32, usize) {
 /// rate is not one this driver decodes".
 #[must_use]
 pub fn link_state() -> Option<(bool, u16, bool)> {
-    let raw = LINK_STATE.load(Ordering::Relaxed);
+    let raw = C.link_state.load(Ordering::Relaxed);
     if raw & 0x80 == 0 {
         return None;
     }
@@ -88,10 +101,6 @@ pub fn link_state() -> Option<(bool, u16, bool)> {
 }
 
 /// Record a PHY reading. Called by the driver glue that owns the chip.
-///
-/// Only the Realtek has a PHY this crate reads, so this is gated on that
-/// feature — virtio has no link state to report and `link_state()` correctly
-/// answers `None` there rather than inventing an "up".
 #[cfg(feature = "rtl8169")]
 pub(crate) fn set_link_state(up: bool, speed_mbit: u16, full_duplex: bool) {
     let speed_bits: u8 = match speed_mbit {
@@ -100,9 +109,28 @@ pub(crate) fn set_link_state(up: bool, speed_mbit: u16, full_duplex: bool) {
         1000 => 3,
         _ => 0,
     };
-    let raw = 0x80
-        | u8::from(up)
-        | (speed_bits << 1)
-        | (u8::from(full_duplex) << 3);
-    LINK_STATE.store(raw, Ordering::Relaxed);
+    let raw = 0x80 | u8::from(up) | (speed_bits << 1) | (u8::from(full_duplex) << 3);
+    C.link_state.store(raw, Ordering::Relaxed);
+}
+
+/// Frames the device accepted for transmission since boot.
+#[must_use]
+pub fn tx_frames_sent() -> usize {
+    C.tx_frames_sent.load(Ordering::Relaxed)
+}
+
+/// Frames the device refused, or that could not get a ring slot.
+#[must_use]
+pub fn tx_drop_count() -> usize {
+    C.tx_drop_count.load(Ordering::Relaxed)
+}
+
+/// `(buffers_posted, begin_failures, frames_received)` since boot.
+#[must_use]
+pub fn rx_counters() -> (usize, usize, usize) {
+    (
+        C.rx_buffers_posted.load(Ordering::Relaxed),
+        C.rx_begin_failures.load(Ordering::Relaxed),
+        C.rx_frames_received.load(Ordering::Relaxed),
+    )
 }

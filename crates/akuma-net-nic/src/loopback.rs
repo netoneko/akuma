@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use smoltcp::phy::{Device, DeviceCapabilities};
 use smoltcp::time::Instant;
 use akuma_primitives::net_runtime::runtime;
-use crate::counters::TX_DROP_COUNT;
+use crate::counters::C;
 use crate::device::VirtioSmoltcpDevice;
 use crate::nicstat;
 use crate::frames::{FrameArena, FrameLease};
@@ -118,7 +118,7 @@ impl ExternalDevice {
                     return res;
                 }
                 // Nowhere to send a non-loopback frame; smoltcp will retry.
-                TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                C.tx_drop_count.fetch_add(1, Ordering::Relaxed);
                 res
             }
         }

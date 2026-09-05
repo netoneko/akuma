@@ -57,7 +57,7 @@ pub mod model;
 
 pub use chip::Model;
 pub use desc::Desc;
-pub use driver::Nic;
+pub use driver::{Nic, Snapshot};
 pub use link::{LinkState, Speed};
 
 /// An Ethernet station address.

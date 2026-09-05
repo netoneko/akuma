@@ -52,10 +52,13 @@ use crate::runtime::runtime;
 use crate::runtime::PreemptGuard;
 use akuma_net_nic::nicstat;
 use akuma_net_nic::nic::Nic;
+#[cfg(feature = "rtl8169")]
+pub use akuma_net_nic::Rtl8169Device;
 pub use akuma_net_nic::{VirtioSmoltcpDevice, LoopbackAwareDevice, ExternalDevice,
     LoopbackAwareRxToken, LoopbackAwareTxToken, VirtioRxToken, VirtioTxToken,
     RX_BUFFER_LEN, loopback_drop_count, nic_irq_ack, nic_irq_count, nic_slot,
-    NIC_SLOT_NONE, isr_history, link_state, rx_counters, tx_drop_count, tx_frames_sent};
+    NIC_SLOT_NONE, canaries_intact, counter_block_addr, isr_history, link_state,
+    rx_counters, tx_drop_count, tx_frames_sent};
 use akuma_primitives::TakeOnce;
 
 pub mod consts;
