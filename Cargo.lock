@@ -70,7 +70,10 @@ dependencies = [
  "akuma-alloc",
  "akuma-exec-core",
  "akuma-ext2",
+ "akuma-fbcon",
+ "akuma-multiboot2",
  "akuma-net",
+ "akuma-net-rtl8169",
  "akuma-pipe",
  "akuma-pmm",
  "akuma-primitives",
@@ -214,6 +217,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-fbcon"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-fdt"
 version = "0.1.0"
 dependencies = [
@@ -346,6 +353,10 @@ dependencies = [
  "log",
  "spinning_top",
 ]
+
+[[package]]
+name = "akuma-multiboot2"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-net"
