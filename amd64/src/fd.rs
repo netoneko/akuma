@@ -236,7 +236,7 @@ pub fn read_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
     loop {
         match crate::pipe::read(pipe_id, &mut tmp) {
             Some(0) => return 0, // EOF
-            Some(n) => return copy_to_user(buf, &tmp[..n]) as u64,
+            Some(n) => return copy_to_user(buf, &tmp[..n]),
             None if nonblock => return errno::EAGAIN,
             None => crate::sched::yield_now(),
         }
@@ -246,7 +246,9 @@ pub fn read_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
 /// Write to a pipe, honouring `nonblock`. A short write is returned as-is;
 /// `sshd`'s bridge carries the residue.
 pub fn write_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
-    let data = copy_in(buf, len as u64);
+    let Some(data) = copy_in(buf, len as u64) else {
+        return errno::EFAULT;
+    };
     loop {
         let n = crate::pipe::write(pipe_id, &data);
         if n > 0 || data.is_empty() {
@@ -307,18 +309,19 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
 }
 
 /// Copy `len` bytes in from a user pointer. Public for `sock`.
+///
+/// `None` on a bad range or a fault — the caller returns `EFAULT`. Fault-safe
+/// through `crate::uaccess` since 2026-09-05; a bad pointer used to halt here.
 #[must_use]
-pub fn copy_in(ptr: u64, len: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len as usize);
-    for i in 0..len {
-        // SAFETY: the same user-pointer contract as every other access here.
-        out.push(unsafe { (ptr as *const u8).add(i as usize).read_volatile() });
-    }
-    out
+pub fn copy_in(ptr: u64, len: u64) -> Option<Vec<u8>> {
+    let mut out = alloc::vec![0u8; len as usize];
+    crate::uaccess::read_bytes(ptr, &mut out).then_some(out)
 }
 
-/// Copy out to a user pointer. Public for `sock`.
-pub fn copy_out(ptr: u64, src: &[u8]) -> usize {
+/// Copy out to a user pointer. Public for `sock`. Returns the byte count, or
+/// `errno::EFAULT` — see [`copy_to_user`].
+#[must_use]
+pub fn copy_out(ptr: u64, src: &[u8]) -> u64 {
     copy_to_user(ptr, src)
 }
 
@@ -345,13 +348,18 @@ static TABLE: Spinlock<[Option<Entry>; MAX_OPEN]> =
 /// would walk off the mapped page into whatever follows.
 const MAX_IO: u64 = 64 * 1024;
 
-/// Copy `src` to a user pointer. Returns how many bytes were written.
-fn copy_to_user(ptr: u64, src: &[u8]) -> usize {
-    for (i, &b) in src.iter().enumerate() {
-        // SAFETY: as `copy_from_user`.
-        unsafe { (ptr as *mut u8).add(i).write_volatile(b) };
+/// Copy `src` to a user pointer.
+///
+/// Returns `src.len()` — or `errno::EFAULT`, already in syscall-return form, so
+/// a caller whose result *is* the count returns this directly and every other
+/// caller checks it with `errno::is_err`. Fault-safe through `crate::uaccess`.
+#[must_use]
+fn copy_to_user(ptr: u64, src: &[u8]) -> u64 {
+    if crate::uaccess::write_bytes(ptr, src) {
+        src.len() as u64
+    } else {
+        errno::EFAULT
     }
-    src.len()
 }
 
 /// Dump a user C string to the serial trace (bounded, stops at NUL). Bring-up
@@ -361,16 +369,11 @@ fn copy_to_user(ptr: u64, src: &[u8]) -> usize {
 /// `copy_from_user` semantics (see the `akuma-user-access` row in the target
 /// README for why that seam does not exist here yet).
 pub fn trace_user_cstr(ptr: u64) {
-    // Above the user half is a kernel address (or garbage) — not a path.
-    if ptr == 0 || ptr >= 0x0000_8000_0000_0000 {
+    // A bad pointer traces as nothing: `read_cstr` range-checks and recovers.
+    let Some(s) = crate::uaccess::read_cstr(ptr, 256) else {
         return;
-    }
-    for i in 0..256u64 {
-        // SAFETY: bounded read of user memory, per this module's contract.
-        let b = unsafe { (ptr as *const u8).add(i as usize).read_volatile() };
-        if b == 0 || !b.is_ascii() {
-            return;
-        }
+    };
+    for &b in s.iter().take_while(|b| b.is_ascii()) {
         serial::putb(b);
     }
 }
@@ -382,19 +385,7 @@ pub fn trace_user_cstr(ptr: u64) {
 /// truncated path names a *different file* and opening it silently would be
 /// worse than failing.
 fn path_from_user(ptr: u64) -> Option<alloc::string::String> {
-    if ptr == 0 {
-        return None;
-    }
-    let mut buf = Vec::new();
-    for i in 0..256u64 {
-        // SAFETY: as `copy_from_user`.
-        let b = unsafe { (ptr as *const u8).add(i as usize).read_volatile() };
-        if b == 0 {
-            return alloc::string::String::from_utf8(buf).ok();
-        }
-        buf.push(b);
-    }
-    None
+    alloc::string::String::from_utf8(crate::uaccess::read_cstr(ptr, 256)?).ok()
 }
 
 /// Resolve an `*at()`-syscall path against its `dirfd`.
@@ -698,7 +689,10 @@ pub fn sys_readlinkat(dirfd: u64, path: u64, buf: u64, bufsiz: u64) -> u64 {
         Ok(target) => {
             let bytes = target.as_bytes();
             let n = (bytes.len() as u64).min(bufsiz);
-            copy_to_user(buf, &bytes[..n as usize]);
+            let r = copy_to_user(buf, &bytes[..n as usize]);
+            if errno::is_err(r) {
+                return r;
+            }
             n
         }
         Err(_) => errno::ENOENT,
@@ -738,19 +732,16 @@ pub fn sys_utimensat(dirfd: u64, path: u64, times: u64, _flags: u64) -> u64 {
     } else {
         // SAFETY: user array of two `struct timespec` { i64, i64 }: atime at
         // +0, mtime at +16.
-        let read_ts = |off: u64| -> (i64, i64) {
-            // SAFETY: user `struct timespec` fields, per this syscall's ABI.
-            unsafe {
-                (
-                    ((times + off) as *const i64).read_volatile(),
-                    ((times + off + 8) as *const i64).read_volatile(),
-                )
-            }
+        let read_ts = |off: u64| -> Option<(i64, i64)> {
+            crate::uaccess::read_val::<[i64; 2]>(times + off).map(<(i64, i64)>::from)
         };
-        let Some(atime) = decode(read_ts(0)) else {
+        let (Some(raw_a), Some(raw_m)) = (read_ts(0), read_ts(16)) else {
+            return errno::EFAULT;
+        };
+        let Some(atime) = decode(raw_a) else {
             return errno::EINVAL;
         };
-        let Some(mtime) = decode(read_ts(16)) else {
+        let Some(mtime) = decode(raw_m) else {
             return errno::EINVAL;
         };
         (atime, mtime)
@@ -924,7 +915,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         if let Some(pid) = crate::usermode::current_stdin_pipe() {
             return read_pipe(pid, buf, len as usize, false);
         }
-        return read_console(buf, len as usize) as u64;
+        return read_console(buf, len as usize);
     }
     if fd == 1 || fd == 2 {
         return errno::EBADF;
@@ -961,7 +952,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     }
     file.position = pos + n;
     let chunk = &entry.data[pos..pos + n];
-    copy_to_user(buf, chunk) as u64
+    copy_to_user(buf, chunk)
 }
 
 /// `write(fd, buf, len)` on a real file descriptor — everything `sys_write` in
@@ -992,7 +983,9 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
         let chunk_len = ((len as usize) - written).min(MAX_IO as usize);
         // Copied in before the lock: there is no reason to hold `TABLE`
         // across a user copy.
-        let incoming = copy_in(buf + written as u64, chunk_len as u64);
+        let Some(incoming) = copy_in(buf + written as u64, chunk_len as u64) else {
+            return if written == 0 { errno::EFAULT } else { written as u64 };
+        };
         let mut table = TABLE.lock();
         let Some(Some(entry)) = table.get_mut(idx as usize) else {
             return errno::EBADF;
@@ -1055,14 +1048,14 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
         loop {
             match crate::pipe::read(pipe_id, &mut one) {
                 Some(0) => return 0, // EOF — the client closed the channel
-                Some(_) => return copy_to_user(buf, &one) as u64,
+                Some(_) => return copy_to_user(buf, &one),
                 None => crate::sched::yield_now(),
             }
         }
     }
     loop {
         if let Some(b) = serial::getb() {
-            return copy_to_user(buf, &[b]) as u64;
+            return copy_to_user(buf, &[b]);
         }
         core::hint::spin_loop();
     }
@@ -1078,7 +1071,7 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
 ///
 /// Ctrl+D on an empty line returns 0, which is EOF. A reader that treated that
 /// as an error would never terminate.
-fn read_console(buf: u64, len: usize) -> usize {
+fn read_console(buf: u64, len: usize) -> u64 {
     loop {
         // Anything the discipline already has, first: a previous call may have
         // delivered two lines' worth of bytes in one burst.
@@ -1267,7 +1260,10 @@ pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
     drop(table);
 
     if written > 0 {
-        copy_to_user(dirp, &kernel_buf[..written]);
+        let r = copy_to_user(dirp, &kernel_buf[..written]);
+        if errno::is_err(r) {
+            return r;
+        }
     }
     written as u64
 }
@@ -1346,7 +1342,9 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         }
     };
     let st = encode_stat(mode, size, 0, nlink, None, None, None);
-    copy_to_user(statbuf, &st);
+    if errno::is_err(copy_to_user(statbuf, &st)) {
+        return errno::EFAULT;
+    }
     0
 }
 
@@ -1403,7 +1401,9 @@ pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
         meta.modified,
         meta.created,
     );
-    copy_to_user(statbuf, &st);
+    if errno::is_err(copy_to_user(statbuf, &st)) {
+        return errno::EFAULT;
+    }
     0
 }
 
@@ -1454,9 +1454,12 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> u64 {
         let mut ready = 0u64;
         for i in 0..n {
             let base = fds + (i as u64) * 8;
-            // SAFETY: user array of `struct pollfd` (8 bytes), bounded by nfds.
-            let fd = unsafe { (base as *const i32).read_volatile() };
-            let events = unsafe { ((base + 4) as *const u16).read_volatile() };
+            // A `struct pollfd` (8 bytes): fd at +0, events at +4, revents at +6.
+            let (Some(fd), Some(events)) =
+                (crate::uaccess::read_val::<i32>(base), crate::uaccess::read_val::<u16>(base + 4))
+            else {
+                return errno::EFAULT;
+            };
             let mut revents = 0u16;
             if fd >= 0 {
                 let (r, w) = poll_ready(fd as u64);
@@ -1467,8 +1470,9 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> u64 {
                     revents |= POLLOUT;
                 }
             }
-            // SAFETY: the `revents` half of the same `struct pollfd`.
-            unsafe { ((base + 6) as *mut u16).write_volatile(revents) };
+            if !crate::uaccess::write_val::<u16>(base + 6, revents) {
+                return errno::EFAULT;
+            }
             if revents != 0 {
                 ready += 1;
             }
@@ -1532,7 +1536,9 @@ pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeou
         (&mut in_except, exceptfds),
     ] {
         if src != 0 {
-            let v = copy_in(src, nb as u64);
+            let Some(v) = copy_in(src, nb as u64) else {
+                return errno::EFAULT;
+            };
             for (dst_w, chunk) in dst[..nb / 8].iter_mut().zip(v.as_chunks::<8>().0) {
                 *dst_w = u64::from_le_bytes(*chunk);
             }
@@ -1545,9 +1551,8 @@ pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeou
     let deadline_budget: Option<u64> = if timeout == 0 {
         Some(1)
     } else {
-        // SAFETY: user `struct timeval`, per this syscall's ABI.
-        let (sec, usec) = unsafe {
-            ((timeout as *const i64).read_volatile(), ((timeout + 8) as *const i64).read_volatile())
+        let Some([sec, usec]) = crate::uaccess::read_val::<[i64; 2]>(timeout) else {
+            return errno::EFAULT;
         };
         if sec < 0 || !(0..1_000_000).contains(&usec) {
             return errno::EINVAL;
@@ -1581,7 +1586,9 @@ pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeou
             ] {
                 if ptr != 0 {
                     let flat: Vec<u8> = src.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    copy_to_user(ptr, &flat[..nb]);
+                    if errno::is_err(copy_to_user(ptr, &flat[..nb])) {
+                        return errno::EFAULT;
+                    }
                 }
             }
             return ready;
@@ -1596,7 +1603,9 @@ pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeou
     for ptr in [readfds, writefds, exceptfds] {
         if ptr != 0 {
             let zero = [0u8; 128];
-            copy_to_user(ptr, &zero[..nb]);
+            if errno::is_err(copy_to_user(ptr, &zero[..nb])) {
+                return errno::EFAULT;
+            }
         }
     }
     0
@@ -1722,7 +1731,9 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             t[22] = 0x00; // VTIME
             t[23] = 0x01; // VMIN   = 1
             t[27] = 0x1A; // VSUSP  = ^Z
-            copy_to_user(arg, &t);
+            if errno::is_err(copy_to_user(arg, &t)) {
+                return errno::EFAULT;
+            }
             0
         }
         TIOCGWINSZ => {
@@ -1733,15 +1744,17 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             let mut w = [0u8; 8];
             w[0..2].copy_from_slice(&24u16.to_le_bytes()); // ws_row
             w[2..4].copy_from_slice(&80u16.to_le_bytes()); // ws_col
-            copy_to_user(arg, &w);
+            if errno::is_err(copy_to_user(arg, &w)) {
+                return errno::EFAULT;
+            }
             0
         }
         // The setters and job-control queries: accept, and answer with the one
         // process group this target has.
         TCSETS | TCSETSW | TCSETSF | TIOCSWINSZ | TIOCSPGRP | TIOCSCTTY => 0,
         TIOCGPGRP => {
-            if arg != 0 {
-                copy_to_user(arg, &1i32.to_le_bytes());
+            if arg != 0 && errno::is_err(copy_to_user(arg, &1i32.to_le_bytes())) {
+                return errno::EFAULT;
             }
             0
         }

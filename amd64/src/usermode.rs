@@ -600,9 +600,9 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             let timeout_ms = if a3 == 0 {
                 (-1i64) as u64
             } else {
-                // SAFETY: user `struct timespec` { i64 tv_sec, i64 tv_nsec }.
-                let (sec, nsec) = unsafe {
-                    ((a3 as *const i64).read_volatile(), (a3 as *const i64).add(1).read_volatile())
+                // A user `struct timespec` { i64 tv_sec, i64 tv_nsec }.
+                let Some([sec, nsec]) = crate::uaccess::read_val::<[i64; 2]>(a3) else {
+                    return errno::EFAULT;
                 };
                 (sec.max(0) as u64)
                     .saturating_mul(1000)
@@ -685,10 +685,9 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             if a1 == 0 || a2 < 2 {
                 return errno::EINVAL;
             }
-            // SAFETY: a user buffer of at least `a2` bytes, `a2 >= 2` checked.
-            unsafe {
-                (a1 as *mut u8).write_volatile(b'/');
-                (a1 as *mut u8).add(1).write_volatile(0);
+            // A user buffer of at least `a2` bytes, `a2 >= 2` checked.
+            if !crate::uaccess::write_bytes(a1, b"/\0") {
+                return errno::EFAULT;
             }
             return 2;
         }
@@ -728,10 +727,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         228 => {
             const CLOCK_REALTIME: u64 = 0;
             let us = if a1 == CLOCK_REALTIME { crate::clock::now_us() } else { crate::net::uptime_us() };
-            // SAFETY: a user `struct timespec { i64 tv_sec, i64 tv_nsec }`.
-            unsafe {
-                (a2 as *mut i64).write_volatile((us / 1_000_000).cast_signed());
-                (a2 as *mut i64).add(1).write_volatile(((us % 1_000_000) * 1000).cast_signed());
+            // A user `struct timespec { i64 tv_sec, i64 tv_nsec }`.
+            let ts = [(us / 1_000_000).cast_signed(), ((us % 1_000_000) * 1000).cast_signed()];
+            if !crate::uaccess::write_val(a2, ts) {
+                return errno::EFAULT;
             }
             return 0;
         }
@@ -740,10 +739,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         96 => {
             if a1 != 0 {
                 let us = crate::clock::now_us();
-                // SAFETY: a user `struct timeval { i64 tv_sec, i64 tv_usec }`.
-                unsafe {
-                    (a1 as *mut i64).write_volatile((us / 1_000_000).cast_signed());
-                    (a1 as *mut i64).add(1).write_volatile((us % 1_000_000).cast_signed());
+                // A user `struct timeval { i64 tv_sec, i64 tv_usec }`.
+                let tv = [(us / 1_000_000).cast_signed(), (us % 1_000_000).cast_signed()];
+                if !crate::uaccess::write_val(a1, tv) {
+                    return errno::EFAULT;
                 }
             }
             return 0;
@@ -752,9 +751,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         // in addition to the return value, matching `time(2)`'s own contract.
         201 => {
             let secs = (crate::clock::now_us() / 1_000_000).cast_signed();
-            if a1 != 0 {
-                // SAFETY: a user `time_t` (i64).
-                unsafe { (a1 as *mut i64).write_volatile(secs) };
+            if a1 != 0 && !crate::uaccess::write_val::<i64>(a1, secs) {
+                return errno::EFAULT;
             }
             return secs as u64;
         }
@@ -850,12 +848,9 @@ fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
     let mut total: u64 = 0;
     for i in 0..cnt {
         let e = iov + (i as u64) * 16;
-        // SAFETY: user pointers to an iovec array; bad ones fault reportably.
-        let (base, len) = unsafe {
-            (
-                (e as *const u64).read_volatile(),
-                (e as *const u64).add(1).read_volatile(),
-            )
+        // One `struct iovec { void *base; size_t len }` of the user's array.
+        let Some([base, len]) = crate::uaccess::read_val::<[u64; 2]>(e) else {
+            return if total == 0 { errno::EFAULT } else { total };
         };
         if len == 0 {
             continue;
@@ -881,12 +876,8 @@ fn sys_readv(fd: u64, iov: u64, cnt: u64) -> u64 {
     let mut total: u64 = 0;
     for i in 0..cnt {
         let e = iov + (i as u64) * 16;
-        // SAFETY: as `sys_writev`.
-        let (base, len) = unsafe {
-            (
-                (e as *const u64).read_volatile(),
-                (e as *const u64).add(1).read_volatile(),
-            )
+        let Some([base, len]) = crate::uaccess::read_val::<[u64; 2]>(e) else {
+            return if total == 0 { errno::EFAULT } else { total };
         };
         if len == 0 {
             continue;
@@ -943,10 +934,8 @@ fn sys_uname(buf: u64) -> u64 {
     if buf == 0 {
         return crate::fd::errno::EFAULT;
     }
-    // SAFETY: a user pointer to a `struct utsname`; `CR4.SMAP` is off and a bad
-    // pointer faults reportably.
-    unsafe {
-        core::ptr::copy_nonoverlapping(UTSNAME.as_ptr(), buf as *mut u8, UTS_LEN);
+    if !crate::uaccess::write_bytes(buf, &UTSNAME) {
+        return crate::fd::errno::EFAULT;
     }
     0
 }
@@ -997,13 +986,15 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             0
         }
         ARCH_GET_FS => {
-            // SAFETY: a user pointer to a u64, per the ABI.
-            unsafe { (addr as *mut u64).write_volatile(rdmsr(IA32_FS_BASE)) };
+            if !crate::uaccess::write_val::<u64>(addr, rdmsr(IA32_FS_BASE)) {
+                return crate::fd::errno::EFAULT;
+            }
             0
         }
         ARCH_GET_GS => {
-            // SAFETY: as above.
-            unsafe { (addr as *mut u64).write_volatile(rdmsr(IA32_GS_BASE)) };
+            if !crate::uaccess::write_val::<u64>(addr, rdmsr(IA32_GS_BASE)) {
+                return crate::fd::errno::EFAULT;
+            }
             0
         }
         _ => crate::fd::errno::EINVAL,
@@ -1018,7 +1009,7 @@ fn sys_getrandom(buf: u64, len: u64) -> u64 {
     let n = (len as usize).min(256);
     let mut tmp = [0u8; 256];
     crate::net::rng_fill(&mut tmp[..n]);
-    crate::fd::copy_out(buf, &tmp[..n]) as u64
+    crate::fd::copy_out(buf, &tmp[..n])
 }
 
 /// `write(fd, buf, len)` — fd 1 and 2 go to the serial console.
@@ -1061,14 +1052,20 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     if len > MAX_WRITE {
         return EFAULT;
     }
-    for i in 0..len {
-        // SAFETY: `buf` is a user pointer and this is the one place the kernel
-        // dereferences one. It is bounded by MAX_WRITE above, and a fault here
-        // would land in the #PF handler rather than silently corrupting — which
-        // is the honest limit of what this can promise without a
-        // copy_from_user that validates the range against the page tables.
-        let byte = unsafe { (buf as *const u8).add(i as usize).read_volatile() };
-        serial::putb(byte);
+    // Fault-safe since 2026-09-05: a bad `buf` is EFAULT, not a halt. Chunked
+    // through a stack buffer so the copy is one `rep movsb` per 256 bytes rather
+    // than a recovered fault per byte, and so nothing here allocates.
+    let mut chunk = [0u8; 256];
+    let mut done = 0u64;
+    while done < len {
+        let n = ((len - done) as usize).min(chunk.len());
+        if !crate::uaccess::read_bytes(buf + done, &mut chunk[..n]) {
+            return if done == 0 { EFAULT } else { done };
+        }
+        for &byte in &chunk[..n] {
+            serial::putb(byte);
+        }
+        done += n as u64;
     }
     let n = WRITE_SEQ_LEN.fetch_add(1, Ordering::Relaxed) as usize;
     if let Some(slot) = WRITE_SEQ.get(n) {
@@ -1583,20 +1580,7 @@ fn spawn_table() -> *mut [Option<Spawn>; SPAWN_SLOTS] {
 
 /// Read a NUL-terminated string from user memory, bounded.
 fn user_cstr(ptr: u64, max: usize) -> Option<alloc::vec::Vec<u8>> {
-    if ptr == 0 {
-        return None;
-    }
-    let mut out = alloc::vec::Vec::new();
-    for i in 0..max {
-        // SAFETY: the same user-pointer contract as every other access on this
-        // target — `CR4.SMAP` is off, and a bad pointer faults reportably.
-        let b = unsafe { (ptr as *const u8).add(i).read_volatile() };
-        if b == 0 {
-            return Some(out);
-        }
-        out.push(b);
-    }
-    None
+    crate::uaccess::read_cstr(ptr, max)
 }
 
 /// Parse a NULL-terminated array of C-string pointers into owned bytes.
@@ -1606,8 +1590,8 @@ fn user_argv(ptr: u64) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
         return argv;
     }
     for i in 0..loader::MAX_ARGV {
-        // SAFETY: as `user_cstr`; the array is the caller's and NULL-terminated.
-        let p = unsafe { (ptr as *const u64).add(i).read_volatile() };
+        // A bad array pointer ends the list, like a NULL entry would.
+        let p = crate::uaccess::read_val::<u64>(ptr + (i as u64) * 8).unwrap_or(0);
         if p == 0 {
             break;
         }
@@ -1626,8 +1610,8 @@ fn user_strv(ptr: u64, max: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
         return out;
     }
     for i in 0..max {
-        // SAFETY: as `user_cstr`; the array is the caller's and NULL-terminated.
-        let p = unsafe { (ptr as *const u64).add(i).read_volatile() };
+        // A bad array pointer ends the list, like a NULL entry would.
+        let p = crate::uaccess::read_val::<u64>(ptr + (i as u64) * 8).unwrap_or(0);
         if p == 0 {
             break;
         }
@@ -1910,8 +1894,11 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
 
     // Seed the child's stdin, if the caller supplied any (`spawn_with_stdin`).
     if stdin_ptr != 0 && stdin_len != 0 {
-        let seed = crate::fd::copy_in(stdin_ptr, stdin_len.min(64 * 1024));
-        pipe::write(stdin_pipe, &seed);
+        // A bad seed pointer seeds nothing rather than failing the spawn: the
+        // child is already built, and an empty stdin is a state it handles.
+        if let Some(seed) = crate::fd::copy_in(stdin_ptr, stdin_len.min(64 * 1024)) {
+            pipe::write(stdin_pipe, &seed);
+        }
     }
 
     let root = proc.space.root();
@@ -2089,8 +2076,9 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
 
     if status_ptr != 0 {
         let raw = ((u64::from((code as u32) & 0xff)) << 8) as i32;
-        // SAFETY: a user pointer to an int, per the wait(2) ABI.
-        unsafe { (status_ptr as *mut i32).write_volatile(raw) };
+        // A bad `status` pointer loses the status, not the reap: the child is
+        // already gone and `wait4` reporting its pid is the useful half.
+        let _ = crate::uaccess::write_val::<i32>(status_ptr, raw);
     }
 
     // A `vfork` child borrows the parent's stdio — leave those pipes alone.

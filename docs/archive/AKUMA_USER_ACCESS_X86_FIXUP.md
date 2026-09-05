@@ -167,18 +167,65 @@ other stage's, and a mechanism whose failure mode is "resumes at garbage" is
 exactly what should be re-proven on every boot. `DEMAND_FAULTS` gained a
 sibling `COPY_FIXUPS` counter for it.
 
-## Known gap, stated
+## Part 2, same day: the syscall bodies, and the `#GP` half
 
-A **non-canonical** address (bit 47 not sign-extended into 48..63) raises
-`#GP`, not `#PF`, and `#GP` is fatal on this target. `USER_VA_LIMIT` in the
-crate is the 48-bit AArch64 bound, so `validate_user_range` admits
-`0x0000_8000_0000_0000..=0x0000_FFFF_FFFF_FFFF`, which x86_64 cannot address
-at all. Until that limit is per-arch, a caller must not reach the loop with
-such a pointer. Out of scope here (the ask was vector 14 only, and the fix
-belongs in the range check, not the copy); it is stated on the asm block.
+The first pass left two things stated and open; both closed within the hour,
+for real hardware.
+
+**Non-canonical addresses.** Bit 47 not sign-extended into 48..63 is not a
+page fault — the CPU rejects it before translation, as `#GP` with error code
+0 — and `#GP` was fatal. Two fixes, belt and braces: `USER_VA_LIMIT` is now
+`0x0000_7FFF_FFFF_FFFF` on x86_64 (`#[cfg]`-gated in the crate; AArch64
+unchanged), so no validated pointer reaches the loop with one; and vector 13
+goes through the same stub as vector 14 — the `global_asm!` became a
+`fixable_exception_entry!("<entry>", "<dispatch>")` macro emitting both —
+with `general_protection_dispatch` running the fixup query and nothing else
+(a `#GP` is never "not mapped yet", so no demand paging). The boot test takes
+one on purpose (`copy_from_user_safe` from `0x0000_8000_0000_0000` →
+`Err(14)`) and the fixup counter pins four recovered faults: three `#PF`, one
+`#GP`.
+
+**The raw dereferences.** `amd64/src/uaccess.rs` is new: `range_ok` (null
+page, wrap, kernel half, non-canonical), `read_bytes`/`write_bytes` over
+`copy_from_user_safe`/`copy_to_user_safe`, `read_val`/`write_val` for the
+small fixed-layout ABI structs, and `read_cstr`, which reads to the end of the
+current page at a time so a string ending just before an unmapped page is not
+failed by a speculative over-read (Linux's `strncpy_from_user` stops at page
+boundaries for the same reason). Every `read_volatile`/`write_volatile`
+through a `ptr as *const u8` in `usermode.rs`, `fd.rs` and `sock.rs` — 31
+sites — now goes through it: `fd::copy_in` returns `Option<Vec<u8>>`,
+`fd::copy_to_user`/`copy_out` return the count **or `errno::EFAULT`** in
+syscall-return form (so a caller whose result is the count returns it
+directly, and every other caller checks `errno::is_err`), `path_from_user`/
+`user_cstr` are one line over `read_cstr`, and the `timespec`/`timeval`/
+`iovec`/`pollfd` field reads are single `read_val::<[i64; 2]>`-style copies.
+`sys_write` to the console copies through a 256-byte stack chunk rather than
+per byte. Three sites deliberately degrade instead of failing: `wait4`'s
+status write (the child is already reaped; the pid is the useful half),
+`sys_spawn`'s stdin seed (an empty stdin is a state the child handles), and
+`sock::read_u64` for optional `msghdr` fields (a bad pointer reads as 0, which
+is what a zeroed field is).
+
+**The self-tests broke, correctly.** First boot after the conversion: 43
+failures, every one `EFAULT` or `EBADF`, every one an `fd`/`sock`/spawn test
+that drives a syscall body with a **kernel-stack buffer** where a program
+would pass a user pointer — which `range_ok` refuses, as it must. That is the
+exact case the AArch64 kernel's ~85 boot-test sites solved with
+`akuma_user_access::BYPASS_VALIDATION`, which is portable; `uaccess` honours
+it (waiving only the "is it in the user half" question — the copy stays
+fault-safe and a wrapping range is refused regardless), and `main.rs` holds a
+`BypassValidationGuard` from `Suite::new` to just before `t.report()`, so
+`run_init`'s real program gets real `EFAULT`s. Second boot: **187 passed, 0
+failed** (185 + the `#GP` case + a `range_ok` truth table), and `busybox sh`
+came up through the converted paths.
+
+Verification repeated in full: aarch64 kernel build + workspace clippy clean,
+crate clippy clean on both bare-metal targets, workspace host tests green.
 
 `CR4.SMAP` stays off, as `proposals/AKUMA_USER_ACCESS_ARCH_PORTABILITY.md`
-already scoped; `stac`/`clac` would go inside the copy region when it turns on.
+scoped; `stac`/`clac` go inside the copy region when it turns on, and until
+then a *mapped* kernel address handed by a program is refused by `range_ok`
+alone, not by hardware.
 
 Also found and not touched: `DISK=none amd64/run.sh` page-faults in
 `net::init` before the self-tests on the untouched tree (`cr2=0x80_0002_0008`,
@@ -187,10 +234,9 @@ measured with the default disk.
 
 ## Next
 
-`amd64/src/usermode.rs` and `fd.rs` still dereference user pointers raw
-(`sys_write`'s per-byte `read_volatile`, `fd.rs`'s "own bounded copy
-helpers"). Every one of those is now a `copy_from_user_safe`/`copy_to_user_safe`
-call away from being fault-safe, and that conversion is the point of this
-work. `akuma-el0-entry` (`invalid register 'x30'`) and `akuma-elf`'s
-`UserAddressSpace` needs remain the next two named blockers on the
-`akuma-exec` chain, unchanged from the gate-fix doc.
+`CR4.SMAP`/`SMEP`, with `stac`/`clac` bracketing the copy region — the one
+remaining way a program can make the kernel touch a mapped kernel address on
+its behalf is a bug in `range_ok`, and SMAP is what makes that class of bug a
+fault instead of a read. `akuma-el0-entry` (`invalid register 'x30'`) and
+`akuma-elf`'s `UserAddressSpace` needs remain the next two named blockers on
+the `akuma-exec` chain, unchanged from the gate-fix doc.

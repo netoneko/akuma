@@ -83,6 +83,7 @@ mod sched;
 mod serial;
 #[cfg(target_arch = "x86_64")]
 mod sock;
+mod uaccess;
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(include_str!("boot.s"), options(att_syntax));
@@ -187,6 +188,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 
     let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
 
+    // The self-tests below drive syscall bodies with kernel-stack buffers where
+    // a program would pass user pointers. `uaccess` refuses kernel addresses —
+    // that is its job — so the tests run inside the same bypass window the
+    // AArch64 kernel's boot tests use. Dropped before the verdict: `run_init`
+    // runs a real program, and its bad pointers must be EFAULT.
+    let user_ptr_bypass = akuma_user_access::BypassValidationGuard::new();
+
     mem::smoke_test(&mut t);
     paging::smoke_test(&mut t);
     // The IDT is already loaded (before mem::init, so faults there are
@@ -253,6 +261,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         }
         net::netpoll_spawn_selftest(&mut t);
     }
+
+    drop(user_ptr_bypass);
 
     // The verdict is `#[must_use]`, and this is why: before the harness existed
     // a `[FAIL]` printed and the boot went on to announce success.

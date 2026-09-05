@@ -69,10 +69,8 @@ fn sockaddr_in_from_user(ptr: u64, len: u64) -> Option<SocketAddrV4> {
         return None;
     }
     let mut raw = [0u8; core::mem::size_of::<SockAddrIn>()];
-    for (i, slot) in raw.iter_mut().enumerate() {
-        // SAFETY: a user pointer, bounded to the struct's size, checked above.
-        // Same contract as every other user access in this kernel — see `fd`.
-        *slot = unsafe { (ptr as *const u8).add(i).read_volatile() };
+    if !crate::uaccess::read_bytes(ptr, &mut raw) {
+        return None;
     }
     // SAFETY: `SockAddrIn` is `repr(C)` and plain-old-data — four integer
     // fields and a padding array, no pointers and no niches — so any 16 bytes
@@ -95,9 +93,8 @@ fn sockaddr_in_to_user(ptr: u64, addr: SocketAddrV4) -> usize {
     let raw: &[u8] = unsafe {
         core::slice::from_raw_parts((&raw const sa).cast::<u8>(), core::mem::size_of::<SockAddrIn>())
     };
-    for (i, b) in raw.iter().enumerate() {
-        // SAFETY: a user pointer, as above.
-        unsafe { (ptr as *mut u8).add(i).write_volatile(*b) };
+    if !crate::uaccess::write_bytes(ptr, raw) {
+        return 0;
     }
     raw.len()
 }
@@ -179,7 +176,9 @@ pub fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
 
 /// Send on a socket descriptor. Reached from `write` as well as `sendto`.
 pub fn send(idx: usize, buf: u64, len: u64, nonblock: bool) -> u64 {
-    let data = fd::copy_in(buf, len);
+    let Some(data) = fd::copy_in(buf, len) else {
+        return errno::EFAULT;
+    };
     match akuma_net::socket::socket_send(idx, &data, nonblock) {
         Ok(n) => n as u64,
         Err(e) => net_err(e),
@@ -190,7 +189,7 @@ pub fn send(idx: usize, buf: u64, len: u64, nonblock: bool) -> u64 {
 pub fn recv(idx: usize, buf: u64, len: u64, nonblock: bool) -> u64 {
     let mut data = alloc::vec![0u8; len as usize];
     match akuma_net::socket::socket_recv(idx, &mut data, nonblock) {
-        Ok(n) => fd::copy_out(buf, &data[..n]) as u64,
+        Ok(n) => fd::copy_out(buf, &data[..n]),
         Err(e) => net_err(e),
     }
 }
@@ -224,7 +223,9 @@ pub fn sys_sendto(fd: u64, buf: u64, len: u64, dest_addr: u64) -> u64 {
         let Some(dest) = sockaddr_in_from_user(dest_addr, size_of::<SockAddrIn>() as u64) else {
             return errno::EINVAL;
         };
-        let data = fd::copy_in(buf, len);
+        let Some(data) = fd::copy_in(buf, len) else {
+            return errno::EFAULT;
+        };
         return match akuma_net::socket::socket_send_udp(idx, &data, dest) {
             Ok(n) => n as u64,
             Err(e) => net_err(e),
@@ -251,7 +252,7 @@ pub fn sys_recvfrom(fd: u64, buf: u64, len: u64, src_addr: u64) -> u64 {
         return match akuma_net::socket::socket_recv_udp(idx, &mut data, fd::is_nonblocking(fd)) {
             Ok((n, from)) => {
                 sockaddr_in_to_user(src_addr, from);
-                fd::copy_out(buf, &data[..n]) as u64
+                fd::copy_out(buf, &data[..n])
             }
             Err(e) => net_err(e),
         };
@@ -279,11 +280,14 @@ const IOVEC_SIZE: u64 = 16;
 const MAX_MSG_IOV: u64 = 8;
 
 /// Read one `u64` field out of user memory at `base + off`.
+///
+/// A bad pointer reads as 0, which every caller here treats as "no such
+/// field" (a NULL `iov`, a zero length, a NULL name) — the fault is recovered
+/// by `crate::uaccess`, not reported, because these are optional fields of a
+/// `msghdr` and the syscall proceeds without them exactly as it would for a
+/// caller that zeroed them.
 fn read_u64(base: u64, off: u64) -> u64 {
-    // SAFETY: same user-pointer contract as every other raw access in this
-    // module; the field offsets above are the caller's guarantee of
-    // alignment and existence.
-    unsafe { ((base + off) as *const u64).read_volatile() }
+    crate::uaccess::read_val::<u64>(base + off).unwrap_or(0)
 }
 
 /// `sendmsg(fd, msghdr*, flags)` / `recvmsg(fd, msghdr*, flags)` — x86_64
@@ -315,7 +319,10 @@ pub fn sys_sendmsg(fd: u64, msg: u64, _flags: u64) -> u64 {
         let entry = iov + i * IOVEC_SIZE;
         let base = read_u64(entry, 0);
         let len = read_u64(entry, 8);
-        data.extend_from_slice(&fd::copy_in(base, len));
+        let Some(chunk) = fd::copy_in(base, len) else {
+            return errno::EFAULT;
+        };
+        data.extend_from_slice(&chunk);
     }
 
     if name != 0 && akuma_net::socket::is_udp_socket(idx) {
@@ -383,7 +390,9 @@ pub fn sys_recvmsg(fd: u64, msg: u64, _flags: u64) -> u64 {
         let base = read_u64(entry, 0);
         let cap = read_u64(entry, 8) as usize;
         let chunk = (n - written).min(cap);
-        fd::copy_out(base, &data[written..written + chunk]);
+        if errno::is_err(fd::copy_out(base, &data[written..written + chunk])) {
+            return if written == 0 { errno::EFAULT } else { written as u64 };
+        }
         written += chunk;
     }
     written as u64

@@ -232,12 +232,12 @@ __arch_copy_user_fault:
 //      AArch64 loop: a bare EFAULT, not bytes-not-copied.
 //   4. DF MUST BE CLEAR, and `cld` makes it so rather than trusting the ABI.
 //
-// Known gap, stated rather than hidden: a NON-CANONICAL address (bit 47 not
-// sign-extended into 48..63) raises #GP, not #PF, and #GP is fatal on this
-// target. `USER_VA_LIMIT` is the 48-bit AArch64 bound, so `validate_user_range`
-// admits 0x0000_8000_0000_0000..=0x0000_FFFF_FFFF_FFFF, which x86_64 cannot
-// address at all. Until that limit is per-arch, a caller must not reach this
-// loop with such a pointer.
+// A NON-CANONICAL address (bit 47 not sign-extended into 48..63) raises #GP,
+// not #PF. Two lines hold it: `USER_VA_LIMIT` is the canonical bound on this
+// target (below), so no validated pointer reaches here with one; and
+// `amd64/src/idt.rs` runs vector 13 through the same fixup query as vector 14,
+// so a raw caller still gets EFAULT rather than a halt (the boot test takes
+// one on purpose).
 //
 // `rep movsb` rather than a hand-tiered loop: with ERMS (every Zen and every
 // Intel core since Ivy Bridge) it is the fastest copy the ISA has for lengths
@@ -324,7 +324,16 @@ const EFAULT: u64 = akuma_primitives::errno::EFAULT as u64;
 /// Not a smaller cap, and that is load-bearing: Go on AArch64 allocates goroutine
 /// stacks and M-structs from high arenas (e.g. `0x203e000000` ≈ 130 GB) via `mmap`,
 /// so any fixed small cap — 4 GB, `stack_top`, … — rejects valid user pointers.
+#[cfg(not(target_arch = "x86_64"))]
 pub const USER_VA_LIMIT: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// x86_64's user half ends at the canonical boundary, one bit lower: bit 47
+/// must be sign-extended into 48..63, so `0x0000_8000_0000_0000..` is not a
+/// kernel address — it is **unaddressable**, and touching it raises `#GP`
+/// rather than `#PF`. Admitting it here would let a validated pointer reach the
+/// copy loop and take a fault the page-fault path never sees.
+#[cfg(target_arch = "x86_64")]
+pub const USER_VA_LIMIT: u64 = 0x0000_7FFF_FFFF_FFFF;
 
 /// Let a kernel address stand in for a user VA, for the boot self-tests that drive
 /// `handle_syscall` directly with kernel-stack buffers.

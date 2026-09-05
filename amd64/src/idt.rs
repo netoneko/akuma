@@ -16,18 +16,19 @@
 //! `fn`. That is a compiler feature, not a dependency — this crate still has none
 //! beyond `akuma-alloc` and `akuma-pmm`.
 //!
-//! **Vector 14 is the exception (2026-09-05).** The page-fault handler is the
-//! one handler that must sometimes *rewrite the return address* — to recover a
-//! faulting user copy (`akuma-user-access`) instead of halting. `x86-interrupt`
+//! **Vectors 13 and 14 are the exception (2026-09-05).** The page-fault
+//! handler must sometimes *rewrite the return address* — to recover a faulting
+//! user copy (`akuma-user-access`) instead of halting — and `#GP` must do the
+//! same for a non-canonical address in that copy, which never reaches `#PF`. `x86-interrupt`
 //! hands the frame over by value and gives no supported way to edit it; the
 //! obvious workaround, taking `&mut InterruptStackFrame`, resumed at an address
 //! 5 bytes inside an unrelated instruction and raised `#UD`
-//! (`docs/archive/AKUMA_USER_ACCESS_GATE_FIX.md`). So `#PF` enters through
-//! [`page_fault_entry`], a `global_asm!` stub that owns the frame layout and the
-//! `iretq`, and calls a plain `extern "C"` Rust function with a pointer to it.
-//! Nothing about that stub depends on an unstable ABI's internals. The other
-//! vectors stay `x86-interrupt`: they never return anywhere but where they came
-//! from, or never return at all.
+//! (`docs/archive/AKUMA_USER_ACCESS_GATE_FIX.md`). So both enter through a
+//! `global_asm!` stub (`fixable_exception_entry!`) that owns the frame layout
+//! and the `iretq`, and calls a plain `extern "C"` Rust function with a pointer
+//! to it. Nothing about that stub depends on an unstable ABI's internals. The
+//! other vectors stay `x86-interrupt`: they never return anywhere but where
+//! they came from, or never return at all.
 //!
 //! # What is deliberately missing
 //!
@@ -198,10 +199,6 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) ->
     fatal("#DF double fault", &frame, Some(code));
 }
 
-extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
-    fatal("#GP general protection", &frame, Some(code));
-}
-
 extern "x86-interrupt" fn unhandled(frame: InterruptStackFrame) {
     fatal("unhandled vector", &frame, None);
 }
@@ -219,66 +216,76 @@ pub struct PageFaultFrame {
     pub frame: InterruptStackFrame,
 }
 
-core::arch::global_asm!(
-    r#"
-    /* Naming the section is mandatory — see sched.rs for why a missing
-     * `.section` puts code in .bss and fails the link. */
-    .section .text
-.global page_fault_entry
-page_fault_entry:
-    /* On entry the CPU has pushed, on a 16-byte-aligned rsp (long mode aligns
-     * before pushing, whether or not the privilege level changed):
-     *
-     *   [rsp +  0]  error code
-     *   [rsp +  8]  rip
-     *   [rsp + 16]  cs
-     *   [rsp + 24]  rflags
-     *   [rsp + 32]  rsp
-     *   [rsp + 40]  ss
-     *
-     * Save every caller-saved register: `page_fault_dispatch` is `extern "C"`,
-     * so it preserves rbx/rbp/r12-r15 itself, but it is free to destroy these
-     * nine and the interrupted code — which may be `rep movsb` in the middle of
-     * a user copy, about to be re-executed after demand paging — is not
-     * expecting a call. rbp is pushed too, as the tenth: ten pushes is 80
-     * bytes, which keeps rsp 16-aligned at the `call`, as System V requires,
-     * and gives a debugger a frame chain for free. */
-    push rbp
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
+/// The hand-assembled entry for an exception **with an error code** whose
+/// handler may rewrite the return address: `$entry` is the symbol the IDT gate
+/// points at, `$dispatch` the `#[unsafe(no_mangle)] extern "C"
+/// fn(*mut PageFaultFrame)` it calls. Used for vectors 13 and 14; see the
+/// module header for why those two and no others.
+macro_rules! fixable_exception_entry {
+    ($entry:literal, $dispatch:literal) => {
+        core::arch::global_asm!(concat!(
+            /* Naming the section is mandatory — see sched.rs for why a missing
+             * `.section` puts code in .bss and fails the link. */
+            "    .section .text\n",
+            ".global ", $entry, "\n",
+            $entry, ":\n",
+            /* On entry the CPU has pushed, on a 16-byte-aligned rsp (long mode
+             * aligns before pushing, whether or not the privilege level changed):
+             *
+             *   [rsp +  0]  error code
+             *   [rsp +  8]  rip
+             *   [rsp + 16]  cs
+             *   [rsp + 24]  rflags
+             *   [rsp + 32]  rsp
+             *   [rsp + 40]  ss
+             *
+             * Save every caller-saved register: the dispatcher is `extern "C"`,
+             * so it preserves rbx/rbp/r12-r15 itself, but it is free to destroy
+             * these nine and the interrupted code — which may be `rep movsb` in
+             * the middle of a user copy, about to be re-executed after demand
+             * paging — is not expecting a call. rbp is pushed too, as the tenth:
+             * ten pushes is 80 bytes, which keeps rsp 16-aligned at the `call`,
+             * as System V requires, and gives a debugger a frame chain for free. */
+            "    push rbp\n",
+            "    push rax\n",
+            "    push rcx\n",
+            "    push rdx\n",
+            "    push rsi\n",
+            "    push rdi\n",
+            "    push r8\n",
+            "    push r9\n",
+            "    push r10\n",
+            "    push r11\n",
+            "    lea rdi, [rsp + 80]\n",          /* &PageFaultFrame: the error code slot */
+            "    call ", $dispatch, "\n",
+            /* The dispatcher returned, so this fault was serviced or fixed up —
+             * it may have rewritten the saved rip. Restore exactly what was
+             * saved; a demand-paged store re-executes with the registers it
+             * faulted with. */
+            "    pop r11\n",
+            "    pop r10\n",
+            "    pop r9\n",
+            "    pop r8\n",
+            "    pop rdi\n",
+            "    pop rsi\n",
+            "    pop rdx\n",
+            "    pop rcx\n",
+            "    pop rax\n",
+            "    pop rbp\n",
+            "    add rsp, 8\n",                   /* drop the error code; iretq does not */
+            "    iretq\n",
+        ));
+    };
+}
 
-    lea rdi, [rsp + 80]             /* &PageFaultFrame: the error code slot */
-    call page_fault_dispatch
-
-    /* The dispatcher returned, so this fault was serviced or fixed up — it may
-     * have rewritten the saved rip. Restore exactly what was saved; a demand-
-     * paged store re-executes with the registers it faulted with. */
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    pop rbp
-
-    add rsp, 8                      /* drop the error code; iretq does not */
-    iretq
-"#
-);
+fixable_exception_entry!("page_fault_entry", "page_fault_dispatch");
+fixable_exception_entry!("general_protection_entry", "general_protection_dispatch");
 
 unsafe extern "C" {
     /// The vector-14 entry point, installed in the IDT by [`init`].
     fn page_fault_entry();
+    /// The vector-13 entry point, installed in the IDT by [`init`].
+    fn general_protection_entry();
 }
 
 /// `#PF` — the only handler that can *return*, and the only one that can return
@@ -338,6 +345,27 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
     }
 
     fatal("#PF page fault", &pf.frame, Some(code));
+}
+
+/// `#GP` — fatal, except inside the user-copy loop.
+///
+/// A **non-canonical** address (bit 47 not sign-extended into 48..63) is not a
+/// page fault: the CPU rejects it before translation, as `#GP` with error code
+/// 0. `crate::uaccess::range_ok` refuses such pointers before any copy, so this
+/// arm is the second line — a direct `copy_from_user_safe` caller, or a bug in
+/// the range check, still gets `EFAULT` and not a halt. Same stub, same frame,
+/// same fixup query as [`page_fault_dispatch`]; no demand paging, because a
+/// `#GP` is never "not mapped yet".
+#[unsafe(no_mangle)]
+extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame) {
+    // SAFETY: as `page_fault_dispatch`.
+    let pf = unsafe { &mut *frame };
+    if let Some(fixup) = akuma_user_access::user_copy_fixup(pf.frame.rip) {
+        COPY_FIXUPS.fetch_add(1, Ordering::Relaxed);
+        pf.frame.rip = fixup;
+        return;
+    }
+    fatal("#GP general protection", &pf.frame, Some(pf.error_code));
 }
 
 /// The LAPIC timer vector.
@@ -408,8 +436,8 @@ pub fn init() {
         (*idt)[0].set(divide_error as usize);
         (*idt)[6].set(invalid_opcode as usize);
         (*idt)[8].set(double_fault as usize);
-        (*idt)[13].set(general_protection as usize);
-        // The one hand-assembled entry; see the module header.
+        // The two hand-assembled entries; see the module header.
+        (*idt)[13].set(general_protection_entry as usize);
         (*idt)[14].set(page_fault_entry as usize);
 
         let idtr = Idtr {
@@ -525,7 +553,9 @@ pub fn smoke_test(t: &mut Suite) {
 ///    `EFAULT` **after** copying the mapped prefix — proof the fault was taken
 ///    mid-`rep movsb` and the CPU's own progress in rcx/rsi/rdi was honoured,
 ///    not that the copy was refused up front.
-/// 5. A copy out of the armed lazy region succeeds and reads zeroes — the
+/// 5. A copy from a non-canonical address returns `EFAULT` — that is a `#GP`,
+///    fixed up by the vector-13 stub; the `#PF` path never sees it.
+/// 6. A copy out of the armed lazy region succeeds and reads zeroes — the
 ///    ordering in [`page_fault_dispatch`]: demand paging wins over fixup when
 ///    both apply. Fixup first would have failed this copy.
 ///
@@ -606,7 +636,26 @@ pub fn user_copy_smoke_test(t: &mut Suite) {
     }
     t.check("user copy: fault off the end of a mapped page copies the prefix, then EFAULT", edge_ok);
 
-    // 5. demand paging beats fixup
+    // 5. a NON-CANONICAL source: `#GP`, not `#PF`, fixed up by the vector-13
+    //     stub. `uaccess::range_ok` refuses this address before any syscall
+    //     copy reaches the loop; this goes through the raw primitive on purpose
+    //     to prove the second line holds too.
+    const NON_CANONICAL: u64 = 0x0000_8000_0000_0000;
+    // SAFETY: the source is unaddressable ON PURPOSE; the #GP handler must
+    // redirect the copy loop to its trampoline.
+    let r = unsafe { copy_from_user_safe(dst.as_mut_ptr(), NON_CANONICAL as *const u8, 8) };
+    t.check_eq("user copy: non-canonical source returns EFAULT via #GP", r.err().unwrap_or(0), EFAULT);
+    t.check(
+        "uaccess: range check refuses non-canonical, null-page and wrapping ranges",
+        !crate::uaccess::range_ok(NON_CANONICAL, 8)
+            && !crate::uaccess::range_ok(NON_CANONICAL - 4, 8)
+            && !crate::uaccess::range_ok(0x800, 8)
+            && !crate::uaccess::range_ok(u64::MAX - 4, 16)
+            && crate::uaccess::range_ok(NON_CANONICAL - 8, 8)
+            && crate::uaccess::range_ok(0x1000, 4096),
+    );
+
+    // 6. demand paging beats fixup
     arm_lazy(LAZY_VA, 4096);
     dst.fill(0xA5);
     let demand_before = DEMAND_FAULTS.load(Ordering::Relaxed);
@@ -624,11 +673,12 @@ pub fn user_copy_smoke_test(t: &mut Suite) {
         akuma_pmm::free_page(pa as usize, 0);
     }
 
-    // Exactly three fixups: cases 2, 3 and 4. Case 5 must not have counted.
+    // Exactly four fixups: cases 2, 3, 4 (#PF) and 5 (#GP). Case 6 must not
+    // have counted.
     t.check_eq(
-        "user copy: exactly three faults were fixed up",
+        "user copy: exactly four faults were fixed up",
         (COPY_FIXUPS.load(Ordering::Relaxed) - fixups_before) as u64,
-        3,
+        4,
     );
 
     // The differential sweep, on kernel memory: `rep movsb` vs. the byte loop.
