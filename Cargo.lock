@@ -609,6 +609,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-usb"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-user-access"
 version = "0.1.0"
 dependencies = [

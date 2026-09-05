@@ -1,0 +1,13 @@
+[package]
+name = "akuma-usb"
+version = "0.1.0"
+edition = "2024"
+description = "Pure USB parsing for the amd64 bare-metal target: standard descriptors, HID report descriptors + boot-keyboard decode, and the EHCI register/queue-head layout — all host-tested against bytes measured on the reference machine, no controller required."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[features]
+default = []

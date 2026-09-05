@@ -58,6 +58,7 @@ default-members = [
     "crates/akuma-terminal",
     "crates/akuma-syscalls-time",
     "crates/akuma-timer",
+    "crates/akuma-usb",
     "crates/akuma-vfs",
     "crates/akuma-virtio",
 ]
