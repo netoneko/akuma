@@ -87,10 +87,18 @@ const STACK_SIZE: usize = 32 * 1024;
 /// be reused until its two 32 KiB stacks can be, and reclaiming those needs the
 /// scheduler to know a task's stack is no longer in use by any frame — which is
 /// a different stage. Growing the table is honest about being a bound on the
-/// boot's total task count; 96 slots × (2 × 32 KiB stacks, leaked lazily on
-/// first use) is ~6 MiB against the 64 MiB heap, and buys an interactive shell
-/// dozens of commands before the ceiling bites.
-const MAX_TASKS: usize = 96;
+/// boot's total task count.
+///
+/// **Raised 96 → 512 on 2026-09-06.** On the HP box a real session runs dozens
+/// of commands — `apk add`, `vi`, a build — and every command is a slot, with
+/// `fork` taking a second; 96 is a few minutes of work before `spawn` returns
+/// `None` and the shell reports `Out of memory`. 512 slots × 2 × 32 KiB stacks,
+/// *leaked lazily on first use*, is ~32 MiB worst case against the now-512 MiB
+/// heap (the `Task` array itself is ~0.5 MiB of `.bss`). Still a stopgap:
+/// **task-slot recycling is the real fix** — a `Finished` task that has been
+/// waited on has no live stack, so this is more tractable than the comment
+/// above once implied (`docs/archive/AKUMA_SELF_HEALING_PORT.md`).
+const MAX_TASKS: usize = 512;
 
 core::arch::global_asm!(
     r#"

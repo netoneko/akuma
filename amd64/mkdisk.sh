@@ -35,9 +35,15 @@ IMG="${1:-target/x86_64-unknown-none/release/amd64-root.img}"
 # itself reported (`failed to commit …: No such file or directory`, its
 # rename() finding no tmp file because the write that should have created it
 # had already failed silently at `close(2)`; see that function's own comment
-# in `amd64/src/fd.rs`). 128 MiB leaves real headroom for a handful of
-# dependency chains like that one, not just the base image.
-SIZE_MIB="${2:-128}"
+# in `amd64/src/fd.rs`). 128 MiB left headroom for a handful of dependency
+# chains — but not for real use: `apk add tar tcc` plus the staged musl-dev
+# filled it on the HP box and the next write truncated a binary
+# (`[spawn] load failed: image is shorter than elf64 header`). **512 MiB
+# 2026-09-06.** This is a RAM disk GRUB loads whole into memory, so it costs
+# half a gigabyte of the ~3 GiB the kernel can address (`PHYSMAP_LIMIT`), which
+# is the price until there is an AHCI driver and a real disk
+# (`docs/archive/AKUMA_SELF_HEALING_PORT.md` §"A proper disk").
+SIZE_MIB="${2:-512}"
 
 # e2fsprogs is keg-only under Homebrew, so its tools are not on PATH by default.
 find_tool() {

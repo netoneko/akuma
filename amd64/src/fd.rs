@@ -490,17 +490,33 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
             let heap_used_kib = (heap.allocated / 1024) as u64;
             let mut text = alloc::string::String::new();
             use core::fmt::Write as _;
+            // Every field `busybox free` / `top` might read, across versions —
+            // it looks some up by the old name (`MemShared`) and some by the
+            // new (`Shmem`), and a name it does not find can be left as
+            // `ULONG_MAX` and underflow the `used = total - free - …` line into
+            // the 18-quintillion garbage that first showed up here.
             let _ = write!(
                 text,
                 "MemTotal:       {total_kib:>10} kB\n\
                  MemFree:        {free_kib:>10} kB\n\
                  MemAvailable:   {free_kib:>10} kB\n\
-                 Buffers:        {:>10} kB\n\
+                 MemShared:      {z:>10} kB\n\
+                 Buffers:        {z:>10} kB\n\
                  Cached:         {heap_used_kib:>10} kB\n\
-                 SwapTotal:      {:>10} kB\n\
-                 SwapFree:       {:>10} kB\n\
-                 Shmem:          {:>10} kB\n",
-                0, 0, 0, 0,
+                 SwapCached:     {z:>10} kB\n\
+                 Active:         {z:>10} kB\n\
+                 Inactive:       {z:>10} kB\n\
+                 SwapTotal:      {z:>10} kB\n\
+                 SwapFree:       {z:>10} kB\n\
+                 Dirty:          {z:>10} kB\n\
+                 Writeback:      {z:>10} kB\n\
+                 AnonPages:      {z:>10} kB\n\
+                 Mapped:         {z:>10} kB\n\
+                 Shmem:          {z:>10} kB\n\
+                 Slab:           {z:>10} kB\n\
+                 SReclaimable:   {z:>10} kB\n\
+                 SUnreclaim:     {z:>10} kB\n",
+                z = 0,
             );
             return install_synthetic_file("/proc/meminfo", text.into_bytes(), flags_);
         }

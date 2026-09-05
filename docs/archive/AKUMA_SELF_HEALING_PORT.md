@@ -167,12 +167,25 @@ Two hard limits, neither a tuning knob today:
   (the AArch64 kernel's `akuma-fpcache`) is the real fix; the bump buys time.
 - **`PHYSMAP_LIMIT` is 4 GiB** (`amd64/src/phys.rs`). `boot.s` builds four
   2-MiB-page directories, so the kernel can address only the first 4 GiB of
-  physical RAM regardless of how much the machine has. On the HP box that is
-  ~2–3 GiB of usable RAM after the PCI hole — plenty for now, but "use the full
-  16 GiB" needs more page directories in `boot.s` **and** the physmap has to
-  either skip the MMIO hole (framebuffer BAR ~`0xE000_0000`, LAPIC
-  `0xFEE0_0000`) or it will lay a cached alias over every device register. Not
-  started.
+  physical RAM. On the HP box the usable RAM below 4 GiB is ~3.2 GiB
+  (`MemTotal: 3354104 kB`), of which ~2.6 GiB is free — the other ~13 GiB is
+  physically present but remapped above the 4 GiB line and unmapped. `free`
+  reports 2.6 GiB on a 16 GiB machine.
+
+  **Attempted 2026-09-06, reverted:** extending `boot.s` to 16 page directories
+  (32 GiB) and `PHYSMAP_LIMIT` to match. It **boots and works under QEMU** — the
+  `ovmf5` rig with `-m 10240` picked a RAM region at `0x1_0000_0000`, put the
+  heap and an 8 GiB PMM there, and ran the self-tests green. It **triple-faults
+  on the metal** ("simply reboots instead of bringing up ssh"). The likely
+  cause: a flat cached 0–32 GiB identity/physmap now lays a writeback mapping
+  over the 64-bit device BARs and reserved ranges above 4 GiB that this
+  platform's memory controller will `#MC` on — the 4 GiB map got away with a
+  cached alias of the framebuffer BAR at 3.5 GiB, but not everything up high.
+
+  **The right approach:** keep `boot.s` at 4 GiB (the minimum the framebuffer
+  needs), and after `machine::describe` has parsed the UEFI memory map, build
+  the physmap's slots 4+ **in Rust from the RAM regions only** — never mapping
+  the holes. That is a real piece of work, not a constant bump.
 
 The `dmesg` ring buffer (below) now prints `mem: heap …/… KiB, pmm … MiB free`
 every 10 s, so the next leak shows up as a line that only climbs.

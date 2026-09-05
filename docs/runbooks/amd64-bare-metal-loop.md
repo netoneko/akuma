@@ -87,10 +87,16 @@ multiboot2 /boot/akuma/akuma-amd64 init=/bin/sshd netprobe
 | token | effect |
 |---|---|
 | `init=<path>` | what runs after the self-tests. `/bin/sshd` direct rather than `/bin/herd` — herd drains a service's stdout into a log file, so a supervised sshd fails *invisibly* on a framebuffer-only console |
-| `netprobe` | a live NIC status line every 2 s from inside the netpoll daemon |
+| `skiptests` | skip the ~200-check self-test suite, go straight to `init`. Still does the `init_*` calls the suite happens to also perform. For a trusted build, cuts a chunk off every reboot |
+| `netprobe` | a live NIC status line every 2 s from inside the netpoll daemon. **Off by default now — `dmesg` over ssh replaces it and it scrolled the TV** |
 | `nosmp` | single core. Quietens the `[BKL] stuck: cpu N …` chatter while cornering something |
 | `ip=<addr>[/<prefix>][,<gw>[,<dns>]]` | override the built-in `192.168.1.220` for one boot |
 | `strace` | trace every syscall (framebuffer only) |
+
+Read the kernel log over ssh: `ssh akuma "dmesg"` (a 64 KiB ring in `serial.rs`,
+served by `syslog(2)`). The `mem: heap …/… KiB, pmm … MiB free` line every 10 s
+is in there, not on the TV. **Pipe on the laptop, not the guest** — `cmd | cmd`
+still fails on the box — so `ssh akuma "dmesg" | grep mem:`.
 
 There is **exactly one** Akuma GRUB entry (`/etc/grub.d/45_akuma`), on purpose:
 with three of them, a `grub-reboot` armed for one booted another, and the
@@ -120,9 +126,9 @@ it reads identically on a dead NIC and a busy one.
 
 | symptom | cause |
 |---|---|
-| `date` says 1970 → `apk`: *server certificate not trusted* | no wall clock; **every** cert is not-yet-valid. Check `date` before the CA bundle |
-| `cmd \| cmd`: *can't create pipe* | fds 0/1/2 are handled by number below `fd.rs`'s table (`FIRST_FILE_FD = 3`), so `dup2` onto them has nowhere to land |
-| `ps`, `top`, `free` | no procfs; `/proc` is an empty directory |
+| `date` says 1970 → `apk`: *server certificate not trusted* | was: no wall clock. **Fixed** — `clock::sync_tick` keeps retrying SNTP until the clock sets itself. If `date` is still 1970, `ssh akuma "dmesg" \| grep clock:` for the reason |
+| `cmd \| cmd`: *can't create pipe* | fds 0/1/2 are handled by number below `fd.rs`'s table (`FIRST_FILE_FD = 3`), so `dup2` onto them has nowhere to land. Still open |
+| `ls`/`apk`: *Out of memory* | was: 64 MiB fixed heap, exhausted by `apk`'s file caches. **Raised to 512 MiB.** `ps`/`top` still need a real procfs; `free` works (`/proc/meminfo` is synthesised) |
 | `wget https://` : *socketpair* | busybox shells out to `ssl_client`. Use `/bin/hget` instead — TLS in-process |
 | `nslookup`: *Bad file descriptor* | `write()` on a connected UDP socket. DNS itself works (`wget http://…` resolves) |
 | pings to `192.168.1.220` time out | `.220` is only the **pre-DHCP fallback**; a lease overrides it. The probe line says the real address |

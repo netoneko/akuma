@@ -741,6 +741,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
     match nr {
         // x86_64 158: the TLS-base primitive. No aarch64 number.
         158 => return sys_arch_prctl(a1, a2),
+        // `sysinfo(struct sysinfo *)` — x86_64 99. `busybox free`/`top` read
+        // total/free RAM from here, not from `/proc/meminfo`, and a missing one
+        // means `used = total - free - …` underflows to 18 quintillion.
+        99 => return sys_sysinfo(a1),
         // `syslog(type, buf, len)` — x86_64 103 (`klogctl`). Backed by the
         // console ring buffer in `serial.rs`, so `busybox dmesg` returns the
         // kernel's own boot/diagnostic output over ssh — the only way to read
@@ -1229,6 +1233,49 @@ fn sys_uname(buf: u64) -> u64 {
         return crate::fd::errno::EFAULT;
     }
     0
+}
+
+/// `sysinfo(2)` — memory totals for `busybox free` / `top`. The struct layout
+/// is `akuma_syscalls_linux::proc::Sysinfo` (LP64, host-tested, shared with the
+/// AArch64 kernel). `mem_unit = 1` so every `*ram` field is already in bytes;
+/// a `0` there is what makes `free` print `16.0E`.
+fn sys_sysinfo(out: u64) -> u64 {
+    use akuma_syscalls_linux::proc::Sysinfo;
+    if out == 0 {
+        return crate::fd::errno::EFAULT;
+    }
+    let page = 4096u64;
+    let heap = akuma_alloc::stats();
+    let info = Sysinfo {
+        uptime: i64::try_from(crate::net::uptime_us() / 1_000_000).unwrap_or(i64::MAX),
+        totalram: akuma_pmm::total_count() as u64 * page,
+        freeram: akuma_pmm::free_count() as u64 * page,
+        bufferram: heap.allocated as u64,
+        procs: proc_count(),
+        mem_unit: 1,
+        ..Sysinfo::default()
+    };
+    // SAFETY: `Sysinfo` is `repr(C)` and `Copy` with no padding of interest;
+    // `write_bytes` bounds-checks the user pointer.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(info).cast::<u8>(),
+            core::mem::size_of::<Sysinfo>(),
+        )
+    };
+    if !crate::uaccess::write_bytes(out, bytes) {
+        return crate::fd::errno::EFAULT;
+    }
+    0
+}
+
+/// A rough count of live processes, for `sysinfo`'s `procs`. Best-effort — the
+/// number is cosmetic in `free`/`top` on this target.
+fn proc_count() -> u16 {
+    // SAFETY: read-only scan of the process table; a torn count is acceptable
+    // for a cosmetic field.
+    let procs = unsafe { &*core::ptr::addr_of!(PROCS) };
+    procs.iter().filter(|p| p.is_some()).count().min(u16::MAX as usize) as u16
 }
 
 /// `syslog(type, bufp, len)` — the `klogctl(2)` operations `busybox dmesg`
@@ -1742,10 +1789,17 @@ impl Process {
 /// its process. A slot per process is the smallest thing that works on one core.
 ///
 /// Slots 0..=6 are the self-tests and `run_init`; slots [`SPAWN_SLOT_BASE`]..
-/// are for `sys_spawn`'d children (an `sshd` session's shell). 16 total leaves
-/// nine concurrent spawns, which is past what the cooperative `sshd` build
-/// serves.
-static mut PROCS: [Option<Process>; 16] = [const { None }; 16];
+/// are for `sys_spawn`'d children (an `sshd` session's shell).
+///
+/// **Raised 16 → 128 on 2026-09-06.** Nine concurrent spawns was "past what the
+/// cooperative `sshd` serves" only while a session stayed idle: a real one
+/// (`apk add`, then any command) exhausted it and `sshd` reported
+/// `failed to spawn '/bin/sh' for exec`. Slots *are* recycled on
+/// `waitpid`/exit, so this is headroom against leaks and bursts, not a true
+/// concurrency bound. `Process` is small enough that 128 is a few tens of KiB
+/// of `.bss`.
+pub const PROC_SLOTS: usize = 128;
+static mut PROCS: [Option<Process>; PROC_SLOTS] = [const { None }; PROC_SLOTS];
 
 /// First `PROCS` slot `sys_spawn` may use; everything below is the self-tests
 /// and `run_init`.
@@ -1755,7 +1809,7 @@ pub const SPAWN_SLOT_BASE: usize = 7;
 /// slot. `run_process` picks it up after `enter_user_mode` returns and does the
 /// address-space swap on the kernel stack — outside the syscall asm, where a
 /// `mov cr3` and a frame free belong.
-static mut PENDING_EXEC: [Option<Process>; 16] = [const { None }; 16];
+static mut PENDING_EXEC: [Option<Process>; PROC_SLOTS] = [const { None }; PROC_SLOTS];
 
 /// Take the replacement image for `idx`, if `execve` parked one.
 fn take_pending_exec(idx: usize) -> Option<Process> {
@@ -1914,7 +1968,7 @@ struct Spawn {
     console_io: bool,
 }
 
-const SPAWN_SLOTS: usize = 16 - SPAWN_SLOT_BASE;
+const SPAWN_SLOTS: usize = PROC_SLOTS - SPAWN_SLOT_BASE;
 
 /// The spawn table. `static mut` reached through raw pointers on one core, same
 /// discipline as `PROCS`: the only writers run inside a syscall (non-preemptible
@@ -2106,7 +2160,7 @@ fn sys_fork() -> u64 {
     let slot = unsafe {
         let procs = &raw const PROCS;
         let spawn = spawn_table();
-        (SPAWN_SLOT_BASE..16)
+        (SPAWN_SLOT_BASE..PROC_SLOTS)
             .find(|&s| (*procs)[s].is_none() && (*spawn)[s - SPAWN_SLOT_BASE].is_none())
     };
     let Some(slot) = slot else {
@@ -2221,7 +2275,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
             let p = &raw const PROCS;
             &*p
         };
-        (SPAWN_SLOT_BASE..16).find(|&s| procs[s].is_none())
+        (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| procs[s].is_none())
     };
     let Some(slot) = slot else {
         return errno::ENOMEM;
