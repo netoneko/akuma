@@ -278,11 +278,48 @@ Also found and not touched: `DISK=none amd64/run.sh` page-faults in
 no NIC to probe). Pre-existing, unrelated, and why the baseline above was
 measured with the default disk.
 
+## Part 4: real hardware — the HP 500-502nj (Haswell), Firecracker/KVM
+
+`FC_HOST=root@192.168.1.123 FC_DIR=akuma-fc FC_NET=1 INIT=/bin/sshd
+amd64/run-firecracker.sh` (`docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md` is
+that machine). This is the **`SMAP_ACTIVE == 0` arm**: `/proc/cpuinfo` on the
+host lists `smep` and not `smap`, KVM passes that through, and it is the only
+place the conditional `clac` in the vector 13/14 stubs and the no-SMAP branch
+of `uaccess::smoke_test` actually run.
+
+```
+  hvm_start_info @ 0x0000000000006000
+  smap: off (CPUID lacks SMAP)  smep: on
+  user copy: non-canonical source returns EFAULT via #GP   [OK]
+  smap: CR4.SMAP follows CPUID   [OK]
+  smap: CR4.SMEP follows CPUID   [OK]
+  smap: (CPUID lacks SMAP) an unbracketed kernel read of a user page succeeds   [OK]
+  smap: a bracketed copy that faults returns false and leaves AC clear   [OK]
+Akuma/amd64 self-test: 196 passed, 0 failed
+[SmolNet] DHCP configured
+[SSHD] Listening on 0.0.0.0:2222...
+```
+
+Every `user copy`/`uaccess`/`smap` check green on the first boot: the stubs
+took real `#PF`s and one `#GP` on a Haswell without executing `clac`, the
+range check and the fixup did the whole job, and `sshd` answered over the tap
+(`ssh -i target/x86_64-unknown-none/release/amd64-ssh-test-key -J
+root@192.168.1.123 -p 2222 root@10.0.2.15`).
+
+**One real finding on the way, not in the kernel.** The first hardware boot
+failed 13 self-tests — `fs: probe.txt starts with its signature`, `[close]
+persist failed … no space`, `[spawn] load failed: bad ELF identification` —
+and not one of them was a fault or an `EFAULT`. `run-firecracker.sh` was
+still building an **8 MiB** image while `run.sh` had moved to 128 MiB on
+2026-09-04 (busybox/apk/sshd no longer fit); `mkdisk.sh` ran out of space
+without saying so and the guest read truncated files. Fixed to 128, matching
+`run.sh` and `mkdisk.sh`'s default, with the symptom written on the line. The
+QEMU path never saw it because only `run.sh` had been updated.
+
 ## Next
 
-Run it on the Ryzen (`FC_HOST=… amd64/run-firecracker.sh`) — KVM passes the
-host's CPUID through, so SMAP is on there — and on the Haswell box, which is
-the `SMAP_ACTIVE == 0` arm and the only place the conditional `clac` in the
-stubs is actually exercised. `akuma-el0-entry` (`invalid register 'x30'`) and
+The Ryzen (`FC_HOST=…`, the `amd64/net-setup.sh` host) is the `SMAP_ACTIVE
+== 1` arm on real silicon — QEMU `-cpu max` has exercised it under TCG, the
+Ryzen has not yet. `akuma-el0-entry` (`invalid register 'x30'`) and
 `akuma-elf`'s `UserAddressSpace` needs remain the next two named blockers on
 the `akuma-exec` chain, unchanged from the gate-fix doc.
