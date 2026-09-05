@@ -70,10 +70,10 @@ pub enum FramebufferKind {
 impl FramebufferKind {
     const fn from_raw(raw: u8) -> Self {
         match raw {
-            0 => FramebufferKind::Indexed,
-            1 => FramebufferKind::Rgb,
-            2 => FramebufferKind::EgaText,
-            other => FramebufferKind::Unknown(other),
+            0 => Self::Indexed,
+            1 => Self::Rgb,
+            2 => Self::EgaText,
+            other => Self::Unknown(other),
         }
     }
 }
@@ -114,7 +114,7 @@ impl ChannelLayout {
     #[must_use]
     pub const fn assumed_for(bpp: u8) -> Option<Self> {
         match bpp {
-            32 | 24 => Some(ChannelLayout {
+            32 | 24 => Some(Self {
                 red_pos: 16,
                 red_size: 8,
                 green_pos: 8,
@@ -122,7 +122,7 @@ impl ChannelLayout {
                 blue_pos: 0,
                 blue_size: 8,
             }),
-            16 => Some(ChannelLayout {
+            16 => Some(Self {
                 red_pos: 11,
                 red_size: 5,
                 green_pos: 5,
@@ -409,7 +409,6 @@ impl<'a> BootInfo<'a> {
     }
 
     /// Every module the loader placed in memory, in the order it reported them.
-    #[must_use]
     pub fn modules(&self) -> impl Iterator<Item = Module<'a>> + '_ {
         self.tags().filter(|t| t.typ == tag::MODULE).filter_map(|t| {
             let start = u32::from_le_bytes(t.body.get(0..4)?.try_into().ok()?);

@@ -78,15 +78,15 @@ pub enum RootDevice {
 impl BlockDevice for RootDevice {
     fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
         match self {
-            RootDevice::Virtio(d) => d.read_bytes(offset, buf),
-            RootDevice::Ram(d) => d.read_bytes(offset, buf),
+            Self::Virtio(d) => d.read_bytes(offset, buf),
+            Self::Ram(d) => d.read_bytes(offset, buf),
         }
     }
 
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
         match self {
-            RootDevice::Virtio(d) => d.write_bytes(offset, data),
-            RootDevice::Ram(d) => d.write_bytes(offset, data),
+            Self::Virtio(d) => d.write_bytes(offset, data),
+            Self::Ram(d) => d.write_bytes(offset, data),
         }
     }
 }

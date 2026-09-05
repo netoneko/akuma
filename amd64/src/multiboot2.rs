@@ -112,7 +112,7 @@ impl Framebuffer {
             blue_pos: fb.format.blue_pos,
             blue_size: fb.format.blue_size,
         };
-        Some(Framebuffer {
+        Some(Self {
             base: (PHYSMAP_BASE + fb.addr) as *mut u8,
             pitch: fb.pitch as usize,
             width: fb.width as usize,
@@ -132,6 +132,9 @@ impl Surface for Framebuffer {
         self.height
     }
 
+    // `base` is a page-aligned framebuffer address and `offset` a multiple of
+    // the pixel size, so the cast never misaligns; clippy cannot see that.
+    #[allow(clippy::cast_ptr_alignment)]
     fn put(&mut self, x: usize, y: usize, color: Rgb) {
         if x >= self.width || y >= self.height {
             return;
@@ -174,7 +177,9 @@ struct FbConsole(Console<Framebuffer>);
 // for the whole life of the kernel, never freed and never moved. What `Send`
 // asks about is whether it may cross threads, and the `Spinlock` around it is
 // what actually serialises access -- the raw pointer carries no aliasing claim
-// of its own.
+// of its own. (That is also the answer to clippy's `non_send_fields_in_send_ty`:
+// the field is a raw pointer, and this impl is the statement about it.)
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for FbConsole {}
 
 /// Write one byte to the framebuffer console, if it exists.
@@ -195,6 +200,9 @@ pub fn mirror_byte(byte: u8) {
 /// the facts come from: a multiboot2 information block instead of a PVH handoff
 /// block, an ext2 image the loader left in RAM instead of a virtio disk, and a
 /// framebuffer instead of a serial port.
+// The information block's size field is a `u32` at an 8-byte-aligned address
+// (the multiboot2 ABI); the byte pointer is how the physmap hands it over.
+#[allow(clippy::cast_ptr_alignment)]
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     ega_text(0, "Akuma/amd64: multiboot2 entry reached");
@@ -256,6 +264,11 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     serial::puts(info.loader_name());
     serial::puts("\n  uart: ");
     serial::puts(if serial::present() { "present" } else { "absent (reads report no data)" });
+    // The keyboard. USB on this board, but firmware's legacy emulation presents
+    // it on the i8042 ports for as long as no OS claims the USB controllers —
+    // which this kernel never does. See `kbd`.
+    serial::puts("  kbd: ");
+    serial::puts(if crate::kbd::init() { "i8042 present" } else { "no i8042" });
     serial::puts("\n  fb:   ");
     serial::put_dec(u64::from(fb.width));
     serial::puts("x");
@@ -418,10 +431,10 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
 /// The `init=` argument from the boot loader's command line, or `/bin/sh`.
 fn init_path(cmdline: &str) -> &str {
     for word in cmdline.split(' ') {
-        if let Some(rest) = word.strip_prefix("init=") {
-            if !rest.is_empty() {
-                return rest;
-            }
+        if let Some(rest) = word.strip_prefix("init=")
+            && !rest.is_empty()
+        {
+            return rest;
         }
     }
     "/bin/sh"

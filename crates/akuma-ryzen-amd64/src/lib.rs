@@ -126,7 +126,7 @@ impl MachineDescription {
         let mut regions = [MemRegion { addr: 0, size: 0, kind: 0 }; MAX_REGIONS];
         let n = regions_in.len().min(MAX_REGIONS);
         regions[..n].copy_from_slice(&regions_in[..n]);
-        MachineDescription {
+        Self {
             start_info: StartInfo {
                 addr: 0,
                 version: 0,

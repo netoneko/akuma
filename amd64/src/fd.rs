@@ -1054,7 +1054,7 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
         }
     }
     loop {
-        if let Some(b) = serial::getb() {
+        if let Some(b) = crate::input::getb() {
             return copy_to_user(buf, &[b]);
         }
         // A yield, not a bare spin: this task holds the Big Kernel Lock, and a
@@ -1090,8 +1090,11 @@ fn read_console(buf: u64, len: usize) -> u64 {
             }
         }
 
-        let Some(byte) = serial::getb() else {
-            core::hint::spin_loop();
+        let Some(byte) = crate::input::getb() else {
+            // A yield, not a spin: this task holds the Big Kernel Lock, and a
+            // shell waiting for a key must not hold every other core's
+            // syscalls hostage (`sched::yield_now` drops the lock briefly).
+            crate::sched::yield_now();
             continue;
         };
 
@@ -1619,7 +1622,7 @@ pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeou
 fn poll_ready(fd: u64) -> (bool, bool) {    if fd == 0 {
         return match crate::usermode::current_stdin_pipe() {
             Some(p) => (crate::pipe::readable(p), false),
-            None => (serial::has_byte(), false),
+            None => (crate::input::has_byte(), false),
         };
     }
     if fd == 1 || fd == 2 {

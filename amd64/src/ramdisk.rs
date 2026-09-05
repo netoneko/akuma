@@ -44,7 +44,7 @@ impl RamDisk {
         if end > crate::phys::PHYSMAP_LIMIT {
             return None;
         }
-        Some(RamDisk { base, len })
+        Some(Self { base, len })
     }
 
     /// The bytes, as a slice.
@@ -58,6 +58,7 @@ impl RamDisk {
     }
 
     /// The bytes, mutably.
+    #[allow(clippy::mut_from_ref)] // the SAFETY note below is the argument
     fn bytes_mut(&self) -> &mut [u8] {
         // SAFETY: as `bytes`. Taking `&self` rather than `&mut self` because
         // `BlockDevice::write_bytes` does, and the aliasing that permits is the

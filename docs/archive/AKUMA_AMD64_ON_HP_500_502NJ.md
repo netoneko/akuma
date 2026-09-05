@@ -665,6 +665,21 @@ framebuffer mirror is unaffected). The multiboot2 entry now calls `init` —
 it never had, which was harmless only while writes to an absent port were the
 only thing at stake. Both paths print `uart: present` or `uart: absent`.
 
+**And the keyboard itself, 2026-09-05, later.** The obvious cheap route — the
+i8042 PS/2 controller, on which most PC firmware emulates a USB keyboard for
+as long as no OS claims the USB controllers — is closed on this board:
+Ubuntu reports `i8042: PNP: No PS/2 controller found`, and the FADT's
+`IAPC_BOOT_ARCH` has the "8042 present" bit clear (`0x10`). The keyboard
+(a ROCCAT Vulcan, USB) lights up because the *firmware* enumerated it, not
+because anything presents it to the kernel. `amd64/src/kbd.rs` is that i8042
+driver anyway — polled, set-1 scancodes, shift/ctrl/caps — because QEMU's `pc`
+machine and most other firmware do have one, and `amd64/src/input.rs` reads
+from whichever of UART and keyboard has a byte. Verified in the OVMF rig by
+typing through QEMU's monitor (`sendkey`). On this box the boot prints
+`kbd: no i8042` and the answer stays: networking, or a machine with a serial
+header, is the way to type at it. For a hands-off run there is now a second
+GRUB entry, `init=/bin/busybox initargs=uname,-a` (`/etc/grub.d/46_akuma_uname`).
+
 The real gap remains input. This board's keyboard is USB, there is no HID stack,
 and the machine has no serial port — so an interactive shell on the framebuffer
 cannot be driven at all. **Networking is the path to a usable shell here**, not a

@@ -280,6 +280,7 @@ found.
 | `amd64/src/lapic.rs` | `init_ap`, `apic_id`, ICR IPIs, `delay_counts`, per-core ticks |
 | `amd64/src/sock.rs` | `accept`'s `addrlen` and `recvmsg`'s `msg_namelen` through `uaccess` (§3.5) |
 | `amd64/src/multiboot2.rs` | RSDP → MADT from the loader's tag, the SMP block after `preempt_test`, `initargs=`, `serial::init` (§3.6) |
+| `amd64/src/kbd.rs`, `amd64/src/input.rs` | polled i8042 keyboard; console input from UART or keyboard, whichever has a byte (not SMP — found while testing the bare-metal boot; `AKUMA_AMD64_ON_HP_500_502NJ.md`) |
 | `crates/akuma-multiboot2` | `BootInfo::rsdp` |
 | `crates/akuma-ryzen-amd64` | `acpi::rsdp_from_bytes` |
 | `amd64/run.sh` | `SMP=N` |

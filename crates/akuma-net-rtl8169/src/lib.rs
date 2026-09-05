@@ -69,8 +69,14 @@ impl MacAddr {
     /// unpowered chip reads back, and never a valid station address.
     #[must_use]
     pub const fn is_zero(&self) -> bool {
-        let [a, b, c, d, e, f] = self.0;
-        a == 0 && b == 0 && c == 0 && d == 0 && e == 0 && f == 0
+        let mut i = 0;
+        while i < 6 {
+            if self.0[i] != 0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// Whether the multicast bit is set. A station address never has it, so
@@ -84,8 +90,14 @@ impl MacAddr {
     /// returns, and the broadcast address, which is never a station address.
     #[must_use]
     pub const fn is_broadcast(&self) -> bool {
-        let [a, b, c, d, e, f] = self.0;
-        a == 0xFF && b == 0xFF && c == 0xFF && d == 0xFF && e == 0xFF && f == 0xFF
+        let mut i = 0;
+        while i < 6 {
+            if self.0[i] != 0xFF {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// Whether this looks like a real station address the chip loaded from its

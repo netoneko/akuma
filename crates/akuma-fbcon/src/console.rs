@@ -75,6 +75,9 @@ impl<S: Surface> Console<S> {
             return None;
         }
 
+        // The grid is the console's whole reason to exist (video memory is
+        // never read back), and it is built once, at boot, on the boot stack.
+        #[allow(clippy::large_stack_arrays)]
         Some(Self {
             surface,
             grid: [[b' '; MAX_COLS]; MAX_ROWS],

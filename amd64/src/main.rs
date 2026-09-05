@@ -58,6 +58,10 @@ mod usermode;
 #[cfg(target_arch = "x86_64")]
 mod idt;
 #[cfg(target_arch = "x86_64")]
+mod input;
+#[cfg(target_arch = "x86_64")]
+mod kbd;
+#[cfg(target_arch = "x86_64")]
 mod lapic;
 #[cfg(target_arch = "x86_64")]
 mod machine;
@@ -131,7 +135,9 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     serial::puts("\n");
     serial::puts("Akuma/amd64 — long mode reached\n");
     serial::puts("  uart: ");
-    serial::puts(if serial::present() { "present\n" } else { "absent (reads report no data)\n" });
+    serial::puts(if serial::present() { "present" } else { "absent (reads report no data)" });
+    serial::puts("  kbd: ");
+    serial::puts(if kbd::init() { "i8042 present\n" } else { "no i8042\n" });
     serial::puts("  hvm_start_info @ 0x");
     serial::put_hex(hvm_start_info);
     serial::puts("\n");

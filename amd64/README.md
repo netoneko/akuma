@@ -453,6 +453,11 @@ bare-metal boot. `SMP=1` is the single-core boot every earlier stage ran.
   still out (it needs `fork` before auth, a different shape). Rest of **Stage
   T**: `pipe2` (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.26 — `getdents64`,
   step 5, shipped 2026-09-04).
+- **Console input is the UART or an i8042 keyboard, polled** (`input.rs`,
+  `kbd.rs`; both probed at boot and reported as `uart:`/`kbd:`). No USB, so a
+  USB keyboard works only where firmware presents it on the i8042 — QEMU's `pc`
+  machine does, the HP reference box does not (`docs/archive/
+  AKUMA_AMD64_ON_HP_500_502NJ.md`).
 - **No pty line discipline for a spawned shell.** `SPAWN_FLAG_PTY` is accepted
   and ignored; an interactive `sshd` shell gets raw bytes over its stdin pipe
   and does its own editing.
