@@ -387,8 +387,18 @@ fn cmd_cd(args: &[String]) {
 }
 
 fn cmd_uname(args: &[String]) {
+    // The machine name is the one this copy of paws was compiled for, not a
+    // constant: paws builds for both `aarch64-unknown-linux-musl` and
+    // `x86_64-unknown-none` (the amd64 target), and the hardcoded "aarch64"
+    // here reported the wrong architecture over every ssh session into the
+    // x86 kernel — the first thing anyone types after logging in.
+    #[cfg(target_arch = "x86_64")]
+    const MACHINE: &str = "x86_64";
+    #[cfg(not(target_arch = "x86_64"))]
+    const MACHINE: &str = "aarch64";
+
     if args.len() > 1 && args[1] == "-a" {
-        println("Akuma 0.1.0 Akuma-OS aarch64");
+        println(&format!("Akuma 0.1.0 Akuma-OS {MACHINE}"));
     } else {
         println("Akuma");
     }

@@ -1148,7 +1148,36 @@ pub mod seek_mode {
     pub const SEEK_END: i32 = 2;
 }
 
-/// File stat structure (simplified)
+/// The kernel's `struct stat`. **Its layout is architecture-specific and there
+/// is one per target below** — this is not a "simplified" struct that a kernel
+/// fills in loosely; it is the exact byte image `fstat(2)` writes, and the
+/// kernel writes it at the offsets and to the length *its own* architecture's
+/// ABI specifies.
+///
+/// It was one struct — `asm-generic`'s, which is AArch64's — until 2026-09-05,
+/// and on x86_64 that was wrong twice over:
+///
+/// * **Size.** `asm-generic`'s is 128 bytes; x86_64's is 144. A caller
+///   reserving 128 handed the kernel a buffer 16 bytes too small, and
+///   `copy_to_user` wrote all 144 — over whatever followed. On a stack-
+///   allocated `Stat` that is the two saved callee-saved registers above the
+///   frame, and since bytes 128..144 are x86_64's `__unused[3]` (always zero)
+///   they came back as zero. `herd` died on the first `fstat` of its config
+///   directory: a `#PF` at `cr2=0`, reading through an `%r14` the syscall had
+///   quietly zeroed. Nothing about the crash pointed at `fstat`.
+/// * **Offsets.** `st_mode` is at 16 on AArch64 and at **24** on x86_64
+///   (`st_nlink` widens to 8 bytes and moves ahead of it), so `S_ISDIR` read
+///   the wrong word. Every field from there to `st_size` differs the same way.
+///
+/// Both are `#[repr(C)]` structs of plain integers, so getting this wrong
+/// never fails to compile — it silently reads one field out of another.
+/// `userspace/tcc/src/amd64_shim.rs` carries a private copy of the x86_64
+/// layout for exactly this reason; it predates this fix and its comment is the
+/// same warning.
+///
+/// The field *names* are identical across both, so consumers
+/// (`st_mode`, `st_size`) are unchanged.
+#[cfg(not(target_arch = "x86_64"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Stat {
@@ -1172,6 +1201,42 @@ pub struct Stat {
     pub st_ctime_nsec: i64,
     pub __unused: [i32; 2],
 }
+
+/// The x86_64 `struct stat` — 144 bytes. See [`Stat`]'s doc above for why this
+/// is a separate definition rather than a shared one; it mirrors
+/// `amd64/src/fd.rs`'s `encode_stat` field for field.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u64,
+    pub st_mode: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub __pad0: u32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+    pub __unused: [i64; 3],
+}
+
+// The kernel writes exactly this many bytes and no caller gets to be shorter.
+// An assertion rather than a comment because the failure mode of being wrong is
+// a silent write past the end of the caller's buffer, which is what this pair
+// of definitions exists to have fixed once.
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(core::mem::size_of::<Stat>() == 144);
+#[cfg(not(target_arch = "x86_64"))]
+const _: () = assert!(core::mem::size_of::<Stat>() == 128);
 
 /// Open a file
 ///

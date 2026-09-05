@@ -332,7 +332,29 @@ if [ ! -f "$BB" ]; then
 fi
 if [ -f "$BB" ]; then
     "$DEBUGFS" -w -R "write $BB bin/busybox" "$IMG" >/dev/null 2>&1
-    for applet in sh uname ls cat echo pwd env cut head tail wc find wget; do
+    # The applet set. Wider since 2026-09-05 for one reason: on the HP box ssh
+    # is the console (no HID stack for its USB keyboard), so whatever is not
+    # linked here is simply not available on that machine — there is no second
+    # way in to add it. Each name costs one directory entry and no space.
+    #
+    # `reboot`/`halt`/`poweroff` are the ones worth calling out: `reboot(2)` is
+    # wired (`amd64/src/reboot.rs`), so they are how that box gets shut down
+    # cleanly from a session instead of by holding its power button.
+    #
+    # NOT here: anything needing a pipeline or a redirect. busybox `sh` runs
+    # plain commands on this target but `cmd | cmd` fails — fds 0/1/2 are not
+    # entries in `fd.rs`'s table (`FIRST_FILE_FD = 3`), so `dup2` onto them
+    # cannot work. That is a real gap, not a missing applet.
+    for applet in \
+        sh ash uname ls cat echo pwd env printf test true false yes seq expr \
+        cut head tail wc find grep sed awk sort uniq tr xargs tee \
+        basename dirname readlink realpath \
+        mkdir rmdir rm cp mv ln touch chmod chown stat du df sync \
+        date sleep uptime free ps kill top id whoami hostname which dmesg \
+        more less vi hexdump od strings cmp diff md5sum sha256sum \
+        tar gzip gunzip zcat \
+        wget ifconfig route netstat nslookup ping nc \
+        mount umount reboot halt poweroff; do
         "$DEBUGFS" -w -R "ln /bin/busybox /bin/$applet" "$IMG" >/dev/null 2>&1
     done
 fi
@@ -366,10 +388,14 @@ if [ -n "$SSHD" ]; then
     if [ -f "$SSH_TEST_KEY.pub" ]; then
         "$DEBUGFS" -w -R "write $SSH_TEST_KEY.pub etc/sshd/authorized_keys" "$IMG" >/dev/null 2>&1
     fi
-    # The shell sshd starts in a session. `paws` is the shell that builds for
-    # this target and is the default; `SSHD_SHELL=/bin/sh` points it at busybox
-    # instead (exec-mode commands only — an interactive busybox needs `fork`).
-    printf 'shell = %s\n' "${SSHD_SHELL:-/bin/paws}" > "$TMP/sshd.conf"
+    # The shell sshd starts in a session. **busybox `sh`**, not `paws`, since
+    # 2026-09-05: the caveat that used to make paws the default — "an
+    # interactive busybox needs `fork`" — stopped being true when this target
+    # grew a real `fork`/`execve` (the boot suite's own `fork:` and `execve:`
+    # checks run `sh -c` through both). busybox is the shell anyone logging in
+    # over ssh expects, and on the HP box ssh IS the console.
+    # `SSHD_SHELL=/bin/paws` puts the small built-in shell back.
+    printf 'shell = %s\n' "${SSHD_SHELL:-/bin/sh}" > "$TMP/sshd.conf"
     "$DEBUGFS" -w -R "write $TMP/sshd.conf etc/sshd/sshd.conf" "$IMG" >/dev/null 2>&1
 fi
 

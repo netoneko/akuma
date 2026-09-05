@@ -425,13 +425,17 @@ pub mod seek_mode {
 
 /// The x86_64 `struct stat` — 144 bytes, field-for-field what
 /// `amd64/src/fd.rs`'s `encode_stat` writes on the kernel side (that
-/// function's own doc has the layout table this mirrors). **Not**
-/// `libakuma::Stat`, whose layout is `asm-generic`/aarch64's — `st_nlink` at
-/// 16 there is 4 bytes; here it is 8, and every offset from `st_mode` on
-/// differs by the same kind of arch-specific padding difference. Getting this
-/// wrong would not fail to compile (both are `#[repr(C)]` structs of plain
-/// integers) — it would read `st_size` out of what is actually `st_blksize`,
-/// silently.
+/// function's own doc has the layout table this mirrors).
+///
+/// A private copy because this shim is deliberately independent of `libakuma`
+/// (it has its own `nr` table and `syscall6` too), not because `libakuma::Stat`
+/// is still wrong: it carried only the `asm-generic`/aarch64 layout until
+/// 2026-09-05, which on this target was 16 bytes short of what `fstat` writes
+/// and had `st_mode` at the wrong offset — the bug that killed `herd` on its
+/// first `fstat`. It is `#[cfg]`'d per architecture now, so either would do.
+/// Getting it wrong would not fail to compile (both are `#[repr(C)]` structs of
+/// plain integers) — it would read `st_size` out of what is actually
+/// `st_blksize`, silently, and write past the end of the caller's buffer.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Stat {

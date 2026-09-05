@@ -438,6 +438,33 @@ enum adds one `match` arm and no allocation.
 kernel uses. On a loopback-only boot `eth0` shows `0.0.0.0` (no address
 configured, not the fallback). Read-only: no `SIOCSIF*`, no netlink.
 
+### The pre-DHCP address
+
+The static address the interface carries until DHCP answers — and reverts to if
+a lease lapses — is an `akuma_net::smoltcp_net::StaticIpv4` chosen at bring-up,
+not a constant inside the stack. Under a VMM it is `StaticIpv4::QEMU_USER`
+(`10.0.2.15/24`, gateway `10.0.2.2`, resolver `10.0.2.3`), which is what every
+hypervisor's user-mode network hands out.
+
+**Bare metal is different and has to be:** `BARE_METAL_STATIC_V4` in
+`src/net.rs` is `192.168.1.220/24`, gateway `192.168.1.1`, resolver `1.1.1.1`.
+The HP box is on a household LAN where `10.0.2.15` is unroutable, and it has no
+keyboard to correct that from — the first boot with the Realtek driver up
+reported exactly that address on exactly that LAN. The resolver is public rather
+than the gateway because a household router may or may not run one.
+
+Override it for one boot from the GRUB command line:
+
+```
+ip=192.168.1.77                                # address only
+ip=10.1.2.3/16,10.1.0.1,1.1.1.1                # address/prefix, gateway, DNS
+```
+
+Anything omitted keeps the built-in value; anything unparseable is reported and
+ignored (a typo must not strand a machine with no keyboard). `net::smoke_test`
+checks the parser and the built-in address on **every** path, bare metal
+included.
+
 ```bash
 amd64/run.sh                       # NIC on virtio-mmio-bus.1, port 8080 forwarded
 INIT=/bin/httpd amd64/run.sh       # run the server instead of the shell
@@ -484,7 +511,7 @@ Two different ways a program gets onto this target, for two different reasons:
   Stage N (ext2), and stayed the shape for the ELF loader's own self-tests
   (`hello`, `fdprobe`): a loader test should not depend on the filesystem it
   is not testing. See `userspace/amd64/README.md` for how to add one.
-- **Real disk-resident programs** — `paws`, `httpd`, `sshd`, and (since
+- **Real disk-resident programs** — `paws`, `httpd`, `sshd`, `herd` and (since
   2026-09-04) **`tcc`** — are ordinary `cargo build -p <name> --target
   x86_64-unknown-none --release` crates under `userspace/`, staged onto the
   ext2 image by `amd64/mkdisk.sh` and opened by path like any other file.
@@ -497,6 +524,58 @@ Two different ways a program gets onto this target, for two different reasons:
 A guest program reports what it checked through its **exit status**, which the
 kernel's self-test compares against a value computed in `src/usermode.rs`. A
 program that printed its verdict would have "passed" by running at all.
+
+### `init=/bin/herd` — services instead of one program
+
+`herd` (`userspace/herd`) is Akuma's supervisor, and `init=/bin/herd` is the
+shape to boot when the machine should offer something rather than run something.
+`mkdisk.sh` stages it with `/etc/herd/enabled/sshd.conf` enabled and
+`/etc/herd/available/httpd.conf` available, so:
+
+```
+multiboot2 /boot/akuma/akuma-amd64 init=/bin/herd
+```
+
+brings the machine up with `sshd` running and restarted if it dies. That matters
+most on the HP box, whose USB keyboard has no HID stack: ssh **is** its console,
+so sshd exiting would end the only way in.
+
+```bash
+ssh -i target/x86_64-unknown-none/release/amd64-ssh-test-key -p 2222 root@<addr>
+```
+
+**Port 2222**, sshd's default on every Akuma target — not 22. The keypair is
+generated once by `mkdisk.sh` into `target/` and its public half is staged as
+`/etc/sshd/authorized_keys`; an image built on one machine only accepts *that*
+machine's key, so copy the pair alongside the image if the two differ.
+
+The session shell is **busybox `sh`** (`SSHD_SHELL=/bin/paws` for the small
+built-in one), with ~70 applets linked — `reboot`/`halt`/`poweroff` among them,
+which is how a keyboard-less box gets shut down cleanly.
+
+**Pipelines and redirects do not work in that shell**: `cmd | cmd` returns
+`can't create pipe: Bad file descriptor`, and `pipe2` alone would not fix it —
+fds 0/1/2 are handled by number *below* `fd.rs`'s table (`FIRST_FILE_FD = 3`),
+so `dup2` onto them has nowhere to land. Plain commands are fine.
+
+### `akuma-cli`
+
+`/bin/akuma` is the sibling `netoneko/akuma-cli` repo's katakana screensaver. It
+is the odd one out: a **std** binary (clap, crossterm, rand), so it cannot target
+`x86_64-unknown-none` like everything above — it links static against musl for
+`x86_64-unknown-linux-musl` and runs here the way the busybox binary does, as a
+program this tree did not compile. `mkdisk.sh` does not build it (cross-linking
+musl from macOS needs a toolchain it cannot assume); build it on a Linux box and
+drop the result where the script looks:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl        # in akuma-cli
+scp .../release/akuma <tree>/target/x86_64-unknown-none/release/akuma-cli-x86_64
+```
+
+`AKUMA_CLI=<path>` points at one elsewhere. Absent, the image is simply built
+without it.
 
 ## SMP
 

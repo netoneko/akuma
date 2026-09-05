@@ -821,3 +821,116 @@ DHCP on.
 needs the box: a reboot, and `ethtool -d eno1` on the Linux side as the golden
 register reference to compare against (§5b). The wiring builds, both kernels are
 clippy-clean, and the loopback half is confirmed in the rig.
+
+---
+
+# Update — 2026-09-05, a real LAN address and a way in
+
+**The RTL8169 driver came up on the real chip.** The first bare-metal boot with
+it wired read its MAC out of the part (`60:02:92:61:4e:73`), brought `eth0`
+`UP BROADCAST RUNNING MULTICAST`, and `busybox ifconfig` printed it beside `lo`.
+That is the driver working on silicon nothing emulates.
+
+It also printed **`inet addr:10.0.2.15`** — a QEMU user-mode networking address,
+on a `192.168.1.0/24` household LAN. DHCP had not answered (or not yet), and the
+static fallback the stack reverts to was a literal spelled out in three places
+inside `akuma-net`, put there when every target was a VMM guest. On this machine
+it is unroutable, and the machine has **no keyboard** (USB HID, no stack) to fix
+it from. Everything below follows from that.
+
+## `StaticIpv4` — the fallback is now a decision, not a literal
+
+`10.0.2.15/24`, `10.0.2.2` and `10.0.2.3` appeared in `smoltcp_net::init`'s
+bring-up, `poll`'s DHCP-deconfigure path and `iface`'s couldn't-take-the-lock
+answer. They are one `StaticIpv4 { addr, prefix_len, gateway, dns }` now, chosen
+by the kernel at bring-up and stored in four atomics — **not** passed around and
+**not** behind a lock, because the deconfigure path runs inside the `NETWORK`
+critical section and `interface_snapshot`'s fallback is the answer for having
+*failed* to take that very lock. `StaticIpv4::QEMU_USER` is the old triple and
+stays the default; `init_with_external` takes an `Option<StaticIpv4>`.
+
+amd64 bare metal picks `192.168.1.220/24`, gateway `192.168.1.1`, resolver
+**`1.1.1.1`** (`BARE_METAL_STATIC_V4`). The resolver is deliberately not the
+gateway: a household router may or may not run one, and this is the box with no
+keyboard. `ip=<addr>[/<prefix>][,<gateway>[,<dns>]]` on the kernel command line
+moves it for one boot. DHCP still runs and still wins when it answers.
+
+`/etc/resolv.conf` on the image lists `10.0.2.3`, `1.1.1.1`, `8.8.8.8` —
+**musl queries every nameserver in parallel** (`__res_msend`), so one image
+serves both worlds at no cost to either.
+
+## `init=/bin/herd` — sshd, supervised
+
+`herd` and `akuma-cli` join `sshd`/`paws`/`httpd`/`tcc`/`apk`/`busybox` on the
+image; `/etc/herd/enabled/sshd.conf` is enabled and `httpd.conf` is available.
+GRUB entry **"Akuma/amd64 (herd + sshd)"** (`/etc/grub.d/47_akuma_herd`) boots
+it. ssh **is** the console on this machine, which is exactly why the supervisor
+earns its process: sshd exiting would otherwise end the only way in.
+
+`akuma-cli` is the sibling repo's katakana screensaver — a **std** binary
+(clap/crossterm/rand) linked static against musl for
+`x86_64-unknown-linux-musl`, not built by `mkdisk.sh` (macOS cannot cross-link
+musl) but staged from
+`target/x86_64-unknown-none/release/akuma-cli-x86_64`. It runs: `akuma --help`
+parsed and printed over an ssh session into the kernel.
+
+## The bug that stood between herd and all of that
+
+`herd` died on its first `fstat` with `#PF ... cr2=0x0` at a
+`movb (%r14), %bl` — a null dereference through a register the compiler had every
+right to assume survived a call. It was not a scheduler race (deterministic at
+`SMP=1`) and not a kernel register clobber. **`libakuma::Stat` was
+`asm-generic`'s `struct stat` — AArch64's — on every target.** On x86_64 that is
+wrong twice:
+
+- **128 bytes vs 144.** The caller reserved 128 on its stack; `sys_fstat`
+  wrote all 144, over the two saved callee-saved registers above the frame.
+  Bytes 128..144 are x86_64's `__unused[3]`, always zero — so `%rbx` and `%r14`
+  came back as **zero**. Nothing about the crash pointed at `fstat`.
+- **`st_mode` at 16 vs 24.** `S_ISDIR` read the wrong word.
+
+`Stat` is `#[cfg]`'d per architecture now, with a `size_of` assertion on each,
+and the field *names* are unchanged so every consumer compiles as before.
+`userspace/tcc/src/amd64_shim.rs` had already hit this and carried a private
+copy; its comment is the warning that was there all along.
+
+Also fixed: the amd64 kernel had no `uptime` syscall (Akuma-private 319), which
+herd's entire supervision loop is keyed on, and `paws`'s `uname -a` reported
+`aarch64` from a hardcoded string — the first thing anyone types after logging in.
+
+## Verified
+
+| env | result |
+|---|---|
+| QEMU microvm (PVH, virtio) | **219/219** (212 + 7 new `ip=` parser checks) |
+| OVMF+KVM+GRUB q35 (bare-metal path) | **197/197**; `ip=` checks green; e1000 → loopback |
+| ssh into the guest | `uname -a`, `ls /bin`, `akuma --help` over `herd`-supervised sshd |
+
+The remaining unknown is the one nothing can emulate: whether **DHCP or a real
+TCP session works over the RTL8169 on the actual chip.** Staged and
+`grub-reboot`-armed for that.
+
+`ssh -i <tree>/target/x86_64-unknown-none/release/amd64-ssh-test-key -p 2222
+root@192.168.1.220` — note **2222**, sshd's default port on every Akuma target.
+
+## The session shell, and the one thing it cannot do
+
+`sshd`'s session shell is **busybox `sh`**, not `paws`, since 2026-09-05. The
+caveat that made `paws` the default — "an interactive busybox needs `fork`" —
+stopped being true when this target grew a real `fork`/`execve`. Verified over
+ssh: `uname -a`, `id`, `df`, `grep`, `wc`, `ifconfig`, `ls`, `apk --version`.
+The applet set is ~70 names now, including `reboot`/`halt`/`poweroff` — on a box
+with no keyboard, `reboot(2)` over ssh is the only clean way to put it down.
+
+**Pipelines and redirects do not work.** `cmd | cmd` fails with `can't create
+pipe: Bad file descriptor`. Adding `pipe2` would not fix it: fds 0/1/2 are not
+entries in `amd64/src/fd.rs`'s table (`FIRST_FILE_FD = 3`; the console is
+handled by number, below the table), so `dup2(pipefd, 1)` has nowhere to land.
+Making a pipeline work means giving the table real entries for 0/1/2 and
+routing the console through one — a restructure of that file, not a syscall to
+add. It is the next thing worth doing for this machine.
+
+`apk` and its whole support tree ship on the image (`/etc/apk/{repositories,
+arch,world,keys}` with all five signing keys, `/lib/apk/db`, `/var/cache/apk`),
+as do the HTTPS roots: `/etc/ssl/cert.pem` and
+`/etc/ssl/certs/ca-certificates.crt`, 121 certificates.

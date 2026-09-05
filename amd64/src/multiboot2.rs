@@ -364,6 +364,13 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // loopback-only stack — enough to prove `socket(AF_INET)`, `bind`, `listen`.
     crate::fs::smoke_test(&mut t, have_fs);
     crate::fd::smoke_test(&mut t, have_fs);
+    // `net::smoke_test` runs here too since 2026-09-05 — it did not before,
+    // because this path has no virtio-net and the checks read as a VMM thing.
+    // They are not: the RNG, the clock, and above all the `ip=` parser whose
+    // built-in address is what this machine answers on when DHCP does not.
+    // This is the one entry where that address matters, so it is the one entry
+    // that must not skip checking it.
+    crate::net::smoke_test(&mut t, have_net);
     crate::sock::smoke_test(&mut t, have_net);
     crate::mm::smoke_test(&mut t);
 
