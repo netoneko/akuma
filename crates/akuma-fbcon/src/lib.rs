@@ -28,7 +28,7 @@
 //!
 //! **Anti-alias the glyphs.** [`font`] stores a coverage value per pixel rather
 //! than a bit, and [`Rgb::blend`] mixes the edge pixels. That is what lets the
-//! default font be [`font::JETBRAINS_MONO`] — an outline face drawn for screens
+//! default font be [`font::IBM_PLEX_MONO`] — an outline face drawn for screens
 //! — instead of a bitmap font drawn for a fixed cell. A 1-bit rasterization of
 //! such a face has visibly uneven stems, which is the failure that makes
 //! outline fonts look wrong on a console and gets blamed on the font.

@@ -741,6 +741,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
     match nr {
         // x86_64 158: the TLS-base primitive. No aarch64 number.
         158 => return sys_arch_prctl(a1, a2),
+        // `syslog(type, buf, len)` — x86_64 103 (`klogctl`). Backed by the
+        // console ring buffer in `serial.rs`, so `busybox dmesg` returns the
+        // kernel's own boot/diagnostic output over ssh — the only way to read
+        // it on the reference box, whose console is a write-only framebuffer.
+        103 => return sys_syslog(a1, a2, a3),
         // `reboot(magic1, magic2, cmd, arg)` — x86_64 169. The ABI decode is
         // shared with the aarch64 kernel (`akuma-boot`); the x86 machine reset
         // under it is `reboot.rs`. `busybox reboot`/`halt`/`poweroff` all land
@@ -1210,8 +1215,8 @@ static UTSNAME: [u8; UTS_LEN] = {
     let b = [0u8; UTS_LEN];
     let b = uts_set(b, 0, b"Akuma"); // sysname
     let b = uts_set(b, 1, b"akuma"); // nodename
-    let b = uts_set(b, 2, b"0.1.0-amd64"); // release
-    let b = uts_set(b, 3, b"Akuma/amd64 (x86_64 bring-up)"); // version
+    let b = uts_set(b, 2, crate::banner::RELEASE.as_bytes()); // release
+    let b = uts_set(b, 3, crate::banner::VERSION_DESC.as_bytes()); // version
     let b = uts_set(b, 4, b"x86_64"); // machine
     uts_set(b, 5, b"(none)") // domainname
 };
@@ -1224,6 +1229,52 @@ fn sys_uname(buf: u64) -> u64 {
         return crate::fd::errno::EFAULT;
     }
     0
+}
+
+/// `syslog(type, bufp, len)` — the `klogctl(2)` operations `busybox dmesg`
+/// uses, served from `serial.rs`'s console ring buffer.
+///
+/// `SIZE_BUFFER`/`SIZE_UNREAD` report what is retrievable; `READ`/`READ_ALL`
+/// copy the newest bytes into the caller's buffer (the ring only ever keeps the
+/// tail, so both behave the same here); `READ_CLEAR`/`CLEAR` also discard the
+/// history. The console-level and open/close actions are accepted as no-ops —
+/// there is no priority filtering on this target.
+fn sys_syslog(action: u64, bufp: u64, len: u64) -> u64 {
+    use crate::fd::errno;
+    const READ: u64 = 2;
+    const READ_ALL: u64 = 3;
+    const READ_CLEAR: u64 = 4;
+    const CLEAR: u64 = 5;
+    const SIZE_UNREAD: u64 = 9;
+    const SIZE_BUFFER: u64 = 10;
+
+    match action {
+        0 | 1 | 6 | 7 | 8 => 0, // close / open / console off / on / level
+        CLEAR => {
+            crate::serial::klog_clear();
+            0
+        }
+        SIZE_UNREAD | SIZE_BUFFER => crate::serial::klog_len() as u64,
+        READ | READ_ALL | READ_CLEAR => {
+            if bufp == 0 || len == 0 {
+                return errno::EINVAL;
+            }
+            // Bounded staging buffer: copy the ring's tail into it, then out to
+            // the user. `len` is clamped so a caller asking for megabytes gets
+            // only what the ring holds, in chunks it controls.
+            let want = (len as usize).min(4096);
+            let mut stage = [0u8; 4096];
+            let n = crate::serial::klog_snapshot(&mut stage[..want]);
+            if n > 0 && !crate::uaccess::write_bytes(bufp, &stage[..n]) {
+                return errno::EFAULT;
+            }
+            if action == READ_CLEAR {
+                crate::serial::klog_clear();
+            }
+            n as u64
+        }
+        _ => errno::EINVAL,
+    }
 }
 
 /// `arch_prctl(code, addr)` — x86_64 syscall 158, the TLS-base primitive.
@@ -3357,7 +3408,11 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
         serial::puts("  [init] no task slot\n");
         return false;
     }
-    serial::puts("\n-- running ");
+    // The sign-on banner, last thing before the init program starts: on the HP
+    // box the console is a television, and this is what is on it when sshd comes
+    // up.
+    crate::banner::print();
+    serial::puts("-- running ");
     serial::puts(path);
     serial::puts(" --\n");
     // Drive the round-robin from the boot task. Unbounded on purpose: a shell

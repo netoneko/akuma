@@ -2,7 +2,7 @@
 //!
 //! Two fonts come out of here and they arrive in very different shapes:
 //!
-//! - **JetBrains Mono** ([`JBM_TTF`]) is a TrueType outline font. There is no
+//! - **IBM Plex Mono** ([`PLEX_TTF`]) is a TrueType outline font. There is no
 //!   bitmap in it at all — every glyph is a set of quadratic contours that have
 //!   to be scaled, positioned and filled before there are any pixels.
 //! - **Spleen** ([`SPLEEN_BDF`]) is already a bitmap, one bit per pixel.
@@ -10,17 +10,21 @@
 //! Both are emitted as the same thing: an **8-bit coverage value per pixel**,
 //! row-major, `WIDTH * HEIGHT` bytes per cell, in code-point order from
 //! [`FIRST`] to [`LAST`], with one extra cell on the end for the replacement
-//! box. Spleen's bits become `0x00` or `0xFF` and lose nothing; JetBrains Mono
+//! box. Spleen's bits become `0x00` or `0xFF` and lose nothing; IBM Plex Mono
 //! keeps its partial coverage, which is the whole reason an outline font is
 //! worth having on screen — a 1-bit rasterization of a face drawn for
 //! anti-aliasing has visibly uneven stems.
 //!
-//! Neither font is checked in. Both are git submodules, so the upstream file
-//! stays the single source of truth, the licence travels with it, and updating
-//! a font is a submodule bump rather than a regenerated blob in a diff.
+//! IBM Plex Mono is vendored as the single `IBMPlexMono-Regular.ttf` file (SIL
+//! OFL 1.1, `vendor/ibm-plex-mono/LICENSE.txt`, `PROVENANCE.txt` records the
+//! upstream commit) rather than as a submodule: `github.com/IBM/plex` is a
+//! ~200 MB monorepo of every Plex family and there is no standalone Plex Mono
+//! repo, so a submodule would cost far more than the one 170 KB file it exists
+//! to reach. Spleen stays a submodule — its repo is small. Either way the table
+//! is generated from the file by `build.rs`, never hand-written.
 //!
 //! Only `0x20..=0x7E` is emitted. Both fonts carry far more — Spleen has
-//! Latin-1, box drawing and Braille; JetBrains Mono has most of Latin and
+//! Latin-1, box drawing and Braille; IBM Plex Mono has most of Latin and
 //! Cyrillic — and a kernel console that cannot decode UTF-8 has no way to reach
 //! any of it.
 
@@ -39,8 +43,8 @@ const LAST: u8 = 0x7E;
 /// Cells in a table: one per code point, plus the replacement box on the end.
 const CELLS: usize = (LAST - FIRST + 2) as usize;
 
-/// The JetBrains Mono submodule, and the one weight the console uses.
-const JBM_TTF: &str = "vendor/jetbrains-mono/fonts/ttf/JetBrainsMono-Regular.ttf";
+/// The vendored IBM Plex Mono file, and the one weight the console uses.
+const PLEX_TTF: &str = "vendor/ibm-plex-mono/IBMPlexMono-Regular.ttf";
 /// The Spleen submodule, and the one size the console uses.
 const SPLEEN_BDF: &str = "vendor/spleen/spleen-8x16.bdf";
 
@@ -68,27 +72,27 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    emit(&jetbrains_mono(), &out);
+    emit(&ibm_plex_mono(), &out);
     emit(&spleen(), &out);
 }
 
 // ---------------------------------------------------------------------------
-// JetBrains Mono
+// IBM Plex Mono
 // ---------------------------------------------------------------------------
 
-/// Pixels across one JetBrains Mono cell.
+/// Pixels across one IBM Plex Mono cell.
 ///
 /// The face advances 600 units per 1000-unit em, so a 12-wide cell is exactly
 /// its drawn proportion against a 24-tall one. Squeezing it into the 8 columns
 /// Spleen uses would narrow every glyph by a third and undo the reason for
 /// preferring an outline font in the first place.
-const JBM_WIDTH: usize = 12;
-/// Pixels down one JetBrains Mono cell.
+const PLEX_WIDTH: usize = 12;
+/// Pixels down one IBM Plex Mono cell.
 ///
 /// Shorter than the face's own line height, which is 1.32 em and would spend
 /// four rows on leading and on accents no code point below `0x7F` reaches.
 /// What fills the cell is the ink of printable ASCII, centred. See [`place`].
-const JBM_HEIGHT: usize = 24;
+const PLEX_HEIGHT: usize = 24;
 
 /// The least coverage that counts as ink, out of 255.
 ///
@@ -101,7 +105,7 @@ const JBM_HEIGHT: usize = 24;
 ///
 /// Laying the cell out from the reported bounds instead of from the ink would
 /// shrink the whole alphabet by 8 % to make room for that. So the layout
-/// ignores anything below this, and [`jetbrains_mono`] refuses to discard
+/// ignores anything below this, and [`ibm_plex_mono`] refuses to discard
 /// anything at or above it — a sliver is dropped, real ink outside the cell is
 /// a build failure.
 const INK_FLOOR: u8 = 16;
@@ -110,19 +114,18 @@ const INK_FLOOR: u8 = 16;
 /// left of the cell, `y` from the baseline, before the cell offset is applied.
 type Drawn = Vec<(i32, i32, u8)>;
 
-/// Rasterize JetBrains Mono into a cell table.
-fn jetbrains_mono() -> Face {
-    println!("cargo:rerun-if-changed={JBM_TTF}");
-    let data = fs::read(JBM_TTF).unwrap_or_else(|e| {
+/// Rasterize IBM Plex Mono into a cell table.
+fn ibm_plex_mono() -> Face {
+    println!("cargo:rerun-if-changed={PLEX_TTF}");
+    let data = fs::read(PLEX_TTF).unwrap_or_else(|e| {
         panic!(
-            "cannot read {JBM_TTF}: {e}\n\
+            "cannot read {PLEX_TTF}: {e}\n\
              \n\
-             JetBrains Mono is a git submodule. Fetch it with:\n\
-             \n\
-             \tgit submodule update --init crates/akuma-fbcon/vendor/jetbrains-mono\n"
+             IBM Plex Mono is vendored at crates/akuma-fbcon/vendor/ibm-plex-mono/;\n\
+             if it is missing the checkout is incomplete.\n"
         )
     });
-    let font = FontRef::try_from_slice(&data).expect("JetBrainsMono-Regular.ttf is not TrueType");
+    let font = FontRef::try_from_slice(&data).expect("IBMPlexMono-Regular.ttf is not TrueType");
 
     // What `PxScale` scales is **not** the em square: ab_glyph divides it by
     // `ascent - descent`, so asking for the em size renders every glyph short
@@ -130,46 +133,46 @@ fn jetbrains_mono() -> Face {
     // look like a deliberately airy font rather than a bug. Solve for the
     // scale that puts the advance on exactly one cell width instead.
     let advance = monospace_advance(&font);
-    let px = JBM_WIDTH as f32 * (font.ascent_unscaled() - font.descent_unscaled()) / advance;
+    let px = PLEX_WIDTH as f32 * (font.ascent_unscaled() - font.descent_unscaled()) / advance;
 
     // Rasterized once, up front, because placement has to know where the ink
     // landed before it can decide where the ink goes.
     let drawn: Vec<Drawn> = (FIRST..=LAST).map(|c| rasterize(&font, c, px)).collect();
     let (off_x, off_y, ink_w, ink_h) = place(&drawn);
 
-    let mut cells = vec![0u8; CELLS * JBM_WIDTH * JBM_HEIGHT];
+    let mut cells = vec![0u8; CELLS * PLEX_WIDTH * PLEX_HEIGHT];
     for (index, glyph) in drawn.iter().enumerate() {
-        let base = index * JBM_WIDTH * JBM_HEIGHT;
+        let base = index * PLEX_WIDTH * PLEX_HEIGHT;
         for &(gx, gy, coverage) in glyph {
             let (x, y) = (gx + off_x, gy + off_y);
             let inside =
-                x >= 0 && y >= 0 && (x as usize) < JBM_WIDTH && (y as usize) < JBM_HEIGHT;
+                x >= 0 && y >= 0 && (x as usize) < PLEX_WIDTH && (y as usize) < PLEX_HEIGHT;
             assert!(
                 inside || coverage < INK_FLOOR,
                 "code point {:#04x} puts {coverage}/255 of ink at ({x},{y}), outside its \
-                 {JBM_WIDTH}x{JBM_HEIGHT} cell; widen the cell rather than clipping a glyph",
+                 {PLEX_WIDTH}x{PLEX_HEIGHT} cell; widen the cell rather than clipping a glyph",
                 index as u8 + FIRST
             );
             if inside {
-                cells[base + y as usize * JBM_WIDTH + x as usize] = coverage;
+                cells[base + y as usize * PLEX_WIDTH + x as usize] = coverage;
             }
         }
     }
-    cells[(CELLS - 1) * JBM_WIDTH * JBM_HEIGHT..]
-        .copy_from_slice(&replacement(JBM_WIDTH, JBM_HEIGHT));
+    cells[(CELLS - 1) * PLEX_WIDTH * PLEX_HEIGHT..]
+        .copy_from_slice(&replacement(PLEX_WIDTH, PLEX_HEIGHT));
 
     Face {
-        ident: "JETBRAINS_MONO",
-        stem: "jetbrains_mono",
-        name: "JetBrains Mono",
-        origin: "vendor/jetbrains-mono/fonts/ttf/JetBrainsMono-Regular.ttf (SIL OFL 1.1)",
+        ident: "IBM_PLEX_MONO",
+        stem: "ibm_plex_mono",
+        name: "IBM Plex Mono",
+        origin: "vendor/ibm-plex-mono/IBMPlexMono-Regular.ttf (SIL OFL 1.1)",
         fit: format!(
             "Rasterized at a {px:.1}-pixel `PxScale`, chosen so the face's {advance:.0}-unit \
-             advance lands on exactly {JBM_WIDTH} pixels. Printable ASCII inks \
+             advance lands on exactly {PLEX_WIDTH} pixels. Printable ASCII inks \
              {ink_w}x{ink_h} of the cell and is centred in it."
         ),
-        width: JBM_WIDTH,
-        height: JBM_HEIGHT,
+        width: PLEX_WIDTH,
+        height: PLEX_HEIGHT,
         cells,
     }
 }
@@ -180,7 +183,7 @@ fn jetbrains_mono() -> Face {
 /// so it has no outline and its cell stays blank.
 fn rasterize(font: &FontRef<'_>, c: u8, px: f32) -> Drawn {
     let id = font.glyph_id(char::from(c));
-    assert_ne!(id.0, 0, "JetBrains Mono has no glyph for code point {c:#04x}");
+    assert_ne!(id.0, 0, "IBM Plex Mono has no glyph for code point {c:#04x}");
     let Some(glyph) = font.outline_glyph(id.with_scale_and_position(px, point(0.0, 0.0))) else {
         return Drawn::new();
     };
@@ -253,13 +256,13 @@ fn place(drawn: &[Drawn]) -> (i32, i32, usize, usize) {
 
     let (ink_w, ink_h) = ((max_x - min_x + 1) as usize, (max_y - min_y + 1) as usize);
     assert!(
-        ink_w <= JBM_WIDTH && ink_h <= JBM_HEIGHT,
+        ink_w <= PLEX_WIDTH && ink_h <= PLEX_HEIGHT,
         "printable ASCII inks {ink_w}x{ink_h} pixels, which does not fit a \
-         {JBM_WIDTH}x{JBM_HEIGHT} cell; widen the cell rather than clipping a glyph"
+         {PLEX_WIDTH}x{PLEX_HEIGHT} cell; widen the cell rather than clipping a glyph"
     );
 
-    let slack_x = i32::try_from(JBM_WIDTH - ink_w).expect("cell wider than an i32");
-    let slack_y = i32::try_from(JBM_HEIGHT - ink_h).expect("cell taller than an i32");
+    let slack_x = i32::try_from(PLEX_WIDTH - ink_w).expect("cell wider than an i32");
+    let slack_y = i32::try_from(PLEX_HEIGHT - ink_h).expect("cell taller than an i32");
     (slack_x / 2 - min_x, slack_y / 2 - min_y, ink_w, ink_h)
 }
 
@@ -403,7 +406,7 @@ fn replacement(width: usize, height: usize) -> Vec<u8> {
 /// Write one face as a `.bin` blob and the `static` that points at it.
 ///
 /// The coverage goes in a separate file and reaches the crate through
-/// `include_bytes!` rather than as a Rust array literal: JetBrains Mono is
+/// `include_bytes!` rather than as a Rust array literal: IBM Plex Mono is
 /// 27 KB of it, and 27 000 comma-separated integers is a source file `rustc`
 /// spends real time parsing on every build for no benefit.
 fn emit(face: &Face, out: &Path) {

@@ -47,6 +47,60 @@ use core::sync::atomic::{AtomicBool, Ordering};
 static LOCK: AtomicBool = AtomicBool::new(false);
 const LOCK_BUDGET: u32 = 1 << 22;
 
+/// A copy of the last [`KLOG_CAP`] console bytes, so `dmesg` works over ssh.
+///
+/// This target has no UART on the reference box and no `/proc/kmsg`, so once the
+/// framebuffer scrolls a diagnostic away there is no way to get it back — which
+/// on a headless box being driven entirely over ssh means "the kernel said why
+/// and nobody can read it". Every byte that goes to [`putb_raw`] is also written
+/// here, under the same lock, and `sys_syslog` (syscall 103) reads it back.
+///
+/// A plain wrapping byte buffer: `KLOG_LEN` counts total bytes ever written and
+/// `% KLOG_CAP` is the write cursor. 64 KiB covers a whole boot's worth of
+/// output comfortably and costs nothing but `.bss`.
+const KLOG_CAP: usize = 64 * 1024;
+static mut KLOG: [u8; KLOG_CAP] = [0; KLOG_CAP];
+static KLOG_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Append one byte to [`KLOG`]. Caller holds [`lock`].
+fn klog_push(byte: u8) {
+    let n = KLOG_LEN.load(Ordering::Relaxed);
+    // SAFETY: single-writer under the serial lock; index is always `< KLOG_CAP`.
+    unsafe {
+        (&raw mut KLOG).cast::<u8>().add((n as usize) % KLOG_CAP).write(byte);
+    }
+    KLOG_LEN.store(n + 1, Ordering::Relaxed);
+}
+
+/// Copy the most recent console bytes into `out`, newest at the end. Returns how
+/// many bytes were written. For `sys_syslog`'s `SYSLOG_ACTION_READ_ALL`.
+#[must_use]
+pub fn klog_snapshot(out: &mut [u8]) -> usize {
+    let _g = lock();
+    let total = KLOG_LEN.load(Ordering::Relaxed);
+    let available = (total as usize).min(KLOG_CAP);
+    let want = available.min(out.len());
+    let start = total as usize - want; // absolute index of the first byte to copy
+    for (i, slot) in out[..want].iter_mut().enumerate() {
+        // SAFETY: read of an initialised `.bss` byte, index masked into range.
+        *slot = unsafe { (&raw const KLOG).cast::<u8>().add((start + i) % KLOG_CAP).read() };
+    }
+    want
+}
+
+/// Total bytes currently retrievable from [`klog_snapshot`]. For
+/// `SYSLOG_ACTION_SIZE_UNREAD` / `SIZE_BUFFER`.
+#[must_use]
+pub fn klog_len() -> usize {
+    (KLOG_LEN.load(Ordering::Relaxed) as usize).min(KLOG_CAP)
+}
+
+/// Discard the buffered console history. For `SYSLOG_ACTION_CLEAR`.
+pub fn klog_clear() {
+    let _g = lock();
+    KLOG_LEN.store(0, Ordering::Relaxed);
+}
+
 /// Did a 16550 answer the probe in [`init`]?
 ///
 /// **An absent x86 I/O port reads `0xFF`.** On a machine with no UART — the
@@ -133,6 +187,10 @@ pub fn putb(byte: u8) {
 
 /// [`putb`] without the lock, for callers that hold it across a whole string.
 fn putb_raw(byte: u8) {
+    // Keep a copy for `dmesg` (see `KLOG`). First, so a byte survives even if
+    // the mirror or the port below hangs.
+    klog_push(byte);
+
     // Mirror to the framebuffer console, if one is up.
     //
     // FIRST, before the wait below. On the bare-metal target there is no UART at

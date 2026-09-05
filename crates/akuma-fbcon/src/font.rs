@@ -2,20 +2,19 @@
 //!
 //! Two are baked in and the console picks one at construction:
 //!
-//! - [`JETBRAINS_MONO`] — 12x24, the default. An outline font rasterized with
+//! - [`IBM_PLEX_MONO`] — 12x24, the default. An outline font rasterized with
 //!   anti-aliasing, which is what a face drawn for screens needs to look like
-//!   itself. Copyright the JetBrains Mono project, SIL OFL 1.1; full text in
-//!   `vendor/jetbrains-mono/OFL.txt`.
+//!   itself. © IBM Corp., SIL OFL 1.1; full text in
+//!   `vendor/ibm-plex-mono/LICENSE.txt`.
 //! - [`SPLEEN`] — 8x16, by Frederic Cambus. A monospaced bitmap font designed
 //!   for consoles and shipped in OpenBSD base; BSD-2-Clause, full text in
 //!   `vendor/spleen/LICENSE`. Half the cell of the default, so it is what to
 //!   reach for on a small framebuffer where 24 pixels of height costs rows that
 //!   matter.
 //!
-//! Neither is checked in. Both are git submodules and both tables are generated
-//! from the upstream file by `build.rs`, so the submodule stays the source of
-//! truth and updating a font is a submodule bump rather than a regenerated blob
-//! in a diff.
+//! IBM Plex Mono is vendored as one `.ttf` file (`build.rs` explains why not a
+//! submodule); Spleen is a submodule. Both tables are generated from the file
+//! by `build.rs`, never hand-written.
 //!
 //! # The table
 //!
@@ -25,16 +24,16 @@
 //! rather than as whatever follows it — a console that silently draws garbage
 //! for a stray byte is worse than one that draws a visible box.
 //!
-//! Coverage rather than bits costs eight times the bytes (27 KB for JetBrains
+//! Coverage rather than bits costs eight times the bytes (27 KB for IBM Plex
 //! Mono, 12 KB for Spleen) and buys two things: an outline font that does not
 //! have visibly uneven stems, and one drawing path in [`crate::Console`] rather
 //! than one per font. Only the font the kernel actually names is linked.
 //!
-//! Larger Spleen sizes exist upstream (12x24, 16x32, 32x64) and JetBrains Mono
+//! Larger Spleen sizes exist upstream (12x24, 16x32, 32x64) and IBM Plex Mono
 //! will rasterize at any size at all; adding one is a change to `build.rs` and
 //! nothing else, since nothing here or in [`crate::Console`] assumes a width.
 
-include!(concat!(env!("OUT_DIR"), "/jetbrains_mono.rs"));
+include!(concat!(env!("OUT_DIR"), "/ibm_plex_mono.rs"));
 include!(concat!(env!("OUT_DIR"), "/spleen.rs"));
 
 /// A fixed-cell font: one coverage value per pixel, one cell per code point.

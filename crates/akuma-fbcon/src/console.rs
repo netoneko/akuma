@@ -12,7 +12,7 @@ use crate::font::{self, Font};
 use crate::{Rgb, Surface};
 
 /// The font a [`Console`] uses when the framebuffer can afford it.
-pub const DEFAULT_FONT: &Font = &font::JETBRAINS_MONO;
+pub const DEFAULT_FONT: &Font = &font::IBM_PLEX_MONO;
 
 /// The font used instead when [`DEFAULT_FONT`]'s cell is too big for the screen.
 ///
@@ -295,6 +295,18 @@ impl<S: Surface> Console<S> {
         }
     }
 
+    /// How many rows a single [`scroll`](Self::scroll) advances by.
+    ///
+    /// One row per scroll means a scroll on *every* line once output reaches the
+    /// bottom, and each scroll rewrites almost the whole screen cell by cell,
+    /// top to bottom — which on a television reads as a tear sweeping down the
+    /// picture on every printed line. Advancing several rows at once makes that
+    /// redraw happen once per `SCROLL_ROWS` lines instead: the cursor lands a few
+    /// rows up from the bottom with blank space below it, and that space fills in
+    /// before the next scroll. Eight is enough to make the sweep occasional
+    /// rather than constant without leaving a distractingly large gap.
+    pub const SCROLL_ROWS: usize = 8;
+
     fn put_char(&mut self, b: u8) {
         if self.col == self.cols {
             self.newline();
@@ -317,22 +329,24 @@ impl<S: Surface> Console<S> {
     /// mostly short lines on a wide grid, so the great majority of cells are
     /// blank both before and after and need no writes at all.
     fn scroll(&mut self) {
-        for r in 0..self.rows - 1 {
+        let shift = Self::SCROLL_ROWS.min(self.rows - 1);
+        for r in 0..self.rows {
             for c in 0..self.cols {
-                let next = self.grid[r + 1][c];
+                let next = if r + shift < self.rows {
+                    self.grid[r + shift][c]
+                } else {
+                    b' '
+                };
                 if self.grid[r][c] != next {
                     self.grid[r][c] = next;
                     self.draw_cell(r, c, next);
                 }
             }
         }
-        let last = self.rows - 1;
-        for c in 0..self.cols {
-            if self.grid[last][c] != b' ' {
-                self.grid[last][c] = b' ';
-                self.draw_cell(last, c, b' ');
-            }
-        }
+        // The line that triggered this scroll sat on the last row and has moved
+        // up to `rows - 1 - shift`; the next line goes just below it, leaving
+        // `shift` blank rows at the bottom to fill before the next scroll.
+        self.row = self.rows - shift;
     }
 
     /// Blit one glyph, background included, so a redraw needs no prior clear.

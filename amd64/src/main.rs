@@ -42,6 +42,8 @@ compile_error!(
 );
 
 #[cfg(target_arch = "x86_64")]
+mod banner;
+#[cfg(target_arch = "x86_64")]
 mod blk;
 #[cfg(target_arch = "x86_64")]
 mod clock;

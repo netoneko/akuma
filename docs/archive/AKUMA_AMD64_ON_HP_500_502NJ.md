@@ -1018,7 +1018,7 @@ known good on this hardware and restart-on-death is worth more than visibility.
 
 ## The console says what font it is in
 
-`Console::choose_font` decides at runtime from the framebuffer size — JetBrains
+`Console::choose_font` decides at runtime from the framebuffer size — IBM Plex
 Mono whenever it reaches 80x24, Spleen when it cannot — so "what am I looking
 at" was answerable only by re-deriving the arithmetic from whatever mode GRUB
 picked. The boot now prints it:
@@ -1027,7 +1027,9 @@ picked. The boot now prints it:
   font: Spleen 8x16 scale 1 -> 91x34 cells        (the 800x600 OVMF rig)
 ```
 
-On the HP box, both 3840x2160 and 1920x1080 give JetBrains Mono at 146x41 cells.
+On the HP box, both 3840x2160 and 1920x1080 give IBM Plex Mono at 146x41 cells.
+(The default font was JetBrains Mono until 2026-09-06; see
+[`AKUMA_SELF_HEALING_PORT.md`](AKUMA_SELF_HEALING_PORT.md).)
 
 ## Still open
 

@@ -254,7 +254,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
     con.clear();
     // Which font and grid the console actually chose. `Console::choose_font`
-    // takes that decision from the framebuffer size at runtime — JetBrains Mono
+    // takes that decision from the framebuffer size at runtime — IBM Plex Mono
     // whenever it reaches 80x24, Spleen when it cannot — so on a machine whose
     // only output IS this console, "what am I looking at" was a question only
     // answerable by re-deriving the arithmetic from the mode GRUB happened to
@@ -368,6 +368,37 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // Either way `socket(AF_INET)` works for `busybox ifconfig` and `127.0.0.1`.
     let have_net = crate::net::init_bare_metal(info.cmdline());
 
+    // `skiptests` on the command line: bring the machine up to `init` without
+    // running the ~200-check self-test suite. The suite is the right default —
+    // it is how a regression in a shared crate is caught before the metal — but
+    // once a build is trusted, re-proving demand paging and the ELF loader on
+    // every reboot is time spent watching a television scroll. This still does
+    // the handful of `init_*` calls the suite happens to also perform (the LAPIC,
+    // the console fd, the syscall MSRs, the secondary cores): those are real
+    // bring-up, not tests.
+    let skiptests = info.cmdline().split_ascii_whitespace().any(|t| t == "skiptests");
+    if skiptests {
+        serial::puts("  boot: skiptests — self-test suite bypassed\n");
+        crate::lapic::init();
+        let nosmp = info.cmdline().split_ascii_whitespace().any(|t| t == "nosmp");
+        let keep_out = [
+            (info_phys, info_phys + bytes.len() as u64),
+            info.first_module().map_or((0, 0), |m| (u64::from(m.start), u64::from(m.end))),
+        ];
+        if !nosmp && crate::smp::trampoline_page_available(&machine, &keep_out) {
+            crate::smp::start_secondaries(machine.madt.as_ref());
+        }
+        crate::fd::init_console();
+        crate::usermode::init_syscall();
+        crate::lapic::start_timer();
+        // Every test path ends in `cli`; with the suite skipped, nothing else
+        // turns interrupts back on before the netpoll daemon and `run_init` need
+        // them. SAFETY: unconditionally safe at ring 0.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+        boot_to_init(&info, have_net, have_fs);
+        cycle_forever(have_net)
+    }
+
     let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
 
     // The same bypass window `kmain` runs its tests in: they drive syscall
@@ -468,10 +499,25 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         serial::puts("Akuma/amd64 - SELF-TESTS FAILED\n");
     }
 
-    // Drive the stack: `poll()` has to run between socket calls for a
-    // connection to complete (loopback or the wire). `ifconfig` needs none of
-    // this, but a shell that opens a socket does.
-    let netprobe = info.cmdline().split_ascii_whitespace().any(|t| t == "netprobe");
+    boot_to_init(&info, have_net, passed && have_fs);
+
+    // Keep driving the scheduler as long as there is a network stack behind it:
+    // the netpoll daemon is what answers ARP and ICMP and services a listening
+    // socket, and an `init` that exits must not take the machine off the
+    // network with it. On a box whose only console is this framebuffer, being
+    // pingable after `init` is done is the difference between diagnosable and
+    // silent.
+    cycle_forever(have_net)
+}
+
+/// Bring the network up (DHCP, then the wall clock, then the netpoll daemon),
+/// then hand the machine to the `init=` program. Shared by the full-suite path
+/// and the `skiptests` path so they cannot drift.
+///
+/// `run_shell` is `false` when the self-test suite failed — a shell on a kernel
+/// whose own tests failed is a way to spend an hour debugging the wrong layer.
+fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
+    let cmdline = info.cmdline();
     if have_net {
         // The wall clock, and the order it has to happen in.
         //
@@ -485,53 +531,34 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         //
         // DHCP first (SNTP needs an address and a route), then the clock, then
         // the daemon — see `net::settle_for_dhcp` for why the daemon must be
-        // last.
+        // last. `clock::sync_tick` in the daemon keeps retrying if this first
+        // attempt did not land.
         if crate::net::settle_for_dhcp(SETTLE_BUDGET_MS) {
             crate::clock::sync_via_sntp();
         } else {
-            serial::puts("  net:  DHCP did not settle; no wall clock (TLS will fail)\n");
+            serial::puts("  net:  DHCP did not settle; no wall clock yet (SNTP will retry)\n");
         }
         crate::net::spawn_netpoll();
-        if netprobe {
+        if cmdline.split_ascii_whitespace().any(|t| t == "netprobe") {
             crate::net::enable_probe();
         }
     }
 
-    // Hand the machine to a shell. After the verdict and only on a passing run,
-    // for the reason `kmain` gives: a shell on a kernel whose own tests failed
-    // is a way to spend an hour debugging the wrong layer.
-    if passed && have_fs {
-        let path = init_path(info.cmdline());
+    if run_shell {
+        let path = init_path(cmdline);
         // `initargs=a,b,c`, comma-separated as on the PVH path: `init=/bin/busybox
-        // initargs=uname,-a` runs one applet and exits, which on a machine with
-        // no input device is the whole shape of "run something and see".
-        let args: alloc::vec::Vec<&str> = info
-            .cmdline()
+        // initargs=uname,-a` runs one applet and exits.
+        let args: alloc::vec::Vec<&str> = cmdline
             .split_ascii_whitespace()
             .find_map(|t| t.strip_prefix("initargs="))
             .map(|v| v.split(',').filter(|s| !s.is_empty()).collect())
             .unwrap_or_default();
-        serial::puts("\n-- running ");
-        serial::puts(path);
-        for a in &args {
-            serial::puts(" ");
-            serial::puts(a);
-        }
-        serial::puts(" --\n");
         // NOTE: stdout reaches the screen through the mirror, but STDIN IS NOT
-        // CONNECTED. This board's keyboard is USB and there is no HID stack, so
-        // an interactive shell will print its prompt and then block on a read
-        // that nothing can satisfy. That is expected, and it is the next gap.
+        // CONNECTED — this board's keyboard is USB with no HID stack, so an
+        // interactive shell prints its prompt and then blocks on a read nothing
+        // can satisfy. Expected, and the next gap.
         crate::usermode::run_init(path, &args);
     }
-
-    // Keep driving the scheduler as long as there is a network stack behind it:
-    // the netpoll daemon is what answers ARP and ICMP and services a listening
-    // socket, and an `init` that exits must not take the machine off the
-    // network with it. On a box whose only console is this framebuffer, being
-    // pingable after `init` is done is the difference between diagnosable and
-    // silent.
-    cycle_forever(have_net)
 }
 
 /// The `init=` argument from the boot loader's command line, or `/bin/sh`.

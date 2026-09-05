@@ -199,7 +199,7 @@ exposes, and it is `serial.rs`'s only target. There is no VGA path.
 
 On a bare-metal (GRUB/multiboot2) boot there is no UART at all on the reference
 box, so `serial::puts` mirrors to a **framebuffer text console** (`akuma-fbcon`,
-via GRUB's framebuffer tag). It draws **JetBrains Mono** at 12x24, anti-aliased,
+via GRUB's framebuffer tag). It draws **IBM Plex Mono** at 12x24, anti-aliased,
 baked from the upstream TTF by that crate's `build.rs`.
 
 It falls back to **Spleen** 8x16 when the mode GRUB set is too small for that
@@ -212,16 +212,17 @@ line. The boundary in practice:
 | 640x480 | Spleen | 73x27 (80 columns needs all 640 px; no margin left) |
 | 800x600 | Spleen | 91x34 |
 | 1024x768 | Spleen | 117x44 |
-| 1280x720 and up | JetBrains Mono | 97x27 … 146x45 |
+| 1280x720 and up | IBM Plex Mono | 97x27 … 146x45 |
 
 `Console::new` is the only thing that chooses; `with_font` and `with_scale` take
 the caller's word. The bar is `MIN_COLS`/`MIN_ROWS` in `console.rs`.
 
-**Both fonts are git submodules** and neither table is checked in, so a fresh
-clone needs:
+IBM Plex Mono is a **vendored `.ttf`** in `crates/akuma-fbcon/vendor/ibm-plex-mono/`
+(the file, its OFL licence and a `PROVENANCE.txt` — not a submodule, because IBM
+ships only the ~200 MB `github.com/IBM/plex` monorepo). Spleen **is** a submodule,
+so a fresh clone needs:
 
 ```bash
-git submodule update --init crates/akuma-fbcon/vendor/jetbrains-mono
 git submodule update --init crates/akuma-fbcon/vendor/spleen
 ```
 

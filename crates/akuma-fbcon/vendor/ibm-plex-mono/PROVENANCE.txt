@@ -1,0 +1,3 @@
+commit: bf260093582f04622aacc1e9f9ca604d7ccd0c42 2026-07-30 08:12:51 -0300
+path: packages/plex-mono/fonts/complete/ttf/IBMPlexMono-Regular.ttf
+source: https://github.com/IBM/plex

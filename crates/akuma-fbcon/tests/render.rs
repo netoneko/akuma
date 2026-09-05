@@ -258,12 +258,15 @@ fn scrolling_keeps_the_newest_lines() {
     con.set_fg(Rgb::WHITE);
     con.clear();
     let rows = con.rows();
+    let shift = Console::<MemSurface>::SCROLL_ROWS.min(rows - 1);
 
-    // One distinct character per line, more lines than fit. The newline goes
-    // *between* lines, never after the last one: a trailing newline opens a
-    // further empty line and shifts what "the top line" means by one, which is
-    // exactly the off-by-one this test exists to pin down.
-    for i in 0..(rows + 5) {
+    // One distinct character per line, driven to exactly one scroll: `rows`
+    // lines fill the screen, and the next line is the one that scrolls. The
+    // newline goes *between* lines, never after the last one — a trailing
+    // newline opens a further empty line and shifts what "the top line" means by
+    // one, which is exactly the off-by-one this test exists to pin down.
+    let total = rows + 1;
+    for i in 0..total {
         if i > 0 {
             con.write_byte(b'\n');
         }
@@ -273,9 +276,9 @@ fn scrolling_keeps_the_newest_lines() {
     let (mx, my) = Console::<MemSurface>::auto_margin(320, 200);
     let s = con.into_surface();
 
-    // `rows + 5` lines were written and `rows` fit, so the first five scrolled
-    // off and line 5 is now at the top.
-    let expected_top = b'a' + 5;
+    // That one scroll advanced by `shift` rows, so lines `0..shift` fell off and
+    // line `shift` is now at the top.
+    let expected_top = b'a' + (shift % 26) as u8;
     assert_glyph_at(&s, DEFAULT_FONT, expected_top, mx, my, Rgb::WHITE, Rgb::BLACK);
 }
 
