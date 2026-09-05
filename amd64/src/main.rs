@@ -147,6 +147,15 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // prints a diagnosis instead of vanishing.
     idt::init();
 
+    // SMAP/SMEP, right after the IDT: from here on a kernel-mode touch of a user
+    // page without `stac` is a fault the handler can report, and every user
+    // access below goes through `uaccess`, which brackets its copies.
+    let smap = uaccess::init_smap();
+    serial::puts("  smap: ");
+    serial::puts(if smap.cpuid_smap { "on" } else { "off (CPUID lacks SMAP)" });
+    serial::puts("  smep: ");
+    serial::puts(if smap.cpuid_smep { "on\n" } else { "off (CPUID lacks SMEP)\n" });
+
     // The trampoline's identity map has done its job: the kernel is executing
     // from its high linked address, its stack is in the physmap, and both
     // descriptor tables are now high. Dropping it hands the lower half to
@@ -205,6 +214,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // the one path on which a kernel-mode #PF is not fatal, and the test takes
     // three of them on purpose.
     idt::user_copy_smoke_test(&mut t);
+    uaccess::smoke_test(&mut t, smap);
 
     if t.check("lapic: initialised", lapic::init()) {
         lapic::smoke_test(&mut t);

@@ -378,6 +378,9 @@ dependencies = [
 [[package]]
 name = "akuma-net-rtl8169"
 version = "0.1.0"
+dependencies = [
+ "akuma-net-rtl8169",
+]
 
 [[package]]
 name = "akuma-net-unix"

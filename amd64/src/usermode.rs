@@ -654,8 +654,13 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         14 => {
             if a3 != 0 {
                 let n = (a4 as usize).min(8);
-                // SAFETY: a user pointer to a sigset_t, bounded by sigsetsize.
-                unsafe { core::ptr::write_bytes(a3 as *mut u8, 0, n) };
+                // The old set, empty, into a user `sigset_t` bounded by sigsetsize.
+                // This was the last raw user write in the kernel; SMAP found it
+                // (`memset` → `#PF err=3` at a user stack address) the first boot
+                // it was on.
+                if !crate::uaccess::write_bytes(a3, &[0u8; 8][..n]) {
+                    return errno::EFAULT;
+                }
             }
             return 0;
         }
@@ -1019,9 +1024,9 @@ fn sys_getrandom(buf: u64, len: u64) -> u64 {
 /// interleaving by recording *which task* performed each write, and that
 /// instrumentation belongs next to the tests that read it.
 ///
-/// Reading `buf` from ring 0 works because `CR4.SMAP` is not enabled; with SMAP
-/// on this would need `stac`/`clac` around the access. That is a real gap and
-/// not a hypothetical — see the module note.
+/// `buf` is read through `crate::uaccess`, which range-checks it and brackets
+/// the copy in `stac`/`clac` — `CR4.SMAP` is on since 2026-09-05, so a raw read
+/// here would fault, and did (`docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md`).
 fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     const EBADF: u64 = (-9i64) as u64;
     const EFAULT: u64 = (-14i64) as u64;
@@ -1088,7 +1093,11 @@ pub fn init_syscall() {
         // while `rsp` still points into user memory. Also clear DF, so the
         // kernel's string operations start from a known direction — userspace
         // can set it and the ABI does not require it cleared on entry.
-        wrmsr(IA32_FMASK, (1 << 9) | (1 << 10));
+        // And AC (bit 18): with `CR4.SMAP` on, a program that sets AC and then
+        // executes `syscall` would otherwise enter the kernel with SMAP
+        // suspended — the one way userspace could grant itself the kernel's
+        // access to user pages. Linux masks it for the same reason.
+        wrmsr(IA32_FMASK, (1 << 9) | (1 << 10) | (1 << 18));
     }
 }
 

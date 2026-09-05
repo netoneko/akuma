@@ -449,17 +449,18 @@ program that printed its verdict would have "passed" by running at all.
   the current handler touches a vector register, which is a property of today's
   code rather than a guarantee — see
   `docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md` §8.
-- **No SMP**, no `CR4.SMAP`/`SMEP`, no IST, no ACPI.
-- **User pointers are fault-safe since 2026-09-05, but not SMAP-checked.**
-  Every user access in `usermode.rs`/`fd.rs`/`sock.rs` goes through
-  `src/uaccess.rs` → `akuma-user-access`'s `copy_from_user_safe`, whose
-  `rep movsb` faults (`#PF`, or `#GP` for a non-canonical address) are
+- **No SMP**, no IST, no ACPI.
+- **User pointers are fault-safe and SMAP-enforced since 2026-09-05.** Every
+  user access in `usermode.rs`/`fd.rs`/`sock.rs` goes through `src/uaccess.rs`
+  → `akuma-user-access`'s `copy_from_user_safe`, bracketed in `stac`/`clac`;
+  the `rep movsb`'s faults (`#PF`, or `#GP` for a non-canonical address) are
   redirected to an `EFAULT` trampoline by the hand-assembled vector 13/14
-  entries in `idt.rs` (`docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md`). The
-  range check refuses kernel-half and non-canonical pointers; the boot
-  self-tests, which pass kernel buffers, run under `BYPASS_VALIDATION`. With
-  `CR4.SMAP` still off, a *mapped* kernel address handed by a program is
-  refused by the range check alone, not by hardware.
+  entries in `idt.rs` (`docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md`).
+  `CR4.SMAP`/`SMEP` are set where CPUID advertises them (Haswell has SMEP but
+  not SMAP — the `stac`/`clac` sites and the stubs' `clac` are gated on
+  `SMAP_ACTIVE`), `IA32_FMASK` clears `AC` on `syscall`, and the boot test
+  proves an unbracketed kernel read of a user page is refused. The self-tests,
+  which pass kernel buffers, run under `BYPASS_VALIDATION`.
 - **Little use of the kernel crates.** 36 of 54 build for `x86_64-unknown-none`
   (§0 of `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md`), but they take the *host
   stub* out of `akuma-cpu`: a no-op `dsb_ish`, a `wfi` that does not park.

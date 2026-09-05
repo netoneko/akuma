@@ -222,10 +222,56 @@ came up through the converted paths.
 Verification repeated in full: aarch64 kernel build + workspace clippy clean,
 crate clippy clean on both bare-metal targets, workspace host tests green.
 
-`CR4.SMAP` stays off, as `proposals/AKUMA_USER_ACCESS_ARCH_PORTABILITY.md`
-scoped; `stac`/`clac` go inside the copy region when it turns on, and until
-then a *mapped* kernel address handed by a program is refused by `range_ok`
-alone, not by hardware.
+## Part 3, same day: SMAP and SMEP
+
+`amd64/src/uaccess.rs::init_smap` reads `CPUID.7.0:EBX` and sets `CR4.SMEP`
+(bit 20, `EBX[7]`) and `CR4.SMAP` (bit 21, `EBX[20]`) where advertised, right
+after `idt::init`. Conditional because `stac`/`clac` are `#UD` without SMAP,
+and that is a real machine in this tree: Haswell (the HP 500-502nj's i5-4460)
+has SMEP but not SMAP. `SMAP_ACTIVE` (a `#[no_mangle]` `AtomicU8`) gates every
+`stac`/`clac` site, including the exception stubs' `cmp byte ptr
+[rip + SMAP_ACTIVE], 0; je; clac`.
+
+Three things had to clear `AC`, and none of them is automatic:
+
+- `read_bytes`/`write_bytes` bracket the copy in `stac`/`clac`, on both the
+  `Ok` and the fixed-up `Err` path (the trampoline `ret`s into
+  `copy_from_user_safe`, which returns into the bracket).
+- The vector 13/14 stubs `clac` before calling Rust. Hardware does **not**
+  clear `AC` on exception delivery — Linux's `idtentry` executes `ASM_CLAC`
+  for the same reason — and `iretq` restores the saved `rflags`, which is what
+  lets a demand-paged `rep movsb` resume with `AC` set. The `x86-interrupt`
+  timer handler calls `uaccess::clac_if_enabled()` first thing, so a tick
+  landing mid-copy does not run the scheduler with SMAP suspended.
+- `IA32_FMASK` gained bit 18, so a program that sets `AC` and executes
+  `syscall` does not enter the kernel with SMAP off.
+
+**SMAP found the last raw write on its first boot.** 196 checks in, the fork
+test's `sh` took `#PF err=3` (present, write, supervisor) at
+`0x7fffffffe840` — a user stack address — from `memset`'s `rep stosq`.
+`rt_sigprocmask` (syscall 14) zeroed the old-set `sigset_t` with a raw
+`core::ptr::write_bytes(a3 as *mut u8, 0, n)`; it was a zero-fill, not a
+`read_volatile`, so the conversion sweep's grep had not matched it. That is
+precisely the class SMAP exists for, and it was a one-line fix. Every other
+kernel path that touches user pages — the loader, `build_stack`'s
+`write_user`, the fork/exec page copies — goes through the physmap, which is
+supervisor-only and unaffected.
+
+`uaccess::smoke_test` pins it: `CR4` bits match CPUID; the **raw** primitive
+reading a `USER_RW` page without `stac` returns `EFAULT` (the CPU refused,
+the `#PF` landed in `rep movsb`, the fixup caught it) — or, on a CPU without
+SMAP, the same read succeeds and the check *says* so instead of passing
+vacuously; a bracketed read is byte-exact and a bracketed write lands; `AC` is
+clear after a successful copy and after a faulting one.
+
+```
+  smap: on  smep: on
+  smap: an unbracketed kernel read of a user page is refused (EFAULT)   [OK]
+  smap: a bracketed copy that faults returns false and leaves AC clear   [OK]
+Akuma/amd64 self-test: 196 passed, 0 failed
+```
+
+`busybox sh` came up after the verdict, through `stac`-bracketed copies.
 
 Also found and not touched: `DISK=none amd64/run.sh` page-faults in
 `net::init` before the self-tests on the untouched tree (`cr2=0x80_0002_0008`,
@@ -234,9 +280,9 @@ measured with the default disk.
 
 ## Next
 
-`CR4.SMAP`/`SMEP`, with `stac`/`clac` bracketing the copy region — the one
-remaining way a program can make the kernel touch a mapped kernel address on
-its behalf is a bug in `range_ok`, and SMAP is what makes that class of bug a
-fault instead of a read. `akuma-el0-entry` (`invalid register 'x30'`) and
+Run it on the Ryzen (`FC_HOST=… amd64/run-firecracker.sh`) — KVM passes the
+host's CPUID through, so SMAP is on there — and on the Haswell box, which is
+the `SMAP_ACTIVE == 0` arm and the only place the conditional `clac` in the
+stubs is actually exercised. `akuma-el0-entry` (`invalid register 'x30'`) and
 `akuma-elf`'s `UserAddressSpace` needs remain the next two named blockers on
 the `akuma-exec` chain, unchanged from the gate-fix doc.

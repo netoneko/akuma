@@ -256,6 +256,15 @@ macro_rules! fixable_exception_entry {
             "    push r9\n",
             "    push r10\n",
             "    push r11\n",
+            /* Hardware does NOT clear RFLAGS.AC on exception delivery, so a
+             * fault taken inside a `stac` window would run the dispatcher with
+             * SMAP suspended. Clear it — but only where SMAP is on, because
+             * `clac` is #UD on a CPU without it (Haswell). `iretq` restores the
+             * saved rflags, so a demand-paged `rep movsb` resumes with AC set. */
+            "    cmp byte ptr [rip + SMAP_ACTIVE], 0\n",
+            "    je 1f\n",
+            "    clac\n",
+            "1:\n",
             "    lea rdi, [rsp + 80]\n",          /* &PageFaultFrame: the error code slot */
             "    call ", $dispatch, "\n",
             /* The dispatcher returned, so this fault was serviced or fixed up —
@@ -376,6 +385,8 @@ extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame) {
 /// with `IF` clear (these are interrupt gates, not trap gates), so it cannot
 /// nest.
 extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
+    // A tick can land inside a `stac` window; the scheduler must not inherit it.
+    crate::uaccess::clac_if_enabled();
     crate::lapic::on_tick();
     // Preemption. EOI has already been sent, so the LAPIC can deliver the next
     // tick to whichever task runs after this returns.
