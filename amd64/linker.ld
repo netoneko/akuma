@@ -47,6 +47,15 @@ SECTIONS
      * kernel is booted at all. */
     .note.Xen : { KEEP(*(.note.Xen)) } :note
 
+    /* The multiboot2 header, for GRUB. Must be 8-byte aligned and inside the
+     * first 32 KiB of the FILE, which here means "immediately after the note" —
+     * a few hundred bytes in, with the ELF header and program headers ahead of
+     * it. KEEP for the same reason the note is kept: no Rust symbol references
+     * it, and --gc-sections would otherwise drop the structure that decides
+     * whether the image can be booted from GRUB at all. */
+    . = ALIGN(8);
+    .multiboot2 : { KEEP(*(.multiboot2)) } :boot
+
     . = ALIGN(0x1000);
     .boot : {
         KEEP(*(.text.boot))

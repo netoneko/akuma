@@ -67,6 +67,9 @@ mod loader;
 mod mem;
 #[cfg(target_arch = "x86_64")]
 mod mm;
+/// The GRUB/multiboot2 entry and its framebuffer console — the bare-metal way
+/// in, used when there is no VMM and no serial port.
+mod multiboot2;
 #[cfg(target_arch = "x86_64")]
 mod net;
 #[cfg(target_arch = "x86_64")]

@@ -1,0 +1,10 @@
+[package]
+name = "akuma-fbcon"
+version = "0.1.0"
+edition = "2024"
+description = "A text console over a linear framebuffer: 8x8 font, integer scaling, overscan margin, and scrolling that never reads back from video memory."
+
+[lints]
+workspace = true
+
+[dependencies]
