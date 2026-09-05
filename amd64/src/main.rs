@@ -198,12 +198,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     let machine = machine::describe(hvm_start_info);
     machine::report(&machine);
 
-    // PCI enumeration. Pure port I/O, so it needs nothing but the console —
-    // before `mem::init` is fine. On this (VMM) path it finds nothing, which is
-    // correct: the devices are virtio-MMIO. It is here so the one code path
-    // runs on both entries.
-    pci::scan();
-    pci::report();
+    // No PCI enumeration on this path. PVH means a VMM, and the VMMs this
+    // target runs under (Firecracker, QEMU `microvm`) present every device as
+    // virtio-MMIO — there is no PCI bus to walk. Worse, Firecracker does not
+    // emulate the `0xCF8`/`0xCFC` config ports at all: reads return garbage
+    // rather than the all-ones an absent bus gives on real hardware, so a scan
+    // there invents devices. Enumeration lives on the bare-metal
+    // (`multiboot2.rs`) path only.
 
     if !mem::init(&machine) {
         serial::puts("\nAkuma/amd64 — memory bring-up FAILED\n");
@@ -261,7 +262,6 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         lapic::stop_timer();
     }
 
-    pci::smoke_test(&mut t);
     reboot::smoke_test(&mut t);
     blk::smoke_test(&mut t, have_disk);
     fs::smoke_test(&mut t, have_fs);

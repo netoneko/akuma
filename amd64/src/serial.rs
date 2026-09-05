@@ -225,6 +225,19 @@ pub fn put_hex(mut val: u64) {
     }
 }
 
+/// Emit the low `nibbles` hex digits of `val`, zero-padded, no `0x`.
+///
+/// For fields that are not addresses — a PCI class byte, a 16-bit vendor id, a
+/// MAC octet — where the full 16-digit [`put_hex`] is noise.
+pub fn put_hexn(val: u64, nibbles: u32) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let n = nibbles.clamp(1, 16);
+    let _g = lock();
+    for shift in (0..n).rev() {
+        putb_raw(DIGITS[((val >> (shift * 4)) & 0xF) as usize]);
+    }
+}
+
 /// Emit a `u64` in decimal.
 pub fn put_dec(val: u64) {
     if val == 0 {

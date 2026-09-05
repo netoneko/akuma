@@ -2056,11 +2056,17 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         let devfd = sys_openat(0, devp.as_ptr() as u64, 0, 0);
         t.check("fd: /proc/net/dev opens", devfd >= FIRST_FILE_FD as u64);
         if devfd >= FIRST_FILE_FD as u64 {
-            let mut d = [0u8; 256];
+            // Both interface rows sit past the ~195-byte two-line header, so
+            // the buffer has to be generous — `busybox ifconfig` reads the
+            // whole file.
+            let mut d = [0u8; 512];
             let n = sys_read(devfd, d.as_mut_ptr() as u64, d.len() as u64);
+            let text = &d[..n.min(d.len() as u64) as usize];
             t.check(
                 "fd: /proc/net/dev lists lo and eth0",
-                n > 0 && d[..n as usize].windows(4).any(|w| w == b"eth0"),
+                n > 0
+                    && text.windows(3).any(|w| w == b"lo:")
+                    && text.windows(5).any(|w| w == b"eth0:"),
             );
             sys_close(devfd);
         }

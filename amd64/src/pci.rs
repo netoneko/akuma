@@ -228,15 +228,15 @@ pub fn report() {
         serial::puts("    ");
         put_bdf(d.addr);
         serial::puts("  ");
-        serial::put_hex(u64::from(d.header.vendor_id));
+        serial::put_hexn(u64::from(d.header.vendor_id), 4);
         serial::puts(":");
-        serial::put_hex(u64::from(d.header.device_id));
+        serial::put_hexn(u64::from(d.header.device_id), 4);
         serial::puts("  class ");
-        serial::put_hex(u64::from(d.header.class_code));
+        serial::put_hexn(u64::from(d.header.class_code), 2);
         serial::puts("/");
-        serial::put_hex(u64::from(d.header.subclass));
+        serial::put_hexn(u64::from(d.header.subclass), 2);
         serial::puts("/");
-        serial::put_hex(u64::from(d.header.prog_if));
+        serial::put_hexn(u64::from(d.header.prog_if), 2);
         if d.header.is_xhci() {
             serial::puts("  [xHCI]");
         } else if d.header.is_ehci() {
@@ -273,11 +273,11 @@ pub fn report() {
 }
 
 fn put_bdf(addr: Address) {
-    serial::put_hex(u64::from(addr.bus));
+    serial::put_hexn(u64::from(addr.bus), 2);
     serial::puts(":");
-    serial::put_hex(u64::from(addr.device));
+    serial::put_hexn(u64::from(addr.device), 2);
     serial::puts(".");
-    serial::put_hex(u64::from(addr.function));
+    serial::put_hexn(u64::from(addr.function), 1);
 }
 
 /// Verify the enumeration ran and parsed something coherent.

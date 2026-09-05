@@ -323,15 +323,15 @@ pub fn probe_ethernet() {
         return;
     };
     serial::puts("  nic:  ");
-    serial::put_hex(u64::from(dev.header.vendor_id));
+    serial::put_hexn(u64::from(dev.header.vendor_id), 4);
     serial::puts(":");
-    serial::put_hex(u64::from(dev.header.device_id));
+    serial::put_hexn(u64::from(dev.header.device_id), 4);
     serial::puts(" at ");
-    serial::put_hex(u64::from(dev.addr.bus));
+    serial::put_hexn(u64::from(dev.addr.bus), 2);
     serial::puts(":");
-    serial::put_hex(u64::from(dev.addr.device));
+    serial::put_hexn(u64::from(dev.addr.device), 2);
     serial::puts(".");
-    serial::put_hex(u64::from(dev.addr.function));
+    serial::put_hexn(u64::from(dev.addr.function), 1);
 
     crate::pci::enable(dev.addr, true);
 
@@ -351,19 +351,25 @@ pub fn probe_ethernet() {
         return;
     };
 
-    // IDR0..IDR5 — the MAC — sit at register offset 0. A device-mapped read.
-    let mut mac = [0u8; 6];
-    for (i, b) in mac.iter_mut().enumerate() {
-        // SAFETY: `regs` is the just-mapped, device-attributed BAR of the NIC
-        // enumerated above; offsets 0..6 are the read-only ID registers.
-        *b = unsafe { regs.add(i).read_volatile() };
-    }
-    serial::puts(" mac ");
-    for (i, b) in mac.iter().enumerate() {
-        if i != 0 {
-            serial::puts(":");
+    // On a Realtek RTL8168/8169 the MAC (IDR0..IDR5) is at register offset 0,
+    // so a read there confirms the BAR mapping end to end. Other NICs
+    // (QEMU's e1000) keep the MAC elsewhere — just report the BAR is mapped.
+    if dev.header.vendor_id == 0x10ec {
+        serial::puts(" mac ");
+        for i in 0..6u8 {
+            if i != 0 {
+                serial::puts(":");
+            }
+            // SAFETY: `regs` is the just-mapped, device-attributed BAR of the
+            // Realtek NIC enumerated above; offsets 0..6 are the read-only ID
+            // registers.
+            let b = unsafe { regs.add(i as usize).read_volatile() };
+            serial::put_hexn(u64::from(b), 2);
         }
-        serial::put_hex(u64::from(*b));
+    } else {
+        serial::puts(" BAR");
+        serial::put_dec(u64::from(idx));
+        serial::puts(" mapped");
     }
     serial::puts("  (driver not wired)\n");
 }

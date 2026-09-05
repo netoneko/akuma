@@ -752,3 +752,29 @@ here; `poweroff` halts (no ACPI PM block). `akuma-boot` grew a `psci` feature
 (default on) so the amd64 port can reach `decode` without the AArch64
 `smc`/`hvc` asm. Decode + the `EINVAL` path are self-tested; the reset itself is
 a by-hand check on the box.
+
+## Verified on the box, and staged
+
+2026-09-05, on `vaporwave`, all three environments:
+
+| environment | result |
+|---|---|
+| QEMU `microvm` (PVH) | **212/212**; `busybox ifconfig` prints `eth0` (DHCP addr) + `lo` |
+| Firecracker (PVH) | **212/212**; no config-port noise |
+| OVMF + KVM + GRUB (bare-metal path, q35) | **178/178**; `pci: 6 function(s)` with BARs (host bridge, VGA, e1000, ISA bridge, AHCI, SMBus); framebuffer console clean; `busybox uname -a` prints |
+
+Two bugs fixed in the process: `pci::scan()` must run on the multiboot2 path
+**only** (Firecracker returns garbage for `0xCF8`/`0xCFC`, inventing 48 fake
+devices and flooding its log — it does not emulate those ports); and a
+self-test's `/proc/net/dev` read buffer was smaller than the file's header.
+
+**Staged**: `/boot/akuma/akuma-amd64` + `root.img` replaced (old kept as
+`.bak-20260905-182952`), `grub-reboot` armed for `Akuma/amd64 (busybox uname
+-a)` — next boot runs Akuma once (self-tests + PCI dump + `uname -a`), the boot
+after returns to Ubuntu.
+
+**`busybox ifconfig` does not work on the bare-metal path yet** — it dies at
+`socket(AF_INET)` because `kmain_mb2` runs no `net::init` (no NIC, and
+`smoltcp_net::init` currently requires a virtio-net device). So the hands-off
+GRUB entry stays `uname -a`. The earlier "`uname` showed nothing" was a stale
+kernel/disk on the box, not a code bug — it prints correctly now.

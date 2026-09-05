@@ -314,6 +314,13 @@ laptop. `net::probe_ethernet()` uses it after the self-tests to find the NIC,
 enable it, map its BAR and read the MAC off the hardware; the RTL8169 driver
 bring-up (`akuma-net-rtl8169`, already host-tested) is the next step.
 
+**The PVH path (`kmain`) does not scan.** Firecracker does not emulate the
+config ports at all — a read there returns *garbage*, not the all-ones a bare
+bus gives on real hardware or QEMU, so a scan would invent devices and flood
+Firecracker's own log. Verified 2026-09-05: bare metal via OVMF/q35 finds 6
+functions with their BARs; `microvm` and Firecracker (PVH) run the scan-free
+path at 212/212.
+
 ## Reboot
 
 `reboot(2)` (x86_64 169) is wired: `akuma-boot::decode` — the same ABI decode
@@ -386,11 +393,16 @@ What amd64 *does* use, and what each replaced:
 by the same command-line discovery the disk uses — another slot in the same
 array (on bare metal, [PCI](#pci) instead).
 
-`busybox ifconfig` works: `src/fd.rs` answers the read-only `SIOCGIF*` ioctls
-and serves a generated `/proc/net/dev`, both through `akuma-syscalls-net` — the
-same `struct ifreq` / column layout the aarch64 kernel uses, extracted so the
-two cannot drift on the 40-byte record stride that once broke `ifconfig -a`.
-Read-only: no `SIOCSIF*`, no netlink.
+`busybox ifconfig` works **where the stack is up** (`microvm`, Firecracker):
+`src/fd.rs` answers the read-only `SIOCGIF*` ioctls and serves a generated
+`/proc/net/dev`, both through `akuma-syscalls-net` — the same `struct ifreq` /
+column layout the aarch64 kernel uses, extracted so the two cannot drift on the
+40-byte record stride that once broke `ifconfig -a`. Read-only: no `SIOCSIF*`,
+no netlink. On the **bare-metal** path `ifconfig` still dies at
+`socket(AF_INET)`: `kmain_mb2` never calls `net::init` (no NIC, and
+`akuma_net::smoltcp_net::init` requires a virtio-net device), so there is no
+socket layer. Fixing that means either the RTL8169 driver or a loopback-only
+`akuma-net` init.
 
 ```bash
 amd64/run.sh                       # NIC on virtio-mmio-bus.1, port 8080 forwarded
