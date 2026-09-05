@@ -41,10 +41,13 @@ ssh akuma "<test>"
 refuses without it. `/proc` exists as an empty directory now, but `-f` skips the
 check entirely and is what makes this unattended.
 
-A helper that knows both personalities and can wait for either is in the
-session scratchpad as `box.py` (`which_system()`, `wait_for()`, `push()`).
-**Ask which system is running — never assume.** Every confusing failure in this
-loop has started with talking to the wrong one.
+A helper that knows both personalities lives at
+[`scripts/utils/hpbox.py`](../../scripts/utils/hpbox.py): `which_system()`,
+`wait_for()`, `reboot_to()`, `push()`, `ubuntu()`, `akuma()`, plus a CLI
+(`python3 scripts/utils/hpbox.py which` / `wait akuma` / `ak '<cmd>'` /
+`ub '<cmd>'` / `reboot-to ubuntu`). **Ask which system is running — never
+assume.** Every confusing failure in this loop has started with talking to the
+wrong one.
 
 ## Rules that cost time to learn
 

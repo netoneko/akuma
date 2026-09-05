@@ -276,24 +276,13 @@ fn attempt_sntp(timeout_us: u64) -> SyncOutcome {
     // see that module's own header for why: the latter hung indefinitely the
     // first time this feature tried it, on a hostname that resolves in
     // seconds through this target's other, already-proven DNS path.
-    let Some(ip) = crate::dns::resolve_a(NTP_HOST, NTP_TIMEOUT_US) else {
-        serial::puts("  clock: could not resolve ");
-        serial::puts(NTP_HOST);
-        serial::puts(" via ");
-        for (i, o) in akuma_net::smoltcp_net::static_ipv4().dns.iter().enumerate() {
-            if i > 0 {
-                serial::puts(".");
-            }
-            serial::put_dec(u64::from(*o));
-        }
-        serial::puts(" — no wall clock this boot\n");
-        return;
+    let Some(ip) = crate::dns::resolve_a(NTP_HOST, timeout_us) else {
+        return SyncOutcome::DnsFailed;
     };
     let server = SocketAddrV4::new(ip, akuma_sntp::sntp::NTP_PORT);
 
     let Some(idx) = akuma_net::socket::alloc_socket(SOCK_DGRAM) else {
-        serial::puts("  clock: no socket free for SNTP\n");
-        return;
+        return SyncOutcome::NoSocket;
     };
 
     let mut send = |req: &[u8]| akuma_net::socket::socket_send_udp(idx, req, server).is_ok();
@@ -319,19 +308,15 @@ fn attempt_sntp(timeout_us: u64) -> SyncOutcome {
         yield_now: &mut yield_now,
     };
 
-    let result = bootstrap_over_udp(&mut effects, NTP_TIMEOUT_US);
+    let result = bootstrap_over_udp(&mut effects, timeout_us);
     akuma_net::socket::remove_socket(idx);
 
     match result {
         Ok(r) => {
             ANCHOR_UNIX_US.store(r.unix_epoch_us.max(1), Ordering::Relaxed);
             ANCHOR_UPTIME_US.store(r.anchor_uptime_us, Ordering::Relaxed);
-            serial::puts("  clock: synced via SNTP (");
-            serial::puts(NTP_HOST);
-            serial::puts(")\n");
+            SyncOutcome::Ok
         }
-        Err(_) => {
-            serial::puts("  clock: SNTP round trip failed — no wall clock this boot\n");
-        }
+        Err(_) => SyncOutcome::NoReply,
     }
 }

@@ -440,6 +440,12 @@ extern "C" fn netpoll_daemon() -> ! {
     let mut next_us = 0u64;
     loop {
         drain_step();
+        // Keep trying SNTP until the wall clock is set. `sync_tick` is a no-op
+        // once synced and self-rate-limits otherwise, so this costs a relaxed
+        // load per lap in the common case. It is here, not in a task of its own,
+        // for the same reason the probe is: one fewer thing the scheduler has to
+        // keep alive, and it runs exactly when the network is being driven.
+        crate::clock::sync_tick();
         let laps = NETPOLL_LAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         if PROBE_ON.load(core::sync::atomic::Ordering::Relaxed) {
             let now = uptime_us();
@@ -573,6 +579,24 @@ pub fn print_probe_line(now_us: u64, laps: u64) {
             serial::puts(".");
         }
         serial::put_dec(u64::from(*o));
+    }
+    // Wall-clock state: `set` once SNTP (or a userspace `date -s`) has anchored
+    // it, otherwise the last SNTP failure and how many attempts in. This is how
+    // "date still says 1970" gets diagnosed from across the room.
+    serial::puts(" clk=");
+    if crate::clock::is_synced() {
+        serial::puts("set");
+    } else {
+        let (outcome, tries) = crate::clock::sync_status();
+        serial::puts(match outcome {
+            crate::clock::SyncOutcome::Untried => "untried",
+            crate::clock::SyncOutcome::Ok => "set",
+            crate::clock::SyncOutcome::DnsFailed => "dns-fail",
+            crate::clock::SyncOutcome::NoSocket => "no-sock",
+            crate::clock::SyncOutcome::NoReply => "no-reply",
+        });
+        serial::puts("/try");
+        serial::put_dec(tries);
     }
     serial::puts("\n");
 

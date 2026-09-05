@@ -25,23 +25,36 @@
 use akuma_net::socket::socket_const::SOCK_DGRAM;
 use akuma_net::socket::SocketAddrV4;
 
-/// The resolver to query: whatever the interface was brought up with.
+/// Public fallback resolvers, tried in order after the configured one.
+/// Cloudflare then Google — the two that a `-netdev user` slirp NATs straight
+/// through and that a household router almost never blocks.
+const FALLBACK_RESOLVERS: [[u8; 4]; 2] = [[1, 1, 1, 1], [8, 8, 8, 8]];
+
+/// The resolvers to try, in order: the one the interface was brought up with
+/// first, then [`FALLBACK_RESOLVERS`] (skipping a duplicate of the first).
 ///
-/// This used to be a hardcoded `10, 0, 2, 3` — QEMU usermode `-netdev user`'s
+/// The configured resolver used to be a hardcoded `10.0.2.3` — QEMU usermode's
 /// fixed DNS proxy, the address `amd64/mkdisk.sh` writes into the guest's
-/// `/etc/resolv.conf` and Firecracker's dnsmasq answers on. That is correct
-/// for every VMM target and **wrong for bare metal**, where nothing answers on
-/// `10.0.2.3`: `amd64/src/net.rs`'s `BARE_METAL_STATIC_V4` seeds the resolver
-/// as Cloudflare's `1.1.1.1` instead (or whatever an `ip=…,<dns>` boot token
-/// overrides it to). A hardcoded `10.0.2.3` here meant `hget`'s syscall-300
-/// DNS and `clock.rs`'s SNTP bootstrap both sent every query into a black hole
-/// on the HP box while musl userspace — which reads `/etc/resolv.conf` and
-/// falls through to `1.1.1.1` — resolved the same names fine.
-///
-/// `akuma_net::smoltcp_net::static_ipv4()` is the single source of truth the
-/// smoltcp DNS socket is also seeded from (`smoltcp_net::init`).
-fn dns_server() -> SocketAddrV4 {
-    SocketAddrV4::new(akuma_net::smoltcp_net::static_ipv4().dns, 53)
+/// `/etc/resolv.conf`. Correct for a VMM, a **black hole on bare metal**, where
+/// `amd64/src/net.rs`'s `BARE_METAL_STATIC_V4` seeds it as `1.1.1.1` instead.
+/// Now it comes from `akuma_net::smoltcp_net::static_ipv4()` — the single source
+/// of truth the smoltcp DNS socket is seeded from too — and the fallbacks cover
+/// the other half of the problem: a *configured* resolver that answers some
+/// names and `NXDOMAIN`s others (measured 2026-09-06: the HP box's own uplink
+/// resolver, reached through slirp, does exactly this for `example.com` while
+/// resolving `pool.ntp.org` fine — so `resolve_a` for one name has to be able
+/// to walk past it to a server that will answer).
+fn resolvers() -> ([[u8; 4]; 3], usize) {
+    let configured = akuma_net::smoltcp_net::static_ipv4().dns;
+    let mut list = [[0u8; 4]; 3];
+    let mut n = 0;
+    for r in core::iter::once(configured).chain(FALLBACK_RESOLVERS) {
+        if !list[..n].contains(&r) {
+            list[n] = r;
+            n += 1;
+        }
+    }
+    (list, n)
 }
 
 /// Largest query or response this client will build or accept. A hostname
@@ -122,81 +135,126 @@ fn skip_name(resp: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-/// Parse a response, validating it answers `id`, and return the first A
-/// record's address.
-fn parse_response(resp: &[u8], id: u16) -> Option<[u8; 4]> {    if resp.len() < 12 {
-        return None;
+/// What a received datagram means for the query in flight.
+enum ParseResult {
+    /// An A record — resolution is done.
+    Answer([u8; 4]),
+    /// A valid response from this server with no usable A record: `NXDOMAIN`,
+    /// `NOERROR` with an empty/AAAA-only answer, or `SERVFAIL`. Nothing more
+    /// will come from *this* server — move to the next resolver rather than
+    /// waiting out the timeout.
+    NoRecord,
+    /// Not an answer to this query (wrong id, QR clear, truncated). Ignore it
+    /// and keep waiting.
+    Ignore,
+}
+
+/// Classify a response datagram against the query `id`.
+fn parse_response(resp: &[u8], id: u16) -> ParseResult {
+    let bad = ParseResult::Ignore;
+    if resp.len() < 12 {
+        return bad;
     }
-    if u16::from_be_bytes(resp[0..2].try_into().ok()?) != id {
-        return None;
+    let Ok(rid) = resp[0..2].try_into().map(u16::from_be_bytes) else { return bad };
+    if rid != id {
+        return bad;
     }
-    let flags = u16::from_be_bytes(resp[2..4].try_into().ok()?);
+    let Ok(flags) = resp[2..4].try_into().map(u16::from_be_bytes) else { return bad };
     if flags & 0x8000 == 0 {
-        return None; // QR bit clear: not a response
+        return bad; // QR clear: not a response
     }
     if flags & 0x000F != 0 {
-        return None; // RCODE != 0: server-side error (NXDOMAIN and friends)
+        return ParseResult::NoRecord; // NXDOMAIN / SERVFAIL / REFUSED
     }
-    let qdcount = u16::from_be_bytes(resp[4..6].try_into().ok()?);
-    let ancount = u16::from_be_bytes(resp[6..8].try_into().ok()?);
+    let Ok(qdcount) = resp[4..6].try_into().map(u16::from_be_bytes) else { return bad };
+    let Ok(ancount) = resp[6..8].try_into().map(u16::from_be_bytes) else { return bad };
 
-    // Skip the question section (echoed back) to reach the answers.
     let mut pos = 12;
     for _ in 0..qdcount {
-        pos = skip_name(resp, pos)?;
-        pos += 4; // QTYPE + QCLASS
+        let Some(p) = skip_name(resp, pos) else { return bad };
+        pos = p + 4; // QTYPE + QCLASS
     }
-
     for _ in 0..ancount {
-        pos = skip_name(resp, pos)?;
-        let rtype = u16::from_be_bytes(resp.get(pos..pos + 2)?.try_into().ok()?);
-        let rdlength = u16::from_be_bytes(resp.get(pos + 8..pos + 10)?.try_into().ok()?) as usize;
+        let Some(p) = skip_name(resp, pos) else { return bad };
+        pos = p;
+        let Some(rtype) = resp.get(pos..pos + 2).and_then(|b| b.try_into().ok()).map(u16::from_be_bytes)
+        else {
+            return bad;
+        };
+        let Some(rdlength) = resp
+            .get(pos + 8..pos + 10)
+            .and_then(|b| b.try_into().ok())
+            .map(|b| u16::from_be_bytes(b) as usize)
+        else {
+            return bad;
+        };
         let rdata_start = pos + 10;
         if rtype == 1 && rdlength == 4 {
-            // TYPE A, a real 4-byte IPv4 address.
-            let addr = resp.get(rdata_start..rdata_start + 4)?;
-            return Some([addr[0], addr[1], addr[2], addr[3]]);
+            if let Some(a) = resp.get(rdata_start..rdata_start + 4) {
+                return ParseResult::Answer([a[0], a[1], a[2], a[3]]);
+            }
+            return bad;
         }
         pos = rdata_start + rdlength;
     }
-    None
+    ParseResult::NoRecord // a valid NOERROR response, just no A record
 }
 
 /// Resolve `hostname` to an IPv4 address, blocking (via `poll`+non-blocking
-/// receive, like every other wait loop on this target) for up to
-/// `timeout_us` of [`crate::net::uptime_us`].
+/// receive, like every other wait loop on this target) for up to `timeout_us`
+/// of [`crate::net::uptime_us`] **total**, split evenly across the resolvers in
+/// [`resolvers`].
 ///
-/// The query is **retransmitted** every [`RETRANSMIT_US`] until the timeout:
-/// this used to be a single send, and a single lost datagram was a failed
-/// resolution — which for [`crate::clock::sync_via_sntp`] meant "no wall
-/// clock this boot", which meant every TLS certificate in sight failed date
-/// validation. The likeliest loss is the very first packet after boot, while
-/// the gateway's ARP entry is still being resolved; a 1.5 s retransmit rides
-/// through that and through ordinary datagram loss alike.
+/// Within one resolver the query is **retransmitted** every [`RETRANSMIT_US`]:
+/// a single lost datagram used to be a failed resolution, which for
+/// [`crate::clock::sync_via_sntp`] meant no wall clock and every TLS handshake
+/// failing date validation. Across resolvers it walks the list on a timeout or
+/// an `NXDOMAIN` — see [`resolvers`] for why a configured resolver that answers
+/// some names and not others is a real case here.
 pub fn resolve_a(hostname: &str, timeout_us: u64) -> Option<[u8; 4]> {
     let mut query_buf = [0u8; MAX_PACKET];
     // The uptime reading doubles as the query ID's low bits — good enough
-    // entropy for "do not accept a stale reply to a different query", which
-    // is all a 16-bit ID buys against an off-path guess anyway.
+    // entropy for "do not accept a stale reply to a different query".
     let id = crate::net::uptime_us() as u16;
-    let len = build_query(id, hostname, &mut query_buf)?;
+    let Some(len) = build_query(id, hostname, &mut query_buf) else {
+        fail("name does not encode");
+        return None;
+    };
 
-    let server = dns_server();
-    let idx = akuma_net::socket::alloc_socket(SOCK_DGRAM)?;
-    let send_query = || akuma_net::socket::socket_send_udp(idx, &query_buf[..len], server).is_ok();
+    let Some(idx) = akuma_net::socket::alloc_socket(SOCK_DGRAM) else {
+        fail("no UDP socket free");
+        return None;
+    };
 
-    let result = if send_query() {
+    let (list, count) = resolvers();
+    let per_server = (timeout_us / count as u64).max(500_000);
+
+    let mut answer = None;
+    let mut resp_buf = [0u8; MAX_PACKET];
+    'servers: for dns in &list[..count] {
+        let server = SocketAddrV4::new(*dns, 53);
+        let send_query = || akuma_net::socket::socket_send_udp(idx, &query_buf[..len], server).is_ok();
+        if !send_query() {
+            continue;
+        }
         let start = crate::net::uptime_us();
         let mut last_send = start;
-        let mut resp_buf = [0u8; MAX_PACKET];
         loop {
             akuma_net::smoltcp_net::poll();
             if let Ok((n, _from)) = akuma_net::socket::socket_recv_udp(idx, &mut resp_buf, true) {
-                break parse_response(&resp_buf[..n], id);
+                match parse_response(&resp_buf[..n], id) {
+                    ParseResult::Answer(ip) => {
+                        answer = Some(ip);
+                        break 'servers;
+                    }
+                    ParseResult::NoRecord => continue 'servers,
+                    ParseResult::Ignore => {}
+                }
             }
             let now = crate::net::uptime_us();
-            if now.saturating_sub(start) > timeout_us {
-                break None;
+            if now.saturating_sub(start) > per_server {
+                fail_at(server.ip, "no reply before timeout");
+                continue 'servers;
             }
             if now.saturating_sub(last_send) > RETRANSMIT_US {
                 let _ = send_query();
@@ -204,10 +262,34 @@ pub fn resolve_a(hostname: &str, timeout_us: u64) -> Option<[u8; 4]> {
             }
             crate::sched::yield_now();
         }
-    } else {
-        None
-    };
+    }
 
     akuma_net::socket::remove_socket(idx);
-    result
+    if answer.is_none() {
+        fail("no resolver answered");
+    }
+    answer
+}
+
+/// One line naming why a resolution did not land — the difference between
+/// "DNS resolution failed" telling you nothing and telling you where to look.
+/// A failed DNS query is already a slow path, so the print is free.
+fn fail(why: &str) {
+    crate::serial::puts("  dns: ");
+    crate::serial::puts(why);
+    crate::serial::puts("\n");
+}
+
+/// [`fail`] naming the resolver that did not work out.
+fn fail_at(ip: [u8; 4], why: &str) {
+    crate::serial::puts("  dns: ");
+    for (i, o) in ip.iter().enumerate() {
+        if i > 0 {
+            crate::serial::puts(".");
+        }
+        crate::serial::put_dec(u64::from(*o));
+    }
+    crate::serial::puts(": ");
+    crate::serial::puts(why);
+    crate::serial::puts("\n");
 }
