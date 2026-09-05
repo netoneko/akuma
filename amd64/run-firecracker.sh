@@ -62,7 +62,12 @@ scp -q -o StrictHostKeyChecking=no -i "$FC_KEY" "$KERNEL" "$FC_HOST:$FC_DIR/akum
 DRIVES_JSON="[]"
 if [ -z "$DISK" ]; then
     DISK=target/x86_64-unknown-none/release/amd64-root.img
-    sh "$HERE/mkdisk.sh" "$DISK" 8 >/dev/null
+    # 128, matching `run.sh` and `mkdisk.sh`'s own default. This said 8 until
+    # 2026-09-05, from before the image grew to hold busybox/apk/sshd: the
+    # build silently ran out of space and the guest failed 13 self-tests with
+    # "bad ELF identification" and "persist failed: no space" — none of which
+    # named the disk. The QEMU path never saw it because `run.sh` was updated.
+    sh "$HERE/mkdisk.sh" "$DISK" 128 >/dev/null
 fi
 [ "$DISK" = "none" ] && DISK=""
 if [ -n "$DISK" ]; then

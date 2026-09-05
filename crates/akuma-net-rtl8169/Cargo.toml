@@ -1,0 +1,24 @@
+[package]
+name = "akuma-net-rtl8169"
+version = "0.1.0"
+edition = "2024"
+description = "Realtek RTL8169/8168/8111 gigabit NIC: register map, descriptor rings and the bring-up sequence as pure logic over a caller-supplied register/DMA interface."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[features]
+default = []
+# The simulated chip (`model`) is compiled for tests always; this feature also
+# exposes it to *other* crates, so a consumer's own integration tests can drive
+# a fake NIC without real hardware.
+model = []
+
+# Integration tests are external consumers of this crate, so `cfg(test)` does
+# not reach the library they link. Depending on ourselves with `model` on is the
+# standard way to turn a test-only module on for `cargo test` and leave it out
+# of a kernel build.
+[dev-dependencies]
+akuma-net-rtl8169 = { path = ".", features = ["model"] }
