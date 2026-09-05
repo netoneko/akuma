@@ -21,10 +21,25 @@
 //! write-only.
 //!
 //! **Scale the font from the resolution, do not pick a size.** The same kernel
-//! boots on a 1024x768 monitor and a 4K television. An 8-pixel glyph is 3 mm on
-//! one and 0.6 mm on the other. [`Console::auto_scale`] picks an integer
-//! multiplier targeting a readable number of rows, so one small font serves
-//! both and there is no second font table to keep in agreement.
+//! boots on a 1024x768 monitor and a 4K television. A 24-pixel glyph is 9 mm on
+//! one and 1.8 mm on the other. [`Console::auto_scale`] picks an integer
+//! multiplier targeting a readable number of rows, so one font table serves
+//! every screen and there is no per-resolution set to keep in agreement.
+//!
+//! **Anti-alias the glyphs.** [`font`] stores a coverage value per pixel rather
+//! than a bit, and [`Rgb::blend`] mixes the edge pixels. That is what lets the
+//! default font be [`font::JETBRAINS_MONO`] — an outline face drawn for screens
+//! — instead of a bitmap font drawn for a fixed cell. A 1-bit rasterization of
+//! such a face has visibly uneven stems, which is the failure that makes
+//! outline fonts look wrong on a console and gets blamed on the font.
+//!
+//! **Fall back rather than wrap.** The default font's 12x24 cell is worth
+//! having wherever it fits, and on a small framebuffer it does not: the scale
+//! is already 1 and cannot go lower, so an XGA screen gets 78 columns and every
+//! long log line wraps. [`Console::new`] therefore *picks* — the 8x16
+//! [`font::SPLEEN`] whenever the default cannot reach 80 columns by 24 rows.
+//! See [`console::choose_font`](Console::choose_font); every other constructor
+//! names its font and takes no such decision.
 //!
 //! **Leave a margin.** Televisions overscan: they crop a few percent off every
 //! edge and show the rest, a habit inherited from analogue broadcast that HDMI
@@ -79,6 +94,31 @@ impl Rgb {
     pub const BAD: Self = Self::new(0xE0, 0x50, 0x50);
     /// Headings and framing.
     pub const ACCENT: Self = Self::new(0x60, 0xA0, 0xE0);
+
+    /// `self` mixed toward `fg`, where `coverage` 0 is all `self` and 255 all
+    /// `fg`.
+    ///
+    /// This is what makes an outline font readable at a console's size. A glyph
+    /// edge covers part of a pixel, and drawing that pixel as either wholly ink
+    /// or wholly background is what gives a 1-bit rasterization its uneven
+    /// stems — the same vertical stroke lands on a pixel boundary in `l` and
+    /// half across one in `d`, so one comes out a pixel wide and the other two.
+    ///
+    /// Integer arithmetic, rounded rather than truncated: truncating leaves
+    /// full coverage one short of `fg`, so a solid glyph interior comes out a
+    /// shade off the colour that was asked for.
+    #[must_use]
+    pub const fn blend(self, fg: Self, coverage: u8) -> Self {
+        const fn mix(bg: u8, fg: u8, coverage: u8) -> u8 {
+            let (bg, fg, c) = (bg as u32, fg as u32, coverage as u32);
+            ((fg * c + bg * (255 - c) + 127) / 255) as u8
+        }
+        Self {
+            r: mix(self.r, fg.r, coverage),
+            g: mix(self.g, fg.g, coverage),
+            b: mix(self.b, fg.b, coverage),
+        }
+    }
 }
 
 /// Somewhere pixels can be written.

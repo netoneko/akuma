@@ -23,3 +23,6 @@
 [submodule "crates/akuma-fbcon/vendor/spleen"]
 	path = crates/akuma-fbcon/vendor/spleen
 	url = https://github.com/fcambus/spleen
+[submodule "crates/akuma-fbcon/vendor/jetbrains-mono"]
+	path = crates/akuma-fbcon/vendor/jetbrains-mono
+	url = https://github.com/JetBrains/JetBrainsMono

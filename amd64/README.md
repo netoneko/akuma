@@ -199,7 +199,33 @@ exposes, and it is `serial.rs`'s only target. There is no VGA path.
 
 On a bare-metal (GRUB/multiboot2) boot there is no UART at all on the reference
 box, so `serial::puts` mirrors to a **framebuffer text console** (`akuma-fbcon`,
-via GRUB's framebuffer tag). Input there is the harder half: the box's keyboard
+via GRUB's framebuffer tag). It draws **JetBrains Mono** at 12x24, anti-aliased,
+baked from the upstream TTF by that crate's `build.rs`.
+
+It falls back to **Spleen** 8x16 when the mode GRUB set is too small for that
+cell to make a terminal — the console insists on 80x24 and the scale cannot help
+below 1, so an XGA screen would otherwise get 78 columns and wrap every long log
+line. The boundary in practice:
+
+| mode | font | grid |
+|---|---|---|
+| 640x480 | Spleen | 73x27 (80 columns needs all 640 px; no margin left) |
+| 800x600 | Spleen | 91x34 |
+| 1024x768 | Spleen | 117x44 |
+| 1280x720 and up | JetBrains Mono | 97x27 … 146x45 |
+
+`Console::new` is the only thing that chooses; `with_font` and `with_scale` take
+the caller's word. The bar is `MIN_COLS`/`MIN_ROWS` in `console.rs`.
+
+**Both fonts are git submodules** and neither table is checked in, so a fresh
+clone needs:
+
+```bash
+git submodule update --init crates/akuma-fbcon/vendor/jetbrains-mono
+git submodule update --init crates/akuma-fbcon/vendor/spleen
+```
+
+Input there is the harder half: the box's keyboard
 is USB and there is no HID stack. `crates/akuma-usb` is the host-tested parsing
 half of one — USB descriptors, the HID boot-keyboard report → ASCII decode, and
 the EHCI split-transaction queue-head layout — built against descriptors and

@@ -2,9 +2,19 @@
 name = "akuma-fbcon"
 version = "0.1.0"
 edition = "2024"
-description = "A text console over a linear framebuffer: 8x8 font, integer scaling, overscan margin, and scrolling that never reads back from video memory."
+description = "A text console over a linear framebuffer: anti-aliased bitmap fonts baked from JetBrains Mono and Spleen, integer scaling, overscan margin, and scrolling that never reads back from video memory."
 
 [lints]
 workspace = true
 
 [dependencies]
+
+[build-dependencies]
+# Rasterizing a TrueType outline is the one job here that is not worth writing
+# from scratch: curve flattening plus a correct nonzero-winding scanline fill is
+# several hundred lines of numerics, and getting it subtly wrong produces a font
+# that looks *almost* right. ab_glyph is small (ttf-parser plus a rasterizer, no
+# transitive fat) and runs on the host at build time only -- nothing here is
+# linked into the kernel.
+ab_glyph = "0.2"
+
