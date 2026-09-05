@@ -1,0 +1,13 @@
+[package]
+name = "akuma-xhci"
+version = "0.1.0"
+edition = "2024"
+description = "Pure xHCI (USB 3.0 host controller) layout and bit math for the amd64 bare-metal target: capability/operational/runtime register decode, TRB encode/decode + ring cycle-bit bookkeeping, 32/64-byte device-context builders, and the extended-capability + USBLEGSUP walk — host-tested against register values read off the reference machine, no controller required."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[features]
+default = []

@@ -104,9 +104,12 @@ dependencies = [
  "akuma-syscalls-net",
  "akuma-syscalls-poll",
  "akuma-terminal",
+ "akuma-usb",
+ "akuma-usb-storage",
  "akuma-user-access",
  "akuma-vfs",
  "akuma-virtio",
+ "akuma-xhci",
  "elf",
  "spinning_top",
 ]
@@ -648,6 +651,10 @@ name = "akuma-usb"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-usb-storage"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-user-access"
 version = "0.1.0"
 dependencies = [
@@ -693,6 +700,10 @@ dependencies = [
  "virtio-drivers",
  "zerocopy",
 ]
+
+[[package]]
+name = "akuma-xhci"
+version = "0.1.0"
 
 [[package]]
 name = "arm_pl031"

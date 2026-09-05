@@ -105,6 +105,8 @@ mod smp;
 #[cfg(target_arch = "x86_64")]
 mod sock;
 mod uaccess;
+#[cfg(target_arch = "x86_64")]
+mod xhci;
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(include_str!("boot.s"), options(att_syntax));

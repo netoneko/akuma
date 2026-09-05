@@ -1,0 +1,13 @@
+[package]
+name = "akuma-usb-storage"
+version = "0.1.0"
+edition = "2024"
+description = "Pure USB Mass Storage Bulk-Only Transport for the amd64 bare-metal disk: the 31-byte Command Block / 13-byte Command Status wrappers and the minimal SCSI command set (INQUIRY, TEST UNIT READY, READ CAPACITY(10), READ(10), WRITE(10), REQUEST SENSE) — encode/decode only, host-tested, the bulk transfers themselves left to the caller."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[features]
+default = []
