@@ -26,6 +26,10 @@ akuma-selftest = { path = "../crates/akuma-selftest" }
 # The framebuffer text console. The bare-metal reference machine has no UART at
 # all, so on a GRUB boot this is the only way the kernel can say anything.
 akuma-fbcon = { path = "../crates/akuma-fbcon" }
+# Parsing GRUB's information block. A crate, with tests, because the first
+# version of this parser lived in amd64/src/multiboot2.rs and had a one-byte
+# offset error that could only be found by rebooting the machine.
+akuma-multiboot2 = { path = "../crates/akuma-multiboot2" }
 # The Realtek RTL8169/8168/8111 driver, for the onboard NIC of the bare-metal
 # reference machine. Nothing calls it yet — that needs PCI enumeration — but it
 # belongs to this target, which is the only one with the part.

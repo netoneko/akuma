@@ -1,0 +1,10 @@
+[package]
+name = "akuma-multiboot2"
+version = "0.1.0"
+edition = "2024"
+description = "Parsing the multiboot2 information block GRUB leaves behind: tags, framebuffer geometry and pixel format, memory map, command line."
+
+[lints]
+workspace = true
+
+[dependencies]

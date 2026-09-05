@@ -16,9 +16,9 @@ use crate::{Rgb, Surface};
 /// A 4K screen at the smallest scale this crate will choose is under this; the
 /// grid is a fixed array because a kernel console must not depend on an
 /// allocator that may be what broke.
-pub const MAX_COLS: usize = 160;
+pub const MAX_COLS: usize = 128;
 /// Tallest grid the console will use.
-pub const MAX_ROWS: usize = 96;
+pub const MAX_ROWS: usize = 64;
 
 /// Target number of text rows [`Console::auto_scale`] aims for.
 ///
@@ -142,7 +142,12 @@ impl<S: Surface> Console<S> {
     pub fn clear(&mut self) {
         let (w, h) = (self.surface.width(), self.surface.height());
         self.surface.fill(0, 0, w, h, self.bg);
-        self.grid = [[b' '; MAX_COLS]; MAX_ROWS];
+        // Filled in place rather than assigned from a fresh array: the array
+        // literal is a temporary the size of the whole grid, and this runs on a
+        // boot stack that has no guard page beneath it.
+        for row in &mut self.grid {
+            row.fill(b' ');
+        }
         self.col = 0;
         self.row = 0;
     }
@@ -203,7 +208,7 @@ impl<S: Surface> Console<S> {
         for r in 1..self.rows {
             self.grid[r - 1] = self.grid[r];
         }
-        self.grid[self.rows - 1] = [b' '; MAX_COLS];
+        self.grid[self.rows - 1].fill(b' ');
 
         for r in 0..self.rows {
             for c in 0..self.cols {

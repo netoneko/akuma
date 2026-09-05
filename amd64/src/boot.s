@@ -69,6 +69,8 @@
  * UART, so a framebuffer is not decoration, it is the only console there is);
  * module alignment (so a GRUB module lands on a page boundary); end. */
 .set MB2_MAGIC,        0xE85250D6
+/* What a multiboot2 loader leaves in %eax. */
+.set MB2_BOOTLOADER_MAGIC, 0x36D76289
 .set MB2_ARCH_I386,    0
 
 .section .multiboot2, "a"
@@ -129,20 +131,48 @@ _start:
     cld
     movl $__boot_stack_top, %esp
 
-    /* Stash the hvm_start_info pointer somewhere `rep stosl` will not eat.
-     * It has to survive until the call to kmain, which wants it in %rdi. */
+    /* Stash the info-block pointer somewhere `rep stosl` will not eat. It has
+     * to survive until the call into Rust, which wants it in %rdi. */
     movl %ebx, %esi
-    movl $BOOT_PVH, %edx
+
+    /* Record the entry state in memory before anything can change it.
+     *
+     * On a board with no serial port there is no way to ask "what did the
+     * loader actually put in my registers?" -- and guessing the answer is what
+     * has cost this bring-up two reboots. These four bytes are readable from a
+     * VMM monitor (`xp/2wx <addr of __entry_eax>`) and, on hardware, by any
+     * later code that gets far enough to draw. */
+    movl %eax, __entry_eax
+    movl %ebx, __entry_ebx
+
+    /* WHICH LOADER BROUGHT US HERE, decided by the one register that can say.
+     *
+     * The multiboot2 header below carries an entry-address tag naming
+     * `_start_mb2`, and GRUB ignores it: for an **ELF** image the specification
+     * has the loader use `e_entry`, and the entry-address tag applies only
+     * alongside the address tag (the a.out kludge). So GRUB and the PVH loaders
+     * all arrive HERE, and a second entry point cannot be the thing that tells
+     * them apart.
+     *
+     * %eax can. Multiboot2 guarantees it holds 0x36D76289 at entry; the PVH ABI
+     * defines only %ebx and leaves %eax unspecified, so a PVH boot matching this
+     * exact value is a coincidence not worth designing against.
+     *
+     * Getting this wrong is expensive and quiet: GRUB jumped to `_start`, the
+     * PVH `kmain` ran, read the multiboot2 information block as an
+     * `hvm_start_info`, and reported the confusion over a serial port that does
+     * not exist on the machine. The screen stayed black through two reboots. */
+    cmpl $MB2_BOOTLOADER_MAGIC, %eax
+    je 4f
+    movl $BOOT_PVH, __boot_protocol
+    jmp common32
+4:
+    movl $BOOT_MULTIBOOT2, __boot_protocol
     jmp common32
 
-/* GRUB's entry. %eax holds 0x36D76289 and %ebx the multiboot2 info block.
- *
- * The magic is deliberately NOT checked here. There is nowhere to report a
- * failure to — no serial port on the target machine, and the framebuffer's
- * address is inside the very block the magic would be vouching for — so a
- * check could only halt silently, which is what a wrong-magic boot does
- * anyway. `kmain_mb2` validates the block itself, where a failure can at
- * least paint the screen. */
+/* Kept for loaders that do honour the entry-address tag, and because the tag
+ * naming it is still in the header. It does exactly what the magic check in
+ * `_start` does; GRUB never comes here. */
 .globl _start_mb2
 .type _start_mb2, @function
 _start_mb2:
@@ -150,7 +180,9 @@ _start_mb2:
     cld
     movl $__boot_stack_top, %esp
     movl %ebx, %esi
-    movl $BOOT_MULTIBOOT2, %edx
+    movl %eax, __entry_eax
+    movl %ebx, __entry_ebx
+    movl $BOOT_MULTIBOOT2, __boot_protocol
     jmp common32
 
 common32:
@@ -328,7 +360,22 @@ high_entry:
      * `hvm_start_info`, `kmain_mb2` reads a multiboot2 info structure. Handing
      * either the other's block is a boot that dereferences plausible garbage. */
     movl %esi, %edi
-    cmpl $BOOT_MULTIBOOT2, %edx
+
+    /* Read the protocol back out of MEMORY, not out of a register.
+     *
+     * It used to live in %edx, and %edx does not survive the trip: enabling
+     * long mode reads EFER with `rdmsr`, which returns its result in EDX:EAX
+     * and destroys whatever was there. Every boot therefore looked like a PVH
+     * boot, GRUB's information block was parsed as an `hvm_start_info`, and the
+     * confusion was reported over a serial port the machine does not have. Two
+     * black-screen reboots.
+     *
+     * The address is loaded with a 32-bit `mov` because the symbol is in the
+     * low boot region: a RIP-relative reference from the kernel's high text
+     * would not reach it, and the identity map that makes this valid is still
+     * live at this point. */
+    movl $__boot_protocol, %eax
+    cmpl $BOOT_MULTIBOOT2, (%rax)
     je 3f
     call kmain
     jmp 2f
@@ -377,9 +424,32 @@ __pd2:       .skip 4096
 __pd3:       .skip 4096
 
 /* The boot stack is addressed physically by the 32-bit trampoline, so it lives
- * in .bootbss beside the page tables rather than in the high .bss. */
+ * in .bootbss beside the page tables rather than in the high .bss.
+ *
+ * 256 KiB, and the size is not arbitrary. This stack grows DOWN into the page
+ * directories declared immediately above it, so an overflow does not fault on a
+ * guard page -- there is no guard page -- it silently rewrites the map the CPU
+ * is executing through, and the next instruction fetch triple-faults. The
+ * symptom is a machine that resets with nothing on the screen, which on a board
+ * with no serial port is indistinguishable from never having started.
+ *
+ * The framebuffer console is what made this real: it carries a character grid,
+ * and building one on the stack put tens of kilobytes through a 64 KiB budget
+ * in a single frame. The grid is smaller now and passed by reference, but the
+ * stack is sized so that being wrong about that again is survivable. */
 .section .bss.bootstack, "aw", @nobits
 .align 16
 __boot_stack:
-    .skip 64 * 1024
+    .skip 256 * 1024
 __boot_stack_top:
+
+/* The loader's own words, kept for inspection. Deliberately ABOVE the stack
+ * top, where a stack overflow cannot reach them. */
+.globl __entry_eax
+__entry_eax: .skip 4
+.globl __entry_ebx
+__entry_ebx: .skip 4
+/* Which loader entered us. In memory rather than a register because no register
+ * survives the long-mode transition intact -- see the dispatch above. */
+.globl __boot_protocol
+__boot_protocol: .skip 4

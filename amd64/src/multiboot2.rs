@@ -1,192 +1,75 @@
 //! The second way in: booted by GRUB, on real hardware, with a framebuffer.
 //!
-//! `kmain` is entered from a VMM through PVH and reports over a 16550. This
-//! module is entered from GRUB through multiboot2 on a machine that **has no
-//! 16550 at all** — the reference board has no serial port, no header, and
-//! nothing at the legacy I/O addresses — so the first thing it must do is find
-//! the framebuffer the firmware set up and start drawing, because until it does
-//! there is no way for the machine to say anything whatsoever.
+//! `kmain` is entered from a VMM through PVH and reports over a 16550. This is
+//! entered from GRUB on a machine that **has no 16550 at all** — no port, no
+//! header, nothing at the legacy addresses — so everything here is arranged
+//! around one problem: until something is drawn, the machine cannot say
+//! anything, including that it failed.
 //!
-//! That shapes the order of everything below. Paint before parsing. Say what
-//! was found before acting on it. A boot that stops here having printed the
-//! memory map is a useful boot; a boot that gets further and prints nothing is
-//! indistinguishable from a machine that did not power on.
+//! # Three output paths, tried in order of how little they assume
 //!
-//! # The information block
+//! 1. **The EGA text buffer at `0xB8000`.** Written unconditionally, first,
+//!    before anything is parsed. On a UEFI machine in a graphics mode this is
+//!    ordinary RAM and nothing appears — it costs six stores to find out, and
+//!    on any machine where it *is* live it is the earliest possible output.
+//! 2. **A flood of colour.** Proves the framebuffer address, pitch and pixel
+//!    format without involving a font. Each stage floods a different colour, so
+//!    a screen that stops changing says how far the boot got.
+//! 3. **Text.** Everything above has to be right first.
 //!
-//! GRUB leaves a physical pointer in `%ebx`: a `u32` total size, a `u32` of
-//! padding, then a run of tags. Every tag is `{u32 type, u32 size}` followed by
-//! its body, and the next tag begins at the next 8-byte boundary — the size
-//! does **not** include that padding, and a parser that walks by `size` alone
-//! desynchronises on the first odd-length tag and then reads noise as tag
-//! headers.
+//! And at the end, [`cycle_forever`] instead of halting: a band that keeps
+//! changing colour is the difference between "the kernel finished" and "the
+//! machine died and the screen kept the last thing on it".
 //!
-//! Only one `unsafe` block appears here, at the top of [`kmain_mb2`]: turning
-//! GRUB's pointer into a slice. Everything after that is safe slice arithmetic
-//! that cannot run off the end, which is the point of doing it that way.
+//! # The parsing lives in a crate
+//!
+//! `akuma-multiboot2` holds it, with tests. The first version of this file
+//! parsed the information block inline and had a one-byte error — the
+//! framebuffer tag's `reserved` field is a `u16`, so the colour fields start at
+//! tag offset 32, not 31 — which produced a zero-width blue channel, a format
+//! that failed validation, and a black screen with no way to report it. That
+//! cost a reboot cycle on a machine in another room. It is now a unit test.
 
 use core::fmt::Write;
 
 use akuma_fbcon::{Console, PixelFormat, Rgb, Surface};
+use akuma_multiboot2::{BootInfo, FramebufferKind};
 
 /// Where the boot page tables mirror all of physical memory.
-///
-/// `boot.s` points PML4 slot 256 here and describes the low 4 GiB through it.
-/// The identity map is still live at this point too, so either address would
-/// work; the physmap is used because it is the one that survives
-/// `drop_identity_map` later.
 const PHYSMAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 
-/// The highest physical address `boot.s` maps. Anything past this cannot be
-/// touched until the kernel builds its own tables.
+/// The highest physical address `boot.s` maps.
 const MAPPED_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 
-/// What GRUB puts in `%eax`. If this is wrong we were not multiboot2-booted.
-const MB2_BOOTLOADER_MAGIC: u32 = 0x36D7_6289;
+/// The legacy colour-text buffer.
+const EGA_TEXT_BASE: u64 = 0xB_8000;
+/// Bright white on blue, the attribute byte for [`EGA_TEXT_BASE`].
+const EGA_ATTR: u8 = 0x1F;
 
-// Tag types, from the multiboot2 specification.
-const TAG_END: u32 = 0;
-const TAG_CMDLINE: u32 = 1;
-const TAG_LOADER_NAME: u32 = 2;
-const TAG_MODULE: u32 = 3;
-const TAG_MEMORY_MAP: u32 = 6;
-const TAG_FRAMEBUFFER: u32 = 8;
-const TAG_ACPI_OLD: u32 = 14;
-const TAG_ACPI_NEW: u32 = 15;
-const TAG_LOAD_BASE: u32 = 21;
+/// Roughly how long a colour stays up in [`cycle_forever`]. Not calibrated —
+/// there is no timer yet — just a spin long enough to be seen.
+const CYCLE_SPINS: u64 = 40_000_000;
 
-/// A framebuffer whose pixels are laid out in a direct RGB format.
-const FB_TYPE_RGB: u8 = 1;
-
-/// One tag, as a borrowed slice of the information block.
-struct Tag<'a> {
-    typ: u32,
-    body: &'a [u8],
-}
-
-/// Walks the tag list, stopping at the end tag or at the first malformed one.
-struct Tags<'a> {
-    rest: &'a [u8],
-}
-
-impl<'a> Iterator for Tags<'a> {
-    type Item = Tag<'a>;
-
-    fn next(&mut self) -> Option<Tag<'a>> {
-        if self.rest.len() < 8 {
-            return None;
-        }
-        let typ = u32::from_le_bytes(self.rest[0..4].try_into().ok()?);
-        let size = u32::from_le_bytes(self.rest[4..8].try_into().ok()?) as usize;
-        if typ == TAG_END || size < 8 || size > self.rest.len() {
-            return None;
-        }
-        let body = &self.rest[8..size];
-        // The *next* tag starts at the next multiple of eight. Advancing by
-        // `size` alone is the classic way to read this structure wrongly.
-        let step = size.next_multiple_of(8).min(self.rest.len());
-        self.rest = &self.rest[step..];
-        Some(Tag { typ, body })
-    }
-}
-
-/// Everything the kernel needs from the information block.
-struct BootInfo<'a> {
-    framebuffer: Option<FbInfo>,
-    cmdline: &'a str,
-    loader: &'a str,
-    memory_map: Option<&'a [u8]>,
-    load_base: Option<u32>,
-    modules: usize,
-    acpi_rsdp: bool,
-}
-
-/// The framebuffer tag, decoded.
-#[derive(Clone, Copy)]
-struct FbInfo {
-    addr: u64,
-    pitch: usize,
-    width: usize,
-    height: usize,
-    format: PixelFormat,
-}
-
-fn parse<'a>(bytes: &'a [u8]) -> BootInfo<'a> {
-    let mut info = BootInfo {
-        framebuffer: None,
-        cmdline: "",
-        loader: "",
-        memory_map: None,
-        load_base: None,
-        modules: 0,
-        acpi_rsdp: false,
-    };
-    // The first eight bytes are total_size and a reserved word.
-    let tags = Tags { rest: if bytes.len() > 8 { &bytes[8..] } else { &[] } };
-
-    for tag in tags {
-        match tag.typ {
-            TAG_CMDLINE => info.cmdline = cstr(tag.body),
-            TAG_LOADER_NAME => info.loader = cstr(tag.body),
-            TAG_MODULE => info.modules += 1,
-            TAG_MEMORY_MAP => info.memory_map = Some(tag.body),
-            TAG_FRAMEBUFFER => info.framebuffer = decode_framebuffer(tag.body),
-            TAG_ACPI_OLD | TAG_ACPI_NEW => info.acpi_rsdp = true,
-            TAG_LOAD_BASE => {
-                if tag.body.len() >= 4 {
-                    info.load_base =
-                        Some(u32::from_le_bytes(tag.body[0..4].try_into().unwrap_or([0; 4])));
-                }
-            }
-            _ => {}
-        }
-    }
-    info
-}
-
-/// A NUL-terminated, hopefully-UTF-8 string from a tag body.
+/// Write a line to the EGA text buffer, in case anything is watching it.
 ///
-/// Anything that is not valid UTF-8 becomes empty rather than a panic: this
-/// text came from a boot loader's command line, and a boot that dies formatting
-/// its own diagnostics has no way to say why.
-fn cstr(body: &[u8]) -> &str {
-    let end = body.iter().position(|b| *b == 0).unwrap_or(body.len());
-    core::str::from_utf8(&body[..end]).unwrap_or("")
-}
-
-/// Decode the framebuffer tag.
-///
-/// Offsets are the specification's and are not all naturally aligned — the
-/// colour fields start at byte 31 of the tag, one past a `u8` reserved — so
-/// every field is read byte-wise rather than through a `repr(C)` struct.
-fn decode_framebuffer(body: &[u8]) -> Option<FbInfo> {
-    // Body is the tag minus its 8-byte header, so subtract 8 from spec offsets.
-    if body.len() < 23 {
-        return None;
+/// This is a shot in the dark by design. Under UEFI in a graphics mode the
+/// address is plain memory and nothing comes of it; with a CSM, or on a machine
+/// whose firmware left the text buffer live, it is the first and cheapest
+/// output there is. Either way it happens before any parsing, so it survives
+/// every failure below it.
+fn ega_text(row: usize, s: &str) {
+    let base = (PHYSMAP_BASE + EGA_TEXT_BASE) as *mut u8;
+    for (i, b) in s.bytes().take(80).enumerate() {
+        let off = (row * 80 + i) * 2;
+        // SAFETY: the identity/physmap window covers the first megabyte, so
+        // this address is mapped. Writing it is either visible text or a store
+        // to unused low RAM; neither can fault, and nothing else claims that
+        // range this early in boot.
+        unsafe {
+            base.add(off).write_volatile(b);
+            base.add(off + 1).write_volatile(EGA_ATTR);
+        }
     }
-    let addr = u64::from_le_bytes(body[0..8].try_into().ok()?);
-    let pitch = u32::from_le_bytes(body[8..12].try_into().ok()?) as usize;
-    let width = u32::from_le_bytes(body[12..16].try_into().ok()?) as usize;
-    let height = u32::from_le_bytes(body[16..20].try_into().ok()?) as usize;
-    let bpp = body[20];
-    let fb_type = body[21];
-    // body[22] is the reserved byte; colour fields follow it.
-    if fb_type != FB_TYPE_RGB || body.len() < 29 {
-        return None;
-    }
-    let format = PixelFormat {
-        bpp,
-        red_pos: body[23],
-        red_size: body[24],
-        green_pos: body[25],
-        green_size: body[26],
-        blue_pos: body[27],
-        blue_size: body[28],
-    };
-    if !format.is_usable() || width == 0 || height == 0 || pitch == 0 {
-        return None;
-    }
-    Some(FbInfo { addr, pitch, width, height, format })
 }
 
 /// The firmware's framebuffer, as somewhere pixels can be written.
@@ -194,12 +77,12 @@ fn decode_framebuffer(body: &[u8]) -> Option<FbInfo> {
 /// # Cache attributes
 ///
 /// The boot page tables map this range write-back, which for device memory
-/// would normally be wrong. It is not, and the reason is worth stating: the
-/// firmware's MTRRs already describe everything above the top of usable DRAM as
-/// uncacheable, and the effective memory type is the **stronger** of the MTRR
-/// and page-table types. So these writes reach the device whatever the PTE
-/// says. They are also slow for the same reason, which is why the console
-/// scales the font up rather than drawing at native 4K resolution.
+/// would normally be wrong. It is not: the firmware's MTRRs already describe
+/// everything above the top of usable DRAM as uncacheable, and the effective
+/// memory type is the **stronger** of the MTRR and page-table types. The writes
+/// reach the device whatever the PTE says — and are slow for the same reason,
+/// which is why the console scales a small font up rather than drawing at
+/// native 4K.
 struct Framebuffer {
     base: *mut u8,
     pitch: usize,
@@ -210,21 +93,30 @@ struct Framebuffer {
 }
 
 impl Framebuffer {
-    fn new(info: FbInfo) -> Option<Self> {
-        let size = info.pitch.checked_mul(info.height)? as u64;
+    fn new(fb: &akuma_multiboot2::Framebuffer) -> Option<Self> {
+        let size = fb.size_bytes();
         // Refuse rather than fault: a framebuffer above what boot.s maps cannot
-        // be written, and the fault would arrive before there was any console
-        // to report it on.
-        if info.addr.checked_add(size)? > MAPPED_LIMIT {
+        // be written, and the fault would arrive before there was a console to
+        // report it on.
+        if fb.addr.checked_add(size)? > MAPPED_LIMIT {
             return None;
         }
+        let format = PixelFormat {
+            bpp: fb.bpp,
+            red_pos: fb.format.red_pos,
+            red_size: fb.format.red_size,
+            green_pos: fb.format.green_pos,
+            green_size: fb.format.green_size,
+            blue_pos: fb.format.blue_pos,
+            blue_size: fb.format.blue_size,
+        };
         Some(Framebuffer {
-            base: (PHYSMAP_BASE + info.addr) as *mut u8,
-            pitch: info.pitch,
-            width: info.width,
-            height: info.height,
-            format: info.format,
-            bytes_per_pixel: info.format.bytes_per_pixel(),
+            base: (PHYSMAP_BASE + fb.addr) as *mut u8,
+            pitch: fb.pitch as usize,
+            width: fb.width as usize,
+            height: fb.height as usize,
+            format,
+            bytes_per_pixel: format.bytes_per_pixel(),
         })
     }
 }
@@ -247,10 +139,9 @@ impl Surface for Framebuffer {
 
         // SAFETY: `base` is the firmware's framebuffer, mapped by boot.s and
         // checked in `new` to lie entirely below MAPPED_LIMIT. `offset` is
-        // within `pitch * height` because x and y were bounds-checked against
-        // the dimensions the same tag reported, and every write below is inside
-        // one pixel starting at `offset`. Volatile because this is device
-        // memory and the writes must not be elided or reordered away.
+        // inside `pitch * height` because x and y were bounds-checked against
+        // the dimensions the same tag reported. Volatile because this is device
+        // memory: the writes must not be elided or reordered away.
         unsafe {
             let p = self.base.add(offset);
             match self.bytes_per_pixel {
@@ -268,148 +159,171 @@ impl Surface for Framebuffer {
 }
 
 /// Long-mode entry for a GRUB/multiboot2 boot, called from `boot.s`.
-///
-/// `extern "C"` and `#[unsafe(no_mangle)]` for the same reason [`crate::kmain`]
-/// is: the trampoline resolves it by name.
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
-    // SAFETY: GRUB guarantees `%ebx` points at an information block whose first
-    // `u32` is its own total size, and boot.s has mapped all of low physical
-    // memory through the physmap. The length is clamped so a corrupt size field
-    // cannot produce a slice running off the end of what is mapped.
+    ega_text(0, "Akuma/amd64: multiboot2 entry reached");
+
+    // SAFETY: GRUB guarantees %ebx points at an information block whose first
+    // u32 is its own total size, and boot.s has mapped all of low physical
+    // memory. The length is clamped so a corrupt size field cannot produce a
+    // slice running off the end of what is mapped.
     let bytes: &[u8] = unsafe {
         let p = (PHYSMAP_BASE + info_phys) as *const u8;
         let total = p.cast::<u32>().read_volatile() as usize;
-        let total = total.clamp(8, 64 * 1024);
-        core::slice::from_raw_parts(p, total)
+        core::slice::from_raw_parts(p, total.clamp(8, 64 * 1024))
     };
 
-    let info = parse(bytes);
-
-    let Some(fbinfo) = info.framebuffer else {
-        // Nothing to say it with. GRUB was asked for a framebuffer in the
-        // header; arriving here means it could not provide one.
-        crate::halt();
-    };
-    let Some(fb) = Framebuffer::new(fbinfo) else {
-        crate::halt();
-    };
-    let Some(mut con) = Console::new(fb) else {
+    let Some(info) = BootInfo::new(bytes) else {
+        ega_text(1, "FAIL: information block too short");
         crate::halt();
     };
 
-    // Proof of life before anything can go wrong in a glyph. If the screen
-    // turns this colour and nothing else happens, the framebuffer address,
-    // pitch and pixel format are all right and the fault is above them.
-    con.flood(Rgb::new(0x10, 0x20, 0x38));
-    con.set_bg(Rgb::new(0x10, 0x20, 0x38));
+    let Some(fb) = info.framebuffer() else {
+        ega_text(1, "FAIL: GRUB provided no framebuffer tag");
+        crate::halt();
+    };
+
+    if !matches!(fb.kind, FramebufferKind::Rgb) {
+        ega_text(1, "FAIL: framebuffer is not direct-colour (EGA text mode?)");
+        crate::halt();
+    }
+
+    let Some(mut surface) = Framebuffer::new(&fb) else {
+        ega_text(1, "FAIL: framebuffer lies above the mapped 4 GiB");
+        crate::halt();
+    };
+    ega_text(1, "framebuffer mapped; painting");
+
+    // STAGE ONE, and it happens before the console exists on purpose.
+    //
+    // This is the smallest possible proof that the address, the pitch and the
+    // pixel format are all correct: a few hundred kilobytes of stores through
+    // nothing but `Surface::fill`, with no font, no character grid and barely
+    // any stack. If the screen turns purple and stops there, everything below
+    // this line is what failed. If it stays black, the framebuffer itself is
+    // wrong and nothing above this line can be trusted either.
+    let (w, h) = (surface.width(), surface.height());
+    surface.fill(0, 0, w, h, Rgb::new(0x30, 0x00, 0x50));
+
+    let Some(mut con) = Console::new(surface) else {
+        ega_text(2, "FAIL: framebuffer too small for a console");
+        crate::halt();
+    };
+
+    // Stage two: the console exists. A different colour, so the two stages are
+    // told apart by looking rather than by guessing.
+    con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
     con.clear();
+    ega_text(2, "console up");
 
     con.set_fg(Rgb::ACCENT);
     let _ = writeln!(con, "Akuma/amd64 on real hardware");
     con.set_fg(Rgb::TEXT);
-    let _ = writeln!(con, "");
-    let _ = writeln!(con, "  loader    {}", info.loader);
-    let _ = writeln!(con, "  cmdline   {}", info.cmdline);
-    let _ = writeln!(
-        con,
-        "  magic     {:#010x} expected {:#010x}",
-        MB2_BOOTLOADER_MAGIC, MB2_BOOTLOADER_MAGIC
-    );
-    if let Some(base) = info.load_base {
-        let _ = writeln!(con, "  loaded at {base:#x}");
+    let _ = writeln!(con);
+    let _ = writeln!(con, "  loader     {}", info.loader_name());
+    let _ = writeln!(con, "  cmdline    {}", info.cmdline());
+    if let Some(base) = info.load_base() {
+        let _ = writeln!(con, "  loaded at  {base:#x}");
     }
-    let _ = writeln!(con, "  modules   {}", info.modules);
-    let _ = writeln!(con, "  acpi rsdp {}", if info.acpi_rsdp { "present" } else { "absent" });
-    let _ = writeln!(con, "");
+    let _ = writeln!(con, "  modules    {}", info.module_count());
+    let _ = writeln!(con, "  acpi rsdp  {}", if info.has_acpi() { "present" } else { "absent" });
+    let _ = writeln!(con);
 
     con.set_fg(Rgb::ACCENT);
     let _ = writeln!(con, "framebuffer");
     con.set_fg(Rgb::TEXT);
+    let _ = writeln!(con, "  {}x{} at {} bpp, pitch {}", fb.width, fb.height, fb.bpp, fb.pitch);
+    let _ = writeln!(con, "  address    {:#x}", fb.addr);
     let _ = writeln!(
         con,
-        "  {}x{} @ {}bpp, pitch {}",
-        fbinfo.width, fbinfo.height, fbinfo.format.bpp, fbinfo.pitch
+        "  channels   r {}@{}  g {}@{}  b {}@{}{}",
+        fb.format.red_size,
+        fb.format.red_pos,
+        fb.format.green_size,
+        fb.format.green_pos,
+        fb.format.blue_size,
+        fb.format.blue_pos,
+        if fb.format_assumed { "  (assumed)" } else { "" }
     );
-    let _ = writeln!(con, "  address   {:#x}", fbinfo.addr);
-    let _ = writeln!(
-        con,
-        "  channels  r{}@{} g{}@{} b{}@{}",
-        fbinfo.format.red_size,
-        fbinfo.format.red_pos,
-        fbinfo.format.green_size,
-        fbinfo.format.green_pos,
-        fbinfo.format.blue_size,
-        fbinfo.format.blue_pos
-    );
-    let _ = writeln!(con, "  console   {}x{} chars at scale {}", con.cols(), con.rows(), con.scale());
-    let _ = writeln!(con, "");
+    let _ = writeln!(con, "  console    {}x{} chars, scale {}", con.cols(), con.rows(), con.scale());
+    let _ = writeln!(con);
 
-    print_memory_map(&mut con, info.memory_map);
+    print_memory_map(&mut con, &info);
 
     con.set_fg(Rgb::GOOD);
-    let _ = writeln!(con, "");
-    let _ = writeln!(con, "reached the end of multiboot2 bring-up; halting.");
-    crate::halt();
+    let _ = writeln!(con);
+    let _ = writeln!(con, "bring-up complete. The band below cycles: the kernel is alive.");
+
+    cycle_forever(&mut con);
 }
 
 /// Print the memory map and the total of what is usable.
-fn print_memory_map<S: Surface>(con: &mut Console<S>, map: Option<&[u8]>) {
+fn print_memory_map<S: Surface>(con: &mut Console<S>, info: &BootInfo<'_>) {
     con.set_fg(Rgb::ACCENT);
     let _ = writeln!(con, "memory map");
     con.set_fg(Rgb::TEXT);
 
-    let Some(body) = map else {
+    let Some(regions) = info.memory_regions() else {
         con.set_fg(Rgb::BAD);
-        let _ = writeln!(con, "  absent — GRUB provided no memory map");
+        let _ = writeln!(con, "  absent or malformed");
         return;
     };
-    if body.len() < 8 {
-        con.set_fg(Rgb::BAD);
-        let _ = writeln!(con, "  malformed");
-        return;
-    }
 
-    let entry_size = u32::from_le_bytes(body[0..4].try_into().unwrap_or([0; 4])) as usize;
-    if entry_size < 24 {
-        con.set_fg(Rgb::BAD);
-        let _ = writeln!(con, "  entry size {entry_size} is too small");
-        return;
-    }
-
-    let mut usable: u64 = 0;
     let mut shown = 0;
-    let mut entries = 0;
-    let mut off = 8;
-    while off + entry_size <= body.len() {
-        let e = &body[off..off + entry_size];
-        let base = u64::from_le_bytes(e[0..8].try_into().unwrap_or([0; 8]));
-        let len = u64::from_le_bytes(e[8..16].try_into().unwrap_or([0; 8]));
-        let typ = u32::from_le_bytes(e[16..20].try_into().unwrap_or([0; 4]));
-        entries += 1;
-
-        if typ == 1 {
-            usable = usable.saturating_add(len);
-        }
-        // A full map on a real machine runs to a dozen-plus entries and would
-        // push everything above it off a small screen; the usable ones are the
-        // ones that matter, and the total below accounts for all of them.
-        if typ == 1 && shown < 8 {
+    let mut total = 0;
+    for r in regions {
+        total += 1;
+        // A real machine reports a dozen-plus regions and would push everything
+        // above this off the screen; the usable ones are what matter and the
+        // total below accounts for all of them.
+        if r.is_usable() && shown < 8 {
             shown += 1;
             let _ = writeln!(
                 con,
-                "  {:#012x}..{:#012x}  {} MiB  usable",
-                base,
-                base.saturating_add(len),
-                len / (1024 * 1024)
+                "  {:#012x} + {:>6} MiB  usable",
+                r.base,
+                r.length / (1024 * 1024)
             );
         }
-        off += entry_size;
     }
-
-    let _ = writeln!(con, "  {entries} entries, {} MiB usable in total", usable / (1024 * 1024));
+    let usable = info.usable_memory();
+    let _ = writeln!(con, "  {total} regions, {} MiB usable in total", usable / (1024 * 1024));
     if usable == 0 {
         con.set_fg(Rgb::BAD);
-        let _ = writeln!(con, "  no usable memory reported — this cannot be right");
+        let _ = writeln!(con, "  no usable memory reported: this cannot be right");
+    }
+}
+
+/// Cycle a band of colour along the bottom, for ever.
+///
+/// This replaces halting, and it is not decoration. A halted kernel and a
+/// crashed one look identical — both leave whatever was last drawn on the
+/// screen. A band that keeps changing says the CPU is still executing our code,
+/// which is the single fact hardest to establish on a machine with no serial
+/// port, no network and no disk output.
+fn cycle_forever<S: Surface>(con: &mut Console<S>) -> ! {
+    let palette = [
+        Rgb::new(0xE0, 0x50, 0x50),
+        Rgb::new(0xE0, 0xC0, 0x40),
+        Rgb::new(0x50, 0xD0, 0x60),
+        Rgb::new(0x60, 0xA0, 0xE0),
+        Rgb::new(0xC0, 0x60, 0xE0),
+    ];
+
+    let surface = con.surface_mut();
+    let w = surface.width();
+    let h = surface.height();
+    let (margin_x, margin_y) = (w / 24, h / 24);
+    let band_h = (h / 14).max(8);
+    let band_y = h.saturating_sub(margin_y + band_h);
+    let band_w = w.saturating_sub(margin_x * 2);
+
+    let mut i = 0usize;
+    loop {
+        surface.fill(margin_x, band_y, band_w, band_h, palette[i % palette.len()]);
+        i += 1;
+        for _ in 0..CYCLE_SPINS {
+            core::hint::spin_loop();
+        }
     }
 }
