@@ -424,6 +424,16 @@ procedure is [`../../runbooks/debug-delayed-first-byte.md`](../../runbooks/debug
 
 ### Interface introspection (`ifconfig`, `SIOCGIF*`, `/proc/net/dev`)
 
+**2026-09-05: the byte layout moved to `crates/akuma-syscalls-net`** — a
+dependency-light leaf (only `akuma-syscalls-linux`) holding the `struct ifreq`
+marshalling, the `SIOCGIFCONF` record + 40-byte stride, the netmask/broadcast
+derivation, and the `/proc/net/dev` column format, all host-tested. Both kernels
+now consume it: `akuma-syscalls-glue::net` (aarch64) and `amd64/src/fd.rs` (the
+amd64 port, which had none of this before and where `busybox ifconfig` now
+works). The extraction is specifically so the stride trap below can only be
+written once. The glue keeps the user-memory reads/writes and the
+`FileDescriptor::Socket` gate; the crate decides the bytes.
+
 Added 2026-08-24 so `ifconfig`/`ifconfig -a`/`ifconfig <name>` work — **read-only**;
 no `SIOCSIF*` (`ifconfig up/down`, address changes) or `AF_NETLINK`/`RTM_GETLINK`
 (`ip addr`, glibc's netlink-based `if_nameindex()`) are implemented, so tools

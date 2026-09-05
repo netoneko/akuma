@@ -303,6 +303,71 @@ pub fn spawn_netpoll() -> bool {
     ok
 }
 
+/// Bare-metal NIC discovery, run after the self-tests on the multiboot2 path.
+///
+/// The VMM targets get their NIC as a virtio-MMIO transport; a real machine
+/// has a PCI Ethernet controller instead. This finds it, turns on its decode
+/// and bus mastering, maps its register BAR, and reads the MAC straight off
+/// the hardware — which is the proof that the PCI enumeration and the MMIO
+/// mapping both work end to end.
+///
+/// **The RTL8169/8168 bring-up itself is not wired yet.** `akuma-net-rtl8169`
+/// is the driver (pure, host-tested against a real register dump); what it
+/// still needs here is a `Regs` impl over the mapped BAR, a `Rings` impl over
+/// DMA memory, and a smoltcp `Device` shim — the same three seams `src/net.rs`
+/// fills for virtio. That is the next step and it needs the box to iterate on.
+pub fn probe_ethernet() {
+    use akuma_pci::{Bar, class, subclass};
+
+    let Some(dev) = crate::pci::find_class(class::NETWORK, subclass::ETHERNET) else {
+        return;
+    };
+    serial::puts("  nic:  ");
+    serial::put_hex(u64::from(dev.header.vendor_id));
+    serial::puts(":");
+    serial::put_hex(u64::from(dev.header.device_id));
+    serial::puts(" at ");
+    serial::put_hex(u64::from(dev.addr.bus));
+    serial::puts(":");
+    serial::put_hex(u64::from(dev.addr.device));
+    serial::puts(".");
+    serial::put_hex(u64::from(dev.addr.function));
+
+    crate::pci::enable(dev.addr, true);
+
+    // The register window: the first memory BAR (BAR2 on the Realtek part).
+    let Some((idx, mem_bar)) = dev
+        .bars
+        .iter()
+        .enumerate()
+        .find_map(|(i, b)| b.filter(Bar::is_memory).map(|b| (i as u8, b)))
+    else {
+        serial::puts("  — no memory BAR\n");
+        return;
+    };
+    let (size, _) = crate::pci::probe_bar_size(dev.addr, idx);
+    let Some(regs) = crate::pci::map_bar(mem_bar, size.max(0x1000)) else {
+        serial::puts("  — BAR map failed\n");
+        return;
+    };
+
+    // IDR0..IDR5 — the MAC — sit at register offset 0. A device-mapped read.
+    let mut mac = [0u8; 6];
+    for (i, b) in mac.iter_mut().enumerate() {
+        // SAFETY: `regs` is the just-mapped, device-attributed BAR of the NIC
+        // enumerated above; offsets 0..6 are the read-only ID registers.
+        *b = unsafe { regs.add(i).read_volatile() };
+    }
+    serial::puts(" mac ");
+    for (i, b) in mac.iter().enumerate() {
+        if i != 0 {
+            serial::puts(":");
+        }
+        serial::put_hex(u64::from(*b));
+    }
+    serial::puts("  (driver not wired)\n");
+}
+
 /// Check the pieces that do not need a NIC, plus the NIC if there is one.
 pub fn smoke_test(t: &mut Suite, up: bool) {
     // `RDRAND` first, and independently of the stack: it is what `sshd`'s key

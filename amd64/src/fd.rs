@@ -85,6 +85,7 @@ pub mod errno {
     pub const EINVAL: u64 = (-22i64) as u64;
     pub const EMFILE: u64 = (-24i64) as u64;
     pub const ENOTTY: u64 = (-25i64) as u64;
+    pub const ENODEV: u64 = (-19i64) as u64;
     pub const ENOSYS: u64 = (-38i64) as u64;
     pub const ESRCH: u64 = (-3i64) as u64;
     pub const EAGAIN: u64 = (-11i64) as u64;
@@ -457,6 +458,13 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
                 return errno::ENOENT;
             };
             return alloc_pipe_fd(pipe_id, true).unwrap_or(errno::EMFILE);
+        }
+        // `busybox ifconfig` with no interface name reads this to enumerate
+        // devices before it will print anything. Generated, not stored.
+        if rest == "net/dev" {
+            let mut text = alloc::string::String::new();
+            let _ = akuma_syscalls_net::write_proc_net_dev(&interfaces(), &mut text);
+            return install_synthetic_file("/proc/net/dev", text.into_bytes(), flags_);
         }
         return errno::ENOENT;
     }
@@ -1708,6 +1716,13 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     const TIOCSPGRP: u64 = 0x5410;
     const TIOCSCTTY: u64 = 0x540E;
 
+    // Read-only interface introspection. `busybox ifconfig` issues these on an
+    // AF_INET socket fd, so they are handled before the "non-console fd →
+    // ENOTTY" gate below. Shared layout with the aarch64 kernel.
+    if akuma_syscalls_net::cmd::is_interface_query(req as u32) {
+        return siocgif(req as u32, arg);
+    }
+
     let is_console = fd < FIRST_FILE_FD as u64;
     if !is_console {
         return errno::ENOTTY;
@@ -1766,6 +1781,103 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             0
         }
         _ => errno::ENOTTY,
+    }
+}
+
+/// Install a read-only fd whose contents are `data` (a generated file like
+/// `/proc/net/dev`). Reads serve from `Entry::data` exactly as a cached real
+/// file does.
+fn install_synthetic_file(path: &str, data: Vec<u8>, flags: u64) -> u64 {
+    let mut table = TABLE.lock();
+    for (i, slot) in table.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(Entry {
+                desc: FileDescriptor::File(KernelFile::new(
+                    alloc::string::String::from(path),
+                    flags as u32,
+                )),
+                data,
+                nonblocking: false,
+                is_dir: false,
+                owner: crate::usermode::current_proc_slot(),
+            });
+            return (i + FIRST_FILE_FD) as u64;
+        }
+    }
+    errno::EMFILE
+}
+
+/// The two synthetic interfaces `ifconfig` sees: `lo` and the live smoltcp
+/// `eth0`. Built fresh each call so a DHCP change is reflected.
+fn interfaces() -> [akuma_syscalls_net::Interface; 2] {
+    let snap = akuma_net::smoltcp_net::interface_snapshot();
+    [
+        akuma_syscalls_net::Interface::loopback(),
+        akuma_syscalls_net::Interface::ethernet(
+            snap.ip,
+            snap.prefix_len,
+            snap.mac,
+            u32::from(snap.mtu),
+        ),
+    ]
+}
+
+/// `SIOCGIFCONF` / `SIOCGIF{FLAGS,ADDR,NETMASK,BRDADDR,MTU,HWADDR}` — the
+/// read-only half of `ifconfig`. The `struct ifreq` / `struct ifconf` byte
+/// layout is `akuma-syscalls-net`; this does the user copies.
+fn siocgif(cmd: u32, arg: u64) -> u64 {
+    use akuma_syscalls_linux::net::{IFREQ_UNION_OFFSET, SIZEOF_IFREQ};
+
+    if arg == 0 {
+        return errno::EFAULT;
+    }
+    let ifaces = interfaces();
+
+    if cmd == akuma_syscalls_net::cmd::SIOCGIFCONF {
+        // struct ifconf { i32 ifc_len; i32 _pad; u64 ifc_buf; }
+        let Some(len) = crate::uaccess::read_val::<i32>(arg) else {
+            return errno::EFAULT;
+        };
+        let Some(buf) = crate::uaccess::read_val::<u64>(arg + 8) else {
+            return errno::EFAULT;
+        };
+        let written = if buf == 0 {
+            akuma_syscalls_net::siocgifconf_size(&ifaces)
+        } else {
+            let cap = usize::try_from(len).unwrap_or(0);
+            let fit = akuma_syscalls_net::siocgifconf_capacity(&ifaces, cap);
+            for (i, iface) in ifaces.iter().take(fit).enumerate() {
+                let rec = akuma_syscalls_net::siocgifconf_record(iface);
+                if errno::is_err(copy_to_user(buf + (i * SIZEOF_IFREQ) as u64, &rec)) {
+                    return errno::EFAULT;
+                }
+            }
+            fit * SIZEOF_IFREQ
+        };
+        let n = i32::try_from(written).unwrap_or(i32::MAX);
+        if !crate::uaccess::write_val::<i32>(arg, n) {
+            return errno::EFAULT;
+        }
+        return 0;
+    }
+
+    // The rest: read the 16-byte ifr_name, marshal the union member, write it
+    // back at arg + 16.
+    let mut name = [0u8; 16];
+    if !crate::uaccess::read_bytes(arg, &mut name) {
+        return errno::EFAULT;
+    }
+    let mut union = [0u8; 24];
+    match akuma_syscalls_net::siocgifreq_reply(cmd, &ifaces, &name, &mut union) {
+        Ok(n) => {
+            if errno::is_err(copy_to_user(arg + IFREQ_UNION_OFFSET as u64, &union[..n])) {
+                errno::EFAULT
+            } else {
+                0
+            }
+        }
+        Err(akuma_syscalls_net::ReplyError::NoDevice) => errno::ENODEV,
+        Err(akuma_syscalls_net::ReplyError::NotHandled) => errno::ENOTTY,
     }
 }
 
@@ -1907,6 +2019,52 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         sys_ioctl(FIRST_FILE_FD as u64, 0x5401, term.as_mut_ptr() as u64),
         errno::ENOTTY,
     );
+
+    // `ifconfig`'s read-only ioctls, on a kernel-stack `struct ifreq` (the
+    // self-tests run inside the user-pointer bypass). `SIOCGIF*` are answered
+    // regardless of the fd, so a not-open fd is fine here.
+    const SIOCGIFADDR: u64 = 0x8915;
+    const SIOCGIFFLAGS: u64 = 0x8913;
+    let mut ifr = [0u8; 40];
+    ifr[..2].copy_from_slice(b"lo");
+    t.check_eq(
+        "fd: SIOCGIFADDR(lo) succeeds",
+        sys_ioctl(3, SIOCGIFADDR, ifr.as_mut_ptr() as u64),
+        0,
+    );
+    t.check("fd: SIOCGIFADDR(lo) returns 127.0.0.1", ifr[20..24] == [127, 0, 0, 1]);
+    ifr = [0u8; 40];
+    ifr[..4].copy_from_slice(b"eth0");
+    t.check_eq(
+        "fd: SIOCGIFFLAGS(eth0) succeeds",
+        sys_ioctl(3, SIOCGIFFLAGS, ifr.as_mut_ptr() as u64),
+        0,
+    );
+    t.check(
+        "fd: eth0 is UP|BROADCAST|RUNNING|MULTICAST",
+        i16::from_le_bytes([ifr[16], ifr[17]]) == akuma_syscalls_net::iff::ETHERNET,
+    );
+    ifr = [0u8; 40];
+    ifr[..3].copy_from_slice(b"zz9");
+    t.check_eq(
+        "fd: SIOCGIFADDR on an unknown interface is ENODEV",
+        sys_ioctl(3, SIOCGIFADDR, ifr.as_mut_ptr() as u64),
+        errno::ENODEV,
+    );
+    if have_fs {
+        let devp = b"/proc/net/dev\0";
+        let devfd = sys_openat(0, devp.as_ptr() as u64, 0, 0);
+        t.check("fd: /proc/net/dev opens", devfd >= FIRST_FILE_FD as u64);
+        if devfd >= FIRST_FILE_FD as u64 {
+            let mut d = [0u8; 256];
+            let n = sys_read(devfd, d.as_mut_ptr() as u64, d.len() as u64);
+            t.check(
+                "fd: /proc/net/dev lists lo and eth0",
+                n > 0 && d[..n as usize].windows(4).any(|w| w == b"eth0"),
+            );
+            sys_close(devfd);
+        }
+    }
 
     // `poll`: a regular file is always ready; a zero-length set with a timeout
     // is a sleep that returns 0; an oversized set is EINVAL.

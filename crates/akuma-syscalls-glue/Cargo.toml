@@ -18,6 +18,9 @@ akuma-pmm = { path = "../akuma-pmm" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-syscalls = { path = "../akuma-syscalls" }
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+# The `SIOCGIF*` / `/proc/net/dev` byte layout, shared with the amd64 port so
+# the two kernels cannot drift on the `struct ifreq` stride.
+akuma-syscalls-net = { path = "../akuma-syscalls-net" }
 akuma-syscalls-log = { path = "../akuma-syscalls-log" }
 akuma-syscalls-mem = { path = "../akuma-syscalls-mem" }
 akuma-syscalls-poll = { path = "../akuma-syscalls-poll" }

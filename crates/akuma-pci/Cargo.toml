@@ -1,0 +1,10 @@
+[package]
+name = "akuma-pci"
+version = "0.1.0"
+edition = "2024"
+description = "Pure PCI/PCIe configuration-space parsing: the CF8/CFC address word, the type-0 header, BAR decode + size math, and the capability list — host-tested against config space read off the reference machine."
+
+[lints]
+workspace = true
+
+[dependencies]

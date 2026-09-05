@@ -685,3 +685,70 @@ and the machine has no serial port — so an interactive shell on the framebuffe
 cannot be driven at all. **Networking is the path to a usable shell here**, not a
 keyboard driver, which puts PCI enumeration and `akuma-net-rtl8169` on the
 critical path for something other than throughput.
+
+---
+
+# Update — 2026-09-05, PCI, reboot, and the USB keyboard parsed
+
+Four pieces, all with host tests, none needing a reboot to verify.
+
+## PCI enumeration exists
+
+`crates/akuma-pci` (pure: the `0xCF8` address word, the type-0 header, BAR
+decode + size math, the capability list) + `amd64/src/pci.rs` (the `unsafe`
+port I/O, a full 256-bus scan into a fixed registry, BAR mapping into the
+device window). Runs on both entries right after the machine description; on the
+VMM path it finds nothing, correctly. `pci::report()` prints an `lspci`-shaped
+dump every boot, and `pci::smoke_test` is in the suite.
+
+The crate's fixtures are this box's real config space (`00:14.0` xHCI, `00:1a.0`
+EHCI, `03:00.0` `10ec:8168`), so the header/BAR/capability parsing was decided
+on a laptop. This unblocks both the NIC driver and the USB stack — the shared
+prerequisite the earlier entries kept naming.
+
+## The keyboard, parsed
+
+Measured off the running Linux: the ROCCAT Vulcan (`1e7d:3098`) is a
+**full-speed HID boot keyboard on EHCI `00:1a.0`**, behind the Intel Integrated
+Rate Matching Hub (single TT, hub address 2, port 6). The xHCI's `XUSB2PRM`
+(USB-2.0 port routing mask, PCI config `0xD4`) reads **`0x00000000`** — no
+USB-2.0 port on this board can be routed to xHCI. So the keyboard cannot be
+moved off EHCI, and the driver is an EHCI driver doing transaction-translator
+split transactions.
+
+`crates/akuma-usb` is the host-tested parsing half of that driver:
+
+* `descriptor` — USB standard descriptors + `find_boot_keyboard`
+* `hid` — the HID report-descriptor item parser, `is_boot_keyboard_report_descriptor`,
+  and `BootKeyboardDecoder` (8-byte boot report → ASCII on the key-down edge)
+* `keymap` — HID usage → ASCII, matching `amd64/src/kbd.rs`'s scancode-table
+  choices (Ctrl-C → `0x03`, Caps Lock after Shift)
+* `ehci` — the capability/operational register layout, the `USBLEGSUP` BIOS→OS
+  handoff, the `PORTSC` decode, and the split-transaction queue-head + qTD
+  dword builders — with the ROCCAT's queue head hand-computed in a test
+
+25 tests against fixtures from the box (`lsusb -v`, `usbhid-dump`, a read-only
+mmap of the EHCI BAR). What is *not* done: the EHCI controller bring-up itself —
+MMIO, DMA rings, frame-list threading, port reset, `SET_PROTOCOL(Boot)`, event
+polling. That is the next step and it needs the box to iterate on.
+
+## `busybox ifconfig` works
+
+`amd64/src/fd.rs` now answers the read-only `SIOCGIF*` ioctls and serves a
+generated `/proc/net/dev`, through the new `crates/akuma-syscalls-net` — the
+`struct ifreq` marshalling, the 40-byte `SIOCGIFCONF` stride, the
+netmask/broadcast math and the `/proc/net/dev` column format, extracted out of
+the aarch64 kernel's `akuma-syscalls-glue` (which does not build for
+`x86_64-unknown-none`) so both kernels share one layout. Read-only — no
+`SIOCSIF*`, no netlink.
+
+## `reboot(2)`
+
+x86_64 169, wired through `akuma-boot::decode` (the ABI decode shared with
+aarch64's `sc-reboot`, host-tested against the values musl sends) +
+`amd64/src/reboot.rs` for the x86 reset: `0xCF9` reset-control register, then an
+i8042 pulse, then a triple fault. `busybox reboot`/`halt`/`poweroff` all land
+here; `poweroff` halts (no ACPI PM block). `akuma-boot` grew a `psci` feature
+(default on) so the amd64 port can reach `decode` without the AArch64
+`smc`/`hvc` asm. Decode + the `EINVAL` path are self-tested; the reset itself is
+a by-hand check on the box.

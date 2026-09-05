@@ -300,6 +300,12 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     serial::put_dec(machine.regions().len() as u64);
     serial::puts(" regions\n");
 
+    // PCI enumeration. This is the whole reason it matters on this entry: a
+    // VMM announces its devices, real firmware announces nothing. The xHCI /
+    // EHCI controllers, the Realtek NIC and the AHCI disk are all found here.
+    crate::pci::scan();
+    crate::pci::report();
+
     // The root filesystem is already in memory, and NOTHING IN THE MEMORY MAP
     // SAYS SO. Reserve it before the physical allocator is told anything.
     let module = info.first_module();
@@ -337,6 +343,8 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
 
     crate::mem::smoke_test(&mut t);
     crate::paging::smoke_test(&mut t);
+    crate::pci::smoke_test(&mut t);
+    crate::reboot::smoke_test(&mut t);
     crate::idt::smoke_test(&mut t);
     crate::idt::user_copy_smoke_test(&mut t);
     crate::uaccess::smoke_test(&mut t, smap);
@@ -396,6 +404,11 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     } else {
         serial::puts("Akuma/amd64 - SELF-TESTS FAILED\n");
     }
+
+    // NIC discovery, right after the tests. Finds the Realtek controller,
+    // enables it, maps its BAR and reads the MAC off the hardware — the full
+    // driver bring-up is the next step (`net::probe_ethernet`'s own docs).
+    crate::net::probe_ethernet();
 
     // Hand the machine to a shell. After the verdict and only on a passing run,
     // for the reason `kmain` gives: a shell on a kernel whose own tests failed

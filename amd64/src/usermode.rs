@@ -652,6 +652,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
     match nr {
         // x86_64 158: the TLS-base primitive. No aarch64 number.
         158 => return sys_arch_prctl(a1, a2),
+        // `reboot(magic1, magic2, cmd, arg)` — x86_64 169. The ABI decode is
+        // shared with the aarch64 kernel (`akuma-boot`); the x86 machine reset
+        // under it is `reboot.rs`. `busybox reboot`/`halt`/`poweroff` all land
+        // here.
+        169 => return crate::reboot::sys_reboot(a1, a2, a3, a4),
         // Path-based `struct stat`. `stat` (4) and `lstat` (6) are x86-only —
         // `asm-generic` dropped them, so aarch64 has no number and they cannot
         // go through the `Syscall` enum; `newfstatat` (262) exists on both but

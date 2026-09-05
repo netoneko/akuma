@@ -1036,15 +1036,15 @@ impl Filesystem for ProcFilesystem {
         // every field is `0` — a legitimate value ifconfig already prints for
         // any idle interface, not a placeholder that reads as broken.
         if path == "net/dev" {
-            let mut out = String::from(
-                "Inter-|   Receive                                                |  Transmit\n \
-                 face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n"
-            );
-            for name in ["lo", "eth0"] {
-                let _ = writeln!(out,
-                    "{name:>6}: {:>7} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-            }
+            // The column layout is `akuma-syscalls-net`, shared with the
+            // `SIOCGIFCONF` path and the amd64 port. Only the names are read
+            // here — this kernel keeps no per-interface counters.
+            let ifaces = [
+                akuma_syscalls_net::Interface::loopback(),
+                akuma_syscalls_net::Interface::ethernet([0; 4], 0, [0; 6], 0),
+            ];
+            let mut out = String::new();
+            let _ = akuma_syscalls_net::write_proc_net_dev(&ifaces, &mut out);
             return Ok(out.into_bytes());
         }
 

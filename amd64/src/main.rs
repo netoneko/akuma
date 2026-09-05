@@ -78,6 +78,13 @@ mod multiboot2;
 mod net;
 #[cfg(target_arch = "x86_64")]
 mod paging;
+/// PCI enumeration — how a bare-metal boot finds the USB controllers, the NIC
+/// and the disk that a VMM would otherwise have announced.
+#[cfg(target_arch = "x86_64")]
+mod pci;
+/// The `reboot(2)` syscall and the x86 machine reset under it.
+#[cfg(target_arch = "x86_64")]
+mod reboot;
 /// A span of RAM as a block device, so a machine with no storage driver can
 /// still mount the root filesystem its boot loader left in memory.
 mod ramdisk;
@@ -191,6 +198,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     let machine = machine::describe(hvm_start_info);
     machine::report(&machine);
 
+    // PCI enumeration. Pure port I/O, so it needs nothing but the console —
+    // before `mem::init` is fine. On this (VMM) path it finds nothing, which is
+    // correct: the devices are virtio-MMIO. It is here so the one code path
+    // runs on both entries.
+    pci::scan();
+    pci::report();
+
     if !mem::init(&machine) {
         serial::puts("\nAkuma/amd64 — memory bring-up FAILED\n");
         halt();
@@ -247,6 +261,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         lapic::stop_timer();
     }
 
+    pci::smoke_test(&mut t);
+    reboot::smoke_test(&mut t);
     blk::smoke_test(&mut t, have_disk);
     fs::smoke_test(&mut t, have_fs);
     fd::smoke_test(&mut t, have_fs);

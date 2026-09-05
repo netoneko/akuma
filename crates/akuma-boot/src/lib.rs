@@ -76,6 +76,47 @@ pub fn decode(magic1: u32, magic2: u32, cmd: u32) -> Result<Option<Action>, BadM
     })
 }
 
+/// Whole-machine PSCI `SYSTEM_RESET`.
+///
+/// Only built with the `psci` feature (the default) — an AArch64 concept.
+/// `amd64/src/reboot.rs` is the x86 counterpart.
+///
+/// Akuma has no in-kernel park/quiesce dance before this, and needs none: QEMU
+/// and firmware tear every core and device back down to the same clean reset
+/// state `boot.rs` already assumes, so a plain PSCI reset gets that for free.
+///
+/// `-kernel` bytes are cached by QEMU at process startup and are **not** re-read
+/// on an in-process reset, so this only picks up a freshly built kernel when
+/// combined with `-action reboot=shutdown` and a host-side relaunch — see
+/// `scripts/cargo_runner.sh`'s `KERNEL_DROPOFF` and
+/// `docs/runbooks/selfhost-kernel-build.md`.
+///
+/// Callers should sync filesystems first; this does not return.
+#[cfg(feature = "psci")]
+pub fn system_reset() -> ! {
+    // Discarded deliberately: on success this does not return at all, so a
+    // returned status can only mean the call failed — which the loop below
+    // already handles. There is no caller left to report it to.
+    let _ = akuma_psci::call(akuma_psci::SYSTEM_RESET, 0, 0, 0);
+    // `SYSTEM_RESET` does not return on success, so reaching here means the call
+    // itself failed — typically no PSCI conduit. There is nothing sensible left
+    // to do: the syscall dispatcher is not set up to receive a return from this
+    // path, and the caller has already synced and announced the reboot.
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Whole-machine PSCI `SYSTEM_OFF`. See [`system_reset`] for the shared
+/// reasoning; likewise does not return.
+#[cfg(feature = "psci")]
+pub fn system_off() -> ! {
+    let _ = akuma_psci::call(akuma_psci::SYSTEM_OFF, 0, 0, 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,41 +159,5 @@ mod tests {
     #[test]
     fn unrecognized_cmd_with_good_magic_is_none() {
         assert_eq!(decode(MAGIC1, MAGIC2, 0xdead_beef), Ok(None));
-    }
-}
-
-/// Whole-machine PSCI `SYSTEM_RESET`.
-///
-/// Akuma has no in-kernel park/quiesce dance before this, and needs none: QEMU
-/// and firmware tear every core and device back down to the same clean reset
-/// state `boot.rs` already assumes, so a plain PSCI reset gets that for free.
-///
-/// `-kernel` bytes are cached by QEMU at process startup and are **not** re-read
-/// on an in-process reset, so this only picks up a freshly built kernel when
-/// combined with `-action reboot=shutdown` and a host-side relaunch — see
-/// `scripts/cargo_runner.sh`'s `KERNEL_DROPOFF` and
-/// `docs/runbooks/selfhost-kernel-build.md`.
-///
-/// Callers should sync filesystems first; this does not return.
-pub fn system_reset() -> ! {
-    // Discarded deliberately: on success this does not return at all, so a
-    // returned status can only mean the call failed — which the loop below
-    // already handles. There is no caller left to report it to.
-    let _ = akuma_psci::call(akuma_psci::SYSTEM_RESET, 0, 0, 0);
-    // `SYSTEM_RESET` does not return on success, so reaching here means the call
-    // itself failed — typically no PSCI conduit. There is nothing sensible left
-    // to do: the syscall dispatcher is not set up to receive a return from this
-    // path, and the caller has already synced and announced the reboot.
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
-/// Whole-machine PSCI `SYSTEM_OFF`. See [`system_reset`] for the shared
-/// reasoning; likewise does not return.
-pub fn system_off() -> ! {
-    let _ = akuma_psci::call(akuma_psci::SYSTEM_OFF, 0, 0, 0);
-    loop {
-        core::hint::spin_loop();
     }
 }

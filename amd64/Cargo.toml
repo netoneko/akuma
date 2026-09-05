@@ -34,6 +34,14 @@ akuma-multiboot2 = { path = "../crates/akuma-multiboot2" }
 # reference machine. Nothing calls it yet — that needs PCI enumeration — but it
 # belongs to this target, which is the only one with the part.
 akuma-net-rtl8169 = { path = "../crates/akuma-net-rtl8169" }
+# PCI configuration-space parsing — the header, BAR decode and capability list,
+# host-tested against config space read off the bare-metal reference machine.
+# `src/pci.rs` is the `0xCF8`/`0xCFC` mechanism half; this is the parsing.
+akuma-pci = { path = "../crates/akuma-pci" }
+# Linux `reboot(2)` ABI decode, shared with the aarch64 kernel's `sc-reboot`.
+# `src/pci.rs`'s sibling `src/reboot.rs` adds the x86 reset that `akuma-boot`'s
+# own `system_reset` (a PSCI `smc`) cannot do here.
+akuma-boot = { path = "../crates/akuma-boot", default-features = false }
 # ELF parsing for the loader (`src/loader.rs`). The same vetted crate
 # `akuma-elf` parses through, at the same version, so the tree still has one ELF
 # parser — the aarch64 loader itself is unusable here because it is written
@@ -66,6 +74,10 @@ spinning_top = "0.3"
 akuma-syscalls-mem = { path = "../crates/akuma-syscalls-mem" }
 # The shared flag tables the decode is written against.
 akuma-syscalls-linux = { path = "../crates/akuma-syscalls-linux" }
+# The read-only interface-introspection marshalling (`SIOCGIF*`,
+# `/proc/net/dev`) — the byte layout `busybox ifconfig` reads, shared with the
+# aarch64 kernel so the two cannot drift on the `struct ifreq` stride.
+akuma-syscalls-net = { path = "../crates/akuma-syscalls-net" }
 # The console line discipline: canonical mode, echo, backspace, Ctrl+D, and
 # `map_cr_to_nl`. Hand-rolling a console reader hits the CR-vs-NL bug on the
 # first Enter keypress; this crate is the tree's answer and is dependency-free.

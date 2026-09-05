@@ -101,6 +101,16 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   A/B/A — `docs/reference/subsystems/syscalls/mem.md`). `mem_op_cost` takes a
   third argument `hostile`; `hostile=0` skips the two arms a pre-fix kernel
   cannot survive, which is what lets a baseline arm run at all.
+  `akuma-syscalls-net` is a fifth (2026-09-05), and the first pulled out *for
+  the amd64 port* rather than for host tests alone: the read-only
+  interface-introspection surface `busybox ifconfig` reads — the `struct ifreq`
+  marshalling, the 40-byte `SIOCGIFCONF` record stride (the trap
+  `docs/reference/subsystems/networking.md` records), the netmask/broadcast
+  derivation, the `/proc/net/dev` column format. It was inside
+  `akuma-syscalls-glue`, which does not build for `x86_64-unknown-none`; now
+  both `akuma-syscalls-glue::net` and `amd64/src/fd.rs` consume it and cannot
+  drift. Depends only on `akuma-syscalls-linux`; the user-memory copies and the
+  `FileDescriptor::Socket` gate stay with each caller.
   Further families move out on the same model when a family has real
   pure logic worth testing.
   `akuma-mmap` is virtual-memory **region bookkeeping**: `MmapRegion`,

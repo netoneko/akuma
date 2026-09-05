@@ -197,6 +197,15 @@ that line is missing entirely, the note is the first thing to suspect —
 16550 UART on I/O port `0x3F8`, polled, no interrupts. This is what Firecracker
 exposes, and it is `serial.rs`'s only target. There is no VGA path.
 
+On a bare-metal (GRUB/multiboot2) boot there is no UART at all on the reference
+box, so `serial::puts` mirrors to a **framebuffer text console** (`akuma-fbcon`,
+via GRUB's framebuffer tag). Input there is the harder half: the box's keyboard
+is USB and there is no HID stack. `crates/akuma-usb` is the host-tested parsing
+half of one — USB descriptors, the HID boot-keyboard report → ASCII decode, and
+the EHCI split-transaction queue-head layout — built against descriptors and
+registers read off the box; the controller-touching driver is the next step and
+needs [PCI enumeration](#pci), which now exists.
+
 ## Running under Firecracker
 
 **Verified 2026-09-03** on Firecracker v1.16.1, AMD Ryzen 7 8845HS (Zen 4),
@@ -287,6 +296,35 @@ a second thing to mount. Reads only: the driver and the filesystem can both
 write, but a self-test that mutated the image would make it stateful across
 boots.
 
+## PCI
+
+`src/pci.rs` + `akuma-pci`. A VMM announces every device (virtio-MMIO on the
+command line); real firmware announces nothing, so a bare-metal boot has to
+walk config space itself to find the xHCI/EHCI controllers, the Realtek NIC and
+the AHCI disk. `pci::scan()` runs right after the machine description on both
+entries — on the VMM path it finds nothing, correctly — and `pci::report()`
+prints an `lspci`-shaped dump every boot.
+
+The split is the same one the rest of this target follows: `src/pci.rs` is the
+`unsafe` mechanism (the `0xCF8`/`0xCFC` port pair, the write-1s BAR size probe,
+mapping a BAR into the device window), `akuma-pci` is the parsing (the type-0
+header, BAR address/size decode, the capability list) — host-tested against
+config space read off the HP box, so the enumeration logic is decided on a
+laptop. `net::probe_ethernet()` uses it after the self-tests to find the NIC,
+enable it, map its BAR and read the MAC off the hardware; the RTL8169 driver
+bring-up (`akuma-net-rtl8169`, already host-tested) is the next step.
+
+## Reboot
+
+`reboot(2)` (x86_64 169) is wired: `akuma-boot::decode` — the same ABI decode
+the aarch64 kernel's `sc-reboot` uses, host-tested against the values musl
+sends — turns the magic + command into an action, and `src/reboot.rs` performs
+it. The x86 machine reset is three fallbacks: the `0xCF9` reset-control
+register, an i8042 pulse, then a triple fault. `busybox reboot`/`halt`/
+`poweroff` all land here; `poweroff` halts (no ACPI PM block on this target).
+The decode and the syscall's `EINVAL` path are self-tested; the reset itself is
+checked by hand on the box.
+
 ## Before writing anything here, check `crates/`
 
 This target exists to *use* the tree's crates, not to re-derive them, and the
@@ -319,7 +357,7 @@ and each entry has one of three reasons:
 | `akuma-syscalls-glue` (incl. its `pipe`) | **Not reached yet** (it needs `akuma-exec`). `amd64/src/{fd,usermode}.rs` hold the file/spawn/pipe syscall bodies; the pure pipe buffer was extracted to `akuma-pipe` rather than re-derived. Until 2026-09-05 it could not build at all, through `akuma-user-access`'s AArch64 asm |
 | `akuma-uart`, `akuma-gic`, `akuma-psci`, `akuma-exceptions`, `akuma-el0-entry`, `akuma-entry`, `akuma-timer`, `akuma-fdt`, `akuma-firecracker` | **Different hardware.** PL011 vs a 16550 on I/O ports, GICv3 vs LAPIC, PSCI vs nothing, an FDT vs a PVH block. Genuinely arch- or machine-specific |
 | `akuma-exec`, `akuma-exec-core`, `akuma-threading`, `akuma-slot-table`, `akuma-syscalls`, `akuma-kernel-core`, `akuma-kernel-glue`, `akuma-vfs-glue`, `akuma-bkl` | **Not reached yet.** The process/exec/SMP layer. `akuma-exec-core` supplied `FileDescriptor`/`KernelFile`; its `Process` and the fork/exec of `akuma-exec` are what Stage T (§3.26) needs |
-| `akuma-rump`, `akuma-fpcache`, `akuma-kacho`, `akuma-isolation`, `akuma-syscalls-{poll,sync,time,ipc,log}`, `akuma-boot`, `akuma-config` | **Not needed yet.** All build for `x86_64-unknown-none`; none has a consumer on this target |
+| `akuma-rump`, `akuma-fpcache`, `akuma-kacho`, `akuma-isolation`, `akuma-syscalls-{poll,sync,time,ipc,log}`, `akuma-config` | **Not needed yet.** All build for `x86_64-unknown-none`; none has a consumer on this target |
 
 What amd64 *does* use, and what each replaced:
 
@@ -335,6 +373,10 @@ What amd64 *does* use, and what each replaced:
 | `mmap` decode | `akuma-syscalls-mem` | after a correction — it was hand-rolled first |
 | console line discipline | `akuma-terminal` | canonical mode, echo, `map_cr_to_nl` |
 | syscall identity | `akuma-syscalls-abi`, `akuma-syscalls-linux` | `write` is 1 here and 64 on aarch64 |
+| PCI enumeration | `akuma-pci` | header / BAR / capability decode, host-tested against the box's config space; `src/pci.rs` is the `0xCF8`/`0xCFC` mechanism (below) |
+| `reboot(2)` decode | `akuma-boot` (`default-features = false`) | the ABI decode is shared with aarch64's `sc-reboot`; `src/reboot.rs` adds the x86 reset (`0xCF9`, i8042, triple-fault) the PSCI-based `system_reset` can't do here |
+| interface introspection | `akuma-syscalls-net` | the `SIOCGIF*` / `/proc/net/dev` byte layout `busybox ifconfig` reads, shared with the aarch64 kernel; `src/fd.rs` does the user copies |
+| USB descriptor / HID parsing | `akuma-usb` | not wired yet — the host-tested parsing half of a bare-metal USB keyboard |
 | self-tests | `akuma-selftest` | the pass/fail tally |
 
 ## Networking
@@ -342,7 +384,13 @@ What amd64 *does* use, and what each replaced:
 `akuma-net` and `akuma-net-nic` run unmodified; `src/net.rs` supplies the twelve
 `NetRuntime` hooks and `src/sock.rs` wires the socket syscalls. The NIC is found
 by the same command-line discovery the disk uses — another slot in the same
-array.
+array (on bare metal, [PCI](#pci) instead).
+
+`busybox ifconfig` works: `src/fd.rs` answers the read-only `SIOCGIF*` ioctls
+and serves a generated `/proc/net/dev`, both through `akuma-syscalls-net` — the
+same `struct ifreq` / column layout the aarch64 kernel uses, extracted so the
+two cannot drift on the 40-byte record stride that once broke `ifconfig -a`.
+Read-only: no `SIOCSIF*`, no netlink.
 
 ```bash
 amd64/run.sh                       # NIC on virtio-mmio-bus.1, port 8080 forwarded
@@ -454,10 +502,14 @@ bare-metal boot. `SMP=1` is the single-core boot every earlier stage ran.
   T**: `pipe2` (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.26 — `getdents64`,
   step 5, shipped 2026-09-04).
 - **Console input is the UART or an i8042 keyboard, polled** (`input.rs`,
-  `kbd.rs`; both probed at boot and reported as `uart:`/`kbd:`). No USB, so a
-  USB keyboard works only where firmware presents it on the i8042 — QEMU's `pc`
-  machine does, the HP reference box does not (`docs/archive/
-  AKUMA_AMD64_ON_HP_500_502NJ.md`).
+  `kbd.rs`; both probed at boot and reported as `uart:`/`kbd:`). No USB **HID
+  stack** yet — QEMU's `pc` machine presents a USB keyboard on the i8042 and
+  that path works; the HP reference box does not, and its keyboard is a
+  full-speed device on EHCI behind a TT (`XUSB2PRM = 0` — it can never be on
+  xHCI). `crates/akuma-usb` is the host-tested parsing half (descriptors, HID
+  boot report → ASCII, the EHCI split-transaction queue head); the EHCI
+  controller driver on top of it is not written. Details:
+  `docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md`.
 - **No pty line discipline for a spawned shell.** `SPAWN_FLAG_PTY` is accepted
   and ignored; an interactive `sshd` shell gets raw bytes over its stdin pipe
   and does its own editing.

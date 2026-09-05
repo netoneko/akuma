@@ -68,12 +68,14 @@ name = "akuma-amd64"
 version = "0.0.7"
 dependencies = [
  "akuma-alloc",
+ "akuma-boot",
  "akuma-exec-core",
  "akuma-ext2",
  "akuma-fbcon",
  "akuma-multiboot2",
  "akuma-net",
  "akuma-net-rtl8169",
+ "akuma-pci",
  "akuma-pipe",
  "akuma-pmm",
  "akuma-primitives",
@@ -83,6 +85,7 @@ dependencies = [
  "akuma-syscalls-abi",
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
+ "akuma-syscalls-net",
  "akuma-syscalls-poll",
  "akuma-terminal",
  "akuma-user-access",
@@ -409,6 +412,10 @@ name = "akuma-not-even-once"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-pci"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-pipe"
 version = "0.1.0"
 
@@ -499,6 +506,7 @@ dependencies = [
  "akuma-syscalls-linux",
  "akuma-syscalls-log",
  "akuma-syscalls-mem",
+ "akuma-syscalls-net",
  "akuma-syscalls-poll",
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
@@ -540,6 +548,13 @@ name = "akuma-syscalls-mem"
 version = "0.1.0"
 dependencies = [
  "akuma-primitives",
+ "akuma-syscalls-linux",
+]
+
+[[package]]
+name = "akuma-syscalls-net"
+version = "0.1.0"
+dependencies = [
  "akuma-syscalls-linux",
 ]
 
@@ -642,6 +657,7 @@ dependencies = [
  "akuma-primitives",
  "akuma-syscalls-ipc",
  "akuma-syscalls-log",
+ "akuma-syscalls-net",
  "akuma-timer",
  "akuma-vfs",
  "akuma-virtio",

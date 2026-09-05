@@ -35,6 +35,9 @@ spinning_top = "0.3"
 # and `src/syscall/` reads 37 symbols back out of here — a cycle Cargo cannot
 # express. See docs/archive/SRC_SYSCALL_EXTRACTION.md Blocker 1.
 akuma-syscalls-log = { path = "../akuma-syscalls-log" }
+# The `/proc/net/dev` column layout, shared with the ioctl path and the amd64
+# port so `busybox ifconfig`'s strict parser sees one format.
+akuma-syscalls-net = { path = "../akuma-syscalls-net" }
 akuma-syscalls-ipc = { path = "../akuma-syscalls-ipc", optional = true }
 
 [features]

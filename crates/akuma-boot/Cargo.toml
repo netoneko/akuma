@@ -7,7 +7,17 @@ description = "Boot/reboot logic: reboot(2) ABI decode plus the PSCI SYSTEM_RESE
 [dependencies]
 # The conduit that actually issues the call. A separate crate so this one keeps
 # `#![forbid(unsafe_code)]` — the `smc`/`hvc` asm lives there, not here.
-akuma-psci = { path = "../akuma-psci" }
+# Optional so the amd64 kernel can reach `decode` (pure) without dragging in
+# AArch64 `smc`/`hvc` asm that will not assemble for `x86_64-unknown-none`.
+# `system_reset`/`system_off` are gated on it; the aarch64 kernel keeps the
+# default and is unaffected.
+akuma-psci = { path = "../akuma-psci", optional = true }
+
+[features]
+default = ["psci"]
+# The PSCI `SYSTEM_RESET`/`SYSTEM_OFF` performers. Off for non-AArch64 targets,
+# which supply their own reset (`amd64/src/reboot.rs`).
+psci = ["dep:akuma-psci"]
 
 [lints]
 workspace = true

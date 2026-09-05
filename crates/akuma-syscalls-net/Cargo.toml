@@ -1,0 +1,13 @@
+[package]
+name = "akuma-syscalls-net"
+version = "0.1.0"
+edition = "2024"
+description = "The read-only network-introspection syscalls (SIOCGIF*, /proc/net/dev) as pure marshalling — the byte layout busybox ifconfig reads, shared by the aarch64 kernel and the amd64 port."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Just the ABI shapes: SIZEOF_IFREQ, IFNAMSIZ, ARPHRD_ETHER. A dependency-free
+# leaf, so this crate stays one too.
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
