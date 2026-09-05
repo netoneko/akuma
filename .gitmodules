@@ -20,3 +20,6 @@
 	path = userspace/rumpkernel/src-netbsd
 	url = https://github.com/netoneko/src-netbsd.git
 	branch = akuma-integration
+[submodule "crates/akuma-fbcon/vendor/spleen"]
+	path = crates/akuma-fbcon/vendor/spleen
+	url = https://github.com/fcambus/spleen

@@ -565,3 +565,101 @@ Three traps in the tooling, all self-inflicted and all worth remembering:
 Also worth raising: the console grid is 128x64 and 1080p at scale 2 needs 61
 rows. A mode with more rows will clip rather than crash, but the margin is
 thinner than it looks.
+
+---
+
+# Update — 2026-09-05, the root filesystem and a shell
+
+**Akuma mounts a real ext2 filesystem on bare metal, runs its own test suite
+there — 151 passed, 0 failed — loads an ELF off that filesystem, and drops into
+`/bin/sh`.** No storage driver is involved: GRUB reads the image off the disk it
+already knows how to read and leaves it in RAM (`module2`), and the kernel mounts
+it through a block device that is simply memory (`amd64/src/ramdisk.rs`).
+
+The PVH path is unregressed at 196/196, and now gets 2047 MiB of RAM rather than
+1 GiB — see bug 5 below.
+
+## Five bugs, each of which only exists on real firmware
+
+None of these can happen under a VMM, which is why none of them had been seen
+before. All were found in the QEMU+OVMF+GRUB rig rather than by rebooting.
+
+### 1. `sysretq` is `#UD` without `EFER.SCE`
+
+`usermode::init_syscall()` writes `IA32_STAR`/`LSTAR`/`SFMASK` **and sets
+`EFER.SCE`**. The bare-metal entry omitted it, so the first ring-3 entry raised
+an invalid-opcode exception one instruction in — at `enter_user_mode+0x2c`,
+after every other test had passed. The lesson is not about that MSR: it is that
+a second boot path which *replicates* an init sequence will drift from it. The
+sequence in `kmain` is the source of truth and `kmain_mb2` says so in a comment,
+but the real fix is to share it.
+
+### 2. UEFI's memory map is fragmented, and "the region containing the kernel"
+is the wrong question
+
+`mem::init` chose the RAM region containing the kernel image, on the reasoning
+that picking any other would hand the PMM frames while the kernel sat somewhere
+it had never heard of. That is right on a VMM, which reports two or three big
+regions.
+
+**UEFI reports dozens**, carved up by how the firmware itself used memory. On
+this machine the region containing the kernel is `0x100000..0x800000` — **seven
+megabytes, on a box with sixteen gigabytes** — and a 64 MiB heap does not fit in
+it. The boot failed with "heap does not fit in the region holding the kernel".
+
+Two changes followed. `akuma-multiboot2::usable_coalesced` sorts and merges
+abutting usable regions before anything looks at them (UEFI splits contiguous
+RAM into runs of separate entries), and `mem::init` now takes **whichever usable
+region has the most room after everything already in it**. Containment stops
+being necessary once the PMM is given a single region: anything outside that
+region is never handed out, which is exactly what protects a kernel image or a
+loader-placed module living elsewhere.
+
+### 3. A boot loader's modules are not marked used in the memory map
+
+GRUB reports the frames holding the module as ordinary available memory. A
+kernel that seeds its allocator from the map alone therefore hands out the pages
+containing **its own root filesystem**, and the corruption appears later and
+somewhere else, looking like a filesystem bug.
+
+Worse, the heap started at `_kernel_end`, and "just after the kernel" is a
+favourite place for a loader to drop a module — so the allocator would have been
+placed directly on top of it. `mem::init_reserving` now raises the heap above
+anything the caller placed in RAM and reserves it from the PMM.
+
+### 4. Scrolling a 4K framebuffer redraws seven million pixels
+
+Video memory is uncached, so the console keeps its text in RAM and re-draws
+rather than reading back (see `akuma-fbcon`'s header). The naive version redrew
+every cell on every scroll: at 3840x2160 that is over 13000 cells of 512 pixels
+each, nearly seven million uncached writes **per line of output**, and the suite
+prints around two hundred lines. The machine would have looked hung for minutes.
+
+`Console::scroll` now compares each cell against what will replace it and draws
+only the difference. Console output is short lines on a wide grid, so most cells
+are blank both before and after and cost nothing. `tests/render.rs` pins it:
+a scroll must cost under an eighth of a full redraw.
+
+### 5. `PHYSMAP_LIMIT` was lying
+
+The constant said 1 GiB, describing a `boot.s` that built one page directory.
+`boot.s` had grown to four (bug: the framebuffer is a PCI BAR at `0xE000_0000`),
+so the physmap covered 4 GiB and the constant did not. It capped the PMM at 1 GiB
+on every target, VMM included. Raised to 4 GiB, which is also what makes the
+LAPIC at `0xFEE0_0000` reachable. **The constant and the page tables describe the
+same thing and must move together.**
+
+## And one that is not a kernel bug at all
+
+The shell came up and then the screen filled with replacement glyphs. `sh` was
+reading a stdin that never stops producing bytes: **an absent x86 I/O port reads
+`0xFF`**, so polling a 16550 that is not there yields an endless stream of
+`0xFF` rather than "no data". Not a missing keyboard — a *phantom* one. The fix
+is to probe for the UART at init (the scratch-register test) and report no data
+when it is absent.
+
+The real gap remains input. This board's keyboard is USB, there is no HID stack,
+and the machine has no serial port — so an interactive shell on the framebuffer
+cannot be driven at all. **Networking is the path to a usable shell here**, not a
+keyboard driver, which puts PCI enumeration and `akuma-net-rtl8169` on the
+critical path for something other than throughput.
