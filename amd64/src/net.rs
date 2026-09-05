@@ -398,6 +398,115 @@ extern "C" fn netpoll_daemon() -> ! {
     }
 }
 
+// The network probe
+// ============================================================================
+
+/// How often [`probe_daemon`] prints, in microseconds.
+const PROBE_PERIOD_US: u64 = 2_000_000;
+
+/// A live NIC status line, printed every [`PROBE_PERIOD_US`] for ever.
+///
+/// This exists because of one boot. On the HP box the only console is a
+/// framebuffer, and the only network diagnostic available was `busybox
+/// ifconfig` — which prints an address, a set of flags, and **counters that are
+/// hardcoded zeros** (`akuma_syscalls_net::write_proc_net_dev` writes literal
+/// `0`s; busybox reads them from `/proc/net/dev`). So a boot that showed
+/// `eth0 UP ... RX packets:0 TX packets:0` was consistent with a NIC moving
+/// nothing *and* with one moving thousands of frames a second, and there was no
+/// way to tell which from the screen. That is a diagnostic that cannot fail,
+/// which makes it worse than none.
+///
+/// Every number here is real and read from the device layer:
+///
+/// * `link` — the PHY, sampled by the Realtek glue (`akuma_net::smoltcp_net::link_state`).
+///   Distinguishes "the cable is not carrying" from "the driver is not
+///   receiving", which look identical from `ifconfig` and have completely
+///   different fixes.
+/// * `rx` — frames that actually came off the ring. On any real LAN this climbs
+///   within seconds from broadcast traffic alone, with nothing configured; a
+///   flat zero next to a link that is up is a receive-path bug and nothing else.
+/// * `tx` / `drop` — frames the chip accepted / refused. DHCP retries on its own,
+///   so `tx` climbing proves the transmit path without anything having to ask.
+/// * `polls` — `smoltcp_net::poll()` laps, the proof the stack is still being
+///   driven at all. `cycle_forever` used to stop driving it the moment `init`
+///   exited, which is how a machine that had answered nothing looked like a
+///   dead NIC.
+extern "C" fn probe_daemon() -> ! {
+    let mut next = 0u64;
+    loop {
+        let now = uptime_us();
+        if now >= next {
+            next = now + PROBE_PERIOD_US;
+            print_probe_line(now);
+        }
+        crate::sched::yield_now();
+    }
+}
+
+/// One status line. Split out so a caller with no scheduler (a one-shot dump)
+/// can print the same thing.
+pub fn print_probe_line(now_us: u64) {
+    let info = akuma_net::smoltcp_net::interface_snapshot();
+    serial::puts("[probe] t=");
+    serial::put_dec(now_us / 1_000_000);
+    serial::puts("s link=");
+    match akuma_net::smoltcp_net::link_state() {
+        None => serial::puts("unsampled"),
+        Some((up, mbit, fd)) => {
+            serial::puts(if up { "up/" } else { "DOWN/" });
+            serial::put_dec(u64::from(mbit));
+            serial::puts(if fd { "M/full" } else { "M/half" });
+        }
+    }
+    serial::puts(" ip=");
+    for (i, o) in info.ip.iter().enumerate() {
+        if i > 0 {
+            serial::puts(".");
+        }
+        serial::put_dec(u64::from(*o));
+    }
+    serial::puts("/");
+    serial::put_dec(u64::from(info.prefix_len));
+    serial::puts(" dhcp=");
+    serial::puts(if !akuma_net::smoltcp_net::is_dhcp_enabled() {
+        "off"
+    } else if akuma_net::smoltcp_net::is_dhcp_configured() {
+        "leased"
+    } else {
+        "pending"
+    });
+
+    let (posted, begin_fail, received) = akuma_net::smoltcp_net::rx_counters();
+    serial::puts(" | rx=");
+    serial::put_dec(received as u64);
+    serial::puts(" posted=");
+    serial::put_dec(posted as u64);
+    serial::puts(" rxfail=");
+    serial::put_dec(begin_fail as u64);
+    serial::puts(" | tx=");
+    serial::put_dec(akuma_net::smoltcp_net::tx_frames_sent() as u64);
+    serial::puts(" drop=");
+    serial::put_dec(akuma_net::smoltcp_net::tx_drop_count() as u64);
+    serial::puts(" | irq=");
+    serial::put_dec(akuma_net::smoltcp_net::nic_irq_count());
+    serial::puts(" polls=");
+    serial::put_dec(akuma_net::smoltcp_net::poll_count() as u64);
+    serial::puts("\n");
+}
+
+/// Spawn [`probe_daemon`]. Gated by the caller on the `netprobe` command-line
+/// flag: the line is two seconds apart for ever, which is right for a bring-up
+/// and wrong for a machine anyone is trying to read other output on.
+pub fn spawn_probe() -> bool {
+    let ok = crate::sched::spawn_daemon(probe_daemon).is_some();
+    serial::puts(if ok {
+        "  net:  probe daemon spawned (netprobe)\n"
+    } else {
+        "  net:  [WARN] no task slot for the probe daemon\n"
+    });
+    ok
+}
+
 /// Spawn the netpoll daemon. Returns false only if the task table is full, which
 /// is a bug (the table is sized for it) rather than a condition to handle.
 pub fn spawn_netpoll() -> bool {

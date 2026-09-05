@@ -21,6 +21,17 @@ pub fn is_ready() -> bool {
 /// Returns true immediately if DHCP is disabled.
 pub(crate) static DHCP_CONFIGURED: AtomicBool = AtomicBool::new(false);
 
+/// Is the DHCP client running at all?
+///
+/// [`is_dhcp_configured`] answers `true` when DHCP is *disabled*, which is
+/// right for its callers ("is the address settled?") and actively misleading
+/// in a diagnostic, where "dhcp=yes" on a loopback-only kernel that never ran a
+/// DHCP client is the opposite of the truth.
+#[must_use]
+pub fn is_dhcp_enabled() -> bool {
+    DHCP_ENABLED.load(Ordering::Relaxed)
+}
+
 pub fn is_dhcp_configured() -> bool {
     if !DHCP_ENABLED.load(Ordering::Relaxed) {
         return true;

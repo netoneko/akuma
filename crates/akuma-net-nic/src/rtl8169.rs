@@ -37,7 +37,7 @@ use akuma_primitives::addr::virt_to_phys;
 use akuma_primitives::mmio::MmioReg;
 use smoltcp::phy::DeviceCapabilities;
 
-use crate::counters::TX_DROP_COUNT;
+use crate::counters::{RX_FRAMES_RECEIVED, TX_DROP_COUNT, TX_FRAMES_SENT};
 
 /// Descriptors per ring. A power of two, small — this is a bring-up NIC on a
 /// polled single-core kernel, not a throughput target.
@@ -233,8 +233,13 @@ impl Rings for Rtl8169Rings {
 }
 
 /// The Realtek NIC behind [`ExternalDevice::Rtl8169`](crate::ExternalDevice).
+/// How many receive laps between PHY samples. See [`Rtl8169Device::take_rx_frame`].
+const LINK_SAMPLE_LAPS: u32 = 1024;
+
 pub struct Rtl8169Device {
     nic: Nic<Rtl8169Regs, Rtl8169Rings>,
+    /// Lap counter for the periodic PHY sample.
+    link_poll: u32,
     /// The copy-out receive path's target, handed up to smoltcp as an
     /// `RxToken`. smoltcp may build a reply through a `TxToken` **while that
     /// token is live**, so the transmit path stages in `tx_scratch` instead.
@@ -255,7 +260,17 @@ impl Rtl8169Device {
     pub unsafe fn probe(bar: *mut u8) -> Result<Self, akuma_net_rtl8169::Error> {
         let mut nic = Nic::probe(Rtl8169Regs { base: bar as usize }, Rtl8169Rings)?;
         nic.init()?;
-        Ok(Self { nic, rx_scratch: [0; BUF_LEN], tx_scratch: [0; BUF_LEN] })
+        // Publish the link once at bring-up, so a probe that reads it before the
+        // first receive lap sees a real answer rather than "never sampled".
+        let l = nic.link();
+        let mbit = match l.speed {
+            akuma_net_rtl8169::Speed::Mb10 => 10,
+            akuma_net_rtl8169::Speed::Mb100 => 100,
+            akuma_net_rtl8169::Speed::Mb1000 => 1000,
+            akuma_net_rtl8169::Speed::Unknown => 0,
+        };
+        crate::counters::set_link_state(l.up, mbit, l.full_duplex);
+        Ok(Self { nic, link_poll: 0, rx_scratch: [0; BUF_LEN], tx_scratch: [0; BUF_LEN] })
     }
 
     #[must_use]
@@ -274,7 +289,35 @@ impl Rtl8169Device {
         // Reap finished transmits each poll lap — the only place they get
         // harvested on a request/response workload.
         self.nic.reclaim_tx();
+
+        // Sample the PHY every so often and publish it (`counters::link_state`).
+        // Periodically rather than per lap because reading it is an MDIO
+        // transaction, which is slow enough to matter on a poll loop that runs
+        // thousands of times a second — and the link does not change that fast.
+        //
+        // This exists because the bare-metal bring-up had no way to tell "the
+        // cable is not carrying" from "the driver is not receiving": both look
+        // like an interface that is UP with nothing arriving. One is a
+        // five-second fix at the switch and the other is a driver bug.
+        self.link_poll = self.link_poll.wrapping_add(1);
+        if self.link_poll.is_multiple_of(LINK_SAMPLE_LAPS) {
+            let l = self.nic.link();
+            let mbit = match l.speed {
+                akuma_net_rtl8169::Speed::Mb10 => 10,
+                akuma_net_rtl8169::Speed::Mb100 => 100,
+                akuma_net_rtl8169::Speed::Mb1000 => 1000,
+                akuma_net_rtl8169::Speed::Unknown => 0,
+            };
+            crate::counters::set_link_state(l.up, mbit, l.full_duplex);
+        }
+
         let n = self.nic.receive(&mut self.rx_scratch)?;
+        // Only reached when a frame really came off the ring, so this counts
+        // wire arrivals. The virtio path bumps the same counter in `device.rs`;
+        // until 2026-09-05 this one bumped nothing, so `rx_counters()` read a
+        // flat zero on the only target that has this chip — the exact number
+        // the bring-up needed.
+        RX_FRAMES_RECEIVED.fetch_add(1, Ordering::Relaxed);
         // The pointer's provenance is `rx_scratch` (a field), not `self`
         // broadly — the borrow checker cannot see that through
         // `from_raw_parts`, which is why the virtio path hands back a raw
@@ -295,6 +338,8 @@ impl Rtl8169Device {
         }
         if self.nic.transmit(&self.tx_scratch[..end]).is_err() {
             TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            TX_FRAMES_SENT.fetch_add(1, Ordering::Relaxed);
         }
         res
     }

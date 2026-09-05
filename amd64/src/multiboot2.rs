@@ -253,6 +253,14 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     };
     con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
     con.clear();
+    // Which font and grid the console actually chose. `Console::choose_font`
+    // takes that decision from the framebuffer size at runtime — JetBrains Mono
+    // whenever it reaches 80x24, Spleen when it cannot — so on a machine whose
+    // only output IS this console, "what am I looking at" was a question only
+    // answerable by re-deriving the arithmetic from the mode GRUB happened to
+    // pick. Now the console says so itself, in itself.
+    let (fname, fw, fh) = (con.font().name(), con.font().width(), con.font().height());
+    let (fcols, frows, fscale) = (con.cols(), con.rows(), con.scale());
     *CONSOLE.lock() = Some(FbConsole(con));
     ega_text(2, "console up");
 
@@ -269,6 +277,19 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // which this kernel never does. See `kbd`.
     serial::puts("  kbd: ");
     serial::puts(if crate::kbd::init() { "i8042 present" } else { "no i8042" });
+    serial::puts("\n  font: ");
+    serial::puts(fname);
+    serial::puts(" ");
+    serial::put_dec(fw as u64);
+    serial::puts("x");
+    serial::put_dec(fh as u64);
+    serial::puts(" scale ");
+    serial::put_dec(fscale as u64);
+    serial::puts(" -> ");
+    serial::put_dec(fcols as u64);
+    serial::puts("x");
+    serial::put_dec(frows as u64);
+    serial::puts(" cells");
     serial::puts("\n  fb:   ");
     serial::put_dec(u64::from(fb.width));
     serial::puts("x");
@@ -420,9 +441,13 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // Drive the stack: `poll()` has to run between socket calls for a
     // connection to complete (loopback or the wire). `ifconfig` needs none of
     // this, but a shell that opens a socket does.
+    let netprobe = info.cmdline().split_ascii_whitespace().any(|t| t == "netprobe");
     if have_net {
         crate::lapic::start_timer();
         crate::net::spawn_netpoll();
+        if netprobe {
+            crate::net::spawn_probe();
+        }
     }
 
     // Hand the machine to a shell. After the verdict and only on a passing run,
@@ -453,7 +478,13 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         crate::usermode::run_init(path, &args);
     }
 
-    cycle_forever()
+    // Keep driving the scheduler as long as there is a network stack behind it:
+    // the netpoll daemon is what answers ARP and ICMP and services a listening
+    // socket, and an `init` that exits must not take the machine off the
+    // network with it. On a box whose only console is this framebuffer, being
+    // pingable after `init` is done is the difference between diagnosable and
+    // silent.
+    cycle_forever(have_net)
 }
 
 /// The `init=` argument from the boot loader's command line, or `/bin/sh`.
@@ -510,10 +541,16 @@ fn machine_from(info: &BootInfo<'_>) -> MachineDescription {
 /// screen. A band that keeps changing says the CPU is still executing our code,
 /// which is the single fact hardest to establish on a machine with no serial
 /// port, no network and no disk output.
-fn cycle_forever() -> ! {
+fn cycle_forever(keep_scheduling: bool) -> ! {
     // The BSP is done with kernel code; the secondaries are not (their idle
     // loops keep taking ticks). See `smp::bkl_abandon`.
-    crate::smp::bkl_abandon();
+    //
+    // NOT when this loop is still going to drive the scheduler: abandoning the
+    // lock and then yielding into tasks that take it is a contradiction. The
+    // caller decides, and it decides on whether anything is left to schedule.
+    if !keep_scheduling {
+        crate::smp::bkl_abandon();
+    }
     let palette = [
         Rgb::new(0xE0, 0x50, 0x50),
         Rgb::new(0xE0, 0xC0, 0x40),
@@ -537,7 +574,19 @@ fn cycle_forever() -> ! {
         }
         i += 1;
         for _ in 0..CYCLE_SPINS {
-            core::hint::spin_loop();
+            // Yielding rather than only spinning, when there is something left
+            // to run. Without this the netpoll daemon stops the instant `init`
+            // exits, and the machine goes from "reachable" to answering
+            // nothing — no ARP, no ICMP, no listening socket — while the colour
+            // band happily keeps cycling to say the CPU is fine. That cost a
+            // whole reboot cycle on the HP box: a boot whose `init` was
+            // `busybox ifconfig` (prints, exits in milliseconds) looked
+            // identical to a NIC that could not receive.
+            if keep_scheduling {
+                crate::sched::yield_now();
+            } else {
+                core::hint::spin_loop();
+            }
         }
     }
 }

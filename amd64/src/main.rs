@@ -346,6 +346,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
             lapic::stop_timer();
         }
         net::netpoll_spawn_selftest(&mut t);
+        // The same `netprobe` flag the bare-metal path honours. Wired here too
+        // so the probe can be exercised in a rig under KVM rather than only by
+        // rebooting the machine it exists for — a diagnostic whose first run is
+        // on the metal is a diagnostic nobody has tested.
+        if machine::flag(hvm_start_info, "netprobe") {
+            net::spawn_probe();
+        }
     }
 
     drop(user_ptr_bypass);

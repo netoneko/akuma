@@ -438,6 +438,27 @@ enum adds one `match` arm and no allocation.
 kernel uses. On a loopback-only boot `eth0` shows `0.0.0.0` (no address
 configured, not the fallback). Read-only: no `SIOCSIF*`, no netlink.
 
+### `netprobe` — the live NIC status line
+
+`netprobe` on the kernel command line spawns a daemon that prints, every two
+seconds, for ever:
+
+```
+[probe] t=12s link=up/1000M/full ip=192.168.1.220/24 dhcp=pending | rx=418 posted=419 rxfail=0 | tx=96 drop=0 | irq=0 polls=111
+```
+
+Use it instead of `busybox ifconfig`, which **cannot answer a network question
+on this target**: `akuma_syscalls_net::write_proc_net_dev` writes literal zeros
+for every counter, so its `RX packets:0 TX packets:0` reads identically on a
+dead NIC and a busy one. Every field above is read from the device layer:
+`link` from the PHY, `rx` from frames actually taken off the ring, `tx` from
+frames the chip accepted, `polls` from `smoltcp_net::poll()` laps. `dhcp` is
+`off` / `pending` / `leased` — note that `is_dhcp_configured()` answers `true`
+when DHCP is *disabled*, so the probe uses `is_dhcp_enabled()` beside it.
+
+Wired on both entry paths (PVH and multiboot2), so it can be exercised under
+KVM rather than only by rebooting the machine it exists for.
+
 ### The pre-DHCP address
 
 The static address the interface carries until DHCP answers — and reverts to if

@@ -934,3 +934,108 @@ add. It is the next thing worth doing for this machine.
 arch,world,keys}` with all five signing keys, `/lib/apk/db`, `/var/cache/apk`),
 as do the HTTPS roots: `/etc/ssl/cert.pem` and
 `/etc/ssl/certs/ca-certificates.crt`, 121 certificates.
+
+
+---
+
+# Update — 2026-09-05 (later), the diagnostic that could not fail
+
+The first `grub-reboot` to the herd entry booted **the wrong entry** — the older
+`busybox ifconfig` one — and the machine answered nothing on the network. Two
+separate causes, both worth writing down, and neither of them the NIC.
+
+## `busybox ifconfig` was never a network diagnostic
+
+`akuma_syscalls_net::write_proc_net_dev` writes **literal zeros** for every
+counter, and busybox `ifconfig` reads them from `/proc/net/dev`. So
+`RX packets:0 TX packets:0` on the screen was consistent with a NIC moving
+nothing *and* with one moving thousands of frames a second. Verified rather than
+assumed: an ssh session that was demonstrably passing traffic printed the same
+zeros. A diagnostic that reads the same whatever happens is worse than none, and
+this one had been the only network output the bare-metal boot produced.
+
+`netprobe` replaces it — a kernel-side daemon (`amd64/src/net.rs`) printing every
+two seconds:
+
+```
+[probe] t=12s link=up/1000M/full ip=192.168.1.220/24 dhcp=pending | rx=418 posted=419 rxfail=0 | tx=96 drop=0 | irq=0 polls=111
+```
+
+Every number is real and reads through no lock:
+
+- `link` — the PHY, sampled by the Realtek glue every 1024 receive laps
+  (`akuma_net_nic::link_state`). This is the field that separates "the cable is
+  not carrying" from "the driver is not receiving", which are indistinguishable
+  from `ifconfig` and have completely different fixes.
+- `rx` — frames actually taken off the ring. **The Realtek path bumped no
+  counter at all before this**; `rx_counters()` read a flat zero on the only
+  target that has the chip. On any real LAN this climbs within seconds from
+  broadcast traffic alone, so a zero beside a live link is a receive-path bug
+  and nothing else.
+- `tx` / `drop` — a new `TX_FRAMES_SENT` beside the existing drop count, on both
+  the Realtek and virtio paths. A drop count alone cannot tell "nothing was
+  sent" from "nothing was asked to be sent".
+- `dhcp` — `off` / `pending` / `leased`. `is_dhcp_configured()` returns `true`
+  when DHCP is *disabled*, which is right for its callers and a lie in a
+  diagnostic, so `is_dhcp_enabled()` now exists beside it.
+- `polls` — `smoltcp_net::poll()` laps: proof the stack is still being driven.
+
+Enable with `netprobe` on the kernel command line. Wired on **both** entry paths
+(PVH and multiboot2) deliberately: a diagnostic whose first run is on the metal
+is a diagnostic nobody has tested.
+
+## `cycle_forever` took the machine off the network
+
+`init=/bin/busybox initargs=ifconfig` prints and exits in milliseconds. Then
+`run_init` returns and `kmain_mb2` called `cycle_forever()`, which abandons the
+BKL and loops drawing a colour band **without ever yielding**. The netpoll
+daemon therefore stopped the instant `init` exited: no ARP replies, no ICMP, no
+listening socket — while the band cheerfully kept cycling to say the CPU was
+fine. That is the entire reason `192.168.1.220` was unreachable and its ARP
+entry read `(incomplete)`.
+
+`cycle_forever(keep_scheduling)` now yields when there is a stack behind it, and
+only abandons the BKL when there is not (abandoning it and then yielding into
+tasks that take it is a contradiction).
+
+**That Akuma answers ARP and ICMP at all was verified, not assumed** — QEMU's
+`-netdev user` cannot be pinged from the host at all, so `/root/taprun.sh` puts
+the guest on a real tap on a real L2 segment. `4 packets transmitted, 4
+received, 0% packet loss`, neighbour `REACHABLE`, `PORT_2222_OPEN`.
+
+## One GRUB entry, and `init=/bin/sshd`
+
+There were three Akuma entries. `grub-reboot` set `next_entry`, the boot
+consumed it, and the wrong one came up anyway — an hour of reasoning about GRUB
+instead of about the machine. `/etc/grub.d/45_akuma` is now the only one, so a
+one-shot can resolve to it or to Ubuntu and the screen says which.
+
+Its command line is `init=/bin/sshd netprobe`, **not** `init=/bin/herd`: herd
+drains a service's stdout into `/var/log/herd/<svc>.log`, so on a machine whose
+only console is a framebuffer a supervised sshd fails *invisibly*. Running it
+directly puts its own startup output on the screen. Switch to herd once sshd is
+known good on this hardware and restart-on-death is worth more than visibility.
+
+## The console says what font it is in
+
+`Console::choose_font` decides at runtime from the framebuffer size — JetBrains
+Mono whenever it reaches 80x24, Spleen when it cannot — so "what am I looking
+at" was answerable only by re-deriving the arithmetic from whatever mode GRUB
+picked. The boot now prints it:
+
+```
+  font: Spleen 8x16 scale 1 -> 91x34 cells        (the 800x600 OVMF rig)
+```
+
+On the HP box, both 3840x2160 and 1920x1080 give JetBrains Mono at 146x41 cells.
+
+## Still open
+
+The RTL8168g **has not moved a frame yet as far as anyone has measured** — the
+two boots that reached the metal used the entry that exits immediately. The
+probe is what answers it: link state and a climbing (or flat) `rx=` on the next
+boot decide between a carrier problem, a receive-path bug, and a working NIC.
+
+Also noted, not fixed: `US_PER_TICK` assumes 10 ms per LAPIC tick, and under KVM
+the probe's `t=` runs roughly 6x fast. It is monotonic, and everything that uses
+it for timeouts works, but it is not seconds.

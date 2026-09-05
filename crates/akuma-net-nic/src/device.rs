@@ -9,7 +9,7 @@ use smoltcp::time::Instant;
 use crate::counters::{RX_BEGIN_FAILURES, RX_BUFFERS_POSTED, RX_FRAMES_RECEIVED};
 #[cfg(not(feature = "net-noalloc"))]
 use crate::frames::{FrameArena, FrameLease};
-use crate::counters::TX_DROP_COUNT;
+use crate::counters::{TX_DROP_COUNT, TX_FRAMES_SENT};
 use crate::nic::Nic;
 use crate::nicstat;
 
@@ -259,7 +259,9 @@ impl VirtioSmoltcpDevice {
                 let t = nicstat::start();
                 let ok = self.tx.submit(&mut self.inner, frame, end);
                 nicstat::record_tx(t, end - hdr, ok);
-                if !ok {
+                if ok {
+                    TX_FRAMES_SENT.fetch_add(1, Ordering::Relaxed);
+                } else {
                     TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
                 return res;
@@ -298,7 +300,9 @@ impl VirtioSmoltcpDevice {
             let t = nicstat::start();
             let ok = self.inner.send_blocking(&self.tx_buffer[..end]);
             nicstat::record_tx(t, end, ok);
-            if !ok {
+            if ok {
+                TX_FRAMES_SENT.fetch_add(1, Ordering::Relaxed);
+            } else {
                 TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
             }
             res
