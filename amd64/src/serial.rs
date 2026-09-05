@@ -101,6 +101,37 @@ pub fn klog_clear() {
     KLOG_LEN.store(0, Ordering::Relaxed);
 }
 
+/// Append a string to the `dmesg` ring **only** — not to the framebuffer or the
+/// port. For a high-frequency diagnostic (the memory ticker) that belongs in
+/// `dmesg` but must not scroll the television on a box being watched.
+pub fn klog_only(s: &str) {
+    let _g = lock();
+    for &b in s.as_bytes() {
+        if b == b'\n' {
+            klog_push(b'\r');
+        }
+        klog_push(b);
+    }
+}
+
+/// [`put_dec`] into the ring only. Companion to [`klog_only`].
+pub fn klog_only_dec(mut val: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        if val == 0 {
+            break;
+        }
+    }
+    let _g = lock();
+    for &b in &buf[i..] {
+        klog_push(b);
+    }
+}
+
 /// Did a 16550 answer the probe in [`init`]?
 ///
 /// **An absent x86 I/O port reads `0xFF`.** On a machine with no UART — the

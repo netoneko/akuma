@@ -446,6 +446,7 @@ extern "C" fn netpoll_daemon() -> ! {
         // for the same reason the probe is: one fewer thing the scheduler has to
         // keep alive, and it runs exactly when the network is being driven.
         crate::clock::sync_tick();
+        mem_watch_tick();
         let laps = NETPOLL_LAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         if PROBE_ON.load(core::sync::atomic::Ordering::Relaxed) {
             let now = uptime_us();
@@ -457,6 +458,32 @@ extern "C" fn netpoll_daemon() -> ! {
         }
         crate::sched::yield_now();
     }
+}
+
+/// Record heap + PMM usage every [`MEM_WATCH_PERIOD_US`] **into the `dmesg` ring
+/// only** — never to the framebuffer, so it does not scroll the television on a
+/// box being watched. A leak shows up as a `mem:` line whose numbers only climb;
+/// read it with `ssh akuma "dmesg | grep mem:"`. `apk add tar && apk add tcc` on
+/// the HP box drove the (then 64 MiB) heap to exhaustion and `ls` reported
+/// `Out of memory`, which is what this is here to catch next time.
+fn mem_watch_tick() {
+    const MEM_WATCH_PERIOD_US: u64 = 10_000_000;
+    static NEXT_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let now = uptime_us();
+    if now < NEXT_US.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    NEXT_US.store(now + MEM_WATCH_PERIOD_US, core::sync::atomic::Ordering::Relaxed);
+    let s = akuma_alloc::stats();
+    serial::klog_only("  mem:  heap ");
+    serial::klog_only_dec((s.allocated / 1024) as u64);
+    serial::klog_only("/");
+    serial::klog_only_dec((s.heap_size / 1024) as u64);
+    serial::klog_only(" KiB (peak ");
+    serial::klog_only_dec((s.peak_allocated / 1024) as u64);
+    serial::klog_only("), pmm ");
+    serial::klog_only_dec((akuma_pmm::free_count() * 4096 / 1024 / 1024) as u64);
+    serial::klog_only(" MiB free\n");
 }
 
 // The network probe

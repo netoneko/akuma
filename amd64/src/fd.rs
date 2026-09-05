@@ -478,6 +478,32 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
             let _ = akuma_syscalls_net::write_proc_net_dev(&interfaces(), &mut text);
             return install_synthetic_file("/proc/net/dev", text.into_bytes(), flags_);
         }
+        // `busybox free` / `top` read this. Only the three fields `free`
+        // actually parses are filled — physical RAM the PMM was handed, what it
+        // has free, and the kernel heap folded into `Cached` so the number
+        // moves when a file-cache leak (see `net::mem_watch_tick`) is eating it.
+        if rest == "meminfo" {
+            let page = 4096u64;
+            let total_kib = akuma_pmm::total_count() as u64 * page / 1024;
+            let free_kib = akuma_pmm::free_count() as u64 * page / 1024;
+            let heap = akuma_alloc::stats();
+            let heap_used_kib = (heap.allocated / 1024) as u64;
+            let mut text = alloc::string::String::new();
+            use core::fmt::Write as _;
+            let _ = write!(
+                text,
+                "MemTotal:       {total_kib:>10} kB\n\
+                 MemFree:        {free_kib:>10} kB\n\
+                 MemAvailable:   {free_kib:>10} kB\n\
+                 Buffers:        {:>10} kB\n\
+                 Cached:         {heap_used_kib:>10} kB\n\
+                 SwapTotal:      {:>10} kB\n\
+                 SwapFree:       {:>10} kB\n\
+                 Shmem:          {:>10} kB\n",
+                0, 0, 0, 0,
+            );
+            return install_synthetic_file("/proc/meminfo", text.into_bytes(), flags_);
+        }
         return errno::ENOENT;
     }
 

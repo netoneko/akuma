@@ -37,12 +37,18 @@ use crate::serial;
 /// 16 KiB) is a rounding error here; what actually spends the heap is the
 /// scheduler's per-task kernel stacks (two 32 KiB `Vec`s each, `MAX_TASKS`
 /// never-recycled slots), a `MAX_PROC_FRAMES`-word `FrameSet` per live process,
-/// and the whole-file `Vec` `sys_openat` caches (busybox is ~1.1 MiB). 64 MiB
-/// leaves headroom for all of that with a shell forking freely. The PMM is
-/// separately capped at `PHYSMAP_LIMIT` (1 GiB — `boot.s` maps only the first
-/// GiB) whatever `mem_size_mib` the guest is given, so a bigger config buys
-/// user pages, not heap.
-const HEAP_SIZE: usize = 64 * 1024 * 1024;
+/// and the whole-file `Vec` `sys_openat` caches (busybox is ~1.1 MiB, `apk`
+/// ~5.4 MiB, and every package `apk add` unpacks passes through one).
+///
+/// **Raised from 64 MiB to 512 MiB on 2026-09-06.** `apk add tar && apk add
+/// tcc` on the HP box drove the 64 MiB heap to exhaustion — `ls` then reported
+/// `Out of memory` — because those file-cache `Vec`s are not evicted and a
+/// package install reads a dozen of them. The box has 16 GiB; the region below
+/// `PHYSMAP_LIMIT` this is carved from has gigabytes free, so this is a safe
+/// bump. The real ceiling is [`PHYSMAP_LIMIT`] (4 GiB — `boot.s` maps only the
+/// first four): using the full 16 GiB needs more page directories there and is
+/// tracked in `docs/archive/AKUMA_SELF_HEALING_PORT.md`.
+const HEAP_SIZE: usize = 512 * 1024 * 1024;
 
 const PAGE_SIZE: usize = 4096;
 

@@ -1,8 +1,8 @@
-//! The sign-on banner: Akuma's cat, then the version line.
+//! The sign-on banner: Akuma's mark, then the version line.
 //!
 //! Printed once, right before `run_init` hands the machine to `sshd` — so on the
 //! HP box, whose console is a television, the last thing on screen before the
-//! login service comes up says what is running. The cat is the signature; the
+//! login service comes up says what is running. The art is the signature; the
 //! version is the fact.
 
 use crate::serial;
@@ -14,20 +14,21 @@ pub const RELEASE: &str = "0.1.0-amd64";
 /// `uname -v` — the longer description, same source as above.
 pub const VERSION_DESC: &str = "Akuma/amd64 (x86_64 bring-up)";
 
-/// Akuma's cat. A demon has horns; a bring-up kernel has a cat with horns.
-/// Deliberately inside 40 columns so it does not wrap on the narrowest grid
-/// `akuma-fbcon` will fall back to (72 columns — see its `MIN_COLS`).
-const CAT: &str = r"       /\_/\        /\_/\
-      ( o.o )      ( -.- )   akuma
-       > ^ <  ~~~~~ > ^ <
-";
+/// Akuma's mark, the 40-column cut — a local copy of `src/akuma_40.txt`, the
+/// same art `userspace/sshd` prints on an interactive login (its own
+/// `akuma_40.txt`). Kept here rather than reaching across the source tree, the
+/// way sshd's copy is.
+const ART: &str = include_str!("akuma_40.txt");
 
-/// Print [`CAT`] then the version line. `run_init` calls this on both boot
+/// Print [`ART`] then the version line. `run_init` calls this on both boot
 /// paths just before the init program starts.
 pub fn print() {
     serial::puts("\n");
-    serial::puts(CAT);
-    serial::puts("  ");
+    for line in ART.lines() {
+        serial::puts(line);
+        serial::puts("\n");
+    }
+    serial::puts("\n  ");
     serial::puts(VERSION_DESC);
     serial::puts("  ");
     serial::puts(RELEASE);

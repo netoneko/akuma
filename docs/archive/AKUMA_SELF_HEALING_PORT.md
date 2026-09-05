@@ -150,6 +150,66 @@ first and succeeds), but this is unverified.
 
 ## Still open
 
+### Memory: the box has 16 GiB, the kernel uses a sliver of it
+
+`apk add tar && apk add tcc` **succeed** on the metal (packages install; the only
+errors are `failed to preserve … owner`, from an unimplemented `chown` on the
+extract path — non-fatal). Then `ls` reports `Out of memory` and the box has to
+be power-cycled.
+
+Two hard limits, neither a tuning knob today:
+
+- **`HEAP_SIZE` was 64 MiB** (`amd64/src/mem.rs`). The kernel heap is a single
+  fixed slab, and `sys_openat` caches whole files in `Vec`s that are never
+  evicted (`busybox` 1.1 MiB, `apk` 5.4 MiB, one per package payload). A couple
+  of installs exhaust it. **Raised to 512 MiB 2026-09-06** — the sub-4 GiB
+  region it is carved from has gigabytes free. A file-cache eviction policy
+  (the AArch64 kernel's `akuma-fpcache`) is the real fix; the bump buys time.
+- **`PHYSMAP_LIMIT` is 4 GiB** (`amd64/src/phys.rs`). `boot.s` builds four
+  2-MiB-page directories, so the kernel can address only the first 4 GiB of
+  physical RAM regardless of how much the machine has. On the HP box that is
+  ~2–3 GiB of usable RAM after the PCI hole — plenty for now, but "use the full
+  16 GiB" needs more page directories in `boot.s` **and** the physmap has to
+  either skip the MMIO hole (framebuffer BAR ~`0xE000_0000`, LAPIC
+  `0xFEE0_0000`) or it will lay a cached alias over every device register. Not
+  started.
+
+The `dmesg` ring buffer (below) now prints `mem: heap …/… KiB, pmm … MiB free`
+every 10 s, so the next leak shows up as a line that only climbs.
+
+### `dmesg` works over ssh now
+
+`serial.rs` keeps the last 64 KiB of console output in a `.bss` ring, and
+`syslog(2)` (x86_64 103, `klogctl`) serves it — so `ssh akuma "dmesg"` returns
+the kernel's own boot log and diagnostics. On a box whose console is a
+write-only framebuffer this is the only way to read them; every "why did it do
+that" before this was a photograph or a guess.
+
+### A proper disk
+
+Today the rootfs is a **128 MiB ext2 image GRUB loads into RAM** (`module2 …
+root.img`), mounted by `ramdisk.rs`. It does not persist and it competes with
+everything else for the sub-4 GiB window. Options for real storage, in rough
+order of effort:
+
+1. **A second SATA disk.** The box's Intel C220 has 6 ports; add a small
+   SSD/HDD and Akuma's driver owns it whole — no partition table to share, no
+   risk to the Ubuntu install. **Needs an AHCI driver** (there is none;
+   `pci::scan` *finds* the controller, `blk.rs` only speaks virtio-blk).
+2. **A partition on the existing 1 TB Toshiba.** `/dev/sda` is GPT: a 1.1 GB
+   FAT32 ESP and a 999 GB ext4 that runs to the end of the disk. Shrink the
+   ext4 offline, add a third partition, format ext2, mount it from the AHCI
+   driver. Same driver work as (1) plus a risky resize.
+3. **The SD-card slot** (`sdb Multi-Card`). Almost certainly USB-attached, so
+   it needs the USB mass-storage stack — which needs the EHCI driver that the
+   keyboard is also waiting on. Worst effort-to-value.
+4. **Stay on the RAM disk, bigger.** Bump `SIZE_MIB` in `mkdisk.sh` and (once
+   `PHYSMAP_LIMIT` is raised) give it more room. Not persistent, but enough to
+   run `apk` without OOMing in the meantime.
+
+The common blocker for (1) and (2) is **`akuma-ahci`**, which does not exist
+yet. That is the next real subsystem.
+
 ### High value
 
 - **Pipes and redirects.** `cmd | cmd` → `can't create pipe`. fds 0/1/2 are
