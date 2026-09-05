@@ -465,3 +465,103 @@ UEFI: it is the GOP/multiboot2 framebuffer, and the tree apparently had
 framebuffer code once that was deleted, which is the cheapest place to start.
 The NIC — the largest item in §5 — now has a driver with a test suite, ahead of
 the boot path that would need it.
+
+---
+
+# Update — 2026-09-05, bare metal
+
+**It boots.** Milestones B1, B2 and most of what B3 was for, in one evening.
+UEFI firmware -> GRUB 2.12 -> multiboot2 -> Akuma, drawing to the television.
+The same binary still boots under Firecracker via PVH at 196/196 self-tests, so
+this cost the VMM path nothing.
+
+What the machine reported about itself, on its own screen:
+
+| | |
+|---|---|
+| loader | GRUB 2.12-5ubuntu11, loaded at `0x200018`, ACPI RSDP present |
+| framebuffer | **1920x1080 @ 32bpp, pitch 8192, at `0xe0000000`** |
+| channels | r 8@16, g 8@8, b 8@0 |
+| console | 110x61 characters at scale 2 |
+| memory | **24 regions, 16321 MiB usable** |
+
+`0xe0000000` is the GTX 745's BAR, 3.5 GiB up — which is exactly why the
+identity map had to grow from 1 GiB to 4, and the one change without which
+nothing above could have been printed. And **pitch 8192 against width 1920**:
+the rows are 2048 pixels apart, so any code computing the stride as
+`width * bpp/8` would have drawn a sheared screen.
+
+## The two bugs, and how they were actually found
+
+Both produced a black screen with no reboot, which is the least informative
+failure a machine can have.
+
+1. **`rdmsr` clobbers `%edx`.** The trampoline carried "which loader booted us"
+   in `%edx`; enabling long mode reads EFER with `rdmsr`, which returns its
+   result in `EDX:EAX`. Every boot therefore fell through to the PVH `kmain`,
+   which read GRUB's information block as an `hvm_start_info` and reported the
+   confusion over a serial port this board does not have. The marker now lives
+   in memory (`__boot_protocol`).
+2. **The framebuffer tag's `reserved` field is a `u16`**, so the colour fields
+   begin at tag offset **32**, not 31. One byte early gives `blue_size == 0`,
+   a format that fails validation, and a kernel whose only console is that
+   framebuffer with no way to say so.
+
+Three wrong diagnoses preceded the right one: the parser was blamed for the
+first black screen (it was bug 1), then a boot-stack overflow (it was not,
+though the stack really was 64 KiB growing into the page tables with no guard
+page, and is now 256 KiB). What settled it was **recording `%eax` and `%ebx`
+into memory at entry** and reading them back out of the guest: `0x36d76289` and
+`0x21000` proved GRUB had entered correctly and the loss happened later.
+`__entry_eax` / `__entry_ebx` are kept for exactly that reason — on a board with
+no UART, "what did the loader actually hand me" is otherwise unanswerable.
+
+## The rig that ended the reboot cycle
+
+Built on the box and reusable for every step from here:
+
+```bash
+grub-mkrescue -o /root/akuma.iso /root/iso        # /boot/akuma/akuma-amd64 + grub.cfg
+qemu-system-x86_64 -enable-kvm -m 512 \
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+  -drive if=pflash,format=raw,file=/root/vars.fd \
+  -cdrom /root/akuma.iso -boot d -display none -vga std -no-reboot \
+  -monitor unix:/tmp/mon.sock,server,nowait
+```
+
+Then over that monitor socket: `screendump /root/shot.ppm` for a picture, and
+`xp/3wx <addr of __entry_eax>` and `xp 0xb8000` (the EGA buffer, which
+`kmain_mb2` writes unconditionally) as debug channels. Two minutes per
+iteration instead of a walk to another room.
+
+Three traps in the tooling, all self-inflicted and all worth remembering:
+
+- `pkill -x qemu-system-x86_64` **matches nothing**: `comm` truncates to 15
+  characters, so the name is `qemu-system-x86`. Five stale VMs accumulated and
+  one round of register readings came from the wrong one.
+- `pkill -f <pattern>` over ssh kills the shell running your own script when the
+  pattern appears in it — which it does, because the script *is* the argv.
+- `set -e` plus `pkill` aborts the script whenever nothing matched.
+
+## New crates
+
+| crate | why |
+|---|---|
+| `akuma-multiboot2` | the information-block parser, 11 tests. The offset bug above is now `the_colour_fields_start_at_tag_offset_32`, which runs in 0.2 s |
+| `akuma-fbcon` | the console: an 8x8 font drawn for this, integer scaling chosen from the resolution, overscan margin for televisions, and a character grid in RAM so **video memory is never read** |
+
+## What is next, in the order the machine now argues for
+
+1. **Memory above 4 GiB.** The map shows **12784 MiB at `0x1_0000_0000`** and
+   `boot.s` maps only the low 4 GiB. Most of this machine's RAM is currently
+   invisible to it.
+2. **B3, the RAM root**: the ext2 image as a GRUB module, so the 196 self-tests
+   run on the metal with no storage driver at all.
+3. **ACPI MADT + IOAPIC**, then PCI enumeration.
+4. **The NIC**: `akuma-net-rtl8169` against the real chip — either through the
+   kernel once PCI works, or through the userspace VFIO harness (§5b) long
+   before that.
+
+Also worth raising: the console grid is 128x64 and 1080p at scale 2 needs 61
+rows. A mode with more rows will clip rather than crash, but the margin is
+thinner than it looks.

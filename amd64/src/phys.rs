@@ -46,11 +46,17 @@ pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
 
 /// How much physical memory the physmap covers.
 ///
-/// `boot.s` builds one page directory of 512 x 2 MiB pages and points the
-/// physmap, the identity map and the kernel window at it, so all three describe
-/// the same first gigabyte. Physical memory beyond this is not addressable by
-/// the kernel, which is why `mem::init` clamps the PMM to it.
-pub const PHYSMAP_LIMIT: u64 = 1 << 30;
+/// `boot.s` builds **four** page directories of 512 x 2 MiB pages each and
+/// points the physmap, the identity map and the kernel window at them, so all
+/// three describe the same first **4 GiB**. Physical memory beyond this is not
+/// addressable by the kernel, which is why `mem::init` clamps the PMM to it.
+///
+/// **Raised from 1 GiB on 2026-09-05**, when the bare-metal boot arrived. It is
+/// not a tuning knob: on real hardware the framebuffer is a PCI BAR at
+/// `0xE000_0000` and the LAPIC is at `0xFEE0_0000`, both of them nearly 4 GiB
+/// up, and with a 1 GiB physmap neither is reachable at all. The constant and
+/// the page tables in `boot.s` describe the same thing and must move together.
+pub const PHYSMAP_LIMIT: u64 = 4 << 30;
 
 /// The kernel-virtual address of a physical address.
 ///

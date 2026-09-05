@@ -16,9 +16,9 @@ use crate::{Rgb, Surface};
 /// A 4K screen at the smallest scale this crate will choose is under this; the
 /// grid is a fixed array because a kernel console must not depend on an
 /// allocator that may be what broke.
-pub const MAX_COLS: usize = 128;
+pub const MAX_COLS: usize = 256;
 /// Tallest grid the console will use.
-pub const MAX_ROWS: usize = 64;
+pub const MAX_ROWS: usize = 72;
 
 /// Target number of text rows [`Console::auto_scale`] aims for.
 ///
@@ -203,16 +203,33 @@ impl<S: Surface> Console<S> {
         self.col += 1;
     }
 
-    /// Shift the grid up one row and re-draw every cell.
+    /// Shift the grid up one row, re-drawing only the cells that changed.
+    ///
+    /// The obvious implementation shifts the grid and then redraws every cell,
+    /// and on a large screen that is ruinous: at 3840x2160 the grid is over
+    /// 13000 cells and each is 512 pixels, so one scroll is nearly seven
+    /// million uncached writes. Boot output that scrolls a hundred times would
+    /// take minutes, and the machine would look hung.
+    ///
+    /// Comparing each cell against what will replace it turns that into work
+    /// proportional to the text rather than to the screen. Console output is
+    /// mostly short lines on a wide grid, so the great majority of cells are
+    /// blank both before and after and need no writes at all.
     fn scroll(&mut self) {
-        for r in 1..self.rows {
-            self.grid[r - 1] = self.grid[r];
-        }
-        self.grid[self.rows - 1].fill(b' ');
-
-        for r in 0..self.rows {
+        for r in 0..self.rows - 1 {
             for c in 0..self.cols {
-                self.draw_cell(r, c, self.grid[r][c]);
+                let next = self.grid[r + 1][c];
+                if self.grid[r][c] != next {
+                    self.grid[r][c] = next;
+                    self.draw_cell(r, c, next);
+                }
+            }
+        }
+        let last = self.rows - 1;
+        for c in 0..self.cols {
+            if self.grid[last][c] != b' ' {
+                self.grid[last][c] = b' ';
+                self.draw_cell(last, c, b' ');
             }
         }
     }

@@ -60,12 +60,43 @@ impl BlockDevice for VirtioBlk {
     }
 }
 
+/// Whatever the root filesystem is sitting on.
+///
+/// Two things can be, and they arrive by completely different routes: a
+/// virtio-blk disk from a VMM, or a span of RAM that GRUB filled with an ext2
+/// image before handing over. An enum rather than a `dyn` object because
+/// `Ext2Filesystem` is generic over its device and there are exactly two, both
+/// known at compile time -- a trait object would cost a vtable dispatch per
+/// block read to express a choice made once at boot.
+pub enum RootDevice {
+    /// A virtio-blk disk: `vda`, from a VMM.
+    Virtio(VirtioBlk),
+    /// An ext2 image already in memory, placed there by the boot loader.
+    Ram(crate::ramdisk::RamDisk),
+}
+
+impl BlockDevice for RootDevice {
+    fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+        match self {
+            RootDevice::Virtio(d) => d.read_bytes(offset, buf),
+            RootDevice::Ram(d) => d.read_bytes(offset, buf),
+        }
+    }
+
+    fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
+        match self {
+            RootDevice::Virtio(d) => d.write_bytes(offset, data),
+            RootDevice::Ram(d) => d.write_bytes(offset, data),
+        }
+    }
+}
+
 /// The mounted root filesystem.
 ///
 /// A `Spinlock<Option<..>>` rather than a `OnceCell`: mounting can fail (no
 /// disk, not ext2, a corrupt superblock) and the kernel must boot anyway, so
 /// "not mounted" has to be a representable state rather than a panic.
-static ROOT: Spinlock<Option<Ext2Filesystem<VirtioBlk>>> = Spinlock::new(None);
+static ROOT: Spinlock<Option<Ext2Filesystem<RootDevice>>> = Spinlock::new(None);
 
 /// Wall-clock source for inode timestamps.
 ///
@@ -86,13 +117,26 @@ pub fn mount_root() -> bool {
     if !akuma_virtio::block::is_initialized() {
         return false;
     }
+    mount_root_on(RootDevice::Virtio(VirtioBlk), "vda")
+}
+
+/// Mount `device` as the root filesystem, naming it in the diagnostics.
+///
+/// The bare-metal path comes here with a [`RootDevice::Ram`]: an ext2 image the
+/// boot loader left in memory, since a machine with no storage driver still
+/// needs somewhere for `/bin/sh` to live.
+pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
     // Not an error worth halting for: a raw disk with no filesystem is a
     // legitimate thing to be handed, and the message says which happened.
-    let Ok(fs) = Ext2Filesystem::new(VirtioBlk, no_clock) else {
-        serial::puts("  fs:   vda holds no readable ext2 image\n");
+    let Ok(fs) = Ext2Filesystem::new(device, no_clock) else {
+        serial::puts("  fs:   ");
+        serial::puts(name);
+        serial::puts(" holds no readable ext2 image\n");
         return false;
     };
-    serial::puts("  fs:   ext2 mounted on vda\n");
+    serial::puts("  fs:   ext2 mounted on ");
+    serial::puts(name);
+    serial::puts("\n");
     *ROOT.lock() = Some(fs);
     true
 }
@@ -102,7 +146,7 @@ pub fn mount_root() -> bool {
 /// A closure rather than a returned reference: the filesystem lives behind a
 /// lock, and handing out a borrow would mean handing out the guard's lifetime
 /// to callers that have no reason to think about it.
-pub fn with_root<R>(f: impl FnOnce(&Ext2Filesystem<VirtioBlk>) -> R) -> Option<R> {
+pub fn with_root<R>(f: impl FnOnce(&Ext2Filesystem<RootDevice>) -> R) -> Option<R> {
     ROOT.lock().as_ref().map(f)
 }
 

@@ -100,6 +100,50 @@ pub struct MachineDescription {
 }
 
 impl MachineDescription {
+    /// Build a description from a memory map obtained some other way.
+    ///
+    /// The rest of this crate reads a **PVH** handoff block, which is what a VMM
+    /// leaves behind. A machine booted from GRUB has no such block: the same
+    /// facts arrive as multiboot2 tags, parsed by `akuma-multiboot2`, and this
+    /// is where they join the path everything downstream already takes.
+    ///
+    /// [`MachineDescription::start_info`] comes back zeroed and is meaningless
+    /// on this path. That is deliberate rather than unfortunate: it is the
+    /// PVH block's *address and contents*, and inventing plausible values for a
+    /// structure that does not exist would let code read them as if it had.
+    /// Anything that needs a fact should take it from a field that is populated.
+    ///
+    /// Regions past [`MAX_REGIONS`] are dropped. A real machine reports around
+    /// two dozen and most are tiny reserved ranges; the ones that matter are the
+    /// large usable ones, so callers should pass **usable regions first** if
+    /// they have more than fit.
+    #[must_use]
+    pub fn from_memory_map(
+        regions_in: &[MemRegion],
+        rsdp: Option<Rsdp>,
+        madt: Option<Madt>,
+    ) -> Self {
+        let mut regions = [MemRegion { addr: 0, size: 0, kind: 0 }; MAX_REGIONS];
+        let n = regions_in.len().min(MAX_REGIONS);
+        regions[..n].copy_from_slice(&regions_in[..n]);
+        MachineDescription {
+            start_info: StartInfo {
+                addr: 0,
+                version: 0,
+                nr_modules: 0,
+                cmdline_paddr: 0,
+                rsdp_paddr: 0,
+                memmap_paddr: 0,
+                memmap_entries: 0,
+            },
+            regions,
+            region_count: n,
+            virtio: MmioDevices::new(),
+            rsdp,
+            madt,
+        }
+    }
+
     /// Every memory region the machine reported, in the order it reported them.
     #[must_use]
     pub fn regions(&self) -> &[MemRegion] {

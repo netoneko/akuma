@@ -225,3 +225,159 @@ fn a_block_too_short_to_be_one_is_refused() {
     assert!(BootInfo::new(&[0; 7]).is_none());
     assert!(BootInfo::new(&[0; 8]).is_some());
 }
+
+/// A module tag carries `mod_start`, `mod_end` and a string. The end is
+/// exclusive, and a kernel that reserves `start..end` inclusive of nothing else
+/// keeps its own root filesystem out of the allocator's hands.
+#[test]
+fn modules_are_located_and_measured() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&0x0100_0000u32.to_le_bytes()); // start: 16 MiB
+    body.extend_from_slice(&0x0180_0000u32.to_le_bytes()); // end: 24 MiB
+    body.extend_from_slice(b"rootfs\0");
+    let info_bytes = Builder::new().tag(tag::MODULE, &body).build();
+    let info = BootInfo::new(&info_bytes).unwrap();
+
+    let m = info.first_module().expect("one module");
+    assert_eq!(m.start, 0x0100_0000);
+    assert_eq!(m.end, 0x0180_0000);
+    assert_eq!(m.len(), 8 * 1024 * 1024);
+    assert_eq!(m.string, "rootfs");
+    assert!(!m.is_empty());
+    assert_eq!(info.modules_end(), 0x0180_0000);
+}
+
+#[test]
+fn several_modules_report_the_highest_end() {
+    let mk = |s: u32, e: u32| {
+        let mut b = Vec::new();
+        b.extend_from_slice(&s.to_le_bytes());
+        b.extend_from_slice(&e.to_le_bytes());
+        b.extend_from_slice(b"m\0");
+        b
+    };
+    let info_bytes = Builder::new()
+        .tag(tag::MODULE, &mk(0x0200_0000, 0x0210_0000))
+        .tag(tag::MODULE, &mk(0x0100_0000, 0x0108_0000))
+        .build();
+    let info = BootInfo::new(&info_bytes).unwrap();
+    assert_eq!(info.modules().count(), 2);
+    // The highest end, not the last one reported: reserving to the last would
+    // leave the earlier module exposed if the loader ordered them by address.
+    assert_eq!(info.modules_end(), 0x0210_0000);
+}
+
+/// A module whose end is not past its start is a truncated or corrupt tag, and
+/// admitting it would produce a zero-length filesystem and a confusing mount
+/// failure rather than an honest "no module".
+#[test]
+fn a_degenerate_module_is_refused() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&0x0100_0000u32.to_le_bytes());
+    body.extend_from_slice(&0x0100_0000u32.to_le_bytes()); // end == start
+    body.extend_from_slice(b"empty\0");
+    let info_bytes = Builder::new().tag(tag::MODULE, &body).build();
+    let info = BootInfo::new(&info_bytes).unwrap();
+    assert!(info.first_module().is_none());
+    assert_eq!(info.modules_end(), 0);
+}
+
+#[test]
+fn no_modules_is_not_an_error() {
+    let info_bytes = Builder::new().tag(tag::CMDLINE, b"\0").build();
+    let info = BootInfo::new(&info_bytes).unwrap();
+    assert!(info.first_module().is_none());
+    assert_eq!(info.modules().count(), 0);
+    assert_eq!(info.modules_end(), 0);
+}
+
+/// Build a memory-map tag body from `(base, length, kind)` triples.
+fn memory_map_body(entries: &[(u64, u64, u32)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&24u32.to_le_bytes()); // entry_size
+    body.extend_from_slice(&0u32.to_le_bytes()); // entry_version
+    for (base, len, kind) in entries {
+        body.extend_from_slice(&base.to_le_bytes());
+        body.extend_from_slice(&len.to_le_bytes());
+        body.extend_from_slice(&kind.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+    }
+    body
+}
+
+/// The bug this exists to prevent, in the shape it actually appeared: UEFI
+/// reports contiguous RAM as a run of separate abutting entries, so the region
+/// "containing the kernel" is a 7 MiB fragment of a 16 GiB machine.
+#[test]
+fn abutting_usable_regions_merge_into_one() {
+    let body = memory_map_body(&[
+        (0x0010_0000, 0x0070_0000, 1), // 1 MiB .. 8 MiB
+        (0x0080_0000, 0x0080_0000, 1), // 8 MiB .. 16 MiB  -- abuts the above
+        (0x0100_0000, 0x3F00_0000, 1), // 16 MiB .. 1 GiB  -- abuts again
+    ]);
+    let info_bytes = Builder::new().tag(tag::MEMORY_MAP, &body).build();
+    let info = BootInfo::new(&info_bytes).unwrap();
+
+    let mut out = [(0u64, 0u64); 16];
+    let n = info.usable_coalesced(&mut out);
+    assert_eq!(n, 1, "three abutting regions are one region");
+    assert_eq!(out[0], (0x0010_0000, 0x3FF0_0000));
+    // And the total is preserved: merging must not invent or lose memory.
+    assert_eq!(out[0].1, info.usable_memory());
+}
+
+#[test]
+fn a_gap_keeps_regions_apart() {
+    let body = memory_map_body(&[
+        (0x0010_0000, 0x0010_0000, 1),
+        (0x0100_0000, 0x0010_0000, 1), // a real gap between them
+    ]);
+    let info_bytes = Builder::new().tag(tag::MEMORY_MAP, &body).build();
+    let info = BootInfo::new(&info_bytes).unwrap();
+    let mut out = [(0u64, 0u64); 16];
+    assert_eq!(info.usable_coalesced(&mut out), 2);
+}
+
+/// Firmware does not promise sorted entries, and merging an unsorted list
+/// without sorting first silently leaves fragments behind.
+#[test]
+fn out_of_order_regions_are_sorted_before_merging() {
+    let body = memory_map_body(&[
+        (0x0100_0000, 0x0100_0000, 1), // 16..32 MiB, reported first
+        (0x0010_0000, 0x00F0_0000, 1), // 1..16 MiB, reported second
+    ]);
+    let info_bytes = Builder::new().tag(tag::MEMORY_MAP, &body).build();
+    let info = BootInfo::new(&info_bytes).unwrap();
+    let mut out = [(0u64, 0u64); 16];
+    assert_eq!(info.usable_coalesced(&mut out), 1);
+    assert_eq!(out[0], (0x0010_0000, 0x0200_0000 - 0x0010_0000));
+}
+
+#[test]
+fn reserved_regions_are_not_merged_in() {
+    let body = memory_map_body(&[
+        (0x0010_0000, 0x0070_0000, 1),
+        (0x0080_0000, 0x0010_0000, 2), // reserved, abutting: must not join
+        (0x0090_0000, 0x0010_0000, 1),
+    ]);
+    let info_bytes = Builder::new().tag(tag::MEMORY_MAP, &body).build();
+    let info = BootInfo::new(&info_bytes).unwrap();
+    let mut out = [(0u64, 0u64); 16];
+    let n = info.usable_coalesced(&mut out);
+    assert_eq!(n, 2, "a reserved range in the middle keeps them separate");
+    assert_eq!(out[0], (0x0010_0000, 0x0070_0000));
+    assert_eq!(out[1], (0x0090_0000, 0x0010_0000));
+}
+
+#[test]
+fn overlapping_regions_do_not_double_count() {
+    let body = memory_map_body(&[
+        (0x0010_0000, 0x0100_0000, 1),
+        (0x0080_0000, 0x0100_0000, 1), // overlaps the first
+    ]);
+    let info_bytes = Builder::new().tag(tag::MEMORY_MAP, &body).build();
+    let info = BootInfo::new(&info_bytes).unwrap();
+    let mut out = [(0u64, 0u64); 16];
+    assert_eq!(info.usable_coalesced(&mut out), 1);
+    assert_eq!(out[0], (0x0010_0000, 0x0180_0000 - 0x0010_0000));
+}

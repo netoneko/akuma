@@ -74,6 +74,9 @@ mod multiboot2;
 mod net;
 #[cfg(target_arch = "x86_64")]
 mod paging;
+/// A span of RAM as a block device, so a machine with no storage driver can
+/// still mount the root filesystem its boot loader left in memory.
+mod ramdisk;
 #[cfg(target_arch = "x86_64")]
 mod phys;
 #[cfg(target_arch = "x86_64")]

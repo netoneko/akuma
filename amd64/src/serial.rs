@@ -56,6 +56,16 @@ pub fn init() {
 /// console: a dropped byte during boot is a bug you cannot see, and a stall is
 /// a bug you can.
 pub fn putb(byte: u8) {
+    // Mirror to the framebuffer console, if one is up.
+    //
+    // FIRST, before the wait below. On the bare-metal target there is no UART at
+    // all: `inb` on an absent port reads 0xFF, so `LSR_THR_EMPTY` appears set and
+    // the loop happens to fall through -- but that is the I/O bus being
+    // forgiving, not a guarantee. Drawing before the wait means a machine whose
+    // absent port ever read 0 would still have said what it was about to hang
+    // on.
+    crate::multiboot2::mirror_byte(byte);
+
     // SAFETY: COM1's register block is fixed by the PC architecture.
     unsafe {
         while inb(COM1 + LINE_STATUS) & LSR_THR_EMPTY == 0 {

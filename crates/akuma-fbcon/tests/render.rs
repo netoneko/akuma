@@ -18,11 +18,13 @@ struct MemSurface {
     h: usize,
     px: Vec<Rgb>,
     out_of_bounds: usize,
+    /// Every accepted pixel write, so a test can measure drawing cost.
+    writes: usize,
 }
 
 impl MemSurface {
     fn new(w: usize, h: usize) -> Self {
-        Self { w, h, px: vec![Rgb::BLACK; w * h], out_of_bounds: 0 }
+        Self { w, h, px: vec![Rgb::BLACK; w * h], out_of_bounds: 0, writes: 0 }
     }
     fn at(&self, x: usize, y: usize) -> Rgb {
         self.px[y * self.w + x]
@@ -45,6 +47,7 @@ impl Surface for MemSurface {
             return;
         }
         self.px[y * self.w + x] = color;
+        self.writes += 1;
     }
 }
 
@@ -219,11 +222,39 @@ fn long_lines_wrap() {
 #[test]
 fn the_scale_suits_the_screen() {
     type C = Console<MemSurface>;
-    assert_eq!(C::auto_scale(768), 2, "1024x768 monitor");
-    assert_eq!(C::auto_scale(1080), 2, "1080p");
-    assert_eq!(C::auto_scale(2160), 5, "4K television");
+    // With a 16-pixel font these are the scales that land near 48 rows.
+    assert_eq!(C::auto_scale(768), 1, "1024x768 monitor");
+    assert_eq!(C::auto_scale(1080), 1, "1080p");
+    assert_eq!(C::auto_scale(2160), 2, "4K television");
     assert_eq!(C::auto_scale(480), 1, "640x480 fallback mode");
     assert_ne!(C::auto_scale(64), 0, "a tiny framebuffer still gets scale 1");
+}
+
+/// Scrolling must cost work proportional to the **text**, not to the screen.
+///
+/// The naive version redraws every cell, which at 4K is seven million uncached
+/// writes per line of output. This pins the cheap behaviour: a screenful of
+/// short lines scrolls for a small fraction of a full redraw.
+#[test]
+fn scrolling_sparse_text_does_not_redraw_the_screen() {
+    let mut con = Console::new(MemSurface::new(1920, 1080)).unwrap();
+    con.clear();
+    let (cols, rows) = (con.cols(), con.rows());
+
+    // Fill the screen with short lines, then measure one more line of output.
+    for _ in 0..rows {
+        con.write_str_bytes("short line\n");
+    }
+    let before = con.surface_mut().writes;
+    con.write_str_bytes("one more\n");
+    let cost = con.surface_mut().writes - before;
+
+    let full_redraw = cols * rows * font::WIDTH * font::HEIGHT;
+    assert!(
+        cost * 8 < full_redraw,
+        "a scroll cost {cost} pixel writes, within 8x of a full redraw \
+         ({full_redraw}) -- the changed-cell optimisation is not working"
+    );
 }
 
 /// Roughly 40 to 60 rows at every resolution — that is what the scale is for.

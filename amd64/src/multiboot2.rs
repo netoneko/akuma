@@ -30,10 +30,12 @@
 //! that failed validation, and a black screen with no way to report it. That
 //! cost a reboot cycle on a machine in another room. It is now a unit test.
 
-use core::fmt::Write;
-
 use akuma_fbcon::{Console, PixelFormat, Rgb, Surface};
+use spinning_top::Spinlock;
 use akuma_multiboot2::{BootInfo, FramebufferKind};
+use akuma_ryzen_amd64::{MAX_REGIONS, MachineDescription, MemRegion};
+
+use crate::serial;
 
 /// Where the boot page tables mirror all of physical memory.
 const PHYSMAP_BASE: u64 = 0xFFFF_8000_0000_0000;
@@ -48,7 +50,7 @@ const EGA_ATTR: u8 = 0x1F;
 
 /// Roughly how long a colour stays up in [`cycle_forever`]. Not calibrated —
 /// there is no timer yet — just a spin long enough to be seen.
-const CYCLE_SPINS: u64 = 40_000_000;
+const CYCLE_SPINS: u64 = 400_000_000;
 
 /// Write a line to the EGA text buffer, in case anything is watching it.
 ///
@@ -158,15 +160,51 @@ impl Surface for Framebuffer {
     }
 }
 
+/// The framebuffer console, once there is one.
+///
+/// A `Spinlock<Option<..>>` for the same reason the root filesystem is: there
+/// is a window at the start of boot where it does not exist yet, and every
+/// print before that has to be a no-op rather than a fault.
+static CONSOLE: Spinlock<Option<FbConsole>> = Spinlock::new(None);
+
+/// Wrapper carrying the `Send` the raw framebuffer pointer does not imply.
+struct FbConsole(Console<Framebuffer>);
+
+// SAFETY: the pointer inside is a device mapping established by `boot.s`, valid
+// for the whole life of the kernel, never freed and never moved. What `Send`
+// asks about is whether it may cross threads, and the `Spinlock` around it is
+// what actually serialises access -- the raw pointer carries no aliasing claim
+// of its own.
+unsafe impl Send for FbConsole {}
+
+/// Write one byte to the framebuffer console, if it exists.
+///
+/// Called from `serial::putb`, which is what makes this the console for
+/// **everything** -- kernel diagnostics, the self-test harness, and the output
+/// of user programs -- without any of them knowing there is a screen.
+pub fn mirror_byte(byte: u8) {
+    if let Some(c) = CONSOLE.lock().as_mut() {
+        c.0.write_byte(byte);
+    }
+}
+
 /// Long-mode entry for a GRUB/multiboot2 boot, called from `boot.s`.
+///
+/// Deliberately parallel to [`crate::kmain`], and in the same order, because
+/// that order is load-bearing and documented there. What differs is only where
+/// the facts come from: a multiboot2 information block instead of a PVH handoff
+/// block, an ext2 image the loader left in RAM instead of a virtio disk, and a
+/// framebuffer instead of a serial port.
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     ega_text(0, "Akuma/amd64: multiboot2 entry reached");
 
     // SAFETY: GRUB guarantees %ebx points at an information block whose first
     // u32 is its own total size, and boot.s has mapped all of low physical
-    // memory. The length is clamped so a corrupt size field cannot produce a
-    // slice running off the end of what is mapped.
+    // memory through the physmap -- which survives `drop_identity_map` below,
+    // so this slice stays valid for the whole function. The length is clamped
+    // so a corrupt size field cannot produce a slice running off the end of
+    // what is mapped.
     let bytes: &[u8] = unsafe {
         let p = (PHYSMAP_BASE + info_phys) as *const u8;
         let total = p.cast::<u32>().read_volatile() as usize;
@@ -177,31 +215,21 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         ega_text(1, "FAIL: information block too short");
         crate::halt();
     };
-
     let Some(fb) = info.framebuffer() else {
         ega_text(1, "FAIL: GRUB provided no framebuffer tag");
         crate::halt();
     };
-
     if !matches!(fb.kind, FramebufferKind::Rgb) {
         ega_text(1, "FAIL: framebuffer is not direct-colour (EGA text mode?)");
         crate::halt();
     }
-
     let Some(mut surface) = Framebuffer::new(&fb) else {
         ega_text(1, "FAIL: framebuffer lies above the mapped 4 GiB");
         crate::halt();
     };
-    ega_text(1, "framebuffer mapped; painting");
 
-    // STAGE ONE, and it happens before the console exists on purpose.
-    //
-    // This is the smallest possible proof that the address, the pitch and the
-    // pixel format are all correct: a few hundred kilobytes of stores through
-    // nothing but `Surface::fill`, with no font, no character grid and barely
-    // any stack. If the screen turns purple and stops there, everything below
-    // this line is what failed. If it stays black, the framebuffer itself is
-    // wrong and nothing above this line can be trusted either.
+    // Colour before glyphs: the smallest proof that address, pitch and pixel
+    // format are all right, with no font and almost no stack involved.
     let (w, h) = (surface.width(), surface.height());
     surface.fill(0, 0, w, h, Rgb::new(0x30, 0x00, 0x50));
 
@@ -209,99 +237,178 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         ega_text(2, "FAIL: framebuffer too small for a console");
         crate::halt();
     };
-
-    // Stage two: the console exists. A different colour, so the two stages are
-    // told apart by looking rather than by guessing.
     con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
     con.clear();
+    *CONSOLE.lock() = Some(FbConsole(con));
     ega_text(2, "console up");
 
-    con.set_fg(Rgb::ACCENT);
-    let _ = writeln!(con, "Akuma/amd64 on real hardware");
-    con.set_fg(Rgb::TEXT);
-    let _ = writeln!(con);
-    let _ = writeln!(con, "  loader     {}", info.loader_name());
-    let _ = writeln!(con, "  cmdline    {}", info.cmdline());
-    if let Some(base) = info.load_base() {
-        let _ = writeln!(con, "  loaded at  {base:#x}");
+    // FROM HERE, `serial::puts` REACHES THE SCREEN. `serial::putb` mirrors into
+    // the console above, so everything below -- the kernel's own diagnostics,
+    // the self-test harness, and anything a user program writes to stdout --
+    // appears without knowing a framebuffer exists.
+    serial::puts("\nAkuma/amd64 - bare metal, booted by ");
+    serial::puts(info.loader_name());
+    serial::puts("\n  fb:   ");
+    serial::put_dec(u64::from(fb.width));
+    serial::puts("x");
+    serial::put_dec(u64::from(fb.height));
+    serial::puts(" @ ");
+    serial::put_dec(u64::from(fb.bpp));
+    serial::puts("bpp, pitch ");
+    serial::put_dec(u64::from(fb.pitch));
+    serial::puts(", at 0x");
+    serial::put_hex(fb.addr);
+    serial::puts("\n");
+
+    // Descriptor tables, SMAP, then drop the identity map. Same order and the
+    // same reasons as `kmain`; see the comments there.
+    crate::gdt::init();
+    crate::idt::init();
+    let smap = crate::uaccess::init_smap();
+    crate::paging::drop_identity_map();
+
+    // The machine, as multiboot2 describes it.
+    let machine = machine_from(&info);
+    serial::puts("  ram:  ");
+    serial::put_dec(machine.usable_ram() / (1024 * 1024));
+    serial::puts(" MiB usable across ");
+    serial::put_dec(machine.regions().len() as u64);
+    serial::puts(" regions\n");
+
+    // The root filesystem is already in memory, and NOTHING IN THE MEMORY MAP
+    // SAYS SO. Reserve it before the physical allocator is told anything.
+    let module = info.first_module();
+    let reserve_to = info.modules_end();
+    if let Some(m) = module {
+        serial::puts("  mod:  root image at 0x");
+        serial::put_hex(u64::from(m.start));
+        serial::puts(" + ");
+        serial::put_dec(m.len() as u64 / 1024);
+        serial::puts(" KiB\n");
     }
-    let _ = writeln!(con, "  modules    {}", info.module_count());
-    let _ = writeln!(con, "  acpi rsdp  {}", if info.has_acpi() { "present" } else { "absent" });
-    let _ = writeln!(con);
 
-    con.set_fg(Rgb::ACCENT);
-    let _ = writeln!(con, "framebuffer");
-    con.set_fg(Rgb::TEXT);
-    let _ = writeln!(con, "  {}x{} at {} bpp, pitch {}", fb.width, fb.height, fb.bpp, fb.pitch);
-    let _ = writeln!(con, "  address    {:#x}", fb.addr);
-    let _ = writeln!(
-        con,
-        "  channels   r {}@{}  g {}@{}  b {}@{}{}",
-        fb.format.red_size,
-        fb.format.red_pos,
-        fb.format.green_size,
-        fb.format.green_pos,
-        fb.format.blue_size,
-        fb.format.blue_pos,
-        if fb.format_assumed { "  (assumed)" } else { "" }
-    );
-    let _ = writeln!(con, "  console    {}x{} chars, scale {}", con.cols(), con.rows(), con.scale());
-    let _ = writeln!(con);
+    if !crate::mem::init_reserving(&machine, reserve_to) {
+        serial::puts("\nAkuma/amd64 - memory bring-up FAILED\n");
+        crate::halt();
+    }
 
-    print_memory_map(&mut con, &info);
+    // Give the shared crates a console, exactly as `kmain` does.
+    akuma_primitives::console::set_print_hook(serial::puts);
 
-    con.set_fg(Rgb::GOOD);
-    let _ = writeln!(con);
-    let _ = writeln!(con, "bring-up complete. The band below cycles: the kernel is alive.");
+    // Mount the image the loader left for us. No storage driver is involved:
+    // this is a real ext2 filesystem whose block device happens to be RAM.
+    let have_fs = module
+        .and_then(|m| crate::ramdisk::RamDisk::new(u64::from(m.start), m.len()))
+        .is_some_and(|rd| {
+            crate::fs::mount_root_on(crate::fs::RootDevice::Ram(rd), "module")
+        });
 
-    cycle_forever(&mut con);
+    let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
+
+    // The same bypass window `kmain` runs its tests in: they drive syscall
+    // bodies with kernel-stack buffers where a program would pass user
+    // pointers, and `uaccess` refuses kernel addresses by design.
+    let user_ptr_bypass = akuma_user_access::BypassValidationGuard::new();
+
+    crate::mem::smoke_test(&mut t);
+    crate::paging::smoke_test(&mut t);
+    crate::idt::smoke_test(&mut t);
+    crate::idt::user_copy_smoke_test(&mut t);
+    crate::uaccess::smoke_test(&mut t, smap);
+
+    if t.check("lapic: initialised", crate::lapic::init()) {
+        crate::lapic::smoke_test(&mut t);
+        crate::lapic::start_timer();
+        crate::sched::smoke_test(&mut t);
+        crate::lapic::stop_timer();
+    }
+
+    // No `blk`, `net` or `sock`: this machine has no virtio transports at all,
+    // and a suite that reported those as passing would be reporting on nothing.
+    crate::fs::smoke_test(&mut t, have_fs);
+    crate::fd::smoke_test(&mut t, have_fs);
+    crate::mm::smoke_test(&mut t);
+
+    // `init_syscall` writes IA32_STAR/LSTAR/SFMASK **and sets `EFER.SCE`**, and
+    // without it `sysretq` is an invalid opcode. Leaving it out is how the first
+    // bare-metal run of this suite died: `#UD` at `enter_user_mode`, one
+    // instruction into the first ring-3 entry, having passed everything else.
+    crate::fd::init_console();
+    crate::usermode::init_syscall();
+    crate::usermode::smoke_test(&mut t);
+    crate::usermode::preempt_test(&mut t);
+    crate::lapic::start_timer();
+    crate::usermode::elf_test(&mut t);
+    crate::usermode::fdprobe_test(&mut t);
+    drop(user_ptr_bypass);
+
+    let passed = t.report();
+    if passed {
+        serial::puts("Akuma/amd64 - all self-tests passed\n");
+    } else {
+        serial::puts("Akuma/amd64 - SELF-TESTS FAILED\n");
+    }
+
+    // Hand the machine to a shell. After the verdict and only on a passing run,
+    // for the reason `kmain` gives: a shell on a kernel whose own tests failed
+    // is a way to spend an hour debugging the wrong layer.
+    if passed && have_fs {
+        let path = init_path(info.cmdline());
+        serial::puts("\n-- running ");
+        serial::puts(path);
+        serial::puts(" --\n");
+        // NOTE: stdout reaches the screen through the mirror, but STDIN IS NOT
+        // CONNECTED. This board's keyboard is USB and there is no HID stack, so
+        // an interactive shell will print its prompt and then block on a read
+        // that nothing can satisfy. That is expected, and it is the next gap.
+        crate::usermode::run_init(path, &[]);
+    }
+
+    cycle_forever()
 }
 
-/// Print the memory map and the total of what is usable.
-fn print_memory_map<S: Surface>(con: &mut Console<S>, info: &BootInfo<'_>) {
-    con.set_fg(Rgb::ACCENT);
-    let _ = writeln!(con, "memory map");
-    con.set_fg(Rgb::TEXT);
-
-    let Some(regions) = info.memory_regions() else {
-        con.set_fg(Rgb::BAD);
-        let _ = writeln!(con, "  absent or malformed");
-        return;
-    };
-
-    let mut shown = 0;
-    let mut total = 0;
-    for r in regions {
-        total += 1;
-        // A real machine reports a dozen-plus regions and would push everything
-        // above this off the screen; the usable ones are what matter and the
-        // total below accounts for all of them.
-        if r.is_usable() && shown < 8 {
-            shown += 1;
-            let _ = writeln!(
-                con,
-                "  {:#012x} + {:>6} MiB  usable",
-                r.base,
-                r.length / (1024 * 1024)
-            );
+/// The `init=` argument from the boot loader's command line, or `/bin/sh`.
+fn init_path(cmdline: &str) -> &str {
+    for word in cmdline.split(' ') {
+        if let Some(rest) = word.strip_prefix("init=") {
+            if !rest.is_empty() {
+                return rest;
+            }
         }
     }
-    let usable = info.usable_memory();
-    let _ = writeln!(con, "  {total} regions, {} MiB usable in total", usable / (1024 * 1024));
-    if usable == 0 {
-        con.set_fg(Rgb::BAD);
-        let _ = writeln!(con, "  no usable memory reported: this cannot be right");
+    "/bin/sh"
+}
+
+/// Build the description the rest of the kernel expects, from multiboot2 tags.
+///
+/// Usable regions are copied first. The description holds a fixed number of
+/// them and a real machine reports more than that -- this one reported 24, of
+/// which most are small reserved ranges -- so an in-order copy would fill the
+/// array with reserved entries and drop the RAM.
+fn machine_from(info: &BootInfo<'_>) -> MachineDescription {
+    // Coalesced, not raw. UEFI reports contiguous RAM as a run of abutting
+    // entries, and `mem::init` chooses the region *containing the kernel* to
+    // carve the heap out of -- so on a raw map it gets whichever fragment the
+    // image happened to land in. Measured on this machine: a 7 MiB answer, on a
+    // box with 16 GiB, and a 64 MiB heap that then did not fit.
+    let mut usable = [(0u64, 0u64); MAX_REGIONS];
+    let n = info.usable_coalesced(&mut usable);
+
+    let mut regions = [MemRegion { addr: 0, size: 0, kind: 0 }; MAX_REGIONS];
+    for (i, (base, len)) in usable[..n].iter().enumerate() {
+        regions[i] = MemRegion { addr: *base, size: *len, kind: 1 };
     }
+    MachineDescription::from_memory_map(&regions[..n], None, None)
 }
 
 /// Cycle a band of colour along the bottom, for ever.
 ///
 /// This replaces halting, and it is not decoration. A halted kernel and a
-/// crashed one look identical — both leave whatever was last drawn on the
+/// crashed one look identical -- both leave whatever was last drawn on the
 /// screen. A band that keeps changing says the CPU is still executing our code,
 /// which is the single fact hardest to establish on a machine with no serial
 /// port, no network and no disk output.
-fn cycle_forever<S: Surface>(con: &mut Console<S>) -> ! {
+fn cycle_forever() -> ! {
     let palette = [
         Rgb::new(0xE0, 0x50, 0x50),
         Rgb::new(0xE0, 0xC0, 0x40),
@@ -310,17 +417,19 @@ fn cycle_forever<S: Surface>(con: &mut Console<S>) -> ! {
         Rgb::new(0xC0, 0x60, 0xE0),
     ];
 
-    let surface = con.surface_mut();
-    let w = surface.width();
-    let h = surface.height();
-    let (margin_x, margin_y) = (w / 24, h / 24);
-    let band_h = (h / 14).max(8);
-    let band_y = h.saturating_sub(margin_y + band_h);
-    let band_w = w.saturating_sub(margin_x * 2);
-
     let mut i = 0usize;
     loop {
-        surface.fill(margin_x, band_y, band_w, band_h, palette[i % palette.len()]);
+        // The lock is taken and released around each fill rather than held
+        // across the wait: anything else printing would block for the whole
+        // cycle, and on this machine printing is the only way to be heard.
+        if let Some(c) = CONSOLE.lock().as_mut() {
+            let s = c.0.surface_mut();
+            let (w, h) = (s.width(), s.height());
+            let (mx, my) = (w / 24, h / 24);
+            let band_h = (h / 14).max(8);
+            let band_y = h.saturating_sub(my + band_h);
+            s.fill(mx, band_y, w.saturating_sub(mx * 2), band_h, palette[i % palette.len()]);
+        }
         i += 1;
         for _ in 0..CYCLE_SPINS {
             core::hint::spin_loop();

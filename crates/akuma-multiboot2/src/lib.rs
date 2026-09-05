@@ -177,6 +177,42 @@ impl Framebuffer {
     }
 }
 
+/// A file the boot loader placed in memory alongside the kernel.
+///
+/// This is how a kernel with no storage driver gets a root filesystem: GRUB
+/// reads the image off whatever it booted from — a disk it already knows how to
+/// read — and leaves it in RAM. What arrives is a physical range and a string.
+///
+/// **Nothing in the memory map marks these frames as taken.** The loader
+/// reports them as ordinary available memory, so a kernel that seeds its
+/// physical allocator from the map alone will hand out the pages holding its own
+/// root filesystem. Reserving [`Module::start`]..[`Module::end`] is the
+/// caller's job and is not optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Module<'a> {
+    /// Physical address of the first byte.
+    pub start: u32,
+    /// Physical address one past the last byte.
+    pub end: u32,
+    /// The string GRUB was given for it in `module2 <file> <string>`.
+    pub string: &'a str,
+}
+
+impl Module<'_> {
+    /// Length in bytes.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        (self.end - self.start) as usize
+    }
+
+    /// Whether the module is empty, which is never useful and usually means a
+    /// truncated tag.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+}
+
 /// One entry of the memory map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryRegion {
@@ -355,6 +391,90 @@ impl<'a> BootInfo<'a> {
             .flatten()
             .filter(MemoryRegion::is_usable)
             .fold(0u64, |acc, r| acc.saturating_add(r.length))
+    }
+
+    /// Every module the loader placed in memory, in the order it reported them.
+    #[must_use]
+    pub fn modules(&self) -> impl Iterator<Item = Module<'a>> + '_ {
+        self.tags().filter(|t| t.typ == tag::MODULE).filter_map(|t| {
+            let start = u32::from_le_bytes(t.body.get(0..4)?.try_into().ok()?);
+            let end = u32::from_le_bytes(t.body.get(4..8)?.try_into().ok()?);
+            if end <= start {
+                return None;
+            }
+            let rest = t.body.get(8..).unwrap_or(&[]);
+            let n = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+            let string = core::str::from_utf8(&rest[..n]).unwrap_or("");
+            Some(Module { start, end, string })
+        })
+    }
+
+    /// The first module, which by convention is the root filesystem.
+    #[must_use]
+    pub fn first_module(&self) -> Option<Module<'a>> {
+        self.modules().next()
+    }
+
+    /// The highest address any module occupies, for the caller's reservation.
+    #[must_use]
+    pub fn modules_end(&self) -> u64 {
+        self.modules().fold(0u64, |acc, m| acc.max(u64::from(m.end)))
+    }
+
+    /// Usable memory, sorted and with adjacent ranges merged.
+    ///
+    /// Writes `(base, length)` pairs into `out` and returns how many. Regions
+    /// past `out.len()` are dropped, largest-first ordering being the caller's
+    /// business rather than this function's.
+    ///
+    /// # Why merging is not tidiness
+    ///
+    /// A VMM reports two or three big regions. **UEFI firmware reports dozens**,
+    /// carved up by how the firmware itself used them, and GRUB passes that
+    /// fragmentation straight through: contiguous RAM arrives as a run of
+    /// separate "available" entries that happen to abut. A kernel that picks
+    /// "the region containing my image" out of that raw list gets whichever
+    /// fragment it landed in -- measured on real hardware as a **7 MiB** answer
+    /// on a machine with 16 GiB of memory, which then failed to fit a 64 MiB
+    /// heap. Merging first turns the same map into a handful of large regions
+    /// and the question into the one the kernel meant to ask.
+    #[must_use]
+    pub fn usable_coalesced(&self, out: &mut [(u64, u64)]) -> usize {
+        let mut n = 0;
+        // Insertion sort by base as they arrive: no allocator here, and the
+        // counts involved are dozens.
+        for r in self.memory_regions().into_iter().flatten() {
+            if !r.is_usable() || r.length == 0 {
+                continue;
+            }
+            if n == out.len() {
+                continue;
+            }
+            let mut i = n;
+            while i > 0 && out[i - 1].0 > r.base {
+                out[i] = out[i - 1];
+                i -= 1;
+            }
+            out[i] = (r.base, r.length);
+            n += 1;
+        }
+
+        // Merge anything that touches or overlaps its predecessor.
+        let mut w = 0;
+        for i in 0..n {
+            if w > 0 {
+                let (pb, pl) = out[w - 1];
+                let pend = pb.saturating_add(pl);
+                if out[i].0 <= pend {
+                    let end = out[i].0.saturating_add(out[i].1).max(pend);
+                    out[w - 1] = (pb, end - pb);
+                    continue;
+                }
+            }
+            out[w] = out[i];
+            w += 1;
+        }
+        w
     }
 
     /// The framebuffer, if the loader provided one.
