@@ -33,8 +33,75 @@ pub fn poll_count() -> usize {
 }
 
 
-/// QEMU user-mode networking DNS server address
-pub(crate) const QEMU_DNS_SERVER: IpAddress = IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 2, 3));
+/// The static IPv4 configuration an interface is brought up with.
+///
+/// Three addresses that have to agree — the interface address, the default
+/// route and the resolver — and used to be three separate literals in three
+/// modules ([`init`](super::init)'s bring-up, [`poll`](super::poll)'s
+/// DHCP-deconfigure fallback, and [`iface`](super::iface)'s
+/// couldn't-take-the-lock answer). They were all `10.0.2.x` because every
+/// target was a VMM whose user-mode network is; the amd64 bare-metal target is
+/// on a real LAN, where they are not.
+///
+/// Chosen once per boot by the kernel and stored (below) rather than passed
+/// around: the deconfigure path runs inside the `NETWORK` critical section,
+/// reached from a poll that has no caller to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticIpv4 {
+    /// The interface address.
+    pub addr: [u8; 4],
+    /// Its prefix length, in bits.
+    pub prefix_len: u8,
+    /// The default IPv4 route.
+    pub gateway: [u8; 4],
+    /// The resolver the DNS socket is seeded with.
+    pub dns: [u8; 4],
+}
+
+impl StaticIpv4 {
+    /// QEMU/Firecracker user-mode networking: the fixed guest address, the
+    /// gateway it NATs through, and the DNS proxy it answers on. The default,
+    /// because every target but amd64 bare metal is one of those.
+    pub const QEMU_USER: Self =
+        Self { addr: [10, 0, 2, 15], prefix_len: 24, gateway: [10, 0, 2, 2], dns: [10, 0, 2, 3] };
+}
+
+// Stored as three `AtomicU32`s plus a byte rather than behind a lock: every
+// reader is either inside the `NETWORK` critical section (the deconfigure
+// fallback) or is `interface_snapshot`'s answer for having *failed* to take
+// that lock, so a second lock here would be one of those two in the worst
+// possible place. Written once, before `NETWORK_READY`.
+static STATIC_V4_ADDR: AtomicU32 = AtomicU32::new(u32::from_be_bytes([10, 0, 2, 15]));
+static STATIC_V4_PREFIX: AtomicU8 = AtomicU8::new(24);
+static STATIC_V4_GATEWAY: AtomicU32 = AtomicU32::new(u32::from_be_bytes([10, 0, 2, 2]));
+static STATIC_V4_DNS: AtomicU32 = AtomicU32::new(u32::from_be_bytes([10, 0, 2, 3]));
+
+/// Install the static IPv4 configuration. Called by `init`'s `build` before the
+/// interface exists; never afterwards.
+pub(crate) fn set_static_ipv4(cfg: StaticIpv4) {
+    STATIC_V4_ADDR.store(u32::from_be_bytes(cfg.addr), Ordering::Relaxed);
+    STATIC_V4_PREFIX.store(cfg.prefix_len, Ordering::Relaxed);
+    STATIC_V4_GATEWAY.store(u32::from_be_bytes(cfg.gateway), Ordering::Relaxed);
+    STATIC_V4_DNS.store(u32::from_be_bytes(cfg.dns), Ordering::Relaxed);
+}
+
+/// The static IPv4 configuration in force — [`StaticIpv4::QEMU_USER`] unless a
+/// kernel installed another one.
+#[must_use]
+pub fn static_ipv4() -> StaticIpv4 {
+    StaticIpv4 {
+        addr: STATIC_V4_ADDR.load(Ordering::Relaxed).to_be_bytes(),
+        prefix_len: STATIC_V4_PREFIX.load(Ordering::Relaxed),
+        gateway: STATIC_V4_GATEWAY.load(Ordering::Relaxed).to_be_bytes(),
+        dns: STATIC_V4_DNS.load(Ordering::Relaxed).to_be_bytes(),
+    }
+}
+
+/// The resolver address, as smoltcp wants it.
+pub(crate) fn static_dns_server() -> IpAddress {
+    let [a, b, c, d] = static_ipv4().dns;
+    IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(a, b, c, d))
+}
 
 pub struct NetworkState {
     pub iface: Interface,

@@ -33,6 +33,7 @@
 //! the stack uses this for timeouts, where a 10 ms granularity is fine.
 
 use akuma_net::NetRuntime;
+use akuma_net::smoltcp_net::StaticIpv4;
 use akuma_selftest::Suite;
 
 use crate::serial;
@@ -253,14 +254,82 @@ pub fn init_loopback_only() -> bool {
     report_init(akuma_net::init_loopback_only(net_runtime()))
 }
 
+/// The address this target carries on a real LAN when DHCP does not answer.
+///
+/// **Hardcoded, and deliberately not `10.0.2.15`.** Every other Akuma target is
+/// a VMM guest whose user-mode network hands out that address; this one is a
+/// desktop plugged into a household switch, where `10.0.2.15` is unroutable and
+/// unreachable — the first bare-metal boot with the Realtek driver up came back
+/// with exactly that, on a `192.168.1.0/24` LAN, which is how this constant came
+/// to exist. `.220` is above the usual DHCP pool and below the broadcast
+/// address, so it does not collide with a lease.
+///
+/// DHCP still runs and still wins when it answers: this is the fallback the
+/// interface carries until then, and reverts to if the lease lapses. Override
+/// it for one boot with `ip=` on the kernel command line — see [`parse_ip_arg`].
+///
+/// The resolver is **Cloudflare's `1.1.1.1`, not the gateway.** A VMM target
+/// resolves through its own hypervisor's proxy (`10.0.2.3`) and can count on
+/// it answering; a household router may or may not run a resolver, may hand out
+/// one only over DHCP, and is the piece most likely to be replaced between two
+/// boots of this machine. A public resolver is one fewer thing that has to be
+/// true for name resolution to work on a box with no keyboard to fix it from —
+/// and `ip=192.168.1.220/24,192.168.1.1,192.168.1.1` puts it back.
+const BARE_METAL_STATIC_V4: StaticIpv4 = StaticIpv4 {
+    addr: [192, 168, 1, 220],
+    prefix_len: 24,
+    gateway: [192, 168, 1, 1],
+    dns: [1, 1, 1, 1],
+};
+
+/// Parse an `ip=` command-line token into a [`StaticIpv4`].
+///
+/// `ip=<addr>[/<prefix>][,<gateway>[,<dns>]]` — anything omitted is taken from
+/// `default`, so `ip=192.168.1.77` moves only the address and
+/// `ip=10.1.2.3/16,10.1.0.1,1.1.1.1` sets all four. Returns `None` for anything
+/// it cannot parse, and the caller then uses `default`: a typo on the command
+/// line of a machine with no keyboard must not leave it with no address at all.
+fn parse_ip_arg(arg: &str, default: StaticIpv4) -> Option<StaticIpv4> {
+    fn quad(s: &str) -> Option<[u8; 4]> {
+        let mut out = [0u8; 4];
+        let mut parts = s.split('.');
+        for slot in &mut out {
+            *slot = parts.next()?.parse().ok()?;
+        }
+        parts.next().is_none().then_some(out)
+    }
+
+    let mut fields = arg.split(',');
+    let (addr_str, prefix_str) = match fields.next()?.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (arg.split(',').next()?, None),
+    };
+    let mut cfg = default;
+    cfg.addr = quad(addr_str)?;
+    if let Some(p) = prefix_str {
+        let bits: u8 = p.parse().ok()?;
+        if bits > 32 {
+            return None;
+        }
+        cfg.prefix_len = bits;
+    }
+    if let Some(g) = fields.next() {
+        cfg.gateway = quad(g)?;
+    }
+    if let Some(d) = fields.next() {
+        cfg.dns = quad(d)?;
+    }
+    fields.next().is_none().then_some(cfg)
+}
+
 /// Bring the stack up on the Realtek RTL8169/8168 at the mapped register BAR
-/// `bar` (from `pci::map_bar`). DHCP on. Falls back to loopback-only if the
-/// chip does not come up.
+/// `bar` (from `pci::map_bar`), with `static_v4` as the pre-DHCP address.
+/// DHCP on. Falls back to loopback-only if the chip does not come up.
 ///
 /// # Safety
 /// `bar` must be the NIC's device-mapped register BAR, live for the rest of
 /// the boot; called once.
-pub unsafe fn init_rtl8169(bar: *mut u8) -> bool {
+pub unsafe fn init_rtl8169(bar: *mut u8, static_v4: StaticIpv4) -> bool {
     // SAFETY: the caller's obligation on `bar`; called once, from `kmain_mb2`.
     let device = match unsafe { akuma_net::ExternalDevice::probe_rtl8169(bar) } {
         Ok(d) => d,
@@ -271,7 +340,7 @@ pub unsafe fn init_rtl8169(bar: *mut u8) -> bool {
             return init_loopback_only();
         }
     };
-    report_init(akuma_net::init_with_external(net_runtime(), true, device))
+    report_init(akuma_net::init_with_external(net_runtime(), true, device, Some(static_v4)))
 }
 
 fn report_init(r: Result<(), &'static str>) -> bool {
@@ -348,15 +417,29 @@ pub fn spawn_netpoll() -> bool {
 /// register BAR, and:
 ///
 /// * a **Realtek RTL8169/8168** (`10ec:*`) → the real driver
-///   (`akuma-net-nic`'s `rtl8169` glue over `akuma-net-rtl8169`), DHCP on;
+///   (`akuma-net-nic`'s `rtl8169` glue over `akuma-net-rtl8169`), DHCP on, with
+///   [`BARE_METAL_STATIC_V4`] (or `cmdline`'s `ip=`) as the pre-DHCP address;
 /// * **anything else** (QEMU's e1000 in the OVMF rig) → loopback only, after
 ///   reading the vendor's ID register to prove the BAR mapping works;
 /// * **no NIC at all** → loopback only.
 ///
 /// Returns whether a socket layer is up (always true unless `akuma-net` itself
 /// fails).
-pub fn init_bare_metal() -> bool {
+pub fn init_bare_metal(cmdline: &str) -> bool {
     use akuma_pci::{Bar, class, subclass};
+
+    // Resolved before the NIC is even found, so a bad `ip=` is reported next to
+    // the command line that carried it rather than three screens later.
+    let mut static_v4 = BARE_METAL_STATIC_V4;
+    if let Some(arg) = cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("ip=")) {
+        if let Some(cfg) = parse_ip_arg(arg, BARE_METAL_STATIC_V4) {
+            static_v4 = cfg;
+        } else {
+            serial::puts("  nic:  [WARN] cannot parse ip=");
+            serial::puts(arg);
+            serial::puts("; using the built-in address\n");
+        }
+    }
 
     let Some(dev) = crate::pci::find_class(class::NETWORK, subclass::ETHERNET) else {
         return init_loopback_only();
@@ -394,7 +477,7 @@ pub fn init_bare_metal() -> bool {
         serial::puts(" [RTL8169]\n");
         // SAFETY: `regs` is the just-mapped, device-attributed register BAR of
         // the Realtek NIC enumerated above; this is the one call.
-        return unsafe { init_rtl8169(regs) };
+        return unsafe { init_rtl8169(regs, static_v4) };
     }
 
     // Not a chip we drive. Read IDR0 to show the mapping works, then loopback.
@@ -432,6 +515,37 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
     let t0 = uptime_us();
     crate::sched::yield_now();
     t.check("net: the uptime clock is readable", uptime_us() >= t0);
+
+    // `ip=`. Checked every boot on every entry (not only the bare-metal one)
+    // because it is the one piece of network configuration a machine with no
+    // keyboard cannot correct after the fact: a parser that silently widened a
+    // prefix or dropped a gateway would strand the box, and it costs
+    // microseconds to prove it did not.
+    let d = BARE_METAL_STATIC_V4;
+    t.check(
+        "net: ip= takes an address alone",
+        parse_ip_arg("192.168.1.77", d)
+            == Some(StaticIpv4 { addr: [192, 168, 1, 77], ..d }),
+    );
+    t.check(
+        "net: ip= takes address/prefix,gateway,dns",
+        parse_ip_arg("10.1.2.3/16,10.1.0.1,1.1.1.1", d)
+            == Some(StaticIpv4 {
+                addr: [10, 1, 2, 3],
+                prefix_len: 16,
+                gateway: [10, 1, 0, 1],
+                dns: [1, 1, 1, 1],
+            }),
+    );
+    t.check("net: ip= rejects a prefix over 32", parse_ip_arg("10.0.0.1/33", d).is_none());
+    t.check("net: ip= rejects an octet over 255", parse_ip_arg("10.0.0.256", d).is_none());
+    t.check("net: ip= rejects a three-part address", parse_ip_arg("10.0.1", d).is_none());
+    t.check("net: ip= rejects trailing junk", parse_ip_arg("10.0.0.1,10.0.0.2,8.8.8.8,x", d).is_none());
+    t.check_eq(
+        "net: the built-in bare-metal address is 192.168.1.220",
+        u64::from(u32::from_be_bytes(BARE_METAL_STATIC_V4.addr)),
+        u64::from(u32::from_be_bytes([192, 168, 1, 220])),
+    );
 
     // A machine with no virtio-net device is legitimate — `DISK=none` under
     // QEMU, and Firecracker without `FC_NET=1` — so "no stack" is a skip, not a

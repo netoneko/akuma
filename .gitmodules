@@ -26,3 +26,8 @@
 [submodule "crates/akuma-fbcon/vendor/jetbrains-mono"]
 	path = crates/akuma-fbcon/vendor/jetbrains-mono
 	url = https://github.com/JetBrains/JetBrainsMono
+	# One file is used (fonts/ttf/JetBrainsMono-Regular.ttf, baked into a cell
+	# table by crates/akuma-fbcon/build.rs) out of a repo whose full history is
+	# ~29 MiB of font binaries. A shallow checkout is 10 MiB of .git and has
+	# the file; nothing here ever reads this submodule's log.
+	shallow = true

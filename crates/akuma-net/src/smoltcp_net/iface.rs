@@ -2,11 +2,6 @@
 
 use super::*;
 
-/// Static IPv4 address/prefix `init()` (above) always configures this
-/// interface with — the fallback when [`with_network`] can't take the lock,
-/// not a placeholder guess.
-const DEFAULT_IP: [u8; 4] = [10, 0, 2, 15];
-const DEFAULT_PREFIX_LEN: u8 = 24;
 pub(crate) const LOOPBACK_IP: [u8; 4] = [127, 0, 0, 1];
 
 #[must_use]
@@ -34,9 +29,10 @@ pub fn interface_snapshot() -> IfaceInfo {
     with_network(|net| {
         // The first non-loopback IPv4 address, if any. `(0.0.0.0, 0)` when the
         // interface is up but unaddressed — a loopback-only kernel, or before
-        // DHCP on a kernel that configures no static fallback. `DEFAULT_IP` is
-        // *not* used here: it is the "couldn't read the stack at all" answer
-        // (the outer `unwrap_or`), not "no address configured".
+        // DHCP on a kernel that configures no static fallback. The configured
+        // `static_ipv4()` is *not* used here: it is the "couldn't read the
+        // stack at all" answer (the outer `unwrap_or_else`), not "no address
+        // configured".
         let (ip, prefix_len) = net.iface.ip_addrs().iter()
             .find_map(|cidr| {
                 let IpCidr::Ipv4(v4) = cidr;
@@ -50,5 +46,13 @@ pub fn interface_snapshot() -> IfaceInfo {
             mac: net.device.mac_address(),
             mtu: net.device.capabilities().max_transmission_unit as u16,
         }
-    }).unwrap_or(IfaceInfo { ip: DEFAULT_IP, prefix_len: DEFAULT_PREFIX_LEN, mac: [0; 6], mtu: 1500 })
+    }).unwrap_or_else(|| {
+        // Couldn't read the stack at all. The configured static address is the
+        // honest answer — not a placeholder guess, and since 2026-09-05 not the
+        // user-mode-networking literal either: a bare-metal kernel installs its
+        // own (`StaticIpv4`), and reporting 10.0.2.15 on a 192.168.1.0/24 LAN
+        // would be worse than reporting nothing.
+        let cfg = static_ipv4();
+        IfaceInfo { ip: cfg.addr, prefix_len: cfg.prefix_len, mac: [0; 6], mtu: 1500 }
+    })
 }

@@ -110,14 +110,20 @@ pub fn init_loopback_only(rt: NetRuntime) -> Result<(), &'static str> {
 
 /// Bring the stack up on a caller-built external device (plus loopback) — the
 /// seam for a NIC this crate cannot probe for.
+///
+/// `static_v4` is the address, default route and resolver to configure — the
+/// fallback the interface carries before DHCP answers and reverts to if it
+/// stops. Pass [`smoltcp_net::StaticIpv4::QEMU_USER`] under a VMM; a machine on
+/// a real LAN needs its own. `None` configures no IPv4 address at all.
 #[cfg(feature = "smoltcp")]
 pub fn init_with_external(
     rt: NetRuntime,
     enable_dhcp: bool,
     device: akuma_net_nic::ExternalDevice,
+    static_v4: Option<smoltcp_net::StaticIpv4>,
 ) -> Result<(), &'static str> {
     runtime::register(rt);
-    smoltcp_net::init_with_external(enable_dhcp, device)
+    smoltcp_net::init_with_external(enable_dhcp, device, static_v4)
 }
 
 /// Smoltcp-free variant of [`init`].

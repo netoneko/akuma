@@ -71,11 +71,13 @@ FDPROBE=$(find target/x86_64-unknown-none/release/build -name fdprobe.elf 2>/dev
 PAWS=""
 HTTPD=""
 SSHD=""
-for prog in paws httpd; do
+HERD=""
+for prog in paws httpd herd; do
     if (cd userspace && cargo build -q -p "$prog" --target x86_64-unknown-none --release 2>/dev/null); then
         found=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name "$prog" -type f | head -1)
         [ "$prog" = paws ] && PAWS="$found"
         [ "$prog" = httpd ] && HTTPD="$found"
+        [ "$prog" = herd ] && HERD="$found"
     fi
 done
 
@@ -139,6 +141,7 @@ done
 [ -n "$FDPROBE" ] && "$DEBUGFS" -w -R "write $FDPROBE bin/fdprobe" "$IMG" >/dev/null 2>&1
 [ -n "$PAWS" ] && "$DEBUGFS" -w -R "write $PAWS bin/paws" "$IMG" >/dev/null 2>&1
 [ -n "$HTTPD" ] && "$DEBUGFS" -w -R "write $HTTPD bin/httpd" "$IMG" >/dev/null 2>&1
+[ -n "$HERD" ] && "$DEBUGFS" -w -R "write $HERD bin/herd" "$IMG" >/dev/null 2>&1
 
 # tcc + its runtime archive.
 if [ -n "$TCC" ]; then
@@ -333,6 +336,29 @@ if [ -f "$BB" ]; then
         "$DEBUGFS" -w -R "ln /bin/busybox /bin/$applet" "$IMG" >/dev/null 2>&1
     done
 fi
+# akuma-cli (`akuma`), the katakana screensaver. NOT built here and NOT a
+# workspace member: it is a **std** binary (clap, crossterm, rand) from the
+# sibling `netoneko/akuma-cli` repo, so it cannot target `x86_64-unknown-none`
+# like everything above — it is linked static against musl for
+# `x86_64-unknown-linux-musl` and runs on this kernel the same way the busybox
+# binary below does, as a program the tree did not compile.
+#
+# Which is also why it is staged from a cached artifact rather than built:
+# cross-linking musl from macOS needs a toolchain this script cannot assume.
+# Build it on a Linux box and drop the result here (the HP box has the source
+# at `/root/akuma-cli`):
+#
+#   rustup target add x86_64-unknown-linux-musl
+#   cargo build --release --target x86_64-unknown-linux-musl
+#   scp .../release/akuma <this tree>/target/x86_64-unknown-none/release/akuma-cli-x86_64
+#
+# `AKUMA_CLI=<path>` points at one somewhere else. Absent, the image is built
+# without it — a missing screensaver must never fail a disk that carries sshd.
+AKUMA_CLI="${AKUMA_CLI:-target/x86_64-unknown-none/release/akuma-cli-x86_64}"
+if [ -f "$AKUMA_CLI" ]; then
+    "$DEBUGFS" -w -R "write $AKUMA_CLI bin/akuma" "$IMG" >/dev/null 2>&1
+fi
+
 if [ -n "$SSHD" ]; then
     "$DEBUGFS" -w -R "write $SSHD bin/sshd" "$IMG" >/dev/null 2>&1
     "$DEBUGFS" -w -R "mkdir /etc" "$IMG" >/dev/null 2>&1
@@ -346,6 +372,45 @@ if [ -n "$SSHD" ]; then
     printf 'shell = %s\n' "${SSHD_SHELL:-/bin/paws}" > "$TMP/sshd.conf"
     "$DEBUGFS" -w -R "write $TMP/sshd.conf etc/sshd/sshd.conf" "$IMG" >/dev/null 2>&1
 fi
+
+# herd, the supervisor — `init=/bin/herd` instead of `init=/bin/sshd`.
+#
+# Why bother, when `init=/bin/sshd` already works: `sshd` exiting (a bug, a
+# panic, a client that wedges the accept loop) ends the only way into a machine
+# whose keyboard does not work yet — the USB HID stack is unwritten, so on the
+# HP box the framebuffer is output-only and ssh is the console. herd restarts
+# it, and adds a second service (`httpd`) without a second boot.
+#
+# The directory layout is herd's own (`userspace/herd/README.md`): a service is
+# a `<name>.conf` in `enabled/`, and `available/` holds ones that exist but are
+# not started. herd `mkdir`s these itself at startup, but pre-creating them here
+# means a boot whose `mkdirat` fails still finds its config — and it is where
+# the .conf files have to be written to anyway.
+if [ -n "$HERD" ]; then
+    "$DEBUGFS" -w -R "mkdir /etc" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /etc/herd" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /etc/herd/available" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /etc/herd/enabled" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /var" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /var/log" "$IMG" >/dev/null 2>&1
+    "$DEBUGFS" -w -R "mkdir /var/log/herd" "$IMG" >/dev/null 2>&1
+
+    # sshd: enabled. `restart_delay` is 2 s rather than herd's 1 s default
+    # because a failed bind (the previous sshd's socket not yet reclaimed)
+    # is the likely reason it died, and that wants a moment.
+    if [ -n "$SSHD" ]; then
+        printf 'command = /bin/sshd\nrestart = true\nrestart_delay = 2000\n' > "$TMP/herd-sshd.conf"
+        "$DEBUGFS" -w -R "write $TMP/herd-sshd.conf etc/herd/enabled/sshd.conf" "$IMG" >/dev/null 2>&1
+        "$DEBUGFS" -w -R "write $TMP/herd-sshd.conf etc/herd/available/sshd.conf" "$IMG" >/dev/null 2>&1
+    fi
+
+    # httpd: available, not enabled. Something to `herd enable httpd` over the
+    # ssh session the service above is there to provide.
+    if [ -n "$HTTPD" ]; then
+        printf 'command = /bin/httpd\nrestart = true\n' > "$TMP/herd-httpd.conf"
+        "$DEBUGFS" -w -R "write $TMP/herd-httpd.conf etc/herd/available/httpd.conf" "$IMG" >/dev/null 2>&1
+    fi
+fi
 # DNS. QEMU's usermode `-netdev user` and Firecracker's `net-setup.sh` tap both
 # answer DNS themselves at `10.0.2.3` (usermode net's fixed proxy address; see
 # `net-setup.sh`'s dnsmasq for the Firecracker side, same address by
@@ -353,8 +418,22 @@ fi
 # musl's resolver reads `/etc/resolv.conf` and, finding none, falls back to
 # `127.0.0.1`, so `wget http://a-hostname/` failed with "bad address" even
 # though outbound TCP itself worked (`amd64/README.md`'s curl/wget check).
+#
+# Three servers, and the two public ones are NOT a fallback that costs a
+# timeout on a VMM: **musl queries every nameserver at once** (`__res_msend`
+# sends to all of them in parallel and takes the first answer) rather than
+# walking the list the way glibc does. So one image serves both worlds — the
+# hypervisor's proxy answers first under a VMM, and on the HP box, where
+# `10.0.2.3` is nothing at all, Cloudflare and Google do. That machine's own
+# router is deliberately not in the list, for the reason
+# `BARE_METAL_STATIC_V4` gives in `amd64/src/net.rs`: a household gateway may
+# not be a resolver, and this is a box with no keyboard to fix it from.
+# `RESOLV_NS="1.1.1.1 8.8.8.8"` replaces the list.
 "$DEBUGFS" -w -R "mkdir /etc" "$IMG" >/dev/null 2>&1
-printf 'nameserver 10.0.2.3\n' > "$TMP/resolv.conf"
+: > "$TMP/resolv.conf"
+for ns in ${RESOLV_NS:-10.0.2.3 1.1.1.1 8.8.8.8}; do
+    printf 'nameserver %s\n' "$ns" >> "$TMP/resolv.conf"
+done
 "$DEBUGFS" -w -R "write $TMP/resolv.conf etc/resolv.conf" "$IMG" >/dev/null 2>&1
 
 # Something for httpd to serve. httpd's document root is `/public`, and `GET /`
@@ -372,4 +451,4 @@ printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></h
 # rather than inventing a different convention.
 "$DEBUGFS" -w -R "mkdir /tmp" "$IMG" >/dev/null 2>&1
 
-echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")"
+echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")$([ -n "$SSHD" ] && echo ", /bin/sshd")$([ -n "$HERD" ] && echo ", /bin/herd (sshd enabled)")$([ -f "$AKUMA_CLI" ] && echo ", /bin/akuma")"

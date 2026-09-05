@@ -78,12 +78,20 @@ pub fn poll() -> bool {
                         }
                         dhcpv4::Event::Deconfigured => {
                             DHCP_CONFIGURED.store(false, Ordering::Release);
+                            // The fallback is whatever the kernel installed at
+                            // bring-up, NOT the user-mode-networking literal
+                            // this used to spell out: on the amd64 bare-metal
+                            // target that literal put an unroutable 10.0.2.15
+                            // on a 192.168.1.0/24 LAN, which is exactly the
+                            // case where a DHCP server not answering matters.
+                            let cfg = static_ipv4();
                             let mut fallback_full = false;
                             let mut loopback_full = false;
                             net.iface.update_ip_addrs(|addrs| {
                                 addrs.clear();
+                                let [a, b, c, d] = cfg.addr;
                                 fallback_full = addrs
-                                    .push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24))
+                                    .push(IpCidr::new(IpAddress::v4(a, b, c, d), cfg.prefix_len))
                                     .is_err();
                                 loopback_full = addrs
                                     .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
@@ -91,7 +99,8 @@ pub fn poll() -> bool {
                             });
                             dhcp_report =
                                 Some(DhcpReport::Deconfigured { fallback_full, loopback_full });
-                            let _ = net.iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2));
+                            let [a, b, c, d] = cfg.gateway;
+                            let _ = net.iface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(a, b, c, d));
                         }
                     }
                     dhcp_changed = true;
@@ -222,7 +231,12 @@ pub fn poll() -> bool {
             crate::safe_print!(64, "[SmolNet] IP: {addr}\n");
         }
         Some(DhcpReport::Deconfigured { fallback_full, loopback_full }) => {
-            crate::safe_print!(80, "[SmolNet] DHCP deconfigured - reverting to static fallback\n");
+            let a = static_ipv4().addr;
+            crate::safe_print!(
+                88,
+                "[SmolNet] DHCP deconfigured - reverting to static {}.{}.{}.{}\n",
+                a[0], a[1], a[2], a[3]
+            );
             if fallback_full {
                 crate::safe_print!(88, "[SmolNet] could not install static fallback address: list full\n");
             }

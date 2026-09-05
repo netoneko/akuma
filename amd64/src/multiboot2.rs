@@ -336,7 +336,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
 
     // Networking: the Realtek NIC if this box has one, loopback only otherwise.
     // Either way `socket(AF_INET)` works for `busybox ifconfig` and `127.0.0.1`.
-    let have_net = crate::net::init_bare_metal();
+    let have_net = crate::net::init_bare_metal(info.cmdline());
 
     let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
 

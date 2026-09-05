@@ -31,7 +31,7 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
     let device = ExternalDevice::Virtio(VirtioSmoltcpDevice::new(Nic::new(
         found_device.ok_or("No virtio-net device found")?,
     )));
-    build(enable_dhcp, device, true)
+    build(enable_dhcp, device, Some(StaticIpv4::QEMU_USER))
 }
 
 /// Bring the stack up with **no wire** — loopback only.
@@ -44,16 +44,25 @@ pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
 /// fallback address a real interface would carry.
 pub fn init_loopback_only() -> Result<(), &'static str> {
     crate::safe_print!(48, "[SmolNet] Initializing (loopback only, no NIC)\n");
-    build(false, ExternalDevice::Absent, false)
+    build(false, ExternalDevice::Absent, None)
 }
 
 /// Bring the stack up on a caller-supplied external device (plus loopback).
 ///
 /// The seam for a NIC this crate cannot probe for itself — the amd64 Realtek,
 /// built by `akuma-net-nic`'s `rtl8169` module from a mapped BAR.
+///
+/// `static_v4` is the address/route/resolver to configure, and is **not**
+/// [`StaticIpv4::QEMU_USER`] for this caller: a machine on a real LAN needs a
+/// real address there, not the user-mode-networking literal every VMM target
+/// shares. `None` configures no IPv4 address at all (loopback only).
 #[allow(clippy::cast_possible_wrap)]
-pub fn init_with_external(enable_dhcp: bool, device: ExternalDevice) -> Result<(), &'static str> {
-    build(enable_dhcp, device, true)
+pub fn init_with_external(
+    enable_dhcp: bool,
+    device: ExternalDevice,
+    static_v4: Option<StaticIpv4>,
+) -> Result<(), &'static str> {
+    build(enable_dhcp, device, static_v4)
 }
 
 /// The shared part: seed the interface, addresses, routes and socket set from
@@ -62,9 +71,17 @@ pub fn init_with_external(enable_dhcp: bool, device: ExternalDevice) -> Result<(
 fn build(
     enable_dhcp: bool,
     external: ExternalDevice,
-    add_static_v4: bool,
+    static_v4: Option<StaticIpv4>,
 ) -> Result<(), &'static str> {
     DHCP_ENABLED.store(enable_dhcp, Ordering::Relaxed);
+
+    // Publish it before anything reads it: `poll()`'s DHCP-deconfigure fallback
+    // and `interface_snapshot`'s lock-failure answer both come from here, and
+    // neither has a caller to take it from. A loopback-only bring-up installs
+    // nothing, so those two keep the default.
+    if let Some(cfg) = static_v4 {
+        set_static_ipv4(cfg);
+    }
 
     let mut device = LoopbackAwareDevice::new(external);
     let mac = device.mac_address();
@@ -87,22 +104,30 @@ fn build(
     // down for a misconfiguration, on a path that has a perfectly good degraded
     // mode (no static fallback address; DHCP still runs). Log and continue.
     iface.update_ip_addrs(|ip_addrs| {
-        if add_static_v4
-            && ip_addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).is_err()
-        {
-            crate::safe_print!(80, "[SmolNet] could not add static IPv4 address: list full\n");
+        if let Some(cfg) = static_v4 {
+            let [a, b, c, d] = cfg.addr;
+            if ip_addrs.push(IpCidr::new(IpAddress::v4(a, b, c, d), cfg.prefix_len)).is_err() {
+                crate::safe_print!(80, "[SmolNet] could not add static IPv4 address: list full\n");
+            }
         }
         if ip_addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).is_err() {
             crate::safe_print!(80, "[SmolNet] could not add loopback address: list full\n");
         }
     });
-    if add_static_v4
-        && iface
+    if let Some(cfg) = static_v4 {
+        let [a, b, c, d] = cfg.gateway;
+        crate::safe_print!(
+            80,
+            "[SmolNet] static IPv4 {}.{}.{}.{}/{} gw {a}.{b}.{c}.{d}\n",
+            cfg.addr[0], cfg.addr[1], cfg.addr[2], cfg.addr[3], cfg.prefix_len
+        );
+        if iface
             .routes_mut()
-            .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2))
+            .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(a, b, c, d))
             .is_err()
-    {
-        crate::safe_print!(80, "[SmolNet] could not add default IPv4 route: table full\n");
+        {
+            crate::safe_print!(80, "[SmolNet] could not add default IPv4 route: table full\n");
+        }
     }
 
     // `None` means `init` ran twice, which the kernel's boot path does not do.
@@ -121,11 +146,16 @@ fn build(
         None
     };
 
-    let dns_servers = &[QEMU_DNS_SERVER];
+    let dns_servers = &[static_dns_server()];
     let dns_socket = dns::Socket::new(dns_servers, vec![]);
     SOCKETS_LIVE.fetch_add(1, Ordering::Relaxed);
     let dns_handle = sockets.add(dns_socket);
-    crate::safe_print!(64, "[SmolNet] DNS socket initialized (server: 10.0.2.3)\n");
+    let dns = static_ipv4().dns;
+    crate::safe_print!(
+        64,
+        "[SmolNet] DNS socket initialized (server: {}.{}.{}.{})\n",
+        dns[0], dns[1], dns[2], dns[3]
+    );
 
     *NETWORK.lock() = Some(NetworkState {
         iface,

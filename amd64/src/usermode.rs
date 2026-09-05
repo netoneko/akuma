@@ -634,6 +634,13 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             301 => sys_spawn(a1, a2, a3, a4, a5),
             313 => crate::fd::sys_poll_input_event(a1, a2, a3),
             303 => sys_waitpid(a1, a2, a3),
+            // `uptime()` — microseconds since boot, matching
+            // `akuma_syscalls_time::sys_uptime` on the AArch64 side. `herd`'s
+            // whole supervision loop is keyed on it (restart delays, start
+            // delays, the 20 s config reload), so without this its clock
+            // reads `-ENOSYS` as a colossal timestamp and every delay is
+            // already in the past.
+            319 => crate::net::uptime_us(),
             326 => sys_close_child_stdin(a1),
             // `kill` is accepted as a no-op success: `sshd` sends SIGHUP/SIGTERM
             // to a session's shell on teardown, and there is nothing here to
