@@ -45,7 +45,7 @@ use crate::port::outb;
 use akuma_selftest::Suite;
 
 use crate::serial;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// `IA32_APIC_BASE`. Bits 12:35 are the base address; bit 11 is the global
 /// enable; bit 8 marks the bootstrap processor.
@@ -266,6 +266,10 @@ pub fn init() -> bool {
     idt::set_handler(TIMER_VECTOR, idt::timer_interrupt_entry());
     crate::smp::set_bsp_lapic_id(read(REG_ID) >> 24);
 
+    // Before the timer is armed for real: `calibrate` borrows it (masked,
+    // one-shot, full scale) and `start_timer` below re-arms it with whatever
+    // count came out.
+    let calibrated = calibrate();
     start_timer();
 
     serial::puts("  lapic: base=0x");
@@ -274,7 +278,21 @@ pub fn init() -> bool {
     serial::put_dec(u64::from(read(REG_ID) >> 24));
     serial::puts(" timer vector=");
     serial::put_dec(u64::from(TIMER_VECTOR));
-    serial::puts(" periodic\n");
+    serial::puts(" periodic\n  lapic: ");
+    if calibrated {
+        let counts = TIMER_COUNT.load(Ordering::Relaxed);
+        serial::puts("calibrated vs PIT: ");
+        serial::put_dec(u64::from(counts));
+        serial::puts(" counts per ");
+        serial::put_dec(u64::from(US_PER_TICK_TARGET));
+        serial::puts("us (");
+        // counts per 10 ms at divide-16 -> the APIC's own input, in kHz.
+        serial::put_dec(u64::from(counts) * 16 / 10_000);
+        serial::puts(" MHz)\n");
+    } else {
+        serial::puts("[WARN] no PIT to calibrate against; tick period is a GUESS ");
+        serial::puts("and every network timeout is scaled by it\n");
+    }
     true
 }
 
@@ -293,16 +311,326 @@ pub fn init_ap() {
 
 /// Arm the periodic timer.
 ///
-/// The initial count is deliberately **uncalibrated**. The LAPIC counts at the
-/// core crystal frequency, which needs CPUID leaf `0x15` or calibration against
-/// another clock to convert into wall time — and nothing here needs wall time
-/// yet. This value only has to tick fast enough for a bounded spin loop to
-/// observe without waiting all day — it was 1_000_000 until the scheduler test
-/// needed several ticks inside one short workload and saw none.
+/// The count comes from [`calibrate`] when a PIT was there to calibrate
+/// against, and from [`UNCALIBRATED_COUNT`] when there was not.
+///
+/// It used to be a flat `100_000`, and that doc said the value was
+/// "deliberately uncalibrated ... nothing here needs wall time yet". That
+/// stopped being true when `net::uptime_us` began multiplying this timer's
+/// ticks by a fixed 10 000 µs and handing the result to smoltcp, which measures
+/// every DHCP retransmit, TCP retransmit and connection timeout against it.
+///
+/// The error was not small and not in one direction: the LAPIC counts at the
+/// core crystal, so `100_000` at divide-16 is 1.6 M counts, which is ~1.6 ms on
+/// a KVM guest whose APIC is nominally 1 GHz and ~16 ms on this machine's
+/// 100 MHz bus. One clock ran 6x fast, the other 1.6x slow, and both called it
+/// 10 ms.
 pub fn start_timer() {
     write(REG_TIMER_DIV, TIMER_DIV_16);
     write(REG_LVT_TIMER, u32::from(TIMER_VECTOR) | LVT_TIMER_PERIODIC);
-    write(REG_TIMER_INIT, 100_000);
+    write(REG_TIMER_INIT, TIMER_COUNT.load(Ordering::Relaxed));
+}
+
+/// The initial count when calibration could not run: the historical value, kept
+/// so a machine with no PIT behaves exactly as it did before calibration
+/// existed rather than differently-wrongly.
+const UNCALIBRATED_COUNT: u32 = 100_000;
+
+/// Counts to load for one [`US_PER_TICK_TARGET`] period. Written once by
+/// [`calibrate`], read by every [`start_timer`] including the APs'.
+static TIMER_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(UNCALIBRATED_COUNT);
+
+/// Whether [`calibrate`] found a PIT and succeeded.
+static CALIBRATED: AtomicBool = AtomicBool::new(false);
+
+/// The tick period the timer is calibrated to, in microseconds. `net::uptime_us`
+/// multiplies by this same number, so the two must agree — hence one constant.
+pub const US_PER_TICK_TARGET: u32 = 10_000;
+
+/// Did [`calibrate`] succeed? When false the tick period is whatever the core
+/// crystal makes of [`UNCALIBRATED_COUNT`] and `uptime_us` is a guess.
+#[must_use]
+pub fn is_calibrated() -> bool {
+    CALIBRATED.load(Ordering::Relaxed)
+}
+
+/// LAPIC counts measured in one [`US_PER_TICK_TARGET`] period, or 0.
+#[must_use]
+pub fn calibrated_count() -> u32 {
+    if CALIBRATED.load(Ordering::Relaxed) { TIMER_COUNT.load(Ordering::Relaxed) } else { 0 }
+}
+
+/// Measure the LAPIC timer against the 8254 PIT and set [`TIMER_COUNT`] so one
+/// tick is [`US_PER_TICK_TARGET`].
+///
+/// # Why the PIT, and why channel 2
+///
+/// The PIT's 1_193_182 Hz crystal is the one reference every PC-compatible
+/// machine agrees on, and **channel 2 is the only one that can be polled**: its
+/// gate is software-controlled through port `0x61` and its output is readable
+/// there as bit 5, so the whole measurement needs no interrupt, no IDT entry
+/// and no ordering against anything else. (Channel 0 drives IRQ0 and would
+/// mean taking interrupts during early boot, which is precisely the state this
+/// runs before.) The speaker bit is left off throughout — this is the standard
+/// trick, and it is worth saying out loud that it does not make a sound.
+///
+/// # Not every machine has one
+///
+/// QEMU `microvm` and Firecracker present a deliberately minimal device set and
+/// may have no PIT at all. So the wait for the output line is **bounded**: if
+/// it never rises, calibration reports failure and the caller keeps the old
+/// uncalibrated count. A boot that hangs here would be a far worse outcome than
+/// a clock that is merely wrong, and the failure is announced rather than
+/// silent.
+///
+/// Returns whether it succeeded.
+pub fn calibrate() -> bool {
+    /// Ticks of the PIT in one target period.
+    const PIT_COUNT: u32 = (PIT_HZ as u64 * US_PER_TICK_TARGET as u64 / 1_000_000) as u32;
+    /// Spins before giving up on an output line that is never going to rise.
+    /// One period is ~10 ms; this is orders of magnitude more than that and
+    /// still a fraction of a second.
+    const SPIN_LIMIT: u32 = 50_000_000;
+
+    if !pit_present() {
+        return false;
+    }
+
+    // SAFETY: the 8254 and the NMI status/control port are fixed legacy I/O
+    // ports. The speaker bit is explicitly cleared in every write, so the gate
+    // manipulation below cannot make a sound, and nothing else in this kernel
+    // touches channel 2 — there is no other user to race with.
+    unsafe {
+        let saved = crate::port::inb(PORT_61);
+        // Gate low, speaker off: channel 2 stopped and reset.
+        crate::port::outb(PORT_61, (saved & !SPEAKER) & !GATE);
+        // Channel 2, lobyte then hibyte, mode 0 (interrupt on terminal count),
+        // binary. Mode 0 is what makes the output line stay low until the count
+        // expires and then latch high, which is the edge this polls for.
+        crate::port::outb(0x43, 0b1011_0000);
+        crate::port::outb(0x42, (PIT_COUNT & 0xff) as u8);
+        crate::port::outb(0x42, (PIT_COUNT >> 8) as u8);
+
+        // Arm the LAPIC at full scale, masked — this borrows the timer exactly
+        // as `delay_counts` does, and `start_timer` re-arms it afterwards.
+        write(REG_TIMER_DIV, TIMER_DIV_16);
+        write(REG_LVT_TIMER, LVT_MASKED);
+        write(REG_TIMER_INIT, u32::MAX);
+
+        // Gate high: channel 2 starts counting now, and so does the measurement.
+        crate::port::outb(PORT_61, (saved & !SPEAKER) | GATE);
+
+        // A freshly gated mode-0 count holds its output LOW until it expires.
+        // If it is already high we are not talking to a PIT, whatever
+        // `pit_present` concluded — belt and braces on the failure that cost a
+        // 50x clock.
+        if crate::port::inb(PORT_61) & OUT != 0 {
+            write(REG_TIMER_INIT, 0);
+            crate::port::outb(PORT_61, saved);
+            return false;
+        }
+
+        let mut spins: u32 = 0;
+        while crate::port::inb(PORT_61) & OUT == 0 {
+            spins += 1;
+            if spins >= SPIN_LIMIT {
+                write(REG_TIMER_INIT, 0);
+                crate::port::outb(PORT_61, saved);
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        let remaining = read(REG_TIMER_CUR);
+        write(REG_TIMER_INIT, 0);
+        crate::port::outb(PORT_61, saved);
+
+        let elapsed = u32::MAX - remaining;
+        // A plausibility band rather than a bare non-zero check. Below this the
+        // measurement is noise (an output line that was already high, a PIT that
+        // answered instantly); above it the counter wrapped or the divisor is
+        // not what we asked for. Either way the old value is the safer answer.
+        if !(1_000..=500_000_000).contains(&elapsed) {
+            return false;
+        }
+        TIMER_COUNT.store(elapsed, Ordering::Relaxed);
+        CALIBRATED.store(true, Ordering::Relaxed);
+    }
+    true
+}
+
+/// Ports and bits of PIT channel 2's software gate (port `0x61`).
+const PORT_61: u16 = 0x61;
+/// Channel 2's gate: counting runs while this is high.
+const GATE: u8 = 1 << 0;
+/// The PC speaker. Cleared in every write here — none of this makes a sound.
+const SPEAKER: u8 = 1 << 1;
+/// Channel 2's output, readable at port `0x61`. Low while counting.
+const OUT: u8 = 1 << 5;
+
+/// Is there a PIT channel 2 that actually responds?
+///
+/// **`inb` on an unimplemented port returns `0xFF`, not zero**, and that is not
+/// a detail — it is the bug this function exists to prevent. QEMU `microvm` and
+/// Firecracker present no PIT, so port `0x61` floats: the [`OUT`] bit reads as
+/// already high, a wait-for-expiry loop falls through on its first iteration,
+/// and a "calibration" comes back having measured the handful of cycles between
+/// two instructions. Measured: 1199 counts where the real answer was 626 088,
+/// which sailed through a plausibility band and left `uptime_us` running about
+/// fifty times fast — with `CALIBRATED` set, so nothing downstream doubted it.
+///
+/// The probe is to clear the gate bit and read it back. A real `0x61` returns
+/// what was written; a floating bus returns the bit still set.
+fn pit_present() -> bool {
+    // SAFETY: a fixed legacy I/O port, restored before returning. The speaker
+    // bit is cleared, so nothing audible happens.
+    unsafe {
+        let saved = crate::port::inb(PORT_61);
+        crate::port::outb(PORT_61, (saved & !SPEAKER) & !GATE);
+        let back = crate::port::inb(PORT_61);
+        crate::port::outb(PORT_61, saved);
+        back & GATE == 0
+    }
+}
+
+/// Gate PIT channel 2 for `us` microseconds and spin until it expires.
+///
+/// The measurement primitive [`calibrate`] and [`clock_rate_check`] share. `us`
+/// must be at most [`PIT_MAX_US`] — the channel's count is 16 bits, so ~54.9 ms
+/// is the longest interval it can express, and asking for more would silently
+/// wrap to a short one.
+///
+/// Returns false if the output line never rose within a bounded spin, which is
+/// how a machine with no PIT answers.
+fn pit_wait_us(us: u32) -> bool {
+    const SPIN_LIMIT: u32 = 500_000_000;
+
+    if !pit_present() {
+        return false;
+    }
+    if us == 0 || us > PIT_MAX_US {
+        return false;
+    }
+    let count = (u64::from(PIT_HZ) * u64::from(us) / 1_000_000) as u32;
+    if count == 0 || count > 0xFFFF {
+        return false;
+    }
+    // SAFETY: fixed legacy I/O ports. The speaker bit is cleared in every write
+    // so nothing audible happens, and channel 2 has no other user in this
+    // kernel to race with.
+    unsafe {
+        let saved = crate::port::inb(PORT_61);
+        crate::port::outb(PORT_61, (saved & !SPEAKER) & !GATE);
+        crate::port::outb(0x43, 0b1011_0000);
+        crate::port::outb(0x42, (count & 0xff) as u8);
+        crate::port::outb(0x42, ((count >> 8) & 0xff) as u8);
+        crate::port::outb(PORT_61, (saved & !SPEAKER) | GATE);
+
+        let mut spins: u32 = 0;
+        while crate::port::inb(PORT_61) & OUT == 0 {
+            spins += 1;
+            if spins >= SPIN_LIMIT {
+                crate::port::outb(PORT_61, saved);
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        crate::port::outb(PORT_61, saved);
+    }
+    true
+}
+
+/// The PIT's input frequency, in Hz. Fixed by the hardware.
+const PIT_HZ: u32 = 1_193_182;
+
+/// The longest interval PIT channel 2's 16-bit count can express.
+const PIT_MAX_US: u32 = 54_000;
+
+/// Check the clock's **rate**, not just that it moves — with interrupts on, and
+/// before any user process starts.
+///
+/// [`calibrate`] can succeed and still be wrong: on QEMU `microvm` it returned a
+/// count roughly forty times too small, so `enable_and_check_clock` saw ticks
+/// arriving, reported success, and `uptime_us` ran about fifty times fast. A
+/// clock that is merely *moving* is not a clock — smoltcp scales every DHCP
+/// retransmit, TCP retransmit and connect timeout by it, so a 50x error is a
+/// stack whose every timeout fires 50x early.
+///
+/// So this counts real timer interrupts across a PIT-measured interval and
+/// compares against what [`US_PER_TICK_TARGET`] promises. It runs inside the
+/// self-test suite, which is **before `run_init`** — a wrong clock is caught on
+/// the boot that has it, on the screen, rather than inferred later from an ssh
+/// session that connects and then stalls.
+pub fn clock_rate_check(t: &mut Suite) {
+    const INTERVAL_US: u32 = 50_000;
+    const EXPECTED: u64 = (INTERVAL_US / US_PER_TICK_TARGET) as u64;
+
+    if !enable_and_check_clock() {
+        t.check("lapic: the clock advances once interrupts are enabled", false);
+        return;
+    }
+    t.check("lapic: the clock advances once interrupts are enabled", true);
+
+    let before = ticks();
+    if !pit_wait_us(INTERVAL_US) {
+        t.note("lapic: no PIT; the tick RATE is unverified", 0);
+        return;
+    }
+    let observed = ticks() - before;
+    t.note("lapic: ticks per 50ms (expect 5)", observed);
+    // A factor-of-two band each way. Tight enough to have caught the 50x error
+    // that motivated this, loose enough that a slow emulated PIT or a tick
+    // landing on a boundary does not fail a boot.
+    t.check(
+        "lapic: the tick rate matches US_PER_TICK_TARGET within 2x",
+        observed * 2 >= EXPECTED && observed <= EXPECTED * 2,
+    );
+}
+
+/// Unmask interrupts on this core, and prove the clock actually moves.
+///
+/// **Every self-test that enables interrupts also disables them again on the
+/// way out** (`lapic::smoke_test`, `sched::smoke_test`, `usermode::preempt_test`
+/// all end in `cli`), which is right for a test — it keeps ticks from
+/// interleaving with the next stage's output — and left the kernel handing the
+/// machine to `init` with `IF` clear. The timer was armed and delivering
+/// nothing.
+///
+/// That is not a cosmetic problem. `net::uptime_us` is `ticks() *
+/// US_PER_TICK_TARGET`, and it is the clock smoltcp measures **every** DHCP
+/// retransmit, TCP retransmit and connect timeout against. With `TICKS` frozen,
+/// time stops: DHCP sends one DISCOVER and never retries, a TCP connection
+/// completes its handshake and then never retransmits anything, and from the
+/// far end the machine "connects once and then dies". Observed on the HP box,
+/// and visible in the probe as `ticks=` pinned while `laps=` ran to 78 million.
+///
+/// The PVH path had been getting away with it by accident: `clock::sync_via_
+/// sntp` does its own `sti` and never puts it back. The bare-metal path calls
+/// no SNTP, so nothing ever re-enabled them.
+///
+/// Returns whether the tick count advanced within a bounded spin — a live timer
+/// is worth *checking* rather than assuming, because everything above depends
+/// on it and the failure is silent.
+pub fn enable_and_check_clock() -> bool {
+    /// Spins to wait for one tick. One period is `US_PER_TICK_TARGET`; this is
+    /// far more than that and still a fraction of a second.
+    const BUDGET: u64 = 200_000_000;
+
+    start_timer();
+    // SAFETY: the IDT is loaded, the timer vector has a handler and the legacy
+    // PICs are masked — the same preconditions `smoke_test` establishes for the
+    // kernel's first `sti`. This one is deliberately not paired with a `cli`:
+    // handing `init` a machine with interrupts enabled is the point.
+    unsafe {
+        core::arch::asm!("sti", options(nomem, nostack));
+    }
+    let before = ticks();
+    let mut spins = 0u64;
+    while ticks() == before && spins < BUDGET {
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    ticks() > before
 }
 
 /// Stop the timer. Used after the smoke test so later output is not interleaved
@@ -340,6 +668,22 @@ pub fn smoke_test(t: &mut Suite) {
     stop_timer();
 
     t.check("lapic: timer interrupts arrive", ticks() >= WANT);
+
+    // The calibration. Reported every boot rather than only checked, because
+    // its *value* is what every network timeout is scaled by: `net::uptime_us`
+    // multiplies ticks by `US_PER_TICK_TARGET`, and if the timer is not
+    // actually running at that period then DHCP retransmits, TCP retransmits
+    // and connect timeouts are all off by the same factor. A machine with no
+    // PIT is legitimate (QEMU `microvm`, Firecracker), so its absence is a
+    // `note`, not a failure — but it is never silent.
+    if is_calibrated() {
+        let counts = calibrated_count();
+        t.check("lapic: the timer is calibrated against the PIT", counts > 0);
+        t.note("lapic: counts per 10ms tick", u64::from(counts));
+        t.note("lapic: apic input MHz", u64::from(counts) * 16 / 10_000);
+    } else {
+        t.note("lapic: NOT calibrated (no PIT); the tick period is a guess", 0);
+    }
     // A measurement, not an assertion: the count differs by an order of
     // magnitude between emulation and real silicon (QEMU ~6e4, Zen 4 ~1e7 for
     // the same five ticks), which is itself evidence the ticks come from a

@@ -21,6 +21,19 @@ pub(crate) static TX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// whole question.
 pub(crate) static TX_FRAMES_SENT: AtomicUsize = AtomicUsize::new(0);
 
+/// Every `ISR` bit this driver has ever observed, OR-ed together.
+///
+/// `ISR` latches **regardless of `IMR`** — the mask gates interrupt *delivery*,
+/// not the status bits — so on a purely polled path the bits accumulate and
+/// nothing clears them unless the driver reads the register back. Accumulated
+/// rather than sampled because the interesting bits are transient: by the time
+/// a human is reading a status line, the event is long past.
+pub(crate) static RX_ISR_SEEN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// How many times the receive ring has been found dry (`ISR.RDU`).
+pub(crate) static RX_RING_DRY: AtomicUsize = AtomicUsize::new(0);
+
 /// The link, as the driver last read it from the PHY, packed so a reader needs
 /// no lock: `0` = never sampled, otherwise bit 0 = up, bits 1..3 = speed
 /// (1/2/3 = 10/100/1000, 0 = unknown), bit 3 = full duplex, bit 7 always set so
@@ -48,6 +61,12 @@ pub fn tx_drop_count() -> usize {
 #[must_use]
 pub fn tx_frames_sent() -> usize {
     TX_FRAMES_SENT.load(Ordering::Relaxed)
+}
+
+/// `(every ISR bit seen so far, times the receive ring ran dry)`.
+#[must_use]
+pub fn isr_history() -> (u32, usize) {
+    (RX_ISR_SEEN.load(Ordering::Relaxed), RX_RING_DRY.load(Ordering::Relaxed))
 }
 
 /// The last sampled link state: `None` until a driver has read the PHY at all,

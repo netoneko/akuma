@@ -270,6 +270,15 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // appears without knowing a framebuffer exists.
     serial::puts("\nAkuma/amd64 - bare metal, booted by ");
     serial::puts(info.loader_name());
+    // The command line, verbatim and early. Every boot option this kernel has
+    // — `init=`, `initargs=`, `netprobe`, `nosmp`, `ip=`, `strace` — is a token
+    // in here, and without echoing it "did the flag take?" is answered by
+    // inferring from behaviour. That inference cost a reboot: `[BKL] stuck:
+    // cpu 3` in a photograph said the secondaries were running, which could
+    // have meant `nosmp` was broken *or* that the machine had booted a kernel
+    // staged five minutes earlier, and nothing on the screen distinguished them.
+    serial::puts("\n  cmd:  ");
+    serial::puts(info.cmdline());
     serial::puts("\n  uart: ");
     serial::puts(if serial::present() { "present" } else { "absent (reads report no data)" });
     // The keyboard. USB on this board, but firmware's legacy emulation presents
@@ -413,11 +422,25 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         (info_phys, info_phys + bytes.len() as u64),
         info.first_module().map_or((0, 0), |m| (u64::from(m.start), u64::from(m.end))),
     ];
-    let expected_aps = machine
-        .madt
-        .as_ref()
-        .map_or(0, |m| m.cpus().len().saturating_sub(1).min(crate::smp::MAX_CPUS - 1));
-    let started = if crate::smp::trampoline_page_available(&machine, &keep_out) {
+    let nosmp = info.cmdline().split_ascii_whitespace().any(|t| t == "nosmp");
+    let expected_aps = if nosmp {
+        0
+    } else {
+        machine
+            .madt
+            .as_ref()
+            .map_or(0, |m| m.cpus().len().saturating_sub(1).min(crate::smp::MAX_CPUS - 1))
+    };
+    // `nosmp` on the command line boots single-core. A bring-up lever, not a
+    // policy: on a machine whose only console is a framebuffer, the `[BKL]
+    // stuck: cpu N waiting on owner ...` chatter from four cores interleaves
+    // into every other line and makes the screen hard to read, and taking the
+    // other cores out of the picture is the cheapest way to decide whether a
+    // fault is a cross-core one.
+    let started = if nosmp {
+        serial::puts("  smp:  nosmp on the command line — single core\n");
+        0
+    } else if crate::smp::trampoline_page_available(&machine, &keep_out) {
         crate::smp::start_secondaries(machine.madt.as_ref())
     } else {
         serial::puts("  smp:  trampoline page is not free RAM — single core\n");
@@ -431,6 +454,13 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     crate::usermode::fdprobe_test(&mut t);
     drop(user_ptr_bypass);
 
+    // The clock, last and **before any user process**. Every test above ends in
+    // `cli`, so this is what leaves interrupts on for the rest of the boot — and
+    // it checks the tick *rate*, not just that ticks arrive, because a clock
+    // that is merely moving still scales every network timeout by however wrong
+    // it is. See `lapic::clock_rate_check`.
+    crate::lapic::clock_rate_check(&mut t);
+
     let passed = t.report();
     if passed {
         serial::puts("Akuma/amd64 - all self-tests passed\n");
@@ -443,10 +473,9 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // this, but a shell that opens a socket does.
     let netprobe = info.cmdline().split_ascii_whitespace().any(|t| t == "netprobe");
     if have_net {
-        crate::lapic::start_timer();
         crate::net::spawn_netpoll();
         if netprobe {
-            crate::net::spawn_probe();
+            crate::net::enable_probe();
         }
     }
 

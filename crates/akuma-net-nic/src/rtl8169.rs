@@ -37,7 +37,7 @@ use akuma_primitives::addr::virt_to_phys;
 use akuma_primitives::mmio::MmioReg;
 use smoltcp::phy::DeviceCapabilities;
 
-use crate::counters::{RX_FRAMES_RECEIVED, TX_DROP_COUNT, TX_FRAMES_SENT};
+use crate::counters::{RX_FRAMES_RECEIVED, RX_ISR_SEEN, RX_RING_DRY, TX_DROP_COUNT, TX_FRAMES_SENT};
 
 /// Descriptors per ring. A power of two, small — this is a bring-up NIC on a
 /// polled single-core kernel, not a throughput target.
@@ -289,6 +289,29 @@ impl Rtl8169Device {
         // Reap finished transmits each poll lap — the only place they get
         // harvested on a request/response workload.
         self.nic.reclaim_tx();
+
+        // **Acknowledge `ISR` every lap, even though nothing here takes
+        // interrupts.** `ISR` latches independently of `IMR`: the mask decides
+        // whether a bit raises an interrupt, not whether it is recorded. On a
+        // polled path the bits therefore accumulate from `init`'s one clear
+        // onwards and are never written back — and `RDU` (receive descriptor
+        // unavailable) is not an idle status, it is a **stall**. The chip
+        // raises it the moment the ring runs dry and does not resume taking
+        // frames until it is cleared, which `take_interrupts` does by writing
+        // the observed bits straight back.
+        //
+        // Measured on the HP box before this existed: `rx` climbed to exactly
+        // 16 — `RING_LEN`, one ring's worth — and then never moved again for
+        // the rest of the boot, while transmit carried on happily. Sixteen is
+        // the tell; a receive path that dies on a round number died at a ring
+        // boundary.
+        let isr = self.nic.take_interrupts();
+        if isr != 0 {
+            RX_ISR_SEEN.fetch_or(u32::from(isr), Ordering::Relaxed);
+            if isr & akuma_net_rtl8169::regs::INT_RDU != 0 {
+                RX_RING_DRY.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         // Sample the PHY every so often and publish it (`counters::link_state`).
         // Periodically rather than per lap because reading it is an MDIO

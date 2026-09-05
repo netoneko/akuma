@@ -69,4 +69,4 @@ pub use loopback::{
 pub use rtl8169::Rtl8169Device;
 pub use irq::{bind as nic_bind, nic_irq_ack, nic_irq_count, nic_slot, NIC_SLOT_NONE};
 pub use nic::{Nic, NetDev};
-pub use counters::{link_state, rx_counters, tx_drop_count, tx_frames_sent};
+pub use counters::{isr_history, link_state, rx_counters, tx_drop_count, tx_frames_sent};

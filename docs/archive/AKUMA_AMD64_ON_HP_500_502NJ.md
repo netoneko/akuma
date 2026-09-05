@@ -1039,3 +1039,180 @@ boot decide between a carrier problem, a receive-path bug, and a working NIC.
 Also noted, not fixed: `US_PER_TICK` assumes 10 ms per LAPIC tick, and under KVM
 the probe's `t=` runs roughly 6x fast. It is monotonic, and everything that uses
 it for timeouts works, but it is not seconds.
+
+
+---
+
+# Update — 2026-09-05 (later still), the clock
+
+**The RTL8169 works on real silicon.** The probe's first line off the metal:
+
+```
+[probe] t=0s link=up/1000M/full ip=192.168.1.220/24 dhcp=pending | rx=16 posted=0 rxfail=0 | tx=1 drop=0 | irq=0 polls=1
+```
+
+`link=up/1000M/full` is the PHY on the actual RTL8168g, negotiated gigabit full
+duplex, and `rx=16` are frames off a real LAN. ARP resolved from another machine
+(`192.168.1.220 at 60:2:92:61:4e:73`), ICMP answered, and an ssh session
+completed a TCP handshake. Receive and transmit both work on hardware nothing
+emulates. That closes the question the reboot cycle existed for.
+
+What did not work: the session **connected and then stalled**, and the machine
+went unreachable afterwards. That turned out to be the clock, and finding it
+took two instruments that did not exist yet.
+
+## The clock was never calibrated, and then was not running
+
+`start_timer` loaded a flat `100_000` at divide-16, with a doc saying the value
+was "deliberately uncalibrated ... nothing here needs wall time yet". That
+stopped being true the moment `net::uptime_us` began returning
+`ticks() * 10_000` and handing it to smoltcp, which measures **every** DHCP
+retransmit, TCP retransmit and connect timeout against it. The LAPIC counts at
+the core crystal, so the same constant meant ~1.6 ms on a KVM guest (1 GHz APIC)
+and ~16 ms on this machine's 100 MHz bus: one clock ran 6x fast, the other 1.6x
+slow, and both called it 10 ms.
+
+Worse, on the bare-metal path the timer was **delivering nothing at all**. Every
+self-test that enables interrupts also disables them on the way out —
+`lapic::smoke_test`, `sched::smoke_test` and `usermode::preempt_test` all end in
+`cli`, which is right for a test and left the kernel handing the machine to
+`init` with `IF` clear. `TICKS` froze, `uptime_us` froze, and with it every
+smoltcp timer: DHCP sent one DISCOVER and never retried (`tx=1`), a TCP
+connection finished its handshake and never retransmitted again. From the far
+end that is exactly "connects once, then dies".
+
+The PVH path had been getting away with it **by accident**: `clock::sync_via_
+sntp` does its own `sti` and never puts it back. The bare-metal path calls no
+SNTP, so nothing ever re-enabled them.
+
+Fixes, in `amd64/src/lapic.rs`:
+
+- `calibrate()` measures the LAPIC against PIT channel 2 (the only channel with
+  a software gate and a pollable output, so no interrupt and no IDT entry) and
+  sets the initial count so one tick really is `US_PER_TICK_TARGET`. On the OVMF
+  rig: **626 088 counts per 10 ms, a 1001 MHz APIC** — against a hardcoded
+  100 000, i.e. the old clock was 6.26x fast, as predicted.
+- `clock_rate_check()` runs **inside the self-test suite, before `run_init`**,
+  enables interrupts for the rest of the boot, and counts real timer interrupts
+  across a PIT-measured 50 ms. It asserts the rate, not merely that ticks
+  arrive.
+
+## `inb` on an absent port returns `0xFF`, not zero
+
+The rate check earned itself immediately. On QEMU `microvm` — which has no PIT —
+port `0x61` floats high, so the channel-2 output bit read as *already expired*,
+the wait loop fell through on its first iteration, and "calibration" measured the
+handful of cycles between two instructions: **1199 counts where the real answer
+was 626 088**. It passed a plausibility band, set `CALIBRATED`, and left
+`uptime_us` running about fifty times fast with nothing downstream doubting it.
+
+`pit_present()` now probes the port instead of trusting it: clear the gate bit,
+read it back, and conclude "no PIT" if it comes back set. `calibrate` also
+rejects a channel whose output is high immediately after gating, since a freshly
+gated mode-0 count must hold its output low. A machine with no PIT keeps the old
+uncalibrated count and **says so** on the console and in the suite.
+
+## Two instruments, and what they cost to get wrong
+
+`netprobe` (`amd64/src/net.rs`) prints a live line from **inside the netpoll
+daemon**, not beside it. A probe in its own task can go quiet for two unrelated
+reasons — its own starvation or netpoll's — and those are identical in a
+photograph. Printing from netpoll collapses that: a line appearing proves the
+network is being driven, and no line at all is itself the diagnosis.
+
+Its first version gated only on `uptime_us()` and printed exactly one line on
+the metal, which was consistent with a stalled clock *and* a starved daemon and
+distinguished neither — the same failure as `busybox ifconfig`'s hardcoded
+zeros, committed one function after complaining about it. It now prints on a lap
+counter or elapsed time, whichever comes first, and carries `ticks=` and `laps=`
+so the three ways it can stop (dead clock, starved scheduler, dead kernel) are
+distinguishable. `ticks=15` pinned while `laps=` ran to 78 million is what
+identified the masked interrupts.
+
+`cycle_forever(keep_scheduling)` yields when there is a stack behind it. It
+used to abandon the BKL and spin, so a boot whose `init` exited took the machine
+off the network entirely while the colour band kept cycling to say the CPU was
+fine.
+
+## Verified
+
+| env | result |
+|---|---|
+| QEMU microvm (PVH, no PIT) | calibration correctly **declines**; uncalibrated clock announced |
+| OVMF+KVM+GRUB q35 (real PIT) | calibrated 626 088 counts/10 ms; `t=` tracks wall time |
+| tap rig, `init=/bin/sshd netprobe` | three back-to-back ssh sessions, still pingable after |
+| HP box, bare metal | `link=up/1000M/full`, ARP + ICMP + TCP over the Realtek |
+
+The clock fix has **not** been seen on the metal yet — that is the next boot.
+
+
+---
+
+# Update — 2026-09-05 (later again), rx stops at exactly 16
+
+The clock fix worked on the metal. From the box's own screen:
+
+```
+lapic: the clock advances once interrupts are enabled   [OK]
+lapic: ticks per 50ms (expect 5) 5
+lapic: the tick rate matches US_PER_TICK_TARGET within 2x   [OK]
+Akuma/amd64 self-test: 200 passed, 0 failed
+```
+
+and the probe, now that time exists:
+
+```
+[probe] t=27s ticks=2799(cal) laps=20086470 link=up/1000M/full ip=192.168.1.220/24 dhcp=pending | rx=16 ... | tx=838975553 ...
+[probe] t=61s ticks=6199(cal) laps=40995562 link=up/1000M/full ip=192.168.1.220/24 dhcp=pending | rx=16 ... | tx=838975556 ...
+```
+
+`ticks` advances 200 per 2 s — exactly 10 ms a tick, calibrated against the PIT
+on real hardware. `tx` climbs by one every couple of seconds: **DHCP is
+retrying**, which it could not do while the clock was frozen. The link is up at
+gigabit full duplex.
+
+And `rx` is **stuck at 16**, from t=3 s to the end of the boot.
+
+## Sixteen is `RING_LEN`
+
+A receive path that dies on a round number died at a ring boundary. The chip
+filled all sixteen receive descriptors, and never took another frame.
+
+It is not a missing re-post: `Nic::receive` already hands each descriptor back
+(`rx.post(...)` then `set_rx_desc`) as it consumes it. It is `ISR`.
+
+**`ISR` latches independently of `IMR`.** The mask decides whether a bit raises
+an interrupt, not whether the bit is recorded — and `regs.rs` deliberately keeps
+`INT_RDU` out of the default mask on the reasoning that a dry receive ring is
+not worth an interrupt. That is true of the *interrupt* and false of the *bit*:
+`RDU` is a stall, not a status. The chip raises it the moment the ring runs dry
+and does not resume receiving until it is written back, and on a purely polled
+path nothing had written it back since `init`'s single clear. One ring's worth
+of frames, then silence, with transmit entirely unaffected — which is exactly
+the shape observed.
+
+`Rtl8169Device::take_rx_frame` now calls `take_interrupts()` every lap (`ISR` is
+write-1-to-clear, so reading and writing back is the acknowledgement), and the
+probe carries `isr=` (every bit ever seen, OR-ed — the interesting ones are
+transient) and `dry=` (how many times `RDU` fired).
+
+## `nosmp`
+
+Added to the multiboot2 command line. The `[BKL] stuck: cpu N waiting on owner
+4294967295` chatter from four cores interleaves into every other line on a
+console that has to be photographed, and taking the other cores out is the
+cheapest way to decide whether a fault is a cross-core one. A bring-up lever,
+not a policy — drop it once the network is trusted.
+
+## Unexplained, and worth watching
+
+`posted` and `tx` both read `838975552` on the metal, identically, having been
+`0` and `1` at t=3 s. `posted` (`RX_BUFFERS_POSTED`) is bumped **only on the
+virtio path** and should never move on this machine at all. Two independent
+`.bss` atomics taking the same large value between t=3 s and t=27 s is not a
+counter overflowing; it is something writing over them. The Realtek's descriptor
+rings and frame buffers are `.bss` statics translated by `virt_to_phys`, so a
+mis-programmed ring base or a buffer overrun is the obvious suspect and
+`0x3201C040` looks far more like a DMA address than a count. **Not yet
+investigated.** If `rx` starts moving after the `ISR` fix and these two still
+climb into the hundreds of millions, that is the next thread to pull.

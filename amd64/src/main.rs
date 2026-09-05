@@ -351,9 +351,15 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         // rebooting the machine it exists for — a diagnostic whose first run is
         // on the metal is a diagnostic nobody has tested.
         if machine::flag(hvm_start_info, "netprobe") {
-            net::spawn_probe();
+            net::enable_probe();
         }
     }
+
+    // The clock, last and **before any user process** — see
+    // `lapic::clock_rate_check`. It is also what leaves interrupts enabled for
+    // the rest of the boot; this path had been getting that by accident, from
+    // the `sti` inside `clock::sync_via_sntp`.
+    lapic::clock_rate_check(&mut t);
 
     drop(user_ptr_bypass);
 

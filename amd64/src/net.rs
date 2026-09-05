@@ -382,29 +382,15 @@ fn drain_step() -> u32 {
     polls
 }
 
-/// The netpoll daemon: the thing that calls `smoltcp_net::poll()` between socket
-/// calls, so DHCP completes and a listening server is actually serviced.
+/// A live NIC status line, printed by [`netpoll_daemon`] itself.
 ///
-/// Spawned once (via [`spawn_netpoll`]) and never returns. It is a
-/// [`crate::sched::spawn_daemon`] task, so the round-robin schedules it
-/// alongside whatever `init=` program is running and the timer preempts a
-/// compute-bound task onto it; `all_user_tasks_finished` ignores it so a shell
-/// exiting still ends the boot.
-extern "C" fn netpoll_daemon() -> ! {
-    loop {
-        drain_step();
-        NETPOLL_LAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        crate::sched::yield_now();
-    }
-}
-
-// The network probe
-// ============================================================================
-
-/// How often [`probe_daemon`] prints, in microseconds.
-const PROBE_PERIOD_US: u64 = 2_000_000;
-
-/// A live NIC status line, printed every [`PROBE_PERIOD_US`] for ever.
+/// **Inside netpoll rather than beside it, deliberately.** The thing that
+/// answers ARP, ICMP and a listening socket is the netpoll daemon being
+/// scheduled; if it is not, the machine is off the network. A probe in its own
+/// task can go quiet for two unrelated reasons — its own starvation, or
+/// netpoll's — and those look identical from a photograph. Printing from
+/// netpoll collapses that: **a line appearing proves the network is being
+/// driven, and no line at all is itself the diagnosis.**
 ///
 /// This exists because of one boot. On the HP box the only console is a
 /// framebuffer, and the only network diagnostic available was `busybox
@@ -427,29 +413,96 @@ const PROBE_PERIOD_US: u64 = 2_000_000;
 ///   flat zero next to a link that is up is a receive-path bug and nothing else.
 /// * `tx` / `drop` — frames the chip accepted / refused. DHCP retries on its own,
 ///   so `tx` climbing proves the transmit path without anything having to ask.
+/// * `isr` / `dry` — every Realtek `ISR` bit seen so far, OR-ed, and how many
+///   times the receive ring ran dry (`RDU`). `RDU` is a stall, not a status:
+///   the chip stops receiving until it is written back.
 /// * `polls` — `smoltcp_net::poll()` laps, the proof the stack is still being
 ///   driven at all. `cycle_forever` used to stop driving it the moment `init`
 ///   exited, which is how a machine that had answered nothing looked like a
 ///   dead NIC.
-extern "C" fn probe_daemon() -> ! {
-    let mut next = 0u64;
+/// * `ticks` / `laps` — the raw LAPIC tick count and netpoll's own lap count.
+///   Without these, "the line stopped appearing" has three explanations that
+///   look identical in a photograph: the clock stopped, the scheduler stopped
+///   running netpoll, or the kernel died.
+//
+///
+/// The netpoll daemon: the thing that calls `smoltcp_net::poll()` between socket
+/// calls, so DHCP completes and a listening server is actually serviced.
+///
+/// Spawned once (via [`spawn_netpoll`]) and never returns. It is a
+/// [`crate::sched::spawn_daemon`] task, so the round-robin schedules it
+/// alongside whatever `init=` program is running and the timer preempts a
+/// compute-bound task onto it; `all_user_tasks_finished` ignores it so a shell
+/// exiting still ends the boot.
+extern "C" fn netpoll_daemon() -> ! {
+    let mut next_lap = 0u64;
+    let mut next_us = 0u64;
     loop {
-        let now = uptime_us();
-        if now >= next {
-            next = now + PROBE_PERIOD_US;
-            print_probe_line(now);
+        drain_step();
+        let laps = NETPOLL_LAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if PROBE_ON.load(core::sync::atomic::Ordering::Relaxed) {
+            let now = uptime_us();
+            if laps >= next_lap || now >= next_us {
+                next_lap = laps + PROBE_LAPS;
+                next_us = now + PROBE_PERIOD_US;
+                print_probe_line(now, laps);
+            }
         }
         crate::sched::yield_now();
     }
 }
 
+// The network probe
+// ============================================================================
+
+/// How often [`probe_daemon`] prints, in microseconds — when the clock works.
+const PROBE_PERIOD_US: u64 = 2_000_000;
+
+/// How many scheduler laps between prints when it does not.
+///
+/// **A probe must not depend on the thing it is there to diagnose.** The first
+/// version of this daemon gated only on [`uptime_us`], and on the HP box it
+/// printed exactly one line and never another — which is consistent with a
+/// stalled clock *and* with a starved daemon, and told us which was happening:
+/// neither. That is the same failure as `busybox ifconfig`'s hardcoded zeros,
+/// committed one function after complaining about it.
+///
+/// The lap arm fires whatever the clock does; the time arm keeps a fast machine
+/// from flooding the screen. Whichever comes first.
+const PROBE_LAPS: u64 = 2_000_000;
+
+/// Whether the netpoll daemon prints [`print_probe_line`] as it goes. Set by
+/// [`enable_probe`] from the `netprobe` command-line flag.
+static PROBE_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Turn the probe on. Not a separate task **on purpose** — see
+/// [`netpoll_daemon`].
+pub fn enable_probe() {
+    PROBE_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+    serial::puts("  net:  probe enabled (netprobe)\n");
+}
+
 /// One status line. Split out so a caller with no scheduler (a one-shot dump)
 /// can print the same thing.
-pub fn print_probe_line(now_us: u64) {
+pub fn print_probe_line(now_us: u64, laps: u64) {
+    // **Two short lines, not one long one.** This console is 146 cells wide and
+    // is read by photographing it; a 160-character line wraps, and a wrapped
+    // line in a scrolling log does not read as one message continued — it reads
+    // as two, with the second half of every field pushed onto a row that starts
+    // mid-word. Worse, a photograph framed on the readable half then silently
+    // omits whatever ran off the edge, which is how a shot of this very probe
+    // arrived with `rx=`, `isr=` and `dry=` — the three fields it exists for —
+    // outside the frame.
+    //
+    // The wire counters go on the second line and lead with the ones that
+    // decide something, so a partial view still carries the answer.
     let info = akuma_net::smoltcp_net::interface_snapshot();
     serial::puts("[probe] t=");
     serial::put_dec(now_us / 1_000_000);
-    serial::puts("s link=");
+    serial::puts("s ticks=");
+    serial::put_dec(crate::lapic::ticks());
+    serial::puts(if crate::lapic::is_calibrated() { "(cal)" } else { "(GUESS)" });
+    serial::puts(" link=");
     match akuma_net::smoltcp_net::link_state() {
         None => serial::puts("unsampled"),
         Some((up, mbit, fd)) => {
@@ -475,36 +528,31 @@ pub fn print_probe_line(now_us: u64) {
     } else {
         "pending"
     });
+    serial::puts("\n");
 
     let (posted, begin_fail, received) = akuma_net::smoltcp_net::rx_counters();
-    serial::puts(" | rx=");
+    let (isr, dry) = akuma_net::smoltcp_net::isr_history();
+    serial::puts("[probe]   rx=");
     serial::put_dec(received as u64);
+    serial::puts(" tx=");
+    serial::put_dec(akuma_net::smoltcp_net::tx_frames_sent() as u64);
+    serial::puts(" drop=");
+    serial::put_dec(akuma_net::smoltcp_net::tx_drop_count() as u64);
+    serial::puts(" isr=0x");
+    serial::put_hexn(u64::from(isr), 4);
+    serial::puts(" dry=");
+    serial::put_dec(dry as u64);
+    serial::puts(" polls=");
+    serial::put_dec(akuma_net::smoltcp_net::poll_count() as u64);
     serial::puts(" posted=");
     serial::put_dec(posted as u64);
     serial::puts(" rxfail=");
     serial::put_dec(begin_fail as u64);
-    serial::puts(" | tx=");
-    serial::put_dec(akuma_net::smoltcp_net::tx_frames_sent() as u64);
-    serial::puts(" drop=");
-    serial::put_dec(akuma_net::smoltcp_net::tx_drop_count() as u64);
-    serial::puts(" | irq=");
+    serial::puts(" irq=");
     serial::put_dec(akuma_net::smoltcp_net::nic_irq_count());
-    serial::puts(" polls=");
-    serial::put_dec(akuma_net::smoltcp_net::poll_count() as u64);
+    serial::puts(" laps=");
+    serial::put_dec(laps);
     serial::puts("\n");
-}
-
-/// Spawn [`probe_daemon`]. Gated by the caller on the `netprobe` command-line
-/// flag: the line is two seconds apart for ever, which is right for a bring-up
-/// and wrong for a machine anyone is trying to read other output on.
-pub fn spawn_probe() -> bool {
-    let ok = crate::sched::spawn_daemon(probe_daemon).is_some();
-    serial::puts(if ok {
-        "  net:  probe daemon spawned (netprobe)\n"
-    } else {
-        "  net:  [WARN] no task slot for the probe daemon\n"
-    });
-    ok
 }
 
 /// Spawn the netpoll daemon. Returns false only if the task table is full, which
