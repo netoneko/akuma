@@ -8,8 +8,11 @@
 
 use core::fmt;
 
-use crate::font;
+use crate::font::{self, Font};
 use crate::{Rgb, Surface};
+
+/// The font a [`Console`] uses unless the caller names another.
+pub const DEFAULT_FONT: &Font = &font::JETBRAINS_MONO;
 
 /// Widest grid the console will use.
 ///
@@ -37,6 +40,7 @@ const MARGIN_DIVISOR: usize = 24;
 /// A scrolling text console.
 pub struct Console<S: Surface> {
     surface: S,
+    font: &'static Font,
     grid: [[u8; MAX_COLS]; MAX_ROWS],
     cols: usize,
     rows: usize,
@@ -50,25 +54,36 @@ pub struct Console<S: Surface> {
 }
 
 impl<S: Surface> Console<S> {
-    /// A console sized to the surface, with the scale and margin chosen for it.
+    /// A console sized to the surface, in [`DEFAULT_FONT`], with the scale and
+    /// margin chosen for it.
     ///
     /// Returns `None` when the surface cannot hold a single character even at
     /// scale 1 — a firmware that reported a 40-pixel-wide framebuffer, or a
     /// mis-parsed tag. Better a caller that knows than a console that divides
     /// by zero.
     pub fn new(surface: S) -> Option<Self> {
-        let scale = Self::auto_scale(surface.height());
-        Self::with_scale(surface, scale)
+        Self::with_font(surface, DEFAULT_FONT)
+    }
+
+    /// As [`Console::new`], in a font the caller names.
+    pub fn with_font(surface: S, font: &'static Font) -> Option<Self> {
+        let scale = Self::auto_scale(font, surface.height());
+        Self::with_font_and_scale(surface, font, scale)
     }
 
     /// As [`Console::new`], with the glyph scale chosen by the caller.
     pub fn with_scale(surface: S, scale: usize) -> Option<Self> {
+        Self::with_font_and_scale(surface, DEFAULT_FONT, scale)
+    }
+
+    /// As [`Console::new`], with both the font and the scale chosen by the caller.
+    pub fn with_font_and_scale(surface: S, font: &'static Font, scale: usize) -> Option<Self> {
         let scale = scale.max(1);
         let (w, h) = (surface.width(), surface.height());
         let (mx, my) = Self::auto_margin(w, h);
 
-        let cell_w = font::WIDTH * scale;
-        let cell_h = font::HEIGHT * scale;
+        let cell_w = font.width() * scale;
+        let cell_h = font.height() * scale;
         let cols = w.saturating_sub(mx * 2) / cell_w;
         let rows = h.saturating_sub(my * 2) / cell_h;
         if cols == 0 || rows == 0 {
@@ -80,6 +95,7 @@ impl<S: Surface> Console<S> {
         #[allow(clippy::large_stack_arrays)]
         Some(Self {
             surface,
+            font,
             grid: [[b' '; MAX_COLS]; MAX_ROWS],
             cols: cols.min(MAX_COLS),
             rows: rows.min(MAX_ROWS),
@@ -93,14 +109,27 @@ impl<S: Surface> Console<S> {
         })
     }
 
-    /// The integer glyph scale for a framebuffer of this height.
+    /// The integer glyph scale for `font` on a framebuffer of this height.
+    ///
+    /// Rounded to nearest, not truncated. Truncating looks equivalent and is
+    /// not: it can only ever under-scale, and it does so by a whole step. A 4K
+    /// screen wants 1.875 cells' worth of a 24-pixel font, and truncation
+    /// answers 1 — ninety rows of 24-pixel text on a television across a room,
+    /// which is precisely the outcome [`TARGET_ROWS`] exists to prevent.
     ///
     /// Never zero: a very small framebuffer gets scale 1 and as many rows as it
     /// can hold.
     #[must_use]
-    pub const fn auto_scale(height: usize) -> usize {
-        let s = height / (font::HEIGHT * TARGET_ROWS);
+    pub const fn auto_scale(font: &Font, height: usize) -> usize {
+        let want = font.height() * TARGET_ROWS;
+        let s = (height + want / 2) / want;
         if s == 0 { 1 } else { s }
+    }
+
+    /// The font this console draws in.
+    #[must_use]
+    pub const fn font(&self) -> &'static Font {
+        self.font
     }
 
     /// The overscan inset for a framebuffer of this size.
@@ -238,17 +267,28 @@ impl<S: Surface> Console<S> {
     }
 
     /// Blit one glyph, background included, so a redraw needs no prior clear.
+    ///
+    /// Each font pixel carries a coverage value, and a partly-covered one is
+    /// drawn as a mix of the two colours (see [`Rgb::blend`]). The two ends of
+    /// that range are the overwhelming majority of pixels in any glyph and are
+    /// taken without arithmetic — every pixel here is a write to uncached video
+    /// memory, so a multiply that only matters on an edge should not be paid
+    /// for the interior.
     fn draw_cell(&mut self, row: usize, col: usize, byte: u8) {
-        let cell_w = font::WIDTH * self.scale;
-        let cell_h = font::HEIGHT * self.scale;
+        let (fw, fh) = (self.font.width(), self.font.height());
+        let cell_w = fw * self.scale;
+        let cell_h = fh * self.scale;
         let x0 = self.origin_x + col * cell_w;
         let y0 = self.origin_y + row * cell_h;
-        let glyph = font::glyph(byte);
+        let cell = self.font.cell(byte);
 
-        for (gy, bits) in glyph.iter().enumerate() {
-            for gx in 0..font::WIDTH {
-                let lit = bits & (0x80 >> gx) != 0;
-                let color = if lit { self.fg } else { self.bg };
+        for gy in 0..fh {
+            for gx in 0..fw {
+                let color = match cell[gy * fw + gx] {
+                    0x00 => self.bg,
+                    0xFF => self.fg,
+                    coverage => self.bg.blend(self.fg, coverage),
+                };
                 let px = x0 + gx * self.scale;
                 let py = y0 + gy * self.scale;
                 if self.scale == 1 {
