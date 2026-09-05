@@ -96,6 +96,28 @@ pub fn utc_seconds() -> Option<u64> {
     }
 }
 
+/// Set the wall clock, in microseconds since the Unix epoch.
+///
+/// The write half of [`now_us`], for `clock_settime`/`settimeofday` from ring
+/// 3 — which is how `busybox ntpd -q` sets the time, and therefore how this
+/// machine gets a usable clock when the kernel's own [`sync_via_sntp`] does not
+/// manage it. Both paths anchor the same pair, so whichever runs last wins and
+/// nothing has to know which.
+///
+/// `0` is rejected rather than stored: it is [`is_synced`]'s "never" sentinel,
+/// and a caller asking to set the clock to 1970-01-01T00:00:00Z is either
+/// confused or reporting a failure as a time.
+pub fn set_unix_us(us: u64) {
+    if us == 0 {
+        return;
+    }
+    // Uptime first: if it were read second, everything between the two reads
+    // would be silently added to the wall clock.
+    let uptime = crate::net::uptime_us();
+    ANCHOR_UPTIME_US.store(uptime, Ordering::Relaxed);
+    ANCHOR_UNIX_US.store(us, Ordering::Relaxed);
+}
+
 /// SNTP server. A public pool rather than a fixed IP: `pool.ntp.org` round-
 /// robins across many operators' servers, so this does not depend on one
 /// server's continued existence the way a hardcoded address would — the same

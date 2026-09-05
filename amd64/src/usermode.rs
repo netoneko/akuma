@@ -854,6 +854,91 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             }
             return 0;
         }
+        // The write side of the clock — x86_64 227 `clock_settime`, 164
+        // `settimeofday`, 159 `adjtimex`.
+        //
+        // This is how the machine gets a usable time when the kernel's own
+        // SNTP does not manage it: `busybox ntpd -q` fetches the time and
+        // steps the clock through these. Without them it fetches correctly and
+        // then fails to apply the answer, which looks exactly like a network
+        // problem and is not.
+        //
+        // Why it matters beyond `date` being wrong: at the epoch **every TLS
+        // certificate on earth is not-yet-valid**, and `apk` reports that as
+        // `server certificate not trusted` — sending you to look at the CA
+        // bundle, which is fine.
+        227 => {
+            const CLOCK_REALTIME: u64 = 0;
+            if a1 != CLOCK_REALTIME {
+                return errno::EINVAL;
+            }
+            let Some(ts) = crate::uaccess::read_val::<akuma_syscalls_linux::time::Timespec>(a2)
+            else {
+                return errno::EFAULT;
+            };
+            if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+                return errno::EINVAL;
+            }
+            crate::clock::set_unix_us(
+                (ts.tv_sec.cast_unsigned()).saturating_mul(1_000_000)
+                    + (ts.tv_nsec.cast_unsigned() / 1000),
+            );
+            return 0;
+        }
+        164 => {
+            // `settimeofday(tv, tz)`. `tz` is ignored: it has been meaningless
+            // since the 1980s and Linux itself does nothing useful with it.
+            if a1 == 0 {
+                return 0;
+            }
+            let Some(tv) = crate::uaccess::read_val::<akuma_syscalls_linux::time::Timeval>(a1)
+            else {
+                return errno::EFAULT;
+            };
+            if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+                return errno::EINVAL;
+            }
+            crate::clock::set_unix_us(
+                (tv.tv_sec.cast_unsigned()).saturating_mul(1_000_000) + tv.tv_usec.cast_unsigned(),
+            );
+            return 0;
+        }
+        159 => {
+            // `adjtimex(buf)`. This target has no frequency discipline — the
+            // tick comes from a PIT-calibrated LAPIC and nothing slews it — so
+            // the honest implementation reports the current time and an
+            // otherwise zeroed state, and accepts a step through `ADJ_SETOFFSET`
+            // because that is a real capability here.
+            //
+            // Returning `ENOSYS` instead is what makes `ntpd` give up before it
+            // ever sends a packet: it probes the clock's state on startup.
+            const ADJ_SETOFFSET: u32 = 0x0100;
+            const TIME_OK: u64 = 0;
+            let Some(mut tx) = crate::uaccess::read_val::<akuma_syscalls_linux::time::Timex>(a1)
+            else {
+                return errno::EFAULT;
+            };
+            if tx.modes & ADJ_SETOFFSET != 0 {
+                let now = crate::clock::now_us();
+                let delta = tx.time_sec.saturating_mul(1_000_000).saturating_add(tx.time_usec);
+                let stepped = now.cast_signed().saturating_add(delta).max(0);
+                crate::clock::set_unix_us(stepped.cast_unsigned());
+            }
+            let now = crate::clock::now_us();
+            tx = akuma_syscalls_linux::time::Timex {
+                time_sec: (now / 1_000_000).cast_signed(),
+                time_usec: (now % 1_000_000).cast_signed(),
+                // A tick of exactly `US_PER_TICK_TARGET`: it is what the
+                // calibration makes true, and reporting the Linux default of
+                // 10000 by accident would be right only by coincidence.
+                tick: i64::from(crate::lapic::US_PER_TICK_TARGET),
+                ..akuma_syscalls_linux::time::Timex::default()
+            };
+            if !crate::uaccess::write_val(a1, tx) {
+                return errno::EFAULT;
+            }
+            return TIME_OK;
+        }
         // `gettimeofday(*timeval, *timezone)` — x86_64 96. `timezone` (a2)
         // is always NULL from every real caller and is not consulted.
         96 => {

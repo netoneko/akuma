@@ -353,7 +353,7 @@ if [ -f "$BB" ]; then
         date sleep uptime free ps kill top id whoami hostname which dmesg \
         more less vi hexdump od strings cmp diff md5sum sha256sum \
         tar gzip gunzip zcat \
-        wget ifconfig route netstat nslookup ping nc \
+        wget ifconfig route netstat nslookup ping nc ntpd \
         mount umount reboot halt poweroff; do
         "$DEBUGFS" -w -R "ln /bin/busybox /bin/$applet" "$IMG" >/dev/null 2>&1
     done
@@ -468,6 +468,22 @@ printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></h
 "$DEBUGFS" -w -R "mkdir /public" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $TMP/index.html public/index.html" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $TMP/probe.txt probe.txt" "$IMG" >/dev/null 2>&1
+
+# `/proc`, as an empty directory.
+#
+# This target synthesizes exactly one file under it (`/proc/net/dev`, in
+# `amd64/src/fd.rs`) and has no process filesystem at all, so this buys nothing
+# for anything that wants to *read* `/proc`. What it buys is the tools that
+# merely check whether it is there: busybox `reboot` opens `/proc` to find init
+# before it will reboot, and without the directory refuses with `can't open
+# '/proc': No such file or directory` — on a machine whose only other way to
+# reboot is the power button. `reboot -f` skips the check; this makes the plain
+# form work too.
+#
+# Still broken and NOT fixed by this: `ps`, `top`, `free` and anything else that
+# reads per-process state. Those need a real procfs, which is a separate piece
+# of work.
+"$DEBUGFS" -w -R "mkdir /proc" "$IMG" >/dev/null 2>&1
 
 # `/tmp`: real writes landed 2026-09-04 (`fd::sys_write_file`/`fs::write_file`),
 # and `akuma-ext2`'s `write_file` requires the parent directory to already
