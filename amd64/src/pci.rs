@@ -151,17 +151,51 @@ pub fn device_count() -> usize {
 }
 
 /// Turn on memory-space decode, I/O-space decode and (optionally) bus
-/// mastering for a device a driver is about to use.
+/// mastering for a device a driver is about to use. `mask_intx` also sets the
+/// Interrupt Disable bit — for a **polled** driver (no IDT vector wired for the
+/// device), which is every driver on this target: an unmasked legacy INTx from
+/// a running controller lands on an unhandled vector and takes the machine down.
 pub fn enable(addr: Address, bus_master: bool) {
+    enable_full(addr, bus_master, false);
+}
+
+/// As [`enable`], plus [`command::INTERRUPT_DISABLE`] when `mask_intx`.
+pub fn enable_full(addr: Address, bus_master: bool, mask_intx: bool) {
     let mut cmd = (read_u32(addr, 0x04) & 0xffff) as u16;
     cmd |= command::MEMORY_SPACE | command::IO_SPACE;
     if bus_master {
         cmd |= command::BUS_MASTER;
     }
+    if mask_intx {
+        cmd |= command::INTERRUPT_DISABLE;
+    }
     // Preserve the high 16 bits (status is write-1-to-clear; writing it back as
     // read clears nothing).
     let status = read_u32(addr, 0x04) & 0xffff_0000;
     write_u32(addr, 0x04, status | u32::from(cmd));
+}
+
+/// Stop a device DMA-ing and stop it asserting a legacy interrupt, leaving its
+/// BARs and its decode alone.
+///
+/// Clearing `BUS_MASTER` is the one write that halts a runaway engine, and it
+/// needs nothing but config space — no BAR mapped, no driver, no knowledge of
+/// the device. That matters because of how this target fails: a controller a
+/// previous boot left running keeps writing its rings into the physical
+/// addresses it was handed, and on this target those are `.bss` in a kernel
+/// image loaded at 2 MiB. The *next* kernel is loaded into that same memory
+/// while the old one's DMA is still in flight, so it is corrupted before its
+/// first instruction runs — a crash-loop no amount of care inside the driver
+/// can break, because the driver never gets to run. See the "Known-broken" row
+/// in `docs/runbooks/amd64-bare-metal-loop.md`.
+///
+/// Memory-space decode is deliberately left ON: a driver that wants to halt the
+/// controller properly afterwards still needs to reach its register file.
+pub fn quiesce(addr: Address) {
+    let cmd = (read_u32(addr, 0x04) & 0xffff) as u16;
+    let quiet = (cmd & !command::BUS_MASTER) | command::INTERRUPT_DISABLE;
+    let status = read_u32(addr, 0x04) & 0xffff_0000;
+    write_u32(addr, 0x04, status | u32::from(quiet));
 }
 
 /// Probe the size of BAR `index` (0..5) by the write-all-ones method, with the

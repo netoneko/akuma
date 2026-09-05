@@ -105,6 +105,8 @@ mod smp;
 #[cfg(target_arch = "x86_64")]
 mod sock;
 mod uaccess;
+#[cfg(target_arch = "x86_64")]
+mod xhci;
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(include_str!("boot.s"), options(att_syntax));
@@ -220,6 +222,22 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // and a driver that goes quiet.
     akuma_primitives::console::set_print_hook(serial::puts);
 
+    // PCI, on request only — the note above says why it is not automatic here.
+    // `pci` on the command line is a promise from whoever booted this kernel
+    // that the config ports are real, which under QEMU `-M q35` they are.
+    //
+    // That combination is the point: q35 gives a PCI bus, `-device qemu-xhci
+    // -device usb-storage` gives a controller and a disk, and the xHCI driver
+    // becomes something that can be iterated in seconds instead of by cold
+    // reboots of a machine that crash-loops when the driver is wrong. It must
+    // stay opt-in: on Firecracker the same scan invents devices out of garbage.
+    let have_pci = machine::flag(hvm_start_info, "pci");
+    if have_pci {
+        pci::scan();
+        pci::report();
+        xhci::quiesce_all();
+    }
+
     // Block devices, after the heap (the virtio HAL allocates DMA buffers from
     // it) and after the IDT (a bad transport address should fault reportably).
     let have_disk = blk::init(&machine.virtio);
@@ -265,6 +283,12 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     }
 
     reboot::smoke_test(&mut t);
+    if have_pci {
+        pci::smoke_test(&mut t);
+        let have_xhci =
+            pci::find_class(0x0c, 0x03).is_some_and(|d| d.header.prog_if == 0x30);
+        xhci::smoke_test(&mut t, have_xhci);
+    }
     blk::smoke_test(&mut t, have_disk);
     fs::smoke_test(&mut t, have_fs);
     fd::smoke_test(&mut t, have_fs);

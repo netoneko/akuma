@@ -60,19 +60,48 @@ impl BlockDevice for VirtioBlk {
     }
 }
 
+/// A partition on the USB disk, as something `akuma-ext2` can read.
+///
+/// The block device is the whole disk (`akuma_xhci` addresses it by absolute
+/// LBA); this adds the partition's byte offset so `read_bytes(0)` lands at the
+/// filesystem's start. On the reference box that is `sda1` at LBA 2048.
+pub struct UsbDisk {
+    partition_offset: u64,
+}
+
+impl UsbDisk {
+    #[must_use]
+    pub fn new(partition_offset: u64) -> Self {
+        Self { partition_offset }
+    }
+}
+
+impl BlockDevice for UsbDisk {
+    fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+        crate::xhci::read_bytes(self.partition_offset + offset, buf).map_err(|_| ())
+    }
+
+    fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
+        crate::xhci::write_bytes(self.partition_offset + offset, data).map_err(|_| ())
+    }
+}
+
 /// Whatever the root filesystem is sitting on.
 ///
-/// Two things can be, and they arrive by completely different routes: a
-/// virtio-blk disk from a VMM, or a span of RAM that GRUB filled with an ext2
-/// image before handing over. An enum rather than a `dyn` object because
-/// `Ext2Filesystem` is generic over its device and there are exactly two, both
-/// known at compile time -- a trait object would cost a vtable dispatch per
-/// block read to express a choice made once at boot.
+/// Three things can be, and they arrive by different routes: a virtio-blk disk
+/// from a VMM, a span of RAM that GRUB filled with an ext2 image before handing
+/// over, or a partition on the USB disk this target's `xhci` driver brought up.
+/// An enum rather than a `dyn` object because `Ext2Filesystem` is generic over
+/// its device and the set is closed and known at compile time -- a trait object
+/// would cost a vtable dispatch per block read to express a choice made once at
+/// boot.
 pub enum RootDevice {
     /// A virtio-blk disk: `vda`, from a VMM.
     Virtio(VirtioBlk),
     /// An ext2 image already in memory, placed there by the boot loader.
     Ram(crate::ramdisk::RamDisk),
+    /// A partition on the USB disk (`sda1`), the persistent root.
+    Usb(UsbDisk),
 }
 
 impl BlockDevice for RootDevice {
@@ -80,6 +109,7 @@ impl BlockDevice for RootDevice {
         match self {
             Self::Virtio(d) => d.read_bytes(offset, buf),
             Self::Ram(d) => d.read_bytes(offset, buf),
+            Self::Usb(d) => d.read_bytes(offset, buf),
         }
     }
 
@@ -87,6 +117,7 @@ impl BlockDevice for RootDevice {
         match self {
             Self::Virtio(d) => d.write_bytes(offset, data),
             Self::Ram(d) => d.write_bytes(offset, data),
+            Self::Usb(d) => d.write_bytes(offset, data),
         }
     }
 }
@@ -98,14 +129,16 @@ impl BlockDevice for RootDevice {
 /// "not mounted" has to be a representable state rather than a panic.
 static ROOT: Spinlock<Option<Ext2Filesystem<RootDevice>>> = Spinlock::new(None);
 
-/// Wall-clock source for inode timestamps.
+/// Wall-clock source for inode timestamps, in seconds since the Unix epoch.
 ///
-/// Zero, honestly. This target has a LAPIC timer but no RTC and no SNTP client,
-/// so it does not know what time it is; `Ext2Filesystem::new` documents `|| 0`
-/// as the answer for exactly this case. Every file this kernel writes would be
-/// stamped 1970 — which is why nothing writes yet.
-fn no_clock() -> u64 {
-    0
+/// `clock::now_us` is fed by the SNTP client that self-heals in the netpoll
+/// daemon (`docs/archive/AKUMA_SELF_HEALING_PORT.md` § "The wall clock synced
+/// once at boot or never"). It returns 0 until the first sync lands — which is
+/// still the honest answer `Ext2Filesystem::new` documents `|| 0` for, not a
+/// guess dressed up as one — so an early write before the clock sets is stamped
+/// 1970 and every write after it is stamped correctly.
+fn wall_clock_secs() -> u64 {
+    crate::clock::now_us() / 1_000_000
 }
 
 /// Mount the first block device as the root filesystem.
@@ -128,7 +161,7 @@ pub fn mount_root() -> bool {
 pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
     // Not an error worth halting for: a raw disk with no filesystem is a
     // legitimate thing to be handed, and the message says which happened.
-    let Ok(fs) = Ext2Filesystem::new(device, no_clock) else {
+    let Ok(fs) = Ext2Filesystem::new(device, wall_clock_secs) else {
         serial::puts("  fs:   ");
         serial::puts(name);
         serial::puts(" holds no readable ext2 image\n");

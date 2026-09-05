@@ -336,6 +336,12 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     crate::pci::scan();
     crate::pci::report();
 
+    // Immediately: stop any xHCI controller a PREVIOUS boot left running. This
+    // is before the memory map is trusted and before anything decides whether
+    // to drive USB, because what it defends against is already in flight —
+    // see `xhci::quiesce_all`.
+    crate::xhci::quiesce_all();
+
     // The root filesystem is already in memory, and NOTHING IN THE MEMORY MAP
     // SAYS SO. Reserve it before the physical allocator is told anything.
     let module = info.first_module();
@@ -356,13 +362,32 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // Give the shared crates a console, exactly as `kmain` does.
     akuma_primitives::console::set_print_hook(serial::puts);
 
-    // Mount the image the loader left for us. No storage driver is involved:
-    // this is a real ext2 filesystem whose block device happens to be RAM.
-    let have_fs = module
-        .and_then(|m| crate::ramdisk::RamDisk::new(u64::from(m.start), m.len()))
-        .is_some_and(|rd| {
-            crate::fs::mount_root_on(crate::fs::RootDevice::Ram(rd), "module")
-        });
+    // The root filesystem. With `root=/dev/sda1` on the command line, bring up
+    // the xHCI + USB mass-storage stack and mount the persistent partition; on
+    // any failure fall back to the RAM image the loader left in memory, which is
+    // also what a boot with no `root=` token uses. The module pages are reserved
+    // (above) regardless — the RAM image stays the recovery root.
+    let want_usb_root =
+        info.cmdline().split_ascii_whitespace().any(|t| t == "root=/dev/sda1");
+    // `usb` alone drives the controller without mounting from it — the shape a
+    // bisect wants: prove the bring-up survives before trusting a root on it.
+    let want_usb =
+        want_usb_root || info.cmdline().split_ascii_whitespace().any(|t| t == "usb");
+    let mount_ram = || {
+        module
+            .and_then(|m| crate::ramdisk::RamDisk::new(u64::from(m.start), m.len()))
+            .is_some_and(|rd| {
+                crate::fs::mount_root_on(crate::fs::RootDevice::Ram(rd), "module")
+            })
+    };
+    let have_fs = if want_usb_root && try_usb_root() {
+        true
+    } else {
+        if want_usb_root {
+            serial::puts("  fs:   USB root unavailable — using the RAM image\n");
+        }
+        mount_ram()
+    };
 
     // Networking: the Realtek NIC if this box has one, loopback only otherwise.
     // Either way `socket(AF_INET)` works for `busybox ifconfig` and `127.0.0.1`.
@@ -421,8 +446,27 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         crate::lapic::stop_timer();
     }
 
-    // No `blk`: this machine has no virtio transports. `net`/`sock` run on the
-    // loopback-only stack — enough to prove `socket(AF_INET)`, `bind`, `listen`.
+    // No `blk`: this machine has no virtio transports. The USB disk is the real
+    // block device here — its self-test drives the whole xHCI + BOT path, and a
+    // `WRITE(10)` round trip to a scratch LBA in `sda2`. Gated on the controller
+    // being present so a box without one (or the QEMU rig) is a clean skip.
+    //
+    // Gated on the command line asking for USB, which it did NOT used to be —
+    // and that is the whole reason a "disarmed" GRUB entry was not disarmed.
+    // Dropping `root=/dev/sda1` stopped the kernel *mounting* the USB disk, but
+    // this test still brought the controller up in full on every boot, so there
+    // was no way to boot the kernel at all without driving it. When a bring-up
+    // can take the machine down, "do not touch the hardware" has to be
+    // reachable from the boot menu.
+    let have_xhci = want_usb
+        && crate::pci::find_class(0x0c, 0x03).is_some_and(|d| d.header.prog_if == 0x30);
+    if !want_usb {
+        t.note("xhci: not requested (pass `usb` or `root=/dev/sda1`)", 0);
+    }
+    crate::xhci::smoke_test(&mut t, have_xhci);
+
+    // `net`/`sock` run on the loopback-only stack — enough to prove
+    // `socket(AF_INET)`, `bind`, `listen`.
     crate::fs::smoke_test(&mut t, have_fs);
     crate::fd::smoke_test(&mut t, have_fs);
     // `net::smoke_test` runs here too since 2026-09-05 — it did not before,
@@ -571,6 +615,27 @@ fn init_path(cmdline: &str) -> &str {
         }
     }
     "/bin/sh"
+}
+
+/// Bring up the xHCI + USB mass-storage stack, sanity-check `/dev/sda`'s MBR,
+/// and mount `sda1` as the root filesystem. `false` on any failure — the caller
+/// falls back to the RAM image.
+fn try_usb_root() -> bool {
+    if let Err(e) = crate::xhci::init() {
+        serial::puts("  fs:   xHCI/USB disk: ");
+        serial::puts(e);
+        serial::puts("\n");
+        return false;
+    }
+    let mut mbr = [0u8; 512];
+    if crate::xhci::read_bytes(0, &mut mbr).is_err() || !crate::xhci::mbr_looks_right(&mbr) {
+        serial::puts("  fs:   /dev/sda MBR check failed\n");
+        return false;
+    }
+    crate::fs::mount_root_on(
+        crate::fs::RootDevice::Usb(crate::fs::UsbDisk::new(crate::xhci::SDA1_OFFSET)),
+        "sda1",
+    )
 }
 
 /// Build the description the rest of the kernel expects, from multiboot2 tags.

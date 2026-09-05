@@ -295,6 +295,24 @@ pub fn set_virtio_window(base_va: usize, stride: usize, slots: usize) {
     VIRTIO_SLOTS.store(slots, Ordering::Relaxed);
 }
 
+/// Declare that this machine has **no** virtio-mmio window at all.
+///
+/// The defaults above are AArch64's real geometry, where the window is a fixed
+/// slot in the kernel's L0[1] device map and is therefore always mapped. On a
+/// machine that *announces* its transports, "none announced" is a real answer —
+/// and leaving those defaults standing points every probe at an AArch64 address
+/// this kernel never mapped. The first driver to go looking takes a #PF before
+/// it has printed anything, which is what `DISK=none` and a QEMU `q35` boot both
+/// did: the fault landed in `akuma_virtio::probe`, reading slot 0 of a window
+/// that does not exist.
+///
+/// Separate from [`set_virtio_window`] rather than a zero passed to it: that
+/// function debug-asserts a non-degenerate geometry, which is the right check
+/// for a machine describing a window it has. This is the other statement.
+pub fn clear_virtio_window() {
+    VIRTIO_SLOTS.store(0, Ordering::Relaxed);
+}
+
 /// Every device span in the L0[1] window, as `(base, size)`.
 ///
 /// The single source of truth for the layout above. `akuma_exec::mmu` walks this

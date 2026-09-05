@@ -79,6 +79,10 @@ fn map_device(base: u64, len: u64) -> bool {
 pub fn init(devices: &MmioDevices) -> bool {
     let devs = devices.as_slice();
     let Some(first) = devs.first() else {
+        // No transports announced. Say so explicitly: the window defaults are
+        // AArch64's, and a later probe that walks them faults on an address this
+        // machine never mapped, long after the reason has scrolled away.
+        akuma_primitives::addr::clear_virtio_window();
         return false;
     };
 

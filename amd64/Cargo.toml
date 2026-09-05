@@ -50,6 +50,17 @@ akuma-net-rtl8169 = { path = "../crates/akuma-net-rtl8169" }
 # host-tested against config space read off the bare-metal reference machine.
 # `src/pci.rs` is the `0xCF8`/`0xCFC` mechanism half; this is the parsing.
 akuma-pci = { path = "../crates/akuma-pci" }
+# xHCI (USB 3.0 host controller) layout + TRB/context bit math, host-tested
+# against register values read off `00:14.0` on the reference machine. The
+# MMIO/DMA half is `src/xhci.rs`. Persistence: the only spare disk is trapped in
+# a USB-to-SATA enclosure (`docs/archive/AKUMA_SELF_HEALING_PORT.md`).
+akuma-xhci = { path = "../crates/akuma-xhci" }
+# USB Mass Storage Bulk-Only Transport wire format (CBW/CSW + minimal SCSI),
+# driven over `akuma-xhci` by `src/usb_storage.rs`'s BOT helpers in `src/xhci.rs`.
+akuma-usb-storage = { path = "../crates/akuma-usb-storage" }
+# Standard USB descriptor parsing (device / config / interface / endpoint) —
+# transport-independent, shared with the (deferred) keyboard work.
+akuma-usb = { path = "../crates/akuma-usb" }
 # Linux `reboot(2)` ABI decode, shared with the aarch64 kernel's `sc-reboot`.
 # `src/pci.rs`'s sibling `src/reboot.rs` adds the x86 reset that `akuma-boot`'s
 # own `system_reset` (a PSCI `smc`) cannot do here.

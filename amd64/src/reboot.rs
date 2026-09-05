@@ -40,6 +40,14 @@ static EMPTY_IDT: Idtr = Idtr { limit: 0, base: 0 };
 pub fn perform_reset() -> ! {
     serial::puts("\n[reboot] resetting\n");
 
+    // Before the reset, not after: a reset does not stop a bus-master device.
+    // An xHCI controller still running here keeps writing its rings into this
+    // kernel's `.bss` while the firmware POSTs and the loader unpacks the next
+    // kernel into the very same memory — which is how a box ends up
+    // crash-looping on a kernel that is itself fine. UEFI does not re-initialise
+    // a controller the OS claimed, so nothing downstream undoes this for us.
+    crate::xhci::shutdown();
+
     // 1. Reset-control register. 0x02 selects "system reset" (vs. just CPU),
     //    0x0E requests a full hard reset.
     // SAFETY: `0xCF9` is the architectural reset-control port on every PC

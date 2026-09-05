@@ -132,19 +132,23 @@ it reads identically on a dead NIC and a busy one.
 | `wget https://` : *socketpair* | busybox shells out to `ssl_client`. Use `/bin/hget` instead — TLS in-process |
 | `nslookup`: *Bad file descriptor* | `write()` on a connected UDP socket. DNS itself works (`wget http://…` resolves) |
 | pings to `192.168.1.220` time out | `.220` is only the **pre-DHCP fallback**; a lease overrides it. The probe line says the real address |
+| every Akuma boot crashes before sshd — even a known-good kernel — after a driver touched a bus-master device | a device left **running with DMA active** (an xHCI/AHCI controller whose bring-up faulted mid-way) keeps scribbling on RAM across a warm `reboot`; UEFI does not fully re-init it. **Fix: full power cycle** (hold the power button ~5 s, or pull the plug). A PCI driver here must (a) mask legacy INTx (`pci::enable_full(.., mask_intx=true)`) — an unmasked INTx lands on an unhandled IDT vector — and (b) `HCRST` / halt the controller on **every** bring-up error path. |
 
-## The spare disk (persistence, not done)
+## The spare disk (persistence — USB/xHCI, in progress)
 
-`/dev/sda` is a spare 1 TB drive (Seagate ST1000LM035) that was in a
-**USB-to-SATA enclosure**. The enclosure is unreliable — `mkfs.ext2` stalled
-after ~8 MB and wedged in `D` state, needing a reboot. It was wiped and given an
-MBR table (`sda1` 64 GiB, `sda2` ~867 GiB) but neither filesystem is made.
-**The drive must move to a free SATA port** (`ata3`–`ata6` on the `00:1f.2` AHCI
-controller — `ata1` is the Ubuntu system disk `sdb`, hands off) before Akuma can
-use it, because Akuma has no USB storage stack. Then it needs `akuma-ahci`. Full
-plan: `proposals/NEXT_AGENT_AMD64_AHCI_PERSISTENCE.md`.
+`/dev/sda` is a spare 1 TB drive (Seagate ST1000LM035) in a **USB-to-SATA
+enclosure** (ASMedia `174c:55aa`). The drive cannot move to SATA (screwed into a
+caddy that will not open), so persistence is over USB. `sda1` (LBA 2048, 64 GiB)
+is **ext2, label `AKUMA`** — formatted from Ubuntu 2026-09-06. Keep the enclosure
+**off the USB hub** — straight into a rear port it does 134 MB/s and enumerates on
+xHCI; behind the hub sustained writes drop it off the bus.
 
-A process stuck in `D` state on that enclosure cannot be killed — reboot the box.
+Driver: `akuma-xhci` + `akuma-usb-storage` (pure, host-tested) + `amd64/src/xhci.rs`
+(MMIO/DMA). Boot with `root=/dev/sda1` on the kernel command line to mount `sda1`
+as the persistent root (falls back to the RAM image on any probe failure). Full
+plan: `docs/archive/AKUMA_SELF_HEALING_PORT.md` § "A proper disk".
+
+A process stuck in `D` state on the enclosure cannot be killed — reboot the box.
 
 ## Background
 
