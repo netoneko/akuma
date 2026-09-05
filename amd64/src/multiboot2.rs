@@ -334,6 +334,10 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
             crate::fs::mount_root_on(crate::fs::RootDevice::Ram(rd), "module")
         });
 
+    // Networking: the Realtek NIC if this box has one, loopback only otherwise.
+    // Either way `socket(AF_INET)` works for `busybox ifconfig` and `127.0.0.1`.
+    let have_net = crate::net::init_bare_metal();
+
     let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
 
     // The same bypass window `kmain` runs its tests in: they drive syscall
@@ -356,10 +360,11 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         crate::lapic::stop_timer();
     }
 
-    // No `blk`, `net` or `sock`: this machine has no virtio transports at all,
-    // and a suite that reported those as passing would be reporting on nothing.
+    // No `blk`: this machine has no virtio transports. `net`/`sock` run on the
+    // loopback-only stack — enough to prove `socket(AF_INET)`, `bind`, `listen`.
     crate::fs::smoke_test(&mut t, have_fs);
     crate::fd::smoke_test(&mut t, have_fs);
+    crate::sock::smoke_test(&mut t, have_net);
     crate::mm::smoke_test(&mut t);
 
     // `init_syscall` writes IA32_STAR/LSTAR/SFMASK **and sets `EFER.SCE`**, and
@@ -405,10 +410,13 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         serial::puts("Akuma/amd64 - SELF-TESTS FAILED\n");
     }
 
-    // NIC discovery, right after the tests. Finds the Realtek controller,
-    // enables it, maps its BAR and reads the MAC off the hardware — the full
-    // driver bring-up is the next step (`net::probe_ethernet`'s own docs).
-    crate::net::probe_ethernet();
+    // Drive the stack: `poll()` has to run between socket calls for a
+    // connection to complete (loopback or the wire). `ifconfig` needs none of
+    // this, but a shell that opens a socket does.
+    if have_net {
+        crate::lapic::start_timer();
+        crate::net::spawn_netpoll();
+    }
 
     // Hand the machine to a shell. After the verdict and only on a passing run,
     // for the reason `kmain` gives: a shell on a kernel whose own tests failed

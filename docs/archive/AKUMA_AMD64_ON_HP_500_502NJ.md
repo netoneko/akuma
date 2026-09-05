@@ -778,3 +778,46 @@ after returns to Ubuntu.
 `smoltcp_net::init` currently requires a virtio-net device). So the hands-off
 GRUB entry stays `uname -a`. The earlier "`uname` showed nothing" was a stale
 kernel/disk on the box, not a code bug — it prints correctly now.
+
+---
+
+# Update — 2026-09-05, loopback + the RTL8169 wired
+
+The socket layer now comes up on the bare-metal path, and the Realtek NIC has a
+driver behind it.
+
+## The seam: `ExternalDevice`
+
+`akuma-net-nic`'s `LoopbackAwareDevice` hard-wired a `VirtioSmoltcpDevice`. It
+now wraps an **`ExternalDevice` enum** — `Virtio` / `Rtl8169` / `Absent`. The
+virtio path is byte-identical (one added `match` arm, no allocation); the new
+variants are additive. `smoltcp_net` grew `init_loopback_only()` and
+`init_with_external()` beside the virtio-probing `init()`.
+
+`interface_snapshot()` was also corrected: with only a loopback address
+configured it now reports `0.0.0.0` for `eth0` rather than the `10.0.2.15`
+static-fallback constant, which was a placeholder guess on a machine that has
+no such address.
+
+## Loopback only — `busybox ifconfig` works on bare metal
+
+`net::init_bare_metal()` (multiboot2 path) walks PCI for an Ethernet controller.
+No NIC, or an unsupported one (QEMU's e1000 in the OVMF rig) → `Absent`:
+`socket(AF_INET)` works, `127.0.0.1` is reachable, `ifconfig` shows `lo` + an
+unaddressed `eth0`. Verified in the OVMF/q35/GRUB rig: **186/186** self-tests
+(the extra 8 are `sock::smoke_test`, now run on this path), and `busybox
+ifconfig` prints both interfaces.
+
+## The RTL8169 driver
+
+`akuma-net-rtl8169` (the pure, host-tested driver) + `akuma-net-nic`'s new
+`rtl8169` module (the `unsafe` half: `MmioReg` over the mapped BAR, two
+descriptor rings + frame buffers in `.bss` translated through
+`virt_to_phys`, `OWN` written last behind a compiler fence). `net::init_bare_metal`
+maps the Realtek's BAR2 and calls it; on failure it falls back to loopback-only.
+DHCP on.
+
+**Not yet verified on the real chip** — nothing emulates the RTL8168g, so this
+needs the box: a reboot, and `ethtool -d eno1` on the Linux side as the golden
+register reference to compare against (§5b). The wiring builds, both kernels are
+clippy-clean, and the loopback half is confirmed in the rig.

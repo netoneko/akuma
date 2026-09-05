@@ -381,6 +381,7 @@ dependencies = [
 name = "akuma-net-nic"
 version = "0.1.0"
 dependencies = [
+ "akuma-net-rtl8169",
  "akuma-primitives",
  "akuma-rump",
  "akuma-virtio",

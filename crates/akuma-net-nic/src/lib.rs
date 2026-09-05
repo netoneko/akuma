@@ -55,8 +55,18 @@ pub mod virtio_rings;
 #[cfg(feature = "rump")]
 pub mod rump_tap;
 
+/// The Realtek RTL8169/8168 glue — `unsafe` MMIO + DMA behind the `rtl8169`
+/// feature. Off for every target but amd64 bare metal.
+#[cfg(feature = "rtl8169")]
+pub mod rtl8169;
+
 pub use device::{VirtioSmoltcpDevice, VirtioRxToken, VirtioTxToken, RX_BUFFER_LEN};
-pub use loopback::{LoopbackAwareDevice, LoopbackAwareRxToken, LoopbackAwareTxToken, loopback_drop_count};
+pub use loopback::{
+    ExternalDevice, LoopbackAwareDevice, LoopbackAwareRxToken, LoopbackAwareTxToken,
+    loopback_drop_count,
+};
+#[cfg(feature = "rtl8169")]
+pub use rtl8169::Rtl8169Device;
 pub use irq::{bind as nic_bind, nic_irq_ack, nic_irq_count, nic_slot, NIC_SLOT_NONE};
 pub use nic::{Nic, NetDev};
 pub use counters::{rx_counters, tx_drop_count};

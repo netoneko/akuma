@@ -78,6 +78,8 @@ smoltcp = ["dep:smoltcp"]
 # device-independent orchestration lives in the host-tested `akuma-rump` crate.
 # Smoltcp-free — usable with `smoltcp` off.
 rump = ["dep:akuma-rump", "akuma-net-nic/rump"]
+# The Realtek RTL8169/8168 `ExternalDevice` variant — amd64 bare metal.
+rtl8169 = ["akuma-net-nic/rtl8169"]
 
 [lints]
 workspace = true

@@ -388,21 +388,29 @@ What amd64 *does* use, and what each replaced:
 
 ## Networking
 
-`akuma-net` and `akuma-net-nic` run unmodified; `src/net.rs` supplies the twelve
-`NetRuntime` hooks and `src/sock.rs` wires the socket syscalls. The NIC is found
-by the same command-line discovery the disk uses — another slot in the same
-array (on bare metal, [PCI](#pci) instead).
+`src/net.rs` supplies the twelve `NetRuntime` hooks and `src/sock.rs` wires the
+socket syscalls. How the device gets there differs by path:
 
-`busybox ifconfig` works **where the stack is up** (`microvm`, Firecracker):
-`src/fd.rs` answers the read-only `SIOCGIF*` ioctls and serves a generated
-`/proc/net/dev`, both through `akuma-syscalls-net` — the same `struct ifreq` /
-column layout the aarch64 kernel uses, extracted so the two cannot drift on the
-40-byte record stride that once broke `ifconfig -a`. Read-only: no `SIOCSIF*`,
-no netlink. On the **bare-metal** path `ifconfig` still dies at
-`socket(AF_INET)`: `kmain_mb2` never calls `net::init` (no NIC, and
-`akuma_net::smoltcp_net::init` requires a virtio-net device), so there is no
-socket layer. Fixing that means either the RTL8169 driver or a loopback-only
-`akuma-net` init.
+* **PVH** (`microvm`, Firecracker) — `akuma_net::init` probes virtio-MMIO,
+  exactly as before.
+* **bare metal** (`multiboot2.rs`) — `net::init_bare_metal()` after the tests:
+  it walks [PCI](#pci) for an Ethernet controller and, for a **Realtek
+  RTL8169/8168** (`10ec:*`), brings up the real driver
+  (`akuma-net-nic`'s `rtl8169` glue over the host-tested `akuma-net-rtl8169`);
+  anything else, or no NIC at all, comes up **loopback only**. Either way
+  `socket(AF_INET)` works.
+
+The seam that made this possible without touching the VMM path is
+`akuma_net_nic::ExternalDevice` — an enum (`Virtio` / `Rtl8169` / `Absent`)
+that `LoopbackAwareDevice` wraps in place of the hard-wired
+`VirtioSmoltcpDevice` it held before. The virtio path is byte-identical; the
+enum adds one `match` arm and no allocation.
+
+`busybox ifconfig` works on all three paths: `src/fd.rs` answers the read-only
+`SIOCGIF*` ioctls and serves a generated `/proc/net/dev`, both through
+`akuma-syscalls-net` — the same `struct ifreq` / column layout the aarch64
+kernel uses. On a loopback-only boot `eth0` shows `0.0.0.0` (no address
+configured, not the fallback). Read-only: no `SIOCSIF*`, no netlink.
 
 ```bash
 amd64/run.sh                       # NIC on virtio-mmio-bus.1, port 8080 forwarded

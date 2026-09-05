@@ -32,13 +32,18 @@ pub struct IfaceInfo {
 #[must_use]
 pub fn interface_snapshot() -> IfaceInfo {
     with_network(|net| {
+        // The first non-loopback IPv4 address, if any. `(0.0.0.0, 0)` when the
+        // interface is up but unaddressed — a loopback-only kernel, or before
+        // DHCP on a kernel that configures no static fallback. `DEFAULT_IP` is
+        // *not* used here: it is the "couldn't read the stack at all" answer
+        // (the outer `unwrap_or`), not "no address configured".
         let (ip, prefix_len) = net.iface.ip_addrs().iter()
             .find_map(|cidr| {
                 let IpCidr::Ipv4(v4) = cidr;
                 let octets = v4.address().octets();
                 (octets != LOOPBACK_IP).then_some((octets, v4.prefix_len()))
             })
-            .unwrap_or((DEFAULT_IP, DEFAULT_PREFIX_LEN));
+            .unwrap_or(([0, 0, 0, 0], 0));
         IfaceInfo {
             ip,
             prefix_len,

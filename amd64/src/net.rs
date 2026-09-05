@@ -214,12 +214,10 @@ pub fn rng_fill(buf: &mut [u8]) {
     }
 }
 
-/// Bring the networking stack up.
-///
-/// Returns false when there is no NIC, which is not an error — every boot before
-/// this stage had none, and `run.sh` without a tap still has to work.
-pub fn init(enable_dhcp: bool) -> bool {
-    let rt = NetRuntime {
+/// The twelve `NetRuntime` hooks this target fills — see the module header for
+/// why most collapse to yields and no-ops on a one-core, no-IRQ machine.
+fn net_runtime() -> NetRuntime {
+    NetRuntime {
         uptime_us,
         utc_seconds,
         yield_now: crate::sched::yield_now,
@@ -235,9 +233,49 @@ pub fn init(enable_dhcp: bool) -> bool {
         rng_fill,
         current_thread_id: || crate::sched::current_task() as u32,
         wake_netpoll: || {},
-    };
+    }
+}
 
-    match akuma_net::init(rt, enable_dhcp) {
+/// Bring the networking stack up on virtio-net.
+///
+/// Returns false when there is no NIC, which is not an error — every boot before
+/// this stage had none, and `run.sh` without a tap still has to work.
+pub fn init(enable_dhcp: bool) -> bool {
+    report_init(akuma_net::init(net_runtime(), enable_dhcp))
+}
+
+/// Bring the stack up with **no NIC** — loopback only.
+///
+/// The bare-metal (`multiboot2.rs`) path when there is no Realtek NIC: there is
+/// no virtio-net either, but `socket(AF_INET)` still has to work for
+/// `busybox ifconfig` and anything talking to `127.0.0.1`.
+pub fn init_loopback_only() -> bool {
+    report_init(akuma_net::init_loopback_only(net_runtime()))
+}
+
+/// Bring the stack up on the Realtek RTL8169/8168 at the mapped register BAR
+/// `bar` (from `pci::map_bar`). DHCP on. Falls back to loopback-only if the
+/// chip does not come up.
+///
+/// # Safety
+/// `bar` must be the NIC's device-mapped register BAR, live for the rest of
+/// the boot; called once.
+pub unsafe fn init_rtl8169(bar: *mut u8) -> bool {
+    // SAFETY: the caller's obligation on `bar`; called once, from `kmain_mb2`.
+    let device = match unsafe { akuma_net::ExternalDevice::probe_rtl8169(bar) } {
+        Ok(d) => d,
+        Err(e) => {
+            serial::puts("  nic:  RTL8169 bring-up failed (");
+            serial::puts(e);
+            serial::puts("); loopback only\n");
+            return init_loopback_only();
+        }
+    };
+    report_init(akuma_net::init_with_external(net_runtime(), true, device))
+}
+
+fn report_init(r: Result<(), &'static str>) -> bool {
+    match r {
         Ok(()) => {
             serial::puts("  net:  stack up\n");
             true
@@ -303,24 +341,25 @@ pub fn spawn_netpoll() -> bool {
     ok
 }
 
-/// Bare-metal NIC discovery, run after the self-tests on the multiboot2 path.
+/// Bring networking up on the multiboot2 (bare-metal) path.
 ///
-/// The VMM targets get their NIC as a virtio-MMIO transport; a real machine
-/// has a PCI Ethernet controller instead. This finds it, turns on its decode
-/// and bus mastering, maps its register BAR, and reads the MAC straight off
-/// the hardware — which is the proof that the PCI enumeration and the MMIO
-/// mapping both work end to end.
+/// A VMM announces a virtio-MMIO NIC; a real machine has a PCI Ethernet
+/// controller instead. This finds it, enables decode + bus mastering, maps its
+/// register BAR, and:
 ///
-/// **The RTL8169/8168 bring-up itself is not wired yet.** `akuma-net-rtl8169`
-/// is the driver (pure, host-tested against a real register dump); what it
-/// still needs here is a `Regs` impl over the mapped BAR, a `Rings` impl over
-/// DMA memory, and a smoltcp `Device` shim — the same three seams `src/net.rs`
-/// fills for virtio. That is the next step and it needs the box to iterate on.
-pub fn probe_ethernet() {
+/// * a **Realtek RTL8169/8168** (`10ec:*`) → the real driver
+///   (`akuma-net-nic`'s `rtl8169` glue over `akuma-net-rtl8169`), DHCP on;
+/// * **anything else** (QEMU's e1000 in the OVMF rig) → loopback only, after
+///   reading the vendor's ID register to prove the BAR mapping works;
+/// * **no NIC at all** → loopback only.
+///
+/// Returns whether a socket layer is up (always true unless `akuma-net` itself
+/// fails).
+pub fn init_bare_metal() -> bool {
     use akuma_pci::{Bar, class, subclass};
 
     let Some(dev) = crate::pci::find_class(class::NETWORK, subclass::ETHERNET) else {
-        return;
+        return init_loopback_only();
     };
     serial::puts("  nic:  ");
     serial::put_hexn(u64::from(dev.header.vendor_id), 4);
@@ -342,36 +381,31 @@ pub fn probe_ethernet() {
         .enumerate()
         .find_map(|(i, b)| b.filter(Bar::is_memory).map(|b| (i as u8, b)))
     else {
-        serial::puts("  — no memory BAR\n");
-        return;
+        serial::puts(" — no memory BAR; loopback only\n");
+        return init_loopback_only();
     };
     let (size, _) = crate::pci::probe_bar_size(dev.addr, idx);
     let Some(regs) = crate::pci::map_bar(mem_bar, size.max(0x1000)) else {
-        serial::puts("  — BAR map failed\n");
-        return;
+        serial::puts(" — BAR map failed; loopback only\n");
+        return init_loopback_only();
     };
 
-    // On a Realtek RTL8168/8169 the MAC (IDR0..IDR5) is at register offset 0,
-    // so a read there confirms the BAR mapping end to end. Other NICs
-    // (QEMU's e1000) keep the MAC elsewhere — just report the BAR is mapped.
     if dev.header.vendor_id == 0x10ec {
-        serial::puts(" mac ");
-        for i in 0..6u8 {
-            if i != 0 {
-                serial::puts(":");
-            }
-            // SAFETY: `regs` is the just-mapped, device-attributed BAR of the
-            // Realtek NIC enumerated above; offsets 0..6 are the read-only ID
-            // registers.
-            let b = unsafe { regs.add(i as usize).read_volatile() };
-            serial::put_hexn(u64::from(b), 2);
-        }
-    } else {
-        serial::puts(" BAR");
-        serial::put_dec(u64::from(idx));
-        serial::puts(" mapped");
+        serial::puts(" [RTL8169]\n");
+        // SAFETY: `regs` is the just-mapped, device-attributed register BAR of
+        // the Realtek NIC enumerated above; this is the one call.
+        return unsafe { init_rtl8169(regs) };
     }
-    serial::puts("  (driver not wired)\n");
+
+    // Not a chip we drive. Read IDR0 to show the mapping works, then loopback.
+    serial::puts(" id ");
+    for i in 0..4u8 {
+        // SAFETY: as above; offset 0 is a read-only ID register on every NIC.
+        let b = unsafe { regs.add(i as usize).read_volatile() };
+        serial::put_hexn(u64::from(b), 2);
+    }
+    serial::puts(" (unsupported NIC; loopback only)\n");
+    init_loopback_only()
 }
 
 /// Check the pieces that do not need a NIC, plus the NIC if there is one.

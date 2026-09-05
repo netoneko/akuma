@@ -1,12 +1,129 @@
 //! `LoopbackAwareDevice` — the ring that keeps 127.x.x.x off the wire.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
-use smoltcp::phy::Device;
+use smoltcp::phy::{Device, DeviceCapabilities};
 use smoltcp::time::Instant;
 use akuma_primitives::net_runtime::runtime;
+use crate::counters::TX_DROP_COUNT;
 use crate::device::VirtioSmoltcpDevice;
 use crate::nicstat;
 use crate::frames::{FrameArena, FrameLease};
+
+/// The external (wire) side of a [`LoopbackAwareDevice`].
+///
+/// `LoopbackAwareDevice` used to hard-wire a [`VirtioSmoltcpDevice`]. It no
+/// longer does: the amd64 bare-metal target has no virtio-net at all — its NIC
+/// is a Realtek on PCI — and a kernel with no NIC still wants a socket layer
+/// (loopback, and the `ifconfig`/`SIOCGIF*` surface). This enum is the seam.
+///
+/// It is an enum rather than a `dyn Device` because `NetworkState` holds it by
+/// value in a `static` and a trait object there would cost a `Box` and a
+/// vtable hop per frame; and rather than a generic because that would ripple a
+/// type parameter through `NETWORK`, `poll()` and every socket call.
+// The `Virtio` variant carries a ~2 KB inline staging buffer that
+// `LoopbackAwareDevice` held by value before this enum existed; there is
+// exactly one `ExternalDevice` in the system, built once at boot into a
+// `static`, so boxing it would add a boot-path allocation and a pointer chase
+// per frame for nothing.
+#[allow(clippy::large_enum_variant)]
+pub enum ExternalDevice {
+    /// virtio-net (every VMM target).
+    Virtio(VirtioSmoltcpDevice),
+    /// The Realtek RTL8169/8168 (`amd64` bare metal).
+    #[cfg(feature = "rtl8169")]
+    Rtl8169(crate::rtl8169::Rtl8169Device),
+    /// No wire — loopback only.
+    Absent,
+}
+
+/// One-slot staging buffer for [`ExternalDevice::Absent`]: `TxToken::consume`
+/// must be handed a `&mut [u8]` of the length smoltcp asked for even when there
+/// is nowhere to send it, and a loopback frame is still diverted out of it.
+static ABSENT_TX_SCRATCH: FrameArena<1, LOOPBACK_FRAME_BUF> = FrameArena::new();
+
+impl ExternalDevice {
+    /// Probe and bring up the Realtek RTL8169/8168 at register BAR `bar`.
+    ///
+    /// # Errors
+    /// A short static string naming why the chip did not come up.
+    ///
+    /// # Safety
+    /// `bar` must be the NIC's device-mapped register BAR, valid for the life
+    /// of the returned device; called once.
+    #[cfg(feature = "rtl8169")]
+    pub unsafe fn probe_rtl8169(bar: *mut u8) -> Result<Self, &'static str> {
+        // SAFETY: forwarded to the caller.
+        unsafe { crate::rtl8169::Rtl8169Device::probe(bar) }
+            .map(Self::Rtl8169)
+            .map_err(|e| match e {
+                akuma_net_rtl8169::Error::ResetTimeout => "reset timed out (chip wedged or absent)",
+                akuma_net_rtl8169::Error::RingMisaligned { .. } => "descriptor ring misaligned",
+                akuma_net_rtl8169::Error::RingLength { .. } => "descriptor ring length not a power of two",
+                akuma_net_rtl8169::Error::UnknownChip(_) => "unrecognised RTL816x family member",
+                akuma_net_rtl8169::Error::ImplausibleMac(_) => "implausible MAC — chip not responding",
+            })
+    }
+
+    /// The station MAC, or all-zero when there is no wire.
+    #[must_use]
+    pub fn mac_address(&self) -> [u8; 6] {
+        match self {
+            Self::Virtio(d) => d.mac_address(),
+            #[cfg(feature = "rtl8169")]
+            Self::Rtl8169(d) => d.mac_address(),
+            Self::Absent => [0; 6],
+        }
+    }
+
+    pub(crate) fn capabilities(&self) -> DeviceCapabilities {
+        match self {
+            Self::Virtio(d) => d.capabilities(),
+            #[cfg(feature = "rtl8169")]
+            Self::Rtl8169(d) => d.capabilities(),
+            Self::Absent => {
+                let mut caps = DeviceCapabilities::default();
+                caps.max_transmission_unit = 1514;
+                caps
+            }
+        }
+    }
+
+    pub(crate) fn take_rx_frame(&mut self) -> Option<(*mut u8, usize)> {
+        match self {
+            Self::Virtio(d) => d.take_rx_frame(),
+            #[cfg(feature = "rtl8169")]
+            Self::Rtl8169(d) => d.take_rx_frame(),
+            Self::Absent => None,
+        }
+    }
+
+    pub(crate) fn emit_frame<R>(
+        &mut self,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> R,
+        divert: impl FnOnce(&[u8]) -> bool,
+    ) -> R {
+        match self {
+            Self::Virtio(d) => d.emit_frame(len, fill, divert),
+            #[cfg(feature = "rtl8169")]
+            Self::Rtl8169(d) => d.emit_frame(len, fill, divert),
+            Self::Absent => {
+                let end = len.min(LOOPBACK_FRAME_BUF);
+                // SAFETY: single slot, `NETWORK` held so this function is not
+                // re-entered, bounds are the arena's; the buffer is write-only
+                // staging that nothing reads back.
+                let scratch = unsafe { &mut *ABSENT_TX_SCRATCH.first_slot_ptr() };
+                let res = fill(&mut scratch[..end]);
+                if divert(&scratch[..end]) {
+                    return res;
+                }
+                // Nowhere to send a non-loopback frame; smoltcp will retry.
+                TX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                res
+            }
+        }
+    }
+}
 
 // Loopback-Aware Device Wrapper
 // ============================================================================
@@ -175,22 +292,22 @@ impl LoopbackRing {
 /// internally rather than being sent through `VirtIO`. `receive()` checks
 /// the loopback ring first, then falls back to `VirtIO`.
 pub struct LoopbackAwareDevice {
-    virtio: VirtioSmoltcpDevice,
+    external: ExternalDevice,
     loopback: LoopbackRing,
 }
 
 impl LoopbackAwareDevice {
     #[must_use]
-    pub const fn new(virtio: VirtioSmoltcpDevice) -> Self {
+    pub const fn new(external: ExternalDevice) -> Self {
         Self {
-            virtio,
+            external,
             loopback: LoopbackRing::new(),
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn mac_address(&self) -> [u8; 6] {
-        self.virtio.mac_address()
+        self.external.mac_address()
     }
 }
 
@@ -209,12 +326,12 @@ impl Device for LoopbackAwareDevice {
             // trip, and `receive` drains these ahead of the wire.
             FrameSource::Loopback(frame, len)
         } else {
-            let (ptr, len) = self.virtio.take_rx_frame()?;
-            FrameSource::Virtio(ptr, len)
+            let (ptr, len) = self.external.take_rx_frame()?;
+            FrameSource::External(ptr, len)
         };
 
         let tx = LoopbackAwareTxToken {
-            virtio: &mut self.virtio,
+            external: &mut self.external,
             loopback: &mut self.loopback,
         };
         let rx = match source {
@@ -224,7 +341,7 @@ impl Device for LoopbackAwareDevice {
             // has already released and will not re-post until the next
             // `receive`, otherwise the single rx buffer. The token's lifetime is
             // bounded by the `&mut self` borrow.
-            FrameSource::Virtio(ptr, len) => LoopbackAwareRxToken::Virtio(unsafe {
+            FrameSource::External(ptr, len) => LoopbackAwareRxToken::External(unsafe {
                 core::slice::from_raw_parts_mut(ptr, len)
             }),
         };
@@ -233,13 +350,13 @@ impl Device for LoopbackAwareDevice {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(LoopbackAwareTxToken {
-            virtio: &mut self.virtio,
+            external: &mut self.external,
             loopback: &mut self.loopback,
         })
     }
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
-        self.virtio.capabilities()
+        self.external.capabilities()
     }
 }
 
@@ -252,14 +369,14 @@ enum FrameSource {
     /// of `LOOPBACK_BUFS`.
     Loopback(LoopbackLease, usize),
     /// A pointer to the L2 frame in device-owned storage, and its length.
-    Virtio(*mut u8, usize),
+    External(*mut u8, usize),
 }
 
 pub enum LoopbackAwareRxToken<'a> {
     /// A frame that was looped back internally: its arena lease and length.
     Loopback(LoopbackLease, usize),
-    /// A borrowed frame received from `VirtIO`.
-    Virtio(&'a mut [u8]),
+    /// A borrowed frame received from the external device.
+    External(&'a mut [u8]),
 }
 
 impl smoltcp::phy::RxToken for LoopbackAwareRxToken<'_> {
@@ -269,13 +386,13 @@ impl smoltcp::phy::RxToken for LoopbackAwareRxToken<'_> {
     {
         match self {
             Self::Loopback(lease, len) => f(&lease[..len]),
-            Self::Virtio(buf) => f(buf),
+            Self::External(buf) => f(buf),
         }
     }
 }
 
 pub struct LoopbackAwareTxToken<'a> {
-    virtio: &'a mut VirtioSmoltcpDevice,
+    external: &'a mut ExternalDevice,
     loopback: &'a mut LoopbackRing,
 }
 
@@ -285,7 +402,7 @@ impl smoltcp::phy::TxToken for LoopbackAwareTxToken<'_> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let ring = self.loopback;
-        self.virtio.emit_frame(len, f, |frame| {
+        self.external.emit_frame(len, f, |frame| {
             // Frames addressed to 127.x never reach the wire: copy them into the
             // internal ring, which `receive` drains ahead of the device.
             if !is_loopback_frame(frame) {

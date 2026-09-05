@@ -53,6 +53,12 @@ pub use akuma_net_nic::virtio_rings;
 // point of the edit. Keep the attribute adjacent to `pub mod`.
 #[cfg(feature = "smoltcp")]
 pub mod smoltcp_net;
+
+/// The wire side of the stack's device — `Virtio`, `Rtl8169` (amd64 bare
+/// metal), or `Absent` (loopback only). Re-exported so callers of
+/// [`init_with_external`] need not reach through `smoltcp_net`.
+#[cfg(feature = "smoltcp")]
+pub use akuma_net_nic::ExternalDevice;
 // The rump tap NIC moved to `akuma-net-nic` with the other drivers.
 #[cfg(feature = "rump")]
 pub use akuma_net_nic::rump_tap;
@@ -90,6 +96,30 @@ pub fn init(rt: NetRuntime, enable_dhcp: bool) -> Result<(), &'static str> {
     smoltcp_net::init(enable_dhcp)
 }
 
+/// Bring the stack up with **no NIC** — loopback only.
+///
+/// For a kernel that has no virtio-net and no other wired device (the amd64
+/// bare-metal target before its Realtek driver is wired): `socket(AF_INET)`
+/// works, `127.0.0.1` is reachable, and `ifconfig` sees `lo` + an unaddressed
+/// `eth0`.
+#[cfg(feature = "smoltcp")]
+pub fn init_loopback_only(rt: NetRuntime) -> Result<(), &'static str> {
+    runtime::register(rt);
+    smoltcp_net::init_loopback_only()
+}
+
+/// Bring the stack up on a caller-built external device (plus loopback) — the
+/// seam for a NIC this crate cannot probe for.
+#[cfg(feature = "smoltcp")]
+pub fn init_with_external(
+    rt: NetRuntime,
+    enable_dhcp: bool,
+    device: akuma_net_nic::ExternalDevice,
+) -> Result<(), &'static str> {
+    runtime::register(rt);
+    smoltcp_net::init_with_external(enable_dhcp, device)
+}
+
 /// Smoltcp-free variant of [`init`].
 ///
 /// With the native stack compiled out (devbox / rump-only) there is no NIC0
@@ -98,6 +128,13 @@ pub fn init(rt: NetRuntime, enable_dhcp: bool) -> Result<(), &'static str> {
 /// `rump` feature.
 #[cfg(not(feature = "smoltcp"))]
 pub fn init(rt: NetRuntime, _enable_dhcp: bool) -> Result<(), &'static str> {
+    runtime::register(rt);
+    Ok(())
+}
+
+/// Smoltcp-free variant of [`init_loopback_only`] — same no-op as [`init`].
+#[cfg(not(feature = "smoltcp"))]
+pub fn init_loopback_only(rt: NetRuntime) -> Result<(), &'static str> {
     runtime::register(rt);
     Ok(())
 }

@@ -17,6 +17,10 @@ many-sessions = []
 # with the others — the device-independent half is `akuma-rump`.
 rump = ["dep:akuma-rump"]
 small-sockets = []
+# The Realtek RTL8169/8168 as an `ExternalDevice` variant — amd64 bare metal.
+# Off by default; the driver logic is `akuma-net-rtl8169`, this feature adds the
+# MMIO/DMA glue and the `smoltcp::phy::Device` shim.
+rtl8169 = ["dep:akuma-net-rtl8169"]
 
 [lints]
 workspace = true
@@ -25,6 +29,7 @@ workspace = true
 # NetRuntime (uptime_us, wake_netpoll), PreemptGuard, mmio::MmioReg, errno.
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-rump = { path = "../akuma-rump", optional = true }
+akuma-net-rtl8169 = { path = "../akuma-net-rtl8169", optional = true }
 spinning_top = "0.3"
 # The shared virtio Hal + MMIO probe.
 akuma-virtio = { path = "../akuma-virtio" }

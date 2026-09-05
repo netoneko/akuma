@@ -88,7 +88,7 @@ akuma-terminal = { path = "../crates/akuma-terminal" }
 akuma-exec-core = { path = "../crates/akuma-exec-core" }
 # The networking stack: smoltcp, the AF_INET socket table and DNS. Used
 # unmodified; `src/net.rs` supplies the twelve `NetRuntime` hooks.
-akuma-net = { path = "../crates/akuma-net" }
+akuma-net = { path = "../crates/akuma-net", features = ["rtl8169"] }
 # The SNTP wire protocol + boot-time retry loop (`src/clock.rs`, 2026-09-05) —
 # pure, host-tested, `#![no_std]`, zero dependencies. Extracted out of
 # `akuma-syscalls-time` specifically so this target could reach it without also

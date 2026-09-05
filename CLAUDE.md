@@ -164,6 +164,18 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   method that takes `&mut [u8]`, that is the seam being drawn in the wrong place.
   The `Device` impls live here *because* of those five `RxToken` sites; keeping
   the crate smoltcp-free would strand them in `akuma-net` and cost it its ban.
+  Since 2026-09-05 `LoopbackAwareDevice` wraps an **`ExternalDevice` enum**
+  (`Virtio` / `Rtl8169` / `Absent`) rather than a hard-wired `VirtioSmoltcpDevice`
+  — the seam for the amd64 bare-metal target, which has no virtio-net (its NIC
+  is a Realtek on PCI) and still needs a socket layer (`Absent` = loopback
+  only). It is an enum, not a generic or `dyn`: there is exactly one in the
+  system, in a `static`, and a type parameter would ripple through `NETWORK`,
+  `poll()` and every socket call. `smoltcp_net::init` still probes virtio and
+  errors if there is none (the VMM contract); `init_loopback_only` /
+  `init_with_external` are the new entries. The `rtl8169` feature adds the
+  Realtek glue (`rtl8169.rs`) over the host-tested `akuma-net-rtl8169` — MMIO on
+  a mapped BAR, descriptor rings in `.bss` with `OWN` written last behind a
+  fence; off for every target but amd64 bare metal.
   `akuma-net-unix` is the AF_UNIX state machine — IPC over pipes, no NIC, no IP,
   no smoltcp — a separate crate because the rump-only devbox (`--no-default-features`,
   smoltcp compiled out) needs AF_UNIX for box 0's `rump_server` at fd 3 and
