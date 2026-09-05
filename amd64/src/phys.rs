@@ -44,13 +44,29 @@ pub const DEVMAP_BASE: u64 = 0xFFFF_8080_0000_0000;
 /// Base the kernel image is linked at (PML4 slot 511); see `amd64/linker.ld`.
 pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
 
-/// How much physical memory the physmap covers.
+/// How much physical memory the PMM is given, and the bound page tables are
+/// checked against.
 ///
-/// `boot.s` builds one page directory of 512 x 2 MiB pages and points the
-/// physmap, the identity map and the kernel window at it, so all three describe
-/// the same first gigabyte. Physical memory beyond this is not addressable by
-/// the kernel, which is why `mem::init` clamps the PMM to it.
+/// One gigabyte, which is what `boot.s` mapped until it grew a fourth page
+/// directory for the bare-metal framebuffer; the PMM's range was never widened
+/// with it, and stays here on purpose — `paging::table_mut` and every frame
+/// this kernel hands out are checked against this. Growing it means auditing
+/// what treats a frame address as small. What is *mapped* is
+/// [`PHYSMAP_MAPPED`], which is larger.
 pub const PHYSMAP_LIMIT: u64 = 1 << 30;
+
+/// How much physical memory the physmap actually covers.
+///
+/// `boot.s` builds **four** page directories of 512 x 2 MiB pages — 4 GiB — and
+/// points the physmap and the identity map at all four (the kernel window at the
+/// first). This is the bound for *reading* through the physmap: ACPI tables in
+/// particular live wherever the VMM put them, and QEMU puts them at the top of
+/// RAM — `0x7fff_ffaf` on a 2 GiB guest, above [`PHYSMAP_LIMIT`] — where a
+/// 1 GiB bound made the MADT invisible and the machine look single-core.
+/// (Measured 2026-09-05; Firecracker's tables are at `0xA00xx` and never hit
+/// this.) The MMIO hole below 4 GiB is inside this range as a *cached* alias;
+/// nothing reads devices through it — the device window exists for that.
+pub const PHYSMAP_MAPPED: u64 = 4 << 30;
 
 /// The kernel-virtual address of a physical address.
 ///
@@ -61,7 +77,7 @@ pub const PHYSMAP_LIMIT: u64 = 1 << 30;
 #[must_use]
 #[inline]
 pub fn phys_to_virt(pa: u64) -> u64 {
-    assert!(pa < PHYSMAP_LIMIT, "physical address outside the physmap");
+    assert!(pa < PHYSMAP_MAPPED, "physical address outside the physmap");
     PHYSMAP_BASE + pa
 }
 

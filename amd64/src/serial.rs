@@ -29,6 +29,42 @@ const LSR_THR_EMPTY: u8 = 1 << 5;
 const LSR_DATA_READY: u8 = 1 << 0;
 
 use crate::port::{inb, outb};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// One writer at a time, per call. With several cores printing, two `puts`
+/// interleaved byte by byte are unreadable; held per *call* rather than per
+/// line, so a line assembled from `puts`/`put_hex`/`put_dec` can still be
+/// interleaved with another core's — kernel code prints under the BKL and is
+/// serialised anyway, and this covers the bring-up window where it is not.
+///
+/// Best-effort on purpose: a core that cannot get the lock within the budget
+/// prints anyway. The console is what a crashed core reports through, and a
+/// lock held by a core that died mid-line must not silence the report.
+static LOCK: AtomicBool = AtomicBool::new(false);
+const LOCK_BUDGET: u32 = 1 << 22;
+
+struct Guard;
+
+fn lock() -> Guard {
+    let mut spins = 0u32;
+    while LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        spins += 1;
+        if spins >= LOCK_BUDGET {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    Guard
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        LOCK.store(false, Ordering::Release);
+    }
+}
 
 /// Configure COM1 for 115200 8N1 with FIFOs on.
 ///
@@ -56,6 +92,12 @@ pub fn init() {
 /// console: a dropped byte during boot is a bug you cannot see, and a stall is
 /// a bug you can.
 pub fn putb(byte: u8) {
+    let _g = lock();
+    putb_raw(byte);
+}
+
+/// [`putb`] without the lock, for callers that hold it across a whole string.
+fn putb_raw(byte: u8) {
     // SAFETY: COM1's register block is fixed by the PC architecture.
     unsafe {
         while inb(COM1 + LINE_STATUS) & LSR_THR_EMPTY == 0 {
@@ -97,11 +139,12 @@ pub fn has_byte() -> bool {
 }
 
 pub fn puts(s: &str) {
+    let _g = lock();
     for &b in s.as_bytes() {
         if b == b'\n' {
-            putb(b'\r');
+            putb_raw(b'\r');
         }
-        putb(b);
+        putb_raw(b);
     }
 }
 
@@ -116,8 +159,9 @@ pub fn put_hex(mut val: u64) {
         *slot = DIGITS[(val & 0xF) as usize];
         val >>= 4;
     }
+    let _g = lock();
     for &b in &out {
-        putb(b);
+        putb_raw(b);
     }
 }
 
@@ -136,7 +180,8 @@ pub fn put_dec(val: u64) {
         buf[i] = b'0' + (n % 10) as u8;
         n /= 10;
     }
+    let _g = lock();
     for &b in &buf[i..] {
-        putb(b);
+        putb_raw(b);
     }
 }

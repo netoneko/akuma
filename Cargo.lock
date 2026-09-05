@@ -70,7 +70,9 @@ dependencies = [
  "akuma-alloc",
  "akuma-exec-core",
  "akuma-ext2",
+ "akuma-fbcon",
  "akuma-net",
+ "akuma-net-rtl8169",
  "akuma-pipe",
  "akuma-pmm",
  "akuma-primitives",
@@ -212,6 +214,10 @@ dependencies = [
  "akuma-vfs",
  "spinning_top",
 ]
+
+[[package]]
+name = "akuma-fbcon"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-fdt"

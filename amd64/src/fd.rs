@@ -1057,7 +1057,11 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
         if let Some(b) = serial::getb() {
             return copy_to_user(buf, &[b]);
         }
-        core::hint::spin_loop();
+        // A yield, not a bare spin: this task holds the Big Kernel Lock, and a
+        // shell waiting for a keypress must not hold every other core's syscalls
+        // hostage. `yield_now` drops the lock for a moment when it has nothing
+        // to switch to.
+        crate::sched::yield_now();
     }
 }
 

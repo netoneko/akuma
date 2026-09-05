@@ -12,7 +12,7 @@
 
 use akuma_ryzen_amd64::{MachineDescription, PhysMem};
 
-use crate::phys::{PHYSMAP_LIMIT, phys_ptr};
+use crate::phys::{PHYSMAP_MAPPED, phys_ptr};
 use crate::serial;
 
 /// Physical memory as the kernel sees it: the physmap, and nothing outside it.
@@ -29,7 +29,7 @@ impl PhysMem for Physmap {
         let Some(end) = pa.checked_add(buf.len() as u64) else {
             return false;
         };
-        if end > PHYSMAP_LIMIT {
+        if end > PHYSMAP_MAPPED {
             return false;
         }
         for (i, slot) in buf.iter_mut().enumerate() {

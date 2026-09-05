@@ -1,4 +1,4 @@
-//! GDT and TSS: the descriptors ring 3 needs.
+//! GDT and TSS: the descriptors ring 3 needs — one set per core.
 //!
 //! `boot.s` builds a three-entry GDT — null, kernel code, kernel data — which is
 //! everything long mode requires and nothing userspace does. This replaces it
@@ -30,7 +30,23 @@
 //! # Why the kernel entries are byte-identical to `boot.s`
 //!
 //! Deliberate: it means `CS` stays valid across the `lgdt`, so there is no need
-//! to reload it with a far return. The only reload is `ltr`.
+//! to reload it with a far return. The only reload is `ltr`. The AP trampoline
+//! (`boot.s`, `ap_gdt`) keeps the same two entries at the same selectors for
+//! the same reason: a secondary arrives in long mode with `CS = 0x08`, loads its
+//! table here, and nothing about its segment state changes.
+//!
+//! # One table per core
+//!
+//! The TSS is what forces this. `rsp0` — the stack the CPU switches to on a
+//! ring-3 trap — is per *task*, rewritten on every context switch by
+//! [`set_kernel_stack`]; with two cores running two tasks, one TSS would have
+//! each switch overwrite the other core's trap stack. `ltr` on a descriptor
+//! marks it busy, too, so two cores cannot even load the same one. The four
+//! segment descriptors are identical across cores and could be shared; a table
+//! per core is simpler than one table with a TSS slot per core, and costs
+//! `7 * 8 * MAX_CPUS` bytes.
+
+use crate::smp::{self, MAX_CPUS};
 
 /// 64-bit TSS. 104 bytes, and the only field this kernel sets is `rsp0`.
 ///
@@ -71,8 +87,10 @@ impl Tss {
     }
 }
 
-/// Stack the CPU switches to for a ring-3 → ring-0 trap. Separate from the boot
-/// stack because it must be valid whatever userspace did to its own.
+/// Stack the BSP switches to for a ring-3 → ring-0 trap before the scheduler
+/// has installed a task's own. Separate from the boot stack because it must be
+/// valid whatever userspace did to its own. Secondaries use their idle task's
+/// stack for the same purpose.
 const KERNEL_TRAP_STACK_SIZE: usize = 16 * 1024;
 
 /// The field is never *read* — the stack is addressed through a raw pointer to
@@ -82,8 +100,8 @@ const KERNEL_TRAP_STACK_SIZE: usize = 16 * 1024;
 struct TrapStack(#[allow(dead_code)] [u8; KERNEL_TRAP_STACK_SIZE]);
 
 static mut TRAP_STACK: TrapStack = TrapStack([0; KERNEL_TRAP_STACK_SIZE]);
-static mut TSS: Tss = Tss::new();
-static mut GDT: [u64; 7] = [0; 7];
+static mut TSS: [Tss; MAX_CPUS] = [const { Tss::new() }; MAX_CPUS];
+static mut GDT: [[u64; 7]; MAX_CPUS] = [[0; 7]; MAX_CPUS];
 
 pub const KERNEL_CODE: u16 = 0x08;
 /// Kernel data. Not referenced by name anywhere: `syscall` derives `SS` as
@@ -121,7 +139,7 @@ struct Gdtr {
     base: u64,
 }
 
-/// Point the TSS at the stack a ring-3 trap should switch to.
+/// Point this core's TSS at the stack a ring-3 trap should switch to.
 ///
 /// Must be called on every context switch once preemption exists. `rsp0` is
 /// where the CPU pushes the interrupt frame when an interrupt arrives **in ring
@@ -132,22 +150,35 @@ struct Gdtr {
 /// Sharing was safe until Stage J only because nothing switched tasks from
 /// inside an interrupt handler.
 pub fn set_kernel_stack(rsp0: u64) {
-    // SAFETY: single core; the TSS is reached only through a raw pointer, and
-    // the CPU reads `rsp0` on the next ring-3 trap rather than concurrently.
+    // SAFETY: this core's own TSS, reached only through a raw pointer; the CPU
+    // reads `rsp0` on this core's next ring-3 trap rather than concurrently, and
+    // no other core touches this slot.
     unsafe {
-        let tss = &raw mut TSS;
+        let tss = (&raw mut TSS).cast::<Tss>().add(smp::cpu_index());
         (*tss).rsp0 = rsp0;
     }
 }
 
-/// Build the GDT and TSS, load both.
+/// Build the BSP's GDT and TSS, load both.
 pub fn init() {
-    // SAFETY: single core, interrupts masked, written once before `lgdt`. The
-    // statics are reached only through raw pointers, never references.
+    // SAFETY: the static trap stack, addressed by its end.
+    let rsp0 = unsafe { (&raw mut TRAP_STACK).cast::<u8>().add(KERNEL_TRAP_STACK_SIZE) as u64 };
+    init_cpu(0, rsp0);
+}
+
+/// Build core `idx`'s GDT and TSS, with `rsp0` as its initial trap stack, and
+/// load both on the calling core.
+///
+/// The BSP calls this as core 0 before `smp::init_bsp`, so it must not read
+/// `gs:` — it takes the index as an argument for that reason.
+pub fn init_cpu(idx: usize, rsp0: u64) {
+    assert!(idx < MAX_CPUS, "cpu index out of range for the GDT table");
+    // SAFETY: interrupts masked on this core, and only this core ever touches
+    // its own slot of the two tables. The statics are reached only through raw
+    // pointers, never references.
     unsafe {
-        let tss = &raw mut TSS;
-        let stack = &raw mut TRAP_STACK;
-        (*tss).rsp0 = stack.cast::<u8>().add(KERNEL_TRAP_STACK_SIZE) as u64;
+        let tss = (&raw mut TSS).cast::<Tss>().add(idx);
+        (*tss).rsp0 = rsp0;
 
         let tss_base = tss as u64;
         let tss_limit = (core::mem::size_of::<Tss>() - 1) as u64;
@@ -163,7 +194,7 @@ pub fn init() {
             | ((tss_base >> 24) & 0xFF) << 56;
         let high = tss_base >> 32;
 
-        let gdt = &raw mut GDT;
+        let gdt = (&raw mut GDT).cast::<[u64; 7]>().add(idx);
         (*gdt)[0] = 0;
         (*gdt)[1] = D_KERNEL_CODE;
         (*gdt)[2] = D_KERNEL_DATA;
@@ -178,7 +209,8 @@ pub fn init() {
         };
 
         // No far return to reload CS: entries 1 and 2 are byte-identical to the
-        // ones `boot.s` installed, so the selectors already loaded stay valid.
+        // ones `boot.s` (and the AP trampoline) installed, so the selectors
+        // already loaded stay valid.
         core::arch::asm!(
             "lgdt [{gdtr}]",
             "ltr {tr:x}",

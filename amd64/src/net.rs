@@ -223,10 +223,13 @@ pub fn init(enable_dhcp: bool) -> bool {
         uptime_us,
         utc_seconds,
         yield_now: crate::sched::yield_now,
+        // A yield: it switches to any runnable task, and when there is none it
+        // drops the BKL for a moment so the other cores' syscalls get in — which
+        // is exactly what "relax while blocked" has to mean under one lock.
         blocking_relax: crate::sched::yield_now,
         park_until,
         current_waker: noop_waker,
-        current_core_id: || 0,
+        current_core_id: crate::smp::cpu_index_u32,
         current_box_id: || 0,
         is_current_interrupted: || false,
         rng_fill,

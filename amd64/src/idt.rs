@@ -239,6 +239,15 @@ macro_rules! fixable_exception_entry {
              *   [rsp + 32]  rsp
              *   [rsp + 40]  ss
              *
+             * If the fault came from ring 3, `%gs` is the program's; kernel code
+             * expects its per-CPU block there (`smp.rs`). Swap it in — and only
+             * then, because from ring 0 it is already in place and a second
+             * `swapgs` would swap it out. The saved CS's RPL is the test. */
+            "    test qword ptr [rsp + 16], 3\n",
+            "    jz 3f\n",
+            "    swapgs\n",
+            "3:\n",
+            /*
              * Save every caller-saved register: the dispatcher is `extern "C"`,
              * so it preserves rbx/rbp/r12-r15 itself, but it is free to destroy
              * these nine and the interrupted code — which may be `rep movsb` in
@@ -282,10 +291,62 @@ macro_rules! fixable_exception_entry {
             "    pop rax\n",
             "    pop rbp\n",
             "    add rsp, 8\n",                   /* drop the error code; iretq does not */
+            /* Back to the program's `%gs` if that is where we are going. */
+            "    test qword ptr [rsp + 8], 3\n",
+            "    jz 4f\n",
+            "    swapgs\n",
+            "4:\n",
             "    iretq\n",
         ));
     };
 }
+
+// The LAPIC timer's entry: hand-assembled like the two above, because its
+// handler may **switch tasks** — the `iretq` at the end then resumes a
+// different task's frame — and because it must `swapgs` on a ring-3 origin so
+// the scheduler it calls can find its per-CPU block. There is no error code,
+// so the frame is 40 bytes and `rsp` arrives `≡ 8 (mod 16)`; the extra
+// `sub rsp, 8` restores the alignment the dispatcher's `call` needs.
+core::arch::global_asm!(
+    r#"
+    .section .text
+.global timer_entry
+timer_entry:
+    test qword ptr [rsp + 8], 3
+    jz 1f
+    swapgs
+1:
+    push rbp
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    sub rsp, 8
+    lea rdi, [rsp + 88]              /* &InterruptStackFrame */
+    call timer_dispatch
+    add rsp, 8
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    pop rbp
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
+    iretq
+"#
+);
 
 fixable_exception_entry!("page_fault_entry", "page_fault_dispatch");
 fixable_exception_entry!("general_protection_entry", "general_protection_dispatch");
@@ -353,7 +414,37 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
         return;
     }
 
+    if pf.frame.cs & 3 == 3 {
+        user_fault("#PF page fault", &pf.frame, Some(code));
+    }
     fatal("#PF page fault", &pf.frame, Some(code));
+}
+
+/// A fault taken **in ring 3**: report it and kill the process, not the core.
+///
+/// Halting was the right answer while every fault was the kernel's own bug to
+/// see. A program's segfault is not: on one core it took the whole machine
+/// down, and on several it silently parked one core with the others carrying
+/// on — which is how a `#GP` in busybox read as "busybox exited -1". The
+/// process leaves ring 3 the way `exit_group` does, with the status a Linux
+/// parent would see for a signal death (`128 + SIGSEGV`).
+fn user_fault(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {
+    serial::puts("\n[Fault] ");
+    serial::puts(vector);
+    serial::puts(" in ring 3 on cpu ");
+    serial::put_dec(crate::smp::cpu_index() as u64);
+    if let Some(code) = error_code {
+        serial::puts(" err=0x");
+        serial::put_hex(code);
+    }
+    serial::puts(" rip=0x");
+    serial::put_hex(frame.rip);
+    serial::puts(" rsp=0x");
+    serial::put_hex(frame.rsp);
+    serial::puts(" cr2=0x");
+    serial::put_hex(read_cr2());
+    serial::puts(" — killing the process\n");
+    crate::usermode::kill_current_from_fault(128 + 11);
 }
 
 /// `#GP` — fatal, except inside the user-copy loop.
@@ -374,34 +465,51 @@ extern "C" fn general_protection_dispatch(frame: *mut PageFaultFrame) {
         pf.frame.rip = fixup;
         return;
     }
+    if pf.frame.cs & 3 == 3 {
+        user_fault("#GP general protection", &pf.frame, Some(pf.error_code));
+    }
     fatal("#GP general protection", &pf.frame, Some(pf.error_code));
 }
 
-/// The LAPIC timer vector.
+unsafe extern "C" {
+    /// The LAPIC timer entry point, installed in the IDT by `lapic::init`.
+    fn timer_entry();
+}
+
+/// The LAPIC timer vector's body, called by [`timer_entry`] with the frame.
 ///
 /// Counts, acknowledges, and may **switch tasks** — the switch happens here, on
 /// the interrupted task's own trap stack, which is what makes preemption
 /// preemption. Everything it does is bounded and allocation-free; a handler runs
 /// with `IF` clear (these are interrupt gates, not trap gates), so it cannot
 /// nest.
-extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
+///
+/// Whether to preempt is decided by where the tick landed, and the saved `CS`
+/// says where: ring 3, or the idle loop, may be switched away from; other
+/// kernel code is only asked (`need_resched`) and switches at its next yield.
+/// See `sched::preempt_if_needed` for why.
+#[unsafe(no_mangle)]
+extern "C" fn timer_dispatch(frame: *const InterruptStackFrame) {
+    // SAFETY: the stub passes a pointer into the current stack, to the frame
+    // the CPU just pushed; it is live until `iretq`.
+    let from_user = unsafe { (*frame).cs & 3 } == 3;
     // A tick can land inside a `stac` window; the scheduler must not inherit it.
     crate::uaccess::clac_if_enabled();
     crate::lapic::on_tick();
     // Preemption. EOI has already been sent, so the LAPIC can deliver the next
     // tick to whichever task runs after this returns.
-    crate::sched::preempt_if_needed();
+    crate::sched::preempt_if_needed(from_user);
 }
 
-/// Address of [`timer_interrupt`], for [`set_handler`].
+/// Address of [`timer_entry`], for [`set_handler`].
 ///
-/// A function rather than a `pub` handler because the handler's ABI is an
+/// A function rather than a `pub` symbol because the entry's ABI is an
 /// implementation detail of this module — the caller wants "the timer entry
-/// point", not a typed `extern "x86-interrupt" fn` it would then have to spell.
+/// point", not a typed `extern "C" fn` it would then have to spell.
 #[allow(function_casts_as_integer)]
 #[must_use]
 pub fn timer_interrupt_entry() -> usize {
-    timer_interrupt as usize
+    timer_entry as usize
 }
 
 /// Install a handler for one vector, after [`init`].
@@ -450,7 +558,19 @@ pub fn init() {
         // The two hand-assembled entries; see the module header.
         (*idt)[13].set(general_protection_entry as usize);
         (*idt)[14].set(page_fault_entry as usize);
+    }
+    load();
+}
 
+/// Load the (one, shared) IDT on the calling core.
+///
+/// `IDTR` is a per-core register, so every AP must do this; the table it points
+/// at is the same one, and by the time a secondary runs it is complete.
+pub fn load() {
+    // SAFETY: the table is fully built by `init` before any AP starts, and
+    // `lidt` only records its address.
+    unsafe {
+        let idt = &raw mut IDT;
         let idtr = Idtr {
             limit: (core::mem::size_of::<[Entry; IDT_LEN]>() - 1) as u16,
             base: idt as u64,

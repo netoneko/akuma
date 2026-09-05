@@ -85,6 +85,8 @@ mod sched;
 #[cfg(target_arch = "x86_64")]
 mod serial;
 #[cfg(target_arch = "x86_64")]
+mod smp;
+#[cfg(target_arch = "x86_64")]
 mod sock;
 mod uaccess;
 
@@ -144,6 +146,12 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // symptom was a triple fault inside the heap allocator with CR2 pointing at
     // 0x2010d8: the GDT itself.
     gdt::init();
+
+    // The BSP's per-CPU block and the Big Kernel Lock, before anything reads
+    // `gs:` — which the scheduler, the syscall path and every `SAFETY: under
+    // the BKL` comment below do. Nothing else runs yet, so the lock is taken
+    // uncontended; every kernel task is born holding it.
+    smp::init_bsp();
 
     // `idt::init` needs nothing but its own static table, so it goes here rather
     // than after the memory subsystem: a fault during memory bring-up then
@@ -239,6 +247,20 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     usermode::init_syscall();
     usermode::smoke_test(&mut t);
     usermode::preempt_test(&mut t);
+
+    // The other cores. After the two ring-3 tests above, which assert an exact
+    // interleaving that only one core produces, and before the ELF, spawn,
+    // busybox, execve and fork tests below, which then run with every core
+    // picking up processes — the best stress the BKL gets short of a shell.
+    // The BSP's timer is stopped here (`preempt_test` stops it), which
+    // `start_secondaries` needs for its INIT delay.
+    let expected_aps = machine
+        .madt
+        .as_ref()
+        .map_or(0, |m| m.cpus().len().saturating_sub(1).min(smp::MAX_CPUS - 1));
+    let started = smp::start_secondaries(machine.madt.as_ref());
+    smp::smoke_test(&mut t, expected_aps, started);
+    usermode::smp_parallel_test(&mut t);
     // Last, because it is the only test whose program the kernel did not
     // assemble: everything before it has to work for a loader failure to be
     // readable as a loader failure.
@@ -248,7 +270,17 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     usermode::spawn_test(&mut t);
     usermode::busybox_test(&mut t);
     usermode::execve_test(&mut t);
+    // `strace` on the command line traces the fork test's syscalls too — the one
+    // self-test whose failure mode under SMP was a silent hang, where the trace
+    // is the only evidence of which core did what.
+    let trace_fork = machine::flag(hvm_start_info, "strace");
+    if trace_fork {
+        usermode::SYSCALL_TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     usermode::fork_test(&mut t);
+    if trace_fork {
+        usermode::SYSCALL_TRACE.store(false, core::sync::atomic::Ordering::Relaxed);
+    }
     lapic::stop_timer();
 
     // The netpoll drain half, then (in the gap before the daemon task

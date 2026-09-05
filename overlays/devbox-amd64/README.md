@@ -28,6 +28,7 @@ INIT=/bin/httpd        overlays/devbox-amd64/run.sh # curl http://localhost:8080
 INIT=/bin/busybox INITARGS=uname,-a overlays/devbox-amd64/run.sh   # busybox applet
 SSHD_SHELL=/bin/sh     overlays/devbox-amd64/run.sh # sshd starts busybox
 STRACE=1               overlays/devbox-amd64/run.sh # trace every syscall the init program makes
+SMP=4                  overlays/devbox-amd64/run.sh # four cores (amd64/README.md § "SMP")
 ```
 
 ssh in with the key `amd64/mkdisk.sh` generated:
