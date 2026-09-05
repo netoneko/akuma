@@ -200,28 +200,117 @@ that" before this was a photograph or a guess.
 
 ### A proper disk
 
-Today the rootfs is a **128 MiB ext2 image GRUB loads into RAM** (`module2 …
-root.img`), mounted by `ramdisk.rs`. It does not persist and it competes with
-everything else for the sub-4 GiB window. Options for real storage, in rough
-order of effort:
+Today the rootfs is a **512 MiB ext2 image GRUB loads into RAM** (`module2 …
+root.img`, `mkdisk.sh` `SIZE_MIB`), mounted by `ramdisk.rs`. It does not persist
+and it competes with everything else for the sub-4 GiB window.
 
-1. **A second SATA disk.** The box's Intel C220 has 6 ports; add a small
-   SSD/HDD and Akuma's driver owns it whole — no partition table to share, no
-   risk to the Ubuntu install. **Needs an AHCI driver** (there is none;
-   `pci::scan` *finds* the controller, `blk.rs` only speaks virtio-blk).
-2. **A partition on the existing 1 TB Toshiba.** `/dev/sda` is GPT: a 1.1 GB
-   FAT32 ESP and a 999 GB ext4 that runs to the end of the disk. Shrink the
-   ext4 offline, add a third partition, format ext2, mount it from the AHCI
-   driver. Same driver work as (1) plus a risky resize.
-3. **The SD-card slot** (`sdb Multi-Card`). Almost certainly USB-attached, so
-   it needs the USB mass-storage stack — which needs the EHCI driver that the
-   keyboard is also waiting on. Worst effort-to-value.
-4. **Stay on the RAM disk, bigger.** Bump `SIZE_MIB` in `mkdisk.sh` and (once
-   `PHYSMAP_LIMIT` is raised) give it more room. Not persistent, but enough to
-   run `apk` without OOMing in the meantime.
+**Decided 2026-09-06: a USB disk over xHCI.** The earlier options below assumed
+SATA + `akuma-ahci`; that is off the table because the spare drive is screwed
+into a caddy the user cannot open, so it stays in its USB-to-SATA enclosure and
+Akuma has to speak USB to reach it. `akuma-ahci` is shelved — not wrong, just
+not the path while the only spare disk is trapped on USB.
 
-The common blocker for (1) and (2) is **`akuma-ahci`**, which does not exist
-yet. That is the next real subsystem.
+#### What was learned about the enclosure (all on the Ubuntu side, 2026-09-06)
+
+- **The drive is fine.** Seagate ST1000LM035, SMART `PASSED`, 8 reallocated
+  sectors, **0 pending / 0 uncorrectable**, 0 UDMA CRC errors, ~1900 power-on
+  hours. Old, lightly worn, not failing.
+- **The USB *hub* was the flakiness.** Behind the hub, on USB 2.0, sustained
+  writes dropped the device off the bus entirely mid-transfer (`usb …: USB
+  disconnect`, `DID_NO_CONNECT`) — this was last session's `mkfs.ext2` stall.
+  Plugged **straight into a rear port** the enclosure enumerates on `xhci_hcd`
+  at SuperSpeed and does **134 MB/s writes with zero errors** (1 GB test).
+- **The bridge is UAS-buggy — force Bulk-Only Transport.** ASMedia `174c:55aa`.
+  Under the `uas` driver even a rear port wedges on I/O. Ubuntu now has
+  `/etc/modprobe.d/akuma-usb-storage-quirk.conf` pinning
+  `usb-storage quirks=174c:55aa:u` (disable UAS → BOT), initramfs rebuilt.
+  Fortunate, because **BOT is exactly what Akuma implements** — so Linux-under-BOT
+  is the representative oracle.
+- **xHCI on this box only ever sees SuperSpeed devices.** `setpci -s 00:14.0
+  0xD0.l 0xD4.l` reads `XUSB2PR = 0` and **`XUSB2PRM = 0`** — firmware hardwires
+  it (Lynx Point `8086:8c31`). Every full/low/high-speed device — the keyboard,
+  a USB-2 disk — routes to **EHCI**, no BIOS option. `USB3PRM = 0x3f`: 6
+  SuperSpeed ports, all enabled.
+- **GRUB 2.12 here has `ehci/ohci/uhci/usb/usbms` modules but no `xhci`.**
+  Mainline GRUB still cannot read an xHCI-attached disk. This is why the kernel
+  image stays on Ubuntu's ext4 `/boot/akuma/` (GRUB loads it from there) and only
+  the *root filesystem* moves to USB.
+
+#### The disk, prepped
+
+`/dev/sda`, MBR: `sda1` (PARTUUID `21dda1ff-01`, LBA 2048 = 1 MiB, 64 GiB) is
+**ext2, label `AKUMA`, UUID `9329e325-…`, 4 KiB blocks**, `mke2fs` defaults
+matching `scripts/create_disk.sh`, `e2fsck` clean, last session's `amd64-root.img`
+rootfs staged onto it. `sda2` (`21dda1ff-02`, 867 GiB) raw.
+
+#### Why xHCI and not EHCI
+
+The keyboard is deferred, which removes the one thing that forced EHCI (a
+full-speed HID device behind the Intel rate-matching hub — the split-transaction
+problem `crates/akuma-usb/src/ehci.rs` is built around). With the keyboard out:
+the disk is already stable on the SuperSpeed port at 134 MB/s (4× a USB-2 EHCI
+connection), needs no physical change, and a single SuperSpeed device with no hub
+is a *minimal* xHCI — one slot, a command ring, an event ring, control + two bulk
+endpoints, **no split transactions**. `crates/akuma-usb`'s `descriptor.rs` (USB
+descriptor parsing) carries over; the 631-line `ehci.rs` stays for when the
+keyboard comes back.
+
+Plan: a `akuma-xhci` crate (register/TRB/context layout, host-tested against
+register values captured off `00:14.0`), an `akuma-usb-storage` crate (CBW/CSW +
+minimal SCSI: `INQUIRY`, `TEST UNIT READY`, `READ CAPACITY(10)`, `READ(10)`,
+`WRITE(10)`, `REQUEST SENSE`), the MMIO/DMA half in `amd64/src/xhci.rs` (`.bss`
+rings, `virt_to_phys`, `compiler_fence` before ownership words — the
+`akuma-net-nic/src/rtl8169.rs` pattern), a `RootDevice::Usb` arm in
+`amd64/src/fs.rs`, and a `root=/dev/sda1` cmdline token on the `multiboot2.rs`
+path that falls back to the RAM image on any probe failure. `sda1`'s 1 MiB offset
+is a hardcoded constant with a `0x55AA` + start-dword sanity check, not an
+MBR-parsing crate. Full plan in `proposals/` and the plan file for the session
+that builds it.
+
+#### Closing the dev loop — open design question
+
+The loop today (`docs/runbooks/amd64-bare-metal-loop.md`) is: edit on the laptop
+→ rsync to Ubuntu → build on Ubuntu → `cp` kernel to `/boot/akuma/` → `grub-reboot`
+→ boot Akuma. The Ubuntu steps are the open part.
+
+A persistent USB root closes the loop for **rootfs contents** (packages, built
+binaries) — writes just survive. It does **not** by itself close the loop for the
+**kernel image**, because GRUB loads that from Ubuntu's disk and cannot read the
+xHCI USB disk. Ideas on the table (2026-09-06, not yet decided):
+
+- **A small userspace kernel-installer that writes to a FAT filesystem.** GRUB
+  always has FAT support and the box already has a FAT32 ESP. A portable tool
+  that lays a kernel image into a FAT partition — **testable against a raw block
+  device or a loopback image so it never touches the real disk** — would let
+  Akuma install its own freshly-built kernels. Catch: the ESP is on the SATA
+  disk (no `akuma-ahci`), and a FAT partition on the *USB* disk is not readable
+  by GRUB (no xHCI). So this wants either EHCI (GRUB can then read a USB-2 FAT
+  partition) or `akuma-ahci` after all — it does not compose with the xHCI-only
+  decision above without one of them.
+- **Run `debugfs` (e2fsprogs) on Akuma.** `mkdisk.sh` already uses `debugfs -w -R
+  write` to populate an ext2 image on macOS with no mount and no kernel FS write
+  path. A **static** `debugfs` on Akuma, pointed at `/dev/sda1`, would manage the
+  root filesystem's contents the same way — sidestepping `akuma-ext2`'s write
+  path entirely. Needs: a static musl build of e2fsprogs (Alpine's is in
+  `e2fsprogs-extra`, dynamically linked — a static build is the work), and raw
+  block-device `open()`/`pread()`/`pwrite()` on `/dev/sda1`, which the USB block
+  driver has to expose anyway. Still does not place a kernel where GRUB reads it.
+
+The honest summary: **xHCI gets a persistent, writable root and a closed loop for
+everything except the kernel image.** Fully closing the kernel half needs EHCI
+(so GRUB can read the USB disk) or `akuma-ahci` (so Akuma can write Ubuntu's
+disk) — a decision to make once the xHCI root is real and the remaining friction
+is measured rather than guessed.
+
+#### Superseded options (needed `akuma-ahci`, which is shelved)
+
+1. A second SATA disk, Akuma owns it whole. Cleanest, but the spare disk is on
+   USB and `akuma-ahci` does not exist.
+2. A third partition on the Toshiba (shrink the ext4). Driver work plus a risky
+   resize.
+3. The SD-card slot — USB-attached, so it needs the same USB stack anyway.
+4. **Stay on the RAM disk, bigger.** Bump `mkdisk.sh` `SIZE_MIB` (done — 512 MiB
+   2026-09-06). Not persistent, but keeps `apk` from OOMing in the meantime.
 
 ### High value
 
@@ -270,8 +359,12 @@ yet. That is the next real subsystem.
 ### Missing subsystems
 
 - **procfs.** `/proc` is an empty directory. `ps`, `top`, `free` need a real one.
-- **USB HID.** The box's keyboard is FS-on-EHCI (not xHCI). No EHCI driver, so
-  the framebuffer is output-only and ssh is the only console.
+- **USB HID.** The box's keyboard is FS-on-EHCI (not xHCI — `XUSB2PRM = 0`), so
+  it stays an EHCI + split-transaction problem regardless of which port it is in.
+  **Deferred 2026-09-06** in favour of the USB disk (which is xHCI-only). The
+  framebuffer is output-only and ssh is the only console until then.
+- **USB mass storage.** In progress 2026-09-06 — see "A proper disk" above.
+  `akuma-xhci` + `akuma-usb-storage` + BOT, single SuperSpeed device.
 
 ---
 
