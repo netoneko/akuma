@@ -239,11 +239,14 @@ impl Rings for Rtl8169Rings {
 /// broadcasts, short enough to catch the failure while it is fresh.
 const STALL_LAPS: u32 = 2_000_000;
 
-/// How many times the receiver is restarted before giving up and staying quiet.
-/// A chip that comes back on the first kick answers the question; one that
-/// needs five has answered a different one, and either way the log stays
-/// readable.
-const MAX_KICKS: u32 = 5;
+/// How many stalls are reported on the console before the recovery goes quiet.
+///
+/// The recovery itself is **not** capped — it is what keeps the machine on the
+/// network, and a chip that needs restarting every few seconds still needs
+/// restarting. Only the printing stops, because a console that scrolls its own
+/// diagnosis away is no better than one that never printed it. The running
+/// total stays visible in the probe line as `kicks=`.
+const MAX_STALL_REPORTS: u32 = 5;
 
 /// How many receive laps between PHY samples. See [`Rtl8169Device::take_rx_frame`].
 const LINK_SAMPLE_LAPS: u32 = 1024;
@@ -331,18 +334,23 @@ impl Rtl8169Device {
     /// completions landing in unrelated kernel memory are simply it writing
     /// where it thinks the ring is.
     fn on_stall(&mut self) {
-        let s = self.nic.snapshot();
-        // The full picture once; after that the kick line alone, which is the
-        // part that changes.
+        crate::counters::C.rx_kicks.fetch_add(1, Ordering::Relaxed);
+
+        // The full picture once; after that a single line; after
+        // `MAX_STALL_REPORTS`, nothing at all — but the kick still happens.
         if self.stalls > 1 {
+            let s = self.nic.snapshot();
             let (before, after) = self.nic.kick_receiver();
-            crate::safe_print!(
-                120,
-                "[rtl] stall #{}: kick misc 0x{:08x} -> 0x{:08x} mpc={} cr=0x{:02x}\n",
-                self.stalls, before, after, s.mpc, s.cr
-            );
+            if self.stalls <= MAX_STALL_REPORTS {
+                crate::safe_print!(
+                    120,
+                    "[rtl] stall #{}: kick misc 0x{:08x} -> 0x{:08x} mpc={} cr=0x{:02x}\n",
+                    self.stalls, before, after, s.mpc, s.cr
+                );
+            }
             return;
         }
+        let s = self.nic.snapshot();
         crate::safe_print!(96, "[rtl] STALL #1 after {} idle laps\n", STALL_LAPS);
         crate::safe_print!(
             128,
@@ -438,7 +446,7 @@ impl Rtl8169Device {
         // says about itself the moment it stops, once, and then never again.
         let Some(n) = self.nic.receive(&mut self.rx_scratch) else {
             self.idle_laps = self.idle_laps.saturating_add(1);
-            if self.idle_laps >= STALL_LAPS && self.stalls < MAX_KICKS {
+            if self.idle_laps >= STALL_LAPS {
                 self.stalls += 1;
                 self.idle_laps = 0;
                 self.on_stall();

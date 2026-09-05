@@ -577,7 +577,7 @@ pub fn print_probe_line(now_us: u64, laps: u64) {
     }
 
     let (posted, begin_fail, received) = akuma_net::smoltcp_net::rx_counters();
-    let (isr, dry) = akuma_net::smoltcp_net::isr_history();
+    let (isr, dry, kicks) = akuma_net::smoltcp_net::isr_history();
     serial::puts("[probe]   rx=");
     serial::put_dec(received as u64);
     serial::puts(" tx=");
@@ -588,6 +588,8 @@ pub fn print_probe_line(now_us: u64, laps: u64) {
     serial::put_hexn(u64::from(isr), 4);
     serial::puts(" dry=");
     serial::put_dec(dry as u64);
+    serial::puts(" kicks=");
+    serial::put_dec(kicks as u64);
     serial::puts(" polls=");
     serial::put_dec(akuma_net::smoltcp_net::poll_count() as u64);
     serial::puts(" posted=");
@@ -599,6 +601,33 @@ pub fn print_probe_line(now_us: u64, laps: u64) {
     serial::puts(" laps=");
     serial::put_dec(laps);
     serial::puts("\n");
+}
+
+/// Drive the stack by hand until DHCP settles, or `budget_ms` elapses.
+///
+/// The window this fills is narrow and load-bearing. The wall clock comes from
+/// SNTP, SNTP needs an address and a route, and an address comes from DHCP —
+/// so the clock cannot be fetched until the stack has settled. But SNTP also
+/// **cannot run once the netpoll daemon exists**: it makes kernel-side socket
+/// calls, and the first thing that ever did that concurrently with the daemon
+/// deadlocked on a spinlock the daemon's own poll step takes, on this single
+/// core, the instant preemption switched into it
+/// (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.30).
+///
+/// So the order is: drain here, fetch the clock, *then* spawn the daemon.
+///
+/// Returns whether DHCP actually configured. `false` is not fatal — the static
+/// address stands and the boot goes on — it just means the clock will stay at
+/// the epoch, and every TLS certificate on earth will look not-yet-valid.
+pub fn settle_for_dhcp(budget_ms: u64) -> bool {
+    let deadline = uptime_us() + budget_ms * 1000;
+    while uptime_us() < deadline {
+        drain_step();
+        if akuma_net::smoltcp_net::is_dhcp_configured() {
+            return true;
+        }
+    }
+    akuma_net::smoltcp_net::is_dhcp_configured()
 }
 
 /// Spawn the netpoll daemon. Returns false only if the task table is full, which

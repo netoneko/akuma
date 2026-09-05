@@ -473,6 +473,24 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // this, but a shell that opens a socket does.
     let netprobe = info.cmdline().split_ascii_whitespace().any(|t| t == "netprobe");
     if have_net {
+        // The wall clock, and the order it has to happen in.
+        //
+        // Until 2026-09-05 this path never fetched one at all — `sync_via_sntp`
+        // was called only from `kmain` (PVH), so a bare-metal boot ran at the
+        // epoch for ever. That is not cosmetic: `date` said 1970, and **every
+        // TLS certificate looked not-yet-valid**, which `apk` reports as
+        // `server certificate not trusted`. Hours of "the CA bundle must be
+        // wrong" are available to anyone who does not check the clock first;
+        // the bundle was fine and present the whole time.
+        //
+        // DHCP first (SNTP needs an address and a route), then the clock, then
+        // the daemon — see `net::settle_for_dhcp` for why the daemon must be
+        // last.
+        if crate::net::settle_for_dhcp(SETTLE_BUDGET_MS) {
+            crate::clock::sync_via_sntp();
+        } else {
+            serial::puts("  net:  DHCP did not settle; no wall clock (TLS will fail)\n");
+        }
         crate::net::spawn_netpoll();
         if netprobe {
             crate::net::enable_probe();
@@ -562,6 +580,16 @@ fn machine_from(info: &BootInfo<'_>) -> MachineDescription {
     });
     MachineDescription::from_memory_map(&regions[..n], rsdp, madt)
 }
+
+/// How long to drive the stack by hand waiting for a DHCP lease before giving
+/// up and booting without a wall clock.
+///
+/// Generous, because on this machine the receiver has to be restarted once
+/// before anything arrives (`akuma-net-nic`'s `rtl8169` stall recovery) and
+/// that takes a couple of seconds of polling to detect. A boot that waits eight
+/// seconds and gets a clock is worth more than one that gives up in two and
+/// cannot verify a certificate.
+const SETTLE_BUDGET_MS: u64 = 8_000;
 
 /// Cycle a band of colour along the bottom, for ever.
 ///

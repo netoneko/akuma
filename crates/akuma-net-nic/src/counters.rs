@@ -34,6 +34,10 @@ pub(crate) struct CounterBlock {
     pub(crate) tx_drop_count: AtomicUsize,
     pub(crate) tx_frames_sent: AtomicUsize,
     pub(crate) rx_ring_dry: AtomicUsize,
+    /// How many times the receiver has been restarted after stalling silently.
+    /// A number that keeps climbing is the machine staying reachable *despite*
+    /// a bug, not evidence there isn't one.
+    pub(crate) rx_kicks: AtomicUsize,
     pub(crate) rx_isr_seen: core::sync::atomic::AtomicU32,
     /// The link, as the driver last read it from the PHY, packed so a reader
     /// needs no lock: bit 0 up, bits 1..3 speed (1/2/3 = 10/100/1000), bit 3
@@ -55,6 +59,7 @@ pub(crate) static C: CounterBlock = CounterBlock {
     tx_drop_count: AtomicUsize::new(0),
     tx_frames_sent: AtomicUsize::new(0),
     rx_ring_dry: AtomicUsize::new(0),
+    rx_kicks: AtomicUsize::new(0),
     rx_isr_seen: core::sync::atomic::AtomicU32::new(0),
     link_state: core::sync::atomic::AtomicU8::new(0),
     canary_hi: AtomicUsize::new(CANARY_VALUE),
@@ -76,10 +81,15 @@ pub fn counter_block_addr() -> usize {
     (&raw const C) as usize
 }
 
-/// `(every ISR bit seen so far, times the receive ring ran dry)`.
+/// `(every ISR bit seen so far, times the receive ring ran dry, receiver
+/// restarts)`.
 #[must_use]
-pub fn isr_history() -> (u32, usize) {
-    (C.rx_isr_seen.load(Ordering::Relaxed), C.rx_ring_dry.load(Ordering::Relaxed))
+pub fn isr_history() -> (u32, usize, usize) {
+    (
+        C.rx_isr_seen.load(Ordering::Relaxed),
+        C.rx_ring_dry.load(Ordering::Relaxed),
+        C.rx_kicks.load(Ordering::Relaxed),
+    )
 }
 
 /// The last sampled link state: `None` until a driver has read the PHY at all,
