@@ -7,7 +7,7 @@
 //! the end of the surface — which on real hardware is not a wrong pixel but a
 //! corrupted page.
 
-use akuma_fbcon::console::{DEFAULT_FONT, MAX_COLS, MAX_ROWS};
+use akuma_fbcon::console::{DEFAULT_FONT, FALLBACK_FONT, MAX_COLS, MAX_ROWS};
 use akuma_fbcon::font::{self, Font};
 use akuma_fbcon::{Console, Rgb, Surface};
 
@@ -347,43 +347,132 @@ fn scrolling_sparse_text_does_not_redraw_the_screen() {
     );
 }
 
-/// A screenful of rows at every resolution — that is what the scale is for.
+/// A usable terminal at every resolution — that is what the scale and the
+/// font fallback are together for.
 ///
-/// The floor is 18 rather than the 40-odd the scale aims at, and that is the
-/// price of the default font: a 24-pixel cell puts only 18 rows on a 640x480
-/// fallback mode, where the 16-pixel one managed 27. The machine this exists
-/// for is wired to a television, so the trade is worth making there — but it is
-/// a trade, and [`the_small_font_buys_back_rows_on_a_small_screen`] is the
-/// other side of it.
+/// The floor is 72x24, not the 80x24 the chooser aims at, and the gap is
+/// arithmetic rather than a compromise: 80 cells of the fallback font's
+/// 8-pixel cell is 640 pixels exactly, so a 640x480 framebuffer cannot reach 80
+/// columns *and* keep an overscan margin. No font choice fixes that, and the
+/// chooser does the next best thing — it takes the larger of the two grids, 73
+/// columns, where the default font would have given 49.
+///
+/// Every other mode clears 80 columns outright.
 #[test]
 fn every_real_resolution_gives_a_readable_grid() {
     for (w, h) in [(640, 480), (800, 600), (1024, 768), (1920, 1080), (3840, 2160)] {
         let con = Console::new(MemSurface::new(w, h)).unwrap();
+        let least = if w == 640 { 72 } else { 80 };
         assert!(
-            (18..=MAX_ROWS).contains(&con.rows()),
-            "{w}x{h} gave {} rows at scale {}",
+            con.cols() >= least && con.rows() >= 24,
+            "{w}x{h} gave {}x{} in {} at scale {}",
+            con.cols(),
             con.rows(),
+            con.font().name(),
             con.scale()
         );
-        assert!(con.cols() >= 40, "{w}x{h} gave only {} columns", con.cols());
         assert!(con.cols() <= MAX_COLS && con.rows() <= MAX_ROWS);
     }
 }
 
-/// Why the second font is still here.
+/// When neither font can reach the target, the chooser still has to choose —
+/// and it must take the bigger grid rather than defaulting to either name.
 ///
-/// On a small framebuffer the default's letterforms cost more rows than they
-/// are worth, and the scale cannot help — it is already 1 and does not go
-/// below. Half the cell height is the only lever left, and it is a big one.
+/// 640x480 is the case: 80 columns needs all 640 pixels at the fallback's cell
+/// width, leaving nothing for the margin, so both fonts fall short and the
+/// question becomes which falls short by less.
 #[test]
-fn the_small_font_buys_back_rows_on_a_small_screen() {
-    let big = Console::new(MemSurface::new(640, 480)).unwrap();
-    let small = Console::with_font(MemSurface::new(640, 480), &font::SPLEEN).unwrap();
-    assert!(
-        small.rows() >= big.rows() + 8,
-        "the small font gave {} rows against the default's {}",
-        small.rows(),
-        big.rows()
+fn neither_font_reaching_the_target_still_takes_the_better_grid() {
+    type C = Console<MemSurface>;
+    let (w, h) = (640, 480);
+    let d = C::grid_for(DEFAULT_FONT, w, h, C::auto_scale(DEFAULT_FONT, h)).unwrap();
+    let f = C::grid_for(FALLBACK_FONT, w, h, C::auto_scale(FALLBACK_FONT, h)).unwrap();
+    assert!(d.0 < 80 && f.0 < 80, "one of them reached the target after all");
+    assert!(f.0 * f.1 > d.0 * d.1);
+    assert_eq!(C::choose_font(w, h).name(), FALLBACK_FONT.name());
+}
+
+/// The whole point of keeping a second font: where the default cannot make a
+/// terminal, the fallback can.
+///
+/// Both halves matter. A fallback that never fires is dead weight, and one that
+/// fires on a screen the default handles fine is a regression in how the output
+/// looks — so this pins the boundary from both sides.
+#[test]
+fn the_font_falls_back_only_on_a_screen_that_needs_it() {
+    type C = Console<MemSurface>;
+    for (w, h) in [(640, 480), (800, 600), (1024, 768)] {
+        assert_eq!(
+            C::choose_font(w, h).name(),
+            FALLBACK_FONT.name(),
+            "{w}x{h} keeps the default at {:?}",
+            C::grid_for(DEFAULT_FONT, w, h, C::auto_scale(DEFAULT_FONT, h))
+        );
+    }
+    for (w, h) in [(1280, 720), (1280, 1024), (1920, 1080), (1920, 1200), (3840, 2160)] {
+        assert_eq!(
+            C::choose_font(w, h).name(),
+            DEFAULT_FONT.name(),
+            "{w}x{h} fell back at {:?}",
+            C::grid_for(DEFAULT_FONT, w, h, C::auto_scale(DEFAULT_FONT, h))
+        );
+    }
+}
+
+/// The font that was chosen must be the font that gets drawn.
+///
+/// These are two separate calculations — one picks, one builds — and a console
+/// that measured its grid with one font's cell and then blitted the other's
+/// would put every glyph in the wrong place. `grid_for` is shared so that
+/// cannot happen; this is the test that says so.
+#[test]
+fn the_console_is_built_in_the_font_that_was_chosen() {
+    type C = Console<MemSurface>;
+    for (w, h) in [(640, 480), (1024, 768), (1920, 1200), (3840, 2160)] {
+        let con = Console::new(MemSurface::new(w, h)).unwrap();
+        let want = C::choose_font(w, h);
+        assert_eq!(con.font().name(), want.name(), "{w}x{h}");
+        assert_eq!(
+            (con.cols(), con.rows()),
+            C::grid_for(want, w, h, C::auto_scale(want, h)).unwrap(),
+            "{w}x{h} built a grid its own font does not describe"
+        );
+    }
+}
+
+/// The fallback is not simply "the smaller font".
+///
+/// Both fonts scale independently, and at 1920x1200 the 8x16 one rounds to
+/// scale 2 while the 12x24 one stays at 1 — a 16x32 cell against a 12x24, so
+/// the *small* font is the bigger of the two there. A chooser that compared
+/// cell sizes rather than the grids they produce would get this backwards.
+#[test]
+fn the_fallback_font_is_not_always_the_smaller_cell() {
+    type C = Console<MemSurface>;
+    let (w, h) = (1920, 1200);
+    let d = C::auto_scale(DEFAULT_FONT, h) * DEFAULT_FONT.height();
+    let f = C::auto_scale(FALLBACK_FONT, h) * FALLBACK_FONT.height();
+    assert!(f > d, "the fallback cell is {f} against the default's {d}");
+    assert_eq!(C::choose_font(w, h).name(), DEFAULT_FONT.name());
+}
+
+/// An override stays an override: naming a font or a scale must not be second
+/// guessed by the chooser, even on a screen the chooser would have rejected.
+#[test]
+fn naming_a_font_or_a_scale_disables_the_fallback() {
+    let (w, h) = (640, 480);
+    assert_eq!(
+        Console::with_font(MemSurface::new(w, h), DEFAULT_FONT).unwrap().font().name(),
+        DEFAULT_FONT.name()
+    );
+    assert_eq!(
+        Console::with_scale(MemSurface::new(w, h), 1).unwrap().font().name(),
+        DEFAULT_FONT.name()
+    );
+    // ...while the automatic path does fall back on that same screen.
+    assert_eq!(
+        Console::new(MemSurface::new(w, h)).unwrap().font().name(),
+        FALLBACK_FONT.name()
     );
 }
 
@@ -408,12 +497,15 @@ fn a_surface_holding_exactly_one_glyph_is_accepted() {
     let font = DEFAULT_FONT;
     let (w, h) = (0..=font.height())
         .map(|margin| (font.width(), font.height() + 2 * margin))
-        .find(|&(w, h)| Console::new(MemSurface::new(w, h)).is_some())
+        .find(|&(w, h)| Console::with_font(MemSurface::new(w, h), font).is_some())
         .expect("no surface at all holds a single glyph");
 
-    let con = Console::new(MemSurface::new(w, h)).unwrap();
+    let con = Console::with_font(MemSurface::new(w, h), font).unwrap();
     assert_eq!((con.cols(), con.rows()), (1, 1));
-    assert!(Console::new(MemSurface::new(w, h - 1)).is_none(), "one pixel less must be refused");
+    assert!(
+        Console::with_font(MemSurface::new(w, h - 1), font).is_none(),
+        "one pixel less must be refused"
+    );
 }
 
 /// `flood` is the first thing a bring-up does: it proves the address, the pitch

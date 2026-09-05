@@ -33,6 +33,14 @@
 //! such a face has visibly uneven stems, which is the failure that makes
 //! outline fonts look wrong on a console and gets blamed on the font.
 //!
+//! **Fall back rather than wrap.** The default font's 12x24 cell is worth
+//! having wherever it fits, and on a small framebuffer it does not: the scale
+//! is already 1 and cannot go lower, so an XGA screen gets 78 columns and every
+//! long log line wraps. [`Console::new`] therefore *picks* — the 8x16
+//! [`font::SPLEEN`] whenever the default cannot reach 80 columns by 24 rows.
+//! See [`console::choose_font`](Console::choose_font); every other constructor
+//! names its font and takes no such decision.
+//!
 //! **Leave a margin.** Televisions overscan: they crop a few percent off every
 //! edge and show the rest, a habit inherited from analogue broadcast that HDMI
 //! never fully shook. Text drawn at `x = 0` can simply not be on the screen,
