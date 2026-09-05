@@ -25,11 +25,24 @@
 use akuma_net::socket::socket_const::SOCK_DGRAM;
 use akuma_net::socket::SocketAddrV4;
 
-/// QEMU usermode `-netdev user`'s fixed DNS proxy address — the same one
-/// `amd64/mkdisk.sh` writes into the guest's own `/etc/resolv.conf`
-/// (`nameserver 10.0.2.3`), and Firecracker's `net-setup.sh` dnsmasq answers
-/// on by the same convention.
-const DNS_SERVER: SocketAddrV4 = SocketAddrV4::new([10, 0, 2, 3], 53);
+/// The resolver to query: whatever the interface was brought up with.
+///
+/// This used to be a hardcoded `10, 0, 2, 3` — QEMU usermode `-netdev user`'s
+/// fixed DNS proxy, the address `amd64/mkdisk.sh` writes into the guest's
+/// `/etc/resolv.conf` and Firecracker's dnsmasq answers on. That is correct
+/// for every VMM target and **wrong for bare metal**, where nothing answers on
+/// `10.0.2.3`: `amd64/src/net.rs`'s `BARE_METAL_STATIC_V4` seeds the resolver
+/// as Cloudflare's `1.1.1.1` instead (or whatever an `ip=…,<dns>` boot token
+/// overrides it to). A hardcoded `10.0.2.3` here meant `hget`'s syscall-300
+/// DNS and `clock.rs`'s SNTP bootstrap both sent every query into a black hole
+/// on the HP box while musl userspace — which reads `/etc/resolv.conf` and
+/// falls through to `1.1.1.1` — resolved the same names fine.
+///
+/// `akuma_net::smoltcp_net::static_ipv4()` is the single source of truth the
+/// smoltcp DNS socket is also seeded from (`smoltcp_net::init`).
+fn dns_server() -> SocketAddrV4 {
+    SocketAddrV4::new(akuma_net::smoltcp_net::static_ipv4().dns, 53)
+}
 
 /// Largest query or response this client will build or accept. A hostname
 /// plus the fixed header/question/answer overhead comfortably fits; a bound
@@ -168,8 +181,9 @@ pub fn resolve_a(hostname: &str, timeout_us: u64) -> Option<[u8; 4]> {
     let id = crate::net::uptime_us() as u16;
     let len = build_query(id, hostname, &mut query_buf)?;
 
+    let server = dns_server();
     let idx = akuma_net::socket::alloc_socket(SOCK_DGRAM)?;
-    let send_query = || akuma_net::socket::socket_send_udp(idx, &query_buf[..len], DNS_SERVER).is_ok();
+    let send_query = || akuma_net::socket::socket_send_udp(idx, &query_buf[..len], server).is_ok();
 
     let result = if send_query() {
         let start = crate::net::uptime_us();

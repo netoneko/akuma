@@ -562,6 +562,18 @@ pub fn print_probe_line(now_us: u64, laps: u64) {
     } else {
         "pending"
     });
+    // The resolver `crate::dns::resolve_a` (hget's syscall 300, the SNTP
+    // bootstrap) actually sends to. It was hardcoded `10.0.2.3` until
+    // 2026-09-06 and silently black-holed every kernel-side DNS query on bare
+    // metal; showing it here is so a "DNS resolution failed" is one photograph
+    // from its cause.
+    serial::puts(" dns=");
+    for (i, o) in akuma_net::smoltcp_net::static_ipv4().dns.iter().enumerate() {
+        if i > 0 {
+            serial::puts(".");
+        }
+        serial::put_dec(u64::from(*o));
+    }
     serial::puts("\n");
 
     let (canary_lo, canary_hi) = akuma_net::smoltcp_net::canaries_intact();
@@ -777,6 +789,15 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
         "net: the built-in bare-metal address is 192.168.1.220",
         u64::from(u32::from_be_bytes(BARE_METAL_STATIC_V4.addr)),
         u64::from(u32::from_be_bytes([192, 168, 1, 220])),
+    );
+    // The bare-metal resolver must be a real public one, never the VMM proxy
+    // `10.0.2.3` — nothing answers on that address on a household LAN, and a
+    // `crate::dns::resolve_a` (hget's syscall 300, the SNTP bootstrap) that
+    // sends there black-holes every kernel-side query, which is exactly the
+    // regression that kept `date` at 1970 and `hget https://` failing on DNS.
+    t.check(
+        "net: the bare-metal resolver is not the VMM DNS proxy",
+        BARE_METAL_STATIC_V4.dns != [10, 0, 2, 3],
     );
 
     // A machine with no virtio-net device is legitimate — `DISK=none` under

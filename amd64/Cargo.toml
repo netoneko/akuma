@@ -7,6 +7,18 @@ description = "amd64 (x86_64) boot target: PVH -> long mode -> the arch-neutral 
 [lints]
 workspace = true
 
+[features]
+default = ["console-notify"]
+# `console_notify` — the Akuma-private syscall (322) a userspace program calls
+# to put a framed line straight on the framebuffer/serial console (`/bin/wall`).
+# On by default *for this target only*: the HP bare-metal reference box has a
+# display but no working keyboard, so a line on its screen is the one channel to
+# a person in front of it that is not the network. It is a write-to-console
+# primitive any userspace binary can reach, so it is a feature rather than
+# unconditional — a deployment that does not want userspace touching the console
+# builds `--no-default-features`.
+console-notify = []
+
 [dependencies]
 # Stage A of the amd64 bring-up: the kernel's own memory management, running on
 # x86_64. Both of these already built for `x86_64-unknown-none` before this

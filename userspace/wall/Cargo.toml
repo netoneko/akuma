@@ -1,0 +1,19 @@
+[package]
+name = "wall"
+version = "0.1.0"
+edition = "2021"
+
+# `wall` — print a message on the machine's own console.
+#
+# Not the Unix `wall(1)` (which writes to every logged-in tty): this target has
+# one console and no ttys. It is a thin front end for `libakuma::console_notify`,
+# the Akuma-private syscall that puts a framed line on the framebuffer/serial
+# console. The point is the amd64 bare-metal box — a screen, no working keyboard
+# — where a line on the display is the only way to say something to a person
+# standing in front of it without going over the network.
+[[bin]]
+name = "wall"
+path = "src/main.rs"
+
+[dependencies]
+libakuma = { path = "../libakuma" }

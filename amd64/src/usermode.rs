@@ -625,6 +625,12 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
     // `AKUMA_PRIVATE_BASE`), far above any allocated Linux number. Checking this
     // range first is what keeps a shell's keystroke poll from dispatching into
     // whatever Linux happens to have at 313 — `finit_module`, as it turns out.
+    /// How long a `resolve_host` may take before it gives up. Generous: a
+    /// cold cache on this target means a real UDP round trip to whatever
+    /// `/etc/resolv.conf`'s first reachable server is, and the alternative to
+    /// waiting is a program that reports "no such host" for a working name.
+    const DNS_TIMEOUT_US: u64 = 5_000_000;
+
     const AKUMA_PRIVATE_BASE: u64 = 0x1000;
     if nr >= AKUMA_PRIVATE_BASE {
         return match nr - AKUMA_PRIVATE_BASE {
@@ -632,6 +638,43 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             // argument (the PTY flag) is dropped by `syscall_entry` and this
             // target ignores it anyway (a pipe has no line discipline).
             301 => sys_spawn(a1, a2, a3, a4, a5),
+            // `resolve_host(name_ptr, name_len, out4)` — Akuma's own 300.
+            //
+            // Wired 2026-09-06 because `hget` (and anything else built on
+            // `libakuma-tls`) resolves through this, not through musl: it is a
+            // `no_std` binary with no resolver of its own. Without it, TLS on
+            // this target failed at `DNS resolution failed` while `busybox
+            // wget http://…` resolved the same name perfectly — because
+            // busybox is musl and goes out over UDP itself.
+            //
+            // The kernel already had the resolver; `clock.rs`'s SNTP bootstrap
+            // uses the same `dns::resolve_a`. Only the syscall was missing.
+            300 => {
+                // A hostname is passed as `(ptr, len)` and is **not**
+                // NUL-terminated, so `read_cstr` is the wrong tool — it would
+                // run past the end looking for a terminator that is not there.
+                const MAX_HOST: u64 = 255; // RFC 1035's limit on a domain name
+                if a2 == 0 || a2 > MAX_HOST {
+                    return errno::EINVAL;
+                }
+                let mut buf = [0u8; MAX_HOST as usize];
+                let n = a2 as usize;
+                if !crate::uaccess::read_bytes(a1, &mut buf[..n]) {
+                    return errno::EFAULT;
+                }
+                let Ok(name) = core::str::from_utf8(&buf[..n]) else {
+                    return errno::EINVAL;
+                };
+                let Some(ip) = crate::dns::resolve_a(name, DNS_TIMEOUT_US) else {
+                    // `EAI_FAIL`'s errno cousin: the name did not resolve. Not
+                    // `EFAULT` — the caller's pointers were fine.
+                    return errno::ENOENT;
+                };
+                if !crate::uaccess::write_bytes(a3, &ip) {
+                    return errno::EFAULT;
+                }
+                0
+            }
             313 => crate::fd::sys_poll_input_event(a1, a2, a3),
             303 => sys_waitpid(a1, a2, a3),
             // `uptime()` — microseconds since boot, matching
@@ -646,6 +689,45 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             // to a session's shell on teardown, and there is nothing here to
             // deliver a signal to, but failing the call makes it log an error.
             302 => 0,
+            // `console_notify(ptr, len)` — Akuma-private 322, feature
+            // `console-notify` (default-on for this target). Prints a
+            // caller-supplied line straight to the framebuffer/serial console,
+            // framed so it stands out in a scrolling boot log. The HP box has a
+            // screen and no keyboard, so this is how a program — or a person
+            // driving one over ssh — puts a word in front of whoever is watching
+            // that screen. `/bin/wall` is the userspace front end.
+            //
+            // Hard-capped at 512 bytes, and every byte below space (bar `\t`) is
+            // rendered as '.': the framebuffer console interprets some control
+            // bytes, and a careless or hostile caller should not be able to move
+            // its cursor or scroll it from here. A trailing '\n' the caller
+            // included is dropped — the framing adds its own.
+            #[cfg(feature = "console-notify")]
+            322 => {
+                const MAX_MSG: usize = 512;
+                let n = (a2 as usize).min(MAX_MSG);
+                if n == 0 {
+                    return errno::EINVAL;
+                }
+                let mut buf = [0u8; MAX_MSG];
+                if !crate::uaccess::read_bytes(a1, &mut buf[..n]) {
+                    return errno::EFAULT;
+                }
+                let mut end = n;
+                while end > 0 && (buf[end - 1] == b'\n' || buf[end - 1] == b'\r') {
+                    end -= 1;
+                }
+                for b in &mut buf[..end] {
+                    if (*b < 0x20 && *b != b'\t') || *b == 0x7f {
+                        *b = b'.';
+                    }
+                }
+                let msg = core::str::from_utf8(&buf[..end]).unwrap_or("<console_notify: not UTF-8>");
+                serial::puts("\n>>> ");
+                serial::puts(msg);
+                serial::puts(" <<<\n");
+                0
+            }
             _ => errno::ENOSYS,
         };
     }
@@ -2385,6 +2467,32 @@ pub fn spawn_test(t: &mut Suite) {
         "spawn: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
         free_before as u64,
+    );
+}
+
+/// The `console_notify` syscall (Akuma-private 322), the kernel half of
+/// `/bin/wall`. Only the argument-validation edges are checkable from here — a
+/// success needs a mapped user page this context does not have — but those edges
+/// are what pin the ABI `libakuma::console_notify` is written against: that the
+/// length is `a2`, that a zero length is `EINVAL` and a bad pointer is `EFAULT`,
+/// and that the number resolves at all rather than falling through to `ENOSYS`.
+#[cfg(feature = "console-notify")]
+pub fn console_notify_test(t: &mut Suite) {
+    use crate::fd::errno;
+    const NR: u64 = 0x1000 + 322;
+
+    t.check_eq(
+        "console_notify: a zero-length message is EINVAL",
+        syscall_dispatch(NR, 0, 0, 0, 0, 0),
+        errno::EINVAL,
+    );
+    // An unmapped low user address: the `rep movsb` user copy faults and
+    // `idt.rs`'s `user_copy_fixup` turns that into a returned error, exactly as
+    // it does for `resolve_host` and `spawn`'s argument reads.
+    t.check_eq(
+        "console_notify: an unreadable pointer is EFAULT",
+        syscall_dispatch(NR, 0x1000, 16, 0, 0, 0),
+        errno::EFAULT,
     );
 }
 

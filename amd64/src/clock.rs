@@ -131,12 +131,130 @@ const NTP_HOST: &str = "pool.ntp.org";
 /// seconds" only approximately, per this module's own header.
 const NTP_TIMEOUT_US: u64 = 5_000_000;
 
+/// Shorter budget for the [`sync_tick`] retries, which run *inside the netpoll
+/// daemon loop* — a 5 s stall there is 5 s of no `smoltcp_net::poll()`, which an
+/// ssh session in the middle of a transfer would feel. The boot one-shot has no
+/// such neighbour and keeps the longer budget.
+const RETRY_TIMEOUT_US: u64 = 2_500_000;
+
+/// How long [`sync_tick`] waits between attempts while the clock is still
+/// unset. Long enough that a genuinely offline machine is not burning a UDP
+/// socket and a DNS query every lap; short enough that a machine whose DHCP
+/// lease just arrived gets a clock within a few tens of seconds.
+const RETRY_INTERVAL_US: u64 = 15_000_000;
+
+/// The result of one SNTP attempt, recorded in [`LAST_OUTCOME`] so it can be
+/// read back — by the `netprobe` line, and by anyone asking the machine over
+/// ssh why `date` still says 1970.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// Not attempted yet.
+    Untried = 0,
+    /// Anchored — the clock is set.
+    Ok = 1,
+    /// [`NTP_HOST`] did not resolve (DNS server unreachable, or no route).
+    DnsFailed = 2,
+    /// No UDP socket free.
+    NoSocket = 3,
+    /// Resolved, but no valid SNTP reply came back inside the timeout.
+    NoReply = 4,
+}
+
+static LAST_OUTCOME: AtomicU64 = AtomicU64::new(0);
+static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+/// [`net::uptime_us`] before which [`sync_tick`] does nothing.
+static NEXT_RETRY_US: AtomicU64 = AtomicU64::new(0);
+
+/// The last SNTP attempt's outcome as `(outcome, attempt_count)` — for the
+/// `netprobe` line and for a future "why no clock" syscall.
+#[must_use]
+pub fn sync_status() -> (SyncOutcome, u64) {
+    let o = match LAST_OUTCOME.load(Ordering::Relaxed) {
+        1 => SyncOutcome::Ok,
+        2 => SyncOutcome::DnsFailed,
+        3 => SyncOutcome::NoSocket,
+        4 => SyncOutcome::NoReply,
+        _ => SyncOutcome::Untried,
+    };
+    (o, ATTEMPTS.load(Ordering::Relaxed))
+}
+
+/// Try SNTP once if the clock is not already set. Cheap to call every netpoll
+/// lap: it returns immediately when synced or when the retry interval has not
+/// elapsed. This is what makes the clock **set itself** even when the boot-time
+/// one-shot ([`sync_via_sntp`]) ran before DHCP finished or lost its datagram —
+/// "synced once at boot or never" was the old contract and it left the HP box
+/// at epoch 0 every time the lease was slow.
+pub fn sync_tick() {
+    if is_synced() {
+        return;
+    }
+    let now = crate::net::uptime_us();
+    if now < NEXT_RETRY_US.load(Ordering::Relaxed) {
+        return;
+    }
+    NEXT_RETRY_US.store(now + RETRY_INTERVAL_US, Ordering::Relaxed);
+    let outcome = attempt_sntp(RETRY_TIMEOUT_US);
+    report_outcome(outcome, "retry");
+}
+
 /// Best-effort: resolve [`NTP_HOST`], fetch the time once, and record it if
 /// it worked. Never fatal — this target booted with no clock at all for
 /// every stage before this one, and a network that cannot reach an NTP pool
 /// (no route, a captive/offline network, DNS blocked) is not a reason to
-/// fail the boot over. Called once from `main.rs`, after DHCP.
+/// fail the boot over. Called once from `main.rs`, after DHCP; [`sync_tick`]
+/// keeps trying afterwards if this did not land.
 pub fn sync_via_sntp() {
+    let outcome = attempt_sntp(NTP_TIMEOUT_US);
+    report_outcome(outcome, "boot");
+}
+
+/// Store the outcome and print one line. `ctx` is `"boot"` or `"retry"` so a
+/// console reader can see which path spoke.
+fn report_outcome(outcome: SyncOutcome, ctx: &str) {
+    LAST_OUTCOME.store(outcome as u64, Ordering::Relaxed);
+    ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    match outcome {
+        SyncOutcome::Ok => {
+            serial::puts("  clock: synced via SNTP (");
+            serial::puts(NTP_HOST);
+            serial::puts(", ");
+            serial::puts(ctx);
+            serial::puts(")\n");
+        }
+        SyncOutcome::DnsFailed => {
+            serial::puts("  clock: ");
+            serial::puts(ctx);
+            serial::puts(": could not resolve ");
+            serial::puts(NTP_HOST);
+            serial::puts(" via ");
+            for (i, o) in akuma_net::smoltcp_net::static_ipv4().dns.iter().enumerate() {
+                if i > 0 {
+                    serial::puts(".");
+                }
+                serial::put_dec(u64::from(*o));
+            }
+            serial::puts("\n");
+        }
+        SyncOutcome::NoSocket => {
+            serial::puts("  clock: ");
+            serial::puts(ctx);
+            serial::puts(": no socket free for SNTP\n");
+        }
+        SyncOutcome::NoReply => {
+            serial::puts("  clock: ");
+            serial::puts(ctx);
+            serial::puts(": SNTP round trip got no reply\n");
+        }
+        SyncOutcome::Untried => {}
+    }
+}
+
+/// One SNTP attempt. Resolves, opens a UDP socket, runs the shared
+/// send/poll/receive/timeout loop, and anchors the clock on success. Prints
+/// nothing — [`report_outcome`] owns the console line — so the boot and the
+/// retry paths format their own context.
+fn attempt_sntp(timeout_us: u64) -> SyncOutcome {
     // `sti`, explicitly. Measured 2026-09-05: at this exact point in boot —
     // after every process/spawn/execve/fork self-test, right after
     // `netpoll_selftest` — `RFLAGS.IF` is already `0`. Something in that
@@ -161,6 +279,13 @@ pub fn sync_via_sntp() {
     let Some(ip) = crate::dns::resolve_a(NTP_HOST, NTP_TIMEOUT_US) else {
         serial::puts("  clock: could not resolve ");
         serial::puts(NTP_HOST);
+        serial::puts(" via ");
+        for (i, o) in akuma_net::smoltcp_net::static_ipv4().dns.iter().enumerate() {
+            if i > 0 {
+                serial::puts(".");
+            }
+            serial::put_dec(u64::from(*o));
+        }
         serial::puts(" — no wall clock this boot\n");
         return;
     };

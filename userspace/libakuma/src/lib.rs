@@ -167,6 +167,10 @@ pub mod syscall {
         pub const RENAMEAT: u64 = 38;
         pub const GETRANDOM: u64 = 278;
         pub const RESOLVE_HOST: u64 = 300;
+        /// `console_notify` — put a line on the kernel console. Wired only on
+        /// the amd64 target (behind its `console-notify` feature); on AArch64
+        /// the number is reserved but the call returns `ENOSYS`.
+        pub const CONSOLE_NOTIFY: u64 = 322;
         pub const SPAWN: u64 = 301;
         pub const KILL: u64 = 302;
         pub const WAITPID: u64 = 303;
@@ -238,6 +242,10 @@ pub mod syscall {
         pub const RENAMEAT: u64 = 264;
         pub const GETRANDOM: u64 = 318;
         pub const RESOLVE_HOST: u64 = AKUMA_PRIVATE_BASE + 300;
+        /// `console_notify` — put a line straight on the framebuffer/serial
+        /// console. Wired on this target behind the kernel's `console-notify`
+        /// feature (default-on); `/bin/wall` is the front end.
+        pub const CONSOLE_NOTIFY: u64 = AKUMA_PRIVATE_BASE + 322;
         pub const SPAWN: u64 = AKUMA_PRIVATE_BASE + 301;
         pub const KILL: u64 = AKUMA_PRIVATE_BASE + 302;
         pub const WAITPID: u64 = AKUMA_PRIVATE_BASE + 303;
@@ -1095,6 +1103,31 @@ pub fn resolve_host(hostname: &str) -> Result<[u8; 4], i32> {
         Err((-ret) as i32)
     } else {
         Ok(result)
+    }
+}
+
+/// Print a line straight to the kernel console (framebuffer and/or serial).
+///
+/// This is a `wall`-style broadcast, not a write to this process's stdout: it
+/// reaches whoever is watching the machine's own screen, which on the amd64
+/// bare-metal box (a display, no working keyboard) is the only local channel
+/// there is. The kernel frames the message and strips control bytes; at most
+/// 512 bytes are taken.
+///
+/// Returns `Err(ENOSYS)` on a kernel built without the `console-notify` feature
+/// (every target but amd64, today).
+pub fn console_notify(msg: &str) -> Result<(), i32> {
+    let ret = syscall(
+        syscall::CONSOLE_NOTIFY,
+        msg.as_ptr() as u64,
+        msg.len() as u64,
+        0, 0, 0, 0,
+    ) as i64;
+
+    if ret < 0 {
+        Err((-ret) as i32)
+    } else {
+        Ok(())
     }
 }
 

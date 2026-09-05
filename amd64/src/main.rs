@@ -309,6 +309,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     usermode::elf_test(&mut t);
     usermode::fdprobe_test(&mut t);
     usermode::spawn_test(&mut t);
+    #[cfg(feature = "console-notify")]
+    usermode::console_notify_test(&mut t);
     usermode::busybox_test(&mut t);
     usermode::execve_test(&mut t);
     // `strace` on the command line traces the fork test's syscalls too — the one
