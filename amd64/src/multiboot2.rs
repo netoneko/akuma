@@ -463,7 +463,18 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     if !want_usb {
         t.note("xhci: not requested (pass `usb` or `root=/dev/sda1`)", 0);
     }
+    // Counted separately, and deliberately not allowed to condemn the boot.
+    //
+    // USB here is an **opt-in peripheral the kernel already falls back from**:
+    // `root=/dev/sda1` reverts to the RAM image on any probe failure, and `usb`
+    // does not touch the root at all. Folding its failure into the verdict makes
+    // `run_shell = passed && have_fs` withhold sshd — which is the only way to
+    // read the `[xhci] ..` breadcrumbs that say *why* the bring-up failed, on a
+    // machine whose console is a television with no scrollback. A failing USB
+    // driver taking away the tool for debugging the USB driver is backwards.
+    let failures_before_usb = t.failed();
     crate::xhci::smoke_test(&mut t, have_xhci);
+    let usb_failures = t.failed() - failures_before_usb;
 
     // `net`/`sock` run on the loopback-only stack — enough to prove
     // `socket(AF_INET)`, `bind`, `listen`.
@@ -543,7 +554,16 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         serial::puts("Akuma/amd64 - SELF-TESTS FAILED\n");
     }
 
-    boot_to_init(&info, have_net, passed && have_fs);
+    // The shell is withheld when the *kernel* failed its own tests, not when an
+    // optional peripheral did — see the note beside `usb_failures` above.
+    let kernel_ok = t.failed() == usb_failures;
+    if !passed && kernel_ok {
+        serial::puts(
+            "Akuma/amd64 - the only failures are USB; starting init anyway \
+             (grep the log for `[xhci]`)\n",
+        );
+    }
+    boot_to_init(&info, have_net, kernel_ok && have_fs);
 
     // Keep driving the scheduler as long as there is a network stack behind it:
     // the netpoll daemon is what answers ARP and ICMP and services a listening

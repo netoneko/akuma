@@ -73,11 +73,33 @@ fn dec(v: u64, buf: &mut [u8; NUM_BUF]) -> &str {
     core::str::from_utf8(&buf[..n]).unwrap_or("?")
 }
 
+/// How many failed check names [`Suite::report`] repeats back.
+///
+/// A suite that fails more than this has a systemic problem the first few
+/// names already describe, so the cost of a bigger array buys nothing. Sixteen
+/// `&'static str` is 256 bytes on the caller's stack, which is what makes this
+/// affordable in a kernel that runs its suite on the boot stack.
+pub const MAX_RECORDED_FAILURES: usize = 16;
+
 /// A named group of checks with a pass/fail tally.
 pub struct Suite {
     name: &'static str,
     passed: u32,
     failed: u32,
+    /// The names of the first [`MAX_RECORDED_FAILURES`] failures, so the
+    /// verdict can repeat them.
+    ///
+    /// A `[FAIL]` is printed the moment it happens, which is enough on a
+    /// terminal you can scroll. The amd64 bare-metal target's only console is a
+    /// framebuffer on a television: 200 checks scroll the two that failed off
+    /// the top long before the verdict appears, and the machine cannot start
+    /// sshd to serve `dmesg` *because* the suite failed. The tally then says
+    /// exactly how many things are wrong and nothing about which, and the next
+    /// step is photographing a screen mid-boot. Names are recorded rather than
+    /// formatted anywhere: `&'static str` costs a pointer pair and no
+    /// allocation, on a path that must work when the allocator is what broke.
+    failures: [&'static str; MAX_RECORDED_FAILURES],
+    recorded: usize,
     emit: fn(&str),
 }
 
@@ -89,7 +111,18 @@ impl Suite {
             name,
             passed: 0,
             failed: 0,
+            failures: [""; MAX_RECORDED_FAILURES],
+            recorded: 0,
             emit,
+        }
+    }
+
+    /// Count a failure and remember its name while there is room.
+    fn fail(&mut self, what: &'static str) {
+        self.failed += 1;
+        if self.recorded < MAX_RECORDED_FAILURES {
+            self.failures[self.recorded] = what;
+            self.recorded += 1;
         }
     }
 
@@ -98,14 +131,14 @@ impl Suite {
     }
 
     /// Record a check. Returns `ok`, so a caller can bail out on failure.
-    pub fn check(&mut self, what: &str, ok: bool) -> bool {
+    pub fn check(&mut self, what: &'static str, ok: bool) -> bool {
         self.put("  ");
         self.put(what);
         if ok {
             self.passed += 1;
             self.put("   [OK]\n");
         } else {
-            self.failed += 1;
+            self.fail(what);
             self.put("   [FAIL]\n");
         }
         ok
@@ -118,7 +151,7 @@ impl Suite {
     /// exited with `0x37` instead of `0x0b`, the *value* was the diagnosis —
     /// 0x37 is 55, the length of the message it had just written, which named
     /// the bug immediately.
-    pub fn check_eq(&mut self, what: &str, got: u64, want: u64) -> bool {
+    pub fn check_eq(&mut self, what: &'static str, got: u64, want: u64) -> bool {
         let ok = got == want;
         self.put("  ");
         self.put(what);
@@ -126,7 +159,7 @@ impl Suite {
             self.passed += 1;
             self.put("   [OK]\n");
         } else {
-            self.failed += 1;
+            self.fail(what);
             let mut g = [0u8; NUM_BUF];
             let mut w = [0u8; NUM_BUF];
             self.put("   [FAIL] got ");
@@ -176,6 +209,23 @@ impl Suite {
         self.put(" passed, ");
         self.put(dec(u64::from(self.failed), &mut f));
         self.put(self.if_failed(" FAILED\n", " failed\n"));
+
+        // Repeat the failures under the tally. On a console you can scroll this
+        // is redundant with the `[FAIL]` already printed; on the one console
+        // that matters here — a framebuffer with no scrollback, on a machine
+        // that will not start sshd precisely because the suite failed — it is
+        // the only place the names are still on screen when the boot stops.
+        for name in &self.failures[..self.recorded] {
+            self.put("  FAILED: ");
+            self.put(name);
+            self.put("\n");
+        }
+        if self.failed as usize > self.recorded {
+            let mut m = [0u8; NUM_BUF];
+            self.put("  ... and ");
+            self.put(dec(u64::from(self.failed) - self.recorded as u64, &mut m));
+            self.put(" more\n");
+        }
         self.failed == 0
     }
 
@@ -260,5 +310,43 @@ mod tests {
         assert_eq!(hex(u64::MAX, &mut b), "0xffffffffffffffff");
         assert_eq!(dec(0, &mut b), "0");
         assert_eq!(dec(u64::MAX, &mut b), "18446744073709551615");
+    }
+
+    /// The verdict must name what failed, not just how many did.
+    ///
+    /// The regression this pins is not hypothetical: an amd64 bare-metal boot
+    /// reported `200 passed, 2 FAILED` on a framebuffer console with no
+    /// scrollback, and identifying the two cost a round of photographing the
+    /// screen mid-boot.
+    #[test]
+    fn report_names_the_failures() {
+        let _g = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = taken();
+        let mut s = Suite::new("suite", emit);
+        s.check("first thing", true);
+        s.check("the broken thing", false);
+        s.check_eq("the wrong value", 0x37, 0x0b);
+        assert!(!s.report());
+
+        let out = taken();
+        assert!(out.contains("FAILED: the broken thing"), "{out}");
+        assert!(out.contains("FAILED: the wrong value"), "{out}");
+        assert!(!out.contains("FAILED: first thing"), "a passing check was named: {out}");
+    }
+
+    /// More failures than the array holds: the overflow is counted, not lost.
+    #[test]
+    fn report_summarises_failures_past_the_cap() {
+        let _g = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = taken();
+        let mut s = Suite::new("suite", emit);
+        for _ in 0..MAX_RECORDED_FAILURES + 3 {
+            s.check("a failing check", false);
+        }
+        assert!(!s.report());
+
+        let out = taken();
+        assert_eq!(out.matches("FAILED: a failing check").count(), MAX_RECORDED_FAILURES);
+        assert!(out.contains("... and 3 more"), "{out}");
     }
 }
