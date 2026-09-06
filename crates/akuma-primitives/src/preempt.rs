@@ -53,7 +53,20 @@ use crate::safe_print;
 /// `akuma_exec::threading::types::MAX_THREADS` re-exports this so the two can
 /// never disagree — they were independent literals with a "must match" comment
 /// once, and on 2026-08-04 raising only one silently did nothing.
-#[cfg(not(kernel_profile_extreme))]
+///
+/// **512 on x86_64**, and that is a target-specific number rather than a
+/// tidier universal one. `amd64/src/sched.rs` raised its own table 96 → 512 on
+/// 2026-09-06 against a measurement: on the bare-metal reference box a real
+/// session runs dozens of commands, every command is a slot and `fork` takes a
+/// second, so 96 was a few minutes of work before `spawn` returned `None` and
+/// the shell reported `Out of memory` with 1.5 GB free. Folding that scheduler
+/// into `akuma-threading` must not walk that back to 256 — the cost is
+/// `.bss` for the per-slot arrays, which that target has, and the benefit is
+/// the ceiling a `cargo -j4` self-host needs (cargo, four `rustc`s, and every
+/// child each hold slots at once).
+#[cfg(all(not(kernel_profile_extreme), target_arch = "x86_64"))]
+pub const MAX_THREADS: usize = 512;
+#[cfg(all(not(kernel_profile_extreme), not(target_arch = "x86_64")))]
 pub const MAX_THREADS: usize = 256;
 #[cfg(kernel_profile_extreme)]
 pub const MAX_THREADS: usize = 64;

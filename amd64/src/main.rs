@@ -193,6 +193,22 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     serial::puts("  smep: ");
     serial::puts(if smap.cpuid_smep { "on\n" } else { "off (CPUID lacks SMEP)\n" });
 
+    // The scheduler, before anything can yield into it.
+    //
+    // This used to live inside `sched::smoke_test`, which was safe only while
+    // `sched` owned its own thread table: a `yield_now` before it ran found an
+    // empty table and returned harmlessly. Since the scheduler is
+    // `akuma-threading` (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md` A1) the same
+    // call would `require()` an unregistered `X86ArchHooks` and panic — and the
+    // network bring-up below yields. Registration is once-only, so this is the
+    // single call site.
+    //
+    // Placed here because it needs exactly three things, all of which are up:
+    // `smp::init_bsp` (the per-CPU block), `idt::init` (a fault here should be
+    // reportable), and a live `CR3` to record as the kernel root. It allocates
+    // nothing, so it does not need the heap.
+    sched::init();
+
     // The trampoline's identity map has done its job: the kernel is executing
     // from its high linked address, its stack is in the physmap, and both
     // descriptor tables are now high. Dropping it hands the lower half to

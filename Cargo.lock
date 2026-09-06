@@ -110,6 +110,7 @@ dependencies = [
  "akuma-syscalls-poll",
  "akuma-syscalls-sync",
  "akuma-terminal",
+ "akuma-threading",
  "akuma-usb",
  "akuma-usb-storage",
  "akuma-user-access",

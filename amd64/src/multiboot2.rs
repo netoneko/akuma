@@ -320,6 +320,13 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     crate::smp::init_bsp();
     crate::idt::init();
     let smap = crate::uaccess::init_smap();
+
+    // The scheduler, before anything can yield into it — the same call, at the
+    // same point, as the PVH path's `kmain`. Registration with
+    // `akuma-threading` is once-only and each of these two entry points runs
+    // exactly one of them, so this is not a double registration.
+    crate::sched::init();
+
     crate::paging::drop_identity_map();
 
     // The machine, as multiboot2 describes it.

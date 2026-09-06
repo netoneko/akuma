@@ -1016,7 +1016,6 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 // `wait4_wake_all` reaching an armed, registered task is that
                 // something. Registering *after* asking would reopen the window
                 // this ordering exists to close.
-                crate::sched::prepare_block();
                 wait4_register(me);
                 // 0 = a matching child exists but has not exited; anything else
                 // is a reaped pid or `-ESRCH`.

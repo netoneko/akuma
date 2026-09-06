@@ -177,6 +177,15 @@ akuma-syscalls-sync = { path = "../crates/akuma-syscalls-sync" }
 # first arch-neutral crate on this target whose *mechanism* had to be built
 # here rather than ported (`docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md`).
 akuma-user-access = { path = "../crates/akuma-user-access" }
+# The scheduler. `amd64/src/sched.rs` was an independent one until 2026-09-07 —
+# its own thread table, states, context switch, picker and park/wake — which
+# meant this target ran a second, weaker copy of a state machine this crate had
+# already hardened against a decade of AArch64 incidents (slot generations,
+# CAS'd state transitions). `sched.rs` is now the machine half only: the CR3,
+# TSS, MSR, `fxsave` and lock-depth effects the scheduler is not allowed to
+# know about, registered as `X86ArchHooks`.
+# `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` calls this A1.
+akuma-threading = { path = "../crates/akuma-threading" }
 
 [[bin]]
 name = "akuma-amd64"

@@ -310,7 +310,6 @@ pub fn read_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
                 // Arm before asking. A write landing between the question and
                 // the park then finds `wake_pending` to set, and the park is a
                 // no-op instead of a missed event.
-                crate::sched::prepare_block();
                 if !crate::pipe::check_set_reader(pipe_id) {
                     crate::sched::block_current();
                 }
@@ -345,7 +344,6 @@ pub fn write_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
         // reader goes away — `check_set_writer` reports that second case as
         // "do not block", because a pipe with no readers never gains room and
         // the retry above is what turns it into `EPIPE`.
-        crate::sched::prepare_block();
         if !crate::pipe::check_set_writer(pipe_id) {
             crate::sched::block_current();
         }
@@ -1484,7 +1482,6 @@ pub fn sys_poll_input_event(buf: u64, len: u64, _timeout_us: u64) -> u64 {
                     // A park, not a yield: an interactive shell waiting on a
                     // keystroke is the longest wait in this kernel and used to
                     // be its busiest loop.
-                    crate::sched::prepare_block();
                     if !crate::pipe::check_set_reader(pipe_id) {
                         crate::sched::block_current();
                     }

@@ -173,7 +173,6 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
         // wake: the table says "gone" a moment too late and the scheduler was
         // never told. Armed first, that wake sets `wake_pending` and the park
         // below returns at once.
-        crate::sched::prepare_block();
         // Without this the deadline below is unreachable whenever every other
         // runnable task is also spinning in the kernel: `uptime_us` is the
         // LAPIC tick counter, a syscall runs with `IF` clear, and only the idle

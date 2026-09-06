@@ -1341,7 +1341,24 @@ fn set_current_thread_register(tid: usize) {
     sync::load_thread_tag_to_core(bkl::current_core_id(), tid);
 }
 
-#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+/// x86_64: the identity lives in the target's per-CPU block, and the switch
+/// already publishes it through [`X86ArchHooks::set_current_slot`] before
+/// handing the stack over. Forwarded here too so the two spellings cannot
+/// disagree — every AArch64 path that re-points the current thread has an
+/// x86 counterpart that must do the same, and a silent no-op is how
+/// `get_current_thread_register` came to read 0 for every thread.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[inline]
+fn set_current_thread_register(tid: usize) {
+    if let Some(h) = X86_ARCH_HOOKS.get() {
+        (h.set_current_slot)(tid);
+    }
+}
+
+#[cfg(not(any(
+    all(target_os = "none", target_arch = "aarch64"),
+    all(target_os = "none", target_arch = "x86_64")
+)))]
 #[inline]
 fn set_current_thread_register(_tid: usize) {}
 
@@ -1354,6 +1371,25 @@ fn set_current_thread_register(_tid: usize) {}
 /// re-points the per-core BKL attribution cache, which is scheduler business.
 #[inline]
 fn get_current_thread_register() -> usize {
+    // x86_64 has no per-thread register free for this. `current_tid` reads
+    // `TPIDRRO_EL0`, which `akuma-cpu` correctly stubs to answer **0** off
+    // AArch64 — so every thread on this target read as "thread 0", and
+    // `schedule_blocking` parked the *boot* thread instead of its caller.
+    // Caught by `amd64`'s own park self-test the first boot after the fold:
+    // "the worker is parked" [FAIL] while the worker ran merrily on.
+    //
+    // The identity lives in the target's per-CPU block instead (`%gs`), which
+    // is what [`X86ArchHooks::current_slot`] reads. `.get()` rather than
+    // `require()`: this is called from diagnostics that can run before
+    // registration, and answering 0 there is the same answer the register gave.
+    #[cfg(target_arch = "x86_64")]
+    {
+        return match X86_ARCH_HOOKS.get() {
+            Some(h) => (h.current_slot)(),
+            None => IDLE_THREAD_IDX,
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     akuma_primitives::preempt::current_tid()
 }
 
@@ -2593,56 +2629,420 @@ fn x86_build_closure_context(stack_top: usize, trampoline: fn(*mut ()) -> !, clo
 /// match; this mirrors `amd64::sched::yield_now`'s own plain scan instead,
 /// which is exactly what a single-core, cooperative-only switch needs.
 #[cfg(target_arch = "x86_64")]
-fn x86_pick_next(from: usize) -> Option<usize> {
+fn x86_pick_next(from: usize, hooks: X86ArchHooks) -> Option<usize> {
     for step in 1..=MAX_THREADS {
         let candidate = (from + step) % MAX_THREADS;
         let state = THREAD_STATES[candidate].load(Ordering::Acquire);
-        if state == thread_state::READY || state == thread_state::RUNNING {
-            return Some(candidate);
+        if state != thread_state::READY && state != thread_state::RUNNING {
+            continue;
+        }
+        // Not already executing on some other core — two cores must never
+        // resume one stack — and allowed here: the boot thread is pinned to the
+        // boot core, and each idle thread to its own, which `can_run` answers.
+        if ON_CPU[candidate].load(Ordering::Acquire) != 0 {
+            continue;
+        }
+        if !(hooks.can_run)(candidate) {
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+/// The machine effects the x86_64 scheduler cannot perform itself.
+///
+/// # Why hooks and not code in this crate
+///
+/// Everything here is per-core CPU state that only the *target* knows how to
+/// touch: `CR3`, the ring-3 trap stack in the TSS, the `IA32_FS_BASE`/`GS_BASE`
+/// MSRs, the `fxsave` area, the Big Kernel Lock's recursion depth, and which
+/// slot this core is currently running. On AArch64 the equivalents are welded
+/// into the SGI trampoline because there is exactly one kernel that uses them;
+/// on x86_64 there is exactly one too (`amd64/`), and the difference is that
+/// this crate must keep building for `aarch64-unknown-none` without naming any
+/// of it.
+///
+/// The split is the same one [`ThreadRuntime`] and [`ProcessHooks`] already
+/// make — the scheduler decides, the caller performs — applied to the layer
+/// below them rather than the layer above.
+///
+/// Registered once by `amd64::sched::init` via [`register_x86_arch_hooks`].
+/// **Every field is load-bearing on a switch**; a missing one is not a
+/// degraded scheduler but a corrupt one, which is why this is a struct with no
+/// defaults rather than a set of optional setters.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+pub struct X86ArchHooks {
+    /// Install `to`'s machine state on this core, called **immediately before**
+    /// the stack switch and with `from` still current.
+    ///
+    /// The order matters and belongs to the caller: `CR3` must be written
+    /// before the switch (every address space shares the kernel's upper half,
+    /// so the stack stays mapped across it), and the `fxsave` of `from` must
+    /// happen before the `fxrstor` of `to`.
+    pub switch_to: fn(from: usize, to: usize),
+    /// The slot this core is running.
+    ///
+    /// Not a `static` in this crate: with SMP there is one per core, and the
+    /// target already keeps a per-CPU block (`%gs` on x86_64). A single static
+    /// here is what limited the previous version of this path to one core.
+    pub current_slot: fn() -> usize,
+    /// Record the slot this core is now running. Called by the switch, before
+    /// it hands the stack over.
+    pub set_current_slot: fn(usize),
+    /// The slot this core runs when nothing else can run: its idle thread.
+    ///
+    /// Consulted only when the running thread *cannot continue* (it parked, or
+    /// it finished) and the picker found nothing. A core must always have
+    /// somewhere to go.
+    pub idle_slot: fn() -> usize,
+    /// May this core run `slot`? Pinning — the boot thread is pinned to the
+    /// boot core and every idle thread to its own.
+    pub can_run: fn(slot: usize) -> bool,
+    /// Hand the kernel lock's recursion depth from the outgoing thread to the
+    /// incoming one. The lock itself stays with the core across a switch; only
+    /// the depth is per-thread.
+    pub transfer_lock_depth: fn(from: usize, to: usize),
+    /// Open a one-instruction interrupt window, then mask again.
+    ///
+    /// The clock is the timer tick, a syscall runs with `IF` clear, and the
+    /// only place the scheduler re-enables it is an idle loop the picker
+    /// reaches only when nothing else is runnable. So a thread parked with a
+    /// deadline, on a core whose other threads are all also in the kernel,
+    /// would wait on a **frozen clock** — measured on this target 2026-09-06,
+    /// where a 400 ms `FUTEX_WAIT` never returned. This is the escape.
+    ///
+    /// It is emphatically **not** `akuma_cpu::park::wfi`, which is `hlt` on
+    /// x86_64: halting with interrupts masked halts forever.
+    pub allow_tick: fn(),
+}
+
+#[cfg(target_arch = "x86_64")]
+static X86_ARCH_HOOKS: Registered<X86ArchHooks> =
+    Registered::new("akuma-threading: X86ArchHooks not registered — call amd64::sched::init()");
+
+/// Register the x86_64 machine effects. Called once, early, from
+/// `amd64::sched::init` — before any thread but the boot thread exists.
+#[cfg(target_arch = "x86_64")]
+pub fn register_x86_arch_hooks(h: X86ArchHooks) {
+    X86_ARCH_HOOKS.register(h);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn arch() -> X86ArchHooks {
+    X86_ARCH_HOOKS.require()
+}
+
+// ── the x86_64 spawn/adopt surface `amd64/src/sched.rs` schedules through ──
+//
+// AArch64 reaches the thread table through `spawn_fn`/`spawn_system_thread_fn`,
+// which box a closure and build a fake IRQ-return frame. x86_64 needs neither:
+// `amd64`'s entries are plain `extern "C" fn() -> !` with their per-thread data
+// in a side table, and its switch is a function call. These are the narrow,
+// allocation-free equivalents — claim, seed, publish — with the same state
+// machine underneath, so both architectures share `THREAD_STATES`,
+// `WAKE_TIMES`, `WOKEN_STATES`, `ON_CPU` and the wake/park discipline built on
+// them rather than each keeping its own.
+
+/// Adapter from this crate's boxed-closure entry convention to a plain
+/// `extern "C" fn() -> !`.
+///
+/// Lets [`x86_seed_entry`] reuse [`x86_build_closure_context`] verbatim rather
+/// than growing a second frame builder: the "closure pointer" is simply the
+/// function pointer, and there is nothing to free. Allocation-free, which
+/// matters because this is on the spawn path of every process a shell runs.
+#[cfg(target_arch = "x86_64")]
+fn x86_plain_entry_trampoline(entry: *mut ()) -> ! {
+    // SAFETY: `x86_seed_entry` is the only producer of this pointer and it only
+    // ever passes an `extern "C" fn() -> !`.
+    let f: extern "C" fn() -> ! = unsafe { core::mem::transmute(entry) };
+    f()
+}
+
+/// Register the thread this core is already executing as `slot`.
+///
+/// The boot thread on the boot core, and each secondary's idle thread: contexts
+/// that exist before the scheduler does, and whose [`Context`] is filled in by
+/// the first switch *away* from them rather than by a seed.
+///
+/// `ON_CPU` is latched here, not later: the thread is running right now, and a
+/// peer core that picked it up between this call and its first switch would
+/// resume a stack that is in use.
+#[cfg(target_arch = "x86_64")]
+pub fn x86_adopt_running_thread(slot: usize) {
+    if slot >= MAX_THREADS {
+        return;
+    }
+    THREAD_STATES[slot].store(thread_state::RUNNING, Ordering::SeqCst);
+    ON_CPU[slot].store(1, Ordering::SeqCst);
+    WAKE_TIMES[slot].store(0, Ordering::SeqCst);
+    WOKEN_STATES[slot].store(false, Ordering::SeqCst);
+    // No generation bump: an adopted thread is a boot or idle thread, and
+    // [`SLOT_GEN`]'s own contract is that slots which never recycle stay at
+    // generation 0 forever, so a handle minted for one always validates.
+}
+
+/// Claim a slot and leave it [`thread_state::INITIALIZING`] — visible to
+/// nothing until [`x86_publish`].
+///
+/// The gap between claiming and publishing is not an implementation detail, it
+/// is the point: `amd64` has been bitten twice by a task becoming schedulable
+/// before its caller had finished describing it (a `space_root` still 0, so the
+/// first `sysret` fetched an unmapped entry point; a `PROCS` index not yet
+/// seeded). With a second core the window is not a tick wide but zero
+/// instructions wide.
+///
+/// Returns `None` when every slot is taken. Slots are reused: a `TERMINATED`
+/// one that no core is executing is as good as a `FREE` one, which is what
+/// stops [`MAX_THREADS`] being a ceiling on the number of processes a boot may
+/// ever run rather than on how many are alive at once.
+#[cfg(target_arch = "x86_64")]
+pub fn x86_claim_slot() -> Option<usize> {
+    for slot in 1..MAX_THREADS {
+        let state = THREAD_STATES[slot].load(Ordering::Acquire);
+        let reusable = state == thread_state::FREE
+            || (state == thread_state::TERMINATED && ON_CPU[slot].load(Ordering::Acquire) == 0);
+        if !reusable {
+            continue;
+        }
+        if THREAD_STATES[slot]
+            .compare_exchange(
+                state,
+                thread_state::INITIALIZING,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            // A recycled slot must not inherit the previous occupant's wait
+            // state: an armed `WOKEN_STATES` would make this thread's first
+            // park a no-op, and a stale `WAKE_TIMES` would release it early.
+            WAKE_TIMES[slot].store(0, Ordering::SeqCst);
+            WOKEN_STATES[slot].store(false, Ordering::SeqCst);
+            ON_CPU[slot].store(0, Ordering::SeqCst);
+            // The generation is what makes a `WakeHandle` for the *previous*
+            // occupant inert. Bumped here — under the winning CAS, before
+            // anything can hold a handle to the new occupant — which is the
+            // same "exactly one bumper per rebirth" rule `scrub_thread_slot`
+            // follows on the AArch64 claim paths. Without it a futex or pipe
+            // waiter that outlived its thread would spend its wake on whoever
+            // inherits the slot.
+            SLOT_GEN[slot].fetch_add(1, Ordering::AcqRel);
+            return Some(slot);
         }
     }
     None
 }
 
-/// The running thread's slot, for the x86_64 switch path only.
+/// Build `slot`'s initial context so the first switch into it enters `entry`.
 ///
-/// Deliberately not [`current_thread_id`]/`akuma_primitives::preempt::current_tid`:
-/// that reads `TPIDRRO_EL0`, a register `akuma-cpu` correctly stubs to always
-/// answer `0` off `aarch64` (`docs/archive/AKUMA_MMU_TARGET_ARCH_GATE_FIX.md`'s
-/// sibling fix, `preempt.rs`) — every thread would misread as "thread 0" if
-/// this path used it. x86_64 has no per-thread register free for the same
-/// trick without also claiming `IA32_FS_BASE`/`GS_BASE` (which
-/// `amd64/src/usermode.rs` already needs for userspace TLS), so this is a
-/// plain static, matching `amd64::sched`'s own `CURRENT` — correct only for
-/// the single-core, no-SMP scope this pass covers.
+/// `stack_top` is the caller's: on this target `amd64` owns thread stacks (it
+/// leaks them lazily per slot and reuses them on recycle), where AArch64 takes
+/// them from the crate's own PMM-backed pool. The scheduler does not care which
+/// — it only needs somewhere to push a frame.
 #[cfg(target_arch = "x86_64")]
-static X86_CURRENT_THREAD: AtomicUsize = AtomicUsize::new(IDLE_THREAD_IDX);
-
-/// The x86_64 cooperative switch: called from [`yield_now`]'s x86_64 arm.
-///
-/// No-op if nothing else is `READY`/`RUNNING` — a lone thread calling this in
-/// a loop must make progress rather than deadlock against itself, same as
-/// `amd64::sched::yield_now`.
-#[cfg(target_arch = "x86_64")]
-fn x86_yield_now() {
-    let cur = X86_CURRENT_THREAD.load(Ordering::Acquire);
-    let Some(next) = x86_pick_next(cur) else { return };
-    if next == cur {
+pub fn x86_seed_entry(slot: usize, stack_top: usize, entry: extern "C" fn() -> !) {
+    if slot >= MAX_THREADS {
         return;
     }
-    if THREAD_STATES[cur].load(Ordering::Acquire) == thread_state::RUNNING {
-        THREAD_STATES[cur].store(thread_state::READY, Ordering::Release);
+    // SAFETY: the slot is INITIALIZING, so no picker can select it and no
+    // switch can be reading its context concurrently.
+    unsafe {
+        *get_context_mut(slot) = x86_build_closure_context(
+            stack_top,
+            x86_plain_entry_trampoline,
+            entry as *const () as *mut (),
+        );
     }
+}
+
+/// Make an [`x86_claim_slot`] slot schedulable.
+///
+/// Separate from claiming so that forgetting it is a thread that never runs —
+/// loud — rather than one that runs too early.
+#[cfg(target_arch = "x86_64")]
+pub fn x86_publish(slot: usize) {
+    if slot < MAX_THREADS {
+        THREAD_STATES[slot].store(thread_state::READY, Ordering::Release);
+    }
+}
+
+/// Release a claimed slot that will never be published.
+///
+/// `TERMINATED`, not `FREE`: on this target a slot owns stacks its next
+/// occupant reuses, and the difference is visible to the caller's own
+/// bookkeeping. [`x86_claim_slot`] treats the two alike.
+#[cfg(target_arch = "x86_64")]
+pub fn x86_abandon(slot: usize) {
+    if slot < MAX_THREADS {
+        THREAD_STATES[slot].store(thread_state::TERMINATED, Ordering::Release);
+    }
+}
+
+/// Mark the running thread terminated and switch away for good.
+///
+/// Never returns: the picker only takes `READY`/`RUNNING`, so once the state is
+/// published this thread is never chosen again. The loop exists because
+/// [`yield_now`] can legitimately decline to switch (nothing else runnable yet)
+/// and this thread must not run on regardless.
+#[cfg(target_arch = "x86_64")]
+pub fn x86_finish_current() -> ! {
+    let slot = (arch().current_slot)();
+    THREAD_STATES[slot].store(thread_state::TERMINATED, Ordering::SeqCst);
+    WAKE_TIMES[slot].store(0, Ordering::SeqCst);
+    loop {
+        yield_now();
+        (arch().allow_tick)();
+    }
+}
+
+/// Is `slot` occupied by a thread that could still run?
+///
+/// `INITIALIZING`, `READY`, `RUNNING` and `WAITING` are all alive; `FREE` and
+/// `TERMINATED` are not. Asked as "alive", not "not `READY`" — a thread parked
+/// on a pipe is as live as one spinning on it, and the boot's drive loop must
+/// not mistake the two.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn x86_slot_is_live(slot: usize) -> bool {
+    slot < MAX_THREADS
+        && !matches!(
+            THREAD_STATES[slot].load(Ordering::Acquire),
+            thread_state::FREE | thread_state::TERMINATED
+        )
+}
+
+/// Is `slot` parked in [`schedule_blocking`]? For diagnostics and self-tests.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn x86_slot_is_waiting(slot: usize) -> bool {
+    slot < MAX_THREADS && THREAD_STATES[slot].load(Ordering::Acquire) == thread_state::WAITING
+}
+
+/// Hand this core to another runnable thread; `true` if a switch happened.
+///
+/// The public face of the x86_64 cooperative switch, for the one caller that
+/// needs the answer rather than just the effect: a core's idle loop, which must
+/// `hlt` when the picker found nothing and must **not** when it did.
+/// [`yield_now`] is the arch-neutral spelling and discards it.
+#[cfg(target_arch = "x86_64")]
+pub fn x86_yield() -> bool {
+    x86_yield_now()
+}
+
+/// Ready every `WAITING` thread whose wake deadline has passed.
+///
+/// The x86_64 counterpart of the wake-pass at the top of
+/// [`ThreadPool::schedule_indices`], and it exists for the same reason: nothing
+/// else moves a thread out of `WAITING` when its timeout — rather than a waker
+/// — is what should release it. Without this, [`schedule_blocking`] with a
+/// deadline parks forever on this target, and every timed `futex` wait,
+/// `nanosleep` and `poll` timeout built on it hangs.
+///
+/// **CAS, not store**, for the reason the AArch64 pass documents at length: a
+/// lock-free [`ThreadWaker::wake`], or a cross-thread kill's `TERMINATED`, can
+/// land between the load and the write, and an unconditional `READY` store
+/// would overwrite it — resurrecting a thread that was killed, or stamping
+/// `READY` onto a half-written slot. `WAKE_TIMES` is cleared only after a
+/// transition this core owns.
+#[cfg(target_arch = "x86_64")]
+fn x86_wake_pass() {
+    let now = (runtime().uptime_us)();
+    for i in 0..MAX_THREADS {
+        if THREAD_STATES[i].load(Ordering::SeqCst) != thread_state::WAITING {
+            continue;
+        }
+        let wake_time = WAKE_TIMES[i].load(Ordering::SeqCst);
+        if wake_time == 0 || now < wake_time {
+            continue;
+        }
+        if THREAD_STATES[i]
+            .compare_exchange(
+                thread_state::WAITING,
+                thread_state::READY,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            WAKE_TIMES[i].store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The x86_64 cooperative switch: called from [`yield_now`]'s x86_64 arm and
+/// from [`schedule_blocking`]'s.
+///
+/// Returns whether a switch actually happened, which
+/// [`schedule_blocking`] needs: a parked thread that could not be switched away
+/// from has to do something other than call this again immediately.
+///
+/// A no-op when the running thread is still runnable and there is nothing else
+/// — a lone thread calling this in a loop must make progress rather than
+/// deadlock against itself. When the running thread **cannot** continue (it
+/// parked, or it terminated) and there is nothing else, this core's idle thread
+/// takes over; a core must always have somewhere to go.
+///
+/// `ON_CPU` is what keeps two cores off one stack. It is cleared for the
+/// outgoing thread before the switch, but no other core can observe that until
+/// this core releases the kernel lock, which the incoming thread does only
+/// after the switch has completed.
+#[cfg(target_arch = "x86_64")]
+fn x86_yield_now() -> bool {
+    // Before the pick, not after: a thread whose deadline just passed has to be
+    // a candidate for *this* scan, or a core with nothing else runnable parks
+    // and the timeout is served a tick late at best.
+    x86_wake_pass();
+
+    let hooks = arch();
+    let cur = (hooks.current_slot)();
+    let cur_runnable = matches!(
+        THREAD_STATES[cur].load(Ordering::Acquire),
+        thread_state::RUNNING | thread_state::READY
+    );
+
+    let next = match x86_pick_next(cur, hooks) {
+        Some(n) if n != cur => n,
+        // Nothing to switch to and this thread can carry on.
+        _ if cur_runnable => return false,
+        _ => {
+            // It cannot carry on and there is nothing else: go idle. If this
+            // core's idle thread IS the caller, there is nowhere to go and the
+            // caller must handle that — see `schedule_blocking`'s x86 arm.
+            let idle = (hooks.idle_slot)();
+            if idle == cur {
+                return false;
+            }
+            idle
+        }
+    };
+
+    // Only demote a thread that is actually running. A WAITING or TERMINATED
+    // one keeps its state — that is the whole reason it is being switched out.
+    let _ = THREAD_STATES[cur].compare_exchange(
+        thread_state::RUNNING,
+        thread_state::READY,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    );
     THREAD_STATES[next].store(thread_state::RUNNING, Ordering::Release);
-    X86_CURRENT_THREAD.store(next, Ordering::Release);
+    ON_CPU[cur].store(0, Ordering::Release);
+    ON_CPU[next].store(1, Ordering::Release);
+    (hooks.transfer_lock_depth)(cur, next);
+    (hooks.set_current_slot)(next);
+    // Every machine effect, with `cur` still current and before the stack moves.
+    (hooks.switch_to)(cur, next);
+
     // SAFETY: `cur`/`next` are both valid slot indices (`x86_pick_next` only
-    // returns in-range candidates), neither is concurrently switched from
-    // anywhere else on this single-core, cooperative-only path, and `next`'s
-    // context was built either by `x86_build_closure_context` or by a
-    // previous call to this same function.
+    // returns in-range candidates), `ON_CPU` above is what stops another core
+    // resuming `next` concurrently, and `next`'s context was built either by
+    // `x86_build_closure_context` or by a previous call to this same function.
     unsafe {
         x86_switch_context(get_context_mut(cur), get_context(next));
     }
+    true
 }
 
 /// Set up a fake IRQ frame on a new thread's stack
@@ -4578,10 +4978,25 @@ pub fn schedule_blocking(wake_time_us: u64) {
     // (device IRQs drive reschedules) but on a secondary two cooperating threads (the
     // rump sysproxy client↔server pipe hop) have NO IRQ between them, so every hop was
     // tick-bound (~10 ms). A voluntary SGI bypasses the preemption-disabled guard too.
-    voluntary_schedule_flag().store(true, Ordering::Release);
-    (runtime().trigger_sgi)(0);
+    #[cfg(target_arch = "aarch64")]
+    {
+        voluntary_schedule_flag().store(true, Ordering::Release);
+        (runtime().trigger_sgi)(0);
+    }
 
-    // Wait for timer to preempt us and for scheduler to wake us
+    // Wait for the scheduler to wake us.
+    //
+    // The two architectures reach that wait completely differently and the
+    // difference is not cosmetic:
+    //
+    // - **AArch64** has an interrupt-driven scheduler. The SGI above asks for a
+    //   switch, the timer IRQ arrives within a tick regardless, and `wfi` is
+    //   the right way to spend the interval.
+    // - **x86_64** has neither. There is no SGI, the switch is a plain
+    //   function call, and `akuma_cpu::park::wfi` is `hlt` on this target —
+    //   which, executed inside a syscall (interrupts masked by `IA32_FMASK`),
+    //   halts the core forever. So the x86 arm *is* the switch: hand the CPU
+    //   over, and re-test each time we are resumed.
     loop {
         // Double check sticky wake flag in loop
         if WOKEN_STATES[tid].swap(false, Ordering::SeqCst) {
@@ -4607,9 +5022,25 @@ pub fn schedule_blocking(wake_time_us: u64) {
             resume_running_unless_terminated(tid);
             break;
         }
-        
+
         // Wait for interrupt - timer IRQ will fire within 10ms
+        #[cfg(target_arch = "aarch64")]
         akuma_cpu::park::wfi();
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // We are WAITING, so `x86_pick_next` skips us: this hands the core
+            // to someone else and returns only once a waker, the wake-pass, or
+            // a kill has readied us again.
+            if !x86_yield_now() {
+                // Nothing else could take the core, and this core's idle thread
+                // is the caller. Not a hang and not a spin either: open one
+                // interrupt window so the tick lands and the clock — and
+                // therefore every deadline, including our own — keeps moving.
+                // The loop then re-tests. See `X86ArchHooks::allow_tick`.
+                (arch().allow_tick)();
+            }
+        }
     }
 
     // Restore preemption state
