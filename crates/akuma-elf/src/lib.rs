@@ -149,10 +149,13 @@ pub mod types;
 
 mod interp;
 mod load;
+pub mod pages;
 mod source;
 mod stack;
 
 pub use types::*;
+
+pub use pages::{SegProt, UserPages};
 
 pub use load::{LoadedElf, load_elf, load_elf_from_path};
 pub use stack::{

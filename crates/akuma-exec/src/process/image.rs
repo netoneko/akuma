@@ -81,7 +81,7 @@ impl ImageSource<'_> {
         args: &[String],
         env: &[String],
         interp_prefix: Option<&str>,
-    ) -> Result<LoadedWithStack, ElfError> {
+    ) -> Result<LoadedWithStack<akuma_mmu::UserAddressSpace>, ElfError> {
         let stack_size = config().user_stack_size;
         match *self {
             Self::Bytes(data) => {

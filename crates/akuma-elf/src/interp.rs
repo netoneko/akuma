@@ -11,7 +11,7 @@ use alloc::string::String;
 
 use elf::abi::{EM_AARCH64, PT_LOAD};
 
-use akuma_mmu::UserAddressSpace;
+use crate::pages::UserPages;
 
 use super::load::{apply_relocations, map_segment_eager};
 use super::source::{ElfSource, parse_headers};
@@ -45,10 +45,10 @@ fn resolve_interp_path(ipath: &str, prefix: Option<&str>) -> String {
 /// immediately), keeping peak heap use under 10 KB regardless of interpreter
 /// size. Every other profile can afford the slurp and prefers it, because one
 /// large sequential read beats hundreds of 4 KB ones.
-pub(super) fn load_interp_for(
+pub(super) fn load_interp_for<A: UserPages>(
     ipath: &str,
     prefix: Option<&str>,
-    address_space: &mut UserAddressSpace,
+    address_space: &mut A,
 ) -> Result<InterpInfo, ElfError> {
     let resolved = resolve_interp_path(ipath, prefix);
     if DEBUG_ELF_LOADING {
@@ -90,9 +90,9 @@ pub(super) fn load_interp_for(
 }
 
 /// Map the interpreter at `INTERP_BASE` and relocate it so it can self-bootstrap.
-fn load_interpreter(
+fn load_interpreter<A: UserPages>(
     src: ElfSource<'_>,
-    address_space: &mut UserAddressSpace,
+    address_space: &mut A,
 ) -> Result<InterpInfo, ElfError> {
     let headers = parse_headers(src)?;
 

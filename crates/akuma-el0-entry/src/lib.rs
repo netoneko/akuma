@@ -34,7 +34,7 @@
 #![cfg_attr(not(test), no_std)]
 
 use akuma_exec_core::process::UserContext;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use akuma_primitives::safe_print;
 
 /// [`enter_user_mode`], with the one check that makes it safe to call.
@@ -52,7 +52,7 @@ use akuma_primitives::safe_print;
 /// here the old image is already gone, so there is nothing to fall back to. It
 /// halts the core with the offending value named, the same choice
 /// `akuma_primitives::preempt::current_tid` makes for a corrupt `TPIDRRO_EL0`.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn enter_user_mode_checked(ctx: &UserContext) -> ! {
     const SPSR_M_MASK: u64 = 0b1111;
     const SPSR_M_EL0T: u64 = 0b0000;
@@ -73,7 +73,7 @@ pub fn enter_user_mode_checked(ctx: &UserContext) -> ! {
     unsafe { enter_user_mode(ctx) }
 }
 
-#[cfg(not(target_os = "none"))]
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 pub fn enter_user_mode_checked(_ctx: &UserContext) -> ! {
     panic!("enter_user_mode_checked on a host build")
 }
@@ -87,7 +87,7 @@ pub fn enter_user_mode_checked(_ctx: &UserContext) -> ! {
 /// `ctx.spsr` must target EL0 (`M[3:0] == 0b0000`). See the crate-level contract;
 /// callers that cannot prove it statically must go through
 /// [`enter_user_mode_checked`].
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
 pub unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
     // Tripwire for the SMP=4 mixed-EL corruption: refuse silence if this EL0 entry
@@ -184,7 +184,7 @@ pub unsafe fn enter_user_mode(ctx: &UserContext) -> ! {
 ///
 /// # Safety
 /// Never satisfiable off bare metal: this always panics.
-#[cfg(not(target_os = "none"))]
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 pub unsafe fn enter_user_mode(_ctx: &UserContext) -> ! {
     panic!("not on bare metal")
 }

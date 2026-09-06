@@ -4,8 +4,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use akuma_mmap::{PAGE_SIZE, span, user_flags};
-use akuma_mmu::UserAddressSpace;
+use akuma_mmap::{PAGE_SIZE, span};
+use crate::pages::{SegProt, UserPages, alloc_page};
 
 use super::load::{LoadedElf, load_elf, load_elf_from_path};
 use super::types::{AuxEntry, DEBUG_ELF_LOADING, DeferredLazySegment, ElfError, auxv};
@@ -17,11 +17,11 @@ use super::types::{AuxEntry, DEBUG_ELF_LOADING, DeferredLazySegment, ElfError, a
 /// the same wide `let (a, b, c, d, e, f, g, h) = …` destructure, which is a large
 /// part of why the four `ProcessImage` entry points were so hard to diff against
 /// each other (Phase 2b).
-pub struct LoadedWithStack {
+pub struct LoadedWithStack<A: UserPages> {
     /// Where execution starts: the interpreter's entry point for a dynamically
     /// linked image, the image's own for a static one.
     pub entry_point: usize,
-    pub address_space: UserAddressSpace,
+    pub address_space: A,
     /// Initial SP, pointing at the argc/argv/envp/auxv block.
     pub sp: usize,
     /// Initial program break — the page-aligned end of the loaded image.
@@ -45,14 +45,14 @@ pub struct LoadedWithStack {
 /// [`UserAddressSpace::write_page_bytes`], where `&mut self` on the address space
 /// is a real exclusivity proof — a `PhysFrame` value is not, since
 /// `PhysFrame::new` is safe and anyone can make one.
-pub struct UserStack<'a> {
+pub struct UserStack<'a, A: UserPages> {
     pub stack_bottom: usize,
     pub stack_top: usize,
     pub sp: usize,
-    address_space: &'a mut UserAddressSpace,
+    address_space: &'a mut A,
 }
 
-impl<'a> UserStack<'a> {
+impl<'a, A: UserPages> UserStack<'a, A> {
     /// Copy `bytes` into the stack starting at virtual address `va`.
     ///
     /// Splits across frames via [`span::PageChunks`], so no write crosses a page.
@@ -76,7 +76,7 @@ impl<'a> UserStack<'a> {
     pub fn new(
         stack_bottom: usize,
         stack_top: usize,
-        address_space: &'a mut UserAddressSpace,
+        address_space: &'a mut A,
     ) -> Self {
         Self { stack_bottom, stack_top, sp: stack_top, address_space }
     }
@@ -118,8 +118,8 @@ impl<'a> UserStack<'a> {
     }
 }
 
-pub fn setup_linux_stack(
-    stack: &mut UserStack<'_>,
+pub fn setup_linux_stack<A: UserPages>(
+    stack: &mut UserStack<'_, A>,
     args: &[String],
     env: &[String],
     auxv: &[AuxEntry],
@@ -221,24 +221,24 @@ fn compute_stack_top(brk: usize, has_interp: bool) -> usize {
     core::cmp::min(aligned, MAX_STACK_TOP)
 }
 
-pub fn load_elf_with_stack(
+pub fn load_elf_with_stack<A: UserPages>(
     elf_data: &[u8],
     args: &[String],
     env: &[String],
     stack_size: usize,
     interp_prefix: Option<&str>,
-) -> Result<LoadedWithStack, ElfError> {
+) -> Result<LoadedWithStack<A>, ElfError> {
     attach_stack(load_elf(elf_data, interp_prefix)?, args, env, stack_size)
 }
 
-pub fn load_elf_with_stack_from_path(
+pub fn load_elf_with_stack_from_path<A: UserPages>(
     path: &str,
     file_size: usize,
     args: &[String],
     env: &[String],
     stack_size: usize,
     interp_prefix: Option<&str>,
-) -> Result<LoadedWithStack, ElfError> {
+) -> Result<LoadedWithStack<A>, ElfError> {
     attach_stack(
         load_elf_from_path(path, file_size, interp_prefix)?,
         args,
@@ -248,12 +248,12 @@ pub fn load_elf_with_stack_from_path(
 }
 
 /// Give a loaded image its initial stack, auxv and heap pre-allocation.
-fn attach_stack(
-    mut loaded: LoadedElf,
+fn attach_stack<A: UserPages>(
+    mut loaded: LoadedElf<A>,
     args: &[String],
     env: &[String],
     stack_size: usize,
-) -> Result<LoadedWithStack, ElfError> {
+) -> Result<LoadedWithStack<A>, ElfError> {
     let has_interp = loaded.interp.is_some();
     let stack_top = compute_stack_top(loaded.brk, has_interp);
     let mmap_floor = if has_interp { 0x3010_0000 } else { 0 };
@@ -264,10 +264,7 @@ fn attach_stack(
 
     for i in 0..stack_pages {
         let page_va = stack_bottom + i * PAGE_SIZE;
-        loaded
-            .address_space
-            .alloc_and_map(page_va, user_flags::RW_NO_EXEC)
-            .map_err(ElfError::MappingFailed)?;
+        alloc_page(&mut loaded.address_space, page_va, SegProt::Data)?;
     }
 
     let mut stack = UserStack::new(stack_bottom, stack_top, &mut loaded.address_space);
@@ -301,7 +298,7 @@ fn attach_stack(
 
     let hs = (loaded.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     for i in 0..16 {
-        let _ = loaded.address_space.alloc_and_map(hs + i * 0x1000, user_flags::RW_NO_EXEC);
+        let _ = loaded.address_space.alloc_and_map(hs + i * 0x1000, SegProt::Data);
     }
 
     if DEBUG_ELF_LOADING {

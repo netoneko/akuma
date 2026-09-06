@@ -15,11 +15,11 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use elf::abi::{EM_AARCH64, ET_DYN, ET_EXEC, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
+use elf::abi::{ET_DYN, ET_EXEC, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
 use elf::segment::ProgramHeader;
 
 use akuma_mmap::{PAGE_SIZE, span, user_flags};
-use akuma_mmu::UserAddressSpace;
+use crate::pages::{SegProt, UserPages, alloc_page};
 
 use super::interp::load_interp_for;
 use super::source::{ElfHeaders, ElfSource, parse_headers};
@@ -32,9 +32,9 @@ use super::types::{
 const PIE_BASE: usize = 0x1000_0000;
 
 /// Result of loading an ELF binary
-pub struct LoadedElf {
+pub struct LoadedElf<A: UserPages> {
     pub entry_point: usize,
-    pub address_space: UserAddressSpace,
+    pub address_space: A,
     pub brk: usize,
     pub phdr_addr: usize,
     pub phnum: usize,
@@ -64,7 +64,10 @@ pub(super) enum MapStrategy<'a> {
 /// Load an ELF binary from memory.
 /// `interp_prefix` is prepended to the PT_INTERP path when loading the dynamic
 /// linker (used for container rootfs where the interpreter lives under a prefix).
-pub fn load_elf(elf_data: &[u8], interp_prefix: Option<&str>) -> Result<LoadedElf, ElfError> {
+pub fn load_elf<A: UserPages>(
+    elf_data: &[u8],
+    interp_prefix: Option<&str>,
+) -> Result<LoadedElf<A>, ElfError> {
     load_image(ElfSource::Bytes(elf_data), &MapStrategy::Eager, interp_prefix)
 }
 
@@ -72,11 +75,11 @@ pub fn load_elf(elf_data: &[u8], interp_prefix: Option<&str>) -> Result<LoadedEl
 /// lazy region instead of buffering the file or its segments.
 /// Supports PIE (ET_DYN) and non-PIE (ET_EXEC) without relocations — the pages
 /// do not exist yet, so there is nothing to relocate.
-pub fn load_elf_from_path(
+pub fn load_elf_from_path<A: UserPages>(
     path: &str,
     file_size: usize,
     interp_prefix: Option<&str>,
-) -> Result<LoadedElf, ElfError> {
+) -> Result<LoadedElf<A>, ElfError> {
     let (mount_id, inode) = (crate::vfs().resolve_file_id)(path).unwrap_or((0, 0));
 
     if DEBUG_ELF_LOADING {
@@ -95,16 +98,34 @@ pub fn load_elf_from_path(
     )
 }
 
+/// The `e_machine` this kernel can actually execute.
+///
+/// Selected by the *build's* architecture, not hard-coded. It read
+/// `EM_AARCH64` unconditionally, which was true while there was one kernel and
+/// became a trap the moment this crate compiled for x86_64: the loader would
+/// have built cleanly and then refused **every** binary it was asked to load,
+/// with `WrongArchitecture` — a correct-looking error for a bug that is
+/// entirely in the kernel.
+///
+/// A `cfg` rather than a `UserPages` associated constant on purpose: which
+/// binaries a kernel can run is a property of the CPU it was compiled for, not
+/// of how it happens to allocate pages, and threading it through the trait
+/// would let the two disagree.
+#[cfg(target_arch = "aarch64")]
+const EM_NATIVE: u16 = elf::abi::EM_AARCH64;
+#[cfg(target_arch = "x86_64")]
+const EM_NATIVE: u16 = elf::abi::EM_X86_64;
+
 /// The single ELF load path, shared by every entry point above.
-fn load_image(
+fn load_image<A: UserPages>(
     src: ElfSource<'_>,
     strategy: &MapStrategy<'_>,
     interp_prefix: Option<&str>,
-) -> Result<LoadedElf, ElfError> {
+) -> Result<LoadedElf<A>, ElfError> {
     let headers = parse_headers(src)?;
     let ehdr = headers.ehdr;
 
-    if ehdr.e_machine != EM_AARCH64 {
+    if ehdr.e_machine != EM_NATIVE {
         return Err(ElfError::WrongArchitecture);
     }
 
@@ -123,7 +144,7 @@ fn load_image(
         return Err(ElfError::InvalidFormat("No program headers"));
     }
 
-    let mut address_space = UserAddressSpace::new().ok_or(ElfError::AddressSpaceFailed)?;
+    let mut address_space = A::new_space().ok_or(ElfError::AddressSpaceFailed)?;
     let mut brk: usize = 0;
     let mut phdr_addr: usize = 0;
 
@@ -205,7 +226,7 @@ fn load_image(
                 deferred_segments.push(DeferredLazySegment {
                     start_va: start_page,
                     size: end_page - start_page,
-                    page_flags: segment_page_flags(phdr.p_flags),
+                    page_flags: segment_prot(phdr.p_flags).to_user_flags(),
                     file_source: Some(FileSegmentSource {
                         path: String::from(path),
                         mount_id,
@@ -273,11 +294,11 @@ fn load_image(
 
 /// Page permissions for a PT_LOAD segment. Writable segments are never
 /// executable and vice versa — W^X, regardless of what `p_flags` asks for.
-pub(super) fn segment_page_flags(p_flags: u32) -> u64 {
+pub(super) fn segment_prot(p_flags: u32) -> SegProt {
     if (p_flags & PF_X) != 0 {
-        user_flags::RX
+        SegProt::Code
     } else {
-        user_flags::RW_NO_EXEC
+        SegProt::Data
     }
 }
 
@@ -304,9 +325,9 @@ fn log_segment(what: &str, vaddr: usize, filesz: usize, memsz: usize, flags: u32
 /// takes `base` rather than assuming zero. Reads go through `ElfSource`, so the
 /// same code serves an in-heap image (borrowed sub-slices, no copy) and a file
 /// on disk (one 4 KB-or-less scratch buffer per page, freed immediately).
-pub(super) fn map_segment_eager(
+pub(super) fn map_segment_eager<A: UserPages>(
     src: ElfSource<'_>,
-    address_space: &mut UserAddressSpace,
+    address_space: &mut A,
     base: usize,
     phdr: &ProgramHeader,
     mapped_pages: &mut BTreeMap<usize, usize>,
@@ -315,7 +336,7 @@ pub(super) fn map_segment_eager(
     let memsz = phdr.p_memsz as usize;
     let filesz = phdr.p_filesz as usize;
     let offset = phdr.p_offset as usize;
-    let page_flags = segment_page_flags(phdr.p_flags);
+    let prot = segment_prot(phdr.p_flags);
 
     // Page span and per-page copy window are `akuma_mmap::span`'s, and host-tested
     // there — see that module's header for why arithmetic next to a raw write is
@@ -326,10 +347,8 @@ pub(super) fn map_segment_eager(
         let page_va = start_page + i * PAGE_SIZE;
 
         if let alloc::collections::btree_map::Entry::Vacant(e) = mapped_pages.entry(page_va) {
-            let frame = address_space
-                .alloc_and_map(page_va, page_flags)
-                .map_err(ElfError::MappingFailed)?;
-            e.insert(frame.addr);
+            let frame_pa = alloc_page(address_space, page_va, prot)?;
+            e.insert(frame_pa);
         }
 
         // `None` means the page holds no file bytes: it is past `filesz` and so
@@ -365,11 +384,11 @@ pub(super) fn map_segment_eager(
 /// checked against this — 118 files carrying 2,832 relocations, zero symbol-less
 /// ABS64/GLOB_DAT/JUMP_SLOT and zero out-of-range symbol indices — so the rule
 /// changes nothing on real input.
-pub(super) fn apply_relocations(
+pub(super) fn apply_relocations<A: UserPages>(
     src: ElfSource<'_>,
     headers: &ElfHeaders<'_>,
     base: usize,
-    address_space: &mut UserAddressSpace,
+    address_space: &mut A,
     mapped_pages: &BTreeMap<usize, usize>,
 ) -> Result<usize, ElfError> {
     let shdr_bytes = headers.read_section_header_bytes(src)?;
