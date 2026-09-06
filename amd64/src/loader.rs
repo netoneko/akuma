@@ -171,7 +171,19 @@ pub type FrameSet = akuma_user_space::FrameLedger;
 /// give back, and freeing per count is a double free.
 pub fn free_all_frames(ledger: &FrameSet) {
     for (pa, _vas) in ledger.take_user_frames() {
-        akuma_pmm::free_page(pa, 0);
+        // **Decrement, do not free.** Since `fork` shares pages copy-on-write,
+        // a frame in this ledger may still be mapped by a sibling. Only the
+        // last address space to let go owns the free, and that is exactly what
+        // `cow_ref_dec` reports — an untracked frame answers `true`, because
+        // the PMM defines untracked as a single owner, so an unshared process
+        // frees everything it holds exactly as before.
+        //
+        // Getting this wrong is a use-after-free that surfaces nowhere near the
+        // exit that caused it: the surviving process keeps reading a page the
+        // allocator has handed to someone else.
+        if akuma_pmm::cow_ref_dec(pa) {
+            akuma_pmm::free_page(pa, 0);
+        }
     }
 }
 
@@ -234,6 +246,8 @@ const fn segment_prot(p_flags: u32) -> Prot {
         write: p_flags & PF_W != 0,
         exec: p_flags & PF_X != 0,
         user: true,
+        // A freshly loaded image shares nothing. `fork` is what marks pages.
+        cow: false,
     }
 }
 
@@ -245,7 +259,17 @@ const fn segment_prot(p_flags: u32) -> Prot {
 /// the over-permitting case that actually matters — W+X — is refused outright by
 /// the caller.
 const fn widen(a: Prot, b: Prot) -> Prot {
-    Prot { write: a.write || b.write, exec: a.exec || b.exec, user: a.user || b.user }
+    Prot {
+        write: a.write || b.write,
+        exec: a.exec || b.exec,
+        user: a.user || b.user,
+        // Deliberately **not** the union: `cow` is a marker, not a permission,
+        // and `segment_prot` never sets it, so both inputs are always false
+        // here. Widening it would be meaningless — a CoW page is by definition
+        // not writable, so "the permissions needed to satisfy both" cannot
+        // include it.
+        cow: false,
+    }
 }
 
 /// Copy `src` into `space` at virtual address `va`, page by page.

@@ -408,6 +408,24 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
         }
     }
 
+    // Copy-on-write. A write from ring 3 to a **present** page: bit 0 set
+    // (protection, not absence), bit 1 set (write), bit 2 set (user).
+    //
+    // Placed after demand paging and before the user-copy fixup, and both
+    // orderings are deliberate. A lazy page must be *populated* before anyone
+    // asks whether it is shared. And a `copy_to_user` landing on a CoW page is
+    // a legitimate write the kernel should break the sharing for, not an
+    // `EFAULT` to hand back — sending it to the fixup would make `read(2)` into
+    // a forked child's buffer fail with no explanation.
+    const PF_PRESENT: u64 = 1 << 0;
+    const PF_WRITE: u64 = 1 << 1;
+    const PF_USER: u64 = 1 << 2;
+    if code & (PF_PRESENT | PF_WRITE | PF_USER) == (PF_PRESENT | PF_WRITE | PF_USER)
+        && cow_write_fault(addr)
+    {
+        return;
+    }
+
     if let Some(fixup) = akuma_user_access::user_copy_fixup(pf.frame.rip) {
         COPY_FIXUPS.fetch_add(1, Ordering::Relaxed);
         pf.frame.rip = fixup;
@@ -419,6 +437,105 @@ extern "C" fn page_fault_dispatch(frame: *mut PageFaultFrame) {
     }
     fatal("#PF page fault", &pf.frame, Some(code));
 }
+
+/// Break copy-on-write sharing for the page containing `addr`.
+///
+/// Returns `true` when the faulting instruction can be re-executed. `false`
+/// falls through to the ordinary fatal path, which is right for a write to a
+/// page that is read-only on purpose and for an out-of-memory copy alike — in
+/// both cases the write genuinely cannot be allowed to proceed.
+///
+/// The **decision** is `akuma_cow`, host-tested and shared with the AArch64
+/// kernel; everything here is the mechanism. Reading the live PTE rather than
+/// trusting the fault's error code is part of that contract: see
+/// [`akuma_cow::CowFault::pte_writable`].
+fn cow_write_fault(addr: u64) -> bool {
+    use akuma_cow::{CowAction, CowFault};
+
+    let page = (addr as usize) & !0xfff;
+    let root = paging::active_root();
+    let Some(prot) = paging::prot_in(root, page) else {
+        return false; // not mapped — not a CoW break
+    };
+    if !prot.user {
+        return false; // a kernel page; ring 3 had no business writing it
+    }
+    let Some(pa) = paging::translate_in(root, page) else {
+        return false;
+    };
+    let pa = (pa & !0xfff) as usize;
+
+    let action = CowFault {
+        pte_writable: prot.write,
+        marked: prot.cow,
+        refs: akuma_pmm::cow_ref_get(pa),
+    }
+    .decide();
+
+    match action {
+        // Someone repaired the page between the trap and here. Nothing to do —
+        // and killing the process would be the spurious-SIGSEGV bug.
+        CowAction::Retry => {
+            COW_RETRIES.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        CowAction::Fault => false,
+        // Sole owner: clear the marker and grant the write. No allocation, no
+        // copy, no memory pressure — and this is the common case, because a
+        // `fork` child usually `execve`s and leaves the parent alone with
+        // everything.
+        CowAction::TakeInPlace => {
+            let writable = Prot { write: true, cow: false, ..prot };
+            if !paging::map_page_in(root, page, pa as u64, writable, MemAttr::WriteBack) {
+                return false;
+            }
+            // The frame stops being shared, so drop this address space's claim
+            // on the share count. `cow_ref_dec` reports whether we now own the
+            // free; we do not free — we are still mapping it — so the answer is
+            // deliberately discarded, and the page is simply ours outright.
+            let _ = akuma_pmm::cow_ref_dec(pa);
+            COW_TAKEN.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        // Genuinely shared: private copy.
+        CowAction::Copy => {
+            let Some(fresh) = akuma_pmm::alloc_page() else {
+                return false; // OOM: fall through to the fatal path
+            };
+            // SAFETY: both frames are live PMM pages reached through the
+            // physmap, and exactly one page is copied. The destination is not
+            // published in any page table until the `map_page_in` below.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_ptr::<u8>(pa as u64),
+                    phys_ptr::<u8>(fresh as u64),
+                    4096,
+                );
+            }
+            let writable = Prot { write: true, cow: false, ..prot };
+            if !paging::map_page_in(root, page, fresh as u64, writable, MemAttr::WriteBack) {
+                akuma_pmm::free_page(fresh, 0);
+                return false;
+            }
+            // The old frame loses this address space. Only the last holder
+            // frees it — the whole point of the count.
+            if akuma_pmm::cow_ref_dec(pa) {
+                akuma_pmm::free_page(pa, 0);
+            }
+            // The private copy is tracked by this process's ledger so teardown
+            // gives it back; the frame it replaced was removed from the ledger
+            // by the same call that decremented above.
+            crate::usermode::cow_swap_frame(pa, fresh);
+            COW_COPIES.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+}
+
+/// Copy-on-write outcome counters, reported by the boot self-tests.
+pub static COW_COPIES: AtomicU64 = AtomicU64::new(0);
+pub static COW_TAKEN: AtomicU64 = AtomicU64::new(0);
+pub static COW_RETRIES: AtomicU64 = AtomicU64::new(0);
 
 /// A fault taken **in ring 3**: report it and kill the process, not the core.
 ///

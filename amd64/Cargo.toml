@@ -123,6 +123,12 @@ akuma-procfs = { path = "../crates/akuma-procfs" }
 akuma-user-space = { path = "../crates/akuma-user-space" }
 # `PhysFrame`, the ledger's currency.
 akuma-mmap = { path = "../crates/akuma-mmap" }
+# The copy-on-write write-fault decision — four outcomes from (live PTE, CoW
+# marker, share count), host-tested. Shared with the AArch64 kernel so both
+# distinguish "already repaired", "read-only on purpose", "sole owner" and
+# "genuinely shared" the same way; each of those four is a real incident in this
+# tree, and getting one wrong is silent in every direction.
+akuma-cow = { path = "../crates/akuma-cow" }
 # The console line discipline: canonical mode, echo, backspace, Ctrl+D, and
 # `map_cr_to_nl`. Hand-rolling a console reader hits the CR-vs-NL bug on the
 # first Enter keypress; this crate is the tree's answer and is dependency-free.

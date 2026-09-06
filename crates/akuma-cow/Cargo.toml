@@ -1,0 +1,10 @@
+[package]
+name = "akuma-cow"
+version = "0.1.0"
+edition = "2024"
+description = "The copy-on-write write-fault decision: given a fault, a PTE and a share count, what should happen."
+
+[lints]
+workspace = true
+
+[dependencies]

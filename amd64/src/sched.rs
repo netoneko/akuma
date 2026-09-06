@@ -284,6 +284,15 @@ struct Task {
     /// Stack the CPU switches to when this task traps from ring 3. Per-task
     /// since Stage J; see `gdt::set_kernel_stack`.
     trap_stack_top: u64,
+    /// Base of this slot's kernel stack, and of its trap stack, or `0` if it has
+    /// never been given one.
+    ///
+    /// Kept so a **recycled** slot reuses the stacks it already owns. Without
+    /// these, reclaiming a slot would `leak()` two fresh 32 KiB stacks every
+    /// time and turn a slot leak into a memory leak — strictly worse than the
+    /// exhaustion it was meant to fix.
+    stack_base: usize,
+    trap_base: usize,
     /// This task's SSE/x87 registers while it is not running.
     fx: FxArea,
 }
@@ -302,6 +311,8 @@ impl Task {
             space_root: 0,
             uctx: UserCtx::new(),
             trap_stack_top: 0,
+            stack_base: 0,
+            trap_base: 0,
         }
     }
 }
@@ -615,41 +626,81 @@ fn spawn_unpublished(
     space_root: u64,
     daemon: bool,
 ) -> Option<usize> {
-    // Leaked deliberately: a task's stack must outlive the frame that made it,
-    // and nothing here ever reaps a task.
-    let stack = vec![0u8; STACK_SIZE].leak();
-    let stack_top = stack.as_ptr() as usize + STACK_SIZE;
+    // Find the slot first, because a **recycled** one already owns its stacks.
+    //
+    // A slot is reusable when it is `Unused`, or when it is `Finished` and no
+    // longer on a CPU. The second case is what stops `MAX_TASKS` being a hard
+    // lifetime limit on the number of processes a boot may ever run: a
+    // `Finished` task is never chosen by the scheduler (it only picks
+    // `Runnable`), so it is never resumed and the frame parked on its stack is
+    // dead. `all_user_tasks_finished` already treats `Unused` and `Finished`
+    // alike, so `run_init`'s drive loop is unaffected.
+    //
+    // Before this, `finish()` set `Finished` and nothing ever set `Unused`
+    // again: 512 slots was a ceiling on **total processes for the life of the
+    // boot**, and a shell hit it at ~500 `fork`s with 1.5 GB free and the
+    // process table almost empty. `sh` reported `can't fork: Out of memory`,
+    // naming the one resource that was not exhausted.
+    //
+    // `daemon` slots are excluded belt-and-braces: they never finish anyway.
+    // SAFETY: raw-pointer access to the table; under the BKL.
+    let slot = unsafe {
+        let t = tasks();
+        (1..MAX_TASKS).find(|&s| {
+            let c = &(*t)[s];
+            c.state == State::Unused
+                || (c.state == State::Finished && !c.on_cpu && !c.daemon)
+        })
+    }?;
+
+    // SAFETY: `slot` is in bounds and not running.
+    let (have_stack, have_trap) = unsafe {
+        let t = tasks();
+        ((*t)[slot].stack_base, (*t)[slot].trap_base)
+    };
+
+    // Leaked deliberately on first use: a task's stack must outlive the frame
+    // that made it. A recycled slot reuses the pair it already has, so the leak
+    // is bounded by `MAX_TASKS` rather than by how many processes ever ran.
+    let stack_base = if have_stack == 0 {
+        vec![0u8; STACK_SIZE].leak().as_ptr() as usize
+    } else {
+        have_stack
+    };
+    let stack_top = stack_base + STACK_SIZE;
 
     // A second stack, for traps taken while this task is in ring 3. Separate
     // from the task's own kernel stack because a preempted task is suspended on
     // the interrupt frame, and the two must not overlap.
-    let trap = vec![0u8; STACK_SIZE].leak();
-    let trap_top = (trap.as_ptr() as usize + STACK_SIZE) & !0xf;
+    let trap_base = if have_trap == 0 {
+        vec![0u8; STACK_SIZE].leak().as_ptr() as usize
+    } else {
+        have_trap
+    };
+    let trap_top = (trap_base + STACK_SIZE) & !0xf;
 
-    // SAFETY: raw-pointer access to the table; under the BKL.
+    // SAFETY: raw-pointer access to the table; under the BKL. `slot` was chosen
+    // above and is either never-used or finished, so nothing runs on it.
     unsafe {
         let t = tasks();
-        for slot in 1..MAX_TASKS {
-            if (*t)[slot].state == State::Unused {
-                let task = &mut (*t)[slot];
-                task.ctx = Context::for_task(stack_top, entry);
-                task.trap_stack_top = trap_top as u64;
-                task.space_root = space_root;
-                task.daemon = daemon;
-                task.idle = false;
-                task.on_cpu = false;
-                task.pinned = NO_CPU;
-                // A fresh task begins in kernel code, and kernel code holds the
-                // lock: it is born at depth 1, as if it had just entered.
-                task.bkl_depth = 1;
-                task.uctx = UserCtx::new();
-                task.fx = FxArea::initial();
-                task.state = State::Reserved;
-                return Some(slot);
-            }
-        }
+        let task = &mut (*t)[slot];
+        task.ctx = Context::for_task(stack_top, entry);
+        task.trap_stack_top = trap_top as u64;
+        task.stack_base = stack_base;
+        task.trap_base = trap_base;
+        task.space_root = space_root;
+        task.daemon = daemon;
+        task.idle = false;
+        task.on_cpu = false;
+        task.pinned = NO_CPU;
+        // A fresh task begins in kernel code, and kernel code holds the lock:
+        // it is born at depth 1, as if it had just entered.
+        task.bkl_depth = 1;
+        task.uctx = UserCtx::new();
+        task.fx = FxArea::initial();
+        task.state = State::Reserved;
     }
-    None
+    Some(slot)
 }
 
 /// Mark the running task finished and switch away for good.

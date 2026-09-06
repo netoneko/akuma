@@ -1761,11 +1761,14 @@ impl Process {
     }
 
     fn free(self) {
-        // A `fork` child's `FrameSet` already holds *every* mapped page,
-        // anonymous ones included (`fork_from` copied them). A loader-built
+        // A `fork` child's ledger already holds *every* mapped page, anonymous
+        // ones included (`fork_from` records each shared frame). A loader-built
         // process's does not — its `mmap`/heap frames are untracked, so walk
-        // the mmap window and free them before the tables go. Running that walk
-        // for a `fork` child would double-free.
+        // the mmap window and release them before the tables go. Running that
+        // walk for a `fork` child would decrement each shared frame twice.
+        //
+        // Both paths release through `cow_ref_dec` and free only on the last
+        // reference; freeing raw was correct only while `fork` copied eagerly.
         if !self.forked {
             crate::mm::release_anon_frames(&self.space);
         }
@@ -1773,55 +1776,112 @@ impl Process {
         self.space.free();
     }
 
-    /// A `fork` child: a full eager copy of `parent`'s address space (every user
-    /// page in fresh frames — no CoW on this target), resuming at `entry`/`stack`
+    /// A `fork` child: `parent`'s address space **shared copy-on-write**,
+    /// resuming at `entry`/`stack`
     /// (the parent's post-`fork` RIP/RSP) as a register-complete copy.
     ///
     /// `None` if a frame runs out mid-copy or the child would need more frames
     /// than `MAX_PROC_FRAMES` — the shell then sees `fork` fail with `ENOMEM`,
     /// which is a survivable "can't fork" rather than a corrupt child.
     fn fork_from(parent: &Self, entry: u64, stack: u64) -> Option<Self> {
-        let space = paging::AddressSpace::new()?;
+        let Some(space) = paging::AddressSpace::new() else {
+            serial::puts("  [fork] no frame for a child PML4; pmm free=");
+            serial::put_dec(akuma_pmm::free_count() as u64);
+            serial::puts("\n");
+            return None;
+        };
         let frames = FrameSet::new(false);
         let mut ok = true;
 
-        paging::for_each_user_leaf(parent.space.root(), |va, pa, prot| {
+        let parent_root = parent.space.root();
+        paging::for_each_user_leaf(parent_root, |va, pa, prot| {
             if !ok {
                 return;
             }
-            let Some(frame) = akuma_pmm::alloc_page() else {
-                ok = false;
-                return;
-            };
-            // SAFETY: both frames are live and reached through the physmap;
-            // exactly one page is copied.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    phys_ptr::<u8>(pa),
-                    phys_ptr::<u8>(frame as u64),
-                    4096,
-                );
-            }
-            let tracked = PhysFrame::new(frame);
-            frames.track_user_frame(tracked);
-            if !space.map(va, frame as u64, prot, MemAttr::WriteBack) {
-                // Hand the ledger's claim back before freeing, or the bail-out
-                // below frees this frame a second time. `remove_user_frame`
-                // returning `true` is what says the free is ours to do — the
-                // same contract the CoW teardown will need.
-                if frames.remove_user_frame(tracked) {
-                    akuma_pmm::free_page(frame, 0);
+            let frame = PhysFrame::new(pa as usize);
+
+            // A page that is already read-only and *not* CoW stays exactly as it
+            // is in both spaces — `.rodata`, an `mprotect(PROT_READ)` region.
+            // Marking it would turn a legitimate `SIGSEGV` into a silent write.
+            let share_writable = prot.write || prot.cow;
+
+            if share_writable {
+                // Demote in **both** address spaces. Demoting only the child
+                // leaves the parent writing straight through to memory the
+                // child can see change — the entire point of CoW, missed.
+                //
+                // The parent's own PTE is edited here, in its live address
+                // space, so `map_page_in`'s `invlpg` is exactly the flush that
+                // is needed. At SMP>1 another core could hold a stale writable
+                // translation and this would need a shootdown, which this
+                // target does not have (`smp.rs`: `invlpg` is core-local) —
+                // hence CoW is SMP=1 only for now.
+                let demoted = prot.cow();
+                if !paging::map_page_in(parent_root, va, pa, demoted, MemAttr::WriteBack) {
+                    ok = false;
+                    return;
                 }
-                ok = false;
+                // One reference per *address space*, taken once for the child.
+                // The parent's own claim is implicit: it already maps the page.
+                akuma_pmm::cow_ref_inc(frame.addr);
+                frames.track_user_frame(frame);
+                if !space.map(va, pa, demoted, MemAttr::WriteBack) {
+                    if frames.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
+                        akuma_pmm::free_page(frame.addr, 0);
+                    }
+                    ok = false;
+                }
+            } else {
+                // Read-only and unshared-by-marker: the child maps the same
+                // frame at the same permissions. It still takes a reference,
+                // because teardown of either process must not free a page the
+                // other still maps.
+                akuma_pmm::cow_ref_inc(frame.addr);
+                frames.track_user_frame(frame);
+                if !space.map(va, pa, prot, MemAttr::WriteBack) {
+                    if frames.remove_user_frame(frame) && akuma_pmm::cow_ref_dec(frame.addr) {
+                        akuma_pmm::free_page(frame.addr, 0);
+                    }
+                    ok = false;
+                }
             }
         });
 
         if !ok {
+            serial::puts("  [fork] share pass failed; pmm free=");
+            serial::put_dec(akuma_pmm::free_count() as u64);
+            serial::puts(" pages=");
+            serial::put_dec(frames.user_frame_count() as u64);
+            serial::puts("\n");
             loader::free_all_frames(&frames);
             space.free();
             return None;
         }
         Some(Self { space, frames, entry, stack, forked: true })
+    }
+}
+
+/// A copy-on-write break replaced `old` with `new` in the running process:
+/// update its ledger so teardown frees what it actually holds.
+///
+/// Without this the private copy is untracked (leaked at exit, forever) and the
+/// shared frame is still claimed by a process that no longer maps it (freed
+/// twice, or freed while a sibling still reads it). Both are silent, and both
+/// arrive long after the fault that caused them.
+///
+/// `remove_user_frame` reporting "last reference" is ignored on purpose: the
+/// fault handler has already done the `cow_ref_dec` and freed the frame if that
+/// was its call to make. This only edits the per-process ledger.
+pub fn cow_swap_frame(old: usize, new: usize) {
+    let slot = current_proc_slot();
+    // SAFETY: raw-pointer read; single core, and this is the running task's own
+    // slot — the process cannot be torn down underneath its own fault handler.
+    unsafe {
+        let procs = &raw const PROCS;
+        if let Some(p) = (*procs).get(slot).and_then(Option::as_ref) {
+            let _ = p.frames.remove_user_frame(akuma_mmap::PhysFrame::new(old));
+            p.frames.track_user_frame(akuma_mmap::PhysFrame::new(new));
+        }
     }
 }
 
@@ -2395,6 +2455,30 @@ fn sys_fork() -> u64 {
             .find(|&s| (*procs)[s].is_none() && (*spawn)[s - SPAWN_SLOT_BASE].is_none())
     };
     let Some(slot) = slot else {
+        // A bare `ENOMEM` here reaches the user as `sh: can't fork: Out of
+        // memory`, which names the wrong resource: the table is full, and the
+        // machine may have gigabytes free. Say which, and how full — the two
+        // halves diverge (`PROCS` and `SPAWN` are searched together by `fork`
+        // but `sys_spawn` checks only `PROCS`), and a count of each is what
+        // distinguishes a leak in one from honest saturation of both.
+        // SAFETY: raw-pointer read; single core.
+        let (procs_used, spawn_used) = unsafe {
+            let procs = &raw const PROCS;
+            let spawn = spawn_table();
+            (
+                (SPAWN_SLOT_BASE..PROC_SLOTS).filter(|&s| (*procs)[s].is_some()).count(),
+                (0..SPAWN_SLOTS).filter(|&s| (*spawn)[s].is_some()).count(),
+            )
+        };
+        serial::puts("  [fork] no free process slot: PROCS ");
+        serial::put_dec(procs_used as u64);
+        serial::puts("/");
+        serial::put_dec((PROC_SLOTS - SPAWN_SLOT_BASE) as u64);
+        serial::puts(" SPAWN ");
+        serial::put_dec(spawn_used as u64);
+        serial::puts("/");
+        serial::put_dec(SPAWN_SLOTS as u64);
+        serial::puts("\n");
         return errno::ENOMEM;
     };
 

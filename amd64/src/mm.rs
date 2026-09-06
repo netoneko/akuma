@@ -161,6 +161,12 @@ pub fn sys_munmap(addr: u64, len: u64) -> u64 {
     for i in 0..len.div_ceil(PAGE_SIZE) {
         let va = (addr + i * PAGE_SIZE) as usize;
         if let Some(frame) = paging::unmap_page_in(root, va) {
+            // Decrement, do not free — the page may be shared copy-on-write
+            // with a `fork` child. An untracked frame answers `true`, so an
+            // unshared mapping is freed exactly as before.
+            if !akuma_pmm::cow_ref_dec(frame as usize) {
+                continue;
+            }
             akuma_pmm::free_page(frame as usize, 0);
         }
     }
@@ -188,7 +194,17 @@ pub fn release_anon_frames(space: &paging::AddressSpace) {
     let mut va = MMAP_BASE;
     while va < end {
         if let Some(frame) = paging::unmap_page_in(root, va as usize) {
-            akuma_pmm::free_page(frame as usize, 0);
+            // **Decrement, do not free.** Since `fork` shares copy-on-write,
+            // an anonymous page here may still be mapped by a child. Only the
+            // last holder owns the free — and an untracked frame answers
+            // `true`, so an unshared process still frees everything it had.
+            //
+            // Freeing raw was correct only while `fork` copied eagerly. It is a
+            // use-after-free the moment sharing exists, and one that surfaces
+            // in the *surviving* process long after the exit that caused it.
+            if akuma_pmm::cow_ref_dec(frame as usize) {
+                akuma_pmm::free_page(frame as usize, 0);
+            }
         }
         va += PAGE_SIZE;
     }

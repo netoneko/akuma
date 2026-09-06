@@ -527,7 +527,12 @@ Also: `amd64/src/fd.rs:1684` is a rustfmt-mangled line —
 The disk is a prerequisite and nowhere near sufficient. Ranked by how much each
 blocks:
 
-### 1. `fork` copies every page eagerly. There is no CoW.
+### 1. `fork` copies every page eagerly. There is no CoW. — **DONE 2026-09-06 (SMP=1)**
+
+**Closed at SMP=1.** `crates/akuma-cow` holds the shared decision; the marker is
+PTE bit 9; three teardown sites moved to `cow_ref_dec`. 2000 forks, 0 KiB drift.
+Needs a TLB shootdown before SMP>1. See `docs/archive/AKUMA_AMD64_COW.md`.
+
 
 `Process::fork_from` (`amd64/src/usermode.rs:1767`):
 

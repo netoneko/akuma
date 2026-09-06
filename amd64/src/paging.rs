@@ -56,6 +56,18 @@ const PS: u64 = 1 << 7;
 const PWT: u64 = 1 << 3;
 /// Page-level cache disable.
 const PCD: u64 = 1 << 4;
+/// Available-to-software bit 9. The CPU ignores bits 9..11 in a PTE entirely,
+/// which is what makes one usable as the copy-on-write marker.
+///
+/// **A marker is required, not a convenience.** A CoW-demoted page and a page
+/// that is read-only *on purpose* (`mprotect(PROT_READ)`, an ELF `.rodata`
+/// segment) are byte-identical in the page table otherwise, and this target has
+/// no region table to consult instead — the PTE is the only record there is.
+/// Deciding from the share count alone promotes an `mprotect`ed page to
+/// writable the moment its frame happens to be shared, which is the trap
+/// `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md` is about.
+const COW: u64 = 1 << 9;
+
 /// No-execute. **Requires `EFER.NXE`**, which `boot.s` sets alongside `LME`;
 /// without it this is a reserved bit and setting it faults.
 const NX: u64 = 1 << 63;
@@ -73,25 +85,48 @@ const ENTRIES: usize = 512;
 /// point of keeping it a struct is that `RO` and `EXEC` cannot accidentally be
 /// the same value, which is exactly the defect item 1.1 documents on the
 /// AArch64 side.
+// Four `bool`s, and clippy would rather they were a bitflag type. They are not:
+// the whole point of this struct (see the module header, and the `RO`-vs-`EXEC`
+// defect it exists to prevent) is that each permission is a *named field* that
+// cannot be confused with another, which a packed encoding is exactly what
+// gives up.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Prot {
     pub write: bool,
     pub exec: bool,
     pub user: bool,
+    /// Copy-on-write: mapped read-only, but a write fault should break the
+    /// sharing rather than kill the process. See [`COW`].
+    ///
+    /// Always accompanied by `write: false` — a page that is both writable and
+    /// CoW would never fault, so the sharing would never break and two address
+    /// spaces would diverge silently. [`Prot::cow`] is the only constructor and
+    /// it enforces that.
+    pub cow: bool,
 }
 
 impl Prot {
     /// Kernel read-only, no execute.
-    pub const KERNEL_RO: Self = Self { write: false, exec: false, user: false };
+    pub const KERNEL_RO: Self = Self { write: false, exec: false, user: false, cow: false };
     /// Kernel read/write, no execute. The default for data.
-    pub const KERNEL_RW: Self = Self { write: true, exec: false, user: false };
+    pub const KERNEL_RW: Self = Self { write: true, exec: false, user: false, cow: false };
     /// Kernel read + execute, not writable. The only executable shape offered:
     /// there is deliberately no writable-and-executable constructor.
-    pub const KERNEL_RX: Self = Self { write: false, exec: true, user: false };
+    pub const KERNEL_RX: Self = Self { write: false, exec: true, user: false, cow: false };
     /// User read/write, no execute.
-    pub const USER_RW: Self = Self { write: true, exec: false, user: true };
+    pub const USER_RW: Self = Self { write: true, exec: false, user: true, cow: false };
     /// User read + execute.
-    pub const USER_RX: Self = Self { write: false, exec: true, user: true };
+    pub const USER_RX: Self = Self { write: false, exec: true, user: true, cow: false };
+
+    /// This protection, demoted to copy-on-write: read-only in the hardware,
+    /// marked so the fault handler knows the write is legitimate.
+    ///
+    /// Clearing `write` is not optional — see the field's own note.
+    #[must_use]
+    pub const fn cow(self) -> Self {
+        Self { write: false, cow: true, ..self }
+    }
 }
 
 /// How a mapping is cached.
@@ -123,6 +158,9 @@ const fn encode(prot: Prot, attr: MemAttr) -> u64 {
     }
     if !prot.exec {
         bits |= NX;
+    }
+    if prot.cow {
+        bits |= COW;
     }
     match attr {
         MemAttr::WriteBack => {}
@@ -376,6 +414,11 @@ pub fn prot_in(root: u64, va: usize) -> Option<Prot> {
         write: entry & RW != 0,
         exec: entry & NX == 0,
         user: entry & US != 0,
+        // Decoded, not dropped. `for_each_user_leaf` reports this and `fork`
+        // re-maps from it, so losing the bit here would silently un-mark every
+        // page on the *second* fork of a process — the child of a child would
+        // share frames with no marker and take a fatal fault on its first write.
+        cow: entry & COW != 0,
     })
 }
 
@@ -383,10 +426,12 @@ pub fn prot_in(root: u64, va: usize) -> Option<Prot> {
 /// virtual address, physical frame and permissions.
 ///
 /// The walk `AddressSpace::free` does, one level deeper — down to the leaves
-/// rather than stopping at the page tables. `fork` uses it to copy a parent's
-/// whole address space: there is no CoW here (no per-page refcount, no
-/// write-fault handler wired to one), so a `fork` is an eager frame-by-frame
-/// copy. Expensive when the child immediately `execve`s, correct always.
+/// rather than stopping at the page tables. `fork` uses it to share a parent's
+/// address space copy-on-write: each leaf is re-mapped read-only and marked in
+/// **both** spaces, and the write fault breaks the sharing a page at a time.
+///
+/// The `Prot` reported includes [`Prot::cow`], which is what lets a fork of a
+/// forked process preserve the marking.
 pub fn for_each_user_leaf(root: u64, mut f: impl FnMut(usize, u64, Prot)) {
     // SAFETY: every table is reached through the physmap; only the private lower
     // half is walked, so the kernel's shared tables are never touched.
@@ -420,6 +465,7 @@ pub fn for_each_user_leaf(root: u64, mut f: impl FnMut(usize, u64, Prot)) {
                             write: e1 & RW != 0,
                             exec: e1 & NX == 0,
                             user: e1 & US != 0,
+                            cow: e1 & COW != 0,
                         };
                         f(va, e1 & ADDR_MASK, prot);
                     }

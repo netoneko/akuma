@@ -85,6 +85,7 @@ version = "0.0.7"
 dependencies = [
  "akuma-alloc",
  "akuma-boot",
+ "akuma-cow",
  "akuma-dmesg",
  "akuma-exec-core",
  "akuma-ext2",
@@ -140,6 +141,10 @@ version = "0.1.0"
 dependencies = [
  "akuma-primitives",
 ]
+
+[[package]]
+name = "akuma-cow"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-cpu"
