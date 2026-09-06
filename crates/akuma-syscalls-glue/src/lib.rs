@@ -84,7 +84,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+// `AtomicU32` is deliberately *not* re-exported here: every remaining user is
+// behind a feature gate (`sc-epoll`, `sc-eventfd`, `sc-timerfd`, `sc-pidfd`)
+// and imports it itself, so a build with none of them on does not carry a
+// dead import. The last unconditional user was `pipe.rs`'s own id counter,
+// which went away when the table moved to `akuma-pipes`.
+use core::sync::atomic::{AtomicU64, Ordering};
 use spinning_top::Spinlock;
 // The folded user-copy API (validate + prefault + copy, safe `fn`s). Re-exported
 // rather than imported per-module: every syscall submodule reaches these through

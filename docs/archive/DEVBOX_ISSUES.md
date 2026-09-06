@@ -2037,6 +2037,78 @@ leave the successful-probe path silent (or behind a counter, the way
 is also console traffic on every process start.
 
 
+## Issue 28: `box grab` does not work again
+
+**Status: OPEN — reported by the user 2026-09-07, NOT reproduced in this
+session.** Recorded so the next person starts from the right place rather than
+rediscovering that it is broken. Nothing below is a measurement: the failure
+*mode* has not been captured, so the first job is to get one.
+
+"Again" is the operative word — `box grab` is a feature this tree has had
+working before, so this is a regression, not a gap. Nobody has established when
+it broke or against which kernel.
+
+### What to capture first
+
+The command prints one of a small set of distinguishable messages, and **which
+one decides where to look**. Run it in a box that definitely has a live process
+(`box open` something long-running first, then `box ps`):
+
+```
+~ # box grab <name>
+```
+
+| What it prints | Where the failure is |
+|---|---|
+| `box grab: target box not found` | `boxes.rs` lookup / `/proc` box enumeration — the userspace half, before any syscall |
+| `box grab: no processes found in box` | box→pid enumeration, again userspace: the box exists but `box` cannot see its processes. Compare against Issue 24's procfs box filtering, which is the same question asked of `/proc` |
+| `box grab: PID N is already attached` | `reattach_process_ext`'s `grabbed_by` check. A **stale** grabber is meant to self-correct (the check filters on the grabber still being alive), so this appearing on a fresh box means either that liveness filter or `lookup_process_shared` is answering wrong |
+| `box grab: failed to reattach` | the syscall returned an error — one of the six `Err(&str)` arms in `reattach_process_ext` |
+| `box: grabbing PID N` and then **nothing** | the syscall succeeded and the *channel* is the problem. This is the interesting case, and the most likely one |
+
+That last case is where the machinery actually is. `sys_reattach` does two
+things: it points the caller's `delegate_pid` at the target, and it moves the
+caller's output `channel` onto the target `Process`. Two loops in the tree
+re-resolve that channel on every iteration **specifically because a grab can
+repoint it mid-read** — `crates/akuma-syscalls-glue/src/fs.rs:321` and
+`crates/akuma-syscalls-glue/src/term.rs:486`, both with comments naming
+`box grab`/`sys_reattach`. A grab that succeeds but shows no output is a defect
+in that hand-off, and those two comments say where the previous one was.
+
+### Where the code is
+
+- `userspace/box/src/main.rs:285` — `cmd_grab`, including the `-d`/`--detach`
+  take-over path and every message in the table above.
+- `libakuma::reattach` (`userspace/libakuma/src/lib.rs:1980`) — syscall
+  `REATTACH`, `(pid, force)`.
+- `crates/akuma-syscalls-glue/src/container.rs:84` — `sys_reattach`, the
+  boundary. The doc comment there records that *detaching* an existing grabber
+  under `force` is this layer's job, not `reattach_process_ext`'s.
+- `crates/akuma-exec/src/process/exec.rs:233` — `reattach_process_ext`: the
+  hierarchy permission check, the `grabbed_by` liveness filter, and the
+  `delegate_pid` + `channel` assignment.
+
+### The most likely "again"
+
+`box grab` has been broken in exactly this shape once before and the write-up
+survives: [`REATTACH_STALE_CHANNEL_HANG.md`](REATTACH_STALE_CHANNEL_HANG.md),
+fixed 2026-08-23. There, the grab *succeeded* — the target's output even
+streamed through — but anything typed was never delivered, because `sys_read`'s
+stdin loop and `sys_poll_input_event` each cached the process's
+`Arc<ProcessChannel>` once before blocking and kept draining the abandoned old
+one after `reattach` swapped in a new channel. The two "re-resolve every
+iteration" comments cited above **are that fix**. Check they are still doing
+what they say before looking anywhere else: a regression that reintroduces the
+cache would reproduce this symptom exactly, and it is a two-line read.
+
+### Adjacent, and worth ruling in or out
+
+Issue 24 (procfs leaked other boxes' processes) changed what `/proc` shows per
+box, and `box grab` with no explicit pid picks its target by *enumerating the
+box's processes*. If that enumeration changed shape, `box grab <name>` breaks
+while `box grab <name> <pid>` still works — which is a one-command
+discrimination and worth running before anything else.
+
 ## Background
 
 - [`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md)

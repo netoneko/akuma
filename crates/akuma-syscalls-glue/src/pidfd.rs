@@ -1,4 +1,5 @@
 use super::*;
+use core::sync::atomic::AtomicU32;
 
 struct KernelPidFd {
     target_pid: u32,

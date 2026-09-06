@@ -2467,7 +2467,17 @@ akuma_threading_x86_switch_context:
      * wrapper below, which passes raw `*mut Context`/`*const Context` whose
      * first field is `magic`, not `rsp`. The offset is computed there so this
      * asm never has to know the struct layout beyond "rsp is a u64 field",
-     * matching `amd64::sched::switch_context`'s own contract one level up. */
+     * matching `amd64::sched::switch_context`'s own contract one level up.
+     *
+     * `pushfq`/`popfq` are not symmetry for its own sake, and leaving them out
+     * is how this port shipped originally: `IF` has to belong to the task, not
+     * to whoever last ran on this core. A syscall (interrupts off) that yields
+     * to a kernel task (interrupts on) must come back with them off, and it did
+     * not until `amd64/src/sched.rs` Stage U — the resumer's state leaked into
+     * the resumed, presenting as an unrelated intermittent hang. Restored here
+     * 2026-09-06 before anything adopts this switch
+     * (`docs/archive/AKUMA_PIPES_EXTRACTION.md` § "two of them disagree"). */
+    pushfq
     push rbp
     push rbx
     push r12
@@ -2482,6 +2492,7 @@ akuma_threading_x86_switch_context:
     pop r12
     pop rbx
     pop rbp
+    popfq
     ret
 
 .global akuma_threading_x86_thread_entry_trampoline
@@ -2522,6 +2533,11 @@ unsafe fn x86_switch_context(old: *mut Context, new: *const Context) { unsafe {
     akuma_threading_x86_switch_context(&raw mut (*old).rsp, &raw const (*new).rsp);
 }}
 
+/// The `rflags` a thread that has never run starts with: `IF` set, plus bit 1,
+/// which is architecturally always 1. Mirrors `amd64::sched::INITIAL_RFLAGS`.
+#[cfg(target_arch = "x86_64")]
+const X86_INITIAL_RFLAGS: u64 = 0x202;
+
 /// Build the [`Context`] for a thread that has never run, so the first
 /// [`x86_switch_context`] into it starts `trampoline(closure_ptr)`.
 ///
@@ -2541,24 +2557,32 @@ unsafe fn x86_switch_context(old: *mut Context, new: *const Context) { unsafe {
 /// (the trampoline) is reached by `jmp`, not `call` — no return address is
 /// pushed, so the alignment `switch_context`'s `ret` leaves behind is already
 /// exactly what a normal call would have produced.
+///
+/// **Seven words, not six.** [`akuma_threading_x86_switch_context`] restores
+/// `rflags` too, so the frame it pops is `r15 r14 r13 r12 rbx rbp rflags` and
+/// then the return address. A fresh thread starts with [`X86_INITIAL_RFLAGS`]
+/// rather than a zero word: a zero `rflags` has `IF` clear, so the very first
+/// thread spawned this way would run with interrupts masked and never be
+/// ticked again.
 #[cfg(target_arch = "x86_64")]
 fn x86_build_closure_context(stack_top: usize, trampoline: fn(*mut ()) -> !, closure_ptr: *mut ()) -> Context {
     let entry_slot = (stack_top - 16) & !0xf;
-    // SAFETY: `entry_slot` and the six words below it are inside the stack
+    // SAFETY: `entry_slot` and the seven words below it are inside the stack
     // the caller just allocated for this thread and nothing else has touched
     // yet — the same obligation `amd64::sched::Context::for_task` documents.
     unsafe {
         let p = entry_slot as *mut u64;
         p.write(akuma_threading_x86_thread_entry_trampoline as *const () as u64);
-        p.sub(1).write(0); // rbp
-        p.sub(2).write(trampoline as *const () as u64); // rbx
-        p.sub(3).write(closure_ptr as u64); // r12
-        p.sub(4).write(0); // r13
-        p.sub(5).write(0); // r14
-        p.sub(6).write(0); // r15
+        p.sub(1).write(X86_INITIAL_RFLAGS); // rflags
+        p.sub(2).write(0); // rbp
+        p.sub(3).write(trampoline as *const () as u64); // rbx
+        p.sub(4).write(closure_ptr as u64); // r12
+        p.sub(5).write(0); // r13
+        p.sub(6).write(0); // r14
+        p.sub(7).write(0); // r15
     }
     let mut ctx = Context::zero();
-    ctx.rsp = (entry_slot - 48) as u64;
+    ctx.rsp = (entry_slot - 56) as u64;
     ctx
 }
 

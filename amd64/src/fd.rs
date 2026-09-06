@@ -122,6 +122,10 @@ pub mod errno {
     pub const EEXIST: u64 = (-17i64) as u64;
     pub const ENOTEMPTY: u64 = (-39i64) as u64;
     pub const EIO: u64 = (-5i64) as u64;
+    /// Written to a pipe every reader has closed. New with `akuma-pipes`' end
+    /// reference counts — before them this kernel could not tell a dead reader
+    /// from a full buffer, and `write_pipe`'s retry loop span forever instead.
+    pub const EPIPE: u64 = (-32i64) as u64;
     /// `FUTEX_WAIT` ran out of time. The one errno a futex wait can return
     /// that no other syscall here produces.
     pub const ETIMEDOUT: u64 = (-110i64) as u64;
@@ -307,7 +311,15 @@ pub fn write_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
         return errno::EFAULT;
     };
     loop {
-        let n = crate::pipe::write(pipe_id, &data);
+        // `None` is a pipe with no readers left. Checking it is not optional:
+        // this loop retries a zero-count write forever, and before the pipe
+        // table grew end reference counts a dead reader was indistinguishable
+        // from a full buffer — so `busybox yes | busybox head -n 1` span here
+        // rather than ending. There is no signal machinery on this target, so
+        // `EPIPE` is the whole of Linux's answer that applies.
+        let Some(n) = crate::pipe::write(pipe_id, &data) else {
+            return errno::EPIPE;
+        };
         if n > 0 || data.is_empty() {
             return n as u64;
         }
@@ -1113,13 +1125,14 @@ fn dup_onto(oldfd: u64, newfd: u64, strict_same: bool) -> u64 {
 /// `fork` inherits them and `dup2` can move them onto 0/1/2 — which together
 /// are a shell pipeline.
 ///
-/// The pipe is allocated through `pipe::alloc_pair`, not `pipe::alloc`: a pair
-/// is freed when its **last** end closes, where a spawn-owned pipe is freed
-/// when its read end does. A shell closes the ends in whichever order its
-/// bookkeeping reaches them, so getting that rule wrong frees the buffer under
-/// a live writer.
+/// The pipe is freed when its **last** end closes — `close_read` and
+/// `close_write` each drop one of the two reference counts `pipe::alloc` starts
+/// it with, and the second of them destroys it. A shell closes the ends in
+/// whichever order its bookkeeping reaches them, so getting that rule wrong
+/// frees the buffer under a live writer; it used to be a hand-rolled `ends`
+/// counter here and is now `akuma-pipes`' own.
 pub fn sys_pipe2(fds: u64, _flags: u64) -> u64 {
-    let Some(id) = crate::pipe::alloc_pair() else {
+    let Some(id) = crate::pipe::alloc() else {
         return errno::ENFILE;
     };
     let read_fd = install(Entry {
@@ -1198,24 +1211,20 @@ fn release(entry: Entry) {
     match entry {
         Entry { desc: FileDescriptor::Socket(s), .. } => crate::sock::close(s),
         // Closing the write end (the `/proc/<pid>/fd/0` handle) signals EOF to
-        // the child but does not free the pipe — the child may still be draining
-        // buffered input.
+        // the child. It frees the pipe only if this was the last end: the child
+        // may still be draining buffered input, and buffered bytes outlive
+        // their writer.
         Entry { desc: FileDescriptor::PipeWrite(p), .. } => {
             crate::pipe::close_write(p as usize);
-            // A `pipe(2)` pair frees when its last end goes; a spawn-owned pipe
-            // accounts no ends and `drop_end` is a no-op on it, preserving the
-            // rule above — the child may still be draining buffered input.
-            crate::pipe::drop_end(p as usize);
         }
-        // Closing the read end (`sshd`'s stdout reader) is the last reference to
+        // Closing the read end (`sshd`'s stdout reader) is the last *reader* of
         // a spawned child's stdout pipe — `waitpid` deliberately left it alive
-        // for this final drain. Free the slot now.
+        // for this final drain. Whether that also destroys the pipe is the end
+        // counts' decision now, not this arm's: a `pipe(2)` pair whose writer is
+        // still open keeps its buffer, and the child's own `close_write` at exit
+        // is what completes the pair.
         Entry { desc: FileDescriptor::PipeRead(p), .. } => {
-            // `drop_end` returns false for a spawn-owned pipe, which has no end
-            // accounting and whose read end really is the last reference.
-            if !crate::pipe::drop_end(p as usize) {
-                crate::pipe::free(p as usize);
-            }
+            crate::pipe::close_read(p as usize);
         }
         // A file opened for writing: this is the one and only point its
         // buffered `data` reaches the disk (see the module header and

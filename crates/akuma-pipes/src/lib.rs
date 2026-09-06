@@ -298,12 +298,20 @@ impl<W> PipeTable<W> {
             return (ReadResult { bytes: 0, eof: true }, Wakes::none());
         };
         match p.buffer.read(out) {
-            ReadOutcome::Read(n) => (ReadResult { bytes: n, eof: false }, p.take_pollers()),
+            // `Read(0)` is reachable only for an empty `out` — `read(fd, buf, 0)`.
+            // It drains nothing, so it makes no room and there is nothing for a
+            // parked writer to re-test; waking on it would be a spin, the same
+            // rule `write` applies to `Wrote(0)`. It falls through to the arm
+            // below so a zero-length read of a writer-less pipe still reports
+            // EOF, which is what the AArch64 implementation this replaces did.
+            ReadOutcome::Read(n) if n > 0 => {
+                (ReadResult { bytes: n, eof: false }, p.take_pollers())
+            }
             // `akuma_pipe` reports EOF from its own `write_closed` flag, which
             // this table sets when the last writer goes; asking `write_count`
             // directly keeps the one source of truth here rather than in two
             // places that can disagree.
-            ReadOutcome::Eof | ReadOutcome::WouldBlock => (
+            ReadOutcome::Read(_) | ReadOutcome::Eof | ReadOutcome::WouldBlock => (
                 ReadResult { bytes: 0, eof: p.write_count == 0 },
                 Wakes::none(),
             ),
@@ -352,6 +360,24 @@ impl<W> PipeTable<W> {
             self.pipes.remove(&id);
         }
         (CloseResult { destroyed }, wakes)
+    }
+
+    /// Remove a pipe outright, regardless of its end counts, waking anyone
+    /// parked on it.
+    ///
+    /// For a pipe whose lifetime an allocator manages by hand rather than by
+    /// refcount: the amd64 kernel's `sys_spawn` pipes, whose child end is
+    /// reached by *number* rather than by descriptor and so never closes. A
+    /// `pipe(2)` pair must **not** come through here — it is destroyed by the
+    /// last [`close_read`](Self::close_read)/[`close_write`](Self::close_write),
+    /// and short-circuiting that frees the buffer under a live peer.
+    ///
+    /// Returns whether there was a pipe to remove.
+    pub fn destroy(&mut self, id: PipeId) -> (bool, Wakes<W>) {
+        match self.pipes.remove(&id) {
+            Some(mut p) => (true, p.take_pollers()),
+            None => (false, Wakes::none()),
+        }
     }
 
     /// "Is there something to read, and if not, register me" — in one step.

@@ -1,9 +1,9 @@
 # `akuma-pipes`: one pipe table for two kernels
 
-**Status, 2026-09-06: the crate exists and is tested; neither kernel consumes it
-yet.** This document is the finding, the design and the reason the design is
-shaped the way it is, so the wiring pass starts from it instead of rediscovering
-any of it.
+**Status, 2026-09-07: both kernels consume it.** The crate was written and tested
+2026-09-06; the wiring pass landed the next day and is recorded in § "What was
+wired" below. This document is the finding, the design and the reason the design
+is shaped the way it is.
 
 ## What was measured
 
@@ -99,29 +99,68 @@ the target. Each pins a rule, and the names say which:
 `check_set_reader_registers_only_when_it_would_block`,
 `a_missing_pipe_reads_eof_and_writes_nosuchpipe`.
 
-## What is not done
+## What was wired (2026-09-07)
 
-Neither kernel consumes it. Both modules keep their current public API so their
-callers do not move:
+Both modules kept their public API, so their callers did not move.
 
-- **aarch64** — `crates/akuma-syscalls-glue/src/pipe.rs` becomes a shim over
-  `PipeTable<WakeHandle>`. **540 references** to its `pipe_*` functions live
-  outside the module; none of them should change. What stays in the shim is the
-  effects it already performs outside the lock: `wake_by_handle`,
-  `super::signal::send_sigpipe`, `super::unixsock::unix_channel_detach`, the
-  `PIPE_TRACE_ENABLED` prints, and the `irq::with_irqs_disabled` + `PIPES.lock()`
-  discipline.
-- **amd64** — `amd64/src/pipe.rs` becomes a shim over `PipeTable<()>` with a
-  no-op wake, matching what that kernel does today (its scheduler has no blocked
-  state, so a waiter is always runnable and learns of events by polling). 15 call
-  sites, all in `fd.rs` (14) and `usermode.rs` (1).
+- **aarch64** — `crates/akuma-syscalls-glue/src/pipe.rs` is now a shim over
+  `PipeTable<WakeHandle>`, 253 lines of table logic replaced by 155 of effects.
+  All **540** references outside the module are unchanged. What stayed is
+  `wake_by_handle`, `send_sigpipe`, `unix_channel_detach`, the
+  `PIPE_TRACE_ENABLED` prints, and one `with_table` helper holding the
+  `irq::with_irqs_disabled` + `PIPES.lock()` discipline.
 
-The amd64 side also carries an uncommitted stopgap this supersedes: a
-`Slot::ends: Option<u8>` counter added to distinguish a `pipe(2)` pair (freed
-when the last end closes) from a spawn-owned pipe (freed when the read end
-closes). That is a crude stand-in for `read_count`/`write_count`, and it should
-be deleted rather than ported. `MAX_PIPES` went 16 → 64 in the same change, which
-the table makes moot.
+  One behaviour did change, and for the better: **wakes now fire outside the
+  lock.** The old `pipe_write`/`pipe_read`/`pipe_close_*` drained `pollers` and
+  called `wake_by_handle` *inside* the locked, IRQ-masked section. Returning the
+  set is what makes firing it outside the only option a caller has.
+
+- **amd64** — `amd64/src/pipe.rs` is a shim over `PipeTable<()>` whose `fire` is
+  an empty function, called on every path that produces wakes so that giving
+  that scheduler a blocked state (item 3) is a change to one body. The
+  `Slot::ends` stopgap is gone, and with it `alloc_pair`/`drop_end`: a `pipe(2)`
+  pair and a spawn pipe are now the same allocation, differing only in who
+  closes the ends. `MAX_PIPES` stays at 64 as an explicit cap — the `BTreeMap`
+  would otherwise grow without bound, and each entry is up to 64 KiB of kernel
+  buffer allocated on a userspace request.
+
+### Three real defects the wiring exposed on amd64
+
+Each was unreachable before, because the state that expresses it did not exist:
+
+1. **`write_pipe` span forever against a dead reader.** With one `write_closed`
+   flag and no `read_count`, a full buffer and a reader-less pipe were the same
+   observation — `Some(0)` — and `write_pipe`'s retry loop treats that as "try
+   again". `busybox yes | busybox head -n 1` hangs the shell. `write` now
+   answers `None` for a broken pipe and the loop returns `EPIPE` (added to
+   `fd::errno`; this target has no signal machinery, so `EPIPE` is the whole of
+   Linux's answer that applies). Pinned by a new boot check,
+   `redirect: \`yes | head -n 1\` terminates`.
+2. **A pipe freed under a live writer.** `release(PipeRead)` freed the slot
+   outright for a spawn-owned pipe. Subsequent writes by the child landed in a
+   cleared buffer and reported success. Now `close_read` drops one count and the
+   pipe is destroyed only when both reach zero.
+3. **`poll` reported POLLOUT on a pipe with no readers.** Left as-is
+   deliberately — Linux answers the same shape (`POLLERR` on the write end,
+   writable to `select`), and reporting "not ready" would turn a broken pipe
+   into a permanent wait. The crate's `writable`/`readable` are taken verbatim
+   here, which is a **deliberate divergence** from the AArch64 `pipe_can_read`'s
+   existence guard; both sides carry the note.
+
+### Two changes to the crate itself
+
+- `read` no longer wakes on a zero-byte read. `Read(0)` is reachable only for an
+  empty `out` (`read(fd, buf, 0)`): it drains nothing, so it makes no room and
+  there is nothing for a parked writer to re-test — the same rule `write`
+  already applied to `Wrote(0)`. It falls through to the EOF arm, which is what
+  the AArch64 implementation did.
+- `destroy(id)` was added, for a lifetime an allocator manages by hand: a
+  spawned child's stdin pipe is read *by number* rather than through a
+  descriptor, so its read end never closes and refcounting alone would never
+  free it. `waitpid` is what knows the child is gone. A `pipe(2)` pair must not
+  come through it.
+
+27 host tests now, up from 22.
 
 ## Two findings about `akuma-threading`, from the same investigation
 

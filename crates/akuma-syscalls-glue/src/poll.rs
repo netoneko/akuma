@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "sc-epoll")]
+use core::sync::atomic::AtomicU32;
 #[cfg(feature = "smoltcp")]
 use akuma_net::socket;
 /// The readiness wait loop, shared with `akuma_net::socket::wait_until`. All

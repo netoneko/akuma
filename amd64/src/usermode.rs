@@ -2915,7 +2915,10 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         // A bad seed pointer seeds nothing rather than failing the spawn: the
         // child is already built, and an empty stdin is a state it handles.
         if let Some(seed) = crate::fd::copy_in(stdin_ptr, stdin_len.min(64 * 1024)) {
-            pipe::write(stdin_pipe, &seed);
+            // The pipe was created two statements ago and has both ends, so the
+            // broken-pipe answer is unreachable; a short write is not, and the
+            // seed is capped at the pipe's own capacity above.
+            let _ = pipe::write(stdin_pipe, &seed);
         }
     }
 
@@ -3478,6 +3481,23 @@ pub fn redirect_test(t: &mut Suite) {
         "redirect: the bytes survived 12 stages",
         dout.windows(6).any(|w| w == b"DEEPOK"),
     );
+
+    // 5. A pipeline whose **reader leaves first**. `head -n 1` prints its line
+    // and exits, dropping the last read end while `yes` is still pushing at a
+    // buffer that is already full — so `yes` can only learn the pipe broke by
+    // its next write reporting it.
+    //
+    // This is the rule the amd64 pipe table could not express until it became
+    // `akuma-pipes` on 2026-09-06: with a single `write_closed` flag and no end
+    // reference counts, a dead reader was indistinguishable from a full buffer,
+    // and `write_pipe`'s retry loop span here forever. It is the whole reason
+    // this case is a boot check and not a unit test — nothing short of the real
+    // shell arranges the exit order.
+    let Some((ystatus, _)) = run_sh_capture(b"busybox yes | busybox head -n 1\0") else {
+        t.check("redirect: sh spawned for the early-exit reader", false);
+        return;
+    };
+    t.check_eq("redirect: `yes | head -n 1` terminates", ystatus, 0);
 
     t.check_eq(
         "redirect: teardown leaks nothing",

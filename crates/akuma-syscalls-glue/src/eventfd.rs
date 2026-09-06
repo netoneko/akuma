@@ -1,6 +1,7 @@
 use alloc::collections::BTreeMap;
 use akuma_exec::threading::{WakeHandle, wake_by_handle, wake_handle_for_thread};
 use super::*;
+use core::sync::atomic::AtomicU32;
 
 struct KernelEventFd {
     counter: u64,

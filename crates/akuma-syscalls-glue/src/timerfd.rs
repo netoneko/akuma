@@ -1,4 +1,5 @@
 use super::*;
+use core::sync::atomic::AtomicU32;
 use alloc::collections::{BTreeMap, BTreeSet};
 
 struct TimerFdState {

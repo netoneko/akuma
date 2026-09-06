@@ -275,3 +275,65 @@ fn ids_are_not_reused_while_a_pipe_is_live() {
     t.close_read(a);
     assert_ne!(t.create(), a, "a destroyed id is not handed straight back");
 }
+
+#[test]
+fn a_zero_length_read_wakes_nobody() {
+    // `read(fd, buf, 0)` drains nothing, so it makes no room and a parked
+    // writer has nothing new to re-test. Waking on it is a spin — the same
+    // rule `write` applies to `Wrote(0)`, and what the AArch64 implementation
+    // this replaces did by only waking when it copied bytes out.
+    let mut t = T::new();
+    let id = t.create();
+    t.write(id, b"data");
+    t.add_poller(id, 7, 70);
+    let (r, wakes) = t.read(id, &mut []);
+    assert_eq!((r.bytes, r.eof), (0, false));
+    assert!(wakes.is_empty());
+    assert_eq!(t.poller_count(id), 1, "the waiter is still registered");
+    assert_eq!(t.buffered(id), 4, "and nothing was consumed");
+}
+
+#[test]
+fn a_zero_length_read_of_a_writerless_pipe_still_reports_eof() {
+    // The other half of the rule above: falling through to the EOF arm is
+    // deliberate, so `read(fd, buf, 0)` after the last writer went away is not
+    // reported as "not yet".
+    let mut t = T::new();
+    let id = t.create();
+    t.close_write(id);
+    let (r, _) = t.read(id, &mut []);
+    assert!(r.eof);
+}
+
+#[test]
+fn destroy_removes_a_pipe_whatever_its_counts_say() {
+    // For the allocator-managed lifetime: an amd64 `sys_spawn` pipe whose child
+    // end is reached by number and therefore never closes.
+    let mut t = T::new();
+    let id = t.create();
+    assert_eq!(t.counts(id), Some((1, 1)));
+    let (existed, _) = t.destroy(id);
+    assert!(existed);
+    assert!(!t.exists(id));
+    assert_eq!(t.live_count(), 0);
+}
+
+#[test]
+fn destroy_wakes_everyone_parked_on_the_pipe() {
+    // A waiter left registered on a destroyed pipe never retries, and its
+    // retry is the only thing that would tell it the pipe is gone.
+    let mut t = T::new();
+    let id = t.create();
+    t.add_poller(id, 3, 30);
+    t.add_poller(id, 4, 40);
+    let (_, wakes) = t.destroy(id);
+    assert_eq!(fired(wakes), vec![3, 4]);
+}
+
+#[test]
+fn destroying_a_missing_pipe_is_a_no_op() {
+    let mut t = T::new();
+    let (existed, wakes) = t.destroy(404);
+    assert!(!existed);
+    assert!(wakes.is_empty());
+}
