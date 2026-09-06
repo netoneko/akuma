@@ -262,6 +262,61 @@ def stage(cmdline_extra="", timeout=900):
     return rc, (out + err).strip()
 
 
+def restage_disk(keep_keys=True, timeout=600):
+    """Copy the freshly built `root.img` onto the persistent `sda1` root.
+
+    The box's own `/AKUMA_DISK.txt` marker records this as the procedure and
+    says "RE-STAGE after a fresh userspace build" — without it the persistent
+    root keeps whatever userspace it was last given while `/boot/akuma/root.img`
+    moves on, and the two disagree about which binaries the machine has. That
+    is not academic: with `root=/dev/sda1` the RAM image is not consulted at
+    all, so a freshly built `/bin/sshd` that exists only there is not the one
+    that runs.
+
+    `rsync --delete` is what makes the two identical, and it takes
+    `etc/sshd/authorized_keys` with it — the image carries only the generated
+    test key, so any key added by hand is lost. `keep_keys` saves that file
+    first and merges back any line the image does not have.
+
+    Ubuntu sees the partition as **`sdb1`** (its own disk is `sda`); Akuma sees
+    the same partition as `sda1`, because it enumerates only the USB one. Every
+    confusing moment in this loop has started with mixing those two up.
+    """
+    merge = ""
+    if keep_keys:
+        merge = (
+            'if [ -f /tmp/ak_keys.save ]; then\n'
+            '  while IFS= read -r k; do\n'
+            '    [ -n "$k" ] || continue\n'
+            '    grep -qF "$k" /mnt/akvol/etc/sshd/authorized_keys 2>/dev/null '
+            '|| echo "$k" >> /mnt/akvol/etc/sshd/authorized_keys\n'
+            '  done < /tmp/ak_keys.save\n'
+            'fi\n'
+        )
+    script = (
+        'set -e\n'
+        'mkdir -p /mnt/rimg /mnt/akvol\n'
+        'mountpoint -q /mnt/rimg  && umount /mnt/rimg  || true\n'
+        'mountpoint -q /mnt/akvol && umount /mnt/akvol || true\n'
+        'mount -o loop,ro /boot/akuma/root.img /mnt/rimg\n'
+        'mount /dev/sdb1 /mnt/akvol\n'
+        'cp -f /mnt/akvol/etc/sshd/authorized_keys /tmp/ak_keys.save 2>/dev/null || true\n'
+        'rsync -aH --delete /mnt/rimg/ /mnt/akvol/\n'
+        + merge +
+        'printf "staged from /boot/akuma/root.img by rsync -aH --delete on %s\\n'
+        'RE-STAGE after a fresh userspace build.\\n" "$(date -Is)" '
+        '> /mnt/akvol/AKUMA_DISK.txt\n'
+        'ls -la /mnt/akvol/bin/ssh /mnt/akvol/bin/sshd\n'
+        'cat /mnt/akvol/etc/sshd/authorized_keys\n'
+        'sync\n'
+        'umount /mnt/akvol\n'
+        'umount /mnt/rimg\n'
+        'echo RESTAGED\n'
+    )
+    rc, out, err = ubuntu(script, timeout=timeout)
+    return rc, (out + err).strip()
+
+
 def which_system(timeout=8):
     """'ubuntu', 'akuma', or 'unknown'. Asked, never assumed — port 22 is Ubuntu
     only, so a successful `uname` there is proof."""

@@ -3464,6 +3464,21 @@ pub fn redirect_test(t: &mut Suite) {
         pout.windows(6).any(|w| w == b"PIPEOK"),
     );
 
+    // 4. A **deep** pipeline. One `|` proves `pipe`+`dup2`; twelve proves the
+    // process ceiling is really gone (the old `proc_entry_for` handed out nine
+    // slots) and that nothing leaks a pipe, a process slot or a task per stage
+    // — each of which is a fixed-size table that a shell can exhaust.
+    let Some((dstatus, dout)) = run_sh_capture(b"echo DEEPOK | cat | cat | cat | cat | cat | cat | cat | cat | cat | cat | cat\0")
+    else {
+        t.check("redirect: sh spawned for the deep pipeline", false);
+        return;
+    };
+    t.check_eq("redirect: a 12-stage pipeline exited 0", dstatus, 0);
+    t.check(
+        "redirect: the bytes survived 12 stages",
+        dout.windows(6).any(|w| w == b"DEEPOK"),
+    );
+
     t.check_eq(
         "redirect: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
