@@ -613,7 +613,12 @@ field, which `mm.rs`'s header already names as the prerequisite.
 §2. `rustc` reads large `.rlib`s and metadata; `open` currently means "allocate
 the file's size and read all of it".
 
-### 6. `PT_INTERP` is refused — static-PIE only
+### 6. `PT_INTERP` is refused — static-PIE only — **DONE 2026-09-06**
+
+**Closed.** The loader places the interpreter at `INTERP_BASE` and reports
+`AT_BASE`; a stock Alpine dynamically-linked `busybox` runs.
+See `docs/archive/AKUMA_AMD64_DYNAMIC_LINKING.md`.
+
 
 `amd64/src/loader.rs:404`:
 

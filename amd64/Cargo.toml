@@ -114,6 +114,15 @@ akuma-dmesg = { path = "../crates/akuma-dmesg" }
 # can, and the formats are where a divergence is invisible: `ps` finds `utime`
 # by counting to field 14 of a 44-field line.
 akuma-procfs = { path = "../crates/akuma-procfs" }
+# The per-process frame ledger — which physical frames a process holds and how
+# many VAs map each, with the two-counts rule and 14 host tests. Replaced this
+# target's `FrameSet`, a 2048-entry flat array with no refcounts whose ceiling
+# was reachable from a shell (`sh: can't fork: Out of memory`). The refcount is
+# also CoW's teardown prerequisite. Shared with the AArch64 kernel's
+# `UserAddressSpace`, so the two targets account for user frames identically.
+akuma-user-space = { path = "../crates/akuma-user-space" }
+# `PhysFrame`, the ledger's currency.
+akuma-mmap = { path = "../crates/akuma-mmap" }
 # The console line discipline: canonical mode, echo, backspace, Ctrl+D, and
 # `map_cr_to_nl`. Hand-rolling a console reader hits the CR-vs-NL bug on the
 # first Enter keypress; this crate is the tree's answer and is dependency-free.

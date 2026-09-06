@@ -334,6 +334,51 @@ if [ -f "$APK_STATIC_APK" ]; then
     printf '' > "$TMP/apk-empty"
     "$DEBUGFS" -w -R "write $TMP/apk-empty lib/apk/db/installed" "$IMG" >/dev/null 2>&1
     "$DEBUGFS" -w -R "write $TMP/apk-empty lib/apk/db/triggers" "$IMG" >/dev/null 2>&1
+    # The dynamic linker, and a dynamically-linked binary to prove it runs.
+    #
+    # Every other binary on this image is static or static-PIE, because until
+    # 2026-09-06 the loader refused `PT_INTERP` outright. Alpine's stock
+    # `busybox` package is the opposite shape — `ET_DYN` with
+    # `PT_INTERP=/lib/ld-musl-x86_64.so.1` — so it exercises the whole path the
+    # kernel is now responsible for: place the program, place the linker at
+    # `INTERP_BASE`, enter at the *linker's* entry, and report `AT_BASE`.
+    # Everything after that happens in ring 3.
+    #
+    # Installed as `/bin/busybox.dyn`, NOT over `/bin/busybox`: the static one
+    # is what `init=` and every `sh` on this image runs, and swapping it would
+    # make a dynamic-linking regression look like the machine failing to boot.
+    MUSL_RT_APK="$APK_VENDOR/musl.apk"
+    BB_DYN_APK="$APK_VENDOR/busybox-dyn.apk"
+    [ -f "$MUSL_RT_APK" ] || curl -sSLf -o "$MUSL_RT_APK" \
+        "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/musl-1.2.6-r2.apk" \
+        || rm -f "$MUSL_RT_APK"
+    [ -f "$BB_DYN_APK" ] || curl -sSLf -o "$BB_DYN_APK" \
+        "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/busybox-1.37.0-r31.apk" \
+        || rm -f "$BB_DYN_APK"
+    if [ -f "$MUSL_RT_APK" ] && [ -f "$BB_DYN_APK" ]; then
+        DYN="$TMP/dyn"
+        mkdir -p "$DYN"
+        # apk files are gzipped tars with a signature member first; `tar` on a
+        # concatenated stream reads the first archive only, so name the members
+        # explicitly and ignore the exit status of the signature pass.
+        #
+        # Absolute paths, not `$OLDPWD`: the first `cd` moves it, so a second
+        # `$OLDPWD`-relative path in the same subshell resolves somewhere else.
+        # That is how the interpreter landed and `busybox.dyn` silently did not.
+        MUSL_RT_ABS=$(cd "$(dirname "$MUSL_RT_APK")" && pwd)/$(basename "$MUSL_RT_APK")
+        BB_DYN_ABS=$(cd "$(dirname "$BB_DYN_APK")" && pwd)/$(basename "$BB_DYN_APK")
+        ( cd "$DYN" && tar xzf "$MUSL_RT_ABS" lib/ld-musl-x86_64.so.1 2>/dev/null
+          tar xzf "$BB_DYN_ABS" bin/busybox 2>/dev/null ) || true
+        if [ -f "$DYN/lib/ld-musl-x86_64.so.1" ]; then
+            "$DEBUGFS" -w -R "write $DYN/lib/ld-musl-x86_64.so.1 lib/ld-musl-x86_64.so.1" \
+                "$IMG" >/dev/null 2>&1
+            echo "  + /lib/ld-musl-x86_64.so.1"
+        fi
+        if [ -f "$DYN/bin/busybox" ]; then
+            "$DEBUGFS" -w -R "write $DYN/bin/busybox bin/busybox.dyn" "$IMG" >/dev/null 2>&1
+            echo "  + /bin/busybox.dyn (dynamically linked)"
+        fi
+    fi
     "$DEBUGFS" -w -R "mkdir /var" "$IMG" >/dev/null 2>&1
     "$DEBUGFS" -w -R "mkdir /var/cache" "$IMG" >/dev/null 2>&1
     "$DEBUGFS" -w -R "mkdir /var/cache/apk" "$IMG" >/dev/null 2>&1

@@ -89,6 +89,8 @@ use elf::endian::LittleEndian;
 use elf::file::{Class, FileHeader};
 use elf::segment::SegmentTable;
 
+use akuma_mmap::PhysFrame;
+
 use crate::paging::{AddressSpace, MemAttr, Prot};
 use crate::phys::phys_ptr;
 
@@ -124,28 +126,8 @@ const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
-
-/// How many frames one process may own.
-///
-/// A fixed array rather than a `Vec`: this is teardown bookkeeping on a path
-/// that runs under memory pressure, and the kernel's own rule is that the best
-/// code allocates nothing.
-///
-/// For a loader-built process this only has to cover **image + stack** — static
-/// musl busybox is ~275 pages of segments plus the 128-page stack — and its
-/// `mmap`/heap frames are tracked separately (`mm::release_anon_frames`).
-///
-/// But a **`fork`** child's `FrameSet` holds a copy of *every* mapped user page
-/// — image, stack, heap and all (`Process::fork_from`) — because there is no
-/// CoW and teardown must find them. A long-lived interactive shell can map well
-/// past 512 pages, and hitting the cap makes `fork` return `ENOMEM` (the user
-/// sees `sh: can't fork: Out of memory` on a box with 500 MiB free). 2048
-/// covers busybox plus a generous heap; the buffer is heap-allocated (see
-/// [`FrameSet`]), so raising this only costs 8 bytes/entry per live process. A
-/// CoW `fork` plus the region list this array stands in for removes the cap
-/// entirely (§3.26.5).
-pub const MAX_PROC_FRAMES: usize = 2048;
 
 /// Every physical frame a process owns, so teardown can give them all back.
 ///
@@ -153,64 +135,64 @@ pub const MAX_PROC_FRAMES: usize = 2048;
 /// deliberately, since the tables are its own and the leaves are the caller's.
 /// This is that caller's half of the bargain.
 ///
-/// The `MAX_PROC_FRAMES`-word buffer lives on the **heap** (a boxed slice), not
-/// inline: at `[usize; 2048]` an inline array made `Process` 16 KiB, and every
-/// by-value move of one — `Process::new` returning two into a tuple,
-/// `fork_from` returning `Option<Process>` on a 32 KiB task stack — overflowed
-/// the stack into a `#PF` that looked like anything but. One 16 KiB heap block
-/// per live process is the fix; teardown reads it and never allocates.
-pub struct FrameSet {
-    frames: alloc::boxed::Box<[usize]>,
-    len: usize,
-}
+/// # This was a 2048-entry flat array until 2026-09-06
+///
+/// `FrameSet` was a `Box<[usize; 2048]>` — 16 KiB of heap per live
+/// process, a hard ceiling, and `free_all` calling `free_page` unconditionally
+/// on every entry. Three things were wrong with it and all three are gone:
+///
+/// 1. **The ceiling was reachable from a shell.** A `fork` needs one entry per
+///    mapped user page and busybox is ~400 pages, so a pipeline of a few
+///    children ran the array out and `fork` returned `ENOMEM` — `sh` printing
+///    `can't fork: Out of memory` on an otherwise idle 2 GiB machine. A
+///    `BTreeMap` has no ceiling.
+/// 2. **It could not count.** Every entry was freed exactly once at teardown,
+///    which is correct only while no two mappings share a frame — i.e. only
+///    while there is no CoW. A refcount per frame is the *prerequisite* for
+///    CoW, not a consequence of it: the fault handler can be written without
+///    one, and teardown then frees a page the sibling is still reading.
+/// 3. **It was a worse copy of something already host-tested.**
+///    `akuma_user_space::FrameLedger` is the same job with the two-counts rule
+///    and 14 tests behind it (`docs/archive/AKUMA_USER_SPACE_LEDGER.md`), and
+///    it builds for `x86_64-unknown-none`.
+///
+/// The AArch64 kernel's `UserAddressSpace` holds one of these too, so the two
+/// targets now account for user frames identically.
+pub type FrameSet = akuma_user_space::FrameLedger;
 
-impl Default for FrameSet {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FrameSet {
-    #[must_use]
-    pub fn new() -> Self {
-        // A repeat `vec!` allocates and fills on the heap directly — no
-        // MAX_PROC_FRAMES-word stack temporary on the way to the box.
-        Self {
-            frames: alloc::vec![0usize; MAX_PROC_FRAMES].into_boxed_slice(),
-            len: 0,
-        }
-    }
-
-    /// Record a frame. Returns false when full, which the caller must treat as
-    /// a load failure — a frame that is not recorded is a frame that leaks.
-    pub fn push(&mut self, pa: usize) -> bool {
-        if self.len >= MAX_PROC_FRAMES {
-            return false;
-        }
-        self.frames[self.len] = pa;
-        self.len += 1;
-        true
-    }
-
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Return every frame to the PMM and forget them.
-    pub fn free_all(&mut self) {
-        for &pa in self.frames.iter().take(self.len) {
-            akuma_pmm::free_page(pa, 0);
-        }
-        self.len = 0;
+/// Hand every frame in `ledger` back to the PMM, emptying it.
+///
+/// Freeing is the caller's job by design — `FrameLedger` deliberately cannot
+/// call the PMM to release a frame, so that the crate stays a ledger rather
+/// than an allocator. This is amd64's half.
+///
+/// **Each distinct frame is freed once, whatever its count.** The count is
+/// virtual addresses, not frames: a page mapped at two VAs is still one page to
+/// give back, and freeing per count is a double free.
+pub fn free_all_frames(ledger: &FrameSet) {
+    for (pa, _vas) in ledger.take_user_frames() {
+        akuma_pmm::free_page(pa, 0);
     }
 }
 
 /// What a successful load produced.
 pub struct LoadedImage {
-    /// `base + e_entry` — where `enter_user_mode` jumps. Equal to `e_entry`
-    /// for an `ET_EXEC` image (`base` is 0 there).
+    /// Where `enter_user_mode` jumps. `base + e_entry` for a static image, and
+    /// the **dynamic linker's** entry for one with a `PT_INTERP` — the linker
+    /// brings the program up and jumps to it itself.
     pub entry: u64,
+    /// The program's own entry point, for `AT_ENTRY`. Equal to [`Self::entry`]
+    /// for a static image; for a dynamic one it is what the linker jumps to
+    /// when it is finished, so reporting the linker's own here would loop.
+    pub prog_entry: u64,
+    /// Where the dynamic linker was placed, for `AT_BASE`. `0` for a static
+    /// image, which is also what Linux reports there.
+    ///
+    /// Not decoration: a PIE interpreter is linked at 0 and has no other way to
+    /// find its own relocations. Omit it and `ld-musl` self-relocates against
+    /// address 0 and faults in the first page before it runs a line of the
+    /// program.
+    pub interp_base: u64,
     /// Page-aligned end of the highest `PT_LOAD`. Where a `brk` heap would
     /// start; recorded now because it is free to compute here and impossible to
     /// recover later.
@@ -306,7 +288,7 @@ fn write_user(space: &AddressSpace, va: u64, src: &[u8]) -> bool {
 /// in it — the same rule the demand-paging handler follows.
 fn map_range(
     space: &AddressSpace,
-    frames: &mut FrameSet,
+    frames: &FrameSet,
     start: u64,
     end: u64,
     prot: Prot,
@@ -330,12 +312,12 @@ fn map_range(
             let pa = akuma_pmm::alloc_page().ok_or("out of frames loading a segment")? as u64;
             // SAFETY: a fresh PMM frame, reached through the physmap.
             unsafe { core::ptr::write_bytes(phys_ptr::<u8>(pa), 0, PAGE_SIZE) };
-            // Recorded before it is mapped: a frame the set does not know about
-            // is a frame that leaks, and `map` can fail.
-            if !frames.push(pa as usize) {
-                akuma_pmm::free_page(pa as usize, 0);
-                return Err("image needs more frames than a process may own");
-            }
+            // Recorded before it is mapped: a frame the ledger does not know
+            // about is a frame that leaks, and `map` can fail. The ledger has
+            // no capacity to run out of, so this no longer has a failure arm —
+            // the "image needs more frames than a process may own" error is
+            // gone with `MAX_PROC_FRAMES`.
+            frames.track_user_frame(PhysFrame::new(pa as usize));
             if !space.map(va as usize, pa, prot, MemAttr::WriteBack) {
                 return Err("could not map a segment page");
             }
@@ -347,15 +329,20 @@ fn map_range(
 
 /// Parse `image` and place its `PT_LOAD` segments into `space`.
 ///
+/// `force_base` overrides where a PIE lands; `None` uses [`PIE_BASE`] for an
+/// `ET_DYN` image and 0 for `ET_EXEC`. It exists for the dynamic linker, which
+/// is itself an `ET_DYN` image and must not land on top of the program.
+///
 /// On failure the frames allocated so far are still recorded in `frames`, so
 /// the caller can free them; nothing is freed here, because a half-loaded image
 /// whose frames were silently reclaimed would leave `space`'s page tables
 /// pointing at memory the PMM had handed to someone else.
-pub fn load(
+fn place_image(
     image: &[u8],
     space: &AddressSpace,
-    frames: &mut FrameSet,
-) -> Result<LoadedImage, &'static str> {
+    frames: &FrameSet,
+    force_base: Option<u64>,
+) -> Result<Placed, &'static str> {
     if image.len() < ELF64_EHDR_SIZE {
         return Err("image is shorter than an ELF64 header");
     }
@@ -378,7 +365,11 @@ pub fn load(
     // `p_vaddr` values in a PIE start near 0 (linked as if loaded at 0); an
     // `ET_EXEC` image links at its real address, so `base` is 0 there and
     // every `base + p_vaddr` below is unchanged from before this existed.
-    let base = if is_pie { PIE_BASE } else { 0 };
+    let base = match force_base {
+        Some(b) => b,
+        None if is_pie => PIE_BASE,
+        None => 0,
+    };
     // PN_XNUM keeps the real count in shdr[0].sh_info. Nothing here comes near
     // 65535 segments, so reject it rather than mis-read the table as that many.
     if ehdr.e_phnum == elf::abi::PN_XNUM {
@@ -397,13 +388,30 @@ pub fn load(
     let phdrs = image.get(phoff..phend).ok_or("program header table past end of image")?;
     let segments = SegmentTable::new(ehdr.endianness, ehdr.class, phdrs);
 
-    // A dynamically-linked binary (one that names a real interpreter) is
-    // still refused outright — see the module header's "What it refuses".
-    // Checked before placing anything, so a rejected image leaves no frames
-    // behind to unwind.
-    if segments.iter().any(|ph| ph.p_type == PT_INTERP) {
-        return Err("PT_INTERP present — this kernel has no dynamic linker, only static-PIE");
-    }
+    // A `PT_INTERP` segment names the dynamic linker. Read the path out here
+    // and hand it to the caller; placing it is `load`'s job, because it needs a
+    // second image and this function only places one.
+    //
+    // The path is a NUL-terminated string in the file, not a segment to map —
+    // `p_filesz` includes the NUL, so trim it rather than carrying it into a
+    // `read_file` that would then miss.
+    let interp = segments
+        .iter()
+        .find(|ph| ph.p_type == PT_INTERP)
+        .map(|ph| -> Result<alloc::string::String, &'static str> {
+            let off = usize::try_from(ph.p_offset).map_err(|_| "interp offset overflow")?;
+            let len = usize::try_from(ph.p_filesz).map_err(|_| "interp size overflow")?;
+            if len == 0 || len > 256 {
+                return Err("implausible PT_INTERP length");
+            }
+            let end = off.checked_add(len).ok_or("interp range overflow")?;
+            let raw = image.get(off..end).ok_or("PT_INTERP past end of image")?;
+            let raw = raw.strip_suffix(b"\0").unwrap_or(raw);
+            core::str::from_utf8(raw)
+                .map(alloc::string::String::from)
+                .map_err(|_| "PT_INTERP path is not UTF-8")
+        })
+        .transpose()?;
 
     let mut placed = 0usize;
     let mut end_va = 0u64;
@@ -495,7 +503,105 @@ pub fn load(
         })
         .unwrap_or(0);
 
-    Ok(LoadedImage { entry, end_va, segments: placed, phdr_addr, phnum: ehdr.e_phnum, phent: ehdr.e_phentsize })
+    Ok(Placed {
+        entry,
+        end_va,
+        segments: placed,
+        phdr_addr,
+        phnum: ehdr.e_phnum,
+        phent: ehdr.e_phentsize,
+        interp,
+    })
+}
+
+/// One placed image. [`load`] turns one or two of these into a [`LoadedImage`].
+struct Placed {
+    entry: u64,
+    end_va: u64,
+    segments: usize,
+    phdr_addr: u64,
+    phnum: u16,
+    phent: u16,
+    /// The `PT_INTERP` path, if this image names a dynamic linker.
+    interp: Option<alloc::string::String>,
+}
+
+/// Where the dynamic linker is placed.
+///
+/// Between [`PIE_BASE`] (0x1000_0000) and `mm::MMAP_BASE` (0x1_0000_0000), so
+/// it collides with neither the program below it nor the mmap window above.
+/// An `ET_EXEC` program links lower still (busybox at 0x40_0000), so both
+/// program shapes clear it.
+const INTERP_BASE: u64 = 0x4000_0000;
+
+/// Parse `image`, place it, and place its dynamic linker if it names one.
+///
+/// # Dynamic linking
+///
+/// A `PT_INTERP` segment names an interpreter — `/lib/ld-musl-x86_64.so.1` for
+/// everything Alpine ships. The kernel's job is small and entirely mechanical:
+///
+/// 1. Place the program, as always.
+/// 2. Place the interpreter, an `ET_DYN` image, at [`INTERP_BASE`].
+/// 3. **Enter at the interpreter's** entry point, not the program's.
+/// 4. Tell the interpreter where it landed (`AT_BASE`) and where the program
+///    is (`AT_PHDR`/`AT_PHNUM`/`AT_PHENT`/`AT_ENTRY`).
+///
+/// Everything after that — mapping the shared libraries, resolving symbols,
+/// running initialisers, jumping to the program — happens in ring 3, in the
+/// interpreter, using syscalls this kernel already serves. There is no
+/// kernel-side symbol resolution and there never should be.
+///
+/// The auxv is the whole interface, which is why `AT_BASE` matters: a PIE
+/// interpreter linked at 0 has no other way to find its own relocations, and
+/// omitting it makes `ld-musl` self-relocate against address 0 and fault
+/// immediately with a `cr2` in the first page.
+pub fn load(
+    image: &[u8],
+    space: &AddressSpace,
+    frames: &FrameSet,
+) -> Result<LoadedImage, &'static str> {
+    let main = place_image(image, space, frames, None)?;
+
+    let Some(interp_path) = main.interp.as_deref() else {
+        return Ok(LoadedImage {
+            entry: main.entry,
+            prog_entry: main.entry,
+            interp_base: 0,
+            end_va: main.end_va,
+            segments: main.segments,
+            phdr_addr: main.phdr_addr,
+            phnum: main.phnum,
+            phent: main.phent,
+        });
+    };
+
+    let interp_image =
+        crate::fs::read_file(interp_path).ok_or("PT_INTERP names a file that is not on the disk")?;
+    let interp = place_image(&interp_image, space, frames, Some(INTERP_BASE))?;
+    if interp.interp.is_some() {
+        // An interpreter that names an interpreter is either a corrupt image or
+        // a loop. Neither is worth chasing at load time.
+        return Err("the dynamic linker itself names a PT_INTERP");
+    }
+
+    Ok(LoadedImage {
+        // Ring 3 is entered in the linker, which brings the program up itself.
+        entry: interp.entry,
+        // `AT_ENTRY` stays the *program's* entry: it is what the linker jumps
+        // to once it is done, and reporting the linker's own would loop.
+        prog_entry: main.entry,
+        interp_base: INTERP_BASE,
+        // The heap starts past the program, not past the linker: `brk` grows up
+        // from the program image and the linker sits above it either way.
+        end_va: main.end_va,
+        segments: main.segments + interp.segments,
+        // The program's headers, not the linker's — the linker reads these to
+        // find what it is loading.
+        phdr_addr: main.phdr_addr,
+        phnum: main.phnum,
+        phent: main.phent,
+    })
 }
 
 /// Map a stack below `top` and lay out the System V initial frame on it.
@@ -531,11 +637,17 @@ pub const MAX_ARGV: usize = 16;
 pub const MAX_ENVP: usize = 32;
 
 /// Words in the fixed word block: argc, argv ptrs + NULL, envp ptrs + NULL,
-/// and five auxv pairs (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`,
-/// `AT_ENTRY`, `AT_NULL` — six, not five; the name undercounts by one on
-/// purpose-adjacent history, see the `aux` word count below which is the
-/// number that actually matters).
-const STACK_WORDS_MAX: usize = 1 + (MAX_ARGV + 1) + (MAX_ENVP + 1) + 12;
+/// and the auxv — **seven** key/value pairs, so fourteen words: `AT_PHDR`,
+/// `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_BASE`, `AT_NULL`.
+///
+/// This must be kept in step with the `words` computation in [`build_stack`],
+/// which writes into a `[u8; STACK_WORDS_MAX * 8]`. It is the *bound*, not the
+/// count — the assertion below is what makes a drift a build failure instead of
+/// an index-out-of-bounds panic in the kernel on the first program with a full
+/// argv. `AT_BASE` was added on 2026-09-06 and this constant was **not** bumped
+/// with it, which is exactly the shape of bug the assertion now prevents.
+const AUXV_WORDS: usize = 14;
+const STACK_WORDS_MAX: usize = 1 + (MAX_ARGV + 1) + (MAX_ENVP + 1) + AUXV_WORDS;
 
 /// As [`load`]'s return value: `AT_PHDR`/`AT_PHNUM`/`AT_PHENT` are what let a
 /// static-PIE binary (`apk`) find its own program headers and self-relocate
@@ -544,7 +656,7 @@ const STACK_WORDS_MAX: usize = 1 + (MAX_ARGV + 1) + (MAX_ENVP + 1) + 12;
 /// words and nothing else.
 pub fn build_stack(
     space: &AddressSpace,
-    frames: &mut FrameSet,
+    frames: &FrameSet,
     top: u64,
     pages: usize,
     argv: &[&[u8]],
@@ -582,9 +694,13 @@ pub fn build_stack(
     let strings_base = cursor & !0xf;
 
     // argc, one pointer per argv entry, argv NULL, one per envp entry, envp
-    // NULL, six auxv pairs (AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_ENTRY,
-    // AT_NULL).
-    let words = 1 + argv.len() + 1 + envp.len() + 1 + 12;
+    // NULL, seven auxv pairs (AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_ENTRY,
+    // AT_BASE, AT_NULL).
+    let words = 1 + argv.len() + 1 + envp.len() + 1 + AUXV_WORDS;
+    debug_assert!(
+        words <= STACK_WORDS_MAX,
+        "the auxv grew past what STACK_WORDS_MAX budgets"
+    );
     let rsp = (strings_base - (words as u64) * 8) & !0xf;
     if rsp < base {
         return Err("initial stack frame does not fit");
@@ -614,9 +730,13 @@ pub fn build_stack(
     put(aux + 6, AT_PAGESZ);
     put(aux + 7, PAGE_SIZE as u64);
     put(aux + 8, AT_ENTRY);
-    put(aux + 9, img.entry);
-    put(aux + 10, AT_NULL);
-    put(aux + 11, 0);
+    // The *program's* entry, which for a dynamic image is not where ring 3 is
+    // entered. See `LoadedImage::prog_entry`.
+    put(aux + 9, img.prog_entry);
+    put(aux + 10, AT_BASE);
+    put(aux + 11, img.interp_base);
+    put(aux + 12, AT_NULL);
+    put(aux + 13, 0);
 
     for (&va, a) in arg_va.iter().zip(argv).chain(env_va.iter().zip(envp)) {
         if !write_user(space, va, a) || !write_user(space, va + a.len() as u64, &[0]) {

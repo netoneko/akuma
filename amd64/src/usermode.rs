@@ -30,6 +30,8 @@ use akuma_syscalls_abi::Syscall;
 use akuma_selftest::Suite;
 
 use crate::gdt;
+use akuma_mmap::PhysFrame;
+
 use crate::loader::{self, FrameSet};
 use crate::paging::{self, MemAttr, Prot};
 use crate::phys::phys_ptr;
@@ -1660,20 +1662,17 @@ impl Process {
     /// cannot fail for a loader's reasons.
     fn new(msg: &[u8], rounds: u32, delay: u32, status: u32) -> Option<Self> {
         let space = paging::AddressSpace::new()?;
-        let mut frames = FrameSet::new();
+        let frames = FrameSet::new(false);
 
         let (Some(code), Some(stack)) = (akuma_pmm::alloc_page(), akuma_pmm::alloc_page()) else {
             space.free();
             return None;
         };
-        // Recorded before anything can fail: a frame the set does not know
-        // about is a frame that leaks.
-        if !frames.push(code) || !frames.push(stack) {
-            akuma_pmm::free_page(code, 0);
-            akuma_pmm::free_page(stack, 0);
-            space.free();
-            return None;
-        }
+        // Recorded before anything can fail: a frame the ledger does not know
+        // about is a frame that leaks. There is no refusal arm — the ledger has
+        // no capacity to exhaust, which is what `MAX_PROC_FRAMES` used to be.
+        frames.track_user_frame(PhysFrame::new(code));
+        frames.track_user_frame(PhysFrame::new(stack));
 
         // SAFETY: PMM frames are reachable through the physmap, so the program
         // can be staged *before* the address space that will hold it is ever
@@ -1688,7 +1687,7 @@ impl Process {
         if !space.map(USER_CODE_VA, code as u64, Prot::USER_RX, MemAttr::WriteBack)
             || !space.map(USER_STACK_VA, stack as u64, Prot::USER_RW, MemAttr::WriteBack)
         {
-            frames.free_all();
+            loader::free_all_frames(&frames);
             space.free();
             return None;
         }
@@ -1733,12 +1732,12 @@ impl Process {
         envp: &[&[u8]],
     ) -> Result<(Self, loader::LoadedImage), &'static str> {
         let space = paging::AddressSpace::new().ok_or("no frame for a PML4")?;
-        let mut frames = FrameSet::new();
+        let frames = FrameSet::new(false);
 
-        let built = loader::load(image, &space, &mut frames).and_then(|img| {
+        let built = loader::load(image, &space, &frames).and_then(|img| {
             loader::build_stack(
                 &space,
-                &mut frames,
+                &frames,
                 ELF_STACK_TOP,
                 ELF_STACK_PAGES,
                 argv,
@@ -1754,14 +1753,14 @@ impl Process {
                 Ok((Self { space, frames, entry, stack, forked: false }, img))
             }
             Err(e) => {
-                frames.free_all();
+                loader::free_all_frames(&frames);
                 space.free();
                 Err(e)
             }
         }
     }
 
-    fn free(mut self) {
+    fn free(self) {
         // A `fork` child's `FrameSet` already holds *every* mapped page,
         // anonymous ones included (`fork_from` copied them). A loader-built
         // process's does not — its `mmap`/heap frames are untracked, so walk
@@ -1770,7 +1769,7 @@ impl Process {
         if !self.forked {
             crate::mm::release_anon_frames(&self.space);
         }
-        self.frames.free_all();
+        loader::free_all_frames(&self.frames);
         self.space.free();
     }
 
@@ -1783,7 +1782,7 @@ impl Process {
     /// which is a survivable "can't fork" rather than a corrupt child.
     fn fork_from(parent: &Self, entry: u64, stack: u64) -> Option<Self> {
         let space = paging::AddressSpace::new()?;
-        let mut frames = FrameSet::new();
+        let frames = FrameSet::new(false);
         let mut ok = true;
 
         paging::for_each_user_leaf(parent.space.root(), |va, pa, prot| {
@@ -1803,14 +1802,22 @@ impl Process {
                     4096,
                 );
             }
-            if !frames.push(frame) || !space.map(va, frame as u64, prot, MemAttr::WriteBack) {
-                akuma_pmm::free_page(frame, 0);
+            let tracked = PhysFrame::new(frame);
+            frames.track_user_frame(tracked);
+            if !space.map(va, frame as u64, prot, MemAttr::WriteBack) {
+                // Hand the ledger's claim back before freeing, or the bail-out
+                // below frees this frame a second time. `remove_user_frame`
+                // returning `true` is what says the free is ours to do — the
+                // same contract the CoW teardown will need.
+                if frames.remove_user_frame(tracked) {
+                    akuma_pmm::free_page(frame, 0);
+                }
                 ok = false;
             }
         });
 
         if !ok {
-            frames.free_all();
+            loader::free_all_frames(&frames);
             space.free();
             return None;
         }
@@ -3423,7 +3430,7 @@ pub fn elf_test(t: &mut Suite) {
     // .rodata and two stack pages the total cannot be a single-page accident.
     t.check(
         "elf: frames owned covers image and stack",
-        proc.frames.len() >= 12 && proc.frames.len() <= loader::MAX_PROC_FRAMES,
+        proc.frames.user_frame_count() >= 12,
     );
 
     // The entry point is what the file said, not what the kernel assumed. Read
@@ -3555,9 +3562,9 @@ fn reject_test(t: &mut Suite) {
             t.check(name, false);
             continue;
         };
-        let mut frames = FrameSet::new();
-        let refused = loader::load(&img, &space, &mut frames).is_err();
-        frames.free_all();
+        let frames = FrameSet::new(false);
+        let refused = loader::load(&img, &space, &frames).is_err();
+        loader::free_all_frames(&frames);
         space.free();
         t.check(name, refused);
     }
@@ -3567,9 +3574,9 @@ fn reject_test(t: &mut Suite) {
         let Some(space) = paging::AddressSpace::new() else {
             return;
         };
-        let mut frames = FrameSet::new();
-        let refused = loader::load(&HELLO_ELF[..48], &space, &mut frames).is_err();
-        frames.free_all();
+        let frames = FrameSet::new(false);
+        let refused = loader::load(&HELLO_ELF[..48], &space, &frames).is_err();
+        loader::free_all_frames(&frames);
         space.free();
         refused
     });
