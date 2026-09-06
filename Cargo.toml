@@ -36,6 +36,7 @@ default-members = [
     "crates/akuma-net-yarn",
     "crates/akuma-fbcon",
     "crates/akuma-pipe",
+    "crates/akuma-pipes",
     "crates/akuma-pmm",
     "crates/akuma-bkl",
     "crates/akuma-boot",

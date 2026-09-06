@@ -1,0 +1,9 @@
+[package]
+name = "akuma-pipes"
+version = "0.1.0"
+edition = "2024"
+
+# Only the buffer leaf. Deliberately **not** `akuma-threading`: waking a waiter
+# is an effect this crate returns rather than performs — see the crate docs.
+[dependencies]
+akuma-pipe = { path = "../akuma-pipe" }

@@ -459,6 +459,13 @@ name = "akuma-pipe"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-pipes"
+version = "0.1.0"
+dependencies = [
+ "akuma-pipe",
+]
+
+[[package]]
 name = "akuma-pmm"
 version = "0.1.0"
 dependencies = [
