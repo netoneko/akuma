@@ -750,6 +750,13 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         // kernel's own boot/diagnostic output over ssh — the only way to read
         // it on the reference box, whose console is a write-only framebuffer.
         103 => return sys_syslog(a1, a2, a3),
+        // `statfs(path, buf)` / `fstatfs(fd, buf)` — x86_64 137 / 138. `busybox
+        // df` reads `/proc/mounts` and then calls `statfs` once per line; with
+        // neither of them it printed a header and nothing else. Both report the
+        // mount that actually serves the path, out of `fs.rs`'s mount table,
+        // rather than one set of hardcoded numbers for the whole kernel.
+        137 => return crate::fd::sys_statfs(a1, a2),
+        138 => return crate::fd::sys_fstatfs(a1, a2),
         // `reboot(magic1, magic2, cmd, arg)` — x86_64 169. The ABI decode is
         // shared with the aarch64 kernel (`akuma-boot`); the x86 machine reset
         // under it is `reboot.rs`. `busybox reboot`/`halt`/`poweroff` all land

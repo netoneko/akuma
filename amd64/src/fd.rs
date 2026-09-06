@@ -482,6 +482,17 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
         // actually parses are filled — physical RAM the PMM was handed, what it
         // has free, and the kernel heap folded into `Cached` so the number
         // moves when a file-cache leak (see `net::mem_watch_tick`) is eating it.
+        // `busybox df` reads this **first** — it enumerates mounts here and
+        // then calls `statfs` on each one, so with no `/proc/mounts` it prints
+        // a header and nothing else no matter how well `statfs` works. Rendered
+        // from the mount table rather than stored, like every other file here.
+        if rest == "mounts" || rest == "self/mounts" {
+            // 8 mounts (`MountSet<8>`) x a line that cannot exceed ~120 bytes:
+            // a source, a mount point, an fs type and a fixed options column.
+            let mut buf = [0u8; 1024];
+            let n = fs::render_mounts(&mut buf);
+            return install_synthetic_file("/proc/mounts", buf[..n].to_vec(), flags_);
+        }
         if rest == "meminfo" {
             let page = 4096u64;
             let total_kib = akuma_pmm::total_count() as u64 * page / 1024;
@@ -1417,6 +1428,94 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     0
 }
 
+/// `statfs` magic numbers, keyed by `Filesystem::name()` — the same table the
+/// AArch64 kernel keeps in `akuma-syscalls-glue`. `df` prints the mount's type
+/// from `/proc/mounts`, but anything reading `f_type` (a libc `fstatfs`, a
+/// build system checking for tmpfs) wants the real constant.
+const fn fs_magic(name_is_ext2: bool) -> i64 {
+    if name_is_ext2 { 0xEF53 } else { 0xADF5 }
+}
+
+/// Fill a user `struct statfs` from whichever mount serves `path`.
+///
+/// The layout is `asm-generic`'s, identical on x86_64 and aarch64, so the
+/// `Statfs` in `akuma-syscalls-linux` — whose 120-byte size and three field
+/// offsets are `const`-asserted there — is shared rather than re-declared. A
+/// re-declaration is exactly how the aarch64 side once shipped a 120 nothing
+/// could check.
+fn statfs_into(path: &str, buf: u64) -> u64 {
+    let (name, stats, flags) = match fs::stats_for_path(path) {
+        Ok(v) => v,
+        Err(akuma_vfs::FsError::NotFound) => return errno::ENOENT,
+        Err(_) => return errno::ENOSYS,
+    };
+    let bs = i64::from(stats.block_size);
+    // Saturating rather than `as`: `struct statfs` is signed and these are not,
+    // and a wrapped block count would make `df` print a negative size instead
+    // of an implausible one. No filesystem reaches the clamp; the point is that
+    // the conversion says what it does.
+    let blocks = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+    let st = akuma_syscalls_linux::Statfs {
+        f_type: fs_magic(name == "ext2"),
+        f_bsize: bs,
+        f_blocks: blocks(stats.total_blocks),
+        f_bfree: blocks(stats.free_blocks),
+        // No reservation for root on this target, so available == free. Saying
+        // otherwise would make `df` report a Use% that never reaches 100.
+        f_bavail: blocks(stats.free_blocks),
+        // `akuma-ext2`'s `FsStats` carries no inode counts. Zero is what Linux
+        // reports for a filesystem with no fixed inode table, and `df -i` shows
+        // it as such rather than inventing a number.
+        f_files: 0,
+        f_ffree: 0,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: bs,
+        f_flags: i64::try_from(flags).unwrap_or(0),
+        f_spare: [0; 4],
+    };
+    // `write_val` rather than a hand-rolled byte view: `Statfs` is `repr(C)`
+    // plain data, which is exactly the `T` that helper takes, and it already
+    // owns the one `unsafe` this needs.
+    if crate::uaccess::write_val(buf, st) { 0 } else { errno::EFAULT }
+}
+
+/// `statfs(path, buf)` — x86_64 137. `busybox df` calls this for every line it
+/// read out of `/proc/mounts`; without it `df` printed its header and stopped.
+pub fn sys_statfs(path: u64, buf: u64) -> u64 {
+    let Some(path) = path_from_user(path) else {
+        return errno::EFAULT;
+    };
+    // `AT_FDCWD` is `resolve_at`'s own local const; `statfs(2)` takes no dirfd,
+    // so pass the value that means "resolve from the root" explicitly.
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    let Ok(normalised) = resolve_at(AT_FDCWD, path) else {
+        return errno::ENOTDIR;
+    };
+    statfs_into(&normalised, buf)
+}
+
+/// `fstatfs(fd, buf)` — x86_64 138. Reports the mount serving the path the fd
+/// was opened on; a descriptor with no path (a socket, a pipe, a stdio fd)
+/// reports the root mount, which is what Linux does for an fd on a filesystem
+/// with no name to resolve.
+pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
+    let path = if fd < FIRST_FILE_FD as u64 {
+        alloc::string::String::from("/")
+    } else {
+        let idx = fd - FIRST_FILE_FD as u64;
+        let table = TABLE.lock();
+        let Some(Some(entry)) = table.get(idx as usize) else {
+            return errno::EBADF;
+        };
+        match &entry.desc {
+            FileDescriptor::File(f) => f.path.clone(),
+            _ => alloc::string::String::from("/"),
+        }
+    };
+    statfs_into(&path, buf)
+}
+
 /// `newfstatat(dirfd, path, statbuf, flags)` — and, by the two thin shims in
 /// `syscall_dispatch`, the x86-only `stat(2)` and `lstat(2)`.
 ///
@@ -2124,6 +2223,58 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
             );
             sys_close(devfd);
         }
+
+        // `/proc/mounts` + `statfs`, the pair `busybox df` needs. `df` reads
+        // the file to learn what to ask about, then calls `statfs` once per
+        // line; either one missing and it prints a header and stops, which is
+        // what it did on this target before the mount table was wired in.
+        let mp = b"/proc/mounts\0";
+        let mfd = sys_openat(0, mp.as_ptr() as u64, 0, 0);
+        t.check("fd: /proc/mounts opens", mfd >= FIRST_FILE_FD as u64);
+        if mfd >= FIRST_FILE_FD as u64 {
+            let mut d = [0u8; 512];
+            let n = sys_read(mfd, d.as_mut_ptr() as u64, d.len() as u64);
+            let text = &d[..n.min(d.len() as u64) as usize];
+            t.check(
+                "fd: /proc/mounts describes the root mount",
+                n > 0 && text.windows(7).any(|w| w == b" / ext2"),
+            );
+            sys_close(mfd);
+        }
+
+        // `statfs("/")`. The buffer is checked for a plausible ext2 rather than
+        // exact numbers: the magic pins the field offsets (a layout slip puts
+        // `f_bsize` where `f_type` should be), and a non-zero block count is
+        // what stops `df` reporting a 0-byte disk.
+        let mut sfs = [0u8; core::mem::size_of::<akuma_syscalls_linux::Statfs>()];
+        let rootp = b"/\0";
+        t.check_eq(
+            "fd: statfs(/) succeeds",
+            sys_statfs(rootp.as_ptr() as u64, sfs.as_mut_ptr() as u64),
+            0,
+        );
+        t.check_eq(
+            "fd: statfs(/) reports ext2 magic",
+            u64::from_le_bytes(sfs[0..8].try_into().unwrap_or_default()),
+            0xEF53,
+        );
+        let f_bsize = u64::from_le_bytes(sfs[8..16].try_into().unwrap_or_default());
+        let f_blocks = u64::from_le_bytes(sfs[16..24].try_into().unwrap_or_default());
+        t.check("fd: statfs(/) block size is sane", (512..=65536).contains(&f_bsize));
+        t.check("fd: statfs(/) reports a non-empty filesystem", f_blocks > 0);
+        // A path with no filesystem behind it must not report the root's
+        // numbers. `fstatfs` on stdin has no path at all, which is the case
+        // that falls back to the root mount on purpose.
+        t.check_eq(
+            "fd: fstatfs(stdin) falls back to the root mount",
+            sys_fstatfs(0, sfs.as_mut_ptr() as u64),
+            0,
+        );
+        t.check_eq(
+            "fd: statfs into a bad pointer is EFAULT",
+            sys_statfs(rootp.as_ptr() as u64, 0),
+            errno::EFAULT,
+        );
     }
 
     // `poll`: a regular file is always ready; a zero-length set with a timeout
