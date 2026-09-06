@@ -92,6 +92,9 @@ const ELF_STACK_PAGES: usize = 128;
 /// steps agreeing.
 const HELLO_ELF: &[u8] = include_bytes!(env!("USER_HELLO_ELF"));
 
+/// The `clone`/`futex` probe. See `usermode::thread_test`.
+const THREADPROBE_ELF: &[u8] = include_bytes!(env!("USER_THREADPROBE_ELF"));
+
 /// Where a task's kernel stack and saved user stack live.
 ///
 /// One per task. `syscall_entry` reaches the running task's through the
@@ -143,6 +146,15 @@ pub struct UserCtx {
     /// keeps its own per-CPU block in the other half of that pair (`smp.rs`),
     /// so the program's value can never be written to `IA32_GS_BASE` directly.
     pub gs_base: u64,
+    /// This task's `thread::THREADS` slot, or [`crate::thread::NO_THREAD`] if
+    /// it is a process's main thread. Offset 152 — past everything the
+    /// assembly indexes, like `proc_slot` and for the same reason.
+    ///
+    /// This is what lets every `clone` child share **one** entry function:
+    /// `usermode::proc_entry_for` needs sixteen hand-written trampolines
+    /// because a `PROCS` index has nowhere to live but the `fn` pointer, and a
+    /// thread's index lives here instead.
+    pub thread_slot: usize,
 }
 
 impl UserCtx {
@@ -157,6 +169,7 @@ impl UserCtx {
             fs_base: 0,
             saved_regs: [0; 12],
             gs_base: 0,
+            thread_slot: crate::thread::NO_THREAD,
         }
     }
 }
@@ -274,15 +287,25 @@ syscall_entry:
     push r9
     push r10
 
-    sub rsp, 8                      /* System V wants rsp 16-aligned at `call` */
+    /* a6, as System V's **seventh** argument — the first stack one, which at
+     * the `call` sits at [rsp+0]. This replaces a bare `sub rsp, 8`: it moves
+     * the stack by the same 8 bytes, so the 16-byte alignment that `sub`
+     * established is unchanged, and it spends those 8 bytes on something.
+     *
+     * `futex` is why. It takes six arguments and the sixth is not optional —
+     * Rust's `std` emits `FUTEX_WAIT_BITSET`, whose `val3` *is* the bitset, for
+     * every timed wait, and a zero bitset is `EINVAL` by the crate's own decode
+     * rule 2. `mmap`'s offset is the other user, still unreached (this target
+     * has no file-backed mappings), but it costs nothing to be ready.
+     *
+     * r9 still holds the user's a6 here: the shuffle below is what clobbers it,
+     * and it has not run yet. Moving this push after `mov r9, r8` would push a5
+     * twice — a bug that would look like a futex whose bitset is its uaddr2. */
+    push r9
 
     /* Linux arg registers into System V positions:
      *   Linux:    nr=rax  a1=rdi  a2=rsi  a3=rdx  a4=r10  a5=r8   a6=r9
-     *   System V: 1 =rdi  2 =rsi  3 =rdx  4 =rcx  5 =r8   6 =r9
-     *
-     * Six of the seven are passed on; a6 is dropped because no syscall this
-     * kernel implements takes one (mmap's sixth is its offset, and only
-     * file-backed mappings use it — this target has none).
+     *   System V: 1 =rdi  2 =rsi  3 =rdx  4 =rcx  5 =r8   6 =r9   7 =[rsp]
      *
      * The order is load-bearing: every move must read its source before some
      * later move overwrites it. `r9 <- r8` precedes `r8 <- r10` for that reason,
@@ -524,6 +547,55 @@ pub fn kill_current_from_fault(status: u64) -> ! {
 /// for the syscall that decided to leave ring 3 and deliberately did not let go.
 /// Nothing between the release and the `sysretq` touches shared state; the
 /// assembly reads only this task's `UserCtx` and this core's per-CPU block.
+/// Name the `clone` flags in a trace line. Bounded and allocation-free — this
+/// runs on the console path, where `format!` is banned.
+fn trace_clone_flags(flags: u64) {
+    const NAMED: [(u64, &str); 10] = [
+        (0x0000_0100, "VM"),
+        (0x0000_0200, "FS"),
+        (0x0000_0400, "FILES"),
+        (0x0000_0800, "SIGHAND"),
+        (0x0001_0000, "THREAD"),
+        (0x0004_0000, "SYSVSEM"),
+        (0x0008_0000, "SETTLS"),
+        (0x0010_0000, "PARENT_SETTID"),
+        (0x0020_0000, "CHILD_CLEARTID"),
+        (0x0100_0000, "CHILD_SETTID"),
+    ];
+    let mut first = true;
+    let mut known = 0u64;
+    for (bit, name) in NAMED {
+        if flags & bit != 0 {
+            if !first {
+                serial::puts("|");
+            }
+            serial::puts(name);
+            first = false;
+            known |= bit;
+        }
+    }
+    if first {
+        serial::puts("0");
+    }
+    // The residue matters: an unnamed bit is a flag this kernel silently
+    // ignored, which is the failure mode `clone` is famous for.
+    let rest = flags & !known;
+    if rest != 0 {
+        serial::puts("|0x");
+        serial::put_hex(rest);
+    }
+}
+
+/// Enter ring 3 as a `clone(CLONE_VM)` child.
+///
+/// The same `enter_user_mode_forked` a `fork` child takes — a full-register
+/// copy of the parent at its `syscall` with `rax = 0` — on the stack the caller
+/// supplied. `crate::thread` cannot call `enter_user` itself because the BKL
+/// hand-off on the way out is this module's business.
+pub fn enter_user_from_thread(rip: u64, rsp: u64) -> u64 {
+    enter_user(rip, rsp, true)
+}
+
 fn enter_user(entry: u64, stack: u64, forked: bool) -> u64 {
     crate::smp::bkl_leave();
     // SAFETY: the caller's obligation, stated on `enter_user_mode` — the
@@ -547,7 +619,15 @@ fn enter_user(entry: u64, stack: u64, forked: bool) -> u64 {
 /// a handler written against numbers cannot be shared and a handler written
 /// against names can.
 #[unsafe(no_mangle)]
-extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+extern "C" fn syscall_handler(
+    nr: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+) -> u64 {
     // Ring 3 does not hold the Big Kernel Lock; kernel code does. Taken here,
     // released at the bottom unless this syscall is the one that leaves ring 3
     // for good — that path returns into kernel code (`run_process`) which
@@ -588,6 +668,23 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
                 crate::fd::trace_user_cstr(a2);
                 serial::puts("\"");
             }
+            // `clone`'s flag word and `futex`'s op decide everything about the
+            // call and neither is legible as a hex blob. Added 2026-09-06 after
+            // decoding `a1=0x7d0f00` by hand off a trace was the step that
+            // identified the wall; the second time would have been waste.
+            56 => {
+                serial::puts(" flags=");
+                trace_clone_flags(a1);
+            }
+            202 => {
+                serial::puts(" op=");
+                serial::put_dec(a2 & 0x7f);
+                if a2 & 128 != 0 {
+                    serial::puts("|PRIV");
+                }
+                serial::puts(" val=");
+                serial::put_dec(a3);
+            }
             264 => {
                 serial::puts(" at=");
                 serial::put_dec(a1);
@@ -603,7 +700,22 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
         }
         serial::puts("\n");
     }
-    let r = syscall_dispatch(nr, a1, a2, a3, a4, a5);
+    // A sibling thread of a process that has called `exit_group` leaves here,
+    // before the syscall runs: its address space is about to be freed and
+    // anything it does with it from now on is a race with the reaper.
+    let r = if crate::thread::should_leave_now() {
+        // SAFETY: single core, interrupts off inside a syscall; this task's own
+        // `UserCtx`. Same `leave` mechanism `exit` uses.
+        unsafe {
+            let uctx = crate::smp::current_uctx();
+            if !uctx.is_null() {
+                (*uctx).leave = 1;
+            }
+        }
+        crate::fd::errno::EINTR
+    } else {
+        syscall_dispatch(nr, a1, a2, a3, a4, a5, a6)
+    };
     if trace {
         serial::puts("[sc] cpu=");
         serial::put_dec(crate::smp::cpu_index() as u64);
@@ -624,7 +736,7 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
     r
 }
 
-fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
     use crate::fd::errno;
 
     // Akuma's own syscalls, before the Linux table.
@@ -840,12 +952,25 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         // `CLONE_VM` is clear; with it set it means threads, not done here.
         57 | 58 => return sys_fork(),
         56 => {
-            const CLONE_VM: u64 = 0x0000_0100;
-            if a1 & CLONE_VM != 0 {
-                return errno::ENOSYS;
+            // `CLONE_VM` is the fork/thread fork in the road, and the only one:
+            // with it the caller wants to share an address space
+            // (`crate::thread`), without it it wants a copy (`sys_fork`).
+            //
+            // x86_64's argument order is its own: `(flags, child_stack,
+            // parent_tid, child_tid, tls)` — `tls` **last**, after `child_tid`,
+            // where most architectures put it fourth.
+            if a1 & clone_flags::CLONE_VM != 0 {
+                return crate::thread::sys_clone_thread(a1, a2, a3, a4, a5);
             }
             return sys_fork();
         }
+        // `gettid` — x86_64 186. Its own tid for a thread, its pid for a main
+        // thread. Rust's `std` prints it in a panic message, which is how its
+        // absence announced itself: `thread 'main' (18446744073709551615)`.
+        186 => return u64::from(crate::thread::current_tid()),
+        // `futex` — x86_64 202. Six arguments, which is why `syscall_entry`
+        // now forwards `a6`.
+        202 => return crate::futex::sys_futex(a1, a2, a3, a4, a5, a6),
         // `wait4(pid, wstatus, options, rusage)` — x86_64 61. Route into the
         // Akuma-private `waitpid` table, but **block** (unless `WNOHANG`): a
         // forked shell calls `wait4(pid, &st, 0, 0)` expecting to sleep until
@@ -1109,11 +1234,37 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         Syscall::Sendto => crate::sock::sys_sendto(a1, a2, a3, a5),
         Syscall::Recvfrom => crate::sock::sys_recvfrom(a1, a2, a3, a5),
         Syscall::Setsockopt => crate::sock::sys_setsockopt(a1, a2, a3, a4, a5),
-        Syscall::Exit | Syscall::ExitGroup => {
+        // `exit` (60) and `exit_group` (231) are the same call for a
+        // single-threaded process and emphatically not for a threaded one:
+        // `exit` ends the calling thread, `exit_group` ends every thread in the
+        // group. musl's `pthread_exit` uses the first and `main` returning uses
+        // the second, so conflating them makes the first thread to finish take
+        // the whole process with it.
+        Syscall::ExitGroup => {
+            crate::thread::set_group_exiting(current_proc_slot());
             EXIT_STATUS.store(a1, Ordering::Relaxed);
             // SAFETY: single core, interrupts off inside a syscall. The
             // running task's context is what `syscall_entry` will read on the
             // way out, and only this task can be inside a syscall.
+            unsafe {
+                let uctx = crate::smp::current_uctx();
+                if !uctx.is_null() {
+                    (*uctx).leave = 1;
+                }
+            }
+            a1
+        }
+        Syscall::Exit => {
+            // A main thread's `exit` is a process exit: nothing else runs in
+            // its address space, and `run_process` is the only frame below it.
+            // A non-main thread's is not — it must leave ring 3 without
+            // touching `EXIT_STATUS`, the fd table or the spawn record, all of
+            // which belong to the process it is only one thread of.
+            if crate::thread::current_is_main() {
+                EXIT_STATUS.store(a1, Ordering::Relaxed);
+            }
+            // SAFETY: single core, interrupts off inside a syscall; the
+            // per-CPU `UserCtx` is this task's own.
             unsafe {
                 let uctx = crate::smp::current_uctx();
                 if !uctx.is_null() {
@@ -1985,6 +2136,10 @@ fn run_process(idx: usize) -> ! {
                 let procs = &raw mut PROCS;
                 (*procs)[idx].replace(next)
             };
+            // A new program in an existing slot starts with a clean group:
+            // a stale `exit_group` flag from the image just replaced would kill
+            // its first thread at its first syscall.
+            crate::thread::clear_group_exiting(idx);
             crate::sched::set_current_space_root(new_root);
             // The old image (the `fork` copy, or a previous `execve`'s) is
             // unreferenced now that CR3 points at the new space — hand it back.
@@ -1993,6 +2148,13 @@ fn run_process(idx: usize) -> ! {
             }
         };
         EXIT_STATUS.store(status, Ordering::Relaxed);
+        // Every thread of this process, gone, before anything downstream can
+        // reap. `sys_waitpid`/`cleanup_spawn_slot` free the `Process` — and
+        // with it the page tables — once this task is `Finished`, so a sibling
+        // still running in that space would be walking freed page tables. This
+        // is the only place that ordering can be enforced: the reaper is
+        // another process and has no idea threads exist.
+        crate::thread::drain(idx);
         // Real Linux closes every fd a process still holds at exit; this
         // target's fd table did not until now (see `close_owned_by`'s own
         // header). Before `spawn_record_exit` so a parent's `waitpid` never
@@ -2095,6 +2257,31 @@ static mut SPAWN: [Option<Spawn>; SPAWN_SLOTS] = [const { None }; SPAWN_SLOTS];
 /// Next pid to hand out. `sshd` itself is pid 1 (`Getpid` returns 1), so
 /// children start at 2.
 static NEXT_PID: AtomicU64 = AtomicU64::new(2);
+
+/// The next pid **or tid**.
+///
+/// One counter for both, as on Linux: a thread's tid and a process's pid live
+/// in one number space there, and `gettid` returning a value that collides with
+/// a live pid is the kind of thing that reads as a scheduler bug three layers
+/// later. `crate::thread` is the other caller.
+pub fn alloc_pid() -> u32 {
+    NEXT_PID.fetch_add(1, Ordering::Relaxed) as u32
+}
+
+/// The `clone(2)` flag bits this kernel names.
+///
+/// Spelled out rather than reached through `akuma-syscalls-linux`: these are
+/// architecture-independent Linux constants, and the one that matters here —
+/// `CLONE_SETTLS` — pairs with an x86_64-specific *argument position*, so
+/// keeping the two facts in one file is worth more than the deduplication.
+pub mod clone_flags {
+    pub const CLONE_VM: u64 = 0x0000_0100;
+    pub const CLONE_THREAD: u64 = 0x0001_0000;
+    pub const CLONE_SETTLS: u64 = 0x0008_0000;
+    pub const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+    pub const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+    pub const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+}
 
 /// Bytes of argv kept per process for `/proc/<pid>/cmdline`.
 ///
@@ -2922,7 +3109,7 @@ pub fn console_notify_test(t: &mut Suite) {
 
     t.check_eq(
         "console_notify: a zero-length message is EINVAL",
-        syscall_dispatch(NR, 0, 0, 0, 0, 0),
+        syscall_dispatch(NR, 0, 0, 0, 0, 0, 0),
         errno::EINVAL,
     );
     // An unmapped low user address: the `rep movsb` user copy faults and
@@ -2930,7 +3117,7 @@ pub fn console_notify_test(t: &mut Suite) {
     // it does for `resolve_host` and `spawn`'s argument reads.
     t.check_eq(
         "console_notify: an unreadable pointer is EFAULT",
-        syscall_dispatch(NR, 0x1000, 16, 0, 0, 0),
+        syscall_dispatch(NR, 0x1000, 16, 0, 0, 0, 0),
         errno::EFAULT,
     );
 }
@@ -3827,4 +4014,116 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     }
     serial::puts("\n-- init exited --\n");
     true
+}
+
+
+/// `clone(CLONE_VM|CLONE_THREAD)` and `futex`, exercised from ring 3.
+///
+/// Wired 2026-09-06 with the syscalls themselves
+/// (`docs/archive/AKUMA_AMD64_RUST_STD.md`). A boot check rather than only the
+/// `ruststd` probe, because that one is built by a cross toolchain the kernel's
+/// own build does not own and runs only when someone asks for it — a
+/// regression in threads has to fail a boot, not wait to be noticed.
+///
+/// Runs in `PROCS` slot 5, next to `elf_test`'s slot 4 and by the same shape:
+/// load, spawn, drive the scheduler until it finishes, read the exit status,
+/// tear down, assert the frame count came back.
+pub fn thread_test(t: &mut Suite) {
+    /// `clone` returned a plausible new tid.
+    const TID_OK: u64 = 1 << 0;
+    /// `CLONE_PARENT_SETTID` wrote it into the parent's word.
+    const PARENT_SETTID_OK: u64 = 1 << 1;
+    /// The child ran, and its own `gettid` agrees.
+    const CHILD_TID_OK: u64 = 1 << 2;
+    /// The child read the parent's memory: `CLONE_VM` shares.
+    const SHARE_P2C_OK: u64 = 1 << 3;
+    /// The parent read the child's write to the same page.
+    const SHARE_C2P_OK: u64 = 1 << 4;
+    /// `FUTEX_WAIT` was released by the child's `FUTEX_WAKE`.
+    const FUTEX_OK: u64 = 1 << 5;
+    /// `CLONE_CHILD_CLEARTID` zeroed the join word on thread exit.
+    const CLEARTID_OK: u64 = 1 << 6;
+    /// The kernel's own wake on that word released a second wait.
+    const JOIN_WAKE_OK: u64 = 1 << 7;
+    /// `mmap` still works alongside all of it.
+    const MMAP_OK: u64 = 1 << 8;
+    const ALL_OK: u64 = TID_OK
+        | PARENT_SETTID_OK
+        | CHILD_TID_OK
+        | SHARE_P2C_OK
+        | SHARE_C2P_OK
+        | FUTEX_OK
+        | CLEARTID_OK
+        | JOIN_WAKE_OK
+        | MMAP_OK;
+
+    let free_before = akuma_pmm::free_count();
+
+    let (proc, _img) = match Process::from_elf(THREADPROBE_ELF) {
+        Ok(p) => p,
+        Err(e) => {
+            t.check("thread: probe loaded", false);
+            serial::puts("  thread: load failed: ");
+            serial::puts(e);
+            serial::puts("\n");
+            return;
+        }
+    };
+    t.check("thread: probe loaded", true);
+    let root = proc.space.root();
+    // SAFETY: raw-pointer write; the slot is filled before the task that reads
+    // it exists.
+    unsafe {
+        let procs = &raw mut PROCS;
+        (*procs)[5] = Some(proc);
+    }
+
+    if !t.check(
+        "thread: probe spawned",
+        crate::sched::spawn_in_space(proc5_entry, root).is_some(),
+    ) {
+        return;
+    }
+
+    EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
+    let mut spins = 0u64;
+    while !crate::sched::all_user_tasks_finished() && spins < 200_000 {
+        spins += 1;
+        crate::sched::yield_now();
+    }
+
+    let status = EXIT_STATUS.load(Ordering::Relaxed);
+    t.check_eq("thread: probe reported every check", status, ALL_OK);
+    if status != ALL_OK && status != u64::MAX {
+        // Named individually: a bitmask in a boot log is a puzzle, and each of
+        // these fails for a different reason in a different file.
+        t.check("thread:   clone returned a new tid", status & TID_OK != 0);
+        t.check("thread:   CLONE_PARENT_SETTID wrote it", status & PARENT_SETTID_OK != 0);
+        t.check("thread:   the child ran and gettid agrees", status & CHILD_TID_OK != 0);
+        t.check("thread:   the child sees the parent's memory", status & SHARE_P2C_OK != 0);
+        t.check("thread:   the parent sees the child's", status & SHARE_C2P_OK != 0);
+        t.check("thread:   FUTEX_WAIT was woken by FUTEX_WAKE", status & FUTEX_OK != 0);
+        t.check("thread:   CLONE_CHILD_CLEARTID zeroed the join word", status & CLEARTID_OK != 0);
+        t.check("thread:   the join word's wake was delivered", status & JOIN_WAKE_OK != 0);
+        t.check("thread:   mmap still works", status & MMAP_OK != 0);
+    }
+
+    // No thread of the probe may outlive it. `run_process` drains before it
+    // finishes, so a non-zero count here means that drain is not working —
+    // which is the use-after-free of a page table that `crate::thread`'s
+    // lifetime rule exists to prevent, seen before it can happen.
+    t.check_eq("thread: no thread outlived the process", crate::thread::live_count(5) as u64, 0);
+
+    // SAFETY: the task has finished; nothing else touches this slot.
+    unsafe {
+        let procs = &raw mut PROCS;
+        if let Some(p) = (*procs)[5].take() {
+            p.free();
+        }
+    }
+    t.check_eq(
+        "thread: teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
 }

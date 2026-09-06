@@ -95,6 +95,14 @@ pub mod errno {
     pub const EEXIST: u64 = (-17i64) as u64;
     pub const ENOTEMPTY: u64 = (-39i64) as u64;
     pub const EIO: u64 = (-5i64) as u64;
+    /// `FUTEX_WAIT` ran out of time. The one errno a futex wait can return
+    /// that no other syscall here produces.
+    pub const ETIMEDOUT: u64 = (-110i64) as u64;
+    /// Interrupted. The one errno this kernel originates rather than reports:
+    /// a thread whose group called `exit_group` gets it for the syscall it was
+    /// in the middle of, so the call fails rather than acting on a dying
+    /// address space.
+    pub const EINTR: u64 = (-4i64) as u64;
 
     /// Does a syscall return value carry an errno? Linux errnos are `1..=4095`,
     /// returned as `(-errno) as u64` — the very top of the range. Anything below

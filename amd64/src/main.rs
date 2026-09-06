@@ -53,6 +53,8 @@ mod dns;
 mod fd;
 #[cfg(target_arch = "x86_64")]
 mod fs;
+/// `futex(2)`: the effects half, over `akuma-syscalls-sync`'s decisions.
+mod futex;
 #[cfg(target_arch = "x86_64")]
 mod gdt;
 #[cfg(target_arch = "x86_64")]
@@ -104,6 +106,8 @@ mod serial;
 mod smp;
 #[cfg(target_arch = "x86_64")]
 mod sock;
+/// `clone(CLONE_VM|CLONE_THREAD)`: threads sharing one address space.
+mod thread;
 mod uaccess;
 #[cfg(target_arch = "x86_64")]
 mod xhci;
@@ -333,6 +337,9 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // readable as a loader failure.
     lapic::start_timer();
     usermode::elf_test(&mut t);
+    // clone(CLONE_VM)+futex. After `elf_test` because it needs the same loader
+    // and the same spawn path, and a failure there explains a failure here.
+    usermode::thread_test(&mut t);
     usermode::fdprobe_test(&mut t);
     usermode::spawn_test(&mut t);
     #[cfg(feature = "console-notify")]

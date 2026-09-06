@@ -9,6 +9,7 @@ fn main() {
     kernel_link_args(&dir);
     build_user_program(&dir, "hello");
     build_user_program(&dir, "fdprobe");
+    build_user_program(&dir, "threadprobe");
 }
 
 /// Pass the amd64 linker script to the bin only.

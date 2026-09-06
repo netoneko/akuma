@@ -553,33 +553,49 @@ handler, and the `is_write` distinction `akuma-mmap` already documents — a
 and breaking CoW on the wrong one silently defeats `mprotect`
 (`docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`).
 
-### 2. Threads and futex are both entirely absent
+### 2. Threads and futex are both entirely absent — **DONE 2026-09-06**
 
-```rust
-56 => {
-    const CLONE_VM: u64 = 0x0000_0100;
-    if a1 & CLONE_VM != 0 {
-        return errno::ENOSYS;   // usermode.rs:827
-    }
-    return sys_fork();
-}
-```
+**Closed.** A real Rust `std` binary spawns and joins a thread on this kernel
+and exits with the status Linux gives it, from the same bytes. `clone`,
+`futex`, `gettid` and a real `exit`/`exit_group` split are wired;
+`akuma-syscalls-sync` supplies the decisions and `amd64/src/{thread,futex}.rs`
+the effects. Boot suite 240 → 245 (`usermode::thread_test` +
+`userspace/amd64/threadprobe`). See `docs/archive/AKUMA_AMD64_RUST_STD.md`.
 
-and there is **no futex arm at all** — syscall 202 does not appear in
-`syscall_dispatch`.
+Three corrections this section needed, all found by measuring rather than
+reading:
 
-`cargo`'s jobserver is threaded. `rustc` is threaded. Neither runs.
+- **futex was not the wall and could not have been.** A single-threaded Rust
+  `std` program calls futex **zero** times — musl only syscalls into one on
+  contention — so futex was unreachable until `clone` worked. Implementing it
+  first would have been implementing something untestable.
+- **"per-task FS/GS base save/restore on switch (currently *not* saved)" was
+  already false when this was written.** `UserCtx::{fs_base, gs_base}` are
+  per-task and the scheduler `wrmsr`s both on every switch; the CoW `fork` work
+  did it. Half of this item was closed and the list did not know.
+- **The scheduler needed no change at all.** `Task::space_root` has been
+  per-task since Stage I, so two tasks sharing one address space was already
+  expressible.
 
-The good news is that the hard, subtle half is already extracted and host-tested:
-`akuma-syscalls-sync` owns the futex op decode, the `(tgid, uaddr)` waiter table,
-the deadline algebra, `WAKE_OP` and the wait-loop outcome — and per CLAUDE.md,
-"every futex bug in `docs/archive/` is a property of one of those four things".
-It builds for `x86_64-unknown-none`.
+The one non-obvious cost was `syscall_entry` dropping Linux's `a6`: `futex`
+takes six arguments and `FUTEX_WAIT_BITSET`'s `val3` is the bitset Rust `std`
+uses for every timed wait. Fixed by turning an alignment pad (`sub rsp, 8`)
+into `push r9` — System V's seventh argument, same eight bytes.
 
-**Work:** the `clone` side — `CLONE_VM|CLONE_THREAD` sharing an address space in
-`sched.rs`'s task table, per-task FS/GS base save/restore on switch (currently
-*not* saved; `sys_arch_prctl`'s own comment says "two concurrent musl processes
-would clobber each other"), then wire `akuma-syscalls-sync`.
+The AArch64 kernel half was **not** reusable, and this is measured rather than
+assumed: `akuma-syscalls-glue::sync` is 947 lines of which 22 references are
+`akuma_exec::threading`, and `cargo check -p akuma-syscalls-glue --target
+x86_64-unknown-none` fails on the whole `UserAddressSpace` page-table walker.
+Reusing it means porting `akuma-mmu` — §11.4's prerequisite, not this one's.
+
+What is **left** here, and is now signals' problem rather than threads':
+
+- `exit_group` cannot reach a thread in a syscall-free ring-3 loop, because
+  there are no signals to interrupt it with. `thread::drain` is bounded and
+  says so on the console; that is containment, not a fix. → §11.7.
+- `sigaltstack` is still `ENOSYS`. musl tolerates it. → §11.7.
+- `FUTEX_REQUEUE` and `FUTEX_WAKE_OP` are implemented over the crate's algebra
+  but nothing has exercised them yet; the first `Condvar` broadcast will.
 
 ### 3. One global 64-entry fd table
 
@@ -647,19 +663,42 @@ mapping half is not.
 
 ### Suggested order
 
+Three of the original eight are done (§11.1 CoW, §11.2 threads+futex, §11.6
+`PT_INTERP`), all on 2026-09-06. What is left, re-ranked by what a real
+toolchain now hits first:
+
 ```
   0. boot-path merge (§1)            — cheap, and everything below must be
                                         validated on QEMU *and* metal, which
                                         today are two different sequences
                                         with two different test lists
-  1. CoW fork (§11.1)                — nothing works without it
-  2. per-process fd tables (§11.3)   — small, and blocks every multi-process test
-  3. clone(CLONE_VM) + futex (§11.2) — the hard half is already a tested crate
-  4. akuma-mmap adoption (§11.4)     — needs REDUCING_PLATFORM_DEPENDENCY §1
-  5. inode-backed fd I/O (§2/§11.5)  — needs the disk, which is in flight
-  6. dynamic linker or static rustc (§11.6)
-  7. signals (§11.7)
+  1. per-process fd tables (§11.3)   — NOW THE TOP BLOCKER. One global
+                                        64-entry table, and threads share fds
+                                        by design, so N threads × M open files
+                                        is one budget. `apk` already reached
+                                        EMFILE installing 14 packages.
+  2. akuma-mmap adoption (§11.4)     — second, and threads made it worse: every
+                                        `pthread_create` mmaps a ~2 MiB stack
+                                        out of the global monotonic bump and
+                                        `munmap` returns no VA. Needs
+                                        REDUCING_PLATFORM_DEPENDENCY §1.
+  3. inode-backed fd I/O (§2/§11.5)  — the disk exists now
+  4. signals (§11.7)                 — `rt_sigaction` returning 0 is a stub
+                                        Rust *believes*; and it is what
+                                        §11.2's remaining gap needs
+  5. dynamic linker done (§11.6) — static vs dynamic rustc is now a choice
 ```
+
+Two items the work of 2026-09-06 added to this list rather than removed:
+
+- **`PROCS`/`SPAWN`/`THREADS` are three hand-rolled `static mut` tables.**
+  `crates/akuma-slot-table` is exactly this — FREE/ACTIVE/RETIRED slots with
+  reuse generations — it is used by neither kernel directly, and it **does**
+  build for `x86_64-unknown-none` (checked). Adopting it for all three at once
+  is the right shape; one table converted and three not is not.
+- **`proc_entry_for` tops out at slot 15**, which is why `sys_fork` refuses a
+  parent slot `>= 16`. Nine concurrent forked processes. `cargo` will find
+  this.
 
 **The overlap is the argument.** §2 (`fd.rs` caching), §5
 (`akuma-syscalls-abi`), the `akuma-mmap` adoption and the `loader.rs`
@@ -684,5 +723,9 @@ work.
   not a `trait Arch`.
 - `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md` — why CoW and `mprotect` have
   to be told apart before either is trusted.
+- `docs/archive/AKUMA_AMD64_RUST_STD.md` — §11.2's closure, and the measurement
+  method: a real `std` binary, a `sha256`-identical A/B against Linux, and the
+  note that on Apple Silicon `docker --platform linux/amd64` runs a binary
+  correctly and traces it wrongly.
 - `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` — the campaign this survey
   is the amd64 sequel to.

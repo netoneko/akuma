@@ -91,6 +91,47 @@ for prog in paws httpd herd hget wall; do
     fi
 done
 
+# ruststd — the Rust `std` probe (2026-09-06).
+#
+# The odd one out in every way that matters, and each way is the point:
+#
+#   * `x86_64-unknown-linux-musl`, not `x86_64-unknown-none`. It links a **real
+#     musl** and a real `std`, so the code that runs before `main` —
+#     `__libc_start_main`, the static-PIE self-relocation, `__init_tp`,
+#     `std::rt::init` — is the actual thing rustc's own binaries run, not a
+#     hand-rolled approximation. That prologue is where the self-hosting
+#     blockers live; see `docs/archive/AKUMA_AMD64_RUST_STD.md`.
+#   * `rustc` directly, not cargo, for the same reason `amd64/build.rs` does it:
+#     one file, no dependencies, and a nested cargo would want its own target
+#     directory to avoid the parent's lock.
+#   * staged onto the disk rather than `include_bytes!`d into the kernel. It is
+#     600 KiB and it is a guest program, not a self-test fixture.
+#
+# The linker is the whole reason this is best-effort: the host is Apple Silicon,
+# so `cc` is Apple clang and cannot emit ELF. `x86_64-linux-musl-gcc` (Homebrew
+# `musl-cross`) can, and is the same class of tool `userspace/build.sh` uses for
+# aarch64. A tree without it still gets a bootable image, minus this probe.
+#
+# `-C strip=debuginfo`, not `strip=symbols`: std ships with DWARF that takes the
+# binary from 600 KiB to 4.7 MiB, and dropping it costs nothing here — but the
+# symbol table is what a panic backtrace needs, and diagnosing this program is
+# the reason it exists.
+RUSTSTD=""
+RUSTSTD_OUT=target/x86_64-unknown-linux-musl/release/ruststd
+if command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$RUSTSTD_OUT")"
+    if rustc --edition 2024 --target x86_64-unknown-linux-musl \
+            -C opt-level=2 -C debuginfo=0 -C strip=debuginfo \
+            -C linker=x86_64-linux-musl-gcc \
+            -o "$RUSTSTD_OUT" userspace/amd64/ruststd/ruststd.rs 2>/dev/null; then
+        RUSTSTD="$RUSTSTD_OUT"
+    else
+        echo "note: ruststd probe did not build (rustup target add x86_64-unknown-linux-musl?)" >&2
+    fi
+else
+    echo "note: ruststd probe skipped — no x86_64-linux-musl-gcc (brew install musl-cross)" >&2
+fi
+
 # tcc, ported to this target 2026-09-04. `userspace/tcc` is not a workspace
 # member (its own `Cargo.toml` declares `[workspace]` with no members, so it
 # is its own root — see `userspace/Cargo.toml`'s comment on the
@@ -161,6 +202,8 @@ done
 # target). The HP box has a screen and no keyboard, so this is how an ssh
 # session leaves a note on the display in front of it.
 [ -n "$WALL" ] && "$DEBUGFS" -w -R "write $WALL bin/wall" "$IMG" >/dev/null 2>&1
+# `ruststd`: the Rust std probe. Run it with `INIT=/bin/ruststd`.
+[ -n "$RUSTSTD" ] && "$DEBUGFS" -w -R "write $RUSTSTD bin/ruststd" "$IMG" >/dev/null 2>&1
 
 # tcc + its runtime archive.
 if [ -n "$TCC" ]; then

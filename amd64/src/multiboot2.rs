@@ -537,6 +537,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
 
     crate::lapic::start_timer();
     crate::usermode::elf_test(&mut t);
+    crate::usermode::thread_test(&mut t);
     crate::usermode::fdprobe_test(&mut t);
     drop(user_ptr_bypass);
 

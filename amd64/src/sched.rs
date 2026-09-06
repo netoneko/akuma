@@ -593,6 +593,66 @@ pub fn seed_forked_task(task_slot: usize, fs_base: u64, gs_base: u64, saved_regs
     }
 }
 
+/// The page-table root the **running** task uses. `0` for a kernel task.
+///
+/// `clone(CLONE_VM)`'s whole memory story: the child gets this number, verbatim,
+/// and therefore the parent's page tables — no copy, no CoW share pass, no
+/// demotion of the parent's PTEs. See `crate::thread`.
+#[must_use]
+pub fn current_space_root() -> u64 {
+    // SAFETY: raw-pointer read under the BKL.
+    unsafe { (*tasks())[current()].space_root }
+}
+
+/// Seed a not-yet-running **thread** task: the `CLONE_SETTLS` base, the
+/// parent's register snapshot and `%gs`, and the two identities the single
+/// `thread_entry` reads back out of its own `UserCtx`.
+///
+/// Deliberately separate from [`seed_forked_task`] rather than a wider version
+/// of it. A `fork` child inherits the parent's `%fs` because musl's post-fork
+/// fixups are `%fs`-relative; a thread must **not** — it gets a base of its
+/// own from `CLONE_SETTLS`, and inheriting the parent's would put two threads
+/// on one `struct pthread`. One function taking an `fs_base` argument would
+/// make those two opposite requirements look like one parameter.
+pub fn seed_thread_task(
+    task_slot: usize,
+    tls_base: u64,
+    gs_base: u64,
+    saved_regs: &[u64; 12],
+    proc_slot: usize,
+    thread_slot: usize,
+) {
+    // SAFETY: raw-pointer access under the BKL; the task is Reserved, so no
+    // core can be running it.
+    unsafe {
+        if let Some(task) = (*tasks()).get_mut(task_slot) {
+            task.uctx.fs_base = tls_base;
+            task.uctx.gs_base = gs_base;
+            task.uctx.saved_regs = *saved_regs;
+            task.uctx.proc_slot = proc_slot;
+            task.uctx.thread_slot = thread_slot;
+        }
+    }
+}
+
+/// Release a [`spawn_in_space_unpublished`] slot that will never be published.
+///
+/// `Finished`, not `Unused`: the slot owns two leaked 32 KiB stacks and the
+/// recycler reuses a `Finished` slot's pair. Marking it `Unused` would work and
+/// would leak them, which is the trade `spawn_unpublished`'s own comment calls
+/// strictly worse than the exhaustion it was fixing.
+pub fn abandon_unpublished(task_slot: usize) {
+    // SAFETY: raw-pointer access under the BKL; never published, so no core
+    // can be running it.
+    unsafe {
+        if let Some(task) = (*tasks()).get_mut(task_slot) {
+            task.state = State::Finished;
+            task.space_root = 0;
+            task.uctx = UserCtx::new();
+        }
+    }
+}
+
 /// Create a daemon task: one that runs for the life of the kernel and is not
 /// counted by [`all_user_tasks_finished`]. The netpoll loop is the only caller.
 ///

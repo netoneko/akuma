@@ -107,6 +107,7 @@ dependencies = [
  "akuma-syscalls-mem",
  "akuma-syscalls-net",
  "akuma-syscalls-poll",
+ "akuma-syscalls-sync",
  "akuma-terminal",
  "akuma-usb",
  "akuma-usb-storage",

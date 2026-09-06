@@ -9,9 +9,42 @@ These are **not** members of the `userspace/` cargo workspace and have no
 nowhere to *put* a binary it could open by path.
 
 ```
-userspace/amd64/user.ld        shared link script: ET_EXEC at 0x40_0000, page-aligned segments
-userspace/amd64/hello/hello.rs the ELF loader's probe
+userspace/amd64/user.ld                    shared link script: ET_EXEC at 0x40_0000, page-aligned segments
+userspace/amd64/hello/hello.rs             the ELF loader's probe
+userspace/amd64/fdprobe/fdprobe.rs         the descriptor table's probe
+userspace/amd64/threadprobe/threadprobe.rs clone(CLONE_VM)+futex, raw — a boot check
+userspace/amd64/ruststd/ruststd.rs         **the odd one out** — see below
 ```
+
+## `ruststd` is not like the others
+
+It is an ordinary Rust binary — `println!`, `Vec`, `std::thread` — for
+`x86_64-unknown-linux-musl`, linked static-PIE against a **real musl** and a
+real `std`. Everything above is `#![no_std]` against `x86_64-unknown-none`.
+
+That difference is its whole purpose. The code that decides whether `rustc` can
+run here executes *before `main`* — `__libc_start_main`, the static-PIE
+self-relocation, `__init_tp`, `std::rt::init` — and no hand-rolled probe
+reproduces it. It is what found that `clone`, not futex, was the wall
+(`docs/archive/AKUMA_AMD64_RUST_STD.md`).
+
+Consequences, all of them deliberate:
+
+- **`mkdisk.sh` builds it, not `build.rs`**, and it is staged onto the disk
+  rather than `include_bytes!`d — 600 KiB is a guest program, not a self-test
+  fixture. Run it with `INIT=/bin/ruststd`.
+- **It is best-effort.** The build host is Apple Silicon, so `cc` is Apple clang
+  and cannot emit ELF; `x86_64-linux-musl-gcc` (Homebrew `musl-cross`) can. A
+  tree without it still gets a bootable image, minus this probe.
+- **It prints as well as exiting.** The convention below — report through the
+  exit status — assumes the program finishes. This one exists to find out where
+  it *stops*, so each stage announces itself first and the status counts the
+  stages that completed.
+
+`threadprobe` is the raw counterpart, and follows every convention below: when
+both fail, the difference between them is the diagnosis — `threadprobe` failing
+means the syscalls are wrong, only `ruststd` failing means musl wants something
+`threadprobe` does not ask for.
 
 The rest of `userspace/` is a different world: those link against `libakuma` and
 musl, target `aarch64-unknown-linux-musl`, and are built by `userspace/build.sh`
