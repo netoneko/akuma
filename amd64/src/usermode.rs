@@ -1286,68 +1286,71 @@ fn proc_count() -> u16 {
 }
 
 /// `syslog(type, bufp, len)` — the `klogctl(2)` operations `busybox dmesg`
-/// uses, served from `serial.rs`'s console ring buffer.
+/// uses, served from `serial.rs`'s console history ring.
 ///
 /// `SIZE_BUFFER`/`SIZE_UNREAD` report what is retrievable; `READ`/`READ_ALL`
-/// copy the newest bytes into the caller's buffer (the ring only ever keeps the
-/// tail, so both behave the same here); `READ_CLEAR`/`CLEAR` also discard the
-/// history. The console-level and open/close actions are accepted as no-ops —
-/// there is no priority filtering on this target.
+/// copy history into the caller's buffer (the ring only ever keeps the tail, so
+/// both behave the same here); `READ_CLEAR`/`CLEAR` also discard it. The
+/// console-level and open/close actions are accepted as no-ops — there is no
+/// priority filtering on this target.
+///
+/// The action numbers are [`akuma_dmesg::Action`] rather than local `const`s:
+/// an action mapped to the wrong arm makes `dmesg` clear the log instead of
+/// reading it and reports no error, and the decode is the half that a host test
+/// can pin. The AArch64 kernel decodes through the same table.
 fn sys_syslog(action: u64, bufp: u64, len: u64) -> u64 {
     use crate::fd::errno;
-    const READ: u64 = 2;
-    const READ_ALL: u64 = 3;
-    const READ_CLEAR: u64 = 4;
-    const CLEAR: u64 = 5;
-    const SIZE_UNREAD: u64 = 9;
-    const SIZE_BUFFER: u64 = 10;
+    use akuma_dmesg::Action;
 
-    match action {
-        0 | 1 | 6 | 7 | 8 => 0, // close / open / console off / on / level
-        CLEAR => {
-            crate::serial::klog_clear();
-            0
-        }
-        SIZE_UNREAD | SIZE_BUFFER => crate::serial::klog_len() as u64,
-        READ | READ_ALL | READ_CLEAR => {
-            if bufp == 0 || len == 0 {
-                return errno::EINVAL;
-            }
-            // Bounded staging buffer, but **not** a bound on the answer: copy
-            // the ring out a chunk at a time until the caller's buffer is full
-            // or the history runs out.
-            //
-            // It used to be `min(4096)` with a single pass, which made this
-            // buffer a hard ceiling on `dmesg` — `SIZE_BUFFER` advertised 64 KiB
-            // (the real ring), `busybox dmesg` allocated that and asked for it,
-            // and got the last 4 KiB back with no indication anything was
-            // missing. Every boot-time diagnostic older than the last few
-            // seconds was unreachable on the one target where the console has no
-            // scrollback: an xHCI bring-up printed its whole trace and then the
-            // NIC's stall dumps pushed it out of what could be read.
-            const CHUNK: usize = 4096;
-            let mut stage = [0u8; CHUNK];
-            let want = (len as usize).min(crate::serial::klog_len());
-            let mut done = 0usize;
-            while done < want {
-                let take = (want - done).min(CHUNK);
-                let n = crate::serial::klog_snapshot_from(done, &mut stage[..take]);
-                if n == 0 {
-                    break;
-                }
-                if !crate::uaccess::write_bytes(bufp + done as u64, &stage[..n]) {
-                    return errno::EFAULT;
-                }
-                done += n;
-            }
-            let n = done;
-            if action == READ_CLEAR {
-                crate::serial::klog_clear();
-            }
-            n as u64
-        }
-        _ => errno::EINVAL,
+    let Some(action) = Action::decode(action) else {
+        return errno::EINVAL;
+    };
+
+    if action.is_noop() {
+        return 0;
     }
+    if action.sizes() {
+        return crate::serial::klog_len() as u64;
+    }
+    if !action.reads() {
+        // `Clear` — the only remaining non-reading action.
+        crate::serial::klog_clear();
+        return 0;
+    }
+
+    if bufp == 0 || len == 0 {
+        return errno::EINVAL;
+    }
+    // Bounded staging buffer, but **not** a bound on the answer: copy the ring
+    // out a chunk at a time until the caller's buffer is full or the history
+    // runs out.
+    //
+    // It used to be `min(4096)` with a single pass, which made this buffer a
+    // hard ceiling on `dmesg` — `SIZE_BUFFER` advertised 64 KiB (the real ring),
+    // `busybox dmesg` allocated that and asked for it, and got the last 4 KiB
+    // back with no indication anything was missing. Every boot-time diagnostic
+    // older than the last few seconds was unreachable on the one target where
+    // the console has no scrollback: an xHCI bring-up printed its whole trace
+    // and then the NIC's stall dumps pushed it out of what could be read.
+    const CHUNK: usize = 4096;
+    let mut stage = [0u8; CHUNK];
+    let want = (len as usize).min(crate::serial::klog_len());
+    let mut done = 0usize;
+    while done < want {
+        let take = (want - done).min(CHUNK);
+        let n = crate::serial::klog_snapshot_from(done, &mut stage[..take]);
+        if n == 0 {
+            break;
+        }
+        if !crate::uaccess::write_bytes(bufp + done as u64, &stage[..n]) {
+            return errno::EFAULT;
+        }
+        done += n;
+    }
+    if action.clears() {
+        crate::serial::klog_clear();
+    }
+    done as u64
 }
 
 /// `arch_prctl(code, addr)` — x86_64 syscall 158, the TLS-base primitive.

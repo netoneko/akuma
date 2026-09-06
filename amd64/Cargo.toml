@@ -101,6 +101,13 @@ akuma-syscalls-linux = { path = "../crates/akuma-syscalls-linux" }
 # `/proc/net/dev`) — the byte layout `busybox ifconfig` reads, shared with the
 # aarch64 kernel so the two cannot drift on the `struct ifreq` stride.
 akuma-syscalls-net = { path = "../crates/akuma-syscalls-net" }
+# The console history ring behind `dmesg` (`syslog(2)` action decode + the
+# wrap/skip arithmetic), shared with the AArch64 kernel's `console::dmesg_*`.
+# `src/serial.rs` used to hand-roll this as a `static mut [u8; 64 * 1024]` with
+# four raw-pointer helpers; its one arithmetic bug made a 4 KiB staging buffer
+# the silent ceiling on a 64 KiB `dmesg`, on the one machine whose console has
+# no scrollback. The ring is host-tested; what stays here is the lock.
+akuma-dmesg = { path = "../crates/akuma-dmesg" }
 # The console line discipline: canonical mode, echo, backspace, Ctrl+D, and
 # `map_cr_to_nl`. Hand-rolling a console reader hits the CR-vs-NL bug on the
 # first Enter keypress; this crate is the tree's answer and is dependency-free.

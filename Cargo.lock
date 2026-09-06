@@ -85,6 +85,7 @@ version = "0.0.7"
 dependencies = [
  "akuma-alloc",
  "akuma-boot",
+ "akuma-dmesg",
  "akuma-exec-core",
  "akuma-ext2",
  "akuma-fbcon",

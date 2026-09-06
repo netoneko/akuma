@@ -5,8 +5,9 @@
 taken at the point where the USB/xHCI disk work is nearly done
 (`docs/archive/AKUMA_AMD64_USB_XHCI.md`, memory note *amd64 persistent disk =
 USB/xHCI*).
-**Status:** survey. Nothing here is fixed yet; §4 is the one piece started
-(`crates/akuma-dmesg`).
+**Status:** survey. §4 is the one piece done — `crates/akuma-dmesg` is wired
+into both kernels (amd64 adopted it 2026-09-06, replacing the `static mut`);
+what is left there is `syslog(2)` on AArch64. Nothing else here is fixed yet.
 
 The question this answers is two questions that turned out to overlap:
 
@@ -167,7 +168,7 @@ where a `struct stat` offset is a bare literal.
 
 ---
 
-## 4. The `dmesg` ring is a `static mut` with untested arithmetic — **started**
+## 4. The `dmesg` ring is a `static mut` with untested arithmetic — **done on amd64**
 
 `amd64/src/serial.rs:62`:
 
@@ -225,10 +226,41 @@ at all:
   `[FAIL]`, `retired_reclaim_ab`, is a known clean-tree failure unrelated to
   this.)
 
-**Still to do:** `syslog(2)` itself. AArch64 has no `nr::SYSLOG` (asm-generic
+**amd64 adopted it, 2026-09-06.** `serial.rs`'s `static mut KLOG` / `KLOG_LEN`
+and the four raw-pointer helpers are gone: the storage is now
+`static KLOG: Spinlock<Ring<64 * 1024>>`, and the six `klog_*` functions are
+thin wrappers whose bodies are one `Ring` call each. `sys_syslog` decodes
+through `akuma_dmesg::Action` rather than six local `const u64`s, so the two
+kernels cannot drift on the action numbers. The public signatures did not
+change, so `net.rs`'s memory ticker and `usermode.rs`'s drain loop are
+untouched.
+
+The lock discipline differs from AArch64's on the read side, deliberately.
+`putb_raw` already runs under `serial.rs`'s best-effort `LOCK`, but that lock is
+*best-effort* — a core that cannot take it within `LOCK_BUDGET` prints anyway —
+so the ring needs its own, and the write path takes it with `try_lock` for the
+same reason `emit` does: a fault landing mid-`putb_raw` must not spin on a lock
+this core holds. Readers (`klog_len`, `klog_snapshot_from`, `klog_clear`)
+instead retry, bounded by the same budget. A `try_lock` there could return a
+spurious `0`, which would break `sys_syslog`'s `while done < want` drain loop
+and truncate `dmesg` silently — the exact failure mode this whole section is
+about, reintroduced through the lock instead of the arithmetic.
+
+Verified on QEMU `-M microvm`, `INIT=/bin/sshd` (2026-09-06):
+
+- `240 passed, 0 failed` self-tests, `all self-tests passed`.
+- `busybox dmesg` over ssh returned **16805 bytes** on a fresh boot and
+  **52764** on a longer-lived one — four and thirteen staging chunks, so the
+  multi-chunk drain is exercised, not just claimed.
+- The returned bytes are **byte-identical to the host's serial capture** for the
+  first 12000 bytes after `Akuma/amd64`, which is what proves both the tee and
+  the CRLF handling.
+- `dmesg -c` (`READ_CLEAR`) returned the log and emptied the ring; the next
+  `dmesg` returned 448 bytes and the one after 896, so the ring refills.
+
+**Still to do:** `syslog(2)` on AArch64. It has no `nr::SYSLOG` (asm-generic
 116) and no dispatch arm, so `busybox dmesg` cannot yet reach the ring that is
-now filling. And amd64 still has its own `static mut` — that is the adoption
-pass, where `serial.rs`'s six `klog_*` helpers collapse onto this crate.
+now filling on that side.
 
 **On the name.** The crate is `akuma-dmesg`, not `akuma-klog`, because
 `akuma_kernel_core::klog` already exists and is the `log`-facade sink. Two

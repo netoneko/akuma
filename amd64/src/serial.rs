@@ -33,7 +33,10 @@ const LSR_THR_EMPTY: u8 = 1 << 5;
 const LSR_DATA_READY: u8 = 1 << 0;
 
 use crate::port::{inb, outb};
+use akuma_dmesg::Ring;
 use core::sync::atomic::{AtomicBool, Ordering};
+use spinning_top::Spinlock;
+use spinning_top::guard::SpinlockGuard;
 
 /// One writer at a time, per call. With several cores printing, two `puts`
 /// interleaved byte by byte are unreadable; held per *call* rather than per
@@ -53,23 +56,56 @@ const LOCK_BUDGET: u32 = 1 << 22;
 /// framebuffer scrolls a diagnostic away there is no way to get it back — which
 /// on a headless box being driven entirely over ssh means "the kernel said why
 /// and nobody can read it". Every byte that goes to [`putb_raw`] is also written
-/// here, under the same lock, and `sys_syslog` (syscall 103) reads it back.
+/// here, and `sys_syslog` (syscall 103) reads it back.
 ///
-/// A plain wrapping byte buffer: `KLOG_LEN` counts total bytes ever written and
-/// `% KLOG_CAP` is the write cursor. 64 KiB covers a whole boot's worth of
-/// output comfortably and costs nothing but `.bss`.
+/// The wrap/skip arithmetic is [`akuma_dmesg::Ring`], shared with the AArch64
+/// kernel's `console::dmesg_*` and host-tested — it started here as a
+/// `static mut [u8; 64 * 1024]` with four raw-pointer helpers, and its single
+/// pure-function bug (a staging buffer that silently became the ceiling on
+/// `dmesg`) cost a reboot of the bare-metal box to find. What lives here is the
+/// `static` and the lock.
+///
+/// 64 KiB covers a whole boot's worth of output comfortably and costs nothing
+/// but `.bss`.
 const KLOG_CAP: usize = 64 * 1024;
-static mut KLOG: [u8; KLOG_CAP] = [0; KLOG_CAP];
-static KLOG_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Append one byte to [`KLOG`]. Caller holds [`lock`].
-fn klog_push(byte: u8) {
-    let n = KLOG_LEN.load(Ordering::Relaxed);
-    // SAFETY: single-writer under the serial lock; index is always `< KLOG_CAP`.
-    unsafe {
-        (&raw mut KLOG).cast::<u8>().add((n as usize) % KLOG_CAP).write(byte);
+/// # Why its own lock, and why `try_lock` on the write path
+///
+/// [`putb_raw`] already runs under [`LOCK`], but that lock is *best-effort*: a
+/// core that cannot take it within [`LOCK_BUDGET`] prints anyway, so two cores
+/// can genuinely be inside `putb_raw` at once and the ring needs its own
+/// serialisation. The acquire there is a single non-blocking attempt, for the
+/// same reason the console lock is bounded — a panic or a fault landing while
+/// this core is mid-`putb_raw` must not spin forever on a lock this core
+/// itself holds. Losing a few bytes of *replay* beats losing the live output.
+///
+/// Readers ([`klog_snapshot_from`], [`klog_len`]) retry, bounded: a spurious
+/// `0` from a transient contention would break `sys_syslog`'s drain loop and
+/// truncate `dmesg` silently, which is precisely the failure this ring exists
+/// to stop.
+static KLOG: Spinlock<Ring<KLOG_CAP>> = Spinlock::new(Ring::new());
+
+/// Bounded acquire of [`KLOG`] for a reader. `None` means "give up rather than
+/// wedge"; callers report an empty/short answer, never a hang.
+fn klog_lock() -> Option<SpinlockGuard<'static, Ring<KLOG_CAP>>> {
+    let mut spins = 0u32;
+    loop {
+        if let Some(g) = KLOG.try_lock() {
+            return Some(g);
+        }
+        spins += 1;
+        if spins >= LOCK_BUDGET {
+            return None;
+        }
+        core::hint::spin_loop();
     }
-    KLOG_LEN.store(n + 1, Ordering::Relaxed);
+}
+
+/// Append one byte to [`KLOG`]. Never blocks; see [`KLOG`].
+fn klog_push(byte: u8) {
+    if let Some(mut ring) = KLOG.try_lock() {
+        ring.push(byte);
+    }
 }
 
 /// Copy console history into `out`, starting `skip` bytes past the oldest byte
@@ -89,46 +125,29 @@ fn klog_push(byte: u8) {
 /// through history.
 #[must_use]
 pub fn klog_snapshot_from(skip: usize, out: &mut [u8]) -> usize {
-    let _g = lock();
-    let total = KLOG_LEN.load(Ordering::Relaxed) as usize;
-    let available = total.min(KLOG_CAP);
-    // Absolute index of the oldest byte still in the ring, then `skip` past it.
-    let oldest = total - available;
-    let Some(remaining) = available.checked_sub(skip) else {
-        return 0;
-    };
-    let want = remaining.min(out.len());
-    let start = oldest + skip;
-    for (i, slot) in out[..want].iter_mut().enumerate() {
-        // SAFETY: read of an initialised `.bss` byte, index masked into range.
-        *slot = unsafe { (&raw const KLOG).cast::<u8>().add((start + i) % KLOG_CAP).read() };
-    }
-    want
+    klog_lock().map_or(0, |r| r.snapshot_from(skip, out))
 }
 
 /// Total bytes currently retrievable from [`klog_snapshot_from`]. For
 /// `SYSLOG_ACTION_SIZE_UNREAD` / `SIZE_BUFFER`.
 #[must_use]
 pub fn klog_len() -> usize {
-    (KLOG_LEN.load(Ordering::Relaxed) as usize).min(KLOG_CAP)
+    klog_lock().map_or(0, |r| r.len())
 }
 
 /// Discard the buffered console history. For `SYSLOG_ACTION_CLEAR`.
 pub fn klog_clear() {
-    let _g = lock();
-    KLOG_LEN.store(0, Ordering::Relaxed);
+    if let Some(mut ring) = klog_lock() {
+        ring.clear();
+    }
 }
 
 /// Append a string to the `dmesg` ring **only** — not to the framebuffer or the
 /// port. For a high-frequency diagnostic (the memory ticker) that belongs in
 /// `dmesg` but must not scroll the television on a box being watched.
 pub fn klog_only(s: &str) {
-    let _g = lock();
-    for &b in s.as_bytes() {
-        if b == b'\n' {
-            klog_push(b'\r');
-        }
-        klog_push(b);
+    if let Some(mut ring) = klog_lock() {
+        ring.push_str_crlf(s);
     }
 }
 
@@ -144,9 +163,8 @@ pub fn klog_only_dec(mut val: u64) {
             break;
         }
     }
-    let _g = lock();
-    for &b in &buf[i..] {
-        klog_push(b);
+    if let Some(mut ring) = klog_lock() {
+        ring.push_bytes(&buf[i..]);
     }
 }
 
