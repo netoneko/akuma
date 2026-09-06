@@ -1,5 +1,17 @@
 # Extracting region bookkeeping: `akuma-mmap`
 
+> **Superseded in one respect, 2026-09-06.** The "PTE permission vocabulary" this
+> extraction moved *into* `akuma-mmap` moved back out again, down to
+> `akuma_mmu::types`. It was the right move for the wrong half: `PAGE_SIZE` and the
+> region algebra belong here, but `flags`/`user_flags` were literal AArch64
+> descriptor bits, so this crate's **code** was portable and its **data** was not —
+> and `cargo check --target x86_64-unknown-none` passes, so amd64 could have adopted
+> it and got silently wrong answers (the two architectures' permission masks share
+> exactly zero bits, and AArch64's `AP_MASK` lands on x86's Dirty and PAT). What
+> lives here now is `Prot`, an opaque neutral token; `akuma_mmu::user_flags::to_pte`
+> encodes it. Every sentence below about `user_flags` living here is history.
+> See `REDUCING_PLATFORM_DEPENDENCY.md` §1.5.
+
 **Date: 2026-08-29.** Stage 1 of a two-stage split of the memory-syscall family.
 Stage 2 (`akuma-syscalls-mem`, the syscall *decision* layer) is not built yet;
 §7 records what it would contain and the one question that decides whether it

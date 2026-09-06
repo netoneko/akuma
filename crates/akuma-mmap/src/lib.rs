@@ -7,7 +7,10 @@
 //! - [`MmapRegion`], the eager-mapping record, and its constructors.
 //! - [`inherit_mmap_regions_for_cow_child`] — what a CoW-forked child's region list is.
 //! - [`detach_eager_regions_in_range`] — `munmap`'s clip-and-split.
-//! - [`flags`] and [`user_flags`], the PTE permission vocabulary the two speak.
+//! - [`Prot`], the **architecture-neutral** permission vocabulary a region records.
+//!   The PTE bits it encodes to live with the walker that writes them —
+//!   `akuma_mmu::types` on AArch64, `amd64/src/paging.rs` on x86_64. See
+//!   `types.rs` for why the data had to move even though the code compiled.
 //!
 //! # What is deliberately NOT in here
 //!
@@ -72,4 +75,4 @@ pub use region::{
 };
 pub mod span;
 
-pub use types::{PAGE_SHIFT, PAGE_SIZE, flags, user_flags};
+pub use types::{PAGE_SHIFT, PAGE_SIZE, Prot};

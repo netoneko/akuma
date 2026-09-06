@@ -5961,8 +5961,8 @@ fn test_munmap_spans_multiple_eager_regions() {
                         p.address_space.get_mut().track_user_frame(frame);
                         frames.push(frame);
                     }
-                    p.vm_with_regions(|list| list.push(MmapRegion::owned_with_flags(
-                        BASE + r * PAGES_PER * 0x1000, frames, user_flags::RW)));
+                    p.vm_with_regions(|list| list.push(MmapRegion::owned_with_prot(
+                        BASE + r * PAGES_PER * 0x1000, frames, akuma_exec::mmu::Prot::RW)));
                 }
 
                 // Unmap from the middle of region 0 through the middle of region 2:

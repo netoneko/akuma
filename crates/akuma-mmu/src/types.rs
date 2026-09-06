@@ -4,15 +4,131 @@
 
 #![allow(dead_code)]
 
-/// Page geometry and the PTE permission vocabulary, re-exported from `akuma-mmap`.
+/// Page geometry and the neutral permission vocabulary, re-exported from
+/// `akuma-mmap`.
 ///
-/// They moved so `MmapRegion` could: a region's `flags` field is a `user_flags`
-/// value and `detach_eager_regions_in_range` divides by `PAGE_SIZE`, so both had to
-/// sit at or below the crate that owns the region. Same move, same reason, as the
-/// device-window table below. Everything else in this file — `PageTable`, the MAIR
-/// attributes, `attr_index`, the block sizes, and the `FaultAccess`/`lazy_map_flags`
-/// demand-paging policy — stays here with the walker and the fault path that use it.
-pub use akuma_mmap::{PAGE_SHIFT, PAGE_SIZE, flags, user_flags};
+/// [`Prot`] is what a *region* records. The AArch64 bits it encodes to are
+/// [`flags`] and [`user_flags`] below, which live **here**, with the walker that
+/// writes them — they were in `akuma-mmap` until 2026-09-06, which made that
+/// crate's code portable and its data not. See `akuma_mmap::types` for the
+/// measurement: the two architectures' permission masks share exactly zero bits,
+/// and AArch64's `AP_MASK` lands on x86's Dirty and PAT, so `is_write` on an x86
+/// PTE would have answered "has this page been written?" instead of "may it be?".
+pub use akuma_mmap::{PAGE_SHIFT, PAGE_SIZE, Prot};
+
+/// Raw AArch64 stage-1 descriptor bits.
+///
+/// Moved down from `akuma-mmap` 2026-09-06. Nothing above the walker should name
+/// these: a consumer that does is encoding a page table by hand, which is the
+/// coupling that stopped the region crate being usable on x86_64.
+pub mod flags {
+    pub const VALID: u64 = 1 << 0;
+    pub const TABLE: u64 = 1 << 1;
+    pub const BLOCK: u64 = 0 << 1;
+    pub const AF: u64 = 1 << 10;
+    pub const SH_INNER: u64 = 3 << 8;
+    pub const SH_OUTER: u64 = 2 << 8;
+    pub const AP_RW_EL1: u64 = 0 << 6;
+    pub const AP_RW_ALL: u64 = 1 << 6;
+    pub const AP_RO_EL1: u64 = 2 << 6;
+    pub const AP_RO_ALL: u64 = 3 << 6;
+    /// AP field mask (bits [7:6]) — isolates the access-permission bits from a PTE
+    /// or a `user_flags` value so the two can be compared.
+    pub const AP_MASK: u64 = 3 << 6;
+    pub const USER: u64 = 1 << 6;
+    pub const PXN: u64 = 1 << 53;
+    pub const UXN: u64 = 1 << 54;
+    pub const NG: u64 = 1 << 11;
+}
+
+/// The six AArch64 permission encodings, and the decode of a [`Prot`] into one.
+///
+/// These constants are unchanged from when they lived in `akuma-mmap` — the
+/// `to_pte` round-trip test below pins every one of them, so this move cannot
+/// have altered a single bit of what the hardware sees.
+pub mod user_flags {
+    use super::flags;
+    use akuma_mmap::Prot;
+
+    /// PROT_NONE: EL1-only access, EL0 gets no read/write/exec.
+    pub const NONE: u64 = flags::AP_RO_EL1 | flags::UXN | flags::PXN;
+    pub const RO: u64 = flags::AP_RO_ALL;
+    pub const RW: u64 = flags::AP_RW_ALL;
+    pub const EXEC: u64 = flags::AP_RO_ALL;
+    pub const RW_NO_EXEC: u64 = flags::AP_RW_ALL | flags::UXN | flags::PXN;
+    pub const RX: u64 = flags::AP_RO_ALL | flags::PXN;
+    /// Read-only and **not** executable — the read-only sibling of
+    /// [`RW_NO_EXEC`], for a page a process may read and nothing else.
+    pub const RO_NO_EXEC: u64 = flags::AP_RO_ALL | flags::UXN | flags::PXN;
+
+    /// The AArch64 encoding of a neutral [`Prot`].
+    ///
+    /// A **total** match, not a bit computation: `Prot::RO` and `Prot::RX` grant
+    /// EL0 the same thing and differ only in `PXN`, so no arithmetic over
+    /// read/write/exec can tell them apart. That is exactly why `Prot` is an
+    /// opaque token rather than a `{read, write, exec}` triple — see
+    /// `akuma_mmap::types`.
+    #[must_use]
+    pub fn to_pte(prot: Prot) -> u64 {
+        match prot {
+            Prot::NONE => NONE,
+            Prot::RO => RO,
+            Prot::RW => RW,
+            Prot::RW_NO_EXEC => RW_NO_EXEC,
+            Prot::RX => RX,
+            Prot::RO_NO_EXEC => RO_NO_EXEC,
+            // `Prot` is a closed set (`Prot::ALL`), but its inner tag is opaque
+            // so the compiler cannot prove exhaustiveness here. Refusing EL0
+            // everything is the safe answer for a value this build does not
+            // know; `to_pte_covers_every_variant` makes it unreachable.
+            _ => NONE,
+        }
+    }
+
+    /// Whether a mapping with these raw PTE flags lets EL0 **write**.
+    ///
+    /// Still takes a `u64` because its callers hold *page-table* flags —
+    /// `lazy_map_flags`' output and `LazyRegion::flags`, both of which are
+    /// AArch64 encodings that have not moved. A caller holding a [`Prot`] wants
+    /// `Prot::is_write` instead.
+    #[must_use]
+    pub const fn is_write(flags_val: u64) -> bool {
+        flags_val & flags::AP_MASK == flags::AP_RW_ALL
+    }
+
+    /// Whether EL0 may *fetch instructions* from a page with these raw flags.
+    /// Reads `UXN` and nothing else — `AP` decides read/write and `PXN` decides
+    /// EL1 fetch, neither of which is relevant to what EL0 can execute.
+    #[must_use]
+    pub const fn is_exec(flags_val: u64) -> bool {
+        flags_val & flags::UXN == 0
+    }
+
+    #[must_use]
+    pub const fn is_none(flags_val: u64) -> bool {
+        flags_val == NONE
+    }
+
+    #[must_use]
+    pub const fn is_read_only_to_user(flags_val: u64) -> bool {
+        flags_val & flags::AP_MASK == flags::AP_RO_ALL
+    }
+
+    /// Is a page mapped with these flags eligible for the shared file-page cache?
+    /// The gate is a parameter, not a config read.
+    #[must_use]
+    pub const fn is_shareable_mapping(flags_val: u64, shared_file_pages_enabled: bool) -> bool {
+        shared_file_pages_enabled && is_read_only_to_user(flags_val)
+    }
+
+    /// The raw encoding an `mmap`/`mprotect` `prot` argument asks for.
+    /// `Prot::from_prot` composed with [`to_pte`], kept as one call because most
+    /// callers want a PTE.
+    #[must_use]
+    pub fn from_prot(prot: u32) -> u64 {
+        to_pte(Prot::from_prot(prot))
+    }
+}
 
 pub const ENTRIES_PER_TABLE: usize = 512;
 pub const BITS_PER_LEVEL: usize = 9;
@@ -114,6 +230,90 @@ pub const fn lazy_map_flags(access: FaultAccess, region_flags: u64, file_backed:
 
 #[cfg(test)]
 mod tests {
+
+    /// Every `Prot` variant encodes to the **literal bits** `user_flags` produced
+    /// before the vocabulary moved out of `akuma-mmap` (2026-09-06).
+    ///
+    /// Spelled as hex literals on purpose rather than as `user_flags::RW` — a
+    /// test written against the constants would pass even if the constants
+    /// themselves drifted, which is the whole thing this is guarding. These
+    /// numbers were read off the pre-move source.
+    #[test]
+    fn prot_roundtrips_to_todays_bits() {
+        use user_flags::to_pte;
+        // AP_RO_EL1|UXN|PXN = (2<<6) | (1<<54) | (1<<53)
+        assert_eq!(to_pte(Prot::NONE), 0x0060_0000_0000_0080);
+        // AP_RO_ALL = 3<<6
+        assert_eq!(to_pte(Prot::RO), 0xC0);
+        assert_eq!(to_pte(Prot::EXEC), 0xC0, "EXEC was byte-identical to RO");
+        // AP_RW_ALL = 1<<6
+        assert_eq!(to_pte(Prot::RW), 0x40);
+        // AP_RW_ALL|UXN|PXN
+        assert_eq!(to_pte(Prot::RW_NO_EXEC), 0x0060_0000_0000_0040);
+        // AP_RO_ALL|PXN
+        assert_eq!(to_pte(Prot::RX), 0x0020_0000_0000_00C0);
+        // AP_RO_ALL|UXN|PXN
+        assert_eq!(to_pte(Prot::RO_NO_EXEC), 0x0060_0000_0000_00C0);
+    }
+
+    /// `to_pte` has a `_ =>` arm it should never reach. Prove it: every variant
+    /// in `Prot::ALL` must land on a distinct, non-fallback encoding.
+    #[test]
+    fn to_pte_covers_every_variant() {
+        let mut seen = alloc::vec::Vec::new();
+        for p in Prot::ALL {
+            let pte = user_flags::to_pte(p);
+            if p != Prot::NONE {
+                assert_ne!(pte, user_flags::NONE, "{p:?} fell through to the NONE arm");
+            }
+            assert!(!seen.contains(&pte), "{p:?} collides with an earlier variant");
+            seen.push(pte);
+        }
+        assert_eq!(seen.len(), 6);
+    }
+
+    /// The neutral predicates and the raw ones must agree, variant by variant.
+    /// This is the join between the two vocabularies, and the place a future
+    /// divergence would show up first.
+    #[test]
+    fn neutral_and_raw_predicates_agree() {
+        for p in Prot::ALL {
+            let pte = user_flags::to_pte(p);
+            assert_eq!(p.is_write(), user_flags::is_write(pte), "is_write {p:?}");
+            assert_eq!(p.is_exec(), user_flags::is_exec(pte), "is_exec {p:?}");
+            assert_eq!(p.is_none(), user_flags::is_none(pte), "is_none {p:?}");
+            assert_eq!(
+                p.is_read_only_to_user(),
+                user_flags::is_read_only_to_user(pte),
+                "is_read_only_to_user {p:?}"
+            );
+            for gate in [true, false] {
+                assert_eq!(
+                    p.is_shareable_mapping(gate),
+                    user_flags::is_shareable_mapping(pte, gate),
+                    "is_shareable_mapping {p:?} gate={gate}"
+                );
+            }
+        }
+    }
+
+    /// `from_prot` must route through `Prot` and land on the same encoding the
+    /// old direct implementation did, for every `prot` bit pattern.
+    #[test]
+    fn from_prot_matches_the_old_direct_encoding() {
+        for prot in 0u32..8 {
+            let want = if prot == 0 {
+                user_flags::NONE
+            } else if prot & 0x2 != 0 {
+                user_flags::RW_NO_EXEC
+            } else if prot & 0x4 != 0 {
+                user_flags::RX
+            } else {
+                user_flags::RO
+            };
+            assert_eq!(user_flags::from_prot(prot), want, "prot={prot:#x}");
+        }
+    }
     use super::*;
 
     #[test]

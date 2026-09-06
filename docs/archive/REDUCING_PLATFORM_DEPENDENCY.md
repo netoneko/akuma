@@ -17,7 +17,7 @@ this table — it corrects two rows below.
 | | Item | State |
 |---|---|---|
 | §0 | The arch gate (`target_os` alone stopped discriminating) | **APPLIED 2026-09-03.** 13 → 36 crates build for `x86_64-unknown-none`. Re-confirmed 2026-09-04 — and see §9.4 for a live instance of the exact bug this fixed, still unfixed inside `akuma-mmu` |
-| §1 | PTE permissions are AArch64 bits inside a crate that forbids knowing that | **OPEN**, re-confirmed 2026-09-04: `crates/akuma-mmap/src/region.rs` still has `pub flags: u64` in `mmu::user_flags` terms; no portable `Prot` type exists anywhere in the tree yet. `amd64/src/paging.rs` has the `Prot`/`MemAttr` vocabulary §1.2 asks for, written from scratch because `MmapRegion.flags` cannot cross (`AKUMA_FIRECRACKER_AMD64.md` §3.5, §3.9.1). Two encodings now exist and neither can be handed to the other |
+| §1 | PTE permissions are AArch64 bits inside a crate that forbids knowing that | **DONE 2026-09-06 — see §1.5.** `akuma_mmap::Prot` is the neutral vocabulary and `MmapRegion.prot: Prot` replaced `flags: u64`; the `flags`/`user_flags` bit tables moved down to `akuma_mmu::types`, which gained `user_flags::to_pte(Prot)`. Bit-exact: `prot_roundtrips_to_todays_bits` pins all six encodings to hex literals. **One thing §1.4 asked for is deliberately NOT done** — `is_exec(RO)` is still `true`, because that is a behaviour change and does not belong inside an encoding move. Blast radius was **8 sites, not the 64 predicted** |
 | §2 | Device discovery arrives as a DTB, threaded through the MMU | **OPEN**, re-confirmed 2026-09-04: x86_64 Firecracker passes no DTB at all — the memory map comes from `hvm_start_info`, parsed by `crates/akuma-ryzen-amd64` (moved out of `amd64/src/hvm.rs`, which no longer exists, 2026-09-04). The second consumer §2 predicted exists now, correctly on its own crate rather than merged with `akuma-fdt` |
 | §3 | TLB invalidation cannot express *who* | **OPEN**, re-confirmed 2026-09-04: `crates/akuma-cpu/src/lib.rs`'s `mod tlb` still has only `tlbi` forms (`vmalle1`, `vaae1is`, `aside1is`, ...); `amd64/src/paging.rs` still carries its own local `invlpg`, not in the shared crate. `invlpg` is **core-local** where `tlbi ...is` broadcasts to the inner-shareable domain, so an x86 multi-core kernel must IPI. There is no way to say that difference in today's vocabulary (`AKUMA_FIRECRACKER_AMD64.md` §3.10.3) |
 | §4 | `Context` is built by register name outside the crates that own registers | **RETARGETED 2026-09-04 — see §9.1.** `amd64/src/sched.rs`'s `Context` is no longer the evidence; it was rewritten to `{ rsp: u64 }`, private field, and its own header cites this as §4's fix shape *already applied*. The current second hand-built register block is `amd64/src/usermode.rs`'s `UserCtx` (7 public fields, `#[repr(C)]`, asm-indexed by offset) |
@@ -173,7 +173,10 @@ this whole document is about, one level down.
 
 ## 1. The PTE permission vocabulary is AArch64 bits, in the crate that forbids knowing that
 
-**OPEN.** Independent evidence arrived after this was written — see the status table.
+**DONE 2026-09-06 — §1.5 records what actually happened, including where it diverged
+from the fix shape proposed in §1.2 and why the blast radius in §1.3 was wrong by a
+factor of eight.** Everything from here to §1.4 is preserved as written, because the
+reasoning is what made the change small.
 
 **Highest leverage. The only item here that is a live imprecision rather than debt.**
 
@@ -294,6 +297,94 @@ onward, the `data/file RX`, `inst/anon`, `non-exec file mapping` cases). Those t
 should be converted, not rewritten, and their assertions should get *stronger* on the
 way: `is_exec(Prot::RO)` must become `false`, which is a behaviour change and needs a
 line in the archive doc when it lands.
+
+### 1.5 What landed, 2026-09-06
+
+Triggered by a question with a sharp edge on it — *"what's preventing amd64 from
+using `akuma-mmap`, isn't it a safe crate?"* It is a safe crate. It
+`#![forbid(unsafe_code)]`, its `[dependencies]` table is empty, and
+`cargo check -p akuma-mmap --target x86_64-unknown-none` **passes today**. That is
+exactly what made this dangerous rather than merely untidy: amd64 could have adopted
+it, compiled, and been wrong.
+
+Concretely wrong, and worth writing down because it is the sharpest statement of
+this whole section. The two permission masks share **exactly zero bits**:
+
+```
+aarch64:  AP_RW_ALL 0x40   AP_RO_ALL 0xC0   PXN 1<<53   UXN 1<<54
+x86_64:   R/W 1<<1         U/S 1<<2         NX  1<<63
+overlap:  0x0
+```
+
+and AArch64's `AP_MASK` — bits [7:6] — lands on x86's **Dirty** and **PAT**. So
+`is_write(x86_pte)` would have evaluated `(pte & 0xC0) == 0x40`, i.e. *"Dirty set and
+PAT clear"*: it answers **"has this page been written?"** when asked **"may this page
+be written?"**. Right often enough to survive a smoke test, and wrong exactly where
+it matters — a clean writable page reads as read-only, so the write-fault handler
+treats a legitimate store as an `mprotect(PROT_READ)` violation. That is
+`GRANT_RECORDS_VS_DENY_RECORDS.md`'s bug, re-created by porting its fix.
+
+**The model was `akuma-cow`,** which serves both kernels already because it takes
+`pte_writable: bool` and `marked: bool` — decoded booleans, never a PTE.
+
+#### Where it diverged from §1.2
+
+- **`Prot` is an opaque token, not `{read, write, exec, user}`.** §1.2 asked for the
+  struct and for `EXEC` to cease to exist. It cannot, without changing behaviour:
+  `user_flags::RO` (`AP_RO_ALL`) and `user_flags::RX` (`AP_RO_ALL | PXN`) grant EL0
+  *identical* access and differ only in whether **EL1** may fetch. A `{read, write,
+  exec}` triple collapses them, and `to_pte` would then have to guess which to
+  re-emit — flipping `PXN` on live mappings from inside a refactor. A token keeps the
+  round trip total and exact. `EXEC` survives as an **alias** of `Prot::RO` because
+  the two constants were byte-identical before the move; inventing a difference here
+  would be inventing one the kernel never had.
+- **`decode(pte) -> Prot` was not written, because nothing needs it.** Every
+  predicate call site was checked: they all hold *region-recorded* values
+  (`recorded_prot`, `eager_region_flags_for_page_fault`, `lazy_map_flags`'s output),
+  never a PTE read back from hardware. An unused reverse mapping would have been a
+  lossy function waiting for a caller.
+- **`MemAttr` (§1.2 item 2) was already fine.** `MAIR_*` and `attr_index` were
+  never in `akuma-mmap`; they sit in `akuma_mmu::types` with the walker.
+
+#### The blast radius was 8, not 64
+
+§1.3 measured 254 sites, projected 64 production sites outside the defining crate,
+and called it "a two-to-three day change." The compiler found **8**.
+
+The 254 was a true count of the wrong thing. `akuma-exec` re-exports
+`akuma_mmu as mmu`, and `akuma_mmu::types` was *already* the re-export point for
+`flags`/`user_flags`. Moving the definitions there rather than deleting them meant
+every one of the ~200 `akuma_exec::mmu::user_flags::RW` spellings — the 79 boot-suite
+sites, most of `akuma-exceptions` — **resolved unchanged**. Only sites touching a
+*region's* recorded protection had to move, which is the set that should have moved.
+
+The lesson generalises: when a symbol is already re-exported through the crate it
+ought to live in, relocating the definition is a no-op at every call site. Measure
+the sites that name the *data*, not the sites that name the *symbol*.
+
+#### Deliberately still open
+
+**`is_exec(Prot::RO)` is still `true`.** §1.4 is right that it should be `false`, and
+right that it is a behaviour change — so it does not belong inside an encoding move,
+where a boot-suite regression would have two candidate causes instead of one. It is
+now a one-line change (`Prot::is_exec`'s match arm) plus one line in
+`prot_roundtrips_to_todays_bits`, and the boot-suite tests §1.4 names are the gate.
+That is a much better position than it was in this morning, and it is the next thing
+to do here.
+
+#### Verification
+
+- Host: `akuma-mmap` 54 tests, `akuma-mmu` 15 including `prot_roundtrips_to_todays_bits`
+  (every variant pinned to a hex literal read off the pre-move source — *not* to the
+  constants, which would pass even if the constants drifted),
+  `to_pte_covers_every_variant`, and `neutral_and_raw_predicates_agree` (the two
+  vocabularies checked against each other, variant by variant). Workspace: 0 failures.
+- AArch64 boot suite under KVM (Lima, nested virt — QEMU/HVF asserts on an unrelated
+  `ESR.ISV=0` writeback in the user-copy fault test, `QEMU_HVF_ISV_BUG.md`):
+  **307 PASSED, 0 real failures.**
+- amd64: clippy clean, and the Firecracker matrix at 1 and 4 vCPUs.
+
+---
 
 ---
 

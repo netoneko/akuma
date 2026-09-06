@@ -588,6 +588,25 @@ assumed: `akuma-syscalls-glue::sync` is 947 lines of which 22 references are
 x86_64-unknown-none` fails on the whole `UserAddressSpace` page-table walker.
 Reusing it means porting `akuma-mmu` — §11.4's prerequisite, not this one's.
 
+Verified on real silicon under Firecracker/KVM as well as QEMU: VCPUS=1
+**235/0**, VCPUS=4 **244/0**, `ruststd` 6/6 and `futexops` 5/5 + `futextest`
+7/7 at both. SMP=4 exercises *threads* rather than CoW `fork` — `clone(CLONE_VM)`
+demotes no PTE, so it never needed the shootdown that keeps §11.1 at SMP=1.
+
+Running the tree's **existing** futex gate (`scripts/futex_suite.py`, whose C
+probes cross-build for x86_64 unchanged) found one real bug that none of the
+probes written for this change could: **`nanosleep` was a no-op `yield_now`** —
+documented as an honest approximation of a coarse clock, and actually *no sleep
+at all*, so every program using a sleep to sequence against another thread
+silently lost its ordering. Fixing it exposed a second: `uptime_us` is the LAPIC
+tick counter, a syscall runs with `IF` clear, and the only place the scheduler
+re-enables it is the idle loop — so two tasks spinning in the kernel freeze the
+clock they are both waiting on. `sched::allow_tick` is the fix. Both were
+required; either alone still hangs. See `AKUMA_AMD64_RUST_STD.md` §8.
+
+Two of the four probes (`futexkey`, `futexkill`) still cannot run: they need
+**`pipe(2)`**, which this target does not implement.
+
 What is **left** here, and is now signals' problem rather than threads':
 
 - `exit_group` cannot reach a thread in a syscall-free ring-3 loop, because
@@ -595,7 +614,12 @@ What is **left** here, and is now signals' problem rather than threads':
   says so on the console; that is containment, not a fix. → §11.7.
 - `sigaltstack` is still `ENOSYS`. musl tolerates it. → §11.7.
 - `FUTEX_REQUEUE` and `FUTEX_WAKE_OP` are implemented over the crate's algebra
-  but nothing has exercised them yet; the first `Condvar` broadcast will.
+  and `futexops` now covers all four ops against Linux semantics.
+- **`pipe(2)` is absent**, which blocks `futexkey` and `futexkill` — the two
+  probes that cover cross-address-space key leaks and kill-while-parked, the
+  two futex bugs that historically cost the most to find. Same root as the
+  known-broken `cmd | cmd`: fds 0-2 are handled by number below `fd.rs`'s
+  table (`FIRST_FILE_FD = 3`), so `dup2` onto them has nowhere to land.
 
 ### 3. One global 64-entry fd table
 
@@ -625,9 +649,26 @@ says "another process's slice of the shared bump range". `munmap` frees frames
 but never returns virtual address space. `MAP_FIXED` and file-backed mappings are
 refused outright. A long `rustc` run walks off the end of the window.
 
-**Work:** adopt `akuma-mmap`. Gated on `REDUCING_PLATFORM_DEPENDENCY.md` §1 —
-`MmapRegion.flags` is a raw AArch64 PTE `u64` and the two encodings share no
-field, which `mm.rs`'s header already names as the prerequisite.
+**Work:** adopt `akuma-mmap`. **The gate is gone as of 2026-09-06** —
+`REDUCING_PLATFORM_DEPENDENCY.md` §1 is done: `MmapRegion` records a neutral
+`akuma_mmap::Prot` instead of a raw AArch64 PTE `u64`, and the bit tables moved
+down to `akuma_mmu::types`. `akuma-mmap` keeps its empty `[dependencies]` table
+and `#![forbid(unsafe_code)]`, builds for `x86_64-unknown-none`, and amd64
+already depends on it (`amd64/Cargo.toml:125`), so adoption needs no new edge.
+
+Two notes for whoever does the adoption:
+
+- **There are now two types called `Prot`.** `akuma_mmap::Prot` is what a
+  *region* records — the owner's read/write/exec, six opaque variants.
+  `amd64::paging::Prot` is what a *page table* takes — it carries `user` and
+  `cow`, which a region never names. They are genuinely different things, which
+  is why they were not merged; rename the amd64 one to `PteProt` when adopting,
+  or the collision will read as an oversight.
+- amd64's half of the encoding is the mirror of `akuma_mmu::user_flags::to_pte`:
+  a total match from `Prot` to x86 bits, living in `amd64/src/paging.rs`. The
+  AArch64 side is pinned by `prot_roundtrips_to_todays_bits`; write the
+  equivalent, because a permission table is exactly the thing that looks right
+  and is not.
 
 ### 5. Files are cached whole in kernel heap
 

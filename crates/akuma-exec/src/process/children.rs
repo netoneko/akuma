@@ -1265,7 +1265,7 @@ pub use akuma_mmap::{detach_eager_regions_in_range, inherit_mmap_regions_for_cow
 pub fn eager_region_flags_for_page_fault(pid: Pid, va: usize) -> Option<u64> {
     let lookup = |p: Pid| -> Option<u64> {
         let proc = lookup_process_shared(p)?;
-        proc.vm_with_regions(|r| r.iter().find(|reg| reg.contains(va)).map(|reg| reg.flags))
+        proc.vm_with_regions(|r| r.iter().find(|reg| reg.contains(va)).map(|reg| crate::mmu::user_flags::to_pte(reg.prot)))
     };
     if let Some(owner) = address_space_owner_pid_for_fault()
         && let Some(f) = lookup(owner)
@@ -1289,7 +1289,7 @@ pub fn eager_region_recorded_prot_for_page_fault(pid: Pid, va: usize) -> Option<
     let lookup = |p: Pid| -> Option<u64> {
         let proc = lookup_process_shared(p)?;
         proc.vm_with_regions(|r| {
-            r.iter().find(|reg| reg.contains(va)).and_then(MmapRegion::recorded_prot)
+            r.iter().find(|reg| reg.contains(va)).and_then(MmapRegion::recorded_prot).map(crate::mmu::user_flags::to_pte)
         })
     };
     if let Some(owner) = address_space_owner_pid_for_fault()
@@ -1316,7 +1316,7 @@ pub fn eager_regions_containing(pid: Pid, va: usize) -> alloc::vec::Vec<(usize, 
             proc.vm_with_regions(|r| {
                 r.iter()
                     .filter(|reg| reg.contains(va))
-                    .map(|reg| (reg.start_va, reg.pages, reg.flags))
+                    .map(|reg| (reg.start_va, reg.pages, crate::mmu::user_flags::to_pte(reg.prot)))
                     .collect()
             })
         })
@@ -1336,7 +1336,20 @@ pub fn eager_regions_containing(pid: Pid, va: usize) -> alloc::vec::Vec<(usize, 
 /// uses these flags to grant a write, so widening the recorded range of a
 /// downgrade can never turn a legitimate SIGSEGV into a silent success. Recording
 /// nothing at all, which is what happened before, is what could.
-pub fn update_eager_region_flags(pid: Pid, range_start: usize, range_size: usize, new_flags: u64) {
+/// `mprotect`'s eager-region half.
+///
+/// Takes the neutral [`akuma_mmap::Prot`] rather than a raw PTE since
+/// 2026-09-06: a region *records* a protection and the encoding lives with the
+/// walker, so handing this an `AP_*` word would put the arch back in the record.
+/// Its lazy sibling (`update_lazy_region_flags`) still takes a `u64` — a
+/// `LazyRegion`'s flags go straight to `map_page` on the fault path and have not
+/// moved.
+pub fn update_eager_region_flags(
+    pid: Pid,
+    range_start: usize,
+    range_size: usize,
+    new_prot: akuma_mmap::Prot,
+) {
     let Some(proc) = lookup_process_shared(pid) else { return };
     let range_end = range_start.saturating_add(range_size);
     // SPLITS now, rather than recording the new protection against the whole
@@ -1353,7 +1366,7 @@ pub fn update_eager_region_flags(pid: Pid, range_start: usize, range_size: usize
     // has always done — the old "we cannot split `frames`" objection was never
     // true. See docs/reference/subsystems/syscalls/mem.md.
     let touched = proc.vm_with_regions(|r| {
-        akuma_mmap::mprotect_eager_regions_in_range(r, range_start, range_end, new_flags)
+        akuma_mmap::mprotect_eager_regions_in_range(r, range_start, range_end, new_prot)
     });
     if touched > 0 {
         EAGER_FLAG_WIDENED.fetch_add(0, core::sync::atomic::Ordering::Relaxed);

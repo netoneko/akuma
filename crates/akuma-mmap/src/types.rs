@@ -1,142 +1,165 @@
-//! Page geometry and the PTE permission vocabulary regions speak.
+//! Page geometry, and the **architecture-neutral** permission vocabulary regions speak.
 //!
-//! Only the bits a *region* names live here. Page-table structure (`PageTable`,
-//! `ENTRIES_PER_TABLE`, `BITS_PER_LEVEL`), memory attributes (`MAIR_*`,
-//! `attr_index`) and block sizes stay in `akuma_exec::mmu::types` with the walker
-//! that uses them; `akuma_exec::mmu::types` re-exports this module so
-//! `crate::mmu::flags::*` and `crate::mmu::user_flags::*` still resolve there.
+//! # What changed, and why
+//!
+//! Until 2026-09-06 this module defined `flags` — literal AArch64 descriptor bits,
+//! `AP_RW_ALL = 1 << 6`, `PXN = 1 << 53`, `UXN = 1 << 54` — and `user_flags`, six
+//! `u64` constants built from them. `MmapRegion::flags` stored one.
+//!
+//! That made this crate's *code* portable and its *data* not, which is the worse
+//! of the two failures. `akuma-mmap` has an empty `[dependencies]` table, forbids
+//! `unsafe`, and builds for `x86_64-unknown-none` today — so the amd64 kernel
+//! could compile it, adopt it, and get **silently wrong answers**. x86_64 uses
+//! bit 1 (R/W), bit 2 (U/S) and bit 63 (NX); the two permission masks share
+//! **exactly zero** bits, and AArch64's `AP_MASK` (bits [7:6]) lands on x86's
+//! **Dirty** and **PAT**. `is_write` would have evaluated "Dirty set, PAT clear"
+//! — answering *"has this page been written?"* when asked *"may it be written?"*.
+//! Right often enough to pass a smoke test, wrong exactly when it matters: a
+//! clean writable page reads as read-only, so the write-fault handler treats a
+//! legitimate store as an `mprotect(PROT_READ)` violation. That is
+//! `GRANT_RECORDS_VS_DENY_RECORDS.md`'s bug, re-created by porting its fix.
+//!
+//! So [`Prot`] is what a region records now, and the bits live with the walker
+//! that writes them: `akuma_mmu::types` for AArch64, `amd64/src/paging.rs` for
+//! x86_64. This is [`akuma_cow`](https://docs.rs/akuma-cow)'s shape — that crate
+//! takes `pte_writable: bool` and `marked: bool`, decoded booleans rather than a
+//! PTE, which is precisely why it already serves both kernels.
+//!
+//! # Why an opaque token and not `{ read, write, exec }`
+//!
+//! Because the AArch64 table it replaces is not expressible as a triple.
+//! `user_flags::RO` (`AP_RO_ALL`) and `user_flags::RX` (`AP_RO_ALL | PXN`) grant
+//! EL0 exactly the same thing — read and execute — and differ only in whether
+//! **EL1** may fetch. A `{read, write, exec}` struct collapses them, and
+//! `to_pte` would then have to guess which one to re-emit; the guess changes
+//! PXN on a live mapping, which is a behaviour change smuggled inside a
+//! refactor.
+//!
+//! A token keeps the round trip exact: each variant names one encoding, the
+//! arch layer's `to_pte` is a total match, and `prot_roundtrips_to_todays_bits`
+//! in `akuma-mmu` pins every variant to the `u64` it produced before the move.
+//! The predicates below are the same three questions the bit arithmetic
+//! answered, asked of the token instead.
+//!
+//! `EXEC` is deliberately an alias of [`Prot::RO`] rather than a seventh
+//! variant: the two constants were **byte-identical** (`AP_RO_ALL`) before this
+//! change, so making them distinct here would invent a difference the kernel
+//! never had.
 
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SHIFT: usize = 12;
 
-pub mod flags {
-    pub const VALID: u64 = 1 << 0;
-    pub const TABLE: u64 = 1 << 1;
-    pub const BLOCK: u64 = 0 << 1;
-    pub const AF: u64 = 1 << 10;
-    pub const SH_INNER: u64 = 3 << 8;
-    pub const SH_OUTER: u64 = 2 << 8;
-    pub const AP_RW_EL1: u64 = 0 << 6;
-    pub const AP_RW_ALL: u64 = 1 << 6;
-    pub const AP_RO_EL1: u64 = 2 << 6;
-    pub const AP_RO_ALL: u64 = 3 << 6;
-    /// AP field mask (bits [7:6]) — isolates the access-permission bits from a PTE
-    /// or a `user_flags` value so the two can be compared.
-    pub const AP_MASK: u64 = 3 << 6;
-    pub const USER: u64 = 1 << 6;
-    pub const PXN: u64 = 1 << 53;
-    pub const UXN: u64 = 1 << 54;
-    pub const NG: u64 = 1 << 11;
-}
+/// The protection a mapping is *supposed* to have, named rather than encoded.
+///
+/// Six distinct values, matching one-for-one the six distinct `u64`s the
+/// AArch64 `user_flags` table produced. The inner `u8` is an opaque tag with no
+/// arithmetic meaning — nothing outside this module may construct one from a
+/// number, which is what stops a raw PTE being smuggled in as a `Prot`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Prot(u8);
 
-pub mod user_flags {
-    use super::flags;
-    /// PROT_NONE: EL1-only access, EL0 gets no read/write/exec.
-    pub const NONE: u64 = flags::AP_RO_EL1 | flags::UXN | flags::PXN;
-    pub const RO: u64 = flags::AP_RO_ALL;
-    pub const RW: u64 = flags::AP_RW_ALL;
-    pub const EXEC: u64 = flags::AP_RO_ALL;
-    pub const RW_NO_EXEC: u64 = flags::AP_RW_ALL | flags::UXN | flags::PXN;
-    pub const RX: u64 = flags::AP_RO_ALL | flags::PXN;
-    /// Read-only and **not** executable — the read-only sibling of
-    /// [`RW_NO_EXEC`], for a page a process may read and nothing else.
-    ///
-    /// Named because four call sites were spelling it `RO | UXN | PXN` inline
-    /// (`process_info`, in both the `execve` and the fresh-image paths). Those
-    /// were the *only* places in the tree outside this module and `akuma-mmu`
-    /// that did bit arithmetic on a permission, which mattered more than the
-    /// duplication: with them gone, every consumer of this vocabulary treats it
-    /// as six opaque named values, and re-encoding it for another architecture
-    /// is a change to this module rather than a hunt through the callers.
-    pub const RO_NO_EXEC: u64 = flags::AP_RO_ALL | flags::UXN | flags::PXN;
+impl Prot {
+    /// `PROT_NONE`: the owner may not read, write or execute. Distinct from
+    /// "not recorded" — see `MmapRegion::prot_recorded`.
+    pub const NONE: Self = Self(0);
+    /// Read and execute by the owner. EL1 fetch permitted (no `PXN` on AArch64)
+    /// — the distinction from [`Self::RX`], and the only thing separating them.
+    pub const RO: Self = Self(1);
+    /// Read, write and execute.
+    pub const RW: Self = Self(2);
+    /// Read and write, no execute.
+    pub const RW_NO_EXEC: Self = Self(3);
+    /// Read and execute by the owner, **not** by the kernel (`PXN`).
+    pub const RX: Self = Self(4);
+    /// Read only — no write, no execute.
+    pub const RO_NO_EXEC: Self = Self(5);
+    /// Historical alias: `user_flags::EXEC` was byte-identical to `RO`.
+    pub const EXEC: Self = Self::RO;
 
+    /// Every variant, for the arch layers' exhaustiveness tests. Adding a
+    /// variant without adding it here fails those tests rather than silently
+    /// leaving a hole in a `to_pte` match.
+    pub const ALL: [Self; 6] =
+        [Self::NONE, Self::RO, Self::RW, Self::RW_NO_EXEC, Self::RX, Self::RO_NO_EXEC];
+
+    /// The opaque tag. For the arch layer's `to_pte` match and for diagnostics;
+    /// it is not a PTE and means nothing to hardware.
     #[must_use]
-    pub fn from_prot(prot: u32) -> u64 {
-        if prot == 0 { return NONE; }
+    pub const fn tag(self) -> u8 {
+        self.0
+    }
+
+    /// The protection an `mmap`/`mprotect` `prot` argument asks for.
+    ///
+    /// The same three-way decision the AArch64 `from_prot` made, unchanged:
+    /// `PROT_WRITE` wins over `PROT_EXEC`, and a `prot` of 0 is `PROT_NONE`.
+    /// Note it never yields [`Self::RO_NO_EXEC`] — a plain `PROT_READ` mapping
+    /// stays executable, which is the AArch64 table's behaviour and is pinned
+    /// by test rather than defended here.
+    #[must_use]
+    pub const fn from_prot(prot: u32) -> Self {
+        if prot == 0 {
+            return Self::NONE;
+        }
         match (prot & 0x2 != 0, prot & 0x4 != 0) {
-            (true, _)      => RW_NO_EXEC,
-            (false, true)  => RX,
-            (false, false) => RO,
+            (true, _) => Self::RW_NO_EXEC,
+            (false, true) => Self::RX,
+            (false, false) => Self::RO,
         }
     }
 
+    /// Whether this mapping lets the owner **write** to the page.
+    ///
+    /// The predicate every permission-repair path in the fault handler needs,
+    /// and the one whose absence let `mprotect` be defeated: a CoW-shared page
+    /// and an `mprotect(PROT_READ)` page are both read-only in the hardware and
+    /// cannot be told apart from it. The region records which; this reads that
+    /// record. Was `flags & AP_MASK == AP_RW_ALL`.
     #[must_use]
-    pub fn is_none(flags: u64) -> bool {
-        flags == NONE
+    pub const fn is_write(self) -> bool {
+        matches!(self.0, 2 | 3)
     }
 
-    /// Whether a mapping with these flags lets EL0 **write** to the page.
+    /// Whether the owner may *fetch instructions* from the page.
     ///
-    /// The predicate every permission-repair path in the EL0 fault handler needs,
-    /// and the one whose absence let `mprotect` be defeated: a CoW-shared page and
-    /// an `mprotect(PROT_READ)` page are both read-only in the PTE and cannot be
-    /// told apart from the hardware state alone. `MmapRegion::flags` records which
-    /// one it is; this reads that record.
-    ///
-    /// Reads the `AP` field and nothing else — `UXN`/`PXN` decide execution, which
-    /// is irrelevant to whether a store may proceed.
+    /// Decides whether a demand-paged frame needs I-cache maintenance
+    /// (`dc cvau` + `ic ivau`), which is only load-bearing for a page some PE
+    /// will fetch from. Was `flags & UXN == 0`, so it was true for `RO`, `RW`
+    /// and `RX` and false for the rest — including `RO`, which carries no
+    /// `UXN`. That is the AArch64 encoding, not an oversight.
     #[must_use]
-    pub const fn is_write(flags: u64) -> bool {
-        flags & flags::AP_MASK == flags::AP_RW_ALL
+    pub const fn is_exec(self) -> bool {
+        matches!(self.0, 1 | 2 | 4)
     }
 
-    /// Whether a mapping with these flags lets EL0 *fetch instructions* from the page.
-    ///
-    /// This is the predicate that decides whether a demand-paged frame needs the
-    /// `dc cvau` + `ic ivau` sequence: I-cache maintenance is only load-bearing for a
-    /// page some PE will fetch from. It reads `UXN` and nothing else, deliberately —
-    /// `AP` decides read/write, `PXN` decides EL1 fetch, and neither is relevant to
-    /// what EL0 can execute.
+    /// Whether this is `PROT_NONE`. Was `flags == user_flags::NONE`.
     #[must_use]
-    pub const fn is_exec(flags: u64) -> bool {
-        flags & flags::UXN == 0
+    pub const fn is_none(self) -> bool {
+        matches!(self.0, 0)
     }
 
-    /// Whether a mapping with these flags gives EL0 **no write access** — true only
-    /// for `AP_RO_ALL`, i.e. [`RO`] and [`RX`].
+    /// Whether the owner has **no write access** — the complement of
+    /// [`Self::is_write`] over the access field, kept as its own name because
+    /// the two are asked for opposite purposes: `is_write` asks whether a store
+    /// may proceed, this asks whether a page may be *shared*.
     ///
-    /// The exact complement of [`is_write`] over the `AP` field, kept as its own
-    /// name because the two are read for opposite purposes: `is_write` is asked
-    /// whether a store may proceed, this is asked whether a page may be *shared*.
-    /// Sharing a page that EL0 can write would need copy-on-write first, which is
-    /// why ELF data segments carrying relocations stay private.
-    ///
-    /// Moved here from `akuma_exec::memmath` on 2026-08-30
-    /// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.3). It is a pure function of
-    /// this module's own vocabulary and never belonged a crate up; the version it
-    /// replaced also carried a fourth private copy of `AP_MASK`, which this one
-    /// reads from [`flags`] instead. The *gated* form — the same predicate ANDed
-    /// with the `SHARED_FILE_PAGES_ENABLED` kill switch — stays in `akuma-exec`,
-    /// because reading a runtime config is exactly what this crate has no
-    /// dependencies to do.
+    /// Was `flags & AP_MASK == AP_RO_ALL`, which is **not** simply `!is_write`:
+    /// `NONE` was `AP_RO_EL1`, so it answered `false` to both. Preserved
+    /// exactly — a `PROT_NONE` page is not shareable.
     #[must_use]
-    pub const fn is_read_only_to_user(flags: u64) -> bool {
-        flags & flags::AP_MASK == flags::AP_RO_ALL
+    pub const fn is_read_only_to_user(self) -> bool {
+        matches!(self.0, 1 | 4 | 5)
     }
 
-    /// Is a page mapped with these flags eligible for the shared file-page cache?
+    /// Is a page mapped like this eligible for the shared file-page cache?
     ///
-    /// [`is_read_only_to_user`] ANDed with the `SHARED_FILE_PAGES_ENABLED` kill
-    /// switch, which the caller passes in. A writable private file mapping would
-    /// need copy-on-write before sharing, so ELF data segments carrying
-    /// relocations stay private.
-    ///
-    /// **The gate is a parameter, not a config read**, which is what let this
-    /// function live in a crate with an empty `[dependencies]` table. The first
-    /// version of the split left it behind in `akuma-exec` for exactly that
-    /// reason — it was written as `config().shared_file_pages_enabled && …`, and
-    /// a crate that cannot depend on anything cannot read an `ExecConfig`. But
-    /// the config read was never part of the *decision*; it was one boolean the
-    /// decision consumed. Taking it as an argument moves the whole predicate down
-    /// here and leaves the config read at the one call site that owns the switch
-    /// (`src/file_page_cache.rs`).
-    ///
-    /// It also made the tests pure: they pass `true`/`false` instead of
-    /// registering an injectable config, and the `gate == false` case — the kill
-    /// switch actually working — became testable for the first time.
+    /// [`Self::is_read_only_to_user`] ANDed with the kill switch, which the
+    /// caller passes in. **The gate is a parameter, not a config read**, which
+    /// is what lets this live in a crate with an empty `[dependencies]` table —
+    /// and what made the `gate == false` case testable at all.
     #[must_use]
-    pub const fn is_shareable_mapping(flags: u64, shared_file_pages_enabled: bool) -> bool {
-        shared_file_pages_enabled && is_read_only_to_user(flags)
+    pub const fn is_shareable_mapping(self, shared_file_pages_enabled: bool) -> bool {
+        shared_file_pages_enabled && self.is_read_only_to_user()
     }
 }
 
@@ -144,192 +167,74 @@ pub mod user_flags {
 mod tests {
     use super::*;
 
-    /// Only `AP_RO_ALL` mappings are read-only to EL0. Moved with the predicate
-    /// from `akuma_exec::memmath` (`AKUMA_EXEC_SPLIT_AGAIN.md` §3.3).
     #[test]
-    fn only_user_read_only_mappings_are_read_only() {
-        assert!(user_flags::is_read_only_to_user(user_flags::RO));
-        assert!(user_flags::is_read_only_to_user(user_flags::RX));
-        assert!(!user_flags::is_read_only_to_user(user_flags::RW));
-        assert!(!user_flags::is_read_only_to_user(user_flags::RW_NO_EXEC));
-    }
-
-    /// The predicate must read *only* the AP field: a page that is RO to EL0 stays
-    /// read-only whatever its execute/attr bits say, and a writable one is never
-    /// rescued by them.
-    #[test]
-    fn read_only_predicate_ignores_bits_outside_the_ap_field() {
-        let other = flags::UXN | flags::PXN | flags::AF;
-        assert!(user_flags::is_read_only_to_user(user_flags::RO | other));
-        assert!(!user_flags::is_read_only_to_user(user_flags::RW | other));
-    }
-
-    /// [`user_flags::is_write`] and [`user_flags::is_read_only_to_user`] are
-    /// **mutually exclusive but not exhaustive**, and the gap is load-bearing.
-    ///
-    /// `AP` has three values an EL0 mapping can take, not two: `AP_RW_ALL`
-    /// (writable), `AP_RO_ALL` (read-only *to EL0*, shareable), and `AP_RO_EL1` —
-    /// which is [`user_flags::NONE`], the `PROT_NONE` encoding, where EL0 has no
-    /// access at all. A `PROT_NONE` page is therefore neither writable nor
-    /// "read-only to user", and code that reaches for `!is_write(..)` as a stand-in
-    /// for the sharing predicate would wrongly treat it as shareable.
-    ///
-    /// Neither predicate had a test tying them together while they lived in
-    /// different crates; this is the one that says why they are two functions.
-    #[test]
-    fn write_and_read_only_are_exclusive_but_not_exhaustive() {
-        for prot in 0..8u32 {
-            let f = user_flags::from_prot(prot);
-            assert!(
-                !(user_flags::is_write(f) && user_flags::is_read_only_to_user(f)),
-                "from_prot({prot}) = {f:#x} claims both"
-            );
-        }
-        // The gap, named: PROT_NONE answers `false` to both.
-        let none = user_flags::NONE;
-        assert!(!user_flags::is_write(none));
-        assert!(!user_flags::is_read_only_to_user(none));
-        assert!(user_flags::is_none(none));
-    }
-
-    /// **A non-executable mapping is never shareable.**
-    ///
-    /// This is what makes the merged DA/IA demand-paging body's `is_exec` gate
-    /// inert for `file_page_cache`: both cache calls in that body
-    /// (`lookup_and_ref`'s `want_exec` and `insert`'s `icache_done`) are reached
-    /// only under `is_shareable_mapping`, so if every shareable mapping is also
-    /// executable, they can only ever be called with `is_exec == true` — which is
-    /// exactly what the instruction-abort arm used to hardcode. Sharing requires
-    /// `AP_RO_ALL`, and the only `AP_RO_ALL` values a lazy region can record
-    /// (`from_prot` and `akuma_elf::load::segment_page_flags` are the two
-    /// producers) leave `UXN` clear.
-    ///
-    /// If this ever fails, the `is_exec` gate has become observable in the shared
-    /// cache: `insert(.., false)` would start publishing `icache_done: false` for
-    /// pages that had it `true`. Still the *safe* direction, but a behaviour
-    /// change, so it should be a decision rather than a surprise. See
-    /// `docs/archive/COW_PILE_AUDIT.md` §12.1.
-    #[test]
-    fn non_exec_mappings_are_never_shareable() {
-        for f in [
-            user_flags::NONE,
-            user_flags::RO,
-            user_flags::RX,
-            user_flags::RW,
-            user_flags::RW_NO_EXEC,
-        ] {
-            if !user_flags::is_exec(f) {
-                assert!(
-                    !user_flags::is_shareable_mapping(f, true),
-                    "non-exec mapping {f:#x} must not be shareable"
-                );
-            }
-        }
-        // The two producers of a lazy region's flags, exhaustively.
-        for prot in 0..8u32 {
-            let f = user_flags::from_prot(prot);
-            assert!(
-                user_flags::is_exec(f) || !user_flags::is_shareable_mapping(f, true),
-                "from_prot({prot}) = {f:#x} is shareable but not exec"
-            );
-        }
-    }
-
-    /// With the gate on, the gated form must agree with the pure predicate for
-    /// every flag combination — i.e. the gate adds nothing but the kill switch.
-    #[test]
-    fn gated_shareable_agrees_with_the_predicate_when_enabled() {
-        for f in [
-            user_flags::NONE,
-            user_flags::RO,
-            user_flags::RX,
-            user_flags::RW,
-            user_flags::RW_NO_EXEC,
-        ] {
-            assert_eq!(
-                user_flags::is_shareable_mapping(f, true),
-                user_flags::is_read_only_to_user(f),
-                "{f:#x}"
-            );
-        }
-    }
-
-    /// **The kill switch actually kills.** Untestable until the gate became a
-    /// parameter: proving it needed an injected `ExecConfig` with the flag off,
-    /// and the host tests only ever registered one with it on
-    /// (`register_config_for_test` hardcodes `true`). So the one behaviour
-    /// `SHARED_FILE_PAGES_ENABLED` exists to provide had no test at all.
-    #[test]
-    fn the_kill_switch_makes_every_mapping_unshareable() {
-        for prot in 0..8u32 {
-            assert!(!user_flags::is_shareable_mapping(user_flags::from_prot(prot), false));
-        }
-        for f in [
-            user_flags::NONE,
-            user_flags::RO,
-            user_flags::RX,
-            user_flags::RW,
-            user_flags::RW_NO_EXEC,
-            user_flags::EXEC,
-        ] {
-            assert!(!user_flags::is_shareable_mapping(f, false), "{f:#x}");
-        }
-    }
-
-    #[test]
-    fn user_flags_from_prot() {
-        // prot 0 = PROT_NONE (no EL0 access)
-        assert_eq!(user_flags::from_prot(0), user_flags::NONE);
-        assert!(user_flags::is_none(user_flags::from_prot(0)));
-        // prot 1 = PROT_READ
-        assert_eq!(user_flags::from_prot(1), user_flags::RO);
-        assert!(!user_flags::is_none(user_flags::from_prot(1)));
-        // prot 2 = PROT_WRITE
-        assert_eq!(user_flags::from_prot(2), user_flags::RW_NO_EXEC);
-        // prot 4 = PROT_EXEC
-        assert_eq!(user_flags::from_prot(4), user_flags::RX);
-    }
-
-    #[test]
-    fn user_flags_is_exec_reads_only_uxn() {
-        assert!(user_flags::is_exec(user_flags::RX));
-        assert!(user_flags::is_exec(user_flags::EXEC));
-        assert!(!user_flags::is_exec(user_flags::RW_NO_EXEC));
-        assert!(!user_flags::is_exec(user_flags::NONE));
-        // `RO`/`RW` carry no UXN, so they are exec by this predicate — that is the
-        // AArch64 encoding, not an oversight: a PTE without UXN *is* EL0-executable.
-        assert!(user_flags::is_exec(user_flags::RO));
-        // PXN (EL1 fetch) must not influence the answer.
-        assert!(user_flags::is_exec(user_flags::RO | flags::PXN));
-        assert!(!user_flags::is_exec(user_flags::RO | flags::UXN));
-    }
-
-    /// The write predicate, across the whole `user_flags` table. `RW`/`RW_NO_EXEC`
-    /// permit a store; `RO`, `RX`, `EXEC` and `NONE` must not — those four are
-    /// exactly the states a repair path must refuse to upgrade.
-    #[test]
-    fn user_flags_is_write_reads_only_the_ap_field() {
-        assert!(user_flags::is_write(user_flags::RW));
-        assert!(user_flags::is_write(user_flags::RW_NO_EXEC));
-        assert!(!user_flags::is_write(user_flags::RO));
-        assert!(!user_flags::is_write(user_flags::RX));
-        assert!(!user_flags::is_write(user_flags::EXEC));
-        assert!(!user_flags::is_write(user_flags::NONE));
-        // UXN/PXN must not influence the answer either way.
-        assert!(user_flags::is_write(user_flags::RW | flags::UXN | flags::PXN));
-        assert!(!user_flags::is_write(user_flags::RO | flags::UXN | flags::PXN));
+    fn from_prot_matches_the_aarch64_table() {
+        assert_eq!(Prot::from_prot(0), Prot::NONE);
+        assert_eq!(Prot::from_prot(1), Prot::RO);
+        assert_eq!(Prot::from_prot(2), Prot::RW_NO_EXEC);
+        assert_eq!(Prot::from_prot(4), Prot::RX);
     }
 
     /// `from_prot` and `is_write` must agree: anything carrying `PROT_WRITE` is
-    /// writable, and nothing else is. This is the pair the fault handler relies on
-    /// to tell an `mprotect` downgrade from a CoW demotion.
+    /// writable and nothing else is. This is the pair the fault handler relies
+    /// on to tell an `mprotect` downgrade from a CoW demotion.
     #[test]
     fn from_prot_and_is_write_agree() {
         for prot in 0u32..8 {
-            let want = prot & 0x2 != 0;
-            assert_eq!(user_flags::is_write(user_flags::from_prot(prot)), want,
-                       "prot={prot:#x}");
+            assert_eq!(Prot::from_prot(prot).is_write(), prot & 0x2 != 0, "prot={prot:#x}");
         }
+    }
+
+    #[test]
+    fn is_write_only_for_the_writable_pair() {
+        assert!(Prot::RW.is_write());
+        assert!(Prot::RW_NO_EXEC.is_write());
+        for p in [Prot::RO, Prot::RX, Prot::EXEC, Prot::NONE, Prot::RO_NO_EXEC] {
+            assert!(!p.is_write(), "{p:?}");
+        }
+    }
+
+    /// `RO` carries no `UXN`, so it *is* executable — the AArch64 encoding, and
+    /// the reason `RO_NO_EXEC` had to be named separately.
+    #[test]
+    fn is_exec_matches_the_uxn_reading() {
+        for p in [Prot::RO, Prot::RW, Prot::RX, Prot::EXEC] {
+            assert!(p.is_exec(), "{p:?}");
+        }
+        for p in [Prot::NONE, Prot::RW_NO_EXEC, Prot::RO_NO_EXEC] {
+            assert!(!p.is_exec(), "{p:?}");
+        }
+    }
+
+    /// `PROT_NONE` answered `false` to `is_read_only_to_user` because it was
+    /// `AP_RO_EL1`, not `AP_RO_ALL`. So this is not `!is_write`, and a
+    /// `PROT_NONE` page must not become shareable.
+    #[test]
+    fn read_only_to_user_excludes_prot_none() {
+        for p in [Prot::RO, Prot::RX, Prot::RO_NO_EXEC] {
+            assert!(p.is_read_only_to_user(), "{p:?}");
+        }
+        for p in [Prot::NONE, Prot::RW, Prot::RW_NO_EXEC] {
+            assert!(!p.is_read_only_to_user(), "{p:?}");
+        }
+        assert!(!Prot::NONE.is_shareable_mapping(true));
+        assert!(!Prot::RO.is_shareable_mapping(false));
+        assert!(Prot::RO.is_shareable_mapping(true));
+    }
+
+    /// `EXEC` and `RO` were byte-identical before the move; keep them so.
+    #[test]
+    fn exec_is_an_alias_of_ro() {
+        assert_eq!(Prot::EXEC, Prot::RO);
+    }
+
+    /// Every variant is in `ALL`, so an arch layer's exhaustiveness test cannot
+    /// silently miss one.
+    #[test]
+    fn all_lists_every_distinct_variant() {
+        let mut tags: [u8; 6] = Prot::ALL.map(Prot::tag);
+        tags.sort_unstable();
+        assert_eq!(tags, [0, 1, 2, 3, 4, 5]);
     }
 
     #[test]

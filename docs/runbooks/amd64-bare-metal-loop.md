@@ -61,6 +61,31 @@ wrong one.
   build fails on a symbol you just added, sync the crate, not just the file.
 - **`cargo … | tail -3 && echo OK` always prints OK** — the pipeline's status is
   `tail`'s. Grep for `^error` instead.
+- **`rsync -a` preserves mtimes, and cargo's freshness check reads mtimes.**
+  Syncing a file whose laptop mtime is *older* than the box's existing build
+  artifacts leaves cargo convinced nothing changed, so it links the stale rlib.
+  Measured 2026-09-06: `crates/akuma-cpu/src/lib.rs` was byte-identical on both
+  sides (`md5sum` agreed) and visibly contained `pub fn invlpg`, and the build
+  still failed with `cannot find function invlpg in module akuma_cpu::tlb` —
+  because the *compiled* `akuma-cpu` was from before it existed. A source file
+  you can `grep` for the symbol is not evidence the symbol is in the rlib.
+  After any sync: `find crates amd64 -type f \( -name '*.rs' -o -name '*.toml' \)
+  -exec touch {} +`.
+- **The Akuma client key lives in `target/`, which is disposable.**
+  `amd64/mkdisk.sh` generates `target/x86_64-unknown-none/release/amd64-ssh-test-key`
+  once and stages its `.pub` into the image as `etc/sshd/authorized_keys`. So the
+  key that opens a running Akuma is **whichever machine built that image** — and
+  the box builds its own. A laptop `cargo clean` (or a first build on a new
+  machine) silently regenerates the laptop's key and locks it out of the image on
+  the box, with no symptom but `Permission denied (publickey)` from a host whose
+  sshd is plainly answering. It is not a key you can re-derive: fetch the box's
+  copy from `/root/akuma/target/x86_64-unknown-none/release/amd64-ssh-test-key`
+  while Ubuntu is up. If Akuma is up and rejecting you, that file is unreachable
+  and the only way back is a reboot into Ubuntu.
+- **Firecracker's VM json can point at a tap that does not exist**, and the only
+  symptom is one failed self-test: `net: the netpoll daemon is being scheduled`.
+  Check `ip link show tap0` before believing a networking regression; the
+  documented no-NIC baseline simply drops `network-interfaces`.
 
 ## Rigs on the box (no reboot needed)
 

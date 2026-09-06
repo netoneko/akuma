@@ -18,7 +18,12 @@ use alloc::vec::Vec;
 use elf::abi::{ET_DYN, ET_EXEC, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
 use elf::segment::ProgramHeader;
 
-use akuma_mmap::{PAGE_SIZE, span, user_flags};
+use akuma_mmap::{PAGE_SIZE, span};
+// The AArch64 PTE encoding, which moved from `akuma-mmap` to the walker
+// 2026-09-06: `page_flags` here is a raw descriptor handed to `map_page`, not a
+// region's neutral `Prot`. When this crate is wanted on x86_64 that is the line
+// that has to change — see `akuma_mmap::types`.
+use akuma_mmu::user_flags;
 use crate::pages::{SegProt, UserPages, alloc_page};
 
 use super::interp::load_interp_for;

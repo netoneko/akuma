@@ -409,7 +409,10 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         return ENOMEM;
     }
     let pages = len.div_ceil(4096);
-    let page_flags = akuma_exec::mmu::user_flags::from_prot(prot);
+    // The region's neutral record and the page table's AArch64 encoding — one
+    // `u64` until 2026-09-06, two vocabularies since. See `akuma_mmap::types`.
+    let page_prot = akuma_exec::mmu::Prot::from_prot(prot);
+    let page_flags = akuma_exec::mmu::user_flags::to_pte(page_prot);
 
     let _ = MAP_STACK; // silence unused-import lint; flag accepted but ignored
 
@@ -682,7 +685,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // CoW-copied — see `MmapRegion::shared_anon` and `process::share_rw_range`. File
     // -backed `MAP_SHARED` is a different mechanism entirely (SHARED_FILE_MAPPINGS
     // writeback), so this is the anonymous case only.
-    let region = MmapRegion::owned_with_flags(mmap_addr, frames, page_flags);
+    let region = MmapRegion::owned_with_prot(mmap_addr, frames, page_prot);
     let region = if plan.shared_anon { region.shared_anon() } else { region };
     proc.vm_with_regions(|r| r.push(region));
 
@@ -795,7 +798,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             r.iter().find(|reg| reg.start_va == old_addr).and_then(MmapRegion::recorded_prot)
         });
         let region = match old_prot {
-            Some(f) => MmapRegion::owned_with_flags(new_addr, new_frames, f),
+            Some(p) => MmapRegion::owned_with_prot(new_addr, new_frames, p),
             None => MmapRegion::owned(new_addr, new_frames),
         };
         proc.vm_with_regions(|r| r.push(region));
@@ -1263,7 +1266,11 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     if len == 0 { return 0; }
     if addr & 0xFFF != 0 { return EINVAL; }
     let pages = len.div_ceil(4096);
-    let new_flags = akuma_exec::mmu::user_flags::from_prot(prot);
+    // Two vocabularies, deliberately: `new_prot` is what a *region* records
+    // (neutral, `akuma-mmap`), `new_flags` is what a *page table* takes
+    // (AArch64 `AP_*`, `akuma-mmu`). They were one `u64` until 2026-09-06.
+    let new_prot = akuma_exec::mmu::Prot::from_prot(prot);
+    let new_flags = akuma_exec::mmu::user_flags::to_pte(new_prot);
     let adding_exec = prot & 0x4 != 0;
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
@@ -1276,7 +1283,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
         akuma_exec::process::update_lazy_region_flags(proc.tgid, addr, pages * 4096, new_flags);
         // Eager regions need the same bookkeeping: they are the ones whose PTEs the
         // fault handler can only repair if it knows the intended protection.
-        akuma_exec::process::update_eager_region_flags(proc.tgid, addr, pages * 4096, new_flags);
+        akuma_exec::process::update_eager_region_flags(proc.tgid, addr, pages * 4096, new_prot);
 
         // Update all page table entries with no_flush, then issue a single
         // TLB range flush. Previously each update_page_flags call issued its

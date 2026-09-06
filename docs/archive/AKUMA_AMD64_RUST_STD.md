@@ -270,8 +270,9 @@ Exit status 6 on Akuma, exit status 6 on Linux, from the same bytes.
 | `sigaltstack` → `ENOSYS` | tolerated by musl | signals are §11.7. An honest `ENOSYS` beats another believed stub. |
 | `rt_sigaction` → `0` | **a stub that lies** | Rust installs a `SIGSEGV` handler for stack-overflow detection and believes it worked. A guard-page overflow will not be reported as one. §11.7. |
 | `brk` → `ENOSYS` | tolerated | musl uses `mmap`. Real cost: it feeds the global monotonic bump, §11.4. |
-| `CLOCK_MONOTONIC` granularity | 10 ms | it is `lapic::ticks() * US_PER_TICK`. `Instant::elapsed` over a 100 k-iteration loop reads **0 ns** here and 11 µs on Linux. Correct and monotonic, just coarse. |
-| `FUTEX_REQUEUE` / `WAKE_OP` | implemented, unexercised | nothing in the trace reaches them. They cost ~30 lines over the crate's own algebra and would otherwise be `ENOSYS` at the moment a `Condvar` first broadcasts. |
+| `CLOCK_MONOTONIC` granularity | 10 ms | it is `lapic::ticks() * US_PER_TICK`. `Instant::elapsed` over a 100 k-iteration loop reads **0 ns** here and 11 µs on Linux. Correct and monotonic, just coarse — but see §8: the counter behind it also *stops* under a condition worth knowing. |
+| `FUTEX_REQUEUE` / `WAKE_OP` | implemented **and exercised** | `futexops` covers all four ops against Linux semantics; §8. |
+| `pipe(2)` | **absent** | blocks two of the four `futex_suite` probes. Pre-existing, unrelated to futex, and `dup2` onto fds 0-2 has the same root (`FIRST_FILE_FD = 3`). |
 | a thread in a syscall-free ring-3 loop | unreachable at `exit_group` | no signals, so nothing can interrupt it. `drain`'s bound is the containment. |
 
 ## Background
@@ -286,3 +287,111 @@ Exit status 6 on Akuma, exit status 6 on Linux, from the same bytes.
   explaining why each one is a host test.
 - `docs/reference/subsystems/syscalls/sync.md` — the AArch64 side's futex
   contract, which this target now shares the algebra of and not the effects.
+
+## 8. What running the existing gate found — `scripts/futex_suite.py`
+
+Everything above was verified by probes written for this change. That is the
+weaker half of a test suite, and the tree already had the stronger half:
+`scripts/futex_suite.py`'s four C probes, whose whole reason for existing is
+that each one cost a `-j4` self-host build to find on the AArch64 side.
+
+They hardcode `aarch64-linux-musl-gcc`; the C is arch-neutral, so the same four
+sources cross-build for x86_64 and stage onto the disk. Running them is what
+this section is:
+
+| probe | result |
+|---|---|
+| `futexops` | **4/5 → found a real bug → 5/5, 0 divergences from Linux** |
+| `futextest` | **7/7 phases** — 200 spawn/joins, 8-thread fan-out, mutex+condvar × 2000, barrier 6×100, wake-before-wait × 500, park/unpark × 500 |
+| `futexkey` | blocked: needs `pipe(2)` |
+| `futexkill` | blocked: needs `pipe(2)` |
+
+### 8a. `nanosleep` did not sleep
+
+`futexops`' fifth probe reported `requeue_timeout_leaves_stale_waiter` — a
+requeued waiter that "never returned at all". The requeue was fine.
+
+The probe parks a thread on a 400 ms `FUTEX_WAIT_BITSET` deadline, then
+`nanosleep`s three times for a second each and checks whether it fired. On this
+target `nanosleep` was:
+
+```rust
+Syscall::Nanosleep => { crate::sched::yield_now(); 0 }
+```
+
+with a comment explaining that the clock is coarse and uncalibrated, so a yield
+is the honest approximation. The comment was right about the clock and wrong
+about the conclusion: **a `nanosleep` that returns immediately is not a coarse
+sleep, it is no sleep.** All three "seconds" elapsed in ~0 ms of guest time, so
+of course the 400 ms timeout had not fired yet. Every program that uses a sleep
+to sequence against another thread was silently losing its ordering, and the
+first one to say so blamed the wrong subsystem.
+
+This is worth stating as a rule, because the same shape is everywhere in a
+bring-up: **a stub that returns success is not a smaller version of the real
+thing, it is a different thing that lies.** The `rt_sigaction` row in §7 is the
+same defect still outstanding.
+
+### 8b. And the clock it would have waited on stops
+
+Fixing `nanosleep` to actually wait exposed the second half. `uptime_us()` is
+`lapic::ticks() * US_PER_TICK`, and `TICKS` only advances when the timer vector
+runs. A syscall runs with `IF` clear (`IA32_FMASK`), and the **only** place the
+scheduler re-enables it is `idle_loop`'s `sti; hlt; cli` — which the picker
+reaches only when nothing else is runnable.
+
+So two tasks spinning in the kernel — here, one in `FUTEX_WAIT` and one in
+`nanosleep` — bounce off each other through `yield_now` forever, the idle task
+is never picked, and the counter both are steering by is **frozen**. Both loops
+make progress; neither can ever terminate.
+
+`sched::allow_tick()` is the fix: `sti; nop; cli`, one instruction of window, so
+a pending tick lands. Safe with the BKL held because `timer_dispatch` takes no
+lock — `on_tick` is two atomic increments and `preempt_if_needed` returns
+immediately unless the tick landed in ring 3 or the idle loop. Deliberately not
+folded into `yield_now`, which is also called *from* the timer handler, where
+opening an interrupt window would let the vector nest.
+
+Both fixes were required. Either alone still hangs.
+
+### 8c. What this says about the probes written for this change
+
+`threadprobe` and `ruststd` both passed throughout, including the parked-sibling
+case, because neither used a **timed** wait whose wake never comes — the one
+shape that needs a moving clock. A probe written alongside an implementation
+tends to exercise the paths the implementer was thinking about. The existing
+suite was written by someone debugging a different kernel a year of incidents
+ago, and that is exactly why it found something.
+
+## 9. Verified on real silicon
+
+QEMU on Apple Silicon is TCG, and this kernel's history has several bugs QEMU
+hid. Run on the HP 500-502nj (`docs/runbooks/amd64-bare-metal-loop.md`) under
+**Firecracker on KVM**:
+
+| | boot suite | `ruststd` | `futexops` | `futextest` |
+|---|---|---|---|---|
+| VCPUS=1 | **235 passed, 0 failed** | 6/6 stages | 5/5 | 7/7 |
+| VCPUS=4 | **244 passed, 0 failed** | 6/6 stages | 5/5 | 7/7 |
+
+and locally under QEMU `microvm`, SMP=1 **245/0** and SMP=4 **254/0**. (The
+counts differ by target because the suite registers different sets — the SMP
+ones only run at SMP>1, and the Firecracker rig has no NIC attached.)
+
+Note **SMP=4 is exercising threads, not CoW `fork`**: `clone(CLONE_VM)` shares
+the parent's `space_root` and demotes no PTE, so it never needed the TLB
+shootdown that keeps `fork` at SMP=1 (§11.1, `AKUMA_AMD64_COW.md`). That is why
+the thread tests can be green at four cores while the CoW constraint stands.
+
+Two things that cost time getting there, both now in the runbook:
+
+- **`rsync -a` preserves mtimes and cargo's freshness check reads mtimes.** A
+  synced file older than the box's build artifacts leaves the *stale rlib*
+  linked. `crates/akuma-cpu/src/lib.rs` was byte-identical on both sides and
+  visibly contained `pub fn invlpg`, and the build still said
+  `cannot find function invlpg`.
+- **The Akuma ssh client key lives in `target/`**, which is disposable, and the
+  box builds its own image — so the image's `authorized_keys` is the *box's*
+  key. A laptop `cargo clean` locks the laptop out of a running box with no
+  symptom but `Permission denied (publickey)`, and the file that would fix it is
+  only reachable from the Ubuntu side.
