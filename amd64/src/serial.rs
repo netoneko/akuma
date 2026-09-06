@@ -72,15 +72,33 @@ fn klog_push(byte: u8) {
     KLOG_LEN.store(n + 1, Ordering::Relaxed);
 }
 
-/// Copy the most recent console bytes into `out`, newest at the end. Returns how
-/// many bytes were written. For `sys_syslog`'s `SYSLOG_ACTION_READ_ALL`.
+/// Copy console history into `out`, starting `skip` bytes past the oldest byte
+/// still retrievable. Returns how many bytes were written.
+///
+/// The `skip` is what lets a caller with a small staging buffer deliver the
+/// *whole* ring, a chunk at a time. Without it, `sys_syslog`'s 4 KiB staging
+/// buffer was also the hard ceiling on `dmesg`: `SIZE_BUFFER` advertised the
+/// full 64 KiB, `dmesg` allocated that and asked for it, and got the last 4 KiB
+/// back — fifteen sixteenths of the log unreachable, with nothing reporting a
+/// short read. On a machine whose console is a television with no scrollback,
+/// `dmesg` is the only way to read a boot, and it was silently truncating it to
+/// the last few seconds: an xHCI bring-up printed its whole trace and the NIC's
+/// stall dumps then pushed it out of reach.
+///
+/// `skip == 0` is the oldest retrievable byte, so successive calls walk forward
+/// through history.
 #[must_use]
-pub fn klog_snapshot(out: &mut [u8]) -> usize {
+pub fn klog_snapshot_from(skip: usize, out: &mut [u8]) -> usize {
     let _g = lock();
-    let total = KLOG_LEN.load(Ordering::Relaxed);
-    let available = (total as usize).min(KLOG_CAP);
-    let want = available.min(out.len());
-    let start = total as usize - want; // absolute index of the first byte to copy
+    let total = KLOG_LEN.load(Ordering::Relaxed) as usize;
+    let available = total.min(KLOG_CAP);
+    // Absolute index of the oldest byte still in the ring, then `skip` past it.
+    let oldest = total - available;
+    let Some(remaining) = available.checked_sub(skip) else {
+        return 0;
+    };
+    let want = remaining.min(out.len());
+    let start = oldest + skip;
     for (i, slot) in out[..want].iter_mut().enumerate() {
         // SAFETY: read of an initialised `.bss` byte, index masked into range.
         *slot = unsafe { (&raw const KLOG).cast::<u8>().add((start + i) % KLOG_CAP).read() };
@@ -88,7 +106,7 @@ pub fn klog_snapshot(out: &mut [u8]) -> usize {
     want
 }
 
-/// Total bytes currently retrievable from [`klog_snapshot`]. For
+/// Total bytes currently retrievable from [`klog_snapshot_from`]. For
 /// `SYSLOG_ACTION_SIZE_UNREAD` / `SIZE_BUFFER`.
 #[must_use]
 pub fn klog_len() -> usize {

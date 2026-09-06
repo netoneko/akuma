@@ -1,8 +1,13 @@
 # Akuma/amd64: a USB (xHCI) disk for persistence — build log
 
-**Grade: C** (active — the driver is written and host-tested but has **not yet
-worked on the metal**; it crash-loops the box and the root cause is open). Written
-2026-09-06.
+**Grade: C** (active — the driver is written, host-tested, and **works
+end-to-end under `qemu-xhci`**, but still fails bring-up on the metal; which step
+is open). Written 2026-09-06, revised the same day — see the dated section at the
+end, which supersedes the "Where it stands" notes below.
+
+**The crash-loop is gone.** A failed bring-up now halts the controller and the
+boot carries on: 201 checks pass, the network comes up, sshd serves. Everything
+below about the box restarting describes what was, not what is.
 
 ## Why this exists
 
@@ -192,7 +197,7 @@ The box is currently on Ubuntu with the known-good kernel restored and GRUB
   -device usb-storage,drive=…` run would exercise the TRB/ring/enumeration logic
   under emulation (different register layout, 0 scratchpad buffers, but the
   driver reads all that dynamically) — **not yet tried, worth doing** to iterate
-  without the metal.
+  without the metal. *(2026-09-06: done — `amd64/run-xhci.sh`. See below.)*
 - Keep the enclosure **off the USB hub** — behind it, sustained writes drop it
   off the bus; straight into a rear port it does 134 MB/s.
 
@@ -204,3 +209,139 @@ The box is currently on Ubuntu with the known-good kernel restored and GRUB
   wedged-box entry in "Known-broken".
 - `crates/akuma-xhci/tests/`, `crates/akuma-usb-storage/tests/` — the register
   and wire fixtures.
+
+---
+
+# 2026-09-06 — the QEMU rig, and what it did and did not settle
+
+The previous session ended with a driver that had never worked on the metal and
+a box that crash-looped when it tried. Both of those changed, and not in the way
+the handoff predicted.
+
+## The rig
+
+`amd64/run-xhci.sh` — QEMU `-M q35`, `-device qemu-xhci`, `-device usb-storage`,
+the PVH entry with `pci` on the command line. `-M microvm` (what `run.sh` uses)
+has no PCI bus, which is the whole reason the driver had never run anywhere but
+the metal. The PVH path does not scan PCI unless asked, because Firecracker does
+not emulate the config ports and a scan there invents devices out of garbage;
+`pci` is the boot-time promise that the ports are real.
+
+The fixture is `amd64/mkusbdisk.py`: MBR, ext2 `sda1` at LBA 2048, scratch
+`sda2` at LBA 134217728 — the real drive's layout, sparse, so 64 GiB costs about
+256 MiB. Without it the four disk checks skip and the run proves nothing about
+`READ(10)`/`WRITE(10)`.
+
+**It reproduced the bug on its first run**, in about ninety seconds, after a
+whole previous session of cold reboots had not.
+
+## The bug it found: Configure Endpoint claimed EP0
+
+`enumerate` built the Configure Endpoint input context with
+`add_flag(0) | add_flag(1) | add_flag(bulk_in) | add_flag(bulk_out)`. `A1` is
+EP0, which belongs to Address Device and Evaluate Context; a Configure Endpoint
+that also claims it is rejected. QEMU requires the low two bits of the Add flags
+to be exactly `0b01` and answers **`TRB Error` (cc=5)** otherwise.
+
+That completion code names the *TRB*, not the flag. The symptom is a bring-up
+that resets the controller, starts it, runs a no-op command, resets the port,
+enables a slot, addresses the device, reads its descriptors, finds its bulk
+endpoint pair — and then fails on the last command before the disk works, saying
+nothing about why.
+
+Fixed by `akuma_xhci::context::configure_endpoint_add_flags`, a builder rather
+than a comment, because the call site is a chain of `add_flag(..) | add_flag(..)`
+in which `add_flag(1)` looks exactly as reasonable as the others — it is what
+Address Device used three lines earlier. Pinned by
+`configure_endpoint_add_flags_exclude_ep0`.
+
+After the fix the rig runs the whole path: enumerate → address → configure →
+`READ CAPACITY` → MBR → `sda1` superblock → `WRITE(10)` round trip. 11/11.
+
+## What the rig did NOT settle
+
+**The metal still fails.** With the EP0 fix deployed, the box's verdict is:
+
+```
+Akuma/amd64 self-test: 201 passed, 1 FAILED
+  FAILED: xhci: controller + enumeration + BOT bring-up
+```
+
+So the EP0 flag was *a* bug and not *the* bug on real hardware — QEMU's
+controller is stricter about `A1` than the Intel one appears to be. Which step
+fails on the metal is **open**; the `[xhci] .. <step>` breadcrumbs will say, and
+reading them is the next agent's first job.
+
+There is also evidence the metal once got much further than any of this
+suggests: the scratch LBA on the real disk already holds the self-test's
+`(i ^ 0x5a)` pattern, which only `xhci::smoke_test` writes. A full BOT
+`WRITE(10)` completed on that hardware at some point. Either the EP0 bug arrived
+with the hardening rewrite, or the real controller tolerates what QEMU refuses.
+
+## What stopped the crash-loop
+
+The box no longer restarts. A failed bring-up now halts the controller and the
+boot carries on with networking up — 201 checks pass, DHCP leases, SNTP syncs,
+sshd serves. Three changes, in the order they matter:
+
+1. **`xhci::quiesce_all`**, on every boot immediately after the PCI scan: clears
+   `BUS_MASTER` on every xHCI controller using config space alone. This defends
+   against the *previous* boot — a controller left running keeps writing its
+   rings into `.bss` inside a kernel image loaded at 2 MiB, and the next kernel
+   is loaded into that same memory with the old DMA still in flight. It is
+   scoped to xHCI deliberately; the obvious generalisation would take out the
+   GPU, whose framebuffer is this machine's only console.
+2. **`xhci::shutdown` in `perform_reset`** — the success path had no halt at all,
+   so a working bring-up followed by a reboot recreated the same wedge.
+3. **The `usb` / `root=/dev/sda1` gate.** The smoke test used to be gated only on
+   the controller being *present*, so a "disarmed" GRUB entry still drove it in
+   full. There was no way to boot that kernel without touching the hardware,
+   which is why "even the fixed kernel still crash-loops" was not a driver
+   symptom at all.
+
+## Three diagnostic bugs, all found by trying to read a failure
+
+Each of these hid the others; they are recorded because the class repeats.
+
+- **The verdict counted failures without naming them.** `200 passed, 2 FAILED`
+  on a framebuffer console with no scrollback, on a machine that would not start
+  sshd *because* the suite failed. `Suite::report` now repeats the names
+  (`akuma-selftest`, 16 slots, `&'static str`, no allocation). It paid for
+  itself on its first boot.
+- **`dmesg` could only ever return 4 KiB.** `sys_syslog` clamped every read to
+  its 4096-byte staging buffer while `SIZE_BUFFER` advertised the real 64 KiB
+  ring — fifteen sixteenths unreachable, with nothing reporting a short read.
+  The NIC's stall dumps then pushed every boot-time diagnostic out of what could
+  be read. Fixed by chunking through `serial::klog_snapshot_from`.
+- **A failing USB driver took away the tool for debugging the USB driver.**
+  `run_shell = passed && have_fs` treats every check as load-bearing, so the
+  xHCI failure withheld sshd — the only way to read the breadcrumbs saying why
+  it failed. USB failures are now counted separately and do not condemn the
+  boot, because USB here is an opt-in peripheral the kernel already falls back
+  from.
+
+Also fixed on the way, and unrelated to USB: `DISK=none` and any PVH boot with
+no virtio transports died in `akuma_virtio::probe` walking a window that keeps
+AArch64's defaults when nothing announces one. `blk::init` now calls
+`akuma_primitives::addr::clear_virtio_window()`. That is the "pre-broken"
+`DISK=none` note in `amd64_smp_bkl_first`, closed.
+
+## The rungs above the rig
+
+`qemu-xhci` models a *correct* controller, so it catches every way the driver is
+wrong about the spec and none of the ways a particular controller is wrong about
+it. Past it, all runnable on the box under KVM without touching its own boot:
+
+| rig | adds | contained by |
+|---|---|---|
+| `usb-storage` backed by the real `/dev/sdb` | the real partition table and filesystem | the VM |
+| `usb-host,vendorid=0x174c,productid=0x55aa` | the real ASMedia enclosure's descriptors, stalls, quirks | the VM |
+| `vfio-pci,host=00:14.0` | the **real Intel controller**, including the BIOS/SMM handoff | the IOMMU |
+
+The last is the only one that can reproduce a handoff or controller-quirk bug,
+and the only one where a runaway DMA is caught rather than landing in RAM —
+strictly more protection than the metal has.
+
+**Careful with device names.** On the box's Ubuntu, `/dev/sda` is the *internal*
+Toshiba boot disk and `sda2` is `/`. The USB drive is `/dev/sdb`. Akuma only
+sees the USB one and calls it `sda`.

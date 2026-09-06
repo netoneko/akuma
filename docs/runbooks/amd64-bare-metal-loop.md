@@ -98,6 +98,18 @@ served by `syslog(2)`). The `mem: heap …/… KiB, pmm … MiB free` line every
 is in there, not on the TV. **Pipe on the laptop, not the guest** — `cmd | cmd`
 still fails on the box — so `ssh akuma "dmesg" | grep mem:`.
 
+Until 2026-09-06 this **silently returned only the last 4 KiB**: `sys_syslog`
+clamped every read to its staging buffer while `SIZE_BUFFER` advertised the full
+ring, so `dmesg` asked for 64 KiB, got 4 KiB, and reported no short read. Fifteen
+sixteenths of every boot was unreachable, and the `[rtl]` stall dumps push a lot
+of bytes — a whole xHCI bring-up trace fitted inside what had already been lost.
+If a diagnostic you know was printed is missing from `dmesg`, check you are
+running a kernel newer than that before believing the kernel never printed it.
+
+**Boot output is what fills the ring.** 64 KiB is roughly one boot; a long-running
+box with a stalling NIC overwrites the boot in minutes. Read `dmesg` early, or
+`ssh akuma "dmesg" > boot.log` on the laptop before poking at anything.
+
 There is **exactly one** Akuma GRUB entry (`/etc/grub.d/45_akuma`), on purpose:
 with three of them, a `grub-reboot` armed for one booted another, and the
 `next_entry` was set *and* consumed. One entry means a one-shot resolves to it
@@ -189,7 +201,33 @@ The last one needs VT-d on and the controller unbound from `xhci_hcd`, and is
 the only rig that can reproduce a handoff or controller-quirk bug. It is also
 the only one where a runaway DMA is caught rather than landing in RAM.
 
+### Status on the metal (2026-09-06)
+
+Bring-up **fails** on the real Intel controller — `201 passed, 1 FAILED`,
+`FAILED: xhci: controller + enumeration + BOT bring-up`. Which step is open.
+Under `qemu-xhci` the same driver passes all 11 checks, so this is a
+controller-specific difference, not a spec mistake.
+
+Two things about this that are easy to get wrong:
+
+- **It no longer takes the box down.** The failure is contained: the controller
+  is halted, the boot continues, the network comes up, sshd serves. A failing
+  USB driver is a bad afternoon, not a power cycle.
+- **USB failures do not withhold `init`.** They are counted separately from the
+  verdict, because `run_shell = passed && have_fs` otherwise takes away the ssh
+  session that is the only way to read why USB failed.
+
+There is unexplained evidence the metal once got further than this: the scratch
+LBA on `/dev/sdb` already holds the self-test's `(i ^ 0x5a)` pattern, which only
+`xhci::smoke_test` writes. A full BOT `WRITE(10)` completed on that hardware at
+some point.
+
 ### Reading a bring-up that died
+
+The verdict repeats every failed check by name under the tally (`FAILED: <name>`,
+up to 16). That exists because this console has no scrollback: a suite of 200
+checks scrolls the two that failed off the top long before the verdict appears,
+and the tally alone says how many things are wrong and nothing about which.
 
 `init` announces each step *before* it runs it (`[xhci] .. <step>`), because
 several of them can take the machine down in a way that reaches no exception

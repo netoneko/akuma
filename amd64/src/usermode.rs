@@ -1306,15 +1306,34 @@ fn sys_syslog(action: u64, bufp: u64, len: u64) -> u64 {
             if bufp == 0 || len == 0 {
                 return errno::EINVAL;
             }
-            // Bounded staging buffer: copy the ring's tail into it, then out to
-            // the user. `len` is clamped so a caller asking for megabytes gets
-            // only what the ring holds, in chunks it controls.
-            let want = (len as usize).min(4096);
-            let mut stage = [0u8; 4096];
-            let n = crate::serial::klog_snapshot(&mut stage[..want]);
-            if n > 0 && !crate::uaccess::write_bytes(bufp, &stage[..n]) {
-                return errno::EFAULT;
+            // Bounded staging buffer, but **not** a bound on the answer: copy
+            // the ring out a chunk at a time until the caller's buffer is full
+            // or the history runs out.
+            //
+            // It used to be `min(4096)` with a single pass, which made this
+            // buffer a hard ceiling on `dmesg` — `SIZE_BUFFER` advertised 64 KiB
+            // (the real ring), `busybox dmesg` allocated that and asked for it,
+            // and got the last 4 KiB back with no indication anything was
+            // missing. Every boot-time diagnostic older than the last few
+            // seconds was unreachable on the one target where the console has no
+            // scrollback: an xHCI bring-up printed its whole trace and then the
+            // NIC's stall dumps pushed it out of what could be read.
+            const CHUNK: usize = 4096;
+            let mut stage = [0u8; CHUNK];
+            let want = (len as usize).min(crate::serial::klog_len());
+            let mut done = 0usize;
+            while done < want {
+                let take = (want - done).min(CHUNK);
+                let n = crate::serial::klog_snapshot_from(done, &mut stage[..take]);
+                if n == 0 {
+                    break;
+                }
+                if !crate::uaccess::write_bytes(bufp + done as u64, &stage[..n]) {
+                    return errno::EFAULT;
+                }
+                done += n;
             }
+            let n = done;
             if action == READ_CLEAR {
                 crate::serial::klog_clear();
             }
