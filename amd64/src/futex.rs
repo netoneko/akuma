@@ -163,6 +163,11 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
 
     loop {
         crate::sched::yield_now();
+        // Without this the deadline below is unreachable whenever every other
+        // runnable task is also spinning in the kernel: `uptime_us` is the
+        // LAPIC tick counter, a syscall runs with `IF` clear, and only the idle
+        // loop re-enables it. `allow_tick`'s own comment has the measurement.
+        crate::sched::allow_tick();
         // Off the table is the wake. Checked with `iter` rather than `queue()`
         // or `locate_and_take` because this runs once per scheduler round and
         // those two allocate; this borrows.

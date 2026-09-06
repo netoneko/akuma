@@ -1276,12 +1276,50 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Getpid => 1,
         Syscall::Fcntl => crate::fd::sys_fcntl(a1, a2, a3),
         Syscall::Getrandom => sys_getrandom(a1, a2),
-        // No high-resolution sleep: this target has a coarse, uncalibrated
-        // clock and a cooperative scheduler. Yield instead — `sshd`'s serve
-        // loop only calls this to avoid a busy-spin when it did no work, and a
-        // yield is exactly that with the preemption timer running.
+        // `nanosleep(req, rem)`.
+        //
+        // This was a bare `yield_now()` — "no high-resolution sleep: this
+        // target has a coarse, uncalibrated clock", which is true and was the
+        // wrong conclusion. A `nanosleep` that returns immediately is not a
+        // coarse sleep, it is **no sleep**, and every program that uses one to
+        // sequence against another thread silently loses its ordering.
+        //
+        // Found 2026-09-06 by `scripts/futex_suite.py`'s `futexops`, which
+        // reported a requeue bug that did not exist: the probe parks a thread
+        // with a 400 ms timeout, then `nanosleep`s three times for a second
+        // each and checks whether it fired. All three returned at once, ~0 ms
+        // of guest time in, so of course it had not. The futex was correct and
+        // the clock the probe was steering by was not moving.
+        //
+        // So: sleep for real, to the 10 ms tick this target's clock has.
+        // `allow_tick` is what makes the deadline reachable at all — see its
+        // own comment; without it a sleeper spinning while any other task also
+        // spins in the kernel freezes the very counter it is waiting on.
         Syscall::Nanosleep => {
-            crate::sched::yield_now();
+            let Some([sec, nsec]) = crate::uaccess::read_val::<[i64; 2]>(a1) else {
+                return errno::EFAULT;
+            };
+            if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+                return errno::EINVAL;
+            }
+            let want_us = (sec.cast_unsigned())
+                .saturating_mul(1_000_000)
+                .saturating_add(nsec.cast_unsigned() / 1000);
+            let deadline = crate::net::uptime_us().saturating_add(want_us);
+            while crate::net::uptime_us() < deadline {
+                crate::sched::yield_now();
+                crate::sched::allow_tick();
+                // A thread whose group is exiting must not finish its nap
+                // first: `thread::drain` is waiting on it. Same argument as the
+                // futex wait loop's own check, and the same errno.
+                if crate::thread::should_leave_now() {
+                    return errno::EINTR;
+                }
+            }
+            // `rem` is only written on an interrupted sleep, and this one
+            // cannot be interrupted except by the group exit above (which does
+            // not return here). A completed sleep leaves it untouched, as Linux
+            // does.
             0
         }
         // The child-tid futex address a threaded libc registers on startup.

@@ -787,6 +787,50 @@ pub fn finish() -> ! {
     }
 }
 
+/// Let a pending timer tick be delivered, then mask again.
+///
+/// # The bug this exists for
+///
+/// `net::uptime_us()` is `lapic::ticks() * US_PER_TICK`, and `TICKS` only
+/// advances when the timer vector runs. A syscall runs with `IF` clear
+/// (`IA32_FMASK`), and the **only** place the scheduler re-enables it is
+/// [`idle_loop`]'s `sti; hlt; cli` — which the picker reaches only when nothing
+/// else is runnable. So a kernel-side drive loop that spins while *any* other
+/// task is also spinning in the kernel sees a **frozen clock**: two tasks
+/// bounce off each other through `yield_now` forever, the idle task is never
+/// picked, and every deadline computed against `uptime_us` is unreachable.
+///
+/// Measured 2026-09-06 by `scripts/futex_suite.py`'s `futexops`: a
+/// `FUTEX_WAIT` with a 400 ms timeout never returned, because the only other
+/// runnable task was in `nanosleep` — which on this target is `yield_now`. The
+/// probe reported it as a requeue bug; the requeue was fine and the clock was
+/// stopped. See `docs/archive/AKUMA_AMD64_RUST_STD.md` §8.
+///
+/// # Why this is safe with the BKL held
+///
+/// `timer_dispatch` takes **no lock**: `lapic::on_tick` is two atomic
+/// increments, and [`preempt_if_needed`] returns immediately unless the tick
+/// landed in ring 3 or in the idle loop — neither of which is true of a caller
+/// here. So the tick advances the clock and switches nothing. Interrupt gates
+/// mask `IF` for the handler's duration, so it cannot nest, and every task has
+/// its own trap stack.
+///
+/// Deliberately **not** folded into [`yield_now`]: that is also called from
+/// inside the timer handler (`preempt_if_needed`), where opening an interrupt
+/// window would let the vector nest, which the gate type exists to prevent.
+/// A drive loop that depends on the clock asks for this by name.
+///
+/// `sti` takes effect only after the following instruction, so the `nop` is the
+/// window and a pending tick is recognised at the boundary before `cli` — the
+/// same idiom as the idle loop's `sti; hlt`.
+pub fn allow_tick() {
+    // SAFETY: interrupts on for exactly one instruction. The timer vector is
+    // installed, takes no lock, and will not switch away from kernel code.
+    unsafe {
+        core::arch::asm!("sti", "nop", "cli", options(nomem, nostack));
+    }
+}
+
 /// Switch to the next runnable task, round-robin.
 ///
 /// A no-op when nothing else is runnable — deliberately, so a lone task calling
