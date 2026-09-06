@@ -38,6 +38,17 @@ pub mod user_flags {
     pub const EXEC: u64 = flags::AP_RO_ALL;
     pub const RW_NO_EXEC: u64 = flags::AP_RW_ALL | flags::UXN | flags::PXN;
     pub const RX: u64 = flags::AP_RO_ALL | flags::PXN;
+    /// Read-only and **not** executable — the read-only sibling of
+    /// [`RW_NO_EXEC`], for a page a process may read and nothing else.
+    ///
+    /// Named because four call sites were spelling it `RO | UXN | PXN` inline
+    /// (`process_info`, in both the `execve` and the fresh-image paths). Those
+    /// were the *only* places in the tree outside this module and `akuma-mmu`
+    /// that did bit arithmetic on a permission, which mattered more than the
+    /// duplication: with them gone, every consumer of this vocabulary treats it
+    /// as six opaque named values, and re-encoding it for another architecture
+    /// is a change to this module rather than a hunt through the callers.
+    pub const RO_NO_EXEC: u64 = flags::AP_RO_ALL | flags::UXN | flags::PXN;
 
     #[must_use]
     pub fn from_prot(prot: u32) -> u64 {

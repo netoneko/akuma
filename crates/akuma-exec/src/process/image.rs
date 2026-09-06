@@ -219,7 +219,7 @@ impl Process {
             asg.map_page(
                 PROCESS_INFO_ADDR,
                 process_info_frame.addr,
-                mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
+                mmu::user_flags::RO_NO_EXEC,
             )
             .map_err(|_| "Failed to map process info")?;
             asg.track_user_frame(process_info_frame);
@@ -295,7 +295,7 @@ impl Process {
             .map_page(
                 PROCESS_INFO_ADDR,
                 process_info_frame.addr,
-                crate::mmu::user_flags::RO | crate::mmu::flags::UXN | crate::mmu::flags::PXN,
+                crate::mmu::user_flags::RO_NO_EXEC,
             )
             .map_err(|_| ElfError::MappingFailed("process info page"))?;
 

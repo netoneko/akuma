@@ -2435,7 +2435,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         .map_page(
             PROCESS_INFO_ADDR,
             process_info_frame.addr,
-            mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
+            mmu::user_flags::RO_NO_EXEC,
         )
         .map_err(|_| "Failed to map process info")?;
     new_address_space.track_user_frame(process_info_frame);
@@ -2963,7 +2963,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     let map_result = new_proc.address_space.get_mut().map_page(
         PROCESS_INFO_ADDR,
         new_proc.process_info_phys.load(core::sync::atomic::Ordering::Relaxed),
-        mmu::user_flags::RO | mmu::flags::UXN | mmu::flags::PXN,
+        mmu::user_flags::RO_NO_EXEC,
     );
     if map_result.is_err() {
         lifecycle_trace("[FORK-DBG] step5a: map_page FAILED\n");
