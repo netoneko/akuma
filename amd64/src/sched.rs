@@ -311,18 +311,30 @@ fn register_hooks() {
         allow_tick,
     });
 
-    // The scheduler also wants a clock and a console. `trigger_sgi`,
-    // `wake_core`, `wake_remote_idle` and `end_of_interrupt` are the AArch64
-    // GIC's vocabulary and are **never called on this target**: the x86_64
-    // switch is a plain function call, not an interrupt, so there is no
-    // software-generated interrupt to raise and no EOI to write. They are
-    // supplied as loud stubs rather than left unregistered because
-    // `ThreadRuntime` is one struct — a `panic!` here would name the exact
-    // field if the crate ever grows an x86 path that needs one.
+    // The scheduler also wants a clock and a console. The other four fields are
+    // the AArch64 GIC's vocabulary, and on this target they are **no-ops with a
+    // reason**, not stubs:
+    //
+    // `trigger_sgi` asks a core to enter its scheduler. AArch64's scheduler
+    // *is* an interrupt handler, so a wake has to raise one; x86_64's is a plain
+    // function call, so a woken thread simply becomes visible to the next
+    // `x86_yield_now` pick and there is nothing to raise. `wake_core` is the
+    // cross-core version of the same request and answers the same way;
+    // `wake_remote_idle` reports that there was no idle core to nudge; and
+    // `end_of_interrupt` has no interrupt to end.
+    //
+    // These were `unreachable!()` for exactly one boot, on the theory that a
+    // field the x86 path never reaches should say so loudly. It reaches
+    // `trigger_sgi` on the very first wake: `ThreadWaker::wake` raises one
+    // unconditionally after a successful `WAITING → READY` CAS, because on
+    // AArch64 that is how the woken thread gets looked at. The self-test caught
+    // it — `[PANIC] sched.rs` immediately after "a parked task is never picked"
+    // — which is the argument for keeping the park checks in the boot suite
+    // rather than trusting a green build.
     threading::register(
         threading::ThreadRuntime {
             uptime_us: crate::net::uptime_us,
-            trigger_sgi: |_| unreachable!("trigger_sgi: no SGI on x86_64; the switch is a call"),
+            trigger_sgi: |_| {},
             wake_core: |_| {},
             wake_remote_idle: || false,
             end_of_interrupt: |_| {},

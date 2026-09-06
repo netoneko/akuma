@@ -197,7 +197,33 @@ case "$HVF" in
     ;;
 esac
 
-if [ "$use_hvf" = "1" ]; then
+# KVM, where there is one. On an aarch64 Linux guest with nested virtualisation
+# — the Lima VM on an Apple Silicon laptop is the case this exists for — QEMU
+# can use KVM, and that is the only fast *and* correct option here:
+#
+#   - HVF is macOS-only, and on this suite it asserts (`Assertion failed:
+#     (isv)`) partway through the user-copy EFAULT probe, because the faulting
+#     instruction is an LDP, which carries no syndrome. See "HVF notes" above.
+#   - TCG is correct and far too slow to sit inside an edit-run loop.
+#
+# So the laptop builds and Lima runs. Checked before HVF is even considered
+# because the two are mutually exclusive by platform: HVF needs Darwin, KVM
+# needs `/dev/kvm`, and no machine offers both.
+use_kvm=0
+if [ "$use_hvf" != "1" ] && [ -w /dev/kvm ] \
+   && qemu-system-aarch64 -accel help 2>/dev/null | grep -qw kvm; then
+  case "$HVF" in
+    0|off|no|false|FALSE) ;;   # an explicit HVF=0 means "software", so honour it
+    *) use_kvm=1 ;;
+  esac
+fi
+
+if [ "$use_kvm" = "1" ]; then
+  # `-cpu host` for the same reason HVF needs it: a virtualised CPU cannot be a
+  # model the host does not implement.
+  ACCEL_ARGS=(-accel kvm -cpu host)
+  echo "[cargo_runner] accelerator: KVM (-accel kvm -cpu host). HVF=0 to force TCG." >&2
+elif [ "$use_hvf" = "1" ]; then
   ACCEL_ARGS=(-accel hvf -cpu host)
   echo "[cargo_runner] accelerator: HVF (-accel hvf -cpu host). HVF=0 to force TCG." >&2
 

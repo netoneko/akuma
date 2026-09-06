@@ -29,7 +29,7 @@ every boot and nothing persists it**, so the fingerprint changes by design and a
 
 ```
 ssh akuma "reboot -f"          # Akuma resets itself -> Ubuntu (GRUB default)
-   ... rsync changed files to root@192.168.1.123:/root/akuma/  (-F /dev/null!)
+   ... hpbox.deploy()                       # box lands on a commit + your patch
    ... cargo build -p akuma-amd64 --target x86_64-unknown-none --release
    ... sh amd64/mkdisk.sh
    ... cp to /boot/akuma/{akuma-amd64,root.img}; grub-reboot "Akuma/amd64"
@@ -37,22 +37,104 @@ ssh -F /dev/null -p 22 root@192.168.1.123 "reboot"   # -> Akuma
 ssh akuma "<test>"
 ```
 
+**`/root/akuma` on the box is a git checkout** (since 2026-09-07), not the
+snapshot the older parts of this runbook were written against. That is what
+makes `hpbox.deploy()` possible and it is why there is no file-copying step
+above any more.
+
 `reboot -f`, not `reboot`: busybox `reboot` opens `/proc` to find init and
 refuses without it. `/proc` exists as an empty directory now, but `-f` skips the
 check entirely and is what makes this unattended.
 
 A helper that knows both personalities lives at
 [`scripts/utils/hpbox.py`](../../scripts/utils/hpbox.py): `which_system()`,
-`wait_for()`, `reboot_to()`, `push()`, `ubuntu()`, `akuma()`, plus a CLI
+`wait_for()`, `reboot_to()`, `deploy()`, `ubuntu()`, `akuma()`, plus a CLI
 (`python3 scripts/utils/hpbox.py which` / `wait akuma` / `ak '<cmd>'` /
 `ub '<cmd>'` / `reboot-to ubuntu`). **Ask which system is running — never
 assume.** Every confusing failure in this loop has started with talking to the
 wrong one.
 
+## Two machines at once (the fast lane)
+
+**Run local QEMU and the box's Firecracker in parallel, not one after the
+other.** They share nothing but the source, they take minutes each, and run
+together the cost is the slower of the two instead of the sum — in practice the
+local TCG boot, because the box builds and boots under KVM while the laptop is
+emulating x86 on Apple Silicon.
+
+```bash
+python3 scripts/utils/amd64_trials.py --sync origin/<branch>
+python3 scripts/utils/amd64_trials.py --smp 4 --grep 'block:'
+python3 scripts/utils/amd64_trials.py --local-only        # laptop only
+```
+
+Exit status is 0 only if every trial that ran reported `0 failed`. A boot that
+produced **no** tally is reported as `NO TALLY`, not as a pass: silence means it
+hung or died, and the two must never read alike.
+
+### Why both, and not just the faster one
+
+They fail differently, and that is the point rather than a caveat:
+
+| | local QEMU | box Firecracker |
+|---|---|---|
+| CPU | TCG, emulated | KVM, a real vCPU |
+| entry | PVH, `-M microvm` | PVH |
+| devices | virtio-MMIO, slirp | virtio-MMIO, the box's own disk |
+| timing | wrong, and slow | close to the metal |
+
+A change that breaks one and not the other is the interesting case. Timing bugs
+and anything touching the scheduler or the clock will show on KVM and hide under
+TCG; anything touching device discovery tends to do the reverse.
+
+**Neither of these reboots the box.** Firecracker runs on the *Ubuntu*
+personality, so the fast lane costs no reboot and does not disturb whatever is
+running. Bare metal is a separate, slower step you take once the fast lane is
+green:
+
+```
+fast lane  →  amd64_trials.py            (no reboot, ~minutes)
+   then    →  hpbox.stage()              (build, image, arm GRUB)
+   then    →  hpbox.reboot_to("akuma")   (the metal, ~a minute each way)
+```
+
+Going straight to the metal for a change the fast lane would have caught is the
+single most expensive habit in this loop.
+
+### Getting the source onto the box
+
+**`hpbox.deploy()`.** One call, and it handles the case that used to need
+judgement — a fix that is neither pushed nor committed:
+
+1. fetch, and hard-reset the box to the newest local commit the remote has;
+2. `git apply --3way` everything after that — unpushed commits and the working
+   tree together, as one patch against the commit it just landed on.
+
+So the box ends at *a named commit plus a named patch*, which is a state you can
+report and reproduce. A hard reset is right here and nowhere else: `/root/akuma`
+is a deployment checkout, never authored on, so there is nothing to destroy.
+(The project rule against `git reset` is about the developer's repository.)
+
+`git apply --3way`, not `patch -p1`: it understands renames and deletions and
+merges a hunk whose context moved. `hpbox.send_files([...])` remains for when a
+patch will not apply and you know exactly which files you want overwritten —
+but note it **cannot express a deletion**, so a file you removed locally stays
+on the box and keeps compiling.
+
+The failure every one of these must avoid is the same one: sync too little, the
+build succeeds against stale source, and the bug you just fixed is still there
+while the evidence says it is not. `deploy` cannot fail that way quietly —
+either the reset lands or it errors, either the patch applies or it conflicts.
+
+One-time setup, already done: the box needs
+`git config --global --add safe.directory /root/akuma`, without which git exits
+128 with "detected dubious ownership" and prints **nothing to stdout** — so a
+caller reading only stdout sees an empty success.
+
 ## Rules that cost time to learn
 
-- **Never rsync the whole tree.** Vendored submodules make it ~37 GB. Copy the
-  files you changed: `rsync -a --relative <files> root@…:/root/akuma/`.
+- **Never copy the whole tree.** Vendored submodules make it ~37 GB. Use
+  `hpbox.deploy()`, which moves a commit id and a patch — bytes, not gigabytes.
 - **`pkill -f <pattern>` over ssh kills your own session** when the pattern
   appears in the script you sent — it is in the argv. Use
   `for p in $(pgrep -x qemu-system-x86); do kill -9 $p; done` (comm truncates
@@ -61,7 +143,8 @@ wrong one.
   build fails on a symbol you just added, sync the crate, not just the file.
 - **`cargo … | tail -3 && echo OK` always prints OK** — the pipeline's status is
   `tail`'s. Grep for `^error` instead.
-- **`rsync -a` preserves mtimes, and cargo's freshness check reads mtimes.**
+- **cargo's freshness check reads mtimes**, so any transport that preserves the
+  laptop's mtimes will lie to it.
   Syncing a file whose laptop mtime is *older* than the box's existing build
   artifacts leaves cargo convinced nothing changed, so it links the stale rlib.
   Measured 2026-09-06: `crates/akuma-cpu/src/lib.rs` was byte-identical on both

@@ -35,9 +35,6 @@ UB = [
     "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
     "-p", "22", f"root@{IP}",
 ]
-UB_RSH = ("ssh -F /dev/null -o StrictHostKeyChecking=no "
-          "-o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p 22")
-
 # Akuma: the config alias already carries port, user, key and no host checking.
 AK = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "akuma"]
 
@@ -58,43 +55,21 @@ def akuma(cmd, timeout=60):
     return r.returncode, r.stdout, r.stderr
 
 
-def push(files, repo="."):
-    """rsync repo-relative paths to the Ubuntu side's snapshot at /root/akuma/.
-
-    NEVER rsync the whole tree — vendored submodules make it ~37 GB. Name the
-    files you changed; `--relative` recreates their directories.
-    """
-    r = subprocess.run(
-        ["rsync", "-a", "--relative", "-e", UB_RSH] + list(files)
-        + [f"root@{IP}:/root/akuma/"],
-        cwd=repo, capture_output=True, text=True,
-    )
-    return r.returncode, r.stderr
-
-
 def patch(paths=None, repo=".", base="HEAD", dry_run_first=True, touch=True):
     """Send local changes to the Ubuntu side as a patch and apply them there.
 
-    Preferred over :func:`push` for iterating on kernel source, for three
-    reasons the rsync path learned the hard way:
+    **Superseded by :func:`deploy`.** Kept because it takes a `paths` filter and
+    a `base` other than `HEAD`, which is occasionally what you want; for the
+    ordinary "make the box match my tree" case `deploy` is strictly better —
+    it pins the box to a *commit* first, so what lands is a known state plus a
+    named patch rather than an unknown state plus a patch.
 
-    * **It carries only what changed.** `push` needs you to name every file, and
-      naming too few is how a build fails on a symbol whose *source* is plainly
-      present on the box — you synced the file and not the crate.
-    * **It fails loudly on drift.** The box's tree is a snapshot, not a
-      checkout, so it drifts. `patch --dry-run` refuses a hunk that does not
-      apply; rsync would overwrite whatever was there and say nothing.
-    * **It sidesteps the mtime trap.** `rsync -a` preserves mtimes and cargo's
-      freshness check reads them, so syncing a file *older* than the box's
-      existing artifacts leaves cargo convinced nothing changed and linking the
-      stale rlib. A patched file is written now, so its mtime is now.
+    This shells out to `patch -p1` because when it was written the box had no
+    `.git`. It has one now, so `deploy` uses `git apply --3way`, which
+    understands renames and deletions and can merge a hunk whose context moved.
 
     `paths` restricts the diff (repo-relative, as `git diff` takes them);
-    `None` sends every tracked change against `base`. Returns
-    ``(rc, message)`` — rc 0 on success, and `message` is whatever `patch`
-    said when it is not.
-
-    The box has no `.git`, so this is `patch -p1`, not `git apply`.
+    `None` sends every tracked change against `base`. Returns ``(rc, message)``.
     """
     cmd = ["git", "diff", base]
     if paths:
@@ -134,17 +109,18 @@ def patch(paths=None, repo=".", base="HEAD", dry_run_first=True, touch=True):
 def send_files(paths, repo=".", touch=True):
     """Make the box's copy of `paths` byte-identical to this worktree's.
 
-    The companion to :func:`patch`, and the one to reach for when the two trees
-    are not on the same base. `patch` sends a *diff against `HEAD`*, so it
-    applies only while the box's snapshot is on that same commit; the moment it
-    is a commit behind, every hunk in a rewritten file is refused. That refusal
-    is the helper working — but the fix is to send the files themselves.
+    The blunt instrument, for when a patch will not apply and you know exactly
+    which files you want overwritten. :func:`deploy` is the default.
 
     Content is piped over ssh and written with `cat`, so each file lands with a
-    **fresh mtime**. That is not incidental: `rsync -a` preserves mtimes and
-    cargo's freshness check reads them, so a file whose laptop mtime predates
-    the box's build artifacts leaves cargo linking the stale rlib and reporting
-    a missing symbol you can plainly `grep` for in the source.
+    **fresh mtime**. That is not incidental: cargo's freshness check reads
+    mtimes, so any transport that preserves the laptop's — and a file whose
+    laptop mtime predates the box's build artifacts — leaves cargo linking the
+    stale rlib and reporting a missing symbol you can plainly `grep` for in the
+    source.
+
+    Cannot express a **deletion**: a file removed locally stays on the box and
+    keeps compiling. :func:`deploy` can, and should be preferred.
 
     Returns ``(rc, message)``.
     """
@@ -175,6 +151,183 @@ def send_files(paths, repo=".", touch=True):
             capture_output=True, text=True, timeout=300,
         )
     return 0, f"sent {len(sent)} file(s): " + ", ".join(sent)
+
+
+def sync_from_git(rev=None, branch=None, timeout=300):
+    """Make the box's tree exactly `rev` by fetching and hard-resetting.
+
+    Returns ``(rc, message)``.
+
+    # Why this and not a file sweep
+
+    The box's tree is a **snapshot that drifts**, and every content-based answer
+    to "what does it not have?" is a guess with a silent failure mode: send too
+    few files and the build succeeds against stale source, so the bug you just
+    fixed is still there and the evidence says it is not. `git` already knows
+    the answer exactly.
+
+    Hard reset is right here and would be wrong anywhere else: `/root/akuma` on
+    the box is a **deployment checkout**, not anyone's working tree. Nothing is
+    ever authored on it — the loop is laptop → push → box — so there is nothing
+    a reset can destroy. (The rule against `git reset` in this project's
+    CLAUDE.md is about the *developer's* repository, where a reset rewrites work
+    the user has not reviewed.)
+
+    The catch, and it is the whole usage note: **this only carries committed
+    work.** Mid-iteration, with the fix still in the working tree, use
+    :func:`send_files` with an explicit list instead. Push, then sync.
+    """
+    if rev is None:
+        rev = f"origin/{branch}" if branch else "origin/HEAD"
+    # `safe.directory` is not optional and its absence is not obvious: git
+    # refuses a repository whose owner differs from the caller with
+    # "detected dubious ownership", exits 128, and prints nothing to stdout —
+    # so a caller that only reads stdout sees an empty success. Set every time;
+    # `--add` on an existing value is a no-op.
+    cmd = (f"git config --global --add safe.directory {BOX_REPO}; "
+           f"cd {BOX_REPO} && git fetch --all --prune 2>&1 | tail -3 && "
+           f"git reset --hard {rev} 2>&1 | tail -2 && git log --oneline -1")
+    rc, out, err = ubuntu(cmd, timeout=timeout)
+    return rc, (out + err).strip()
+
+
+def deploy(repo=".", branch=None, timeout=600):
+    """Make the box's checkout match this worktree exactly — commits *and* dirt.
+
+    Returns ``(rc, message)``. This is the one to call; everything below it is a
+    piece of it.
+
+    # What it does
+
+    1. Fetch, and hard-reset the box to the newest local commit it can reach.
+       Usually that is local `HEAD`. If `HEAD` has not been pushed, it falls
+       back to the newest ancestor that *has* been, and says which.
+    2. `git apply --3way` the remaining diff — unpushed commits and the working
+       tree together, as one patch against the commit the box just landed on.
+
+    So an unpushed, uncommitted fix reaches the box in one call, and the box
+    ends up at a known commit plus a named patch rather than at "some files were
+    overwritten".
+
+    # Why this replaces both older helpers
+
+    :func:`patch` shells out to `patch -p1` because when it was written the box
+    had no `.git`. It has one now, and `git apply --3way` is strictly better:
+    it understands renames and deletions, it can merge a hunk whose context
+    moved, and when it cannot it reports a conflict instead of a rejected hunk.
+    :func:`send_files` cannot express a deletion at all — a file removed locally
+    stays on the box and keeps compiling.
+
+    The failure both older paths shared is the one that costs the most: sync too
+    little and the build succeeds against stale source, so the bug you just
+    fixed is still there and the evidence says it is not. Resetting to a commit
+    and applying a patch cannot do that quietly — either the reset lands or it
+    errors, and either the patch applies or it conflicts.
+    """
+    import subprocess as sp
+
+    def git(*args, check=False):
+        r = sp.run(["git", "-C", repo, *args], capture_output=True, text=True)
+        if check and r.returncode != 0:
+            raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()}")
+        return r
+
+    head = git("rev-parse", "HEAD").stdout.strip()
+    if not head:
+        return 1, "not a git repository"
+
+    # Which local commits does the remote already have? `git branch -r
+    # --contains` is the honest question; asking the box would be a round trip
+    # for the same answer.
+    fetch = f"git config --global --add safe.directory {BOX_REPO}; cd {BOX_REPO} && git fetch --all --prune 2>&1 | tail -2"
+    rc, out, err = ubuntu(fetch, timeout=timeout)
+    if rc not in (0, None):
+        return rc, f"fetch failed: {(out + err).strip()}"
+
+    # The newest local commit that exists on the remote. Walk back from HEAD
+    # rather than trusting @{upstream}, which may not be set.
+    base = None
+    for line in git("rev-list", "--max-count=200", "HEAD").stdout.split():
+        contains = git("branch", "-r", "--contains", line).stdout.strip()
+        if contains:
+            base = line
+            break
+    if base is None:
+        return 1, ("no commit in the last 200 is on any remote — push something first, "
+                   "or the box has nothing to reset to")
+
+    rc, out, err = ubuntu(
+        f"cd {BOX_REPO} && git reset --hard {base} 2>&1 | tail -2 && git log --oneline -1",
+        timeout=timeout)
+    if rc not in (0, None):
+        return rc, f"reset failed: {(out + err).strip()}"
+    landed = (out + err).strip().splitlines()[-1] if (out + err).strip() else base[:7]
+
+    # Everything else: unpushed commits + the working tree, as one patch.
+    diff = git("diff", base).stdout
+    note = f"box at {landed}"
+    if base != head:
+        note += f" (local HEAD {head[:7]} is not pushed — sent as patch)"
+    if not diff.strip():
+        return 0, note + "; nothing further to apply"
+
+    r = subprocess.run(
+        UB + [f"cd {BOX_REPO} && git apply --3way --whitespace=nowarn -"],
+        input=diff, capture_output=True, text=True, timeout=300,
+    )
+    if r.returncode != 0:
+        return r.returncode, note + "; git apply failed:\n" + (r.stdout + r.stderr).strip()
+
+    lines = len(diff.splitlines())
+    return 0, f"{note}; applied a {lines}-line patch"
+
+
+def files_missing_on_box(repo=".", paths=("amd64", "crates", "Cargo.toml", "Cargo.lock"),
+                        timeout=120):
+    """Exactly the files this worktree has that the box's checkout does not.
+
+    Returns ``(rc, paths)`` for :func:`send_files`.
+
+    Now that `/root/akuma` is a real checkout (:func:`sync_from_git`), the box
+    can be *asked* what it is on, and the answer makes this exact rather than a
+    guess: everything committed since that point, plus everything still dirty in
+    the working tree. No checksum sweep, no commit-range magic number, and no
+    dependence on the box having been synced recently.
+
+    This is the mid-iteration path — the one for a fix that is not pushed yet.
+    Once it is pushed, :func:`sync_from_git` is simpler and carries deletions
+    too, which this cannot.
+    """
+    import subprocess as sp
+
+    rc, head = box_head(timeout=timeout)
+    if rc not in (0, None) or not head:
+        return 1, f"could not read the box's HEAD: {head}"
+    sha = head.split()[0]
+
+    def git(*args):
+        r = sp.run(["git", "-C", repo, *args], capture_output=True, text=True)
+        return r.stdout.splitlines() if r.returncode == 0 else []
+
+    # Committed locally but not on the box.
+    committed = git("diff", "--name-only", f"{sha}..HEAD", "--", *paths)
+    # Still only in the working tree.
+    dirty = [l[3:] for l in git("status", "--porcelain", "--", *paths) if l[3:]]
+
+    import os
+    both = sorted({f for f in committed + dirty if os.path.isfile(os.path.join(repo, f))})
+    return 0, both
+
+
+def box_head(timeout=60):
+    """The commit the box's tree is on — one line, `<short sha> <subject>`.
+
+    Worth printing before every remote trial. "Which system is running" is the
+    first question this loop teaches you to ask; "which commit is it building"
+    is the second, and it has cost just as much time.
+    """
+    rc, out, err = ubuntu(f"cd {BOX_REPO} && git log --oneline -1", timeout=timeout)
+    return rc, (out + err).strip()
 
 
 # Where the box keeps the things this module drives.
