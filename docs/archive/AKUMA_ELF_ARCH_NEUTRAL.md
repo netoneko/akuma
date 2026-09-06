@@ -122,6 +122,13 @@ targets.
   musl binaries.
 - **amd64**: 240/0 self-tests, unchanged.
 
+## Follow-on
+
+The ledger half of `UserAddressSpace` was extracted the same day —
+`crates/akuma-user-space`, `docs/archive/AKUMA_USER_SPACE_LEDGER.md`. It does not
+move the wall (it is 16% of the type) but it makes the walker's remaining content
+honest and puts host tests on the two-counts rule.
+
 ## Background
 
 - `docs/archive/AKUMA_AMD64_STREAMLINING.md` — the survey this came out of.

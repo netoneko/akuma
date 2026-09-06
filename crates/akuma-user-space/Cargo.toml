@@ -1,0 +1,23 @@
+[package]
+name = "akuma-user-space"
+version = "0.1.0"
+edition = "2024"
+description = "The frame ledger of a user address space: which physical frames it holds, and how many times. No page tables."
+
+[lints]
+workspace = true
+
+[features]
+# Forwarded from `akuma-mmu`. Off, every counter hook compiles to nothing.
+leak-instr = []
+
+[dependencies]
+# `PhysFrame`. That crate's `[dependencies]` table is empty, which is what makes
+# it safe to sit under this one.
+akuma-mmap = { path = "../akuma-mmap" }
+# `IrqGuard` — the ledger's locks are taken from IRQ context.
+akuma-primitives = { path = "../akuma-primitives" }
+# The **global** CoW refcount, which `adopt_user_frame` must update in the same
+# uninterruptible window as the per-address-space count. See that method.
+akuma-pmm = { path = "../akuma-pmm" }
+spinning_top = "0.3"

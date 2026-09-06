@@ -199,6 +199,10 @@ pub use types::*;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use akuma_mmap::PhysFrame;
+// Gated like `UserAddressSpace` itself, which is the only thing that holds one:
+// on x86_64 that struct is compiled out and an ungated import is an error.
+#[cfg(target_arch = "aarch64")]
+use akuma_user_space::FrameLedger;
 use akuma_primitives::irq::{with_irqs_disabled, IrqGuard};
 
 /// MMU initialization state
@@ -1112,15 +1116,9 @@ mod instr {
     pub(super) static AS_NEW_SHARED: AtomicUsize = AtomicUsize::new(0);
     pub(super) static AS_DROP: AtomicUsize = AtomicUsize::new(0);
     pub(super) static AS_DROP_SHARED: AtomicUsize = AtomicUsize::new(0);
-    /// Entries currently held by a `user_frames` map that still exists: +1 per new
-    /// key, -1 per key removed, -len when a map is freed or dropped.
-    pub(super) static UF_LIVE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
-    /// Components of that residual, so a short term names the escape route.
-    pub(super) static UF_INSERTS: AtomicUsize = AtomicUsize::new(0);
-    pub(super) static UF_REMOVE_ONE: AtomicUsize = AtomicUsize::new(0);
-    pub(super) static UF_FREED_NOW: AtomicUsize = AtomicUsize::new(0);
-    pub(super) static UF_DROP_REMAINDER: AtomicUsize = AtomicUsize::new(0);
-    pub(super) static UF_SILENT: AtomicUsize = AtomicUsize::new(0);
+    // The `user_frames` counters moved to `akuma-user-space` with the map they
+    // count; the hooks below forward. Only the address-space *lifecycle*
+    // counters stay here, because they count this crate's own events.
     /// Drop-completion bracket. This kernel does not unwind — a killed or abandoned
     /// teardown thread skips destructors — so a `Drop` that is entered and never
     /// left leaks the `user_frames` map it is holding in a local, with every other
@@ -1216,14 +1214,10 @@ mod instr {
     }
 
     /// (inserts, removals, freed at teardown, dropped with the struct, silently dropped).
+    ///
+    /// Forwarded: the counters live with the map, in `akuma-user-space`.
     pub fn uf_flow_stats() -> (usize, usize, usize, usize, usize) {
-        (
-            UF_INSERTS.load(Ordering::Relaxed),
-            UF_REMOVE_ONE.load(Ordering::Relaxed),
-            UF_FREED_NOW.load(Ordering::Relaxed),
-            UF_DROP_REMAINDER.load(Ordering::Relaxed),
-            UF_SILENT.load(Ordering::Relaxed),
-        )
+        akuma_user_space::instr::uf_flow_stats()
     }
 
     /// (new, new_shared, dropped, dropped_shared, live user_frames entries).
@@ -1233,7 +1227,7 @@ mod instr {
             AS_NEW_SHARED.load(Ordering::Relaxed),
             AS_DROP.load(Ordering::Relaxed),
             AS_DROP_SHARED.load(Ordering::Relaxed),
-            UF_LIVE_ENTRIES.load(Ordering::Relaxed),
+            akuma_user_space::instr::uf_live_entries(),
         )
     }
 
@@ -1253,31 +1247,18 @@ mod instr {
     }
     pub(super) fn free_now_enter(l0: usize, uf_len: usize, kind: usize) -> Ledger {
         FREE_NOW_ENTER.fetch_add(1, Ordering::Relaxed);
-        UF_LIVE_ENTRIES.fetch_sub(uf_len, Ordering::Relaxed);
-        UF_FREED_NOW.fetch_add(uf_len, Ordering::Relaxed);
+        akuma_user_space::instr::uf_freed_now(uf_len);
         drop_ledger_enter(l0, 0, uf_len, kind)
     }
     pub(super) fn free_now_exit(l: Ledger) {
         FREE_NOW_EXIT.fetch_add(1, Ordering::Relaxed);
         drop_ledger_exit(l);
     }
-    pub(super) fn uf_insert() {
-        UF_LIVE_ENTRIES.fetch_add(1, Ordering::Relaxed);
-        UF_INSERTS.fetch_add(1, Ordering::Relaxed);
-    }
-    pub(super) fn uf_removed() {
-        UF_LIVE_ENTRIES.fetch_sub(1, Ordering::Relaxed);
-        UF_REMOVE_ONE.fetch_add(1, Ordering::Relaxed);
-    }
     pub(super) fn uf_drop_remainder(n: usize) {
-        if n > 0 {
-            UF_LIVE_ENTRIES.fetch_sub(n, Ordering::Relaxed);
-            UF_DROP_REMAINDER.fetch_add(n, Ordering::Relaxed);
-        }
+        akuma_user_space::instr::uf_drop_remainder(n);
     }
     pub(super) fn uf_silent(n: usize) {
-        UF_LIVE_ENTRIES.fetch_sub(n, Ordering::Relaxed);
-        UF_SILENT.fetch_add(n, Ordering::Relaxed);
+        akuma_user_space::instr::uf_silent(n);
     }
 }
 
@@ -1292,8 +1273,6 @@ mod instr {
     #[inline(always)] pub(super) fn as_drop_exit(_l: Ledger) {}
     #[inline(always)] pub(super) fn free_now_enter(_l0: usize, _n: usize, _k: usize) -> Ledger {}
     #[inline(always)] pub(super) fn free_now_exit(_l: Ledger) {}
-    #[inline(always)] pub(super) fn uf_insert() {}
-    #[inline(always)] pub(super) fn uf_removed() {}
     #[inline(always)] pub(super) fn uf_drop_remainder(_n: usize) {}
     #[inline(always)] pub(super) fn uf_silent(_n: usize) {}
 }
@@ -1656,15 +1635,11 @@ pub fn with_phys_bytes_mut<R>(
 #[cfg(target_arch = "aarch64")]
 pub struct UserAddressSpace {
     l0_frame: PhysFrame,
-    page_table_frames: Spinlock<Vec<PhysFrame>>,
-    /// Tracked user data frames, keyed by physical address → reference count
-    /// *within this address space* (a PA can be tracked more than once if it is
-    /// mapped at multiple VAs).  A map (not a `Vec`) so `remove_user_frame` is
-    /// O(log n) instead of an O(n) linear scan — `munmap`/exit tears down
-    /// `P` pages in O(P·log n) instead of O(P·n).  See docs/COW_OPTIMIZATIONS.md.
-    user_frames: Spinlock<BTreeMap<usize, u32>>,
+    /// Which physical frames this address space holds, and how many VAs map
+    /// each. Arch-neutral and host-tested — `akuma-user-space`. Everything left
+    /// in this struct is the AArch64 page-table walker.
+    ledger: FrameLedger,
     asid: u16,
-    shared: bool,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1689,10 +1664,8 @@ impl UserAddressSpace {
         };
         let mut addr_space = Self {
             l0_frame,
-            page_table_frames: Spinlock::new(Vec::new()),
-            user_frames: Spinlock::new(BTreeMap::new()),
+            ledger: FrameLedger::new(false),
             asid,
-            shared: false,
         };
         addr_space.add_kernel_mappings().ok()?;
         instr::as_new();
@@ -1728,17 +1701,15 @@ impl UserAddressSpace {
         instr::as_new_shared();
         Some(Self {
             l0_frame: PhysFrame { addr: parent_l0_phys },
-            page_table_frames: Spinlock::new(Vec::new()),
-            user_frames: Spinlock::new(BTreeMap::new()),
+            ledger: FrameLedger::new(true),
             asid,
-            shared: true,
         })
     }
 
     fn add_kernel_mappings(&self) -> Result<(), &'static str> {
         let l1_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("Failed to allocate L1 table")?;
         track_frame(l1_frame, FrameSource::UserPageTable);
-        { let _irq = IrqGuard::new(); self.page_table_frames.lock().push(l1_frame); }
+        self.ledger.track_page_table_frame(l1_frame);
 
         let l0_ptr = phys_to_virt(self.l0_frame.addr) as *mut u64;
         unsafe {
@@ -1749,7 +1720,7 @@ impl UserAddressSpace {
         let l1_ptr = phys_to_virt(l1_frame.addr) as *mut u64;
         let l2_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("Failed to allocate L2 table")?;
         track_frame(l2_frame, FrameSource::UserPageTable);
-        { let _irq = IrqGuard::new(); self.page_table_frames.lock().push(l2_frame); }
+        self.ledger.track_page_table_frame(l2_frame);
 
         unsafe {
             let l2_entry = (l2_frame.addr as u64) | flags::VALID | flags::TABLE;
@@ -1790,7 +1761,7 @@ impl UserAddressSpace {
             for l1_idx in start_l1_idx..=end_l1_idx {
                 let l2_ram_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("Failed to allocate kernel RAM L2 table")?;
                 track_frame(l2_ram_frame, FrameSource::UserPageTable);
-                { let _irq = IrqGuard::new(); self.page_table_frames.lock().push(l2_ram_frame); }
+                self.ledger.track_page_table_frame(l2_ram_frame);
 
                 unsafe {
                     let l2_ram_entry = (l2_ram_frame.addr as u64) | flags::VALID | flags::TABLE;
@@ -1818,7 +1789,7 @@ impl UserAddressSpace {
 
     pub fn l0_phys(&self) -> usize { self.l0_frame.addr }
 
-    pub fn is_shared(&self) -> bool { self.shared }
+    pub fn is_shared(&self) -> bool { self.ledger.is_shared() }
 
     pub fn asid(&self) -> u16 { self.asid }
 
@@ -1849,7 +1820,7 @@ impl UserAddressSpace {
                 if entry & flags::TABLE == 0 {
                     let frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("Out of memory for page table")?;
                     track_frame(frame, FrameSource::UserPageTable);
-                    { let _irq = IrqGuard::new(); self.page_table_frames.lock().push(frame); }
+                    self.ledger.track_page_table_frame(frame);
                     shatter_block_to_pages(frame.addr, entry);
                     let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                     table_ptr.add(idx).write_volatile(new_entry);
@@ -1860,7 +1831,7 @@ impl UserAddressSpace {
             } else {
                 let frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or("Out of memory for page table")?;
                 track_frame(frame, FrameSource::UserPageTable);
-                { let _irq = IrqGuard::new(); self.page_table_frames.lock().push(frame); }
+                self.ledger.track_page_table_frame(frame);
                 let new_entry = (frame.addr as u64) | flags::VALID | flags::TABLE;
                 table_ptr.add(idx).write_volatile(new_entry);
                 Ok(frame)
@@ -1987,11 +1958,7 @@ impl UserAddressSpace {
     /// `as_lock` — the PMM OOM/reclaim path can re-enter it). Contains only PTE writes
     /// + the self-locked `user_frames` bookkeeping.
     pub fn map_and_track(&mut self, va: usize, frame: PhysFrame, user_flags: u64) -> Result<(), &'static str> {
-        {
-            let _irq = IrqGuard::new();
-            *self.user_frames.lock().entry(frame.addr)
-                .or_insert_with(|| { instr::uf_insert(); 0 }) += 1;
-        }
+        self.ledger.track_user_frame(frame);
         self.map_page(va, frame.addr, user_flags)
     }
 
@@ -2051,11 +2018,7 @@ impl UserAddressSpace {
     /// Thread-safe frame tracking — IRQs disabled to prevent preemption deadlock
     /// (same pattern as PMM: if timer fires while holding lock, scheduler switches
     /// to another thread which tries to lock → spins forever).
-    pub fn track_user_frame(&self, frame: PhysFrame) {
-        let _irq = IrqGuard::new();
-        *self.user_frames.lock().entry(frame.addr)
-            .or_insert_with(|| { instr::uf_insert(); 0 }) += 1;
-    }
+    pub fn track_user_frame(&self, frame: PhysFrame) { self.ledger.track_user_frame(frame); }
 
     /// Adopt `frame` as a mapping of this address space, maintaining **both** the
     /// per-AS frame list and the global share count as one uninterruptible unit.
@@ -2080,24 +2043,7 @@ impl UserAddressSpace {
     /// Lock order: `COW_REFCOUNTS` is a leaf and is taken innermost here, which is the
     /// same direction as the existing `as_lock` → `COW_REFCOUNTS` order.
     pub fn adopt_user_frame(&self, frame: PhysFrame, caller_holds_ref: bool) -> bool {
-        let _irq = IrqGuard::new();
-        let mut uf = self.user_frames.lock();
-        let first_va_here = !uf.contains_key(&frame.addr);
-        if first_va_here { instr::uf_insert(); }
-        *uf.entry(frame.addr).or_insert(0) += 1;
-        match (caller_holds_ref, first_va_here) {
-            // Caller's reference becomes this address space's one reference.
-            (true, true) => false,
-            // Already had the PA: the caller's reference is surplus.
-            (true, false) => true,
-            // No reference taken; this is the first VA, so take one now.
-            (false, true) => {
-                akuma_pmm::cow_ref_inc(frame.addr);
-                false
-            }
-            // Already counted by an earlier VA — nothing to add.
-            (false, false) => false,
-        }
+        self.ledger.adopt_user_frame(frame, caller_holds_ref)
     }
 
     /// Does this address space already hold `pa` as a user frame?
@@ -2107,14 +2053,8 @@ impl UserAddressSpace {
     /// Callers that take a reference per *fault* (the shared file-page cache) use
     /// this to detect the second VA mapping an already-held frame and hand the
     /// surplus reference back, instead of leaking it until reboot.
-    pub fn tracks_user_frame(&self, pa: usize) -> bool {
-        let _irq = IrqGuard::new();
-        self.user_frames.lock().contains_key(&pa)
-    }
-    pub fn track_page_table_frame(&self, frame: PhysFrame) {
-        let _irq = IrqGuard::new();
-        self.page_table_frames.lock().push(frame);
-    }
+    pub fn tracks_user_frame(&self, pa: usize) -> bool { self.ledger.tracks_user_frame(pa) }
+    pub fn track_page_table_frame(&self, frame: PhysFrame) { self.ledger.track_page_table_frame(frame); }
 
     /// Map `frame` at `va` in the **currently installed** address space and adopt
     /// everything the walk produced — the safe way to install a user page from a
@@ -2228,20 +2168,11 @@ impl UserAddressSpace {
     /// (one entry per PA, regardless of how many VAs map it). Leak-debugging:
     /// compare against the VA actually mapped — a count far larger than the
     /// mapped VA means frames are being tracked-but-orphaned (re-fault leak).
-    pub fn user_frame_count(&self) -> usize {
-        let _irq = IrqGuard::new();
-        self.user_frames.lock().len()
-    }
+    pub fn user_frame_count(&self) -> usize { self.ledger.user_frame_count() }
     /// Sum of all per-PA reference counts (total VA→frame mappings tracked).
-    pub fn user_frame_total_refs(&self) -> usize {
-        let _irq = IrqGuard::new();
-        self.user_frames.lock().values().map(|&c| c as usize).sum()
-    }
+    pub fn user_frame_total_refs(&self) -> usize { self.ledger.user_frame_total_refs() }
     /// Number of page-table frames (L1/L2/L3) this address space holds.
-    pub fn page_table_frame_count(&self) -> usize {
-        let _irq = IrqGuard::new();
-        self.page_table_frames.lock().len()
-    }
+    pub fn page_table_frame_count(&self) -> usize { self.ledger.page_table_frame_count() }
     /// Physical frames this address space will hand back to the PMM when it drops:
     /// tracked user pages + intermediate page tables + the L0. A **shared** view owns
     /// none of them (the L0 owner does), so it reports 0.
@@ -2249,12 +2180,7 @@ impl UserAddressSpace {
     /// Snapshotted into `process::reclaim`'s per-slot stamp at retirement, so the
     /// memory-pressure path can size the reclaimable backlog without dereferencing a
     /// RETIRED `Process` — which would race the deferred drop it is scheduling.
-    pub fn resident_pages(&self) -> usize {
-        if self.shared {
-            return 0;
-        }
-        self.user_frame_count() + self.page_table_frame_count() + 1
-    }
+    pub fn resident_pages(&self) -> usize { self.ledger.resident_pages() }
     /// Drop one tracked reference to `frame`'s physical address.  O(log n) map
     /// lookup (was an O(n) linear scan — the dominant `munmap`/exit cost, see
     /// docs/COW_OPTIMIZATIONS.md).  A PA can be tracked more than once (mapped
@@ -2270,20 +2196,7 @@ impl UserAddressSpace {
     /// crashes under memory pressure (a still-live page handed back to the PMM
     /// and re-mapped into a kernel allocation).
     #[must_use = "free the frame only when this returns true; freeing otherwise is a double-free"]
-    pub fn remove_user_frame(&self, frame: PhysFrame) -> bool {
-        let _irq = IrqGuard::new();
-        let mut frames = self.user_frames.lock();
-        if let Some(count) = frames.get_mut(&frame.addr) {
-            *count -= 1;
-            if *count == 0 {
-                frames.remove(&frame.addr);
-                instr::uf_removed();
-                return true; // last reference dropped — caller owns the free
-            }
-            return false; // still mapped at another VA — must not free yet
-        }
-        false // untracked here — not this address space's free obligation
-    }
+    pub fn remove_user_frame(&self, frame: PhysFrame) -> bool { self.ledger.remove_user_frame(frame) }
 
     /// Walk **this** address space's own L0→L2 and return a pointer to the L3 slot
     /// for `va`, or `None` when any intermediate level is unmapped or is a block
@@ -2547,17 +2460,17 @@ impl Drop for UserAddressSpace {
     fn drop(&mut self) {
         #[allow(clippy::let_unit_value)]
         let _ledger = instr::as_drop_enter(
-            self.shared,
+            self.ledger.is_shared(),
             self.l0_frame.addr,
             self.asid,
-            { let _irq = IrqGuard::new(); self.user_frames.lock().len() },
+            self.ledger.user_frame_count(),
         );
         // Opportunistic retry of earlier TTBR-deferred frees: address spaces die
         // constantly under load, so this keeps the parked list near-empty without
         // needing a dedicated collector to run first.
         drain_pending_ttbr_frees();
         let l0_addr = self.l0_frame.addr;
-        if !self.shared {
+        if !self.ledger.is_shared() {
             // Owner dropping — check if shared views still exist
             let has_shared = with_irqs_disabled(|| {
                 let table = SHARED_L0_TABLE.lock();
@@ -2569,8 +2482,8 @@ impl Drop for UserAddressSpace {
                 // #endregion
                 as_trace(format_args!("[AS-DEFER] l0=0x{:x} asid=0x{:x} core={}\n",
                     l0_addr, self.asid, akuma_bkl::bkl::current_core_id()));
-                let user_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.user_frames.lock()) };
-                let pt_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.page_table_frames.lock()) };
+                let user_frames = self.ledger.take_user_frames();
+                let pt_frames = self.ledger.take_page_table_frames();
                 let l0 = self.l0_frame;
                 let n_uf = user_frames.len();
                 let stored = with_irqs_disabled(|| {
@@ -2593,8 +2506,8 @@ impl Drop for UserAddressSpace {
                 // still resident on this L0 (killer-side hard-terminate, a reap
                 // outrunning the exiting core's final switch) must not have the
                 // tables freed and poisoned under it. See `free_or_defer_as_frames`.
-                let user_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.user_frames.lock()) };
-                let pt_frames = { let _irq = IrqGuard::new(); core::mem::take(&mut *self.page_table_frames.lock()) };
+                let user_frames = self.ledger.take_user_frames();
+                let pt_frames = self.ledger.take_page_table_frames();
                 with_irqs_disabled(|| { SHARED_L0_TABLE.lock().remove(&l0_addr); });
                 free_or_defer_as_frames(l0_addr, self.asid, self.l0_frame, user_frames, pt_frames, "owner");
             }
@@ -2635,7 +2548,7 @@ impl Drop for UserAddressSpace {
         // Whatever the branch above did not take (a shared view's own map) dies
         // with the struct here; stop counting its entries as live. Temporary.
         {
-            let n = { let _irq = IrqGuard::new(); self.user_frames.lock().len() };
+            let n = self.ledger.user_frame_count();
             instr::uf_drop_remainder(n);
         }
         // ORDER IS LOAD-BEARING: flush BEFORE returning the ASID to the allocator.

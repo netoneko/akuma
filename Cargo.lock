@@ -382,6 +382,7 @@ dependencies = [
  "akuma-mmap",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-user-space",
  "log",
  "spinning_top",
 ]
@@ -674,6 +675,16 @@ version = "0.1.0"
 dependencies = [
  "akuma-mmu",
  "akuma-primitives",
+]
+
+[[package]]
+name = "akuma-user-space"
+version = "0.1.0"
+dependencies = [
+ "akuma-mmap",
+ "akuma-pmm",
+ "akuma-primitives",
+ "spinning_top",
 ]
 
 [[package]]

@@ -24,7 +24,7 @@ debug-info = []
 # kernel heap leak, and the regression gate for it. OFF by default: the counters
 # sit on the page-fault `user_frames` path.
 # See docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md.
-leak-instr = []
+leak-instr = ["akuma-user-space/leak-instr"]
 
 # Real (shared-kernel) SMP, forwarded from the bin crate. Only reaches
 # `akuma-bkl`, whose `current_core_id` this crate uses for the TTBR free gate.
@@ -44,6 +44,10 @@ akuma-fdt = { path = "../akuma-fdt" }
 akuma-primitives = { path = "../akuma-primitives" }
 # PhysFrame, PAGE_SIZE/PAGE_SHIFT, and the `flags`/`user_flags` PTE vocabulary.
 akuma-mmap = { path = "../akuma-mmap" }
+# The frame ledger half of `UserAddressSpace` — which physical frames it holds
+# and how many VAs map each. Arch-neutral and host-tested; see that crate's
+# header for the split.
+akuma-user-space = { path = "../akuma-user-space" }
 # Frame allocation and free for page tables and user pages.
 akuma-pmm = { path = "../akuma-pmm" }
 # `current_core_id`, for the per-core ACTIVE_L0/PREV_L0 free gate.
