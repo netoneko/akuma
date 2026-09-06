@@ -1383,11 +1383,9 @@ fn get_current_thread_register() -> usize {
     // `require()`: this is called from diagnostics that can run before
     // registration, and answering 0 there is the same answer the register gave.
     #[cfg(target_arch = "x86_64")]
-    {
-        return match X86_ARCH_HOOKS.get() {
-            Some(h) => (h.current_slot)(),
-            None => IDLE_THREAD_IDX,
-        };
+    match X86_ARCH_HOOKS.get() {
+        Some(h) => (h.current_slot)(),
+        None => IDLE_THREAD_IDX,
     }
     #[cfg(not(target_arch = "x86_64"))]
     akuma_primitives::preempt::current_tid()

@@ -1,4 +1,4 @@
-# amd64: a blocked state, and the `CR0.WP` hole that turned up next to it
+# amd64: folding the scheduler into `akuma-threading`, and the `CR0.WP` hole next door
 
 **Status, 2026-09-07: landed and boot-verified.** Two changes that arrived
 together because they live in the same handler. They are unrelated in cause and
@@ -6,8 +6,10 @@ both are prerequisites for self-hosting on this target.
 
 - § 1 — `CR0.WP` was never set, so `copy_to_user` onto a copy-on-write page
   corrupted the *parent*. Silent, no error, no fault.
-- § 2 — the scheduler gained a blocked state, and pipes, `futex` and `wait4`
-  stopped polling.
+- § 2 — `amd64/src/sched.rs` stopped being a scheduler. `akuma-threading` is now
+  the scheduler on both architectures; what is left here is the machine effects
+  it is not allowed to know about. Pipes, `futex` and `wait4` park instead of
+  polling as a consequence, not as the goal.
 
 Verification for both is § 3. **The RAM root and Firecracker only** — do not
 verify against `root=/dev/sda1`, which has a separate open failure (Akuma cannot
@@ -149,65 +151,104 @@ x86_64."*
 
 ---
 
-## 2. The scheduler grew a blocked state
+## 2. `amd64/src/sched.rs` stopped being a scheduler
 
-`State` was `Unused | Reserved | Runnable | Finished`. A waiter was therefore
-always runnable, and every wait in this kernel was a poll: `pipe::fire` was an
-empty function, `futex` span on `yield_now` re-testing table membership, and
-`wait4` span on `yield_now` re-calling `sys_waitpid`.
+`docs/archive/AKUMA_SELF_HOSTING_AMD64.md` calls this **A1**, the trunk the rest
+of the amd64 self-hosting tree hangs off, and its one-line summary is
+"`sched.rs` → `akuma-threading`".
 
-That is survivable on a bring-up target and is not survivable on one expected to
-run `cargo -j4`, where it is most of a core per blocked thread.
+### The wrong turn first, because it is the instructive part
 
-### What was added
+The first attempt did **A2 without A1**: it gave `amd64/src/sched.rs` its own
+`State::Blocked`, its own `wake_pending` flag, its own deadline sweep, and
+pointed pipes, `futex` and `wait4` at them. It worked — 295/0 at `SMP=1`, 304/0
+at `SMP=4`, every wait released by a real wake.
 
-`State::Blocked`, invisible to the picker. That is the whole mechanism: a task
-the round-robin cannot choose burns no CPU, and `wake` is the transition back to
-`Runnable`.
+It was still wrong, and not for tidiness. That file had grown a **second, weaker
+copy** of a state machine `akuma-threading` already had, hardened by years of
+AArch64 incidents:
 
-Three things had to come with it.
+| the new local version | the crate | what the difference costs |
+|---|---|---|
+| `State::Blocked` | `thread_state::WAITING` | — |
+| `Task::wake_pending` | `WOKEN_STATES` | — |
+| `Task::wake_at_us` | `WAKE_TIMES` | — |
+| `wake(slot)` | `WakeHandle` / `ThreadWaker` | **slot generations.** A wake held across a slot's death is *refused*; the local version would spend it on whoever inherited the slot |
+| `state = Runnable` on a wake | a `WAITING → READY` **CAS** | a plain store overwrites a concurrent `TERMINATED`, resurrecting a killed thread onto page tables that are being freed |
 
-**`Task::wake_pending`, and the arm-before-you-test discipline.** The flag is
-needed even though every writer runs under the BKL. A pipe reader registers in
-the pipe's poller set, the pipe lock is released, and only then does it park; a
-wake landing in that gap finds the task Runnable, does nothing, and **drains the
-poller set** — so the waiter parks with no registration and nobody to wake it.
-Recording the wake as durable state rather than an edge closes that. The shape
-every caller uses is Linux's `prepare_to_wait`:
+The last two rows are the argument. Both are real, documented AArch64 failures
+(`ThreadWaker::wake`'s own comment; the `THREAD_STATES` check-then-store races),
+both are **silent**, and the local version had neither defence. Two
+implementations of one thing meant the target aiming at `cargo -j4` — the one
+that will run the most threads — was running the copy that had never been
+debugged.
 
-```rust
-sched::prepare_block();                 // arm
-if !pipe::check_set_reader(id) {        // test AND register, in one step
-    sched::block_current();             // park
-}
-```
+### What the fold actually moved
 
-Arm-then-test has no window; test-then-arm does.
+The crate schedules; `amd64/src/sched.rs` performs. Everything the scheduler
+cannot know about is registered once as `akuma_threading::X86ArchHooks` and
+lives in a per-slot `Machine` side table indexed by the crate's own thread id:
+`CR3`, the TSS trap stack, `IA32_FS_BASE`/`GS_BASE`, the `fxsave` area, the Big
+Kernel Lock's recursion depth, which slot each core runs, and which slot idles
+it. `Task`, `State`, `Context`, `TASKS`, `switch_context` and `try_switch` are
+gone.
 
-**Deadlines.** `block_until_deadline` takes an absolute `uptime_us`, and
-`try_switch` sweeps expired parks before it picks — before, not after, or a core
-with nothing else runnable parks in `hlt` and serves the timeout a tick late.
-The sweep is gated on a single atomic (`NEXT_DEADLINE_US`, maintained with
-`fetch_min`) so the common path never walks 512 slots.
+The crate gained, all `#[cfg(target_arch = "x86_64")]` and inert on AArch64:
 
-**`all_user_tasks_finished` had to change.** It asked "is this slot not
-Runnable", which is the same question as "is it dead" only while `Blocked` does
-not exist. Left alone, the boot's drive loop would have declared the shell
-finished the moment it waited for a keystroke.
+- `X86ArchHooks` and its registration;
+- `x86_wake_pass` — the `WAITING` deadline sweep, mirroring the AArch64 one's
+  CAS discipline. Without it `schedule_blocking` with a deadline parks forever
+  on this target, because the AArch64 sweep lives inside `ThreadPool::
+  schedule_indices`, which x86 never enters;
+- an SMP-aware `x86_pick_next` (honours `ON_CPU` and pinning) and an
+  `x86_yield_now` that runs the hooks around the switch;
+- **`schedule_blocking`'s x86 arm, routed through the cooperative switch.** The
+  AArch64 arm raises an SGI and `wfi`s; on x86 there is no SGI, and
+  `akuma_cpu::park::wfi` is `hlt`, which inside a syscall (interrupts masked by
+  `IA32_FMASK`) halts the core **forever**. So the x86 arm *is* the switch;
+- a narrow, allocation-free spawn surface — `x86_claim_slot` / `x86_seed_entry`
+  / `x86_publish` / `x86_adopt_running_thread` / `x86_finish_current` — because
+  amd64's entries are plain `extern "C" fn() -> !` with their data in a side
+  table, not boxed closures.
+
+`MAX_THREADS` gained an `x86_64` arm of **512**, deliberately not a tidier
+universal number: `amd64/src/sched.rs` raised its own table 96 → 512 against a
+measurement (a real session runs dozens of commands, every one a slot, `fork`
+takes a second), and folding must not walk that back to 256.
+
+### Two bugs the fold surfaced, both found by the boot suite
+
+Neither was reachable from a clean build, and both were caught by the park
+self-test rather than by review:
+
+1. **`current_thread_id()` answered `0` for every thread on x86.** It reads
+   `TPIDRRO_EL0`, which `akuma-cpu` correctly stubs off AArch64 — so
+   `schedule_blocking` published `WAITING` for the **boot thread** instead of
+   its caller. The symptom was exact and immediate: `block: the worker is
+   parked` `[FAIL]` while the worker ran merrily on. The identity now comes from
+   the target's per-CPU block through `X86ArchHooks::current_slot`.
+2. **`trigger_sgi` registered as `unreachable!()` panicked on the first wake.**
+   The reasoning was that the x86 path never raises an SGI, so a field it cannot
+   reach should say so loudly. It reaches it on every wake: `ThreadWaker::wake`
+   raises one unconditionally after a successful `WAITING → READY` CAS, because
+   on AArch64 that is how the woken thread gets *looked at*. It is now a no-op
+   with the reason written down, alongside `wake_core`, `wake_remote_idle` and
+   `end_of_interrupt`, which are no-ops for the same reason.
 
 ### `BACKSTOP_US`: a tripwire, not a design
 
-`block_current` — the untimed form — still installs a deadline, one second out.
+`block_current` — the untimed form — still installs a deadline one second out.
 A correct wait has a wake path; if that path is missing, an untimed park is an
 unrecoverable hang with no output, which `thread::drain`'s own comment already
 calls the failure mode that costs the most to diagnose and says the least. With
-a backstop the same bug degrades to what this kernel did before: a poll, at 1 Hz
-instead of at scheduler frequency. `sched::backstop_wakes()` counts them and the
-boot prints the total.
+a backstop the same bug degrades to a 1 Hz poll. `sched::backstop_wakes()`
+counts them and the boot prints the total.
 
-**It has read 0 on every run.** That is the number to watch: it climbing names a
-wait whose wake path is missing, and it is reported at the end of the suite
-alongside the park and wake totals for exactly that reason.
+It is spelled in `amd64/src/sched.rs` rather than in the crate on purpose:
+AArch64 parks untimed constantly and has an interrupt-driven scheduler to
+recover, where this target reaches its scheduler only by being called.
+
+**It has read 0 on every run**, on every machine. That is the number to watch.
 
 ### What now parks, and what deliberately does not
 
@@ -220,86 +261,133 @@ alongside the park and wake totals for exactly that reason.
 | **netpoll daemon** | `yield_now` | **unchanged** | none exists |
 | **`read_console`** | `yield_now` | **unchanged** | none exists |
 
-The last two are deliberate and are not oversights: **this target takes no
-device interrupts at all** — the LAPIC timer is the only vector. There is
-nothing to wake a NIC poller or a UART reader, so both must keep polling. An
-IOAPIC is what changes that, and it is what would let those two rows move.
+The last two are deliberate: **this target takes no device interrupts at all** —
+the LAPIC timer is the only vector — so nothing exists to wake a NIC poller or a
+UART reader. An IOAPIC is what moves those two rows.
 
-Notes on the three conversions:
+Notes on the conversions:
 
 - **pipes.** `fire` was written as a real function and called on every path that
   produces wakes precisely so this would be a change to one body. It was. The
-  token type stays `()`: `Wakes<W>` yields `(tid, W)` pairs and this kernel's
-  `tid` **is** the scheduler task slot, so the identity a wake needs is already
-  the key.
+  token stays `()`: `Wakes<W>` yields `(tid, W)` and this kernel's `tid` **is**
+  the scheduler slot, so the identity is already the key.
 - **futex.** The signal did not change — "am I still queued?" is still the whole
-  test, still durable state rather than an edge. What was added is that the
-  waiter parks between tests and a waker also calls `sched::wake`, in that order
-  of authority: get the `sched::wake` wrong and the waiter is merely late (the
-  backstop releases it); get the table wrong and it is incorrect. Requeued
-  waiters are deliberately **not** resumed — they were moved, not woken, and
-  waking them would undo the point of a requeue.
-- **`wait4`.** Waiters go in a bitmap over task slots rather than a per-child
-  parent link, because `wait4(-1)` waits for *any* child and the waiter is often
-  not in the spawn table at all (`sshd` is pid 1). Any child's exit wakes the
-  whole set; each parked task re-runs `sys_waitpid` and parks again if the exit
-  was not its child.
-- **`thread::drain`** now wakes the group. The exit flag is only tested at
-  syscall entry and inside the futex wait loop, and that loop parks now — without
-  the wake an `exit_group` while a sibling holds an untimed `FUTEX_WAIT` would
-  wait out the full backstop.
+  test, still durable state rather than an edge. The waiter now parks between
+  tests and a waker also calls `sched::wake`, in that order of authority: get
+  the wake wrong and the waiter is merely *late*; get the table wrong and it is
+  *incorrect*. Requeued waiters are deliberately not resumed — they were moved,
+  not woken.
+- **`wait4`.** Waiters go in a bitmap over slots rather than a per-child parent
+  link, because `wait4(-1)` waits for *any* child and the waiter is often not in
+  the spawn table at all (`sshd` is pid 1).
+- **`thread::drain`** now wakes the group, or an `exit_group` while a sibling
+  holds an untimed `FUTEX_WAIT` would wait out the full backstop.
 
-### Not done: folding this into `akuma-threading`
+### There is no `prepare_block`
 
-`AKUMA_PIPES_EXTRACTION.md` framed this as "two pieces, not a rewrite": a
-blocked state the picker skips, and `schedule_blocking` routed through the
-cooperative x86 switch. Only the first piece was needed. `amd64/src/sched.rs`
-runs its own switch (`switch_context`), not `akuma-threading`'s, so nothing here
-goes through `schedule_blocking` at all and there was no `trigger_sgi` + `wfi`
-to replace.
+The pre-fold version had one, as its own answer to the window between
+registering as a waiter and parking. The crate closes that window without the
+caller's help: a waker's first act is a sticky `WOKEN_STATES` flag, which
+`schedule_blocking` tests on entry **and again atomically with publishing
+`WAITING`** (`publish_waiting_and_take_pending_wake`). So the shape is two steps,
+not three, and there is nothing to forget:
 
-**The finding that doc recorded still stands and is still unfixed**:
-`akuma-threading`'s x86 switch is a port of `amd64/src/sched.rs`'s that dropped
-the `pushfq`/`popfq`, and therefore reintroduces the interrupt-flag leak that
-switch's own comment exists to record. Nothing consumes it yet. **Fix it before
-anything adopts it** — the symptom is an unrelated intermittent hang.
+```rust
+if !pipe::check_set_reader(id) {   // test AND register, in one step
+    sched::block_current();        // park
+}
+```
 
----
+### Not done, and named
+
+- **`thread.rs` (391 lines) and the `smp.rs` ticket-lock BKL → `akuma-bkl`** are
+  the rest of A1 in the chart. Not attempted here.
+- **`thread.rs` and the BKL swap**, above, are the whole of what is left.
+
+### The boot paths, and the seven tests nobody was running
+
+`kmain` (PVH) and `kmain_mb2` (multiboot2/GRUB) each carried a full copy of the
+boot, described in the latter's own comment as "deliberately parallel to
+`kmain`, and in the same order". Patching `sched::init()` into both by hand is
+what prompted looking, and the two had drifted: **the multiboot2 path was not
+running seven of the PVH path's tests** —
+
+```text
+blk::smoke_test              usermode::execve_test
+sched::block_smoke_test      usermode::fork_test
+usermode::spawn_test         usermode::busybox_test
+usermode::console_notify_test
+```
+
+— the entire process-lifecycle suite, missing from **the least-tested path in
+the tree**, the one that runs on real silicon where the emulators cannot reach.
+It is why bare metal reported 262 checks where QEMU reported 295, and nobody had
+noticed, because both said `0 failed`.
+
+The two blocks that were genuinely identical now live in `amd64/src/boot.rs`:
+
+- `early_init` — descriptor tables, per-CPU block, IDT, SMAP/SMEP/WP, the
+  scheduler, drop the identity map. Six steps whose *order* is load-bearing and
+  which were written out twice.
+- `self_tests` — one canonical list, one canonical order, both paths.
+
+What deliberately stays per-protocol is what genuinely differs: how the console
+comes up (a UART versus a GRUB framebuffer, which must exist before anything can
+report a failure), where the machine description comes from, what the root
+filesystem *is* (virtio disk, GRUB module in RAM, or ext2 on USB), how the
+network is configured, and what happens when `init` exits. Five different
+decisions with five different reasons — a single function taking five callbacks
+would have been a merge in name only.
 
 ## 3. Verification
 
-Host tests:
+Host tests: `cargo test` over the workspace, green.
 
-```bash
-cargo test -p akuma-pipes -p akuma-cow -p akuma-mmap -p akuma-syscalls-sync \
-    --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
-```
-→ 8 / 54 / 27 / 42 passed, 0 failed.
+**amd64** — `scripts/utils/amd64_trials.py` runs local QEMU and the trashcan's
+Firecracker in parallel (see `docs/runbooks/amd64-bare-metal-loop.md`):
 
-Boot suite (QEMU/TCG, `amd64/run.sh`), including `redirect_test`'s real busybox
-`>`, `>>`, `cmd | cmd` and 12-stage pipeline:
+| | passed | failed | parks | backstop |
+|---|---|---|---|---|
+| baseline, before any of this | 276 | 0 | — | — |
+| QEMU/TCG `SMP=1` | 295 | 0 | 23 | **0** |
+| QEMU/TCG `SMP=4` | 304 | 0 | 18 | **0** |
+| Firecracker `SMP=1` (KVM, the box) | 285 | 0 | 15 | **0** |
+| Firecracker `SMP=4` (KVM, the box) | 294 | 0 | 27 | **0** |
+| **bare metal, the HP box** | **262** | **0** | — | — |
 
-| | passed | failed | parks | wakes | backstop |
-|---|---|---|---|---|---|
-| baseline, before any of this | 276 | 0 | — | — | — |
-| `SMP=1` | 295 | 0 | 28 | 27 | **0** |
-| `SMP=4` | 304 | 0 | 28 | 27 | **0** |
+The park totals are the evidence: the blocking self-test performs 3 of its own,
+so the rest came from real pipe, `futex` and `wait4` waits — and **every one was
+released by a real wake**, none by the backstop.
 
-The park/wake totals are the evidence that matters: the blocking self-test
-performs 3 parks of its own, so the rest came from real pipe, futex and `wait4`
-waits — and **every one was released by a real wake**, none by the backstop.
+One flake, on QEMU/TCG at `SMP=4` only: `net: the netpoll daemon is being
+scheduled` wants >100 daemon laps per 4000 boot-task yields and got fewer, once,
+on a run that shared the laptop with a `cargo build`. Re-runs on an idle host
+measure 3977–3989 laps against a bar of 100. Timing, not mechanism — but it is
+the first thing to re-check if it recurs on an idle machine.
 
-Interactive check, driven over the console (the boot suite does not cover it):
-`ls /bin | head -3`, a three-iteration `for` loop, `sleep 1`, `exit` — all
-correct.
+**aarch64 must be unaffected**, since the crate change is `cfg`-gated. Measured
+rather than asserted, on one accelerator so there is no second variable:
 
-`aarch64 is untouched.` Only `amd64/src/` changed, so the AArch64 `kernel_tests`
-that are the oracle for the pipe shim (`test_pipe_close_read_wakes_blocked_writer`,
-`run_pselect6_registers_waker_test`, `test_sigpipe_terminate_no_deadlock`) are
-unaffected by this pass.
+| kernel | PASSED | failures |
+|---|---|---|
+| `main` @ b7c89d47 | 307 | `retired_reclaim_ab` |
+| branch, pre-fold @ dbbbb986 | 307 | `retired_reclaim_ab` |
+| **branch, post-fold** | **307** | `retired_reclaim_ab` |
 
-Not run here: the HP box (`hpbox.firecracker`), and `/bin/futexops`, which is not
-on the disk `amd64/mkdisk.sh` generates.
+Identical, including the failure — which is a standing bug on `main` and is
+written up separately in `docs/archive/POST_EXIT_PMM_RECLAIM.md`.
+
+### Two things about running the aarch64 suite that cost time here
+
+- **HVF needs `MEMORY=2048M`.** Below it, this suite dies with
+  `Assertion failed: (isv) ... hvf.c` and QEMU exit 134 on the user-copy EFAULT
+  probe, whose faulting instruction is an LDP and carries no syndrome. That is
+  the configuration, not the kernel — `scripts/cargo_runner.sh` prints a warning
+  saying exactly this, and it is easy to mistake for a crash you just caused.
+- **Lima runs it under KVM**, which is the fast correct option on an Apple
+  Silicon laptop: `scripts/lima_aarch64_run.sh` (a wrapper around
+  `cargo_runner.sh`, which now selects KVM on its own). The laptop builds, Lima
+  runs — Lima has no Rust toolchain and the host has no KVM.
 
 ## Background
 

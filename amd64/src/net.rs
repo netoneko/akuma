@@ -914,13 +914,50 @@ pub fn netpoll_drain_selftest(t: &mut Suite, up: bool) -> bool {
 pub fn netpoll_spawn_selftest(t: &mut Suite) {
     use core::sync::atomic::Ordering;
 
+    /// Laps that count as "the daemon is getting scheduled".
+    const REQUIRED_LAPS: u64 = 100;
+    /// How long to give it. Two seconds is enormous for a daemon that laps
+    /// thousands of times a second when it runs at all, so this bounds the
+    /// *failure* case rather than the passing one — a healthy boot leaves the
+    /// loop in microseconds.
+    const BUDGET_US: u64 = 2_000_000;
+
     let before = NETPOLL_LAPS.load(Ordering::Relaxed);
-    if t.check("net: netpoll daemon spawned", spawn_netpoll()) {
-        for _ in 0..4_000 {
-            crate::sched::yield_now();
-        }
-        let laps = NETPOLL_LAPS.load(Ordering::Relaxed) - before;
-        t.check("net: the netpoll daemon is being scheduled", laps > 100);
-        t.note("net: netpoll laps per 4000 boot-task yields", laps);
+    if !t.check("net: netpoll daemon spawned", spawn_netpoll()) {
+        return;
     }
+
+    // **Wait on the clock, not on a yield count**, and the difference is not
+    // cosmetic.
+    //
+    // This used to yield 4000 times and then look. That measures "does the boot
+    // task's own yielding hand the CPU to the daemon", which is a fair question
+    // on one core and the wrong one on four: the other cores are runnable, so a
+    // yield here need not switch to the daemon at all, and the daemon may be
+    // waiting on the Big Kernel Lock this core keeps re-taking. Measured
+    // 2026-09-07 on the bare-metal box at `SMP=4`: fewer than 100 laps, with
+    // `[BKL] stuck: cpu 1/2/3 waiting on owner 0` printed alongside — the
+    // daemon was ready and starved, not unscheduled.
+    //
+    // The cost of that flake is out of all proportion to it. On the multiboot2
+    // path a failed suite withholds `init`, so a slow daemon meant **no sshd on
+    // a headless box** that was otherwise perfectly healthy: DHCP done, clock
+    // synced, daemon running. The machine had to be power-cycled by hand.
+    //
+    // `allow_tick` because `uptime_us` is the timer tick and a syscall — and
+    // this loop — runs with `IF` clear; without it the deadline below is
+    // unreachable whenever another kernel thread is also runnable, which is
+    // exactly the situation being measured. See `sched::allow_tick`.
+    let deadline = uptime_us().saturating_add(BUDGET_US);
+    let laps = loop {
+        let laps = NETPOLL_LAPS.load(Ordering::Relaxed) - before;
+        if laps > REQUIRED_LAPS || uptime_us() >= deadline {
+            break laps;
+        }
+        crate::sched::yield_now();
+        crate::sched::allow_tick();
+    };
+
+    t.check("net: the netpoll daemon is being scheduled", laps > REQUIRED_LAPS);
+    t.note("net: netpoll laps", laps);
 }

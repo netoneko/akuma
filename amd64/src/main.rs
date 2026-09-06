@@ -45,6 +45,7 @@ compile_error!(
 mod banner;
 #[cfg(target_arch = "x86_64")]
 mod blk;
+mod boot;
 #[cfg(target_arch = "x86_64")]
 mod clock;
 #[cfg(target_arch = "x86_64")]
@@ -157,63 +158,23 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     serial::put_hex(hvm_start_info);
     serial::puts("\n");
 
-    // Descriptor tables first, and the ORDER HERE IS LOAD-BEARING.
-    //
-    // `boot.s` builds its GDT in the low boot region, because the 32-bit
-    // trampoline has to reach it with paging off. The CPU reads the GDT on every
-    // exception delivery — it loads CS from the IDT entry's selector — so once
-    // the identity map is dropped, that GDT is unmapped and *any* fault becomes
-    // a triple fault. The first #PF cannot be delivered, which raises #DF, whose
-    // delivery faults for the same reason.
-    //
-    // `gdt::init` rebuilds the table in the kernel's own high .bss, so GDTR
-    // points somewhere that survives. It must therefore run before
-    // `drop_identity_map`, not after — which is where it used to be, and the
-    // symptom was a triple fault inside the heap allocator with CR2 pointing at
-    // 0x2010d8: the GDT itself.
-    gdt::init();
-
-    // The BSP's per-CPU block and the Big Kernel Lock, before anything reads
-    // `gs:` — which the scheduler, the syscall path and every `SAFETY: under
-    // the BKL` comment below do. Nothing else runs yet, so the lock is taken
-    // uncontended; every kernel task is born holding it.
-    smp::init_bsp();
-
-    // `idt::init` needs nothing but its own static table, so it goes here rather
-    // than after the memory subsystem: a fault during memory bring-up then
-    // prints a diagnosis instead of vanishing.
-    idt::init();
-
-    // SMAP/SMEP, right after the IDT: from here on a kernel-mode touch of a user
-    // page without `stac` is a fault the handler can report, and every user
-    // access below goes through `uaccess`, which brackets its copies.
-    let smap = uaccess::init_smap();
+    // Descriptor tables, per-CPU block, IDT, SMAP/SMEP/WP, the scheduler, and
+    // dropping the identity map — six steps whose ORDER IS LOAD-BEARING, shared
+    // with the multiboot2 entry point. `boot::early_init` has the reason for
+    // each one; they were written out twice until 2026-09-07, which is how
+    // `sched::init()` came to need adding by hand in two places.
+    let smap = boot::early_init();
     serial::puts("  smap: ");
     serial::puts(if smap.cpuid_smap { "on" } else { "off (CPUID lacks SMAP)" });
     serial::puts("  smep: ");
     serial::puts(if smap.cpuid_smep { "on\n" } else { "off (CPUID lacks SMEP)\n" });
 
-    // The scheduler, before anything can yield into it.
-    //
-    // This used to live inside `sched::smoke_test`, which was safe only while
-    // `sched` owned its own thread table: a `yield_now` before it ran found an
-    // empty table and returned harmlessly. Since the scheduler is
-    // `akuma-threading` (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md` A1) the same
-    // call would `require()` an unregistered `X86ArchHooks` and panic — and the
-    // network bring-up below yields. Registration is once-only, so this is the
-    // single call site.
-    //
-    // Placed here because it needs exactly three things, all of which are up:
-    // `smp::init_bsp` (the per-CPU block), `idt::init` (a fault here should be
-    // reportable), and a live `CR3` to record as the kernel root. It allocates
-    // nothing, so it does not need the heap.
-    sched::init();
-
-    // The trampoline's identity map has done its job: the kernel is executing
-    // from its high linked address, its stack is in the physmap, and both
-    // descriptor tables are now high. Dropping it hands the lower half to
-    // userspace.
-    paging::drop_identity_map();
+    // The command line, copied once into a frame-local buffer. Everything that
+    // reads a boot flag below — and inside `boot::self_tests` — reads it from
+    // here, so this path and the multiboot2 one answer the same flag the same
+    // way rather than each parsing the line its own way.
+    let mut cmdline_buf = [0u8; 512];
+    let cmdline = machine::cmdline(hvm_start_info, &mut cmdline_buf);
 
     // Read the machine's description of itself. After `drop_identity_map`
     // because every read goes through the physmap, and after `idt::init` because
@@ -274,166 +235,31 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 
     let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
 
-    // The self-tests below drive syscall bodies with kernel-stack buffers where
-    // a program would pass user pointers. `uaccess` refuses kernel addresses —
-    // that is its job — so the tests run inside the same bypass window the
-    // AArch64 kernel's boot tests use. Dropped before the verdict: `run_init`
-    // runs a real program, and its bad pointers must be EFAULT.
-    let user_ptr_bypass = akuma_user_access::BypassValidationGuard::new();
-
-    mem::smoke_test(&mut t);
-    paging::smoke_test(&mut t);
-    // The IDT is already loaded (before mem::init, so faults there are
-    // visible). Demand paging is what needs the PMM, and that is only exercised
-    // here.
-    idt::smoke_test(&mut t);
-    // The user-copy fault recovery, after demand paging is known-good: it is
-    // the one path on which a kernel-mode #PF is not fatal, and the test takes
-    // three of them on purpose.
-    idt::user_copy_smoke_test(&mut t);
-    uaccess::smoke_test(&mut t, smap);
-
-    if t.check("lapic: initialised", lapic::init()) {
-        lapic::smoke_test(&mut t);
-        // Restart the timer the smoke test stopped: the scheduler wants a live
-        // tick to drive NEED_RESCHED.
-        lapic::start_timer();
-        sched::smoke_test(&mut t);
-        sched::block_smoke_test(&mut t);
-        lapic::stop_timer();
-    }
-
-    reboot::smoke_test(&mut t);
-    if have_pci {
-        pci::smoke_test(&mut t);
-        let have_xhci =
-            pci::find_class(0x0c, 0x03).is_some_and(|d| d.header.prog_if == 0x30);
-        xhci::smoke_test(&mut t, have_xhci);
-    }
-    blk::smoke_test(&mut t, have_disk);
-    fs::smoke_test(&mut t, have_fs);
-    fd::smoke_test(&mut t, have_fs);
-    mm::smoke_test(&mut t);
-    net::smoke_test(&mut t, have_net);
-    sock::smoke_test(&mut t, have_net);
-
-    fd::init_console();
-    usermode::init_syscall();
-    usermode::smoke_test(&mut t);
-    usermode::preempt_test(&mut t);
-
-    // The other cores. After the two ring-3 tests above, which assert an exact
-    // interleaving that only one core produces, and before the ELF, spawn,
-    // busybox, execve and fork tests below, which then run with every core
-    // picking up processes — the best stress the BKL gets short of a shell.
-    // The BSP's timer is stopped here (`preempt_test` stops it), which
-    // `start_secondaries` needs for its INIT delay.
-    let expected_aps = machine
-        .madt
-        .as_ref()
-        .map_or(0, |m| m.cpus().len().saturating_sub(1).min(smp::MAX_CPUS - 1));
-    // The VMM's boot structures all sit below the trampoline page on both
-    // machines (`smp::AP_TRAMPOLINE_PA`); this is the check that says so rather
-    // than the comment that assumes it.
+    // The whole suite, shared with the multiboot2 entry point. It was written
+    // out separately in both until 2026-09-07, and the two lists had drifted —
+    // the bare-metal path was not running `fork`, `execve`, `spawn`, busybox,
+    // `blk` or the scheduler's park tests at all. See `boot::self_tests`.
     let si = &machine.start_info;
-    let keep_out = [
-        (si.addr, si.addr + 4096),
-        (si.cmdline_paddr, si.cmdline_paddr + 4096),
-        (si.memmap_paddr, si.memmap_paddr + 4096),
-    ];
-    let started = if smp::trampoline_page_available(&machine, &keep_out) {
-        smp::start_secondaries(machine.madt.as_ref())
-    } else {
-        serial::puts("  smp:  trampoline page is not free RAM — single core\n");
-        0
-    };
-    smp::smoke_test(&mut t, expected_aps, started);
-    usermode::smp_parallel_test(&mut t);
-    // Last, because it is the only test whose program the kernel did not
-    // assemble: everything before it has to work for a loader failure to be
-    // readable as a loader failure.
-    lapic::start_timer();
-    usermode::elf_test(&mut t);
-    // clone(CLONE_VM)+futex. After `elf_test` because it needs the same loader
-    // and the same spawn path, and a failure there explains a failure here.
-    usermode::thread_test(&mut t);
-    usermode::fdprobe_test(&mut t);
-    usermode::spawn_test(&mut t);
-    #[cfg(feature = "console-notify")]
-    usermode::console_notify_test(&mut t);
-    usermode::busybox_test(&mut t);
-    usermode::execve_test(&mut t);
-    // `strace` on the command line traces the fork test's syscalls too — the one
-    // self-test whose failure mode under SMP was a silent hang, where the trace
-    // is the only evidence of which core did what.
-    let trace_fork = machine::flag(hvm_start_info, "strace");
-    if trace_fork {
-        usermode::SYSCALL_TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
-    }
-    usermode::fork_test(&mut t);
-    if trace_fork {
-        usermode::SYSCALL_TRACE.store(false, core::sync::atomic::Ordering::Relaxed);
-    }
-    // Shell redirection and pipelines. After `fork_test` because a pipeline is
-    // a fork plus two `dup2`s, so a failure here on a green `fork_test` points
-    // at the descriptor table rather than at process creation.
-    usermode::redirect_test(&mut t);
-    lapic::stop_timer();
-
-    // The netpoll drain half, then (in the gap before the daemon task
-    // exists) the wall clock, then the spawn half — see `net::
-    // netpoll_selftest`'s doc for exactly why the clock sync has to run
-    // between these two rather than after both, and `clock.rs`'s own header
-    // for why this is best-effort (no `t.check`) rather than something to
-    // fail the boot over. The daemon is left running once spawned (that is
-    // the point; `run_init` needs it), so all of this must come after the
-    // leak and preemption checks above.
-    if net::netpoll_drain_selftest(&mut t, have_net) {
-        if have_net {
-            // `start_timer`/`stop_timer`, same idiom as every other phase
-            // above that needs real elapsed time: `net::uptime_us` reads
-            // `lapic::ticks()`, which does not advance while the timer is
-            // stopped (true here since line 227), and `akuma_sntp::boot::
-            // bootstrap_over_udp`'s own timeout depends on it moving —
-            // without a live tick, an unanswered request would spin forever
-            // instead of giving up.
-            lapic::start_timer();
-            clock::sync_via_sntp();
-            lapic::stop_timer();
-        }
-        net::netpoll_spawn_selftest(&mut t);
-        // The same `netprobe` flag the bare-metal path honours. Wired here too
-        // so the probe can be exercised in a rig under KVM rather than only by
-        // rebooting the machine it exists for — a diagnostic whose first run is
-        // on the metal is a diagnostic nobody has tested.
-        if machine::flag(hvm_start_info, "netprobe") {
-            net::enable_probe();
-        }
-    }
-
-    // The clock, last and **before any user process** — see
-    // `lapic::clock_rate_check`. It is also what leaves interrupts enabled for
-    // the rest of the boot; this path had been getting that by accident, from
-    // the `sti` inside `clock::sync_via_sntp`.
-    lapic::clock_rate_check(&mut t);
-
-    drop(user_ptr_bypass);
-
-    // What the suite's own workload did to the scheduler. Notes rather than
-    // checks: the numbers depend on timing and on how much work the boot found
-    // to do, so a threshold here would be a flake. What they are worth reading
-    // for is the *shape* — `parks` climbing well past the three the blocking
-    // self-test performs is the pipe and futex waits actually parking, which is
-    // the whole point of the change and is otherwise invisible from a green
-    // suite. `backstop releases` is the one to watch: see `sched::BACKSTOP_US`,
-    // a number that grows names a wait whose wake path is missing.
-    t.note("sched: parks over the whole suite", sched::blocks());
-    t.note("sched: wakes over the whole suite", sched::wakes());
-    t.note("sched: backstop releases (0 is the healthy value)", sched::backstop_wakes());
-
-    // The verdict is `#[must_use]`, and this is why: before the harness existed
-    // a `[FAIL]` printed and the boot went on to announce success.
-    let passed = t.report();
+    let verdict = boot::self_tests(
+        &mut t,
+        &boot::SuiteCtx {
+            machine: &machine,
+            cmdline,
+            smap,
+            have_pci,
+            // On a VMM, test xHCI whenever PCI was scanned and a controller is
+            // there. Bare metal asks first — see the field's own note.
+            want_xhci: have_pci,
+            have_disk,
+            have_fs,
+            have_net,
+            keep_out: [
+                (si.addr, si.addr + 4096),
+                (si.cmdline_paddr, si.cmdline_paddr + 4096),
+            ],
+        },
+    );
+    let passed = verdict.passed;
     if passed {
         serial::puts("Akuma/amd64 — all self-tests passed\n");
     } else {
@@ -444,7 +270,10 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // an interactive session never hides a failing boot — and only on a passing
     // one, because a shell on a kernel whose own tests failed is a way to spend
     // an hour debugging the wrong layer.
-    if passed && have_fs {
+    // `init` runs whether or not the suite passed — the same reversal the
+    // multiboot2 path documents at length. A failed check is a line in `dmesg`,
+    // not a reason to make the machine unreachable.
+    if have_fs {
         let mut init_buf = [0u8; 128];
         let mut args_buf = [0u8; 256];
         // Copy the path out first: `init_path` and `init_args` both borrow a

@@ -92,6 +92,31 @@ pub fn flag(start_info_pa: u64, flag: &str) -> bool {
     cmdline.split_ascii_whitespace().any(|t| t == flag)
 }
 
+/// The whole boot command line, copied into `buf`.
+///
+/// The PVH handoff keeps it behind a physical pointer in the start-info block,
+/// so unlike multiboot2 — where GRUB hands over a `&str` directly — reading it
+/// costs a copy. Worth paying once at boot: with the command line as a plain
+/// `&str`, the shared `boot::self_tests` asks both protocols the same question
+/// the same way (`nosmp`, `strace`, `netprobe`, `usb`), instead of one path
+/// calling [`flag`] and the other doing its own `split_ascii_whitespace`.
+///
+/// Empty when there is no command line, which reads as "no flags set" — the
+/// right answer, and the same one [`flag`] gives.
+#[must_use]
+pub fn cmdline(start_info_pa: u64, buf: &mut [u8]) -> &str {
+    let mut scratch = [0u8; 512];
+    let Some(si) = akuma_ryzen_amd64::StartInfo::parse(&Physmap, start_info_pa) else {
+        return "";
+    };
+    let Some(line) = si.cmdline(&Physmap, &mut scratch) else {
+        return "";
+    };
+    let n = line.len().min(buf.len());
+    buf[..n].copy_from_slice(&line.as_bytes()[..n]);
+    core::str::from_utf8(&buf[..n]).unwrap_or("")
+}
+
 fn cmdline_token<'a>(start_info_pa: u64, prefix: &str, buf: &'a mut [u8]) -> Option<&'a str> {
     let mut scratch = [0u8; 512];
     let si = akuma_ryzen_amd64::StartInfo::parse(&Physmap, start_info_pa)?;

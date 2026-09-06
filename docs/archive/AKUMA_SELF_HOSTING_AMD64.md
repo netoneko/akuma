@@ -5,7 +5,26 @@
 `akuma-mmap` adoption, the `akuma-mmu` x86 surface, and the `usermode.rs` fold —
 as they stand one day after the survey
 (`docs/archive/AKUMA_AMD64_STREAMLINING.md`).
-**Status:** plan, with measurements taken 2026-09-07:
+**Status:** plan, with measurements taken 2026-09-07.
+
+> **A1 and A2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_BLOCKING.md`.
+> `amd64/src/sched.rs` no longer contains a scheduler: `akuma-threading` is the
+> scheduler on both architectures, and what is left is the machine effects
+> (`CR3`, TSS trap stack, FS/GS bases, `fxsave`, BKL depth, per-core current
+> slot) registered as `X86ArchHooks`. Pipes, `futex` and `wait4` park instead of
+> polling. Verified QEMU 295/0, Firecracker 294/0 at `SMP=4`, bare metal, and
+> aarch64 proven unchanged against `main`.
+>
+> **Not done from the A1 box:** `thread.rs` (391 lines) and the `smp.rs`
+> ticket-lock BKL → `akuma-bkl`. Both still stand.
+>
+> A side effect worth knowing about: consolidating the two boot paths
+> (`boot::early_init` + `boot::self_tests`) found that the multiboot2 path had
+> **never run seven of the PVH path's tests**, including the whole
+> process-lifecycle suite. That is why bare metal reported 262 checks where QEMU
+> reported 295.
+
+Measurements as of 2026-09-07:
 
 - `cargo check -p akuma-mmu --target x86_64-unknown-none` **passes**. The crate
   reaches amd64 transitively through `akuma-user-access`, and carries a real x86

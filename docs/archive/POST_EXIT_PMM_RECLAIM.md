@@ -202,3 +202,136 @@ easy to mistake for a crash introduced by whatever you are testing — it is not
   demonstrate.
 - `docs/archive/BOOT_SUITE_PMM_DEFERRED_RECLAIM.md` — why these tests have to
   force `cleanup_terminated_force` + `reclaim_retired_processes_force` by hand.
+
+---
+
+# Root cause found 2026-09-07: 7ec02e91's TERMINATED gate disarmed every teardown drain site
+
+## The mechanism, and where it broke
+
+`retired_reclaim_ab` has exactly one collector that can run at the moment it
+samples: the exit-path teardown drain (`drain_retired_before_parking` in
+`akuma-syscalls-glue/src/proc.rs`, twin call in `return_to_kernel` /
+`return_to_kernel_from_fault` in `akuma-exec/src/process/mod.rs`). At SMP=1
+during the boot suite every other collector is absent:
+
+- `netpoll_maint` (`akuma-kernel-glue/src/lib.rs:2136`, intact) — not spawned yet;
+  the suite runs before `run_async_main_preemptive`.
+- thread 0's idle loop (`akuma-kernel-glue/src/lib.rs:1334`) — thread 0 *is* the
+  test, not idling.
+- the `smp-shared` per-core idle loop (`akuma-entry/src/smp_shared.rs:634`) —
+  no secondaries at SMP=1.
+- `drain_retired_under_pressure` (the PMM ladder) — declines: at 2048M parking
+  1024p is 0.05% of RAM, no allocation failure ever occurs.
+
+Commit **7ec02e91** ("fix reclamation of the heap", 2026-09-03) added to the top
+of `drain_retired` (`crates/akuma-exec/src/process/reclaim.rs`):
+
+```rust
+if crate::threading::current_thread_is_terminated() {
+    request_retired_reclaim();
+    return 0;
+}
+```
+
+All three teardown drain sites call it **immediately after** marking their own
+thread terminated — the condition is always true there *by construction*. The
+gate turned all three sites into no-ops, and the A/B's B side began waiting for
+a collector that no longer exists: both sides measure `0p`, one slot stuck
+RETIRED. (The gate's own comment says "terminal sites keep requesting" — true,
+and useless: a request flag needs an eligible collector to ever be serviced.)
+
+**Verified experimentally** (worktree, gate disabled, one boot, HVF 2048M):
+`retired_reclaim_ab` PASSes — `OFF recovered 0p (retired 1), ON recovered 740p
+(0 left)`; 740p is inside the documented 745/1029 bimodal band. Neighbouring
+tests already prove the retire/stamp/cooldown half works when any live
+collector calls the drain (`retired_reclaim_pressure_rung`,
+`retired_reclaim_request_flag`).
+
+The gate itself fixed a real bug (`SELFHOST_KERNEL_HEAP_LEAK.md`): a TERMINATED
+thread can be reaped at any yield and never resumes, so a sweep it started is
+abandoned mid-`Process::drop`, stranding that address space's `user_frames`
+map. **Do not simply delete the gate.** Replace it with a pin.
+
+## The fix: reap-safe drain (sketch)
+
+Keep the gate's hazard model — a terminated drainer must never be reaped
+mid-sweep — but pin the reaper instead of skipping the drain. Three parts:
+
+### 1. `drain_retired` (akuma-exec/src/process/reclaim.rs)
+
+Replace the unconditional bail with a *pinned* sweep for the terminated case:
+
+```rust
+let terminal = crate::threading::current_thread_is_terminated();
+if terminal {
+    // A dying thread must finish what it starts: with preemption disabled it
+    // cannot be switched away mid-sweep, and it never yields voluntarily, so
+    // the sweep is guaranteed to complete and DRAINING[tid] is guaranteed to
+    // clear. No abandonment, no stale pin.
+    akuma_primitives::preempt::disable_preemption();
+}
+// ... existing DRAINING[tid] reentrancy guard + sweep + flag recompute ...
+// (restructure the early `return 0` arms so the enable_preemption() below
+// always runs — RAII or a single exit path.)
+if terminal {
+    akuma_primitives::preempt::enable_preemption();
+}
+```
+
+`disable_preemption`/`enable_preemption` already exist in
+`akuma-primitives/src/preempt.rs` with watchdog diagnostics. Note the sweep
+site runs with IRQs enabled, and the disabled window is bounded by the free of
+the parked address spaces — a dying thread's last act; the 100 ms watchdog line
+is diagnostic-only and acceptable here (the pre-7ec02e91 behaviour drained this
+same work from this same site while holding the BKL, and that was the shipped
+design for months).
+
+### 2. Reaper pin (akuma-threading/src/lib.rs, `cleanup_terminated_internal`)
+
+Next to the existing `ON_CPU[i]` guard (~line 2124) — which already skips a
+slot whose core may still be on its stack — add the drain pin:
+
+```rust
+// A terminated thread may be running its final retired-process sweep
+// (process::reclaim). Don't free its stack out from under it; the next
+// pass gets it. With preemption disabled for the sweep this cannot fire,
+// but it is the same belt the ON_CPU check is: cheap, and it keeps the
+// invariant local to the reaper rather than trusting every drainer.
+if (runtime().drain_in_flight)(i) {
+    continue;
+}
+```
+
+### 3. Hook wiring (four one-line edits)
+
+- `akuma-threading/src/lib.rs` runtime table (~line 185): add
+  `pub drain_in_flight: fn(usize) -> bool` beside `clear_draining`.
+- `akuma-exec/src/lib.rs` (~line 223): wire
+  `drain_in_flight: process::reclaim::drain_in_flight` — a new
+  `pub(crate) fn drain_in_flight(tid: usize) -> bool` reading `DRAINING[tid]`.
+- Host stub `akuma-threading/src/test_support.rs` (~line 72): `|_| false`.
+- amd64 stub `amd64/src/sched.rs` (~line 368): `|_| false`.
+
+### Why the interleaving is now impossible
+
+The reaper only reaps a TERMINATED slot when it is off-CPU (`ON_CPU[i] == 0`).
+A drainer mid-sweep is either (a) on-CPU — ON_CPU already excludes the reaper —
+or (b) was preempted — impossible, the sweep runs preempt-off and never yields.
+So the reaper can never observe a drainer's slot in a reapable state while the
+sweep is live, DRAINING always clears (guaranteed completion), and the slot is
+always reaped on a later pass. The pin flag therefore cannot go stale — which
+is the one way a naive DRAINING-only version of this fails (an abandoned sweep
+would leave the flag set forever and strand the stack with it).
+
+### Expected outcome
+
+- `retired_reclaim_ab` B side recovers through the exit-path drain again
+  (measured 740p with the gate naively disabled; the pinned version should
+  match, 745/1029 bimodal band).
+- The `SELFHOST_KERNEL_HEAP_LEAK.md` abandonment residual stays fixed — the
+  sweep is now *never* abandoned rather than never *started*.
+- `test_mmap_file_oom_survives` (256M failure in the matrix above) is worth a
+  re-run after the fix: it is a second post-kill reclaim failure and may share
+  this root cause, since a SIGSEGV kill also exits through a terminal drain
+  site.

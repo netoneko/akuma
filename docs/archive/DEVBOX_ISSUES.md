@@ -2109,6 +2109,58 @@ box's processes*. If that enumeration changed shape, `box grab <name>` breaks
 while `box grab <name> <pid>` still works — which is a one-command
 discrimination and worth running before anything else.
 
+## Issue 29: `dmesg` is readable from inside a box — it should be gated to box 0
+
+**Status: OPEN, raised 2026-09-07.** Not observed as a failure; raised as a
+containment gap while reading the console ring for something else.
+
+`dmesg` reads the kernel's console history ring (`akuma-dmesg`, shared by both
+kernels since 2026-09-06). Inside a box that is the **host's** ring, not the
+box's: every line the kernel has printed since boot, from every process on the
+machine.
+
+### Why that matters more here than it looks
+
+The ring is not a tidy event log. It carries, routinely:
+
+- process ids, thread ids and `comm` names for everything that has run —
+  including whatever the operator was doing before the box started;
+- kernel virtual and **physical** addresses, from the memory tracers, the fault
+  paths and the `[BKL]`/`[SGI-S]` diagnostics. On a kernel without KASLR that is
+  a map of where things live;
+- paths, mount points and device names from the VFS and block layers;
+- on a failing boot, the full `[Fault]`/panic context of *other* processes.
+
+A box is supposed to be an isolation boundary (`docs/reference/subsystems/
+containers.md`, `akuma-isolation`). Handing everything inside it a running
+commentary on the host is **the same leak as Issue 24** — `ls /proc` showing
+other boxes' processes — through a different door. That one was found and
+fixed; this one is the same question asked of the console ring, and nothing has
+been done about it.
+
+### The shape of the fix
+
+Gate it at the **`syslog(2)` decode**, not in the `dmesg` binary — the binary is
+just a caller and a box can bring its own. `akuma_dmesg` already owns the action
+decode, so the natural seam is: a caller not in box 0 gets `EPERM` for the read
+actions, and an empty ring for the size actions.
+
+Two decisions to make deliberately rather than by default:
+
+- **`EPERM` or empty?** Linux answers `EPERM` when `dmesg_restrict` is set.
+  Empty is friendlier to a script that pipes `dmesg` into a grep and does not
+  check, and it is a lie. Prefer `EPERM`, which is what the caller can act on.
+- **Per-box rings, later?** The honest end state is that a box sees *its own*
+  kernel messages, not none. That needs the ring to be partitioned by box id,
+  which is a bigger change than the gate — do the gate first, and leave this
+  paragraph as the note that the gate is a floor, not the design.
+
+### Where
+
+- `crates/akuma-dmesg` — the ring and the `syslog(2)` action decode.
+- The `syslog` dispatch arm on each kernel (`src/syscall/`, `amd64/src/`).
+- `akuma-isolation` / `boxlib` for "which box is this caller in".
+
 ## Background
 
 - [`SOCKET_DELAYED_FIRST_BYTE_HANG.md`](SOCKET_DELAYED_FIRST_BYTE_HANG.md)

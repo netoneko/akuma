@@ -316,18 +316,12 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // `smp::init_bsp` is not optional on this path either: the scheduler and
     // the syscall stubs reach their per-core state through `%gs`, and without
     // the block installed the first `yield_now` reads address 0.
-    crate::gdt::init();
-    crate::smp::init_bsp();
-    crate::idt::init();
-    let smap = crate::uaccess::init_smap();
-
-    // The scheduler, before anything can yield into it — the same call, at the
-    // same point, as the PVH path's `kmain`. Registration with
-    // `akuma-threading` is once-only and each of these two entry points runs
-    // exactly one of them, so this is not a double registration.
-    crate::sched::init();
-
-    crate::paging::drop_identity_map();
+    // Descriptor tables, per-CPU block, IDT, SMAP/SMEP/WP, the scheduler, and
+    // dropping the identity map — the same six steps in the same order as the
+    // PVH entry point, and now literally the same code. `boot::early_init` has
+    // the reason for each; the ordering constraints between them are subtle
+    // enough that keeping two copies was the hazard.
+    let smap = crate::boot::early_init();
 
     // The machine, as multiboot2 describes it.
     let machine = machine_from(&info);
@@ -433,154 +427,64 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
 
     let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", serial::puts);
 
-    // The same bypass window `kmain` runs its tests in: they drive syscall
-    // bodies with kernel-stack buffers where a program would pass user
-    // pointers, and `uaccess` refuses kernel addresses by design.
-    let user_ptr_bypass = akuma_user_access::BypassValidationGuard::new();
-
-    crate::mem::smoke_test(&mut t);
-    crate::paging::smoke_test(&mut t);
-    crate::pci::smoke_test(&mut t);
-    crate::reboot::smoke_test(&mut t);
-    crate::idt::smoke_test(&mut t);
-    crate::idt::user_copy_smoke_test(&mut t);
-    crate::uaccess::smoke_test(&mut t, smap);
-
-    if t.check("lapic: initialised", crate::lapic::init()) {
-        crate::lapic::smoke_test(&mut t);
-        crate::lapic::start_timer();
-        crate::sched::smoke_test(&mut t);
-        crate::lapic::stop_timer();
-    }
-
-    // No `blk`: this machine has no virtio transports. The USB disk is the real
-    // block device here — its self-test drives the whole xHCI + BOT path, and a
-    // `WRITE(10)` round trip to a scratch LBA in `sda2`. Gated on the controller
-    // being present so a box without one (or the QEMU rig) is a clean skip.
+    // The whole suite, shared with the PVH entry point.
     //
-    // Gated on the command line asking for USB, which it did NOT used to be —
-    // and that is the whole reason a "disarmed" GRUB entry was not disarmed.
-    // Dropping `root=/dev/sda1` stopped the kernel *mounting* the USB disk, but
-    // this test still brought the controller up in full on every boot, so there
-    // was no way to boot the kernel at all without driving it. When a bring-up
-    // can take the machine down, "do not touch the hardware" has to be
-    // reachable from the boot menu.
-    let have_xhci = want_usb
-        && crate::pci::find_class(0x0c, 0x03).is_some_and(|d| d.header.prog_if == 0x30);
-    if !want_usb {
-        t.note("xhci: not requested (pass `usb` or `root=/dev/sda1`)", 0);
-    }
-    // Counted separately, and deliberately not allowed to condemn the boot.
-    //
-    // USB here is an **opt-in peripheral the kernel already falls back from**:
-    // `root=/dev/sda1` reverts to the RAM image on any probe failure, and `usb`
-    // does not touch the root at all. Folding its failure into the verdict makes
-    // `run_shell = passed && have_fs` withhold sshd — which is the only way to
-    // read the `[xhci] ..` breadcrumbs that say *why* the bring-up failed, on a
-    // machine whose console is a television with no scrollback. A failing USB
-    // driver taking away the tool for debugging the USB driver is backwards.
-    let failures_before_usb = t.failed();
-    crate::xhci::smoke_test(&mut t, have_xhci);
-    let usb_failures = t.failed() - failures_before_usb;
-
-    // `net`/`sock` run on the loopback-only stack — enough to prove
-    // `socket(AF_INET)`, `bind`, `listen`.
-    crate::fs::smoke_test(&mut t, have_fs);
-    crate::fd::smoke_test(&mut t, have_fs);
-    // `net::smoke_test` runs here too since 2026-09-05 — it did not before,
-    // because this path has no virtio-net and the checks read as a VMM thing.
-    // They are not: the RNG, the clock, and above all the `ip=` parser whose
-    // built-in address is what this machine answers on when DHCP does not.
-    // This is the one entry where that address matters, so it is the one entry
-    // that must not skip checking it.
-    crate::net::smoke_test(&mut t, have_net);
-    crate::sock::smoke_test(&mut t, have_net);
-    crate::mm::smoke_test(&mut t);
-
-    // `init_syscall` writes IA32_STAR/LSTAR/SFMASK **and sets `EFER.SCE`**, and
-    // without it `sysretq` is an invalid opcode. Leaving it out is how the first
-    // bare-metal run of this suite died: `#UD` at `enter_user_mode`, one
-    // instruction into the first ring-3 entry, having passed everything else.
-    crate::fd::init_console();
-    crate::usermode::init_syscall();
-    crate::usermode::smoke_test(&mut t);
-    crate::usermode::preempt_test(&mut t);
-
-    // The other cores, exactly where `kmain` starts them. What is different on
-    // a firmware boot is what might be sitting on the trampoline page: the
-    // information block this function is still reading, or the root filesystem
-    // GRUB left in RAM. Either one there means single core rather than a copy
-    // over it.
-    let keep_out = [
-        (info_phys, info_phys + bytes.len() as u64),
-        info.first_module().map_or((0, 0), |m| (u64::from(m.start), u64::from(m.end))),
-    ];
-    let nosmp = info.cmdline().split_ascii_whitespace().any(|t| t == "nosmp");
-    let expected_aps = if nosmp {
-        0
-    } else {
-        machine
-            .madt
-            .as_ref()
-            .map_or(0, |m| m.cpus().len().saturating_sub(1).min(crate::smp::MAX_CPUS - 1))
-    };
-    // `nosmp` on the command line boots single-core. A bring-up lever, not a
-    // policy: on a machine whose only console is a framebuffer, the `[BKL]
-    // stuck: cpu N waiting on owner ...` chatter from four cores interleaves
-    // into every other line and makes the screen hard to read, and taking the
-    // other cores out of the picture is the cheapest way to decide whether a
-    // fault is a cross-core one.
-    let started = if nosmp {
-        serial::puts("  smp:  nosmp on the command line — single core\n");
-        0
-    } else if crate::smp::trampoline_page_available(&machine, &keep_out) {
-        crate::smp::start_secondaries(machine.madt.as_ref())
-    } else {
-        serial::puts("  smp:  trampoline page is not free RAM — single core\n");
-        0
-    };
-    crate::smp::smoke_test(&mut t, expected_aps, started);
-    crate::usermode::smp_parallel_test(&mut t);
-
-    crate::lapic::start_timer();
-    crate::usermode::elf_test(&mut t);
-    crate::usermode::thread_test(&mut t);
-    crate::usermode::fdprobe_test(&mut t);
-    // Shell redirection and pipelines — `dup2` and `pipe(2)`.
-    //
-    // Registered on **both** boot paths, unlike `spawn`/`busybox`/`execve`/
-    // `fork`, which this one still does not run (the divergence
-    // `AKUMA_AMD64_STREAMLINING.md` §1 is about). It earns its place here
-    // because this is the path with the persistent root: a redirect that works
-    // against a RAM image and fails against ext2-on-USB is exactly the class of
-    // bug the two lists were manufacturing.
-    crate::usermode::redirect_test(&mut t);
-    drop(user_ptr_bypass);
-
-    // The clock, last and **before any user process**. Every test above ends in
-    // `cli`, so this is what leaves interrupts on for the rest of the boot — and
-    // it checks the tick *rate*, not just that ticks arrive, because a clock
-    // that is merely moving still scales every network timeout by however wrong
-    // it is. See `lapic::clock_rate_check`.
-    crate::lapic::clock_rate_check(&mut t);
-
-    let passed = t.report();
-    if passed {
+    // This path used to carry its own copy, and the two had drifted: it was
+    // **not running** `blk::smoke_test`, `sched::block_smoke_test`, or
+    // `usermode::{spawn,console_notify,busybox,execve,fork}_test`. Seven
+    // checks — the entire process-lifecycle suite — missing from the one path
+    // that runs on real silicon, and invisible because both paths still said
+    // `0 failed`. See `boot::self_tests`.
+    let verdict = crate::boot::self_tests(
+        &mut t,
+        &crate::boot::SuiteCtx {
+            machine: &machine,
+            cmdline: info.cmdline(),
+            smap,
+            // Firmware boots always have PCI, and the scan already happened
+            // above — the Realtek NIC and the xHCI controller are both found
+            // through it.
+            have_pci: true,
+            // Only when asked: bringing the controller up on a box booted from
+            // the RAM image is a slow no-op with a real chance of hanging on
+            // whatever is plugged in.
+            want_xhci: want_usb,
+            // No virtio-blk on a firmware boot — the root is a GRUB module in
+            // RAM, or ext2 on USB.
+            have_disk: false,
+            have_fs,
+            have_net,
+            // What might be sitting on the trampoline page here is not a PVH
+            // start-info block but the information block this function is still
+            // reading, or the root filesystem GRUB left in RAM.
+            keep_out: [
+                (info_phys, info_phys + bytes.len() as u64),
+                info.first_module().map_or((0, 0), |m| (u64::from(m.start), u64::from(m.end))),
+            ],
+        },
+    );
+    if verdict.passed {
         serial::puts("Akuma/amd64 - all self-tests passed\n");
     } else {
-        serial::puts("Akuma/amd64 - SELF-TESTS FAILED\n");
-    }
-
-    // The shell is withheld when the *kernel* failed its own tests, not when an
-    // optional peripheral did — see the note beside `usb_failures` above.
-    let kernel_ok = t.failed() == usb_failures;
-    if !passed && kernel_ok {
+        // **The shell starts anyway**, and this is a deliberate reversal.
+        //
+        // It used to be withheld unless every failure was USB's. On a headless
+        // box that is the wrong trade by a wide margin: measured 2026-09-07,
+        // one flaky check — `net: the netpoll daemon is being scheduled`,
+        // starved for the length of a `[BKL] stuck` window at `SMP=4` — left a
+        // machine with DHCP, a synced clock and a running network stack and
+        // **no sshd**. No way in, on a box whose only other console is a
+        // television in another room; it had to be power-cycled by hand.
+        //
+        // Withholding the shell protects nothing the log does not already
+        // record. Every failure is in `dmesg`, and `dmesg` is exactly what you
+        // ssh in to read.
         serial::puts(
-            "Akuma/amd64 - the only failures are USB; starting init anyway \
-             (grep the log for `[xhci]`)\n",
+            "Akuma/amd64 - SELF-TESTS FAILED; starting init anyway \
+             (`dmesg | grep FAILED` for what)\n",
         );
     }
-    boot_to_init(&info, have_net, kernel_ok && have_fs);
+    boot_to_init(&info, have_net, have_fs);
 
     // Keep driving the scheduler as long as there is a network stack behind it:
     // the netpoll daemon is what answers ARP and ICMP and services a listening

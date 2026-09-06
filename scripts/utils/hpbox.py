@@ -191,7 +191,8 @@ def sync_from_git(rev=None, branch=None, timeout=300):
     return rc, (out + err).strip()
 
 
-def deploy(repo=".", branch=None, timeout=600):
+def deploy(repo=".", branch=None, timeout=600,
+           paths=("amd64", "crates", "src", "scripts", "Cargo.toml", "Cargo.lock")):
     """Make the box's checkout match this worktree exactly — commits *and* dirt.
 
     Returns ``(rc, message)``. This is the one to call; everything below it is a
@@ -268,6 +269,29 @@ def deploy(repo=".", branch=None, timeout=600):
     note = f"box at {landed}"
     if base != head:
         note += f" (local HEAD {head[:7]} is not pushed — sent as patch)"
+
+    # **Untracked files are not in `git diff`**, and a refactor's first act is to
+    # create one. This is not a corner case; it is the single most likely way to
+    # deploy stale source, and it is silent in the worst way: the box builds, the
+    # build *succeeds* against the old code, and the numbers you then read look
+    # like your change did nothing.
+    #
+    # Measured 2026-09-07: `amd64/src/boot.rs` was new, the patch carried the
+    # edits to `main.rs`/`multiboot2.rs` that referenced it and not the file
+    # itself, and the box shipped a kernel byte-identical to the previous one.
+    # The md5 in `stage_akuma.sh`'s output was the only evidence.
+    #
+    # `--exclude-standard` so `.gitignore` still applies — `target/` must never
+    # come along.
+    untracked = [
+        f for f in git("ls-files", "--others", "--exclude-standard", "--", *paths).stdout.split()
+    ]
+    if untracked:
+        rc, msg = send_files(untracked, repo=repo, touch=False)
+        if rc not in (0, None):
+            return rc, note + f"; sending untracked files failed: {msg}"
+        note += f"; {len(untracked)} untracked file(s) sent"
+
     if not diff.strip():
         return 0, note + "; nothing further to apply"
 
