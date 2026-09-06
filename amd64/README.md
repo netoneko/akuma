@@ -22,7 +22,7 @@ ed25519 pubkey auth, and a shell started over stdin/stdout pipes; and Stage S
 runs a **stock static musl `busybox`** — a binary the tree did not compile —
 via `arch_prctl` (TLS base), SSE enabled in `boot.s`, `uname` and `writev`
 (`busybox uname -a` prints `x86_64`); and Stage T (in progress) added path
-`stat`/`lstat`/`newfstatat`, **`execve`**, **`fork`** (eager full-copy, no CoW)
+`stat`/`lstat`/`newfstatat`, **`execve`**, **`fork`** (copy-on-write since 2026-09-06, SMP=1)
 + `wait4`, per-task `%fs` base, `open`, `access`, terminal `ioctl` and `poll` —
 so an **interactive `busybox sh` over SSH runs external commands**
 (`uname -a`, `echo`, …), and Stage T's step 5 (2026-09-04) wired `getdents64`,
@@ -97,9 +97,10 @@ ran to `ENOSPC` partway through a real install) and closing a leak where
 nothing freed a task's fds when it exited (§3.32) — `apk add curl` (14
 packages) and `apk add busybox-static` both install cleanly over SSH, and
 the freshly-committed `/bin/busybox.static` runs and prints correctly:
-`apk` itself works end to end. `curl` the *binary* does not run once
-installed — it is dynamically linked, and this target has no `PT_INTERP`
-support at all, a separate and much larger gap than anything `apk` does.
+`apk` itself works end to end. `curl` the *binary* did not run once installed,
+because it is dynamically linked — **that gap closed on 2026-09-06**: the loader
+places the interpreter and enters at its entry point, and a stock Alpine dynamic
+`busybox` runs (`docs/archive/AKUMA_AMD64_DYNAMIC_LINKING.md`).
 
 No device interrupts, and no pipelines (`a | b`) over the interactive SSH
 shell — `sys_pipe2`/`dup2` (step 4) are still `ENOSYS`, seen directly as
@@ -386,8 +387,9 @@ and each entry has one of three reasons:
 
 | crate | why amd64 does not use it |
 |---|---|
-| `akuma-mmu`, `akuma-elf` | **Blocked.** `akuma-mmu` is AArch64 page-table format; `akuma-elf`'s mapping half is written against it. The fix is a parse/place split for the loader, and proposal item 1 for the tables. `amd64/src/loader.rs` grew its own independent static-PIE (`ET_DYN`) support 2026-09-04 for `apk` rather than waiting on that split — real duplication, tracked as such, not evidence the split stopped mattering |
-| `akuma-mmap` | **Blocked on item 1.** `MmapRegion.flags` is a raw AArch64 PTE `u64`; the two encodings share no field. This costs `munmap`'s clip-and-split, lazy regions, and a region list to replace `loader::MAX_PROC_FRAMES` |
+| `akuma-elf` | **No longer blocked — but still not used here.** It called exactly three methods on `UserAddressSpace`; those are the `UserPages` trait since 2026-09-06 and the crate builds for `x86_64-unknown-none` (`docs/archive/AKUMA_ELF_ARCH_NEUTRAL.md`). `amd64/src/loader.rs` remains its own, so this row is now a live duplication to close rather than a blocked dependency |
+| `akuma-mmu` | **It builds for x86_64.** What does not is the `UserAddressSpace` *type* inside it, which is `#[cfg(target_arch = "aarch64")]` — the L0–L3 walker with ASIDs and `TTBR`. Its ledger half was extracted to `akuma-user-space` and **amd64 does use that**, as its `FrameSet`. Earlier editions of this table said the whole crate was blocked; that was never checked and was wrong |
+| `akuma-mmap` | **Blocked on item 1.** `MmapRegion.flags` is a raw AArch64 PTE `u64`; the two encodings share no field. This costs `munmap`'s clip-and-split and lazy regions. It no longer costs a region list to replace `MAX_PROC_FRAMES` — that cap is gone, replaced by `akuma-user-space`'s `FrameLedger` |
 | `akuma-syscalls-glue` (incl. its `pipe`) | **Not reached yet** (it needs `akuma-exec`). `amd64/src/{fd,usermode}.rs` hold the file/spawn/pipe syscall bodies; the pure pipe buffer was extracted to `akuma-pipe` rather than re-derived. Until 2026-09-05 it could not build at all, through `akuma-user-access`'s AArch64 asm |
 | `akuma-uart`, `akuma-gic`, `akuma-psci`, `akuma-exceptions`, `akuma-el0-entry`, `akuma-entry`, `akuma-timer`, `akuma-fdt`, `akuma-firecracker` | **Different hardware.** PL011 vs a 16550 on I/O ports, GICv3 vs LAPIC, PSCI vs nothing, an FDT vs a PVH block. Genuinely arch- or machine-specific |
 | `akuma-exec`, `akuma-exec-core`, `akuma-threading`, `akuma-slot-table`, `akuma-syscalls`, `akuma-kernel-core`, `akuma-kernel-glue`, `akuma-vfs-glue`, `akuma-bkl` | **Not reached yet.** The process/exec/SMP layer. `akuma-exec-core` supplied `FileDescriptor`/`KernelFile`; its `Process` and the fork/exec of `akuma-exec` are what Stage T (§3.26) needs |
@@ -594,7 +596,8 @@ in-process through `libakuma-tls` (the same crate `box pull` and `meow` use).
 
 It exists because every obvious way to get `curl` here is blocked:
 `bootstrap/bin/curl` is **aarch64**; Alpine's `curl` package is dynamically
-linked and this kernel has no `PT_INTERP` support; and busybox
+linked, which this kernel could not load until `PT_INTERP` support landed
+2026-09-06 (so that half is now worth re-testing); and busybox
 `wget https://...` shells out to a separate `ssl_client` over a `socketpair`,
 which is neither implemented nor on the image. `libakuma-tls` already builds
 for `x86_64-unknown-none`, so the shortest path to HTTPS is thirty lines rather
@@ -661,15 +664,21 @@ bare-metal boot. `SMP=1` is the single-core boot every earlier stage ran.
 
 ## What is deliberately missing
 
-- **`fork` is an eager full copy, no CoW.** `sys_fork` (Stage T; `fork`/`vfork`/
-  `clone(SIGCHLD)`) copies every mapped user page into fresh frames and runs the
-  child as its own task — enough for an interactive `busybox sh` to run external
-  commands and command sequences (`a; b`). What is missing: **CoW** (so `fork`
-  costs one frame per page and can hit `ENOMEM` near `MAX_PROC_FRAMES`), and
-  `pipe2`/`dup2` for **pipelines** (`a | b`). `sshd`'s `fork-sessions` mode is
-  still out (it needs `fork` before auth, a different shape). Rest of **Stage
-  T**: `pipe2` (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.26 — `getdents64`,
-  step 5, shipped 2026-09-04).
+- **`fork` is copy-on-write, and only at SMP=1.** `sys_fork` (Stage T;
+  `fork`/`vfork`/`clone(SIGCHLD)`) shares every mapped user page read-only in
+  both address spaces and breaks the sharing a page at a time on the write
+  fault. Measured 2026-09-06: **2000 forks, 0 KiB memory drift, flat 0.4 s per
+  200** — where the eager copy died at ~500. The decision is `akuma-cow`, the
+  marker is x86 PTE bit 9, and `MAX_PROC_FRAMES` is gone with the flat array it
+  bounded (`docs/archive/AKUMA_AMD64_COW.md`).
+  **The SMP=1 restriction is by construction, not an oversight**: `invlpg` is
+  core-local and this target has no TLB shootdown, while `fork` demotes the
+  *parent's* live PTEs — another core could hold a stale writable translation.
+  Still missing: `pipe2`/`dup2` for **pipelines** (`a | b`). `sshd`'s
+  `fork-sessions` mode is still out (it needs `fork` before auth, a different
+  shape). Rest of **Stage T**: `pipe2`
+  (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.26 — `getdents64`, step 5,
+  shipped 2026-09-04).
 - **Console input is the UART or an i8042 keyboard, polled** (`input.rs`,
   `kbd.rs`; both probed at boot and reported as `uart:`/`kbd:`). No USB **HID
   stack** yet — QEMU's `pc` machine presents a USB keyboard on the i8042 and

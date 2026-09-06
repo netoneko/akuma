@@ -1780,9 +1780,12 @@ impl Process {
     /// resuming at `entry`/`stack`
     /// (the parent's post-`fork` RIP/RSP) as a register-complete copy.
     ///
-    /// `None` if a frame runs out mid-copy or the child would need more frames
-    /// than `MAX_PROC_FRAMES` — the shell then sees `fork` fail with `ENOMEM`,
-    /// which is a survivable "can't fork" rather than a corrupt child.
+    /// `None` if a frame for the child's PML4 or one of its page tables runs
+    /// out — the shell then sees `fork` fail with `ENOMEM`, which is a
+    /// survivable "can't fork" rather than a corrupt child. Both failure paths
+    /// print which one they took: an `ENOMEM` that names the wrong resource is
+    /// what made the scheduler's slot leak look like memory exhaustion for an
+    /// afternoon (`docs/archive/AKUMA_AMD64_COW.md`).
     fn fork_from(parent: &Self, entry: u64, stack: u64) -> Option<Self> {
         let Some(space) = paging::AddressSpace::new() else {
             serial::puts("  [fork] no frame for a child PML4; pmm free=");
@@ -2397,23 +2400,22 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 
 /// `fork` (57) / `vfork` (58) / plain `clone(SIGCHLD, 0)` (56).
 ///
-/// A real fork: the child gets an **eager full copy** of the parent's address
-/// space (every user page in fresh frames — there is no CoW on this target),
+/// A real fork: the child **shares** the parent's address space copy-on-write,
 /// resumes at the parent's post-`fork` instruction as a register- and TLS-
 /// complete copy, and runs as its own scheduler task. The parent is **not**
 /// suspended — it gets the child pid back immediately and both run; a shell
 /// blocks on the child itself, in `wait4`.
 ///
 /// This is what an interactive `busybox sh` needs for every external command
-/// (`fork(); if (child) execvp(...)`) and it is `uname -a` at a shell prompt
-/// that it unblocks. The copy is thrown away microseconds later by the child's
-/// `execve`, which is wasteful but correct — CoW is the optimisation, not the
-/// semantics.
+/// (`fork(); if (child) execvp(...)`), and CoW is what makes it cheap: the
+/// child usually `execve`s microseconds later and throws the whole space away,
+/// so almost nothing is ever copied. Measured 2026-09-06: 2000 forks, zero
+/// memory drift, constant time — the eager copy this replaced died at ~500.
 ///
-/// The rough edges are `MAX_PROC_FRAMES`: a `fork` needs one frame per mapped
-/// user page, so a large program near that ceiling (busybox is ~400 pages) can
-/// make `fork` fail with `ENOMEM` — the shell reports `can't fork` and carries
-/// on. A two-child pipeline needs both copies live at once.
+/// **SMP=1 only, by construction.** The share pass demotes the *parent's* live
+/// PTEs, and `invlpg` is core-local with no shootdown on this target
+/// (`smp.rs`), so at SMP>1 another core could hold a stale writable
+/// translation. See `docs/archive/AKUMA_AMD64_COW.md`.
 ///
 /// Returns the child pid in the parent; the child never returns from here.
 fn sys_fork() -> u64 {

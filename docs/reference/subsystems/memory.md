@@ -4,6 +4,15 @@ Current-state architecture for physical memory (PMM), the kernel heap, CoW
 fork, and userspace address spaces. For debugging, see
 [`../../runbooks/debug-memory-oom.md`](../../runbooks/debug-memory-oom.md).
 
+**This document is the AArch64 kernel's.** The **amd64** target has had its own
+copy-on-write `fork` since 2026-09-06 and shares none of the machinery here —
+its page tables, its PTE marker bit and its fault arm are all in `amd64/`. What
+the two kernels *do* share is the **decision** (`crates/akuma-cow`) and the
+per-address-space frame ledger (`crates/akuma-user-space`), both host-tested.
+See [`../../archive/AKUMA_AMD64_COW.md`](../../archive/AKUMA_AMD64_COW.md);
+note that amd64's CoW is **SMP=1 only**, because `invlpg` is core-local there
+and nothing does a shootdown.
+
 > **Stability: C (active risk).** Highest-churn subsystem through 2026-06.
 > Four items still OPEN: per-run kernel-heap creep; reclaim-after-OOM below
 > ~5 MB; a full process table panicking instead of failing the spawn (see

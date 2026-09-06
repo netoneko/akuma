@@ -54,6 +54,10 @@
 //!
 //! # Static-PIE (`ET_DYN`, no `PT_INTERP`)
 //!
+//! Still the simplest shape, and the one `apk.static` uses. A `PT_INTERP`
+//! segment is no longer refused — see [`load`] — but a static-PIE needs no
+//! interpreter at all, and the path below is what handles it.
+//!
 //! Alpine's `apk-tools-static` — the reason this exists — is compiled
 //! `-static-pie`: `ET_DYN`, no `PT_INTERP`, and its relocations are `DT_RELR`
 //! (a compact bitmap format, not a classic `SHT_RELA` array — confirmed by

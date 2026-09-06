@@ -1,6 +1,29 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-09-02 with
+**Grade: A** — regenerated 2026-09-06 with
+`python3 scripts/cloc_akuma.py src crates` after four extractions in one
+session: **`akuma-dmesg`** (console history + `syslog(2)` decode),
+**`akuma-procfs`** (`/proc/<pid>` byte formats), **`akuma-user-space`** (the
+frame ledger out of `akuma_mmu::UserAddressSpace`) and **`akuma-cow`** (the
+copy-on-write write-fault decision). All four read **0 `unsafe` sites, 100.0%
+safe** and carry the ban from their first commit. **49 of 69 crates** forbid.
+
+Two of them are the reason the *other* numbers moved: `akuma-user-space` took
+three of `UserAddressSpace`'s five fields, and `akuma-cow` took a decision that
+had never been written down in one place. Neither made `akuma-mmu` able to
+forbid — it is a page-table walker and never will — but both shrank what it has
+to justify. See [`AKUMA_USER_SPACE_LEDGER.md`](../archive/AKUMA_USER_SPACE_LEDGER.md)
+and [`AKUMA_AMD64_COW.md`](../archive/AKUMA_AMD64_COW.md).
+
+Also this session: **`akuma-el0-entry` now compiles for `x86_64-unknown-none`**.
+Its gate was `#[cfg(target_os = "none")]`, written when bare-metal and AArch64
+were the same thing; `x86_64-unknown-none` *is* `target_os = "none"`, so it
+selected the AArch64 assembly arm and failed on `invalid register x30` while a
+perfectly good host stub sat unreachable beside it. **Worth grepping for: that
+`cfg` shape is no longer a safe spelling anywhere in the tree.**
+([`AKUMA_ELF_ARCH_NEUTRAL.md`](../archive/AKUMA_ELF_ARCH_NEUTRAL.md))
+
+The run before it, on 2026-09-02, was with
 `python3 scripts/cloc_akuma.py src crates` after **`akuma-exec` took
 `#![forbid(unsafe_code)]`** — the last group of
 [`AKUMA_EXEC_AUDIT.md`](../archive/AKUMA_EXEC_AUDIT.md) §6.E. At **9,311

@@ -8,7 +8,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{bkl,exec,ext2,firecracker,fpcache,gic,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,psci,rump,terminal,timer,vfs,virtio}`
+  `akuma-{bkl,cow,dmesg,exec,ext2,firecracker,fpcache,gic,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,primitives,procfs,psci,rump,terminal,timer,user-space,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
   `akuma-cpu` holds every AArch64 instruction that is **safe to execute** —
   barriers, cache/TLB maintenance, core parking, `DAIF`, the virtual-timer
@@ -31,8 +31,8 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `sysreg::set_tpidr_el0` (`docs/archive/SYSCALL_UNSAFE_CLEANUP.md` §6). To time a code path use
   `sysreg::cntvct_el0_ordered()` — a bare counter read is unordered against the
   work it measures and once made an 8 KB copy measure as 0 ns.
-  **23 of the 38 carry `#![forbid(unsafe_code)]`** — which crates, and why the
-  other 15 cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
+  **49 of the 69 carry `#![forbid(unsafe_code)]`** — which crates, and why the
+  other 20 cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
   with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).
   **`src/syscall/` carries the ban too** (2026-08-31), as a module attribute in
   its `mod.rs` — the first one outside `crates/`, and the reason the crate tally
@@ -134,6 +134,40 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   refusal that killed `rustc` mid-build. **Before reading any permission record to
   refuse something, enumerate every writer** —
   `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`.
+  `akuma-user-space` is the **frame ledger** half of a user address space: which
+  physical frames it holds and how many VAs map each, plus the rule joining that
+  to the PMM's global CoW count (`user_frames` counts VAs *within one space*;
+  `COW_REFCOUNTS` counts *spaces*, to which a frame at five VAs contributes one).
+  Split out of `akuma_mmu::UserAddressSpace` 2026-09-06 because that type is 45
+  methods and only 13 of them — 71 of 457 lines — are architecture-neutral; the
+  page-table walker stayed. It does **not** unblock `akuma-exec` for amd64 and
+  was never going to, but it makes the walker's remaining content honest and it
+  is what amd64 replaced its own capped, refcount-less `FrameSet` with
+  (`docs/archive/AKUMA_USER_SPACE_LEDGER.md`).
+  `akuma-cow` is the copy-on-write **write-fault decision** and nothing else:
+  `(live PTE writable?, PTE CoW-marked?, share count)` -> `Retry` / `Fault` /
+  `TakeInPlace` / `Copy`. Four situations that need different answers and are
+  each silent when answered wrongly — a `SIGSEGV` on a write the page table
+  grants, an `mprotect(PROT_READ)` that stops working, a needless copy on the
+  commonest path, two processes sharing one page. **The order of the tests is
+  the substance** (`pte_writable` outranks `marked` outranks `refs`) and has its
+  own test, because a reordering still passes every single-condition one. The
+  ~500-line AArch64 break in `akuma-exceptions` is deliberately NOT here: it is
+  welded to `akuma-exec` and nearly all its bulk is multi-thread races. Note
+  `marked` is a **PTE bit**, not `refs > 0` — amd64 uses x86 bit 9; AArch64 has
+  no marker and passes `refs > 0`, a pinned divergence recorded in the crate
+  (`docs/archive/AKUMA_AMD64_COW.md`).
+  `akuma-procfs` is the `/proc/<pid>/{stat,status,cmdline}` byte formats both
+  kernels render through — the wire layer, with no process model behind it. The
+  AArch64 `ProcFilesystem` (`akuma-vfs-glue`) cannot be compiled for
+  `x86_64-unknown-none`, so the formats moved rather than the filesystem. `ps`
+  finds `utime` by counting to field 14 of a 44-field line, which is why this is
+  a crate: extraction found the line had been emitting **41** fields where its
+  own comment listed 44, and a `comm` truncation that could panic the kernel on
+  a UTF-8 boundary (`docs/archive/AKUMA_AMD64_STREAMLINING.md` §4b).
+  `akuma-dmesg` is the console history ring behind `dmesg(1)` plus the
+  `syslog(2)` action decode, shared by both kernels' consoles
+  (`docs/archive/AKUMA_AMD64_STREAMLINING.md` §4).
   `akuma-kacho` is the shared observe/decide/hysteresis layer every self-tuning
   policy uses (timer-tick demotion, file-page cache cap, netpoll wake rate).
   `akuma-fpcache` is that file-page cache: shared physical frames for read-only
