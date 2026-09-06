@@ -2743,6 +2743,14 @@ fn sys_fork() -> u64 {
         (*procs)[slot] = Some(child);
     }
 
+    // The child gets its own descriptor *row*, naming the same open file
+    // descriptions. Before per-process rows existed there was nothing to do
+    // here and that was the bug: parent and child shared one flat table, so a
+    // child that closed fd 1 to redirect its own output closed the parent's
+    // too. Done before the task is published — a child that runs with an empty
+    // row cannot open anything and does not say why.
+    crate::fd::inherit_fds(parent_slot, slot);
+
     let Some(entry_fn) = proc_entry_for(slot) else {
         take_proc_slot(slot);
         return errno::ENOMEM;
@@ -2863,6 +2871,12 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
     }
 
     let root = proc.space.root();
+    // A spawned process starts with an empty descriptor row: its stdio is the
+    // pipes above, addressed by number, and it inherits nothing else. The
+    // reset is defensive rather than expected — `close_owned_by` clears the row
+    // at exit — but a slot whose previous occupant died without running that
+    // would otherwise hand this process working descriptors it never opened.
+    crate::fd::close_owned_by(slot);
     // SAFETY: raw-pointer write; single core, slot was just found free.
     unsafe {
         let procs = &raw mut PROCS;

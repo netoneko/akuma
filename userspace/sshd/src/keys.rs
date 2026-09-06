@@ -133,19 +133,70 @@ pub async fn load_or_generate_host_key() -> SigningKey {
     key
 }
 
-/// Load authorized keys from the filesystem
+/// Load authorized keys from the filesystem.
+///
+/// **Every way this can come back empty is logged**, because an empty list is
+/// indistinguishable from a correct one at the protocol level: sshd answers the
+/// banner, completes the key exchange, and then refuses every key that is
+/// offered. `Permission denied (publickey)` from a plainly-working server is
+/// the *only* symptom, and it points at the client's key — which is the one
+/// thing that is fine.
+///
+/// That cost a bare-metal session on 2026-09-06: the box was locked out with a
+/// correct `authorized_keys` sitting on its root filesystem, and there was no
+/// way to tell "the file could not be read" from "the file held no usable key"
+/// without rebooting into the other operating system to look. The three cases
+/// below are now three different lines.
 pub async fn load_authorized_keys() -> Vec<VerifyingKey> {
     let mut keys = Vec::new();
 
-    if let Ok(data) = read_file_to_vec(AUTHORIZED_KEYS_PATH)
-        && let Ok(content) = core::str::from_utf8(&data)
-    {
-        for line in content.lines() {
-            if let Some(key) = parse_public_key_ssh(line) {
-                keys.push(key);
-            }
+    let Ok(data) = read_file_to_vec(AUTHORIZED_KEYS_PATH) else {
+        println(
+            "[SSH Keys] WARNING: cannot read /etc/sshd/authorized_keys -- \
+             every publickey auth will be refused",
+        );
+        return keys;
+    };
+    let Ok(content) = core::str::from_utf8(&data) else {
+        println(
+            "[SSH Keys] WARNING: /etc/sshd/authorized_keys is not UTF-8 -- \
+             every publickey auth will be refused",
+        );
+        return keys;
+    };
+
+    for line in content.lines() {
+        if let Some(key) = parse_public_key_ssh(line) {
+            keys.push(key);
         }
     }
+
+    if keys.is_empty() {
+        // Reached with a file that exists and has content: either it is empty
+        // of keys, or every line is a type this server cannot parse. Ed25519
+        // is the only one it accepts, and an `ssh-rsa` line reads as perfectly
+        // valid to anyone looking at the file.
+        println(
+            "[SSH Keys] WARNING: /etc/sshd/authorized_keys has no usable key \
+             (ed25519 only) -- every publickey auth will be refused",
+        );
+    }
+
+    // The count, unconditionally, and on the console rather than only in a
+    // failure branch. It is the one number that separates the two ways a
+    // publickey auth can be refused by a server that is otherwise working:
+    // *no keys were loaded* (this says 0, and the file or the path is the
+    // problem) versus *the key was loaded and the signature did not verify*
+    // (this says 1 or more, and the client or the crypto is). From outside,
+    // both are the identical `Permission denied (publickey)`.
+    //
+    // On the bare-metal box this line reaches the framebuffer, which is the
+    // only diagnostic still available once ssh itself is what is broken.
+    println(&alloc::format!(
+        "[SSH Keys] authorized_keys: {} bytes, {} usable key(s)",
+        data.len(),
+        keys.len()
+    ));
 
     keys
 }

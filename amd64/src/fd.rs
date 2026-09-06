@@ -31,16 +31,40 @@
 //! divergence, not an oversight, and the cost is that a file occupies its own
 //! size in kernel heap while open.
 //!
-//! # The table is global
+//! # Descriptors are per-process; descriptions are not
 //!
-//! One table, not one per process. That is wrong in the way that matters as soon
-//! as there is a `fork`, and right for now: this target runs one interactive
-//! program at a time, and the boot self-tests that run several processes
-//! concurrently use only the console descriptors, which are stateless.
+//! The table used to be one flat 64-entry array shared by every task, with an
+//! `owner` field on each entry and a sweep at exit to reclaim what a task had
+//! not closed. That was stated here as "right for now: this target runs one
+//! interactive program at a time" — which stopped being true the day it grew
+//! `fork`, and had three separate costs by 2026-09-06:
 //!
-//! When `Process` grows a descriptor table, this moves into it unchanged — the
-//! operations do not care where the array lives. Stated here so that move is a
-//! relocation rather than a rewrite.
+//! - **One budget for the machine.** `apk` installing 14 packages ran the
+//!   table dry on its own, and the next `apk` started from a full one.
+//! - **A `close` in a child reached into its parent.** Both named the same
+//!   array slot, so `sh -c 'prog > file'` could not work even in principle.
+//! - **Descriptor numbers were machine-wide.** A program's first `open`
+//!   returned whatever slot happened to be free.
+//!
+//! It is now the POSIX split, which fixes all three at once:
+//!
+//! - [`FDS`] is one **row per process** — `FDS[row][fd]` — so every process
+//!   has its own fd 3 and its own budget of [`MAX_FDS`].
+//! - [`FILES`] is the machine-wide table of open file **descriptions**: the
+//!   cursor, the cached contents, the socket or pipe identity. Reference
+//!   counted, because `dup` and `fork` add a *name* without adding a
+//!   description.
+//!
+//! `fork` copies a row and increments; `exit` drops a row and decrements; only
+//! the last name going away releases the description (and persists a written
+//! file). `close_owned_by` survives as the exit hook, but it is now a row
+//! release rather than a search for an owner.
+//!
+//! **Descriptors 0/1/2 are still answered by number, above this layer.** They
+//! are not in a row, which is why `dup2(fd, 1)` still has nowhere to land and
+//! `cmd | cmd` and `echo x > file` still fail. Making them real entries is the
+//! next step and is now a fill-in rather than a redesign: the rows already have
+//! the three slots, held at [`NO_FILE`].
 
 use akuma_exec_core::process::{FileDescriptor, KernelFile};
 use akuma_selftest::Suite;
@@ -84,6 +108,9 @@ pub mod errno {
     pub const EFAULT: u64 = (-14i64) as u64;
     pub const EINVAL: u64 = (-22i64) as u64;
     pub const EMFILE: u64 = (-24i64) as u64;
+    /// The machine, not this process, is out of open file descriptions.
+    /// Distinct from `EMFILE` on purpose — see `install`.
+    pub const ENFILE: u64 = (-23i64) as u64;
     pub const ENOTTY: u64 = (-25i64) as u64;
     pub const ENODEV: u64 = (-19i64) as u64;
     pub const ENOSYS: u64 = (-38i64) as u64;
@@ -115,24 +142,45 @@ pub mod errno {
 
 /// Descriptors 0, 1 and 2 are the console and are never in the table.
 pub const FIRST_FILE_FD: usize = 3;
-/// How many files may be open at once.
+/// How many descriptors **one process** may hold.
 ///
 /// A fixed array so the table allocates nothing; the *contents* are heap, but
 /// the bookkeeping is not.
 ///
-/// It was 16, on the reasoning that this is "more than a shell opens" and that
-/// a small table makes a leak show up as `EMFILE` quickly rather than as steady
-/// heap growth. Both halves are still true and the number was still wrong: a
-/// shell is not the only thing that runs here. `apk update` opens the package
-/// database, a repository index and a TLS connection per repository and gave up
-/// before reaching the network at all —
+/// It was 16, then 64, and both were one number for the whole machine. The
+/// history is worth keeping because each step was a real failure: 16 came from
+/// "more than a shell opens", and `apk update` — a package database, a
+/// repository index and a TLS connection per repository — gave up before
+/// reaching the network with
 ///
 ///     ERROR: Unable to open root: No file descriptors available
 ///
-/// — which reads like a permissions or path problem and is neither. 64 leaves
-/// room for a package manager with a handful of repositories and is still small
-/// enough that a descriptor leak announces itself in seconds.
-pub const MAX_OPEN: usize = 64;
+/// which reads like a permissions or path problem and is neither. 64 bought a
+/// package manager with a handful of repositories, and was still a *shared*
+/// budget: `apk` installing 14 packages ran it dry on its own, and a second
+/// `apk` in a fresh process started from a table the first had filled.
+///
+/// The budget is now per-process, so the number answers a different question —
+/// "how many descriptors may one program hold", not "how many may the machine".
+/// 256 is what a `rustc` on a real crate graph needs; `cargo` running four of
+/// them concurrently now costs 4 × its own budget rather than sharing one.
+pub const MAX_FDS: usize = 256;
+
+/// How many **open file descriptions** exist machine-wide.
+///
+/// The other half of the POSIX split: a descriptor is a per-process *name*, and
+/// what it names is one of these — the thing that carries the cursor, the
+/// cached contents and the socket or pipe identity. `dup` and `fork` make a
+/// second name for the same description, which is why this is reference
+/// counted and `MAX_FDS` is not.
+///
+/// Deliberately smaller than `MAX_FDS * PROC_SLOTS` (256 × 128 = 32768): that
+/// product is what the *names* can address, and sizing the descriptions to it
+/// would reserve for a machine where every process holds a full table at once.
+/// A description costs a `Vec` of the file's contents; 512 is the ceiling on
+/// concurrently-open *files*, and running into it is a real condition worth
+/// reporting rather than a limit worth pre-allocating past.
+const MAX_FILES: usize = 512;
 
 /// One entry: the tree's descriptor, plus this target's cached contents.
 ///
@@ -156,18 +204,22 @@ struct Entry {
     /// pass `false`. Only `getdents64` may read a directory descriptor;
     /// `read`/`write` on one report `EISDIR`/`EBADF` per POSIX.
     is_dir: bool,
-    /// The `PROCS` slot that held `current_proc_slot()` when this fd was
-    /// opened. The table is one flat array shared by every task on this
-    /// target (see the module header), so nothing closed a task's fds when it
-    /// exited — a real apk install opens more concurrent fds than a shell
-    /// ever did (its own directory-fd cache across a multi-package tar
-    /// extraction) and reliably ran the table to `EMFILE` by the middle of
-    /// installing 14 packages; the *next* `apk` invocation, in a fresh
-    /// process, then started from an already-full table because the first
-    /// process's fds were never reclaimed. [`close_owned_by`] is the fix:
-    /// called once at process exit, it does exactly what [`sys_close`] would
-    /// have done for each fd this task never closed itself.
-    owner: usize,
+    /// How many descriptors name this description.
+    ///
+    /// One at `open`. `dup` and `fork` add a name without adding a
+    /// description, so both increment; `close` decrements and only the
+    /// transition to zero runs [`release`] — which is what persists a written
+    /// file, closes a socket and frees a pipe.
+    ///
+    /// This field replaced an `owner: usize` (the `PROCS` slot that opened the
+    /// fd), which existed because the table used to be one flat array shared
+    /// by every task: nothing reclaimed a task's fds when it exited, and
+    /// `apk` installing 14 packages left the *next* `apk` starting from a
+    /// full table. Ownership is now expressed by which process's row holds the
+    /// name, so the sweep at exit is "clear this row" and the lifetime
+    /// question the `owner` field was answering badly is answered by this
+    /// count instead.
+    refs: u32,
 }
 
 /// Allocate a descriptor for an already-created socket.
@@ -177,31 +229,23 @@ struct Entry {
 /// same `akuma_net::socket` table. Sharing the table is what makes `read` and
 /// `write` work on a socket without the caller knowing.
 pub fn alloc_socket_fd(idx: usize) -> Option<u64> {
-    let mut table = TABLE.lock();
-    for (i, slot) in table.iter_mut().enumerate() {
-        if slot.is_none() {
-            *slot = Some(Entry {
-                desc: FileDescriptor::Socket(idx),
-                data: Vec::new(),
-                nonblocking: false,
-                is_dir: false,
-                owner: crate::usermode::current_proc_slot(),
-            });
-            return Some((i + FIRST_FILE_FD) as u64);
-        }
-    }
-    None
+    let fd = install(Entry {
+        desc: FileDescriptor::Socket(idx),
+        data: Vec::new(),
+        nonblocking: false,
+        is_dir: false,
+        refs: 1,
+    });
+    (!errno::is_err(fd)).then_some(fd)
 }
 
 /// The socket index behind `fd`, or `None` if it is not a socket.
 #[must_use]
 pub fn socket_index(fd: u64) -> Option<usize> {
-    let idx = fd.checked_sub(FIRST_FILE_FD as u64)?;
-    let table = TABLE.lock();
-    match table.get(idx as usize)? {
-        Some(Entry { desc: FileDescriptor::Socket(s), .. }) => Some(*s),
+    with_file(fd, |e| match e.desc {
+        FileDescriptor::Socket(s) => Some(s),
         _ => None,
-    }
+    })?
 }
 
 /// Give `pipe_id` a descriptor: `PipeRead` for a reader end, `PipeWrite` for a
@@ -213,40 +257,32 @@ pub fn alloc_pipe_fd(pipe_id: usize, is_write: bool) -> Option<u64> {
     } else {
         FileDescriptor::PipeRead(pipe_id as u32)
     };
-    let mut table = TABLE.lock();
-    for (i, slot) in table.iter_mut().enumerate() {
-        if slot.is_none() {
-            *slot = Some(Entry {
-                desc,
-                data: Vec::new(),
-                nonblocking: false,
-                is_dir: false,
-                owner: crate::usermode::current_proc_slot(),
-            });
-            return Some((i + FIRST_FILE_FD) as u64);
-        }
-    }
-    None
+    let fd = install(Entry {
+        desc,
+        data: Vec::new(),
+        nonblocking: false,
+        is_dir: false,
+        refs: 1,
+    });
+    (!errno::is_err(fd)).then_some(fd)
 }
 
 /// The pipe id behind `fd` if it is a `PipeRead` descriptor.
 #[must_use]
 pub fn pipe_read_id(fd: u64) -> Option<usize> {
-    let idx = fd.checked_sub(FIRST_FILE_FD as u64)?;
-    match TABLE.lock().get(idx as usize)? {
-        Some(Entry { desc: FileDescriptor::PipeRead(p), .. }) => Some(*p as usize),
+    with_file(fd, |e| match e.desc {
+        FileDescriptor::PipeRead(p) => Some(p as usize),
         _ => None,
-    }
+    })?
 }
 
 /// The pipe id behind `fd` if it is a `PipeWrite` descriptor.
 #[must_use]
 pub fn pipe_write_id(fd: u64) -> Option<usize> {
-    let idx = fd.checked_sub(FIRST_FILE_FD as u64)?;
-    match TABLE.lock().get(idx as usize)? {
-        Some(Entry { desc: FileDescriptor::PipeWrite(p), .. }) => Some(*p as usize),
+    with_file(fd, |e| match e.desc {
+        FileDescriptor::PipeWrite(p) => Some(p as usize),
         _ => None,
-    }
+    })?
 }
 
 /// Read from a pipe, honouring `nonblock`. A blocking read yields until data or
@@ -285,11 +321,7 @@ pub fn write_pipe(pipe_id: usize, buf: u64, len: usize, nonblock: bool) -> u64 {
 /// Is `fd` marked `O_NONBLOCK`? `false` for anything not in the table.
 #[must_use]
 pub fn is_nonblocking(fd: u64) -> bool {
-    let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
-        return false;
-    };
-    let table = TABLE.lock();
-    matches!(table.get(idx as usize), Some(Some(e)) if e.nonblocking)
+    with_file(fd, |e| e.nonblocking).unwrap_or(false)
 }
 
 /// `fcntl(fd, cmd, arg)`. Only the two flag commands are implemented, and
@@ -302,14 +334,7 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     const F_GETFD: u64 = 1;
     const O_NONBLOCK: u64 = 0x800;
 
-    let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
-        return errno::EBADF;
-    };
-    let mut table = TABLE.lock();
-    let Some(Some(entry)) = table.get_mut(idx as usize) else {
-        return errno::EBADF;
-    };
-    match cmd {
+    with_file(fd, |entry| match cmd {
         F_SETFL => {
             entry.nonblocking = arg & O_NONBLOCK != 0;
             0
@@ -321,12 +346,19 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                 0
             }
         }
-        // FD_CLOEXEC is meaningless without exec; accept and ignore so a caller
-        // that sets it on every fd does not fail.
+        // **`FD_CLOEXEC` is accepted and ignored — a pinned divergence.** It
+        // used to be "meaningless without exec", and that stopped being true
+        // when this target grew a real `execve`: a descriptor a caller marked
+        // close-on-exec now survives one. Nothing here has been bitten by it
+        // yet because the flag is set defensively far more often than it is
+        // relied on, and the honest fix is a per-descriptor flag word in the
+        // row next to the `FileIdx` — cheap, but it belongs with the work that
+        // makes 0/1/2 real entries rather than bolted on ahead of it.
         F_SETFD => 0,
         F_GETFD => 0,
         _ => errno::EINVAL,
-    }
+    })
+    .unwrap_or(errno::EBADF)
 }
 
 /// Copy `len` bytes in from a user pointer. Public for `sock`.
@@ -360,8 +392,171 @@ impl Entry {
     }
 }
 
-static TABLE: Spinlock<[Option<Entry>; MAX_OPEN]> =
-    Spinlock::new([const { None }; MAX_OPEN]);
+/// The machine-wide table of open file **descriptions**.
+///
+/// One entry per `open`/`socket`/`pipe`, not per descriptor. Nothing outside
+/// this module indexes it: a description is reached only by resolving a
+/// descriptor through [`FDS`].
+static FILES: Spinlock<[Option<Entry>; MAX_FILES]> =
+    Spinlock::new([const { None }; MAX_FILES]);
+
+/// An index into [`FILES`], or [`NO_FILE`] for a closed descriptor.
+type FileIdx = u16;
+const NO_FILE: FileIdx = FileIdx::MAX;
+
+/// One row per `PROCS` slot, plus one on the end for the kernel.
+///
+/// The kernel row is not a courtesy: the boot self-tests open files, and
+/// `current_proc_slot()` answers `usize::MAX` when no user task is running.
+/// Folding that onto row 0 would have the suite share a table with pid 1.
+const KERNEL_ROW: usize = crate::usermode::PROC_SLOTS;
+const FD_ROWS: usize = crate::usermode::PROC_SLOTS + 1;
+
+/// Per-process descriptor tables: `FDS[row][fd]` is the description `fd` names.
+///
+/// Indexed by descriptor *number*, so `FDS[row][7]` is that process's fd 7 and
+/// every process's fd 3 is its own. Entries below [`FIRST_FILE_FD`] are always
+/// [`NO_FILE`] — 0/1/2 are still answered by number above this layer, which is
+/// why `dup2` onto them cannot work yet (see the module header).
+///
+/// 129 rows × 256 × 2 bytes = 64 KiB of `.bss`, allocated once and never grown.
+/// A row of `u16` rather than a row of descriptions is the whole point: `fork`
+/// gives the child its own *names* for its parent's *descriptions*, which is a
+/// 512-byte copy and 256 increments, not a copy of any file's contents.
+static FDS: Spinlock<[[FileIdx; MAX_FDS]; FD_ROWS]> =
+    Spinlock::new([[NO_FILE; MAX_FDS]; FD_ROWS]);
+
+/// Which row the calling context's descriptors live in.
+fn current_row() -> usize {
+    let slot = crate::usermode::current_proc_slot();
+    if slot < crate::usermode::PROC_SLOTS { slot } else { KERNEL_ROW }
+}
+
+/// The description `fd` names in the calling process, or `None` if it names
+/// nothing — a closed descriptor, one out of range, or a console descriptor.
+fn file_index(fd: u64) -> Option<usize> {
+    let fd = usize::try_from(fd).ok()?;
+    if !(FIRST_FILE_FD..MAX_FDS).contains(&fd) {
+        return None;
+    }
+    let idx = FDS.lock()[current_row()][fd];
+    (idx != NO_FILE).then_some(idx as usize)
+}
+
+/// Borrow the description `fd` names, for the duration of `f`.
+///
+/// The two locks are taken one at a time and are **never nested**: [`FILES`]
+/// and [`FDS`] have no ordering between them today and must not acquire one.
+/// Resolving the name and then operating on the description is two separate
+/// holds, which is safe here for the same reason the rest of this target is —
+/// one core, under the BKL — and would need a real hold across both the day
+/// `fork` runs at SMP > 1.
+fn with_file<R>(fd: u64, f: impl FnOnce(&mut Entry) -> R) -> Option<R> {
+    let fi = file_index(fd)?;
+    FILES.lock()[fi].as_mut().map(f)
+}
+
+/// Put `entry` in the description table with one reference.
+fn intern(entry: Entry) -> Option<usize> {
+    let mut files = FILES.lock();
+    for (i, slot) in files.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(entry);
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Name the description `fi` with the lowest free descriptor in `row`.
+///
+/// "Lowest free" is not an aesthetic choice: `sh` closes fd 1 and expects the
+/// next `open`/`dup` to land on 1, and every shell redirection in existence
+/// depends on it.
+fn bind(row: usize, fi: usize) -> Option<u64> {
+    let mut fds = FDS.lock();
+    let row = &mut fds[row];
+    for (fd, slot) in row.iter_mut().enumerate().skip(FIRST_FILE_FD) {
+        if *slot == NO_FILE {
+            *slot = fi as FileIdx;
+            return Some(fd as u64);
+        }
+    }
+    None
+}
+
+/// Intern `entry` and give the calling process a descriptor for it.
+///
+/// The two exhaustion cases are different errnos and are worth keeping apart:
+/// `EMFILE` is *this process* out of descriptor numbers, `ENFILE` is the
+/// machine out of open file descriptions. Reporting the second as the first
+/// sends whoever reads it looking for a leak in the wrong program.
+fn install(entry: Entry) -> u64 {
+    let Some(fi) = intern(entry) else {
+        return errno::ENFILE;
+    };
+    let Some(fd) = bind(current_row(), fi) else {
+        // Un-intern rather than leak: the description has no name and so no
+        // `close` will ever reach it.
+        FILES.lock()[fi] = None;
+        return errno::EMFILE;
+    };
+    fd
+}
+
+/// Drop one reference to description `fi`, releasing it if that was the last.
+///
+/// The description is taken out from under the lock before [`release`] runs:
+/// releasing reaches into `akuma_net` and `crate::pipe` and writes a file back
+/// to disk, and holding the description table across any of those is how a
+/// lock inversion starts.
+fn unref(fi: usize) {
+    let taken = {
+        let mut files = FILES.lock();
+        let Some(entry) = files[fi].as_mut() else {
+            return;
+        };
+        entry.refs = entry.refs.saturating_sub(1);
+        if entry.refs > 0 {
+            return;
+        }
+        files[fi].take()
+    };
+    if let Some(entry) = taken {
+        release(entry);
+    }
+}
+
+/// Give `child_slot` its own names for every description `parent_slot` holds.
+///
+/// This is `fork`'s half of the descriptor table. The child gets an
+/// independent *row* — so a `close` in the child no longer reaches into the
+/// parent, which is what the single shared table did and what made
+/// `sh -c 'prog > file'` unsurvivable — while both rows name the same
+/// descriptions, so the cursor and the socket really are shared, as POSIX
+/// requires.
+pub fn inherit_fds(parent_slot: usize, child_slot: usize) {
+    if parent_slot >= FD_ROWS || child_slot >= FD_ROWS {
+        return;
+    }
+    // Drop whatever the child's row held first. It should hold nothing — the
+    // slot was found free — but overwriting a stale row would strand every
+    // reference in it, and a description no `close` can reach is a leak the
+    // machine never recovers from.
+    close_owned_by(child_slot);
+    let inherited = {
+        let mut fds = FDS.lock();
+        let row = fds[parent_slot];
+        fds[child_slot] = row;
+        row
+    };
+    let mut files = FILES.lock();
+    for fi in inherited.iter().filter(|&&fi| fi != NO_FILE) {
+        if let Some(entry) = files[*fi as usize].as_mut() {
+            entry.refs = entry.refs.saturating_add(1);
+        }
+    }
+}
 
 /// Largest single `read`/`write` this kernel will accept.
 ///
@@ -431,20 +626,19 @@ fn resolve_at(dirfd: u64, path: alloc::string::String) -> Result<alloc::string::
         p.push_str(&path);
         return Ok(p);
     }
-    let Some(idx) = dirfd.checked_sub(FIRST_FILE_FD as u64) else {
+    let base = with_file(dirfd, |entry| {
+        if !entry.is_dir {
+            return None;
+        }
+        match &entry.desc {
+            FileDescriptor::File(f) => Some(f.path.clone()),
+            _ => None,
+        }
+    })
+    .flatten();
+    let Some(mut joined) = base else {
         return Err(errno::ENOTDIR);
     };
-    let table = TABLE.lock();
-    let Some(Some(entry)) = table.get(idx as usize) else {
-        return Err(errno::ENOTDIR);
-    };
-    if !entry.is_dir {
-        return Err(errno::ENOTDIR);
-    }
-    let Some(FileDescriptor::File(f)) = Some(&entry.desc) else {
-        return Err(errno::ENOTDIR);
-    };
-    let mut joined = f.path.clone();
     if !joined.ends_with('/') {
         joined.push('/');
     }
@@ -546,23 +740,15 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
         }
     };
 
-    let mut table = TABLE.lock();
-    for (i, slot) in table.iter_mut().enumerate() {
-        if slot.is_none() {
-            // `KernelFile::new` leaves the inode 0 — "read by path", which is
-            // what this target does.
-            let desc = FileDescriptor::File(KernelFile::new(normalised, flags_ as u32));
-            *slot = Some(Entry {
-                desc,
-                data,
-                nonblocking: false,
-                is_dir,
-                owner: crate::usermode::current_proc_slot(),
-            });
-            return (i + FIRST_FILE_FD) as u64;
-        }
-    }
-    errno::EMFILE
+    // `KernelFile::new` leaves the inode 0 — "read by path", which is what
+    // this target does.
+    install(Entry {
+        desc: FileDescriptor::File(KernelFile::new(normalised, flags_ as u32)),
+        data,
+        nonblocking: false,
+        is_dir,
+        refs: 1,
+    })
 }
 
 /// `O_CREAT`, `O_WRONLY`, `O_RDWR`, `O_TRUNC` — the bits [`sys_openat`] and
@@ -654,15 +840,14 @@ pub fn sys_renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: u64) ->
 /// Static name for a VFS error, for console reporting (no allocation).
 #[must_use]
 fn fd_path_debug(fd: u64) -> alloc::string::String {
-    let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
+    if fd < FIRST_FILE_FD as u64 {
         return alloc::format!("<console {fd}>");
-    };
-    let table = TABLE.lock();
-    match table.get(idx as usize) {
-        Some(Some(Entry { desc: FileDescriptor::File(f), .. })) => f.path.clone(),
-        Some(Some(_)) => alloc::format!("<non-file {fd}>"),
-        _ => alloc::format!("<free {fd}>"),
     }
+    with_file(fd, |entry| match &entry.desc {
+        FileDescriptor::File(f) => f.path.clone(),
+        _ => alloc::format!("<non-file {fd}>"),
+    })
+    .unwrap_or_else(|| alloc::format!("<free {fd}>"))
 }
 
 /// Static name for a VFS error, for console reporting (no allocation).
@@ -792,32 +977,27 @@ pub fn sys_utimensat(dirfd: u64, path: u64, times: u64, _flags: u64) -> u64 {
 /// apk gave up and reported `UNTRUSTED signature` over a fetch that was in
 /// fact fine). Same bug, different syscall number.
 ///
-/// **Divergence, pinned:** the copy is a *value* copy. The two descriptors
-/// share nothing — an independent cursor, an independent cached-contents
-/// buffer — and `close` on either releases the underlying socket or pipe
-/// outright, where Linux refcounts. That is wrong for shared-offset semantics
-/// and for closing one of two dups of a socket, and right for the hold-a-
-/// reference-across-a-close shape apk actually uses. Revisit when a caller
-/// needs the real thing.
+/// **The pinned "value copy" divergence is gone.** This used to clone the
+/// whole entry, so the two descriptors shared nothing — separate cursors,
+/// separate cached contents, and a `close` on either releasing the underlying
+/// socket or pipe outright. It was right for the one shape apk uses (hold a
+/// reference across a close) and wrong for everything else. Now that a
+/// descriptor is a *name* and the description is refcounted, `dup` is the real
+/// thing: one more name for one description, a shared cursor, and a release
+/// only when the last name goes.
 pub fn sys_dup(fd: u64) -> u64 {
-    let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
+    let Some(fi) = file_index(fd) else {
         return errno::EBADF;
     };
-    let cloned = {
-        let table = TABLE.lock();
-        match table.get(idx as usize) {
-            Some(Some(entry)) => entry.clone(),
-            _ => return errno::EBADF,
-        }
+    let Some(newfd) = bind(current_row(), fi) else {
+        return errno::EMFILE;
     };
-    let mut table = TABLE.lock();
-    for (i, slot) in table.iter_mut().enumerate() {
-        if slot.is_none() {
-            *slot = Some(cloned);
-            return (i + FIRST_FILE_FD) as u64;
-        }
+    // Bumped only once the new name exists: an increment before a failed
+    // `bind` would strand the description at a count no `close` can reach.
+    if let Some(entry) = FILES.lock()[fi].as_mut() {
+        entry.refs = entry.refs.saturating_add(1);
     }
-    errno::EMFILE
+    newfd
 }
 
 /// `close(fd)`. Closing a console descriptor succeeds and does nothing — a
@@ -826,31 +1006,43 @@ pub fn sys_close(fd: u64) -> u64 {
     if fd < FIRST_FILE_FD as u64 {
         return 0;
     }
-    let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
+    // Unbind the *name* first, then drop the reference. Only the last name
+    // going away releases the description, which is why `close` on one of two
+    // dups no longer tears the socket down under the other one.
+    let Some(fd_idx) = usize::try_from(fd).ok().filter(|f| *f < MAX_FDS) else {
         return errno::EBADF;
     };
-    // Take the entry out under the lock, then release the socket outside it:
-    // `remove_socket` reaches into the network stack, and holding the
-    // descriptor table across that is how a lock inversion starts.
-    let taken = {
-        let mut table = TABLE.lock();
-        match table.get_mut(idx as usize) {
-            Some(slot) if slot.is_some() => slot.take(),
-            _ => return errno::EBADF,
+    let fi = {
+        let mut fds = FDS.lock();
+        let slot = &mut fds[current_row()][fd_idx];
+        if *slot == NO_FILE {
+            return errno::EBADF;
         }
+        core::mem::replace(slot, NO_FILE)
     };
-    match taken {
-        Some(Entry { desc: FileDescriptor::Socket(s), .. }) => crate::sock::close(s),
+    unref(fi as usize);
+    0
+}
+
+/// Tear down an open file description whose last descriptor has gone.
+///
+/// Called only from [`unref`], which has already taken the entry out of
+/// [`FILES`]: releasing reaches into the network stack, the pipe table and the
+/// filesystem, and holding the description table across any of those is how a
+/// lock inversion starts.
+fn release(entry: Entry) {
+    match entry {
+        Entry { desc: FileDescriptor::Socket(s), .. } => crate::sock::close(s),
         // Closing the write end (the `/proc/<pid>/fd/0` handle) signals EOF to
         // the child but does not free the pipe — the child may still be draining
         // buffered input.
-        Some(Entry { desc: FileDescriptor::PipeWrite(p), .. }) => {
+        Entry { desc: FileDescriptor::PipeWrite(p), .. } => {
             crate::pipe::close_write(p as usize);
         }
         // Closing the read end (`sshd`'s stdout reader) is the last reference to
         // a spawned child's stdout pipe — `waitpid` deliberately left it alive
         // for this final drain. Free the slot now.
-        Some(Entry { desc: FileDescriptor::PipeRead(p), .. }) => {
+        Entry { desc: FileDescriptor::PipeRead(p), .. } => {
             crate::pipe::free(p as usize);
         }
         // A file opened for writing: this is the one and only point its
@@ -860,7 +1052,7 @@ pub fn sys_close(fd: u64) -> u64 {
         // Read-only opens skip this: writing back an unmodified `read_file`
         // copy on every `close` would be a silent no-op turned into needless
         // disk I/O.
-        Some(Entry { desc: FileDescriptor::File(file), data, is_dir: false, .. })
+        Entry { desc: FileDescriptor::File(file), data, is_dir: false, .. }
             if file.flags & open_flags::O_ACCMODE != 0 =>
         {
             // A failed persist is REPORTED, not discarded: this is the whole
@@ -880,37 +1072,37 @@ pub fn sys_close(fd: u64) -> u64 {
         }
         _ => {}
     }
-    0
 }
 
-/// Close every fd `proc_slot` still holds. Real Linux does this implicitly at
-/// `exit`/`exit_group`; this target's fd table is one array shared by every
-/// task (see the module header), and nothing swept it on task exit until now
-/// — a leak that stayed invisible through every earlier self-test (each opens
-/// a handful of fds and closes them itself) and only showed up 2026-09-04
-/// running `apk` twice in a row: the second invocation started from a table
-/// the first had already filled and failed at the database write with
-/// `EMFILE` before doing any real work. Called once, from `run_process`,
-/// right after a task's last `enter_user_mode` returns.
+/// Drop every descriptor `proc_slot` still holds. Real Linux does this
+/// implicitly at `exit`/`exit_group`.
 ///
-/// Collects the fds under the lock, then closes each through [`sys_close`]
-/// afterward — closing a socket calls into `akuma_net`, and nothing here
-/// should hold `TABLE`'s lock across that (the same reason [`sys_close`]
-/// itself takes the entry out before matching on it).
+/// It exists because the fd table used to be one array shared by every task
+/// and nothing swept it on exit — a leak that stayed invisible through every
+/// self-test (each opens a handful of fds and closes them itself) and only
+/// showed up 2026-09-04 running `apk` twice in a row: the second invocation
+/// started from a table the first had already filled and failed at the
+/// database write with `EMFILE` before doing any real work. With per-process
+/// rows the leak is gone by construction, and this is now what it always
+/// should have been — the row is released, not searched. Called once, from
+/// `run_process`, right after a task's last `enter_user_mode` returns.
+///
+/// **A row is dropped, not each fd closed.** Descriptions this row shares with
+/// a live process (through `fork` or `dup`) survive: only the reference goes.
 pub fn close_owned_by(proc_slot: usize) {
-    let fds: Vec<u64> = {
-        let table = TABLE.lock();
-        table
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| match slot {
-                Some(e) if e.owner == proc_slot => Some((i + FIRST_FILE_FD) as u64),
-                _ => None,
-            })
-            .collect()
+    if proc_slot >= FD_ROWS {
+        return;
+    }
+    // Clear the whole row in one hold, then drop the references outside it.
+    // Going through `sys_close` per fd is no longer possible and no longer
+    // wanted: it resolves against the *calling* row, and this runs after the
+    // task it is cleaning up has stopped being the current one.
+    let row = {
+        let mut fds = FDS.lock();
+        core::mem::replace(&mut fds[proc_slot], [NO_FILE; MAX_FDS])
     };
-    for fd in fds {
-        sys_close(fd);
+    for fi in row.iter().filter(|&&fi| fi != NO_FILE) {
+        unref(*fi as usize);
     }
 }
 
@@ -962,26 +1154,24 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         return read_pipe(pid, buf, len as usize, is_nonblocking(fd));
     }
 
-    let idx = fd - FIRST_FILE_FD as u64;
-    let mut table = TABLE.lock();
-    let Some(Some(entry)) = table.get_mut(idx as usize) else {
-        return errno::EBADF;
-    };
-    if entry.is_dir {
-        return errno::EISDIR;
-    }
-    let total = entry.data.len();
-    let Some(file) = entry.file() else {
-        return errno::EBADF;
-    };
-    let pos = file.position;
-    let n = total.saturating_sub(pos).min(len as usize);
-    if n == 0 {
-        return 0;
-    }
-    file.position = pos + n;
-    let chunk = &entry.data[pos..pos + n];
-    copy_to_user(buf, chunk)
+    with_file(fd, |entry| {
+        if entry.is_dir {
+            return errno::EISDIR;
+        }
+        let total = entry.data.len();
+        let Some(file) = entry.file() else {
+            return errno::EBADF;
+        };
+        let pos = file.position;
+        let n = total.saturating_sub(pos).min(len as usize);
+        if n == 0 {
+            return 0;
+        }
+        file.position = pos + n;
+        let chunk = &entry.data[pos..pos + n];
+        copy_to_user(buf, chunk)
+    })
+    .unwrap_or(errno::EBADF)
 }
 
 /// `write(fd, buf, len)` on a real file descriptor — everything `sys_write` in
@@ -1006,42 +1196,43 @@ pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
     // reported as `updating and opening ...: Invalid argument` and killed
     // every fetch, 2026-09-04.
 
-    let idx = fd - FIRST_FILE_FD as u64;
     let mut written: usize = 0;
     while written < len as usize {
         let chunk_len = ((len as usize) - written).min(MAX_IO as usize);
-        // Copied in before the lock: there is no reason to hold `TABLE`
+        // Copied in before the lock: there is no reason to hold `FILES`
         // across a user copy.
         let Some(incoming) = copy_in(buf + written as u64, chunk_len as u64) else {
             return if written == 0 { errno::EFAULT } else { written as u64 };
         };
-        let mut table = TABLE.lock();
-        let Some(Some(entry)) = table.get_mut(idx as usize) else {
-            return errno::EBADF;
-        };
-        if entry.is_dir {
-            return errno::EISDIR;
+        let step = with_file(fd, |entry| {
+            if entry.is_dir {
+                return Err(errno::EISDIR);
+            }
+            // The position read and the write-permission check both come from
+            // `entry.desc`, borrowed immutably first so the mutable borrow of
+            // `entry.data` just below is not fighting a live borrow of a
+            // sibling field through the same `&mut Entry` — `entry.file()`
+            // would hold that borrow for the rest of the closure if used here.
+            let pos = match &entry.desc {
+                FileDescriptor::File(f) if f.flags & open_flags::O_ACCMODE != 0 => f.position,
+                FileDescriptor::File(_) => return Err(errno::EBADF), // opened read-only
+                _ => return Err(errno::EBADF),
+            };
+            let end = pos + incoming.len();
+            if entry.data.len() < end {
+                entry.data.resize(end, 0);
+            }
+            entry.data[pos..end].copy_from_slice(&incoming);
+            if let FileDescriptor::File(f) = &mut entry.desc {
+                f.position = end;
+            }
+            Ok(incoming.len())
+        });
+        match step {
+            Some(Ok(n)) => written += n,
+            Some(Err(e)) => return e,
+            None => return errno::EBADF,
         }
-        // The position read and the write-permission check both come from
-        // `entry.desc`, borrowed immutably first so the mutable borrow of
-        // `entry.data` just below is not fighting a live borrow of a sibling
-        // field through the same `&mut Entry` — `entry.file()` would hold that
-        // borrow for the rest of the function if used here instead.
-        let pos = match &entry.desc {
-            FileDescriptor::File(f) if f.flags & open_flags::O_ACCMODE != 0 => f.position,
-            FileDescriptor::File(_) => return errno::EBADF, // opened read-only
-            _ => return errno::EBADF,
-        };
-        let end = pos + incoming.len();
-        if entry.data.len() < end {
-            entry.data.resize(end, 0);
-        }
-        entry.data[pos..end].copy_from_slice(&incoming);
-        if let FileDescriptor::File(f) = &mut entry.desc {
-            f.position = end;
-        }
-        drop(table);
-        written += incoming.len();
     }
     len
 }
@@ -1157,9 +1348,11 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     if fd < FIRST_FILE_FD as u64 {
         return errno::EBADF;
     }
-    let idx = fd - FIRST_FILE_FD as u64;
-    let mut table = TABLE.lock();
-    let Some(Some(entry)) = table.get_mut(idx as usize) else {
+    let Some(fi) = file_index(fd) else {
+        return errno::EBADF;
+    };
+    let mut files = FILES.lock();
+    let Some(entry) = files[fi].as_mut() else {
         return errno::EBADF;
     };
     let total = entry.data.len();
@@ -1203,21 +1396,21 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
 /// reports no real inode number through `getdents64` either, and nothing seeks
 /// a directory by `d_off`.
 ///
-/// Three separate `TABLE` locks rather than one held across the call: the
+/// Three separate `FILES` locks rather than one held across the call: the
 /// cache-miss path calls `fs::read_dir`, which takes the *other* lock
 /// (`fs::ROOT`), and nothing else in this module nests the two — see
-/// [`sys_openat`], which reads the file before ever touching `TABLE`.
+/// [`sys_openat`], which reads the file before ever touching `FILES`.
 pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
     if count == 0 {
         return 0;
     }
-    let Some(idx) = fd.checked_sub(FIRST_FILE_FD as u64) else {
-        return errno::ENOTDIR;
+    let Some(fi) = file_index(fd) else {
+        return errno::EBADF;
     };
 
     let (path, cached) = {
-        let mut table = TABLE.lock();
-        let Some(Some(entry)) = table.get_mut(idx as usize) else {
+        let mut files = FILES.lock();
+        let Some(entry) = files[fi].as_mut() else {
             return errno::EBADF;
         };
         if !entry.is_dir {
@@ -1248,8 +1441,8 @@ pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
                 },
             })
             .collect();
-        let mut table = TABLE.lock();
-        if let Some(Some(entry)) = table.get_mut(idx as usize)
+        let mut files = FILES.lock();
+        if let Some(entry) = files[fi].as_mut()
             && let Some(file) = entry.file()
         {
             file.dir_cache = Some(cache.clone());
@@ -1257,8 +1450,8 @@ pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
         cache
     };
 
-    let mut table = TABLE.lock();
-    let Some(Some(entry)) = table.get_mut(idx as usize) else {
+    let mut files = FILES.lock();
+    let Some(entry) = files[fi].as_mut() else {
         return errno::EBADF;
     };
     let Some(file) = entry.file() else {
@@ -1293,7 +1486,9 @@ pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
         consumed += 1;
     }
     file.position += consumed;
-    drop(table);
+    // Released before the user copy: `copy_to_user` can fault, and the fault
+    // handler has no business finding `FILES` held.
+    drop(files);
 
     if written > 0 {
         let r = copy_to_user(dirp, &kernel_buf[..written]);
@@ -1366,16 +1561,16 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     let (mode, size, nlink) = if fd < FIRST_FILE_FD as u64 {
         (S_IFCHR_0620, 0u64, 1u64)
     } else {
-        let idx = fd - FIRST_FILE_FD as u64;
-        let table = TABLE.lock();
-        let Some(Some(entry)) = table.get(idx as usize) else {
+        let Some(triple) = with_file(fd, |entry| {
+            if entry.is_dir {
+                (S_IFDIR_0755, 0u64, 2u64)
+            } else {
+                (S_IFREG_0644, entry.data.len() as u64, 1u64)
+            }
+        }) else {
             return errno::EBADF;
         };
-        if entry.is_dir {
-            (S_IFDIR_0755, 0u64, 2u64)
-        } else {
-            (S_IFREG_0644, entry.data.len() as u64, 1u64)
-        }
+        triple
     };
     let st = encode_stat(mode, size, 0, nlink, None, None, None);
     if errno::is_err(copy_to_user(statbuf, &st)) {
@@ -1459,15 +1654,13 @@ pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
     let path = if fd < FIRST_FILE_FD as u64 {
         alloc::string::String::from("/")
     } else {
-        let idx = fd - FIRST_FILE_FD as u64;
-        let table = TABLE.lock();
-        let Some(Some(entry)) = table.get(idx as usize) else {
-            return errno::EBADF;
-        };
-        match &entry.desc {
+        let Some(path) = with_file(fd, |entry| match &entry.desc {
             FileDescriptor::File(f) => f.path.clone(),
             _ => alloc::string::String::from("/"),
-        }
+        }) else {
+            return errno::EBADF;
+        };
+        path
     };
     statfs_into(&path, buf)
 }
@@ -1791,10 +1984,7 @@ fn poll_ready(fd: u64) -> (bool, bool) {    if fd == 0 {
         return akuma_net::socket::socket_tcp_ready(idx);
     }
     // A regular file: always ready, per POSIX.
-    let in_table = {
-        let idx = fd.wrapping_sub(FIRST_FILE_FD as u64) as usize;
-        matches!(TABLE.lock().get(idx), Some(Some(_)))
-    };
+    let in_table = file_index(fd).is_some();
     (in_table, in_table)
 }
 
@@ -1930,20 +2120,13 @@ fn install_synthetic_dir(path: &str, names: Vec<(alloc::string::String, u8)>, fl
             .map(|(name, d_type)| akuma_exec_core::process::DirCacheEntry { name, d_type })
             .collect(),
     );
-    let mut table = TABLE.lock();
-    for (i, slot) in table.iter_mut().enumerate() {
-        if slot.is_none() {
-            *slot = Some(Entry {
-                desc: FileDescriptor::File(file),
-                data: Vec::new(),
-                nonblocking: false,
-                is_dir: true,
-                owner: crate::usermode::current_proc_slot(),
-            });
-            return (i + FIRST_FILE_FD) as u64;
-        }
-    }
-    errno::EMFILE
+    install(Entry {
+        desc: FileDescriptor::File(file),
+        data: Vec::new(),
+        nonblocking: false,
+        is_dir: true,
+        refs: 1,
+    })
 }
 
 /// DT_DIR / DT_REG, as `getdents64` spells them.
@@ -2190,23 +2373,16 @@ fn open_proc(rest: &str, flags: u64) -> Option<u64> {
 /// `/proc/net/dev`). Reads serve from `Entry::data` exactly as a cached real
 /// file does.
 fn install_synthetic_file(path: &str, data: Vec<u8>, flags: u64) -> u64 {
-    let mut table = TABLE.lock();
-    for (i, slot) in table.iter_mut().enumerate() {
-        if slot.is_none() {
-            *slot = Some(Entry {
-                desc: FileDescriptor::File(KernelFile::new(
-                    alloc::string::String::from(path),
-                    flags as u32,
-                )),
-                data,
-                nonblocking: false,
-                is_dir: false,
-                owner: crate::usermode::current_proc_slot(),
-            });
-            return (i + FIRST_FILE_FD) as u64;
-        }
-    }
-    errno::EMFILE
+    install(Entry {
+        desc: FileDescriptor::File(KernelFile::new(
+            alloc::string::String::from(path),
+            flags as u32,
+        )),
+        data,
+        nonblocking: false,
+        is_dir: false,
+        refs: 1,
+    })
 }
 
 /// The two synthetic interfaces `ifconfig` sees: `lo` and the live smoltcp
@@ -2596,26 +2772,75 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     );
     sys_close(rofd);
 
-    // Fill the table, then check the next open is refused rather than
-    // overwriting a live descriptor.
+    // `dup` is a second *name*, not a second description. Both halves matter
+    // and only the second one is new: closing one of two dups used to release
+    // the description outright, so the survivor read `EBADF` on a descriptor
+    // that was still open. That was pinned as a divergence for as long as the
+    // table stored descriptions directly.
+    {
+        let a = sys_openat(0, path.as_ptr() as u64, 0, 0);
+        let b = sys_dup(a);
+        t.check("fd: dup returns a new descriptor", b != a && !errno::is_err(b));
+        let mut one = [0u8; 16];
+        t.check_eq(
+            "fd: reading through a dup advances the shared cursor",
+            sys_read(a, one.as_mut_ptr() as u64, 8),
+            8,
+        );
+        t.check_eq("fd: the dup sees the advanced cursor", sys_lseek(b, 0, 1), 8);
+        sys_close(a);
+        // The description is still named by `b`, so it must still be readable.
+        t.check_eq(
+            "fd: closing one dup leaves the other open",
+            sys_read(b, one.as_mut_ptr() as u64, 8),
+            8,
+        );
+        sys_close(b);
+        t.check_eq(
+            "fd: closing the last dup releases it",
+            sys_read(b, one.as_mut_ptr() as u64, 8),
+            errno::EBADF,
+        );
+    }
+
+    // Fill this row's descriptors, then check the next open is refused rather
+    // than overwriting a live one. The budget is per-process now, so the
+    // ceiling is this row's descriptor count — not, as it was until
+    // 2026-09-06, one number shared by every task on the machine.
+    const ROW_CAPACITY: usize = MAX_FDS - FIRST_FILE_FD;
     let mut opened = Vec::new();
     loop {
         let fd = sys_openat(0, path.as_ptr() as u64, 0, 0);
-        if fd >= FIRST_FILE_FD as u64 && fd < (FIRST_FILE_FD + MAX_OPEN) as u64 {
+        if fd >= FIRST_FILE_FD as u64 && fd < MAX_FDS as u64 {
             opened.push(fd);
         } else {
             t.check_eq("fd: a full table is EMFILE", fd, errno::EMFILE);
             break;
         }
-        if opened.len() > MAX_OPEN {
+        if opened.len() > ROW_CAPACITY {
             t.check("fd: the table has a bound", false);
             break;
         }
     }
-    t.check_eq("fd: the table held exactly MAX_OPEN files", opened.len() as u64, MAX_OPEN as u64);
+    t.check_eq(
+        "fd: the row held exactly its capacity",
+        opened.len() as u64,
+        ROW_CAPACITY as u64,
+    );
     for fd in opened {
         sys_close(fd);
     }
+
+    // And it is empty again afterwards: a row that leaked would hand out a
+    // descriptor above `FIRST_FILE_FD` here, which is exactly the shape of the
+    // `apk`-twice-in-a-row failure that `close_owned_by` was written for.
+    let reopened = sys_openat(0, path.as_ptr() as u64, 0, 0);
+    t.check_eq(
+        "fd: closing every descriptor frees the whole row",
+        reopened,
+        FIRST_FILE_FD as u64,
+    );
+    sys_close(reopened);
 
     // A request past `MAX_IO` is clamped, not refused — real `read(2)`
     // semantics (see `sys_read`'s own comment): the byte count actually
