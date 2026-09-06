@@ -282,6 +282,116 @@ flag. Two things are pinned by tests rather than by prose:
 
 ---
 
+## 4b. `ps` showed nothing, and `/proc` was a real empty directory — **done**
+
+`busybox ps` printed its header and no rows, on both a serial console and over
+ssh, with **exit status 0 and no error anywhere**. `ls /proc` printed nothing;
+`top` said `can't change directory to '/proc': Function not implemented`.
+
+The cause was not a missing `/proc`. `/proc` **exists on the image as a real,
+empty ext2 directory** (`mkdisk.sh`, put there so `busybox reboot` can find
+init), so `openat` resolved it, `getdents64` succeeded, and it returned zero
+entries. `ps` iterated nothing and stopped. Every layer reported success.
+
+**Fix, 2026-09-06 — `crates/akuma-procfs`, shared with the AArch64 kernel.**
+
+The AArch64 side already had a full `ProcFilesystem` (`akuma-vfs-glue/src/proc.rs`,
+1547 lines). It cannot be reused here and cannot even be compiled for
+`x86_64-unknown-none`: it reaches `akuma-exec`/`akuma-elf`, which are written
+against `akuma-mmu`'s `UserAddressSpace` — a type that is itself
+`#[cfg(target_arch = "aarch64")]`. So the **filesystem** stayed where it is and
+the **formats** moved out, which is the half where a divergence is invisible.
+Same seam, same reason, as `akuma-syscalls-net`.
+
+`akuma-procfs` is `no_std`, `#![forbid(unsafe_code)]`, depends only on
+`akuma-primitives` (for `FmtBuf`), and holds `ProcStat`/`ProcState` plus
+`render_pid_stat`/`render_status`/`render_cmdline`. **17 host tests.** Both
+kernels now render through it: `akuma-vfs-glue::proc` maps its `&Process` onto
+`ProcStat`, and amd64's `fd.rs` maps its `Spawn`.
+
+Extraction paid for itself twice before it shipped:
+
+1. **The `stat` line emitted 41 fields where its own comment listed 44.** `ps`
+   counts to field 14 for `utime` and stops, so nothing downstream had noticed;
+   anything reading `rss` or `policy` would have read a neighbour's value or run
+   off the end. A/B against a pre-change VM: `fields=41` -> `fields=44`, with
+   fields 1-20 byte-identical.
+2. **`comm` truncation could panic the kernel.** It sliced `&name[..15]`, which
+   panics if byte 15 is inside a multi-byte character — reachable from any
+   program that names itself in UTF-8. Now trimmed to the boundary below, with a
+   test.
+
+### What amd64 needed on top of the formats
+
+- **A retained argv.** `sys_spawn`/`sys_execve` parsed argv, handed it to the
+  ELF loader (which writes it onto the child's initial stack) and dropped it.
+  Reading it back out of the child's stack later is not possible — the program
+  owns that memory and a shell has overwritten it by the time `ps` asks. `Spawn`
+  now keeps a `CMDLINE_MAX`-bounded copy, and `execve` **replaces** it: without
+  that, every process reported the name of whatever `fork`ed it and a session
+  showed a column of `sh`.
+- **A `ppid`.** Recorded at `fork`/`spawn` from the caller's pid.
+- **Synthetic directories.** `install_synthetic_dir` pre-seeds the descriptor's
+  `dir_cache`, which is the field `sys_getdents64` already consults before it
+  would call `fs::read_dir` — so a synthetic directory needed **no branch in
+  `getdents64` at all**, and inherits its snapshot-on-open semantics, which is
+  what walking a live process table wants anyway.
+- **`stat` on a `/proc` path.** `procps_scan` calls `stat("/proc/<pid>")` for
+  the USER column and `continue`s on failure.
+
+### The bug that actually blocked it, and how it was found
+
+With all of the above in place `ps` was *still* empty. The syscall trace is what
+settled it:
+
+```
+nr=2   "/proc"     -> 3          open
+nr=217 fd=3        -> 0xc0       getdents64: 192 bytes, the listing is there
+nr=4   "/proc/1/"  -> -2         stat: ENOENT      <-- here
+nr=217 fd=3        -> 0          getdents64: end
+```
+
+**busybox stats `/proc/1/`, with a trailing slash** — it builds the directory
+prefix once and reuses it with each filename appended, so the bare-directory
+`stat` carries the separator. `strip_prefix("/proc/")` left `"1/"`, which split
+into `("1", Some(""))` and matched no arm. `procps_scan` treats a failed `stat`
+as "the process exited between the readdir and the stat" and skips it, so every
+pid was skipped silently. `normalise_proc` now trims trailing slashes before
+anything else, and resolves `self` in the same place.
+
+Getting there required a **tracer fix that is worth keeping**: the syscall trace
+printed paths for `open` and the `*at` family but not for `stat`/`lstat`/
+`access`/`chdir`, so an ENOENT from a first-arg-path syscall was a number with
+nothing attached. Those four now print their path.
+
+`ls /proc` also listed names whose `stat` then said `No such file or directory`,
+because the listing and the `open` handler had drifted. `render_proc_file` now
+serves `open`, `stat` and the listing from one place, so they cannot.
+
+### Verified on QEMU `-M microvm` (2026-09-06)
+
+```
+$ ps                          $ ls /proc
+PID   USER     TIME  COMMAND  1  10  meminfo  mounts  net  self
+    1 0         0:00 /bin/sshd
+    8 0         0:00 ps       $ ls /proc/1
+                              cmdline  fd  stat  status
+```
+
+`/proc/self/status` resolves and reports `PPid: 1`; 240/0 self-tests. On the
+AArch64 side, `ps` still lists five processes and the whole boot suite is
+unchanged (165 `Result: PASS`, 97 `[PASS]`, the one known-failing
+`retired_reclaim_ab`).
+
+**Still to do:** `top`, which needs `chdir` (x86_64 80, entirely unimplemented —
+`getcwd` hardcodes `/`) plus the system-wide `/proc/stat` and `/proc/uptime`.
+Those two files already exist as renderers on the AArch64 side and are the
+natural next thing to move into `akuma-procfs`. And the USER column prints `0`
+rather than `root`, which is a missing `/etc/passwd` on the image, not a kernel
+gap.
+
+---
+
 ## 5. `syscall_dispatch` is two-tier: 47 raw numbers, ~30 named
 
 `amd64/src/usermode.rs:619-1140`, one function, 520 lines.

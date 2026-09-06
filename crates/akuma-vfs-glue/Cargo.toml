@@ -22,6 +22,12 @@ akuma-pmm = { path = "../akuma-pmm" }
 akuma-fpcache = { path = "../akuma-fpcache" }
 # Uptime for `/proc/uptime`; `safe_print!`/`tprint!`; `Spinlock`.
 akuma-primitives = { path = "../akuma-primitives" }
+# The `/proc/<pid>/{stat,status,cmdline}` byte formats, shared with the amd64
+# kernel's `fd::sys_openat`. This crate cannot itself be compiled for
+# `x86_64-unknown-none` (it reaches `akuma-exec`/`akuma-elf`, both written
+# against `akuma-mmu`), so the *formats* moved out rather than the filesystem —
+# the same seam, for the same reason, as `akuma-syscalls-net`.
+akuma-procfs = { path = "../akuma-procfs" }
 akuma-timer = { path = "../akuma-timer" }
 # `/proc/net/tcp` lists the socket table. `default-features = false` matches the
 # binary: the rump-only devbox compiles smoltcp out and still needs this crate.

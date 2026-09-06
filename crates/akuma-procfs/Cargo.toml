@@ -1,0 +1,13 @@
+[package]
+name = "akuma-procfs"
+version = "0.1.0"
+edition = "2024"
+description = "The `/proc/<pid>` virtual-file byte formats `ps` and `top` parse — the wire layer, with no process model behind it."
+
+[lints]
+workspace = true
+
+[dependencies]
+# `FmtBuf`, so every renderer writes into a caller's buffer instead of
+# allocating. Nothing else: this crate must not know what a `Process` is.
+akuma-primitives = { path = "../akuma-primitives" }

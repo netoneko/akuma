@@ -108,6 +108,12 @@ akuma-syscalls-net = { path = "../crates/akuma-syscalls-net" }
 # the silent ceiling on a 64 KiB `dmesg`, on the one machine whose console has
 # no scrollback. The ring is host-tested; what stays here is the lock.
 akuma-dmesg = { path = "../crates/akuma-dmesg" }
+# The `/proc/<pid>/{stat,status,cmdline}` byte formats, shared with the AArch64
+# kernel's `ProcFilesystem`. That filesystem cannot be reused here — it reaches
+# `akuma-exec`/`akuma-elf`, both written against `akuma-mmu` — but the formats
+# can, and the formats are where a divergence is invisible: `ps` finds `utime`
+# by counting to field 14 of a 44-field line.
+akuma-procfs = { path = "../crates/akuma-procfs" }
 # The console line discipline: canonical mode, echo, backspace, Ctrl+D, and
 # `map_cr_to_nl`. Hand-rolling a console reader hits the CR-vs-NL bug on the
 # first Enter keypress; this crate is the tree's answer and is dependency-free.

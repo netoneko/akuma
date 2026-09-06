@@ -96,6 +96,7 @@ dependencies = [
  "akuma-pipe",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-procfs",
  "akuma-ryzen-amd64",
  "akuma-selftest",
  "akuma-sntp",
@@ -466,6 +467,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-procfs"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+]
+
+[[package]]
 name = "akuma-psci"
 version = "0.1.0"
 
@@ -688,6 +696,7 @@ dependencies = [
  "akuma-net",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-procfs",
  "akuma-syscalls-ipc",
  "akuma-syscalls-log",
  "akuma-syscalls-net",

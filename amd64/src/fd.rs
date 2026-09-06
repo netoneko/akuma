@@ -471,67 +471,15 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
             };
             return alloc_pipe_fd(pipe_id, true).unwrap_or(errno::EMFILE);
         }
-        // `busybox ifconfig` with no interface name reads this to enumerate
-        // devices before it will print anything. Generated, not stored.
-        if rest == "net/dev" {
-            let mut text = alloc::string::String::new();
-            let _ = akuma_syscalls_net::write_proc_net_dev(&interfaces(), &mut text);
-            return install_synthetic_file("/proc/net/dev", text.into_bytes(), flags_);
-        }
-        // `busybox free` / `top` read this. Only the three fields `free`
-        // actually parses are filled — physical RAM the PMM was handed, what it
-        // has free, and the kernel heap folded into `Cached` so the number
-        // moves when a file-cache leak (see `net::mem_watch_tick`) is eating it.
-        // `busybox df` reads this **first** — it enumerates mounts here and
-        // then calls `statfs` on each one, so with no `/proc/mounts` it prints
-        // a header and nothing else no matter how well `statfs` works. Rendered
-        // from the mount table rather than stored, like every other file here.
-        if rest == "mounts" || rest == "self/mounts" {
-            // 8 mounts (`MountSet<8>`) x a line that cannot exceed ~120 bytes:
-            // a source, a mount point, an fs type and a fixed options column.
-            let mut buf = [0u8; 1024];
-            let n = fs::render_mounts(&mut buf);
-            return install_synthetic_file("/proc/mounts", buf[..n].to_vec(), flags_);
-        }
-        if rest == "meminfo" {
-            let page = 4096u64;
-            let total_kib = akuma_pmm::total_count() as u64 * page / 1024;
-            let free_kib = akuma_pmm::free_count() as u64 * page / 1024;
-            let heap = akuma_alloc::stats();
-            let heap_used_kib = (heap.allocated / 1024) as u64;
-            let mut text = alloc::string::String::new();
-            use core::fmt::Write as _;
-            // Every field `busybox free` / `top` might read, across versions —
-            // it looks some up by the old name (`MemShared`) and some by the
-            // new (`Shmem`), and a name it does not find can be left as
-            // `ULONG_MAX` and underflow the `used = total - free - …` line into
-            // the 18-quintillion garbage that first showed up here.
-            let _ = write!(
-                text,
-                "MemTotal:       {total_kib:>10} kB\n\
-                 MemFree:        {free_kib:>10} kB\n\
-                 MemAvailable:   {free_kib:>10} kB\n\
-                 MemShared:      {z:>10} kB\n\
-                 Buffers:        {z:>10} kB\n\
-                 Cached:         {heap_used_kib:>10} kB\n\
-                 SwapCached:     {z:>10} kB\n\
-                 Active:         {z:>10} kB\n\
-                 Inactive:       {z:>10} kB\n\
-                 SwapTotal:      {z:>10} kB\n\
-                 SwapFree:       {z:>10} kB\n\
-                 Dirty:          {z:>10} kB\n\
-                 Writeback:      {z:>10} kB\n\
-                 AnonPages:      {z:>10} kB\n\
-                 Mapped:         {z:>10} kB\n\
-                 Shmem:          {z:>10} kB\n\
-                 Slab:           {z:>10} kB\n\
-                 SReclaimable:   {z:>10} kB\n\
-                 SUnreclaim:     {z:>10} kB\n",
-                z = 0,
-            );
-            return install_synthetic_file("/proc/meminfo", text.into_bytes(), flags_);
-        }
-        return errno::ENOENT;
+        // Everything else under /proc: the live process table and the
+        // system-wide virtual files.
+        return open_proc(rest, flags_).unwrap_or(errno::ENOENT);
+    }
+    // `/proc` itself, with no trailing slash — the path `ps` and `top` open to
+    // enumerate processes. The `strip_prefix("/proc/")` above cannot match it,
+    // and without this it fell through to the real, empty ext2 directory.
+    if path == "/proc" {
+        return open_proc("", flags_).unwrap_or(errno::ENOENT);
     }
 
     let Ok(normalised) = resolve_at(dirfd, path) else {
@@ -1557,6 +1505,27 @@ pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
         p
     };
 
+    // `/proc` paths have no inode. `ps` calls `stat` on `/proc/<pid>` to read
+    // the owning uid for its USER column, and `top` `stat`s `/proc` itself
+    // before it will start.
+    let proc_rest = if normalised == "/proc" {
+        Some("")
+    } else {
+        normalised.strip_prefix("/proc/")
+    };
+    if let Some(rest) = proc_rest {
+        let Some((size, is_dir)) = proc_metadata(rest) else {
+            return errno::ENOENT;
+        };
+        // 0o40555 / 0o100444: root-owned, world-readable, never writable.
+        let mode = if is_dir { 0o040_555 } else { 0o100_444 };
+        let st = encode_stat(mode, size, 1, if is_dir { 2 } else { 1 }, None, None, None);
+        if errno::is_err(copy_to_user(statbuf, &st)) {
+            return errno::EFAULT;
+        }
+        return 0;
+    }
+
     let Some(meta) = fs::metadata(&normalised) else {
         return errno::ENOENT;
     };
@@ -1935,6 +1904,278 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
         }
         _ => errno::ENOTTY,
     }
+}
+
+/// Install a read-only fd for a **synthetic directory**: one that exists only
+/// as a listing, with no ext2 inode behind it.
+///
+/// The listing is pre-seeded into the descriptor's `dir_cache`, which is the
+/// field [`sys_getdents64`] already consults before it would call
+/// `fs::read_dir`. So a synthetic directory needs no branch in `getdents64` at
+/// all — and it inherits the snapshot-on-open semantics for free, which is what
+/// a process table being walked while processes come and go requires anyway.
+fn install_synthetic_dir(path: &str, names: Vec<(alloc::string::String, u8)>, flags: u64) -> u64 {
+    let mut file = KernelFile::new(alloc::string::String::from(path), flags as u32);
+    file.dir_cache = Some(
+        names
+            .into_iter()
+            .map(|(name, d_type)| akuma_exec_core::process::DirCacheEntry { name, d_type })
+            .collect(),
+    );
+    let mut table = TABLE.lock();
+    for (i, slot) in table.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(Entry {
+                desc: FileDescriptor::File(file),
+                data: Vec::new(),
+                nonblocking: false,
+                is_dir: true,
+                owner: crate::usermode::current_proc_slot(),
+            });
+            return (i + FIRST_FILE_FD) as u64;
+        }
+    }
+    errno::EMFILE
+}
+
+/// DT_DIR / DT_REG, as `getdents64` spells them.
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+
+/// The per-process files this target serves under `/proc/<pid>/`.
+const PID_FILES: [&str; 3] = ["cmdline", "stat", "status"];
+
+/// Normalise a path under `/proc`: drop trailing slashes, then rewrite a
+/// leading `self` to the calling process's own pid.
+///
+/// # Both halves are load-bearing, and both were found the hard way
+///
+/// **Trailing slashes.** `busybox ps` stats `"/proc/1/"`, not `"/proc/1"` — it
+/// builds the directory prefix once and reuses it with the filename appended,
+/// so the bare-directory `stat` carries the separator. Without the trim,
+/// `"1/"` split into `("1", Some(""))` and matched no arm, `stat` answered
+/// `ENOENT`, and `procps_scan` did what it does for a process that exited
+/// between the `readdir` and the `stat`: `continue`. Every pid was skipped and
+/// `ps` printed its header and nothing else — with no error anywhere, because
+/// from `ps`'s point of view nothing had gone wrong.
+///
+/// **`self`.** `/proc/self` is a symlink on Linux and essentially every tool
+/// reaches `/proc` through it. This target has no symlink machinery for a
+/// synthetic path, so the rewrite happens here, on the string. The AArch64
+/// kernel has the identical helper for the identical reason
+/// (`akuma-vfs-glue`'s `resolve_self`), where its absence was what stopped
+/// `redis-server` starting at all.
+fn normalise_proc(rest: &str) -> alloc::string::String {
+    let rest = rest.trim_end_matches('/');
+    let pid = crate::usermode::current_pid();
+    let mut out = alloc::string::String::new();
+    use core::fmt::Write as _;
+    if rest == "self" {
+        let _ = write!(out, "{pid}");
+    } else if let Some(tail) = rest.strip_prefix("self/") {
+        let _ = write!(out, "{pid}/{tail}");
+    } else {
+        out.push_str(rest);
+    }
+    out
+}
+
+/// Render one `/proc/<pid>/<file>`, or `None` if the pid or the file is not one
+/// this target serves.
+///
+/// The bytes themselves are `akuma-procfs`, shared with the AArch64 kernel and
+/// host-tested there — this function is only the lookup and the buffer.
+fn render_pid_file(pid: u32, file: &str) -> Option<Vec<u8>> {
+    let entry = crate::usermode::proc_by_pid(pid)?;
+    let name_owned = alloc::string::String::from(entry.name());
+    let stat = entry.stat(&name_owned);
+    match file {
+        "stat" => {
+            let mut buf = [0u8; akuma_procfs::STAT_LINE_MAX];
+            let n = akuma_procfs::render_pid_stat(&stat, &mut buf);
+            Some(buf[..n].to_vec())
+        }
+        "status" => {
+            let mut buf = [0u8; akuma_procfs::STATUS_MAX];
+            let n = akuma_procfs::render_status(&stat, &mut buf);
+            Some(buf[..n].to_vec())
+        }
+        // Already in the `/proc` wire form (NUL-separated) — `usermode` stores
+        // it that way, so this is a copy rather than a render.
+        "cmdline" => Some(entry.cmdline.clone()),
+        _ => None,
+    }
+}
+
+/// Render any `/proc` file this target serves, system-wide or per-process.
+///
+/// One function for `open` and for `stat`, so the two can never disagree about
+/// what exists — the failure that shape produces is `ls /proc` listing a name
+/// whose `stat` then says `No such file or directory`.
+fn render_proc_file(rest: &str) -> Option<Vec<u8>> {
+    match rest {
+        // `busybox ifconfig` with no interface name reads this to enumerate
+        // devices before it will print anything. Generated, not stored.
+        "net/dev" => {
+            let mut text = alloc::string::String::new();
+            let _ = akuma_syscalls_net::write_proc_net_dev(&interfaces(), &mut text);
+            Some(text.into_bytes())
+        }
+        // `busybox df` reads this **first** — it enumerates mounts here and
+        // then calls `statfs` on each one, so with no `/proc/mounts` it prints
+        // a header and nothing else no matter how well `statfs` works.
+        // Rendered from the mount table rather than stored.
+        "mounts" => {
+            // 8 mounts (`MountSet<8>`) x a line that cannot exceed ~120 bytes.
+            let mut buf = [0u8; 1024];
+            let n = fs::render_mounts(&mut buf);
+            Some(buf[..n].to_vec())
+        }
+        "meminfo" => Some(render_meminfo().into_bytes()),
+        _ => {
+            let (head, file) = rest.split_once('/')?;
+            render_pid_file(head.parse::<u32>().ok()?, file)
+        }
+    }
+}
+
+/// `/proc/meminfo`. `busybox free` / `top` read this.
+///
+/// Only the three fields `free` actually parses carry real numbers — physical
+/// RAM the PMM was handed, what it has free, and the kernel heap folded into
+/// `Cached` so the number moves when a file-cache leak (see
+/// `net::mem_watch_tick`) is eating it. Every other field is present and zero
+/// **on purpose**: `free` looks some up by the old name (`MemShared`) and some
+/// by the new (`Shmem`), and a name it does not find can be left as
+/// `ULONG_MAX` and underflow the `used = total - free - …` line into the
+/// 18-quintillion garbage that first showed up here.
+fn render_meminfo() -> alloc::string::String {
+    let page = 4096u64;
+    let total_kib = akuma_pmm::total_count() as u64 * page / 1024;
+    let free_kib = akuma_pmm::free_count() as u64 * page / 1024;
+    let heap = akuma_alloc::stats();
+    let heap_used_kib = (heap.allocated / 1024) as u64;
+    let mut text = alloc::string::String::new();
+    use core::fmt::Write as _;
+    let _ = write!(
+        text,
+        "MemTotal:       {total_kib:>10} kB\n\
+         MemFree:        {free_kib:>10} kB\n\
+         MemAvailable:   {free_kib:>10} kB\n\
+         MemShared:      {z:>10} kB\n\
+         Buffers:        {z:>10} kB\n\
+         Cached:         {heap_used_kib:>10} kB\n\
+         SwapCached:     {z:>10} kB\n\
+         Active:         {z:>10} kB\n\
+         Inactive:       {z:>10} kB\n\
+         SwapTotal:      {z:>10} kB\n\
+         SwapFree:       {z:>10} kB\n\
+         Dirty:          {z:>10} kB\n\
+         Writeback:      {z:>10} kB\n\
+         AnonPages:      {z:>10} kB\n\
+         Mapped:         {z:>10} kB\n\
+         Shmem:          {z:>10} kB\n\
+         Slab:           {z:>10} kB\n\
+         SReclaimable:   {z:>10} kB\n\
+         SUnreclaim:     {z:>10} kB\n",
+        z = 0,
+    );
+    text
+}
+
+/// Is `rest` a directory this target synthesises under `/proc`?
+///
+/// `stat` must answer yes for `/proc/<pid>` before `ps` will look inside it.
+fn proc_is_dir(rest: &str) -> bool {
+    if rest.is_empty() || rest == "net" {
+        return true;
+    }
+    match rest.split_once('/') {
+        None => rest.parse::<u32>().is_ok_and(|p| crate::usermode::proc_by_pid(p).is_some()),
+        Some((head, "fd")) => {
+            head.parse::<u32>().is_ok_and(|p| crate::usermode::proc_by_pid(p).is_some())
+        }
+        Some(_) => false,
+    }
+}
+
+/// The size `stat` should report for a `/proc` path, and whether it is a
+/// directory. `None` if this target does not serve it.
+///
+/// Rendering the file just to measure it is deliberate: a `/proc` file's length
+/// is a property of the moment, and reporting a stale or guessed size is how a
+/// reader that trusts `st_size` (rather than reading to EOF) truncates. The
+/// cost is one render per `stat`, on a path nothing calls in a loop.
+fn proc_metadata(rest: &str) -> Option<(u64, bool)> {
+    let rest = normalise_proc(rest);
+    if proc_is_dir(&rest) {
+        return Some((0, true));
+    }
+    render_proc_file(&rest).map(|d| (d.len() as u64, false))
+}
+
+/// Answer an `open` under `/proc`, or `None` to fall through to the disk.
+///
+/// `rest` is the path with the leading `/proc/` (or `/proc`) stripped: the empty
+/// string is `/proc` itself.
+///
+/// # Why `/proc` has to be intercepted at all
+///
+/// `/proc` is a **real, empty ext2 directory** on this target's image
+/// (`mkdisk.sh`, so that `busybox reboot` can find init). So `getdents64` on it
+/// succeeded and returned nothing, and `ps` printed its header and stopped —
+/// a failure with no error anywhere in it. Everything below replaces that empty
+/// listing with the live process table.
+fn open_proc(rest: &str, flags: u64) -> Option<u64> {
+    let rest = normalise_proc(rest);
+    let rest = rest.as_str();
+
+    // `/proc` itself: one directory entry per live process, plus the files
+    // already served here. `.`/`..` are omitted — `getdents64` on this target
+    // has never emitted them for a real directory either, and `ps` skips
+    // non-numeric names regardless.
+    //
+    // **Only names that also `stat`.** Advertising one that does not is how
+    // `ls /proc` ends up printing `No such file or directory` for its own
+    // listing, which is why `render_proc_file` serves both this and `stat`.
+    if rest.is_empty() {
+        let mut names: Vec<(alloc::string::String, u8)> = Vec::new();
+        for p in crate::usermode::proc_list() {
+            let mut n = alloc::string::String::new();
+            use core::fmt::Write as _;
+            let _ = write!(n, "{}", p.pid);
+            names.push((n, DT_DIR));
+        }
+        names.push((alloc::string::String::from("self"), DT_DIR));
+        names.push((alloc::string::String::from("net"), DT_DIR));
+        for f in ["meminfo", "mounts"] {
+            names.push((alloc::string::String::from(f), DT_REG));
+        }
+        return Some(install_synthetic_dir("/proc", names, flags));
+    }
+
+    if rest == "net" {
+        return Some(install_synthetic_dir(
+            "/proc/net",
+            alloc::vec![(alloc::string::String::from("dev"), DT_REG)],
+            flags,
+        ));
+    }
+
+    // `/proc/<pid>` — the per-process directory.
+    if let Ok(pid) = rest.parse::<u32>() {
+        if crate::usermode::proc_by_pid(pid).is_none() {
+            return Some(errno::ENOENT);
+        }
+        let mut names: Vec<(alloc::string::String, u8)> = PID_FILES
+            .iter()
+            .map(|f| (alloc::string::String::from(*f), DT_REG))
+            .collect();
+        names.push((alloc::string::String::from("fd"), DT_DIR));
+        return Some(install_synthetic_dir(rest, names, flags));
+    }
+
+    render_proc_file(rest).map(|data| install_synthetic_file(rest, data, flags))
 }
 
 /// Install a read-only fd whose contents are `data` (a generated file like

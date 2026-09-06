@@ -35,6 +35,7 @@ use crate::paging::{self, MemAttr, Prot};
 use crate::phys::phys_ptr;
 use crate::serial;
 use core::sync::atomic::{AtomicU64, Ordering};
+use spinning_top::Spinlock;
 
 const IA32_EFER: u32 = 0xC000_0080;
 const IA32_STAR: u32 = 0xC000_0081;
@@ -567,8 +568,13 @@ extern "C" fn syscall_handler(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
         serial::puts(" a1=0x");
         serial::put_hex(a1);
         match nr {
-            // x86_64 `open(path, flags, mode)` — the path is the FIRST arg.
-            2 => {
+            // The first-arg-path syscalls: `open`, `stat`, `lstat`, `access`,
+            // `chdir`. All of them answer ENOENT for a path this kernel does
+            // not serve, and without the path in the trace an ENOENT is a
+            // number with nothing attached — which is exactly how long it took
+            // to see that `ps` was failing on `stat("/proc/<pid>")` rather than
+            // on anything to do with `getdents64`.
+            2 | 4 | 6 | 21 | 80 => {
                 serial::puts(" \"");
                 crate::fd::trace_user_cstr(a1);
                 serial::puts("\"");
@@ -1980,6 +1986,18 @@ use crate::pipe::{self, PipeId};
 /// One spawned child. Indexed by `proc_slot - SPAWN_SLOT_BASE`.
 struct Spawn {
     pid: u32,
+    /// The pid of whoever called `spawn`/`fork`. `ps` prints this as PPID, and
+    /// without it every process looked like a child of init.
+    ppid: u32,
+    /// argv as `/proc/<pid>/cmdline` wants it: each element NUL-terminated.
+    ///
+    /// Kept because it is the **only** copy — `sys_spawn`/`sys_execve` parse
+    /// argv, hand it to the ELF loader, which writes it onto the child's
+    /// initial stack and drops the kernel-side vector. Reading it back out of
+    /// the child's stack later is not possible: the program is free to
+    /// overwrite it, and by the time `ps` asks, a shell has. Bounded at
+    /// [`CMDLINE_MAX`] so a pathological argv cannot grow the process table.
+    cmdline: alloc::vec::Vec<u8>,
     /// The child writes fd 1/2 here; the parent's `stdout_fd` reads it.
     stdout_pipe: PipeId,
     /// The child reads fd 0 here; `/proc/<pid>/fd/0` writes it.
@@ -2007,6 +2025,170 @@ static mut SPAWN: [Option<Spawn>; SPAWN_SLOTS] = [const { None }; SPAWN_SLOTS];
 /// Next pid to hand out. `sshd` itself is pid 1 (`Getpid` returns 1), so
 /// children start at 2.
 static NEXT_PID: AtomicU64 = AtomicU64::new(2);
+
+/// Bytes of argv kept per process for `/proc/<pid>/cmdline`.
+///
+/// A shell command line, not a program's whole argument vector: 256 bytes holds
+/// every command a person types and every `sh -c "..."` a session runs, and
+/// caps what an `execve` with a pathological argv can add to the process table.
+/// `ps` shows the COMMAND column truncated, which is what `ps` does anyway.
+const CMDLINE_MAX: usize = 256;
+
+/// The init program's `/proc/1/cmdline`, recorded by [`run_init`].
+///
+/// Init has no `Spawn` entry — it runs in `PROCS` slot 6, below
+/// [`SPAWN_SLOT_BASE`], and predates the spawn table entirely — so its name
+/// lives here. Without it `ps` listed every session's shell and not the thing
+/// that started them, which is the one line a person checks first.
+static INIT_CMDLINE: Spinlock<alloc::vec::Vec<u8>> = Spinlock::new(alloc::vec::Vec::new());
+
+/// Flatten argv into the `/proc/<pid>/cmdline` form: each element
+/// NUL-terminated, the whole thing capped at [`CMDLINE_MAX`].
+///
+/// The cap truncates **whole bytes, not whole elements** — same as Linux, whose
+/// `cmdline` is just the argv block clipped at the page it lives on, and same
+/// as what a reader that splits on NUL expects.
+fn flatten_cmdline<'a>(args: impl IntoIterator<Item = &'a [u8]>) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::new();
+    for a in args {
+        if out.len() >= CMDLINE_MAX {
+            break;
+        }
+        let room = CMDLINE_MAX - out.len();
+        let take = a.len().min(room.saturating_sub(1));
+        out.extend_from_slice(&a[..take]);
+        out.push(0);
+    }
+    out
+}
+
+/// One process, as `/proc` needs to describe it.
+///
+/// Owned rather than borrowed: every reader of the process table is a syscall
+/// rendering a virtual file, and the table is a `static mut` behind raw
+/// pointers — handing out a reference into it would outlive the single-core
+/// reasoning that makes touching it sound at all.
+pub struct ProcEntry {
+    pub pid: u32,
+    pub ppid: u32,
+    /// `Some(code)` for a process that has exited and not yet been reaped.
+    pub exit: Option<i32>,
+    /// argv, NUL-separated. Never empty: falls back to the program name.
+    pub cmdline: alloc::vec::Vec<u8>,
+}
+
+impl ProcEntry {
+    /// argv[0], for `comm` and the `Name:` field.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        let first = self.cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
+        core::str::from_utf8(first).unwrap_or("?")
+    }
+
+    /// The state `/proc` should report.
+    #[must_use]
+    pub fn state(&self) -> akuma_procfs::ProcState {
+        match self.exit {
+            Some(code) => akuma_procfs::ProcState::Zombie(code),
+            // This target keeps no per-process run state — a task is either in
+            // the table or gone — so a live process reads `R`. Reporting `S`
+            // for one blocked in a syscall would need the scheduler to record
+            // it, which is a real feature rather than a `/proc` detail.
+            None => akuma_procfs::ProcState::Running,
+        }
+    }
+
+    /// The value `/proc/<pid>/stat` renders through.
+    #[must_use]
+    pub fn stat<'a>(&'a self, name: &'a str) -> akuma_procfs::ProcStat<'a> {
+        akuma_procfs::ProcStat {
+            pid: self.pid,
+            ppid: self.ppid,
+            state: self.state(),
+            name,
+            // No per-process CPU accounting on this target. A zero is the
+            // honest answer — `ps` prints `0:00` — where a fabricated number
+            // would be worse than none.
+            cpu_time_us: 0,
+        }
+    }
+}
+
+/// Record init's argv so `/proc/1` can describe it. Called once by [`run_init`].
+fn set_init_cmdline<'a>(args: impl IntoIterator<Item = &'a [u8]>) {
+    *INIT_CMDLINE.lock() = flatten_cmdline(args);
+}
+
+/// Init, as a [`ProcEntry`]. Always present: pid 1 exists from the moment
+/// `run_init` succeeds until the machine stops.
+fn init_entry() -> ProcEntry {
+    let cmdline = INIT_CMDLINE.lock().clone();
+    ProcEntry {
+        pid: 1,
+        // Linux gives init ppid 0, and `ps` renders that as the tree root.
+        ppid: 0,
+        exit: None,
+        cmdline: if cmdline.is_empty() { alloc::vec![b'i', b'n', b'i', b't', 0] } else { cmdline },
+    }
+}
+
+/// Every live process, init first. What `getdents64("/proc")` enumerates.
+///
+/// A *reaped* child is not here — `waitpid` clears its slot, and Linux drops the
+/// directory at the same point. A child that has exited but not been reaped is,
+/// as a zombie, which is exactly what `ps` is for.
+#[must_use]
+pub fn proc_list() -> alloc::vec::Vec<ProcEntry> {
+    let mut out = alloc::vec::Vec::new();
+    out.push(init_entry());
+    // SAFETY: raw-pointer read; single core, and no entry is mutated here.
+    unsafe {
+        for slot in (*spawn_table()).iter().flatten() {
+            out.push(ProcEntry {
+                pid: slot.pid,
+                ppid: slot.ppid,
+                exit: slot.exit,
+                cmdline: slot.cmdline.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// One process by pid, or `None` if no such process is live.
+#[must_use]
+pub fn proc_by_pid(pid: u32) -> Option<ProcEntry> {
+    if pid == 1 {
+        return Some(init_entry());
+    }
+    // SAFETY: raw-pointer read; single core.
+    unsafe {
+        (*spawn_table()).iter().flatten().find(|s| s.pid == pid).map(|s| ProcEntry {
+            pid: s.pid,
+            ppid: s.ppid,
+            exit: s.exit,
+            cmdline: s.cmdline.clone(),
+        })
+    }
+}
+
+/// The pid of the process making the current syscall — what `/proc/self`
+/// resolves to. `1` for init and for anything not in the spawn table, matching
+/// `getpid`, which returns 1 on this target for exactly the same reason.
+#[must_use]
+pub fn current_pid() -> u32 {
+    let slot = current_proc_slot();
+    if slot < SPAWN_SLOT_BASE || slot == usize::MAX {
+        return 1;
+    }
+    // SAFETY: raw-pointer read; single core.
+    unsafe {
+        (*spawn_table())
+            .get(slot - SPAWN_SLOT_BASE)
+            .and_then(|s| s.as_ref())
+            .map_or(1, |s| s.pid)
+    }
+}
 
 fn spawn_table() -> *mut [Option<Spawn>; SPAWN_SLOTS] {
     &raw mut SPAWN
@@ -2115,6 +2297,19 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     };
 
+    // `/proc/<pid>/cmdline` follows the new image. Without this, `ps` reported
+    // every process under the name of whatever `fork`ed it — a shell session
+    // showed a column of `sh`, which is the shape that makes `ps` useless
+    // rather than merely incomplete.
+    if slot >= SPAWN_SLOT_BASE {
+        // SAFETY: raw-pointer access; single core, this task's own slot.
+        unsafe {
+            if let Some(Some(sp)) = (*spawn_table()).get_mut(slot - SPAWN_SLOT_BASE) {
+                sp.cmdline = flatten_cmdline(argv_refs.iter().copied());
+            }
+        }
+    }
+
     // Park the built image and ask the entry path to leave ring 3. `run_process`
     // does the swap.
     // SAFETY: raw-pointer access; single core, slot is this task's own.
@@ -2196,6 +2391,12 @@ fn sys_fork() -> u64 {
         return errno::ENOMEM;
     };
 
+    // The parent's pid and command line, for the child's `/proc` entry. Read
+    // before the child exists, because `proc_by_pid` walks the same table the
+    // write below is about to touch.
+    let parent_pid = current_pid();
+    let parent_cmdline = proc_by_pid(parent_pid).map_or_else(alloc::vec::Vec::new, |p| p.cmdline);
+
     // The child's fd 0/1/2 route wherever the parent's do.
     let (stdin_pipe, stdout_pipe, console_io) = match spawn_stdio(parent_slot) {
         Some((si, so)) => (si, so, false),
@@ -2243,6 +2444,11 @@ fn sys_fork() -> u64 {
     unsafe {
         (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
             pid,
+            ppid: parent_pid,
+            // A `fork` child runs the parent's image until it `execve`s, so it
+            // shows the parent's command line — exactly as on Linux, and the
+            // reason `ps` briefly lists two `sh`s during a pipeline.
+            cmdline: parent_cmdline,
             stdout_pipe,
             stdin_pipe,
             exit: None,
@@ -2296,6 +2502,10 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
     };
     let argv_refs: alloc::vec::Vec<&[u8]> =
         argv_owned.iter().map(alloc::vec::Vec::as_slice).collect();
+    // Kept for `/proc/<pid>/cmdline`: the loader writes argv onto the child's
+    // stack and this vector is dropped, so this is the last chance to record it.
+    let spawn_cmdline = flatten_cmdline(argv_refs.iter().copied());
+    let spawner_pid = current_pid();
 
     // A free PROCS slot in the spawn range.
     let slot = {
@@ -2355,6 +2565,8 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
     unsafe {
         (*spawn_table())[slot - SPAWN_SLOT_BASE] = Some(Spawn {
             pid,
+            ppid: spawner_pid,
+            cmdline: spawn_cmdline,
             stdout_pipe,
             stdin_pipe,
             exit: None,
@@ -3485,6 +3697,8 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     for a in args {
         argv_owned.push(a.as_bytes());
     }
+    // Init has no `Spawn` entry, so `/proc/1` reads its argv from here.
+    set_init_cmdline(argv_owned.iter().copied());
     let (proc, _img) = match Process::from_elf_argv(&image, &argv_owned) {
         Ok(p) => p,
         Err(e) => {

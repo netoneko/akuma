@@ -93,105 +93,71 @@ pub fn mounts_bytes(target_pid: Option<Pid>, viewer_box_id: u64) -> Option<Vec<u
     Some(buf[..n].to_vec())
 }
 
-fn proc_cmdline_bytes(p: &process::Process) -> Vec<u8> {
-    let args = p.image_args();
-    if args.is_empty() {
-        let mut v: Vec<u8> = p.image_name().into_bytes();
-        v.push(0);
-        return v;
+/// Map a `Process` onto the plain value the `akuma-procfs` renderers take.
+///
+/// `name` is borrowed rather than owned because `image_name()` returns an owned
+/// `String` and [`ProcStat`] holds a `&str` — the caller keeps the `String`
+/// alive across the render. That is the whole adaptation layer: everything
+/// below is `akuma-procfs`, byte for byte the same as the amd64 kernel emits.
+///
+/// [`ProcStat`]: akuma_procfs::ProcStat
+fn proc_stat_of<'a>(p: &process::Process, name: &'a str) -> akuma_procfs::ProcStat<'a> {
+    use akuma_procfs::{ProcStat, ProcState as PS};
+    let state = match p.state.load() {
+        ProcessState::Zombie(code) => PS::Zombie(code),
+        ProcessState::Blocked => PS::Sleeping,
+        ProcessState::Ready | ProcessState::Running => PS::Running,
+    };
+    ProcStat {
+        pid: p.pid,
+        ppid: p.parent_pid,
+        state,
+        name,
+        // The same per-thread microsecond counter `top`'s CORE column reads via
+        // `sys_get_cpu_stats`. We do not split user from system time, so all of
+        // it lands in `utime` and `stime` stays 0.
+        cpu_time_us: p.thread_id.map_or(0, threading::get_thread_cpu_time),
     }
-    let mut out = Vec::new();
-    for a in &args {
-        out.extend_from_slice(a.as_bytes());
-        out.push(0);
-    }
-    out
 }
 
-/// The capability mask a full-root process reports: every capability Linux
-/// defines up to `CAP_LAST_CAP`.
-///
-/// This kernel has no capability model — everything runs as root — but the
-/// `Cap*` lines still have to be here, because that is where **libcap-ng** reads
-/// a process's capabilities from (`capng_get_caps_process` parses
-/// `/proc/self/status`, it does not call `capget`). With the lines absent it
-/// fails, and `capng_apply` then returns -1 *without setting errno* — which is
-/// exactly the `setpriv: activate capabilities: No error information` that
-/// killed `redis:alpine`'s entrypoint. Stubbing `capset(2)` did not help,
-/// because `capset` was never the call that failed.
-const CAP_FULL_MASK: &str = "000001ffffffffff";
+fn proc_cmdline_bytes(p: &process::Process) -> Vec<u8> {
+    let name = p.image_name();
+    let args = p.image_args();
+    let stat = proc_stat_of(p, &name);
+    // Bounded by what the caller could ever read back: `MAX_ARGV` elements is
+    // not a thing this crate knows, so size from the arguments themselves and
+    // let the renderer's own truncation cap a pathological one.
+    let need: usize = args.iter().map(|a| a.len() + 1).sum::<usize>().max(name.len() + 1);
+    let mut buf = alloc::vec![0u8; need];
+    let n = akuma_procfs::render_cmdline(&stat, args.iter().map(alloc::string::String::as_bytes), &mut buf);
+    buf.truncate(n);
+    buf
+}
 
 fn proc_status_text(p: &process::Process) -> String {
-    let name_owned = p.image_name();
-    let name = name_owned.as_str();
-    let name_field = if name.len() > 15 { &name[..15] } else { name };
-    let state = match p.state.load() {
-        ProcessState::Zombie(_) => "Z (zombie)",
-        ProcessState::Ready | ProcessState::Running => "R (running)",
-        ProcessState::Blocked => "S (sleeping)",
-    };
-    // One format for every state — the four arms this replaced were identical
-    // apart from the state string and the zombie's trailing ExitCode, so adding
-    // a field meant remembering to add it four times.
-    let mut out = format!(
-        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\n\
-         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\n\
-         VmPeak:\t0 kB\nVmSize:\t0 kB\nVmRSS:\t0 kB\nThreads:\t1\n\
-         CapInh:\t0000000000000000\nCapPrm:\t{}\nCapEff:\t{}\nCapBnd:\t{}\n\
-         CapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\n",
-        name_field, state, p.pid, p.pid, p.parent_pid,
-        CAP_FULL_MASK, CAP_FULL_MASK, CAP_FULL_MASK,
-    );
-    if let ProcessState::Zombie(code) = p.state.load() {
-        use core::fmt::Write as _;
-        let _ = writeln!(out, "ExitCode:\t{code}");
-    }
-    out
+    let name = p.image_name();
+    let stat = proc_stat_of(p, &name);
+    let mut buf = [0u8; akuma_procfs::STATUS_MAX];
+    let n = akuma_procfs::render_status(&stat, &mut buf);
+    // The renderer emits ASCII only, so this cannot lose bytes; `from_utf8_lossy`
+    // rather than an `unwrap` because a panic here would be a kernel panic
+    // reachable from `cat /proc/1/status`.
+    String::from(alloc::string::String::from_utf8_lossy(&buf[..n]))
 }
 
 /// `/proc/<pid>/stat` (Linux-compatible, space-separated, single line).
 ///
-/// This is the file `ps`/`top` actually parse (not `status`) — busybox's
-/// `ps` applet showed an empty process list despite `status`/`cmdline` being
-/// populated because this file didn't exist at all. Accounting fields we
-/// don't track per-process yet (times, memory, scheduling) read as 0/a
-/// neutral placeholder — enough for `ps`/`top` to list PID/PPID/STATE/
-/// COMMAND, which is what they read this file for; real per-process CPU/mem
-/// stats are a separate, larger feature.
+/// **This is the file `ps`/`top` actually parse** — not `status`. Busybox `ps`
+/// showed an empty process list here despite `status`/`cmdline` being fully
+/// populated, because this file did not exist at all.
+///
+/// The line itself is [`akuma_procfs::render_pid_stat`], shared with the amd64
+/// kernel and host-tested there. Moving it out found that this line had been
+/// emitting **41 fields where its own comment listed 44** — harmless only
+/// because `ps` counts no further than `utime` at field 14.
 fn render_pid_stat(p: &process::Process, buf: &mut [u8]) -> usize {
-    use akuma_primitives::console::FmtBuf;
-    let name_owned = p.image_name();
-    let name = name_owned.as_str();
-    // Linux's `comm` is the executable's basename, truncated to 15 bytes.
-    let base = name.rsplit('/').next().unwrap_or(name);
-    let comm = if base.len() > 15 { &base[..15] } else { base };
-    let state = match p.state.load() {
-        ProcessState::Zombie(_) => 'Z',
-        ProcessState::Blocked => 'S',
-        ProcessState::Ready | ProcessState::Running => 'R',
-    };
-    let pid = p.pid;
-    let ppid = p.parent_pid;
-    // `utime` is real, in USER_HZ jiffies, off the same per-thread microsecond
-    // counter `top`'s CORE column already reads via `sys_get_cpu_stats`
-    // (`akuma_exec::threading::get_thread_cpu_time`) — busybox `top`/`ps` parse
-    // *this* file (not `status`) for it. We don't split user/kernel time, so
-    // all of it lands in `utime`; `stime` stays 0.
-    let utime_jiffies = p.thread_id
-        .map_or(0, |tid| threading::get_thread_cpu_time(tid) / JIFFY_US);
-    // pid comm state ppid pgrp session tty_nr tpgid flags minflt cminflt
-    // majflt cmajflt utime stime cutime cstime priority nice num_threads
-    // itrealvalue starttime vsize rss rsslim startcode endcode startstack
-    // kstkesp kstkeip signal blocked sigignore sigcatch wchan nswap cnswap
-    // exit_signal processor rt_priority policy delayacct_blkio_ticks
-    // guest_time cguest_time
-    let mut pos = 0usize;
-    let mut w = FmtBuf { buf, pos: &mut pos };
-    let _ = writeln!(
-        w,
-        "{pid} ({comm}) {state} {ppid} {pid} {pid} 0 -1 0 0 0 0 0 {utime_jiffies} 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-    );
-    pos
+    let name = p.image_name();
+    akuma_procfs::render_pid_stat(&proc_stat_of(p, &name), buf)
 }
 
 /// USER_HZ: Linux's jiffy rate for every `/proc` CPU-time field (`utime`,
@@ -199,7 +165,7 @@ fn render_pid_stat(p: &process::Process, buf: &mut [u8]) -> usize {
 /// matters here, regardless of the kernel's actual timer tick
 /// (`config::TIMER_INTERVAL_US`) — it's an ABI constant `sysconf(_SC_CLK_TCK)`
 /// reports, not a reflection of how often we actually interrupt.
-const JIFFY_US: u64 = 10_000;
+use akuma_procfs::JIFFY_US;
 
 use akuma_exec::threading::types::MAX_CORES;
 
