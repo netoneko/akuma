@@ -357,6 +357,10 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     if trace_fork {
         usermode::SYSCALL_TRACE.store(false, core::sync::atomic::Ordering::Relaxed);
     }
+    // Shell redirection and pipelines. After `fork_test` because a pipeline is
+    // a fork plus two `dup2`s, so a failure here on a green `fork_test` points
+    // at the descriptor table rather than at process creation.
+    usermode::redirect_test(&mut t);
     lapic::stop_timer();
 
     // The netpoll drain half, then (in the gap before the daemon task

@@ -621,20 +621,32 @@ What is **left** here, and is now signals' problem rather than threads':
   known-broken `cmd | cmd`: fds 0-2 are handled by number below `fd.rs`'s
   table (`FIRST_FILE_FD = 3`), so `dup2` onto them has nowhere to land.
 
-### 3. One global 64-entry fd table
+### 3. One global 64-entry fd table — **DONE 2026-09-06**
 
-`amd64/src/fd.rs:127`, header:
+**Closed.** `fd.rs` is now the POSIX two-level split: `FDS[row][fd]` is one
+descriptor row per `PROCS` slot (plus a `KERNEL_ROW` for the boot suite, which
+runs with `current_proc_slot() == usize::MAX`), and `FILES` is the machine-wide
+table of open file **descriptions**, reference counted. 64 KiB of `.bss`.
 
-> One table, not one per process. That is wrong in the way that matters as soon
-> as there is a `fork`, and right for now.
+The doc predicted "this should be a relocation — the operations don't care
+where the array lives". It was not, and the reason is worth keeping: moving the
+array fixes the *budget* and nothing else. Three defects needed the split:
 
-`fork` now exists. `close_owned_by` (`fd.rs:933`) was added because `apk` already
-ran the table to `EMFILE` in the middle of installing 14 packages. `rustc` alone
-exceeds 64 descriptors on a real crate graph; `cargo` plus N concurrent `rustc`s
-sharing one table is not survivable.
+- one 64-descriptor budget for the whole machine (`apk` ran it dry installing
+  14 packages, and the next `apk` started from a full table);
+- a `close` in a forked child reached into its parent, because both named the
+  same array slot — `sh -c 'prog > file'` could not work even in principle;
+- `dup` was a **value copy**, a pinned divergence: separate cursors, and
+  closing one dup released the socket under the other. It is now a second name
+  for one description.
 
-**Work:** move the table into `Process`, raise `MAX_OPEN`. The header says the
-operations don't care where the array lives, so this should be a relocation.
+`fork` copies a row and increments; exit drops a row and decrements; only the
+last name going away releases the description and persists a written file.
+`close_owned_by` survives as the exit hook, but is a row release rather than a
+search for an owner.
+
+**What came out of it that was not in this item.** With rows in place,
+descriptors 0/1/2 could be *bound*, which is what `dup2` needs — see §11.8.
 
 ### 4. `mmap` is a global monotonic bump with no VA reuse
 
@@ -702,32 +714,84 @@ mapping half is not.
 `cargo`. `rustc` needs a real `SIGSEGV`→abort for ICE handling; `cargo` needs
 `SIGCHLD` semantics for reaping.
 
+### 8. Shell redirection and pipelines — **DONE 2026-09-06**
+
+Not in the original eight, because until §11.3 landed it was not reachable.
+`dup2`/`dup3`/`pipe`/`pipe2` were **not dispatched at all**, and descriptors
+0/1/2 were routed by number below `fd`'s table, so `dup2` had nowhere to land.
+The symptoms were `echo x > file` leaving a **zero-length file** and
+`cmd | cmd` reporting *can't create pipe* — read as filesystem or resource
+problems, and neither.
+
+The fix is a **row override**, not console descriptions: `FDS[row][0..3]` is
+`NO_FILE` by default and every by-number console path is now guarded on
+`!is_bound(fd)`, so an unbound 0/1/2 behaves exactly as before and a bound one
+wins. That is why this was a fill-in rather than a redesign.
+
+`pipe(2)` needed a lifetime rule of its own. A spawn-owned pipe is freed when
+its *read* end closes (only one end is ever a descriptor); a `pipe(2)` pair has
+two, either may be closed first, so it is freed when the last goes —
+`pipe::alloc_pair` and `Slot::ends`. The counter counts **descriptions, not
+descriptors**: `dup` and `fork` add a name, and `FILES`' own refcount keeps the
+description alive, so counting names here would double-count every inherited
+pipe and leak it. `MAX_PIPES` 16 → 64.
+
+**Two bugs this exposed**, both invisible while nothing could redirect:
+
+- `open_flags` read neither `O_APPEND` nor `O_TRUNC`, so **every `O_CREAT` open
+  started from an empty buffer** and `>>` silently behaved as `>`. Since
+  `close` persists the buffer as the file's entire contents, that is not a
+  mis-positioned write, it destroys the rest of the file.
+- `mkdir` (83) was not in the dispatch table while `mkdirat` (258) was
+  implemented and working — busybox uses the legacy number. Added with the
+  other three legacy spellings (`rename` 82, `rmdir` 84, `unlink` 87) as
+  `AT_FDCWD` shims, the same shape `stat`/`lstat` already used.
+
+Still open: an unbound 0/1/2 is not "free" for allocation, so `close(1);
+open(f)` returns 3 rather than 1 (pinned divergence — every real shell uses
+`dup2`), and `FD_CLOEXEC` is still accepted-and-ignored, which became a *live*
+divergence when `execve` landed.
+
 ### Suggested order
 
 Three of the original eight are done (§11.1 CoW, §11.2 threads+futex, §11.6
 `PT_INTERP`), all on 2026-09-06. What is left, re-ranked by what a real
 toolchain now hits first:
 
+Rewritten 2026-09-06, after §11.3, §11.8 and the process ceiling landed.
+
 ```
-  0. boot-path merge (§1)            — cheap, and everything below must be
-                                        validated on QEMU *and* metal, which
-                                        today are two different sequences
-                                        with two different test lists
-  1. per-process fd tables (§11.3)   — NOW THE TOP BLOCKER. One global
-                                        64-entry table, and threads share fds
-                                        by design, so N threads × M open files
-                                        is one budget. `apk` already reached
-                                        EMFILE installing 14 packages.
-  2. akuma-mmap adoption (§11.4)     — second, and threads made it worse: every
-                                        `pthread_create` mmaps a ~2 MiB stack
-                                        out of the global monotonic bump and
-                                        `munmap` returns no VA. Needs
-                                        REDUCING_PLATFORM_DEPENDENCY §1.
-  3. inode-backed fd I/O (§2/§11.5)  — the disk exists now
-  4. signals (§11.7)                 — `rt_sigaction` returning 0 is a stub
-                                        Rust *believes*; and it is what
-                                        §11.2's remaining gap needs
-  5. dynamic linker done (§11.6) — static vs dynamic rustc is now a choice
+  0. akuma-mmap adoption (§11.4)     — NOW THE TOP BLOCKER, and worse than
+                                        this doc first said: `MAX_MAPPING` is
+                                        64 MiB and refuses more, `EAGER_MAX_
+                                        PAGES` is usize::MAX so there is *no
+                                        lazy path* — a reservation costs its
+                                        full size in physical RAM — and
+                                        `NEXT_VA` is one bump shared by every
+                                        process with no VA reuse. rustc and
+                                        LLVM reserve far more than they touch.
+                                        The gate is gone (REDUCING_PLATFORM_
+                                        DEPENDENCY §1) and amd64 already
+                                        depends on the crate.
+  1. inode-backed fd I/O (§2/§11.5)  — `open` means "allocate the file's size
+                                        and read all of it". rustc reads large
+                                        .rlibs. The disk exists now.
+  2. signals (§11.7)                 — `rt_sigaction` returns 0, a stub Rust
+                                        *believes*; `wait4` is a yield spin
+                                        burning a core per waiting cargo.
+  3. akuma-slot-table for PROCS /
+     SPAWN / THREADS                 — three hand-rolled `static mut` tables.
+                                        Pairs naturally with the process-entry
+                                        work above: both are about slot
+                                        identity, and doing them apart touches
+                                        the same code twice.
+  4. boot-path merge (§1)            — no direct self-hosting payoff; its value
+                                        is that it stops manufacturing "works
+                                        under QEMU, broken on the HP box".
+                                        `redirect_test` is registered on both
+                                        paths; `spawn`/`busybox`/`execve`/
+                                        `fork` still are not.
+  5. dynamic linker done (§11.6)     — static vs dynamic rustc is a choice
 ```
 
 Two items the work of 2026-09-06 added to this list rather than removed:
@@ -737,9 +801,17 @@ Two items the work of 2026-09-06 added to this list rather than removed:
   reuse generations — it is used by neither kernel directly, and it **does**
   build for `x86_64-unknown-none` (checked). Adopting it for all three at once
   is the right shape; one table converted and three not is not.
-- **`proc_entry_for` tops out at slot 15**, which is why `sys_fork` refuses a
+- ~~**`proc_entry_for` tops out at slot 15**, which is why `sys_fork` refuses a
   parent slot `>= 16`. Nine concurrent forked processes. `cargo` will find
-  this.
+  this.~~ **DONE 2026-09-06.** There is one `proc_entry` now, and the `PROCS`
+  index it serves is seeded into `UserCtx::proc_slot` by
+  `sched::seed_proc_slot` while the task is still unpublished — the shape
+  `thread::thread_entry` had used all along, and which `UserCtx::thread_slot`'s
+  own doc pointed at. Both `>= 16` guards became `>= PROC_SLOTS` (128), and
+  `sched::spawn_in_space` — the publish-immediately variant — was deleted,
+  because a task that is schedulable before it is seeded reaches `proc_entry`
+  and finds `usize::MAX`. Verified on the metal: a **20-stage pipeline** runs,
+  i.e. 20 concurrent processes where the ceiling was 9.
 
 **The overlap is the argument.** §2 (`fd.rs` caching), §5
 (`akuma-syscalls-abi`), the `akuma-mmap` adoption and the `loader.rs`

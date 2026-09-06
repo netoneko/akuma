@@ -150,10 +150,11 @@ pub struct UserCtx {
     /// it is a process's main thread. Offset 152 — past everything the
     /// assembly indexes, like `proc_slot` and for the same reason.
     ///
-    /// This is what lets every `clone` child share **one** entry function:
-    /// `usermode::proc_entry_for` needs sixteen hand-written trampolines
-    /// because a `PROCS` index has nowhere to live but the `fn` pointer, and a
-    /// thread's index lives here instead.
+    /// This is what lets every `clone` child share **one** entry function, and
+    /// since 2026-09-06 `proc_slot` above does the same job for processes —
+    /// `usermode::proc_entry` replaced sixteen hand-written trampolines that
+    /// existed only because a `PROCS` index had nowhere to live but the `fn`
+    /// pointer. Both indices are seeded before the task is published.
     pub thread_slot: usize,
 }
 
@@ -739,6 +740,11 @@ extern "C" fn syscall_handler(
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
     use crate::fd::errno;
 
+    /// `AT_FDCWD` — "relative to the current directory", which on a target with
+    /// no per-process cwd means relative to the root. What every legacy,
+    /// non-`at` path syscall below passes to its `*at` implementation.
+    const AT_FDCWD: u64 = (-100i64) as u64;
+
     // Akuma's own syscalls, before the Linux table.
     //
     // They live at `0x1000 +` their AArch64 number (see `libakuma`'s
@@ -891,8 +897,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // busybox `sh` stats every PATH entry before it will run an applet —
         // without this it saw `ENOSYS` and reported "Function not implemented"
         // for a working builtin.
-        4 => return crate::fd::sys_newfstatat((-100i64) as u64, a1, a2, 0),
-        6 => return crate::fd::sys_newfstatat((-100i64) as u64, a1, a2, 0x100),
+        4 => return crate::fd::sys_newfstatat(AT_FDCWD, a1, a2, 0),
+        6 => return crate::fd::sys_newfstatat(AT_FDCWD, a1, a2, 0x100),
         262 => return crate::fd::sys_newfstatat(a1, a2, a3, a4),
         // `open(path, flags, mode)` — x86_64 2. x86_64 musl issues this directly
         // (it only falls back to `openat` on architectures without `open`, like
@@ -919,6 +925,16 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // `UNTRUSTED signature` over a fetch that was fine (see
         // `fd::sys_dup`; the aarch64 twin is `APK_MISSING_SYSCALLS.md`).
         32 => return crate::fd::sys_dup(a1),
+        // `pipe` (22) / `dup2` (33) / `dup3` (292) / `pipe2` (293) — the four
+        // that make a shell a shell. Every one of them was `ENOSYS` until
+        // 2026-09-06, which is why `cmd | cmd` reported *can't create pipe*
+        // and `echo x > file` left a zero-length file: a shell builds both out
+        // of `pipe` plus `dup2`, and neither existed. `mkdisk`'s busybox has
+        // been able to run pipelines all along; the kernel could not.
+        22 => return crate::fd::sys_pipe2(a1, 0),
+        33 => return crate::fd::sys_dup2(a1, a2),
+        292 => return crate::fd::sys_dup3(a1, a2, a3),
+        293 => return crate::fd::sys_pipe2(a1, a2),
         // `mkdirat` (258) / `unlinkat` (263) / `renameat` (264) — `apk`'s
         // cache write is a named `.tmp.<pid>` file plus a rename; without
         // these the cache write fails and the index fetch is unusable (the
@@ -926,6 +942,21 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         258 => return crate::fd::sys_mkdirat(a1, a2, a3),
         263 => return crate::fd::sys_unlinkat(a1, a2, a3),
         264 => return crate::fd::sys_renameat(a1, a2, a3, a4),
+        // The **legacy, non-`at`** spellings of the same four — x86_64 82/83/
+        // 84/87 — as thin `AT_FDCWD` shims, exactly like `stat`/`lstat` above.
+        //
+        // Not redundant: musl issues whichever the architecture has, and
+        // x86_64 has both, so which one arrives is a property of the *caller*.
+        // busybox `mkdir` uses 83 and got `ENOSYS` while `mkdirat` sat
+        // implemented and working two lines up — reported as
+        // `mkdir: can't create directory: Function not implemented`, which
+        // reads as a filesystem that cannot make directories rather than a
+        // dispatch table missing a number. `rmdir` is `unlinkat` with
+        // `AT_REMOVEDIR` (0x200).
+        82 => return crate::fd::sys_renameat(AT_FDCWD, a1, AT_FDCWD, a2),
+        83 => return crate::fd::sys_mkdirat(AT_FDCWD, a1, a2),
+        84 => return crate::fd::sys_unlinkat(AT_FDCWD, a1, 0x200),
+        87 => return crate::fd::sys_unlinkat(AT_FDCWD, a1, 0),
         // `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271. Same
         // core; a NULL timespec means wait forever, otherwise fold sec+nsec to
         // milliseconds (this target has no finer clock to honour anyway).
@@ -1655,10 +1686,14 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         return crate::fd::write_pipe(p, buf, len as usize, crate::fd::is_nonblocking(fd));
     }
     // A real file descriptor, opened `O_WRONLY`/`O_RDWR` — tcc's `-o` output,
-    // the first real writer on this target (2026-09-04). Above `fd::FIRST_FILE_FD`
-    // and not a socket or pipe (both already routed above), so this is the last
-    // fd class before the two console descriptors.
-    if fd >= crate::fd::FIRST_FILE_FD as u64 {
+    // the first real writer on this target (2026-09-04). Not a socket or pipe
+    // (both already routed above), so this is the last fd class before the two
+    // console descriptors.
+    //
+    // `is_bound` is what makes `prog > file` work: `sh` does `dup2(f, 1)`, so
+    // fd **1** now names a file and must be written to it rather than to the
+    // serial port. An unbound 1 or 2 is still the console, below.
+    if fd >= crate::fd::FIRST_FILE_FD as u64 || crate::fd::is_bound(fd) {
         return crate::fd::sys_write_file(fd, buf, len);
     }
     if fd != 1 && fd != 2 {
@@ -2206,33 +2241,44 @@ fn run_process(idx: usize) -> ! {
     crate::sched::finish();
 }
 
-macro_rules! proc_entries {
-    ($($name:ident => $idx:literal),* $(,)?) => {
-        $(extern "C" fn $name() -> ! { run_process($idx); })*
-    };
-}
-proc_entries! {
-    proc0_entry => 0, proc1_entry => 1, proc2_entry => 2, proc3_entry => 3,
-    proc4_entry => 4, proc5_entry => 5, proc6_entry => 6, proc7_entry => 7,
-    proc8_entry => 8, proc9_entry => 9, proc10_entry => 10, proc11_entry => 11,
-    proc12_entry => 12, proc13_entry => 13, proc14_entry => 14, proc15_entry => 15,
+/// Every process task starts here.
+///
+/// **One entry function for all of them**, the same shape `thread::thread_entry`
+/// has used since threads existed. Until 2026-09-06 this was sixteen
+/// hand-written trampolines generated by a macro, each with a `PROCS` index
+/// baked into its `fn` pointer, behind a `proc_entry_for(idx)` that handed out
+/// only nine of them (7..=15). That was the machine's real process ceiling:
+/// `PROC_SLOTS` is 128, `sys_spawn` searched all of them, and `sys_fork`
+/// refused any parent slot `>= 16` — so nine concurrent processes, which
+/// `cargo -j4` exceeds before it has finished starting.
+///
+/// The index now lives where a thread's already did: `UserCtx::proc_slot`,
+/// written by `sched::seed_proc_slot` while the task is still unpublished and
+/// read back here. Nothing else changed — the ceiling was never about memory
+/// or scheduling, only about where one `usize` could be kept.
+extern "C" fn proc_entry() -> ! {
+    let slot = current_proc_slot();
+    if slot >= PROC_SLOTS {
+        // Reached only if a task was published without being seeded. Say so:
+        // `run_process` would index `PROCS` out of bounds, and a panic here
+        // reads as a scheduler fault rather than a missing seed.
+        serial::puts("  [proc] entry with no slot\n");
+        crate::sched::finish();
+    }
+    run_process(slot);
 }
 
-/// The task entry function for `PROCS` slot `idx`. `sys_spawn` needs to hand
-/// `sched::spawn_in_space` a plain `fn` pointer and the slot is baked into each.
-pub fn proc_entry_for(idx: usize) -> Option<extern "C" fn() -> !> {
-    Some(match idx {
-        7 => proc7_entry,
-        8 => proc8_entry,
-        9 => proc9_entry,
-        10 => proc10_entry,
-        11 => proc11_entry,
-        12 => proc12_entry,
-        13 => proc13_entry,
-        14 => proc14_entry,
-        15 => proc15_entry,
-        _ => return None,
-    })
+/// Spawn a task to run `PROCS` slot `proc_slot`, in the address space `root`.
+///
+/// Three steps in a fixed order, which is why it is a function rather than
+/// three lines at each call site: reserve the task, seed the slot it serves,
+/// and only then publish it. A task published before it is seeded can be
+/// scheduled, reach [`proc_entry`], and find `usize::MAX` there.
+fn spawn_process_task(proc_slot: usize, root: u64) -> Option<usize> {
+    let task_slot = crate::sched::spawn_in_space_unpublished(proc_entry, root)?;
+    crate::sched::seed_proc_slot(task_slot, proc_slot);
+    crate::sched::publish_task(task_slot);
+    Some(task_slot)
 }
 
 // ===========================================================================
@@ -2552,8 +2598,9 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     use crate::fd::errno;
 
     let slot = current_proc_slot();
-    if slot == usize::MAX || slot >= 16 {
-        // Not a slotted user task — nothing to replace.
+    if slot >= PROC_SLOTS {
+        // Not a slotted user task — nothing to replace. (`current_proc_slot`
+        // answers `usize::MAX` off a user task, which this same bound catches.)
         return errno::ENOSYS;
     }
 
@@ -2647,7 +2694,12 @@ fn sys_fork() -> u64 {
     use crate::fd::errno;
 
     let parent_slot = current_proc_slot();
-    if parent_slot == usize::MAX || parent_slot >= 16 {
+    // `>= PROC_SLOTS`, not `>= 16`. The old bound existed because
+    // `proc_entry_for` had only sixteen trampolines and handed out nine, so a
+    // parent in a higher slot had no entry function for its child. There is one
+    // entry function now (`proc_entry`), and `usize::MAX` — the answer off a
+    // user task — is caught by the same comparison.
+    if parent_slot >= PROC_SLOTS {
         return errno::ENOSYS;
     }
 
@@ -2751,14 +2803,11 @@ fn sys_fork() -> u64 {
     // row cannot open anything and does not say why.
     crate::fd::inherit_fds(parent_slot, slot);
 
-    let Some(entry_fn) = proc_entry_for(slot) else {
+    let Some(task_slot) = crate::sched::spawn_in_space_unpublished(proc_entry, child_root) else {
         take_proc_slot(slot);
         return errno::ENOMEM;
     };
-    let Some(task_slot) = crate::sched::spawn_in_space_unpublished(entry_fn, child_root) else {
-        take_proc_slot(slot);
-        return errno::ENOMEM;
-    };
+    crate::sched::seed_proc_slot(task_slot, slot);
     crate::sched::seed_forked_task(task_slot, parent_fs_base, parent_gs_base, &parent_regs);
     // Published last: the child's register/TLS snapshot must be in place before
     // anything can schedule it — same ordering rule as `spawn_in_space`'s space
@@ -2883,11 +2932,7 @@ pub fn sys_spawn(path_ptr: u64, argv_ptr: u64, _envp: u64, stdin_ptr: u64, stdin
         (*procs)[slot] = Some(proc);
     }
 
-    let Some(entry) = proc_entry_for(slot) else {
-        cleanup_spawn_slot(slot, stdout_pipe, stdin_pipe);
-        return errno::ENOMEM;
-    };
-    if crate::sched::spawn_in_space(entry, root).is_none() {
+    if spawn_process_task(slot, root).is_none() {
         cleanup_spawn_slot(slot, stdout_pipe, stdin_pipe);
         return errno::ENOMEM;
     }
@@ -3306,6 +3351,126 @@ pub fn execve_test(t: &mut Suite) {
     );
 }
 
+/// Run `busybox sh -c <cmd>` and collect its stdout and exit status.
+///
+/// The drive loop `fork_test` and `execve_test` each spell out longhand. Split
+/// out for [`redirect_test`], which needs it twice; the two older tests are
+/// deliberately left alone so a failure there still bisects to their own code.
+fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
+    const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
+    let path = b"/bin/sh\0";
+    let (a0, adash) = (b"sh\0", b"-c\0");
+    let argv: [u64; 4] = [a0.as_ptr() as u64, adash.as_ptr() as u64, cmd.as_ptr() as u64, 0];
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0);
+    if r >= ERRNO_FLOOR {
+        return None;
+    }
+    let pid = (r & 0xFFFF_FFFF) as u32;
+    let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
+    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut status = u64::MAX;
+    let mut buf = [0u8; 64];
+    let mut spins = 0u64;
+    loop {
+        spins += 1;
+        if spins > 4_000_000 {
+            break;
+        }
+        let n = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        if n != 0 && n < ERRNO_FLOOR {
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        let mut st: i32 = -1;
+        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+            status = ((st >> 8) & 0xff) as u64;
+            break;
+        }
+        crate::sched::yield_now();
+    }
+    crate::fd::sys_close(stdout_fd);
+    Some((status, out))
+}
+
+/// Shell redirection and pipelines — `dup2` and `pipe(2)`, end to end.
+///
+/// These are the two things a build system cannot do without, and until
+/// 2026-09-06 neither worked: descriptors 0/1/2 were routed by number below
+/// `fd`'s table, so `dup2` had nowhere to land, and `pipe`/`pipe2` were not
+/// dispatched at all. The symptoms were `echo x > file` leaving a
+/// **zero-length file** and `cmd | cmd` reporting *can't create pipe* — both
+/// of which read as filesystem or resource problems and are neither.
+///
+/// Driven through the real `busybox ash` rather than by calling the syscalls
+/// directly, because what has to work is the shell's *own* sequence:
+/// `open(file)` → `dup2(fd,1)` → `close(fd)` for a redirect, and `pipe()` plus
+/// two `dup2`s across a `fork` for a pipeline. A unit test of `dup2` in
+/// isolation passed on kernels where neither of those worked.
+///
+/// The redirect is checked by reading the file **back through the kernel's own
+/// filesystem**, not by trusting the shell's exit status: the pre-fix failure
+/// exited 0 and left an empty file, so a status check alone scores it green.
+pub fn redirect_test(t: &mut Suite) {
+    if crate::fs::read_file("/bin/busybox").is_none() || crate::fs::read_file("/bin/sh").is_none() {
+        t.note("redirect: busybox /bin/sh not on the disk; skipped", 0);
+        return;
+    }
+    let free_before = akuma_pmm::free_count();
+
+    // 1. `>` — the shell's open/dup2/close sequence onto fd 1.
+    let Some((status, _)) = run_sh_capture(b"echo REDIROK > /tmp/redir.txt\0") else {
+        t.check("redirect: sh spawned for `>`", false);
+        return;
+    };
+    t.check_eq("redirect: `echo … > file` exited 0", status, 0);
+    let written = crate::fs::read_file("/tmp/redir.txt");
+    t.check("redirect: the redirected file exists", written.is_some());
+    t.check(
+        "redirect: the redirected bytes reached the file",
+        written.is_some_and(|d| d.windows(7).any(|w| w == b"REDIROK")),
+    );
+
+    // 2. `>>` — the same sequence with `O_APPEND`, which is a *different* open
+    // and was the same one until 2026-09-06: `open_flags` read neither
+    // `O_APPEND` nor `O_TRUNC`, so every `O_CREAT` began with an empty buffer
+    // and `>>` silently behaved as `>`. Checked here rather than beside the
+    // `open` unit tests because it is invisible without working redirection —
+    // there was no way for a program to reach it before `dup2` landed.
+    let Some((astatus, _)) = run_sh_capture(b"echo ONE > /tmp/app.txt\0") else {
+        t.check("redirect: sh spawned for `>>`", false);
+        return;
+    };
+    t.check_eq("redirect: `>` for the append case exited 0", astatus, 0);
+    let _ = run_sh_capture(b"echo TWO >> /tmp/app.txt\0");
+    let appended = crate::fs::read_file("/tmp/app.txt");
+    t.check(
+        "redirect: `>>` kept the first line",
+        appended.as_ref().is_some_and(|d| d.windows(3).any(|w| w == b"ONE")),
+    );
+    t.check(
+        "redirect: `>>` added the second",
+        appended.as_ref().is_some_and(|d| d.windows(3).any(|w| w == b"TWO")),
+    );
+
+    // 3. `|` — `pipe(2)` plus a `dup2` on each side of a fork.
+    let Some((pstatus, pout)) = run_sh_capture(b"echo PIPEOK | cat\0") else {
+        t.check("redirect: sh spawned for `|`", false);
+        return;
+    };
+    t.check_eq("redirect: `cmd | cmd` exited 0", pstatus, 0);
+    t.check(
+        "redirect: the piped bytes came out the far end",
+        pout.windows(6).any(|w| w == b"PIPEOK"),
+    );
+
+    t.check_eq(
+        "redirect: teardown leaks nothing",
+        akuma_pmm::free_count() as u64,
+        free_before as u64,
+    );
+}
+
 /// Stage T: `fork` (with `vfork` semantics) + `execve` + `wait4`.
 ///
 /// `busybox sh -c "uname; echo DONE"` — the `;` makes ash a command list, and
@@ -3403,8 +3568,7 @@ pub fn smoke_test(t: &mut Suite) {
         (*procs)[1] = Some(b);
     }
 
-    let spawned = crate::sched::spawn_in_space(proc0_entry, root_a).is_some()
-        && crate::sched::spawn_in_space(proc1_entry, root_b).is_some();
+    let spawned = spawn_process_task(0, root_a).is_some() && spawn_process_task(1, root_b).is_some();
     if !t.check("ring3: processes spawned", spawned) {
         return;
     }
@@ -3489,8 +3653,7 @@ pub fn preempt_test(t: &mut Suite) {
         (*procs)[3] = Some(d);
     }
 
-    let spawned = crate::sched::spawn_in_space(proc2_entry, root_c).is_some()
-        && crate::sched::spawn_in_space(proc3_entry, root_d).is_some();
+    let spawned = spawn_process_task(2, root_c).is_some() && spawn_process_task(3, root_d).is_some();
     if !t.check("preempt: processes spawned", spawned) {
         return;
     }
@@ -3575,8 +3738,7 @@ pub fn smp_parallel_test(t: &mut Suite) {
         (*procs)[3] = Some(d);
     }
 
-    let spawned = crate::sched::spawn_in_space(proc2_entry, root_c).is_some()
-        && crate::sched::spawn_in_space(proc3_entry, root_d).is_some();
+    let spawned = spawn_process_task(2, root_c).is_some() && spawn_process_task(3, root_d).is_some();
     if !t.check("smp ring3: processes spawned", spawned) {
         return;
     }
@@ -3798,7 +3960,7 @@ pub fn elf_test(t: &mut Suite) {
 
     if !t.check(
         "elf: process spawned",
-        crate::sched::spawn_in_space(proc4_entry, root).is_some(),
+        spawn_process_task(4, root).is_some(),
     ) {
         return;
     }
@@ -3951,7 +4113,7 @@ pub fn fdprobe_test(t: &mut Suite) {
     }
     if !t.check(
         "fdprobe: spawned",
-        crate::sched::spawn_in_space(proc5_entry, root).is_some(),
+        spawn_process_task(5, root).is_some(),
     ) {
         return;
     }
@@ -4047,7 +4209,7 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
         let procs = &raw mut PROCS;
         (*procs)[6] = Some(proc);
     }
-    if crate::sched::spawn_in_space(proc6_entry, root).is_none() {
+    if spawn_process_task(6, root).is_none() {
         serial::puts("  [init] no task slot\n");
         return false;
     }
@@ -4132,7 +4294,7 @@ pub fn thread_test(t: &mut Suite) {
 
     if !t.check(
         "thread: probe spawned",
-        crate::sched::spawn_in_space(proc5_entry, root).is_some(),
+        spawn_process_task(5, root).is_some(),
     ) {
         return;
     }

@@ -164,7 +164,7 @@ it reads identically on a dead NIC and a busy one.
 | symptom | cause |
 |---|---|
 | `date` says 1970 → `apk`: *server certificate not trusted* | was: no wall clock. **Fixed** — `clock::sync_tick` keeps retrying SNTP until the clock sets itself. If `date` is still 1970, `ssh akuma "dmesg" \| grep clock:` for the reason |
-| `cmd \| cmd`: *can't create pipe* | fds 0/1/2 are handled by number below `fd.rs`'s table (`FIRST_FILE_FD = 3`), so `dup2` onto them has nowhere to land. Still open |
+| `cmd \| cmd`: *can't create pipe* | was: fds 0/1/2 were handled by number below `fd.rs`'s table (`FIRST_FILE_FD = 3`), so `dup2` onto them had nowhere to land — and `pipe`/`pipe2`/`dup2`/`dup3` were not dispatched at all. **Fixed 2026-09-06.** A bound 0/1/2 in the process's own descriptor row now wins over the by-number console default. Verified on the metal: a 20-stage pipeline runs |
 | `ls`/`apk`: *Out of memory* | was: 64 MiB fixed heap, exhausted by `apk`'s file caches. **Raised to 512 MiB.** `ps`/`top` still need a real procfs; `free` works (`/proc/meminfo` is synthesised) |
 | `wget https://` : *socketpair* | busybox shells out to `ssl_client`. Use `/bin/hget` instead — TLS in-process |
 | `nslookup`: *Bad file descriptor* | `write()` on a connected UDP socket. DNS itself works (`wget http://…` resolves) |
@@ -245,10 +245,15 @@ timeout and `port reset timeout` as the only symptom. Full account:
 Two userspace gaps stand between a persistent root and a comfortable one, and
 **neither is a disk problem** — both fail the same way on the RAM image:
 
-- `echo x > file` returns ENOSYS and leaves a zero-length file. The redirect
-  needs `dup2(fd, 1)`, which is the `cmd | cmd` row in the known-broken table
-  above. `cp` writes fine, which is what proved the disk path.
-- `mkdir` is ENOSYS — the syscall is not implemented.
+- ~~`echo x > file` returns ENOSYS and leaves a zero-length file.~~ **Fixed
+  2026-09-06** with `dup2` — same fix as the `cmd | cmd` row above. `>>` was
+  fixed with it and needed a second change: `open_flags` read neither
+  `O_APPEND` nor `O_TRUNC`, so every `O_CREAT` open started from an empty
+  buffer and `>>` silently behaved as `>`. That was unreachable while nothing
+  could redirect, and a data-losing bug the moment something could.
+- `mkdir` is ENOSYS — the syscall is not implemented. **Still open**, and now
+  the most visible gap: `mkdirat` (258) *is* dispatched and works, so this is
+  busybox calling the legacy `mkdir` (83), which is not in the table.
 
 ### Reading a bring-up that died
 

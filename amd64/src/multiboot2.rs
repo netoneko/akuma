@@ -539,6 +539,15 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     crate::usermode::elf_test(&mut t);
     crate::usermode::thread_test(&mut t);
     crate::usermode::fdprobe_test(&mut t);
+    // Shell redirection and pipelines — `dup2` and `pipe(2)`.
+    //
+    // Registered on **both** boot paths, unlike `spawn`/`busybox`/`execve`/
+    // `fork`, which this one still does not run (the divergence
+    // `AKUMA_AMD64_STREAMLINING.md` §1 is about). It earns its place here
+    // because this is the path with the persistent root: a redirect that works
+    // against a RAM image and fails against ext2-on-USB is exactly the class of
+    // bug the two lists were manufacturing.
+    crate::usermode::redirect_test(&mut t);
     drop(user_ptr_bypass);
 
     // The clock, last and **before any user process**. Every test above ends in

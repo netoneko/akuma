@@ -436,11 +436,21 @@ fn current_row() -> usize {
 /// nothing — a closed descriptor, one out of range, or a console descriptor.
 fn file_index(fd: u64) -> Option<usize> {
     let fd = usize::try_from(fd).ok()?;
-    if !(FIRST_FILE_FD..MAX_FDS).contains(&fd) {
+    if fd >= MAX_FDS {
         return None;
     }
     let idx = FDS.lock()[current_row()][fd];
     (idx != NO_FILE).then_some(idx as usize)
+}
+
+/// Does `fd` name an open file description in the calling process?
+///
+/// The question `sys_write` asks before falling back to the console: a bound
+/// 1 or 2 has been redirected and must go where the row says, not to the
+/// serial port.
+#[must_use]
+pub fn is_bound(fd: u64) -> bool {
+    file_index(fd).is_some()
 }
 
 /// Borrow the description `fd` names, for the duration of `f`.
@@ -468,11 +478,17 @@ fn intern(entry: Entry) -> Option<usize> {
     None
 }
 
-/// Name the description `fi` with the lowest free descriptor in `row`.
+/// Name the description `fi` with the lowest free descriptor in `row`,
+/// **starting at [`FIRST_FILE_FD`]**.
 ///
-/// "Lowest free" is not an aesthetic choice: `sh` closes fd 1 and expects the
-/// next `open`/`dup` to land on 1, and every shell redirection in existence
-/// depends on it.
+/// **Divergence, pinned.** POSIX's "lowest available" includes 0/1/2, so on
+/// Linux `close(1); open(f)` returns 1. Here it returns 3, because an *unbound*
+/// 0/1/2 is not "free" — it is the console, or a spawned child's pipe, routed
+/// by number below this layer. Redirection through `dup2`, which is what every
+/// shell in practice emits (`open` → `dup2(fd,1)` → `close(fd)`), is exact;
+/// the close-then-open idiom is what would land somewhere else. Closing that
+/// gap means giving 0/1/2 real default descriptions at process creation, which
+/// is a bigger change than making `dup2` land.
 fn bind(row: usize, fi: usize) -> Option<u64> {
     let mut fds = FDS.lock();
     let row = &mut fds[row];
@@ -731,19 +747,44 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
     if is_dir && flags_ & u64::from(open_flags::O_ACCMODE) != 0 {
         return errno::EISDIR;
     }
-    let data = if creating || is_dir {
+    // What the descriptor's buffer starts as, and where its cursor starts.
+    //
+    // This used to be "empty if `creating`, else the file's bytes", which
+    // collapsed three different opens into one: `O_TRUNC` (start empty),
+    // `O_APPEND` (start at the end) and a plain `O_CREAT` on a file that
+    // already exists (start at the beginning, keeping what is there — POSIX
+    // truncates only when asked). Since `close` persists this buffer as the
+    // file's *entire* contents, getting it wrong does not mis-position a
+    // write, it destroys the rest of the file.
+    let truncating = flags_ & u64::from(open_flags::O_TRUNC) != 0;
+    let appending = flags_ & u64::from(open_flags::O_APPEND) != 0;
+    let data = if is_dir || truncating {
         Vec::new()
     } else {
         match fs::read_file(&normalised) {
             Some(d) => d,
+            // A brand-new `O_CREAT` file: nothing to read, and that is not an
+            // error. Without `O_CREAT` it is `ENOENT`.
+            None if creating => Vec::new(),
             None => return errno::ENOENT,
         }
     };
+    let start_pos = if appending { data.len() } else { 0 };
 
     // `KernelFile::new` leaves the inode 0 — "read by path", which is what
-    // this target does.
+    // this target does — and the position 0, which `O_APPEND` overrides.
+    //
+    // **Divergence, pinned.** Real `O_APPEND` re-seeks to the end before
+    // *every* write, so two processes appending to one file interleave whole
+    // records. Here it only sets the starting cursor. That is right for a
+    // shell's `>>` and wrong for concurrent appenders, and the fix is not
+    // local: this target keeps a private copy of the file per descriptor and
+    // writes it back whole at `close`, so two appenders already lose each
+    // other's data regardless of where the cursor starts.
+    let mut file = KernelFile::new(normalised, flags_ as u32);
+    file.position = start_pos;
     install(Entry {
-        desc: FileDescriptor::File(KernelFile::new(normalised, flags_ as u32)),
+        desc: FileDescriptor::File(file),
         data,
         nonblocking: false,
         is_dir,
@@ -761,6 +802,16 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, _mode: u64) -> u64 {
 pub mod open_flags {
     pub const O_ACCMODE: u32 = 0o3;
     pub const O_CREAT: u32 = 0o100;
+    /// Start from nothing. x86_64 `0o1000`.
+    pub const O_TRUNC: u32 = 0o1000;
+    /// Start at the end. x86_64 `0o2000`.
+    ///
+    /// Added 2026-09-06 with `O_TRUNC`, because until then neither was read at
+    /// all: **any** `O_CREAT` open began with an empty buffer, so `>>` behaved
+    /// exactly like `>`. That was invisible while `dup2` did not work — nothing
+    /// could redirect in the first place — and became a data-losing bug the
+    /// moment it did. `echo a > f; echo b >> f` left `f` holding only `b`.
+    pub const O_APPEND: u32 = 0o2000;
 }
 
 /// `mkdirat(dirfd, path, mode)` — x86_64 258. `mode` is not tracked (one
@@ -1000,10 +1051,123 @@ pub fn sys_dup(fd: u64) -> u64 {
     newfd
 }
 
+/// `dup2(oldfd, newfd)` — x86_64 33 — and `dup3`, which is the same with a
+/// flags word.
+///
+/// **This is what makes shell redirection work**, and until 2026-09-06 it did
+/// not exist. `sh` implements `prog > file` as `open(file) -> 3`,
+/// `dup2(3, 1)`, `close(3)`: the whole mechanism is the ability to make fd 1
+/// name something else. Descriptors 0/1/2 were not in the table at all — they
+/// were routed by number below it — so there was nowhere for the new name to
+/// land, and `echo x > file` and `cmd | cmd` both failed with `ENOSYS` in a
+/// way that looked like a missing syscall rather than a missing table entry.
+///
+/// POSIX subtleties, both of which real shells depend on:
+/// - `oldfd == newfd` returns `newfd` **without closing it**, and is not an
+///   error. `dup3` differs here and returns `EINVAL`, which is the only
+///   behavioural difference between the two.
+/// - `newfd` is closed first if it was open, and that close is silent — its
+///   errors are not reported, because the caller is asking about `oldfd`.
+pub fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
+    dup_onto(oldfd, newfd, false)
+}
+
+/// `dup3(oldfd, newfd, flags)` — x86_64 292. `O_CLOEXEC` is accepted and
+/// ignored, as `fcntl(F_SETFD)` is; see [`sys_fcntl`].
+pub fn sys_dup3(oldfd: u64, newfd: u64, _flags: u64) -> u64 {
+    dup_onto(oldfd, newfd, true)
+}
+
+fn dup_onto(oldfd: u64, newfd: u64, strict_same: bool) -> u64 {
+    let Some(fi) = file_index(oldfd) else {
+        return errno::EBADF;
+    };
+    if oldfd == newfd {
+        return if strict_same { errno::EINVAL } else { newfd };
+    }
+    let Some(new_idx) = usize::try_from(newfd).ok().filter(|f| *f < MAX_FDS) else {
+        return errno::EBADF;
+    };
+
+    // Install the new name and take out whatever it displaced, in one hold, so
+    // no window exists in which `newfd` names nothing. Then bump, then release
+    // the displaced description outside the lock.
+    let displaced = {
+        let mut fds = FDS.lock();
+        core::mem::replace(&mut fds[current_row()][new_idx], fi as FileIdx)
+    };
+    if let Some(entry) = FILES.lock()[fi].as_mut() {
+        entry.refs = entry.refs.saturating_add(1);
+    }
+    if displaced != NO_FILE {
+        unref(displaced as usize);
+    }
+    newfd
+}
+
+/// `pipe2(fds, flags)` — x86_64 293 — and `pipe(fds)`, which is `pipe2` with
+/// no flags.
+///
+/// Writes the read end to `fds[0]` and the write end to `fds[1]`, as two
+/// `int`s. Both are ordinary descriptors in the calling process's row, so
+/// `fork` inherits them and `dup2` can move them onto 0/1/2 — which together
+/// are a shell pipeline.
+///
+/// The pipe is allocated through `pipe::alloc_pair`, not `pipe::alloc`: a pair
+/// is freed when its **last** end closes, where a spawn-owned pipe is freed
+/// when its read end does. A shell closes the ends in whichever order its
+/// bookkeeping reaches them, so getting that rule wrong frees the buffer under
+/// a live writer.
+pub fn sys_pipe2(fds: u64, _flags: u64) -> u64 {
+    let Some(id) = crate::pipe::alloc_pair() else {
+        return errno::ENFILE;
+    };
+    let read_fd = install(Entry {
+        desc: FileDescriptor::PipeRead(id as u32),
+        data: Vec::new(),
+        nonblocking: false,
+        is_dir: false,
+        refs: 1,
+    });
+    if errno::is_err(read_fd) {
+        crate::pipe::free(id);
+        return read_fd;
+    }
+    let write_fd = install(Entry {
+        desc: FileDescriptor::PipeWrite(id as u32),
+        data: Vec::new(),
+        nonblocking: false,
+        is_dir: false,
+        refs: 1,
+    });
+    if errno::is_err(write_fd) {
+        sys_close(read_fd);
+        crate::pipe::free(id);
+        return write_fd;
+    }
+
+    // Written last: a partial copy must not leave the caller holding two
+    // descriptors it does not know about.
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&(read_fd as u32).to_ne_bytes());
+    out[4..].copy_from_slice(&(write_fd as u32).to_ne_bytes());
+    if errno::is_err(copy_to_user(fds, &out)) {
+        sys_close(read_fd);
+        sys_close(write_fd);
+        return errno::EFAULT;
+    }
+    0
+}
+
 /// `close(fd)`. Closing a console descriptor succeeds and does nothing — a
 /// program that closes stdin should not then find the kernel refusing to print.
 pub fn sys_close(fd: u64) -> u64 {
-    if fd < FIRST_FILE_FD as u64 {
+    // An *unbound* console descriptor: closing succeeds and does nothing, so a
+    // program that closes stdin does not then find the kernel refusing to
+    // print. A **bound** one has been redirected and is a real descriptor —
+    // `sh` does `dup2(f,1); close(f)` and later `close(1)`, and that last close
+    // has to reach the file or its buffered contents are never persisted.
+    if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
         return 0;
     }
     // Unbind the *name* first, then drop the reference. Only the last name
@@ -1038,12 +1202,20 @@ fn release(entry: Entry) {
         // buffered input.
         Entry { desc: FileDescriptor::PipeWrite(p), .. } => {
             crate::pipe::close_write(p as usize);
+            // A `pipe(2)` pair frees when its last end goes; a spawn-owned pipe
+            // accounts no ends and `drop_end` is a no-op on it, preserving the
+            // rule above — the child may still be draining buffered input.
+            crate::pipe::drop_end(p as usize);
         }
         // Closing the read end (`sshd`'s stdout reader) is the last reference to
         // a spawned child's stdout pipe — `waitpid` deliberately left it alive
         // for this final drain. Free the slot now.
         Entry { desc: FileDescriptor::PipeRead(p), .. } => {
-            crate::pipe::free(p as usize);
+            // `drop_end` returns false for a spawn-owned pipe, which has no end
+            // accounting and whose read end really is the last reference.
+            if !crate::pipe::drop_end(p as usize) {
+                crate::pipe::free(p as usize);
+            }
         }
         // A file opened for writing: this is the one and only point its
         // buffered `data` reaches the disk (see the module header and
@@ -1131,16 +1303,11 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     // outright.
     let len = len.min(MAX_IO);
 
-    if fd == 0 {
-        // A spawned child's stdin is a pipe, not the console — `sshd` feeds it.
-        if let Some(pid) = crate::usermode::current_stdin_pipe() {
-            return read_pipe(pid, buf, len as usize, false);
-        }
-        return read_console(buf, len as usize);
-    }
-    if fd == 1 || fd == 2 {
-        return errno::EBADF;
-    }
+    // **The row is consulted before the by-number defaults**, so a redirected
+    // descriptor wins. `sh -c 'prog < file'` is `open(file); dup2(fd, 0)`, and
+    // reading fd 0 must then reach the file rather than the console. For an
+    // *unbound* 0/1/2 nothing here matches and the console path below runs,
+    // exactly as it did before descriptors 0/1/2 could be bound at all.
 
     // A socket descriptor routes to the network stack. The lock is dropped
     // first: `socket_recv` blocks, and holding the descriptor table across a
@@ -1149,9 +1316,22 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         return crate::sock::recv(sock, buf, len, is_nonblocking(fd));
     }
 
-    // A pipe descriptor — the parent's read end of a spawned child's stdout.
+    // A pipe descriptor — the parent's read end of a spawned child's stdout,
+    // or either end of a `pipe(2)` pair.
     if let Some(pid) = pipe_read_id(fd) {
         return read_pipe(pid, buf, len as usize, is_nonblocking(fd));
+    }
+
+    if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
+        if fd == 0 {
+            // A spawned child's stdin is a pipe, not the console — `sshd`
+            // feeds it.
+            if let Some(pid) = crate::usermode::current_stdin_pipe() {
+                return read_pipe(pid, buf, len as usize, false);
+            }
+            return read_console(buf, len as usize);
+        }
+        return errno::EBADF;
     }
 
     with_file(fd, |entry| {
@@ -1558,7 +1738,7 @@ fn encode_stat(
 /// refuses it with `ENOTDIR` unless `S_ISDIR` holds, so `ls`/`find` need this
 /// to be right, not just `openat` succeeding.
 pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
-    let (mode, size, nlink) = if fd < FIRST_FILE_FD as u64 {
+    let (mode, size, nlink) = if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
         (S_IFCHR_0620, 0u64, 1u64)
     } else {
         let Some(triple) = with_file(fd, |entry| {
@@ -1651,7 +1831,7 @@ pub fn sys_statfs(path: u64, buf: u64) -> u64 {
 /// reports the root mount, which is what Linux does for an fd on a filesystem
 /// with no name to resolve.
 pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
-    let path = if fd < FIRST_FILE_FD as u64 {
+    let path = if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
         alloc::string::String::from("/")
     } else {
         let Some(path) = with_file(fd, |entry| match &entry.desc {
@@ -1950,13 +2130,17 @@ pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeou
 }
 
 /// `(readable, writable)` for one fd, for [`sys_poll`]. Non-destructive.
-fn poll_ready(fd: u64) -> (bool, bool) {    if fd == 0 {
-        return match crate::usermode::current_stdin_pipe() {
-            Some(p) => (crate::pipe::readable(p), false),
-            None => (crate::input::has_byte(), false),
-        };
-    }
-    if fd == 1 || fd == 2 {
+fn poll_ready(fd: u64) -> (bool, bool) {
+    // Same rule as `sys_read`: an *unbound* 0/1/2 is the console (or a spawned
+    // child's pipe), a bound one has been redirected and is described by what
+    // it now names — so the console answers below are guarded, not first.
+    if fd < FIRST_FILE_FD as u64 && !is_bound(fd) {
+        if fd == 0 {
+            return match crate::usermode::current_stdin_pipe() {
+                Some(p) => (crate::pipe::readable(p), false),
+                None => (crate::input::has_byte(), false),
+            };
+        }
         return match crate::usermode::current_stdout_pipe() {
             Some(p) => (false, crate::pipe::writable(p)),
             None => (false, true),

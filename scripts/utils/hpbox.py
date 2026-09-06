@@ -18,6 +18,7 @@ CLI:  python3 scripts/utils/hpbox.py which        # 'ubuntu' | 'akuma' | 'unknow
       python3 scripts/utils/hpbox.py wait akuma   # block until that side answers
       python3 scripts/utils/hpbox.py ak  '<cmd>'  # run on Akuma
       python3 scripts/utils/hpbox.py ub  '<cmd>'  # run on Ubuntu
+      python3 scripts/utils/hpbox.py patch [path…]  # send local diff, apply there
 """
 
 import subprocess
@@ -69,6 +70,196 @@ def push(files, repo="."):
         cwd=repo, capture_output=True, text=True,
     )
     return r.returncode, r.stderr
+
+
+def patch(paths=None, repo=".", base="HEAD", dry_run_first=True, touch=True):
+    """Send local changes to the Ubuntu side as a patch and apply them there.
+
+    Preferred over :func:`push` for iterating on kernel source, for three
+    reasons the rsync path learned the hard way:
+
+    * **It carries only what changed.** `push` needs you to name every file, and
+      naming too few is how a build fails on a symbol whose *source* is plainly
+      present on the box — you synced the file and not the crate.
+    * **It fails loudly on drift.** The box's tree is a snapshot, not a
+      checkout, so it drifts. `patch --dry-run` refuses a hunk that does not
+      apply; rsync would overwrite whatever was there and say nothing.
+    * **It sidesteps the mtime trap.** `rsync -a` preserves mtimes and cargo's
+      freshness check reads them, so syncing a file *older* than the box's
+      existing artifacts leaves cargo convinced nothing changed and linking the
+      stale rlib. A patched file is written now, so its mtime is now.
+
+    `paths` restricts the diff (repo-relative, as `git diff` takes them);
+    `None` sends every tracked change against `base`. Returns
+    ``(rc, message)`` — rc 0 on success, and `message` is whatever `patch`
+    said when it is not.
+
+    The box has no `.git`, so this is `patch -p1`, not `git apply`.
+    """
+    cmd = ["git", "diff", base]
+    if paths:
+        cmd += ["--"] + list(paths)
+    diff = subprocess.run(cmd, cwd=repo, capture_output=True, text=True)
+    if diff.returncode != 0:
+        return diff.returncode, f"git diff failed: {diff.stderr.strip()}"
+    if not diff.stdout.strip():
+        return 0, "no local changes to send"
+
+    def _apply(extra):
+        return subprocess.run(
+            UB + [f"cd /root/akuma && patch -p1 {extra}"],
+            input=diff.stdout, capture_output=True, text=True, timeout=120,
+        )
+
+    if dry_run_first:
+        chk = _apply("--dry-run --forward")
+        if chk.returncode != 0:
+            return chk.returncode, "dry run refused:\n" + (chk.stdout + chk.stderr).strip()
+    r = _apply("--forward")
+    if r.returncode != 0:
+        return r.returncode, (r.stdout + r.stderr).strip()
+
+    if touch:
+        # Belt and braces for the mtime trap: `patch` already writes fresh
+        # mtimes, but a crate the patch did not touch can still hold a stale
+        # rlib from a *previous* partial sync.
+        subprocess.run(
+            UB + ["cd /root/akuma && find crates amd64 userspace -type f "
+                  "\\( -name '*.rs' -o -name '*.toml' \\) -newermt '-2 days' -exec touch {} + 2>/dev/null; true"],
+            capture_output=True, text=True, timeout=180,
+        )
+    return 0, (r.stdout or "applied").strip()
+
+
+def send_files(paths, repo=".", touch=True):
+    """Make the box's copy of `paths` byte-identical to this worktree's.
+
+    The companion to :func:`patch`, and the one to reach for when the two trees
+    are not on the same base. `patch` sends a *diff against `HEAD`*, so it
+    applies only while the box's snapshot is on that same commit; the moment it
+    is a commit behind, every hunk in a rewritten file is refused. That refusal
+    is the helper working — but the fix is to send the files themselves.
+
+    Content is piped over ssh and written with `cat`, so each file lands with a
+    **fresh mtime**. That is not incidental: `rsync -a` preserves mtimes and
+    cargo's freshness check reads them, so a file whose laptop mtime predates
+    the box's build artifacts leaves cargo linking the stale rlib and reporting
+    a missing symbol you can plainly `grep` for in the source.
+
+    Returns ``(rc, message)``.
+    """
+    import os
+    sent = []
+    for rel in paths:
+        local = os.path.join(repo, rel)
+        try:
+            with open(local, "rb") as fh:
+                body = fh.read()
+        except OSError as exc:
+            return 1, f"{rel}: {exc}"
+        remote = f"/root/akuma/{rel}"
+        # `cat > file` via a heredoc-free stdin pipe: no quoting of the content
+        # at all, so a Rust file full of quotes and backslashes is safe.
+        r = subprocess.run(
+            UB + [f"mkdir -p $(dirname {remote}) && cat > {remote}"],
+            input=body, capture_output=True, timeout=180,
+        )
+        if r.returncode != 0:
+            return r.returncode, f"{rel}: {r.stderr.decode(errors='replace').strip()}"
+        sent.append(rel)
+
+    if touch:
+        subprocess.run(
+            UB + ["cd /root/akuma && find crates amd64 userspace -type f "
+                  "\\( -name '*.rs' -o -name '*.toml' \\) -exec touch {} + 2>/dev/null; true"],
+            capture_output=True, text=True, timeout=300,
+        )
+    return 0, f"sent {len(sent)} file(s): " + ", ".join(sent)
+
+
+# Where the box keeps the things this module drives.
+BOX_REPO = "/root/akuma"
+BOX_CARGO = "export PATH=/root/.cargo/bin:$PATH"
+BOX_KERNEL = f"{BOX_REPO}/target/x86_64-unknown-none/release/akuma-amd64"
+BOX_DISK = f"{BOX_REPO}/target/x86_64-unknown-none/release/amd64-root.img"
+
+
+def build(pkg="akuma-amd64", target="x86_64-unknown-none", timeout=900):
+    """Build `pkg` on the Ubuntu side. Returns ``(rc, tail_of_output)``.
+
+    `BOX_CARGO` is not optional: a non-interactive ssh does not read the
+    profile that puts `~/.cargo/bin` on `PATH`, so a bare `cargo build` over
+    this transport fails with `bash: cargo: command not found` — a line that
+    matches no `^error` grep and so reads as a *successful* build with no
+    output. The binary's mtime is the only thing that gives it away.
+    """
+    cmd = (f"{BOX_CARGO}; cd {BOX_REPO} && "
+           f"cargo build -p {pkg} --target {target} --release 2>&1 | tail -25")
+    rc, out, err = ubuntu(cmd, timeout=timeout)
+    return rc, (out + err).strip()
+
+
+def firecracker(vcpus=1, init="/bin/busybox", initargs="uname,-a", memory=2048,
+                timeout_s=90, disk=True):
+    """Boot the box's freshly-built kernel under Firecracker. Returns the log.
+
+    The config is written here rather than kept on the box, so the two cannot
+    drift — the same reason `amd64/run-firecracker.sh` stages its own. That
+    script is the laptop-driven path and needs `FC_HOST` plus ssh options that
+    dodge the `akuma` alias; this one runs entirely on the Ubuntu side, against
+    the kernel `build()` just produced.
+
+    `timeout` without `--foreground` is correct **here specifically**: the
+    kernel halts with `cli; hlt` and never exits, so a bound is required, and
+    over ssh with no `-t` there is no controlling TTY for the process-group
+    problem that `--foreground` exists to avoid.
+    """
+    boot_args = f"init={init}"
+    if initargs:
+        boot_args += f" initargs={initargs}"
+    drives = ("[]" if not disk else
+              '[{"drive_id":"rootfs","path_on_host":"%s",'
+              '"is_root_device":false,"is_read_only":false}]' % BOX_DISK)
+    cfg = (
+        '{\n'
+        f'  "boot-source": {{ "kernel_image_path": "{BOX_KERNEL}", "boot_args": "{boot_args}" }},\n'
+        f'  "drives": {drives},\n'
+        '  "network-interfaces": [],\n'
+        f'  "machine-config": {{ "vcpu_count": {vcpus}, "mem_size_mib": {memory} }}\n'
+        '}\n'
+    )
+    # Written through stdin, not a quoted heredoc: the JSON carries braces and
+    # quotes that a shell-side heredoc in an ssh argument would have to escape.
+    r = subprocess.run(UB + ["cat > /tmp/hpbox-fc.json"], input=cfg,
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return f"config write failed: {r.stderr.strip()}"
+    run = (f"for p in $(pgrep -x firecracker); do kill -9 $p; done; "
+           f"rm -f /tmp/hpbox-fc.sock /tmp/hpbox-fc.log; "
+           f"timeout {timeout_s} firecracker --no-api "
+           f"--config-file /tmp/hpbox-fc.json --api-sock /tmp/hpbox-fc.sock "
+           f"> /tmp/hpbox-fc.log 2>&1; cat /tmp/hpbox-fc.log")
+    _rc, out, err = ubuntu(run, timeout=timeout_s + 90)
+    return out + err
+
+
+def stage(cmdline_extra="", timeout=900):
+    """Build, rebuild the root image, install into `/boot/akuma`, arm GRUB.
+
+    Wraps the box's own `/root/stage_akuma.sh`, which is the authority on the
+    sequence (it also backs up what it replaces and checks the multiboot2
+    header survived the link). Returns ``(rc, output)``.
+
+    **`cmdline_extra` is the whole boot configuration.** The script rewrites the
+    GRUB entry to `init=/bin/sshd <extra>`, so anything omitted is *dropped* —
+    passing nothing boots the RAM image in `root.img` and does not touch the USB
+    controller at all. `root=/dev/sda1` is what selects the persistent root;
+    `usb` brings the controller up without mounting it; `skiptests` skips the
+    suite; `nosmp` is single core.
+    """
+    rc, out, err = ubuntu(f'CMDLINE_EXTRA="{cmdline_extra}" bash /root/stage_akuma.sh 2>&1',
+                          timeout=timeout)
+    return rc, (out + err).strip()
 
 
 def which_system(timeout=8):
@@ -140,6 +331,17 @@ def _main(argv):
         rc, o, e = ubuntu(" ".join(rest))
         sys.stdout.write(o)
         sys.stderr.write(e)
+        return rc
+    if cmd == "fc":
+        print(firecracker(vcpus=int(rest[0]) if rest else 1))
+        return 0
+    if cmd == "build":
+        rc, out = build()
+        print(out)
+        return rc
+    if cmd == "patch":
+        rc, msg = patch(rest or None)
+        print(msg)
         return rc
     if cmd == "reboot-to":
         return 0 if reboot_to(rest[0]) else 1

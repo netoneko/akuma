@@ -509,29 +509,33 @@ pub fn idle_loop() -> ! {
     }
 }
 
-/// Create a task that runs in a page table of its own.
+/// Create a task that runs in a page table of its own, left **unpublished**
+/// ([`State::Reserved`]) so the caller can finish initialising it before
+/// anything can schedule it. Finish with [`publish_task`].
 ///
 /// `space_root` is installed in `CR3` whenever this task is scheduled. The
 /// address space must share the kernel's mappings — see
 /// `paging::AddressSpace` — or the switch faults on the instruction after
 /// `mov cr3`.
 ///
-/// The slot is published [`State::Runnable`] only after `space_root` is in
-/// place: this used to be `spawn()` followed by a separate write, and a LAPIC
-/// tick landing between the two scheduled the task with `space_root` still 0 —
-/// kernel CR3 — so `run_init`'s sysret into ring 3 fetched sshd's entry point
-/// unmapped (`#PF`, `cr2 == rip == 0x2045d0`, `err=0x14`). Measured 2026-09-04,
-/// intermittent by timer phase: one boot served ssh, the next died on the first
-/// user instruction. With a second core the same gap is not a tick away but
-/// zero instructions away, which is why [`State::Reserved`] exists.
-pub fn spawn_in_space(entry: extern "C" fn() -> !, space_root: u64) -> Option<usize> {
-    spawn_ready(entry, space_root, false)
-}
-
-/// Like [`spawn_in_space`], but the slot is left unpublished
-/// ([`State::Reserved`]) so the caller can finish initialising it —
-/// [`seed_forked_task`]'s register and TLS snapshot — before anything can
-/// schedule it. Finish with [`publish_task`].
+/// **There is no publish-immediately variant, on purpose.** There was one
+/// (`spawn_in_space`) until 2026-09-06, and the gap it leaves has bitten this
+/// target twice for the same reason — a task became schedulable before the
+/// caller had finished describing it:
+///
+/// - `space_root` was once written *after* `spawn()`, and a LAPIC tick landing
+///   between the two scheduled the task with `space_root` still 0 — kernel CR3
+///   — so `run_init`'s sysret into ring 3 fetched sshd's entry point unmapped
+///   (`#PF`, `cr2 == rip == 0x2045d0`, `err=0x14`). Measured 2026-09-04,
+///   intermittent by timer phase: one boot served ssh, the next died on the
+///   first user instruction.
+/// - Every process task now needs [`seed_proc_slot`] before it runs, because
+///   `usermode::proc_entry` reads its `PROCS` index out of its own `UserCtx`.
+///
+/// With a second core the window is not a tick away but zero instructions
+/// away, which is why [`State::Reserved`] exists at all. Publishing is a
+/// separate call so that forgetting it is a task that never runs — loud —
+/// rather than a task that runs too early.
 pub fn spawn_in_space_unpublished(entry: extern "C" fn() -> !, space_root: u64) -> Option<usize> {
     spawn_unpublished(entry, space_root, false)
 }
@@ -631,6 +635,30 @@ pub fn seed_thread_task(
             task.uctx.saved_regs = *saved_regs;
             task.uctx.proc_slot = proc_slot;
             task.uctx.thread_slot = thread_slot;
+        }
+    }
+}
+
+/// Seed a not-yet-running **process** task with the `PROCS` slot it serves.
+///
+/// The counterpart of [`seed_thread_task`]'s `proc_slot`/`thread_slot` pair,
+/// and the reason `usermode` needs only one process entry function. Until
+/// 2026-09-06 a `PROCS` index had nowhere to live but the `fn` pointer itself,
+/// so `usermode::proc_entry_for` baked one into each of sixteen hand-written
+/// trampolines — and since only nine of them were ever handed out, the machine
+/// could not run more than nine processes at once. `cargo -j4` is cargo plus
+/// four `rustc`s plus their children before anything interesting happens.
+///
+/// Deliberately not folded into [`seed_forked_task`]: a `spawn`ed process needs
+/// this and *not* a register snapshot (it starts at a fresh entry point, not at
+/// a copy of its parent's context), so one function taking both would make two
+/// unrelated requirements look like one call.
+pub fn seed_proc_slot(task_slot: usize, proc_slot: usize) {
+    // SAFETY: raw-pointer access under the BKL; the task is Reserved, so no
+    // core can be running it.
+    unsafe {
+        if let Some(task) = (*tasks()).get_mut(task_slot) {
+            task.uctx.proc_slot = proc_slot;
         }
     }
 }
